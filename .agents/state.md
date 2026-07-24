@@ -22375,3 +22375,88 @@ CUTLASS @ `~/cutlass-4.5.0`).**
 `SPEC-GDN-SEGMENTS` stays `ACTIVE` (I5a wires the layer; the e2e token gate is
 owed at I5d); `SPEC-MTP` STAYS `GATING`. `benchmark_binding=false`, no speed
 claim — the honest denominator is vLLM with the same spec config, owed by I5d.
+
+---
+
+## 2026-07-24 — SPEC-MTP I5b: `prepare_prefill_inputs` (the drafter prefill input-prep) (`CLAIM-SPEC-MTP-I5B`)
+
+Base `origin/main` `3ae5cfe` (I5a's tip); isolated worktree
+`/home/mudler/_git/vllm.cpp.wt/i5b` branch `spec-mtp-i5b`; CPU build + CPU ctest
+only (no GPU needed — see below). NOT pushed.
+
+**Scope.** Second of the four scoped M-mtp-1 sub-increments (I5a GDN wiring →
+**I5b prepare_prefill** → I5c MTP paged propose → I5d config+runner-loop+27B token
+gate; `mtp-spec-decode.md` §5). The DRAFTER input-prep for the prefill / k=1
+step: shift each request's `input_ids` left one within its query span, splice the
+just-sampled next token into the freed last slot, `query_len -= num_rejected`,
+and emit the last-token index / query_start_loc / seq_lens the draft forward +
+sampler consume. Mirrors `_prepare_prefill_inputs_kernel` + `prepare_prefill_inputs`
+(`vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py:469-588` @ `e24d1b24`),
+driven from `propose` (:184-195) with the k=1 early-exit (:236-238) as the tested
+shape, and the runner spec split (`gpu/model_runner.py:866-898`, landed for the
+VERIFY half by I3).
+
+**Design decision — HOST routine, no new CUDA kernel (recorded).** The shift-splice
+is pure integer index logic over the input batch. OUR engine builds ALL step
+index arrays host-side over `std::vector`s and uploads them (`prepare_inputs`,
+and the DIRECTLY analogous spec-adjacent `combine_sampled_and_draft_tokens`, are
+both host routines explicitly marked DEVICE-NEUTRAL — "on CPU these are host
+std::vectors; the DGX leaf ports this loop to the cited Triton kernel over
+GPU-resident input_ids"). `prepare_prefill_inputs` is exactly that family, so the
+faithful mirror to our architecture is a host routine, and I5d's runner leaf
+ports the SAME loop to the Triton kernel over the draft `input_buffers`. No new
+`vt::` op / CUDA kernel is added by I5b, so the "CUDA==CPU bit-exact" and
+"compute-sanitizer" clauses are N/A (no kernel) and no dgx run is required — the
+increment is CPU-unit-only, exactly as scoped ("primarily a CPU/unit increment").
+
+**What landed (2 new files + 1 new test + 2 one-line CMake additions).**
+- NEW `include/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.h`
+  — the `SpecPrefillInputs` output struct (`input_ids` [num_tokens] i32,
+  `positions` [num_tokens] i64, `query_start_loc` [max_num_reqs+1] i32, `seq_lens`
+  [max_num_reqs] i32, `last_token_indices` [max_num_reqs] i64, `current_draft_step`)
+  + the `prepare_prefill_inputs(...)` signature. Mirrors the buffers the Triton
+  kernel writes (speculator.py:472-476 + last_token_indices + current_draft_step).
+- NEW `src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.cpp`
+  — the CPU reference: per request `query_len = (query_end-query_start) - num_rejected`;
+  `next_token = num_sampled>0 ? last_sampled[idx_mapping[r]] : next_prefill_tokens[...]`
+  (:502-508); shift `draft[query_start+i-1] = target[query_start+i]` for i in
+  [1,query_len) (:511-515); `last_token_index = query_start+query_len-1`,
+  `draft[last]=next_token` (:517-519); positions copied unchanged (:522-526);
+  `query_start_loc[r]=query_start`, `seq_lens[r]=target seq_len` (:529-531); the
+  request-count CUDA-graph padding (:532-549). KEY INVARIANT preserved: input_ids/
+  positions keep the TARGET batch's total size (rejected positions are PADDED, not
+  compacted — NOTE :162-167), so the draft reuses the target attention metadata;
+  only the shift range / last_token_index / sampled row shrink by num_rejected.
+- NEW `tests/vllm/v1/spec_decode/test_prepare_prefill_inputs.cpp` — 7 cases / 27
+  assertions.
+
+**Gate (CPU-unit).** Ported test `test_prepare_prefill_inputs` — no dedicated
+upstream UNIT test exists (the kernel is e2e-covered), so as in
+`test_combine_tokens.cpp` the oracle is derived directly from the kernel algorithm
+and every expected array written by hand. Cases: perfect-accept (k=1, shift by
+k+1), early-mismatch (k=1 j=0 → shift by 1, query_len−=1; and k=3 j=1 → shift by
+2, query_len−=2, the general shape), single-token (k=0 → plain next-token),
+multi-request (different k_i), chunked-prefill (num_sampled==0 → next_prefill_tokens),
+and CUDA-graph request-count padding. **RED-FIRST proven by experiment:** a
+reverted no-shift/no-splice stub fails 7/7 cases (12/27 assertions) — the drafter
+would consume the un-shifted verify tokens and never see the just-sampled token;
+the real routine passes 7/7 (27/27).
+
+**Additive / default-off (byte-identical SACRED by construction).**
+`git diff --stat` for code = two NEW files + one NEW test + `CMakeLists.txt` +1
+and `tests/CMakeLists.txt` +1 — NO existing forward / runner-step / kernel TU is
+altered. Nothing on the production path calls `prepare_prefill_inputs` (I5d wires
+the runner loop); with no `SpeculativeConfig` the speculator is never constructed
+and this TU's object code is unreachable. So every SACRED gate (GDN-bearing 27B/
+35B/Coder included) is byte-identical BY CONSTRUCTION — NO dgx re-run is owed
+(nothing they exercise changed). CPU clean full `-Werror` build 0 warnings; the
+new source `prepare_prefill_inputs.cpp.o` compiles into libvllm; test 7/7 (27).
+
+`SPEC-MTP` STAYS `GATING`; `SPEC-GDN-SEGMENTS` unchanged (`ACTIVE`).
+`benchmark_binding=false`, no speed claim — the honest denominator is vLLM with
+the same spec config, owed by I5d. **Resume point (I5c/I5d):** the runner loop
+calls `prepare_prefill_inputs` after the verify-step rejection sampler (feeding
+its `num_sampled`/`num_rejected` + the request's `last_sampled`), then drives the
+`Qwen3_5MTP` paged propose (I5c) over the shifted `input_ids`/`positions`,
+sampling at `last_token_indices`; on the DGX it ports this host loop to the Triton
+kernel over the draft `input_buffers` (identical arithmetic).

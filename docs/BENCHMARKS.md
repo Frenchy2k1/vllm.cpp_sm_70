@@ -3392,3 +3392,31 @@ at the real 27B/35B GDN dims (Hv 48/32, Dk=Dv 128), RED-first proven; MANDATORY
 spec-off SACRED gates re-run under flock (27B 235/235, 35B 315/315, Coder
 138/138). Reproduction:
 `ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/work/vllm.cpp-i5a && ./build/tests/test_qwen3_5_gdn_spec_routing"'`.
+
+**`SPEC-MTP` I5b - `prepare_prefill_inputs`, the drafter prefill input-prep
+(2026-07-24, [spec](../.agents/specs/mtp-spec-decode.md) §5, `CLAIM-SPEC-MTP-I5B`).**
+**Benchmark disposition: NOT APPLICABLE - no measurement, no speed credit
+claimed (`benchmark_binding=false`).** I5b is the second sub-increment of the
+scoped M-mtp-1 (I5a GDN layer wiring -> I5b prepare_prefill -> I5c MTP paged
+propose -> I5d config + runner loop + the 27B token gate). It adds the DRAFTER
+prefill input-prep host routine `vllm::v1::prepare_prefill_inputs` + its
+`SpecPrefillInputs` output struct: per request, shift `input_ids` left one within
+its query span, splice the just-sampled next token into the freed last slot,
+`query_len -= num_rejected`, and emit the last-token index / query_start_loc /
+seq_lens (with request-count CUDA-graph padding) the draft forward consumes -
+mirroring `_prepare_prefill_inputs_kernel` + `prepare_prefill_inputs`
+(`speculator.py:469-588` @ `e24d1b24`), k=1 early-exit (:236-238) the tested
+shape. Implemented as a HOST routine (no new CUDA kernel), matching our
+DEVICE-NEUTRAL `prepare_inputs`/`combine_sampled_and_draft_tokens` family (the
+DGX runner leaf ports the loop to the Triton kernel at I5d). It is DEFAULT-OFF and
+INERT: nothing calls it until I5d wires the runner loop; with no `SpeculativeConfig`
+the speculator is never constructed and this TU is unreachable - so no engine
+behavior changes and every SACRED gate (incl. GDN-bearing 27B/35B/Coder) is
+byte-identical BY CONSTRUCTION, NO dgx re-run owed. No throughput/TPOT/acceptance
+number is claimed: the honest denominator is vLLM with the SAME speculative
+config, owed by the M-mtp-1 e2e gate at I5d, which keeps `SPEC-MTP` at `GATING`.
+Correctness: CPU-unit only - `test_prepare_prefill_inputs` 7 cases / 27 assertions
+(perfect-accept, early-mismatch k=1+k=3, single-token, multi-request,
+chunked-prefill, CG padding), RED-first proven by a reverted no-op stub (7/7
+fail). No CUDA kernel added, so CUDA==CPU / compute-sanitizer are N/A.
+Reproduction: `cd /home/mudler/_git/vllm.cpp.wt/i5b && ./build-cpu/tests/test_prepare_prefill_inputs`.
