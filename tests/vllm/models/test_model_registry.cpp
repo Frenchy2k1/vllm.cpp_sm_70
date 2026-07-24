@@ -8,6 +8,8 @@
 #include "vllm/model_executor/models/opt.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
+#include "vllm/model_executor/models/qwen3_5_common.h"
+#include "vllm/v1/kv_cache_interface.h"
 
 #include <doctest/doctest.h>
 
@@ -647,4 +649,81 @@ TEST_CASE("can_initialize SKIP: MODEL-FACTORY-registry: no second family yet" *
   // Qwen variants are exercised by the loaded-engine CPU suites; a genuinely
   // distinct second-family dummy initialization belongs to the Llama leaf.
   MESSAGE("SKIP MODEL-FACTORY-registry: no second family yet");
+}
+
+// ===========================================================================
+// SPEC-MTP I4 — GDN speculative state-slot ALLOCATION. Mirrors
+// vllm/model_executor/models/qwen3_5.py:524-543 (`num_spec` from the
+// SpeculativeConfig) → mamba_utils.py:213-234 (conv row widened to
+// `conv_kernel_size - 1 + num_spec`) → mamba/abstract.py:55-59
+// (`MambaSpec.num_speculative_blocks = num_speculative_tokens`), which is what
+// makes MambaManager allocate k+1 GDN state blocks per request
+// (single_type_kv_cache_manager.py:1206-1215).
+// ===========================================================================
+TEST_CASE("Qwen3.5 KV-cache spec: num_spec widens the conv row and adds state blocks") {
+  HfConfig cfg = Config({"Qwen3_5ForCausalLM"});
+  // Real 35B GDN geometry (nvidia--Qwen3.6-35B-A3B-NVFP4 config.json).
+  cfg.num_key_value_heads = 2;
+  cfg.head_dim = 256;
+  cfg.linear_num_key_heads = 16;
+  cfg.linear_num_value_heads = 32;
+  cfg.linear_key_head_dim = 128;
+  cfg.linear_value_head_dim = 128;
+  cfg.linear_conv_kernel_dim = 4;
+
+  const int64_t conv_dim = 2 * 16 * 128 + 32 * 128;  // 8192
+
+  // num_spec == 0 is the production default and must reproduce the registered
+  // KVCacheSpecBuilder byte for byte.
+  const vllm::v1::KVCacheConfig base =
+      vllm::MakeQwen3_5KVCache(cfg, /*block_size=*/16, /*num_blocks=*/8);
+  const vllm::v1::KVCacheConfig zero =
+      vllm::MakeQwen3_5KVCacheSpec(cfg, /*block_size=*/16, /*num_blocks=*/8, /*num_spec=*/0);
+  REQUIRE(base.kv_cache_groups.size() == 2);
+  REQUIRE(zero.kv_cache_groups.size() == 2);
+  const auto* base_mamba =
+      dynamic_cast<const vllm::v1::MambaSpec*>(base.kv_cache_groups[1].kv_cache_spec.get());
+  const auto* zero_mamba =
+      dynamic_cast<const vllm::v1::MambaSpec*>(zero.kv_cache_groups[1].kv_cache_spec.get());
+  REQUIRE(base_mamba != nullptr);
+  REQUIRE(zero_mamba != nullptr);
+  CHECK(base_mamba->num_speculative_blocks == 0);
+  CHECK(base_mamba->shapes == zero_mamba->shapes);
+  CHECK(base_mamba->dtypes == zero_mamba->dtypes);
+  CHECK(base_mamba->num_speculative_blocks == zero_mamba->num_speculative_blocks);
+  CHECK(base_mamba->page_size_bytes() == zero_mamba->page_size_bytes());
+  // Conv row is the plain K-1 window with no speculation.
+  CHECK(base_mamba->shapes[0] == std::vector<int64_t>{conv_dim, 3});
+
+  for (const int num_spec : {1, 2, 3}) {
+    CAPTURE(num_spec);
+    const vllm::v1::KVCacheConfig kv =
+        vllm::MakeQwen3_5KVCacheSpec(cfg, /*block_size=*/16, /*num_blocks=*/8, num_spec);
+    const auto* mamba =
+        dynamic_cast<const vllm::v1::MambaSpec*>(kv.kv_cache_groups[1].kv_cache_spec.get());
+    REQUIRE(mamba != nullptr);
+    // conv_kernel_size - 1 + num_spec (mamba_utils.py:226): the sliding window
+    // the accepted count rewinds into. The conv needs NO extra slots.
+    CHECK(mamba->shapes[0] == std::vector<int64_t>{conv_dim, 3 + num_spec});
+    // The SSM state shape is unchanged; the k+1 snapshot slots come from the
+    // per-request block count, not from a bigger row.
+    CHECK(mamba->shapes[1] == std::vector<int64_t>{32, 128, 128});
+    CHECK(mamba->num_speculative_blocks == num_spec);
+    // The full-attention group is untouched by speculation.
+    CHECK(kv.kv_cache_groups[0].kv_cache_spec->page_size_bytes() ==
+          base.kv_cache_groups[0].kv_cache_spec->page_size_bytes());
+  }
+
+  // MEASURED state cost of k=1 on this geometry, per GDN layer and per request:
+  // one SSM slot is Hv*Dv*Dk*4B = 32*128*128*4 = 2 MiB, so k=1 (2 slots) doubles
+  // it; the conv row grows by one tap per channel only.
+  const vllm::v1::KVCacheConfig kv1 = vllm::MakeQwen3_5KVCacheSpec(cfg, 16, 8, 1);
+  const auto* k1 =
+      dynamic_cast<const vllm::v1::MambaSpec*>(kv1.kv_cache_groups[1].kv_cache_spec.get());
+  REQUIRE(k1 != nullptr);
+  const int64_t ssm_slot_bytes = 32 * 128 * 128 * 4;  // f32 SSM state
+  CHECK(ssm_slot_bytes == 2 * 1024 * 1024);
+  // page_size_bytes covers ONE block (conv row + ssm row); k=1 grows the conv
+  // part by conv_dim * sizeof(bf16) and leaves the ssm part alone.
+  CHECK(k1->page_size_bytes() - base_mamba->page_size_bytes() == conv_dim * 2);
 }

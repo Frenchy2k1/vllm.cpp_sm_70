@@ -5106,6 +5106,370 @@ void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
               nullptr, args, "gdn_prefill");
 }
 
+// ===========================================================================
+// SPECULATIVE GDN (SPEC-MTP I4): the T>1 / IS_SPEC_DECODING variants.
+//
+// Both are NEW ENTRY POINTS. They add no branch to any shipped kernel, so the
+// non-speculative production path (the only one reachable today — without a
+// SpeculativeConfig num_spec_decodes is always 0) is byte-identical by
+// construction; see the default-off proof in the I4 record.
+// ===========================================================================
+
+// SPECULATIVE causal_conv1d_update. Ported from
+// vllm/model_executor/layers/mamba/ops/causal_conv1d.py @ e24d1b24
+// (_causal_conv1d_update_kernel, IS_SPEC_DECODING + IS_VARLEN, :818-1067).
+// One thread per (request, channel); the request's 1+k tokens run sequentially
+// inside the thread, which mirrors the upstream program structure exactly
+// (grid = (batch, cdiv(dim, BLOCK_N)) with a `for idx_token in range(seqlen)`
+// loop at :972). Bit-identical to the CPU reference CausalConv1dSpecUpdateKernel
+// (src/vt/cpu/cpu_ops.cpp): same bias init, same left-to-right accumulation over
+// the widened window, same silu epilogue, same one-tap left shift.
+template <typename Tin, typename Tout, typename TState>
+__global__ void ConvSpecUpdateKernel(Tout* out, const Tin* x, const Tin* w, const Tin* bias,
+                                     TState* conv_state, const int32_t* cache_idx,
+                                     const int32_t* num_accepted, const int32_t* cu_seqlens,
+                                     int64_t num_reqs, int64_t c_dim, int64_t x_row_stride,
+                                     int64_t k, int64_t state_len, int64_t state_slots,
+                                     bool silu) {
+  const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (c >= c_dim) return;
+  const int64_t i = blockIdx.y;
+  if (i >= num_reqs) return;
+  const int32_t slot = cache_idx[i];
+  // Local cache ABI: idx < 0 == NULL row → leave `out` and the cache untouched.
+  // The upper bound is an independent kernel-side guard (engine metadata is
+  // validated on host before upload; re-checking here adds no capture-breaking
+  // synchronization).
+  if (slot < 0 || static_cast<int64_t>(slot) >= state_slots) return;
+  const int64_t lo = cu_seqlens[i], hi = cu_seqlens[i + 1];
+  const int64_t seqlen = hi - lo;
+  if (seqlen <= 0) return;  // zero-length padded row (:832-833)
+  const int64_t width = k - 1;
+  // Sliding-window read offset = accepted count - 1 (:846-852).
+  const int64_t off = static_cast<int64_t>(num_accepted[i]) - 1;
+  TState* srow = conv_state + (static_cast<int64_t>(slot) * c_dim + c) * state_len;
+  // Outputs first: the whole window is still the OLD state (the roll below only
+  // starts once every token has been emitted).
+  for (int64_t t = 0; t < seqlen; ++t) {
+    float acc = bias != nullptr ? Load(bias, c) : 0.0f;
+    for (int64_t j = 0; j < k; ++j) {
+      const int64_t si = t + j;
+      const float sv = si < width
+                           ? ((off + si) < state_len ? Load(srow, off + si) : 0.0f)
+                           : Load(x, (lo + si - width) * x_row_stride + c);
+      acc += Load(w, c * k + j) * sv;
+    }
+    Store(out, (lo + t) * c_dim + c, silu ? Silu(acc) : acc);
+  }
+  // Roll: new row = old[off+1 .. off+keep] ++ raw x. Writing forward is safe —
+  // destination j reads source off+j+1 > j, so no source is clobbered first.
+  const int64_t keep = state_len - seqlen;
+  for (int64_t j = 0; j < keep; ++j) {
+    const int64_t src = off + j + 1;
+    Store(srow, j, src < state_len ? Load(srow, src) : 0.0f);
+  }
+  for (int64_t t = 0; t < seqlen; ++t)
+    Store(srow, keep + t, Load(x, (lo + t) * x_row_stride + c));
+}
+
+template <typename Tin, typename Tout, typename TState>
+void LaunchConvSpecUpdate(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                          const Tensor* bias, Tensor& conv_state, const int32_t* cache_idx,
+                          const int32_t* num_accepted, const int32_t* cu_seqlens,
+                          int64_t num_reqs, const CausalConv1dArgs& args) {
+  const int64_t c = x.shape[1], k = w.shape[1];
+  const int64_t state_len = conv_state.shape[2];
+  const dim3 grid(static_cast<unsigned>((c + kBlock - 1) / kBlock),
+                  static_cast<unsigned>(num_reqs));
+  ConvSpecUpdateKernel<Tin, Tout, TState><<<grid, kBlock, 0, s>>>(
+      out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+      bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<TState>(), cache_idx,
+      num_accepted, cu_seqlens, num_reqs, c, x.stride[0], k, state_len, conv_state.shape[0],
+      args.silu_activation);
+  Check(cudaGetLastError(), "causal_conv1d_spec_update launch");
+}
+
+template <typename Tin, typename Tout>
+void LaunchConvSpecUpdateS(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                           const Tensor* bias, Tensor& conv_state, const int32_t* cache_idx,
+                           const int32_t* num_accepted, const int32_t* cu_seqlens,
+                           int64_t num_reqs, const CausalConv1dArgs& args) {
+  if (conv_state.dtype == DType::kBF16)
+    LaunchConvSpecUpdate<Tin, Tout, __nv_bfloat16>(s, out, x, w, bias, conv_state, cache_idx,
+                                                   num_accepted, cu_seqlens, num_reqs, args);
+  else
+    LaunchConvSpecUpdate<Tin, Tout, float>(s, out, x, w, bias, conv_state, cache_idx,
+                                           num_accepted, cu_seqlens, num_reqs, args);
+}
+
+void ConvSpecUpdateKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
+                              const Tensor* bias, Tensor& conv_state,
+                              const Tensor& conv_state_indices,
+                              const Tensor& num_accepted_tokens, const Tensor& cu_seqlens,
+                              const CausalConv1dArgs& args) {
+  VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16,
+           "cuda causal_conv1d_spec_update: unsupported x dtype (f32/bf16 only)");
+  VT_CHECK(w.dtype == x.dtype && (bias == nullptr || bias->dtype == x.dtype),
+           "cuda causal_conv1d_spec_update: weight/bias dtype must match x");
+  const int64_t num_reqs = cu_seqlens.shape[0] - 1;
+  if (num_reqs == 0 || x.shape[1] == 0) return;
+  VT_CHECK(num_reqs <= kMaxGridY,
+           "cuda causal_conv1d_spec_update: too many sequences (grid.y limit)");
+  cudaStream_t s = AsStream(q);
+  const int32_t* ci = conv_state_indices.Ptr<int32_t>();
+  const int32_t* na = num_accepted_tokens.Ptr<int32_t>();
+  const int32_t* cs = cu_seqlens.Ptr<int32_t>();
+  if (x.dtype == DType::kF32) {
+    if (out.dtype == DType::kF32)
+      LaunchConvSpecUpdateS<float, float>(s, out, x, w, bias, conv_state, ci, na, cs, num_reqs,
+                                          args);
+    else
+      LaunchConvSpecUpdateS<float, __nv_bfloat16>(s, out, x, w, bias, conv_state, ci, na, cs,
+                                                  num_reqs, args);
+  } else {
+    if (out.dtype == DType::kF32)
+      LaunchConvSpecUpdateS<__nv_bfloat16, float>(s, out, x, w, bias, conv_state, ci, na, cs,
+                                                  num_reqs, args);
+    else
+      LaunchConvSpecUpdateS<__nv_bfloat16, __nv_bfloat16>(s, out, x, w, bias, conv_state, ci, na,
+                                                          cs, num_reqs, args);
+  }
+}
+
+// SPECULATIVE gated-delta-rule recurrence. Ported from
+// vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py @ e24d1b24
+// (fused_recurrent_gated_delta_rule_fwd_kernel with IS_VARLEN :66-72,
+// IS_SPEC_DECODING :103-116 and INPLACE_FINAL_STATE :156-166).
+//
+// Geometry is GdnDecodeFusedKernel's — one block per (request, v-head, BV value
+// tile), the [BV,Dk] state slice staged once into shared and updated in place —
+// with two additions:
+//   * the INITIAL slice is read from column `num_accepted_tokens[i] - 1` of the
+//     request's state-index row (the snapshot after the last ACCEPTED token);
+//   * the request's 1+k tokens run as an inner sequential loop, and after EVERY
+//     timestep the slice is written back to THAT timestep's own slot, so a later
+//     rejection is just an earlier column read.
+// The per-token arithmetic is the GdnDecodeFusedKernel body verbatim (same
+// decay-fused Dk pass, same shfl_xor reduction, same update order), so a T==1 /
+// num_accepted==1 spec call reproduces GdnDecode bit-for-bit.
+template <typename Tin, typename Tout, typename TState, int NW>
+__global__ void GdnSpecDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, const Tin* v,
+                                         const float* g, const float* beta, TState* state,
+                                         const int32_t* cu_seqlens,
+                                         const int32_t* state_indices,
+                                         const int32_t* num_accepted, int64_t num_cols,
+                                         int64_t state_slots, int64_t hk_n, int64_t dk,
+                                         int64_t hv_n, int64_t dv, int64_t bv, float scale) {
+  const int64_t i_v = blockIdx.x;         // value-dim tile
+  const int64_t i_nh = blockIdx.y;        // fused (request, v-head)
+  const int64_t i_n = i_nh / hv_n;        // request
+  const int64_t hv = i_nh % hv_n;         // v-head
+  const int64_t hk = hv / (hv_n / hk_n);  // GQA-mapped k-head
+  const int64_t vbase = i_v * bv;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int vi = tid / NW;
+  const int wk = tid % NW;
+  const int64_t vrow = vbase + vi;
+
+  const int64_t lo = cu_seqlens[i_n];
+  const int64_t hi = cu_seqlens[i_n + 1];
+  // Initial-state column = accepted count - 1 (fused_sigmoid_gating.py:105-107).
+  // Uniform over the block (i_n is fixed by blockIdx.y), so every early return
+  // below is block-uniform and the shfl butterflies stay well-formed.
+  int64_t init_col = static_cast<int64_t>(num_accepted[i_n]) - 1;
+  if (init_col < 0) init_col = 0;
+  if (init_col >= num_cols) init_col = num_cols - 1;
+  const int32_t init_slot = state_indices[i_n * num_cols + init_col];
+  if (init_slot < 0 || static_cast<int64_t>(init_slot) >= state_slots) {
+    // NULL initial slot ⇒ skip the request, zeroing its output rows
+    // (fused_sigmoid_gating.py:112-115 `if state_idx <= 0: return`).
+    if (vrow < dv && wk == 0)
+      for (int64_t t = lo; t < hi; ++t) Store(out, (t * hv_n + hv) * dv + vrow, 0.0f);
+    return;
+  }
+  if (hi <= lo) return;  // T == 0 early-out (:76-78)
+
+  const int64_t sdk = dk + 1;  // padded shared row stride (kills bank conflicts)
+  extern __shared__ float smem[];
+  float* bq = smem;
+  float* bk = bq + dk;
+  float* sbh = bk + dk;  // [bv * sdk]
+  const int64_t vrows = (dv - vbase) < bv ? (dv - vbase) : bv;
+  const int64_t tile = vrows * dk;
+
+  const TState* s_init =
+      state + (static_cast<int64_t>(init_slot) * hv_n + hv) * dv * dk + vbase * dk;
+  for (int64_t e = tid; e < bv * dk; e += blockDim.x)
+    sbh[(e / dk) * sdk + e % dk] = e < tile ? Load(s_init, e) : 0.0f;
+
+  const int64_t ck = (dk + NW - 1) / NW;
+  const int64_t c0 = static_cast<int64_t>(wk) * ck;
+  const int64_t c1 = (c0 + ck) < dk ? (c0 + ck) : dk;
+  float* r = sbh + static_cast<int64_t>(vi) * sdk;
+
+  for (int64_t t = lo; t < hi; ++t) {
+    __syncthreads();  // protects bq/bk and the shared slice across iterations
+    const int64_t qkbase = (t * hk_n + hk) * dk;
+    for (int64_t i = tid; i < dk; i += blockDim.x) {
+      bq[i] = Load(q, qkbase + i) * scale;
+      bk[i] = Load(k, qkbase + i);
+    }
+    __syncthreads();
+
+    const float decay = expf(g[t * hv_n + hv]);
+    const float beta_t = beta[t * hv_n + hv];
+    float pdot = 0.0f;
+    for (int64_t c = c0; c < c1; ++c) {
+      r[c] *= decay;
+      pdot += r[c] * bk[c];
+    }
+    float dot = pdot;
+#pragma unroll
+    for (int off = 1; off < NW; off <<= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+    const float vv = vrow < dv ? Load(v, (t * hv_n + hv) * dv + vrow) : 0.0f;
+    const float vp = (vv - dot) * beta_t;
+    float po = 0.0f;
+    for (int64_t c = c0; c < c1; ++c) {
+      r[c] += vp * bk[c];
+      po += r[c] * bq[c];
+    }
+    float o = po;
+#pragma unroll
+    for (int off = 1; off < NW; off <<= 1) o += __shfl_xor_sync(0xffffffffu, o, off);
+    if (vrow < dv && wk == 0) Store(out, (t * hv_n + hv) * dv + vrow, o);
+
+    // Per-timestep SNAPSHOT into timestep t's OWN slot
+    // (fused_sigmoid_gating.py:156-166). A NULL column skips only its store.
+    __syncthreads();
+    const int32_t slot = state_indices[i_n * num_cols + (t - lo)];
+    if (slot >= 0 && static_cast<int64_t>(slot) < state_slots) {
+      TState* s_dst = state + (static_cast<int64_t>(slot) * hv_n + hv) * dv * dk + vbase * dk;
+      for (int64_t e = tid; e < tile; e += blockDim.x)
+        Store(s_dst, e, sbh[(e / dk) * sdk + e % dk]);
+    }
+  }
+}
+
+template <typename Tin, typename Tout, typename TState, int NW>
+void LaunchGdnSpecDecodeNW(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
+                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                           const int32_t* cu_seqlens, const int32_t* state_indices,
+                           const int32_t* num_accepted, int64_t num_reqs, int64_t num_cols,
+                           const GdnArgs& args) {
+  const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv_n = v.shape[1], dv = v.shape[2];
+  const int64_t bv = dv < 32 ? dv : 32;
+  const int64_t nv = (dv + bv - 1) / bv;
+  const dim3 grid(static_cast<unsigned>(nv), static_cast<unsigned>(num_reqs * hv_n));
+  const size_t shmem =
+      (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) * sizeof(float);
+  GdnSpecDecodeFusedKernel<Tin, Tout, TState, NW>
+      <<<grid, static_cast<unsigned>(bv * NW), shmem, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
+          beta.Ptr<float>(), state.Ptr<TState>(), cu_seqlens, state_indices, num_accepted,
+          num_cols, state.shape[0], hk_n, dk, hv_n, dv, bv, args.scale);
+  Check(cudaGetLastError(), "gdn spec decode launch");
+}
+
+template <typename Tin, typename Tout, typename TState>
+void LaunchGdnSpecDecode(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
+                         const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                         const int32_t* cu_seqlens, const int32_t* state_indices,
+                         const int32_t* num_accepted, int64_t num_reqs, int64_t num_cols,
+                         const GdnArgs& args, int nw) {
+  const int64_t dv = v.shape[2];
+  const int nw_eff = dv >= 32 ? nw : 1;
+  switch (nw_eff) {
+    case 2:
+      LaunchGdnSpecDecodeNW<Tin, Tout, TState, 2>(s, out, q_in, k, v, g, beta, state, cu_seqlens,
+                                                  state_indices, num_accepted, num_reqs,
+                                                  num_cols, args);
+      break;
+    case 4:
+      LaunchGdnSpecDecodeNW<Tin, Tout, TState, 4>(s, out, q_in, k, v, g, beta, state, cu_seqlens,
+                                                  state_indices, num_accepted, num_reqs,
+                                                  num_cols, args);
+      break;
+    case 8:
+      LaunchGdnSpecDecodeNW<Tin, Tout, TState, 8>(s, out, q_in, k, v, g, beta, state, cu_seqlens,
+                                                  state_indices, num_accepted, num_reqs,
+                                                  num_cols, args);
+      break;
+    default:
+      LaunchGdnSpecDecodeNW<Tin, Tout, TState, 1>(s, out, q_in, k, v, g, beta, state, cu_seqlens,
+                                                  state_indices, num_accepted, num_reqs,
+                                                  num_cols, args);
+      break;
+  }
+}
+
+template <typename Tin, typename Tout>
+void LaunchGdnSpecDecodeS(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
+                          const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                          const int32_t* cu_seqlens, const int32_t* state_indices,
+                          const int32_t* num_accepted, int64_t num_reqs, int64_t num_cols,
+                          const GdnArgs& args, int nw) {
+  if (state.dtype == DType::kBF16)
+    LaunchGdnSpecDecode<Tin, Tout, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, cu_seqlens,
+                                                  state_indices, num_accepted, num_reqs,
+                                                  num_cols, args, nw);
+  else if (state.dtype == DType::kF16)
+    LaunchGdnSpecDecode<Tin, Tout, __half>(s, out, q_in, k, v, g, beta, state, cu_seqlens,
+                                           state_indices, num_accepted, num_reqs, num_cols, args,
+                                           nw);
+  else
+    LaunchGdnSpecDecode<Tin, Tout, float>(s, out, q_in, k, v, g, beta, state, cu_seqlens,
+                                          state_indices, num_accepted, num_reqs, num_cols, args,
+                                          nw);
+}
+
+void GdnSpecDecodeKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                             const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                             const Tensor& cu_seqlens, const Tensor& state_indices,
+                             const Tensor& num_accepted_tokens, const GdnArgs& args) {
+  VT_CHECK(q_in.dtype == DType::kF32 || q_in.dtype == DType::kBF16,
+           "cuda gdn_spec_decode: unsupported q dtype (f32/bf16 only)");
+  VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
+           "cuda gdn_spec_decode: q/k/v dtypes must match");
+  const int64_t num_reqs = state_indices.shape[0];
+  const int64_t num_cols = state_indices.shape[1];
+  const int64_t hv_n = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  if (num_reqs == 0 || hv_n == 0 || dv == 0) return;
+  VT_CHECK(num_reqs * hv_n <= kMaxGridY,
+           "cuda gdn_spec_decode: too many (request x head) blocks (grid.y limit)");
+  const int64_t bv = dv < 32 ? dv : 32;
+  const size_t shmem =
+      (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) * sizeof(float);
+  VT_CHECK(shmem <= 48 * 1024,
+           "cuda gdn_spec_decode: Dk/Dv too large for the shared state slice");
+  // Same warps-per-block occupancy lever as GdnDecodeFused (default 8; NW==1 is
+  // the single-warp reference). Read once per call.
+  int nw = 8;
+  if (const char* e = std::getenv("VT_GDN_DECODE_NW")) {
+    const int v_nw = std::atoi(e);
+    if (v_nw == 1 || v_nw == 2 || v_nw == 4 || v_nw == 8) nw = v_nw;
+  }
+  cudaStream_t s = AsStream(q);
+  const int32_t* cs = cu_seqlens.Ptr<int32_t>();
+  const int32_t* si = state_indices.Ptr<int32_t>();
+  const int32_t* na = num_accepted_tokens.Ptr<int32_t>();
+  if (q_in.dtype == DType::kF32) {
+    if (out.dtype == DType::kF32)
+      LaunchGdnSpecDecodeS<float, float>(s, out, q_in, k, v, g, beta, state, cs, si, na, num_reqs,
+                                         num_cols, args, nw);
+    else
+      LaunchGdnSpecDecodeS<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, cs, si, na,
+                                                 num_reqs, num_cols, args, nw);
+  } else {
+    if (out.dtype == DType::kF32)
+      LaunchGdnSpecDecodeS<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, cs, si, na,
+                                                 num_reqs, num_cols, args, nw);
+    else
+      LaunchGdnSpecDecodeS<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, cs,
+                                                         si, na, num_reqs, num_cols, args, nw);
+  }
+}
+
 void GdnDecodeKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                          const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                          const Tensor* state_idx, const GdnArgs& args) {
@@ -5151,6 +5515,13 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernelCuda)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernelCuda)));
+    RegisterOp(
+        OpId::kGdnSpecDecode, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<GdnSpecDecodeFn>(&GdnSpecDecodeKernelCuda)));
+    RegisterOp(
+        OpId::kCausalConv1dSpecUpdate, DeviceType::kCUDA,
+        reinterpret_cast<void*>(
+            static_cast<CausalConv1dSpecUpdateFn>(&ConvSpecUpdateKernelCuda)));
     RegisterOp(
         OpId::kGdnPackedDecode, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<GdnPackedDecodeFn>(

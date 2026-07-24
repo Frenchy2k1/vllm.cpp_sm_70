@@ -22177,3 +22177,86 @@ reaching the engine is three additive lines in `BuildKvConnector`, which cannot 
 configured KV transfer config, and connectors remain default-off. No SACRED model re-witness was run
 (no model weights are staged in this scratch tree), so the inertness argument above is the basis and
 is stated as such rather than as a measured re-run. Not pushed.
+
+---
+
+## 2026-07-24 — SPEC-MTP I4 (`SPEC-GDN-SEGMENTS`): GDN speculative slot path + bit-exact state rollback (LANDED, `CLAIM-SPEC-GDN-I4`)
+
+**What landed.** The GDN half of speculative decoding — the piece BOTH gate
+checkpoints need at all (27B = 48 GDN + 16 full-attn layers, 35B = 30 + 10), so
+without it a draft cannot advance and roll back the recurrent GDN state and any
+spec-decode loop would silently produce plausible-but-wrong continuations. Base
+`origin/main` `1e14f60` (rebased to `262fc14`), worktree
+`/home/mudler/_git/wt-i4-gdn-spec`, dgx `~/i4gdn/s-a9840fc`. Codes against I2's
+FROZEN metadata ABI (spec §2.7); CONSUMES `InputBatch::num_accepted_tokens` and
+`SchedulerOutput::scheduled_spec_decode_tokens`, defines neither.
+
+**The mechanism (why there is no rollback code).** Upstream never rolls the GDN
+state back. The recurrence writes a state SNAPSHOT per draft position into a
+per-request array of k+1 slots, and the NEXT step selects its initial slot by the
+accepted count: `initial = state[state_indices[i][num_accepted[i]-1]]`, timestep
+`t` stores to `state[state_indices[i][t]]`. Rejecting at position j is nothing
+but reading slot j next step; because the recurrence is strictly sequential and
+slot j holds the state after exactly j+1 tokens, the surviving state is
+bit-identical to running only the accepted prefix — no copy, no undo.
+
+**Four pieces** (all mirrored at the pin `e24d1b24`):
+1. Metadata split + decode→prefill reclassification —
+   `GDNAttentionMetadataBuilder` (`src/vllm/v1/attention/backends/gdn_attn.cpp`)
+   gains `num_spec`/`use_full_cuda_graph` and a spec `build()` overload; the
+   3-arg override DELEGATES to it (ONE implementation). Mirrors
+   `gdn_attn.py:189-326` + the `:413-462` FULL-cudagraph request-count padding.
+   NULL sentinel is `kNullStateSlot = -1` (RECORDED DEVIATION: our cache slot 0
+   is live, unlike upstream's block-0 null).
+2. `vt::GdnSpecDecode` (`kGdnSpecDecode`, CPU + CUDA) — the `T>1`/`IS_SPEC`
+   recurrence, reusing `GdnDecodeFusedKernel` geometry + arithmetic verbatim
+   (`fla/ops/fused_sigmoid_gating.py:66-72,103-116,156-166`).
+3. `vt::CausalConv1dSpecUpdate` (`kCausalConv1dSpecUpdate`, CPU + CUDA) — the
+   4-tap conv sliding window advancing by the ACCEPTED count, row widened to
+   `(K-1)+k` (`causal_conv1d.py:818-1067,1181-1184`).
+4. `MakeQwen3_5KVCacheSpec(...,num_spec)` — widened conv row + `num_speculative_blocks`
+   (k+1 SSM slots/request via the existing `MambaManager`). The registered
+   builder delegates with `num_spec=0`.
+
+**DEFAULT-OFF INERT.** No `SpeculativeConfig` ⇒ `num_spec==0` ⇒ the identical
+pre-I4 non-spec branch; both spec kernels are NEW op ids so no shipped kernel
+(`GdnDecode`/`GdnPackedDecode`/`CausalConv1dUpdate`/`GdnPrefill`) gained a branch.
+
+**Gates (all green).** RED-first by four reverted experiments (hardwired-0
+metadata 11/20 fail; final-slot snapshot 2 fail; ignore-accepted read 30 fail;
+1+k conv 12 fail). The rollback proof (`tests/vt/test_ops_gdn.cpp`, CPU + CUDA,
+real 27B Hv=48 / 35B Hv=32 dims): reject-at-every-j surviving SSM state and conv
+window memcmp-identical to a shipped-`vt::GdnDecode`/`CausalConv1dUpdate` chain
+over the accepted prefix; T==1/accepted==1 bit-identical to `vt::GdnDecode`; CUDA
+matches CPU across NW={1,2,4,8}. Metadata (`test_gdn_metadata_builder`, 20 cases /
+483 assertions): the whole upstream `GDN_BUILD_TEST_CASES` + reclassification +
+CG-padding + the default-off byte-identity proof. Allocation
+(`test_model_registry`): k+1 slot / `(K-1)+k` conv sizing + `num_spec==0`
+identity. dgx CUDA: clean full `-Werror` 0 warnings (501 objects, `cuda_gdn.cu.o`
+recompiled); `test_ops_gdn` 63/63 (3630), `test_gdn_metadata_builder` 20/20,
+`test_model_registry` spec 1/1; `compute-sanitizer memcheck` on the spec path 0
+errors. **SACRED GDN-bearing gates STANDALONE under `flock $HOME/gpu.lock`: 27B
+235/235, 35B 315/315, Qwen3-Coder 138/138 — all PASS** (MANDATORY re-runs, not
+by-construction). Non-GDN gates (Qwen3-dense, GLM-4/4.7, Gemma 1/2/3, OPT,
+DeepSeek-V2, Llama, Mistral, OLMo-2, Granite-3) byte-identical BY CONSTRUCTION —
+`git diff --stat` touches only the qwen3_5-family GDN metadata/kernels/kv-cache +
+additive op ids. `benchmark_binding=false`, no speed claim.
+
+**MEASURED state-memory cost.** One f32 SSM slot = Hv·Dv·Dk·4B ⇒ **27B 144
+MiB/req** (Hv=48 × 48 GDN layers) / **35B 60 MiB/req** (Hv=32 × 30) per extra
+slot; k=1 DOUBLES the GDN SSM state per in-flight request; the conv row grows by
+only `conv_dim·2B`/block. On GB10's 119 GiB unified pool this is a
+per-concurrency multiplier on GDN state (not weights) — 27B at conc 16 ≈ 2.25 GiB
+extra, within headroom; first-order only at DFlash k=8/16.
+
+**Row states.** `SPEC-GDN-SEGMENTS` `READY` → `ACTIVE` (gets an `ours` cell for
+the first time; not `DONE` — the M-mtp-1 e2e greedy token gate is owed).
+`SPEC-MTP` STAYS `GATING`.
+
+**Resume point for M-mtp-1.** The ops + metadata + allocation exist; the LAYER
+WIRING does not. The verify/propose runner must feed `num_decode_draft_tokens_cpu`
+(−1 sentinel for non-spec rows) into the spec `build()` overload, and the
+qwen3_5 GDN layer-forward (`GdnBlockPaged` in `qwen3_5.cpp`) must route spec rows
+through `vt::GdnSpecDecode` + `vt::CausalConv1dSpecUpdate` mirroring
+`qwen_gdn_linear_attn.py:1344-1356,1455-1476` (the conv/recurrence spec branches
+of `_forward_core`), gated on `meta.num_spec_decodes > 0`.

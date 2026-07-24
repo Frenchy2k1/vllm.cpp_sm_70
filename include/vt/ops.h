@@ -93,10 +93,12 @@ enum class OpId : uint8_t {
   kEmbedding,
   kCausalConv1dFwd,
   kCausalConv1dUpdate,
+  kCausalConv1dSpecUpdate,
   kL2Norm,
   kRmsNormGated,
   kGdnPrefill,
   kGdnDecode,
+  kGdnSpecDecode,
   kGdnPackedDecode,
   kMoeRouterTopK,
   kMoeCombine,
@@ -590,6 +592,12 @@ using GdnPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, con
 using GdnDecodeFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const Tensor&, const Tensor&, Tensor&, const Tensor*,
                              const GdnArgs&);
+using GdnSpecDecodeFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                 const Tensor&, const Tensor&, Tensor&, const Tensor&,
+                                 const Tensor&, const Tensor&, const GdnArgs&);
+using CausalConv1dSpecUpdateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                          const Tensor*, Tensor&, const Tensor&, const Tensor&,
+                                          const Tensor&, const CausalConv1dArgs&);
 using GdnPackedDecodeFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
              const Tensor&, const Tensor&, Tensor&, const Tensor&,
@@ -1366,6 +1374,47 @@ void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& we
                         const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args,
                         const Tensor* conv_state_indices = nullptr);
 
+// SPECULATIVE multi-token conv step (SPEC-MTP I4). Ported from
+// vllm/model_executor/layers/mamba/ops/causal_conv1d.py @ e24d1b24
+// (_causal_conv1d_update_kernel IS_SPEC_DECODING + IS_VARLEN branches
+// :835-1067, wrapper `state_len = width - 1 + (seqlen - 1)` :1181-1184), as
+// called by qwen_gdn_linear_attn.py:1344-1356.
+//
+// A speculative request submits `1 + k` query tokens per step, but only
+// `num_accepted_tokens` of the PREVIOUS step's tokens were actually kept. The
+// conv window must therefore advance by exactly the accepted count, NOT by
+// 1 + k. Upstream does that WITHOUT any rollback copy, by widening the conv
+// state row to `state_len = (K-1) + k` taps and treating it as a sliding
+// window: the read offset for this step is `num_accepted_tokens[i] - 1`.
+//
+//   x            [num_tokens, C] varlen token stream of the SPEC rows only,
+//                request i occupying [cu_seqlens[i], cu_seqlens[i+1]).
+//                May be a padded-row (inner-contiguous) view. Written in place
+//                is NOT done here — `out` is a separate [num_tokens, C] buffer.
+//   conv_state   [num_slots, C, state_len] FULL persistent cache, updated in
+//                place. state_len must be (K-1) + max_query_len - 1.
+//   conv_state_indices [num_reqs] — the slot of each spec row. This is
+//                spec_state_indices_tensor COLUMN 0 only: unlike the SSM state,
+//                the conv window needs no per-timestep slots because the whole
+//                1+k history fits in the widened row (qwen_gdn_linear_attn.py:1350).
+//                Local ABI: index < 0 ⇒ NULL row, skipped (see GdnDecode).
+//   num_accepted_tokens [num_reqs] i32, each in [1, max_query_len].
+//   cu_seqlens   [num_reqs + 1] i32 (upstream query_start_loc).
+//   max_query_len = 1 + k (upstream `max_query_len`, = spec_state_indices.size(-1)).
+//
+// Semantics, per request i and channel c, with off = num_accepted_tokens[i]-1,
+// S = conv_state[slot][c][off : off+K-1] ++ x[i-th row range][c]:
+//   out[t][c] = act(bias[c] + sum_{j<K} w[c][j] * S[t + j])
+//   conv_state[slot][c] <- S[1 : 1 + state_len]      (left-shift by ONE tap)
+// The left-shift-by-one (not by seqlen) is what makes the NEXT step's
+// `off = num_accepted - 1` select exactly the window ending at the last
+// accepted token — i.e. the conv rollback.
+void CausalConv1dSpecUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                            const Tensor* bias, Tensor& conv_state,
+                            const Tensor& conv_state_indices,
+                            const Tensor& num_accepted_tokens, const Tensor& cu_seqlens,
+                            const CausalConv1dArgs& args);
+
 // Rowwise l2 normalization over the LAST dim (gdn-semantics.md §4, upstream
 // l2norm_fwd): y = x * rsqrt(sum(x^2) + eps). Plain SUM, not mean — this is
 // not an rmsnorm. x/out rank 2 or 3 ([rows, D] or [T, H, D]); f32 math.
@@ -1410,6 +1459,45 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
                const Tensor* state_idx = nullptr);
+
+// SPECULATIVE gated-delta-rule step (SPEC-MTP I4) — the multi-token (T>1),
+// slot-snapshotting variant of GdnDecode. Ported from
+// vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py @ e24d1b24
+// (fused_recurrent_gated_delta_rule_fwd_kernel, IS_VARLEN :66-72 +
+// IS_SPEC_DECODING initial-state select :103-116 + INPLACE_FINAL_STATE
+// per-timestep snapshot :156-166), as called by
+// qwen_gdn_linear_attn.py:1455-1476.
+//
+// THE MECHANISM (why there is no rollback code anywhere). A speculative step
+// runs 1+k query positions for a request, but a later verify may reject some of
+// them. Instead of undoing the state, the kernel WRITES A SNAPSHOT PER
+// TIMESTEP into a per-request array of k+1 state slots, and the NEXT step
+// SELECTS its initial slot by the accepted count:
+//
+//   initial state  = state[ state_indices[i][ num_accepted_tokens[i] - 1 ] ]
+//   after token t  → stored to state[ state_indices[i][t] ]      (t = 0..T-1)
+//
+// Rejecting at position j is therefore nothing but reading slot j next step.
+// Because the recurrence is strictly sequential and slot j is written with the
+// state after exactly j+1 tokens, the surviving state is BIT-IDENTICAL to
+// running only the accepted prefix — no copy, no undo, no drift.
+//
+//   q_in/k       [num_tokens, Hk, Dk] ALREADY l2-normalized (like GdnDecode)
+//   v            [num_tokens, Hv, Dv]
+//   g/beta       [num_tokens, Hv] f32 (log-decay / sigmoid(b))
+//   state        [num_slots, Hv, Dv, Dk] FULL persistent cache, in place
+//   cu_seqlens   [num_reqs + 1] i32 — request i owns tokens
+//                [cu_seqlens[i], cu_seqlens[i+1]) of the (already gathered)
+//                spec token stream. Upstream spec_query_start_loc.
+//   state_indices [num_reqs, num_cols] i32 ROW-MAJOR, num_cols == k+1.
+//                Upstream spec_state_indices_tensor. Local ABI: an entry < 0 is
+//                a NULL slot — a NULL INITIAL slot skips the request entirely
+//                (output zeroed), a NULL timestep slot skips only that store.
+//   num_accepted_tokens [num_reqs] i32, each in [1, num_cols].
+void GdnSpecDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
+                   const Tensor& g, const Tensor& beta, Tensor& state, const Tensor& cu_seqlens,
+                   const Tensor& state_indices, const Tensor& num_accepted_tokens,
+                   const GdnArgs& args);
 
 // Pure non-spec packed decode, ported from vLLM v0.25.0
 // vllm/model_executor/layers/fla/ops/fused_recurrent.py:255-478 @ 702f4814.

@@ -36,9 +36,30 @@ inline constexpr ModelInfo kQwen3_5Info{
 void ParseQwen3_5Config(const HfConfig& config);
 
 // KV-cache spec builder — identical for the dense and MoE variants (both are the
-// same hybrid full-attention + GDN/Mamba layout).
+// same hybrid full-attention + GDN/Mamba layout). This is the `KVCacheSpecBuilder`
+// registered in the model factory, so its signature is fixed; it delegates with
+// num_spec == 0 (no speculative decoding), the production default.
 v1::KVCacheConfig MakeQwen3_5KVCache(const HfConfig& config, int block_size,
                                      int num_blocks);
+
+// Speculative-decoding-aware variant (SPEC-MTP I4). `num_spec` is the resolved
+// `num_speculative_tokens` (k); 0 reproduces MakeQwen3_5KVCache exactly. Mirrors
+// vllm/model_executor/models/qwen3_5.py:524-543 (`num_spec` from the
+// SpeculativeConfig) plus mamba_utils.py:213-234 and mamba/abstract.py:55-59:
+//
+//   * conv_state row grows to `conv_kernel_size - 1 + num_spec` taps
+//     (mamba_utils.py:226) — the sliding window vt::CausalConv1dSpecUpdate
+//     advances by the ACCEPTED count. The conv needs no extra SLOTS.
+//   * MambaSpec::num_speculative_blocks = num_spec (abstract.py:55-59), which
+//     makes MambaManager allocate k+1 state blocks per request
+//     (single_type_kv_cache_manager.py:1206-1215) — the k+1 SSM snapshot slots
+//     the spec kernel writes, one per draft position.
+//
+// MEMORY: one SSM slot is Hv*Dv*Dk*4B per GDN layer, so k=1 DOUBLES the GDN SSM
+// state per in-flight request (27B: ~144 MiB/request/slot over 48 GDN layers;
+// 35B: ~60 MiB over 30). This is inherent to vLLM's scheme; we mirror it.
+v1::KVCacheConfig MakeQwen3_5KVCacheSpec(const HfConfig& config, int block_size,
+                                         int num_blocks, int num_spec);
 
 // Wraps a host logits vector into a ForwardLogits (rows inferred from vocab).
 ForwardLogits HostLogits(std::vector<float>&& host, int64_t vocab);

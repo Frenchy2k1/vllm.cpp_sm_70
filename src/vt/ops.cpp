@@ -1493,6 +1493,73 @@ void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& we
       q, out, x, weight, bias, conv_state, conv_state_indices, args);
 }
 
+void CausalConv1dSpecUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                            const Tensor* bias, Tensor& conv_state,
+                            const Tensor& conv_state_indices,
+                            const Tensor& num_accepted_tokens, const Tensor& cu_seqlens,
+                            const CausalConv1dArgs& args) {
+  constexpr const char* name = "causal_conv1d_spec_update";
+  // Same contract as CheckConvCommon EXCEPT the state width: a speculative row
+  // carries the sliding window (K-1) + (max_query_len - 1) taps
+  // (causal_conv1d.py:1181-1184), not K-1.
+  VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 2 && conv_state.rank == 3,
+           std::string(name) + ": x/out [T,C], weight [C,K], conv_state [N,C,state_len]");
+  const int64_t c = x.shape[1], k = weight.shape[1];
+  const int64_t state_len = conv_state.shape[2];
+  VT_CHECK(out.shape[0] == x.shape[0] && out.shape[1] == c,
+           std::string(name) + ": out shape must match x");
+  VT_CHECK(weight.shape[0] == c, std::string(name) + ": weight channel dim mismatch");
+  VT_CHECK(k >= 2, std::string(name) + ": kernel width must be >= 2");
+  VT_CHECK(conv_state.shape[1] == c && state_len >= k - 1,
+           std::string(name) + ": conv_state must be [N,C,state_len>=K-1]");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float x/weight, f32/bf16 out");
+  VT_CHECK(conv_state.dtype == DType::kF32 ||
+               (conv_state.dtype == DType::kBF16 && q.device.type == DeviceType::kCUDA),
+           std::string(name) + ": conv_state must be f32, or bf16 on CUDA");
+  VT_CHECK(x.stride[1] == 1 && x.stride[0] >= c && out.IsContiguous() &&
+               weight.IsContiguous() && conv_state.IsContiguous(),
+           std::string(name) +
+               ": out/weight/conv_state contiguous; x rows inner-contiguous");
+  VT_CHECK(x.device == q.device && out.device == q.device && weight.device == q.device &&
+               conv_state.device == q.device,
+           std::string(name) + ": device mismatch (x/out/weight/conv_state/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == c && IsFloat(bias->dtype) &&
+                 bias->IsContiguous() && bias->device == q.device,
+             std::string(name) + ": bias must be float [C] contiguous on the queue device");
+  }
+  VT_CHECK(cu_seqlens.rank == 1 && cu_seqlens.shape[0] >= 2, std::string(name) +
+               ": cu_seqlens must be i32 [num_reqs + 1]");
+  const int64_t num_reqs = cu_seqlens.shape[0] - 1;
+  CheckI32Meta(q, cu_seqlens, num_reqs + 1, name, "cu_seqlens");
+  CheckI32Meta(q, conv_state_indices, num_reqs, name, "conv_state_indices");
+  CheckI32Meta(q, num_accepted_tokens, num_reqs, name, "num_accepted_tokens");
+  // max_query_len is implied by the state width: state_len = (K-1) + (mql - 1).
+  const int64_t max_query_len = state_len - (k - 1) + 1;
+  VT_CHECK(max_query_len >= 1,
+           std::string(name) + ": conv_state width too small for a spec step");
+  if (q.device.type == DeviceType::kCPU) {
+    const int32_t* cs = cu_seqlens.Ptr<int32_t>();
+    const int32_t* nat = num_accepted_tokens.Ptr<int32_t>();
+    const int32_t* idx = conv_state_indices.Ptr<int32_t>();
+    VT_CHECK(cs[0] == 0 && cs[num_reqs] == x.shape[0],
+             std::string(name) + ": bad cu_seqlens bounds");
+    for (int64_t i = 0; i < num_reqs; ++i) {
+      VT_CHECK(cs[i + 1] >= cs[i] && cs[i + 1] - cs[i] <= max_query_len,
+               std::string(name) + ": query length exceeds the conv window");
+      VT_CHECK(nat[i] >= 1 && nat[i] <= max_query_len,
+               std::string(name) + ": num_accepted_tokens out of range");
+      VT_CHECK(idx[i] < conv_state.shape[0],
+               std::string(name) + ": conv_state_indices out of range");
+    }
+  }
+  reinterpret_cast<CausalConv1dSpecUpdateFn>(
+      GetOp(OpId::kCausalConv1dSpecUpdate, q.device.type))(
+      q, out, x, weight, bias, conv_state, conv_state_indices, num_accepted_tokens,
+      cu_seqlens, args);
+}
+
 void L2Norm(Queue& q, Tensor& out, const Tensor& x, const L2NormArgs& args) {
   VT_CHECK(x.rank == 2 || x.rank == 3, "l2norm: rank 2 or 3 required");
   VT_CHECK(out.rank == x.rank, "l2norm: out rank must match x");
@@ -1570,6 +1637,47 @@ void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const
   }
   reinterpret_cast<GdnDecodeFn>(GetOp(OpId::kGdnDecode, q.device.type))(
       q, out, q_in, k, v, g, beta, state, state_idx, args);
+}
+
+void GdnSpecDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
+                   const Tensor& g, const Tensor& beta, Tensor& state, const Tensor& cu_seqlens,
+                   const Tensor& state_indices, const Tensor& num_accepted_tokens,
+                   const GdnArgs& args) {
+  constexpr const char* name = "gdn_spec_decode";
+  CheckGdnCommon(q, out, q_in, k, v, g, beta, state, args, name,
+                 /*allow_compressed_state=*/true);
+  VT_CHECK(state_indices.rank == 2 && state_indices.dtype == DType::kI32 &&
+               state_indices.IsContiguous() && state_indices.device == q.device,
+           std::string(name) + ": state_indices must be i32 [num_reqs, num_cols] contiguous");
+  const int64_t num_reqs = state_indices.shape[0];
+  const int64_t num_cols = state_indices.shape[1];
+  VT_CHECK(num_cols >= 1, std::string(name) + ": state_indices needs >= 1 column");
+  CheckI32Meta(q, cu_seqlens, num_reqs + 1, name, "cu_seqlens");
+  CheckI32Meta(q, num_accepted_tokens, num_reqs, name, "num_accepted_tokens");
+  VT_CHECK(state.shape[0] >= 1, std::string(name) + ": state cache must be non-empty");
+  if (q.device.type == DeviceType::kCPU) {
+    // CPU can validate the engine-owned index metadata without a sync; the CUDA
+    // kernel keeps its own per-slot bounds guard instead (no capture-breaking
+    // D2H). Mirrors the GdnPackedDecode contract.
+    const int32_t* cs = cu_seqlens.Ptr<int32_t>();
+    const int32_t* nat = num_accepted_tokens.Ptr<int32_t>();
+    const int32_t* idx = state_indices.Ptr<int32_t>();
+    VT_CHECK(cs[0] == 0 && cs[num_reqs] == q_in.shape[0],
+             std::string(name) + ": bad cu_seqlens bounds");
+    for (int64_t i = 0; i < num_reqs; ++i) {
+      VT_CHECK(cs[i + 1] >= cs[i] && cs[i + 1] - cs[i] <= num_cols,
+               std::string(name) + ": query length exceeds the spec slot count");
+      VT_CHECK(nat[i] >= 1 && nat[i] <= num_cols,
+               std::string(name) + ": num_accepted_tokens out of range");
+      for (int64_t c = 0; c < num_cols; ++c) {
+        VT_CHECK(idx[i * num_cols + c] < state.shape[0],
+                 std::string(name) + ": state_indices out of range");
+      }
+    }
+  }
+  reinterpret_cast<GdnSpecDecodeFn>(GetOp(OpId::kGdnSpecDecode, q.device.type))(
+      q, out, q_in, k, v, g, beta, state, cu_seqlens, state_indices, num_accepted_tokens,
+      args);
 }
 
 void GdnPackedDecode(Queue& q, Tensor& out, const Tensor& mixed_qkv,

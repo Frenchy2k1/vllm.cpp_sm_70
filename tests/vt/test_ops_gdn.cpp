@@ -3490,3 +3490,724 @@ TEST_CASE("CUDA gdn Triton bf16 chunk_o dispatch and same-stream pools reuse dir
   setenv("VT_GDN_CHUNKED", "1", 1);
 }
 #endif
+
+// ===========================================================================
+// SPECULATIVE GDN ops (SPEC-MTP I4): vt::GdnSpecDecode and
+// vt::CausalConv1dSpecUpdate. Ported from
+// vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py @ e24d1b24
+// (fused_recurrent_gated_delta_rule_fwd_kernel, IS_SPEC_DECODING +
+// INPLACE_FINAL_STATE, :103-170) and
+// vllm/model_executor/layers/mamba/ops/causal_conv1d.py @ e24d1b24
+// (_causal_conv1d_update_kernel, IS_SPEC_DECODING, :818-1067). Upstream has no
+// dedicated unit test for either (they are covered e2e), so the cases below are
+// written against the ROLLBACK INVARIANT the mechanism exists to provide, and
+// the reference is the already-gated non-spec production op on the SAME device:
+//
+//   selecting slot j next step == running ONLY the first j+1 tokens natively
+//
+// "Natively" = a chain of vt::GdnDecode (resp. vt::CausalConv1dUpdate) calls,
+// one token at a time. Those ops share the per-token arithmetic with the spec
+// kernels character for character (same accumulation order, same reduction
+// structure, same libm on a given device), so the comparison is BIT-EXACT, not
+// approximate — a rollback that merely "looks reasonable" fails these cases.
+// ===========================================================================
+
+namespace {
+
+// Real gate-checkpoint GDN dims (config.json, verified on dgx.casa):
+//   35B nvidia--Qwen3.6-35B-A3B-NVFP4: linear_num_key_heads 16,
+//       linear_num_value_heads 32, linear_{key,value}_head_dim 128,
+//       linear_conv_kernel_dim 4
+//   27B unsloth--Qwen3.6-27B-NVFP4:    linear_num_key_heads 16,
+//       linear_num_value_heads 48, same head dims and conv width
+struct GdnDims {
+  int64_t hk, hv, dk, dv, kw;
+  const char* name;
+};
+constexpr GdnDims kGate35B{16, 32, 128, 128, 4, "35B (Hv=32)"};
+constexpr GdnDims kGate27B{16, 48, 128, 128, 4, "27B (Hv=48)"};
+
+Tensor F32At(std::vector<float>& v, size_t offset, const std::vector<int64_t>& shape) {
+  return MakeT(v.data() + offset, DType::kF32, Cpu(), shape);
+}
+Tensor I32At(std::vector<int32_t>& v, const std::vector<int64_t>& shape) {
+  return MakeT(v.data(), DType::kI32, Cpu(), shape);
+}
+
+// Bit-exact vector comparison (no tolerance at all).
+void CheckBitExact(const std::vector<float>& got, const std::vector<float>& want,
+                   const char* what) {
+  REQUIRE(got.size() == want.size());
+  size_t bad = 0, first_bad = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) {
+      if (bad == 0) first_bad = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    CAPTURE(what);
+    CAPTURE(bad);
+    CAPTURE(first_bad);
+    CAPTURE(got[first_bad]);
+    CAPTURE(want[first_bad]);
+  }
+  CHECK(bad == 0);
+}
+
+// One speculative token batch: q/k [T,Hk,Dk], v [T,Hv,Dv], g/beta [T,Hv].
+struct SpecTokens {
+  std::vector<float> q, k, v, g, beta;
+};
+
+SpecTokens MakeSpecTokens(const GdnDims& d, int64_t t, uint32_t seed) {
+  SpecTokens s;
+  s.q = RandomF32(static_cast<size_t>(t * d.hk * d.dk), seed, -1.0f, 1.0f);
+  s.k = RandomF32(static_cast<size_t>(t * d.hk * d.dk), seed + 1, -1.0f, 1.0f);
+  s.v = RandomF32(static_cast<size_t>(t * d.hv * d.dv), seed + 2, -1.0f, 1.0f);
+  // g is a LOG decay (always <= 0 upstream: -exp(A_log) * softplus(...)).
+  s.g = RandomF32(static_cast<size_t>(t * d.hv), seed + 3, -1.5f, -0.05f);
+  s.beta = RandomF32(static_cast<size_t>(t * d.hv), seed + 4, 0.05f, 0.95f);
+  return s;
+}
+
+// The NATIVE reference: run `count` tokens of `tok` (starting at token `from`)
+// one at a time through the shipped non-spec vt::GdnDecode, carrying a compact
+// [1,Hv,Dv,Dk] state. Returns the per-token post-state snapshots and outputs.
+struct NativeChain {
+  std::vector<std::vector<float>> state_after;  // [count][Hv*Dv*Dk]
+  std::vector<float> out;                       // [count*Hv*Dv]
+};
+
+NativeChain RunNativeChain(Queue& q, const GdnDims& d, const SpecTokens& tok, int64_t from,
+                           int64_t count, const std::vector<float>& initial_state, float scale) {
+  NativeChain c;
+  std::vector<float> st = initial_state;
+  c.out.assign(static_cast<size_t>(count * d.hv * d.dv), 0.0f);
+  SpecTokens t1 = tok;  // mutable copies so the views below are non-const
+  for (int64_t i = 0; i < count; ++i) {
+    const int64_t t = from + i;
+    Tensor tq = F32At(t1.q, static_cast<size_t>(t * d.hk * d.dk), {1, d.hk, d.dk});
+    Tensor tk = F32At(t1.k, static_cast<size_t>(t * d.hk * d.dk), {1, d.hk, d.dk});
+    Tensor tv = F32At(t1.v, static_cast<size_t>(t * d.hv * d.dv), {1, d.hv, d.dv});
+    Tensor tg = F32At(t1.g, static_cast<size_t>(t * d.hv), {1, d.hv});
+    Tensor tb = F32At(t1.beta, static_cast<size_t>(t * d.hv), {1, d.hv});
+    Tensor ts = F32At(st, 0, {1, d.hv, d.dv, d.dk});
+    Tensor to = F32At(c.out, static_cast<size_t>(i * d.hv * d.dv), {1, d.hv, d.dv});
+    vt::GdnDecode(q, to, tq, tk, tv, tg, tb, ts, GdnArgs{scale});
+    c.state_after.push_back(st);
+  }
+  return c;
+}
+
+// Runs ONE speculative step for a single request over `t` tokens, on a cache of
+// `t` slots (columns 0..t-1 of the request's spec_state_indices row).
+void RunSpecStep(Queue& q, const GdnDims& d, SpecTokens& tok, int64_t t,
+                 std::vector<float>& cache, int32_t num_accepted, std::vector<float>& out,
+                 float scale) {
+  std::vector<int32_t> cu = {0, static_cast<int32_t>(t)};
+  std::vector<int32_t> idx(static_cast<size_t>(t));
+  for (int64_t c = 0; c < t; ++c) idx[static_cast<size_t>(c)] = static_cast<int32_t>(c);
+  std::vector<int32_t> nat = {num_accepted};
+  Tensor tq = F32At(tok.q, 0, {t, d.hk, d.dk});
+  Tensor tk = F32At(tok.k, 0, {t, d.hk, d.dk});
+  Tensor tv = F32At(tok.v, 0, {t, d.hv, d.dv});
+  Tensor tg = F32At(tok.g, 0, {t, d.hv});
+  Tensor tb = F32At(tok.beta, 0, {t, d.hv});
+  Tensor ts = F32At(cache, 0, {t, d.hv, d.dv, d.dk});
+  Tensor to = F32At(out, 0, {t, d.hv, d.dv});
+  Tensor tcu = Ti(cu);
+  Tensor tidx = I32At(idx, {1, t});
+  Tensor tnat = Ti(nat);
+  vt::GdnSpecDecode(q, to, tq, tk, tv, tg, tb, ts, tcu, tidx, tnat, GdnArgs{scale});
+}
+
+std::vector<float> SlotOf(const std::vector<float>& cache, const GdnDims& d, int64_t slot) {
+  const size_t row = static_cast<size_t>(d.hv * d.dv * d.dk);
+  return std::vector<float>(cache.begin() + static_cast<std::ptrdiff_t>(slot * row),
+                            cache.begin() + static_cast<std::ptrdiff_t>((slot + 1) * row));
+}
+
+}  // namespace
+
+// The degenerate case: one token, accepted count 1. The spec kernel must be
+// BIT-IDENTICAL to the shipped vt::GdnDecode — this is what makes "spec on" a
+// pure superset rather than a second numerical path.
+TEST_CASE("gdn spec decode: T=1 accepted=1 is bit-identical to gdn decode") {
+  const GdnDims d{2, 4, 8, 8, 4, "small"};
+  const float scale = 1.0f / std::sqrt(static_cast<float>(d.dk));
+  SpecTokens tok = MakeSpecTokens(d, 1, 909);
+  const std::vector<float> h0 =
+      RandomF32(static_cast<size_t>(d.hv * d.dv * d.dk), 910, -0.5f, 0.5f);
+
+  Queue q = Q();
+  const NativeChain native = RunNativeChain(q, d, tok, 0, 1, h0, scale);
+
+  std::vector<float> cache = h0;  // one slot
+  std::vector<float> out(static_cast<size_t>(d.hv * d.dv), 0.0f);
+  RunSpecStep(q, d, tok, 1, cache, /*num_accepted=*/1, out, scale);
+
+  CheckBitExact(out, native.out, "output");
+  CheckBitExact(cache, native.state_after[0], "state");
+}
+
+// ── THE ROLLBACK PROOF (write side). Advance the GDN state over 1+k draft
+// positions, then assert that EVERY per-timestep snapshot slot j is
+// BIT-IDENTICAL to the state produced by running only tokens 0..j natively.
+// Rejecting at position j is exactly "read slot j", so this is the rollback. ──
+TEST_CASE("gdn spec decode: per-timestep snapshots are bit-exact prefix states") {
+  for (const GdnDims& d : {kGate35B, kGate27B}) {
+    CAPTURE(d.name);
+    for (const int64_t k : {1, 3}) {  // k=1 is vLLM's MTP default; k=3 stresses it
+      CAPTURE(k);
+      const int64_t t = k + 1;
+      const float scale = 1.0f / std::sqrt(static_cast<float>(d.dk));
+      SpecTokens tok = MakeSpecTokens(d, t, 4200 + static_cast<uint32_t>(k) * 17);
+      const std::vector<float> h0 = RandomF32(
+          static_cast<size_t>(d.hv * d.dv * d.dk), 4300 + static_cast<uint32_t>(k), -0.5f, 0.5f);
+
+      Queue q = Q();
+      // Ground truth: t independent single-token native decodes from h0.
+      const NativeChain native = RunNativeChain(q, d, tok, 0, t, h0, scale);
+
+      // Spec step: cache has t = k+1 slots; the initial state sits in the slot
+      // named by column num_accepted-1 == 0.
+      std::vector<float> cache(static_cast<size_t>(t * d.hv * d.dv * d.dk), 0.0f);
+      std::copy(h0.begin(), h0.end(), cache.begin());
+      std::vector<float> out(static_cast<size_t>(t * d.hv * d.dv), 0.0f);
+      RunSpecStep(q, d, tok, t, cache, /*num_accepted=*/1, out, scale);
+
+      CheckBitExact(out, native.out, "spec outputs vs native chain");
+      for (int64_t j = 0; j < t; ++j) {
+        CAPTURE(j);
+        // Slot j must be the state after exactly j+1 tokens — i.e. what a
+        // rejection at position j leaves behind.
+        CheckBitExact(SlotOf(cache, d, j), native.state_after[static_cast<size_t>(j)],
+                      "snapshot slot vs native accepted-prefix state");
+      }
+    }
+  }
+}
+
+// ── THE ROLLBACK PROOF (read side). For EVERY possible rejection point
+// j in [0..k], run a SECOND speculative step with num_accepted = j+1 and assert
+// that its outputs and its own snapshots are bit-identical to a native chain
+// that processed only the accepted prefix of step 1 and then step 2's tokens.
+// This is the equivalence I4 exists to guarantee. ──
+TEST_CASE("gdn spec decode: reject-at-every-j equals the native accepted-prefix run") {
+  for (const GdnDims& d : {kGate35B, kGate27B}) {
+    CAPTURE(d.name);
+    const int64_t k = 3;
+    const int64_t t = k + 1;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(d.dk));
+    SpecTokens step1 = MakeSpecTokens(d, t, 5100);
+    SpecTokens step2 = MakeSpecTokens(d, t, 5200);
+    const std::vector<float> h0 =
+        RandomF32(static_cast<size_t>(d.hv * d.dv * d.dk), 5300, -0.5f, 0.5f);
+    Queue q = Q();
+
+    // Step 1 (all k drafts proposed; nothing decided yet).
+    std::vector<float> cache1(static_cast<size_t>(t * d.hv * d.dv * d.dk), 0.0f);
+    std::copy(h0.begin(), h0.end(), cache1.begin());
+    std::vector<float> out1(static_cast<size_t>(t * d.hv * d.dv), 0.0f);
+    RunSpecStep(q, d, step1, t, cache1, /*num_accepted=*/1, out1, scale);
+
+    for (int64_t j = 0; j < t; ++j) {  // reject after accepting j+1 of step 1
+      CAPTURE(j);
+      const int32_t accepted = static_cast<int32_t>(j + 1);
+
+      // NATIVE ground truth: only the accepted prefix of step 1 ever happened.
+      const NativeChain acc = RunNativeChain(q, d, step1, 0, j + 1, h0, scale);
+      const NativeChain native2 =
+          RunNativeChain(q, d, step2, 0, t, acc.state_after[static_cast<size_t>(j)], scale);
+
+      std::vector<float> cache2 = cache1;  // the cache as step 1 left it
+      std::vector<float> out2(static_cast<size_t>(t * d.hv * d.dv), 0.0f);
+      RunSpecStep(q, d, step2, t, cache2, accepted, out2, scale);
+
+      CheckBitExact(out2, native2.out, "step-2 outputs after rejecting at j");
+      for (int64_t s = 0; s < t; ++s) {
+        CAPTURE(s);
+        CheckBitExact(SlotOf(cache2, d, s), native2.state_after[static_cast<size_t>(s)],
+                      "step-2 snapshot after rejecting at j");
+      }
+    }
+  }
+}
+
+// Local cache ABI corners: a NULL initial slot skips the request (zeroing its
+// output rows), and a zero-length row is a no-op.
+TEST_CASE("gdn spec decode: NULL slot skips the request; zero-length row is inert") {
+  const GdnDims d{1, 2, 4, 4, 4, "tiny"};
+  const int64_t t = 2;
+  const float scale = 0.5f;
+  SpecTokens tok = MakeSpecTokens(d, t, 6100);
+  const size_t row = static_cast<size_t>(d.hv * d.dv * d.dk);
+  std::vector<float> cache(2 * row, 7.0f);  // canary
+  std::vector<float> out(static_cast<size_t>(t * d.hv * d.dv), -1.0f);
+  Queue q = Q();
+
+  std::vector<int32_t> cu = {0, static_cast<int32_t>(t)};
+  std::vector<int32_t> idx = {-1, 1};  // column 0 (the initial column) is NULL
+  std::vector<int32_t> nat = {1};
+  Tensor tq = F32At(tok.q, 0, {t, d.hk, d.dk});
+  Tensor tk = F32At(tok.k, 0, {t, d.hk, d.dk});
+  Tensor tv = F32At(tok.v, 0, {t, d.hv, d.dv});
+  Tensor tg = F32At(tok.g, 0, {t, d.hv});
+  Tensor tb = F32At(tok.beta, 0, {t, d.hv});
+  Tensor ts = F32At(cache, 0, {2, d.hv, d.dv, d.dk});
+  Tensor to = F32At(out, 0, {t, d.hv, d.dv});
+  Tensor tcu = Ti(cu);
+  Tensor tidx = I32At(idx, {1, 2});
+  Tensor tnat = Ti(nat);
+  vt::GdnSpecDecode(q, to, tq, tk, tv, tg, tb, ts, tcu, tidx, tnat, GdnArgs{scale});
+  for (const float o : out) CHECK(o == 0.0f);
+  for (const float s : cache) CHECK(s == 7.0f);  // cache untouched
+
+  // Zero-length row: nothing read, nothing written.
+  std::vector<int32_t> cu0 = {0, 0};
+  std::vector<int32_t> idx0 = {0, 1};
+  Tensor tq0 = F32At(tok.q, 0, {0, d.hk, d.dk});
+  Tensor tk0 = F32At(tok.k, 0, {0, d.hk, d.dk});
+  Tensor tv0 = F32At(tok.v, 0, {0, d.hv, d.dv});
+  Tensor tg0 = F32At(tok.g, 0, {0, d.hv});
+  Tensor tb0 = F32At(tok.beta, 0, {0, d.hv});
+  Tensor to0 = F32At(out, 0, {0, d.hv, d.dv});
+  Tensor tcu0 = Ti(cu0);
+  Tensor tidx0 = I32At(idx0, {1, 2});
+  vt::GdnSpecDecode(q, to0, tq0, tk0, tv0, tg0, tb0, ts, tcu0, tidx0, tnat, GdnArgs{scale});
+  for (const float s : cache) CHECK(s == 7.0f);
+}
+
+TEST_CASE("gdn spec decode: rejects a bad accepted count / slot index") {
+  const GdnDims d{1, 1, 4, 4, 4, "tiny"};
+  SpecTokens tok = MakeSpecTokens(d, 2, 6200);
+  std::vector<float> cache(2 * static_cast<size_t>(d.hv * d.dv * d.dk), 0.0f);
+  std::vector<float> out(static_cast<size_t>(2 * d.hv * d.dv), 0.0f);
+  Queue q = Q();
+  Tensor tq = F32At(tok.q, 0, {2, d.hk, d.dk});
+  Tensor tk = F32At(tok.k, 0, {2, d.hk, d.dk});
+  Tensor tv = F32At(tok.v, 0, {2, d.hv, d.dv});
+  Tensor tg = F32At(tok.g, 0, {2, d.hv});
+  Tensor tb = F32At(tok.beta, 0, {2, d.hv});
+  Tensor ts = F32At(cache, 0, {2, d.hv, d.dv, d.dk});
+  Tensor to = F32At(out, 0, {2, d.hv, d.dv});
+  std::vector<int32_t> cu = {0, 2};
+  Tensor tcu = Ti(cu);
+  std::vector<int32_t> idx = {0, 1};
+  Tensor tidx = I32At(idx, {1, 2});
+  std::vector<int32_t> bad_hi = {3};  // > num_cols
+  Tensor tbad_hi = Ti(bad_hi);
+  CHECK_THROWS_AS(
+      vt::GdnSpecDecode(q, to, tq, tk, tv, tg, tb, ts, tcu, tidx, tbad_hi, GdnArgs{0.5f}),
+      std::runtime_error);
+  std::vector<int32_t> zero = {0};
+  Tensor tzero = Ti(zero);
+  CHECK_THROWS_AS(
+      vt::GdnSpecDecode(q, to, tq, tk, tv, tg, tb, ts, tcu, tidx, tzero, GdnArgs{0.5f}),
+      std::runtime_error);
+  std::vector<int32_t> oor = {0, 99};  // slot beyond the cache
+  Tensor toor = I32At(oor, {1, 2});
+  std::vector<int32_t> one = {1};
+  Tensor tone = Ti(one);
+  CHECK_THROWS_AS(
+      vt::GdnSpecDecode(q, to, tq, tk, tv, tg, tb, ts, tcu, toor, tone, GdnArgs{0.5f}),
+      std::runtime_error);
+}
+
+// ── CONV ROLLBACK PROOF. The 4-tap causal conv window must advance by exactly
+// the ACCEPTED count, not by 1+k. Upstream does that with one widened row
+// (state_len = (K-1) + k) shifted left by a single tap per step, read at offset
+// num_accepted-1. Reference: a chain of the shipped single-token
+// vt::CausalConv1dUpdate over the accepted prefix, on a compact [C,K-1] row. ──
+TEST_CASE("causal_conv1d spec update: window advances by exactly the accepted count") {
+  for (const GdnDims& d : {kGate35B, kGate27B}) {
+    CAPTURE(d.name);
+    const int64_t k = 3;                 // draft count
+    const int64_t t = k + 1;             // query tokens per step
+    const int64_t kw = d.kw;             // conv width (4)
+    const int64_t width = kw - 1;        // compact taps
+    const int64_t state_len = width + k;  // widened spec row
+    const int64_t c_dim = 2 * d.hk * d.dk + d.hv * d.dv;
+    Queue q = Q();
+
+    std::vector<float> w = RandomF32(static_cast<size_t>(c_dim * kw), 7100, -0.5f, 0.5f);
+    std::vector<float> bias = RandomF32(static_cast<size_t>(c_dim), 7101, -0.2f, 0.2f);
+    std::vector<float> x1 = RandomF32(static_cast<size_t>(t * c_dim), 7102, -1.0f, 1.0f);
+    std::vector<float> x2 = RandomF32(static_cast<size_t>(t * c_dim), 7103, -1.0f, 1.0f);
+    // Widened spec row, one slot. Column 0 is the initial read (accepted == 1).
+    std::vector<float> spec_row =
+        RandomF32(static_cast<size_t>(c_dim * state_len), 7104, -1.0f, 1.0f);
+    // The equivalent compact row the native chain starts from: the K-1 taps the
+    // widened row exposes at read offset 0.
+    std::vector<float> compact0(static_cast<size_t>(c_dim * width), 0.0f);
+    for (int64_t c = 0; c < c_dim; ++c)
+      for (int64_t j = 0; j < width; ++j)
+        compact0[static_cast<size_t>(c * width + j)] =
+            spec_row[static_cast<size_t>(c * state_len + j)];
+
+    Tensor tw = F32At(w, 0, {c_dim, kw});
+    Tensor tbias = F32At(bias, 0, {c_dim});
+
+    // NATIVE chain over all t tokens of step 1: per-token outputs and the
+    // compact row after each token.
+    std::vector<float> native_out(static_cast<size_t>(t * c_dim), 0.0f);
+    std::vector<std::vector<float>> native_row_after;
+    {
+      std::vector<float> row = compact0;
+      for (int64_t i = 0; i < t; ++i) {
+        Tensor tx = F32At(x1, static_cast<size_t>(i * c_dim), {1, c_dim});
+        Tensor to = F32At(native_out, static_cast<size_t>(i * c_dim), {1, c_dim});
+        Tensor ts = F32At(row, 0, {1, c_dim, width});
+        vt::CausalConv1dUpdate(q, to, tx, tw, &tbias, ts, CausalConv1dArgs{true});
+        native_row_after.push_back(row);
+      }
+    }
+
+    // SPEC step 1 over the same t tokens.
+    std::vector<float> row1 = spec_row;
+    std::vector<float> spec_out(static_cast<size_t>(t * c_dim), 0.0f);
+    {
+      std::vector<int32_t> cu = {0, static_cast<int32_t>(t)};
+      std::vector<int32_t> idx = {0};
+      std::vector<int32_t> nat = {1};
+      Tensor tx = F32At(x1, 0, {t, c_dim});
+      Tensor to = F32At(spec_out, 0, {t, c_dim});
+      Tensor ts = F32At(row1, 0, {1, c_dim, state_len});
+      Tensor tcu = Ti(cu), tidx = Ti(idx), tnat = Ti(nat);
+      vt::CausalConv1dSpecUpdate(q, to, tx, tw, &tbias, ts, tidx, tnat, tcu,
+                                 CausalConv1dArgs{true});
+    }
+    CheckBitExact(spec_out, native_out, "conv spec outputs vs native chain");
+
+    // The widened row read at offset j must expose EXACTLY the compact window a
+    // native chain over j+1 accepted tokens would hold.
+    for (int64_t j = 0; j < t; ++j) {
+      CAPTURE(j);
+      std::vector<float> got(static_cast<size_t>(c_dim * width));
+      for (int64_t c = 0; c < c_dim; ++c)
+        for (int64_t i = 0; i < width; ++i)
+          got[static_cast<size_t>(c * width + i)] =
+              row1[static_cast<size_t>(c * state_len + j + i)];
+      CheckBitExact(got, native_row_after[static_cast<size_t>(j)],
+                    "conv window at accepted-j vs native compact row");
+    }
+
+    // Read side: a second spec step at every possible accepted count must
+    // reproduce the native continuation bit for bit.
+    for (int64_t j = 0; j < t; ++j) {
+      CAPTURE(j);
+      std::vector<float> native2(static_cast<size_t>(t * c_dim), 0.0f);
+      {
+        std::vector<float> row = native_row_after[static_cast<size_t>(j)];
+        for (int64_t i = 0; i < t; ++i) {
+          Tensor tx = F32At(x2, static_cast<size_t>(i * c_dim), {1, c_dim});
+          Tensor to = F32At(native2, static_cast<size_t>(i * c_dim), {1, c_dim});
+          Tensor ts = F32At(row, 0, {1, c_dim, width});
+          vt::CausalConv1dUpdate(q, to, tx, tw, &tbias, ts, CausalConv1dArgs{true});
+        }
+      }
+      std::vector<float> row2 = row1;
+      std::vector<float> spec2(static_cast<size_t>(t * c_dim), 0.0f);
+      std::vector<int32_t> cu = {0, static_cast<int32_t>(t)};
+      std::vector<int32_t> idx = {0};
+      std::vector<int32_t> nat = {static_cast<int32_t>(j + 1)};
+      Tensor tx = F32At(x2, 0, {t, c_dim});
+      Tensor to = F32At(spec2, 0, {t, c_dim});
+      Tensor ts = F32At(row2, 0, {1, c_dim, state_len});
+      Tensor tcu = Ti(cu), tidx = Ti(idx), tnat = Ti(nat);
+      vt::CausalConv1dSpecUpdate(q, to, tx, tw, &tbias, ts, tidx, tnat, tcu,
+                                 CausalConv1dArgs{true});
+      CheckBitExact(spec2, native2, "conv step-2 outputs after rejecting at j");
+    }
+  }
+}
+
+TEST_CASE("causal_conv1d spec update: NULL slot and zero-length rows are inert") {
+  const int64_t c_dim = 4, kw = 4, width = kw - 1, k = 1;
+  const int64_t state_len = width + k;
+  Queue q = Q();
+  std::vector<float> w = RandomF32(static_cast<size_t>(c_dim * kw), 7300);
+  std::vector<float> x = RandomF32(static_cast<size_t>(4 * c_dim), 7301);
+  std::vector<float> row(static_cast<size_t>(2 * c_dim * state_len), 3.0f);
+  std::vector<float> out(static_cast<size_t>(4 * c_dim), -1.0f);
+  Tensor tw = F32At(w, 0, {c_dim, kw});
+  Tensor ts = F32At(row, 0, {2, c_dim, state_len});
+  // req0: NULL slot over 2 tokens; req1: zero-length.
+  std::vector<int32_t> cu = {0, 2, 2};
+  std::vector<int32_t> idx = {-1, 1};
+  std::vector<int32_t> nat = {1, 1};
+  Tensor tx = F32At(x, 0, {2, c_dim});
+  Tensor to = F32At(out, 0, {2, c_dim});
+  Tensor tcu = Ti(cu), tidx = Ti(idx), tnat = Ti(nat);
+  vt::CausalConv1dSpecUpdate(q, to, tx, tw, nullptr, ts, tidx, tnat, tcu,
+                             CausalConv1dArgs{true});
+  for (const float s : row) CHECK(s == 3.0f);
+  for (int64_t i = 0; i < 2 * c_dim; ++i) CHECK(out[static_cast<size_t>(i)] == -1.0f);
+}
+
+#ifdef VLLM_CPP_CUDA
+// ── CUDA spec-decode parity. Two references, both meaningful:
+//   (1) BIT-EXACT vs the shipped vt::GdnDecode chain ON THE SAME DEVICE. Same
+//       kernel body, same shfl reduction structure, same device libm — so any
+//       difference would be a real defect in the spec slot/loop logic, not
+//       rounding. This is the bit-exactness bar for the rollback claim, and it
+//       is run at the REAL 27B/35B GDN dims (Hv 48/32, Dk=Dv=128).
+//   (2) CLOSE vs the CPU reference, at the tolerances every other CUDA-vs-CPU
+//       GDN case in this file uses (different libm exp + FMA contraction make
+//       cross-device bit-exactness unattainable for any f32 recurrence).
+namespace {
+
+struct SpecCudaCase {
+  GdnDims d;
+  int64_t k;
+};
+
+// Runs one spec step on CUDA. `cache` is [slots,Hv,Dv,Dk] f32 host data,
+// updated in place from the device result.
+void RunSpecStepCuda(Backend& b, Queue& q, const GdnDims& d, const SpecTokens& tok, int64_t t,
+                     std::vector<float>& cache, const std::vector<int32_t>& state_idx,
+                     int32_t num_accepted, std::vector<float>& out, float scale) {
+  const int64_t slots = static_cast<int64_t>(cache.size() / static_cast<size_t>(d.hv * d.dv * d.dk));
+  DeviceTensor dq(b, q, DType::kF32, {t, d.hk, d.dk}, tok.q.data());
+  DeviceTensor dk_(b, q, DType::kF32, {t, d.hk, d.dk}, tok.k.data());
+  DeviceTensor dv(b, q, DType::kF32, {t, d.hv, d.dv}, tok.v.data());
+  DeviceTensor dg(b, q, DType::kF32, {t, d.hv}, tok.g.data());
+  DeviceTensor db(b, q, DType::kF32, {t, d.hv}, tok.beta.data());
+  DeviceTensor ds(b, q, DType::kF32, {slots, d.hv, d.dv, d.dk}, cache.data());
+  DeviceTensor dout(b, q, DType::kF32, {t, d.hv, d.dv});
+  std::vector<int32_t> cu = {0, static_cast<int32_t>(t)};
+  std::vector<int32_t> nat = {num_accepted};
+  const int64_t cols = static_cast<int64_t>(state_idx.size());
+  DeviceTensor dcu(b, q, DType::kI32, {2}, cu.data());
+  DeviceTensor didx(b, q, DType::kI32, {1, cols}, state_idx.data());
+  DeviceTensor dnat(b, q, DType::kI32, {1}, nat.data());
+  vt::GdnSpecDecode(q, dout.tensor(), dq.tensor(), dk_.tensor(), dv.tensor(), dg.tensor(),
+                    db.tensor(), ds.tensor(), dcu.tensor(), didx.tensor(), dnat.tensor(),
+                    GdnArgs{scale});
+  b.Synchronize(q);
+  ds.Download(q, cache.data());
+  dout.Download(q, out.data());
+}
+
+// Native CUDA reference: a chain of single-token vt::GdnDecode calls on a
+// compact [1,Hv,Dv,Dk] device state.
+NativeChain RunNativeChainCuda(Backend& b, Queue& q, const GdnDims& d, const SpecTokens& tok,
+                               int64_t from, int64_t count,
+                               const std::vector<float>& initial_state, float scale) {
+  NativeChain c;
+  std::vector<float> st = initial_state;
+  c.out.assign(static_cast<size_t>(count * d.hv * d.dv), 0.0f);
+  DeviceTensor ds(b, q, DType::kF32, {1, d.hv, d.dv, d.dk}, st.data());
+  for (int64_t i = 0; i < count; ++i) {
+    const int64_t t = from + i;
+    DeviceTensor dq(b, q, DType::kF32, {1, d.hk, d.dk}, tok.q.data() + t * d.hk * d.dk);
+    DeviceTensor dk_(b, q, DType::kF32, {1, d.hk, d.dk}, tok.k.data() + t * d.hk * d.dk);
+    DeviceTensor dv(b, q, DType::kF32, {1, d.hv, d.dv}, tok.v.data() + t * d.hv * d.dv);
+    DeviceTensor dg(b, q, DType::kF32, {1, d.hv}, tok.g.data() + t * d.hv);
+    DeviceTensor db(b, q, DType::kF32, {1, d.hv}, tok.beta.data() + t * d.hv);
+    DeviceTensor dout(b, q, DType::kF32, {1, d.hv, d.dv});
+    vt::GdnDecode(q, dout.tensor(), dq.tensor(), dk_.tensor(), dv.tensor(), dg.tensor(),
+                  db.tensor(), ds.tensor(), GdnArgs{scale});
+    b.Synchronize(q);
+    dout.Download(q, c.out.data() + i * d.hv * d.dv);
+    ds.Download(q, st.data());
+    c.state_after.push_back(st);
+  }
+  return c;
+}
+
+}  // namespace
+
+// ROLLBACK PROOF on the GPU, at the real gate-checkpoint GDN dims: every
+// per-timestep snapshot slot is BIT-IDENTICAL to the shipped decode kernel's
+// state after exactly that many tokens, and a second step at every possible
+// rejection point reproduces the native accepted-prefix continuation bit for bit.
+TEST_CASE("CUDA gdn spec decode: snapshots + reject-at-every-j are bit-exact vs GdnDecode") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  for (const SpecCudaCase& cs : {SpecCudaCase{kGate35B, 1}, SpecCudaCase{kGate27B, 3}}) {
+    CAPTURE(cs.d.name);
+    CAPTURE(cs.k);
+    const GdnDims& d = cs.d;
+    const int64_t t = cs.k + 1;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(d.dk));
+    SpecTokens step1 = MakeSpecTokens(d, t, 8100 + static_cast<uint32_t>(cs.k));
+    SpecTokens step2 = MakeSpecTokens(d, t, 8200 + static_cast<uint32_t>(cs.k));
+    const std::vector<float> h0 =
+        RandomF32(static_cast<size_t>(d.hv * d.dv * d.dk), 8300, -0.5f, 0.5f);
+    std::vector<int32_t> idx(static_cast<size_t>(t));
+    for (int64_t c = 0; c < t; ++c) idx[static_cast<size_t>(c)] = static_cast<int32_t>(c);
+
+    const NativeChain native = RunNativeChainCuda(gpu, gq.q, d, step1, 0, t, h0, scale);
+
+    std::vector<float> cache1(static_cast<size_t>(t * d.hv * d.dv * d.dk), 0.0f);
+    std::copy(h0.begin(), h0.end(), cache1.begin());
+    std::vector<float> out1(static_cast<size_t>(t * d.hv * d.dv), 0.0f);
+    RunSpecStepCuda(gpu, gq.q, d, step1, t, cache1, idx, /*num_accepted=*/1, out1, scale);
+
+    CheckBitExact(out1, native.out, "CUDA spec outputs vs CUDA GdnDecode chain");
+    for (int64_t j = 0; j < t; ++j) {
+      CAPTURE(j);
+      CheckBitExact(SlotOf(cache1, d, j), native.state_after[static_cast<size_t>(j)],
+                    "CUDA snapshot slot vs native accepted-prefix state");
+    }
+
+    for (int64_t j = 0; j < t; ++j) {  // reject after accepting j+1
+      CAPTURE(j);
+      const NativeChain acc = RunNativeChainCuda(gpu, gq.q, d, step1, 0, j + 1, h0, scale);
+      const NativeChain native2 = RunNativeChainCuda(
+          gpu, gq.q, d, step2, 0, t, acc.state_after[static_cast<size_t>(j)], scale);
+      std::vector<float> cache2 = cache1;
+      std::vector<float> out2(static_cast<size_t>(t * d.hv * d.dv), 0.0f);
+      RunSpecStepCuda(gpu, gq.q, d, step2, t, cache2, idx, static_cast<int32_t>(j + 1), out2,
+                      scale);
+      CheckBitExact(out2, native2.out, "CUDA step-2 outputs after rejecting at j");
+      for (int64_t s = 0; s < t; ++s) {
+        CAPTURE(s);
+        CheckBitExact(SlotOf(cache2, d, s), native2.state_after[static_cast<size_t>(s)],
+                      "CUDA step-2 snapshot after rejecting at j");
+      }
+    }
+  }
+}
+
+// CUDA vs the CPU reference kernel, and across the NW (warps-per-block) lever —
+// NW only changes how the Dk contraction is split, so every setting must agree
+// with the single-warp reference within f32 reduction-order noise.
+TEST_CASE("CUDA gdn spec decode matches the CPU reference across the NW lever") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  const GdnDims d = kGate35B;
+  const int64_t k = 3, t = k + 1;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(d.dk));
+  SpecTokens tok = MakeSpecTokens(d, t, 8500);
+  const std::vector<float> h0 =
+      RandomF32(static_cast<size_t>(d.hv * d.dv * d.dk), 8600, -0.5f, 0.5f);
+  std::vector<int32_t> idx(static_cast<size_t>(t));
+  for (int64_t c = 0; c < t; ++c) idx[static_cast<size_t>(c)] = static_cast<int32_t>(c);
+
+  // CPU reference, accepted = 2 (a real mid-batch rejection point).
+  std::vector<float> cpu_cache(static_cast<size_t>(t * d.hv * d.dv * d.dk), 0.0f);
+  std::copy(h0.begin(), h0.end(),
+            cpu_cache.begin() + static_cast<std::ptrdiff_t>(1 * d.hv * d.dv * d.dk));
+  std::vector<float> cpu_out(static_cast<size_t>(t * d.hv * d.dv), 0.0f);
+  {
+    Queue cq = Q();
+    SpecTokens tk = tok;
+    std::vector<int32_t> cu = {0, static_cast<int32_t>(t)};
+    std::vector<int32_t> nat = {2};
+    std::vector<int32_t> id = idx;
+    Tensor tq = F32At(tk.q, 0, {t, d.hk, d.dk});
+    Tensor tkk = F32At(tk.k, 0, {t, d.hk, d.dk});
+    Tensor tv = F32At(tk.v, 0, {t, d.hv, d.dv});
+    Tensor tg = F32At(tk.g, 0, {t, d.hv});
+    Tensor tb = F32At(tk.beta, 0, {t, d.hv});
+    Tensor ts = F32At(cpu_cache, 0, {t, d.hv, d.dv, d.dk});
+    Tensor to = F32At(cpu_out, 0, {t, d.hv, d.dv});
+    Tensor tcu = Ti(cu), tidx = I32At(id, {1, t}), tnat = Ti(nat);
+    vt::GdnSpecDecode(cq, to, tq, tkk, tv, tg, tb, ts, tcu, tidx, tnat, GdnArgs{scale});
+  }
+
+  for (const char* nw : {"1", "2", "4", "8"}) {
+    CAPTURE(nw);
+    setenv("VT_GDN_DECODE_NW", nw, 1);
+    std::vector<float> cache(static_cast<size_t>(t * d.hv * d.dv * d.dk), 0.0f);
+    std::copy(h0.begin(), h0.end(),
+              cache.begin() + static_cast<std::ptrdiff_t>(1 * d.hv * d.dv * d.dk));
+    std::vector<float> out(static_cast<size_t>(t * d.hv * d.dv), 0.0f);
+    RunSpecStepCuda(gpu, gq.q, d, tok, t, cache, idx, /*num_accepted=*/2, out, scale);
+    CheckClose(out, cpu_out, 1e-5f, 1e-5f);
+    CheckClose(cache, cpu_cache, 1e-5f, 1e-5f);
+  }
+  unsetenv("VT_GDN_DECODE_NW");
+}
+
+// The CUDA conv spec update against the CPU reference and against a chain of the
+// shipped single-token vt::CausalConv1dUpdate (bit-exact on the same device).
+TEST_CASE("CUDA causal_conv1d spec update matches CPU and the native update chain") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  const GdnDims d = kGate27B;
+  const int64_t k = 3, t = k + 1, kw = d.kw, width = kw - 1, state_len = width + k;
+  const int64_t c_dim = 2 * d.hk * d.dk + d.hv * d.dv;
+
+  std::vector<float> w = RandomF32(static_cast<size_t>(c_dim * kw), 8700, -0.5f, 0.5f);
+  std::vector<float> bias = RandomF32(static_cast<size_t>(c_dim), 8701, -0.2f, 0.2f);
+  std::vector<float> x = RandomF32(static_cast<size_t>(t * c_dim), 8702, -1.0f, 1.0f);
+  std::vector<float> row0 = RandomF32(static_cast<size_t>(c_dim * state_len), 8703, -1.0f, 1.0f);
+  std::vector<int32_t> cu = {0, static_cast<int32_t>(t)};
+  std::vector<int32_t> idx = {0};
+  std::vector<int32_t> nat = {2};  // a real rejection point
+
+  // CPU reference.
+  std::vector<float> cpu_row = row0, cpu_out(static_cast<size_t>(t * c_dim), 0.0f);
+  {
+    Queue cq = Q();
+    std::vector<float> ww = w, bb = bias, xx = x;
+    std::vector<int32_t> c1 = cu, i1 = idx, n1 = nat;
+    Tensor tw = F32At(ww, 0, {c_dim, kw}), tb = F32At(bb, 0, {c_dim});
+    Tensor tx = F32At(xx, 0, {t, c_dim}), to = F32At(cpu_out, 0, {t, c_dim});
+    Tensor ts = F32At(cpu_row, 0, {1, c_dim, state_len});
+    Tensor tcu = Ti(c1), tidx = Ti(i1), tnat = Ti(n1);
+    vt::CausalConv1dSpecUpdate(cq, to, tx, tw, &tb, ts, tidx, tnat, tcu, CausalConv1dArgs{true});
+  }
+
+  std::vector<float> gpu_row = row0, gpu_out(static_cast<size_t>(t * c_dim), 0.0f);
+  {
+    DeviceTensor dw(gpu, gq.q, DType::kF32, {c_dim, kw}, w.data());
+    DeviceTensor db(gpu, gq.q, DType::kF32, {c_dim}, bias.data());
+    DeviceTensor dx(gpu, gq.q, DType::kF32, {t, c_dim}, x.data());
+    DeviceTensor dout(gpu, gq.q, DType::kF32, {t, c_dim});
+    DeviceTensor ds(gpu, gq.q, DType::kF32, {1, c_dim, state_len}, row0.data());
+    DeviceTensor dcu(gpu, gq.q, DType::kI32, {2}, cu.data());
+    DeviceTensor didx(gpu, gq.q, DType::kI32, {1}, idx.data());
+    DeviceTensor dnat(gpu, gq.q, DType::kI32, {1}, nat.data());
+    Tensor bt = db.tensor();
+    vt::CausalConv1dSpecUpdate(gq.q, dout.tensor(), dx.tensor(), dw.tensor(), &bt, ds.tensor(),
+                               didx.tensor(), dnat.tensor(), dcu.tensor(),
+                               CausalConv1dArgs{true});
+    gpu.Synchronize(gq.q);
+    ds.Download(gq.q, gpu_row.data());
+    dout.Download(gq.q, gpu_out.data());
+  }
+  CheckClose(gpu_out, cpu_out, 1e-5f, 1e-5f);
+  CheckClose(gpu_row, cpu_row, 1e-6f, 1e-6f);
+
+  // Bit-exact on the GPU against the shipped single-token update chain, started
+  // from the compact window the widened row exposes at offset num_accepted-1.
+  std::vector<float> native_out(static_cast<size_t>(t * c_dim), 0.0f);
+  {
+    std::vector<float> compact(static_cast<size_t>(c_dim * width), 0.0f);
+    for (int64_t c = 0; c < c_dim; ++c)
+      for (int64_t j = 0; j < width; ++j)
+        compact[static_cast<size_t>(c * width + j)] =
+            row0[static_cast<size_t>(c * state_len + (nat[0] - 1) + j)];
+    DeviceTensor dw(gpu, gq.q, DType::kF32, {c_dim, kw}, w.data());
+    DeviceTensor db(gpu, gq.q, DType::kF32, {c_dim}, bias.data());
+    DeviceTensor ds(gpu, gq.q, DType::kF32, {1, c_dim, width}, compact.data());
+    Tensor bt = db.tensor();
+    for (int64_t i = 0; i < t; ++i) {
+      DeviceTensor dx(gpu, gq.q, DType::kF32, {1, c_dim}, x.data() + i * c_dim);
+      DeviceTensor dout(gpu, gq.q, DType::kF32, {1, c_dim});
+      vt::CausalConv1dUpdate(gq.q, dout.tensor(), dx.tensor(), dw.tensor(), &bt, ds.tensor(),
+                             CausalConv1dArgs{true});
+      gpu.Synchronize(gq.q);
+      dout.Download(gq.q, native_out.data() + i * c_dim);
+    }
+  }
+  CheckBitExact(gpu_out, native_out, "CUDA conv spec outputs vs native update chain");
+}
+#endif  // VLLM_CPP_CUDA

@@ -3328,3 +3328,23 @@ BYTE-IDENTICAL signature (same prompt, token index, engine token id and anchor
 id), so the engine tokens are unchanged by this work and the drift is
 pre-existing golden staleness owned elsewhere. Full CPU ctest 232/238 with zero
 new failures.
+
+**`SPEC-GDN-SEGMENTS` I4 - GDN speculative slot path and state rollback
+(2026-07-24, [spec](../.agents/specs/mtp-spec-decode.md) §3/§4).**
+**Benchmark disposition: NOT APPLICABLE - no measurement, no speed credit
+claimed (`benchmark_binding=false`).** I4 lands the piece both gate checkpoints
+need for speculative decoding at all (both are GDN hybrids: 48 of 64 layers on
+the 27B, 30 of 40 on the 35B): the spec/non-spec metadata split with the
+decode-to-prefill reclassification, the `T>1`/`IS_SPEC` GDN recurrence with
+per-timestep state snapshots, the conv sliding window that advances by the
+ACCEPTED count, and the k+1 state-slot allocation. It is DEFAULT-OFF and INERT:
+without a `SpeculativeConfig` the builder's `num_spec` is 0, `spec_sequence_masks`
+is never populated, `num_spec_decodes` stays 0, and no shipped kernel gained a
+branch - both spec kernels are NEW op ids with their own entry points. No
+throughput, TPOT or acceptance-rate number is claimed: the honest denominator is
+vLLM with the SAME speculative config, and that A/B is owed by the M-mtp-1 e2e
+gate, which keeps `SPEC-MTP` at `GATING`.
+
+Correctness evidence is recorded in the I4 measured-evidence entry below once the
+gate run completes; the reproduction entry point is
+`ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/i4gdn/s-<sha> && ./build/tests/test_ops_gdn && ./build/tests/test_gdn_metadata_builder"'`.

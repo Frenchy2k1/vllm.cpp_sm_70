@@ -1001,6 +1001,76 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
   });
 }
 
+// SPECULATIVE causal_conv1d_update (SPEC-MTP I4). Ported from
+// vllm/model_executor/layers/mamba/ops/causal_conv1d.py @ e24d1b24
+// (_causal_conv1d_update_kernel, IS_SPEC_DECODING + IS_VARLEN branches
+// :818-1067). The conv row is the widened sliding window
+// state_len = (K-1) + (max_query_len - 1); the read offset is
+// num_accepted_tokens[i] - 1 (:835-852) and the row is shifted left by exactly
+// ONE tap per step (:889-896, `idx_tokens + 1` under IS_SPEC_DECODING), which is
+// what makes the NEXT step's offset select the window ending at the last
+// ACCEPTED token. This is the executable reference for the CUDA kernel.
+void CausalConv1dSpecUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
+                                  const Tensor* bias, Tensor& conv_state,
+                                  const Tensor& conv_state_indices,
+                                  const Tensor& num_accepted_tokens,
+                                  const Tensor& cu_seqlens,
+                                  const CausalConv1dArgs& args) {
+  const int64_t c_dim = x.shape[1], k = w.shape[1], width = k - 1;
+  const int64_t state_len = conv_state.shape[2];
+  const int64_t x_rs = x.stride[0];
+  const int64_t num_reqs = cu_seqlens.shape[0] - 1;
+  const int32_t* cs = cu_seqlens.Ptr<int32_t>();
+  const int32_t* nat = num_accepted_tokens.Ptr<int32_t>();
+  const int32_t* cache_idx = conv_state_indices.Ptr<int32_t>();
+  // Row-chunked over (request, channel): each pair owns its own conv_state row
+  // slice and its own output column across the request's tokens.
+  ForRows(num_reqs * c_dim, [&](int64_t r0, int64_t r1) {
+    std::vector<float> win;
+    std::vector<float> next(static_cast<size_t>(state_len));
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t i = r / c_dim, c = r % c_dim;
+      if (cache_idx[i] < 0) continue;  // NULL slot
+      const int64_t lo = cs[i], hi = cs[i + 1];
+      const int64_t seqlen = hi - lo;
+      if (seqlen == 0) continue;  // zero-length padded row (:832-833)
+      const int64_t off = static_cast<int64_t>(nat[i]) - 1;
+      float* srow = conv_state.Ptr<float>() +
+                    (static_cast<int64_t>(cache_idx[i]) * c_dim + c) * state_len;
+      // S = old_state[off .. off+width-1] ++ x[lo .. hi-1]: the conv window
+      // stream this step reads (:863-880 col0..col4 preload + the per-token x
+      // load at :1019-1021).
+      win.assign(static_cast<size_t>(width + seqlen), 0.0f);
+      for (int64_t j = 0; j < width; ++j) {
+        const int64_t src = off + j;
+        win[static_cast<size_t>(j)] = src < state_len ? srow[src] : 0.0f;
+      }
+      for (int64_t t = 0; t < seqlen; ++t) {
+        win[static_cast<size_t>(width + t)] = LoadF32(x, (lo + t) * x_rs + c);
+      }
+      for (int64_t t = 0; t < seqlen; ++t) {
+        float acc = bias != nullptr ? LoadF32(*bias, c) : 0.0f;
+        for (int64_t j = 0; j < k; ++j) {
+          acc += LoadF32(w, c * k + j) * win[static_cast<size_t>(t + j)];
+        }
+        StoreF32(out, (lo + t) * c_dim + c, args.silu_activation ? Silu(acc) : acc);
+      }
+      // New row = old_state[off+1 .. off+(state_len-seqlen)] ++ x[lo..hi-1]
+      // (:889-908 `new_conv_state = where(mask, conv_state, loaded_x)` with the
+      // IS_SPEC_DECODING source offset `off + idx_tokens + 1`).
+      const int64_t keep = state_len - seqlen;
+      for (int64_t j = 0; j < keep; ++j) {
+        const int64_t src = off + j + 1;
+        next[static_cast<size_t>(j)] = src < state_len ? srow[src] : 0.0f;
+      }
+      for (int64_t t = 0; t < seqlen; ++t) {
+        next[static_cast<size_t>(keep + t)] = LoadF32(x, (lo + t) * x_rs + c);
+      }
+      for (int64_t j = 0; j < state_len; ++j) srow[j] = next[static_cast<size_t>(j)];
+    }
+  });
+}
+
 // §4 l2norm_fwd: y = x * rsqrt(sum(x^2) + eps) over the last dim (plain SUM).
 void L2NormKernel(Queue&, Tensor& out, const Tensor& x, const L2NormArgs& args) {
   const int64_t d = x.shape[x.rank - 1];
@@ -1205,6 +1275,71 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, c
     float* s_state = state.Ptr<float>() + srow * hv_n * dv * dk;
     GdnTokenStep(out, q_in, k, v, g, beta, s_state, bt, args.scale, qbuf, kbuf, vbuf);
   }
+  });
+}
+
+// SPECULATIVE (multi-token, slot-snapshotting) gated-delta-rule step.
+// Ported from vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py @
+// e24d1b24 — fused_recurrent_gated_delta_rule_fwd_kernel with IS_VARLEN
+// (:66-72), IS_SPEC_DECODING (the initial-slot select :103-116) and
+// INPLACE_FINAL_STATE (the per-timestep snapshot :156-166) all True, which is
+// exactly how qwen_gdn_linear_attn.py:1455-1476 calls it.
+//
+// This is the executable CPU reference the CUDA kernel is checked against, and
+// the ground truth for the rollback-equivalence test: because the recurrence is
+// strictly sequential and slot t receives the state after exactly t+1 tokens,
+// selecting slot j next step IS running only the first j+1 tokens.
+void GdnSpecDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k,
+                         const Tensor& v, const Tensor& g, const Tensor& beta,
+                         Tensor& state, const Tensor& cu_seqlens,
+                         const Tensor& state_indices,
+                         const Tensor& num_accepted_tokens, const GdnArgs& args) {
+  const int64_t hv_n = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  const int64_t hk_n = q_in.shape[1];
+  const int64_t ratio = hv_n / hk_n;
+  const int64_t num_reqs = state_indices.shape[0];
+  const int64_t num_cols = state_indices.shape[1];
+  const int64_t row_elems = hv_n * dv * dk;
+  const int32_t* cs = cu_seqlens.Ptr<int32_t>();
+  const int32_t* nat = num_accepted_tokens.Ptr<int32_t>();
+  const int32_t* sidx = state_indices.Ptr<int32_t>();
+  // Row-chunked over (request, value-head): each item owns a disjoint
+  // [Dv,Dk] state block in every slot of its request's row, and disjoint
+  // output rows. The in-request recurrence stays sequential in t.
+  ForRows(num_reqs * hv_n, [&](int64_t r0, int64_t r1) {
+    std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
+        vbuf(static_cast<size_t>(dv));
+    std::vector<float> head(static_cast<size_t>(dv * dk));
+    for (int64_t item = r0; item < r1; ++item) {
+      const int64_t i = item / hv_n;
+      const int64_t hv = item % hv_n;
+      const int64_t hk = hv / ratio;
+      const int64_t lo = cs[i], hi = cs[i + 1];
+      // Initial state slot = column (num_accepted - 1) — the snapshot taken
+      // after the last ACCEPTED token of the previous step (:106-116).
+      const int32_t init_slot = sidx[i * num_cols + (nat[i] - 1)];
+      if (init_slot < 0) {  // NULL slot ⇒ skip the whole request (:114-115)
+        for (int64_t t = lo; t < hi; ++t)
+          for (int64_t d = 0; d < dv; ++d)
+            StoreF32(out, (t * hv_n + hv) * dv + d, 0.0f);
+        continue;
+      }
+      if (hi == lo) continue;  // T == 0 early-out (:76-78)
+      float* s_head = head.data();
+      const int64_t base = static_cast<int64_t>(init_slot) * row_elems + hv * dv * dk;
+      for (int64_t e = 0; e < dv * dk; ++e)
+        s_head[e] = LoadF32(state, base + e);
+      for (int64_t t = lo; t < hi; ++t) {
+        GdnHeadTokenStep(out, q_in, k, v, g, beta, s_head, t, hv, hk, hk_n, hv_n, dk, dv,
+                         args.scale, qbuf, kbuf, vbuf);
+        // Snapshot AFTER this timestep into its own slot (:156-166). A NULL
+        // column skips only its store, leaving that slot untouched.
+        const int32_t slot = sidx[i * num_cols + (t - lo)];
+        if (slot < 0) continue;
+        const int64_t dst = static_cast<int64_t>(slot) * row_elems + hv * dv * dk;
+        for (int64_t e = 0; e < dv * dk; ++e) StoreF32(state, dst + e, s_head[e]);
+      }
+    }
   });
 }
 
@@ -1937,6 +2072,9 @@ struct Registrar {
     RegisterOp(
         OpId::kCausalConv1dUpdate, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<CausalConv1dUpdateFn>(&CausalConv1dUpdateKernel)));
+    RegisterOp(OpId::kCausalConv1dSpecUpdate, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<CausalConv1dSpecUpdateFn>(
+                   &CausalConv1dSpecUpdateKernel)));
     RegisterOp(OpId::kL2Norm, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<L2NormFn>(&L2NormKernel)));
     RegisterOp(OpId::kRmsNormGated, DeviceType::kCPU,
@@ -1949,6 +2087,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernel)));
+    RegisterOp(
+        OpId::kGdnSpecDecode, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<GdnSpecDecodeFn>(&GdnSpecDecodeKernel)));
     RegisterOp(
         OpId::kGdnPackedDecode, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<GdnPackedDecodeFn>(
