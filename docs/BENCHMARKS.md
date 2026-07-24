@@ -3371,3 +3371,24 @@ gate, which keeps `SPEC-MTP` at `GATING`.
 Correctness evidence is recorded in the I4 measured-evidence entry below once the
 gate run completes; the reproduction entry point is
 `ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/i4gdn/s-<sha> && ./build/tests/test_ops_gdn && ./build/tests/test_gdn_metadata_builder"'`.
+
+**`SPEC-MTP` I5a - GDN layer spec routing + runner spec-metadata upload
+(2026-07-24, [spec](../.agents/specs/mtp-spec-decode.md) §5, `CLAIM-SPEC-MTP-I5A`).**
+**Benchmark disposition: NOT APPLICABLE - no measurement, no speed credit
+claimed (`benchmark_binding=false`).** I5a is the first sub-increment of the
+scoped M-mtp-1 (I5a GDN layer wiring -> I5b prepare_prefill -> I5c MTP paged
+propose -> I5d config + runner loop + the 27B token gate). It wires
+`GdnBlockPaged`'s `num_spec_decodes>0` branch to route a PURE-spec batch through
+`vt::CausalConv1dSpecUpdate` + `vt::GdnSpecDecode`, and extends the runner's
+per-step upload (`StepDevInputs`/`BuildStepDevInputs` + the two decode-graph
+`Refresh` copies) to carry I4's six spec device tensors. It is DEFAULT-OFF and
+INERT: `num_spec_decodes==0` on every production step (config cannot enable spec
+until I5d) keeps the uploads stubbed and takes the identical non-spec branch, so
+the engine is byte-identical. No throughput/TPOT/acceptance number is claimed:
+the honest denominator is vLLM with the SAME speculative config, owed by the
+M-mtp-1 e2e gate at I5d, which keeps `SPEC-MTP` at `GATING`. Correctness: the
+spec branch is BIT-EXACT vs the I4 ops applied as a token-sequential decode chain
+at the real 27B/35B GDN dims (Hv 48/32, Dk=Dv 128), RED-first proven; MANDATORY
+spec-off SACRED gates re-run under flock (27B 235/235, 35B 315/315, Coder
+138/138). Reproduction:
+`ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/work/vllm.cpp-i5a && ./build/tests/test_qwen3_5_gdn_spec_routing"'`.

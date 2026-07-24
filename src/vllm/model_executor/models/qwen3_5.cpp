@@ -143,24 +143,85 @@ void detail::ValidateGdnAttentionMetadata(
   const int64_t np = metadata.num_prefills;
   const int64_t nd_tok = metadata.num_decode_tokens;
   const int64_t np_tok = metadata.num_prefill_tokens;
+  // Spec-decode segmentation (SPEC-MTP I5a). ns == 0 on every production step —
+  // the default path validated below is byte-identical to pre-I5a.
+  const int64_t ns = metadata.num_spec_decodes;
+  const int64_t ns_tok = metadata.num_spec_decode_tokens;
   const int64_t nreq = nd + np;
 
   VT_CHECK(nd >= 0 && np >= 0 && nd_tok >= 0 && np_tok >= 0 &&
-               metadata.num_actual_tokens >= 0,
+               ns >= 0 && ns_tok >= 0 && metadata.num_actual_tokens >= 0,
            "qwen3_5: negative GDN metadata count");
-  VT_CHECK(metadata.num_spec_decodes == 0 &&
-               metadata.num_spec_decode_tokens == 0,
-           "qwen3_5: speculative GDN metadata is not implemented");
   VT_CHECK(nd_tok == nd,
            "qwen3_5: non-spec decode requires one token per request");
-  VT_CHECK(metadata.num_actual_tokens == nd_tok + np_tok,
-           "qwen3_5: GDN decode+prefill tokens must equal actual tokens");
+  VT_CHECK(metadata.num_actual_tokens == nd_tok + np_tok + ns_tok,
+           "qwen3_5: GDN decode+prefill+spec tokens must equal actual tokens");
 
-  if (nreq == 0) {
+  // ── Spec metadata validation (SPEC-MTP I5a; mirrors the gdn_attn.py build()
+  // spec contract, src/vllm/v1/attention/backends/gdn_attn.cpp:181-276). Runs
+  // only when the step actually carries drafts; on the default path (ns == 0)
+  // none of it executes. ──
+  if (ns > 0) {
+    const int64_t num_cols = metadata.spec_state_indices_num_cols;
+    VT_CHECK(num_cols >= 1,
+             "qwen3_5: spec GDN state slot column count must be >= 1");
+    VT_CHECK(metadata.spec_state_indices_tensor.has_value() &&
+                 metadata.spec_query_start_loc.has_value() &&
+                 metadata.spec_sequence_masks.has_value() &&
+                 metadata.spec_token_indx.has_value() &&
+                 metadata.num_accepted_tokens.has_value(),
+             "qwen3_5: incomplete spec GDN metadata");
+    const std::vector<int32_t>& ssi = *metadata.spec_state_indices_tensor;
+    const std::vector<int32_t>& sqsl = *metadata.spec_query_start_loc;
+    const std::vector<int32_t>& nat = *metadata.num_accepted_tokens;
+    const std::vector<int32_t>& stx = *metadata.spec_token_indx;
+    VT_CHECK(static_cast<int64_t>(ssi.size()) == ns * num_cols,
+             "qwen3_5: spec_state_indices_tensor must be [num_spec_decodes, "
+             "num_spec+1]");
+    VT_CHECK(static_cast<int64_t>(sqsl.size()) == ns + 1,
+             "qwen3_5: spec_query_start_loc must be [num_spec_decodes + 1]");
+    VT_CHECK(static_cast<int64_t>(nat.size()) == ns,
+             "qwen3_5: num_accepted_tokens must be [num_spec_decodes]");
+    VT_CHECK(static_cast<int64_t>(stx.size()) == ns_tok,
+             "qwen3_5: spec_token_indx must be [num_spec_decode_tokens]");
+    VT_CHECK(sqsl.front() == 0 && sqsl.back() == ns_tok,
+             "qwen3_5: spec query offsets must span the spec tokens");
+    for (int64_t i = 0; i < ns; ++i) {
+      VT_CHECK(sqsl[static_cast<size_t>(i + 1)] > sqsl[static_cast<size_t>(i)],
+               "qwen3_5: spec query offsets must be strictly increasing");
+      const int32_t acc = nat[static_cast<size_t>(i)];
+      VT_CHECK(acc >= 1 && acc <= num_cols,
+               "qwen3_5: num_accepted_tokens must be in [1, num_spec + 1]");
+      // The INITIAL-state slot (column num_accepted-1) must be a live slot in
+      // range; per-timestep snapshot slots may be null (< 0) only under padding.
+      const int32_t init_slot =
+          ssi[static_cast<size_t>(i * num_cols + (acc - 1))];
+      VT_CHECK(init_slot >= 0 || allow_inert_padding,
+               "qwen3_5: spec initial GDN state slot must be live");
+      VT_CHECK(init_slot < state_slots,
+               "qwen3_5: spec GDN state slot out of range");
+    }
+    for (int32_t slot : ssi)
+      VT_CHECK(slot < state_slots,
+               "qwen3_5: spec GDN state slot out of range");
+    for (int32_t t : stx)
+      VT_CHECK(t >= 0 && t < metadata.num_actual_tokens,
+               "qwen3_5: spec_token_indx entry out of range");
+    if (metadata.non_spec_token_indx.has_value()) {
+      VT_CHECK(static_cast<int64_t>(metadata.non_spec_token_indx->size()) ==
+                   nd_tok + np_tok,
+               "qwen3_5: non_spec_token_indx must cover the non-spec tokens");
+    }
+  }
+
+  if (nreq == 0 && ns == 0) {
     VT_CHECK(metadata.num_actual_tokens == 0,
              "qwen3_5: GDN tokens require state metadata");
     return;
   }
+  // Pure spec batch (no non-spec rows): the non-spec segmentation is nullopt by
+  // construction (gdn_attn.cpp:202-217), so skip the non-spec validation below.
+  if (nreq == 0) return;
 
   VT_CHECK(metadata.non_spec_state_indices_tensor.has_value(),
            "qwen3_5: missing non-spec GDN state indices");
@@ -3015,6 +3076,20 @@ struct StepDevInputs {
   DBuf gdn_prefill_has_initial;  // i8 [num_prefills]
   bool has_gdn_prefill_meta = false;
   bool indexed_gdn_state_io = false;
+  // ── Spec-decode device tensors (SPEC-MTP I5a). Uploaded ONCE per step (shared
+  // by every GDN layer's spec branch), only when the step carries drafts
+  // (num_spec_decodes > 0). Every one is a stub of size 1 on the default path,
+  // so the upload is byte-identical to pre-I5a there. Mirror the six host arrays
+  // I4's GDN builder emits (gdn_attn.cpp:181-287). ──
+  DBuf gdn_spec_state_idx;   // i32 [num_spec_decodes * num_cols] (row-major)
+  DBuf gdn_spec_qsl;         // i32 [num_spec_decodes + 1]
+  DBuf gdn_spec_token_indx;  // i32 [num_spec_decode_tokens]
+  DBuf gdn_non_spec_token_indx;  // i32 [num_decode_tokens + num_prefill_tokens]
+  DBuf gdn_spec_seq_masks;   // i8  [num_reqs], upstream bool mask
+  DBuf gdn_num_accepted;     // i32 [num_spec_decodes]
+  DBuf gdn_spec_conv_state_idx;  // i32 [num_spec_decodes] = spec_state_idx col 0
+  bool has_gdn_spec = false;
+  int64_t gdn_spec_num_cols = 0;  // == num_spec + 1 (spec_state_indices .size(-1))
   // f32 [T, rotary_dim] cos|sin cache for the fused full-attn preamble, built ONCE
   // per step (VT_FUSE_ATTN_PREAMBLE) and reused by every full-attn layer; a 1-elem
   // stub when the toggle is off (has_attn_cos_sin=false).
@@ -3063,6 +3138,15 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
       DBuf(d, DType::kI8, {1}),   // prefill has-initial stub
       false,
       indexed_state_io,
+      DBuf(d, DType::kI32, {1}),  // spec state-idx stub
+      DBuf(d, DType::kI32, {1}),  // spec qsl stub
+      DBuf(d, DType::kI32, {1}),  // spec token-indx stub
+      DBuf(d, DType::kI32, {1}),  // non-spec token-indx stub
+      DBuf(d, DType::kI8, {1}),   // spec seq-masks stub
+      DBuf(d, DType::kI32, {1}),  // num-accepted stub
+      DBuf(d, DType::kI32, {1}),  // spec conv-state-idx (col0) stub
+      false,                       // has_gdn_spec
+      0,                           // gdn_spec_num_cols
       DBuf(d, DType::kF32, {1}),  // attn cos|sin stub (filled by MaybeBuildAttnCosSin)
       false,
   };
@@ -3107,6 +3191,54 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
         {static_cast<int64_t>(gm.prefill_has_initial_state->size())},
         gm.prefill_has_initial_state->data());
     s.has_gdn_prefill_meta = true;
+  }
+  // ── Spec-decode tensor upload (SPEC-MTP I5a). The six device tensors the GDN
+  // spec branch of GdnBlockPaged reads (mirror qwen_gdn_linear_attn.py:
+  // 1344-1476). Uploaded once per step from I4's builder output; NONE of this
+  // runs on the default path (gm.num_spec_decodes == 0), so the per-step upload
+  // is byte-identical to pre-I5a there. ValidateGdnAttentionMetadata above has
+  // already verified every shape/range invariant of these host arrays. ──
+  if (gm.num_spec_decodes > 0) {
+    s.gdn_spec_state_idx = DBuf(
+        d, DType::kI32,
+        {static_cast<int64_t>(gm.spec_state_indices_tensor->size())},
+        gm.spec_state_indices_tensor->data());
+    s.gdn_spec_qsl = DBuf(
+        d, DType::kI32,
+        {static_cast<int64_t>(gm.spec_query_start_loc->size())},
+        gm.spec_query_start_loc->data());
+    s.gdn_spec_token_indx = DBuf(
+        d, DType::kI32, {static_cast<int64_t>(gm.spec_token_indx->size())},
+        gm.spec_token_indx->data());
+    s.gdn_spec_seq_masks = DBuf(
+        d, DType::kI8, {static_cast<int64_t>(gm.spec_sequence_masks->size())},
+        gm.spec_sequence_masks->data());
+    s.gdn_num_accepted = DBuf(
+        d, DType::kI32, {static_cast<int64_t>(gm.num_accepted_tokens->size())},
+        gm.num_accepted_tokens->data());
+    // Column 0 of spec_state_indices per request — the conv slot (the conv
+    // window needs no per-timestep slots; qwen_gdn_linear_attn.py:1350). The
+    // CausalConv1dSpecUpdate op reads it as a contiguous [num_spec_decodes]
+    // buffer, so materialize the strided column here rather than per layer.
+    const int64_t spec_cols = gm.spec_state_indices_num_cols;
+    const int64_t nspec = gm.num_spec_decodes;
+    std::vector<int32_t> conv_col0(static_cast<size_t>(nspec));
+    for (int64_t i = 0; i < nspec; ++i)
+      conv_col0[static_cast<size_t>(i)] =
+          (*gm.spec_state_indices_tensor)[static_cast<size_t>(i * spec_cols)];
+    s.gdn_spec_conv_state_idx =
+        DBuf(d, DType::kI32, {nspec}, conv_col0.data());
+    // non_spec_token_indx is present only for a MIXED spec batch (nullopt/empty
+    // for a pure spec batch, gdn_attn.cpp:211); upload it only when non-empty.
+    if (gm.non_spec_token_indx.has_value() &&
+        !gm.non_spec_token_indx->empty()) {
+      s.gdn_non_spec_token_indx = DBuf(
+          d, DType::kI32,
+          {static_cast<int64_t>(gm.non_spec_token_indx->size())},
+          gm.non_spec_token_indx->data());
+    }
+    s.gdn_spec_num_cols = gm.spec_state_indices_num_cols;
+    s.has_gdn_spec = true;
   }
   return s;
 }
@@ -3153,8 +3285,24 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const int64_t np = meta.num_prefills;
   const int64_t nd_tok = meta.num_decode_tokens;
   const int64_t np_tok = meta.num_prefill_tokens;
+  // Spec-decode segmentation (SPEC-MTP I5a). `spec` is false on every production
+  // step, so the whole branch below is dead code on the default path.
+  const int64_t ns = meta.num_spec_decodes;
+  const int64_t ns_tok = meta.num_spec_decode_tokens;
+  const bool spec = ns > 0;
   VT_CHECK(meta.num_actual_tokens == T, "gdn paged: num_actual_tokens != T");
-  VT_CHECK(nd_tok + np_tok == T, "gdn paged: decode+prefill tokens != T");
+  VT_CHECK(nd_tok + np_tok + ns_tok == T,
+           "gdn paged: decode+prefill+spec tokens != T");
+  // I5a ships the PURE spec batch (num_prefills == 0 && num_decodes == 0), which
+  // is the k=1 greedy steady-state decode and exactly what the I5a bit-exact
+  // gate proves. A MIXED spec batch (spec rows alongside reclassified non-spec
+  // prefill rows) additionally needs the mixed_qkv index_select split + merge;
+  // it is first produced e2e by the runner loop (I5b-d) and lands with that
+  // increment, gated end-to-end. Refuse it loudly here rather than silently
+  // degrade (mirrors the codebase's refuse-never-degrade rule).
+  VT_CHECK(!spec || (np == 0 && nd == 0),
+           "gdn paged: mixed spec+non-spec GDN batch is not yet routed "
+           "(SPEC-MTP I5a is pure-spec only; mixed lands with the runner loop)");
 
   const DType indt = GdnInDType();
   const DType outdt = GdnOutDType(cfg.num_experts == 0);
@@ -3231,7 +3379,21 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     row_copy_decode_indices.assign(all_indices.begin(),
                                    all_indices.begin() + nd);
   }
-  if (np > 0) {
+  if (spec) {
+    // ── PURE spec conv (SPEC-MTP I5a; qwen_gdn_linear_attn.py:1344-1357). Every
+    // token is a spec token (pure batch: np == nd == 0), so mixed_qkv_spec is
+    // the whole stream and the multi-query conv runs over it in place on the
+    // widened conv_state rows ((K-1)+num_spec taps). The slot is column 0 of
+    // spec_state_indices; the window advances by num_accepted, not 1+k, which is
+    // the conv rollback. Persistent per-step device tensors (uploaded once). ──
+    VT_CHECK(sdi.has_gdn_spec,
+             "gdn paged: spec batch requires uploaded spec metadata");
+    Tensor conv_cache = state.conv_state;  // widened [slots, conv_dim, (K-1)+k]
+    vt::CausalConv1dSpecUpdate(d.q, dconv.t(), mixed, dcw, /*bias=*/nullptr,
+                               conv_cache, sdi.gdn_spec_conv_state_idx.t(),
+                               sdi.gdn_num_accepted.t(), sdi.gdn_spec_qsl.t(),
+                               vt::CausalConv1dArgs{true});
+  } else if (np > 0) {
     // Any prefill: conv over the WHOLE non-spec stream (decodes lead, each with
     // has_initial_state=1). qwen_gdn_linear_attn.py:1360-1375.
     const auto& sidx = *meta.non_spec_state_indices_tensor;
@@ -3346,6 +3508,23 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // GdnDecode/GdnPrefill store Tout directly; otherwise use the f32 arm.
     const int64_t ssm_row_elems = Hv * Dv * Dk;
 
+    if (spec) {
+      // ── PURE spec recurrence (SPEC-MTP I5a; qwen_gdn_linear_attn.py:
+      // 1455-1475). Every token is a spec token, in batch order (identity gather
+      // in a pure batch), so the whole [T,...] post-conv output feeds one
+      // GdnSpecDecode over the per-request k+1 state slots. The kernel selects
+      // each request's initial state from column num_accepted-1 and snapshots
+      // the post-token state of timestep t into column t — the SSM rollback.
+      // Persistent per-step device tensors (uploaded once, shared by all GDN
+      // layers). state_indices is the flat [num_spec_decodes*num_cols] upload
+      // viewed row-major as [num_spec_decodes, num_cols]. ──
+      Tensor ssm_cache = state.ssm_state;  // full [slots, Hv, Dv, Dk] cache
+      Tensor spec_idx_2d =
+          Reshape(sdi.gdn_spec_state_idx.t(), {ns, sdi.gdn_spec_num_cols});
+      vt::GdnSpecDecode(d.q, dcore.t(), dql2.t(), dkl2.t(), vf.t(), dg.t(),
+                        dbeta.t(), ssm_cache, sdi.gdn_spec_qsl.t(), spec_idx_2d,
+                        sdi.gdn_num_accepted.t(), vt::GdnArgs{scale});
+    } else {
     // Recurrence — decode segment first (leading nd_tok tokens), then prefill.
     if (nd > 0) {
       // Decode recurrence IN PLACE on the persistent ssm_state at each sequence's
@@ -3426,6 +3605,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
         ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems);
       }
     }
+    }  // end non-spec recurrence
   }
 
   // Gated RMSNorm over Dv with the z gate, cast bf16, flatten heads, out-project.
@@ -5018,6 +5198,88 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
 
 }  // namespace
 
+// Test-only exposed wrapper over the anon-ns GdnBlockPaged + BuildStepDevInputs
+// (SPEC-MTP I5a). Runs ONE GDN layer's paged forward over one batched step,
+// driving the exact production per-step upload (BuildStepDevInputs) and layer
+// assembly (GdnBlockPaged) — including the spec branch when `meta` carries
+// drafts — and returns the [T*H] output on host (f32). It stages the SSM/conv
+// state onto the queue's device, runs, and downloads the mutated state back into
+// `ssm_host`/`conv_host` (both f32, updated in place), so the caller works purely
+// in host vectors on either backend. The synthetic spec-branch test uses this to
+// compare the spec pass bit-for-bit against a token-sequential non-spec decode
+// chain over the same weights and inputs; a mis-wired split / slot select / merge
+// diverges. h_host is the f32 hidden [T*H] (rounded to bf16 on upload, exactly
+// like the real forward's embed target). conv_len is (K-1) for the non-spec
+// decode reference and (K-1)+num_spec for the widened spec state.
+std::vector<float> GdnBlockPagedForTest(vt::Queue queue, const GdnLayerWeights& w,
+                                        const HfConfig& cfg,
+                                        const std::vector<float>& h_host,
+                                        const v1::GDNAttentionMetadata& meta,
+                                        std::vector<float>& ssm_host,
+                                        std::vector<float>& conv_host,
+                                        int64_t num_slots, int64_t conv_len,
+                                        int64_t T) {
+  Backend& b = vt::GetBackend(queue.device.type);
+  Dev d{b, queue};
+  const int64_t H = cfg.hidden_size;
+  const int64_t Hv = cfg.linear_num_value_heads;
+  const int64_t Dv = cfg.linear_value_head_dim;
+  const int64_t Dk = cfg.linear_key_head_dim;
+  const int64_t Hk = cfg.linear_num_key_heads;
+  const int64_t conv_dim = 2 * Hk * Dk + Hv * Dv;
+  VT_CHECK(static_cast<int64_t>(h_host.size()) == T * H,
+           "GdnBlockPagedForTest: h_host must be [T*H]");
+  VT_CHECK(static_cast<int64_t>(ssm_host.size()) == num_slots * Hv * Dv * Dk,
+           "GdnBlockPagedForTest: ssm_host must be [slots*Hv*Dv*Dk]");
+  VT_CHECK(static_cast<int64_t>(conv_host.size()) == num_slots * conv_dim * conv_len,
+           "GdnBlockPagedForTest: conv_host must be [slots*conv_dim*conv_len]");
+  DBuf hf(d, DType::kF32, {T, H}, h_host.data());
+  DBuf h(d, DType::kBF16, {T, H});
+  vt::CastBf16(d.q, h.t(), hf.t());
+  // Device-staged f32 SSM/conv caches (mutated in place by GdnBlockPaged).
+  DBuf ssm(d, DType::kF32, {num_slots, Hv, Dv, Dk}, ssm_host.data());
+  DBuf conv(d, DType::kF32, {num_slots, conv_dim, conv_len}, conv_host.data());
+  GdnStateCache state;
+  state.ssm_state = ssm.t();
+  state.conv_state = conv.t();
+
+  // Minimal CommonAttentionMetadata — GdnBlockPaged never reads it, but
+  // BuildStepDevInputs uploads its positions/slot_mapping/block_table/seq_lens/
+  // query_start_loc. One request per non-spec segment or one spec request; the
+  // exact non-GDN fields do not affect the GDN layer output.
+  const int num_reqs = meta.num_decodes + meta.num_prefills + meta.num_spec_decodes;
+  v1::CommonAttentionMetadata am;
+  am.num_reqs = num_reqs;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = std::max<int>(1, meta.spec_state_indices_num_cols);
+  am.block_table_tensor.assign(
+      static_cast<size_t>(num_reqs) * static_cast<size_t>(am.block_table_num_cols), 0);
+  am.seq_lens.assign(static_cast<size_t>(num_reqs), static_cast<int32_t>(T));
+  am.query_start_loc.assign(static_cast<size_t>(num_reqs) + 1, 0);
+  for (int r = 0; r < num_reqs; ++r)
+    am.query_start_loc[static_cast<size_t>(r) + 1] =
+        am.query_start_loc[static_cast<size_t>(r)] +
+        static_cast<int32_t>(T / std::max(1, num_reqs));
+  am.query_start_loc.back() = static_cast<int32_t>(T);
+  am.slot_mapping.assign(static_cast<size_t>(T), 0);
+  std::vector<int32_t> positions(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  const int64_t state_slots = state.ssm_state.shape[0];
+  StepDevInputs sdi = BuildStepDevInputs(d, positions, am, meta, state_slots);
+  DBuf out = GdnBlockPaged(d, w, cfg, h.t(), sdi, meta, state, T);
+
+  DBuf of(d, DType::kF32, {T, H});
+  vt::CastF32(d.q, of.t(), out.t());
+  std::vector<float> host(static_cast<size_t>(T * H));
+  of.Download(d, host.data());
+  // Return the mutated SSM/conv state to the caller (rollback slots, evolved
+  // decode state) so a token-sequential reference chain can carry it forward.
+  ssm.Download(d, ssm_host.data());
+  conv.Download(d, conv_host.data());
+  return host;
+}
+
 // Exposed wrapper over the anon-ns `MoeBlock` (SEAM GAP #2) so a full-attention
 // MoE in another TU (qwen3_moe.cpp, W3) can reuse the exact same sparse-MoE block.
 // Builds the internal Dev, runs MoeBlock, and releases the combined DBuf into an
@@ -6066,6 +6328,18 @@ struct Qwen3_5DecodeGraph::Impl {
       gdn_meta.num_decode_tokens = gm.num_decode_tokens;
       gdn_meta.num_spec_decodes = gm.num_spec_decodes;
       gdn_meta.num_spec_decode_tokens = gm.num_spec_decode_tokens;
+      // Spec-decode segmentation (SPEC-MTP I5a). All empty on the pure-decode
+      // graph path (spec never captures — ValidateGdnDecodeGraphState rejects a
+      // spec batch), so these copies are inert here; carried for completeness so
+      // a future spec-capable graph slot refreshes the full metadata. CopyInPlace
+      // on an empty optional is a no-op, keeping the default path byte-identical.
+      CopyInPlace(gdn_meta.spec_state_indices_tensor, gm.spec_state_indices_tensor);
+      CopyInPlace(gdn_meta.spec_query_start_loc, gm.spec_query_start_loc);
+      CopyInPlace(gdn_meta.spec_sequence_masks, gm.spec_sequence_masks);
+      CopyInPlace(gdn_meta.spec_token_indx, gm.spec_token_indx);
+      CopyInPlace(gdn_meta.non_spec_token_indx, gm.non_spec_token_indx);
+      CopyInPlace(gdn_meta.num_accepted_tokens, gm.num_accepted_tokens);
+      gdn_meta.spec_state_indices_num_cols = gm.spec_state_indices_num_cols;
       gdn_meta.num_actual_tokens = gm.num_actual_tokens;
     }
   };
@@ -6269,6 +6543,18 @@ struct Qwen3_5DenseDecodeGraph::Impl {
       gdn_meta.num_decode_tokens = gm.num_decode_tokens;
       gdn_meta.num_spec_decodes = gm.num_spec_decodes;
       gdn_meta.num_spec_decode_tokens = gm.num_spec_decode_tokens;
+      // Spec-decode segmentation (SPEC-MTP I5a). All empty on the pure-decode
+      // graph path (spec never captures — ValidateGdnDecodeGraphState rejects a
+      // spec batch), so these copies are inert here; carried for completeness so
+      // a future spec-capable graph slot refreshes the full metadata. CopyInPlace
+      // on an empty optional is a no-op, keeping the default path byte-identical.
+      CopyInPlace(gdn_meta.spec_state_indices_tensor, gm.spec_state_indices_tensor);
+      CopyInPlace(gdn_meta.spec_query_start_loc, gm.spec_query_start_loc);
+      CopyInPlace(gdn_meta.spec_sequence_masks, gm.spec_sequence_masks);
+      CopyInPlace(gdn_meta.spec_token_indx, gm.spec_token_indx);
+      CopyInPlace(gdn_meta.non_spec_token_indx, gm.non_spec_token_indx);
+      CopyInPlace(gdn_meta.num_accepted_tokens, gm.num_accepted_tokens);
+      gdn_meta.spec_state_indices_num_cols = gm.spec_state_indices_num_cols;
       gdn_meta.num_actual_tokens = gm.num_actual_tokens;
     }
   };

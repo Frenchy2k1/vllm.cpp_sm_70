@@ -583,6 +583,46 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
   greedy, AND acceptance-rate telemetry within noise of vLLM's on the same
   prompts. Then A/B decode throughput + TPOT (expected from B5/community:
   ~1.15–1.35× decode at conc16/32; +27.5% k=1 reported on the 35B-class).
+
+  **M-mtp-1 SUB-INCREMENT DECOMPOSITION (scoping pass 2026-07-24).** M-mtp-1 is
+  NOT one landing — I2 (scheduler-half), I3 (verify/rejection), I4 (GDN spec
+  slots) already landed against the §2.7 frozen ABI; the remaining loop is four
+  more independently-gateable bricks. The e2e token gate above lands with the
+  LAST (I5d). Order and boundaries:
+  - **I5a — GDN layer spec routing + runner spec-metadata upload. LANDED
+    2026-07-24 (`CLAIM-SPEC-MTP-I5A`).** The `GdnBlockPaged` `num_spec_decodes>0`
+    branch (PURE-spec fast path) routing a spec batch through
+    `vt::CausalConv1dSpecUpdate` + `vt::GdnSpecDecode` (mirror
+    `qwen_gdn_linear_attn.py:1344-1357,1455-1475`), plus the `StepDevInputs` /
+    `BuildStepDevInputs` upload of I4's six spec device tensors
+    (`spec_state_indices_tensor`, `spec_query_start_loc`, `spec_token_indx`,
+    `non_spec_token_indx`, `spec_sequence_masks`, `num_accepted_tokens`) and the
+    decode-graph `Refresh` copies, and the `ValidateGdnAttentionMetadata` spec
+    contract. DEFAULT-OFF INERT (`num_spec_decodes==0` ⇒ stub uploads, non-spec
+    branch, byte-identical). Gate: a synthetic test drives the spec branch at the
+    real 27B/35B GDN dims (Hv 48/32, Dk=Dv 128) and asserts BIT-EXACT vs the I4
+    ops applied as a token-sequential decode chain (`GdnBlockPagedForTest`);
+    RED-first proven by a reverted stub (spec recurrence zeroed ⇒ 4/8 fail,
+    maxΔ 1.3-1.6). NOT the e2e gate — the MIXED spec+non-spec batch (index_select
+    split + merge) is refused loudly and lands with I5d's runner loop. The runner
+    `GDNAttentionMetadataBuilder::build` spec feed (`num_decode_draft_tokens_cpu`,
+    `num_accepted_tokens`) is I5d (the runner loop), inert until then.
+  - **I5b — `prepare_prefill_inputs`.** Port the draft-prefill input shift kernel
+    (`autoregressive/speculator.py:469-588`): shift `input_ids` left one within
+    each query span, splice `last_sampled`/`next_prefill_tokens`, `query_len -=
+    num_rejected`. Independently unit-gateable against a CPU reference.
+  - **I5c — MTP paged propose forward + draft KV layer.** The `Qwen3_5MTP` paged
+    forward driven from the target's post-final-norm hidden tap, its own draft
+    full-attn KV layer (index `num_hidden_layers`), and the k=1 early-exit
+    propose (`autoregressive/speculator.py:236-238`). Gated vs the M-mtp-0 oracle
+    head goldens extended to the paged path.
+  - **I5d — config plumbing + runner loop + the three-way 27B token gate.**
+    `--speculative-config` parse + arch resolve; wire the speculator into the
+    runner (`take_draft_token_ids`, `propose` post-sampling, the
+    `num_decode_draft_tokens_cpu`/`num_accepted_tokens` feed into the GDN builder,
+    the MIXED spec batch split/merge in `GdnBlockPaged`); THEN the M-mtp-1 e2e
+    gate: token-for-token 16/16 vs vLLM same-spec-config, acceptance telemetry,
+    A/B throughput. `SPEC-MTP` leaves `GATING` only here.
 - **M-mtp-2 — 35B k=1 greedy.** Adds only the MoE MTP layer (reuses our MoE
   blocks) — GDN path identical. Same gates. Caveat: verify unions experts
   across k+1 tokens/request (more experts touched per step — measure, don't
