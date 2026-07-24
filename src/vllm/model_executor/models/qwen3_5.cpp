@@ -5196,6 +5196,126 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
 }
 
+// ── Qwen3.5/3.6 MTP head shared preamble (SPEC-MTP I5c). ────────────────────
+// The fc-cat-norm head from qwen3_5_mtp.py:129-140, shared by the standalone
+// (Qwen3_5MTPModel::Forward) and paged (ForwardPaged) drafts so a single copy of
+// the head math feeds both. Produces `h = fc(cat[pre_fc_norm_embedding(embed),
+// pre_fc_norm_hidden(target_hidden)])` as a [T,H] bf16 device buffer; the caller
+// runs the (dense or MoE) decoder layer + final norm over it. `embed_tokens` is
+// the shared target embedding; `target_hidden_states` is the target model's
+// post-final-norm bf16 [T,H] output (the drafter's hidden-state tap).
+DBuf MtpHeadHidden(Dev device, const Qwen3_5MTPWeights& weights,
+                   const HfConfig& config, const OwnedTensor& embed_tokens,
+                   const std::vector<int32_t>& input_ids,
+                   const Tensor& target_hidden_states, int64_t tokens) {
+  const int64_t hidden_size = config.hidden_size;
+  const int64_t vocab_size = config.vocab_size;
+  const float eps = static_cast<float>(config.rms_norm_eps);
+
+  Tensor embedding_table =
+      ResidentWeight(device, embed_tokens, {vocab_size, hidden_size});
+  DBuf device_ids(device, DType::kI32, {tokens}, input_ids.data());
+  DBuf embedding(device, DType::kBF16, {tokens, hidden_size});
+  vt::Embedding(device.q, embedding.t(), embedding_table, device_ids.t());
+
+  Tensor embedding_norm_weight =
+      ResidentWeight(device, weights.pre_fc_norm_embedding, {hidden_size});
+  Tensor hidden_norm_weight =
+      ResidentWeight(device, weights.pre_fc_norm_hidden, {hidden_size});
+  DBuf embedding_norm(device, DType::kBF16, {tokens, hidden_size});
+  DBuf target_norm(device, DType::kBF16, {tokens, hidden_size});
+  vt::RmsNorm(device.q, embedding_norm.t(), embedding.t(), embedding_norm_weight,
+              vt::RmsNormArgs{eps, true});
+  vt::RmsNorm(device.q, target_norm.t(), target_hidden_states, hidden_norm_weight,
+              vt::RmsNormArgs{eps, true});
+
+  // torch.cat([embedding_norm, target_norm], -1), row by row (portable, exact).
+  DBuf concatenated(device, DType::kBF16, {tokens, 2 * hidden_size});
+  const size_t row_bytes =
+      static_cast<size_t>(hidden_size) * vt::SizeOf(DType::kBF16);
+  auto* cat = static_cast<uint8_t*>(concatenated.ptr());
+  const auto* embed = static_cast<const uint8_t*>(embedding_norm.t().data);
+  const auto* target = static_cast<const uint8_t*>(target_norm.t().data);
+  for (int64_t token = 0; token < tokens; ++token) {
+    const size_t source_offset = static_cast<size_t>(token) * row_bytes;
+    const size_t target_offset = static_cast<size_t>(token) * 2 * row_bytes;
+    device.b.Copy(device.q, cat + target_offset, embed + source_offset, row_bytes);
+    device.b.Copy(device.q, cat + target_offset + row_bytes, target + source_offset,
+                  row_bytes);
+  }
+  return MatmulBf16D(device, concatenated.t(), weights.fc);
+}
+
+// ── Full-attention-only per-step device inputs (SPEC-MTP I5c). ──────────────
+// BuildStepDevInputs sibling for a step with NO GDN layers (the MTP draft head
+// is a single layer_type="full_attention" decoder — qwen3_5_mtp.py:105-112). It
+// uploads exactly the full-attn tensors FullAttnBlockPaged reads (positions +
+// slot_mapping / block_table / seq_lens / query_start_loc) and leaves every GDN
+// field a size-1 stub, so it needs no GDN state slots or GDN metadata (which do
+// not exist for the draft layer). MaybeBuildAttnCosSin fills attn_cos_sin.
+StepDevInputs BuildFullAttnStepDevInputs(Dev d,
+                                         const std::vector<int32_t>& positions,
+                                         const CommonAttentionMetadata& am) {
+  const int64_t T = static_cast<int64_t>(positions.size());
+  VT_CHECK(am.num_actual_tokens == T,
+           "qwen3_5 MTP paged: attn metadata token count must match positions");
+  VT_CHECK(static_cast<int64_t>(am.slot_mapping.size()) == T,
+           "qwen3_5 MTP paged: slot_mapping must cover every token");
+  VT_CHECK(static_cast<int64_t>(am.seq_lens.size()) == am.num_reqs &&
+               static_cast<int64_t>(am.query_start_loc.size()) == am.num_reqs + 1,
+           "qwen3_5 MTP paged: malformed full-attn metadata shapes");
+  return StepDevInputs{
+      DBuf(d, DType::kI32, {T}, positions.data()),
+      DBuf(d, DType::kI64, {T}, am.slot_mapping.data()),
+      DBuf(d, DType::kI32, {am.num_reqs, am.block_table_num_cols},
+           am.block_table_tensor.data()),
+      DBuf(d, DType::kI32, {am.num_reqs}, am.seq_lens.data()),
+      DBuf(d, DType::kI32, {am.num_reqs + 1}, am.query_start_loc.data()),
+      DBuf(d, DType::kI32, {1}),  // gdn_state_idx stub
+      false,
+      DBuf(d, DType::kI32, {1}),  // gdn_non_spec_qsl stub
+      DBuf(d, DType::kI8, {1}),   // gdn_has_initial stub
+      DBuf(d, DType::kI32, {1}),  // gdn_prefill_state_idx stub
+      DBuf(d, DType::kI32, {1}),  // gdn_prefill_qsl stub
+      DBuf(d, DType::kI8, {1}),   // gdn_prefill_has_initial stub
+      false,                       // has_gdn_prefill_meta
+      false,                       // indexed_gdn_state_io (no GDN layers)
+      DBuf(d, DType::kI32, {1}),  // gdn_spec_state_idx stub
+      DBuf(d, DType::kI32, {1}),  // gdn_spec_qsl stub
+      DBuf(d, DType::kI32, {1}),  // gdn_spec_token_indx stub
+      DBuf(d, DType::kI32, {1}),  // gdn_non_spec_token_indx stub
+      DBuf(d, DType::kI8, {1}),   // gdn_spec_seq_masks stub
+      DBuf(d, DType::kI32, {1}),  // gdn_num_accepted stub
+      DBuf(d, DType::kI32, {1}),  // gdn_spec_conv_state_idx stub
+      false,                       // has_gdn_spec
+      0,                           // gdn_spec_num_cols
+      DBuf(d, DType::kF32, {1}),  // attn cos|sin stub (MaybeBuildAttnCosSin fills)
+      false,
+  };
+}
+
+// ── MTP final-norm + owning return (SPEC-MTP I5c), shared by Forward/ForwardPaged.
+// mtp.norm over the fused residual stream (qwen3_5_mtp.py:163-165), then move the
+// [T,H] bf16 result into a pool-backed owning carrier (the WrapDeviceLogits idiom).
+Qwen3_5MTPHiddenStates MtpFinalize(Dev device, const Qwen3_5MTPWeights& weights,
+                                   const HfConfig& config, DBuf& hidden,
+                                   DBuf& residual, int64_t tokens) {
+  const int64_t hidden_size = config.hidden_size;
+  const float eps = static_cast<float>(config.rms_norm_eps);
+  Tensor final_norm_weight =
+      ResidentWeight(device, weights.final_norm, {hidden_size});
+  DBuf normalized(device, DType::kBF16, {tokens, hidden_size});
+  vt::RmsNorm(device.q, normalized.t(), hidden.t(), final_norm_weight,
+              vt::RmsNormArgs{eps, true}, &residual.t());
+  Qwen3_5MTPHiddenStates out;
+  out.tensor = normalized.t();
+  const size_t allocation = normalized.alloc_bytes();
+  void* storage = normalized.Release();
+  out.storage = std::shared_ptr<void>(
+      storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+  return out;
+}
+
 }  // namespace
 
 // Test-only exposed wrapper over the anon-ns GdnBlockPaged + BuildStepDevInputs
@@ -5334,7 +5454,8 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const std::vector<PagedKvCache>& attn_kv,
                           const std::vector<GdnStateCache>& gdn_state,
                           const Qwen3_5MoeWeights& weights, const HfConfig& config,
-                          const std::vector<int32_t>& logits_indices = {}) {
+                          const std::vector<int32_t>& logits_indices = {},
+                          const Tensor* hidden_tap = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -5380,6 +5501,22 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   DBuf dnorm(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
+  // Hidden-state tap (SPEC-MTP I5c): the full [T,H] post-final-norm hidden the
+  // MTP drafter consumes (qwen3_5_mtp.py:129-140 `hidden_states` input; the
+  // tap tensor is exactly upstream's target-model forward output). Captured
+  // BEFORE the logits gather so the drafter sees every token's hidden, not just
+  // the sampled rows. INERT on the production path: hidden_tap is nullptr for
+  // every existing caller (only I5c's ForwardDeviceTap passes a buffer), so no
+  // shipped forward writes it and the object code is byte-identical there.
+  if (hidden_tap != nullptr) {
+    VT_CHECK(hidden_tap->shape[0] == T && hidden_tap->shape[1] == H &&
+                 hidden_tap->dtype == DType::kBF16,
+             "qwen3_5: hidden tap buffer must be bf16 [T,H]");
+    d.b.Copy(d.q, hidden_tap->data, dnorm.t().data,
+             static_cast<size_t>(T) * static_cast<size_t>(H) *
+                 vt::SizeOf(DType::kBF16));
+  }
+
   // Logits gather (perf): mirror vLLM's gather-BEFORE-lm_head. On a prefill/mixed
   // step (len(logits_indices) < T) gather only the per-request last-token hidden
   // rows [num_reqs,H] and run lm_head on those → [num_reqs,vocab]. This is the
@@ -5413,13 +5550,14 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const std::vector<PagedKvCache>& attn_kv,
                         const std::vector<GdnStateCache>& gdn_state,
                         const Qwen3_5MoeWeights& weights, const HfConfig& config,
-                        const std::vector<int32_t>& logits_indices = {}) {
+                        const std::vector<int32_t>& logits_indices = {},
+                        const Tensor* hidden_tap = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   DBuf hidden(d, DType::kBF16, {T, H});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
-                       gdn_state, weights, config, logits_indices);
+                       gdn_state, weights, config, logits_indices, hidden_tap);
 }
 
 // Shared shape/count validation for the paged forward entry points.
@@ -5662,6 +5800,34 @@ ForwardLogits Qwen3_5Model::ForwardDevice(
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 
+ForwardLogits Qwen3_5Model::ForwardDeviceTap(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue, Qwen3_5MTPHiddenStates* hidden_out,
+    const std::vector<int32_t>& logits_indices) {
+  CheckPagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                    gdn_state, weights, config);
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  // Owning [T,H] bf16 buffer that the layer body fills via the inert tap hook;
+  // moved into hidden_out so the drafter (I5d) can consume it with no re-forward.
+  DBuf tap(d, DType::kBF16, {T, H});
+  const Tensor tap_view = tap.t();
+  DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                             gdn_state, weights, config, logits_indices, &tap_view);
+  if (hidden_out != nullptr) {
+    hidden_out->tensor = tap.t();
+    const size_t allocation = tap.alloc_bytes();
+    void* storage = tap.Release();
+    hidden_out->storage = std::shared_ptr<void>(
+        storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+  }
+  return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
+}
+
 std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_ids,
                                               const std::vector<int32_t>& positions,
                                               const Qwen3_5MoeWeights& weights,
@@ -5801,48 +5967,13 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
                weights_->fc.shape[1] == 2 * hidden_size,
            "qwen3_5 MTP forward: fc must be raw bf16 [H,2H]");
 
+  (void)vocab_size;
   Dev device{vt::GetBackend(queue.device.type), queue};
-  const float eps = static_cast<float>(config_->rms_norm_eps);
 
-  // Qwen3_5MultiTokenPredictor.forward: shared embedding, then independent
-  // Gemma RMSNorms over the embedding and target final hidden states.
-  Tensor embedding_table =
-      ResidentWeight(device, *embed_tokens_, {vocab_size, hidden_size});
-  DBuf device_ids(device, DType::kI32, {tokens}, input_ids.data());
-  DBuf embedding(device, DType::kBF16, {tokens, hidden_size});
-  vt::Embedding(device.q, embedding.t(), embedding_table, device_ids.t());
-
-  Tensor embedding_norm_weight = ResidentWeight(
-      device, weights_->pre_fc_norm_embedding, {hidden_size});
-  Tensor hidden_norm_weight =
-      ResidentWeight(device, weights_->pre_fc_norm_hidden, {hidden_size});
-  DBuf embedding_norm(device, DType::kBF16, {tokens, hidden_size});
-  DBuf target_norm(device, DType::kBF16, {tokens, hidden_size});
-  vt::RmsNorm(device.q, embedding_norm.t(), embedding.t(),
-              embedding_norm_weight, vt::RmsNormArgs{eps, true});
-  vt::RmsNorm(device.q, target_norm.t(), target_hidden_states,
-              hidden_norm_weight, vt::RmsNormArgs{eps, true});
-
-  // torch.cat([embedding_norm, target_norm], -1). Backend::Copy is used row by
-  // row so this remains portable and exact without introducing a one-off MTP
-  // kernel; M-mtp-1 may fuse this if profiling makes it material.
-  DBuf concatenated(device, DType::kBF16, {tokens, 2 * hidden_size});
-  const size_t row_bytes =
-      static_cast<size_t>(hidden_size) * vt::SizeOf(DType::kBF16);
-  auto* cat = static_cast<uint8_t*>(concatenated.ptr());
-  const auto* embed =
-      static_cast<const uint8_t*>(embedding_norm.t().data);
-  const auto* target = static_cast<const uint8_t*>(target_norm.t().data);
-  for (int64_t token = 0; token < tokens; ++token) {
-    const size_t source_offset = static_cast<size_t>(token) * row_bytes;
-    const size_t target_offset = static_cast<size_t>(token) * 2 * row_bytes;
-    device.b.Copy(device.q, cat + target_offset, embed + source_offset,
-                  row_bytes);
-    device.b.Copy(device.q, cat + target_offset + row_bytes,
-                  target + source_offset, row_bytes);
-  }
-
-  DBuf hidden = MatmulBf16D(device, concatenated.t(), weights_->fc);
+  // Qwen3_5MultiTokenPredictor.forward head: shared embedding + independent Gemma
+  // RMSNorms + cat + fc (extracted into MtpHeadHidden, shared with ForwardPaged).
+  DBuf hidden = MtpHeadHidden(device, *weights_, *config_, *embed_tokens_,
+                              input_ids, target_hidden_states, tokens);
   DBuf residual(device, ResidualDType(), {tokens, hidden_size});
   residual.Zero(device);
   const size_t layer_index =
@@ -5854,20 +5985,70 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
     RunLayer(device, weights_->moe_layers[layer_index], *config_, hidden,
              residual, positions, tokens);
   }
+  return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
+}
 
-  Tensor final_norm_weight =
-      ResidentWeight(device, weights_->final_norm, {hidden_size});
-  DBuf normalized(device, DType::kBF16, {tokens, hidden_size});
-  vt::RmsNorm(device.q, normalized.t(), hidden.t(), final_norm_weight,
-              vt::RmsNormArgs{eps, true}, &residual.t());
+Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
+    const std::vector<int32_t>& input_ids,
+    const std::vector<int32_t>& positions,
+    const vt::Tensor& target_hidden_states,
+    const v1::CommonAttentionMetadata& attn_meta, PagedKvCache& draft_kv,
+    vt::Queue& queue, int64_t spec_step_idx) const {
+  const int64_t tokens = static_cast<int64_t>(input_ids.size());
+  const int64_t hidden_size = config_->hidden_size;
+  const int64_t num_layers = weights_->NumLayers();
+  VT_CHECK(tokens > 0, "qwen3_5 MTP paged forward: empty input_ids");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == tokens,
+           "qwen3_5 MTP paged forward: positions length must equal token count");
+  VT_CHECK(spec_step_idx >= 0 && num_layers > 0,
+           "qwen3_5 MTP paged forward: invalid spec step/layer count");
+  VT_CHECK(target_hidden_states.rank == 2 &&
+               target_hidden_states.shape[0] == tokens &&
+               target_hidden_states.shape[1] == hidden_size &&
+               target_hidden_states.dtype == DType::kBF16 &&
+               target_hidden_states.IsContiguous() &&
+               target_hidden_states.device == queue.device,
+           "qwen3_5 MTP paged forward: target hidden states must be contiguous "
+           "bf16 [T,H] on the queue device");
+  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
+               weights_->fc.shape[0] == hidden_size &&
+               weights_->fc.shape[1] == 2 * hidden_size,
+           "qwen3_5 MTP paged forward: fc must be raw bf16 [H,2H]");
+  VT_CHECK(attn_meta.num_actual_tokens == tokens,
+           "qwen3_5 MTP paged forward: attn metadata token count must equal T");
+  VT_CHECK(draft_kv.num_kv_heads == config_->num_key_value_heads &&
+               draft_kv.head_size == config_->head_dim,
+           "qwen3_5 MTP paged forward: draft KV cache dims mismatch config");
 
-  Qwen3_5MTPHiddenStates out;
-  out.tensor = normalized.t();
-  const size_t allocation = normalized.alloc_bytes();
-  void* storage = normalized.Release();
-  out.storage = std::shared_ptr<void>(
-      storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
-  return out;
+  Dev device{vt::GetBackend(queue.device.type), queue};
+
+  // Same head math as Forward; the difference is the DECODER LAYER, which runs
+  // paged (writes/reads the draft KV layer via slot_mapping/block_table).
+  DBuf hidden = MtpHeadHidden(device, *weights_, *config_, *embed_tokens_,
+                              input_ids, target_hidden_states, tokens);
+  DBuf residual(device, ResidualDType(), {tokens, hidden_size});
+  residual.Zero(device);
+
+  // Per-step device inputs for the single full-attention layer (no GDN state) +
+  // the fused-preamble cos|sin cache (a stub unless VT_FUSE_ATTN_PREAMBLE). The
+  // MTP head is bf16-unquantized, so the fp4 attn preamble default is OFF.
+  StepDevInputs sdi = BuildFullAttnStepDevInputs(device, positions, attn_meta);
+  MaybeBuildAttnCosSin(device, sdi, *config_, tokens, /*fp4_attn=*/false);
+
+  // The MTP layer is always layer_type="full_attention": gdn_meta/gdn_state are
+  // never touched by RunDense/RunLayerPaged for a non-linear-attention layer.
+  const v1::GDNAttentionMetadata gdn_meta_unused;
+  const size_t layer_index = static_cast<size_t>(spec_step_idx % num_layers);
+  if (weights_->kind == Qwen3_5MTPKind::kDense) {
+    RunDenseLayerPaged(device, weights_->dense_layers[layer_index], *config_,
+                       hidden, residual, sdi, attn_meta, gdn_meta_unused,
+                       &draft_kv, /*gdn_state=*/nullptr, tokens);
+  } else {
+    RunLayerPaged(device, weights_->moe_layers[layer_index], *config_, hidden,
+                  residual, sdi, attn_meta, gdn_meta_unused, &draft_kv,
+                  /*gdn_state=*/nullptr, tokens);
+  }
+  return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
 
 ForwardLogits Qwen3_5MTPModel::ComputeLogits(
@@ -5976,7 +6157,8 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                                const std::vector<GdnStateCache>& gdn_state,
                                const Qwen3_5DenseWeights& weights,
                                const HfConfig& config,
-                               const std::vector<int32_t>& logits_indices = {}) {
+                               const std::vector<int32_t>& logits_indices = {},
+                               const Tensor* hidden_tap = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -6023,6 +6205,18 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   DBuf dnorm(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
+  // Hidden-state tap (SPEC-MTP I5c): the full [T,H] post-final-norm hidden the MTP
+  // drafter consumes; captured before the gather. INERT (nullptr on every shipped
+  // caller — only ForwardDeviceTap passes a buffer). See the 35B ForwardLayers tap.
+  if (hidden_tap != nullptr) {
+    VT_CHECK(hidden_tap->shape[0] == T && hidden_tap->shape[1] == H &&
+                 hidden_tap->dtype == DType::kBF16,
+             "qwen3_5 dense: hidden tap buffer must be bf16 [T,H]");
+    d.b.Copy(d.q, hidden_tap->data, dnorm.t().data,
+             static_cast<size_t>(T) * static_cast<size_t>(H) *
+                 vt::SizeOf(DType::kBF16));
+  }
+
   // Logits gather-before-lm_head (prefill/mixed): same semantics as the 35B path.
   // lm_head is unquantized bf16 in the 27B (notes §3.6). Pure-decode / graph
   // replay pass empty indices (identity) → the full [T,vocab] path.
@@ -6054,7 +6248,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                              const std::vector<GdnStateCache>& gdn_state,
                              const Qwen3_5DenseWeights& weights,
                              const HfConfig& config,
-                             const std::vector<int32_t>& logits_indices) {
+                             const std::vector<int32_t>& logits_indices,
+                             const Tensor* hidden_tap = nullptr) {
   CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
@@ -6062,7 +6257,7 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DBuf hidden(d, DType::kBF16, {T, H});
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
-                            gdn_state, weights, config, logits_indices);
+                            gdn_state, weights, config, logits_indices, hidden_tap);
 }
 
 std::vector<float> Qwen3_5DenseModel::Forward(
@@ -6093,6 +6288,32 @@ ForwardLogits Qwen3_5DenseModel::ForwardDevice(
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
                                   logits_indices);
+  return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
+}
+
+ForwardLogits Qwen3_5DenseModel::ForwardDeviceTap(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state,
+    const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
+    Qwen3_5MTPHiddenStates* hidden_out,
+    const std::vector<int32_t>& logits_indices) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  DBuf tap(d, DType::kBF16, {T, H});
+  const Tensor tap_view = tap.t();
+  DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
+                                  attn_kv, gdn_state, weights, config,
+                                  logits_indices, &tap_view);
+  if (hidden_out != nullptr) {
+    hidden_out->tensor = tap.t();
+    const size_t allocation = tap.alloc_bytes();
+    void* storage = tap.Release();
+    hidden_out->storage = std::shared_ptr<void>(
+        storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+  }
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 

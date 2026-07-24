@@ -205,6 +205,20 @@ class Qwen3_5DenseModel {
       const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
       const std::vector<int32_t>& logits_indices = {});
 
+  // ForwardDevice + the DRAFTER hidden-state tap (SPEC-MTP I5c). Byte-identical
+  // logits to ForwardDevice, and additionally moves the full [num_actual_tokens, H]
+  // post-final-norm hidden into `*hidden_out` (device-owning) for the MTP drafter's
+  // propose(). `hidden_out` may be null. Not wired into the runner until I5d.
+  static ForwardLogits ForwardDeviceTap(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const v1::GDNAttentionMetadata& gdn_meta,
+      const std::vector<PagedKvCache>& attn_kv,
+      const std::vector<GdnStateCache>& gdn_state,
+      const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
+      Qwen3_5MTPHiddenStates* hidden_out,
+      const std::vector<int32_t>& logits_indices = {});
+
   // Dense single-sequence reference forward (M0.9 anchor). Runs the whole model
   // for a single non-paged sequence and returns logits [T, vocab] f32 (T =
   // token_ids.size()). Retained as the paged==dense parity reference.

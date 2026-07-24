@@ -350,6 +350,7 @@ add_library(vllm STATIC
   src/vllm/v1/sample/sampler.cpp
   src/vllm/v1/spec_decode/rejection_sampler.cpp
   src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.cpp
+  src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/kv_cache_spec_registry.cpp
   src/vllm/v1/core/kv_cache_utils.cpp

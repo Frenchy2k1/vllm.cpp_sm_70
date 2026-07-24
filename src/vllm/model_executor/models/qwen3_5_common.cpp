@@ -88,6 +88,20 @@ v1::KVCacheConfig MakeQwen3_5KVCacheSpec(const HfConfig& config, int block_size,
           /*page_size_padded=*/std::nullopt,
           /*mamba_cache_mode=*/"none",
           /*num_speculative_blocks=*/num_spec));
+  // SPEC-MTP I5c: the MTP draft head is one extra full_attention decoder layer
+  // (index num_hidden_layers upstream, qwen3_5_mtp.py:105-112) with its OWN paged
+  // K/V — registered as a NEW attention KV layer whose draft names are all layer
+  // names minus the target's (speculator.py:163-169). Sized exactly like a target
+  // full-attn layer; it shares the target's block table / slot mapping. It exists
+  // ONLY when speculative decoding is on (num_spec > 0); num_spec == 0 (the
+  // production default) emits the two pre-I5c groups byte for byte, so the draft
+  // layer is never allocated and the engine is byte-identical when spec is off.
+  if (num_spec > 0) {
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"fa_draft"},
+        std::make_shared<v1::FullAttentionSpec>(
+            block_size, num_kv_heads, head_dim, v1::ResolveKvCacheDType()));
+  }
   return kv;
 }
 

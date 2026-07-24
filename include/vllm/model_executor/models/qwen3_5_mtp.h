@@ -81,6 +81,25 @@ class Qwen3_5MTPModel {
       const vt::Tensor& target_hidden_states, vt::Queue& queue,
       int64_t spec_step_idx = 0) const;
 
+  // PAGED MTP draft forward (SPEC-MTP I5c). Same head math as Forward (the
+  // fc-cat-norm over embed(input_ids) + target_hidden), but the single
+  // full_attention decoder layer reads/writes the DRAFT KV-cache layer through
+  // the paged attention path (vt::ReshapeAndCache + vt::PagedAttention) using the
+  // target's block table / slot mapping — mirroring qwen3_5_mtp.py:129-165 driven
+  // over the paged attention backend the target layers already use, exactly what
+  // AutoRegressiveSpeculator._prefill (speculator.py:332-370) runs each step. The
+  // MTP head is layer_type="full_attention" (qwen3_5_mtp.py:105-112) so no GDN
+  // path is ever taken; `attn_meta` carries slot_mapping / block_table / seq_lens
+  // / query_start_loc and `draft_kv` is the head's own paged K/V layer (index
+  // num_hidden_layers upstream). Over a single-request 1-block KV with a trivial
+  // slot map this reproduces Forward's dense result (the paged==dense anchor).
+  Qwen3_5MTPHiddenStates ForwardPaged(
+      const std::vector<int32_t>& input_ids,
+      const std::vector<int32_t>& positions,
+      const vt::Tensor& target_hidden_states,
+      const v1::CommonAttentionMetadata& attn_meta, PagedKvCache& draft_kv,
+      vt::Queue& queue, int64_t spec_step_idx = 0) const;
+
   // Apply the shared target lm_head to a direct MTP hidden-state return. Logits
   // remain device-resident in ForwardLogits, matching the target hot-path API.
   ForwardLogits ComputeLogits(const vt::Tensor& hidden_states,

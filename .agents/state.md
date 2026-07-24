@@ -22460,3 +22460,116 @@ its `num_sampled`/`num_rejected` + the request's `last_sampled`), then drives th
 `Qwen3_5MTP` paged propose (I5c) over the shifted `input_ids`/`positions`,
 sampling at `last_token_indices`; on the DGX it ports this host loop to the Triton
 kernel over the draft `input_buffers` (identical arithmetic).
+
+---
+
+## 2026-07-24 — SPEC-MTP I5c: PAGED MTP propose forward + draft KV layer (`CLAIM-SPEC-MTP-I5C`)
+
+Base `origin/main` `9721e84` (I5b's tip); isolated worktree `/home/mudler/_git/wt-i5c`
+(branch `spec-mtp-i5c`); CPU `build-cpu` + dgx CUDA `build-cuda`. NOT pushed.
+
+**Scope.** Third of the four scoped M-mtp-1 sub-increments (I5a GDN layer wiring →
+I5b prepare_prefill → **I5c MTP paged propose + draft KV** → I5d config+runner-loop
++27B token gate; `mtp-spec-decode.md` §5). I1 landed a STANDALONE, non-paged MTP
+head forward (op-parity vs a dumped oracle). The real speculative loop needs a
+PAGED draft forward: the MTP head is one `layer_type="full_attention"` decoder
+layer (`qwen3_5_mtp.py:105-112`) that must attend over the paged KV cache using the
+target's block table / slot mapping and write/read its OWN draft K/V. I5c delivers
+that paged forward + its draft KV layer + the target hidden-state tap + a callable
+k=1 propose — all INERT until I5d drives them.
+
+**What landed (mirror `qwen3_5_mtp.py:129-165` over the paged backend +
+`autoregressive/speculator.py` propose/_prefill):**
+- `Qwen3_5MTPModel::ForwardPaged` (`qwen3_5.cpp`): the fc-cat-norm head (extracted
+  into a shared `MtpHeadHidden` so `Forward` stays byte-identical) + one paged
+  decoder layer via the existing `RunDenseLayerPaged`/`RunLayerPaged` +
+  `FullAttnBlockPaged` (ReshapeAndCache + PagedAttention over slot_mapping/
+  block_table), + `MtpFinalize` (mtp.norm). A NEW `BuildFullAttnStepDevInputs`
+  uploads only the full-attn per-step tensors (the draft head has NO GDN layer, so
+  it needs no GDN state slots / metadata — a default `GDNAttentionMetadata` is
+  passed and never read). Over a single-request 1-block KV with a contiguous slot
+  map this reproduces `Forward`'s dense result (the paged==dense anchor property).
+- Draft KV layer: `MakeQwen3_5KVCacheSpec(..., num_spec>0)` appends one extra
+  `FullAttentionSpec` group (`fa_draft`, index `num_hidden_layers`,
+  `speculator.py:163-169`), sized like a target full-attn layer. `num_spec==0` (the
+  production default) is the two pre-I5c groups byte for byte.
+- Hidden-state tap: `Qwen3_5Model::ForwardDeviceTap` / `Qwen3_5DenseModel::
+  ForwardDeviceTap` — threads an INERT optional `const Tensor* hidden_tap` (nullptr
+  default) through `ForwardLayers`/`DenseForwardLayers` + their bodies, copying the
+  full `[T,H]` post-final-norm `dnorm` (before the logits gather) into a device-
+  owning carrier. Every shipped caller passes nullptr, so no shipped forward writes
+  it and the object code is byte-identical there.
+- `MtpProposePrefill` (NEW `src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.{h,cpp}`):
+  the callable k=1 propose — I5b `prepare_prefill_inputs` (shift-splice) → one
+  `ForwardPaged` (reusing the target's attention metadata + slot mappings unchanged,
+  `speculator.py:222-234`) → shared lm_head + argmax at `last_token_indices`
+  (`_greedy_sample_draft` :255-259), k=1 EARLY-EXIT (:236-238). NOT wired into the
+  runner step loop.
+
+**Gates (CPU, this worktree).** Clean full `-Werror` build, 0 warnings.
+- `test_mtp_speculator` 12/12 (161 assertions), +5 NEW I5c cases:
+  paged==standalone (dense head) max|diff|=0 argmax-exact; paged==standalone (MoE
+  head) max|diff|=0 argmax-exact; the draft-KV two-step (with-step1 max|diff|=0 vs
+  the combined forward, RED control fresh-KV max|diff|=0.0117 diverges);
+  `MtpProposePrefill` k=1 (draft == argmax over the expected shift-splice); the tap
+  carrier plumbing.
+- `test_model_registry` KV-spec case 1/1 (41 assertions): num_spec>0 adds the
+  `fa_draft` group sized like the target full-attn group; num_spec==0 = 2 groups.
+- Affected paged-forward tests green (`test_qwen27_paged_forward`,
+  `test_qwen35_paged_forward`) — the tap threading is inert.
+- **RED-first by experiment:** routing `ForwardPaged` to the non-paged
+  `RunDenseLayer` (ignoring the draft KV) makes with-step1 == fresh-KV
+  (both 0.0078) so the two-step `d_red > d_ok` assertion FAILS — proving the test
+  detects the paged draft-KV path. Reverted; final code green.
+- **PRE-EXISTING (not mine):** `test_model_registry` has 5 failing cases / 13
+  failing assertions on BASE `9721e84` too (registry now has 17 arches vs the test's
+  hardcoded 13 — Granite/Olmo2/3/Phi3 from other sweep agents; is_hybrid/multimodal
+  flags; unsupported-message ordering) — my +13 assertions all pass, the 13 failures
+  are unchanged. Verified by building the base tree's `test_model_registry`.
+
+**dgx CUDA gates (`~/mtp_i5c`, `git archive` of `d481333`, banner CONFIRMED:
+cutlass-nvfp4/fp8 + marlin-nvfp4 + fa2 ENABLED for [121a], CUTLASS @
+`~/cutlass-4.5.0`).** Clean full CUDA `-Werror` build 0 warnings / 0 errors (505
+objects; `qwen3_5.cpp`, `qwen3_5_common.cpp`, `spec_decode/mtp/speculator.cpp` all
+recompiled). All GPU work STANDALONE under one `flock $HOME/gpu.lock`.
+- **PAGED MTP head parity BOTH checkpoints (the CORE I5c proof)** — `test_op_parity`
+  RunQwen35MtpHead paged arm, `VLLM_MTP_REQUIRE_CHECKPOINTS=1`, **28/28 assertions,
+  both checkpoints**: paged argmax vs oracle **26/26 unambiguous** (27B + 35B),
+  paged logits top-8 **0/216 out-of-tol** at atol 0.05 + rtol 0.05 (I1's bound),
+  paged==standalone argmax on **26/26 unambiguous rows** (the one non-unambiguous
+  row is the exact oracle tie — same as I1). **RCA (honest, NOT a tolerance-widen):
+  on CUDA the paged path takes the PRODUCTION FA2 prefill kernel over a bf16 draft
+  KV cache while the standalone head uses dense f32 attention**, so paged-vs-standalone
+  differs by bf16-KV rounding + FA2-vs-dense softmax order — max|d| **0.166 (27B) /
+  0.125 (35B)** on logits ~14-20, i.e. within rtol*|val|, the SAME class of delta
+  the whole-model paged==dense anchor already accepts. The **CPU build (both paths
+  non-FA2) is bit-exact (max|d|=0)**, isolating the head math as identical; the CUDA
+  delta is purely the FA2/bf16-KV attention kernel the 27B/35B paged engines already
+  run. The correctness bar (oracle-argmax + atol+rtol) PASSES on both. (My initial
+  gate used a bare-absolute `<= atol` paged-vs-standalone bound that RED-flagged the
+  legitimate FA2 delta; corrected to the oracle-argmax + atol+rtol bar I1 uses.)
+- `test_mtp_speculator` (CUDA build) 12/12 (161 assertions); `test_model_registry`
+  KV-spec case 1/1 (41).
+- **MANDATORY spec-off SACRED gates STANDALONE under flock: 27B
+  `test_qwen27_paged_engine` 235/235 · 35B `test_qwen36_paged_engine` 315/315 ·
+  Qwen3-Coder `test_qwen3coder_paged_engine` 138/138 — ALL PASS** (the tap +
+  draft-layer + paged-MTP additions are inert when spec is off).
+- **compute-sanitizer memcheck on the paged propose: `ERROR SUMMARY: 0 errors`**,
+  gate still 28/28 UNDER the sanitizer (so `ForwardPaged` + `ComputeLogits` RAN
+  on-device). Graph replay==eager N/A (the propose is not graph-captured in I5c).
+
+Non-GDN models (Qwen3-dense, GLM, Gemma, OPT, DeepSeek-V2, Llama, Mistral, OLMo-2,
+Granite-3) byte-identical BY CONSTRUCTION: the `git diff --stat` touches only the
+qwen3_5 family (`qwen3_5.cpp`, its headers, `qwen3_5_common.cpp`), the new
+spec_decode `mtp/speculator.{h,cpp}`, tests, and one CMake line — no other model's
+forward TU, and the MTP path is unreachable with no spec config.
+
+`SPEC-MTP` STAYS `GATING`; `SPEC-GDN-SEGMENTS` unchanged (`ACTIVE`).
+`benchmark_binding=false`, no speed claim — the honest denominator is vLLM with the
+same spec config, owed by I5d. **Resume point (I5d):** wire `MtpProposePrefill` (or
+a speculator class) into the runner step loop after the verify rejection sampler;
+add `--speculative-config` parse + arch resolve, the `take_draft_token_ids`
+out-of-band path, the `GDNAttentionMetadataBuilder::build` spec feed
+(`num_decode_draft_tokens_cpu` / `num_accepted_tokens`), the MIXED spec+non-spec
+`GdnBlockPaged` split/merge (currently refused), then the 3-way 27B k=1 greedy token
+gate vs vLLM same-spec-config.
