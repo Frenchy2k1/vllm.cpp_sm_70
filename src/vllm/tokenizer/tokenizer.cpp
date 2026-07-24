@@ -563,8 +563,11 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
   }
 
   // Added tokens. The special flag does not change encoding; it drives
-  // detokenizer skip logic. lstrip/rstrip/single_word alter matching in ways
-  // we do not emulate; normalized is a no-op without an applied normalizer.
+  // detokenizer skip logic. lstrip/rstrip ARE implemented (see SpecialToken and
+  // Encode(): the matched token eats the adjacent whitespace, mirroring
+  // transformers tokenization_utils.py:670-677). single_word alters word-boundary
+  // matching in a way we do not emulate and stays a loud failure; normalized is a
+  // no-op without an applied normalizer.
   const auto added_it = doc.find("added_tokens");
   if (added_it != doc.end() && !added_it->is_null()) {
     if (!added_it->is_array()) Fail("added_tokens is not an array");
@@ -579,12 +582,16 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
       t.text = entry["content"].get<std::string>();
       t.special = entry.value("special", false);
       if (t.text.empty()) Fail("added token with empty content");
-      // lstrip/rstrip only strip whitespace ADJACENT to the special token when it
-      // is matched during encoding; since our greedy gate prompts never contain
-      // these special tokens, ignoring the strip is exactly correct for the gate
-      // (and diff-inert: every checkpoint that previously loaded set neither flag).
-      // Phi-4-mini's <|assistant|>-family tokens set rstrip. single_word genuinely
-      // changes word-boundary matching, so it stays unsupported.
+      // REAL semantics, not accept-and-ignore: a token flagged rstrip eats the
+      // whitespace after its match, lstrip the whitespace before it. Silently
+      // dropping the flag mis-tokenizes every checkpoint that sets it (e.g.
+      // Phi-4-mini's <|assistant|>/<|end|>/<|user|>/<|system|>/<|tool|> family,
+      // all rstrip=true), so we carry it into Encode().
+      t.lstrip = entry.value("lstrip", false);
+      t.rstrip = entry.value("rstrip", false);
+      // single_word genuinely changes word-boundary matching (the token is NOT
+      // split off mid-word, transformers tokenization_utils.py:678-681); we do
+      // not emulate it, so refuse loudly rather than mis-tokenize.
       if (entry.value("single_word", false)) {
         Fail("added token \"" + t.text +
              "\" uses unsupported option \"single_word\"");
@@ -839,6 +846,45 @@ void Tokenizer::EncodePlainSp(std::string_view text, bool at_input_start,
   }
 }
 
+namespace {
+
+// AddedToken rstrip: the index just past the whitespace run that starts at
+// `pos`. Mirrors python `right.lstrip()` on the segment FOLLOWING the matched
+// token (transformers tokenization_utils.py:670-673); IsWhitespace() is exactly
+// python str.isspace(), the predicate str.lstrip() uses.
+size_t SkipWhitespaceForward(std::string_view text, size_t pos) {
+  while (pos < text.size()) {
+    size_t next = pos;
+    const uint32_t cp = DecodeUtf8(text, next);
+    if (!IsWhitespace(cp)) break;
+    pos = next;
+  }
+  return pos;
+}
+
+// AddedToken lstrip: the index of the start of the trailing whitespace run of
+// text[begin, end). Mirrors python `left.rstrip()` on the segment PRECEDING the
+// matched token (transformers tokenization_utils.py:675-676).
+size_t TrimWhitespaceBackward(std::string_view text, size_t begin, size_t end) {
+  while (end > begin) {
+    // Walk back to the lead byte of the last codepoint (continuation bytes are
+    // 10xxxxxx); a malformed tail decodes as one byte, matching DecodeUtf8.
+    size_t start = end - 1;
+    while (start > begin &&
+           (static_cast<uint8_t>(text[start]) & 0xC0) == 0x80 &&
+           end - start < 4) {
+      --start;
+    }
+    size_t next = start;
+    const uint32_t cp = DecodeUtf8(text, next);
+    if (next != end || !IsWhitespace(cp)) break;
+    end = start;
+  }
+  return end;
+}
+
+}  // namespace
+
 std::vector<int32_t> Tokenizer::Encode(std::string_view text) const {
   std::vector<int32_t> out;
   size_t pos = 0;
@@ -869,13 +915,20 @@ std::vector<int32_t> Tokenizer::Encode(std::string_view text) const {
       }
       break;
     }
+    // lstrip: the matched token eats the whitespace run immediately before it,
+    // so the preceding segment is shortened (python `left.rstrip()`).
+    const size_t seg_end =
+        best->lstrip ? TrimWhitespaceBackward(text, pos, best_pos) : best_pos;
     if (family_ == Family::kSentencePiece) {
-      EncodePlainSp(text.substr(pos, best_pos - pos), at_input_start, out);
+      EncodePlainSp(text.substr(pos, seg_end - pos), at_input_start, out);
     } else {
-      EncodePlain(text.substr(pos, best_pos - pos), out);
+      EncodePlain(text.substr(pos, seg_end - pos), out);
     }
     out.push_back(best->id);
     pos = best_pos + best->text.size();
+    // rstrip: the matched token also eats the whitespace run right after it, so
+    // the next segment starts past it (python `right.lstrip()`).
+    if (best->rstrip) pos = SkipWhitespaceForward(text, pos);
   }
   return out;
 }

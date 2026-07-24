@@ -110,6 +110,42 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 ## Active claims
 
+**Red-gate RCA coordination note (2026-07-24, `CLAIM-REDGATE-RCA`, DONE,
+direct-to-main).** Cleared the two red gates a sibling surfaced on `origin/main`.
+Recorded as a note (no `SPIKE`/`ACTIVE` matrix row): it is a correctness fix plus
+two RCAs, not a new capability row. Worktree `/home/mudler/wt-redgates` (branch
+`fix/red-gates-tokenizer-anchors`, base `origin/main` `1e14f60`), dgx tree
+`~/redgate/s-1e14f60` transferred by `git archive`, every GPU stage under
+`flock $HOME/gpu.lock` on a verified-idle GPU. Owned files ONLY:
+`src/vllm/tokenizer/tokenizer.cpp`, `include/vllm/tokenizer/tokenizer.h`,
+`tests/vllm/test_bpe.cpp`, plus the record surfaces (README, BENCHMARKS, ledger,
+state, this note). Did NOT touch the coordination-prohibited areas (GDN
+attention/state-slot path — I4; `examples/server/main.cpp` +
+`src/vllm/entrypoints/model_loader.cpp` — CLI agent; `speculative.h`,
+`v1/core/sched/*`, the rejection-sampler/input-batch layer — landed I2/I3 ABI).
+- **RED #1 (test_bpe): a REAL live bug, fixed by implementing the semantics.**
+  `4e9f1d2`'s accept-and-ignore of `lstrip`/`rstrip` silently mis-tokenized
+  `microsoft/Phi-4-mini-instruct` (10 of its 12 added tokens set `rstrip=true`).
+  Proven on dgx: our `tokenize` tool on the real Phi-4-mini `tokenizer.json`
+  matched the HF `tokenizers` 0.22.2 oracle ONLY after the fix; the
+  accept-and-ignore build diverged on 4/4 prompts. Now the matched token eats the
+  adjacent whitespace exactly like transformers `tokenization_utils.py:670-677`.
+  `single_word` stays a loud refusal (unemulated word-boundary semantics).
+- **RED #2 (Qwen3-dense + Mistral "anchor drift"): NOT a regression and NOT
+  stale goldens — a BUILD-CONFIG artifact.** All three SACRED gates PASS 16/16 on
+  a clean CANONICAL build of current `origin/main` (`1e14f60`, CUTLASS 4.5.0 +
+  FA2 + Triton AOT, arch `121a`), reproduced 3x. The sibling's failure came from a
+  DEGRADED build (its `third_party/cutlass` lacked 4.5.0 -> `VLLM_CPP_CUTLASS`
+  OFF -> the Qwen3-dense/Mistral FlashAttention-2 kernels never compiled, arch 75,
+  Triton OFF). A same-binary A/B on the canonical build (`VT_FA2_PREFILL_QWEN3=0
+  VT_FA2_DECODE_QWEN3=0`) reproduces the sibling's BYTE-IDENTICAL signature
+  (q06 p0 tok5->15344, q4b p2 tok11->323, mistral p5 tok10->1281): with FA2 off the
+  fallback attention resolves the model's genuine bf16 near-ties the other way.
+  The sibling's same-tree A/B looked "byte-identical on both arms" because BOTH
+  arms were built FA2-off. Goldens are CORRECT for the production config;
+  **md5 unchanged before/after, no regeneration.** The ledger row 662 inference
+  "stale anchors, an unclaimed fix" is corrected here.
+
 **MTP coordination note (2026-07-24, `CLAIM-MTP-I1-HEAD-ORACLE`, DONE).**
 Increment I1 of the MTP campaign closed **M-mtp-0**: it captured the draft-head
 oracle golden on both gate checkpoints and turned the previously SKIP'd parity

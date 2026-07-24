@@ -22260,3 +22260,55 @@ qwen3_5 GDN layer-forward (`GdnBlockPaged` in `qwen3_5.cpp`) must route spec row
 through `vt::GdnSpecDecode` + `vt::CausalConv1dSpecUpdate` mirroring
 `qwen_gdn_linear_attn.py:1344-1356,1455-1476` (the conv/recurrence spec branches
 of `_forward_core`), gated on `meta.num_spec_decodes > 0`.
+
+## 2026-07-24 — RED-GATE RCA + FIX: `lstrip`/`rstrip` real semantics; `anchor drift` is a BUILD-CONFIG artifact (`CLAIM-REDGATE-RCA`)
+
+Base `origin/main` `1e14f60`; worktree `/home/mudler/wt-redgates` branch
+`fix/red-gates-tokenizer-anchors`; dgx tree `~/redgate/s-1e14f60` via `git
+archive`; GPU under `flock $HOME/gpu.lock`. Two red gates a sibling surfaced.
+
+**RED #1 — `test_bpe` (CPU): a REAL live bug, resolved by IMPLEMENTING the
+semantics.** `4e9f1d2` made `tokenizer.cpp` accept-and-ignore added-token
+`lstrip`/`rstrip`. Grounding in upstream showed this is a correctness bug, not a
+benign relaxation: transformers `tokenization_utils.py:670-677` has the matched
+special token EAT the whitespace run to its left (`lstrip`) / right (`rstrip`),
+and a scan of every gated HF checkpoint found `microsoft/Phi-4-mini-instruct`
+sets `rstrip=true` on 10 of its 12 added tokens (`<|assistant|>`, `<|end|>`,
+`<|user|>`, `<|system|>`, `<|tool|>`, …). So ignoring the flag mis-tokenizes a
+gated checkpoint. Fix: `SpecialToken` carries `bool lstrip/rstrip`; `Encode`
+trims the adjacent whitespace run with two UTF-8-aware helpers over
+`IsWhitespace` (python `str.isspace()`). `single_word` stays a loud refusal.
+PROOF it was live: on dgx, `examples/tokenize` on the real Phi-4-mini
+`tokenizer.json` over a special-token corpus matched HF `tokenizers` 0.22.2
+byte-for-byte AFTER the fix, and the pre-fix accept-and-ignore build diverged on
+all 4 prompts. `test_bpe` 18 cases / 905 assertions GREEN (CPU + dgx CUDA, clean
+`-Werror`), every id-vector oracle-verified.
+
+**RED #2 — Qwen3-dense + Mistral `anchor drift`: NOT a regression, NOT stale
+goldens — a BUILD-CONFIG artifact.** The standing lesson (verify "not mine" on a
+clean build of current main) paid off. Clean CANONICAL CUDA build of `1e14f60`
+(CUTLASS 4.5.0 + FA2 + Triton AOT, arch `121a`): `test_qwen3_paged_engine` +
+`test_mistral_paged_engine` PASS, reproduced 3×. The sibling built a DEGRADED
+config: `-DVLLM_CPP_CUDA=ON` at a `third_party/cutlass` lacking 4.5.0 →
+`VLLM_CPP_CUTLASS` OFF → the Qwen3-dense/Mistral FlashAttention-2 kernels never
+compiled (they are gated `if(... AND VLLM_CPP_CUTLASS ...)`), arch 75, Triton
+OFF. Same-binary A/B on the canonical build proves the mechanism:
+`VT_FA2_PREFILL_QWEN3=0 VT_FA2_DECODE_QWEN3=0` reproduces the sibling's EXACT
+byte-identical signature (q06 p0 tok5→15344 vs anchor 96251; q4b p2 tok11→323 vs
+111; mistral p5 tok10→1281 vs 1535) — with FA2 off the fallback attention
+resolves the model's genuine bf16 near-ties the other way. Rebuilding `86fff01`
+with the sibling's degraded flags reproduces the failure; adding
+`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` back makes it PASS. The sibling's
+same-tree A/B looked "identical on both arms" because BOTH arms were built
+FA2-off — a build artifact, not a golden problem. **Goldens md5 unchanged
+before/after; NO regeneration.** This corrects parity-ledger row 662's
+conclusion ("stale anchors, an unclaimed fix").
+
+**Gates.** CPU `-Werror` clean build 0 warnings; CUDA `-Werror` clean build 0
+warnings. Full CPU ctest 235/238: the 2 non-green are the pre-existing
+`test_model_loader_gguf` + `test_model_registry` (stale arch-count/Llama-support
+expectations from the recent model additions, identical to base), plus
+`test_openai_conformance` — a `-j8` load flake that passes standalone and within
+its 7-test server family. `test_bpe` went RED→GREEN, the ONLY delta vs base. The
+two big SACRED gates re-run green with the fix (inert for Qwen3/Mistral: 0
+flagged added tokens). All five record checkers green by bare RC.
