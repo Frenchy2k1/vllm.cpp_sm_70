@@ -4,6 +4,7 @@
 #include "vllm/model_executor/models/qwen3_5_common.h"
 
 #include <cstdlib>
+#include <optional>
 
 #include "vllm/model_executor/models/qwen3_5.h"           // ForwardLogits
 #include "vllm/model_executor/models/qwen3_5_internal.h"  // ResolveMambaSsmCacheDType
@@ -30,6 +31,11 @@ ForwardLogits HostLogits(std::vector<float>&& host, int64_t vocab) {
 
 v1::KVCacheConfig MakeQwen3_5KVCache(const HfConfig& config, int block_size,
                                      int num_blocks) {
+  return MakeQwen3_5KVCacheSpec(config, block_size, num_blocks, /*num_spec=*/0);
+}
+
+v1::KVCacheConfig MakeQwen3_5KVCacheSpec(const HfConfig& config, int block_size,
+                                         int num_blocks, int num_spec) {
   const int num_kv_heads = static_cast<int>(config.num_key_value_heads);
   const int head_dim = static_cast<int>(config.head_dim);
   const int num_value_heads = static_cast<int>(config.linear_num_value_heads);
@@ -67,12 +73,21 @@ v1::KVCacheConfig MakeQwen3_5KVCache(const HfConfig& config, int block_size,
           block_size, num_kv_heads, head_dim, v1::ResolveKvCacheDType()));
   kv.kv_cache_groups.emplace_back(
       std::vector<std::string>{"gdn"},
+      // SPEC-MTP I4: with k speculative tokens the conv row widens to
+      // (K-1)+k taps (mamba_utils.py:226 `conv_kernel_size - 1 + num_spec`) so
+      // the sliding window can be rewound to the accepted count, and
+      // num_speculative_blocks = k gives MambaManager the k+1 SSM snapshot slots
+      // per request (mamba/abstract.py:55-59). num_spec == 0 is the production
+      // default and reproduces the pre-I4 spec byte for byte.
       std::make_shared<v1::MambaSpec>(
           block_size,
           std::vector<std::vector<int64_t>>{
-              {conv_dim, conv_kernel - 1},
+              {conv_dim, conv_kernel - 1 + num_spec},
               {num_value_heads, value_head_dim, key_head_dim}},
-          std::vector<vt::DType>{conv_dtype, ssm_dtype}));
+          std::vector<vt::DType>{conv_dtype, ssm_dtype},
+          /*page_size_padded=*/std::nullopt,
+          /*mamba_cache_mode=*/"none",
+          /*num_speculative_blocks=*/num_spec));
   return kv;
 }
 

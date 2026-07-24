@@ -16,24 +16,32 @@
 // boundary in that reordered batch. We mirror the same split; the reorder is the
 // runner's job (M1.5 InputBatch), not the builder's.
 //
+// ─── SPEC-DECODE segmentation (SPEC-MTP I4, LANDED) ─────────────────────────
+// The spec branch of gdn_attn.py build() (:189-326) is now ported: a request
+// carrying drafts becomes a multi-token SPEC row, non-spec decodes are
+// reclassified as prefills whenever any spec row exists (:243-251), and the
+// per-request k+1 state-slot layout (spec_state_indices_tensor) plus the
+// gather-order token index vectors (spec_token_indx / non_spec_token_indx) are
+// emitted. The FULL-cudagraph request-count padding (:413-462) is ported too.
+//
+// DEFAULT-OFF CONTRACT: a builder constructed with num_spec == 0 (every
+// production configuration today — no SpeculativeConfig ⇒ no drafts) takes the
+// SAME code path as before this change: `use_spec_decode()` is false, so
+// spec_sequence_masks is nullopt and build() runs the identical non-spec branch.
+// The 3-argument `build()` override never populates a spec field.
+//
 // ─── DEFERRED upstream fields (T0 gate models never exercise them) ──────────
-//   * Spec-decode segmentation (spec_query_start_loc / spec_state_indices_tensor
-//     / spec_sequence_masks / spec_token_indx / non_spec_token_indx /
-//     num_accepted_tokens / num_spec_decodes / num_spec_decode_tokens). T0 gate
-//     models (Qwen3.6) do not speculative-decode. Carried as fields for 1:1
-//     fidelity; build() leaves them empty / num_spec_decodes == 0. See the
-//     `spec` region below and the marked stub in build().
 //   * Triton-kernel launch metadata: chunk_indices / chunk_offsets (FLA chunk
 //     kernel) and nums_dict / batch_ptr / token_chunk_offset_ptr (Triton
-//     causal_conv1d). OMITTED: our sequential C++ vt::GdnPrefill and
+//     causal_conv1d). OMITTED: our sequential C++ vt::GdnPrefill /
+//     vt::GdnSpecDecode and
 //     vt::CausalConv1dFwd consume `prefill_query_start_loc` + a
 //     `has_initial_state` mask DIRECTLY (ops.h — GdnPrefill takes
 //     query_start_loc; CausalConv1dFwd takes query_start_loc + has_initial_state),
 //     so the chunk/conv-tile precompute has no C++ consumer. Upstream itself
 //     tolerates them being None — the FLA ops recompute on the fly
 //     (gdn-semantics.md §8).
-//   * cudagraph capture (build_for_cudagraph_capture, the full-CG padding of the
-//     request-indexed tensors) and the FLA/cutedsl prefill-backend selection.
+//   * the FLA/cutedsl prefill-backend selection.
 #ifndef VLLM_V1_ATTENTION_BACKENDS_GDN_ATTN_H_
 #define VLLM_V1_ATTENTION_BACKENDS_GDN_ATTN_H_
 
@@ -49,6 +57,14 @@ namespace vllm::v1 {
 
 // Upstream helper vllm/v1/attention/backends/utils.py:46.
 inline constexpr int32_t kNullBlockId = 0;  // NULL_BLOCK_ID
+
+// RECORDED DEVIATION from upstream's NULL_BLOCK_ID. vLLM reserves paged block 0
+// as the null block, so its kernels treat `state_idx <= 0` as "skip this row".
+// Our GDN state cache has no reserved row — slot 0 is a live slot — so the local
+// cache ABI (documented on vt::GdnDecode / vt::GdnPackedDecode in include/vt/ops.h)
+// uses a NEGATIVE sentinel instead: `state_idx < 0` ⇒ skip. Padded spec rows are
+// therefore filled with this value, not with 0.
+inline constexpr int32_t kNullStateSlot = -1;
 
 // Finds the decode/prefill boundary in an already decode-first-reordered batch
 // (utils.py::split_decodes_and_prefills @ e24d1b24, T0 subset:
@@ -71,8 +87,10 @@ struct GDNAttentionMetadata : AttentionMetadata {
   int num_prefill_tokens = 0;
   int num_decodes = 0;
   int num_decode_tokens = 0;
-  int num_spec_decodes = 0;        // DEFERRED (spec): always 0 at T0.
-  int num_spec_decode_tokens = 0;  // DEFERRED (spec): always 0 at T0.
+  // Spec-decode counts (gdn_attn.py:46-47). 0 on every non-speculative step —
+  // the default production configuration.
+  int num_spec_decodes = 0;
+  int num_spec_decode_tokens = 0;
   int num_actual_tokens = 0;
 
   // has_initial_state = context_lens (num_computed_tokens) > 0, per request, in
@@ -113,12 +131,44 @@ struct GDNAttentionMetadata : AttentionMetadata {
   std::optional<std::vector<int32_t>> prefill_state_indices;
   std::optional<std::vector<uint8_t>> prefill_has_initial_state;
 
-  // ── Spec-decode segmentation (DEFERRED T0 stub; see header) ──
+  // ── Spec-decode segmentation (SPEC-MTP I4; gdn_attn.py:189-326) ────────────
+  // All nullopt / 0 unless the step actually carries drafts.
+  //
+  // spec_query_start_loc [num_spec_decodes + 1]: cumulative query offsets of the
+  // SPEC sub-batch only, i.e. cumsum(query_lens[spec_sequence_masks])
+  // (gdn_attn.py:290-297). Indexes the spec token stream AFTER the
+  // spec_token_indx gather, so entry i is where request i's 1+k query tokens
+  // begin.
   std::optional<std::vector<int32_t>> spec_query_start_loc;
+
+  // spec_state_indices_tensor: ROW-MAJOR [num_spec_decodes, num_spec + 1] slice
+  // of the block table (gdn_attn.py:266-269 / :285-287). Row i column t is the
+  // GDN state slot that timestep t of request i writes its post-token snapshot
+  // into; column `num_accepted-1` is where the NEXT step reads its initial
+  // state. `spec_state_indices_num_cols` is num_spec + 1 (upstream's
+  // `.size(-1)`, also the conv `max_query_len`); the flat vector is
+  // num_spec_decodes*num_cols long (or num_reqs*num_cols after CG padding).
   std::optional<std::vector<int32_t>> spec_state_indices_tensor;
+  int spec_state_indices_num_cols = 0;
+
+  // spec_sequence_masks [num_reqs]: 1 where the request carries drafts
+  // (gdn_attn.py:200-206), in the batch's own order.
   std::optional<std::vector<uint8_t>> spec_sequence_masks;
+
+  // Token gather orders (gdn_attn.py:277-283). spec_token_indx lists the flat
+  // token positions belonging to spec rows, non_spec_token_indx the rest; both
+  // in a STABLE sort of the per-token spec mask, so each preserves the batch's
+  // original relative token order. The GDN layer index-selects the packed
+  // mixed_qkv rows with them (qwen_gdn_linear_attn.py:1440-1446).
   std::optional<std::vector<int32_t>> spec_token_indx;
   std::optional<std::vector<int32_t>> non_spec_token_indx;
+
+  // num_accepted_tokens [num_spec_decodes] (or [num_reqs] after CG padding):
+  // how many of the PREVIOUS step's 1+k positions were accepted, per spec row
+  // (gdn_attn.py:325). Seeded to 1, so slot 0 is the first read. This is the
+  // ROLLBACK selector: the kernels read the initial SSM state from
+  // spec_state_indices_tensor[i][num_accepted_tokens[i] - 1] and advance the
+  // conv window by exactly num_accepted_tokens[i] - 1 taps.
   std::optional<std::vector<int32_t>> num_accepted_tokens;
 };
 
@@ -131,15 +181,43 @@ class GDNAttentionMetadataBuilder final
   // requests with query_len <= this threshold sit at the front.
   static constexpr int kReorderBatchThreshold = 1;
 
+  // num_spec mirrors `self.num_spec` (gdn_attn.py:104-109): the resolved
+  // `num_speculative_tokens`, or 0 when there is no SpeculativeConfig — the
+  // production default, for which every spec branch below is dead code.
+  // use_full_cuda_graph mirrors `self.use_full_cuda_graph` (:111-113) and only
+  // enables the request-count padding of the request-indexed spec metadata.
   GDNAttentionMetadataBuilder() = default;
+  explicit GDNAttentionMetadataBuilder(int num_spec,
+                                       bool use_full_cuda_graph = false)
+      : num_spec_(num_spec), use_full_cuda_graph_(use_full_cuda_graph) {}
 
-  // T0 non-spec build. common_prefix_len (cascade attention) and fast_build are
-  // accepted for interface fidelity but unused here. Spec-decode kwargs
-  // (num_accepted_tokens / num_decode_draft_tokens_cpu) are DEFERRED — T0 has no
-  // speculative config so num_spec == 0 and the spec branch is never taken.
+  // Non-spec build. common_prefix_len (cascade attention) and fast_build are
+  // accepted for interface fidelity but unused here. Equivalent to calling the
+  // spec overload with both spec arguments null — which is what it does.
   GDNAttentionMetadata build(int common_prefix_len,
                              const CommonAttentionMetadata& common_attn_metadata,
                              bool fast_build = false) override;
+
+  // Spec-decode build (gdn_attn.py:167-172 kwargs).
+  //   num_accepted_tokens        [num_reqs] — accepted count of the PREVIOUS
+  //                              step per request (>= 1); required whenever any
+  //                              spec row exists (upstream asserts at :324).
+  //   num_decode_draft_tokens    [num_reqs] — number of DRAFT tokens carried by
+  //                              each request, or -1 for a non-spec row (the
+  //                              sentinel built by mamba_hybrid.py:247-264).
+  // Passing nullptr for either reproduces the non-spec build exactly.
+  GDNAttentionMetadata build(
+      int common_prefix_len, const CommonAttentionMetadata& common_attn_metadata,
+      const std::vector<int32_t>* num_accepted_tokens,
+      const std::vector<int32_t>* num_decode_draft_tokens_cpu,
+      bool fast_build = false);
+
+  int num_spec() const { return num_spec_; }
+  bool use_spec_decode() const { return num_spec_ > 0; }
+
+ private:
+  int num_spec_ = 0;
+  bool use_full_cuda_graph_ = false;
 };
 
 // Upstream GDNAttentionBackend (gdn_attn.py:27-38). A state-space (mamba) backend

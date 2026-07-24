@@ -411,6 +411,78 @@ state by acceptance count.** No copies, no undo.
   we mirror it; at DFlash's k=8/16 it becomes a first-order sizing input, see
   the DFlash spec §5.)
 
+### 3.2 SPEC-GDN-SEGMENTS I4 — LANDED (2026-07-24)
+
+I4 lands the whole §3 mechanism against the §2.7 frozen ABI (consumes
+`InputBatch::num_accepted_tokens` and `SchedulerOutput::scheduled_spec_decode_tokens`,
+defines neither). It is DEFAULT-OFF and INERT: the builder's `num_spec` is 0
+without a `SpeculativeConfig`, so `spec_sequence_masks` is never populated and
+`num_spec_decodes` stays 0. **No shipped kernel gained a branch** — both spec
+kernels are NEW op ids (`kGdnSpecDecode`, `kCausalConv1dSpecUpdate`) with their
+own entry points, so `GdnDecode`/`GdnPackedDecode`/`CausalConv1dUpdate`/`GdnPrefill`
+are untouched object code.
+
+**Metadata split + reclassification** — `GDNAttentionMetadataBuilder`
+(`src/vllm/v1/attention/backends/gdn_attn.cpp`) gains `num_spec`/`use_full_cuda_graph`
+and a `build()` overload taking `num_accepted_tokens` + `num_decode_draft_tokens`
+(−1 sentinel = non-spec row). The 3-argument override now DELEGATES to it with
+null spec arguments, so there is exactly ONE implementation. Mirrors
+`gdn_attn.py:189-326`: spec/non-spec partition, the decode→prefill
+reclassification (`:243-251`, the #34845 crash), the k+1-column
+`spec_state_indices_tensor`, `spec_query_start_loc`, the stable-sorted
+`spec_token_indx`/`non_spec_token_indx`, `spec_sequence_masks`, and the
+mask-filtered `num_accepted_tokens`; the FULL-cudagraph padding (`:413-462`) pads
+the REQUEST-indexed metadata to `num_reqs` (never the token count) with NULL
+slots and accepted=1. **RECORDED DEVIATION:** upstream's NULL sentinel is block 0
+(`state_idx <= 0` skips); our GDN cache has no reserved row (slot 0 is live), so
+the local ABI uses a NEGATIVE sentinel (`kNullStateSlot = -1`), matching the
+existing `vt::GdnDecode`/`GdnPackedDecode` cache ABI.
+
+**GDN `T>1`/`IS_SPEC` recurrence** — new `vt::GdnSpecDecode` (CPU reference +
+CUDA), ports `fla/ops/fused_sigmoid_gating.py:66-72,103-116,156-166`. The CUDA
+kernel reuses `GdnDecodeFusedKernel`'s geometry and per-token arithmetic verbatim
+and adds only the initial-slot select (column `num_accepted[i]-1`) and the
+per-timestep snapshot write-back (to column `t`). **BIT-EXACT reference:** a T==1
+/ accepted==1 spec call reproduces `vt::GdnDecode` bit-for-bit (memcmp), and every
+per-timestep snapshot slot j is memcmp-identical to a chain of shipped
+`vt::GdnDecode` calls over only tokens 0..j — asserted at the real 27B (Hv=48) and
+35B (Hv=32) GDN dims, Dk=Dv=128, on CPU and CUDA.
+
+**Conv state honouring `num_accepted_tokens`** — new `vt::CausalConv1dSpecUpdate`,
+ports `causal_conv1d.py:818-1067` + the wrapper's `state_len = width-1 + (seqlen-1)`
+(`:1181-1184`). The conv row widens to `(K-1)+k` taps; it is read at offset
+`num_accepted-1` and shifted left by exactly ONE tap per step, so the window
+advances by the ACCEPTED count, not by `1+k`. The conv needs no extra SLOTS, only
+column 0 of the spec index row (`qwen_gdn_linear_attn.py:1350`).
+
+**Allocation** — `MakeQwen3_5KVCacheSpec(config, block_size, num_blocks, num_spec)`
+sets the conv row to `conv_kernel-1+num_spec` (`mamba_utils.py:226`) and
+`MambaSpec::num_speculative_blocks = num_spec` (`mamba/abstract.py:55-59`),
+driving the already-present `MambaManager` k+1 block allocation. The registered
+`KVCacheSpecBuilder` delegates with `num_spec=0`, so the production spec is
+byte-unchanged.
+
+**MEASURED state-memory cost** (from the real dims; pinned by
+`test_model_registry`): one f32 SSM slot is `Hv·Dv·Dk·4B`. **35B** (Hv=32):
+32·128·128·4 = **2.0 MiB/slot/layer**, ×30 GDN layers = **60 MiB per extra slot
+per request**; **27B** (Hv=48): **3.0 MiB/slot/layer**, ×48 GDN layers = **144
+MiB per extra slot per request**. `k=1` allocates one extra slot, so it DOUBLES
+the GDN SSM state per in-flight request; the conv row grows by only
+`conv_dim·sizeof(bf16)` per block. On GB10's 119 GiB unified pool this is a
+per-concurrency multiplier on the GDN state, not on the weights — at decode
+concurrency 16 the 27B extra SSM state is ~16·144 MiB ≈ 2.25 GiB, within
+headroom; it becomes a first-order sizing input only at DFlash k=8/16 (DFlash
+spec §5).
+
+**Tests.** `test_gdn_metadata_builder` (20 cases / 483 assertions) grows the whole
+upstream `GDN_BUILD_TEST_CASES` table + reclassification + CG-padding cases +
+the default-off byte-identity proof; `test_ops_gdn` grows the reject-at-every-j
+rollback proof (CPU + CUDA, real dims) for both the SSM recurrence and the conv
+window; `test_model_registry` pins the k+1 slot / widened-conv sizing and the
+`num_spec==0` byte-identity. RED-first proven by four reverted experiments (the
+hardwired-0 metadata, the wrong-snapshot-slot, the ignore-accepted read, and the
+1+k conv advance all fail).
+
 ## 4. Our-code touch points (survey, file:line)
 
 | area | where | change |
