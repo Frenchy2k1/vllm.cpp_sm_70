@@ -180,6 +180,30 @@ bundled server hardcoding the `hermes` tool parser with reasoning off, and so
 on); and 153 production environment variables of which exactly one appears in
 the README. Fix plan in impact order lives in the spec.
 
+**T2 fix-wave coordination note (2026-07-24, `CLAIM-DOCS-T2-FIXES`, DONE).**
+Executed Tier 2 of [specs/docs-coverage-audit.md](specs/docs-coverage-audit.md):
+the D1 safety guard plus the three shipped-but-unreachable user surfaces.
+Isolated worktree, branch `t2-fix-wave`, base `ba4dd62`; CPU build + full CPU
+ctest, no GPU. Owned scope: `include/vllm/v1/kv_offload/kv_connector.h`,
+`src/vllm/v1/kv_offload/kv_connector.cpp`,
+`include/vllm/v1/kv_offload/lmcache/lmcache_connector.h`,
+`src/vllm/v1/kv_offload/lmcache/lmcache_connector.cpp`,
+`{include,src}/vllm/config/kv_transfer.*`,
+`{include,src}/vllm/entrypoints/openai/tool_parsers/{abstract,detect}.*`,
+`{include,src}/vllm/entrypoints/openai/reasoning_parsers/{abstract,detect}.*`,
+`examples/server/main.cpp`, the `BuildKvConnector` guard call in
+`src/vllm/entrypoints/model_loader.cpp` (three lines, additive — the file is
+shared with a sibling claim), `tests/vllm/v1/test_kv_offload_connector.cpp`,
+`tests/vllm/entrypoints/openai/{tool_parsers,reasoning_parsers}/test_detect.cpp`,
+`docs/KV-OFFLOAD.md` (new), the README flag/model/notes rows, and the
+engine-matrix `SERVE-C-ABI` / `KV-OFFLOAD` / `KV-CONNECTORS` /
+`TOOLS-CALLING-CORE` rows. It moved no matrix row STATE. **The honest headline:
+the disk connector's worker half is still NOT implemented — this wave makes the
+engine REFUSE it loudly instead of silently serving output computed over KV that
+was never written. That is a safety fix, not the feature.** Deliberately NOT
+done here: `docs/ENVIRONMENT.md` (the 153-variable reference, a separate
+increment) and the Tier-3 README restructuring.
+
 **Structured-output coordination note (2026-07-23, `CLAIM-CAPI-STRUCTURED-V2`,
 DONE, direct-to-main, user-directed).** Production-wired the engine-wide
 `StructuredOutputManager` (LoadedEngine -> Scheduler/EngineCore/AsyncLLM) and

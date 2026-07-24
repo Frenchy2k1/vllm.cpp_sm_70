@@ -288,12 +288,26 @@ std::unique_ptr<KVConnector> LMCacheConnector::CreateFromConfig(
       new LMCacheConnector(std::move(conn_cfg), std::move(client_cfg)));
 }
 
+// See the header: the worker half is device-agnostic (it moves whole K/V planes
+// through vt::Backend::Copy, which every backend implements), so every device
+// is admitted. This is deliberately NOT `return device == kCUDA`: the LMCache
+// output-invariance gate that proved the store/load cycle bit-exact runs on the
+// CPU backend, and the same runner code drives both.
+bool LMCacheConnector::WorkerTransferSupportedOn(vt::DeviceType /*device*/) {
+  return true;
+}
+
 }  // namespace vllm::v1::kv_offload::lmcache
 
 // Self-register the LMCache lm:// connector (mirrors factory.py registering
 // "LMCacheConnectorV1"). Compile-time registration replaces vLLM's dynamic
 // importlib path (recorded W5 deviation). Selected by
 // KVTransferConfig{kv_connector = "LMCacheConnector"}.
-REGISTER_KV_CONNECTOR(
+//
+// Registered WITH its worker-transfer predicate: this is the one connector
+// whose worker half exists, so it is the one the engine admits (see
+// KVConnector::supports_worker_transfer_on and BuildKvConnector's guard).
+REGISTER_KV_CONNECTOR_WITH_WORKER(
     lmcache, "LMCacheConnector",
-    &::vllm::v1::kv_offload::lmcache::LMCacheConnector::CreateFromConfig)
+    &::vllm::v1::kv_offload::lmcache::LMCacheConnector::CreateFromConfig,
+    &::vllm::v1::kv_offload::lmcache::LMCacheConnector::WorkerTransferSupportedOn)

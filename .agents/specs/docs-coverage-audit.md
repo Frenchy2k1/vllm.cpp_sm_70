@@ -119,16 +119,16 @@ Ordered by user impact. `→` marks the concrete fix.
 | B2 | **README:74 "Gemma 1 / 2 / 4 remain spiked-only"** contradicts README:31-32 in the SAME document, which record Gemma-2 (48/48 near-tie-band) and Gemma-1 (STRICT 48/48) as Correctness-complete, and contradicts `.agents/model-matrix.md` (`GemmaForCausalLM` ✅, `Gemma2ForCausalLM` ✅) | landed by `a60b88b`; the Features table was updated, the Supported-models prose was not | the README calls its own shipped models unimplemented | → rewrite that sentence to "Gemma 1 / 2 / 3 are landed; Gemma 4 remains blocked". **Fixed in the closing commit.** |
 | B3 | **README:287 "Tool calling uses a Hermes-style / Qwen3 parser subset; the Qwen3-Coder XML forced-reasoning template is not fully implemented"** contradicts README:45 ("39 dialects, streaming, every vLLM tool parser at the pin except the three Rust/Harmony-backed ones") and the code, which has `qwen3_coder` / `qwen3_xml` / `mimo` | `src/vllm/entrypoints/openai/tool_parsers/qwen3_coder.cpp`; `abstract.cpp:174`; waves `b846f2a`, `da93382`, `954a3c5`, `cbcc612`, `df8909b` | understates the largest single feature the project shipped | → delete/replace the bullet. **Fixed in the closing commit.** |
 | B4 | README:74 "`Olmo3ForCausalLM` rides the same class ...; the Olmo-3 interleaved sliding-window path is a **follow-on**" — it landed in `4e9f1d2` and has its own row in both README tables | `include/vllm/model_executor/models/olmo2.h`, `tests/.../test_olmo3_paged_engine.cpp` | mild; contradicted by the same README's own tables | → one-word edit ("landed, oracle-blocked"). Fixed in the closing commit. |
-| B5 | `.agents/engine-matrix.md:171` `SERVE-C-ABI` still says "**17 exported symbols**"; the ABI has been 19 since `c44c1f8`/`eb9d129` (ABI v4/v5 added `tool_parser`/`reasoning_parser` and the chat entry points) | `include/vllm.h` = 19 `VLLM_API` symbols; README:231 correctly says 19 | internal record only, but it is the row a porter reads | → matrix-row edit (owned by whoever next touches `SERVE-C-ABI`; not taken here to avoid a row-state edit outside this claim) |
+| B5 | `.agents/engine-matrix.md:171` `SERVE-C-ABI` still says "**17 exported symbols**"; the ABI has been 19 since `c44c1f8`/`eb9d129` (ABI v4/v5 added `tool_parser`/`reasoning_parser` and the chat entry points) | `include/vllm.h` = 19 `VLLM_API` symbols; README:231 correctly says 19 | internal record only, but it is the row a porter reads | → matrix-row edit. **FIXED 2026-07-24 by `CLAIM-DOCS-T2-FIXES`** (now reads 19 with the ABI-v4/v5 provenance) |
 
 ### Class C — documented but unusable (no usage path)
 
 | # | Gap | Evidence | Impact | Fix |
 |---|---|---|---|---|
-| C1 | **LMCache / KV-transfer has NO CLI flag and NO env selector.** `--kv-transfer-config` exists nowhere in the tree. The only way to enable any connector is programmatic: `EngineParams::kv_transfer_config` | `include/vllm/entrypoints/model_loader.h:76`; `src/vllm/entrypoints/model_loader.cpp:109-140`; grep `kv-transfer-config` = 0 hits in `examples/`, `src/` | the whole W1-W5 LMCache campaign is unreachable from `server` and `vllm-cli` | → small wiring job: add `--kv-transfer-config '<json>'` to `examples/server/main.cpp` mirroring vLLM's own CLI (parse JSON into `KVTransferConfig`; `KVTransferConfig::Validate()` already exists at `src/vllm/config/kv_transfer.cpp:47`), plus a `docs/` KV-offload usage page. ~40 lines. |
-| C2 | **The OpenAI server hardcodes the tool parser to `"hermes"` and disables reasoning parsing**, with no `--tool-call-parser` / `--reasoning-parser` flag (vLLM has both) | `examples/server/main.cpp:288-289`: `OpenAIServingChat chat(..., "hermes", /*reasoning_parser_name=*/"", ...)` | 39 tool dialects + 7 reasoning parsers ship but only 1 dialect and 0 reasoning parsers are reachable over HTTP. Serving any Qwen3-Coder / DeepSeek-R1 / Mistral / GLM model through the server silently uses the wrong parser | → small wiring job: two string args threaded to `OpenAIServingChat`, defaulting to the template auto-detection the C ABI already uses (`ABI v4/v5` detect tables in `tool_parsers/detect.cpp`, `reasoning_parsers/detect.cpp`). ~20 lines + 2 README rows. |
+| C1 | **LMCache / KV-transfer has NO CLI flag and NO env selector.** `--kv-transfer-config` exists nowhere in the tree. The only way to enable any connector is programmatic: `EngineParams::kv_transfer_config` | `include/vllm/entrypoints/model_loader.h:76`; `src/vllm/entrypoints/model_loader.cpp:109-140`; grep `kv-transfer-config` = 0 hits in `examples/`, `src/` | the whole W1-W5 LMCache campaign is unreachable from `server` and `vllm-cli` | → **LANDED 2026-07-24 (`CLAIM-DOCS-T2-FIXES`)**: `--kv-transfer-config '<json>'` on the server (`vllm::ParseKVTransferConfigJson`, vLLM's flag name + JSON shape, malformed/unknown-key/unknown-role/unknown-connector all loud at startup) plus [docs/KV-OFFLOAD.md](../../docs/KV-OFFLOAD.md). |
+| C2 | **The OpenAI server hardcodes the tool parser to `"hermes"` and disables reasoning parsing**, with no `--tool-call-parser` / `--reasoning-parser` flag (vLLM has both) | `examples/server/main.cpp:288-289`: `OpenAIServingChat chat(..., "hermes", /*reasoning_parser_name=*/"", ...)` | 39 tool dialects + 7 reasoning parsers ship but only 1 dialect and 0 reasoning parsers are reachable over HTTP. Serving any Qwen3-Coder / DeepSeek-R1 / Mistral / GLM model through the server silently uses the wrong parser | → **LANDED 2026-07-24 (`CLAIM-DOCS-T2-FIXES`)**: `--tool-call-parser` / `--reasoning-parser`. NOTE a deliberate deviation from this recommendation — the flags do NOT default to auto-detection, because the marker table would then silently change the parser of every existing deployment (26 tool rows, 2 reasoning rows would fire). They default to the previous hardcode (`hermes` / disabled) and take `auto` to opt into the C ABI's detection. |
 | C3 | **`vllm-cli` cannot reach structured output, stop strings, penalties, min-p, min-tokens or ignore-eos** although `vllm_sampling_params` exposes all of them (ABI v2) | `include/vllm.h:139-180`; `examples/cli/main.cpp` has only model/prompt/max-tokens/temperature/top-p/top-k/seed/stream | the flagship "Structured output: Supported (subset)" feature has no CLI demo | → add `--json-schema`, `--gbnf`, `--regex`, `--stop`, `--min-p`, `--repetition-penalty`, `--min-tokens`, `--ignore-eos`. Small. |
-| C4 | **KV offload to CPU/disk is "Built, opt-in"** but, beyond C1, has no user-facing story at all: no doc for the `kv_connector_extra_config` keys the disk tier reads (`root_dir`, byte budget, `offload_block_tokens`, `offload_prompt_only`) | `src/vllm/v1/kv_offload/kv_connector.cpp:93-170` (`extra_int`/`extra_bool` readers) | the feature is undocumented-by-construction even for a programmatic caller | → the same new `docs/kv-offload.md` page as C1 |
+| C4 | **KV offload to CPU/disk is "Built, opt-in"** but, beyond C1, has no user-facing story at all: no doc for the `kv_connector_extra_config` keys the disk tier reads (`root_dir`, byte budget, `offload_block_tokens`, `offload_prompt_only`) | `src/vllm/v1/kv_offload/kv_connector.cpp:93-170` (`extra_int`/`extra_bool` readers) | the feature is undocumented-by-construction even for a programmatic caller | → **LANDED 2026-07-24**: [docs/KV-OFFLOAD.md](../../docs/KV-OFFLOAD.md), including the disk tier's `root_dir` / `num_cpu_blocks` / `offload_block_tokens` / `offload_prompt_only` keys and the refusal semantics. |
 
 ### Class A — implemented but undocumented
 
@@ -198,10 +198,55 @@ sentence. These are the only edits that can be made without restructuring.
 **Tier 2 — small code wiring (each independently shippable, each ~20-40 lines).**
 1. C2 `--tool-call-parser` / `--reasoning-parser` on the server (highest
    user impact per line: unlocks 39 dialects + 7 reasoning parsers over HTTP).
+   **LANDED 2026-07-24, `CLAIM-DOCS-T2-FIXES`.**
 2. C1 `--kv-transfer-config` on the server, mirroring vLLM's own CLI.
+   **LANDED 2026-07-24, `CLAIM-DOCS-T2-FIXES`.**
 3. D1 device guard: refuse `OffloadingConnector` on a non-CPU device in
    `BuildKvConnector` until its worker half exists (safety, not ergonomics).
-4. C3 sampling/structured-output flags on `vllm-cli`.
+   **LANDED 2026-07-24, `CLAIM-DOCS-T2-FIXES` — and it refuses on EVERY device,
+   not only GPU. See the correction below.**
+4. C3 sampling/structured-output flags on `vllm-cli`. **STILL OPEN.**
+
+### T2 fix-wave outcome (2026-07-24, `CLAIM-DOCS-T2-FIXES`)
+
+Landed: Tier-2 items 1-3, plus `docs/KV-OFFLOAD.md` (Tier 4), the README flag
+rows and the three missing Gemma model rows (Tier 3 subset), and B5
+(`SERVE-C-ABI` 17 → 19). Not landed: Tier-2 item 4, the Tier-3 README structure
+pass, `docs/ENVIRONMENT.md`.
+
+**Correction to this audit's D1 fix recommendation.** The audit proposed
+refusing the disk connector "on a non-CPU device". That is too narrow, and the
+implementation deliberately does not follow it: the connector's worker half does
+not exist on ANY device — the bytes are never copied into a KV page whether that
+page is CUDA or host memory — so a CPU-admitting guard would have shipped the
+same silent-corruption bug on the CPU backend. The guard therefore refuses the
+connector everywhere the engine would wire it. The scheduler-level 32/48
+prefill-shortcut e2e is unaffected: it drives the connector directly through
+`KVConnectorFactory`, never through `BuildKvConnector`, and still passes.
+
+**Second correction: the D1 hazard was latent, not live-and-silent.** The audit
+described selecting `OffloadingConnector` on a GPU model as reaching wrong
+output. In fact `BuildKvConnector` never populated `KVConnectorContext::
+page_size_bytes` or `::identity`, so `OffloadingConnector::CreateFromConfig`
+already threw first — with an unrelated precondition message
+("page_size_bytes must be > 0") that named neither the real problem nor a
+remedy. The hazard was one plumbing patch away from becoming real, and the
+misleading error is itself a defect. The guard now runs BEFORE construction and
+reports the actual problem, so this stops depending on an accident.
+
+**Shape of the guard.** Not a `dynamic_cast` ladder: `KVConnector` gained
+`supports_worker_transfer_on(vt::DeviceType)` (base default false, since the
+base's worker hooks are no-ops), the registry gained a matching static
+`KVConnectorWorkerTransferFn` registered beside the builder
+(`REGISTER_KV_CONNECTOR_WITH_WORKER`) so capability can be queried by NAME
+before anything is constructed, and `EnsureWorkerTransferSupported` is the one
+refusal point. Admitting a future worker half is one override plus one
+registration argument; no call site changes.
+
+**What remains honestly unimplemented.** The disk connector's worker half. This
+wave converts a silent-wrong-output path into a loud refusal; it does not make
+the disk tier usable from a serving engine, and nothing here should be read as
+claiming otherwise.
 
 **Tier 3 — README additions (one increment, needs the structure pass).**
 A1 request-field table, A2/A3/A4/A5/A6/A7/A8/A9 rows and clauses, plus the

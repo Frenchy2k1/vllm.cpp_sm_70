@@ -91,6 +91,20 @@ class ToolParser {
 // "granite-20b-fc".
 std::unique_ptr<ToolParser> get_tool_parser(const std::string& name);
 
+// Every name get_tool_parser accepts, in factory order (the C++ analogue of
+// `ToolParserManager.tool_parsers.keys()`, which upstream's `--tool-call-parser`
+// error path enumerates). Aliases are listed individually, so this is the set of
+// accepted NAMES, not the count of parser families: several names share one
+// implementation (llama3_json/llama4_json; qwen3_coder/qwen3_xml/mimo;
+// glm45/glm47). Callers that must reject an unknown name — the server's
+// --tool-call-parser flag — print this rather than a hand-maintained list.
+//
+// INVARIANT, enforced by "Registry: every enumerated tool-parser name resolves"
+// in tests/vllm/entrypoints/openai/tool_parsers/test_tool_parsers.cpp: every
+// name here resolves to a non-null parser, and the count is pinned, so adding a
+// factory branch without listing its name here fails the suite.
+const std::vector<std::string>& tool_parser_names();
+
 // Ported from: vllm/entrypoints/chat_utils.py:1964 (make_tool_call_id). Returns
 // a "chatcmpl-tool-<uuid>" id (random_uuid() => uuid4().hex). Uniqueness only.
 std::string make_tool_call_id();

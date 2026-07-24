@@ -180,6 +180,24 @@ class LMCacheConnector final : public KVConnector {
   RequestFinishedResult request_finished(
       const Request& request, const std::vector<int>& block_ids) override;
 
+  // ---- worker-half capability (the D1 guard; see KVConnector) ---------------
+
+  // TRUE on every device. This connector's worker half IS implemented: the
+  // runner's ConnectorLoadExternalKv / ConnectorStorePromptKv move whole K and
+  // V planes between the KV pages and this client through vt::Backend::Copy,
+  // which is resolved per device (a UMA memcpy on GB10, a plain memcpy on CPU)
+  // and carries no device-specific assumption. Both directions re-verify the
+  // page geometry against config() before touching bytes, so a geometry
+  // mismatch is refused rather than mis-copied.
+  //
+  // Static form + override: the static is what gets REGISTERED (the engine
+  // queries capability by name, before constructing anything), the override is
+  // the same answer for an instance already in hand. One truth, two call sites.
+  static bool WorkerTransferSupportedOn(vt::DeviceType device);
+  bool supports_worker_transfer_on(vt::DeviceType device) const override {
+    return WorkerTransferSupportedOn(device);
+  }
+
   // ---- worker-side store/load (driven by the worker / round-trip harness) ----
 
   // Open the TCP connection if not already open (client retry/backoff). Safe to

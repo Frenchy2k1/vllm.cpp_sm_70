@@ -105,6 +105,29 @@ std::optional<KVLoadFailurePolicy> parse_kv_load_failure_policy(
     const std::string& s);
 const char* kv_load_failure_policy_str(KVLoadFailurePolicy policy);
 
+// Parse vLLM's `--kv-transfer-config` JSON into a KVTransferConfig. Mirrors the
+// upstream CLI surface exactly (vllm/engine/arg_utils.py passes the flag's JSON
+// straight to KVTransferConfig), so a config written for vLLM works here:
+//
+//   {"kv_connector": "LMCacheConnector",
+//    "kv_role": "kv_both",
+//    "kv_connector_extra_config": {"host": "127.0.0.1", "port": 65432}}
+//
+// Recognized keys: kv_connector, kv_role, engine_id, kv_load_failure_policy,
+// kv_connector_extra_config. The extra-config map is string->string here, so
+// non-string scalars are stringified in their JSON spelling (8 -> "8",
+// true -> "true"), which is what the connectors' extra_int/extra_bool readers
+// expect; a nested object/array value is rejected rather than silently dumped.
+//
+// Throws std::invalid_argument on malformed JSON, a non-object document, an
+// unknown key, a wrongly-typed value, or an unknown kv_role /
+// kv_load_failure_policy token — the message names the offending key. Runs
+// Validate() before returning, so kv_connector-without-kv_role is refused here
+// too. Does NOT check that kv_connector names a REGISTERED connector: that is
+// the KV-offload layer's job (KVConnectorFactory / EnsureWorkerTransferSupported),
+// and this header must not depend on it.
+KVTransferConfig ParseKVTransferConfigJson(const std::string& json_text);
+
 }  // namespace vllm
 
 #endif  // VLLM_CONFIG_KV_TRANSFER_H_

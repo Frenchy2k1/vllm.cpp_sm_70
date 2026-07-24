@@ -46,6 +46,29 @@ std::string DetectToolParser(const std::string& chat_template,
 // count when non-null. The returned pointer has static storage duration.
 const ToolParserMarker* ToolParserMarkerTable(std::size_t* out_count);
 
+// Resolve the `--tool-call-parser` selection into the name OpenAIServingChat is
+// constructed with. This is the whole behaviour of the server flag, factored out
+// of examples/server/main.cpp so it is directly testable.
+//
+//   requested == ""      -> "" (tool parsing DISABLED). The server never passes
+//                           this: its flag defaults to "hermes", which is what
+//                           the server hardcoded before the flag existed, so an
+//                           invocation without --tool-call-parser is unchanged.
+//   requested == "none"  -> "" (explicitly disabled).
+//   requested == "auto"  -> DetectToolParser(chat_template), the same
+//                           chat-template sniffing the C ABI does when the
+//                           caller names no parser (vllm_model_params
+//                           .tool_parser, ABI v4). Opt-in, never the default:
+//                           auto-detection would otherwise silently change the
+//                           parser of every existing deployment.
+//   anything else        -> that name, VALIDATED.
+//
+// Throws std::invalid_argument, listing tool_parser_names(), when the resolved
+// name is not registered — loud at startup, rather than get_tool_parser()
+// returning nullptr at the first request and tool parsing being silently off.
+std::string ResolveToolParserName(const std::string& requested,
+                                  const std::string& chat_template);
+
 }  // namespace vllm::entrypoints::openai
 
 #endif  // VLLM_ENTRYPOINTS_OPENAI_TOOL_PARSERS_DETECT_H_

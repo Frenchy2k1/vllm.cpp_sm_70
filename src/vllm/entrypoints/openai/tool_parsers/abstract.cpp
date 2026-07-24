@@ -255,4 +255,35 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   return nullptr;
 }
 
+// The enumeration of the factory above (see abstract.h). Listed in factory
+// order, aliases individually. ADD A NAME HERE IN THE SAME CHANGE THAT ADDS ITS
+// FACTORY BRANCH — the registry test resolves every entry and pins the count, so
+// an unlisted parser is caught by the suite rather than by a user who cannot
+// find it in --tool-call-parser's error message.
+const std::vector<std::string>& tool_parser_names() {
+  static const std::vector<std::string> names = {
+      "hermes",         "qwen3",
+      "deepseek_v3",    "deepseek_v31",
+      "deepseek_v32",   "deepseek_v4",
+      "longcat",        "mistral",
+      "granite",        "granite4",
+      "granite-20b-fc", "llama3_json",
+      "llama4_json",    "pythonic",
+      "llama4_pythonic", "xlam",
+      "phi4_mini_json", "internlm",
+      "jamba",          "step3",
+      "step3p5",        "qwen3_coder",
+      "qwen3_xml",      "mimo",
+      "olmo3",          "minicpm5",
+      "hy_v3",          "hunyuan_a13b",
+      "apertus",        "ernie45",
+      "gigachat3",      "lfm2",
+      "poolside_v1",    "functiongemma",
+      "kimi_k2",        "glm45",
+      "glm47",          "minimax_m2",
+      "gemma4",         "seed_oss",
+  };
+  return names;
+}
+
 }  // namespace vllm::entrypoints::openai

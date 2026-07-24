@@ -30,6 +30,19 @@ std::string DetectReasoningParser(const std::string& chat_template,
                                   std::size_t count);
 const ReasoningParserMarker* ReasoningParserMarkerTable(std::size_t* out_count);
 
+// Resolve the `--reasoning-parser` selection, the sibling of
+// ResolveToolParserName (same "auto"/"none" vocabulary, same loud rejection):
+//   "" / "none" -> "" (reasoning extraction DISABLED). The server's flag
+//                  defaults to "none", which is exactly what it hardcoded
+//                  before the flag existed, so an invocation without
+//                  --reasoning-parser is unchanged.
+//   "auto"      -> DetectReasoningParser(chat_template) (may itself return "",
+//                  meaning no marker matched and reasoning stays off).
+//   otherwise   -> that name, validated against reasoning_parser_names().
+// Throws std::invalid_argument listing the registered names on an unknown one.
+std::string ResolveReasoningParserName(const std::string& requested,
+                                       const std::string& chat_template);
+
 }  // namespace vllm::entrypoints::openai
 
 #endif  // VLLM_ENTRYPOINTS_OPENAI_REASONING_PARSERS_DETECT_H_

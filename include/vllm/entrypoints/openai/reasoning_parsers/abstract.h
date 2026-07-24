@@ -33,6 +33,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "vllm/entrypoints/openai/protocol.h"
 
@@ -90,5 +91,12 @@ class ReasoningParser {
 // (upstream raises KeyError). Registered names: "deepseek_r1", "mistral",
 // "minimax_m2", "minimax_m2_append_think", "step3", "olmo3".
 std::unique_ptr<ReasoningParser> get_reasoning_parser(const std::string& name);
+
+// Every name get_reasoning_parser accepts, in factory order (the analogue of
+// `ReasoningParserManager.reasoning_parsers.keys()`, which upstream's
+// `--reasoning-parser` error path enumerates). The server's --reasoning-parser
+// flag prints this when it rejects an unknown name. Same invariant as
+// tool_parser_names(): every entry resolves, the count is pinned by the suite.
+const std::vector<std::string>& reasoning_parser_names();
 
 }  // namespace vllm::entrypoints::openai

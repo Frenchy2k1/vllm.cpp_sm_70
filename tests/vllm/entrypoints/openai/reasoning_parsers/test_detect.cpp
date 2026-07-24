@@ -4,12 +4,15 @@
 
 #include <doctest/doctest.h>
 
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"
 
 using vllm::entrypoints::openai::DetectReasoningParser;
 using vllm::entrypoints::openai::get_reasoning_parser;
+using vllm::entrypoints::openai::ResolveReasoningParserName;
 using vllm::entrypoints::openai::ReasoningParserMarker;
 using vllm::entrypoints::openai::ReasoningParserMarkerTable;
 
@@ -36,5 +39,71 @@ TEST_CASE("reasoning detect: every built-in row names a registered parser") {
     REQUIRE(table[i].parser != nullptr);
     REQUIRE(table[i].template_marker != nullptr);
     CHECK(get_reasoning_parser(table[i].parser) != nullptr);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ResolveReasoningParserName — the behaviour of the server's --reasoning-parser
+// flag (examples/server/main.cpp), the sibling of ResolveToolParserName.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("--reasoning-parser: the DEFAULT is byte-identical to the old hardcode") {
+  // Before the flag existed the server passed reasoning_parser_name="" — i.e.
+  // reasoning extraction DISABLED. The flag defaults to "none", which resolves
+  // to that same empty name, for ANY chat template. A <think> template that
+  // "auto" would light up stays off unless the operator asks.
+  CHECK(ResolveReasoningParserName("none", "..<think>..").empty());
+  CHECK(ResolveReasoningParserName("none", "").empty());
+  CHECK(ResolveReasoningParserName("", "..[THINK]..").empty());
+  // Proof the templates above WOULD have detected something under "auto".
+  CHECK(DetectReasoningParser("..<think>..") == "think_auto");
+}
+
+TEST_CASE("--reasoning-parser: explicit names and auto-detection") {
+  CHECK(ResolveReasoningParserName("deepseek_r1", "") == "deepseek_r1");
+  CHECK(ResolveReasoningParserName("olmo3", "") == "olmo3");
+  CHECK(ResolveReasoningParserName("minimax_m2_append_think", "") ==
+        "minimax_m2_append_think");
+  CHECK(ResolveReasoningParserName("auto", "..<think>..") == "think_auto");
+  CHECK(ResolveReasoningParserName("auto", "..[THINK]..") == "mistral");
+  // "auto" with no matching marker legitimately stays DISABLED (unlike tool
+  // detection, a reasoning parser actively splits text, so silence is safest).
+  CHECK(ResolveReasoningParserName("auto", "plain template").empty());
+}
+
+TEST_CASE("--reasoning-parser: an unknown name FAILS LOUDLY, listing the registry") {
+  CHECK_THROWS_AS(ResolveReasoningParserName("deepseek-r1", ""),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(ResolveReasoningParserName("think", ""),
+                  std::invalid_argument);
+  std::string what;
+  try {
+    ResolveReasoningParserName("nope", "");
+  } catch (const std::invalid_argument& e) {
+    what = e.what();
+  }
+  CHECK(what.find("nope") != std::string::npos);
+  for (const std::string& name :
+       vllm::entrypoints::openai::reasoning_parser_names()) {
+    CAPTURE(name);
+    CHECK(what.find(name) != std::string::npos);
+  }
+}
+
+TEST_CASE("Registry: every enumerated reasoning-parser name resolves") {
+  const std::vector<std::string>& names =
+      vllm::entrypoints::openai::reasoning_parser_names();
+  for (const std::string& name : names) {
+    CAPTURE(name);
+    CHECK(get_reasoning_parser(name) != nullptr);
+    CHECK(ResolveReasoningParserName(name, "") == name);
+  }
+  // Pinned count: adding a factory branch without listing it fails here.
+  CHECK(names.size() == 7);
+  std::size_t marker_count = 0;
+  const ReasoningParserMarker* markers = ReasoningParserMarkerTable(&marker_count);
+  for (std::size_t i = 0; i < marker_count; ++i) {
+    CAPTURE(markers[i].parser);
+    CHECK(get_reasoning_parser(markers[i].parser) != nullptr);
   }
 }

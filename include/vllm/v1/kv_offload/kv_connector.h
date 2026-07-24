@@ -75,6 +75,7 @@
 #include "vllm/v1/kv_offload/base.h"
 #include "vllm/v1/kv_offload/cache_identity.h"
 #include "vllm/v1/kv_offload/tiering_manager.h"
+#include "vt/device.h"
 
 namespace vllm::v1 {
 struct Request;
@@ -189,6 +190,42 @@ class KVConnector {
   // Synchronous connectors have nothing pending across steps -> empty.
   virtual std::vector<std::string> get_finished() { return {}; }
 
+  // ---- WORKER-HALF CAPABILITY (the D1 safety predicate) --------------------
+  //
+  // Whether THIS connector's worker half can move KV bytes on `device`.
+  //
+  // WHY THIS EXISTS. The SCHEDULER half of a connector shortcuts prefill: the
+  // tokens it reports from get_num_new_matched_tokens are treated by the
+  // scheduler as ALREADY COMPUTED and are never run through the model. That is
+  // only sound if the WORKER half then writes the matching KV bytes into the
+  // device's KV pages before the model attends over them. A connector whose
+  // worker half cannot move bytes on the target device would make the model
+  // attend over KV that was NEVER WRITTEN — silently wrong output, with no
+  // error anywhere. So the engine (entrypoints/model_loader.cpp
+  // BuildKvConnector) REFUSES such a (connector, device) pair rather than
+  // degrading silently.
+  //
+  // BASE DEFAULT IS FALSE ON EVERY DEVICE. The base class's worker-side hooks
+  // above are no-ops, so a connector that does not override this has no worker
+  // half at all. A connector that DOES implement the worker transfer overrides
+  // this and admits exactly the devices it can move bytes on, which keeps the
+  // guard ADDITIVE: a future worker half is one override plus one registration
+  // argument, never a new branch in a dynamic_cast ladder at the call site.
+  //
+  // STATE OF THE TREE (be honest here, this is load-bearing documentation):
+  //   * LMCacheConnector  — worker half IMPLEMENTED (runner.cpp
+  //     ConnectorLoadExternalKv / ConnectorStorePromptKv move whole K/V planes
+  //     through vt::Backend::Copy, which is device-agnostic) -> true.
+  //   * OffloadingConnector (the CPU/disk tier) — worker half NOT IMPLEMENTED
+  //     on ANY device: its ConnectorLoadJobs are consumed by nothing and its
+  //     bytes live in a host PrimaryByteView that is never copied into a KV
+  //     page. It does not override this, so it is refused everywhere the engine
+  //     would wire it. Its scheduler-side seam (the 32/48 prefill-shortcut e2e)
+  //     is unaffected — that path never reaches a worker.
+  virtual bool supports_worker_transfer_on(vt::DeviceType /*device*/) const {
+    return false;
+  }
+
   // ---- per-step end hook (scheduler drives it unconditionally) --------------
 
   // Once per step, after build_connector_meta: flush deferred promotions and poll
@@ -222,13 +259,28 @@ struct KVConnectorContext {
 using KVConnectorBuilder =
     std::unique_ptr<KVConnector> (*)(const KVConnectorContext&);
 
+// The STATIC form of KVConnector::supports_worker_transfer_on, registered
+// alongside the builder. The engine must be able to refuse an unsafe
+// (connector, device) pair BEFORE constructing anything: a connector ctor can
+// fail for unrelated reasons (the disk connector rejects a context with no page
+// geometry / no CacheIdentity first), and a refusal that surfaces as somebody
+// else's precondition error is not a refusal a user can act on. Registering the
+// predicate keeps ONE truth per connector: the concrete class implements this
+// static and its supports_worker_transfer_on override forwards to it.
+// A connector registered WITHOUT one has no worker half (the safe default).
+using KVConnectorWorkerTransferFn = bool (*)(vt::DeviceType device);
+
 // The compile-time connector registry (mirrors KVConnectorFactory,
 // factory.py:27-125). Registration is by a static KVConnectorRegistrar from each
 // connector's own TU (REGISTER_KV_CONNECTOR), replacing the Python lazy import.
 class KVConnectorFactory {
  public:
-  // factory.py:31-40. Duplicate registration is rejected.
-  static void Register(const std::string& name, KVConnectorBuilder builder);
+  // factory.py:31-40. Duplicate registration is rejected. `worker_transfer` is
+  // the connector's static worker-half capability predicate (see
+  // KVConnectorWorkerTransferFn); nullptr (the default) means NO worker half on
+  // any device, which is what every connector that does not implement one gets.
+  static void Register(const std::string& name, KVConnectorBuilder builder,
+                       KVConnectorWorkerTransferFn worker_transfer = nullptr);
 
   // factory.py:43-77 + 96-125. Selection is by config: an absent connector
   // (empty kv_connector / not is_kv_transfer_instance) yields nullptr — the
@@ -237,20 +289,65 @@ class KVConnectorFactory {
 
   static bool IsRegistered(const std::string& name);
   static std::vector<std::string> RegisteredNames();
+
+  // The D1 safety query: can the connector registered under `name` move KV
+  // bytes on `device` from its worker half? False for an unregistered name and
+  // for any connector registered without a worker-transfer predicate. The
+  // engine calls this BEFORE Create() so an unsafe pair is refused by name,
+  // with a message about the real problem, and nothing is constructed.
+  static bool WorkerTransferSupportedOn(const std::string& name,
+                                        vt::DeviceType device);
+
+  // Names of every connector whose worker half can move bytes on `device` —
+  // i.e. the connectors the engine will actually admit there. Used to make the
+  // refusal message actionable instead of a dead end.
+  static std::vector<std::string> WorkerCapableNames(vt::DeviceType device);
 };
 
-// Static-init helper; used only through REGISTER_KV_CONNECTOR.
+// THE D1 GUARD. Refuse to wire a connector into an engine on `device` unless
+// its worker half can move KV bytes there. A no-op for an empty name (no
+// connector selected == the default-off inert path). Throws std::runtime_error
+// naming the connector, the device, WHY the combination is unsafe, and which
+// connectors are admissible on that device. Called by BuildKvConnector before
+// the connector is constructed; exposed here so the refusal is directly
+// testable and so any other entry point that wires a connector gets the same
+// answer. FAIL LOUDLY: there is no warn-and-continue mode, because the failure
+// mode being prevented is wrong output with no error at all.
+void EnsureWorkerTransferSupported(const std::string& connector_name,
+                                   vt::DeviceType device);
+
+// The device spelling used in that refusal (and in the docs): "cpu", "cuda",
+// "metal", "vulkan", "xpu". Thin forwarder to vt::DeviceTypeName, which owns the
+// names beside the enum so the device-agnostic layer never spells one out.
+const char* device_type_name(vt::DeviceType device);
+
+// Static-init helper; used only through REGISTER_KV_CONNECTOR*.
 struct KVConnectorRegistrar {
-  KVConnectorRegistrar(const std::string& name, KVConnectorBuilder builder) {
-    KVConnectorFactory::Register(name, builder);
+  KVConnectorRegistrar(const std::string& name, KVConnectorBuilder builder,
+                       KVConnectorWorkerTransferFn worker_transfer = nullptr) {
+    KVConnectorFactory::Register(name, builder, worker_transfer);
   }
 };
 
 // Registers one connector's builder from its own TU. Place at namespace scope.
+// This form declares NO worker half: the connector is scheduler-side only and
+// the engine refuses to wire it on any device (see
+// KVConnector::supports_worker_transfer_on).
 #define REGISTER_KV_CONNECTOR(unique_tag, connector_name, builder_fn)      \
   namespace {                                                              \
   const ::vllm::v1::kv_offload::KVConnectorRegistrar                       \
       kv_connector_registrar_##unique_tag((connector_name), (builder_fn)); \
+  } /* namespace */
+
+// The same, for a connector that DOES implement the worker half:
+// `worker_transfer_fn` is its static capability predicate, and the engine
+// admits it on exactly the devices that predicate accepts.
+#define REGISTER_KV_CONNECTOR_WITH_WORKER(unique_tag, connector_name, \
+                                          builder_fn, worker_transfer_fn) \
+  namespace {                                                             \
+  const ::vllm::v1::kv_offload::KVConnectorRegistrar                      \
+      kv_connector_registrar_##unique_tag((connector_name), (builder_fn), \
+                                          (worker_transfer_fn));          \
   } /* namespace */
 
 struct OffloadingConnectorConfig {
