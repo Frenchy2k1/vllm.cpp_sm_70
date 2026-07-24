@@ -607,10 +607,30 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
     split + merge) is refused loudly and lands with I5d's runner loop. The runner
     `GDNAttentionMetadataBuilder::build` spec feed (`num_decode_draft_tokens_cpu`,
     `num_accepted_tokens`) is I5d (the runner loop), inert until then.
-  - **I5b — `prepare_prefill_inputs`.** Port the draft-prefill input shift kernel
-    (`autoregressive/speculator.py:469-588`): shift `input_ids` left one within
-    each query span, splice `last_sampled`/`next_prefill_tokens`, `query_len -=
-    num_rejected`. Independently unit-gateable against a CPU reference.
+  - **I5b — `prepare_prefill_inputs`. LANDED 2026-07-24 (`CLAIM-SPEC-MTP-I5B`).**
+    Ports the draft-prefill input shift (`autoregressive/speculator.py:469-588`):
+    per request shift `input_ids` left one within its query span, splice the
+    just-sampled next token (`num_sampled>0 ? last_sampled[idx_mapping[r]] :
+    next_prefill_tokens[...]`) into the freed last slot, `query_len -=
+    num_rejected`, emit `last_token_indices`/`query_start_loc`/`seq_lens` +
+    request-count CUDA-graph padding, into the `SpecPrefillInputs` output struct
+    (`include/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.h`,
+    `src/.../prepare_prefill_inputs.cpp`). KEY INVARIANT: input_ids/positions keep
+    the TARGET batch's total size (rejected positions PADDED not compacted, NOTE
+    :162-167) so the draft reuses the target attention metadata; only the shift
+    range / last_token_index / sampled row shrink by num_rejected. **Implemented as
+    a HOST routine** (no new CUDA kernel): OUR `prepare_inputs`/
+    `combine_sampled_and_draft_tokens` are host `std::vector` routines marked
+    DEVICE-NEUTRAL (the DGX leaf ports the loop to the Triton kernel over the draft
+    `input_buffers`), and this is exactly that family — so the "CUDA==CPU"/
+    compute-sanitizer clauses are N/A and no dgx run is needed. Unit-gated against
+    a from-the-algorithm oracle: `tests/vllm/v1/spec_decode/test_prepare_prefill_inputs.cpp`
+    7 cases / 27 assertions (perfect-accept, early-mismatch k=1 j=0 + k=3 j=1,
+    single-token, multi-request, chunked-prefill, CG padding), RED-first by a
+    reverted no-shift/no-splice stub (7/7 fail, 12/27 assertions). DEFAULT-OFF
+    INERT (nothing calls it until I5d); additive by construction (two new files +
+    one new test + 2 CMake lines, no existing TU touched) → all SACRED gates
+    byte-identical, no re-run owed. `SPEC-MTP` STAYS `GATING`.
   - **I5c — MTP paged propose forward + draft KV layer.** The `Qwen3_5MTP` paged
     forward driven from the target's post-final-norm hidden tap, its own draft
     full-attn KV layer (index `num_hidden_layers`), and the k=1 early-exit
