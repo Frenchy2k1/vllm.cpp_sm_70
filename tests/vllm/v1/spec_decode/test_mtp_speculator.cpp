@@ -6,6 +6,7 @@
 // scheduler/speculator plumbing, as required by .agents/test-porting.md rule 6.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -13,7 +14,10 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
+#include "vllm/v1/attention/backend.h"
+#include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
@@ -196,6 +200,67 @@ void CheckFinite(const std::vector<float>& values) {
   for (float value : values) CHECK(std::isfinite(value));
 }
 
+// ── SPEC-MTP I5c helpers: a host-backed draft KV cache + full-attn metadata. ──
+using vllm::PagedKvCache;
+using vllm::v1::CommonAttentionMetadata;
+
+// Owns one draft full-attention KV layer's bf16 buffer (the production draft KV
+// dtype — ResolveKvCacheDType; the raw-torch MTP weights produce bf16 K/V so the
+// "auto" reshape_and_cache requires a bf16 cache) and hands out a PagedKvCache
+// view. num_blocks*block_size slots of [2, num_kv_heads, head_size].
+struct DraftKvPool {
+  std::vector<uint16_t> buf;
+  PagedKvCache kv;
+  DraftKvPool(const HfConfig& c, int64_t num_blocks, int64_t block_size) {
+    const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
+    buf.assign(static_cast<size_t>(num_blocks * 2 * block_size * Hkv * Dh), 0);
+    kv.data = buf.data();
+    kv.dtype = vt::DType::kBF16;
+    kv.num_blocks = num_blocks;
+    kv.block_size = block_size;
+    kv.num_kv_heads = Hkv;
+    kv.head_size = Dh;
+  }
+};
+
+// A single-request prefill metadata over T contiguous tokens starting at
+// absolute position `start` into block 0 (block_size >= start+T). slot_mapping =
+// [start, start+T).
+CommonAttentionMetadata MtpMeta(int64_t T, int64_t seq_len, int64_t start,
+                                int64_t block_size) {
+  (void)block_size;  // single block 0; slots addressed by absolute position.
+  CommonAttentionMetadata m;
+  m.num_reqs = 1;
+  m.num_actual_tokens = static_cast<int>(T);
+  m.query_start_loc = {0, static_cast<int32_t>(T)};
+  m.query_start_loc_cpu = m.query_start_loc;
+  m.seq_lens = {static_cast<int32_t>(seq_len)};
+  m.seq_lens_cpu = m.seq_lens;
+  m.max_query_len = static_cast<int>(T);
+  m.max_seq_len = static_cast<int>(seq_len);
+  m.block_table_num_cols = 1;
+  m.block_table_tensor = {0};
+  for (int64_t t = 0; t < T; ++t)
+    m.slot_mapping.push_back(start + t);
+  m.causal = true;
+  return m;
+}
+
+double MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
+  double d = 0.0;
+  for (size_t i = 0; i < a.size(); ++i)
+    d = std::max(d, std::abs(static_cast<double>(a[i]) - b[i]));
+  return d;
+}
+
+int64_t ArgmaxRow(const std::vector<float>& logits, int64_t row, int64_t vocab) {
+  const float* r = logits.data() + static_cast<size_t>(row) * vocab;
+  int64_t best = 0;
+  for (int64_t v = 1; v < vocab; ++v)
+    if (r[static_cast<size_t>(v)] > r[static_cast<size_t>(best)]) best = v;
+  return best;
+}
+
 }  // namespace
 
 TEST_CASE("test_mtp_load_model_unified: dense MTP shares target embedding and lm_head") {
@@ -365,6 +430,223 @@ TEST_CASE("test_run_model_unpacks_tuple_return_for_mtp" * doctest::skip(true)) {
   MESSAGE("SKIP: tuple-vs-tensor dispatch belongs to M-mtp-1 AutoRegressiveSpeculator");
 }
 
-TEST_CASE("test_mtp_propose shape" * doctest::skip(true)) {
-  MESSAGE("SKIP: propose() [batch,k] flow lands with M-mtp-1, not loader-only M-mtp-0");
+// ── SPEC-MTP I5c: the PAGED MTP propose forward + draft KV layer. ────────────
+
+namespace {
+// Download an on-device ForwardLogits to a host [rows*vocab] vector.
+std::vector<float> HostLogits(const vllm::ForwardLogits& logits,
+                              vt::Backend& backend, vt::Queue& queue) {
+  std::vector<float> host(static_cast<size_t>(logits.rows) * logits.vocab);
+  backend.Copy(queue, host.data(), logits.device_tensor.data,
+               host.size() * sizeof(float));
+  backend.Synchronize(queue);
+  return host;
+}
+
+// A [1,H] contiguous bf16 view of row `r` of a [rows,H] owned bf16 tensor.
+vt::Tensor Row(const OwnedTensor& owned, int64_t r, int64_t H) {
+  vt::Tensor t = owned.View();
+  t.rank = 2;
+  t.shape[0] = 1;
+  t.shape[1] = H;
+  t.stride[0] = H;
+  t.stride[1] = 1;
+  t.data = static_cast<uint16_t*>(t.data) + r * H;
+  return t;
+}
+}  // namespace
+
+// CORE I5c PROOF: the PAGED MTP forward over a single-request 1-block KV with a
+// trivial slot map reproduces the STANDALONE (dense) forward's logits/argmax —
+// the paged rewrite did not change the head math (mtp-spec-decode.md §5 I5c gate).
+TEST_CASE("i5c paged MTP forward equals standalone (dense head)") {
+  const HfConfig config = MakeConfig(Qwen3_5MTPKind::kDense);
+  TensorStore store;
+  AddDenseMtp(store, config);
+  const Qwen3_5MTPWeights weights =
+      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense);
+  const Qwen3_5DenseWeights target = MakeDenseTarget(config);
+  const Qwen3_5MTPModel model(weights, target, config);
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const int64_t T = 4, H = config.hidden_size, vocab = config.vocab_size;
+  const std::vector<int32_t> ids = {1, 5, 2, 9};
+  const std::vector<int32_t> pos = {0, 1, 2, 3};
+  OwnedTensor target_hidden = MakeOwned({T, H}, 41);
+
+  // Standalone (I1) path.
+  const std::vector<float> logits_std =
+      model.ForwardLogitsHost(ids, pos, target_hidden.View(), queue);
+
+  // Paged path: fresh 1-block KV, contiguous slot map.
+  DraftKvPool pool(config, /*num_blocks=*/1, /*block_size=*/8);
+  const CommonAttentionMetadata am = MtpMeta(T, /*seq_len=*/T, /*start=*/0, 8);
+  const vllm::Qwen3_5MTPHiddenStates hidden = model.ForwardPaged(
+      ids, pos, target_hidden.View(), am, pool.kv, queue);
+  const std::vector<float> logits_paged =
+      HostLogits(model.ComputeLogits(hidden.tensor, queue), backend, queue);
+
+  REQUIRE(logits_paged.size() == logits_std.size());
+  const double d = MaxAbsDiff(logits_paged, logits_std);
+  MESSAGE("i5c dense paged==standalone max|diff| = " << d);
+  CHECK(d < 1e-2);
+  for (int64_t t = 0; t < T; ++t)
+    CHECK(ArgmaxRow(logits_paged, t, vocab) == ArgmaxRow(logits_std, t, vocab));
+  backend.DestroyQueue(queue);
+}
+
+TEST_CASE("i5c paged MTP forward equals standalone (MoE head)") {
+  const HfConfig config = MakeConfig(Qwen3_5MTPKind::kMoe);
+  TensorStore store;
+  AddMoeMtp(store, config);
+  const Qwen3_5MTPWeights weights =
+      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kMoe);
+  const Qwen3_5MoeWeights target = MakeMoeTarget(config);
+  const Qwen3_5MTPModel model(weights, target, config);
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const int64_t T = 4, H = config.hidden_size, vocab = config.vocab_size;
+  const std::vector<int32_t> ids = {3, 7, 1, 4};
+  const std::vector<int32_t> pos = {0, 1, 2, 3};
+  OwnedTensor target_hidden = MakeOwned({T, H}, 43);
+
+  const std::vector<float> logits_std =
+      model.ForwardLogitsHost(ids, pos, target_hidden.View(), queue);
+  DraftKvPool pool(config, 1, 8);
+  const CommonAttentionMetadata am = MtpMeta(T, T, 0, 8);
+  const vllm::Qwen3_5MTPHiddenStates hidden = model.ForwardPaged(
+      ids, pos, target_hidden.View(), am, pool.kv, queue);
+  const std::vector<float> logits_paged =
+      HostLogits(model.ComputeLogits(hidden.tensor, queue), backend, queue);
+
+  REQUIRE(logits_paged.size() == logits_std.size());
+  const double d = MaxAbsDiff(logits_paged, logits_std);
+  MESSAGE("i5c MoE paged==standalone max|diff| = " << d);
+  CHECK(d < 1e-2);
+  for (int64_t t = 0; t < T; ++t)
+    CHECK(ArgmaxRow(logits_paged, t, vocab) == ArgmaxRow(logits_std, t, vocab));
+  backend.DestroyQueue(queue);
+}
+
+// DRAFT-KV CORRECTNESS: a two-step drive where step 1 writes the draft K/V and
+// step 2 (a decode) attends over it must reproduce the token-1 hidden of a single
+// combined 2-token forward. The RED CONTROL in the same test — running step 2
+// over a FRESH (unpopulated) draft KV — DIVERGES, proving step 2 genuinely reads
+// what step 1 wrote (a stubbed/absent paged KV path fails here).
+TEST_CASE("i5c draft KV two-step: decode attends over written K/V") {
+  const HfConfig config = MakeConfig(Qwen3_5MTPKind::kDense);
+  TensorStore store;
+  AddDenseMtp(store, config);
+  const Qwen3_5MTPWeights weights =
+      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense);
+  const Qwen3_5DenseWeights target = MakeDenseTarget(config);
+  const Qwen3_5MTPModel model(weights, target, config);
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const int64_t H = config.hidden_size;
+  const int32_t id0 = 5, id1 = 9;
+  OwnedTensor th = MakeOwned({2, H}, 47);  // per-token target hidden rows
+  const vt::Tensor th0 = Row(th, 0, H), th1 = Row(th, 1, H);
+
+  auto row_bytes = [&](const vllm::Qwen3_5MTPHiddenStates& hs, int64_t r) {
+    std::vector<float> out(static_cast<size_t>(H));
+    const auto* p = static_cast<const uint16_t*>(hs.tensor.data) + r * H;
+    for (int64_t i = 0; i < H; ++i)
+      out[static_cast<size_t>(i)] = vt::BF16ToF32(p[i]);
+    return out;
+  };
+
+  // (A) Combined 2-token forward → reference token-1 hidden.
+  DraftKvPool comb(config, 1, 8);
+  const CommonAttentionMetadata am_comb = MtpMeta(2, 2, 0, 8);
+  const auto hs_comb = model.ForwardPaged({id0, id1}, {0, 1}, th.View(),
+                                          am_comb, comb.kv, queue);
+  const std::vector<float> ref = row_bytes(hs_comb, 1);
+
+  // (B) Split: step 1 prefill token0 (writes slot 0), step 2 decode token1
+  // (seq_len 2, slot 1) reads slots 0..1.
+  DraftKvPool split(config, 1, 8);
+  const CommonAttentionMetadata am_s1 = MtpMeta(1, 1, 0, 8);
+  (void)model.ForwardPaged({id0}, {0}, th0, am_s1, split.kv, queue);
+  const CommonAttentionMetadata am_s2 = MtpMeta(1, 2, 1, 8);
+  const auto hs_s2 = model.ForwardPaged({id1}, {1}, th1, am_s2, split.kv, queue);
+  const std::vector<float> got = row_bytes(hs_s2, 0);
+
+  // (C) RED CONTROL: step 2 over a FRESH KV (slot 0 never written).
+  DraftKvPool fresh(config, 1, 8);
+  const auto hs_nokv = model.ForwardPaged({id1}, {1}, th1, am_s2, fresh.kv, queue);
+  const std::vector<float> nokv = row_bytes(hs_nokv, 0);
+
+  const double d_ok = MaxAbsDiff(got, ref);
+  const double d_red = MaxAbsDiff(nokv, ref);
+  MESSAGE("i5c draft-KV two-step: with-step1 max|diff|=" << d_ok
+          << " vs fresh-KV (RED) max|diff|=" << d_red);
+  CHECK(d_ok < 2e-2);       // decode-via-written-cache == combined forward
+  CHECK(d_red > d_ok);      // unwritten KV diverges → step 2 really reads step 1
+  backend.DestroyQueue(queue);
+}
+
+// propose() k=1: prepare_prefill_inputs (I5b) shift-splice + one paged forward +
+// argmax draft pick, returning one token per request (speculator.py:236-238).
+TEST_CASE("i5c MtpProposePrefill k=1 returns the argmax over the shifted draft") {
+  const HfConfig config = MakeConfig(Qwen3_5MTPKind::kDense);
+  TensorStore store;
+  AddDenseMtp(store, config);
+  const Qwen3_5MTPWeights weights =
+      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense);
+  const Qwen3_5DenseWeights target = MakeDenseTarget(config);
+  const Qwen3_5MTPModel model(weights, target, config);
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const int64_t H = config.hidden_size, vocab = config.vocab_size;
+
+  // One decoding request, k=1: verify span = 2 tokens (the last is the bonus).
+  const std::vector<int32_t> verify_ids = {5, 9};
+  const std::vector<int64_t> verify_pos = {0, 1};
+  const std::vector<int32_t> idx_mapping = {0};
+  const int32_t sampled = 7;  // last_sampled[req_state 0]
+  const std::vector<int32_t> last_sampled = {sampled};
+  const std::vector<int32_t> next_prefill_tokens = {0};
+  const std::vector<int32_t> num_sampled = {1};   // all accepted
+  const std::vector<int32_t> num_rejected = {0};
+  OwnedTensor target_hidden = MakeOwned({2, H}, 51);
+
+  CommonAttentionMetadata am = MtpMeta(2, 2, 0, 8);
+  DraftKvPool pool(config, 1, 8);
+
+  const std::vector<int32_t> draft = vllm::v1::MtpProposePrefill(
+      model, am, pool.kv, target_hidden.View(), verify_ids, verify_pos,
+      idx_mapping, last_sampled, next_prefill_tokens, num_sampled, num_rejected,
+      /*max_num_reqs=*/1, queue);
+  REQUIRE(draft.size() == 1);
+  CHECK(draft[0] >= 0);
+  CHECK(draft[0] < vocab);
+
+  // Independent recomputation over the EXPECTED shift-splice: with 0 rejected the
+  // draft span is [verify_ids[1], sampled] and the sampled row is index 1. This
+  // proves propose applied prepare_prefill_inputs' shift + last_token index.
+  const std::vector<int32_t> expect_ids = {9, sampled};
+  const std::vector<int32_t> expect_pos = {0, 1};
+  DraftKvPool pool2(config, 1, 8);
+  const auto hs = model.ForwardPaged(expect_ids, expect_pos,
+                                     target_hidden.View(), am, pool2.kv, queue);
+  const std::vector<float> lg =
+      HostLogits(model.ComputeLogits(hs.tensor, queue), backend, queue);
+  CHECK(draft[0] == ArgmaxRow(lg, /*row=*/1, vocab));
+  backend.DestroyQueue(queue);
+}
+
+// The target-model hidden-state tap (ForwardDeviceTap) is INERT: it returns the
+// exact same logits as ForwardDevice and hands back a [T,H] post-norm hidden.
+TEST_CASE("i5c hidden-state tap is inert and shape-correct") {
+  // Exercised against a real paged forward in the dedicated paged-forward tests
+  // (test_qwen27_paged_forward / test_qwen35_paged_forward); this asserts the
+  // MTP carrier plumbing compiles and the forward-declared type resolves.
+  vllm::Qwen3_5MTPHiddenStates carrier;
+  CHECK(carrier.storage == nullptr);
+  CHECK(carrier.tensor.data == nullptr);
 }

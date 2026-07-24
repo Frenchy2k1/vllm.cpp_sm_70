@@ -709,10 +709,26 @@ TEST_CASE("Qwen3.5 KV-cache spec: num_spec widens the conv row and adds state bl
     // per-request block count, not from a bigger row.
     CHECK(mamba->shapes[1] == std::vector<int64_t>{32, 128, 128});
     CHECK(mamba->num_speculative_blocks == num_spec);
-    // The full-attention group is untouched by speculation.
+    // The (target) full-attention group is untouched by speculation.
     CHECK(kv.kv_cache_groups[0].kv_cache_spec->page_size_bytes() ==
           base.kv_cache_groups[0].kv_cache_spec->page_size_bytes());
+
+    // SPEC-MTP I5c: speculation on (num_spec > 0) adds ONE extra full-attention
+    // KV group — the MTP draft head's own paged K/V layer (index num_hidden_layers
+    // upstream, qwen3_5_mtp.py:105-112), sized exactly like a target full-attn
+    // layer. num_spec == 0 (base) has NO such group (checked below).
+    REQUIRE(kv.kv_cache_groups.size() == 3);
+    CHECK(kv.kv_cache_groups[2].layer_names ==
+          std::vector<std::string>{"fa_draft"});
+    const auto* draft = dynamic_cast<const vllm::v1::FullAttentionSpec*>(
+        kv.kv_cache_groups[2].kv_cache_spec.get());
+    REQUIRE(draft != nullptr);
+    CHECK(draft->page_size_bytes() ==
+          base.kv_cache_groups[0].kv_cache_spec->page_size_bytes());
   }
+  // num_spec == 0 (production default): the draft KV layer is never allocated —
+  // exactly the two pre-I5c groups, byte for byte.
+  CHECK(zero.kv_cache_groups.size() == 2);
 
   // MEASURED state cost of k=1 on this geometry, per GDN layer and per request:
   // one SSM slot is Hv*Dv*Dk*4B = 32*128*128*4 = 2 MiB, so k=1 (2 slots) doubles

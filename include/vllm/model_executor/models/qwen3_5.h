@@ -97,6 +97,12 @@ struct ForwardLogits {
   bool on_device() const { return static_cast<bool>(device_storage); }
 };
 
+// The MTP drafter's hidden-state carrier (defined in qwen3_5_mtp.h). Forward-
+// declared here so the target forward's hidden-state tap (ForwardDeviceTap,
+// SPEC-MTP I5c) can hand back the [T,H] post-final-norm hidden by pointer without
+// pulling the MTP header into this one (qwen3_5_mtp.h includes this header).
+struct Qwen3_5MTPHiddenStates;
+
 class Qwen3_5Model {
  public:
   // Batched PAGED forward (M1.8 Task 3, the central refactor). Runs the whole
@@ -149,6 +155,23 @@ class Qwen3_5Model {
                                      const Qwen3_5MoeWeights& weights,
                                      const HfConfig& config, vt::Queue& queue,
                                      const std::vector<int32_t>& logits_indices = {});
+
+  // ForwardDevice + the DRAFTER hidden-state tap (SPEC-MTP I5c). Identical to
+  // ForwardDevice (same logits, same op sequence — the tap is an inert copy of the
+  // full [num_actual_tokens, H] post-final-norm hidden), and additionally moves
+  // that hidden into `*hidden_out` (a device-owning carrier) so the MTP drafter's
+  // propose() consumes the exact tensor upstream feeds Qwen3_5MTP.forward as
+  // `hidden_states` (qwen3_5.py returns self.model(...) output). `hidden_out` may
+  // be null (then it is exactly ForwardDevice). Not wired into the runner loop
+  // until I5d; default path never calls it, so the engine is byte-identical.
+  static ForwardLogits ForwardDeviceTap(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const v1::GDNAttentionMetadata& gdn_meta,
+      const std::vector<PagedKvCache>& attn_kv,
+      const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
+      const HfConfig& config, vt::Queue& queue, Qwen3_5MTPHiddenStates* hidden_out,
+      const std::vector<int32_t>& logits_indices = {});
 
   // Dense single-sequence reference forward (M0.9). Runs the whole model for a
   // single non-paged sequence and returns logits [T, vocab] f32 (T =

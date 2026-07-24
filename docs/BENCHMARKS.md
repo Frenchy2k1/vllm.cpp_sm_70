@@ -494,6 +494,27 @@ config** at both the latency and throughput operating points
 (mtp-spec-decode.md §5). Reproduce the correctness gate with
 `ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/mtp_i1 && VLLM_MTP_REQUIRE_CHECKPOINTS=1 ./build-cuda/tests/test_op_parity -tc=\"qwen3.5 MTP standalone head parity*\" -s"'`.
 
+### MTP paged propose forward + draft KV layer, SPEC-MTP I5c (2026-07-24, `CLAIM-SPEC-MTP-I5C`) - correctness only, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - correctness increment, no performance
+claim, `benchmark_binding=false`.** I5c lands the PAGED MTP draft forward
+(`Qwen3_5MTPModel::ForwardPaged`), the head's own paged draft KV-cache layer
+(`MakeQwen3_5KVCacheSpec` num_spec > 0 adds it), the target-forward hidden-state
+tap, and a callable k=1 `MtpProposePrefill`. It is NOT the e2e speculative loop
+(that is I5d): nothing is wired into the runner step, so there is no throughput or
+TPOT number to report and no honest same-spec-config denominator to run yet. The
+I5c CORE PROOF is correctness: the paged propose forward reproduces I1's
+standalone head logits/argmax on BOTH checkpoints (paged-vs-standalone), and a
+two-step drive proves the draft KV write/read. DEFAULT-OFF INERT - with no
+speculative config the draft KV layer is not allocated, the tap is nullptr, and
+the target engine is byte-identical; the shared-`qwen3_5.cpp` SACRED gates (27B
+235/235, 35B 315/315, Qwen3-Coder 138/138) are re-run STANDALONE under
+`flock $HOME/gpu.lock` and PASS. **Next benchmark owed:** I5d (27B k=1 greedy
+e2e), whose honest denominator is vLLM **with the same speculative config** at
+both the latency and throughput operating points (mtp-spec-decode.md §5).
+Reproduce the correctness gate with
+`ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/mtp_i5c && VLLM_MTP_REQUIRE_CHECKPOINTS=1 ./build-cuda/tests/test_op_parity -tc=\"qwen3.5 MTP standalone head parity*\" -s"'`.
+
 ### Accelerator-seam `S4` - LinearMethod / QuantizationConfig seam (2026-07-23, `CLAIM-BACKEND-SEAM-S4-1`) - byte-identical, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - structural refactor, no performance claim.**

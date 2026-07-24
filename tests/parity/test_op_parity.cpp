@@ -1440,6 +1440,7 @@ bool RunQwen35MtpHead(Backend& b, Queue& q, const fs::path& dir,
 
   std::vector<uint8_t> hidden_bytes;
   std::vector<float> logits;
+  std::vector<float> paged_logits;  // SPEC-MTP I5c: the PAGED propose forward
   std::vector<float> oracle_hidden_logits;
   auto execute = [&](const vllm::Qwen3_5MTPModel& model) {
     vllm::Qwen3_5MTPHiddenStates hidden =
@@ -1454,6 +1455,46 @@ bool RunQwen35MtpHead(Backend& b, Queue& q, const fs::path& dir,
     logits.resize(static_cast<size_t>(output.rows) * output.vocab);
     b.Copy(q, logits.data(), output.device_tensor.data,
            logits.size() * sizeof(float));
+
+    // ── SPEC-MTP I5c: the PAGED MTP forward over a single-request 1-block draft
+    // KV with a contiguous slot map must reproduce the STANDALONE head's logits
+    // (a paged forward over a trivial KV == the dense forward). This drives the
+    // production paged attention path (FA2 prefill at head_dim 256, bf16 draft
+    // KV = ResolveKvCacheDType) the I5d propose() runs each step. ──
+    const int64_t kv_block = 64;  // >= tokens (27); one block holds the sequence
+    const int64_t Hkv = config.num_key_value_heads, Dh = config.head_dim;
+    std::vector<uint16_t> draft_kv_buf(
+        static_cast<size_t>(2 * kv_block * Hkv * Dh), 0);
+    vllm::PagedKvCache draft_kv;
+    draft_kv.data = draft_kv_buf.data();
+    draft_kv.dtype = DType::kBF16;
+    draft_kv.num_blocks = 1;
+    draft_kv.block_size = kv_block;
+    draft_kv.num_kv_heads = Hkv;
+    draft_kv.head_size = Dh;
+    vllm::v1::CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = static_cast<int>(tokens);
+    am.query_start_loc = {0, static_cast<int32_t>(tokens)};
+    am.query_start_loc_cpu = am.query_start_loc;
+    am.seq_lens = {static_cast<int32_t>(tokens)};
+    am.seq_lens_cpu = am.seq_lens;
+    am.max_query_len = static_cast<int>(tokens);
+    am.max_seq_len = static_cast<int>(tokens);
+    am.block_table_num_cols = 1;
+    am.block_table_tensor = {0};
+    for (int64_t t = 0; t < tokens; ++t) am.slot_mapping.push_back(t);
+    am.causal = true;
+    vllm::Qwen3_5MTPHiddenStates paged_hidden = model.ForwardPaged(
+        input_ids, positions, target_hidden.tensor(), am, draft_kv, q);
+    vllm::ForwardLogits paged_out = model.ComputeLogits(paged_hidden.tensor, q);
+    VT_CHECK(paged_out.on_device() && paged_out.rows == tokens &&
+                 paged_out.vocab == config.vocab_size,
+             "MTP parity: unexpected paged logits result");
+    paged_logits.resize(static_cast<size_t>(paged_out.rows) * paged_out.vocab);
+    b.Copy(q, paged_logits.data(), paged_out.device_tensor.data,
+           paged_logits.size() * sizeof(float));
+
     // Same shared lm_head, but fed the ORACLE's hidden states: isolates the
     // lm_head tie from everything the head forward does before it.
     vllm::ForwardLogits from_oracle =
@@ -1732,6 +1773,62 @@ bool RunQwen35MtpHead(Backend& b, Queue& q, const fs::path& dir,
   REQUIRE(unambiguous_rows >= 16);  // the spec's >=16/16 sample-size bar
   CHECK(strict_matches == unambiguous_rows);
   CHECK(tie_rows_resolved == tie_rows);
+
+  // ── SPEC-MTP I5c: PAGED propose parity (the core I5c proof). ────────────────
+  // The paged propose forward over a trivial 1-block draft KV must reproduce
+  // I1's STANDALONE head RESULT: argmax-exact vs the oracle on every unambiguous
+  // row, and logits within the SAME atol+rtol bound the whole-model gates use.
+  // This proves the paged rewrite (own draft KV layer, paged attention over
+  // slot_mapping/block_table) did not change the head math.
+  //
+  // NOTE (RCA, not a tolerance-widen): on CUDA the paged path takes the PRODUCTION
+  // FA2 prefill kernel over a bf16 draft KV cache, while the standalone head uses
+  // the dense f32 attention path — so paged-vs-standalone differs by bf16-KV
+  // rounding + FA2-vs-dense softmax order (max|d| ~0.13-0.17 on logits ~14-20,
+  // i.e. within rtol*|val|), exactly the class of difference the whole-model
+  // paged==dense anchor already accepts. The CPU build (both paths non-FA2) is
+  // bit-exact (max|d|=0), isolating the head math as identical; the CUDA delta is
+  // purely the FA2/bf16-KV attention kernel the 27B/35B paged engines already run.
+  // The BAR is therefore the oracle-argmax + atol+rtol logits bound (as I1's), NOT
+  // a bare-absolute paged==standalone equality.
+  REQUIRE(paged_logits.size() == logits.size());
+  double paged_max_abs = 0.0;              // paged vs standalone, informational
+  int64_t paged_vs_std_unambig = 0;       // paged==standalone argmax, unambig rows
+  int64_t paged_logits_out_of_tol = 0;    // paged vs ORACLE top-8 (atol+rtol)
+  int64_t paged_argmax_vs_oracle = 0;     // paged==oracle argmax, unambig rows (bar)
+  for (int64_t token = 0; token < tokens; ++token) {
+    const float* pr = paged_logits.data() +
+                      static_cast<size_t>(token) * config.vocab_size;
+    const float* sr =
+        logits.data() + static_cast<size_t>(token) * config.vocab_size;
+    for (int64_t v = 0; v < config.vocab_size; ++v)
+      paged_max_abs = std::max(
+          paged_max_abs, std::abs(static_cast<double>(pr[v]) - sr[v]));
+    const size_t base = static_cast<size_t>(token) * topk;
+    for (int64_t k = 0; k < topk; ++k) {
+      const int32_t idx = want_topk_idx[base + k];
+      const double want = want_topk[base + k];
+      const double diff = std::abs(static_cast<double>(pr[idx]) - want);
+      if (!(diff <= logits_atol + logits_rtol * std::abs(want)))
+        ++paged_logits_out_of_tol;
+    }
+    const int32_t paged_arg = ArgmaxRow(pr, config.vocab_size);
+    const bool unamb = want_topk[base] > want_topk[base + 1];
+    if (unamb && paged_arg == want_argmax[token]) ++paged_argmax_vs_oracle;
+    if (unamb && paged_arg == ArgmaxRow(sr, config.vocab_size))
+      ++paged_vs_std_unambig;
+  }
+  MESSAGE("MTP " << tag << "B PAGED propose: argmax vs oracle "
+                 << paged_argmax_vs_oracle << "/" << unambiguous_rows
+                 << " unambiguous, logits(top-8) out-of-tol "
+                 << paged_logits_out_of_tol << "/" << (tokens * topk)
+                 << "; paged==standalone on " << paged_vs_std_unambig << "/"
+                 << unambiguous_rows << " unambiguous rows (paged-vs-standalone "
+                 << "max|d|=" << paged_max_abs
+                 << ", = FA2/bf16-KV vs dense-f32 on CUDA, 0 on CPU)");
+  CHECK(paged_logits_out_of_tol == 0);                 // within I1's atol+rtol
+  CHECK(paged_argmax_vs_oracle == unambiguous_rows);   // the correctness bar
+  CHECK(paged_vs_std_unambig == unambiguous_rows);     // == standalone off ties
   return true;
 }
 

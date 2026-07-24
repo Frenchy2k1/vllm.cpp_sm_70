@@ -631,11 +631,28 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
     INERT (nothing calls it until I5d); additive by construction (two new files +
     one new test + 2 CMake lines, no existing TU touched) → all SACRED gates
     byte-identical, no re-run owed. `SPEC-MTP` STAYS `GATING`.
-  - **I5c — MTP paged propose forward + draft KV layer.** The `Qwen3_5MTP` paged
-    forward driven from the target's post-final-norm hidden tap, its own draft
-    full-attn KV layer (index `num_hidden_layers`), and the k=1 early-exit
-    propose (`autoregressive/speculator.py:236-238`). Gated vs the M-mtp-0 oracle
-    head goldens extended to the paged path.
+  - **I5c — MTP paged propose forward + draft KV layer. LANDED 2026-07-24
+    (`CLAIM-SPEC-MTP-I5C`).** `Qwen3_5MTPModel::ForwardPaged` runs the fc-cat-norm
+    head + one `layer_type="full_attention"` decoder layer over the head's OWN
+    paged draft KV layer via `FullAttnBlockPaged` (ReshapeAndCache + PagedAttention
+    over the target's slot_mapping/block_table) — mirror of `qwen3_5_mtp.py:129-165`
+    over the paged backend (`speculator.py:346` `_run_model`). The draft KV layer is
+    added by `MakeQwen3_5KVCacheSpec(..., num_spec>0)` as an extra `FullAttentionSpec`
+    group (`fa_draft`, index `num_hidden_layers`, `speculator.py:163-169`), sized like
+    a target full-attn layer; `num_spec==0` (production default) is the two pre-I5c
+    groups byte for byte. The target forward exposes the `[T,H]` post-final-norm
+    hidden via `ForwardDeviceTap` (an INERT optional copy of `dnorm` before the logits
+    gather; nullptr on every shipped caller). `MtpProposePrefill`
+    (`src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.cpp`) is the callable k=1
+    propose: I5b `prepare_prefill_inputs` → one `ForwardPaged` → argmax at
+    `last_token_indices` (`speculator.py:236-238` early-exit). **NOT wired into the
+    runner step loop (I5d).** Gates: paged-vs-standalone parity on BOTH checkpoints
+    (`test_op_parity` RunQwen35MtpHead extended); a synthetic two-step draft-KV
+    write/read (bit-exact vs the combined forward, RED control = fresh-KV diverges);
+    draft-KV sizing (`test_model_registry`); `MtpProposePrefill` k=1 — 5 new
+    `test_mtp_speculator.cpp` cases. DEFAULT-OFF INERT; the shared-`qwen3_5.cpp`
+    SACRED gates (27B/35B/Coder) re-run and pass byte-identically. `SPEC-MTP` STAYS
+    `GATING` (the runner loop + e2e token gate are I5d).
   - **I5d — config plumbing + runner loop + the three-way 27B token gate.**
     `--speculative-config` parse + arch resolve; wire the speculator into the
     runner (`take_draft_token_ids`, `propose` post-sampling, the
