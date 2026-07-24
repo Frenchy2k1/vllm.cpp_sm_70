@@ -10,14 +10,33 @@
 
 #include "vt/dtype.h"
 
+namespace vt {
+struct Queue;
+}  // namespace vt
+
 namespace vllm {
 
 struct GdnStateCache;
 struct HfConfig;
+struct GdnLayerWeights;
 
 namespace v1 {
 struct GDNAttentionMetadata;
 }  // namespace v1
+
+// Test-only entry point (SPEC-MTP I5a): run one GDN layer's paged forward over a
+// batched step (spec or non-spec, per `meta`) and return the [T*H] output on host
+// (f32). Drives the real per-step upload (BuildStepDevInputs) + layer assembly
+// (GdnBlockPaged), so the synthetic spec-branch test exercises the exact
+// production routing. Defined in qwen3_5.cpp.
+std::vector<float> GdnBlockPagedForTest(vt::Queue queue, const GdnLayerWeights& w,
+                                        const HfConfig& cfg,
+                                        const std::vector<float>& h_host,
+                                        const v1::GDNAttentionMetadata& meta,
+                                        std::vector<float>& ssm_host,
+                                        std::vector<float>& conv_host,
+                                        int64_t num_slots, int64_t conv_len,
+                                        int64_t T);
 
 }  // namespace vllm
 

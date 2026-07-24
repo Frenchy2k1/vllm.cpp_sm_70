@@ -22312,3 +22312,66 @@ expectations from the recent model additions, identical to base), plus
 its 7-test server family. `test_bpe` went RED→GREEN, the ONLY delta vs base. The
 two big SACRED gates re-run green with the fix (inert for Qwen3/Mistral: 0
 flagged added tokens). All five record checkers green by bare RC.
+
+---
+
+## 2026-07-24 — SPEC-MTP I5a: GDN layer spec routing + runner spec-metadata upload (`CLAIM-SPEC-MTP-I5A`)
+
+Base `origin/main` `594980f`; isolated worktree `/home/mudler/_git/vllm.cpp-i5a`
+branch `i5a-gdn-spec-routing`; dgx `~/work/vllm.cpp-i5a` (`git archive`, CUDA
+`build`, all GPU work under one `flock $HOME/gpu.lock`, big-model gates
+STANDALONE one at a time). NOT pushed.
+
+**Scope decision (from the M-mtp-1 scoping pass).** M-mtp-1 is 4 sub-increments,
+not one. I5a is I4's explicit resume point and independently gateable NOW: the
+GDN layer-forward spec routing + the runner's spec-metadata upload. The full
+decomposition (I5a GDN wiring → I5b `prepare_prefill_inputs` → I5c MTP paged
+propose forward + draft KV layer → I5d config plumbing + runner loop + the 27B
+token gate) is recorded in `mtp-spec-decode.md` §5.
+
+**What landed (all in `qwen3_5.cpp` + its internal header + a new test).**
+1. `GdnBlockPaged` `num_spec_decodes>0` branch — the PURE-spec fast path
+   (`num_prefills==0 && num_decodes==0`): the multi-query conv via
+   `vt::CausalConv1dSpecUpdate` (slot = spec_state_indices col 0, `num_accepted`,
+   `spec_query_start_loc`), the shared `GdnPostConv` prep, and the recurrence via
+   `vt::GdnSpecDecode` over the k+1 state slots — mirroring
+   `qwen_gdn_linear_attn.py:1344-1357,1455-1475`. The existing decode/prefill
+   branches are byte-identical when `num_spec_decodes==0`.
+2. Runner spec-metadata upload — `StepDevInputs` gained the six spec device
+   tensors (+ a derived conv-col0 buffer), `BuildStepDevInputs` uploads them once
+   per step, and the two decode-graph `Refresh` copies carry the host fields.
+   `ValidateGdnAttentionMetadata` gained the spec contract. All stubbed/inert on
+   the default path.
+3. Test-only `GdnBlockPagedForTest` (exposed via `qwen3_5_internal.h`) that stages
+   the SSM/conv caches and drives `BuildStepDevInputs` + `GdnBlockPaged`, used by
+   the synthetic test.
+
+**HONEST SCOPE BOUNDARY.** I5a ships the PURE-spec batch (the k=1 greedy
+steady-state decode, exactly what the bit-exact gate proves). The MIXED
+spec+non-spec batch (index_select split + index_copy merge) is REFUSED LOUDLY in
+`GdnBlockPaged` (`VT_CHECK(!spec || (np==0 && nd==0))`); it is first produced e2e
+by the runner loop and lands with I5d, gated end-to-end. Likewise the runner's
+`GDNAttentionMetadataBuilder::build` spec feed (`num_decode_draft_tokens_cpu`,
+`num_accepted_tokens`) is deferred to I5d's loop — untouched here to keep
+`runner.cpp` (a shared TU) out of the diff, so non-GDN byte-identity stays
+by-construction.
+
+**Gates (cutlass-ON banner CONFIRMED: cutlass-nvfp4/fp8 ENABLED, FA2 ENABLED,
+CUTLASS @ `~/cutlass-4.5.0`).**
+- NEW-CODE: `test_qwen3_5_gdn_spec_routing` drives the spec branch at real 27B
+  (Hv=48)/35B (Hv=32) GDN dims (Dk=Dv=128) — BIT-EXACT (CPU) vs the I4 ops applied
+  as a token-sequential decode chain, CUDA on-device within a tight bf16-ULP band.
+  2 cases / 8 assertions GREEN; `compute-sanitizer memcheck` 0 errors (passes
+  UNDER the sanitizer → spec branch RAN on-device). RED-first by a reverted stub
+  (spec recurrence zeroed ⇒ 4/8 fail, maxΔ 1.3-1.6).
+- I4 tests stay green: `test_ops_gdn` 63/3630, `test_gdn_metadata_builder` 20/483.
+- MANDATORY spec-off byte-identity SACRED gates STANDALONE under flock:
+  **27B `test_qwen27_paged_engine` 235/235, 35B `test_qwen36_paged_engine`
+  315/315, Qwen3-Coder `test_qwen3coder_paged_engine` 138/138 — ALL PASS.**
+- Non-GDN models byte-identical BY CONSTRUCTION: `git diff --stat` touches only
+  `qwen3_5.cpp` (+ internal header + new test + one CMake line); no other model's
+  forward TU.
+
+`SPEC-GDN-SEGMENTS` stays `ACTIVE` (I5a wires the layer; the e2e token gate is
+owed at I5d); `SPEC-MTP` STAYS `GATING`. `benchmark_binding=false`, no speed
+claim — the honest denominator is vLLM with the same spec config, owed by I5d.
