@@ -320,6 +320,89 @@ TEST_CASE("llama3-style \\p{N}{1,3} split regex maps to kLlama3") {
   CHECK(tok.Encode("hello12") == Ids{13, 8, 9});
 }
 
+// HF AddedToken lstrip/rstrip. Every id vector below is copied VERBATIM from the
+// real HF tokenizers 0.22.2 oracle run on the same fixture (the fast/Rust path
+// vLLM itself runs):
+//   ssh dgx.casa '~/venvs/vllm-oracle/bin/python /tmp/oracle_tiny_strip.py'
+// Semantics (transformers 4.54.1 tokenization_utils.py:670-677): rstrip makes
+// the matched token eat the WHOLE whitespace run to its right, lstrip the whole
+// run to its left. Ignoring the flags silently mis-tokenizes any checkpoint that
+// sets them (microsoft/Phi-4-mini-instruct sets rstrip=true on 10 of its 12
+// added tokens), so this is a correctness contract, not a nicety.
+TEST_CASE("added token lstrip/rstrip eat the adjacent whitespace") {
+  const std::string kLstrip =
+      ReplaceOnce(kTinyJson, R"("single_word": false, "lstrip": false)",
+                  R"("single_word": false, "lstrip": true)");
+  const std::string kRstrip = ReplaceOnce(
+      kTinyJson, R"("single_word": false, "lstrip": false, "rstrip": false)",
+      R"("single_word": false, "lstrip": false, "rstrip": true)");
+  const std::string kBoth = ReplaceOnce(
+      kTinyJson, R"("single_word": false, "lstrip": false, "rstrip": false)",
+      R"("single_word": false, "lstrip": true, "rstrip": true)");
+
+  SUBCASE("flags load instead of throwing, and are recorded") {
+    const Tokenizer l = LoadTiny(kLstrip);
+    CHECK(l.AddedTokens()[0].lstrip);
+    CHECK_FALSE(l.AddedTokens()[0].rstrip);
+    CHECK_FALSE(l.AddedTokens()[1].lstrip);  // untouched neighbours stay off
+    const Tokenizer r = LoadTiny(kRstrip);
+    CHECK_FALSE(r.AddedTokens()[0].lstrip);
+    CHECK(r.AddedTokens()[0].rstrip);
+    // Default (both false) is the historical behaviour, bit-for-bit.
+    const Tokenizer b = LoadTiny();
+    CHECK_FALSE(b.AddedTokens()[0].lstrip);
+    CHECK_FALSE(b.AddedTokens()[0].rstrip);
+  }
+  SUBCASE("baseline: no flags, whitespace tokenizes normally") {
+    const Tokenizer tok = LoadTiny();
+    CHECK(tok.Encode("hello <|end|> world") == Ids{13, 7, 19, 17});
+    CHECK(tok.Encode("hello  <|end|>  world") == Ids{13, 7, 7, 19, 7, 17});
+    CHECK(tok.Encode("hello<|end|> world") == Ids{13, 19, 17});
+    CHECK(tok.Encode("hello <|end|>world") == Ids{13, 7, 19, 4, 16});
+    // Multi-space run on both sides (each ' ' -> Ġ=7): all six preserved.
+    CHECK(tok.Encode("hello   <|end|>   world") ==
+          Ids{13, 7, 7, 7, 19, 7, 7, 17});
+    CHECK(tok.Encode("<|end|> world") == Ids{19, 17});
+    CHECK(tok.Encode("hello <|end|>") == Ids{13, 7, 19});
+  }
+  SUBCASE("lstrip eats the whole run to the LEFT") {
+    const Tokenizer tok = LoadTiny(kLstrip);
+    CHECK(tok.Encode("hello <|end|> world") == Ids{13, 19, 17});
+    CHECK(tok.Encode("hello  <|end|>  world") == Ids{13, 19, 7, 17});
+    CHECK(tok.Encode("hello<|end|> world") == Ids{13, 19, 17});
+    CHECK(tok.Encode("hello <|end|>world") == Ids{13, 19, 4, 16});
+    // Whole LEFT run (three spaces) eaten; the RIGHT run stays (7,7).
+    CHECK(tok.Encode("hello   <|end|>   world") == Ids{13, 19, 7, 7, 17});
+    CHECK(tok.Encode("<|end|> world") == Ids{19, 17});  // nothing to the left
+    CHECK(tok.Encode("hello <|end|>") == Ids{13, 19});
+    // A non-flagged added token in the SAME tokenizer is unaffected.
+    CHECK(tok.Encode("hello <tool> world") == Ids{13, 7, 20, 17});
+  }
+  SUBCASE("rstrip eats the whole run to the RIGHT") {
+    const Tokenizer tok = LoadTiny(kRstrip);
+    CHECK(tok.Encode("hello <|end|> world") == Ids{13, 7, 19, 4, 16});
+    CHECK(tok.Encode("hello  <|end|>  world") == Ids{13, 7, 7, 19, 4, 16});
+    CHECK(tok.Encode("hello<|end|> world") == Ids{13, 19, 4, 16});
+    CHECK(tok.Encode("hello <|end|>world") == Ids{13, 7, 19, 4, 16});
+    // LEFT run (7,7,7) stays; whole RIGHT run eaten.
+    CHECK(tok.Encode("hello   <|end|>   world") == Ids{13, 7, 7, 7, 19, 4, 16});
+    CHECK(tok.Encode("<|end|> world") == Ids{19, 4, 16});
+    CHECK(tok.Encode("hello <|end|>") == Ids{13, 7, 19});  // nothing right
+    CHECK(tok.Encode("hello <tool> world") == Ids{13, 7, 20, 17});
+  }
+  SUBCASE("both flags eat both runs") {
+    const Tokenizer tok = LoadTiny(kBoth);
+    CHECK(tok.Encode("hello <|end|> world") == Ids{13, 19, 4, 16});
+    CHECK(tok.Encode("hello  <|end|>  world") == Ids{13, 19, 4, 16});
+    CHECK(tok.Encode("hello<|end|> world") == Ids{13, 19, 4, 16});
+    CHECK(tok.Encode("hello <|end|>world") == Ids{13, 19, 4, 16});
+    CHECK(tok.Encode("hello   <|end|>   world") == Ids{13, 19, 4, 16});
+    CHECK(tok.Encode("<|end|> world") == Ids{19, 4, 16});
+    CHECK(tok.Encode("hello <|end|>") == Ids{13, 19});
+    CHECK(tok.Encode("hello <tool> world") == Ids{13, 7, 20, 17});
+  }
+}
+
 TEST_CASE("loader failure modes throw with actionable messages") {
   SUBCASE("unknown model type") {
     CheckThrowsContains(
@@ -393,14 +476,19 @@ TEST_CASE("loader failure modes throw with actionable messages") {
         },
         "a b");
   }
-  SUBCASE("added token lstrip/rstrip/single_word semantics unsupported") {
+  SUBCASE("added token single_word semantics unsupported") {
+    // single_word changes word-boundary matching (the token is NOT split off
+    // mid-word; transformers tokenization_utils.py:678-681). We do not emulate
+    // it, so it stays a LOUD refusal rather than a silent mis-tokenization.
+    // lstrip/rstrip are a different story: they ARE implemented (see the
+    // "added token lstrip/rstrip eat the adjacent whitespace" case), so they
+    // must NOT throw.
     CheckThrowsContains(
         [&] {
-          LoadTiny(ReplaceOnce(
-              kTinyJson, R"("single_word": false, "lstrip": false)",
-              R"("single_word": false, "lstrip": true)"));
+          LoadTiny(ReplaceOnce(kTinyJson, R"("single_word": false)",
+                               R"("single_word": true)"));
         },
-        "lstrip");
+        "single_word");
   }
   SUBCASE("missing file") {
     CHECK_THROWS_AS((void)Tokenizer::FromHfJson("/nonexistent/tok.json"),

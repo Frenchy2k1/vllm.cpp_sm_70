@@ -446,6 +446,29 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
+### Red-gate RCA + fix - tokenizer `lstrip`/`rstrip`, `anchor drift` (2026-07-24, `CLAIM-REDGATE-RCA`) - correctness only, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - correctness fix + RCA, no performance
+claim, `benchmark_binding=false`.** Cleared two red gates on `origin/main`
+`1e14f60`. **(1) `test_bpe`:** `4e9f1d2`'s accept-and-ignore of added-token
+`lstrip`/`rstrip` was a REAL live tokenization bug (`microsoft/Phi-4-mini-instruct`
+sets `rstrip=true` on 10 of 12 added tokens), not a benign relaxation; fixed by
+implementing the whitespace-eating semantics (transformers
+`tokenization_utils.py:670-677`). Proven on dgx: `examples/tokenize` on the real
+Phi-4-mini `tokenizer.json` matches the HF `tokenizers` 0.22.2 oracle
+byte-for-byte only after the fix (the pre-fix build diverged on all 4 corpus
+prompts). `test_bpe` 18 cases / 905 assertions GREEN. **(2) Qwen3-dense + Mistral
+`anchor drift`:** NOT a regression and NOT stale goldens - a BUILD-CONFIG
+artifact. All three SACRED gates PASS 16/16 on a clean CANONICAL build of current
+main (CUTLASS 4.5.0 + FA2 + Triton AOT, arch `121a`), reproduced 3x; the sibling's
+failure came from a degraded build with CUTLASS (hence FlashAttention-2) not
+compiled, which makes the fallback attention resolve the model's genuine bf16
+near-ties the other way. Same-binary A/B proof: `VT_FA2_PREFILL_QWEN3=0
+VT_FA2_DECODE_QWEN3=0` reproduces the exact signature; FA2-on it is green. Golden
+md5 identical before/after - no regeneration. No throughput number is affected
+(tokenizer fix inert for Qwen3/Mistral; the two big gates re-run green). Reproduce:
+`ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/redgate/s-1e14f60/build && ctest -R test_qwen3_paged_engine\|test_mistral_paged_engine --output-on-failure"'`.
+
 ### MTP draft-head oracle parity, M-mtp-0 (2026-07-24, `CLAIM-MTP-I1-HEAD-ORACLE`) - correctness only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - correctness increment, no performance

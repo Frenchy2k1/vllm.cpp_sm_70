@@ -26,6 +26,19 @@ struct SpecialToken {
   std::string text;
   int32_t id = -1;
   bool special = false;
+  // HF AddedToken lstrip/rstrip. They DO change encoding: when this token is
+  // matched, the whitespace immediately to its left (lstrip) / right (rstrip)
+  // is EATEN by the token instead of being tokenized. Mirrors transformers
+  // `tokenization_utils.py` PreTrainedTokenizer.tokenize()
+  //   if tok_extended.rstrip and right:  tokens[i + 1] = right.lstrip()
+  //   if tok_extended.lstrip  and left:  tokens[i - 1] = left.rstrip()
+  // (transformers 4.54.1 src/transformers/tokenization_utils.py:670-677), which
+  // is the semantic the fast Rust `tokenizers` AddedVocabulary implements by
+  // extending the match span over the adjacent whitespace. Real checkpoints set
+  // them: microsoft/Phi-4-mini-instruct marks 10 of its 12 added tokens
+  // rstrip=true (<|assistant|>, <|end|>, <|user|>, <|system|>, <|tool|>, ...).
+  bool lstrip = false;
+  bool rstrip = false;
 };
 
 class Tokenizer {
