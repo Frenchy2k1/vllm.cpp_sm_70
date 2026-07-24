@@ -14,6 +14,7 @@
 //      records the hit rate and prefill-tokens-saved, and proves byte identity.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -613,4 +614,213 @@ TEST_CASE("KVConnector e2e: the config-selected disk connector shortcuts prefill
   // EXACTLY the borrowing path's numbers: 32 tokens saved, 16 recomputed.
   CHECK(prefill_saved == expected_hit_blocks * kBlockSize);  // 32
   CHECK(treated_prefill == kBlockSize);                      // 16
+}
+
+// ===========================================================================
+// D1 GUARD — a connector's SCHEDULER half shortcuts prefill, so wiring one whose
+// WORKER half cannot move bytes on the target device would make the model attend
+// over KV that was never written (silently wrong output). The engine refuses the
+// combination instead. These cases pin the refusal, the admission, and the fact
+// that the guard is a CAPABILITY QUERY (not a type ladder), so a future
+// connector that implements a worker half is admitted without touching the
+// call site.
+// ===========================================================================
+
+namespace {
+// A connector that declares a worker half only on CPU: stands in for a future
+// partial implementation and proves the guard is genuinely per-device rather
+// than a hardcoded allow/deny of the two connectors that exist today.
+class CpuOnlyWorkerConnector : public MockConnector {
+ public:
+  static bool WorkerTransferSupportedOn(vt::DeviceType device) {
+    return device == vt::DeviceType::kCPU;
+  }
+  bool supports_worker_transfer_on(vt::DeviceType device) const override {
+    return WorkerTransferSupportedOn(device);
+  }
+};
+}  // namespace
+
+TEST_CASE("D1 guard: the base default is NO worker half on any device") {
+  // A connector that does not override the predicate has no worker half — the
+  // base's worker hooks are all no-ops, so this default is the honest one.
+  MockConnector m;
+  CHECK_FALSE(m.supports_worker_transfer_on(vt::DeviceType::kCPU));
+  CHECK_FALSE(m.supports_worker_transfer_on(vt::DeviceType::kCUDA));
+  CHECK_FALSE(m.supports_worker_transfer_on(vt::DeviceType::kMETAL));
+
+  // ...and an override is all it takes to admit a device (additivity).
+  CpuOnlyWorkerConnector c;
+  CHECK(c.supports_worker_transfer_on(vt::DeviceType::kCPU));
+  CHECK_FALSE(c.supports_worker_transfer_on(vt::DeviceType::kCUDA));
+}
+
+TEST_CASE("D1 guard: the disk connector has NO worker half and is REFUSED") {
+  // HONEST STATE OF THE TREE: OffloadingConnector's worker half is NOT
+  // implemented. Its ConnectorLoadJobs are consumed by nothing and its bytes
+  // live in a host PrimaryByteView that is never copied into a KV page — on
+  // ANY device, CPU included. So the engine refuses it everywhere, rather than
+  // shortcutting prefill for KV that no one writes.
+  for (vt::DeviceType device :
+       {vt::DeviceType::kCPU, vt::DeviceType::kCUDA, vt::DeviceType::kMETAL}) {
+    CAPTURE(device_type_name(device));
+    CHECK_FALSE(KVConnectorFactory::WorkerTransferSupportedOn(
+        "OffloadingConnector", device));
+    CHECK_THROWS_AS(
+        EnsureWorkerTransferSupported("OffloadingConnector", device),
+        std::runtime_error);
+  }
+
+  // The refusal must be ACTIONABLE: it names the connector, the device, the
+  // consequence, and what IS admissible there.
+  std::string what;
+  try {
+    EnsureWorkerTransferSupported("OffloadingConnector", vt::DeviceType::kCUDA);
+  } catch (const std::runtime_error& e) {
+    what = e.what();
+  }
+  CHECK(what.find("OffloadingConnector") != std::string::npos);
+  CHECK(what.find("cuda") != std::string::npos);
+  CHECK(what.find("no worker half") != std::string::npos);
+  CHECK(what.find("silently wrong output") != std::string::npos);
+  CHECK(what.find("LMCacheConnector") != std::string::npos);  // the way forward
+}
+
+TEST_CASE("D1 guard: the LMCache connector HAS a worker half and is ADMITTED") {
+  // runner.cpp's ConnectorLoadExternalKv / ConnectorStorePromptKv implement it,
+  // through the device-agnostic vt::Backend::Copy — so every device is admitted
+  // and the guard is inert for the connector that actually works.
+  for (vt::DeviceType device :
+       {vt::DeviceType::kCPU, vt::DeviceType::kCUDA, vt::DeviceType::kMETAL}) {
+    CAPTURE(device_type_name(device));
+    CHECK(KVConnectorFactory::WorkerTransferSupportedOn("LMCacheConnector",
+                                                        device));
+    CHECK_NOTHROW(EnsureWorkerTransferSupported("LMCacheConnector", device));
+  }
+  const std::vector<std::string> capable =
+      KVConnectorFactory::WorkerCapableNames(vt::DeviceType::kCUDA);
+  CHECK(std::find(capable.begin(), capable.end(), "LMCacheConnector") !=
+        capable.end());
+  CHECK(std::find(capable.begin(), capable.end(), "OffloadingConnector") ==
+        capable.end());
+}
+
+TEST_CASE("D1 guard: no connector is inert; an unknown name is named as such") {
+  // The default-off path must not be disturbed by the guard.
+  CHECK_NOTHROW(EnsureWorkerTransferSupported("", vt::DeviceType::kCUDA));
+  CHECK_NOTHROW(EnsureWorkerTransferSupported("", vt::DeviceType::kCPU));
+
+  // An unregistered name reports THAT, rather than a confusing worker-half
+  // message about a connector that does not exist.
+  std::string what;
+  try {
+    EnsureWorkerTransferSupported("NoSuchConnector", vt::DeviceType::kCPU);
+  } catch (const std::runtime_error& e) {
+    what = e.what();
+  }
+  CHECK(what.find("unknown KV connector") != std::string::npos);
+  CHECK(what.find("NoSuchConnector") != std::string::npos);
+  CHECK(what.find("OffloadingConnector") != std::string::npos);  // registry list
+  CHECK(what.find("LMCacheConnector") != std::string::npos);
+
+  CHECK(std::string(device_type_name(vt::DeviceType::kCPU)) == "cpu");
+  CHECK(std::string(device_type_name(vt::DeviceType::kCUDA)) == "cuda");
+}
+
+// ===========================================================================
+// --kv-transfer-config JSON (FIX 3) — vLLM's own CLI payload shape, parsed into
+// the KVTransferConfig the engine already consumes.
+// ===========================================================================
+
+TEST_CASE("kv-transfer-config: vLLM's JSON shape round-trips into the config") {
+  const vllm::KVTransferConfig cfg = vllm::ParseKVTransferConfigJson(
+      R"({"kv_connector": "LMCacheConnector",
+          "kv_role": "kv_both",
+          "kv_connector_extra_config": {
+              "host": "127.0.0.1", "port": 65432,
+              "hash_algo": "blake3", "chunk_tokens": 256,
+              "offload_prompt_only": true}})");
+  REQUIRE(cfg.kv_connector.has_value());
+  CHECK(*cfg.kv_connector == "LMCacheConnector");
+  REQUIRE(cfg.kv_role.has_value());
+  CHECK(*cfg.kv_role == vllm::KVRole::kBoth);
+  CHECK(cfg.is_kv_transfer_instance());
+  CHECK(cfg.get_from_extra_config("host", "") == "127.0.0.1");
+  // Non-string scalars stringify in JSON spelling, which is exactly what the
+  // connectors' extra_int / extra_bool readers accept.
+  CHECK(cfg.get_from_extra_config("port", "") == "65432");
+  CHECK(cfg.get_from_extra_config("chunk_tokens", "") == "256");
+  CHECK(cfg.get_from_extra_config("offload_prompt_only", "") == "true");
+  CHECK(cfg.get_from_extra_config("hash_algo", "") == "blake3");
+  // Validate() ran: engine_id is filled.
+  CHECK(cfg.engine_id.has_value());
+  // The disk tier's own keys parse the same way.
+  const vllm::KVTransferConfig disk = vllm::ParseKVTransferConfigJson(
+      R"({"kv_connector": "OffloadingConnector", "kv_role": "kv_both",
+          "kv_connector_extra_config": {"root_dir": "/var/tmp/kv",
+                                        "num_cpu_blocks": 512}})");
+  CHECK(disk.get_from_extra_config("root_dir", "") == "/var/tmp/kv");
+  CHECK(disk.get_from_extra_config("num_cpu_blocks", "") == "512");
+}
+
+TEST_CASE("kv-transfer-config: optional fields and roles") {
+  const vllm::KVTransferConfig cfg = vllm::ParseKVTransferConfigJson(
+      R"({"kv_connector": "LMCacheConnector", "kv_role": "kv_producer",
+          "engine_id": "e0", "kv_load_failure_policy": "recompute"})");
+  CHECK(*cfg.kv_role == vllm::KVRole::kProducer);
+  CHECK(cfg.is_kv_producer());
+  CHECK_FALSE(cfg.is_kv_consumer());
+  CHECK(*cfg.engine_id == "e0");
+  CHECK(cfg.kv_load_failure_policy == vllm::KVLoadFailurePolicy::kRecompute);
+
+  // An empty object is legal and INERT (no connector selected).
+  const vllm::KVTransferConfig empty = vllm::ParseKVTransferConfigJson("{}");
+  CHECK_FALSE(empty.is_kv_transfer_instance());
+}
+
+TEST_CASE("kv-transfer-config: malformed input FAILS LOUDLY") {
+  // Malformed JSON.
+  CHECK_THROWS_AS(vllm::ParseKVTransferConfigJson("{not json"),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(vllm::ParseKVTransferConfigJson(""), std::invalid_argument);
+  // Not an object.
+  CHECK_THROWS_AS(vllm::ParseKVTransferConfigJson("[1,2]"),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(vllm::ParseKVTransferConfigJson("\"LMCacheConnector\""),
+                  std::invalid_argument);
+  // Unknown key (a typo must not be silently dropped).
+  CHECK_THROWS_AS(
+      vllm::ParseKVTransferConfigJson(R"({"kv_conector": "LMCacheConnector"})"),
+      std::invalid_argument);
+  // Wrong types.
+  CHECK_THROWS_AS(vllm::ParseKVTransferConfigJson(R"({"kv_connector": 7})"),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(
+      vllm::ParseKVTransferConfigJson(R"({"kv_connector_extra_config": 1})"),
+      std::invalid_argument);
+  CHECK_THROWS_AS(vllm::ParseKVTransferConfigJson(
+                      R"({"kv_connector_extra_config": {"a": {"b": 1}}})"),
+                  std::invalid_argument);
+  // Unknown enum tokens.
+  CHECK_THROWS_AS(vllm::ParseKVTransferConfigJson(
+                      R"({"kv_connector": "x", "kv_role": "kv_maybe"})"),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(
+      vllm::ParseKVTransferConfigJson(
+          R"({"kv_connector": "x", "kv_role": "kv_both",
+              "kv_load_failure_policy": "shrug"})"),
+      std::invalid_argument);
+  // Validate() still applies: a connector without a role is refused.
+  CHECK_THROWS_AS(
+      vllm::ParseKVTransferConfigJson(R"({"kv_connector": "LMCacheConnector"})"),
+      std::invalid_argument);
+
+  // A parsed-but-unregistered connector name is caught by the factory /
+  // the D1 guard, which is what the server calls next.
+  const vllm::KVTransferConfig bogus = vllm::ParseKVTransferConfigJson(
+      R"({"kv_connector": "NopeConnector", "kv_role": "kv_both"})");
+  CHECK_FALSE(KVConnectorFactory::IsRegistered(*bogus.kv_connector));
+  CHECK_THROWS_AS(
+      EnsureWorkerTransferSupported(*bogus.kv_connector, vt::DeviceType::kCPU),
+      std::runtime_error);
 }

@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "vllm/entrypoints/openai/reasoning_parsers/deepseek_r1.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/think_auto.h"
@@ -38,6 +39,16 @@ std::unique_ptr<ReasoningParser> get_reasoning_parser(const std::string& name) {
     return std::make_unique<Olmo3ReasoningParser>();
   }
   return nullptr;
+}
+
+// The enumeration of the factory above (see abstract.h). ADD A NAME HERE IN THE
+// SAME CHANGE THAT ADDS ITS FACTORY BRANCH.
+const std::vector<std::string>& reasoning_parser_names() {
+  static const std::vector<std::string> names = {
+      "think_auto", "deepseek_r1", "mistral", "minimax_m2",
+      "minimax_m2_append_think", "step3", "olmo3",
+  };
+  return names;
 }
 
 }  // namespace vllm::entrypoints::openai

@@ -16,6 +16,27 @@ uint64_t NextQueueId() noexcept;
 enum class DeviceType : uint8_t { kCPU = 0, kCUDA = 1, kMETAL = 2, kVULKAN = 3, kXPU = 4 };
 constexpr size_t kNumDeviceTypes = 5;
 
+// The canonical lowercase spelling of a device, for user-facing messages (and
+// the docs that quote them). Lives here, beside the enum, rather than in the
+// shared vllm layer: it names every platform EQUALLY, so it is a data list like
+// the platform priority walk, not a device-specific branch — and keeping it in
+// vt means adding a platform touches one enum and one switch, both in this file.
+constexpr const char* DeviceTypeName(DeviceType device) {
+  switch (device) {
+    case DeviceType::kCPU:
+      return "cpu";
+    case DeviceType::kCUDA:
+      return "cuda";
+    case DeviceType::kMETAL:
+      return "metal";
+    case DeviceType::kVULKAN:
+      return "vulkan";
+    case DeviceType::kXPU:
+      return "xpu";
+  }
+  return "unknown";
+}
+
 struct Device {
   DeviceType type = DeviceType::kCPU;
   int32_t index = 0;

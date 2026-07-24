@@ -116,6 +116,18 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
   // caller that only names the connector still yields a valid config.
   if (!cfg.kv_role.has_value()) cfg.kv_role = vllm::KVRole::kBoth;
 
+  // D1 SAFETY GUARD, before anything is constructed. A connector's scheduler
+  // half shortcuts prefill for externally matched blocks; if its worker half
+  // cannot write those bytes into THIS device's KV pages, the model would
+  // attend over never-written KV and emit plausible, wrong output with no error
+  // anywhere. Refuse instead. The predicate is registered per connector
+  // (KVConnectorWorkerTransferFn), so admitting a future worker half is one
+  // override plus one registration argument — no ladder to extend here.
+  // Checked BEFORE Create() on purpose: a connector ctor can fail first for an
+  // unrelated precondition, and a refusal that surfaces as somebody else's
+  // error message is not actionable.
+  EnsureWorkerTransferSupported(*cfg.kv_connector, runner.device().type);
+
   const std::vector<vllm::PagedKvCache>& kv = runner.attn_kv();
   if (kv.empty()) {
     throw std::runtime_error(

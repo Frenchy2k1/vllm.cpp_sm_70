@@ -21,20 +21,28 @@ namespace vllm::v1::kv_offload {
 // order-independent, exactly like the model registry.
 // ---------------------------------------------------------------------------
 namespace {
-std::map<std::string, KVConnectorBuilder>& registry() {
-  static std::map<std::string, KVConnectorBuilder> r;
+// One registry entry: the builder plus the connector's STATIC worker-half
+// capability predicate (null == no worker half, the safe default).
+struct Registration {
+  KVConnectorBuilder builder = nullptr;
+  KVConnectorWorkerTransferFn worker_transfer = nullptr;
+};
+
+std::map<std::string, Registration>& registry() {
+  static std::map<std::string, Registration> r;
   return r;
 }
 }  // namespace
 
 void KVConnectorFactory::Register(const std::string& name,
-                                  KVConnectorBuilder builder) {
+                                  KVConnectorBuilder builder,
+                                  KVConnectorWorkerTransferFn worker_transfer) {
   auto& r = registry();
   if (r.count(name) != 0) {
     // factory.py:33-36: duplicate registration is rejected.
     throw std::runtime_error("KV connector already registered: " + name);
   }
-  r[name] = builder;
+  r[name] = Registration{builder, worker_transfer};
 }
 
 std::unique_ptr<KVConnector> KVConnectorFactory::Create(
@@ -52,7 +60,7 @@ std::unique_ptr<KVConnector> KVConnectorFactory::Create(
     // factory.py:91-92: unsupported connector name.
     throw std::runtime_error("Unsupported KV connector: " + name);
   }
-  return it->second(ctx);
+  return it->second.builder(ctx);
 }
 
 bool KVConnectorFactory::IsRegistered(const std::string& name) {
@@ -64,6 +72,68 @@ std::vector<std::string> KVConnectorFactory::RegisteredNames() {
   names.reserve(registry().size());
   for (const auto& [name, _] : registry()) names.push_back(name);
   return names;
+}
+
+bool KVConnectorFactory::WorkerTransferSupportedOn(const std::string& name,
+                                                   vt::DeviceType device) {
+  auto& r = registry();
+  auto it = r.find(name);
+  if (it == r.end() || it->second.worker_transfer == nullptr) return false;
+  return it->second.worker_transfer(device);
+}
+
+std::vector<std::string> KVConnectorFactory::WorkerCapableNames(
+    vt::DeviceType device) {
+  std::vector<std::string> names;
+  for (const auto& [name, reg] : registry()) {
+    if (reg.worker_transfer != nullptr && reg.worker_transfer(device)) {
+      names.push_back(name);
+    }
+  }
+  return names;
+}
+
+const char* device_type_name(vt::DeviceType device) {
+  // The spelling lives with the enum (vt/device.h); this is the shared layer's
+  // handle on it, so no device name is written here.
+  return vt::DeviceTypeName(device);
+}
+
+namespace {
+std::string JoinNames(const std::vector<std::string>& names) {
+  if (names.empty()) return "(none)";
+  std::string out;
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    if (i != 0) out += ", ";
+    out += names[i];
+  }
+  return out;
+}
+}  // namespace
+
+void EnsureWorkerTransferSupported(const std::string& connector_name,
+                                   vt::DeviceType device) {
+  if (connector_name.empty()) return;  // no connector == nothing to guard.
+  if (KVConnectorFactory::WorkerTransferSupportedOn(connector_name, device)) {
+    return;
+  }
+  const std::string device_name = device_type_name(device);
+  if (!KVConnectorFactory::IsRegistered(connector_name)) {
+    throw std::runtime_error(
+        "unknown KV connector '" + connector_name + "' (registered: " +
+        JoinNames(KVConnectorFactory::RegisteredNames()) + ")");
+  }
+  throw std::runtime_error(
+      "REFUSING KV connector '" + connector_name + "' on device '" +
+      device_name +
+      "': this connector has no worker half on this device, but its scheduler "
+      "half shortcuts prefill for externally matched blocks. Running it would "
+      "make the model attend over KV that is never written into the device's "
+      "KV pages, i.e. silently wrong output. Connectors whose worker half can "
+      "move KV bytes on '" + device_name + "': " +
+      JoinNames(KVConnectorFactory::WorkerCapableNames(device)) +
+      ". Select one of those, or unset the KV transfer config to run with no "
+      "connector.");
 }
 
 // ---------------------------------------------------------------------------
@@ -327,5 +397,16 @@ std::vector<OffloadKey> OffloadingConnector::store_keys(
 // Self-register the disk-offload connector (factory.py:206). Compile-time
 // registration replaces vLLM's dynamic importlib module path (recorded
 // deviation). Selected by KVTransferConfig{kv_connector = "OffloadingConnector"}.
+//
+// NO WORKER HALF (deliberate, and the reason the plain REGISTER_KV_CONNECTOR
+// form is used here): this connector is SCHEDULER-SIDE ONLY. It matches keys
+// and shortcuts prefill, but nothing ever copies its bytes into a KV page —
+// build_connector_meta's ConnectorLoadJobs have no consumer, and its tier bytes
+// live in a host PrimaryByteView. Registering without a worker-transfer
+// predicate makes KVConnectorFactory::WorkerTransferSupportedOn false on EVERY
+// device, so BuildKvConnector refuses to wire it into an engine instead of
+// serving output computed over KV that was never written. Implementing the
+// worker half (GPU/CPU page <-> tier byte movement, the mirror of runner.cpp's
+// LMCache store/load) is tracked as open work, NOT shipped here.
 REGISTER_KV_CONNECTOR(offloading, "OffloadingConnector",
                       &::vllm::v1::kv_offload::OffloadingConnector::CreateFromConfig)

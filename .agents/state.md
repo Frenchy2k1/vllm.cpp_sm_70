@@ -22043,3 +22043,137 @@ splice into `input_ids` (still deferred in `combine_sampled_and_draft_tokens`,
 which needs the `draft_tokens` per-req buffer), and plumbing a real
 `SpeculativeConfig` into the runner so a `RejectionSampler` can be constructed
 once instead of per step.
+## 2026-07-24 — T2 fix wave (`CLAIM-DOCS-T2-FIXES`): the D1 worker-half guard + three unreachable user surfaces
+
+Base `origin/main` `ba4dd62`, isolated worktree branch `t2-fix-wave`. Tier 2 of
+[specs/docs-coverage-audit.md](specs/docs-coverage-audit.md): one latent correctness bug and three
+shipped-but-unreachable surfaces. CPU build + full CPU ctest; no GPU work in this session.
+
+**FIX 1 — the D1 guard (the reason this wave exists).** A KV connector's SCHEDULER half shortcuts
+prefill: the tokens `get_num_new_matched_tokens` reports are treated as already computed and never run
+through the model. That is only sound if the WORKER half writes the matching KV bytes into the
+device's KV pages first. `OffloadingConnector` (CPU/disk) has NO worker half — its `ConnectorLoadJob`s
+have no consumer, the base worker hooks it inherits are no-ops, and its bytes live in a host
+`PrimaryByteView` that is never copied into a KV page — yet `BuildKvConnector` built it for any device
+with no guard. The failure mode is wrong output with no error anywhere.
+
+Design: a CAPABILITY QUERY, not a `dynamic_cast` ladder. `KVConnector::supports_worker_transfer_on(
+vt::DeviceType)` (base default FALSE, because the base's worker hooks are no-ops), plus a matching
+STATIC `KVConnectorWorkerTransferFn` registered beside the builder
+(`REGISTER_KV_CONNECTOR_WITH_WORKER`) so capability is queryable BY NAME, and
+`EnsureWorkerTransferSupported` as the single refusal point. `LMCacheConnector` implements the static
+and returns true on every device (its worker half is `vt::Backend::Copy`-based and device-agnostic;
+the output-invariance gate that proved it bit-exact ran on the CPU backend). `OffloadingConnector`
+registers no predicate, so it is refused everywhere.
+
+Two deliberate departures from the audit's own recommendation, both recorded in the spec:
+
+1. **The refusal is not GPU-only.** The audit proposed refusing on "a non-CPU device". The worker half
+   does not exist on ANY device — the bytes are never copied into a KV page whether that page is CUDA
+   or host memory — so a CPU-admitting guard would have shipped the same silent-corruption bug on the
+   CPU backend. It refuses everywhere the engine would wire it.
+2. **The check runs BEFORE construction.** `BuildKvConnector` never populated
+   `KVConnectorContext::page_size_bytes` or `::identity`, so `OffloadingConnector::CreateFromConfig`
+   already threw first, with an unrelated precondition message ("page_size_bytes must be > 0") naming
+   neither the problem nor a remedy. So the hazard was LATENT rather than live-and-silent — one
+   plumbing patch from becoming real — and the misleading error was itself a defect. Querying by name
+   before `Create()` makes the honest message the one users see, and stops correctness depending on an
+   accident of unset context fields.
+
+The refusal names the connector, the device, the consequence, and what IS admissible there:
+`REFUSING KV connector 'OffloadingConnector' on device 'cuda': this connector has no worker half on
+this device, but its scheduler half shortcuts prefill for externally matched blocks. Running it would
+make the model attend over KV that is never written into the device's KV pages, i.e. silently wrong
+output. Connectors whose worker half can move KV bytes on 'cuda': LMCacheConnector. Select one of
+those, or unset the KV transfer config to run with no connector.`
+
+**The scheduler-side path is untouched, and proven so.** Both pre-existing restart-hit e2es still save
+exactly 32/48 prefill tokens (2 of 3 blocks): the borrowing-constructor case and the config-selected
+owning case. They drive the connector directly through `KVConnectorFactory`, never through
+`BuildKvConnector`, which is the correct seam for a scheduler-only harness.
+
+**HONEST REMAINING WORK: the disk connector's worker half is NOT implemented.** This wave converts a
+silent-wrong-output path into a loud refusal. It does not make the disk tier usable from a serving
+engine and nothing here should be read as claiming it does. Implementing it means writing the mirror
+of `runner.cpp`'s LMCache store/load — device page <-> tier byte movement plus a `CacheIdentity` and
+page geometry threaded into `KVConnectorContext` — and is tracked as open on `KV-OFFLOAD`.
+
+**FIX 2 — `--tool-call-parser` / `--reasoning-parser`.** The server hardcoded `"hermes"` and `""`, so
+39 tool dialects and 7 reasoning parsers shipped unreachable over HTTP. Both flags use vLLM's own
+names. Their DEFAULTS ARE THE OLD LITERALS, deliberately: wiring auto-detection as the default would
+have silently changed the parser of every existing deployment (the tool marker table has 26 rows and
+would fire on most templates; the reasoning table would enable `think_auto` on any `<think>` model).
+`auto` opts into exactly the C ABI's detection, `none` disables. Unknown names throw at startup
+listing every registered name, enumerated FROM the factories via new `tool_parser_names()` (40
+accepted names over 36 families) and `reasoning_parser_names()` (7) rather than a list written at the
+flag; a registry test resolves every enumerated name and pins the counts, so a factory branch added
+without listing its name fails the suite. The whole flag behaviour lives in `ResolveToolParserName` /
+`ResolveReasoningParserName` so it is unit-tested without launching a server, and named (non-`auto`)
+values are validated in `ParseArgs`, before the multi-GB model load.
+
+**FIX 3 — `--kv-transfer-config '<json>'`.** vLLM's flag name and JSON shape, parsed by
+`vllm::ParseKVTransferConfigJson` into the `KVTransferConfig` the engine already consumed
+programmatically. Non-string scalars stringify in JSON spelling, which is what the connectors'
+`extra_int`/`extra_bool` readers accept. Malformed JSON, a non-object document, an unknown key, a
+wrongly-typed value, an unknown role/policy and a connector-without-role are each refused by name;
+an unregistered connector name is refused listing `KVConnectorFactory::RegisteredNames()`. Absent
+leaves the optional unset, i.e. the inert path. It composes with FIX 1: selecting the disk connector
+now produces the loud refusal above.
+
+**Device-name placement (a checker catch worth recording).** The refusal message needs to spell the
+device, and the first cut put that switch in `src/vllm/v1/kv_offload/kv_connector.cpp`.
+`scripts/check-device-leakage.py` correctly flagged it: `kcuda` 1 > baseline 0, a device-specific
+reference in the device-agnostic shared layer. The fix was PLACEMENT, not an allowlist entry — the
+spelling is a `vt::DeviceType` concern, so `vt::DeviceTypeName` now lives beside the enum in
+`include/vt/device.h` (outside the scanned layer) and the shared layer holds only a forwarder. Adding
+a platform now touches one enum and one switch in the same file. DSR back to 32 == baseline 32.
+
+**FIX 4 — docs.** New `docs/KV-OFFLOAD.md` (copy-pasteable LMCache example with the
+`host`/`port`/`hash_algo`/`chunk_tokens` extra_config keys, peer-interoperability settings, the
+identity/refusal semantics, and an honest limitations section covering the missing worker half and the
+absence of a binding throughput number). README: the three new flag rows, the three MISSING GEMMA
+ROWS in the Supported-models table (matrix had 15 engaged, table had 13), the KV-offload feature row
+and both Serving-notes bullets rewritten to current reality, and the "39 dialects" count given its
+basis (36 families / 40 names) so the new flag row does not contradict it. `.agents/engine-matrix.md`
+`SERVE-C-ABI` corrected 17 -> 19 exported symbols (B5). Deliberately NOT written:
+`docs/ENVIRONMENT.md` (153 vars, a separate increment) and the Tier-3 README structure pass.
+
+**Gates.** CPU `-Werror` clean build, 0 warnings. CPU ctest 233/236. CUDA `-Werror` build on dgx.casa (GB10, sm_121a, `VLLM_CPP_CUDA=ON`, clean tree from `git archive` of this exact commit): **480 TUs, 243 targets, 0 warnings, 0 errors**, and the build log shows every changed TU actually compiled there (`kv_transfer.cpp`, `kv_offload/kv_connector.cpp`, `lmcache/lmcache_connector.cpp`, both `detect.cpp`, `examples/server/main.cpp`). The three new/extended suites RUN GREEN on that CUDA build: `test_kv_offload_connector` 144/144, `test_tool_parser_detect` 340/340, `test_reasoning_parser_detect` 49/49 — so the guard's `cuda` refusal path is exercised on real GB10, not only in a CPU build. New/extended suites all green:
+`test_kv_offload_connector` 18/18 (144 assertions), `test_tool_parser_detect`,
+`test_reasoning_parser_detect`.
+
+The 3 failures are PRE-EXISTING AND INHERITED, proven rather than asserted: `test_model_loader_gguf`,
+`test_model_registry` and `test_bpe` reproduce with byte-identical counts (1/3, 5/23 and 1/17 cases)
+on a CLEAN build of the base commit `ba4dd62` in a separate worktree. They are stale expected-string
+assertions — the model-registry architecture list in the test does not yet include
+`GraniteForCausalLM` / `Olmo2ForCausalLM` / `Olmo3ForCausalLM` / `Phi3ForCausalLM`, added by this
+base's own ancestors — plus one BPE `lstrip` expectation. None is in this change's blast radius and
+none is repaired here (they belong to the model rows that landed them). Three further `-j8`
+failures (`test_openai_api_server`, `test_openai_conformance`, `test_engine_core_proc`) are PARALLEL
+CONTENTION, not regressions: run serially they pass 23/23, 10/10 and clean — the two OpenAI suites
+bind HTTP ports and were racing three ~450 s engine tests.
+
+`test_capi` also warrants a note, because it failed twice during this session and the honest answer is
+FLAKE, not regression: the failing assertion is `acc2.deltas > 2` (it saw exactly 2) in "vllm_complete_
+stream early-stop tears the request down cleanly" — a timing-sensitive delta count in the streaming
+early-stop case. It PASSED in the full ctest run (494 s) and then 3/3 on an idle box, and a clean
+build of base `ba4dd62` also passes 24/24. Both failures occurred while a CUDA build and a second
+local build were loading the machine. Nothing in this change touches the C ABI or the streaming path
+(`git diff --name-only` confirms), so the correlation is with machine load, not with the diff.
+
+**SACRED-gate inertness, by construction and with the diff as proof.** `git diff --stat ba4dd62..HEAD
+-- src include examples` touches 17 files: the KV connector seam, the config parse, the two parser
+registries/resolvers, the server binary, three additive lines in `BuildKvConnector`, and
+`include/vt/device.h`. NO model, kernel or runner TU is touched — in particular
+`src/vllm/v1/worker/gpu/runner.cpp` is NOT in the diff (the guard sits at the factory/loader seam, so
+the runner's connector helpers did not need to change at all), and the single `vt/` edit is a NEW
+`constexpr` function that alters no existing declaration. The only engine-reachable code added is the
+guard call, which returns immediately unless a KV transfer config is set, and connectors remain
+default-off. Model gates are therefore byte-identical by construction rather than by assertion. Default-behaviour-unchanged proof is structural and tested: the flag
+defaults ARE the literals the server previously hardcoded, an absent `--kv-transfer-config` leaves the
+connector unset, and the api-server/serving/conformance/capi suites are unchanged-green. SACRED model
+gates inert by construction — no model, kernel or runner-forward TU is touched; the only change
+reaching the engine is three additive lines in `BuildKvConnector`, which cannot execute without a
+configured KV transfer config, and connectors remain default-off. No SACRED model re-witness was run
+(no model weights are staged in this scratch tree), so the inertness argument above is the basis and
+is stated as such rather than as a measured re-run. Not pushed.

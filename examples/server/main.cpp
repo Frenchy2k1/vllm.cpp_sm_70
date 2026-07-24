@@ -13,6 +13,9 @@
 //          [--enable-force-include-usage]
 //          [--[no-]enable-prefix-caching]
 //          [--scheduling-policy fcfs|priority]
+//          [--tool-call-parser <name>|auto|none]
+//          [--reasoning-parser <name>|auto|none]
+//          [--kv-transfer-config '<json>']
 //
 // A directory holds config.json, tokenizer.json and supported safetensors
 // shards. A supported GGUF file is also accepted and supplies model metadata
@@ -32,6 +35,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 #ifdef VT_BENCH_PROFILE_CONTROL
 #include <atomic>
 #include <cerrno>
@@ -42,6 +47,7 @@
 #include <unistd.h>
 #endif
 
+#include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
@@ -49,6 +55,8 @@
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
+#include "vllm/entrypoints/openai/reasoning_parsers/detect.h"
+#include "vllm/entrypoints/openai/tool_parsers/detect.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
@@ -62,6 +70,7 @@
 #include "vllm/v1/engine/output_processor.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/kv_offload/kv_connector.h"
 #include "vllm/v1/worker/gpu/runner.h"
 #include "vt/backend.h"
 #ifdef VT_BENCH_PROFILE_CONTROL
@@ -95,6 +104,18 @@ struct Args {
   // Scheduling policy: "fcfs" (default) or "priority" (mirrors vLLM's
   // --scheduling-policy / SchedulerConfig.policy).
   std::string scheduling_policy = "fcfs";
+  // Tool-call / reasoning dialect selection (mirrors vLLM's --tool-call-parser
+  // and --reasoning-parser). THE DEFAULTS ARE TODAY'S HARDCODED BEHAVIOUR:
+  // "hermes" is exactly what OpenAIServingChat was constructed with before this
+  // flag existed, and "none" is the empty reasoning-parser name it passed. An
+  // invocation that names neither flag is therefore unchanged, byte for byte.
+  // "auto" opts into the chat-template detection the C ABI uses.
+  std::string tool_call_parser = "hermes";
+  std::string reasoning_parser = "none";
+  // vLLM's --kv-transfer-config: the external KV connector selection, as the
+  // same JSON object vLLM takes. Empty (default) == no connector == the inert
+  // production path. See docs/KV-OFFLOAD.md.
+  std::string kv_transfer_config;
 };
 
 [[noreturn]] void Usage(const char* argv0, int code) {
@@ -110,7 +131,10 @@ struct Args {
          "               [--benchmark-shutdown-fifo F]\n"
          "               [--enable-force-include-usage]\n"
          "               [--[no-]enable-prefix-caching]\n"
-         "               [--scheduling-policy fcfs|priority]\n";
+         "               [--scheduling-policy fcfs|priority]\n"
+         "               [--tool-call-parser <name>|auto|none]\n"
+         "               [--reasoning-parser <name>|auto|none]\n"
+         "               [--kv-transfer-config '<json>']\n";
   std::exit(code);
 }
 
@@ -162,6 +186,12 @@ Args ParseArgs(int argc, char** argv) {
       a.enable_prefix_caching = flag == "--enable-prefix-caching";
     } else if (flag == "--scheduling-policy") {
       a.scheduling_policy = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--tool-call-parser") {
+      a.tool_call_parser = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--reasoning-parser") {
+      a.reasoning_parser = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--kv-transfer-config") {
+      a.kv_transfer_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "-h" || flag == "--help") {
       Usage(argv[0], 0);
     } else {
@@ -196,6 +226,17 @@ Args ParseArgs(int argc, char** argv) {
   if (a.cuda_profile_graph_batch > a.max_num_seqs) {
     std::cerr << "server: --cuda-profile-graph-batch exceeds --max-num-seqs\n";
     Usage(argv[0], 2);
+  }
+  // Validate a NAMED parser dialect here, before the (multi-GB) model load, so a
+  // typo costs a second rather than a full load. "auto" cannot be checked yet —
+  // it resolves against the chat template — but detection only ever returns
+  // registered names, so it cannot fail later either.
+  namespace oai = vllm::entrypoints::openai;
+  if (a.tool_call_parser != "auto") {
+    (void)oai::ResolveToolParserName(a.tool_call_parser, "");
+  }
+  if (a.reasoning_parser != "auto") {
+    (void)oai::ResolveReasoningParserName(a.reasoning_parser, "");
   }
   return a;
 }
@@ -234,6 +275,31 @@ int main(int argc, char** argv) {
     engine_params.enable_prefix_caching = args.enable_prefix_caching;
     // Reject an unknown policy string (mirrors upstream SchedulingPolicy(value)).
     engine_params.policy = vllm::SchedulerPolicyFromString(args.scheduling_policy);
+    // --kv-transfer-config: the external KV connector, mirroring vLLM's own
+    // flag and JSON shape. Absent (default) leaves the optional unset, which is
+    // the inert no-connector path the server has always run. A malformed
+    // document, an unknown key/role, or a connector whose worker half cannot
+    // move bytes on this device (the D1 guard, inside LoadedEngine) all throw
+    // out of here and are reported at startup by the catch in main.
+    if (!args.kv_transfer_config.empty()) {
+      vllm::KVTransferConfig kv_cfg =
+          vllm::ParseKVTransferConfigJson(args.kv_transfer_config);
+      if (kv_cfg.kv_connector.has_value() &&
+          !vllm::v1::kv_offload::KVConnectorFactory::IsRegistered(
+              *kv_cfg.kv_connector)) {
+        std::string msg = "unknown kv_connector \"" + *kv_cfg.kv_connector +
+                          "\" (registered connectors: ";
+        const std::vector<std::string> names =
+            vllm::v1::kv_offload::KVConnectorFactory::RegisteredNames();
+        for (size_t n = 0; n < names.size(); ++n) {
+          if (n != 0) msg += ", ";
+          msg += names[n];
+        }
+        msg += ")";
+        throw std::invalid_argument(msg);
+      }
+      engine_params.kv_transfer_config = std::move(kv_cfg);
+    }
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
         vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
                                                       engine_params);
@@ -270,8 +336,12 @@ int main(int argc, char** argv) {
         engine, served_model_name, args.enable_force_include_usage);
 
     oai::ChatPromptFn chat_prompt_fn = oai::DefaultChatPromptFallback;
+    // Kept outside the try so the parser resolution below can sniff it when
+    // --tool-call-parser/--reasoning-parser are "auto"; empty when the model
+    // ships no template (auto then falls back to hermes / disabled).
+    std::string chat_template;
     try {
-      const std::string chat_template =
+      chat_template =
           vllm::entrypoints::LoadChatTemplateFromConfig(tokenizer_config_path);
       const std::string bos =
           tokenizer.BosId() >= 0 ? tokenizer.Decode({tokenizer.BosId()}) : "";
@@ -285,8 +355,22 @@ int main(int argc, char** argv) {
       std::cerr << "server: no chat template (" << e.what()
                 << "); falling back to the simple role-join prompt\n";
     }
+    // Dialect selection. Defaults reproduce the previously hardcoded pair
+    // ("hermes", "") exactly; an unknown name throws std::invalid_argument
+    // listing every registered parser and aborts startup, rather than leaving
+    // tool/reasoning parsing silently off for the life of the process.
+    const std::string tool_parser_name =
+        oai::ResolveToolParserName(args.tool_call_parser, chat_template);
+    const std::string reasoning_parser_name =
+        oai::ResolveReasoningParserName(args.reasoning_parser, chat_template);
+    std::cerr << "server: tool-call parser "
+              << (tool_parser_name.empty() ? "disabled" : tool_parser_name)
+              << ", reasoning parser "
+              << (reasoning_parser_name.empty() ? "disabled"
+                                                : reasoning_parser_name)
+              << "\n";
     oai::OpenAIServingChat chat(engine, served_model_name, chat_prompt_fn,
-                                "hermes", /*reasoning_parser_name=*/"",
+                                tool_parser_name, reasoning_parser_name,
                                 args.enable_force_include_usage);
 
     // Diagnostic opt-out exists only for same-binary attribution. Production

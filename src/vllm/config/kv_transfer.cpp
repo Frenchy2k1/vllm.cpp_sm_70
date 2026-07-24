@@ -3,6 +3,8 @@
 
 #include <stdexcept>
 
+#include <nlohmann/json.hpp>
+
 namespace vllm {
 
 std::optional<KVRole> parse_kv_role(const std::string& s) {
@@ -53,6 +55,94 @@ void KVTransferConfig::Validate() {
         "Please specify kv_role when kv_connector is set (supported roles: "
         "kv_producer, kv_consumer, kv_both).");
   }
+}
+
+// See the header. Mirrors vLLM's --kv-transfer-config JSON payload 1:1.
+KVTransferConfig ParseKVTransferConfigJson(const std::string& json_text) {
+  nlohmann::json doc;
+  try {
+    doc = nlohmann::json::parse(json_text);
+  } catch (const nlohmann::json::exception& e) {
+    throw std::invalid_argument(std::string("kv-transfer-config is not valid "
+                                            "JSON: ") +
+                                e.what());
+  }
+  if (!doc.is_object()) {
+    throw std::invalid_argument(
+        "kv-transfer-config must be a JSON object, e.g. "
+        "{\"kv_connector\": \"LMCacheConnector\", \"kv_role\": \"kv_both\"}");
+  }
+
+  KVTransferConfig cfg;
+  for (auto it = doc.begin(); it != doc.end(); ++it) {
+    const std::string& key = it.key();
+    const nlohmann::json& value = it.value();
+    if (key == "kv_connector" || key == "engine_id") {
+      if (!value.is_string()) {
+        throw std::invalid_argument("kv-transfer-config: \"" + key +
+                                    "\" must be a string");
+      }
+      if (key == "kv_connector") {
+        cfg.kv_connector = value.get<std::string>();
+      } else {
+        cfg.engine_id = value.get<std::string>();
+      }
+    } else if (key == "kv_role") {
+      if (!value.is_string()) {
+        throw std::invalid_argument(
+            "kv-transfer-config: \"kv_role\" must be a string");
+      }
+      const std::string role = value.get<std::string>();
+      std::optional<KVRole> parsed = parse_kv_role(role);
+      if (!parsed.has_value()) {
+        throw std::invalid_argument(
+            "kv-transfer-config: unknown \"kv_role\" \"" + role +
+            "\" (supported: kv_producer, kv_consumer, kv_both)");
+      }
+      cfg.kv_role = *parsed;
+    } else if (key == "kv_load_failure_policy") {
+      if (!value.is_string()) {
+        throw std::invalid_argument(
+            "kv-transfer-config: \"kv_load_failure_policy\" must be a string");
+      }
+      const std::string policy = value.get<std::string>();
+      std::optional<KVLoadFailurePolicy> parsed =
+          parse_kv_load_failure_policy(policy);
+      if (!parsed.has_value()) {
+        throw std::invalid_argument(
+            "kv-transfer-config: unknown \"kv_load_failure_policy\" \"" +
+            policy + "\" (supported: fail, recompute)");
+      }
+      cfg.kv_load_failure_policy = *parsed;
+    } else if (key == "kv_connector_extra_config") {
+      if (!value.is_object()) {
+        throw std::invalid_argument(
+            "kv-transfer-config: \"kv_connector_extra_config\" must be a JSON "
+            "object of scalar values");
+      }
+      for (auto e = value.begin(); e != value.end(); ++e) {
+        const nlohmann::json& v = e.value();
+        if (v.is_string()) {
+          cfg.kv_connector_extra_config[e.key()] = v.get<std::string>();
+        } else if (v.is_number() || v.is_boolean()) {
+          // Stringified in JSON spelling: the connectors read these back with
+          // extra_int / extra_bool, which accept "8" / "true".
+          cfg.kv_connector_extra_config[e.key()] = v.dump();
+        } else {
+          throw std::invalid_argument(
+              "kv-transfer-config: kv_connector_extra_config[\"" + e.key() +
+              "\"] must be a string, number or boolean");
+        }
+      }
+    } else {
+      throw std::invalid_argument(
+          "kv-transfer-config: unknown key \"" + key +
+          "\" (supported: kv_connector, kv_role, engine_id, "
+          "kv_load_failure_policy, kv_connector_extra_config)");
+    }
+  }
+  cfg.Validate();
+  return cfg;
 }
 
 }  // namespace vllm

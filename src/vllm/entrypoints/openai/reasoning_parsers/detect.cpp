@@ -1,6 +1,12 @@
 // See detect.h. ORIGINAL packaging-layer component (no upstream mirror).
 #include "vllm/entrypoints/openai/reasoning_parsers/detect.h"
 
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"
+
 namespace vllm::entrypoints::openai {
 
 namespace {
@@ -48,6 +54,27 @@ std::string DetectReasoningParser(const std::string& chat_template) {
 const ReasoningParserMarker* ReasoningParserMarkerTable(std::size_t* out_count) {
   if (out_count != nullptr) *out_count = kReasoningParserMarkerCount;
   return kReasoningParserMarkers;
+}
+
+std::string ResolveReasoningParserName(const std::string& requested,
+                                       const std::string& chat_template) {
+  if (requested.empty() || requested == "none") return std::string();
+  const std::string name =
+      requested == "auto" ? DetectReasoningParser(chat_template) : requested;
+  // "auto" with no matching marker legitimately resolves to "" (disabled).
+  if (name.empty()) return name;
+  if (get_reasoning_parser(name) == nullptr) {
+    std::string msg = "unknown reasoning parser \"" + name +
+                      "\" (registered parsers: ";
+    const std::vector<std::string>& names = reasoning_parser_names();
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      if (i != 0) msg += ", ";
+      msg += names[i];
+    }
+    msg += "; \"auto\" detects from the chat template, \"none\" disables)";
+    throw std::invalid_argument(msg);
+  }
+  return name;
 }
 
 }  // namespace vllm::entrypoints::openai

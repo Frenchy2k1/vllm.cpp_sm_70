@@ -1,7 +1,10 @@
 // See detect.h. ORIGINAL packaging-layer component (no upstream mirror).
 #include "vllm/entrypoints/openai/tool_parsers/detect.h"
 
+#include <stdexcept>
 #include <string>
+
+#include "vllm/entrypoints/openai/tool_parsers/abstract.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -109,6 +112,25 @@ std::string DetectToolParser(const std::string& chat_template) {
 const ToolParserMarker* ToolParserMarkerTable(std::size_t* out_count) {
   if (out_count != nullptr) *out_count = kToolParserMarkerCount;
   return kToolParserMarkers;
+}
+
+std::string ResolveToolParserName(const std::string& requested,
+                                  const std::string& chat_template) {
+  if (requested.empty() || requested == "none") return std::string();
+  const std::string name =
+      requested == "auto" ? DetectToolParser(chat_template) : requested;
+  if (get_tool_parser(name) == nullptr) {
+    std::string msg = "unknown tool-call parser \"" + name +
+                      "\" (registered parsers: ";
+    const std::vector<std::string>& names = tool_parser_names();
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      if (i != 0) msg += ", ";
+      msg += names[i];
+    }
+    msg += "; \"auto\" detects from the chat template, \"none\" disables)";
+    throw std::invalid_argument(msg);
+  }
+  return name;
 }
 
 }  // namespace vllm::entrypoints::openai

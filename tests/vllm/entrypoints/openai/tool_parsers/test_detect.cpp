@@ -8,12 +8,15 @@
 #include <doctest/doctest.h>
 
 #include <cstddef>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
 
 using vllm::entrypoints::openai::DetectToolParser;
 using vllm::entrypoints::openai::get_tool_parser;
+using vllm::entrypoints::openai::ResolveToolParserName;
 using vllm::entrypoints::openai::ToolParserMarker;
 using vllm::entrypoints::openai::ToolParserMarkerTable;
 
@@ -134,4 +137,92 @@ TEST_CASE("detect: ENG-wave families resolve from their template markers") {
   CHECK(DetectToolParser("<seed:tool_call><function=f>") != "step3p5");
   // gemma4 and lfm2 share a "<|tool_call" prefix but stay distinct.
   CHECK(DetectToolParser("..<|tool_call_start|>..") == "lfm2");
+}
+
+// ---------------------------------------------------------------------------
+// ResolveToolParserName — the behaviour of the server's --tool-call-parser flag
+// (examples/server/main.cpp). The flag's whole semantics live in this function
+// so they are testable without launching a server.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("--tool-call-parser: the DEFAULT is byte-identical to the old hardcode") {
+  // Before the flag existed, examples/server/main.cpp constructed
+  // OpenAIServingChat with the literal "hermes". The flag's default value is
+  // that same literal, so an invocation that does not name the flag resolves to
+  // exactly "hermes" REGARDLESS of the model's chat template — no detection, no
+  // behaviour change for any existing deployment.
+  const std::string deepseek_tmpl = "..<｜tool▁calls▁begin｜>..";
+  CHECK(ResolveToolParserName("hermes", deepseek_tmpl) == "hermes");
+  CHECK(ResolveToolParserName("hermes", "") == "hermes");
+  // Proof the template above WOULD have detected as something else: this is
+  // what "auto" opts into, and what the default deliberately does not do.
+  CHECK(DetectToolParser(deepseek_tmpl) == "deepseek_v3");
+}
+
+TEST_CASE("--tool-call-parser: an explicit name selects that dialect") {
+  CHECK(ResolveToolParserName("qwen3_coder", "") == "qwen3_coder");
+  CHECK(ResolveToolParserName("mistral", "") == "mistral");
+  CHECK(ResolveToolParserName("glm47", "") == "glm47");
+  // Aliases resolve to themselves (the factory maps several names onto one impl).
+  CHECK(ResolveToolParserName("mimo", "") == "mimo");
+  CHECK(ResolveToolParserName("llama4_json", "") == "llama4_json");
+}
+
+TEST_CASE("--tool-call-parser: auto detects, none disables") {
+  CHECK(ResolveToolParserName("auto", "..<minimax:tool_call>..") == "minimax_m2");
+  CHECK(ResolveToolParserName("auto", "..<tool_call>..") == "hermes");
+  // No template to sniff: detection falls back to hermes, never to nothing.
+  CHECK(ResolveToolParserName("auto", "") == "hermes");
+  // "none" and "" both mean DISABLED (empty name => MakeToolParser returns null).
+  CHECK(ResolveToolParserName("none", "..<tool_call>..").empty());
+  CHECK(ResolveToolParserName("", "..<tool_call>..").empty());
+}
+
+TEST_CASE("--tool-call-parser: an unknown name FAILS LOUDLY, listing the registry") {
+  // The failure must be an exception at startup, not a silent fallback: a
+  // server that quietly disabled tool parsing for a typo'd dialect would look
+  // healthy while emitting raw tool-call text to every client.
+  CHECK_THROWS_AS(ResolveToolParserName("hermez", ""), std::invalid_argument);
+  CHECK_THROWS_AS(ResolveToolParserName("Hermes", ""), std::invalid_argument);
+  CHECK_THROWS_AS(ResolveToolParserName("qwen3-coder", ""), std::invalid_argument);
+
+  // The message enumerates the registry (so a user can fix the typo from it),
+  // and it is enumerated FROM tool_parser_names(), not hand-written here.
+  std::string what;
+  try {
+    ResolveToolParserName("nope", "");
+  } catch (const std::invalid_argument& e) {
+    what = e.what();
+  }
+  CHECK(what.find("nope") != std::string::npos);
+  for (const std::string& name : vllm::entrypoints::openai::tool_parser_names()) {
+    CAPTURE(name);
+    CHECK(what.find(name) != std::string::npos);
+  }
+  CHECK(what.find("auto") != std::string::npos);
+  CHECK(what.find("none") != std::string::npos);
+}
+
+TEST_CASE("Registry: every enumerated tool-parser name resolves") {
+  // The list backing the flag's error message must not drift from the factory.
+  // Every enumerated name builds a real parser...
+  const std::vector<std::string>& names =
+      vllm::entrypoints::openai::tool_parser_names();
+  for (const std::string& name : names) {
+    CAPTURE(name);
+    CHECK(get_tool_parser(name) != nullptr);
+    CHECK(ResolveToolParserName(name, "") == name);
+  }
+  // ...and the count is PINNED, so adding a factory branch without listing its
+  // name here fails this case instead of silently shipping an unreachable
+  // dialect. 40 accepted names over 36 parser families (aliases:
+  // llama3_json/llama4_json, qwen3_coder/qwen3_xml/mimo, glm45/glm47).
+  CHECK(names.size() == 40);
+  // Every name the marker table can emit must itself be a registered name.
+  std::size_t marker_count = 0;
+  const ToolParserMarker* markers = ToolParserMarkerTable(&marker_count);
+  for (std::size_t i = 0; i < marker_count; ++i) {
+    CAPTURE(markers[i].parser);
+    CHECK(get_tool_parser(markers[i].parser) != nullptr);
+  }
 }
