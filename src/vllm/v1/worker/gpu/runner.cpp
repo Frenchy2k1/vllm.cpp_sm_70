@@ -308,7 +308,15 @@ GPUModelRunner::GPUModelRunner(
                    group_block_sizes(kv_cache_config),
                    group_block_sizes(kv_cache_config)) {
   max_num_reqs_ = max_num_reqs;
-  async_input_combine_ = AsyncRunnerEnvDefault();
+  // SPEC-MTP I5e: the async input-combine splices the device-resident
+  // last_sampled token over each decode row's input id with
+  // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
+  // draft token at a verify step's draft position with the committed token.
+  // Speculative decode already forces SYNC scheduling and gets its drafts
+  // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
+  // so force the sync host input path here. Byte-identical for non-spec
+  // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
+  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
@@ -332,7 +340,15 @@ GPUModelRunner::GPUModelRunner(
                    group_block_sizes(kv_cache_config),
                    group_block_sizes(kv_cache_config)) {
   max_num_reqs_ = max_num_reqs;
-  async_input_combine_ = AsyncRunnerEnvDefault();
+  // SPEC-MTP I5e: the async input-combine splices the device-resident
+  // last_sampled token over each decode row's input id with
+  // num_new_sampled_tokens==1; it is NOT spec-aware and would overwrite the
+  // draft token at a verify step's draft position with the committed token.
+  // Speculative decode already forces SYNC scheduling and gets its drafts
+  // spliced into token_ids_cpu by update_req_spec_token_ids + prepare_inputs,
+  // so force the sync host input path here. Byte-identical for non-spec
+  // (spec_config_ is nullopt there, so this is AsyncRunnerEnvDefault()).
+  async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value();
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }

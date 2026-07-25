@@ -224,12 +224,23 @@ __device__ inline float Silu(float x) { return x / (1.0f + expf(-x)); }
 // Indexed persistent GDN cache boundary. One elementwise launch replaces N
 // cudaMemcpyAsync row copies plus a separate cast launch. The optional fresh
 // mask is i8 (metadata's upstream-bool mirror) or i32 (standalone op callers).
+// The cache's INNERMOST dim (cache_inner) may be WIDER than the working buffer's
+// (work_inner) when the GDN conv state is widened to (K-1)+num_spec taps for
+// spec-decode rollback. The non-spec gather/scatter then maps each working column
+// to the LEADING work_inner cols of its channel, using the cache row's PHYSICAL
+// stride (cache_row = mid*cache_inner). At num_spec==0 (all non-spec models, and
+// the never-widened SSM state cache) cache_inner==work_inner and the uniform
+// branch takes the original flat path, byte-for-byte. `row_elems` is the working
+// row width (mid*work_inner).
 template <typename TCache>
 __global__ void GdnStateGatherKernel(float* working, const TCache* cache,
                                      const int32_t* state_idx,
                                      const int8_t* has_i8,
                                      const int32_t* has_i32,
-                                     int64_t row_elems, int64_t n) {
+                                     int64_t row_elems, int64_t n,
+                                     int64_t work_inner, int64_t cache_inner) {
+  const bool widened = cache_inner != work_inner;
+  const int64_t cache_row = (row_elems / work_inner) * cache_inner;  // mid*cache_inner
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < n; i += step) {
@@ -238,22 +249,39 @@ __global__ void GdnStateGatherKernel(float* working, const TCache* cache,
     const bool keep = has_i8 != nullptr ? has_i8[row] != 0
                       : has_i32 != nullptr ? has_i32[row] != 0
                                            : true;
-    working[i] = keep ? Load(cache, static_cast<int64_t>(state_idx[row]) * row_elems + col)
-                      : 0.0f;
+    int64_t cache_off;
+    if (!widened) {
+      cache_off = static_cast<int64_t>(state_idx[row]) * row_elems + col;
+    } else {
+      const int64_t m = col / work_inner, wcol = col - m * work_inner;
+      cache_off = static_cast<int64_t>(state_idx[row]) * cache_row +
+                  m * cache_inner + wcol;
+    }
+    working[i] = keep ? Load(cache, cache_off) : 0.0f;
   }
 }
 
 template <typename TCache>
 __global__ void GdnStateScatterKernel(TCache* cache, const float* working,
                                       const int32_t* state_idx,
-                                      int64_t row_elems, int64_t n) {
+                                      int64_t row_elems, int64_t n,
+                                      int64_t work_inner, int64_t cache_inner) {
+  const bool widened = cache_inner != work_inner;
+  const int64_t cache_row = (row_elems / work_inner) * cache_inner;  // mid*cache_inner
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < n; i += step) {
     const int64_t row = i / row_elems;
     const int64_t col = i - row * row_elems;
-    Store(cache, static_cast<int64_t>(state_idx[row]) * row_elems + col,
-          working[i]);
+    int64_t cache_off;
+    if (!widened) {
+      cache_off = static_cast<int64_t>(state_idx[row]) * row_elems + col;
+    } else {
+      const int64_t m = col / work_inner, wcol = col - m * work_inner;
+      cache_off = static_cast<int64_t>(state_idx[row]) * cache_row +
+                  m * cache_inner + wcol;
+    }
+    Store(cache, cache_off, working[i]);
   }
 }
 
@@ -264,6 +292,8 @@ void GdnStateGatherKernelCuda(Queue& q, Tensor& working, const Tensor& cache,
   if (rows == 0) return;
   const int64_t n = working.Numel();
   const int64_t row_elems = n / rows;
+  const int64_t work_inner = working.shape[working.rank - 1];
+  const int64_t cache_inner = cache.shape[cache.rank - 1];
   const int8_t* has_i8 =
       has_initial_state != nullptr && has_initial_state->dtype == DType::kI8
           ? has_initial_state->Ptr<int8_t>()
@@ -276,15 +306,15 @@ void GdnStateGatherKernelCuda(Queue& q, Tensor& working, const Tensor& cache,
   if (cache.dtype == DType::kBF16) {
     GdnStateGatherKernel<<<GridFor(n), kBlock, 0, s>>>(
         working.Ptr<float>(), cache.Ptr<__nv_bfloat16>(), state_idx.Ptr<int32_t>(),
-        has_i8, has_i32, row_elems, n);
+        has_i8, has_i32, row_elems, n, work_inner, cache_inner);
   } else if (cache.dtype == DType::kF16) {
     GdnStateGatherKernel<<<GridFor(n), kBlock, 0, s>>>(
         working.Ptr<float>(), cache.Ptr<__half>(), state_idx.Ptr<int32_t>(),
-        has_i8, has_i32, row_elems, n);
+        has_i8, has_i32, row_elems, n, work_inner, cache_inner);
   } else {
     GdnStateGatherKernel<<<GridFor(n), kBlock, 0, s>>>(
         working.Ptr<float>(), cache.Ptr<float>(), state_idx.Ptr<int32_t>(),
-        has_i8, has_i32, row_elems, n);
+        has_i8, has_i32, row_elems, n, work_inner, cache_inner);
   }
   Check(cudaGetLastError(), "gdn state indexed gather launch");
 }
@@ -296,19 +326,21 @@ void GdnStateScatterKernelCuda(Queue& q, Tensor& cache,
   if (rows == 0) return;
   const int64_t n = working.Numel();
   const int64_t row_elems = n / rows;
+  const int64_t work_inner = working.shape[working.rank - 1];
+  const int64_t cache_inner = cache.shape[cache.rank - 1];
   cudaStream_t s = AsStream(q);
   if (cache.dtype == DType::kBF16) {
     GdnStateScatterKernel<<<GridFor(n), kBlock, 0, s>>>(
         cache.Ptr<__nv_bfloat16>(), working.Ptr<float>(),
-        state_idx.Ptr<int32_t>(), row_elems, n);
+        state_idx.Ptr<int32_t>(), row_elems, n, work_inner, cache_inner);
   } else if (cache.dtype == DType::kF16) {
     GdnStateScatterKernel<<<GridFor(n), kBlock, 0, s>>>(
         cache.Ptr<__half>(), working.Ptr<float>(), state_idx.Ptr<int32_t>(),
-        row_elems, n);
+        row_elems, n, work_inner, cache_inner);
   } else {
     GdnStateScatterKernel<<<GridFor(n), kBlock, 0, s>>>(
         cache.Ptr<float>(), working.Ptr<float>(), state_idx.Ptr<int32_t>(),
-        row_elems, n);
+        row_elems, n, work_inner, cache_inner);
   }
   Check(cudaGetLastError(), "gdn state indexed scatter launch");
 }
@@ -709,7 +741,8 @@ template <typename Tin, typename Tout, typename TState>
 __global__ void CausalConv1dUpdateKernel(Tout* out, const Tin* x, const Tin* w,
                                          const Tin* bias, TState* conv_state,
                                          const int32_t* cache_idx, int64_t n, int64_t c_dim,
-                                         int64_t x_row_stride, int64_t k, bool silu) {
+                                         int64_t x_row_stride, int64_t k, int64_t state_len,
+                                         bool silu) {
   const int64_t width = k - 1;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
@@ -724,8 +757,10 @@ __global__ void CausalConv1dUpdateKernel(Tout* out, const Tin* x, const Tin* w,
     }
     // Persistent conv_state cache is bf16 (vLLM default) or f32 (unit test);
     // Load()/Store() upcast/downcast, the convolution accumulates in f32. x may
-    // be a padded-row (merged qkvz) view; out stays contiguous at idx.
-    TState* srow = conv_state + srow_off * width;  // row [K-1]
+    // be a padded-row (merged qkvz) view; out stays contiguous at idx. The conv
+    // row physical width is state_len ((K-1) normally, or (K-1)+num_spec when the
+    // spec-decode rollback taps are allocated); we operate on the LEADING (K-1).
+    TState* srow = conv_state + srow_off * state_len;  // row [state_len], op [0,K-1)
     const float xt = Load(x, bt * x_row_stride + c);
     float acc = bias != nullptr ? Load(bias, c) : 0.0f;
     for (int64_t j = 0; j < width; ++j) acc += Load(w, c * k + j) * Load(srow, j);
@@ -751,7 +786,8 @@ template <typename Tin, typename Tout, typename TState, int WIDTH>
 __global__ void CausalConv1dUpdateFastKernel(Tout* out, const Tin* x, const Tin* w,
                                              const Tin* bias, TState* conv_state,
                                              const int32_t* cache_idx, int64_t c_dim,
-                                             int64_t x_row_stride, bool silu) {
+                                             int64_t x_row_stride, int64_t state_len,
+                                             bool silu) {
   const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (c >= c_dim) return;
   const int64_t bt = blockIdx.y;             // token — no idx/c_dim, idx%c_dim
@@ -763,7 +799,9 @@ __global__ void CausalConv1dUpdateFastKernel(Tout* out, const Tin* x, const Tin*
     if (slot < 0) return;                     // NULL block → leave out untouched
     srow_off = static_cast<int64_t>(slot) * c_dim + c;
   }
-  TState* srow = conv_state + srow_off * WIDTH;  // row [K-1]
+  // Conv row physical width is state_len ((K-1), or (K-1)+num_spec when spec
+  // rollback taps are allocated); operate on the LEADING WIDTH=(K-1) cols.
+  TState* srow = conv_state + srow_off * state_len;  // row [state_len]
   // Load the state row ONCE into registers (shipped re-reads srow[j+1] in the roll).
   float sreg[WIDTH];
 #pragma unroll
@@ -792,6 +830,7 @@ bool TryLaunchConvUpdateFast(cudaStream_t s, Tensor& out, const Tensor& x, const
   const int64_t width = k - 1;
   if (nt <= 0 || nt > kMaxGridY) return false;  // 2D grid.y == num_tokens
   const int64_t x_rs = x.stride[0];             // padded-row (merged qkvz) x view honored
+  const int64_t state_len = conv_state.shape[2];  // physical row width ((K-1)+num_spec)
   const Tin* wp = w.Ptr<Tin>();
   const Tin* bp = bias != nullptr ? bias->Ptr<Tin>() : nullptr;
   const dim3 grid(static_cast<unsigned>((c + kBlock - 1) / kBlock), static_cast<unsigned>(nt));
@@ -799,7 +838,7 @@ bool TryLaunchConvUpdateFast(cudaStream_t s, Tensor& out, const Tensor& x, const
     constexpr int W = decltype(width_tag)::value;
     CausalConv1dUpdateFastKernel<Tin, Tout, TState, W><<<grid, kBlock, 0, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), wp, bp, conv_state.Ptr<TState>(), cache_idx, c, x_rs,
-        args.silu_activation);
+        state_len, args.silu_activation);
   };
   switch (width) {  // specialize the production widths (Qwen GDN k=4 → width 3)
     case 1: launch(std::integral_constant<int, 1>{}); break;
@@ -823,9 +862,10 @@ void LaunchConvUpdate(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor
     return;
   const int64_t n = x.shape[0] * x.shape[1], c = x.shape[1], k = w.shape[1];
   const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
+  const int64_t state_len = conv_state.shape[2];  // physical row width ((K-1)+num_spec)
   CausalConv1dUpdateKernel<Tin, Tout, TState><<<GridFor(n), kBlock, 0, s>>>(
       out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), bias != nullptr ? bias->Ptr<Tin>() : nullptr,
-      conv_state.Ptr<TState>(), cache_idx, n, c, x_rs, k, args.silu_activation);
+      conv_state.Ptr<TState>(), cache_idx, n, c, x_rs, k, state_len, args.silu_activation);
   Check(cudaGetLastError(), "causal_conv1d_update launch");
 }
 

@@ -38,6 +38,28 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
+**MTP speculative decode, k=1 on the 27B GDN hybrid - SINGLE-REQUEST GREEDY
+CORRECTNESS PROVEN, NO SPEED NUMBER (2026-07-25, `SPEC-MTP` I5e,
+`CLAIM-SPEC-MTP-I5E`, [spec](../.agents/specs/mtp-spec-decode.md)).**
+Disposition: **CORRECTNESS (single-request greedy) COMPLETE; THROUGHPUT PENDING -
+`benchmark_binding=false`, no speed measured or claimed.** The three-way gate
+`tests/parity/test_qwen27_spec_decode.cpp` (single-request greedy, 27B NVFP4
+`~/bench/q36-27b-nvfp4-vllm`) PASSES: our speculative-ON greedy continuation is
+token-for-token identical to both our own speculative-OFF continuation and the
+pip-vLLM 0.25.0 oracle greedy continuation (which is itself vLLM's own
+`--speculative-config '{"method":"mtp","num_speculative_tokens":1}'` greedy),
+on the 16-token golden prefix (continuation " capital of Germany is Berlin.").
+**Acceptance is measured and nonzero: 16 of 16 drafts accepted** on this short,
+highly predictable factual prompt (roughly halving the number of full model
+steps, ~16 target decode steps saved over the 32-token run); the required
+`proposed>0 && accepted>0` both hold, so this is not a dead-drafter pass.
+Spec-OFF SACRED gates stay byte-identical (27B 235/235, 35B 315/315, Coder
+138/138) and compute-sanitizer is clean on the spec step. THROUGHPUT is
+explicitly NOT claimed: the honest denominator is vLLM with the same speculative
+config at the same operating point, and that A/B (plus the multi-request /
+concurrent mixed-batch path) is deferred to I6. No user-facing supported
+speculative flag yet.
+
 **Gemma-3 (`Gemma3ForCausalLM`, gemma-3-1b-it) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-SWEEP-GEMMA` W0-W2, [spike](../.agents/specs/sweep-gemma.md)).**
 The FIRST Gemma-family model. Disposition: **SPEED PENDING - no throughput measured

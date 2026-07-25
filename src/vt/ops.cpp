@@ -1365,8 +1365,15 @@ void CheckConvCommon(const Queue& q, const Tensor& out, const Tensor& x, const T
            std::string(name) + ": out shape must match x");
   VT_CHECK(weight.shape[0] == c, std::string(name) + ": weight channel dim mismatch");
   VT_CHECK(k >= 1, std::string(name) + ": kernel width must be >= 1");
-  VT_CHECK(conv_state.shape[1] == c && conv_state.shape[2] == k - 1,
-           std::string(name) + ": conv_state must be [N,C,K-1]");
+  // The conv row physical width is (K-1) for the ordinary (num_spec==0) cache,
+  // but WIDENED to (K-1)+num_spec when speculative decode allocates the extra
+  // rollback taps (mamba_utils.py:226). Non-spec ops operate on the LEADING
+  // (K-1) sub-window with the row's PHYSICAL stride, mirroring vLLM's
+  // `state_len = KERNEL_WIDTH - 1` + physical `stride_conv_state_tok`
+  // (causal_conv1d.py:67-69,156, prefill writes leading [0,K-1)). At num_spec==0
+  // the row is exactly (K-1), so this admits the identical shapes as before.
+  VT_CHECK(conv_state.shape[1] == c && conv_state.shape[2] >= k - 1,
+           std::string(name) + ": conv_state must be [N,C,(K-1)+num_spec>=K-1]");
   VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
            std::string(name) + ": float x/weight, f32/bf16 out");
   VT_CHECK(conv_state.dtype == DType::kF32 ||
@@ -1769,10 +1776,20 @@ void CheckGdnStateIo(const Queue& q, const Tensor& working,
            std::string(name) + ": state_idx must be contiguous i32 [N]");
   VT_CHECK(working.shape[0] == state_idx.shape[0],
            std::string(name) + ": working rows must match state_idx");
-  for (int d = 1; d < cache.rank; ++d) {
+  // The middle dims (channels/heads) must match exactly. The INNERMOST dim of
+  // the cache may be WIDER than the working buffer: the GDN conv state row is
+  // widened to (K-1)+num_spec taps for spec-decode rollback, while the non-spec
+  // gather/scatter operates on the LEADING (K-1) sub-window per channel with the
+  // cache row's physical stride (mirror vLLM `state_len=KERNEL_WIDTH-1`). At
+  // num_spec==0 the inner dims are equal, so this is the previous exact-match
+  // check byte-for-byte; the SSM state cache (rank 4) is never widened, so its
+  // inner dim always matches and it always takes the contiguous fast path.
+  for (int d = 1; d < cache.rank - 1; ++d) {
     VT_CHECK(working.shape[d] == cache.shape[d],
              std::string(name) + ": working/cache row shapes must match");
   }
+  VT_CHECK(cache.shape[cache.rank - 1] >= working.shape[working.rank - 1],
+           std::string(name) + ": cache inner dim must be >= working inner dim");
   VT_CHECK(working.dtype == DType::kF32,
            std::string(name) + ": working state must be f32");
   VT_CHECK(cache.dtype == DType::kF32 || cache.dtype == DType::kF16 ||
