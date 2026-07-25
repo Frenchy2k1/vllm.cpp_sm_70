@@ -23025,3 +23025,55 @@ SHA reported in the session, NOT pushed.
   scripts + tests + ci + records only). Did NOT touch
   `.agents/specs/dflash-spec-decode.md` (sibling DFlash-readiness spike). Not pushed;
   full SHA reported in-session.
+---
+
+**2026-07-25 — MULTIMODAL TRACK spike (`CLAIM-MULTIMODAL-TRACK`, base `origin/main`
+`72f9fb1`, isolated worktree, SPIKE ONLY — no code, no build, no download, no gate;
+one dgx metadata read).** Grounds the user's NEW TOP `roadmap_v1` priority
+"Multimodal (Audio/Video/Image) with Gemma-4 and Qwen3.6". Deliverable:
+`.agents/specs/multimodal-track.md` (seam map + per-target gateability + M0–M5
+W-plan). DFlash re-sequenced to LAST.
+
+**High-leverage framing:** the two production GATE models are ALREADY multimodal
+architectures brought up text-only — Qwen3.6-27B = `Qwen3_5ForConditionalGeneration`
+(`qwen3_5.py:389`, subclasses `Qwen3VLForConditionalGeneration`, tower
+`Qwen3_VisionTransformer` over `{"image","video"}`), Qwen3.6-35B =
+`Qwen3_5MoeForConditionalGeneration` (`:604`). Completing them completes models we
+already ship + benchmark (235/235, 315/315). Same tower unlocks the whole Qwen3-VL
+family.
+
+**GATING FACTS (measured on dgx 2026-07-25):**
+- **Oracle CAN construct the mm path.** vLLM 0.25.0 (`~/venvs/vllm-oracle`) ships
+  `qwen3_5.py`, `qwen3_vl.py`, `qwen2_5_vl.py`, `gemma4_mm.py`, `gemma4_unified.py`,
+  `gemma3_mm.py`, `gemma3n_mm.py`. So the SACRED mm oracle EXISTS for every target;
+  actual mm-forward run is an M0 verification.
+- **Cached NVFP4 gate checkpoints are TEXT-ONLY.** Read the safetensors headers:
+  `unsloth/Qwen3.6-27B-NVFP4` = `Qwen3_5ForConditionalGeneration`, `config.json`
+  DECLARES a `vision_config` (depth 27, hidden 1152, out 5120, deepstack /
+  spatial_merge / temporal_patch) but the 2111 tensors have ZERO `visual.*` (only
+  `model.language_model.*`, `lm_head`, `mtp.*`). `nvidia/Qwen3.6-35B-A3B-NVFP4` same.
+  No vision/VL checkpoint of any family cached on dgx. ⇒ Qwen3.6 mm is
+  CHECKPOINT-gated (needs a vision-inclusive download), NOT HW/oracle-blocked. The
+  tower is ~0.5–0.7 B params (~1–1.4 GiB bf16) — fits the 119 GiB GB10 pool trivially.
+- **Modalities:** Qwen3.6 = image+video, NO audio. Gemma-4 = image+video+AUDIO but
+  every public ckpt is ≥12B mm-wrapped + `google/*` HF-gated and needs the
+  PLE/YOCO/Gemma-4-MoE backbone (sweep-gemma §0.1) + vision + audio towers →
+  `INVENTORIED`→`SPIKE`, BLOCKED-for-now. Audio reachable ONLY via Gemma-4/gemma3n
+  (Qwen3.6 has none) → deferred M5, a large separate lift.
+- **First vehicle:** `Qwen/Qwen3-VL-4B-Instruct` (`Qwen3VLForConditionalGeneration`)
+  — the EXACT `Qwen3_VisionTransformer` Qwen3.6 reuses, image+video, oracle-runnable,
+  ~9 GiB, fits; LLM backbone is a Qwen3-dense sibling we own. Fallback Qwen2.5-VL-3B.
+
+**Reuse-vs-new:** REUSE = paged path + model-shape-agnostic runner + both landed LLM
+backbones + tokenizer + sampling + the LMCache `extra_keys` seam (already mm-aware,
+currently `()`). NEW = the mm input pipeline (`MultiModalKwargs`, processor,
+`MultiModalHasher`), the vision tower + projector/merge, the encoder-cache engine
+seam (`EncoderCacheManager`/`EncoderRunner`/scheduler budget), serving `image_url`/
+video ingestion, and (M5) an audio encoder/ASR frontend. Grep confirms zero mm
+subsystems in `src/`/`include/` today.
+
+**W-plan:** M0 ground+vehicle+oracle/fit/checkpoint → M1 mm input pipeline +
+encoder-cache seam (inert without mm input) → M2 first vision tower + merge on
+Qwen3-VL-4B → image gate → M3 complete Qwen3.6 image (reuse tower) then video → M4
+Gemma-4 (staged, honesty-pass blocked pieces) → M5 audio if reachable. Critical path
+M0→M1→M2→M3; M4/M5 deferred. Records only; NOT pushed.
