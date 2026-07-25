@@ -108,6 +108,15 @@ struct SpeculativeConfig {
   }
 };
 
+// Parse vLLM's `--speculative-config` JSON (SPEC-MTP I5d). Mirrors the subset of
+// vllm/engine/arg_utils.py speculative-config handling the CLI needs: the
+// `method` string and the optional `num_speculative_tokens`. Only "mtp" is
+// supported at this pin (the two gate checkpoints); any other method throws. The
+// returned config has n_predict == 0 — the loader resolves it from the model's
+// mtp_num_hidden_layers via SpeculativeConfig::ResolveMtp once the HF config is
+// known. Throws std::invalid_argument on a malformed document / unknown method.
+SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text);
+
 }  // namespace vllm
 
 #endif  // VLLM_CONFIG_SPECULATIVE_H_

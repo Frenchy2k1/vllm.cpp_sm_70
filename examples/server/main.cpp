@@ -116,6 +116,10 @@ struct Args {
   // same JSON object vLLM takes. Empty (default) == no connector == the inert
   // production path. See docs/KV-OFFLOAD.md.
   std::string kv_transfer_config;
+  // vLLM's --speculative-config: the speculative-decoding selection, as the same
+  // JSON object vLLM takes (e.g. '{"method":"mtp","num_speculative_tokens":1}').
+  // Empty (default) == no speculation == the inert production path (SPEC-MTP I5d).
+  std::string speculative_config;
 };
 
 [[noreturn]] void Usage(const char* argv0, int code) {
@@ -134,7 +138,8 @@ struct Args {
          "               [--scheduling-policy fcfs|priority]\n"
          "               [--tool-call-parser <name>|auto|none]\n"
          "               [--reasoning-parser <name>|auto|none]\n"
-         "               [--kv-transfer-config '<json>']\n";
+         "               [--kv-transfer-config '<json>']\n"
+         "               [--speculative-config '<json>']\n";
   std::exit(code);
 }
 
@@ -192,6 +197,8 @@ Args ParseArgs(int argc, char** argv) {
       a.reasoning_parser = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--kv-transfer-config") {
       a.kv_transfer_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speculative-config") {
+      a.speculative_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "-h" || flag == "--help") {
       Usage(argv[0], 0);
     } else {
@@ -299,6 +306,15 @@ int main(int argc, char** argv) {
         throw std::invalid_argument(msg);
       }
       engine_params.kv_transfer_config = std::move(kv_cfg);
+    }
+    // --speculative-config: speculative decoding (SPEC-MTP I5d). Absent (default)
+    // leaves the optional unset — the byte-identical no-speculation path. The
+    // parse validates method/k here; n_predict + the resolved k are finalized in
+    // LoadedEngine once the checkpoint's mtp_num_hidden_layers is known. A
+    // malformed document or unsupported method throws and is reported at startup.
+    if (!args.speculative_config.empty()) {
+      engine_params.speculative_config =
+          vllm::ParseSpeculativeConfigJson(args.speculative_config);
     }
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
         vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,

@@ -18,6 +18,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
+#include "vllm/model_executor/models/qwen3_5_common.h"  // SPEC-MTP I5d KV widening
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vt/dtype.h"
@@ -259,16 +260,61 @@ std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
     bool async_enabled, vllm::SchedulerConfig scheduler_config,
     vllm::v1::KVCacheConfig kv_cache_config, int block_size,
     bool enable_caching,
-    vllm::v1::StructuredOutputManager* structured_output_manager) {
+    vllm::v1::StructuredOutputManager* structured_output_manager,
+    std::optional<vllm::SpeculativeConfig> speculative_config) {
   if (async_enabled) {
-    // get_scheduler_cls -> AsyncScheduler (scheduler.py:180-189).
+    // get_scheduler_cls -> AsyncScheduler (scheduler.py:180-189). SPEC-MTP: the
+    // async-scheduling draft-in-output path is deferred, so speculation forces
+    // the synchronous Scheduler below — async_enabled is never true when a
+    // speculative_config is present.
     return std::make_unique<vllm::v1::AsyncScheduler>(
         std::move(scheduler_config), std::move(kv_cache_config), block_size,
         enable_caching, structured_output_manager);
   }
   return std::make_unique<vllm::v1::Scheduler>(
       std::move(scheduler_config), std::move(kv_cache_config), block_size,
-      enable_caching, structured_output_manager);
+      enable_caching, structured_output_manager, std::move(speculative_config));
+}
+
+std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
+    const EngineParams& params, const HfConfig& config) {
+  if (!params.speculative_config.has_value()) {
+    return std::nullopt;  // production default: no speculation.
+  }
+  const vllm::SpeculativeConfig& cli = *params.speculative_config;
+  if (cli.method != "mtp") {
+    throw std::invalid_argument(
+        "speculative-config: only method \"mtp\" is supported (got \"" +
+        cli.method + "\")");
+  }
+  // mtp_num_hidden_layers from the checkpoint (text_config, default 1 — both gate
+  // checkpoints). Mirrors qwen3_5_mtp.cpp NumMtpLayers.
+  int64_t mtp_layers = 1;
+  if (config.raw.is_object()) {
+    const nlohmann::json* text = &config.raw;
+    if (config.raw.contains("text_config") &&
+        config.raw.at("text_config").is_object()) {
+      text = &config.raw.at("text_config");
+    }
+    if (text->is_object()) {
+      mtp_layers = text->value("mtp_num_hidden_layers", int64_t{1});
+    }
+  }
+  return vllm::SpeculativeConfig::ResolveMtp(static_cast<int>(mtp_layers),
+                                             cli.num_speculative_tokens);
+}
+
+vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheMaybeSpec(
+    const LoadedModel& model, const HfConfig& config, int block_size,
+    int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec) {
+  if (spec.has_value()) {
+    // Speculation is Qwen3.5/3.6-only at this pin (both gate checkpoints); build
+    // the widened spec KV directly (extra GDN k+1 state slots + widened conv row
+    // + the `fa_draft` full-attn group). MakeQwen3_5KVCacheSpec(num_spec>0).
+    return vllm::MakeQwen3_5KVCacheSpec(config, block_size, num_blocks,
+                                        spec->ResolvedNumSpeculativeTokens());
+  }
+  return ModelRegistry::MakeKVCache(model, config, block_size, num_blocks);
 }
 
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
@@ -290,6 +336,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
                            vt::Queue* preselected_queue)
     : hash_ready_(EnsureNoneHash()),
       config_(std::move(config)),
+      // SPEC-MTP I5d: finalize the speculative config against the checkpoint
+      // (n_predict + resolved k). nullopt on the production default path.
+      resolved_spec_config_(ResolveSpecConfig(params, config_)),
       model_(std::move(model)),
       tokenizer_(std::move(tokenizer)),
       max_model_len_(params.max_model_len > 0
@@ -299,24 +348,39 @@ LoadedEngine::LoadedEngine(HfConfig config,
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
           params, model_->registration().info)),
-      kv_cfg_(ModelRegistry::MakeKVCache(
+      kv_cfg_(MakeKVCacheMaybeSpec(
           *model_, config_, params.block_size > 0 ? params.block_size : 32,
-          params.num_blocks > 0 ? params.num_blocks : 256)),
+          params.num_blocks > 0 ? params.num_blocks : 256,
+          resolved_spec_config_)),
       // runner_ FIRST (W3): the async-scheduling flip reads
-      // runner_.runner_supports_async().
+      // runner_.runner_supports_async(). SPEC-MTP I5d: when speculation is on,
+      // pass the resolved config + the MTP draft (built from the retained mtp.*
+      // weights, sharing the target embed/lm_head). The draft KV `fa_draft` group
+      // is allocated by the runner from kv_cfg_ (empty vector here), so the loop
+      // reaches it via runner-owned storage. nullopt/null on the default path.
       runner_(config_, *model_, kv_cfg_,
               preselected_queue != nullptr
                   ? *preselected_queue
                   : SelectQueue(model_->registration().architecture),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
-              /*max_num_batched_tokens=*/max_num_batched_tokens_),
+              /*max_num_batched_tokens=*/max_num_batched_tokens_,
+              resolved_spec_config_,
+              resolved_spec_config_.has_value() && model_->supports_mtp_draft()
+                  ? model_->BuildMtpDraft(config_)
+                  : nullptr,
+              /*draft_kv=*/{}),
       // Resolve the enable-flip from the now-constructed runner + VT_ASYNC_SCHED,
       // then size the batch-queue depth (2 under async scheduling → depth-2
       // step_with_batch_queue; 1 otherwise). Since the 2026-07-17 flip the default
       // (no env) resolves ON (VT_ASYNC_RUNNER default ON), mirroring vLLM;
       // VT_ASYNC_RUNNER=0 / VT_ASYNC_SCHED=0 roll back to the synchronous path.
-      async_scheduling_enabled_(ResolveAsyncEnabled(
+      // SPEC-MTP I5d: speculation uses the out-of-band take_draft_token_ids /
+      // post_step path, which is the SYNCHRONOUS scheduler's contract; the
+      // async-scheduling draft-in-output variant is deferred (spec §2.5), so a
+      // configured speculator forces sync scheduling here.
+      async_scheduling_enabled_(!resolved_spec_config_.has_value() &&
+          ResolveAsyncEnabled(
           MakeSchedulerConfig(
               max_model_len_,
               params.max_num_seqs > 0 ? params.max_num_seqs : 8,
@@ -344,9 +408,13 @@ LoadedEngine::LoadedEngine(HfConfig config,
               max_num_batched_tokens_, params.policy),
           kv_cfg_, params.block_size > 0 ? params.block_size : 32,
           /*enable_caching=*/prefix_caching_enabled_,
-          &structured_output_manager_)),
+          &structured_output_manager_, resolved_spec_config_)),
       executor_(runner_),
-      engine_core_(*scheduler_, executor_, &structured_output_manager_),
+      // SPEC-MTP I5d: with a speculator configured, EngineCore pulls the runner's
+      // out-of-band drafts each step (take_draft_token_ids -> update_draft_token_ids)
+      // so the next verify step schedules them. Default false (no-op post_step).
+      engine_core_(*scheduler_, executor_, &structured_output_manager_,
+                   /*check_for_draft_tokens=*/resolved_spec_config_.has_value()),
       input_processor_(tokenizer_, config_),
       output_processor_(&tokenizer_),
       block_hasher_(prefix_caching_enabled_

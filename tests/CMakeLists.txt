@@ -648,6 +648,14 @@ target_compile_definitions(test_qwen27_paged_engine PRIVATE
 target_include_directories(test_qwen27_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# SPEC-MTP I5d — the 27B k=1 MTP speculative-decode three-way identity gate
+# (our spec-ON == our spec-OFF == vLLM greedy) + measured nonzero acceptance.
+vllm_cpp_add_test(test_qwen27_spec_decode parity/test_qwen27_spec_decode.cpp)
+target_compile_definitions(test_qwen27_spec_decode PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen27_spec_decode PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # ADDITIVE-MODEL W4 (Qwen3-Coder-30B-A3B, Qwen3MoeForCausalLM) — the SACRED
 # full-attention BF16 MoE greedy correctness gate: drives a compact prompt
 # battery through the paged engine and checks per-(prompt,pos) set membership vs
