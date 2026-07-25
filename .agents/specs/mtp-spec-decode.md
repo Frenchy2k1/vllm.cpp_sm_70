@@ -697,13 +697,45 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
     (`test_runner.cpp`). DEFAULT-OFF INERT throughout; `SPEC-MTP` STAYS `GATING` — this
     is the enabling seam, NOT the spec loop and NOT any e2e result. `benchmark_binding=false`,
     no speed claim.
-  - **I5d — config plumbing + runner loop + the three-way 27B token gate.**
-    `--speculative-config` parse + arch resolve; wire the speculator into the
-    runner (`take_draft_token_ids`, `propose` post-sampling, the
-    `num_decode_draft_tokens_cpu`/`num_accepted_tokens` feed into the GDN builder,
-    the MIXED spec batch split/merge in `GdnBlockPaged`); THEN the M-mtp-1 e2e
-    gate: token-for-token 16/16 vs vLLM same-spec-config, acceptance telemetry,
-    A/B throughput. `SPEC-MTP` leaves `GATING` only here.
+  - **I5d — config plumbing + runner loop. PARTIAL, 2026-07-25 (`CLAIM-SPEC-MTP-I5D`).**
+    LANDED and spec-OFF byte-identical: `--speculative-config` JSON parse
+    (`ParseSpeculativeConfigJson` -> `EngineParams::speculative_config`), the
+    `LoadedEngine` resolution (`ResolveSpecConfig` -> `ResolveMtp`, the widened KV
+    spec via `MakeQwen3_5KVCacheSpec(num_spec>0)`, `BuildMtpDraft`, forced sync
+    scheduling, `MakeScheduler(spec)`, `EngineCore(check_for_draft_tokens=true)`),
+    and the full runner verify/propose loop: draft splice
+    (`update_req_spec_token_ids`), hidden-tap capture, the GDN builder spec-overload
+    feed (`num_accepted_tokens` + `num_decode_draft_tokens` -1 sentinel), the GDN
+    compact-pool k+1 state-slot remap + widened conv cache + draft-KV allocation,
+    `MtpProposePrefill` post-sampling, `take_draft_token_ids` out-of-band, and
+    acceptance telemetry. Builds CLEAN on dgx (CUDA `-Werror` 0 warnings, cutlass-ON
+    banner). **Spec-OFF SACRED regressions PASS (byte-identical, all changes gated
+    on `spec_on()`): 27B 235/235, 35B 315/315, Coder 138/138; unit test_runner
+    257, test_mtp_speculator 169, test_gdn_metadata_builder 483, test_ops_gdn 3630.**
+    **The three-way 27B token gate is NOT yet passing** — `SPEC-MTP` STAYS `GATING`.
+    RCA (measured, `tests/parity/test_qwen27_spec_decode.cpp`): the spec-ON engine
+    resolves config, allocates the widened KV + draft KV, runs the target forward
+    with the hidden tap, and reaches the GDN layer, then THROWS on the FIRST
+    (prefill) step at `vt: gdn_state_gather: working/cache row shapes must match`
+    (`src/vt/ops.cpp:1773`). The gap: I4's spec conv rollback REQUIRES the conv
+    state row widened to `(conv_kernel-1)+num_spec` (`mamba_utils.py:226`), but the
+    NON-spec GDN conv ops (`GdnStateGather`/`CausalConv1dFwd`/`CausalConv1dUpdate`,
+    `GdnBlockPaged` prefill/decode branches) assume a `(conv_kernel-1)`-wide row, so
+    the prefill conv gather shape-mismatches the widened cache. Closing the gate
+    needs the non-spec GDN conv ops made widened-cache-aware (mirror vLLM
+    `causal_conv1d` with `state_len = width-1 + (seqlen-1)`,
+    `qwen_gdn_linear_attn.py:1181-1184`), a kernel-level change with its own
+    bit-exact gate — plus the MIXED spec+non-spec `GdnBlockPaged` split/merge (still
+    refused loudly; only trips under concurrency, so a single-request gate would not
+    need it). NOT overclaimed: token-identity + nonzero acceptance is the bar and it
+    is not yet met. The remaining code (config + loop) is a real, gated,
+    regression-green partial. `benchmark_binding=false`, no speed claim.
+  - **I5d-followup (the OPEN e2e gate) — config plumbing + runner loop DONE; still
+    owed for `SPEC-MTP` to leave `GATING`:** (1) widened-cache-aware non-spec GDN
+    conv ops (the measured blocker above), (2) the MIXED `GdnBlockPaged` split/merge
+    (needs a row `IndexSelect`/`IndexCopy` vt op), then (3) the three-way token gate
+    (our-ON == our-OFF == vLLM `--speculative-config mtp` greedy, token-for-token)
+    with measured nonzero acceptance, then (4) A/B throughput vs vLLM same-config.
 - **M-mtp-2 — 35B k=1 greedy.** Adds only the MoE MTP layer (reuses our MoE
   blocks) — GDN path identical. Same gates. Caveat: verify unions experts
   across k+1 tokens/request (more experts touched per step — measure, don't

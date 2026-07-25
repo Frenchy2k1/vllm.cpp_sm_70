@@ -26,6 +26,7 @@
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
 #include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_RUNNER predicate
 #include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
+#include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"  // SPEC-MTP I5d MtpProposePrefill
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
@@ -386,12 +387,22 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // GDN mamba-state slots = max concurrent sequences (one recurrent state per
   // sequence), decoupled from the attention num_blocks. Guard against a 0 (e.g.
   // a test path that skipped the ctor arg) by falling back to num_blocks.
-  gdn_state_slots_ = max_num_reqs_ > 0 ? max_num_reqs_ : num_blocks_;
+  //
+  // SPEC-MTP I5d: under speculation each sequence needs num_spec+1 CONSECUTIVE
+  // GDN state slots (the k+1 draft-timestep snapshots the recurrent rollback
+  // selects among, spec §3). Size the compact pool max_num_reqs*(num_spec+1) and
+  // let remap_gdn_state_slots hand each sequence a base of num_spec+1 slots.
+  const int spec_cols = spec_on() ? num_spec() + 1 : 1;
+  const int64_t base_slots = max_num_reqs_ > 0 ? max_num_reqs_ : num_blocks_;
+  gdn_state_slots_ = base_slots * spec_cols;
   gdn_slot_of_req_.clear();
   gdn_free_slots_.clear();
-  gdn_free_slots_.reserve(static_cast<size_t>(gdn_state_slots_));
-  for (int64_t s = gdn_state_slots_ - 1; s >= 0; --s)
-    gdn_free_slots_.push_back(static_cast<int32_t>(s));
+  gdn_free_slots_.reserve(static_cast<size_t>(base_slots));
+  // The free list holds each sequence's BASE state slot. Under speculation a
+  // base owns spec_cols (== num_spec+1) consecutive slots, so bases step by
+  // spec_cols; without speculation spec_cols==1 and this is the pre-spec pool.
+  for (int64_t b = base_slots - 1; b >= 0; --b)
+    gdn_free_slots_.push_back(static_cast<int32_t>(b * spec_cols));
 
   // Resolve the full-attn + GDN(mamba) KV group ids (T0 gate models: exactly one
   // of each). The block-table group order == kv_cache_groups order.
@@ -438,6 +449,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   const int64_t key_dim = Hk * Dk;
   const int64_t value_dim = Hv * Dv;
   const int64_t conv_dim = 2 * key_dim + value_dim;
+  // SPEC-MTP I5d: conv state row width, (Kw-1)+num_spec under speculation.
+  const int64_t conv_state_len = spec_on() ? (Kw - 1 + num_spec()) : (Kw - 1);
 
   const MambaSpec* mamba_spec = nullptr;
   if (gdn_group_id_ >= 0) {
@@ -449,7 +462,11 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     VT_CHECK(mamba_spec->shapes.size() == 2 &&
                  mamba_spec->dtypes.size() == 2,
              "runner: Qwen3.5 MambaSpec must contain conv then temporal state");
-    const std::vector<int64_t> expected_conv_shape{conv_dim, Kw - 1};
+    // SPEC-MTP I5d: the conv state row is widened to (Kw-1)+num_spec when
+    // speculation is on (MakeQwen3_5KVCacheSpec / mamba_utils.py:226), so accept
+    // the spec-driven width rather than the fixed Kw-1. The SSM state shape is
+    // unchanged (the extra draft snapshots live in extra SLOTS, not a wider row).
+    const std::vector<int64_t> expected_conv_shape{conv_dim, conv_state_len};
     const std::vector<int64_t> expected_ssm_shape{Hv, Dv, Dk};
     VT_CHECK(mamba_spec->shapes[0] == expected_conv_shape &&
                  mamba_spec->shapes[1] == expected_ssm_shape,
@@ -573,7 +590,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       // for every supported floating storage type.
       const size_t ssm_es = vt::SizeOf(gdn_ssm_cache_dtype_);
       const size_t conv_es = vt::SizeOf(gdn_conv_cache_dtype_);
-      const int64_t conv_row_elems = conv_dim * (Kw - 1);
+      const int64_t conv_row_elems = conv_dim * conv_state_len;
       const int64_t ssm_row_elems = Hv * Dv * Dk;
       ssm_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
@@ -610,6 +627,39 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     kv.head_size = Dh;
     attn_kv_.push_back(kv);
   }
+
+  // SPEC-MTP I5d: allocate the MTP draft's own paged KV layer (the `fa_draft`
+  // group). It is sized exactly like a target full-attn layer and the propose
+  // forward reuses the target's block table / slot mapping over it
+  // (speculator.py:222-234). Allocated ONLY when speculation is on and the ctor
+  // did not already supply a draft KV (tests may). num_spec==0 has no fa_draft
+  // group, so this is never entered on the production default path.
+  draft_attn_buf_.clear();
+  if (spec_on() && draft_attn_kv_.empty() && full_attn_group_id_ >= 0 &&
+      fa_page_bytes > 0) {
+    for (int g = 0;
+         g < static_cast<int>(kv_cache_config.kv_cache_groups.size()); ++g) {
+      if (g == full_attn_group_id_) continue;
+      const auto& group = kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
+      if (group.kv_cache_spec->kind() != KVCacheSpecKind::kFullAttention) {
+        continue;  // the GDN group and any non-attn group are not the draft.
+      }
+      draft_attn_buf_.push_back(std::make_unique<CacheBuffer>(
+          dev, queue_,
+          static_cast<size_t>(num_blocks_) * static_cast<size_t>(fa_page_bytes),
+          kv_cache_backend_resident_));
+      PagedKvCache dkv;
+      dkv.data = draft_attn_buf_.back()->data();
+      dkv.dtype = kv_dtype;
+      dkv.num_blocks = num_blocks_;
+      dkv.block_size = fa_block_size;
+      dkv.num_kv_heads = Hkv;
+      dkv.head_size = Dh;
+      draft_attn_kv_.push_back(dkv);
+      break;  // exactly one fa_draft group at k=1.
+    }
+  }
+
   gdn_state_.clear();
   for (size_t g = 0; g < ssm_buf_.size(); ++g) {
     GdnStateCache gs;
@@ -619,7 +669,8 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g]->data(),
                                            gdn_conv_cache_dtype_,
                                            dev,
-                                           {gdn_state_slots_, conv_dim, Kw - 1});
+                                           {gdn_state_slots_, conv_dim,
+                                            conv_state_len});
     gdn_state_.push_back(gs);
   }
 }
@@ -668,24 +719,29 @@ void GPUModelRunner::remap_gdn_state_slots(
       ++it;
     }
   }
-  // Assign/reuse a compact slot per live sequence and write it into col 0 (the
-  // only column the GDN metadata builder reads as the state index). Distinct
-  // req_ids get distinct slots, so no two live sequences ever share a slot.
+  // Assign/reuse a compact BASE slot per live sequence. Without speculation the
+  // base is written into col 0 (the only column the GDN metadata builder reads).
+  // SPEC-MTP I5d: under speculation each sequence owns num_spec+1 CONSECUTIVE
+  // slots [base, base+num_spec]; write them into cols 0..num_spec so the spec
+  // GDN builder reads the k+1 draft-timestep state slots (gdn_attn.py:266-269).
+  const int spec_cols = spec_on() ? num_spec() + 1 : 1;
   for (int r = 0; r < num_reqs; ++r) {
     const std::string& rid = *req_ids[static_cast<size_t>(r)];
     const size_t off = static_cast<size_t>(r) * static_cast<size_t>(gdn_cols);
     auto it = gdn_slot_of_req_.find(rid);
-    int32_t slot;
+    int32_t base;
     if (it != gdn_slot_of_req_.end()) {
-      slot = it->second;
+      base = it->second;
     } else {
       VT_CHECK(!gdn_free_slots_.empty(),
                "GDN state slots exhausted: live sequences exceed max_num_reqs");
-      slot = gdn_free_slots_.back();
+      base = gdn_free_slots_.back();
       gdn_free_slots_.pop_back();
-      gdn_slot_of_req_.emplace(rid, slot);
+      gdn_slot_of_req_.emplace(rid, base);
     }
-    gdn_bt[off] = slot;
+    for (int c = 0; c < spec_cols && c < gdn_cols; ++c) {
+      gdn_bt[off + static_cast<size_t>(c)] = base + c;
+    }
   }
 }
 
@@ -706,6 +762,19 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
 
   // DECODE-FIRST REORDER (four-way ordering contract) — before any metadata.
   reorder_batch_to_split_decodes_and_prefills(input_batch_, scheduler_output);
+
+  // SPEC-MTP I5d: splice the scheduler's drafts for THIS verify step into
+  // token_ids_cpu after each request's committed prefix (gpu_input_batch.py:
+  // 484-509 update_req_spec_token_ids) so prepare_inputs reads the k draft tokens
+  // at the verify positions. No-op on the default path (empty map / no speculator).
+  if (spec_on()) {
+    const int nr = input_batch_.num_reqs();
+    for (int i = 0; i < nr; ++i) {
+      const std::string& req_id = *input_batch_.req_ids[static_cast<size_t>(i)];
+      input_batch_.update_req_spec_token_ids(
+          i, req_id, scheduler_output.scheduled_spec_decode_tokens);
+    }
+  }
 
   // Build the flattened dense-order step inputs (M1.5).
   StepInputs step = prepare_inputs(input_batch_, scheduler_output);
@@ -779,6 +848,22 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     int gdn_cols = 0;
     std::vector<int32_t> gdn_bt =
         gather_block_table(gdn_group_id_, num_reqs, &gdn_cols);
+    // SPEC-MTP I5d: the spec GDN builder reads cols 0..num_spec of the block
+    // table as the k+1 draft-timestep state slots. Our compact per-sequence pool
+    // OWNS the slot ids (the physical mamba block-id is irrelevant, see the remap
+    // rationale), so widen the block-table view to num_spec+1 columns when the
+    // real GDN block table is narrower, and let remap fill all k+1 slots.
+    if (spec_on() && gdn_cols < num_spec() + 1) {
+      const int wide = num_spec() + 1;
+      std::vector<int32_t> widened(
+          static_cast<size_t>(num_reqs) * static_cast<size_t>(wide), 0);
+      for (int r = 0; r < num_reqs; ++r) {
+        widened[static_cast<size_t>(r) * static_cast<size_t>(wide)] =
+            gdn_bt[static_cast<size_t>(r) * static_cast<size_t>(gdn_cols)];
+      }
+      gdn_bt = std::move(widened);
+      gdn_cols = wide;
+    }
     // Remap col 0 to a compact per-sequence state slot in [0, gdn_state_slots_),
     // keyed on the request identity so the GDN state cache is sized by
     // max_num_reqs (one recurrent state per sequence) rather than the attention
@@ -792,8 +877,33 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     }
     const CommonAttentionMetadata gdn_cam = MakeCommonAttentionMetadata(
         step, gdn_bt, gdn_cols, /*causal=*/true, gdn_group_id_);
-    GDNAttentionMetadataBuilder gdn_builder;
-    gdn_meta = gdn_builder.build(/*common_prefix_len=*/0, gdn_cam);
+    if (spec_on()) {
+      // SPEC-MTP I5d: feed the GDN builder's spec overload (gdn_attn.py:189-326).
+      // num_decode_draft_tokens_cpu[i] = -1 for a non-spec row, else the number of
+      // drafts this verify step scheduled for req i (mamba_hybrid.py:247-264);
+      // num_accepted_tokens[i] is the PREVIOUS step's accepted count (seeded 1,
+      // overwritten by the rejection sampler). The remapped gdn_bt cols 0..k hold
+      // this request's k+1 GDN state slots (see remap_gdn_state_slots spec branch).
+      std::vector<int32_t> num_decode_draft_tokens(static_cast<size_t>(num_reqs), -1);
+      for (int i = 0; i < num_reqs; ++i) {
+        const std::string& req_id = *input_batch_.req_ids[static_cast<size_t>(i)];
+        const auto it = scheduler_output.scheduled_spec_decode_tokens.find(req_id);
+        if (it != scheduler_output.scheduled_spec_decode_tokens.end() &&
+            !it->second.empty()) {
+          num_decode_draft_tokens[static_cast<size_t>(i)] =
+              static_cast<int32_t>(it->second.size());
+        }
+      }
+      std::vector<int32_t> num_accepted(
+          input_batch_.num_accepted_tokens.begin(),
+          input_batch_.num_accepted_tokens.begin() + num_reqs);
+      GDNAttentionMetadataBuilder gdn_builder(num_spec());
+      gdn_meta = gdn_builder.build(/*common_prefix_len=*/0, gdn_cam, &num_accepted,
+                                   &num_decode_draft_tokens);
+    } else {
+      GDNAttentionMetadataBuilder gdn_builder;
+      gdn_meta = gdn_builder.build(/*common_prefix_len=*/0, gdn_cam);
+    }
   }
 
   // Flattened dense-order forward inputs (positions int64 -> int32 for RoPE).
@@ -846,6 +956,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       .gdn_state_slots = gdn_state_slots_,
       .pure_decode = pure_decode,
       .gather_logits = gather,
+      // SPEC-MTP I5d: capture the target's post-final-norm [T,H] hidden for the
+      // MTP drafter. Non-null only when a speculator is configured — the Qwen3.5
+      // dense/MoE forward then routes to ForwardDeviceTap (byte-identical logits).
+      // Null on every default step, so the forward path is byte-identical.
+      .hidden_tap = spec_on() ? &exec_state_.spec_hidden : nullptr,
   };
   // KV-EXTERNAL-CACHE (LMCache): apply any external-prefix loads recorded by the
   // scheduler's connector for THIS step into the freshly-allocated KV blocks
@@ -1039,6 +1154,16 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logit
     // slot select reads it next step (spec §3 step 3 / §2.4).
     const int32_t ns = rs.num_sampled[static_cast<size_t>(i)];
     input_batch_.num_accepted_tokens[static_cast<size_t>(i)] = ns > 1 ? ns : 1;
+    // Acceptance telemetry: k drafts verified this row, (num_sampled-1) accepted
+    // (the trailing token is the bonus/replacement, not a draft). Chunked-prefill
+    // rows carry no drafts.
+    const int32_t kr = step.num_draft_tokens_per_req.empty()
+                           ? 0
+                           : step.num_draft_tokens_per_req[static_cast<size_t>(i)];
+    if (kr > 0 && !chunked_prefilling[static_cast<size_t>(i)]) {
+      spec_drafts_proposed_ += kr;
+      spec_drafts_accepted_ += (ns > 1 ? ns - 1 : 0);
+    }
 
     if (chunked_prefilling[static_cast<size_t>(i)]) {
       out.sampled_token_ids.push_back({});
@@ -1090,7 +1215,24 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   // SpeculativeConfig. On the production default it is 0 on every step, so this
   // branch is never taken and the sampler path below is byte-identical.
   if (exec_state_.step.num_draft_tokens > 0) {
-    return sample_tokens_with_rejection(logits);
+    ModelRunnerOutput out_rej = sample_tokens_with_rejection(logits);
+    // SPEC-MTP I5d: propose the next verify step's drafts after committing this
+    // step's accepted tokens. The accept accounting lives in num_accepted_tokens
+    // (num_sampled = accepted, seeded/overwritten there); num_rejected is derived.
+    if (spec_on()) {
+      std::vector<int32_t> num_sampled(static_cast<size_t>(num_reqs), 1);
+      std::vector<int32_t> num_rejected(static_cast<size_t>(num_reqs), 0);
+      for (int i = 0; i < num_reqs; ++i) {
+        const int32_t acc = input_batch_.num_accepted_tokens[static_cast<size_t>(i)];
+        const int32_t k = exec_state_.step.num_draft_tokens_per_req.empty()
+                              ? 0
+                              : exec_state_.step.num_draft_tokens_per_req[static_cast<size_t>(i)];
+        num_sampled[static_cast<size_t>(i)] = acc;              // == accepted count
+        num_rejected[static_cast<size_t>(i)] = k - (acc - 1);   // (1+k) - num_sampled
+      }
+      propose_drafts(num_sampled, num_rejected);
+    }
+    return out_rej;
   }
 
   // SamplingMetadata in the SAME dense [0, num_reqs) order (M1.7; CLOSES the
@@ -1149,7 +1291,80 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
       input_batch_.last_sampled_tokens[static_cast<size_t>(i)] = toks.back();
     }
   }
+  // SPEC-MTP I5d: propose drafts after a plain (no-draft, e.g. first) decode step
+  // so the next step verifies them. Each generating row sampled exactly one token
+  // (num_sampled=1, num_rejected=0); discarded prefill-chunk rows are skipped
+  // inside propose_drafts. No-op unless a speculator is configured.
+  if (spec_on()) {
+    std::vector<int32_t> num_sampled(static_cast<size_t>(num_reqs), 1);
+    std::vector<int32_t> num_rejected(static_cast<size_t>(num_reqs), 0);
+    propose_drafts(num_sampled, num_rejected);
+  }
   return out;
+}
+
+// SPEC-MTP I5d: the k=1 MTP propose, run after each step's sampling
+// (gpu/model_runner.py:1455-1489 speculator.propose + set_draft_tokens). Uses the
+// stashed target hidden tap + this step's verify attention metadata; the draft
+// reuses the target's metadata over its OWN paged KV layer (speculator.py:222-234).
+// Stashes the resulting per-request drafts in pending_drafts_ for the engine
+// core's out-of-band pull. UNREACHABLE unless a speculator is configured.
+void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
+                                    const std::vector<int32_t>& num_rejected_in) {
+  const int num_reqs = exec_state_.num_reqs;
+  if (num_reqs == 0 || draft_model_ == nullptr || draft_attn_kv_.empty()) {
+    pending_drafts_.reset();
+    return;
+  }
+  VT_CHECK(exec_state_.spec_hidden.tensor.data != nullptr,
+           "propose_drafts: missing target hidden tap (hidden_tap not captured)");
+
+  // idx_mapping is identity: our persistent batch is condensed-dense (batch row
+  // == req_state slot), so last_sampled/next_prefill index directly by row.
+  std::vector<int32_t> idx_mapping(static_cast<size_t>(num_reqs));
+  std::iota(idx_mapping.begin(), idx_mapping.end(), 0);
+
+  // num_sampled == 0 tells prepare_prefill_inputs to splice next_prefill_tokens
+  // instead of last_sampled (a still-prefilling chunk). Force it for discarded
+  // rows (which sampled no committed token this step). next_prefill_tokens[i] is
+  // the token at the request's next prefill position; unused for generating rows.
+  std::vector<int32_t> num_sampled = num_sampled_in;
+  std::vector<int32_t> num_rejected = num_rejected_in;
+  std::vector<int32_t> next_prefill(static_cast<size_t>(num_reqs), 0);
+  for (int i = 0; i < num_reqs; ++i) {
+    if (i < static_cast<int>(exec_state_.discard.size()) &&
+        exec_state_.discard[static_cast<size_t>(i)]) {
+      num_sampled[static_cast<size_t>(i)] = 0;
+      num_rejected[static_cast<size_t>(i)] = 0;
+    }
+    const int32_t seq_len = exec_state_.step.seq_lens[static_cast<size_t>(i)];
+    next_prefill[static_cast<size_t>(i)] =
+        input_batch_.token_id(i, seq_len);
+  }
+
+  const std::vector<int32_t> drafts = MtpProposePrefill(
+      *draft_model_, exec_state_.attn_meta, draft_attn_kv_[0],
+      exec_state_.spec_hidden.tensor, exec_state_.step.input_token_ids,
+      exec_state_.step.positions, idx_mapping,
+      input_batch_.last_sampled_tokens, next_prefill, num_sampled, num_rejected,
+      /*max_num_reqs=*/num_reqs, queue_);
+
+  // Stash the per-request draft (k=1: one token/request) for the out-of-band pull.
+  // A discarded (still-prefilling) row gets no draft — an empty list clears its
+  // spec tokens (scheduler.update_draft_token_ids skips prefill-chunk requests).
+  DraftTokenIds out;
+  out.req_ids.reserve(static_cast<size_t>(num_reqs));
+  out.draft_token_ids.reserve(static_cast<size_t>(num_reqs));
+  for (int i = 0; i < num_reqs; ++i) {
+    out.req_ids.push_back(exec_state_.req_ids[static_cast<size_t>(i)]);
+    if (i < static_cast<int>(exec_state_.discard.size()) &&
+        exec_state_.discard[static_cast<size_t>(i)]) {
+      out.draft_token_ids.push_back({});
+    } else {
+      out.draft_token_ids.push_back({drafts[static_cast<size_t>(i)]});
+    }
+  }
+  pending_drafts_ = std::move(out);
 }
 
 GPUModelRunner::~GPUModelRunner() {

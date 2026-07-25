@@ -205,7 +205,24 @@ class LoadedEngine {
       bool async_enabled, vllm::SchedulerConfig scheduler_config,
       vllm::v1::KVCacheConfig kv_cache_config, int block_size,
       bool enable_caching,
-      vllm::v1::StructuredOutputManager* structured_output_manager);
+      vllm::v1::StructuredOutputManager* structured_output_manager,
+      std::optional<vllm::SpeculativeConfig> speculative_config = std::nullopt);
+  // SPEC-MTP I5d: finalize the entrypoint's SpeculativeConfig against the loaded
+  // checkpoint. params.speculative_config carries the CLI method + optional user
+  // k; this re-runs SpeculativeConfig::ResolveMtp with the checkpoint's
+  // mtp_num_hidden_layers (from config.raw text_config, default 1) so n_predict
+  // and the resolved k are correct. Returns nullopt when no speculation is
+  // configured (the byte-identical production path). Non-Qwen3.5 or non-mtp
+  // methods that reached here throw.
+  static std::optional<vllm::SpeculativeConfig> ResolveSpecConfig(
+      const EngineParams& params, const HfConfig& config);
+  // SPEC-MTP I5d: build the KV-cache spec, widened for speculation when a spec
+  // config is set (the extra GDN k+1 state slots + widened conv row + the
+  // `fa_draft` full-attn group, MakeQwen3_5KVCacheSpec num_spec>0). With no spec
+  // config it is exactly ModelRegistry::MakeKVCache (byte-identical).
+  static vllm::v1::KVCacheConfig MakeKVCacheMaybeSpec(
+      const LoadedModel& model, const HfConfig& config, int block_size,
+      int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec);
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();
@@ -216,6 +233,12 @@ class LoadedEngine {
 
   bool hash_ready_;  // declared first: forces EnsureNoneHash() ahead of the rest.
   HfConfig config_;
+  // SPEC-MTP I5d: the finalized speculative config (method/k/n_predict), or
+  // nullopt on the production default path. Declared before model_/kv_cfg_/runner_
+  // because the KV-cache widening, the draft build, the scheduler lookahead, and
+  // the engine-core draft pull all read it. nullopt ⇒ every spec path is inert
+  // and the engine is byte-identical to the pre-spec engine.
+  std::optional<vllm::SpeculativeConfig> resolved_spec_config_;
   // Concrete weights and model-specific runtime state behind the central
   // registry contract. Declared before runner_ so its borrow remains live.
   std::unique_ptr<LoadedModel> model_;

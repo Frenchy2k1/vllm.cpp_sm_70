@@ -546,6 +546,40 @@ content-hash IDENTICAL before and after the whole series. The full per-suite tal
 e2e), whose honest denominator is vLLM **with the same speculative config** at both
 the latency and throughput operating points (mtp-spec-decode.md §5).
 
+### MTP config runtime + verify/propose runner loop, SPEC-MTP I5d (2026-07-25, `CLAIM-SPEC-MTP-I5D`) - PARTIAL, token-identity + acceptance PENDING, `benchmark_binding=false`
+
+**Benchmark disposition: PENDING - no throughput/latency number and no
+token-identity result yet; `benchmark_binding=false`.** I5d wires
+`--speculative-config` through the engine (JSON parse -> `EngineParams` ->
+`LoadedEngine` resolution: widened KV `MakeQwen3_5KVCacheSpec(num_spec>0)`,
+`BuildMtpDraft`, forced sync scheduling, `MakeScheduler(spec)`,
+`EngineCore(check_for_draft_tokens=true)`) and the full k=1 verify/propose runner
+loop (draft splice, hidden-tap capture, GDN builder spec-overload feed, k+1 GDN
+state-slot remap + widened conv cache + draft-KV alloc, `MtpProposePrefill`,
+`take_draft_token_ids`, acceptance telemetry). Builds CLEAN on dgx (CUDA `-Werror`
+0 warnings, cutlass-ON: CUTLASS 4.5.0 + FA2 + Triton AOT, arch 121a). **The
+three-way 27B token gate is NOT passing** (`tests/parity/test_qwen27_spec_decode.cpp`
+RUNS the loop and MEASURES the blocker): the spec-ON engine resolves config,
+allocates the widened + draft KV, runs the target forward with the hidden tap, and
+reaches the GDN layer, then THROWS on the FIRST (prefill) step at
+`vt: gdn_state_gather: working/cache row shapes must match` (`src/vt/ops.cpp:1773`).
+RCA: I4's spec conv rollback needs the conv state row widened to
+`(conv_kernel-1)+num_spec`, but the non-spec GDN conv ops
+(`GdnStateGather`/`CausalConv1dFwd`/`CausalConv1dUpdate`) assume `(conv_kernel-1)` -
+so the prefill conv gather shape-mismatches the widened cache. Closing the gate
+needs widened-cache-aware non-spec GDN conv ops + the MIXED `GdnBlockPaged`
+split/merge, then the token-identity gate + the same-spec-config A/B. **Spec-OFF
+byte-identical, STANDALONE under `flock $HOME/gpu.lock`, one big-model at a time,
+cutlass-ON build:** the MANDATORY GDN trio - 27B `test_qwen27_paged_engine`
+235/235, 35B `test_qwen36_paged_engine` 315/315, Coder `test_qwen3coder_paged_engine`
+138/138 - ALL PASS; unit `test_runner` 257, `test_mtp_speculator` 169,
+`test_gdn_metadata_builder` 483, `test_ops_gdn` 3630 ALL PASS. All I5d changes are
+gated on `spec_on()` (nullopt on the default path), so the dense model set is
+byte-identical by construction (same runner spec-off path, proven token-exact by
+the trio). **Next benchmark owed (unchanged):** the passing 27B k=1 greedy e2e gate
+vs vLLM **with the same speculative config** at both operating points
+(mtp-spec-decode.md §5).
+
 ### Accelerator-seam `S4` - LinearMethod / QuantizationConfig seam (2026-07-23, `CLAIM-BACKEND-SEAM-S4-1`) - byte-identical, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - structural refactor, no performance claim.**

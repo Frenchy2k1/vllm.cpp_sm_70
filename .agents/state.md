@@ -22708,3 +22708,56 @@ loop (the ctor now accepts the draft + draft KV + `SpeculativeConfig`); add
 `--speculative-config` parse + arch resolve; the `take_draft_token_ids` out-of-band path;
 the `GDNAttentionMetadataBuilder::build` spec feed; the MIXED spec+non-spec `GdnBlockPaged`
 split/merge; then the 3-way 27B k=1 greedy token gate.
+
+- **2026-07-25** — **SPEC-MTP I5d (config runtime + verify/propose runner loop)
+  LANDED as a spec-off-byte-identical PARTIAL; the three-way 27B token GATE is NOT
+  yet passing, `SPEC-MTP` STAYS `GATING` (`CLAIM-SPEC-MTP-I5D`, worktree
+  `/home/mudler/_git/vllm.cpp.wt/i5d`, dgx `~/work/vllm-i5d`, base `origin/main`
+  `8e50a18`).** Implemented, on top of the landed I1-I5c + I5d-pre ABIs:
+  (1) **config runtime** — `ParseSpeculativeConfigJson` (nlohmann) →
+  `EngineParams::speculative_config`; the server `--speculative-config` flag;
+  `LoadedEngine::ResolveSpecConfig` (re-runs `SpeculativeConfig::ResolveMtp` with the
+  checkpoint's `mtp_num_hidden_layers`), `MakeKVCacheMaybeSpec` (widened KV via
+  `MakeQwen3_5KVCacheSpec(num_spec>0)`), `BuildMtpDraft`, forced sync scheduling,
+  `MakeScheduler(spec)`, `EngineCore(check_for_draft_tokens=true)`.
+  (2) **runner loop** — draft splice (`update_req_spec_token_ids`), hidden-tap
+  capture (`ModelForwardInput::hidden_tap` → `ForwardDeviceTap`), the GDN builder
+  spec-overload feed (`num_accepted_tokens` + `num_decode_draft_tokens` -1 sentinel),
+  the GDN compact-pool **k+1 state-slot remap** (`gdn_state_slots_ =
+  max_num_reqs*(num_spec+1)`, bases step by `num_spec+1`, block-table cols 0..k) +
+  the **widened conv cache** (`(K-1)+num_spec`) + the **draft-KV allocation** (the
+  `fa_draft` group), `MtpProposePrefill` after sampling, `take_draft_token_ids`
+  out-of-band, and acceptance telemetry (`spec_drafts_proposed/accepted`).
+  (3) **gate** — NEW `tests/parity/test_qwen27_spec_decode.cpp` (dgx-only,
+  checkpoint-gated) three-way identity vs the vLLM greedy golden + nonzero acceptance.
+  **BUILD:** dgx CUDA `-Werror` 0 warnings, cutlass-ON banner CONFIRMED (cutlass-nvfp4
+  + cutlass-fp8 + marlin-nvfp4 + FA2 ENABLED @ 121a, CUTLASS `~/cutlass-4.5.0`, Triton
+  AOT vendored). **SPEC-OFF BYTE-IDENTICAL (all I5d changes gated on `spec_on()`,
+  nullopt on the default path):** SACRED regressions STANDALONE under
+  `flock $HOME/gpu.lock`, one big-model at a time — **27B `test_qwen27_paged_engine`
+  235/235, 35B `test_qwen36_paged_engine` 315/315, Coder `test_qwen3coder_paged_engine`
+  138/138** ALL PASS; unit `test_runner` 257, `test_mtp_speculator` 169,
+  `test_gdn_metadata_builder` 483, `test_ops_gdn` 3630 ALL PASS on CUDA. The dense
+  model set is byte-identical by construction (same runner spec-off path, proven
+  token-exact by the GDN trio + Coder full-attn). **THE GATE IS NOT PASSING —
+  MEASURED RCA (`test_qwen27_spec_decode`):** the spec-ON engine resolves config,
+  allocates the widened + draft KV, runs the target forward with the hidden tap, and
+  reaches the GDN layer, then THROWS on the FIRST (prefill) step at
+  `vt: gdn_state_gather: working/cache row shapes must match` (`src/vt/ops.cpp:1773`).
+  The gap: I4's spec conv rollback REQUIRES the conv state row widened to
+  `(conv_kernel-1)+num_spec` (`mamba_utils.py:226`), but the NON-spec GDN conv ops
+  (`GdnStateGather`/`CausalConv1dFwd`/`CausalConv1dUpdate` in the `GdnBlockPaged`
+  prefill/decode branches) assume a `(conv_kernel-1)`-wide row, so the prefill conv
+  gather shape-mismatches the widened cache. **Remaining before `SPEC-MTP` leaves
+  `GATING`:** (a) widened-cache-aware non-spec GDN conv ops (mirror vLLM
+  `causal_conv1d` `state_len = width-1 + (seqlen-1)`, `qwen_gdn_linear_attn.py:1181-1184`)
+  — a kernel change needing its own bit-exact gate; (b) the MIXED `GdnBlockPaged`
+  split/merge (still refused loudly; needs a row `IndexSelect`/`IndexCopy` vt op;
+  only trips under concurrency, so a single-request gate would not need it); (c) the
+  passing three-way token gate + nonzero acceptance; (d) the same-spec-config A/B.
+  NOT overclaimed: token-identity + nonzero acceptance is the bar and it is not yet
+  met; the config + loop is a real, gated, regression-green partial.
+  `benchmark_binding=false`, no speed claim. **compute-sanitizer on the e2e spec
+  step is N/A** (the step does not reach a clean completion pending the conv fix; the
+  spec KERNELS themselves are sanitizer-clean from I4/I5a). Full SHA reported in the
+  session; NOT pushed.

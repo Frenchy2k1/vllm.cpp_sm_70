@@ -66,6 +66,7 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d hidden tap + draft
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
@@ -190,6 +191,17 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::unique_ptr<AsyncModelRunnerOutput> sample_tokens_async(
       const std::optional<GrammarOutput>& grammar_output) override;
 
+  // take_draft_token_ids (SPEC-MTP I5d; gpu/model_runner.py:1483-1489). Returns
+  // the out-of-band drafts the verify/propose loop produced this step, moving
+  // them out (a second call returns nullopt). EngineCore::post_step pulls these
+  // and installs them on the scheduler for the next verify step. nullopt when no
+  // speculator is configured (the production default) — byte-identical.
+  std::optional<DraftTokenIds> take_draft_token_ids() override {
+    std::optional<DraftTokenIds> out = std::move(pending_drafts_);
+    pending_drafts_.reset();
+    return out;
+  }
+
   // runner_supports_async (mirror of the vLLM compat gate feeding
   // SchedulerConfig::ResolveAsyncScheduling — vllm/config/vllm.py:990-1038). TRUE
   // iff the runner advertises the placeholder-aware async device path: it is
@@ -221,6 +233,9 @@ class GPUModelRunner final : public ModelRunnerBase {
   const GDNAttentionMetadata& last_gdn_meta() const {
     return exec_state_.gdn_meta;
   }
+  // SPEC-MTP I5d acceptance telemetry accessors (the gate reads these).
+  int64_t spec_drafts_proposed() const { return spec_drafts_proposed_; }
+  int64_t spec_drafts_accepted() const { return spec_drafts_accepted_; }
   int full_attn_group_id() const { return full_attn_group_id_; }
   int gdn_group_id() const { return gdn_group_id_; }
   int64_t num_blocks() const { return num_blocks_; }
@@ -413,6 +428,36 @@ class GPUModelRunner final : public ModelRunnerBase {
   // SpeculativeConfig — unreachable on the production default path. Mirrors
   // gpu/model_runner.py:1065-1077.
   ModelRunnerOutput sample_tokens_with_rejection(vt::Tensor& logits);
+
+  // ── SPEC-MTP I5d verify/propose loop helpers ────────────────────────────────
+  // Whether a speculator is configured (nullopt on the production default path,
+  // so every helper below is unreachable and the runner is byte-identical).
+  bool spec_on() const { return spec_config_.has_value(); }
+  // k = resolved num_speculative_tokens (0 when spec off).
+  int num_spec() const {
+    return spec_config_.has_value()
+               ? spec_config_->ResolvedNumSpeculativeTokens()
+               : 0;
+  }
+  // Run the k=1 MTP propose after this step's sampling and stash the drafts for
+  // take_draft_token_ids (gpu/model_runner.py:1455-1489). Uses the stashed target
+  // hidden tap + verify attn metadata; `num_sampled`/`num_rejected` are the
+  // per-req accept accounting (1/0 on a plain non-spec step). No-op unless spec_on.
+  void propose_drafts(const std::vector<int32_t>& num_sampled,
+                      const std::vector<int32_t>& num_rejected);
+  // The drafts produced this step, pending pull by EngineCore::post_step. Empty
+  // (nullopt) on the default path.
+  std::optional<DraftTokenIds> pending_drafts_;
+  // SPEC-MTP I5d acceptance telemetry (spec §5 gate: measured nonzero acceptance).
+  // spec_drafts_proposed_ counts draft tokens VERIFIED, spec_drafts_accepted_ the
+  // subset the rejection sampler accepted. accepted/proposed is the acceptance
+  // rate; total generated / total verify steps is the effective speedup proxy.
+  int64_t spec_drafts_proposed_ = 0;
+  int64_t spec_drafts_accepted_ = 0;
+  // Draft KV cache (`fa_draft` group) backing storage, owned by the runner and
+  // allocated in initialize_kv_cache when spec is on. draft_attn_kv_ (declared
+  // above) views into these buffers. Empty on the default path.
+  std::vector<std::unique_ptr<CacheBuffer>> draft_attn_buf_;
   std::vector<std::unique_ptr<CacheBuffer>> full_attn_buf_;
   // GDN convolution and recurrent caches have independent dtypes. This mirrors
   // MambaStateDtypeCalculator::_mamba_state_dtype: mamba_cache_dtype="auto"
@@ -460,6 +505,10 @@ class GPUModelRunner final : public ModelRunnerBase {
     CommonAttentionMetadata attn_meta;
     GDNAttentionMetadata gdn_meta;
     std::vector<std::string> req_ids;  // dense order (== input_batch order)
+    // SPEC-MTP I5d: the target's post-final-norm [T,H] hidden tap captured this
+    // step (ModelForwardInput::hidden_tap output), consumed by propose_drafts to
+    // run the MTP drafter. Empty (null storage) unless spec is on.
+    Qwen3_5MTPHiddenStates spec_hidden;
     // discard_request_mask (gpu_model_runner.py:2048): per dense batch row, 1 iff
     // the request is still consuming its known prefill tokens this step
     // (optimistic seq_len < num_tokens) and so must NOT sample — its sampled
