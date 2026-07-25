@@ -44,6 +44,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/config/speculative.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/outputs.h"
@@ -66,6 +67,12 @@ struct BenchConfig {
   std::string dataset_path;
   // Optional JSON output path containing generated IDs in submission order.
   std::string output_token_ids_path;
+  // Optional speculative-decoding config JSON, e.g.
+  // '{"method":"mtp","num_speculative_tokens":1}'. Empty => spec decode OFF
+  // (production non-spec path, byte-identical to pre-existing runs). Parsed via
+  // vllm::ParseSpeculativeConfigJson and forwarded to EngineParams for the real
+  // checkpoint path only (the synthetic engine ignores it).
+  std::string speculative_config;
   int num_prompts = 8;     // N: total requests to submit.
   int input_len = 16;      // L: target prompt tokens per request.
   int output_len = 16;     // O: max_tokens per request (greedy => exactly O).
@@ -119,6 +126,12 @@ struct BenchResult {
   double mean_tpot_ms = 0, median_tpot_ms = 0, p99_tpot_ms = 0;
   double mean_itl_ms = 0, median_itl_ms = 0, p99_itl_ms = 0;
   double mean_e2el_ms = 0, median_e2el_ms = 0, p99_e2el_ms = 0;
+  // Speculative-decoding telemetry (only meaningful when spec decode is ON).
+  // spec_proposed = draft tokens VERIFIED; spec_accepted = draft tokens
+  // ACCEPTED. Acceptance rate = accepted / proposed. Both 0 when spec is OFF.
+  bool spec_on = false;
+  int64_t spec_proposed = 0;
+  int64_t spec_accepted = 0;
 };
 
 // ── numpy-style linear-interpolation percentile (matches np.percentile). ───────
@@ -452,6 +465,13 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
                             : std::max(cfg.concurrency * seq_blocks * 2, 256);
     // Chunked-prefill per-step budget (0 => engine bounded default).
     params.max_num_batched_tokens = cfg.max_num_batched_tokens;
+    // Speculative decoding (MTP): OFF unless a config JSON is supplied. When
+    // set, resolve the CLI method here; FromModelDir loads the mtp.* head and
+    // wires the verify/propose loop (spec-OFF path is byte-unchanged).
+    if (!cfg.speculative_config.empty()) {
+      params.speculative_config =
+          vllm::ParseSpeculativeConfigJson(cfg.speculative_config);
+    }
     loaded = vllm::entrypoints::LoadedEngine::FromModelDir(cfg.model_path, params);
     if (prompts.empty()) {
       for (int i = 0; i < cfg.num_prompts; ++i) {
@@ -579,6 +599,13 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     }
     res.output_token_ids[request_index] = kv.second.output_token_ids;
   }
+  // Speculative-decoding acceptance telemetry (real-checkpoint spec-ON only;
+  // the synthetic engine has no draft loop).
+  if (!cfg.model_path.empty() && !cfg.speculative_config.empty()) {
+    res.spec_on = true;
+    res.spec_proposed = loaded->runner().spec_drafts_proposed();
+    res.spec_accepted = loaded->runner().spec_drafts_accepted();
+  }
   return res;
 }
 
@@ -635,6 +662,16 @@ inline void PrintReport(const BenchConfig& cfg, const BenchResult& r,
   line_f("Input (prefill) token throughput (tok/s):", r.input_throughput);
   line_f("Output (decode) token throughput (tok/s):", r.output_throughput);
   line_f("Mean per-stream decode rate (tok/s):", r.mean_per_stream_decode);
+  if (r.spec_on) {
+    sep("Speculative decoding (MTP)");
+    line_i("Draft tokens proposed:", static_cast<long long>(r.spec_proposed));
+    line_i("Draft tokens accepted:", static_cast<long long>(r.spec_accepted));
+    line_f("Acceptance rate (accepted/proposed):",
+           r.spec_proposed > 0
+               ? static_cast<double>(r.spec_accepted) /
+                     static_cast<double>(r.spec_proposed)
+               : 0.0);
+  }
   std::fprintf(out, "====================================================\n");
 }
 

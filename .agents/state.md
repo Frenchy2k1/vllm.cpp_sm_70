@@ -22824,3 +22824,80 @@ split/merge; then the 3-way 27B k=1 greedy token gate.
   still refused loudly; needs a row `IndexSelect`/`IndexCopy` vt op) + the throughput
   A/B vs vLLM same-config are **I6**. `benchmark_binding=false`, no speed claim. Full
   SHA reported in the session; NOT pushed.
+
+## 2026-07-25 — SPEC-MTP I6: the §5 c1 THROUGHPUT GATE (first spec-decode speed number, `benchmark_binding=true`) (`CLAIM-SPEC-MTP-I6`)
+
+- **Scope.** Measure the §5 throughput gate at the c1 (low-concurrency) spec-decode
+  operating point: OURS spec-ON vs the pinned vLLM 0.25.0 spec-ON, same `mtp` k=1
+  config, honest graphed denominator. Base `origin/main` `f0bffda`; isolated worktree
+  `/home/mudler/_git/vllm-mtp-bench` branch `bench/spec-mtp-i6`; dgx `~/work/mtp-bench-i6`
+  (`git archive` of the worktree incl. the additive bench flag; CUDA `build` cutlass-ON
+  banner CONFIRMED: CUDA backend, `fa2 ENABLED [121a]`, `CUTLASS found at
+  ~/cutlass-4.5.0`, Triton AOT gdn kernels; Release/NDEBUG). ALL GPU work FOREGROUND
+  under ONE `flock $HOME/gpu.lock`, ours and vLLM NEVER co-scheduled on the unified pool;
+  worker container stayed STOPPED; box verified idle (57-87 GiB free) before each arm.
+- **Code (additive, example-only).** A `--speculative-config <json>` flag on
+  `examples/vllm-bench` (`examples/bench/main.cpp` + `examples/bench/bench_core.h`):
+  parsed via `vllm::ParseSpeculativeConfigJson` and set on `EngineParams::speculative_config`
+  for the real-checkpoint path only, plus acceptance telemetry read from
+  `LoadedEngine::runner().spec_drafts_{proposed,accepted}()` and printed in the report.
+  NO engine/library/kernel TU touched ⇒ spec-OFF and every non-spec run are byte-unchanged
+  and the SACRED gates are untouched by construction (stated, not re-run — no gated code
+  changed). Also two real-prompt ShareGPT datasets (8 prose + 8 code) both arms consume
+  identically.
+- **Correctness guard FIRST.** On the clean cutlass-ON build, `test_qwen27_spec_decode`
+  (the three-way single-request greedy gate) re-run and PASSES: 9/9 assertions, "produced
+  32 tokens; drafts 16/16 accepted", continuation " capital of Germany is Berlin." So the
+  speed numbers below come from a token-identical spec loop.
+- **A/B.** Both arms spec-ON, SAME `{"method":"mtp","num_speculative_tokens":1}`, 27B
+  `~/bench/q36-27b-nvfp4-vllm`, c1, greedy, 8 real prose+code prompts x 256 out tokens, 3
+  reps (cold TTFT leg discarded; ours reruns near-identical, no discard needed). OURS =
+  `examples/vllm-bench` + the flag (production config). vLLM = `vllm serve
+  --speculative-config ... --no-enable-prefix-caching --gpu-memory-utilization 0.45
+  --max-model-len 2048 --max-num-seqs 1` (graphed PRODUCTION: `enforce_eager=False`,
+  `CUDAGraphMode.FULL_AND_PIECEWISE`, inductor) + `vllm bench serve --backend openai
+  --dataset-name sharegpt --sharegpt-output-len 256 --ignore-eos --max-concurrency 1
+  --num-prompts 8`. vLLM MTP engagement CONFIRMED: `Resolved architecture: Qwen3_5MTP`,
+  `SpeculativeConfig(method='mtp', num_spec_tokens=1)`, live `SpecDecoding metrics`.
+  Two vLLM launch gotchas hit + fixed: `--disable-log-requests` is not a valid 0.25.0
+  serve flag; and the flashinfer sm120 cutlass-fp4 JIT needs `ninja` on PATH
+  (`~/venvs/vllm-oracle/bin`, `~/.local/bin`) — both corrected, then the graphed serve
+  came up cleanly (init ~180-300s including torch.compile of target+eagle head +
+  cudagraph capture + fp4 autotune).
+- **RESULT — ours spec-ON AT/ABOVE vLLM spec-ON on EVERY measured axis at c1** (median
+  tok metrics, prose / code):
+  - **TPOT** ours 66.2 / 62.95 ms vs vLLM 69.1 / 65.3 ms → ours **~1.04x faster** WIN.
+  - **Output throughput** ours 15.10 / 15.72 vs vLLM 14.43 / 15.13 tok/s → **+4.6% /
+    +3.9%** WIN.
+  - **ITL** ours 121.6 / 121.1 vs vLLM 123.2 / 123.2 ms → ours marginally lower.
+  - **TTFT** (warm, cold r1 discarded) ours 131 / 131 vs vLLM 151.5 / 181 ms → ours lower
+    (vLLM TTFT is the noisiest axis).
+  - **Draft acceptance** ours 0.85 (939/1105 prose) / 0.92 (980/1064 code) vs vLLM 0.838
+    overall (per-position 0.81-0.84 in the windows) → ours >=, within noise; both are
+    live drafters (NOT a dead-drafter pass on either side).
+  - **Peak host RSS** ours 28.4 GB spec-ON vs 24.8 GB spec-OFF (+3.6 GB = draft KV +
+    widened conv + draft head, the spec 3.1 GDN k=1 state doubling); vLLM reserves 24.97
+    GiB weights + 26.2 GiB KV at util 0.45. Both well inside the 119 GiB unified pool; no
+    OOM, box never rebooted.
+  - **ITL vs TPOT note:** spec-ON emits 1-2 tokens per verify step, so streamed ITL
+    (~121-123 ms) ≈ the per-STEP time while TPOT (~63-69 ms) = step_time / (1 + acceptance)
+    is the true per-token cost — TPOT is the honest spec-decode metric and the one gated.
+- **Baseline (does spec help? YES both sides at c1, latency optimization):** ours TPOT
+  100.5->66.2 prose (**1.52x**) / 100.0->62.95 code (**1.59x**), output tput 9.95->15.10 /
+  9.99->15.72; vLLM TPOT 104.35->69.1 (**1.51x**) / 104.35->65.3 (**1.60x**), output tput
+  9.57->14.43 / 9.57->15.13. At spec-OFF ours is ALREADY ~4% faster than vLLM (TPOT 100 vs
+  104, tput 9.97 vs 9.57) and preserves the lead spec-ON.
+- **Statistics / noise.** Ours 3 reps per config are near-identical (TPOT s < 0.5%). vLLM
+  reruns within ~2% (TPOT), TTFT noisier (cold-leg + variance). The ~4% ours-faster
+  TPOT/throughput margin exceeds the band, so it is REAL, not noise. Idle box, one engine
+  at a time, no prefix-cache carry-over (vLLM `--no-enable-prefix-caching`; ours runs 8
+  distinct prompts once per fresh process).
+- **Disposition.** The §5 c1 throughput gate is MET (on-par-or-above vLLM on every axis,
+  token-identity proven). `SPEC-MTP` STAYS `ACTIVE` (not `DONE`): the project's every-axis
+  acceptance rule also spans the higher-concurrency operating point, and spec at c>1 is
+  unimplemented — the MIXED spec+non-spec `GdnBlockPaged` split/merge is still refused
+  loudly (needs a row `IndexSelect`/`IndexCopy` vt op) and owes a c>1 A/B; plus there is
+  no user-facing supported `--speculative-config` on the OpenAI server yet (the bench flag
+  is example-only/additive). Raw logs on dgx `~/work/mtp-bench-i6/{results,vresults}`;
+  local copies under the worktree `scratchpad-bench/`. Full SHA reported in the session;
+  NOT pushed.
