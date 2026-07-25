@@ -230,6 +230,20 @@ CHECKPOINT-gated (cached NVFP4 quants are text-only, no `visual.*`), not HW/orac
 future M2/M3 image/video token-exact gates vs the 0.25.0 mm oracle bind first. Gemma-4 (+audio)
 is SPIKE/BLOCKED-for-now. No number is claimed here.
 
+**Frontier sweep (Kimi K3 / MiniMax ~M2.7 / GLM latest) - SPIKE ONLY, DESIGN, no gate run (2026-07-25, `CLAIM-SWEEP-FRONTIER-KMG` [spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md)).**
+Disposition: **NO throughput or correctness gate run, nothing built or downloaded (HF API +
+`raw/config.json` metadata + dgx oracle/cache reads only) - PENDING for all rows.** Gating facts:
+**Kimi K3 is ABSENT** from the pin (no arch class); **MiniMax "M2.7" is not an arch** (loads as
+`MiniMaxM2ForCausalLM`; newest registered = M3 `MiniMaxM3Sparse`); **GLM latest** = `Glm4Moe` +
+`GlmMoeDsa` (owned by the GLM/DSA claim). GB10 fit (119 GiB pool): **Kimi-Linear-48B FITS 91.5 GiB
+(0.77x)** = the ONLY frontier model that gets a REAL e2e SACRED gate (one new kernel = the KDA
+gated-delta gate; needs ~10 GiB dgx-disk reclaim). **MiniMax-M2 is HW-blocked at 214.3 GiB fp8-native
+(1.80x over)** - a correction to the matrix's prior wrong "428 GiB bf16 / 4x"; its mechanical port is
+zero-new-kernel so it is honesty-pass gateable (config/loader/unit/build), e2e HW-blocked. **GLM-4.5-Air-FP8
+(104.8 GiB)** is the fitting variant that would yield the first GLM-MoE e2e if fp8-checkpoint loading lands.
+Kimi-K2 (958.5 GiB) / MiniMax-M3 (795.5 GiB + sm100 sparse + multimodal) / GLM-5 (1404 GiB + DSA
+DEP-blocked) are registry/config-resolution only. No number is claimed here.
+
 **GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,
 [spike](../.agents/specs/glm-dsa-latest-deepseek.md)).** The first GLM-family model.

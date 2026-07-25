@@ -136,6 +136,40 @@ model that hand-fuses add+RMSNorm without the catalog unless allowlisted (the 5 
 models are on `fusion-consistency-allowlist.txt`, keeping the gate GREEN while
 blocking new silent bypasses); mutation-tested (10/10). No build, no GPU.
 
+**Frontier-sweep scoping note (2026-07-25, `CLAIM-SWEEP-FRONTIER-KMG`, DONE,
+direct-to-main).** A READ-ONLY per-model MECHANICAL-PORT disposition for the three
+user-named frontier families (Kimi K3 / MiniMax ~M2.7 / GLM latest) — no code,
+build, download, or gate. Recorded as a NOTE (NOT a `SPIKE`/`ACTIVE` matrix row):
+**all three families' rows are already owned by other ACTIVE claims** —
+`MODEL-TEXT-kimi-linear-kimi-linear-for-causal-lm`, `MODEL-TEXT-minimax-m2-mini-max-m2-for-causal-lm` and
+`MODEL-TEXT-minimax-m3-mini-max-m3-sparse-for-causal-lm` by `CLAIM-MLA-DEEPSEEK`;
+`MODEL-TEXT-glm4-moe-glm4-moe-for-causal-lm` (and the GLM/DSA/V4 set) by
+`CLAIM-GLM-DSA-LATEST-DEEPSEEK` — so this note owns ONLY
+`.agents/specs/sweep-kimi-minimax-glm-latest.md` and the record surfaces
+(roadmap breadth block, ledger, state, README, BENCHMARKS single line). It does
+NOT edit any model-matrix row; its corrections are handed to the two owning
+claims as CROSS-REFERENCED input (spec §5), the exact precedent of
+`glm-dsa-latest-deepseek.md` §0.1 vs the MLA campaign. Base `origin/main`
+`39943fc`, isolated worktree, metadata-only (HF API + `raw/config.json` + dgx
+oracle/cache reads). **Gating facts:** **Kimi K3 is ABSENT** from the pin (no
+arch class; the big Kimi MoE loads as `DeepseekV3ForCausalLM`, K2.5=`KimiK25`
+mm); **MiniMax "M2.7" is not an arch** (a ~M2.x ckpt loads as
+`MiniMaxM2ForCausalLM`; newest registered = M3 `MiniMaxM3Sparse`); **GLM latest**
+= `Glm4Moe`/`GlmMoeDsa`. **Fit (119 GiB pool):** Kimi-Linear-48B **FITS 91.5 GiB
+(0.77×)** = the ONLY frontier model with a REAL e2e SACRED gate (reuses MLA +
+sigmoid router + bf16 grouped-MoE + GDN; ONE new kernel = the KDA gated-delta
+gate; needs ~10 GiB dgx-disk reclaim). **★ CORRECTION handed to
+`CLAIM-MLA-DEEPSEEK`:** its MiniMax-M2 row states "~230B / ~428 GiB bf16 / ~4×";
+the checkpoint is **fp8-native, 214.3 GiB, 1.80× over** (no bf16 checkpoint
+exists) — a ZERO-new-kernel port, honesty-pass gateable, e2e HW-blocked.
+**★ To `CLAIM-GLM-DSA-LATEST-DEEPSEEK`:** `Glm4Moe` is 0-new-kernel and
+**GLM-4.5-Air-FP8 (104.8 GiB) FITS** — the fitting variant that would yield the
+first GLM-MoE e2e if fp8-checkpoint loading lands. Kimi-K2 (958.5 GiB) /
+MiniMax-M3 (795.5 GiB + sm100 sparse + multimodal) / GLM-5 (1404 GiB + DSA
+DEP-blocked) = registry/config-resolution only. RANK: Kimi-Linear (real e2e gate)
+> MiniMax-M2 (cheapest, honesty-pass) > `Glm4Moe` (honesty-pass; fp8 fitting
+variant). Did NOT touch any `MODEL-MM-*` row or `multimodal-track.md`. No
+implementation, build, or gate. Not pushed.
 **DFlash readiness-assessment note (2026-07-25, `CLAIM-SPEC-DFLASH-READINESS`,
 DONE, direct-to-main).** A READ-ONLY design + checkpoint-availability pass, not
 implementation. Recorded as a note (NOT a `SPIKE`/`ACTIVE` matrix row — `SPEC-DFLASH`

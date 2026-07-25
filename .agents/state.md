@@ -23109,3 +23109,51 @@ catalog unless allowlisted — the 5 drift stems are allowlisted so the gate is 
 at HEAD while a NEW silent bypass fails and migrating a drift model = removing its
 allowlist line. Coarse per-file floor (not per-site), limitation recorded in the
 spec. Full detail: `.agents/specs/fusion-consistency-audit.md`. Not pushed.
+## 2026-07-25 — FRONTIER SWEEP scoped (Kimi K3 / MiniMax ~M2.7 / GLM latest), `CLAIM-SWEEP-FRONTIER-KMG`
+
+READ-ONLY scoping + per-model MECHANICAL-PORT disposition (no code, build,
+download, or gate). Spec `.agents/specs/sweep-kimi-minimax-glm-latest.md`. Base
+`origin/main` `39943fc`. Oracle: vLLM 0.25.0 on dgx CONSTRUCTS all three arch
+classes (verified `kimi_linear`/`minimax_m2`/`minimax_m3`/`glm4_moe` files +
+`kimi_gdn_linear_attn` kernel present in site-packages).
+
+**User-named versions vs the pin (gating fact):** **Kimi K3 ABSENT** — no arch
+class; the big Kimi MoE loads as `DeepseekV3ForCausalLM`, K2.5 = `KimiK25` (mm).
+**MiniMax "M2.7" is not an arch** — a ~M2.x checkpoint loads as
+`MiniMaxM2ForCausalLM`; the NEWEST registered MiniMax is M3 (`MiniMaxM3Sparse`,
+block-sparse MSA). **GLM latest** = `Glm4Moe` (GLM-4.5/4.6) + `GlmMoeDsa`
+(GLM-5), both owned by `CLAIM-GLM-DSA-LATEST-DEEPSEEK` (we already have `Glm4`
++ `Glm4MoeLite`).
+
+**Fit (HF API + real config.json, 2026-07-25; 119 GiB pool):** Kimi-Linear-48B
+**FITS 91.5 GiB (0.77×)** = the ONLY frontier model with a REAL e2e SACRED gate
+(disk: 91.5 > 82 GiB free → ~10 GiB reclaim). MiniMax-M2 HW-blocked **214.3 GiB
+fp8-native (1.80×)** — CORRECTS the matrix's wrong "428 GiB bf16 / 4×"; there is
+no bf16 M2 checkpoint. Kimi-K2 958.5 GiB fp8 (8.05×), MiniMax-M3 795.5 GiB +
+sm100-sparse + multimodal (6.68×), GLM-5 1404 GiB + DSA-DEP-blocked → all
+registry/config-resolution only.
+
+**Reuse-vs-new + ranking (mechanical portability + gateability):**
+1) **Kimi-Linear-48B** — reuses MLA (`q_lora=null` DeepSeek-V2-Lite branch),
+   sigmoid+routed_scaling MoE router, bf16 grouped-MoE + shared expert, GDN base;
+   ONE genuinely-new kernel = the **KDA gated-delta gate** (`fused_kda_gate` +
+   `FusedRMSNormGated` + per-q/k/v conv + `dt_bias`) with its own unit gate;
+   `mla_use_nope` = a small MLA config branch. IMPLEMENTABLE-ADDITIVE-e2e — DO
+   FIRST (only real gate). 2) **MiniMax-M2** — ZERO new kernels (full softmax GQA
+   + partial rope + QK-norm + sigmoid/routing-bias MoE 256/top-8 + block-128 fp8
+   loading; NO lightning attention — M2 dropped it after M1), HONESTY-PASS-BLOCKED
+   (HW). 3) **`Glm4Moe`** — 0 new kernels; **GLM-4.5-Air-FP8 104.8 GiB fitting
+   variant** would be first GLM-MoE e2e if fp8-checkpoint loading lands (deferred
+   to the GLM claim).
+
+**Honesty-pass gate set (substitutes for HW-blocked e2e):** (A) config/registry
+resolution from real config.json (no GPU); (B) loader weight-map coverage on ONE
+shard (zero unmapped/missing, correct shapes); (C) unit parity of the
+genuinely-new ops at real dims vs CPU ref / dumped vLLM tensor; (D) clean
+`-Werror` build. Recorded as "architecture ported + unit/loader/config-gated;
+e2e HW-blocked (N GiB over pool)" — NEVER a claimed SACRED pass.
+
+**Coordination:** owns the spec + the formally-unowned MiniMax-M2 row (status-text
+correction). Kimi-Linear (owned by `CLAIM-MLA-DEEPSEEK`) and `Glm4Moe` (owned by
+`CLAIM-GLM-DSA-LATEST-DEEPSEEK`) NOT edited — corrections handed to those claims
+(spec §5). No `MODEL-MM-*` / `multimodal-track.md` touched. Records only; NOT pushed.

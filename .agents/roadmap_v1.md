@@ -106,6 +106,20 @@ one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay
 MoE/SSM campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no
 0.25.0 oracle.
 
+**FRONTIER SWEEP SCOPED (2026-07-25, [sweep-kimi-minimax-glm-latest.md](specs/sweep-kimi-minimax-glm-latest.md),
+`CLAIM-SWEEP-FRONTIER-KMG`):** the three user-named frontier families dispositioned as ACTIONABLE
+MECHANICAL PORTS (honesty-pass gates substitute for HW-blocked e2e). User-named versions vs the pin:
+**Kimi K3 ABSENT** (no arch class; big Kimi MoE loads as `DeepseekV3ForCausalLM`); **MiniMax "M2.7"
+not an arch** (loads as `MiniMaxM2ForCausalLM`; newest registered = M3 `MiniMaxM3Sparse`); **GLM latest**
+= `Glm4Moe`/`GlmMoeDsa` (owned by the GLM/DSA claim). Ranked: (1) **Kimi-Linear-48B FITS GB10
+(91.5 GiB, 0.77× pool)** = the ONLY frontier model with a REAL e2e SACRED gate — reuses MLA + sigmoid
+router + bf16 grouped-MoE + GDN base, ONE genuinely-new kernel (the **KDA gated-delta gate**), needs
+~10 GiB dgx-disk reclaim; (2) **MiniMax-M2** HW-blocked (**214.3 GiB fp8-native, 1.80× over** — corrects
+the matrix's wrong "428 GiB bf16/4×"), ZERO-new-kernel port → honesty-pass; (3) **`Glm4Moe`** 0-new-kernel,
+honesty-pass at bf16, with **GLM-4.5-Air-FP8 (104.8 GiB) the fitting variant** that jumps the queue to a
+real e2e gate if fp8-checkpoint loading lands. Kimi-K2 (958.5 GiB) / MiniMax-M3 (795.5 GiB + sm100 sparse
++ multimodal) / GLM-5 (1404 GiB + DSA DEP-blocked) = registry/config-resolution only.
+
 ## Top-level portfolio
 
 This is the single ordered roadmap table. Detailed capability/status rows live
