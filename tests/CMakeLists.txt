@@ -134,6 +134,12 @@ vllm_cpp_add_test(test_qwen3vl_tower vllm/multimodal/test_qwen3vl_tower.cpp)
 target_compile_definitions(test_qwen3vl_tower PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
   TOWER_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_tower")
+# Multimodal M2b/M2c text-backbone unit gates: MRoPE get_rope_index, 3-section
+# rope application (vt::RopeFromCache), DeepStack scatter, and embed-merge —
+# BIT/near-exact vs the dumped vLLM 0.25.0 reference (CPU-only, no weights).
+vllm_cpp_add_test(test_qwen3vl_text vllm/multimodal/test_qwen3vl_text.cpp)
+target_compile_definitions(test_qwen3vl_text PRIVATE
+  TEXT_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_text")
 # Multimodal M1 encoder-cache manager (inert-when-off engine seam).
 vllm_cpp_add_test(test_encoder_cache_manager vllm/v1/core/test_encoder_cache_manager.cpp)
 # LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip

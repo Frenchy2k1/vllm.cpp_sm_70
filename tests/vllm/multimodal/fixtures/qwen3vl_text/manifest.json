@@ -1,0 +1,148 @@
+{
+  "model_id": "Qwen/Qwen3-VL-4B-Instruct",
+  "refs": {
+    "rope_index_positions_i32": {
+      "shape": [
+        3,
+        204
+      ],
+      "dtype": "int32",
+      "sha256": "e9237b1a8061404b3a8b201d28636e097cefa9e554b6152fadaa1d374a6ad239",
+      "file": "rope_index_positions_i32.bin",
+      "note": "vLLM _get_mrope_input_positions [3,T] int32"
+    },
+    "rope_cos_sin_cache_f32": {
+      "shape": [
+        22,
+        128
+      ],
+      "dtype": "float32",
+      "sha256": "520c7c41b86c63fff37b70373d24ad63c9754472fcbaf24a69e3683f54971dab",
+      "file": "rope_cos_sin_cache_f32.bin",
+      "note": "MRotaryEmbedding cos_sin_cache[0:22] (bf16->f32) [Pmax,rotary_dim]"
+    },
+    "rotary_q_in_f32": {
+      "shape": [
+        204,
+        512
+      ],
+      "dtype": "float32",
+      "sha256": "1c7e5f1840d48c9b77bbe55829a98a5ba95785c0901e72376db343e1dc9626e9",
+      "file": "rotary_q_in_f32.bin",
+      "note": "seeded q [T, Hq*Dh] bf16->f32"
+    },
+    "rotary_k_in_f32": {
+      "shape": [
+        204,
+        256
+      ],
+      "dtype": "float32",
+      "sha256": "a044c7f48e5b153cbf05d2f4d1c701c4b10019b817937e7b0146ab3ae199f43c",
+      "file": "rotary_k_in_f32.bin",
+      "note": "seeded k [T, Hkv*Dh] bf16->f32"
+    },
+    "rotary_q_out_f32": {
+      "shape": [
+        204,
+        512
+      ],
+      "dtype": "float32",
+      "sha256": "f0342a95c0dee040697b4b17f68bb73415a8b19cf8dc6e05e79cf87b4b058bab",
+      "file": "rotary_q_out_f32.bin",
+      "note": "vLLM MRoPE q_out [T, Hq*Dh]"
+    },
+    "rotary_k_out_f32": {
+      "shape": [
+        204,
+        256
+      ],
+      "dtype": "float32",
+      "sha256": "538974cf402bd8de67458fc3b44e2c702b8b8101f3923df2ade676c5f271d566",
+      "file": "rotary_k_out_f32.bin",
+      "note": "vLLM MRoPE k_out [T, Hkv*Dh]"
+    },
+    "deepstack_multiscale_f32": {
+      "shape": [
+        196,
+        48
+      ],
+      "dtype": "float32",
+      "sha256": "d56d50891ef78a5552688c8ef77f2d6aace8dfafd831a4cdf55059a159b50766",
+      "file": "deepstack_multiscale_f32.bin",
+      "note": "seeded multiscale [N, n_deepstack*H]"
+    },
+    "deepstack_out_f32": {
+      "shape": [
+        3,
+        204,
+        16
+      ],
+      "dtype": "float32",
+      "sha256": "8ea85c4407033d689273b873110663215c514b85312a7f3004b225b0eaf1b05e",
+      "file": "deepstack_out_f32.bin",
+      "note": "[n_deepstack, T, H] scattered"
+    },
+    "merge_main_f32": {
+      "shape": [
+        196,
+        16
+      ],
+      "dtype": "float32",
+      "sha256": "859962f3cf3ac33774b6c39b698eeee68311937dcd8fc1306ce35b68d2a3225c",
+      "file": "merge_main_f32.bin",
+      "note": "seeded visual main embeds [N,H]"
+    },
+    "merge_text_f32": {
+      "shape": [
+        204,
+        16
+      ],
+      "dtype": "float32",
+      "sha256": "6328e1c9b38a7a9d68d64d1ae22dca57897f4e74e896969ce236a42b078e508e",
+      "file": "merge_text_f32.bin",
+      "note": "seeded text embeds [T,H]"
+    },
+    "merge_out_f32": {
+      "shape": [
+        204,
+        16
+      ],
+      "dtype": "float32",
+      "sha256": "24e70d19520488eb7b140b1585a5267ad507e827f2598e5c761b85f50101d3a2",
+      "file": "merge_out_f32.bin",
+      "note": "_merge_multimodal_embeddings result [T,H]"
+    }
+  },
+  "config": {
+    "hidden_size": 2560,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "rope_theta": 5000000.0,
+    "mrope_section": [
+      24,
+      20,
+      20
+    ],
+    "mrope_interleaved": true,
+    "out_hidden_size": 2560,
+    "n_deepstack": 3,
+    "image_token_id": 151655,
+    "video_token_id": 151656,
+    "vision_start_token_id": 151652,
+    "vision_end_token_id": 151653,
+    "spatial_merge_size": 2
+  },
+  "T": 204,
+  "N_visual": 196,
+  "test_dims": {
+    "Hq_t": 4,
+    "Hkv_t": 2,
+    "Dh": 128,
+    "Ht": 16
+  },
+  "is_multimodal_first_last": [
+    1,
+    196
+  ]
+}
