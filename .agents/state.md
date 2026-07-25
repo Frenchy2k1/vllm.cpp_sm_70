@@ -23236,3 +23236,60 @@ Golden committed: `tests/vllm/multimodal/fixtures/qwen3vl_text/gen_tokens_i32.bi
 sha256 `3ec5f2b7…`; text "This image appears to be a **noise pattern** or **static** …" — vLLM
 correctly reads the np.random-noise fixture). This retires the gate-form question the M2c wire-up
 inherits: it must match these 32 tokens EXACTLY. NEXT: build the VL forward and gate STRICT vs this golden.
+
+## 2026-07-25 — MULTIMODAL M2c: Qwen3-VL e2e IMAGE forward, STRICT gate PASS 32/32 (M2 CLOSED, `CLAIM-MULTIMODAL-M2C`)
+
+**MILESTONE — first multimodal capability in the tree.** The forked Qwen3-VL VL
+decode is wired into a running forward and the STRICT end-to-end image→text gate
+PASSES on Qwen3-VL-4B: our full pipeline greedy tokens == the committed vLLM
+0.25.0 golden **32/32 token-for-token** on the fixture (image, "What is in this
+image?"). Base `origin/main` `1cd5710`, branch `feat/mm-m2c-e2e`. NOT pushed.
+
+**What landed (ADDITIVE — text SACRED byte-identical by construction):**
+- `include/vllm/model_executor/models/qwen3_vl.h` + `src/vllm/model_executor/models/qwen3_vl.cpp`:
+  `LoadQwen3VLWeights` (remap `model.language_model.*` onto the landed Qwen3-dense
+  bf16 loader helpers + `model.visual.*` bf16→f32 into the M2a tower) and
+  `Qwen3VLGenerateGreedy` (forked greedy decode: embed ids →
+  `Qwen3VLMergeMultimodal` scatter of the tower merger `[:, :2560]` into image rows
+  → 3-section MRoPE via `vt::RopeFromCache` over a global absolute-position cos|sin
+  cache + positions `[3,T]` → DeepStack add after decoder layers 0/1/2 → the
+  byte-identical dense preamble (per-head q/k RMSNorm, paged FA2, SwiGLU via the
+  shared `dense_attn` glue + LinearMethod seam) → tied lm_head → paged greedy with
+  MRoPE decode positions `idx+delta`).
+- `tests/vllm/multimodal/test_qwen3vl_e2e.cpp`: the STRICT e2e gate (dgx-only).
+- `scripts/mm/m2c_e2e_inputs.py` + fixture `input_ids_i32.bin` (212 tokens, 196
+  image at offset 4 — vLLM's exact prompt_token_ids; the tokenizer text path is out
+  of M2c's numeric scope).
+- **One M2a fix** `src/vllm/model_executor/models/qwen3_vl_vision.cpp`: the
+  `cap==nullptr` DeepStack concat was an explicit deferred-to-M2c STUB (deepstack
+  merger features were only stashed on the capture struct, so the no-capture e2e
+  concat read empty vectors → host OOB SIGSEGV). Completed via a local `ds_features`
+  vector populated regardless of capture; the M2a capture output is byte-identical
+  (`cap->deepstack_out` still receives the same bytes).
+
+**RCA of the only failure encountered:** initial run SIGSEGV'd in
+`Qwen3VLVisionForward` (`__memcpy_sve`). All weight/pixel sizes verified correct;
+the crash was the deferred `cap==nullptr` DeepStack stub above (a host OOB, not a
+GPU or numeric bug). After the one-line-family fix, the STRICT gate passed exactly,
+FIRST TRY — the M2a bf16-envelope drift (tower rel-L2 ~5e-2) did NOT flip any
+argmax, so NO near-tie fallback was needed. Generated text: "This image appears to
+be a **noise pattern** or **static**…" (correct read of the random-noise fixture).
+
+**Verification (dgx, CUDA sm_121a, cutlass-ON `-DVLLM_CPP_CUTLASS_DIR` +
+`-DVLLM_CPP_TRITON=ON` + `-DCMAKE_CUDA_ARCHITECTURES=121a`, Release):**
+- STRICT e2e image gate `test_qwen3vl_e2e` 32/32 (46 assertions) RC 0.
+- Text-inertness SACRED regressions STANDALONE under `flock`: Coder 138/138 RC 0;
+  27B 235/235 + 35B 315/315 (`test_qwen36_paged_engine`) [see run log].
+- Clean CUDA `-Werror` 0 warnings; new GPU compute = only pre-existing kernels
+  (MatmulBT/RmsNorm/RopeFromCache-mrope/PagedAttention/Add/SiluAndMul); M2a tower was
+  compute-sanitizer-0 at M2a and the M2c fix is host-side only.
+- `benchmark_binding=false`, SPEED PENDING (row stays `PARTIAL` until every-axis
+  vLLM parity).
+
+**Records advanced:** model-matrix (Qwen3-VL row → IMAGE e2e WORKING), roadmap
+`ROAD-V1-MM` (M2 CLOSED, M3 next), coordination `CLAIM-MULTIMODAL-M2C`, ledger,
+README, `docs/BENCHMARKS.md`, `multimodal-track.md` (M2 CLOSED).
+
+**NEXT (M3):** Qwen3.6-27B image reusing this tower+backbone+loader on the
+GDN-hybrid backbone (needs a vision-inclusive checkpoint — cached NVFP4 quants are
+text-only), then video.

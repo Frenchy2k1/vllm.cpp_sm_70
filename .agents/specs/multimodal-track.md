@@ -295,7 +295,7 @@ every one.
       |
  M1  mm INPUT pipeline + encoder-cache engine seam     [CRITICAL PATH, foundation]
       |
- M2  first vision TOWER + merge on Qwen3-VL-4B -> IMAGE gate   [CRITICAL PATH]
+ M2  first vision TOWER + merge on Qwen3-VL-4B -> IMAGE gate   [CLOSED 2026-07-25: STRICT 32/32]
       |
  M3  complete Qwen3.6 IMAGE (reuse M2 tower) -> then VIDEO     [CRITICAL PATH -> user's target]
       |
@@ -401,7 +401,25 @@ scope audit found the LLM side is NOT the landed plain Qwen3-dense (it needs MRo
   q/k rel-L2 1.5e-3 (RED interleaved-off >5e-2), DeepStack + merge BIT-exact.
   Additive-only ⇒ text SACRED byte-identical by construction. The FORKED VL decode
   (inputs_embeds + MRoPE + DeepStack inject in a running forward) is part of M2c below.
-- **M2c — merge + e2e IMAGE gate.** `Qwen3VLMergeMultimodal` masked scatter
+- **M2c — merge + e2e IMAGE gate. [LANDED 2026-07-25, `CLAIM-MULTIMODAL-M2C`, M2 CLOSED].**
+  The forked VL decode is wired and the STRICT e2e image gate PASSES: our full
+  pipeline greedy tokens == the committed vLLM 0.25.0 golden **32/32 token-exact**
+  on Qwen3-VL-4B (fixture image + "What is in this image?"). Built `src/vllm/
+  model_executor/models/qwen3_vl.{h,cpp}`: the VL weight loader (`model.language_model.*`
+  onto the landed Qwen3-dense bf16 helpers + `model.visual.*` into the M2a tower) +
+  the forked greedy decode (embed text ids → `Qwen3VLMergeMultimodal` scatter of the
+  tower merger `[:, :2560]` into image rows → 3-section MRoPE via `vt::RopeFromCache`
+  over a global absolute-position cos|sin cache + positions `[3,T]` → DeepStack add
+  after decoder layers 0/1/2 → paged greedy, MRoPE decode positions = `idx+delta`).
+  Gate `tests/vllm/multimodal/test_qwen3vl_e2e.cpp` (dgx-only) + input-ids fixture
+  `scripts/mm/m2c_e2e_inputs.py`. RCA (one bug fixed): the M2a tower's `cap==nullptr`
+  DeepStack concat path was an explicit deferred-to-M2c stub (deepstack features were
+  only stashed on the capture struct) → completed in `qwen3_vl_vision.cpp` (M2a
+  capture output byte-identical). No near-tie needed: the STRICT gate passed exactly,
+  first try after the stub fix — the M2a bf16-envelope drift did NOT flip any argmax.
+  **M3 next:** Qwen3.6-27B image reusing this tower+backbone+loader on the GDN-hybrid
+  backbone, then video. HISTORICAL M2c pre-wire notes below.
+- **M2c (pre-wire, superseded by LANDED above).** `Qwen3VLMergeMultimodal` masked scatter
   (`_merge_multimodal_embeddings`, `utils.py:524-545`) of the tower's `[:, :2560]` into
   `input_embeds` is UNIT-GREEN (BIT-exact, landed with M2b). **REMAINING:** the
   `visual.*`/`language_model.*` weight loading (a name-remap over the landed
