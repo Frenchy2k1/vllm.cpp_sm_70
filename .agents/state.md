@@ -23228,3 +23228,11 @@ REMAINING (M2c e2e — NOT built): the VL weight loader (`model.language_model.*
 CommonAttentionMetadata) → the image token-exact gate vs vLLM 0.25.0 on Qwen3-VL-4B. RISK: the M2a tower is
 bf16-envelope faithful (rel-L2 ~5e-2), so a deterministic vLLM near-tie could flip the argmax — gate form is
 "by measurement" (vLLM K=5 self-determinism), distributional fallback only if measured. NEXT: build the e2e forward.
+
+**M2c GATE-FORM MEASURED + GOLDEN CAPTURED (2026-07-25, same claim).** `scripts/mm/m2c_e2e_golden.py`
+on dgx under `flock`: vLLM 0.25.0 greedy `enforce_eager` on the fixed (image, prompt) for Qwen3-VL-4B
+is DETERMINISTIC across K=5 (first_divergence=None) → the M2c e2e image gate is **STRICT token-exact**.
+Golden committed: `tests/vllm/multimodal/fixtures/qwen3vl_text/gen_tokens_i32.bin` (32 greedy tokens,
+sha256 `3ec5f2b7…`; text "This image appears to be a **noise pattern** or **static** …" — vLLM
+correctly reads the np.random-noise fixture). This retires the gate-form question the M2c wire-up
+inherits: it must match these 32 tokens EXACTLY. NEXT: build the VL forward and gate STRICT vs this golden.
