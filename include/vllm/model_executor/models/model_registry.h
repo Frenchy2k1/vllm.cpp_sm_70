@@ -29,6 +29,15 @@ struct GdnStateCache;
 struct PagedKvCache;
 struct Qwen3_5DenseWeights;
 struct Qwen3_5MoeWeights;
+// SPEC-MTP I5d-pre: the checkpoint-owned MTP draft weights, the drafter's
+// hidden-state carrier, and the draft model wrapper (all defined in
+// qwen3_5_mtp.h). Forward-declared here so the type-erased LoadedModel can
+// expose a typed path to the draft (BuildMtpDraft) and a hidden-state tap
+// out-field WITHOUT pulling the MTP header — or any concrete weight type — into
+// this shared registry seam. Inert unless speculative decoding is configured.
+struct Qwen3_5MTPWeights;
+struct Qwen3_5MTPHiddenStates;
+class Qwen3_5MTPModel;
 
 namespace v1 {
 struct CommonAttentionMetadata;
@@ -92,6 +101,32 @@ class LoadedModel {
   // instances of a W4A4-capable family may contain only BF16 weights.
   virtual bool uses_nvfp4_w4a4() const { return false; }
 
+  // ── SPEC-MTP I5d-pre: typed access to the MTP draft, without breaking the
+  //    type-erasure of this base. Only the concrete Qwen3.5 dense/MoE
+  //    LoadedModel (which owns the target Qwen3_5DenseWeights/Qwen3_5MoeWeights)
+  //    can retain the loaded `mtp.*` weights and construct the draft that shares
+  //    the target's embed_tokens/lm_head (qwen3_5_mtp.h:61-66). Every default
+  //    below is the non-MTP behavior: no support, and BuildMtpDraft yields null.
+  //    All of this is unreachable on the production default path (no
+  //    SpeculativeConfig ⇒ FromModelDir never attaches MTP weights), so the
+  //    engine is byte-identical when speculative decoding is off. ──────────────
+
+  // Whether this concrete model can hold MTP draft weights and build the draft.
+  virtual bool supports_mtp_draft() const { return false; }
+
+  // Retain the checkpoint's loaded `mtp.*` draft weights (the 15/19 BF16 tensors
+  // LoadQwen3_5MTP produced) inside the concrete model so the draft can be built
+  // on demand with a stable lifetime. Default: unsupported (throws), because a
+  // non-MTP architecture has nowhere valid to put them.
+  virtual void AttachMtpDraftWeights(Qwen3_5MTPWeights weights);
+
+  // Construct the Qwen3_5MTPModel draft from the retained MTP weights + this
+  // model's own target weights. Returns null when no MTP weights were attached
+  // or the architecture is not an MTP target. The returned draft borrows this
+  // model's weights/config, so it must not outlive this LoadedModel.
+  virtual std::unique_ptr<Qwen3_5MTPModel> BuildMtpDraft(
+      const HfConfig& config) const;
+
  protected:
   explicit LoadedModel(const ModelRegistration& registration)
       : registration_(registration) {}
@@ -117,6 +152,14 @@ struct ModelForwardInput {
   int64_t gdn_state_slots = 0;
   bool pure_decode = false;
   bool gather_logits = true;
+  // SPEC-MTP I5d-pre hidden-state tap. When non-null (only the spec verify
+  // forward sets it, I5d), the Qwen3.5 dense/MoE forward routes to
+  // Qwen3_5{,Dense}Model::ForwardDeviceTap, which returns byte-identical logits
+  // AND moves the full [num_actual_tokens, H] post-final-norm hidden into
+  // `*hidden_tap` for the MTP drafter. When null (every spec-off run) the
+  // forward takes the current ModelRegistry::Forward path and is byte-identical.
+  // Models other than Qwen3.5 ignore this field.
+  Qwen3_5MTPHiddenStates* hidden_tap = nullptr;
 };
 
 using ModelConfigHook = void (*)(const HfConfig& config);

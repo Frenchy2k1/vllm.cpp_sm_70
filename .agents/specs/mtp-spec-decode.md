@@ -653,6 +653,50 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
     `test_mtp_speculator.cpp` cases. DEFAULT-OFF INERT; the shared-`qwen3_5.cpp`
     SACRED gates (27B/35B/Coder) re-run and pass byte-identically. `SPEC-MTP` STAYS
     `GATING` (the runner loop + e2e token gate are I5d).
+  - **I5d-pre — registry/forward-seam enabling refactor. LANDED 2026-07-25
+    (`CLAIM-SPEC-MTP-I5D-PRE`).** A scoping pass found the model seam is fully
+    TYPE-ERASED, so the runner cannot reach the concrete target weights, the
+    hidden-state tap, or the loaded MTP weights the I5d verify/propose loop needs.
+    This increment adds those access paths as ADDITIVE, INERT-WHEN-SPEC-OFF changes
+    (no spec loop — that is I5d), plus one latent-bug fix. FOUR seam changes:
+    (1) **hidden-tap out-field** on the type-erased `ModelForwardInput`
+    (`include/vllm/model_executor/models/model_registry.h:106-133`): a
+    `Qwen3_5MTPHiddenStates* hidden_tap = nullptr`; the Qwen3.5 dense + MoE
+    `ModelForwardFn` (`qwen3_5_dense.cpp` / `qwen3_5_moe.cpp` `ForwardQwen3_5{Dense,Moe}`)
+    route to the EXISTING `Qwen3_5{,Dense}Model::ForwardDeviceTap` when it is
+    non-null, else the current path — byte-identical when null (every spec-off run);
+    other models ignore the field. (2) **draft-construction access on `LoadedModel`**
+    (`model_registry.h:95-131` + `model_registry.cpp`): a virtual `BuildMtpDraft(config)`
+    that constructs the `Qwen3_5MTPModel` draft from the retained MTP weights + this
+    model's own target weights (only the concrete `Qwen3_5{Dense,Moe}LoadedModel` can;
+    default returns null for non-MTP), plus `AttachMtpDraftWeights` to retain them and
+    `supports_mtp_draft()`. (3) **MTP weight loading + shard retention in
+    `FromModelDir`** (`src/vllm/entrypoints/model_loader.cpp`): when
+    `EngineParams::speculative_config` is an MTP config, `FromModelDir` calls
+    `LoadQwen3_5MTP(*shards, config, kind)` while the local `shards` shared_ptr is
+    still alive (the dense direct-device-load path releases shards post-load) and
+    attaches them to the model; GGUF + MTP is rejected (no `mtp.*` in GGUF); spec
+    unset ⇒ load path unchanged. (4) **runner ctor widening + the LATENT
+    full-attn-group bug** (`include/vllm/v1/worker/gpu/runner.h`,
+    `src/vllm/v1/worker/gpu/runner.cpp`): the `GPUModelRunner` ctor is widened with
+    optional draft model + draft KV cache + `SpeculativeConfig` (defaulted/nullopt →
+    today's behavior at every existing construction site + runner test). **LATENT-BUG
+    FIX:** `initialize_kv_cache` assigned `full_attn_group_id_` to the LAST
+    `kFullAttention` group; with a third `fa_draft` group (`num_spec>0`) it would
+    wrongly select `fa_draft`. Now it selects the TARGET group deterministically — the
+    FIRST (index 0) non-eagle full-attn/MLA group — so a later-appended draft group
+    can never displace it. With `num_spec==0` (every run today) there is exactly one
+    full-attn group, so the fix is BYTE-IDENTICAL now (proven RED-first: the buggy
+    last-wins loop reports group 2 with a synthetic third `fa_draft` group, the fix
+    reports 0). Unit coverage (RED-first): the hidden-tap out-field captures the
+    post-final-norm `[T,H]` and is byte-identical on logits
+    (`test_qwen27_paged_forward.cpp`); `BuildMtpDraft` returns a valid draft for a
+    Qwen3.5 target and null for a non-MTP model
+    (`test_mtp_speculator.cpp`); the `full_attn_group_id_` selection picks the target
+    group with a synthetic third `fa_draft` group present, unmarked and eagle-marked
+    (`test_runner.cpp`). DEFAULT-OFF INERT throughout; `SPEC-MTP` STAYS `GATING` — this
+    is the enabling seam, NOT the spec loop and NOT any e2e result. `benchmark_binding=false`,
+    no speed claim.
   - **I5d — config plumbing + runner loop + the three-way 27B token gate.**
     `--speculative-config` parse + arch resolve; wire the speculator into the
     runner (`take_draft_token_ids`, `propose` post-sampling, the

@@ -15,6 +15,7 @@
 
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
+#include "vllm/config/speculative.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -74,6 +75,17 @@ struct EngineParams {
   // extra_config, and wires it to BOTH the scheduler (prefix lookup / prefill
   // shortcut) and the runner (worker-side KV store/load).
   std::optional<vllm::KVTransferConfig> kv_transfer_config = std::nullopt;
+
+  // SPEC-MTP I5d-pre: opt-in speculative-decoding configuration. Empty/absent
+  // (default) == NO speculation == byte-identical production engine (mirrors
+  // vLLM's --speculative-config being unset). When set to an MTP config,
+  // FromModelDir additionally loads the checkpoint's `mtp.*` draft weights
+  // (LoadQwen3_5MTP) and retains them on the loaded model so the runner has a
+  // typed path to build the draft (LoadedModel::BuildMtpDraft). The verify /
+  // propose runner loop and --speculative-config CLI parsing are I5d; this field
+  // only enables the seam. Non-safetensors (GGUF) checkpoints lack `mtp.*`, so an
+  // MTP config over a GGUF source is rejected.
+  std::optional<vllm::SpeculativeConfig> speculative_config = std::nullopt;
 };
 
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +

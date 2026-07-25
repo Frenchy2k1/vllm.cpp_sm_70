@@ -460,6 +460,48 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
   CHECK(gs.conv_state.shape[2] == c.linear_conv_kernel_dim - 1);
 }
 
+// SPEC-MTP I5d-pre LATENT-BUG FIX: with a THIRD `fa_draft` full-attention group
+// (as MakeQwen3_5KVCacheSpec appends when num_spec>0), the runner must still
+// select the TARGET full-attn group (index 0), NOT the last full-attn group.
+// RED-first: the pre-fix loop kept the last kFullAttention group, so this would
+// report 2 (the draft) instead of 0.
+TEST_CASE("runner: full-attn group selection ignores a third fa_draft group") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const int Hkv = static_cast<int>(c.num_key_value_heads);
+  const int Dh = static_cast<int>(c.head_dim);
+
+  // fa(0), gdn(1), fa_draft(2) — the draft KV layer is a second full-attn group
+  // appended after the target's, exactly as the num_spec>0 spec does.
+  SUBCASE("draft group unmarked (first-wins selection)") {
+    KVCacheConfig kv = MakeKvConfig(c);
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"fa_draft"},
+        std::make_shared<FullAttentionSpec>(kBlockSize, Hkv, Dh,
+                                            vllm::v1::ResolveKvCacheDType()));
+    REQUIRE(kv.kv_cache_groups.size() == 3);
+    GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                          /*max_num_batched_tokens=*/64);
+    CHECK(runner.full_attn_group_id() == 0);  // target, not the fa_draft at 2.
+    CHECK(runner.gdn_group_id() == 1);
+  }
+
+  // Even if a future change marks the draft group as an eagle group, the
+  // by-role skip keeps the target selected.
+  SUBCASE("draft group marked eagle (by-role skip)") {
+    KVCacheConfig kv = MakeKvConfig(c);
+    kv.kv_cache_groups.emplace_back(
+        std::vector<std::string>{"fa_draft"},
+        std::make_shared<FullAttentionSpec>(kBlockSize, Hkv, Dh,
+                                            vllm::v1::ResolveKvCacheDType()),
+        /*is_eagle_group=*/true);
+    GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                          /*max_num_batched_tokens=*/64);
+    CHECK(runner.full_attn_group_id() == 0);
+    CHECK(runner.gdn_group_id() == 1);
+  }
+}
+
 TEST_CASE("runner: MambaSpec is the allocation source of truth") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);

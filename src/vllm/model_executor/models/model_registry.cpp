@@ -24,6 +24,10 @@
 // ForwardLogits (the type-erased forward-result carrier) is defined here; its
 // complete definition is required for ModelRegistry::Forward's by-value return.
 #include "vllm/model_executor/models/qwen3_5.h"
+// SPEC-MTP I5d-pre: Qwen3_5MTPWeights / Qwen3_5MTPModel complete types for the
+// LoadedModel base defaults of AttachMtpDraftWeights / BuildMtpDraft (the
+// non-MTP behavior — throw / return null).
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
 
 namespace vllm {
 namespace {
@@ -154,6 +158,20 @@ const ModelRegistration& RegistrationFor(std::string_view architecture) {
 }
 
 LoadedModel::~LoadedModel() = default;
+
+// SPEC-MTP I5d-pre base defaults: a non-MTP architecture cannot retain draft
+// weights and builds no draft. The concrete Qwen3.5 dense/MoE models override
+// both (qwen3_5_dense.cpp / qwen3_5_moe.cpp).
+void LoadedModel::AttachMtpDraftWeights(Qwen3_5MTPWeights /*weights*/) {
+  throw std::runtime_error(
+      "model does not support MTP draft weights (no speculative-decoding draft "
+      "head for this architecture)");
+}
+
+std::unique_ptr<Qwen3_5MTPModel> LoadedModel::BuildMtpDraft(
+    const HfConfig& /*config*/) const {
+  return nullptr;
+}
 
 ModelSource ModelSource::FromSafetensors(
     const std::vector<SafetensorsFile>& shards, vt::Queue* load_queue) {
