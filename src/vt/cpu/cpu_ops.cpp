@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -1526,6 +1527,47 @@ void GdnStateScatterKernel(Queue&, Tensor& cache, const Tensor& working,
   });
 }
 
+// Row gather over dim 0: out[i,...] = in[idx[i],...] (torch index_select).
+// dtype-agnostic byte copy per row; the base (in) may carry an outer row stride.
+void IndexSelectKernel(Queue&, Tensor& out, const Tensor& in,
+                       const Tensor& idx) {
+  const int64_t rows = idx.shape[0];
+  if (rows == 0) return;
+  const int32_t* ix = idx.Ptr<int32_t>();
+  const int64_t inner = out.Numel() / rows;                 // packed row elems
+  const size_t esz = SizeOf(out.dtype);
+  const size_t row_bytes = static_cast<size_t>(inner) * esz;
+  const int64_t in_row_stride = in.stride[0];               // elements
+  auto* dst = static_cast<char*>(out.data);
+  const auto* src = static_cast<const char*>(in.data);
+  for (int64_t i = 0; i < rows; ++i) {
+    VT_CHECK(ix[i] >= 0 && ix[i] < in.shape[0],
+             "index_select: idx out of range");
+    std::memcpy(dst + static_cast<size_t>(i) * row_bytes,
+                src + static_cast<size_t>(ix[i]) * static_cast<size_t>(in_row_stride) * esz,
+                row_bytes);
+  }
+}
+
+// Row scatter over dim 0: out[idx[i],...] = in[i,...] (torch index_copy_).
+void IndexCopyKernel(Queue&, Tensor& out, const Tensor& in, const Tensor& idx) {
+  const int64_t rows = idx.shape[0];
+  if (rows == 0) return;
+  const int32_t* ix = idx.Ptr<int32_t>();
+  const int64_t inner = in.Numel() / rows;
+  const size_t esz = SizeOf(in.dtype);
+  const size_t row_bytes = static_cast<size_t>(inner) * esz;
+  const int64_t out_row_stride = out.stride[0];             // elements
+  auto* dst = static_cast<char*>(out.data);
+  const auto* src = static_cast<const char*>(in.data);
+  for (int64_t i = 0; i < rows; ++i) {
+    VT_CHECK(ix[i] >= 0 && ix[i] < out.shape[0],
+             "index_copy: idx out of range");
+    std::memcpy(dst + static_cast<size_t>(ix[i]) * static_cast<size_t>(out_row_stride) * esz,
+                src + static_cast<size_t>(i) * row_bytes, row_bytes);
+  }
+}
+
 // Grouped-topk (`noaux_tc`) router — the CPU REFERENCE and the executable spec
 // for the DeepSeek router. 1:1 port of
 // vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:106-161
@@ -2145,6 +2187,12 @@ struct Registrar {
         OpId::kGdnStateScatter, DeviceType::kCPU,
         reinterpret_cast<void*>(
             static_cast<GdnStateScatterFn>(&GdnStateScatterKernel)));
+    RegisterOp(OpId::kIndexSelect, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<IndexSelectFn>(&IndexSelectKernel)));
+    RegisterOp(OpId::kIndexCopy, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<IndexCopyFn>(&IndexCopyKernel)));
     RegisterOp(OpId::kMoeRouterTopK, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernel)));
     RegisterOp(OpId::kMoeCombine, DeviceType::kCPU,

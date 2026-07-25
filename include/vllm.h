@@ -53,8 +53,11 @@ extern "C" {
  * v4: tool_parser field appended to vllm_model_params — selects the tool-call
  * v5: vllm_model_params.reasoning_parser (chain-of-thought split selection).
  * parser for the chat entry points, or AUTO-detects it from the chat template
- * when NULL/empty. */
-#define VLLM_ABI_VERSION 5
+ * when NULL/empty.
+ * v6: vllm_model_params.speculative_config — the speculative-decoding selection
+ * as the JSON object vLLM takes (e.g. '{"method":"mtp"}'); NULL/empty disables
+ * speculation (the byte-identical default). */
+#define VLLM_ABI_VERSION 6
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -130,6 +133,15 @@ typedef struct vllm_model_params {
    * first chat call with VLLM_ERR_INVALID_ARGUMENT. Borrowed for the
    * vllm_engine_load call only. */
   const char* reasoning_parser;
+  /* ── Speculative-decoding config (ABI v6) ──────────────────────────────────
+   * The JSON object vLLM's --speculative-config takes, e.g.
+   * '{"method":"mtp"}' or '{"method":"mtp","num_speculative_tokens":1}'.
+   * NULL or "" => speculation DISABLED, the byte-identical default engine.
+   * A malformed document or unsupported method fails vllm_engine_load with
+   * VLLM_ERR_INVALID_ARGUMENT. Only MTP is supported today, on the Qwen3.5/3.6
+   * checkpoints that ship an mtp.* head (safetensors only). Borrowed for the
+   * vllm_engine_load call only. */
+  const char* speculative_config;
 } vllm_model_params;
 
 /* ── Sampling parameters ──────────────────────────────────────────────────────

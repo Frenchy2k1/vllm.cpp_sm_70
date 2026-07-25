@@ -656,6 +656,11 @@ target_compile_definitions(test_qwen27_spec_decode PRIVATE
 target_include_directories(test_qwen27_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+vllm_cpp_add_test(test_qwen27_spec_decode_concurrent
+  parity/test_qwen27_spec_decode_concurrent.cpp)
+target_include_directories(test_qwen27_spec_decode_concurrent PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # ADDITIVE-MODEL W4 (Qwen3-Coder-30B-A3B, Qwen3MoeForCausalLM) — the SACRED
 # full-attention BF16 MoE greedy correctness gate: drives a compact prompt
 # battery through the paged engine and checks per-(prompt,pos) set membership vs

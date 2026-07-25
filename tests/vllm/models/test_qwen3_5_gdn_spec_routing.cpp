@@ -24,6 +24,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -230,6 +231,132 @@ void RunSpecRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
   }
 }
 
+// ── MIXED spec+non-spec batch metadata: one spec request (2 tokens, k=1, state
+// slots 0,1) followed by one PREFILL request (Tp tokens, state slot 2). Mirrors
+// the GDN metadata builder's mixed output (gdn_attn.cpp:218-333). ──
+GDNAttentionMetadata MixedMeta(int Tp) {
+  const int Ts = 2;  // 1 + k, k = 1
+  GDNAttentionMetadata g;
+  g.num_spec_decodes = 1;
+  g.num_spec_decode_tokens = Ts;
+  g.num_prefills = 1;
+  g.num_prefill_tokens = Tp;
+  g.num_decodes = 0;
+  g.num_decode_tokens = 0;
+  g.num_actual_tokens = Ts + Tp;
+  g.spec_state_indices_num_cols = 2;
+  g.spec_state_indices_tensor = std::vector<int32_t>{0, 1};
+  g.spec_query_start_loc = std::vector<int32_t>{0, Ts};
+  g.spec_sequence_masks = std::vector<uint8_t>{1, 0};
+  g.spec_token_indx = std::vector<int32_t>{0, 1};
+  std::vector<int32_t> nst;
+  for (int t = Ts; t < Ts + Tp; ++t) nst.push_back(t);
+  g.non_spec_token_indx = nst;
+  g.num_accepted_tokens = std::vector<int32_t>{1};
+  g.non_spec_state_indices_tensor = std::vector<int32_t>{2};
+  g.non_spec_query_start_loc = std::vector<int32_t>{0, Tp};
+  g.has_initial_state = std::vector<uint8_t>{0};
+  g.prefill_state_indices = std::vector<int32_t>{2};
+  g.prefill_query_start_loc = std::vector<int32_t>{0, Tp};
+  g.prefill_has_initial_state = std::vector<uint8_t>{0};
+  return g;
+}
+
+// One fresh PURE prefill request over Tp tokens at state slot `slot`.
+GDNAttentionMetadata PrefillMeta(int Tp, int slot) {
+  GDNAttentionMetadata g;
+  g.num_prefills = 1;
+  g.num_prefill_tokens = Tp;
+  g.num_actual_tokens = Tp;
+  g.non_spec_state_indices_tensor = std::vector<int32_t>{slot};
+  g.non_spec_query_start_loc = std::vector<int32_t>{0, Tp};
+  g.has_initial_state = std::vector<uint8_t>{0};
+  g.prefill_state_indices = std::vector<int32_t>{slot};
+  g.prefill_query_start_loc = std::vector<int32_t>{0, Tp};
+  g.prefill_has_initial_state = std::vector<uint8_t>{0};
+  return g;
+}
+
+// THE MIXED-BATCH PROOF (model-independent). The mixed spec+non-spec batch
+// processes the spec request and the prefill request over DISJOINT state slots,
+// so its per-row output MUST equal the spec request run as a PURE spec batch
+// (rows 0..1) followed by the prefill request run as a PURE prefill batch
+// (rows 2..). A mis-wired index_select split, a wrong sub-batch metadata feed,
+// or a mis-indexed index_copy merge diverges immediately. This is independent
+// of any model-level bf16 batch-nondeterminism (the e2e c>1 confound): the
+// CPU projection GEMM is row-invariant, so the split/merge is BIT-EXACT.
+void RunMixedRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
+  setenv("VT_GDN_INDEXED_STATE_IO", "1", 1);  // mixed needs widened indexed IO
+  const int64_t H = 128;
+  const int Ts = 2, Tp = 3, T = Ts + Tp;
+  const HfConfig c = MakeConfig(g, H);
+  const GdnLayerWeights w = MakeGdnWeights(c);
+  const int64_t Hv = g.hv, Dv = g.dv, Dk = g.dk, Kw = g.kw;
+  const int64_t key_dim = g.hk * Dk, value_dim = Hv * Dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t ssm_row = Hv * Dv * Dk;
+  const int64_t conv_len = (Kw - 1) + 1;  // widened spec row (k = 1)
+  const int64_t slots = 3;
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i) h[i] = RandV(5000 + i, -1.0f, 1.0f);
+  // Initial state: slot 0 = the spec request's initial (read at num_accepted-1);
+  // slot 2 = the prefill request (fresh — zeroed by has_initial_state==0).
+  std::vector<float> ssm0(static_cast<size_t>(slots * ssm_row));
+  for (size_t i = 0; i < ssm0.size(); ++i) ssm0[i] = RandV(6000 + i, -0.5f, 0.5f);
+  std::vector<float> conv0(static_cast<size_t>(slots * conv_dim * conv_len), 0.0f);
+  for (int64_t s = 0; s < slots; ++s)
+    for (int64_t ch = 0; ch < conv_dim; ++ch)
+      for (int64_t j = 0; j < Kw - 1; ++j)
+        conv0[static_cast<size_t>((s * conv_dim + ch) * conv_len + j)] =
+            RandV(7000 + (s * conv_dim + ch) * (Kw - 1) + j, -1.0f, 1.0f);
+
+  // ── Mixed run. ──
+  std::vector<float> ssm_m = ssm0, conv_m = conv0;
+  const std::vector<float> mixed_out = vllm::GdnBlockPagedForTest(
+      Q(dev), w, c, h, MixedMeta(Tp), ssm_m, conv_m, slots, conv_len, T);
+
+  // ── Reference: spec rows via the PURE spec path (slot 0 initial). ──
+  std::vector<float> ssm_s = ssm0, conv_s = conv0;
+  std::vector<float> h_spec(h.begin(), h.begin() + static_cast<std::ptrdiff_t>(Ts * H));
+  const std::vector<float> spec_ref = vllm::GdnBlockPagedForTest(
+      Q(dev), w, c, h_spec, SpecMeta(Ts), ssm_s, conv_s, slots, conv_len, Ts);
+
+  // ── Reference: prefill rows via the PURE prefill path (fresh slot 2). ──
+  std::vector<float> ssm_p = ssm0, conv_p = conv0;
+  std::vector<float> h_pf(h.begin() + static_cast<std::ptrdiff_t>(Ts * H), h.end());
+  const std::vector<float> pf_ref = vllm::GdnBlockPagedForTest(
+      Q(dev), w, c, h_pf, PrefillMeta(Tp, 2), ssm_p, conv_p, slots, conv_len, Tp);
+
+  REQUIRE(static_cast<int64_t>(mixed_out.size()) == T * H);
+  REQUIRE(static_cast<int64_t>(spec_ref.size()) == Ts * H);
+  REQUIRE(static_cast<int64_t>(pf_ref.size()) == Tp * H);
+  std::vector<float> ref;
+  ref.insert(ref.end(), spec_ref.begin(), spec_ref.end());
+  ref.insert(ref.end(), pf_ref.begin(), pf_ref.end());
+
+  if (bit_exact) {
+    size_t bad = 0, first = 0;
+    for (size_t i = 0; i < mixed_out.size(); ++i)
+      if (std::memcmp(&mixed_out[i], &ref[i], sizeof(float)) != 0) {
+        if (bad == 0) first = i;
+        ++bad;
+      }
+    CAPTURE(g.name);
+    CAPTURE(bad);
+    CAPTURE(first);
+    if (bad != 0) { CAPTURE(mixed_out[first]); CAPTURE(ref[first]); }
+    CHECK(bad == 0);
+  } else {
+    float maxabs = 0.0f;
+    for (size_t i = 0; i < mixed_out.size(); ++i)
+      maxabs = std::max(maxabs, std::fabs(mixed_out[i] - ref[i]));
+    CAPTURE(g.name);
+    CAPTURE(maxabs);
+    CHECK(maxabs < 0.05f);
+  }
+}
+
 constexpr GdnDims kGate27B{16, 48, 128, 128, 4, "27B (Hv=48)"};
 constexpr GdnDims kGate35B{16, 32, 128, 128, 4, "35B (Hv=32)"};
 
@@ -240,10 +367,21 @@ TEST_CASE("GDN spec routing (CPU): pure spec batch == token-sequential decode ch
   RunSpecRoutingCase(vt::DeviceType::kCPU, kGate35B, /*bit_exact=*/true);
 }
 
+TEST_CASE("GDN MIXED spec+prefill routing (CPU): mixed batch == pure spec + pure prefill") {
+  RunMixedRoutingCase(vt::DeviceType::kCPU, kGate27B, /*bit_exact=*/true);
+  RunMixedRoutingCase(vt::DeviceType::kCPU, kGate35B, /*bit_exact=*/true);
+}
+
 #ifdef VLLM_CPP_CUDA
 TEST_CASE("GDN spec routing (CUDA): spec branch runs on-device and matches decode chain") {
   vt::GetBackend(vt::DeviceType::kCUDA);  // skip cleanly if no device
   RunSpecRoutingCase(vt::DeviceType::kCUDA, kGate27B, /*bit_exact=*/false);
   RunSpecRoutingCase(vt::DeviceType::kCUDA, kGate35B, /*bit_exact=*/false);
+}
+
+TEST_CASE("GDN MIXED spec+prefill routing (CUDA): mixed batch matches pure spec + prefill") {
+  vt::GetBackend(vt::DeviceType::kCUDA);
+  RunMixedRoutingCase(vt::DeviceType::kCUDA, kGate27B, /*bit_exact=*/false);
+  RunMixedRoutingCase(vt::DeviceType::kCUDA, kGate35B, /*bit_exact=*/false);
 }
 #endif

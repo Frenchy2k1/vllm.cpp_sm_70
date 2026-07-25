@@ -165,6 +165,12 @@ enum class OpId : uint8_t {
   // per-row copies plus a separate BF16<->F32 cast.
   kGdnStateGather,
   kGdnStateScatter,
+  // Row gather/scatter over dim 0 (torch index_select / index_copy_). Additive
+  // op powering the MIXED spec+non-spec GDN batch split/merge (SPEC-MTP): gather
+  // the per-token conv inputs into compact spec / non-spec working buffers and
+  // scatter the per-group core outputs back to their original row positions.
+  kIndexSelect,
+  kIndexCopy,
   // BF16 grouped-MoE GEMM: the dtype-native analog of kMoeGroupedGemmNvfp4 (no
   // fp4 decode). Powers the Qwen3-Coder (Qwen3MoeForCausalLM) fast bf16 MoE path.
   kMoeGroupedGemmBf16,
@@ -606,6 +612,8 @@ using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using IndexSelectFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using IndexCopyFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using MoeRouterTopKFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
                                  const MoeRouterTopKArgs&, const Tensor*);
 using MoeCombineFn =
@@ -1531,6 +1539,21 @@ void GdnStateGather(Queue& q, Tensor& working, const Tensor& cache,
                     const Tensor* has_initial_state = nullptr);
 void GdnStateScatter(Queue& q, Tensor& cache, const Tensor& working,
                      const Tensor& state_idx);
+
+// Row gather over dim 0 (torch `index_select(0, idx)`): out[i, ...] =
+// in[idx[i], ...]. `idx` is i32 [M] on the same device; out is [M, D...]
+// contiguous; in is [N, D...] and MAY carry an outer row stride (a padded /
+// row-strided packed view), but its inner dims must be contiguous. in/out share
+// dtype (any elementwise dtype). Powers the MIXED spec+non-spec GDN split
+// (qwen_gdn_linear_attn.py:1334-1335,1407-1408).
+void IndexSelect(Queue& q, Tensor& out, const Tensor& in, const Tensor& idx);
+
+// Row scatter over dim 0 (torch `index_copy_(0, idx, src)`): out[idx[i], ...] =
+// in[i, ...]. `idx` is i32 [M]; in is [M, D...] contiguous; out is [N, D...]
+// contiguous. Rows of out not named by idx are untouched. Merges the per-group
+// GDN core outputs back into their original positions
+// (qwen_gdn_linear_attn.py:1570-1571).
+void IndexCopy(Queue& q, Tensor& out, const Tensor& in, const Tensor& idx);
 
 // --- MoE (sparse mixture-of-experts) ops. Formula reference:
 // .agents/specs/moe-semantics.md. The expert MLP itself is NOT an op — it is composed

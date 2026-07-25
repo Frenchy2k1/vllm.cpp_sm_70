@@ -35,6 +35,7 @@ struct Args {
   unsigned long long seed = 0;
   bool have_seed = false;
   bool stream = false;
+  std::string speculative_config;  // vLLM --speculative-config JSON; "" => off.
 };
 
 void Usage(const char* argv0, std::FILE* out) {
@@ -44,6 +45,7 @@ void Usage(const char* argv0, std::FILE* out) {
       "          [--tokenizer-config <path>]\n"
       "          [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]\n"
       "          [--seed S] [--stream]\n"
+      "          [--speculative-config '<json>']\n"
       "\n"
       "Runs one completion over the vllm.cpp C ABI (libvllm). <dir> holds\n"
       "config.json, tokenizer.json and the *.safetensors shards.\n",
@@ -86,6 +88,8 @@ bool ParseArgs(int argc, char** argv, Args& a, int& exit_code) {
       a.have_seed = true;
     } else if (flag == "--stream") {
       a.stream = true;
+    } else if (flag == "--speculative-config") {
+      a.speculative_config = NextArg(argc, argv, i);
     } else if (flag == "-h" || flag == "--help") {
       Usage(argv[0], stdout);
       exit_code = 0;
@@ -139,6 +143,12 @@ int main(int argc, char** argv) {
   mp.model_path = args.model_dir.c_str();
   if (!args.tokenizer_config.empty()) {
     mp.tokenizer_config_path = args.tokenizer_config.c_str();
+  }
+  // --speculative-config: enable speculative decoding (SPEC-MTP). Absent =>
+  // NULL => the byte-identical no-speculation engine. A malformed/unsupported
+  // document fails the load below with the parse error.
+  if (!args.speculative_config.empty()) {
+    mp.speculative_config = args.speculative_config.c_str();
   }
 
   vllm_engine* engine = nullptr;

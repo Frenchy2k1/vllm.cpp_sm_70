@@ -411,6 +411,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.max_num_seqs = 8;
   p.tool_parser = nullptr;  // AUTO-detect from the chat template (ABI v4).
   p.reasoning_parser = nullptr;  // AUTO-detect / disabled (ABI v5).
+  p.speculative_config = nullptr;  // speculation disabled (ABI v6).
   return p;
 }
 
@@ -457,6 +458,14 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
     if (params->num_blocks > 0) ep.num_blocks = params->num_blocks;
     if (params->max_model_len > 0) ep.max_model_len = params->max_model_len;
     if (params->max_num_seqs > 0) ep.max_num_seqs = params->max_num_seqs;
+    // ABI v6: speculative-decoding config. NULL/empty => unset => the
+    // byte-identical no-speculation engine; a malformed/unsupported document
+    // throws out of ParseSpeculativeConfigJson and is reported as a load error.
+    if (params->speculative_config != nullptr &&
+        params->speculative_config[0] != '\0') {
+      ep.speculative_config =
+          vllm::ParseSpeculativeConfigJson(params->speculative_config);
+    }
 
     auto loaded =
         vllm::entrypoints::LoadedEngine::FromModelDir(params->model_path, ep);

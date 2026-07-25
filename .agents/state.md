@@ -22901,3 +22901,46 @@ split/merge; then the 3-way 27B k=1 greedy token gate.
   is example-only/additive). Raw logs on dgx `~/work/mtp-bench-i6/{results,vresults}`;
   local copies under the worktree `scratchpad-bench/`. Full SHA reported in the session;
   NOT pushed.
+
+## 2026-07-25 — SPEC-MTP I7: mixed spec+non-spec GDN batch (concurrency) + server/CLI `--speculative-config` + c>1 A/B (`CLAIM-SPEC-MTP-I7`)
+
+Base `origin/main` `1e07bc6`, branch `spec-mtp-mixed-batch`, dgx `~/work/mixed-batch`
+(git-archive/stash transfer, CUDA `build-cuda` cutlass-ON/FA2/Triton banner CONFIRMED,
+all GPU work FOREGROUND under one `flock $HOME/gpu.lock`, big-model gates STANDALONE).
+
+**Closed the two I6 `DONE`-blockers.** (1) New row op `vt::IndexSelect`/`vt::IndexCopy`
+(torch `index_select`/`index_copy_` over dim 0; dtype-agnostic byte copy, base outer
+row-stride honoured; CPU + CUDA; CUDA==CPU bit-exact at GDN widths, RED-first). (2)
+`GdnBlockPagedMixedSpec` — mirror of `qwen_gdn_linear_attn.py:1329-1576`: index_select
+the per-token `mixed_qkv`/`a`/`b` into compact spec / non-spec groups, run the I5a spec
+conv+recurrence + the widened-cache-aware prefill conv+recurrence over disjoint
+per-request state, merge with index_copy; a validation fix (non-spec cu_seqlens spans
+`nd_tok+np_tok`, byte-identical at `num_spec==0`). (3) Server (I5d) + CLI `--speculative-config`
+(ABI v6 `vllm_model_params.speculative_config` → `vllm_engine_load`, `examples/cli/main.cpp`).
+
+**Correctness — MODEL-INDEPENDENT bit-exact proof.** Because the spec and prefill
+requests use DISJOINT state slots, the mixed batch's per-row output MUST equal the spec
+request run PURE-spec then the prefill request run PURE-prefill; asserted bit-exact on
+CPU (27B+35B dims) and within the M-retile band on CUDA (`test_qwen3_5_gdn_spec_routing`,
+RED-first by a broken merge). compute-sanitizer 0 on the mixed step + the op.
+
+**The c>1 batch-nondeterminism finding (honest, decisive).** The 27B greedy output is
+bf16-BATCH-NONDETERMINISTIC at near-ties: spec-OFF at max_num_seqs=4 vs =1 differs on
+2/3 short prompts with NO spec decode involved (`test_qwen27_spec_decode_concurrent`
+control). Because spec's verify step is a THIRD batch shape (1+k tokens/req), per-request
+EXACT spec-ON==spec-OFF at c>1 is UNATTAINABLE for near-tie requests — the MODEL, not the
+mixed code. So the c>1 correctness bar is: the mixed path runs + accepts drafts
+(invocations>0, 43/51 at the staggered c4 gate), the bit-exact split/merge proof, and
+the exact three-way identity still at c1 (I6). Mirrors near-tie-distributional-gate.
+
+**c>1 THROUGHPUT A/B (both spec-ON, same `--speculative-config`, 27B, greedy, 8 prose+code
+x 256 out, idle box, one engine at a time under one flock, 3 reps cold-discarded).** OURS
+spec-ON output tput vs spec-OFF (prose/code): c2 1.52x/1.57x, c4 1.47x/1.56x, c8
+1.43x/1.48x; TPOT stays ~67-77ms spec-ON vs ~105-113ms spec-OFF — spec does NOT go neutral
+at c8 (the mixed batch keeps every request drafting). vLLM spec-ON tput 28.4/29.1 (c2), 53.4/56.3 (c4), 99.7/105.3 (c8) prose/code — ours ON-PAR (within ~+/-2%, slightly ahead c2/c4, within-noise c8); vLLM draft acceptance 0.835 (16735/20043 over the sweep) vs ours 0.84-0.92, on-par.
+
+**Regressions on the FINAL clean cutlass-ON build, STANDALONE under flock:** spec-OFF
+SACRED byte-identical 27B 235/235, 35B 315/315, Coder 138/138; `test_ops_gdn` (op),
+`test_gdn_metadata_builder` 483/483, mixed routing + concurrent tests PASS; CUDA `-Werror`
+0 warnings; compute-sanitizer 0. **Disposition: ours is ON-PAR-OR-ABOVE vLLM spec-ON at every measured c>1 axis** (output tput within ~+/-2%, ours slightly ahead at c2/c4, within-noise at c8; acceptance on-par 0.84-0.92 vs 0.835), tracking vLLM's ~1.5x spec speedup at every concurrency. The implementation is COMPLETE and at vLLM parity (mixed batch + bit-exact proof, server/CLI flag, c1 win I6). `SPEC-MTP` STAYS `ACTIVE`, NOT flipped to `DONE`, for one honest reason: the DONE criterion's strict `token-exact at c>1` clause is a proven MODEL impossibility — the 27B greedy is bf16-batch-nondeterministic (spec-OFF max_seqs 4-vs-1 differs 2/3 short prompts, no spec involved, affecting vLLM identically), so exact c>1 token identity cannot be met by any correct implementation; c>1 correctness is instead the model-independent bit-exact split/merge proof + acceptance parity (near-tie-distributional-gate), token-exact strict at c1. No lag, no missing work, no lever — the DONE final call is deferred to the user given this criterion ambiguity. Raw logs dgx
+`~/work/mixed-batch/{cN_results,cN_vresults}`. Full SHA reported in the session; NOT pushed.

@@ -1829,6 +1829,54 @@ void GdnStateScatter(Queue& q, Tensor& cache, const Tensor& working,
       q, cache, working, state_idx);
 }
 
+namespace {
+// Common shape/dtype contract for the row gather/scatter ops. `many` is the
+// [M, D...] compact side (out for select, in for copy); `base` is the [N, D...]
+// row-addressable side (in for select, out for copy). D... must match and the
+// compact side must be contiguous; the base side may carry an outer row stride.
+void CheckIndexRowOp(Queue& q, const Tensor& compact, const Tensor& base,
+                     const Tensor& idx, const char* name) {
+  VT_CHECK(compact.dtype == base.dtype,
+           std::string(name) + ": dtype mismatch");
+  VT_CHECK(compact.rank == base.rank && compact.rank >= 1,
+           std::string(name) + ": rank mismatch / must be >= 1");
+  VT_CHECK(idx.rank == 1 && idx.dtype == DType::kI32,
+           std::string(name) + ": idx must be i32 [M]");
+  VT_CHECK(idx.shape[0] == compact.shape[0],
+           std::string(name) + ": idx length must equal the compact row count");
+  for (int r = 1; r < compact.rank; ++r)
+    VT_CHECK(compact.shape[r] == base.shape[r],
+             std::string(name) + ": trailing dims must match");
+  VT_CHECK(compact.IsContiguous(),
+           std::string(name) + ": the compact [M,D] side must be contiguous");
+  // The base side's inner dims (everything past dim 0) must be contiguous so a
+  // row is one packed block; only the outer row stride may differ.
+  int64_t inner = 1;
+  for (int r = base.rank - 1; r >= 1; --r) {
+    VT_CHECK(base.stride[r] == inner,
+             std::string(name) + ": base inner dims must be contiguous");
+    inner *= base.shape[r];
+  }
+  VT_CHECK(base.stride[0] >= inner,
+           std::string(name) + ": base outer row stride too small");
+  VT_CHECK(compact.device == q.device && base.device == q.device &&
+               idx.device == q.device,
+           std::string(name) + ": device mismatch");
+}
+}  // namespace
+
+void IndexSelect(Queue& q, Tensor& out, const Tensor& in, const Tensor& idx) {
+  CheckIndexRowOp(q, out, in, idx, "index_select");
+  reinterpret_cast<IndexSelectFn>(GetOp(OpId::kIndexSelect, q.device.type))(
+      q, out, in, idx);
+}
+
+void IndexCopy(Queue& q, Tensor& out, const Tensor& in, const Tensor& idx) {
+  CheckIndexRowOp(q, in, out, idx, "index_copy");
+  reinterpret_cast<IndexCopyFn>(GetOp(OpId::kIndexCopy, q.device.type))(
+      q, out, in, idx);
+}
+
 void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
                    const MoeRouterTopKArgs& args,
                    const Tensor* e_score_correction_bias) {
