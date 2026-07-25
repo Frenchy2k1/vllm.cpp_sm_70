@@ -177,6 +177,14 @@ target_compile_definitions(test_qwen3vl_video_e2e PRIVATE
 vllm_cpp_add_test(test_audio_processor vllm/multimodal/test_audio_processor.cpp)
 target_compile_definitions(test_audio_processor PRIVATE
   MM_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/whisper_audio")
+# M3d — NEAR-TIE-ROBUST e2e VIDEO->text token gate on the Qwen3.6-27B GDN-hybrid
+# gate model: the full pipeline (video processor -> tower per-frame windowed attn,
+# 27B vision config -> merge -> forked GDN-hybrid video MRoPE greedy decode) vs the
+# committed vLLM 0.25.0 golden. GPU + Qwen/Qwen3.6-27B checkpoint required, else
+# skipped (VLLM_QWEN36_CKPT or the HF cache path).
+vllm_cpp_add_test(test_qwen3_5_vl_video_e2e vllm/multimodal/test_qwen3_5_vl_video_e2e.cpp)
+target_compile_definitions(test_qwen3_5_vl_video_e2e PRIVATE
+  MM_VIDEO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3_5_27b_video")
 # Multimodal M1 encoder-cache manager (inert-when-off engine seam).
 vllm_cpp_add_test(test_encoder_cache_manager vllm/v1/core/test_encoder_cache_manager.cpp)
 # LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip
