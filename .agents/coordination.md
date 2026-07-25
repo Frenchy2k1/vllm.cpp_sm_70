@@ -954,3 +954,21 @@ list of what the project supports.
   11.80 vs 14.03 ms (1.19x), output-tput 78.73 vs 67.68 tok/s (+16.3%), acceptance
   0.908 — the MoE speedup transfers. Remaining spec-decode follow-on: `SPEC-DFLASH`
   (oracle-BLOCKED, vllm#40898). NOT pushed.
+
+- **2026-07-25 — local integration checkpoint released
+  (`CLAIM-LOCAL-BF16-H32-AOT`).** The stale
+  `local-blackwell-environment` rebase was aborted and only the relevant H32
+  Triton-AOT repair was transplanted onto current `main`; no isolated worktree
+  or live parallel claim remains. The integration then completed the
+  plain-BF16 decode graph and exact ratio-4 FA2 leaf on the local RTX 5070 Ti.
+  Focused correctness passes: H32 flag 10/10, GDN 66/66 (4,242 assertions),
+  paged attention 25/25 (454,474), real 4B graph/direct/eager 3/3 (1,672).
+  Final matched root `/tmp/qwen35-main-final-fa2-20260725`; stable vLLM
+  confirmation `/tmp/qwen35-vllm-confirm2-20260725`; node trace
+  `/tmp/qwen35-main-final-fa2-profile-20260725`. Disposition is `GATING`:
+  direct ON reaches 0.9864x stable vLLM total/output throughput and wins host
+  memory/TTFT, but TPOT/ITL is 43.72 vs 38.55 ms. Next owner must repair the
+  measured discrete-CUDA sampled-ID main-stream wait by implementing a
+  request-compaction-safe device token map, not retune FA2 blindly or delete
+  the synchronization without preserving row identity.
+  Evidence: [2026-07-25 4B repair](../docs/bench-evidence/qwen35-4b-main-repair-20260725.md).
