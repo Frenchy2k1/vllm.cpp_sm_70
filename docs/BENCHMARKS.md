@@ -221,6 +221,16 @@ to implement next: OLMo-3 (nearly-free W5 on the landed OLMo-2 code), Phi-3/Phi-
 Each binds a future per-family SACRED token-exact gate vs vLLM 0.25.0 (form BY MEASUREMENT) +
 the every-axis speed close before any row reaches DONE. No number is claimed here.
 
+**Multimodal M2c - IMAGE e2e token-exact WORKING on Qwen3-VL-4B (2026-07-25, `CLAIM-MULTIMODAL-M2C`).**
+CORRECTNESS: **STRICT image->text token-exact 32/32** vs the committed vLLM 0.25.0 golden
+(`tests/vllm/multimodal/fixtures/qwen3vl_text/gen_tokens_i32.bin`) on the fixed (image, prompt),
+the full C++ pipeline (image processor -> M2a vision tower -> merge -> forked MRoPE/DeepStack
+greedy decode) on-device (`tests/vllm/multimodal/test_qwen3vl_e2e.cpp`, dgx-only). Reproduce:
+`flock $HOME/gpu.lock ./build/tests/test_qwen3vl_e2e` after `scripts/mm/m2c_e2e_inputs.py` dumps
+the input-ids fixture. SPEED: **`benchmark_binding=false`, PENDING** - no throughput measured
+(the row is not DONE until every-axis vLLM speed parity; M3 reuses this tower for Qwen3.6 image +
+video). No throughput number is claimed here.
+
 **Multimodal track (Audio/Video/Image, Gemma-4 + Qwen3.6) - SPIKE ONLY, DESIGN, no gate run (2026-07-25, `CLAIM-MULTIMODAL-TRACK` [spike](../.agents/specs/multimodal-track.md)).**
 Disposition: **NO throughput measured, NO correctness gate run, nothing built or downloaded
 (oracle-metadata + safetensors-header read only) - PENDING for all rows.** The gate models are

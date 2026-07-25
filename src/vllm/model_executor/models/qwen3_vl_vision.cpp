@@ -306,6 +306,9 @@ std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_value
   ra.rotary_dim = static_cast<int>(hd);
   ra.is_neox_style = true;
   if (cap != nullptr) cap->deepstack_out.clear();
+  // DeepStack merger outputs collected during the block loop, needed by the final
+  // concat on BOTH the capture (M2a) and no-capture (M2c e2e) paths.
+  std::vector<std::vector<float>> ds_features(cfg.deepstack_visual_indexes.size());
 
   for (int64_t l = 0; l < cfg.depth; ++l) {
     const VisionBlockWeights& bw = w.blocks[static_cast<size_t>(l)];
@@ -396,14 +399,13 @@ std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_value
         dsout.Download(q, tmp.data());
         std::vector<float> f(tmp.size());
         for (size_t i = 0; i < tmp.size(); ++i) f[i] = vt::BF16ToF32(tmp[i]);
-        // stash: index by di into a temporary list carried on cap or local.
+        // Keep for the tower concat regardless of capture (the M2c cap==nullptr
+        // e2e path); also expose to the M2a capture when present.
+        ds_features[di] = f;
         if (cap != nullptr) {
           if (cap->deepstack_out.size() <= di) cap->deepstack_out.resize(di + 1);
-          cap->deepstack_out[di] = f;
+          cap->deepstack_out[di] = std::move(f);
         }
-        // Also keep for the tower concat regardless of capture.
-        // (stored in ds_features below via cap; when cap==nullptr we recompute
-        //  into ds_features directly)
       }
     }
   }
@@ -422,13 +424,8 @@ std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_value
   }
   if (cap != nullptr) cap->merger_out = merger_f;
 
-  // deepstack features were captured above; if cap==nullptr, recompute them now.
-  std::vector<std::vector<float>> ds(static_cast<size_t>(ndeep));
-  if (cap != nullptr) {
-    for (int64_t i = 0; i < ndeep; ++i) ds[static_cast<size_t>(i)] = cap->deepstack_out[static_cast<size_t>(i)];
-  }
-  // (When cap==nullptr the deepstack recompute path is exercised by M2c; M2a
-  // always passes a capture, so ds is populated.)
+  // DeepStack features collected during the block loop (both cap and non-cap).
+  std::vector<std::vector<float>>& ds = ds_features;
 
   // concat: [merger | ds0 | ds1 | ds2] along dim1.
   const int64_t W = D * (1 + ndeep);

@@ -1,0 +1,7 @@
+{
+  "model_id": "Qwen/Qwen3-VL-4B-Instruct",
+  "len": 212,
+  "image_tokens": 196,
+  "image_offset": 4,
+  "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>What is in this image?<|im_end|>\n<|im_start|>assistant\n"
+}
