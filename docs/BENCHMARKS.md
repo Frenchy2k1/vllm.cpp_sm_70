@@ -38,6 +38,19 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
+**DFlash speculative decode (block-diffusion) - PENDING, readiness assessed
+(2026-07-25, `SPEC-DFLASH` `READY`, `CLAIM-SPEC-DFLASH-READINESS`,
+[spec](../.agents/specs/dflash-spec-decode.md)).** `benchmark_binding=false`, NO
+number. Design-only readiness pass against the landed MTP machinery: verdict GREEN,
+dispatch-ready, no hardware/oracle/download blocker. Both z-lab draft checkpoints
+exist on HF (27B 1.73 GB / 35B 368 MB, bf16) and fit the 119 GiB pool; the dgx 0.25.0
+oracle constructs DFlash. Correctness gate (D5: our-DFlash-ON == our-spec-OFF == vLLM
+`--speculative-config dflash` greedy, token-for-token + nonzero acceptance) and the
+c1/c>1 throughput A/B (D6) are OWED once DFlash is implemented; the honest denominator
+is vLLM with the same DFlash speculative config. The single biggest measured-risk input
+is the GDN spec-state memory at k=15 (~2.3 GiB/req on the 27B at block-16). Repro: see
+the D0-D6 W-plan in the spec.
+
 **MTP speculative decode, k=1 on the 27B GDN hybrid - SINGLE-REQUEST (c1)
 CORRECTNESS PROVEN AND THROUGHPUT AT/ABOVE vLLM ON EVERY MEASURED AXIS
 (2026-07-25, `SPEC-MTP` I6, `CLAIM-SPEC-MTP-I6`,
