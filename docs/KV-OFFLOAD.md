@@ -34,7 +34,7 @@ unknown key, a wrongly-typed value, an unknown role, or a connector name that is
 not registered (the error lists the registered names). Omit the flag entirely and
 no connector is built.
 
-## LMCache (`lm://` remote KV) — the connector that works end to end
+## LMCache (`lm://` remote KV), the connector that works end to end
 
 This is the connector to use. It is a pure-C++ `lm://` client (no in-process
 `lmcache`, no Python) whose keys agree byte-for-byte with a real Python
@@ -101,7 +101,7 @@ sliding window, page/block sizes, hash algorithm, hash-chain seed, parallelism,
 format version, …). Upstream vLLM's `fs` tier writes a `config.json` it never
 reads back; we refuse on every one of those fields instead.
 
-## CPU + disk offload (`OffloadingConnector`) — REFUSED by the engine today
+## CPU + disk offload (`OffloadingConnector`), REFUSED by the engine today
 
 `kv_connector: "OffloadingConnector"` selects the local tiered CPU + disk cache.
 Its scheduler half is real and gated: on a restart, a prefix that is only on disk
