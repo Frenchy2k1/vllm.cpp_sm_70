@@ -38,27 +38,54 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
-**MTP speculative decode, k=1 on the 27B GDN hybrid - SINGLE-REQUEST GREEDY
-CORRECTNESS PROVEN, NO SPEED NUMBER (2026-07-25, `SPEC-MTP` I5e,
-`CLAIM-SPEC-MTP-I5E`, [spec](../.agents/specs/mtp-spec-decode.md)).**
-Disposition: **CORRECTNESS (single-request greedy) COMPLETE; THROUGHPUT PENDING -
-`benchmark_binding=false`, no speed measured or claimed.** The three-way gate
-`tests/parity/test_qwen27_spec_decode.cpp` (single-request greedy, 27B NVFP4
-`~/bench/q36-27b-nvfp4-vllm`) PASSES: our speculative-ON greedy continuation is
-token-for-token identical to both our own speculative-OFF continuation and the
-pip-vLLM 0.25.0 oracle greedy continuation (which is itself vLLM's own
-`--speculative-config '{"method":"mtp","num_speculative_tokens":1}'` greedy),
-on the 16-token golden prefix (continuation " capital of Germany is Berlin.").
-**Acceptance is measured and nonzero: 16 of 16 drafts accepted** on this short,
-highly predictable factual prompt (roughly halving the number of full model
-steps, ~16 target decode steps saved over the 32-token run); the required
-`proposed>0 && accepted>0` both hold, so this is not a dead-drafter pass.
-Spec-OFF SACRED gates stay byte-identical (27B 235/235, 35B 315/315, Coder
-138/138) and compute-sanitizer is clean on the spec step. THROUGHPUT is
-explicitly NOT claimed: the honest denominator is vLLM with the same speculative
-config at the same operating point, and that A/B (plus the multi-request /
-concurrent mixed-batch path) is deferred to I6. No user-facing supported
-speculative flag yet.
+**MTP speculative decode, k=1 on the 27B GDN hybrid - SINGLE-REQUEST (c1)
+CORRECTNESS PROVEN AND THROUGHPUT AT/ABOVE vLLM ON EVERY MEASURED AXIS
+(2026-07-25, `SPEC-MTP` I6, `CLAIM-SPEC-MTP-I6`,
+[spec](../.agents/specs/mtp-spec-decode.md)).** `benchmark_binding=true`, the
+first spec-decode speed number. Disposition: **CORRECTNESS (single-request greedy)
+COMPLETE; c1 THROUGHPUT MEASURED AND AT/ABOVE vLLM spec-on; the multi-request /
+mixed-batch (c>1) path remains for `DONE`.** Correctness re-confirmed on the clean
+cutlass-ON build: `tests/parity/test_qwen27_spec_decode.cpp` PASSES (our spec-ON ==
+our spec-OFF == pip-vLLM 0.25.0 `--speculative-config mtp` greedy, token-for-token;
+16/16 drafts accepted), so the speed numbers below come from a token-identical spec
+loop.
+
+**A/B methodology (honest-bar).** Both arms spec-ON, SAME config
+`{"method":"mtp","num_speculative_tokens":1}`, same checkpoint
+`~/bench/q36-27b-nvfp4-vllm`, concurrency 1 (the operating point our engine
+supports today; the mixed-batch c>1 path is refused and deferred), greedy, 8 real
+prompts x 256 output tokens, prose + code sets (random tokens accept nothing), idle
+box under one `flock $HOME/gpu.lock`, one engine at a time, 3 reps (cold first leg
+discarded for the noisier TTFT). **Ours** = `examples/vllm-bench` at f0bffda + an
+additive `--speculative-config` flag, PRODUCTION config. **vLLM** = pinned 0.25.0
+oracle `vllm serve --speculative-config ... --no-enable-prefix-caching` (graphed
+PRODUCTION: `enforce_eager=False`, `CUDAGraphMode.FULL_AND_PIECEWISE`, inductor)
+driven by `vllm bench serve --dataset-name sharegpt --sharegpt-output-len 256
+--ignore-eos --max-concurrency 1`; vLLM confirmed engaging MTP (`Resolved
+architecture: Qwen3_5MTP`, live `SpecDecoding metrics`). Byte-identical prompts.
+
+**BINDING GRID (c1, median tok metrics; prose / code):**
+
+| axis | ours spec-ON | vLLM spec-ON | verdict |
+|---|---|---|---|
+| TPOT ms | 66.2 / 62.95 | 69.1 / 65.3 | ours **1.04x / 1.04x faster** WIN |
+| ITL ms | 121.6 / 121.1 | 123.2 / 123.2 | ours marginally lower, at/above |
+| Output tput tok/s | 15.10 / 15.72 | 14.43 / 15.13 | ours **+4.6% / +3.9%** WIN |
+| TTFT ms (warm) | 131.3 / 131.0 | 151.5 / 181.2 | ours lower WIN (vLLM TTFT noisy) |
+| draft acceptance | 0.85 / 0.92 | 0.838 overall (per-pos 0.81-0.84) | ours >=, within noise |
+| peak host RSS GB | 28.4 (ON) / 24.8 (OFF) | 24.97 weights + 26.2 KV reserved (util 0.45) | both fit 119 GiB pool |
+
+**Spec-decode HELPS BOTH sides at c1** (it is a latency optimization): ours TPOT
+100.5->66.2 prose (**1.52x**) / 100.0->62.95 code (**1.59x**); vLLM 104.35->69.1
+(**1.51x**) / 104.35->65.3 (**1.60x**). At spec-OFF ours is already ~4% faster than
+vLLM (TPOT 100 vs 104, tput 9.97 vs 9.57) and preserves the lead spec-ON. **Noise:**
+ours reruns TPOT s<0.5%, vLLM within ~2%; the ~4% ours-faster TPOT/tput margin
+exceeds the band (real, not noise). **GDN state doubling at k=1** (spec 3.1) costs
+ours +3.6 GB RSS (draft KV + widened conv + draft head), inside the pool. Raw logs
+on dgx `~/work/mtp-bench-i6/{results,vresults}`. **Remaining for `DONE`:** the mixed
+spec+non-spec `GdnBlockPaged` split/merge (c>1, refused) and its c>1 A/B; no
+user-facing supported speculative flag on the OpenAI server yet (the bench flag is
+additive/example-only).
 
 **Gemma-3 (`Gemma3ForCausalLM`, gemma-3-1b-it) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-SWEEP-GEMMA` W0-W2, [spike](../.agents/specs/sweep-gemma.md)).**

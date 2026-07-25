@@ -784,6 +784,47 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
       step. `SPEC-MTP` moves past `GATING` (single-request greedy correctness PROVEN);
       NOT `DONE` — the MIXED `GdnBlockPaged` split/merge (concurrency) + the throughput
       A/B vs vLLM same-config are **I6**. `benchmark_binding=false`, no speed claim.
+  - **I6 — the c1 throughput A/B vs vLLM same-config (THE §5 THROUGHPUT GATE, low-
+    concurrency operating point). LANDED 2026-07-25 (`CLAIM-SPEC-MTP-I6`).
+    `benchmark_binding=true`** — the first spec-decode speed number. Measures the §5
+    gate at c1 (the operating point the engine supports; the c>1 mixed-batch path is
+    still refused). Both arms spec-ON, SAME `{"method":"mtp","num_speculative_tokens":1}`,
+    27B `~/bench/q36-27b-nvfp4-vllm`, greedy, c1, 8 real prompts x 256 out, prose + code
+    (random tokens accept ~nothing), idle box, one engine at a time under one
+    `flock`, 3 reps (cold TTFT leg discarded). OURS = `examples/vllm-bench` + an
+    additive `--speculative-config` flag (production config). vLLM = pinned 0.25.0
+    `vllm serve --speculative-config ... --no-enable-prefix-caching` (graphed
+    PRODUCTION: `enforce_eager=False`, `FULL_AND_PIECEWISE`, inductor) + `vllm bench
+    serve --dataset-name sharegpt --sharegpt-output-len 256 --ignore-eos
+    --max-concurrency 1`; vLLM confirmed engaging MTP (`Resolved architecture:
+    Qwen3_5MTP`, live `SpecDecoding metrics`). Correctness re-confirmed on the clean
+    build FIRST (`test_qwen27_spec_decode` PASS, 16/16 accepted), so the timings are
+    from a token-identical loop.
+    - **RESULT — OURS spec-ON AT/ABOVE vLLM spec-ON on EVERY measured axis at c1**
+      (median tok metrics, prose / code): **TPOT** ours 66.2 / 62.95 ms vs vLLM
+      69.1 / 65.3 ms (**ours ~1.04x faster**); **output tput** ours 15.10 / 15.72
+      vs vLLM 14.43 / 15.13 tok/s (**+4.6% / +3.9%**); **ITL** ours 121.6 / 121.1 vs
+      vLLM 123.2 / 123.2 ms (ours marginally lower); **TTFT** (warm) ours 131.3 /
+      131.0 vs vLLM 151.5 / 181.2 ms (ours lower, vLLM TTFT noisy); **acceptance**
+      ours 0.85 / 0.92 vs vLLM 0.838 overall (per-position 0.81-0.84) — ours >=,
+      within noise, live drafter both sides; **peak host RSS** ours 28.4 GB spec-ON
+      (24.8 GB spec-OFF, the +3.6 GB = draft KV + widened conv + draft head, spec
+      3.1 GDN doubling), vLLM reserves 24.97 GiB weights + 26.2 GiB KV at util 0.45 —
+      both well inside the 119 GiB pool.
+    - **Baseline (does spec help?)** — YES on both sides at c1: ours TPOT
+      100.5->66.2 prose (1.52x) / 100.0->62.95 code (1.59x); vLLM 104.35->69.1
+      (1.51x) / 104.35->65.3 (1.60x). At spec-OFF ours is already ~4% faster than
+      vLLM and preserves the lead spec-ON. **Noise:** ours reruns TPOT s<0.5%, vLLM
+      ~2%; the ~4% margin exceeds the band (real).
+    - **Disposition:** the §5 THROUGHPUT gate is MET at c1 (on-par-or-above vLLM on
+      every axis, token-identity proven). `SPEC-MTP` stays `ACTIVE` (not `DONE`)
+      because the project's every-axis rule also spans the higher-concurrency
+      operating point, and spec at c>1 is unimplemented (mixed spec+non-spec
+      `GdnBlockPaged` split/merge still refused). Remaining for `DONE`: (1) the mixed
+      `GdnBlockPaged` split/merge (needs a row `IndexSelect`/`IndexCopy` vt op) + a
+      c>1 A/B, (2) a user-facing supported `--speculative-config` on the OpenAI
+      server (the bench flag is example-only/additive). Raw logs on dgx
+      `~/work/mtp-bench-i6/{results,vresults}`.
 - **M-mtp-2 — 35B k=1 greedy.** Adds only the MoE MTP layer (reuses our MoE
   blocks) — GDN path identical. Same gates. Caveat: verify unions experts
   across k+1 tokens/request (more experts touched per step — measure, don't
