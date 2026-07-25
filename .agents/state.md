@@ -23455,3 +23455,66 @@ text-only), then video.
   **NEXT:** close the video token-exact gate by tightening the tower bf16 envelope (M2a
   portable-kernel work — the same ceiling that risks image near-ties); then 27B-video (reuse
   the 4B video path on the GDN-hybrid backbone) + speed. Gemma-4 image+video+AUDIO = M4.
+
+## 2026-07-25 — MULTIMODAL M3c TOWER-FIDELITY / GATE-FORM RESOLVED: video e2e divergence MEASURED = genuine bf16 near-tie ⇒ near-tie-robust gate PASS (`CLAIM-MULTIMODAL-TOWER-FIDELITY`)
+
+Base `origin/main` `648a5f1`; isolated worktree `.claude/worktrees/mm-tower-fidelity`
+(branch `mm-tower-fidelity`); dgx measure+build+gate `~/work/m3b-vl` (reused build cache),
+all GPU under ONE `flock $HOME/gpu.lock`, sole owner, local-ai-worker verified Exited.
+
+**The task:** resolve the M3c video STRICT-gate limiter — MEASURE whether the token
+divergence is a genuine near-tie or a real fidelity gap, THEN close it the right way
+(near-tie gate if a tie; tower f32-accum tightening if a real gap). Per the
+misattributed-own-bug discipline: measure the teacher-forced gap before deciding.
+
+**MEASURED — it is a GENUINE bf16 near-tie (NOT a fidelity gap):**
+- The prior M3c RCA was WRONG: it claimed the flip is at token 24 (ours 11980 "noise" vs
+  golden 11 ",") and NEVER teacher-forced. Running our engine, the REAL first divergence is
+  at **tok22** (ours ' colorful' 33866 vs golden ' static' 1099); token 24 is just a
+  downstream artifact of the one-token shift.
+- **Decisive measurement** (`scripts/mm/m3c_video_neartie_gap.py` — teacher-force vLLM
+  0.25.0 on OUR exact 32-token sequence with the identical video mm input, read per-position
+  gap between vLLM's argmax and our token): the SOLE divergence is ONE near-tie at tok22,
+  **gap 0.125 nats**, our token is vLLM's OWN 2nd choice among 4 tokens tied within 0.25
+  nats (top-4 = `[1099 -1.311, 33866 -1.436, 264 -1.436, 4194 -1.561]`, then a ~3-nat cliff).
+  EVERY downstream token (tok23-31) IS vLLM's teacher-forced argmax at gap **0.0000** — the
+  22/32-vs-greedy is the deterministic one-token shift from that single tie.
+- vLLM is fully SELF-CONSISTENT on the golden (teacher-forced argmax == golden at all 32
+  positions, 0 mismatches) ⇒ a clean STRICT target, so our divergence is REAL but a genuine
+  bf16 tie, not vLLM's own jitter. Our forward reproduces vLLM's logits everywhere but the tie.
+
+**Tower-accumulation analysis (the "fixable f32 vs bf16" hypothesis — answered NO):** the
+M2a tower ALREADY accumulates in f32 everywhere and matches vLLM's numerics:
+- GEMMs: cuBLASLt `CUBLAS_COMPUTE_32F` (bf16-in / f32-accum) = vLLM's cuBLAS
+  (`src/vt/cuda/cuda_matmul.cu`).
+- Vision attention: an online-softmax kernel entirely in f32 (QK dot, softmax max/denom,
+  output accumulator; stores bf16) = vLLM's FlashAttention f32-softmax
+  (`src/vt/cuda/cuda_ops.cu` `AttentionKernel`).
+- LayerNorm / patch-merger: f32 accumulation.
+So rel-L2 0.072 is the IRREDUCIBLE inter-op bf16 rounding envelope (kernel reduction-order
+differences rounded to bf16 between ops, compounding over 24 ViT layers), NOT a fixable
+numeric choice ⇒ **NO kernel change** (tower work would be unnecessary — the correct path
+per the DATA).
+
+**Closed the RIGHT way — the ratified near-tie-robust gate (methodology fix, not a loosened
+STRICT gate):** `test_qwen3vl_video_e2e` converted STRICT→near-tie-robust, identical in form
+to the olmo2/qwen3-dense/glm4 text gates (`kNearTieMnats=500`): REQUIRE engine == committed
+anchor `our_ids_i32.bin`, then every position's teacher-forced gap (`neartie_gap_mnats_i32.bin`,
+built by `m3c_video_neartie_gap.py`) ≤ 0.5 nats. **Gate PASS, 22/22 assertions, max gap
+0.125 nats @ tok22.** Bootstrap path (VT_DUMP_IDS / goldens-absent) dumps our_ids for the
+gap script, mirroring olmo2.
+
+**Proof / no-regression:**
+- Video e2e near-tie-robust: **PASS** (max teacher-forced gap 0.125 << 0.5 nats).
+- Image e2e 4B `test_qwen3vl_e2e` STRICT **32/32** — the deterministic strict-pass proof
+  (same 4B, same tower, rel-L2 0.05), unchanged.
+- `git diff --stat`: ONLY `tests/vllm/multimodal/test_qwen3vl_video_e2e.cpp` + new
+  `scripts/mm/m3c_video_neartie_gap.py` + 2 fixture goldens
+  (`our_ids_i32.bin`, `neartie_gap_mnats_i32.bin`). Zero src/kernel/shared-op ⇒ text SACRED
+  (27B/35B/Coder) byte-identical BY CONSTRUCTION (re-run NOT required); no kernel changed ⇒
+  compute-sanitizer N/A. Build cutlass-4.5.0 + `-DVLLM_CPP_TRITON=ON` + arch 121a, Release;
+  incremental build clean. `benchmark_binding=false`, speed pending. Not pushed; FULL SHA reported.
+
+**NEXT:** 27B-video (reuse the 4B video path on the GDN-hybrid backbone) + speed; then
+Gemma-4 (M4, image+video+AUDIO, staged). Qwen3-VL-4B image (STRICT) + video (near-tie-robust)
+are both correct e2e; speed is the remaining deliverable for the DONE bar.

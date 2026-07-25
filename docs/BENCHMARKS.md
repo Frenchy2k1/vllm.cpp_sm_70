@@ -260,7 +260,22 @@ STANDALONE under `flock`, cutlass-ON+FA2 - **27B 235/235, 35B 315/315, Coder 138
 forward. SPEED: **`benchmark_binding=false`, PENDING** - no throughput measured (the row is not DONE
 until every-axis vLLM speed parity; VIDEO = M3c, owed). No throughput number is claimed here.
 
-**Multimodal M3c - VIDEO preprocessing + wiring LANDED + unit-gated on Qwen3-VL-4B; e2e token-exact PENDING on tower fidelity (2026-07-25, `CLAIM-MULTIMODAL-M3C`).**
+**Multimodal M3c - VIDEO understanding WORKS e2e on Qwen3-VL-4B; e2e NEAR-TIE-ROBUST gate PASS (gate form RESOLVED BY MEASUREMENT 2026-07-25, `CLAIM-MULTIMODAL-TOWER-FIDELITY`; supersedes the `CLAIM-MULTIMODAL-M3C` "PENDING on tower fidelity" line below).**
+Disposition: **NO throughput measured; VIDEO correctness is COMPLETE - the e2e gate PASSES
+near-tie-robust (the sole divergence is a MEASURED genuine 0.125-nat bf16 near-tie, NOT a fidelity
+gap; the tower already f32-accumulates everywhere so there is no numeric fix to make, and the gate
+is the ratified near-tie form, NOT a loosened STRICT gate). speed pending.**
+Measurement (`scripts/mm/m3c_video_neartie_gap.py`, teacher-force vLLM 0.25.0 on OUR exact tokens
+with the identical video): the sole divergence is ONE near-tie at tok22 (' colorful' 33866 vs vLLM
+' static' 1099, gap **0.125 nats**, our token vLLM's 2nd of 4 tokens tied within 0.25 nats); EVERY
+downstream token IS vLLM's teacher-forced argmax at gap **0.0000** (22/32-vs-greedy = the one-token
+shift from that tie). vLLM's teacher-forced argmax == the golden at all 32 positions (self-consistent
+STRICT target). The gate: `test_qwen3vl_video_e2e` = anchor `our_ids_i32.bin` + `neartie_gap_mnats_i32.bin`,
+PASS iff all gaps <= 0.5 nats (max 0.125), identical in form to the olmo2/qwen3-dense/glm4 text gates.
+Reproduce: `flock $HOME/gpu.lock ./build/tests/test_qwen3vl_video_e2e`; regen goldens (dgx oracle):
+run the e2e with `VT_DUMP_IDS=1` then `PATH=$HOME/venvs/vllm-oracle/bin:$PATH flock $HOME/gpu.lock python scripts/mm/m3c_video_neartie_gap.py --fixture-dir tests/vllm/multimodal/fixtures/qwen3vl_video`.
+
+--- SUPERSEDED (original M3c landing note, kept for the audit trail) ---
 Disposition: **NO throughput measured; the video PATH is correct + unit-gated, the e2e STRICT
 token-exact gate does NOT yet pass (22/32) - RCA'd to the shared bf16 tower envelope, NOT loosened.**
 The genuinely-new piece is video PREPROCESSING (frame sampling + temporal grid + timestamp-interleaved
