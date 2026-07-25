@@ -23174,3 +23174,30 @@ seam on ChunkedTokenDatabase (empty->byte-identical). Processor-parity gate 23/2
 OK. NO vision tower/embed-merge (M2). SACRED CUDA text-inertness PASSED STANDALONE under flock (27B 235/235, 35B 315/315, Coder 138/138, cutlass-ON banner confirmed, clean -Werror);
 build `~/work/mm-m0m1-cuda`. Resume: `git -C ~/work/mm-m0m1 status`; rerun processor gate
 `./build-cpu/tests/test_qwen3vl_processor`. NOT pushed.
+
+- **2026-07-25** — **MULTIMODAL M2a: Qwen3-VL vision TOWER proven faithful vs vLLM 0.25.0**
+  (`CLAIM-MULTIMODAL-M2A`, base `origin/main` `463633d`, isolated worktree
+  `/home/mudler/_git/vllm.cpp-m2a` branch `m2a-vision-tower`; dgx build+gate `~/m2a_build`,
+  weights `~/m2a_weights`). Landed `src/vllm/model_executor/models/qwen3_vl_vision.{h,cpp}`
+  (`Qwen3_VisionTransformer` forward: patch-embed matmul+bias; host pos-embed
+  bilinear-interp+reorder + vision-rope cos|sin; 24 ViT blocks = LayerNorm + partial-rotary
+  vision RoPE via `vt::RopeFromCache` [neox convention verified vs `ApplyRotaryEmb`] +
+  non-causal `vt::Attention` + tanh-GELU MLP; patch merger = LN + exact-erf-GELU + 2 FCs;
+  DeepStack 3 post-shuffle mergers at 5/11/17 → `[196,10240]`) + 2 additive vt ops
+  `GeluTanh`/`GeluErf`. **Scope discovery:** M2 is 3 bricks not 1 — the Qwen3-VL LLM is NOT the
+  landed plain Qwen3-dense (needs MRoPE 3-D positions + DeepStack decoder injection), so M2
+  decomposed: **M2a tower [DONE]** → M2b MRoPE+DeepStack text backbone → M2c merge+e2e image
+  gate. **Gate PASS (dgx, one flock):** `tests/vllm/multimodal/test_qwen3vl_tower.cpp` 348/348 vs
+  the dumped 0.25.0 tower reference — patch-embed relL2 2.1e-3, block0 6.8e-3, merger 6.5e-2,
+  DeepStack 1.2e-2/3.3e-2/4.4e-2, full tower 5.1e-2; NEW-kernel gates pos-embed 2.5e-3 + rope
+  1.9e-3 TIGHT. Deep-stage tol = MEASURED bf16-depth envelope (smooth ~0.25%/layer, RCA'd
+  numerical). RED proven: rope disabled → block0 0.149, tower 0.75, 6 fails. cutlass-ON+FA2
+  banner CONFIRMED; clean CUDA `-Werror` 0 warnings; compute-sanitizer 0 errors. Text inertness
+  BY CONSTRUCTION (`git diff --stat` 128 insertions 0 deletions, additive vt ops only; no
+  runner/model TU). `benchmark_binding=false`. NOT pushed. **Resume M2b:**
+  `git -C /home/mudler/_git/vllm.cpp-m2a status`; rerun the tower gate on dgx —
+  `cd ~/m2a_build && flock $HOME/gpu.lock bash -lc 'cmake --build build --target test_qwen3vl_tower
+  && VLLM_QWEN3VL_WEIGHTS=$HOME/m2a_weights ./build/tests/test_qwen3vl_tower'`; references at
+  `tests/vllm/multimodal/fixtures/qwen3vl_tower/`, weight/ref dumps
+  `scripts/mm/m2a_tower_{ref,weight}_dump.py`. NEXT: fork the Qwen3-VL text backbone (MRoPE +
+  DeepStack decoder hooks) from the dense forward.

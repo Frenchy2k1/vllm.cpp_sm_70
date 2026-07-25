@@ -193,6 +193,56 @@ void ReluKernelCuda(Queue& q, Tensor& out, const Tensor& x) {
 }
 
 // ---------------------------------------------------------------------------
+// gelu (elementwise, Qwen3-VL vision tower). f32 compute, may alias in-place.
+//   tanh: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))  — gelu_pytorch_tanh
+//         (same constant as cuda_ops.cu GeluAndMulKernel gate).
+//   erf : 0.5*x*(1+erf(x/sqrt(2)))                      — exact nn.GELU().
+template <typename OutT, typename InT, bool kTanh>
+__global__ void GeluKernel(OutT* out, const InT* x, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step) {
+    const float v = Load(x, i);
+    float g;
+    if (kTanh) {
+      const float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+      g = 0.5f * v * (1.0f + tanhf(inner));
+    } else {
+      g = 0.5f * v * (1.0f + erff(v * 0.7071067811865476f));
+    }
+    Store(out, i, g);
+  }
+}
+
+template <bool kTanh>
+void GeluDispatch(Queue& q, Tensor& out, const Tensor& x) {
+  const int64_t n = x.Numel();
+  if (n == 0) return;
+  VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16, "cuda gelu: x must be f32 or bf16");
+  const unsigned grid = GridFor(n);
+  if (out.dtype == DType::kBF16) {
+    auto* o = static_cast<__nv_bfloat16*>(out.data);
+    if (x.dtype == DType::kBF16)
+      GeluKernel<__nv_bfloat16, __nv_bfloat16, kTanh><<<grid, kBlock, 0, AsStream(q)>>>(
+          o, static_cast<const __nv_bfloat16*>(x.data), n);
+    else
+      GeluKernel<__nv_bfloat16, float, kTanh><<<grid, kBlock, 0, AsStream(q)>>>(
+          o, static_cast<const float*>(x.data), n);
+  } else {
+    auto* o = static_cast<float*>(out.data);
+    if (x.dtype == DType::kBF16)
+      GeluKernel<float, __nv_bfloat16, kTanh><<<grid, kBlock, 0, AsStream(q)>>>(
+          o, static_cast<const __nv_bfloat16*>(x.data), n);
+    else
+      GeluKernel<float, float, kTanh><<<grid, kBlock, 0, AsStream(q)>>>(
+          o, static_cast<const float*>(x.data), n);
+  }
+  Check(cudaGetLastError(), "gelu launch");
+}
+
+void GeluTanhKernelCuda(Queue& q, Tensor& out, const Tensor& x) { GeluDispatch<true>(q, out, x); }
+void GeluErfKernelCuda(Queue& q, Tensor& out, const Tensor& x) { GeluDispatch<false>(q, out, x); }
+
+// ---------------------------------------------------------------------------
 // add: out[i] = a[i] + b[i % row_d] where row_d == d selects the rank-1 bias
 // row-broadcast and row_d == 0 selects the elementwise form. Grid-stride, may
 // alias in-place.
@@ -249,6 +299,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernelCuda)));
     RegisterOp(OpId::kRelu, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<ReluFn>(&ReluKernelCuda)));
+    RegisterOp(OpId::kGeluTanh, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<ReluFn>(&GeluTanhKernelCuda)));
+    RegisterOp(OpId::kGeluErf, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<ReluFn>(&GeluErfKernelCuda)));
     RegisterOp(OpId::kAdd, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<AddFn>(&AddKernelCuda)));
   }
