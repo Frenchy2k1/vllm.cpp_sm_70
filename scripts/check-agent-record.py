@@ -54,7 +54,12 @@ ENGINE_PREFIXES = (
     "ATTN",
     "LOAD",
 )
-ENGINE_ROWS = 116
+# 117 since 2026-07-25: +`ENG-MM-AUDIO-ENCODER` (the Whisper-class AUDIO encoder
+# tower, audio-track A2 — the encoder half of audio understanding, proven faithful
+# in isolation; a genuinely-new engine capability, distinct from the A0/A1
+# `ENG-MM-AUDIO-PIPELINE` INPUT row). Bumped for a real new row, never to make a
+# failing state transition pass.
+ENGINE_ROWS = 117
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

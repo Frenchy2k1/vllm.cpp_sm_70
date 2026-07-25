@@ -23657,3 +23657,53 @@ golden: 32/32"; ours[:8]==golden[:8]==760,1156,6587,728,310,7276,279,2678; oracl
 **NEXT:** mm SPEED (encoder-cache reuse + chunked-prefill mm) to reach the DONE bar; then
 Gemma-4 (M4, image+video+AUDIO, staged). Qwen3.6-27B image+video are both correct e2e — the
 user's stated Qwen3.6 video modality is COMPLETE.
+- **2026-07-25** — **AUDIO track A2 — the Whisper-class AUDIO ENCODER TOWER, proven
+  faithful in isolation** (`CLAIM-AUDIO-ENCODER`; `ENG-MM-AUDIO-ENCODER` NEW `ACTIVE`;
+  base `origin/main` `adcac8e`, isolated worktree `/home/mudler/_git/vllm-a2-audio-enc`
+  branch `feat/audio-a2-encoder`; dgx `~/work/a2-audio` — reference/weight DUMP on CPU
+  in `~/venvs/vllm-oracle` NO flock, the parity GATE under ONE `flock $HOME/gpu.lock`
+  FOREGROUND, sibling 27B NOT co-resident). New additive TU
+  `include/vllm/model_executor/models/whisper_audio.{h,cpp}` +
+  `src/…/whisper_audio.cpp`: `WhisperAudioEncoderForward` mirrors transformers
+  `WhisperEncoder` (`modeling_whisper.py` `WhisperEncoder.forward:641-721`,
+  `WhisperEncoderLayer.forward:400-430`, `WhisperAttention.forward:298-368` [q pre-scaled
+  by head_dim⁻⁰·⁵, **k_proj NO bias**], `sinusoids:54` @ 5.13.1; cross-checked the
+  faithful vLLM port `whisper.py:458,353,322,473-476` @ `e24d1b24`). Consumes the A1
+  log-mel `input_features` `[80,3000]` → encoder hidden states `[1500,768]`: conv
+  frontend as **im2col + `vt::MatmulBT`** (Conv1d 80→768 k3 pad1 s1 + GELU-erf →
+  Conv1d 768→768 k3 pad1 **s2** halving 3000→1500 + GELU-erf; Whisper conv is a FULL
+  cross-channel conv, NOT the depthwise `vt::CausalConv1d`, so NO new CUDA kernel) →
+  + fixed sinusoidal `embed_positions` (dumped GOLDEN constant) → 12 pre-norm
+  bidirectional blocks (`self_attn_layer_norm` → q/k/v → `vt::Attention(causal=false)`
+  scale head_dim⁻⁰·⁵ → out_proj → residual → `final_layer_norm` → GELU-erf MLP →
+  residual) → final `layer_norm`. All GEMMs bf16, norm/softmax f32 (production dtype,
+  matches vLLM + M2a). Reference dumped in **bf16 on CPU** (`scripts/mm/
+  a2_audio_encoder_ref.py`, post_pos reconstruction maxdev 0.0); weights dumped f32
+  (`a2_audio_encoder_weight_dump.py`, uncommitted ~337 MiB) rounded fp32→bf16 on
+  upload (whisper-small ships fp32). **DELTA from M2a vision tower:** no
+  patch-merger/DeepStack/RoPE (fully bidirectional + fixed additive sinusoid), conv
+  frontend not patchify matmul, GELU-erf everywhere (vision used tanh-GELU MLP), LN
+  names `self_attn_layer_norm`/`final_layer_norm`; same Buf/UpBf16/LinearBias scaffold.
+  **GATE (`tests/vllm/multimodal/test_whisper_audio.cpp`, GPU under flock, cutlass-ON
+  banner CONFIRMED [cutlass-nvfp4/fp8 + FA2 + Triton-AOT sm_121a], sibling 27B NOT
+  co-resident): encoder-tower fidelity PASS 203/203** — post_conv rel-L2 **4.7e-3**,
+  post_pos **2.8e-3**, block0 **6.6e-3**, encoder-output **3.0e-2** (bf16-depth
+  envelope ~0.28%/layer over 12 layers, matches M2a's ~0.25%/layer; bands post_conv/
+  post_pos<8e-3, block0<1.5e-2, final<5e-2 = measured×1.6–2.3). **RED-first
+  (revert-experiment under flock):** wrong conv-stride (s1) → post_conv **0.34** (72×,
+  FAIL); missing sinusoid → post_pos **0.86** (FAIL); skipped final-LN → **4.22**
+  (140×, FAIL). Honest non-discriminators (recorded, NOT loosened): GELU-tanh vs erf
+  stays IN-envelope (tanh≈erf below the bf16 depth — we use faithful erf regardless);
+  a single conv1-weight ×3 is aggregate-insensitive (1 of 184 320) — the STRIDE RED
+  is the conv discriminator. **INERT:** `git diff --stat` vs `adcac8e` = 7 additive
+  entries + committed reference fixtures, NO shared forward/kernel/runner/registry/
+  other-model TU ⇒ text + image + video + audio-pipeline byte-identical BY
+  CONSTRUCTION; `check-device-leakage` unchanged; im2col + existing GEMM ⇒ no new
+  kernel, no compute-sanitizer needed. Clean CUDA + CPU `-Werror` 0 warnings; all
+  seven record checkers green by bare RC. `benchmark_binding=false`, SPEED pending.
+  Not pushed; FULL SHA reported. **HONEST:** A2 is the encoder tower proven in
+  ISOLATION vs a dumped reference, NOT audio→text (that is A3 e2e on Voxtral-Mini-3B:
+  projector RMSNorm+Linear + masked-scatter merge into the LANDED Mistral decoder).
+  The USM-Conformer tower (Gemma-4/Granite family: Conv2d stride-2 semicausal
+  subsample + Conformer conv-module + relative-position attention + softcap) is a
+  SEPARATE tower delta (A2-follow, Granite-Speech-2b), NOT built here. NEXT: A3.

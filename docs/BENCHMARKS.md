@@ -257,6 +257,28 @@ assertions** (`tests/vllm/multimodal/test_audio_processor.cpp`, CPU-only). Repro
 PENDING** - this is the INPUT pipeline (feature parity), NOT audio->text (A2 encoder tower + A3 e2e
 on Voxtral-Mini-3B are owed); no throughput number is claimed.
 
+**AUDIO track A2 - Whisper-class AUDIO ENCODER TOWER on `openai/whisper-small`, encoder-tower fidelity
+gate PASS, NO throughput (2026-07-25, `CLAIM-AUDIO-ENCODER` [spec](../.agents/specs/audio-track.md) §0b).**
+CORRECTNESS: the C++ `WhisperAudioEncoderForward` (`src/vllm/model_executor/models/whisper_audio.cpp`:
+2x Conv1d frontend as im2col + `vt::MatmulBT` [no new CUDA kernel] halving 3000->1500 tokens, fixed
+sinusoidal `embed_positions` golden, 12 pre-norm bidirectional blocks w/ k_proj-no-bias +
+`vt::Attention(causal=false)` + GELU-erf MLP, final `layer_norm`) consumes the A1 log-mel
+`input_features` `[80,3000]` -> encoder hidden states `[1500,768]`, vs the dumped bf16 transformers
+5.13.1 `WhisperEncoder` reference (`scripts/mm/a2_audio_encoder_ref.py`, per-stage goldens in
+`tests/vllm/multimodal/fixtures/whisper_audio/enc_*`): per-stage rel-L2 **post_conv 4.7e-3, post_pos
+2.8e-3, block0 6.6e-3, encoder-output 3.0e-2** (bf16-depth envelope ~0.28%/layer over 12 layers,
+matches the M2a vision tower's ~0.25%/layer; bands post_conv/post_pos<8e-3, block0<1.5e-2, final<5e-2
+= measured x1.6-2.3), RED-first (wrong conv-stride 0.34 / missing sinusoid 0.86 / skipped final-LN
+4.22 all FAIL; honest non-discriminators recorded: GELU-tanh~erf in-envelope, single conv-weight
+aggregate-insensitive); **203/203 assertions** (`tests/vllm/multimodal/test_whisper_audio.cpp`, GPU
+under `flock` on a cutlass-ON build [cutlass-nvfp4/fp8+FA2+Triton-AOT sm_121a banner CONFIRMED],
+sibling 27B NOT co-resident). Reproduce: dump weights via `scripts/mm/a2_audio_encoder_weight_dump.py`
+then `VLLM_WHISPER_ENC_WEIGHTS=<dir> ./build-cuda/tests/test_whisper_audio` under `flock $HOME/gpu.lock`.
+Inert (additive, 7 files + fixtures, no shared TU -> text/image/video/audio-pipeline byte-identical by
+construction; `check-device-leakage` unchanged; im2col+existing GEMM -> no compute-sanitizer). SPEED:
+**`benchmark_binding=false`, PENDING** - this is the encoder tower proven in ISOLATION, NOT audio->text
+(A3 e2e on Voxtral-Mini-3B is owed); no throughput number is claimed.
+
 **Multimodal M3-W0 - Qwen3.6-27B image, checkpoint+oracle GROUNDED, e2e gate PENDING (2026-07-25, `CLAIM-MULTIMODAL-M3`).**
 Disposition: **NO throughput measured; the image e2e correctness gate is NOT yet run (M3-b, next brick).**
 W0 RESOLVED the gating fact: the vision-inclusive checkpoint is `Qwen/Qwen3.6-27B` (51.7 GiB uniform
