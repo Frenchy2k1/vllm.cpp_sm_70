@@ -185,6 +185,16 @@ target_compile_definitions(test_audio_processor PRIVATE
 vllm_cpp_add_test(test_qwen3_5_vl_video_e2e vllm/multimodal/test_qwen3_5_vl_video_e2e.cpp)
 target_compile_definitions(test_qwen3_5_vl_video_e2e PRIVATE
   MM_VIDEO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3_5_27b_video")
+# Audio-track A2 Whisper encoder-tower faithfulness gate: the C++
+# WhisperAudioEncoderForward (2x Conv1d im2col+MatmulBT + sinusoidal pos + 12
+# pre-norm bidirectional encoder blocks + final layer_norm) vs the dumped
+# transformers-5.13.1 WhisperEncoder reference (per-stage post_conv/post_pos/
+# block0/final_ln within the bf16-depth envelope). Needs a CUDA backend + the
+# dumped encoder.* weights (VLLM_WHISPER_ENC_WEIGHTS); else skipped, not failed
+# (scripts/mm/a2_audio_encoder_{ref,weight}_dump.py; embed_positions committed).
+vllm_cpp_add_test(test_whisper_audio vllm/multimodal/test_whisper_audio.cpp)
+target_compile_definitions(test_whisper_audio PRIVATE
+  MM_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/whisper_audio")
 # Multimodal M1 encoder-cache manager (inert-when-off engine seam).
 vllm_cpp_add_test(test_encoder_cache_manager vllm/v1/core/test_encoder_cache_manager.cpp)
 # LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip

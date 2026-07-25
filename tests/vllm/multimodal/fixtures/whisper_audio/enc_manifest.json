@@ -1,0 +1,60 @@
+{
+  "model_id": "openai/whisper-small",
+  "vehicle": "openai/whisper-small WhisperEncoder (transformers 5.13.1, CPU)",
+  "ref_dtype": "bfloat16",
+  "note": "cast fp32 checkpoint -> ref_dtype; input_features from the committed A1 golden; encoder-block math is the parity variable",
+  "config": {
+    "d_model": 768,
+    "encoder_layers": 12,
+    "encoder_attention_heads": 12,
+    "encoder_ffn_dim": 3072,
+    "num_mel_bins": 80,
+    "max_source_positions": 1500,
+    "n_frames": 3000,
+    "activation_function": "gelu",
+    "layer_norm_eps": 1e-05,
+    "attn_scaling": 0.125,
+    "k_proj_bias": false,
+    "conv1": "Conv1d(80->768,k3,pad1,stride1)",
+    "conv2": "Conv1d(768->768,k3,pad1,stride2)"
+  },
+  "stages": {
+    "enc_embed_positions_f32": {
+      "shape": [
+        1500,
+        768
+      ],
+      "sha256": "95da10e81671157d472266e45159a47bea0a0c212136f8a683f0ebfcbd72d756"
+    },
+    "enc_post_conv_f32": {
+      "shape": [
+        1500,
+        768
+      ],
+      "sha256": "cea5937dc143b81a8f6af64c59662659cff09734400b6e4fe8a94c737101d90f"
+    },
+    "enc_post_pos_f32": {
+      "shape": [
+        1500,
+        768
+      ],
+      "sha256": "7e3c3a0374821bcf0e570211592abf60e9935d03e2c56ee5db385edde41b37a0"
+    },
+    "enc_block0_f32": {
+      "shape": [
+        1500,
+        768
+      ],
+      "sha256": "1b8d0cf5afccc9122f96999865d16b6d0c8444f408984feeb9c842923e088a7e"
+    },
+    "enc_final_ln_f32": {
+      "shape": [
+        1500,
+        768
+      ],
+      "sha256": "0a99a18a7a08fabf2678c1bac2597d3d827d847457049285c7509e4a3d0bdfd2"
+    }
+  },
+  "post_pos_reconstruction_maxdev": 0.0,
+  "upstream": "transformers modeling_whisper.py:641-721,400-430,298-368,54 @ 5.13.1; vllm whisper.py:458,353,322,473-476 @ e24d1b24"
+}

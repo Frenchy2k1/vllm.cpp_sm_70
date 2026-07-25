@@ -1,7 +1,8 @@
 # AUDIO track — the genuinely-new AUDIO modality (A0–A3)
 
-**Status: A0 + A1 LANDED (2026-07-25, `CLAIM-AUDIO-PIPELINE`). A2 (encoder tower)
-+ A3 (e2e audio→text) REMAINING.** This is the modality-first, oracle-runnable
+**Status: A0 + A1 + A2 LANDED (2026-07-25; A0/A1 `CLAIM-AUDIO-PIPELINE`, A2
+`CLAIM-AUDIO-ENCODER`). A3 (e2e audio→text on Voxtral-Mini-3B) REMAINING.** This is
+the modality-first, oracle-runnable
 path that stands up audio on the smallest native-tower vehicle
 (`openai/whisper-small`) before carrying it to Voxtral-Mini-3B (A3) and Gemma-4
 (G3). It does NOT depend on Gemma-4 (which is oracle-blocked, see
@@ -126,15 +127,107 @@ compute-sanitizer needed; `check-device-leakage` unchanged (32 == baseline).
 
 ---
 
-## 1. REMAINING (A2 + A3)
+## 0b. What LANDED (A2 — the Whisper-class encoder tower, faithful in isolation)
 
-- **A2 — AUDIO encoder TOWER.** Whisper-class encoder first (2×Conv1d + transformer;
-  reuse `vt::` GEMM/attn/LayerNorm/GELU), proven faithful in isolation vs a dumped
-  oracle reference (mirror M2a, bf16-envelope tol). Then the USM Conformer delta
-  (Conv2d stride-2 semicausal subsample + conv-module + relative-position attention
-  + softcap), proven on Granite-Speech-2b — the Gemma-4-family tower. New kernels
-  (Conv2d subsample, Conformer conv-module, relative-position bias) get
-  compute-sanitizer 0. GPU under `flock`.
+Row `ENG-MM-AUDIO-ENCODER` (engine-matrix, `ACTIVE`, owner `CLAIM-AUDIO-ENCODER`).
+
+
+New additive TU `include/vllm/model_executor/models/whisper_audio.{h,cpp}` +
+`src/…/whisper_audio.cpp`, mirroring transformers `WhisperEncoder`
+(`modeling_whisper.py` @ 5.13.1: `WhisperEncoder.forward:641-721`,
+`WhisperEncoderLayer.forward:400-430`, `WhisperAttention.forward:298-368`,
+`sinusoids:54`; cross-checked vs the faithful vLLM port `whisper.py:458,353,322,
+473-476`). Consumes the A1 log-mel `input_features` `[80,3000]`, produces encoder
+hidden states `[1500,768]`:
+- **conv frontend as im2col + `vt::MatmulBT` (no new CUDA kernel):** Conv1d(80→768,
+  k3,pad1,stride1) + GELU-erf → Conv1d(768→768,k3,pad1,**stride2**, halving
+  3000→1500) + GELU-erf; the stride-2 matmul emits the already-transposed `[1500,
+  768]`. Whisper conv is a FULL cross-channel conv, NOT the depthwise
+  `vt::CausalConv1d` (Mamba/GDN), so it is expressed as im2col + the existing GEMM.
+- **fixed sinusoidal `embed_positions.weight [1500,768]`** added — dumped as a
+  GOLDEN CONSTANT (`enc_embed_positions_f32.bin`, like A1's mel filterbank) so the
+  encoder-block math is the parity variable.
+- **12 pre-norm encoder blocks:** `self_attn_layer_norm` → q(bias)/k(**NO bias**)/
+  v(bias) → full **bidirectional** `vt::Attention(causal=false)` (scale=head_dim⁻⁰·⁵,
+  q pre-scaling folded into the call as transformers does) → out_proj → residual →
+  `final_layer_norm` → MLP(fc1 768→3072, GELU-erf, fc2 3072→768) → residual.
+- **final `layer_norm`** → `[1500,768]`. All GEMMs bf16, norm/softmax accumulate
+  f32 (production dtype, matches vLLM's bf16 encoder + the M2a methodology).
+- **weight loader:** the C++ unit test loads `encoder.*` (conv/attn/mlp/LN) from a
+  dumped f32 dir (`scripts/mm/a2_audio_encoder_weight_dump.py`, uncommitted ~130
+  MiB) rounded fp32→bf16 on upload; whisper-small ships fp32, cast to bf16
+  (identical rounding both sides).
+
+**Delta from the M2a vision tower:** NO patch-merger, NO DeepStack, NO RoPE (fully
+bidirectional, a fixed additive sinusoid instead of positional rotation); a CONV
+frontend rather than a patchify matmul; GELU-erf everywhere (vision used tanh-GELU
+in the MLP); LN names `self_attn_layer_norm`/`final_layer_norm`. Same Buf/UpBf16/
+LinearBias scaffold and unit-gate methodology.
+
+### The A2 gate (PASS) — encoder-tower fidelity vs the dumped oracle
+
+`tests/vllm/multimodal/test_whisper_audio.cpp` runs the C++ tower on the committed
+A1 `input_features` golden and compares 4 per-stage taps vs the bf16 transformers
+5.13.1 `WhisperEncoder` reference (`scripts/mm/a2_audio_encoder_ref.py`, dumped on
+CPU), **on the GPU under `flock` on a cutlass-ON build** (banner CONFIRMED:
+cutlass-nvfp4/fp8 + FA2 + Triton-AOT ENABLED for sm_121a), the sibling 27B NOT
+co-resident:
+- **post_conv rel-L2 = 0.00473** (maxabs 0.039) — the conv frontend, TIGHT;
+- **post_pos rel-L2 = 0.00280** (after + sinusoid);
+- **block0 rel-L2 = 0.00660** — one full encoder block, TIGHT;
+- **final_ln (the `[1500,768]` encoder output) rel-L2 = 0.03049** (maxabs 6.44).
+- **203/203 assertions pass; clean CUDA + CPU `-Werror` (0 warnings).**
+
+**Tolerance (measured bf16-depth envelope, bands post_conv/post_pos <8e-3, block0
+<1.5e-2, final <5e-2 = measured × ~1.6–2.3).** The conv frontend + first block match
+the transformers bf16 reference TIGHTLY (<0.7%), proving the im2col+MatmulBT conv,
+the sinusoid add, and the pre-norm block are correct; the final output diverges only
+by SMOOTH bf16 accumulation across the 12 layers between two independent bf16 kernel
+stacks (our `vt` ops vs transformers' bf16 conv/linear/SDPA), the same ~0.28%/layer
+the M2a vision tower measured (there ~0.25%/layer). No discontinuity ⇒ numerical, not
+a logic error. Bit-exact is infeasible (different GEMM/attn kernels); token-exact e2e
+is the ultimate bar at A3.
+
+**RED-first (the gate bites).** Each structural bug drives a stage FAR past its band
+(GPU under `flock`, revert-experiment):
+- **wrong conv-stride** (conv2 stride 1 instead of 2 → wrong down-sample): post_conv
+  **0.34** (72× the 4.7e-3 band), FAILURE — the conv frontend / stride-2 halving is
+  gate-discriminated (and it also sets num_audio_tokens=1500 = A1's placeholder count);
+- **missing sinusoidal pos** (skip the `embed_positions` add): post_pos **0.86**,
+  block0 **1.53**, final **1.08**, FAILURE;
+- **skipped final `layer_norm`** (return pre-LN hidden): final **4.22** (140× the
+  5e-2 band), FAILURE.
+- Honest non-discriminators (recorded, not loosened): **GELU-tanh vs GELU-erf** stays
+  IN the envelope (final 0.0343 vs 0.0305) — the tanh approximation agrees with erf
+  BELOW the bf16-depth envelope, so this axis is not gate-discriminated (we use the
+  faithful erf regardless, per the reference `nn.functional.gelu`); a **single
+  conv1-weight ×3** perturbation is aggregate-insensitive (one of 184 320 conv1
+  weights across 1500×768 outputs) — the STRIDE RED is the conv-path discriminator.
+
+**Inertness (proven).** `git diff --stat` vs `adcac8e` = 7 ADDITIVE entries (new
+`whisper_audio.{h,cpp}` + test + 2 dump scripts, +1 `CMakeLists.txt` source line, +10
+`tests/CMakeLists.txt` lines) plus the committed reference fixtures. NO shared forward
+/ kernel / runner / registry / other-model TU edited ⇒ the SACRED text gates + the
+landed image/video/audio-pipeline gates are byte-identical BY CONSTRUCTION. `check-
+device-leakage` unchanged. No CUDA kernel added (im2col + existing GEMM) ⇒ no
+compute-sanitizer run needed.
+
+**USM-Conformer delta (A2-follow, NOT built here).** Gemma-4/gemma3n/Granite use a
+USM Conformer audio tower, NOT this Whisper-class encoder: Conv2d stride-2 semicausal
+SUBSAMPLING (not 2×Conv1d), Conformer blocks (conv-module + macaron FFN),
+RELATIVE-position attention, and attention softcap. That is a genuinely-different
+tower — to be proven separately on **Granite-Speech-2b** as an A2-follow sub-item
+(new kernels get compute-sanitizer 0). A1/A2 de-risk the Whisper-class pipeline +
+tower fully, NOT the Conformer.
+
+---
+
+## 1. REMAINING (A3)
+
+- **A2-follow — USM Conformer tower** (Granite-Speech-2b), the Gemma-4-family audio
+  tower delta (Conv2d stride-2 semicausal subsample + Conformer conv-module +
+  relative-position attention + softcap). New kernels get compute-sanitizer 0. GPU
+  under `flock`. (Scoped above; not built.)
 - **A3 — e2e AUDIO→text gate.** `Voxtral-Mini-3B`: native Whisper-class encoder
   (A2) + projector (RMSNorm+Linear, `vt::` ops) + masked-scatter merge (REUSE the
   `VLGenerateCore`/`Qwen3VLMergeMultimodal` pattern) into the LANDED Mistral decoder
@@ -209,7 +302,10 @@ throughput; A1 is `ACTIVE` (feature-parity + inertness proven, speed pending).
    PROVEN (additive; shared-TU gates re-run byte-identical).
 2. **Audio feature parity (A1).** log-mel rel-L2 within the stated band + ids +
    mm-hash bit/byte-exact, RED-first. PASS (rel-L2 1.96e-7, 77/77).
-3. **Audio tower fidelity (A2)** — owed.
+3. **Audio tower fidelity (A2)** — PASS. Encoder-tower per-stage rel-L2 within the
+   measured bf16-depth envelope vs the dumped oracle (post_conv 4.7e-3, block0
+   6.6e-3, encoder-output 3.0e-2), RED-first (stride/pos/final-LN blow it), GPU
+   under flock on a cutlass-ON build. (USM Conformer A2-follow owed.)
 4. **Audio e2e (A3, SACRED)** — owed.
 5. **Build/records.** Clean CPU `-Werror` 0 warn; `check-device-leakage`
    unchanged; the record checkers green. (No CUDA kernel added.)
@@ -230,7 +326,8 @@ family incl. Gemma-4 (G3, once its oracle block clears).
 |---|---|---|
 | A0 — vehicle + oracle reference (whisper-small; log-mel/mel/placeholder/mm-hash goldens + capture script) | **DONE** | references produced, content-hashed |
 | A1 — C++ audio INPUT pipeline + inert seam (decode/resample/log-mel/expansion/mm-hash) | **DONE** | feature-parity 77/77 (rel-L2 1.96e-7, ids+hash bit/byte-exact) + inertness |
-| A2 — audio encoder TOWER (Whisper-class → USM Conformer on Granite-Speech-2b) | OWED | tower rel-L2 within bf16 envelope vs oracle dump, RED-first; compute-sanitizer 0 on new kernels |
+| A2 — audio encoder TOWER (Whisper-class, `whisper-small`) | **DONE** | tower fidelity gate PASS 203/203 (post_conv 4.7e-3, block0 6.6e-3, encoder-output 3.0e-2, bf16 envelope; RED-first stride/pos/final-LN blow it; GPU under flock, cutlass-ON) |
+| A2-follow — USM Conformer tower (Granite-Speech-2b) | OWED | Conformer tower rel-L2 within bf16 envelope vs oracle dump, RED-first; compute-sanitizer 0 on new kernels (Conv2d subsample, conv-module, rel-pos) |
 | A3 — e2e audio→text on Voxtral-Mini-3B (encoder + projector-merge into LANDED Mistral) | OWED | audio→text token-exact vs vLLM 0.25.0, gate form by measurement |
 
 ### Risks/decisions

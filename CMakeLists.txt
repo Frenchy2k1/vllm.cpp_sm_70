@@ -339,6 +339,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/granite.cpp
   src/vllm/model_executor/models/model_registry.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
+  src/vllm/model_executor/models/whisper_audio.cpp
   src/vllm/model_executor/models/qwen3_vl_text.cpp
   src/vllm/model_executor/models/qwen3_vl.cpp
   src/vllm/multimodal/hasher.cpp
