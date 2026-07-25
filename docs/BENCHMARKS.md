@@ -2171,6 +2171,22 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Darwin arm64 build fix for the i8mm CPU-quant tiers -
+  `NOT APPLICABLE` (2026-07-25, `CLAIM-DARWIN-I8MM-DETECT`).**
+  `benchmark_binding=false`. **Build/portability fix, no kernel change.**
+  cpu_quant_repack_arm.cpp and cpu_quant_dot_arm.cpp gated on
+  `__aarch64__ && __ARM_FEATURE_MATMUL_INT8` but unconditionally included
+  Linux-only `<asm/hwcap.h>`/`<sys/auxv.h>`, so macOS arm64 (Apple Silicon,
+  where clang defines the i8mm macro) failed to compile - caught by LocalAI
+  PR #11100 darwin-metal CI, the first job to build these files on Darwin.
+  Runtime detection is now per-OS behind one `CpuHasI8mm()` helper: Linux
+  keeps the exact `getauxval(AT_HWCAP2) & HWCAP2_I8MM` expression; Darwin
+  asks `sysctlbyname("hw.optional.arm.FEAT_I8MM")`; other OSes report false
+  (portable tiers serve). Kernels, tile shapes and dispatch order are
+  untouched, so no binding number is created, re-based, or invalidated.
+  Evidence: aarch64-linux g++ `-march=armv8.2-a+i8mm -fsyntax-only` green on
+  both files (DGX); Darwin compile proven by the consumer CI matrix.
+
 - **Multi-turn tool-conversation fields through the chat protocol -
   `NOT APPLICABLE` (2026-07-24, `CLAIM-TOOL-TURN-FIELDS`).**
   `benchmark_binding=false`. **Protocol/serving fix, no decode-path change.**

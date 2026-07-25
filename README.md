@@ -277,7 +277,7 @@ For C++ consumers, the higher-level surface lives under [`include/vllm/`](includ
 
 | Backend | Hardware | State |
 |---|---|---|
-| CPU | x86-64 and arm64 | Correctness / CI reference; at or ahead of llama.cpp on every GGUF axis (prefill 1.18x, decode parity, memory parity), with an Arm i8mm quant-GEMM tier |
+| CPU | x86-64 and arm64 | Correctness / CI reference; at or ahead of llama.cpp on every GGUF axis (prefill 1.18x, decode parity, memory parity), with an Arm i8mm quant-GEMM tier (runtime-detected via auxv on Linux, sysctl on Apple Silicon) |
 | CUDA | GB10 / DGX Spark, sm_121a | Gate-model correctness passes; 27B at/above vLLM throughput, 35B prefill-pending. The only runtime-gated CUDA target |
 | CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
 | CUDA | Hopper, sm_90a | Build-supported, portable-kernels-only (accelerated paths disabled, no Hopper kernel bodies); not runtime-proven here |
