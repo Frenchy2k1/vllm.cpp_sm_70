@@ -23077,3 +23077,35 @@ encoder-cache seam (inert without mm input) → M2 first vision tower + merge on
 Qwen3-VL-4B → image gate → M3 complete Qwen3.6 image (reuse tower) then video → M4
 Gemma-4 (staged, honesty-pass blocked pieces) → M5 audio if reachable. Critical path
 M0→M1→M2→M3; M4/M5 deferred. Records only; NOT pushed.
+
+## 2026-07-25 — KERNEL-FUSION-FRAMEWORK consistency audit (`CLAIM-FUSION-CONSISTENCY-AUDIT`)
+
+Read-only static audit answering "are we consistent with our fusion framework and
+use it everywhere?" Base `origin/main` `39943fc`, isolated worktree, spec/records +
+one additive CI checker only (no source/kernel/forward change).
+
+**Verdict: MOSTLY consistent.** The `vt::FusedChain` catalog + dispatch is proven
+end-to-end (W0-W4; all four backends CPU/CUDA/Metal/Vulkan register `kFusedChain`).
+The MVP gate model (qwen3_5 base/dense/moe/mtp — the variant TUs delegate to the
+shared migrated `Qwen3_5{,Dense}Model` forward blocks) routes EVERY bespoke fused op
+through `FusedChain(recipe)` behind `FusedChainAdoptEnabled()` (default ON, hand-call
+rollback else-branch). qwen3, qwen3_moe, deepseek_v2 adopted `kFusedAddRmsNorm{,Std}`.
+
+**The one real drift (ranked #1):** gemma, gemma2, gemma3, glm4, phi3 hand-call the
+residual `vt::RmsNorm(..., &res)` add+RMSNorm chain (~3 sites each) and NEVER
+reference the catalog, though the recipe for both variants already exists
+(`kFusedAddRmsNorm` gemma-(1+w) / `kFusedAddRmsNormStd` plain-w). Fix = a one-line
+`FusedChain(...)` adoption per site (byte-exact by construction, perf-neutral),
+tracked as follow-on `FUSION-DENSE-MIGRATE`. Deliberately-not-fused (correct):
+olmo2 (post-norm, add separate from norm), granite (residual-multiplier), opt
+(LayerNorm). Known-deferred: qwen3_5 GDN glue + `kMoeCombineGate` (spike §10 W2
+remainder, no recipe declared — single CUDA realization, no additivity gap today).
+
+**Enforcement (implemented, green):** `scripts/check-fusion-consistency.py` +
+`scripts/fusion-consistency-allowlist.txt` + mutation test
+`tests/scripts/test_check_fusion_consistency.py` (10/10), wired into the
+`agent-record` CI job. It flags any model that hand-fuses add+RMSNorm without the
+catalog unless allowlisted — the 5 drift stems are allowlisted so the gate is GREEN
+at HEAD while a NEW silent bypass fails and migrating a drift model = removing its
+allowlist line. Coarse per-file floor (not per-site), limitation recorded in the
+spec. Full detail: `.agents/specs/fusion-consistency-audit.md`. Not pushed.

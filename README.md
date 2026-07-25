@@ -300,7 +300,7 @@ For C++ consumers, the higher-level surface lives under [`include/vllm/`](includ
 
 ## Verification and parity
 
-Every model is gated token-for-token against the pinned vLLM 0.25.0 oracle on the same workload, and every change that could affect correctness or performance is compared apples-to-apples against vLLM with both numbers and the ratio recorded. Behavioral CPU tests run under CTest; CUDA correctness, sanitizer, trace, and performance evidence is recorded per feature rather than inferred from source. The protocol is in [`.agents/gates.md`](.agents/gates.md) and [`.agents/benchmark-protocol.md`](.agents/benchmark-protocol.md).
+Every model is gated token-for-token against the pinned vLLM 0.25.0 oracle on the same workload, and every change that could affect correctness or performance is compared apples-to-apples against vLLM with both numbers and the ratio recorded. Behavioral CPU tests run under CTest; CUDA correctness, sanitizer, trace, and performance evidence is recorded per feature rather than inferred from source. The protocol is in [`.agents/gates.md`](.agents/gates.md) and [`.agents/benchmark-protocol.md`](.agents/benchmark-protocol.md). A CI check (`scripts/check-fusion-consistency.py`) additionally keeps model forwards routing their fusable add+RMSNorm glue through the portable fusion catalog rather than hand-fusing it.
 
 ## Why vllm.cpp
 

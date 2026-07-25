@@ -27,6 +27,10 @@ jobs:
         run: |
           python3 scripts/check-env-doc.py
           python3 tests/scripts/test_check_env_doc.py
+      - name: Model add+RMSNorm glue routes through the fusion catalog
+        run: |
+          python3 scripts/check-fusion-consistency.py
+          python3 tests/scripts/test_check_fusion_consistency.py
   documentation-checkpoint:
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.

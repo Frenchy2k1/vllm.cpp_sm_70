@@ -3634,3 +3634,7 @@ Correctness: CPU-unit only - `test_prepare_prefill_inputs` 7 cases / 27 assertio
 chunked-prefill, CG padding), RED-first proven by a reverted no-op stub (7/7
 fail). No CUDA kernel added, so CUDA==CPU / compute-sanitizer are N/A.
 Reproduction: `cd /home/mudler/_git/vllm.cpp.wt/i5b && ./build-cpu/tests/test_prepare_prefill_inputs`.
+
+## KERNEL-FUSION-FRAMEWORK consistency audit (2026-07-25, `CLAIM-FUSION-CONSISTENCY-AUDIT`)
+
+NOT APPLICABLE (read-only static audit + one additive CI checker, `benchmark_binding=false`) - no forward code changed, so no benchmark is owed and every SACRED gate is untouched by construction. Verdict: the `vt::FusedChain` catalog is MOSTLY used consistently (qwen3_5 family fully migrated; qwen3/qwen3_moe/deepseek_v2 adopted the add+RMSNorm recipes); drift is gemma/gemma2/gemma3/glm4/phi3 hand-fusing add+RMSNorm without the catalog (follow-on `FUSION-DENSE-MIGRATE`, perf-neutral). New `scripts/check-fusion-consistency.py` (+ mutation test 10/10) enforces it. Full audit: `.agents/specs/fusion-consistency-audit.md`.
