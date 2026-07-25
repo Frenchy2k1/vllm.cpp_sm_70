@@ -300,6 +300,13 @@ bf16-rounded); the DeepStack scatter `[3,204,16]` and the embed-merge `[204,16]`
 RED-first: a wrong MRoPE layout (contiguous split instead of interleaved) drives q rel-L2 **>5e-2**,
 so the gate pins the exact section selection. Clean CPU `-Werror`. Text-inertness holds by
 construction (additive TU only; the shared dense forward is untouched). No speed number.
+**M2c gate form DECIDED BY MEASUREMENT** (`scripts/mm/m2c_e2e_golden.py`, dgx under `flock`): vLLM
+0.25.0 greedy `enforce_eager` on the fixed (image, prompt) for Qwen3-VL-4B is **DETERMINISTIC across
+K=5** (first_divergence=None) → the M2c e2e image gate is **STRICT token-exact** (not a near-tie band).
+The golden is committed (`tests/vllm/multimodal/fixtures/qwen3vl_text/gen_tokens_i32.bin`, 32 greedy
+tokens, sha256 `3ec5f2b7...`; vLLM correctly reads the random-noise fixture as "a noise pattern /
+static"). The e2e image forward (VL weight loader + forked MRoPE/DeepStack decode + greedy) is the
+remaining M2c wire-up that will be gated STRICT against this golden.
 
 **GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,

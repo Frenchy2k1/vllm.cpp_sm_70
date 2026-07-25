@@ -409,10 +409,17 @@ scope audit found the LLM side is NOT the landed plain Qwen3-dense (it needs MRo
   decode forward (inputs_embeds instead of embed-from-ids + `vt::RopeFromCache` MRoPE +
   DeepStack add after layers 0/1/2) + a single-seq greedy loop (scaffold =
   `tests/vllm/models/test_qwen3_forward.cpp`) → Gate 3 (image token-exact vs vLLM 0.25.0
-  on Qwen3-VL-4B, fixed image+prompt, greedy; form by measurement). This is the first
-  end-to-end image→text proof. RISK: the M2a tower is bf16-envelope faithful (rel-L2
-  ~5e-2), so a deterministic vLLM near-tie could flip the argmax (distributional
-  fallback only if measured per [[near-tie-distributional-gate]]).
+  on Qwen3-VL-4B, fixed image+prompt, greedy). **GATE FORM DECIDED BY MEASUREMENT
+  (2026-07-25, `scripts/mm/m2c_e2e_golden.py`): STRICT token-exact.** vLLM 0.25.0
+  greedy `enforce_eager` on the fixed (image, prompt) is DETERMINISTIC across K=5
+  (first_divergence=None) → the M2c e2e gate is STRICT, not near-tie. The golden is
+  captured + committed (`tests/vllm/multimodal/fixtures/qwen3vl_text/gen_tokens_i32.bin`,
+  32 greedy tokens, sha256 `3ec5f2b7…`; the model correctly reads the random-noise
+  fixture as "a noise pattern / static"). This is the first end-to-end image→text
+  proof once wired. RISK: the M2a tower is bf16-envelope faithful (rel-L2 ~5e-2) and
+  the gate is STRICT, so any tower/merge/MRoPE numeric drift that flips a near-tie
+  argmax fails the gate — localize with the M2b unit gates (all green) before blaming
+  the tower.
 - Hardest risk: DeepStack multi-level injection; vision-tower attention numerics +
   vision RoPE (M2a: PROVEN faithful); MRoPE positions (M2b); the placeholder-merge
   silent-corruption (M2c).
