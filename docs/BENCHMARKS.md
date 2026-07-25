@@ -187,6 +187,18 @@ unchanged) - EMPIRICAL WITNESS from the clean build: **Gemma-3 48/48, Qwen3-dens
 the identical `logits_soft_cap==0` path and are byte-identical by construction; not
 re-run this pass (GB10 GPU time / unified-memory OOM safety).
 
+**Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
+(2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
+Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =
+**oracle-BLOCKED (decisive):** the vision/audio towers load via Transformers
+`AutoModel.from_config` but the dgx oracle transformers 5.13.1 has no `gemma4` module
+(measured; `gemma3n` present) => the mm path is unconstructible, no SACRED oracle, no
+gate; also >=12B `google/*` HF-gated mm-wrapped (none cached) + PLE/YOCO/Gemma-4-MoE
+backbone + USM-Conformer audio tower unbuilt (SigLIP vision tower reuses the M2a
+scaffold); HW fits 12B. AUDIO (genuinely-new; Qwen3.6 has none) staged first on the
+smallest oracle-runnable native vehicle: `whisper-small` (pipeline+tower) then
+`Voxtral-Mini-3B` (e2e merge on the LANDED Mistral backbone). PENDING - no measurement.
+
 **OLMo-2 (`Olmo2ForCausalLM` / `Olmo3ForCausalLM`) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-SWEEP-OLMO2` [spike](../.agents/specs/sweep-olmo2.md)).**
 The first OLMo-family model. Disposition: **NO throughput measured or claimed - SPEED
