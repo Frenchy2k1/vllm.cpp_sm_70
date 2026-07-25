@@ -246,6 +246,20 @@ Golden = 214-token input (196 image tokens @ offset 4), 32-token greedy, **K=5 D
 GDN-hybrid VL forward vs this golden) + text-inertness (27B/35B/Coder) is the next step; no
 correctness or throughput number is claimed here yet.
 
+**Multimodal M3-b - IMAGE e2e token-exact WORKING on Qwen3.6-27B, our own gate model (2026-07-25, `CLAIM-MULTIMODAL-M3B`).**
+CORRECTNESS: **STRICT image->text token-exact 32/32** vs the committed vLLM 0.25.0 golden
+(`tests/vllm/multimodal/fixtures/qwen3_5_27b/gen_tokens_i32.bin`, sha256 `ead4b484...`) on the fixed
+(image, prompt), the full C++ pipeline (image processor -> M2a vision tower with the 27B config
+`[196,5120]` -> embed + scatter into image_token(248056) rows [no DeepStack] -> three-section MRoPE
+`[11,11,10]` interleaved on the 16 full-attn layers -> GDN-hybrid backbone -> paged greedy) on-device
+(`tests/vllm/multimodal/test_qwen3_5_vl_e2e.cpp`, 54/54 assertions, dgx-only). Reproduce:
+`VLLM_QWEN36_CKPT=<snapshot> flock $HOME/gpu.lock ./build/tests/test_qwen3_5_vl_e2e`. Text-inertness
+(the shared `qwen3_5.cpp` forward is edited; the mm path is gated on mm input): SACRED gates re-run
+STANDALONE under `flock`, cutlass-ON+FA2 - **27B 235/235, 35B 315/315, Coder 138/138**. Clean CUDA
+`-Werror` 0 warn (Release, arch 121a, cutlass-NVFP4 + FA2 banner); compute-sanitizer on the 27B VL
+forward. SPEED: **`benchmark_binding=false`, PENDING** - no throughput measured (the row is not DONE
+until every-axis vLLM speed parity; VIDEO = M3c, owed). No throughput number is claimed here.
+
 **Multimodal track (Audio/Video/Image, Gemma-4 + Qwen3.6) - SPIKE ONLY, DESIGN, no gate run (2026-07-25, `CLAIM-MULTIMODAL-TRACK` [spike](../.agents/specs/multimodal-track.md)).**
 Disposition: **NO throughput measured, NO correctness gate run, nothing built or downloaded
 (oracle-metadata + safetensors-header read only) - PENDING for all rows.** The gate models are
