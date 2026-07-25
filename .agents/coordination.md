@@ -110,6 +110,32 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 ## Active claims
 
+**Fusion-consistency audit note (2026-07-25, `CLAIM-FUSION-CONSISTENCY-AUDIT`,
+DONE, direct-to-main).** A READ-ONLY static-analysis audit of whether the
+`KERNEL-FUSION-FRAMEWORK` catalog (`vt::FusedChain`) is used consistently across
+every model forward, plus ONE additive CI checker — no source/kernel/forward
+refactor, so the SACRED gates are untouched by construction. Base `origin/main`
+`39943fc`, isolated worktree (spec/records + checker only). Owned files ONLY:
+`.agents/specs/fusion-consistency-audit.md` (new), `scripts/check-fusion-consistency.py`
+(new), `scripts/fusion-consistency-allowlist.txt` (new),
+`tests/scripts/test_check_fusion_consistency.py` (new),
+`.github/workflows/ci.yml` (wire the new check under the existing `agent-record`
+job), the `KERNEL-FUSION-FRAMEWORK` row narrative in `.agents/kernel-matrix.md`,
+and the record surfaces (roadmap C1 note, ledger, state, README, BENCHMARKS, this
+note). Did NOT touch `multimodal-track.md`, `sweep-kimi-minimax-glm-latest.md`, the
+`MODEL-MM-*`/Kimi/MiniMax/GLM rows, or any model/kernel/runtime source.
+**VERDICT: MOSTLY consistent.** Catalog + dispatch proven (W0-W4, all 4 backends
+register `kFusedChain`); qwen3_5 family fully migrated; qwen3/qwen3_moe/deepseek_v2
+adopted `kFusedAddRmsNorm{,Std}`. **DRIFT (ranked #1): gemma, gemma2, gemma3, glm4,
+phi3 hand-call the residual `vt::RmsNorm(...,&res)` add+RMSNorm chain and never
+touch the catalog** though the recipe already exists — a one-line adoption each
+(`FUSION-DENSE-MIGRATE`, follow-on). olmo2/granite/opt are deliberately-not-fused
+(post-norm / LayerNorm, no chain). GDN glue + MoE-combine remain bespoke (spike §10
+W2 remainder, no recipe). Enforcement: `scripts/check-fusion-consistency.py` flags a
+model that hand-fuses add+RMSNorm without the catalog unless allowlisted (the 5 drift
+models are on `fusion-consistency-allowlist.txt`, keeping the gate GREEN while
+blocking new silent bypasses); mutation-tested (10/10). No build, no GPU.
+
 **DFlash readiness-assessment note (2026-07-25, `CLAIM-SPEC-DFLASH-READINESS`,
 DONE, direct-to-main).** A READ-ONLY design + checkpoint-availability pass, not
 implementation. Recorded as a note (NOT a `SPIKE`/`ACTIVE` matrix row — `SPEC-DFLASH`

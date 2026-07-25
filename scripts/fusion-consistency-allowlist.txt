@@ -1,0 +1,22 @@
+# Fusion-consistency allowlist — model TUs that hand-fuse an add+residual+RMSNorm
+# chain WITHOUT (yet) routing it through the vt::FusedChain catalog, accepted as a
+# KNOWN, TRACKED state so scripts/check-fusion-consistency.py stays green while
+# preventing a NEW unadopted hand-fusion model from landing silently.
+#
+# Each entry is a model-file stem (src/vllm/model_executor/models/<stem>.cpp) with
+# a reason. Full audit + fix plan: .agents/specs/fusion-consistency-audit.md.
+# Removing a stem here (after routing its add+RMSNorm sites through
+# vt::FusedChain(kFusedAddRmsNorm{,Std}) behind FusedChainAdoptEnabled(), byte-exact
+# + token-exact) is the enforcement gate closing.
+#
+# NOTE: the recipe for BOTH variants already exists (kFusedAddRmsNorm gemma-(1+w);
+# kFusedAddRmsNormStd plain-w) — these models need only the one-line adoption, no
+# new declaration. Migration is a follow-on increment (read-only audit did NOT
+# refactor the forwards).
+
+# --- KNOWN-DRIFT: recipe exists, model has NOT adopted the catalog (fix = adopt) ---
+gemma      # gemma-(1+w) add+RMSNorm at input/pre-ffn/final sites → kFusedAddRmsNorm; pending FUSION-DENSE-MIGRATE
+gemma2     # gemma-(1+w) sandwich norms (residual-carrying) → kFusedAddRmsNorm; pending FUSION-DENSE-MIGRATE
+gemma3     # gemma-(1+w) sandwich norms (residual-carrying) → kFusedAddRmsNorm; pending FUSION-DENSE-MIGRATE
+glm4       # plain-w add+RMSNorm at input/post/final sites → kFusedAddRmsNormStd; pending FUSION-DENSE-MIGRATE
+phi3       # plain-w add+RMSNorm at input/post/final sites → kFusedAddRmsNormStd; pending FUSION-DENSE-MIGRATE
