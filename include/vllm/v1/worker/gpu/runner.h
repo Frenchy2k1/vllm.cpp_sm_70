@@ -62,6 +62,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "vllm/config/speculative.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
@@ -126,10 +127,22 @@ class GPUModelRunner final : public ModelRunnerBase {
  public:
   // Generic model-factory path. `model` owns/borrows its concrete weights and
   // must outlive the runner (LoadedEngine declares it before runner_).
+  //
+  // SPEC-MTP I5d-pre: the trailing draft parameters are the ENABLING seam for the
+  // verify/propose loop (I5d). All three default to "no speculation", so every
+  // existing construction site is byte-identical: `spec_config == nullopt` and a
+  // null `draft_model` leave the runner on the current single-model decode path.
+  // When set (I5d), `draft_model` is the MTP draft the runner owns for its
+  // lifetime (built via LoadedModel::BuildMtpDraft) and `draft_kv` is its paged
+  // KV layer (the `fa_draft` group). This increment only STORES them; nothing
+  // reads them yet.
   GPUModelRunner(const HfConfig& config, LoadedModel& model,
                  const KVCacheConfig& kv_cache_config, vt::Queue queue,
-                 int max_num_reqs, int max_model_len,
-                 int max_num_batched_tokens);
+                 int max_num_reqs, int max_model_len, int max_num_batched_tokens,
+                 std::optional<vllm::SpeculativeConfig> spec_config =
+                     std::nullopt,
+                 std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model = nullptr,
+                 std::vector<PagedKvCache> draft_kv = {});
 
   // Construct the runner over a model (config + weights) and allocate the KV
   // caches from `kv_cache_config` (initialize_kv_cache). `queue` selects the
@@ -278,12 +291,17 @@ class GPUModelRunner final : public ModelRunnerBase {
   };
 
   // Compatibility path for direct synthetic-weight runner tests. The wrapper
-  // is type-erased but borrows the caller-owned concrete weights.
+  // is type-erased but borrows the caller-owned concrete weights. Widened with
+  // the same defaulted SPEC-MTP I5d-pre draft seam so the concrete-weight
+  // constructors (which delegate here) stay byte-identical.
   GPUModelRunner(const HfConfig& config,
                  std::unique_ptr<LoadedModel> owned_model,
                  const KVCacheConfig& kv_cache_config, vt::Queue queue,
-                 int max_num_reqs, int max_model_len,
-                 int max_num_batched_tokens);
+                 int max_num_reqs, int max_model_len, int max_num_batched_tokens,
+                 std::optional<vllm::SpeculativeConfig> spec_config =
+                     std::nullopt,
+                 std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model = nullptr,
+                 std::vector<PagedKvCache> draft_kv = {});
 
   // Allocate the per-full-attn-layer paged KV buffers + the per-GDN-layer
   // persistent mamba ssm/conv buffers from the KVCacheConfig groups.
@@ -318,6 +336,15 @@ class GPUModelRunner final : public ModelRunnerBase {
   // small owned adapter that in turn borrows their concrete weights.
   std::unique_ptr<LoadedModel> owned_model_;
   LoadedModel* model_ = nullptr;
+  // SPEC-MTP I5d-pre draft seam (all inert unless a SpeculativeConfig is set).
+  // spec_config_ carries the resolved method/k; draft_model_ is the MTP draft the
+  // runner owns for its lifetime (built via LoadedModel::BuildMtpDraft);
+  // draft_attn_kv_ is the draft's paged KV layer (the `fa_draft` group). Stored
+  // here so the I5d verify/propose loop can reach them; UNREAD in this increment
+  // (nullopt / null / empty on every existing construction site).
+  std::optional<vllm::SpeculativeConfig> spec_config_;
+  std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model_;
+  std::vector<PagedKvCache> draft_attn_kv_;
   vt::Queue queue_;
   InputBatch input_batch_;
   Sampler sampler_;

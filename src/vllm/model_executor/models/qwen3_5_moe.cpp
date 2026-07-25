@@ -16,6 +16,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits, Qwen3_5Model
 #include "vllm/model_executor/models/qwen3_5_common.h"  // kQwen3_5Info, helpers
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) memory-model seam
 
@@ -36,10 +37,26 @@ class Qwen3_5MoeLoadedModel final : public LoadedModel {
   const Qwen3_5MoeWeights& weights() const { return *weights_; }
   std::unique_ptr<Qwen3_5DecodeGraph>& decode_graph() { return decode_graph_; }
 
+  // SPEC-MTP I5d-pre: retain the loaded `mtp.*` draft weights + build the draft
+  // (the 35B MoE MTP layer) sharing this target's embed_tokens/lm_head. Inert
+  // unless FromModelDir attached weights (i.e. unless a SpeculativeConfig is set).
+  bool supports_mtp_draft() const override { return true; }
+  void AttachMtpDraftWeights(Qwen3_5MTPWeights weights) override {
+    mtp_draft_weights_ = std::move(weights);
+  }
+  std::unique_ptr<Qwen3_5MTPModel> BuildMtpDraft(
+      const HfConfig& config) const override {
+    if (!mtp_draft_weights_.has_value()) return nullptr;
+    return std::make_unique<Qwen3_5MTPModel>(*mtp_draft_weights_, *weights_,
+                                             config);
+  }
+
  private:
   std::optional<Qwen3_5MoeWeights> owned_weights_;
   const Qwen3_5MoeWeights* weights_ = nullptr;
   std::unique_ptr<Qwen3_5DecodeGraph> decode_graph_;
+  // Retained draft weights (SPEC-MTP I5d-pre); empty on the production default.
+  std::optional<Qwen3_5MTPWeights> mtp_draft_weights_;
 };
 
 std::unique_ptr<LoadedModel> LoadQwen3_5MoeModel(
@@ -73,6 +90,17 @@ ForwardLogits ForwardQwen3_5Moe(LoadedModel& model,
                                 const ModelForwardInput& input) {
   auto& qwen = static_cast<Qwen3_5MoeLoadedModel&>(model);
   const Qwen3_5MoeWeights& weights = qwen.weights();
+
+  // SPEC-MTP I5d-pre hidden-state tap (see qwen3_5_dense.cpp). Non-null routes to
+  // the EXISTING ForwardDeviceTap (byte-identical logits + the [T,H] post-norm
+  // hidden); null (every spec-off run) is byte-identical to the path below.
+  if (input.hidden_tap != nullptr) {
+    return Qwen3_5Model::ForwardDeviceTap(
+        input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
+        input.attn_kv, input.gdn_state, weights, input.config, input.queue,
+        input.hidden_tap, input.logits_indices);
+  }
+
   const bool fp4_cuda =
       platforms::GetPlatform(input.queue.device.type).cutlass_fp4_supported() &&
       !weights.layers.empty() &&

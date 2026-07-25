@@ -20,13 +20,16 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -35,8 +38,12 @@
 #include "vt/tensor.h"
 
 using vllm::DenseMlpWeights;
+using vllm::ForwardLogits;
 using vllm::GdnStateCache;
 using vllm::HfConfig;
+using vllm::ModelForwardInput;
+using vllm::ModelRegistry;
+using vllm::Qwen3_5MTPHiddenStates;
 using vllm::MergeDenseGateUpGlobals;
 using vllm::MergeFullAttnQkvGlobals;
 using vllm::Nvfp4Weight;
@@ -825,6 +832,93 @@ TEST_CASE("qwen27 dense paged: multi-block full-prefill (block_size<T) equals de
   const double d = MaxAbsDiff(paged, dense, paged.size());
   MESSAGE("dense paged==dense multi-block max|diff| = " << d);
   CHECK(d < 1e-2);
+}
+
+// SPEC-MTP I5d-pre: the hidden-tap out-field on the type-erased ModelForwardInput.
+// When set, ModelRegistry::Forward routes the Qwen3.5 dense forward to
+// ForwardDeviceTap, which (a) returns byte-identical logits to the untapped
+// forward and (b) captures the full [T,H] post-final-norm hidden into the
+// carrier. RED-first: before this increment ModelForwardInput has no hidden_tap
+// field and the forward never populates the carrier.
+TEST_CASE("qwen27 hidden-tap out-field captures post-final-norm [T,H], inert on logits") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5DenseWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+  const int64_t T = 6, vocab = c.vocab_size, H = c.hidden_size;
+  const std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+  const std::vector<int32_t> logits_indices;  // full [T, vocab].
+
+  // Fresh KV/GDN state per forward (each forward writes the caches).
+  CachePool pool_ref(c, /*num_blocks=*/8, /*block_size=*/8);
+  CachePool pool_tap(c, /*num_blocks=*/8, /*block_size=*/8);
+  CachePool pool_plain(c, /*num_blocks=*/8, /*block_size=*/8);
+  const CommonAttentionMetadata am = PrefillAttnMeta(T, {0, 1}, 8, 0);
+  const GDNAttentionMetadata gm = PrefillGdnMeta(T, 0);
+
+  // Reference: the concrete ForwardDeviceTap directly (the I5c primitive this
+  // seam routes to).
+  Qwen3_5MTPHiddenStates ref_carrier;
+  const ForwardLogits ref = Qwen3_5DenseModel::ForwardDeviceTap(
+      ids, pos, am, gm, pool_ref.attn_kv, pool_ref.gdn_state, w, c, q,
+      &ref_carrier, logits_indices);
+
+  // Type-erased forward WITH the tap set (the new routing).
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::BorrowQwen3_5DenseLoadedModel(w);
+  Qwen3_5MTPHiddenStates tap_carrier;
+  ModelForwardInput in_tap{ids,
+                           pos,
+                           am,
+                           gm,
+                           pool_tap.attn_kv,
+                           pool_tap.gdn_state,
+                           c,
+                           q,
+                           logits_indices};
+  in_tap.num_reqs = 1;
+  in_tap.hidden_tap = &tap_carrier;
+  const ForwardLogits routed_tap = ModelRegistry::Forward(*model, in_tap);
+
+  // Type-erased forward WITHOUT the tap (the current default path).
+  ModelForwardInput in_plain{ids,
+                             pos,
+                             am,
+                             gm,
+                             pool_plain.attn_kv,
+                             pool_plain.gdn_state,
+                             c,
+                             q,
+                             logits_indices};
+  in_plain.num_reqs = 1;
+  const ForwardLogits routed_plain = ModelRegistry::Forward(*model, in_plain);
+
+  // The tap captured the full [T,H] post-final-norm hidden (bf16).
+  REQUIRE(tap_carrier.storage != nullptr);
+  REQUIRE(tap_carrier.tensor.data != nullptr);
+  REQUIRE(tap_carrier.tensor.rank == 2);
+  CHECK(tap_carrier.tensor.shape[0] == T);
+  CHECK(tap_carrier.tensor.shape[1] == H);
+  CHECK(tap_carrier.tensor.dtype == DType::kBF16);
+
+  // Routing goes to ForwardDeviceTap: the captured hidden is bit-identical to the
+  // direct reference carrier (bf16 raw bytes).
+  REQUIRE(ref_carrier.tensor.data != nullptr);
+  CHECK(std::memcmp(tap_carrier.tensor.data, ref_carrier.tensor.data,
+                    static_cast<size_t>(T * H) * sizeof(uint16_t)) == 0);
+
+  // Inert on logits: the tapped forward's logits are byte-identical to the
+  // untapped default path (and to the direct reference).
+  REQUIRE(routed_tap.on_device());
+  REQUIRE(routed_plain.on_device());
+  REQUIRE(routed_tap.rows == T);
+  REQUIRE(routed_tap.vocab == vocab);
+  REQUIRE(routed_plain.rows == routed_tap.rows);
+  const size_t nbytes = static_cast<size_t>(T * vocab) * sizeof(float);
+  CHECK(std::memcmp(routed_tap.device_tensor.data,
+                    routed_plain.device_tensor.data, nbytes) == 0);
+  CHECK(std::memcmp(routed_tap.device_tensor.data, ref.device_tensor.data,
+                    nbytes) == 0);
 }
 
 TEST_CASE("qwen27 dense paged: decode via KV cache equals dense over full sequence") {

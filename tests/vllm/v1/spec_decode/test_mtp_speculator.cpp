@@ -10,10 +10,13 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/v1/attention/backend.h"
@@ -649,4 +652,47 @@ TEST_CASE("i5c hidden-state tap is inert and shape-correct") {
   vllm::Qwen3_5MTPHiddenStates carrier;
   CHECK(carrier.storage == nullptr);
   CHECK(carrier.tensor.data == nullptr);
+}
+
+// SPEC-MTP I5d-pre: the LoadedModel draft-construction virtual. The concrete
+// Qwen3.5 target retains the loaded mtp.* weights and builds a Qwen3_5MTPModel
+// draft sharing the target's embed_tokens/lm_head; a non-MTP model returns null
+// and refuses to hold draft weights. RED-first: before this increment the
+// virtuals do not exist (does not compile) and no non-qwen model returns null.
+TEST_CASE("i5d-pre LoadedModel::BuildMtpDraft builds a Qwen3.5 draft, null otherwise") {
+  const HfConfig config = MakeConfig(Qwen3_5MTPKind::kDense);
+  TensorStore store;
+  AddDenseMtp(store, config);
+
+  // The target LoadedModel (borrows caller-owned dense target weights).
+  const Qwen3_5DenseWeights target = MakeDenseTarget(config);
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::BorrowQwen3_5DenseLoadedModel(target);
+
+  // Capability + before-attach: supports MTP, but no draft yet.
+  CHECK(model->supports_mtp_draft());
+  CHECK(model->BuildMtpDraft(config) == nullptr);
+
+  // Attach the loaded mtp.* draft weights, then build the draft.
+  model->AttachMtpDraftWeights(
+      vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense));
+  std::unique_ptr<Qwen3_5MTPModel> draft = model->BuildMtpDraft(config);
+  REQUIRE(draft != nullptr);
+  // load_eagle_model sharing: the draft borrows the target's embed_tokens/lm_head.
+  CHECK(&draft->embed_tokens() == &target.embed_tokens);
+  CHECK(draft->lm_head() == &target.lm_head);
+
+  // A non-MTP model inherits the base defaults: no support, null draft, and it
+  // refuses to hold draft weights. A test-local subclass exercises the base
+  // contract without needing a full non-qwen checkpoint on disk.
+  struct NonMtpModel final : public vllm::LoadedModel {
+    explicit NonMtpModel(const vllm::ModelRegistration& r) : LoadedModel(r) {}
+  };
+  NonMtpModel non_mtp(vllm::RegistrationFor("OPTForCausalLM"));
+  CHECK_FALSE(non_mtp.supports_mtp_draft());
+  CHECK(non_mtp.BuildMtpDraft(config) == nullptr);
+  CHECK_THROWS_AS(
+      non_mtp.AttachMtpDraftWeights(
+          vllm::LoadQwen3_5MTP(store.Resolver(), config, Qwen3_5MTPKind::kDense)),
+      std::runtime_error);
 }

@@ -22588,3 +22588,123 @@ other OSes report false so the portable tiers serve. The HWCAP2_I8MM
 fallback #define is now Linux-scoped. Verified: aarch64-linux g++
 `-march=armv8.2-a+i8mm -fsyntax-only` green on both files (DGX run);
 x86 host syntax green (branch compiled out); Darwin proven by consumer CI.
+## 2026-07-25 — SPEC-MTP I5d-pre: registry/forward-seam enabling refactor (`CLAIM-SPEC-MTP-I5D-PRE`)
+
+Base `origin/main` `01cfd9b` (I5c's tip); isolated worktree `/home/mudler/_git/vllm-i5dpre`
+(branch `spec-mtp-i5d-pre`); CPU `build-cpu` + dgx CUDA `build-cuda`. NOT pushed.
+
+**Scope.** The ENABLING seam refactor that unblocks I5d's verify/propose loop. A
+scoping pass found the model seam is fully TYPE-ERASED: the runner reaches the model
+only through `LoadedModel` + the `ModelForwardFn` function table, so it cannot reach
+the concrete target weights (to build the draft), the post-final-norm hidden (to feed
+the drafter), or the loaded `mtp.*` weights. I5d-pre adds those access paths as
+ADDITIVE, INERT-WHEN-SPEC-OFF changes — NO spec loop (that is I5d), just the seam —
+plus one latent-bug fix the scoping pass found. `SPEC-MTP` STAYS `GATING`.
+
+**The four seam changes (ours + file:line):**
+1. **Hidden-tap out-field on the type-erased forward.** `ModelForwardInput`
+   (`include/vllm/model_executor/models/model_registry.h:106-133`) gains
+   `Qwen3_5MTPHiddenStates* hidden_tap = nullptr`. `ForwardQwen3_5Dense`
+   (`src/vllm/model_executor/models/qwen3_5_dense.cpp`) and `ForwardQwen3_5Moe`
+   (`qwen3_5_moe.cpp`) route to the EXISTING `Qwen3_5{Dense,}Model::ForwardDeviceTap`
+   (I5c) when `hidden_tap != nullptr`, else the current path. Null (every spec-off run)
+   ⇒ byte-identical. Other models ignore the field.
+2. **Draft-construction access on `LoadedModel`.** A virtual
+   `std::unique_ptr<Qwen3_5MTPModel> BuildMtpDraft(const HfConfig&) const`
+   (`model_registry.h:95-131`, base default null in `model_registry.cpp`) that the
+   concrete `Qwen3_5{Dense,Moe}LoadedModel` overrides to build the draft from the
+   retained MTP weights + `*weights_` (the target), sharing the target's embed/lm_head
+   (`qwen3_5_mtp.h:61-66`). Companion `AttachMtpDraftWeights` retains the weights (base
+   throws for non-MTP) and `supports_mtp_draft()`. This gives the runner a TYPED path
+   to the draft without breaking type-erasure.
+3. **MTP weight loading + shard retention in `FromModelDir`.** `EngineParams` gains
+   `std::optional<SpeculativeConfig> speculative_config` (`model_loader.h`). When set to
+   an MTP config, `FromModelDir` (`src/vllm/entrypoints/model_loader.cpp`) calls
+   `LoadQwen3_5MTP(*shards, config, kind)` (kind from `registration.factory->is_dense_model`)
+   and attaches the result to the model — done INSIDE `FromModelDir` while the local
+   `shards` shared_ptr is still alive (the dense direct-device-load path releases the
+   shards once the target is on device). GGUF + MTP is rejected (no `mtp.*` in GGUF).
+   Spec unset ⇒ load path unchanged.
+4. **Runner ctor widening + the latent full-attn-group bug.** The `GPUModelRunner` ctor
+   (`include/vllm/v1/worker/gpu/runner.h`, both the public `LoadedModel&` and private
+   owned-`unique_ptr` ctors) gains `std::optional<SpeculativeConfig> spec_config =
+   nullopt, std::unique_ptr<Qwen3_5MTPModel> draft_model = nullptr,
+   std::vector<PagedKvCache> draft_kv = {}` (stored in new inert members). Every existing
+   construction site + the runner test are byte-identical (all trailing, all defaulted).
+
+**The latent full-attn-group bug + its fix + byte-identity proof.**
+`initialize_kv_cache` (`src/vllm/v1/worker/gpu/runner.cpp`) assigned
+`full_attn_group_id_ = g` on EVERY `kFullAttention`/`kMlaAttention` group, so it kept
+the LAST one. With a third `fa_draft` group (`num_spec>0`, appended at index
+`num_hidden_layers` by `MakeQwen3_5KVCacheSpec`, I5c/`qwen3_5_common.cpp:99-104`) it
+would wrongly select `fa_draft` as the TARGET attention group. FIX: select the FIRST
+(index 0) non-eagle full-attn/MLA group (`if (!group.is_eagle_group &&
+full_attn_group_id_ < 0)`), so a later-appended draft group can never displace the
+target. **Byte-identity proof:** with `num_spec==0` (every run today) there is exactly
+one full-attn group, so first==last==the only group. RED-first PROVEN: a local revert
+to the buggy last-wins loop makes the new `test_runner` case report
+`full_attn_group_id()==2` (the `fa_draft` group) → `CHECK(2==0)` FAILS; the fix reports
+0; SACRED gates byte-identical (below).
+
+**Unit coverage + RED evidence.**
+- Hidden-tap (`tests/vllm/models/test_qwen27_paged_forward.cpp`, +1 case / 15
+  assertions): a synthetic CPU dense forward driven through the type-erased
+  `ModelRegistry::Forward` with `hidden_tap` set captures a `[T,H]` bf16 post-final-norm
+  hidden that is memcmp-IDENTICAL to a direct `Qwen3_5DenseModel::ForwardDeviceTap`, and
+  its logits are memcmp-IDENTICAL to both the untapped `ModelRegistry::Forward` and the
+  reference — proving routing + inertness on logits. RED-first by construction (no
+  `hidden_tap` field / no routing before this increment).
+- Draft-construction (`tests/vllm/v1/spec_decode/test_mtp_speculator.cpp`, +1 case / 8
+  assertions): `supports_mtp_draft()` true; `BuildMtpDraft` null before attach; after
+  `AttachMtpDraftWeights(LoadQwen3_5MTP(...))` a valid draft sharing the target's
+  embed_tokens/lm_head; a test-local non-MTP `LoadedModel` subclass returns false / null
+  and throws on attach.
+- Full-attn-group selection (`tests/vllm/v1/worker/test_runner.cpp`, +1 case / 5
+  assertions): a synthetic `fa(0)/gdn(1)/fa_draft(2)` config selects target group 0, both
+  with the draft group unmarked (first-wins) and eagle-marked (by-role skip). RED-first
+  proven by the buggy-revert above.
+
+**EVIDENCE (CPU).** Clean full CPU `-Werror` 0 warnings/errors (whole `all` target).
+Touched suites: `test_runner` 16/16 (257 assertions), `test_mtp_speculator` 13/13 (169,
++1 I5d-pre case), `test_qwen27_paged_forward` 18/18 (99, +1 I5d-pre case). `git diff
+--stat` = 8 src/include files + 3 test files (414 insertions), NO other model's forward
+TU touched.
+
+**EVIDENCE (dgx CUDA) — cutlass-ON, spec-off byte-identical SACRED, STANDALONE under
+`flock $HOME/gpu.lock`, one big-model at a time (dgx `~/work/vllm-i5dpre`, `git archive`
+of `01cfd9b`+this diff).** Build: `cmake -DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON
+-DCMAKE_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo`; **cutlass-ON banner
+CONFIRMED** (`CUDA feature cutlass-nvfp4: ENABLED [121a]`, `cutlass-fp8: ENABLED`,
+`fa2: ENABLED`, `CUTLASS found at ~/cutlass-4.5.0`, `FlashAttention-2 sm_121a
+prefill/decode: ENABLED`). **Clean full CUDA `-Werror` build: 0 warnings/errors** across
+the whole `all` target (library + every test + examples). **MANDATORY GDN trio (each
+STANDALONE under flock): 27B `test_qwen27_paged_engine` 235/235, 35B
+`test_qwen36_paged_engine` 315/315, Qwen3-Coder `test_qwen3coder_paged_engine` 138/138 —
+ALL PASS.** Representative dense set that also traverses the changed `ModelForwardInput`
+/ runner ctor: Qwen3-dense `test_qwen3_paged_engine` 184/184, OPT `test_opt_paged_engine`
+63/63, Llama `test_llama_paged_engine` 92/92, Mistral `test_mistral_paged_engine` 92/92,
+Gemma `test_gemma2_forward` 1065/1065 — ALL PASS. (GLM `test_glm4_paged_engine` ran and
+passed but emitted its guarded SKIP — its greedy paged-engine golden is NOT committed in
+this tree, so 0 assertions; not a real gate here.) The I5d-pre new unit tests also pass on
+CUDA: `test_runner` 16/16 (257), `test_mtp_speculator` 13/13 (169), `test_qwen27_paged_forward`
+18/18 (99). **Goldens content-hash IDENTICAL before and after the whole series**
+(`md5(sorted md5sums) = 05affa13acab8fd175a2f0d9a6291637`), proving the code RAN against
+the committed goldens and regenerated nothing. All spec-off — the seam is INERT — so the
+byte-identity is real, not argued. Non-GDN models NOT re-run individually (OLMo/Granite/
+DeepSeek/Phi) are byte-identical BY CONSTRUCTION: `git diff --stat` touches only the shared
+seams (`model_registry.*`, `model_loader.*`, `runner.*`) + the two Qwen3.5 registry TUs +
+tests — no other model's forward/loader TU — and the routing/virtuals/ctor-params are all
+guarded behind a null `hidden_tap` / unset `speculative_config` / defaulted draft args.
+
+**DEFAULT-OFF / INERT.** No `SpeculativeConfig` ⇒ `FromModelDir` never loads/attaches MTP
+weights, the forward's `hidden_tap` is nullptr on every shipped caller, `BuildMtpDraft`
+is never called, the runner's draft members are nullopt/null/empty, and there is exactly
+one full-attn group. `benchmark_binding=false`, no speed claim — the honest denominator
+is vLLM with the same spec config, owed by the M-mtp-1 e2e gate at I5d.
+
+**Resume point (I5d).** Wire the speculator / `MtpProposePrefill` into the runner step
+loop (the ctor now accepts the draft + draft KV + `SpeculativeConfig`); add
+`--speculative-config` parse + arch resolve; the `take_draft_token_ids` out-of-band path;
+the `GDNAttentionMetadataBuilder::build` spec feed; the MIXED spec+non-spec `GdnBlockPaged`
+split/merge; then the 3-way 27B k=1 greedy token gate.

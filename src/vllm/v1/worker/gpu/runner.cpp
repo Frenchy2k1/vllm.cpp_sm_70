@@ -19,6 +19,7 @@
 #include <unordered_set>
 
 #include "vllm/model_executor/models/qwen3_5_internal.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre: Qwen3_5MTPModel complete type for the owned draft member
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor memory-model seam
 #include "vllm/v1/kv_cache_dtype.h"  // ResolveKvCacheDType (VT_KV_CACHE_F32 A/B)
 #include "vllm/v1/kv_offload/lmcache/lmcache_connector.h"  // KV-EXTERNAL-CACHE worker store/load
@@ -288,13 +289,18 @@ std::vector<int> group_block_sizes(const KVCacheConfig& cfg) {
 }
 }  // namespace
 
-GPUModelRunner::GPUModelRunner(const HfConfig& config,
-                               LoadedModel& model,
-                               const KVCacheConfig& kv_cache_config,
-                               vt::Queue queue, int max_num_reqs,
-                               int max_model_len, int max_num_batched_tokens)
+GPUModelRunner::GPUModelRunner(
+    const HfConfig& config, LoadedModel& model,
+    const KVCacheConfig& kv_cache_config, vt::Queue queue, int max_num_reqs,
+    int max_model_len, int max_num_batched_tokens,
+    std::optional<vllm::SpeculativeConfig> spec_config,
+    std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model,
+    std::vector<PagedKvCache> draft_kv)
     : config_(config),
       model_(&model),
+      spec_config_(std::move(spec_config)),
+      draft_model_(std::move(draft_model)),
+      draft_attn_kv_(std::move(draft_kv)),
       queue_(queue),
       input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
                    static_cast<int>(config.vocab_size),
@@ -306,14 +312,19 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
 
-GPUModelRunner::GPUModelRunner(const HfConfig& config,
-                               std::unique_ptr<LoadedModel> owned_model,
-                               const KVCacheConfig& kv_cache_config,
-                               vt::Queue queue, int max_num_reqs,
-                               int max_model_len, int max_num_batched_tokens)
+GPUModelRunner::GPUModelRunner(
+    const HfConfig& config, std::unique_ptr<LoadedModel> owned_model,
+    const KVCacheConfig& kv_cache_config, vt::Queue queue, int max_num_reqs,
+    int max_model_len, int max_num_batched_tokens,
+    std::optional<vllm::SpeculativeConfig> spec_config,
+    std::unique_ptr<vllm::Qwen3_5MTPModel> draft_model,
+    std::vector<PagedKvCache> draft_kv)
     : config_(config),
       owned_model_(std::move(owned_model)),
       model_(owned_model_.get()),
+      spec_config_(std::move(spec_config)),
+      draft_model_(std::move(draft_model)),
+      draft_attn_kv_(std::move(draft_kv)),
       queue_(queue),
       input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
                    static_cast<int>(config.vocab_size),
@@ -384,11 +395,20 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
 
   // Resolve the full-attn + GDN(mamba) KV group ids (T0 gate models: exactly one
   // of each). The block-table group order == kv_cache_groups order.
+  //
+  // SPEC-MTP I5d-pre LATENT-BUG FIX: the previous loop assigned
+  // `full_attn_group_id_` on EVERY full-attn/MLA group, so it kept the LAST one.
+  // With num_spec>0 the MTP draft adds a THIRD group (`fa_draft`, appended at
+  // index num_hidden_layers — qwen3_5_common.cpp:99-104), which the old code
+  // would then wrongly select as the TARGET attention group. Select the TARGET
+  // deterministically instead: the FIRST (index 0) non-eagle full-attn/MLA group,
+  // so a later-appended draft group can never displace it. With num_spec==0
+  // (every run today) there is exactly ONE full-attn group, so this is
+  // byte-identical to the old behavior — the first and only group is chosen.
   for (int g = 0; g < static_cast<int>(kv_cache_config.kv_cache_groups.size());
        ++g) {
-    const KVCacheSpecKind kind =
-        kv_cache_config.kv_cache_groups[static_cast<size_t>(g)]
-            .kv_cache_spec->kind();
+    const auto& group = kv_cache_config.kv_cache_groups[static_cast<size_t>(g)];
+    const KVCacheSpecKind kind = group.kv_cache_spec->kind();
     // MLA campaign W7: an `MLAAttentionSpec` group IS the model's attention
     // group. Upstream registers MLA against the ordinary FullAttentionManager
     // (`vllm/v1/core/single_type_kv_cache_manager.py:1539`), so block table,
@@ -397,7 +417,10 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     // off the spec. Additive condition: no existing arch changes group.
     if (kind == KVCacheSpecKind::kFullAttention ||
         kind == KVCacheSpecKind::kMlaAttention) {
-      full_attn_group_id_ = g;
+      // Skip a draft (eagle) group and keep the FIRST match as the target.
+      if (!group.is_eagle_group && full_attn_group_id_ < 0) {
+        full_attn_group_id_ = g;
+      }
     } else if (kind == KVCacheSpecKind::kMamba) {
       gdn_group_id_ = g;
     }

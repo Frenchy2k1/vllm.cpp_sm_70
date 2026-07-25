@@ -17,6 +17,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vt/dtype.h"
@@ -462,6 +463,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // `HfConfigFromGguf` mapping the GGUF `general.architecture` key
     // (`qwen35` dense / `qwen35moe` / `qwen3next`) onto the registered
     // architecture ID, which resolves to the owning arch TU's GGUF loader.
+    // SPEC-MTP I5d-pre: GGUF exports carry no `mtp.*` tensors (spec §4), so a
+    // speculative (MTP) config cannot be satisfied from a GGUF source. Reject
+    // deterministically rather than silently dropping speculation.
+    if (params.speculative_config.has_value() &&
+        params.speculative_config->method == "mtp") {
+      throw std::runtime_error(
+          "MTP speculative decoding requires a safetensors checkpoint: GGUF "
+          "exports do not contain the mtp.* draft tensors");
+    }
     std::unique_ptr<LoadedModel> model =
         ModelRegistry::Load(config, ModelSource::FromGguf(gguf));
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
@@ -487,12 +497,33 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   auto shards = std::make_shared<const std::vector<vllm::SafetensorsFile>>(
       LoadShards(model_dir));
 
+  // SPEC-MTP I5d-pre: when a speculative (MTP) config is set, load the `mtp.*`
+  // draft weights from the SAME shards and retain them on the loaded target
+  // model, so the runner has a typed path to build the draft
+  // (LoadedModel::BuildMtpDraft). This runs INSIDE FromModelDir, while the local
+  // `shards` shared_ptr is still alive — the dense direct-device-load path
+  // releases the shards once the target is on device, so the draft tensors must
+  // be materialized here before this function returns. Inert (never called) on
+  // the production default where speculative_config is unset. The verify/propose
+  // runner loop is I5d; this only retains the weights.
+  const auto maybe_attach_mtp = [&](LoadedModel& loaded) {
+    if (!params.speculative_config.has_value() ||
+        params.speculative_config->method != "mtp") {
+      return;
+    }
+    const Qwen3_5MTPKind kind = registration.factory->is_dense_model
+                                    ? Qwen3_5MTPKind::kDense
+                                    : Qwen3_5MTPKind::kMoe;
+    loaded.AttachMtpDraftWeights(vllm::LoadQwen3_5MTP(*shards, config, kind));
+  };
+
   // Live architecture dispatch: consume config.architectures in order and let
   // the matched registration own the weight-name map/loader. Unknown dense
   // configs now reject instead of falling through num_experts == 0.
   if (!registration.factory->is_dense_model || !DirectDeviceLoadRequested()) {
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards));
+    maybe_attach_mtp(*model);
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params));
   }
@@ -504,6 +535,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   try {
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards, &load_queue));
+    maybe_attach_mtp(*model);
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params,
         &load_queue));

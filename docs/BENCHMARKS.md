@@ -515,6 +515,37 @@ both the latency and throughput operating points (mtp-spec-decode.md §5).
 Reproduce the correctness gate with
 `ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/mtp_i5c && VLLM_MTP_REQUIRE_CHECKPOINTS=1 ./build-cuda/tests/test_op_parity -tc=\"qwen3.5 MTP standalone head parity*\" -s"'`.
 
+### MTP registry/forward-seam enabling refactor, SPEC-MTP I5d-pre (2026-07-25, `CLAIM-SPEC-MTP-I5D-PRE`) - correctness only, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - a behavior-preserving seam refactor,
+no performance claim, `benchmark_binding=false`.** I5d-pre adds the four typed
+access paths the I5d verify/propose loop needs through the otherwise fully
+type-erased model seam (the `hidden_tap` out-field on `ModelForwardInput` routing
+to the existing `ForwardDeviceTap`; the `LoadedModel::BuildMtpDraft` virtual; MTP
+weight loading + shard retention in `FromModelDir` behind
+`EngineParams::speculative_config`; the widened `GPUModelRunner` ctor), plus the
+latent `initialize_kv_cache` full-attn-group fix (select the FIRST non-eagle
+full-attn/MLA group as the target). It wires NO spec loop, so there is no
+throughput or TPOT number and no honest same-spec-config denominator to run yet -
+the bar is BYTE-IDENTITY across the model set, since this edits SHARED seams
+(`ModelForwardInput`, `LoadedModel`, `FromModelDir`, the `GPUModelRunner` ctor)
+that every model compiles through. DEFAULT-OFF INERT: with no speculative config
+nothing is loaded/attached, `hidden_tap` is nullptr, `BuildMtpDraft` is never
+called, the runner's draft members are empty, and there is exactly one full-attn
+group. **Spec-off byte-identical SACRED regressions, STANDALONE under
+`flock $HOME/gpu.lock`, one big-model at a time, on the cutlass-ON build (CUTLASS
+4.5.0 + FA2 + Triton AOT, arch 121a):** the MANDATORY GDN trio - 27B
+`test_qwen27_paged_engine`, 35B `test_qwen36_paged_engine`, Qwen3-Coder
+`test_qwen3coder_paged_engine` (235/235, 315/315, 138/138) - plus a representative
+dense set that also traverses the changed `ModelForwardInput` / runner ctor:
+Qwen3-dense 184/184, OPT 63/63, Llama 92/92, Mistral 92/92, Gemma
+(`test_gemma2_forward`) 1065/1065 (GLM's paged-engine greedy golden is not committed
+in this tree, so `test_glm4_paged_engine` emits its guarded skip). Goldens are
+content-hash IDENTICAL before and after the whole series. The full per-suite tallies
++ the cutlass/FA2 banner are recorded in the `.agents/state.md` I5d-pre entry. **Next benchmark owed:** I5d (27B k=1 greedy
+e2e), whose honest denominator is vLLM **with the same speculative config** at both
+the latency and throughput operating points (mtp-spec-decode.md §5).
+
 ### Accelerator-seam `S4` - LinearMethod / QuantizationConfig seam (2026-07-23, `CLAIM-BACKEND-SEAM-S4-1`) - byte-identical, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - structural refactor, no performance claim.**
