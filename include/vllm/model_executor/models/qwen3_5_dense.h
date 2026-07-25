@@ -24,6 +24,7 @@
 // A_log, dt_bias, all norms, embed_tokens, lm_head, mtp.*, and visual.*.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -228,6 +229,30 @@ class Qwen3_5DenseModel {
                                          const HfConfig& config,
                                          vt::Queue& queue);
 };
+
+// M3-b — single-image, single-sequence GREEDY image->text generation on the
+// Qwen3.6-27B GDN-hybrid backbone (Qwen3_5ForConditionalGeneration). The forked
+// VL forward, gated on multimodal input so a text-only request is byte-identical
+// (it reuses Qwen3_5DenseModel::Forward's DenseForwardLayers machinery with two
+// mm-only points active): (1) inputs_embeds — embed(prompt_ids) then scatter the
+// vision tower's merger output [N,H] into the image_token rows; (2) MRoPE — the
+// 16 full-attention layers' cos|sin cache is built from Qwen3VLGetRopeIndex
+// positions [3,T] + config.mrope_section ([11,11,10]) interleaved, instead of the
+// 1-D RoPE cache. NO DeepStack (empty deepstack_visual_indexes on the 27B). GDN
+// (linear_attention) layers carry no rope. Runs the whole model on `queue`'s
+// device (CUDA), allocating its own paged KV (full-attn) + GDN recurrent state,
+// and greedy-decodes up to max_new_tokens (stops on eos_token_id).
+//
+// prompt_ids : placeholder-expanded model input ids (image_token_id repeated N
+//              times at the image span).
+// mm_main    : the tower merger output [N, H] (== hidden_size == out_hidden 5120),
+//              host f32; scattered (bf16-rounded) into the image rows.
+// grid_thw   : the LLM-grid source (t,h,w) for get_rope_index.
+std::vector<int32_t> Qwen3_5VLGenerateGreedy(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t image_token_id,
+    int32_t eos_token_id, const Qwen3_5DenseWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens);
 
 // Replay one dense decoder layer from a captured combined residual stream.
 // This is the dense sibling of Qwen3_5ReplayLayer and is the focused parity

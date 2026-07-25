@@ -14,6 +14,7 @@
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"  // RunMoeBlock (SEAM GAP #2 exposure)
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
+#include "vllm/model_executor/models/qwen3_vl_text.h"  // M3-b: Qwen3VLGetRopeIndex (MRoPE positions)
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor residency seam
 
 #include <algorithm>
@@ -6389,7 +6390,8 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                                const Qwen3_5DenseWeights& weights,
                                const HfConfig& config,
                                const std::vector<int32_t>& logits_indices = {},
-                               const Tensor* hidden_tap = nullptr) {
+                               const Tensor* hidden_tap = nullptr,
+                               const std::vector<float>* mrope_cos_sin = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -6415,7 +6417,21 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
       if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
     return false;
   }();
-  MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
+  // M3-b VL path: a prebuilt MRoPE cos|sin cache [T, rotary_dim] (host f32,
+  // interleaved 3-section selection already baked in) is injected verbatim into
+  // the fused full-attn preamble, replacing the 1-D RoPE cache MaybeBuildAttnCosSin
+  // would build. FuseAttnPreamble is default-ON (VT_FUSE_ATTN_PREAMBLE) so
+  // AttnQkNormRopeGate reads this per-token cache; sdi.positions is unused for rope
+  // then. mrope_cos_sin==nullptr (every text caller) ⇒ byte-identical to before.
+  if (mrope_cos_sin != nullptr) {
+    const int rot = static_cast<int>(config.rotary_dim);
+    VT_CHECK(rot > 0 && static_cast<int64_t>(mrope_cos_sin->size()) == T * rot,
+             "qwen3_5 VL: MRoPE cos|sin cache must be [T, rotary_dim]");
+    sdi.attn_cos_sin = DBuf(d, DType::kF32, {T, rot}, mrope_cos_sin->data());
+    sdi.has_attn_cos_sin = true;
+  } else {
+    MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
+  }
 
   // N paged decoder layers: full-attn layers read/write attn_kv[fa_idx], GDN
   // layers the persistent gdn_state[gdn_idx] (same layer-order indexing as the
@@ -6506,6 +6522,272 @@ std::vector<float> Qwen3_5DenseModel::Forward(
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
   return logits;
+}
+
+// ── M3-b: the Qwen3.6-27B GDN-hybrid VL image->text greedy driver. ──────────
+// Builds the per-token MRoPE cos|sin cache [T, rotary_dim] (host f32) from the
+// 3-D positions [3,T] + config.mrope_section, mirroring RopeCosSinCacheKernel's
+// angle math (cpu_ops.cpp:812) and MropeAxisForPair's interleaved 3-section axis
+// selection (cpu_ops.cpp:731) exactly, so the fused AttnQkNormRopeGate applies
+// true MRoPE by reading this cache row-per-token (the text path bakes 1-D RoPE
+// into the same cache). No Llama3 freq scaling (mrope rope_type ⇒ identity).
+static std::vector<float> BuildMropeCosSinHost(
+    const std::vector<int32_t>& positions3, int64_t T, const HfConfig& config) {
+  const int rot = static_cast<int>(config.rotary_dim);
+  VT_CHECK(rot > 0, "qwen3_5 VL: rotary_dim must be > 0");
+  const int64_t half = rot / 2;
+  const double base = config.rope_theta;
+  const bool interleaved = config.rope_parameters.mrope_interleaved;
+  const std::vector<int64_t>& sec = config.rope_parameters.mrope_section;
+  VT_CHECK(sec.size() == 3 && sec[0] + sec[1] + sec[2] == half,
+           "qwen3_5 VL: mrope_section must be 3 entries summing to rotary_dim/2");
+  std::vector<float> cache(static_cast<size_t>(T * rot));
+  for (int64_t i = 0; i < T; ++i) {
+    for (int64_t pair = 0; pair < half; ++pair) {
+      int axis;
+      if (interleaved) {
+        if (pair % 3 == 1 && pair <= 3LL * sec[1]) {
+          axis = 1;
+        } else if (pair % 3 == 2 && pair <= 3LL * sec[2]) {
+          axis = 2;
+        } else {
+          axis = 0;
+        }
+      } else {
+        if (pair < sec[0]) {
+          axis = 0;
+        } else if (pair < sec[0] + sec[1]) {
+          axis = 1;
+        } else {
+          axis = 2;
+        }
+      }
+      const int32_t p = positions3[static_cast<size_t>(axis) * T + i];
+      const double freq = std::pow(
+          base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+      const double angle = static_cast<double>(p) * freq;
+      cache[static_cast<size_t>(i * rot + pair)] =
+          static_cast<float>(std::cos(angle));
+      cache[static_cast<size_t>(i * rot + half + pair)] =
+          static_cast<float>(std::sin(angle));
+    }
+  }
+  return cache;
+}
+
+namespace {
+int64_t VLArgMax(const std::vector<float>& logits, int64_t vocab) {
+  int64_t best = 0;
+  float bv = logits[0];
+  for (int64_t i = 1; i < vocab; ++i) {
+    if (logits[static_cast<size_t>(i)] > bv) {
+      bv = logits[static_cast<size_t>(i)];
+      best = i;
+    }
+  }
+  return best;
+}
+}  // namespace
+
+std::vector<int32_t> Qwen3_5VLGenerateGreedy(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t image_token_id,
+    int32_t eos_token_id, const Qwen3_5DenseWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const int64_t H = config.hidden_size;
+  const int64_t vocab = config.vocab_size;
+  const int64_t Hkv = config.num_key_value_heads;
+  const int64_t Dh = config.head_dim;
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+
+  // GDN recurrent-state dims (mirror the runner / test CachePool).
+  const int64_t Hk = config.linear_num_key_heads;
+  const int64_t Hv = config.linear_num_value_heads;
+  const int64_t Dk = config.linear_key_head_dim;
+  const int64_t Dv = config.linear_value_head_dim;
+  const int64_t Kw = config.linear_conv_kernel_dim;
+  const int64_t key_dim = Hk * Dk, value_dim = Hv * Dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = Kw - 1;
+
+  // Image span offset + visual mask + N.
+  int64_t offset = -1, n_img = 0;
+  std::vector<bool> mask(static_cast<size_t>(T0), false);
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
+      if (offset < 0) offset = t;
+      mask[static_cast<size_t>(t)] = true;
+      ++n_img;
+    }
+  }
+  VT_CHECK(offset >= 0, "qwen3_5 VL: no image token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_img, "qwen3_5 VL: mm_main rows != image-token count");
+
+  // MRoPE 3-D positions [3,T0] + decode continuation delta. spatial_merge_size is
+  // 2 for the whole Qwen3-VL lineage (not a text-config field; matches the 4B).
+  const int64_t sms = 2;
+  const std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
+  int64_t delta = 0;
+  const std::vector<int32_t> pos3_prefill =
+      multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, sms, &delta);
+
+  // Persistent per-layer caches: bf16 paged KV for full-attn layers, F32 SSM +
+  // BF16 conv recurrent state (one slot) for GDN layers. One big KV block.
+  const int64_t block_size = T0 + max_new_tokens + 8;
+  std::vector<std::shared_ptr<void>> storage;
+  auto alloc0 = [&](size_t bytes) -> void* {
+    void* p = backend.Alloc(bytes);
+    backend.Memset(d.q, p, 0, bytes);
+    storage.emplace_back(p, [&backend](void* q) { backend.Free(q); });
+    return p;
+  };
+  std::vector<PagedKvCache> attn_kv;
+  std::vector<GdnStateCache> gdn_state;
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    const bool is_gdn =
+        config.layer_types[static_cast<size_t>(l)] == "linear_attention";
+    if (is_gdn) {
+      void* ssm =
+          alloc0(static_cast<size_t>(1 * Hv * Dv * Dk) * vt::SizeOf(DType::kF32));
+      void* conv = alloc0(static_cast<size_t>(1 * conv_dim * conv_len) *
+                          vt::SizeOf(DType::kBF16));
+      GdnStateCache gs;
+      gs.ssm_state =
+          vt::Tensor::Contiguous(ssm, DType::kF32, d.q.device, {1, Hv, Dv, Dk});
+      gs.conv_state = vt::Tensor::Contiguous(conv, DType::kBF16, d.q.device,
+                                             {1, conv_dim, conv_len});
+      gdn_state.push_back(gs);
+    } else {
+      const size_t kv_bytes = static_cast<size_t>(2 * block_size * Hkv * Dh) *
+                              vt::SizeOf(DType::kBF16);
+      PagedKvCache kv;
+      kv.data = alloc0(kv_bytes);
+      kv.dtype = DType::kBF16;
+      kv.num_blocks = 1;
+      kv.block_size = block_size;
+      kv.num_kv_heads = Hkv;
+      kv.head_size = Dh;
+      attn_kv.push_back(kv);
+    }
+  }
+
+  // Metadata builders for one single-sequence step in block 0.
+  auto attn_meta = [&](int64_t qlen, int64_t context) {
+    CommonAttentionMetadata m;
+    m.num_reqs = 1;
+    m.num_actual_tokens = static_cast<int>(qlen);
+    m.query_start_loc = {0, static_cast<int32_t>(qlen)};
+    m.query_start_loc_cpu = m.query_start_loc;
+    m.seq_lens = {static_cast<int32_t>(context + qlen)};
+    m.seq_lens_cpu = m.seq_lens;
+    m.max_query_len = static_cast<int>(qlen);
+    m.max_seq_len = static_cast<int>(context + qlen);
+    m.block_table_num_cols = 1;
+    m.block_table_tensor = {0};
+    for (int64_t t = 0; t < qlen; ++t) m.slot_mapping.push_back(context + t);
+    m.causal = true;
+    return m;
+  };
+  auto gdn_prefill_meta = [&](int64_t qlen) {
+    GDNAttentionMetadata g;
+    g.num_prefills = 1;
+    g.num_prefill_tokens = static_cast<int>(qlen);
+    g.num_decodes = 0;
+    g.num_decode_tokens = 0;
+    g.num_actual_tokens = static_cast<int>(qlen);
+    g.has_initial_state = std::vector<uint8_t>{0};
+    g.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    g.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(qlen)};
+    g.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(qlen)};
+    g.prefill_state_indices = std::vector<int32_t>{0};
+    g.prefill_has_initial_state = std::vector<uint8_t>{0};
+    return g;
+  };
+  auto gdn_decode_meta = [&]() {
+    GDNAttentionMetadata g;
+    g.num_prefills = 0;
+    g.num_prefill_tokens = 0;
+    g.num_decodes = 1;
+    g.num_decode_tokens = 1;
+    g.num_actual_tokens = 1;
+    g.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    g.non_spec_query_start_loc = std::vector<int32_t>{0, 1};
+    return g;
+  };
+
+  // Embed prompt ids, then scatter the (bf16-rounded) tower merger rows into the
+  // image-token rows to form inputs_embeds (masked-scatter; NO deepstack on 27B).
+  std::vector<uint16_t> emb_bits(static_cast<size_t>(T0 * H));
+  {
+    DBuf hemb(d, DType::kBF16, {T0, H});
+    DenseEmbedInto(d, hemb, prompt_ids, weights, config);
+    hemb.Download(d, emb_bits.data());
+  }
+  {
+    int64_t k = 0;
+    for (int64_t t = 0; t < T0; ++t) {
+      if (!mask[static_cast<size_t>(t)]) continue;
+      for (int64_t h = 0; h < H; ++h)
+        emb_bits[static_cast<size_t>(t * H + h)] =
+            vt::F32ToBF16(mm_main[static_cast<size_t>(k * H + h)]);
+      ++k;
+    }
+  }
+
+  // 1-D positions (unused for rope under the fused MRoPE path; kept valid [T]).
+  std::vector<int32_t> pos1d_prefill(static_cast<size_t>(T0));
+  for (int64_t t = 0; t < T0; ++t)
+    pos1d_prefill[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  const std::vector<float> mrope_prefill =
+      BuildMropeCosSinHost(pos3_prefill, T0, config);
+
+  // ---- PREFILL: gather only the last token's logits. ----
+  std::vector<int32_t> generated;
+  {
+    DBuf merged(d, DType::kBF16, {T0, H}, emb_bits.data());
+    const CommonAttentionMetadata am = attn_meta(T0, 0);
+    const GDNAttentionMetadata gm = gdn_prefill_meta(T0);
+    const std::vector<int32_t> last_idx = {static_cast<int32_t>(T0 - 1)};
+    DBuf dlogits = DenseForwardLayers(d, merged.t(), pos1d_prefill, am, gm,
+                                      attn_kv, gdn_state, weights, config,
+                                      last_idx, /*hidden_tap=*/nullptr,
+                                      &mrope_prefill);
+    std::vector<float> logits(static_cast<size_t>(vocab));
+    dlogits.Download(d, logits.data());
+    generated.push_back(static_cast<int32_t>(VLArgMax(logits, vocab)));
+  }
+
+  // ---- DECODE: one token/step; MRoPE positions equal on all 3 axes (text). ----
+  for (int step = 1; step < max_new_tokens; ++step) {
+    if (generated.back() == eos_token_id) break;
+    const int64_t abs_idx = T0 + (step - 1);  // sequence index of the fed token
+    const int32_t p = static_cast<int32_t>(abs_idx + delta);
+    const std::vector<int32_t> pos3_dec = {p, p, p};
+    const std::vector<int32_t> pos1d_dec = {static_cast<int32_t>(abs_idx)};
+    const std::vector<float> mrope_dec = BuildMropeCosSinHost(pos3_dec, 1, config);
+
+    const std::vector<int32_t> one_id = {generated.back()};
+    std::vector<uint16_t> tok_bits(static_cast<size_t>(H));
+    {
+      DBuf hemb(d, DType::kBF16, {1, H});
+      DenseEmbedInto(d, hemb, one_id, weights, config);
+      hemb.Download(d, tok_bits.data());
+    }
+    DBuf tok(d, DType::kBF16, {1, H}, tok_bits.data());
+    const CommonAttentionMetadata am = attn_meta(1, abs_idx);
+    const GDNAttentionMetadata gm = gdn_decode_meta();
+    DBuf dlogits = DenseForwardLayers(d, tok.t(), pos1d_dec, am, gm, attn_kv,
+                                      gdn_state, weights, config, {},
+                                      /*hidden_tap=*/nullptr, &mrope_dec);
+    std::vector<float> logits(static_cast<size_t>(vocab));
+    dlogits.Download(d, logits.data());
+    generated.push_back(static_cast<int32_t>(VLArgMax(logits, vocab)));
+  }
+  return generated;
 }
 
 ForwardLogits Qwen3_5DenseModel::ForwardDevice(

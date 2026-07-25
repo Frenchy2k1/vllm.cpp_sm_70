@@ -57,6 +57,18 @@ struct Qwen3VLWeights {
 Qwen3VLWeights LoadQwen3VLWeights(const std::vector<SafetensorsFile>& shards,
                                   const HfConfig& config);
 
+// Load ONLY the vision tower (model.visual.*) into the M2a tower weights (bf16
+// widened to f32, matching the M2a dump). Shared by the 4B VL loader above and
+// the 27B (Qwen3.6, Qwen3_5ForConditionalGeneration) GDN-hybrid VL path, which
+// supplies its own vision config (depth 27, hidden 1152, out_hidden 5120, EMPTY
+// deepstack_visual_indexes ⇒ NO deepstack mergers). `vision_cfg.depth` drives the
+// block count and `vision_cfg.deepstack_visual_indexes` how many
+// deepstack_merger_list.* mergers are read (none for the 27B). The 27B LLM
+// backbone is loaded separately by LoadQwen3_5Dense (GDN-hybrid).
+multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionWeights(
+    const std::vector<SafetensorsFile>& shards,
+    const multimodal::Qwen3VLVisionConfig& vision_cfg);
+
 // Single-image, single-sequence GREEDY image->text generation (the M2c gate
 // driver). Runs the FULL forked forward: embed(prompt_ids) + merge(mm_embeds) ->
 // MRoPE prefill with DeepStack inject at layers 0/1/2 -> greedy argmax -> paged

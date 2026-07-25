@@ -338,10 +338,26 @@ Qwen3VLWeights LoadQwen3VLWeights(const std::vector<SafetensorsFile>& shards,
 
   Qwen3VLWeights w;
   w.text = LoadTextBackbone(get, config);
+  // Vision tower (model.visual.*), bf16 -> f32; w.vision_cfg holds the Qwen3-VL-4B
+  // defaults. Shared with the 27B path via LoadQwen3VLVisionWeights.
+  w.vision = LoadQwen3VLVisionWeights(shards, w.vision_cfg);
+  return w;
+}
 
-  // Vision tower (model.visual.*), bf16 -> f32.
-  multimodal::Qwen3VLVisionConfig& vc = w.vision_cfg;  // Qwen3-VL-4B defaults
-  multimodal::Qwen3VLVisionWeights& vw = w.vision;
+multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionWeights(
+    const std::vector<SafetensorsFile>& shards,
+    const multimodal::Qwen3VLVisionConfig& vc) {
+  std::unordered_map<std::string, const SafetensorsFile*> where;
+  for (const SafetensorsFile& shard : shards)
+    for (const std::string& name : shard.Names()) where[name] = &shard;
+  const TensorResolver get =
+      [&where](const std::string& name) -> const StTensor& {
+    auto it = where.find(name);
+    VT_CHECK(it != where.end(), "qwen3-vl vision: tensor not found: " + name);
+    return it->second->Get(name);
+  };
+
+  multimodal::Qwen3VLVisionWeights vw;
   const std::string V = "model.visual.";
   vw.patch_proj_w = LoadVisionF32(get, V + "patch_embed.proj.weight");
   vw.patch_proj_b = LoadVisionF32(get, V + "patch_embed.proj.bias");
@@ -364,11 +380,13 @@ Qwen3VLWeights LoadQwen3VLWeights(const std::vector<SafetensorsFile>& shards,
     b.fc2_b = LoadVisionF32(get, p + ".mlp.linear_fc2.bias");
   }
   vw.merger = LoadMerger(get, V + "merger", /*postshuffle=*/false);
+  // Qwen3.6-27B has EMPTY deepstack_visual_indexes ⇒ this loop runs zero times
+  // (no deepstack_merger_list.* tensors exist in the checkpoint).
   for (size_t i = 0; i < vc.deepstack_visual_indexes.size(); ++i)
     vw.deepstack_mergers.push_back(
         LoadMerger(get, V + "deepstack_merger_list." + std::to_string(i),
                    /*postshuffle=*/true));
-  return w;
+  return vw;
 }
 
 std::vector<int32_t> Qwen3VLGenerateGreedy(

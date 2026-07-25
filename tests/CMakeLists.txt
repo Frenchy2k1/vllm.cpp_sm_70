@@ -148,6 +148,13 @@ vllm_cpp_add_test(test_qwen3vl_e2e vllm/multimodal/test_qwen3vl_e2e.cpp)
 target_compile_definitions(test_qwen3vl_e2e PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
   TEXT_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_text")
+# M3-b — STRICT image->text token-exact on the Qwen3.6-27B GDN-hybrid gate model
+# vs the committed vLLM 0.25.0 golden. GPU + the vision-inclusive bf16 checkpoint
+# Qwen/Qwen3.6-27B required, else skipped (VLLM_QWEN36_CKPT or the HF cache path).
+vllm_cpp_add_test(test_qwen3_5_vl_e2e vllm/multimodal/test_qwen3_5_vl_e2e.cpp)
+target_compile_definitions(test_qwen3_5_vl_e2e PRIVATE
+  MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
+  GOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3_5_27b")
 # Multimodal M1 encoder-cache manager (inert-when-off engine seam).
 vllm_cpp_add_test(test_encoder_cache_manager vllm/v1/core/test_encoder_cache_manager.cpp)
 # LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip

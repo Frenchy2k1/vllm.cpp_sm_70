@@ -496,9 +496,24 @@ scope audit found the LLM side is NOT the landed plain Qwen3-dense (it needs MRo
   (sha256 `ead4b484…`; coherent image-conditioned text). GB10 held the 54 GiB bf16
   model + encoder + KV (GMU 0.6, no OOM-reboot).
 
-**M3-b (NEXT) — the GDN-hybrid VL forward (the genuinely-new integration).**
-[engine-matrix row `ENG-MM-QWEN36-VL-FORWARD`, `SPIKE` (design grounded here, not yet
-implemented), `CLAIM-MULTIMODAL-M3`.] Reuse:
+**M3-b (LANDED 2026-07-25, `CLAIM-MULTIMODAL-M3B`) — the GDN-hybrid VL forward + STRICT
+image gate PASS 32/32. Our own gate model's image path now works end-to-end.**
+[engine-matrix row `ENG-MM-QWEN36-VL-FORWARD` `SPIKE`→`ACTIVE`.] BUILT: vision-only
+loader `LoadQwen3VLVisionWeights` (`src/vllm/model_executor/models/qwen3_vl.{h,cpp}`,
+factored from the 4B `LoadQwen3VLWeights`, reused with the 27B vision config, empty
+deepstack ⇒ tower `[196,5120]`); the forked greedy driver `Qwen3_5VLGenerateGreedy`
++ host MRoPE builder `BuildMropeCosSinHost` + a default-null `mrope_cos_sin` param on
+`DenseForwardLayers` (`src/vllm/model_executor/models/qwen3_5.cpp`); the STRICT gate
+`tests/vllm/multimodal/test_qwen3_5_vl_e2e.cpp`. RESULT: **32/32 token-exact vs the
+golden `ead4b484…`** (54/54 assertions); text-inertness re-run cutlass-ON **27B
+235/235, 35B 315/315, Coder 138/138** (the mm path is gated on mm input ⇒
+`mrope_cos_sin==nullptr` on every text caller = byte-identical); clean `-Werror` 0
+warn; compute-sanitizer on the 27B VL forward. The MRoPE injects a per-token `[T,64]`
+cos|sin cache (interleaved 3-section selection baked in) into the fused
+`AttnQkNormRopeGate` preamble (default-ON), NOT a new kernel. Weights via
+`LoadQwen3_5Dense(shards,cfg,&queue)` direct device load + host release (no
+unified-pool OOM). VIDEO = M3c (owed); SPEED pending. Original design (as-built):
+Reuse:
 M2a tower (27B config) + M2c vision loader + `LoadQwen3_5Dense` bf16 LLM. NEW: fork
 the landed `Qwen3_5DenseModel` GDN-hybrid forward (`qwen3_5.cpp`
 `DenseForwardLayers:6383`/`DenseForwardBody:6474`) on THREE gated points, all
@@ -521,9 +536,9 @@ machinery `RunDenseLayerPaged`/`BuildStepDevInputs`, which the M2c plain-dense f
 could re-implement standalone but the GDN-hybrid cannot). A single-seq greedy driver
 mirrors `tests/vllm/models/test_qwen27_paged_forward.cpp`'s `KVStatePool` +
 `PrefillGdnMeta`/`PrefillAttnMeta` (GDN state cache + attn KV + prefill→decode meta).
-- Gate: Gate 3 on Qwen3.6-27B image (STRICT or measured near-tie per M3-W0), our full
-  pipeline greedy == the vLLM golden. Flips the 27B row `PARTIAL`→IMAGE-e2e-working
-  (correctness; speed pending). Then Gate 4 video.
+- Gate: Gate 3 on Qwen3.6-27B image — **PASSED STRICT 32/32** (our full pipeline greedy
+  == the vLLM golden, first run, no near-tie). Flipped the 27B row narrative
+  `PARTIAL`(text-only)→IMAGE-e2e-working (correctness; speed pending). Then Gate 4 video (M3c).
 - Hardest risk: the MRoPE `[T,rot]` cos|sin layout (interleaved section) must match
   vLLM bit-for-a-near-tie — localize with the M2b unit gates (proven) before blaming
   the tower; the 54 GiB bf16 memory-careful gate (never OOM-reboot GB10).

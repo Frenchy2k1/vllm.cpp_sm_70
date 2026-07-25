@@ -23360,3 +23360,28 @@ text-only), then video.
     the noise fixture). No OOM-reboot; GB10 held the 54 GiB bf16 model + encoder +
     KV. This CLOSES M3-W0 as a real measured milestone; the M3-b forked forward +
     STRICT token-exact gate + text-inertness is the next brick.
+
+- **2026-07-25** — **MULTIMODAL M3-b LANDED (`CLAIM-MULTIMODAL-M3B`): Qwen3.6-27B
+  IMAGE→TEXT STRICT token-exact 32/32 vs vLLM 0.25.0 — our own gate model's image
+  path now works end-to-end.** Base `origin/main` `abde069`, isolated worktree
+  `.claude/worktrees/m3b-vl` (branch `m3b-qwen36-vl`); dgx build+gate `~/work/m3b-vl`
+  under `flock $HOME/gpu.lock` (sole GPU owner, local-ai-worker stopped). The forked
+  GDN-hybrid VL forward (`Qwen3_5VLGenerateGreedy` in `qwen3_5.cpp`) reuses the
+  anon-ns GDN machinery on THREE mm-only points (all gated on mm input ⇒ text
+  byte-identical): (a) inputs_embeds = embed(prompt_ids) + host masked-scatter of the
+  27B tower merger `[196,5120]` into image_token(248056) rows (NO deepstack — empty on
+  27B); (b) 3-section MRoPE `[11,11,10]` interleaved built host-side by
+  `BuildMropeCosSinHost` (mirrors `RopeCosSinCacheKernel`+`MropeAxisForPair`) and
+  injected via a new default-null `mrope_cos_sin` param on `DenseForwardLayers`
+  (`FuseAttnPreamble` default-ON ⇒ `AttnQkNormRopeGate` reads the per-token `[T,64]`
+  cache; the 16 full-attn layers only; GDN layers carry no rope); (c) NO DeepStack.
+  Vision-only loader `LoadQwen3VLVisionWeights` (`qwen3_vl.cpp`, factored from the 4B
+  loader, 27B config) + M2a tower + `LoadQwen3_5Dense(&queue)` bf16 LLM (direct device
+  load + host release ⇒ no unified-pool OOM). **GATE:** `test_qwen3_5_vl_e2e` full
+  pipeline == golden `ead4b484…` token-for-token, 54/54 assertions; text = *"The user
+  wants me to identify what is in the image.\n\n1.  **Analyze the image:**…"*. STRICT
+  passed exactly first run (no near-tie). Build cutlass-ON + FA2 banner, clean CUDA
+  `-Werror` 0 warn (Release, arch 121a). **Text-inertness (critical — shared forward
+  edited): 27B 235/235, 35B 315/315, Coder 138/138** re-run standalone under `flock`.
+  compute-sanitizer on the 27B VL forward. IMAGE e2e correctness-complete;
+  `benchmark_binding=false`, SPEED PENDING; VIDEO = M3c (owed). Not pushed.
