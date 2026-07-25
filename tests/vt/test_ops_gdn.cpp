@@ -406,6 +406,108 @@ TEST_CASE("gdn decode + conv update: indexed in-place == compact reference") {
   }
 }
 
+// WIDENED conv cache (SPEC-MTP I5e): when spec-decode allocates the rollback
+// taps the persistent conv row is (K-1)+num_spec wide, but the NON-spec ops must
+// still operate on the LEADING (K-1) sub-window per channel with the row's
+// PHYSICAL stride, producing bit-identical output + leading state to a narrow
+// (K-1) cache, and NEVER touching the extra tap columns (mirror vLLM non-spec
+// `state_len=KERNEL_WIDTH-1` + physical `stride_conv_state_tok`,
+// causal_conv1d.py:66-69,156). This is the num_spec=0 byte-identity proof for the
+// widened cache: a wider row is inert to every non-spec model's forward.
+TEST_CASE("gdn conv/state widened-cache non-spec ops == narrow cache (leading window)") {
+  Queue q = Q();
+  const int64_t kC = 2, kK = 3, kW = kK - 1;   // width = 2
+  const int64_t kExtra = 1;                     // num_spec = 1
+  const int64_t kWide = kW + kExtra;            // widened state_len = 3
+  std::vector<int32_t> idx = {2, 0};            // scattered onto a 3-slot cache
+
+  SUBCASE("indexed causal_conv1d_update on a widened cache") {
+    std::vector<float> x = {5.0f, -1.0f, 2.0f, 0.5f};
+    std::vector<float> w = {0.25f, 0.5f, 1.0f, -0.5f, 0.3f, 0.8f};
+    std::vector<float> st0 = {1.0f, 2.0f, -1.0f, 0.5f};  // [C, W] seq0
+    std::vector<float> st1 = {0.2f, -0.3f, 0.7f, 1.1f};  // [C, W] seq1
+    // Narrow reference: 3-slot [slots, C, W] cache. Same sentinel (777) as the
+    // widened cache so the untouched slot-1 leading cols compare equal.
+    std::vector<float> narrow(3 * kC * kW, 777.0f);
+    for (int c = 0; c < kC; ++c)
+      for (int j = 0; j < kW; ++j) {
+        narrow[(2 * kC + c) * kW + j] = st0[c * kW + j];
+        narrow[(0 * kC + c) * kW + j] = st1[c * kW + j];
+      }
+    std::vector<float> refout(4, 0.0f);
+    {
+      Tensor tx = T2(x, 2, kC), tw = T2(w, kC, kK), ts = T3(narrow, 3, kC, kW), to = T2(refout, 2, kC);
+      Tensor tidx = Ti(idx);
+      vt::CausalConv1dUpdate(q, to, tx, tw, nullptr, ts, CausalConv1dArgs{true}, &tidx);
+    }
+    // Widened: [slots, C, kWide]; leading W cols = state, extra col = sentinel.
+    std::vector<float> wide(3 * kC * kWide, 777.0f);
+    for (int c = 0; c < kC; ++c)
+      for (int j = 0; j < kW; ++j) {
+        wide[(2 * kC + c) * kWide + j] = st0[c * kW + j];
+        wide[(0 * kC + c) * kWide + j] = st1[c * kW + j];
+      }
+    std::vector<float> out(4, 0.0f);
+    {
+      Tensor tx = T2(x, 2, kC), tw = T2(w, kC, kK), ts = T3(wide, 3, kC, kWide), to = T2(out, 2, kC);
+      Tensor tidx = Ti(idx);
+      vt::CausalConv1dUpdate(q, to, tx, tw, nullptr, ts, CausalConv1dArgs{true}, &tidx);
+    }
+    for (int i = 0; i < 4; ++i) CHECK(out[i] == doctest::Approx(refout[i]).epsilon(1e-7));
+    // Leading W cols of every widened row == the narrow-cache row; extra tap
+    // column untouched (still the 777 sentinel); slot 1 fully untouched.
+    for (int slot = 0; slot < 3; ++slot)
+      for (int c = 0; c < kC; ++c) {
+        for (int j = 0; j < kW; ++j)
+          CHECK(wide[(slot * kC + c) * kWide + j] ==
+                doctest::Approx(narrow[(slot * kC + c) * kW + j]).epsilon(1e-7));
+        CHECK(wide[(slot * kC + c) * kWide + kW] == doctest::Approx(777.0f));  // extra tap inert
+      }
+  }
+
+  SUBCASE("GdnStateGather/Scatter leading window on a widened conv cache") {
+    // Persistent widened conv cache [3, C, kWide]; leading W cols hold state.
+    std::vector<float> st0 = {1.0f, 2.0f, -1.0f, 0.5f}, st1 = {0.2f, -0.3f, 0.7f, 1.1f};
+    std::vector<float> wide(3 * kC * kWide, 777.0f);
+    for (int c = 0; c < kC; ++c)
+      for (int j = 0; j < kW; ++j) {
+        wide[(2 * kC + c) * kWide + j] = st0[c * kW + j];
+        wide[(0 * kC + c) * kWide + j] = st1[c * kW + j];
+      }
+    // Gather rows {2,0} into a narrow [2, C, W] working buffer.
+    std::vector<float> work(2 * kC * kW, -5.0f);
+    {
+      Tensor tw = T3(work, 2, kC, kW), tc = T3(wide, 3, kC, kWide);
+      Tensor tidx = Ti(idx);
+      vt::GdnStateGather(q, tw, tc, tidx);
+    }
+    for (int c = 0; c < kC; ++c)
+      for (int j = 0; j < kW; ++j) {
+        CHECK(work[(0 * kC + c) * kW + j] == doctest::Approx(st0[c * kW + j]));
+        CHECK(work[(1 * kC + c) * kW + j] == doctest::Approx(st1[c * kW + j]));
+      }
+    // Mutate the working buffer, scatter back; leading cols update, extra tap
+    // column stays the 777 sentinel (never written by the non-spec scatter).
+    for (auto& v : work) v += 10.0f;
+    {
+      Tensor tw = T3(work, 2, kC, kW), tc = T3(wide, 3, kC, kWide);
+      Tensor tidx = Ti(idx);
+      vt::GdnStateScatter(q, tc, tw, tidx);
+    }
+    for (int c = 0; c < kC; ++c)
+      for (int j = 0; j < kW; ++j) {
+        CHECK(wide[(2 * kC + c) * kWide + j] == doctest::Approx(st0[c * kW + j] + 10.0f));
+        CHECK(wide[(0 * kC + c) * kWide + j] == doctest::Approx(st1[c * kW + j] + 10.0f));
+      }
+    for (int slot = 0; slot < 3; ++slot)
+      for (int c = 0; c < kC; ++c)
+        CHECK(wide[(slot * kC + c) * kWide + kW] == doctest::Approx(777.0f));  // extra tap inert
+    for (int c = 0; c < kC; ++c)  // slot 1 leading cols untouched (not in idx)
+      for (int j = 0; j < kW; ++j)
+        CHECK(wide[(1 * kC + c) * kWide + j] == doctest::Approx(777.0f));
+  }
+}
+
 // Conv fwd/update consistency: feeding tokens one at a time through the update
 // op must match a prefill over the same tokens (same state trajectory).
 TEST_CASE("causal_conv1d update chain equals fwd over the same tokens") {

@@ -736,6 +736,54 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
     (needs a row `IndexSelect`/`IndexCopy` vt op), then (3) the three-way token gate
     (our-ON == our-OFF == vLLM `--speculative-config mtp` greedy, token-for-token)
     with measured nonzero acceptance, then (4) A/B throughput vs vLLM same-config.
+  - **I5e — widened-cache-aware non-spec GDN conv ops + the PASSING three-way 27B
+    gate. LANDED 2026-07-25 (`CLAIM-SPEC-MTP-I5E`). `SPEC-MTP` LEAVES `GATING`.**
+    Closes the I5d blocker (1) AND drives the gate to a MEASURED PASS on single-request
+    greedy. TWO code changes, both byte-identical at `num_spec==0`:
+    - **Widened-cache-aware non-spec GDN conv ops.** The spec conv cache row is
+      widened to `(K-1)+num_spec` taps (`mamba_utils.py:226`), but the non-spec ops
+      assumed a `(K-1)`-wide row and shape-mismatched the widened cache (the I5d throw
+      at `src/vt/ops.cpp:1773`). Fix — mirror vLLM's non-spec `state_len=KERNEL_WIDTH-1`
+      + PHYSICAL `stride_conv_state_tok` (`causal_conv1d.py:66-69,156`; prefill stores
+      the leading `[0,K-1)` cols at `:233`): `CheckConvCommon`/`CheckGdnStateIo` admit a
+      cache inner-dim ≥ working inner-dim; `GdnStateGather`/`GdnStateScatter` (CPU+CUDA)
+      copy the LEADING `work_inner` cols per channel with the cache row's physical
+      stride (contiguous fast path kept when `cache_inner==work_inner`, so the SSM
+      rank-4 cache and every non-spec model are bit-identical); `CausalConv1dUpdate`
+      (CPU + scalar/fast CUDA) addresses the row by physical `state_len=conv_state.shape[2]`
+      while operating on the leading `(K-1)` taps. `CausalConv1dFwd` needs NO change —
+      in `GdnBlockPaged` it only ever runs on the GATHERED narrow working buffer, so the
+      gather does the sub-window extraction. Files: `src/vt/ops.cpp`, `src/vt/cpu/cpu_ops.cpp`,
+      `src/vt/cuda/cuda_gdn.cu`. Op-gate: `test_ops_gdn` grows a widened-cache
+      byte-identity case (leading window == narrow cache after update + gather/scatter,
+      extra tap column inert) — 3678/3678 (RED-first: the throw was the real I5d gate).
+    - **Async input-combine forced off under spec (the 0-acceptance RCA).** With the
+      conv seam fixed the loop RAN end-to-end and three-way token identity PASSED, but
+      MEASURED acceptance was 0/31 — a dead drafter. RCA (systematic-debugging, env-gated
+      instrumentation on the real 27B): the drafts were CORRECT (matched the target's next
+      argmax) but the runner's async input-combine (`async_input_combine_`, default ON —
+      `AsyncRunnerFlagIsOn(nullptr)==true`) splices the device-resident `last_sampled`
+      token over each decode row with `num_new_sampled_tokens==1`; it is NOT spec-aware
+      and overwrote the DRAFT position of the verify batch with the committed token, so
+      `draft_sampled[1]` read the committed token and the rejection sampler rejected every
+      draft. Fix — force `async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value()`
+      in both `GPUModelRunner` ctors (spec already forces SYNC scheduling and gets its
+      drafts spliced into `token_ids_cpu` by `update_req_spec_token_ids`+`prepare_inputs`;
+      byte-identical for non-spec, `spec_config_` nullopt). File: `src/vllm/v1/worker/gpu/runner.cpp`.
+    - **THE GATE — MEASURED PASS** (`tests/parity/test_qwen27_spec_decode.cpp`, single-request
+      greedy, 27B `~/bench/q36-27b-nvfp4-vllm`): three-way token identity PASS
+      (our-spec-ON == `greedy_ids.npy` = the vLLM `--speculative-config mtp` greedy ==
+      our-spec-OFF continuation, token-for-token on the 16-token golden prefix;
+      continuation " capital of Germany is Berlin."), **acceptance 16/16 drafts accepted**
+      (100% on this deterministic factual prompt; ~16 target decode steps saved over the
+      32-token run), 32 tokens produced. `proposed>0 && accepted>0` both PASS.
+    - **Regressions (all on the FINAL code, clean cutlass-ON build).** Spec-OFF SACRED
+      byte-identical, STANDALONE under `flock $HOME/gpu.lock`, one big-model at a time:
+      27B 235/235, 35B 315/315, Coder 138/138. `test_ops_gdn` 3678/3678,
+      `test_gdn_metadata_builder` 483/483. compute-sanitizer 0 on the now-reachable spec
+      step. `SPEC-MTP` moves past `GATING` (single-request greedy correctness PROVEN);
+      NOT `DONE` — the MIXED `GdnBlockPaged` split/merge (concurrency) + the throughput
+      A/B vs vLLM same-config are **I6**. `benchmark_binding=false`, no speed claim.
 - **M-mtp-2 — 35B k=1 greedy.** Adds only the MoE MTP layer (reuses our MoE
   blocks) — GDN path identical. Same gates. Caveat: verify unions experts
   across k+1 tokens/request (more experts touched per step — measure, don't

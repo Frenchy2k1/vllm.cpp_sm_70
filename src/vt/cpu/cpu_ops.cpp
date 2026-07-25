@@ -972,6 +972,12 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
                               const Tensor* conv_state_indices,
                               const CausalConv1dArgs& args) {
   const int64_t batch = x.shape[0], c_dim = x.shape[1], k = w.shape[1], width = k - 1;
+  // The conv row physical width may be WIDENED to (K-1)+num_spec for spec-decode
+  // rollback; the non-spec update operates on the LEADING (K-1) taps with the
+  // row's PHYSICAL stride (mirror vLLM non-spec update `conv_state_token_offset=0`
+  // + `state_len=KERNEL_WIDTH-1`, causal_conv1d.py:66-69,850-852). At num_spec==0
+  // state_len==width, so the addressing below is byte-identical to before.
+  const int64_t state_len = conv_state.shape[2];
   // x may be a padded-row view of the merged qkvz output; out is contiguous.
   const int64_t x_rs = x.stride[0];
   const int32_t* cache_idx =
@@ -986,9 +992,9 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
       if (cache_idx[bt] < 0) continue;  // NULL block
       srow_row = cache_idx[bt];
     }
-    float* srow_base = conv_state.Ptr<float>() + srow_row * c_dim * width;
+    float* srow_base = conv_state.Ptr<float>() + srow_row * c_dim * state_len;
     {
-      float* srow = srow_base + c * width;
+      float* srow = srow_base + c * state_len;
       const float xt = LoadF32(x, bt * x_rs + c);
       float acc = bias != nullptr ? LoadF32(*bias, c) : 0.0f;
       for (int64_t j = 0; j < width; ++j) acc += LoadF32(w, c * k + j) * srow[j];
@@ -1434,17 +1440,29 @@ void GdnPackedDecodeKernel(Queue&, Tensor& out, const Tensor& mixed_qkv,
 // Indexed cache boundary for mixed GDN prefill. This is the CPU executable
 // reference for the fused CUDA gather/scatter kernels: cache rows may be f32 or
 // bf16, while the compact recurrence/conv working state is always f32.
+// GDN state gather/scatter. The cache's INNERMOST dim may be WIDER than the
+// working buffer's when the GDN conv state is widened to (K-1)+num_spec taps for
+// spec-decode rollback: the non-spec op then operates on the LEADING working
+// inner-dim columns per channel, with the cache row's PHYSICAL stride (mirror
+// vLLM `state_len=KERNEL_WIDTH-1` + physical `stride_conv_state_tok`,
+// causal_conv1d.py:67-69). At num_spec==0 (every non-spec model, and the SSM
+// state cache which is never widened) cache_inner==work_inner, so the contiguous
+// fast path below runs — byte-for-byte the pre-spec kernel.
 void GdnStateGatherKernel(Queue&, Tensor& working, const Tensor& cache,
                           const Tensor& state_idx,
                           const Tensor* has_initial_state) {
   const int64_t rows = state_idx.shape[0];
   if (rows == 0) return;
-  const int64_t row_elems = working.Numel() / rows;
   const int32_t* idx = state_idx.Ptr<int32_t>();
   for (int64_t r = 0; r < rows; ++r) {
     VT_CHECK(idx[r] >= 0 && idx[r] < cache.shape[0],
              "gdn_state_gather: state_idx out of range");
   }
+  const int64_t work_inner = working.shape[working.rank - 1];
+  const int64_t cache_inner = cache.shape[cache.rank - 1];
+  const int64_t work_row = working.Numel() / rows;   // = mid * work_inner
+  const int64_t mid = work_row / work_inner;          // channels/heads per row
+  const int64_t cache_row = mid * cache_inner;         // physical cache row width
   ForRows(rows, [&](int64_t r0, int64_t r1) {
     for (int64_t r = r0; r < r1; ++r) {
       bool keep = true;
@@ -1453,10 +1471,20 @@ void GdnStateGatherKernel(Queue&, Tensor& working, const Tensor& cache,
                    ? has_initial_state->Ptr<int8_t>()[r] != 0
                    : has_initial_state->Ptr<int32_t>()[r] != 0;
       }
-      const int64_t src = static_cast<int64_t>(idx[r]) * row_elems;
-      const int64_t dst = r * row_elems;
-      for (int64_t e = 0; e < row_elems; ++e) {
-        StoreF32(working, dst + e, keep ? LoadF32(cache, src + e) : 0.0f);
+      const int64_t src_row = static_cast<int64_t>(idx[r]) * cache_row;
+      const int64_t dst_row = r * work_row;
+      if (cache_inner == work_inner) {  // contiguous fast path (num_spec==0)
+        for (int64_t e = 0; e < work_row; ++e) {
+          StoreF32(working, dst_row + e, keep ? LoadF32(cache, src_row + e) : 0.0f);
+        }
+      } else {  // widened cache: leading work_inner cols per channel
+        for (int64_t m = 0; m < mid; ++m) {
+          const int64_t src = src_row + m * cache_inner;
+          const int64_t dst = dst_row + m * work_inner;
+          for (int64_t e = 0; e < work_inner; ++e) {
+            StoreF32(working, dst + e, keep ? LoadF32(cache, src + e) : 0.0f);
+          }
+        }
       }
     }
   });
@@ -1466,18 +1494,33 @@ void GdnStateScatterKernel(Queue&, Tensor& cache, const Tensor& working,
                            const Tensor& state_idx) {
   const int64_t rows = state_idx.shape[0];
   if (rows == 0) return;
-  const int64_t row_elems = working.Numel() / rows;
   const int32_t* idx = state_idx.Ptr<int32_t>();
   for (int64_t r = 0; r < rows; ++r) {
     VT_CHECK(idx[r] >= 0 && idx[r] < cache.shape[0],
              "gdn_state_scatter: state_idx out of range");
   }
+  const int64_t work_inner = working.shape[working.rank - 1];
+  const int64_t cache_inner = cache.shape[cache.rank - 1];
+  const int64_t work_row = working.Numel() / rows;
+  const int64_t mid = work_row / work_inner;
+  const int64_t cache_row = mid * cache_inner;
   ForRows(rows, [&](int64_t r0, int64_t r1) {
     for (int64_t r = r0; r < r1; ++r) {
-      const int64_t src = r * row_elems;
-      const int64_t dst = static_cast<int64_t>(idx[r]) * row_elems;
-      for (int64_t e = 0; e < row_elems; ++e) {
-        StoreF32(cache, dst + e, LoadF32(working, src + e));
+      const int64_t src_row = r * work_row;
+      const int64_t dst_row = static_cast<int64_t>(idx[r]) * cache_row;
+      if (cache_inner == work_inner) {  // contiguous fast path (num_spec==0)
+        for (int64_t e = 0; e < work_row; ++e) {
+          StoreF32(cache, dst_row + e, LoadF32(working, src_row + e));
+        }
+        continue;
+      }
+      // widened cache: write leading work_inner cols per channel (physical stride)
+      for (int64_t m = 0; m < mid; ++m) {
+        const int64_t src = src_row + m * work_inner;
+        const int64_t dst = dst_row + m * cache_inner;
+        for (int64_t e = 0; e < work_inner; ++e) {
+          StoreF32(cache, dst + e, LoadF32(working, src + e));
+        }
       }
     }
   });
