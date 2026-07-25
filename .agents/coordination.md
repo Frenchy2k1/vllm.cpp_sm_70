@@ -110,6 +110,25 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 ## Active claims
 
+**DFlash readiness-assessment note (2026-07-25, `CLAIM-SPEC-DFLASH-READINESS`,
+DONE, direct-to-main).** A READ-ONLY design + checkpoint-availability pass, not
+implementation. Recorded as a note (NOT a `SPIKE`/`ACTIVE` matrix row — `SPEC-DFLASH`
+stays `READY`, dispatch-ready): it refreshes the DFlash spec's reuse-vs-new map
+against the LANDED MTP machinery (`SPEC-MTP` I1..I7 on `72f9fb1`), delivers the
+D0-D6 W-plan, and returns the checkpoint-fit + oracle verdict. Base `origin/main`
+`72f9fb1`, isolated worktree (spec/records only, no source/build). Owned files ONLY:
+`.agents/specs/dflash-spec-decode.md`, the `SPEC-DFLASH` row in
+`.agents/engine-matrix.md`, this note, and the record surfaces (roadmap C3, ledger,
+state, README, BENCHMARKS). Did NOT touch any source/kernel/test code, nor any other
+matrix row, nor the coordination-prohibited landed-ABI areas. **Verdict GREEN, no
+HW/oracle/download blocker:** both z-lab drafts exist on HF (27B 1.73 GB / 35B 368 MB
+bf16) and fit the 119 GiB pool; the dgx oracle `vllm-oracle-v0.25.0-stage` constructs
+DFlash; the drafts are not yet on dgx (D0 downloads them) and the sole soft risk is
+confirming the oracle SERVES DFlash+NVFP4 on sm_121 (D0). k>1 verdict: the landed
+rejection + GDN paths are mechanically k-general — no mechanism extension needed for
+DFlash's k=15 blocks, only exercise/validation + the k+1-slot memory measurement. No
+implementation, no build, no gate.
+
 **Red-gate RCA coordination note (2026-07-24, `CLAIM-REDGATE-RCA`, DONE,
 direct-to-main).** Cleared the two red gates a sibling surfaced on `origin/main`.
 Recorded as a note (no `SPIKE`/`ACTIVE` matrix row): it is a correctness fix plus

@@ -22944,3 +22944,54 @@ SACRED byte-identical 27B 235/235, 35B 315/315, Coder 138/138; `test_ops_gdn` (o
 `test_gdn_metadata_builder` 483/483, mixed routing + concurrent tests PASS; CUDA `-Werror`
 0 warnings; compute-sanitizer 0. **Disposition: ours is ON-PAR-OR-ABOVE vLLM spec-ON at every measured c>1 axis** (output tput within ~+/-2%, ours slightly ahead at c2/c4, within-noise at c8; acceptance on-par 0.84-0.92 vs 0.835), tracking vLLM's ~1.5x spec speedup at every concurrency. The implementation is COMPLETE and at vLLM parity (mixed batch + bit-exact proof, server/CLI flag, c1 win I6). `SPEC-MTP` STAYS `ACTIVE`, NOT flipped to `DONE`, for one honest reason: the DONE criterion's strict `token-exact at c>1` clause is a proven MODEL impossibility — the 27B greedy is bf16-batch-nondeterministic (spec-OFF max_seqs 4-vs-1 differs 2/3 short prompts, no spec involved, affecting vLLM identically), so exact c>1 token identity cannot be met by any correct implementation; c>1 correctness is instead the model-independent bit-exact split/merge proof + acceptance parity (near-tie-distributional-gate), token-exact strict at c1. No lag, no missing work, no lever — the DONE final call is deferred to the user given this criterion ambiguity. Raw logs dgx
 `~/work/mixed-batch/{cN_results,cN_vresults}`. Full SHA reported in the session; NOT pushed.
+
+## 2026-07-25 — `SPEC-DFLASH` readiness re-assessment + D0-D6 W-plan (DESIGN-ONLY, `CLAIM-SPEC-DFLASH-READINESS`)
+
+READ-ONLY design + checkpoint-availability pass (no code, no build, no gate). Base
+`origin/main` `72f9fb1`, isolated worktree, spec/records only. `SPEC-DFLASH` stays
+`READY`. **Verdict: GREEN, dispatch-ready, no HW/oracle/download blocker.**
+
+**Refreshed reuse-vs-new map (vs the LANDED MTP machinery `SPEC-MTP` I1..I7,
+file:line-verified at `72f9fb1`).** DFlash gets FREE from MTP: the frozen
+spec-metadata ABI, the greedy rejection sampler (k-general — the accept loop is
+`for i in [0,k_r)`, no `k==1` hardwiring, I3 tested k∈{1,3}), the per-request logits
+expansion, the GDN spec slot path + snapshot rollback + mixed spec/non-spec batch
+(`GdnBlockPagedMixedSpec` + `vt::IndexSelect`/`IndexCopy`, general `num_spec`), the
+I5e widened-cache-aware conv ops, the `fa_draft` draft-KV layer pattern, the I5d/I7
+runner verify/propose loop, and — crucially — `num_lookahead_tokens = k+1` is ALREADY
+coded (`include/vllm/config/speculative.h:91-108`, `use_dflash()`). EXTENDS the single
+I5d-pre `hidden_tap` seam to multi-tap `[T,H×taps]` (5 taps 27B / 8 taps 35B). NEW:
+the `qwen3_dflash` drafter, the project's FIRST non-causal in-block attention primitive
+(bidirectional over the uniform 1+k query; SWA layers causal), context-KV precompute,
+`prepare_dflash_inputs` (mask-token blocks + context slots), and the uniform-1+k FULL CG.
+
+**k>1 question — answered: no mechanism gap.** The landed rejection + GDN paths are
+mechanically k-general. DFlash's k=15 blocks (block-16, k=block−1) need NO extension to
+the rejection or GDN-slot MECHANISM — only (a) exercise/validation at k=15 (MTP only ran
+k=1 e2e; D4), (b) the k+1=16-slot GDN-state memory measurement (~2.3 GiB/req on the 27B,
+0.96 GiB on the 35B — the single biggest DFlash-on-hybrid risk, §5). DFlash's own drafting
+is non-autoregressive block, so MTP's k=1-only `MtpProposePrefill` early-exit is irrelevant.
+
+**Checkpoint-fit + oracle verdict (the gating facts).** Both z-lab drafts EXIST on HF
+(`z-lab/Qwen3.6-27B-DFlash` 1.73 GB / `Qwen3.6-35B-A3B-DFlash` 368 MB, bf16, arch
+`DFlashDraftModel`, config.json present) and FIT the 119 GiB unified pool trivially (bf16
+draft + ~15 GiB NVFP4 target is negligible; the k+1 GDN slots are the only per-concurrency
+scaling term). Drafts are NOT on dgx yet (only the NVFP4 targets are) — D0 downloads them,
+≤1.73 GB, not a blocker. The active dgx oracle `~/venvs/vllm-oracle` →
+`vllm-oracle-v0.25.0-stage` (vLLM 0.25.0) CONSTRUCTS DFlash: registry
+`"DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM")`, the
+`vllm/v1/worker/gpu/spec_decode/dflash/` speculator dir, and `config/speculative.py`
+method `"dflash"` resolution all present. Sole SOFT D0 risk: confirm the oracle SERVES
+DFlash+NVFP4 on sm_121/GB10 (vLLM's own note: DFlash needs a non-causal-capable backend
+like FLASH_ATTN, `speculative.py:117`); the community `AEON-7/vllm-dflash` DGX-Spark
+container proves the DFlash+NVFP4 combination runs on exactly this hardware, so worst case
+is a config/version bump, not a dead row.
+
+**W-plan (D0-D6, in the spec):** D0 ground+download+oracle-serve check, D1 aux multi-tap
+seam, D2 the `qwen3_dflash` drafter + non-causal in-block attention (the project's first
+bidirectional primitive — the hardest new piece), D3 context-KV precompute +
+`prepare_dflash_inputs`, D4 engine integration + k=15 exercise, D5 the three-way token
+gate (our-ON == our-OFF == vLLM `--speculative-config dflash`) + acceptance, D6 c1/c>1
+throughput A/B + memory + block-8 variant. Critical path D0→…→D6; per-increment gates,
+GPU/CPU split, and hardest risks in the spec. No implementation, no build, no gate; full
+SHA reported in the session, NOT pushed.
