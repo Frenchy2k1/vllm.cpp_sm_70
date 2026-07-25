@@ -444,17 +444,92 @@ scope audit found the LLM side is NOT the landed plain Qwen3-dense (it needs MRo
 - Critical path: YES (proves the tower Qwen3.6 reuses).
 
 **M3 — Complete Qwen3.6-27B IMAGE (reuse M2 tower verbatim), then VIDEO.**
-- Builds: attach the M2 `Qwen3_VisionTransformer` to the LANDED
-  `Qwen3_5ForConditionalGeneration`/`…Moe…` wrapper over the GDN-hybrid backbone
-  (the vision half is identical to Qwen3-VL; only the LLM backbone differs, and it
-  is already ours + token-exact); then video frame sampling + `video_grid_thw`.
-- Gate: Gate 3 on Qwen3.6-27B image (needs the M0 vision-inclusive checkpoint),
-  then Gate 4 video. Flips both Qwen rows `PARTIAL` → mm-complete (correctness;
-  speed still pending). GPU: YES; GB10 fit confirmed (tower ~1 GiB + 27B/35B).
-- Hardest risk: the vision-inclusive-checkpoint precision (bf16 tower + NVFP4 LLM
-  mixed load, from M0); video preprocessing parity (temporal patch + frame
-  sampling).
-- Critical path: YES — this is the user's stated target.
+
+**M3-W0 (LANDED 2026-07-25, `CLAIM-MULTIMODAL-M3`) — the GATING FACTS, MEASURED on dgx.**
+- **Vision-inclusive checkpoint FOUND + FITS + downloaded.** The real repo is
+  **`Qwen/Qwen3.6-27B`** (HF, NOT gated, `language_model_only:false`): 51.7 GiB
+  **fully-bf16** (LLM + vision both bf16 — NOT the "NVFP4-LLM + bf16-vision mixed"
+  layout the spike guessed; the checkpoint is uniform bf16), 15 safetensors, 1199
+  tensors of which **333 `model.visual.*`** are present + `preprocessor_config.json`
+  + `video_preprocessor_config.json`. dgx free was 55 GiB (99% full) → reclaimed
+  mine-only `~/work/{mixed-batch,mm-m0m1-cuda,spec-i3,wt-marlin-ctmp-pool}` (~42 GiB;
+  apex/darwin_36b_opus untouched) → 95 GiB free → downloaded. GB10 fit: 54 GiB bf16
+  weights + ~1.4 GiB bf16 tower + KV in the 119 GiB unified pool (measured 115 GiB
+  available, 4 GiB used) — FITS with headroom; oracle `gpu_memory_utilization` kept
+  low, run ALONE, never OOM-rebooted.
+- **The 27B vision config DIFFERS from Qwen3-VL-4B — parametrize, do not hardcode.**
+  From `Qwen/Qwen3.6-27B/config.json`: vision **depth 27** (vs 24), **hidden 1152**
+  (vs 1024), **out_hidden 5120** (== 27B text hidden, vs 2560), **num_heads 16**,
+  **intermediate 4304**, num_position_embeddings 2304, patch_size 16,
+  spatial_merge_size 2, temporal_patch_size 2, `hidden_act` gelu_pytorch_tanh, and
+  **`deepstack_visual_indexes: []` EMPTY** — Qwen3.6-27B has **NO DeepStack**
+  (confirmed in the vision-inclusive checkpoint, not a quant-stripping artifact; the
+  `model.visual.*` tensor list has NO `deepstack_merger_list.*`). So M3 REUSES the
+  M2a `Qwen3VLVisionForward` VERBATIM with a 27B `Qwen3VLVisionConfig` (empty
+  deepstack ⇒ tower output `[N,5120]`, no multiscale concat, NO decoder-layer
+  DeepStack injection — SIMPLER than the 4B). IMAGE_TOKEN=248056, VIDEO_TOKEN=248057,
+  vision_start=248053.
+- **MRoPE config (27B):** `rope_parameters.mrope_section=[11,11,10]`,
+  `mrope_interleaved=true`, `partial_rotary_factor=0.25` (head_dim 256 ⇒ rotary_dim
+  **64**), `rope_theta=1e7`. (vs 4B's section=[24,20,20], rotary_dim 128, theta 5e6
+  — so the M2b MRoPE application is REUSED with the 27B section/rot/theta, no new
+  kernel.) Text backbone: 64 layers = **48 linear_attention (GDN) + 16 full_attention**
+  (`full_attention_interval:4`), hidden 5120, 24 heads / 4 kv, head_dim 256,
+  `attn_output_gate:true`, vocab 248320, `tie_word_embeddings:false` (owns lm_head).
+- **The bf16 GDN-hybrid LLM loader ALREADY EXISTS.** `LoadQwen3_5Dense`
+  (`qwen3_5_dense_weights.cpp:369`) routes each Linear bf16-vs-NVFP4 by the presence
+  of `.weight_packed`; on `Qwen/Qwen3.6-27B` (no `.weight_packed`) it loads every
+  projection bf16 (`LoadBf16RawNK`/`LoadMergedBf16RawNK`) into the SAME
+  `Qwen3_5DenseWeights` the existing forward reads, and the GDN-hybrid forward's
+  bf16 path (`fp8→fp4→bf16` fallback, exercised by the GGUF/synthetic loaders) runs
+  it. So M3 needs NO new LLM loader — only the `model.visual.*` vision loader (the
+  M2c `LoadQwen3VLWeights` vision half, verbatim, with the 27B vision config).
+- **Oracle golden + gate form:** `scripts/mm/m3_oracle_capture.py` (fixed fixture
+  image 448x448 + "What is in this image?" via the chat template) captured the vLLM
+  0.25.0 greedy `enforce_eager` golden + K=5 self-determinism + the
+  placeholder-expanded model input ids (image span 196 tokens) → committed fixtures
+  `tests/vllm/multimodal/fixtures/qwen3_5_27b/`. **MEASURED VERDICT:** vLLM
+  CONSTRUCTS + LOADS + RUNS the 27B mm path (resolves `Qwen3_5ForConditionalGeneration`,
+  loads 15 bf16 shards, initializes the encoder cache + profiles 1 image item) — NOT
+  oracle-blocked. Input = 214 tokens / **196 image tokens** at offset 4; the greedy
+  32-token golden is **K=5 DETERMINISTIC (first_divergence=None) ⇒ GATE FORM = STRICT**
+  (sha256 `ead4b484…`; coherent image-conditioned text). GB10 held the 54 GiB bf16
+  model + encoder + KV (GMU 0.6, no OOM-reboot).
+
+**M3-b (NEXT) — the GDN-hybrid VL forward (the genuinely-new integration).**
+[engine-matrix row `ENG-MM-QWEN36-VL-FORWARD`, `SPIKE` (design grounded here, not yet
+implemented), `CLAIM-MULTIMODAL-M3`.] Reuse:
+M2a tower (27B config) + M2c vision loader + `LoadQwen3_5Dense` bf16 LLM. NEW: fork
+the landed `Qwen3_5DenseModel` GDN-hybrid forward (`qwen3_5.cpp`
+`DenseForwardLayers:6383`/`DenseForwardBody:6474`) on THREE gated points, all
+default-off so a text-only 27B request stays byte-identical:
+  (a) `inputs_embeds` entry — `DenseForwardLayers` already takes an embedded
+      `hidden_in`; build it OUTSIDE = embed(prompt_ids) then `Qwen3VLMergeMultimodal`
+      scatter of the tower merger `[N,5120]` into the image_token(248056) rows (NO
+      deepstack add — empty for 27B);
+  (b) MRoPE positions — the full-attn rope reads a per-token `[T,rot]` cos|sin cache
+      (`AttnQkNormRopeGate` / `sdi.attn_cos_sin`, built by `MaybeBuildAttnCosSin`
+      from 1-D positions and applied ROW-PER-TOKEN, base unused). Inject MRoPE by
+      building that same `[T,rot]` cache from `Qwen3VLGetRopeIndex` positions `[3,T]`
+      + `mrope_section=[11,11,10]` interleaved (a small host builder mirroring the
+      proven M2b interleaved selection) — NO attn-block/kernel change, byte-identical
+      for text. GDN (linear_attention) layers have NO rope, so only the 16 full-attn
+      layers are touched.
+  (c) NO DeepStack (empty `deepstack_visual_indexes`).
+The forked VL forward lives IN `qwen3_5.cpp` (it must reuse the anon-namespace GDN
+machinery `RunDenseLayerPaged`/`BuildStepDevInputs`, which the M2c plain-dense fork
+could re-implement standalone but the GDN-hybrid cannot). A single-seq greedy driver
+mirrors `tests/vllm/models/test_qwen27_paged_forward.cpp`'s `KVStatePool` +
+`PrefillGdnMeta`/`PrefillAttnMeta` (GDN state cache + attn KV + prefill→decode meta).
+- Gate: Gate 3 on Qwen3.6-27B image (STRICT or measured near-tie per M3-W0), our full
+  pipeline greedy == the vLLM golden. Flips the 27B row `PARTIAL`→IMAGE-e2e-working
+  (correctness; speed pending). Then Gate 4 video.
+- Hardest risk: the MRoPE `[T,rot]` cos|sin layout (interleaved section) must match
+  vLLM bit-for-a-near-tie — localize with the M2b unit gates (proven) before blaming
+  the tower; the 54 GiB bf16 memory-careful gate (never OOM-reboot GB10).
+- Critical path: YES — this is the user's stated target. Text-inertness (27B 235/235,
+  35B 315/315, Coder 138/138) is MANDATORY on every increment (the fork is gated on
+  mm input).
 
 **M4 — Gemma-4 (staged: vision tower + backbone stack; honesty-pass the blocked
 pieces).**

@@ -231,6 +231,21 @@ the input-ids fixture. SPEED: **`benchmark_binding=false`, PENDING** - no throug
 (the row is not DONE until every-axis vLLM speed parity; M3 reuses this tower for Qwen3.6 image +
 video). No throughput number is claimed here.
 
+**Multimodal M3-W0 - Qwen3.6-27B image, checkpoint+oracle GROUNDED, e2e gate PENDING (2026-07-25, `CLAIM-MULTIMODAL-M3`).**
+Disposition: **NO throughput measured; the image e2e correctness gate is NOT yet run (M3-b, next brick).**
+W0 RESOLVED the gating fact: the vision-inclusive checkpoint is `Qwen/Qwen3.6-27B` (51.7 GiB uniform
+bf16, 333 `visual.*` tensors, NOT gated), it FITS GB10 (after reclaiming mine-only `~/work` trees;
+54 GiB weights + ~1.4 GiB tower + KV in the 119 GiB unified pool), and the **vLLM 0.25.0 oracle
+CONSTRUCTS + runs the `Qwen3_5ForConditionalGeneration` multimodal path** - a greedy `enforce_eager`
+golden + K=5 self-determinism + the placeholder-expanded input ids were captured
+(`scripts/mm/m3_oracle_capture.py` -> `tests/vllm/multimodal/fixtures/qwen3_5_27b/`, GMU 0.6, ALONE
+under `flock`). Reproduce the golden: `flock $HOME/gpu.lock bash ~/work/m3-golden/run_golden.sh`.
+Golden = 214-token input (196 image tokens @ offset 4), 32-token greedy, **K=5 DETERMINISTIC
+(first_divergence=None) => GATE FORM STRICT** (sha256 `ead4b484...`), 54 GiB bf16 held on GB10 (GMU
+0.6, no OOM-reboot). `benchmark_binding=false`. The M3-b image token-exact gate (the forked
+GDN-hybrid VL forward vs this golden) + text-inertness (27B/35B/Coder) is the next step; no
+correctness or throughput number is claimed here yet.
+
 **Multimodal track (Audio/Video/Image, Gemma-4 + Qwen3.6) - SPIKE ONLY, DESIGN, no gate run (2026-07-25, `CLAIM-MULTIMODAL-TRACK` [spike](../.agents/specs/multimodal-track.md)).**
 Disposition: **NO throughput measured, NO correctness gate run, nothing built or downloaded
 (oracle-metadata + safetensors-header read only) - PENDING for all rows.** The gate models are
