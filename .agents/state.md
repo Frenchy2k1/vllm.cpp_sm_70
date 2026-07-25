@@ -23518,3 +23518,23 @@ gap script, mirroring olmo2.
 **NEXT:** 27B-video (reuse the 4B video path on the GDN-hybrid backbone) + speed; then
 Gemma-4 (M4, image+video+AUDIO, staged). Qwen3-VL-4B image (STRICT) + video (near-tie-robust)
 are both correct e2e; speed is the remaining deliverable for the DONE bar.
+
+---
+
+## 2026-07-25 — GEMMA-4 MULTIMODAL + AUDIO-TRACK readiness (SPIKE, `CLAIM-GEMMA4-MULTIMODAL`)
+
+READ-ONLY design assessment of the remaining #1-priority mm piece: the AUDIO modality (only Gemma-4/gemma3n have audio; Qwen3.6 has none) + the Gemma-4 backbone/towers. Base `origin/main` `64a01af`, isolated worktree, spec + records only — no code, no build, no download, no gate.
+
+**DECISIVE FINDING — Gemma-4 mm is oracle-BLOCKED.** The Gemma-4 vision + audio towers load via Transformers `AutoModel.from_config(config.vision_config/audio_config)` (`gemma4_mm.py:1040,1056`), but the dgx oracle (`~/venvs/vllm-oracle` = vLLM 0.25.0 + transformers **5.13.1**) has **no `transformers.models.gemma4`** (measured: import fails; `gemma3n` present). So the pinned oracle cannot construct the Gemma-4 mm path ⇒ no SACRED oracle ⇒ no gate — stronger/more decisive than sweep-gemma §W6 (which only worried the text registry). Even though vLLM 0.25.0 ships `gemma4_mm.py`/`gemma4_unified.py`, the towers are Transformers modules the pinned Transformers lacks.
+
+**Architecture.** Two variants: `Gemma4ForConditionalGeneration` = SigLIP-class ViT vision tower (image+video) + OPTIONAL USM-Conformer audio tower (only if `audio_config`; mel + 2×Conv2d stride-2 subsample + conv-module + relpos + softcap) + a 2-layer `Gemma4MultimodalEmbedder` projector (RMSNorm-no-weight + Linear) + the PLE/YOCO/Gemma-4-MoE backbone. `Gemma4UnifiedForConditionalGeneration` = encoder-free (`Gemma4UnifiedVisionEmbedder`, factorized-2D pos-embed); the smallest public checkpoint `google/gemma-4-12B-it` (11.96B) IS this Unified variant.
+
+**Reuse-vs-new (vs landed M0-M3).** REUSE: mm input container/hash/encoder-cache/merge + the M2a ViT scaffold (for SigLIP, minus merger/DeepStack/RoPE) + the landed Gemma text primitives (gemma-RMSNorm, sandwich norms, `kGeluAndMul`, `kSoftCap`) + the Mistral backbone (for the Voxtral audio vehicle). GENUINELY NEW: (a) the AUDIO input pipeline (decode→resample→log-mel→framing→placeholder-count — nothing today), (b) the USM-Conformer audio tower, (c) the Gemma-4 backbone (sweep-gemma §0.1).
+
+**AUDIO track (reachable now; the genuinely-new work).** Land it FIRST on the smallest oracle-runnable native vehicle — `whisper-small` (244M) for the pipeline + first encoder tower, then `Voxtral-Mini-3B` (~9.4 GiB, native Whisper-class encoder + our LANDED Mistral backbone + projector-merge) for the e2e audio→text gate. The Gemma-4 USM-Conformer tower delta proven on `Granite-Speech-2b`. Whisper-class ≠ Conformer (honest caveat: the vehicles de-risk the pipeline + merge, not the Conformer tower). W-plans: AUDIO A0-A3, Gemma-4 G0-G3.
+
+**Dispositions.** Gemma-4 (both rows) = HONESTY-PASS-BLOCKED/STAGED (oracle-blocked + ≥12B `google/*` HF-gated mm-wrapped, none cached + backbone/audio-tower unbuilt; HW fits 12B in the 119 GiB pool). AUDIO modality = STAGED-but-reachable on a smaller vehicle. Both `MODEL-MM-gemma4-*` rows stay `SPIKE`, owner→`CLAIM-GEMMA4-MULTIMODAL`, re-pointed to `.agents/specs/gemma4-multimodal.md`.
+
+**Records.** New `.agents/specs/gemma4-multimodal.md`; model-matrix checklist + detail rows; coordination claim; roadmap ROAD-V1-MM note; ledger; this entry; one README + one BENCHMARKS status line. No source/kernel/test touched ⇒ SACRED gates untouched by construction. Not pushed; FULL SHA reported.
+
+**NEXT (out of this claim):** AUDIO A0 — fetch `whisper-small` + `Voxtral-Mini-3B`, capture the oracle log-mel + audio→text golden. Gemma-4 stays blocked until the oracle's Transformers carries `gemma4` (or the pin advances) AND a fitting checkpoint downloads.
