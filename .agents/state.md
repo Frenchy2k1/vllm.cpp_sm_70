@@ -23293,3 +23293,70 @@ README, `docs/BENCHMARKS.md`, `multimodal-track.md` (M2 CLOSED).
 **NEXT (M3):** Qwen3.6-27B image reusing this tower+backbone+loader on the
 GDN-hybrid backbone (needs a vision-inclusive checkpoint — cached NVFP4 quants are
 text-only), then video.
+- **2026-07-25 — MULTIMODAL M3-W0 (`CLAIM-MULTIMODAL-M3`): the vision-inclusive
+  Qwen3.6-27B checkpoint FOUND, FITS, DOWNLOADED; the GDN-hybrid VL forward DESIGN
+  grounded end-to-end.** The genuine gating fact for M3 (per the spike: our cached
+  NVFP4 27B is TEXT-ONLY, zero `visual.*`) is RESOLVED:
+  - **Checkpoint = `Qwen/Qwen3.6-27B`** (HF, NOT gated, `language_model_only:false`):
+    **51.7 GiB uniform bf16** (LLM + vision both bf16 — NOT the "NVFP4-LLM + bf16-vision
+    mixed" layout the spike guessed), 15 safetensors, 1199 tensors incl. **333
+    `model.visual.*`** + `preprocessor_config.json` + `video_preprocessor_config.json`.
+    dgx was 55 GiB free (99% full) → reclaimed mine-only
+    `~/work/{mixed-batch,mm-m0m1-cuda,spec-i3,wt-marlin-ctmp-pool}` (~42 GiB;
+    apex/darwin_36b_opus untouched) → 95 GiB free → downloaded. GB10 unified-pool fit:
+    54 GiB bf16 weights + ~1.4 GiB tower + KV in 119 GiB (measured 115 GiB avail) —
+    FITS; oracle GMU kept low (0.6), run ALONE (local-ai-worker verified Exited), no
+    OOM-reboot.
+  - **27B vision config DIFFERS from Qwen3-VL-4B (parametrize, do not hardcode):**
+    depth **27** (vs 24), hidden **1152** (vs 1024), out_hidden **5120** (== text
+    hidden), 16 heads, intermediate 4304, num_position_embeddings 2304, patch 16,
+    merge 2, temporal 2, gelu_pytorch_tanh, and **`deepstack_visual_indexes: []`
+    EMPTY** — Qwen3.6-27B has **NO DeepStack** (confirmed in the vision-inclusive
+    checkpoint: the `model.visual.*` tensor list has NO `deepstack_merger_list.*`).
+    ⇒ REUSE the M2a `Qwen3VLVisionForward` VERBATIM with a 27B config (empty deepstack
+    ⇒ tower output `[N,5120]`, no multiscale concat, NO decoder-layer injection —
+    SIMPLER than the 4B). IMAGE_TOKEN=248056, VIDEO_TOKEN=248057.
+  - **MRoPE (27B):** `rope_parameters.mrope_section=[11,11,10]`, interleaved,
+    partial_rotary_factor 0.25 (head_dim 256 ⇒ rotary_dim **64**), theta **1e7**
+    (vs 4B [24,20,20]/128/5e6). Text backbone = **48 GDN + 16 full-attn** (64 layers,
+    `full_attention_interval:4`), hidden 5120, 24 heads / 4 kv, head_dim 256,
+    `attn_output_gate:true`, vocab 248320, `tie_word_embeddings:false`.
+  - **The bf16 GDN-hybrid LLM loader ALREADY EXISTS:** `LoadQwen3_5Dense`
+    (`qwen3_5_dense_weights.cpp:369`) routes each Linear bf16-vs-NVFP4 by
+    `.weight_packed` presence; on `Qwen/Qwen3.6-27B` (no `.weight_packed`) it loads
+    every projection bf16 into the SAME `Qwen3_5DenseWeights` the landed forward reads
+    (bf16 `fp8→fp4→bf16` fallback path, exercised by GGUF/synthetic). ⇒ NO new LLM
+    loader; only the `model.visual.*` tower loader (M2c vision half, verbatim) is new.
+  - **GDN-hybrid VL forward DESIGN (M3-b, grounded):** the forked forward lives IN
+    `qwen3_5.cpp` (must reuse the anon-ns GDN machinery `RunDenseLayerPaged`/
+    `FullAttnBlockPaged`/`BuildStepDevInputs`, unlike M2c's standalone plain-dense
+    fork). Three gated points (all default-off ⇒ text byte-identical): (a) inputs_embeds
+    entry (`DenseForwardLayers:6383` already takes an embedded `hidden_in`; build it
+    outside = embed + `Qwen3VLMergeMultimodal` scatter of the tower `[N,5120]` into
+    image rows, NO deepstack); (b) MRoPE in the 16 full-attn layers only via the proven
+    `vt::RopeFromCache` mrope path off a global cos|sin cache + positions `[3,T]`
+    (`FuseAttnPreambleOn` default-true so the fused preamble consumes a per-token
+    `[T,rot]` cache; the narrow injection sets that cache OR un-fuses to RopeFromCache;
+    GDN layers have no rope); (c) no DeepStack. Single-seq greedy driver mirrors
+    `tests/vllm/models/test_qwen27_paged_forward.cpp` (`CachePool`/`PrefillGdnMeta`/
+    `PrefillAttnMeta`). The M3-b e2e gate (image token-exact vs the vLLM golden below)
+    + text-inertness (27B 235/235, 35B 315/315, Coder 138/138) is the next brick.
+  - **Oracle golden + gate form:** `scripts/mm/m3_oracle_capture.py` (fixed fixture
+    image 448x448 + "What is in this image?" via the chat template) captures the vLLM
+    0.25.0 greedy `enforce_eager` golden + K=5 self-determinism + the
+    placeholder-expanded model input ids → committed to
+    `tests/vllm/multimodal/fixtures/qwen3_5_27b/`.
+  - **GOLDEN VERDICT (measured, dgx, vLLM 0.25.0 `Qwen3_5ForConditionalGeneration`,
+    bf16, enforce_eager, GMU 0.6, ALONE under `flock`):** vLLM CONSTRUCTS + LOADS +
+    RUNS the 27B multimodal path (resolved `Qwen3_5ForConditionalGeneration`, loaded
+    15 bf16 shards, initialized the ENCODER cache + profiled 1 image item, KV
+    concurrency 36.89x — the mm/vision path is live, NOT oracle-blocked). Input =
+    214 prompt tokens, **196 image tokens** at offset 4 (matches the 4B: 448×448,
+    patch 16, merge 2 ⇒ 14×14). Greedy 32-token golden is **K=5 DETERMINISTIC
+    (first_divergence=None) ⇒ GATE FORM = STRICT** (the M3-b image gate will be
+    STRICT token-exact, like M2c). sha256 `ead4b484…`; text = *"The user wants me to
+    identify what is in the image.\n\n1. **Analyze the image:** I'm looking at the
+    provided image. It appears…"* (a coherent image-conditioned reasoning trace on
+    the noise fixture). No OOM-reboot; GB10 held the 54 GiB bf16 model + encoder +
+    KV. This CLOSES M3-W0 as a real measured milestone; the M3-b forked forward +
+    STRICT token-exact gate + text-inertness is the next brick.
