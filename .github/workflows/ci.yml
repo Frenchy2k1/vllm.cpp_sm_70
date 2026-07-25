@@ -23,6 +23,10 @@ jobs:
         run: |
           python3 scripts/check-model-checklist.py
           python3 tests/scripts/test_check_model_checklist.py
+      - name: Every production env var is documented or classified
+        run: |
+          python3 scripts/check-env-doc.py
+          python3 tests/scripts/test_check_env_doc.py
   documentation-checkpoint:
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.

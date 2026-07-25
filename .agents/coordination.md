@@ -128,6 +128,38 @@ confirming the oracle SERVES DFlash+NVFP4 on sm_121 (D0). k>1 verdict: the lande
 rejection + GDN paths are mechanically k-general — no mechanism extension needed for
 DFlash's k=15 blocks, only exercise/validation + the k+1-slot memory measurement. No
 implementation, no build, no gate.
+**Docs-refresh coordination note (2026-07-25, `CLAIM-DOCS-REFRESH`, DONE,
+direct-to-main).** Comprehensive README + docs refresh to current git history
+(base `origin/main` `72f9fb1`), following the `CLAIM-DOCS-T2-FIXES` precedent.
+Recorded as a note (no `SPIKE`/`ACTIVE` matrix row): it is docs + one CI checker,
+no capability row and no model/kernel/runtime code, so the SACRED gates are
+untouched by construction. Isolated worktree (branch `docs/refresh-comprehensive`).
+Owned files ONLY: `README.md`, `docs/ENVIRONMENT.md` (new), `docs/SPECULATIVE-DECODING.md`
+(new), `docs/KV-OFFLOAD.md` (em-dash fix), `scripts/check-env-doc.py` (new),
+`scripts/env-doc-allowlist.txt` (new), `tests/scripts/test_check_env_doc.py` (new),
+`.github/workflows/ci.yml` (wire the new check), plus the record surfaces
+(BENCHMARKS, ledger, state, roadmap, this note). Did NOT touch
+`.agents/specs/dflash-spec-decode.md` (owned by the sibling DFlash-readiness spike).
+What it brought current, each re-derived from source, not copied:
+- Spec-decode is now user-facing: fixed the class-B falsehood "Speculative decoding
+  is not user-visible yet" (contradicted by the shipped `--speculative-config`),
+  collapsed the wall-of-prose SPEC-MTP bullet to a concise current-state
+  disposition, added `docs/SPECULATIVE-DECODING.md`, added the CLI flag row and the
+  server-flag guide link.
+- C ABI bumped `VLLM_ABI_VERSION 5` -> `6` in the README (verified `include/vllm.h:60`),
+  19 exported symbols (re-counted `VLLM_API` decls), added the `speculative_config`
+  (ABI v6) field note.
+- `docs/ENVIRONMENT.md` (new): documents the 26 user-facing/behavior-changing env
+  vars (deployment, GGUF loading, rollback/bisect, diagnostic) out of the 153
+  `VT_*`/`VLLM_*` names swept from `src/`+`include/`; the ~127 kernel-internal tail
+  is enumerated on `scripts/env-doc-allowlist.txt` and deferred to the ledger.
+- `scripts/check-env-doc.py` (new, CI-wired in the `agent-record` job, mutation-test
+  `tests/scripts/test_check_env_doc.py`): fails if any scanned production env var is
+  neither documented nor allowlisted, so a new one cannot rot silently.
+- Verified-current counts that needed no change: 36 tool-parser families / 40
+  accepted names, 7 reasoning parsers, the 16-row Supported-models table vs the
+  model-matrix architecture-support checklist. LMCache/KV-offload doc already
+  current from T2; only the two em-dashes fixed for house style.
 
 **Red-gate RCA coordination note (2026-07-24, `CLAIM-REDGATE-RCA`, DONE,
 direct-to-main).** Cleared the two red gates a sibling surfaced on `origin/main`.

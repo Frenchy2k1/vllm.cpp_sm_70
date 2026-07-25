@@ -3477,6 +3477,26 @@ flock $HOME/gpu.lock sh -c '
 # All nine token files MUST be md5 d235db12f2cd304007530286a1755c95.
 ```
 
+### Comprehensive docs refresh + env-var CI checker (2026-07-25, `CLAIM-DOCS-REFRESH`) - NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - docs + one CI checker only, no
+`src/`/`include/` touched, no kernel or engine behavior changed; the SACRED gates
+are untouched by construction.** Brought the README and `docs/` current with git
+history through `72f9fb1`: corrected the class-B falsehood that speculative
+decoding is "not user-visible" (it ships via `--speculative-config`), collapsed
+the wall-of-prose SPEC-MTP bullet to a current-state disposition, bumped the
+documented C ABI to `VLLM_ABI_VERSION 6` (19 symbols, re-counted) with the
+`speculative_config` field, and added the CLI spec-config flag row. New usage
+guide `docs/SPECULATIVE-DECODING.md`; the measured spec-decode A/B numbers here
+(SPEC-MTP I6/I7) are the source and are unchanged. New `docs/ENVIRONMENT.md`
+documents the 26 user-facing env vars out of the 153 swept from `src/`+`include/`,
+with the kernel-internal tail on `scripts/env-doc-allowlist.txt`; new
+`scripts/check-env-doc.py` (CI-wired, mutation-tested) fails if a new production
+env var is neither documented nor allowlisted. No binding benchmark row was
+altered; no throughput number introduced.
+
+---
+
 ### Architecture-support checklist + its CI checker (2026-07-23, `CLAIM-DOCS-MODEL-CHECKLIST`) - NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - docs/policy/CI only, no `src/`/`include/`

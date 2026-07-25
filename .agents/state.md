@@ -22995,3 +22995,33 @@ gate (our-ON == our-OFF == vLLM `--speculative-config dflash`) + acceptance, D6 
 throughput A/B + memory + block-8 variant. Critical path D0→…→D6; per-increment gates,
 GPU/CPU split, and hardest risks in the spec. No implementation, no build, no gate; full
 SHA reported in the session, NOT pushed.
+- **2026-07-25** — **Comprehensive docs refresh (`CLAIM-DOCS-REFRESH`, base
+  `origin/main` `72f9fb1`, isolated worktree branch `docs/refresh-comprehensive`,
+  direct-to-main, docs + one CI checker only).** Brought README + `docs/` current
+  with git history since the `CLAIM-DOCS-COVERAGE` audit and `CLAIM-DOCS-T2-FIXES`,
+  every count re-derived from source, not copied. Changes: (1) fixed the class-B
+  falsehood "Speculative decoding is not user-visible yet" (it ships via
+  `--speculative-config` on server/CLI/C-API) and collapsed the multi-thousand-char
+  wall-of-prose SPEC-MTP bullet to a concise current-state disposition per the
+  AGENTS.md compaction policy; (2) README C ABI `VLLM_ABI_VERSION 5` -> `6`
+  (verified `include/vllm.h:60`), 19 exported symbols (re-counted `VLLM_API` decls),
+  added the `speculative_config` (ABI v6) field note; (3) added the CLI
+  `--speculative-config` flag row + the server-flag guide link; (4) new usage guide
+  `docs/SPECULATIVE-DECODING.md` (copy-pasteable server/CLI/C-API examples, the
+  measured c1 A/B, honest k=1 / Qwen3.5-3.6-only / c>1-token-instability caveats);
+  (5) new `docs/ENVIRONMENT.md` documenting the 26 user-facing/behavior-changing env
+  vars (deployment, GGUF loading, rollback/bisect, diagnostic) of the 153 swept from
+  `src/`+`include/`, the ~127 kernel-internal tail on `scripts/env-doc-allowlist.txt`;
+  (6) new `scripts/check-env-doc.py` + mutation test `tests/scripts/test_check_env_doc.py`,
+  wired into the CI `agent-record` job, failing if a scanned production env var is
+  neither documented nor allowlisted; (7) house-style em-dash fix (2) in
+  `docs/KV-OFFLOAD.md`. Re-derived counts that needed NO change: 36 tool-parser
+  families / 40 accepted names, 7 reasoning parsers, the 16-row Supported-models
+  table vs the model-matrix architecture-support checklist. Checkers all GREEN bare:
+  `check-readme-structure.py`, `check-doc-checkpoint.py`, `check-agent-record.py`,
+  `check-model-checklist.py`, `check-device-leakage.py`, and the new
+  `check-env-doc.py` (+ its mutation test). NO `src/`/`include/`/kernel/runtime code
+  touched, so SACRED gates untouched by construction (`git diff --stat` = docs +
+  scripts + tests + ci + records only). Did NOT touch
+  `.agents/specs/dflash-spec-decode.md` (sibling DFlash-readiness spike). Not pushed;
+  full SHA reported in-session.
