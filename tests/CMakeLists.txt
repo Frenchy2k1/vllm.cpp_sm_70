@@ -120,6 +120,14 @@ vllm_cpp_add_test(test_kv_offload_connector vllm/v1/test_kv_offload_connector.cp
 vllm_cpp_add_test(test_lmcache_codec vllm/v1/kv_offload/lmcache/test_lmcache_codec.cpp)
 target_compile_definitions(test_lmcache_codec PRIVATE
   TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
+# Multimodal M1 processor-parity gate: C++ Qwen3-VL image pipeline
+# (pixel_values/grid/mm-hash/placeholder-expansion) BIT-identical to the vLLM
+# 0.25.0 oracle fixture (tests/vllm/multimodal/fixtures/qwen3vl).
+vllm_cpp_add_test(test_qwen3vl_processor vllm/multimodal/test_qwen3vl_processor.cpp)
+target_compile_definitions(test_qwen3vl_processor PRIVATE
+  MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl")
+# Multimodal M1 encoder-cache manager (inert-when-off engine seam).
+vllm_cpp_add_test(test_encoder_cache_manager vllm/v1/core/test_encoder_cache_manager.cpp)
 # LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip
 # vs an in-process C++ mock server (always), and vs a REAL lmcache.v1.server
 # when VT_LMCACHE_LIVE_HOST/PORT are set (scripts/lmcache/run_live_roundtrip.sh).

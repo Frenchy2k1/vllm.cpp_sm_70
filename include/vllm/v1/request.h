@@ -51,6 +51,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/multimodal/inputs.h"            // multimodal::MultiModalFeatureSpec
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"       // BlockHash, BlockHasher
 #include "vllm/v1/structured_output/request.h"  // StructuredOutputRequest
@@ -135,6 +136,13 @@ struct Request {
 
   std::string request_id;
   std::vector<int32_t> prompt_token_ids;
+  // mm_features (Request.mm_features, vllm/v1/request.py): processed multimodal
+  // placeholder specs (mm-hash + span + encoder input). EMPTY for text-only
+  // requests -> the scheduler encoder-budget / encoder-cache / vision hooks are
+  // all no-ops and the request path is byte-identical. Populated from
+  // EngineCoreRequest.mm_features in FromEngineCoreRequest; consumed by the
+  // encoder cache (M1 seam) and the vision tower (M2).
+  std::vector<multimodal::MultiModalFeatureSpec> mm_features;
   // Already PostInit'd / validated by the frontend (upstream stores the
   // already-validated params; construction here does not re-validate). The
   // model's EOS token id (for the stop check) rides on sampling_params, as

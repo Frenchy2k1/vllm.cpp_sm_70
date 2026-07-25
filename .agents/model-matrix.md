@@ -53,8 +53,8 @@ Engaged architectures (the 38 non-`INVENTORIED` rows):
 |---|---|---|---|---|
 | ✅ | `Qwen3ForCausalLM` | Qwen3 dense (0.6B/1.7B/4B/32B) | near-tie-robust token-exact 16/16 on 0.6B+4B vs vLLM 0.25.0; NVFP4A16 (W4A16) dense quant also gated; c1 every-axis speed parity, c8 decode residual | `MODEL-TEXT-qwen3-qwen3-for-causal-lm` |
 | ✅ | `Qwen3MoeForCausalLM` | Qwen3-Coder-30B-A3B (MoE) | STRICT token-exact 6/6 vs vLLM 0.25.0; 11/16 speed-grid cells at/above graphed vLLM, c1/c2 residual | `MODEL-TEXT-qwen3-moe-qwen3-moe-for-causal-lm` |
-| ✅ | `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B (text path) | text-gen STRICT token-exact 235/235 vs vLLM 0.25.0; multimodal pending so the row is `PARTIAL` (text-only) | `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation` |
-| ✅ | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (text path) | text-gen STRICT token-exact 315/315 vs vLLM 0.25.0; multimodal pending so the row is `PARTIAL` (text-only) | `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` |
+| ✅ | `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B (text path) | text-gen STRICT token-exact 235/235 vs vLLM 0.25.0; mm INPUT pipeline (M0/M1) landed + processor-parity gate PASS, vision tower pending (M2/M3) so the row is `PARTIAL` (text-only) | `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation` |
+| ✅ | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (text path) | text-gen STRICT token-exact 315/315 vs vLLM 0.25.0; mm INPUT pipeline (M0/M1) landed + processor-parity gate PASS, vision tower pending (M2/M3) so the row is `PARTIAL` (text-only) | `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` |
 | ✅ | `OPTForCausalLM` | OPT-125m | STRICT token-exact 6/6 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-opt-optfor-causal-lm` |
 | ✅ | `DeepseekV2ForCausalLM` | DeepSeek-V2-Lite (MLA) | SACRED gate 8/8 token-exact vs vLLM 0.25.0; speed short (attributed, W9) | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` |
 | ✅ | `LlamaForCausalLM` | Llama-3.2-1B dense | STRICT token-exact 16/16 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-llama-llama-for-causal-lm` |

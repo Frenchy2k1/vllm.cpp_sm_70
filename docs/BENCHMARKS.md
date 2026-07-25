@@ -243,6 +243,23 @@ zero-new-kernel so it is honesty-pass gateable (config/loader/unit/build), e2e H
 (104.8 GiB)** is the fitting variant that would yield the first GLM-MoE e2e if fp8-checkpoint loading lands.
 Kimi-K2 (958.5 GiB) / MiniMax-M3 (795.5 GiB + sm100 sparse + multimodal) / GLM-5 (1404 GiB + DSA
 DEP-blocked) are registry/config-resolution only. No number is claimed here.
+**Multimodal M0+M1 (input pipeline + encoder-cache seam, Qwen3-VL) - PROCESSOR-PARITY GATE PASS,
+correctness only, `benchmark_binding=false` (2026-07-25, `CLAIM-MULTIMODAL-M1`
+[spec](../.agents/specs/multimodal-track.md)).**
+Disposition: **NO throughput measured or claimed - SPEED PENDING (no vision forward yet; M2 owns the
+first image token-exact gate).** M0 captured the vLLM 0.25.0 oracle reference for a fixed
+(image, prompt) on `Qwen/Qwen3-VL-4B-Instruct` (`scripts/mm/m0_oracle_capture.py`; fixtures in
+`tests/vllm/multimodal/fixtures/qwen3vl/`): `pixel_values` (784x1536 bf16, sha256 `2c908796...`),
+`image_grid_thw` [1,28,28], the placeholder-expanded prompt ids (9->204, N=196), and the mm-hash
+`ef6f5bea...`. M1 processor parity (`tests/.../test_qwen3vl_processor.cpp`, 23/23 assertions) is
+**BIT/BYTE-identical** to that oracle on all four surfaces (RED-first: a wrong normalize shift ->
+1,204,224 pixel mismatches). RCA-locked contract: `pixel_values = bf16_rne((raw - 127.5f)/127.5f)`
+patchified (transformers fused rescale+normalize; vLLM casts mm_kwargs to model dtype bf16). Encoder-
+cache manager unit `test_encoder_cache_manager.cpp` 32/32. **Text-inertness:** with no mm input the
+engine is byte-identical - CPU suite green standalone (`test_request`, `test_engine_types`,
+`test_lmcache_codec`, `test_lmcache_key_agreement` = CBOR still matches the Python oracle with empty
+`extra_keys`); the 27B/35B/Coder SACRED CUDA gates PASS byte-identical (235/235, 315/315, 138/138, cutlass-ON banner confirmed). `check-device-leakage`
+holds at baseline (mm processor is device-agnostic). No speed number.
 
 **GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,
