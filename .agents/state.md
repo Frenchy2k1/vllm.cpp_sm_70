@@ -22573,3 +22573,18 @@ out-of-band path, the `GDNAttentionMetadataBuilder::build` spec feed
 (`num_decode_draft_tokens_cpu` / `num_accepted_tokens`), the MIXED spec+non-spec
 `GdnBlockPaged` split/merge (currently refused), then the 3-way 27B k=1 greedy token
 gate vs vLLM same-spec-config.
+
+## 2026-07-25 — Darwin arm64 build fix for the i8mm CPU-quant tiers (`CLAIM-DARWIN-I8MM-DETECT`)
+
+LocalAI PR #11100's darwin-metal job was the FIRST build to compile the
+arm quant files on macOS (every earlier darwin job was cancelled by a
+superseding push before reaching them): cpu_quant_repack_arm.cpp and
+cpu_quant_dot_arm.cpp gate on `__aarch64__ && __ARM_FEATURE_MATMUL_INT8`
+(true for Apple Silicon clang) but included Linux-only `<asm/hwcap.h>` /
+`<sys/auxv.h>` — fatal error at compile. Fixed with per-OS runtime
+detection behind `CpuHasI8mm()`: Linux keeps the exact getauxval
+expression, Darwin uses `sysctlbyname("hw.optional.arm.FEAT_I8MM")`,
+other OSes report false so the portable tiers serve. The HWCAP2_I8MM
+fallback #define is now Linux-scoped. Verified: aarch64-linux g++
+`-march=armv8.2-a+i8mm -fsyntax-only` green on both files (DGX run);
+x86 host syntax green (branch compiled out); Darwin proven by consumer CI.

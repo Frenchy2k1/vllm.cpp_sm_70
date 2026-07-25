@@ -25,8 +25,13 @@
 #if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
 
 #include <arm_neon.h>
+
+#if defined(__linux__)
 #include <asm/hwcap.h>
 #include <sys/auxv.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +47,29 @@
 #endif
 
 namespace vt::cpu {
+namespace {
+
+// Runtime i8mm detection is OS-specific: Linux exposes it through the aux
+// vector, Darwin through sysctl. The compile-time __ARM_FEATURE_MATMUL_INT8
+// gate above only says the compiler MAY emit i8mm - the running core still
+// has to confirm it.
+bool CpuHasI8mm() {
+#if defined(__linux__)
+  return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
+#elif defined(__APPLE__)
+  int v = 0;
+  size_t sz = sizeof(v);
+  if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &v, &sz, nullptr, 0) != 0) {
+    return false;
+  }
+  return v != 0;
+#else
+  return false;
+#endif
+}
+
+}  // namespace
+
 namespace {
 
 float LoadActF32(const Tensor& t, int64_t elem_offset) {
@@ -175,7 +203,7 @@ bool QuantRepackActive() {
                          std::strcmp(e, "false") == 0)) {
       return false;
     }
-    return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
+    return CpuHasI8mm();
   }();
   return v;
 }
