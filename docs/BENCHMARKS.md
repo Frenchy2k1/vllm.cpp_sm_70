@@ -286,6 +286,28 @@ STANDALONE under `flock`, cutlass-ON+FA2 - **27B 235/235, 35B 315/315, Coder 138
 forward. SPEED: **`benchmark_binding=false`, PENDING** - no throughput measured (the row is not DONE
 until every-axis vLLM speed parity; VIDEO = M3c, owed). No throughput number is claimed here.
 
+**Multimodal M3d - VIDEO e2e token-exact WORKING on Qwen3.6-27B, our own gate model - Qwen video modalities COMPLETE (2026-07-25, `CLAIM-MULTIMODAL-M3D`).**
+CORRECTNESS: **STRICT video->text token-exact 32/32** vs the committed vLLM 0.25.0 golden
+(`tests/vllm/multimodal/fixtures/qwen3_5_27b_video/gen_tokens_i32.bin`) on the fixed (video, prompt),
+the full C++ pipeline (`ProcessVideo` -> M2a vision tower with the 27B config, per-frame windowed
+attn `[64,5120]` -> embed + scatter into video_token(248057) rows [no DeepStack] -> temporal MRoPE
+`[11,11,10]` via `Qwen3VLGetRopeIndexVideo` on the 16 full-attn layers -> GDN-hybrid backbone ->
+paged greedy) on-device (`tests/vllm/multimodal/test_qwen3_5_vl_video_e2e.cpp`, 27/27 assertions,
+dgx-only). A REUSE increment: the video driver `Qwen3_5VLGenerateGreedyVideo` shares
+`VLGenerateCoreGdn` with the M3-b image driver and reuses the M3c processor/windowed-tower/video-MRoPE
+verbatim. Oracle `scripts/mm/m3d_video_oracle_capture.py` on the M3c synthetic clip (raw sha
+`8a111599...`, grid `[4,8,8]`, 64 video tokens) K=5 DETERMINISTIC (first_divergence=None) => gate form
+STRICT; teacher-forced near-tie gaps (`m3c_video_neartie_gap.py --model Qwen/Qwen3.6-27B`) 0.0000 nats
+at every position (0 divergent). Reproduce:
+`VLLM_QWEN36_CKPT=<snapshot> flock $HOME/gpu.lock ./build/tests/test_qwen3_5_vl_video_e2e`. Inertness:
+27B IMAGE e2e re-run STRICT 32/32 (the shared-driver refactor is byte-identical on image); text SACRED
+(27B 235/235, 35B 315/315, Coder 138/138) byte-identical BY CONSTRUCTION (the video driver is purely
+additive; the shared `qwen3_5.cpp` text forward is UNTOUCHED per `git diff --stat`; the video path is
+gated on mm input). Clean CUDA `-Werror` 0 warn (Release, arch 121a, cutlass NVFP4+FP8+Marlin+FA2
+banner); compute-sanitizer memcheck 0 on the 27B video forward. SPEED: **`benchmark_binding=false`,
+PENDING** - no throughput measured (the row is not DONE until every-axis vLLM speed parity). No
+throughput number is claimed here.
+
 **Multimodal M3c - VIDEO understanding WORKS e2e on Qwen3-VL-4B; e2e NEAR-TIE-ROBUST gate PASS (gate form RESOLVED BY MEASUREMENT 2026-07-25, `CLAIM-MULTIMODAL-TOWER-FIDELITY`; supersedes the `CLAIM-MULTIMODAL-M3C` "PENDING on tower fidelity" line below).**
 Disposition: **NO throughput measured; VIDEO correctness is COMPLETE - the e2e gate PASSES
 near-tie-robust (the sole divergence is a MEASURED genuine 0.125-nat bf16 near-tie, NOT a fidelity

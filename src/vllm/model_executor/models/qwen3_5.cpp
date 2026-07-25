@@ -6589,13 +6589,26 @@ int64_t VLArgMax(const std::vector<float>& logits, int64_t vocab) {
 }
 }  // namespace
 
-std::vector<int32_t> Qwen3_5VLGenerateGreedy(
-    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
-    const std::array<int64_t, 3>& grid_thw, int32_t image_token_id,
+// ── M3-b image + M3d video shared GDN-hybrid VL greedy core. ────────────────
+// Given the merge `mask` (true at each visual-token row of `prompt_ids`), the
+// tower merger rows `mm_main` [N,H] (N == mask true-count), and the prebuilt
+// MRoPE 3-D prefill positions `pos3_prefill` [3,T0] + decode continuation
+// `delta`, this: embeds the prompt ids, scatters `mm_main` (bf16-rounded) into
+// the masked rows to form inputs_embeds, runs the GDN-hybrid prefill/decode over
+// its own paged KV + GDN recurrent state with the [T,rotary_dim] MRoPE cos|sin
+// cache (built by BuildMropeCosSinHost), and greedy-decodes up to
+// max_new_tokens (stops on eos_token_id). The IMAGE and VIDEO drivers differ
+// ONLY in how `mask`/`pos3_prefill`/`delta` are built (image_token mask +
+// Qwen3VLGetRopeIndex vs video_token mask + Qwen3VLGetRopeIndexVideo); the
+// forward, KV/GDN state, MRoPE application, and decode continuation here are
+// IDENTICAL, so the image path is byte-identical across the M3d refactor.
+static std::vector<int32_t> VLGenerateCoreGdn(
+    Dev d, const std::vector<int32_t>& prompt_ids,
+    const std::vector<float>& mm_main, const std::vector<bool>& mask,
+    const std::vector<int32_t>& pos3_prefill, int64_t delta,
     int32_t eos_token_id, const Qwen3_5DenseWeights& weights,
-    const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
-  Backend& backend = vt::GetBackend(queue.device.type);
-  Dev d{backend, queue};
+    const HfConfig& config, int max_new_tokens) {
+  Backend& backend = d.b;
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
   const int64_t Hkv = config.num_key_value_heads;
@@ -6611,28 +6624,6 @@ std::vector<int32_t> Qwen3_5VLGenerateGreedy(
   const int64_t key_dim = Hk * Dk, value_dim = Hv * Dv;
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const int64_t conv_len = Kw - 1;
-
-  // Image span offset + visual mask + N.
-  int64_t offset = -1, n_img = 0;
-  std::vector<bool> mask(static_cast<size_t>(T0), false);
-  for (int64_t t = 0; t < T0; ++t) {
-    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
-      if (offset < 0) offset = t;
-      mask[static_cast<size_t>(t)] = true;
-      ++n_img;
-    }
-  }
-  VT_CHECK(offset >= 0, "qwen3_5 VL: no image token in prompt");
-  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
-  VT_CHECK(N == n_img, "qwen3_5 VL: mm_main rows != image-token count");
-
-  // MRoPE 3-D positions [3,T0] + decode continuation delta. spatial_merge_size is
-  // 2 for the whole Qwen3-VL lineage (not a text-config field; matches the 4B).
-  const int64_t sms = 2;
-  const std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
-  int64_t delta = 0;
-  const std::vector<int32_t> pos3_prefill =
-      multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, sms, &delta);
 
   // Persistent per-layer caches: bf16 paged KV for full-attn layers, F32 SSM +
   // BF16 conv recurrent state (one slot) for GDN layers. One big KV block.
@@ -6788,6 +6779,86 @@ std::vector<int32_t> Qwen3_5VLGenerateGreedy(
     generated.push_back(static_cast<int32_t>(VLArgMax(logits, vocab)));
   }
   return generated;
+}
+
+std::vector<int32_t> Qwen3_5VLGenerateGreedy(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t image_token_id,
+    int32_t eos_token_id, const Qwen3_5DenseWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const int64_t H = config.hidden_size;
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+
+  // Image span offset + visual mask + N.
+  int64_t offset = -1, n_img = 0;
+  std::vector<bool> mask(static_cast<size_t>(T0), false);
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
+      if (offset < 0) offset = t;
+      mask[static_cast<size_t>(t)] = true;
+      ++n_img;
+    }
+  }
+  VT_CHECK(offset >= 0, "qwen3_5 VL: no image token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_img, "qwen3_5 VL: mm_main rows != image-token count");
+
+  // MRoPE 3-D positions [3,T0] + decode continuation delta. spatial_merge_size is
+  // 2 for the whole Qwen3-VL lineage (not a text-config field; matches the 4B).
+  const int64_t sms = 2;
+  const std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
+  int64_t delta = 0;
+  const std::vector<int32_t> pos3_prefill =
+      multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, sms, &delta);
+
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, mask, pos3_prefill, delta,
+                           eos_token_id, weights, config, max_new_tokens);
+}
+
+// ── M3d: the Qwen3.6-27B GDN-hybrid VL video->text greedy driver. ───────────
+// Mirrors the image driver above through the shared VLGenerateCoreGdn; the two
+// video differences (identical to the 4B M3c split) are (a) the merge mask is on
+// video_token_id across ALL frames (not image_token_id) and (b) the MRoPE prefill
+// positions come from Qwen3VLGetRopeIndexVideo, which scans the timestamp-
+// interleaved, per-frame placeholder structure for grid_t frames. NO DeepStack
+// (empty deepstack_visual_indexes on the 27B). The tower + video processor +
+// video MRoPE were already proven bit/near-exact by M3c on the 4B path; the tower
+// per-frame windowing is config-shared, so this driver is the only new wiring.
+std::vector<int32_t> Qwen3_5VLGenerateGreedyVideo(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t video_token_id,
+    int32_t vision_start_token_id, int32_t vision_end_token_id,
+    int32_t eos_token_id, const Qwen3_5DenseWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const int64_t H = config.hidden_size;
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+
+  // Video merge mask (all video_token_id positions across all frames).
+  int64_t n_vid = 0;
+  std::vector<bool> mask(static_cast<size_t>(T0), false);
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == video_token_id) {
+      mask[static_cast<size_t>(t)] = true;
+      ++n_vid;
+    }
+  }
+  VT_CHECK(n_vid > 0, "qwen3_5 VL: no video token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_vid, "qwen3_5 VL: mm_main rows != video-token count");
+
+  // MRoPE 3-D positions [3,T0] + decode delta via the per-frame video scan.
+  const int64_t sms = 2;
+  int64_t delta = 0;
+  const std::vector<int32_t> pos3_prefill = multimodal::Qwen3VLGetRopeIndexVideo(
+      prompt_ids, grid_thw, sms, vision_start_token_id, video_token_id,
+      vision_end_token_id, &delta);
+
+  return VLGenerateCoreGdn(d, prompt_ids, mm_main, mask, pos3_prefill, delta,
+                           eos_token_id, weights, config, max_new_tokens);
 }
 
 ForwardLogits Qwen3_5DenseModel::ForwardDevice(

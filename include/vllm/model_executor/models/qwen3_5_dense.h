@@ -254,6 +254,25 @@ std::vector<int32_t> Qwen3_5VLGenerateGreedy(
     int32_t eos_token_id, const Qwen3_5DenseWeights& weights,
     const HfConfig& config, vt::Queue& queue, int max_new_tokens);
 
+// M3d — single-VIDEO, single-sequence GREEDY video->text generation on the
+// Qwen3.6-27B GDN-hybrid backbone. Mirrors Qwen3_5VLGenerateGreedy through the
+// shared GDN-hybrid VL core; the two video differences (as in the 4B M3c split)
+// are (a) the merge mask is on video_token_id across all frames and (b) the MRoPE
+// prefill positions come from Qwen3VLGetRopeIndexVideo (per-frame, timestamp-
+// interleaved scan). NO DeepStack (empty deepstack_visual_indexes on the 27B).
+//
+// prompt_ids  : placeholder-expanded model input ids (per-frame timestamp tokens
+//               + vision_start + video_token*Nf + vision_end, x grid_t).
+// mm_main     : the tower merger output [N, H] over ALL video tokens
+//               (N = grid_t*(h/merge)*(w/merge)); scattered into the video rows.
+// grid_thw    : the video (t,h,w) patch grid for get_rope_index.
+std::vector<int32_t> Qwen3_5VLGenerateGreedyVideo(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::array<int64_t, 3>& grid_thw, int32_t video_token_id,
+    int32_t vision_start_token_id, int32_t vision_end_token_id,
+    int32_t eos_token_id, const Qwen3_5DenseWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens);
+
 // Replay one dense decoder layer from a captured combined residual stream.
 // This is the dense sibling of Qwen3_5ReplayLayer and is the focused parity
 // seam for the real 27B resident W4A4 layer goldens.

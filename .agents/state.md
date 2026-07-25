@@ -23600,3 +23600,60 @@ then the USM Conformer delta on Granite-Speech-2b (the Gemma-4-family tower). A3
 e2e audio→text on Voxtral-Mini-3B (native Whisper-class encoder + projector-merge into
 the LANDED Mistral backbone). Gemma-4 audio (G3) reuses this pipeline once its oracle
 block clears.
+## 2026-07-25 — MULTIMODAL M3d: VIDEO on Qwen3.6-27B — STRICT video→text 32/32 (`CLAIM-MULTIMODAL-M3D`)
+
+**Qwen3.6-27B video works end-to-end. The Qwen video modalities (image+video) are COMPLETE
+on our own gate model** (audio N/A for Qwen; SPEED pending). A pure REUSE increment: image
+works on the 27B (M3-b), video works on Qwen3-VL-4B (M3c); M3d runs video through the 27B VL
+forward. Base `origin/main` `64a01af`, isolated worktree `/home/mudler/_git/wt-m3d-video`
+(branch `m3d-27b-video`); dgx build+gate `dgx.casa:~/work/m3d-video`, all GPU under
+`flock $HOME/gpu.lock` (sole owner, local-ai-worker Exited 0).
+
+**What was built (the only NEW wiring — the 27B video driver):**
+- `Qwen3_5VLGenerateGreedyVideo` (`src/vllm/model_executor/models/qwen3_5.cpp`; decl
+  `include/vllm/model_executor/models/qwen3_5_dense.h`). The M3-b image driver
+  `Qwen3_5VLGenerateGreedy` was refactored into a shared `VLGenerateCoreGdn` (embed +
+  scatter `mm_main` `[N,5120]` into the masked rows → GDN-hybrid prefill/decode with the
+  `[T,64]` MRoPE cos|sin cache via `BuildMropeCosSinHost` → paged greedy), mirroring how M3c
+  split the 4B path into `VLGenerateCore`. Image vs video wrappers differ ONLY in
+  `mask`/`pos3_prefill`/`delta`: image = image_token(248056) mask + `Qwen3VLGetRopeIndex`;
+  video = video_token(248057) mask across ALL frames + `Qwen3VLGetRopeIndexVideo` (per-frame,
+  timestamp-interleaved, temporal MRoPE `[11,11,10]`). NO DeepStack (27B empty).
+- REUSED VERBATIM (verified at HEAD, NOT modified): the M3c video processor (`ProcessVideo`,
+  bit-exact `pixel_values_videos` + temporal grid + timestamps + `BuildVideoRepl`), the
+  per-frame windowed tower attention, `Qwen3VLGetRopeIndexVideo`; the M3-b/M2a tower (27B
+  vision config) + `LoadQwen3VLVisionWeights` + `LoadQwen3_5Dense` bf16 LLM.
+- Oracle `scripts/mm/m3d_video_oracle_capture.py` (reuses the M3c synthetic clip byte-identically:
+  raw sha256 `8a111599…` == the M3c fixture) + committed fixtures
+  `tests/vllm/multimodal/fixtures/qwen3_5_27b_video/` + gate `test_qwen3_5_vl_video_e2e.cpp`
+  (+ CMake). The near-tie gap golden was produced by REUSING `m3c_video_neartie_gap.py --model
+  Qwen/Qwen3.6-27B --gpu-mem-util 0.6`.
+
+**Gate (BY MEASUREMENT):** vLLM 0.25.0 greedy `enforce_eager` on the fixed (video, prompt)
+is K=5 DETERMINISTIC (first_divergence=None) ⇒ gate form STRICT. Our full pipeline
+(C++ `ProcessVideo` → M2a tower 27B config per-frame windowed attn `[64,5120]` → merge into
+video_token rows → temporal MRoPE → GDN-hybrid backbone → greedy) == the vLLM golden
+**32/32 token-exact** (`test_qwen3_5_vl_video_e2e` 27/27 assertions; near-tie gaps 0.0000 nats
+at every position, 0 divergent). **Proof it RAN:** MESSAGE "video token-exact vs vLLM greedy
+golden: 32/32"; ours[:8]==golden[:8]==760,1156,6587,728,310,7276,279,2678; oracle text =
+"The user wants me to describe the video…I see a sequence of 6 images…".
+
+**Proof / no-regression:**
+- 27B video e2e: STRICT **32/32** (first run — the tower bf16 drift flipped no argmax; unlike
+  the 4B video which needed the near-tie band, the 27B golden itself is deterministic).
+- 27B IMAGE e2e re-run `test_qwen3_5_vl_e2e` STRICT **32/32** (54/54) — the driver refactor is
+  byte-identical on image.
+- Text SACRED **27B 235/235, 35B 315/315, Coder 138/138** byte-identical BY CONSTRUCTION —
+  `git diff --stat`: the `qwen3_5.cpp` change is confined to the VL-only driver region; the
+  shared text forward (`DenseForwardLayers`/`DenseForwardBody`/`DenseEmbedInto`/`RunLayer`/
+  `RunDenseLayer` + `Qwen3_5DenseModel::Forward*`) is UNTOUCHED, and the video path is gated on
+  mm input ⇒ `mrope_cos_sin==nullptr` on every text caller.
+- BUILD: a fresh full CUDA build (the transferred archive; nvcc found this time — the first
+  configure had missed nvcc in PATH and silently built CPU-only) — Release, arch 121a, cutlass
+  NVFP4+FP8 + Marlin-NVFP4 + FA2 all ENABLED banner, clean `-Werror` **0 warnings**.
+- compute-sanitizer memcheck **0 errors** on the 27B video forward.
+- `benchmark_binding=false`, SPEED unmeasured. Not pushed; FULL SHA reported.
+
+**NEXT:** mm SPEED (encoder-cache reuse + chunked-prefill mm) to reach the DONE bar; then
+Gemma-4 (M4, image+video+AUDIO, staged). Qwen3.6-27B image+video are both correct e2e — the
+user's stated Qwen3.6 video modality is COMPLETE.

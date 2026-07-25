@@ -297,7 +297,7 @@ every one.
       |
  M2  first vision TOWER + merge on Qwen3-VL-4B -> IMAGE gate   [CLOSED 2026-07-25: STRICT 32/32]
       |
- M3  complete Qwen3.6 IMAGE (reuse M2 tower) -> then VIDEO     [CRITICAL PATH -> user's target]
+ M3  complete Qwen3.6 IMAGE (reuse M2 tower) -> then VIDEO     [CLOSED 2026-07-25: image STRICT 32/32 (M3-b) + video STRICT 32/32 (M3d)]
       |
  M4  Gemma-4 (staged: vision + PLE/YOCO/MoE backbone; honesty-pass blocked pieces)
       |
@@ -619,6 +619,56 @@ GATES (Qwen3-VL-4B, vLLM 0.25.0 oracle, dgx GB10 arch 121a, cutlass+FA2 banner, 
   so a text-SACRED re-run is not required and compute-sanitizer is N/A (no kernel changed).
 - Critical path: YES (video is part of the user's stated Qwen modalities). NEXT: 27B-video (reuse
   the 4B video path on the GDN-hybrid backbone) + speed; then Gemma-4 (M4).
+
+**M3d (LANDED 2026-07-25, `CLAIM-MULTIMODAL-M3D`, engine-matrix row `ENG-MM-QWEN36-VL-FORWARD`)
+— VIDEO on Qwen3.6-27B: the GDN-hybrid VL video driver, STRICT e2e gate PASS 32/32. This
+COMPLETES the Qwen video modalities on our own gate model (image+video both work e2e).** A pure
+REUSE increment — image works on 27B (M3-b), video works on Qwen3-VL-4B (M3c); M3d runs video
+through the 27B VL forward. The processor (`ProcessVideo`, bit-exact `pixel_values_videos` +
+temporal grid + timestamps + `BuildVideoRepl`), the per-frame windowed tower attention, and
+`Qwen3VLGetRopeIndexVideo` were all landed + unit-gated by M3c and are REUSED verbatim (verified,
+not modified) — the only new wiring is the 27B video driver.
+- **The 27B video driver `Qwen3_5VLGenerateGreedyVideo`** (`src/vllm/model_executor/models/
+  qwen3_5.cpp`, decl `include/vllm/model_executor/models/qwen3_5_dense.h`). The M3-b image driver
+  `Qwen3_5VLGenerateGreedy` was refactored into a shared **`VLGenerateCoreGdn`** (embed + scatter
+  `mm_main` `[N,5120]` into the masked rows → GDN-hybrid prefill/decode with the `[T,64]` MRoPE
+  cos|sin cache via `BuildMropeCosSinHost` → paged greedy), mirroring how M3c split the 4B path
+  into `VLGenerateCore`. The image and video wrappers differ ONLY in how `mask`/`pos3_prefill`/
+  `delta` are built: image = `image_token`(248056) mask + `Qwen3VLGetRopeIndex`; video =
+  `video_token`(248057) mask across ALL frames + `Qwen3VLGetRopeIndexVideo` (per-frame,
+  timestamp-interleaved). NO DeepStack (27B `deepstack_visual_indexes` empty ⇒ tower `[N,5120]`,
+  no multiscale, no decoder inject). The GDN backbone, KV/GDN state, MRoPE application, and decode
+  continuation are IDENTICAL to the image path — so the image path is byte-identical across the
+  refactor (proven by the image gate re-run below). The video driver is purely additive (a new
+  function); the shared TEXT forward (`DenseForwardLayers`/`DenseForwardBody`/`DenseEmbedInto`/
+  `RunLayer`/`RunDenseLayer` + `Qwen3_5DenseModel::Forward*`) is UNTOUCHED (`git diff --stat`) ⇒
+  text SACRED byte-identical BY CONSTRUCTION.
+- **Oracle golden + gate form (`scripts/mm/m3d_video_oracle_capture.py`).** Reuses the M3c
+  synthetic clip byte-identically (same RNG seed/NF/HW/FPS ⇒ raw-video sha256 `8a111599…` ==
+  the M3c fixture) retargeted to `Qwen/Qwen3.6-27B`: grid_thw `[4,8,8]`, 64 video tokens, gen
+  input 113 tokens (64 video at offset 10). vLLM 0.25.0 greedy `enforce_eager` K=5 **DETERMINISTIC
+  (first_divergence=None) ⇒ GATE FORM STRICT** — golden 32 tokens (coherent video-conditioned
+  text: "The user wants me to describe the video…I see a sequence of 6 images…"). Committed
+  `tests/vllm/multimodal/fixtures/qwen3_5_27b_video/`.
+- **Gate 4 (27B video e2e) `test_qwen3_5_vl_video_e2e`: STRICT PASS 32/32** (near-tie-robust gate
+  FORM, mirroring M3c since the tower bf16 envelope is shared — but MEASURED STRICT: our tokens ==
+  vLLM greedy golden 32/32, and the teacher-forced near-tie gaps `neartie_gap_mnats_i32.bin` are
+  **0.0000 nats at every position** — 0 divergent positions; the near-tie band never engages). The
+  full pipeline (C++ `ProcessVideo` → M2a tower 27B config per-frame windowed attn `[64,5120]` →
+  merge into video_token(248057) rows → temporal MRoPE `[11,11,10]` on the 16 full-attn layers →
+  GDN-hybrid backbone → greedy) == golden, first run (27/27 assertions). Proof it RAN: MESSAGE
+  "video token-exact vs vLLM greedy golden: 32/32", ours[:8]==golden[:8]==760,1156,6587,728,310,
+  7276,279,2678.
+- **Inertness.** 27B IMAGE e2e re-run `test_qwen3_5_vl_e2e` **STRICT 32/32** (54/54) — the driver
+  refactor preserved the image path exactly. Text SACRED (27B 235/235, 35B 315/315, Coder 138/138)
+  byte-identical BY CONSTRUCTION — the shared text forward is untouched (`git diff --stat`: the
+  qwen3_5.cpp change is confined to the VL-only driver region; the video path is gated on mm input
+  ⇒ `mrope_cos_sin==nullptr` on every text caller).
+- **Build/memcheck.** Clean CUDA `-Werror` 0 warnings (Release, arch 121a, cutlass NVFP4 + FP8 +
+  Marlin + FA2 all ENABLED banner); compute-sanitizer memcheck 0 errors on the 27B video forward.
+- Critical path: YES — COMPLETES the user's stated Qwen3.6 video modality. Qwen3.6-27B is now
+  image+video e2e (audio N/A for Qwen; SPEED pending — the row stays `PARTIAL`). NEXT: speed
+  (encoder-cache reuse + chunked-prefill mm); then Gemma-4 (M4, image+video+AUDIO).
 
 **M4 — Gemma-4 (staged: vision tower + backbone stack; honesty-pass the blocked
 pieces).**
