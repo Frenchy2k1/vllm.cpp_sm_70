@@ -1,0 +1,89 @@
+// Qwen3-VL multimodal input processor — C++ mirror of the vLLM/HF processing
+// pipeline for Qwen3VL / Qwen3.6 (they share Qwen3_VisionTransformer).
+//
+// Ported from:
+//   - transformers Qwen2VLImageProcessor(Fast): smart_resize (image_processing_
+//     qwen2_vl.py:62), _preprocess patchify (:148-229), fused rescale+normalize
+//     (image_processing_backends.py:327 -> (x-127.5)/127.5 for mean=std=0.5,
+//     rescale=1/255).
+//   - vllm/model_executor/models/qwen3_vl.py: _get_prompt_updates :1400
+//     (single <|image_pad|> -> prod(grid_thw)//merge^2 copies of image_token_id);
+//     Qwen3VLProcessingInfo :848 (grid sizing).
+//   - vllm/multimodal/processing/context.py::call_hf_processor :244
+//     (_postprocess_output casts mm_kwargs to model dtype = bf16).
+//
+// The M1 correctness gate (processor parity) checks pixel_values + image_grid_thw
+// + placeholder-expanded ids + mm-hash BIT-identical to the vLLM oracle fixture.
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "vllm/multimodal/inputs.h"
+
+namespace vllm::multimodal {
+
+// The subset of preprocessor_config.json + config.vision_config the image path
+// needs. mean/std/rescale are fused into the (x - shift)/scale normalize.
+struct Qwen3VLProcessorConfig {
+  int patch_size = 16;
+  int temporal_patch_size = 2;
+  int merge_size = 2;  // == vision_config.spatial_merge_size
+  double image_mean = 0.5;
+  double image_std = 0.5;
+  double rescale_factor = 1.0 / 255.0;
+  int64_t min_pixels = 65536;      // size.shortest_edge
+  int64_t max_pixels = 16777216;   // size.longest_edge
+  // token ids (config.json top-level)
+  int32_t image_token_id = 151655;
+  int32_t vision_start_token_id = 151652;
+  int32_t vision_end_token_id = 151653;
+
+  std::string model_id = "Qwen/Qwen3-VL-4B-Instruct";  // for the mm-hash
+};
+
+// Load from the two HF json files (preprocessor_config.json + config.json).
+Qwen3VLProcessorConfig LoadQwen3VLProcessorConfig(
+    const std::string& preprocessor_config_json_path,
+    const std::string& config_json_path, const std::string& model_id);
+
+// smart_resize (transformers image_processing_qwen2_vl.py:62). Returns the
+// (height, width) that are both divisible by `factor` and whose product lies in
+// [min_pixels, max_pixels], preserving aspect ratio.
+std::array<int64_t, 2> SmartResize(int64_t height, int64_t width, int64_t factor,
+                                   int64_t min_pixels, int64_t max_pixels);
+
+class Qwen3VLImageProcessor {
+ public:
+  explicit Qwen3VLImageProcessor(Qwen3VLProcessorConfig cfg)
+      : cfg_(std::move(cfg)) {}
+
+  const Qwen3VLProcessorConfig& config() const { return cfg_; }
+
+  // Preprocess ONE RGB image (HWC uint8, height*width*3) into ImageKwargs:
+  // pixel_values [num_patches, channel*temporal*patch*patch] + image_grid_thw,
+  // plus the mm-hash. Assumes the image dimensions require no resize when they
+  // already satisfy smart_resize (the fixture case); a genuine resize path
+  // (bicubic) is deferred — see ProcessImage for the guard.
+  ImageKwargs ProcessImage(const uint8_t* rgb, int64_t height,
+                           int64_t width) const;
+
+  std::string HashImage(const uint8_t* rgb, int64_t height,
+                        int64_t width) const;
+
+ private:
+  Qwen3VLProcessorConfig cfg_;
+};
+
+// Placeholder expansion (qwen3_vl.py::_get_prompt_updates:1400). Replaces each
+// image_token_id in `prompt_ids` with N = prod(grid_thw)/merge^2 copies of
+// image_token_id, consuming `grids` in order. Returns the expanded ids and fills
+// `placeholders` with the [offset,length] span of every expanded item.
+std::vector<int32_t> ExpandImagePlaceholders(
+    const std::vector<int32_t>& prompt_ids, int32_t image_token_id,
+    int merge_size, const std::vector<std::array<int64_t, 3>>& grids,
+    std::vector<std::array<int, 2>>* placeholders);
+
+}  // namespace vllm::multimodal

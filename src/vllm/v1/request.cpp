@@ -79,9 +79,13 @@ Request::Request(std::string request_id,
 // engine injects block_hasher exactly as upstream.
 Request Request::FromEngineCoreRequest(const EngineCoreRequest& request,
                                        BlockHasher block_hasher) {
-  return Request(request.request_id, request.prompt_token_ids,
-                 request.sampling_params, request.arrival_time,
-                 std::move(block_hasher), request.priority);
+  Request req(request.request_id, request.prompt_token_ids,
+              request.sampling_params, request.arrival_time,
+              std::move(block_hasher), request.priority);
+  // Carry the multimodal placeholder specs through (empty for text-only ->
+  // byte-identical). Consumed by the encoder-cache / vision seam (M1/M2).
+  req.mm_features = request.mm_features;
+  return req;
 }
 
 // Request.__lt__ (request.py:309-320): priority, then arrival_time, then

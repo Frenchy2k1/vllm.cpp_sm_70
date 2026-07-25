@@ -80,11 +80,18 @@ class ChunkedTokenDatabase {
   // The interop peer uses seed "0".
   static uint64_t NoneHashFromSeed(const std::string& seed);
 
-  // hash one chunk with a rolling `prefix`: fold8(hash_func((prefix, tokens, ())))
-  // (token_database.py:269-295). `prefix` is the folded uint64 of the previous
-  // chunk (or none_hash for the first).
-  uint64_t HashTokens(const std::vector<int32_t>& chunk_tokens,
-                      uint64_t prefix) const;
+  // hash one chunk with a rolling `prefix`:
+  //   fold8(hash_func((prefix, tokens, extra_keys)))  (token_database.py:269-295)
+  // `prefix` is the folded uint64 of the previous chunk (or none_hash for the
+  // first). `extra_keys` is the multimodal seam: for a TEXT-ONLY request it is
+  // empty and the third tuple element serializes to CBOR 0x80 (empty array) ==>
+  // BYTE-IDENTICAL to the pre-mm hash. For a multimodal request the caller passes
+  // the per-chunk MultiModalHasher mm-hashes (hex strings); they are encoded as a
+  // CBOR array of text items. (mm-hash bit-parity itself is gated by the
+  // processor-parity test; the non-empty extra_keys byte-format vs a full mm
+  // LMCache oracle is an M2/M3 gate.)
+  uint64_t HashTokens(const std::vector<int32_t>& chunk_tokens, uint64_t prefix,
+                      const std::vector<std::string>& extra_keys = {}) const;
 
   // The full chunked prefix-hash walk (token_database.py:414-431). Each Entry's
   // chunk_hash is the CacheEngineKey.chunk_hash for [start, end).

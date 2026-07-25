@@ -43,9 +43,11 @@ uint64_t ChunkedTokenDatabase::NoneHashFromSeed(const std::string& seed) {
 }
 
 uint64_t ChunkedTokenDatabase::HashTokens(
-    const std::vector<int32_t>& chunk_tokens, uint64_t prefix) const {
+    const std::vector<int32_t>& chunk_tokens, uint64_t prefix,
+    const std::vector<std::string>& extra_keys) const {
   // hash_func((canon_prefix, canon_tokens, canon_extra)) where the tuple is the
-  // CBOR "Any" input: (prefix:int, tuple(tokens), ()) (token_database.py:263-295).
+  // CBOR "Any" input: (prefix:int, tuple(tokens), extra_keys)
+  // (token_database.py:263-295).
   std::vector<::vllm::v1::CborValue> tok_items;
   tok_items.reserve(chunk_tokens.size());
   for (int32_t t : chunk_tokens) {
@@ -53,12 +55,19 @@ uint64_t ChunkedTokenDatabase::HashTokens(
     // unsigned ints, which CborValue::Int(>=0) -> UInt reproduces exactly.
     tok_items.push_back(::vllm::v1::CborValue::Int(t));
   }
+  // extra_keys: empty for text-only (-> CBOR 0x80, byte-identical to pre-mm); the
+  // multimodal mm-hashes (hex) as a CBOR text array otherwise (mm seam).
+  std::vector<::vllm::v1::CborValue> extra_items;
+  extra_items.reserve(extra_keys.size());
+  for (const std::string& k : extra_keys) {
+    extra_items.push_back(::vllm::v1::CborValue::Text(k));
+  }
   // The prefix is a folded uint64 (may exceed int64 max), so it MUST use the
   // unsigned CBOR major type — cbor2 encodes a Python int in [0, 2^64) as major 0.
   ::vllm::v1::CborValue input = ::vllm::v1::CborValue::Array({
       ::vllm::v1::CborValue::UInt(prefix),
       ::vllm::v1::CborValue::Array(std::move(tok_items)),
-      ::vllm::v1::CborValue::Array({}),  // empty extra_keys tuple -> CBOR 0x80
+      ::vllm::v1::CborValue::Array(std::move(extra_items)),  // extra_keys
   });
   switch (hash_) {
     case PreCachingHash::kSha256Cbor:

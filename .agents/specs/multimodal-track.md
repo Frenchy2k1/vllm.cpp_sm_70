@@ -304,7 +304,14 @@ every one.
  M5  AUDIO if reachable (Gemma-4 / gemma3n audio encoder + ASR frontend)
 ```
 
-**M0 — Ground the facts; pick the first vehicle; confirm oracle + fit + checkpoint.**
+**M0 — Ground the facts; pick the first vehicle; confirm oracle + fit + checkpoint.
+[LANDED 2026-07-25, `CLAIM-MULTIMODAL-M1`]** Downloaded `Qwen/Qwen3-VL-4B-Instruct` (8.3 GiB) to
+dgx; `scripts/mm/m0_oracle_capture.py` captured the vLLM 0.25.0 `BaseMultiModalProcessor.apply`
+reference for a fixed (image, prompt) into committed fixtures
+`tests/vllm/multimodal/fixtures/qwen3vl/` (pixel_values bf16 784x1536 sha256 `2c908796...`, grid_thw
+[1,28,28], expanded ids 9->204 N=196, mm-hash `ef6f5bea...`). RCA locked the bit-exact pixel
+contract: fused rescale+normalize `(raw-127.5)/127.5` -> transformers patchify -> bf16 model-dtype
+cast (vLLM casts mm_kwargs to model dtype in `call_hf_processor`).
 - Builds: nothing (design + measurement). Confirm (DONE in this spike): our cached
   NVFP4 gate checkpoints are text-only (no `visual.*`); 0.25.0 has the mm model
   files. Remaining M0 work: fetch `Qwen/Qwen3-VL-4B-Instruct`; run the 0.25.0
@@ -319,7 +326,34 @@ every one.
 - Critical path: YES (unblocks everything).
 
 **M1 — The mm INPUT pipeline + encoder-cache engine seam (the foundation, inert
-without mm input).**
+without mm input). [LANDED 2026-07-25, `CLAIM-MULTIMODAL-M1`]** Built `src/vllm/multimodal/`
+(MultiModalKwargs/FeatureSpec/Inputs, MultiModalHasher blake3, Qwen3VLImageProcessor
+smart_resize+normalize+patchify, ExpandImagePlaceholders) + `EncoderCacheManager`+budget; additive
+inert `mm_features` on Request/EngineCoreRequest; `extra_keys` seam on ChunkedTokenDatabase. Gate 2
+(processor parity) PASS 23/23 BIT-identical vs the M0 oracle (RED-first proven); encoder-cache 32/32;
+Gate 1 (text-inertness) CPU-green STANDALONE + `check-device-leakage` OK; the 27B/35B/Coder SACRED
+CUDA gates are the mandatory GPU inertness proof. NO vision tower / embed-merge (that is M2).
+Tracked as engine-matrix row `ENG-MM-INPUT-PIPELINE` (`ACTIVE`, `CLAIM-MULTIMODAL-M1`).
+
+#### Port map
+`ENG-MM-INPUT-PIPELINE` vLLM `file:line` -> our code:
+- `multimodal/inputs.py` -> `include/vllm/multimodal/inputs.h` (MultiModalKwargs/FeatureSpec/Inputs).
+- `multimodal/hasher.py:50` + `processing/inputs.py:62` -> `src/vllm/multimodal/hasher.cpp` (blake3 mm-hash, exact byte stream).
+- transformers `image_processing_qwen2_vl.py:62` + `image_processing_backends.py:327`; `qwen3_vl.py::_get_prompt_updates:1400` -> `src/vllm/multimodal/qwen3vl_processor.cpp` (smart_resize + fused normalize + patchify + placeholder expansion).
+- `v1/core/encoder_cache_manager.py:17` -> `src/vllm/v1/core/encoder_cache_manager.cpp`.
+- `Request`/`EngineCoreRequest` mm_features -> `include/vllm/v1/request.h`, `src/vllm/v1/request.cpp`, `include/vllm/v1/engine/types.h` (additive, inert).
+- LMCache `extra_keys` -> `include/vllm/v1/kv_offload/lmcache/chunked_token_database.h` + `.cpp` (empty -> byte-identical).
+
+#### Work breakdown
+- M0 [DONE]: fetch Qwen3-VL-4B; `scripts/mm/m0_oracle_capture.py` -> committed oracle fixtures.
+- M1 [DONE]: image processor + placeholder expansion + mm-hash + MultiModalKwargs; EncoderCacheManager + budget; inert `mm_features` + `extra_keys`; processor-parity gate 23/23 + encoder-cache 32/32; CPU inertness + `check-device-leakage`; SACRED CUDA 27B/35B/Coder.
+- M2 [NEXT]: `Qwen3_VisionTransformer` forward + `_merge_multimodal_embeddings` -> image token-exact gate.
+
+#### Risks/decisions
+- pixel_values is the bf16 MODEL-DTYPE cast (vLLM `call_hf_processor::_postprocess_output`), NOT the raw f32 processor output — the parity gate compares bf16 (RCA-locked). Decision: C++ computes f32 `(raw-127.5)/127.5` then round-to-nearest-even bf16.
+- The bicubic RESIZE path is deferred: M1 uses images already conformant to smart_resize (a genuine resize throws). Risk retired for the gate image (448x448); M2/M3 owns arbitrary sizes.
+- `extra_keys` non-empty byte-format vs a full mm LMCache oracle is an M2/M3 gate; the empty (text) path is byte-identical (proven by `test_lmcache_key_agreement`).
+- Placeholder expansion is a silent-corruption hazard (wrong count -> fluent-wrong text); gated bit-exact against the oracle, never by eyeball.
 - Builds: `MultiModalKwargs`; a `BaseMultiModalProcessor` port (image preprocess +
   placeholder expansion + `_get_mm_fields_config`); `MultiModalHasher`;
   `EncoderCacheManager` + `EncoderRunner` scaffold + scheduler encoder-budget /

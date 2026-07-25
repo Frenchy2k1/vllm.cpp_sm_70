@@ -23157,3 +23157,20 @@ e2e HW-blocked (N GiB over pool)" — NEVER a claimed SACRED pass.
 correction). Kimi-Linear (owned by `CLAIM-MLA-DEEPSEEK`) and `Glm4Moe` (owned by
 `CLAIM-GLM-DSA-LATEST-DEEPSEEK`) NOT edited — corrections handed to those claims
 (spec §5). No `MODEL-MM-*` / `multimodal-track.md` touched. Records only; NOT pushed.
+## 2026-07-25 — MULTIMODAL M0+M1 landed (input pipeline + encoder-cache seam), `CLAIM-MULTIMODAL-M1`
+
+Base `origin/main` `39943fc`, isolated worktree `~/work/mm-m0m1` (branch `mm-m0m1`).
+**M0 done:** downloaded `Qwen/Qwen3-VL-4B-Instruct` to dgx; `scripts/mm/m0_oracle_capture.py`
+dumped the vLLM 0.25.0 `BaseMultiModalProcessor.apply` reference for a fixed (image,prompt) into
+committed fixtures `tests/vllm/multimodal/fixtures/qwen3vl/` (pixel_values bf16 784x1536 sha256
+`2c908796...`, grid_thw [1,28,28], expanded ids 9->204 N=196, mm-hash `ef6f5bea...`). RCA locked the
+bit-exact contract: `bf16_rne((raw-127.5)/127.5)` patchified; the fixture pixel_values are the
+model-dtype (bf16) cast vLLM applies in `call_hf_processor`.
+**M1 done (new `src/vllm/multimodal/`):** MultiModalKwargs/FeatureSpec/Inputs, MultiModalHasher
+(blake3), Qwen3VLImageProcessor (smart_resize+normalize+patchify) + ExpandImagePlaceholders,
+EncoderCacheManager+budget; additive inert `mm_features` on Request/EngineCoreRequest; extra_keys
+seam on ChunkedTokenDatabase (empty->byte-identical). Processor-parity gate 23/23 BIT-identical
+(RED-first proven); encoder-cache 32/32; CPU inertness green; clean CPU -Werror; check-device-leakage
+OK. NO vision tower/embed-merge (M2). SACRED CUDA text-inertness PASSED STANDALONE under flock (27B 235/235, 35B 315/315, Coder 138/138, cutlass-ON banner confirmed, clean -Werror);
+build `~/work/mm-m0m1-cuda`. Resume: `git -C ~/work/mm-m0m1 status`; rerun processor gate
+`./build-cpu/tests/test_qwen3vl_processor`. NOT pushed.

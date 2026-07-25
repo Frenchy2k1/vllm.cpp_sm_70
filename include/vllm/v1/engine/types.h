@@ -53,6 +53,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/multimodal/inputs.h"  // multimodal::MultiModalFeatureSpec (mm seam)
 #include "vllm/sampling_params.h"
 #include "vllm/v1/outputs.h"  // vllm::v1::LogprobsTensors (SamplerOutput payload)
 #include "vllm/v1/request.h"  // vllm::v1::FinishReason (reused, not redefined)
@@ -78,6 +79,11 @@ struct EngineCoreRequest {
   // priority carried from the frontend request (OpenAI `priority` field) into
   // Request.priority. Default 0 keeps FCFS parity when unset.
   int priority = 0;
+  // mm_features (EngineCoreRequest.mm_features): processed multimodal placeholder
+  // specs (mm-hash + span + encoder input). EMPTY for text-only requests -> every
+  // downstream mm hook is a no-op and the engine is byte-identical. Populated by
+  // the mm input pipeline (M1); consumed by the encoder cache / vision tower (M2).
+  std::vector<multimodal::MultiModalFeatureSpec> mm_features = {};
 };
 
 // SamplerOutput (vllm/v1/outputs.py): the raw sampler result for a step.
