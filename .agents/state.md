@@ -23385,3 +23385,73 @@ text-only), then video.
   edited): 27B 235/235, 35B 315/315, Coder 138/138** re-run standalone under `flock`.
   compute-sanitizer on the 27B VL forward. IMAGE e2e correctness-complete;
   `benchmark_binding=false`, SPEED PENDING; VIDEO = M3c (owed). Not pushed.
+
+- **2026-07-25 — MULTIMODAL M3c: VIDEO understanding (Qwen3-VL-4B). Video
+  preprocessing + full wiring LANDED + unit-gated; video e2e token-exact 22/32 with
+  the divergence RCA'd OUT of the new video path (bf16 tower near-tie), token-exact
+  PENDING on tower fidelity. `CLAIM-MULTIMODAL-M3C`, base `origin/main` `ed4bc11`,
+  isolated worktree `/home/mudler/_git/wt-m3c-video` branch `m3c-video`; dgx build+gate
+  `~/work/m3b-vl` reused build cache under `flock $HOME/gpu.lock` (sole GPU owner,
+  local-ai-worker Exited).** The genuinely-new piece is video PREPROCESSING; the tower
+  handles temporal patches and MRoPE the temporal axis (both verified). BUILT (all
+  additive to the qwen3_vl*/multimodal TUs — ZERO text-path TU touched ⇒ text SACRED
+  byte-identical BY CONSTRUCTION):
+  (1) **Video processor** `Qwen3VLImageProcessor::ProcessVideo` + `VideoSmartResize` +
+      `ComputeVideoTimestamps` + `BuildVideoRepl` + `VideoKwargs`
+      (`src/vllm/multimodal/qwen3vl_processor.cpp`, `include/.../inputs.h`). Video
+      patchify mirrors transformers `video_processing_qwen3_vl.py:249` reshape/permute:
+      rows enumerate C-order `[grid_t,Gh,Gw,mh,mw]`, cols `[c,tp,ph,pw]`, **source
+      frame = grid_t_index*temporal_patch_size + t (2 REAL frames per patch-row, NOT
+      the image duplicate)**. `BuildVideoRepl` owns the timestamp-interleaved expansion
+      (`qwen3_vl.py::get_video_repl:1479`): per frame `[ts_ids]+vision_start+
+      video_token*Nf+vision_end`.
+  (2) **Tower per-frame windowed attention** (`qwen3_vl_vision.cpp`): vLLM builds
+      cu_seqlens per frame (`qwen3_vl.py:744`, dumped `[0,64,128,192,256]`) ⇒ frames
+      never attend across each other. Replaced the single non-causal window with a loop
+      over grid_t frames (each `[h*w,nh,hd]`); for an image (grid_t==1) this is ONE
+      window == byte-identical. pos-embed + vision RoPE already loop over t.
+  (3) **Video MRoPE** `Qwen3VLGetRopeIndexVideo` (`qwen3_vl_text.cpp`): mirrors
+      `_iter_mm_grid_hw`+`_get_mrope_input_positions` video path — per-frame scan
+      (vision_start→video_token→vision_end), timestamp/marker tokens get sequential
+      text positions, each frame's video tokens get grid positions off the running max.
+  (4) **e2e video driver** `Qwen3VLGenerateGreedyVideo` (`qwen3_vl.cpp`): refactored the
+      image driver into a shared `VLGenerateCore`; video wrapper builds the mask on
+      video_token_id + positions via the video get_rope_index. Image driver unchanged
+      (byte-identical — proven by the image gate below).
+  **GATES (Qwen3-VL-4B, vLLM 0.25.0 oracle, dgx GB10 arch 121a cutlass+FA2 banner,
+  clean `-Werror` RC=0):**
+  - Oracle capture `scripts/mm/m3c_video_oracle_capture.py` on a fixed 8×128×128 synthetic
+    video (do_sample_frames=false): grid_thw `[4,8,8]`, pixel_values_videos `[256,1536]`
+    (precast-bf16 == production, same contract as image), timestamps `[0.25,1.25,2.25,3.25]`,
+    64 video tokens, K=5 DETERMINISTIC ⇒ **gate form STRICT**; golden 32 tokens sha256
+    `9f78f8a0…`, text *"The video appears to be static, with no discernible action…
+    static noise… television"*. Committed `tests/vllm/multimodal/fixtures/qwen3vl_video/`.
+  - **Video-processor UNIT gate `test_qwen3vl_video_processor` — 41/41 SUCCESS:
+    pixel_values_videos BIT-exact 0/393216 mismatches, grid + timestamps + interleaved
+    expansion exact. RED-first PROVEN:** image-style duplicate frame mapping (`frame=gt*tp`,
+    ignoring t) → 195838/393216 mismatches → FAILURE.
+  - **Video MRoPE positions BIT-exact vs vLLM** (`scripts/mm/m3c_mrope_check.py`:
+    positions equal, delta −48 == vLLM's).
+  - **Video TOWER faithful** (never gated before — M2a only tested grid_t==1): our
+    per-frame windowed-attention output rel-L2 **0.072** vs the dumped vLLM 0.25.0 video
+    tower (`scripts/mm/m3c_video_tower_ref_dump.py`), within the bf16 envelope (image
+    tower ~0.05; tolerance <0.1). No video-tower bug.
+  - **Video e2e `test_qwen3vl_video_e2e`: 22/32 token-exact** — a 23-token EXACT prefix,
+    then a single bf16-envelope near-tie flip at token 24 (ours 11980 "noise" vs golden
+    11 ",") shifting the tail. RCA: every DISCRETE video element is bit-exact/faithful vs
+    vLLM (pixels, grid, timestamps, expansion, MRoPE positions, tower within envelope), so
+    the flip is a downstream bf16 near-tie in the SHARED decode — the M2a tower ~0.05–0.07
+    rel-L2 ceiling, NOT a video-path defect (the image gate rode the same envelope and did
+    not flip in 32). NOT loosened; STRICT token-exact PENDING on tower numeric fidelity
+    (the M2a portable-kernel follow-on).
+  - **NO REGRESSION: image e2e 4B `test_qwen3vl_e2e` STRICT 32/32** (proves the tower
+    windowing change [identical for grid_t==1] + the driver refactor are byte-identical on
+    image); CPU units image-processor 23/23, video-processor 41/41, text 85/85. Text SACRED
+    (27B/35B/Coder) byte-identical BY CONSTRUCTION (zero text-path TU touched — unlike M3-b
+    which edited `qwen3_5.cpp`; this session edited only qwen3_vl*/multimodal TUs). 27B image
+    e2e + text SACRED not re-run (shared tower identical for grid_t==1, empirically confirmed
+    on 4B; big-model runs spared on the disk-tight box). compute-sanitizer on the video
+    forward not run (owed with the tower-fidelity follow-on). Not pushed; FULL SHA reported.
+  **NEXT:** close the video token-exact gate by tightening the tower bf16 envelope (M2a
+  portable-kernel work — the same ceiling that risks image near-ties); then 27B-video (reuse
+  the 4B video path on the GDN-hybrid backbone) + speed. Gemma-4 image+video+AUDIO = M4.

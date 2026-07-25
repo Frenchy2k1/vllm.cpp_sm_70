@@ -260,6 +260,30 @@ STANDALONE under `flock`, cutlass-ON+FA2 - **27B 235/235, 35B 315/315, Coder 138
 forward. SPEED: **`benchmark_binding=false`, PENDING** - no throughput measured (the row is not DONE
 until every-axis vLLM speed parity; VIDEO = M3c, owed). No throughput number is claimed here.
 
+**Multimodal M3c - VIDEO preprocessing + wiring LANDED + unit-gated on Qwen3-VL-4B; e2e token-exact PENDING on tower fidelity (2026-07-25, `CLAIM-MULTIMODAL-M3C`).**
+Disposition: **NO throughput measured; the video PATH is correct + unit-gated, the e2e STRICT
+token-exact gate does NOT yet pass (22/32) - RCA'd to the shared bf16 tower envelope, NOT loosened.**
+The genuinely-new piece is video PREPROCESSING (frame sampling + temporal grid + timestamp-interleaved
+placeholder); the tower handles temporal patches and MRoPE the temporal axis. On a fixed 8x128x128
+synthetic clip (do_sample_frames=false), grid_thw `[4,8,8]`, pixel_values_videos `[256,1536]`, golden
+K=5 DETERMINISTIC => GATE FORM STRICT (sha256 `9f78f8a0...`), text *"The video appears to be static...
+static noise... television"*. GATES (vLLM 0.25.0 oracle, dgx GB10, cutlass+FA2, clean `-Werror`):
+video-processor UNIT gate `test_qwen3vl_video_processor` **41/41, pixel_values_videos BIT-exact
+0/393216** + grid + timestamps + interleaved expansion (RED-first: image-duplicate temporal mapping ->
+195838/393216 mismatch -> FAILURE); video MRoPE positions **BIT-exact vs vLLM** (`scripts/mm/
+m3c_mrope_check.py`, delta -48); video tower rel-L2 **0.072** vs the dumped vLLM video tower
+(`scripts/mm/m3c_video_tower_ref_dump.py`, within the bf16 envelope, image tower ~0.05); video e2e
+`test_qwen3vl_video_e2e` **22/32** (23-token exact prefix, token-24 bf16 near-tie flip 11980 vs 11).
+RCA: every discrete video element is bit-exact/faithful vs vLLM, so the residual is a downstream bf16
+near-tie in the SHARED decode (the M2a tower ~0.05-0.07 rel-L2 ceiling), NOT a video defect; STRICT
+video token-exact is PENDING on tower numeric fidelity (the M2a portable-kernel follow-on). NO
+REGRESSION: image e2e 4B STRICT **32/32** (proves the per-frame windowing [identical for grid_t==1] +
+the driver refactor are byte-identical), CPU units 23/41/85; text SACRED byte-identical BY CONSTRUCTION
+(zero text-path TU touched). Reproduce the golden: `OUT_DIR=$HOME/mm_video_fixture PATH=$HOME/venvs/
+vllm-oracle/bin:$PATH flock $HOME/gpu.lock ~/venvs/vllm-oracle/bin/python scripts/mm/
+m3c_video_oracle_capture.py`; the e2e: `flock $HOME/gpu.lock ./build/tests/test_qwen3vl_video_e2e`.
+`benchmark_binding=false`. No throughput number is claimed here.
+
 **Multimodal track (Audio/Video/Image, Gemma-4 + Qwen3.6) - SPIKE ONLY, DESIGN, no gate run (2026-07-25, `CLAIM-MULTIMODAL-TRACK` [spike](../.agents/specs/multimodal-track.md)).**
 Disposition: **NO throughput measured, NO correctness gate run, nothing built or downloaded
 (oracle-metadata + safetensors-header read only) - PENDING for all rows.** The gate models are

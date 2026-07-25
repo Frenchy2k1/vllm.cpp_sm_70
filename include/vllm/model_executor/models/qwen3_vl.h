@@ -89,4 +89,24 @@ std::vector<int32_t> Qwen3VLGenerateGreedy(
     int32_t eos_token_id, const Qwen3VLWeights& weights, const HfConfig& config,
     vt::Queue& queue, int max_new_tokens);
 
+// Single-VIDEO, single-sequence GREEDY video->text generation (the M3c gate
+// driver). Identical forked forward to the image driver above; the two video
+// differences are (a) the merge mask is on video_token_id (not image_token_id) and
+// (b) the MRoPE prefill positions come from Qwen3VLGetRopeIndexVideo, which scans
+// the timestamp-interleaved, per-frame placeholder structure for grid_t frames.
+//
+// prompt_ids  : the placeholder-expanded model input ids (per-frame timestamp
+//               tokens + vision_start + video_token*Nf + vision_end, x grid_t).
+// mm_main     : the tower merger output [N, H_text] over ALL video tokens
+//               (N = grid_t*(h/merge)*(w/merge)); scattered into the video rows.
+// mm_deepstack: the tower multiscale output [N, L*H_text] (L levels; 4B has 3).
+// grid_thw    : the video (t,h,w) patch grid for get_rope_index.
+std::vector<int32_t> Qwen3VLGenerateGreedyVideo(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::vector<float>& mm_deepstack, int64_t num_deepstack_levels,
+    const std::array<int64_t, 3>& grid_thw, int32_t video_token_id,
+    int32_t vision_start_token_id, int32_t vision_end_token_id,
+    int32_t eos_token_id, const Qwen3VLWeights& weights, const HfConfig& config,
+    vt::Queue& queue, int max_new_tokens);
+
 }  // namespace vllm

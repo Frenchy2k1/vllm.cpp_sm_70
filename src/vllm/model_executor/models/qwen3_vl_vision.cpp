@@ -345,11 +345,32 @@ std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_value
     Tensor k3 = kb.tensor(); k3.rank = 3; k3.shape[0] = L; k3.shape[1] = nh; k3.shape[2] = hd;
     k3.stride[0] = nh * hd; k3.stride[1] = hd; k3.stride[2] = 1;
     vt::RopeFromCache(q, q3, &k3, posb.tensor(), cache->tensor(), ra);
-    // non-causal full attention (single sequence, cu_seqlens=[0,L]).
+    // Non-causal attention, WINDOWED PER FRAME. vLLM builds cu_seqlens per frame
+    // (qwen3_vl.py:744 patches_per_frame repeated grid_t times) so a video's frames
+    // never attend across each other — temporal mixing is via temporal_patch_size
+    // in patch_embed + the LLM, not vision attention. For an image (grid_t==1) this
+    // is a single window == the previous behavior (byte-identical). Frame f owns the
+    // contiguous patch block [f*hw, (f+1)*hw) (rows are frame-major).
     Tensor v3 = vb.tensor(); v3.rank = 3; v3.shape[0] = L; v3.shape[1] = nh; v3.shape[2] = hd;
     v3.stride[0] = nh * hd; v3.stride[1] = hd; v3.stride[2] = 1;
     Buf ao(b, q, DType::kBF16, {L, nh, hd});
-    vt::Attention(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
+    {
+      const int64_t nframes = grid_thw[0];
+      const int64_t hw = grid_thw[1] * grid_thw[2];  // patches per frame
+      const size_t elt = vt::SizeOf(DType::kBF16);
+      auto frame_slice = [&](const Tensor& src, int64_t f) -> Tensor {
+        Tensor s = src;
+        s.shape[0] = hw;
+        s.data = static_cast<char*>(src.data) +
+                 static_cast<size_t>(f * hw * nh * hd) * elt;
+        return s;
+      };
+      for (int64_t f = 0; f < nframes; ++f) {
+        Tensor qf = frame_slice(q3, f), kf = frame_slice(k3, f),
+               vf = frame_slice(v3, f), aof = frame_slice(ao.tensor(), f);
+        vt::Attention(q, aof, qf, kf, vf, vt::AttentionArgs{scale, /*causal=*/false});
+      }
+    }
     // proj + residual.
     Tensor ao2 = ao.tensor(); ao2.rank = 2; ao2.shape[0] = L; ao2.shape[1] = H;
     ao2.stride[0] = H; ao2.stride[1] = 1;

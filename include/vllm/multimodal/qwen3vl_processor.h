@@ -55,6 +55,23 @@ Qwen3VLProcessorConfig LoadQwen3VLProcessorConfig(
 std::array<int64_t, 2> SmartResize(int64_t height, int64_t width, int64_t factor,
                                    int64_t min_pixels, int64_t max_pixels);
 
+// Video smart_resize (transformers qwen3_vl/video_processing_qwen3_vl.py:35).
+// Unlike the image variant the pixel budget includes the temporal dim: t_bar =
+// ceil(num_frames/temporal_factor)*temporal_factor and the bound compares
+// t_bar*h_bar*w_bar to [min_pixels, max_pixels]. Returns (height, width) only
+// (t_bar is handled by the temporal patchify). No aspect-ratio-preserving branch
+// when the identity holds (the fixture case); a genuine bicubic resize is deferred.
+std::array<int64_t, 2> VideoSmartResize(int64_t num_frames, int64_t height,
+                                        int64_t width, int64_t temporal_factor,
+                                        int64_t factor, int64_t min_pixels,
+                                        int64_t max_pixels);
+
+// Per-temporal-group timestamps (qwen3_vl.py::_calculate_timestamps:975). For
+// sampled frame `indices`, ts[i]=indices[i]/video_fps, then averaged in groups of
+// `merge_size` (== temporal_patch_size) -> one timestamp per grid_t group.
+std::vector<double> ComputeVideoTimestamps(const std::vector<int64_t>& frame_indices,
+                                           double video_fps, int merge_size);
+
 class Qwen3VLImageProcessor {
  public:
   explicit Qwen3VLImageProcessor(Qwen3VLProcessorConfig cfg)
@@ -73,6 +90,18 @@ class Qwen3VLImageProcessor {
   std::string HashImage(const uint8_t* rgb, int64_t height,
                         int64_t width) const;
 
+  // Preprocess ONE video (THWC uint8, num_frames*height*width*3) into VideoKwargs:
+  // pixel_values_videos [num_patches, channel*temporal*patch*patch] +
+  // video_grid_thw + per-group timestamps. num_frames is padded up to a multiple
+  // of temporal_patch_size by repeating the last frame (transformers _preprocess
+  // :228-232); each patch-row fuses `temporal_patch_size` REAL consecutive frames.
+  // `frame_indices`/`video_fps` drive ComputeVideoTimestamps. Assumes conformant
+  // frame dimensions (VideoSmartResize identity); a genuine resize is deferred.
+  VideoKwargs ProcessVideo(const uint8_t* thwc, int64_t num_frames, int64_t height,
+                           int64_t width,
+                           const std::vector<int64_t>& frame_indices,
+                           double video_fps) const;
+
  private:
   Qwen3VLProcessorConfig cfg_;
 };
@@ -85,5 +114,18 @@ std::vector<int32_t> ExpandImagePlaceholders(
     const std::vector<int32_t>& prompt_ids, int32_t image_token_id,
     int merge_size, const std::vector<std::array<int64_t, 3>>& grids,
     std::vector<std::array<int, 2>>* placeholders);
+
+// Build the per-video replacement sequence (qwen3_vl.py::get_video_repl:1479).
+// For each of grid_t frames the structure is:
+//   timestamp_token_ids[f] + vision_start + video_token*tokens_per_frame[f] + vision_end
+// `timestamp_token_ids` are the BPE ids of the string f"<{ts:.1f} seconds>" for
+// each group's timestamp (produced by the serving tokenizer); this function owns
+// the genuinely-new INTERLEAVE structure, not the tokenizer. Returns the full
+// expanded sequence for one video item.
+std::vector<int32_t> BuildVideoRepl(
+    const std::vector<int64_t>& tokens_per_frame,
+    const std::vector<std::vector<int32_t>>& timestamp_token_ids,
+    int32_t vision_start_token_id, int32_t video_token_id,
+    int32_t vision_end_token_id);
 
 }  // namespace vllm::multimodal

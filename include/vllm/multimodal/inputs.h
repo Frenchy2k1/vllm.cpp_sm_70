@@ -34,6 +34,25 @@ struct ImageKwargs {
   bool empty() const { return num_patches == 0; }
 };
 
+// Processed features for ONE video item — the Qwen3-VL video branch of
+// MultiModalKwargs (vllm/multimodal/inputs.py, _process_video_input). Mirrors
+// ImageKwargs but the temporal dim T>1: `pixel_values` is the flattened patch
+// matrix [num_patches, patch_feature_dim] where num_patches = grid_t*grid_h*
+// grid_w and each patch-row fuses temporal_patch_size REAL consecutive frames
+// (source frame = grid_t_index*temporal_patch_size + t, NOT duplicated as an
+// image is). Same bf16 model-dtype cast contract as ImageKwargs (verified:
+// precast-bf16 == production golden on the fixture video).
+struct VideoKwargs {
+  std::vector<float> pixel_values_f32;      // [num_patches * patch_feature_dim]
+  std::vector<uint16_t> pixel_values_bf16;  // round-to-nearest-even of the above
+  int64_t num_patches = 0;
+  int64_t patch_feature_dim = 0;
+  std::array<int64_t, 3> video_grid_thw{0, 0, 0};  // [grid_t, grid_h, grid_w]
+  std::vector<double> timestamps;                  // per temporal-group (len grid_t)
+
+  bool empty() const { return num_patches == 0; }
+};
+
 // One multimodal placeholder occupied in the prompt id stream — the C++ analogue
 // of MultiModalFeatureSpec (vllm/multimodal/inputs.py). Carried on Request so the
 // scheduler/encoder-cache seam can budget/allocate/free per item WITHOUT the
