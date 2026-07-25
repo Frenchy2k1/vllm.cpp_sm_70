@@ -221,6 +221,15 @@ to implement next: OLMo-3 (nearly-free W5 on the landed OLMo-2 code), Phi-3/Phi-
 Each binds a future per-family SACRED token-exact gate vs vLLM 0.25.0 (form BY MEASUREMENT) +
 the every-axis speed close before any row reaches DONE. No number is claimed here.
 
+**Multimodal track (Audio/Video/Image, Gemma-4 + Qwen3.6) - SPIKE ONLY, DESIGN, no gate run (2026-07-25, `CLAIM-MULTIMODAL-TRACK` [spike](../.agents/specs/multimodal-track.md)).**
+Disposition: **NO throughput measured, NO correctness gate run, nothing built or downloaded
+(oracle-metadata + safetensors-header read only) - PENDING for all rows.** The gate models are
+already multimodal (`Qwen3_5{,Moe}ForConditionalGeneration`, image+video) run text-only; the mm
+oracle EXISTS (vLLM 0.25.0 ships `qwen3_5.py`/`qwen3_vl.py`/`gemma4_mm.py`). Qwen3.6 mm is
+CHECKPOINT-gated (cached NVFP4 quants are text-only, no `visual.*`), not HW/oracle-blocked; the
+future M2/M3 image/video token-exact gates vs the 0.25.0 mm oracle bind first. Gemma-4 (+audio)
+is SPIKE/BLOCKED-for-now. No number is claimed here.
+
 **GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,
 [spike](../.agents/specs/glm-dsa-latest-deepseek.md)).** The first GLM-family model.
