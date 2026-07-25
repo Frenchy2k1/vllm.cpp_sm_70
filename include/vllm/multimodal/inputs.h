@@ -53,6 +53,21 @@ struct VideoKwargs {
   bool empty() const { return num_patches == 0; }
 };
 
+// Processed features for ONE audio item — the AUDIO branch of MultiModalKwargs
+// (audio-track A1; mirror of vllm/multimodal/inputs.py + the Whisper
+// `input_features` field, whisper.py:103,738). `input_features` is the flattened
+// log-mel spectrogram [n_mels, n_frames] (row-major), produced by the C++
+// WhisperFeatureExtractor-equivalent pipeline. Unlike the image/video branch there
+// is no bf16 pre-cast golden: the parity gate is a stated rel-L2 vs the oracle
+// log-mel (FFT float ops make bit-exact infeasible; ids/hash stay exact).
+struct AudioKwargs {
+  std::vector<float> input_features;  // [n_mels * n_frames], row-major [n_mels, n_frames]
+  int64_t n_mels = 0;
+  int64_t n_frames = 0;
+
+  bool empty() const { return n_frames == 0; }
+};
+
 // One multimodal placeholder occupied in the prompt id stream — the C++ analogue
 // of MultiModalFeatureSpec (vllm/multimodal/inputs.py). Carried on Request so the
 // scheduler/encoder-cache seam can budget/allocate/free per item WITHOUT the
@@ -62,7 +77,8 @@ struct MultiModalFeatureSpec {
   std::string modality = "image";          // "image" (M1); "video"/"audio" later
   int offset = 0;                          // start index in the expanded prompt
   int length = 0;                          // number of placeholder tokens (N)
-  std::shared_ptr<ImageKwargs> data;       // encoder input (opaque until M2)
+  std::shared_ptr<ImageKwargs> data;       // image/video encoder input (opaque until M2)
+  std::shared_ptr<AudioKwargs> audio_data; // audio encoder input (null unless modality=="audio")
 };
 
 // The processed bundle returned by the mm input pipeline for a single prompt —

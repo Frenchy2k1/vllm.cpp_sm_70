@@ -38,6 +38,19 @@ void UpdateInt64LE(blake3_hasher& h, int64_t v) {
   blake3_hasher_update(&h, b, 8);
 }
 
+std::string FinalizeHex(blake3_hasher& h) {
+  std::array<uint8_t, BLAKE3_OUT_LEN> out{};
+  blake3_hasher_finalize(&h, out.data(), out.size());
+  static const char* kHex = "0123456789abcdef";
+  std::string hex;
+  hex.reserve(out.size() * 2);
+  for (uint8_t byte : out) {
+    hex.push_back(kHex[byte >> 4]);
+    hex.push_back(kHex[byte & 0xF]);
+  }
+  return hex;
+}
+
 }  // namespace
 
 std::string MultiModalHasher::HashImageRGB(const std::string& model_id,
@@ -73,17 +86,35 @@ std::string MultiModalHasher::HashImageRGB(const std::string& model_id,
   UpdateStr(h, "model_id");
   UpdateStr(h, model_id);
 
-  std::array<uint8_t, BLAKE3_OUT_LEN> out{};
-  blake3_hasher_finalize(&h, out.data(), out.size());
+  return FinalizeHex(h);
+}
 
-  static const char* kHex = "0123456789abcdef";
-  std::string hex;
-  hex.reserve(out.size() * 2);
-  for (uint8_t byte : out) {
-    hex.push_back(kHex[byte >> 4]);
-    hex.push_back(kHex[byte & 0xF]);
-  }
-  return hex;
+std::string MultiModalHasher::HashAudioF32(const std::string& model_id,
+                                           const float* samples,
+                                           int64_t num_samples) {
+  blake3_hasher h;
+  blake3_hasher_init(&h);
+
+  // ---- key "audio" (a float32 1-D np.ndarray) ----
+  // hash_kwargs sorts kwargs => "audio" < "model_id"; iter_item_to_bytes("audio",
+  // ndarray) yields the key then serialize_item(ndarray) (hasher.py:108-127).
+  UpdateStr(h, "audio");
+  //   serialize_item(ndarray) -> iter_item_to_bytes("ndarray", {dtype,shape,data})
+  UpdateStr(h, "ndarray.dtype");
+  UpdateStr(h, "<f4");  // little-endian float32 (numpy obj.dtype.str)
+  // shape = (N,), a 1-element tuple -> one "ndarray.shape.0" entry.
+  UpdateStr(h, "ndarray.shape.0");
+  UpdateInt64LE(h, num_samples);
+  // data = raw c-contiguous float32 bytes (obj.view(np.uint8).data memoryview).
+  UpdateStr(h, "ndarray.data");
+  Update(h, reinterpret_cast<const char*>(samples),
+         static_cast<size_t>(num_samples) * sizeof(float));
+
+  // ---- key "model_id" (a str) ----
+  UpdateStr(h, "model_id");
+  UpdateStr(h, model_id);
+
+  return FinalizeHex(h);
 }
 
 }  // namespace vllm::multimodal

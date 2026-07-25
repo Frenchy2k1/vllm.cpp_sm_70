@@ -168,6 +168,15 @@ target_compile_definitions(test_qwen3vl_video_processor PRIVATE
 vllm_cpp_add_test(test_qwen3vl_video_e2e vllm/multimodal/test_qwen3vl_video_e2e.cpp)
 target_compile_definitions(test_qwen3vl_video_e2e PRIVATE
   MM_VIDEO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_video")
+# Audio-track A1 audio-processor parity gate: the C++ Whisper-class audio INPUT
+# pipeline (WAV decode -> log-mel input_features -> placeholder expansion -> mm-hash)
+# vs the vLLM 0.25.0 / transformers 5.13.1 oracle fixture for openai/whisper-small
+# (tests/vllm/multimodal/fixtures/whisper_audio; scripts/mm/a0_audio_ref.py).
+# Log-mel rel-L2 within a stated tolerance (FFT vs DFT summation order); ids + mm-hash
+# bit/byte-exact. RED-first: perturbed mel/hop/normalization blow the tolerance.
+vllm_cpp_add_test(test_audio_processor vllm/multimodal/test_audio_processor.cpp)
+target_compile_definitions(test_audio_processor PRIVATE
+  MM_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/whisper_audio")
 # Multimodal M1 encoder-cache manager (inert-when-off engine seam).
 vllm_cpp_add_test(test_encoder_cache_manager vllm/v1/core/test_encoder_cache_manager.cpp)
 # LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip

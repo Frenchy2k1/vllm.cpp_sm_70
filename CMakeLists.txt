@@ -343,6 +343,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_vl.cpp
   src/vllm/multimodal/hasher.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
+  src/vllm/multimodal/audio_processor.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
