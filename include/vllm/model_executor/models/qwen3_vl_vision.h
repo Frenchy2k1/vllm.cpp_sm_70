@@ -1,0 +1,114 @@
+// Qwen3-VL vision tower (`Qwen3_VisionTransformer`) — M2a standalone forward.
+//
+// Ported from: vllm/model_executor/models/qwen3_vl.py @ e24d1b24
+//   Qwen3_VisionPatchEmbed (:347), Qwen3_VisionBlock (:413),
+//   Qwen3_VisionPatchMerger (:467), Qwen3_VisionTransformer (:519),
+//   forward (:800), pos_embed_interpolate_native (:277), rot_pos_emb (:667),
+//   vision attention Qwen2_5_VisionAttention (qwen2_5_vl.py:345),
+//   ApplyRotaryEmb.forward_static (rotary_embedding/common.py:125).
+//
+// This is the M2a increment: the vision tower proven faithful to vLLM in
+// isolation (image token-exact e2e is M2c, after the M2b MRoPE/DeepStack text
+// backbone). Pure additive TU — it does NOT touch the shared model runner /
+// registry, so the text SACRED gates are byte-identical by construction.
+//
+// Numeric contract: production model dtype is bf16 (patch-embed/attn/mlp/merger
+// GEMMs bf16, softmax/norm accumulation f32). The pos-embed bilinear interp and
+// the vision-rope cos|sin are computed HOST-side in f32 then consumed on device
+// (deterministic precompute; vLLM computes them on GPU — gated within a stated
+// bf16 tolerance). Vision RoPE is a full-64-dim NeoX rope with per-token cos|sin
+// [L,32] (partial_rotary_factor 0.5 builds the 32-wide table from a 16-freq
+// cache over the 2 spatial axes); it reuses vt::RopeFromCache with rotary_dim=64
+// and a [L,64]=[cos|sin] cache.
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <vector>
+
+#include "vt/backend.h"
+
+namespace vllm::multimodal {
+
+struct Qwen3VLVisionConfig {
+  int64_t hidden_size = 1024;
+  int64_t num_heads = 16;
+  int64_t depth = 24;
+  int64_t intermediate_size = 4096;
+  int64_t out_hidden_size = 2560;
+  int64_t patch_size = 16;
+  int64_t temporal_patch_size = 2;
+  int64_t spatial_merge_size = 2;
+  int64_t num_position_embeddings = 2304;
+  int64_t in_channels = 3;
+  std::vector<int> deepstack_visual_indexes = {5, 11, 17};
+  float norm_eps = 1e-6f;
+
+  int64_t head_dim() const { return hidden_size / num_heads; }
+  int64_t merge_unit() const { return spatial_merge_size * spatial_merge_size; }
+  int64_t num_grid_per_side() const {
+    // isqrt(num_position_embeddings)
+    int64_t r = 0;
+    while ((r + 1) * (r + 1) <= num_position_embeddings) ++r;
+    return r;
+  }
+};
+
+// All weights are host-side row-major f32 (as stored by torch: Linear weight is
+// [out, in]). LayerNorm weight/bias are [dim].
+struct VisionBlockWeights {
+  std::vector<float> norm1_w, norm1_b;   // [hidden]
+  std::vector<float> norm2_w, norm2_b;   // [hidden]
+  std::vector<float> qkv_w, qkv_b;       // qkv_w [3*hidden, hidden], qkv_b [3*hidden]
+  std::vector<float> proj_w, proj_b;     // [hidden, hidden], [hidden]
+  std::vector<float> fc1_w, fc1_b;       // [inter, hidden], [inter]
+  std::vector<float> fc2_w, fc2_b;       // [hidden, inter], [hidden]
+};
+
+struct VisionMergerWeights {
+  bool use_postshuffle_norm = false;     // main merger false; deepstack true
+  std::vector<float> norm_w, norm_b;     // [context_dim] (false) or [4*context] (true)
+  std::vector<float> fc1_w, fc1_b;       // [4*context, 4*context]
+  std::vector<float> fc2_w, fc2_b;       // [out_hidden, 4*context], [out_hidden]
+};
+
+struct Qwen3VLVisionWeights {
+  std::vector<float> patch_proj_w, patch_proj_b;  // [hidden, C*tp*p*p], [hidden]
+  std::vector<float> pos_embed_w;                 // [num_position_embeddings, hidden]
+  std::vector<VisionBlockWeights> blocks;         // depth
+  VisionMergerWeights merger;
+  std::vector<VisionMergerWeights> deepstack_mergers;  // len(deepstack_visual_indexes)
+};
+
+// Optional intermediate capture for the M2a unit gates (all host f32). When a
+// pointer to this is passed, the forward downloads the gated stages; production
+// (M2c) passes nullptr and pays nothing.
+struct Qwen3VLVisionCapture {
+  std::vector<float> pos_embeds;                  // [L, hidden]
+  std::vector<float> rotary_cos, rotary_sin;      // [L, head_dim/2]
+  std::vector<float> patch_embed_out;             // [L, hidden]
+  std::vector<float> block0_out;                  // [L, hidden]
+  std::vector<float> merger_out;                  // [Nmerge, out_hidden]
+  std::vector<std::vector<float>> deepstack_out;  // 3 x [Nmerge, out_hidden]
+};
+
+// Runs the tower on one image. pixel_values is [L, C*tp*p*p] host bf16 bits
+// (uint16 raw bf16), grid_thw = [t,h,w]. Returns the full tower output
+// [Nmerge, out_hidden*(1+num_deepstack)] as host f32. If capture != nullptr, the
+// gated intermediate stages are filled.
+std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_values_bf16,
+                                        const std::array<int64_t, 3>& grid_thw,
+                                        const Qwen3VLVisionWeights& w,
+                                        const Qwen3VLVisionConfig& cfg, vt::Backend& backend,
+                                        Qwen3VLVisionCapture* capture = nullptr);
+
+// Host precompute helpers (exposed for direct unit-gating).
+// pos_embed bilinear interpolation + spatial-merge reorder → [L, hidden] f32.
+std::vector<float> VisionPosEmbedInterpolate(const std::vector<float>& pos_embed_w,
+                                             const std::array<int64_t, 3>& grid_thw,
+                                             const Qwen3VLVisionConfig& cfg);
+// vision-rope cos|sin tables → each [L, head_dim/2] f32.
+void VisionRopeCosSin(const std::array<int64_t, 3>& grid_thw, const Qwen3VLVisionConfig& cfg,
+                      std::vector<float>* cos, std::vector<float>* sin);
+
+}  // namespace vllm::multimodal

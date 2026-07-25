@@ -1,0 +1,82 @@
+{
+  "pos_embeds": {
+    "shape": [
+      784,
+      1024
+    ],
+    "sha256": "3a40e9617efa8974be033c1000d3ed728a5319df89bdb9622da98584f78084fe"
+  },
+  "rotary_cos": {
+    "shape": [
+      784,
+      32
+    ],
+    "sha256": "f69cef8de5497dc9f3d32e9da2ed251cb8f12aeeb1455252e0386637d6f0d314"
+  },
+  "rotary_sin": {
+    "shape": [
+      784,
+      32
+    ],
+    "sha256": "bec76ff000c03bb632562674195ecec9c81abc207f12c3403c7484184a970d00"
+  },
+  "cu_seqlens": {
+    "shape": [
+      2
+    ],
+    "values": [
+      0,
+      784
+    ]
+  },
+  "patch_embed_out": {
+    "shape": [
+      784,
+      1024
+    ],
+    "sha256": "ef5d6fe07065e9bbe169ddbbc83888d10f9d9398d07fd0cc863198dbbb6b2bfc"
+  },
+  "block0_out": {
+    "shape": [
+      784,
+      1,
+      1024
+    ],
+    "sha256": "b536ff012955155766dbc206fb4f733648aceab6f13cd287846f6009ff5b7813"
+  },
+  "deepstack_0_out": {
+    "shape": [
+      196,
+      2560
+    ],
+    "sha256": "d40bc1cb7a697802b6e119e8dca778188c77ae23b71baed149f0de1e36aaa343"
+  },
+  "deepstack_1_out": {
+    "shape": [
+      196,
+      2560
+    ],
+    "sha256": "70a03708fe51d54552e1d70cc627d56503de9d1b2549d549f14386d99fb6f4fd"
+  },
+  "deepstack_2_out": {
+    "shape": [
+      196,
+      2560
+    ],
+    "sha256": "fe14cb311655e8c6fa76412ffdbbeebd661da47bed0ed27a7a8ce0946c168902"
+  },
+  "merger_out": {
+    "shape": [
+      196,
+      2560
+    ],
+    "sha256": "d151e9ff2a1c4f4645d29e00aa4ab9b93c58eb3659d47430832da795281152fa"
+  },
+  "tower_out": {
+    "shape": [
+      196,
+      10240
+    ],
+    "sha256": "92fa3a933188c380010c0521548cdead825443546eef3dac65e025a6993ac89a"
+  }
+}

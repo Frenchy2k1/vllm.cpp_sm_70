@@ -126,6 +126,14 @@ target_compile_definitions(test_lmcache_codec PRIVATE
 vllm_cpp_add_test(test_qwen3vl_processor vllm/multimodal/test_qwen3vl_processor.cpp)
 target_compile_definitions(test_qwen3vl_processor PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl")
+# Multimodal M2a vision-tower faithfulness gate: the C++ Qwen3_VisionTransformer
+# forward vs the dumped vLLM 0.25.0 tower reference (patch-embed/block0/merger/
+# DeepStack taps + full [196,10240] output). GPU + VLLM_QWEN3VL_WEIGHTS required,
+# else skipped (scripts/mm/m2a_tower_ref_dump.py + m2a_tower_weight_dump.py).
+vllm_cpp_add_test(test_qwen3vl_tower vllm/multimodal/test_qwen3vl_tower.cpp)
+target_compile_definitions(test_qwen3vl_tower PRIVATE
+  MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
+  TOWER_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_tower")
 # Multimodal M1 encoder-cache manager (inert-when-off engine seam).
 vllm_cpp_add_test(test_encoder_cache_manager vllm/v1/core/test_encoder_cache_manager.cpp)
 # LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip

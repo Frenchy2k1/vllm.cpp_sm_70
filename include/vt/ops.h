@@ -188,6 +188,16 @@ enum class OpId : uint8_t {
   //                the bias-free Qwen projections never needed).
   kLayerNorm,
   kRelu,
+  // Elementwise GELU activations (NEW for the Qwen3-VL vision tower). Both are
+  // plain (non-gated) elementwise ops, may alias in-place, f32 compute →
+  // out-dtype store.
+  //   kGeluTanh — `gelu_pytorch_tanh` / F.gelu(approximate="tanh"): the vision
+  //               MLP act_fn (qwen3_vl.py::Qwen3_VisionMLP, hidden_act
+  //               "gelu_pytorch_tanh"). Same constant as kGeluAndMul's gate.
+  //   kGeluErf  — exact erf GELU / nn.GELU(): the patch-merger act_fn
+  //               (qwen3_vl.py::Qwen3_VisionPatchMerger, self.act_fn=nn.GELU()).
+  kGeluTanh,
+  kGeluErf,
   kAdd,
   // Batched dense GEMM (`torch.bmm`). The primitive MLA weight absorption is
   // expressed in — mla_attention.py:789 (q-side W_UK fold) and :1034 (W_UV
@@ -1247,6 +1257,12 @@ void LayerNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor* weight,
 // `config.activation_function` (opt.py:156). Computed in f32, rounded on store;
 // `out` may alias `x` (in-place). x/out f32 or bf16. CPU + CUDA.
 void Relu(Queue& q, Tensor& out, const Tensor& x);
+
+// Elementwise GELU (NEW, Qwen3-VL vision tower). out[i] = gelu(x[i]); `out` may
+// alias `x`. x/out f32 or bf16, computed in f32. GeluTanh is the tanh-approx
+// (`gelu_pytorch_tanh`, vision MLP); GeluErf is exact erf (`nn.GELU()`, merger).
+void GeluTanh(Queue& q, Tensor& out, const Tensor& x);
+void GeluErf(Queue& q, Tensor& out, const Tensor& x);
 
 // out = a + b, in two shapes:
 //   ELEMENTWISE  — b has a's exact shape (OPT's `residual + hidden_states`

@@ -84,6 +84,31 @@ void ReluKernel(Queue&, Tensor& out, const Tensor& x) {
   });
 }
 
+void GeluTanhKernel(Queue&, Tensor& out, const Tensor& x) {
+  const int64_t n = x.Numel();
+  const int64_t d = x.rank == 0 ? 1 : x.shape[x.rank - 1];
+  const int64_t rows = d == 0 ? 0 : n / d;
+  ParallelForRows(CurrentThreadpool(), rows, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0 * d; i < r1 * d; ++i) {
+      const float v = LoadF32At(x, i);
+      const float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+      StoreF32At(out, i, 0.5f * v * (1.0f + std::tanh(inner)));
+    }
+  });
+}
+
+void GeluErfKernel(Queue&, Tensor& out, const Tensor& x) {
+  const int64_t n = x.Numel();
+  const int64_t d = x.rank == 0 ? 1 : x.shape[x.rank - 1];
+  const int64_t rows = d == 0 ? 0 : n / d;
+  ParallelForRows(CurrentThreadpool(), rows, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0 * d; i < r1 * d; ++i) {
+      const float v = LoadF32At(x, i);
+      StoreF32At(out, i, 0.5f * v * (1.0f + std::erf(v * 0.7071067811865476f)));
+    }
+  });
+}
+
 void AddKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const int64_t n = a.Numel();
   const int64_t d = a.rank == 0 ? 1 : a.shape[a.rank - 1];
@@ -103,6 +128,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
     RegisterOp(OpId::kRelu, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<ReluFn>(&ReluKernel)));
+    RegisterOp(OpId::kGeluTanh, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<ReluFn>(&GeluTanhKernel)));
+    RegisterOp(OpId::kGeluErf, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<ReluFn>(&GeluErfKernel)));
     RegisterOp(OpId::kAdd, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AddFn>(&AddKernel)));
   }

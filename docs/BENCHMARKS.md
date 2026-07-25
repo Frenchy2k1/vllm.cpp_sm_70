@@ -261,6 +261,27 @@ engine is byte-identical - CPU suite green standalone (`test_request`, `test_eng
 `extra_keys`); the 27B/35B/Coder SACRED CUDA gates PASS byte-identical (235/235, 315/315, 138/138, cutlass-ON banner confirmed). `check-device-leakage`
 holds at baseline (mm processor is device-agnostic). No speed number.
 
+**Multimodal M2a (Qwen3-VL vision TOWER) - TOWER FAITHFULNESS GATE PASS, correctness only,
+`benchmark_binding=false` (2026-07-25, `CLAIM-MULTIMODAL-M2A`
+[spec](../.agents/specs/multimodal-track.md)).**
+Disposition: **NO throughput measured or claimed - SPEED PENDING (this is the tower proven faithful
+in isolation, NOT the e2e image result; M2c owns the first image token-exact gate).** The C++
+`Qwen3_VisionTransformer` forward (`src/vllm/model_executor/models/qwen3_vl_vision.{h,cpp}`) run on
+the fixed M1 fixture image (grid [1,28,28], 784 patches) is checked stage-by-stage against a
+reference dumped from the vLLM 0.25.0 tower on dgx (`scripts/mm/m2a_tower_ref_dump.py`, 315
+`visual.*` tensors, run standalone bf16). Gate `tests/vllm/multimodal/test_qwen3vl_tower.cpp`
+**348/348 assertions PASS** (relL2 vs the reference): patch-embed **2.1e-3**, one ViT block **6.8e-3**,
+patch merger **6.5e-2**, DeepStack taps at layers 5/11/17 **1.2e-2 / 3.3e-2 / 4.4e-2**, the full
+`[196,10240]` tower output **5.1e-2**; the two new host precomputes (pos-embed bilinear interp, vision
+rope cos/sin) are tight at **2.5e-3 / 1.9e-3**. Tolerances are the MEASURED bf16-depth envelope (RCA:
+smooth monotone ~0.25%/layer accumulation between two independent bf16 kernel stacks - our vt ops vs
+vLLM's cuBLAS/FlashAttention - with no discontinuity, i.e. numerical not a logic error). RED-first
+proven: disabling the vision RoPE drives block0 to **0.149** and the tower to **0.75** (6 assertions
+fail). Build cutlass-ON + FA2 sm_121a banner confirmed; clean CUDA `-Werror` 0 warnings;
+`compute-sanitizer memcheck` 0 errors on the tower + new kernels. Text-inertness holds by construction
+(additive vt ops + a new TU only; no runner/model edit; `git diff --stat` 128 insertions, 0
+deletions). No speed number.
+
 **GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,
 [spike](../.agents/specs/glm-dsa-latest-deepseek.md)).** The first GLM-family model.

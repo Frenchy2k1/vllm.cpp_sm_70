@@ -370,16 +370,35 @@ Tracked as engine-matrix row `ENG-MM-INPUT-PIPELINE` (`ACTIVE`, `CLAIM-MULTIMODA
 - Critical path: YES.
 
 **M2 — First vision TOWER + projector/merge on Qwen3-VL-4B → first IMAGE gate.**
-- Builds: `Qwen3_VisionTransformer` (patch embed, ViT blocks over `vt::` GEMM/attn/
-  norm, patch merger, DeepStack multi-level injection); the `visual.*` weight map;
-  wire `embed_multimodal` → `_merge_multimodal_embeddings` → the landed
-  Qwen3-VL-dense decode.
-- Gate: Gate 3 (image token-exact vs vLLM 0.25.0 on Qwen3-VL-4B, fixed
-  image+prompt, greedy; form by measurement). GPU: YES (vision GEMM/attn +
-  paged LLM decode). Fits trivially.
-- Hardest risk: DeepStack multi-level feature injection (`qwen3_vl.py:821-840`);
-  vision-tower attention numerics + vision position/RoPE; the pixel→patch grid
-  (`grid_thw`) must match the processor exactly.
+DECOMPOSED (2026-07-25) into three independently-gateable bricks after the M2a
+scope audit found the LLM side is NOT the landed plain Qwen3-dense (it needs MRoPE
+3-D positions + DeepStack decoder injection):
+- **M2a — vision TOWER proven faithful (LANDED 2026-07-25, `CLAIM-MULTIMODAL-M2A`, engine-matrix row `ENG-MM-VISION-TOWER`).**
+  Built `src/vllm/model_executor/models/qwen3_vl_vision.{h,cpp}` (patch-embed
+  matmul+bias; host pos-embed bilinear-interp+reorder; 24 ViT blocks = LayerNorm +
+  vision attention with partial-rotary vision RoPE [`vt::RopeFromCache` neox,
+  rotary_dim=64, `[cos|sin]` cache] + non-causal varlen `vt::Attention(causal=false)`
+  + tanh-GELU MLP; patch merger = LayerNorm + exact-erf-GELU + 2 FCs; DeepStack 3
+  post-shuffle mergers at layers 5/11/17 → concat `[196,10240]`). Added 2 additive
+  vt ops (`GeluTanh`/`GeluErf`). 4 RED-first unit gates vs the dumped vLLM-0.25.0
+  tower reference PASS (patch-embed relL2 2.1e-3, block0 6.8e-3, merger 6.5e-2,
+  DeepStack taps, full tower 5.1e-2 — bf16-depth envelope, RCA'd; RED = rope
+  disabled → block0 0.149, tower 0.75, 6 fails). Tower proven faithful in
+  ISOLATION — NOT the e2e image result. Additive-only (no runner/model TU) → text
+  SACRED byte-identical by construction. compute-sanitizer 0.
+- **M2b — the Qwen3-VL text backbone (NEXT).** MRoPE 3-D position computation
+  (`get_rope_index`) + DeepStack decoder injection (`qwen3_vl.py:1589-1594`:
+  `deepstack_input_embeds_{0,1,2}` added at decoder layers 0/1/2), forked from the
+  landed dense forward. Gated: MRoPE positions + a text-only decode still
+  token-exact.
+- **M2c — merge + e2e IMAGE gate.** `_merge_multimodal_embeddings` masked scatter
+  (`utils.py:524-545`) of the tower's `[:, :2560]` into `input_embeds` +
+  `visual.*`/`language_model.*` weight loading + wire tower→merge→M2b decode →
+  Gate 3 (image token-exact vs vLLM 0.25.0 on Qwen3-VL-4B, fixed image+prompt,
+  greedy; form by measurement). This is the first end-to-end image→text proof.
+- Hardest risk: DeepStack multi-level injection; vision-tower attention numerics +
+  vision RoPE (M2a: PROVEN faithful); MRoPE positions (M2b); the placeholder-merge
+  silent-corruption (M2c).
 - Critical path: YES (proves the tower Qwen3.6 reuses).
 
 **M3 — Complete Qwen3.6-27B IMAGE (reuse M2 tower verbatim), then VIDEO.**

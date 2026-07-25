@@ -1156,6 +1156,26 @@ void Relu(Queue& q, Tensor& out, const Tensor& x) {
   reinterpret_cast<ReluFn>(GetOp(OpId::kRelu, q.device.type))(q, out, x);
 }
 
+void GeluTanh(Queue& q, Tensor& out, const Tensor& x) {
+  VT_CHECK(out.rank == x.rank, "gelu_tanh: out rank must match x");
+  for (int i = 0; i < x.rank; ++i)
+    VT_CHECK(out.shape[i] == x.shape[i], "gelu_tanh: out shape must match x");
+  VT_CHECK(IsFloat(x.dtype) && IsOutFloat(out.dtype), "gelu_tanh: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(), "gelu_tanh: contiguous required");
+  VT_CHECK(x.device == out.device && x.device == q.device, "gelu_tanh: device mismatch");
+  reinterpret_cast<ReluFn>(GetOp(OpId::kGeluTanh, q.device.type))(q, out, x);
+}
+
+void GeluErf(Queue& q, Tensor& out, const Tensor& x) {
+  VT_CHECK(out.rank == x.rank, "gelu_erf: out rank must match x");
+  for (int i = 0; i < x.rank; ++i)
+    VT_CHECK(out.shape[i] == x.shape[i], "gelu_erf: out shape must match x");
+  VT_CHECK(IsFloat(x.dtype) && IsOutFloat(out.dtype), "gelu_erf: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(), "gelu_erf: contiguous required");
+  VT_CHECK(x.device == out.device && x.device == q.device, "gelu_erf: device mismatch");
+  reinterpret_cast<ReluFn>(GetOp(OpId::kGeluErf, q.device.type))(q, out, x);
+}
+
 void Add(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   VT_CHECK(a.rank >= 1 && out.rank == a.rank, "add: out rank must match a");
   for (int i = 0; i < a.rank; ++i)
