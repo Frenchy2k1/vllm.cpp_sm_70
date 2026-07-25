@@ -4048,6 +4048,69 @@ TEST_CASE("causal_conv1d spec update: NULL slot and zero-length rows are inert")
   for (int64_t i = 0; i < 2 * c_dim; ++i) CHECK(out[static_cast<size_t>(i)] == -1.0f);
 }
 
+// ── Row gather/scatter (vt::IndexSelect / vt::IndexCopy) — the MIXED spec
+// split/merge primitive. Real GDN row widths: 27B conv_dim (10240) and dcore
+// row Hv*Dv (48*128=6144). A stable-sorted spec/non-spec partition of an
+// interleaved token batch, gathered per group and scattered back, must
+// reconstruct the original buffer exactly (index_copy over a full partition is
+// the identity permutation). CPU reference; the CUDA==CPU bit-exact arm is in
+// the CUDA block below. Mirror of qwen_gdn_linear_attn.py:1334-1335,1570-1571. ──
+TEST_CASE("index_select/index_copy: spec/non-spec partition round-trip (bf16 + f32)") {
+  Queue q = Q();
+  const int64_t N = 21;  // interleaved spec/non-spec tokens
+  // Partition by parity: spec = odd rows (stable), non-spec = even rows (stable).
+  std::vector<int32_t> spec_idx, ns_idx;
+  for (int32_t r = 0; r < N; ++r) (r % 2 == 1 ? spec_idx : ns_idx).push_back(r);
+  const int64_t ns_tok = static_cast<int64_t>(spec_idx.size());
+  const int64_t nns_tok = static_cast<int64_t>(ns_idx.size());
+
+  for (const DType dt : {DType::kBF16, DType::kF32}) {
+    for (const int64_t D : {int64_t{10240}, int64_t{6144}}) {
+      const std::vector<float> master =
+          RandomF32(static_cast<size_t>(N * D), 4242u + static_cast<uint32_t>(D));
+      const std::vector<uint8_t> in_b = Pack(master, dt);
+      Tensor in = MakeT(const_cast<uint8_t*>(in_b.data()), dt, Cpu(), {N, D});
+      Tensor tsi = Ti(spec_idx), tni = Ti(ns_idx);
+
+      std::vector<uint8_t> gs(static_cast<size_t>(ns_tok * D) * SizeOf(dt));
+      std::vector<uint8_t> gn(static_cast<size_t>(nns_tok * D) * SizeOf(dt));
+      Tensor spec_out = MakeT(gs.data(), dt, Cpu(), {ns_tok, D});
+      Tensor ns_out = MakeT(gn.data(), dt, Cpu(), {nns_tok, D});
+      vt::IndexSelect(q, spec_out, in, tsi);
+      vt::IndexSelect(q, ns_out, in, tni);
+
+      // Gathered rows equal the addressed source rows (byte-exact).
+      const size_t rb = static_cast<size_t>(D) * SizeOf(dt);
+      for (int64_t i = 0; i < ns_tok; ++i)
+        CHECK(std::memcmp(gs.data() + static_cast<size_t>(i) * rb,
+                          in_b.data() + static_cast<size_t>(spec_idx[static_cast<size_t>(i)]) * rb,
+                          rb) == 0);
+
+      // Scatter both groups back → identity over the full partition.
+      std::vector<uint8_t> merged(in_b.size(), 0xAB);
+      Tensor mt = MakeT(merged.data(), dt, Cpu(), {N, D});
+      vt::IndexCopy(q, mt, spec_out, tsi);
+      vt::IndexCopy(q, mt, ns_out, tni);
+      CHECK(std::memcmp(merged.data(), in_b.data(), in_b.size()) == 0);
+    }
+  }
+
+  // Row-strided source (the merged a|b view: [N, 2D] buffer viewed as [N, D]
+  // with an outer stride of 2D). IndexSelect must follow the outer stride.
+  const int64_t D = 48;  // Hv for the 27B a/b projection
+  const std::vector<float> wide = RandomF32(static_cast<size_t>(N * 2 * D), 77u);
+  Tensor view = MakeT(const_cast<float*>(wide.data()), DType::kF32, Cpu(), {N, D});
+  view.stride[0] = 2 * D;  // padded outer stride; inner contiguous
+  std::vector<float> got(static_cast<size_t>(ns_tok * D));
+  Tensor go = MakeT(got.data(), DType::kF32, Cpu(), {ns_tok, D});
+  Tensor tsi = Ti(spec_idx);
+  vt::IndexSelect(q, go, view, tsi);
+  for (int64_t i = 0; i < ns_tok; ++i)
+    for (int64_t c = 0; c < D; ++c)
+      CHECK(got[static_cast<size_t>(i * D + c)] ==
+            wide[static_cast<size_t>(spec_idx[static_cast<size_t>(i)]) * 2 * D + c]);
+}
+
 #ifdef VLLM_CPP_CUDA
 // ── CUDA spec-decode parity. Two references, both meaningful:
 //   (1) BIT-EXACT vs the shipped vt::GdnDecode chain ON THE SAME DEVICE. Same
@@ -4311,5 +4374,58 @@ TEST_CASE("CUDA causal_conv1d spec update matches CPU and the native update chai
     }
   }
   CheckBitExact(gpu_out, native_out, "CUDA conv spec outputs vs native update chain");
+}
+
+// ── CUDA==CPU bit-exactness for the row gather/scatter at real GDN widths. The
+// op is a pure byte copy, so the CUDA output must equal the CPU output bit for
+// bit (memcmp), for both bf16 and f32 rows and for a row-strided source. ──
+TEST_CASE("index_select/index_copy: CUDA==CPU bit-exact at GDN dims") {
+  if (!HasCuda()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  Queue cq = Q();
+
+  const int64_t N = 21;
+  std::vector<int32_t> spec_idx, ns_idx;
+  for (int32_t r = 0; r < N; ++r) (r % 2 == 1 ? spec_idx : ns_idx).push_back(r);
+  const int64_t ns_tok = static_cast<int64_t>(spec_idx.size());
+
+  for (const DType dt : {DType::kBF16, DType::kF32}) {
+    for (const int64_t D : {int64_t{10240}, int64_t{6144}}) {
+      const std::vector<float> master =
+          RandomF32(static_cast<size_t>(N * D), 909u + static_cast<uint32_t>(D));
+      const std::vector<uint8_t> in_b = Pack(master, dt);
+      const size_t rb = static_cast<size_t>(D) * SizeOf(dt);
+
+      // CPU gather.
+      Tensor in_cpu = MakeT(const_cast<uint8_t*>(in_b.data()), dt, Cpu(), {N, D});
+      Tensor tsi_cpu = Ti(spec_idx);
+      std::vector<uint8_t> cpu_g(static_cast<size_t>(ns_tok) * rb);
+      Tensor cpu_out = MakeT(cpu_g.data(), dt, Cpu(), {ns_tok, D});
+      vt::IndexSelect(cq, cpu_out, in_cpu, tsi_cpu);
+
+      // CUDA gather.
+      DeviceTensor d_in(gpu, gq.q, dt, {N, D}, in_b.data());
+      DeviceTensor d_idx(gpu, gq.q, DType::kI32, {ns_tok}, spec_idx.data());
+      DeviceTensor d_out(gpu, gq.q, dt, {ns_tok, D});
+      vt::IndexSelect(gq.q, d_out.tensor(), d_in.tensor(), d_idx.tensor());
+      gpu.Synchronize(gq.q);
+      std::vector<uint8_t> cuda_g(cpu_g.size());
+      d_out.Download(gq.q, cuda_g.data());
+      CHECK(std::memcmp(cpu_g.data(), cuda_g.data(), cpu_g.size()) == 0);
+
+      // CUDA scatter back into a full buffer == the original bytes.
+      DeviceTensor d_merged(gpu, gq.q, dt, {N, D});
+      DeviceTensor d_nidx(gpu, gq.q, DType::kI32, {N - ns_tok}, ns_idx.data());
+      DeviceTensor d_nsg(gpu, gq.q, dt, {N - ns_tok, D});
+      vt::IndexSelect(gq.q, d_nsg.tensor(), d_in.tensor(), d_nidx.tensor());
+      vt::IndexCopy(gq.q, d_merged.tensor(), d_out.tensor(), d_idx.tensor());
+      vt::IndexCopy(gq.q, d_merged.tensor(), d_nsg.tensor(), d_nidx.tensor());
+      gpu.Synchronize(gq.q);
+      std::vector<uint8_t> merged(in_b.size());
+      d_merged.Download(gq.q, merged.data());
+      CHECK(std::memcmp(merged.data(), in_b.data(), in_b.size()) == 0);
+    }
+  }
 }
 #endif  // VLLM_CPP_CUDA

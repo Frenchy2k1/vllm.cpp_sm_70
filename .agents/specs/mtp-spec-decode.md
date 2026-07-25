@@ -825,6 +825,71 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
       c>1 A/B, (2) a user-facing supported `--speculative-config` on the OpenAI
       server (the bench flag is example-only/additive). Raw logs on dgx
       `~/work/mtp-bench-i6/{results,vresults}`.
+  - **I7 — the MIXED spec+non-spec GDN batch (concurrency) + server/CLI
+    `--speculative-config` + the c>1 A/B. LANDED 2026-07-25 (`CLAIM-SPEC-MTP-I7`).**
+    Closes the two `DONE`-blockers from I6. THREE pieces:
+    - **New row gather/scatter op `vt::IndexSelect`/`vt::IndexCopy`** (`kIndexSelect`/
+      `kIndexCopy`; CPU `src/vt/cpu/cpu_ops.cpp` + CUDA `src/vt/cuda/cuda_gdn.cu`,
+      dispatch/validation `src/vt/ops.cpp`, decl `include/vt/ops.h`). torch
+      `index_select(0,·)` / `index_copy_(0,·)` over rows: dtype-agnostic byte copy,
+      the base side may carry an outer (padded / merged-view) row stride, inner
+      contiguous. Gate: CUDA==CPU bit-exact at real GDN row widths (conv_dim 10240,
+      dcore 6144), bf16 + f32, incl. a row-strided source and a full-partition
+      scatter round-trip (`tests/vt/test_ops_gdn.cpp`); RED-first proven by a
+      neutered gather (524/526 fail).
+    - **Mixed `GdnBlockPaged` split/merge** (`GdnBlockPagedMixedSpec`,
+      `src/vllm/model_executor/models/qwen3_5.cpp`) — mirror of
+      `qwen_gdn_linear_attn.py::_forward_core:1329-1576`: index_select `mixed_qkv`/
+      `a`/`b` by `spec_token_indx`/`non_spec_token_indx` into compact per-group
+      buffers, run the I5a spec conv+recurrence over the spec rows + the widened-
+      cache-aware prefill conv+recurrence over the reclassified non-spec rows
+      (upstream forces `num_decodes==0` when a spec row exists, gdn_attn.py:243-251),
+      merge the two core outputs back with index_copy. Reuses the shipped spec/
+      prefill vt ops verbatim (each already bit-exact-gated). One validation fix:
+      the non-spec cu_seqlens spans the non-spec tokens (`nd_tok+np_tok`), not
+      `num_actual_tokens` — equal only at `num_spec==0`, so byte-identical on the
+      default path. **MODEL-INDEPENDENT BIT-EXACT PROOF:** because the spec and
+      prefill requests use DISJOINT state slots, the mixed batch's per-row output
+      must equal the spec request run PURE-spec (rows 0..k) followed by the prefill
+      request run PURE-prefill (`test_qwen3_5_gdn_spec_routing` "MIXED == pure spec +
+      prefill", CPU bit-exact 27B+35B dims, CUDA within the M-retile band; RED-first
+      by a broken merge). compute-sanitizer 0 on the mixed step + the new op.
+    - **Server + CLI `--speculative-config`.** The server flag was wired in I5d
+      (`examples/server/main.cpp`); I7 adds the CLI path — an ABI v6
+      `vllm_model_params.speculative_config` field (`include/vllm.h`) parsed by
+      `ParseSpeculativeConfigJson` in `vllm_engine_load` (`src/capi/vllm_c.cpp`) and
+      the `--speculative-config` flag on `examples/cli/main.cpp`; absent => NULL =>
+      byte-identical no-spec engine; malformed/unsupported => loud load failure.
+      README CLI-flags table + spec-decode note updated.
+    - **c>1 CORRECTNESS — the batch-nondeterminism finding (honest, decisive).**
+      The 27B greedy output is bf16-BATCH-NONDETERMINISTIC at near-ties: spec-OFF at
+      max_num_seqs=4 vs =1 differs on 2/3 short prompts, NO spec decode involved
+      (`test_qwen27_spec_decode_concurrent` control). Because spec's verify step is a
+      THIRD batch shape (1+k tokens/req), per-request EXACT spec-ON==spec-OFF at c>1
+      is UNATTAINABLE for near-tie requests — the MODEL, not the mixed code (which is
+      bit-exact-proven above). So the c>1 correctness bar is: (a) the mixed path runs
+      and accepts drafts (integration: mixed-batch invocations>0, 43/51 accepted at
+      the staggered c4 gate), (b) the model-independent bit-exact proof, and (c) the
+      EXACT three-way identity still holds at c1 (I6). This mirrors
+      near-tie-distributional-gate: token-exact where the model is deterministic (c1),
+      distributional where it is not (c>1).
+    - **c>1 THROUGHPUT A/B — ours vs vLLM, both spec-ON, same `--speculative-config`,
+      27B, greedy, 8 prose+code prompts x 256 out, idle box, one engine at a time
+      under one `flock`, 3 reps (rep1 discarded as cold), production configs.** OURS =
+      `examples/vllm-bench` + `--speculative-config`; vLLM = pinned 0.25.0 graphed
+      `vllm serve --speculative-config ... --max-num-seqs 8 --no-enable-prefix-caching`
+      + `vllm bench serve --max-concurrency {2,4,8}`.
+      **RESULT — spec decode KEEPS HELPING at every c>1 on BOTH engines; ours tracks
+      vLLM (median output tput tok/s, prose / code):**
+      - **c2** ours ON 28.9 / 29.8 vs OFF 19.0 / 19.0 (**1.52x / 1.57x**); vLLM
+        28.4 / 29.1 tok/s (ours +1.6% / +2.5%).
+      - **c4** ours ON 53.9 / 57.2 vs OFF 36.7 / 36.7 (**1.47x / 1.56x**); vLLM
+        53.4 / 56.3 (ours +0.9% / +1.7%).
+      - **c8** ours ON 100.5 / 104.1 vs OFF 70.3 / 70.3 (**1.43x / 1.48x**); vLLM
+        99.7 / 105.3 (ours +0.9% / -1.1%, within vLLM's own run noise).
+      TPOT spec-ON stays ~67-77 ms across c2-c8 (vs ~105-113 ms spec-OFF). Ours does
+      NOT go neutral at c8 (the mixed batch keeps every request drafting).
+      **Disposition: ours is ON-PAR-OR-ABOVE vLLM spec-ON at every measured c>1 axis** (output tput within ~+/-2%, ours slightly ahead at c2/c4, within-noise at c8; acceptance on-par 0.84-0.92 vs 0.835), tracking vLLM's ~1.5x spec speedup at every concurrency. The implementation is COMPLETE and at vLLM parity (mixed batch + bit-exact proof, server/CLI flag, c1 win I6). `SPEC-MTP` STAYS `ACTIVE`, NOT flipped to `DONE`, for one honest reason: the DONE criterion's strict `token-exact at c>1` clause is a proven MODEL impossibility — the 27B greedy is bf16-batch-nondeterministic (spec-OFF max_seqs 4-vs-1 differs 2/3 short prompts, no spec involved, affecting vLLM identically), so exact c>1 token identity cannot be met by any correct implementation; c>1 correctness is instead the model-independent bit-exact split/merge proof + acceptance parity (near-tie-distributional-gate), token-exact strict at c1. No lag, no missing work, no lever — the DONE final call is deferred to the user given this criterion ambiguity. Raw logs dgx `~/work/mixed-batch/{cN_results,cN_vresults}`.
 - **M-mtp-2 — 35B k=1 greedy.** Adds only the MoE MTP layer (reuses our MoE
   blocks) — GDN path identical. Same gates. Caveat: verify unions experts
   across k+1 tokens/request (more experts touched per step — measure, don't

@@ -48,6 +48,22 @@
 
 namespace vllm {
 
+namespace {
+// Telemetry: how many times the MIXED spec+non-spec GDN batch path
+// (GdnBlockPagedMixedSpec) ran this process. Incremented per GDN layer per
+// mixed step; a nonzero count proves the concurrency split/merge was actually
+// exercised (a c>1 spec run that never mixed would leave it at 0). Used by the
+// c>1 identity gate to distinguish "mixed batch handled" from "pure-spec only".
+std::atomic<int64_t> g_mixed_spec_invocations{0};
+}  // namespace
+
+int64_t Qwen3_5MixedSpecInvocations() {
+  return g_mixed_spec_invocations.load(std::memory_order_relaxed);
+}
+void ResetQwen3_5MixedSpecInvocations() {
+  g_mixed_spec_invocations.store(0, std::memory_order_relaxed);
+}
+
 bool detail::ShouldUsePackedGdnDecode(
     const GdnPackedDecodeEligibility& e) {
   return e.runtime_enabled && e.cuda && e.dense_model && e.has_packed_ba &&
@@ -262,9 +278,12 @@ void detail::ValidateGdnAttentionMetadata(
                static_cast<int64_t>(prefill_qsl.size()) == np + 1 &&
                static_cast<int64_t>(prefill_initial.size()) == np,
            "qwen3_5: prefill-only GDN metadata has invalid shape");
-  VT_CHECK(full_qsl.front() == 0 &&
-               full_qsl.back() == metadata.num_actual_tokens,
-           "qwen3_5: non-spec GDN query offsets must span actual tokens");
+  // The non-spec cu_seqlens spans the NON-SPEC tokens only. On the default path
+  // (ns == 0) that equals num_actual_tokens; in a MIXED spec batch the spec
+  // tokens (ns_tok) are carried by the separate spec segmentation, so the
+  // non-spec span is nd_tok + np_tok < num_actual_tokens (gdn_attn.cpp:240-253).
+  VT_CHECK(full_qsl.front() == 0 && full_qsl.back() == nd_tok + np_tok,
+           "qwen3_5: non-spec GDN query offsets must span the non-spec tokens");
   for (int64_t i = 0; i < nreq; ++i) {
     VT_CHECK(full_qsl[static_cast<size_t>(i + 1)] >
                  full_qsl[static_cast<size_t>(i)],
@@ -3267,6 +3286,210 @@ void MaybeBuildAttnCosSin(Dev d, StepDevInputs& sdi, const HfConfig& cfg, int64_
 // qwen_gdn_linear_attn.py::_forward_core @ e24d1b24 (conv split L1360-1388;
 // recurrence split L1480-1559; the ssm gather+ZERO L1513-1514, scatter L1532).
 // h [T*H] bf16 -> [T*H] bf16.
+// MIXED spec+non-spec GDN batch (SPEC-MTP concurrency). A speculative-decode
+// request shares a step with an ordinary prefill request; upstream reclassifies
+// any non-spec DECODE to a prefill whenever a spec row exists (gdn_attn.py:
+// 243-251), so the non-spec side is pure prefill (num_decodes == 0). Split
+// mixed_qkv / a / b by spec_token_indx / non_spec_token_indx into compact
+// per-group buffers (index_select), run the I5a spec recurrence + the prefill
+// recurrence independently over the SHARED persistent state, merge the two core
+// outputs back to their original row positions (index_copy), then finish with
+// the shared gated-RMSNorm + out_proj. 1:1 mirror of
+// qwen_gdn_linear_attn.py::_forward_core:1329-1576 @ e24d1b24. Reached ONLY under
+// an active speculator at concurrency > 1; the default forward never builds it.
+DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
+                            const Tensor& mixed, const Tensor& z,
+                            const Tensor& araw, const Tensor& braw,
+                            const GdnStateCache& state, const StepDevInputs& sdi,
+                            const GDNAttentionMetadata& meta, int64_t T) {
+  const int64_t Hk = cfg.linear_num_key_heads;
+  const int64_t Hv = cfg.linear_num_value_heads;
+  const int64_t Dk = cfg.linear_key_head_dim;
+  const int64_t Dv = cfg.linear_value_head_dim;
+  const int64_t Kw = cfg.linear_conv_kernel_dim;
+  const int64_t key_dim = Hk * Dk;
+  const int64_t value_dim = Hv * Dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const float eps = static_cast<float>(cfg.rms_norm_eps);
+  const DType convdt = mixed.dtype;
+  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType actdt = GdnActDType();
+  const float scale = 1.0F / std::sqrt(SizeF(Dk));
+  g_mixed_spec_invocations.fetch_add(1, std::memory_order_relaxed);
+
+  // The mixed split reuses the WIDENED-cache-aware indexed conv gather/scatter
+  // (I5e) for the non-spec prefill, so indexed state IO + the uploaded spec and
+  // non-spec prefill metadata are required. This holds on the CUDA production
+  // path (indexed state IO defaults ON); refuse loudly otherwise.
+  VT_CHECK(sdi.indexed_gdn_state_io,
+           "gdn paged mixed spec: requires indexed GDN state IO (widened conv "
+           "cache); enable VT_GDN_INDEXED_STATE_IO");
+  VT_CHECK(sdi.has_gdn_spec && sdi.has_gdn_prefill_meta && sdi.has_gdn_idx,
+           "gdn paged mixed spec: spec + non-spec prefill metadata must be uploaded");
+  VT_CHECK(meta.non_spec_token_indx.has_value() &&
+               meta.prefill_query_start_loc.has_value(),
+           "gdn paged mixed spec: builder must emit non_spec_token_indx + prefill qsl");
+
+  const int64_t ns = meta.num_spec_decodes;
+  const int64_t ns_tok = meta.num_spec_decode_tokens;
+  const int64_t nns_tok = static_cast<int64_t>(meta.non_spec_token_indx->size());
+  const int64_t np = meta.num_prefills;
+  VT_CHECK(ns_tok + nns_tok == T, "gdn paged mixed spec: spec+non-spec != T");
+
+  Tensor spec_tok = sdi.gdn_spec_token_indx.t();
+  Tensor ns_tok_idx = sdi.gdn_non_spec_token_indx.t();
+
+  // ── 1. Split mixed_qkv / a / b by token group (index_select; :1334-1335,
+  // :1407-1408). araw/braw may be inner-contiguous row-strided merged views;
+  // IndexSelect follows the outer stride and packs each group contiguously. ──
+  DBuf mixed_spec(d, convdt, {ns_tok, conv_dim});
+  DBuf mixed_ns(d, convdt, {nns_tok, conv_dim});
+  vt::IndexSelect(d.q, mixed_spec.t(), mixed, spec_tok);
+  vt::IndexSelect(d.q, mixed_ns.t(), mixed, ns_tok_idx);
+  DBuf a_spec(d, araw.dtype, {ns_tok, Hv});
+  DBuf b_spec(d, braw.dtype, {ns_tok, Hv});
+  DBuf a_ns(d, araw.dtype, {nns_tok, Hv});
+  DBuf b_ns(d, braw.dtype, {nns_tok, Hv});
+  vt::IndexSelect(d.q, a_spec.t(), araw, spec_tok);
+  vt::IndexSelect(d.q, b_spec.t(), braw, spec_tok);
+  vt::IndexSelect(d.q, a_ns.t(), araw, ns_tok_idx);
+  vt::IndexSelect(d.q, b_ns.t(), braw, ns_tok_idx);
+
+  Tensor dcw = convdt == DType::kBF16
+                   ? ResidentWeight(d, w.conv1d_weight, {conv_dim, Kw})
+                   : ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
+  Tensor a_log_dev = ResidentWeight(d, w.a_log, {Hv});
+  Tensor dt_bias_dev = ResidentWeight(d, w.dt_bias, {Hv});
+
+  // ── 2. Conv per group. spec: multi-query causal_conv1d_update over the
+  // WIDENED conv_state (:1344-1357). non-spec: gather narrow conv rows, causal
+  // conv1d_fn, scatter back (:1365-1375). ──
+  DBuf dconv_spec(d, convdt, {ns_tok, conv_dim});
+  {
+    Tensor conv_cache = state.conv_state;
+    vt::CausalConv1dSpecUpdate(d.q, dconv_spec.t(), mixed_spec.t(), dcw,
+                               /*bias=*/nullptr, conv_cache,
+                               sdi.gdn_spec_conv_state_idx.t(),
+                               sdi.gdn_num_accepted.t(), sdi.gdn_spec_qsl.t(),
+                               vt::CausalConv1dArgs{true});
+  }
+  DBuf dconv_ns(d, convdt, {nns_tok, conv_dim});
+  {
+    DBuf dcs(d, DType::kF32, {np, conv_dim, Kw - 1});
+    vt::GdnStateGather(d.q, dcs.t(), state.conv_state, sdi.gdn_state_idx.t());
+    vt::CausalConv1dFwd(d.q, dconv_ns.t(), mixed_ns.t(), dcw, nullptr, dcs.t(),
+                        sdi.gdn_non_spec_qsl.t(), sdi.gdn_has_initial.t(),
+                        vt::CausalConv1dArgs{true});
+    Tensor conv_cache = state.conv_state;
+    vt::GdnStateScatter(d.q, conv_cache, dcs.t(), sdi.gdn_state_idx.t());
+  }
+
+  // ── 3. post-conv prep (split q|k|v, l2-normalize q/k, derive g/beta) per
+  // group; identical op set to the pure paths (fused GdnPostConv or 4-op). ──
+  auto post_conv = [&](Tensor dconv_g, Tensor a_g, Tensor b_g, int64_t n_tok,
+                       DBuf& dql2, DBuf& dkl2, DBuf& vf, DBuf& dg, DBuf& dbeta) {
+    if (GlueFuseEnabled()) {
+      vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(), dconv_g,
+                      a_g, b_g, a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
+    } else {
+      DBuf qf(d, actdt, {n_tok, Hk, Dk});
+      DBuf kf(d, actdt, {n_tok, Hk, Dk});
+      Tensor q2 = Reshape(qf.t(), {n_tok, key_dim});
+      Tensor k2 = Reshape(kf.t(), {n_tok, key_dim});
+      Tensor v2 = Reshape(vf.t(), {n_tok, value_dim});
+      vt::GdnConvSplit(d.q, q2, k2, v2, dconv_g);
+      vt::GdnGBeta(d.q, dg.t(), dbeta.t(), a_g, b_g, a_log_dev, dt_bias_dev);
+      vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
+      vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
+    }
+  };
+
+  DBuf dcore(d, outdt, {T, Hv, Dv});
+
+  // ── 4.1 spec recurrence (fused_sigmoid_gating_delta_rule_update, :1455-1475):
+  // k+1 state slots per request, initial state selected by num_accepted. ──
+  {
+    DBuf dql2(d, actdt, {ns_tok, Hk, Dk});
+    DBuf dkl2(d, actdt, {ns_tok, Hk, Dk});
+    DBuf vf(d, actdt, {ns_tok, Hv, Dv});
+    DBuf dg(d, DType::kF32, {ns_tok, Hv});
+    DBuf dbeta(d, DType::kF32, {ns_tok, Hv});
+    post_conv(dconv_spec.t(), a_spec.t(), b_spec.t(), ns_tok, dql2, dkl2, vf, dg,
+              dbeta);
+    DBuf dcore_spec(d, outdt, {ns_tok, Hv, Dv});
+    Tensor ssm_cache = state.ssm_state;
+    Tensor spec_idx_2d =
+        Reshape(sdi.gdn_spec_state_idx.t(), {ns, sdi.gdn_spec_num_cols});
+    vt::GdnSpecDecode(d.q, dcore_spec.t(), dql2.t(), dkl2.t(), vf.t(), dg.t(),
+                      dbeta.t(), ssm_cache, sdi.gdn_spec_qsl.t(), spec_idx_2d,
+                      sdi.gdn_num_accepted.t(), vt::GdnArgs{scale});
+    vt::IndexCopy(d.q, dcore.t(), dcore_spec.t(), spec_tok);  // :1570
+  }
+
+  // ── 4.2 non-spec prefill recurrence (chunk_gated_delta_rule, :1504-1532):
+  // gather initial state (zeroing fresh rows), chunked prefill, scatter final. ──
+  {
+    DBuf dql2(d, actdt, {nns_tok, Hk, Dk});
+    DBuf dkl2(d, actdt, {nns_tok, Hk, Dk});
+    DBuf vf(d, actdt, {nns_tok, Hv, Dv});
+    DBuf dg(d, DType::kF32, {nns_tok, Hv});
+    DBuf dbeta(d, DType::kF32, {nns_tok, Hv});
+    post_conv(dconv_ns.t(), a_ns.t(), b_ns.t(), nns_tok, dql2, dkl2, vf, dg,
+              dbeta);
+    DBuf dcore_ns(d, outdt, {nns_tok, Hv, Dv});
+    DBuf dss(d, DType::kF32, {np, Hv, Dv, Dk});
+    vt::GdnStateGather(d.q, dss.t(), state.ssm_state,
+                       sdi.gdn_prefill_state_idx.t(),
+                       &sdi.gdn_prefill_has_initial.t());
+    vt::GdnArgs gdn_args{scale};
+    gdn_args.query_start_loc_host = meta.prefill_query_start_loc->data();
+    vt::GdnPrefill(d.q, dcore_ns.t(), dql2.t(), dkl2.t(), vf.t(), dg.t(),
+                   dbeta.t(), dss.t(), sdi.gdn_prefill_qsl.t(), gdn_args);
+    Tensor ssm_cache = state.ssm_state;
+    vt::GdnStateScatter(d.q, ssm_cache, dss.t(), sdi.gdn_prefill_state_idx.t());
+    vt::IndexCopy(d.q, dcore.t(), dcore_ns.t(), ns_tok_idx);  // :1571
+  }
+
+  // ── 5. shared gated-RMSNorm(z) + out_proj over the merged [T,Hv,Dv] core.
+  // Byte-identical op sequence to GdnBlockPaged's tail. ──
+  Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
+                                     : ResidentWeightF32(d, w.norm_weight, {Dv});
+  const bool z_strided = z.stride[0] != value_dim;
+  Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
+  Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
+  if (!w.out_proj_fp8.Empty() && GdnOutFp8FuseEnabled() && GlueFuseEnabled() &&
+      vllm::platforms::GetPlatform(d.q.device.type).supports_fp8()) {
+    DBuf a_fp8(d, DType::kI8, {T, value_dim});
+    Tensor a_fp8_v = z_strided ? Reshape(a_fp8.t(), {T, Hv, Dv})
+                               : Reshape(a_fp8.t(), {T * Hv, Dv});
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, vt::kRmsNormGatedQuantFp8, a_fp8_v, core2, z2, dnw, eps,
+                     w.out_proj_fp8.input_scale);
+    } else {
+      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw,
+                               vt::RmsNormGatedArgs{eps, false},
+                               w.out_proj_fp8.input_scale);
+    }
+    return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
+  }
+  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  if (GlueFuseEnabled()) {
+    Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
+                              : Reshape(gated_bf16.t(), {T * Hv, Dv});
+    vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+  } else {
+    DBuf dgated(d, DType::kF32, {T * Hv, Dv});
+    Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
+    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
+  }
+  return !w.out_proj_fp8.Empty()
+             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
+         : !w.out_proj_fp4.Empty()
+             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
+             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+}
+
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                    const Tensor& h, const StepDevInputs& sdi,
                    const GDNAttentionMetadata& meta,
@@ -3293,16 +3516,16 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   VT_CHECK(meta.num_actual_tokens == T, "gdn paged: num_actual_tokens != T");
   VT_CHECK(nd_tok + np_tok + ns_tok == T,
            "gdn paged: decode+prefill+spec tokens != T");
-  // I5a ships the PURE spec batch (num_prefills == 0 && num_decodes == 0), which
-  // is the k=1 greedy steady-state decode and exactly what the I5a bit-exact
-  // gate proves. A MIXED spec batch (spec rows alongside reclassified non-spec
-  // prefill rows) additionally needs the mixed_qkv index_select split + merge;
-  // it is first produced e2e by the runner loop (I5b-d) and lands with that
-  // increment, gated end-to-end. Refuse it loudly here rather than silently
-  // degrade (mirrors the codebase's refuse-never-degrade rule).
-  VT_CHECK(!spec || (np == 0 && nd == 0),
-           "gdn paged: mixed spec+non-spec GDN batch is not yet routed "
-           "(SPEC-MTP I5a is pure-spec only; mixed lands with the runner loop)");
+  // A spec batch is either PURE (num_prefills == 0 && num_decodes == 0 — the
+  // steady-state k=1 decode, the I5a fast path below) or MIXED (spec rows share
+  // the step with reclassified non-spec prefill rows, under concurrency > 1).
+  // Upstream reclassifies any non-spec DECODE to a prefill when a spec row
+  // exists (gdn_attn.py:243-251), so a spec batch never carries num_decodes > 0;
+  // the MIXED case is handled by the index_select split/merge helper.
+  VT_CHECK(!spec || nd == 0,
+           "gdn paged: a spec batch must have num_decodes == 0 (upstream "
+           "reclassifies non-spec decodes to prefill, gdn_attn.py:243-251)");
+  const bool mixed_spec = spec && np > 0;
 
   const DType indt = GdnInDType();
   const DType outdt = GdnOutDType(cfg.num_experts == 0);
@@ -3357,6 +3580,14 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   GdnBaOutput ba = ProjectGdnBA(d, w, h, Hv, packed_decode);
   Tensor braw = ba.b;  // [T,Hv], F32 contiguous or row-strided merged view
   Tensor araw = ba.a;
+
+  // MIXED spec+non-spec batch: split the per-token projections into compact spec
+  // / non-spec groups, run each recurrence path, merge back (qwen_gdn_linear_attn
+  // .py:1329-1576). Reached only under an active speculator at concurrency > 1.
+  if (mixed_spec) {
+    return GdnBlockPagedMixedSpec(d, w, cfg, mixed, z, araw, braw, state, sdi,
+                                  meta, T);
+  }
 
   // Causal conv1d over the token stream, PERSISTENT conv_state (gathered by the
   // per-request state indices, updated in place, scattered back). conv in/out

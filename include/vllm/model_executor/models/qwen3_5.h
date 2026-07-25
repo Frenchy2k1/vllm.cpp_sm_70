@@ -39,6 +39,14 @@
 
 namespace vllm {
 
+// Process-wide count of MIXED spec+non-spec GDN batch invocations
+// (GdnBlockPagedMixedSpec), incremented per GDN layer per mixed step. A nonzero
+// value proves the concurrency split/merge path actually ran; the c>1 spec
+// identity gate reads it to prove it exercised the mixed batch, not just the
+// pure-spec fast path. Reset lets a test scope the count to its own run.
+int64_t Qwen3_5MixedSpecInvocations();
+void ResetQwen3_5MixedSpecInvocations();
+
 // Per-full-attn-layer paged KV cache: the FlashAttention V1 buffer
 // (num_blocks, 2, block_size, num_kv_heads, head_size) referenced by base ptr +
 // dims. Rank 5 exceeds vt::kMaxRank (4), so the buffer is carried raw and the

@@ -345,6 +345,112 @@ void GdnStateScatterKernelCuda(Queue& q, Tensor& cache,
   Check(cudaGetLastError(), "gdn state indexed scatter launch");
 }
 
+// --- Row gather/scatter over dim 0 (torch index_select / index_copy_). Powers
+// the MIXED spec+non-spec GDN split/merge. dtype-agnostic: dispatched on the
+// element storage size (bf16 -> u16, f32 -> u32). `n_total` = rows * inner
+// elements; grid-stride over the compact side; the base side carries an outer
+// row stride (in elements) so a padded / row-strided packed view is addressed
+// directly. Mirror of qwen_gdn_linear_attn.py:1334-1335,1407-1408,1570-1571.
+template <typename T>
+__global__ void IndexSelectRowKernel(T* out, const T* in, const int32_t* idx,
+                                     int64_t inner, int64_t in_row_stride,
+                                     int64_t n_total) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n_total; i += step) {
+    const int64_t row = i / inner;
+    const int64_t col = i - row * inner;
+    out[i] = in[static_cast<int64_t>(idx[row]) * in_row_stride + col];
+  }
+}
+
+template <typename T>
+__global__ void IndexCopyRowKernel(T* out, const T* in, const int32_t* idx,
+                                   int64_t inner, int64_t out_row_stride,
+                                   int64_t n_total) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n_total; i += step) {
+    const int64_t row = i / inner;
+    const int64_t col = i - row * inner;
+    out[static_cast<int64_t>(idx[row]) * out_row_stride + col] = in[i];
+  }
+}
+
+void IndexSelectKernelCuda(Queue& q, Tensor& out, const Tensor& in,
+                           const Tensor& idx) {
+  const int64_t rows = idx.shape[0];
+  if (rows == 0) return;
+  const int64_t inner = out.Numel() / rows;
+  const int64_t n = out.Numel();
+  const int64_t in_row_stride = in.stride[0];
+  cudaStream_t s = AsStream(q);
+  switch (SizeOf(out.dtype)) {
+    case 1:
+      IndexSelectRowKernel<<<GridFor(n), kBlock, 0, s>>>(
+          static_cast<uint8_t*>(out.data),
+          static_cast<const uint8_t*>(in.data), idx.Ptr<int32_t>(), inner,
+          in_row_stride, n);
+      break;
+    case 2:
+      IndexSelectRowKernel<<<GridFor(n), kBlock, 0, s>>>(
+          static_cast<uint16_t*>(out.data),
+          static_cast<const uint16_t*>(in.data), idx.Ptr<int32_t>(), inner,
+          in_row_stride, n);
+      break;
+    case 4:
+      IndexSelectRowKernel<<<GridFor(n), kBlock, 0, s>>>(
+          static_cast<uint32_t*>(out.data),
+          static_cast<const uint32_t*>(in.data), idx.Ptr<int32_t>(), inner,
+          in_row_stride, n);
+      break;
+    default:
+      IndexSelectRowKernel<<<GridFor(n), kBlock, 0, s>>>(
+          static_cast<uint64_t*>(out.data),
+          static_cast<const uint64_t*>(in.data), idx.Ptr<int32_t>(), inner,
+          in_row_stride, n);
+      break;
+  }
+  Check(cudaGetLastError(), "index_select row launch");
+}
+
+void IndexCopyKernelCuda(Queue& q, Tensor& out, const Tensor& in,
+                         const Tensor& idx) {
+  const int64_t rows = idx.shape[0];
+  if (rows == 0) return;
+  const int64_t inner = in.Numel() / rows;
+  const int64_t n = in.Numel();
+  const int64_t out_row_stride = out.stride[0];
+  cudaStream_t s = AsStream(q);
+  switch (SizeOf(in.dtype)) {
+    case 1:
+      IndexCopyRowKernel<<<GridFor(n), kBlock, 0, s>>>(
+          static_cast<uint8_t*>(out.data),
+          static_cast<const uint8_t*>(in.data), idx.Ptr<int32_t>(), inner,
+          out_row_stride, n);
+      break;
+    case 2:
+      IndexCopyRowKernel<<<GridFor(n), kBlock, 0, s>>>(
+          static_cast<uint16_t*>(out.data),
+          static_cast<const uint16_t*>(in.data), idx.Ptr<int32_t>(), inner,
+          out_row_stride, n);
+      break;
+    case 4:
+      IndexCopyRowKernel<<<GridFor(n), kBlock, 0, s>>>(
+          static_cast<uint32_t*>(out.data),
+          static_cast<const uint32_t*>(in.data), idx.Ptr<int32_t>(), inner,
+          out_row_stride, n);
+      break;
+    default:
+      IndexCopyRowKernel<<<GridFor(n), kBlock, 0, s>>>(
+          static_cast<uint64_t*>(out.data),
+          static_cast<const uint64_t*>(in.data), idx.Ptr<int32_t>(), inner,
+          out_row_stride, n);
+      break;
+  }
+  Check(cudaGetLastError(), "index_copy row launch");
+}
+
 // ---------------------------------------------------------------------------
 // causal_conv1d_fwd (gdn-semantics.md §2): one thread per (sequence, channel),
 // sequential over the sequence's tokens. Each thread owns its conv_state row
@@ -5574,6 +5680,12 @@ struct Registrar {
         OpId::kGdnStateScatter, DeviceType::kCUDA,
         reinterpret_cast<void*>(
             static_cast<GdnStateScatterFn>(&GdnStateScatterKernelCuda)));
+    RegisterOp(OpId::kIndexSelect, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<IndexSelectFn>(&IndexSelectKernelCuda)));
+    RegisterOp(OpId::kIndexCopy, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<IndexCopyFn>(&IndexCopyKernelCuda)));
   }
 } registrar;
 

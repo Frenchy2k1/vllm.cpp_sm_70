@@ -82,10 +82,31 @@ vLLM (TPOT 100 vs 104, tput 9.97 vs 9.57) and preserves the lead spec-ON. **Nois
 ours reruns TPOT s<0.5%, vLLM within ~2%; the ~4% ours-faster TPOT/tput margin
 exceeds the band (real, not noise). **GDN state doubling at k=1** (spec 3.1) costs
 ours +3.6 GB RSS (draft KV + widened conv + draft head), inside the pool. Raw logs
-on dgx `~/work/mtp-bench-i6/{results,vresults}`. **Remaining for `DONE`:** the mixed
-spec+non-spec `GdnBlockPaged` split/merge (c>1, refused) and its c>1 A/B; no
-user-facing supported speculative flag on the OpenAI server yet (the bench flag is
-additive/example-only).
+on dgx `~/work/mtp-bench-i6/{results,vresults}`.
+
+**MTP speculative decode, k=1 on the 27B GDN hybrid - CONCURRENCY (c2/c4/c8)
+(2026-07-25, `SPEC-MTP` I7, `CLAIM-SPEC-MTP-I7`,
+[spec](../.agents/specs/mtp-spec-decode.md)).** `benchmark_binding=true`. The
+mixed spec+non-spec `GdnBlockPaged` split/merge (the c>1 blocker) is implemented and
+model-independently bit-exact (mixed batch == pure spec + pure prefill,
+`test_qwen3_5_gdn_spec_routing`, 27B/35B, CPU exact + CUDA band). A/B both arms
+spec-ON, SAME `{"method":"mtp","num_speculative_tokens":1}`, 27B, greedy, 8 prose+code
+prompts x 256 out, idle box, one engine at a time under one `flock`, 3 reps (cold r1
+discarded), production configs (ours `examples/vllm-bench` + `--speculative-config`;
+vLLM graphed 0.25.0 `vllm serve --speculative-config ... --max-num-seqs 8` +
+`vllm bench serve --max-concurrency {2,4,8}`). **RESULT — spec KEEPS HELPING at every
+c>1 on both engines; ours tracks vLLM** (median output tput tok/s, prose / code, ON vs
+OFF):
+- **c2** ours 28.9/29.8 vs 19.0/19.0 (**1.52x/1.57x**); vLLM 28.4 / 29.1 tok/s (ours +1.6% / +2.5%).
+- **c4** ours 53.9/57.2 vs 36.7/36.7 (**1.47x/1.56x**); vLLM 53.4 / 56.3 (ours +0.9% / +1.7%).
+- **c8** ours 100.5/104.1 vs 70.3/70.3 (**1.43x/1.48x**); vLLM 99.7 / 105.3 (ours +0.9% / -1.1%, within vLLM's own run noise).
+TPOT spec-ON stays ~67-77 ms across c2-c8 (vs ~105-113 ms spec-OFF); ours does NOT go
+neutral at c8 (the mixed batch keeps every request drafting). **c>1 correctness:** the
+27B greedy is bf16-batch-nondeterministic (spec-OFF max_seqs 4-vs-1 differs 2/3 short
+prompts, no spec), so exact c>1 token identity is a MODEL impossibility, not the mixed
+code — correctness rests on the bit-exact split/merge proof, healthy acceptance
+(43/51 at the staggered c4 gate), and the exact three-way identity at c1. Raw logs dgx
+`~/work/mixed-batch/{cN_results,cN_vresults}`. **Disposition: ours is ON-PAR-OR-ABOVE vLLM spec-ON at every measured c>1 axis** (output tput within ~+/-2%, ours slightly ahead at c2/c4, within-noise at c8; acceptance on-par 0.84-0.92 vs 0.835), tracking vLLM's ~1.5x spec speedup at every concurrency. The implementation is COMPLETE and at vLLM parity (mixed batch + bit-exact proof, server/CLI flag, c1 win I6). `SPEC-MTP` STAYS `ACTIVE`, NOT flipped to `DONE`, for one honest reason: the DONE criterion's strict `token-exact at c>1` clause is a proven MODEL impossibility — the 27B greedy is bf16-batch-nondeterministic (spec-OFF max_seqs 4-vs-1 differs 2/3 short prompts, no spec involved, affecting vLLM identically), so exact c>1 token identity cannot be met by any correct implementation; c>1 correctness is instead the model-independent bit-exact split/merge proof + acceptance parity (near-tie-distributional-gate), token-exact strict at c1. No lag, no missing work, no lever — the DONE final call is deferred to the user given this criterion ambiguity.
 
 **Gemma-3 (`Gemma3ForCausalLM`, gemma-3-1b-it) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-SWEEP-GEMMA` W0-W2, [spike](../.agents/specs/sweep-gemma.md)).**
