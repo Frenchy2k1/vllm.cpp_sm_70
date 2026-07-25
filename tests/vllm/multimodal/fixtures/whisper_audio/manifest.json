@@ -1,0 +1,62 @@
+{
+  "model_id": "openai/whisper-small",
+  "vehicle": "openai/whisper-small (native WhisperEncoder; oracle-constructible)",
+  "audio": {
+    "wav_file": "audio_tone_16k_mono.wav",
+    "waveform_file": "audio_waveform_f32.bin",
+    "n_samples": 48000,
+    "sampling_rate": 16000,
+    "channels": 1,
+    "duration_s": 3.0,
+    "dtype": "float32",
+    "decode_contract": "int16_le / 32768.0 (canonical PCM16 mono WAV)",
+    "waveform_sha256": "ea1f2cbd966d4c3755226cf7e9f93b371928fa02a68a9ef1b9e824472f29cd2d",
+    "wav_sha256": "b8bdafe4097d9a20a6ceaa53f05781c9c6176907e41028c09261a01e0f30af32"
+  },
+  "input_features": {
+    "shape": [
+      80,
+      3000
+    ],
+    "dtype": "float32",
+    "note": "WhisperFeatureExtractor torch STFT log-mel (the path that runs when torch is installed); padded/truncated to chunk_length*sr=480000 samples => 3000 frames",
+    "sha256": "980ef280685e5afb884bc4cc9e936779c68769a644ba906a80bc92150c3a1a1b",
+    "file": "input_features_f32.bin"
+  },
+  "mel_filters": {
+    "shape": [
+      201,
+      80
+    ],
+    "dtype": "float32",
+    "note": "mel_filter_bank(num_frequency_bins=201, num_mel_filters=80, min=0, max=8000, sr=16000, norm=slaney, mel_scale=slaney); dumped as a golden config constant (the C++ side loads it; STFT is the parity var)",
+    "sha256": "d18b48f33345d958ea71098bb990b5e32cebc78d9a2cf65ca0d7302f34ebe8a9",
+    "file": "mel_filters_f32.bin"
+  },
+  "feature_contract": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 80,
+    "sampling_rate": 16000,
+    "chunk_length_s": 30,
+    "n_samples_padded": 480000,
+    "nb_max_frames": 3000,
+    "dither": 0.0,
+    "window": "hann (torch.hann_window(400), periodic)",
+    "stft": "torch.stft(n_fft=400, hop=160, center=True, pad=reflect, return_complex=True); magnitudes=|stft[...,:-1]|**2 (drop last frame)",
+    "log_mel": "log10(clamp(mel_spec, 1e-10)); x=max(x, x.max()-8.0); x=(x+4.0)/4.0",
+    "max_source_positions": 1500
+  },
+  "placeholder": {
+    "audio_placeholder_id": 0,
+    "num_audio_tokens": 1500,
+    "arithmetic": "num_audio_tokens = max_source_positions = 1500 = n_frames(3000) / total_conv_stride(2)",
+    "pre_expansion_token_ids": [
+      0
+    ],
+    "expanded_len": 1500,
+    "upstream": "vllm/model_executor/models/whisper.py:656,740-753 @ e24d1b24"
+  },
+  "mm_hash": "2d0c7e4c2d1f3735e883c97cb489dd59b851cbf9b6a485e9a6d506f28fa57891",
+  "mm_hash_contract": "MultiModalHasher.hash_kwargs(model_id=<utf8>, audio=<f32 c-contiguous 1-D ndarray>); sorted kwargs => 'audio' < 'model_id'"
+}

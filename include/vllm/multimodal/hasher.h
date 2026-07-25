@@ -29,6 +29,19 @@ class MultiModalHasher {
   static std::string HashImageRGB(const std::string& model_id,
                                   const uint8_t* rgb, int64_t height,
                                   int64_t width);
+
+  // Hash one AUDIO item exactly as vLLM does for a pre-resampled mono float32
+  // waveform with no provided UUID and empty hf_processor_mm_kwargs:
+  //   hash_kwargs(model_id=<model_id>, audio=<np.ndarray float32, 1-D>)
+  // where sorted kwargs => "audio" is serialized before "model_id" (matching
+  // vllm/multimodal/processing/inputs.py::get_mm_hashes). `samples` is the
+  // c-contiguous float32 waveform (== the resampled mono audio item), length
+  // `num_samples`. The ndarray serialization uses dtype str "<f4" and shape (N,),
+  // exactly like the image path uses "|u1" and shape (H,W,3) (hasher.py:110-127).
+  //
+  // Returns the lowercase hex BLAKE3 digest (64 chars).
+  static std::string HashAudioF32(const std::string& model_id,
+                                  const float* samples, int64_t num_samples);
 };
 
 }  // namespace vllm::multimodal

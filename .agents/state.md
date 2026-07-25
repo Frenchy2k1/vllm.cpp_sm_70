@@ -23538,3 +23538,65 @@ READ-ONLY design assessment of the remaining #1-priority mm piece: the AUDIO mod
 **Records.** New `.agents/specs/gemma4-multimodal.md`; model-matrix checklist + detail rows; coordination claim; roadmap ROAD-V1-MM note; ledger; this entry; one README + one BENCHMARKS status line. No source/kernel/test touched ⇒ SACRED gates untouched by construction. Not pushed; FULL SHA reported.
 
 **NEXT (out of this claim):** AUDIO A0 — fetch `whisper-small` + `Voxtral-Mini-3B`, capture the oracle log-mel + audio→text golden. Gemma-4 stays blocked until the oracle's Transformers carries `gemma4` (or the pin advances) AND a fitting checkpoint downloads.
+
+---
+
+## 2026-07-25 — AUDIO track A0+A1 (LANDED, `CLAIM-AUDIO-PIPELINE`)
+
+The genuinely-new AUDIO modality stood up on the smallest oracle-runnable vehicle
+`openai/whisper-small`. Base `origin/main` `435ba70`, isolated worktree
+`/home/mudler/_git/vllm.cpp-audio-a0a1` branch `audio-a0a1`. Foreground-waited every
+build/test; returned once.
+
+**A0 — vehicle + oracle reference.** `whisper-small` confirmed oracle-constructible
+on dgx (`~/venvs/vllm-oracle`, transformers 5.13.1 has `WhisperFeatureExtractor` +
+`WhisperConfig`; feature extraction is CPU ⇒ no GPU/flock). `scripts/mm/a0_audio_ref.py`
+captured, for a deterministic 3 s PCM16-mono-16kHz clip (committed WAV; C++ decodes
+`int16/32768.0` to the identical f32 array): the log-mel `input_features` `[80,3000]`
+(the REAL `_torch_extract_fbank_features` torch STFT path — the one that runs when
+torch is installed), the mel filterbank `[201,80]` (dumped as a golden config
+constant), the placeholder expansion (`[0]`→`[0]*1500`, num_audio_tokens =
+`max_source_positions` = encoder output length, `whisper.py:656,740-753`), and the
+mm-hash. Fixtures `tests/vllm/multimodal/fixtures/whisper_audio/` (content-hashed:
+wav `b8bdafe4…`, waveform `ea1f2cbd…`, input_features `980ef280…`, mel `d18b48f3…`,
+mm-hash `2d0c7e4c…`).
+
+**A1 — the C++ audio INPUT pipeline + inert seam.** New additive TU
+`src/vllm/multimodal/audio_processor.{h,cpp}` (`WhisperAudioProcessor`): PCM16-mono
+WAV decode, identity resample at 16 kHz (genuine windowed-sinc DEFERRED, mirrors the
+image SmartResize/bicubic deferral), log-mel (pad/truncate 480000 → reflect-pad
+`n_fft/2` + periodic Hann + hop 160 + drop last frame + direct DFT over 201 bins →
+`abs(stft)^2` → `mel_filters.T@mag` → `log10(clamp 1e-10)` → `max(x,x.max()-8)` → `(x+4)/4`),
+`ExpandAudioPlaceholders`, and `MultiModalHasher::HashAudioF32` (float32 1-D ndarray
+`"<f4"`/`(N,)` byte stream — the audio analogue of the image `"|u1"`/`(H,W,3)`).
+Engine seam reuses the M1 modality-agnostic `MultiModalFeatureSpec` + `EncoderCacheManager`
++ LMCache `extra_keys`; adds a default-null `AudioKwargs audio_data`.
+
+**Gate PASS (77/77).** `tests/vllm/multimodal/test_audio_processor.cpp` vs the A0
+oracle fixture (RED-first): log-mel `input_features` **rel-L2 1.96e-7** (stated 2e-4
+band; torch.stft-FFT vs our DFT summation order — transformers' own torch/numpy claim
+is 1e-5, we sit 2 orders tighter; bit-exact infeasible with a different FFT algorithm);
+WAV decode byte-identical (0 mismatches); placeholder `[0]*1500` byte-identical; mm-hash
+byte-identical (`2d0c7e4c…`). RED-first: mel-perturb 2.6e-3, wrong hop (161) 0.70, skip
+`(x+4)/4` 9.27 — each blows the band.
+
+**Inertness (proven).** `git diff --stat` additive; shared `hasher.cpp`/`inputs.h`
+re-run byte-identical: image processor 23/23 (hasher refactor inert — image mm-hash
+unchanged), video processor 41/41, request 71/71, encoder-cache 32/32, text backbone
+85/85. Clean CPU `-Werror` 0 warn; `check-device-leakage` unchanged (32==baseline);
+no CUDA kernel ⇒ compute-sanitizer N/A. All seven record checkers green by bare RC.
+`benchmark_binding=false`, SPEED pending. Not pushed; FULL SHA reported.
+
+**Coordination.** Owns ONLY the new `src/vllm/multimodal/audio_processor.*`,
+`AudioKwargs`+`HashAudioF32`, the audio test + fixtures + `a0_audio_ref.py`,
+`.agents/specs/audio-track.md`, `ENG-MM-AUDIO-PIPELINE` (engine-matrix, `ACTIVE`), and
+`CLAIM-AUDIO-PIPELINE`. Did NOT touch `multimodal-track.md` / the Qwen `MODEL-MM-*`
+rows (Qwen3.6-video agent) or the Gemma-4 `MODEL-MM-*` rows + `gemma4-multimodal.md`
+(Gemma-4 agent). OpenAI-server `audio_url` ingestion NOT wired (no in-tree image/video
+server precedent to mirror — owed with the image/video server wiring).
+
+**NEXT.** A2 — the Whisper-class audio encoder tower proven faithful in isolation,
+then the USM Conformer delta on Granite-Speech-2b (the Gemma-4-family tower). A3 —
+e2e audio→text on Voxtral-Mini-3B (native Whisper-class encoder + projector-merge into
+the LANDED Mistral backbone). Gemma-4 audio (G3) reuses this pipeline once its oracle
+block clears.

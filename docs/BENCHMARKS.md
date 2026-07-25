@@ -243,6 +243,20 @@ the input-ids fixture. SPEED: **`benchmark_binding=false`, PENDING** - no throug
 (the row is not DONE until every-axis vLLM speed parity; M3 reuses this tower for Qwen3.6 image +
 video). No throughput number is claimed here.
 
+**AUDIO track A0+A1 - audio INPUT pipeline on `openai/whisper-small`, feature-parity gate PASS,
+NO throughput (2026-07-25, `CLAIM-AUDIO-PIPELINE` [spec](../.agents/specs/audio-track.md)).**
+CORRECTNESS: the C++ Whisper-class audio processor (WAV decode -> log-mel `input_features`
+`[80,3000]` -> placeholder expansion `[0]*1500` -> mm-hash) vs the vLLM 0.25.0 / transformers
+5.13.1 oracle fixture (`tests/vllm/multimodal/fixtures/whisper_audio/`, captured by
+`scripts/mm/a0_audio_ref.py`): **log-mel rel-L2 1.96e-7** (stated 2e-4 band - torch.stft-FFT vs
+our DFT summation order, transformers' own torch/numpy claim is 1e-5), placeholder ids + mm-hash
+BIT/BYTE-exact, RED-first (mel-perturb 2.6e-3 / hop-161 0.70 / no-normalize 9.27); **77/77
+assertions** (`tests/vllm/multimodal/test_audio_processor.cpp`, CPU-only). Reproduce:
+`./build-cpu/tests/test_audio_processor`. Inert when no audio (image 23/23 / video 41/41 / request
+71/71 / encoder-cache 32/32 / text 85/85 re-run byte-identical). SPEED: **`benchmark_binding=false`,
+PENDING** - this is the INPUT pipeline (feature parity), NOT audio->text (A2 encoder tower + A3 e2e
+on Voxtral-Mini-3B are owed); no throughput number is claimed.
+
 **Multimodal M3-W0 - Qwen3.6-27B image, checkpoint+oracle GROUNDED, e2e gate PENDING (2026-07-25, `CLAIM-MULTIMODAL-M3`).**
 Disposition: **NO throughput measured; the image e2e correctness gate is NOT yet run (M3-b, next brick).**
 W0 RESOLVED the gating fact: the vision-inclusive checkpoint is `Qwen/Qwen3.6-27B` (51.7 GiB uniform
