@@ -389,41 +389,24 @@ multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionWeights(
   return vw;
 }
 
-std::vector<int32_t> Qwen3VLGenerateGreedy(
-    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
-    const std::vector<float>& mm_deepstack, int64_t num_deepstack_levels,
-    const std::array<int64_t, 3>& grid_thw, int32_t image_token_id,
-    int32_t eos_token_id, const Qwen3VLWeights& weights, const HfConfig& config,
-    vt::Queue& queue, int max_new_tokens) {
-  Backend& backend = vt::GetBackend(queue.device.type);
-  Dev d{backend, queue};
+namespace {
+
+// Common forked-forward core (shared by the image + video gate drivers): given the
+// precomputed visual mask + MRoPE prefill positions [3,T0] + decode delta, run
+// embed(prompt_ids) + masked-scatter merge + DeepStack inject prefill, then paged
+// greedy decode. `weights_text` is the dense text backbone; `L` = deepstack levels.
+std::vector<int32_t> VLGenerateCore(
+    Dev d, const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::vector<float>& mm_deepstack, int64_t L, const std::vector<bool>& mask,
+    const std::vector<int32_t>& pos_prefill, int64_t delta, int32_t eos_token_id,
+    const Qwen3DenseWeights& weights_text, const HfConfig& config,
+    const vt::RopeArgs& rope, int max_new_tokens) {
+  Backend& backend = d.b;
   const int64_t H = config.hidden_size;
   const int64_t Hkv = config.num_key_value_heads;
   const int64_t Dh = config.head_dim;
-  const int64_t L = num_deepstack_levels;
   const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
-  const vt::RopeArgs rope = MropeArgs(config);
-
-  // Image span offset + visual mask.
-  int64_t offset = -1;
-  int64_t n_img = 0;
-  std::vector<bool> mask(static_cast<size_t>(T0), false);
-  for (int64_t t = 0; t < T0; ++t) {
-    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
-      if (offset < 0) offset = t;
-      mask[static_cast<size_t>(t)] = true;
-      ++n_img;
-    }
-  }
-  VT_CHECK(offset >= 0, "qwen3-vl: no image token in prompt");
   const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
-  VT_CHECK(N == n_img, "qwen3-vl: mm_main rows != image-token count");
-
-  // MRoPE positions [3,T0] + decode delta (spatial_merge_size == 2 for Qwen3-VL).
-  std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
-  int64_t delta = 0;
-  std::vector<int32_t> pos_prefill =
-      multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, /*spatial_merge_size=*/2, &delta);
 
   // Global absolute-position cos|sin cache [Pmax, rotary_dim] bf16.
   const int64_t Pmax = 8192;
@@ -462,7 +445,7 @@ std::vector<int32_t> Qwen3VLGenerateGreedy(
   {
     DBuf ids(d, DType::kI32, {T0}, prompt_ids.data());
     DBuf emb(d, DType::kBF16, {T0, H});
-    Tensor tab = ResidentWeight(d, weights.text.embed_tokens, {config.vocab_size, H});
+    Tensor tab = ResidentWeight(d, weights_text.embed_tokens, {config.vocab_size, H});
     vt::Embedding(d.q, emb.t(), tab, ids.t());
     emb.Download(d, emb_bits.data());
   }
@@ -481,7 +464,7 @@ std::vector<int32_t> Qwen3VLGenerateGreedy(
   const CommonAttentionMetadata pm = StepMeta(T0, T0, 0);
   std::vector<float> logits = VLForwardLastLogits(
       d, merged_bits, pos_prefill, T0, ds_bits, L, cache_bf16.t(), pm, attn_kv,
-      weights.text, config, rope);
+      weights_text, config, rope);
 
   std::vector<int32_t> generated;
   int32_t next = static_cast<int32_t>(ArgMax(logits));
@@ -500,18 +483,95 @@ std::vector<int32_t> Qwen3VLGenerateGreedy(
       const std::vector<int32_t> one = {next};
       DBuf ids(d, DType::kI32, {1}, one.data());
       DBuf emb(d, DType::kBF16, {1, H});
-      Tensor tab = ResidentWeight(d, weights.text.embed_tokens, {config.vocab_size, H});
+      Tensor tab = ResidentWeight(d, weights_text.embed_tokens, {config.vocab_size, H});
       vt::Embedding(d.q, emb.t(), tab, ids.t());
       emb.Download(d, tok_emb.data());
     }
     const int64_t seq_len = abs_idx + 1;
     const CommonAttentionMetadata dm = StepMeta(1, seq_len, abs_idx);
     logits = VLForwardLastLogits(d, tok_emb, pos1, 1, no_ds, L, cache_bf16.t(), dm,
-                                 attn_kv, weights.text, config, rope);
+                                 attn_kv, weights_text, config, rope);
     next = static_cast<int32_t>(ArgMax(logits));
     generated.push_back(next);
   }
   return generated;
+}
+
+}  // namespace
+
+std::vector<int32_t> Qwen3VLGenerateGreedy(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::vector<float>& mm_deepstack, int64_t num_deepstack_levels,
+    const std::array<int64_t, 3>& grid_thw, int32_t image_token_id,
+    int32_t eos_token_id, const Qwen3VLWeights& weights, const HfConfig& config,
+    vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const int64_t H = config.hidden_size;
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+  const vt::RopeArgs rope = MropeArgs(config);
+
+  // Image span offset + visual mask.
+  int64_t offset = -1;
+  int64_t n_img = 0;
+  std::vector<bool> mask(static_cast<size_t>(T0), false);
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
+      if (offset < 0) offset = t;
+      mask[static_cast<size_t>(t)] = true;
+      ++n_img;
+    }
+  }
+  VT_CHECK(offset >= 0, "qwen3-vl: no image token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_img, "qwen3-vl: mm_main rows != image-token count");
+
+  // MRoPE positions [3,T0] + decode delta (spatial_merge_size == 2 for Qwen3-VL).
+  std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
+  int64_t delta = 0;
+  std::vector<int32_t> pos_prefill =
+      multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, /*spatial_merge_size=*/2, &delta);
+
+  return VLGenerateCore(d, prompt_ids, mm_main, mm_deepstack, num_deepstack_levels,
+                        mask, pos_prefill, delta, eos_token_id, weights.text, config,
+                        rope, max_new_tokens);
+}
+
+std::vector<int32_t> Qwen3VLGenerateGreedyVideo(
+    const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
+    const std::vector<float>& mm_deepstack, int64_t num_deepstack_levels,
+    const std::array<int64_t, 3>& grid_thw, int32_t video_token_id,
+    int32_t vision_start_token_id, int32_t vision_end_token_id,
+    int32_t eos_token_id, const Qwen3VLWeights& weights, const HfConfig& config,
+    vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const int64_t H = config.hidden_size;
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+  const vt::RopeArgs rope = MropeArgs(config);
+
+  // Video merge mask (all video_token_id positions across all frames).
+  int64_t n_vid = 0;
+  std::vector<bool> mask(static_cast<size_t>(T0), false);
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == video_token_id) {
+      mask[static_cast<size_t>(t)] = true;
+      ++n_vid;
+    }
+  }
+  VT_CHECK(n_vid > 0, "qwen3-vl: no video token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_vid, "qwen3-vl: mm_main rows != video-token count");
+
+  // MRoPE positions [3,T0] + decode delta via the per-frame video scan.
+  int64_t delta = 0;
+  std::vector<int32_t> pos_prefill = multimodal::Qwen3VLGetRopeIndexVideo(
+      prompt_ids, grid_thw, /*spatial_merge_size=*/2, vision_start_token_id,
+      video_token_id, vision_end_token_id, &delta);
+
+  return VLGenerateCore(d, prompt_ids, mm_main, mm_deepstack, num_deepstack_levels,
+                        mask, pos_prefill, delta, eos_token_id, weights.text, config,
+                        rope, max_new_tokens);
 }
 
 }  // namespace vllm

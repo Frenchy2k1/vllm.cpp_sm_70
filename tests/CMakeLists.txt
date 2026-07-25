@@ -155,6 +155,19 @@ vllm_cpp_add_test(test_qwen3_5_vl_e2e vllm/multimodal/test_qwen3_5_vl_e2e.cpp)
 target_compile_definitions(test_qwen3_5_vl_e2e PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
   GOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3_5_27b")
+# Multimodal M3c VIDEO-processor UNIT gate: C++ Qwen3-VL video pipeline
+# (pixel_values_videos/grid/timestamps/timestamp-interleaved expansion) BIT-identical
+# to the vLLM 0.25.0 oracle fixture (tests/vllm/multimodal/fixtures/qwen3vl_video).
+vllm_cpp_add_test(test_qwen3vl_video_processor vllm/multimodal/test_qwen3vl_video_processor.cpp)
+target_compile_definitions(test_qwen3vl_video_processor PRIVATE
+  MM_VIDEO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_video")
+# Multimodal M3c STRICT e2e VIDEO->text token-exact gate on Qwen3-VL-4B: the full
+# pipeline (video processor -> tower per-frame windowed attn -> merge -> forked
+# video MRoPE/DeepStack greedy decode) vs the committed vLLM 0.25.0 golden. GPU +
+# Qwen3-VL-4B checkpoint required, else skipped (VLLM_QWEN3VL_CKPT or HF cache).
+vllm_cpp_add_test(test_qwen3vl_video_e2e vllm/multimodal/test_qwen3vl_video_e2e.cpp)
+target_compile_definitions(test_qwen3vl_video_e2e PRIVATE
+  MM_VIDEO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_video")
 # Multimodal M1 encoder-cache manager (inert-when-off engine seam).
 vllm_cpp_add_test(test_encoder_cache_manager vllm/v1/core/test_encoder_cache_manager.cpp)
 # LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip

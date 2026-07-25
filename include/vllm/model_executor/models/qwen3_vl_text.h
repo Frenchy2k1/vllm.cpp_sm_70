@@ -41,6 +41,23 @@ std::vector<int32_t> Qwen3VLGetRopeIndex(const std::vector<int32_t>& input_ids,
                                          int64_t spatial_merge_size,
                                          int64_t* mrope_position_delta = nullptr);
 
+// get_rope_index for a single VIDEO item (M3c). Mirrors _iter_mm_grid_hw +
+// _get_mrope_input_positions video path (qwen3_vl.py:2482,2567): scans the
+// (already placeholder-expanded, timestamp-interleaved) input_ids for each of the
+// grid_t frames — vision_start -> first video_token before vision_end -> the
+// frame's video tokens. Per-frame timestamp/vision-marker tokens get sequential
+// TEXT positions; each frame's video tokens get (t,h,w) grid positions whose
+// temporal progression comes from the accumulated running max (grid t-row is the
+// per-frame base, NOT the frame number — matching np.indices((1,h,w))). The scan
+// starts at 0 (self-contained; there are no image spans in the video gate). EVS
+// (0-token / lumped frames) is not exercised by the gate and rejected. Returns a
+// flat [3*T] vector; writes mrope_position_delta if non-null.
+std::vector<int32_t> Qwen3VLGetRopeIndexVideo(
+    const std::vector<int32_t>& input_ids, const std::array<int64_t, 3>& video_grid_thw,
+    int64_t spatial_merge_size, int32_t vision_start_token_id,
+    int32_t video_token_id, int32_t vision_end_token_id,
+    int64_t* mrope_position_delta = nullptr);
+
 // _merge_multimodal_embeddings (masked scatter): overwrite the rows of
 // `inputs_embeds` [T, H] at the visual-token positions (mask true) with the
 // consecutive rows of `mm_embeds` [N, H]. `mask` has length T with exactly N

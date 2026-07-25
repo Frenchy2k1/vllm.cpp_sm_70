@@ -90,6 +90,90 @@ std::vector<int32_t> Qwen3VLGetRopeIndex(const std::vector<int32_t>& input_ids,
   return out;
 }
 
+std::vector<int32_t> Qwen3VLGetRopeIndexVideo(
+    const std::vector<int32_t>& input_ids, const std::array<int64_t, 3>& video_grid_thw,
+    int64_t spatial_merge_size, int32_t vision_start_token_id,
+    int32_t video_token_id, int32_t vision_end_token_id,
+    int64_t* mrope_position_delta) {
+  const int64_t T = static_cast<int64_t>(input_ids.size());
+  const int64_t grid_t = video_grid_thw[0];
+  const int64_t llm_h = video_grid_thw[1] / spatial_merge_size;
+  const int64_t llm_w = video_grid_thw[2] / spatial_merge_size;
+  const int64_t expected = llm_h * llm_w;
+
+  std::array<std::vector<int32_t>, 3> rows;
+  for (auto& r : rows) r.reserve(static_cast<size_t>(T));
+  int64_t st = 0;
+  int64_t last_max = -1;  // running max of emitted positions (-1 => none yet)
+  bool any = false;
+
+  auto find_from = [&](int32_t tok, int64_t from, int64_t upto) -> int64_t {
+    for (int64_t i = from; i < upto; ++i)
+      if (input_ids[static_cast<size_t>(i)] == tok) return i;
+    return -1;
+  };
+  auto append_text = [&](int64_t st_idx, int64_t text_len) {
+    for (int64_t i = 0; i < text_len; ++i) {
+      const int32_t p = static_cast<int32_t>(st_idx + i);
+      rows[0].push_back(p); rows[1].push_back(p); rows[2].push_back(p);
+    }
+    if (text_len > 0) last_max = std::max(last_max, st_idx + text_len - 1);
+  };
+
+  int64_t search = 0;
+  for (int64_t f = 0; f < grid_t; ++f) {
+    const int64_t vs = find_from(vision_start_token_id, search, T);
+    if (vs < 0)
+      throw std::invalid_argument("Qwen3VLGetRopeIndexVideo: missing vision_start for frame");
+    const int64_t ve = find_from(vision_end_token_id, vs, T);
+    if (ve < 0)
+      throw std::invalid_argument("Qwen3VLGetRopeIndexVideo: missing vision_end for frame");
+    const int64_t vid = find_from(video_token_id, vs, ve);
+    const int64_t actual = (vid >= 0) ? (ve - vid) : 0;
+    const int64_t video_offset = (vid >= 0) ? vid : (vs + 1);
+    if (actual == 0) {  // EVS 0-token frame (not exercised by the gate)
+      search = ve + 1;
+      continue;
+    }
+    if (actual != expected)
+      throw std::invalid_argument("Qwen3VLGetRopeIndexVideo: EVS/lumped frames "
+                                  "(actual != expected tokens) not supported by the gate");
+    const int64_t text_len = video_offset - st;
+    if (text_len < 0)
+      throw std::invalid_argument("Qwen3VLGetRopeIndexVideo: negative text_len (ordering)");
+    const int64_t st_idx = any ? last_max + 1 : 0;
+    append_text(st_idx, text_len);
+    const int64_t bias = text_len + st_idx;
+    for (int64_t j = 0; j < expected; ++j) {
+      const int64_t h_idx = j / llm_w, w_idx = j % llm_w;
+      rows[0].push_back(static_cast<int32_t>(bias));
+      rows[1].push_back(static_cast<int32_t>(bias + h_idx));
+      rows[2].push_back(static_cast<int32_t>(bias + w_idx));
+    }
+    last_max = std::max(last_max, bias + std::max(llm_h - 1, llm_w - 1));
+    st = video_offset + actual;
+    search = ve + 1;
+    any = true;
+  }
+  if (st < T) {
+    const int64_t st_idx = any ? last_max + 1 : 0;
+    append_text(st_idx, T - st);
+  }
+
+  if (static_cast<int64_t>(rows[0].size()) != T)
+    throw std::invalid_argument("Qwen3VLGetRopeIndexVideo: emitted count != T");
+
+  std::vector<int32_t> out(static_cast<size_t>(3 * T));
+  for (int r = 0; r < 3; ++r)
+    std::copy(rows[r].begin(), rows[r].end(), out.begin() + static_cast<size_t>(r) * T);
+  if (mrope_position_delta != nullptr) {
+    int32_t mx = 0;
+    for (int32_t v : out) mx = std::max(mx, v);
+    *mrope_position_delta = static_cast<int64_t>(mx) + 1 - T;
+  }
+  return out;
+}
+
 void Qwen3VLMergeMultimodal(std::vector<float>& inputs_embeds, int64_t T, int64_t H,
                             const std::vector<float>& mm_embeds,
                             const std::vector<bool>& mask) {

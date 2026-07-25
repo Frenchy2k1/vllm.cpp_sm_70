@@ -206,4 +206,150 @@ std::vector<int32_t> ExpandImagePlaceholders(
   return out;
 }
 
+// ---- VIDEO (M3c) ----------------------------------------------------------
+
+std::array<int64_t, 2> VideoSmartResize(int64_t num_frames, int64_t height,
+                                        int64_t width, int64_t temporal_factor,
+                                        int64_t factor, int64_t min_pixels,
+                                        int64_t max_pixels) {
+  if (height < factor || width < factor)
+    throw std::runtime_error("video smart_resize: h/w must be >= factor");
+  const int64_t hi = std::max(height, width), lo = std::min(height, width);
+  if (lo <= 0 || static_cast<double>(hi) / static_cast<double>(lo) > 200.0)
+    throw std::runtime_error("video smart_resize: aspect ratio must be < 200");
+  auto round_by = [factor](int64_t v) -> int64_t {
+    return static_cast<int64_t>(std::nearbyint(static_cast<double>(v) / factor)) * factor;
+  };
+  int64_t h_bar = round_by(height), w_bar = round_by(width);
+  const int64_t t_bar =
+      static_cast<int64_t>(std::ceil(static_cast<double>(num_frames) / temporal_factor)) *
+      temporal_factor;
+  const double area = static_cast<double>(t_bar) * h_bar * w_bar;
+  if (area > static_cast<double>(max_pixels)) {
+    const double beta = std::sqrt(static_cast<double>(num_frames) *
+                                  static_cast<double>(height) * width / max_pixels);
+    h_bar = std::max<int64_t>(factor,
+                              static_cast<int64_t>(std::floor(height / beta / factor)) * factor);
+    w_bar = std::max<int64_t>(factor,
+                              static_cast<int64_t>(std::floor(width / beta / factor)) * factor);
+  } else if (area < static_cast<double>(min_pixels)) {
+    const double beta = std::sqrt(static_cast<double>(min_pixels) /
+                                  (static_cast<double>(num_frames) * height * width));
+    h_bar = static_cast<int64_t>(std::ceil(height * beta / factor)) * factor;
+    w_bar = static_cast<int64_t>(std::ceil(width * beta / factor)) * factor;
+  }
+  return {h_bar, w_bar};
+}
+
+std::vector<double> ComputeVideoTimestamps(const std::vector<int64_t>& frame_indices,
+                                           double video_fps, int merge_size) {
+  std::vector<double> ts;
+  ts.reserve(frame_indices.size());
+  for (int64_t idx : frame_indices)
+    ts.push_back(static_cast<double>(idx) / video_fps);
+  std::vector<double> out;
+  for (size_t i = 0; i + merge_size - 1 < ts.size(); i += static_cast<size_t>(merge_size))
+    out.push_back((ts[i] + ts[i + static_cast<size_t>(merge_size) - 1]) / 2.0);
+  return out;
+}
+
+VideoKwargs Qwen3VLImageProcessor::ProcessVideo(
+    const uint8_t* thwc, int64_t num_frames, int64_t height, int64_t width,
+    const std::vector<int64_t>& frame_indices, double video_fps) const {
+  const int patch = cfg_.patch_size;
+  const int merge = cfg_.merge_size;
+  const int tp = cfg_.temporal_patch_size;
+  const int64_t factor = static_cast<int64_t>(patch) * merge;
+  // Video pixel budget from the video_preprocessor_config size (min/max already
+  // fused into cfg_.min/max_pixels defaults for images; video uses its own bounds
+  // but for the conformant fixture the identity holds regardless — the guard below
+  // rejects any true resize).
+  const auto rs = VideoSmartResize(num_frames, height, width, tp, factor,
+                                   /*min_pixels=*/4096, /*max_pixels=*/25165824);
+  if (rs[0] != height || rs[1] != width) {
+    throw std::runtime_error(
+        "Qwen3VLImageProcessor::ProcessVideo: frame requires resize (" +
+        std::to_string(width) + "x" + std::to_string(height) + " -> " +
+        std::to_string(rs[1]) + "x" + std::to_string(rs[0]) +
+        "); bicubic resize path is deferred (M3c uses conformant frames)");
+  }
+
+  // Pad num_frames up to a multiple of temporal_patch_size by repeating the last
+  // frame (transformers _preprocess:228-232); frame reads clamp to the last real.
+  const int64_t padded = ((num_frames + tp - 1) / tp) * tp;
+  const int64_t grid_t = padded / tp;
+  const int64_t grid_h = height / patch;
+  const int64_t grid_w = width / patch;
+  const int64_t Gh = grid_h / merge;
+  const int64_t Gw = grid_w / merge;
+  const int64_t num_patches = grid_t * grid_h * grid_w;
+  const int64_t feat = static_cast<int64_t>(3) * tp * patch * patch;
+
+  const float shift = static_cast<float>(cfg_.image_mean / cfg_.rescale_factor);
+  const float scale = static_cast<float>(cfg_.image_std / cfg_.rescale_factor);
+
+  VideoKwargs out;
+  out.num_patches = num_patches;
+  out.patch_feature_dim = feat;
+  out.video_grid_thw = {grid_t, grid_h, grid_w};
+  out.timestamps = ComputeVideoTimestamps(frame_indices, video_fps, tp);
+  out.pixel_values_f32.resize(static_cast<size_t>(num_patches * feat));
+  out.pixel_values_bf16.resize(static_cast<size_t>(num_patches * feat));
+
+  const int64_t framestride = height * width * 3;  // THWC uint8 source, per frame
+  const int64_t rowstride = width * 3;
+  // row r enumerates C-order [gt, Gh, Gw, mh, mw]; col k enumerates [c, tp, ph, pw];
+  // source frame = gt*tp + t (2 real frames per temporal group), clamped to last.
+  for (int64_t gt = 0; gt < grid_t; ++gt) {
+    for (int64_t gh = 0; gh < Gh; ++gh) {
+      for (int64_t gw = 0; gw < Gw; ++gw) {
+        for (int64_t mh = 0; mh < merge; ++mh) {
+          for (int64_t mw = 0; mw < merge; ++mw) {
+            const int64_t r =
+                (((gt * Gh + gh) * Gw + gw) * merge + mh) * merge + mw;
+            for (int64_t c = 0; c < 3; ++c) {
+              for (int64_t t = 0; t < tp; ++t) {
+                int64_t frame = gt * tp + t;
+                if (frame >= num_frames) frame = num_frames - 1;  // repeat-last pad
+                const uint8_t* fp = thwc + frame * framestride;
+                for (int64_t ph = 0; ph < patch; ++ph) {
+                  const int64_t H = (gh * merge + mh) * patch + ph;
+                  const int64_t Wbase = (gw * merge + mw) * patch;
+                  for (int64_t pw = 0; pw < patch; ++pw) {
+                    const int64_t W = Wbase + pw;
+                    const uint8_t raw = fp[H * rowstride + W * 3 + c];
+                    const float v = (static_cast<float>(raw) - shift) / scale;
+                    const int64_t k = ((c * tp + t) * patch + ph) * patch + pw;
+                    const size_t idx = static_cast<size_t>(r * feat + k);
+                    out.pixel_values_f32[idx] = v;
+                    out.pixel_values_bf16[idx] = vt::F32ToBF16(v);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<int32_t> BuildVideoRepl(
+    const std::vector<int64_t>& tokens_per_frame,
+    const std::vector<std::vector<int32_t>>& timestamp_token_ids,
+    int32_t vision_start_token_id, int32_t video_token_id,
+    int32_t vision_end_token_id) {
+  if (tokens_per_frame.size() != timestamp_token_ids.size())
+    throw std::runtime_error("BuildVideoRepl: tokens_per_frame vs timestamps length");
+  std::vector<int32_t> out;
+  for (size_t f = 0; f < tokens_per_frame.size(); ++f) {
+    for (int32_t t : timestamp_token_ids[f]) out.push_back(t);
+    out.push_back(vision_start_token_id);
+    out.insert(out.end(), static_cast<size_t>(tokens_per_frame[f]), video_token_id);
+    out.push_back(vision_end_token_id);
+  }
+  return out;
+}
+
 }  // namespace vllm::multimodal
