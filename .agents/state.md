@@ -23201,3 +23201,30 @@ build `~/work/mm-m0m1-cuda`. Resume: `git -C ~/work/mm-m0m1 status`; rerun proce
   `tests/vllm/multimodal/fixtures/qwen3vl_tower/`, weight/ref dumps
   `scripts/mm/m2a_tower_{ref,weight}_dump.py`. NEXT: fork the Qwen3-VL text backbone (MRoPE +
   DeepStack decoder hooks) from the dense forward.
+
+### 2026-07-25 — MULTIMODAL M2b/M2c: Qwen3-VL text-backbone numeric contracts UNIT-GREEN (`CLAIM-MULTIMODAL-M2BC`)
+
+Base `origin/main` `0eed915`; isolated worktree `.claude/worktrees/m2bc` (branch `m2bc-multimodal`). CPU `build-cpu`
++ CPU ctest; dgx used only for the CPU-only vLLM-0.25.0 reference dump under `flock $HOME/gpu.lock`. Not pushed.
+
+LANDED (additive TU only — shared dense forward / runner / registry UNTOUCHED, so text SACRED byte-identical by
+construction): `src/vllm/model_executor/models/qwen3_vl_text.{h,cpp}` — `Qwen3VLGetRopeIndex` (MRoPE 3-D
+`get_rope_index` positions `[3,T]`, single-image/text), `Qwen3VLMergeMultimodal` (`_merge_multimodal_embeddings`
+masked scatter), `Qwen3VLComputeDeepstack` (`_compute_deepstack_embeds` → `[L,T,H]`). KEY FINDING: the 3-section
+MRoPE APPLICATION is the EXISTING `vt::RopeFromCache` mrope path (positions `[3,T]` + `mrope_section` + interleaved,
+both CPU+CUDA) — no new kernel; the gate proves it faithful to `MRotaryEmbedding.forward_native` for Qwen3-VL's
+exact config (interleaved, `section=[24,20,20]`, `rotary_dim=128`, `theta=5e6`).
+
+GATES (`tests/vllm/multimodal/test_qwen3vl_text.cpp`, CPU, no weights) vs the dumped vLLM-0.25.0 reference
+(`scripts/mm/m2b_text_ref_dump.py`, fixtures `tests/vllm/multimodal/fixtures/qwen3vl_text/`) — **85/85 PASS**:
+get_rope_index BIT-exact `[3,204]` (delta −182); MRoPE q/k rel-L2 1.5e-3 (bf16 band), RED interleaved-off >5e-2;
+DeepStack + embed-merge BIT-exact. Clean CPU `-Werror`. Verified: `cd .claude/worktrees/m2bc/build-cpu &&
+cmake --build . --target test_qwen3vl_text && ./tests/test_qwen3vl_text`.
+
+REMAINING (M2c e2e — NOT built): the VL weight loader (`model.language_model.*` remap over the existing
+`LoadQwen3ForCausalLMWeights` layer helpers + `model.visual.*` into the M2a tower weights) + a forked VL decode
+(inputs_embeds instead of embed-from-ids + MRoPE via `vt::RopeFromCache` + DeepStack add after decoder layers 0/1/2
++ merge) + a single-seq greedy loop (scaffold = `tests/vllm/models/test_qwen3_forward.cpp` PagedKvCache/
+CommonAttentionMetadata) → the image token-exact gate vs vLLM 0.25.0 on Qwen3-VL-4B. RISK: the M2a tower is
+bf16-envelope faithful (rel-L2 ~5e-2), so a deterministic vLLM near-tie could flip the argmax — gate form is
+"by measurement" (vLLM K=5 self-determinism), distributional fallback only if measured. NEXT: build the e2e forward.

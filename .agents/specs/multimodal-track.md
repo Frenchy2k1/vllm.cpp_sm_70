@@ -386,16 +386,33 @@ scope audit found the LLM side is NOT the landed plain Qwen3-dense (it needs MRo
   disabled → block0 0.149, tower 0.75, 6 fails). Tower proven faithful in
   ISOLATION — NOT the e2e image result. Additive-only (no runner/model TU) → text
   SACRED byte-identical by construction. compute-sanitizer 0.
-- **M2b — the Qwen3-VL text backbone (NEXT).** MRoPE 3-D position computation
-  (`get_rope_index`) + DeepStack decoder injection (`qwen3_vl.py:1589-1594`:
-  `deepstack_input_embeds_{0,1,2}` added at decoder layers 0/1/2), forked from the
-  landed dense forward. Gated: MRoPE positions + a text-only decode still
-  token-exact.
-- **M2c — merge + e2e IMAGE gate.** `_merge_multimodal_embeddings` masked scatter
-  (`utils.py:524-545`) of the tower's `[:, :2560]` into `input_embeds` +
-  `visual.*`/`language_model.*` weight loading + wire tower→merge→M2b decode →
-  Gate 3 (image token-exact vs vLLM 0.25.0 on Qwen3-VL-4B, fixed image+prompt,
-  greedy; form by measurement). This is the first end-to-end image→text proof.
+- **M2b — the Qwen3-VL text backbone. NUMERIC CONTRACTS UNIT-GREEN (LANDED 2026-07-25,
+  `CLAIM-MULTIMODAL-M2BC`, engine-matrix row `ENG-MM-TEXT-BACKBONE`).** `src/vllm/
+  model_executor/models/qwen3_vl_text.{h,cpp}`: `Qwen3VLGetRopeIndex` (MRoPE 3-D
+  `get_rope_index` positions `[3,T]`, `qwen3_vl.py:2567`/`2482`) + established that the
+  DeepStack decoder injection (`qwen3_vl.py:1589-1594`) is a plain add of
+  `Qwen3VLComputeDeepstack`'s `[L,T,H]` at layers 0/1/2. KEY: the 3-section MRoPE
+  APPLICATION needs NO new kernel — it is the EXISTING `vt::RopeFromCache` mrope path
+  (positions `[3,T]` + `mrope_section` + `mrope_interleaved`), proven faithful to
+  `MRotaryEmbedding.forward_native` for Qwen3-VL's config (interleaved,
+  `section=[24,20,20]`, `rotary_dim=128`, `theta=5e6`). Gate
+  `tests/vllm/multimodal/test_qwen3vl_text.cpp` — 4 RED-first CPU gates PASS 85/85 vs
+  vLLM 0.25.0 (`scripts/mm/m2b_text_ref_dump.py`): get_rope_index BIT-exact, MRoPE
+  q/k rel-L2 1.5e-3 (RED interleaved-off >5e-2), DeepStack + merge BIT-exact.
+  Additive-only ⇒ text SACRED byte-identical by construction. The FORKED VL decode
+  (inputs_embeds + MRoPE + DeepStack inject in a running forward) is part of M2c below.
+- **M2c — merge + e2e IMAGE gate.** `Qwen3VLMergeMultimodal` masked scatter
+  (`_merge_multimodal_embeddings`, `utils.py:524-545`) of the tower's `[:, :2560]` into
+  `input_embeds` is UNIT-GREEN (BIT-exact, landed with M2b). **REMAINING:** the
+  `visual.*`/`language_model.*` weight loading (a name-remap over the landed
+  `LoadQwen3ForCausalLMWeights` layer helpers + the M2a tower weights) + the forked VL
+  decode forward (inputs_embeds instead of embed-from-ids + `vt::RopeFromCache` MRoPE +
+  DeepStack add after layers 0/1/2) + a single-seq greedy loop (scaffold =
+  `tests/vllm/models/test_qwen3_forward.cpp`) → Gate 3 (image token-exact vs vLLM 0.25.0
+  on Qwen3-VL-4B, fixed image+prompt, greedy; form by measurement). This is the first
+  end-to-end image→text proof. RISK: the M2a tower is bf16-envelope faithful (rel-L2
+  ~5e-2), so a deterministic vLLM near-tie could flip the argmax (distributional
+  fallback only if measured per [[near-tie-distributional-gate]]).
 - Hardest risk: DeepStack multi-level injection; vision-tower attention numerics +
   vision RoPE (M2a: PROVEN faithful); MRoPE positions (M2b); the placeholder-merge
   silent-corruption (M2c).

@@ -282,6 +282,25 @@ fail). Build cutlass-ON + FA2 sm_121a banner confirmed; clean CUDA `-Werror` 0 w
 (additive vt ops + a new TU only; no runner/model edit; `git diff --stat` 128 insertions, 0
 deletions). No speed number.
 
+**Multimodal M2b/M2c (Qwen3-VL text-backbone numeric contracts) - UNIT GATES PASS, correctness
+only, `benchmark_binding=false` (2026-07-25, `CLAIM-MULTIMODAL-M2BC`
+[spec](../.agents/specs/multimodal-track.md)).**
+Disposition: **NO throughput measured or claimed - SPEED PENDING (these are the M2b/M2c numeric
+contracts proven in isolation, NOT the e2e image result; M2c still owns the first image token-exact
+gate).** The deterministic pieces that fork the plain Qwen3-dense text path for a vision-conditioned
+decode (`src/vllm/model_executor/models/qwen3_vl_text.{h,cpp}`) are checked against a reference
+dumped from vLLM 0.25.0 (`scripts/mm/m2b_text_ref_dump.py`, CPU oracle on the fixed M1 fixture).
+Gate `tests/vllm/multimodal/test_qwen3vl_text.cpp` **85/85 assertions PASS** (CPU, no weights):
+`get_rope_index` MRoPE 3-D positions `[3,204]` **BIT-exact** (`mrope_position_delta` -182); the
+3-section MRoPE application - proven to be the EXISTING cached-RoPE kernel (`vt::RopeFromCache` with
+positions `[3,T]` + `mrope_section` + interleaved) - q/k rel-L2 **1.5e-3** vs
+`MRotaryEmbedding.forward_native` for Qwen3-VL's config (interleaved, section `[24,20,20]`,
+rotary_dim 128, theta 5e6), within the bf16 envelope (our CPU rope is f32-precise, the reference is
+bf16-rounded); the DeepStack scatter `[3,204,16]` and the embed-merge `[204,16]` are **BIT-exact**.
+RED-first: a wrong MRoPE layout (contiguous split instead of interleaved) drives q rel-L2 **>5e-2**,
+so the gate pins the exact section selection. Clean CPU `-Werror`. Text-inertness holds by
+construction (additive TU only; the shared dense forward is untouched). No speed number.
+
 **GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,
 [spike](../.agents/specs/glm-dsa-latest-deepseek.md)).** The first GLM-family model.
