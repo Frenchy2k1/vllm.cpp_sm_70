@@ -9,7 +9,7 @@ vllm.cpp is a from-scratch C++20 port of [vLLM](https://github.com/vllm-project/
 
 > **Pre-release, under heavy development.** The engine is correctness-complete and speed-competitive for a specific set of models on one GPU (NVIDIA GB10 / DGX Spark, sm_121a), plus a CPU path that matches or beats llama.cpp on GGUF. Read the honest per-feature state in [Features](#features) and [Supported models](#supported-models) below, and the full evidence in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Capabilities are labelled: *correctness-complete* (token-exact vs the vLLM oracle), *speed-pending* (correct, throughput work in progress), *build-only* (compiles for a target with no runtime proof here), and *hardware-blocked* (cannot run on the hardware available).
 
-The reference numbers below are measured against the pinned **vLLM 0.25.0** oracle on GB10, greedy, same workload, same tokens. Where a claim cannot be measured on the hardware here, it is stated as such rather than implied.
+The reference numbers below are measured against the pinned vLLM oracle on GB10, greedy, same workload, same tokens. Where a claim cannot be measured on the hardware here, it is stated as such rather than implied. **The parity pin advanced 2026-07-26 to vLLM 0.26.0.dev0 (`55596792`) + transformers 5.14.1** (from 0.25.0); correctness was re-validated bit-identical on the new oracle (zero golden drift; see [.agents/specs/pin-advance.md](.agents/specs/pin-advance.md)), so the token-exact claims hold against the new pin. Historical speed figures below citing "vLLM 0.25.0" are the last binding measurement against the prior oracle (our engine is unchanged by the advance); a re-benchmark against 0.26 is pending.
 
 ## Features
 
