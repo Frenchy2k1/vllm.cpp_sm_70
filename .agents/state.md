@@ -23933,3 +23933,51 @@ assertions.** RED: qkv-bias disabled → p0 tok0 = 4697 vs 264 (FAIL). memcheck 
 `-Werror` 0 warnings (CUTLASS sm120a + FA2 [121a] + Marlin + Triton-AOT banner confirmed). SPEED
 PENDING (row `ACTIVE`, not `DONE`). Not pushed. NEXT queue: MiniCPM, InternLM2, Command-R, Phi-1/2,
 MiniCPM3.
+
+## 2026-07-26 — Phi-3/Phi-4 (`Phi3ForCausalLM`) gate RESOLVED to a CLEAN PASS (ratified near-tie ROOT-divergence); TEST+goldens only, NO forward change
+
+The held Phi-3/Phi-4 15/16 increment closes. `CLAIM-PHI3-GATE-RESOLVE` (under
+`CLAIM-SWEEP-RECENT-DENSE`), base `origin/main` `93ee0246`, isolated worktree
+`phi3-neartie-gate`; dgx build+capture+gate `~/scratch_phi3_gate` (cutlass 4.5.0 +
+FA2 + Triton arch 121a banner confirmed), all GPU under `flock $HOME/gpu.lock`.
+
+**RCA re-verified on current main (holds exactly).** Both checkpoints vLLM 0.25.0
+per-prompt K=5 ALL-DETERMINISTIC ⇒ STRICT well-posed. With the LANDED per-position
+gate, Phi-4-mini = 15/16 (90/92 assertions), failing ONLY p12 (tok6 gap 1.0). A
+teacher-forced-gap inspection of every position confirmed: every ROOT (first)
+divergence ≤0.5 nats (max 0.5 @ p6 tok2); the ONLY >0.5 positions (p12 tok6/tok8 =
+1.0) are CASCADE downstream of an exact-tie ROOT (p12 tok4 gap 0.0000 — vLLM's own
+teacher-forced argmax IS our token, i.e. vLLM's incremental decode contradicts its
+own argmax at a bf16 tie). NO forward bug. The LongRoPE cos/sin cache is
+BIT-IDENTICAL to vLLM's (`.to(bf16)`, mscale 1.1902380714238083).
+
+**Conversion (mirrors olmo2/qwen3-dense).** `test_phi3_paged_engine` converted to
+the RATIFIED ROOT-divergence gate: teacher-force vLLM on OUR sequence, PASS iff
+every ROOT/first divergence's gap ≤0.5 nats; positions after the root sit on an
+off-greedy-path prefix vLLM never visits and are NOT counted (strict generalization
+of the per-position gate — identical verdict wherever there is no cascade).
+**Phi-4-mini now 16/16** (7 strict + 9 near-tie, 0 forward-divergent, 108 assertions,
+max on-path gap 0.5 @ p6).
+
+**RED-first (gate not vacuously lenient).** Disabling the LongRoPE mscale (1.19→1.0)
+on dgx shifts the ROOTS to 0.75–3.0 nats → 11 ROOT-fails, gate FATAL 5/16; restored
+source+goldens → 16/16 again. A genuine forward bug diverges EARLY, so its root gap
+is caught.
+
+**RATIFIED BIGGER-DENSE STRICT anchor.** Added a 2nd `RunGate` case for
+`microsoft/phi-4` (14B, same `Phi3ForCausalLM` forward, default rope/full rotary,
+GQA 40/10, ~29 GiB bf16, ungated). Downloaded + RUN-verified. vLLM K=5
+ALL-DETERMINISTIC. **phi-4-14B 16/16 with STRICT token-exact 14/16** + 2 exact-tie
+(gap 0.0000), 0 divergent, 134 assertions — the deterministic proof the forward is
+genuinely correct (not near-tie-lucky). Harness + `glm4-neartie-gap.py` made
+EOS-aware (14B emits EOS on 3 short factual prompts; the -1 padding otherwise
+overflowed vLLM's detokenizer). Phi-4-mini re-passed 16/16 after the EOS-aware
+change (no regression).
+
+**Inertness.** `git diff --stat` = the phi3 TEST + 2 golden dirs
+(`goldens/{phi4_mini_greedy,phi4_14b_greedy}/`) + the shared capture script
+`glm4-neartie-gap.py` (EOS-truncation robustness — cannot alter any committed golden
+or other gate). NO src/include/kernel/loader change ⇒ every other model
+byte-identical BY CONSTRUCTION. memcheck N/A (no kernel touched). All seven record
+checkers green by bare RC. `benchmark_binding=false`, SPEED still PENDING (row stays
+`ACTIVE`, not `DONE`). Not pushed; FULL SHA reported.

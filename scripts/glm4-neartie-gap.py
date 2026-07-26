@@ -70,12 +70,23 @@ def main():
         prompt_ids = np.fromfile(
             os.path.join(args.golden_dir, f"p{i}_prompt.i32"), dtype="<i4").tolist()
         our_ids = [int(x) for x in our[i]]
-        full = list(prompt_ids) + our_ids
+        # Our engine STOPS at EOS and the dump pads the remaining positions with -1
+        # (our_ids.i32 is initialized to -1). Those padded positions are NOT real
+        # generations, and feeding a negative id to vLLM's detokenizer overflows, so
+        # teacher-force ONLY the real tokens (prefix up to the first -1). Post-
+        # termination positions get gap 0 (no token to score) and are skipped in the
+        # divergence report. Models that never hit EOS in T tokens are unaffected.
+        L = next((k for k, x in enumerate(our_ids) if x < 0), len(our_ids))
+        real_ids = our_ids[:L]
+        full = list(prompt_ids) + real_ids
         sp = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=args.topk)
         out = llm.generate({"prompt_token_ids": full}, sp)[0]
         plp = out.prompt_logprobs
         P = len(prompt_ids)
         for j in range(T):
+            if j >= L:
+                gap_mnats[i, j] = 0  # our engine terminated (EOS); no real token here
+                continue
             pos = P + j
             d = plp[pos] or {}
             arg_tid = max(d, key=lambda k: d[k].logprob) if d else -1
