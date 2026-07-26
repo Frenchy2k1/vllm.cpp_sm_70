@@ -148,10 +148,22 @@ mscale 1.0), q_lora-always. ONE reuse-not-new shared change: the FA-2 MLA prefil
 qk_head_dim 96→128 to reuse the compiled hdim128 kernel (identity for DeepSeek d=192/GLM d=256).
 RED-first (MLA-specific): wrong rope style → first-token divergence gate-CAUGHT. **DeepSeek-V2-Lite
 re-gated 8/8** (shared-MLA non-regression). `.bin`-only vehicle resolved via trusted torch
-`.bin`→safetensors. Remaining recent-dense rows are the TRIVIAL tail only: Yi (`YiForCausalLM` =
-Llama alias) and InternLM3 (`InternLM3ForCausalLM` = InternLM2 + sliding window). Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
-MoE/SSM campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no
-0.25.0 oracle.
+`.bin`→safetensors. **TRIVIAL-TAIL DONE (2026-07-26, `sweep-yi-internlm3`) — the recent-dense TEXT
+tier is now CLOSED (all 8 families accounted for).** Both remaining rows brought up as Llama
+aliases on the ACTIVE `MODEL-TEXT-llama-llama-for-causal-lm` row (near-zero-work), each W0
+RUN-VERIFIED on the pinned vLLM 0.25.0 oracle (the OLMo-3 lesson): **Yi (`01-ai/Yi-Coder-1.5B-Chat`)
+— VERDICT modern Yi IS the Llama arch (`architectures:["LlamaForCausalLM"]`), ZERO code delta, no
+`YiForCausalLM` alias (vLLM registers none); SACRED 16/16** vs vLLM 0.25.0 (K=5 deterministic ⇒
+STRICT; 13 strict + 3 near-tie, max gap 0.125 nats, 0 divergent). **InternLM3
+(`internlm3-8b-instruct`) — VERDICT a PLAIN Llama alias (`registry.py:134`→llama), NOT
+InternLM2+sliding-window (no `sliding_window` in config; dynamic-NTK rope factor 6.0); ONE additive
+registry-alias line; SACRED 16/16** vs vLLM 0.25.0 (K=5 deterministic ⇒ STRICT; 14 strict + 2
+near-tie, max gap 0.0 nats, 0 divergent). Additive-only ⇒ `Llama-3.2-1B` re-gated 16/16 UNCHANGED.
+**Recent-dense TEXT tier CLOSED:** Granite-3/StableLM/InternLM2/Phi-3-4/Phi-1-2/MiniCPM/MiniCPM3
+SACRED-landed, Command-R HF-gate-blocked, OLMo-3 oracle-pin-blocked, + Yi/InternLM3 landed here.
+Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as MoE/SSM
+campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no 0.25.0
+oracle.
 
 **FRONTIER SWEEP SCOPED (2026-07-25, [sweep-kimi-minimax-glm-latest.md](specs/sweep-kimi-minimax-glm-latest.md),
 `CLAIM-SWEEP-FRONTIER-KMG`):** the three user-named frontier families dispositioned as ACTIONABLE

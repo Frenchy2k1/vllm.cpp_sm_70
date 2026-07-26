@@ -9,6 +9,18 @@
 // llama3 rope-scaling applied, both handled additively inside the shared
 // dense_attn_block.h AttnBlock. So this TU only wires the loader + forward hooks.
 // See .agents/specs/sweep-llama-3.2.md.
+//
+// Registry ALIASES (mirror vLLM 0.25.0 registry.py which maps these arch strings
+// onto ("llama", "LlamaForCausalLM") — the SAME model class): "InternLM3ForCausalLM"
+// (registry.py:134) is InternLM3, a plain Llama arch (RMSNorm + NeoX + GQA +
+// SiLU-SwiGLU, dynamic-NTK rope) — NOT InternLM2 (which has the fused-wqkv
+// interleaved split); the internlm3 checkpoint config carries no sliding_window.
+// Both aliases reuse kLlamaFactory/kLlamaInfo VERBATIM — zero delta beyond the
+// arch-string registration. NOTE on Yi: modern Yi checkpoints (Yi-1.5-*, Yi-Coder-*)
+// declare architectures:["LlamaForCausalLM"] directly, so they resolve to the
+// llama_dense registration below with NO alias; vLLM 0.25.0 registers no
+// "YiForCausalLM", so we add none (mirror the oracle). See
+// .agents/specs/sweep-recent-dense-batch.md (trivial tail).
 #include "vllm/model_executor/models/model_registry.h"
 
 #include <memory>
@@ -126,5 +138,12 @@ v1::KVCacheConfig MakeLlamaForCausalLMKVCache(const HfConfig& config,
 }
 
 REGISTER_VLLM_MODEL(llama_dense, "LlamaForCausalLM", kLlamaFactory, kLlamaInfo)
+
+// InternLM3 (`InternLM3ForCausalLM`, registry.py:134) is a plain Llama arch in vLLM
+// 0.25.0 — the internlm3-8b-instruct checkpoint is RMSNorm + NeoX + GQA(kv=2) +
+// SiLU-SwiGLU with dynamic-NTK rope (factor 6.0, identity within the trained
+// window), no biases, untied lm_head — all handled by the shared dense path. Alias
+// only; zero forward/loader delta.
+REGISTER_VLLM_MODEL(internlm3_llama, "InternLM3ForCausalLM", kLlamaFactory, kLlamaInfo)
 
 }  // namespace vllm

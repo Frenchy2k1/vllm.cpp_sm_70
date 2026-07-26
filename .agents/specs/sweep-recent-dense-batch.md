@@ -1,5 +1,61 @@
 # SPIKE: recent-dense TEXT batch (Phi / Command-R / Granite / StableLM / InternLM2 / MiniCPM / Phi-3-4)
 
+## TRIVIAL-TAIL IMPLEMENTATION UPDATE (2026-07-26, Yi + InternLM3 — base `origin/main` `4fff34f7`, worktree `sweep-yi-internlm3`, dgx `~/vllmcpp-yi-il3`). **CLOSES the recent-dense TEXT tier.**
+
+Both remaining trivial-tail rows brought up as Llama aliases (each a near-zero-work reuse of
+the landed Llama path). **W0 RUN-VERIFIED both on the pinned vLLM 0.25.0 oracle (the OLMo-3
+lesson): both BUILD+RUN a coherent greedy golden**, unlike OLMo-3. Two SACRED gates PASS.
+
+- **Yi (`YiForCausalLM`?) — VERDICT: modern Yi IS the Llama arch, ZERO code delta.** The
+  checkpoints (`01-ai/Yi-1.5-6B-Chat`, `01-ai/Yi-Coder-1.5B-Chat`) declare
+  `architectures:["LlamaForCausalLM"]` / `model_type:"llama"`, so Yi is ALREADY supported by
+  the landed Llama registration — **no `YiForCausalLM` alias added** (the legacy arch id does
+  NOT appear in modern checkpoints AND vLLM 0.25.0 registers no `YiForCausalLM` → mirror the
+  oracle, add none). Gate vehicle `01-ai/Yi-Coder-1.5B-Chat` (ungated, 1.5B, distinct
+  64000-vocab, rope_theta 1e7, GQA). **W0:** vLLM 0.25.0 builds+runs it coherently; per-prompt
+  K=5 ALL-DETERMINISTIC ⇒ STRICT bar. **SACRED gate `test_yi_paged_engine` (dgx GB10): 16/16
+  PASS — 13/16 STRICT token-exact + 3/16 near-tie band, max teacher-forced gap 0.125 nats, 0
+  forward-divergent (140 assertions).** RED is vacuous (zero code delta); the Llama forward is
+  separately STRICT-proven on `Llama-3.2-1B` (re-gated 16/16 UNCHANGED here). TEST + goldens
+  only.
+- **InternLM3 (`InternLM3ForCausalLM`) — VERDICT: a plain Llama alias in vLLM 0.25.0, NOT
+  InternLM2+sliding-window.** The spike's trivial-tail note ("InternLM3 = InternLM2 + sliding
+  window") was WRONG: `registry.py:134` maps `InternLM3ForCausalLM` → `("llama",
+  "LlamaForCausalLM")`, and the `internlm3-8b-instruct` config carries NO `sliding_window` (it
+  is RMSNorm + NeoX + GQA(kv=2) + SiLU-SwiGLU + **dynamic-NTK rope** factor 6.0 / theta 5e7,
+  no biases, untied lm_head, head_dim 128, vocab 128512). **ONE registry ALIAS line** in
+  `llama_registry.cpp` (`REGISTER_VLLM_MODEL(internlm3_llama, "InternLM3ForCausalLM",
+  kLlamaFactory, kLlamaInfo)`) binds it to the landed Llama factory VERBATIM — zero
+  forward/loader delta. Dynamic rope is already gate-proven (InternLM2's dynamic factor-2.0
+  rides `DynamicNTKScalingRotaryEmbedding` and identity-within-window; InternLM3 factor 6.0 is
+  the same path). **W0:** vLLM 0.25.0 builds+runs `internlm/internlm3-8b-instruct` coherently
+  ("Paris.Paris is the capital of France…", "Albert Einstein…"); per-prompt K=5
+  ALL-DETERMINISTIC ⇒ STRICT bar. **SACRED gate `test_internlm3_paged_engine` (dgx GB10): 16/16
+  PASS — 14/16 STRICT token-exact + 2/16 near-tie band, max teacher-forced gap 0.0000 nats, 0
+  forward-divergent (140 assertions).** RED (mutual-confirmation): the plain-Llama alias gates
+  16/16 → InternLM3 does NOT need InternLM2's fused-`wqkv` interleaved de-split (which the
+  InternLM2 row RED-proves is load-bearing for InternLM2); routing InternLM3 through that split
+  would scramble its plain [q|k|v] weights. Alias + TEST + goldens only.
+- **Tokenizer (both, additive vehicle prep):** Yi and internlm3 ship a SentencePiece
+  `tokenizer.model` whose HF form is either absent (`tokenizer.model` only) or a null
+  pre_tokenizer + `Replace " "→"▁"` normalizer that our parser rejects
+  (`tokenizer.cpp:283,345`). Gated ID-based via the `TokensPrompt` path (feeds the oracle's
+  exact prompt ids). `scripts/stage-tokenizer-metaspace.py` (reproducible, gate-neutral)
+  generates a BPE `tokenizer.json` (fast-backend for Yi; direct SentencePiece→BPE extraction
+  for internlm3's custom slow `InternLM3Tokenizer`) and re-expresses whitespace as the
+  equivalent Metaspace pre_tokenizer our parser accepts (MiniCPM precedent). Only affects
+  engine construction + detok display; the forward is ID-gated.
+- **Non-regression:** additive only — `git diff --stat` = one `llama_registry.cpp` alias line +
+  comment, two new tests, CMake, staging script, goldens, records. No shared op/kernel touched
+  ⇒ every other model byte-identical. `Llama-3.2-1B` SACRED re-gated **16/16 UNCHANGED** (I
+  touched `llama_registry.cpp`). Clean CUDA `-Werror` 0 warnings; no kernel touched (no
+  compute-sanitizer needed). **SPEED PENDING** (both eager).
+- **★ TIER STATUS: the recent-dense TEXT tier is CLOSED.** All 8 families accounted for:
+  Granite-3 / StableLM / InternLM2 / Phi-3-4 / Phi-1-2 / MiniCPM / MiniCPM3 SACRED-landed;
+  Command-R HF-gate-blocked (implemented, no ungated real vehicle); OLMo-3 oracle-pin-blocked
+  (implemented, vLLM 0.25.0 can't run it); + Yi (Llama arch, zero delta) and InternLM3 (Llama
+  alias) SACRED-landed here. No trivial-tail rows remain.
+
 ## RANK-9 IMPLEMENTATION UPDATE (2026-07-26, MiniCPM3 — base `origin/main` `a8363c60`, worktree `sweep-minicpm3`, dgx `~/vllmcpp-minicpm3`)
 
 - **rank 9 MiniCPM3 (`MiniCPM3ForCausalLM`, `openbmb/MiniCPM3-4B`) — SACRED 16/16, row `ACTIVE`. CLOSES the non-trivial recent-dense tier** (only the trivial tail — Yi=Llama-alias, InternLM3=InternLM2+sliding-window — would remain).
