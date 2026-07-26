@@ -890,10 +890,38 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
       TPOT spec-ON stays ~67-77 ms across c2-c8 (vs ~105-113 ms spec-OFF). Ours does
       NOT go neutral at c8 (the mixed batch keeps every request drafting).
       **Disposition: ours is ON-PAR-OR-ABOVE vLLM spec-ON at every measured c>1 axis** (output tput within ~+/-2%, ours slightly ahead at c2/c4, within-noise at c8; acceptance on-par 0.84-0.92 vs 0.835), tracking vLLM's ~1.5x spec speedup at every concurrency. The implementation is COMPLETE and at vLLM parity (mixed batch + bit-exact proof, server/CLI flag, c1 win I6). `SPEC-MTP` STAYS `ACTIVE`, NOT flipped to `DONE`, for one honest reason: the DONE criterion's strict `token-exact at c>1` clause is a proven MODEL impossibility — the 27B greedy is bf16-batch-nondeterministic (spec-OFF max_seqs 4-vs-1 differs 2/3 short prompts, no spec involved, affecting vLLM identically), so exact c>1 token identity cannot be met by any correct implementation; c>1 correctness is instead the model-independent bit-exact split/merge proof + acceptance parity (near-tie-distributional-gate), token-exact strict at c1. No lag, no missing work, no lever — the DONE final call is deferred to the user given this criterion ambiguity. Raw logs dgx `~/work/mixed-batch/{cN_results,cN_vresults}`.
-- **M-mtp-2 — 35B k=1 greedy.** Adds only the MoE MTP layer (reuses our MoE
-  blocks) — GDN path identical. Same gates. Caveat: verify unions experts
-  across k+1 tokens/request (more experts touched per step — measure, don't
-  assume the 27B speedup transfers).
+- **M-mtp-2 — 35B k=1 greedy. CLOSED 2026-07-26 (`CLAIM-SPEC-MTP-M-MTP-2`).**
+  Adds only the MoE MTP layer (reuses our MoE blocks) — GDN path identical.
+  Same gates. Caveat: verify unions experts across k+1 tokens/request (more
+  experts touched per step — measure, don't assume the 27B speedup transfers).
+  **RESULT — the full 35B MoE-MTP e2e three-way token gate PASSES; the 27B
+  speedup TRANSFERS to the MoE.** New gate `tests/parity/test_qwen36_spec_decode.cpp`
+  (mirror of the 27B `test_qwen27_spec_decode.cpp` at 35B, MoE draft head
+  `Qwen3_5MTPKind::kMoe` via `model_loader.cpp:582`) drives the pinned M0-exit
+  prompt through the full paged engine with `speculative_config
+  {"method":"mtp","num_speculative_tokens":1}`. RAN on dgx.casa (GB10, cutlass
+  NVFP4 + FA2 ON), 9/9 assertions:
+  - **Three-way token identity, STRICT (deterministic at c1):** our spec-ON ==
+    `qwen36_logits_35b/greedy_ids.npy` (16/16), which is BOTH our spec-OFF
+    (`test_qwen36_paged_engine.cpp`) AND vLLM's greedy. **Confirmed DIRECTLY
+    against the live vLLM 0.25.0 oracle** (`tools/parity/capture_qwen36_spec_greedy.py`,
+    `enforce_eager`, `gpu_memory_utilization=0.45`): vLLM spec-ON greedy AND
+    vLLM spec-OFF greedy BOTH == the anchor, so all four decode paths are
+    token-identical on the 16-token prefix.
+  - **Acceptance (dead-drafter trap closed):** our 16/16 drafts accepted; vLLM's
+    own acceptance 16/16 (rate 1.0) on the same prompt — parity, and the MoE
+    drafter is provably alive.
+  - **c1 SPEED A/B (our engine, spec-ON vs spec-OFF, same binary, 6 prose+code
+    prompts × 128 out, greedy, reproducible across cold/warm σ<1%):** TPOT 11.80
+    vs 14.03 ms (**1.19x faster**), output-tput 78.73 vs 67.68 tok/s (**+16.3%**),
+    E2EL 1569 vs 1820 ms, draft acceptance **0.908** (364/401, in the 27B
+    0.85-0.92 band). The MoE expert-union caveat does NOT erase the speedup.
+  - **spec-OFF byte-identity:** the whole M-mtp-2 landing is a test + capture
+    script + records diff (no source/kernel touched), so the 35B non-spec path
+    is byte-identical and 35B SACRED 315/315 holds by construction
+    (`git diff --stat` = test/docs only). CUDA `-Werror` 0 warnings (test + bench
+    targets); no kernel touched ⇒ compute-sanitizer / device-leakage unchanged.
+  Raw logs dgx `~/mtp35b/vllm.cpp/{gate.log,capON.log,capOFF.log,abON_warm.log,abOFF_warm.log}`.
 - **M-mtp-3 — k>1 + stochastic rejection.** Multi-step decode loop
   (`_multi_step_decode` port; note upstream's own warning that k>1 re-runs the
   SAME single MTP layer and lowers acceptance, `speculative.py:805-813`),
@@ -1000,6 +1028,9 @@ records only). Ledger: `.agents/parity-ledger.md` (2026-07-26 SPEC-MTP DONE row)
 
 **Tracked follow-ons (own live rows, NOT DONE blockers):** the 35B
 `Qwen3_5MoeMTP` full e2e three-way token gate (M-mtp-2,
-`MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` stays `GATING` — mechanism landed +
-proven bit-exact at 35B dims, head oracle-parity, e2e gate pending) and
-`SPEC-DFLASH` (oracle-BLOCKED on vLLM 0.25.0, vllm#40898).
+`MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp`) is now **CLOSED — `DONE` 2026-07-26**
+(three-way token-exact 16/16 vs the live vLLM 0.25.0 oracle, acceptance 16/16
+both sides, c1 spec-ON 1.19x/+16.3% vs spec-OFF; see §5 M-mtp-2 RESULT). MTP
+spec-decode is therefore `DONE` on BOTH gate models (27B `Qwen3_5MTP` + 35B
+`Qwen3_5MoeMTP`). Remaining spec-decode follow-on: `SPEC-DFLASH` (oracle-BLOCKED
+on vLLM 0.25.0, vllm#40898).

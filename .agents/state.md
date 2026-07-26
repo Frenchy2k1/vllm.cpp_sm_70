@@ -24390,3 +24390,39 @@ surfaces (coordination note, roadmap SCOPED note, this entry, ledger, README,
 BENCHMARKS) ONLY; ZERO `src/`/`include/`/`tests/` touched ⇒ SACRED gates
 byte-identical by construction (not re-run). Oracle venv NOT touched. All seven
 record checkers green by bare RC. NOT pushed; FULL SHA reported to caller.
+
+---
+
+## 2026-07-26 — M-mtp-2: 35B `Qwen3_5MoeMTP` MTP k=1 e2e gate PASSES → `DONE` (`CLAIM-SPEC-MTP-M-MTP-2`)
+
+The LAST owed MTP gate. The 35B MoE-MTP mechanism was already landed + bit-exact at
+35B dims (I4/I5a mixed-batch split/merge + GDN spec rollback) + head oracle-parity
+(M-mtp-0); only the full e2e three-way token gate was owed. **It now PASSES.**
+
+- **Test (new, mirror of the 27B):** `tests/parity/test_qwen36_spec_decode.cpp`
+  drives the pinned M0-exit prompt through the full paged engine with
+  `speculative_config {"method":"mtp","num_speculative_tokens":1}`; the MoE draft
+  head is selected automatically (`Qwen3_5MTPKind::kMoe`, `model_loader.cpp:582`).
+- **Oracle capture (new):** `tools/parity/capture_qwen36_spec_greedy.py` ran vLLM
+  0.25.0 spec-ON and spec-OFF on dgx (`enforce_eager`, `gpu_mem 0.45`).
+- **RESULT (dgx GB10, cutlass NVFP4 + FA2 ON, `-Werror` 0 warn, 9/9 assertions,
+  RAN):** three-way token identity STRICT at c1 — our spec-ON == our spec-OFF
+  (`test_qwen36_paged_engine`) == vLLM 0.25.0 spec-ON == vLLM 0.25.0 spec-OFF,
+  16/16 vs the `qwen36_logits_35b/greedy_ids` anchor (both vLLM sides confirmed
+  DIRECTLY, `prefix16_matches_anchor: true`). Acceptance 16/16 both sides (vLLM
+  rate 1.0 == ours; dead-drafter trap closed). c1 our-engine A/B spec-ON vs
+  spec-OFF (same binary, 6 prose+code x 128 out, warm, σ<1%): TPOT 11.80 vs 14.03
+  ms (1.19x), output-tput 78.73 vs 67.68 tok/s (+16.3%), acceptance 0.908 — the
+  27B MoE speedup TRANSFERS.
+- **Byte-identity:** ZERO `src/`/`include/`/`examples/` changes ⇒ 35B spec-OFF path
+  byte-identical, 35B SACRED 315/315 holds by construction (`git diff --stat` =
+  test/docs only); no kernel touched ⇒ compute-sanitizer / `check-device-leakage`
+  unchanged.
+- **MTP k=1 spec-decode is now `DONE` on BOTH gate models** (27B `Qwen3_5MTP` +
+  35B `Qwen3_5MoeMTP`). Records advanced: model-matrix (row + checklist + rollup
+  GATING 2→1 / DONE 1→2), mtp-spec-decode.md §5 M-mtp-2 + §9, engine-matrix
+  `SPEC-MTP` follow-on, roadmap C3, README, BENCHMARKS, ledger, coordination.
+
+**Remaining spec-decode follow-on:** `SPEC-DFLASH` (oracle-BLOCKED on vLLM 0.25.0,
+vllm#40898). Raw dgx logs `~/mtp35b/vllm.cpp/{gate.log,capON.log,capOFF.log,abON_warm.log,abOFF_warm.log}`.
+NOT pushed; FULL SHA reported in the session.
