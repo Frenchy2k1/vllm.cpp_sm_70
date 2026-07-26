@@ -45,7 +45,7 @@ additive drop-in.
 ## CUDA compiler branches
 
 The global target list is selected by the CUDA compiler version at
-`/home/mudler/_git/vllm/CMakeLists.txt:105-118`.
+`${VLLM_SOURCE}/CMakeLists.txt:105-118`.
 
 | Compiler branch | Global numeric targets | Count |
 |---|---|---:|
