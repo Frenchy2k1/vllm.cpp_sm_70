@@ -187,6 +187,32 @@ unchanged) - EMPIRICAL WITNESS from the clean build: **Gemma-3 48/48, Qwen3-dens
 the identical `logits_soft_cap==0` path and are byte-identical by construction; not
 re-run this pass (GB10 GPU time / unified-memory OOM safety).
 
+**MULTIMODAL SPEED - MEASURED, c1, vs vLLM 0.25.0 GRAPHED (2026-07-26,
+`CLAIM-MULTIMODAL-SPEED` [spec](../.agents/specs/multimodal-speed.md)).**
+`benchmark_binding=false` (not a production-default serving binding: our mm path is a
+single-sequence test driver, no batched/server mm ingestion; vLLM graphed is the
+honest denominator). dgx GB10 sm_121a, our build cutlass 4.5.0 + FA2 + Triton (arch
+121a); GPU under `flock`, engine and oracle never co-resident; cold rep discarded.
+**Qwen3.6-27B IMAGE** (448x448, 214-tok prompt): our vision **tower 2114 ms**
+(2091-2126) vs vLLM encode (<=~250 ms, a subset of its 321 ms graphed TTFT) =
+**~10x, THE gap**; our LLM **prefill 326 ms** ~ vLLM TTFT 321 ms = **at parity**; our
+**decode TPOT 225.0 ms/tok** (224.9-225.1) vs vLLM graphed **226.9** (226.8-227.0) =
+**0.99x, AT PARITY** (the 226 ms/tok is the ~54 GiB bf16 weight-streaming floor at c1
+- both engines sit on it). Time-to-first-token ~2.44 s ours vs 0.32 s vLLM (7.6x, all
+tower). Proof-of-run: the timed driver still asserts 32/32 token-exact vs golden.
+**Verdict: decode + prefill at parity; the ENTIRE gap is the vision encoder tower;
+NOT host-bound at c1.** **Qwen3.6-27B VIDEO:** decode at parity by construction (shared
+driver), tower is the gap (per-frame windowed attn) - not separately timed.
+**Voxtral-Mini-3B AUDIO:** vLLM graphed denominator captured (**TTFT 43 ms, TPOT
+41 ms/tok**, 388-tok prompt); **our-side UNMEASURED** - blocked (no A3 binary on a
+reusable dgx tree; dgx disk 100% full makes building it ENOSPC-risky). Because the 3B
+decode is cheap (~41 ms), audio is where our eager-driver per-token host overhead
+would NOT be hidden - the top follow-on measurement. Ranked levers (spec S5): (1)
+vision-tower kernel efficiency (~90% of first-token gap; nsys the tower, suspect
+vision attn not on FA2 varlen), (2) route mm decode through the graphed paged runner
+(neutral c1-27B, the lever for audio/c2+), (3) batched mm serving (structural, needed
+for c2+). No trivial win surfaced; no source touched.
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =
