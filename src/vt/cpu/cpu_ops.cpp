@@ -1829,6 +1829,78 @@ void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key
   });
 }
 
+// DFlash in-block attention (SPEC-DFLASH D2, DF-DRAFT-MODEL) — the CPU REFERENCE
+// for the project's first non-causal / bidirectional attention. Semantics ported
+// from DFlashQwen3Attention + _resolve_layer_attention (qwen3_dflash.py:86-146,
+// 149-263 @ 555967922). For each request block [cu[r],cu[r+1]) and query i in the
+// block, attend over keys j in the SAME block:
+//   - full-attention layer (args.causal==false): ALL j (BIDIRECTIONAL, no mask);
+//   - SWA layer (args.causal==true): j <= i AND (window<=0 || j >= i-(window-1)).
+// f32 online softmax (max-subtracted), GQA broadcast (q-head h reads kv-head
+// h/(Hq/Hk)). Same three-pass structure as AttentionKernel, generalized to
+// per-block bounds + a bidirectional/window mask. This is the authoritative
+// reference; the CUDA kernel mirrors this recurrence.
+void DFlashBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key,
+                                const Tensor& value, const DFlashBlockAttentionArgs& args) {
+  const int64_t hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  const int64_t qpk = hq / hk;  // q-heads per kv-head (GQA ratio)
+  const float scale = args.scale;
+  const int64_t window = args.sliding_window;
+  const bool causal = args.causal;
+  const int num_reqs = args.num_reqs;
+  const int32_t* cu = args.cu_seqlens;
+  // Row-chunked over (head, request-block, query) triples. Each row does its own
+  // block-local softmax; blocks never attend across their boundary.
+  ForRows(hq * static_cast<int64_t>(num_reqs), [&](int64_t r0, int64_t r1) {
+    std::vector<float> probs;
+    std::vector<float> acc(static_cast<size_t>(d));
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t h = r % hq;
+      const int64_t req = r / hq;
+      const int64_t g = h / qpk;
+      const int64_t qs = cu[req];
+      const int64_t qe = cu[req + 1];
+      const int64_t blen = qe - qs;
+      probs.resize(static_cast<size_t>(blen));
+      for (int64_t ii = 0; ii < blen; ++ii) {
+        const int64_t i = qs + ii;  // global row; intra-block offset = ii
+        // Visible key range within the block (intra-block offsets [jlo,jhi]).
+        const int64_t jhi = causal ? ii : blen - 1;
+        int64_t jlo = 0;
+        if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+        const int64_t qoff = (i * hq + h) * d;
+        // Pass 1: scores + running max.
+        float m = -std::numeric_limits<float>::infinity();
+        for (int64_t jj = jlo; jj <= jhi; ++jj) {
+          const int64_t koff = ((qs + jj) * hk + g) * d;
+          float dot = 0.0f;
+          for (int64_t e = 0; e < d; ++e) dot += LoadF32(query, qoff + e) * LoadF32(key, koff + e);
+          dot *= scale;
+          probs[static_cast<size_t>(jj)] = dot;
+          if (dot > m) m = dot;
+        }
+        // Pass 2: exp + denom.
+        float denom = 0.0f;
+        for (int64_t jj = jlo; jj <= jhi; ++jj) {
+          float e = std::exp(probs[static_cast<size_t>(jj)] - m);
+          probs[static_cast<size_t>(jj)] = e;
+          denom += e;
+        }
+        const float inv = 1.0f / denom;  // >= 1 (the j==i term is exp(0)=1 for both masks)
+        // Pass 3: weighted sum of v.
+        for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
+        for (int64_t jj = jlo; jj <= jhi; ++jj) {
+          const float p = probs[static_cast<size_t>(jj)] * inv;
+          const int64_t voff = ((qs + jj) * hk + g) * d;
+          for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += p * LoadF32(value, voff + e);
+        }
+        for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
+      }
+    }
+  });
+}
+
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). Elementwise fusions of the
 // small host-side loops between the big decode ops; all math f32, dims inferred
 // from the tensor shapes.
@@ -2203,6 +2275,9 @@ struct Registrar {
     // optimization); byte-identical to kAttention on CPU.
     RegisterOp(OpId::kAttentionDenseFast, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
+    RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernel)));
     RegisterOp(OpId::kCastBf16, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kCPU,

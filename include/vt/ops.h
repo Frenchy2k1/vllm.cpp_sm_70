@@ -104,6 +104,7 @@ enum class OpId : uint8_t {
   kMoeCombine,
   kAttention,
   kAttentionDenseFast,
+  kDFlashBlockAttention,
   kReshapeAndCache,
   kConcatAndCacheMla,
   kMlaDecodeAttention,
@@ -355,6 +356,36 @@ struct AttentionArgs {
   // Causal masking: key position j attends only when j <= query position i.
   // Always true for the M0.9 decoder path (bidirectional is a M1.6+ concern).
   bool causal = true;
+};
+
+// Arguments for vt::DFlashBlockAttention — the DFlash draft's IN-BLOCK attention
+// (SPEC-DFLASH D2, DF-DRAFT-MODEL; the project's FIRST bidirectional/non-causal
+// attention primitive). Ported from the semantics of DFlashQwen3Attention +
+// _resolve_layer_attention (vllm/model_executor/models/qwen3_dflash.py:86-146,
+// 149-263 @ 555967922) and grounded in flashinfer's non-causal attention path
+// (the #48167 Blackwell non-causal kernel now in-pin). This op computes attention
+// for the uniform (1+k)-token QUERY block of each request over the keys IN THAT
+// SAME block only (the context K/V is pre-inserted separately by the D3
+// context-KV precompute; D2 isolates the block forward). Kept a SEPARATE op from
+// vt::Attention / vt::PagedAttention so every CAUSAL model stays byte-identical.
+//
+// Per-request block boundaries come from `cu_seqlens` (host, length num_reqs+1):
+// request r owns query/key rows [cu_seqlens[r], cu_seqlens[r+1]). Each query i in
+// the block attends to keys j in the same block subject to:
+//   - full-attention layer  (causal=false): ALL j in the block (BIDIRECTIONAL);
+//   - sliding-window layer   (causal=true):  j <= i AND j >= i-(window-1)
+//     (window<=0 means plain causal). Positions are the intra-block offsets, which
+//     matches DFlash's contiguous (1+k) block; the z-lab 27B window (2048) >> 17
+//     so the SWA layer degenerates to plain causal over the block — the mask still
+//     computes the true window bound for fidelity to other DFlash checkpoints.
+// f32 softmax accumulation (max-subtracted), matching vLLM. GQA broadcast as in
+// vt::Attention. query [T,Hq,D], key/value [T,Hkv,D], out [T,Hq,D], T = ΣblockLen.
+struct DFlashBlockAttentionArgs {
+  float scale = 0.0f;              // head_dim^-0.5 (DFlashQwen3Attention.scaling)
+  bool causal = false;            // per-layer: false=full(non-causal), true=SWA
+  int64_t sliding_window = 0;     // SWA window (>0); 0 = full causal when causal
+  const int32_t* cu_seqlens = nullptr;  // host, length num_reqs+1 (block bounds)
+  int num_reqs = 1;               // number of query blocks
 };
 
 // Backend-neutral local-attention window, matching FlashAttention's
@@ -633,6 +664,8 @@ using MoeCombineGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&);
 using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const AttentionArgs&);
+using DFlashBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                        const Tensor&, const DFlashBlockAttentionArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
 using ConcatAndCacheMlaFn =
@@ -1667,6 +1700,18 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
 // Attention (byte-identical there). Separate op so kAttention stays untouched.
 void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                         const Tensor& value, const AttentionArgs& args);
+
+// DFlash in-block attention (SPEC-DFLASH D2, DF-DRAFT-MODEL) — the project's FIRST
+// non-causal / bidirectional attention primitive. See DFlashBlockAttentionArgs for
+// the full contract. Per request block [cu_seqlens[r], cu_seqlens[r+1]), each query
+// attends to keys IN THAT BLOCK: BIDIRECTIONAL when args.causal is false (the
+// DFlash full-attention layers, qwen3_dflash.py _resolve_layer_attention -> causal
+// False), causal-within-window when args.causal is true (the SWA layers). f32
+// online softmax, GQA broadcast. A SEPARATE op from vt::Attention/PagedAttention so
+// the causal decoder path used by every other model is byte-identical. CUDA impl
+// mirrors AttentionKernel's block-reduction recurrence; CPU is the reference.
+void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                          const Tensor& value, const DFlashBlockAttentionArgs& args);
 
 // --- Paged KV-cache write (M1.6). Semantics ported from the FlashAttention
 // path of vllm/csrc/.../cache_kernels.cu::reshape_and_cache_flash @ e24d1b24;

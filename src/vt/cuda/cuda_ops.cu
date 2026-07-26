@@ -1188,6 +1188,129 @@ void AttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tenso
 }
 
 // ---------------------------------------------------------------------------
+// DFlash in-block attention (SPEC-DFLASH D2, DF-DRAFT-MODEL) — the project's FIRST
+// non-causal / bidirectional attention CUDA kernel. Mirrors AttentionKernel's
+// one-block-per-(query,head) block-reduction online-softmax recurrence EXACTLY
+// (same f32 accumulation), generalized to (a) per-request BLOCK bounds so a query
+// attends only within its own (1+k) block and (b) a BIDIRECTIONAL (non-causal) or
+// causal-within-window mask per DFlashQwen3Attention (_resolve_layer_attention,
+// qwen3_dflash.py:86-146). Kept a SEPARATE op so the causal kAttention used by the
+// text/audio paths is byte-identical. `cu` is a device copy of cu_seqlens
+// (num_reqs+1); each block linearly finds its request (num_reqs is small).
+template <typename Tin, typename Tout>
+__global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Tin* key,
+                                           const Tin* value, const int32_t* cu, int num_reqs,
+                                           int64_t hq, int64_t hk, int64_t d, float scale,
+                                           bool causal, int64_t window) {
+  const int64_t i = blockIdx.x;  // GLOBAL query row
+  const int64_t h = blockIdx.y;  // q-head
+  const int64_t g = h / (hq / hk);
+  // Find the request block owning row i (small num_reqs; the uniform DFlash case
+  // is num_reqs blocks of 1+k). qs/qe are GLOBAL row bounds of the block.
+  int64_t qs = 0, qe = 0;
+  for (int r = 0; r < num_reqs; ++r) {
+    if (i >= cu[r] && i < cu[r + 1]) {
+      qs = cu[r];
+      qe = cu[r + 1];
+      break;
+    }
+  }
+  const int64_t ii = i - qs;                       // intra-block query offset
+  const int64_t jhi = causal ? ii : (qe - qs - 1);  // last visible intra-block key
+  int64_t jlo = 0;
+  if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+  const int64_t qoff = (i * hq + h) * d;
+
+  extern __shared__ float smem[];
+  float* acc = smem;                   // [d] running output accumulator
+  float* red = smem + d;               // [blockDim.x] reduction scratch
+  __shared__ float s_score, s_m, s_l;  // block-wide score / running max / denom
+  for (int64_t e = threadIdx.x; e < d; e += blockDim.x) acc[e] = 0.0f;
+  if (threadIdx.x == 0) {
+    s_m = -CUDART_INF_F;
+    s_l = 0.0f;
+  }
+  __syncthreads();
+
+  for (int64_t jj = jlo; jj <= jhi; ++jj) {
+    const int64_t koff = ((qs + jj) * hk + g) * d;
+    float part = 0.0f;
+    for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
+      part += Load(query, qoff + e) * Load(key, koff + e);
+    red[threadIdx.x] = part;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) s_score = red[0] * scale;
+    __syncthreads();
+
+    const float s = s_score;
+    const float m_new = fmaxf(s_m, s);
+    const float corr = expf(s_m - m_new);  // 0 on the first key (s_m == -inf)
+    const float p = expf(s - m_new);
+    const int64_t voff = ((qs + jj) * hk + g) * d;
+    for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
+      acc[e] = acc[e] * corr + p * Load(value, voff + e);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      s_l = s_l * corr + p;
+      s_m = m_new;
+    }
+    __syncthreads();
+  }
+
+  const float inv = 1.0f / s_l;
+  for (int64_t e = threadIdx.x; e < d; e += blockDim.x) Store(out, qoff + e, acc[e] * inv);
+}
+
+template <typename Tin>
+void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query,
+                                const Tensor& key, const Tensor& value,
+                                const DFlashBlockAttentionArgs& args) {
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  if (t == 0 || hq == 0 || d == 0) return;
+  // Upload cu_seqlens (host, num_reqs+1) to a stream-ordered device scratch.
+  const size_t cub = static_cast<size_t>(args.num_reqs + 1) * sizeof(int32_t);
+  int32_t* d_cu = nullptr;
+  Check(cudaMallocAsync(&d_cu, cub, s), "dflash-block-attn cu malloc");
+  Check(cudaMemcpyAsync(d_cu, args.cu_seqlens, cub, cudaMemcpyHostToDevice, s),
+        "dflash-block-attn cu upload");
+  const dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq));
+  const size_t shmem = (static_cast<size_t>(d) + kBlock) * sizeof(float);
+  switch (out.dtype) {
+    case DType::kF32:
+      DFlashBlockAttentionKernel<Tin, float><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,
+          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);
+      break;
+    case DType::kBF16:
+      DFlashBlockAttentionKernel<Tin, __nv_bfloat16><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,
+          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);
+      break;
+    default: VT_CHECK(false, "cuda dflash-block-attn: unsupported out dtype");
+  }
+  Check(cudaGetLastError(), "dflash-block-attn launch");
+  Check(cudaFreeAsync(d_cu, s), "dflash-block-attn cu free");
+}
+
+void DFlashBlockAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                                    const Tensor& value, const DFlashBlockAttentionArgs& args) {
+  switch (query.dtype) {
+    case DType::kF32:
+      LaunchDFlashBlockAttention<float>(AsStream(q), out, query, key, value, args);
+      break;
+    case DType::kBF16:
+      LaunchDFlashBlockAttention<__nv_bfloat16>(AsStream(q), out, query, key, value, args);
+      break;
+    default: VT_CHECK(false, "cuda dflash-block-attn: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // AttentionDenseFast — a WARP-scoped variant of the AttentionKernel above with
 // the IDENTICAL online-softmax recurrence (flash-style, f32 accumulation), for
 // dense full/causal attention over small head_dim (the Qwen3-VL vision tower:
@@ -1479,6 +1602,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernelCuda)));
     RegisterOp(OpId::kAttentionDenseFast, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionDenseFastKernelCuda)));
+    RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernelCuda)));
     RegisterOp(OpId::kFusedChain, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernelCuda)));
   }
