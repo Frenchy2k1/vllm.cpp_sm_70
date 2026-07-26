@@ -124,6 +124,16 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
         input.hidden_tap, input.logits_indices);
   }
 
+  // SPEC-DFLASH D1 (DF-AUX-TAPS): non-null routes to ForwardDeviceMultiTap
+  // (byte-identical logits + the [T,H×taps] aux capture); null is byte-identical to
+  // the path below. Mutually exclusive with hidden_tap.
+  if (input.aux_tap != nullptr) {
+    return Qwen3_5DenseModel::ForwardDeviceMultiTap(
+        input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
+        input.attn_kv, input.gdn_state, weights, input.config, input.queue,
+        input.aux_tap, input.logits_indices);
+  }
+
   const bool fp4_cuda =
       platforms::GetPlatform(input.queue.device.type).cutlass_fp4_supported() &&
       !weights.layers.empty() &&

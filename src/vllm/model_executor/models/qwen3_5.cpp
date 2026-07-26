@@ -5667,6 +5667,56 @@ static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 }
 
+// DFlash DF-AUX-TAPS (SPEC-DFLASH D1) — capture the residual-stream value at a
+// decoder-layer boundary into the aux-taps buffer. Called after each RunLayerPaged
+// with the JUST-RUN layer index `l`; if `l` is in `aux_layer_ids`, it writes
+// (hidden + res) — the exact value vLLM appends at eagle3 aux key l+1
+// (interfaces.py:1382 `hidden_states + residual`) — as bf16 into the k-th [T,H]
+// column block of `aux_out` = [T, H×taps], where k is l's index in aux_layer_ids
+// (so column order == ascending layer_ids == cat(aux, dim=-1)). INERT when
+// `aux_out` is null: no shipped forward passes a buffer, so the object code on the
+// default/MTP-spec path is byte-identical (identical discipline to the single tap).
+// The strided per-tap write is a T-row copy loop; DFlash captures on small query
+// blocks and this path is unused in production until D4, so a fused column scatter
+// is deferred (D-later perf, not correctness).
+// DFlash DF-AUX-TAPS layer-id contract: the target_layer_ids must be non-empty,
+// STRICTLY ASCENDING (the capture-order == concat-order invariant, matching vLLM's
+// increasing-layer_idx aux append), and each in [0, num_hidden_layers). A wrong or
+// out-of-order id list is a construction bug, not a runtime near-tie — fail loud.
+static void ValidateAuxTapLayerIds(const std::vector<int32_t>& layer_ids,
+                                   int64_t num_hidden_layers) {
+  VT_CHECK(!layer_ids.empty(), "qwen3_5 aux tap: layer_ids must be non-empty");
+  for (size_t k = 0; k < layer_ids.size(); ++k) {
+    VT_CHECK(layer_ids[k] >= 0 &&
+                 static_cast<int64_t>(layer_ids[k]) < num_hidden_layers,
+             "qwen3_5 aux tap: target_layer_id out of [0, num_hidden_layers)");
+    VT_CHECK(k == 0 || layer_ids[k] > layer_ids[k - 1],
+             "qwen3_5 aux tap: target_layer_ids must be strictly ascending "
+             "(capture order == concat order)");
+  }
+}
+
+static void MaybeCaptureAuxTap(Dev d, int64_t l,
+                               const std::vector<int32_t>* aux_layer_ids,
+                               const Tensor* aux_out, const Tensor& hidden,
+                               const Tensor& res, int64_t T, int64_t H) {
+  if (aux_out == nullptr) return;
+  for (size_t k = 0; k < aux_layer_ids->size(); ++k) {
+    if (static_cast<int64_t>((*aux_layer_ids)[k]) != l) continue;
+    DBuf tmp(d, DType::kBF16, {T, H});
+    Tensor tt = tmp.t();
+    vt::Add(d.q, tt, hidden, res);  // bf16 (hidden+res); matches eagle3 aux value
+    const size_t row_bytes = static_cast<size_t>(H) * vt::SizeOf(DType::kBF16);
+    const int64_t taps = aux_out->shape[1] / H;
+    const size_t dst_pitch = static_cast<size_t>(taps) * row_bytes;
+    char* dst0 = static_cast<char*>(aux_out->data) + static_cast<size_t>(k) * row_bytes;
+    const char* src0 = static_cast<const char*>(tt.data);
+    for (int64_t t = 0; t < T; ++t)
+      d.b.Copy(d.q, dst0 + static_cast<size_t>(t) * dst_pitch,
+               src0 + static_cast<size_t>(t) * row_bytes, row_bytes);
+  }
+}
+
 // The CAPTURABLE paged forward region: everything AFTER the embedding — the
 // residual stream (res=0), the N paged decoder layers, the final RMSNorm and the
 // lm_head — returning the [T,vocab] f32 logits as a device DBuf (NO host
@@ -5687,7 +5737,9 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const std::vector<GdnStateCache>& gdn_state,
                           const Qwen3_5MoeWeights& weights, const HfConfig& config,
                           const std::vector<int32_t>& logits_indices = {},
-                          const Tensor* hidden_tap = nullptr) {
+                          const Tensor* hidden_tap = nullptr,
+                          const std::vector<int32_t>* aux_layer_ids = nullptr,
+                          const Tensor* aux_out = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -5726,6 +5778,9 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunLayerPaged(d, layer, config, hidden, res, sdi, attn_meta, gdn_meta,
                   kv, gs, T);
+    // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
+    // (no-op) when aux_out is null — every non-DFlash caller.
+    MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
   }
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
@@ -5783,13 +5838,16 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const std::vector<GdnStateCache>& gdn_state,
                         const Qwen3_5MoeWeights& weights, const HfConfig& config,
                         const std::vector<int32_t>& logits_indices = {},
-                        const Tensor* hidden_tap = nullptr) {
+                        const Tensor* hidden_tap = nullptr,
+                        const std::vector<int32_t>* aux_layer_ids = nullptr,
+                        const Tensor* aux_out = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   DBuf hidden(d, DType::kBF16, {T, H});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
-                       gdn_state, weights, config, logits_indices, hidden_tap);
+                       gdn_state, weights, config, logits_indices, hidden_tap,
+                       aux_layer_ids, aux_out);
 }
 
 // Shared shape/count validation for the paged forward entry points.
@@ -6057,6 +6115,39 @@ ForwardLogits Qwen3_5Model::ForwardDeviceTap(
     hidden_out->storage = std::shared_ptr<void>(
         storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
   }
+  return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
+}
+
+ForwardLogits Qwen3_5Model::ForwardDeviceMultiTap(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue, Qwen3_5AuxTaps* aux_out,
+    const std::vector<int32_t>& logits_indices) {
+  CheckPagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                    gdn_state, weights, config);
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  if (aux_out == nullptr) {
+    return ForwardDevice(token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                         gdn_state, weights, config, queue, logits_indices);
+  }
+  ValidateAuxTapLayerIds(aux_out->layer_ids, config.num_hidden_layers);
+  const int64_t taps = static_cast<int64_t>(aux_out->layer_ids.size());
+  // Owning [T, H×taps] bf16 buffer, filled column-block per tap by the inert
+  // aux-tap hook (MaybeCaptureAuxTap); moved into aux_out for the DFlash drafter.
+  DBuf aux(d, DType::kBF16, {T, H * taps});
+  const Tensor aux_view = aux.t();
+  DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                             gdn_state, weights, config, logits_indices,
+                             /*hidden_tap=*/nullptr, &aux_out->layer_ids, &aux_view);
+  aux_out->tensor = aux.t();
+  const size_t allocation = aux.alloc_bytes();
+  void* storage = aux.Release();
+  aux_out->storage = std::shared_ptr<void>(
+      storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 
@@ -6391,7 +6482,9 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                                const HfConfig& config,
                                const std::vector<int32_t>& logits_indices = {},
                                const Tensor* hidden_tap = nullptr,
-                               const std::vector<float>* mrope_cos_sin = nullptr) {
+                               const std::vector<float>* mrope_cos_sin = nullptr,
+                               const std::vector<int32_t>* aux_layer_ids = nullptr,
+                               const Tensor* aux_out = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -6445,6 +6538,9 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
                        gdn_meta, kv, gs, T);
+    // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
+    // (no-op) when aux_out is null — every non-DFlash caller.
+    MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
   }
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
@@ -6496,7 +6592,9 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                              const Qwen3_5DenseWeights& weights,
                              const HfConfig& config,
                              const std::vector<int32_t>& logits_indices,
-                             const Tensor* hidden_tap = nullptr) {
+                             const Tensor* hidden_tap = nullptr,
+                             const std::vector<int32_t>* aux_layer_ids = nullptr,
+                             const Tensor* aux_out = nullptr) {
   CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
@@ -6504,7 +6602,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DBuf hidden(d, DType::kBF16, {T, H});
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
-                            gdn_state, weights, config, logits_indices, hidden_tap);
+                            gdn_state, weights, config, logits_indices, hidden_tap,
+                            /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out);
 }
 
 std::vector<float> Qwen3_5DenseModel::Forward(
@@ -6898,6 +6997,36 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceTap(
     hidden_out->storage = std::shared_ptr<void>(
         storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
   }
+  return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
+}
+
+ForwardLogits Qwen3_5DenseModel::ForwardDeviceMultiTap(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state,
+    const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
+    Qwen3_5AuxTaps* aux_out, const std::vector<int32_t>& logits_indices) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  if (aux_out == nullptr) {
+    return ForwardDevice(token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                         gdn_state, weights, config, queue, logits_indices);
+  }
+  ValidateAuxTapLayerIds(aux_out->layer_ids, config.num_hidden_layers);
+  const int64_t taps = static_cast<int64_t>(aux_out->layer_ids.size());
+  DBuf aux(d, DType::kBF16, {T, H * taps});
+  const Tensor aux_view = aux.t();
+  DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
+                                  attn_kv, gdn_state, weights, config,
+                                  logits_indices, /*hidden_tap=*/nullptr,
+                                  &aux_out->layer_ids, &aux_view);
+  aux_out->tensor = aux.t();
+  const size_t allocation = aux.alloc_bytes();
+  void* storage = aux.Release();
+  aux_out->storage = std::shared_ptr<void>(
+      storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 

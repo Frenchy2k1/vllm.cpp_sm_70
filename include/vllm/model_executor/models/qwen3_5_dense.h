@@ -220,6 +220,23 @@ class Qwen3_5DenseModel {
       Qwen3_5MTPHiddenStates* hidden_out,
       const std::vector<int32_t>& logits_indices = {});
 
+  // ForwardDevice + the DFlash multi-layer aux hidden taps (SPEC-DFLASH D1,
+  // DF-AUX-TAPS). Byte-identical logits to ForwardDevice; additionally captures
+  // (hidden + residual) at each `aux_out->layer_ids` boundary into
+  // `aux_out->tensor` = [T, H×taps] (concat order = layer_ids), mirroring vLLM's
+  // eagle3 aux capture (see Qwen3_5AuxTaps). `aux_out` may be null (then exactly
+  // ForwardDevice). Not wired into the runner until DFlash D4; byte-identical when
+  // unused.
+  static ForwardLogits ForwardDeviceMultiTap(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const v1::GDNAttentionMetadata& gdn_meta,
+      const std::vector<PagedKvCache>& attn_kv,
+      const std::vector<GdnStateCache>& gdn_state,
+      const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
+      Qwen3_5AuxTaps* aux_out,
+      const std::vector<int32_t>& logits_indices = {});
+
   // Dense single-sequence reference forward (M0.9 anchor). Runs the whole model
   // for a single non-paged sequence and returns logits [T, vocab] f32 (T =
   // token_ids.size()). Retained as the paged==dense parity reference.

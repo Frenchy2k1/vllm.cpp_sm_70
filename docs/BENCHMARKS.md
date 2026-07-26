@@ -40,25 +40,35 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
-**DFlash speculative decode (block-diffusion) - BLOCKED (no oracle baseline), D0
-oracle check RAN (2026-07-26, `SPEC-DFLASH` `BLOCKED`, `CLAIM-DFLASH-D0`,
-[spec §0](../.agents/specs/dflash-spec-decode.md)).** `benchmark_binding=false`, NO
-number and NO oracle baseline is capturable. The D0 decisive check RAN on dgx
-(`LLM(unsloth/Qwen3.6-27B-NVFP4, speculative_config={method:"dflash",
-model:"z-lab/Qwen3.6-27B-DFlash", num_speculative_tokens:16})`, flock, GPU sole-owner):
-the DFlash config is accepted and the NVFP4 target loads, but constructing the DFlash
-draft ABORTS at `qwen3_dflash.py:93` `NotImplementedError: DFlash does not yet support
-mixed sliding/full attention via layer_types` (upstream vllm#40898) - both z-lab Qwen3.6
-drafts (27B `[SWA×4,full]`, 35B `[SWA×5,full]`) are the unsupported mixed kind and no
-all-full Qwen3.6 draft exists, so it is not config-fixable. The 2026-07-25 "GREEN,
-oracle constructs DFlash" readiness was config-construct reasoning, now superseded by
-this RUN. Consequently the D5 correctness gate (our-DFlash-ON == our-spec-OFF == vLLM
-`--speculative-config dflash` greedy) has NO vLLM arm and the D6 throughput A/B has no
-denominator on the pin; both are BLOCKED until the oracle advances past 0.25.0 (resolving
-vllm#40898). The GDN spec-state memory at k=15 (~2.3 GiB/req on the 27B at block-16)
-remains the biggest measured-risk input for whenever it unblocks. Repro (re-run the moment
-the pin advances): `scripts/spec/d0_dflash_oracle_capture.py --mode spec-on`; evidence
-`tests/parity/goldens/dflash_27b/{D0_VERDICT.md,d0_blocked_traceback.txt}`.
+**DFlash speculative decode (block-diffusion) - D0 ORACLE BASELINE CAPTURED, D1
+landed (2026-07-26, `SPEC-DFLASH` `ACTIVE`, `CLAIM-DFLASH-D0D1`,
+[spec §0](../.agents/specs/dflash-spec-decode.md)).** `benchmark_binding=false` (a
+correctness/acceptance baseline, NOT a throughput A/B). On the ADVANCED pin
+`555967922`/vLLM 0.26.0.dev0 under `VLLM_USE_V2_MODEL_RUNNER=1` (vllm#40898 resolved),
+the D0-redo RAN on dgx (`LLM(unsloth/Qwen3.6-27B-NVFP4, speculative_config={method:"dflash",
+model:"z-lab/Qwen3.6-27B-DFlash", num_speculative_tokens:16}, gpu_memory_utilization=0.30,
+limit_mm_per_prompt={image:0,video:0}, disable_log_stats=False)`, flock, GPU sole-owner):
+the mixed-SWA/full 27B draft CONSTRUCTS and the drafter is ALIVE. Greedy `acceptance_len`
+(= 1 + accepted/drafts, `max_tokens=32`):
+
+| prompt | acceptance_len | drafts | accepted |
+|---|---|---|---|
+| "The capital of France is" | 2.214 | 14 | 17 |
+| "def fibonacci(n):" | 8.800 | 5 | 39 |
+| "Q: What is 17 * 23?\nA:" | 4.750 | 8 | 30 |
+| "The three laws of robotics are" | 4.571 | 7 | 25 |
+
+All > 1 (dead-drafter trap cleared; content-dependence code >> prose). Backend auto-selects
+`flashinfer-native` fp8-KV sm121 (NOT FLASH_ATTN). **Gate FORM (measured):** vLLM-DFlash-ON
+greedy is RUN-DETERMINISTIC (K>=3 token+acceptance identical) but NOT token-identical to
+vLLM-spec-OFF (3/4 prompts differ at the k=16 block-verify near-ties), so the D5 gate is
+STRICT MODE-MATCHED (`our-ON == vLLM-ON`), not the MTP three-way identity. **MEMORY:** the
+first attempt (gpu_util 0.55, mm ON) OOM-rebooted dgx (vision-encoder profiling on the
+multimodal 27B); `limit_mm_per_prompt=0` + gpu_util 0.30 fixed it (26.2 GiB weights + KV
+8.85 GiB). The D6 throughput A/B (with the GDN k=15 spec-state memory, ~2.3 GiB/req on the
+27B at block-16) is the pending speed gate once the drafter (D2-D4) lands. Repro:
+`scripts/spec/d0_dflash_oracle_capture.py --mode spec-on` (env `VLLM_USE_V2_MODEL_RUNNER=1`);
+evidence `tests/parity/goldens/dflash_27b/{D0_VERDICT.md,dflash_27b_spec_{on,off}.json}`.
 
 **Pin-advance target SELECTED (SCOPE only, no measurement) - PENDING execution
 (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, `.agents/specs/pin-advance.md`).** The

@@ -50,6 +50,7 @@ using vllm::Nvfp4Weight;
 using vllm::OwnedTensor;
 using vllm::PagedKvCache;
 using vllm::Qwen3_5DenseLayerWeights;
+using vllm::Qwen3_5AuxTaps;
 using vllm::Qwen3_5DenseModel;
 using vllm::Qwen3_5DenseWeights;
 using vllm::v1::CommonAttentionMetadata;
@@ -919,6 +920,140 @@ TEST_CASE("qwen27 hidden-tap out-field captures post-final-norm [T,H], inert on 
                     routed_plain.device_tensor.data, nbytes) == 0);
   CHECK(std::memcmp(routed_tap.device_tensor.data, ref.device_tensor.data,
                     nbytes) == 0);
+}
+
+// SPEC-DFLASH D1 (DF-AUX-TAPS): the multi-layer aux-tap out-field on the type-erased
+// ModelForwardInput. ForwardDeviceMultiTap captures (hidden + residual) — the exact
+// value vLLM appends via eagle3 _maybe_add_hidden_state (interfaces.py:1382) at aux key
+// L+1 — at each configured target_layer_id L into a [T, H×taps] buffer whose column
+// order is ascending layer_ids (== cat(aux, dim=-1) fed to the DFlash fc). It returns
+// byte-identical logits and is INERT when aux_tap is null.
+//
+// REFERENCE per tap is an INDEPENDENT truncated-model rebuild: a model with only the
+// first L+1 layers (layers > L cannot affect the depth-L residual stream, and
+// MakeWeights is deterministic per-layer so layers 0..L are bit-identical) captured at
+// its own last layer reproduces the full model's tap for L. This validates the captured
+// VALUE, the LAYER index, and the concat SLOT together. RED-first: a wrong tap layer or
+// wrong concat order would map a column to the wrong depth and fail (the explicit
+// negative check below shows layer 0's column differs from the layer-2 reference).
+TEST_CASE("qwen27 DFlash multi-tap captures [T,H×taps] at configured layers, inert on logits") {
+  const HfConfig c = MakeConfig();  // 4 layers: lin, lin, lin, full
+  const Qwen3_5DenseWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+  const int64_t T = 6, vocab = c.vocab_size, H = c.hidden_size;
+  const std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+  const std::vector<int32_t> logits_indices;              // full [T, vocab]
+  const std::vector<int32_t> layer_ids = {0, 2, 3};       // ascending; intermediate + last
+  const int64_t taps = static_cast<int64_t>(layer_ids.size());
+
+  const CommonAttentionMetadata am = PrefillAttnMeta(T, {0, 1}, 8, 0);
+  const GDNAttentionMetadata gm = PrefillGdnMeta(T, 0);
+
+  // Full-model multi-tap forward.
+  CachePool pool_aux(c, /*num_blocks=*/8, /*block_size=*/8);
+  Qwen3_5AuxTaps aux;
+  aux.layer_ids = layer_ids;
+  const ForwardLogits multi = Qwen3_5DenseModel::ForwardDeviceMultiTap(
+      ids, pos, am, gm, pool_aux.attn_kv, pool_aux.gdn_state, w, c, q, &aux,
+      logits_indices);
+
+  // Shape / dtype: [T, H×taps] bf16.
+  REQUIRE(aux.storage != nullptr);
+  REQUIRE(aux.tensor.data != nullptr);
+  REQUIRE(aux.tensor.rank == 2);
+  CHECK(aux.tensor.shape[0] == T);
+  CHECK(aux.tensor.shape[1] == H * taps);
+  CHECK(aux.tensor.dtype == DType::kBF16);
+
+  const uint16_t* aux_raw = static_cast<const uint16_t*>(aux.tensor.data);
+  auto aux_col = [&](int64_t k, int64_t t, int64_t h) -> uint16_t {
+    return aux_raw[t * (H * taps) + k * H + h];  // column block k = tap for layer_ids[k]
+  };
+
+  // Independent per-layer reference via a truncated rebuild (first L+1 layers only).
+  auto ref_tap_for_layer = [&](int64_t L) {
+    HfConfig cL = c;
+    cL.num_hidden_layers = static_cast<int>(L + 1);
+    cL.layer_types.assign(c.layer_types.begin(),
+                          c.layer_types.begin() + static_cast<size_t>(L + 1));
+    Qwen3_5DenseWeights wL = MakeWeights(cL);
+    CachePool poolL(cL, 8, 8);
+    const CommonAttentionMetadata amL = PrefillAttnMeta(T, {0, 1}, 8, 0);
+    const GDNAttentionMetadata gmL = PrefillGdnMeta(T, 0);
+    auto tapL = std::make_shared<Qwen3_5AuxTaps>();
+    tapL->layer_ids = {static_cast<int32_t>(L)};
+    Qwen3_5DenseModel::ForwardDeviceMultiTap(ids, pos, amL, gmL, poolL.attn_kv,
+                                             poolL.gdn_state, wL, cL, q, tapL.get(),
+                                             std::vector<int32_t>{});
+    return tapL;  // owns its device storage
+  };
+
+  // Every configured tap's column == the independent truncated reference at that layer.
+  for (int64_t k = 0; k < taps; ++k) {
+    const int64_t L = layer_ids[static_cast<size_t>(k)];
+    auto ref = ref_tap_for_layer(L);
+    REQUIRE(ref->tensor.shape[0] == T);
+    REQUIRE(ref->tensor.shape[1] == H);
+    const uint16_t* rb = static_cast<const uint16_t*>(ref->tensor.data);
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t h = 0; h < H; ++h)
+        CHECK(aux_col(k, t, h) == rb[t * H + h]);
+  }
+
+  // RED-first: a wrong tap layer / wrong concat order is DETECTABLE. Column 0
+  // (layer 0's residual) must differ from the layer-2 reference — distinct
+  // residual-stream values across depth.
+  {
+    auto ref2 = ref_tap_for_layer(2);
+    const uint16_t* rb2 = static_cast<const uint16_t*>(ref2->tensor.data);
+    int diffs = 0;
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t h = 0; h < H; ++h)
+        if (aux_col(0, t, h) != rb2[t * H + h]) ++diffs;
+    CHECK(diffs > 0);
+  }
+
+  // Inert on logits: the multi-tap forward's logits are byte-identical to the
+  // untapped default path routed through ModelRegistry::Forward.
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::BorrowQwen3_5DenseLoadedModel(w);
+  CachePool pool_plain(c, 8, 8);
+  ModelForwardInput in_plain{ids,  pos,
+                             am,   gm,
+                             pool_plain.attn_kv,
+                             pool_plain.gdn_state,
+                             c,    q,
+                             logits_indices};
+  in_plain.num_reqs = 1;
+  const ForwardLogits routed_plain = ModelRegistry::Forward(*model, in_plain);
+  REQUIRE(multi.on_device());
+  REQUIRE(routed_plain.on_device());
+  REQUIRE(multi.rows == T);
+  REQUIRE(multi.vocab == vocab);
+  CHECK(std::memcmp(multi.device_tensor.data, routed_plain.device_tensor.data,
+                    static_cast<size_t>(T * vocab) * sizeof(float)) == 0);
+
+  // Routing parity: ModelRegistry::Forward with aux_tap set reaches ForwardDeviceMultiTap
+  // (same logits + a fresh [T,H×taps] capture bit-identical to the direct call).
+  CachePool pool_route(c, 8, 8);
+  Qwen3_5AuxTaps aux_routed;
+  aux_routed.layer_ids = layer_ids;
+  ModelForwardInput in_aux{ids,  pos,
+                           am,   gm,
+                           pool_route.attn_kv,
+                           pool_route.gdn_state,
+                           c,    q,
+                           logits_indices};
+  in_aux.num_reqs = 1;
+  in_aux.aux_tap = &aux_routed;
+  const ForwardLogits routed_aux = ModelRegistry::Forward(*model, in_aux);
+  REQUIRE(aux_routed.tensor.data != nullptr);
+  CHECK(aux_routed.tensor.shape[1] == H * taps);
+  CHECK(std::memcmp(aux_routed.tensor.data, aux.tensor.data,
+                    static_cast<size_t>(T * H * taps) * sizeof(uint16_t)) == 0);
+  CHECK(std::memcmp(routed_aux.device_tensor.data, routed_plain.device_tensor.data,
+                    static_cast<size_t>(T * vocab) * sizeof(float)) == 0);
 }
 
 TEST_CASE("qwen27 dense paged: decode via KV cache equals dense over full sequence") {

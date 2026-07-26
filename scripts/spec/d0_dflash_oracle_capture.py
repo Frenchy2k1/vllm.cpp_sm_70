@@ -80,7 +80,7 @@ def parse_args():
     ap.add_argument("--num-spec-tokens", type=int,
                     default=int(os.environ.get("DFLASH_K", "16")))
     ap.add_argument("--gpu-mem-util", type=float,
-                    default=float(os.environ.get("DFLASH_GPU_UTIL", "0.55")))
+                    default=float(os.environ.get("DFLASH_GPU_UTIL", "0.30")))
     ap.add_argument("--max-model-len", type=int,
                     default=int(os.environ.get("DFLASH_MAX_LEN", "4096")))
     ap.add_argument("--max-num-seqs", type=int, default=4)
@@ -139,6 +139,21 @@ def main():
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
+        # DFlash LIVENESS PROOF (the dead-drafter trap): greedy spec-on is token-
+        # identical to greedy spec-off even when the drafter accepts ZERO tokens, so
+        # coherent output is NOT sufficient — we MUST read the acceptance metrics.
+        # The LLM API defaults disable_log_stats=True, which makes get_metrics()
+        # raise "Stat logging disabled"; enable it so the spec_decode_num_drafts /
+        # _num_accepted_tokens counters are collected (acceptance_len companion).
+        disable_log_stats=False,
+        # MEMORY (GB10 119 GiB UNIFIED): the NVFP4 27B is a *multimodal*
+        # (ForConditionalGeneration) target; leaving the vision tower enabled makes
+        # vLLM profile the encoder cache with one max-feature-size dummy image at
+        # startup, which spiked the unified pool and HARD-REBOOTED dgx on the first
+        # D0-redo attempt (2026-07-26; the exact [[gb10-unified-memory-oom-reboots-box]]
+        # hazard). DFlash is a TEXT speculative path, so we disable image+video mm
+        # entirely to skip that profiling — the drafter/target text path is unchanged.
+        limit_mm_per_prompt={"image": 0, "video": 0},
     )
     if args.mode == "spec-on":
         spec = {

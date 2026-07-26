@@ -37,6 +37,7 @@ struct Qwen3_5MoeWeights;
 // this shared registry seam. Inert unless speculative decoding is configured.
 struct Qwen3_5MTPWeights;
 struct Qwen3_5MTPHiddenStates;
+struct Qwen3_5AuxTaps;
 class Qwen3_5MTPModel;
 
 namespace v1 {
@@ -160,6 +161,15 @@ struct ModelForwardInput {
   // forward takes the current ModelRegistry::Forward path and is byte-identical.
   // Models other than Qwen3.5 ignore this field.
   Qwen3_5MTPHiddenStates* hidden_tap = nullptr;
+  // SPEC-DFLASH D1 (DF-AUX-TAPS) multi-layer aux hidden taps. When non-null (only
+  // the DFlash spec verify forward sets it, D4), the Qwen3.5 dense/MoE forward
+  // routes to Qwen3_5{,Dense}Model::ForwardDeviceMultiTap, which returns byte-
+  // identical logits AND captures (hidden + residual) at each configured
+  // target_layer_id boundary into `aux_tap->tensor` = [T, H×taps] for the DFlash
+  // drafter. When null (every non-DFlash run) the forward takes the current path
+  // and is byte-identical. Mutually exclusive with hidden_tap. Models other than
+  // Qwen3.5 ignore this field.
+  Qwen3_5AuxTaps* aux_tap = nullptr;
 };
 
 using ModelConfigHook = void (*)(const HfConfig& config);
