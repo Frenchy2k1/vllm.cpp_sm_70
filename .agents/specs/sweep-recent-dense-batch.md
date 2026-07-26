@@ -33,8 +33,37 @@ sliding-window arg). Results:
 
 Regressions byte-identical (OLMo-2 16/16 · Qwen3-dense 184/184 · OPT 63/63 · Llama
 92/92 · Mistral 92/92 re-run; big gates by construction). SPEED PENDING for all three.
-Remaining rows (StableLM, MiniCPM, InternLM2, Command-R, Phi-1/2, MiniCPM3) stay
+Remaining rows (MiniCPM, InternLM2, Command-R, Phi-1/2, MiniCPM3) stay
 `SPIKE`, one agent each per the queue below.
+
+## RANK-4 IMPLEMENTATION UPDATE (2026-07-26, StableLM — base `origin/main` `fb7609f7`, dgx `~/vllmcpp-stablelm`)
+
+**rank 4 StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) — SACRED 16/16, row `ACTIVE`.**
+ZERO-NEW-KERNEL as scoped: `nn.LayerNorm` (weight+bias, NON-fused explicit residual —
+REUSE the OPT-landed `vt::LayerNorm`) + partial NeoX RoPE (rotary_dim 16 of head_dim 64,
+`partial_rotary_factor` 0.25, plain `default` cache built via the landed `RotaryEmbedding`
+class — REUSE the phi3/GLM-4 `vt::RopeFromCache` partial path) + merged qkv **bias**
+(`use_qkv_bias`=True — REUSE `LoadMergedBf16Vector` + `vt::Add` row-broadcast, the OPT
+biased-projection path) + SiLU-SwiGLU (REUSE). New files only (`stablelm.{h,cpp}`,
+`stablelm_weights.cpp`, `stablelm_registry.cpp`, `test_stablelm_paged_engine.cpp`); the
+forward is written fresh (NOT `dense_attn::AttnBlock`) exactly like OPT/phi3 because the
+non-fused LayerNorm residual + merged-qkv-bias cannot ride that block.
+
+**W0 RUN-VERIFIED** (not config-construct): the pinned vLLM 0.25.0 oracle BUILDS+RUNS
+`stablelm-2-1_6b` (ungated, ~3.3 GiB, fits). Gate form BY MEASUREMENT: per-prompt
+(batch=1) K=5 greedy is **ALL-DETERMINISTIC** (0 multi-member cells) ⇒ STRICT bar (like
+Granite); W0's BATCHED 24-token run showed one bf16 near-tie flip, so the ratified near-tie
+harness is retained. Gate: **14/16 STRICT token-exact + 2/16 near-tie-band, max
+teacher-forced gap 0.438 nats @ prompt[13] tok0, 0 forward-divergent**. RED-first: disabling
+the qkv bias → prompt0 tok0 emits 4697 vs golden 264 (gate FAILS) — the `use_qkv_bias`
+delta is load-bearing. memcheck 0 errors; clean CUDA `-Werror` 0 warnings.
+
+**One shared-file touch (additive, proven inert):** `stablelm-2`'s Arcade100k tokenizer
+stores the cl100k/Qwen2 split regex with LITERAL CR/LF control chars where the Qwen
+checkpoints use `\r`/`\n` escapes (same regex). `tokenizer.cpp::DetectPattern` now
+canonicalizes literal CR/LF → escape form before its equality checks (a no-op for every
+checkpoint already using escapes). Inertness: `test_pretokenizer` 97926/97926 +
+`test_tokenizer_parity` 1175/1175 unchanged. SPEED PENDING.
 
 ---
 

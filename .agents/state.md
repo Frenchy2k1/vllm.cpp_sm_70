@@ -23898,3 +23898,38 @@ SACRED gate byte-identical BY CONSTRUCTION. Not pushed; FULL SHA reported.
 **PIVOT.** OLMo-3 is NOT the cheapest reachable win (no oracle). Next impl agent → the
 rank-4 **StableLM** (`StableLmForCausalLM`, `stabilityai/stablelm-2-1_6b`, ungated,
 oracle-certain), since rank-3 **Granite-3** already landed SACRED 16/16 in batch3.
+
+## 2026-07-26 — StableLM (`StableLmForCausalLM`) rank-4 bring-up: SACRED 16/16, row `ACTIVE`
+
+`MODEL-TEXT-stablelm-stablelm-for-causal-lm` under `CLAIM-SWEEP-RECENT-DENSE`. Base
+`origin/main` `fb7609f7`, isolated worktree `.claude/worktrees/stablelm` (branch
+`sweep-stablelm`); dgx build+gate `~/vllmcpp-stablelm`, all GPU under `flock ~/gpu.lock`,
+sole owner, `local-ai-worker` down.
+
+**W0 RUN-VERIFIED (not config-construct):** the pinned vLLM 0.25.0 oracle BUILDS+RUNS
+`stabilityai/stablelm-2-1_6b` (ungated, ~3.3 GiB, fits). Config: hidden 2048 / 32 heads (MHA:
+32 kv) / 24 layers / intermediate 5632 / head_dim 64 / `partial_rotary_factor` 0.25 (rotary_dim
+16) / `use_qkv_bias`=True / `layer_norm_eps` 1e-5 / rope_theta 10000 (default) /
+`tie_word_embeddings`=False. Gate form BY MEASUREMENT: per-prompt (batch=1) K=5 greedy is
+ALL-DETERMINISTIC ⇒ STRICT bar (Granite-like); W0's batched 24-tok run showed one bf16 near-tie
+flip → near-tie harness retained as the safety net.
+
+**Impl (ZERO new kernel, new files only):** `stablelm.{h,cpp}` + `stablelm_weights.cpp` +
+`stablelm_registry.cpp` (`REGISTER_VLLM_MODEL`, one line). OPT-style pre-norm NON-fused-residual
+`vt::LayerNorm` (weight+bias) + phi3 partial-NeoX `vt::RopeFromCache` (plain `default` cache via
+the landed `RotaryEmbedding` class) + merged qkv bias (`LoadMergedBf16Vector` + `vt::Add`
+broadcast) + `vt::SiluAndMul`. Forward written fresh (NOT `dense_attn::AttnBlock`, OPT/phi3
+precedent). Ported 1:1 from `stablelm.py` @ `e24d1b24`.
+
+**One shared-file touch (additive, inert):** `stablelm-2`'s Arcade100k tokenizer stores the
+cl100k/Qwen2 split regex with LITERAL CR/LF where the Qwen checkpoints use `\r`/`\n` escapes (same
+regex). `tokenizer.cpp::DetectPattern` now canonicalizes literal CR/LF → escape form before the
+equality checks (no-op for checkpoints already using escapes). Inert: `test_pretokenizer`
+97926/97926 + `test_tokenizer_parity` 1175/1175.
+
+**Gate:** `test_stablelm_paged_engine.cpp` (full paged engine) — **16/16 prompts PASS: 14/16
+STRICT token-exact + 2/16 near-tie-band, max gap 0.438 nats @ p13 tok0, 0 forward-divergent, 92/92
+assertions.** RED: qkv-bias disabled → p0 tok0 = 4697 vs 264 (FAIL). memcheck 0. Clean CUDA
+`-Werror` 0 warnings (CUTLASS sm120a + FA2 [121a] + Marlin + Triton-AOT banner confirmed). SPEED
+PENDING (row `ACTIVE`, not `DONE`). Not pushed. NEXT queue: MiniCPM, InternLM2, Command-R, Phi-1/2,
+MiniCPM3.

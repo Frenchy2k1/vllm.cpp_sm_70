@@ -296,7 +296,29 @@ SplitPattern DetectPattern(const json& doc) {
     Fail("expected exactly one Split pre-tokenizer, found " +
          std::to_string(regexes.size()));
   }
-  const std::string& re = regexes[0];
+  // Some checkpoints (stabilityai/stablelm-2-*, Arcade100k) store the cl100k/Qwen2
+  // split regex with LITERAL CR/LF control characters inside its `[\r\n]` character
+  // classes, where the Qwen checkpoints write the `\r`/`\n` escape sequences. A
+  // regex engine treats a literal CR and the escape `\r` identically, so the two
+  // forms are the SAME pattern — canonicalize the control chars to their escape
+  // form so the byte-equality checks below match. This is a no-op for every
+  // checkpoint that already uses the escape form (none ship a literal CR/LF byte in
+  // the split regex), so no existing detection changes.
+  std::string re = regexes[0];
+  {
+    std::string canon;
+    canon.reserve(re.size());
+    for (const char c : re) {
+      if (c == '\r') {
+        canon += "\\r";
+      } else if (c == '\n') {
+        canon += "\\n";
+      } else {
+        canon += c;
+      }
+    }
+    re.swap(canon);
+  }
   if (re == kQwen36Regex) return SplitPattern::kQwen2;
   if (re == kClassicQwen2Regex) return SplitPattern::kQwen2Classic;
   if (re.find(R"(\p{N}{1,3})") != std::string::npos) {
