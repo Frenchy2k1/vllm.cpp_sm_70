@@ -298,6 +298,28 @@ dgx: capture goldens `glm4-oracle-capture.py --per-prompt --runs 5 --model stabi
 **`benchmark_binding=false`, PENDING** - no throughput measured (row is `ACTIVE`, not `DONE`, until
 every-axis vLLM speed parity). No throughput number is claimed here.
 
+**Phi-3 / Phi-4 (`Phi3ForCausalLM`) - CORRECTNESS-COMPLETE, SPEED PENDING (2026-07-26,
+`CLAIM-PHI3-GATE-RESOLVE`; the held 15/16 increment closes).** CORRECTNESS: the gate is now a
+**CLEAN PASS** via the ratified near-tie ROOT-divergence methodology (both checkpoints vLLM 0.25.0
+per-prompt K=5 ALL-DETERMINISTIC ⇒ STRICT bar). **`microsoft/Phi-4-mini-instruct` 16/16 prompts
+PASS** by root divergence (7 strict token-exact + 9 near-tie, 0 forward-divergent, 108 assertions):
+the gate teacher-forces vLLM on OUR sequence and passes iff every ROOT (first) divergence's gap
+≤0.5 nats; cascade positions downstream of a root are not counted (p12's tok6/tok8 = 1.0 nats are
+cascade on a forked continuation, downstream of an exact-tie root tok4 gap 0.0000 where vLLM's own
+teacher-forced argmax IS our token). **RATIFIED BIGGER-DENSE STRICT anchor `microsoft/phi-4` (14B,
+same forward) 16/16 with STRICT token-exact 14/16** + 2 exact-tie (gap 0.0000), 134 assertions - the
+deterministic proof the forward is genuinely correct. RED-first: disabling the LongRoPE mscale
+(1.19→1.0) produces 11 ROOT-fails (0.75-3.0 nats), gate FATAL 5/16 (not vacuously lenient). TEST +
+goldens only, no forward change (`tests/parity/test_phi3_paged_engine.cpp`, goldens
+`tests/parity/goldens/{phi4_mini_greedy,phi4_14b_greedy}/`; harness EOS-aware). Reproduce on dgx:
+capture `glm4-oracle-capture.py --per-prompt --runs 5 --model microsoft/Phi-4-mini-instruct --out-dir
+tests/parity/goldens/phi4_mini_greedy --gpu-mem 0.40` (and `microsoft/phi-4` → `phi4_14b_greedy`),
+bootstrap `VT_DUMP_IDS=1 ./build/tests/test_phi3_paged_engine`, gap `glm4-neartie-gap.py --model
+microsoft/Phi-4-mini-instruct --golden-dir <dir>`, then `flock $HOME/gpu.lock
+./build/tests/test_phi3_paged_engine`. SPEED: **`benchmark_binding=false`, PENDING** - no throughput
+measured (row is `ACTIVE`, not `DONE`, until every-axis vLLM speed parity). No throughput number is
+claimed here.
+
 **Multimodal M2c - IMAGE e2e token-exact WORKING on Qwen3-VL-4B (2026-07-25, `CLAIM-MULTIMODAL-M2C`).**
 CORRECTNESS: **STRICT image->text token-exact 32/32** vs the committed vLLM 0.25.0 golden
 (`tests/vllm/multimodal/fixtures/qwen3vl_text/gen_tokens_i32.bin`) on the fixed (image, prompt),

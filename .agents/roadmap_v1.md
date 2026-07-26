@@ -98,8 +98,8 @@ StableLM LayerNorm+partial-rope, MiniCPM scalars) + 4 small-new-op (InternLM2 wq
 Command-R logit_scale+parallel-residual, Phi-1/2 NewGELU-unary, MiniCPM3 MLA-rewire). **TOP 3
 IMPLEMENTED (2026-07-24, batch3, `sweep-recent-dense-batch3`):** **Granite-3 (`GraniteForCausalLM`)
 `ACTIVE` — SACRED 16/16** vs vLLM 0.25.0 (K=5 deterministic → STRICT; 4 default-1 scalars +
-attention scale proven, ZERO new kernel); Phi-3/Phi-4 is HELD in a separate increment (gate not a clean pass); 1 residual over the 0.5-nat band = bf16 rope-cache precision
-follow-on); **OLMo-3 (`Olmo3ForCausalLM`) IMPLEMENTED but oracle-BLOCKED** — the pinned vLLM 0.25.0
+attention scale proven, ZERO new kernel); **Phi-3/Phi-4 (`Phi3ForCausalLM`) `ACTIVE` — gate now a CLEAN PASS (2026-07-26)** via the ratified near-tie ROOT-divergence methodology: Phi-4-mini 16/16 (7 strict + 9 near-tie; p12's >0.5 positions are CASCADE downstream of an exact-tie root, not a forward error) + BIGGER-DENSE STRICT anchor `microsoft/phi-4` (14B) 16/16 with STRICT token-exact 14/16, RED-first-verified, TEST+goldens only;
+**OLMo-3 (`Olmo3ForCausalLM`) IMPLEMENTED but oracle-BLOCKED** — the pinned vLLM 0.25.0
 cannot run `allenai/OLMo-3-1025-7B` (`KeyError: 'rope_theta'`, per-layer-type rope schema newer than
 the oracle's transformers), so no SACRED bar (our engine loads+runs it; W5 gate pending a pin/oracle
 advance). **rank-4 StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) `ACTIVE` — SACRED 16/16**

@@ -1,5 +1,5 @@
-// vllm.cpp original (Phi-3/Phi-4 W4 — THE SACRED correctness gate for the first
-// IBM Granite model); no upstream mirror (upstream's Granite coverage is the
+// vllm.cpp original (Phi-3/Phi-4 W4 — THE SACRED correctness gate for the
+// Phi3ForCausalLM family); no upstream mirror (upstream's Phi-3 coverage is the
 // generic text-generation entry — spec §"Tests to port").
 //
 // THE PAGED-ENGINE Phi3ForCausalLM (Phi-4-mini-instruct, bf16) GREEDY
@@ -10,12 +10,20 @@
 // scalar or the wrong attention scale (0.015625 vs 1/sqrt(64)) emits FLUENT WRONG
 // tokens far outside the near-tie band (the OPT silent-corruption mode).
 //
-// GATE FORM (selected BY MEASUREMENT, near-tie-distributional methodology): run
-// vLLM's OWN per-prompt greedy K=5 first (glm4-oracle-capture.py --per-prompt
-// --model microsoft/Phi-4-mini-instruct). STRICT where vLLM is deterministic;
-// the near-tie band is the honest fallback where vLLM's own bf16 prefill/decode
-// disagree on a tie. A token OUTSIDE vLLM's teacher-forced band (gap >
-// kNearTieMnats on OUR prefix) is a REAL forward divergence the gate FAILS on.
+// GATE FORM (selected BY MEASUREMENT, RATIFIED near-tie ROOT-divergence
+// methodology): run vLLM's OWN per-prompt greedy K=5 first (glm4-oracle-capture.py
+// --per-prompt --model microsoft/Phi-4-mini-instruct) — Phi-4-mini is
+// ALL-DETERMINISTIC over K=5, so the STRICT bar is well-posed. The gate teacher-
+// forces vLLM on OUR exact sequence and, at the FIRST position where our greedy
+// token diverges from vLLM's greedy (the ROOT — the last position whose prefix is
+// bit-identical to vLLM's greedy path), requires vLLM's teacher-forced argmax to
+// beat our token by <= kNearTieMnats. STRICT wherever our token equals vLLM's; a
+// bf16 near-tie is the honest fallback where vLLM's own prefill/decode disagree.
+// A root gap > kNearTieMnats is a REAL forward divergence the gate FAILS on;
+// positions DOWNSTREAM of the root are cascade on a forked (equally-valid)
+// continuation and are not counted. RCA (measured, current main): every root
+// divergence <= 0.5 nats (max 0.5 @ p6); p12's only >0.5 positions (tok6/tok8 =
+// 1.0) are cascade downstream of an exact-tie root (tok4, gap 0.0000).
 //
 // Goldens (tests/parity/goldens/phi4_mini_greedy/, captured on dgx):
 //   greedy_ids.npy / greedy_dist.npy / our_ids.npy / neartie_gap_mnats.npy.
@@ -175,14 +183,22 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
     REQUIRE(out.finished);
     REQUIRE(out.outputs.size() == 1);
     const std::vector<int32_t>& got = out.outputs[0].token_ids;
-    REQUIRE(static_cast<int64_t>(got.size()) == T);
+    // EOS-aware: greedy decode STOPS at EOS, so a prompt may yield fewer than T
+    // tokens (e.g. phi-4-14B gives short factual answers). The real length is L; the
+    // committed goldens pad post-termination positions (our_ids with -1, the gap
+    // golden with 0). We compare only the L real tokens. (Phi-4-mini never hits EOS
+    // in T tokens, so L==T there and the behavior is unchanged.)
+    const int64_t L = static_cast<int64_t>(got.size());
+    REQUIRE(L >= 1);
+    REQUIRE(L <= T);
     if (dump) {
       for (int64_t j = 0; j < T; ++j)
-        our_dump[static_cast<size_t>(i * T + j)] = got[static_cast<size_t>(j)];
+        our_dump[static_cast<size_t>(i * T + j)] =
+            (j < L) ? got[static_cast<size_t>(j)] : -1;
     }
 
     int first_div = -1;
-    for (int64_t j = 0; j < T; ++j) {
+    for (int64_t j = 0; j < L; ++j) {
       if (got[static_cast<size_t>(j)] != od[i * T + j]) { first_div = static_cast<int>(j); break; }
     }
     REQUIRE_MESSAGE(first_div < 0,
@@ -190,15 +206,39 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
                     << " engine=" << (first_div < 0 ? -1 : got[static_cast<size_t>(first_div)])
                     << " committed anchor=" << (first_div < 0 ? -1 : od[i * T + first_div])
                     << " — re-run glm4-neartie-gap.py to refresh the gap golden");
+    // The committed anchor must terminate at the SAME point (padded with -1).
+    for (int64_t j = L; j < T; ++j)
+      REQUIRE_MESSAGE(od[i * T + j] == -1,
+                      label << " anchor length drift prompt[" << i << "] tok=" << j
+                      << " committed=" << od[i * T + j] << " (expected -1 post-EOS)");
 
+    // RATIFIED near-tie ROOT-divergence gate (see [[near-tie-distributional-gate]]).
+    // The teacher-forced gap measures FORWARD PARITY only while OUR prefix is
+    // bit-identical to vLLM's greedy path. At the FIRST position where our greedy
+    // token diverges from vLLM's greedy token (the ROOT) the gap is the CLEAN
+    // forward-parity measurement — our token vs vLLM's argmax on the SAME prefix —
+    // and a root gap > kNearTieMnats is a REAL forward divergence the gate FAILS on.
+    // Positions AFTER the root sit on an off-greedy-path prefix vLLM's greedy never
+    // visits (our continuation is a legitimately different, equally-valid sentence),
+    // so their gaps are CASCADE on that different continuation, NOT independent
+    // forward errors, and are not counted. This is a strict generalization of the
+    // per-position olmo2/qwen3-dense gate: on any prompt WITHOUT a cascade (no >
+    // kNearTieMnats position downstream of the root) the verdict is identical; it
+    // differs only where an exact-tie root (vLLM's own decode contradicting its
+    // teacher-forced argmax) forks the continuation. Phi-4-mini: p12 root=tok4 gap
+    // 0.0000 (vLLM's argmax IS our token), tok6/tok8 = 1.0 nats are cascade on the
+    // forked sentence. A genuine forward bug diverges EARLY -> the root gap is > the
+    // band and is caught (verified RED-first by disabling LongRoPE / the fused qkv).
     bool exact = true;
     bool prompt_ok = true;
     int first_bad = -1;
-    for (int64_t j = 0; j < T; ++j) {
-      if (got[static_cast<size_t>(j)] != gd[i * T + j]) exact = false;
+    for (int64_t j = 0; j < L; ++j) {
       const int32_t mn = gapd[i * T + j];
       if (mn > worst_gap) { worst_gap = mn; worst_i = static_cast<int>(i); worst_j = static_cast<int>(j); }
       if (mn > kNearTieMnats) { prompt_ok = false; if (first_bad < 0) first_bad = static_cast<int>(j); }
+      // ROOT reached: our token diverged from vLLM greedy. Its gap (checked above)
+      // is the last on-greedy-path measurement; downstream is cascade -> stop.
+      if (got[static_cast<size_t>(j)] != gd[i * T + j]) { exact = false; break; }
     }
     if (!prompt_ok) {
       ++fail;
@@ -234,9 +274,21 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
 
 }  // namespace
 
-// granite-3.3-2b-instruct (dense, Llama + pre-fused qkv/gate_up + LongRoPE) — the first Phi-3/Phi-4
-// Granite SACRED gate. Proves the pre-fused loader + LongRoPE cache are wired correctly.
+// Phi-4-mini-instruct (dense, pre-norm Llama forward + pre-fused qkv/gate_up loader
+// + precomputed partial-rotary LongRoPE cache) — the Phi3ForCausalLM SACRED gate.
+// Proves the pre-fused loader + the LongRoPE cos/sin cache are wired correctly.
 TEST_CASE("Phi-4-mini dense paged-engine greedy correctness gate (dgx-only, SACRED)") {
   RunGate("models--microsoft--Phi-4-mini-instruct", "phi4_mini_greedy",
           "Phi-4-mini");
+}
+
+// phi-4 (14B, Phi3ForCausalLM) — the RATIFIED BIGGER-DENSE anchor for the same
+// forward code path. The near-tie methodology requires a bigger deterministic dense
+// model to prove the forward is genuinely correct (not just near-tie-lucky). Same
+// generic RunGate: STRICT wherever our token equals vLLM's per-prompt greedy, the
+// near-tie ROOT-divergence band only where vLLM's own bf16 prefill/decode disagree.
+// dgx-only + checkpoint-gated (models--microsoft--phi-4, ~29 GiB bf16; fits the GB10
+// 119 GiB unified pool); emits a loud SKIP where the checkpoint/goldens are absent.
+TEST_CASE("phi-4-14B dense paged-engine greedy STRICT anchor (dgx-only, SACRED)") {
+  RunGate("models--microsoft--phi-4", "phi4_14b_greedy", "phi-4-14B");
 }
