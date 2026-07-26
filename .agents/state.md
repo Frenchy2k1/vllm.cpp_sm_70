@@ -24324,3 +24324,69 @@ gate (M-mtp-2) and `SPEC-DFLASH` (oracle-BLOCKED, vllm#40898).
 
 **Checkers:** all seven record checkers green by bare RC on the dev box. NOT
 pushed; FULL SHA reported in the session.
+
+## 2026-07-26 — PIN-ADVANCE SCOPE + PLAN: advance the vLLM parity pin past `e24d1b24` (v0.25.0-era) (`CLAIM-PIN-ADVANCE-SCOPE`, records-only, base `origin/main` `55596792` [vllm.cpp], isolated worktree `pin-advance-scope`; NOT pushed)
+
+**What.** The user directed (2026-07-26): *"advance the pin then and let's assess
+what we need to port that vLLM advanced."* This is the CPU/repo-research SCOPE +
+PLAN phase — NO venv, NO pin swap, NO code, NO golden re-capture (EXECUTION is
+GPU-gated and runs AFTER the sibling 35B-MTP agent frees `~/venvs/vllm-oracle`,
+which was NOT touched). Full deliverable: [`specs/pin-advance.md`](specs/pin-advance.md).
+
+**TARGET (Deliverable 1) — ONE coherent version unblocks all three, NO tradeoff:**
+vLLM `origin/main` `55596792` (`5559679229bc961848b121ccdeaa8fa5d79bec98`,
+2026-07-26; range `e24d1b24..origin/main` = **777 commits / ~4 weeks**) pinned with
+**transformers 5.14.1 / torch 2.13.0 / torchvision 0.28.0 / triton 3.7.1 /
+flashinfer 0.6.15 / nvidia-cutlass-dsl 4.6.0**. **No release tag carries the fixes**
+— v0.25.0 (`702f4814`, 2026-07-11) predates all three (verified
+`git merge-base --is-ancestor`) ⇒ the target must be a main commit.
+- **DFlash vllm#40898** → `0d12618e` #47914 (2026-07-08): mixed sliding/full drafts
+  now CONSTRUCT, but only under `VLLM_USE_V2_MODEL_RUNNER=1` (= our MRV2); +
+  follow-ups `7614b88e` #48113, `a7d00ec0` #48524 (fc sizing for our 27B draft's
+  5≠64 target layers), `ecf4aa5c` #48167 (Blackwell non-causal attn), `7bd15437`
+  #47698 (mamba+dflash MRV2). Min DFlash-complete target ≥ `a7d00ec0` (2026-07-21).
+- **Gemma-4 mm** → transformers 5.14.1 (`0d77325b` #49223) ships
+  `transformers.models.gemma4` (5.13.1 had none — the decisive block); vLLM's own
+  Gemma-4 CI (`b8fb56d9` #49243) runs under it.
+- **OLMo-3** → new native `olmo3.py` (`rope_parameters.get(attn_type, rope_parameters)`
+  at :140-142) + transformers 5.14.1 nested schema; `b83be00c` #48100 also routes
+  older Olmo/Olmo2 to the transformers backend.
+
+**DELTA (Deliverable 2).** New models: `Olmo3ForCausalLM`, a full new Inkling family
+(NVFP4+MTP+LoRA), LongCat-Flash-Lite, Cosmos3Edge, MOSS/VibeVoice ASR, VaultGemma/
+TranslateGemma, new DFlash/DSpark/Gemma4-DSpark drafts; frontier growth in
+DeepSeek-V4/V3.2, GLM-5.2 (Blackwell decode opt #48597 **REVERTED** #49768),
+MiniMax-M3, Kimi-K2.5 (mostly already owned by `CLAIM-MLA-DEEPSEEK` /
+`CLAIM-GLM-DSA-LATEST-DEEPSEEK`). ★ Golden-drift kernels: sampling fp32-upcast
+flip-flop (#48641 then reverted #49033 = net-restored), RMSNorm has_weight #48741 +
+B200 rms_norm_per_block_quant #48797, NVFP4 MoE scale/pad/autotune (#49489/#46880/
+#46276/#48268), TRTLLM BF16 MoE #45182 + FlashInfer combine #47156, GDN ReplaySSM
+#48018 + mamba-cache #44456, Blackwell FlashInfer attn #48167, allreduce+rmsnorm+quant
+fusion #48064/#48330/#46998. Mechanical re-sync (our mirrored files): qwen3_next.py
+(3), layernorm.py (2), fused_moe.py (2 incl. MoeWNA16→MK #44120), mamba_mixer2.py
+(1), sampler.py (1), qwen3_dflash.py (6), new olmo3.py.
+
+**GOLDEN-DRIFT RISK (Deliverable 3a) — HONEST cost.** Advancing likely drifts the 2
+NVFP4 hybrid gates (**27B, 35B = HIGH**), 32B-NVFP4A16 (HIGH), Coder-30B (MEDIUM) ⇒
+**~4 core re-captures**, plus a diff-and-maybe-recapture pass over the ~30
+model-matrix `*_greedy` rows + the NVFP4/bf16 op goldens. f32 op goldens + near-tie-
+robust dense gates should mostly survive. A drift is the ORACLE MOVING (Torch-2.13 /
+CUTLASS-4.6 / FlashInfer-0.6.15 + NVFP4/fusion changes), NOT our bug — the plan
+re-captures against the new oracle with our code byte-unchanged.
+
+**MIGRATION W-PLAN (Deliverable 3b).** W0 reclaim disk (≥200 GiB; new venv ~15-20
+GiB) → W1 staged `~/venvs/vllm-oracle-next` (keep 0.25.0 + `-v0.25.0-stage` for
+rollback) → W2 the 3-unblock RUN smoke test (gemma4 import; DFlash mixed-draft
+constructs under MRV2; OLMo-3 builds+runs) → W3 golden re-capture (§3 priority
+order) → W4 mechanical re-sync of the §2D files → W5 flip pin + sync report. Each W
+has a gate; GB10 OOM/CUDA-graph/JIT caveats recorded.
+
+**POST-UNBLOCK PRIORITY (Deliverable 3c).** 1. OLMo-3 W5 (implemented, near-free) →
+2. DFlash D1-D6 (headline spec method, reuse map verified-present) → 3. Gemma-4 mm +
+AUDIO (user's #1 mm ask) → 4. mechanical re-sync closeout → 5. top frontier models.
+
+**Byte-identity.** `git diff --stat` = `.agents/specs/pin-advance.md` (new) + record
+surfaces (coordination note, roadmap SCOPED note, this entry, ledger, README,
+BENCHMARKS) ONLY; ZERO `src/`/`include/`/`tests/` touched ⇒ SACRED gates
+byte-identical by construction (not re-run). Oracle venv NOT touched. All seven
+record checkers green by bare RC. NOT pushed; FULL SHA reported to caller.

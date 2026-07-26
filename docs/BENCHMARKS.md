@@ -58,6 +58,20 @@ remains the biggest measured-risk input for whenever it unblocks. Repro (re-run 
 the pin advances): `scripts/spec/d0_dflash_oracle_capture.py --mode spec-on`; evidence
 `tests/parity/goldens/dflash_27b/{D0_VERDICT.md,d0_blocked_traceback.txt}`.
 
+**Pin-advance target SELECTED (SCOPE only, no measurement) - PENDING execution
+(2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, `.agents/specs/pin-advance.md`).** The
+single coherent target that unblocks DFlash + Gemma-4 multimodal + OLMo-3 is vLLM
+`origin/main` `55596792` + transformers 5.14.1 / torch 2.13.0 / flashinfer 0.6.15 /
+cutlass-dsl 4.6.0 (no release tag carries the fixes; DFlash mixed drafts need the V2
+model runner). Nothing is re-benchmarked or re-gated here - this is CPU/repo scope.
+HONEST cost flagged for execution: the Torch/CUTLASS/FlashInfer + NVFP4-MoE +
+rmsnorm-quant-fusion changes will likely DRIFT the 27B/35B NVFP4 hybrid goldens +
+32B-NVFP4A16 + Coder (~4 core golden re-captures) plus a diff pass over ~30
+model-matrix rows; those re-captures (oracle moving, our code unchanged) are the
+dominant EXECUTION cost and are GPU-gated behind the sibling 35B-MTP agent freeing
+the oracle. Migration W-plan (staged `~/venvs/vllm-oracle-next` -> 3-unblock smoke
+test -> golden re-capture -> pin flip) is spec pin-advance.md section 4.
+
 **MTP speculative decode, k=1 on the 27B GDN hybrid - SINGLE-REQUEST (c1)
 CORRECTNESS PROVEN AND THROUGHPUT AT/ABOVE vLLM ON EVERY MEASURED AXIS
 (2026-07-25, `SPEC-MTP` I6, `CLAIM-SPEC-MTP-I6`,

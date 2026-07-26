@@ -110,6 +110,28 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 ## Active claims
 
+**Pin-advance SCOPE note (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, DONE, NOT pushed —
+FULL SHA reported to caller).** A CPU/repo-research SCOPE + PLAN for advancing the
+vLLM parity pin past `e24d1b24` (v0.25.0-era) — no venv, no pin swap, no code, no
+golden re-capture (EXECUTION is GPU-gated, run AFTER the sibling 35B-MTP agent frees
+`~/venvs/vllm-oracle`). Base `origin/main` `55596792` (vllm.cpp), isolated worktree
+`pin-advance-scope`. **TARGET: vLLM `origin/main` `55596792` + transformers 5.14.1 /
+torch 2.13.0 / flashinfer 0.6.15 / cutlass-dsl 4.6.0 — ONE coherent version unblocks
+all three blockers (no tradeoff):** DFlash vllm#40898 via #47914 (mixed drafts
+construct under `VLLM_USE_V2_MODEL_RUNNER=1` = our MRV2) + follow-ups
+#48113/#48167/#48524; Gemma-4 mm via transformers 5.14.1 shipping
+`transformers.models.gemma4`; OLMo-3 via the new native `olmo3.py`
+(`rope_parameters.get(attn_type,...)`) + 5.14.1 nested schema. No release tag has
+the fixes (v0.25.0 predates all three) ⇒ target is a main commit. **GOLDEN-DRIFT
+HONESTY: advancing likely drifts the 2 NVFP4 hybrid gates (27B/35B) + 32B-NVFP4A16
++ Coder (~4 core re-captures) + a diff pass over ~30 model-matrix rows** — the
+Torch/CUTLASS/FlashInfer + NVFP4-MoE + rmsnorm-quant-fusion changes move the oracle.
+Owns ONLY records: `.agents/specs/pin-advance.md` (new) + the record surfaces
+(`.agents/coordination.md` this note, `.agents/roadmap_v1.md`, `.agents/state.md`,
+`.agents/parity-ledger.md`, `README.md`, `docs/BENCHMARKS.md`). Did NOT touch any
+model/kernel/runtime source, any matrix ACTIVE/SPIKE row, or the oracle venv ⇒
+SACRED gates byte-identical by construction (not re-run).
+
 **DFlash D0 readiness note (2026-07-26, `CLAIM-DFLASH-D0`, DONE, NOT pushed —
 FULL SHA reported to caller).** The gating oracle-gateability check for `SPEC-DFLASH`
 (rows `SPEC-DFLASH`, `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm`). Base
