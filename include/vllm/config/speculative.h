@@ -70,6 +70,22 @@ struct SpeculativeConfig {
     return cfg;
   }
 
+  // ResolveDflash: build the scheduler-facing SpeculativeConfig for a z-lab DFlash
+  // draft (SPEC-DFLASH D4). Mirrors speculative.py method resolution for "dflash"
+  // (:1172 use_dflash) + the num_speculative_tokens = block-derived k the loader
+  // reads off the draft's dflash_config. Unlike MTP there is no n_predict-module
+  // divisibility constraint (the block drafter is non-autoregressive); k is taken
+  // as given (the CLI value, or the draft's block-1 default resolved by the loader).
+  // n_predict stays 0 (not an n_predict-style method); the extra scheduler
+  // lookahead slot comes from use_dflash()/NumLookaheadTokens() (already coded).
+  static SpeculativeConfig ResolveDflash(int num_speculative_tokens_k) {
+    SpeculativeConfig cfg;
+    cfg.method = "dflash";
+    cfg.n_predict = 0;
+    cfg.num_speculative_tokens = num_speculative_tokens_k;
+    return cfg;
+  }
+
   // num_speculative_tokens resolved to a concrete k (falls back to n_predict).
   int ResolvedNumSpeculativeTokens() const {
     return num_speculative_tokens.value_or(n_predict);
@@ -110,11 +126,12 @@ struct SpeculativeConfig {
 
 // Parse vLLM's `--speculative-config` JSON (SPEC-MTP I5d). Mirrors the subset of
 // vllm/engine/arg_utils.py speculative-config handling the CLI needs: the
-// `method` string and the optional `num_speculative_tokens`. Only "mtp" is
-// supported at this pin (the two gate checkpoints); any other method throws. The
+// `method` string and the optional `num_speculative_tokens`. "mtp" and "dflash"
+// (SPEC-DFLASH D4) are supported at this pin; any other method throws. The
 // returned config has n_predict == 0 — the loader resolves it from the model's
-// mtp_num_hidden_layers via SpeculativeConfig::ResolveMtp once the HF config is
-// known. Throws std::invalid_argument on a malformed document / unknown method.
+// mtp_num_hidden_layers via SpeculativeConfig::ResolveMtp (MTP) or the draft's
+// dflash_config via ResolveDflash (DFlash) once the HF config is known. Throws
+// std::invalid_argument on a malformed document / unknown method.
 SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text);
 
 }  // namespace vllm

@@ -24738,3 +24738,38 @@ reported to caller.
   §6 D3 row, model-matrix DFlash rows, README (both DFlash passages), `docs/BENCHMARKS.md`,
   ledger, this entry. **D3 DONE**; D4 (engine loop) + D5 (SACRED) + D6 (throughput/CUDA
   graph) remain. `benchmark_binding=false`. NOT pushed; FULL SHA reported to caller.
+
+- **2026-07-26** — **DFlash D4 (`DF-ENGINE-INTEGRATION`, `CLAIM-DFLASH-D4D5`, branch
+  `dflash-d4d5` off `origin/main` `4b6ef54c`): the propose brick + `dflash` config-select
+  CODE LANDED + CPU-GATED; the runner-loop integration + D5 e2e are the GPU-promotion
+  PENDING (like D2/D3 were).** Landed the NON-autoregressive whole-block DFlash propose
+  brick that swaps in for the MTP k=1 `MtpProposePrefill`: NEW
+  `include/vllm/v1/worker/gpu/spec_decode/dflash/speculator.{h,cpp}` — `DflashProposeBlock`
+  composes the landed D3 `Qwen3DFlashModel::ForwardBlockLogitsWithContext` (context-aware
+  (1+k) block forward) with the greedy `SampleDflashBlockDrafts` (argmax over each of the k
+  mask positions; the anchor row at block offset 0 is NOT sampled, `sample_from_anchor=false`;
+  `dflash/speculator.py:300-413` + `_generate_draft :242-273`). Extended the config-select
+  seam: `ParseSpeculativeConfigJson` (`config/speculative.cpp`) + `SpeculativeConfig::ResolveDflash`
+  (`config/speculative.h`) now accept `method:"dflash"` alongside `"mtp"` (`NumLookaheadTokens()=k+1`
+  already coded). CPU gate `tests/vllm/v1/spec_decode/test_dflash_propose.cpp` **5 cases / 19
+  assertions** GREEN (`build-cpu`, `-Werror`-clean TU) on synthetic draft weights: the greedy
+  sampler argmaxes the k mask rows + SKIPS the anchor (**RED-first: a sampler reading the anchor
+  row fails 4/5 cases / 6 assertions**), the brick composes forward+sampler exactly, the
+  empty-context brick degenerates to the D2 context-free argmax, and `method:"dflash"` parses with
+  lookahead k+1 (`dspark` still throws). The diff is additive + config-gated ⇒ the MTP +
+  non-speculative engine paths are byte-identical BY CONSTRUCTION (`git diff --stat` = a new
+  speculator TU + the config accept-list widening + CMake + the test; NO runner/model/loader/scheduler
+  edit). **D5 e2e PENDING (GPU-promotion, exactly the D2/D3 shape):** the runner verify/propose-loop
+  wiring — loader building the z-lab draft (`LoadQwen3DFlash` + a `ResolveSpecConfig` dflash branch),
+  runner-owned DFlash-draft storage, the `aux_tap` capture on the verify forward (D1
+  `ForwardDeviceMultiTap`), the per-request context accumulation across steps (append this step's
+  `CombineAuxFeatures` of the accepted tokens, roll back on rejection — the numerically-delicate part
+  that needs GPU iteration, the I5e async-input-combine bug class), and the propose-branch swap in
+  `GPUModelRunner::propose_drafts` gated on `method=="dflash"` — then the e2e gate `our-DFlash-ON ==
+  vLLM-DFlash-ON` STRICT mode-matched on `tests/parity/goldens/dflash_27b/dflash_27b_spec_on.json` +
+  nonzero acceptance ≈ vLLM's (2.2/8.8/4.75/4.57) + spec-OFF byte-identity (27B SACRED 235/235 + 27B
+  MTP 9/9). Records advanced: spec §0 D4 RESULT + §6 D4 row, engine-matrix `SPEC-DFLASH` (also
+  refreshed the stale D2-GPU/D3 status), model-matrix DFlash rows + checklist, roadmap C3, coordination
+  `CLAIM-DFLASH-D4D5` (claim row), README (both DFlash passages), `docs/BENCHMARKS.md`, ledger, this
+  entry. Seven record checkers green by bare RC. `benchmark_binding=false`. NOT pushed; FULL SHA
+  reported to caller.
