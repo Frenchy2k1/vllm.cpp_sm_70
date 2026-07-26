@@ -95,6 +95,29 @@ from the target), so the loader now tolerates their absence. The deterministic C
 (op 12 assertions, model 95 assertions, RED-first) and the causal path byte-identity
 (`test_ops_attention`, `test_qwen3_forward` unchanged) still hold.
 
+**DFlash D3 (`DF-DRAFT-KV-PREP`) - context-KV precompute + prepare_dflash_inputs CODE LANDED +
+CPU-GATED (2026-07-26, `CLAIM-DFLASH-D3`); GPU numeric parity PENDING on dgx.** `benchmark_binding
+=false` (a correctness gate, not a throughput number - no speed A/B until the engine loop, D4/D6).
+Two new pieces landed ADDITIVE (git diff --stat: only `qwen3_dflash.{h,cpp}` +487 and
+`tests/CMakeLists.txt` +2; NO CUDA, NO shared causal-path/scheduler/vt-op edit): (1)
+`PrepareDflashInputs`, a pure-integer HOST port of `_prepare_dflash_inputs_kernel`
+(dflash/speculator.py:472-618); (2) `PrecomputeContextKV` + `ForwardBlockLogitsWithContext`, the
+context-KV precompute (precompute_and_store_context_kv, qwen3_dflash.py:548-619) reusing the
+landed MatmulBT/RmsNorm/RopeNeox and the context-aware forward reusing the UNCHANGED D2
+`vt::DFlashBlockAttention` via a combined [context;block] sequence (no new kernel). CPU gate
+`test_dflash_kvprep` 6 cases / 114 assertions GREEN: prepare_dflash_inputs INTEGER bit-exact vs a
+hand-computed 2-request reference (ids/positions/query+context slots/sample maps/seq_lens/padding),
+RED-first proven (breaking valid_ctx_end = ctx_end - num_rejected fails 4 assertions); context-KV V
+matches an f32 envelope reference and hidden_norm (K+V) / k_norm (K only) / RoPE position (K only)
+are each RED-proven load-bearing; the context-aware forward degenerates EXACTLY to the D2
+context-free forward at empty context (consistency) and diverges when context is present
+(load-bearing), with per-request block isolation. Inertness: `test_qwen3_dflash_forward` 95/95 and
+`test_ops_dflash_block_attn` 12/12 byte-identical (additive-only diff). PENDING on dgx (no
+GPU/nvcc/cutlass on the dev box, as D2): the numeric parity vs the vLLM reference dump
+(`scripts/spec/d3_dflash_kvprep_ref.py`: context-KV envelope + prepare bit-exact + block-proposal
+STRICT-or-near-tie) and the 27B SACRED 235/235 + MTP 9/9 + D2 draft-parity re-runs. No new CUDA
+kernel, so the `-Werror`/compute-sanitizer gate is N/A for D3.
+
 **Pin-advance target SELECTED (SCOPE only, no measurement) - PENDING execution
 (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, `.agents/specs/pin-advance.md`).** The
 single coherent target that unblocks DFlash + Gemma-4 multimodal + OLMo-3 is vLLM
