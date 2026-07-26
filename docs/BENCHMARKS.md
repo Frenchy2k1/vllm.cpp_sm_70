@@ -95,9 +95,9 @@ from the target), so the loader now tolerates their absence. The deterministic C
 (op 12 assertions, model 95 assertions, RED-first) and the causal path byte-identity
 (`test_ops_attention`, `test_qwen3_forward` unchanged) still hold.
 
-**DFlash D3 (`DF-DRAFT-KV-PREP`) - context-KV precompute + prepare_dflash_inputs CODE LANDED +
-CPU-GATED (2026-07-26, `CLAIM-DFLASH-D3`); GPU numeric parity PENDING on dgx.** `benchmark_binding
-=false` (a correctness gate, not a throughput number - no speed A/B until the engine loop, D4/D6).
+**DFlash D3 (`DF-DRAFT-KV-PREP`) - context-KV precompute + prepare_dflash_inputs DONE, GPU
+numeric-parity GREEN (2026-07-26, `CLAIM-DFLASH-D3`, dgx GB10 sm_121a, oracle vLLM 0.26.0.dev0).**
+`benchmark_binding=false` (a correctness gate, not a throughput number - no speed A/B until the engine loop, D4/D6).
 Two new pieces landed ADDITIVE (git diff --stat: only `qwen3_dflash.{h,cpp}` +487 and
 `tests/CMakeLists.txt` +2; NO CUDA, NO shared causal-path/scheduler/vt-op edit): (1)
 `PrepareDflashInputs`, a pure-integer HOST port of `_prepare_dflash_inputs_kernel`
@@ -112,11 +112,21 @@ matches an f32 envelope reference and hidden_norm (K+V) / k_norm (K only) / RoPE
 are each RED-proven load-bearing; the context-aware forward degenerates EXACTLY to the D2
 context-free forward at empty context (consistency) and diverges when context is present
 (load-bearing), with per-request block isolation. Inertness: `test_qwen3_dflash_forward` 95/95 and
-`test_ops_dflash_block_attn` 12/12 byte-identical (additive-only diff). PENDING on dgx (no
-GPU/nvcc/cutlass on the dev box, as D2): the numeric parity vs the vLLM reference dump
-(`scripts/spec/d3_dflash_kvprep_ref.py`: context-KV envelope + prepare bit-exact + block-proposal
-STRICT-or-near-tie) and the 27B SACRED 235/235 + MTP 9/9 + D2 draft-parity re-runs. No new CUDA
-kernel, so the `-Werror`/compute-sanitizer gate is N/A for D3.
+`test_ops_dflash_block_attn` 12/12 byte-identical (additive-only diff). GPU NUMERIC-PARITY GREEN on
+dgx: the decisive gate `test_qwen3_dflash_kvprep_parity` 61/61 vs the REAL vLLM draft (via
+`collective_rpc` into the V2 worker, mm-limited + gpu_util 0.30) - (1) prepare_dflash_inputs INTEGER
+BIT-EXACT vs vLLM's ACTUAL Triton `_prepare_dflash_inputs_kernel`, which the reference
+(`scripts/spec/d3_dflash_kvprep_ref.py`) launches directly on GPU and cross-checks against the numpy
+replica (`kernel_matches_numpy=true`); (2) context-KV within envelope, worst K rel-L2 0.31 percent,
+worst V rel-L2 0.26 percent across all five draft layers (which also proves our per-layer qkv_proj
+K/V slicing reproduces vLLM's fused `_fused_kv_weight` projection); (3) block proposal worst
+layer-hidden rel-L2 1.44 percent, final 1.02 percent, and proposed ids 13 deterministic rows STRICT
+top-1 + 3 bf16-near-tie rows cluster-matched = 16/16. The CUDA build is warning-clean under
+`-Werror` (D3 adds no kernel, so the compute-sanitizer gate is N/A for D3), the CPU
+`test_dflash_kvprep` 114/114 re-passed on the dgx build (RED proofs load-bearing), and inertness is
+GREEN and proven: 27B text SACRED `test_qwen27_paged_engine` 235/235 + 27B MTP
+`test_qwen27_spec_decode` 9/9 (16/16 drafts accepted) + D2 draft-parity `test_qwen3_dflash_draft_parity`
+37/37, all byte-identical.
 
 **Pin-advance target SELECTED (SCOPE only, no measurement) - PENDING execution
 (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, `.agents/specs/pin-advance.md`).** The
