@@ -155,6 +155,13 @@ vllm_cpp_add_test(test_qwen3_5_vl_e2e vllm/multimodal/test_qwen3_5_vl_e2e.cpp)
 target_compile_definitions(test_qwen3_5_vl_e2e PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
   GOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3_5_27b")
+# Vision-tower SPEED A-B (CLAIM-MULTIMODAL-SPEED-TOWER): baseline host-weights
+# forward (per-call marshal+compute) vs the resident-weights fast forward (compute
+# only), on the Qwen3.6-27B vision tower. Timing only; correctness is proven by
+# test_qwen3_5_vl_e2e (the host overload now delegates to the resident forward).
+vllm_cpp_add_test(bench_qwen3_5_vl_tower vllm/multimodal/bench_qwen3_5_vl_tower.cpp)
+target_compile_definitions(bench_qwen3_5_vl_tower PRIVATE
+  MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl")
 # Multimodal M3c VIDEO-processor UNIT gate: C++ Qwen3-VL video pipeline
 # (pixel_values_videos/grid/timestamps/timestamp-interleaved expansion) BIT-identical
 # to the vLLM 0.25.0 oracle fixture (tests/vllm/multimodal/fixtures/qwen3vl_video).

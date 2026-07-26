@@ -4,6 +4,7 @@
 # docs/BENCHMARKS.md, not on the deployment surface. scripts/check-env-doc.py
 # treats a name here as a known kernel-internal knob. A NEW production env
 # var must be documented in docs/ENVIRONMENT.md OR added here.
+VLLM_MM_TOWER_PROFILE
 VT_ARCH_TACTIC_STATS
 VT_ATTN_DECODE_GQA
 VT_ATTN_DECODE_OPT

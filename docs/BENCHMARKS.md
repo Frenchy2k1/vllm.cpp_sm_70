@@ -213,6 +213,27 @@ vision attn not on FA2 varlen), (2) route mm decode through the graphed paged ru
 (neutral c1-27B, the lever for audio/c2+), (3) batched mm serving (structural, needed
 for c2+). No trivial win surfaced; no source touched.
 
+**MULTIMODAL SPEED - TOWER LEVER EXECUTED: vision tower now BEATS vLLM's eager encode
+(2026-07-26, `CLAIM-MULTIMODAL-SPEED-TOWER` [spec](../.agents/specs/multimodal-speed.md)
+S7).** `benchmark_binding=false` (tower A-B via a test driver, not a production serving
+binding; vLLM eager encode is the honest denominator - vLLM does NOT graph/compile the
+encoder, `compile_mm_encoder:False`). dgx GB10 sm_121a, build cutlass 4.5.0 + FA2 +
+Triton arch 121a; GPU under `flock`, cold rep discarded. **W0 attribution** (nsys
+`cuda_gpu_kern_sum`): **98.9% of the ~1.6 s tower forward = the naive
+`vt::cuda::AttentionKernel`** (56 ms/block x 27 over 784 patches; GEMMs <0.5%,
+marshalling 24% of the old total) - REFUTES the earlier "FA2-varlen / QKV" suspicion
+(the `cudaFree` 93% in `cuda_api_sum` was a sync-artifact red herring). **W1 fix:** (1)
+one-time resident-weight load (BIT-IDENTICAL, moves ~497 ms marshalling off the per-image
+path); (2) `AttentionDenseFast`, a warp-scoped online-softmax op (no `__syncthreads`;
+`kAttention` untouched -> text byte-identical). **RESULT: per-image tower forward 2114 ->
+148 ms (14.3x); vs vLLM ~250 ms eager encode = 0.59x, FASTER.** One-time weight load
+~484 ms (amortized). **Correctness (RED line, HELD):** 27B image e2e STRICT **32/32**,
+27B video STRICT **32/32**, 4B DeepStack image STRICT **32/32**, `test_ops_attention`
+**37239/37239** (kAttention intact), 27B text SACRED **235/235**; clean `-Werror` 0 warn,
+compute-sanitizer memcheck **0 errors**. Lever #1 CLOSED; remaining DONE-bar = batched/
+graphed mm serving (c2+) + audio our-side. `benchmark_binding=false`, SPEED still pending
+on the batched-serving axis.
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =

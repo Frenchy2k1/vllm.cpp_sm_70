@@ -23800,3 +23800,39 @@ co-resident, cold rep discarded.
   All seven record checkers green by bare RC. Not pushed; FULL SHA reported.
   NEXT: nsys-driven vision-tower lever; build a disk-safe timed `test_voxtral_e2e` for
   the audio our-side number; then the graphed-decode routing (audio/c2+).
+
+## 2026-07-26 — MULTIMODAL SPEED tower lever #1 EXECUTED (`CLAIM-MULTIMODAL-SPEED-TOWER`)
+
+- Base `origin/main` `27bc3054`; isolated worktree `/home/mudler/_git/vllm-tower-speed`
+  (branch `spike/mm-tower-speed`); dgx build+profile+gate `~/work/mm-tower-speed`
+  (cutlass 4.5.0 + FA2 + Triton arch 121a), all GPU under `flock $HOME/gpu.lock`.
+- **W0 (nsys, measure-don't-guess).** `cuda_gpu_kern_sum` on the Qwen3.6-27B tower
+  forward: **98.9% = the naive `vt::cuda::AttentionKernel`** (270 inst, avg 56.3 ms/block
+  over 784 patches); cutlass/nvjet GEMMs <0.5%; weight marshalling 24% of the old total.
+  REFUTES the scoping §5 suspicion (vision-attn-not-on-FA2-varlen / unfused-QKV). The
+  `cuda_api_sum` `cudaFree`-93% was a red herring (cudaFree synchronizes ⇒ its wall-time
+  = waiting on the slow kernel). Root cause: grid(t,hq) one block per (query,head) with a
+  per-key block-reduction `__syncthreads` storm.
+- **W1 (two correctness-preserving fixes).** (1) `PrepareVisionDeviceWeights` — the
+  host f32→bf16 convert + ~0.5 GiB H2D upload made device-RESIDENT (one-time model-load,
+  not per-image), forward runs pure kernels + tiny per-image uploads; host-weights
+  overload kept as a BIT-IDENTICAL wrapper (0 mismatch); per-block scratch hoisted out of
+  the ViT loop. (2) `AttentionDenseFast` — NEW additive warp-scoped online-softmax op
+  (`cuda_ops.cu` `AttentionWarpKernel`; `ops.h`/`ops.cpp`/`cpu_ops.cpp` plumbing): one warp
+  per (query,head), butterfly `__shfl_xor` head_dim reduce (no `__syncthreads`), register
+  accumulator — same f32 online-softmax as `AttentionKernel`, warp-scoped. Separate op ⇒
+  `kAttention` (text/audio) byte-identical. Vision tower calls it per frame.
+- **RESULT: per-image tower forward 1543 (old naive) → 148.4 ms = 10.4×; vs the original
+  2114 ms scoping baseline = 14.3×; vs vLLM 0.25.0 ~250 ms EAGER encode = 0.59× — FASTER.**
+  One-time weight load ~484 ms (amortized).
+- **Correctness (RED line HELD):** 27B image e2e STRICT 32/32, 27B video STRICT 32/32,
+  4B DeepStack image STRICT 32/32, `test_ops_attention` 37239/37239 (kAttention intact),
+  27B text SACRED 235/235. Clean CUDA `-Werror` 0 warn (cutlass+FA2 banner); compute-
+  sanitizer memcheck 0. M2a tower UNIT gate SKIPPED on this tree (needs a script-dumped
+  `visual.*` dir absent from the archive; the STRICT e2e passes are the binding proof).
+- Records: `.agents/specs/multimodal-speed.md` §7, `docs/BENCHMARKS.md`
+  (`benchmark_binding=false`), README mm line, engine-matrix `ENG-MM-QWEN36-VL-FORWARD`,
+  roadmap `ROAD-V1-MM`, coordination claim, ledger. Lever #1 CLOSED; DONE-bar still unmet
+  (batched/graphed mm serving c2+ + audio our-side). Not pushed; FULL SHA reported.
+  NEXT: batched mm serving (encoder-cache + scheduler hooks) for c2+/`image_url`; the
+  audio our-side timing.

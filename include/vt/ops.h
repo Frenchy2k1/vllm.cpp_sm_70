@@ -103,6 +103,7 @@ enum class OpId : uint8_t {
   kMoeRouterTopK,
   kMoeCombine,
   kAttention,
+  kAttentionDenseFast,
   kReshapeAndCache,
   kConcatAndCacheMla,
   kMlaDecodeAttention,
@@ -1656,6 +1657,16 @@ void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tenso
 // f32 or bf16 in, f32/bf16 out; all softmax/accumulation math in f32.
 void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                const Tensor& value, const AttentionArgs& args);
+
+// Same contract and math as Attention (dense full/causal, GQA broadcast, f32
+// online-softmax), but the CUDA impl is WARP-scoped (one warp per (query,head),
+// __shfl head_dim reduction, register accumulator, no __syncthreads) — the fast
+// path for small head_dim dense attention (the Qwen3-VL vision tower). NOT
+// bit-identical to Attention (different head_dim partial-sum grouping), same f32
+// math; adopt per token-exact gate. On CPU it dispatches to the SAME kernel as
+// Attention (byte-identical there). Separate op so kAttention stays untouched.
+void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                        const Tensor& value, const AttentionArgs& args);
 
 // --- Paged KV-cache write (M1.6). Semantics ported from the FlashAttention
 // path of vllm/csrc/.../cache_kernels.cu::reshape_and_cache_flash @ e24d1b24;

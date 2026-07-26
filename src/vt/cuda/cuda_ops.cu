@@ -1188,6 +1188,113 @@ void AttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tenso
 }
 
 // ---------------------------------------------------------------------------
+// AttentionDenseFast — a WARP-scoped variant of the AttentionKernel above with
+// the IDENTICAL online-softmax recurrence (flash-style, f32 accumulation), for
+// dense full/causal attention over small head_dim (the Qwen3-VL vision tower:
+// head_dim 72, non-causal). One WARP (not a whole block) owns each (query,head):
+// the head_dim reduction is a butterfly `__shfl_xor` (NO __syncthreads), the
+// output accumulator lives in registers, and the softmax stats are tracked per
+// lane. This removes the naive kernel's per-key block-reduction __syncthreads
+// storm — nsys attributed ~99% of the ViT tower forward to that kernel (56 ms
+// per block at 784 tokens). It is NOT bit-identical to AttentionKernel (the
+// head_dim partial-sum grouping over 32 lanes differs from the block version),
+// but is the same f32-online-softmax math within the tower's bf16 envelope.
+// Registered as a SEPARATE op (kAttentionDenseFast) so kAttention — used by the
+// text/audio paths — is byte-identical. Grounded in the online-softmax /
+// FlashAttention recurrence we already ship (src/vt/cuda/flash_attn/).
+template <typename Tin, typename Tout>
+__global__ void AttentionWarpKernel(Tout* out, const Tin* query, const Tin* key, const Tin* value,
+                                    int64_t hq, int64_t hk, int64_t d, int64_t t, float scale,
+                                    bool causal) {
+  constexpr int kMaxPerLane = 8;  // head_dim up to 256
+  const int64_t i = blockIdx.x;   // query position
+  const int64_t h = blockIdx.y;   // q-head
+  const int64_t g = h / (hq / hk);
+  const int lane = static_cast<int>(threadIdx.x);  // 0..31
+  const int64_t jmax = causal ? i : t - 1;
+  const int64_t qoff = (i * hq + h) * d;
+  const int npl = static_cast<int>((d + 31) / 32);  // elements this lane owns
+  float qreg[kMaxPerLane];
+  float acc[kMaxPerLane];
+#pragma unroll
+  for (int k = 0; k < kMaxPerLane; ++k) {
+    qreg[k] = 0.0f;
+    acc[k] = 0.0f;
+  }
+  for (int k = 0; k < npl; ++k) {
+    const int e = lane + 32 * k;
+    if (e < d) qreg[k] = Load(query, qoff + e);
+  }
+  float m = -CUDART_INF_F, l = 0.0f;
+  for (int64_t j = 0; j <= jmax; ++j) {
+    const int64_t koff = (j * hk + g) * d;
+    float part = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kMaxPerLane; ++k) {
+      const int e = lane + 32 * k;
+      if (k < npl && e < d) part += qreg[k] * Load(key, koff + e);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
+    const float s = part * scale;
+    const float m_new = fmaxf(m, s);
+    const float corr = expf(m - m_new);  // 0 on the first key (m == -inf)
+    const float p = expf(s - m_new);
+    const int64_t voff = (j * hk + g) * d;
+#pragma unroll
+    for (int k = 0; k < kMaxPerLane; ++k) {
+      const int e = lane + 32 * k;
+      if (k < npl && e < d) acc[k] = acc[k] * corr + p * Load(value, voff + e);
+    }
+    l = l * corr + p;
+    m = m_new;
+  }
+  const float inv = 1.0f / l;
+  for (int k = 0; k < npl; ++k) {
+    const int e = lane + 32 * k;
+    if (e < d) Store(out, qoff + e, acc[k] * inv);
+  }
+}
+
+template <typename Tin>
+void LaunchAttentionWarp(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& key,
+                         const Tensor& value, const AttentionArgs& args) {
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  if (t == 0 || hq == 0 || d == 0) return;
+  VT_CHECK(d <= 256, "cuda attention-dense-fast: head_dim <= 256 only");
+  const dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq));
+  switch (out.dtype) {
+    case DType::kF32:
+      AttentionWarpKernel<Tin, float><<<grid, 32, 0, s>>>(
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk, d, t,
+          args.scale, args.causal);
+      break;
+    case DType::kBF16:
+      AttentionWarpKernel<Tin, __nv_bfloat16><<<grid, 32, 0, s>>>(
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk,
+          d, t, args.scale, args.causal);
+      break;
+    default: VT_CHECK(false, "cuda attention-dense-fast: unsupported out dtype");
+  }
+  Check(cudaGetLastError(), "attention-dense-fast launch");
+}
+
+void AttentionDenseFastKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                                  const Tensor& value, const AttentionArgs& args) {
+  switch (query.dtype) {
+    case DType::kF32:
+      LaunchAttentionWarp<float>(AsStream(q), out, query, key, value, args);
+      break;
+    case DType::kBF16:
+      LaunchAttentionWarp<__nv_bfloat16>(AsStream(q), out, query, key, value, args);
+      break;
+    default:
+      VT_CHECK(false, "cuda attention-dense-fast: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // fused_chain (TDR): the Tier-1 single-pass INTERPRETER over the canonical
 // (out, x, weight, residual) 4-operand shape. The Tier-0 composite is device-
 // agnostic (ops.cpp), dispatching each opcode to the standalone vt:: op. This
@@ -1370,6 +1477,8 @@ struct Registrar {
                    static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelCuda)));
     RegisterOp(OpId::kAttention, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernelCuda)));
+    RegisterOp(OpId::kAttentionDenseFast, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionDenseFastKernelCuda)));
     RegisterOp(OpId::kFusedChain, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernelCuda)));
   }
