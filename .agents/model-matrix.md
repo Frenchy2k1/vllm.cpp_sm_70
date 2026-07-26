@@ -40,9 +40,9 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 | ACTIVE | 20 |
 | GATING | 3 |
 | PARTIAL | 3 |
-| READY | 1 |
+| READY | 0 |
 | SPIKE | 8 |
-| BLOCKED | 5 |
+| BLOCKED | 6 |
 | INVENTORIED | 286 |
 | DONE | 0 |
 | **Total** | **326** |
@@ -63,7 +63,7 @@ Engaged architectures (the 40 non-`INVENTORIED` rows):
 | ✅ | `MistralForCausalLM` | Mistral-7B-v0.3 dense | full paged-engine SACRED gate 16/16 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-mistral-mistral-for-causal-lm` |
 | 🚧 | `Qwen3_5MTP` | Qwen3.5 MTP draft (spec-decode) | spec complete; correctness gate in progress (`GATING`) | `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp` |
 | 🚧 | `Qwen3_5MoeMTP` | Qwen3.5-MoE MTP draft (spec-decode) | spec complete; correctness gate in progress (`GATING`) | `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` |
-| 🚧 | `DFlashDraftModel` | Qwen3 DFlash draft (spec-decode) | spec complete (`READY`); not yet implemented | `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm` |
+| 🚫 | `DFlashDraftModel` | Qwen3 DFlash draft (spec-decode) | ORACLE-BLOCKED on vLLM 0.25.0 (D0 2026-07-26): the mixed-SWA/full z-lab Qwen3.6 drafts abort at `qwen3_dflash.py:93` `NotImplementedError` (mixed `layer_types` unsupported, vllm#40898); NOT config-fixable, no all-full variant exists. Draft downloads ungated + config confirmed. UNBLOCK = pin > 0.25.0 | `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm` |
 | 🚧 | model factory / self-registration | cross-cutting registry (not an arch) | CPU build + test suite green; dgx gate + no-regression campaign deferred (`GATING`) | `MODEL-FACTORY-registry` |
 | 📋 | `ChatGLMForCausalLM` | ChatGLM | scoped in the GLM/DSA spike, not implemented | `MODEL-TEXT-chatglm-chat-glmfor-causal-lm` |
 | 📋 | `DeepseekForCausalLM` | DeepSeek (plain MHA, not MLA) | scoped; this is a plain-MHA row, distinct from the MLA campaign | `MODEL-TEXT-deepseek-v2-deepseek-for-causal-lm` |
@@ -466,7 +466,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-SPEC-llama-eagle-eagle-llama-for-causal-lm` | `EagleLlamaForCausalLM` | `registry.py:588`; `vllm/model_executor/models/llama_eagle.py::EagleLlamaForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; EAGLE/EAGLE3 | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-llama4-eagle-eagle-llama4-for-causal-lm` | `EagleLlama4ForCausalLM` | `registry.py:589`; `vllm/model_executor/models/llama4_eagle.py::EagleLlama4ForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; EAGLE/EAGLE3 | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-minicpm-eagle-eagle-mini-cpmfor-causal-lm` | `EagleMiniCPMForCausalLM` | `registry.py:590`; `vllm/model_executor/models/minicpm_eagle.py::EagleMiniCPMForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; EAGLE/EAGLE3 | ☐ required | `INVENTORIED` | none | unassigned |
-| `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm` | `DFlashDraftModel` | `registry.py:591`; `vllm/model_executor/models/qwen3_dflash.py::DFlashQwen3ForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; sliding-window attention; DFlash | ✅ [DFlash spec](specs/dflash-spec-decode.md) | `READY` | none | unassigned |
+| `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm` | `DFlashDraftModel` | `registry.py:591`; `vllm/model_executor/models/qwen3_dflash.py::DFlashQwen3ForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; sliding-window attention; DFlash | ✅ [DFlash spec](specs/dflash-spec-decode.md) §0 D0 | `BLOCKED` | D0 oracle check (`CLAIM-DFLASH-D0`, 2026-07-26): RUN on dgx aborts constructing the mixed-SWA/full z-lab Qwen3.6 draft — `qwen3_dflash.py:93` `NotImplementedError` (mixed `layer_types`, vllm#40898); no all-full Qwen3.6 draft ⇒ NOT config-fixable. UNBLOCK = pin > 0.25.0 | unassigned |
 | `MODEL-SPEC-deepseek-v4-dspark-deepseek-v4-for-causal-lm` | `DSparkDraftModel` | `registry.py:592`; `vllm/models/deepseek_v4/__init__.py::DSparkDeepseekV4ForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MLA/latent KV; sliding-window attention; DSpark | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-qwen3-dspark-qwen3-dspark-for-causal-lm` | `Qwen3DSparkModel` | `registry.py:593`; `vllm/model_executor/models/qwen3_dspark.py::Qwen3DSparkForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; DSpark | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-laguna-dflash-dflash-laguna-for-causal-lm` | `DFlashLagunaForCausalLM` (v0.25.0 target-pending) | v0.25.0 target `registry.py:598`; `vllm/model_executor/models/laguna_dflash.py::DFlashLagunaForCausalLM` @ `702f481` | speculative draft / Laguna targets | draft runner; acceptance/sampling; full/sliding attention; DFlash | ☐ required | `INVENTORIED` | none | unassigned |

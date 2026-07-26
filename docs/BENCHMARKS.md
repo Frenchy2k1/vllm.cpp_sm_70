@@ -38,18 +38,25 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
-**DFlash speculative decode (block-diffusion) - PENDING, readiness assessed
-(2026-07-25, `SPEC-DFLASH` `READY`, `CLAIM-SPEC-DFLASH-READINESS`,
-[spec](../.agents/specs/dflash-spec-decode.md)).** `benchmark_binding=false`, NO
-number. Design-only readiness pass against the landed MTP machinery: verdict GREEN,
-dispatch-ready, no hardware/oracle/download blocker. Both z-lab draft checkpoints
-exist on HF (27B 1.73 GB / 35B 368 MB, bf16) and fit the 119 GiB pool; the dgx 0.25.0
-oracle constructs DFlash. Correctness gate (D5: our-DFlash-ON == our-spec-OFF == vLLM
-`--speculative-config dflash` greedy, token-for-token + nonzero acceptance) and the
-c1/c>1 throughput A/B (D6) are OWED once DFlash is implemented; the honest denominator
-is vLLM with the same DFlash speculative config. The single biggest measured-risk input
-is the GDN spec-state memory at k=15 (~2.3 GiB/req on the 27B at block-16). Repro: see
-the D0-D6 W-plan in the spec.
+**DFlash speculative decode (block-diffusion) - BLOCKED (no oracle baseline), D0
+oracle check RAN (2026-07-26, `SPEC-DFLASH` `BLOCKED`, `CLAIM-DFLASH-D0`,
+[spec §0](../.agents/specs/dflash-spec-decode.md)).** `benchmark_binding=false`, NO
+number and NO oracle baseline is capturable. The D0 decisive check RAN on dgx
+(`LLM(unsloth/Qwen3.6-27B-NVFP4, speculative_config={method:"dflash",
+model:"z-lab/Qwen3.6-27B-DFlash", num_speculative_tokens:16})`, flock, GPU sole-owner):
+the DFlash config is accepted and the NVFP4 target loads, but constructing the DFlash
+draft ABORTS at `qwen3_dflash.py:93` `NotImplementedError: DFlash does not yet support
+mixed sliding/full attention via layer_types` (upstream vllm#40898) - both z-lab Qwen3.6
+drafts (27B `[SWA×4,full]`, 35B `[SWA×5,full]`) are the unsupported mixed kind and no
+all-full Qwen3.6 draft exists, so it is not config-fixable. The 2026-07-25 "GREEN,
+oracle constructs DFlash" readiness was config-construct reasoning, now superseded by
+this RUN. Consequently the D5 correctness gate (our-DFlash-ON == our-spec-OFF == vLLM
+`--speculative-config dflash` greedy) has NO vLLM arm and the D6 throughput A/B has no
+denominator on the pin; both are BLOCKED until the oracle advances past 0.25.0 (resolving
+vllm#40898). The GDN spec-state memory at k=15 (~2.3 GiB/req on the 27B at block-16)
+remains the biggest measured-risk input for whenever it unblocks. Repro (re-run the moment
+the pin advances): `scripts/spec/d0_dflash_oracle_capture.py --mode spec-on`; evidence
+`tests/parity/goldens/dflash_27b/{D0_VERDICT.md,d0_blocked_traceback.txt}`.
 
 **MTP speculative decode, k=1 on the 27B GDN hybrid - SINGLE-REQUEST (c1)
 CORRECTNESS PROVEN AND THROUGHPUT AT/ABOVE vLLM ON EVERY MEASURED AXIS
