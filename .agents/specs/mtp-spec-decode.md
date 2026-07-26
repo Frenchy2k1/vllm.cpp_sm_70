@@ -952,3 +952,54 @@ tiers).
   we re-export GGUFs with the head.
 - Acceptance-rate parity tolerance: define "within noise" from ≥3 oracle runs
   (benchmark-protocol.md reproduction rule).
+
+## 9. SPEC-MTP → DONE (2026-07-26, `CLAIM-SPEC-MTP-DONE`, records-only)
+
+MTP k=1 speculative decoding is **COMPLETE and gated**; `SPEC-MTP` moves from
+`ACTIVE` to `DONE`. This is a records-only lifecycle transition (ZERO code) that
+reconciles the row to the state landed by I5e/I6/I7; the closing commit is I7
+`72f9fb1`.
+
+**The I6-owed DONE items are both closed:**
+- **(1) MIXED spec+non-spec `GdnBlockPaged` concurrency batch (I7).**
+  `GdnBlockPagedMixedSpec` (`src/vllm/model_executor/models/qwen3_5.cpp:3301`)
+  index_selects `mixed_qkv`/`a`/`b` by `spec_token_indx`/`non_spec_token_indx`
+  into compact groups, runs the I5a spec conv+recurrence over the spec rows and
+  the widened-cache-aware prefill conv+recurrence over the reclassified non-spec
+  rows (upstream forces `num_decodes==0` when a spec row exists,
+  `gdn_attn.py:243-251`), and index_copies the two cores back to their original
+  positions — a 1:1 mirror of `qwen_gdn_linear_attn.py::_forward_core:1329-1576`.
+  New row ops `vt::IndexSelect`/`vt::IndexCopy` (CUDA==CPU bit-exact, RED-first).
+  Proven MODEL-INDEPENDENTLY bit-exact: `mixed == pure spec + pure prefill` on
+  27B/35B dims (`tests/vllm/models/test_qwen3_5_gdn_spec_routing.cpp`), RED-first
+  by a broken merge; compute-sanitizer 0 on the mixed step + op.
+- **(2) Server-facing `--speculative-config` (I5d/I7).** Wired through the
+  OpenAI server (`examples/server/main.cpp`), the example CLI
+  (`examples/cli/main.cpp`) and the C ABI v6 (`src/capi/vllm_c.cpp` →
+  `ParseSpeculativeConfigJson` in `vllm_engine_load`). Absent/NULL/empty ⇒
+  byte-identical no-speculation engine; a malformed or unsupported document
+  aborts load loudly (not silently ignored).
+
+**The c>1 DONE criterion (user-ratified).** At concurrency > 1 the DONE bar is
+the near-tie-distributional form (ours ∈ vLLM's batch-nondeterministic greedy
+set) plus the SPEED delta — NOT strict token-exact. Strict c>1 token identity is
+a proven bf16-batch-nondeterminism MODEL impossibility: the spec-OFF 27B greedy
+itself differs at `max_num_seqs` 4-vs-1 on 2/3 short prompts with no spec
+involved, and this affects vLLM identically. Correctness at c>1 therefore rests
+on the model-independent bit-exact split/merge proof + acceptance parity, with
+token-exact strict at c1.
+
+**Gate evidence (I5e/I6/I7, on this exact code):** 27B three-way token-exact at
+c1 (acceptance 16/16); c1 ours AT/ABOVE vLLM every axis (TPOT ~1.04x faster,
+output tput +4.6%/+3.9%, acceptance 0.85/0.92 vs 0.838); c2-c8 ours
+ON-PAR-OR-ABOVE vLLM spec-ON (output tput within ~±2%, ~1.5x spec speedup at
+every concurrency, acceptance 0.84-0.92 vs 0.835); spec-OFF byte-identical SACRED
+(27B 235/235, 35B 315/315, Coder 138/138); CUDA `-Werror` 0 warnings. Byte
+identity of the DONE transition holds by construction (`git diff --stat` =
+records only). Ledger: `.agents/parity-ledger.md` (2026-07-26 SPEC-MTP DONE row).
+
+**Tracked follow-ons (own live rows, NOT DONE blockers):** the 35B
+`Qwen3_5MoeMTP` full e2e three-way token gate (M-mtp-2,
+`MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` stays `GATING` — mechanism landed +
+proven bit-exact at 35B dims, head oracle-parity, e2e gate pending) and
+`SPEC-DFLASH` (oracle-BLOCKED on vLLM 0.25.0, vllm#40898).

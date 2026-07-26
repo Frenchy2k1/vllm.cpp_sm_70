@@ -55,7 +55,7 @@ vllm.cpp implements an intentionally focused subset of vLLM, held to token-for-t
 | OpenAI server | Supported (subset) | `/v1/completions`, `/v1/chat/completions`, streaming SSE, `/v1/models`, `/health`, `/version` |
 | Tokenizers | Supported | Byte-level BPE (Qwen/Llama-3/OPT/GPT-2/DeepSeek/OLMo-2) and SentencePiece BPE (Mistral/Gemma), plus GGUF vocab; added-token `lstrip`/`rstrip` whitespace semantics (e.g. Phi-4-mini's special tokens); byte-exact vs the vLLM oracle |
 
-Speculative decoding (MTP, k=1) is available on the Qwen3.5/3.6 checkpoints via `--speculative-config`, at concurrency 1 and above. Not yet supported: multimodal / vision, LoRA, multi-GPU, and the full tool-calling template surface. See [Serving and API notes](#serving-and-api-notes).
+Speculative decoding (MTP, k=1) is available on the Qwen3.5/3.6 checkpoints via `--speculative-config`, at concurrency 1 (token-exact and faster than vLLM) and above (mixed-batch concurrency, on par or above vLLM). Not yet supported: multimodal / vision, LoRA, multi-GPU, and the full tool-calling template surface. See [Serving and API notes](#serving-and-api-notes).
 
 ## Supported models
 
