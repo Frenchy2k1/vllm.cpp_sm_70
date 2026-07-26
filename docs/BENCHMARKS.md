@@ -402,6 +402,35 @@ on dgx: prep `minicpm3-convert-safetensors.py`, capture `glm4-oracle-capture.py 
 ./build/tests/test_minicpm3_paged_engine`. SPEED: **PENDING** - no throughput measured (row is `ACTIVE`,
 not `DONE`; EAGER - the decode CUDA-graph is a follow-up). No throughput number is claimed here.
 
+**Yi (Llama architecture, `01-ai/Yi-Coder-1.5B-Chat`) - CORRECTNESS-COMPLETE, SPEED PENDING
+(2026-07-26, recent-dense trivial-tail, `CLAIM-SWEEP-RECENT-DENSE`, base `origin/main` `4fff34f7`).**
+`benchmark_binding=false`. CORRECTNESS: **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0
+(per-prompt K=5 ALL-DETERMINISTIC ⇒ STRICT bar): 13/16 strict token-exact + 3/16 bf16 near-tie-band,
+max teacher-forced gap 0.125 nats, 0 forward-divergent (`tests/parity/test_yi_paged_engine.cpp`,
+140/140 assertions, dgx-only). **ZERO code delta**: modern Yi declares `architectures:["LlamaForCausalLM"]`
+so it runs on the LANDED Llama path unchanged (no `YiForCausalLM` alias - vLLM 0.25.0 registers none).
+W0 RUN-VERIFIED (vLLM builds+runs `Yi-Coder-1.5B-Chat` coherently; ungated + safetensors). The Llama
+forward is separately STRICT-proven (`Llama-3.2-1B` re-gated 16/16 UNCHANGED). Gated ID-based via the
+`TokensPrompt` path (`scripts/stage-tokenizer-metaspace.py` stages a Metaspace tokenizer.json for engine
+construction). SPEED: **PENDING** - no throughput measured. No throughput number is claimed here.
+
+**InternLM3 (`InternLM3ForCausalLM`, `internlm/internlm3-8b-instruct`) - CORRECTNESS-COMPLETE, SPEED
+PENDING (2026-07-26, recent-dense trivial-tail, `CLAIM-SWEEP-RECENT-DENSE`, base `origin/main` `4fff34f7`).**
+`benchmark_binding=false`. CORRECTNESS: **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0
+(per-prompt K=5 ALL-DETERMINISTIC ⇒ STRICT bar): 14/16 strict token-exact + 2/16 bf16 near-tie-band,
+**max teacher-forced gap 0.0000 nats**, 0 forward-divergent (`tests/parity/test_internlm3_paged_engine.cpp`,
+140/140 assertions, dgx-only). A **one-line Llama ALIAS** (`REGISTER_VLLM_MODEL(internlm3_llama,
+"InternLM3ForCausalLM", kLlamaFactory, kLlamaInfo)`): InternLM3 is a PLAIN Llama arch in vLLM 0.25.0
+(`registry.py:134`→llama), NOT InternLM2+sliding-window - RMSNorm + NeoX + GQA(kv=2) + SiLU-SwiGLU +
+dynamic-NTK rope factor 6.0 (identity within the trained window, the same path InternLM2's factor-2.0 gate
+exercises), no `sliding_window`, untied lm_head. W0 RUN-VERIFIED (vLLM builds+runs `internlm3-8b-instruct`
+coherently; ungated + safetensors; the OLMo-3 lesson). **RED (mutual-confirmation)**: the plain-Llama alias
+gates 16/16 ⇒ InternLM3 does NOT need InternLM2's fused-`wqkv` interleaved de-split (RED-proven load-bearing
+for InternLM2). Additive-only ⇒ `Llama-3.2-1B` re-gated 16/16 UNCHANGED. Gated ID-based via `TokensPrompt`
+(tokenizer.json built by SentencePiece→BPE extraction of the custom slow `InternLM3Tokenizer`,
+`scripts/stage-tokenizer-metaspace.py`). **CLOSES the recent-dense TEXT tier.** SPEED: **PENDING** - no
+throughput measured. No throughput number is claimed here.
+
 **StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) - CORRECTNESS-COMPLETE, SPEED PENDING
 (2026-07-26, rank-4 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`).** CORRECTNESS:
 **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0 (per-prompt K=5 ALL-DETERMINISTIC ⇒

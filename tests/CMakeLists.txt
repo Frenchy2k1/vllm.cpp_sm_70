@@ -744,6 +744,18 @@ target_compile_definitions(test_internlm2_paged_engine PRIVATE
 target_include_directories(test_internlm2_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+vllm_cpp_add_test(test_internlm3_paged_engine parity/test_internlm3_paged_engine.cpp)
+target_compile_definitions(test_internlm3_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_internlm3_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+vllm_cpp_add_test(test_yi_paged_engine parity/test_yi_paged_engine.cpp)
+target_compile_definitions(test_yi_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_yi_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_commandr_paged_engine parity/test_commandr_paged_engine.cpp)
 target_compile_definitions(test_commandr_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
