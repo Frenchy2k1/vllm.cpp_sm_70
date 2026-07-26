@@ -24535,3 +24535,72 @@ UNBLOCKED: OLMo-3 W5 → DFlash D1-D6 (auto-select attn, not FLASH_ATTN) → Gem
 §2D mechanical re-sync (deferred) → frontier arches. NOTE: the W3-W4 build reclaimed dgx disk
 via `docker system prune` — the already-stopped `local-ai`/`local-ai-worker` CONTAINERS were
 removed (images+volumes intact; `docker compose up` recreates them).
+
+---
+
+## 2026-07-26 — DFlash D0-redo + D1 (`DF-AUX-TAPS`): `SPEC-DFLASH` UNBLOCKED + `ACTIVE` (`CLAIM-DFLASH-D0D1`)
+
+Base `origin/main` `bc415a3e` (the pin-advance commit), isolated worktree `dflash-d0d1`.
+dgx oracle `~/venvs/vllm-oracle` → `vllm-oracle-next` (vLLM 0.26.0.dev0+g5559679, pin `555967922`).
+NOT pushed; FULL SHA reported to caller.
+
+**Part 1 — D0-redo (UNBLOCKED, golden captured).** On the advanced pin under
+`VLLM_USE_V2_MODEL_RUNNER=1` (no FLASH_ATTN pin), the mixed-SWA/full z-lab 27B DFlash
+draft CONSTRUCTS and the propose/verify/rejection loop RUNS (vllm#40898 resolved) —
+superseding the 0.25.0 ORACLE-BLOCKED verdict. **Drafter ALIVE** (dead-drafter trap
+cleared): greedy acceptance_len France 2.214 / fibonacci 8.800 / "17*23" 4.750 /
+three-laws 4.571 (drafts/accepted 14·17, 5·39, 8·30, 7·25). `num_spec=16`, backend
+auto = `flashinfer-native` fp8-KV sm121. Oracle log confirms `eagle3 aux layers
+(2,17,32,47,62)` = `target_layer_ids [1,16,31,46,61] + 1`.
+- **MEMORY LESSON:** the first D0-redo attempt (gpu_util 0.55, mm ON) OOM-**rebooted**
+  dgx — the multimodal 27B profiles the vision encoder at max image size. Fix (now the
+  capture-tool default): `limit_mm_per_prompt={image:0,video:0}` (DFlash is text) +
+  gpu_util 0.30. Startup then used 26.2 GiB + KV 8.85 GiB, well within the 119 GiB pool.
+- **Gate FORM (measured):** vLLM-DFlash-ON greedy is RUN-DETERMINISTIC (K≥3 spec-on runs
+  token+acceptance identical) BUT is NOT token-identical to vLLM-spec-OFF (3/4 prompts
+  differ — the k=16 BLOCK verify diverges from sequential decode at bf16 near-ties). ⇒
+  **D5 = STRICT MODE-MATCHED (`our-ON == vLLM-ON`), NOT the MTP three-way identity**;
+  spec-OFF byte-identical SACRED is a SEPARATE inertness gate. (One run `k2/` failed
+  engine init on "No available memory for the cache blocks" — a host-RAM contention
+  artifact from a concurrent CUDA build, not DFlash.)
+- Goldens: `tests/parity/goldens/dflash_27b/dflash_27b_spec_{on,off}.json` + rewritten
+  `D0_VERDICT.md`; capture tool extended (`disable_log_stats=False`, mm-off + gpu_util 0.30).
+
+**Part 2 — D1 `DF-AUX-TAPS` (DONE).** The landed single hidden tap
+(`hidden_tap`/`ForwardDeviceTap`) is generalized to the DFlash multi-tap. New
+`Qwen3_5AuxTaps` carrier + `ModelForwardInput::aux_tap` out-field route the Qwen3.5
+dense/MoE forward to `Qwen3_5{,Dense}Model::ForwardDeviceMultiTap`, which captures
+`(hidden + residual)` — the exact eagle3 `_maybe_add_hidden_state` (`interfaces.py:1382`)
+value at aux key `L+1` — at each configured `target_layer_id L` into a `[T, H×taps]`
+buffer (column order = ascending `layer_ids` = `cat(aux, dim=-1)` fed to the DFlash `fc`).
+Helper `MaybeCaptureAuxTap` (per-layer, in `ForwardLayers`/`DenseForwardLayers`) +
+`ValidateAuxTapLayerIds` (non-empty, strictly ascending, in-range). Config-gated: null
+`aux_tap` → byte-identical (the single-tap inertness discipline).
+- Anchors: `include/.../qwen3_5.h` (struct + MoE decl), `qwen3_5_dense.h` (dense decl),
+  `model_registry.h` (`aux_tap` field + fwd-decl), `src/.../qwen3_5.cpp`
+  (`MaybeCaptureAuxTap`/`ValidateAuxTapLayerIds`/both `ForwardDeviceMultiTap` +
+  ForwardLayers/DenseForwardLayers/ForwardBody/DenseForwardBody pass-through),
+  `qwen3_5_moe.cpp`+`qwen3_5_dense.cpp` (routing beside the `hidden_tap` branch).
+
+**Gates (all GREEN).** D1 unit gate `tests/vllm/models/test_qwen27_paged_forward.cpp`
+(new case, 598 assertions) — each tap column == an INDEPENDENT truncated-depth-rebuild
+reference at that layer (layers > L cannot affect the depth-L residual; MakeWeights is
+deterministic per-layer); **RED-first proven** (reversed concat order → 384 assertions
+fail, reverted → 598 pass). On dgx GB10 (Release/sm_121a/cutlass-4.5.0/TRITON=ON, CUDA
+`-Werror` **0 warnings**): D1 case + full suite 697/697; **compute-sanitizer 0 errors**
+on the multi-tap. **INERTNESS PROVEN (not by construction):** 27B MTP e2e
+`test_qwen27_spec_decode` 9/9 + 27B text SACRED `test_qwen27_paged_engine` **235/235**
+("full production stream 16/16 token-exact vs vLLM") byte-identical on the new oracle;
+`git diff --stat` = additive/config-gated.
+
+**Honest scope note.** The D1 unit gate uses an in-engine truncated-rebuild reference,
+not a direct vLLM aux-hidden dump. Our 27B forward is already bit-exact to vLLM (SACRED),
+so `(hidden+res)` matches vLLM's aux transitively within the bf16 envelope; the direct
+per-layer vLLM aux-dump parity folds into D2's drafter golden. D2-D6 (drafter model +
+non-causal block attn, context-KV precompute, `prepare_dflash_inputs`, engine loop,
+FULL CG) remain.
+
+Records advanced: `.agents/specs/dflash-spec-decode.md` (§0 D0/D1 RESULT + §6 D0/D1/D5
+rows), engine-matrix `SPEC-DFLASH` READY→`ACTIVE`, model-matrix DFlash row BLOCKED→SPIKE
+(+ checklist 🚫→📋 + rollup), roadmap C3, coordination `CLAIM-DFLASH-D0D1`, ledger, this
+entry, README, `docs/BENCHMARKS.md`.

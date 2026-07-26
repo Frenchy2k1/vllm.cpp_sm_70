@@ -111,6 +111,30 @@ struct ForwardLogits {
 // pulling the MTP header into this one (qwen3_5_mtp.h includes this header).
 struct Qwen3_5MTPHiddenStates;
 
+// DFlash DF-AUX-TAPS multi-layer auxiliary hidden-state carrier (SPEC-DFLASH D1).
+// Where the SPEC-MTP single tap (Qwen3_5MTPHiddenStates) captures ONE post-final-
+// norm [T,H] hidden, the DFlash drafter conditions on the target's residual stream
+// at a LIST of intermediate layer boundaries, combined by an `fc` (H×taps -> H;
+// qwen3_dflash.py:411-419 + combine_hidden_states :750-770). This carrier holds the
+// concatenated [T, H×taps] buffer that mirrors vLLM's eagle3 aux capture:
+//   * `layer_ids` are 0-based target-model decoder indices — the DFlash draft's
+//     `target_layer_ids` (27B: [1,16,31,46,61]; 35B: [1,6,11,16,22,27,32,37]).
+//     For each id L the forward captures (hidden_states + residual), the residual-
+//     stream value AFTER decoder layer L, i.e. exactly the value vLLM appends at
+//     eagle3 aux key L+1 (interfaces.py:1382 `hidden_states + residual`;
+//     eagle3_utils.py:41-56 shifts DFlash's ids by +1 -> keys {2,17,32,47,62}).
+//   * `tensor` is bf16 [T, H×layer_ids.size()], the taps concatenated along the
+//     last dim in ASCENDING layer_ids order (matching cat(aux, dim=-1) fed to
+//     `fc`). Column block k = tap for layer_ids[k].
+// Config-gated: only a runner that sets ModelForwardInput::aux_tap routes to the
+// multi-tap forward; the default (and MTP-spec) forward never allocates or writes
+// it and is byte-identical (identical inertness discipline to the single tap).
+struct Qwen3_5AuxTaps {
+  std::vector<int32_t> layer_ids;      // ascending 0-based capture-after indices
+  std::shared_ptr<void> storage;       // owns the pool-backed device buffer
+  vt::Tensor tensor;                   // bf16 [T, H×taps], concat order = layer_ids
+};
+
 class Qwen3_5Model {
  public:
   // Batched PAGED forward (M1.8 Task 3, the central refactor). Runs the whole
@@ -179,6 +203,24 @@ class Qwen3_5Model {
       const std::vector<PagedKvCache>& attn_kv,
       const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
       const HfConfig& config, vt::Queue& queue, Qwen3_5MTPHiddenStates* hidden_out,
+      const std::vector<int32_t>& logits_indices = {});
+
+  // ForwardDevice + the DFlash multi-layer aux hidden-state taps (SPEC-DFLASH D1,
+  // DF-AUX-TAPS). Byte-identical logits to ForwardDevice, and additionally captures
+  // the residual stream (hidden + residual, bf16) at each boundary in
+  // `aux_out->layer_ids` into `aux_out->tensor` = [T, H×taps] (concat order =
+  // layer_ids), moving the owning device buffer into `aux_out->storage`. The
+  // capture mirrors vLLM's eagle3 aux collection (interfaces.py:1382); see
+  // Qwen3_5AuxTaps. `aux_out` may be null (then it is exactly ForwardDevice). Not
+  // wired into the runner loop until DFlash D4; the default path never calls it, so
+  // the shipped engine is byte-identical.
+  static ForwardLogits ForwardDeviceMultiTap(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const v1::GDNAttentionMetadata& gdn_meta,
+      const std::vector<PagedKvCache>& attn_kv,
+      const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
+      const HfConfig& config, vt::Queue& queue, Qwen3_5AuxTaps* aux_out,
       const std::vector<int32_t>& logits_indices = {});
 
   // Dense single-sequence reference forward (M0.9). Runs the whole model for a

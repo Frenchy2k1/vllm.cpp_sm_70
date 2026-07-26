@@ -11,48 +11,63 @@ c2/c4/c8). **Readiness re-assessment: 2026-07-25.** This is a READINESS ASSESSME
 
 ## 0. READINESS VERDICT
 
-### D0 RESULT (2026-07-26, `CLAIM-DFLASH-D0`) — **ORACLE-BLOCKED on vLLM 0.25.0. STOP; the D-series is NOT unblocked.**
+### D0 RESULT (2026-07-26, `CLAIM-DFLASH-D0D1`) — **UNBLOCKED on vLLM 0.26.0.dev0, GOLDEN CAPTURED. D1 LANDED.**
 
-The one soft risk flagged below (does the pinned 0.25.0 oracle SERVE DFlash?) was
-RUN-verified on dgx and **resolved NEGATIVE** — superseding the 2026-07-25 "GREEN"
-optimism, which was config-construct reasoning, not a model run (exactly the
-[[oracle-gateability-model-runs-not-config-constructs]] discipline: RUN the model).
+The pin advance `e24d1b24`/0.25.0 -> `555967922`/**vLLM 0.26.0.dev0+g5559679**
+(`chore(pin)` `bc415a3e`) resolves upstream **vllm#40898** (mixed sliding/full
+attention `layer_types` for DFlash drafts, under `VLLM_USE_V2_MODEL_RUNNER=1`).
+The prior 0.25.0 ORACLE-BLOCKED verdict (draft construction aborted at
+`qwen3_dflash.py _resolve_layer_attention`) is SUPERSEDED. Full verdict +
+determinism + gate-form analysis: `tests/parity/goldens/dflash_27b/D0_VERDICT.md`.
 
-- **Decisive check RAN** (dgx, `flock`, GPU sole-owner): `LLM(unsloth/Qwen3.6-27B-NVFP4,
-  speculative_config={method:"dflash", model:"z-lab/Qwen3.6-27B-DFlash",
-  num_speculative_tokens:16, max_model_len:4096}, enforce_eager, gpu_memory_utilization
-  0.55)`. The DFlash config is **accepted** (method resolves, `parallel_drafting=True`)
-  and the **NVFP4 target loads fully**, but **DFlash DRAFT-MODEL CONSTRUCTION ABORTS**
-  before any propose/verify/rejection loop — no tokens, no acceptance rate:
-  `qwen3_dflash.py:93 _resolve_layer_attention` -> `NotImplementedError: DFlash does not
-  yet support mixed sliding/full attention via layer_types` (upstream **vllm#40898**) ->
-  `RuntimeError: Engine core initialization failed`.
-- **Root cause (verified in pinned source `e24d1b24`):** `_resolve_layer_attention` raises
-  when `any_sliding and not all_sliding`. The z-lab **27B** draft is `layer_types =
-  [SWA×4, full×1]` (mixed) -> raises; the **35B-A3B** draft is `[SWA×5, full×1]` (mixed)
-  -> **also blocked**. Only all-full ("standard", e.g. `z-lab/Qwen3.5-9B-DFlash`) or
-  all-SWA (`use_swa`) drafts construct on 0.25.0 — and BOTH our gate-model drafts are the
-  mixed kind. No all-full-attention DFlash draft is published for either Qwen3.6 gate
-  model, so the spec §0/§8 "worst case a config/version bump" config-swap fallback does
-  NOT exist today; this is a genuine version gate.
-- **UNBLOCK = pin advance to a vLLM > 0.25.0 that resolves vllm#40898** (per-layer causal
-  metadata + multiple KV-cache groups for mixed DFlash drafts). Same class as Gemma-4 /
-  OLMo-3. Until then the D5 three-way gate has no vLLM arm -> the drafter cannot be
-  verified -> **do NOT implement the drafter blind.**
-- **Cleared regardless (D0 deliverables #1, #3):** the draft **downloads ungated** (arch
-  `DFlashDraftModel` -> `("qwen3_dflash","DFlashQwen3ForCausalLM")`, `model.safetensors`
-  3.46 GiB = 1.73 **B params** bf16 — the "1.73 GB" is the param count); its
-  `target_layer_ids = [1,16,31,46,61]` (5 taps, `num_target_layers=64`, matching the 64-layer
-  target) — the §2 table is correct (the brief's `[1,6,11,16,22,27,32,37]`/40 is the **35B**
-  draft, verified). The §1 reuse map re-verified valid at `8a379182` (all MTP anchors —
-  `use_dflash()`/`NumLookaheadTokens()` `k+1`, `ForwardDeviceTap`+`hidden_tap`,
-  `GreedyRejectionSample`, `GdnSpecDecode`/`CausalConv1dSpecUpdate`, `gdn_attn` spec builder,
-  `MakeQwen3_5KVCacheSpec`/`fa_draft`, `GdnBlockPagedMixedSpec`+`IndexSelect/IndexCopy`,
-  `take_draft_token_ids`, and `ParseSpeculativeConfigJson` still throwing on method≠"mtp" =
-  the EXTEND point — all present; line numbers shifted from `72f9fb1`, no structural drift).
+- **Decisive check RAN** (dgx, `flock`, GPU sole-owner, `VLLM_USE_V2_MODEL_RUNNER=1`,
+  no FLASH_ATTN pin): the mixed-attention z-lab 27B draft **CONSTRUCTS** and the
+  propose/verify/rejection loop **RUNS**. The **DRAFTER IS ALIVE** — acceptance_len
+  France 2.214 / fibonacci 8.800 / "17*23" 4.750 / three-laws 4.571 (drafts/accepted
+  14·17, 5·39, 8·30, 7·25); all > 1 (dead-drafter trap cleared, content-dependence as
+  §5). Backend auto-selects `flashinfer-native` fp8-KV sm121 (NOT FLASH_ATTN — the §0
+  soft risk did not materialize). `num_speculative_tokens=16`; oracle log confirms
+  `eagle3 aux layers (2,17,32,47,62)` = `target_layer_ids [1,16,31,46,61] + 1`.
+- **MEMORY:** the first attempt (gpu_util 0.55, mm ON) OOM-**rebooted** dgx — the 27B
+  is multimodal and profiles the vision encoder at max image size. Fix (now the
+  capture-tool default): `limit_mm_per_prompt={image:0,video:0}` + gpu_util 0.30.
+- **Gate FORM (measured):** vLLM-DFlash-ON greedy is **run-deterministic** (K>=3
+  token+acceptance identical) BUT is **NOT** token-identical to vLLM-spec-OFF (3/4
+  prompts differ — the k=16 block verify diverges from sequential decode at bf16
+  near-ties). So the D5 gate is **STRICT + MODE-MATCHED** (`our-DFlash-ON ==
+  vLLM-DFlash-ON`), NOT the MTP three-way identity; spec-OFF byte-identical SACRED is a
+  separate inertness gate. (Supersedes the §6 "three-way identity" D5 row below.)
+- **Goldens committed:** `tests/parity/goldens/dflash_27b/dflash_27b_spec_{on,off}.json`
+  (tokens + acceptance); capture tool `scripts/spec/d0_dflash_oracle_capture.py`
+  (extended: `disable_log_stats=False`, mm-off + gpu_util 0.30).
 
-Evidence: `tests/parity/goldens/dflash_27b/{D0_VERDICT.md,d0_blocked_traceback.txt}`;
-capture tool (ready for pin-advance re-run): `scripts/spec/d0_dflash_oracle_capture.py`.
+### D1 RESULT (2026-07-26, `CLAIM-DFLASH-D0D1`) — **DF-AUX-TAPS DONE.**
+
+The landed single hidden tap (`hidden_tap`/`ForwardDeviceTap`) is generalized to the
+DFlash multi-tap. New `Qwen3_5AuxTaps` carrier + `ModelForwardInput::aux_tap` out-field
+route the Qwen3.5 dense/MoE forward to `Qwen3_5{,Dense}Model::ForwardDeviceMultiTap`,
+which captures `(hidden + residual)` — the exact eagle3 `_maybe_add_hidden_state`
+(`interfaces.py:1382`) value at aux key `L+1` — at each configured `target_layer_id L`
+into a `[T, H×taps]` buffer (column order = ascending `layer_ids` = `cat(aux, dim=-1)`
+fed to the DFlash `fc`, `qwen3_dflash.py:411-419`/`:750-770`). Config-gated: null
+`aux_tap` -> byte-identical (the single-tap inertness discipline). Anchors:
+`include/.../qwen3_5.h` (struct + MoE decl), `qwen3_5_dense.h` (dense decl),
+`model_registry.h` (field), `src/.../qwen3_5.cpp` (`MaybeCaptureAuxTap` +
+`ValidateAuxTapLayerIds` + both `ForwardDeviceMultiTap`), `qwen3_5_moe.cpp`/
+`qwen3_5_dense.cpp` (routing). Unit gate: `test_qwen27_paged_forward` new case
+(598 assertions) — each tap column == an INDEPENDENT truncated-model reference at that
+layer; RED-first proven (reversed concat order -> 384 assertions fail). Inertness: the
+tap struct is additive/config-gated (`git diff --stat` = new methods only), the 27B
+MTP e2e + 27B text SACRED gates re-run byte-identical on the new oracle. CUDA `-Werror`
+0 warnings; compute-sanitizer 0 on the multi-tap.
+
+**Honest scope note (D1 reference):** the D1 unit gate validates the multi-tap capture
+against an INDEPENDENT in-engine reference (a truncated-depth rebuild — layers > L cannot
+affect the depth-L residual), not a direct vLLM aux-hidden dump. Our full 27B forward is
+already bit-exact to vLLM (SACRED), and `(hidden+res)` is a deterministic function of the
+bit-exact per-layer state, so the captured taps equal vLLM's aux within the bf16 envelope
+transitively; the direct per-layer vLLM aux-dump parity folds into D2's drafter golden
+(where the `fc(cat(aux))` output is checked end-to-end).
 
 ### (Superseded) 2026-07-25 pre-run assessment — GREEN, no HW/oracle/download blocker
 
@@ -298,12 +313,12 @@ the combination runs, so worst case is a config/version bump, not a dead row).
 
 | # | Builds | Gate | GPU/CPU | Hardest risk |
 |---|---|---|---|---|
-| **D0** ground + download | Fetch both drafts to dgx; dump their resolved `SpeculativeConfig` (default k, block_size resolution through `EAGLEConfig`, `target_layer_ids`); confirm the pinned 0.25.0 oracle SERVES DFlash + NVFP4 on sm_121 end-to-end (short greedy run) | **✗ RESULT 2026-07-26: ORACLE-BLOCKED (§0 D0 RESULT).** Draft downloads ungated + config confirmed; DFlash config accepted + NVFP4 target loads — but the mixed-SWA/full draft ABORTS at `qwen3_dflash.py:93` `NotImplementedError` (vllm#40898). No greedy run, no acceptance. **D1–D6 remain BLOCKED until a pin > 0.25.0 resolves vllm#40898.** | GPU (one short oracle run under `flock`) | Oracle can't serve DFlash on sm_121 — **REALIZED** (mixed layer_types unsupported at the pin; NOT the non-causal-backend risk anticipated, and NOT config-fixable — no all-full Qwen3.6 draft exists) |
-| **D1** aux multi-tap seam (`DF-AUX-TAPS`) | Extend `ForwardDeviceTap`/tap struct: capture `[T,H×taps]` at 5(27B)/8(35B) residual boundaries, config-gated | multi-tap buffer matches an oracle dump of the target's aux hidden states at the configured layers; **non-spec + MTP-spec SACRED gates byte-identical** (taps null/off) | GPU (parity dump) + CPU (unit) | Touching the fused forward → must stay byte-identical when off (RMSNorm-saga discipline); mid-residual tap points must match eagle3 +1 shift exactly |
+| **D0** ground + download | Fetch both drafts to dgx; dump their resolved `SpeculativeConfig`; confirm the pinned oracle SERVES DFlash + NVFP4 on sm_121 end-to-end (short greedy run) | **✓ DONE 2026-07-26 (§0 D0 RESULT) on the NEW pin `555967922`/vLLM 0.26.0.dev0.** vllm#40898 resolved: mixed-attn draft CONSTRUCTS, drafter ALIVE (acceptance 2.21/8.80/4.75/4.57 > 1), `num_spec=16`, backend flashinfer-native. Goldens `dflash_27b_spec_{on,off}.json` committed. Gate FORM measured = STRICT mode-matched (vLLM-ON run-deterministic K>=3 but != vLLM-OFF). | GPU (one short oracle run under `flock`) | ~~Oracle can't serve DFlash on sm_121~~ RESOLVED by pin advance + `VLLM_USE_V2_MODEL_RUNNER=1`. New hazard hit+fixed: multimodal 27B vision-encoder profiling OOM-rebooted dgx -> `limit_mm_per_prompt=0` + gpu_util 0.30 |
+| **D1** aux multi-tap seam (`DF-AUX-TAPS`) | Extend `ForwardDeviceTap`/tap struct: capture `[T,H×taps]` at 5(27B)/8(35B) residual boundaries, config-gated | **✓ DONE 2026-07-26 (§0 D1 RESULT).** `ForwardDeviceMultiTap` (MoE+Dense) captures `(hidden+res)` at `target_layer_ids` into `[T,H×taps]`; unit gate 598 assertions vs an independent truncated-model reference (RED-first: reversed concat -> 384 fail); CUDA 697/697 + compute-sanitizer 0; MTP e2e 9/9 + 27B SACRED **235/235** byte-identical on the new oracle (inertness) | GPU (parity dump) + CPU (unit) | ~~byte-identical when off~~ PROVEN (config-gated, additive); the direct vLLM aux-dump parity folds into D2 (see §0 D1 honest scope note) |
 | **D2** the `qwen3_dflash` drafter + non-causal in-block attention (`DF-DRAFT-MODEL`) | New draft model (5-6 dense layers, SWA+full), loader, the NEW non-causal block-attention `vt` primitive, draft KV groups | standalone draft forward token-exact vs the HF/vLLM draft on captured target features (golden-dump parity); the non-causal primitive CUDA==CPU bit-exact | GPU (forward + parity) + CPU (op ref) | **The non-causal primitive is the project's first** — bidirectional block attention; get the mask + SWA-vs-full per-layer routing right |
 | **D3** context-KV precompute + `prepare_dflash_inputs` (`DF-DRAFT-KV-PREP`) | Fused multi-layer KV proj + bulk RoPE + cache insert; the mask-block/context-slot/sample-map input kernel | context-KV reuse bit-exact (draft with precomputed context == draft re-running context); `prepare_dflash_inputs` matches a from-algorithm oracle (mask blocks, `valid_ctx_end` under rejection, CG padding) | GPU (kernels) + CPU (input-prep ref) | Rejected-position exclusion (`ctx_end − num_rejected`) + slot arithmetic off-by-one; eager (non-CG) context path |
 | **D4** engine integration + k>1 exercise (`DF-ENGINE-INTEGRATION`) | Wire the DFlash speculator into the landed I5d/I7 runner loop; `--speculative-config dflash` parse/resolve; run the k-general shared paths at k=15 | the loop runs end-to-end at k=15 on the 27B, drafts proposed & accepted (nonzero); the k=15 GDN spec slots + rejection + mixed batch exercised (no crash, bit-exact vs I4 ops as a token chain at k=15) | GPU | First real k=15 exercise of the shared GDN/rejection paths (code-general but untested at scale); k+1=16 slot alloc + widened conv at k=15 |
-| **D5** correctness gate | The DFlash correctness bar (mirror MTP I5e) | **token-identical greedy: our-DFlash-ON == our-spec-OFF == vLLM `--speculative-config dflash` greedy, token-for-token (single-request, deterministic prompt)** + measured nonzero acceptance; 27B then 35B; SACRED spec-OFF byte-identical | GPU (three-way, `flock`, standalone big-model) | Batch-nondeterminism at c>1 (near-tie-distributional-gate applies as in I7 — exact identity only at c1); acceptance content-dependence |
+| **D5** correctness gate | The DFlash correctness bar | **REVISED by the D0 measurement (§0):** NOT the three-way identity — vLLM-DFlash-ON != vLLM-spec-OFF at k=16 near-ties. Gate = STRICT MODE-MATCHED **`our-DFlash-ON == vLLM-DFlash-ON` greedy token-for-token** (the committed golden is the reference) + measured nonzero acceptance; 27B then 35B; spec-OFF byte-identical SACRED as a SEPARATE inertness gate | GPU (`flock`, standalone big-model) | Batch-nondeterminism at c>1 (near-tie-distributional-gate applies as in I7 — exact identity only at c1); acceptance content-dependence |
 | **D6** throughput A/B + memory + block-8 | c1 then c>1 A/B vs vLLM DFlash same-config; GDN k+1-slot memory measurement; block-8 vs block-16 acceptance-vs-memory | ours ≥ vLLM (throughput) / ≤ vLLM (latency, memory) on every axis at c1 AND the throughput operating point, both models; §5 memory within the 119 GiB pool at the target concurrency; `benchmark_binding=true` | GPU (A/B series, one `flock`, cold-leg discarded, ≥3 reps) | The 2.3 GiB/req 27B GDN state at k=15 caps concurrency; DFlash may go <1× at high concurrency (mirror vLLM's behavior at each point) |
 
 Milestone rollup: **M-df-0** = D0-D3 (draft runs standalone + inputs), **M-df-1** =
