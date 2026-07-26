@@ -132,6 +132,26 @@ Owns ONLY records: `.agents/specs/pin-advance.md` (new) + the record surfaces
 model/kernel/runtime source, any matrix ACTIVE/SPIKE row, or the oracle venv ⇒
 SACRED gates byte-identical by construction (not re-run).
 
+**Pin-advance EXECUTION W3a-W4 note (2026-07-26, `CLAIM-PIN-ADVANCE-W3W4`, DONE, NOT
+pushed — FULL SHA reported to caller).** RCA'd the W0-W2 "27B drift", diffed the full
+drift surface, and re-gated OUR engine against the target stack, on dgx GB10. Base
+`origin/main` `36381c1b`, isolated worktree `pin-advance-w3w4`; REUSED
+`~/venvs/vllm-oracle-next` (the W0-W2 staged target `0.26.0.dev0+g5559679`);
+`~/venvs/vllm-oracle` (0.25.0) pristine; **NO pin flip.** **VERDICT: the W0-W2 "27B
+drift" is NOT real drift — it is the already-documented tok6 whitespace near-tie
+(gap 0.5625 nats; the SAME oracle emits the 198 production branch under the canonical
+golden-capture config and the 271 emulation branch under the W0-W2 `drift_capture.py`
+config).** Apples-to-apples re-capture reproduces every measured SACRED golden
+bit-for-bit (27B W4A4 all tensors 0.0 diff; 32B-NVFP4A16 greedy+dist 0 diff; 35B/Coder
+byte-stable). **Definitive re-capture list EMPTY; W4 kernel re-sync NONE.** OUR engine
+unchanged at `36381c1b` rebuilt (Release/sm_121a/cutlass-4.5.0/TRITON=ON; -Werror clean)
++ re-gated GREEN on GB10 (SACRED model + op-parity gates; two PRE-EXISTING stale
+registry-count CPU tests unrelated to the pin). Owns ONLY records:
+`.agents/specs/pin-advance.md` §7 + `.agents/{coordination,state,parity-ledger}.md`,
+`README.md`, `docs/BENCHMARKS.md`. Did NOT flip the pin, touch AGENTS.md pin refs, the
+source-repo checkout, the `vllm-oracle` symlink, or any model/kernel source ⇒ no golden
+or code change (W5 is the deliberate pin flip).
+
 **DFlash D0 readiness note (2026-07-26, `CLAIM-DFLASH-D0`, DONE, NOT pushed —
 FULL SHA reported to caller).** The gating oracle-gateability check for `SPEC-DFLASH`
 (rows `SPEC-DFLASH`, `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm`). Base
