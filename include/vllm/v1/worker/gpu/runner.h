@@ -68,6 +68,7 @@
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d hidden tap + draft
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft + aux taps
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -282,6 +283,16 @@ class GPUModelRunner final : public ModelRunnerBase {
   }
   kv_offload::KVConnector* kv_connector() const { return kv_connector_; }
 
+  // SPEC-DFLASH D5 (DF-ENGINE-INTEGRATION): wire the separately-loaded z-lab
+  // DFlash draft into the verify/propose loop. `weights`/`config` are borrows
+  // owned by LoadedEngine (they outlive the runner); `k` = num_speculative_tokens
+  // (block-1's block, the (1+k) query). Sets use_dflash(): on the verify forward
+  // the runner captures the D1 multi-tap (target_layer_ids) instead of the MTP
+  // single hidden tap, and propose_drafts routes to the DFlash block propose.
+  // Idempotent; null weights leaves the runner on the MTP/non-spec path.
+  void set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
+                        const vllm::HfConfig* config, int k);
+
  private:
   // Owns one persistent cache allocation. CUDA defaults to vt::Alloc-backed
   // device storage; CPU and VT_DEVICE_KV_CACHE=0 retain the host-vector
@@ -445,6 +456,15 @@ class GPUModelRunner final : public ModelRunnerBase {
   // per-req accept accounting (1/0 on a plain non-spec step). No-op unless spec_on.
   void propose_drafts(const std::vector<int32_t>& num_sampled,
                       const std::vector<int32_t>& num_rejected);
+  // SPEC-DFLASH D5: the DFlash branch of propose_drafts. Combines this step's D1
+  // multi-tap into per-token features (CombineAuxFeatures), ACCUMULATES the
+  // accepted-prefix features into each request's growing combined-feature context
+  // (rolling back the rejected drafts by appending only num_sampled features —
+  // the num_rejected rollback, dflash/speculator.py:300-413), then runs the
+  // non-autoregressive (1+k) block propose over that context (DflashProposeBlock)
+  // and stashes the k drafts/request. Only reachable when use_dflash().
+  void propose_drafts_dflash(const std::vector<int32_t>& num_sampled,
+                             const std::vector<int32_t>& num_rejected);
   // The drafts produced this step, pending pull by EngineCore::post_step. Empty
   // (nullopt) on the default path.
   std::optional<DraftTokenIds> pending_drafts_;
@@ -454,6 +474,27 @@ class GPUModelRunner final : public ModelRunnerBase {
   // rate; total generated / total verify steps is the effective speedup proxy.
   int64_t spec_drafts_proposed_ = 0;
   int64_t spec_drafts_accepted_ = 0;
+  // ── SPEC-DFLASH D5 (DF-ENGINE-INTEGRATION) ──────────────────────────────────
+  // The separately-loaded DFlash draft (borrows owned by LoadedEngine; null
+  // unless method=="dflash"). use_dflash() gates the aux-tap capture + the DFlash
+  // propose branch. dflash_tap_layer_ids_ = the draft's target_layer_ids (the D1
+  // multi-tap capture-after indices), resolved once from the draft config.
+  const vllm::Qwen3DFlashWeights* dflash_weights_ = nullptr;
+  const vllm::HfConfig* dflash_config_ = nullptr;
+  int dflash_k_ = 0;
+  std::vector<int32_t> dflash_tap_layer_ids_;
+  bool use_dflash() const { return dflash_weights_ != nullptr; }
+  // Per-request ACCUMULATED combined-feature context (the inline analogue of
+  // vLLM's incrementally-written draft KV cache). dflash_ctx_feats_[i] is a flat
+  // [L_i * H] f32 buffer of fc(cat(aux)) for request i's committed sequence
+  // positions 0..L_i-1 (L_i = dflash_ctx_len_[i]); dflash_ctx_reqid_[i] tracks the
+  // occupant so a reused batch slot resets its context. Indexed by the runner's
+  // condensed-dense batch row (== req_state slot). Grown per verify step by the
+  // accepted count (num_sampled), rolled back by dropping the rejected drafts'
+  // features (they are never appended). Sized to max_num_reqs on set_dflash_draft.
+  std::vector<std::vector<float>> dflash_ctx_feats_;
+  std::vector<int32_t> dflash_ctx_len_;
+  std::vector<std::string> dflash_ctx_reqid_;
   // Draft KV cache (`fa_draft` group) backing storage, owned by the runner and
   // allocated in initialize_kv_cache when spec is on. draft_attn_kv_ (declared
   // above) views into these buffers. Empty on the default path.
@@ -509,6 +550,12 @@ class GPUModelRunner final : public ModelRunnerBase {
     // step (ModelForwardInput::hidden_tap output), consumed by propose_drafts to
     // run the MTP drafter. Empty (null storage) unless spec is on.
     Qwen3_5MTPHiddenStates spec_hidden;
+    // SPEC-DFLASH D5: the target's D1 MULTI-tap captured this step
+    // (ModelForwardInput::aux_tap output) — the residual stream at the draft's
+    // target_layer_ids as [T, H×taps] bf16, consumed by propose_drafts_dflash.
+    // Empty (null storage) unless use_dflash(); mutually exclusive with
+    // spec_hidden (MTP single tap).
+    Qwen3_5AuxTaps spec_aux;
     // discard_request_mask (gpu_model_runner.py:2048): per dense batch row, 1 iff
     // the request is still consuming its known prefill tokens this step
     // (optimistic seq_len < num_tokens) and so must NOT sample — its sampled

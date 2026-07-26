@@ -38,6 +38,13 @@ struct SpeculativeConfig {
   // upstream __post_init__ (speculative.py:865-875).
   std::optional<int> num_speculative_tokens = std::nullopt;
 
+  // SPEC-DFLASH D5: the DFlash draft model path (the `model` key of
+  // `--speculative-config`, e.g. "z-lab/Qwen3.6-27B-DFlash" or a local snapshot
+  // dir). Unlike MTP (whose draft `mtp.*` tensors live inside the target
+  // checkpoint), the DFlash draft is a SEPARATE checkpoint the loader opens; this
+  // carries its path. Empty/unset for MTP and non-spec.
+  std::optional<std::string> draft_model_path = std::nullopt;
+
   // n_predict: the draft head depth (MTP: mtp_num_hidden_layers, = 1 for both
   // gate checkpoints). Upstream reads it off the draft model's hf_config
   // (speculative.py:482-486,860-863). 0 when not an n_predict-style method.

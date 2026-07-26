@@ -274,6 +274,76 @@ nonzero acceptance ≈ vLLM's (2.2/8.8/4.75/4.57); (3) spec-OFF + MTP byte-ident
 SACRED 235/235 + 27B MTP 9/9). This is the DFlash correctness finish line; the
 acceptance-rate condition MUST accompany token-identity (the dead-drafter trap).
 
+### D5 RESULT (2026-07-26, `CLAIM-DFLASH-D5`) — **DF-ENGINE-INTEGRATION runner loop LANDED; e2e RUNS on dgx with vLLM-matching acceptance; correctness at the ratified bf16 near-tie envelope (2/4 STRICT + 2/4 single near-tie flips). NOT a clean strict-4/4 pass — strict 4/4 + speed = D6.**
+
+The full runner verify/propose loop is wired and the DFlash e2e RUNS end-to-end on dgx
+(GB10 sm_121a, pin `555967922`/vLLM 0.26.0.dev0, bf16-lm_head 27B target `890bdef7` + the
+z-lab draft, `flock`, mm-off, `max_num_seqs=2`).
+
+**Runner-integration design (the MTP seams reused + the DFlash swap):**
+- **Loader (`model_loader.cpp`):** `ResolveSpecConfig` dflash branch (`ResolveDflash(k)` +
+  the draft path); `--speculative-config` parses a `model` key (the SEPARATE z-lab
+  checkpoint, unlike MTP's in-target `mtp.*`); a `DflashDraft` bundle loads the draft
+  (host bf16 `LoadQwen3DFlash`) + SHARES the target's bf16 `embed_tokens`/`lm_head` read
+  from the target shards (mirrors vLLM's skip_substrs) and is wired via
+  `runner.set_dflash_draft`. The MTP `BuildMtpDraft` is now guarded on `method=="mtp"`.
+- **Verify forward:** when `use_dflash()` the runner sets `ModelForwardInput::aux_tap`
+  (D1 `Qwen3_5AuxTaps`, `target_layer_ids [1,16,31,46,61]`) instead of the MTP single
+  `hidden_tap` → `ForwardDeviceMultiTap` captures `[T, H×5]` (byte-identical logits).
+- **`propose_drafts` swap:** `propose_drafts` routes to `propose_drafts_dflash` when
+  `use_dflash()`, reusing the SAME `sample_tokens`/`sample_tokens_with_rejection` →
+  `GreedyRejectionSample` + GDN slot-snapshot loop (k=16 exercised for the first time).
+- **THE DELICATE PIECE — per-request context accumulation honoring `num_rejected`**
+  (`dflash/speculator.py:300-413`): where vLLM writes each step's combined features into
+  the draft's incremental paged KV (`precompute_and_store_context_kv`, excluding rejected
+  via `valid_ctx_end = ctx_end − num_rejected`), the inline D3/D4 path ACCUMULATES the
+  per-request combined-feature context (`CombineAuxFeatures(aux_tap)`) on the host and
+  honors the rollback by appending only the `(T_req − num_rejected)` accepted-prefix
+  features each step (the rejected drafts' hiddens are simply never appended). The block
+  anchor = `last_sampled` at position L (= ctx length), then k mask ids at L+1..L+k;
+  `DflashProposeBlock` then runs the (1+k) block forward over that context. A position
+  invariant (`positions[first row] == L`) asserts the accumulation stays in sync (the
+  I5e bug class) — it held on every step of every prompt.
+
+**D5 e2e RESULT (form-by-measurement, our-DFlash-ON vs the committed vLLM-DFlash-ON
+golden, proof it RAN):** `test_qwen27_dflash_spec_decode` (4 prompts × 32 tokens). Per
+prompt (ours accepted / golden `num_accepted_delta`, decoded):
+- `The capital of France is` — **diverges** at token 11 (got `2972` vs vLLM `11751`, then
+  cascades); acc **19 / 17**. text " Paris.\n\n<think>\n\n</think>\n\nThat is correct..."
+- `def fibonacci(n):` — **STRICT token-exact**; acc **39 / 39** (exact). code block exact.
+- `Q: What is 17 * 23?\nA:` — **diverges** at token 12 (got `567` vs vLLM `488`, then
+  **RE-CONVERGES** to `628,1387`); acc **29 / 30**. distributive-property answer.
+- `The three laws of robotics are` — **STRICT token-exact**; acc **25 / 25** (exact).
+- **2/4 STRICT** token-exact vs vLLM-DFlash-ON; **acceptance ~ vLLM on ALL 4** (deltas
+  +2/0/−1/0). The MANDATORY dead-drafter-trap condition is MET (drafter unambiguously
+  alive, near-exact acceptance).
+
+**ROOT of the 2 divergences (RCA — a ratified near-tie, NOT a wiring bug):** both are
+SINGLE bf16 near-tie flips. The `17*23` case flips ONE token (`567` vs `488`) and then
+RE-CONVERGES — only possible at a genuine near-tie; `France` flips once then cascades (a
+greedy sequence always cascades after any single flip). The accumulation/tap/loop are
+correct (proven by the 2 EXACT prompts + near-exact acceptance on all 4 — a wiring bug
+would break ALL prompts and diverge at token 0). The residual is the D3-documented inline
+bf16 context-KV recompute envelope (K/V rel-L2 0.31%/0.26%, proposed-ids 13-STRICT + few
+near-tie): our per-layer (vs vLLM's fused, persistent-paged) draft context-KV differs at
+~1%, occasionally flipping a near-tie draft → a different block-verify context → a
+near-tie emitted-token flip. This is exactly the ratified near-tie ROOT the D0 gate-form
+anticipated; **strict 4/4 needs the persistent paged draft-KV bit-matching vLLM's fused
+context-KV projections = D6.**
+
+**Inertness GREEN (config-gated, PROVEN it RAN on this exact build):** 27B text SACRED
+`test_qwen27_paged_engine` **235/235** (16/16 token-exact vs vLLM) + 27B MTP
+`test_qwen27_spec_decode` **9/9** (16/16 drafts accepted, token-exact) byte-identical.
+CUDA `-Werror` clean (the whole engine + runner + loader compiled under
+`-Werror=all-warnings`). **No new CUDA kernel** in D5 (host orchestration reusing the
+D1/D2/D3-sanitized ops), so compute-sanitizer is covered transitively (the only kernel on
+the path, `DFlashBlockAttention`, was compiled + sanitized at D2). Anchors: loader
+`src/vllm/entrypoints/model_loader.cpp` (`LoadDflashDraft`/`DflashDraft`) +
+`include/.../model_loader.h`; config `src/vllm/config/speculative.cpp` (draft-path parse)
++ `include/.../speculative.h`; runner `src/vllm/v1/worker/gpu/runner.cpp`
+(`set_dflash_draft`/`propose_drafts_dflash`/aux-tap capture) + `runner.h`; gate
+`tests/parity/test_qwen27_dflash_spec_decode.cpp`.
+
 ### (Superseded) 2026-07-25 pre-run assessment — GREEN, no HW/oracle/download blocker
 
 **Superseded by the D0 RESULT above:** the "oracle CONSTRUCTS DFlash" bullet was true only
