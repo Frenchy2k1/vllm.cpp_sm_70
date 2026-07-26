@@ -83,6 +83,15 @@ class LLMEngine {
                           const std::string& prompt, SamplingParams params,
                           int priority = 0);
 
+  // add_request for a PRE-TOKENIZED prompt (vLLM TokensPrompt). Strictly
+  // ADDITIVE overload: builds the request from prompt_token_ids directly
+  // (InputProcessor::process_inputs_tokens), skipping tokenization. Used to gate
+  // a model whose tokenizer family we have not ported (InternLM2) with the
+  // oracle's exact prompt ids. The string overload above is unchanged.
+  std::string add_request(const std::string& request_id,
+                          std::vector<int32_t> prompt_token_ids,
+                          SamplingParams params, int priority = 0);
+
   // step (llm_engine.py:296): get the EngineCore outputs -> process_outputs ->
   // abort any reqs the detokenizer stopped -> return the RequestOutputs.
   std::vector<RequestOutput> step();
@@ -112,6 +121,14 @@ class LLMEngine {
   // deltas.
   RequestOutput generate(const std::string& prompt, SamplingParams params,
                          const std::string& request_id = "0", int priority = 0);
+
+  // generate for a PRE-TOKENIZED prompt (vLLM TokensPrompt). Strictly ADDITIVE
+  // overload of the single-request driver: add the pre-tokenized request, then
+  // loop step() to completion. Used to gate InternLM2's forward with the
+  // oracle's exact prompt ids (its non-standard tokenizer is not ported).
+  RequestOutput generate(std::vector<int32_t> prompt_token_ids,
+                         SamplingParams params, const std::string& request_id = "0",
+                         int priority = 0);
 
   // The rolling prefix-cache hit rate (queries/hits in TOKENS over the most
   // recent 1000 requests). See EngineCore::prefix_cache_metrics.

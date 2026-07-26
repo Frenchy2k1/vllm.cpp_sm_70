@@ -133,4 +133,34 @@ EngineCoreRequest InputProcessor::process_inputs(
   return request;
 }
 
+EngineCoreRequest InputProcessor::process_inputs_tokens(
+    const std::string& request_id, std::vector<int32_t> prompt_token_ids,
+    SamplingParams params, std::optional<double> arrival_time,
+    int priority) const {
+  // Identical to process_inputs EXCEPT the prompt is already tokenized (vLLM
+  // TokensPrompt): no tokenizer_.EncodeWithSpecialTokens call, and no
+  // post_processor template applied (the caller supplies the exact ids, special
+  // tokens included). Every other step (validate, default max_tokens, eos/stop
+  // wiring, request assembly) is byte-for-byte the string path.
+  ValidateParams(params);
+
+  const double t = arrival_time.has_value() ? *arrival_time : NowSeconds();
+
+  if (!params.max_tokens.has_value()) {
+    const int64_t seq_len = static_cast<int64_t>(prompt_token_ids.size());
+    params.max_tokens = static_cast<int>(max_model_len_ - seq_len);
+  }
+
+  UpdateFromGenerationConfig(params);
+  UpdateFromTokenizer(params);
+
+  EngineCoreRequest request;
+  request.request_id = request_id;
+  request.prompt_token_ids = std::move(prompt_token_ids);
+  request.sampling_params = std::move(params);
+  request.arrival_time = t;
+  request.priority = priority;
+  return request;
+}
+
 }  // namespace vllm::v1
