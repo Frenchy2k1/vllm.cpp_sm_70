@@ -4199,3 +4199,26 @@ vLLM-COMPETITIVE path for any of these families is a separate kernel campaign (f
 tactic bodies + widened FEATURE-TABLE cells) with its own benchmark, out of scope here.
 `sm_70`/`sm_75` (no bf16 tensor cores) and `sm_101a` (not in nvcc 13.0) are recorded SCOPED,
 non-additive. Full record: `.agents/specs/cuda-arch-additivity.md` §W10.
+
+## Pin-advance W0-W2 go/no-go — staged next-pin drift + DFlash acceptance (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`)
+
+**Benchmark disposition: INFORMATIONAL / go/no-go (`benchmark_binding=false`).** No pin flip,
+no golden re-capture; `~/venvs/vllm-oracle` (0.25.0) left pristine. The staged target stack
+(vLLM `55596792` built from source for sm_121a + transformers 5.14.1 + torch 2.13.0+cu130 +
+flashinfer 0.6.15.post1 + cutlass-dsl 4.6.0) installs+imports on GB10; all three unblocks
+resolve. Full record: `.agents/specs/pin-advance.md` §6.
+
+- **DFlash acceptance (RUN on new stack, `VLLM_USE_V2_MODEL_RUNNER=1`, 27B-NVFP4 target +
+  z-lab 27B-DFlash draft, k=16, eager):** the mixed-attn draft constructs+runs (the
+  #40898 `NotImplementedError` is gone) and emits **non-zero acceptance_len 2.21 / 8.8 /
+  4.75 / 4.57** across the 4 D0 prompts (dead-drafter floor = 1.0). Auto-selected backend =
+  `flashinfer-native` non-causal fp8-KV on sm121 (forcing FLASH_ATTN fails). These are
+  liveness numbers, not a speed claim (no vLLM-same-config throughput denominator here).
+- **Greedy golden drift vs committed goldens** (new stack, OUR code unchanged): **27B-NVFP4
+  (W4A4) DRIFTS** — first-divergence position 6, 10/16 tokens differ (emits a `<think>`
+  block); **35B-NVFP4 (W4A16) byte-identical 16/16**; **Qwen3-Coder-30B byte-identical 6/6**;
+  **Qwen3-4B dense** 5/16 prompts near-tie point-drift (2 differ by a single token). The
+  measured re-capture bill is 1 STRICT gate (27B) + a small-dense near-tie re-validation,
+  materially under the estimated "~4 core re-captures". Reproduction: dgx
+  `~/work/pin-drift/` (`dflash_stats.log`, `drift_{27b,35b}.log`, `out_coder/`, `out_4b/`),
+  venv `~/venvs/vllm-oracle-next`, source `~/work/vllm-src-5559679`.
