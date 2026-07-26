@@ -351,9 +351,11 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   // `q.view(-1, num_heads, qk_head_dim)`, `k_pe.unsqueeze(1)`, then
   // `q[..., qk_nope_head_dim:], k_pe = rotary_emb(positions,
   //                                q[..., qk_nope_head_dim:], k_pe)`.
-  // Only the TRAILING qk_rope_head_dim slice of each query head rotates; the
-  // rotation is `is_neox_style=False` (deepseek_v2.py:1059-1064), i.e. the
-  // adjacent-pair GPT-J form. Both operands are STRIDED views, which is why W6
+  // Only the TRAILING qk_rope_head_dim slice of each query head rotates. The
+  // rotation style comes from `dims.is_neox_style`: DeepSeek-V2/V3 use the
+  // adjacent-pair GPT-J form (`is_neox_style=False`, deepseek_v2.py:1059-1064,
+  // the DEFAULT), MiniCPM3 the neox half-split form (get_rope default,
+  // minicpm3.py:121-125). Both operands are STRIDED views, which is why W6
   // relaxed vt::RopeFromCache to stride-driven q/k.
   if (R > 0) {
     RequireWeight(w.rope_cos_sin_cache, "rope_cos_sin_cache");
@@ -361,7 +363,7 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     Tensor k_pe3 = View3(k_pe.t(), 0, T, 1, R, R, R, 1);
     vt::RopeArgs rope;
     rope.rotary_dim = static_cast<int>(R);
-    rope.is_neox_style = false;
+    rope.is_neox_style = dims.is_neox_style;
     vt::RopeFromCache(d.q, q_pe, &k_pe3, positions, w.rope_cos_sin_cache, rope);
   }
 

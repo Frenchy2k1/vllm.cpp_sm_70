@@ -24118,3 +24118,35 @@ checkers green by bare RC. `benchmark_binding=false`, SPEED still PENDING (row s
   `--trust-remote-code` flag on the two shared golden-capture scripts (default off = inert) + records;
   every other model byte-identical by construction. `benchmark_binding=false`, SPEED PENDING (row
   `ACTIVE`, not `DONE`). Remaining recent-dense row (MiniCPM3) stays `SPIKE`. Not pushed; FULL SHA reported.
+
+---
+
+## 2026-07-26 — MiniCPM3 (`MiniCPM3ForCausalLM`, `openbmb/MiniCPM3-4B`) SACRED 16/16 — first MLA-attention MiniCPM, ZERO NEW compute KERNEL, CLOSES the non-trivial recent-dense tier (base `origin/main` `a8363c60`, worktree `sweep-minicpm3`, dgx `~/vllmcpp-minicpm3`)
+
+- **Row `MODEL-TEXT-minicpm3-mini-cpm3-for-causal-lm` → `ACTIVE`; `CLAIM-SWEEP-RECENT-DENSE`.**
+  MiniCPM3 = the landed MiniCPM 3-scalar dense skeleton (scale_emb / scale_depth / dim_model_base,
+  inherited verbatim — `MiniCPM3*` subclass `MiniCPM*` upstream, minicpm3.py:186-233) with attention
+  swapped GQA→**MLA**, REUSING the landed DeepSeek-V2 MLA block (`mla::ForwardMlaAttentionBlock`,
+  load-time kv_b_proj→W_UK/W_UV absorption). New files only: `minicpm3.{h,cpp}` + `minicpm3_weights.cpp`
+  + `minicpm3_registry.cpp` (one `REGISTER_VLLM_MODEL`) + `test_minicpm3_paged_engine.cpp` +
+  `scripts/minicpm3-convert-safetensors.py`. Grounded in `minicpm3.py`/`minicpm.py`/`phi3_long_rope_scaled_rope.py` @ `e24d1b24`.
+- **THREE MLA deltas vs DeepSeek**, all handled faithfully: (1) `is_neox_style=True` (neox rotation,
+  minicpm3.py:121-125) — threaded through a NEW shared field `mla::MlaBlockDims::is_neox_style`
+  (DEFAULT false ⇒ DeepSeek/GLM byte-identical), read by the MLA block's decoupled-rope call;
+  (2) LongRoPE not YaRN — `BuildMiniCPM3RopeCosSinCache` (phi3_long_rope short cache, mscale 1.0 since
+  max_pos==orig_max_pos ⇒ plain qk_head_dim**-0.5 scale, no mscale^2); (3) q_lora always present.
+- **ONE reuse-not-new shared-kernel change:** the FA-2 MLA prefill only had hdim {192,256}; MiniCPM3's
+  qk_head_dim is 96. `cuda_mla_prefill.cu` now rounds qk_head_dim UP to the nearest COMPILED FA-2 dim
+  and zero-pads Q/K/V into it (96→128, reusing the compiled hdim128 split-KV kernel); the dispatch gate
+  (`cuda_flash_attn_fa2.cu`) accepts d=128. EXACT (trailing zeros add nothing to the QK dot, scale passed
+  explicitly; V padding sliced off); identity for DeepSeek d=192 / GLM d=256.
+- **W0 RUN-VERIFIED:** oracle BUILDS+RUNS `MiniCPM3ForCausalLM` (trust_remote_code, coherent ~19 tok/s);
+  `.bin`-only checkpoint converted `.bin`→safetensors via trusted torch (746 tensors bf16, tied — no lm_head);
+  K=5 self-determinism ALL 16/16 → STRICT bar. MLA config: qk_nope 64/qk_rope 32/qk_head 96/v 64/kv_lora 256/q_lora 768/cache 288/rope_theta 10000/longrope.
+- **W4 SACRED (`test_minicpm3_paged_engine`, dgx):** 16/16 PASS (13/16 STRICT token-exact + 3/16 near-tie,
+  max teacher-forced gap 0.0000 nats across 20 divergent positions — perfect bf16 ties, 0 forward-divergent,
+  140 assertions). **RED (MLA-specific):** wrong rope style (is_neox false) → first-token divergence, gate FAILS.
+  **DeepSeek-V2-Lite non-regression:** re-gated 8/8 (byte-identical baseline). CUDA `-Werror` 0 warnings;
+  compute-sanitizer memcheck 0 on the padded prefill. `benchmark_binding=false`, SPEED PENDING (EAGER; decode
+  CUDA-graph = follow-up). Not pushed; FULL SHA reported.
+- **This CLOSES the non-trivial recent-dense tier** — only the trivial tail (Yi=Llama-alias, InternLM3=InternLM2+sliding-window) remains.
