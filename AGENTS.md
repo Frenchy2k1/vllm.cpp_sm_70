@@ -6,7 +6,7 @@ allowed for completed in-scope changes and must follow the commit protocol
 below.
 
 **Developer preferences.** After this file, read
-[`.agents/developer-preferences.md`](.agents/developer-preferences.md) when it
+`.agents/developer-preferences.md` when it
 exists. It is intentionally untracked and records the current developer's Git
 integration choices, usable hosts, local paths, GPU contention policy,
 download/service permissions, and collaboration preferences. Start from the
@@ -365,7 +365,7 @@ submitting AI-assisted code, read
 
 ## Index
 
-- [`.agents/developer-preferences.md`](.agents/developer-preferences.md) — the
+- `.agents/developer-preferences.md` — the
   ignored, developer-owned execution profile for this workspace (copy the
   tracked example below; absence uses the safe defaults above).
 - [.agents/developer-preferences.example.md](.agents/developer-preferences.example.md)
