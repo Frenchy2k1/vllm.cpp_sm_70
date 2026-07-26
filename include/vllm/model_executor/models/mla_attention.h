@@ -119,6 +119,15 @@ struct MlaBlockDims {
   // The softmax scale INCLUDING the YaRN mscale^2 correction — build it with
   // MlaAttentionScale(), never by hand.
   float scale = 0.0f;
+  // The decoupled-RoPE rotation style. DeepSeek-V2/V3 build the rotary with
+  // `is_neox_style=False` (deepseek_v2.py:1063), i.e. the adjacent-pair GPT-J
+  // form — the DEFAULT here, so every DeepSeek registration stays byte-identical.
+  // MiniCPM3 instead takes get_rope's default `is_neox_style=True`
+  // (minicpm3.py:121-125, no is_neox_style arg → the neox half-split rotation),
+  // so its registration sets this true. This is the ONLY MLA-geometry field that
+  // differs between the two families; the cos/sin cache layout is identical
+  // (cos(d/2)|sin(d/2)), only the application pairing changes.
+  bool is_neox_style = false;
 
   // `self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim` (:969) — 192.
   int64_t qk_head_dim() const { return qk_nope_head_dim + qk_rope_head_dim; }

@@ -373,6 +373,35 @@ prep `minicpm-convert-safetensors.py`, capture `glm4-oracle-capture.py --per-pro
 ./build/tests/test_minicpm_paged_engine`. SPEED: **PENDING** - no throughput measured (row is `ACTIVE`,
 not `DONE`, until every-axis vLLM speed parity). No throughput number is claimed here.
 
+**MiniCPM3 (`MiniCPM3ForCausalLM`, `openbmb/MiniCPM3-4B`) - CORRECTNESS-COMPLETE, SPEED PENDING
+(2026-07-26, rank-9 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`, base `origin/main` `a8363c60`).**
+`benchmark_binding=false`. CORRECTNESS: **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0
+(per-prompt K=5 ALL-DETERMINISTIC ⇒ STRICT bar): 13/16 strict token-exact + 3/16 bf16 near-tie-band,
+**max teacher-forced gap 0.0000 nats** across all 20 divergent positions (perfect bf16 ties), 0
+forward-divergent (`tests/parity/test_minicpm3_paged_engine.cpp`, 140/140 assertions, dgx-only). The
+first MLA-attention MiniCPM; **CLOSES the non-trivial recent-dense tier**. **ZERO new compute kernel**:
+the landed MiniCPM three scalars (grounded `minicpm.py:588-640`) with attention swapped GQA->**MLA**,
+REUSING the landed DeepSeek-V2 MLA block (`mla::ForwardMlaAttentionBlock`, load-time kv_b_proj->W_UK/W_UV
+absorption) threaded with MiniCPM3 dims (`minicpm3.py:52-134` @ `e24d1b24`). THREE MLA deltas, all faithful:
+`is_neox_style=True` via a NEW default-false shared field `mla::MlaBlockDims::is_neox_style` (DeepSeek/GLM
+byte-identical); LongRoPE-not-YaRN (`BuildMiniCPM3RopeCosSinCache`, phi3_long_rope short cache, mscale 1.0
+=> plain qk_head_dim**-0.5 scale); q_lora always present. ONE reuse-not-new shared-kernel change: the FA-2
+MLA prefill (`cuda_mla_prefill.cu`+`cuda_flash_attn_fa2.cu`) zero-pads qk_head_dim 96->128 to reuse the
+compiled hdim128 split-KV kernel (EXACT; identity for DeepSeek d=192/GLM d=256). **W0 `.bin`-RISK
+RESOLVED**: MiniCPM3-4B ships ONLY `pytorch_model.bin`; vLLM 0.25.0 builds+runs it with
+`trust_remote_code=True`, and the vehicle was prepared via trusted torch `.bin`->safetensors
+(`scripts/minicpm3-convert-safetensors.py`, tied embeddings) so BOTH oracle and engine read identical bf16.
+**RED-first (MLA-specific)**: flipping `is_neox_style` to the wrong (DeepSeek gptj) rotation -> first-token
+divergence, gate FAILS. **DeepSeek-V2-Lite non-regression**: `test_deepseek_v2_paged_engine` re-gated 8/8
+(byte-identical baseline - the is_neox default + identity prefill padding leave it unchanged). memcheck 0
+on the padded prefill, clean CUDA `-Werror`. Gated via the additive `TokensPrompt` engine path. Reproduce
+on dgx: prep `minicpm3-convert-safetensors.py`, capture `glm4-oracle-capture.py --per-prompt
+--trust-remote-code --runs 5 --model <converted MiniCPM3-4B> --out-dir <dir>`, bootstrap
+`VT_DUMP_IDS=1 ./build/tests/test_minicpm3_paged_engine`, gap `glm4-neartie-gap.py --trust-remote-code
+--model <converted MiniCPM3-4B> --golden-dir <dir>`, then `flock $HOME/gpu.lock
+./build/tests/test_minicpm3_paged_engine`. SPEED: **PENDING** - no throughput measured (row is `ACTIVE`,
+not `DONE`; EAGER - the decode CUDA-graph is a follow-up). No throughput number is claimed here.
+
 **StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) - CORRECTNESS-COMPLETE, SPEED PENDING
 (2026-07-26, rank-4 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`).** CORRECTNESS:
 **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0 (per-prompt K=5 ALL-DETERMINISTIC ⇒

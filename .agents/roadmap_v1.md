@@ -136,8 +136,20 @@ before lm_head, all `vt::MulScalar`/`vt::Add`), tied lm_head. W0 `.bin`-only ris
 C++ pickle loader: converted the official openbmb `.bin`→safetensors via trusted torch (same weights,
 both oracle+engine); vLLM builds+runs it with `trust_remote_code=True`. RED-first: dropping
 scale_depth → 256/256 divergent, max gap 29.375 nats gate-CAUGHT. Gated via the additive
-`TokensPrompt` path (MiniCPM's SentencePiece normalizer is a follow-up). Remaining row
-(MiniCPM3) stays `SPIKE`, one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
+`TokensPrompt` path (MiniCPM's SentencePiece normalizer is a follow-up). **rank-9 MiniCPM3
+(`MiniCPM3ForCausalLM`, `openbmb/MiniCPM3-4B`) `ACTIVE` — SACRED 16/16** vs vLLM 0.25.0
+(2026-07-26, worktree `sweep-minicpm3`, dgx `~/vllmcpp-minicpm3`; per-prompt K=5 deterministic →
+STRICT; 13/16 exact + 3/16 near-tie, **max gap 0.0 nats**, 0 divergent). The first MLA-attention
+MiniCPM and the model that **CLOSES the non-trivial recent-dense tier**. **ZERO new compute kernel**
+= the landed MiniCPM 3 scalars with attention swapped GQA→**MLA**, REUSING the landed DeepSeek-V2 MLA
+block; THREE deltas handled faithfully — `is_neox_style=True` (via a new default-false shared
+`MlaBlockDims` field ⇒ DeepSeek byte-identical), LongRoPE-not-YaRN (phi3_long_rope short cache,
+mscale 1.0), q_lora-always. ONE reuse-not-new shared change: the FA-2 MLA prefill zero-pads
+qk_head_dim 96→128 to reuse the compiled hdim128 kernel (identity for DeepSeek d=192/GLM d=256).
+RED-first (MLA-specific): wrong rope style → first-token divergence gate-CAUGHT. **DeepSeek-V2-Lite
+re-gated 8/8** (shared-MLA non-regression). `.bin`-only vehicle resolved via trusted torch
+`.bin`→safetensors. Remaining recent-dense rows are the TRIVIAL tail only: Yi (`YiForCausalLM` =
+Llama alias) and InternLM3 (`InternLM3ForCausalLM` = InternLM2 + sliding window). Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
 MoE/SSM campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no
 0.25.0 oracle.
 

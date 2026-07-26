@@ -1,5 +1,52 @@
 # SPIKE: recent-dense TEXT batch (Phi / Command-R / Granite / StableLM / InternLM2 / MiniCPM / Phi-3-4)
 
+## RANK-9 IMPLEMENTATION UPDATE (2026-07-26, MiniCPM3 — base `origin/main` `a8363c60`, worktree `sweep-minicpm3`, dgx `~/vllmcpp-minicpm3`)
+
+- **rank 9 MiniCPM3 (`MiniCPM3ForCausalLM`, `openbmb/MiniCPM3-4B`) — SACRED 16/16, row `ACTIVE`. CLOSES the non-trivial recent-dense tier** (only the trivial tail — Yi=Llama-alias, InternLM3=InternLM2+sliding-window — would remain).
+  **ZERO NEW compute KERNEL** as scoped — MiniCPM3 is the landed MiniCPM 3-scalar dense
+  skeleton with attention swapped GQA→**MLA**, REUSING the landed DeepSeek-V2 MLA block
+  (`mla::ForwardMlaAttentionBlock`, load-time `kv_b_proj`→W_UK/W_UV absorption) threaded
+  with MiniCPM3 dims. Grounded in `minicpm3.py` @ `e24d1b24`: `MiniCPM3Attention` MLA
+  geometry (`:52-134`, q_a_proj/q_a_layernorm/q_b_proj + kv_a_proj_with_mqa/kv_a_layernorm/
+  kv_b_proj + o_proj), `MiniCPM3DecoderLayer`/`MiniCPM3Model`/`MiniCPM3ForCausalLM`
+  subclass MiniCPM (`:186-233`) so the 3 scalars (scale_emb 12, scale_depth/sqrt(62),
+  hidden/scale_width=2560/256=10) are inherited verbatim from the landed `minicpm.cpp`.
+- **THREE MLA deltas vs the landed DeepSeek-V2 path**, all handled faithfully:
+  (1) **`is_neox_style=True`** — MiniCPM3 takes get_rope's default neox rotation
+  (`:121-125`), DeepSeek uses gptj (`is_neox_style=False`). Threaded through the shared
+  `mla::MlaBlockDims::is_neox_style` (DEFAULT false → every DeepSeek/GLM registration is
+  byte-identical); the MLA block's decoupled-rope call now reads `dims.is_neox_style`.
+  (2) **LongRoPE not YaRN** — MiniCPM3-4B ships `rope_scaling type=longrope`; since
+  max_pos==original_max_pos (32768) the LongRoPE scale is 1.0 ⇒ mscale 1.0, the SHORT
+  cache is selected, and the softmax scale is the plain qk_head_dim**-0.5 (NO mscale^2
+  correction). A small `BuildMiniCPM3RopeCosSinCache` (phi3_long_rope_scaled_rope.py:97-123)
+  replaces `BuildDeepseekRopeCosSinCache`. (3) q_lora ALWAYS present → only the
+  fused_qkv_a_proj branch runs.
+- **ONE shared-kernel change (reuse, not a new kernel):** the FA-2 MLA prefill only had
+  hdim {192,256} instantiated; MiniCPM3's qk_head_dim is 96. The caller
+  (`cuda_mla_prefill.cu`) now rounds qk_head_dim UP to the nearest compiled FA-2 dim and
+  zero-pads Q/K/V into it (96→128, reusing the already-compiled `hdim128` split-KV kernel);
+  the dispatch gate (`cuda_flash_attn_fa2.cu`) accepts d=128. EXACT: trailing zeros add
+  nothing to the QK dot (scale passed explicitly) and V's padded output columns are sliced
+  off. For DeepSeek (d=192)/GLM (d=256) `d_pad==dqk` so Q/K pass native and only V is
+  padded — byte-identical to before.
+- **W0 (RUN-VERIFIED):** `openbmb/MiniCPM3-4B` is ungated but ships ONLY `pytorch_model.bin`
+  (no safetensors); converted `.bin`→safetensors via trusted torch on the oracle box
+  (`scripts/minicpm3-convert-safetensors.py`; tied embeddings — no lm_head — bf16, 746
+  tensors). vLLM 0.25.0 BUILDS+RUNS `MiniCPM3ForCausalLM` with `trust_remote_code=True`
+  (coherent greedy ~19 tok/s). K=5 self-determinism: ALL 16/16 prompts DETERMINISTIC → the
+  gate holds us to STRICT. MLA config: qk_nope 64, qk_rope 32, qk_head_dim 96, v_head_dim
+  64, kv_lora 256, q_lora 768, MLA cache head_size 288, rope_theta 10000, longrope.
+- **W4 SACRED (`test_minicpm3_paged_engine`, dgx):** 16/16 PASS (13/16 STRICT token-exact +
+  3/16 near-tie band only; max teacher-forced root-divergence gap 0.0000 nats across all 20
+  divergent positions — perfect bf16 ties; 0 forward-divergent; 140 assertions). Gated via
+  oracle prompt ids (TokensPrompt path). **RED:** flipping `is_neox_style` to the wrong
+  (DeepSeek gptj) rotation → first-token divergence, gate FAILS loudly. **DeepSeek-V2-Lite
+  non-regression:** `test_deepseek_v2_paged_engine` re-gated 8/8 (unchanged — the is_neox
+  default + identity prefill padding leave it byte-identical). CUDA `-Werror` clean;
+  compute-sanitizer memcheck 0 on the padded prefill. SPEED PENDING (eager; the decode
+  CUDA-graph sibling of DeepSeek-V2 W9 is the follow-up).
+
 ## RANK-5 IMPLEMENTATION UPDATE (2026-07-26, MiniCPM — base `origin/main` `c39d78a6`, worktree `minicpm-bringup`, dgx `~/vllmcpp-minicpm`)
 
 - **rank 5 MiniCPM (`MiniCPMForCausalLM`, `openbmb/MiniCPM-2B-sft-bf16`) — SACRED 16/16, row `ACTIVE`.**

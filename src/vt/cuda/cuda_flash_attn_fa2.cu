@@ -535,15 +535,20 @@ void LaunchMlaPrefillFA2Bf16(cudaStream_t s, Tensor& out, float* lse_out,
   //   * DeepSeek-V2/V3: qk_nope 128 + qk_rope 64 = 192, v_head_dim 128
   //     (V zero-padded 128 -> 192 by the caller);
   //   * GLM-4.7-Flash (`Glm4MoeLite`): qk_nope 192 + qk_rope 64 = 256, v_head_dim
-  //     256 (the caller's V pad is then a no-op, since v_head_dim == d already).
-  // V arrives already zero-padded to the SAME width by the caller, mirroring
-  // `requires_v_padding` (flash_attn.py:88-99 — TRUE on GB10 because FA3-on-SM90
-  // and FA4 are the only exemptions). Both split-KV instantiations are already
-  // compiled (flash_fwd_split_hdim{192,256}_bf16{,_causal}_sm80.cu), so this is a
-  // dispatch addition only — the 192 path is byte-identical.
-  if (d != 192 && d != 256) {
+  //     256 (the caller's V pad is then a no-op, since v_head_dim == d already);
+  //   * MiniCPM3: qk_nope 64 + qk_rope 32 = 96, v_head_dim 64 — the caller
+  //     ROUNDS d up to 128 and zero-pads Q/K/V into it (the QK dot is unchanged;
+  //     V's padded output columns are sliced back off).
+  // Q/K/V arrive already zero-padded to the SAME width `d` by the caller,
+  // mirroring `requires_v_padding` (flash_attn.py:88-99 — TRUE on GB10 because
+  // FA3-on-SM90 and FA4 are the only exemptions). All three split-KV
+  // instantiations are compiled (flash_fwd_split_hdim{128,192,256}_bf16{,_causal}
+  // _sm80.cu), so this is a dispatch addition only — the 192/256 paths are
+  // byte-identical.
+  if (d != 128 && d != 192 && d != 256) {
     throw std::runtime_error(
-        "cuda flash-attn-2 MLA prefill: head_dim 192 or 256 only (dispatch gate must enforce)");
+        "cuda flash-attn-2 MLA prefill: head_dim 128, 192 or 256 only (dispatch "
+        "gate must enforce)");
   }
 
   // max_seqlen_q / max_seqlen_k: host UPPER BOUNDS are safe for grid sizing and
@@ -663,6 +668,12 @@ void LaunchMlaPrefillFA2Bf16(cudaStream_t s, Tensor& out, float* lse_out,
       FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, s);
     } else {
       FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, s);
+    }
+  } else if (d == 128) {
+    if (args.causal) {
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, s);
+    } else {
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, s);
     }
   } else if (args.causal) {
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 192, true>(p, s);

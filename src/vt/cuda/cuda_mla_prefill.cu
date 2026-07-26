@@ -191,24 +191,82 @@ void MlaPrefillAttentionCuda(Queue& q, Tensor& out, Tensor* lse, const Tensor& q
   cudaStream_t s = AsStream(q);
   std::lock_guard<std::mutex> lk(ScratchMutex());
 
-  // Workspace: the zero-padded V [total_k, heads, dqk] followed by the padded
-  // output [total_q, heads, dqk], both contiguous and bf16.
+  // FA-2's compiled head_dim instantiations are {128, 192, 256}. MLA query/key
+  // are qk_head_dim wide (DeepSeek 192, GLM-4.7-Flash 256, MiniCPM3 96). Round
+  // qk_head_dim UP to the nearest compiled dim and run FA-2 at that width. The
+  // zero-pad is EXACT: the QK dot gains only sum_{d>=dqk} q*0 == 0 (the softmax
+  // scale is passed explicitly, not derived from d), and V's padded output
+  // columns are sliced back off. For DeepSeek/GLM `d_pad == dqk`, so Q/K pass
+  // through natively and only V is padded — byte-identical to before; only
+  // MiniCPM3 (dqk 96 -> 128) also pads Q/K.
+  int64_t d_pad;
+  if (dqk <= 128) d_pad = 128;
+  else if (dqk <= 192) d_pad = 192;
+  else if (dqk <= 256) d_pad = 256;
+  else
+    throw std::runtime_error(
+        "cuda mla_prefill_attention: qk_head_dim > 256 has no FA-2 instantiation");
+  const bool pad_qk = (dqk != d_pad);
+
+  // Workspace: padded V [total_k, heads, d_pad] + padded output
+  // [total_q, heads, d_pad] (+ padded Q/K only when d_pad != dqk), contiguous bf16.
   const size_t v_elems = static_cast<size_t>(total_k) * static_cast<size_t>(heads) *
-                         static_cast<size_t>(dqk);
+                         static_cast<size_t>(d_pad);
   const size_t o_elems = static_cast<size_t>(total_q) * static_cast<size_t>(heads) *
-                         static_cast<size_t>(dqk);
-  auto* base = static_cast<__nv_bfloat16*>(
-      EnsureScratch((v_elems + o_elems) * sizeof(__nv_bfloat16), s));
+                         static_cast<size_t>(d_pad);
+  const size_t q_elems =
+      pad_qk ? static_cast<size_t>(total_q) * static_cast<size_t>(heads) *
+                   static_cast<size_t>(d_pad)
+             : 0;
+  const size_t k_elems =
+      pad_qk ? static_cast<size_t>(total_k) * static_cast<size_t>(heads) *
+                   static_cast<size_t>(d_pad)
+             : 0;
+  auto* base = static_cast<__nv_bfloat16*>(EnsureScratch(
+      (v_elems + o_elems + q_elems + k_elems) * sizeof(__nv_bfloat16), s));
   __nv_bfloat16* vpad = base;
   __nv_bfloat16* opad = base + v_elems;
+  __nv_bfloat16* qpad = pad_qk ? opad + o_elems : nullptr;
+  __nv_bfloat16* kpad = pad_qk ? qpad + q_elems : nullptr;
 
+  const int threads = 256;
   if (total_k > 0) {
-    const int threads = 256;
     const int64_t blocks = (static_cast<int64_t>(v_elems) + threads - 1) / threads;
     PadVKernel<__nv_bfloat16><<<static_cast<unsigned>(blocks), threads, 0, s>>>(
         vpad, value.Ptr<__nv_bfloat16>(), total_k, static_cast<int>(heads),
-        static_cast<int>(dv), static_cast<int>(dqk), value.stride[0], value.stride[1]);
+        static_cast<int>(dv), static_cast<int>(d_pad), value.stride[0],
+        value.stride[1]);
     Check(cudaGetLastError(), "pad-V launch");
+  }
+
+  // Q/K: use the native (strided) tensors when d_pad == dqk; otherwise zero-pad
+  // dqk -> d_pad into contiguous scratch (same PadVKernel, copying the first dqk).
+  Tensor q_use = query;
+  Tensor k_use = key;
+  if (pad_qk) {
+    const int64_t qb = (static_cast<int64_t>(q_elems) + threads - 1) / threads;
+    PadVKernel<__nv_bfloat16><<<static_cast<unsigned>(qb), threads, 0, s>>>(
+        qpad, query.Ptr<__nv_bfloat16>(), total_q, static_cast<int>(heads),
+        static_cast<int>(dqk), static_cast<int>(d_pad), query.stride[0],
+        query.stride[1]);
+    Check(cudaGetLastError(), "pad-Q launch");
+    if (total_k > 0) {
+      const int64_t kb = (static_cast<int64_t>(k_elems) + threads - 1) / threads;
+      PadVKernel<__nv_bfloat16><<<static_cast<unsigned>(kb), threads, 0, s>>>(
+          kpad, key.Ptr<__nv_bfloat16>(), total_k, static_cast<int>(heads),
+          static_cast<int>(dqk), static_cast<int>(d_pad), key.stride[0],
+          key.stride[1]);
+      Check(cudaGetLastError(), "pad-K launch");
+    }
+    q_use = query;
+    q_use.data = qpad;
+    q_use.shape[2] = d_pad;
+    q_use.stride[0] = heads * d_pad;
+    q_use.stride[1] = d_pad;
+    q_use.stride[2] = 1;
+    k_use = q_use;
+    k_use.data = kpad;
+    k_use.shape[0] = total_k;
   }
 
   Tensor vpad_t{};
@@ -218,9 +276,9 @@ void MlaPrefillAttentionCuda(Queue& q, Tensor& out, Tensor* lse, const Tensor& q
   vpad_t.rank = 3;
   vpad_t.shape[0] = total_k;
   vpad_t.shape[1] = heads;
-  vpad_t.shape[2] = dqk;
-  vpad_t.stride[0] = heads * dqk;
-  vpad_t.stride[1] = dqk;
+  vpad_t.shape[2] = d_pad;
+  vpad_t.stride[0] = heads * d_pad;
+  vpad_t.stride[1] = d_pad;
   vpad_t.stride[2] = 1;
 
   Tensor opad_t = vpad_t;
@@ -228,16 +286,15 @@ void MlaPrefillAttentionCuda(Queue& q, Tensor& out, Tensor* lse, const Tensor& q
   opad_t.shape[0] = total_q;
 
   LaunchMlaPrefillFA2Bf16(s, opad_t, lse != nullptr ? lse->Ptr<float>() : nullptr,
-                          lse != nullptr ? lse->stride[0] : 0, query, key, vpad_t,
-                          cu_seqlens_q, cu_seqlens_k, args, num_reqs, heads, dqk);
+                          lse != nullptr ? lse->stride[0] : 0, q_use, k_use, vpad_t,
+                          cu_seqlens_q, cu_seqlens_k, args, num_reqs, heads, d_pad);
 
   {
-    const int threads = 256;
     const int64_t total = total_q * heads * dv;
     const int64_t blocks = (total + threads - 1) / threads;
     SliceOutKernel<__nv_bfloat16><<<static_cast<unsigned>(blocks), threads, 0, s>>>(
         out.Ptr<__nv_bfloat16>(), opad, total_q, static_cast<int>(heads),
-        static_cast<int>(dv), static_cast<int>(dqk), out.stride[0], out.stride[1]);
+        static_cast<int>(dv), static_cast<int>(d_pad), out.stride[0], out.stride[1]);
     Check(cudaGetLastError(), "slice-out launch");
   }
 #endif  // VLLM_CPP_FLASH_ATTN
