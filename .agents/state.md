@@ -24051,3 +24051,31 @@ checkers green by bare RC. `benchmark_binding=false`, SPEED still PENDING (row s
   dump our ids under `VT_DUMP_IDS=1`, run `commandr-neartie-gap.py`, then the SACRED
   gate. NOTE: `logit_scale` + parallel-residual are the load-bearing deltas — RED-test
   both (they emit fluent-WRONG tokens if mis-wired).
+
+- 2026-07-26 — **MODEL BREADTH: Phi-1/Phi-2 (`PhiForCausalLM`, `microsoft/phi-2`)
+  landed `ACTIVE` — SACRED gate PASSES 16/16 vs vLLM 0.25.0** (`MODEL-TEXT-phi-phi-for-causal-lm`,
+  `CLAIM-SWEEP-RECENT-DENSE`; base `origin/main` `29c710dd`, worktree
+  `.claude/worktrees/phi12-bringup` branch `phi12-bringup`; dgx build+gate
+  `~/vllmcpp-phi12`, all GPU under `flock $HOME/gpu.lock`). The OLDER Microsoft Phi
+  arch, DISTINCT from the landed `Phi3ForCausalLM`. **W0 RUN-VERIFIED** the oracle
+  (builds+runs coherent greedy text; ungated + safetensors; ~5.18 GiB F16). Gate form
+  BY MEASUREMENT: per-prompt K=5 ALL-DETERMINISTIC ⇒ STRICT well-posed; **16/16 PASS**
+  by the ratified near-tie ROOT-divergence gate — 9/16 strict token-exact + 7/16
+  near-tie band, max teacher-forced gap 0.25 nats < 0.5, 0 forward-divergent (every
+  downstream token == vLLM's teacher-forced argmax at gap 0.0). **ZERO-NEW-KERNEL**:
+  the spike's predicted `kGelu` unary was unnecessary — `gelu_new`/NewGELU is
+  bit-identical to the landed `vt::GeluTanh`. New files only (`phi.{h,cpp}`,
+  `phi_weights.cpp`, `phi_registry.cpp`, `test_phi_paged_engine.cpp`). Deltas (all
+  REUSE, grounded `phi.py` @ `e24d1b24`): GPT-J PARALLEL residual (Command-R `RunLayer`
+  wiring), nn.LayerNorm+bias (`vt::LayerNorm`), biased q/k/v/dense (OPT `BiasedProj`),
+  partial NeoX rope 32/80 (`vt::RopeFromCache`), non-gated NewGELU MLP (`vt::GeluTanh`),
+  untied lm_head+bias. microsoft/phi-2 is FLOAT16 on disk (453 F16 tensors) → a
+  DTYPE-AWARE f16→bf16(RNE) loader kept LOCAL to `phi_weights.cpp` (mirrors OLMo-2's
+  F32→BF16; shared `dense_weight_loaders.h` UNTOUCHED). **RED-first (3 load-bearing
+  deltas):** dropped qkv bias 1.25 nats + sequential-instead-of-parallel residual 21.19
+  nats gate-CAUGHT; wrong partial-rotary fraction hard-aborts (`rope_from_cache` shape
+  contract). memcheck 0 errors; clean CUDA `-Werror` 0 warnings; no kernel touched.
+  Inertness: `git diff --stat` = 5 new phi files + 2 CMake edits + records; every other
+  model byte-identical by construction. `benchmark_binding=false`, SPEED PENDING (row
+  `ACTIVE`, not `DONE`). Remaining recent-dense rows (MiniCPM, MiniCPM3) stay `SPIKE`.
+  Not pushed; FULL SHA reported.

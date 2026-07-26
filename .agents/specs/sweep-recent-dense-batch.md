@@ -1,5 +1,38 @@
 # SPIKE: recent-dense TEXT batch (Phi / Command-R / Granite / StableLM / InternLM2 / MiniCPM / Phi-3-4)
 
+## RANK-8 IMPLEMENTATION UPDATE (2026-07-26, Phi-1/2 — base `origin/main` `29c710dd`, worktree `phi12-bringup`, dgx `~/vllmcpp-phi12`)
+
+- **rank 8 Phi-1/Phi-2 (`PhiForCausalLM`, `microsoft/phi-2`) — SACRED 16/16, row `ACTIVE`.**
+  The OLDER Microsoft Phi arch, DISTINCT from the landed `Phi3ForCausalLM`. **W0 RUN-verified**
+  the oracle (builds+runs coherent greedy text; ungated + safetensors; ~5.18 GiB F16). Gate form
+  BY MEASUREMENT: vLLM 0.25.0 per-prompt K=5 **ALL-DETERMINISTIC** (0 multi-member cells) ⇒
+  STRICT well-posed; **16/16 PASS** by the ratified near-tie ROOT-divergence gate — **9/16
+  STRICT token-exact + 7/16 near-tie band, max teacher-forced gap 0.25 nats < 0.5, 0
+  forward-divergent** (every downstream token == vLLM's teacher-forced argmax at gap 0.0).
+  - **ZERO-NEW-KERNEL — spec §0.2 row 7 CORRECTED.** The spike predicted "ONE new op: a
+    `kGelu`/NewGELU unary". WRONG: `gelu_new` (activation.py:516-519, NewGELU
+    `0.5x(1+tanh(√(2/π)(x+0.044715x³)))`) is **bit-identical to the landed `vt::GeluTanh`**
+    (the Qwen3-VL vision-tower unary) — the non-gated MLP reuses it, so **NO new op**. New
+    files only (`phi.{h,cpp}`, `phi_weights.cpp`, `phi_registry.cpp`, `test_phi_paged_engine.cpp`).
+  - **Deltas ported (all REUSE), grounded in `phi.py` @ `e24d1b24`:** GPT-J PARALLEL residual
+    (`PhiLayer.forward` :189-202: ONE nn.LayerNorm+bias feeds BOTH attn+mlp, outputs summed
+    together — reuses the Command-R `RunLayer` wiring); biased q/k/v/`dense` (`:98,102`, OPT
+    `BiasedProj`); partial NeoX RoPE (rotary_dim 32/head_dim 80, `partial_rotary_factor` 0.4,
+    `RopeFromCache` — the phi3/StableLM path); non-gated NewGELU MLP (`PhiMLP` :165-169, fc1->
+    `vt::GeluTanh`->fc2, both biased); untied lm_head WITH per-vocab bias (`:288-320`, `vt::Matmul`
+    + f32 `vt::Add` broadcast).
+  - **F16 checkpoint (new fact, spec §0.3 said ~5.6 GiB bf16).** microsoft/phi-2 is **FLOAT16 on
+    disk (all 453 tensors F16)**; vLLM serves it bf16 (`Casting torch.float16 to torch.bfloat16`).
+    The loader is DTYPE-AWARE: BF16 reuses the shared helpers verbatim, F16 downcasts f16->f32->
+    bf16(RNE) — bit-identical to torch `.to(bfloat16)`. Kept LOCAL to `phi_weights.cpp` (mirrors
+    OLMo-2's F32→BF16 converters); the shared `dense_weight_loaders.h` is UNTOUCHED ⇒ every other
+    model byte-identical.
+  - **RED-first (3 load-bearing deltas):** drop qkv bias → max gap **1.25 nats** (gate CATCHES);
+    sequential-instead-of-parallel residual → max gap **21.19 nats** (gate CATCHES); wrong partial-
+    rotary fraction (full 80 or half 16) → hard `rope_from_cache` shape-contract abort (cannot
+    silently run — structurally caught). memcheck 0 errors. Clean CUDA `-Werror` 0 warnings; no
+    kernel touched. SPEED PENDING. Remaining rows (MiniCPM, MiniCPM3) stay `SPIKE`.
+
 ## TOP-3 IMPLEMENTATION UPDATE (2026-07-24, batch3 — `sweep-recent-dense-batch3`, base `origin/main` `e1173fa`, dgx `~/vllmcpp-b3`)
 
 The three §0.6 recommendations were implemented, one clean `-Werror` build, one
