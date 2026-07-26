@@ -23752,3 +23752,51 @@ user's stated Qwen3.6 video modality is COMPLETE.
   false`, SPEED pending (A3 `DONE` only at token-exact AND vLLM throughput). Not
   pushed; FULL SHA reported. NEXT: A2-follow USM-Conformer (Granite-Speech-2b) for the
   Gemma-4 audio family; A3 speed grid vs vLLM.
+
+## 2026-07-26 — MULTIMODAL SPEED measured vs vLLM 0.25.0 GRAPHED (c1) — `CLAIM-MULTIMODAL-SPEED`
+
+First inference-speed characterization of the landed mm paths (measurement +
+attribution + lever-ranking, NOT optimization). Base `origin/main` `e3ab9547`. dgx
+GB10 sm_121a; our build `~/work/m3b-vl` (M3-b tree = HEAD's 27B image forward,
+unchanged since M3-b), cutlass 4.5.0 + FA2 + Triton arch 121a; vLLM 0.25.0 oracle.
+ALL GPU under `flock $HOME/gpu.lock`, engine and oracle serialized/never
+co-resident, cold rep discarded.
+
+- **HEADLINE:** at c1 the 27B image/video DECODE is already AT vLLM parity (225.0 vs
+  226.9 ms/tok, marginally faster) and the LLM prefill is at parity — the ENTIRE
+  measured gap is the vision ENCODER TOWER (~2.1 s vs vLLM's ≤~250 ms encode, ~10×),
+  which dominates time-to-first-token (2.44 s ours vs 0.32 s vLLM). NOT host-bound at
+  c1: the 226 ms/tok is the ~54 GiB bf16 weight-streaming floor (both engines sit on
+  it), so the eager driver's per-token host round-trips are hidden.
+- **Qwen3.6-27B IMAGE (measured):** tower 2114 ms (2091–2126), LLM prefill 326 ms,
+  decode TPOT 225.0 ms/tok (224.9–225.1); vLLM graphed TTFT 321.6 ms (encode+prefill
+  +sample), TPOT 226.9 ms/tok. Timed driver still asserted 32/32 token-exact
+  (proof-of-run). vLLM does NOT graph/compile its encoder (`compile_mm_encoder:False`,
+  `cudagraph_mm_encoder:False`) ⇒ the tower gap is a fair eager-vs-eager kernel gap.
+- **Voxtral AUDIO:** vLLM graphed denominator captured (TTFT 43 ms, TPOT 41 ms/tok,
+  388-tok prompt). OUR-SIDE UNMEASURED — build-blocked: no A3/Voxtral binary on a
+  reusable dgx tree (`~/work/m3b-vl` = image/video, `~/work/a2-audio` = A2 encoder
+  fidelity only), and dgx disk is 100% full (25 GiB free) ⇒ building `test_voxtral_e2e`
+  is ENOSPC-risky ([[grid-per-sha-trees-fill-disk]]). Because the 3B decode is cheap
+  (~41 ms), audio is the path where the eager-driver host overhead would NOT be hidden
+  — the top follow-on measurement.
+- **Structural:** the mm drivers (`VLGenerateCoreGdn` `qwen3_5.cpp:6756-6780`;
+  `VoxtralGenerateGreedy`) are single-sequence eager un-graphed greedy loops with
+  per-token host round-trips, NOT the production graphed paged runner. No batched mm
+  path + no `image_url`/`audio_url` server ingestion ⇒ c2+ throughput not measurable
+  our-side (a structural gap, not tuning). The tower is genuinely GPU-compute-bound
+  (per-block Downloads in `qwen3_vl_vision.cpp` are unit-test taps, null in e2e).
+- **Ranked levers** (spec §5): (1) vision-tower kernel efficiency (~90% of the
+  first-token gap — nsys our tower vs vLLM `Qwen3_VisionTransformer` `qwen3_vl.py:519`
+  / attn `qwen2_5_vl.py:397-460` `flash_attn_varlen_func`; suspect vision attn not on
+  FA2 varlen or un-fused per-block QKV); (2) route mm decode through the graphed paged
+  runner (`qwen3_5.cpp:7231/7448`) — neutral c1-27B, the audio/c2+ lever; (3) batched
+  mm serving (`EncoderCacheManager` + scheduler mm hooks) — structural, for c2+.
+- No trivial byte-exact win surfaced; NO repo source touched (instrumentation was a
+  throwaway on the dgx extraction, reverted). Records written: new spec
+  `.agents/specs/multimodal-speed.md`, `docs/BENCHMARKS.md` (`benchmark_binding=false`),
+  README mm line, engine-matrix `ENG-MM-QWEN36-VL-FORWARD`/`ENG-MM-AUDIO-E2E`, roadmap
+  `ROAD-V1-MM`, ledger. No mm row advances to `DONE` (speed bar unmet on every axis).
+  All seven record checkers green by bare RC. Not pushed; FULL SHA reported.
+  NEXT: nsys-driven vision-tower lever; build a disk-safe timed `test_voxtral_e2e` for
+  the audio our-side number; then the graphed-decode routing (audio/c2+).
