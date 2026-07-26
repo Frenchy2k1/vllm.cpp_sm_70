@@ -44,6 +44,26 @@ std::string LLMEngine::add_request(const std::string& request_id,
   return req_id;
 }
 
+std::string LLMEngine::add_request(const std::string& request_id,
+                                   std::vector<int32_t> prompt_token_ids,
+                                   SamplingParams params, int priority) {
+  // TokensPrompt path: build the request from prompt_token_ids directly (no
+  // tokenization). Mirrors the string add_request step-for-step otherwise; the
+  // output processor gets no prompt string (std::nullopt) since none was given.
+  EngineCoreRequest request = input_processor_.process_inputs_tokens(
+      request_id, std::move(prompt_token_ids), std::move(params),
+      /*arrival_time=*/std::nullopt, priority);
+  const std::string req_id = request.request_id;
+
+  output_processor_.add_request(request, /*prompt=*/std::nullopt,
+                                /*request_index=*/0);
+
+  auto req = std::make_unique<Request>(
+      Request::FromEngineCoreRequest(request, block_hasher_));
+  engine_core_.add_request(std::move(req));
+  return req_id;
+}
+
 std::vector<RequestOutput> LLMEngine::step() {
   // llm_engine.py:303 outputs = self.engine_core.get_output(). Our EngineCore
   // fuses the core's schedule/execute/sample/update into step(), returning the
@@ -88,6 +108,24 @@ RequestOutput LLMEngine::generate(const std::string& prompt,
   //       for output in self.llm_engine.step():
   //           if output.finished: outputs.append(output)
   add_request(request_id, prompt, std::move(params), priority);
+  RequestOutput result;
+  while (has_unfinished_requests()) {
+    std::vector<RequestOutput> step_outputs = step();
+    for (RequestOutput& out : step_outputs) {
+      if (out.finished) {
+        result = std::move(out);
+      }
+    }
+  }
+  return result;
+}
+
+RequestOutput LLMEngine::generate(std::vector<int32_t> prompt_token_ids,
+                                  SamplingParams params,
+                                  const std::string& request_id, int priority) {
+  // TokensPrompt single-request driver (mirrors the string generate loop).
+  add_request(request_id, std::move(prompt_token_ids), std::move(params),
+              priority);
   RequestOutput result;
   while (has_unfinished_requests()) {
     std::vector<RequestOutput> step_outputs = step();

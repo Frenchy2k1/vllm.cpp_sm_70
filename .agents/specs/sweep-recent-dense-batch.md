@@ -36,6 +36,28 @@ Regressions byte-identical (OLMo-2 16/16 · Qwen3-dense 184/184 · OPT 63/63 · 
 Remaining rows (MiniCPM, InternLM2, Command-R, Phi-1/2, MiniCPM3) stay
 `SPIKE`, one agent each per the queue below.
 
+## RANK-6 IMPLEMENTATION UPDATE (2026-07-26, InternLM2 — base `origin/main` `43287971`, worktree `internlm2-bringup`, dgx `~/vllmcpp-internlm2`)
+
+- **rank 6 InternLM2 (`InternLM2ForCausalLM`, `internlm2-chat-1_8b`) — SACRED 16/16, row `ACTIVE`.**
+  **W0 RUN-verified** the oracle (builds+runs coherent greedy text; ungated + safetensors
+  + ~3.8 GiB). **ZERO new kernel** as scoped: `internlm2.h` aliases the landed
+  Llama/Qwen3-dense forward VERBATIM (`using InternLM2Model = Qwen3DenseModel`); the ONLY
+  delta is the LOADER de-interleave of the fused `wqkv` (packed q/k/v INTERLEAVED by
+  kv-group, `internlm2.py:158-176 split_qkv`) into the plain [q|k|v]-row merged qkv_proj
+  the shared AttnBlock consumes. rope_scaling `dynamic` is identity here (base unchanged).
+  vLLM K=5 ALL-DETERMINISTIC → STRICT; 12/16 token-exact + 4/16 near-tie band, **max gap
+  0.0000 nats**, 0 forward-divergent (the 4 near-ties are EOS-overrun — vLLM stops on its
+  generation_config secondary eos 92542, our engine reads only config.json eos=2 — plus
+  vLLM prefill/decode tie self-inconsistency; every teacher-forced argmax == our token).
+  **RED wrong-split (non-interleaved concat) CAUGHT**: engine emits 55040 vs 1934 at
+  prompt0/tok0, gate FATAL — the interleave is load-bearing. New TUs only + an ADDITIVE
+  engine `TokensPrompt` path (`LLMEngine::{add_request,generate}` /
+  `InputProcessor::process_inputs_tokens`, string path byte-identical) to gate on the
+  oracle's exact prompt ids — InternLM2's non-standard fast BPE (no pre_tokenizer,
+  fuse_unk drops spaces) is not in our tokenizer families; a full port is orthogonal/out
+  of scope. Clean CUDA `-Werror` 0 warnings; no kernel touched. SPEED PENDING. Remaining
+  rows (MiniCPM, Command-R, Phi-1/2, MiniCPM3) stay `SPIKE`, one agent each.
+
 ## RANK-4 IMPLEMENTATION UPDATE (2026-07-26, StableLM — base `origin/main` `fb7609f7`, dgx `~/vllmcpp-stablelm`)
 
 **rank 4 StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) — SACRED 16/16, row `ACTIVE`.**

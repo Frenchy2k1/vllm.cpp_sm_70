@@ -284,6 +284,30 @@ to implement next: OLMo-3 (nearly-free W5 on the landed OLMo-2 code), Phi-3/Phi-
 Each binds a future per-family SACRED token-exact gate vs vLLM 0.25.0 (form BY MEASUREMENT) +
 the every-axis speed close before any row reaches DONE. No number is claimed here.
 
+**InternLM2 (`InternLM2ForCausalLM`, `internlm2-chat-1_8b`) - CORRECTNESS-COMPLETE, SPEED
+PENDING (2026-07-26, rank-6 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`).**
+CORRECTNESS: **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0 (per-prompt K=5
+ALL-DETERMINISTIC ⇒ STRICT bar): 12/16 strict token-exact + 4/16 bf16 near-tie-band, **max
+teacher-forced gap 0.0000 nats**, 0 forward-divergent (`tests/parity/test_internlm2_paged_engine.cpp`,
+140/140 assertions, dgx-only). The 4 near-ties are all gap 0.0 (vLLM's own argmax == our token):
+EOS-overrun (vLLM stops on its generation_config secondary eos 92542; our engine reads only
+config.json eos=2) plus vLLM prefill/decode tie self-inconsistency - the forward matches vLLM's
+logits bit-identically at every position. ZERO new compute kernel: reuses the landed
+Llama/Qwen3-dense forward VERBATIM (`using InternLM2Model = Qwen3DenseModel`); the ONLY delta is a
+loader-side de-interleave of the fused `wqkv` (packed q/k/v interleaved by KV-group,
+`internlm2.py:158-176`). **RED wrong-split proven**: `VT_INTERNLM2_WRONG_SPLIT=1` (naive [q|k|v]
+concat) makes the engine emit 55040 vs 1934 at prompt0 tok0, gate FATAL - the interleave is
+load-bearing. The gate feeds the oracle's exact prompt token ids via the additive `TokensPrompt`
+engine path (InternLM2's non-standard fast BPE, spaces dropped, is not a supported tokenizer family;
+the forward is thus isolated from tokenization). Reproduce on dgx: generate a Metaspace-augmented
+`tokenizer.json` in the snapshot (InternLM2 ships only `tokenizer.model`); capture goldens
+`internlm2-oracle-capture.py --per-prompt --runs 5 --model internlm/internlm2-chat-1_8b --gpu-mem
+0.35`, bootstrap `VT_DUMP_IDS=1 ./build/tests/test_internlm2_paged_engine`, gap
+`internlm2-neartie-gap.py --model internlm/internlm2-chat-1_8b --golden-dir <dir>`, then `flock
+$HOME/gpu.lock ./build/tests/test_internlm2_paged_engine`. SPEED: **`benchmark_binding=false`,
+PENDING** - no throughput measured (row is `ACTIVE`, not `DONE`, until every-axis vLLM speed
+parity). No throughput number is claimed here.
+
 **StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) - CORRECTNESS-COMPLETE, SPEED PENDING
 (2026-07-26, rank-4 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`).** CORRECTNESS:
 **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0 (per-prompt K=5 ALL-DETERMINISTIC ⇒

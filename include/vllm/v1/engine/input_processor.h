@@ -80,6 +80,19 @@ class InputProcessor {
       std::optional<double> arrival_time = std::nullopt,
       int priority = 0) const;
 
+  // process_inputs for a PRE-TOKENIZED prompt (vLLM `TokensPrompt`: a request
+  // built from prompt_token_ids directly, skipping tokenization). Mirrors the
+  // input_preprocessor token-prompt branch. Strictly ADDITIVE: the string
+  // overload above is UNCHANGED and every existing caller keeps the tokenize
+  // path byte-for-byte. Used to gate a model whose tokenizer family we have not
+  // ported yet (e.g. InternLM2's non-standard fast BPE) by feeding the oracle's
+  // exact prompt token ids, isolating the forward from tokenization.
+  EngineCoreRequest process_inputs_tokens(
+      const std::string& request_id, std::vector<int32_t> prompt_token_ids,
+      SamplingParams params,
+      std::optional<double> arrival_time = std::nullopt,
+      int priority = 0) const;
+
  private:
   // _validate_params: runs SamplingParams::PostInit() (normalize + Verify) —
   // this closes the M1.1 deferred-__post_init__ carry.

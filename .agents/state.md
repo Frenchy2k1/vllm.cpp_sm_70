@@ -23981,3 +23981,41 @@ or other gate). NO src/include/kernel/loader change ⇒ every other model
 byte-identical BY CONSTRUCTION. memcheck N/A (no kernel touched). All seven record
 checkers green by bare RC. `benchmark_binding=false`, SPEED still PENDING (row stays
 `ACTIVE`, not `DONE`). Not pushed; FULL SHA reported.
+
+- **2026-07-26** — **InternLM2 (`InternLM2ForCausalLM`, internlm2-chat-1_8b)
+  brought up → row `ACTIVE`, SACRED 16/16.** `CLAIM-SWEEP-RECENT-DENSE` rank 6;
+  base `origin/main` `43287971`, isolated worktree `internlm2-bringup`, dgx
+  `~/vllmcpp-internlm2`. **W0 RUN-verified** the oracle (not config-construct):
+  `LLM(internlm/internlm2-chat-1_8b, trust_remote_code=True)` on dgx builds+runs
+  and emits coherent greedy text; ungated + safetensors + ~3.8 GiB (fits). **ZERO
+  new kernel**: `internlm2.h` aliases the landed Llama/Qwen3-dense forward VERBATIM
+  (`using InternLM2Model = Qwen3DenseModel`); the ONLY delta is a LOADER-side
+  de-interleave of the fused `wqkv` (packed q/k/v INTERLEAVED by kv-group,
+  `internlm2.py:158-176 split_qkv`) into the plain [q|k|v]-row merged qkv_proj the
+  shared AttnBlock consumes — RMSNorm+NeoX(theta 1e6)+GQA 16/8+SiLU-SwiGLU+untied
+  `output` lm_head all reused. rope_scaling `dynamic` is identity here
+  (max_trained_positions defaults to max_position). New TUs only: `internlm2.h`,
+  `internlm2_weights.cpp`, `internlm2_registry.cpp` (one REGISTER line) +
+  `test_internlm2_paged_engine.cpp` + `internlm2-oracle-capture.py` /
+  `internlm2-neartie-gap.py`. **SACRED gate 16/16** vs vLLM 0.25.0 (per-prompt
+  greedy K=5 ALL-DETERMINISTIC ⇒ STRICT bar): 12/16 token-exact + 4/16 near-tie
+  band, **max gap 0.0000 nats**, 0 forward-divergent. Every near-tie divergence is
+  gap 0.0 (vLLM's teacher-forced argmax == our token): 3 prompts are EOS-overrun
+  (vLLM stops on its generation_config secondary eos 92542; our engine reads only
+  config.json eos=2 — a config-file gap, forward matches through EOS) + vLLM
+  prefill/decode tie self-inconsistency. **RED wrong-split proven essential**:
+  `VT_INTERNLM2_WRONG_SPLIT=1` (naive [q|k|v] concat, no de-interleave) → engine
+  emits 55040 vs correct 1934 at prompt0/tok0, gate FAILS (FATAL) — the interleave
+  is load-bearing. **Additive engine `TokensPrompt` path** (mirrors vLLM): new
+  `LLMEngine::{add_request,generate}` + `InputProcessor::process_inputs_tokens`
+  overloads take pre-tokenized prompt ids (string path byte-identical) so the gate
+  feeds the oracle's exact prompt ids — InternLM2's non-standard fast BPE (no
+  pre_tokenizer, byte_fallback=false + fuse_unk → literal spaces DROPPED) is not in
+  our tokenizer families and a full InternLM2 tokenizer port is orthogonal, out of
+  scope for this bring-up. Clean CUDA `-Werror` 0 warnings; no kernel touched
+  (memcheck N/A). Inertness: additive TUs + one REGISTER line + additive engine
+  overloads ⇒ every other model byte-identical by construction. `benchmark_binding=
+  false`, SPEED PENDING (row stays `ACTIVE`, not `DONE`). Not pushed; FULL SHA
+  reported. NOTE for the next InternLM3/Yi (Llama-alias) + Command-R agents: the
+  `TokensPrompt` engine path is now available to gate any model whose tokenizer we
+  have not ported.

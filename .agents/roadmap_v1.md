@@ -106,7 +106,13 @@ advance). **rank-4 StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) `ACTIVE` 
 vs vLLM 0.25.0 (2026-07-26; per-prompt K=5 deterministic → STRICT; 14/16 exact + 2/16 near-tie,
 max gap 0.438 nats, 0 divergent; ZERO new kernel = nn.LayerNorm + partial NeoX rope 16/64 + merged
 qkv bias all reuse; one inert shared tokenizer canon for the Arcade100k CR/LF split-regex variant).
-Remaining rows (MiniCPM, InternLM2, Command-R, Phi-1/2, MiniCPM3) stay `SPIKE`,
+**rank-6 InternLM2 (`InternLM2ForCausalLM`, `internlm2-chat-1_8b`) `ACTIVE` — SACRED 16/16** vs
+vLLM 0.25.0 (2026-07-26; per-prompt K=5 deterministic → STRICT; 12/16 exact + 4/16 near-tie, **max
+gap 0.0 nats**, 0 divergent; ZERO new kernel = reuses the Llama/Qwen3-dense forward VERBATIM, the
+ONLY delta a loader-side de-interleave of the fused `wqkv` — packed q/k/v interleaved by KV-group,
+`internlm2.py:158-176`; RED wrong-split CAUGHT at prompt0 tok0). Gated via the additive
+`TokensPrompt` engine path (InternLM2's non-standard fast BPE is not a supported tokenizer family —
+a full port is orthogonal). Remaining rows (MiniCPM, Command-R, Phi-1/2, MiniCPM3) stay `SPIKE`,
 one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
 MoE/SSM campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no
 0.25.0 oracle.
