@@ -24019,3 +24019,35 @@ checkers green by bare RC. `benchmark_binding=false`, SPEED still PENDING (row s
   reported. NOTE for the next InternLM3/Yi (Llama-alias) + Command-R agents: the
   `TokensPrompt` engine path is now available to gate any model whose tokenizer we
   have not ported.
+
+- 2026-07-26 — **Command-R / Cohere (`CohereForCausalLM`) — IMPLEMENTED, SACRED
+  gate BLOCKED (row → `BLOCKED`/`🚫`).** `CLAIM-SWEEP-RECENT-DENSE` (row moved OFF
+  the active claim; BLOCKED rows are unclaimed). Base `origin/main` `0fb19410`,
+  isolated worktree `sweep-commandr`. Faithful ZERO-NEW-KERNEL port grounded 1:1 in
+  vLLM `commandr.py` @ `e24d1b24`: weight-only mean-centred Cohere `LayerNorm`
+  (REUSE `vt::LayerNorm` NULL bias), GPT-J full-width RoPE (REUSE `vt::RopeFromCache`
+  `is_neox_style=false`, rotary_dim==head_dim), PARALLEL residual (ONE norm feeds
+  attn AND mlp, `h=residual+attn+mlp`, `commandr.py:257-273`), `logit_scale` scalar
+  (REUSE `vt::MulScalar`, `:376`), tied embeddings (`:372`), SiLU-SwiGLU. New TUs
+  `commandr.{h,cpp}` + `commandr_{weights,registry}.cpp` (self-registers via one
+  `REGISTER_VLLM_MODEL` line); `use_qk_norm`/`sliding_window` (Cohere2 arch) rejected
+  at parse. **W0 oracle RUN-VERIFIED** (not config-construct): tiny-random
+  `CohereForCausalLM` BUILDS+RUNS on vLLM 0.25.0 (golden captured), arch confirmed
+  `CohereForCausalLM`≠`Cohere2`. **Gate BLOCKED — no runnable vehicle:** every real
+  small `CohereForCausalLM` (aya-expanse-8b/aya-23-8B/c4ai-command-r-v01) is
+  HF-gated (no dgx token); the only ungated checkpoints are tiny-random (head_dim
+  8/2, outside validated attention); dgx is disk-full (26 GiB free, no build tree);
+  the dev box has no nvcc/GPU and the paged-engine SACRED gate is GPU-only. Test
+  `test_commandr_paged_engine.cpp` written (mirrors stablelm/internlm2 gate),
+  compiles+links+self-registers+SKIPs cleanly on the CPU dev build. `-Werror` 0
+  warn/0 err (3 TUs + full test exe); NO `.cu` touched (no compute-sanitizer needed).
+  Inertness: `git diff --stat` = 5 new files + 2 additive CMake edits, no existing
+  source touched ⇒ every other model byte-identical by construction. All seven
+  record checkers green by bare RC. `benchmark_binding=false`, SPEED PENDING. Not
+  pushed; FULL SHA reported. RESUME when an ungated real `CohereForCausalLM`
+  checkpoint (or an HF token on dgx) + dgx disk are available: `git worktree add`
+  from this branch, build on dgx, capture the greedy golden via a
+  `commandr-oracle-capture.py` (mirror `glm4-oracle-capture.py --per-prompt`),
+  dump our ids under `VT_DUMP_IDS=1`, run `commandr-neartie-gap.py`, then the SACRED
+  gate. NOTE: `logit_scale` + parallel-residual are the load-bearing deltas — RED-test
+  both (they emit fluent-WRONG tokens if mis-wired).
