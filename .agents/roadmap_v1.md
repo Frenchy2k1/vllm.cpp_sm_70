@@ -102,7 +102,11 @@ attention scale proven, ZERO new kernel); Phi-3/Phi-4 is HELD in a separate incr
 follow-on); **OLMo-3 (`Olmo3ForCausalLM`) IMPLEMENTED but oracle-BLOCKED** — the pinned vLLM 0.25.0
 cannot run `allenai/OLMo-3-1025-7B` (`KeyError: 'rope_theta'`, per-layer-type rope schema newer than
 the oracle's transformers), so no SACRED bar (our engine loads+runs it; W5 gate pending a pin/oracle
-advance). Remaining rows (StableLM, MiniCPM, InternLM2, Command-R, Phi-1/2, MiniCPM3) stay `SPIKE`,
+advance). **rank-4 StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) `ACTIVE` — SACRED 16/16**
+vs vLLM 0.25.0 (2026-07-26; per-prompt K=5 deterministic → STRICT; 14/16 exact + 2/16 near-tie,
+max gap 0.438 nats, 0 divergent; ZERO new kernel = nn.LayerNorm + partial NeoX rope 16/64 + merged
+qkv bias all reuse; one inert shared tokenizer canon for the Arcade100k CR/LF split-regex variant).
+Remaining rows (MiniCPM, InternLM2, Command-R, Phi-1/2, MiniCPM3) stay `SPIKE`,
 one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
 MoE/SSM campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no
 0.25.0 oracle.

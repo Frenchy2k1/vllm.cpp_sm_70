@@ -284,6 +284,20 @@ to implement next: OLMo-3 (nearly-free W5 on the landed OLMo-2 code), Phi-3/Phi-
 Each binds a future per-family SACRED token-exact gate vs vLLM 0.25.0 (form BY MEASUREMENT) +
 the every-axis speed close before any row reaches DONE. No number is claimed here.
 
+**StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) - CORRECTNESS-COMPLETE, SPEED PENDING
+(2026-07-26, rank-4 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`).** CORRECTNESS:
+**SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0 (per-prompt K=5 ALL-DETERMINISTIC ⇒
+STRICT bar): 14/16 strict token-exact + 2/16 bf16 near-tie-band, max teacher-forced gap 0.438
+nats, 0 forward-divergent (`tests/parity/test_stablelm_paged_engine.cpp`, 92/92 assertions,
+dgx-only; RED: disabling qkv bias fails at prompt0 tok0; memcheck 0). ZERO new compute kernel
+(nn.LayerNorm weight+bias + partial NeoX rope 16/64 + merged qkv bias, all reuse). Reproduce on
+dgx: capture goldens `glm4-oracle-capture.py --per-prompt --runs 5 --model stabilityai/stablelm-2-1_6b
+--out-dir tests/parity/goldens/stablelm_greedy_1_6b --gpu-mem 0.40`, bootstrap `VT_DUMP_IDS=1
+./build/tests/test_stablelm_paged_engine`, gap `glm4-neartie-gap.py --model stabilityai/stablelm-2-1_6b
+--golden-dir <dir>`, then `flock $HOME/gpu.lock ./build/tests/test_stablelm_paged_engine`. SPEED:
+**`benchmark_binding=false`, PENDING** - no throughput measured (row is `ACTIVE`, not `DONE`, until
+every-axis vLLM speed parity). No throughput number is claimed here.
+
 **Multimodal M2c - IMAGE e2e token-exact WORKING on Qwen3-VL-4B (2026-07-25, `CLAIM-MULTIMODAL-M2C`).**
 CORRECTNESS: **STRICT image->text token-exact 32/32** vs the committed vLLM 0.25.0 golden
 (`tests/vllm/multimodal/fixtures/qwen3vl_text/gen_tokens_i32.bin`) on the fixed (image, prompt),

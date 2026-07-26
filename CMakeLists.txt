@@ -337,6 +337,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/granite_registry.cpp
   src/vllm/model_executor/models/granite_weights.cpp
   src/vllm/model_executor/models/granite.cpp
+  src/vllm/model_executor/models/stablelm_registry.cpp
+  src/vllm/model_executor/models/stablelm_weights.cpp
+  src/vllm/model_executor/models/stablelm.cpp
   src/vllm/model_executor/models/model_registry.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
   src/vllm/model_executor/models/whisper_audio.cpp
