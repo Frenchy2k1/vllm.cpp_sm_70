@@ -52,7 +52,8 @@ std::vector<float> Qwen3DFlashModel::CombineAuxFeatures(const std::vector<float>
 std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     const std::vector<int32_t>& input_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
-    vt::Queue& queue) {
+    vt::Queue& queue, std::vector<std::vector<float>>* per_layer_out,
+    std::vector<float>* final_out) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t T = static_cast<int64_t>(input_ids.size());
   const int64_t H = config.hidden_size;
@@ -172,6 +173,13 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {T, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    if (per_layer_out != nullptr) {
+      DBuf tmp(d, DType::kF32, {T, H});
+      vt::CastF32(d.q, tmp.t(), down.t());
+      std::vector<float> lh(static_cast<size_t>(T) * H);
+      tmp.Download(d, lh.data());
+      per_layer_out->push_back(std::move(lh));
+    }
     hidden = std::move(down);
   }
 
@@ -182,6 +190,13 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     vt::FusedChain(d.q, dnorm.t(), hidden.t(), w_fn, &res.t(), vt::kFusedAddRmsNormStd, eps);
   else
     vt::RmsNorm(d.q, dnorm.t(), hidden.t(), w_fn, vt::RmsNormArgs{eps, false}, &res.t());
+
+  if (final_out != nullptr) {
+    DBuf tmp(d, DType::kF32, {T, H});
+    vt::CastF32(d.q, tmp.t(), dnorm.t());
+    final_out->assign(static_cast<size_t>(T) * H, 0.0f);
+    tmp.Download(d, final_out->data());
+  }
 
   Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, H});
   DBuf logits(d, DType::kF32, {T, vocab});
