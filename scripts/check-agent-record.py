@@ -59,7 +59,7 @@ ENGINE_PREFIXES = (
 # in isolation; a genuinely-new engine capability, distinct from the A0/A1
 # `ENG-MM-AUDIO-PIPELINE` INPUT row). Bumped for a real new row, never to make a
 # failing state transition pass.
-ENGINE_ROWS = 117
+ENGINE_ROWS = 118
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

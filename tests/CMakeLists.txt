@@ -195,6 +195,13 @@ target_compile_definitions(test_qwen3_5_vl_video_e2e PRIVATE
 vllm_cpp_add_test(test_whisper_audio vllm/multimodal/test_whisper_audio.cpp)
 target_compile_definitions(test_whisper_audio PRIVATE
   MM_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/whisper_audio")
+# A3 — e2e AUDIO->TEXT on Voxtral-Mini-3B. GPU-gated: runs only with CUDA + the
+# downloaded consolidated.safetensors (VLLM_VOXTRAL_SAFETENSORS); else skipped, not
+# failed. Fixtures (WAV, log-mel/mel/sinusoid goldens, prompt+golden tokens) are
+# committed (scripts/mm/a3_voxtral_oracle_capture.py).
+vllm_cpp_add_test(test_voxtral_e2e vllm/multimodal/test_voxtral_e2e.cpp)
+target_compile_definitions(test_voxtral_e2e PRIVATE
+  MM_VOXTRAL_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/voxtral_audio")
 # Multimodal M1 encoder-cache manager (inert-when-off engine seam).
 vllm_cpp_add_test(test_encoder_cache_manager vllm/v1/core/test_encoder_cache_manager.cpp)
 # LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip

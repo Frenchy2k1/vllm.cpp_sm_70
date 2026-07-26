@@ -23707,3 +23707,48 @@ user's stated Qwen3.6 video modality is COMPLETE.
   The USM-Conformer tower (Gemma-4/Granite family: Conv2d stride-2 semicausal
   subsample + Conformer conv-module + relative-position attention + softcap) is a
   SEPARATE tower delta (A2-follow, Granite-Speech-2b), NOT built here. NEXT: A3.
+
+- **2026-07-26** — **AUDIO track A3 — the FIRST e2e AUDIO→TEXT understanding in the
+  tree: audio→text on `mistralai/Voxtral-Mini-3B-2507`, e2e gate PASS 14/14**
+  (`CLAIM-AUDIO-E2E`, `ENG-MM-AUDIO-E2E` `ACTIVE`; base `origin/main` `c4f4dfcc`,
+  isolated worktree `/home/mudler/_git/vllm.cpp-a3` branch `a3-voxtral-e2e`; dgx
+  build+gate `~/vllm-cpp-a3-build`, CUDA cutlass-ON `-DCMAKE_CUDA_ARCHITECTURES=121a`,
+  oracle in `~/venvs/vllm-oracle`, e2e gate under one `flock $HOME/gpu.lock`, sibling
+  27B NOT co-resident). **Vehicle+oracle verdict:** Voxtral-Mini-3B is downloadable
+  (NOT HF-gated; `model_info().gated==False`) and oracle-runnable (vLLM 0.25.0
+  `config_format/load_format/tokenizer_mode=mistral` + mistral_common 1.11.5 +
+  `soundfile`); vLLM greedy is K=5 self-DETERMINISTIC ⇒ gate form = STRICT.
+  **Design:** the A2 `WhisperAudioEncoderForward` reused verbatim at Voxtral's
+  Whisper-large-v3 encoder config (d_model 1280/32L/20 heads/head_dim 64/ffn 5120/128
+  mel/1500 src-pos) → downsample-concat reshape `[1500,1280]`→`[375,5120]` (factor 4)
+  → `AudioLanguageAdapter` (`w_in`→`nn.GELU()`erf→`w_out`, no bias) → `[375,3072]` →
+  `Qwen3VLMergeMultimodal` masked-scatter into the 375 audio-token(24) rows → forked
+  greedy `VoxtralGenerateGreedy` over the LANDED shared dense forward
+  (`dense_attn::AttnBlock`, qk-norm-optional/1-D NeoX rope/GQA/paged FA2), only forks
+  = inputs_embeds start + untied lm_head. Ported 1:1 from `voxtral.py`
+  (embed_multimodal:382-412, AudioLanguageAdapter:660-668, load_weights:502-568). NEW
+  additive TU `include/vllm/model_executor/models/voxtral.{h,cpp}`. **KEY BUG (RED):**
+  the mistral-CONSOLIDATED q/k weights are Meta-interleaved; vLLM applies a Meta→HF-
+  NeoX row PERMUTE on the mistral load path (verified BIT-exact `permute(wq)==vLLM
+  q_proj`, `scripts/mm/a3_voxtral_wcheck.py`). Loading raw → WRONG decoder (text-only
+  1/22, e2e 0/48); adding `PermuteQKBf16` (q 32 heads, k 8 heads; v/o raw) fixed it →
+  text-only 22/22, first audio token exact. **Gate (`test_voxtral_e2e`, GPU flock,
+  cutlass-ON):** log-mel rel-L2 **7.7e-7**, 375 audio rows; STRICT prefix **33/48**
+  vs vLLM greedy; decoder proven token-exact (vLLM ref-audio embeds → **48/48**); the
+  residual is the encoder's DIFFERENT bf16 GEMM/attn kernels vs vLLM's cuBLASLt+
+  FLASH_ATTN (encoder rel-L2 8.7% = the A2 ~0.28%/layer envelope over 32 layers; both
+  bf16, bit-exact infeasible). Binding gate = the ratified near-tie-robust gate
+  (exactly as M3c/M3d): teacher-force vLLM on OUR sequence → **worst gap 0.0 nats, 0
+  over-band failures**; the SOLE greedy branch (pos 33) is a **4-way EXACT bf16 tie**
+  at -2.069 nats and every one of our 48 tokens is vLLM's teacher-forced argmax
+  (`scripts/mm/a3_voxtral_neartie_gate.py`, `voxtral_neartie.json`). Decoded text
+  ("The audio begins with a series of sustained, low-pitched hums or drones…") is a
+  real audio description. **INERT:** `git diff --stat` = 2 modified lines
+  (`CMakeLists.txt` +1 src, `tests/CMakeLists.txt` +test) + new files; re-ran Mistral
+  text **541/541**, A1 **77/77**, A2 **203/203** byte-identical; `check-device-leakage`
+  unchanged; NO new CUDA kernel (reuses A2 im2col+GEMM + merge scatter) ⇒ no
+  compute-sanitizer. Clean CUDA `-Werror` **0 warn**, cutlass-nvfp4/fp8+FA2 sm_121a
+  banner CONFIRMED; all seven record checkers green by bare RC. `benchmark_binding=
+  false`, SPEED pending (A3 `DONE` only at token-exact AND vLLM throughput). Not
+  pushed; FULL SHA reported. NEXT: A2-follow USM-Conformer (Granite-Speech-2b) for the
+  Gemma-4 audio family; A3 speed grid vs vLLM.
