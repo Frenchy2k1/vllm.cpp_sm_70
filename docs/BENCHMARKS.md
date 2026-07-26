@@ -128,6 +128,34 @@ GREEN and proven: 27B text SACRED `test_qwen27_paged_engine` 235/235 + 27B MTP
 `test_qwen27_spec_decode` 9/9 (16/16 drafts accepted) + D2 draft-parity `test_qwen3_dflash_draft_parity`
 37/37, all byte-identical.
 
+**DFlash D4 (`DF-ENGINE-INTEGRATION`) - propose brick + `--speculative-config` dflash-select
+CODE LANDED + CPU-GATED; the engine-loop integration + end-to-end token-exact gate PENDING on dgx
+(2026-07-26, `CLAIM-DFLASH-D4D5`).** `benchmark_binding=false` (this is the correctness finish
+line, not a throughput number - the c1 speed A/B is D6). Landed additive: (1) `DflashProposeBlock`
++ `SampleDflashBlockDrafts` (`src/vllm/v1/worker/gpu/spec_decode/dflash/speculator.{h,cpp}`), the
+non-autoregressive whole-block propose that swaps in for the MTP k=1 `MtpProposePrefill` - it
+composes the landed D3 `ForwardBlockLogitsWithContext` (context-aware (1+k) block forward) with a
+greedy per-mask-position argmax (dflash/speculator.py::propose :300-413, sample_from_anchor=false);
+(2) `ParseSpeculativeConfigJson` + `SpeculativeConfig::ResolveDflash` now accept `method:"dflash"`
+alongside `"mtp"` (the config-select seam) with `NumLookaheadTokens()=k+1`. CPU gate
+`test_dflash_propose` 5 cases / 19 assertions GREEN on synthetic draft weights: the greedy sampler
+argmaxes the k mask rows and SKIPS the anchor (RED-first proven - reading the anchor row fails 4/5
+cases / 6 assertions), the brick composes forward+sampler exactly, the empty-context brick
+degenerates to the D2 context-free argmax, and the dflash config parses with lookahead k+1 (dspark
+still throws). The diff is additive + config-gated: the brick is unreachable unless a DFlash
+`SpeculativeConfig` is set, so the MTP + non-speculative engine paths are byte-identical by
+construction (git diff --stat: no runner/model/loader/scheduler edit; only a new speculator TU, the
+config accept-list widening, CMake, and the test). PENDING for the D5 finish line (GPU-promotion,
+like D2/D3 were): the runner verify/propose-loop wiring (loader building the z-lab draft, runner
+DFlash-draft storage + aux-tap capture + per-request context accumulation across steps honoring
+num_rejected, and the propose-branch swap gated on `method=="dflash"`), then the end-to-end gate
+`our-DFlash-ON == vLLM-DFlash-ON` STRICT mode-matched on the 4-prompt golden
+(`tests/parity/goldens/dflash_27b/dflash_27b_spec_on.json`) + nonzero acceptance approx vLLM's
+(2.2/8.8/4.75/4.57), plus spec-OFF byte-identity (27B SACRED 235/235 + 27B MTP 9/9). Repro for the
+e2e: build on dgx (`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON
+-DCMAKE_CUDA_ARCHITECTURES=121a`), oracle recapture via `scripts/spec/d0_dflash_oracle_capture.py`
+under `VLLM_USE_V2_MODEL_RUNNER=1` + `limit_mm_per_prompt={image:0,video:0}` + gpu_util 0.30.
+
 **Pin-advance target SELECTED (SCOPE only, no measurement) - PENDING execution
 (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, `.agents/specs/pin-advance.md`).** The
 single coherent target that unblocks DFlash + Gemma-4 multimodal + OLMo-3 is vLLM

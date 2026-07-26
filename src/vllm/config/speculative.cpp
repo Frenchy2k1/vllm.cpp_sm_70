@@ -32,9 +32,14 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
         "speculative-config: a string \"method\" is required");
   }
   cfg.method = doc.at("method").get<std::string>();
-  if (cfg.method != "mtp") {
+  // SPEC-DFLASH D4: accept "dflash" alongside "mtp". Both are draft-hidden-state
+  // methods; the loader resolves the concrete draft (MTP head vs the z-lab DFlash
+  // checkpoint) and the block-derived k from the model config. Any other method
+  // is still rejected at this pin (the two implemented speculators).
+  if (cfg.method != "mtp" && cfg.method != "dflash") {
     throw std::invalid_argument(
-        "speculative-config: only method \"mtp\" is supported at this pin (got \"" +
+        "speculative-config: only methods \"mtp\" and \"dflash\" are supported at "
+        "this pin (got \"" +
         cfg.method + "\")");
   }
 

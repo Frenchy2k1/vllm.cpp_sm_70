@@ -229,6 +229,51 @@ build; `valid_ctx_end`/hidden_norm/k_norm/position/causal-flip RED proofs load-b
 5 near-tie). No new CUDA kernel ⇒ `-Werror`/compute-sanitizer N/A for the kernel (the only kernel on
 the path, `DFlashBlockAttention`, was compiled + sanitized at D2). **D3 DONE.**
 
+### D4 RESULT (2026-07-26, `CLAIM-DFLASH-D4D5`) — **DF-ENGINE-INTEGRATION propose brick + `dflash` config-select CODE LANDED + CPU-GATED; the runner-loop integration + D5 e2e are the GPU-promotion PENDING (like D2/D3 were).**
+
+Two additive, config-gated pieces landed. The diff touches NO shared engine path
+(`git diff --stat` = a new speculator TU + a config accept-list widening + CMake + a
+test), so the MTP + non-spec engine paths are byte-identical **by construction**.
+
+- **The DFlash propose brick** (`src/vllm/v1/worker/gpu/spec_decode/dflash/speculator.{h,cpp}`):
+  `DflashProposeBlock` — the NON-autoregressive whole-block propose that swaps in for
+  the MTP k=1 `MtpProposePrefill`. It COMPOSES the landed D3 `Qwen3DFlashModel::
+  ForwardBlockLogitsWithContext` (the context-aware (1+k) block forward over the
+  accumulated combined-feature context) with the greedy `SampleDflashBlockDrafts`
+  (argmax over each of the k mask positions; the anchor row at block offset 0 is NOT
+  sampled — `sample_from_anchor=false`). Grounded in `dflash/speculator.py::propose
+  :300-413` + `_generate_draft :242-273`. `SampleDflashBlockDrafts` is split out as a
+  pure, unit-testable sampler. The caller (the runner's DFlash propose branch, D5) owns
+  the two stateful inputs — the per-request ACCUMULATED context (D1 multi-tap -> D2
+  `CombineAuxFeatures`, appended per verify step honoring `num_rejected`) and this step's
+  (1+k) mask block from `PrepareDflashInputs`.
+- **The `dflash` config-select** (`config/speculative.{h,cpp}`): `ParseSpeculativeConfigJson`
+  now accepts `method:"dflash"` alongside `"mtp"`; new `SpeculativeConfig::ResolveDflash`
+  (no n_predict-module divisibility — the block drafter is non-autoregressive). The
+  scheduler `NumLookaheadTokens()=k+1` + `use_dflash()` were already coded (D0 note).
+
+**CPU GATE GREEN (deterministic, RED-first):** `tests/vllm/v1/spec_decode/test_dflash_propose.cpp`
+5 cases / **19 assertions** on synthetic draft weights (mirrors the D2 synthetic-weight
+builder): the greedy sampler argmaxes the k mask rows + SKIPS the anchor (**RED-first: a
+sampler reading the anchor row fails 4/5 cases / 6 assertions**); the brick composes
+forward+sampler exactly (`DflashProposeBlock == SampleDflashBlockDrafts(ForwardBlockLogitsWithContext)`);
+the empty-context brick degenerates to the D2 context-free argmax; and `method:"dflash"`
+parses through `ParseSpeculativeConfigJson`/`ResolveDflash` with lookahead k+1 (`dspark`
+still throws). Compiles clean on the CPU build (`build-cpu`, `-Werror`-clean TU).
+
+**PENDING — the D5 finish line (GPU-promotion on dgx, exactly the D2/D3 shape):** (1) the
+runner verify/propose-loop wiring — loader building the z-lab draft (`LoadQwen3DFlash` +
+a `ResolveSpecConfig` dflash branch + draft-config resolution), runner-owned DFlash-draft
+storage, the `aux_tap` capture on the verify forward (D1's `ForwardDeviceMultiTap`), the
+**per-request context accumulation across steps** (append this step's `CombineAuxFeatures`
+of the accepted tokens, roll back on rejection — the numerically-delicate part that needs
+GPU iteration, the I5e async-input-combine bug class), and the propose-branch swap in
+`GPUModelRunner::propose_drafts` gated on `method=="dflash"`; (2) the e2e gate
+`our-DFlash-ON == vLLM-DFlash-ON` STRICT mode-matched on the committed 4-prompt golden +
+nonzero acceptance ≈ vLLM's (2.2/8.8/4.75/4.57); (3) spec-OFF + MTP byte-identity (27B
+SACRED 235/235 + 27B MTP 9/9). This is the DFlash correctness finish line; the
+acceptance-rate condition MUST accompany token-identity (the dead-drafter trap).
+
 ### (Superseded) 2026-07-25 pre-run assessment — GREEN, no HW/oracle/download blocker
 
 **Superseded by the D0 RESULT above:** the "oracle CONSTRUCTS DFlash" bullet was true only
@@ -477,7 +522,7 @@ the combination runs, so worst case is a config/version bump, not a dead row).
 | **D1** aux multi-tap seam (`DF-AUX-TAPS`) | Extend `ForwardDeviceTap`/tap struct: capture `[T,H×taps]` at 5(27B)/8(35B) residual boundaries, config-gated | **✓ DONE 2026-07-26 (§0 D1 RESULT).** `ForwardDeviceMultiTap` (MoE+Dense) captures `(hidden+res)` at `target_layer_ids` into `[T,H×taps]`; unit gate 598 assertions vs an independent truncated-model reference (RED-first: reversed concat -> 384 fail); CUDA 697/697 + compute-sanitizer 0; MTP e2e 9/9 + 27B SACRED **235/235** byte-identical on the new oracle (inertness) | GPU (parity dump) + CPU (unit) | ~~byte-identical when off~~ PROVEN (config-gated, additive); the direct vLLM aux-dump parity folds into D2 (see §0 D1 honest scope note) |
 | **D2** the `qwen3_dflash` drafter + non-causal in-block attention (`DF-DRAFT-MODEL`) | New draft model (5-6 dense layers, SWA+full), loader, the NEW non-causal block-attention `vt` primitive, draft KV groups | **CODE LANDED + CPU-GATED 2026-07-26 (`CLAIM-DFLASH-D2`, §0 D2 RESULT):** model + `vt::DFlashBlockAttention` (CPU authoritative + CUDA port) + fc + mask-embed + loader; CPU gate op 12/12 (RED non-causal) + model 95/95 (RED full-layer-causal-flip, block isolation, fc RED); causal path byte-identical (test_ops_attention/test_qwen3_forward unchanged). **✓ DONE 2026-07-26 — GPU promotion GREEN on dgx (§0 D2 RESULT):** CUDA `-Werror` clean (kernel compiles as-written); CUDA==CPU 198412/198412 + compute-sanitizer 0; draft-forward parity vs the REAL vLLM draft (fc rel-L2 0.46%, hidden ≤1.3%, 11 strict + 5 near-tie proposed ids); 27B SACRED 235/235 + MTP 9/9 byte-identical | GPU (forward + parity) + CPU (op ref) | **The non-causal primitive is the project's first** — bidirectional block attention; get the mask + SWA-vs-full per-layer routing right |
 | **D3** context-KV precompute + `prepare_dflash_inputs` (`DF-DRAFT-KV-PREP`) | Multi-layer KV proj + k-norm + RoPE (context-KV precompute); the mask-block/context-slot/sample-map input builder; the context-aware draft forward | **CODE LANDED + CPU-GATED 2026-07-26 (`CLAIM-DFLASH-D3`, §0 D3 RESULT):** `PrepareDflashInputs` (pure-integer HOST port of `_prepare_dflash_inputs_kernel`) + `PrecomputeContextKV` + `ForwardBlockLogitsWithContext` (reuse the LANDED MatmulBT/RmsNorm/RopeNeox + the UNCHANGED D2 `vt::DFlashBlockAttention` via a combined `[context;block]` sequence — NO new kernel). CPU gate `test_dflash_kvprep` 6/114: prepare INTEGER bit-exact vs a hand reference (RED-first: breaking `valid_ctx_end` fails 4 assertions); context-KV V envelope-matched + hidden_norm/k_norm/RoPE-pos RED load-bearing; context forward degenerates EXACTLY to the D2 context-free forward at empty context + diverges with context + block isolation. Additive-only diff ⇒ D2/MTP/SACRED byte-identical. **✓ DONE 2026-07-26 — GPU numeric-parity GREEN on dgx (§0 D3 RESULT):** `test_qwen3_dflash_kvprep_parity` 61/61 vs the REAL vLLM draft — prepare INTEGER bit-exact vs vLLM's ACTUAL Triton kernel (`kernel_matches_numpy`), context-KV worst K/V rel-L2 0.31%/0.26% (all 5 layers), block-proposal 13 STRICT + 3 near-tie = 16/16; CPU `test_dflash_kvprep` 114/114 re-passed (RED-proven); 27B SACRED 235/235 + MTP 9/9 + D2 parity 37/37 byte-identical. No new CUDA ⇒ `-Werror` clean 0 warnings, sanitizer N/A. | GPU (parity dump) + CPU (input-prep ref) | Rejected-position exclusion (`ctx_end − num_rejected`) + slot arithmetic off-by-one — both RED-gated; eager (non-CG) context path |
-| **D4** engine integration + k>1 exercise (`DF-ENGINE-INTEGRATION`) | Wire the DFlash speculator into the landed I5d/I7 runner loop; `--speculative-config dflash` parse/resolve; run the k-general shared paths at k=15 | the loop runs end-to-end at k=15 on the 27B, drafts proposed & accepted (nonzero); the k=15 GDN spec slots + rejection + mixed batch exercised (no crash, bit-exact vs I4 ops as a token chain at k=15) | GPU | First real k=15 exercise of the shared GDN/rejection paths (code-general but untested at scale); k+1=16 slot alloc + widened conv at k=15 |
+| **D4** engine integration + k>1 exercise (`DF-ENGINE-INTEGRATION`) | Wire the DFlash speculator into the landed I5d/I7 runner loop; `--speculative-config dflash` parse/resolve; run the k-general shared paths at k=15 | **PROPOSE BRICK + CONFIG-SELECT CODE LANDED + CPU-GATED 2026-07-26 (`CLAIM-DFLASH-D4D5`, §0 D4 RESULT):** `DflashProposeBlock`/`SampleDflashBlockDrafts` (the non-autoregressive whole-block propose composing D3 `ForwardBlockLogitsWithContext` + greedy per-mask argmax, anchor not sampled) + `ParseSpeculativeConfigJson`/`ResolveDflash` accept `method:"dflash"`. CPU gate `test_dflash_propose` 5/19 GREEN (RED-first anchor-read fails 4/5; brick composes forward+sampler; empty-ctx degenerates to D2; config parses lookahead k+1). Additive + config-gated ⇒ MTP + non-spec byte-identical by construction. **PENDING (GPU-promotion, like D2/D3):** the runner verify/propose-loop wiring (loader draft build, aux-tap capture, per-request context accumulation across steps honoring num_rejected, propose-branch swap gated on `method=="dflash"`) + the k=15 GDN spec-slot/rejection/mixed-batch exercise | GPU | Per-request context accumulation + rollback bit-exactness (needs GPU iteration, the I5e async-input-combine bug class); first real k=15 exercise of the shared GDN/rejection paths |
 | **D5** correctness gate | The DFlash correctness bar | **REVISED by the D0 measurement (§0):** NOT the three-way identity — vLLM-DFlash-ON != vLLM-spec-OFF at k=16 near-ties. Gate = STRICT MODE-MATCHED **`our-DFlash-ON == vLLM-DFlash-ON` greedy token-for-token** (the committed golden is the reference) + measured nonzero acceptance; 27B then 35B; spec-OFF byte-identical SACRED as a SEPARATE inertness gate | GPU (`flock`, standalone big-model) | Batch-nondeterminism at c>1 (near-tie-distributional-gate applies as in I7 — exact identity only at c1); acceptance content-dependence |
 | **D6** throughput A/B + memory + block-8 | c1 then c>1 A/B vs vLLM DFlash same-config; GDN k+1-slot memory measurement; block-8 vs block-16 acceptance-vs-memory | ours ≥ vLLM (throughput) / ≤ vLLM (latency, memory) on every axis at c1 AND the throughput operating point, both models; §5 memory within the 119 GiB pool at the target concurrency; `benchmark_binding=true` | GPU (A/B series, one `flock`, cold-leg discarded, ≥3 reps) | The 2.3 GiB/req 27B GDN state at k=15 caps concurrency; DFlash may go <1× at high concurrency (mirror vLLM's behavior at each point) |
 

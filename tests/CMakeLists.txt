@@ -260,6 +260,8 @@ vllm_cpp_add_test(test_rejection_sampler vllm/v1/spec_decode/test_rejection_samp
 vllm_cpp_add_test(test_prepare_prefill_inputs vllm/v1/spec_decode/test_prepare_prefill_inputs.cpp)
 vllm_cpp_add_test(test_dflash_kvprep vllm/v1/spec_decode/test_dflash_kvprep.cpp)
 target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
+target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_structured_output vllm/v1/structured_output/test_structured_output.cpp)
 vllm_cpp_add_test(test_apply_grammar_bitmask vllm/v1/structured_output/test_apply_grammar_bitmask.cpp)
 vllm_cpp_add_test(test_backend_native vllm/v1/structured_output/test_backend_native.cpp)
