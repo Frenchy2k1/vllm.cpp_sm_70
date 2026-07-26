@@ -156,6 +156,34 @@ e2e: build on dgx (`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON
 -DCMAKE_CUDA_ARCHITECTURES=121a`), oracle recapture via `scripts/spec/d0_dflash_oracle_capture.py`
 under `VLLM_USE_V2_MODEL_RUNNER=1` + `limit_mm_per_prompt={image:0,video:0}` + gpu_util 0.30.
 
+**DFlash D5 (`DF-ENGINE-INTEGRATION`) - runner-loop integration LANDED + e2e RUNS on dgx; correctness
+at the ratified bf16 near-tie envelope (2026-07-26, `CLAIM-DFLASH-D5`, dgx GB10 sm_121a, oracle vLLM
+0.26.0.dev0).** `benchmark_binding=false` (this is the correctness gate, NOT a throughput number -
+the c1 speed A/B is D6). The full verify/propose loop is wired: the loader loads the SEPARATE z-lab
+draft (`LoadDflashDraft`, host bf16 weights + the target-SHARED bf16 embed/lm_head) via a
+`--speculative-config` `model` key, the verify forward captures the D1 multi-tap
+(`aux_tap`->`ForwardDeviceMultiTap`) instead of the MTP single tap, and `propose_drafts_dflash`
+ACCUMULATES each request's combined-feature context (`CombineAuxFeatures(aux_tap)`) across steps and
+honors the num_rejected rollback by appending only the `(T_req - num_rejected)` accepted-prefix
+features, then runs `DflashProposeBlock` (k=16 GDN-spec exercised for the first time). e2e
+`test_qwen27_dflash_spec_decode` on the four committed golden prompts (32 tokens each) vs the
+vLLM-DFlash-ON golden: our output is STRICT token-exact on 2/4 (fibonacci, three-laws), and the
+drafter acceptance matches vLLM on ALL 4 (accepted 19/39/29/25 vs golden 17/39/30/25, deltas
++2/0/-1/0 - the MANDATORY dead-drafter-trap condition MET). The 2 divergences (France token 11 got
+2972 vs 11751; 17*23 token 12 got 567 vs 488) are SINGLE bf16 near-tie flips (the 17*23 case
+RE-CONVERGES to 628,1387 one token later, only possible at a genuine near-tie; France cascades from
+one flip), the ratified near-tie root the D0 gate form anticipated, rooted in the D3-documented
+inline bf16 context-KV recompute envelope (K/V rel-L2 0.31/0.26 percent), NOT a wiring bug (proven by
+the 2 exact prompts + near-exact acceptance + a non-trivial shared prefix; a wiring bug would break
+all prompts and diverge at token 0). Inertness GREEN on this exact build: `test_qwen27_paged_engine`
+235/235 + `test_qwen27_spec_decode` 9/9 byte-identical; CUDA `-Werror` clean; NO new CUDA kernel (host
+orchestration reusing the D1/D2/D3-sanitized ops, so compute-sanitizer is covered transitively).
+NOT a clean strict-4/4 pass: a STRICT 4/4 token-identity plus the c1 speed A/B are D6, gated on a
+persistent paged draft-KV that bit-matches vLLM's fused context-KV projections (removing the inline
+recompute envelope) plus the uniform-1+k FULL CG. Repro: run
+`./build-cuda/tests/test_qwen27_dflash_spec_decode` under `flock` with the bf16-lm_head 27B snapshot
+(single-file `model.safetensors`) + the z-lab draft in the HF cache.
+
 **Pin-advance target SELECTED (SCOPE only, no measurement) - PENDING execution
 (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, `.agents/specs/pin-advance.md`).** The
 single coherent target that unblocks DFlash + Gemma-4 multimodal + OLMo-3 is vLLM

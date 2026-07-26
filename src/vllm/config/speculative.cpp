@@ -54,6 +54,18 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
     }
     cfg.num_speculative_tokens = k.get<int>();
   }
+  // SPEC-DFLASH D5: the DFlash draft is a SEPARATE checkpoint (unlike MTP's
+  // in-target mtp.* tensors), so `--speculative-config` carries a `model` key
+  // (vllm/config/speculative.py `model`) pointing at the z-lab draft. Required
+  // for dflash; ignored (and not required) for mtp.
+  if (doc.contains("model") && doc.at("model").is_string()) {
+    cfg.draft_model_path = doc.at("model").get<std::string>();
+  }
+  if (cfg.method == "dflash" && !cfg.draft_model_path.has_value()) {
+    throw std::invalid_argument(
+        "speculative-config: method \"dflash\" requires a \"model\" key naming "
+        "the DFlash draft checkpoint (path or HF repo id)");
+  }
   // n_predict stays 0 here: the model loader resolves it from the checkpoint's
   // mtp_num_hidden_layers and re-runs ResolveMtp with this user k.
   return cfg;

@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -14,11 +16,15 @@
 #include <string_view>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
 #include "vllm/model_executor/models/qwen3_5_common.h"  // SPEC-MTP I5d KV widening
+#include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft load
+#include "vllm/transformers_utils/hf_config.h"  // SPEC-DFLASH D5 draft config
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vt/dtype.h"
@@ -101,6 +107,134 @@ bool EnvironmentEnabled(const char* name) {
   return value == nullptr || value[0] != '0';
 }
 #endif
+
+// ── SPEC-DFLASH D5: separate DFlash draft-checkpoint load ────────────────────
+// Resolve the DFlash draft path: a local directory (with config.json) is used
+// as-is; an HF repo id ("z-lab/Qwen3.6-27B-DFlash") resolves to the newest
+// ~/.cache/huggingface/hub/models--<org>--<name>/snapshots/<hash>/ dir.
+std::string ResolveDflashDraftDir(const std::string& path) {
+  std::error_code ec;
+  if (fs::exists(fs::path(path) / "config.json", ec)) return path;
+  // HF repo id -> local cache snapshot.
+  std::string slug = "models--";
+  for (char c : path) slug.push_back(c == '/' ? '-' : c);
+  // "z-lab/Qwen3.6-27B-DFlash" -> "models--z-lab--Qwen3.6-27B-DFlash" (each '/'
+  // becomes '--'): the single replace above turned '/' into one '-', so redo it
+  // as the HF two-dash convention.
+  slug.clear();
+  slug = "models--";
+  for (size_t i = 0; i < path.size(); ++i) {
+    if (path[i] == '/') slug += "--";
+    else slug.push_back(path[i]);
+  }
+  const char* home = std::getenv("HOME");
+  if (home == nullptr) return path;
+  fs::path snaps = fs::path(home) / ".cache/huggingface/hub" / slug / "snapshots";
+  if (!fs::is_directory(snaps, ec)) return path;
+  std::string best;
+  for (const auto& e : fs::directory_iterator(snaps, ec))
+    if (fs::exists(e.path() / "config.json", ec)) best = e.path().string();
+  return best.empty() ? path : best;
+}
+
+// Read a named BF16 tensor from safetensors shards into a host OwnedTensor
+// (mirrors the D2/D3 parity harness LoadTargetBf16). `nk` marks the torch
+// [N=out,K=in] Linear orientation for vt::MatmulBT (lm_head); false for the
+// embed lookup table.
+vllm::OwnedTensor LoadNamedBf16(const std::vector<vllm::SafetensorsFile>& shards,
+                               const std::string& name, bool nk) {
+  for (const vllm::SafetensorsFile& s : shards) {
+    for (const std::string& n : s.Names()) {
+      if (n != name) continue;
+      const vllm::StTensor& t = s.Get(name);
+      if (t.dtype != "BF16") {
+        throw std::runtime_error("dflash: target tensor " + name +
+                                 " is not BF16 (got " + t.dtype + ")");
+      }
+      vllm::OwnedTensor out;
+      out.dtype = vt::DType::kBF16;
+      out.rank = static_cast<int>(t.shape.size());
+      out.nk = nk;
+      for (int i = 0; i < out.rank; ++i)
+        out.shape[i] = t.shape[static_cast<size_t>(i)];
+      out.bytes.resize(t.nbytes);
+      std::memcpy(out.bytes.data(), t.data, t.nbytes);
+      return out;
+    }
+  }
+  return vllm::OwnedTensor{};
+}
+
+// Build the DFlash draft HfConfig from the draft config.json (the real nested
+// {block_size, dflash_config:{mask_token_id,target_layer_ids}, layer_types,...}).
+// Mirrors the D3 parity harness MakeConfig; kept manual (not LoadHfConfig) so the
+// DFlashDraftModel architecture / nested dflash_config parse deterministically.
+vllm::HfConfig MakeDflashDraftConfig(const nlohmann::json& c) {
+  vllm::HfConfig cfg;
+  cfg.hidden_size = c.at("hidden_size").get<int64_t>();
+  cfg.num_attention_heads = c.at("num_attention_heads").get<int64_t>();
+  cfg.num_key_value_heads = c.at("num_key_value_heads").get<int64_t>();
+  cfg.head_dim = c.at("head_dim").get<int64_t>();
+  cfg.rotary_dim = cfg.head_dim;
+  cfg.rope_theta = c.at("rope_theta").get<double>();
+  cfg.intermediate_size = c.at("intermediate_size").get<int64_t>();
+  cfg.vocab_size = c.at("vocab_size").get<int64_t>();
+  cfg.num_hidden_layers = c.at("num_hidden_layers").get<int64_t>();
+  cfg.rms_norm_eps = c.at("rms_norm_eps").get<double>();
+  cfg.sliding_window = c.at("sliding_window").get<int64_t>();
+  cfg.layer_types = c.at("layer_types").get<std::vector<std::string>>();
+  cfg.raw = nlohmann::json::object();
+  cfg.raw["dflash_config"] = c.at("dflash_config");
+  cfg.raw["block_size"] = c.at("block_size");
+  return cfg;
+}
+
+// Load the whole DFlash draft (layer weights + fc + norms from the z-lab
+// checkpoint; embed_tokens + lm_head SHARED bf16 from the target shards) plus the
+// resolved draft config + k. `target_shards` must still be alive (they are inside
+// FromModelDir). Returns null when the config carries no dflash draft path.
+std::unique_ptr<DflashDraft> LoadDflashDraft(
+    const vllm::SpeculativeConfig& spec,
+    const std::vector<vllm::SafetensorsFile>& target_shards) {
+  if (spec.method != "dflash") return nullptr;
+  if (!spec.draft_model_path.has_value()) {
+    throw std::runtime_error("dflash: resolved config missing draft_model_path");
+  }
+  const std::string draft_dir = ResolveDflashDraftDir(*spec.draft_model_path);
+  std::error_code ec;
+  if (!fs::exists(fs::path(draft_dir) / "config.json", ec)) {
+    throw std::runtime_error("dflash: draft checkpoint not found at " + draft_dir +
+                             " (from \"" + *spec.draft_model_path + "\")");
+  }
+  std::ifstream cf((fs::path(draft_dir) / "config.json").string());
+  nlohmann::json cj;
+  cf >> cj;
+
+  auto draft = std::make_unique<DflashDraft>();
+  draft->config = MakeDflashDraftConfig(cj);
+  draft->k = spec.ResolvedNumSpeculativeTokens();
+  const int64_t num_taps =
+      static_cast<int64_t>(cj.at("dflash_config").at("target_layer_ids").size());
+  const int32_t mask_id =
+      cj.at("dflash_config").at("mask_token_id").get<int32_t>();
+
+  std::vector<vllm::SafetensorsFile> dshards = LoadShards(draft_dir);
+  draft->weights =
+      vllm::LoadQwen3DFlash(dshards, draft->config, num_taps, mask_id);
+  // The draft SHARES the target's embed_tokens + lm_head (bf16, unquantized in the
+  // NVFP4 27B), exactly as vLLM's skip_substrs(embed_tokens)/tie handling.
+  draft->weights.embed_tokens =
+      LoadNamedBf16(target_shards, "model.language_model.embed_tokens.weight", false);
+  draft->weights.lm_head = LoadNamedBf16(target_shards, "lm_head.weight", true);
+  if (draft->weights.embed_tokens.Empty() || draft->weights.lm_head.Empty()) {
+    throw std::runtime_error(
+        "dflash: target embed_tokens/lm_head (bf16) not found in target shards");
+  }
+  draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
+  std::cerr << "vllm.cpp: DFlash draft loaded from " << draft_dir << " (k="
+            << draft->k << ", taps=" << num_taps << ", mask=" << mask_id << ")\n";
+  return draft;
+}
 
 // KV-EXTERNAL-CACHE (LMCache): build the external KV connector selected by
 // EngineParams::kv_transfer_config, injecting the runner's resolved
@@ -282,9 +416,27 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
     return std::nullopt;  // production default: no speculation.
   }
   const vllm::SpeculativeConfig& cli = *params.speculative_config;
+  // SPEC-DFLASH D5: the block-diffusion drafter. num_speculative_tokens is REQUIRED
+  // (= the draft block_size, e.g. 16; speculative.py raises if None) and there is no
+  // n_predict-module divisibility (the drafter is non-autoregressive). The concrete
+  // draft checkpoint is loaded separately (LoadDflashDraft); this only finalizes the
+  // scheduler-facing config and carries the draft path forward. The extra scheduler
+  // lookahead slot comes from NumLookaheadTokens() = k+1 (already coded).
+  if (cli.method == "dflash") {
+    if (!cli.num_speculative_tokens.has_value()) {
+      throw std::invalid_argument(
+          "speculative-config: method \"dflash\" requires num_speculative_tokens "
+          "(the draft block_size, e.g. 16)");
+    }
+    vllm::SpeculativeConfig cfg =
+        vllm::SpeculativeConfig::ResolveDflash(*cli.num_speculative_tokens);
+    cfg.draft_model_path = cli.draft_model_path;
+    return cfg;
+  }
   if (cli.method != "mtp") {
     throw std::invalid_argument(
-        "speculative-config: only method \"mtp\" is supported (got \"" +
+        "speculative-config: only methods \"mtp\" and \"dflash\" are supported "
+        "(got \"" +
         cli.method + "\")");
   }
   // mtp_num_hidden_layers from the checkpoint (text_config, default 1 — both gate
@@ -333,12 +485,15 @@ LoadedEngine::LoadedEngine(HfConfig config,
                            std::unique_ptr<LoadedModel> model,
                            tok::Tokenizer tokenizer,
                            const EngineParams& params,
-                           vt::Queue* preselected_queue)
+                           vt::Queue* preselected_queue,
+                           std::unique_ptr<DflashDraft> dflash_draft)
     : hash_ready_(EnsureNoneHash()),
       config_(std::move(config)),
       // SPEC-MTP I5d: finalize the speculative config against the checkpoint
       // (n_predict + resolved k). nullopt on the production default path.
       resolved_spec_config_(ResolveSpecConfig(params, config_)),
+      // SPEC-DFLASH D5: the separately-loaded DFlash draft (null for mtp/non-spec).
+      dflash_draft_(std::move(dflash_draft)),
       model_(std::move(model)),
       tokenizer_(std::move(tokenizer)),
       max_model_len_(params.max_model_len > 0
@@ -366,7 +521,11 @@ LoadedEngine::LoadedEngine(HfConfig config,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_,
               resolved_spec_config_,
-              resolved_spec_config_.has_value() && model_->supports_mtp_draft()
+              // Only the MTP method builds an in-target MTP draft; DFlash (D5)
+              // loads a SEPARATE draft, wired via set_dflash_draft in the body.
+              resolved_spec_config_.has_value() &&
+                      resolved_spec_config_->method == "mtp" &&
+                      model_->supports_mtp_draft()
                   ? model_->BuildMtpDraft(config_)
                   : nullptr,
               /*draft_kv=*/{}),
@@ -424,6 +583,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
+  // SPEC-DFLASH D5: wire the separately-loaded DFlash draft into the runner's
+  // verify/propose loop. Done here (after runner_ is fully constructed, before
+  // WarmupKernels) so the runner holds a stable borrow of dflash_draft_ (which
+  // outlives it). Null for mtp/non-spec, so this is inert on every other path.
+  if (dflash_draft_ != nullptr) {
+    runner_.set_dflash_draft(&dflash_draft_->weights, &dflash_draft_->config,
+                             dflash_draft_->k);
+  }
   // KV-EXTERNAL-CACHE (LMCache): build + wire the external KV connector when the
   // caller selected one via EngineParams::kv_transfer_config. Default (unset)
   // leaves kv_connector_ null and BOTH the scheduler and the runner unchanged —
@@ -535,10 +702,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // speculative (MTP) config cannot be satisfied from a GGUF source. Reject
     // deterministically rather than silently dropping speculation.
     if (params.speculative_config.has_value() &&
-        params.speculative_config->method == "mtp") {
+        (params.speculative_config->method == "mtp" ||
+         params.speculative_config->method == "dflash")) {
       throw std::runtime_error(
-          "MTP speculative decoding requires a safetensors checkpoint: GGUF "
-          "exports do not contain the mtp.* draft tensors");
+          "speculative decoding requires a safetensors target checkpoint: GGUF "
+          "exports lack the mtp.* draft tensors / bf16 target embed+lm_head the "
+          "DFlash draft shares");
     }
     std::unique_ptr<LoadedModel> model =
         ModelRegistry::Load(config, ModelSource::FromGguf(gguf));
@@ -585,6 +754,23 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     loaded.AttachMtpDraftWeights(vllm::LoadQwen3_5MTP(*shards, config, kind));
   };
 
+  // SPEC-DFLASH D5: when a dflash config is set, load the SEPARATE z-lab draft
+  // checkpoint (host bf16 weights + the target-SHARED embed/lm_head read from
+  // *shards, which are still alive here) into a DflashDraft bundle the engine
+  // owns and wires into the runner. Null (never built) on every other path.
+  const auto maybe_load_dflash = [&]() -> std::unique_ptr<DflashDraft> {
+    if (!params.speculative_config.has_value() ||
+        params.speculative_config->method != "dflash") {
+      return nullptr;
+    }
+    // ResolveSpecConfig re-runs on the target config in the LoadedEngine ctor, so
+    // resolve the draft here from the CLI config (path + k) directly.
+    vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDflash(
+        params.speculative_config->ResolvedNumSpeculativeTokens());
+    resolved.draft_model_path = params.speculative_config->draft_model_path;
+    return LoadDflashDraft(resolved, *shards);
+  };
+
   // Live architecture dispatch: consume config.architectures in order and let
   // the matched registration own the weight-name map/loader. Unknown dense
   // configs now reject instead of falling through num_experts == 0.
@@ -592,8 +778,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards));
     maybe_attach_mtp(*model);
+    std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
-        std::move(config), std::move(model), std::move(tokenizer), params));
+        std::move(config), std::move(model), std::move(tokenizer), params,
+        /*preselected_queue=*/nullptr, std::move(dflash)));
   }
 
   // Select before loading so an eligible discrete-CUDA dense loader stages each
@@ -604,9 +792,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards, &load_queue));
     maybe_attach_mtp(*model);
+    std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params,
-        &load_queue));
+        &load_queue, std::move(dflash)));
   } catch (...) {
     vt::DestroyQueue(load_queue);
     throw;

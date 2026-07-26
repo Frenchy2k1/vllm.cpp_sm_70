@@ -27,6 +27,7 @@
 #include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_RUNNER predicate
 #include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"  // SPEC-MTP I5d MtpProposePrefill
+#include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 DflashProposeBlock
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
@@ -976,8 +977,18 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // MTP drafter. Non-null only when a speculator is configured — the Qwen3.5
       // dense/MoE forward then routes to ForwardDeviceTap (byte-identical logits).
       // Null on every default step, so the forward path is byte-identical.
-      .hidden_tap = spec_on() ? &exec_state_.spec_hidden : nullptr,
+      // SPEC-DFLASH D5: the DFlash drafter conditions on the MULTI-tap instead,
+      // so it uses aux_tap (below) and leaves hidden_tap null.
+      .hidden_tap = (spec_on() && !use_dflash()) ? &exec_state_.spec_hidden : nullptr,
   };
+  // SPEC-DFLASH D5: on the verify forward capture the D1 multi-tap (the residual
+  // stream at the draft's target_layer_ids) as [T, H×taps]. Mutually exclusive
+  // with hidden_tap; routes the dense/MoE forward to ForwardDeviceMultiTap
+  // (byte-identical logits). Null on every non-dflash step.
+  if (use_dflash()) {
+    exec_state_.spec_aux.layer_ids = dflash_tap_layer_ids_;
+    forward_input.aux_tap = &exec_state_.spec_aux;
+  }
   // KV-EXTERNAL-CACHE (LMCache): apply any external-prefix loads recorded by the
   // scheduler's connector for THIS step into the freshly-allocated KV blocks
   // BEFORE the forward reads them (load-before-compute, base.py:293). Inert when
@@ -1328,6 +1339,12 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
 void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
                                     const std::vector<int32_t>& num_rejected_in) {
   const int num_reqs = exec_state_.num_reqs;
+  // SPEC-DFLASH D5: the block-diffusion drafter has no MTP draft_model_/
+  // draft_attn_kv_ (it recomputes context K/V inline); route to its own propose.
+  if (use_dflash()) {
+    propose_drafts_dflash(num_sampled_in, num_rejected_in);
+    return;
+  }
   if (num_reqs == 0 || draft_model_ == nullptr || draft_attn_kv_.empty()) {
     pending_drafts_.reset();
     return;
@@ -1378,6 +1395,183 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
       out.draft_token_ids.push_back({});
     } else {
       out.draft_token_ids.push_back({drafts[static_cast<size_t>(i)]});
+    }
+  }
+  pending_drafts_ = std::move(out);
+}
+
+// SPEC-DFLASH D5 (DF-ENGINE-INTEGRATION): wire the separately-loaded z-lab DFlash
+// draft into the runner. Resolves the D1 multi-tap capture indices
+// (target_layer_ids) from the draft config once and sizes the per-request
+// combined-feature context accumulation.
+void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
+                                      const vllm::HfConfig* config, int k) {
+  dflash_weights_ = weights;
+  dflash_config_ = config;
+  dflash_k_ = k;
+  dflash_tap_layer_ids_.clear();
+  if (config != nullptr && config->raw.is_object() &&
+      config->raw.contains("dflash_config") &&
+      config->raw.at("dflash_config").contains("target_layer_ids")) {
+    for (const auto& id : config->raw.at("dflash_config").at("target_layer_ids")) {
+      dflash_tap_layer_ids_.push_back(id.get<int32_t>());
+    }
+  }
+  dflash_ctx_feats_.clear();
+  dflash_ctx_len_.clear();
+  dflash_ctx_reqid_.clear();
+}
+
+// SPEC-DFLASH D5: the DFlash branch of propose_drafts. Ported from
+// dflash/speculator.py::propose (:300-413). Where vLLM writes each step's
+// combined target features into the draft's incremental KV cache
+// (precompute_and_store_context_kv) and excludes rejected positions via
+// valid_ctx_end = ctx_end - num_rejected (:518), the inline D3/D4 path instead
+// ACCUMULATES the per-request combined-feature context on the host and honors the
+// rollback by appending only the num_sampled accepted-prefix features each step
+// (the rejected drafts' features are simply never appended). Then it runs the
+// non-autoregressive (1+k) block forward over that context (DflashProposeBlock)
+// and stashes the k drafts/request. Reachable only when use_dflash().
+void GPUModelRunner::propose_drafts_dflash(
+    const std::vector<int32_t>& num_sampled_in,
+    const std::vector<int32_t>& num_rejected_in) {
+  // num_sampled_in is derivable from (T_req - num_rejected) per request (and the
+  // two differ on a non-spec prefill step, where we accumulate ALL chunk features
+  // regardless of num_sampled==1), so only num_rejected_in drives the append.
+  (void)num_sampled_in;
+  const int num_reqs = exec_state_.num_reqs;
+  if (num_reqs == 0 || dflash_weights_ == nullptr) {
+    pending_drafts_.reset();
+    return;
+  }
+  VT_CHECK(exec_state_.spec_aux.tensor.data != nullptr,
+           "propose_drafts_dflash: missing target aux multi-tap (aux_tap not "
+           "captured on the verify forward)");
+  const int64_t H = dflash_config_->hidden_size;
+  const int taps = static_cast<int>(dflash_tap_layer_ids_.size());
+  const int k = dflash_k_;
+  const int32_t mask_id = dflash_weights_->mask_token_id;
+  const StepInputs& step = exec_state_.step;
+
+  if (static_cast<int>(dflash_ctx_len_.size()) < num_reqs) {
+    dflash_ctx_feats_.resize(static_cast<size_t>(num_reqs));
+    dflash_ctx_len_.resize(static_cast<size_t>(num_reqs), 0);
+    dflash_ctx_reqid_.resize(static_cast<size_t>(num_reqs));
+  }
+
+  // 1. Download the [T_total, H×taps] bf16 aux tap to host and cast to f32.
+  const int64_t T_total = exec_state_.num_actual_tokens;
+  const vt::Tensor& aux = exec_state_.spec_aux.tensor;
+  VT_CHECK(aux.shape[0] == T_total && aux.shape[1] == H * taps,
+           "propose_drafts_dflash: aux tap shape mismatch");
+  std::vector<uint16_t> aux_bf16(static_cast<size_t>(T_total) *
+                                 static_cast<size_t>(H) * static_cast<size_t>(taps));
+  vt::Backend& b = vt::GetBackend(queue_.device.type);
+  b.Copy(queue_, aux_bf16.data(), aux.data, aux_bf16.size() * sizeof(uint16_t));
+  b.Synchronize(queue_);
+  std::vector<float> aux_f32(aux_bf16.size());
+  for (size_t j = 0; j < aux_bf16.size(); ++j) {
+    const uint32_t bits = static_cast<uint32_t>(aux_bf16[j]) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    aux_f32[j] = f;
+  }
+
+  // 2. fc(cat(aux)) -> [T_total, H] combined features (combine_hidden_states).
+  const std::vector<float> combined = Qwen3DFlashModel::CombineAuxFeatures(
+      aux_f32, T_total, *dflash_weights_, *dflash_config_, queue_);
+
+  // 3. Per request: reset a reused slot, accumulate the accepted-prefix features,
+  //    and (for a generating row) build the next (1+k) mask block.
+  std::vector<float> ctx_states;               // flat [sum L_i * H]
+  std::vector<int32_t> ctx_pos;                // [sum L_i]
+  std::vector<int32_t> ctx_cu = {0};           // [P+1]
+  std::vector<int32_t> blk_ids;                // [P*(1+k)]
+  std::vector<int32_t> blk_pos;                // [P*(1+k)]
+  std::vector<int32_t> blk_cu = {0};           // [P+1]
+  std::vector<int> propose_rows;               // batch rows in the propose batch
+
+  for (int i = 0; i < num_reqs; ++i) {
+    // Reset a reused dense slot (a new request now occupies this row).
+    if (dflash_ctx_reqid_[static_cast<size_t>(i)] !=
+        exec_state_.req_ids[static_cast<size_t>(i)]) {
+      dflash_ctx_feats_[static_cast<size_t>(i)].clear();
+      dflash_ctx_len_[static_cast<size_t>(i)] = 0;
+      dflash_ctx_reqid_[static_cast<size_t>(i)] =
+          exec_state_.req_ids[static_cast<size_t>(i)];
+    }
+    const int seg0 = step.query_start_loc[static_cast<size_t>(i)];
+    const int seg1 = step.query_start_loc[static_cast<size_t>(i + 1)];
+    const int T_req = seg1 - seg0;
+    if (T_req <= 0) continue;
+    // Rows in ascending absolute position (== committed sequence order).
+    std::vector<int> rows(static_cast<size_t>(T_req));
+    std::iota(rows.begin(), rows.end(), seg0);
+    std::sort(rows.begin(), rows.end(), [&](int a, int c) {
+      return step.positions[static_cast<size_t>(a)] <
+             step.positions[static_cast<size_t>(c)];
+    });
+    const int nrej = (i < static_cast<int>(num_rejected_in.size()))
+                         ? num_rejected_in[static_cast<size_t>(i)]
+                         : 0;
+    int append = T_req - nrej;
+    if (append < 0) append = 0;
+    // Invariant: this step's first committed token sits at absolute position L
+    // (== current context length). A violation means the accumulation lost sync
+    // (the I5e async-input-combine bug class) — assert rather than corrupt.
+    const int64_t L = dflash_ctx_len_[static_cast<size_t>(i)];
+    VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
+             "propose_drafts_dflash: context position discontinuity (accumulation "
+             "out of sync with the target's committed positions)");
+    std::vector<float>& feats = dflash_ctx_feats_[static_cast<size_t>(i)];
+    for (int j = 0; j < append; ++j) {
+      const float* src =
+          combined.data() + static_cast<size_t>(rows[j]) * static_cast<size_t>(H);
+      feats.insert(feats.end(), src, src + H);
+    }
+    dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
+
+    // A discarded (still-prefilling chunk) row commits its chunk's features but
+    // proposes no draft — it has no valid last_sampled anchor yet.
+    const bool discarded = i < static_cast<int>(exec_state_.discard.size()) &&
+                           exec_state_.discard[static_cast<size_t>(i)];
+    if (discarded) continue;
+
+    // Block: anchor = last_sampled (the bonus/last committed token, re-embedded),
+    // then k mask tokens; positions L' .. L'+k (L' = the new context length).
+    const int64_t Lp = dflash_ctx_len_[static_cast<size_t>(i)];
+    const int32_t anchor = input_batch_.last_sampled_tokens[static_cast<size_t>(i)];
+    blk_ids.push_back(anchor);
+    blk_pos.push_back(static_cast<int32_t>(Lp));
+    for (int j = 1; j <= k; ++j) {
+      blk_ids.push_back(mask_id);
+      blk_pos.push_back(static_cast<int32_t>(Lp + j));
+    }
+    blk_cu.push_back(static_cast<int32_t>(blk_ids.size()));
+    ctx_states.insert(ctx_states.end(), feats.begin(), feats.end());
+    for (int64_t p = 0; p < Lp; ++p) ctx_pos.push_back(static_cast<int32_t>(p));
+    ctx_cu.push_back(static_cast<int32_t>(ctx_pos.size()));
+    propose_rows.push_back(i);
+  }
+
+  // 4. Non-autoregressive (1+k) block propose over the accumulated context.
+  DraftTokenIds out;
+  out.req_ids.reserve(static_cast<size_t>(num_reqs));
+  out.draft_token_ids.assign(static_cast<size_t>(num_reqs), {});
+  for (int i = 0; i < num_reqs; ++i)
+    out.req_ids.push_back(exec_state_.req_ids[static_cast<size_t>(i)]);
+
+  if (!propose_rows.empty()) {
+    const int P = static_cast<int>(propose_rows.size());
+    DflashProposeResult res =
+        DflashProposeBlock(*dflash_weights_, *dflash_config_, ctx_states, ctx_pos,
+                           ctx_cu, blk_ids, blk_pos, blk_cu, P, k, queue_);
+    for (int r = 0; r < P; ++r) {
+      const int row = propose_rows[static_cast<size_t>(r)];
+      out.draft_token_ids[static_cast<size_t>(row)] =
+          res.draft_token_ids[static_cast<size_t>(r)];
+      // Acceptance telemetry seed: count proposals here (accepted counted on the
+      // next verify step's rejection walk, sample_tokens_with_rejection).
     }
   }
   pending_drafts_ = std::move(out);

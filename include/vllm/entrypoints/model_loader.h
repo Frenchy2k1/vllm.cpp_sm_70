@@ -19,6 +19,7 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft bundle
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -37,6 +38,17 @@
 #include "vt/backend.h"
 
 namespace vllm::entrypoints {
+
+// SPEC-DFLASH D5: the separately-loaded DFlash draft. Unlike MTP (in-target
+// mtp.*), the z-lab DFlash draft is its own checkpoint; FromModelDir loads it
+// (host-resident bf16 weights + the target-shared embed/lm_head + the resolved
+// draft config + k) and the LoadedEngine hands a borrow to the runner. Owned by
+// LoadedEngine, declared before runner_ so the borrow outlives it.
+struct DflashDraft {
+  vllm::Qwen3DFlashWeights weights;
+  vllm::HfConfig config;
+  int k = 0;
+};
 
 // Knobs that size the engine stack. Zero/negative fields fall back to the
 // documented defaults (see below), so a default-constructed EngineParams is
@@ -192,7 +204,8 @@ class LoadedEngine {
   // compatibility overloads above.
   LoadedEngine(HfConfig config, std::unique_ptr<LoadedModel> model,
                tok::Tokenizer tokenizer, const EngineParams& params,
-               vt::Queue* preselected_queue = nullptr);
+               vt::Queue* preselected_queue = nullptr,
+               std::unique_ptr<DflashDraft> dflash_draft = nullptr);
 
   static vllm::SchedulerConfig MakeSchedulerConfig(
       int max_model_len, int max_num_seqs, int max_num_batched_tokens,
@@ -239,6 +252,10 @@ class LoadedEngine {
   // the engine-core draft pull all read it. nullopt ⇒ every spec path is inert
   // and the engine is byte-identical to the pre-spec engine.
   std::optional<vllm::SpeculativeConfig> resolved_spec_config_;
+  // SPEC-DFLASH D5: the owned DFlash draft (null unless method=="dflash").
+  // Declared before runner_ so the borrow the runner holds stays live for the
+  // runner's whole lifetime. Set in the ctor body via runner_.set_dflash_draft.
+  std::unique_ptr<DflashDraft> dflash_draft_;
   // Concrete weights and model-specific runtime state behind the central
   // registry contract. Declared before runner_ so its borrow remains live.
   std::unique_ptr<LoadedModel> model_;

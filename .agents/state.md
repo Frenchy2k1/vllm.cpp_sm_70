@@ -24923,3 +24923,61 @@ path, lock, download/service, and parallel-agent choices now come from that
 local profile; safe non-remote defaults apply when it is absent. Project-wide
 correctness, evidence, testing, lifecycle, documentation, and attribution rules
 remain invariant. No remote ref changed.
+
+## 2026-07-26 — SPEC-DFLASH D5 (`DF-ENGINE-INTEGRATION`) runner-loop integration + 27B e2e (`CLAIM-DFLASH-D5`)
+
+DFlash D5 landed: the runner verify/propose loop is wired and the DFlash e2e RUNS
+end to end on dgx (GB10 sm_121a, pin `555967922`/vLLM 0.26.0.dev0). NOT pushed;
+FULL SHA reported to caller. Base `origin/main` `ffa22cdc`, isolated worktree
+`/home/mudler/_git/wt-dflash-d5`; dgx build+gate tree `~/dflash-d5/vllm.cpp`
+(`git archive` of the commit, CUDA `build-cuda`, all GPU work under one `flock`).
+
+**Runner-integration design (MTP seams reused + the DFlash swap):**
+- Loader (`model_loader.cpp`): `ResolveSpecConfig` dflash branch (`ResolveDflash(k)`
+  + the draft path); `--speculative-config` parses a `model` key (the SEPARATE z-lab
+  checkpoint, unlike MTP's in-target `mtp.*`); a `DflashDraft` bundle loads the draft
+  (host bf16 `LoadQwen3DFlash`) + SHARES the target's bf16 `embed_tokens`/`lm_head`
+  read from the target shards, wired via `runner.set_dflash_draft`. MTP `BuildMtpDraft`
+  guarded on `method=="mtp"`.
+- Verify forward: `use_dflash()` sets `ModelForwardInput::aux_tap` (D1 multi-tap,
+  `target_layer_ids [1,16,31,46,61]`) → `ForwardDeviceMultiTap` `[T,H×5]` instead of
+  the MTP single `hidden_tap`.
+- `propose_drafts` routes to `propose_drafts_dflash` when `use_dflash()`.
+- THE DELICATE PIECE — per-request context accumulation honoring `num_rejected`
+  (`dflash/speculator.py:300-413`): where vLLM writes each step's combined features
+  into the draft's incremental paged KV (excluding rejected via `valid_ctx_end =
+  ctx_end − num_rejected`), the inline D3/D4 path ACCUMULATES the per-request
+  combined-feature context (`CombineAuxFeatures(aux_tap)`) on the host and honors the
+  rollback by appending only the `(T_req − num_rejected)` accepted-prefix features each
+  step (rejected drafts' hiddens are never appended). Block anchor = `last_sampled` at
+  position L (= ctx length), then k mask ids at L+1..L+k; a position invariant
+  (`positions[first row] == L`) asserts the accumulation stays in sync — it held on
+  every step of every prompt.
+
+**e2e RESULT** (`test_qwen27_dflash_spec_decode`, 4 golden prompts × 32 tok, our-DFlash-ON
+vs the committed vLLM-DFlash-ON golden): **2/4 STRICT token-exact (fibonacci, three-laws)**
++ **acceptance ~ vLLM on ALL 4** (accepted 19/39/29/25 vs golden `num_accepted_delta`
+17/39/30/25, deltas +2/0/−1/0 — the MANDATORY dead-drafter-trap condition MET). The 2
+divergences (France tok11 got 2972 vs 11751; 17*23 tok12 got 567 vs 488) are SINGLE bf16
+near-tie flips (the 17*23 case RE-CONVERGES to 628,1387 one token later = proven near-tie;
+France cascades from one flip), the ratified near-tie ROOT the D0 gate-form anticipated,
+rooted in the D3-documented inline bf16 context-KV recompute envelope (K/V rel-L2
+0.31%/0.26%), NOT a wiring bug (proven by the 2 exact prompts + near-exact acceptance +
+non-trivial shared prefixes; a wiring bug diverges at token 0 on all prompts).
+
+**Inertness GREEN on this exact build:** `test_qwen27_paged_engine` 235/235 +
+`test_qwen27_spec_decode` 9/9 byte-identical; CUDA `-Werror` clean (whole engine + runner
++ loader). **No new CUDA kernel** in D5 (host orchestration reusing D1/D2/D3-sanitized
+ops), so compute-sanitizer is covered transitively (only `DFlashBlockAttention`, sanitized
+at D2, runs on the path).
+
+**On-box finding:** the 27B NVFP4 repo has TWO HF snapshots — the bf16-lm_head single-file
+`model.safetensors` (`890bdef7`, what the SACRED gate + golden use, loadable by our dense
+loader) and a newer 5-shard FP8-lm_head re-quant (`ccdaab7e`, rejected by the bf16 dense
+loader). The e2e test now prefers the single-file bf16 snapshot.
+
+**Disposition:** SPEC-DFLASH is correctness at the ratified bf16 near-tie envelope (drafter
+alive, acceptance matches vLLM, majority strict). NOT a clean strict-4/4 pass. Row STAYS
+`ACTIVE`. **Remaining = D6:** STRICT 4/4 token-identity (a persistent paged draft-KV that
+bit-matches vLLM's fused context-KV projections, removing the ~1% inline-recompute
+envelope) + the uniform-1+k FULL CG + the c1 speed A/B.
