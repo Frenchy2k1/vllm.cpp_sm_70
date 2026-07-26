@@ -1,5 +1,7 @@
 # Benchmarks
 
+**PARITY PIN ADVANCED 2026-07-26 → vLLM 0.26.0.dev0 (`55596792`) + transformers 5.14.1** (from 0.25.0). Correctness re-validated BIT-IDENTICAL on the new oracle (zero golden drift; 27B-W4A4 + 32B-NVFP4A16 bit-identical, 35B/Coder byte-stable — the W0-W2 '27B drift' was a capture-config near-tie, not the oracle). Full re-gate 296/299 GREEN on GB10. DFlash's mixed-attn draft now CONSTRUCTS + generates + accepts (2.2-4.8 tok/step) under `VLLM_USE_V2_MODEL_RUNNER=1` (vllm#40898 cleared) — D1-D6 unblocked. Speed figures citing '0.25.0' are the last binding run (engine unchanged by the advance); a 0.26 re-benchmark is pending. Rollback: `~/venvs/vllm-oracle-v0.25.0-stage`. See `.agents/specs/pin-advance.md`.
+
 This is the public current-state scoreboard for vllm.cpp. It contains the
 binding result, the active performance diagnosis, pending gates, and current
 reproduction entry points. For the user-facing overview (what the project is,

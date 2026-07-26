@@ -24522,3 +24522,16 @@ intact.
 
 **Next (W5, deliberate):** flip the pin to `55596792` + land the §2D mechanical re-ports +
 fetch/gate OLMo-3. Evidence on dgx `~/work/pin-drift/`.
+
+## 2026-07-26 — PIN FLIPPED to `555967922` / vLLM 0.26.0.dev0 (`CLAIM-PIN-ADVANCE-W5`)
+
+W5 DONE. Runtime: dev-box `/home/mudler/_git/vllm` @ `555967922`; dgx oracle symlink →
+`~/venvs/vllm-oracle-next` (vLLM 0.26.0.dev0+g5559679 / transformers 5.14.1 / torch
+2.13.0+cu130 / flashinfer 0.6.15.post1 / cutlass-dsl 4.6.0 / triton 3.7.1). Rollback
+preserved (`~/venvs/vllm-oracle-v0.25.0-stage`). Canonical pin declarations updated
+(AGENTS.md, environment.md, pin-advance.md §7, porting-inventory); historical `@ e24d1b24`
+citations left intact. Zero golden drift (W3-W4 proved bit-identical), re-gate 296/299 GREEN.
+UNBLOCKED: OLMo-3 W5 → DFlash D1-D6 (auto-select attn, not FLASH_ATTN) → Gemma-4 mm+audio →
+§2D mechanical re-sync (deferred) → frontier arches. NOTE: the W3-W4 build reclaimed dgx disk
+via `docker system prune` — the already-stopped `local-ai`/`local-ai-worker` CONTAINERS were
+removed (images+volumes intact; `docker compose up` recreates them).

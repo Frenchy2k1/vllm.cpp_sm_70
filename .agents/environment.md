@@ -10,17 +10,29 @@
   never share a build tree between agents.
   - Non-interactive SSH does not put nvcc on PATH — prepend
     `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
-  - Oracle venv: `~/venvs/vllm-oracle` is now a canonical symlink to the
-    validated `~/venvs/vllm-oracle-v0.25.0-stage`; the immediately restorable
-    v0.24.0 directory is preserved at
-    `~/venvs/vllm-oracle-v0.24.0-retired`. The active stack is pip vLLM 0.25.0,
-    FlashInfer Python/cubin 0.6.13, Torch 2.11.0+cu130, CUTLASS DSL 4.5.2,
-    Humming kernels 0.1.10, Transformers 5.13.1 and Ninja 1.13.0. Its serving
-    dependencies are pandas 2.2.3, python-dateutil 2.9.0.post0, pytz 2024.2 and
-    tzdata 2024.2. Install/serving report SHA-256 values are
-    `ab786eee…c297` / `536385d8…f506`; executable vLLM/Ninja hashes are
-    `ec6d76ff…96c` / `abf71487…10b`, and the sorted freeze hash is
-    `cf1636cc…fa5f`.
+  - Oracle venv: **PIN ADVANCED 2026-07-26** (see
+    [specs/pin-advance.md](specs/pin-advance.md)). `~/venvs/vllm-oracle` is now a
+    canonical symlink to the from-source **`~/venvs/vllm-oracle-next`** — the new
+    active stack is **vLLM 0.26.0.dev0+g5559679** (source `55596792`, built for
+    sm_121a: the exact commit has NO aarch64 wheel, so the oracle is a ~1.3 h
+    from-source build not a pip install), **Transformers 5.14.1, Torch
+    2.13.0+cu130, FlashInfer 0.6.15.post1, CUTLASS DSL 4.6.0, Triton 3.7.1,
+    torchvision 0.28.0**. This advance unblocks DFlash (vllm#40898 mixed-attn fix,
+    under `VLLM_USE_V2_MODEL_RUNNER=1`), Gemma-4 (`transformers.models.gemma4`),
+    and OLMo-3 (nested rope). It was validated by the W0–W4 pin-advance re-gate:
+    **zero real golden drift** (27B-W4A4 + 32B-NVFP4A16 bit-identical, 35B/Coder
+    byte-stable — the W0-W2 "27B drift" was a capture-config near-tie, not the
+    oracle), full `ctest` 296/299 GREEN on GB10 (the 3 fails pre-exist on main,
+    unrelated). **ROLLBACK (immediately restorable):** `ln -sfn
+    ~/venvs/vllm-oracle-v0.25.0-stage ~/venvs/vllm-oracle` restores the prior pip
+    vLLM 0.25.0 stack (FlashInfer 0.6.13, Torch 2.11.0+cu130, CUTLASS DSL 4.5.2,
+    Transformers 5.13.1, Ninja 1.13.0; install/serving SHA-256 `ab786eee…c297` /
+    `536385d8…f506`, vLLM/Ninja `ec6d76ff…96c` / `abf71487…10b`, freeze
+    `cf1636cc…fa5f`); the v0.24.0 dir remains at
+    `~/venvs/vllm-oracle-v0.24.0-retired`. The §2D mechanical re-sync of
+    upstream-changed mirrored files (rmsnorm-fusion #46998, ReplaySSM #48018,
+    MoeWNA16 #44120, olmo3.py, …) is a DEFERRED follow-on (gate-correctness does
+    not depend on it — goldens are bit-identical).
   - The only dependency-check exception is NVIDIA's
     `nvidia-cusparselt-cu13==0.8.0` wheel: PyPI served the aarch64 wheel
     (`sha256:400c6ed1…77c`), its library is an AArch64 ELF and direct

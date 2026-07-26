@@ -509,7 +509,23 @@ tokenizer fixture), `test_capi` (toy random-weight model garbled-first-byte gree
 flake under async scheduling). -Werror clean (0 `warning:` lines across both build logs).
 
 **Bottom line.** The pin advance is materially CHEAPER than the W0-W2 worst case: **zero real
-golden drift, zero kernel re-sync.** W5 (pin flip + §2D mechanical re-ports + OLMo-3 fetch/gate)
-remains the deliberate next step. Evidence on dgx `~/work/pin-drift/`: `rca_27b.log`
+golden drift, zero kernel re-sync.** Evidence on dgx `~/work/pin-drift/`: `rca_27b.log`
 (near-tie gap), `dump27_new.log`+`gold27_new/` (27B bit-identical), `dump32_new.log`+`gold32_new/`
 (32B bit-identical), `build.log`, `regate.log`.
+
+## §7. W5 — PIN FLIPPED (2026-07-26, `CLAIM-PIN-ADVANCE-W5`) — DONE
+
+The parity pin is now **`555967922` / vLLM 0.26.0.dev0**, advanced from `e24d1b24` / 0.25.0.
+Runtime flip executed + verified: (1) dev-box source `/home/mudler/_git/vllm` checked out
+`555967922`; (2) dgx oracle symlink `~/venvs/vllm-oracle` → `~/venvs/vllm-oracle-next`
+(imports `vllm 0.26.0.dev0+g5559679 / transformers 5.14.1 / torch 2.13.0+cu130`); the
+`~/venvs/vllm-oracle-v0.25.0-stage` rollback is preserved (`ln -sfn …-v0.25.0-stage
+~/venvs/vllm-oracle` restores it). Canonical pin declarations updated (AGENTS.md,
+environment.md, this spec, porting-inventory); the 656 historical `@ e24d1b24` citations are
+LEFT as-is (they record the pin each past task ran against — accurate to their moment).
+
+**Now UNBLOCKED (priority order):** OLMo-3 W5 gate (fetch checkpoint + run — impl already
+landed) → DFlash D1–D6 (mixed-attn draft constructs+accepts under MRV2; **D-series must NOT
+pin FLASH_ATTN** — sm_121 fp8-KV needs the auto-selected flashinfer-native path) → Gemma-4
+mm+audio (oracle now runnable) → §2D mechanical re-sync of upstream-changed mirrored files
+(DEFERRED, not gate-blocking) → top new frontier arches (Olmo3/Inkling/etc.).

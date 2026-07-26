@@ -208,7 +208,9 @@ is an ORCHESTRATION layer — the kernels that actually run (and that make it fa
 live in its DEPENDENCIES: **flashinfer** (CuTe-DSL / cutlass fp4·fp8 GEMMs, fused
 norm+quant, MoE, sm_121 "blackwell_sm12x" kernels), **cutlass**, **cuBLASLt**
 (nvjet), **DeepGEMM**, and **torch/Inductor** (the fused Triton it codegens). Read
-the actual pinned vLLM code (`/home/mudler/_git/vllm` @ pin `e24d1b24`) AND, as
+the actual pinned vLLM code (`/home/mudler/_git/vllm` @ pin `555967922`, vLLM
+0.26.0.dev0 — advanced 2026-07-26 from the prior `e24d1b24`/0.25.0 pin; see
+[.agents/specs/pin-advance.md](.agents/specs/pin-advance.md)) AND, as
 needed, the installed dep source (`~/venvs/vllm-oracle/lib/python3.12/site-packages/`
 — e.g. `flashinfer/cute_dsl/*.py`, `flashinfer/gemm/`), cite `file:line` on every
 side, and mirror what you find. **NEVER declare a lever "build-specific",

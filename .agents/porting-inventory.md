@@ -802,7 +802,7 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    usage accounting, error shapes), health/metrics; runs in CI with the 0.6B
    model on CPU ref backend, nightly on dgx.casa with gate models.
 5. **The gate benchmark**: the unmodified pip-vLLM 0.25.0 `bench serve` oracle
-   (contract-audited against target `702f481`; porting pin still `e24d1b24`) is
+   (contract-audited against target `702f481`; porting pin ADVANCED 2026-07-26 to `555967922` / vLLM 0.26.0.dev0 — see specs/pin-advance.md) is
    validated/active on DGX and wrapped by the committed
    `tools/bench/online_gate*.py` and `scripts/dgx-online-serving.sh` harness
    (ported command/schema contracts in

@@ -102,9 +102,13 @@ attention scale proven, ZERO new kernel); **Phi-3/Phi-4 (`Phi3ForCausalLM`) `ACT
 **OLMo-3 (`Olmo3ForCausalLM`) IMPLEMENTED but oracle-BLOCKED** — the pinned vLLM 0.25.0
 cannot run `allenai/OLMo-3-1025-7B` (`KeyError: 'rope_theta'`, per-layer-type rope schema newer than
 the oracle's transformers), so no SACRED bar (our engine loads+runs it; W5 gate pending a pin/oracle
-advance). **PIN-ADVANCE SCOPED (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`,
-[`specs/pin-advance.md`](specs/pin-advance.md); EXECUTION GPU-gated, pending the
-sibling 35B-MTP agent freeing `~/venvs/vllm-oracle`):** the three oracle-pin
+advance). **PIN-ADVANCE EXECUTED + FLIPPED 2026-07-26 (`CLAIM-PIN-ADVANCE-W5`,
+[`specs/pin-advance.md`](specs/pin-advance.md)): pin is now `555967922` / vLLM 0.26.0.dev0 +
+transformers 5.14.1** (from `e24d1b24`/0.25.0). Zero real golden drift (W3-W4: 27B-W4A4 +
+32B-NVFP4A16 bit-identical; the W0-W2 "27B drift" was a capture-config near-tie), re-gate
+296/299 GREEN, rollback preserved (`~/venvs/vllm-oracle-v0.25.0-stage`). UNBLOCKS OLMo-3 W5 →
+DFlash D1-D6 (mixed-attn constructs+accepts under MRV2) → Gemma-4 mm+audio → frontier arches.
+(Scoping was `CLAIM-PIN-ADVANCE-SCOPE`.) the three oracle-pin
 blockers (DFlash vllm#40898, Gemma-4 mm, OLMo-3 nested-rope) ALL clear at ONE
 coherent target — vLLM `origin/main` `55596792` + transformers 5.14.1 / torch 2.13.0
 / flashinfer 0.6.15 / cutlass-dsl 4.6.0 (no release tag carries the fixes; DFlash
