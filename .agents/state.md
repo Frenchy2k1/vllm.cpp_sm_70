@@ -23836,3 +23836,65 @@ co-resident, cold rep discarded.
   (batched/graphed mm serving c2+ + audio our-side). Not pushed; FULL SHA reported.
   NEXT: batched mm serving (encoder-cache + scheduler hooks) for c2+/`image_url`; the
   audio our-side timing.
+
+---
+
+## 2026-07-26 — OLMo-3 (`Olmo3ForCausalLM`) W0 AUTHORITATIVE ORACLE VERDICT: oracle-BLOCKED, RUN-VERIFIED (`CLAIM-OLMO3-W0-VERIFY`)
+
+**Task.** Bring up OLMo-3 W5 (rank-1 of the recent-dense queue) with a mandated
+VERIFY-FIRST W0: resolve authoritatively the recorded contradiction — an earlier note
+said "OLMo-3 oracle-blocked, awaits pin advance" while the recent-dense-batch spike
+§0.3/§0.5 claimed "0.25.0 CONSTRUCTS `Olmo3Config` (verified) ⇒ NONE oracle risk". Base
+`origin/main` `bbaa182b`, isolated worktree `w0-olmo3-verify`.
+
+**Finding at W0: the W5 code was ALREADY LANDED (batch3, `4e9f1d2e`).** `olmo2.cpp`
+carries the full OLMo-3 delta on the OLMo-2 class: per-layer dual rope (plain sliding
+theta 500000 via `RopeFromCache` vs YaRN full-attn cache, routed by
+`config.layer_types`), finite sliding window (`AttentionWindow{W-1,0}`, inert for the
+short gate battery), dtype-aware BF16 loader. `tests/parity/test_olmo3_paged_engine.cpp`
+exists. OLMo-2 stays byte-identical (empty `layer_types` ⇒ every layer takes the
+plain-rope/no-window path). So there was no code to write; the whole task reduces to the
+W0 oracle verdict.
+
+**AUTHORITATIVE W0 VERDICT — oracle-BLOCKED, RUN-VERIFIED on dgx (not inferred).** vLLM
+0.25.0 (`~/venvs/vllm-oracle` = `vllm-oracle-v0.25.0-stage`, transformers **5.13.1**)
+CANNOT construct+run `Olmo3ForCausalLM`. Checkpoint `allenai/OLMo-3-1025-7B` is CACHED
+(~13.6 GiB, ungated, snapshot `a81bae42…`, fits the 119 GiB pool trivially). Under
+`flock ~/gpu.lock`, `LLM(model=…, enforce_eager=True, gpu_memory_utilization=0.35)`
+aborts in `Olmo2Attention.__init__`:
+```
+File ".../vllm/model_executor/models/olmo2.py", line 143, in __init__
+    rope_theta = self.config.rope_parameters["rope_theta"]
+KeyError: 'rope_theta'
+```
+ROOT CAUSE (pinned precisely, beyond the batch3 "KeyError" note): transformers 5.13.1's
+`Olmo3Config.rope_parameters` is a **NESTED per-layer-type dict** —
+`{'sliding_attention': {'rope_type':'default','rope_theta':500000.0}, 'full_attention':
+{'rope_type':'yarn', …, 'rope_theta':500000}}` — while vLLM 0.25.0's `olmo2.py`
+(byte-identical to pin `e24d1b24`) expects a FLAT dict with top-level `rope_theta`. The
+sliding branch (`sliding_window is not None`) does `rope_parameters["rope_theta"]` →
+KeyError; the full branch would pass the nested dict to `get_rope` which also chokes.
+The checkpoint config (transformers_version 4.57.0) has `rope_theta`/`rope_scaling` at
+top level and NO `rope_parameters` key at all; transformers 5.13.1 synthesizes the
+nested `rope_parameters` on load.
+
+**CONTRADICTION RESOLVED.** Both prior claims were partially right: `AutoConfig` DOES
+construct `Olmo3Config` (config-construction succeeds — what the OLMo-2 spike verified),
+but the MODEL does NOT run (vLLM's `__init__` reads the config's rope schema and dies).
+"CONSTRUCTS ⇒ unblocked/NONE risk" conflated config-construction with model-run. The
+honest state is the batch3 verdict, now RUN-VERIFIED: **oracle-BLOCKED, no SACRED bar
+(spec D5)**, gate PENDING a vLLM/transformers oracle advance.
+
+**Records (this change, records-only, NO code/build/gate).** Corrected the residual
+contradiction-bearing lines that still claimed "CONSTRUCTS ⇒ NONE risk / W5 unblocked":
+`model-matrix.md` OLMo row note, `docs/BENCHMARKS.md` OLMo section, `README.md` OLMo-3
+line (run-verified root cause), `sweep-recent-dense-batch.md` §0.3 + §0.5 (oracle-risk
+now BLOCKED). Ledger + this state entry record the authoritative verdict; coordination
+claim registered. OLMo-2 row stays `ACTIVE` (its own SACRED gate 16/16 unchanged); OLMo-3
+W5 is IMPLEMENTED-but-BLOCKED, NOT `DONE` (a row is DONE only at token-exact + speed, and
+there is no gate to pass here). No `git diff` under `src/`/`include/`/`tests/` — every
+SACRED gate byte-identical BY CONSTRUCTION. Not pushed; FULL SHA reported.
+
+**PIVOT.** OLMo-3 is NOT the cheapest reachable win (no oracle). Next impl agent → the
+rank-4 **StableLM** (`StableLmForCausalLM`, `stabilityai/stablelm-2-1_6b`, ungated,
+oracle-certain), since rank-3 **Granite-3** already landed SACRED 16/16 in batch3.
