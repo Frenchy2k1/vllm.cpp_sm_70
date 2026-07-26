@@ -142,6 +142,46 @@ code — correctness rests on the bit-exact split/merge proof, healthy acceptanc
 (43/51 at the staggered c4 gate), and the exact three-way identity at c1. Raw logs dgx
 `~/work/mixed-batch/{cN_results,cN_vresults}`. **Disposition: ours is ON-PAR-OR-ABOVE vLLM spec-ON at every measured c>1 axis** (output tput within ~+/-2%, ours slightly ahead at c2/c4, within-noise at c8; acceptance on-par 0.84-0.92 vs 0.835), tracking vLLM's ~1.5x spec speedup at every concurrency. The implementation is COMPLETE and at vLLM parity (mixed batch + bit-exact proof, server/CLI flag, c1 win I6). `SPEC-MTP` STAYS `ACTIVE`, NOT flipped to `DONE`, for one honest reason: the DONE criterion's strict `token-exact at c>1` clause is a proven MODEL impossibility — the 27B greedy is bf16-batch-nondeterministic (spec-OFF max_seqs 4-vs-1 differs 2/3 short prompts, no spec involved, affecting vLLM identically), so exact c>1 token identity cannot be met by any correct implementation; c>1 correctness is instead the model-independent bit-exact split/merge proof + acceptance parity (near-tie-distributional-gate), token-exact strict at c1. No lag, no missing work, no lever — the DONE final call is deferred to the user given this criterion ambiguity. **UPDATE 2026-07-26 (`CLAIM-SPEC-MTP-DONE`, records-only): the user RATIFIED that c>1 criterion** — at concurrency > 1 the DONE bar is the near-tie-distributional form + this SPEED delta (NOT strict token-exact), so `SPEC-MTP` is now `DONE`. The binding numbers above (c1 I6, c2-c8 I7) are unchanged; no new measurement (`benchmark_binding=false` for the transition). Closing commit I7 `72f9fb1`.
 
+**MTP speculative decode, k=1 on the 35B MoE (`Qwen3_5MoeMTP`) - SINGLE-REQUEST
+(c1) CORRECTNESS PROVEN + spec-ON FASTER THAN spec-OFF (2026-07-26, M-mtp-2,
+`CLAIM-SPEC-MTP-M-MTP-2`, [spec](../.agents/specs/mtp-spec-decode.md)).**
+`benchmark_binding=true` for the our-engine spec-ON-vs-spec-OFF c1 delta.
+Disposition: **CORRECTNESS COMPLETE (three-way token-exact + acceptance parity vs
+the live vLLM 0.25.0 oracle); c1 spec-ON is FASTER than spec-OFF on the 35B MoE (the
+27B MTP speedup transfers despite the MoE expert-union).** The correctness gate
+`tests/parity/test_qwen36_spec_decode.cpp` PASSES on dgx (GB10, cutlass NVFP4 + FA2
+ON, `-Werror` 0 warn): our spec-ON == our spec-OFF (`test_qwen36_paged_engine`) ==
+vLLM 0.25.0 `--speculative-config {"method":"mtp","num_speculative_tokens":1}` greedy
+== vLLM 0.25.0 spec-OFF, all 16/16 vs the `qwen36_logits_35b/greedy_ids` anchor
+(STRICT, deterministic at c1; vLLM sides captured live by
+`tools/parity/capture_qwen36_spec_greedy.py`, `enforce_eager`, `gpu_mem 0.45`);
+acceptance 16/16 on both sides (vLLM rate 1.0 == ours — MoE drafter provably alive).
+
+**A/B methodology.** OUR ENGINE, same binary spec-ON vs spec-OFF (a robust
+same-binary A/B), 35B `nvidia/Qwen3.6-35B-A3B-NVFP4`, c1, greedy, 6 prose+code
+prompts x 128 out, idle box under one `flock $HOME/gpu.lock`, warm rep after a
+discarded cold leg (reproducible σ<1% across cold/warm). NOTE: the vLLM cross-arm
+throughput number is NOT re-run at 35B here (the c1 win vs graphed vLLM is already
+established at 27B, I6; the 35B vLLM oracle in this run uses Marlin FP4 fallback, not
+a like-for-like production denominator) — the 35B speed claim is the intra-engine
+spec-ON-vs-OFF delta only.
+
+**BINDING (c1, our engine, warm; spec-ON vs spec-OFF):**
+
+| axis | spec-ON | spec-OFF | verdict |
+|---|---|---|---|
+| Mean TPOT ms | 11.80 | 14.03 | spec-ON **1.19x faster** |
+| Output tput tok/s | 78.73 | 67.68 | spec-ON **+16.3%** |
+| Median E2EL ms | 1569 | 1820 | spec-ON 1.16x faster |
+| draft acceptance | 0.908 (364/401) | n/a (0 drafts) | healthy, in the 27B 0.85-0.92 band |
+
+Cold-leg reproducibility: spec-ON TPOT 11.87 / tput 78.01; spec-OFF TPOT 13.98 /
+tput 67.52 (σ<1%). **spec-OFF byte-identity:** the whole M-mtp-2 landing is a test +
+capture-script + records diff (no `src/`/`include/`/`examples/` touched), so the 35B
+non-spec path is byte-identical and 35B SACRED 315/315 holds by construction; no
+kernel touched ⇒ compute-sanitizer / `check-device-leakage` unchanged. Raw logs dgx
+`~/mtp35b/vllm.cpp/{gate.log,capON.log,capOFF.log,abON_warm.log,abOFF_warm.log}`.
+
 **Gemma-3 (`Gemma3ForCausalLM`, gemma-3-1b-it) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-SWEEP-GEMMA` W0-W2, [spike](../.agents/specs/sweep-gemma.md)).**
 The FIRST Gemma-family model. Disposition: **SPEED PENDING - no throughput measured

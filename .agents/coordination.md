@@ -842,3 +842,25 @@ list of what the project supports.
   Tracked follow-ons keep their own live rows: the 35B `Qwen3_5MoeMTP` full e2e
   token gate (M-mtp-2, `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` `GATING`) and
   `SPEC-DFLASH` (oracle-BLOCKED, vllm#40898). NOT pushed.
+- 2026-07-26: `CLAIM-SPEC-MTP-M-MTP-2` (Claude Code opus-4-8; worktree
+  `spec-mtp-done`, base `origin/main` `3662ec52`, dgx `~/mtp35b/vllm.cpp` via
+  `git archive`, GPU work under one `flock $HOME/gpu.lock`) — the LAST owed MTP
+  gate. **M-mtp-2: the 35B `Qwen3_5MoeMTP` full e2e three-way token gate PASSES**;
+  `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` `GATING`→`DONE`, so MTP k=1 spec-decode
+  is `DONE` on BOTH gate models. Owns ONLY: NEW `tests/parity/test_qwen36_spec_decode.cpp`
+  (+1 `tests/CMakeLists.txt` line, mirror of the landed 27B `test_qwen27_spec_decode.cpp`
+  at 35B, MoE draft head `Qwen3_5MTPKind::kMoe`), NEW oracle-capture
+  `tools/parity/capture_qwen36_spec_greedy.py`, and the records
+  (model-matrix / mtp-spec-decode.md §5 M-mtp-2 + §9 / engine-matrix / roadmap /
+  README / BENCHMARKS / ledger / state). **ZERO `src/`/`include/`/`examples/`
+  changes** ⇒ the 35B spec-OFF path is byte-identical and 35B SACRED 315/315 holds
+  by construction (`git diff --stat` = test/docs only); no kernel touched ⇒
+  compute-sanitizer / `check-device-leakage` unchanged. GATE (dgx GB10, cutlass
+  NVFP4 + FA2 ON, `-Werror` 0 warn, 9/9 assertions, RAN): three-way token identity
+  STRICT at c1 — our spec-ON == our spec-OFF (`test_qwen36_paged_engine`) == vLLM
+  0.25.0 spec-ON == vLLM 0.25.0 spec-OFF, 16/16 vs the `qwen36_logits_35b/greedy_ids`
+  anchor (vLLM both sides confirmed live via the capture script); acceptance 16/16
+  both sides (vLLM rate 1.0 == ours). c1 our-engine A/B spec-ON vs spec-OFF: TPOT
+  11.80 vs 14.03 ms (1.19x), output-tput 78.73 vs 67.68 tok/s (+16.3%), acceptance
+  0.908 — the MoE speedup transfers. Remaining spec-decode follow-on: `SPEC-DFLASH`
+  (oracle-BLOCKED, vllm#40898). NOT pushed.

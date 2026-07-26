@@ -795,6 +795,15 @@ target_compile_definitions(test_qwen27_spec_decode PRIVATE
 target_include_directories(test_qwen27_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# SPEC-MTP M-mtp-2 — the 35B MoE-MTP k=1 speculative-decode three-way identity
+# gate (Qwen3_5MoeMTP: our spec-ON == our spec-OFF == vLLM greedy) + measured
+# nonzero acceptance. Mirror of the 27B gate at 35B (MoE MTP draft head).
+vllm_cpp_add_test(test_qwen36_spec_decode parity/test_qwen36_spec_decode.cpp)
+target_compile_definitions(test_qwen36_spec_decode PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen36_spec_decode PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_qwen27_spec_decode_concurrent
   parity/test_qwen27_spec_decode_concurrent.cpp)
 target_include_directories(test_qwen27_spec_decode_concurrent PRIVATE
