@@ -96,6 +96,31 @@ foreach(_f IN LISTS _ALL_FEATURES)
   expect_feature("90" "${_f}" "")
 endforeach()
 
+# --- The CROSS-FAMILY BUILD-SUPPORTED FAN-OUT (BACKEND-CUDA-ARCH-EXPANSION,
+# spec §W10). Every architecture vLLM builds kernels for that is compilable with
+# the pinned nvcc 13.0 and whose portable bf16-WMMA path compiles — Ampere
+# sm_80/86/89 and Jetson sm_87 (major 8), datacenter Blackwell sm_100a/sm_103a
+# (major 10), and sm_110 (major 11) — resolves EVERY fp4/cutlass/marlin/fa2
+# feature to EMPTY, exactly like sm_90a: none of these families has a
+# BUILT+VALIDATED fast-path body here, so the FEATURE TABLE (deviation #2) names
+# none of them and only the portable C++/CUDA kernels compile. These are
+# BUILD-supported, portable-kernels-only, runtime-UNVERIFIED targets (no such
+# board here). sm_80 (major 8) and sm_100a (major 10) were compiled end to end
+# `-Werror` 0-warn on dgx as the per-major representatives; the same-major
+# siblings share the identical portable kernel bodies and gencode-compatible
+# SASS. Pinned so a future table edit cannot silently claim a fast path we do not
+# have. See backend-matrix.md BACKEND-CUDA-SM0{80,86,87,89}/SM10{0,3}/SM110 and
+# .agents/specs/cuda-arch-additivity.md §W10.
+foreach(_f IN LISTS _ALL_FEATURES)
+  expect_feature("80" "${_f}" "")      # (already asserted above; kept for locality)
+  expect_feature("86" "${_f}" "")
+  expect_feature("87" "${_f}" "")
+  expect_feature("89" "${_f}" "")
+  expect_feature("100a" "${_f}" "")    # (already asserted above; kept for locality)
+  expect_feature("103a" "${_f}" "")
+  expect_feature("110" "${_f}" "")
+endforeach()
+
 if(_failures GREATER 0)
   message(FATAL_ERROR "${_failures} CUDA feature-table expectation(s) failed")
 endif()

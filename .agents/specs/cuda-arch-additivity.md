@@ -1,11 +1,14 @@
 # CUDA-architecture additivity — implementation spike
 
 Status: **IMPLEMENTED — framework seams (W1-W6); the first SAME-FAMILY arch through
-them (W8: `sm_120a`, BUILD-supported, runtime HW-blocked); and the first CROSS-FAMILY
+them (W8: `sm_120a`, BUILD-supported, runtime HW-blocked); the first CROSS-FAMILY
 arch (W9: `sm_90a` Hopper, single-arch PORTABLE-KERNELS-ONLY build-supported, runtime
-HW-blocked, no fast paths)**.
+HW-blocked, no fast paths); and the CROSS-FAMILY BUILD-SUPPORTED FAN-OUT (W10:
+Ampere `sm_80/86/87/89`, Ada `sm_89`, datacenter Blackwell `sm_100a/103a`, `sm_110` —
+all single-arch PORTABLE-KERNELS-ONLY build-supported, runtime HW-blocked; `sm_70`
+Volta and `sm_75` Turing recorded as SCOPED, non-additive — no bf16 tensor cores)**.
 Owners: `CLAIM-CUDA-ARCH-ADDITIVITY` (the seams), `CLAIM-CUDA-SM120-BRINGUP` (W8),
-`CLAIM-CUDA-SM090-BRINGUP` (W9).
+`CLAIM-CUDA-SM090-BRINGUP` (W9), `CLAIM-CUDA-ARCH-EXPANSION` (W10).
 Rows: **`BACKEND-CUDA-ARCH-ADDITIVITY`** (new, the seam row), advancing
 `BACKEND-CUDA-SM120` / `BACKEND-CUDA-SM121` / `BACKEND-CUDA-COMP-FP4` /
 `BACKEND-CUDA-COMP-MARLIN` / `BACKEND-CUDA-COMP-SCALEDMM-C3X` / `BACKEND-CUDA-COMP-FA`.
@@ -216,6 +219,7 @@ predicate over an 8-entry table, off the gate models' default path entirely
 | W7 | **NAMED NEXT ROW, HW-BLOCKED value** — per-source `-gencode` narrowing (vLLM `set_gencode_flags_for_srcs`, `utils.cmake:265-345`) so a CROSS-FAMILY FAT build (`"90a;121a"`) can compile the sm12x-only TUs for sm12x only. Requires target-level `CUDA_ARCHITECTURES OFF` + manual per-TU gencode across every CUDA target. Buys nothing runtime until a cross-family tactic body exists, and it re-codegens the arch we DO run (GB10) so it must be proven byte-identical. **W9 measured that the fat build is the ONLY thing that needs it** — a single-arch cross-family build does not. | `cmake/CudaArchFeatures.cmake`, every `target_sources` CUDA block | NOT STARTED |
 | W8 | **sm_120a bring-up — the first ADDITIVE architecture exercised end to end.** Same-family fat build proven to compile; Triton-AOT multi-arch diagnosis; configure-tier feature-table test + CI job | `cmake/TritonAOT.cmake`, `cmake/CudaArchFeaturesTest.cmake` (new), `CMakeLists.txt`, `.github/workflows/ci.yml` | DONE (BUILD-supported; runtime UNPROVEN — no sm_120 board here) |
 | W9 | **sm_90a (Hopper) bring-up — the first CROSS-FAMILY architecture, single-arch, PORTABLE-KERNELS-ONLY.** Guard the native fp4 helpers so the TU compiles when `VT_FP4_MMA_SM120A` is off; feature-table test pins `90a`→all-features-EMPTY; registry cross-family additivity test | `src/vt/cuda/cuda_matmul_nvfp4.cu`, `cmake/CudaArchFeaturesTest.cmake`, `tests/vt/test_ops_nvfp4_fp4.cpp` | DONE (single-arch BUILD-supported, portable-only, NO fast paths, runtime UNPROVEN — no Hopper board here; fat cross-family build still blocked, W7) |
+| W10 | **CROSS-FAMILY BUILD-SUPPORTED FAN-OUT — every remaining vLLM CUDA arch that is cleanly additive (portable-only, mirror W9).** Ampere `sm_80/86/87/89`, datacenter Blackwell `sm_100a/103a`, `sm_110`: feature-table test pins each → all-features-EMPTY; doc the supported values. ZERO kernel/model/runner edits (W9's helper guards already generalized the single-arch cross-family compile). SCOPED-OUT as non-additive: `sm_70` (Volta, dropped by nvcc 13) and `sm_75` (Turing) — no bf16 tensor cores, so the portable bf16-WMMA path does not compile; `sm_101a` (not in nvcc 13.0). | `cmake/CudaArchFeaturesTest.cmake`, the `VLLM_CPP_CUDA_ARCHITECTURES` doc in `CMakeLists.txt`, records | DONE (build-config + test + records only; representatives sm_80/sm_100a/sm_110 compiled `-Werror` 0-warn on dgx; siblings share the identical portable bodies; runtime UNPROVEN — no such board here) |
 
 ### W9 — sm_90a (Hopper), measured
 
@@ -344,6 +348,99 @@ not execution evidence and this row does not treat it as such.
    `triton_aot_vendored/sm_120a/`, then rebuild with `-DVLLM_CPP_TRITON=ON`.
 Only step 3, reported with its counts, would move `BACKEND-CUDA-SM120` past a
 build-supported claim.
+
+### W10 — the cross-family build-supported fan-out, measured
+
+**W0 — the GAP, grounded in vLLM's own arch list (pin `e24d1b24`).** vLLM's
+`CUDA_SUPPORTED_ARCHS` is toolkit-branched
+(`/home/mudler/_git/vllm/CMakeLists.txt:112,115,117`): on CUDA ≥13 it is
+`7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0`, on `≥12.8,<13`
+`7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1`, and its per-feature gencode
+lists add the arch-specific `a`/`f` targets (`9.0a`, `10.0a;10.1a;10.3a`,
+`12.0a;12.1a`, e.g. `MARLIN_ARCHS` `:558`, sm120 `SCALED_MM_ARCHS` `:777`,
+sm100 `SCALED_MM_ARCHS` `:811`, `DSV3_FUSED_A_GEMM_ARCHS` `:691`). Our
+build-supported set before W10 was `121a` (runtime-gated), `120a`/`120a;121a`
+(W8, same-family), and `90a` (W9, cross-family portable-only). **GAP** = every
+other arch vLLM builds for: `sm_70`, `sm_75`, `sm_80/86/87/89`, `sm_100/101/103`,
+`sm_110`.
+
+**Ranking by additivity-cleanliness (does the existing seam absorb it with ZERO
+kernel edit?).** The W9 measurement already established the rule for a
+cross-family arch: its five fast-path FEATURE-TABLE cells stay EMPTY (deviation
+#2 — we have no wgmma/tcgen05/Ampere fast-path body), so a single-arch build
+compiles ONLY the portable C++/CUDA kernels, and W9's guarding of the native fp4
+helpers on `VT_FP4_MMA_SM120A` is what makes that portable compile clean. That
+guarding is arch-agnostic, so **any** cross-family arch whose portable kernels
+compile is now additive with no further code change. The one hard constraint is
+the portable attention path, which uses `nvcuda::wmma::fragment<…,__nv_bfloat16,…>`
+(`cuda_paged_attn.cu:713-717`) — bf16 tensor-core WMMA, which exists only on
+**sm_80+**. That cleanly splits the gap:
+
+- **Cleanly additive (portable-only, brought up here):** `sm_80`, `sm_86`,
+  `sm_87`, `sm_89` (major 8, Ampere/Jetson/Ada), `sm_100a`, `sm_103a` (major 10,
+  datacenter Blackwell), `sm_110` (major 11). All have bf16 tensor cores and are
+  accepted by nvcc 13.0.
+- **SCOPED follow-up, NOT additive:** `sm_70` (Volta — dropped by nvcc 13.0:
+  `nvcc fatal: Unsupported gpu architecture 'sm_70'`, and no bf16 tensor cores),
+  `sm_75` (Turing — nvcc compiles a trivial kernel, but the portable paged-attn
+  TU FAILS: `incomplete type "…fragment<matrix_a,16,16,16,__nv_bfloat16,…>"` at
+  `cuda_paged_attn.cu:1797`, because Turing has no bf16 WMMA). Bringing these two
+  up needs a real fp16/non-tensor-core attention kernel body — a kernel campaign,
+  not a table edit — so they are recorded scoped, not forced. `sm_101a` is a
+  third scoped case for a different reason: nvcc 13.0 rejects it
+  (`Unsupported gpu architecture 'sm_101a'`), so it is toolkit-blocked here even
+  though vLLM lists `10.1` on the `<13` branch.
+
+**Measured on dgx (nvcc 13.0, cutlass 4.5.0, `~/work/archexp`, base `b28174e6`,
+`-DVLLM_CPP_TRITON=OFF`):**
+- **Configure** resolves fp4-mma / cutlass-nvfp4 / cutlass-fp8 / marlin-nvfp4 /
+  fa2 all **DISABLED** ("no requested arch in [<arch>] provides it") for every one
+  of `80`, `86`, `87`, `89`, `100a`, `103a`, `110` — the honest portable-only
+  state, identical to `90a`.
+- **Full single-arch `-Werror` builds** of the per-major representatives complete
+  clean, **0 warnings / 0 errors** (`EXIT=0`), each producing real SASS and
+  nothing else: `sm_80` → **16 TUs carrying `sm_80` cubins**, `sm_100a` → **16
+  `sm_100a`**, `sm_110` → **16 `sm_110`** (`cuobjdump -lelf libvllm.a`), exactly
+  the 16-portable-TU shape W9 measured for `sm_90a` (the 22 fast-path TUs
+  correctly absent). The same-major siblings (`86/87/89` for major 8; `103a` for
+  major 10) share the identical portable kernel bodies and are gencode-compatible
+  within the major (if the lowest member `sm_80` compiles, the higher ones do),
+  so they inherit the representative's clean compile; each is additionally
+  configure-verified and pinned in `CudaArchFeaturesTest.cmake`.
+- The scoped split is measured, not asserted: `sm_70`/`sm_101a` fail at `nvcc`
+  arch selection, `sm_75` fails at the bf16-WMMA TU (compile log above).
+
+**Rows advanced (backend-matrix.md):** `BACKEND-CUDA-SM080`, `BACKEND-CUDA-SM086`,
+`BACKEND-CUDA-SM087`, `BACKEND-CUDA-SM089` (major 8), `BACKEND-CUDA-SM100`,
+`BACKEND-CUDA-SM103` (major 10) and `BACKEND-CUDA-SM110` (major 11) all move
+`INVENTORIED` -> BUILD-supported (portable-only). `BACKEND-CUDA-SM070`,
+`BACKEND-CUDA-SM075` and `BACKEND-CUDA-SM101` stay `INVENTORIED`, recorded SCOPED
+(the non-additive cases above).
+
+**What is PROVEN for the fan-out:** configure-time feature resolution (all five
+fast paths DISABLED — portable-only) for all seven added arches; a clean
+`-Werror` single-arch compile with real per-arch SASS for a representative of
+each new major (8, 10, 11); the resolution asserted, not eyeballed, in
+`CudaArchFeaturesTest.cmake` (`cmake -P`, no GPU, CI-gated).
+
+**What is NOT proven:** any execution on any of these boards. None exists here.
+A green single-arch link is not execution evidence, and — as for `sm_90a` — there
+are NO fast-path kernels at all for these families, so even an owner of one of
+these cards gets only the portable path, not vLLM-competitive throughput. Moving
+any of these rows past build-supported requires the owner to run the unit tier
+and a gate model end to end and report token counts (same four-step protocol as
+§W9), and a competitive path requires the fast-path tactic BODIES ported for the
+family (wgmma / tcgen05 / Ampere-mma) and the FEATURE-TABLE cells widened — the
+kernel campaign, out of scope here.
+
+**Additivity.** W10 touched ONLY build-config + test + records:
+`cmake/CudaArchFeaturesTest.cmake` (new EMPTY-resolution expectations), the
+`VLLM_CPP_CUDA_ARCHITECTURES` doc comment in `CMakeLists.txt` (a comment; no
+functional CMake change), and the record surfaces. ZERO edits to any kernel,
+model, runner or sampler TU — the W9 guards already generalized the compile, so
+the fan-out needed no new guard. The `sm_121a` GB10 default build config is
+therefore byte-identical (the only `CMakeLists.txt` change is comment text; the
+test file runs only under `cmake -P`).
 
 ### Risks/decisions
 

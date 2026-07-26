@@ -140,7 +140,7 @@ Read from [`CMakeLists.txt`](CMakeLists.txt). Defaults shown are the shipped def
 | Option | Default | Purpose |
 |---|---|---|
 | `VLLM_CPP_CUDA` | `AUTO` | Build the CUDA backend: `ON`, `OFF`, or `AUTO` (on when a CUDA toolchain is found) |
-| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a` (consumer Blackwell), `120a;121a` (same-family fat binary), `90a` (Hopper, portable-only). The `a` suffix is required for the native fp4 MMA |
+| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family portable-only build-supported targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110` (accelerated paths off, not runtime-proven here). The `a` suffix is required for the native fp4 MMA |
 | `VLLM_CPP_METAL` | `AUTO` | Build the Metal backend: `ON`, `OFF`, or `AUTO` (on for an Apple host with an ObjC++ compiler) |
 | `VLLM_CPP_VULKAN` | `AUTO` (= `OFF`) | Build the Vulkan backend. Opt-in with `-DVLLM_CPP_VULKAN=ON`; headers are vendored and SPIR-V is committed, so no graphics toolchain is needed |
 | `VLLM_CPP_MLX` | `OFF` | Build the optional MLX GEMM provider for Metal (needs `-DMLX_ROOT=<mlx install>`) |
@@ -155,7 +155,7 @@ Read from [`CMakeLists.txt`](CMakeLists.txt). Defaults shown are the shipped def
 | `VLLM_CPP_BUILD_EXAMPLES` | `ON` | Build the example CLI, server, and bench binaries |
 | `VLLM_CPP_BENCH_PROFILE_CONTROL` | `OFF` | Trace-only profiler replay control (never for production timing builds) |
 
-Only GB10 / sm_121a is a runtime-gated CUDA target today. `120a` and `90a` are build-supported (they compile and emit real machine code) but unproven here, and non-Apple / non-NVIDIA backends run a subset of operations. See [Acceleration](#acceleration) and the [backend matrix](.agents/backend-matrix.md).
+Only GB10 / sm_121a is a runtime-gated CUDA target today. Consumer Blackwell (`120a`) plus the cross-family portable-only targets (`90a` Hopper, `80`/`86`/`87`/`89` Ampere/Ada, `100a`/`103a` datacenter Blackwell, `110`) are build-supported (they compile and emit real machine code) but unproven here (no such board), and non-Apple / non-NVIDIA backends run a subset of operations. See [Acceleration](#acceleration) and the [backend matrix](.agents/backend-matrix.md).
 
 ## Running inference (CLI)
 
@@ -294,6 +294,7 @@ For C++ consumers, the higher-level surface lives under [`include/vllm/`](includ
 | CUDA | GB10 / DGX Spark, sm_121a | Gate-model correctness passes; 27B at/above vLLM throughput, 35B prefill-pending. The only runtime-gated CUDA target |
 | CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
 | CUDA | Hopper, sm_90a | Build-supported, portable-kernels-only (accelerated paths disabled, no Hopper kernel bodies); not runtime-proven here |
+| CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a), sm_110 | Build-supported, portable-kernels-only (accelerated paths disabled, no fast-path bodies for these families); sm_80/sm_100a/sm_110 compiled `-Werror` clean on dgx as per-major representatives, siblings share the bodies; not runtime-proven here (no such boards). sm_70/sm_75 are not build-supported (no bf16 tensor cores) |
 | Metal | Apple Silicon | Two models run end to end and pass correctness (OPT-125m, Qwen3-0.6B); 18 of 75 ops native, the rest fall back to CPU on unified memory. No general model support yet; MLX is the named speed floor |
 | Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet; off unless `-DVLLM_CPP_VULKAN=ON` |
 | Intel XPU | Intel GPUs | Spiked, hardware-blocked |

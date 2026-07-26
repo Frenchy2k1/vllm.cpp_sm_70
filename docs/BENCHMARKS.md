@@ -4121,3 +4121,20 @@ Reproduction: `cd /home/mudler/_git/vllm.cpp.wt/i5b && ./build-cpu/tests/test_pr
 ## KERNEL-FUSION-FRAMEWORK consistency audit (2026-07-25, `CLAIM-FUSION-CONSISTENCY-AUDIT`)
 
 NOT APPLICABLE (read-only static audit + one additive CI checker, `benchmark_binding=false`) - no forward code changed, so no benchmark is owed and every SACRED gate is untouched by construction. Verdict: the `vt::FusedChain` catalog is MOSTLY used consistently (qwen3_5 family fully migrated; qwen3/qwen3_moe/deepseek_v2 adopted the add+RMSNorm recipes); drift is gemma/gemma2/gemma3/glm4/phi3 hand-fusing add+RMSNorm without the catalog (follow-on `FUSION-DENSE-MIGRATE`, perf-neutral). New `scripts/check-fusion-consistency.py` (+ mutation test 10/10) enforces it. Full audit: `.agents/specs/fusion-consistency-audit.md`.
+
+## CUDA-arch cross-family BUILD-SUPPORTED fan-out — W10 (2026-07-26, `CLAIM-CUDA-ARCH-EXPANSION`)
+
+**Benchmark disposition: NOT APPLICABLE / build-only (`benchmark_binding=false`).** This is
+an ADDITIVITY + COMPILE-VERIFY task, HONESTY-PASS for runtime — it adds NO kernel, changes
+NO numerics, and there is no board here beyond GB10 sm_121a to run any added arch, so no
+throughput/latency number is owed or claimed. Ampere/Ada `sm_80/86/87/89`, datacenter
+Blackwell `sm_100a/103a` and `sm_110` moved `INVENTORIED` -> BUILD-supported,
+portable-kernels-only (mirror sm_90a — all five fast-path features resolve DISABLED). Evidence
+is COMPILE-only (dgx, nvcc 13.0, cutlass 4.5.0, `~/work/archexp`, base `b28174e6`,
+`-DVLLM_CPP_TRITON=OFF`): the per-major representatives `sm_80`/`sm_100a`/`sm_110` each build
+`-Werror` 0-warn with `cuobjdump -lelf` = 16 TUs of real per-arch SASS and nothing else; the
+configure-tier `cmake -P cmake/CudaArchFeaturesTest.cmake` passes all expectations. A
+vLLM-COMPETITIVE path for any of these families is a separate kernel campaign (fast-path
+tactic bodies + widened FEATURE-TABLE cells) with its own benchmark, out of scope here.
+`sm_70`/`sm_75` (no bf16 tensor cores) and `sm_101a` (not in nvcc 13.0) are recorded SCOPED,
+non-additive. Full record: `.agents/specs/cuda-arch-additivity.md` §W10.
