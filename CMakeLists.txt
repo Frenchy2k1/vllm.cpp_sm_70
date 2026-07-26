@@ -345,6 +345,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/commandr_registry.cpp
   src/vllm/model_executor/models/commandr_weights.cpp
   src/vllm/model_executor/models/commandr.cpp
+  src/vllm/model_executor/models/phi_registry.cpp
+  src/vllm/model_executor/models/phi_weights.cpp
+  src/vllm/model_executor/models/phi.cpp
   src/vllm/model_executor/models/model_registry.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
   src/vllm/model_executor/models/whisper_audio.cpp

@@ -323,6 +323,29 @@ $HOME/gpu.lock ./build/tests/test_internlm2_paged_engine`. SPEED: **`benchmark_b
 PENDING** - no throughput measured (row is `ACTIVE`, not `DONE`, until every-axis vLLM speed
 parity). No throughput number is claimed here.
 
+**Phi-1/Phi-2 (`PhiForCausalLM`, `microsoft/phi-2`) - CORRECTNESS-COMPLETE, SPEED PENDING
+(2026-07-26, rank-8 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`).** `benchmark_binding=false`.
+CORRECTNESS: **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0 (per-prompt K=5
+ALL-DETERMINISTIC ⇒ STRICT bar): 9/16 strict token-exact + 7/16 bf16 near-tie-band, **max
+teacher-forced gap 0.25 nats** (< 0.5), 0 forward-divergent (`tests/parity/test_phi_paged_engine.cpp`,
+92/92 assertions, dgx-only) - every downstream token == vLLM's teacher-forced argmax at gap 0.0.
+The OLDER Microsoft Phi arch, DISTINCT from `Phi3ForCausalLM`. **ZERO new compute kernel** (the
+spike's predicted `kGelu` unary was unnecessary: `gelu_new`/NewGELU == the landed `vt::GeluTanh`):
+GPT-J PARALLEL residual (one nn.LayerNorm+bias feeds both attn+mlp, summed together - Command-R
+wiring), biased q/k/v/dense (OPT BiasedProj), partial NeoX RoPE 32/80, non-gated NewGELU MLP
+(fc1->gelu->fc2 both biased), untied lm_head+bias, all reuse. microsoft/phi-2 is **FLOAT16 on disk**
+(all 453 tensors F16); the loader is dtype-aware, downcasting f16->bf16 (RNE, bit-identical to
+torch `.to(bfloat16)`, mirroring vLLM's cast), kept LOCAL to `phi_weights.cpp` (shared
+`dense_weight_loaders.h` untouched). **RED-first (3 load-bearing deltas)**: drop qkv bias -> max
+gap 1.25 nats (gate CATCHES); sequential-instead-of-parallel residual -> max gap 21.19 nats (gate
+CATCHES); wrong partial-rotary fraction -> hard `rope_from_cache` shape-contract abort (cannot
+silently run). memcheck 0 errors, clean CUDA `-Werror`. Reproduce on dgx: capture goldens
+`phi2_w0_probe.py --model microsoft/phi-2 --out-dir <dir>` (or `internlm2-oracle-capture.py`),
+bootstrap `VT_DUMP_IDS=1 ./build/tests/test_phi_paged_engine`, gap `internlm2-neartie-gap.py
+--model microsoft/phi-2 --golden-dir <dir>`, then `flock $HOME/gpu.lock
+./build/tests/test_phi_paged_engine`. SPEED: **PENDING** - no throughput measured (row is `ACTIVE`,
+not `DONE`, until every-axis vLLM speed parity). No throughput number is claimed here.
+
 **StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) - CORRECTNESS-COMPLETE, SPEED PENDING
 (2026-07-26, rank-4 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`).** CORRECTNESS:
 **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0 (per-prompt K=5 ALL-DETERMINISTIC ⇒

@@ -118,8 +118,16 @@ Cohere LayerNorm + GPT-J full-width rope + PARALLEL residual + `logit_scale` + t
 + links + self-registers CPU `-Werror` clean; W0 oracle RUN-VERIFIED (tiny-random builds+runs on vLLM
 0.25.0, arch confirmed `CohereForCausalLM`≠`Cohere2`). NO SACRED gate — every real small
 `CohereForCausalLM` is HF-gated (no dgx token), the only ungated vehicles are tiny-random (head_dim
-8/2, outside validated attn), and dgx is disk-full. Remaining rows (MiniCPM, Phi-1/2, MiniCPM3) stay
-`SPIKE`, one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
+8/2, outside validated attn), and dgx is disk-full. **rank-8 Phi-1/Phi-2 (`PhiForCausalLM`,
+`microsoft/phi-2`) `ACTIVE` — SACRED 16/16** vs vLLM 0.25.0 (2026-07-26, worktree `phi12-bringup`,
+dgx `~/vllmcpp-phi12`; per-prompt K=5 deterministic → STRICT; 9/16 exact + 7/16 near-tie, max gap
+0.25 nats, 0 divergent). The OLDER Microsoft Phi arch, DISTINCT from `Phi3ForCausalLM`. **ZERO new
+kernel** (the spike's predicted `kGelu` unary was unnecessary — `gelu_new` == the landed
+`vt::GeluTanh`): GPT-J parallel residual (Command-R wiring) + nn.LayerNorm+bias + biased qkv/dense
++ partial NeoX rope 32/80 + non-gated NewGELU MLP + untied biased lm_head, all reuse; F16→BF16
+dtype-aware loader (LOCAL, shared header untouched). RED-first: dropped qkv bias 1.25 nats +
+sequential residual 21.19 nats gate-CAUGHT, wrong rotary fraction hard-aborts. Remaining rows
+(MiniCPM, MiniCPM3) stay `SPIKE`, one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
 MoE/SSM campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no
 0.25.0 oracle.
 
