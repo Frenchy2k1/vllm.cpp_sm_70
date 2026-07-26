@@ -2230,6 +2230,79 @@ in that evidence document before publishing these values as binding for the
 development branch.
 This 4B diagnostic does not establish 27B/35B support.
 
+## MLX GEMM provider A/B on Apple M4 - Qwen3-1.7B (2026-07-27, M5) - INDICATIVE / partially quieted
+
+**The first measurement of what the optional MLX provider is WORTH, and the
+answer to the question §5.4 of `metal-mlx-reuse-study.md` left open: does
+delegating the dense GEMM to MLX earn its 105 MB dependency.** This is an
+ours-vs-ours A/B, NOT a competitor comparison (for that see the M3b table below).
+
+**Method - one binary, no rebuild between arms.** Built ONCE with
+`-DVLLM_CPP_MLX=ON`; the arms are `VT_OP_PROVIDER_DISABLE=mlx` (native MSL) versus
+unset (MLX). A rebuild-free A/B is what the provider seam exists for, and it
+removes any build-difference confound. Commit `9e1c9025`; `git log
+9e1c9025..main -- src/vt/metal/ src/vt/op_provider.cpp include/vt/op_provider.h`
+is EMPTY, so these numbers apply unchanged to `main`. Model
+`mlx-community/Qwen3-1.7B-bf16` rev `9cd6692855d3e06772228e9a962b2606359b2d24`,
+p=512 g=128, b in {1,2,4,8,16}, 2 reps, arm order ALTERNATED per rep so thermal
+drift cannot favour one arm. Peak memory via `/usr/bin/time -l`.
+
+| B | MLX agg tok/s | native agg tok/s | speedup | MLX TTFT | native TTFT | MLX decode tok/s/stream | native decode tok/s/stream |
+|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 5.79 | 3.08 | 1.88x | 3.32 s | 7.68 s | 6.76 | 3.75 |
+| 2 | 10.19 | 6.08 | 1.68x | 5.09 s | 11.68 s | 6.34 | 4.17 |
+| 4 | 15.75 | 10.24 | 1.54x | 9.63 s | 18.77 s | 5.58 | 4.09 |
+| 8 | 25.70 | 13.69 | 1.88x | 13.95 s | 34.38 s | 4.94 | 3.16 |
+| 16 | 38.65 | 17.69 | 2.19x | 18.33 s | 54.48 s | 3.69 | 2.09 |
+
+**MLX wins every axis: 1.5x to 2.2x aggregate throughput, 2x to 3x faster TTFT,
+at no memory cost** (peak RSS 6.65 to 7.50 GB in BOTH arms; one MLX b=16 rep read
+9.20 GB). Exactly ONE op is delegated: `VT_OP_PROVIDER_STATS=1` shows `op=65
+selected=mlx priority=100` and everything else `vt-native`. `kPagedAttention`
+stays ours, as study §5.3 requires.
+
+**And it is free of accuracy cost.** `tests/vt/test_metal_backend.cpp` three-way
+parity (bar NMSE <= 5e-4), same box, MLX build:
+
+| Shape | msl-vs-cpu | mlx-vs-cpu | mlx-vs-msl |
+|---|--:|--:|--:|
+| decode bf16 1x2048x2048 | 2.80e-06 | 2.80e-06 | 0 |
+| decode bf16, B transposed | 2.76e-06 | 2.76e-06 | 0 |
+| prefill bf16 32x2048x6144 | 2.75e-06 | 2.75e-06 | 0 |
+| prefill bf16, B transposed | 2.74e-06 | 2.74e-06 | 0 |
+| square f32 128x512x512 | 3.81e-14 | 3.81e-14 | 0 |
+| square f32, B transposed | 3.73e-14 | 3.73e-14 | 0 |
+
+The exact zeros are REAL, not a stale buffer: the harness allocates fresh input
+and output buffers per call, `mlx_declines == 0` rules out a silent forward down
+to MSL, and the 1.5x to 2.2x throughput delta proves a different kernel ran. Same
+accumulation order, different scheduling. Bit-exactness across providers is still
+NOT claimed as a contract (study §5.3); it is what these six shapes measured.
+
+**This does NOT close `BACKEND-GATE-METAL-MLXLM`.** Against the mlx_lm floor
+below (27.57 agg tok/s at b=1, 213.39 at b=16, itself INDICATIVE and not re-run
+today) the MLX-provider arm is still ~4.8x to ~5.5x behind. The provider
+accelerates the dense GEMM only; the rest of the deficit is what `M3c` (batched
+encoders) and a simdgroup-matrix GEMM are for.
+
+**Status: INDICATIVE, NOT BINDING - partially quieted.** Better isolation than the
+M3b run but still short of the standing bar. DONE: the three `actions.runner`
+LaunchAgents (dante-desktop, platform, wingman) were verified job-idle, booted
+out for the sweep and restored after; the WHOLE A/B ran inside one
+`/usr/bin/lockf -k /tmp/gpu` so nothing could interleave between arms. NOT done:
+`com.localai.worker` and the aerial wallpaper stayed up (still no passwordless
+sudo). Rep spread reached 9.4% (MLX b=16) against mlx_lm's 0.12 to 0.63%, on 2
+reps, so read the multipliers as +/-10%; the gap far exceeds the noise.
+**Repro (M4, `~/vllmcpp-mlx-ab`):** configure `-DVLLM_CPP_METAL=ON
+-DVLLM_CPP_MLX=ON -DMLX_ROOT=$HOME/mlx-venv/lib/python3.9/site-packages/mlx`,
+then per arm `/usr/bin/lockf -k /tmp/gpu env [VT_OP_PROVIDER_DISABLE=mlx]
+/usr/bin/time -l ./build/examples/vllm-bench --model <snapshot> --num-prompts <B>
+--input-len 512 --output-len 128 --concurrency <B> --seed 0`. To make it binding,
+add `sudo launchctl bootout system/com.localai.worker` plus the wallpaper
+disable, and restore both after.
+
+---
+
 ## Ours-vs-MLX on Apple M4 - Qwen3-1.7B (2026-07-23, M3b) - INDICATIVE / `BLOCKED-ON-SUDO`
 
 **The first ours-vs-MLX comparison. NOT binding.** Qwen3-dense now runs on Metal

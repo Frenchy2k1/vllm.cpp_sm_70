@@ -198,14 +198,31 @@ TEST_CASE("Metal registers the W0 op set and NOT the unimplemented rest") {
   }
   // Still stubbed, and asserted so a later row cannot quietly claim more than it
   // implements: the quant tier, the GDN/MoE families, and every sampler op except
-  // greedy argmax. A partial backend is a supported state: vt::GetOp throws on
-  // lookup.
+  // greedy argmax. `OpRegistered` means a NATIVE kernel exists, so it stays false
+  // regardless of what the portable reference tier installs underneath.
   for (vt::OpId op : {vt::OpId::kRandomSample, vt::OpId::kComputeProbs,
                       vt::OpId::kMoeCombine, vt::OpId::kGdnStateGather}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kMETAL));
   }
-  CHECK_THROWS_AS(vt::GetOp(vt::OpId::kMoeCombine, DeviceType::kMETAL),
-                  std::runtime_error);
+  // A partial backend is still a supported state, but since S5 that no longer
+  // means "GetOp throws". Metal is unified-memory, so ReferenceTierEligible holds
+  // and the portable CPU tier installs LAZILY on the miss: GetOp returns a
+  // working (correct but slow) kernel instead. This asserts the CURRENT contract
+  // plus the two facts that keep it honest — the selection is the reference tier
+  // BY NAME, and the observability counter moves — so a Metal op silently running
+  // on the CPU path can never masquerade as a native kernel (Risk 7).
+  REQUIRE(vt::ReferenceTierEligible(DeviceType::kMETAL));
+  void* moe_combine = nullptr;
+  CHECK_NOTHROW(moe_combine = vt::GetOp(vt::OpId::kMoeCombine, DeviceType::kMETAL));
+  CHECK(moe_combine != nullptr);
+  const auto moe_stats = vt::GetOpProviderStats(vt::OpId::kMoeCombine, DeviceType::kMETAL);
+  REQUIRE(moe_stats.last_selected != nullptr);
+  CHECK(std::string(moe_stats.last_selected) == std::string(vt::kReferenceProviderName));
+  // Deliberately `> 0` and not a strict per-call increment: Resolve() caches the
+  // winner in the slot, and ResetOpProviderStats does not clear that cache, so a
+  // second resolution of the same (op, device) never re-counts. `> 0` is the
+  // order-independent form of "the portable path announced itself".
+  CHECK(vt::GetReferenceTierHits() > 0);
 }
 
 // ===========================================================================
