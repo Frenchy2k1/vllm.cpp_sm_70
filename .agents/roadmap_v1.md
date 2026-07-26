@@ -112,8 +112,14 @@ gap 0.0 nats**, 0 divergent; ZERO new kernel = reuses the Llama/Qwen3-dense forw
 ONLY delta a loader-side de-interleave of the fused `wqkv` — packed q/k/v interleaved by KV-group,
 `internlm2.py:158-176`; RED wrong-split CAUGHT at prompt0 tok0). Gated via the additive
 `TokensPrompt` engine path (InternLM2's non-standard fast BPE is not a supported tokenizer family —
-a full port is orthogonal). Remaining rows (MiniCPM, Command-R, Phi-1/2, MiniCPM3) stay `SPIKE`,
-one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
+a full port is orthogonal). **Command-R / Cohere (`CohereForCausalLM`) IMPLEMENTED but `BLOCKED`**
+(2026-07-26, `sweep-commandr`): faithful ZERO-NEW-KERNEL port grounded in `commandr.py` (weight-only
+Cohere LayerNorm + GPT-J full-width rope + PARALLEL residual + `logit_scale` + tied embeds), compiles
++ links + self-registers CPU `-Werror` clean; W0 oracle RUN-VERIFIED (tiny-random builds+runs on vLLM
+0.25.0, arch confirmed `CohereForCausalLM`≠`Cohere2`). NO SACRED gate — every real small
+`CohereForCausalLM` is HF-gated (no dgx token), the only ungated vehicles are tiny-random (head_dim
+8/2, outside validated attn), and dgx is disk-full. Remaining rows (MiniCPM, Phi-1/2, MiniCPM3) stay
+`SPIKE`, one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
 MoE/SSM campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no
 0.25.0 oracle.
 

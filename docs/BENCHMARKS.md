@@ -284,6 +284,21 @@ to implement next: OLMo-3 (nearly-free W5 on the landed OLMo-2 code), Phi-3/Phi-
 Each binds a future per-family SACRED token-exact gate vs vLLM 0.25.0 (form BY MEASUREMENT) +
 the every-axis speed close before any row reaches DONE. No number is claimed here.
 
+**Command-R / Cohere (`CohereForCausalLM`) - IMPLEMENTED, SACRED GATE BLOCKED, NO SPEED
+(2026-07-26, `sweep-commandr`, base `origin/main` `0fb19410`).** `benchmark_binding=false`.
+Disposition: **NO throughput measured, NO correctness gate run - the model is implemented but
+has no runnable SACRED vehicle.** Faithful zero-new-kernel port grounded in vLLM `commandr.py`
+(weight-only mean-centred Cohere LayerNorm, GPT-J full-width RoPE `is_neox_style=false`, PARALLEL
+residual `h=residual+attn+mlp` off one norm, `logit_scale` scalar, tied embeddings), compiles +
+links + self-registers on the CPU dev build (`-Werror` clean, host TUs; no `.cu` touched). W0
+oracle RUN-VERIFIED: `hf-internal-testing/tiny-random-CohereForCausalLM` builds+runs on vLLM
+0.25.0 (deterministic greedy golden captured), arch confirmed `CohereForCausalLM` NOT the newer
+`Cohere2ForCausalLM`. The SACRED gate cannot be produced yet: every REAL small `CohereForCausalLM`
+(aya-expanse-8b / aya-23-8B / c4ai-command-r-v01) is HF-gated and the GPU box has no HF token; the
+only ungated checkpoints are tiny-random (head_dim 8/2, outside the validated FA2/paged-attention
+path); and the GPU box is disk-full (26 GiB free, no reusable build tree). Gate + every-axis speed
+close pending an ungated real checkpoint (or an HF token) and GPU-box disk. No number is claimed.
+
 **InternLM2 (`InternLM2ForCausalLM`, `internlm2-chat-1_8b`) - CORRECTNESS-COMPLETE, SPEED
 PENDING (2026-07-26, rank-6 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`).**
 CORRECTNESS: **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0 (per-prompt K=5
