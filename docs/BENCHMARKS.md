@@ -346,6 +346,33 @@ bootstrap `VT_DUMP_IDS=1 ./build/tests/test_phi_paged_engine`, gap `internlm2-ne
 ./build/tests/test_phi_paged_engine`. SPEED: **PENDING** - no throughput measured (row is `ACTIVE`,
 not `DONE`, until every-axis vLLM speed parity). No throughput number is claimed here.
 
+**MiniCPM (`MiniCPMForCausalLM`, `openbmb/MiniCPM-2B-sft-bf16`) - CORRECTNESS-COMPLETE, SPEED PENDING
+(2026-07-26, rank-5 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`, base `origin/main` `c39d78a6`).**
+`benchmark_binding=false`. CORRECTNESS: **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0
+(per-prompt K=5 ALL-DETERMINISTIC ⇒ STRICT bar): 10/16 strict token-exact + 6/16 bf16 near-tie-band,
+**max teacher-forced gap 0.0000 nats**, 0 forward-divergent (`tests/parity/test_minicpm_paged_engine.cpp`,
+140/140 assertions, dgx-only) - every sequence-divergent position == vLLM's teacher-forced argmax at
+gap 0.0 (vLLM's own prefill/decode near-tie inconsistency cascading). The first OpenBMB MiniCPM model.
+**ZERO new compute kernel**: the landed Llama/Granite dense forward + three scalars grounded in
+`minicpm.py` @ `e24d1b24` (scale_emb 12 embedding scale via `vt::MulScalar`; scale_depth/sqrt(40)=0.2214
+scaled residual add on each sublayer via `vt::MulScalar`+`vt::Add`; hidden/scale_width=hidden_size/dim_model_base=9.0
+before lm_head), standard 1/sqrt(head_dim) attn scale, tied lm_head. **W0 `.bin`-RISK RESOLVED**:
+MiniCPM-2B ships ONLY `pytorch_model.bin` (no safetensors) + no native transformers/vLLM config;
+vLLM 0.25.0 builds+runs it with `trust_remote_code=True`, and the vehicle was prepared WITHOUT a C++
+pickle loader by converting the OFFICIAL openbmb `.bin`->safetensors via trusted torch
+(`scripts/minicpm-convert-safetensors.py`) so BOTH oracle and engine read identical bf16.
+**RED-first**: dropping scale_depth (residual_scale->1.0) -> 256/256 positions divergent, max gap
+29.375 nats (gate CATCHES) - scale_depth is load-bearing. memcheck 0 errors, clean CUDA `-Werror`.
+Gated via the additive `TokensPrompt` engine path feeding the oracle's exact prompt ids (MiniCPM's
+SentencePiece normalizer Prepend/Replace is not ported; the vehicle tokenizer.json is faithfully
+re-expressed as a Metaspace pre_tokenizer for engine construction - follow-up). Reproduce on dgx:
+prep `minicpm-convert-safetensors.py`, capture `glm4-oracle-capture.py --per-prompt
+--trust-remote-code --runs 5 --model openbmb/MiniCPM-2B-sft-bf16 --out-dir <dir>`, bootstrap
+`VT_DUMP_IDS=1 ./build/tests/test_minicpm_paged_engine`, gap `glm4-neartie-gap.py --trust-remote-code
+--model openbmb/MiniCPM-2B-sft-bf16 --golden-dir <dir>`, then `flock $HOME/gpu.lock
+./build/tests/test_minicpm_paged_engine`. SPEED: **PENDING** - no throughput measured (row is `ACTIVE`,
+not `DONE`, until every-axis vLLM speed parity). No throughput number is claimed here.
+
 **StableLM (`StableLmForCausalLM`, `stablelm-2-1_6b`) - CORRECTNESS-COMPLETE, SPEED PENDING
 (2026-07-26, rank-4 of the recent-dense batch, `CLAIM-SWEEP-RECENT-DENSE`).** CORRECTNESS:
 **SACRED greedy gate 16/16 prompts PASS** vs vLLM 0.25.0 (per-prompt K=5 ALL-DETERMINISTIC ⇒

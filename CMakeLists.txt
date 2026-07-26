@@ -340,6 +340,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/stablelm_registry.cpp
   src/vllm/model_executor/models/stablelm_weights.cpp
   src/vllm/model_executor/models/stablelm.cpp
+  src/vllm/model_executor/models/minicpm_registry.cpp
+  src/vllm/model_executor/models/minicpm_weights.cpp
+  src/vllm/model_executor/models/minicpm.cpp
   src/vllm/model_executor/models/internlm2_registry.cpp
   src/vllm/model_executor/models/internlm2_weights.cpp
   src/vllm/model_executor/models/commandr_registry.cpp

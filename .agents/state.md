@@ -24079,3 +24079,42 @@ checkers green by bare RC. `benchmark_binding=false`, SPEED still PENDING (row s
   model byte-identical by construction. `benchmark_binding=false`, SPEED PENDING (row
   `ACTIVE`, not `DONE`). Remaining recent-dense rows (MiniCPM, MiniCPM3) stay `SPIKE`.
   Not pushed; FULL SHA reported.
+
+- 2026-07-26 — **MODEL BREADTH: MiniCPM (`MiniCPMForCausalLM`, `openbmb/MiniCPM-2B-sft-bf16`)
+  landed `ACTIVE` — SACRED gate PASSES 16/16 vs vLLM 0.25.0** (`MODEL-TEXT-minicpm-mini-cpmfor-causal-lm`,
+  `CLAIM-SWEEP-RECENT-DENSE`; base `origin/main` `c39d78a6`, worktree `minicpm-bringup`;
+  dgx build+gate `~/vllmcpp-minicpm`, all GPU under `flock $HOME/gpu.lock`, sole owner,
+  local-ai-worker down). The first OpenBMB MiniCPM model. **W0 RUN-VERIFIED + `.bin`-RISK
+  RESOLVED (spec §0.3 MEDIUM oracle-risk, D5):** vLLM 0.25.0 BUILDS+RUNS `MiniCPMForCausalLM`
+  with `trust_remote_code=True` (coherent greedy — "Paris", "Albert Einstein", correct
+  fibonacci code); neither transformers nor vLLM registers the `minicpm` config so
+  trust_remote_code loads `configuration_minicpm.MiniCPMConfig`, but vLLM uses its OWN
+  `minicpm.py`. The ONLY checkpoint format is `pytorch_model.bin` (NO safetensors; our loader
+  is safetensors-only) → resolved WITHOUT a C++ pickle loader by converting the OFFICIAL
+  openbmb `.bin`→safetensors via TRUSTED torch on the oracle box
+  (`scripts/minicpm-convert-safetensors.py`), so BOTH the vLLM golden AND our engine read
+  IDENTICAL bf16 weights. Ungated, ~5.4 GiB, tied embeddings (no lm_head.weight), scalars
+  scale_emb=12/scale_depth=1.4/dim_model_base=256. Gate form BY MEASUREMENT: per-prompt K=5
+  ALL-DETERMINISTIC ⇒ STRICT well-posed; **16/16 PASS** by the ratified near-tie ROOT-divergence
+  gate — 10/16 strict token-exact + 6/16 near-tie band, **max teacher-forced gap 0.0000 nats,
+  0 forward-divergent** (the 34 sequence-divergent positions each == vLLM's teacher-forced argmax
+  at gap 0.0 — vLLM's own prefill/decode near-tie inconsistency cascading; e.g. vLLM greedy
+  degenerated into "-"×10 on p14 while our coherent tokens are each vLLM's argmax). **ZERO-NEW-KERNEL**:
+  the landed Granite/Llama dense forward + three scalars (grounded `minicpm.py` @ `e24d1b24`):
+  scale_emb 12 after embed (`:441-443`, `vt::MulScalar`); scale_depth/sqrt(40)=0.2214 scaled
+  residual add on both sublayers (`:384-393`, `vt::MulScalar`+`vt::Add`, NON-fused); hidden/
+  scale_width=hidden_size/dim_model_base=9.0 before lm_head (`:604,633,640`). Standard 1/sqrt(head_dim)
+  attn scale (MiniCPM has NO custom attention multiplier — the one delta vs Granite). New files only
+  (`minicpm.{h,cpp}`, `minicpm_weights.cpp`, `minicpm_registry.cpp`, `test_minicpm_paged_engine.cpp`)
+  + one `REGISTER_VLLM_MODEL`. **RED-first:** dropping scale_depth (residual_scale→1.0) → 256/256
+  positions divergent, max teacher-forced gap 29.375 nats gate-CAUGHT — scale_depth is load-bearing.
+  memcheck 0 errors; clean CUDA `-Werror` 0 warnings; no kernel touched. **Tokenizer (D4):** MiniCPM's
+  tokenizer.json encodes SentencePiece whitespace as a normalizer Sequence [Prepend "▁", Replace
+  " "→"▁"] with null pre_tokenizer, which our parser rejects; gated via the additive `TokensPrompt`
+  engine path (InternLM2/Command-R precedent) feeding the oracle's exact prompt ids, and the vehicle
+  tokenizer.json faithfully re-expressed as a Metaspace pre_tokenizer for engine construction/detok
+  (native normalizer Prepend/Replace port = orthogonal follow-up; raw-checkpoint model_type add =
+  follow-up). Inertness: `git diff --stat` = 5 new minicpm files + 2 CMake edits + one opt-in
+  `--trust-remote-code` flag on the two shared golden-capture scripts (default off = inert) + records;
+  every other model byte-identical by construction. `benchmark_binding=false`, SPEED PENDING (row
+  `ACTIVE`, not `DONE`). Remaining recent-dense row (MiniCPM3) stays `SPIKE`. Not pushed; FULL SHA reported.

@@ -1,5 +1,44 @@
 # SPIKE: recent-dense TEXT batch (Phi / Command-R / Granite / StableLM / InternLM2 / MiniCPM / Phi-3-4)
 
+## RANK-5 IMPLEMENTATION UPDATE (2026-07-26, MiniCPM — base `origin/main` `c39d78a6`, worktree `minicpm-bringup`, dgx `~/vllmcpp-minicpm`)
+
+- **rank 5 MiniCPM (`MiniCPMForCausalLM`, `openbmb/MiniCPM-2B-sft-bf16`) — SACRED 16/16, row `ACTIVE`.**
+  **ZERO NEW KERNEL** as scoped — MiniCPM is the landed Granite forward with three
+  scalar deltas (grounded in `minicpm.py` @ `e24d1b24`, reusing the shared dense glue):
+  scale_emb=12 after embed (`:441-443` `MiniCPMModel.embed_input_ids`, `vt::MulScalar`);
+  scale_depth/sqrt(num_layers)=1.4/sqrt(40)=0.2214 scaled residual add on BOTH attn+mlp
+  sublayer outputs (`:384-386,392-393` `MiniCPMDecoderLayer.forward`, `vt::MulScalar`+
+  `vt::Add`, NON-fused residual); hidden divided by scale_width=hidden_size/dim_model_base
+  =2304/256=9.0 before lm_head (`:604,633,640`, `vt::MulScalar` on the normed hidden).
+  Standard 1/sqrt(head_dim) attn scale (MiniCPM has NO custom attention multiplier — the
+  one delta vs Granite). Tied lm_head (checkpoint has no lm_head.weight). New files only
+  (`minicpm.{h,cpp}`, `minicpm_weights.cpp`, `minicpm_registry.cpp`,
+  `test_minicpm_paged_engine.cpp`) + one `REGISTER_VLLM_MODEL`.
+  - **W0 RUN-VERIFIED + `.bin` RISK RESOLVED (spec §0.3 MEDIUM oracle-risk, D5).** vLLM
+    0.25.0 BUILDS+RUNS `MiniCPMForCausalLM` with `trust_remote_code=True` (coherent greedy;
+    neither transformers nor vLLM register the `minicpm` config → trust_remote_code loads
+    `configuration_minicpm.MiniCPMConfig`; vLLM still uses its OWN `minicpm.py`). The ONLY
+    checkpoint format is `pytorch_model.bin` (NO safetensors, our loader is safetensors-only)
+    → resolved WITHOUT a pickle loader: converted the OFFICIAL openbmb `.bin`→safetensors via
+    TRUSTED torch on the oracle box (`scripts/minicpm-convert-safetensors.py`), so BOTH the
+    vLLM golden AND our engine read IDENTICAL bf16 weights. Ungated. Tied embeddings, scalars
+    scale_emb=12/scale_depth=1.4/dim_model_base=256 confirmed against config.json.
+  - **Gate form BY MEASUREMENT:** vLLM per-prompt K=5 **ALL-DETERMINISTIC** (0 multi-member
+    cells) ⇒ STRICT well-posed; **16/16 PASS** by the ratified near-tie ROOT-divergence gate
+    — **10/16 STRICT token-exact + 6/16 near-tie band, max teacher-forced gap 0.0000 nats, 0
+    forward-divergent** (the near-ties are vLLM's own prefill/decode inconsistency cascading —
+    e.g. vLLM greedy degenerated into "-"×10 on p14 while every one of our tokens IS vLLM's
+    teacher-forced argmax at gap 0.0). RED-first: dropping scale_depth (residual_scale→1.0) →
+    **256/256 positions divergent, max gap 29.375 nats** the gate CATCHES — scale_depth is
+    load-bearing. Clean CUDA `-Werror` 0 warnings; no kernel touched.
+  - **Tokenizer (D4):** MiniCPM's tokenizer.json encodes SentencePiece whitespace as a
+    normalizer Sequence [Prepend "▁", Replace " "→"▁"] with null pre_tokenizer, which our
+    parser rejects. Gated via the additive `TokensPrompt` engine path (InternLM2/Command-R
+    precedent) feeding the oracle's exact prompt ids; the vehicle tokenizer.json is
+    faithfully re-expressed as a Metaspace pre_tokenizer for engine construction/detok. A
+    native normalizer Prepend/Replace port is the orthogonal follow-up. SPEED PENDING.
+    Remaining rows (Command-R, MiniCPM3) stay `SPIKE`, one agent each.
+
 ## RANK-8 IMPLEMENTATION UPDATE (2026-07-26, Phi-1/2 — base `origin/main` `29c710dd`, worktree `phi12-bringup`, dgx `~/vllmcpp-phi12`)
 
 - **rank 8 Phi-1/Phi-2 (`PhiForCausalLM`, `microsoft/phi-2`) — SACRED 16/16, row `ACTIVE`.**

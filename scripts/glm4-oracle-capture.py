@@ -77,6 +77,11 @@ def parse_args():
                     help="decode each prompt in its OWN generate() call (batch size 1) "
                          "to match the paged-engine gate's single-request decode "
                          "regime; otherwise all prompts are batched in one call")
+    ap.add_argument("--trust-remote-code", action="store_true",
+                    help="pass trust_remote_code=True to LLM() — needed for arches "
+                         "whose config class is NOT in transformers/vLLM (e.g. "
+                         "MiniCPMForCausalLM: configuration_minicpm.MiniCPMConfig). "
+                         "Default off (inert for every already-supported model).")
     return ap.parse_args()
 
 
@@ -104,7 +109,8 @@ def main():
     K = max(1, args.runs)
 
     llm = LLM(model=args.model, dtype="bfloat16", enforce_eager=True,
-              gpu_memory_utilization=args.gpu_mem)
+              gpu_memory_utilization=args.gpu_mem,
+              trust_remote_code=args.trust_remote_code)
     sp = SamplingParams(temperature=0.0, max_tokens=T)
 
     # runs[k][i] = list of token ids for prompt i on run k (padded to T with -1).
