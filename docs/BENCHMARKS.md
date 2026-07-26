@@ -260,8 +260,12 @@ exact). ZERO new compute kernels: pure post-norm (`norm_after`) = standalone `vt
 on each sublayer OUTPUT + plain `vt::Add`, NO pre-norm; full-width QK-norm = two standalone
 `vt::RmsNorm` over `[T,q_size]`/`[T,kv_size]` before NeoX rope. Checkpoint is F32 on-disk →
 loader downcasts f32→bf16 to match vLLM-bf16; UNTIED lm_head; NO-BOS ByteLevel tokenizer
-(a real tokenizer-inclusive gate). Olmo3Config CONSTRUCTS in the 0.25.0 oracle (W5
-sliding-window e2e unblocked). **Regression (ONE guarded shared-TU touch — `tokenizer.cpp`
+(a real tokenizer-inclusive gate). **OLMo-3 (`Olmo3ForCausalLM`) W5 is IMPLEMENTED but
+oracle-BLOCKED — NO throughput or correctness number possible:** RUN-VERIFIED on dgx
+2026-07-26, vLLM 0.25.0 cannot build `allenai/OLMo-3-1025-7B` (`olmo2.py:143`
+`rope_parameters["rope_theta"]` → `KeyError`; transformers 5.13.1's nested per-layer-type
+rope schema vs 0.25.0's flat expectation). Config-construction succeeds but model-run
+fails, so there is NO SACRED bar (spec D5); PENDING an oracle advance. **Regression (ONE guarded shared-TU touch — `tokenizer.cpp`
 accepts the OLMo-2 Split `Removed/invert=true` encoding, inert for every non-OLMo
 checkpoint):** the fast dense SACRED gates re-run byte-identical (see the clean-build
 witness above); no kernel/runner/forward edit. SPEED stays PENDING until the every-axis
