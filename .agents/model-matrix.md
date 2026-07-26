@@ -38,13 +38,13 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 | State | Rows |
 |---|---|
 | ACTIVE | 20 |
-| GATING | 3 |
+| GATING | 2 |
 | PARTIAL | 3 |
 | READY | 0 |
 | SPIKE | 8 |
 | BLOCKED | 6 |
 | INVENTORIED | 286 |
-| DONE | 0 |
+| DONE | 1 |
 | **Total** | **326** |
 
 Engaged architectures (the 40 non-`INVENTORIED` rows):
@@ -61,8 +61,8 @@ Engaged architectures (the 40 non-`INVENTORIED` rows):
 | ✅ | `DeepseekV2ForCausalLM` | DeepSeek-V2-Lite (MLA) | SACRED gate 8/8 token-exact vs vLLM 0.25.0; speed short (attributed, W9) | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` |
 | ✅ | `LlamaForCausalLM` | Llama-3.2-1B dense (+ Yi + `InternLM3ForCausalLM` aliases) | STRICT token-exact 16/16 vs vLLM 0.25.0; speed pending. Llama-alias checkpoints gated 2026-07-26: Yi (`01-ai/Yi-Coder-1.5B-Chat`, arch=LlamaForCausalLM, zero delta) 16/16; InternLM3 (`internlm3-8b-instruct`, one alias line, plain-Llama+dynamic rope) 16/16 — CLOSES the recent-dense TEXT tier | `MODEL-TEXT-llama-llama-for-causal-lm` |
 | ✅ | `MistralForCausalLM` | Mistral-7B-v0.3 dense | full paged-engine SACRED gate 16/16 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-mistral-mistral-for-causal-lm` |
-| 🚧 | `Qwen3_5MTP` | Qwen3.5 MTP draft (spec-decode) | spec complete; correctness gate in progress (`GATING`) | `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp` |
-| 🚧 | `Qwen3_5MoeMTP` | Qwen3.5-MoE MTP draft (spec-decode) | spec complete; correctness gate in progress (`GATING`) | `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` |
+| ✅ | `Qwen3_5MTP` | Qwen3.5 MTP draft (spec-decode) | `DONE` 2026-07-26: k=1 MTP spec-decode e2e on the 27B GDN hybrid — three-way token-exact at c1 (our-ON == vLLM `--speculative-config mtp` == our-OFF, acceptance 16/16), c1 above vLLM every-axis + c2-c8 on-par-or-above, mixed-batch concurrency bit-exact, server/CLI/C-ABI `--speculative-config`; spec-OFF byte-identical | `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp` |
+| 🚧 | `Qwen3_5MoeMTP` | Qwen3.5-MoE MTP draft (spec-decode) | mechanism landed + proven bit-exact at 35B dims (mixed-batch split/merge, GDN spec rollback) + head oracle-parity (M-mtp-0); full 35B e2e three-way token gate (M-mtp-2) pending (`GATING`) | `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` |
 | 🚫 | `DFlashDraftModel` | Qwen3 DFlash draft (spec-decode) | ORACLE-BLOCKED on vLLM 0.25.0 (D0 2026-07-26): the mixed-SWA/full z-lab Qwen3.6 drafts abort at `qwen3_dflash.py:93` `NotImplementedError` (mixed `layer_types` unsupported, vllm#40898); NOT config-fixable, no all-full variant exists. Draft downloads ungated + config confirmed. UNBLOCK = pin > 0.25.0 | `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm` |
 | 🚧 | model factory / self-registration | cross-cutting registry (not an arch) | CPU build + test suite green; dgx gate + no-regression campaign deferred (`GATING`) | `MODEL-FACTORY-registry` |
 | 📋 | `ChatGLMForCausalLM` | ChatGLM | scoped in the GLM/DSA spike, not implemented | `MODEL-TEXT-chatglm-chat-glmfor-causal-lm` |
@@ -493,8 +493,8 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-SPEC-openpangu-mtp-open-pangu-mtp` | `OpenPanguMTPModel` | `registry.py:624`; `vllm/model_executor/models/openpangu_mtp.py::OpenPanguMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-qwen3-next-mtp-qwen3-next-mtp` | `Qwen3NextMTP` | `registry.py:625`; `vllm/model_executor/models/qwen3_next_mtp.py::Qwen3NextMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-step3p5-mtp-step3p5-mtp` | `Step3p5MTP` | `registry.py:626`; `vllm/model_executor/models/step3p5_mtp.py::Step3p5MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ☐ required | `INVENTORIED` | none | unassigned |
-| `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp` | `Qwen3_5MTP` | `registry.py:627`; `vllm/model_executor/models/qwen3_5_mtp.py::Qwen3_5MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; GDN verify path; MTP | ✅ [Qwen3.5 MTP spec](specs/mtp-spec-decode.md) | `GATING` | dense safetensors loader `src/vllm/model_executor/models/qwen3_5_mtp.cpp:271`; forward `src/vllm/model_executor/models/qwen3_5.cpp:3359`; tests `tests/vllm/v1/spec_decode/test_mtp_speculator.cpp:201,299`; DGX oracle runner `tests/parity/test_op_parity.cpp:1226` | - |
-| `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` | `Qwen3_5MoeMTP` | `registry.py:628`; `vllm/model_executor/models/qwen3_5_mtp.py::Qwen3_5MoeMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; GDN verify path; MTP | ✅ [Qwen3.5 MTP spec](specs/mtp-spec-decode.md) | `GATING` | fused-stack safetensors split `src/vllm/model_executor/models/qwen3_5_mtp.cpp:83,221,271`; forward `src/vllm/model_executor/models/qwen3_5.cpp:3347,3359`; tests `tests/vllm/v1/spec_decode/test_mtp_speculator.cpp:225,331`; DGX oracle runner `tests/parity/test_op_parity.cpp:1226` | - |
+| `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp` | `Qwen3_5MTP` | `registry.py:627`; `vllm/model_executor/models/qwen3_5_mtp.py::Qwen3_5MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; GDN verify path; MTP | ✅ [Qwen3.5 MTP spec](specs/mtp-spec-decode.md) | `DONE` | **DONE 2026-07-26 (`CLAIM-SPEC-MTP-DONE`, closing commit records the I5e/I6/I7 gate evidence):** k=1 MTP spec-decode e2e on the 27B GDN hybrid — three-way token-exact at c1 (our-ON == vLLM `--speculative-config mtp` == our-OFF, acceptance 16/16), c1 above vLLM every-axis (I6), c2-c8 on-par-or-above (I7), mixed-batch concurrency model-independently bit-exact (I7), server/CLI/C-ABI `--speculative-config`; spec-OFF byte-identical (27B 235/235). dense safetensors loader `src/vllm/model_executor/models/qwen3_5_mtp.cpp:271`; forward `src/vllm/model_executor/models/qwen3_5.cpp:3359`; mixed batch `qwen3_5.cpp:3301` (`GdnBlockPagedMixedSpec`); tests `tests/vllm/v1/spec_decode/test_mtp_speculator.cpp:201,299`, `tests/parity/test_qwen27_spec_decode.cpp`, `tests/parity/test_qwen27_spec_decode_concurrent.cpp`, `tests/vllm/models/test_qwen3_5_gdn_spec_routing.cpp`; DGX oracle runner `tests/parity/test_op_parity.cpp:1226`; DONE closure [ledger](parity-ledger.md#L714) | `72f9fb1` |
+| `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` | `Qwen3_5MoeMTP` | `registry.py:628`; `vllm/model_executor/models/qwen3_5_mtp.py::Qwen3_5MoeMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; GDN verify path; MTP | ✅ [Qwen3.5 MTP spec](specs/mtp-spec-decode.md) | `GATING` | mechanism landed + proven bit-exact at 35B dims (mixed-batch split/merge + GDN spec rollback, `test_qwen3_5_gdn_spec_routing` 35B) + head oracle-parity (M-mtp-0); full 35B e2e three-way token gate (M-mtp-2) pending. fused-stack safetensors split `src/vllm/model_executor/models/qwen3_5_mtp.cpp:83,221,271`; forward `src/vllm/model_executor/models/qwen3_5.cpp:3347,3359`; tests `tests/vllm/v1/spec_decode/test_mtp_speculator.cpp:225,331`; DGX oracle runner `tests/parity/test_op_parity.cpp:1226` | - |
 | `MODEL-SPEC-hy-v3-mtp-hyv3-mtp` | `HYV3MTPModel` | `registry.py:629`; `vllm/model_executor/models/hy_v3_mtp.py::HYV3MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 
 ## MODEL-HFALIAS - Static Transformers aliases

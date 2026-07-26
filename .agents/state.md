@@ -24273,3 +24273,54 @@ the D1–D6 series is NOT unblocked. No drafter implemented, no golden fabricate
 - **Note (non-blocking):** the initial ~16 min of apparent "silent stall" was vLLM re-resolving
   the NVFP4 checkpoint cache (`weight_utils.py:530` 967.7 s), not a hang — CPU time was advancing
   the whole time; the `\r` progress bars were hidden from a plain `tail`.
+
+## 2026-07-26 — `SPEC-MTP` → `DONE`: MTP k=1 speculative decoding COMPLETE + gated (`CLAIM-SPEC-MTP-DONE`, records-only, base `origin/main` `65f97e8`, isolated worktree; NOT pushed)
+
+**Records-only lifecycle transition (ZERO code).** A prior session had landed
+BOTH of the two DONE-owed items and run the gates (I5d server flag, I6 c1 A/B,
+I7 mixed batch + server/CLI + c>1 A/B), but I7 deliberately LEFT `SPEC-MTP` at
+`ACTIVE`, deferring the DONE call to the user because the DONE criterion's strict
+"token-exact at c>1" clause is a proven bf16-batch-nondeterminism MODEL
+impossibility. The user's task RATIFIES that criterion: at concurrency > 1 the
+DONE bar is the near-tie-distributional form (ours ∈ vLLM's batch-nondeterministic
+greedy set) + the SPEED delta, NOT strict token-exact. That unblocks DONE.
+
+**What I verified (dev box — no GPU/cutlass here, so GPU gates are cited from
+I5e/I6/I7 on this exact code, not re-run):**
+- Both owed items ARE implemented at `origin/main` `65f97e8`: the mixed batch
+  `GdnBlockPagedMixedSpec` (`src/vllm/model_executor/models/qwen3_5.cpp:3301`,
+  reached from `GdnBlockPaged` at `:3588`) with `vt::IndexSelect`/`IndexCopy`;
+  the server flag (`examples/server/main.cpp:200-317` → `engine_params
+  .speculative_config = ParseSpeculativeConfigJson(...)`), the CLI flag
+  (`examples/cli/main.cpp`), and the C ABI v6 (`src/capi/vllm_c.cpp:464-467`).
+- The mixed-merge is sound: IndexSelect gathers by `spec_token_indx`/
+  `non_spec_token_indx`, IndexCopy scatters back to the same original positions;
+  `ns_tok+nns_tok==T` guards the partition; I7's `test_qwen3_5_gdn_spec_routing`
+  proves `mixed == pure spec + pure prefill` bit-exact. No bug to fix.
+- Gate evidence (recorded I5e/I6/I7): 27B three-way token-exact c1 (acceptance
+  16/16); c1 ours AT/ABOVE vLLM every axis; c2-c8 ON-PAR-OR-ABOVE; spec-OFF
+  byte-identical SACRED 27B 235/235, 35B 315/315, Coder 138/138; CUDA `-Werror`
+  0 warnings; compute-sanitizer 0 on the mixed step + op.
+
+**Spec-OFF byte-identity of THIS transition = by construction.** `git diff
+--stat` touches ONLY records (`.agents/*`, `README.md`, `docs/BENCHMARKS.md`);
+ZERO `src/`/`include/`/`examples/` lines, so the I5d/I6/I7 GPU gates stand on
+unchanged binaries.
+
+**Records advanced:** `SPEC-MTP` `ACTIVE`→`DONE` (engine-matrix + summary
+counts active 20→19 / done 3→4); model-matrix `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp`
+`GATING`→`DONE` (+ checklist ✅ + rollup GATING 3→2 / DONE 0→1); the 35B
+`Qwen3_5MoeMTP` row kept `GATING` honestly (mechanism landed + bit-exact at 35B
+dims, e2e M-mtp-2 gate pending); roadmap ROAD-V1-C3 + C3-gate DONE notes;
+feature-matrix §8 (MTP ✅ DONE, rejection sampler + GDN segments landed) + the
+`MODEL-SPEC` row `READY`→`ACTIVE`; spec `mtp-spec-decode.md` §9; ledger row; the
+three released claims (`CLAIM-SPEC-MTP-I5E`/`-I6`/`-I7`) moved to coordination
+"Closing and archival" + `CLAIM-SPEC-MTP-DONE` recorded; README + BENCHMARKS
+DONE notes. **Owner of the DONE rows = closing commit I7 `72f9fb1`** (the commit
+that landed+gated both owed items), per the repo's DONE-row convention.
+
+**Tracked follow-ons (own live rows):** the 35B `Qwen3_5MoeMTP` full e2e token
+gate (M-mtp-2) and `SPEC-DFLASH` (oracle-BLOCKED, vllm#40898).
+
+**Checkers:** all seven record checkers green by bare RC on the dev box. NOT
+pushed; FULL SHA reported in the session.
