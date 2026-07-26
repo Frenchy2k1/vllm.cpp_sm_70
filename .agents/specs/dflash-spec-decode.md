@@ -9,7 +9,56 @@ token-identical to vLLM + ~1.04x TPOT / +4% output-tput at c1, on-par-or-above a
 c2/c4/c8). **Readiness re-assessment: 2026-07-25.** This is a READINESS ASSESSMENT
 + dispatch-sized W-plan; no DFlash code exists yet.
 
-## 0. READINESS VERDICT (2026-07-25) — GREEN, no HW/oracle/download blocker
+## 0. READINESS VERDICT
+
+### D0 RESULT (2026-07-26, `CLAIM-DFLASH-D0`) — **ORACLE-BLOCKED on vLLM 0.25.0. STOP; the D-series is NOT unblocked.**
+
+The one soft risk flagged below (does the pinned 0.25.0 oracle SERVE DFlash?) was
+RUN-verified on dgx and **resolved NEGATIVE** — superseding the 2026-07-25 "GREEN"
+optimism, which was config-construct reasoning, not a model run (exactly the
+[[oracle-gateability-model-runs-not-config-constructs]] discipline: RUN the model).
+
+- **Decisive check RAN** (dgx, `flock`, GPU sole-owner): `LLM(unsloth/Qwen3.6-27B-NVFP4,
+  speculative_config={method:"dflash", model:"z-lab/Qwen3.6-27B-DFlash",
+  num_speculative_tokens:16, max_model_len:4096}, enforce_eager, gpu_memory_utilization
+  0.55)`. The DFlash config is **accepted** (method resolves, `parallel_drafting=True`)
+  and the **NVFP4 target loads fully**, but **DFlash DRAFT-MODEL CONSTRUCTION ABORTS**
+  before any propose/verify/rejection loop — no tokens, no acceptance rate:
+  `qwen3_dflash.py:93 _resolve_layer_attention` -> `NotImplementedError: DFlash does not
+  yet support mixed sliding/full attention via layer_types` (upstream **vllm#40898**) ->
+  `RuntimeError: Engine core initialization failed`.
+- **Root cause (verified in pinned source `e24d1b24`):** `_resolve_layer_attention` raises
+  when `any_sliding and not all_sliding`. The z-lab **27B** draft is `layer_types =
+  [SWA×4, full×1]` (mixed) -> raises; the **35B-A3B** draft is `[SWA×5, full×1]` (mixed)
+  -> **also blocked**. Only all-full ("standard", e.g. `z-lab/Qwen3.5-9B-DFlash`) or
+  all-SWA (`use_swa`) drafts construct on 0.25.0 — and BOTH our gate-model drafts are the
+  mixed kind. No all-full-attention DFlash draft is published for either Qwen3.6 gate
+  model, so the spec §0/§8 "worst case a config/version bump" config-swap fallback does
+  NOT exist today; this is a genuine version gate.
+- **UNBLOCK = pin advance to a vLLM > 0.25.0 that resolves vllm#40898** (per-layer causal
+  metadata + multiple KV-cache groups for mixed DFlash drafts). Same class as Gemma-4 /
+  OLMo-3. Until then the D5 three-way gate has no vLLM arm -> the drafter cannot be
+  verified -> **do NOT implement the drafter blind.**
+- **Cleared regardless (D0 deliverables #1, #3):** the draft **downloads ungated** (arch
+  `DFlashDraftModel` -> `("qwen3_dflash","DFlashQwen3ForCausalLM")`, `model.safetensors`
+  3.46 GiB = 1.73 **B params** bf16 — the "1.73 GB" is the param count); its
+  `target_layer_ids = [1,16,31,46,61]` (5 taps, `num_target_layers=64`, matching the 64-layer
+  target) — the §2 table is correct (the brief's `[1,6,11,16,22,27,32,37]`/40 is the **35B**
+  draft, verified). The §1 reuse map re-verified valid at `8a379182` (all MTP anchors —
+  `use_dflash()`/`NumLookaheadTokens()` `k+1`, `ForwardDeviceTap`+`hidden_tap`,
+  `GreedyRejectionSample`, `GdnSpecDecode`/`CausalConv1dSpecUpdate`, `gdn_attn` spec builder,
+  `MakeQwen3_5KVCacheSpec`/`fa_draft`, `GdnBlockPagedMixedSpec`+`IndexSelect/IndexCopy`,
+  `take_draft_token_ids`, and `ParseSpeculativeConfigJson` still throwing on method≠"mtp" =
+  the EXTEND point — all present; line numbers shifted from `72f9fb1`, no structural drift).
+
+Evidence: `tests/parity/goldens/dflash_27b/{D0_VERDICT.md,d0_blocked_traceback.txt}`;
+capture tool (ready for pin-advance re-run): `scripts/spec/d0_dflash_oracle_capture.py`.
+
+### (Superseded) 2026-07-25 pre-run assessment — GREEN, no HW/oracle/download blocker
+
+**Superseded by the D0 RESULT above:** the "oracle CONSTRUCTS DFlash" bullet was true only
+of the config/registry, not a model run — construction of the mixed-attention draft aborts.
+Retained for the reuse map (§1, still valid) and sizing (§5). Original text:
 
 DFlash is **dispatch-ready**. The three gating facts all clear:
 
@@ -249,7 +298,7 @@ the combination runs, so worst case is a config/version bump, not a dead row).
 
 | # | Builds | Gate | GPU/CPU | Hardest risk |
 |---|---|---|---|---|
-| **D0** ground + download | Fetch both drafts to dgx; dump their resolved `SpeculativeConfig` (default k, block_size resolution through `EAGLEConfig`, `target_layer_ids`); confirm the pinned 0.25.0 oracle SERVES DFlash + NVFP4 on sm_121 end-to-end (short greedy run) | oracle serves DFlash greedy on 27B target (nonzero acceptance in vLLM's own metrics); default k resolved & recorded; no download/HW/backend blocker | GPU (one short oracle run under `flock`) | Oracle can't serve DFlash on sm_121 (non-causal backend gate) — surface LOUD, mitigate via community-container config |
+| **D0** ground + download | Fetch both drafts to dgx; dump their resolved `SpeculativeConfig` (default k, block_size resolution through `EAGLEConfig`, `target_layer_ids`); confirm the pinned 0.25.0 oracle SERVES DFlash + NVFP4 on sm_121 end-to-end (short greedy run) | **✗ RESULT 2026-07-26: ORACLE-BLOCKED (§0 D0 RESULT).** Draft downloads ungated + config confirmed; DFlash config accepted + NVFP4 target loads — but the mixed-SWA/full draft ABORTS at `qwen3_dflash.py:93` `NotImplementedError` (vllm#40898). No greedy run, no acceptance. **D1–D6 remain BLOCKED until a pin > 0.25.0 resolves vllm#40898.** | GPU (one short oracle run under `flock`) | Oracle can't serve DFlash on sm_121 — **REALIZED** (mixed layer_types unsupported at the pin; NOT the non-causal-backend risk anticipated, and NOT config-fixable — no all-full Qwen3.6 draft exists) |
 | **D1** aux multi-tap seam (`DF-AUX-TAPS`) | Extend `ForwardDeviceTap`/tap struct: capture `[T,H×taps]` at 5(27B)/8(35B) residual boundaries, config-gated | multi-tap buffer matches an oracle dump of the target's aux hidden states at the configured layers; **non-spec + MTP-spec SACRED gates byte-identical** (taps null/off) | GPU (parity dump) + CPU (unit) | Touching the fused forward → must stay byte-identical when off (RMSNorm-saga discipline); mid-residual tap points must match eagle3 +1 shift exactly |
 | **D2** the `qwen3_dflash` drafter + non-causal in-block attention (`DF-DRAFT-MODEL`) | New draft model (5-6 dense layers, SWA+full), loader, the NEW non-causal block-attention `vt` primitive, draft KV groups | standalone draft forward token-exact vs the HF/vLLM draft on captured target features (golden-dump parity); the non-causal primitive CUDA==CPU bit-exact | GPU (forward + parity) + CPU (op ref) | **The non-causal primitive is the project's first** — bidirectional block attention; get the mask + SWA-vs-full per-layer routing right |
 | **D3** context-KV precompute + `prepare_dflash_inputs` (`DF-DRAFT-KV-PREP`) | Fused multi-layer KV proj + bulk RoPE + cache insert; the mask-block/context-slot/sample-map input kernel | context-KV reuse bit-exact (draft with precomputed context == draft re-running context); `prepare_dflash_inputs` matches a from-algorithm oracle (mask blocks, `valid_ctx_end` under rejection, CG padding) | GPU (kernels) + CPU (input-prep ref) | Rejected-position exclusion (`ctx_end − num_rejected`) + slot arithmetic off-by-one; eager (non-CG) context path |

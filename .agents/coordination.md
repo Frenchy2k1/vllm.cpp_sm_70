@@ -110,6 +110,23 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 ## Active claims
 
+**DFlash D0 readiness note (2026-07-26, `CLAIM-DFLASH-D0`, DONE, NOT pushed —
+FULL SHA reported to caller).** The gating oracle-gateability check for `SPEC-DFLASH`
+(rows `SPEC-DFLASH`, `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm`). Base
+`origin/main` `8a379182`, isolated worktree `dflash-d0`. **VERDICT: DFlash is
+oracle-BLOCKED on vLLM 0.25.0** — a RUN of `LLM(Qwen3.6-27B-NVFP4,
+speculative_config=dflash z-lab/Qwen3.6-27B-DFlash)` on dgx (flock, sole owner)
+accepts the config + loads the NVFP4 target but ABORTS constructing the mixed-SWA/full
+draft (`qwen3_dflash.py:93` `NotImplementedError`, upstream vllm#40898); both Qwen3.6
+drafts are mixed + no all-full variant exists ⇒ NOT config-fixable; D1–D6 BLOCKED until a
+pin > 0.25.0 resolves vllm#40898 (same class as Gemma-4/OLMo-3). Owned files ONLY (readiness
++ records, ZERO `src/`/`include/`): `scripts/spec/d0_dflash_oracle_capture.py` (new),
+`tests/parity/goldens/dflash_27b/{D0_VERDICT.md,d0_blocked_traceback.txt}` (new), and the
+record surfaces (`.agents/specs/dflash-spec-decode.md` §0/§6, roadmap ROAD-V1-C3 + C3
+checklist, `.agents/model-matrix.md` the DFlash spec row + checklist, ledger, state, this
+note, README, `docs/BENCHMARKS.md`). Did NOT touch any model/kernel/runtime source ⇒ SACRED
+gates byte-identical by construction (not re-run).
+
 **Fusion-consistency audit note (2026-07-25, `CLAIM-FUSION-CONSISTENCY-AUDIT`,
 DONE, direct-to-main).** A READ-ONLY static-analysis audit of whether the
 `KERNEL-FUSION-FRAMEWORK` catalog (`vt::FusedChain`) is used consistently across

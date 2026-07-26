@@ -24222,3 +24222,54 @@ gate).
   `cmake/CudaArchFeaturesTest.cmake`) + records only; zero `.cu`/`.cpp`/`.h` under
   `src/`/`include/` touched. Not pushed; FULL SHA in the ledger. `BACKEND-CUDA-ARCH-ADDITIVITY`
   §W10 DONE.
+
+## 2026-07-26 — DFlash D0 readiness/oracle check: `SPEC-DFLASH` ORACLE-BLOCKED on vLLM 0.25.0 (`CLAIM-DFLASH-D0`)
+
+The gating check BEFORE the heavy DFlash D-series. Base `origin/main` `8a379182`,
+isolated worktree `dflash-d0`. Decisive run on dgx `~/venvs/vllm-oracle` (vLLM 0.25.0)
+under `flock $HOME/gpu.lock`, GPU sole-owner idle. **Verdict: STOP — oracle-BLOCKED;
+the D1–D6 series is NOT unblocked. No drafter implemented, no golden fabricated.**
+
+- **Deliverable #1 — draft download (CLEAR):** `z-lab/Qwen3.6-27B-DFlash` is **ungated +
+  downloadable** (unauthenticated HF fetch OK). arch `DFlashDraftModel` → registry
+  `("qwen3_dflash","DFlashQwen3ForCausalLM")` confirmed; `config.json` present;
+  `model.safetensors` **3.46 GiB** on disk = **1.73 B params** bf16 (the spec/brief "1.73 GB"
+  is the param count, not the file size). 5 layers (4×SWA-2048 + 1 full), hidden 5120,
+  block_size 16, mask 248070. `target_layer_ids=[1,16,31,46,61]` (5 taps), `num_target_layers=64`
+  (matches the 64-layer target). **Reconciliation:** the D0 brief's "`[1,6,11,16,22,27,32,37]`
+  (8 taps / 40 layers)" is the **35B-A3B** draft's config (verified on HF: 35B =
+  `[1,6,11,16,22,27,32,37]`, 40 layers, mask 248077), NOT the 27B — the spec §2 table is
+  correct; the brief transposed the two drafts.
+- **Deliverable #2 — THE DECISIVE CHECK (RUN, negative):** `LLM(unsloth/Qwen3.6-27B-NVFP4,
+  speculative_config={method:"dflash", model:"z-lab/Qwen3.6-27B-DFlash",
+  num_speculative_tokens:16, max_model_len:4096}, enforce_eager, gpu_memory_utilization 0.55)`.
+  (NVFP4 target = the spec's parity denominator, 25 GiB; safer than the 69 GiB bf16 target
+  under the OOM-reboot rule. `num_speculative_tokens=16` = block_size 16, the e2e-fixture value,
+  NOT 15.) The config is ACCEPTED (`SpeculativeConfig(method='dflash', num_spec_tokens=16)`,
+  `parallel_drafting=True`) and the NVFP4 target LOADS FULLY, but the **DFlash DRAFT-MODEL
+  CONSTRUCTION ABORTS** before any propose/verify/rejection loop:
+  `qwen3_dflash.py:93 _resolve_layer_attention` → `NotImplementedError: DFlash does not yet
+  support mixed sliding/full attention via layer_types` (upstream **vllm#40898**) →
+  `RuntimeError: Engine core initialization failed`. So NO tokens, NO acceptance rate.
+  Root cause (verified in pinned source `e24d1b24`): the guard raises on
+  `any_sliding and not all_sliding`; the z-lab 27B draft is `[SWA×4,full×1]` (mixed) → raises,
+  the 35B-A3B `[SWA×5,full×1]` is also mixed → also blocked. Only all-full ("standard",
+  e.g. `z-lab/Qwen3.5-9B-DFlash`) or all-SWA (`use_swa`) drafts construct on 0.25.0, and BOTH
+  our gate drafts are the mixed kind. No all-full Qwen3.6 DFlash draft exists ⇒ the spec §0/§8
+  "worst case a config/version bump" config-swap fallback does NOT exist — a genuine version gate.
+  UNBLOCK = a pin > 0.25.0 resolving vllm#40898 (same class as Gemma-4 / OLMo-3, the D5
+  "no oracle → honestly blocked" case).
+- **Deliverable #3 — reuse map re-verified at `8a379182` (no drift):** all §1 MTP anchors present —
+  `speculative.h` `use_dflash()`/`NumLookaheadTokens()` (returns k+1 for dflash), `ForwardDeviceTap`
+  + `hidden_tap` seam, `rejection_sampler.cpp` + `GreedyRejectionSample` (cuda/cpu), `GdnSpecDecode`/
+  `CausalConv1dSpecUpdate`, `gdn_attn.cpp` spec builder, `MtpProposePrefill`, `MakeQwen3_5KVCacheSpec`/
+  `fa_draft`, `GdnBlockPagedMixedSpec` + `IndexSelect`/`IndexCopy`, `take_draft_token_ids`/`DraftTokenIds`
+  runner loop, and `ParseSpeculativeConfigJson` still throwing on method≠"mtp" (the EXTEND point).
+  Line numbers shifted from the spec's `72f9fb1` citations, but no structural drift.
+- **Byte-identity:** `git diff --stat` = `scripts/spec/d0_dflash_oracle_capture.py` + evidence
+  (`tests/parity/goldens/dflash_27b/{D0_VERDICT.md,d0_blocked_traceback.txt}`) + records ONLY;
+  ZERO `src/`/`include/` touched ⇒ SACRED gates byte-identical by construction (not re-run).
+  All seven record checkers green by bare RC. Not pushed; FULL SHA in the ledger.
+- **Note (non-blocking):** the initial ~16 min of apparent "silent stall" was vLLM re-resolving
+  the NVFP4 checkpoint cache (`weight_utils.py:530` 967.7 s), not a hang — CPU time was advancing
+  the whole time; the `\r` progress bars were hidden from a plain `tail`.
