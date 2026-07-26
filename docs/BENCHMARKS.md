@@ -4222,3 +4222,18 @@ resolve. Full record: `.agents/specs/pin-advance.md` §6.
   materially under the estimated "~4 core re-captures". Reproduction: dgx
   `~/work/pin-drift/` (`dflash_stats.log`, `drift_{27b,35b}.log`, `out_coder/`, `out_4b/`),
   venv `~/venvs/vllm-oracle-next`, source `~/work/vllm-src-5559679`.
+
+## Pin-advance W3a-W4 — RCA verdict = benign near-tie (no real drift), re-gate GREEN (2026-07-26, `CLAIM-PIN-ADVANCE-W3W4`)
+
+**Benchmark disposition: NOT APPLICABLE (correctness RCA + re-gate; `benchmark_binding=false`).**
+No pin flip; `~/venvs/vllm-oracle` (0.25.0) pristine; the W0-W2 `~/venvs/vllm-oracle-next`
+(vLLM `0.26.0.dev0+g5559679`, torch 2.13.0 / cutlass-dsl 4.6.0 / flashinfer 0.6.15) REUSED.
+The W0-W2 §6(d) "27B-NVFP4 W4A4 DRIFTS" item is resolved as a benign tok6 whitespace near-tie
+(gap 0.5625 nats, top-1 p≈14%; the SAME oracle emits 198 under the canonical golden-capture
+config and 271 under the W0-W2 `drift_capture.py` config), NOT oracle drift. Apples-to-apples
+re-capture on the target stack reproduces every measured SACRED golden bit-for-bit (27B W4A4
+all tensors 0.0 diff; 32B-NVFP4A16 greedy+dist 0 diff; 35B/Coder byte-stable). Definitive
+re-capture list EMPTY; W4 kernel re-sync NONE. OUR engine (unchanged at `36381c1b`) rebuilt
+Release/sm_121a/cutlass-4.5.0/TRITON=ON (-Werror clean, 0 warnings) and re-gated on GB10 via
+full serial `ctest` under `flock`. A throughput-parity benchmark is out of scope for this
+correctness re-gate and remains PENDING for the W5 pin flip. Evidence on dgx `~/work/pin-drift/`.

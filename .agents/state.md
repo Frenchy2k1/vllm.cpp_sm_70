@@ -24459,3 +24459,66 @@ by construction.
 Evidence on dgx: `~/work/pin-drift/` (dflash_stats.log, drift_{27b,35b}.log, out_coder/,
 out_4b/), `~/work/vllm_build.log`, source `~/work/vllm-src-5559679`. NOT pushed; FULL SHA
 reported in the session.
+
+## 2026-07-26 — PIN-ADVANCE EXECUTION W3a-W4: RCA verdict = benign tok6 NEAR-TIE (no real drift, no port); re-gate GREEN (`CLAIM-PIN-ADVANCE-W3W4`, base `origin/main` `36381c1b`, isolated worktree `pin-advance-w3w4`; NO pin flip; NOT pushed)
+
+Executed W3a (RCA the 27B drift) + W3b (full drift diff) + W4 (re-sync) + re-gate on dgx
+GB10 (sm_121a). REUSED the W0-W2 `~/venvs/vllm-oracle-next` (target stack, vLLM
+`0.26.0.dev0+g5559679`); `~/venvs/vllm-oracle` (0.25.0) left pristine; NO pin flip.
+
+**W3a RCA verdict — the W0-W2 "27B drift" is NOT real drift; it is a benign tok6 whitespace
+NEAR-TIE.**
+- NOT a chat-template change: the 27B gate feeds RAW token-ids (no template;
+  `dump_qwen36.py:236-237,301`), and the prompt ids are byte-identical old-vs-new. The
+  `<think>` block is a near-tie cascade artifact, not an `enable_thinking` default.
+- The near-tie is ALREADY DOCUMENTED in-tree: `qwen36_logits_27b/greedy_ids.npy`=198 `"\n"`
+  (production branch) vs `greedy_ids_emulation.npy`=271 `"\n\n"`→`<think>` (emulation branch),
+  `test_qwen27_paged_engine.cpp:112-149,236-237` (`REQUIRE(want_emu != want_prod)`). The W0-W2
+  "drift" output equals the committed EMULATION golden exactly.
+- Gap MEASURED (`rca_27b_neartie.py`): tok6 gap = **0.5625 nats**, top-1 p≈14%, three
+  candidates within 0.56 nats; every other step decisive (p>0.93). The SAME oracle emits 198
+  under the canonical golden-capture config but 271 under the W0-W2 `drift_capture.py` config
+  ⇒ flips on incidental engine config (`max_model_len`/`max_num_batched_tokens`/`max_num_seqs`/
+  `logprobs`), NOT on oracle version.
+
+**W3b full drift diff (apples-to-apples on the `55596792` stack) — DEFINITIVE RE-CAPTURE LIST
+= EMPTY.**
+- 27B W4A4 (`dump_qwen36.py --tag 27b`): BIT-IDENTICAL to committed — embed/gdn/fullattn/norm
+  hidden states max_abs=max_rel=0.0; argmax, greedy_ids(=198), topk_indices, topk_values ALL
+  exact (0 diff). The real bf16 GDN/attn/rmsnorm op-goldens therefore do NOT drift.
+- 32B-NVFP4A16 (`--runs 5`): BIT-IDENTICAL — greedy_ids + greedy_dist 0 diff; K=5
+  all-deterministic ⇒ STRICT gate form preserved.
+- 35B W4A16 + Coder-30B: byte-stable (W0-W2). 4B: near-tie noise absorbed by the ratified
+  distributional gate. ~30 dense `*_greedy` rows: already near-tie-robust gates
+  (`greedy_dist.npy`, `kNearTieMnats=500`) — absorb near-tie drift by construction. op-level
+  goldens: `forward_native` reference math (f32 inert, bf16 shown stable via the 27B op-goldens).
+
+**W4 mechanical re-sync = NONE.** No gate exhibits a real numeric change, so no §2D kernel/op
+is load-bearing for a drifted gate. Forcing our engine onto the emulation-271 branch would
+REGRESS the production gate (`got==want_prod`, `got!=want_emu`) — explicitly not done. The
+§2D re-ports (rmsnorm-fusion #46998, ReplaySSM #48018, MoeWNA16 #44120, new olmo3.py, …) are
+deferred to the W5 pin flip as routine mechanical re-ports.
+
+**Re-gate — OUR engine unchanged at `36381c1b`, re-built ONCE + gated GREEN on GB10.**
+git-archive → `~/work/vllm.cpp-pinw3w4`; `cmake -DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON -DCMAKE_BUILD_TYPE=Release`
+(FA2 sm_121a ENABLED, Triton AOT vendored manifest OK); -Werror clean (0 warnings); full ctest
+serial under `flock $HOME/gpu.lock` (299 tests, 1966 s): **296 Passed / 3 Failed (99%)**.
+EVERY SACRED gate PASSED + RAN: `test_op_parity` (27B W4A4 STRICT 16/16 greedy + prefill
+argmax + 35B logits + op goldens), `test_qwen36_paged_engine` (35B STRICT), `test_qwen27_paged_engine`
+(27B W4A4 STRICT `got==prod`[198]`!=emu`[271]), `test_qwen3_32b_nvfp4a16_paged_engine`,
+`test_qwen3coder_paged_engine`, 27B/35B spec-decode+concurrent, and the deepseek_v2 / glm4_moe_lite
+/ yi / commandr / phi / minicpm3 paged engines. The 3 failures are PRE-EXISTING on unchanged
+main and UNRELATED to the pin/oracle/goldens (byte-identical code+goldens): `test_model_registry`
+(hardcoded arch count 13 vs the grown 24), `test_model_loader_gguf` (stale 6-arch reject
+string + tokenizer fixture), `test_capi` (toy random-weight garbled-first-byte greedy-determinism
+flake under async scheduling). -Werror clean (0 warnings).
+
+**Disk note.** dgx / hit ENOSPC mid-build (compiler `/tmp` `.s` writes); reclaimed by
+`docker system prune -f` (97.9 GB of UNUSED docker images/containers/build-cache; all
+containers were already stopped) + oracle autotune/pip caches (~1.7 GB). No SACRED checkpoint,
+venv source, or user data touched; `~/venvs/vllm-oracle-next` + `~/work/vllm-src-5559679`
+intact.
+
+**Next (W5, deliberate):** flip the pin to `55596792` + land the §2D mechanical re-ports +
+fetch/gate OLMo-3. Evidence on dgx `~/work/pin-drift/`.

@@ -417,3 +417,99 @@ under MRV2; drift is small. Proceed to W3 (targeted 27B re-capture + OLMo-3 fetc
 diff) → W4 (mechanical re-sync) → W5 (pin flip). Evidence on dgx: `~/work/pin-drift/`
 (`dflash_stats.log`, `drift_{27b,35b}.log`, `out_coder/`, `out_4b/`); build log
 `~/work/vllm_build.log`; source `~/work/vllm-src-5559679`.
+
+---
+
+## 7. EXECUTION W3a-W4 RESULTS — RCA VERDICT = **NEAR-TIE (NO real drift, NO port)**; re-gate GREEN (2026-07-26, `CLAIM-PIN-ADVANCE-W3W4`)
+
+Ran W3a (RCA the 27B drift) + W3b (full drift diff) + W4 (re-sync) + the re-gate on dgx
+GB10 (sm_121a). **NO pin flip** (`~/venvs/vllm-oracle` = 0.25.0 left pristine; the W0-W2
+`~/venvs/vllm-oracle-next` REUSED). Base `origin/main` `36381c1b`, isolated worktree
+branch `pin-advance-w3w4`. **HEADLINE: the W0-W2 "27B drift" is NOT real drift — it is the
+already-DOCUMENTED tok6 whitespace near-tie flipping on incidental engine/sampling config.
+Under an apples-to-apples re-capture the new oracle reproduces EVERY measured SACRED golden
+BIT-FOR-BIT. The definitive re-capture list is EMPTY; W4 kernel re-sync = NONE.**
+
+### W3a — RCA the 27B `<think>`-block "drift" — VERDICT: benign tok6 near-tie (not template, not numeric-port)
+1. **Template? NO.** The 27B gate feeds the prompt as RAW token-ids (no chat template):
+   `dump_qwen36.py:236-237,301` tokenizes `"The capital of France is Paris, and the"` with
+   `add_special_tokens=True` → ids `[760,6511,314,9338,369,11751,11,321,279]` and generates
+   greedy. The prompt ids are BYTE-IDENTICAL old-vs-new (no `enable_thinking` / `<think>`
+   trigger in play). The `<think>` block in the W0-W2 capture is an ARTIFACT of a near-tie
+   cascade, not a template default.
+2. **Decisive test — the tok6 near-tie is DOCUMENTED and the forward is bit-exact.** The
+   codebase already committed BOTH branches of this near-tie: `qwen36_logits_27b/greedy_ids.npy`
+   = `[…,13,198,760,…]` (198 `"\n"`, the production branch) vs
+   `greedy_ids_emulation.npy` = `[…,13,271,248068,…]` (271 `"\n\n"` → `<think>`, the emulation
+   branch), with `test_qwen27_paged_engine.cpp:112-118,144-149,236-237` asserting
+   `REQUIRE(want_emu != want_prod)` and gating our engine to the production branch. The W0-W2
+   "new drift" output equals the committed **emulation** golden EXACTLY — the new stack merely
+   tipped the pre-characterized near-tie to the OTHER already-committed branch.
+   - **Near-tie gap MEASURED** (`rca_27b_neartie.py`, new oracle, per-step top-k logprobs):
+     at tok6 three candidates bunch within **0.5625 nats** — `271 "\n\n"` (-1.937),
+     `" What"` (-2.312), `198 "\n"` (-2.4995); **top-1 probability ≈ 14%**. Every OTHER step
+     (0-5, 7-15) is a decisive argmax (p > 0.93; " is"/" correct"/"</think>" at p > 0.99) and
+     both trajectories share the identical `"capital of Germany is Berlin."` prefix. tok6 is
+     the ONE genuinely undecided position — a textbook bf16/fp4 whitespace near-tie.
+   - **Config-sensitivity PROVEN on ONE oracle version.** The SAME `vllm-oracle-next` emits
+     `198` under the canonical golden-capture config (`dump_qwen36.py`: `max_model_len=256`,
+     `max_num_seqs=1`) but `271` under the W0-W2 `drift_capture.py` config
+     (`max_model_len=8192`, `max_num_batched_tokens=8192`, `max_num_seqs=4`, `logprobs`). The
+     near-tie flips on incidental engine config, NOT on the oracle version.
+   - **Our-engine reproduction.** Our C++ engine deterministically produces the production
+     `198` branch (its default merged-BF16 GDN + FlashInfer W4A4 chain), reproduced by the new
+     oracle under the canonical capture; the strict 27B gates keep passing unchanged.
+   - **VERDICT: benign tok6 whitespace NEAR-TIE.** NOT a chat-template default (raw ids,
+     byte-identical). NOT a portable fp4-act numeric change — the entire 27B FORWARD is
+     bit-identical on the new stack (see W3b). **NO W4 kernel port.**
+
+### W3b — full drift diff (new oracle `55596792` stack vs committed goldens) — DEFINITIVE RE-CAPTURE LIST = **EMPTY**
+Re-captured with the CANONICAL per-golden capture config (apples-to-apples) and diffed:
+
+| Gate | Method | Result vs committed |
+|---|---|---|
+| **Qwen3.6-27B-NVFP4 W4A4** (STRICT) | `dump_qwen36.py --tag 27b` full re-capture | **BIT-IDENTICAL.** embed/gdn_layer/fullattn_layer/norm hidden states `max_abs=max_rel=0.0`; `argmax`, `greedy_ids`(=198), `topk_indices`, `topk_values` ALL EXACT (0 diff). |
+| **Qwen3-32B-NVFP4A16 W4A16** (STRICT) | `qwen3-32b-nvfp4a16-oracle-capture.py --runs 5` | **BIT-IDENTICAL.** `greedy_ids` + `greedy_dist` 0 diff; K=5 all-deterministic ⇒ STRICT gate form unchanged. |
+| **Qwen3.6-35B-A3B-NVFP4 W4A16** (STRICT) | W0-W2 measured | SURVIVES 16/16 byte-identical. |
+| **Qwen3-Coder-30B-A3B** bf16 MoE (STRICT/dist) | W0-W2 measured | SURVIVES 6/6 (0/6 drift). |
+| **Qwen3-4B** dense bf16 (distributional) | W0-W2 measured | near-tie noise absorbed by the ratified `greedy_dist` near-tie-robust gate. |
+| **27B op-goldens** (embed/norm/gdn/fullattn — REAL bf16 GDN/attn/rmsnorm kernels on the new stack) | part of the 27B re-capture | BIT-IDENTICAL (0.0) ⇒ the shared bf16 kernels do not drift. |
+| **~30 model-matrix `*_greedy` rows** (llama/opt/phi/mistral/internlm/minicpm/yi/olmo2/deepseek-v2/glm4-moe-lite/…) | already RATIFIED near-tie-robust gates (`greedy_dist.npy`, `kNearTieMnats=500`) | no re-capture: the distributional gates absorb near-tie drift by construction; validated against OUR unchanged engine by the re-gate ctest. |
+| **op-level goldens** (rmsnorm/rope/silu/moe/causal_conv1d/gdn/l2norm/matmul) | `forward_native` reference math; f32 = dtype-stable/inert, bf16 shown stable via the 27B op-goldens | no re-capture; validated by the op-parity ctests. |
+
+**No committed golden drifts under apples-to-apples capture.** The W0-W2 §6(d) "27B DRIFTS"
+row is superseded: it measured a near-tie config artifact, not oracle drift.
+
+### W4 — mechanical re-sync = **NONE required.**
+No gate exhibits a real numeric change (the entire 27B forward + 32B/35B/Coder goldens are
+bit/near-tie-stable on the new stack), so no §2D kernel/op is load-bearing for a drifted gate.
+Per the sync cycle those §2D files (qwen3_next rmsnorm-fusion #46998, layernorm #48741,
+fused_moe #44120, mamba_mixer2 #48018, sampler #46662, qwen3_dflash, new olmo3.py) remain a
+routine mechanical re-port to land at the W5 pin-flip, but NONE is required to keep a SACRED
+gate green against the new oracle. Porting a kernel to force our engine onto the emulation-271
+branch would REGRESS the `got == want_prod` / `got != want_emu` production gate — explicitly
+NOT done.
+
+### Re-gate — OUR engine (unchanged, `36381c1b`) vs the validated goldens on GB10
+Built ONCE from the worktree HEAD (git-archive → `~/work/vllm.cpp-pinw3w4`):
+`cmake -DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DVLLM_CPP_TRITON=ON -DCMAKE_BUILD_TYPE=Release` (FA2 sm_121a ENABLED, Triton AOT vendored
+manifest OK). Full serial `ctest` under `flock $HOME/gpu.lock` (299 tests, 1966 s):
+**296 Passed / 3 Failed (99%)**. **Every SACRED gate PASSED and RAN** (checkpoints present):
+`test_op_parity` (27B W4A4 STRICT logits — 16/16 greedy + per-position prefill argmax — + 35B
+`RunQwen36Logits` + all op goldens, 187 s), `test_qwen36_paged_engine` (35B STRICT greedy +
+batched-graph, 77 s), `test_qwen27_paged_engine` (27B W4A4 STRICT `got==want_prod` [198]
+`&& got!=want_emu` [271], 31 s), `test_qwen3_32b_nvfp4a16_paged_engine` (28 s),
+`test_qwen3coder_paged_engine` (105 s), 27B/35B `spec_decode` + concurrent, and the
+`deepseek_v2`/`glm4_moe_lite`/`yi`/`commandr`/`phi`/`minicpm3` paged engines. **The 3 failures
+are PRE-EXISTING on unchanged main (`36381c1b`) and UNRELATED to the pin/oracle/goldens** (our
+code + goldens are byte-identical to main): `test_model_registry` (hardcoded `registrations
+== 13` vs the grown registry's 24), `test_model_loader_gguf` (stale 6-arch reject string +
+tokenizer fixture), `test_capi` (toy random-weight model garbled-first-byte greedy-determinism
+flake under async scheduling). -Werror clean (0 `warning:` lines across both build logs).
+
+**Bottom line.** The pin advance is materially CHEAPER than the W0-W2 worst case: **zero real
+golden drift, zero kernel re-sync.** W5 (pin flip + §2D mechanical re-ports + OLMo-3 fetch/gate)
+remains the deliberate next step. Evidence on dgx `~/work/pin-drift/`: `rca_27b.log`
+(near-tie gap), `dump27_new.log`+`gold27_new/` (27B bit-identical), `dump32_new.log`+`gold32_new/`
+(32B bit-identical), `build.log`, `regate.log`.
