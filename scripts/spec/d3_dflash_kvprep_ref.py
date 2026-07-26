@@ -115,6 +115,14 @@ def _dump_worker(worker, out_dir, block, mask_id, anchor_id, ctx_len, kv_block_s
     dt = next(draft.parameters()).dtype
 
     cfg = draft.config
+    inner = getattr(cfg, "model", cfg)  # EAGLEConfig wraps the real config in .model
+
+    def gv(name, default=None):
+        for c in (cfg, inner):
+            if c is not None and hasattr(c, name):
+                return getattr(c, name)
+        return default
+
     H = cfg.hidden_size
     Dh = cfg.head_dim
     Hq = cfg.num_attention_heads
@@ -124,10 +132,115 @@ def _dump_worker(worker, out_dir, block, mask_id, anchor_id, ctx_len, kv_block_s
     scale = Dh ** -0.5
     causal = draft.get_draft_attn_causal()
     T = block
+    rope_theta = gv("rope_theta")
+    if rope_theta is None:
+        rope_theta = float(getattr(model.layers[0].self_attn.rotary_emb, "base", 1e7))
+    layer_types = list(gv("layer_types", []))
+    sliding_window = gv("sliding_window", None)
 
-    # ---- prepare_ref (numpy replica, integer) ----
+    # ---- config.json (self-contained fixture for the C++ parity test) ----
+    with open(os.path.join(out_dir, "config.json"), "w") as f:
+        json.dump({
+            "hidden_size": H, "head_dim": Dh, "num_attention_heads": Hq,
+            "num_key_value_heads": Hkv, "num_hidden_layers": nlayers,
+            "intermediate_size": cfg.intermediate_size, "vocab_size": cfg.vocab_size,
+            "draft_vocab_size": getattr(cfg, "draft_vocab_size", cfg.vocab_size),
+            "rms_norm_eps": eps, "rope_theta": rope_theta, "num_taps": len(
+                cfg.dflash_config["target_layer_ids"]),
+            "mask_token_id": mask_id, "block_size": block, "anchor_token_id": anchor_id,
+            "layer_types": layer_types,
+            "target_layer_ids": list(cfg.dflash_config["target_layer_ids"]),
+            "sliding_window": sliding_window,
+            "ctx_len": ctx_len, "kv_block_size": kv_block_size,
+        }, f, indent=2)
+
+    # ---- prepare_ref: launch the REAL Triton _prepare_dflash_inputs_kernel on GPU
+    # (single-request contiguous prefill, no rejection) and read its outputs back,
+    # then cross-check them against the line-for-line numpy replica. The fixture we
+    # commit is vLLM's ACTUAL kernel output (not just the replica); the assert proves
+    # the replica == the kernel so the C++ host port is gated bit-exact vs both. ----
+    import triton
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+        _prepare_dflash_inputs_kernel, PAD_SLOT_ID)
+
+    npref = prepare_numpy_ref(ctx_len, block, mask_id, anchor_id, kv_block_size)
+    nqpr = block
+    nspec = block - 1
+    max_num_reqs = 1
+    max_num_tokens = nqpr  # single request, no CG padding beyond the active block
+    max_model_len = 2048
+    num_blocks_bt = (ctx_len + nqpr + kv_block_size - 1) // kv_block_size
+    dl = dev
+
+    t_target_positions = torch.arange(ctx_len, dtype=torch.int64, device=dl)
+    t_tqsl = torch.tensor([0, ctx_len], dtype=torch.int32, device=dl)
+    t_idx_mapping = torch.tensor([0], dtype=torch.int32, device=dl)
+    t_last_sampled = torch.tensor([anchor_id], dtype=torch.int32, device=dl)
+    t_next_prefill = torch.tensor([0], dtype=torch.int32, device=dl)
+    t_num_sampled = torch.tensor([1], dtype=torch.int32, device=dl)
+    t_num_rejected = torch.tensor([0], dtype=torch.int32, device=dl)
+    t_block_table = torch.tensor(
+        [list(range(100, 100 + num_blocks_bt))], dtype=torch.int32, device=dl)
+
+    o_input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=dl)
+    o_query_positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=dl)
+    o_query_start_loc = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=dl)
+    o_seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=dl)
+    o_query_slot = torch.zeros(max_num_tokens, dtype=torch.int64, device=dl)
+    o_ctx_positions = torch.zeros(ctx_len, dtype=torch.int64, device=dl)
+    o_ctx_slot = torch.zeros(ctx_len, dtype=torch.int64, device=dl)
+    o_sample_indices = torch.zeros(max_num_reqs * nspec, dtype=torch.int64, device=dl)
+    o_sample_pos = torch.zeros(max_num_reqs * nspec, dtype=torch.int64, device=dl)
+    o_sample_idx_map = torch.zeros(max_num_reqs * nspec, dtype=torch.int32, device=dl)
+
+    max_tokens_per_req = ctx_len + nqpr
+    BS = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
+    n_blk = triton.cdiv(max_tokens_per_req, BS)
+    _prepare_dflash_inputs_kernel[(1, n_blk)](
+        o_input_ids, o_query_positions, o_query_start_loc, o_seq_lens, o_query_slot,
+        o_ctx_positions, o_ctx_slot, o_sample_indices, o_sample_pos, o_sample_idx_map,
+        t_target_positions, t_tqsl, t_idx_mapping, t_last_sampled, t_next_prefill,
+        t_num_sampled, t_num_rejected, t_block_table, t_block_table.stride(0),
+        mask_id, kv_block_size, nqpr, nspec, max_num_reqs, max_num_tokens, max_model_len,
+        SAMPLE_FROM_ANCHOR=False, PAD_SLOT_ID=PAD_SLOT_ID, BLOCK_SIZE=BS)
+    torch.cuda.synchronize()
+
+    kern = {
+        "input_ids": o_input_ids.cpu().tolist(),
+        "query_positions": o_query_positions.cpu().tolist(),
+        "query_start_loc": o_query_start_loc.cpu().tolist(),
+        "seq_lens": o_seq_lens.cpu().tolist(),
+        "query_slot_mapping": o_query_slot.cpu().tolist(),
+        "context_positions": o_ctx_positions.cpu().tolist(),
+        "context_slot_mapping": o_ctx_slot.cpu().tolist(),
+        "sample_indices": o_sample_indices.cpu().tolist(),
+        "sample_pos": o_sample_pos.cpu().tolist(),
+        "sample_idx_mapping": o_sample_idx_map.cpu().tolist(),
+    }
+    # Cross-check: numpy replica == real Triton kernel (active region).
+    kernel_matches_numpy = (
+        kern["input_ids"] == npref["input_ids"]
+        and kern["query_positions"] == npref["query_positions"]
+        and kern["query_slot_mapping"] == npref["query_slot_mapping"]
+        and kern["context_positions"] == npref["context_positions"]
+        and kern["context_slot_mapping"] == npref["context_slot_mapping"]
+        and kern["seq_lens"][0] == npref["seq_lens"][0]
+        and kern["sample_indices"][:nspec] == npref["sample_indices"]
+        and kern["sample_pos"][:nspec] == npref["sample_pos"]
+        and kern["sample_idx_mapping"][:nspec] == npref["sample_idx_mapping"])
+    assert kernel_matches_numpy, (
+        "numpy replica DIVERGES from the real Triton kernel:\n"
+        f"kernel={kern}\nnumpy={npref}")
+    out_prepare = dict(npref)
+    out_prepare["kernel"] = kern
+    out_prepare["kernel_matches_numpy"] = kernel_matches_numpy
+    out_prepare["max_num_reqs"] = max_num_reqs
+    out_prepare["max_num_tokens"] = max_num_tokens
+    out_prepare["max_model_len"] = max_model_len
+    out_prepare["mask_token_id"] = mask_id
+    out_prepare["anchor_token_id"] = anchor_id
     with open(os.path.join(out_dir, "prepare_ref.json"), "w") as f:
-        json.dump(prepare_numpy_ref(ctx_len, block, mask_id, anchor_id, kv_block_size), f)
+        json.dump(out_prepare, f)
 
     # ---- ctxkv_ref: precompute context K/V from a fixed synthetic context via the
     # REAL loaded precompute buffers (qwen3_dflash.py:440-619). ----

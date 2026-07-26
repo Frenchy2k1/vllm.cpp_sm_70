@@ -801,6 +801,16 @@ target_compile_definitions(test_qwen3_dflash_draft_parity PRIVATE
 target_include_directories(test_qwen3_dflash_draft_parity PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# SPEC-DFLASH D3 (DF-DRAFT-KV-PREP) — the decisive GPU numeric-parity gate vs the
+# REAL loaded vLLM draft: prepare_dflash_inputs INTEGER bit-exact (vs vLLM's actual
+# Triton kernel), context-KV precompute per-layer rel-L2 within envelope, block
+# proposal STRICT-or-near-tie. GPU + z-lab-draft + NVFP4-target + fixture gated.
+vllm_cpp_add_test(test_qwen3_dflash_kvprep_parity parity/test_qwen3_dflash_kvprep_parity.cpp)
+target_compile_definitions(test_qwen3_dflash_kvprep_parity PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen3_dflash_kvprep_parity PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # SPEC-MTP I5d — the 27B k=1 MTP speculative-decode three-way identity gate
 # (our spec-ON == our spec-OFF == vLLM greedy) + measured nonzero acceptance.
 vllm_cpp_add_test(test_qwen27_spec_decode parity/test_qwen27_spec_decode.cpp)

@@ -24711,3 +24711,30 @@ reported to caller.
   passages), `docs/BENCHMARKS.md`, ledger, coordination `CLAIM-DFLASH-D3`, this
   entry. D3 → CPU-GATED; D4 (engine loop) + D5 (SACRED) + D6 (CUDA graph) remain.
   `benchmark_binding=false`. NOT pushed; FULL SHA reported to caller.
+
+- **2026-07-26** — **DFlash D3 GPU PROMOTION GREEN on dgx (`CLAIM-DFLASH-D3`, branch
+  `spec-dflash-d3` off `origin/main` `9b4e02a4`, pin `555967922`/vLLM 0.26.0.dev0, GB10
+  sm_121a).** Promotes the CPU-gated D3 code (`e292258f`) by proving the pending GPU
+  numeric parity + inertness and landing the parity harness. CUDA `-Werror` build clean
+  (**0 warnings**; D3 added no kernel — overlay-rebuilt the reuse tree
+  `~/work/dflash-d0d1/tree`, all CPU+GPU test binaries link). DECISIVE gate
+  `test_qwen3_dflash_kvprep_parity` **61/61** vs the REAL loaded vLLM draft (via
+  `collective_rpc` → `model_runner.speculator.model`, mm-limited `{image:0,video:0}` +
+  gpu_util 0.30, `VLLM_USE_V2_MODEL_RUNNER=1` + `VLLM_ALLOW_INSECURE_SERIALIZATION=1`):
+  (1) `prepare_dflash_inputs` INTEGER **BIT-EXACT** vs vLLM's ACTUAL Triton
+  `_prepare_dflash_inputs_kernel` — the enhanced ref launches that kernel directly on GPU
+  (JIT-compiled at run = proof it ran) and cross-checks the numpy replica
+  (`kernel_matches_numpy=true`); (2) context-KV worst K rel-L2 **0.31%** / worst V rel-L2
+  **0.26%** across all 5 draft layers (also proves our per-layer `qkv_proj` K/V slicing
+  reproduces vLLM's FUSED `_fused_kv_weight` projection — no ordering bug); (3) block
+  proposal worst layer-hidden 1.44% / final 1.02%, **13 STRICT + 3 near-tie = 16/16**
+  proposed ids. RED-first holds: CPU `test_dflash_kvprep` **114/114** re-passed on the dgx
+  build. Inertness GREEN + PROVEN it ran: 27B SACRED `test_qwen27_paged_engine` **235/235**
+  + 27B MTP `test_qwen27_spec_decode` **9/9** (16/16 accepted) + D2 draft-parity
+  `test_qwen3_dflash_draft_parity` **37/37** byte-identical. Landed the finalized ref
+  (`scripts/spec/d3_dflash_kvprep_ref.py`) + committed fixtures
+  `tests/parity/goldens/dflash_27b_kvprep/{config,prepare_ref,ctxkv_ref,propose_ref}.json`
+  + the parity test wired in `tests/CMakeLists.txt`. Records advanced: spec §0 D3 RESULT +
+  §6 D3 row, model-matrix DFlash rows, README (both DFlash passages), `docs/BENCHMARKS.md`,
+  ledger, this entry. **D3 DONE**; D4 (engine loop) + D5 (SACRED) + D6 (throughput/CUDA
+  graph) remain. `benchmark_binding=false`. NOT pushed; FULL SHA reported to caller.
