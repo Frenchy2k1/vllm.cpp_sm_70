@@ -24981,3 +24981,57 @@ alive, acceptance matches vLLM, majority strict). NOT a clean strict-4/4 pass. R
 `ACTIVE`. **Remaining = D6:** STRICT 4/4 token-identity (a persistent paged draft-KV that
 bit-matches vLLM's fused context-KV projections, removing the ~1% inline-recompute
 envelope) + the uniform-1+k FULL CG + the c1 speed A/B.
+
+## 2026-07-27 — SPEC-DFLASH D6 (`CLAIM-DFLASH-D6`): c1 speed A/B DONE + STRICT proven bf16-irreducible + CG feasibility
+
+DFlash D6 pursued the three finish-line items. Base `origin/main` `361189a7`, isolated
+worktree `/home/mudler/_git/wt-dflash-d6` (records only). dgx measurement reused the D5 build
+tree `~/dflash-d5/vllm.cpp/build-cuda` (rebuilt ONLY the `vllm-bench` target) + oracle
+`~/venvs/vllm-oracle` (vLLM 0.26.0.dev0), all GPU work under one `flock $HOME/gpu.lock`. NOT
+pushed; FULL SHA reported to caller. **D6 landed NO source/correctness code** — the gated binary
+is the D5 binary `361189a7`.
+
+**Part 1 — persistent paged draft-KV → STRICT: RCA verdict = bf16-IRREDUCIBLE.** The D5
+residual (2/4 near-tie flips) is NOT a reachable-fixable wiring/fusion gap: (a) the draft KV
+cache is **bf16, not fp8** — `kv_cache_dtype='auto'`→`model_config.dtype`=bf16 for target AND
+draft (vLLM `vllm/utils/torch_utils.py:398`; live 27B DFlash engine config dump confirms
+`kv_cache_dtype=auto`), so there is NO fp8 storage step our bf16 path skips; (b) the D3 golden
+already compares vLLM's **pre-storage bf16** K/V (`d3_dflash_kvprep_ref.py:265`), residual K
+0.31% / V 0.26% = sub-ULP bf16 kernel noise (fc combine 0.46% + hidden_norm + KV GEMM + k_norm
++ RoPE); (c) a fused multi-layer KV GEMM (vLLM's `_fused_kv_weight`) is **per-element invariant**
+to our per-layer GEMMs (concatenating weights along the output dim changes no dot product), so it
+cannot reach bit-exact — that needs vLLM's exact CUDA kernels. **VERDICT: strict-4/4 is genuinely
+bf16-irreducible; the ratified near-tie gate (D5: 2/4 STRICT + 2/4 single near-tie flips,
+acceptance matched to vLLM on all 4) is the honest FINAL correctness form.** No fused-KV code
+landed (it cannot reach strict; not touching correctness code keeps inertness exact).
+
+**Part 2 — FULL CUDA graph: BLOCKED on a device-resident draft-path rewrite (NOT delivered).**
+The D5 draft path is host-bound: 13 device→host `Download`s per step (3×`PrecomputeContextKV`×5
+layers + 10 in `ForwardBlockLogitsWithContext`) + host-side `std::vector` `[context;block]`
+interleaving + host per-request context accumulation. A CUDA graph needs a fixed device kernel
+sequence with no host round-trips; the path cannot be captured as written. A full graph requires
+FIRST converting the draft path device-resident (on-device paged context-KV store = the PERF form
+of "persistent paged draft-KV" + a device paged/block attention + device sampling) — a
+multi-file increment, the remaining throughput-parity closeout, not safely
+implementable+validatable this session on the disk-constrained box.
+
+**Part 3 — the c1 SPEED A/B (the user's explicit "on par of them and above" bar): DONE.**
+`examples/vllm-bench` at `361189a7`, 27B NVFP4 single-file bf16 target `890bdef7` + z-lab 27B
+DFlash draft, 8 real prose+code prompts × 256 tokens, greedy, c1, `flock`, 2 reps (rep-stable
+<1.5%): **our DFlash-ON = 2.50x TPOT (40.4 vs 101.2 ms) / 2.48x output-tput (24.4 vs 9.86 tok/s)
+over our OFF**, acceptance 0.22 (1621/7280 = 3.56/16 per block). The host-orchestration overhead
+does NOT kill the speedup; block-drafting dominates. `benchmark_binding=true`. vs **vLLM-DFlash-ON
+graphed** (production `enforce_eager=False`, `VLLM_USE_V2_MODEL_RUNNER=1`, mm-off + gpu_util 0.30,
+same workload, via `scripts/spec/vllm_dflash_timing.py`): vLLM-DFlash-ON graphed = 28.5 tok/s / 35.1 ms TPOT / acceptance_len 4.30 (same 8 prompts, `VLLM_USE_V2_MODEL_RUNNER=1`, mm-off, gpu_util 0.30), so OURS IS ~14% BELOW vLLM-DFlash-ON on output throughput (24.4 vs 28.5 tok/s) - both ~on-par at spec-OFF (9.86 vs 9.83 tok/s), but vLLM extracts a larger DFlash speedup (2.90x vs our 2.47x) because its draft step is fully device-resident + CUDA-graphed (ours host-orchestrates 13 downloads/step) + slightly higher acceptance (~4.3 vs ~3.6 draft tokens/step). The DONE speed bar (ours >= vLLM) is NOT met; closing it = the device-resident draft rewrite + FULL CG (D6 part 2). On-box note: the
+graphed vLLM path needs `ninja` on PATH (inductor); add `$HOME/venvs/vllm-oracle/bin` to PATH in
+the flock subshell (the abs-path python call does not).
+
+**Inertness: preserved BY CONSTRUCTION** (no code change) — the D5 binary's 27B text SACRED
+`test_qwen27_paged_engine` 235/235 + 27B MTP `test_qwen27_spec_decode` 9/9 stand byte-identical.
+No new CUDA ⇒ `-Werror`/compute-sanitizer N/A.
+
+**Disposition: SPEC-DFLASH stays `ACTIVE`** — correctness at the ratified near-tie envelope (FINAL
+honest form) + the c1 speculative speedup MEASURED (2.48x). The device-resident draft-path rewrite
+(persistent paged draft-KV in its perf form + the FULL CG) is the remaining throughput-parity
+increment. Raw logs on dgx `/tmp/dflash_ab.log`, `/tmp/vllm_arm2.log`; scripts `/tmp/dflash_ab.sh`,
+`/tmp/vllm_arm.sh`.

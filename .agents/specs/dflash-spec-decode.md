@@ -274,6 +274,91 @@ nonzero acceptance ≈ vLLM's (2.2/8.8/4.75/4.57); (3) spec-OFF + MTP byte-ident
 SACRED 235/235 + 27B MTP 9/9). This is the DFlash correctness finish line; the
 acceptance-rate condition MUST accompany token-identity (the dead-drafter trap).
 
+### D6 RESULT (2026-07-27, `CLAIM-DFLASH-D6`) — **SPEED A/B MEASURED (our DFlash-ON = 2.5x our OFF at c1, but ~14% BELOW vLLM-DFlash-ON - the honest residual); STRICT-4/4 proven bf16-IRREDUCIBLE (ratified near-tie gate is the honest FINAL correctness form); the FULL CUDA graph + persistent-paged-KV are BLOCKED on a device-resident draft-path rewrite (NOT delivered). SPEC-DFLASH stays ACTIVE.**
+
+D6 pursued the three finish-line items. Two resolved to honest conclusions grounded in
+source + measurement; one (the CG) is a scoped-but-undelivered perf increment.
+
+**Part 1 — persistent paged draft-KV → STRICT: RCA verdict = bf16-IRREDUCIBLE (no code
+change reaches strict; ratified near-tie gate is FINAL).** The D5 residual (2/4 near-tie
+flips) was hypothesized to come from our inline per-layer context-KV recompute differing
+from vLLM's fused+persistent-paged draft KV. D6 RCA disproves any reachable strict fix:
+- **The draft KV cache is bf16, not fp8.** `kv_cache_dtype='auto'` resolves to
+  `model_config.dtype` = bf16 for BOTH target and draft (vLLM `vllm/utils/torch_utils.py:398`
+  `kv_cache_dtype_str_to_dtype`; the live 27B DFlash engine config dump confirms
+  `kv_cache_dtype=auto`). So there is NO fp8-storage step our bf16 path skips — vLLM's
+  actual attention reads bf16 context KV, exactly what the D3 golden already compared against.
+- **The D3 golden is vLLM's PRE-STORAGE bf16 K/V** (`scripts/spec/d3_dflash_kvprep_ref.py:265`
+  `all_k_flat.view(...).float()`), and the measured residual was K 0.31% / V 0.26% rel-L2.
+  That residual is pure bf16 kernel noise in the drafter chain (fc combine 0.46% [D2] +
+  hidden_norm RMSNorm + KV GEMM + k_norm + RoPE), compounding sub-ULP differences between
+  OUR vt kernels and vLLM's `ops.*` kernels — the SAME kernels that are token-exact on the
+  SACRED target but not bit-identical at every near-tie.
+- **A fused multi-layer KV GEMM (vLLM's `_fused_kv_weight`) is per-element INVARIANT to our
+  per-layer GEMMs.** Concatenating K/V weights along the OUTPUT dim changes no output
+  element: `out[c,j] = Σ_h normed[c,h]·W[j,h]` is an independent dot product over the same
+  contraction range (hidden_size) whether the GEMM is wide or narrow. The only thing fusion
+  can change is which cuBLAS algorithm is selected — a different, equally-valid bf16 rounding,
+  not a "more-correct" quantity, and not one that matches vLLM's `F.linear` bit-for-bit.
+- **Therefore literal bit-exact requires invoking vLLM's exact CUDA kernels — unreachable
+  from our independent kernels.** The `DFlashBlockAttention` (from-scratch f32-online-softmax)
+  vs vLLM's flashinfer paged attention adds a second, larger irreducible near-tie source.
+  **VERDICT: strict-4/4 is genuinely bf16-irreducible. The ratified near-tie gate (D5: 2/4
+  STRICT + 2/4 single near-tie flips, acceptance matched to vLLM on all 4) is the honest FINAL
+  correctness form**, exactly as the D0 gate-form + §0 pre-ratified. **No fused-KV code was
+  landed** (it cannot reach strict, and not touching correctness code keeps inertness exact).
+
+**Part 2 — FULL CUDA graph for the uniform (1+k) draft step: BLOCKED on a device-resident
+draft-path rewrite (NOT delivered).** The D5 draft path is pervasively HOST-bound: 13
+device→host `Download`s per step (3 in `PrecomputeContextKV`×5 layers + 10 in
+`ForwardBlockLogitsWithContext`) plus host-side `std::vector` `[context;block]` interleaving,
+plus fully host-side per-request context accumulation (`propose_drafts_dflash`). A CUDA graph
+requires a fixed device kernel sequence with NO host round-trips; the current path cannot be
+captured as written. A full graph requires FIRST converting the draft path to device-resident
+(an on-device PAGED context-KV store = the "persistent paged draft-KV" in its PERF form, a
+device paged/block attention reading that store, device sampling) — a substantial multi-file
+increment. D5 chose the host-orchestrated inline path as the fastest route to a CORRECT e2e;
+that host round-tripping is the perf debt the CG + persistent-paged-KV pay down. Not safely
+implementable+validatable in this session on the disk-constrained box; scoped as the next
+increment. (This is the honest attribution for any throughput gap vs vLLM's graphed draft.)
+
+**Part 3 — THE SPEED A/B (the user's explicit "on par of them and above" bar): MEASURED — a
+2.5x c1 speculative speedup vs our OFF, but the on-par-or-above-vLLM bar is NOT met (we are
+~14% below vLLM-DFlash-ON, part (b) — the honest residual).** `examples/vllm-bench` at `361189a7` (the D5
+binary, rebuilt `vllm-bench` target only), 27B NVFP4 single-file bf16 target `890bdef7` + the
+z-lab 27B DFlash draft, 8 real prose+code prompts × 256 output tokens, greedy (temp 0), c1,
+idle box under one `flock $HOME/gpu.lock`, one engine at a time, 2 reps (rep-stable <1.5%):
+
+| axis (c1, median) | ours DFlash-OFF | ours DFlash-ON | ON/OFF |
+|---|---|---|---|
+| Median TPOT (ms) | 101.2 | 40.4 | **2.50x faster** |
+| Output throughput (tok/s) | 9.86 | 24.4 | **2.48x** |
+| Benchmark duration (s) | 208 | 84 | 2.47x |
+| draft acceptance (accepted/proposed) | — | 0.22 (1621/7280 = 3.56/16 per block) | — |
+
+**(a) Our DFlash-ON is a 2.5x c1 speculative speedup over our OFF** — the host-orchestration
+overhead does NOT kill it; the block-drafting algorithmic win (≈3.56 accepted tokens per target
+forward) dominates. Reproducible: TPOT 40.66/40.12 ms, tput 24.29/24.54 tok/s, acceptance
+identical (greedy-deterministic) across both reps.
+**(b) vs vLLM-DFlash-ON (graphed production, `VLLM_USE_V2_MODEL_RUNNER=1`, mm-off, gpu_util
+0.30, same 8 prompts × 256 tok): vLLM-DFlash-ON graphed = 28.5 tok/s / 35.1 ms TPOT / acceptance_len 4.30 (same 8 prompts, `VLLM_USE_V2_MODEL_RUNNER=1`, mm-off, gpu_util 0.30), so OURS IS ~14% BELOW vLLM-DFlash-ON on output throughput (24.4 vs 28.5 tok/s) - both ~on-par at spec-OFF (9.86 vs 9.83 tok/s), but vLLM extracts a larger DFlash speedup (2.90x vs our 2.47x) because its draft step is fully device-resident + CUDA-graphed (ours host-orchestrates 13 downloads/step) + slightly higher acceptance (~4.3 vs ~3.6 draft tokens/step). The DONE speed bar (ours >= vLLM) is NOT met; closing it = the device-resident draft rewrite + FULL CG (D6 part 2).** Cross-check harness
+`scripts/spec/vllm_dflash_timing.py` (mirrors the proven D0 oracle config).
+
+**Inertness: preserved BY CONSTRUCTION — D6 landed NO source/correctness code** (part 1 is
+irreducible ⇒ no code; part 2 not delivered). The gated binary IS the D5 binary `361189a7`,
+whose 27B text SACRED `test_qwen27_paged_engine` **235/235** + 27B MTP `test_qwen27_spec_decode`
+**9/9** already pass byte-identical (D5 RESULT). No new CUDA ⇒ `-Werror`/compute-sanitizer N/A.
+
+**DONE-bar disposition (HONEST — the DONE bar is NOT fully met):** correctness = ratified
+near-tie envelope (FINAL honest form, strict bf16-irreducible); speed = a strong c1 spec-speedup
+vs our OFF (2.48x, `benchmark_binding=true`) BUT ~14% BELOW vLLM-DFlash-ON (part (b)), so the
+user's "on par of them and above" bar is NOT met. Attribution: vLLM's draft step is fully
+device-resident + CUDA-graphed while ours host-orchestrates (13 device→host downloads/step), and
+vLLM's acceptance is slightly higher (~4.3 vs ~3.6 tokens/step). The FULL CG + persistent-paged-KV
+(the device-resident draft-path rewrite) is exactly the increment that closes this gap.
+**SPEC-DFLASH stays `ACTIVE`** (correctness-final + c1-speedup-measured; the throughput-parity
+closeout = the device-resident draft rewrite + CG remains).
+
 ### D5 RESULT (2026-07-26, `CLAIM-DFLASH-D5`) — **DF-ENGINE-INTEGRATION runner loop LANDED; e2e RUNS on dgx with vLLM-matching acceptance; correctness at the ratified bf16 near-tie envelope (2/4 STRICT + 2/4 single near-tie flips). NOT a clean strict-4/4 pass — strict 4/4 + speed = D6.**
 
 The full runner verify/propose loop is wired and the DFlash e2e RUNS end-to-end on dgx

@@ -184,6 +184,38 @@ recompute envelope) plus the uniform-1+k FULL CG. Repro: run
 `./build-cuda/tests/test_qwen27_dflash_spec_decode` under `flock` with the bf16-lm_head 27B snapshot
 (single-file `model.safetensors`) + the z-lab draft in the HF cache.
 
+**DFlash D6 - c1 SPEED A/B: our DFlash-ON is a 2.5x speculative speedup over our OFF, but ~14% below
+vLLM-DFlash-ON (honest residual) (2026-07-27, `CLAIM-DFLASH-D6`, dgx GB10 sm_121a, oracle vLLM
+0.26.0.dev0).** `benchmark_binding=true` (the first DFlash throughput number). Workload: 27B
+NVFP4 single-file bf16 target (`890bdef7`) + z-lab 27B DFlash draft, 8 real prose+code prompts x
+256 output tokens, greedy (temp 0), concurrency 1, idle box under one `flock $HOME/gpu.lock`, one
+engine at a time, 2 reps (rep-stable <1.5%). **Ours** = `examples/vllm-bench` at `361189a7` (D5
+binary; only the `vllm-bench` target rebuilt) with/without
+`--speculative-config '{"method":"dflash","model":<z-lab draft>,"num_speculative_tokens":16}'`.
+
+| axis (c1, median) | ours DFlash-OFF | ours DFlash-ON | ON/OFF |
+|---|---|---|---|
+| Median TPOT (ms) | 101.2 | 40.4 | **2.50x faster** |
+| Output throughput (tok/s) | 9.86 | 24.4 | **2.48x** |
+| Benchmark duration (s) | 208 | 84 | 2.47x |
+| draft acceptance | - | 0.22 (1621/7280 = 3.56/16 accepted per block) | - |
+
+DFlash-ON HELPS decisively at c1 (the block-diffusion algorithmic win - ~3.56 accepted tokens per
+target forward - dominates the host-orchestration overhead of the current inline draft path).
+Reproducible: TPOT 40.66/40.12 ms, tput 24.29/24.54 tok/s, acceptance identical across reps
+(greedy-deterministic). **vs vLLM-DFlash-ON** (graphed production, `VLLM_USE_V2_MODEL_RUNNER=1`,
+mm-off + gpu_util 0.30, same 8 prompts x 256 tok, via `scripts/spec/vllm_dflash_timing.py`):
+vLLM-DFlash-ON graphed = 28.5 tok/s / 35.1 ms TPOT / acceptance_len 4.30 (same 8 prompts, `VLLM_USE_V2_MODEL_RUNNER=1`, mm-off, gpu_util 0.30), so OURS IS ~14% BELOW vLLM-DFlash-ON on output throughput (24.4 vs 28.5 tok/s) - both ~on-par at spec-OFF (9.86 vs 9.83 tok/s), but vLLM extracts a larger DFlash speedup (2.90x vs our 2.47x) because its draft step is fully device-resident + CUDA-graphed (ours host-orchestrates 13 downloads/step) + slightly higher acceptance (~4.3 vs ~3.6 draft tokens/step). The DONE speed bar (ours >= vLLM) is NOT met; closing it = the device-resident draft rewrite + FULL CG (D6 part 2). Repro: `bash /tmp/dflash_ab.sh` (ours) + `bash /tmp/vllm_arm.sh` (vLLM) on
+dgx under `flock`. Raw logs on dgx `/tmp/dflash_ab.log`, `/tmp/vllm_arm.log`.
+
+**Honest scope (D6):** the c1 A/B is the speed deliverable; STRICT-4/4 token-identity is proven
+bf16-IRREDUCIBLE (draft KV cache is bf16 not fp8, the D3 golden already compares pre-storage bf16,
+and a fused KV GEMM is per-element invariant to our per-layer GEMMs - bit-exact needs vLLM's exact
+kernels), so the ratified near-tie gate is the FINAL correctness form. The FULL CUDA graph +
+persistent-paged-KV are BLOCKED on a device-resident draft-path rewrite (the current path does 13
+device->host downloads per step + host interleaving) and are the remaining throughput-parity
+increment. Full RCA: spec `.agents/specs/dflash-spec-decode.md` D6 RESULT.
+
 **Pin-advance target SELECTED (SCOPE only, no measurement) - PENDING execution
 (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, `.agents/specs/pin-advance.md`).** The
 single coherent target that unblocks DFlash + Gemma-4 multimodal + OLMo-3 is vLLM
