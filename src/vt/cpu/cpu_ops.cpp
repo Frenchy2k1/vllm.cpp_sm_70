@@ -2199,6 +2199,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernel)));
     RegisterOp(OpId::kAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
+    // Dense-fast shares the CPU reference (the warp variant is a CUDA-only
+    // optimization); byte-identical to kAttention on CPU.
+    RegisterOp(OpId::kAttentionDenseFast, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
     RegisterOp(OpId::kCastBf16, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kCPU,

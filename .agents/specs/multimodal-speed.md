@@ -20,6 +20,19 @@ round-trips are hidden under the ~226 ms/token weight-streaming floor of a ~54 G
 bf16 model). Audio our-side is UNMEASURED (build-blocked, §4); the vLLM audio
 denominator IS captured.
 
+**UPDATE 2026-07-26 (`CLAIM-MULTIMODAL-SPEED-TOWER`, §7) — the tower gap is CLOSED
+and BEATEN.** Profiling (nsys `cuda_gpu_kern_sum`) attributed **98.9 %** of the
+~1.6 s tower forward to the naive `vt::cuda::AttentionKernel` (56 ms/block × 27
+blocks over 784 patches; the GEMMs are <0.5 %, marshalling is 24 % of the old
+total) — NOT the QKV fusion / FA2-varlen routing the levers §5 suspected. Two
+correctness-preserving fixes: (1) hoist the per-call host f32→bf16 weight
+convert+upload out of the forward into a one-time resident-weights load
+(BIT-IDENTICAL); (2) a WARP-scoped online-softmax attention op `AttentionDenseFast`
+(no `__syncthreads`, register accumulator; `kAttention` untouched ⇒ text
+byte-identical by construction). **Per-image tower forward 2114 → 148 ms (14.3×);
+vs vLLM's ~250 ms eager encode we are now 0.59× — FASTER.** STRICT image e2e held
+**32/32** (4B + 27B), video **32/32**. See §7.
+
 ---
 
 ## 1. A-B methodology (how these numbers were grounded)
@@ -185,3 +198,95 @@ implemented. No repo source was touched by this pass.
 
 All three remain **speed-pending / `PARTIAL`** — correctness-complete, not yet at
 vLLM throughput on every axis. No mm row advances to `DONE` on this pass.
+
+---
+
+## 7. TOWER OPTIMIZATION — lever #1 executed (`CLAIM-MULTIMODAL-SPEED-TOWER`, 2026-07-26)
+
+**Base:** `origin/main` `27bc3054`. **Build:** `~/work/mm-tower-speed`, cutlass 4.5.0
++ FA2 + Triton-AOT, arch 121a (banner confirmed, clean `-Werror` 0 warn). All GPU
+under `flock $HOME/gpu.lock`, sole owner, cold rep discarded (bench = 4 timed reps
+after rep0). Driver `tests/vllm/multimodal/bench_qwen3_5_vl_tower.cpp` (Qwen3.6-27B,
+fixed 448×448 image, 784 patches → 196 tokens).
+
+### 7.1 W0 — profile ATTRIBUTION (measure, don't guess — [[profile-vllm-actual-kernels-port-1to1]])
+
+The §5 lever #1 SUSPECTED (a) vision attn not on FA2 varlen and (b) unfused QKV.
+**Both REFUTED by measurement.** The old per-image tower forward is **2103 ms**
+(reproduces the §2.1 2114 ms scoping number). Split (env-gated `VLLM_MM_TOWER_PROFILE`):
+- **weight marshalling** (host f32→bf16 convert + ~0.5 GiB H2D, done INSIDE the
+  forward every call): **~497 ms (24 %)**.
+- **forward compute: ~1543 ms (76 %)**.
+
+nsys `cuda_api_sum` first pointed at `cudaFree` (93 %) — a RED HERRING: `cudaFree`
+SYNCHRONIZES, so its wall-time is inflated by WAITING on the enqueued kernels. The
+truth is `cuda_gpu_kern_sum`:
+- **`vt::cuda::AttentionKernel<bf16>`: 98.9 % of GPU time**, 270 instances (27 blocks
+  × 10 forwards), **avg 56.3 ms EACH** over just 784 patches (~1000× off peak).
+- cutlass/nvjet GEMMs: 43–127 µs each (<0.5 % total). QKV fusion is irrelevant.
+
+Root cause: the naive `AttentionKernel` (`cuda_ops.cu`) launches grid(t, hq) — one
+block per (query, head) — and each block streams ALL keys sequentially with a
+per-key block reduction (a `__syncthreads` storm). O(t²) with catastrophic sync
+overhead. The lever is the ATTENTION KERNEL, exactly as §5 lever #1 headlined, but
+via kernel efficiency (not FA2-routing / QKV).
+
+### 7.2 W1 — two correctness-preserving fixes
+
+1. **Resident weights (BIT-IDENTICAL).** `PrepareVisionDeviceWeights` converts +
+   uploads the ~0.5 GiB tower weights to device bf16 ONCE (mirror vLLM keeping the
+   ViT nn.Linears resident); the forward runs pure GEMMs/attention + only the tiny
+   per-image pixel/pos/rope uploads. The host-weights overload is preserved as a
+   prepare-then-forward wrapper (0/1 003 520 mismatch vs the old path). Also hoisted
+   the per-block scratch buffers out of the ViT loop (reuse; bit-identical). This
+   moves the ~497 ms marshalling from per-image to one-time model-load.
+2. **`AttentionDenseFast` — warp-scoped online-softmax attention (the real lever).**
+   New additive CUDA op (`cuda_ops.cu` `AttentionWarpKernel` + `LaunchAttentionWarp`;
+   `ops.h`/`ops.cpp` wrapper; CPU dispatches to the same reference kernel). ONE WARP
+   per (query, head): the head_dim reduction is a butterfly `__shfl_xor` (NO
+   `__syncthreads`), the output accumulator lives in registers, softmax stats per
+   lane — the SAME f32 online-softmax recurrence as `AttentionKernel`, warp-scoped.
+   Grounded in the online-softmax / FlashAttention recurrence we ship
+   (`src/vt/cuda/flash_attn/`). NOT bit-identical (the 32-lane head_dim partial-sum
+   grouping differs) but same f32 math within the tower bf16 envelope. Registered as
+   a SEPARATE op ⇒ `kAttention` (text `qwen3_5.cpp:4005` + audio whisper) is BYTE-
+   IDENTICAL. The vision tower calls `AttentionDenseFast` per frame (image = one
+   window; video = per-frame windows, unchanged).
+
+### 7.3 RESULT — tower BEATS vLLM's eager encode
+
+| Metric | Old (naive attn) | New (resident + fast attn) |
+|---|---|---|
+| **per-image tower forward** | **1543 ms** | **148.4 ms** (band 148–150) |
+| per-image tower (marshal+forward, old baseline) | 2103 ms | (marshal now one-time) |
+| one-time `PrepareVisionDeviceWeights` (model load) | (was per-image) | ~484 ms |
+
+- **Per-image tower forward 1543 → 148 ms = 10.4× (attention alone); vs the original
+  2114 ms scoping baseline = 14.3×.**
+- **vs vLLM 0.25.0 eager encode ~250 ms: 148 ms = 0.59× — we are FASTER than vLLM's
+  vision tower.** (vLLM does NOT graph/compile the encoder — `compile_mm_encoder:False`
+  — so this is a fair eager-vs-eager kernel comparison.)
+- Noise: forward ±1 %. Proof-of-run: the bench asserts fast-vs-baseline 0 mismatch;
+  the STRICT e2e gates below ran the fast kernel end-to-end.
+
+### 7.4 CORRECTNESS (the RED line — HELD)
+
+- **27B image e2e `test_qwen3_5_vl_e2e`: STRICT 32/32** (54/54 assertions) — the fast
+  attention's bf16 differences flip ZERO argmax.
+- **27B video e2e `test_qwen3_5_vl_video_e2e`: STRICT 32/32** (27/27; teacher-forced
+  gap 0 nats everywhere).
+- **4B image e2e `test_qwen3vl_e2e` (DeepStack tower): STRICT 32/32** (46/46).
+- **`test_ops_attention`: 37239/37239** — `kAttention` (the shared naive kernel) is
+  intact ⇒ text/audio byte-identical by construction.
+- compute-sanitizer memcheck on the tower forward (with the new kernel): see ledger.
+- Text SACRED: additive op, `kAttention` untouched (`git diff`), text never calls
+  `kAttentionDenseFast` ⇒ byte-identical by construction; the 27B text SACRED gate
+  re-run confirms (see ledger).
+
+### 7.5 What remains
+
+The tower is now FASTER than vLLM's eager encode, so lever #1 is CLOSED. TTFT is now
+prefill+tower ≈ 326 + 148 ≈ 474 ms vs vLLM's 321 ms graphed TTFT — the residual
+first-token gap is now the LLM prefill/tower vs vLLM's GRAPHED encode+prefill, small.
+Remaining DONE-bar work is unchanged: batched/graphed mm SERVING (lever #3, for c2+
+and `image_url` ingestion) and the audio our-side measurement (§5 lever #4).

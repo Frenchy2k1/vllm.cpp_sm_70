@@ -24,6 +24,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "vt/backend.h"
@@ -99,6 +100,26 @@ struct Qwen3VLVisionCapture {
 std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_values_bf16,
                                         const std::array<int64_t, 3>& grid_thw,
                                         const Qwen3VLVisionWeights& w,
+                                        const Qwen3VLVisionConfig& cfg, vt::Backend& backend,
+                                        Qwen3VLVisionCapture* capture = nullptr);
+
+// --- Device-resident tower weights (the production/fast path) -----------------
+// The M2a host-weights forward above converted every weight host f32->bf16 and
+// re-uploaded ~0.5 GiB per call, INSIDE the timed forward — that host marshalling
+// (not the ViT kernels) dominated the ~2.1 s vs vLLM's ~0.25 s encode (which runs
+// on weights already resident on GPU, mirror `Qwen3_VisionTransformer` whose
+// nn.Linears are loaded once). PrepareVisionDeviceWeights does that conversion +
+// upload ONCE; the resident-weights forward then runs pure GEMMs/attention with
+// only the tiny per-image (pixel / pos-embed / rope) uploads. Numerically
+// BIT-IDENTICAL to the host overload (same bf16 weight bytes, same GEMM order).
+struct Qwen3VLVisionDeviceWeights;
+
+std::shared_ptr<Qwen3VLVisionDeviceWeights> PrepareVisionDeviceWeights(
+    const Qwen3VLVisionWeights& host_w, const Qwen3VLVisionConfig& cfg, vt::Backend& backend);
+
+std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_values_bf16,
+                                        const std::array<int64_t, 3>& grid_thw,
+                                        const Qwen3VLVisionDeviceWeights& dw,
                                         const Qwen3VLVisionConfig& cfg, vt::Backend& backend,
                                         Qwen3VLVisionCapture* capture = nullptr);
 
