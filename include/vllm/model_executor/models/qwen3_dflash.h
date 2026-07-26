@@ -145,6 +145,98 @@ class Qwen3DFlashModel {
       const HfConfig& config, vt::Queue& queue,
       std::vector<std::vector<float>>* per_layer_out = nullptr,
       std::vector<float>* final_out = nullptr);
+
+  // ---- D3 (DF-DRAFT-KV-PREP) ----------------------------------------------
+  //
+  // Context-KV precompute (precompute_and_store_context_kv, qwen3_dflash.py:
+  // 548-619). Projects the TARGET's per-token combined features (the fc output of
+  // D1's multi-tap, or the last target hidden) to K/V for EVERY draft attention
+  // layer, k-norms + NeoX-RoPE's K, and returns the per-layer context K/V that D3
+  // pre-inserts into the draft's KV cache so the draft never re-runs context. The
+  // path is: normed = RMSNorm(context_states, hidden_norm); for each layer l,
+  // K_l = kv_proj_l.k(normed) (rows [q_size, q_size+kv_size) of qkv_proj), then
+  // RMSNorm(K_l, k_norm_l) over head_dim, then RoPE(K_l, context_positions);
+  // V_l = kv_proj_l.v(normed) (rows [q_size+kv_size, q_size+2*kv_size), no norm,
+  // no RoPE). Mirrors _build_context_kv_buffers (:440-460) + _project_context_kv
+  // (:505-534) + _normalize_context_k (:536-546) + the fused RoPE (:582-597); the
+  // fused multi-layer GEMM/grouped-norm are perf fusions, so per-layer here is
+  // numerically the same bf16 projection vLLM computes. `context_states` is
+  // [num_ctx, H] f32; `context_positions` is [num_ctx] absolute positions.
+  struct ContextKV {
+    // Per draft attention layer: K normed+RoPE'd, V raw. Each is [num_ctx, Hkv,
+    // Dh] flattened f32 (the paged-cache insert layout the D3 forward reads back).
+    std::vector<std::vector<float>> k;
+    std::vector<std::vector<float>> v;
+    int64_t num_ctx = 0;
+  };
+  static ContextKV PrecomputeContextKV(const std::vector<float>& context_states,
+                                       const std::vector<int32_t>& context_positions,
+                                       const Qwen3DFlashWeights& weights,
+                                       const HfConfig& config, vt::Queue& queue);
+
+  // CONTEXT-AWARE block forward (the D3 isolation gate): the uniform (1+k) query
+  // block of each request attends over its pre-inserted context K/V (from
+  // PrecomputeContextKV) PLUS the in-block K/V. Full-attention layers are
+  // BIDIRECTIONAL within the block and see all context; SWA layers are causal in
+  // window. Context is laid out before the block per request, so the landed
+  // vt::DFlashBlockAttention's offset-based mask is exact when context+query
+  // positions are contiguous (the z-lab 27B SWA window 2048 >> any block so SWA
+  // degenerates to plain causal-over-[context;block]); this reuses the D2
+  // primitive UNCHANGED (no new kernel). `ctx_cu`/`cu` are the per-request
+  // context/query boundaries (length num_reqs+1). Returns [Tq, draft_vocab] f32
+  // logits over the query tokens (Tq = num_reqs*(1+k)). `per_layer_out`/`final_out`
+  // capture the query-token per-stage hidden for the parity dump (as ForwardBlockLogits).
+  static std::vector<float> ForwardBlockLogitsWithContext(
+      const std::vector<float>& context_states, const std::vector<int32_t>& context_positions,
+      const std::vector<int32_t>& ctx_cu, const std::vector<int32_t>& block_input_ids,
+      const std::vector<int32_t>& block_positions, const std::vector<int32_t>& cu,
+      const Qwen3DFlashWeights& weights, const HfConfig& config, vt::Queue& queue,
+      std::vector<std::vector<float>>* per_layer_out = nullptr,
+      std::vector<float>* final_out = nullptr);
 };
+
+// prepare_dflash_inputs (dflash/speculator.py:472-687, the _prepare_dflash_inputs_kernel
+// Triton kernel + its launcher). Ported as a HOST op (pure integer index arithmetic
+// — exactly what the Triton kernel computes, no float math), so it is bit-exact and
+// needs no CUDA/sanitizer. For each request it builds the (1+k) query block (anchor =
+// bonus/verified token at offset 0, then k mask_token_id rows), the query
+// positions/slots, the context positions/slots from the target block table, the
+// per-mask sample maps, and seq_lens = last_valid_pos+1+num_query_per_req. Rejected
+// positions are excluded via valid_ctx_end = ctx_end - num_rejected (:518), so the
+// bonus/query positions anchor at the last ACCEPTED token. DISTINCT from MTP's
+// shift-splice prepare_prefill_inputs.
+struct DflashPrepareBatch {
+  // Target batch inputs (mirror the kernel's pointer args).
+  std::vector<int32_t> target_query_start_loc;  // [num_reqs+1] target token boundaries (ctx)
+  std::vector<int64_t> target_positions;        // [num_target_tokens] absolute positions
+  std::vector<int32_t> idx_mapping;             // [num_reqs] req_idx -> req_state_idx
+  std::vector<int32_t> last_sampled;            // [max_num_reqs] indexed by req_state_idx
+  std::vector<int32_t> next_prefill_tokens;     // [max_num_reqs] indexed by req_state_idx
+  std::vector<int32_t> num_sampled;             // [num_reqs]
+  std::vector<int32_t> num_rejected;            // [num_reqs]
+  std::vector<int32_t> block_table;             // [max_num_reqs * block_table_stride]
+  int32_t block_table_stride = 0;
+  int32_t block_size = 0;                        // paged KV block size
+  int32_t parallel_drafting_token_id = 0;        // = mask_token_id
+  int32_t num_query_per_req = 0;                  // 1 + k
+  int32_t num_speculative_steps = 0;             // k
+  int32_t max_num_reqs = 0;
+  int32_t max_num_tokens = 0;
+  int32_t max_model_len = 0;
+  bool sample_from_anchor = false;               // DFlash: false (anchor = bonus token)
+};
+struct DflashPrepareOutputs {
+  std::vector<int32_t> input_ids;             // [num_reqs*num_query_per_req]
+  std::vector<int64_t> query_positions;       // [num_reqs*num_query_per_req] (clamped max_model_len-1)
+  std::vector<int32_t> query_start_loc;       // [max_num_reqs+1]
+  std::vector<int32_t> seq_lens;              // [max_num_reqs]
+  std::vector<int64_t> query_slot_mapping;    // [max_num_tokens] (PAD_SLOT_ID=-1 past active)
+  std::vector<int64_t> context_positions;     // [num_target_tokens]
+  std::vector<int64_t> context_slot_mapping;  // [num_target_tokens]
+  std::vector<int64_t> sample_indices;        // [max_num_reqs*num_speculative_steps]
+  std::vector<int64_t> sample_pos;            // [max_num_reqs*num_speculative_steps]
+  std::vector<int32_t> sample_idx_mapping;    // [max_num_reqs*num_speculative_steps] (-1 past active)
+};
+DflashPrepareOutputs PrepareDflashInputs(const DflashPrepareBatch& batch);
 
 }  // namespace vllm

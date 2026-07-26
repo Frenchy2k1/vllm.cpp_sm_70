@@ -24681,3 +24681,33 @@ reported to caller.
   `KERNEL-ATTN-DFLASH-BLOCK`, model-matrix DFlash rows + rollup (SPIKE 9→8, ACTIVE
   20→21), ledger, README, `docs/BENCHMARKS.md`, coordination `CLAIM-DFLASH-D2`, this
   entry. `benchmark_binding=false`. NOT pushed; FULL SHA reported to caller.
+- **2026-07-26** — **DFlash D3 (`DF-DRAFT-KV-PREP`, `CLAIM-DFLASH-D3`) CODE LANDED
+  + CPU-GATED; GPU numeric-parity PENDING on dgx.** Two new pieces landed ADDITIVE
+  (`git diff --stat` = `qwen3_dflash.h` +92, `qwen3_dflash.cpp` +393,
+  `tests/CMakeLists.txt` +2; new `tests/vllm/v1/spec_decode/test_dflash_kvprep.cpp`
+  + `scripts/spec/d3_dflash_kvprep_ref.py`; **NO CUDA, NO shared causal-path /
+  scheduler / `vt`-op edit**): (1) `PrepareDflashInputs`, a pure-integer HOST port
+  of `_prepare_dflash_inputs_kernel` (`dflash/speculator.py:472-618`) — the (1+k)
+  mask block (anchor=bonus token then k `mask_token_id`), query positions/slots,
+  context positions/slots from the target block table, per-mask sample maps,
+  `valid_ctx_end = ctx_end - num_rejected`, and the CG-replay padding; (2)
+  `PrecomputeContextKV` + `ForwardBlockLogitsWithContext` — the context-KV
+  precompute (`precompute_and_store_context_kv`, `qwen3_dflash.py:548-619`) reusing
+  the LANDED MatmulBT/RmsNorm/RopeNeox (per-layer K/V proj + k-norm + NeoX RoPE on
+  K), and the context-aware draft forward reusing the **UNCHANGED D2
+  `vt::DFlashBlockAttention`** via a `[context;block]` combined sequence per request
+  (offset mask exact since context precedes the block + 27B SWA window 2048 >> block;
+  **no new kernel**). CPU gate `test_dflash_kvprep` **6 cases / 114 assertions**:
+  prepare INTEGER bit-exact vs a hand 2-request reference (RED-first: breaking
+  `valid_ctx_end` fails 4 assertions); context-KV V envelope-matched + hidden_norm
+  (K+V) / k_norm (K) / RoPE-pos (K) RED load-bearing; context forward DEGENERATES
+  exactly to the D2 context-free forward at empty ctx + diverges with ctx + block
+  isolation. Inertness: `test_qwen3_dflash_forward` 95/95 + `test_ops_dflash_block_attn`
+  12/12 byte-identical (additive-only diff ⇒ D2/MTP/SACRED byte-identical by
+  construction). PENDING on dgx (no GPU/nvcc/cutlass on the dev box, as D2): the
+  numeric parity vs the vLLM dump (`d3_dflash_kvprep_ref.py`) + 27B SACRED 235/235 +
+  MTP 9/9 + D2 parity re-run; no new CUDA ⇒ -Werror/sanitizer N/A. Records advanced:
+  spec §0 D3 RESULT + §6 D3 row, model-matrix DFlash row, README (both DFlash
+  passages), `docs/BENCHMARKS.md`, ledger, coordination `CLAIM-DFLASH-D3`, this
+  entry. D3 → CPU-GATED; D4 (engine loop) + D5 (SACRED) + D6 (CUDA graph) remain.
+  `benchmark_binding=false`. NOT pushed; FULL SHA reported to caller.
