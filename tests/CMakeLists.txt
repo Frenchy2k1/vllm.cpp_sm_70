@@ -790,6 +790,15 @@ target_compile_definitions(test_qwen27_paged_engine PRIVATE
 target_include_directories(test_qwen27_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# SPEC-DFLASH D2 — the DFlash draft-forward parity gate vs the dumped vLLM DFlash
+# draft reference (fc combine + context-free block forward per-stage hidden +
+# proposed ids). GPU + z-lab-draft + NVFP4-target + fixture gated (skips on CPU/CI).
+vllm_cpp_add_test(test_qwen3_dflash_draft_parity parity/test_qwen3_dflash_draft_parity.cpp)
+target_compile_definitions(test_qwen3_dflash_draft_parity PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen3_dflash_draft_parity PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # SPEC-MTP I5d — the 27B k=1 MTP speculative-decode three-way identity gate
 # (our spec-ON == our spec-OFF == vLLM greedy) + measured nonzero acceptance.
 vllm_cpp_add_test(test_qwen27_spec_decode parity/test_qwen27_spec_decode.cpp)

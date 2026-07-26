@@ -69,6 +69,45 @@ bit-exact per-layer state, so the captured taps equal vLLM's aux within the bf16
 transitively; the direct per-layer vLLM aux-dump parity folds into D2's drafter golden
 (where the `fc(cat(aux))` output is checked end-to-end).
 
+### D2 RESULT (2026-07-26, `CLAIM-DFLASH-D2`) — **DF-DRAFT-MODEL DONE: GPU promotion GREEN on dgx (all 4 gates pass), draft forward matches vLLM.**
+
+**GPU PROMOTION COMPLETE (dgx GB10, CUDA 13.0, sm_121a, oracle vLLM 0.26.0.dev0+g5559679).**
+The dev-box CPU session's 4 pending GPU gates all pass:
+1. **CUDA `-Werror` build clean** — 0 warnings, 0 errors. The new
+   `DFlashBlockAttentionKernelCuda` (`cuda_ops.cu:1300`, never before compiled)
+   builds AS-WRITTEN under `-Werror=all-warnings`; NO algorithm change needed.
+2. **New-primitive CUDA==CPU + compute-sanitizer 0** — added CUDA-vs-CPU parity
+   cases to `test_ops_dflash_block_attn` covering all 5 semantic corners
+   (non-causal, causal, block isolation, SWA window, GQA): 198412/198412
+   assertions pass within the 1e-4 f32-online-softmax envelope; `compute-sanitizer
+   --tool memcheck` = **0 errors** on the new kernel.
+3. **Draft-forward parity vs the REAL vLLM DFlash draft** (the decisive gate) —
+   `scripts/spec/d2_dflash_draft_ref.py` dumps, from the loaded
+   `DFlashQwen3ForCausalLM` (reached via `collective_rpc` into the V2 worker's
+   `model_runner.speculator.model`), vLLM's real `combine_hidden_states` + the
+   context-free (1+k) block forward (per-layer + final hidden + top-k proposed
+   ids) built from vLLM's OWN loaded submodules. `test_qwen3_dflash_draft_parity`
+   loads the same z-lab draft + the target-SHARED embed/lm_head and gates: **fc
+   rel-L2 0.46%**, per-layer hidden rel-L2 **0.44/1.00/1.27/1.30/0.65%**, final
+   hidden **0.88%** (all ≪ the 5% bf16/f32-softmax envelope); proposed ids **11
+   deterministic rows STRICT-matched vLLM's top-1 + 5 bf16-near-tie rows
+   cluster-matched** (the 2 non-strict flips are within ONE bf16 ULP = 0.0625 at
+   magnitude ~8 — a genuine vocab-head near-tie, per [[near-tie-distributional-gate]],
+   NOT a root divergence). vLLM's `get_draft_attn_causal()` = `[T,T,T,T,F]`
+   matches our `ResolveQwen3DFlashAttnModes` exactly. The RED proofs (causal-flip,
+   reversed-tap) stay in the deterministic CPU unit test.
+4. **Inertness re-runs byte-identical** — 27B text SACRED `test_qwen27_paged_engine`
+   **235/235** (16/16 token-exact vs vLLM) + 27B MTP `test_qwen27_spec_decode`
+   **9/9**, both unchanged (the new op is separate).
+
+**Loader fix (found on-box):** the z-lab draft ckpt ships only 58 tensors
+(fc/hidden_norm/norm + 5 layers) — it OMITS embed_tokens + lm_head, which the draft
+SHARES from the target (mirrors vLLM's `skip_substrs.append("embed_tokens")`). The
+loader now tolerates their absence (`TryLoadBf16`); the parity harness supplies the
+target's bf16 embed/lm_head, exactly as vLLM does.
+
+Below = the pre-promotion record (retained for context).
+
 ### D2 RESULT (2026-07-26, `CLAIM-DFLASH-D2`) — **DF-DRAFT-MODEL code LANDED + CPU-GATED; GPU promotion gate PENDING on dgx.**
 
 The biggest new DFlash brick is implemented and CPU-verified. Three genuinely-new
@@ -365,7 +404,7 @@ the combination runs, so worst case is a config/version bump, not a dead row).
 |---|---|---|---|---|
 | **D0** ground + download | Fetch both drafts to dgx; dump their resolved `SpeculativeConfig`; confirm the pinned oracle SERVES DFlash + NVFP4 on sm_121 end-to-end (short greedy run) | **✓ DONE 2026-07-26 (§0 D0 RESULT) on the NEW pin `555967922`/vLLM 0.26.0.dev0.** vllm#40898 resolved: mixed-attn draft CONSTRUCTS, drafter ALIVE (acceptance 2.21/8.80/4.75/4.57 > 1), `num_spec=16`, backend flashinfer-native. Goldens `dflash_27b_spec_{on,off}.json` committed. Gate FORM measured = STRICT mode-matched (vLLM-ON run-deterministic K>=3 but != vLLM-OFF). | GPU (one short oracle run under `flock`) | ~~Oracle can't serve DFlash on sm_121~~ RESOLVED by pin advance + `VLLM_USE_V2_MODEL_RUNNER=1`. New hazard hit+fixed: multimodal 27B vision-encoder profiling OOM-rebooted dgx -> `limit_mm_per_prompt=0` + gpu_util 0.30 |
 | **D1** aux multi-tap seam (`DF-AUX-TAPS`) | Extend `ForwardDeviceTap`/tap struct: capture `[T,H×taps]` at 5(27B)/8(35B) residual boundaries, config-gated | **✓ DONE 2026-07-26 (§0 D1 RESULT).** `ForwardDeviceMultiTap` (MoE+Dense) captures `(hidden+res)` at `target_layer_ids` into `[T,H×taps]`; unit gate 598 assertions vs an independent truncated-model reference (RED-first: reversed concat -> 384 fail); CUDA 697/697 + compute-sanitizer 0; MTP e2e 9/9 + 27B SACRED **235/235** byte-identical on the new oracle (inertness) | GPU (parity dump) + CPU (unit) | ~~byte-identical when off~~ PROVEN (config-gated, additive); the direct vLLM aux-dump parity folds into D2 (see §0 D1 honest scope note) |
-| **D2** the `qwen3_dflash` drafter + non-causal in-block attention (`DF-DRAFT-MODEL`) | New draft model (5-6 dense layers, SWA+full), loader, the NEW non-causal block-attention `vt` primitive, draft KV groups | **CODE LANDED + CPU-GATED 2026-07-26 (`CLAIM-DFLASH-D2`, §0 D2 RESULT):** model + `vt::DFlashBlockAttention` (CPU authoritative + CUDA port) + fc + mask-embed + loader; CPU gate op 12/12 (RED non-causal) + model 95/95 (RED full-layer-causal-flip, block isolation, fc RED); causal path byte-identical (test_ops_attention/test_qwen3_forward unchanged). **PENDING on dgx (promotes to DONE):** standalone draft forward parity vs dumped vLLM draft ref + non-causal primitive CUDA==CPU bit-exact + CUDA `-Werror`/compute-sanitizer + 27B SACRED 235/235 + MTP 9/9 | GPU (forward + parity) + CPU (op ref) | **The non-causal primitive is the project's first** — bidirectional block attention; get the mask + SWA-vs-full per-layer routing right |
+| **D2** the `qwen3_dflash` drafter + non-causal in-block attention (`DF-DRAFT-MODEL`) | New draft model (5-6 dense layers, SWA+full), loader, the NEW non-causal block-attention `vt` primitive, draft KV groups | **CODE LANDED + CPU-GATED 2026-07-26 (`CLAIM-DFLASH-D2`, §0 D2 RESULT):** model + `vt::DFlashBlockAttention` (CPU authoritative + CUDA port) + fc + mask-embed + loader; CPU gate op 12/12 (RED non-causal) + model 95/95 (RED full-layer-causal-flip, block isolation, fc RED); causal path byte-identical (test_ops_attention/test_qwen3_forward unchanged). **✓ DONE 2026-07-26 — GPU promotion GREEN on dgx (§0 D2 RESULT):** CUDA `-Werror` clean (kernel compiles as-written); CUDA==CPU 198412/198412 + compute-sanitizer 0; draft-forward parity vs the REAL vLLM draft (fc rel-L2 0.46%, hidden ≤1.3%, 11 strict + 5 near-tie proposed ids); 27B SACRED 235/235 + MTP 9/9 byte-identical | GPU (forward + parity) + CPU (op ref) | **The non-causal primitive is the project's first** — bidirectional block attention; get the mask + SWA-vs-full per-layer routing right |
 | **D3** context-KV precompute + `prepare_dflash_inputs` (`DF-DRAFT-KV-PREP`) | Fused multi-layer KV proj + bulk RoPE + cache insert; the mask-block/context-slot/sample-map input kernel | context-KV reuse bit-exact (draft with precomputed context == draft re-running context); `prepare_dflash_inputs` matches a from-algorithm oracle (mask blocks, `valid_ctx_end` under rejection, CG padding) | GPU (kernels) + CPU (input-prep ref) | Rejected-position exclusion (`ctx_end − num_rejected`) + slot arithmetic off-by-one; eager (non-CG) context path |
 | **D4** engine integration + k>1 exercise (`DF-ENGINE-INTEGRATION`) | Wire the DFlash speculator into the landed I5d/I7 runner loop; `--speculative-config dflash` parse/resolve; run the k-general shared paths at k=15 | the loop runs end-to-end at k=15 on the 27B, drafts proposed & accepted (nonzero); the k=15 GDN spec slots + rejection + mixed batch exercised (no crash, bit-exact vs I4 ops as a token chain at k=15) | GPU | First real k=15 exercise of the shared GDN/rejection paths (code-general but untested at scale); k+1=16 slot alloc + widened conv at k=15 |
 | **D5** correctness gate | The DFlash correctness bar | **REVISED by the D0 measurement (§0):** NOT the three-way identity — vLLM-DFlash-ON != vLLM-spec-OFF at k=16 near-ties. Gate = STRICT MODE-MATCHED **`our-DFlash-ON == vLLM-DFlash-ON` greedy token-for-token** (the committed golden is the reference) + measured nonzero acceptance; 27B then 35B; spec-OFF byte-identical SACRED as a SEPARATE inertness gate | GPU (`flock`, standalone big-model) | Batch-nondeterminism at c>1 (near-tie-distributional-gate applies as in I7 — exact identity only at c1); acceptance content-dependence |

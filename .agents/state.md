@@ -24646,3 +24646,38 @@ Records advanced: spec §0 D2 RESULT + §6 D2 row, kernel-matrix `KERNEL-ATTN-DF
 model-matrix DFlash rows (note), engine-matrix `SPEC-DFLASH`, roadmap, coordination
 `CLAIM-DFLASH-D2`, ledger, this entry, README, `docs/BENCHMARKS.md`. NOT pushed; FULL SHA
 reported to caller.
+
+- **2026-07-26** — **DFlash D2 GPU PROMOTION GREEN on dgx (`CLAIM-DFLASH-D2`, branch
+  `dflash-d2` off the D2 commit `d968c4f4`; dgx GB10 sm_121a, CUDA 13.0,
+  cutlass-4.5.0/TRITON=ON, oracle vLLM 0.26.0.dev0+g5559679 under `flock`).** Runs the
+  four GPU gates the dev-box CPU session could not. (1) **CUDA `-Werror=all-warnings`
+  build clean, 0 warnings** — the new `DFlashBlockAttentionKernelCuda`
+  (`cuda_ops.cu`, never before compiled) builds AS-WRITTEN, no algorithm change.
+  (2) **New-primitive CUDA==CPU + compute-sanitizer 0** — added CUDA-vs-CPU parity
+  cases to `tests/vt/test_ops_dflash_block_attn.cpp` (all 5 corners: non-causal,
+  causal, block isolation, SWA window, GQA) → 198412/198412 within the 1e-4
+  f32-online-softmax envelope; `compute-sanitizer --tool memcheck` 0 errors.
+  (3) **Draft-forward parity vs the REAL vLLM DFlash draft** (the decisive gate) —
+  finalized `scripts/spec/d2_dflash_draft_ref.py` to reach the loaded
+  `DFlashQwen3ForCausalLM` via `collective_rpc` into the V2 worker
+  (`model_runner.speculator.model`; needs `VLLM_ALLOW_INSECURE_SERIALIZATION=1`) and
+  dump vLLM's real `combine_hidden_states` + the context-free (1+k) block forward
+  (per-layer + final hidden + top-k ids) from vLLM's OWN loaded submodules; new
+  `tests/parity/test_qwen3_dflash_draft_parity.cpp` loads the same z-lab draft + the
+  target-SHARED embed/lm_head and gates **fc rel-L2 0.46%**, per-layer hidden
+  0.44/1.00/1.27/1.30/0.65%, final 0.88% (all far inside the 5% bf16 envelope),
+  proposed ids **11 deterministic rows STRICT top-1 + 5 bf16-near-tie rows
+  cluster-matched** (the 2 flips are within one bf16 ULP = 0.0625 — a real vocab-head
+  near-tie, per [[near-tie-distributional-gate]]). vLLM's
+  `get_draft_attn_causal() = [T,T,T,T,F]` matches `ResolveQwen3DFlashAttnModes` exactly.
+  (4) **Inertness byte-identical** — 27B SACRED `test_qwen27_paged_engine` 235/235
+  (16/16 token-exact vs vLLM) + 27B MTP `test_qwen27_spec_decode` 9/9. **Loader fix
+  (on-box finding):** the z-lab draft ships only 58 tensors and OMITS
+  embed_tokens/lm_head (shared from the target) — the loader
+  (`qwen3_dflash_weights.cpp`) now tolerates their absence (`TryLoadBf16`), and
+  `ForwardBlockLogits` gained optional per-layer/final hidden out-params for the
+  per-stage gate. D2 → DONE/`ACTIVE`; D3 (context-KV), D4 (engine loop), D5 (SACRED)
+  remain. Records advanced: spec §0 D2 RESULT + §6 D2 row, kernel-matrix
+  `KERNEL-ATTN-DFLASH-BLOCK`, model-matrix DFlash rows + rollup (SPIKE 9→8, ACTIVE
+  20→21), ledger, README, `docs/BENCHMARKS.md`, coordination `CLAIM-DFLASH-D2`, this
+  entry. `benchmark_binding=false`. NOT pushed; FULL SHA reported to caller.

@@ -70,23 +70,30 @@ multimodal 27B); `limit_mm_per_prompt=0` + gpu_util 0.30 fixed it (26.2 GiB weig
 `scripts/spec/d0_dflash_oracle_capture.py --mode spec-on` (env `VLLM_USE_V2_MODEL_RUNNER=1`);
 evidence `tests/parity/goldens/dflash_27b/{D0_VERDICT.md,dflash_27b_spec_{on,off}.json}`.
 
-**DFlash D2 (`DF-DRAFT-MODEL`) - drafter model + non-causal in-block attention CODE LANDED
-+ CPU-GATED (2026-07-26, `CLAIM-DFLASH-D2`).** `benchmark_binding=false` (a correctness
-gate, NOT a throughput number - the drafter has no speed A/B until the engine loop, D4/D6).
-No GPU/nvcc on the dev box this session, so the D2 verification is the deterministic CPU
-unit gate: the new `vt::DFlashBlockAttention` op passes 5 cases / 12 assertions (hand-checked
-non-causal attention where query 0 attends to the future key, the RED causal-vs-non-causal
-separation proving the mask is load-bearing, per-request block isolation, the SWA window
-bound, and GQA), and the draft-model context-free block forward passes 5 cases / 95
-assertions (runs + finite, the RED full-attention-layer-causal-flip shifting the logits by
-~1e-2 where a byte-identical rerun is exactly 0, end-to-end block isolation, the fc
-aux-combine vs an independent reference plus a RED reversed-tap-order check, and the
-4x-sliding + 1x-full attention-mode resolution). The causal attention every other model uses
-is untouched: the existing `test_ops_attention` (23 assertions) and `test_qwen3_forward`
-(1028 assertions) re-pass unchanged. PENDING on dgx (promotes D2 to a passing gate): the
-draft forward's parity against a dumped vLLM DFlash-draft reference (harness
-`scripts/spec/d2_dflash_draft_ref.py`), the CUDA build + compute-sanitizer on the new kernel,
-and the 27B SACRED 235/235 + 27B MTP 9/9 inertness re-runs.
+**DFlash D2 (`DF-DRAFT-MODEL`) - drafter model + non-causal in-block attention DONE, GPU
+promotion GREEN (2026-07-26, `CLAIM-DFLASH-D2`, dgx GB10 sm_121a, oracle vLLM 0.26.0.dev0).**
+`benchmark_binding=false` (a correctness gate, NOT a throughput number - the drafter has no
+speed A/B until the engine loop, D4/D6). All four GPU gates the dev-box CPU session owed now
+pass. (1) The CUDA build is warning-clean under `-Werror=all-warnings`: the new
+`DFlashBlockAttentionKernelCuda` (never before compiled) builds as-written, no algorithm
+change. (2) CUDA==CPU parity: added CUDA-vs-CPU cases to `test_ops_dflash_block_attn` covering
+all five corners (non-causal, causal, block isolation, SWA window, GQA) pass 198412/198412
+assertions within the 1e-4 f32-online-softmax envelope, and `compute-sanitizer --tool
+memcheck` reports 0 errors on the new kernel. (3) Draft-forward parity vs the REAL vLLM DFlash
+draft (the decisive gate): `scripts/spec/d2_dflash_draft_ref.py` dumps, from vLLM's own loaded
+`DFlashQwen3ForCausalLM` (reached via `collective_rpc` into the V2 worker), the fc combine plus
+the context-free block forward built from vLLM's own submodules; `test_qwen3_dflash_draft_parity`
+loads the same z-lab draft plus the target-shared embed/lm_head and gates fc rel-L2 0.46
+percent, per-layer hidden rel-L2 0.44/1.00/1.27/1.30/0.65 percent, final hidden 0.88 percent
+(all far inside the 5 percent bf16 envelope), and proposed ids as 11 deterministic rows STRICT
+top-1 matched plus 5 bf16-near-tie rows cluster-matched (the flips are within one bf16 ULP,
+0.0625 at magnitude 8, a genuine vocab-head near-tie). (4) Inertness: 27B text SACRED
+`test_qwen27_paged_engine` 235/235 (16/16 token-exact vs vLLM) and 27B MTP
+`test_qwen27_spec_decode` 9/9, both byte-identical (the new op is separate). A loader fix
+surfaced on-box: the z-lab draft ships only 58 tensors and omits embed_tokens/lm_head (shared
+from the target), so the loader now tolerates their absence. The deterministic CPU unit gate
+(op 12 assertions, model 95 assertions, RED-first) and the causal path byte-identity
+(`test_ops_attention`, `test_qwen3_forward` unchanged) still hold.
 
 **Pin-advance target SELECTED (SCOPE only, no measurement) - PENDING execution
 (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, `.agents/specs/pin-advance.md`).** The

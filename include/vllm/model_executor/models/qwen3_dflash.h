@@ -134,10 +134,17 @@ class Qwen3DFlashModel {
   // to itself: full-attention layers BIDIRECTIONAL, SWA layers causal-in-window.
   // Mask slots embed via embed_tokens[mask_token_id] (or the dedicated
   // mask_embedding when present), mirroring embed_input_ids (:432-438).
+  // `per_layer_out` (if non-null) receives each decoder layer's post-MLP hidden
+  // [T,H] (column-major flattened, one entry per layer); `final_out` (if non-null)
+  // receives the post-final-norm hidden [T,H] fed to lm_head. Both are the exact
+  // per-stage tensors the D2 draft-parity gate compares against the dumped vLLM
+  // reference (scripts/spec/d2_dflash_draft_ref.py). Pass nullptr in production.
   static std::vector<float> ForwardBlockLogits(
       const std::vector<int32_t>& input_ids, const std::vector<int32_t>& positions,
       const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights,
-      const HfConfig& config, vt::Queue& queue);
+      const HfConfig& config, vt::Queue& queue,
+      std::vector<std::vector<float>>* per_layer_out = nullptr,
+      std::vector<float>* final_out = nullptr);
 };
 
 }  // namespace vllm

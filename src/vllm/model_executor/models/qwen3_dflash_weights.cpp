@@ -52,6 +52,20 @@ OwnedTensor LoadBf16RawNK(const TensorResolver& get, const std::string& name) {
   return out;
 }
 
+// Load `name` if the checkpoint ships it, else return an EMPTY OwnedTensor. The
+// z-lab DFlash draft ships neither embed_tokens nor lm_head (confirmed against the
+// on-disk key dump, 58 tensors: fc/hidden_norm/norm + 5 layers only) — the draft
+// SHARES the target model's embed_tokens + lm_head, exactly as vLLM's loader skips
+// them (qwen3_dflash.py:787-806 `skip_substrs.append("embed_tokens")` +
+// lm_head untied-but-shared). The caller supplies them from the resolved target.
+OwnedTensor TryLoadBf16(const TensorResolver& get, const std::string& name, bool nk) {
+  try {
+    return nk ? LoadBf16RawNK(get, name) : LoadBf16Direct(get, name);
+  } catch (const std::runtime_error&) {
+    return OwnedTensor{};
+  }
+}
+
 // Concatenate several [N_i, K] BF16 raw-NK matrices along their output rows,
 // preserving order (vLLM's QKV / gate_up stacked mapping). Sets nk=true.
 OwnedTensor ConcatRawNK(const TensorResolver& get, const std::vector<std::string>& names,
@@ -138,11 +152,13 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
   out.mask_token_id = mask_token_id;
   out.draft_vocab_size = config.vocab_size;
 
-  out.embed_tokens = LoadBf16Direct(get, "embed_tokens.weight");
+  // embed_tokens + lm_head are SHARED from the target (the draft ckpt omits them,
+  // see TryLoadBf16); load if present, else leave empty for the caller to fill.
+  out.embed_tokens = TryLoadBf16(get, "embed_tokens.weight", /*nk=*/false);
   out.fc = LoadBf16RawNK(get, "fc.weight");
   out.hidden_norm = LoadBf16Direct(get, "hidden_norm.weight");
   out.final_norm = LoadBf16Direct(get, "norm.weight");
-  out.lm_head = LoadBf16RawNK(get, "lm_head.weight");
+  out.lm_head = TryLoadBf16(get, "lm_head.weight", /*nk=*/true);
 
   const std::vector<Qwen3DFlashLayerAttnMode> modes = ResolveQwen3DFlashAttnModes(config);
   out.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
