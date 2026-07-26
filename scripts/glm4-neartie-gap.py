@@ -48,6 +48,10 @@ def main():
     # over-commits and REBOOTS the box. 0.40 is the safe ceiling (does not affect the
     # teacher-forced logprobs — only KV-cache capacity, unused here at max_tokens=1).
     ap.add_argument("--gpu-mem-util", type=float, default=0.40)
+    ap.add_argument("--trust-remote-code", action="store_true",
+                    help="pass trust_remote_code=True to LLM() — needed for arches "
+                         "whose config class is NOT in transformers/vLLM (e.g. "
+                         "MiniCPMForCausalLM). Default off (inert for supported models).")
     args = ap.parse_args()
     from vllm import LLM, SamplingParams
 
@@ -57,7 +61,8 @@ def main():
     greedy = np.load(os.path.join(args.golden_dir, "greedy_ids.npy"))
 
     llm = LLM(model=args.model, dtype="bfloat16", enforce_eager=True,
-              gpu_memory_utilization=args.gpu_mem_util)
+              gpu_memory_utilization=args.gpu_mem_util,
+              trust_remote_code=args.trust_remote_code)
 
     gap_mnats = np.zeros((N, T), dtype="<i4")
     print(f"=== teacher-forced near-tie gap: {args.model} (OUR prefix) ===")

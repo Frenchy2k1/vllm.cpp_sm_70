@@ -126,8 +126,18 @@ kernel** (the spike's predicted `kGelu` unary was unnecessary — `gelu_new` == 
 `vt::GeluTanh`): GPT-J parallel residual (Command-R wiring) + nn.LayerNorm+bias + biased qkv/dense
 + partial NeoX rope 32/80 + non-gated NewGELU MLP + untied biased lm_head, all reuse; F16→BF16
 dtype-aware loader (LOCAL, shared header untouched). RED-first: dropped qkv bias 1.25 nats +
-sequential residual 21.19 nats gate-CAUGHT, wrong rotary fraction hard-aborts. Remaining rows
-(MiniCPM, MiniCPM3) stay `SPIKE`, one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
+sequential residual 21.19 nats gate-CAUGHT, wrong rotary fraction hard-aborts. **rank-5 MiniCPM
+(`MiniCPMForCausalLM`, `openbmb/MiniCPM-2B-sft-bf16`) `ACTIVE` — SACRED 16/16** vs vLLM 0.25.0
+(2026-07-26, worktree `minicpm-bringup`, dgx `~/vllmcpp-minicpm`; per-prompt K=5 deterministic →
+STRICT; 10/16 exact + 6/16 near-tie, **max gap 0.0 nats**, 0 divergent). The first OpenBMB MiniCPM
+model. **ZERO new kernel** = the landed Llama/Granite dense forward + three scalars (scale_emb 12
+embedding scale; scale_depth/sqrt(40)=0.2214 scaled residual add per sublayer; hidden/scale_width=9.0
+before lm_head, all `vt::MulScalar`/`vt::Add`), tied lm_head. W0 `.bin`-only risk resolved WITHOUT a
+C++ pickle loader: converted the official openbmb `.bin`→safetensors via trusted torch (same weights,
+both oracle+engine); vLLM builds+runs it with `trust_remote_code=True`. RED-first: dropping
+scale_depth → 256/256 divergent, max gap 29.375 nats gate-CAUGHT. Gated via the additive
+`TokensPrompt` path (MiniCPM's SentencePiece normalizer is a follow-up). Remaining row
+(MiniCPM3) stays `SPIKE`, one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
 MoE/SSM campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no
 0.25.0 oracle.
 
