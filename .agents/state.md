@@ -24426,3 +24426,36 @@ The LAST owed MTP gate. The 35B MoE-MTP mechanism was already landed + bit-exact
 **Remaining spec-decode follow-on:** `SPEC-DFLASH` (oracle-BLOCKED on vLLM 0.25.0,
 vllm#40898). Raw dgx logs `~/mtp35b/vllm.cpp/{gate.log,capON.log,capOFF.log,abON_warm.log,abOFF_warm.log}`.
 NOT pushed; FULL SHA reported in the session.
+
+## 2026-07-26 — `CLAIM-PIN-ADVANCE-SCOPE` EXECUTION W0-W2 go/no-go = **GO** (records-only; NO pin flip, NO golden re-capture)
+
+Ran the pin-advance W0-W2 go/no-go on dgx GB10 (sm_121a). Staged the target stack in
+a NEW venv `~/venvs/vllm-oracle-next`; **`~/venvs/vllm-oracle` (0.25.0) UNTOUCHED** as
+rollback. Full detail in `.agents/specs/pin-advance.md` §6. `git diff --stat` = docs/records
+only (no `src/`/`include/`/`tests/`/golden byte changes) ⇒ every SACRED gate byte-identical
+by construction.
+
+- **W0 disk:** reclaimed ~12 GiB (26→38 free) deleting ONLY transient `*.nsys-rep`/`*.sqlite`
+  under `~/bench`/`~/pk-bench`/`~/vllm-bench` (excl. apex/darwin) + `~/work/pinenv`.
+  GLM-4.7-Flash (59 GiB) PRESERVED — landed tests load it (grep-verified). No SACRED
+  checkpoint / user data touched.
+- **W1 install ✓ on GB10:** commit `55596792` has NO aarch64 wheel (main commit, not on any
+  release branch), so vLLM built FROM SOURCE for sm_121a (`TORCH_CUDA_ARCH_LIST=12.1a`,
+  MAX_JOBS=6, ~1h21m). Imports confirmed: torch 2.13.0+cu130 (cap (12,1)), transformers
+  5.14.1, flashinfer 0.6.15.post1, cutlass-dsl 4.6.0, triton 3.7.1, vllm 0.26.0.dev0+g5559679;
+  `_custom_ops` loads. Friction: needs Rust (`rustup` 1.97.1); setuptools-scm needs
+  `SETUPTOOLS_SCM_PRETEND_VERSION`; flashinfer-cubin off PyPI ⇒ flashinfer index.
+- **W2 unblocks:** (a) **Gemma-4** `import transformers.models.gemma4` ✓. (b) **DFlash
+  (headline)** ✓ — mixed-attn draft CONSTRUCTS + RUNS + coherent tokens + **acceptance_len
+  2.21/8.8/4.75/4.57** under `VLLM_USE_V2_MODEL_RUNNER=1`; #40898 gone; auto-select picks
+  `flashinfer-native` non-causal fp8-KV on sm121 (forcing FLASH_ATTN FAILS — don't). (c)
+  **OLMo-3** NOT run (checkpoint absent; 14 GiB re-fetch deferred to W3).
+- **W2 MEASURED DRIFT (real re-capture bill):** **27B-NVFP4 (W4A4) DRIFTS** (first-div pos 6,
+  10/16 differ, emits `<think>` block) ⇒ needs re-capture; **35B-NVFP4 (W4A16) SURVIVES 16/16**;
+  **Coder-30B SURVIVES 6/6**; **Qwen3-4B dense** 5/16 near-tie point-drift (2 by 1 token).
+  ⇒ MUCH cheaper than the §3 "~4 re-captures": only the 27B W4A4 STRICT golden truly drifts.
+  32B-NVFP4A16 + op-level goldens still owe a W3 diff.
+
+Evidence on dgx: `~/work/pin-drift/` (dflash_stats.log, drift_{27b,35b}.log, out_coder/,
+out_4b/), `~/work/vllm_build.log`, source `~/work/vllm-src-5559679`. NOT pushed; FULL SHA
+reported in the session.

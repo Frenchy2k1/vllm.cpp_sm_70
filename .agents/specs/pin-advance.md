@@ -340,3 +340,80 @@ gain÷effort (unblocked-and-implemented first):
 | Dependencies | sibling 35B-MTP agent frees `~/venvs/vllm-oracle`; disk ≥200 GiB; GB10 |
 | Work breakdown | W0-W5 (§4) |
 | Risks/decisions | Torch-2.13/CUTLASS-4.6/FlashInfer-0.6.15 stack change = build + drift risk; MRV2 requirement for mixed DFlash; no release tag has the fixes ⇒ main commit |
+
+---
+
+## 6. EXECUTION W0-W2 RESULTS — GO/NO-GO VERDICT = **GO** (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`)
+
+Ran the W0-W2 go/no-go on dgx GB10 (sm_121a). **NO pin flip, NO golden re-capture,
+`~/venvs/vllm-oracle` (0.25.0) left pristine as rollback.** Staged the target stack in
+a NEW venv `~/venvs/vllm-oracle-next`. **Headline: the target stack builds+imports on
+GB10, all three unblocks resolve, and the golden drift is FAR SMALLER than the §3
+estimate — only 1 of the 3 STRICT core gates (27B) actually drifts.**
+
+### W0 — DISK
+Reclaimed **~12 GiB** (26 GiB → 38 GiB free) by deleting ONLY transient profiler
+artifacts (`*.nsys-rep`/`*.sqlite`/`*.qdrep` under `~/bench`/`~/pk-bench`/`~/vllm-bench`,
+excluding `~/work/apex` + `~/work/darwin_36b_opus`) + the rebuildable `~/work/pinenv`.
+**GLM-4.7-Flash (59 GiB) is NOT reclaimable** — `tests/vllm/models/test_glm4_moe_lite_load.cpp`
++ `test_glm4_moe_lite_paged_engine.cpp` + `test_mla_attention_block.cpp` load it (verified
+by grep); it was PRESERVED. No SACRED checkpoint or user data touched.
+
+### W1 — STAGED venv `~/venvs/vllm-oracle-next` — **INSTALLS + IMPORTS on GB10 ✓**
+The exact commit `55596792` has **no aarch64 wheel** (per-commit index 404; it is a
+main commit NOT on any release branch — v0.26.0/v0.25.1 diverged), so vLLM was **built
+from source** (editable) for sm_121a only (`TORCH_CUDA_ARCH_LIST=12.1a`, `MAX_JOBS=6`,
+~1h21m, ~380 CUDA TUs, disk floor 18 GiB). Deps installed clean from PyPI + the
+`https://flashinfer.ai/whl/` index. Verified on GB10: `torch 2.13.0+cu130` (CUDA 13.0,
+cap (12,1)), `transformers 5.14.1`, `flashinfer 0.6.15.post1` (+cubin), `nvidia-cutlass-dsl
+4.6.0`, `triton 3.7.1`, `torchvision 0.28.0`, `vllm 0.26.0.dev0+g5559679` (our build of
+`55596792`); `vllm._custom_ops` (compiled `_C`) loads; platform = NVIDIA GB10.
+**Build friction resolved (record for W1 EXECUTION):** (1) commit has no aarch64 wheel ⇒
+source build; (2) vLLM now needs a **Rust** toolchain (`setuptools-rust`, `rust/Cargo.toml`)
+— installed `rustup` stable 1.97.1; (3) `git archive` tarball has no `.git` ⇒ setuptools-scm
+fails ⇒ set `SETUPTOOLS_SCM_PRETEND_VERSION` + `git init`; (4) `flashinfer-cubin` is off
+PyPI since 0.6.14 ⇒ pulled `0.6.15.post1` from the flashinfer index; (5) target pins are
+`flashinfer 0.6.15.post1`, `nvidia-cutlass-dsl[cu13]==4.6.0` (+ `quack-kernels`,
+`humming-kernels[cu13]`, `tilelang`, `tokenspeed-mla`) — all resolve on aarch64.
+
+### W2 — THE THREE UNBLOCKS + DRIFT
+**(a) Gemma-4 — ✓** `import transformers.models.gemma4` + `Gemma4Config/Processor/
+TextConfig/VisionConfig` all import under transformers 5.14.1. The decisive block is gone.
+
+**(b) DFlash (HEADLINE) — ✓ CONSTRUCTS + RUNS + NON-ZERO ACCEPTANCE under MRV2.**
+`LLM(unsloth/Qwen3.6-27B-NVFP4, speculative_config={method:dflash, model:z-lab/Qwen3.6-27B-DFlash,
+num_speculative_tokens:16})` with `VLLM_USE_V2_MODEL_RUNNER=1`: the mixed sliding/full-attn
+draft (#40898) now RESOLVES `DFlashDraftModel`, loads (24.74 GiB), and generates coherent
+tokens on all 4 prompts. The DFlash `_prepare_dflash_inputs_kernel` JIT-compiled+ran DURING
+inference (drafter is LIVE, not dead). **Acceptance_len = 2.21 / 8.8 / 4.75 / 4.57** (all
+well above the dead-drafter floor 1.0). **Backend note:** forcing `FLASH_ATTN` FAILS on
+sm_121 ("FP8 KV cache requires FA3 on SM90 or FA4 on SM100"); **auto-select works** — vLLM
+picks `flashinfer-native` non-causal decode w/ fp8 KV on `arch=sm121` (the #48167 Blackwell
+fix is live). D1-D6 should NOT pin `FLASH_ATTN`.
+
+**(c) OLMo-3 — NOT RUN (checkpoint absent).** `allenai/OLMo-3-1025-7B` is not in the HF
+cache and W0 left only 18 GiB free (a 14 GiB re-download would leave too little headroom
+for the venv build cache), so this was deferred. Needs a re-fetch in W3 before the OLMo-3
+SACRED gate. The transformers-5.14.1 nested-`rope_parameters` fix is present in the stack.
+
+**(d) MEASURED DRIFT — the real re-capture bill (vs committed goldens):**
+
+| Gate | Path | Result | Detail |
+|---|---|---|---|
+| **Qwen3.6-27B-NVFP4** | compressed-tensors **W4A4** (fp4 acts) | **DRIFTS** | first 6 tokens identical ("capital of Germany is Berlin."), **first-divergence pos 6**, **10/16 differ**; new stack emits a `<think></think>` block. **Needs re-capture.** |
+| **Qwen3.6-35B-A3B-NVFP4** | modelopt **W4A16** | **SURVIVES** | **16/16 byte-identical.** No re-capture. |
+| **Qwen3-Coder-30B-A3B** | bf16 MoE (STRICT 6/6) | **SURVIVES** | **0/6 prompts drift** (all 16/16). No re-capture. |
+| **Qwen3-4B dense** | bf16 near-tie (distributional gate) | 5/16 point-drift | near-tie noise (2 prompts differ by 1 token); distributional gate likely absorbs, re-validate. |
+
+**Verdict on the drift bill:** the §3 estimate ("~4 core re-captures") is a **worst case**;
+MEASURED, only the **27B W4A4** STRICT golden actually drifts. **35B (W4A16) and Coder are
+bit-stable** — the true-fp4-activation path (27B) is the sensitive one; W4A16 + bf16 MoE
+reproduce exactly. W3 re-capture is materially cheaper than planned: **1 STRICT re-capture
+(27B) + a near-tie re-validation of the small-dense set**, not a full ~30-row campaign.
+(32B-NVFP4A16 + the op-level goldens still owe a W3 diff — not measured here.)
+
+**GO/NO-GO = GO.** Target stack runs the NVFP4 gate models on GB10; DFlash constructs+runs
+under MRV2; drift is small. Proceed to W3 (targeted 27B re-capture + OLMo-3 fetch + 32B/op
+diff) → W4 (mechanical re-sync) → W5 (pin flip). Evidence on dgx: `~/work/pin-drift/`
+(`dflash_stats.log`, `drift_{27b,35b}.log`, `out_coder/`, `out_4b/`); build log
+`~/work/vllm_build.log`; source `~/work/vllm-src-5559679`.
