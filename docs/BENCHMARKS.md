@@ -70,6 +70,24 @@ multimodal 27B); `limit_mm_per_prompt=0` + gpu_util 0.30 fixed it (26.2 GiB weig
 `scripts/spec/d0_dflash_oracle_capture.py --mode spec-on` (env `VLLM_USE_V2_MODEL_RUNNER=1`);
 evidence `tests/parity/goldens/dflash_27b/{D0_VERDICT.md,dflash_27b_spec_{on,off}.json}`.
 
+**DFlash D2 (`DF-DRAFT-MODEL`) - drafter model + non-causal in-block attention CODE LANDED
++ CPU-GATED (2026-07-26, `CLAIM-DFLASH-D2`).** `benchmark_binding=false` (a correctness
+gate, NOT a throughput number - the drafter has no speed A/B until the engine loop, D4/D6).
+No GPU/nvcc on the dev box this session, so the D2 verification is the deterministic CPU
+unit gate: the new `vt::DFlashBlockAttention` op passes 5 cases / 12 assertions (hand-checked
+non-causal attention where query 0 attends to the future key, the RED causal-vs-non-causal
+separation proving the mask is load-bearing, per-request block isolation, the SWA window
+bound, and GQA), and the draft-model context-free block forward passes 5 cases / 95
+assertions (runs + finite, the RED full-attention-layer-causal-flip shifting the logits by
+~1e-2 where a byte-identical rerun is exactly 0, end-to-end block isolation, the fc
+aux-combine vs an independent reference plus a RED reversed-tap-order check, and the
+4x-sliding + 1x-full attention-mode resolution). The causal attention every other model uses
+is untouched: the existing `test_ops_attention` (23 assertions) and `test_qwen3_forward`
+(1028 assertions) re-pass unchanged. PENDING on dgx (promotes D2 to a passing gate): the
+draft forward's parity against a dumped vLLM DFlash-draft reference (harness
+`scripts/spec/d2_dflash_draft_ref.py`), the CUDA build + compute-sanitizer on the new kernel,
+and the 27B SACRED 235/235 + 27B MTP 9/9 inertness re-runs.
+
 **Pin-advance target SELECTED (SCOPE only, no measurement) - PENDING execution
 (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, `.agents/specs/pin-advance.md`).** The
 single coherent target that unblocks DFlash + Gemma-4 multimodal + OLMo-3 is vLLM

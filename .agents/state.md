@@ -24604,3 +24604,45 @@ Records advanced: `.agents/specs/dflash-spec-decode.md` (§0 D0/D1 RESULT + §6 
 rows), engine-matrix `SPEC-DFLASH` READY→`ACTIVE`, model-matrix DFlash row BLOCKED→SPIKE
 (+ checklist 🚫→📋 + rollup), roadmap C3, coordination `CLAIM-DFLASH-D0D1`, ledger, this
 entry, README, `docs/BENCHMARKS.md`.
+
+---
+
+## 2026-07-26 — DFlash D2 (`DF-DRAFT-MODEL`, `CLAIM-DFLASH-D2`): drafter model + the project's FIRST non-causal attention primitive — CODE LANDED + CPU-GATED, GPU gate PENDING
+
+Base `origin/main` `8095b0e3`, isolated worktree `dflash-d2`. Implemented the biggest
+new DFlash brick (spec §1.3), the three genuinely-new pieces:
+
+- **NEW `vt::DFlashBlockAttention` op** (`kDFlashBlockAttention` + `DFlashBlockAttentionArgs`,
+  `ops.h`/`ops.cpp`; CPU `DFlashBlockAttentionKernel` in `cpu_ops.cpp` = authoritative;
+  CUDA kernel in `cuda_ops.cu` mirrors the causal `AttentionKernel` block-reduction with
+  per-block bounds + the bidirectional/window mask). The project's FIRST non-causal /
+  bidirectional attention: per-request (1+k) block, full layers `causal=false` (no mask),
+  SWA layers causal-in-window, f32 online softmax, GQA. A SEPARATE op — the causal
+  `kAttention`/`kPagedAttention` are byte-identical (untouched).
+- **`qwen3_dflash` draft model** (`qwen3_dflash.{h,cpp}`): plain 5-layer Qwen3-dense decoder
+  reusing `dense_attn_block.h` ops, attention routed through the new op per
+  `ResolveQwen3DFlashAttnModes` (mirrors `_resolve_layer_attention`); fc aux-combine
+  (`CombineAuxFeatures`), mask-embed, final norm, lm_head. Loader `qwen3_dflash_weights.cpp`
+  (q/k/v->qkv + gate/up concat per the vLLM stacked mapper). NO registry TU (arch reg +
+  speculator wiring = D4, matching the MTP precedent; registering `DFlashDraftModel` would
+  break the curated `test_model_registry` count/hybrid golden).
+
+CPU GATE GREEN (built + run on the dev box, no GPU needed): `test_ops_dflash_block_attn`
+5/12 (hand-checked non-causal + RED causal-vs-non-causal + block isolation + SWA window +
+GQA); `test_qwen3_dflash_forward` 5/95 (forward runs + RED full-layer-causal-flip + block
+isolation + fc ref + RED reversed tap order + attn-mode resolution). INERTNESS at the
+behavior level: existing causal `test_ops_attention` 9/9·23 + `test_qwen3_forward` 5/1028
+UNCHANGED.
+
+PENDING on dgx (promotes D2 SPIKE->DONE; the dev box has NO GPU/nvcc this session): draft-
+forward parity vs a dumped vLLM DFlash-draft reference (harness
+`scripts/spec/d2_dflash_draft_ref.py`, mm-limited + gpu_util 0.30), CUDA `-Werror` build +
+non-causal primitive CUDA==CPU bit-exact + compute-sanitizer 0 on the new kernel, 27B
+SACRED 235/235 + MTP 9/9 re-runs, and the loader's exact on-disk key spelling confirmed
+against the checkpoint key dump. D3-D6 (context-KV precompute, `prepare_dflash_inputs`,
+engine loop, FULL CG) remain.
+
+Records advanced: spec §0 D2 RESULT + §6 D2 row, kernel-matrix `KERNEL-ATTN-DFLASH-BLOCK`,
+model-matrix DFlash rows (note), engine-matrix `SPEC-DFLASH`, roadmap, coordination
+`CLAIM-DFLASH-D2`, ledger, this entry, README, `docs/BENCHMARKS.md`. NOT pushed; FULL SHA
+reported to caller.

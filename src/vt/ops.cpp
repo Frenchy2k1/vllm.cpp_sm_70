@@ -2066,6 +2066,39 @@ void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor
       q, out, query, key, value, args);
 }
 
+void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                          const Tensor& value, const DFlashBlockAttentionArgs& args) {
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
+           "dflash-block-attn: query/key/value/out rank-3 [T,Hq/Hkv,D]");
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  VT_CHECK(key.shape[0] == t && value.shape[0] == t,
+           "dflash-block-attn: query/key/value token count must match");
+  VT_CHECK(key.shape[2] == d && value.shape[2] == d,
+           "dflash-block-attn: key/value head_dim must match query");
+  VT_CHECK(value.shape[1] == hk, "dflash-block-attn: key/value must share the kv-head count");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hq && out.shape[2] == d,
+           "dflash-block-attn: out must be [T,Hq,D] matching query");
+  VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
+           "dflash-block-attn: Hq must be a positive multiple of Hk (GQA broadcast)");
+  VT_CHECK(args.scale > 0.0f, "dflash-block-attn: scale must be set (> 0), e.g. head_dim^-0.5");
+  VT_CHECK(args.num_reqs >= 1 && args.cu_seqlens != nullptr,
+           "dflash-block-attn: cu_seqlens (host, num_reqs+1) required");
+  VT_CHECK(args.cu_seqlens[0] == 0 && args.cu_seqlens[args.num_reqs] == static_cast<int32_t>(t),
+           "dflash-block-attn: cu_seqlens must span [0,T]");
+  VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype,
+           "dflash-block-attn: query/key/value must share one float dtype");
+  VT_CHECK(IsOutFloat(out.dtype), "dflash-block-attn: out must be f32 or bf16");
+  VT_CHECK(query.IsContiguous() && key.IsContiguous() && value.IsContiguous() &&
+               out.IsContiguous(),
+           "dflash-block-attn: contiguous tensors required");
+  VT_CHECK(query.device == q.device && key.device == q.device && value.device == q.device &&
+               out.device == q.device,
+           "dflash-block-attn: device mismatch (query/key/value/out/queue)");
+  reinterpret_cast<DFlashBlockAttentionFn>(GetOp(OpId::kDFlashBlockAttention, q.device.type))(
+      q, out, query, key, value, args);
+}
+
 void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                      Tensor& v_cache, const Tensor& slot_mapping) {
   VT_CHECK(k.rank == 3 && v.rank == 3,

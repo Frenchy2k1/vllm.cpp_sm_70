@@ -29,9 +29,13 @@ MATRICES = {
     # (which IMPLEMENTATION of an op runs when a device has more than one — the
     # selection layer above every kernel family here, distinct from
     # `KERNEL-CUDA-DISPATCH-AOT`, which selects an ARCH for one implementation).
+    # 35 since 2026-07-26: +`KERNEL-ATTN-DFLASH-BLOCK` (the DFlash draft's in-block
+    # attention — the project's FIRST non-causal / bidirectional attention primitive,
+    # a genuinely separate op from the causal `kAttention`/`kPagedAttention`; SPEC-DFLASH
+    # D2, `CLAIM-DFLASH-D2`).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 34),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 35),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
