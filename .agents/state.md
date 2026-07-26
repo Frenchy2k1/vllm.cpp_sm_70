@@ -24188,3 +24188,37 @@ gate).
 - **★ TIER CLOSED:** the recent-dense TEXT tier is CLOSED — all 8 families accounted for
   (Granite-3/StableLM/InternLM2/Phi-3-4/Phi-1-2/MiniCPM/MiniCPM3 SACRED-landed; Command-R
   HF-gate-blocked; OLMo-3 oracle-pin-blocked; + Yi/InternLM3 landed here). No trivial-tail rows remain.
+
+## 2026-07-26 — CUDA-ARCH EXPANSION (W10): cross-family BUILD-SUPPORTED fan-out (`CLAIM-CUDA-ARCH-EXPANSION`)
+
+- **What.** Continued the additive GPU-arch sweep (roadmap `ROAD-V1-D1`, "expand GPU
+  architecture support directly from vLLM"). W0 scoped the gap vs vLLM's
+  `CUDA_SUPPORTED_ARCHS` (`/home/mudler/_git/vllm/CMakeLists.txt:112,115,117` @ `e24d1b24`
+  = `7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0` on CUDA≥13, +`10.1;10.3;12.1` on `≥12.8,<13`,
+  with `a`/`f` gencode variants); our set was `121a`(runtime)/`120a`(W8)/`90a`(W9).
+- **Brought up build-supported (portable-kernels-only, mirror sm_90a):** Ampere/Jetson/Ada
+  `sm_80/86/87/89` (major 8), datacenter Blackwell `sm_100a/103a` (major 10), `sm_110`
+  (major 11). All resolve the five fast-path FEATURE-TABLE cells EMPTY (deviation #2 — no
+  wgmma/tcgen05/Ampere body), so only the portable C++/CUDA kernels compile. **ZERO
+  kernel/model/runner/sampler edits** — W9's `VT_FP4_MMA_SM120A` guards already generalized
+  the cross-family single-arch compile; the fan-out is build-config + configure-test + records.
+- **COMPILE-VERIFY on dgx (nvcc 13.0, cutlass 4.5.0, `~/work/archexp`, base `b28174e6`,
+  `-DVLLM_CPP_TRITON=OFF`):** all seven configure all-features-DISABLED; the per-major
+  representatives `sm_80`/`sm_100a`/`sm_110` each build `-Werror` 0-warn (`EXIT=0`),
+  `cuobjdump -lelf libvllm.a` = **16 TUs of real per-arch SASS and nothing else** (the sm_90a
+  16-portable-TU shape; 22 fast-path TUs absent). Same-major siblings share the bodies and
+  are pinned in `CudaArchFeaturesTest.cmake`. No GPU touched (CPU/nvcc compile only).
+- **SCOPED-OUT, non-additive (recorded, NOT forced):** `sm_70` (Volta — nvcc 13.0 rejects
+  `sm_70`, and no bf16 tensor cores); `sm_75` (Turing — nvcc accepts a trivial kernel but the
+  portable paged-attn TU FAILS `incomplete type "…fragment<matrix_a,16,16,16,__nv_bfloat16,…>"`
+  at `cuda_paged_attn.cu:1797`, measured — needs a real fp16/non-tensor-core attention body);
+  `sm_101a` (nvcc 13.0 rejects it — toolkit-blocked here). A vLLM-COMPETITIVE path for any
+  cross-family arch is a separate kernel campaign (fast-path bodies + widened cells).
+- **HONESTY.** Build-supported ≠ runtime support: no board here beyond GB10 sm_121a, no gate
+  model has executed on any added arch, and there are NO fast-path kernels for these families
+  at all. The `sm_121a` GB10 SACRED path is byte-identical (only comment text changed in
+  `CMakeLists.txt`; the test file runs only under `cmake -P`).
+- **Additivity proof.** `git diff --stat` = build-config (`CMakeLists.txt` comment +
+  `cmake/CudaArchFeaturesTest.cmake`) + records only; zero `.cu`/`.cpp`/`.h` under
+  `src/`/`include/` touched. Not pushed; FULL SHA in the ledger. `BACKEND-CUDA-ARCH-ADDITIVITY`
+  §W10 DONE.

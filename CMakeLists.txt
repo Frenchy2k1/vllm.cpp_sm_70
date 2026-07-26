@@ -78,6 +78,21 @@ set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CP
 #                 kernels compile — build-supported, NOT vLLM-competitive, and
 #                 runtime-UNPROVEN (no Hopper board here). See backend-matrix.md
 #                 BACKEND-CUDA-SM090 and cuda-arch-additivity.md §W9.
+#   80 86 87 89   Ampere (A100 / consumer 30-series / Jetson Orin) and Ada
+#   100a 103a     (sm_89), datacenter Blackwell (sm_100/sm_103), and sm_110 — the
+#   110           CROSS-FAMILY BUILD-SUPPORTED FAN-OUT (spec §W10). Single-arch,
+#                 PORTABLE-KERNELS-ONLY exactly like 90a: every fp4/cutlass/
+#                 marlin/fa2 feature resolves DISABLED (no fast-path body for
+#                 these families), so only the portable C++/CUDA kernels compile.
+#                 BUILD-supported and runtime-UNVERIFIED (no such board here).
+#                 sm_80 and sm_100a were compiled end to end `-Werror` 0-warn on
+#                 dgx as the per-major representatives; the same-major siblings
+#                 (86/87/89, 103a) share the identical portable bodies. sm_70
+#                 (Volta, dropped by nvcc 13) and sm_75 (Turing, no bf16 tensor
+#                 cores → the portable bf16-WMMA path will not compile) are NOT
+#                 build-supported — they need a real fp16/non-tensor-core kernel
+#                 body, a scoped follow-up. See backend-matrix.md
+#                 BACKEND-CUDA-SM0{80,86,87,89}/SM10{0,3}/SM110 and §W10.
 # A cross-FAMILY FAT list (e.g. "90a;121a") resolves its features honestly but
 # does NOT compile — the sources are gencode'd for the whole list, so the sm12x
 # fp4 PTX is rejected on compute_90a; per-source gencode narrowing (spec W7) is
