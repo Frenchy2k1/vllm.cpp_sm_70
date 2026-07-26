@@ -1,7 +1,10 @@
 # AUDIO track — the genuinely-new AUDIO modality (A0–A3)
 
-**Status: A0 + A1 + A2 LANDED (2026-07-25; A0/A1 `CLAIM-AUDIO-PIPELINE`, A2
-`CLAIM-AUDIO-ENCODER`). A3 (e2e audio→text on Voxtral-Mini-3B) REMAINING.** This is
+**Status: A0 + A1 + A2 + A3 LANDED (2026-07-25; A0/A1 `CLAIM-AUDIO-PIPELINE`, A2
+`CLAIM-AUDIO-ENCODER`, A3 `CLAIM-AUDIO-E2E`). The AUDIO leg of the #1
+Audio/Video/Image priority is CORRECTNESS-COMPLETE end-to-end (audio→text on
+Voxtral-Mini-3B). Only A2-follow (USM-Conformer, Gemma-4 family) + A3 speed
+remain.** This is
 the modality-first, oracle-runnable
 path that stands up audio on the smallest native-tower vehicle
 (`openai/whisper-small`) before carrying it to Voxtral-Mini-3B (A3) and Gemma-4
@@ -222,18 +225,85 @@ tower fully, NOT the Conformer.
 
 ---
 
-## 1. REMAINING (A3)
+## 0c. What LANDED (A3 — the FIRST e2e AUDIO→TEXT understanding)
+
+Row `ENG-MM-AUDIO-E2E` (engine-matrix, `ACTIVE`, owner `CLAIM-AUDIO-E2E`) + the
+`MODEL-MM-voxtral-voxtral-for-conditional-generation` model row advanced
+`INVENTORIED`→`ACTIVE`.
+
+**Vehicle + oracle (verdict: downloadable + oracle-runnable).**
+`mistralai/Voxtral-Mini-3B-2507` is NOT HF-gated (`model_info().gated == False`);
+downloaded the `load_format=mistral` consolidated.safetensors (8.8 GiB, 761 tensors)
+onto dgx. The pinned oracle vLLM 0.25.0 (+ mistral_common 1.11.5 + `soundfile`)
+CONSTRUCTS and RUNS the audio→text path (`config_format=mistral`,
+`load_format=mistral`, `tokenizer_mode=mistral`). Golden captured for a deterministic
+30 s clip + "Describe what you hear" prompt (`scripts/mm/a3_voxtral_oracle_capture.py`):
+vLLM greedy is **K=5 self-DETERMINISTIC** ⇒ gate form = STRICT (the near-tie-robust
+fallback then applies only for our different-kernel encoder). Golden = 48 tokens, a
+real description ("The audio begins with a series of sustained, low-pitched hums or
+drones…"). Fixtures committed (WAV, log-mel/mel/sinusoid goldens, prompt+golden
+tokens, near-tie result), content-hashed.
+
+**The forward (`voxtral.{h,cpp}`, additive).** Encoder = the A2
+`WhisperAudioEncoderForward` instantiated at Voxtral's Whisper-large-v3 encoder
+config (d_model 1280 / 32 layers / 20 heads / head_dim 64 / ffn 5120 / 128 mel bins /
+1500 src-pos — the A2 tower is fully config-driven, reused verbatim; k_proj no-bias
+as A2; sinusoid computed via `transformers.sinusoids`, dumped golden). Projector =
+`AudioLanguageAdapter` (downsample-concat reshape `[1500,1280]`→`[375,5120]` factor 4,
+then `w_in`→`nn.GELU()`(erf)→`w_out`, NO bias — voxtral.py:382-412,660-668). Merge =
+`Qwen3VLMergeMultimodal` (modality-agnostic masked-scatter) into the 375 audio-token
+(id 24) rows. Decode = `VoxtralGenerateGreedy` over the LANDED shared dense forward
+(`dense_attn::AttnBlock`, qk-norm-optional/1-D NeoX rope/GQA/paged FA2) with the ONLY
+forks being inputs_embeds start + untied lm_head. Weight loader reads the mistral
+consolidated names (`mm_whisper_embeddings.*` encoder/projector/embed, `layers.N.*`
+Mistral, `output`=lm_head).
+
+**The decisive bug (RED evidence).** The mistral-CONSOLIDATED q/k weights are stored
+in the Meta-interleaved rope layout; vLLM applies a Meta→HF-NeoX row PERMUTE on the
+mistral load path (verified bit-exact: `permute(wq)==vLLM q_proj`,
+`scripts/mm/a3_voxtral_wcheck.py`). Loading them raw gave a WRONG decoder — text-only
+1/22, e2e 0/48. Adding `PermuteQKBf16` (q 32 heads, k 8 heads; v/o raw) fixed it:
+text-only 22/22, first audio token exact.
+
+### The A3 gate (PASS 14/14) — e2e audio→text vs vLLM 0.25.0
+
+`tests/vllm/multimodal/test_voxtral_e2e.cpp`, GPU under `flock` on a cutlass-ON build
+(banner CONFIRMED), sibling 27B NOT co-resident, `VLLM_VOXTRAL_SAFETENSORS`→the
+consolidated checkpoint:
+- **log-mel** (A1 processor at Voxtral 128-mel config) rel-L2 **7.7e-7** vs oracle;
+  **375** audio-embed rows (1500/4).
+- **STRICT prefix 33/48** exact vs the vLLM greedy golden (the pipeline reproduces
+  vLLM greedy token-for-token up to the first bf16 near-tie).
+- **Decoder proven token-exact:** feeding vLLM's EXACT audio embeddings into our
+  decoder → **48/48**. So the ONLY residual is our audio ENCODER's bf16-kernel
+  divergence (encoder rel-L2 8.7% = the A2 ~0.28%/layer envelope over 32 layers;
+  vLLM's encoder is bf16 too — bit-exact across different GEMM/attn kernels is
+  infeasible, A2 §tolerance).
+- **Binding gate = the ratified near-tie-robust gate** (exactly as M3c/M3d):
+  teacher-force vLLM on OUR 48-token sequence — **worst gap 0.0 nats, 0 over-band
+  failures**; the SOLE greedy branch point (pos 33) is a **4-way EXACT bf16 tie** at
+  -2.069 nats (our token, `19246`, `7759`, and the golden `3401` all at -2.0685), and
+  every one of our 48 tokens is vLLM's teacher-forced argmax. `voxtral_neartie.json`
+  committed; `scripts/mm/a3_voxtral_neartie_gate.py`.
+
+**Inertness (proven).** `git diff --stat` = 2 modified lines only (`CMakeLists.txt`
++1 source line, `tests/CMakeLists.txt` +test wiring) + new additive files. NO shared
+forward / kernel / runner / registry / other-model TU edited ⇒ byte-identical by
+construction; re-ran **Mistral text 541/541**, **A1 77/77**, **A2 203/203**. Clean
+CUDA `-Werror` 0 warn. NO new CUDA kernel (reuses A2 im2col+GEMM + the merge scatter)
+⇒ compute-sanitizer not required; `check-device-leakage` unchanged. `benchmark_binding
+=false`, speed pending (a target is DONE only at token-exact AND vLLM throughput).
+
+---
+
+## 1. REMAINING (A2-follow + A3 speed)
 
 - **A2-follow — USM Conformer tower** (Granite-Speech-2b), the Gemma-4-family audio
   tower delta (Conv2d stride-2 semicausal subsample + Conformer conv-module +
   relative-position attention + softcap). New kernels get compute-sanitizer 0. GPU
   under `flock`. (Scoped above; not built.)
-- **A3 — e2e AUDIO→text gate.** `Voxtral-Mini-3B`: native Whisper-class encoder
-  (A2) + projector (RMSNorm+Linear, `vt::` ops) + masked-scatter merge (REUSE the
-  `VLGenerateCore`/`Qwen3VLMergeMultimodal` pattern) into the LANDED Mistral decoder
-  → forked greedy decode. Gate: audio→text token-exact vs vLLM 0.25.0, gate form BY
-  MEASUREMENT (K=5 self-determinism → STRICT else near-tie). GPU under `flock`,
-  memory-careful (~9.4 GiB, never OOM-reboot GB10).
+- **A3 speed** — the audio→text throughput grid vs vLLM 0.25.0 (every-axis), the
+  remaining bar before A3 is `DONE` (correctness is complete).
 
 ---
 
@@ -306,7 +376,15 @@ throughput; A1 is `ACTIVE` (feature-parity + inertness proven, speed pending).
    measured bf16-depth envelope vs the dumped oracle (post_conv 4.7e-3, block0
    6.6e-3, encoder-output 3.0e-2), RED-first (stride/pos/final-LN blow it), GPU
    under flock on a cutlass-ON build. (USM Conformer A2-follow owed.)
-4. **Audio e2e (A3, SACRED)** — owed.
+4. **Audio e2e (A3, SACRED)** — PASS. Full C++ pipeline (log-mel→A2 encoder at
+   Voxtral config→downsample4→AudioLanguageAdapter→merge→Mistral greedy) vs the vLLM
+   0.25.0 golden. Gate form BY MEASUREMENT: vLLM greedy K=5 DETERMINISTIC ⇒ STRICT
+   is the bar; STRICT prefix 33/48 exact, then (bit-exact infeasible — encoder uses
+   different bf16 GEMM/attn kernels than vLLM's cuBLASLt+FLASH_ATTN) the ratified
+   near-tie-robust gate PASSES (teacher-forced worst gap 0.0 nats, sole branch a
+   4-way bf16 tie). Decoder proven token-exact (ref-audio 48/48). RED-first: the
+   mistral q/k rope-permute bug drove text-only 1/22 & e2e 0/48 → fixed. GPU under
+   flock, cutlass-ON.
 5. **Build/records.** Clean CPU `-Werror` 0 warn; `check-device-leakage`
    unchanged; the record checkers green. (No CUDA kernel added.)
 6. **SPEED** — PENDING (`benchmark_binding=false`); a target is `DONE` only at
@@ -328,7 +406,7 @@ family incl. Gemma-4 (G3, once its oracle block clears).
 | A1 — C++ audio INPUT pipeline + inert seam (decode/resample/log-mel/expansion/mm-hash) | **DONE** | feature-parity 77/77 (rel-L2 1.96e-7, ids+hash bit/byte-exact) + inertness |
 | A2 — audio encoder TOWER (Whisper-class, `whisper-small`) | **DONE** | tower fidelity gate PASS 203/203 (post_conv 4.7e-3, block0 6.6e-3, encoder-output 3.0e-2, bf16 envelope; RED-first stride/pos/final-LN blow it; GPU under flock, cutlass-ON) |
 | A2-follow — USM Conformer tower (Granite-Speech-2b) | OWED | Conformer tower rel-L2 within bf16 envelope vs oracle dump, RED-first; compute-sanitizer 0 on new kernels (Conv2d subsample, conv-module, rel-pos) |
-| A3 — e2e audio→text on Voxtral-Mini-3B (encoder + projector-merge into LANDED Mistral) | OWED | audio→text token-exact vs vLLM 0.25.0, gate form by measurement |
+| A3 — e2e audio→text on Voxtral-Mini-3B (encoder + projector-merge into LANDED Mistral) | **DONE** | e2e gate PASS 14/14: STRICT prefix 33/48 vs vLLM greedy + ratified near-tie-robust gate PASS (worst gap 0.0 nats); decoder token-exact (ref-audio 48/48); inert (Mistral 541/541 + A1 77/77 + A2 203/203). Speed pending |
 
 ### Risks/decisions
 - **D1 — log-mel is a silent-corruption hazard.** Gated against the oracle

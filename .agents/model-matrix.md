@@ -16,8 +16,8 @@ a practical unit that one agent can spike without silently dropping aliases.
 ## Architecture-support checklist
 
 At-a-glance view of which architectures we have actually engaged, and how far.
-**326 architecture rows are inventoried at the pin**; 39 are past `INVENTORIED`
-(engaged), the remaining 287 are known-but-not-started long tail. Every mark
+**326 architecture rows are inventoried at the pin**; 40 are past `INVENTORIED`
+(engaged), the remaining 286 are known-but-not-started long tail. Every mark
 below is grounded in the row's lifecycle `State` cell plus its ledger evidence,
 and this section is CI-enforced against those rows by
 [`scripts/check-model-checklist.py`](../scripts/check-model-checklist.py): a mark
@@ -37,17 +37,17 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 
 | State | Rows |
 |---|---|
-| ACTIVE | 14 |
+| ACTIVE | 15 |
 | GATING | 3 |
 | PARTIAL | 3 |
 | READY | 1 |
 | SPIKE | 14 |
 | BLOCKED | 4 |
-| INVENTORIED | 287 |
+| INVENTORIED | 286 |
 | DONE | 0 |
 | **Total** | **326** |
 
-Engaged architectures (the 39 non-`INVENTORIED` rows):
+Engaged architectures (the 40 non-`INVENTORIED` rows):
 
 | Support | Architecture | Family / example | Status | Row |
 |---|---|---|---|---|
@@ -56,6 +56,7 @@ Engaged architectures (the 39 non-`INVENTORIED` rows):
 | ✅ | `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B (text path) | text-gen STRICT token-exact 235/235 vs vLLM 0.25.0; mm INPUT pipeline (M0/M1) landed + processor-parity gate PASS; **M3-W0 landed** (vision-inclusive checkpoint `Qwen/Qwen3.6-27B` 51.7 GiB bf16 with 333 `visual.*` FOUND+fits+downloaded; 27B vision config resolved — depth 27/out 5120/**EMPTY deepstack**; MRoPE `[11,11,10]`/rot 64/theta 1e7; the bf16 GDN-hybrid loader ALREADY handles it). **M3-b LANDED 2026-07-25: image→text STRICT token-exact 32/32 vs vLLM 0.25.0** — Qwen3.6-27B image understanding works end-to-end (forked GDN-hybrid VL forward gated on mm input ⇒ text byte-identical; 27B/35B/Coder inertness re-passed 235/315/138). **M3d LANDED 2026-07-25: video→text STRICT token-exact 32/32 vs vLLM 0.25.0** — video works end-to-end too (`Qwen3_5VLGenerateGreedyVideo` reuses the M3c processor/windowed-tower/video-MRoPE on the GDN-hybrid backbone). **Qwen video modalities COMPLETE: image+video both work e2e** (audio N/A for Qwen). Row stays `PARTIAL` — **speed pending** | `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation` |
 | ✅ | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (text path) | text-gen STRICT token-exact 315/315 vs vLLM 0.25.0; mm INPUT pipeline (M0/M1) landed + processor-parity gate PASS, vision tower pending (M2/M3) so the row is `PARTIAL` (text-only) | `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` |
 | 🚧 | `Qwen3VLForConditionalGeneration` | Qwen3-VL-4B-Instruct (image + video vehicle) | **IMAGE e2e WORKING (M2 CLOSED): STRICT image→text token-exact 32/32 vs vLLM 0.25.0** (full pipeline: C++ processor→M2a tower→merge→forked MRoPE/DeepStack greedy decode); correctness complete, **speed pending**. Underpinned by mm processor (M1), vision tower (M2a faithful), M2b/M2c numeric contracts (85/85). **VIDEO (M3c 2026-07-25): preprocessing + full wiring LANDED + unit-gated** — video-processor pixel_values_videos BIT-exact 41/41 (RED-first), video MRoPE positions BIT-exact vs vLLM, per-frame windowed tower faithful (rel-L2 0.072); video e2e **NEAR-TIE-ROBUST PASS** (gate form chosen BY MEASUREMENT 2026-07-25): teacher-forcing vLLM 0.25.0 on OUR exact tokens proves the sole divergence is ONE genuine bf16 near-tie at tok22 (gap **0.125 nats**, our token vLLM's 2nd of 4 tied choices) with every downstream token == vLLM's teacher-forced argmax at gap **0.0** — the tower already accumulates in f32 everywhere (matches vLLM), so the residual is the irreducible bf16 envelope, NOT a fixable numeric gap. VIDEO understanding now WORKS e2e (correctness complete, **speed pending**); image e2e STRICT 32/32 unchanged (the deterministic strict-pass proof, no regression). | `MODEL-MM-qwen3-vl-qwen3-vlfor-conditional-generation` |
+| ✅ | `VoxtralForConditionalGeneration` | Voxtral-Mini-3B-2507 (AUDIO→text, audio-track A3) | **FIRST e2e AUDIO UNDERSTANDING: audio→text vs vLLM 0.25.0** — A2 Whisper-large-v3 encoder at Voxtral config (128 mel/1280/32L/head_dim 64) + AudioLanguageAdapter projector + masked-scatter merge into the LANDED Mistral/Llama decoder (untied lm_head, mistral-consolidated q/k rope-permute) → forked greedy. Gate form BY MEASUREMENT: vLLM greedy K=5 deterministic ⇒ STRICT is the bar; STRICT prefix 33/48 exact vs vLLM greedy, then the ratified near-tie-robust gate PASSES (worst teacher-forced gap 0.0 nats, sole branch = a 4-way bf16 tie at -2.069 nats) — bit-exact infeasible (encoder uses different bf16 GEMM/attn kernels). Decoder proven token-exact (ref-audio→48/48). Additive driver/loader gated on audio ⇒ Mistral text byte-identical. **Speed pending** | `MODEL-MM-voxtral-voxtral-for-conditional-generation` |
 | ✅ | `OPTForCausalLM` | OPT-125m | STRICT token-exact 6/6 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-opt-optfor-causal-lm` |
 | ✅ | `DeepseekV2ForCausalLM` | DeepSeek-V2-Lite (MLA) | SACRED gate 8/8 token-exact vs vLLM 0.25.0; speed short (attributed, W9) | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` |
 | ✅ | `LlamaForCausalLM` | Llama-3.2-1B dense | STRICT token-exact 16/16 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-llama-llama-for-causal-lm` |
@@ -447,7 +448,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-MM-step3-vl-step3-vlfor-conditional-generation` | `Step3VLForConditionalGeneration` | `registry.py:565`; `vllm/model_executor/models/step3_vl.py::Step3VLForConditionalGeneration` | conditional generation / image | MM processor; encoder/merge; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-step3p7-step3p7-for-conditional-generation` | `Step3p7ForConditionalGeneration` | `registry.py:566`; `vllm/model_executor/models/step3p7.py::Step3p7ForConditionalGeneration` | conditional generation / image | MM processor; encoder/merge; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-ultravox-ultravox-model` | `UltravoxModel` | `registry.py:567`; `vllm/model_executor/models/ultravox.py::UltravoxModel` | conditional generation / audio+image | MM processor; encoder/merge; audio/ASR frontend; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
-| `MODEL-MM-voxtral-voxtral-for-conditional-generation` | `VoxtralForConditionalGeneration` | `registry.py:568`; `vllm/model_executor/models/voxtral.py::VoxtralForConditionalGeneration` | conditional generation / audio+image | MM processor; encoder/merge; audio/ASR frontend | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-voxtral-voxtral-for-conditional-generation` | `VoxtralForConditionalGeneration` | `registry.py:568`; `vllm/model_executor/models/voxtral.py::VoxtralForConditionalGeneration` | conditional generation / audio→text (audio-track A3) | A1 log-mel (landed) + A2 Whisper-class encoder tower (reused at Voxtral config) + LANDED Mistral/Llama decoder | [audio-track.md](specs/audio-track.md) §0c/§1 (A3) | `ACTIVE` | **audio→text e2e gate PASS 14/14** (near-tie-robust, GPU dgx-only): `include/vllm/model_executor/models/voxtral.h` + `src/vllm/model_executor/models/voxtral.cpp` + `tests/vllm/multimodal/test_voxtral_e2e.cpp`; oracle `scripts/mm/a3_voxtral_oracle_capture.py` + `scripts/mm/a3_voxtral_neartie_gate.py`; fixtures `tests/vllm/multimodal/fixtures/voxtral_audio/` | `CLAIM-AUDIO-E2E` |
 | `MODEL-MM-voxtral-realtime-voxtral-realtime-generation` | `VoxtralRealtimeGeneration` | `registry.py:569`; `vllm/model_executor/models/voxtral_realtime.py::VoxtralRealtimeGeneration` | conditional generation / audio+image | MM processor; encoder/merge; audio/ASR frontend | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-cohere-asr-cohere-asr-for-conditional-generation` | `CohereAsrForConditionalGeneration` | `registry.py:571-574`; `vllm/model_executor/models/cohere_asr.py::CohereAsrForConditionalGeneration` | conditional generation / audio+image | MM processor; encoder/merge; cross-attention; audio/ASR frontend; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-nemotron-parse-nemotron-parse-for-conditional-generation` | `NemotronParseForConditionalGeneration` | `registry.py:575-578`; `vllm/model_executor/models/nemotron_parse.py::NemotronParseForConditionalGeneration` | conditional generation / audio+image | MM processor; encoder/merge; cross-attention; audio/ASR frontend; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |

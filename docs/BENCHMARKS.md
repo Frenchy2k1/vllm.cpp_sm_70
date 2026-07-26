@@ -279,6 +279,29 @@ construction; `check-device-leakage` unchanged; im2col+existing GEMM -> no compu
 **`benchmark_binding=false`, PENDING** - this is the encoder tower proven in ISOLATION, NOT audio->text
 (A3 e2e on Voxtral-Mini-3B is owed); no throughput number is claimed.
 
+**AUDIO track A3 - the FIRST e2e AUDIO->TEXT understanding: audio->text on `mistralai/Voxtral-Mini-3B-2507`,
+e2e gate PASS 14/14, NO throughput (2026-07-26, `CLAIM-AUDIO-E2E` [spec](../.agents/specs/audio-track.md) §0c).**
+CORRECTNESS: the full C++ pipeline (A1 log-mel `[128,3000]` -> the A2 `WhisperAudioEncoderForward` at
+Voxtral's Whisper-large-v3 encoder config [1280/32L/head_dim 64/128 mel] -> downsample-concat `[375,5120]`
+-> `AudioLanguageAdapter` projector `[375,3072]` -> `Qwen3VLMergeMultimodal` scatter at the 375 audio-token
+rows -> forked greedy over the LANDED Mistral/Llama decoder, untied lm_head; loader applies vLLM's
+Meta->NeoX q/k rope PERMUTE for the mistral consolidated format) vs the vLLM 0.25.0 golden
+(`scripts/mm/a3_voxtral_oracle_capture.py`, `load_format=mistral`, vLLM greedy K=5 DETERMINISTIC).
+Vehicle+oracle verdict: Voxtral-Mini-3B downloadable (NOT HF-gated) + oracle-runnable. GATE
+(`tests/vllm/multimodal/test_voxtral_e2e.cpp`, GPU under `flock`, cutlass-ON banner CONFIRMED, sibling 27B
+NOT co-resident): log-mel rel-L2 **7.7e-7**, 375 audio rows; **STRICT prefix 33/48** vs vLLM greedy;
+decoder proven token-exact (vLLM ref-audio embeds -> **48/48**). Bit-exact infeasible (encoder uses
+different bf16 GEMM/attn kernels than vLLM's cuBLASLt+FLASH_ATTN; encoder rel-L2 8.7% = the A2 bf16-depth
+envelope over 32 layers) => the ratified near-tie-robust gate (exactly as M3c/M3d, `a3_voxtral_neartie_gate.py`):
+teacher-forced **worst gap 0.0 nats, 0 over-band failures**, sole greedy branch (pos 33) a **4-way EXACT
+bf16 tie** at -2.069 nats, every one of 48 tokens = vLLM's teacher-forced argmax. RED: the mistral q/k
+rope-permute bug drove text-only 1/22 & e2e 0/48 -> fixed 22/22 (`a3_voxtral_wcheck.py`: `permute(wq)==vLLM q`).
+Reproduce: `VLLM_VOXTRAL_SAFETENSORS=<consolidated.safetensors> ./build/tests/test_voxtral_e2e` under
+`flock $HOME/gpu.lock`. Inert (additive, `git diff --stat` = 2 modified lines; Mistral 541/541 + A1 77/77 +
+A2 203/203 byte-identical; `check-device-leakage` unchanged; no new CUDA kernel -> no compute-sanitizer).
+SPEED: **`benchmark_binding=false`, PENDING** - correctness complete; the audio->text throughput grid vs
+vLLM is owed before A3 is `DONE`.
+
 **Multimodal M3-W0 - Qwen3.6-27B image, checkpoint+oracle GROUNDED, e2e gate PENDING (2026-07-25, `CLAIM-MULTIMODAL-M3`).**
 Disposition: **NO throughput measured; the image e2e correctness gate is NOT yet run (M3-b, next brick).**
 W0 RESOLVED the gating fact: the vision-inclusive checkpoint is `Qwen/Qwen3.6-27B` (51.7 GiB uniform
