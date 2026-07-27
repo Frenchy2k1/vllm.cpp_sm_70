@@ -26222,3 +26222,30 @@ risk, unlike anything that touches reduction order.
 
 **Goal:** 19.07 of 27.9 tok/s, 1.46x remaining. Decode ~5.2 s vs MLX-LM's 4.59 s
 (1.13x); prefill ~1.5 s vs ~0.47 s.
+
+---
+
+## 2026-07-27 — attention threadgroup width: 2d is optimal, +2.3%
+
+Decode launches one threadgroup per (head, query token) = 16 for this model, and
+the group was sized by `d` alone (128 threads). Since the score loop now scales
+with SIMDGROUP count, a wider group buys parallelism there.
+
+| threadgroup | throughput | attention GPU |
+|---|--:|--:|
+| d = 128 | 19.07 tok/s | 1039 ms |
+| **2d = 256** | **19.51** | **966 ms** |
+| 4d = 512 | 18.66 | — |
+
+**2d optimal; 4d is WORSE than baseline.** That locates the trade-off exactly:
+the score loop gains from more simdgroups, the V loop uses only `d` threads, so
+past 2d the idle majority costs more than the scores gain.
+
+**It also names the real fix:** parallelise V ACROSS simdgroups (each taking a
+slice of the chunk's keys into its own partial accumulator in threadgroup memory,
+then reduce), or go to flash-decoding KV splitting. Width alone is now exhausted.
+
+Gate 16/16 unchanged, max gap still 0, no re-capture (thread count does not
+change accumulation order).
+
+**Goal:** 19.51 of 27.9 tok/s, 1.43x remaining.
