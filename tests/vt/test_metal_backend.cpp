@@ -1282,6 +1282,54 @@ TEST_CASE("Metal routes m=1 BT matmul to the GEMV kernel and matches the CPU ora
     }
     const double f32_nmse = den > 0.0 ? num / den : num;
     MESSAGE("GEMV f32 1x2048x512 NMSE vs f64 oracle = " << f32_nmse);
+    // bf16 INPUTS with an f32 OUTPUT. This is the only arm that can see the
+    // GEMV's bf16 accumulation: the all-bf16 arms below are dominated by output
+    // store rounding (~2.8e-06 for any correct kernel), and the all-f32 arm
+    // above does not take the bf16 code path at all. Without this, a change to
+    // the bf16 reduction order is unmeasurable.
+    {
+      const int64_t k2 = 2048, n2 = 512;
+      std::mt19937 rng2(0xBEE5u);
+      std::uniform_real_distribution<float> dd(-1.0f, 1.0f);
+      std::vector<float> ah2(static_cast<size_t>(k2)), bh2(static_cast<size_t>(k2 * n2));
+      for (auto& x : ah2) x = Bf16RT(dd(rng2));
+      for (auto& x : bh2) x = Bf16RT(dd(rng2));
+      std::vector<double> ref2(static_cast<size_t>(n2), 0.0);
+      for (int64_t col = 0; col < n2; ++col) {
+        double acc2 = 0.0;
+        for (int64_t kk = 0; kk < k2; ++kk)
+          acc2 += double(ah2[static_cast<size_t>(kk)]) *
+                  double(bh2[static_cast<size_t>(col * k2 + kk)]);
+        ref2[static_cast<size_t>(col)] = acc2;
+      }
+      auto upb = [&](const std::vector<float>& h) {
+        void* pp = metal.Alloc(h.size() * sizeof(uint16_t));
+        std::vector<uint16_t> pk(h.size());
+        for (size_t i = 0; i < h.size(); ++i) pk[i] = vt::F32ToBF16(h[i]);
+        metal.Copy(q, pp, pk.data(), pk.size() * sizeof(uint16_t));
+        return pp;
+      };
+      void* da2 = upb(ah2);
+      void* db2 = upb(bh2);
+      void* dc2 = metal.Alloc(static_cast<size_t>(n2) * sizeof(float));
+      Tensor ta2 = Tensor::Contiguous(da2, vt::DType::kBF16, d, {1, k2});
+      Tensor tb2 = Tensor::Contiguous(db2, vt::DType::kBF16, d, {n2, k2});
+      Tensor tc2 = Tensor::Contiguous(dc2, vt::DType::kF32, d, {1, n2});
+      vt::MatmulBT(q, tc2, ta2, tb2);
+      metal.Synchronize(q);
+      std::vector<float> got2(static_cast<size_t>(n2));
+      metal.Copy(q, got2.data(), dc2, got2.size() * sizeof(float));
+      double nu = 0.0, de = 0.0;
+      for (size_t i = 0; i < got2.size(); ++i) {
+        const double df = double(got2[i]) - ref2[i];
+        nu += df * df;
+        de += ref2[i] * ref2[i];
+      }
+      const double bf_nmse = de > 0.0 ? nu / de : nu;
+      MESSAGE("GEMV bf16-in/f32-out 1x2048x512 NMSE vs f64 oracle = " << bf_nmse);
+      CHECK(bf_nmse <= 5e-4);
+      metal.Free(da2); metal.Free(db2); metal.Free(dc2);
+    }
     // f32 accumulation over K=2048 should sit near 1e-14, as the tile GEMM's
     // f32 arm does (3.7e-14). Orders above that would mean a real defect, not a
     // reduction-order difference.
