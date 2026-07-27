@@ -66,6 +66,27 @@ low-conc medians forfeits the tail/high-conc/throughput wins (net-negative). NEX
 the append-only state/ledger and the specs; not re-copied here per the compaction
 directive.*
 
+**★ SGLang elevated to a FULL parity target (user-directed 2026-07-27,
+`CLAIM-SGLANG-PARITY-PROGRAM`).** "We need the same vLLM approach there for
+reaching parity." The SGLang floor under `ROAD-V1-A` (`BACKEND-GATE-CUDA-SGLANG*`)
+is now backed by the full vLLM-parity apparatus: a whole-surface tabular
+inventory ([sglang-matrix.md](sglang-matrix.md), 44 rows classified
+FUSED 23 / SGLANG-DISTINCT 8 / INVENTORIED 5 / OUT-OF-SCOPE 8) and the
+SGLang-as-oracle gate methodology ([specs/sglang-parity-oracle.md](specs/sglang-parity-oracle.md)):
+SGLang stood up as a correctness cross-check + a binding perf floor on dgx GB10
+via the digest-pinned arm64 cu130 image (no from-source build needed). SGLang is
+a COMPETITOR, not the mirror source — vLLM stays the behavior truth; a
+SGLANG-DISTINCT behavior is an opt-in over our vLLM-derived design, never a fork.
+The honest finding: most of SGLang's surface is FUSED (shared lineage); the value
+is the precise SGLANG-DISTINCT map (LPM scheduling, in-batch prefix
+de-prioritization, radix eviction strategies, jump-forward, custom logit
+processors, batch-invariant determinism, PD disaggregation, two-batch EP overlap),
+ranked in the oracle spec §6. This program does NOT add a new portfolio row — it
+deepens `ROAD-V1-A`; the implementation rows (`KV-SGLANG-RADIX-CACHE`,
+`ENG-SGLANG-BEHAVIOR-FLAG`) remain owned by `CLAIM-SGLANG-RADIX-SCOPE`, and the
+residual perf-gate blocker stays `SERVE-ASYNC-LLM` (our comparable async server),
+not SGLang runnability.
+
 **★ ACTIVE PHASE (user-directed 2026-07-20/21) — the BREADTH SWEEP.** With 27B/35B parity,
 the `KERNEL-FUSION-FRAMEWORK` extensibility cornerstone (W0-W4), and the FIRST additive model
 (Qwen3 dense: correctness-complete + c1 effective every-axis parity, c8 within a cross-cutting

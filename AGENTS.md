@@ -438,6 +438,13 @@ submitting AI-assisted code, read
   dispatch parity inventory across vLLM and its runtime dependency chain.
 - [.agents/backend-matrix.md](.agents/backend-matrix.md) — backend/platform and
   CUDA target matrix, including native-competitor performance gates.
+- [.agents/sglang-matrix.md](.agents/sglang-matrix.md) — the SGLang parity
+  PROGRAM's whole-surface inventory: every SGLang runtime capability classified
+  FUSED / SGLANG-DISTINCT / INVENTORIED / OUT-OF-SCOPE vs our vLLM-derived
+  engine, with the SGLang-as-oracle gate methodology in
+  [.agents/specs/sglang-parity-oracle.md](.agents/specs/sglang-parity-oracle.md).
+  SGLang is a full parity target (competitor perf floor + correctness
+  cross-check), not the mirror source — vLLM remains the behavior truth.
 - [.agents/specs/](.agents/specs/) — live feature implementation specs,
   scoping reports, semantics notes, feasibility studies, and design references.
 - [.agents/state.md](.agents/state.md) — **append-only state log**: progress,
