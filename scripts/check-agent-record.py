@@ -73,7 +73,14 @@ ENGINE_PREFIXES = (
 # in isolation; a genuinely-new engine capability, distinct from the A0/A1
 # `ENG-MM-AUDIO-PIPELINE` INPUT row). Bumped for a real new row, never to make a
 # failing state transition pass.
-ENGINE_ROWS = 118
+# 120 since 2026-07-27: +`KV-SGLANG-RADIX-CACHE` (SGLang RadixAttention
+# behavior-parity scope — verdict: already fused into our block-hash APC, the
+# `--enable-radix-attention` flag is an alias) and +`ENG-SGLANG-BEHAVIOR-FLAG`
+# (the SGLang-alike runtime survey + the enable/disable control: cache-aware LPM
+# scheduling is the one genuinely-distinct flag-worthy behavior; overlap ==
+# `ENG-ASYNC-SCHED`, jump-forward deferred). Both `SPIKE`,
+# `CLAIM-SGLANG-RADIX-SCOPE`, spec `specs/sglang-radixattention.md`.
+ENGINE_ROWS = 120
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
