@@ -26364,3 +26364,36 @@ PagedAttentionKernel picks by query length.
 **Where prefill stands now:** GEMM 650 ms vs MLX's ~469 ms whole prefill, so
 `vt_matmul_bt_mm` (79-87% of MLX's steel GEMM) is now essentially the entire
 remaining prefill gap. Attention is no longer the story.
+
+---
+
+## 2026-07-27 — Metal GEMM: epilogue LDS 16 KB -> 2 KB landed; bf16 tiles REJECTED
+
+With prefill attention fixed, `vt_matmul_bt_mm` (653 ms, 2.2 TFLOP/s vs MLX
+steel's ~3.07) is the entire remaining prefill gap. Two experiments:
+
+**LANDED — per-simdgroup epilogue.** `sc` staged the whole 64x64 f32 tile, 16 KB
+of the kernel's 24 KB. Each simdgroup only reads back the 8x8 fragment it just
+stored, so a per-simdgroup 8x8 scratch needs no threadgroup barrier: kernel drops
+to 10 KB. GEMM 653 -> 642 ms (-1.7%), TTFT 1388 -> 1351 ms, +0.4% throughput.
+
+The SMALLNESS is the finding. Freeing 14 KB — enough to take residency from 2
+threadgroups per core to 6 — bought under 2%, so **this kernel is not
+occupancy-limited**. Kept anyway: faster, simpler, one barrier fewer.
+
+**REJECTED — bf16 tiles + bf16 mma with f32 accumulate.** The last structural
+difference from MLX steel: it keeps tiles in the source dtype, we widened to f32
+while staging. Numerically a no-op (bf16 x bf16 is exact in f32) and it halves
+LDS write traffic. Measured GEMM 640 -> 677 ms, **5.7% WORSE**. Reverted.
+Apple's bf16 simdgroup path does not beat f32 mma here; tile dtype is not the
+source of MLX's advantage. Do not retry without new evidence about the hardware.
+
+**Excluded as this GEMM's limiter so far:** tile width, barrier traffic, staging
+latency (double buffering), mma precision (half AND bf16), epilogue occupancy.
+Landed: staging vectorisation, per-simdgroup epilogue. Still unexplained: 2.25
+vs 3.07 TFLOP/s. The untested structural difference left is the fragment layout
+per simdgroup (ours 4x2 covering 32x16; MLX uses fewer, fatter simdgroups with
+more register reuse per staged element).
+
+**Standing goal status (b=1, Qwen3-1.7B-bf16, p=512 g=128):** decode 26.6 vs
+MLX-LM 27.89 = **95.4%**; total-basis 20.91 vs 25.31 = **82.6%**. NOT parity.

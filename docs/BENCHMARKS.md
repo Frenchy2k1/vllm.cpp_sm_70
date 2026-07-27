@@ -2555,6 +2555,35 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal GEMM: epilogue LDS cut 16 KB -> 2 KB, and bf16 tiles REJECTED (2026-07-27)
+
+Two experiments against the last big prefill item, `vt_matmul_bt_mm` at 653 ms
+(2.2 TFLOP/s against MLX steel's ~3.07).
+
+**Landed - per-simdgroup epilogue.** `sc` staged the whole 64x64 f32 tile: 16 KB
+of the kernel's 24 KB. A simdgroup only reads back the 8x8 fragment it just
+stored, so a per-simdgroup 8x8 scratch needs no threadgroup barrier and takes the
+kernel to 10 KB. GEMM **653 -> 642 ms (-1.7%)**, TTFT 1388 -> 1351 ms, throughput
++0.4% at both p=512 and p=2048.
+
+The small size IS the result: freeing 14 KB of threadgroup memory, enough to take
+residency from 2 threadgroups per core to 6, bought under 2%. **This kernel is
+not occupancy-limited.** Kept because it is faster, simpler and drops a barrier.
+
+**Rejected - bf16 threadgroup tiles with f32 accumulate.** MLX's steel GEMM keeps
+tiles in the source dtype and multiplies bf16; ours widened every element to f32
+while staging. Numerically this is a no-op (a bf16 x bf16 product needs 16
+mantissa bits and is exact in f32) and it halves LDS write traffic, so it looked
+like the last structural difference. Measured: GEMM **640 -> 677 ms, 5.7% WORSE**;
+p=512 20.84 -> 20.77, p=2048 10.32 -> 10.25. Reverted. Apple's bf16 simdgroup
+path does not beat f32 mma here, so tile dtype is not where MLX's advantage lives.
+
+Running list of things measured and EXCLUDED as this GEMM's limiter: tile width,
+barrier traffic, staging latency (double buffering), mma precision (half, and now
+bf16), and epilogue occupancy. Staging vectorisation was the one that landed.
+
+---
+
 ## Metal query-tiled PREFILL attention on Apple M4 (2026-07-27) - up to +32%
 
 Prefill attention ran one threadgroup per (head, query token), so every one of
