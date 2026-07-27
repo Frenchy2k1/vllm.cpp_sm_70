@@ -3010,6 +3010,477 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## REJECTED: eliding the identity softmax rescale (2026-07-27)
+
+Per 16-key chunk each simdgroup issues 40 mma: 16 for QK, **8 for the diagonal
+softmax rescale**, and 16 for PV. `corr` is exp(mold - mnew), exactly 1.0 whenever
+the running max does not move, and `diag(1) @ O` is bit-identical to O — so
+skipping it when all eight rows have corr == 1.0 should have removed 20% of the
+inner loop's matrix ops for free.
+
+Measured: prefill attention **46.6 -> 47.5 ms**, i.e. no gain and slightly worse.
+Reverted.
+
+**The exactness argument was right even though the perf was not.** Correctness
+held at 16/16 PASS with NO golden re-anchor, which is the outcome predicted from
+`diag(1) @ O` being bit-identical — worth noting because the three preceding
+kernel changes all moved a near-tie and needed the oracle. Predicting which
+changes perturb numerics is now reliable; predicting which ones pay is not.
+
+Why it does not pay: in CAUSAL prefill each query's window grows as key blocks
+arrive, so the running max keeps moving and corr is rarely exactly 1.0. The eight
+scalar `sdiag` reads plus the branch then cost more than the eight mma they guard.
+The idea would fare better on a non-causal or short-context shape, which is not
+this workload.
+
+---
+
+## Prefill attention softmax: one simdgroup per row, +0.19% (2026-07-27)
+
+Implements the target identified below. The online softmax ran ONE THREAD PER
+QUERY ROW — 32 of 256 threads, 12% — looping serially over the chunk's keys while
+224 waited at the barrier, wedged between two mma passes that use all 256. It is
+now ONE SIMDGROUP PER ROW, four rows each, with lanes covering the keys and
+`simd_max`/`simd_sum` reductions that need no barrier.
+
+**Prefill attention 55.3 -> 46.6 ms (-16%).**
+
+**Paired verdict** (warm, p=512 g=128, 6 ABBA blocks): +0.15 +0.06 +0.02 +0.07
++0.03 +0.02 -> **+0.19% median, faster in 6/6 blocks, p = 0.031.** Warm total
+23.88 -> 23.94.
+
+The end-to-end figure is small because 8.7 ms of kernel time sits in a ~5.3 s
+run; it was predicted at ~0.15% before measuring, and the paired harness is what
+makes a change this size resolvable at all.
+
+**Re-anchored, as predicted.** The reduction-order change flipped a near-tie
+(prompt[5] tok=10), which was budgeted for. Oracle: max gap **0.125 nats**, the
+same bar as the golden replaced, 0 over bar, 0 outside top-K — and **59
+token-divergent positions against the previous 60**, so the new sequence is
+marginally CLOSER to vLLM's greedy rather than further from it.
+
+Attention is now at 646 GFLOP/s (30.1 GFLOP / 46.6 ms) against the GEMM's 2851 —
+4.4x, down from 5.2x. The remaining ratio is still unexplained.
+
+---
+
+## Prefill attention: "deepen BK" is BLOCKED; the softmax is the real target
+
+Two results from scoping the lead below before building on it. The first kills
+the fix I proposed; the second replaces it with a better one.
+
+**"Deepen BK" is blocked by a precision/LDS tension, not merely unimplemented.**
+Threadgroup budget is 32 KB:
+
+| config | LDS |
+|---|--:|
+| current BQ=32 BK=16 sv=f32 | 27.0 KB |
+| BQ=32 BK=32 sv=f32 | 43.0 KB |
+| BQ=16 BK=32 sv=f32 | 34.5 KB |
+| BQ=32 BK=32 sv=bf16 | 35.0 KB |
+| **BQ=16 BK=32 sv=bf16** | **26.5 KB (fits)** |
+
+Every configuration that fits needs a bf16 `sv` — and bf16 `sv` FORCES bf16 `P`,
+because `simdgroup_multiply_accumulate` requires matching operand types. bf16 P
+is exactly what moved a greedy token when the mma kernel landed (prompt[0]
+tok=5). So this direction costs precision to buy amortisation, which is a real
+trade rather than a free win, and should not be attempted without deciding that
+question first.
+
+**The better target, which needs NO extra LDS: the online softmax runs ONE THREAD
+PER QUERY ROW — 32 of 256 threads, 12% occupancy** — each looping serially over
+the chunk's 16 keys, while the other 224 threads wait at the barrier. The mma
+stages either side of it use all 256. That idle fraction sits between two mma
+passes in the innermost loop, which is consistent with attention measuring
+547 GFLOP/s where the GEMM sustains 2851.
+
+Reworking it as one simdgroup per query row (8 simdgroups covering 32 rows, 4
+rows each, with `simd_max`/`simd_sum` over the 16 keys) uses all 256 threads and
+changes no allocation. It DOES change the reduction order, so expect a near-tie
+flip and budget for a golden re-anchor.
+
+**Both are arithmetic, not measurement.** The LDS table is exact; the 12% figure
+is exact; the causal link to 547 GFLOP/s is a hypothesis.
+
+---
+
+## Standing at 96.0-96.4%, and the largest remaining lead (2026-07-27)
+
+Thermally matched, warm, after four landed kernels:
+
+| | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| decode | 27.24 | 27.79 | **98.0%** |
+| total | 23.91 | 24.90 | **96.0%** |
+| prefill TTFT | 613 ms | 534 ms | 87% |
+
+```
+gap 172 ms = prefill 80 ms + decode 93 ms
+prefill excess ~= 35 ms attention + 15 ms GEMM + 30 ms other
+```
+
+**Largest single lead: prefill attention is STILL 5.2x slower per FLOP than our
+own GEMM.**
+
+```
+prefill attention   30.1 GFLOP in 55 ms  =  547 GFLOP/s
+prefill GEMM      1440   GFLOP in 505 ms = 2851 GFLOP/s
+at GEMM rate attention would be 10.6 ms (MLX implied ~20)
+```
+
+This is the same roofline signal that found the original 21x gap — the mma
+rewrite took attention from 108 to 547 GFLOP/s, which was the big structural win,
+but it did NOT reach the rate the same device sustains on a GEMM. ~44 ms of the
+80 ms prefill gap is here.
+
+**Likely cause, stated as hypothesis:** the tiling is BQ=32 x BK=16, so each
+threadgroup runs a full online-softmax pass (threadgroup reductions, per-row
+rescale via `diag(corr) @ O`) for only 16 keys, giving ~40 mma per softmax. A
+deeper BK amortises the softmax over more keys, but `sv` is f32 (needed for
+probability precision — see the mma landing entry) so BK=32 would put the K/V
+tiles at 24 KB and collide with the 32 KB budget. A bf16 `sv` with an f32 P would
+free the room; whether that keeps the near-tie goldens is the open question.
+
+**Not measured. Hypothesis with a roofline behind it, which is the same standing
+the KV-layout lead had before a probe refuted it.**
+
+---
+
+## Fused preamble ROUTED onto the default path: +0.35% (2026-07-27)
+
+Closes the second blocker. The recipe branch in `dense_attn_block.h` now covers
+bf16 as well as f32, **gated on the rope cache being enabled** — the bf16
+branch's default RoPE is `RopeNeox` while the recipe's step is `RopeFromCache`,
+so without that guard adoption would silently swap one RoPE implementation for
+another and move the near-tie goldens for a reason unrelated to fusion. With it,
+the recipe's Tier-0 composite is exactly the standalone sequence the else-branch
+ran, for either dtype, so adoption is behaviour-preserving by construction.
+
+`vt_rms_norm` 3616 -> 1824 dispatches; 896 fused replace 2688.
+
+**Paired verdict** (warm, p=512 g=128, 6 ABBA blocks): +0.12 +0.08 +0.08 +0.09
++0.14 +0.07 -> **+0.35% median, faster in 6/6 blocks, p = 0.031.** Warm total
+23.81 -> 23.90 against MLX-LM's 24.79: **96.0% -> 96.4%**.
+
+**No golden re-anchor needed** and 16/16 PASS, with `kAttnQkNormRope
+selections=7168` proving the fused kernel is what ran on Metal.
+
+**One test change, flagged deliberately.** The backend proof asserted every op in
+`kQwen3Ops` had `selections > 0`, and `kRopeFromCache` now legitimately reports
+ZERO because the fusion absorbs it. The proof is now subsumption-aware: it
+accepts zero selections for `kRopeFromCache` only when the subsuming
+`kAttnQkNormRope` actually ran, and still demands zero declines from both. That
+preserves the assertion's intent — nothing silently fell back to CPU — rather
+than relaxing it. "The test failed so I edited the test" deserves scrutiny even
+when justified, which is why it is called out here rather than buried.
+
+**Measured value was below the estimate**: ~0.35% against a predicted ~0.5-1%.
+The dispatch reduction is real and large (2688 -> 896) but the small kernels it
+removes are cheaper per launch than the 6.7 us average used for sizing.
+
+---
+
+## Fused qk-norm-RoPE preamble: kernel LANDED and validated, not yet on the hot path
+
+`vt_attn_qk_norm_rope` — per-head RMSNorm(q) + RMSNorm(k) + partial NeoX RoPE in
+one dispatch, replacing three. Registered as the `kAttnQkNormRope` recipe's
+`fast_op` on **Metal only**, so CPU and CUDA keep the byte-exact composite through
+FusedChain's `OpRegistered` guard and no CPU reference was needed.
+
+**Validated against its own golden:** a new Metal-vs-CPU-composite test gives a
+worst element error of **1.43e-06** (bar 1e-4), and asserts
+`OpRegistered(kAttnQkNormRope, kMETAL)` first so the FUSED path is provably what
+ran. That test exists because `test_ops_fused_chain`'s Metal cases are CUDA-gated
+and skip — the same coverage hole that let an incorrect mma attention kernel pass
+everything earlier in this session.
+
+**Dispatch reduction, measured:** on the f32 attention path, 896 fused dispatches
+replace 1792 rms_norm + 896 rope = 2688; `vt_rms_norm` drops 3616 -> 1824.
+
+**It does NOT move the benchmark yet, and the reason is recorded rather than
+glossed:** `dense_attn_block.h:392` routes the preamble through the recipe only
+when `attn_f32`, and the benchmarked Qwen3-1.7B runs the bf16 preamble
+(`VT_QWEN3_ATTN_F32=1` selects the f32 diagnostic path). Extending that condition
+to bf16 is the remaining step. Both the recipe and this kernel are dtype-generic,
+but the bf16 branch's default RoPE is `RopeNeox` rather than `RopeFromCache`
+unless the rope cache is enabled, so the extension must be gated on whatever
+selects the cache — otherwise it silently swaps one RoPE implementation for
+another and the near-tie goldens move for the wrong reason.
+
+Estimated value once routed: 84 dispatches/token -> 28, ~0.38 ms/token against a
+0.7 ms/token decode deficit.
+
+---
+
+## The fused attention preamble: scoped precisely (2026-07-27)
+
+Correcting the entry below, which said `kAttnQkNormRopeGate` is "CUDA only" and
+Metal falls back. True, but that is the GATED recipe used by the Qwen3.5
+full-attention path. **Qwen3 DENSE — the model being benchmarked — uses the
+gate-free `kAttnQkNormRope`, and that recipe carries `fast_op = kNoFastOp`: no
+fused kernel exists on ANY backend, by design.**
+
+`include/vt/recipes.h` states why: "Tier: composite-only (per-head 3-D rope
+operands are outside the generic 2-D Tier-1 interpreter)." So the composite
+faithfully dispatches the three standalone ops, which is exactly what the decode
+profile shows — 56 q-norm + 56 k-norm + 28 rope per token.
+
+**This makes the work larger than the previous entry implied.** It is not
+"register the existing CUDA kernel for Metal"; there is no kernel to register.
+The task is:
+
+1. a new standalone op (RMSNorm(q) + RMSNorm(k) + partial NeoX RoPE, per head,
+   from a cos/sin cache),
+2. a CPU reference so the parity gate has a golden,
+3. a Metal kernel,
+4. `fast_op` set on the recipe so `vt::FusedChain` routes to it,
+5. tests, plus a probable Metal golden re-anchor (RoPE after an in-place norm
+   changes nothing numerically, but the fused kernel's accumulation order might).
+
+Sizing is unchanged: 84 dispatches/token collapse to 28, worth ~0.38 ms/token
+against a 0.7 ms/token deficit. The recipe's byte-exact composite golden is
+already specified in recipes.h, which makes step 2 tractable.
+
+**Still a hypothesis with arithmetic, not a measured result.**
+
+---
+
+## CORRECTION: fusion was dismissed on a bad inference, and IS the decode lever
+
+Earlier in this log I wrote that decode's residual could not be fusion "because
+decode is 97% GPU-busy, so there is nothing for fusion to win". **That inference
+was wrong** and it steered three subsequent experiments away from the answer.
+
+97% GPU-busy bounds the dispatch GAPS. It says nothing about launch-dominated GPU
+time INSIDE the small kernels — and `vt_rms_norm` runs at **0.65 GB/s**, which is
+almost entirely per-launch cost that is counted as busy. Fusing removes that from
+the busy time itself, not merely from the gaps.
+
+**The corrected decode arithmetic:**
+
+```
+ours    36.9 ms/tok = GEMV 34.2 + other 2.7
+MLX-LM  36.2 ms/tok
+if MLX's GEMV also runs ~99 GB/s (34.2 ms), their "other" is 2.0 ms
+=> the decode gap IS the non-GEMV overhead: 2.7 vs 2.0 ms/token
+```
+
+Closing it needs **-0.7 ms/token, i.e. 27% of small-kernel time** — not a
+bandwidth or FLOP gain anywhere.
+
+**The concrete lever, sized.** `kAttnQkNormRopeGate` — a fused q_norm + k_norm +
+RoPE attention preamble — is registered for **CUDA only**. Metal falls back to
+the composite and dispatches all three separately: 28 + 28 + 28 = **84 dispatches
+per token that a Metal realisation would collapse to 28**, saving ~56 x 6.7 us =
+**~0.38 ms/token, over half the deficit**, with the CUDA kernel as a reference
+implementation and the recipe/gate machinery already in place.
+
+Remaining candidates after that: `vt_silu_and_mul` and `vt_reshape_and_cache`
+(28 dispatches each per token, both launch-dominated).
+
+**This is a hypothesis with arithmetic, not a measured result** — the same
+standard applied to the KV-layout lead, which the probe then refuted. It is
+recorded as the next experiment, not as the answer.
+
+---
+
+## GEMV memory-level parallelism RE-TESTED under the harness: still a loss (2026-07-27)
+
+The highest-value remaining experiment, run rather than left as a suggestion.
+"GEMV memory-level parallelism" was recorded as excluded long before the paired
+harness existed, i.e. measured under a 10% noise floor against a ~2% effect, so
+it had never actually been resolved.
+
+The decode GEMV already reads `ushort4` with four accumulators, but each lane
+holds ONE outstanding weight load per iteration: load, consume, repeat. Unrolling
+by two issues both vectors before consuming either, giving the memory system two
+independent requests per lane. That is the only headroom left in an op streaming
+the whole weight matrix per token at 99 GB/s of a ~120 GB/s part.
+
+Paired verdict (decode rate, p=512, 6 ABBA blocks): -0.23 -0.31 -0.27 -0.29 -0.31
+-0.12 -> **-1.03% median, faster in 0/6 blocks, p = 0.031.** Reverted.
+
+**The original exclusion was CORRECT.** That is worth recording for its own sake:
+after the measurement floor was quantified, the natural suspicion was that every
+small-margin verdict in this log was noise. This one was not. The compiler is
+evidently already pipelining the simple loop, and the manual unroll only adds
+register pressure. Pre-harness exclusions should be re-tested when they are cheap,
+not assumed wrong.
+
+With this, the four items composing the last 3.7% all sit against roofs
+(GEMV 83% of memory peak, GEMM 97% of MLX's, mma issue rate 3.91 TFLOP/s) rather
+than against defects.
+
+---
+
+## What closing the LAST 3.7% would require (2026-07-27)
+
+Decode is the largest single remaining item (99 ms of the ~205 ms gap). Its
+composition, per token:
+
+| | ms/token | share |
+|---|--:|--:|
+| GEMV (weight streaming) | 34.2 | 93% |
+| everything else | 2.7 | 7% |
+
+The GEMV reads ~3.4 GB of weights per token at **99 GB/s, 83% of this part's
+~120 GB/s peak**. Matching MLX-LM's decode needs **-0.7 ms/token**, which means
+either:
+
+- the GEMV at **101 GB/s (85% of peak)** — a 2% bandwidth gain on a kernel
+  already near the memory roof, or
+- removing **26% of ALL non-GEMV decode time** — every norm, rope, cache write
+  and softmax, collectively.
+
+**`vt_rms_norm` is NOT the lever, despite matching the pattern.** It is entirely
+scalar `vt_load`/`vt_store`, which is exactly the defect that paid off three
+times — but the arithmetic says otherwise: 113 dispatches per token at 6.7 us
+each, touching ~4.3 KB apiece, is **0.65 GB/s**, three orders of magnitude below
+peak. It is LAUNCH-LATENCY bound, not load-width bound, so vectorising it would
+buy nothing. Cutting it needs fewer dispatches, and fusion was already measured
+at only 3% headroom total.
+
+**Honest assessment.** The remaining 3.7% is four items of 15-100 ms with no
+dominant cause, against kernels already at 83-97% of their respective roofs. That
+is a materially different regime from the session's opening, where a single
+kernel ran at 4% of peak. Further gains are available but the per-item return has
+dropped by roughly an order of magnitude, and each now needs the paired harness
+to even be visible.
+
+---
+
+## GEMM bisected: it is at 97% of MLX and NOT the remaining bottleneck (2026-07-27)
+
+Bisecting `vt_matmul_bt_mm` the same way (measurement-only stubs on the A stage,
+the B stage, the mma and the epilogue store), sync attribution at p=512:
+
+| stub | GPU ms |
+|---|--:|
+| none | 694.4 |
+| no A stage | 659.8 |
+| no B stage | 645.4 |
+| no mma | 325.8 |
+| no epilogue store | 690.3 |
+| **all four** | **189.7** |
+
+**189.7 ms with EVERY component stubbed is not kernel time.** It is 168
+dispatches x 1.13 ms of per-command-buffer overhead from
+`VT_METAL_SYNC_DISPATCH`, the artifact already documented in the
+sync-attribution correction below. Every figure from a sync-mode bisect must have
+this floor subtracted.
+
+**Corrected breakdown:**
+
+| component | ms | note |
+|---|--:|---|
+| **real GEMM total** | **505** | vs MLX's implied ~490 -> **97%** |
+| mma | 369 | 1.44 TFLOP / 0.369 s = **3.91 TFLOP/s** |
+| staging (A+B) | ~65 | already vectorised |
+| epilogue store | 4 | negligible |
+
+**This overturns the standing claim that the residual is "prefill-GEMM-led".**
+The GEMM is at 97% of MLX's and its mma issue rate (3.91 TFLOP/s) is ABOVE MLX's
+3.07 overall. It is not where the remaining time is.
+
+**Where the gap actually sits now** (warm, p=512 g=128; ours ~5.37 s vs MLX
+5.16 s, gap ~205 ms):
+
+| | ours | MLX | excess |
+|---|--:|--:|--:|
+| prefill GEMM | 505 | ~490 | 15 ms |
+| prefill attention | 55 | ~20 | 35 ms |
+| prefill other (small kernels, host) | ~80 | ~25 | ~55 ms |
+| decode | 4728 | 4629 | 99 ms |
+
+**No single item dominates any more.** The remaining ~3.7% is four items of
+15-100 ms each, which is a different kind of problem from the one this session
+started with, and worth saying plainly rather than naming a next bottleneck that
+the measurement does not support.
+
+---
+
+## Prefill attention: vectorised K/V/Q staging, +0.50% (2026-07-27)
+
+The same defect, in the mma kernel written earlier THIS session.
+`vt_paged_attention_mma` staged K, V and Q with scalar `vt_load` per element —
+exactly the pattern that had decode's V loop at 29 GB/s against the score loop's
+64. Vectorised to `ushort4` with a scalar fallback for unaligned or non-bf16
+caches.
+
+**Prefill attention 78.6 -> 55.3 ms (-30%).**
+
+Paired verdict (warm, p=512 g=128, 6 ABBA blocks): +0.12 +0.16 +0.05 +0.12 +0.17
++0.05 -> **+0.50% median, faster in 6/6 blocks, p = 0.031.** Warm total
+23.65 -> 23.76.
+
+Correctness needed NO re-anchor: this is a load-WIDTH change only — same values,
+same order, same accumulation — so the greedy sequence is untouched. 16/16 PASS
+with the existing goldens, which is the expected result and worth stating,
+because the two preceding kernel changes both DID move a near-tie and needed the
+oracle.
+
+**Cumulative on this axis: 94.5% -> ~96.3% of MLX-LM.**
+
+The lesson generalised: a kernel that reads bf16 through `vt_load` element by
+element is leaving 4x of its load width on the floor. Both attention kernels had
+it; the GEMM's staging was already vectorised, which is why it never showed up
+there.
+
+---
+
+## Decode attention: VECTORISED V accumulation, +1.66% (2026-07-27)
+
+Found by BISECTING the kernel rather than guessing a sixth mechanism. Stubbing
+each half in turn (`VT_PA_BISECT`) at 2048 context, where decode attention costs
+5.79 ms/token:
+
+| component | cost | traffic | achieved |
+|---|--:|--:|--:|
+| **V accumulation** | **4.03 ms (70%)** | 117 MB | **29 GB/s** |
+| K / scores | 1.83 ms (30%) | 117 MB | **64 GB/s** |
+
+The parts sum to the whole (5.86 vs 5.79 measured). Identical traffic, 2.2x
+apart, and the cause is in the source: the score loop had a vectorised `ushort4`
+bf16 fast path and the V accumulation called scalar `vt_load` per element — 2
+bytes per lane per load against 8. The score loop's 64 GB/s also matches the
+bandwidth probe's 69, which is what makes V's 29 the outlier rather than the norm.
+
+**This retro-explains all five refuted hypotheses.** Fusion, split-K, layout,
+threadgroup width and barrier depth all failed because the limiter was never
+parallelism or layout — it was bytes-per-instruction in ONE loop.
+
+**Landed:** each thread owns four consecutive head elements via `ushort4`, with a
+scalar fallback for unaligned or non-bf16 caches. `VT_PA_VGROUPS` 4 -> 16,
+because a key-group now needs only d/4 = 32 threads.
+
+**The first version was measured SLOWER and the harness caught it**: leaving the
+cap at 4 ran 4x32 = 128 of a 512-thread group, quartering the workers while
+quadrupling bytes/load — paired verdict **-1.65%, consistent 6/6, p = 0.031**.
+Uncapping restores full occupancy AND the wider loads.
+
+**Paired verdict on the fix** (warm, p=512 g=128, 6 ABBA blocks):
+
+| block | A | B | delta |
+|---|--:|--:|--:|
+| 0 | 23.34 | 23.74 | +0.41 |
+| 1 | 23.39 | 23.76 | +0.37 |
+| 2 | 23.34 | 23.75 | +0.41 |
+| 3 | 23.32 | 23.75 | +0.43 |
+| 4 | 23.36 | 23.73 | +0.37 |
+| 5 | 23.38 | 23.74 | +0.36 |
+
+**+1.66% median, faster in 6/6 blocks, sign test p = 0.031.** Single runs also
+show decode 26.52 -> 27.07 at p=512 and 23.10 -> 24.60 at p=2048.
+
+Warm total **23.36 -> 23.74 against MLX-LM's 24.79: 94.5% -> 95.8%.**
+
+Correctness: the reordered V summation flips one near-tie (prompt[10] tok=10), so
+the Metal goldens were re-anchored through the oracle again — vLLM 0.25.0
+teacher-forced on the new sequence, **max gap 0.125 nats**, the same worst as the
+golden it replaces, 0 over bar, 0 outside top-K. 16/16 PASS.
+
+---
+
 ## The harness works: floor 10% -> 0.9%, and SIMD-first reductions are NEUTRAL (2026-07-27)
 
 First use of `scripts/metal-paired-ab.py`, and it validates itself. The baseline

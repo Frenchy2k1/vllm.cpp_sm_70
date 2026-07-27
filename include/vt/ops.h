@@ -151,6 +151,10 @@ enum class OpId : uint8_t {
   kGdnPostConv,
   kRopeCosSinCache,
   kAttnQkNormRopeGate,
+  // Gate-FREE sibling: per-head standard RMSNorm(q)+RMSNorm(k)+partial NeoX RoPE,
+  // the Qwen3-DENSE preamble. Backends may register it as kAttnQkNormRope's
+  // fast_op; those that do not keep the byte-exact composite automatically.
+  kAttnQkNormRope,
   kFusedChain,
   kRmsNormQuantFp8,
   kRmsNormGatedQuantFp8,
@@ -633,6 +637,11 @@ using RopeCosSinCacheFn = void (*)(Queue&, Tensor&, const Tensor&, const RopeArg
 using AttnQkNormRopeGateFn =
     void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
              const Tensor&, const Tensor&, const RmsNormArgs&, const RopeArgs&);
+// Gate-free fused preamble (kAttnQkNormRope): q3/k3 are normed and rotated IN
+// PLACE, so the op takes no separate outputs. See the recipe in recipes.h.
+using AttnQkNormRopeFn =
+    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+             const Tensor&, const RmsNormArgs&, const RopeArgs&);
 using SharedExpertGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
