@@ -261,11 +261,34 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 **Metal (Apple Silicon), indicative, not binding.** Two models run end to end
 and pass correctness (OPT-125m, Qwen3-0.6B); 18 of 75 ops are native, the rest
 fall back to CPU on unified memory. Kernel work including mma prefill attention
-(4.3x) puts warm b=1 throughput at 94.5% of MLX-LM. The residual is decode
-attention running at 24% of peak bandwidth; the decode hypotheses tested so far
-are refuted (the KV-layout and flash-decoding leads both closed), and a paired
-ABBA harness with cooldown now resolves differences down to about 0.2%, below
-the remaining gap. An optional MLX GEMM provider is available via
+(4.3x), a vectorised decode V accumulation (+1.66%) and vectorised prefill
+attention staging (+0.50%) puts warm b=1 throughput at about 96.3% of MLX-LM. Bisecting the GEMM puts it at 97% of MLX's own
+(mma issue rate 3.91 TFLOP/s), so the residual is NOT GEMM-led: it is spread
+across prefill attention, small prefill kernels and decode, none dominant. The
+decode share is 93% weight streaming at 83% of the part's memory peak, so the
+remaining items sit against roofs rather than against defects: GEMV at 83% of
+memory peak, GEMM at 97% of MLX's, and a re-test of GEMV memory-level
+parallelism under the paired harness confirmed the earlier exclusion at -1.03%.
+The decode residual is non-GEMV overhead (2.7 ms/token against MLX's implied
+2.0), so the next lever is a fused qk-norm-RoPE attention
+preamble. The dense recipe (kAttnQkNormRope) is composite-only on every backend
+(fast_op = kNoFastOp), so this meant writing the kernel rather than porting one.
+That kernel now exists and is validated on Metal (worst element error 1.4e-06 vs
+the composite); the default bf16 path is now routed through it
+(gated on the rope cache), worth a measured +0.35% and taking warm b=1 throughput
+to about 96.0-96.4% of MLX-LM, with decode at 98.0%. The largest remaining lead
+is prefill attention, which at 547 GFLOP/s is still 5.2x slower per FLOP than
+this device's own GEMM; its online softmax now runs one simdgroup per query
+row rather than one thread, worth -16% on the kernel and +0.19% end to end. Its
+remaining 4.4x FLOP-rate gap to this device's own GEMM has no open structural
+idea left: BK deepening is blocked by a bf16-P precision constraint and eliding
+the identity softmax rescale measured no gain. The V-accumulation win came from BISECTING the attention
+kernel once a paired ABBA harness with cooldown made 0.2% differences
+measurable: the V loop moved 2 bytes per lane per load where the score loop
+moved 8, giving 29 GB/s against 64 on identical traffic. That also explains why
+five earlier decode hypotheses (fusion, split-K, KV layout, threadgroup width,
+barrier depth) were each refuted — the limiter was bytes per instruction in one
+loop, not parallelism or layout. An optional MLX GEMM provider is available via
 `-DVLLM_CPP_MLX=ON` and currently measures net slower than our own kernels. Full
 per-lever chronology: [docs/BENCHMARKS.md](BENCHMARKS.md) and
 [.agents/specs/metal-dispatch-attribution.md](../.agents/specs/metal-dispatch-attribution.md).

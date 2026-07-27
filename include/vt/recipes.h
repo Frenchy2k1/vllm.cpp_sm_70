@@ -347,6 +347,11 @@ constexpr FusedRecipe kAttnQkNormRope = {
     /*n=*/3,
     /*n_operands=*/8,
     /*name=*/"attn_qk_norm_rope",
+    // FAST realisation, registered per backend. A backend that does not register
+    // kAttnQkNormRope keeps the byte-exact Tier-0 composite automatically (see
+    // FusedChain's OpRegistered guard), so this is additive: only a backend that
+    // has actually implemented the fused kernel takes it.
+    /*fast_op=*/static_cast<int>(OpId::kAttnQkNormRope),
 };
 
 }  // namespace vt

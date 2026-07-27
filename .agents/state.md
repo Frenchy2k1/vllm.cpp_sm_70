@@ -27488,3 +27488,457 @@ pushed; FULL SHA reported in the closing commit.
 - **2026-07-27** — **Ampere major-8 CUDA fast-path bring-up SPIKED (derive-and-ship); Orin is the one runtime target** (`CLAIM-CUDA-AMPERE-SCOPE`; isolated worktree `.claude/worktrees/agent-adb843dde95033953` off local `main` `11e0ba36`, branch `worktree-agent-adb843dde95033953`; SPIKE ONLY — read-only on production code, no build/GPU/download; pin `555967922`/vLLM 0.26.0.dev0; NOT pushed; FULL SHA reported). USER-REFINED to DERIVE-AND-SHIP: port the Ampere fast-path kernels 1:1 from vLLM, build-verify (compile + `cuobjdump` SASS), and SHIP LABELED "derived from vLLM upstream, not hardware-tested here, community testing welcome" — a real board only upgrades the LABEL from DERIVED+BUILD-VERIFIED to RUNTIME-VERIFIED, never the code (AGENTS.md "a green link is not execution evidence"). **Deliverable:** new spec `.agents/specs/cuda-arch-ampere-fastpath.md` (all 9 required sections + a three-state SIGNAL/help-wanted matrix + the Orin W-plan). **Fast-path inventory grounded in vLLM `file:line`:** (1) **FA2** — the vendored kernels ARE the sm_80 FlashAttention-2 bodies (`src/vt/cuda/flash_attn/src/flash_fwd_split_hdim{128,192,256}_bf16[_causal]_sm80.cu`, `__CUDA_ARCH__>=800`), gencode'd `121a` only because the `fa2` FEATURE-TABLE cell (`CudaArchFeatures.cmake:234`) lists `12.0a,12.1a` — so Ampere FA2 is a ONE-CELL TABLE EDIT (widen to `8.0,8.6,8.7,8.9`); attn priority already returns FLASH_ATTN for major 8 (`cuda_attn_priority.h:80`). Upstream build gate `vllm/cmake/external_projects/vllm_flash_attn.cmake:1-46`, selection `fa_utils.py:132-250`. (2) **Marlin** int4 W4A16 GPTQ/AWQ (`MARLIN_ARCHS "8.0+PTX;12.0a;12.1a"` `CMakeLists.txt:570-572`) + fp8-input `sm_89` (`MARLIN_FP8_ARCHS "8.9;..."` `:585-589`, `sm89_kernel_*.cu` `:670`) — the Marlin MoE-WNA16 INFRA is vendored (`src/vt/cuda/marlin/libtorch_stable/moe/marlin_moe_wna16/*`, `cuda_moe_marlin.cu`, `cuda_marlin_repack.cu`) but ONLY the bf16 NVFP4 slice is instantiated for `sm_12x` (deviation #2); int4/fp8 = NEW instantiations. (3) **AllSpark** W8A16 (`ALLSPARK_ARCHS "8.0;8.6;8.7;8.9"` `:736-745`, `allspark_qgemm_w8a16.cu`+`allspark_repack.cu`) — NOT vendored, NEW body, purely Ampere. (4) **scaled-mm C2x** int8 W8A8 all + fp8 on `sm_89` (`SCALED_MM_2X_ARCHS "7.5;8.0;8.7;8.9+PTX"` `:857-867`, `scaled_mm_c2x.cu:862`, define `ENABLE_SCALED_MM_C2X`) — NOT vendored (we have only the C3x `sm_121` subset), NEW body. **VENDORED vs NEW verdict:** FA2 already vendored (table edit); Marlin infra vendored, int4+fp8 instantiations new; AllSpark + scaled-mm C2x wholly new bodies. **Orin (`sm_87`) gateable subset** (bf16 + int8 tensor cores, NO fp8, NO fp4): portable bf16/GGUF, FA2, Marlin int4 W4A16, AllSpark W8A16, scaled-mm C2x int8 → RUNTIME-VERIFIED targets; fp8 paths (C2x fp8, Marlin fp8) need `sm_89`/Ada (DERIVED-only, no board here); fp4/NVFP4 is `sm_12x`-only, out of Ampere scope. **Orin W-plan:** WA-O0 record host handle (MUST be provided, like `dgx.casa`) + `git archive` transfer (never rsync); WA-O1 portable+GGUF token-exact vs vLLM 0.25.0 oracle = FIRST non-GB10 runtime proof; WA-O2 FA2; WA-O3 Marlin int4; WA-O4 AllSpark + C2x int8; WA-O5 benchmark vs llama.cpp (non-fp4 competitor floor) + vLLM all axes. Correctness gate = token-exact vs vLLM; perf gate = ≥vLLM and ≥llama.cpp every axis. **Record moves:** new spec; `BACKEND-CUDA-SM080/086/087/089` + `BACKEND-CUDA-COMP-ALLSPARK` + `BACKEND-CUDA-COMP-SCALEDMM-C2X` → `SPIKE` (owner `CLAIM-CUDA-AMPERE-SCOPE`); `BACKEND-CUDA-COMP-MARLIN`/`-FA` KEPT `PARTIAL` (real `sm_121a` evidence NOT regressed — moving them to SPIKE would delete that evidence; Ampere leg cross-referenced instead, honesty rules override the literal "move to SPIKE" directive); backend-matrix intro; docs/STATUS.md CUDA-arch line; docs/BENCHMARKS.md NOT APPLICABLE; ledger; this entry; coordination CLAIM. Record checkers RC green. `benchmark_binding=false`.
 - **2026-07-27** — **Hopper (`sm_90a`) + datacenter-Blackwell (`sm_100/103/110`) FAST-PATH derive-and-ship SCOPING SPIKE** (`CLAIM-CUDA-DATACENTER-SCOPE`; isolated worktree `.claude/worktrees/agent-a83ea76d85c22b27b`, base `main` HEAD `11e0ba36` — hard-reset off a stale divergent ref onto local `main` before authoring, base confirmed; pin vLLM `555967922` + flashinfer-ref + cutlass 4.5.0; SCOPING, read-only on production code, NO build/GPU; NOT pushed, FULL SHA reported). **Deliverable:** `.agents/specs/cuda-arch-datacenter-fastpath.md` — the per-fast-path inventory (vLLM+dep `file:line`) + portability verdict + a per-arch/per-fast-path SIGNAL matrix for the datacenter fast-path kernel BODIES (the FRAMEWORK/arch-additivity seams are done; today every wgmma/tcgen05 fast-path FEATURE-TABLE cell resolves EMPTY, no board here). **User refinement honored (DERIVE-AND-SHIP, not scope-and-wait):** each 1:1-portable fast-path is framed as port-now → build-verify HERE → ship LABELED `DERIVED+BUILD-VERIFIED (testing-welcome)`; a board only upgrades the label. **KEY ENABLER:** a single-arch `-DVLLM_CPP_CUDA_ARCHITECTURES=90a` (or `100a`) cross-compile on the existing GB10 box emits real `sm_90a`/`sm_100a` SASS (`cuobjdump`) with NO Hopper/B200 silicon — so the build+SASS proof is achievable here (only the cross-family FAT build needs W7 gencode narrowing; single-arch does not). **PORTABILITY VERDICT (honest):** the CUTLASS C3x FP8/INT8, NVFP4-tcgen05, grouped-MoE, W4A8 and MLA kernels are CUTLASS TEMPLATE INSTANTIATIONS — vLLM writes a thin dispatch wrapper and the wgmma(Sm90)/tcgen05(Sm100) MMA+TMA lives inside cutlass 4.5.0's `CollectiveBuilder` selected by `ArchTag` — so they are genuinely 1:1-portable (`scaled_mm_sm{90,100}_fp8_dispatch.cuh`; `nvfp4_scaled_mm_kernels.cu:76-97` `Fp4GemmSm100` vs our existing `Fp4GemmSm120`; sm100 NVFP4 = our sm_12x body with `ArchTag` Sm120→Sm100). FA3 + FlashMLA are buildable hand CuTe (FA2 vendoring category), LARGE. Machete is codegen-adjacent (generated CUTLASS sources, vendor them). **DeepGEMM is the ONE genuinely codegen-blocked path** (runtime NVRTC JIT + autotune + `@torch.compile`, `deep_gemm.py:189,250,661`) → `NOT-YET-BUILDABLE / needs-real-port`, no fake shipped. **Records touched (ONLY):** NEW spec; 11 backend-matrix row State→`SPIKE` (`BACKEND-CUDA-SM090/SM100/SM103/SM110` + `COMP-MACHETE/DSV3/MOE-CUTLASS/W4A8/MLA/FLASHMLA/DEEPGEMM`; multi-arch `SCALEDMM-C3X`/`FP4` stay `PARTIAL` — not regressed); coordination CLAIM table row + note; ledger; docs/STATUS.md CUDA-arch line; docs/BENCHMARKS.md NOT-APPLICABLE entry; this entry. Touched NO `src/`/`include/`/`cmake/`/`tests/`, no Ampere/breadth rows (sibling agents), no roadmap/README/Metal. Record checkers `check-agent-record.py` + `check-doc-checkpoint.py` RC green.
 - **2026-07-27** — **beyond-vLLM CUDA breadth (Pascal/Volta/Turing) — fp16/non-tensor-core lane SCOPED (SPIKE committed, read-only, NO code/build/GPU)** (`CLAIM-CUDA-BREADTH-SCOPE`; isolated worktree `.claude/worktrees/agent-a161dbd9bd2409e46` off local `main` `11e0ba36`; NOT pushed; FULL SHA reported). Deliverable [`.agents/specs/cuda-arch-breadth-fp16.md`](specs/cuda-arch-breadth-fp16.md): the "support MORE than vLLM" lane for the older NVIDIA arches vLLM DROPS but **llama.cpp still supports** — Pascal `sm_60`/`sm_61`, Volta `sm_70`, Turing `sm_75`. **Core constraint (measured, W10 + re-verified in source):** our portable paged-attn instantiates bf16 tensor-core WMMA fragments unconditionally at `cuda_paged_attn.cu:706-717` (Ampere-only type), so the TU fails on `<sm_80` (`incomplete type …__nv_bfloat16… fragment` at `:1797` on `sm_75`); nvcc 13.0 additionally rejects `sm_70`/`sm_60`/`sm_61` outright. **De-risking find:** a scalar CUDA-core flash fallback ALREADY exists (`VT_ATTN_WMMA=0`, `cuda_paged_attn.cu:2349-2352`) — the cheapest first step is a `__CUDA_ARCH__>=800` guard on the bf16-WMMA block, not a new kernel. **llama.cpp fp16 inventory (pin `237ad9b96`, `ggml-cuda`, file:line):** attention `fattn-tile.cu:5`+`fattn-vec.cuh:21` (no-tensor-core; dispatch `fattn.cu:523-537` Pascal / `:487-495` Volta / `:457-478` Turing / enum `:332-338`), GEMM `mmvf.cu` (float mat-vec) + dequant→cuBLAS `ggml-cuda.cu:1668-1890` (router `:2751-2786`), CC gates `common.cuh:50-55,257-263,303-326,344-350,723-729` (incl. the `!=610` P40 quarter-rate-fp16 trap → `sm_61` needs fp32-accum). **Precise toolkit split (the actionable output):** **Turing `sm_75` = DERIVE-AND-SHIP NOW** (nvcc 13.0 accepts it → guard W1 + port fp16 body W2-W3 → build+SASS W4, ship labeled `DERIVED+BUILD-VERIFIED (testing-welcome)`); **Volta `sm_70` + Pascal `sm_60/61` = NOT-YET-BUILDABLE** (need a CUDA `<13` toolkit; NONE provisioned here — `ls /usr/local/cuda*` empty on dev box, dgx runs cuda-13.0). **Per-arch SIGNAL matrix** (RUNTIME-VERIFIED / DERIVED+BUILD-VERIFIED testing-welcome / NOT-YET-BUILDABLE) = a help-wanted-hardware-testing table. **Oracle honesty:** no vLLM oracle runs on these cards → correctness reference is llama.cpp-on-card + a portable/newer-card cross-check; perf floor is `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` (llama.cpp on the same old card). **Records touched (ONLY):** the spec; backend-matrix `BACKEND-CUDA-SM075`/`SM070` → `SPIKE` + NEW `SM060`/`SM061` at `SPIKE` + NEW `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` + count invariants (13→15 CUDA target rows, 12→13 competitor rows) + the `sm_70/75` intro sentence; coordination note + active-claim table row; docs/STATUS.md backend-detail note; docs/BENCHMARKS.md NOT-APPLICABLE entry; parity-ledger row; this entry. ZERO `src/`/`include/`/`cmake/` production code (read-only). Sibling Ampere/Hopper/datacenter rows, roadmap, README, Metal/demo untouched. All seven record checkers rc=0. `benchmark_binding=false`. Next executable step is spec W1 (guard the bf16-WMMA TU) → W4 (Turing build+SASS derive-and-ship).
+
+---
+
+## 2026-07-27 — decode attention: VECTORISED V accumulation, +1.66% (95.8% of MLX-LM)
+
+**Found by BISECTING the kernel instead of guessing a sixth mechanism.** Stubbing
+each half in turn (`VT_PA_BISECT`, measurement-only) at 2048 context, where decode
+attention costs 5.79 ms/token:
+
+| component | cost | traffic | achieved |
+|---|--:|--:|--:|
+| **V accumulation** | **4.03 ms (70%)** | 117 MB | **29 GB/s** |
+| K / scores | 1.83 ms (30%) | 117 MB | **64 GB/s** |
+
+Parts sum to the whole (5.86 vs 5.79). Identical traffic, 2.2x apart. Cause was
+in plain sight: the score loop had a vectorised `ushort4` bf16 path, the V
+accumulation used scalar `vt_load` per element — 2 bytes per lane per load
+against 8. The score loop's 64 GB/s matches the bandwidth probe's 69, so V's 29
+was the outlier all along.
+
+**This retro-explains all five refuted decode hypotheses.** Fusion, split-K,
+layout, threadgroup width, barrier depth — every one failed because the limiter
+was never parallelism or layout but BYTES PER INSTRUCTION in one loop. Five
+guesses cost far more than the bisect that found it, and the bisect only became
+possible once the paired harness made 0.2% measurable.
+
+**Landed:** four consecutive head elements per thread via `ushort4`, scalar
+fallback for unaligned/non-bf16. `VT_PA_VGROUPS` 4 -> 16 (a key-group now needs
+d/4 = 32 threads; pacc 16 KB, kernel ~24 KB of 32).
+
+**The first version was SLOWER and the harness caught it.** Leaving the cap at 4
+ran 4x32 = 128 of a 512-thread group — workers quartered while bytes/load
+quadrupled. Paired: **-1.65%, consistent 6/6, p = 0.031.** One block read -2.84
+against the others' -0.3, exactly the outlier that makes unpaired measurement lie.
+
+**Paired verdict on the fix** (warm p=512 g=128): +0.41 +0.37 +0.41 +0.43 +0.37
++0.36 -> **+1.66% median, 6/6 blocks, p = 0.031.** Decode 26.52 -> 27.07 (p=512)
+and 23.10 -> 24.60 (p=2048).
+
+**Warm total 23.36 -> 23.74 vs MLX-LM 24.79: 94.5% -> 95.8%.**
+
+Correctness: re-anchored through the oracle a second time (vLLM 0.25.0
+teacher-forced on the new sequence). Max gap **0.125 nats**, same worst as the
+golden replaced, 0 over bar, 0 outside top-K, 16/16 PASS.
+
+---
+
+## 2026-07-27 — prefill attention: vectorised K/V/Q staging, +0.50% (~96.3% of MLX-LM)
+
+**The same defect, in the mma kernel I wrote earlier THIS session.**
+`vt_paged_attention_mma` staged K, V and Q with scalar `vt_load` per element —
+the exact pattern that had decode's V loop at 29 GB/s against the score loop's
+64. Vectorised to `ushort4`, scalar fallback for unaligned/non-bf16.
+
+**Prefill attention 78.6 -> 55.3 ms (-30%).**
+
+Paired verdict (warm p=512 g=128): +0.12 +0.16 +0.05 +0.12 +0.17 +0.05 ->
+**+0.50% median, 6/6 blocks, p = 0.031.** Warm total 23.65 -> 23.76.
+
+**No golden re-anchor needed** — a load-WIDTH change only: same values, same
+order, same accumulation, so the greedy sequence is untouched. 16/16 PASS on the
+existing goldens. Worth stating explicitly because the two preceding kernel
+changes both moved a near-tie and needed the oracle; predicting which changes
+perturb numerics is part of knowing what you changed.
+
+**Generalised lesson:** any kernel reading bf16 through `vt_load` element by
+element leaves 4x of its load width on the floor. BOTH attention kernels had it.
+The GEMM's staging was already vectorised, which is why the defect never showed
+up there and why five decode hypotheses missed it — the bug was in the loop
+nobody had profiled in isolation.
+
+**Cumulative on this axis: 94.5% -> ~96.3%.** Remaining gap ~3.7%, now
+prefill-GEMM-led again (~540 ms against MLX's implied ~490).
+
+---
+
+## 2026-07-27 — GEMM bisected: 97% of MLX, and NOT the remaining bottleneck
+
+Bisected `vt_matmul_bt_mm` with measurement-only stubs (A stage / B stage / mma /
+epilogue store), sync attribution at p=512:
+
+| stub | GPU ms |
+|---|--:|
+| none | 694.4 |
+| no A | 659.8 |
+| no B | 645.4 |
+| no mma | 325.8 |
+| no epilogue store | 690.3 |
+| **all four** | **189.7** |
+
+**189.7 ms with everything stubbed is NOT kernel time** — it is 168 dispatches x
+1.13 ms of `VT_METAL_SYNC_DISPATCH` per-command-buffer overhead, the artifact
+already recorded in the sync-attribution correction. Subtract this floor from any
+sync-mode bisect.
+
+**Corrected:** real GEMM **505 ms** (vs MLX implied ~490 = **97%**); mma 369 ms =
+**3.91 TFLOP/s**, which is ABOVE MLX's 3.07 overall rate; staging ~65 ms;
+epilogue 4 ms.
+
+**This overturns my own repeated claim that the residual is "prefill-GEMM-led".**
+It is not. The GEMM is nearly at parity and its matrix issue rate is excellent.
+I asserted GEMM-led in several entries above on the strength of sync-mode numbers
+that carried this floor.
+
+**Where the ~205 ms gap actually sits:** prefill GEMM 15 ms, prefill attention
+35 ms (55 vs ~20), prefill other ~55 ms, decode 99 ms. **No single item
+dominates.** That is a different kind of problem from the one this session
+started with — the big structural wins are taken, and what is left is four
+moderate items.
+
+The bisect levers were NOT landed: they put a branch in the k-loop's init and
+their value is diagnostic, not runtime. Re-add them behind `VT_MM_BISECT` when
+next needed; the patch is small and the method is now proven three times
+(decode attention, prefill attention, GEMM).
+
+---
+
+## 2026-07-27 — what the LAST 3.7% would cost, and why rms_norm is not the lever
+
+Decode is the largest single remaining item (99 ms of ~205 ms). Per token: GEMV
+34.2 ms (93%), everything else 2.7 ms. The GEMV streams ~3.4 GB of weights at
+**99 GB/s = 83% of the ~120 GB/s peak**.
+
+Matching MLX-LM's decode needs **-0.7 ms/token**, i.e. either the GEMV at
+**101 GB/s (85% of peak)** — 2% more on a kernel already near the memory roof —
+or removing **26% of ALL non-GEMV decode time**.
+
+**`vt_rms_norm` matches the winning pattern and is still NOT the lever.** It is
+entirely scalar `vt_load`/`vt_store`, the exact defect that paid off three times.
+But: 113 dispatches/token at 6.7 us each, ~4.3 KB touched apiece = **0.65 GB/s**,
+three orders below peak. It is LAUNCH-LATENCY bound, so vectorising buys nothing;
+cutting it needs fewer dispatches, and fusion measured only 3% headroom total.
+**Checked the arithmetic before pattern-matching the fix — worth doing, because
+the pattern was a very good match and the answer was still no.**
+
+**Regime change, stated plainly.** The session opened with a kernel at 4% of its
+roofline (prefill attention, 108 GFLOP/s vs the GEMM's 2250). It now has four
+items of 15-100 ms against kernels at 83-97% of their roofs. Gains remain
+available but per-item return has fallen roughly an order of magnitude, and each
+now needs the paired harness to be visible at all. That is the honest reason to
+treat further work here as optional rather than obvious.
+
+---
+
+## 2026-07-27 — GEMV memory-level parallelism re-tested under the harness: still a loss
+
+Ran the experiment I had flagged rather than leaving it as a recommendation.
+"GEMV memory-level parallelism" was excluded long before the paired harness, i.e.
+measured under a 10% noise floor against a ~2% effect, so it had never been
+resolved.
+
+The decode GEMV already reads `ushort4` with four accumulators but keeps ONE
+outstanding weight load per lane per iteration. Unrolling by two issues both
+vectors before consuming either — the only headroom left in an op streaming the
+entire weight matrix per token at 99 GB/s of a ~120 GB/s part.
+
+Paired (decode rate, p=512): -0.23 -0.31 -0.27 -0.29 -0.31 -0.12 -> **-1.03%
+median, 0/6 blocks faster, p = 0.031.** Reverted. Metal tests stayed green.
+
+**The original exclusion was CORRECT**, and that matters on its own: once the
+measurement floor was quantified the natural suspicion was that EVERY
+small-margin verdict in this log was noise. This one was not. The compiler is
+already pipelining the simple loop and the manual unroll only adds register
+pressure. Re-test pre-harness exclusions when cheap; do not assume they are wrong.
+
+**All four items in the last 3.7% now sit against ROOFS, not defects:** GEMV at
+83% of memory peak, GEMM at 97% of MLX's with an mma issue rate of 3.91 TFLOP/s
+(above MLX's 3.07 overall), prefill attention post-vectorisation, and decode's
+small kernels which are launch-bound. Every cheap structural lever this session
+identified has been either landed or measured away.
+
+---
+
+## 2026-07-27 — CORRECTION: I dismissed fusion on a bad inference; it IS the decode lever
+
+**An earlier entry in this log is wrong and steered three later experiments away
+from the answer.** I wrote that decode's residual could not be fusion "because
+decode is 97% GPU-busy, so there is nothing for fusion to win".
+
+97% GPU-busy bounds the dispatch GAPS. It says NOTHING about launch-dominated GPU
+time *inside* the small kernels. `vt_rms_norm` runs at 0.65 GB/s — that cost is
+counted as busy and is almost entirely per-launch. Fusing removes it from the
+busy time itself.
+
+**Corrected decode arithmetic:**
+
+```
+ours    36.9 ms/tok = GEMV 34.2 + other 2.7
+MLX-LM  36.2 ms/tok ; if their GEMV is also ~99 GB/s, their "other" is 2.0
+=> the decode gap IS the non-GEMV overhead: 2.7 vs 2.0 ms/token
+```
+
+Closing it needs **-0.7 ms/token = 27% of small-kernel time**. Not bandwidth, not
+FLOPs.
+
+**Concrete lever, sized:** `kAttnQkNormRopeGate` (fused q_norm + k_norm + RoPE)
+is registered for **CUDA ONLY**; Metal falls back to the composite and dispatches
+all three separately. That is 28+28+28 = **84 dispatches/token collapsing to 28**,
+worth ~56 x 6.7 us = **~0.38 ms/token, over half the deficit** — with the CUDA
+kernel as reference and the recipe/gate machinery already in place. Then
+`vt_silu_and_mul` and `vt_reshape_and_cache` (28 each, both launch-dominated).
+
+**Hypothesis with arithmetic, NOT a measured result** — the same standard that
+the KV-layout lead failed. Recorded as the next experiment, not the answer.
+
+**Lesson:** the bad inference was a category error — bounding one quantity (gaps)
+and concluding about another (in-kernel launch cost). It survived three
+experiments because each new result was read as confirming "not fusion" rather
+than re-examining why fusion had been excluded. When several hypotheses in a row
+fail, re-audit the one that was ruled out FIRST.
+
+---
+
+## 2026-07-27 — fused attention preamble: scoped precisely (larger than I said)
+
+**Correcting my own previous entry.** I wrote that `kAttnQkNormRopeGate` is "CUDA
+only" and Metal falls back, implying the fix is a Metal registration. That recipe
+is the GATED one, used by the Qwen3.5 full-attention path.
+
+**Qwen3 DENSE — the benchmarked model — uses the gate-free `kAttnQkNormRope`, and
+that recipe has `fast_op = kNoFastOp`. No fused kernel exists on ANY backend.**
+recipes.h says why: "composite-only (per-head 3-D rope operands are outside the
+generic 2-D Tier-1 interpreter)". The composite faithfully dispatches three
+standalone ops, which is exactly the 56 q-norm + 56 k-norm + 28 rope per token
+the decode profile shows.
+
+**Revised scope — write a kernel, do not port one:**
+1. new standalone op: per-head RMSNorm(q) + RMSNorm(k) + partial NeoX RoPE from a
+   cos/sin cache;
+2. CPU reference (the byte-exact composite golden is already SPECIFIED in
+   recipes.h, which makes this tractable);
+3. Metal kernel;
+4. set `fast_op` so `vt::FusedChain` routes to it;
+5. tests + probable Metal golden re-anchor (the fused accumulation order may move
+   a near-tie, as two of this session's three kernels did).
+
+Sizing unchanged: 84 dispatches/token -> 28, ~0.38 ms/token against a 0.7 ms/token
+deficit. So it is over half the decode gap and NOT the whole of it;
+`vt_silu_and_mul` and `vt_reshape_and_cache` (28 each, launch-dominated) are the
+follow-ons.
+
+**Hypothesis with arithmetic, not a measured result.** Handing over at a clean
+boundary rather than starting a multi-hour kernel and leaving it half-done: the
+diagnosis, the sizing, the exact call site
+(`include/vllm/model_executor/models/dense_attn_block.h:412`) and the golden
+definition are all recorded.
+
+---
+
+## 2026-07-27 — fused qk-norm-RoPE preamble: kernel LANDED + validated; routing remains
+
+Blocker 1 (validation) is CLOSED and the kernel is on main. Blocker 2 (routing)
+remains. Original entry follows, amended.
+
+**Done.** `vt_attn_qk_norm_rope`: one threadgroup per (token, head) doing per-head
+RMSNorm then partial NeoX RoPE, reproducing `vt_rms_norm` and
+`vt_rope_from_cache` arithmetic line for line. The store-then-reload between the
+halves is deliberate: the composite STORES the normed value (rounding it to the
+buffer dtype) before RoPE reads it back, so keeping it in registers would differ
+for a bf16 buffer. Plumbing: `OpId::kAttnQkNormRope`, `AttnQkNormRopeFn`, a
+`DispatchFusedFast` binding, `fast_op` on the recipe, and a Metal-only
+registration — which means CPU and CUDA keep the byte-exact composite
+automatically via FusedChain's `OpRegistered` guard, so no CPU reference was
+needed.
+
+**Verified dispatching:** on the f32 attention path, 896 `vt_attn_qk_norm_rope`
+dispatches REPLACE 1792 rms_norm + 896 rope = 2688. `vt_rms_norm` drops
+3616 -> 1824 (the remainder being the hidden-state norms).
+test_metal_backend 112298 assertions and test_ops_fused_chain 370 both green.
+
+**Blocker 1 — CLOSED.** A targeted Metal-vs-CPU-composite test now exists
+(`Metal fused qk-norm-RoPE matches the CPU composite`): worst element error
+**1.43e-06** against a 1e-4 bar, and it REQUIREs
+`OpRegistered(kAttnQkNormRope, kMETAL)` first so the fused path is provably what
+ran. Written before landing, which is the sequencing the mma kernel got wrong.
+
+**Blocker 2 — OPEN.**
+**Unreachable by default.** `dense_attn_block.h:392` routes the preamble
+   through the recipe only when `attn_f32`, and Qwen3-1.7B runs the bf16 preamble
+   (`VT_QWEN3_ATTN_F32=1` selects the f32 diagnostic path). So the win is not
+   realised for the benchmarked model. Extending the condition to bf16 is
+   plausible — the recipe and my kernel are both dtype-generic — but it changes
+   which path the model takes and needs its own byte-exactness argument.
+
+**Estimated value once both are closed:** 84 dispatches/token -> 28, ~0.38 ms/token
+of a 0.7 ms/token decode deficit. Not measured; the harness run has not been done
+because there is nothing correct to measure yet.
+
+**Extra hazard found while scoping the routing:** the bf16 branch's DEFAULT RoPE
+is `RopeNeox`, not `RopeFromCache`; the recipe's kRope step is RopeFromCache. So
+extending the condition must be gated on whatever enables the rope cache,
+otherwise it silently swaps one RoPE implementation for another and the near-tie
+goldens move for a reason that has nothing to do with fusion.
+
+---
+
+## 2026-07-27 — fused preamble ROUTED onto the default path: +0.35% (96.4% of MLX-LM)
+
+Blocker 2 closed. The recipe branch now covers bf16 as well as f32, **gated on
+`RopeCacheEnabled()`**: the bf16 branch's default RoPE is `RopeNeox` while the
+recipe's third step is `RopeFromCache`, so ungated adoption would have swapped
+RoPE implementations silently and moved the near-tie goldens for a reason having
+nothing to do with fusion. With the guard the composite IS the else-branch's
+sequence for either dtype, so adoption is behaviour-preserving by construction.
+
+`vt_rms_norm` 3616 -> 1824; 896 fused dispatches replace 2688.
+
+**Paired:** +0.12 +0.08 +0.08 +0.09 +0.14 +0.07 -> **+0.35% median, 6/6 blocks,
+p = 0.031.** Warm total 23.81 -> 23.90 vs MLX 24.79 = **96.0% -> 96.4%**.
+16/16 PASS, NO re-anchor, `kAttnQkNormRope selections=7168`.
+
+**Test change, called out rather than buried:** the backend proof required
+`selections > 0` for every op in kQwen3Ops, and kRopeFromCache now legitimately
+reports ZERO because the fusion absorbs it. The proof is now subsumption-aware —
+zero is accepted for kRopeFromCache ONLY when the subsuming kAttnQkNormRope ran,
+and zero declines is still required of both. Intent (nothing silently fell back
+to CPU) preserved, not relaxed. Editing a test to make it pass deserves scrutiny
+even when correct; reviewers should look here first.
+
+**Estimate vs measurement: predicted ~0.5-1%, got 0.35%.** The dispatch reduction
+was as large as predicted (2688 -> 896); the error was in valuing each removed
+dispatch at the 6.7 us average, when the q/k norms are among the cheapest. Worth
+remembering the next time a dispatch-count saving is sized from an average.
+
+**Cumulative: 89.4% -> 96.4%**, four kernels landed. Remaining ~3.6% has no
+single dominant item: prefill GEMM 15 ms (97% of MLX's already), prefill
+attention ~35 ms, prefill other ~55 ms, decode ~85 ms.
+
+---
+
+## 2026-07-27 — standing at 96.0-96.4%; largest remaining lead is prefill attention's FLOP rate
+
+Thermally matched after four landed kernels: decode **27.24 vs 27.79 = 98.0%**,
+total **23.91 vs 24.90 = 96.0%**, prefill TTFT 613 vs 534 ms.
+
+```
+gap 172 ms = prefill 80 ms + decode 93 ms
+prefill excess ~= 35 ms attention + 15 ms GEMM + 30 ms other
+```
+
+**LEAD: prefill attention is still 5.2x slower PER FLOP than our own GEMM.**
+547 GFLOP/s against the GEMM's 2851 on the same device in the same forward. At
+GEMM rate it would be 10.6 ms rather than 55 — about 44 ms of the 80 ms prefill
+gap. This is the SAME roofline signal that found the original 21x: the mma
+rewrite moved attention 108 -> 547 GFLOP/s, a large structural win, but did not
+reach the rate this device sustains on a GEMM.
+
+**Hypothesis (not measured):** tiling is BQ=32 x BK=16, so a full online-softmax
+pass — threadgroup reductions plus the per-row `diag(corr) @ O` rescale — runs for
+only 16 keys, roughly 40 mma per softmax. Deepening BK amortises it, but `sv` is
+f32 (required for probability precision; bf16 P moved a greedy token when the mma
+kernel landed) so BK=32 puts K/V tiles at 24 KB against a 32 KB budget. A bf16
+`sv` with an f32 P would free the room; whether that holds the near-tie goldens is
+the open question.
+
+**Same standing as the KV-layout lead had before a probe refuted it: arithmetic,
+not measurement.** Test it before building on it.
+
+**Method that produced this session's four wins, for whoever continues:** compute
+achieved FLOP/s or GB/s per kernel, compare against what the SAME device sustains
+elsewhere, and treat any large ratio as a defect rather than a ceiling. It found
+prefill attention (21x), decode V accumulation (2.2x), and this. Bisect with
+measurement-only stubs to localise; verify with scripts/metal-paired-ab.py, never
+with single runs.
+
+---
+
+## 2026-07-27 — prefill attention: "deepen BK" is BLOCKED; the softmax is the real target
+
+Scoped the lead from the previous entry before building on it. The first result
+kills the fix I proposed there; the second replaces it.
+
+**"Deepen BK" is blocked.** 32 KB threadgroup budget:
+
+| config | LDS |
+|---|--:|
+| current BQ=32 BK=16 sv=f32 | 27.0 KB |
+| BQ=32 BK=32 sv=f32 | 43.0 KB |
+| BQ=16 BK=32 sv=f32 | 34.5 KB |
+| BQ=32 BK=32 sv=bf16 | 35.0 KB |
+| **BQ=16 BK=32 sv=bf16** | **26.5 KB fits** |
+
+Every fitting config needs bf16 `sv`, and bf16 `sv` FORCES bf16 `P` because
+`simdgroup_multiply_accumulate` needs matching operand types. bf16 P is precisely
+what moved a greedy token when the mma kernel landed. So the direction trades
+precision for amortisation; decide that question before writing code.
+
+**Better target, needs NO extra LDS: the online softmax runs ONE THREAD PER QUERY
+ROW — 32 of 256 threads = 12% occupancy** — looping serially over the chunk's 16
+keys while 224 threads wait at the barrier. The mma stages either side use all
+256. That idle fraction sits between two mma passes in the innermost loop, which
+is consistent with 547 GFLOP/s against the GEMM's 2851.
+
+Rework as ONE SIMDGROUP PER QUERY ROW (8 simdgroups over 32 rows, 4 rows each,
+`simd_max`/`simd_sum` across the 16 keys): all 256 threads busy, no allocation
+change. It changes reduction order, so expect a near-tie flip and budget a golden
+re-anchor — the flow is proven twice in this session.
+
+**Both results are arithmetic, not measurement.** The LDS table and the 12% are
+exact; the causal link to 547 GFLOP/s is the hypothesis to test first.
+
+---
+
+## 2026-07-27 — prefill attention softmax: one simdgroup per row, +0.19%
+
+Implements the target from the previous entry. The online softmax ran ONE THREAD
+PER QUERY ROW (32 of 256 = 12%) looping serially over the chunk's keys while 224
+threads waited, between two mma passes using all 256. Now ONE SIMDGROUP PER ROW,
+four rows each, lanes over the keys, `simd_max`/`simd_sum` — no barrier needed.
+
+**Prefill attention 55.3 -> 46.6 ms (-16%).**
+**Paired:** +0.15 +0.06 +0.02 +0.07 +0.03 +0.02 -> **+0.19% median, 6/6 blocks,
+p = 0.031.** Warm total 23.88 -> 23.94.
+
+Predicted ~0.15% before measuring and got 0.19% — the first estimate this session
+that came in ABOVE rather than below, and the third data point that dispatch- and
+occupancy-sized predictions are good to roughly a factor of two.
+
+**Re-anchored as predicted:** the reduction-order change flipped prompt[5] tok=10.
+Oracle gap **0.125 nats**, same bar, 0 over, 0 outside top-K, and **59 divergent
+positions vs the previous 60** — marginally CLOSER to vLLM greedy.
+
+Attention is now 646 GFLOP/s against the GEMM's 2851: **4.4x, down from 5.2x**.
+The residual ratio is still unexplained, and the remaining structural difference
+is the BK=16 amortisation blocked by the bf16-P precision constraint recorded
+above.
+
+---
+
+## 2026-07-27 — REJECTED: eliding the identity softmax rescale
+
+Per 16-key chunk each simdgroup issues 40 mma: 16 QK + **8 diagonal rescale** +
+16 PV. `corr` is exactly 1.0 when the running max does not move, and
+`diag(1) @ O` is bit-identical to O, so skipping the rescale in that case should
+have removed 20% of the inner loop's mma for free.
+
+Measured: prefill attention **46.6 -> 47.5 ms** — no gain, marginally worse.
+Reverted.
+
+**The exactness prediction held even though the perf one did not:** 16/16 PASS
+with NO re-anchor, exactly as argued from `diag(1) @ O`. The three preceding
+kernel changes all moved a near-tie and needed the oracle. So: predicting which
+changes perturb numerics is now reliable, predicting which ones pay is not — a
+useful asymmetry to carry forward.
+
+Cause: in CAUSAL prefill each query's window grows as key blocks arrive, so the
+running max keeps moving and corr is seldom exactly 1.0. The eight scalar sdiag
+reads plus the branch then cost more than the eight mma they guard. The idea
+would fare better on non-causal or short-context shapes; not this workload.
+
+**Standing: ~96.4%, five kernels landed this session (89.4% -> 96.4%).** The
+attention:GEMM FLOP-rate ratio is 4.4x and the two structural ideas for it are
+now both closed — BK deepening by the bf16-P precision constraint, rescale
+elision by measurement.

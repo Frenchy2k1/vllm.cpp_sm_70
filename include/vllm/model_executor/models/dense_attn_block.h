@@ -389,13 +389,34 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   // fused-chain qk-norm-rope recipe requires the norm weights, so a qk-norm-absent
   // model always takes the standalone `else` branch below.
   const bool has_qk_norm = !w.q_norm.Empty();
-  if (attn_f32 && FusedChainAdoptEnabled() && rot > 0 && has_qk_norm) {
+  // The fused preamble applies to the BF16 path too, but ONLY when the rope cache
+  // is on. The recipe's third step is kRope == RopeFromCache; the bf16 branch's
+  // DEFAULT rope is RopeNeox. Routing bf16 through the recipe without this guard
+  // would silently swap one RoPE implementation for another, and the near-tie
+  // goldens would move for a reason that has nothing to do with fusion.
+  //
+  // With the guard, the recipe's Tier-0 composite is EXACTLY the standalone
+  // sequence the else-branch runs — RmsNorm(q), RmsNorm(k), RopeFromCache — for
+  // either dtype, so adoption is behaviour-preserving by construction and the
+  // only new thing is the backend's fused realisation.
+  const bool fused_preamble =
+      FusedChainAdoptEnabled() && rot > 0 && has_qk_norm && (attn_f32 || RopeCacheEnabled());
+  if (fused_preamble) {
     // f32 A/B ADOPT: the whole preamble through vt::FusedChain(kAttnQkNormRope) —
     // the Tier-0 composite = RmsNorm(q,false) + RmsNorm(k,false) + RopeFromCache,
     // byte-identical to the hand-call (test_ops_fused_chain.cpp). Qwen3's reuse of
     // the fusion catalog's non-gated qk-norm-rope recipe (f32 cos/sin cache).
-    Tensor wqn = ResidentWeightF32(d, w.q_norm, {Dh});
-    Tensor wkn = ResidentWeightF32(d, w.k_norm, {Dh});
+    // Weight dtype follows q's (RmsNorm requires w.dtype == x.dtype), and the
+    // rope operands follow the branch that would otherwise have run: the f32 path
+    // rotates against the f32 cache indexed by real positions, the bf16 path
+    // against the bf16 cache indexed by the identity row (the position map is
+    // already baked into the cache rows).
+    Tensor wqn = attn_f32 ? ResidentWeightF32(d, w.q_norm, {Dh})
+                          : ResidentWeight(d, w.q_norm, {Dh});
+    Tensor wkn = attn_f32 ? ResidentWeightF32(d, w.k_norm, {Dh})
+                          : ResidentWeight(d, w.k_norm, {Dh});
+    Tensor rope_cache = attn_f32 ? si.cos_sin.t() : si.cos_sin_bf16.t();
+    Tensor rope_idx = attn_f32 ? si.positions.t() : si.rope_row_idx.t();
     vt::FusedBinding b;
     b.op[0] = &q2;
     b.op[1] = &wqn;
@@ -403,8 +424,8 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
     b.op[3] = &wkn;
     b.op[4] = &q3;
     b.op[5] = &k3;
-    b.op[6] = const_cast<Tensor*>(&si.cos_sin.t());
-    b.op[7] = const_cast<Tensor*>(&si.positions.t());
+    b.op[6] = &rope_cache;
+    b.op[7] = &rope_idx;
     b.n = 8;
     vt::FusedParams p;
     p.eps = eps;
