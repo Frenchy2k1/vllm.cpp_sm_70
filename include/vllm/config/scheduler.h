@@ -51,11 +51,21 @@
 
 namespace vllm {
 
-// SchedulerPolicy = Literal["fcfs", "priority"]. String values are the wire
-// form ("fcfs" is the default).
+// SchedulerPolicy = Literal["fcfs", "priority", "lpm"]. String values are the
+// wire form ("fcfs" is the default).
+//
+// kLPM (ENG-SGLANG-BEHAVIOR-FLAG, SW1): SGLang's cache-aware "longest prefix
+// match" admission ordering (schedule_policy.py:142,205 @ SGLang v0.5.15
+// f63458b). It is NOT in vLLM — a scoped opt-in behavior parity flag, NOT a
+// blind mirror. It reorders the waiting queue (a plain FCFS deque under the
+// hood) by each request's longest cached-prefix match against our block-hash
+// APC index, so cache hits are maximized. It is output-neutral (admission
+// ORDER only; each request computes identical tokens) and meaningful only with
+// prefix caching ON — Scheduler resolves `lpm` + cache-off back to fcfs.
 enum class SchedulerPolicy {
   kFCFS,      // "fcfs": first come first served (arrival order).
   kPriority,  // "priority": handled by (priority, arrival_time) — lower first.
+  kLPM,       // "lpm": cache-aware longest-prefix-match ordering (SGLang).
 };
 
 // The wire string for a policy ("fcfs" / "priority").

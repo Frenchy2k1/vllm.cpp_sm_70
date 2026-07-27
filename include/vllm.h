@@ -56,8 +56,11 @@ extern "C" {
  * when NULL/empty.
  * v6: vllm_model_params.speculative_config — the speculative-decoding selection
  * as the JSON object vLLM takes (e.g. '{"method":"mtp"}'); NULL/empty disables
- * speculation (the byte-identical default). */
-#define VLLM_ABI_VERSION 6
+ * speculation (the byte-identical default).
+ * v7: vllm_model_params.enable_prefix_caching — tri-state APC toggle
+ * (0=model default, 1=on, 2=off). The server's --enable-radix-attention is a
+ * documented alias for the ON state (RadixAttention is fused into our APC). */
+#define VLLM_ABI_VERSION 7
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -142,6 +145,20 @@ typedef struct vllm_model_params {
    * checkpoints that ship an mtp.* head (safetensors only). Borrowed for the
    * vllm_engine_load call only. */
   const char* speculative_config;
+  /* ── Automatic prefix caching (ABI v7) ─────────────────────────────────────
+   * Tri-state toggle for automatic prefix caching (APC), mirroring vLLM's
+   * --[no-]enable-prefix-caching resolution against the model default:
+   *   0 => MODEL DEFAULT (the byte-identical default): dense full-attention
+   *        models default ON, hybrid / attention-free models default OFF;
+   *   1 => force ON;
+   *   2 => force OFF.
+   * The server's --enable-radix-attention flag is a documented ALIAS for state
+   * 1 and --disable-radix-attention for state 2: SGLang's "RadixAttention" is
+   * functionally fused into our block-hash APC (see
+   * .agents/specs/sglang-radixattention.md §1), so the radix flag switches
+   * exactly this field — there is no distinct radix code path. Any value other
+   * than 0/1/2 fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. */
+  int32_t enable_prefix_caching;
 } vllm_model_params;
 
 /* ── Sampling parameters ──────────────────────────────────────────────────────

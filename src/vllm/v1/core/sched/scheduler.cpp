@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,11 +23,16 @@ namespace vllm::v1 {
 
 namespace {
 
-// Map the config-level policy onto the request-queue policy. Priority is
-// deferred (T1); create_request_queue(kPriority) throws.
+// Map the config-level policy onto the request-queue policy.
+//   kLPM (ENG-SGLANG-BEHAVIOR-FLAG) rides on the FCFS deque: the queue mechanics
+//   are identical to fcfs (append / popleft / prepend), and the cache-aware
+//   ordering is imposed by Scheduler::schedule() reordering the deque each step
+//   (waiting->reorder), exactly as SGLang's SchedulePolicy.calc_priority sorts
+//   the waiting list in place (schedule_policy.py:176,205).
 SchedulingPolicy ToQueuePolicy(SchedulerPolicy policy) {
   switch (policy) {
     case SchedulerPolicy::kFCFS:
+    case SchedulerPolicy::kLPM:
       return SchedulingPolicy::kFCFS;
     case SchedulerPolicy::kPriority:
       return SchedulingPolicy::kPriority;
@@ -137,6 +143,50 @@ void Scheduler::preempt_request(Request* request, double timestamp) {
   // Put the request back to the FRONT of the waiting queue (FCFS retry).
   waiting->prepend_request(request);
   reset_preempted_req_ids.insert(request->request_id);
+}
+
+void Scheduler::maybe_reorder_waiting_for_lpm() {
+  // ENG-SGLANG-BEHAVIOR-FLAG (SW1) — SGLang cache-aware LPM admission ordering,
+  // ported from SchedulePolicy.calc_priority + _sort_by_longest_prefix
+  // (python/sglang/srt/managers/schedule_policy.py:176,205 @ v0.5.15 f63458b),
+  // mapped onto OUR waiting deque + OUR block-hash APC longest-match (reusing the
+  // same index the admission loop matches against — NOT a second trie).
+  if (scheduler_config_.policy != SchedulerPolicy::kLPM) {
+    return;  // fcfs / priority: no cache-aware reorder (byte-identical default).
+  }
+  // `lpm` is meaningless with prefix caching off (no cache to match) -> fcfs.
+  // (The server also warns at load; here we simply leave arrival order intact.)
+  if (kv_cache_manager == nullptr || !kv_cache_manager->enable_caching) {
+    return;
+  }
+  const std::size_t n = waiting->size();
+  if (n <= 1) {
+    return;  // nothing to reorder.
+  }
+  // Large-queue fallback (schedule_policy.py:229-233): skip the expensive
+  // per-request match + sort when the waiting queue is large; stay fcfs.
+  if (n > kLpmMaxWaitingQueue) {
+    return;
+  }
+
+  // Snapshot the current (arrival / fcfs) order and compute each request's
+  // longest cached-prefix match as a PURE read (no stats, no LRU touch).
+  std::vector<Request*> order = waiting->ToList();
+  std::unordered_map<const Request*, int> matched;
+  matched.reserve(order.size());
+  for (Request* r : order) {
+    matched[r] = kv_cache_manager->num_matched_prefix_tokens(*r);
+  }
+
+  // _sort_by_longest_prefix: sort DESCENDING by num_matched_prefix_tokens. A
+  // STABLE sort keeps arrival (fcfs) order among equal-match requests, matching
+  // Python's list.sort with key=-num_matched_prefix_tokens (SW2 in-batch
+  // collision de-prioritization is a named residual — not yet ported).
+  std::stable_sort(order.begin(), order.end(),
+                   [&matched](const Request* a, const Request* b) {
+                     return matched[a] > matched[b];
+                   });
+  waiting->reorder(order);
 }
 
 SchedulerOutput Scheduler::schedule() {
@@ -320,6 +370,11 @@ SchedulerOutput Scheduler::schedule() {
   // after the loop so they are re-asked next step (scheduler.py:744-750,1017).
   std::vector<Request*> connector_skipped_waiting;
   if (preempted_reqs.empty()) {
+    // ENG-SGLANG-BEHAVIOR-FLAG (SW1): cache-aware `lpm` admission ordering. A
+    // no-op under fcfs/priority or with caching off (the byte-identical default
+    // path). Reorders the waiting deque by longest cached-prefix match so the
+    // admission loop below (unchanged) admits the highest-hit requests first.
+    maybe_reorder_waiting_for_lpm();
     while (!waiting->empty() && token_budget > 0) {
       if (static_cast<int>(running.size()) >= max_num_running_reqs) {
         break;

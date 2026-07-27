@@ -157,6 +157,17 @@ class KVCacheManager {
   // always full; num_computed_tokens is block-size aligned.
   std::pair<KVCacheBlocks, int> get_computed_blocks(const Request& request);
 
+  // ENG-SGLANG-BEHAVIOR-FLAG (SW1): the number of tokens of `request` that match
+  // the cached prefix, as a PURE read of the APC index — the block-hash analogue
+  // of SGLang's `req.num_matched_prefix_tokens` (schedule_policy.py:129). Unlike
+  // get_computed_blocks it has NO side effects: it does NOT record prefix-cache
+  // statistics (so calling it for LPM ordering does not double-count against the
+  // real per-request query in the admission loop) and does NOT touch/ref-count or
+  // reorder LRU. Returns 0 when caching is disabled. Used only to reorder the
+  // waiting queue under the `lpm` policy; the admission loop's get_computed_blocks
+  // remains the single authority on the actual hit each request is served.
+  int num_matched_prefix_tokens(const Request& request);
+
   // THE central allocator. Returns the newly allocated blocks, or std::nullopt
   // when the pool cannot supply them (OOM -> the Scheduler preempts). See the
   // file header for the comp|new_comp|ext_comp|new|lookahead accounting.

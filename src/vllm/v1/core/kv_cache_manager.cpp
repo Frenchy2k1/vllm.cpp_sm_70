@@ -148,6 +148,27 @@ std::pair<KVCacheBlocks, int> KVCacheManager::get_computed_blocks(
   return {create_kv_cache_blocks(computed_blocks), num_new_computed_tokens};
 }
 
+int KVCacheManager::num_matched_prefix_tokens(const Request& request) {
+  // Pure read of the longest cached-prefix match — the same lookup
+  // get_computed_blocks performs, MINUS the prefix_cache_stats.record side
+  // effect (so LPM ordering never double-counts) and minus block allocation.
+  // find_longest_cache_hit itself is a non-mutating walk of the hash chain (no
+  // ref-count / LRU touch — those happen only in allocate_slots), so this is
+  // safe to call for every waiting request each step.
+  if (!enable_caching) {
+    return 0;
+  }
+  const int max_cache_hit_length = request.NumTokens() - 1;
+  if (max_cache_hit_length <= 0) {
+    return 0;
+  }
+  auto [computed_blocks, num_new_computed_tokens] =
+      coordinator->find_longest_cache_hit(request.block_hashes,
+                                          max_cache_hit_length);
+  (void)computed_blocks;
+  return num_new_computed_tokens;
+}
+
 std::optional<KVCacheBlocks> KVCacheManager::allocate_slots(
     const Request& request, int num_new_tokens, int num_new_computed_tokens,
     std::optional<KVCacheBlocks> new_computed_blocks, int num_lookahead_tokens,

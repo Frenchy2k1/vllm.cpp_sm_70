@@ -349,15 +349,57 @@ the C-ABI field, both trivial and gated by existing APC tests.
 | Work | Row | Deliverable | State |
 |---|---|---|---|
 | RW0 | `KV-SGLANG-RADIX-CACHE` | This spike + verdict (RadixAttention == APC, alias not path) | **this spec** |
-| RW1 | `KV-SGLANG-RADIX-CACHE` | `--enable-radix-attention` CLI alias + C-ABI `enable_prefix_caching` tri-state field; reuses `test_qwen3_apc_e2e` + server-help contract; no engine change | scoped (trivial) |
+| RW1 | `KV-SGLANG-RADIX-CACHE` | `--enable-radix-attention` CLI alias + C-ABI `enable_prefix_caching` tri-state field; reuses `test_qwen3_apc_e2e` + server-help contract; no engine change | **DONE 2026-07-27** (`CLAIM-SGLANG-IMPL`) |
 
 | Work | Row | Deliverable | State |
 |---|---|---|---|
 | SW0 | `ENG-SGLANG-BEHAVIOR-FLAG` | This spike: cache-aware / overlap / jump-forward survey + flag design | **this spec** |
-| SW1 | `ENG-SGLANG-BEHAVIOR-FLAG` | `SchedulingPolicy::kLPM` + `LPMRequestQueue` ordering by APC longest-match, large-queue fcfs fallback; port `schedule_policy.py` LPM cases as CPU behavioral tests; token-neutral A/B | scoped |
-| SW2 | `ENG-SGLANG-BEHAVIOR-FLAG` | in-batch prefix-collision de-prioritization (`IN_BATCH_PREFIX_CACHING_*`) | scoped (after SW1) |
+| SW1 | `ENG-SGLANG-BEHAVIOR-FLAG` | `SchedulerPolicy::kLPM` waiting-queue reorder by APC longest-match, large-queue fcfs fallback; port `schedule_policy.py` LPM cases as CPU behavioral tests; token-neutral A/B | **DONE 2026-07-27** (`CLAIM-SGLANG-IMPL`) |
+| SW2 | `ENG-SGLANG-BEHAVIOR-FLAG` | in-batch prefix-collision de-prioritization (`IN_BATCH_PREFIX_CACHING_*`) | **RESIDUAL** (named; not yet ported — LPM lands without it, still output-neutral) |
 | SW3 | `ENG-SGLANG-BEHAVIOR-FLAG` | jump-forward decoding behind `--enable-jump-forward` (FSM-run precompute + retokenize) | **deferred** (named) |
 | SW4 | `ENG-SGLANG-BEHAVIOR-FLAG` | `--radix-eviction-policy` lfu/slru/priority knob over the block pool | **deferred** (minor) |
+
+### W1/W2 implementation status (2026-07-27, `CLAIM-SGLANG-IMPL`, NOT pushed)
+
+**W1 (RW1) — the flag surface — LANDED.**
+- `--enable-radix-attention` / `--disable-radix-attention` server aliases for the
+  APC toggle (`examples/server/main.cpp`), sharing the SAME `enable_prefix_caching`
+  tri-state and the once-only guard as `--[no-]enable-prefix-caching`. Alias-not-path
+  per the §1 verdict.
+- C-ABI `int32_t vllm_model_params.enable_prefix_caching` (0=model default / 1=on /
+  2=off), ABI bumped v6→v7 (`include/vllm.h`), mapped to `EngineParams::enable_prefix_caching`
+  in `src/capi/vllm_c.cpp` (out-of-range → `VLLM_ERR_INVALID_ARGUMENT`). Default 0 keeps
+  the byte-identical model-default resolution.
+- `--schedule-policy` accepted as an SGLang-compatible alias of `--scheduling-policy`;
+  both take `fcfs|priority|lpm`.
+- Inertness: default (no flags) path byte-identical — `test_scheduler` 36/36,
+  `test_prefix_cache_stats` 12/12, `test_request_queue` 26/26 unchanged; ABI
+  round-trip `tests/capi/test_capi.cpp` "enable_prefix_caching tri-state" 9/9.
+
+**W2 (SW1) — the LPM cache-aware admission — LANDED (minimal, output-neutral).**
+- `SchedulerPolicy::kLPM` ("lpm"), `include/vllm/config/scheduler.h` +
+  `src/vllm/config/scheduler.cpp`. Maps to the FCFS deque (`ToQueuePolicy`); the
+  cache-aware order is imposed by `Scheduler::maybe_reorder_waiting_for_lpm()`
+  reordering the waiting deque each step before the (unchanged) admission loop
+  (`src/vllm/v1/core/sched/scheduler.cpp`).
+- Ported 1:1 FROM SGLang `schedule_policy.py:205` (`_sort_by_longest_prefix`,
+  a STABLE descending sort by `num_matched_prefix_tokens`) + `:229-233`
+  (`_determine_active_policy` large-queue fcfs fallback at >128 waiting). The match
+  length reuses OUR block-hash APC via a new side-effect-free
+  `KVCacheManager::num_matched_prefix_tokens()` (pure `find_longest_cache_hit`, NO
+  stats record, NO LRU touch — so it never double-counts the admission-loop query).
+  `waiting->reorder()` added to the `RequestQueue` interface (FCFS adopts the order;
+  Priority ignores it — LPM never drives a priority queue).
+- `lpm` + caching-off resolves to fcfs (no reorder) + a load-time warn.
+- Gate `tests/vllm/v1/test_scheduler_lpm.cpp` (3 cases / 20 asserts): (a) output-neutral
+  — per-request scheduled-token work + total hits identical lpm vs fcfs; (b) reorder —
+  RED baseline fcfs admits the earlier no-match request first, GREEN lpm admits the
+  later high-match request first; (c) under capacity pressure lpm serves strictly more
+  cache-hit tokens by the contended step (64 vs 0) — hits realized earlier.
+- Residual: SW2 in-batch prefix-collision de-prioritization
+  (`IN_BATCH_PREFIX_CACHING_*_THRESHOLD`, `schedule_policy.py:253`) NOT ported; SW3/SW4
+  deferred. The cache-ON throughput A/B vs the SGLang floor stays owned by
+  `BACKEND-GATE-CUDA-SGLANG-PREFIX` (GB10, not this CPU lane).
 
 Gates for any flag-worthy work: CPU `-Werror` + full CTest; token-neutral A/B
 (an ordering/eviction change must not change greedy outputs — it is a
@@ -396,3 +438,90 @@ not this row).
 - **Naming.** The SGLang-compatible names are ergonomics; the engine behavior is
   vLLM's. Every alias documents the vLLM concept it maps to so the mirror stays
   legible.
+
+## 11. Structured spec record (RW1 + SW1 implementation)
+
+The implementation of the two owning rows (`KV-SGLANG-RADIX-CACHE` RW1 alias +
+`ENG-SGLANG-BEHAVIOR-FLAG` SW1 LPM), now `ACTIVE`, in the canonical structured
+form.
+
+### Scope
+
+Two engine-side, CPU-testable deliverables. **RW1:** the `--enable-radix-attention`
+server alias for the APC toggle (a no-op wrapper — RadixAttention is fused into our
+block-hash APC, §1) plus a tri-state `enable_prefix_caching` field on the C-ABI
+`vllm_model_params`. **SW1:** the cache-aware `lpm` waiting-queue admission ordering
+(the one genuinely-distinct SGLang behavior), output-neutral, gated behind
+`--schedule-policy=lpm`. No model/kernel/runtime-forward change; the default (no
+flags, `fcfs`) path stays byte-identical.
+
+### Upstream chain
+
+SGLang v0.5.15 `f63458b`: LPM sort `python/sglang/srt/managers/schedule_policy.py:205`
+(`_sort_by_longest_prefix`, key `-num_matched_prefix_tokens`); large-queue fcfs
+fallback `:229-233` (`_determine_active_policy`, `>128`); per-request match
+`:129` (`num_matched_prefix_tokens`); in-batch de-prioritization `:253`
+(`_compute_prefix_matches`, SW2 residual). SGLang's own default `fcfs`
+`server_args.py:692`; radix toggle `--disable-radix-cache` `server_args.py:755`.
+vLLM is the MIRROR engine but has NO lpm policy — this is a scoped opt-in behavior
+flag, not a blind port.
+
+### Our baseline
+
+APC (block-hash chain, longest-match, LRU, ref-count, extra-keys) is `DONE` dense
+(`KV-PREFIX-CACHE`). Scheduler admits from an FCFS/priority waiting queue
+(`src/vllm/v1/core/sched/scheduler.cpp`, `request_queue.cpp`) with NO cache-hit
+ordering. APC toggle `EngineParams::enable_prefix_caching`
+(`include/vllm/entrypoints/model_loader.h:76`), server `examples/server/main.cpp:185`;
+the C-ABI `vllm_model_params` had NO prefix-caching field.
+
+### Port map
+
+- `SchedulerPolicy::kLPM` ("lpm") — `include/vllm/config/scheduler.h`,
+  `src/vllm/config/scheduler.cpp`.
+- `Scheduler::maybe_reorder_waiting_for_lpm()` (stable descending sort by match,
+  `>128` fcfs fallback) FROM `schedule_policy.py:205,229` —
+  `src/vllm/v1/core/sched/scheduler.cpp`; `ToQueuePolicy` maps kLPM→FCFS deque.
+- `KVCacheManager::num_matched_prefix_tokens()` — side-effect-free `find_longest_cache_hit`
+  (no stats record, no LRU touch) — `src/vllm/v1/core/kv_cache_manager.cpp`.
+- `RequestQueue::reorder()` — `include/vllm/v1/core/sched/request_queue.h`,
+  `src/vllm/v1/core/sched/request_queue.cpp`.
+- RW1 alias + `--schedule-policy` + lpm+cache-off warn — `examples/server/main.cpp`.
+- C-ABI `int32_t vllm_model_params.enable_prefix_caching` (0/1/2), ABI v7 —
+  `include/vllm.h`; mapped in `src/capi/vllm_c.cpp`.
+
+### Tests to port
+
+`tests/vllm/v1/test_scheduler_lpm.cpp` (mirrors the shared-prefix intent of
+SGLang's LPM cases): output-neutral A/B, reorder assertion (RED under fcfs / GREEN
+under lpm), capacity-pressure hit-realized-earlier, lpm+cache-off→fcfs. C-ABI
+tri-state round-trip in `tests/capi/test_capi.cpp`.
+
+### Gates
+
+CPU `-Werror` full-library, 0 warnings. Default (`fcfs`, no radix flag) byte-identical:
+`test_scheduler` 36/36, `test_prefix_cache_stats` 12/12, `test_request_queue` 26/26
+unchanged. LPM gate `test_scheduler_lpm` 3/3 (20 asserts). ABI round-trip 9/9.
+Cache-ON throughput A/B vs the SGLang floor stays owned by
+`BACKEND-GATE-CUDA-SGLANG-PREFIX` (GB10, not this CPU lane).
+
+### Dependencies
+
+`KV-PREFIX-CACHE` (`DONE` dense — the APC the alias maps onto and the LPM match
+reuses); `ENG-ASYNC-SCHED` (overlap equivalent, `DONE`);
+`BACKEND-GATE-CUDA-SGLANG-PREFIX` (the GB10 throughput sibling). No new library.
+
+### Work breakdown
+
+RW1 (alias + C-ABI field) — **DONE**. SW1 (LPM comparator + reorder + match
+lookup) — **DONE**. SW2 (in-batch prefix-collision de-prioritization,
+`schedule_policy.py:253`) — **RESIDUAL**, named, not ported (LPM lands
+output-neutral without it). SW3 (jump-forward) / SW4 (eviction-policy knob) —
+**deferred**.
+
+### Risks/decisions
+
+Do not build a second cache (alias only). `lpm` without APC → `fcfs` + warn. The
+reorder MUST stay output-neutral: it uses a pure match lookup (no stats
+double-count, no LRU perturbation) and the unchanged admission loop, so only the
+order of admission changes, never the tokens each request computes.

@@ -311,6 +311,24 @@ class Scheduler {
   // PREEMPTED event when log_stats_ is on.
   void preempt_request(Request* request, double timestamp);
 
+  // ENG-SGLANG-BEHAVIOR-FLAG (SW1): under the `lpm` policy, reorder the waiting
+  // queue by descending longest cached-prefix match before the admission loop,
+  // so high-cache-hit requests are admitted first (maximizing hit rate). Ported
+  // from SGLang SchedulePolicy.calc_priority / _sort_by_longest_prefix
+  // (schedule_policy.py:176,205 @ v0.5.15 f63458b): a STABLE sort by
+  // -num_matched_prefix_tokens (ties keep FCFS/arrival order). Mirrors SGLang's
+  // large-queue fallback (schedule_policy.py:229-233): when the queue exceeds
+  // kLpmMaxWaitingQueue the expensive per-request match+sort is skipped (order
+  // stays fcfs). No-op unless the policy is kLPM AND prefix caching is on
+  // (an lpm run with caching off has nothing to match, so it stays fcfs). It is
+  // OUTPUT-NEUTRAL: only admission order changes; the pure match lookup has no
+  // side effects (no stats, no LRU touch).
+  void maybe_reorder_waiting_for_lpm();
+
+  // SGLang's expensive-prefix-sort cutoff (schedule_policy.py:230): above this
+  // many waiting requests, lpm degrades to fcfs for the step.
+  static constexpr std::size_t kLpmMaxWaitingQueue = 128;
+
   // _make_cached_request_data: build the diff payload for the already-running
   // (running_reqs) + resumed-from-preemption (resumed_reqs) requests. MRV2:
   // use_pp is false so new_token_ids stays empty, and all_token_ids stays empty
