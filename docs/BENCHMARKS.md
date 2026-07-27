@@ -4978,3 +4978,22 @@ dominant OPEN performance gate across the reachable portfolio remains every-axis
 SPEED closure (multimodal serving c2+, the 35B c1/c2 residual, the ~20
 correctness-complete text families, GGUF decode >=10x at M=1). Reproduction:
 none - this entry is a pointer, not a run.
+
+## ROAD-V1-C5 sliding/local-attention/YaRN/long-context GPU closure (2026-07-27) - NOT APPLICABLE (`benchmark_binding=false`)
+
+Correctness/lifecycle checkpoint, no speed measured or credited. The C5 shared
+scaled-RoPE + local-mask CUDA path was compiled and RUN on dgx GB10 sm_121a (clean
+CUDA build of `489f7771`, `-Werror` 0 warnings) and its feature-positive correctness
+gates PASS vs the vLLM 0.26.0.dev0+g5559679 oracle under one `flock $HOME/gpu.lock`:
+operator `test_ops_paged_attn` 25/25 (incl. WMMA sliding-window max_abs_err 2.10e-6 +
+FA-2), `test_attention_window` 3/3, `test_chunked_local_attention` 5/5, the scaled-RoPE
+cache tests 6/6+6/6+14/14; model SACRED - LongRoPE Phi-4-mini 16/16, llama3
+Llama-3.2-1B 16/16, dynamic-NTK InternLM2 16/16, sliding-window Gemma-2 48/48 +
+Gemma-3 48/48. Both RoPE 0.26-oracle recaptures BIT-IDENTICAL to the committed
+goldens (zero drift). No `src/`/kernel change ⇒ every SACRED gate byte-identical by
+construction; no benchmark is owed. The every-axis **SPEED** gate for the C5 leaves
+(all correctness-complete, speed-pending, mirroring their model consumers) remains the
+open tail, plus the vehicle-blocked YaRN/chunked-local model e2e. Evidence + repro:
+`.agents/parity-ledger.md` / `.agents/state.md` (`CLAIM-ROADMAP-C5`); rerun via the
+gate targets on `~/work/c5-gate/src/build/tests`. Reproduction: none for a number -
+this entry records a correctness closure, not a speed run.

@@ -25534,3 +25534,52 @@ plumbing remains. Also INVENTORIED (separate rows): `n>1` execution, `SAMPLE-PHI
 exact RNG, `SAMPLE-LOGPROB-TOKEN-IDS`/logprobs_mode, beam search, custom
 logits-processor plugins. Spec: `.agents/specs/sampling-controls-c7.md`. NOT pushed;
 FULL SHA reported to caller.
+
+## 2026-07-27 — `ROAD-V1-C5` sliding/local-attention/YaRN/long-context: shared scaled-RoPE + local-mask CUDA path GPU-CLOSED on GB10 — `CLAIM-ROADMAP-C5`
+
+**Punch-list rank #3.** The C5 W1–W8 code was already landed + CPU-green; the rows sat
+`GATING` on "compile/run the shared scaled-RoPE + local-mask CUDA path on GB10 and pass
+the feature-positive model gates". This session did exactly that against the **0.26**
+oracle. RECORDS-ONLY (no `src/`/`include/`/`tests/`/CMake edit; clean build of pristine
+`489f7771`) ⇒ every SACRED gate byte-identical BY CONSTRUCTION.
+
+**Environment.** Isolated worktree `/home/mudler/_git/wt-c5-gate` (branch `c5-gate-close`,
+base `origin/main` `489f7771`). dgx GB10 sm_121a `~/work/c5-gate/src` (`git archive`
+transfer, clean CUDA `build` `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON
+-DCMAKE_CUDA_ARCHITECTURES=121a`, `-Werror` **0 warnings**). Oracle `~/venvs/vllm-oracle` =
+vLLM **0.26.0.dev0+g5559679** / transformers 5.14.1. All GPU under one `flock $HOME/gpu.lock`.
+
+**Feature-positive vehicle map (cached + supported + oracle-runnable).** SWA →
+`unsloth/gemma-2-2b-it` (W=4096) + `google/gemma-3-1b-it` (W=512 interleaved 5:1); LongRoPE →
+`microsoft/Phi-4-mini-instruct` (longrope, long cache selected: max_pos 131072 > original);
+llama3-rope → `unsloth/Llama-3.2-1B` (type `llama3`, applied at all positions); dynamic-NTK →
+`internlm/internlm2-chat-1_8b` (type `dynamic` factor 2.0 — IDENTITY at gate lengths, mirrors
+vLLM). YaRN and chunked-local have NO cached oracle-runnable/supported vehicle → honest block.
+
+**Gate results (all GREEN on GB10).** Operator/unit: `test_attention_window` 3/3;
+`test_ops_paged_attn` 25/25 (454474 assertions, incl. WMMA **sliding-window** max_abs_err
+2.10e-6 vs f32 ref + FA-2 — the local-mask CUDA kernel POSITIVELY gated); `test_chunked_local_attention`
+5/5 (18849); `test_ops_rope` 6/6, `test_ops_rope_cache` 6/6 (6692), `test_rotary_embedding`
+14/14 (scaled-RoPE caches). Model SACRED vs the 0.26 oracle: **Phi-4-mini (LongRoPE) 16/16**
+(7 strict + 9 near-tie ≤0.5, 0 divergent; RED-first — disabling the mscale catches);
+**Llama-3.2-1B (llama3) 16/16** (12 strict + 4 near-tie gap 0.0); **InternLM2 (dynamic-NTK)
+16/16**; **Gemma-2 48/48 + Gemma-3 48/48** CUDA greedy (SWA). **0.26 confirmation:** Phi-4-mini +
+Llama-3.2-1B 0.26-oracle recaptures ALL-DETERMINISTIC K=5 and BIT-IDENTICAL to the committed
+goldens ⇒ zero drift ⇒ the STRICT/near-tie gates are valid vs the 0.26 oracle.
+
+**Lifecycle.** `ATTN-SLIDING-WINDOW`, `ATTN-ROPE-LLAMA3`, `ATTN-ROPE-LONGROPE`,
+`ATTN-ROPE-DYNAMIC-NTK`, `ATTN-YARN` → `ACTIVE` (correctness feature-positive GPU-gated,
+speed pending). `ATTN-CHUNKED-LOCAL` + `KV-{SLIDING-WINDOW,CHUNKED-LOCAL}-SPEC` stay honest.
+
+**Honest residual (vehicle-blocked / speed tail — NOT skipped gates).** YaRN model e2e:
+no cached oracle-runnable YaRN consumer (Nomic-bert/gpt-oss absent, Qwen3-4B is default-rope) —
+operator CUDA + G3 CPU formula proven. Chunked-local model e2e: no `Llama4ForCausalLM` model row
+(the representative consumer) — metadata/operator G5 proven. Long-context positive-mask
+(prompt > W) SWA model e2e + the KV memory-optimization G8. And the roadmap-wide every-axis
+**SPEED** gate (all C5 leaves correctness-complete, speed-pending, mirroring their ACTIVE model
+consumers). `ROAD-V1-C5` therefore stays `PARTIAL`/RI with the residual recorded, NOT row-DONE.
+
+**Inertness.** No kernel/model TU touched (`git diff --stat` = C5 matrix rows + roadmap +
+docs only) ⇒ compute-sanitizer N/A, `check-device-leakage` not increased, every other SACRED
+gate byte-identical by construction. `benchmark_binding=false`. Seven checkers bare RC green.
+NOT pushed; FULL SHA reported to caller. Coordination `CLAIM-ROADMAP-C5`; ledger row same date.
