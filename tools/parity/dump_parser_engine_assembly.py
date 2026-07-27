@@ -42,7 +42,17 @@ ENGINE_MODULES = [
     "streaming_parser_engine",
     "parser_engine",
 ]
-FAMILY_MODULES = ["qwen3", "kimi_k2", "seed_oss"]
+FAMILY_MODULES = [
+    "qwen3",
+    "kimi_k2",
+    "seed_oss",
+    # ROAD-V1-C8: the remaining engine-backed families ported to the C++ engine.
+    "minimax_m2",
+    "glm47_moe",
+    "deepseek_v4",
+    "deepseek_v32",
+    "nemotron_v3",
+]
 
 
 def build_sandbox(vllm_source):
@@ -62,6 +72,9 @@ def build_sandbox(vllm_source):
         text = text.replace("from vllm.parser.engine.", "from pe.")
         text = text.replace("from vllm.parser.qwen3 import", "from pe.qwen3 import")
         text = text.replace("from vllm.parser.kimi_k2 import", "from pe.kimi_k2 import")
+        # nemotron_v3 imports qwen3; deepseek_v32 imports deepseek_v4.
+        text = text.replace(
+            "from vllm.parser.deepseek_v4 import", "from pe.deepseek_v4 import")
         return text
 
     for m in ENGINE_MODULES:
@@ -91,6 +104,14 @@ def build_sandbox(vllm_source):
     write("vllm/entrypoints/openai/__init__.py", "")
     write("vllm/entrypoints/openai/engine/__init__.py", "")
     write("vllm/entrypoints/openai/engine/protocol.py", _PROTOCOL_STUB)
+    # glm47_moe imports the request protocol types at module load (used only for
+    # type hints); a bare placeholder class is enough for the pure-function gate.
+    write("vllm/entrypoints/openai/chat_completion/__init__.py", "")
+    write("vllm/entrypoints/openai/chat_completion/protocol.py",
+          "class ChatCompletionRequest:\n    pass\n")
+    write("vllm/entrypoints/openai/responses/__init__.py", "")
+    write("vllm/entrypoints/openai/responses/protocol.py",
+          "class ResponsesRequest:\n    pass\n")
 
     write("vllm/tool_parsers/__init__.py", "")
     write("vllm/tool_parsers/utils.py", _TOOL_UTILS_STUB)
@@ -221,6 +242,10 @@ class MockTok:
             "<|tool_call_begin|>": 1005,
             "<|tool_call_end|>": 1006,
             "<|tool_call_argument_begin|>": 1007,
+            # ROAD-V1-C8 families: outer wrapper tokens the parsers look up at
+            # construction (never fired: gate streams carry no token ids).
+            "<minimax:tool_call>": 1030,
+            "</minimax:tool_call>": 1031,
         }
 
     def get_vocab(self):
@@ -310,6 +335,115 @@ def make_scenarios():
         '{"city": "Tokyo", "unit": "celsius"}',
         "<|tool_call_end|><|tool_calls_section_end|>",
     ]))
+
+    # ── ROAD-V1-C8: the remaining engine-backed families ──────────────────
+    # 10. minimax_m2 reasoning + <invoke>/<parameter> XML, whole-delta.
+    MINIMAX_FULL = (
+        "<think>weighing options</think>"
+        "Let me look that up."
+        '<minimax:tool_call><invoke name="get_weather">\n'
+        '<parameter name="city">Seattle</parameter>\n'
+        '<parameter name="unit">celsius</parameter>\n'
+        "</invoke></minimax:tool_call>"
+    )
+    scenarios.append(("minimax_reasoning_xml_wholedelta", "minimax_m2", True,
+                      True, [
+        "<think>weighing options</think>",
+        "Let me look that up.",
+        '<minimax:tool_call><invoke name="get_weather">\n',
+        '<parameter name="city">Seattle</parameter>\n',
+        '<parameter name="unit">celsius</parameter>\n',
+        "</invoke></minimax:tool_call>",
+    ]))
+    # 11. minimax_m2 char-by-char (streaming stability).
+    scenarios.append(("minimax_reasoning_xml_charwise", "minimax_m2", True,
+                      True, chars(MINIMAX_FULL)))
+
+    # 12. glm47_moe reasoning + <arg_key>/<arg_value>, whole-delta. The function
+    #     name carries a trailing newline that the parser .strip()s.
+    GLM_FULL = (
+        "<think>deciding</think>"
+        "<tool_call>get_weather\n"
+        "<arg_key>city</arg_key><arg_value>Seattle</arg_value>"
+        "<arg_key>unit</arg_key><arg_value>celsius</arg_value>"
+        "</tool_call>"
+    )
+    scenarios.append(("glm47_reasoning_xml_wholedelta", "glm47_moe", True, True, [
+        "<think>deciding</think>",
+        "<tool_call>get_weather\n",
+        "<arg_key>city</arg_key><arg_value>Seattle</arg_value>",
+        "<arg_key>unit</arg_key><arg_value>celsius</arg_value>",
+        "</tool_call>",
+    ]))
+    # 13. glm47_moe char-by-char (name-strip + arg carve under fine cadence).
+    scenarios.append(("glm47_reasoning_xml_charwise", "glm47_moe", True, True,
+                      chars(GLM_FULL)))
+
+    # 14. deepseek_v4 <think> reasoning + DSML tool_calls, whole-delta. A
+    #     string="false" typed value exercises the json.loads coercion.
+    DS = "｜DSML｜"
+    DSV4_FULL = (
+        "<think>calling</think>"
+        f"<{DS}tool_calls>"
+        f'<{DS}invoke name="get_weather">'
+        f'<{DS}parameter name="city" string="true">Hangzhou</{DS}parameter>'
+        f'<{DS}parameter name="days" string="false">5</{DS}parameter>'
+        f"</{DS}invoke>"
+        f"</{DS}tool_calls>"
+    )
+    scenarios.append(("deepseek_v4_reasoning_dsml_wholedelta", "deepseek_v4",
+                      True, True, [
+        "<think>calling</think>",
+        f"<{DS}tool_calls>",
+        f'<{DS}invoke name="get_weather">',
+        f'<{DS}parameter name="city" string="true">Hangzhou</{DS}parameter>',
+        f'<{DS}parameter name="days" string="false">5</{DS}parameter>',
+        f"</{DS}invoke>",
+        f"</{DS}tool_calls>",
+    ]))
+    # 15. deepseek_v4 char-by-char.
+    scenarios.append(("deepseek_v4_reasoning_dsml_charwise", "deepseek_v4",
+                      True, True, chars(DSV4_FULL)))
+
+    # 16. deepseek_v32 DSML function_calls wrapper, no reasoning, whole-delta.
+    DSV32_FULL = (
+        f"<{DS}function_calls>"
+        f'<{DS}invoke name="lookup">'
+        f'<{DS}parameter name="q" string="true">weather</{DS}parameter>'
+        f'<{DS}parameter name="count" string="false">3</{DS}parameter>'
+        f"</{DS}invoke>"
+        f"</{DS}function_calls>"
+    )
+    scenarios.append(("deepseek_v32_dsml_wholedelta", "deepseek_v32", False,
+                      True, [
+        f"<{DS}function_calls>",
+        f'<{DS}invoke name="lookup">',
+        f'<{DS}parameter name="q" string="true">weather</{DS}parameter>',
+        f'<{DS}parameter name="count" string="false">3</{DS}parameter>',
+        f"</{DS}invoke>",
+        f"</{DS}function_calls>",
+    ]))
+    # 17. deepseek_v32 char-by-char.
+    scenarios.append(("deepseek_v32_dsml_charwise", "deepseek_v32", False, True,
+                      chars(DSV32_FULL)))
+
+    # 18. nemotron_v3 (qwen3 grammar) reasoning + XML tool call, whole-delta.
+    scenarios.append(("nemotron_reasoning_xml_wholedelta", "nemotron_v3", True,
+                      True, [
+        "<think>Let me check.</think>",
+        "On it.",
+        "<tool_call>\n<function=get_weather>\n",
+        "<parameter=city>Tokyo</parameter>\n",
+        "</function>\n</tool_call>",
+    ]))
+    # 19. nemotron_v3 char-by-char.
+    NEMO_FULL = (
+        "<think>Let me check.</think>On it."
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>Tokyo</parameter>\n</function>\n</tool_call>"
+    )
+    scenarios.append(("nemotron_reasoning_xml_charwise", "nemotron_v3", True,
+                      True, chars(NEMO_FULL)))
     return scenarios
 
 
@@ -323,6 +457,20 @@ def make_parser(pe_pkg, cfg, thinking, tok):
     if cfg == "kimi_k2":
         return pe_pkg["kimi_k2"].KimiK2Parser(tok, chat_template_kwargs={
             "thinking": thinking})
+    if cfg == "minimax_m2":
+        # Always reasoning-initial; no chat_template_kwargs consumed.
+        return pe_pkg["minimax_m2"].MinimaxM2Parser(tok)
+    if cfg == "glm47_moe":
+        return pe_pkg["glm47_moe"].Glm47MoeParser(tok, chat_template_kwargs={
+            "enable_thinking": thinking})
+    if cfg == "deepseek_v4":
+        return pe_pkg["deepseek_v4"].DeepSeekV4Parser(tok, chat_template_kwargs={
+            "thinking": thinking})
+    if cfg == "deepseek_v32":
+        return pe_pkg["deepseek_v32"].DeepSeekV32Parser(tok)
+    if cfg == "nemotron_v3":
+        return pe_pkg["nemotron_v3"].NemotronV3Parser(tok, chat_template_kwargs={
+            "enable_thinking": thinking})
     raise SystemExit("unknown cfg: " + cfg)
 
 

@@ -26371,3 +26371,48 @@ chat-form `/tokenize`.
 - **2026-07-27** — **ROAD-V1-MM speed lever #3 FIRST BRICK: the 27B mm image+video decode step is now GRAPH-CAPTURABLE** (`CLAIM-MULTIMODAL-SPEED-GRAPH`; base `origin/main` `bd3e15ed`; dgx GB10 `~/work/mm-decode-graph`, cutlass 4.5.0 + FA2 + Triton-AOT arch 121a, GPU under `flock /tmp/gpu`). SCOPE (grounded file:line): mm serving ingestion is UNWIRED (`protocol.cpp:298` bare-string only, no `image_url`/`audio_url`, no engine `multi_modal_data` path); mm decode was single-seq eager (`VLGenerateCoreGdn` `qwen3_5.cpp:6724`, `VoxtralGenerateGreedy` `voxtral.cpp:375`); the graphed captured decode `Qwen3_5DenseDecodeGraph` already existed for the 27B-dense family (`qwen3_5_dense.h:314`) but the mm path bypassed it; Voxtral's Llama stack has NO decode-graph class. BRICK: routed `VLGenerateCoreGdn`'s pure-decode loop (shared 27B image+video) through `Qwen3_5DenseDecodeGraph::Step` (per-generate, `max_num_reqs=1`; S==B==1 bit-identical rebuild); decode-time 1-D device RoPE at p reproduces the degenerate MRoPE {p,p,p}; one file (`qwen3_5.cpp`); eager fallback behind `VT_MM_DECODE_EAGER=1`. GATE (dgx, RED line HELD, proven-to-run via `VT_DECODE_GRAPH_STATS`=30 replays each): 27B image STRICT **32/32** + 27B video STRICT **32/32**, golden md5 unchanged. A/B (throwaway toggle, rep0 dropped): graphed **232.5** vs eager **233.4 ms/tok** = NEUTRAL at the 27B bandwidth floor (the ~1 ms/tok launch overhead is hidden — as §8 predicted). Value is STRUCTURAL: mm decode is now graph-capturable (closes the §3 un-graphed gap), a prerequisite for batched c2+ and the audio launch-overhead win. Records: multimodal-speed.md §9 (SCOPE + brick + A/B + W-plan W1-W3), engine/model/feature matrices + roadmap + completion spec (by-key), README/BENCHMARKS, ledger. Record checkers RC green. mm rows stay `PARTIAL` (speed-pending). Not pushed; FULL SHA reported to the dispatcher.
 
 - **Next (lever-#3 W-plan, multimodal-speed.md §9.5):** W1 — a `VoxtralDecodeGraph` (Llama/Mistral text stack) to route `VoxtralGenerateGreedy`'s decode through a captured graph = the audio 1.52× gap-closer (3B decode is NOT bandwidth-floored, so launch overhead is NOT hidden); W2 — batched multi-seq mm decode (S>1 / c2+); W3 — `image_url`/`audio_url` serving ingestion (parse + engine mm-request path + processor wiring).
+
+## 2026-07-27 — ROAD-V1-C8 `TOOLS-STREAMING-PARSER` engine CONFIG FAMILIES (5 PORTED, 2 DEFERRED)
+
+`CLAIM-ROADMAP-C8-CONFIGS`. Worktree `.claude/worktrees/agent-a99f3d3d056329649`
+off `main` `22a9db5e` (branch `worktree-agent-a99f3d3d056329649`). CPU-only, NO
+dgx. pin `555967922` / vLLM 0.26.0.dev0. NOT pushed.
+
+**Ported (exact-gated):** `minimax_m2`, `glm47_moe`, `deepseek_v4`,
+`deepseek_v32`, `nemotron_v3` — additive `ParserEngineConfig` builders in
+`src/vllm/parser/engine/configs.cpp` (5 builders + `_minimax_m2`/`_glm47`/`_dsml`
+std::regex arg-converters mirroring qwen3), registry + parser_manager dispatch,
+and a `Glm47MoeParser` C++ subclass (`include/vllm/parser/glm47_moe.{h,cpp}`) for
+the function-name `.strip()` over the EXISTING `emit_name_delta`/`handle_tool_end`
+hooks. deepseek DSML `string="true|false"` typed-value coercion via
+`nlohmann::ordered_json::parse`; deepseek's schema wrapper-unwrap degenerates to
+the config converter under the no-tool-schema model (same identity bucket as
+`_fix_arg_types`), exercised by the tools-empty gate. `test_parser_engine_assembly`
+**3510/3510** over **19 scenarios** (+10, each family whole-delta AND char-by-char),
+field-for-field vs vLLM 0.26; goldens byte-reproduced by the extended
+`dump_parser_engine_assembly.py` (copies the REAL vLLM family modules). RED-first:
+disabling glm47 name-`.strip()` fails exactly 2 asserts at
+`glm47_reasoning_xml_wholedelta delta[2] tc[0] tc name` (want `get_weather`, break
+`get_weather\n`) + the char-by-char twin; restore → GREEN.
+
+**Deferred (honest, NOT stubbed) — each needs a specific UNPORTED assembly hook:**
+- `gemma4` — per-parser `_events_to_delta` reasoning-rewrite hook (`gemma4.py:530`
+  strips the intrinsic `thought\n` channel prefix from streamed reasoning) +
+  `_preprocess_feed` `<|channel>` first-feed injection (`:424`). The custom
+  `_parse_gemma4_args` scanner itself is portable; the delta-rewrite/feed hooks are
+  the blockers (adding them edits the assembly core, out of scope).
+- `inkling` — virtual `_extract_args_value` hook to unwrap the Inkling `args`
+  wrapper key in the non-streaming name-from-args path (`inkling.py:402`; base
+  `extract_name_and_args` inlines a fixed `{"arguments","parameters"}` key list) +
+  `_single_pass_parse` trailing-text flush (`:376`). The `_inkling_arg_converter`
+  JSON-span scanner itself is portable.
+
+**Inertness proven:** engine-core `test_streaming_parser_engine` **586/586** and
+serving-SSE `test_openai_serving_chat_stream` **210/210** both UNCHANGED (streaming
+engine + serving path untouched). CPU `-Werror` 0-warn on a clean full `vllm`
+library rebuild. Additive only: config builders/converters + registry/manager
+dispatch + NEW `glm47_moe.{h,cpp}` + 1 CMake line + the extended assembly test/dump.
+
+**Residual (C8 stays PARTIAL).** gemma4 + inkling engine configs (need the named
+assembly hooks above); JSON-schema arg-type coercion; `SERVE-RESPONSE-METRICS`
+(INVENTORIED); live-engine per-step metric value wiring; chat-form `/tokenize`.
