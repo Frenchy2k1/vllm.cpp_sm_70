@@ -2555,6 +2555,24 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## OPEN LEAD: 64x64 GEMM with 8 simdgroups - 1.8x but INCORRECT (2026-07-27)
+
+Measured, not shipped. The strongest unclosed lead toward parity:
+
+| kernel | qkv | mlp-up | mlp-dn |
+|---|--:|--:|--:|
+| shipped 32x32, 4 simdgroups | 990 GFLOP/s | 1019 | 1002 |
+| 64x64, 8 simdgroups | **1712** | **1907** | **1821** |
+| MLX steel (target) | 2640 | 3325 | 3293 |
+
+**1.8x, roughly half the remaining distance to MLX** — and **numerically wrong**:
+NMSE 0.994 on f32 64x512x128, a shape with no ragged edge in M, N or K, so an
+indexing or synchronisation defect rather than an edge guard. Not located, not
+shipped. Reproduction and a bisect starting point are in the spec's "OPEN LEAD"
+section.
+
+---
+
 ## MLX provider is now NET SLOWER than our own kernels (2026-07-27) - action for LocalAI
 
 **Our Metal kernels have overtaken the MLX provider.** Measured on current main,
