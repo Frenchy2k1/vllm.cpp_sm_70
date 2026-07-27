@@ -528,7 +528,16 @@ kernel void vt_matmul_bt_mm(device const uchar* a   [[buffer(0)]],
   // fingerprint in .agents/specs/metal-dispatch-attribution.md.
   threadgroup float sa[VT_MM_BM * VT_MM_BK];
   threadgroup float sb[VT_MM_BK * VT_MM_BN];
-  threadgroup float sc[VT_MM_BM * VT_MM_BN];
+  // Epilogue scratch, ONE 8x8 fragment PER SIMDGROUP rather than the whole
+  // BM x BN tile. A simdgroup only ever reads back the fragment it just stored,
+  // so nothing crosses simdgroups and a simdgroup_barrier suffices where the
+  // full tile needed a threadgroup barrier. At 64x64 that is 2 KB instead of
+  // 16 KB, taking the kernel from 24 KB of threadgroup memory to 10 KB.
+  //
+  // It buys less than the footprint suggests (GEMM 653 -> 642 ms, ~1.7%), and
+  // that is the finding: this kernel is NOT occupancy-limited, so freeing 14 KB
+  // barely moves it. Kept because it is faster, simpler and drops a barrier.
+  threadgroup float sc[VT_MM_SGS * 64u];
 
   const uint row0 = tgid.y * VT_MM_BM;
   const uint col0 = tgid.x * VT_MM_BN;
@@ -632,20 +641,25 @@ kernel void vt_matmul_bt_mm(device const uchar* a   [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  // Land the accumulators in threadgroup memory, then write out with vt_store so
-  // the runtime output dtype is honoured.
-  for (uint i = 0u; i < 4u; ++i)
-    for (uint j = 0u; j < 2u; ++j)
-      simdgroup_store(acc[i][j],
-                      &sc[(sg_r * 32u + i * 8u) * VT_MM_BN + sg_c * 16u + j * 8u],
-                      VT_MM_BN);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  for (uint e = tid; e < VT_MM_BM * VT_MM_BN; e += nthreads) {
-    const uint r = e / VT_MM_BN, c = e % VT_MM_BN;
-    const uint gr = row0 + r, gc = col0 + c;
-    if (gr < p.m && gc < p.n) {
-      vt_store(out, p.out_dt, ulong(gr) * ulong(p.n) + ulong(gc), sc[r * VT_MM_BN + c]);
+  // Land each accumulator fragment in this SIMDGROUP's own 8x8 scratch and write
+  // it out with vt_store, so the runtime output dtype is honoured. Private per
+  // simdgroup means no threadgroup barrier here: simdgroup_barrier orders the
+  // store against the read-back, and the next fragment against the read.
+  threadgroup float* mysc = &sc[sgitg * 64u];
+  const uint lane = tid % 32u;
+  for (uint i = 0u; i < 4u; ++i) {
+    for (uint j = 0u; j < 2u; ++j) {
+      simdgroup_store(acc[i][j], mysc, 8u);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      const uint br = row0 + sg_r * 32u + i * 8u;
+      const uint bc = col0 + sg_c * 16u + j * 8u;
+      for (uint e = lane; e < 64u; e += 32u) {
+        const uint gr = br + e / 8u, gc = bc + e % 8u;
+        if (gr < p.m && gc < p.n) {
+          vt_store(out, p.out_dt, ulong(gr) * ulong(p.n) + ulong(gc), mysc[e]);
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
     }
   }
 }
