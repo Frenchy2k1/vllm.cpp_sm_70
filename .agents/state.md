@@ -32362,3 +32362,73 @@ GPU memory-halving path, DGX-blocked); the runner/spec integration (half-sized K
 `k_scale`/`v_scale` threading + `--kv-cache-dtype`/`--calculate-kv-scales`); fp8_e5m2 CPU compute +
 per-attention-head scales. W1 is a CPU correctness brick — the real memory/throughput WIN is the GPU
 path + halved-block runner integration. Not pushed; FULL SHA reported to the caller.
+
+## 2026-07-27 — Qwen3.5-4B post-pull revalidation on discrete Blackwell, and a VOIDED prior series
+
+Workspace fast-forwarded 109 commits onto `upstream/main` `7f620e74`; the local
+`c317237a` transplant's two commits are now upstream (`a131de03`, `b6f1efc8`), so
+the measured tree is plain current `main`. Rebuilt
+`build-nix-cuda-transplant-triton` clean, ran the correctness tier and the full
+18-leg matched comparison under one `flock /tmp/gpu`.
+
+**Correctness: unchanged, bit for bit.** `test_qwen35_plain_weights --no-skip`
+3/3 (1672 asserts), `test_ops_gdn` 66/66 (4242), `test_ops_paged_attn` 25/25
+(454,474), `test_gdn_packed_decode_triton` 1/1, `test_combine_tokens` 7/7,
+`test_input_batch` 22/22 — every count identical to the 2026-07-25 record. And
+the benchmark output is token-identical to that series: 128/128 requests per
+repetition for BOTH direct-ON and direct-OFF. 109 upstream commits moved no token
+on this workload.
+
+**Performance: no meaningful regression, and no real gain either.** Against the
+oracle in the SAME series, total throughput 0.9864x -> 0.9819x and the TPOT
+excess +13.41% -> +14.00%. Absolute numbers rose ~14% on BOTH arms, which is the
+whole story below.
+
+**THE FINDING — the 2026-07-25 series was contended, so its absolute numbers are
+VOID.** All nine of its performance legs recorded 11-13% GPU utilization and
+611 MiB of extra resident VRAM BEFORE the leg started; all nine of today's
+recorded 0%. `prepare_leg` gated idleness on `nvidia-smi --query-compute-apps`,
+which enumerates CUDA contexts only, so a GRAPHICS consumer was invisible to it
+and an entire binding series passed the gate while sharing the GPU. Both arms
+gained ~14% on a genuinely idle box, which is exactly why the RATIO moved almost
+not at all. Closed by adding an explicit `utilization.gpu` check
+(`GPU_IDLE_UTIL_MAX`, default 2%); re-parsed, it reads 0 for today and 12 for
+2026-07-25. The prior series' ratios, same-binary component attributions and
+profiling attribution survive — each was internal to one uniformly-contended
+series — but no absolute number from it may be published.
+
+Also corrected: the local oracle is **vLLM 0.24.0**, not the 0.25.0 the previous
+evidence and BENCHMARKS entry claimed. That series' own recorded
+`vllm-version.txt` already said 0.24.0. The project parity pin is now
+`555967922` / 0.26.0.dev0, so this denominator is behind the pin and is labelled
+as such.
+
+Two summarizer defects fixed on the way: it read historical token legs under a
+`perf-` prefix the harness has never written, and it demanded a
+`vllm_production` key its own current output does not contain. Either one made
+summarizing a series against the previous one impossible.
+
+**Residual and next step.** TPOT is the only failing latency axis and its
+mechanism is specific, not diffuse: this GPU is DISCRETE, `is_integrated_gpu()`
+is false, so both ENG-ASYNC-SCHED W3 device call sites (`runner.cpp:821`
+combine, `runner.cpp:1763` scatter) take their host fallback and
+`sample_tokens_async` must synchronize the main stream before the host can read
+the sampled ids. The async scheduler IS engaged (`max_concurrent_batches=2`), so
+depth-2 currently overlaps nothing here. Upstream has no such branch:
+`states.py:64` keeps `last_sampled_tokens` GPU-resident unconditionally and
+`states.py:132` never condenses slots (free-index pool), which is why it needs no
+host round-trip; our `InputBatch::condense` is the one real complication and the
+spec resolves it by replaying the recorded row moves on device in stream order.
+Scoped, not implemented: [specs/async-discrete-device-combine.md](specs/async-discrete-device-combine.md).
+The spec also names the SECOND per-step barrier that must go with it — the CUDA
+embedding out-of-range flag does `cudaMalloc` + `cudaStreamSynchronize` +
+`cudaFree` on EVERY call, which is 23.7 us while the engine is serialized and a
+hard barrier the moment it is not.
+
+Evidence root `/tmp/qwen35-postpull-7f620e74`; index
+[docs/bench-evidence/qwen35-4b-postpull-20260727.md](../docs/bench-evidence/qwen35-4b-postpull-20260727.md).
+
+Pre-existing and NOT introduced here: `scripts/check-agent-record.py` reports 6
+errors on pristine `main` (DONE rows citing closing commits `164453a2` /
+`7a3f04b2`, which do not exist in this clone). Verified identical with and
+without this change.

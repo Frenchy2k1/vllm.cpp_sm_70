@@ -4941,42 +4941,66 @@ The local Qwen3.5-4B checkpoint corpus is exactly
 `/tmp/qwen35-4b-sharegpt-1024.json`, SHA-256
 `9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`.
 
-### Local Qwen3.5-4B direct-load checkpoint, 2026-07-25
+### Local Qwen3.5-4B direct-load checkpoint, 2026-07-27 (revalidated on `main` @ `7f620e74`)
 
-**GATING / speed-pending; current-main transplant revalidation PENDING.** The
-measurements below bind the original repair commit `8964bde7` based on
-`72f9fb13`, not its current-main transplant `c317237a` based on `c39d78a6`.
-That path includes the exact H32 Triton-AOT recurrence, plain-BF16 decode graph
-capture/replay and ratio-4 FA2 split-KV decode. On the corpus above at
-concurrency 32, 128 output tokens/request and three repetitions, direct
-ON/OFF/vLLM-0.25 means were:
+**GATING / speed-pending.** This SUPERSEDES the 2026-07-25 entry and discharges
+the revalidation it recorded as pending; the transplant's commits are now
+upstream, so the measured tree is plain current `main`. Corpus above,
+concurrency 32, 128 output tokens/request, three repetitions per arm, one
+`flock /tmp/gpu` across all 18 legs, oracle **vLLM 0.24.0** (the local venv's
+own recorded version; the previous entry's "0.25.0" label was wrong).
 
-| Axis | Direct ON | Direct OFF | vLLM 0.25 stable confirmation | Disposition |
+| Axis | Direct ON | Direct OFF | vLLM 0.24.0 | Disposition |
 |---|---:|---:|---:|---|
-| Total throughput (tok/s) | 5769.99 | 5660.70 | 5849.80 | FAIL, 0.9864x |
-| Output throughput (tok/s) | 638.03 | 625.94 | 646.85 | FAIL, 0.9864x |
-| Requests/s | 4.9867 | 4.8900 | 5.0536 | FAIL, 0.9868x |
-| Mean TTFT (ms) | 834.91 | 943.43 | 1047.13 | PASS |
-| Mean TPOT/ITL (ms) | 43.72 | 43.84 | 38.55 | FAIL |
-| Peak PSS (GiB) | 2.406 | 8.592 | 7.662 | PASS |
-| Stable PSS (GiB) | 0.759 | 8.589 | 4.029 | PASS |
-| Peak VRAM (MiB) | 12850.7 | 12843.3 | 12942.7 | PASS vs vLLM and within +8 MiB vs OFF |
+| Total throughput (tok/s) | 6600.66 | 6481.34 | 6722.24 | FAIL, 0.9819x |
+| Output throughput (tok/s) | 729.88 | 716.69 | 743.33 | FAIL, 0.9819x |
+| Requests/s | 5.700 | 5.600 | 5.807 | FAIL, 0.9815x |
+| Mean TTFT (ms) | 729.24 | 835.01 | 913.55 | PASS, 20.2% lower |
+| Mean TPOT/ITL (ms) | 38.22 | 38.21 | 33.53 | FAIL, 14.0% higher |
+| Peak PSS (GiB) | 2.282 | 8.594 | 7.666 | PASS |
+| Stable PSS (GiB) | 0.761 | 8.591 | 4.039 | PASS |
+| Peak VRAM (MiB) | 12850.0 | 12846.0 | 12933.3 | PASS vs vLLM and within +4 MiB vs OFF |
 
-Direct ON and OFF are output-identical for 128/128 requests in every pair.
-Same-binary component gains are H32 AOT **+4.5906%**, decode graph
-**+0.3873%**, and ratio-4 FA2 **+1.6004%**. The final attribution-complete
-node trace contains 453 graph launches and 200,972 graph-child kernels; local
-FA2 averages 180.28 us/call versus vLLM's 178.40 us/call. CUDA API attribution
-finds the residual: 497 sampled-ID D2H synchronizations consume 20.975 s
-(42.20 ms/call) because the discrete path updates host request rows
-immediately; vLLM defers the equivalent wait through events. Root, hashes,
-exact commands and the stable-denominator rationale:
+Every generated token is IDENTICAL to the 2026-07-25 run, 128/128 requests per
+repetition in both arms, so 109 upstream commits moved no token here. Our arm is
+deterministic rep-to-rep and ON==OFF 128/128; the oracle is not self-deterministic
+(102/128 on one pair). Spread is 0.13% (ours) and 0.17% (vLLM) across
+repetitions, so the ratios are not noise.
+
+**The 2026-07-25 absolute numbers are VOID: that series was contended.** All
+nine of its performance legs ran with the GPU at 11-13% utilization and 611 MiB
+of extra resident VRAM; today's nine ran at 0%. Both arms gained ~14% on the
+idle box, which is exactly why the ratio barely moved (0.9864x -> 0.9819x). The
+cause was a harness hole - `prepare_leg` gated idleness on
+`--query-compute-apps`, which cannot see a GRAPHICS consumer - now closed by an
+explicit `utilization.gpu` check (`GPU_IDLE_UTIL_MAX`, default 2%). The prior
+entry's RATIOS, its same-binary component attributions (H32 AOT **+4.5906%**,
+decode graph **+0.3873%**, ratio-4 FA2 **+1.6004%**) and its profiling
+attribution survive, because each was internal to one uniformly-contended series.
+
+The residual is unchanged and now specified. TPOT fails because this GPU is
+DISCRETE: `is_integrated_gpu()` is false, so both ENG-ASYNC-SCHED W3 device call
+sites take their host fallback and `sample_tokens_async` must synchronize the
+main stream (497 syncs, 20.975 s, 42.20 ms/call in the node-mode trace). The
+async scheduler IS engaged (`max_concurrent_batches=2`), so depth-2 currently
+buys nothing here. Upstream keeps `last_sampled_tokens` GPU-resident
+unconditionally and never condenses request slots. Scoped as `ENG-ASYNC-SCHED`
+W4 in [.agents/specs/async-discrete-device-combine.md](../.agents/specs/async-discrete-device-combine.md).
+Root, hashes, per-leg contention table, exact commands:
+[Qwen3.5-4B post-pull revalidation](bench-evidence/qwen35-4b-postpull-20260727.md).
+Prior series (ratios and attributions only):
 [Qwen3.5-4B main repair evidence](bench-evidence/qwen35-4b-main-repair-20260725.md).
-Revalidate `c317237a` with the exact `flock /tmp/gpu
-tools/bench/run_qwen35_4b_compare.sh /tmp/qwen35-main-final-fa2-<commit>` recipe
-in that evidence document before publishing these values as binding for the
-development branch.
 This 4B diagnostic does not establish 27B/35B support.
+
+### Hardening detector lanes (2026-07-27, `HARDEN-DETECTOR-LANES`) - infrastructure, NOT APPLICABLE
+
+No performance claim: `VLLM_CPP_SANITIZE` (ASan/UBSan/TSan host lanes, CPU-tier
+only) and `VT_POOL_BYPASS=1` (exact-size, really-freed `DevicePool` allocations
+so `compute-sanitizer` can see tensor boundaries and use-after-free) are both
+default-OFF and production-inert. `VT_POOL_BYPASS` is explicitly NOT a timing
+configuration - it reinstates the per-op `cudaMalloc`/`cudaFree` device-sync
+storm the pool exists to remove. Rationale and the item-by-item transfer
+decision: [.agents/specs/hardening-adoption-2026-07-27.md](../.agents/specs/hardening-adoption-2026-07-27.md).
 
 ## `M3c-1` CUDA-path neutrality on GB10 (2026-07-27) - NO MEASURABLE REGRESSION
 
