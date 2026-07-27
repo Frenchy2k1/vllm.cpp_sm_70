@@ -432,12 +432,36 @@ kernel void vt_matmul_bt_gemv(device const uchar* a   [[buffer(0)]],
   // bf16xbf16 is the case that matters (it is what the gate model runs); every
   // other combination keeps the generic path, so no dtype loses correctness for
   // one gaining speed.
-  if (p.a_dt == VT_DT_BF16 && p.b_dt == VT_DT_BF16) {
+  // VECTORISED bf16 path. The typed scalar loop below it already removed
+  // vt_load's per-element branches, but each lane still issued ONE 2-byte load
+  // per element. Reading a `ushort4` instead issues one 8-byte load per lane, so
+  // a simdgroup fetches 256 contiguous bytes per iteration instead of 64. This
+  // is the same change that took the tile GEMM's staging from 45% to ~80% of
+  // MLX's kernel, applied to the op that dominates DECODE.
+  //
+  // Alignment: the vector cast needs the element index to be a multiple of 4.
+  // `brow = col * k`, so `k % 4 == 0` carries every row start, and the loop index
+  // is a multiple of 4 by construction. Anything else falls to the scalar paths.
+  if (p.a_dt == VT_DT_BF16 && p.b_dt == VT_DT_BF16 && (p.k & 3u) == 0u) {
+    device const ushort4* a4 = (device const ushort4*)a;
+    device const ushort4* b4 = (device const ushort4*)((device const ushort*)b + brow);
+    const uint n4 = p.k >> 2u;
+    // Four accumulators, one per vector lane: a single `acc` would serialise the
+    // FMA chain in a loop that is latency- rather than throughput-bound.
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint i = tiisg; i < n4; i += sgsize) {
+      const ushort4 av = a4[i];
+      const ushort4 bv = b4[i];
+      a0 += vt_bf16_to_f32(av.x) * vt_bf16_to_f32(bv.x);
+      a1 += vt_bf16_to_f32(av.y) * vt_bf16_to_f32(bv.y);
+      a2 += vt_bf16_to_f32(av.z) * vt_bf16_to_f32(bv.z);
+      a3 += vt_bf16_to_f32(av.w) * vt_bf16_to_f32(bv.w);
+    }
+    acc = (a0 + a1) + (a2 + a3);
+  } else if (p.a_dt == VT_DT_BF16 && p.b_dt == VT_DT_BF16) {
     device const ushort* au = (device const ushort*)a;
     device const ushort* bu = (device const ushort*)b + brow;
     uint kk = tiisg;
-    // Four independent accumulators: the dependency chain on a single `acc`
-    // serialises the FMAs, and this loop is latency- not throughput-bound.
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     const uint step = sgsize * 4u;
     for (; kk + sgsize * 3u < p.k; kk += step) {

@@ -2555,6 +2555,40 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal vectorised decode GEMV on Apple M4 (2026-07-27) - +9.8%
+
+The same vectorisation applied to the op that dominates DECODE, which is now the
+larger pool (decode ~5.6 s of a 7.4 s run against MLX-LM's 4.59 s). The GEMV had
+already lost `vt_load`'s per-element branches, but each lane still issued one
+2-byte load per element; a `ushort4` makes that one 8-byte load, so a simdgroup
+fetches 256 contiguous bytes per iteration instead of 64.
+
+| | before | after |
+|---|--:|--:|
+| throughput | 15.85 tok/s | **17.41** (17.24 / 17.58) |
+| duration | 8.07 s | 7.36 s |
+| TTFT | 1774 ms | 1749 ms (unchanged; decode-only change) |
+
+**+9.8%.** Guarded on bf16 x bf16 and `k % 4 == 0` (the vector cast needs the
+element index to be a multiple of 4, and `brow = col * k` carries every row
+start); every other dtype and shape keeps the scalar paths. bf16-in/f32-out NMSE
+5.19e-15, effectively unchanged from 5.11e-15.
+
+**Golden re-captured, oracle-validated (vLLM 0.25.0, version read from the
+interpreter), and the profile is IDENTICAL:**
+
+| | new | previous |
+|---|--:|--:|
+| per-token == vLLM argmax | 254/256 | 254/256 |
+| mean gap | 0.98 mnats | 0.98 |
+| max gap | 0.125 nats | 0.125 |
+| outside vLLM top-K | 0 | 0 |
+
+12 of 256 tokens changed across 2 prompts; the near-tie character is unchanged,
+those positions simply resolve the other way. Gate 16/16 (10 strict + 6 band).
+
+---
+
 ## Metal vectorised GEMM staging on Apple M4 (2026-07-27) - 1.55x on the kernel
 
 **Found by reading MLX's steel loader**, which the exclusion list below made the
