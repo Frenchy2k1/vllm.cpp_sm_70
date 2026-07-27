@@ -549,6 +549,10 @@ InternLM2 plus a sliding window).
 
 ## Build and test lanes
 
+One open lead is on record from the same profiling pass: cuBLASLt resolves
+Ampere-class GEMM kernels on this Blackwell device. It is unmeasured and may be
+a non-issue, since it lands on the axis we already pass.
+
 Device-specific references in the device-agnostic layer stay at their ratchet
 floor: capability questions ("is memory unified?") rather than device-type
 tests.

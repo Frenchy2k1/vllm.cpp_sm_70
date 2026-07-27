@@ -5040,6 +5040,18 @@ Numbers, profile and reproduction:
 [W4 evidence](bench-evidence/w4-async-mirror-20260727.md). Spec and deviations:
 [.agents/specs/async-discrete-device-combine.md](../.agents/specs/async-discrete-device-combine.md).
 
+### OPEN LEAD - cuBLASLt resolves Ampere-class GEMM kernels on sm_120 (2026-07-27) - NOT MEASURED
+
+From the same profile: `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128`
+is 47.1% of GPU kernel time (1,664 instances, 2.099 s) and its 128x256 sibling a
+further 12.8%. Both are SM80 / Ampere-class kernels chosen by cuBLASLt's
+heuristic on a Blackwell device. Recorded as a LEAD, not a claim: the instance
+counts and `_relu_` epilogue indicate the PREFILL projections, and prefill is the
+axis we already pass (TTFT 0.798x), while the failing axis is TPOT. No matched
+vLLM trace exists on this device yet, and if the oracle resolves the same kernels
+there is no gap. The next step is a matched pair of traces on the identical
+corpus, diffed by kernel name.
+
 ### Hardening detector lanes (2026-07-27, `HARDEN-DETECTOR-LANES`) - infrastructure, NOT APPLICABLE
 
 No performance claim: `VLLM_CPP_SANITIZE` (ASan/UBSan/TSan host lanes, CPU-tier
