@@ -28003,3 +28003,61 @@ Records touched: `.agents/backend-matrix.md`, `.agents/specs/cuda-arch-additivit
 `docs/STATUS.md`, `docs/BENCHMARKS.md`, `.agents/roadmap_v1.md`,
 `.agents/environment.md` (new Thor profile + oracle caveat), `parity-ledger.md`,
 `coordination.md` (`CLAIM-CUDA-SM110-RUNTIME`), this `state.md`. Not pushed.
+---
+
+## 2026-07-27 — SGLang RadixAttention behavior-parity SCOPING SPIKE (`CLAIM-SGLANG-RADIX-SCOPE`)
+
+Scoping spike (read-only on production code) answering the user directive to
+scope SGLang, look at how it implements RadixAttention etc., fold into specs, and
+have at least a flag that enables/disables RadixAttention / SGLang-alike
+behavior "if it can't be fused somehow." Base `main` `0f07fe34`, isolated
+worktree. SGLang grounded at the project's pin **v0.5.15 `f63458b`** (cloned to
+`/home/mudler/_git/sglang`; the SGLang analogue of our `/home/mudler/_git/vllm`);
+every SGLang claim carries a `file:line`.
+
+**The load-bearing finding: RadixAttention is NOT a new mechanism for us — it is
+what our APC already is.** SGLang's radix tree (`radix_cache.py:280`) and our
+block-hash APC (`kv_cache_utils.cpp:259`) are two encodings of the SAME behavior:
+automatic longest-prefix KV sharing with LRU eviction, in-use ref-count
+protection, and extra-key tenant isolation. Walked both:
+- match: SGLang `_match_prefix_helper` (`:648`) galloping token/page match with
+  mid-node `_split_node` (`:674`) vs our block-hash-chain `find_longest_cache_hit`;
+- evict: SGLang LRU min-heap over evictable leaves (`:563`, `TreeNode.__lt__` by
+  `last_access_time`, pluggable lfu/slru/priority) vs our block-pool LRU;
+- protect: SGLang `lock_ref`/`inc_lock_ref` (`:592`) vs our block ref-count;
+- isolate: SGLang `RadixKey.extra_key` (`:75`, lora/cache_salt) vs our
+  `generate_block_hash_extra_keys` (mm/lora/salt, RED-proven no-false-share).
+The ONLY behavioral delta is sharing GRANULARITY: SGLang shares down to a token
+(or `page_size` unit) while we share at `block_size`. That delta is bounded to a
+single block at the point of divergence, is already parametrized by our
+`block_size` knob, and is OUTPUT-NEUTRAL (the `KV-PREFIX-CACHE` W3 gate proved
+APC-ON==APC-OFF token-exact). Building a second token-granular trie cache would
+be a redundant incompatible abstraction — against the recorded rule
+(cuda-sglang-low-concurrency.md:594) and against MIRROR-vLLM (vLLM chose
+block-hash; we mirror vLLM, not SGLang). Verdict: **already FUSED**, and
+`--enable-radix-attention` is an ALIAS for the existing prefix-cache toggle, not
+a distinct path.
+
+**Fuse-or-flag per technique.** (1) RadixAttention → already fused (APC); flag =
+alias. (2) Cache-aware LPM scheduling (`schedule_policy.py:155,205`) → genuinely
+distinct (our scheduler is FCFS/priority only, no cache-hit ordering) → FLAG
+`--schedule-policy=lpm`; but SGLang's OWN default is `fcfs` (`server_args.py:692`),
+so the default is already covered and lpm is opt-in. (3) Overlap/zero-overhead
+scheduler (`scheduler.py:1563`) → already FUSED (== `ENG-ASYNC-SCHED`, DONE,
+default-ON). (4) Jump-forward decoding (`outlines_jump_forward.py:182`) → distinct
+but opt-in → FLAG (deferred). (5) Survey: chunked-prefill / continuous-batching /
+DFlash / ngram / priority / HiCache (== KV-OFFLOAD) / Mamba-radix (== KV-MAMBA-ALIGN)
+all already covered or scoped elsewhere; custom kernels / session-radix / PD
+out of scope for a behavior toggle.
+
+**Flag design.** `--enable-radix-attention` = APC alias (+ a C-ABI
+`enable_prefix_caching` tri-state field to add — `vllm_model_params` lacks one
+today); `--schedule-policy=lpm` = the one genuinely-new path; `--enable-jump-forward`
+= deferred; optional `--sglang-compat` composes the bundle. Defaults mirror our
+current defaults (APC on for dense, fcfs). LPM without APC resolves to fcfs+warn.
+
+Deliverable: `.agents/specs/sglang-radixattention.md` + engine-matrix rows
+`KV-SGLANG-RADIX-CACHE` + `ENG-SGLANG-BEHAVIOR-FLAG` (both `SPIKE`) +
+feature-matrix entry. The `BACKEND-GATE-CUDA-SGLANG*` competitor benchmark rows
+are the SIBLING track, cross-referenced and unchanged. Records-only, no engine
+code, `benchmark_binding=false`. Not pushed.

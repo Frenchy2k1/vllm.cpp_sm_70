@@ -385,6 +385,21 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   remaining work is the async production-serving path wiring, the chat/completion
   response-body timing surface, and the config-gated metric families (speculative
   decoding, KV connector, multimodal cache, LoRA).
+  matching vLLM's own mapping. A behavioural CPU gate drives the reference engine
+  for several steps and checks the values track the run. The remaining work is
+  the async production-serving path wiring and the config-gated metric families
+  (speculative decoding, KV connector, multimodal cache, LoRA).
+- **SGLang RadixAttention behavior parity** is scoped (fuse-or-flag,
+  2026-07-27). SGLang's radix-tree prefix cache is functionally equivalent to our
+  block-hash APC (both do automatic longest-prefix KV sharing with LRU eviction;
+  the only delta is token/page vs block sharing granularity, which is bounded and
+  never changes the output), so RadixAttention is already fused into APC and an
+  `--enable-radix-attention` flag would be an alias for the existing prefix-cache
+  toggle, not a second cache. SGLang's overlap scheduler is likewise already our
+  async scheduler. The one genuinely-distinct SGLang behavior is cache-aware
+  scheduling (reordering the queue by longest prefix match, `--schedule-policy=lpm`),
+  which is scoped as an opt-in flag; jump-forward constrained decoding is a
+  deferred opt-in. See `.agents/specs/sglang-radixattention.md`.
 - **KV persistence to disk / CPU offload** is built (CPU and disk tiers,
   identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the
   scheduler through an abstract `KVConnector` ABI selected by a

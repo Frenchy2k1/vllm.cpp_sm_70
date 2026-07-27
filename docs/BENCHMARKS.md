@@ -113,6 +113,17 @@ build-verified only (compile + `cuobjdump` SASS, no throughput claim); the only
 real numbers the campaign will produce come later from the Orin RUNTIME-VERIFIED
 gate (token-exact vs the vLLM 0.25.0 oracle, then benchmarked vs llama.cpp and
 vLLM on that box, all axes).
+**SGLang RadixAttention behavior-parity scope (2026-07-27,
+`CLAIM-SGLANG-RADIX-SCOPE`, NOT pushed).** Disposition: **NOT APPLICABLE
+(scoping spike; no measurement taken, claimed, or owed; `benchmark_binding=false`).**
+Read-only scoping of SGLang v0.5.15 (`f63458b`) RadixAttention and its sibling
+runtime techniques against our engine, with a fuse-or-flag verdict per technique
+(spec `.agents/specs/sglang-radixattention.md`; rows `KV-SGLANG-RADIX-CACHE` +
+`ENG-SGLANG-BEHAVIOR-FLAG`, both `SPIKE`). No source/kernel/engine path touched.
+The competitive throughput comparison against SGLang is the separate benchmark
+track (`BACKEND-GATE-CUDA-SGLANG*`), unchanged by this scope; any flag-worthy
+follow-on (cache-aware LPM scheduling) carries its own token-neutral A/B + a
+cache-ON throughput A/B under `BACKEND-GATE-CUDA-SGLANG-PREFIX` when implemented.
 
 **DOCS user-facing split: README landing page + `docs/STATUS.md` ledger
 (2026-07-27, `CLAIM-DOCS-README-SPLIT`).** Disposition: **NOT APPLICABLE (no
