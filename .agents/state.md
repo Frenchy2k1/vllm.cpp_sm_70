@@ -26089,3 +26089,28 @@ guess among many.
 
 **Goal:** 15.85 of 27.9 tok/s, 1.76x remaining. Decode is now dominant again
 (~6.3 s vs MLX-LM's 4.59 s, 1.37x); prefill ~1.77 s vs ~0.47 s.
+
+---
+
+## 2026-07-27 — vectorised decode GEMV: 15.85 -> 17.41 tok/s (+9.8%)
+
+Applied the loader lesson from MLX's steel GEMM to the op that dominates DECODE,
+which became the larger pool once prefill fell to ~22% of the run. The GEMV had
+already lost `vt_load`'s per-element branches; each lane still issued one 2-byte
+load per element. A `ushort4` makes that one 8-byte load, so a simdgroup fetches
+256 contiguous bytes per iteration instead of 64.
+
+**15.85 -> 17.41 tok/s (+9.8%)**, duration 8.07 -> 7.36 s, TTFT unchanged
+(decode-only). Guarded on bf16 x bf16 and `k % 4 == 0`; other dtypes and shapes
+keep the scalar paths. bf16-in/f32-out NMSE 5.19e-15 vs 5.11e-15 before.
+
+**Golden re-captured and oracle-validated (vLLM 0.25.0, version read from the
+interpreter first). The quality profile is IDENTICAL:** 254/256 tokens are
+vLLM's own argmax, mean gap 0.98 mnats, max 0.125 nats, 0 outside top-K — all
+unchanged. 12 of 256 tokens differ across 2 prompts; those near-tie positions
+simply resolve the other way. Gate 16/16.
+
+**Goal:** 17.41 of 27.9 tok/s, **1.60x remaining**. Decode ~5.6 s vs MLX-LM's
+4.59 s (1.22x); prefill ~1.75 s vs ~0.47 s (3.7x). Prefill is now the larger
+RATIO but the smaller pool. Untested: the same vectorisation on the mm kernel's
+B tile (only A was done), whose BT layout needs the load to run along k.
