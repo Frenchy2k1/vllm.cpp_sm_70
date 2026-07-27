@@ -696,7 +696,22 @@ std::vector<int32_t> VoxtralGenerateGreedy(
   VT_CHECK(N == n_audio, "voxtral: audio_embeds rows != audio-token count");
 
   // KV caches: one big block per layer sized for T0 + max_new_tokens.
-  const int64_t block_size = T0 + max_new_tokens + 8;
+  //
+  // ROAD-V1-MM lever #3 W2 (multimodal-speed.md §11/§12): round the single KV
+  // block_size UP to a multiple of 16 so the pure-DECODE attention routes through
+  // the FA2 varlen split-KV path (LaunchDecodeVarlenFA2Bf16) instead of the naive
+  // scalar PagedAttentionKernel. The FA2 decode dispatch `fa2_decode_qwen3`
+  // (cuda_paged_attn.cu:2620-2628) requires `block_size % 16 == 0` (line 2621);
+  // Voxtral's head_dim-128 / GQA-32q-8kv / bf16 / causal decode matches every
+  // other clause of that gate, so this single rounding is all that was blocking
+  // FA2. The seq (T0+max_new) still fits ONE block, and slot == abs_idx is
+  // unchanged (we only enlarge the block, never re-index), so prefill/decode KV
+  // addressing is identical; only the decode-attention kernel changes (39x faster
+  // attention → audio TPOT 59.4→38.2 ms/tok = 0.94x, BEATS vLLM 40.8 ms). The FA2
+  // f32 reduction order takes a different-but-vLLM-valid branch at the pos-33
+  // 4-way EXACT bf16 tie (teacher-force PASS, gap 0.0) — see the distributional
+  // near-tie gate in test_voxtral_e2e and §11.4.
+  const int64_t block_size = ((T0 + max_new_tokens + 8 + 15) / 16) * 16;
   const size_t kv_bytes =
       static_cast<size_t>(2 * block_size * Hkv * Dh) * vt::SizeOf(DType::kBF16);
   std::vector<std::shared_ptr<void>> kv_storage;

@@ -994,6 +994,51 @@ Reachable follow-on (USER DECISION on the golden-change policy): regenerate
 `block_size/16` -> claims a validated ~36% audio-decode win that BEATS vLLM and closes the last mm
 speed gap. No mm row advances to DONE (speed-pending).
 
+**MULTIMODAL SPEED - DECODE-KERNEL ADOPTED: FA2 decode SHIPS as the Voxtral default - audio decode
+BEATS vLLM (0.97x), the LAST mm decode-speed gap is CLOSED (2026-07-27, USER-APPROVED,
+`CLAIM-MM-SPEED-DECODE-KERN-ADOPT` [spec](../.agents/specs/multimodal-speed.md) S12).**
+`benchmark_binding=false` (single-seq test driver; vLLM graphed is the honest denominator). dgx
+GB10 sm_121a `~/work/mm-audio-fa2`, build cutlass 4.5.0 + FA2 + Triton arch 121a (FA2 ENABLED
+banner CONFIRMED, `-Werror` 0-warn); ALL GPU under `flock $HOME/gpu.lock` sole owner (`nvidia-smi`
+idle, `local-ai-worker` absent), cold rep0 dropped; teacher-force oracle
+`~/venvs/vllm-oracle-v0.25.0-stage` (vLLM 0.25.0 + mistral_common 1.11.5). Lands the S11-characterized
+win. **Code (one line):** `VoxtralGenerateGreedy` rounds the single KV `block_size` UP to a multiple
+of 16 (`((T0+max_new+8+15)/16)*16`) so the pure-decode attention routes through FA2 varlen
+`LaunchDecodeVarlenFA2Bf16` (dispatch `fa2_decode_qwen3` requires `block_size % 16 == 0`,
+`cuda_paged_attn.cu:2621`; seq still one block, `slot==abs_idx` unchanged). **FA2-routing PROVEN**
+(nsys `cuda_gpu_kern_sum --cuda-graph-trace=node`): `flash_fwd_splitkv_kernel` 1410 @ **18.5 us**
++ combine 1410 @ 3.1 us (30 layers x 47 steps), **ZERO `PagedAttentionKernel`** in decode. **Gate
+converted to the ratified near-tie DISTRIBUTIONAL form:** binding correctness = the teacher-force
+PASS (`result==PASS` + `n_divergent==0` + `over_band==0` + `worst_gap<=0.5`), KERNEL-INDEPENDENT
+(scalar AND FA2 both PASS); strict prefix = token-exact vs vLLM greedy up to the first genuine bf16
+exact tie (FA2 takes the OTHER side of the pos-18 2-way EXACT tie, 24466 vs golden 1584, identical
+logprob -1.9875 ⇒ prefix 18, asserted `>=18`; the old `repro==48` byte-match to the scalar branch is
+downgraded to a determinism anchor, regenerated to the FA2 seq). `voxtral_neartie.json` md5
+`3d199c2d...` -> `937b9ad3...`; STRICT greedy golden `voxtral_golden.json` `8ab87b7e...` UNCHANGED.
+**Gate PASS 16/16** (strict prefix 18/48; teacher-force result=PASS, divergent=0, worst_gap=0.0,
+over-band=0; FA2 seq 48/48). **Teacher-force (fresh, vLLM 0.25.0 on the FA2 seq):** 0 divergent,
+worst gap 0.0000 nats, PASS. **CUDA-graph CAPTURE SAFETY** (FA2 runs inside the captured
+`VoxtralDecodeGraph`): captured S=1 + **46 replays** (all 48 tokens valid); compute-sanitizer
+memcheck **ERROR SUMMARY 0 errors** on the graphed-FA2-decode surface (text-only path: prefill +
+captured FA2 decode, 20 replays, 22/22, exit 0); 3 e2e runs byte-identical ⇒ capture-safe, ships as
+the DEFAULT graph path (no eager-FA2 fallback).
+
+| Vehicle | scalar (`VT_FA2_DECODE_QWEN3=0`) | FA2 varlen (ships, default) | delta | vs vLLM 0.25.0 graphed 40.8 ms |
+|---|---|---|---|---|
+| Voxtral audio (3B, 47 decode steps) | **60.50 ms/tok** (60.39-60.62) | **39.50 ms/tok** (39.41-39.58) | **-21.0 ms/tok (~35%, NON-OVERLAPPING)** | **0.97x - BEATS vLLM** (39.58 max < 40.8) |
+
+Same-binary A/B (throwaway env-gated steady_clock timer NOT committed, `VT_FA2_DECODE_QWEN3` toggle,
+steady-state excl. 2 cold+warm steps, 6 reps/mode rep0 dropped). The -21.0 ms delta matches the S11
+nsys attribution (21.7 ms) + the S11.3 throwaway-tree A/B (-21.2) to within noise (absolute ~1.3 ms
+above S11.3's 38.2/59.4 because this clean-build timer adds a per-step `Synchronize`, applied to BOTH
+modes ⇒ delta + "beats vLLM" verdict clean). **HONEST verdict:** the audio DECODE axis now meets both
+DONE criteria - correctness-complete under the ratified near-tie distributional gate AND at/above vLLM
+throughput (0.97x, non-overlapping, BEATS). This closes the LAST mm decode-speed gap. BUT
+`ENG-MM-AUDIO-E2E` / the umbrella MM row stays PARTIAL: audio TTFT (the 32-layer Whisper encoder +
+prefill) is UNMEASURED our-side vs vLLM's 43 ms, and there is no batched c2+ mm decode or
+`audio_url` serving ingestion (the same structural gaps that keep image/video PARTIAL). No mm row
+reaches full DONE this pass.
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =
