@@ -40,9 +40,38 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
-**DFlash speculative decode (block-diffusion) - D0 ORACLE BASELINE CAPTURED, D1
-landed (2026-07-26, `SPEC-DFLASH` `ACTIVE`, `CLAIM-DFLASH-D0D1`,
-[spec §0](../.agents/specs/dflash-spec-decode.md)).** `benchmark_binding=false` (a
+**DFlash speculative decode (block-diffusion) - D13 c1 NEAR-PARITY (ours 0.978x, ~2%
+below vLLM; gap CLOSED 0.917x->0.978x); `SPEC-DFLASH` stays `ACTIVE` (2026-07-27,
+`CLAIM-DFLASH-D13`, `benchmark_binding=true`,
+dgx GB10 sm_121a, pin `555967922`/vLLM 0.26.0.dev0, one `flock` series, cold rep
+discarded, 8 prose+code prompts x 256 out tok, input-len 512, greedy, c1).** Part C
+landed the fixed-capacity paged draft-KV store wired through `vt::DFlashPagedBlockAttention`
+plus the static-shape draft-step CUDA graph (capture+replay); capture-correctness PROVEN
+(replayed==eager BIT-IDENTICAL, `test_qwen27_dflash_spec_decode` 27/27 with the graph
+producing the same tokens + acceptance 19/39/29/25 as eager). c1 A/B: our OFF 10.24 tok/s
+(TPOT 97.6 ms); our DFlash-ON eager-paged 28.65 (28.69/28.61); **our DFlash-ON GRAPHED
+28.70 tok/s (28.70/28.70), TPOT 34.40 ms**; vLLM-DFlash-ON graphed MRV2 steady-state
+**29.35 tok/s** (tight 3-rep 29.33/29.37/29.33, TPOT 34.07, acc_len 4.44); the D9 28.09 was a
+colder cross-session outlier. VERDICT = **NEAR-PARITY: ours 0.978x (~2% below)** on the rigorous
+same-session band (across sessions ours 28.70 falls inside vLLM's observed 28.09-29.37 range),
+ON/OFF 2.80x (vLLM ~2.98x), our OFF >= vLLM OFF. Per the acceptance rule ("below on any axis =
+an open gap; near-parity is NOT met") the >=vLLM bar is NOT met, so SPEC-DFLASH stays `ACTIVE`;
+the residual ~2% is per-step compute (ours acceptance ~3.68 accepted draft-tok/step > vLLM 3.44,
+both graphed) - nsys both draft steps is the next lever. HONEST ATTRIBUTION (supersedes
+the D9 "eager-vs-graphed" hypothesis): the CUDA graph is performance-NEUTRAL here (+0.3% over
+the eager paged path); the ACTUAL lever was the paged context read, which removed the
+D9/D12 per-layer [context;block] `IndexCopy` materialization of the whole growing context
+(25.75 D9 materialized -> 28.65 eager-paged, +11%). Inertness on the capture binary: 27B
+SACRED 235/235 + 27B MTP 9/9 byte-identical; CUDA `-Werror` clean; no new kernel (the D12
+paged kernel was already memcheck-0 across 795648 assertions; the token-diff is the
+capture-safety proof). Repro: `/tmp/d13_ab.sh` (ours), `scripts/spec/vllm_dflash_timing.py`
+(vLLM), dataset `/tmp/dflash_bench_prompts.json`; raw dgx logs `/tmp/d13_ab.log`,
+`/tmp/d13_vllm_on.log`. Correctness gate form unchanged (strict run-deterministic match to
+vLLM-DFlash-ON; the ratified near-tie is the honest final correctness form, bf16-irreducible).
+
+**DFlash D0-D12 history (superseded by D13; retained for the campaign record).** D0 ORACLE
+BASELINE CAPTURED, D1 landed (2026-07-26, `CLAIM-DFLASH-D0D1`,
+[spec §0](../.agents/specs/dflash-spec-decode.md)). `benchmark_binding=false` (a
 correctness/acceptance baseline, NOT a throughput A/B). On the ADVANCED pin
 `555967922`/vLLM 0.26.0.dev0 under `VLLM_USE_V2_MODEL_RUNNER=1` (vllm#40898 resolved),
 the D0-redo RAN on dgx (`LLM(unsloth/Qwen3.6-27B-NVFP4, speculative_config={method:"dflash",
