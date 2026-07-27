@@ -411,9 +411,16 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   waiting queue by longest prefix match — is implemented behind
   `--schedule-policy=lpm` (`SchedulerPolicy::kLPM`, output-neutral: it changes only
   which request is admitted first, never any request's tokens; default stays
-  `fcfs`). Residual: SGLang's in-batch prefix-collision de-prioritization and
-  jump-forward constrained decoding stay named/deferred opt-ins. See
-  `.agents/specs/sglang-radixattention.md`.
+  `fcfs`). SGLang's in-batch prefix-collision de-prioritization (SW2) is now also
+  implemented inside the `lpm` path (a later request that would collide on the
+  same not-yet-cached prefix as an earlier waiting request is sorted behind the
+  non-colliding requests), still output-neutral. Note: this de-prioritization
+  changes only admission order here — our prefix cache already caches a request's
+  blocks at allocation time, so a second same-step request sharing an uncached
+  prefix already reuses the first's blocks (the redundant-prefill this avoids in
+  SGLang, whose cache updates only after the forward pass, does not occur for us).
+  Residual: jump-forward constrained decoding and the radix eviction-policy knob
+  stay named/deferred opt-ins. See `.agents/specs/sglang-radixattention.md`.
 - **KV persistence to disk / CPU offload** is built (CPU and disk tiers,
   identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the
   scheduler through an abstract `KVConnector` ABI selected by a

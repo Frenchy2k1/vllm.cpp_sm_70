@@ -355,7 +355,7 @@ the C-ABI field, both trivial and gated by existing APC tests.
 |---|---|---|---|
 | SW0 | `ENG-SGLANG-BEHAVIOR-FLAG` | This spike: cache-aware / overlap / jump-forward survey + flag design | **this spec** |
 | SW1 | `ENG-SGLANG-BEHAVIOR-FLAG` | `SchedulerPolicy::kLPM` waiting-queue reorder by APC longest-match, large-queue fcfs fallback; port `schedule_policy.py` LPM cases as CPU behavioral tests; token-neutral A/B | **DONE 2026-07-27** (`CLAIM-SGLANG-IMPL`) |
-| SW2 | `ENG-SGLANG-BEHAVIOR-FLAG` | in-batch prefix-collision de-prioritization (`IN_BATCH_PREFIX_CACHING_*`) | **RESIDUAL** (named; not yet ported — LPM lands without it, still output-neutral) |
+| SW2 | `ENG-SGLANG-BEHAVIOR-FLAG` | in-batch prefix-collision de-prioritization (`IN_BATCH_PREFIX_CACHING_*`) | **DONE 2026-07-27** (`CLAIM-SGLANG-SW2`) — order-only inside `kLPM`, output-neutral; throughput lever NOT-APPLICABLE (within-step APC dedup subsumes it) |
 | SW3 | `ENG-SGLANG-BEHAVIOR-FLAG` | jump-forward decoding behind `--enable-jump-forward` (FSM-run precompute + retokenize) | **deferred** (named) |
 | SW4 | `ENG-SGLANG-BEHAVIOR-FLAG` | `--radix-eviction-policy` lfu/slru/priority knob over the block pool | **deferred** (minor) |
 
@@ -396,8 +396,10 @@ the C-ABI field, both trivial and gated by existing APC tests.
   RED baseline fcfs admits the earlier no-match request first, GREEN lpm admits the
   later high-match request first; (c) under capacity pressure lpm serves strictly more
   cache-hit tokens by the contended step (64 vs 0) — hits realized earlier.
-- Residual: SW2 in-batch prefix-collision de-prioritization
-  (`IN_BATCH_PREFIX_CACHING_*_THRESHOLD`, `schedule_policy.py:253`) NOT ported; SW3/SW4
+- SW2 in-batch prefix-collision de-prioritization
+  (`IN_BATCH_PREFIX_CACHING_*_THRESHOLD`, `schedule_policy.py:253-301,311`) — now
+  **LANDED** (`CLAIM-SGLANG-SW2`, order-only inside `kLPM`, output-neutral;
+  hit-rate lever NOT-APPLICABLE — within-step APC dedup subsumes it). SW3/SW4
   deferred. The cache-ON throughput A/B vs the SGLang floor stays owned by
   `BACKEND-GATE-CUDA-SGLANG-PREFIX` (GB10, not this CPU lane).
 
@@ -515,8 +517,14 @@ reuses); `ENG-ASYNC-SCHED` (overlap equivalent, `DONE`);
 
 RW1 (alias + C-ABI field) — **DONE**. SW1 (LPM comparator + reorder + match
 lookup) — **DONE**. SW2 (in-batch prefix-collision de-prioritization,
-`schedule_policy.py:253`) — **RESIDUAL**, named, not ported (LPM lands
-output-neutral without it). SW3 (jump-forward) / SW4 (eviction-policy knob) —
+`schedule_policy.py:253-301,311`) — **DONE** (`CLAIM-SGLANG-SW2`): ported 1:1
+inside the `kLPM` reorder (`scheduler.cpp:183-243`) using OUR block-hash APC keys
+(no second trie), thresholds `kInBatch{Check,Deprioritize}Threshold=32`;
+output-neutral (RED-first order gate). The redundant-prefill/hit-rate lever it
+represents in SGLang is **NOT-APPLICABLE** here — our APC caches blocks at
+ALLOCATION time (`kv_cache_manager.cpp:267`), so the second same-step collider
+already hits the first's just-cached prefix; SGLang needs SW2 only because its
+radix updates post-forward. SW3 (jump-forward) / SW4 (eviction-policy knob) —
 **deferred**.
 
 ### Risks/decisions

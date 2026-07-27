@@ -171,6 +171,22 @@ step vs 0 under fcfs, via the `PrefixCacheStats` counters). The binding cache-ON
 throughput A/B of `--schedule-policy=lpm` vs the SGLang floor stays owned by
 `BACKEND-GATE-CUDA-SGLANG-PREFIX` (GB10), not this CPU lane.
 
+**SGLang behavior-parity SW2 (in-batch prefix-collision de-prioritization,
+2026-07-27, `CLAIM-SGLANG-SW2`, NOT pushed).** Disposition: **redundant-prefill /
+hit-rate lever NOT APPLICABLE in our engine (`benchmark_binding=false`).** SW2
+de-prioritizes a waiting request that would collide on the same not-yet-cached
+prefix as an earlier waiting request, so in SGLang the second waits one round and
+hits the cache instead of redundantly recomputing the shared prefix. In our
+engine that redundancy does not exist to remove: our APC caches a request's
+blocks at ALLOCATION time during scheduling (`src/vllm/v1/core/kv_cache_manager.cpp:267`),
+so a second request sharing an uncached prefix already reuses the first's blocks
+WITHIN the same step (SGLang's radix cache updates only after the forward pass).
+The CPU gate (`tests/vllm/v1/test_scheduler_lpm.cpp`) PROVES this: with AND
+without SW2, the second in-batch collider computes only its unique tail (16
+tokens, not 64), and the shared uncached prefix is computed exactly once — so SW2
+here is admission-ORDER parity only, output- and hit-rate-neutral. No throughput
+number is owed; there is no positive redundant-prefill delta to measure.
+
 **DOCS user-facing split: README landing page + `docs/STATUS.md` ledger
 (2026-07-27, `CLAIM-DOCS-README-SPLIT`).** Disposition: **NOT APPLICABLE (no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Documentation

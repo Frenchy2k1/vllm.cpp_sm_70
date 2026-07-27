@@ -28147,3 +28147,51 @@ ROAD-V1-A note; docs/STATUS.md + docs/BENCHMARKS.md; coordination
 `CLAIM-SGLANG-IMPL` claim-row + note; ledger; this entry. NO model/kernel source,
 NO README/Metal/demo (concurrent session), NOT the `BACKEND-GATE-CUDA-SGLANG*`
 benchmark rows. All record checkers rc=0. `benchmark_binding=false`.
+
+---
+
+## 2026-07-27 — SGLang SW2 in-batch prefix-collision de-prioritization LANDED (`CLAIM-SGLANG-SW2`)
+
+**What.** Ported the named SW1 residual (`ENG-SGLANG-BEHAVIOR-FLAG` SW2) on base
+local `main` `cc5d2348` (confirmed via `git rev-parse HEAD`), isolated worktree
+`.claude/worktrees/agent-afeedca484fb784ed`. Extends the `kLPM` reorder
+(`maybe_reorder_waiting_for_lpm`, `src/vllm/v1/core/sched/scheduler.cpp:183-243`):
+walks the pre-sort (arrival) waiting queue building an ephemeral seen-set of OUR
+block-hash APC keys (`Request::block_hashes` — NOT a second trie), and
+de-prioritizes a later request whose in-batch prefix match ≥
+`kInBatchDeprioritizeThreshold` when its real cached match ≤
+`kInBatchCheckThreshold` (both 32 tokens, `scheduler.h`); de-prioritized requests
+sort BEHIND all non-colliders (mirrors SGLang's `float("inf")`). Ported 1:1 FROM
+`schedule_policy.py:253-301,311`. Gated inside `kLPM`; fcfs/priority byte-identical.
+Output-neutral (admission ORDER only).
+
+**Honest finding (the key result).** The redundant-prefill / hit-rate lever SW2
+provides in SGLang is **NOT-APPLICABLE** in our engine. Our APC caches a
+request's blocks at ALLOCATION time during scheduling
+(`src/vllm/v1/core/kv_cache_manager.cpp:267`), so the SECOND same-step collider
+already HITS the first's just-cached prefix (computes only its unique tail) —
+the shared uncached prefix is computed EXACTLY ONCE even WITHOUT SW2. SGLang
+needs SW2 only because its radix cache updates POST-forward, so two colliders in
+the same batch both miss and redundantly compute. SW2 for us is therefore an
+admission-ORDER parity feature, output- AND compute-neutral; forcing the order
+can even mildly DELAY a within-step dedup hit. Recorded as NOT-APPLICABLE.
+
+**Gate.** `tests/vllm/v1/test_scheduler_lpm.cpp` 6/6 (47 asserts; 3 NEW SW2 + 3
+unchanged SW1): (b) de-prioritizes collider RED-first (fcfs/raw-prefix admits
+collider before solo; lpm+SW2 admits solo before collider — RED-first PROVEN by a
+reverted experiment: forcing the deprioritize-set empty flips 2 order asserts);
+(a) output-neutral (per-req tokens + total hits 112 identical, single-step); (c)
+within-step-dedup-subsumes-redundant-prefill NOT-APPLICABLE proof (2nd collider
+computes 16 not 64 even under fcfs); (d) inert when collision prefix already
+cached (check-threshold gate). Inertness `test_scheduler` 36/36 +
+`test_prefix_cache_stats` 12/12 UNCHANGED. Clean full-library CPU `-Werror`, 0
+warnings.
+
+**Records.** Row `ENG-SGLANG-BEHAVIOR-FLAG` (stays `ACTIVE`, SW2 mapping+tests
+updated); `sglang-matrix.md` `SGLANG-SCHED-INBATCH` SGLANG-DISTINCT→ACTIVE;
+spec §SW-table + work-breakdown; feature-matrix; coordination `CLAIM-SGLANG-SW2`
+note; docs/STATUS.md + docs/BENCHMARKS.md (hit-rate NOT-APPLICABLE note); ledger;
+this entry. NO model/kernel source, NO README/Metal/demo (concurrent session),
+NOT the `BACKEND-GATE-CUDA-SGLANG*` benchmark rows. All record checkers rc=0.
+`benchmark_binding=false` (throughput lever NOT-APPLICABLE by architecture). NOT
+pushed; FULL SHA reported to caller.

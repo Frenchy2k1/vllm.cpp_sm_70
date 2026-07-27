@@ -323,11 +323,37 @@ class Scheduler {
   // (an lpm run with caching off has nothing to match, so it stays fcfs). It is
   // OUTPUT-NEUTRAL: only admission order changes; the pure match lookup has no
   // side effects (no stats, no LRU touch).
+  //
+  // SW2 — in-batch prefix-collision de-prioritization (SGLang
+  // SchedulePolicy._compute_prefix_matches, schedule_policy.py:253-301):
+  // refines the LPM sort. Two waiting requests that share an UNCACHED prefix
+  // (each with a small real-cache match) would otherwise both be admitted the
+  // same step and REDUNDANTLY compute that prefix. SW2 lets the FIRST such
+  // request through and DE-PRIORITIZES every later collider (sorts it behind all
+  // non-colliding requests, mirroring the `float("inf")` sort key at
+  // schedule_policy.py:311); the collider waits one round for the first to
+  // populate the APC and then HITS it. Detected by reusing OUR block-hash APC
+  // keys (Request::block_hashes — the same keys the admission loop matches
+  // against) against an ephemeral per-step "seen" set of already-admitted-into-
+  // the-sort prefixes — NOT a second radix trie. Still OUTPUT-NEUTRAL: only
+  // admission order changes; each request computes the same tokens (a deferred
+  // collider recomputes FEWER, reusing the now-cached prefix, but produces the
+  // identical token stream). Inert unless two waiting requests actually collide.
   void maybe_reorder_waiting_for_lpm();
 
   // SGLang's expensive-prefix-sort cutoff (schedule_policy.py:230): above this
   // many waiting requests, lpm degrades to fcfs for the step.
   static constexpr std::size_t kLpmMaxWaitingQueue = 128;
+
+  // SW2 in-batch prefix-caching thresholds (TOKENS), mirroring SGLang's env
+  // defaults (schedule_policy.py:76,83). kInBatchCheckThreshold: only a request
+  // whose REAL cached-prefix match is <= this is subject to the in-batch check
+  // (a request already well-served by the cache is never de-prioritized).
+  // kInBatchDeprioritizeThreshold: a request whose in-batch (waiting-queue)
+  // prefix match is >= this is de-prioritized. Applied at block granularity
+  // (in-batch match tokens = matched blocks * block_size_).
+  static constexpr int kInBatchCheckThreshold = 32;
+  static constexpr int kInBatchDeprioritizeThreshold = 32;
 
   // _make_cached_request_data: build the diff payload for the already-running
   // (running_reqs) + resumed-from-preemption (resumed_reqs) requests. MRV2:
@@ -351,6 +377,10 @@ class Scheduler {
   int long_prefill_token_threshold_;
   bool enable_chunked_prefill_;
   bool scheduler_reserve_full_isl_;
+  // KV-cache block size (tokens per block). Held so SW2's in-batch collision
+  // check can convert its block-granular match into tokens for the threshold
+  // comparison (see maybe_reorder_waiting_for_lpm).
+  int block_size_ = 0;
   // num_lookahead_tokens (scheduler.py:275-292): reserved verify slots per running
   // request. 0 when no SpeculativeConfig is supplied (default), else derived from
   // it in the ctor via SpeculativeConfig::NumLookaheadTokens (k for MTP). Threaded
