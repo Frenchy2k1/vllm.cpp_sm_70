@@ -859,6 +859,11 @@ kernel void vt_reshape_and_cache(device const uchar* k    [[buffer(0)]],
 // rather than a silent wrong answer.
 #define VT_PA_CHUNK 256u
 #define VT_PA_MAXD  256u
+// How many key-groups the V accumulation may split into. The threadgroup is
+// sized at 2*d, so the d-parallel V loop left half the threads idle; splitting
+// the chunk's KEYS across `tg/d` groups puts them all to work. Capped so the
+// partial-accumulator tile stays small (4 * 256 floats = 4 KB).
+#define VT_PA_VGROUPS 4u
 
 // Same layout discipline as VtCacheParams: 8-byte members first, then 4-byte.
 struct VtPagedAttnParams {
@@ -918,6 +923,8 @@ kernel void vt_paged_attention(device const uchar* q     [[buffer(0)]],
   // key it accumulates, i.e. jc * tg block-table loads per chunk where jc would
   // do. The block table is small but it is device memory in the inner loop.
   threadgroup ulong vbases[VT_PA_CHUNK];
+  // Per-key-group partial V accumulators, reduced into `acc` once per chunk.
+  threadgroup float pacc[VT_PA_VGROUPS * VT_PA_MAXD];
   threadgroup float acc[VT_PA_MAXD];
   threadgroup float sh_m;
   threadgroup float sh_l;
@@ -1026,16 +1033,28 @@ kernel void vt_paged_attention(device const uchar* q     [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Weighted V accumulation, parallel over the head dimension so each thread
-    // owns its own acc[] slots. Adjacent threads read adjacent elements of the
-    // same V row, which is already the coalesced direction; the win here is
-    // dropping the redundant block-table traffic above.
-    for (uint e = tid; e < p.d; e += p.tg) {
+    // Weighted V accumulation over BOTH the head dimension and the chunk's keys.
+    // Parallelising over `d` alone used only `d` threads, so at the 2*d
+    // threadgroup width half the group idled; measuring 4*d was WORSE than the
+    // baseline for exactly that reason. Each key-group now walks a strided slice
+    // of the keys into its own partial, and the partials are summed once.
+    // Adjacent threads still read adjacent elements of the same V row, so the
+    // coalescing that made this loop cheap is preserved.
+    const uint ngrp = min(max(p.tg / p.d, 1u), VT_PA_VGROUPS);
+    const uint grp = min(tid / p.d, ngrp - 1u);
+    const uint ge = tid % p.d;
+    if (tid < ngrp * p.d) {
       float s = 0.0f;
-      for (int idx = 0; idx < jc; ++idx) {
-        s += scores[idx] * vt_load(vc, p.vc_dt, vbases[idx] + ulong(e));
+      for (int idx = int(grp); idx < jc; idx += int(ngrp)) {
+        s += scores[idx] * vt_load(vc, p.vc_dt, vbases[idx] + ulong(ge));
       }
-      acc[e] += s;
+      pacc[grp * VT_PA_MAXD + ge] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < p.d; e += p.tg) {
+      float tot = 0.0f;
+      for (uint gg = 0u; gg < ngrp; ++gg) { tot += pacc[gg * VT_PA_MAXD + e]; }
+      acc[e] += tot;
     }
     if (tid == 0u) { sh_l = sh_l * corr + lchunk; sh_m = mnew; }
     // Orders this chunk's acc/scores reads before the next chunk overwrites them.
