@@ -898,9 +898,27 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   // token per request, so there is nothing to reuse and tiling would only cost
   // it grid parallelism and threadgroup memory.
   const bool tiled = tq > num_reqs;
-  const char* kname = tiled ? "vt_paged_attention_tiled" : "vt_paged_attention";
+  // PREFILL on the matrix units. vt_paged_attention scores with simd_sum dot
+  // products and accumulates V with scalar FMAs, measured at 108 GFLOP/s against
+  // the GEMM's ~2250 on the same device in the same forward. The mma kernel needs
+  // exactly 8 simdgroups (its 4x2 simdgroup map) and a head that fits its tiles.
+  // VT_METAL_NO_ATTN_MMA=1 routes back to the scalar kernel for a same-binary A/B.
+  const uint32_t kMmaTg = 256;
+  static const bool mma_off = [] {
+    const char* e = std::getenv("VT_METAL_NO_ATTN_MMA");
+    return e != nullptr && e[0] == '1';
+  }();
+  // Q and K are staged as bfloat for the mma, which is lossless ONLY if they are
+  // already bf16; an f32 query would be silently truncated.
+  const bool bf_in = query.dtype == DType::kBF16 && k_cache.dtype == DType::kBF16 &&
+                     v_cache.dtype == DType::kBF16;
+  const bool mma = tiled && !mma_off && bf_in && d <= 128 && (d % 8) == 0 &&
+                   MetalContext::Get().PipelineMaxThreads("vt_paged_attention_mma") >= kMmaTg;
+  const char* kname = mma ? "vt_paged_attention_mma"
+                          : (tiled ? "vt_paged_attention_tiled" : "vt_paged_attention");
   const uint32_t tg =
-      ChooseThreadgroupSize(d * 4, MetalContext::Get().PipelineMaxThreads(kname));
+      mma ? kMmaTg
+          : ChooseThreadgroupSize(d * 4, MetalContext::Get().PipelineMaxThreads(kname));
   PagedAttnParams p{
       static_cast<uint64_t>(k_cache.stride[0]), static_cast<uint64_t>(k_cache.stride[1]),
       static_cast<uint64_t>(k_cache.stride[2]), static_cast<uint64_t>(v_cache.stride[0]),

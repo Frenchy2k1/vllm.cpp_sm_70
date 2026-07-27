@@ -1399,6 +1399,237 @@ kernel void vt_paged_attention_tiled(device const uchar* q     [[buffer(0)]],
                                        sgitg, sgsize);
 }
 
+
+// ===========================================================================
+// PREFILL attention on the MATRIX UNITS.
+//
+// vt_paged_attention scores with simd_sum dot products and accumulates V with
+// scalar FMAs, so it never issues a simdgroup_multiply_accumulate. Measured at
+// 108 GFLOP/s against the GEMM's ~2250 on the same device in the same forward:
+// 21x slower PER FLOP, purely because the matrix units are idle.
+//
+// This is the flash-attention form: S = Q@K^T and O += P@V both by mma, with the
+// online softmax between them. The one MSL-specific subtlety is the running
+// rescale of O. There is no elementwise operation on a simdgroup_matrix, so the
+// per-row correction is applied as diag(corr) @ O — an ordinary mma against a
+// diagonal matrix built in threadgroup memory.
+//
+// Tiling: BQ=32 queries x BK=16 keys, 8 simdgroups mapped as 4 row blocks x 2
+// column halves. That gives each simdgroup exactly ONE S tile (S is 4x2 tiles of
+// 8x8) and EIGHT O tiles (O is 4x16), so O stays in registers across the whole
+// key loop and only the correction touches it.
+#define VT_PAM_BQ   32u
+#define VT_PAM_BK   16u
+#define VT_PAM_MAXD 128u
+
+kernel void vt_paged_attention_mma(device const uchar* q     [[buffer(0)]],
+                                   device const uchar* kc    [[buffer(1)]],
+                                   device const uchar* vc    [[buffer(2)]],
+                                   device const int*   btab  [[buffer(3)]],
+                                   device const int*   slens [[buffer(4)]],
+                                   device const int*   qsl   [[buffer(5)]],
+                                   device uchar*       out   [[buffer(6)]],
+                                   constant VtPagedAttnParams& p [[buffer(7)]],
+                                   uint2 tgid [[threadgroup_position_in_grid]],
+                                   uint2 tid2 [[thread_position_in_threadgroup]],
+                                   uint tiisg [[thread_index_in_simdgroup]],
+                                   uint sgitg [[simdgroup_index_in_threadgroup]],
+                                   uint sgsize [[threads_per_simdgroup]]) {
+  threadgroup bfloat sq[VT_PAM_BQ * VT_PAM_MAXD];   // 8 KB
+  threadgroup bfloat sk[VT_PAM_BK * VT_PAM_MAXD];   // 4 KB
+  // V and P stay F32. Q and K are bf16 in the checkpoint so staging them as
+  // bfloat is lossless, but the exp'd probabilities are COMPUTED here and the
+  // scalar kernel accumulated V against them in f32. Rounding P to bf16 cost
+  // enough precision to move a greedy token at prompt[0] tok=5 (engine 15344 vs
+  // anchor 96251) — the near-tie gate catches what the op-level NMSE bar does not.
+  threadgroup float  sv[VT_PAM_BK * VT_PAM_MAXD];   // 8 KB
+  threadgroup float  sp[VT_PAM_BQ * VT_PAM_BK];     // 2 KB — exp'd scores for P@V
+  threadgroup float  ss[VT_PAM_BQ * VT_PAM_BK];     // 2 KB — raw scores
+  threadgroup float  sdiag[4u * 64u];               // 1 KB — per-row-block diag(corr)
+  threadgroup float  smax[VT_PAM_BQ];
+  threadgroup float  slsum[VT_PAM_BQ];
+  threadgroup float  sout[8u * 64u];                // 2 KB — epilogue, per simdgroup
+
+  const uint tid = tid2.x;
+  const uint h = tgid.x;
+  const uint t = tgid.y;
+
+  int r = -1;
+  for (uint i = 0u; i < p.num_reqs; ++i) {
+    if (int(t) >= qsl[i] && int(t) < qsl[i + 1u]) { r = int(i); break; }
+  }
+  if (r < 0) { return; }
+  const int q0 = qsl[r];
+  const int query_len = qsl[r + 1] - q0;
+  const int seqlen = slens[r];
+  const int context = seqlen - query_len;
+  const int loc = int(t) - q0;
+
+  // One threadgroup per BQ queries OF THE SAME REQUEST; the rest idle. Keeping
+  // tiles inside a request is what lets the whole tile share one block table.
+  if ((loc % int(VT_PAM_BQ)) != 0) { return; }
+  const int nq = min(int(VT_PAM_BQ), query_len - loc);
+
+  const uint g = h / p.qpk;
+  const uint rb = sgitg % 4u;   // row block: queries [rb*8, rb*8+8)
+  const uint ch = sgitg / 4u;   // column half: dims [ch*64, ch*64+64)
+  const uint lane = tid % sgsize;
+
+  // Union of the tile's causal windows; per-row masking happens in the softmax.
+  int jlo = 0x7fffffff;
+  int jhi = -1;
+  for (int u = 0; u < nq; ++u) {
+    const int pos = context + loc + u;
+    int a = p.window_left >= 0 ? max(0, pos - p.window_left) : 0;
+    int b = p.causal != 0u ? pos : seqlen - 1;
+    if (p.window_right >= 0) { b = min(b, pos + p.window_right); }
+    b = min(b, seqlen - 1);
+    if (b >= a) { jlo = min(jlo, a); jhi = max(jhi, b); }
+  }
+  if (jhi < jlo) { return; }
+
+  // Stage Q once for the whole key loop.
+  for (uint e = tid; e < VT_PAM_BQ * p.d; e += p.tg) {
+    const uint rr = e / p.d, dd = e % p.d;
+    if (int(rr) < nq) {
+      const ulong qoff = (ulong(uint(int(t) + int(rr))) * ulong(p.hq) + ulong(h)) * ulong(p.d);
+      sq[rr * VT_PAM_MAXD + dd] = bfloat(vt_load(q, p.q_dt, qoff + ulong(dd)));
+    } else {
+      sq[rr * VT_PAM_MAXD + dd] = bfloat(0.0f);
+    }
+  }
+  if (tid < VT_PAM_BQ) { smax[tid] = -INFINITY; slsum[tid] = 0.0f; }
+
+  simdgroup_float8x8 acc[8];
+  for (uint c = 0u; c < 8u; ++c) { acc[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f); }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int j0 = jlo; j0 <= jhi; j0 += int(VT_PAM_BK)) {
+    const int jc = min(int(VT_PAM_BK), jhi - j0 + 1);
+
+    // Gather this key block out of the paged cache into contiguous tiles.
+    for (uint e = tid; e < VT_PAM_BK * p.d; e += p.tg) {
+      const uint kk = e / p.d, dd = e % p.d;
+      if (int(kk) < jc) {
+        const int j = j0 + int(kk);
+        const int blk = btab[r * p.bt_row + (j / int(p.block_size)) * p.bt_col];
+        const int off = j % int(p.block_size);
+        const ulong kbase = ulong(blk) * p.kc_blk + ulong(off) * p.kc_pg + ulong(g) * p.kc_hd;
+        const ulong vbase = ulong(blk) * p.vc_blk + ulong(off) * p.vc_pg + ulong(g) * p.vc_hd;
+        sk[kk * VT_PAM_MAXD + dd] = bfloat(vt_load(kc, p.kc_dt, kbase + ulong(dd)));
+        sv[kk * VT_PAM_MAXD + dd] = vt_load(vc, p.vc_dt, vbase + ulong(dd));
+      } else {
+        // Padding keys score to -INFINITY below and carry zero V, so a partial
+        // block needs no special case in the mma.
+        sk[kk * VT_PAM_MAXD + dd] = bfloat(0.0f);
+        sv[kk * VT_PAM_MAXD + dd] = 0.0f;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // S = Q @ K^T, one 8x8 tile per simdgroup, accumulated over d in 8-deep
+    // steps. K is loaded TRANSPOSED so the [8 keys][8 d] block presents as the
+    // [8 d][8 keys] operand the mma wants.
+    simdgroup_float8x8 sacc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    if (ch * 8u < uint(VT_PAM_BK)) {
+      for (uint dd = 0u; dd < p.d; dd += 8u) {
+        simdgroup_matrix<bfloat, 8, 8> qf, kf;
+        simdgroup_load(qf, &sq[rb * 8u * VT_PAM_MAXD + dd], VT_PAM_MAXD);
+        simdgroup_load(kf, &sk[ch * 8u * VT_PAM_MAXD + dd], VT_PAM_MAXD, 0, true);
+        simdgroup_multiply_accumulate(sacc, qf, kf, sacc);
+      }
+      simdgroup_store(sacc, &ss[rb * 8u * VT_PAM_BK + ch * 8u], VT_PAM_BK);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax, one thread per query row. Cheap next to the mma, and it
+    // keeps the running max/sum in plain scalars where they are easy to reason
+    // about.
+    for (uint e = tid; e < 4u * 64u; e += p.tg) { sdiag[e] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < VT_PAM_BQ) {
+      const uint rr = tid;
+      float corr = 1.0f;
+      if (int(rr) < nq) {
+        const int pos = context + loc + int(rr);
+        int a = p.window_left >= 0 ? max(0, pos - p.window_left) : 0;
+        int b = p.causal != 0u ? pos : seqlen - 1;
+        if (p.window_right >= 0) { b = min(b, pos + p.window_right); }
+        b = min(b, seqlen - 1);
+        float mc = -INFINITY;
+        for (int idx = 0; idx < jc; ++idx) {
+          const int j = j0 + idx;
+          const bool inwin = (b >= a) && j >= a && j <= b;
+          const float s = inwin ? ss[rr * VT_PAM_BK + uint(idx)] * p.scale : -INFINITY;
+          ss[rr * VT_PAM_BK + uint(idx)] = s;
+          mc = max(mc, s);
+        }
+        if (mc > -INFINITY) {
+          const float mold = smax[rr];
+          const float mnew = max(mold, mc);
+          corr = mold == -INFINITY ? 0.0f : exp(mold - mnew);
+          float ls = 0.0f;
+          for (int idx = 0; idx < jc; ++idx) {
+            const float e0 = exp(ss[rr * VT_PAM_BK + uint(idx)] - mnew);
+            sp[rr * VT_PAM_BK + uint(idx)] = e0;
+            ls += e0;
+          }
+          smax[rr] = mnew;
+          slsum[rr] = slsum[rr] * corr + ls;
+        } else {
+          corr = 1.0f;  // nothing in window this block: O and l stay as they are
+          for (int idx = 0; idx < jc; ++idx) { sp[rr * VT_PAM_BK + uint(idx)] = 0.0f; }
+        }
+      } else {
+        for (int idx = 0; idx < jc; ++idx) { sp[rr * VT_PAM_BK + uint(idx)] = 0.0f; }
+      }
+      for (int idx = jc; idx < int(VT_PAM_BK); ++idx) {
+        sp[rr * VT_PAM_BK + uint(idx)] = 0.0f;
+      }
+      // diag(corr) for this row, in its row block's 8x8.
+      sdiag[(rr / 8u) * 64u + (rr % 8u) * 8u + (rr % 8u)] = corr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // O <- diag(corr) @ O, then O += P @ V. Both mma; the diagonal multiply is
+    // how the per-row rescale reaches a register-resident simdgroup_matrix.
+    simdgroup_float8x8 dg;
+    simdgroup_load(dg, &sdiag[rb * 64u], 8u);
+    for (uint c = 0u; c < 8u; ++c) {
+      simdgroup_float8x8 tmp;
+      simdgroup_multiply(tmp, dg, acc[c]);
+      acc[c] = tmp;
+    }
+    for (uint kk = 0u; kk < VT_PAM_BK; kk += 8u) {
+      simdgroup_float8x8 pf;
+      simdgroup_load(pf, &sp[rb * 8u * VT_PAM_BK + kk], VT_PAM_BK);
+      for (uint c = 0u; c < 8u; ++c) {
+        simdgroup_float8x8 vf;
+        simdgroup_load(vf, &sv[kk * VT_PAM_MAXD + ch * 64u + c * 8u], VT_PAM_MAXD);
+        simdgroup_multiply_accumulate(acc[c], pf, vf, acc[c]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Epilogue: one 8x8 fragment at a time through this simdgroup's own scratch,
+  // so no threadgroup barrier is needed (see vt_matmul_bt_mm).
+  threadgroup float* mysc = &sout[sgitg * 64u];
+  for (uint c = 0u; c < 8u; ++c) {
+    simdgroup_store(acc[c], mysc, 8u);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = lane; e < 64u; e += sgsize) {
+      const uint rr = rb * 8u + e / 8u;
+      const uint col = ch * 64u + c * 8u + e % 8u;
+      if (int(rr) < nq && col < p.d && slsum[rr] > 0.0f) {
+        const ulong qoff = (ulong(uint(int(t) + int(rr))) * ulong(p.hq) + ulong(h)) * ulong(p.d);
+        vt_store(out, p.out_dt, qoff + ulong(col), mysc[e] / slsum[rr]);
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
 struct VtArgmaxParams {
   uint n;
   uint v;
