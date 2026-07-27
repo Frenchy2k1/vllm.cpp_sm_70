@@ -286,7 +286,10 @@ a runtime claim. AGX Orin (`sm_87`) is the one reachable non-GB10 board and the
 sole target that reaches RUNTIME-VERIFIED, gating the first non-GB10 runtime proof
 token-exact vs the vLLM 0.25.0 oracle. FA2 is a one-cell table edit (the vendored
 kernels are already the sm_80 FlashAttention-2 bodies); AllSpark and scaled-mm C2x
-are new bodies; Marlin needs its int4/fp8 instantiations.
+are new bodies; Marlin needs its int4/fp8 instantiations. The whole CUDA-arch
+fast-path + beyond-vLLM breadth effort is tracked on the roadmap as
+`ROAD-V1-D1-CUDA` (derive-and-ship + a public tested/untested signal matrix), with
+AGX Orin (sm_87) and NVIDIA Thor (Blackwell) as the reachable runtime-gate boards.
 
 **Datacenter CUDA arches (Hopper `sm_90a`, Blackwell `sm_100/103/110`) — build-only, fast-path SPIKED.** These arches compile today as **portable-kernels-only** (`build-only`; every wgmma/tcgen05 fast-path FEATURE-TABLE cell resolves EMPTY, no board here) — see [.agents/backend-matrix.md](../.agents/backend-matrix.md). The FRAMEWORK (arch-additivity seams) is done; the FAST-PATH kernel bodies are now scoped for **derive-and-ship** (the llama.cpp model) in [.agents/specs/cuda-arch-datacenter-fastpath.md](../.agents/specs/cuda-arch-datacenter-fastpath.md). The CUTLASS C3x / NVFP4-tcgen05 / grouped-MoE / MLA kernels are CUTLASS template instantiations (the wgmma/tcgen05 MMA lives in cutlass 4.5.0, selected by `ArchTag`), so they are 1:1-portable and BUILD-VERIFIABLE here via a single-arch `90a`/`100a` cross-compile + `cuobjdump` SASS proof, with NO Hopper/B200 board. Such kernels will ship LABELED `DERIVED+BUILD-VERIFIED (testing-welcome)` — a faithful port with a compile+SASS proof, HONESTLY untested (a green link is not execution evidence); cloud-GPU token-exact + every-axis runs upgrade the label to runtime-verified. DeepGEMM (runtime JIT/autotune) is the one path that is `not-yet-buildable / needs-real-port` and ships no fake.
 
