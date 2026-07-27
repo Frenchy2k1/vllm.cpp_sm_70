@@ -25687,3 +25687,66 @@ NOT pushed; FULL SHA reported to caller.
     `.agents/specs/{prometheus-metrics,utility-endpoints}.md` same date. Sibling
     `D4-APC` (prefix-cache/KV) untouched — `/reset_prefix_cache` uses an injected
     callback only.
+
+## 2026-07-27 — ROAD-V1-C8 residual: `TOOLS-STREAMING-PARSER` unified streaming parser ENGINE CORE (CLAIM-ROADMAP-C8-PARSER, NOT pushed)
+
+Advanced the largest remaining `ROAD-V1-C8` leaf: ported vLLM 0.26's NEW unified
+`parser/engine/` abstraction (the 0.26 replacement for hand-rolled per-family
+streaming parsers) as an additive C++ subsystem. Isolated worktree
+`.claude/worktrees/agent-acde2845d19401df6`, base `origin/main` `c0abfa3f`,
+CPU-only (a parser is a device-neutral pure function of the token stream — NO
+dgx contention with the D4-APC-W3 sibling), pin `555967922`/vLLM 0.26.0.dev0.
+
+- **Context (0.25→0.26 shift):** through 0.25 each model's tool/reasoning format
+  was a hand-rolled `extract_tool_calls_streaming` (this project already ports 40
+  tool + 9 reasoning parsers, individually gated). 0.26 added
+  `vllm/parser/engine/` — each format is a declarative `ParserEngineConfig`
+  (terminals + a transition state machine) and ONE shared `StreamingParserEngine`
+  handles streaming, ambiguity buffering, token-ID mapping and delta computation.
+  The engine-backed families (qwen3, seed_oss, kimi_k2, gemma4, deepseek_v4/v32,
+  minimax_m2, nemotron_v3, glm47_moe, inkling) route through it.
+- **Ported (CORE):** `include|src/vllm/parser/engine/` — `events.h`
+  (`EventType`/`SemanticEvent`), `parser_engine_config.h`, `incremental_lexer.{h,cpp}`
+  (literal `LexerShape` + prefix-buffering lexer; byte-wise iteration equivalent to
+  upstream char-wise for ASCII terminals), `token_id_scanner.{h,cpp}` (`TokenIDScanner`
+  with deferral + hold-back/anchor-rebuild recovery over an `EngineTokenizer` seam),
+  `streaming_parser_engine.{h,cpp}` (`StreamingParserEngine`: scan→lex→transition
+  state machine→events, JSON-arg brace hold-back `_feed_args_char`/`_flush_safe_args`,
+  `_build_drop_info`, `finish`), `configs.{h,cpp}` (`qwen3_config` reused by seed_oss +
+  `kimi_k2_config`), `registry.{h,cpp}` (unified name→config dispatch = the C++ analogue
+  of `registered_adapters.py`). Grounded 1:1 with file:line in
+  `.agents/specs/streaming-parser-engine.md`.
+- **GATE (exact, RED-first, CPU):** a parser is a pure function of the
+  `(delta_text, delta_token_ids)` stream, so it is gated EXACTLY:
+  `tests/vllm/parser/engine/test_streaming_parser_engine.cpp` (+ `..._goldens.inc`)
+  — 8 fixed deterministic streams matched event-for-event (type,value,tool_index)
+  vs the vLLM 0.26 Python engine, **586/586 assertions**. Coverage: qwen3
+  reasoning+XML tool call (char-by-char & whole cadence), thinking-off plain
+  content, two consecutive calls (tool_index increment), an unfinished call flushed
+  by finish(), kimi_k2 JSON args with the held-back top-level brace, a token-ID
+  driven stream through the scanner + mock vocab. Goldens captured from the pinned
+  source by `tools/parity/dump_streaming_parser_engine.py` (copies the six engine
+  modules, rebuilds the configs inline, drives the identical streams) and reproduce
+  the committed `.inc` BYTE-IDENTICALLY. **RED-first proof:** disabling the
+  held-back arg-delta flush on tool-args exit fails 12 asserts at the exact
+  divergent `}` boundary (`<|tool_call_end|>` mis-ordered vs `}`); restoring →
+  586/586 green.
+- **INERTNESS:** additive opt-in subsystem — nothing dispatches to it unless a
+  request selects an engine-backed parser; tracked `git diff --stat` code = the new
+  `parser/engine/` files + 5 CMake src lines + 1 test CMake line; NO existing
+  tool_parsers/serving_chat TU altered → plain generation byte-identical. CPU
+  `-Werror` 0-warn (full `vllm` lib). All 7 record checkers bare rc=0;
+  `check-device-leakage` DSR 32==32 (no `vt::`/CUDA). `benchmark_binding=false`
+  (parser is not on a throughput path).
+- **STATE:** engine-matrix `TOOLS-STREAMING-PARSER` `INVENTORIED`→`ACTIVE` (code +
+  test anchors + `CLAIM-ROADMAP-C8-PARSER`); feature-matrix §7 row `ACTIVE`.
+  `ROAD-V1-C8` STAYS `PARTIAL`.
+- **RESIDUAL (honest, stays open under the row):** the parser ASSEMBLY layer
+  (`parser_engine.py`: SemanticEvent→`DeltaMessage`/`ExtractedToolCallInformation`,
+  DeltaToolCall id/name/arg objects, arg_converter, validate_tool_names, strip
+  flags) + replay adapters; the serving-SSE DISPATCH swap (routing engine-backed
+  families in `serving_chat` through the engine — the legacy per-family parsers
+  remain the live path); the other 6 engine configs (gemma4/deepseek_v4/v32/
+  minimax_m2/nemotron_v3/glm47_moe/inkling); regex (non-literal) terminals. NOT
+  pushed; FULL SHA reported to caller. Sibling `D4-APC-W3` (prefix-cache/KV/§2, GPU)
+  untouched.

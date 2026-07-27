@@ -529,6 +529,11 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/minimax_m2.cpp
   src/vllm/entrypoints/openai/tool_parsers/gemma4.cpp
   src/vllm/entrypoints/openai/tool_parsers/seed_oss.cpp
+  src/vllm/parser/engine/incremental_lexer.cpp
+  src/vllm/parser/engine/token_id_scanner.cpp
+  src/vllm/parser/engine/streaming_parser_engine.cpp
+  src/vllm/parser/engine/configs.cpp
+  src/vllm/parser/engine/registry.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp
