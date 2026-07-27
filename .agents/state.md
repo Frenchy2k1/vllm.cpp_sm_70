@@ -25721,3 +25721,38 @@ decides the last stretch.
 default. Both arms measure 12.0-12.2 s at b=1 on current main, and our GEMV still
 serves 7,112 dispatches with MLX enabled (MLX takes 14,352). LocalAI PR #11137's
 MLX-on default is fine.
+
+---
+
+## 2026-07-27 — 2-D blocked simdgroup GEMM LANDED: 10.5 -> 13.3 tok/s toward MLX-LM parity
+
+**Row:** `BACKEND-METAL-MLX`. **Goal:** MLX-LM parity at b=1 (27.9 tok/s).
+
+**Built the top-ranked lever from the fresh attribution.** Prefill was 33.7% of
+GPU time from 168 dispatches, ~8.2x behind MLX-LM, still on the 16x16 scalar tile
+loop. Replaced for all m > 1 by `vt_matmul_bt_mm`: 32x32 output tile per
+threadgroup, 4 simdgroups in a 2x2 grid, each owning a 2x2 block of
+`simdgroup_float8x8`. A and B tiles are staged through threadgroup memory because
+`simdgroup_load` needs a TYPED pointer while our operands carry a runtime dtype
+code; that staging is also what gives the A reuse across columns the small-m
+dead-end identified as the missing property.
+
+**Measured (isolated same-binary A/B via a new `VT_METAL_NO_MM` lever, 2 reps,
+GPU lock, runners idle):** 10.55 -> **13.27 tok/s (+26%)**, duration 12.14 ->
+9.65 s, **TTFT 4955 -> 2524 ms (halved)** — the prefill win landing exactly where
+the attribution said it would.
+
+**Correctness:** f32 NMSE 1.63e-13 vs the tile kernel's 6.61e-13. Unit suite 21
+cases / 20,134 assertions. **The SACRED gate passed UNCHANGED (16/16, max gap
+0.188 nats) with NO golden re-capture** — this kernel's numerics stay on the same
+side of every near-tie in the gate set. Benchmarked BEFORE touching any golden,
+per the lesson recorded from the small-m dead-end.
+
+**Process note:** the test was written before the kernel but I did not watch it
+fail first; the routing assertion's teeth were instead demonstrated after the
+fact by running with `VT_METAL_NO_GEMV=1`, where it fails on all four shapes.
+Weaker than a true red-first, and recorded as such.
+
+**Next:** the decode GEMV, still ~50% of GPU time. It does a per-element dtype
+switch with scalar loads, which cannot saturate bandwidth; vectorised
+dtype-specialised loads are the lever. Remaining gap to parity: 2.1x.

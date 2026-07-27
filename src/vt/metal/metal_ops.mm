@@ -549,11 +549,26 @@ void AddKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 constexpr uint32_t kGemmTile = 16;
 // Must match VT_GEMV_SGS in metal_msl.h; Apple simdgroups are 32-wide.
 constexpr uint32_t kGemvSimdgroups = 8;
+// Must match VT_MM_BM/VT_MM_BN/VT_MM_SGS in metal_msl.h.
+constexpr int64_t kMmTile = 32;
+constexpr uint32_t kMmSimdgroups = 4;
 
 // Same-binary A/B lever for the GEMV fast path, which the benchmark protocol
 // requires ("use a same-binary A/B") and which doubles as the bisect switch if
 // a decode result is ever suspected of coming from this kernel.
 // VT_METAL_NO_GEMV=1 routes m=1 back through the tile GEMM.
+// Separate lever for the m>1 simdgroup GEMM, so it can be A/B'd INDEPENDENTLY of
+// the m=1 GEMV. VT_METAL_NO_GEMV disables the whole fast-path family;
+// VT_METAL_NO_MM disables only this kernel. Without the split, an A/B of one
+// lever silently measures both.
+bool MmEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_METAL_NO_MM");
+    return !(e != nullptr && e[0] == '1');
+  }();
+  return on;
+}
+
 bool GemvEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_METAL_NO_GEMV");
@@ -596,6 +611,18 @@ void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
     // One simdgroup per output column, kGemvSimdgroups of them per threadgroup.
     e.DispatchGrid2D((n + kGemvSimdgroups - 1) / kGemvSimdgroups, 1,
                      kGemvSimdgroups * kSimdWidth);
+    return;
+  }
+  // m > 1: the 2-D blocked simdgroup GEMM. One 32x32 output tile per
+  // threadgroup, 4 simdgroups of 32 threads.
+  if (GemvEnabled() && MmEnabled()) {
+    Encoder e("vt_matmul_bt_mm");
+    e.BindTensor(a, 0, "matmul_bt: a");
+    e.BindTensor(b, 1, "matmul_bt: b");
+    e.BindTensor(out, 2, "matmul_bt: out");
+    e.BindBytes(&p, sizeof(p), 3);
+    e.DispatchGrid2D((n + kMmTile - 1) / kMmTile, (m + kMmTile - 1) / kMmTile,
+                     kMmSimdgroups * kSimdWidth);
     return;
   }
   Encoder e("vt_matmul", "vt_matmul_bt(gemm m>1)");

@@ -2555,6 +2555,40 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal 2-D blocked simdgroup GEMM on Apple M4 (2026-07-27) - INDICATIVE
+
+**The top-ranked lever from the attribution below, built and measured.** Prefill
+was 33.7% of GPU time from 168 dispatches and ~8.2x behind MLX-LM, still on the
+16x16 scalar tile loop. This replaces it for every m > 1 with a 2-D blocked
+kernel: a 32x32 output tile per threadgroup, 4 simdgroups in a 2x2 grid each
+owning a 2x2 block of `simdgroup_float8x8` accumulators, with A and B tiles
+staged through threadgroup memory so one kernel still serves every runtime dtype.
+
+Isolated same-binary A/B via `VT_METAL_NO_MM` (a lever added specifically so this
+kernel could be measured independently of the m=1 GEMV), 2 reps, GPU lock, CI
+runners idle:
+
+| | without mm | with mm | change |
+|---|--:|--:|--:|
+| throughput | 10.52 / 10.57 | **13.30 / 13.23** | **+26%** |
+| duration | 12.17 / 12.11 s | 9.63 / 9.67 s | -2.5 s |
+| TTFT | 4982 / 4928 ms | **2504 / 2545 ms** | **halved** |
+
+TTFT halving is the prefill win landing directly, as the attribution predicted.
+
+**Accuracy:** f32 NMSE 1.63e-13 against an f64 oracle, better than the tile
+kernel's 6.61e-13. **The SACRED gate passed UNCHANGED (16/16, max gap 0.188
+nats), with no golden re-capture required** — the kernel's numerics stay on the
+same side of every near-tie in the gate set.
+
+**Progress against the parity goal:** 10.5 -> 13.3 tok/s of the 27.9 target. The
+next ranked lever is the decode GEMV, still 50% of GPU time and using scalar
+per-element dtype-switched loads that cannot saturate bandwidth.
+
+**Status: INDICATIVE** (worker daemon and wallpaper up), CI runners idle.
+
+---
+
 ## Metal GPU-time attribution after `M3c-1`+`M3d` (2026-07-27) - PREFILL is the outlier
 
 **Re-profiled because the two landed levers moved the bottleneck, and the answer
