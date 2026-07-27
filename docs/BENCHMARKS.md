@@ -184,6 +184,37 @@ recompute envelope) plus the uniform-1+k FULL CG. Repro: run
 `./build-cuda/tests/test_qwen27_dflash_spec_decode` under `flock` with the bf16-lm_head 27B snapshot
 (single-file `model.safetensors`) + the z-lab draft in the HF cache.
 
+**DFlash D8 - ACCEPTANCE RCA closed by measurement = bf16-IRREDUCIBLE (NOT a reducible per-step draft
+bug); FINAL c1 speed A/B on the golden set = ours ~31% below vLLM-DFlash-ON (2026-07-27,
+`CLAIM-DFLASH-D8`, dgx GB10 sm_121a, oracle vLLM 0.26.0.dev0).** `benchmark_binding=true`. NO engine code
+changed (only the harness `scripts/spec/d8_acceptance_rca.py`); inertness holds by construction (D7 binary).
+Workload: 27B NVFP4 single-file bf16 target (`890bdef7`) + z-lab 27B DFlash draft, the 4 committed golden
+prompts, greedy, c1, idle box under one `flock`, warmup discarded. **Part 1 (acceptance-vs-length, the
+signature test):** accepted draft-tok/step both engines:
+
+| L (tokens) | vLLM-ON graphed | ours-ON eager | ratio |
+|---|---|---|---|
+| 8 | 2.92 | 2.00 | 0.69 |
+| 32 | 3.79 | 3.39 | 0.89 |
+| 128 | 3.96 | 2.84 | 0.72 |
+| 256 | 3.26 | 2.78 | 0.85 |
+
+Gap present but noisy/non-monotonic and confounded by divergent trajectories. Confound-free evidence that the
+per-step draft is FAITHFUL (deficit is NOT a reducible bug): (i) D2/D3 identical-context proposal diff vs the
+REAL loaded vLLM draft = 13 STRICT + 3 single-ULP near-tie = 16/16; (ii) on token-identical golden prompts our
+accepted-per-step equals vLLM's by construction; (iii) D6 source RCA - our independent kernels cannot bit-match
+vLLM's flashinfer/cutlass draft+paged-attn ⇒ near-tie flips are bf16-irreducible. **CEILING: ours ~0.80-0.85x
+vLLM acceptance** (0.85x golden, 0.80x D7 prose) - the honest bf16 floor on max spec throughput. **FINAL c1 A/B
+(L=256 golden set):** ours 20.99 tok/s / 43.08 ms TPOT (eager) vs vLLM-DFlash-ON graphed 30.42 / 32.87 - **ours
+~31% below** (matches D7's ~33% on prose). **Part 2 (persistent-paged-KV + FULL CG):** VALIDATED bit-identical
+design (per-row K/V independence; vLLM `precompute_and_store_context_kv(...,context_slots)` persistent paged
+cache + `run_fullgraph` confirmed in-source) but NOT landed this session (a SACRED-bit-identical landing exceeds
+the safe envelope; a partial ungated landing would risk false parity). **On-par-or-above NOT met; SPEC-DFLASH
+stays `ACTIVE`** at the honest residual = irreducible acceptance floor + un-landed recompute-elimination/CG.
+Repro: `flock $HOME/gpu.lock env PATH=$HOME/venvs/vllm-oracle/bin:$PATH VLLM_USE_V2_MODEL_RUNNER=1 python
+scripts/spec/d8_acceptance_rca.py --dataset <golden4.json> --out d8_vllm_rca.json` (vLLM) + `vllm-bench
+--speculative-config '{"method":"dflash",...}' --output-len L` (ours).
+
 **DFlash D7 - device-resident within-step draft forward: bit-identical, but the direct old-vs-new A/B
 = +2% (in-noise) REFUTES D6's download-gap hypothesis; our DFlash-ON is STILL ~33% below vLLM-DFlash-ON
 on this set (2026-07-27, `CLAIM-DFLASH-D7`, dgx GB10 sm_121a, oracle vLLM 0.26.0.dev0).**
