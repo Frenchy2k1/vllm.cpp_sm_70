@@ -26715,3 +26715,49 @@ is ~50 ms of GEMM plus attention's 63 ms against MLX's implied ~20.
 **Standing goal: 94.5%, not met.** The two remaining projects are now ranked by
 evidence rather than assumption: decode fusion first (63% of the gap), then
 attention tile tuning and the last ~9% of GEMM.
+
+---
+
+## 2026-07-27 — OPEN LEAD 2: decode attention streams KV at 24% of peak (fusion was the WRONG target)
+
+**Overturns the entry immediately above, which ranked decode's residual as
+dispatch count and named fusion as the project. That was wrong, and one
+measurement disproved it.**
+
+A decode-dominated run (p=8) reports **gpu_busy 97.0% of wall** and **28.02
+tok/s** — already at MLX-LM's 27.65. Dispatch overhead is 3%. There is nothing
+material for fusion to win.
+
+The decode gap appears only WITH CONTEXT, and it is a clean bandwidth limit:
+
+| prompt | decode tok/s | ms/tok | KV read/tok | delta vs p=8 | implied BW |
+|---|--:|--:|--:|--:|--:|
+| 8 | 28.02 | 35.69 | 0.9 MB | - | - |
+| 512 | 26.53 | 37.69 | 58.7 MB | 2.00 ms | **29.3 GB/s** |
+| 2048 | 22.87 | 43.73 | 234.9 MB | 8.04 ms | **29.2 GB/s** |
+
+Identical implied bandwidth at two context lengths ⇒ steady-state limit, not
+fixed overhead. **24% of the M4's ~120 GB/s** for a pure streaming KV read.
+
+**Cause, already named in metal_ops.mm's own comment:** PagedAttentionKernel
+launches one threadgroup per (q-head, query token), which at decode is just `hq`
+= 16 threadgroups. Widening each threadgroup (tg = 4*d) was the earlier
+mitigation; it cannot fix memory-level parallelism, because 16 threadgroups
+cannot keep enough independent loads in flight regardless of width.
+
+**Fix: flash-decoding.** Split the key range across G threadgroups per (head,
+token), each emitting a partial (m, l, acc), then combine. Grid 16 -> 16*G.
+Needs a scratch buffer for partials plus a combine kernel — a real change, not a
+parameter. Projection:
+
+| decode attention at | p=512 | p=2048 |
+|---|--:|--:|
+| 29 GB/s (today) | 26.53 | 22.87 |
+| 90 GB/s | **27.52** (≈ MLX 27.65) | **26.11** (+14%) |
+
+**Method note.** This was found the same way as the prefill-attention lead: take
+a measured component, divide by its theoretical roofline, and look for the
+outlier — here bytes/second rather than FLOP/s. Both times the answer was a
+kernel running at a small fraction of the hardware's ceiling for structural
+reasons, and both times the preceding entry had confidently ranked something
+else. Sweep the roofline of EVERY component before ranking projects.
