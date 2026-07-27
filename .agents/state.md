@@ -26529,3 +26529,34 @@ now identified. Two concrete projects would be required, in parallel:
    different algorithm, not another parameter).
 2. Decode kernel fusion to cut 398 dispatches/token materially.
 Each is a project, not a patch. Everything cheaper has been measured.
+
+---
+
+## 2026-07-27 — last two levers closed: bf16+4x4 GEMM and Tier-1 fusion
+
+**REJECTED — bf16 operand fragments WITH 4x4 blocks, i.e. MLX's actual config.**
+The one untested COMBINATION: 4x4 with f32 fragments regressed 3.3x and bf16
+tiles at 4x2 were 5.7% slower, but a mechanism linked them — a bf16
+simdgroup_matrix is half the registers, so bf16 operands are exactly what should
+make the 4x4 accumulator block affordable (32+8 registers vs 32+16). Measured:
+GEMM 650 -> **1419 ms**; warm throughput 22.34 -> 19.98; median TTFT 904 -> 1579.
+
+The register story was PARTLY right (bf16 took 4x4 from 2113 to 1419 ms) and
+still the wrong conclusion. **The fattening direction is closed at both operand
+precisions.** Whatever MLX gains from its block shape does not transfer here, and
+I have no mechanism left that predicts it would.
+
+**REJECTED — VT_FUSED_TIER=1.** Metal registers the Tier-1 single-pass fused
+interpreter but it is off by default, which looked like free dispatch reduction
+for decode. Dispatch count identical (25472 both tiers), throughput ~0.5% lower.
+Cause: the Tier-0 composite ALREADY folds the residual kAdd into the following
+RmsNorm(residual), so both tiers issue ONE dispatch for kFusedAddRmsNormStd.
+There was no fusion win to take — decode's 113 rms_norm/token are already minimal
+for the current op decomposition, and cutting them needs NEW fused kernels
+(rmsnorm into the GEMV, rope+reshape_cache into attention), not a tier flag.
+
+**Final status of the standing goal: NOT MET, and I am out of identified levers.**
+Warm, thermally matched: decode 95.4%, total 89.4%. The 600 ms gap is 61% prefill
+GEMM and 39% decode dispatch overhead, and fixing either alone caps at 95.9% /
+93.6% — parity needs both. Everything short of two new kernel projects has now
+been measured and recorded, negatives included.

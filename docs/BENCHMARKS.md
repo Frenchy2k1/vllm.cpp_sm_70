@@ -2555,6 +2555,30 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Last two levers closed: bf16+4x4 GEMM, and Tier-1 fusion (2026-07-27)
+
+**REJECTED - bf16 operand fragments WITH 4x4 blocks (MLX's actual config).**
+Tested separately these both lost: 4x4 with f32 fragments regressed 3.3x, and
+bf16 tiles at 4x2 were 5.7% slower. The pairing is what MLX's steel GEMM does,
+and there was a mechanism linking them: a bf16 simdgroup_matrix is half the
+registers, so bf16 operands are what should make the 4x4 accumulator block
+affordable (32+8 registers rather than 32+16). Measured: GEMM 650 -> **1419 ms**,
+warm throughput 22.34 -> 19.98, median TTFT 904 -> 1579 ms.
+
+Partial vindication of the register story - bf16 operands took 4x4 from 2113 ms
+to 1419 - but 4x4 is still 2.2x worse than 4x2. **The fattening direction is now
+closed at BOTH operand precisions**, so whatever MLX gains from its block shape
+does not transfer to this kernel.
+
+**REJECTED - VT_FUSED_TIER=1.** The portable fusion framework's Tier-1 single-
+pass interpreter is registered for Metal but off by default. Enabling it changed
+the decode dispatch count not at all (25472 either way) and cost ~0.5%: the
+Tier-0 composite ALREADY folds the residual kAdd into the following
+RmsNorm(residual) call, so both tiers issue one dispatch for the recipe. No
+fusion win was available there to take.
+
+---
+
 ## What parity actually requires, and the MLX provider verdict (2026-07-27)
 
 **The MLX GEMM provider settles its own question.** Same-binary A/B
