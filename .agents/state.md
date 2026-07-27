@@ -27541,3 +27541,32 @@ items of 15-100 ms against kernels at 83-97% of their roofs. Gains remain
 available but per-item return has fallen roughly an order of magnitude, and each
 now needs the paired harness to be visible at all. That is the honest reason to
 treat further work here as optional rather than obvious.
+
+---
+
+## 2026-07-27 — GEMV memory-level parallelism re-tested under the harness: still a loss
+
+Ran the experiment I had flagged rather than leaving it as a recommendation.
+"GEMV memory-level parallelism" was excluded long before the paired harness, i.e.
+measured under a 10% noise floor against a ~2% effect, so it had never been
+resolved.
+
+The decode GEMV already reads `ushort4` with four accumulators but keeps ONE
+outstanding weight load per lane per iteration. Unrolling by two issues both
+vectors before consuming either — the only headroom left in an op streaming the
+entire weight matrix per token at 99 GB/s of a ~120 GB/s part.
+
+Paired (decode rate, p=512): -0.23 -0.31 -0.27 -0.29 -0.31 -0.12 -> **-1.03%
+median, 0/6 blocks faster, p = 0.031.** Reverted. Metal tests stayed green.
+
+**The original exclusion was CORRECT**, and that matters on its own: once the
+measurement floor was quantified the natural suspicion was that EVERY
+small-margin verdict in this log was noise. This one was not. The compiler is
+already pipelining the simple loop and the manual unroll only adds register
+pressure. Re-test pre-harness exclusions when cheap; do not assume they are wrong.
+
+**All four items in the last 3.7% now sit against ROOFS, not defects:** GEMV at
+83% of memory peak, GEMM at 97% of MLX's with an mma issue rate of 3.91 TFLOP/s
+(above MLX's 3.07 overall), prefill attention post-vectorisation, and decode's
+small kernels which are launch-bound. Every cheap structural lever this session
+identified has been either landed or measured away.

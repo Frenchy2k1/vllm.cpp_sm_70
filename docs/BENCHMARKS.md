@@ -2862,6 +2862,35 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## GEMV memory-level parallelism RE-TESTED under the harness: still a loss (2026-07-27)
+
+The highest-value remaining experiment, run rather than left as a suggestion.
+"GEMV memory-level parallelism" was recorded as excluded long before the paired
+harness existed, i.e. measured under a 10% noise floor against a ~2% effect, so
+it had never actually been resolved.
+
+The decode GEMV already reads `ushort4` with four accumulators, but each lane
+holds ONE outstanding weight load per iteration: load, consume, repeat. Unrolling
+by two issues both vectors before consuming either, giving the memory system two
+independent requests per lane. That is the only headroom left in an op streaming
+the whole weight matrix per token at 99 GB/s of a ~120 GB/s part.
+
+Paired verdict (decode rate, p=512, 6 ABBA blocks): -0.23 -0.31 -0.27 -0.29 -0.31
+-0.12 -> **-1.03% median, faster in 0/6 blocks, p = 0.031.** Reverted.
+
+**The original exclusion was CORRECT.** That is worth recording for its own sake:
+after the measurement floor was quantified, the natural suspicion was that every
+small-margin verdict in this log was noise. This one was not. The compiler is
+evidently already pipelining the simple loop, and the manual unroll only adds
+register pressure. Pre-harness exclusions should be re-tested when they are cheap,
+not assumed wrong.
+
+With this, the four items composing the last 3.7% all sit against roofs
+(GEMV 83% of memory peak, GEMM 97% of MLX's, mma issue rate 3.91 TFLOP/s) rather
+than against defects.
+
+---
+
 ## What closing the LAST 3.7% would require (2026-07-27)
 
 Decode is the largest single remaining item (99 ms of the ~205 ms gap). Its
