@@ -167,6 +167,8 @@ if(NOT VLLM_CPP_SANITIZE STREQUAL "OFF")
     $<$<COMPILE_LANGUAGE:CXX>:-fno-sanitize-recover=all>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
     $<$<COMPILE_LANGUAGE:CXX>:-g>)
+  # -Werror itself is dropped for this lane in cmake/CompilerWarnings.cmake, where
+  # the per-target warning flags are set; see the rationale there.
   add_link_options(-fsanitize=${VLLM_CPP_SANITIZE})
   message(STATUS "Host sanitizer lane: ${VLLM_CPP_SANITIZE} (CUDA backend off)")
 endif()

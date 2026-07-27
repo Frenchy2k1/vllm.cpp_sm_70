@@ -1862,10 +1862,14 @@ AsyncOutputPool& GPUModelRunner::get_or_create_async_output_pool() {
 // VT_ASYNC_DEVICE_MIRROR=1 engages it. Distinct from VT_ASYNC_RUNNER, which would
 // also turn off async scheduling itself; keeping them separate is what makes an
 // honest A/B of W4 alone possible — same binary, same scheduler, one mechanism.
+#ifdef VLLM_CPP_CUDA
+// Guarded with its only use below: on a CPU build the mirror cannot exist, and
+// an unused static function is a -Werror=unused-function break there.
 static bool AsyncDeviceMirrorEnvDefault() {
   const char* value = std::getenv("VT_ASYNC_DEVICE_MIRROR");
   return value != nullptr && value[0] == '1';
 }
+#endif
 
 bool GPUModelRunner::async_device_mirror() const {
   if (async_device_mirror_cached_ >= 0) return async_device_mirror_cached_ != 0;

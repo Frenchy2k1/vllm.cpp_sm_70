@@ -5035,6 +5035,10 @@ default-OFF and production-inert. `VT_POOL_BYPASS` is explicitly NOT a timing
 configuration - it reinstates the per-op `cudaMalloc`/`cudaFree` device-sync
 storm the pool exists to remove. Rationale and the item-by-item transfer
 decision: [.agents/specs/hardening-adoption-2026-07-27.md](../.agents/specs/hardening-adoption-2026-07-27.md).
+The lanes are verified end to end (both configure, both guards fire, ASan+UBSan
+builds and passes three CPU suites with leak detection on), and their first real
+build already caught a `-Werror=unused-function` break in the W4 commit that
+would also have failed the existing `build-test-cpu` job.
 
 ## `M3c-1` CUDA-path neutrality on GB10 (2026-07-27) - NO MEASURABLE REGRESSION
 
