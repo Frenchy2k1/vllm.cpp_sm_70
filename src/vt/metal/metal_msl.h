@@ -864,6 +864,16 @@ kernel void vt_reshape_and_cache(device const uchar* k    [[buffer(0)]],
 // the chunk's KEYS across `tg/d` groups puts them all to work. Capped so the
 // partial-accumulator tile stays small (4 * 256 floats = 4 KB).
 #define VT_PA_VGROUPS 4u
+// Query tokens per threadgroup. With one threadgroup per (head, query token),
+// PREFILL re-reads the entire K/V range once per query: ~57 GB for a 512-token
+// prompt on this model, which is why prefill attention measured ~175 GFLOP/s
+// against MLX's ~3000. Serving QTILE queries from one threadgroup reuses each
+// K/V element QTILE times, and the working set per chunk is small enough to stay
+// in cache. Decode has one query, so QTILE-1 slots simply idle there.
+#define VT_PA_QTILE 4u
+// ushort4 registers per lane for the K row held across the tile's queries.
+// d <= VT_PA_MAXD (256) gives d4 <= 64, i.e. 2 per lane at simdgroup width 32.
+#define VT_PA_KREG 8u
 
 // Same layout discipline as VtCacheParams: 8-byte members first, then 4-byte.
 struct VtPagedAttnParams {
@@ -898,6 +908,286 @@ struct VtPagedAttnParams {
 // index: num_reqs is tiny, the scan is uniform across the threadgroup, and it
 // keeps the op's device-side inputs exactly the ones the vt:: signature already
 // passes.
+// The body is shared by two SPECIALISED pipelines, `QT` being the number of
+// query tokens one threadgroup serves. It is a template parameter and not a
+// runtime value because both properties that make each pipeline fast are decided
+// at compile time: the per-query loops must unroll to keep qjmin/qjmax/qok/s in
+// REGISTERS (with a runtime bound MSL spills them to thread-private memory, and
+// `s[u]` sits in the innermost V loop — measured at +42ms on prefill attention),
+// and the threadgroup arrays must be sized for the tile so DECODE keeps its
+// original, smaller allocation. One kernel serving both loses either way: a
+// runtime bound costs prefill the spills, a fixed bound of 4 makes decode
+// compute and mask three dead slots.
+template <uint QT>
+inline void vt_paged_attention_impl(device const uchar* q,
+                                    device const uchar* kc,
+                                    device const uchar* vc,
+                                    device const int*   btab,
+                                    device const int*   slens,
+                                    device const int*   qsl,
+                                    device uchar*       out,
+                                    constant VtPagedAttnParams& p,
+                                    // Sized REFERENCES, not pointers: bare
+                                    // threadgroup pointers cost decode ~17% here
+                                    // because the compiler can no longer prove
+                                    // they do not alias and reloads across every
+                                    // barrier.
+                                    threadgroup float  (&smem)[VT_TG_MAX],
+                                    threadgroup float  (&scores)[QT * VT_PA_CHUNK],
+                                    threadgroup ulong  (&vbases)[VT_PA_CHUNK],
+                                    threadgroup float  (&pacc)[VT_PA_VGROUPS * VT_PA_MAXD],
+                                    threadgroup float  (&acc)[QT * VT_PA_MAXD],
+                                    threadgroup float  (&sh_m)[QT],
+                                    threadgroup float  (&sh_l)[QT],
+                                    uint2 tgid,
+                                    uint tid,
+                                    uint tiisg,
+                                    uint sgitg,
+                                    uint sgsize) {
+  const uint h = tgid.x;
+  const uint t = tgid.y;
+
+  // Locate the request owning global query index `t`: qsl[r] <= t < qsl[r+1].
+  // UNIFORM across the threadgroup, so the early-outs below never split a
+  // barrier.
+  int r = -1;
+  for (uint i = 0u; i < p.num_reqs; ++i) {
+    if (int(t) >= qsl[i] && int(t) < qsl[i + 1u]) { r = int(i); break; }
+  }
+  if (r < 0) { return; }
+  const int q0 = qsl[r];
+  const int query_len = qsl[r + 1] - q0;
+  const int seqlen = slens[r];
+  const int context = seqlen - query_len;   // past positions before this chunk
+  const int loc = int(t) - q0;              // this token's index within the request
+
+  // PREFILL ONLY: take QT consecutive queries of the SAME request so
+  // the chunk loop loads each K row and each V element once and reuses it
+  // across the tile.
+  //
+  // With one threadgroup per query token, prefill re-streamed the entire K/V
+  // range once per query: ~57 GB for a 512-token prompt on Qwen3-1.7B, which is
+  // why prefill attention measured ~175 GFLOP/s against MLX's ~3000 and held 33%
+  // of prefill GPU time. Decode keeps one threadgroup per query — it has one
+  // query per request, so tiling there would divide the grid by QTILE and cost
+  // far more parallelism than the (nonexistent) reuse is worth.
+  const int qt = query_len > 1 ? int(QT) : 1;
+  if ((loc % qt) != 0) { return; }  // non-leaders idle; uniform, no barrier split
+  const int nq = min(qt, query_len - loc);
+
+  const uint g = h / p.qpk;
+
+  // Per-query windows. A query whose window is empty is left UNTOUCHED in `out`,
+  // matching cpu_paged_attn.cpp's `continue`.
+  int qjmin[QT];
+  int qjmax[QT];
+  bool qok[QT];
+  int jlo = 0x7fffffff;
+  int jhi = -1;
+  for (int u = 0; u < int(QT); ++u) {
+    // Slots past the tile's end are marked invalid rather than skipped, so every
+    // loop below can keep its compile-time bound: they score to -INFINITY, get
+    // their score row zeroed by the running-max branch, and are not stored.
+    if (u >= nq) { qjmin[u] = 0; qjmax[u] = -1; qok[u] = false; continue; }
+    const int pos = context + loc + u;
+    int a = p.window_left >= 0 ? max(0, pos - p.window_left) : 0;
+    int b = p.causal != 0u ? pos : seqlen - 1;
+    if (p.window_right >= 0) { b = min(b, pos + p.window_right); }
+    b = min(b, seqlen - 1);
+    qjmin[u] = a;
+    qjmax[u] = b;
+    qok[u] = (b >= a);
+    if (qok[u]) { jlo = min(jlo, a); jhi = max(jhi, b); }
+  }
+  if (jhi < jlo) { return; }  // no query in the tile has any key
+
+  for (int u = 0; u < int(QT); ++u) {
+    for (uint e = tid; e < p.d; e += p.tg) { acc[u * int(VT_PA_MAXD) + int(e)] = 0.0f; }
+  }
+  if (tid == 0u) {
+    for (int u = 0; u < int(QT); ++u) { sh_m[u] = -INFINITY; sh_l[u] = 0.0f; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int j0 = jlo; j0 <= jhi; j0 += int(VT_PA_CHUNK)) {
+    const int jc = min(int(VT_PA_CHUNK), jhi - j0 + 1);
+
+    // Scores for this chunk (scaled), ONE SIMDGROUP PER KEY, with the K row held
+    // in REGISTERS across all `nq` queries of the tile.
+    //
+    // The original form gave one THREAD the whole d-length dot product. Adjacent
+    // threads then read entirely different K rows (kbase varies per key), so the
+    // loads never coalesced and this kernel ran at roughly 4% of the M4's memory
+    // bandwidth. Splitting `d` across a simdgroup's lanes makes neighbouring
+    // lanes read neighbouring elements of the SAME K row, which is the coalesced
+    // direction, and lets each lane take a 4-wide vector load. Hoisting that row
+    // into `kreg` then serves the whole tile from registers: K device traffic
+    // drops by a factor of `nq`.
+    //
+    // `simd_sum` requires every lane to participate, so the loop bound is the
+    // SIMDGROUP index; `jc` and `nq` are uniform, so no lane diverges.
+    const uint n_sg = p.tg / sgsize;
+    const uint d4 = p.d >> 2u;
+    for (int idx = int(sgitg); idx < jc; idx += int(n_sg)) {
+      const int j = j0 + idx;
+      const int blk = btab[r * p.bt_row + (j / int(p.block_size)) * p.bt_col];
+      const int off = j % int(p.block_size);
+      const ulong kbase = ulong(blk) * p.kc_blk + ulong(off) * p.kc_pg + ulong(g) * p.kc_hd;
+      // The register path must cover the WHOLE row, else the staged and the
+      // re-read halves would disagree; d <= VT_PA_MAXD makes this always true at
+      // simdgroup width 32, and the bound keeps it honest if either changes.
+      const bool fast = (p.q_dt == VT_DT_BF16 && p.kc_dt == VT_DT_BF16 &&
+                         (p.d & 3u) == 0u && (kbase & 3ul) == 0ul &&
+                         d4 <= VT_PA_KREG * sgsize);
+      ushort4 kreg[VT_PA_KREG];
+      if (fast) {
+        device const ushort4* k4 = (device const ushort4*)((device const ushort*)kc + kbase);
+        uint c = 0u;
+        for (uint e = tiisg; e < d4; e += sgsize) { kreg[c++] = k4[e]; }
+      }
+      for (int u = 0; u < int(QT); ++u) {
+        // Clamped: an invalid slot re-reads the tile's last valid row instead of
+        // running off the end of Q. Its score is masked to -INFINITY below.
+        const uint tu = t + uint(min(u, nq - 1));
+        const ulong qoff = (ulong(tu) * ulong(p.hq) + ulong(h)) * ulong(p.d);
+        float part = 0.0f;
+        if (fast && (qoff & 3ul) == 0ul) {
+          device const ushort4* q4 = (device const ushort4*)((device const ushort*)q + qoff);
+          uint c = 0u;
+          for (uint e = tiisg; e < d4; e += sgsize) {
+            const ushort4 qv = q4[e];
+            const ushort4 kv = kreg[c++];
+            part += vt_bf16_to_f32(qv.x) * vt_bf16_to_f32(kv.x);
+            part += vt_bf16_to_f32(qv.y) * vt_bf16_to_f32(kv.y);
+            part += vt_bf16_to_f32(qv.z) * vt_bf16_to_f32(kv.z);
+            part += vt_bf16_to_f32(qv.w) * vt_bf16_to_f32(kv.w);
+          }
+        } else {
+          for (uint e = tiisg; e < p.d; e += sgsize) {
+            part += vt_load(q, p.q_dt, qoff + ulong(e)) * vt_load(kc, p.kc_dt, kbase + ulong(e));
+          }
+        }
+        const float dot = simd_sum(part);
+        if (tiisg == 0u) {
+          // Each query of the tile has its own causal/window bound, so the tile
+          // walks the UNION of their key ranges and masks per query here.
+          const bool inwin = qok[u] && j >= qjmin[u] && j <= qjmax[u];
+          scores[u * int(VT_PA_CHUNK) + idx] = inwin ? dot * p.scale : -INFINITY;
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Running max, then rescale the accumulator and the denominator — per query.
+    for (int u = 0; u < int(QT); ++u) {
+      float pm = -INFINITY;
+      for (int idx = int(tid); idx < jc; idx += int(p.tg)) {
+        pm = max(pm, scores[u * int(VT_PA_CHUNK) + idx]);
+      }
+      const float mchunk = vt_tg_max(smem, tid, p.tg, pm);
+      // UNIFORM (vt_tg_max broadcasts smem[0]), so this branch never splits a
+      // barrier. No key of this chunk lies in this query's window — zero the row
+      // so the V accumulation below, which is shared across the tile, adds
+      // nothing for it rather than propagating -INFINITY.
+      if (mchunk == -INFINITY) {
+        for (int idx = int(tid); idx < jc; idx += int(p.tg)) {
+          scores[u * int(VT_PA_CHUNK) + idx] = 0.0f;
+        }
+        continue;
+      }
+      const float mold = sh_m[u];
+      const float mnew = max(mold, mchunk);
+      const float corr = mold == -INFINITY ? 0.0f : exp(mold - mnew);
+      for (uint e = tid; e < p.d; e += p.tg) { acc[u * int(VT_PA_MAXD) + int(e)] *= corr; }
+
+      // Masked keys hold -INFINITY, so exp() sends them to exactly 0.
+      for (int idx = int(tid); idx < jc; idx += int(p.tg)) {
+        scores[u * int(VT_PA_CHUNK) + idx] = exp(scores[u * int(VT_PA_CHUNK) + idx] - mnew);
+      }
+      float ps = 0.0f;
+      for (int idx = int(tid); idx < jc; idx += int(p.tg)) {
+        ps += scores[u * int(VT_PA_CHUNK) + idx];
+      }
+      // vt_tg_sum's LEADING barrier is what makes every thread's exp() above
+      // visible to the V accumulation below, which reads the WHOLE chunk.
+      const float lchunk = vt_tg_sum(smem, tid, p.tg, ps);
+      if (tid == 0u) { sh_l[u] = sh_l[u] * corr + lchunk; sh_m[u] = mnew; }
+    }
+
+    // Resolve each key's V base address ONCE for the whole threadgroup — and now
+    // for the whole tile.
+    for (int idx = int(tid); idx < jc; idx += int(p.tg)) {
+      const int j = j0 + idx;
+      const int blk = btab[r * p.bt_row + (j / int(p.block_size)) * p.bt_col];
+      const int off = j % int(p.block_size);
+      vbases[idx] = ulong(blk) * p.vc_blk + ulong(off) * p.vc_pg + ulong(g) * p.vc_hd;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Weighted V accumulation over BOTH the head dimension and the chunk's keys.
+    // Parallelising over `d` alone used only `d` threads, so at the 2*d
+    // threadgroup width half the group idled; measuring 4*d was WORSE than the
+    // baseline for exactly that reason. Each key-group walks a strided slice of
+    // the keys into its own partial, and the partials are summed once.
+    //
+    // Each V element is now loaded ONCE and applied to all `nq` queries from a
+    // register, so V device traffic drops by the same factor as K's. Adjacent
+    // threads still read adjacent elements of the same V row.
+    const uint ngrp = min(max(p.tg / p.d, 1u), VT_PA_VGROUPS);
+    const uint grp = min(tid / p.d, ngrp - 1u);
+    const uint ge = tid % p.d;
+    float s[QT];
+    for (uint u = 0u; u < QT; ++u) { s[u] = 0.0f; }
+    if (tid < ngrp * p.d) {
+      for (int idx = int(grp); idx < jc; idx += int(ngrp)) {
+        const float v = vt_load(vc, p.vc_dt, vbases[idx] + ulong(ge));
+        // Compile-time bound: keeps `s` in registers. Invalid slots hold 0.
+        for (uint u = 0u; u < QT; ++u) {
+          s[u] += scores[u * VT_PA_CHUNK + uint(idx)] * v;
+        }
+      }
+    }
+    // `pacc` is reused per query, so each round needs its own pair of barriers.
+    for (int u = 0; u < int(QT); ++u) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tid < ngrp * p.d) { pacc[grp * VT_PA_MAXD + ge] = s[u]; }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint e = tid; e < p.d; e += p.tg) {
+        float tot = 0.0f;
+        for (uint gg = 0u; gg < ngrp; ++gg) { tot += pacc[gg * VT_PA_MAXD + e]; }
+        acc[u * int(VT_PA_MAXD) + int(e)] += tot;
+      }
+    }
+    // Orders this chunk's acc/scores reads before the next chunk overwrites them.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // sh_l is written by thread 0 only.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int u = 0; u < int(QT); ++u) {
+    if (!qok[u]) { continue; }  // empty window / past tile end: leave `out` alone
+    const float inv = 1.0f / sh_l[u];  // every valid window has >= 1 key
+    const ulong qoff = (ulong(t + uint(u)) * ulong(p.hq) + ulong(h)) * ulong(p.d);
+    for (uint e = tid; e < p.d; e += p.tg) {
+      vt_store(out, p.out_dt, qoff + ulong(e), acc[u * int(VT_PA_MAXD) + int(e)] * inv);
+    }
+  }
+}
+
+
+// DECODE — the reference implementation, restored verbatim.
+//
+// It is NOT routed through vt_paged_attention_impl. Sharing one body with the
+// tiled kernel was measured three ways (runtime tile bound, compile-time bound,
+// sized threadgroup references) and every one cost decode 15-17%: the shared
+// form stages K through registers in two passes where decode wants one fused
+// pass, and carries per-query barriers decode does not need. Decode runs 128x
+// more often than prefill here, so that trade is heavily negative even though
+// the tiling makes prefill attention 20% faster.
+//
+// Any change to the online-softmax algorithm must be made in BOTH this kernel
+// and vt_paged_attention_impl below; test_ops_paged_attn covers both paths
+// because PagedAttentionKernel picks by query length.
 kernel void vt_paged_attention(device const uchar* q     [[buffer(0)]],
                                device const uchar* kc    [[buffer(1)]],
                                device const uchar* vc    [[buffer(2)]],
@@ -1065,6 +1355,34 @@ kernel void vt_paged_attention(device const uchar* q     [[buffer(0)]],
   for (uint e = tid; e < p.d; e += p.tg) {
     vt_store(out, p.out_dt, qoff + ulong(e), acc[e] * inv);
   }
+}
+
+
+// Prefill: VT_PA_QTILE query tokens of the same request per threadgroup, so each
+// K row is held in registers and each V element loaded once across the tile.
+kernel void vt_paged_attention_tiled(device const uchar* q     [[buffer(0)]],
+                                     device const uchar* kc    [[buffer(1)]],
+                                     device const uchar* vc    [[buffer(2)]],
+                                     device const int*   btab  [[buffer(3)]],
+                                     device const int*   slens [[buffer(4)]],
+                                     device const int*   qsl   [[buffer(5)]],
+                                     device uchar*       out   [[buffer(6)]],
+                                     constant VtPagedAttnParams& p [[buffer(7)]],
+                                     uint2 tgid [[threadgroup_position_in_grid]],
+                                     uint2 tid2 [[thread_position_in_threadgroup]],
+                                     uint tiisg [[thread_index_in_simdgroup]],
+                                     uint sgitg [[simdgroup_index_in_threadgroup]],
+                                     uint sgsize [[threads_per_simdgroup]]) {
+  threadgroup float smem[VT_TG_MAX];
+  threadgroup float scores[VT_PA_QTILE * VT_PA_CHUNK];
+  threadgroup ulong vbases[VT_PA_CHUNK];
+  threadgroup float pacc[VT_PA_VGROUPS * VT_PA_MAXD];
+  threadgroup float acc[VT_PA_QTILE * VT_PA_MAXD];
+  threadgroup float sh_m[VT_PA_QTILE];
+  threadgroup float sh_l[VT_PA_QTILE];
+  vt_paged_attention_impl<VT_PA_QTILE>(q, kc, vc, btab, slens, qsl, out, p, smem, scores,
+                                       vbases, pacc, acc, sh_m, sh_l, tgid, tid2.x, tiisg,
+                                       sgitg, sgsize);
 }
 
 struct VtArgmaxParams {

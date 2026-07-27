@@ -891,8 +891,16 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   // The score loop now scales with SIMDGROUP count (one simdgroup per key), so
   // a wider group buys real parallelism there even though the V accumulation is
   // still bounded by `d`. Measured experiment, not an assumption.
-  const uint32_t tg = ChooseThreadgroupSize(
-      d * 4, MetalContext::Get().PipelineMaxThreads("vt_paged_attention"));
+  // Any request with more than one query token is a PREFILL, which gets the
+  // query-tiled pipeline: it serves VT_PA_QTILE consecutive tokens from one
+  // threadgroup so each K row and V element is read once for the whole tile
+  // instead of once per token. Decode keeps the untiled pipeline — it has one
+  // token per request, so there is nothing to reuse and tiling would only cost
+  // it grid parallelism and threadgroup memory.
+  const bool tiled = tq > num_reqs;
+  const char* kname = tiled ? "vt_paged_attention_tiled" : "vt_paged_attention";
+  const uint32_t tg =
+      ChooseThreadgroupSize(d * 4, MetalContext::Get().PipelineMaxThreads(kname));
   PagedAttnParams p{
       static_cast<uint64_t>(k_cache.stride[0]), static_cast<uint64_t>(k_cache.stride[1]),
       static_cast<uint64_t>(k_cache.stride[2]), static_cast<uint64_t>(v_cache.stride[0]),
@@ -908,7 +916,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
       DtypeCode(query.dtype),                   DtypeCode(k_cache.dtype),
       DtypeCode(v_cache.dtype),                 DtypeCode(out.dtype),
       args.scale};
-  Encoder e("vt_paged_attention");
+  Encoder e(kname);
   e.BindTensor(query, 0, "paged_attention: query");
   e.BindTensor(k_cache, 1, "paged_attention: k_cache");
   e.BindTensor(v_cache, 2, "paged_attention: v_cache");
