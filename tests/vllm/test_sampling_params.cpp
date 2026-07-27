@@ -226,6 +226,38 @@ TEST_CASE("_verify_args failures throw") {
     p.detokenize = false;
     CHECK_THROWS_AS(p.Verify(), std::runtime_error);
   }
+  // ROAD-V1-C7 SAMPLE-LOGIT-FILTERS: bad_words / allowed_token_ids validation
+  // (sampling_params.py:618-623, :849-854).
+  SUBCASE("bad_words with an empty string throws") {
+    SamplingParams p;
+    p.bad_words = {"foo", ""};
+    CHECK_THROWS_AS(p.Verify(), std::runtime_error);
+  }
+  SUBCASE("bad_words all non-empty is accepted") {
+    SamplingParams p;
+    p.bad_words = {"foo", "bar"};
+    CHECK_NOTHROW(p.Verify());
+  }
+  SUBCASE("allowed_token_ids present but empty throws") {
+    SamplingParams p;
+    p.allowed_token_ids = std::vector<int32_t>{};
+    CHECK_THROWS_AS(p.Verify(), std::runtime_error);
+  }
+  SUBCASE("allowed_token_ids non-empty is accepted") {
+    SamplingParams p;
+    p.allowed_token_ids = std::vector<int32_t>{1, 5, 9};
+    CHECK_NOTHROW(p.Verify());
+  }
+}
+
+// ROAD-V1-C7 SAMPLE-LOGIT-FILTERS / SAMPLE-CORE: PostInit seeds
+// all_stop_token_ids from stop_token_ids (sampling_params.py:500) so the
+// MinTokens logits processor masks the right ids.
+TEST_CASE("PostInit seeds all_stop_token_ids from stop_token_ids") {
+  SamplingParams p;
+  p.stop_token_ids = {7, 11, 7};  // duplicate collapses in the set
+  p.PostInit();
+  CHECK(p.all_stop_token_ids == std::set<int32_t>{7, 11});
 }
 
 TEST_CASE("PostInit normalizes like __post_init__") {

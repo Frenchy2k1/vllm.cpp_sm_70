@@ -15,6 +15,28 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+**ROAD-V1-C7 sampling controls + logprobs (2026-07-27, `CLAIM-ROADMAP-C7`, NOT
+pushed).** Disposition: **CORRECTNESS gate, no throughput number
+(`benchmark_binding=false`).** A sampling transform is a pure function of
+(logits, params), so it is gated EXACTLY (not near-tie) on the CPU reference
+backend. W1-W4 wire the full control surface end to end (SamplingParams fields +
+validation, OpenAI protocol parse + logit_bias clamp to [-100, 100], InputBatch
+per-slot tracking + `build_sampling_metadata` for
+min_p/min_tokens/logit_bias/allowed_token_ids_mask/bad_words/max_num_logprobs with
+condense/swap maintenance, InputProcessor bad_words tokenization + eos stop-set).
+Gates GREEN on CPU: `test_sampling_params` 9/90, `test_openai_protocol` 28/171,
+`test_input_batch` 22/163 (RED-first: disabling `md.logit_bias = logit_bias` fails
+1 case), `test_input_processor` 8/37, `test_sampler`/`test_logits_processors`
+unchanged. Inertness: the default/greedy path builds a byte-identical
+SamplingMetadata (all filters empty, `max_num_logprobs` None), so the SACRED
+greedy gates are untouched; CPU `-Werror` 0-warn on the full `vllm` lib. No GPU
+run (transforms are device-neutral; the CUDA-Queue execution is dgx-pending like
+the rest of the sampler). RESIDUAL (not measured, not faked): the `SAMPLE-LOGPROBS`
+payload serialization end to end (LogprobsProcessor + OpenAI `CompletionLogProbs`)
+needs the engine-output plumbing + a running-engine gate. Repro:
+`cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build build-cpu -j &&
+ctest -R "test_sampling_params|test_openai_protocol|test_input_batch|test_input_processor|test_sampler|test_logits_processors"`.
+
 **Roadmap note (2026-07-20):** the first additive-model bring-up (Qwen3 dense on
 `Qwen3-0.6B`, [spike](../.agents/specs/first-additive-model-qwen3-dense.md)) is a
 CORRECTNESS deliverable - its gate is greedy vs the vLLM 0.25.0 oracle, not a perf

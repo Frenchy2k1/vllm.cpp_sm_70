@@ -14,6 +14,7 @@
 
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -449,4 +450,145 @@ TEST_CASE("num_accepted_tokens moves with the request under swap/condense") {
   const int idx_c = batch.req_id_to_index.at("c");
   CHECK(batch.num_accepted_tokens[static_cast<size_t>(idx_a)] == 2);
   CHECK(batch.num_accepted_tokens[static_cast<size_t>(idx_c)] == 3);
+}
+
+// ─── ROAD-V1-C7 SAMPLE-CORE / SAMPLE-LOGPROBS / SAMPLE-LOGIT-FILTERS wiring ───
+// The controls flow SamplingParams -> add_request per-slot state ->
+// build_sampling_metadata -> SamplingMetadata (which the Sampler consumes). These
+// gate the WIRING (the transforms themselves are gated in test_sampler.cpp).
+namespace {
+CachedRequestState make_req_sp(const std::string& req_id, vllm::SamplingParams sp) {
+  sp.PostInit();
+  CachedRequestState state;
+  state.req_id = req_id;
+  state.prompt_token_ids = {1, 2, 3};
+  state.sampling_params = sp;
+  state.block_ids = {{0}};
+  state.finalize();
+  state.num_computed_tokens = state.num_prompt_tokens;
+  return state;
+}
+}  // namespace
+
+TEST_CASE("C7 wiring: logit_bias / allowed_token_ids / bad_words / min_p / "
+          "min_tokens / logprobs reach SamplingMetadata") {
+  InputBatch batch = make_batch(/*max_num_reqs=*/8, /*max_model_len=*/64);
+
+  vllm::SamplingParams sp;
+  sp.temperature = 0.7;  // random (so top_p/min_p not zeroed by greedy path)
+  sp.min_p = 0.3;
+  sp.min_tokens = 5;
+  sp.stop_token_ids = {42};
+  sp.logit_bias = std::map<int32_t, float>{{100, 3.5f}, {7, -2.0f}};
+  sp.allowed_token_ids = std::vector<int32_t>{5, 9, 900};
+  sp.bad_words = {"foo"};
+  // Engine-side tokenization result (UpdateFromTokenizer); provide directly.
+  sp.bad_words_token_ids =
+      std::vector<std::vector<int32_t>>{{2, 3}, {11}};
+  sp.logprobs = 4;
+  const int idx = batch.add_request(make_req_sp("r0", sp));
+
+  const auto& md = batch.make_sampling_metadata();
+
+  // min_p slice populated (row idx == 0.3).
+  REQUIRE(md.min_p.size() == 1);
+  CHECK(md.min_p[static_cast<size_t>(idx)] == doctest::Approx(0.3f));
+
+  // min_tokens: MinTokensState{5, {42}} (all_stop_token_ids seeded in PostInit).
+  REQUIRE(md.min_tokens.count(idx) == 1);
+  CHECK(md.min_tokens.at(idx).min_tokens == 5);
+  CHECK(md.min_tokens.at(idx).stop_token_ids == std::set<int32_t>{42});
+
+  // logit_bias map for the request.
+  REQUIRE(md.logit_bias.count(idx) == 1);
+  CHECK(md.logit_bias.at(idx).at(100) == doctest::Approx(3.5f));
+  CHECK(md.logit_bias.at(idx).at(7) == doctest::Approx(-2.0f));
+
+  // allowed_token_ids_mask: TRUE == exclude; allowed ids are FALSE.
+  REQUIRE(md.allowed_token_ids_mask.has_value());
+  const auto& row = (*md.allowed_token_ids_mask)[static_cast<size_t>(idx)];
+  CHECK(row[5] == 0);
+  CHECK(row[9] == 0);
+  CHECK(row[900] == 0);
+  CHECK(row[6] == 1);   // not allowed -> excluded
+  CHECK(row[0] == 1);
+
+  // bad_words_token_ids passed through by req index.
+  REQUIRE(md.bad_words_token_ids.count(idx) == 1);
+  CHECK(md.bad_words_token_ids.at(idx) ==
+        std::vector<std::vector<int32_t>>{{2, 3}, {11}});
+
+  // logprobs count reaches max_num_logprobs.
+  CHECK(md.max_num_logprobs.has_value());
+  CHECK(*md.max_num_logprobs == 4);
+
+  // output_token_ids now required (min_tokens is an output-consuming proc).
+  REQUIRE(md.output_token_ids.size() == 1);
+}
+
+TEST_CASE("C7 wiring: default request keeps every filter empty (inertness)") {
+  InputBatch batch = make_batch();
+  vllm::SamplingParams sp;  // defaults: greedy (temp 1 -> random actually)
+  sp.temperature = 0.0;     // greedy
+  const int idx = batch.add_request(make_req_sp("r0", sp));
+  (void)idx;
+  const auto& md = batch.make_sampling_metadata();
+  CHECK(md.min_p.empty());
+  CHECK(md.min_tokens.empty());
+  CHECK(md.logit_bias.empty());
+  CHECK(md.bad_words_token_ids.empty());
+  CHECK_FALSE(md.allowed_token_ids_mask.has_value());
+  CHECK_FALSE(md.max_num_logprobs.has_value());
+  CHECK(batch.no_min_p());
+  CHECK(batch.no_allowed_token_ids());
+}
+
+TEST_CASE("C7 wiring: -1 logprobs sentinel dominates max_num_logprobs") {
+  InputBatch batch = make_batch();
+  vllm::SamplingParams a;
+  a.temperature = 0.0;
+  a.logprobs = 3;
+  vllm::SamplingParams b;
+  b.temperature = 0.0;
+  b.logprobs = -1;  // all
+  batch.add_request(make_req_sp("a", a));
+  batch.add_request(make_req_sp("b", b));
+  const auto& md = batch.make_sampling_metadata();
+  REQUIRE(md.max_num_logprobs.has_value());
+  CHECK(*md.max_num_logprobs == -1);
+}
+
+TEST_CASE("C7 wiring: index-keyed controls follow the row through swap/condense") {
+  InputBatch batch = make_batch();
+  vllm::SamplingParams sa;
+  sa.temperature = 0.0;
+  sa.logit_bias = std::map<int32_t, float>{{1, 9.0f}};
+  sa.allowed_token_ids = std::vector<int32_t>{1};
+  vllm::SamplingParams sb;
+  sb.temperature = 0.0;
+  vllm::SamplingParams sc;
+  sc.temperature = 0.0;
+  sc.min_tokens = 2;
+  sc.stop_token_ids = {5};
+  int s0 = batch.add_request(make_req_sp("a", sa));
+  int s1 = batch.add_request(make_req_sp("b", sb));
+  int s2 = batch.add_request(make_req_sp("c", sc));
+  (void)s1;
+
+  batch.swap_states(s0, s2);  // a's logit_bias -> slot2; c's min_tokens -> slot0
+  CHECK(batch.logit_bias.count(s2) == 1);
+  CHECK(batch.logit_bias.at(s2).at(1) == doctest::Approx(9.0f));
+  CHECK(batch.min_tokens.count(s0) == 1);
+  CHECK(batch.min_tokens.at(s0).min_tokens == 2);
+
+  batch.remove_request("b");
+  batch.condense();
+  const int ia = batch.req_id_to_index.at("a");
+  const int ic = batch.req_id_to_index.at("c");
+  CHECK(batch.logit_bias.at(ia).at(1) == doctest::Approx(9.0f));
+  CHECK(batch.min_tokens.at(ic).min_tokens == 2);
+  // The allowed-ids mask row for "a" still keeps only token 1.
+  REQUIRE_FALSE(batch.allowed_token_ids_mask.empty());
+  CHECK(batch.allowed_token_ids_mask[static_cast<size_t>(ia)][1] == 0);
+  CHECK(batch.allowed_token_ids_mask[static_cast<size_t>(ia)][0] == 1);
 }

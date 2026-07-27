@@ -5,21 +5,27 @@
 // sampling_type derivation and the _verify_args / __post_init__ semantics are
 // mirrored 1:1 with upstream; only Python-specific concerns are dropped.
 //
+// WIRED (ROAD-V1-C7, `SAMPLE-LOGIT-FILTERS`): logit_bias, allowed_token_ids,
+// bad_words + bad_words_token_ids (upstream `_bad_words_token_ids`) and the
+// all_stop_token_ids set (upstream `_all_stop_token_ids`) are now ported below —
+// they feed the already-implemented sampler logits processors via the
+// InputBatch::build_sampling_metadata wiring. logit_bias clamp to [-100, 100] is
+// applied at the request-construction boundary (from_optional's role, ported in
+// entrypoints/openai/protocol.cpp), mirroring sampling_params.py:388-413.
+//
 // DEFERRED (T1/T2) upstream fields, intentionally omitted here — a future
 // porter slots them in without reshaping the struct:
-//   - logit_bias,
-//     allowed_token_ids, bad_words / _bad_words_token_ids, extra_args
+//   - extra_args
 //   (structured_outputs (StructuredOutputsParams) is now ported below — M3.4)
 //   - logprob_token_ids, flat_logprobs, num_logprobs()
 //   - thinking_token_budget, repetition_detection (RepetitionDetectionParams),
 //     routed_experts_prompt_start, skip_reading_prefix_cache
 //   - skip_clone / clone(), for_sampler_warmup()
-//   - internal post-init state: output_text_buffer_length,
-//     _all_stop_token_ids (the detokenizer computes its own stop buffer len)
-//   - engine-time helpers: from_optional(), update_from_generation_config(),
-//     update_from_tokenizer(), verify(model_config, ...) and its
+//   - internal post-init state: output_text_buffer_length
+//   - engine-time helpers: from_optional(), verify(model_config, ...) and its
 //     _validate_* family, the eos_token_id / all_stop_token_ids /
-//     bad_words_token_ids properties
+//     bad_words_token_ids properties (update_from_generation_config /
+//     update_from_tokenizer are ported on InputProcessor, M1.8)
 //   - BeamSearchParams (separate struct)
 //
 // DEVIATIONS, recorded:
@@ -32,7 +38,9 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -161,6 +169,37 @@ struct SamplingParams {
   // structured-output / guided-decoding constraint, or unset. PostInit()
   // validates it (mutual exclusion) when present.
   std::optional<StructuredOutputsParams> structured_outputs;
+
+  // logit_bias (sampling_params.py:318): token_id -> additive bias. When set,
+  // the sampler adds the bias to each listed token's logit. Callers building
+  // from an OpenAI request MUST have already converted string keys to int and
+  // clamped each bias to [-100, 100] (sampling_params.py:388-413 / from_optional).
+  std::optional<std::map<int32_t, float>> logit_bias;
+
+  // allowed_token_ids (sampling_params.py:321): if set, only these token ids
+  // keep their logits (all others are masked to -inf). Upstream requires a
+  // non-empty list of in-range ids (validated in verify(), model-config-aware —
+  // the vocab-range check is engine-time and stays deferred; the empty-list
+  // check is enforced in Verify()).
+  std::optional<std::vector<int32_t>> allowed_token_ids;
+
+  // bad_words (sampling_params.py:337): words never to generate (only the final
+  // token of a matching token sequence is blocked). Always list-form (upstream
+  // __post_init__ normalizes None -> []). Tokenized engine-side into
+  // bad_words_token_ids by InputProcessor::UpdateFromTokenizer
+  // (update_from_tokenizer, sampling_params.py:659).
+  std::vector<std::string> bad_words;
+  // _bad_words_token_ids (sampling_params.py:341): the per-word token-id n-grams
+  // update_from_tokenizer produces; unset until the tokenizer pass runs. The
+  // sampler's apply_bad_words consumes these.
+  std::optional<std::vector<std::vector<int32_t>>> bad_words_token_ids;
+
+  // _all_stop_token_ids (sampling_params.py:313): the union of stop_token_ids
+  // and (engine-time) the eos id(s), used by the MinTokens logits processor to
+  // know which tokens to mask while output_len < min_tokens. PostInit() seeds it
+  // from stop_token_ids (sampling_params.py:500); the engine adds eos ids via
+  // InputProcessor::UpdateFromGenerationConfig.
+  std::set<int32_t> all_stop_token_ids;
 
   // The model's EOS token id. Upstream: `_eos_token_id` — a non-init field set
   // engine-side by update_from_generation_config, exposed via the read-only

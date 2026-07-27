@@ -192,6 +192,12 @@ class InputBatch {
            frequency_penalties_reqs.empty() &&
            repetition_penalties_reqs.empty();
   }
+  // ROAD-V1-C7 predicates (gpu_input_batch.py no_allowed_token_ids / min-p).
+  bool no_min_p() const { return min_p_reqs.empty(); }
+  bool no_allowed_token_ids() const { return has_allowed_token_ids.empty(); }
+  // max_num_logprobs (gpu_input_batch.py:1150-1151): max requested count, or
+  // unset when no request asked for logprobs. Our -1 ("all") sentinel dominates.
+  std::optional<int> max_num_logprobs() const;
 
   // Convenience token-id read (flat row-major token_ids_cpu; row stride is
   // max_model_len). Mirrors the numpy token_ids_cpu[req, col] access.
@@ -246,6 +252,27 @@ class InputBatch {
   std::vector<float> presence_penalties_cpu;
   std::vector<float> repetition_penalties_cpu;
 
+  // ─── ROAD-V1-C7 SAMPLE-CORE / SAMPLE-LOGIT-FILTERS per-slot controls ───────
+  // min_p (MinPLogitsProcessor); [max_num_reqs], 0 disables the row. Moved with
+  // the row on condense/swap like the penalty arrays.
+  std::vector<float> min_p_cpu;
+  // req_index -> MinTokensState (min_tokens floor + all_stop_token_ids to mask
+  // while output_len < min_tokens; gpu_input_batch.py MinTokensLogitsProcessor).
+  std::map<int, MinTokensState> min_tokens;
+  // req_index -> (token_id -> additive bias) (LogitBiasLogitsProcessor).
+  std::map<int, std::map<int32_t, float>> logit_bias;
+  // req_id -> requested sample-logprob count (gpu_input_batch.py:435-440); the
+  // -1 "all" sentinel is preserved (our Sampler consumes it directly, whereas
+  // upstream stores vocab_size — recorded deviation).
+  std::map<std::string, int> num_logprobs;
+  // Lazily-allocated [max_num_reqs][vocab_size] EXCLUDE mask (TRUE == mask this
+  // token to -inf). Empty until the first request with allowed_token_ids; a row
+  // is all-TRUE then the allowed ids are cleared to FALSE (gpu_input_batch.py
+  // :446-467). apply_allowed_token_ids reads TRUE == exclude.
+  std::vector<std::vector<uint8_t>> allowed_token_ids_mask;
+  // req_index -> bad-words token-id n-grams (gpu_input_batch.py:469-471).
+  std::map<int, std::vector<std::vector<int32_t>>> bad_words_token_ids;
+
   // Membership sets driving the sampling predicates (upstream *_reqs sets).
   std::unordered_map<std::string, char> greedy_reqs;
   std::unordered_map<std::string, char> random_reqs;
@@ -254,6 +281,9 @@ class InputBatch {
   std::unordered_map<std::string, char> frequency_penalties_reqs;
   std::unordered_map<std::string, char> presence_penalties_reqs;
   std::unordered_map<std::string, char> repetition_penalties_reqs;
+  // ROAD-V1-C7 predicate sets (keyed by req_id, so reindexing is a no-op).
+  std::unordered_map<std::string, char> min_p_reqs;
+  std::unordered_map<std::string, char> has_allowed_token_ids;
 
   // Per-slot output token ids (nullopt on a freed slot). Consumed by the M1.7
   // sampler for penalties; mirrors upstream req_output_token_ids.

@@ -196,3 +196,56 @@ TEST_CASE("process_inputs wires eos/stop token ids") {
     CHECK(req.sampling_params.stop_token_ids == expected);
   }
 }
+
+// ─── ROAD-V1-C7 SAMPLE-LOGIT-FILTERS: bad_words + all_stop_token_ids wiring ───
+TEST_CASE("process_inputs tokenizes bad_words into bad_words_token_ids") {
+  const Tokenizer& tok = GoldenTokenizer();
+  HfConfig cfg = MakeConfig(4096, json(nullptr));
+  InputProcessor proc(tok, cfg);
+
+  SamplingParams params;
+  params.bad_words = {"hello"};
+  EngineCoreRequest req = proc.process_inputs("r", "hi", params);
+
+  // update_from_tokenizer produces the per-word n-grams (sampling_params.py:659).
+  REQUIRE(req.sampling_params.bad_words_token_ids.has_value());
+  const auto& bwti = *req.sampling_params.bad_words_token_ids;
+  REQUIRE_FALSE(bwti.empty());
+  // The no-prefix variant is the encode of the lstripped word.
+  CHECK(bwti[0] == tok.Encode("hello"));
+  // Every produced id is in range.
+  const int32_t max_id = tok.VocabSize() - 1;
+  for (const auto& ngram : bwti) {
+    for (int32_t id : ngram) {
+      CHECK(id >= 0);
+      CHECK(id <= max_id);
+    }
+  }
+}
+
+TEST_CASE("process_inputs seeds all_stop_token_ids (stop_token_ids + eos)") {
+  const Tokenizer& tok = GoldenTokenizer();
+  // A primary eos id via the tokenizer fallback is used when config eos is null;
+  // pass an explicit eos list to make the assertion deterministic.
+  HfConfig cfg = MakeConfig(4096, json({1000, 1001}));
+  InputProcessor proc(tok, cfg);
+
+  SamplingParams params;
+  params.stop_token_ids = {55};
+  EngineCoreRequest req = proc.process_inputs("r", "hi", params);
+
+  // all_stop_token_ids = stop_token_ids (PostInit) + eos ids (generation config).
+  const auto& all = req.sampling_params.all_stop_token_ids;
+  CHECK(all.count(55) == 1);
+  CHECK(all.count(1000) == 1);
+  CHECK(all.count(1001) == 1);
+}
+
+TEST_CASE("process_inputs: empty bad_words leaves bad_words_token_ids unset") {
+  const Tokenizer& tok = GoldenTokenizer();
+  HfConfig cfg = MakeConfig(4096, json(nullptr));
+  InputProcessor proc(tok, cfg);
+  SamplingParams params;  // no bad_words
+  EngineCoreRequest req = proc.process_inputs("r", "hi", params);
+  CHECK_FALSE(req.sampling_params.bad_words_token_ids.has_value());
+}

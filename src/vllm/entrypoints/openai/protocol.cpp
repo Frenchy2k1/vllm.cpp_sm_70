@@ -4,6 +4,8 @@
 
 #include "vllm/entrypoints/openai/protocol.h"
 
+#include <algorithm>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -48,6 +50,63 @@ std::vector<std::string> ParseStop(const nlohmann::json& j) {
   if (it->is_string()) return {it->get<std::string>()};
   if (it->is_array()) return it->get<std::vector<std::string>>();
   return {};
+}
+
+// ROAD-V1-C7 SAMPLE-LOGIT-FILTERS: parse the shared logit_bias /
+// allowed_token_ids / bad_words request fields (completion/protocol.py:58,93,108;
+// chat_completion/protocol.py:202,282,283). `logit_bias` keeps its OpenAI string
+// keys here; to_sampling_params converts + clamps (from_optional:388-413).
+void ParseLogitFilters(const nlohmann::json& j,
+                       std::optional<std::map<std::string, double>>& logit_bias,
+                       std::optional<std::vector<int32_t>>& allowed_token_ids,
+                       std::vector<std::string>& bad_words) {
+  if (auto it = j.find("logit_bias"); it != j.end() && it->is_object()) {
+    std::map<std::string, double> lb;
+    for (auto e = it->begin(); e != it->end(); ++e) {
+      lb[e.key()] = e.value().get<double>();
+    }
+    logit_bias = std::move(lb);
+  }
+  if (auto it = j.find("allowed_token_ids");
+      it != j.end() && it->is_array()) {
+    allowed_token_ids = it->get<std::vector<int32_t>>();
+  }
+  if (auto it = j.find("bad_words"); it != j.end() && it->is_array()) {
+    bad_words = it->get<std::vector<std::string>>();
+  }
+}
+
+// ROAD-V1-C7 SAMPLE-LOGIT-FILTERS: from_optional's logit_bias conversion +
+// clamp (sampling_params.py:388-413) plus the allowed_token_ids / bad_words
+// carry. String keys are parsed to int token ids; each bias is clamped to
+// [-100, 100]. A key that does not parse to an integer throws (VLLMValidationError
+// upstream -> std::runtime_error here, surfaced as a 400).
+void ApplyLogitFilters(
+    SamplingParams& sp,
+    const std::optional<std::map<std::string, double>>& logit_bias,
+    const std::optional<std::vector<int32_t>>& allowed_token_ids,
+    const std::vector<std::string>& bad_words) {
+  if (logit_bias.has_value()) {
+    std::map<int32_t, float> converted;
+    for (const auto& [token, bias] : *logit_bias) {
+      int32_t token_id = 0;
+      try {
+        size_t consumed = 0;
+        token_id = static_cast<int32_t>(std::stol(token, &consumed));
+        if (consumed != token.size()) throw std::invalid_argument("trailing");
+      } catch (const std::exception&) {
+        throw std::runtime_error(
+            "logit_bias contains key(s) that cannot be converted to integer "
+            "token IDs: ['" +
+            token + "']");
+      }
+      converted[token_id] =
+          static_cast<float>(std::min(100.0, std::max(-100.0, bias)));
+    }
+    sp.logit_bias = std::move(converted);
+  }
+  sp.allowed_token_ids = allowed_token_ids;
+  sp.bad_words = bad_words;
 }
 
 // Serialize an optional string as either its value or JSON null.
@@ -230,6 +289,7 @@ void from_json(const nlohmann::json& j, CompletionRequest& r) {
   GetOr(j, "skip_special_tokens", r.skip_special_tokens);
   GetOr(j, "spaces_between_special_tokens", r.spaces_between_special_tokens);
   GetOr(j, "priority", r.priority);
+  ParseLogitFilters(j, r.logit_bias, r.allowed_token_ids, r.bad_words);
   ParseResponseFormat(j, r.response_format);
 }
 
@@ -318,6 +378,7 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   if (auto it = j.find("tools"); it != j.end() && it->is_array()) {
     r.tools = it->get<std::vector<ChatCompletionToolsParam>>();
   }
+  ParseLogitFilters(j, r.logit_bias, r.allowed_token_ids, r.bad_words);
   ParseToolChoice(j, r.tool_choice);
   // DEFERRED: parallel_tool_calls, legacy functions / function_call — parsed and
   // ignored (nlohmann skips unknown keys; no field mapped here at T0).
@@ -355,6 +416,8 @@ SamplingParams CompletionRequest::to_sampling_params(
   sp.include_stop_str_in_output = include_stop_str_in_output;
   sp.output_kind =
       stream ? RequestOutputKind::kDelta : RequestOutputKind::kFinalOnly;
+  // logit_bias / allowed_token_ids / bad_words (completion/protocol.py:369-371).
+  ApplyLogitFilters(sp, logit_bias, allowed_token_ids, bad_words);
   // response_format -> structured_outputs (completion/protocol.py:309-338).
   ApplyResponseFormat(response_format, sp);
   sp.PostInit();
@@ -392,6 +455,8 @@ SamplingParams ChatCompletionRequest::to_sampling_params(
   sp.include_stop_str_in_output = include_stop_str_in_output;
   sp.output_kind =
       stream ? RequestOutputKind::kDelta : RequestOutputKind::kFinalOnly;
+  // logit_bias / allowed_token_ids / bad_words (chat_completion/protocol.py:694-697).
+  ApplyLogitFilters(sp, logit_bias, allowed_token_ids, bad_words);
   // response_format -> structured_outputs (chat_completion/protocol.py:629-658).
   ApplyResponseFormat(response_format, sp);
   sp.PostInit();
