@@ -1,0 +1,296 @@
+# Metal dispatch attribution — the Metal backend is SUBMIT bound, not kernel bound
+
+**Rows this spec owns:** `BACKEND-METAL-MLX` (work row `M3c`, batched encoders)
+and `BACKEND-GATE-METAL-MLXLM` (the MLX-LM competitor floor). It also supplies
+the missing evidence base for both: an execution trace on Apple, which the
+project did not previously have.
+
+Measured 2026-07-27 on the M4 (Apple M4, 16 GiB unified, macOS 26.5.2), commit
+`41d7f8d7`, Qwen3-1.7B-bf16 p=512 g=128 b=1, every run under the `${GPU_LOCK}`
+exclusion.
+
+---
+
+## 0. Executive answer
+
+1. **The binding constraint is the DISPATCH MODEL, not kernel quality.** The
+   Metal backend opens one command buffer per op and does `commit` +
+   `waitUntilCompleted` (`metal_ops.mm` `Encoder::Finish`). That round trip
+   measures **~186 us** on this box, and a 128-token generation pays it
+   **50,944 times**.
+2. **That alone caps us BELOW the competitor floor.** ~395 dispatches per decode
+   token x 186 us = **~73 ms/token of pure round trip = a ~13.6 tok/s ceiling
+   with infinitely fast kernels**. MLX-LM measures **27.9 tok/s** on the same box
+   and model. **No amount of kernel work can reach the floor while the dispatch
+   model stands.** This is the first hard, arithmetic statement the Metal track
+   has about its own ceiling.
+3. **The recorded lever ranking was wrong and is corrected here.** The M3b
+   narrative named "`M3c` (batched encoders) and a simdgroup GEMM" as co-equal
+   next levers. They are not: `M3c` is the **unlock**, and the GEMM lever
+   **cannot be cashed until `M3c` lands**, because the GEMM's own ceiling sits
+   above the dispatch ceiling.
+4. **The small elementwise kernels are ~96% pure overhead.** `vt_rms_norm`,
+   `vt_silu_and_mul`, `vt_reshape_and_cache` and `vt_rope_from_cache` together
+   spend **4.69 s of wall for 0.19 s of GPU work** in a 34.47 s run. They are
+   13.6% of total runtime and 0.8% of the GPU's actual work.
+5. **No op is silently running on the CPU.** `GetReferenceTierHits()` is **0** in
+   both arms, so the S5 portable tier is not involved and cannot be blamed. That
+   hypothesis is closed, not left open.
+
+---
+
+## 1. Method, and why it is in-process
+
+AGENTS.md § "TRACE THE EXECUTION, not just the code" requires an execution trace
+before any throughput claim: reading dispatch code says what COULD run, not what
+DID. On CUDA that instrument is `nsys`. On Apple it is Instruments' Metal System
+Trace, **which requires a full Xcode**. The M4 has Command Line Tools only
+(`xcrun -f xctrace` -> "not a developer tool"; no `/Applications/Xcode.app`), so
+no external profiler can run there at all.
+
+So the trace is collected in-process, by `VT_METAL_PROFILE`
+([include/vt/metal_profile.h](../../include/vt/metal_profile.h), implemented in
+[metal_ops.mm](../../src/vt/metal/metal_ops.mm)). Per dispatch it separates:
+
+| phase | definition | what it isolates |
+|---|---|---|
+| `encode_s` | `Encoder` ctor to start of `commit` | HOST work: pipeline lookup, argument binds |
+| `wait_s` | wall time inside `commit` + `waitUntilCompleted` | the full submit/sync round trip |
+| `gpu_s` | `MTLCommandBuffer.GPUEndTime - GPUStartTime` | the interval the GPU actually executed |
+
+`gpu_s / wait_s` is the decision number. Near 1.0 = genuinely compute bound, so
+kernels are the lever. Far below = submit bound, and kernel tuning cannot reach
+the difference.
+
+**Both arms come from ONE binary**, the arms selected by
+`VT_OP_PROVIDER_DISABLE=mlx`, which is the same-binary A/B the benchmark
+protocol demands.
+
+---
+
+## 2. Measured — native MSL arm (fully attributed)
+
+34.47 s duration, 3.71 tok/s aggregate output.
+
+| | value | note |
+|---|--:|---|
+| dispatches | 50,944 | one command buffer each |
+| host encode | 0.213 s | 0.6% of the run: host binding is NOT the problem |
+| submit + wait wall | 33.882 s | **98.3% of total runtime** |
+| real GPU busy | 22.566 s | **66.6% of that wall** |
+| round-trip overhead | **11.316 s** | 32.8% of the entire run |
+
+| kernel | count | encode ms | wait ms | gpu ms | gpu/wait |
+|---|--:|--:|--:|--:|--:|
+| `vt_matmul` | 21,632 | 70.6 | 26,513.9 | 20,751.2 | 78.3% |
+| `vt_rms_norm` | 14,464 | 78.4 | 2,803.3 | 116.4 | **4.2%** |
+| `vt_paged_attention` | 3,584 | 8.4 | 2,379.7 | 1,619.1 | 68.0% |
+| `vt_reshape_and_cache` | 3,584 | 8.5 | 725.6 | 27.2 | **3.7%** |
+| `vt_silu_and_mul` | 3,584 | 34.8 | 718.3 | 20.7 | **2.9%** |
+| `vt_rope_from_cache` | 3,584 | 8.5 | 632.7 | 25.1 | **4.0%** |
+| `vt_greedy_argmax` | 128 | 1.4 | 35.2 | 4.7 | 13.4% |
+| `vt_embedding` | 128 | 1.8 | 27.7 | 0.7 | 2.4% |
+| `vt_cast` | 128 | 0.3 | 23.1 | 0.7 | 3.2% |
+| `vt_rope_cos_sin_cache` | 128 | 0.4 | 22.5 | 0.7 | 2.9% |
+
+**The round-trip constant, four independent estimates.** A kernel that does
+almost no GPU work measures the fixed cost directly, as `(wait - gpu) / count`:
+`vt_rms_norm` **186 us**, `vt_silu_and_mul` **195 us**, `vt_reshape_and_cache`
+**195 us**, `vt_rope_from_cache` **170 us**. They agree, which is what makes this
+a constant of the dispatch model rather than a property of any one kernel.
+
+---
+
+## 3. Measured — MLX provider arm (partially attributed, stated as such)
+
+20.55 s duration, 6.23 tok/s. 36,480 dispatches through our `Encoder`, wait
+10.472 s, GPU busy 3.554 s, ratio **33.9%**.
+
+**This arm is NOT fully attributed and must never be quoted as if it were.**
+MLX-served GEMMs never enter our `Encoder`, so they are invisible to this
+instrument: `vt_matmul` falls from 21,632 to 7,168 (MLX absorbed exactly 14,464,
+the `kMatmulBT` weight GEMMs), and **10.08 s of the 20.55 s is unaccounted** —
+MLX's own dispatch plus its compute. Closing that needs the provider seam
+instrumented too (row `M3c-4` below).
+
+What the arm DOES establish: replacing the GEMM cut runtime 34.47 s -> 20.55 s,
+and the *remaining* per-op traffic still costs 6.92 s of non-GPU time on our side
+alone. Study §5.3 predicted exactly this as the "sync tax": one command-buffer
+commit+wait per delegated op unless we share a command buffer with MLX's stream.
+It is now measured, not predicted.
+
+---
+
+## 4. The ceiling arithmetic (the load-bearing claim)
+
+Decode dispatches per token: `(50,944 - ~396 prefill) / 128` = **~395**.
+
+| assumption | per-token round trip | implied ceiling |
+|---|--:|--:|
+| 186 us (small-kernel constant) | 73.5 ms | **13.6 tok/s** |
+| 222 us (measured mean, 11.316 s / 50,944) | 87.7 ms | **11.4 tok/s** |
+
+MLX-LM on the same box and model: **27.9 tok/s** (b=1, re-measured 2026-07-27).
+
+**So the dispatch model alone puts the competitor floor out of reach by ~2x,
+before a single kernel is considered.** This is why `M3c` is not one lever among
+several; it is the precondition for every other Metal performance lever having
+anywhere to land.
+
+---
+
+## 5. What MLX does differently
+
+MLX's lazy graph terminates in an eager per-op encode layer (study §5.1,
+`mlx/backend/metal/eval.cpp:32-48`), but the **eval boundary**, not the op
+boundary, is where it commits. One `eval()` encodes many ops into a command
+buffer and commits once. It therefore pays the ~186 us round trip a handful of
+times per token where we pay it ~395 times. Its `steel` simdgroup-matrix GEMM is
+a real second advantage, and our MLX-provider arm already cashes part of it, but
+the structural difference is the submission granularity.
+
+---
+
+## 6. Structured spike contract
+
+### Scope
+
+One question: **where does the Metal backend's wall-clock time actually go, and
+therefore which lever can move it.** In scope: per-dispatch time attribution
+(host encode vs submit/wait vs real GPU busy), the resulting ranking of the
+Metal performance levers, and the permanent instrument that produces it. Out of
+scope: implementing any lever. This spike does not change a kernel, does not
+change dispatch behaviour, and claims no speedup. It changes what the next
+change should be.
+
+### Upstream chain
+
+vLLM is an orchestration layer and its kernels live downstream, so the chain
+that matters here is the Apple one, not the CUDA one. `MTLCommandQueue` ->
+`MTLCommandBuffer` -> `MTLComputeCommandEncoder` (Metal framework), with
+`GPUStartTime`/`GPUEndTime` as the only runtime-exposed GPU-side timestamps
+available without Instruments. The competitor's chain is MLX
+(`mlx/backend/metal/eval.cpp:32-48`, study §5.1): a lazy graph whose commit
+boundary is `eval()`, over `steel` simdgroup-matrix GEMM kernels. There is no
+vLLM-side upstream to mirror for this row: vLLM has no Metal backend, so the
+"mirror vLLM" directive has nothing to bind here, and that absence is recorded
+deliberately rather than left implicit.
+
+### Our baseline
+
+`metal_ops.mm` `Encoder`: one `MTLCommandBuffer` plus one
+`MTLComputeCommandEncoder` per op, `Finish()` doing `endEncoding` + `commit` +
+`waitUntilCompleted`, i.e. fully synchronous at op granularity.
+`SupportsGraphCapture()` is false (`MTLIndirectCommandBuffer` unimplemented). 18
+of 75 ops native, the rest served by the S5 portable CPU tier. Measured
+consequence: **50,944 dispatches, 33.882 s of submit+wait, 22.566 s of GPU busy,
+~186 us fixed round trip** on Qwen3-1.7B-bf16 p=512 g=128 b=1.
+
+### Port map
+
+Nothing is ported. The one file changed for the instrument is
+[metal_ops.mm](../../src/vt/metal/metal_ops.mm) (the `Encoder` records three
+timestamps), plus the new public surface
+[include/vt/metal_profile.h](../../include/vt/metal_profile.h). The files the
+FOLLOW-UP rows will touch, named now so the work breakdown is grounded:
+`metal_ops.mm` (`Encoder` lifetime, `M3c-1`/`M3c-2`), `metal_msl.h` +
+`metal_ops.mm` (`kFusedChain` coverage for the elementwise chain, `M3c-3`),
+`metal_mlx_provider.mm` (provider-side attribution and command-buffer sharing,
+`M3c-4`/`M5b`), `metal_msl.h` (simdgroup GEMM, `M3d`).
+
+### Tests to port
+
+**None, and that is a decision rather than an omission.** vLLM has no Metal
+backend and no dispatch-attribution facility, so its `tests/` tree contains no
+module this could re-express; the test-porting directive has nothing to carry.
+What this change does add is our own gate:
+[test_metal_backend.cpp](../../tests/vt/test_metal_backend.cpp) "Metal dispatch
+profile attributes host encode, wait and GPU busy" — asserts the facility
+records nothing while disabled, exactly one row per dispatch while enabled, that
+the named kernel row appears, and the `gpu_s <= wait_s` invariant the entire
+attribution rests on. The follow-up rows inherit the existing M3b oracle gate
+unchanged.
+
+### Gates
+
+- **Correctness, a precondition never traded off.** Every follow-up row re-runs
+  the M3b device-appropriate oracle gate (16/16: hard anchor REQUIRE plus the
+  <= 0.5 nat near-tie band). Batching or reordering that changes tokens is a bug,
+  not a win, and is reverted rather than re-baselined.
+- **Performance.** `BACKEND-GATE-METAL-MLXLM` binds ours >= MLX-LM on every axis
+  (throughput, req/s, TTFT, TPOT/ITL, peak memory). This spike does NOT move that
+  row; it establishes why it cannot pass yet and what must land first.
+- **Attribution completeness.** A future perf claim on the MLX arm is not
+  admissible until `M3c-4` closes the 10.08 s blind spot (§3).
+- **Reproduction is a gate.** §7 recipe, re-run >= 2 times, same-binary A/B,
+  whole series under one `${GPU_LOCK}` exclusion.
+
+### Dependencies
+
+- **Hardware:** the M4 is the only Apple box available; it has Command Line
+  Tools only, so Instruments/`xctrace` is unavailable and this in-process
+  instrument is the sole trace source. No other Apple silicon is claimed.
+- **Blocking order:** `M3d` (simdgroup GEMM) DEPENDS on `M3c-1`+`M3c-2`; its win
+  is unobservable end to end while dispatch dominates. `M5b` depends on `M3c-4`
+  for the evidence to judge it.
+- **Quiet-box dependency:** a BINDING number additionally needs
+  `com.localai.worker` booted out and the aerial wallpaper disabled, both of
+  which need interactive sudo the agent does not have (commands in
+  [environment.md](../environment.md)).
+- **No new build dependency.** The instrument uses only Metal and the C++
+  standard library; it does not require the MLX provider to be built.
+
+### Work breakdown
+
+| row | work | why ranked here |
+|---|---|---|
+| `M3c-1` | Batch dispatches into one command buffer per forward segment: keep one encoder open, encode many ops, commit at a synchronisation point | Attacks the measured 11.3 s (33% of runtime). Highest gain/effort by a wide margin |
+| `M3c-2` | Remove the per-op `waitUntilCompleted`; synchronise only where a host read or cross-queue dependency demands it | The other half of the same cost; `M3c-1` alone still serialises |
+| `M3c-3` | Route the tiny elementwise chain (rms_norm, silu, rope, reshape_and_cache) through the existing `kFusedChain` Tier-1 interpreter on Metal | Cuts dispatch COUNT at source: those four are 25,216 of 50,944 dispatches for 0.8% of GPU work |
+| `M3c-4` | Instrument the MLX provider path so the MLX arm is fully attributed | Removes the 10.08 s blind spot; a gate cannot bind on a partially attributed arm |
+| `M3d` | Simdgroup-matrix GEMM replacing the threadgroup tile loop | Real (20.75 s GPU, 78.3% efficient) but BLOCKED behind `M3c` |
+| `M5b` | Share a command buffer with MLX's stream instead of committing per delegated op | The measured form of study §5.3's sync tax |
+
+### Risks/decisions
+
+- **Batching changes failure semantics (accepted, mitigated).** Today a failed
+  command buffer is attributed to exactly one op by construction, and
+  `VT_CHECK([cmd_ error] == nil, ...)` names it. Batched, an error covers a span.
+  `M3c-1` must keep a debug mode that reverts to one-op-per-buffer.
+- **The ~186 us is THIS box** (M4, CLT-only). Not claimed for other Apple
+  silicon, and any other machine re-measures before citing it.
+- **The MLX arm must not be read as fully attributed** (§3). Recorded here
+  because the number is quotable-looking and would be wrong to quote.
+- **Decision: the instrument ships permanently rather than as a throwaway
+  patch.** There is no external profiler on this platform, so deleting it would
+  delete the only evidence base for every future Metal perf claim. Cost when off
+  is one relaxed atomic load per dispatch, beside an operation that already
+  blocks on the GPU.
+- **Decision: no lever was implemented in this change.** Measuring and fixing in
+  one commit would have made the attribution unauditable against a moving tree.
+
+## 7. Repro
+
+```sh
+# M4, under the GPU lock; one binary, both arms.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_METAL=ON \
+  -DVLLM_CPP_MLX=ON -DMLX_ROOT=$HOME/mlx-venv/lib/python3.9/site-packages/mlx
+cmake --build build -j10 --target vllm-bench
+M=$HOME/hf-cache/hub/models--mlx-community--Qwen3-1.7B-bf16/snapshots/9cd6692855d3e06772228e9a962b2606359b2d24
+# native arm (fully attributed)
+/usr/bin/lockf -k /tmp/gpu env VT_METAL_PROFILE=1 VT_OP_PROVIDER_DISABLE=mlx \
+  ./build/examples/vllm-bench --model $M --num-prompts 1 --input-len 512 \
+  --output-len 128 --concurrency 1
+# MLX arm (partially attributed, see section 3)
+/usr/bin/lockf -k /tmp/gpu env VT_METAL_PROFILE=1 \
+  ./build/examples/vllm-bench --model $M --num-prompts 1 --input-len 512 \
+  --output-len 128 --concurrency 1
+```
+
+Isolation achieved: the three `actions.runner` LaunchAgents were verified
+job-idle, booted out and restored; the whole series held `/usr/bin/lockf -k
+/tmp/gpu`. Not achieved: `com.localai.worker` and the aerial wallpaper stayed up
+(no passwordless sudo), so these remain **INDICATIVE, not binding**, exactly like
+every prior M4 number. The RATIOS this spec turns on (gpu/wait per kernel) are
+far more robust to that contention than absolute throughput is, since both terms
+are measured inside the same dispatch.

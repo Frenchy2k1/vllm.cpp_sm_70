@@ -2434,6 +2434,58 @@ in that evidence document before publishing these values as binding for the
 development branch.
 This 4B diagnostic does not establish 27B/35B support.
 
+## Metal dispatch attribution on Apple M4 (2026-07-27) - the backend is SUBMIT bound
+
+**This is the section that explains every other Metal number below it.** Full
+method, per-kernel table and work breakdown:
+[metal-dispatch-attribution.md](../.agents/specs/metal-dispatch-attribution.md).
+
+Instruments' Metal System Trace needs a full Xcode and the M4 has Command Line
+Tools only, so this backend had **no execution trace at all** and every prior
+Metal perf statement rested on reading the dispatch code. `VT_METAL_PROFILE`
+([include/vt/metal_profile.h](../include/vt/metal_profile.h)) supplies one from
+inside the process, splitting each dispatch into host encode, submit+wait wall,
+and real GPU busy (`MTLCommandBuffer.GPUEndTime - GPUStartTime`).
+
+Native MSL arm, Qwen3-1.7B-bf16 p=512 g=128 b=1, 34.47 s, 3.71 tok/s:
+
+| | value |
+|---|--:|
+| dispatches (one command buffer each) | 50,944 |
+| host encode | 0.213 s (0.6% of run) |
+| submit + wait wall | 33.882 s (**98.3% of run**) |
+| real GPU busy | 22.566 s (**66.6% of that wall**) |
+| pure round-trip overhead | **11.316 s (33% of run)** |
+
+| kernel | count | wait ms | gpu ms | gpu/wait |
+|---|--:|--:|--:|--:|
+| `vt_matmul` | 21,632 | 26,513.9 | 20,751.2 | 78.3% |
+| `vt_rms_norm` | 14,464 | 2,803.3 | 116.4 | **4.2%** |
+| `vt_paged_attention` | 3,584 | 2,379.7 | 1,619.1 | 68.0% |
+| `vt_reshape_and_cache` | 3,584 | 725.6 | 27.2 | **3.7%** |
+| `vt_silu_and_mul` | 3,584 | 718.3 | 20.7 | **2.9%** |
+| `vt_rope_from_cache` | 3,584 | 632.7 | 25.1 | **4.0%** |
+
+**Findings.** The round-trip constant is **~186 us**, agreed independently by
+four near-zero-work kernels as `(wait - gpu) / count` (186 / 195 / 195 / 170 us),
+so it is a property of the dispatch model rather than of any kernel. Those four
+kernels are **25,216 of 50,944 dispatches** and burn **4.69 s of wall for 0.19 s
+of GPU work**. At **~395 dispatches per decode token** that is ~73 ms/token of
+pure round trip, a **~13.6 tok/s ceiling with infinitely fast kernels**, against
+mlx_lm's measured **27.9 tok/s**. **The competitor floor is therefore
+unreachable by kernel work alone**, which promotes `M3c` (batched encoders) from
+"one of two levers" to the precondition for all Metal perf work.
+`GetReferenceTierHits()` is **0**, so no op is silently on the CPU tier.
+
+**Not fully attributed:** the MLX-provider arm, because MLX-served GEMMs bypass
+our `Encoder` (10.08 s of its 20.55 s unaccounted). Row `M3c-4`.
+
+**Status: INDICATIVE, NOT BINDING** (worker daemon and aerial wallpaper up), but
+the gpu/wait ratios are far more contention-robust than absolute throughput,
+both terms being measured inside the same dispatch. Repro in the spec §10.
+
+---
+
 ## MLX GEMM provider A/B on Apple M4 - Qwen3-1.7B (2026-07-27, M5) - INDICATIVE / partially quieted
 
 **The first measurement of what the optional MLX provider is WORTH, and the
@@ -2484,10 +2536,18 @@ accumulation order, different scheduling. Bit-exactness across providers is stil
 NOT claimed as a contract (study §5.3); it is what these six shapes measured.
 
 **This does NOT close `BACKEND-GATE-METAL-MLXLM`.** Against the mlx_lm floor
-below (27.57 agg tok/s at b=1, 213.39 at b=16, itself INDICATIVE and not re-run
-today) the MLX-provider arm is still ~4.8x to ~5.5x behind. The provider
-accelerates the dense GEMM only; the rest of the deficit is what `M3c` (batched
-encoders) and a simdgroup-matrix GEMM are for.
+(re-measured 2026-07-27 and reproduced, see below) the MLX-provider arm is still
+**4.8x to 6.2x** behind. The provider accelerates the dense GEMM only.
+
+**UPDATED 2026-07-27 — the rest of the deficit is now MEASURED, and the lever
+ranking in the sentence this replaces was wrong.** It previously read "what `M3c`
+(batched encoders) and a simdgroup-matrix GEMM are for", treating the two as
+co-equal. Dispatch attribution shows they are not: the per-op
+`commit`+`waitUntilCompleted` model costs **~186 us x ~395 dispatches per decode
+token**, a **~13.6 tok/s ceiling with infinitely fast kernels** against mlx_lm's
+27.9. `M3c` is the precondition; the GEMM lever cannot be cashed until it lands.
+See "Metal dispatch attribution" below and
+[the spec](../.agents/specs/metal-dispatch-attribution.md).
 
 **Status: INDICATIVE, NOT BINDING - partially quieted.** Better isolation than the
 M3b run but still short of the standing bar. DONE: the three `actions.runner`
@@ -2561,7 +2621,28 @@ mlx_lm.benchmark --model mlx-community/Qwen3-1.7B-bf16 -p 512 -g 128 -b <B> -n 3
 
 ---
 
-## MLX competitor baseline on Apple M4 - UNOPPOSED FLOOR (2026-07-22)
+## MLX competitor baseline on Apple M4 - UNOPPOSED FLOOR (2026-07-22, RE-MEASURED 2026-07-27)
+
+**RE-RUN 2026-07-27, AND IT REPRODUCES.** Same box, same model revision,
+byte-identical toolchain (`mlx` 0.29.3 / `mlx-metal` 0.29.3 / `mlx-lm` 0.29.1),
+MLX-LM's own harness, p=512 g=128 n=3, this time with the three `actions.runner`
+LaunchAgents verified job-idle, booted out and restored, and the sweep under the
+GPU lock.
+
+| B | gen tok/s 2026-07-27 | committed 2026-07-22 | delta | peak GB (both) |
+|--:|--:|--:|--:|--:|
+| 1 | 27.89 | 27.57 | +1.2% | 3.776 |
+| 2 | 49.69 | 48.91 | +1.6% | 3.974 |
+| 4 | 91.10 | 90.15 | +1.1% | 4.184 |
+| 8 | 158.65 | 156.95 | +1.1% | 4.466 |
+| 16 | 213.71 | 213.39 | +0.15% | 5.279 |
+
+Prefill matches within 0.3% (1091.2 / 1139.5 / 1180.2 / 1200.2 / 1197.7 tok/s)
+and **peak memory is identical to three decimals at every batch size**. The ~1%
+generation gain is consistent with the paused runners. Trial spread tightened to
+**0.05%-0.28%** (was 0.12%-0.63%). The floor is therefore **reproduced, not
+merely restated** — which is what the "reproduction is a gate" rule asks for.
+It remains INDICATIVE: the worker daemon and aerial wallpaper were still up.
 
 **READ THIS FIRST. This is NOT a parity result and NOT a binding floor.** (Now
 superseded as the live comparison by the ours-vs-MLX table above; retained as the
