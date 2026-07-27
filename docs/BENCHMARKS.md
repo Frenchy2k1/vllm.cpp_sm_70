@@ -2555,6 +2555,31 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal decode GEMV is at its practical limit (2026-07-27) - MLP increase NEUTRAL
+
+Two vector loads in flight per lane instead of one, to add memory-level
+parallelism. **NEUTRAL: 19.00 vs 19.07 tok/s. Reverted.**
+
+The GEMV moves 435 GB of weights in 4.45 s = **97.7 GB/s, ~81% of the M4's
+~120 GB/s**, and it is not traffic-limited: the activation is ~4 KB and stays in
+L1, so the only DRAM stream is the weight row, already read exactly once and
+fully coalesced. Adding load parallelism changes nothing, so **this kernel is
+done**; 81% of peak on a pure streaming loop is close to what the hardware gives.
+
+**This reframes the remaining decode gap as ATTENTION, not the GEMV.** MLX-LM's
+entire decode is 4.59 s for the same 435 GB = 94.8 GB/s aggregate — and that
+budget includes its attention. Ours: GEMV 4.45 s (comparable) PLUS 1.04 s of
+attention on top. So the ~0.6 s decode gap is almost exactly our attention cost.
+
+**Identified remaining decode lever:** attention parallelism. For decode the
+kernel launches one threadgroup per (head, token) = 16 threadgroups for this
+model, each walking the whole sequence in chunks. Splitting along the KV sequence
+(flash-decoding style, partial results plus a combine pass) is the standard fix
+and would raise occupancy by an order of magnitude. That is a structural change,
+not a tuning knob.
+
+---
+
 ## Metal paged-attention V accumulation on Apple M4 (2026-07-27) - +4.2%
 
 The follow-up the score-loop change deliberately left alone. The V loop's memory
