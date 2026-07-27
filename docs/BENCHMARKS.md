@@ -2571,8 +2571,12 @@ identically at the same speed), the threadgroup-size limit is REFUTED (a new
 `DispatchGrid2D` assert does not fire), and a host/kernel thread-count mismatch
 is REFUTED. Sharpest clue: the failure is m-DEPENDENT. m=2 and m=16 PASS,
 m=64 and m=512 FAIL, so only tile rows >= 16 are affected, consistent with part
-of the A tile never being staged or being staged after it is read. Not located,
-not shipped; resume notes in the spec's "OPEN LEAD" section.
+of the A tile never being staged or being staged after it is read. Now FINGERPRINTED: a per-row diagnostic (`VT_MM_ROWDIAG=1`) shows rows 0-15
+correct, 16-31 zero, 32-47 reading A[16..31], 48-63 zero — the tile is filled at
+HALF the expected row spacing, which excludes thread under-coverage (that would
+leave correct sources) and points at a STRIDE disagreement between the staging
+writes and `simdgroup_load`'s assumed `VT_MM_BK` pitch. Not shipped; concrete
+next step in the spec's "OPEN LEAD" section.
 
 ---
 

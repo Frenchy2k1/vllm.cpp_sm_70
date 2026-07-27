@@ -25954,3 +25954,39 @@ consistent with part of the A tile never being staged, or staged after it is
 read. Next step: stage a known constant into `sa` and check which rows survive.
 
 **Goal:** 14.25 of 27.9 tok/s. This lead is worth ~half the remaining GEMM gap.
+
+---
+
+## 2026-07-27 — 64x64 GEMM defect FINGERPRINTED: a threadgroup stride disagreement
+
+**Added a permanent per-row diagnostic** (`VT_MM_ROWDIAG=1`, skipped by default):
+feeds A[r][*] = r+1 and B = 1 so each output row's VALUE names the source row it
+actually read. NMSE could never have told these cases apart.
+
+**Result on the 64x64/8-simdgroup kernel at m=n=k=64:**
+
+```
+rows  0..15  correct
+rows 16..31  ZERO           (never written)
+rows 32..47  read A[16..31] (written, WRONG source row)
+rows 48..63  ZERO           (never written)
+```
+
+**This excludes the obvious explanations.** Thread under-coverage would leave
+zeros but every written row would carry its CORRECT source. Here the written rows
+are shifted: 64 source rows land in 32 destination rows, at HALF the expected
+spacing. That is a STRIDE disagreement between the staging writes (`sa[r][kk]`,
+laid out with whatever row pitch the compiler picks for
+`threadgroup float sa[VT_MM_BM][VT_MM_BK]`) and the
+`simdgroup_load(..., &sa[R][kk], VT_MM_BK)` calls, which assume the pitch is
+exactly `VT_MM_BK`. It works at BM=32 and breaks at BM=64, consistent with the
+compiler padding the inner dimension at the larger size.
+
+**Concrete fix to try next:** stop passing `VT_MM_BK` as `elements_per_row`;
+derive the real pitch, or make `sa` a flat `threadgroup float[]` with an
+explicit stride so the write and the read cannot disagree. Verify with
+`VT_MM_ROWDIAG=1` (expects NONE), then `VT_MM_BENCH=1` for the 1.8x, then the
+f32 64x512x128 arm.
+
+**Goal:** 14.25 of 27.9 tok/s. This lead is worth ~half the remaining GEMM gap
+and is now one hypothesis from resolution.

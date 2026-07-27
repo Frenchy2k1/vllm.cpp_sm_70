@@ -410,8 +410,39 @@ so **the defect only affects tile rows >= 16**. That is consistent with part of
 staging for rows 16..63 first: dump `sa` for a single threadgroup, or stage a
 known constant and check which rows survive to the output.
 
-**Reproduce:** the f32 64x512x128 arm catches it in one run; `VT_MM_BENCH=1`
-gives the speed.
+**THE DEFECT IS NOW FINGERPRINTED (2026-07-27).** A per-row diagnostic
+(`VT_MM_ROWDIAG=1`, committed and skipped by default) feeds A[r][*] = r+1 and
+B = 1 so each output row's VALUE names the source row it actually read. At
+m=n=k=64 on the 64x64/8-simdgroup kernel:
+
+```
+rows  0..15  correct
+rows 16..31  ZERO            (never written)
+rows 32..47  read A[16..31]  (written, WRONG source row)
+rows 48..63  ZERO            (never written)
+```
+
+**Read this carefully, because it excludes the obvious explanations.** Pure
+thread under-coverage would leave zeros but every written row would carry its
+CORRECT source. Here the written rows are correct in count but shifted: the tile
+is being filled at HALF the expected row spacing, so 64 rows of source land in
+32 rows of destination, and the rest is never touched.
+
+That is a STRIDE disagreement between the staging writes (`sa[r][kk]`, which the
+compiler lays out with whatever row pitch it chooses for
+`threadgroup float sa[VT_MM_BM][VT_MM_BK]`) and the `simdgroup_load(..., &sa[R][kk],
+VT_MM_BK)` calls, which assume the pitch is exactly `VT_MM_BK`. It works at
+BM=32 and breaks at BM=64, which is consistent with the compiler padding the
+inner dimension for bank-conflict avoidance at the larger size.
+
+**Next step, and it is concrete:** stop passing `VT_MM_BK` as the
+`elements_per_row` argument and derive the ACTUAL pitch, or restructure `sa` as a
+flat `threadgroup float[]` with an explicitly computed stride so the write and
+the read cannot disagree. Verify with `VT_MM_ROWDIAG=1` (expects "NONE"), then
+`VT_MM_BENCH=1` for the 1.8x, then the f32 64x512x128 arm.
+
+**Reproduce:** the f32 64x512x128 arm catches the defect in one run;
+`VT_MM_ROWDIAG=1` says which rows and which sources; `VT_MM_BENCH=1` gives speed.
 
 ### Risks/decisions
 
