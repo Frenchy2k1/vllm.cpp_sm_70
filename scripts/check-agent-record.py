@@ -33,9 +33,14 @@ MATRICES = {
     # attention — the project's FIRST non-causal / bidirectional attention primitive,
     # a genuinely separate op from the causal `kAttention`/`kPagedAttention`; SPEC-DFLASH
     # D2, `CLAIM-DFLASH-D2`).
+    # 36 since 2026-07-27: +`KERNEL-ATTN-DFLASH-PAGED-BLOCK` (the CAPTURE-SAFE paged
+    # variant of the DFlash in-block attention — a genuinely separate op
+    # `kDFlashPagedBlockAttention` reading the growing context from a paged K/V cache +
+    # persistent device block_table instead of a materialized combined buffer, the
+    # CUDA-graph draft-attention primitive; SPEC-DFLASH D12 Part B, `CLAIM-DFLASH-D12`).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 35),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 36),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

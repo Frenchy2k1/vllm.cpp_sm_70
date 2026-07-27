@@ -105,6 +105,7 @@ enum class OpId : uint8_t {
   kAttention,
   kAttentionDenseFast,
   kDFlashBlockAttention,
+  kDFlashPagedBlockAttention,
   kReshapeAndCache,
   kConcatAndCacheMla,
   kMlaDecodeAttention,
@@ -388,6 +389,28 @@ struct DFlashBlockAttentionArgs {
   int num_reqs = 1;               // number of query blocks
 };
 
+// SPEC-DFLASH D12 Part B — CAPTURE-SAFE paged variant of DFlashBlockAttention.
+// The (1+k) block queries attend over [persistent PAGED context ; their own (1+k)
+// block] exactly as DFlashBlockAttention does over a materialized [context; block]
+// combined buffer, but the growing context enters as DATA (a paged K/V cache +
+// per-request block_table + seq_lens) instead of a variable-size combined buffer —
+// so the launch grid is STATIC over the fixed (1+k)*num_reqs query rows and every
+// metadata input is a persistent DEVICE tensor read in place (NO function-local
+// host upload, the cudagraph-capture-bakes-stack-addresses UAF class the eager
+// DFlashBlockAttention launcher had). Same f32 online-softmax recurrence + the D2
+// in-block mask (full/non-causal or causal-SWA), applied over the COMBINED index
+// (context rows [0,C_r) then block rows [C_r, C_r+blen_r)); the context is always
+// position-ordered (ascending), so the combined mask matches the materialized one
+// bit-for-bit. CUDA is capture-safe; CPU is the reference; a unit test cross-checks
+// both against DFlashBlockAttention over an explicit combined buffer.
+struct DFlashPagedBlockAttentionArgs {
+  float scale = 0.0f;             // head_dim^-0.5
+  bool causal = false;            // false=full(non-causal); true=causal-SWA
+  int64_t sliding_window = 0;     // SWA window (>0); 0 = full causal when causal
+  int num_reqs = 1;               // number of (1+k) query blocks
+  int64_t block_size = 0;         // rows per paged context page (>0)
+};
+
 // Backend-neutral local-attention window, matching FlashAttention's
 // `window_size=(left, right)` convention. The bounds are inclusive distances
 // from the bottom-right-aligned absolute query position: (W-1, 0) is a causal
@@ -666,6 +689,10 @@ using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, cons
                              const AttentionArgs&);
 using DFlashBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                         const Tensor&, const DFlashBlockAttentionArgs&);
+using DFlashPagedBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                             const Tensor&, const Tensor&, const Tensor&,
+                                             const Tensor&, const Tensor&, const Tensor&,
+                                             const DFlashPagedBlockAttentionArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
 using ConcatAndCacheMlaFn =
@@ -1712,6 +1739,27 @@ void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor
 // mirrors AttentionKernel's block-reduction recurrence; CPU is the reference.
 void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                           const Tensor& value, const DFlashBlockAttentionArgs& args);
+
+// DFlash PAGED in-block attention (SPEC-DFLASH D12 Part B) — the capture-safe form
+// of DFlashBlockAttention. See DFlashPagedBlockAttentionArgs. Tensors:
+//   out          [Nq, Hq, D]           block-query outputs (Nq = sum of block lens)
+//   query        [Nq, Hq, D]           the (1+k)*num_reqs block queries
+//   block_key    [Nq, Hkv, D]          the block K (same rows as query)
+//   block_value  [Nq, Hkv, D]          the block V
+//   ctx_key      [num_pages, block_size, Hkv, D]   PAGED context K (normed+RoPE'd)
+//   ctx_value    [num_pages, block_size, Hkv, D]   PAGED context V (raw)
+//   cu_seqlens   [num_reqs+1] i32       block-query row bounds (device)
+//   seq_lens     [num_reqs]   i32       per-request context length C_r (device)
+//   block_table  [num_reqs, max_pages] i32  logical-page -> physical-page (device)
+// Every metadata tensor is read in place on the op's device (device for CUDA =
+// capture-safe; host for CPU). GQA broadcast; f32 online softmax. Bit-identical to
+// DFlashBlockAttention over the materialized [context; block] combined buffer.
+void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
+                               const Tensor& block_key, const Tensor& block_value,
+                               const Tensor& ctx_key, const Tensor& ctx_value,
+                               const Tensor& cu_seqlens, const Tensor& seq_lens,
+                               const Tensor& block_table,
+                               const DFlashPagedBlockAttentionArgs& args);
 
 // --- Paged KV-cache write (M1.6). Semantics ported from the FlashAttention
 // path of vllm/csrc/.../cache_kernels.cu::reshape_and_cache_flash @ e24d1b24;

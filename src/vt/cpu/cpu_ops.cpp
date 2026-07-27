@@ -1901,6 +1901,106 @@ void DFlashBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query, const 
   });
 }
 
+// DFlash PAGED in-block attention (SPEC-DFLASH D12 Part B) — CPU reference. Each
+// (1+k) block query attends over [PAGED context ; its own (1+k) block] with the D2
+// mask over the COMBINED index (context rows [0,C) then block rows [C, C+blen)).
+// Bit-identical math to DFlashBlockAttentionKernel over a materialized combined
+// buffer: same ascending key order, same f32 online (2-pass) softmax. The context
+// enters as a paged K/V cache + per-request seq_lens + block_table (DATA), matching
+// the capture-safe CUDA kernel.
+void DFlashPagedBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query,
+                                     const Tensor& block_key, const Tensor& block_value,
+                                     const Tensor& ctx_key, const Tensor& ctx_value,
+                                     const Tensor& cu_seqlens, const Tensor& seq_lens,
+                                     const Tensor& block_table,
+                                     const DFlashPagedBlockAttentionArgs& args) {
+  const int64_t hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = block_key.shape[1];
+  const int64_t qpk = hq / hk;  // GQA ratio
+  const float scale = args.scale;
+  const int64_t window = args.sliding_window;
+  const bool causal = args.causal;
+  const int num_reqs = args.num_reqs;
+  const int64_t block_size = args.block_size;
+  const int64_t max_pages = block_table.shape[1];
+  // Contiguous paged cache strides: [num_pages, block_size, Hkv, D].
+  const int64_t ck_blk = block_size * hk * d, ck_pg = hk * d, ck_hd = d;
+  const int32_t* cu = cu_seqlens.Ptr<int32_t>();
+  const int32_t* slen = seq_lens.Ptr<int32_t>();
+  const int32_t* btbl = block_table.Ptr<int32_t>();
+  ForRows(hq * static_cast<int64_t>(num_reqs), [&](int64_t r0, int64_t r1) {
+    std::vector<float> probs;
+    std::vector<float> acc(static_cast<size_t>(d));
+    for (int64_t rr = r0; rr < r1; ++rr) {
+      const int64_t h = rr % hq;
+      const int64_t req = rr / hq;
+      const int64_t g = h / qpk;
+      const int64_t qs = cu[req];
+      const int64_t qe = cu[req + 1];
+      const int64_t blen = qe - qs;
+      const int64_t C = slen[req];
+      const int64_t N = C + blen;  // combined key length
+      probs.resize(static_cast<size_t>(N));
+      for (int64_t ii = 0; ii < blen; ++ii) {
+        const int64_t i = qs + ii;          // global block-query row
+        const int64_t ii_comb = C + ii;     // query offset in the combined sequence
+        const int64_t jhi = causal ? ii_comb : N - 1;
+        int64_t jlo = 0;
+        if (causal && window > 0) jlo = ii_comb - (window - 1) > 0 ? ii_comb - (window - 1) : 0;
+        const int64_t qoff = (i * hq + h) * d;
+        // Pass 1: scores + running max over combined keys [jlo, jhi].
+        float m = -std::numeric_limits<float>::infinity();
+        for (int64_t cj = jlo; cj <= jhi; ++cj) {
+          int64_t koff;
+          const Tensor* ksrc;
+          if (cj < C) {  // paged context key
+            const int64_t page = btbl[req * max_pages + cj / block_size];
+            const int64_t off = cj % block_size;
+            koff = page * ck_blk + off * ck_pg + g * ck_hd;
+            ksrc = &ctx_key;
+          } else {  // block key (contiguous)
+            const int64_t brow = qs + (cj - C);
+            koff = (brow * hk + g) * d;
+            ksrc = &block_key;
+          }
+          float dot = 0.0f;
+          for (int64_t e = 0; e < d; ++e) dot += LoadF32(query, qoff + e) * LoadF32(*ksrc, koff + e);
+          dot *= scale;
+          probs[static_cast<size_t>(cj)] = dot;
+          if (dot > m) m = dot;
+        }
+        // Pass 2: exp + denom.
+        float denom = 0.0f;
+        for (int64_t cj = jlo; cj <= jhi; ++cj) {
+          float e = std::exp(probs[static_cast<size_t>(cj)] - m);
+          probs[static_cast<size_t>(cj)] = e;
+          denom += e;
+        }
+        const float inv = 1.0f / denom;
+        // Pass 3: weighted sum of v.
+        for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
+        for (int64_t cj = jlo; cj <= jhi; ++cj) {
+          const float pw = probs[static_cast<size_t>(cj)] * inv;
+          int64_t voff;
+          const Tensor* vsrc;
+          if (cj < C) {
+            const int64_t page = btbl[req * max_pages + cj / block_size];
+            const int64_t off = cj % block_size;
+            voff = page * ck_blk + off * ck_pg + g * ck_hd;
+            vsrc = &ctx_value;
+          } else {
+            const int64_t brow = qs + (cj - C);
+            voff = (brow * hk + g) * d;
+            vsrc = &block_value;
+          }
+          for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += pw * LoadF32(*vsrc, voff + e);
+        }
+        for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
+      }
+    }
+  });
+}
+
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). Elementwise fusions of the
 // small host-side loops between the big decode ops; all math f32, dims inferred
 // from the tensor shapes.
@@ -2278,6 +2378,9 @@ struct Registrar {
     RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernel)));
+    RegisterOp(OpId::kDFlashPagedBlockAttention, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<DFlashPagedBlockAttentionFn>(&DFlashPagedBlockAttentionKernel)));
     RegisterOp(OpId::kCastBf16, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kCPU,
