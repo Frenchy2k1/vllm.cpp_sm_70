@@ -208,6 +208,11 @@ int InputBatch::add_request(const CachedRequestState& request) {
   } else {
     last_sampled_tokens[static_cast<size_t>(req_index)] = 0;
   }
+  // W4: record the seed so a device mirror starts from the same value. The value
+  // is host-known here, so this is the one op kind that carries data.
+  last_sampled_ops.push_back(LastSampledOp{
+      LastSampledOp::kSeed, req_index, 0,
+      last_sampled_tokens[static_cast<size_t>(req_index)]});
 
   // Sampling metadata (pooling DEFERRED — T0 always has sampling_params).
   const SamplingParams& sp = request.sampling_params;
@@ -652,6 +657,10 @@ void InputBatch::condense() {
     // to the dense req_state index combine reads).
     last_sampled_tokens[static_cast<size_t>(empty_index)] =
         last_sampled_tokens[static_cast<size_t>(last_req_index)];
+    // W4: the moved VALUE may only exist on the device mirror, so record the
+    // move by index and let the device replay it in stream order.
+    last_sampled_ops.push_back(
+        LastSampledOp{LastSampledOp::kMove, empty_index, last_req_index, 0});
     prefill_len[static_cast<size_t>(empty_index)] =
         prefill_len[static_cast<size_t>(last_req_index)];
     block_table.move_row(last_req_index, empty_index);
@@ -749,6 +758,8 @@ void InputBatch::swap_states(int i1, int i2) {
   // reorder, so combine's dense req_state index stays correct).
   std::swap(last_sampled_tokens[static_cast<size_t>(i1)],
             last_sampled_tokens[static_cast<size_t>(i2)]);
+  // W4: same reasoning as the condense move — indices, not values.
+  last_sampled_ops.push_back(LastSampledOp{LastSampledOp::kSwap, i1, i2, 0});
   std::swap(prefill_len[static_cast<size_t>(i1)],
             prefill_len[static_cast<size_t>(i2)]);
 

@@ -125,6 +125,52 @@ else()
   set(VLLM_CPP_CUDA OFF)
 endif()
 
+# ─── Host instrumentation lanes ───────────────────────────────────────────────
+# One default build is shallow coverage: it reaches neither the dynamic
+# memory/UB detectors nor the race detector, so a whole defect class (bad index
+# arithmetic, use-after-free across the engine's owning containers, unsynchronized
+# access from the serving threads) can only be caught by a failing parity test,
+# if at all. This selects an instrumentation lane for the HOST C++ build so those
+# detectors run as their own CI jobs alongside the plain build.
+#
+# ASan/UBSan and TSan are deliberately SEPARATE lanes: their runtimes are
+# mutually exclusive and their environment requirements differ. The lane is
+# HOST-ONLY — nvcc-compiled device TUs are not instrumented, and a host sanitizer
+# runtime reports false positives against the CUDA driver — so anything other
+# than OFF requires the resolved VLLM_CPP_CUDA to be OFF. The CUDA tier's
+# equivalent detector is compute-sanitizer, run against the normal build.
+#
+# -fno-sanitize-recover=all makes a finding ABORT instead of print-and-continue,
+# so ctest FAILS the lane rather than burying the report inside passing output.
+# Frame pointers plus -g keep the traces attributable; the lane keeps the
+# project's -ffp-contract=off numerics so a bit-identity test still means what it
+# means in the production build.
+set(VLLM_CPP_SANITIZE "OFF" CACHE STRING
+  "Host sanitizer lane: OFF | address | undefined | address,undefined | thread")
+set_property(CACHE VLLM_CPP_SANITIZE PROPERTY STRINGS
+  OFF address undefined address,undefined thread)
+if(NOT VLLM_CPP_SANITIZE STREQUAL "OFF")
+  set(_vllm_cpp_sanitize_allowed address undefined address,undefined thread)
+  if(NOT VLLM_CPP_SANITIZE IN_LIST _vllm_cpp_sanitize_allowed)
+    message(FATAL_ERROR
+      "VLLM_CPP_SANITIZE='${VLLM_CPP_SANITIZE}' is not one of: "
+      "OFF;${_vllm_cpp_sanitize_allowed}")
+  endif()
+  if(VLLM_CPP_CUDA)
+    message(FATAL_ERROR
+      "VLLM_CPP_SANITIZE requires VLLM_CPP_CUDA=OFF: the host sanitizer runtime "
+      "does not instrument nvcc device TUs and reports false positives against "
+      "the CUDA driver. Use compute-sanitizer for the CUDA tier instead.")
+  endif()
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=${VLLM_CPP_SANITIZE}>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-sanitize-recover=all>
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
+    $<$<COMPILE_LANGUAGE:CXX>:-g>)
+  add_link_options(-fsanitize=${VLLM_CPP_SANITIZE})
+  message(STATUS "Host sanitizer lane: ${VLLM_CPP_SANITIZE} (CUDA backend off)")
+endif()
+
 # Resolve the tri-state VLLM_CPP_METAL the same way (BACKEND-METAL-MLX W0). The
 # Metal backend is ObjC++ against the Metal/Foundation frameworks, so it needs
 # APPLE plus a working OBJCXX compiler; on any other host AUTO resolves OFF and

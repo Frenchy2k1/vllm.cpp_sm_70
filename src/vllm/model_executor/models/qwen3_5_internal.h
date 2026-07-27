@@ -150,4 +150,44 @@ void ValidateGdnDecodeGraphState(
     const v1::GDNAttentionMetadata& metadata,
     const std::vector<GdnStateCache>& state_caches, int64_t real_batch);
 
+// ─── ENG-ASYNC-SCHED W4: device-resident input ids for the embed ─────────────
+//
+// `ModelForwardInput::device_token_ids` says "the input ids for this step are
+// ALREADY on the device; the host vector is stale for decode rows". Only the
+// embed at the very top of the forward cares, and it sits under five layers of
+// entry points (eager / gathered / tap / multi-tap / decode-graph replay), each
+// of which takes `const std::vector<int32_t>& token_ids` and passes it down.
+//
+// Rather than add a defaulted pointer parameter to every one of those and to the
+// decode-graph class, the two Qwen3.5 registry forwards establish this SCOPED
+// override for the duration of one forward and the embed consults it. The
+// trade-off is deliberate and bounded: it is thread-local (a forward runs on one
+// host thread), strictly RAII so it cannot leak past the call that set it, and
+// set ONLY from the registry entry points that receive the ModelForwardInput —
+// so its lifetime is exactly the forward's, not process state. It is null on
+// every path except the discrete-CUDA async runner.
+// The COUNT travels with the pointer so the embed can prove the buffer is the
+// one meant for it. A forward can reach a second, unrelated embed over different
+// ids (the multimodal generate helper embeds a prompt and then single tokens);
+// an override that matched on "non-null" alone would silently feed that embed
+// the wrong row count. Length disagreement means "not mine" and falls back to
+// the host upload, which is always correct.
+struct DeviceTokenIds {
+  const int32_t* ids = nullptr;
+  int64_t count = 0;
+};
+
+DeviceTokenIds& DeviceTokenIdsOverride();
+
+struct DeviceTokenIdsScope {
+  DeviceTokenIdsScope(const int32_t* ids, int64_t count)
+      : prev(DeviceTokenIdsOverride()) {
+    DeviceTokenIdsOverride() = DeviceTokenIds{ids, count};
+  }
+  ~DeviceTokenIdsScope() { DeviceTokenIdsOverride() = prev; }
+  DeviceTokenIdsScope(const DeviceTokenIdsScope&) = delete;
+  DeviceTokenIdsScope& operator=(const DeviceTokenIdsScope&) = delete;
+  DeviceTokenIds prev;
+};
+
 }  // namespace vllm::detail

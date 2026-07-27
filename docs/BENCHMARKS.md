@@ -4992,6 +4992,40 @@ Prior series (ratios and attributions only):
 [Qwen3.5-4B main repair evidence](bench-evidence/qwen35-4b-main-repair-20260725.md).
 This 4B diagnostic does not establish 27B/35B support.
 
+### ENG-ASYNC-SCHED W4 discrete-CUDA device-resident sampled tokens (2026-07-27) - correctness GATED, speed NEUTRAL here, serving A/B PENDING
+
+**Implemented, opt-in (`VT_ASYNC_DEVICE_MIRROR=1`), DEFAULT OFF.** On a discrete
+GPU the W3 device combine/scatter fell back to a host path that must synchronize
+the main stream for the sampled ids; W4 gives that path a device-resident
+`last_sampled_tokens` (what upstream does unconditionally, `states.py:64`), with
+the condense/swap row edits recorded on the host and replayed on the device in
+stream order.
+
+Correctness gate on the RTX 5070 Ti, one `flock /tmp/gpu`, same binary:
+**token-identical, 128/128 requests, in both directions** on the 128-request
+corpus; `test_qwen35_plain_weights --no-skip` 3/3 (1672), `test_input_batch`
+25/25 (183, +3 new W4 cases), `test_combine_tokens` 7/7, `test_ops_gdn` 66/66
+(4242), `test_ops_paged_attn` 25/25 (454,474).
+
+Speed on this workload is NEUTRAL and cannot be otherwise, which is why the
+default is OFF. `vllm-bench` drives the SYNCHRONOUS `LLMEngine::step()` loop, so
+`sample_tokens_async` is never called and there is no depth-2 overlap for W4 to
+unlock; it adds four small uploads and two kernels per step and removes nothing.
+Two paired runs measured 6612.31 vs 6600.68 and 6602.22 vs 6612.15 tok/s - equal
+and opposite, i.e. run noise. The win it was built for needs the ASYNC serving
+loop (`AsyncLLM` -> `step_with_batch_queue`), so the binding measurement is a
+SERVING A/B and is **PENDING**.
+
+**This also corrects a wrong attribution in the record.** The 2026-07-25 evidence
+assigned the 497 `cudaStreamSynchronize` calls (20.975 s, 42.20 ms/call) to
+`GPUModelRunner::sample_tokens_async`'s discrete host path. That function is not
+called on the benchmarked path at all - verified directly, by instrumenting the
+branch and observing it never executes under `vllm-bench`. Whatever those
+synchronizations are, they are not the async sampler's, and the next profiling
+pass must re-attribute them before any further lever is chosen from that trace.
+Spec, deviations and gates:
+[.agents/specs/async-discrete-device-combine.md](../.agents/specs/async-discrete-device-combine.md).
+
 ### Hardening detector lanes (2026-07-27, `HARDEN-DETECTOR-LANES`) - infrastructure, NOT APPLICABLE
 
 No performance claim: `VLLM_CPP_SANITIZE` (ASan/UBSan/TSan host lanes, CPU-tier

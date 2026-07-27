@@ -47,6 +47,25 @@ namespace vllm {
 class DevicePool {
  public:
   void* Get(vt::Backend& b, size_t bytes) {
+    // BYPASS lane (VT_POOL_BYPASS=1) — the pool is a DETECTOR BLIND SPOT and
+    // this is how you see through it. Two ways it hides a real defect from
+    // compute-sanitizer:
+    //   1. size-class rounding hands back a block up to 6.25% LARGER than the
+    //      logical tensor, so a write past the last row lands inside the same
+    //      driver allocation and memcheck reports nothing;
+    //   2. blocks are never returned to the driver, so a use-after-free of a
+    //      released DBuf reads memory that is still legally mapped — and, worse,
+    //      may already have been handed to an unrelated op.
+    // Under bypass every Get is an EXACT-size driver allocation and every Put is
+    // a real Free, which restores both boundaries for the detector. It is a
+    // debugging lane only: it reinstates the per-op cudaMalloc/cudaFree sync
+    // storm this pool exists to remove, so it is never a timing configuration.
+    // The backend is remembered here so the no-backend Put overload (the
+    // cross-step shared_ptr deleter) can free through it.
+    if (Bypass()) {
+      backend_ = &b;
+      return b.Alloc(bytes);
+    }
     const size_t key = ClassOf(bytes);
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -66,6 +85,14 @@ class DevicePool {
   // logits / MTP hidden handed off via a shared_ptr deleter). Bytes are always
   // returned to the free list — the cross-step buffers are not cap-evicted.
   void Put(size_t bytes, void* p) {
+    // Bypass: free for real so a later use-after-free traps. `backend_` is set by
+    // the Get that produced `p`, so it is non-null whenever a Put can be reached;
+    // the null guard keeps the lane from leaking a block if that ever stops
+    // holding rather than dereferencing a null backend.
+    if (Bypass()) {
+      if (backend_ != nullptr) backend_->Free(p);
+      return;
+    }
     const size_t key = ClassOf(bytes);
     std::lock_guard<std::mutex> lk(mu_);
     retained_ += key;
@@ -78,6 +105,10 @@ class DevicePool {
   // When a discrete GPU sets a bound, scratch over the cap is freed to the driver
   // rather than pooled, so the reuse pool self-limits without a model edit.
   void Put(vt::Backend& b, size_t bytes, void* p, size_t cap) {
+    if (Bypass()) {
+      b.Free(p);
+      return;
+    }
     const size_t key = ClassOf(bytes);
     std::lock_guard<std::mutex> lk(mu_);
     if (cap != 0 && retained_ + key > cap) {
@@ -100,6 +131,18 @@ class DevicePool {
   }
 
  private:
+  // VT_POOL_BYPASS=1 turns every Get/Put into a raw driver Alloc/Free (see Get).
+  // Read once: it must not change between an allocation and its matching free,
+  // or a pooled block would be handed to Backend::Free (or a driver block leaked
+  // into the free list).
+  static bool Bypass() {
+    static const bool on = [] {
+      const char* e = std::getenv("VT_POOL_BYPASS");
+      return e != nullptr && e[0] == '1';
+    }();
+    return on;
+  }
+
   // Round `bytes` up so it keeps at most kClassBits leading significant bits.
   // Exact keying when VT_POOL_EXACT=1 (A/B). Small sizes (< 2^kClassBits) key
   // exactly — there are few of them and the waste would be proportionally large.
@@ -118,6 +161,10 @@ class DevicePool {
   }
 
   std::mutex mu_;
+  // Backend the last Get allocated through, so the no-backend Put overload can
+  // free under bypass. One device per process (see ResolveDevicePoolPolicy), so
+  // this is stable; unused when bypass is off.
+  vt::Backend* backend_ = nullptr;
   std::unordered_map<size_t, std::vector<void*>> free_;
   size_t retained_ = 0;  // bytes (class-rounded) held in free_, for the soft cap
   std::atomic<uint64_t> hits_{0};

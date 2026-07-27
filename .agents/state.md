@@ -32432,3 +32432,63 @@ Pre-existing and NOT introduced here: `scripts/check-agent-record.py` reports 6
 errors on pristine `main` (DONE rows citing closing commits `164453a2` /
 `7a3f04b2`, which do not exist in this clone). Verified identical with and
 without this change.
+
+## 2026-07-27 (later) — ENG-ASYNC-SCHED W4 implemented and gated; the lever's own attribution was WRONG
+
+Built the discrete-CUDA device-resident sampled-token path the earlier entry
+scoped, gated it, and in the process disproved the premise it was scoped from.
+
+**What landed.** `last_sampled_tokens` gains a device mirror on discrete CUDA
+(what upstream keeps unconditionally, `states.py:64`); the combine and scatter
+run on it; `InputBatch` records its structural row edits (seed/move/swap) and the
+runner replays them on the device in stream order, which is how a device-resident
+buffer survives our `condense()` (upstream never condenses — `states.py:132` uses
+a free-index pool). The forward reads the patched device ids through
+`ModelForwardInput::device_token_ids`. W4e removed the other per-step barrier:
+the CUDA embedding's out-of-range flag no longer does cudaMalloc + stream-sync +
+cudaFree per call, but uses a persistent ring of flag slots with a deferred,
+event-queried check (reporting contract changed deliberately; its test changed
+with it).
+
+**Three design corrections forced during implementation**, each recorded in the
+spec: the embed PATCHES a prefix rather than embedding the runner's buffer
+(the decode graph embeds a PADDED id vector, so "replace the whole buffer" would
+have mis-shaped it); the uploads copy from PAGEABLE host memory on purpose (a
+shared pinned staging buffer is a race — pinned copies are truly async, so the
+next upload can overwrite bytes an in-flight DMA has not read, and with depth-2
+that window spans steps); and the forward reads the ids through an RAII scoped
+override consumed on first use, rather than a parameter threaded through five
+entry points plus the decode-graph class.
+
+**THE FINDING — the lever was aimed at code the benchmark never runs.** First
+gate run: token identity mirror-ON vs OFF was **0/128**, output garbage from the
+first decode. Instrumenting showed the device mirror stayed all-zero: the scatter
+branch in `sample_tokens_async` NEVER EXECUTED. Cause: `vllm-bench` drives the
+SYNCHRONOUS `LLMEngine::step()` loop, which calls `sample_tokens()`, not
+`AsyncLLM`'s depth-2 `step_with_batch_queue` -> `sample_tokens_async`. So on the
+benchmarked path there is no async sampler, no depth-2 overlap, and **no
+`sample_tokens_async` synchronize to remove**. The 2026-07-25 attribution of 497
+`cudaStreamSynchronize` calls (20.975 s, 42.20 ms/call) to that function is
+therefore WRONG for this workload; those synchronizations come from somewhere
+else and must be re-attributed before another lever is chosen from that trace.
+Fixed by feeding the mirror from whichever sampler ran (the sync path uploads the
+ids it already downloaded); identity is now **128/128 in both directions**.
+
+**Disposition: opt-in, DEFAULT OFF** (`VT_ASYNC_DEVICE_MIRROR=1`), exactly as the
+W3 device kernels landed before their DGX A/B. On the sync loop W4 is correct but
+can only cost (four small uploads + two kernels per step, nothing removed);
+paired runs measured 6612.31 vs 6600.68 and 6602.22 vs 6612.15 tok/s — equal and
+opposite, run noise. The binding measurement is a SERVING A/B over `AsyncLLM`,
+PENDING; `tools/bench/run_serve_low.py` is the harness for it.
+
+**Pre-existing failure found and verified, NOT introduced here:** `test_cuda_ops`
+"CUDA matmul (cuBLASLt) matches CPU on odd sizes" fails 11 elements on the
+bf16/bf16 17x31x13 case on this discrete sm_120. Reproduced on a pristine
+stash-clean build of the same commit (436 assertions, same single failure). The
+project develops on GB10/sm_121a, so this is an unattributed per-architecture
+numerics difference on consumer Blackwell that nobody has recorded.
+
+Also adopted from the external hardening study: `VLLM_CPP_SANITIZE` host lanes
+(ASan+UBSan, TSan) plus the `sanitize-cpu` CI matrix, and `VT_POOL_BYPASS=1` so
+compute-sanitizer can see through the caching device-scratch pool. Item-by-item
+transfer decisions: [specs/hardening-adoption-2026-07-27.md](specs/hardening-adoption-2026-07-27.md).

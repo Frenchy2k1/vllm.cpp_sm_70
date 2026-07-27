@@ -267,6 +267,124 @@ TEST_CASE("swap_states swaps last_sampled_tokens + prefill_len") {
   CHECK(batch.prefill_len[0] == 1);
 }
 
+// ─── ENG-ASYNC-SCHED W4: the structural-op log a device mirror replays ───────
+//
+// On a discrete GPU last_sampled_tokens lives on the device, so the host cannot
+// perform condense's row move or swap_states' row swap itself — it does not hold
+// the values any more. It records what it did; the runner replays the record
+// onto the device buffer in stream order. These cases pin the record, because a
+// missing or misordered op silently feeds the NEXT step's combine the wrong
+// request's token, which shows up as a corrupted output stream and nothing else.
+TEST_CASE("W4: add_request records the last_sampled seed with its value") {
+  InputBatch batch = make_batch();
+  using Op = InputBatch::LastSampledOp;
+
+  CachedRequestState fresh = make_req("fresh", {10, 11, 12}, {}, {3});
+  fresh.num_computed_tokens = 0;
+  const int i0 = batch.add_request(fresh);
+
+  REQUIRE(batch.last_sampled_ops.size() == 1);
+  CHECK(batch.last_sampled_ops[0].kind == Op::kSeed);
+  CHECK(batch.last_sampled_ops[0].a == i0);
+  CHECK(batch.last_sampled_ops[0].value == 0);
+
+  // A resumed request seeds a real token, and the op must carry that VALUE (it
+  // is the one op kind whose data the device cannot derive from indices).
+  CachedRequestState resumed = make_req("resumed", {20, 21, 22}, {23, 24}, {7});
+  resumed.num_computed_tokens = 4;
+  const int i1 = batch.add_request(resumed);
+
+  REQUIRE(batch.last_sampled_ops.size() == 2);
+  CHECK(batch.last_sampled_ops[1].kind == Op::kSeed);
+  CHECK(batch.last_sampled_ops[1].a == i1);
+  CHECK(batch.last_sampled_ops[1].value == 23);
+  CHECK(batch.last_sampled_ops[1].value ==
+        batch.last_sampled_tokens[static_cast<size_t>(i1)]);
+}
+
+TEST_CASE("W4: condense records the row move, swap_states records the swap") {
+  InputBatch batch = make_batch();
+  using Op = InputBatch::LastSampledOp;
+
+  CachedRequestState r0 = make_req("r0", {100}, {}, {10});
+  r0.num_computed_tokens = 1;
+  CachedRequestState r1 = make_req("r1", {200, 201}, {}, {20});
+  r1.num_computed_tokens = 2;
+  CachedRequestState r2 = make_req("r2", {300, 301}, {302}, {30});
+  r2.num_computed_tokens = 3;
+  batch.add_request(r0);
+  batch.add_request(r1);
+  batch.add_request(r2);
+
+  // Drain the admission seeds the way the runner does, so what follows is only
+  // the structural edits under test.
+  batch.last_sampled_ops.clear();
+
+  batch.remove_request("r1");
+  batch.condense();  // r2 (slot 2) slides into the freed slot 1
+
+  REQUIRE(batch.last_sampled_ops.size() == 1);
+  CHECK(batch.last_sampled_ops[0].kind == Op::kMove);
+  CHECK(batch.last_sampled_ops[0].a == 1);  // destination
+  CHECK(batch.last_sampled_ops[0].b == 2);  // source
+  // Replaying that move on a mirror must reproduce what the host array holds.
+  CHECK(batch.last_sampled_tokens[1] == 302);
+
+  batch.last_sampled_ops.clear();
+  batch.swap_states(0, 1);
+
+  REQUIRE(batch.last_sampled_ops.size() == 1);
+  CHECK(batch.last_sampled_ops[0].kind == Op::kSwap);
+  CHECK(batch.last_sampled_ops[0].a == 0);
+  CHECK(batch.last_sampled_ops[0].b == 1);
+}
+
+TEST_CASE("W4: replaying the op log reproduces the host array exactly") {
+  // The whole contract in one place: run a realistic admit / finish / reorder
+  // sequence, replay the recorded ops onto an INDEPENDENT array with the same
+  // semantics the device kernel implements, and require the two to agree. This
+  // is what catches an op that is recorded in the wrong ORDER — each op
+  // individually looks right, and only the composition disagrees.
+  InputBatch batch = make_batch();
+  using Op = InputBatch::LastSampledOp;
+  std::vector<int32_t> mirror(batch.last_sampled_tokens.size(), 0);
+
+  auto replay = [&] {
+    for (const Op& op : batch.last_sampled_ops) {
+      const size_t a = static_cast<size_t>(op.a);
+      const size_t b = static_cast<size_t>(op.b);
+      if (op.kind == Op::kSeed) {
+        mirror[a] = op.value;
+      } else if (op.kind == Op::kMove) {
+        mirror[a] = mirror[b];
+      } else {
+        std::swap(mirror[a], mirror[b]);
+      }
+    }
+    batch.last_sampled_ops.clear();
+  };
+
+  CachedRequestState a = make_req("a", {1, 2}, {3}, {10});
+  a.num_computed_tokens = 3;  // seeds 3
+  CachedRequestState b = make_req("b", {5, 6}, {7}, {20});
+  b.num_computed_tokens = 3;  // seeds 7
+  CachedRequestState c = make_req("c", {8, 9}, {11}, {30});
+  c.num_computed_tokens = 3;  // seeds 11
+  batch.add_request(a);
+  batch.add_request(b);
+  batch.add_request(c);
+  replay();
+  CHECK(mirror == batch.last_sampled_tokens);
+
+  // Reorder, then finish the middle request and condense: the move must be
+  // replayed AFTER the swap, or the mirror picks up the pre-swap occupant.
+  batch.swap_states(0, 2);
+  batch.remove_request("b");
+  batch.condense();
+  replay();
+  CHECK(mirror == batch.last_sampled_tokens);
+}
+
 TEST_CASE("condense is a no-op when only the last request was removed") {
   InputBatch batch = make_batch();
   batch.add_request(make_req("a", {1}, {}, {0}));

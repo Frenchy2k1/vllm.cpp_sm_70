@@ -635,8 +635,79 @@ cudaError_t LaunchEmbeddingIn(cudaStream_t s, Tensor& out, const Tensor& table,
   return LaunchEmbedding<Tin, __nv_bfloat16>(s, out, table, ids, err);
 }
 
+// Out-of-range reporting WITHOUT a per-call barrier.
+//
+// The original shape was cudaMalloc + kernel + D2H + cudaStreamSynchronize +
+// cudaFree on EVERY call. All three of those driver calls SYNCHRONIZE the device,
+// and embedding runs once per engine step at the very front of the forward, so
+// the sequence is a hard barrier between consecutive steps. It costs almost
+// nothing while the engine is serialized anyway (measured 23.7 us/call), and it
+// costs the ENTIRE overlap the moment the engine stops being serialized — which
+// is exactly what ENG-ASYNC-SCHED is for. See
+// .agents/specs/async-discrete-device-combine.md W4e.
+//
+// The replacement is a small RING of persistent slots. Each slot owns a device
+// flag, a PINNED host mirror and an event; a call takes the next slot, resets and
+// launches into it, and records the event — no sync, no allocation. The check is
+// then DEFERRED: before reusing a slot, its event is consumed. If the event has
+// already completed the check is free (cudaEventQuery); only a genuinely
+// in-flight slot blocks, which bounds the ring's memory without ever making the
+// common path wait.
+//
+// Semantics change in exactly one way, deliberately: a bad id is reported up to
+// kSlots calls later than it was, instead of on the offending call. It is still
+// LOUD (the same exception, the same message, on the same queue) and it is still
+// memory-safe on the offending call itself, because the kernel clamps the gather
+// — an out-of-range id has never produced an out-of-bounds read, only a wrong
+// row. The one report the ring cannot deliver is an error in the final embedding
+// of a process that then exits without another embedding; that residue is
+// covered by the token-exactness gates, which compare the produced ids.
+struct EmbeddingErrSlot {
+  EmbeddingErr* dev = nullptr;   // device-side flag the kernel atomically sets
+  EmbeddingErr* host = nullptr;  // pinned mirror the async D2H lands in
+  cudaEvent_t done = nullptr;    // completion of that D2H
+  bool pending = false;          // event recorded and not yet consumed
+  int64_t vocab = 0;             // table rows of the call that armed the slot
+};
+
+// One embedding call per engine step per queue, so a handful of slots covers any
+// realistic overlap depth; the ring only has to outlive the in-flight window.
+constexpr int kEmbeddingErrSlots = 4;
+
+struct EmbeddingErrRing {
+  EmbeddingErrSlot slots[kEmbeddingErrSlots];
+  int next = 0;
+};
+
+// One ring per process: the forward runs on a single device and a single host
+// thread (the same assumption DevicePool and the resident-weight caches make).
+EmbeddingErrRing& ErrRing() {
+  static EmbeddingErrRing ring;
+  return ring;
+}
+
+// Consume a slot's outstanding result, blocking only if `force`. Returns the
+// error to report, if any, WITHOUT throwing: the caller decides when to throw so
+// a partially-armed slot is never left behind.
+bool ConsumeEmbeddingErr(EmbeddingErrSlot& slot, bool force, EmbeddingErr* err_out,
+                         int64_t* vocab_out) {
+  if (!slot.pending) return false;
+  if (!force) {
+    const cudaError_t q = cudaEventQuery(slot.done);
+    if (q == cudaErrorNotReady) return false;  // still in flight: check it later
+    if (q != cudaSuccess) Check(q, "embedding flag event query");
+  } else {
+    Check(cudaEventSynchronize(slot.done), "embedding flag event sync");
+  }
+  slot.pending = false;
+  if (slot.host->status == 0) return false;
+  *err_out = *slot.host;
+  *vocab_out = slot.vocab;
+  return true;
+}
+
 void EmbeddingKernelCuda(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
-  // Validate dtypes before allocating the flag buffer so a throw cannot leak it.
+  // Validate dtypes before touching the ring so a throw cannot leave a slot armed.
   VT_CHECK(table.dtype == DType::kF32 || table.dtype == DType::kBF16,
            "cuda embedding: unsupported table dtype (f32/bf16 only)");
   VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
@@ -648,23 +719,65 @@ void EmbeddingKernelCuda(Queue& q, Tensor& out, const Tensor& table, const Tenso
   VT_CHECK(table.shape[0] > 0, "cuda embedding: empty table (vocab 0) with nonempty ids");
   cudaStream_t s = AsStream(q);
 
-  EmbeddingErr* derr = nullptr;
-  Check(cudaMalloc(&derr, sizeof(EmbeddingErr)), "cudaMalloc embedding flag");
-  EmbeddingErr herr{};
-  cudaError_t st = cudaMemsetAsync(derr, 0, sizeof(EmbeddingErr), s);
+  EmbeddingErrRing& ring = ErrRing();
+  EmbeddingErrSlot& slot = ring.slots[ring.next];
+  ring.next = (ring.next + 1) % kEmbeddingErrSlots;
+
+  if (slot.dev == nullptr) {
+    // First use of this slot: the ONLY allocation this path ever makes. Pinned
+    // host memory so the D2H is a real async copy rather than a staged one.
+    Check(cudaMalloc(&slot.dev, sizeof(EmbeddingErr)), "cudaMalloc embedding flag");
+    Check(cudaHostAlloc(reinterpret_cast<void**>(&slot.host), sizeof(EmbeddingErr),
+                        cudaHostAllocDefault),
+          "cudaHostAlloc embedding flag mirror");
+    Check(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming),
+          "cudaEventCreate embedding flag");
+    slot.host->status = 0;
+  }
+
+  // Reusing this slot means its previous result must be consumed first. Force the
+  // wait: the slot is about to be overwritten, so skipping the check here would
+  // DROP a report rather than defer it. With kSlots slots in the ring this only
+  // blocks when more than kSlots embeddings are genuinely in flight.
+  EmbeddingErr prev{};
+  int64_t prev_vocab = 0;
+  const bool had_prev = ConsumeEmbeddingErr(slot, /*force=*/true, &prev, &prev_vocab);
+
+  cudaError_t st = cudaMemsetAsync(slot.dev, 0, sizeof(EmbeddingErr), s);
   if (st == cudaSuccess) {
-    st = table.dtype == DType::kF32 ? LaunchEmbeddingIn<float>(s, out, table, ids, derr)
-                                    : LaunchEmbeddingIn<__nv_bfloat16>(s, out, table, ids, derr);
+    st = table.dtype == DType::kF32
+             ? LaunchEmbeddingIn<float>(s, out, table, ids, slot.dev)
+             : LaunchEmbeddingIn<__nv_bfloat16>(s, out, table, ids, slot.dev);
   }
   if (st == cudaSuccess) {
-    st = cudaMemcpyAsync(&herr, derr, sizeof(EmbeddingErr), cudaMemcpyDeviceToHost, s);
+    st = cudaMemcpyAsync(slot.host, slot.dev, sizeof(EmbeddingErr), cudaMemcpyDeviceToHost, s);
   }
-  if (st == cudaSuccess) st = cudaStreamSynchronize(s);
-  cudaFree(derr);  // best-effort; the primary error (if any) is reported below
+  if (st == cudaSuccess) st = cudaEventRecord(slot.done, s);
+  if (st == cudaSuccess) {
+    slot.pending = true;
+    slot.vocab = table.shape[0];
+  }
+
+  // A launch/copy failure is reported before a deferred out-of-range id: it is
+  // the more immediate fault, and it may be why the older flag never arrived.
   Check(st, "embedding");
-  if (herr.status != 0) {
-    throw std::runtime_error("vt cuda: embedding: id " + std::to_string(herr.id) +
-                             " out of range [0, " + std::to_string(table.shape[0]) + ")");
+  if (had_prev) {
+    throw std::runtime_error("vt cuda: embedding: id " + std::to_string(prev.id) +
+                             " out of range [0, " + std::to_string(prev_vocab) + ")");
+  }
+
+  // Opportunistically drain every OTHER slot whose copy has already landed, so a
+  // bad id surfaces at the next call rather than only when its slot comes round
+  // again. Free: cudaEventQuery on a completed event does not block.
+  for (int i = 0; i < kEmbeddingErrSlots; ++i) {
+    EmbeddingErrSlot& other = ring.slots[i];
+    if (&other == &slot) continue;
+    EmbeddingErr err{};
+    int64_t vocab = 0;
+    if (ConsumeEmbeddingErr(other, /*force=*/false, &err, &vocab)) {
+      throw std::runtime_error("vt cuda: embedding: id " + std::to_string(err.id) +
+                               " out of range [0, " + std::to_string(vocab) + ")");
+    }
   }
 }
 

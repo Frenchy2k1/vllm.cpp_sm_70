@@ -18,6 +18,7 @@
 #include "vllm/model_executor/models/qwen3_5_common.h"  // kQwen3_5Info, helpers
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "qwen3_5_internal.h"  // W4 DeviceTokenIdsScope
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) memory-model seam
 
@@ -108,6 +109,14 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
                                   const ModelForwardInput& input) {
   auto& qwen = static_cast<Qwen3_5DenseLoadedModel&>(model);
   const Qwen3_5DenseWeights& weights = qwen.weights();
+
+  // ENG-ASYNC-SCHED W4: publish the async runner's device-resident input ids for
+  // the duration of THIS forward, so the embed at the top of every route below
+  // (eager, gathered, tap, multi-tap, decode-graph replay) reads them instead of
+  // uploading the host vector, which is stale for decode rows on that path.
+  // Null on every other path, and RAII-scoped so it cannot outlive the call.
+  const detail::DeviceTokenIdsScope device_ids_scope(
+      input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
 
   // SPEC-MTP I5d-pre hidden-state tap. When the spec verify forward requests the
   // drafter's [T,H] post-final-norm hidden (I5d), route to the EXISTING
