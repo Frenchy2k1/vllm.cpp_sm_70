@@ -2555,6 +2555,38 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal paged-attention score loop on Apple M4 (2026-07-27) - +3.7%, and a PERFECT oracle result
+
+**Re-attribution moved the target.** After the GEMM work, GPU time was: decode
+GEMV 4452 ms (64%), **paged attention 1636 ms (24%)**, prefill GEMM 645 ms (9%,
+down from 3863). The GEMV moves 435 GB in 4.45 s = **97.7 GB/s, ~81% of the M4's
+peak — essentially done**. Paged attention moved ~8.4 GB of KV cache in 1.64 s =
+**~5 GB/s, about 4% of peak.** That kernel was written for the OPT bring-up and
+never revisited.
+
+**Cause: the score loop gave ONE THREAD an entire d-length dot product**, so
+adjacent threads read entirely different K rows (`kbase` varies per key) and the
+loads never coalesced. Restructured so one SIMDGROUP handles one key with lanes
+splitting `d`, which makes neighbouring lanes read neighbouring elements of the
+same K row, plus a 4-wide vector load where dtype and alignment allow.
+
+| | before | after |
+|---|--:|--:|
+| throughput | 17.65 tok/s | **18.30** (18.19 / 18.41) |
+| duration | 7.25 s | 7.00 s |
+| TTFT | 1664 ms | **1515 ms** |
+| attention GPU | 1636 ms | **1370 ms** |
+
+**The oracle result is the best of the session: 256/256 tokens are vLLM's OWN
+teacher-forced argmax**, mean gap 0.00 mnats, max gap 0.0000 nats, 0 outside
+top-K (previous golden: 254/256, mean 0.98, max 0.125). The improved attention
+numerics agree with vLLM 0.25.0 EXACTLY at every position, including the p0 tok5
+France/Italy tie the record has tracked all along — our engine now picks 9625
+(" France"), which is what vLLM's own argmax says. 37 of 256 tokens changed
+across 4 prompts. Gate 16/16.
+
+---
+
 ## Metal BK=16 + fully-utilised vectorised staging (2026-07-27)
 
 **The fix the previous negative result prescribed.** B-tile vectorisation was
