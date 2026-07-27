@@ -295,6 +295,84 @@ TEST_CASE("dflash D9 persistent-KV: multi-request concat == full recompute, BIT-
   (void)num_reqs; (void)k;
 }
 
+TEST_CASE("dflash D11 device-KV: append+device forward == full recompute, BIT-IDENTICAL (c1)") {
+  // Part A: the DEVICE-RESIDENT append-only store (no host round-trip) must be bit-for-bit
+  // identical to the full per-step recompute (and therefore to the D9 host store). Same
+  // 3-token / two-append shape as the D9 c1 case, but via MakeDeviceKVStore +
+  // AppendContextKVDevice + ForwardBlockLogitsWithDeviceKV. Per-row projection independence
+  // + IndexCopy concat in ascending-position order => IDENTICAL bf16 K/V => IDENTICAL logits.
+  Dims dm;
+  HfConfig cfg = MakeConfig(dm);
+  Qwen3DFlashWeights w = MakeWeights(dm);
+  vt::Queue q = Cpu();
+  const int64_t H = dm.H;
+  std::vector<int32_t> ids = {2, 7, 7};
+  std::vector<int32_t> pos = {3, 4, 5};
+  std::vector<int32_t> block_cu = {0, 3};
+  std::vector<int32_t> ctx_cu = {0, 3};
+  std::vector<int32_t> ctx_pos = {0, 1, 2};
+  std::vector<float> ctx(static_cast<size_t>(3) * H);
+  for (size_t i = 0; i < ctx.size(); ++i)
+    ctx[i] = 0.2f * std::sin(0.13 * static_cast<double>(i) + 0.4);
+
+  const std::vector<float> recompute = Qwen3DFlashModel::ForwardBlockLogitsWithContext(
+      ctx, ctx_pos, ctx_cu, ids, pos, block_cu, w, cfg, q);
+
+  auto store = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+  std::vector<float> f01(ctx.begin(), ctx.begin() + 2 * H);
+  std::vector<float> f2(ctx.begin() + 2 * H, ctx.end());
+  Qwen3DFlashModel::AppendContextKVDevice(*store, f01, {0, 1}, w, cfg, q);
+  Qwen3DFlashModel::AppendContextKVDevice(*store, f2, {2}, w, cfg, q);
+  REQUIRE(Qwen3DFlashModel::DeviceKVNumCtx(*store) == 3);
+  std::vector<DflashDeviceKVStore*> stores = {store.get()};
+  const std::vector<float> device_kv = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      stores, ctx_cu, ids, pos, block_cu, w, cfg, q);
+
+  REQUIRE(device_kv.size() == recompute.size());
+  bool bit_identical = true;
+  for (size_t i = 0; i < device_kv.size(); ++i)
+    if (device_kv[i] != recompute[i]) { bit_identical = false; break; }
+  CHECK(bit_identical);  // exact equality: device-resident store is not an approximation
+}
+
+TEST_CASE("dflash D11 device-KV: multi-request device forward == full recompute, BIT-IDENTICAL") {
+  // Part A multi-request: two device stores (ctx 2 + 1), passed in ctx_cu order to
+  // ForwardBlockLogitsWithDeviceKV, must equal the recompute over the [req0; req1] combined
+  // context. Exercises the on-device per-request concat (the runner's propose-batch path).
+  Dims dm;
+  HfConfig cfg = MakeConfig(dm);
+  Qwen3DFlashWeights w = MakeWeights(dm);
+  vt::Queue q = Cpu();
+  const int64_t H = dm.H;
+  std::vector<int32_t> ids = {2, 7, 7, 3, 7, 7};
+  std::vector<int32_t> pos = {5, 6, 7, 4, 5, 6};
+  std::vector<int32_t> block_cu = {0, 3, 6};
+  std::vector<int32_t> ctx_cu = {0, 2, 3};
+  std::vector<int32_t> ctx_pos = {0, 1, 0};
+  std::vector<float> ctx(static_cast<size_t>(3) * H);
+  for (size_t i = 0; i < ctx.size(); ++i)
+    ctx[i] = 0.2f * std::sin(0.13 * static_cast<double>(i) + 0.4);
+
+  const std::vector<float> recompute = Qwen3DFlashModel::ForwardBlockLogitsWithContext(
+      ctx, ctx_pos, ctx_cu, ids, pos, block_cu, w, cfg, q);
+
+  auto s0 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+  auto s1 = Qwen3DFlashModel::MakeDeviceKVStore(cfg, q);
+  std::vector<float> f0(ctx.begin(), ctx.begin() + 2 * H);  // req0 rows @ pos {0,1}
+  std::vector<float> f1(ctx.begin() + 2 * H, ctx.end());     // req1 row  @ pos {0}
+  Qwen3DFlashModel::AppendContextKVDevice(*s0, f0, {0, 1}, w, cfg, q);
+  Qwen3DFlashModel::AppendContextKVDevice(*s1, f1, {0}, w, cfg, q);
+  std::vector<DflashDeviceKVStore*> stores = {s0.get(), s1.get()};
+  const std::vector<float> device_kv = Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+      stores, ctx_cu, ids, pos, block_cu, w, cfg, q);
+
+  REQUIRE(device_kv.size() == recompute.size());
+  bool bit_identical = true;
+  for (size_t i = 0; i < device_kv.size(); ++i)
+    if (device_kv[i] != recompute[i]) { bit_identical = false; break; }
+  CHECK(bit_identical);
+}
+
 TEST_CASE("dflash DflashProposeBlock: empty context degenerates to context-free ForwardBlockLogits") {
   Dims dm;
   HfConfig cfg = MakeConfig(dm);

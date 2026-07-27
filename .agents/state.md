@@ -25195,3 +25195,52 @@ entry point for the CG work.
 (unchanged), speed improved to 0.917× vLLM with the acceptance-ceiling REFUTED and the residual
 isolated to the FULL CG. Raw logs on dgx `/tmp/d9_ab.log` + `/tmp/d9_vllm_on.log`; harness
 `/tmp/dflash_ab.sh`, `/tmp/vllm_on.sh`, `scripts/spec/vllm_dflash_timing.py`.
+
+## 2026-07-27 — SPEC-DFLASH D11 (`CLAIM-DFLASH-D11`): FULL-CG build opened; Part A device-store PRIMITIVE landed + CPU-bit-identity-GATED (production UNTOUCHED); A-wire/B/C turnkey; speed UNCHANGED 0.917×
+
+DFlash D11 opened the FULL uniform-(1+k) CUDA-graph build — the SOLE residual after D9
+(our-DFlash-ON eager 0.917× vLLM-DFlash-ON graphed). The CG is a heavy multi-file new-CUDA
+increment in three parts: **A** = device paged draft-KV store; **B** = a new capture-safe
+`vt::DFlashPagedBlockAttention` kernel; **C** = the static-shape capture-safe draft forward +
+graph capture. This cycle landed **Part A as a device-store PRIMITIVE, CPU-bit-identity-gated
+locally**, and recorded the complete turnkey design for A-wire + B + C. It did NOT wire the
+runner, did NOT build B/C, and ran NO GPU gate (dev box has no GPU/nvcc) — those are the honest
+remaining work. No fabricated parity, no premature ceiling. Base `origin/main` `1940144f`;
+worktree `/home/mudler/_git/vllm.cpp/.claude/worktrees/agent-a2c03b73e7b840b3d`; CPU gate in
+`build-cpu`. NOT pushed; FULL SHA reported to caller.
+
+**What landed (Part A primitive, bit-identical, CPU-gated):** `include/.../qwen3_dflash.h`
+(forward-declared `struct DflashDeviceKVStore;` + 4 static methods) + `src/.../qwen3_dflash.cpp`
+(struct def + `MakeDeviceKVStore`/`AppendContextKVDevice`/`DeviceKVNumCtx`/
+`ForwardBlockLogitsWithDeviceKV`). The store keeps each request's per-layer bf16 K/V resident
+on device as append chunks (no `Download` on append, no `UploadContextKV` re-upload on forward,
+superseding the D9 host round-trip). `AppendContextKVDevice` reuses the EXACT D9
+`PrecomputeContextKVDevice` on the newly-accepted rows; `ForwardBlockLogitsWithDeviceKV`
+concatenates the per-request chunks into one combined `ContextKVDev` ON DEVICE via `vt::IndexCopy`
+(ascending-append = ascending-position order, the D9 invariant) and runs the UNCHANGED downstream
+core `ForwardWithCtxKVDev` — so the logits are BIT-IDENTICAL to `ForwardBlockLogitsWithPrecomputedKV`
+given identical appends. NO new CUDA kernel (reuses the sanitized `IndexCopy` + the D2
+`DFlashBlockAttention`).
+
+**Gate (CPU exact-equality, local, RED-capable):** two new cases in
+`tests/vllm/v1/spec_decode/test_dflash_propose.cpp` — device-store c1 (two appends {0,1} then {2})
+and multi-request concat (ctx 2+1) — both **exact float equality** vs the single-recompute
+`ForwardBlockLogitsWithContext`. PASS on `build-cpu` (`-Werror`-clean). The two D9 host cases + all
+prior propose cases still pass; the one failing case in that file is the PRE-EXISTING stale
+`method:"dflash"` config-parse test (needs a `model` key), unrelated to Part A and failing
+identically on the `origin/main` baseline.
+
+**Inertness BY CONSTRUCTION + speed UNCHANGED:** the production DFlash path (`propose_drafts_dflash`)
+was NOT changed — it still uses the D9 host store — so SACRED 235/235 + MTP 9/9 + DFlash e2e 27/27
+are byte-identical by construction; no new CUDA ⇒ `-Werror`/compute-sanitizer/`check-device-leakage`
+unchanged. Speed stays D9's 0.917× (Part A yields no speed on its own; it is the capture-ready
+substrate for B/C — D7 measured the analogous download removal at +2%, in-noise).
+
+**TURNKEY remaining (next cycle, exact anchors in spec §0 D11):**
+- **A-wire** — `runner.{h,cpp}`: member `dflash_kv_store_` → `std::vector<std::shared_ptr<vllm::DflashDeviceKVStore>>`; reset (`runner.cpp:1496`)/resize (`:1457`) via `MakeDeviceKVStore`; append (`:1537`) → `AppendContextKVDevice`; propose-batch forward (`:1573-1595`) → `ForwardBlockLogitsWithDeviceKV(stores, ctx_cu, …)`. GPU gate: e2e 27/27 SAME tokens + SACRED 235/235 + MTP 9/9.
+- **Part B** — new `vt::DFlashPagedBlockAttention` OpId + CUDA kernel: static grid over `(1+k)*num_reqs`; context as DATA (`seq_lens`+`block_table`+`block_size`) over the Part-A store; f32 online-softmax + paged phase + the D2 mask. **MANDATORY capture-safety fix ([[cudagraph-capture-bakes-stack-addresses]]):** `LaunchDFlashBlockAttention` (`cuda_ops.cu:1269-1290`) currently `cudaMallocAsync`/`cudaMemcpyAsync`s a function-local host `cu_seqlens` (`:1277-1280`) = the exact capture-UAF class → make `cu_seqlens`/`block_table`/`seq_lens` PERSISTENT pre-uploaded device buffers updated in-place before replay. Gate: CUDA==CPU + memcheck 0.
+- **Part C** — capture-safe static-shape `ForwardWithCtxKVDev` (`qwen3_dflash.cpp:418-620`) on persistent buffers padded to captured `num_reqs`; device mask-scatter replacing the host download/scatter/re-upload (`:478-498`); logits Download + sample OUTSIDE the graph; capture via the landed harness (`cuda_backend.cu:184-248`, `runner.cpp:935-948`); config-gated. Gate: replayed tokens == eager tokens BIT-IDENTICAL (diff the tokens) + e2e 27/27 + sanitizer 0 on kernel+capture; THEN c1 A/B our-ON-graphed vs vLLM-ON, GATE ours ≥ vLLM (CG should lift ON/OFF 2.60×→~2.91×, closing 0.917×→≥1.0×). If ≥ vLLM → SPEC-DFLASH DONE.
+
+**Disposition: SPEC-DFLASH stays `ACTIVE`** — Part A primitive landed + CPU-gated (zero-risk);
+A-wire + B + C turnkey; speed unchanged 0.917×. `benchmark_binding=false` (nothing measured
+changed).

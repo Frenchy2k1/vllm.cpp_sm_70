@@ -112,6 +112,19 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
 // _resolve_layer_attention (qwen3_dflash.py:86-146).
 std::vector<Qwen3DFlashLayerAttnMode> ResolveQwen3DFlashAttnModes(const HfConfig& config);
 
+// D11 (Part A) — DEVICE-RESIDENT append-only draft-KV store. Opaque handle (defined
+// in qwen3_dflash.cpp) holding, per request, the projected bf16 K/V for every draft
+// layer as device chunks that persist ACROSS verify steps. It supersedes D9's
+// host-vector PrecomputedContextKV + UploadContextKV re-upload: AppendContextKVDevice
+// projects ONLY the newly-accepted rows on-device and keeps their bf16 K/V resident
+// (no D->H download/H->D re-upload each step), and ForwardBlockLogitsWithDeviceKV runs
+// the block forward straight off the device store. It is BIT-IDENTICAL to the host
+// path by per-row projection independence (same PrecomputeContextKVDevice, same
+// ascending-position append order, same IndexCopy concat), so tokens+acceptance are
+// unchanged; it is the capture-ready substrate the Part B paged-attention kernel + the
+// Part C static-shape CUDA-graph draft step will read (block-table over these slots).
+struct DflashDeviceKVStore;
+
 // The DFlash draft forward. D2 owns the CONTEXT-FREE block forward (the isolation
 // gate): each request's uniform (1+k) query block attends only to itself through
 // vt::DFlashBlockAttention (non-causal full / causal SWA per layer). D3 extends
@@ -234,6 +247,42 @@ class Qwen3DFlashModel {
   // the [context; block] attention (the UNCHANGED D2 primitive) sees bit-identical inputs.
   static std::vector<float> ForwardBlockLogitsWithPrecomputedKV(
       const PrecomputedContextKV& ckv, const std::vector<int32_t>& ctx_cu,
+      const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
+      const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
+      vt::Queue& queue, std::vector<std::vector<float>>* per_layer_out = nullptr,
+      std::vector<float>* final_out = nullptr);
+
+  // ---- D11 Part A (device-resident append-only draft-KV store) ------------
+  //
+  // Create an empty per-request device KV store for `config.num_hidden_layers`
+  // draft layers. Held by the runner across verify steps (shared_ptr so the runner
+  // header needs only the forward declaration).
+  static std::shared_ptr<DflashDeviceKVStore> MakeDeviceKVStore(const HfConfig& config,
+                                                                vt::Queue& queue);
+
+  // Project the `count` NEW context rows (`new_features` [count,H] f32 at absolute
+  // `new_positions` [count]) to per-layer bf16 K/V ON DEVICE and append them (as a
+  // resident chunk) to `store`, growing num_ctx by count. Reuses the EXACT projection
+  // (PrecomputeContextKVDevice) the host AppendContextKVHost runs, but keeps the bits
+  // on device (no download). Per-row independence => bit-identical to the host store.
+  static void AppendContextKVDevice(DflashDeviceKVStore& store,
+                                    const std::vector<float>& new_features,
+                                    const std::vector<int32_t>& new_positions,
+                                    const Qwen3DFlashWeights& weights, const HfConfig& config,
+                                    vt::Queue& queue);
+
+  // Number of context rows currently resident in a device store.
+  static int64_t DeviceKVNumCtx(const DflashDeviceKVStore& store);
+
+  // CONTEXT-AWARE block forward over PERSISTENT DEVICE stores (the D11 production
+  // path): concatenates the `stores` (one per propose request, in ctx_cu order) into
+  // one combined device ContextKVDev ON DEVICE (no host round-trip) and runs the SAME
+  // downstream core (ForwardWithCtxKVDev) the D9 host path used, so the result is
+  // BIT-IDENTICAL to ForwardBlockLogitsWithPrecomputedKV given identical appends.
+  // `ctx_cu`/`cu` are the per-request context/query boundaries (length num_reqs+1);
+  // ctx_cu.back() == sum of the stores' num_ctx.
+  static std::vector<float> ForwardBlockLogitsWithDeviceKV(
+      const std::vector<DflashDeviceKVStore*>& stores, const std::vector<int32_t>& ctx_cu,
       const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
       const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
       vt::Queue& queue, std::vector<std::vector<float>>* per_layer_out = nullptr,

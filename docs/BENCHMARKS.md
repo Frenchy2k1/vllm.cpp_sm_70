@@ -214,6 +214,23 @@ only structural difference left is our eager draft step vs vLLM's graphed one (o
 CUDA) is the sole un-landed increment. Raw logs dgx `/tmp/d9_ab.log` + `/tmp/d9_vllm_on.log`; harness
 `/tmp/dflash_ab.sh`, `/tmp/vllm_on.sh`, `scripts/spec/vllm_dflash_timing.py`.
 
+**DFlash D11 - FULL-CG build OPENED; Part A device-store PRIMITIVE landed + CPU-bit-identity-GATED; speed
+UNCHANGED 0.917x.** `benchmark_binding=false` (NO new measurement - nothing in the measured production
+path changed this cycle). D11 opened the FULL uniform-(1+k) CUDA-graph build (the sole D9 residual). It
+landed **Part A only, as a device-store primitive**: a new opaque `DflashDeviceKVStore` +
+`Qwen3DFlashModel::{MakeDeviceKVStore, AppendContextKVDevice, DeviceKVNumCtx, ForwardBlockLogitsWithDeviceKV}`
+- an append-only device-resident bf16 draft-KV store (no download-on-append / upload-on-forward round-trip;
+on-device `IndexCopy` concat -> the UNCHANGED `ForwardWithCtxKVDev`). CPU exact-equality GATE (locally
+verified): two new `test_dflash_propose` cases (device c1 two-append + multi-request concat) = exact float
+equality vs the full recompute. The production runner (`propose_drafts_dflash`) was NOT wired to it this
+cycle, so SACRED 235/235 + MTP 9/9 + DFlash e2e 27/27 are byte-identical BY CONSTRUCTION and the c1 speed
+stays D9's **0.917x** (Part A yields no speed on its own - it is the capture-ready substrate for Parts B/C;
+D7 measured the analogous download-removal at +2%, in-noise). Remaining turnkey (spec section 0, D11):
+A-wire (runner swap) + Part B (`vt::DFlashPagedBlockAttention` capture-safe kernel, persistent
+`cu_seqlens`/`block_table`/`seq_lens` fixing the `cuda_ops.cu:1277-1280` capture-UAF) + Part C (static-shape
+capture) + the GPU gate + the >=vLLM c1 A/B (`scripts/spec/vllm_dflash_timing.py`, >=2 reps, cold leg
+discarded). If our-ON-graphed >= vLLM-ON -> SPEC-DFLASH DONE.
+
 **DFlash D8 - ACCEPTANCE RCA closed by measurement = bf16-IRREDUCIBLE (NOT a reducible per-step draft
 bug); FINAL c1 speed A/B on the golden set = ours ~31% below vLLM-DFlash-ON (2026-07-27,
 `CLAIM-DFLASH-D8`, dgx GB10 sm_121a, oracle vLLM 0.26.0.dev0).** `benchmark_binding=true`. NO engine code
