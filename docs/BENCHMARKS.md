@@ -5033,6 +5033,9 @@ is ~500 calls at ~40 ms, i.e. the 2026-07-25 numbers almost exactly. The count
 and the time in that trace were right; the attribution was not. It is the depth-1
 engine loop waiting for its own sampling, not an async-sampler defect. The
 per-call embedding barrier is absent from the new trace, which is W4e working.
+The mirror's enable predicate asks the BACKEND whether memory is unified rather
+than testing for CUDA, which is both more precise and what keeps the shared
+layer's device-leakage ratchet at its floor.
 Numbers, profile and reproduction:
 [W4 evidence](bench-evidence/w4-async-mirror-20260727.md). Spec and deviations:
 [.agents/specs/async-discrete-device-combine.md](../.agents/specs/async-discrete-device-combine.md).

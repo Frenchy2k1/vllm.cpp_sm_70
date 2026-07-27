@@ -549,6 +549,10 @@ InternLM2 plus a sliding window).
 
 ## Build and test lanes
 
+Device-specific references in the device-agnostic layer stay at their ratchet
+floor: capability questions ("is memory unified?") rather than device-type
+tests.
+
 Benchmark provenance is gated as well as measured: both the comparison and the
 same-binary A/B harness refuse to start a leg on a GPU that is not idle, after
 a cooldown rather than before it.
