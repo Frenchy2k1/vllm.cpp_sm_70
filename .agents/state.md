@@ -26056,3 +26056,36 @@ WORK rather than its latency, and the simdgroup_load-to-mma issue ratio at the
 64x64 tile (BK was only ever varied at 32x32).
 
 **Goal:** 15.30 of 27.9 tok/s, 1.82x remaining.
+
+---
+
+## 2026-07-27 — vectorised GEMM staging: kernel 1.55x, now 76-86% of MLX
+
+**Found by reading MLX's steel loader**, which the exclusion list made the
+obvious move: tile width, barriers, staging latency and mma precision were each
+measured and only the per-element staging WORK remained.
+`steel/gemm/loader.h:77` copies a whole vector per instruction
+(`*(threadgroup ReadVector*)dst = *(const device ReadVector*)src`); ours paid two
+branches inside `vt_load` per element plus a scalar threadgroup write.
+
+| shape | before | after | MLX steel |
+|---|--:|--:|--:|
+| qkv | 1484 GFLOP/s | **2282** | 2640 |
+| mlp-up | 1574 | **2501** | 3325 |
+| mlp-dn | 1507 | **2382** | 3293 |
+
+**1.55x on the kernel: 45% of MLX's GEMM -> 76-86% of it.** End to end 15.30 ->
+**15.85 tok/s**, TTFT **2065 -> 1774 ms**. The end-to-end gain is far smaller
+than the kernel gain because prefill is now only ~22% of the run.
+
+**Guarded:** bf16 x bf16, `k % 4 == 0`, `lda % 4 == 0`, BT, fully interior tile.
+Everything else keeps the generic path. SACRED gate 16/16 UNCHANGED, row
+diagnostic NONE, suite 21 cases / 20,135 assertions.
+
+**Method note worth keeping:** the four excluded hypotheses were what made this
+findable. Reading a competitor's source is far more productive once measurement
+has narrowed WHAT to look for; scanning `loader.h` first would have been one
+guess among many.
+
+**Goal:** 15.85 of 27.9 tok/s, 1.76x remaining. Decode is now dominant again
+(~6.3 s vs MLX-LM's 4.59 s, 1.37x); prefill ~1.77 s vs ~0.47 s.

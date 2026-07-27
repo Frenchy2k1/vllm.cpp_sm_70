@@ -2555,6 +2555,36 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal vectorised GEMM staging on Apple M4 (2026-07-27) - 1.55x on the kernel
+
+**Found by reading MLX's steel loader**, which the exclusion list below made the
+obvious next move: tile width, barriers, staging latency and mma precision had
+each been measured and only the per-element staging WORK remained.
+`steel/gemm/loader.h` copies a whole vector per instruction
+(`*(threadgroup ReadVector*)dst = *(const device ReadVector*)src`) where ours paid
+two branches inside `vt_load` per element plus a scalar threadgroup write.
+
+Vectorising the A-tile staging (bf16 `ushort4` loads, guarded on alignment):
+
+| shape | before | after | MLX steel |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 1484 GFLOP/s | **2282** | 2640 |
+| mlp-up 512x2048x6144 | 1574 | **2501** | 3325 |
+| mlp-dn 512x6144x2048 | 1507 | **2382** | 3293 |
+
+**~1.55x on the kernel, taking us from 45% of MLX's GEMM to 76-86% of it.**
+End to end 15.30 -> **15.85 tok/s**, TTFT **2065 -> 1774 ms (-14%)**. The
+end-to-end gain is much smaller than the kernel gain because prefill is now only
+~22% of the run.
+
+**Guards, so nothing loses correctness for another gaining speed:** the vector
+cast needs 8-byte alignment, so the fast path is taken only for bf16 x bf16 with
+`k % 4 == 0`, `lda % 4 == 0`, BT orientation, and a fully interior tile. Every
+other shape and dtype keeps the generic path. SACRED gate **16/16 unchanged, no
+golden re-capture**; row diagnostic NONE; suite 21 cases / 20,135 assertions.
+
+---
+
 ## GEMM limit: four hypotheses excluded (2026-07-27)
 
 Our GEMM is ~1.5 TFLOP/s against MLX's ~3.3. Four explanations were each built

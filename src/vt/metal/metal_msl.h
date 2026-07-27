@@ -521,6 +521,49 @@ kernel void vt_matmul_bt_mm(device const uchar* a   [[buffer(0)]],
     // Stage A[BM x BK] and B[BK x BN]. 256 elements each, 128 threads => 2 apiece.
     // Out-of-range lanes stage ZERO so the accumulate stays correct at the edges
     // without any special-casing in the inner loop.
+    // VECTORISED STAGING. Every operand element passes through here once per
+    // tile, and the generic path below pays two branches per element inside
+    // vt_load plus a scalar threadgroup write. MLX's steel loader instead copies
+    // a whole vector per instruction
+    // (steel/gemm/loader.h: *(threadgroup ReadVector*)dst = *(const device
+    // ReadVector*)src), which is the single structural difference left between
+    // its GEMM and ours after tile width, barriers, staging latency and mma
+    // precision were each measured and excluded.
+    //
+    // GUARDS. The vector cast needs 8-byte alignment, so it is taken only when
+    // both operands are bf16 AND the indices are multiples of 4: `kk` steps by 4
+    // within a BK=8 tile, k0 by BK, and `p.k % 4 == 0` / `p.lda % 4 == 0` carry
+    // the row starts. Anything else keeps the generic path, so no shape loses
+    // correctness for another gaining speed. The interior tile rows are also
+    // fully in range whenever `row0 + BM <= m` and `col0 + BN <= n`, which is
+    // what lets the fast path skip the per-element bounds test entirely.
+    const bool vec_ok = p.a_dt == VT_DT_BF16 && p.b_dt == VT_DT_BF16 &&
+                        (p.k & 3u) == 0u && (p.lda & 3u) == 0u && p.bt != 0u &&
+                        (row0 + VT_MM_BM) <= p.m && (col0 + VT_MM_BN) <= p.n &&
+                        (k0 + VT_MM_BK) <= p.k;
+    if (vec_ok) {
+      device const ushort* au = (device const ushort*)a;
+      device const ushort* bu = (device const ushort*)b;
+      for (uint e = tid * 4u; e < VT_MM_BM * VT_MM_BK; e += nthreads * 4u) {
+        const uint r = e / VT_MM_BK, kk = e % VT_MM_BK;
+        const ulong idx = ulong(row0 + r) * ulong(p.lda) + ulong(k0 + kk);
+        const ushort4 v = *((device const ushort4*)(au + idx));
+        threadgroup float* d = &sa[r * VT_MM_BK + kk];
+        d[0] = vt_bf16_to_f32(v.x); d[1] = vt_bf16_to_f32(v.y);
+        d[2] = vt_bf16_to_f32(v.z); d[3] = vt_bf16_to_f32(v.w);
+      }
+      for (uint e = tid * 4u; e < VT_MM_BK * VT_MM_BN; e += nthreads * 4u) {
+        const uint kk = e / VT_MM_BN, c = e % VT_MM_BN;
+        // BT: row `gc` is contiguous over k, so four CONSECUTIVE columns of the
+        // staged tile come from four DIFFERENT B rows; the vector load therefore
+        // runs along k for one column, and the four results are scattered into
+        // the tile row. Reading along k is the coalesced direction here.
+        for (uint q = 0u; q < 4u; ++q) {
+          const ulong idx = ulong(col0 + c + q) * ulong(p.k) + ulong(k0 + kk);
+          sb[kk * VT_MM_BN + c + q] = vt_bf16_to_f32(bu[idx]);
+        }
+      }
+    } else {
     for (uint e = tid; e < VT_MM_BM * VT_MM_BK; e += nthreads) {
       const uint r = e / VT_MM_BK, kk = e % VT_MM_BK;
       const uint gr = row0 + r, gk = k0 + kk;
@@ -537,6 +580,7 @@ kernel void vt_matmul_bt_mm(device const uchar* a   [[buffer(0)]],
                          : vt_load(b, p.b_dt, ulong(gk) * ulong(p.n) + ulong(gc));
       }
       sb[kk * VT_MM_BN + c] = v;
+    }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
