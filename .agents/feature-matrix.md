@@ -159,8 +159,8 @@ is configured, exactly as upstream loads its draft model on demand.
 | DFlash (block-diffusion drafter) | in-pin + published drafts for our models | 🚧 **spec written** (after MTP) | DGX-Spark community container exists; GDN slot memory at k=15 flagged | [specs/dflash-spec-decode.md](specs/dflash-spec-decode.md) |
 | DSpark (semi-autoregressive block drafter) | `v1/worker/gpu/spec_decode/dspark/`, `models/{qwen3_dspark,deepseek_v4/nvidia/dspark}.py` | ☐ T1 (**user-promoted**) | DeepSeek-V4 and Qwen3 draft layouts, reduced-vocab mapping, Markov sampling and full-CUDA-graph behavior inventoried as `SPEC-DSPARK`; dedicated spike follows parity/MTP | `planned: specs/dspark-spec-decode.md` |
 | TLI heterogeneous-vocabulary spec decode | `v1/spec_decode/vocab_mapping.py`, `config/speculative.py` | ☐ T1 | target↔draft ID mapping and shared-token constrained logits; current upstream validation is greedy draft only; inventory row `SPEC-TLI` | `planned: specs/tli-spec-decode.md` |
-| ngram | `v1/spec_decode/ngram_proposer.py` | ☐ T2 | | `planned: specs/spec-decode-ngram.md` |
-| EAGLE3 | `v1/spec_decode/eagle.py` | ☐ T2 | | `planned: specs/spec-decode-eagle3.md` |
+| ngram (draft-free proposer) | `v1/spec_decode/ngram_proposer.py` | ✅ **DONE (`SPEC-NGRAM`, 2026-07-27)** | Draft-FREE suffix-ngram matcher (KMP-LPS, 1:1 port) wired as a third method reusing the MTP/DFlash verify/reject/`take_draft_token_ids` loop. 27B gate: 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted; unit 19/19; spec-OFF byte-identical (SACRED 235/235 + MTP 9/9 + DFlash 27/27); no new kernel | [specs/spec-decode-breadth-d3.md](specs/spec-decode-breadth-d3.md) |
+| EAGLE3 | `v1/spec_decode/eagle.py` | 🚫 **SCOPED — reachable-blocked (`SPEC-EAGLE3`)** | Port designed (reuses DFlash D5 separate-draft loader + D1 aux multi-tap). BLOCKED: no ungated oracle-runnable EAGLE3 draft arch/checkpoint for a Qwen3.6 gate model at pin `555967922` (registry has no `Eagle3Qwen3_5*`; z-lab published DFlash not EAGLE3). No fabricated gate | [specs/spec-decode-breadth-d3.md](specs/spec-decode-breadth-d3.md) |
 
 ## 9. Serving surface (OpenAI API, endpoints, CLI, library)
 

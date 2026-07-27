@@ -433,10 +433,26 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
     cfg.draft_model_path = cli.draft_model_path;
     return cfg;
   }
+  // SPEC-NGRAM (ROAD-V1-D3): the draft-FREE n-gram proposer. num_speculative_tokens
+  // (k) is REQUIRED (speculative.py:1224-1234); the prompt_lookup window defaults to
+  // 5/5. There is NO draft checkpoint to load and NO n_predict-module constraint —
+  // the drafts come from matching the sequence's own suffix. The GDN spec verify
+  // machinery (widened conv + k+1 state slots) is still needed and is reused via
+  // MakeQwen3_5KVCacheSpec(num_spec>0) exactly like MTP; the fa_draft draft-KV group
+  // it allocates is simply unused (ngram has no draft-model forward).
+  if (cli.method == "ngram") {
+    if (!cli.num_speculative_tokens.has_value()) {
+      throw std::invalid_argument(
+          "speculative-config: method \"ngram\" requires num_speculative_tokens");
+    }
+    return vllm::SpeculativeConfig::ResolveNgram(*cli.num_speculative_tokens,
+                                                 cli.prompt_lookup_min,
+                                                 cli.prompt_lookup_max);
+  }
   if (cli.method != "mtp") {
     throw std::invalid_argument(
-        "speculative-config: only methods \"mtp\" and \"dflash\" are supported "
-        "(got \"" +
+        "speculative-config: only methods \"mtp\", \"dflash\" and \"ngram\" are "
+        "supported (got \"" +
         cli.method + "\")");
   }
   // mtp_num_hidden_layers from the checkpoint (text_config, default 1 — both gate

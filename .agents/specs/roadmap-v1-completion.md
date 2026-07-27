@@ -46,12 +46,12 @@ carry more than one class list the dominant one first.
 | `ROAD-V1-C9` recurring sync | **RI** (recurring) | Pin **advanced to `555967922` / vLLM 0.26.0.dev0 + transformers 5.14.1** (`CLAIM-PIN-ADVANCE-W5`); re-gate 296/299 GREEN, zero golden drift. This unblocked OLMo-3 W5, DFlash, Gemma-4 module. | Refresh exact performance denominators + target goldens/tests on 0.26; then the ongoing mechanical cycle. Never terminally "done" (recurring). |
 | `ROAD-V1-D1` backend fan-out | **RI + HW** | CUDA-arch **seams landed + gated** on sm_121a (`BACKEND-CUDA-ARCH-ADDITIVITY` ACTIVE: feature table, capability probe, runtime SM-dispatch registry). **CPU REACHABLE** (macOS M4 `-Werror`-clean, 108k assertions). **Metal/MLX REACHABLE + running** (`BACKEND-METAL-MLX` ACTIVE: 18 MSL kernels, 2 models token-exact/near-tie on Apple GPU, M3c-1/M3d landed). | **REACHABLE:** Metal/MLX perf close (still ~2.96× behind MLX-LM b=1; batched-decode tile kernel; binding needs M4 quiet/sudo), CPU B4 speed/RSS gates. **HW-BLOCKED (build-only ceiling):** ROCm (INVENTORIED, no AMD board), Intel XPU (SPIKE, no board + upstream loyalty target incomplete), discrete-Vulkan (ACTIVE skeleton + hermetic SPIR-V, but only llvmpipe/GB10-unified here), ANE (encoder/pooling niche), and every cross-family CUDA kernel body / gencode beyond sm_120/121. |
 | `ROAD-V1-D2` multi-GPU/TP | **HW** | `PAR-TP` READY (spike accepted). | Runtime is **HW-BLOCKED: needs a 2-GPU box** (GB10 is single-GPU). Reachable build-only: TP mock/ABI Phase-0. PP/EP/DP/sequence-MoE/multinode all INVENTORIED and also multi-GPU-gated. |
-| `ROAD-V1-D3` spec-decode breadth | **RI** | Reuses the landed spec machinery (frozen ABI + rejection sampler + runner loop from MTP/DFlash). | `SPEC-NGRAM` (INVENTORIED — no draft model, cheapest) + `SPEC-EAGLE3` (INVENTORIED — draft-model download). High value/size because the harness already exists. |
+| `ROAD-V1-D3` spec-decode breadth | **DONE** (2026-07-27) | Reused the landed spec machinery (frozen ABI + rejection sampler + runner loop from MTP/DFlash). | `SPEC-NGRAM` **DONE/ACTIVE** — draft-FREE n-gram proposer (1:1 port of `ngram_proposer.py`), 27B gate 5/5 STRICT our-ngram-ON == vLLM-ngram-ON + 180/180 accepted, spec-OFF byte-identical (SACRED 235 + MTP 9 + DFlash 27), no new kernel. `SPEC-EAGLE3` **BLOCKED (honest)** — no ungated oracle-runnable EAGLE3 draft arch/checkpoint for a Qwen3.6 gate model at pin `555967922` (registry has no `Eagle3Qwen3_5*`; z-lab published DFlash not EAGLE3); port scoped. See [spec-decode-breadth-d3.md](spec-decode-breadth-d3.md). |
 | `ROAD-V1-D4` KV-disk/LMCache | **RI** (+HW sub) | `KV-OFFLOAD` ACTIVE (CPU+disk tiers W1–W5, 32/48 restart-prefill saved); `KV-EXTERNAL-CACHE` ACTIVE (LMCache `lm://` client W1–W5, bit-identical vs cold prefill on OPT-125m); `KV-CONNECTORS` ACTIVE (ABI + `--kv-transfer-config` CLI). | `KV-EVENTS` (SPIKE), W6 LMCache go/no-go study, W7 named per-sequence save/restore (the beyond-parity item), and a **binding every-axis LMCache grid on a LARGER model** (125M is noise-dominated). **HW-BLOCKED sub:** NIXL/Mooncake/HF3FS/MoRI-IO + P/D disaggregation (need RDMA/multi-node). |
 | `ROAD-V1-D4-APC` prefix caching | **RI** (headline) | Deep port already default-ON for dense: `KV-PREFIX-CACHE` PARTIAL (chain hashing, block pool, all coordinators, hybrid intersection, stats, hit-rate 0.75); `KV-BLOCK-POOL`/`KV-HYBRID-COORD` PARTIAL; `ENG-CASCADE-ATTN` verified-not-owed on the mirrored path. | **W3: the first-ever cache-ON model gate** (token-exact ON/OFF/oracle + every-axis grid — precondition is only GPU time). Then W2 `extra_keys` (**blocks MM/LoRA cache consumers**), W4 events, W5 partial-block, W6 Mamba `align` (`KV-MAMBA-ALIGN` SPIKE), W7 `reset_prefix_cache`. User headline: "same featureset as vLLM and better". |
 | `ROAD-V1-D5` LoRA/offload/experts | **RI** | `ENG-EXPERT-STREAM` READY (surpass-track spike accepted; absent in pinned vLLM). | `ENG-EXPERT-STREAM` W0–W2 (bank/reader/cache-policy), `ENG-WEIGHT-OFFLOAD` (INVENTORIED, UVA `cpu_offload_gb`), `LORA-RUNTIME` + `LORA-ENDPOINTS` (INVENTORIED, Punica-style batched apply + dynamic load/unload). LoRA is the user headline; large. |
 
-**Counts (18 portfolio rows):** **DONE = 2** (`C1` cornerstone, `C3` core spec-decode) · **REACHABLE-INCOMPLETE = 15** (`A, MM, C2, C2a, C4, C5, C6, C7, C8, C9, D1, D3, D4, D4-APC, D5` — note `MM/C2/D1/D4` also carry HW/EXT sub-items) · **HW-BLOCKED (primary) = 1** (`D2`). No row is *purely* external-blocked; EXT applies to sub-items (Gemma-4, Command-R, DeepSeek-V3.2/GLM-5 DSA) inside `MM`/`C2`.
+**Counts (18 portfolio rows):** **DONE = 3** (`C1` cornerstone, `C3` core spec-decode, `D3` spec-decode breadth) · **REACHABLE-INCOMPLETE = 14** (`A, MM, C2, C2a, C4, C5, C6, C7, C8, C9, D1, D4, D4-APC, D5` — note `MM/C2/D1/D4` also carry HW/EXT sub-items) · **HW-BLOCKED (primary) = 1** (`D2`). No row is *purely* external-blocked; EXT applies to sub-items (Gemma-4, Command-R, DeepSeek-V3.2/GLM-5 DSA) inside `MM`/`C2`.
 
 ## 2. The blocked set (what bounds "complete roadmap_v1")
 
@@ -103,10 +103,12 @@ gate → size (S/M/L) → vehicle model. `[H]` = user-directed headline.
    `SERVE-ASYNC-LLM` prod-ON to unblock the SGLang arm. **Gate:** 35B every-axis ≥ vLLM;
    SGLang preflight equivalence then the binding SGLang + prefix arms. **Size M→L.**
    **Vehicle:** Qwen3.6-35B-A3B-NVFP4.
-6. **`ROAD-V1-D3` ngram + EAGLE3** (reuses the landed MTP/DFlash machinery → cheap). W:
-   `SPEC-NGRAM` proposer (no model) first; then `SPEC-EAGLE3` drafter. **Gate:** c1
-   token-exact + ≥ vLLM speed (the ratified spec-decode bar). **Size S (ngram) / M
-   (EAGLE3).** **Vehicle:** 27B for ngram; an EAGLE3 draft checkpoint.
+6. **`ROAD-V1-D3` ngram + EAGLE3 — DONE 2026-07-27.** `SPEC-NGRAM` (draft-free
+   proposer, no model) LANDED + gated: 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON
+   + 180/180 accepted, spec-OFF byte-identical, no new kernel. `SPEC-EAGLE3` honest
+   reachable-BLOCKED (no ungated oracle-runnable EAGLE3 draft arch/checkpoint for a
+   Qwen3.6 gate model at pin `555967922`; port scoped). See
+   [spec-decode-breadth-d3.md](spec-decode-breadth-d3.md).
 7. **`ROAD-V1-C8` /metrics + streaming parser + utility endpoints** `[H]` (oldest T0
    debt). W: `/metrics` Prometheus core → `TOOLS-STREAMING-PARSER` →
    `SERVE-RESPONSE-METRICS` → `/tokenize`,`/detokenize`,reset. **Gate:** metric-name +
@@ -151,11 +153,12 @@ gate → size (S/M/L) → vehicle model. `[H]` = user-directed headline.
   first additive model + a 20-family text sweep **correctness**, D4 KV-disk+LMCache
   **landed**, D1 CUDA-arch **seams**), but those rows retain an open SPEED or breadth
   gate and so are not row-DONE.
-- **REACHABLE-INCOMPLETE: 15** rows — executable now on GB10 + CPU + M4. The single
+- **REACHABLE-INCOMPLETE: 14** rows — executable now on GB10 + CPU + M4. The single
   dominant cross-cutting gate is **every-axis SPEED**: it is the entire remaining work
   for MM and the 20 correctness-complete model families, and a major part of A, C4, C5,
-  C6, D1, D4. The reachable feature-parity gaps (C7 sampling, C8 metrics/parser, D3
-  spec-breadth, D4-APC prefix, D5 LoRA) are ordinary ports with existing harnesses.
+  C6, D1, D4. The reachable feature-parity gaps (C7 sampling, C8 metrics/parser,
+  D4-APC prefix, D5 LoRA) are ordinary ports with existing harnesses. (D3 spec-breadth
+  CLOSED 2026-07-27: ngram gated + EAGLE3 honestly blocked.)
 - **HW/EXTERNAL-BLOCKED: bounds completeness.** "Complete roadmap_v1" is **NOT fully
   reachable on the current hardware.** It is bounded by, and only by, the blocked set in
   §2: `ROAD-V1-D2` multi-GPU; the `ROAD-V1-D1` non-CUDA accelerators (ROCm, Intel XPU,

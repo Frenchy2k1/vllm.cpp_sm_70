@@ -28,6 +28,7 @@
 #include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"  // SPEC-MTP I5d MtpProposePrefill
 #include "vllm/v1/worker/gpu/spec_decode/dflash/speculator.h"  // SPEC-DFLASH D5 DflashProposeBlock
+#include "vllm/v1/spec_decode/ngram_proposer.h"  // SPEC-NGRAM D3 NgramPropose
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
@@ -978,8 +979,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       // dense/MoE forward then routes to ForwardDeviceTap (byte-identical logits).
       // Null on every default step, so the forward path is byte-identical.
       // SPEC-DFLASH D5: the DFlash drafter conditions on the MULTI-tap instead,
-      // so it uses aux_tap (below) and leaves hidden_tap null.
-      .hidden_tap = (spec_on() && !use_dflash()) ? &exec_state_.spec_hidden : nullptr,
+      // so it uses aux_tap (below) and leaves hidden_tap null. SPEC-NGRAM: the
+      // draft-free proposer needs no hidden state at all, so leave it null too.
+      .hidden_tap = (spec_on() && !use_dflash() && !use_ngram())
+                        ? &exec_state_.spec_hidden
+                        : nullptr,
   };
   // SPEC-DFLASH D5: on the verify forward capture the D1 multi-tap (the residual
   // stream at the draft's target_layer_ids) as [T, H×taps]. Mutually exclusive
@@ -1345,6 +1349,12 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
 void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
                                     const std::vector<int32_t>& num_rejected_in) {
   const int num_reqs = exec_state_.num_reqs;
+  // SPEC-NGRAM (ROAD-V1-D3): the draft-FREE proposer has no draft model, no hidden
+  // tap and no draft KV — it matches the sequence's own suffix. Route first.
+  if (use_ngram()) {
+    propose_drafts_ngram(num_sampled_in, num_rejected_in);
+    return;
+  }
   // SPEC-DFLASH D5: the block-diffusion drafter has no MTP draft_model_/
   // draft_attn_kv_ (it recomputes context K/V inline); route to its own propose.
   if (use_dflash()) {
@@ -1402,6 +1412,61 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
     } else {
       out.draft_token_ids.push_back({drafts[static_cast<size_t>(i)]});
     }
+  }
+  pending_drafts_ = std::move(out);
+}
+
+// SPEC-NGRAM (ROAD-V1-D3): the draft-FREE propose. Ported from
+// vllm/v1/spec_decode/ngram_proposer.py NgramProposer.propose (via NgramPropose).
+// Runs the host-side suffix-ngram matcher over each generating request's OWN
+// committed context and stashes the variable-length (0..k) drafts for the engine
+// core's out-of-band pull. No draft model / hidden tap / draft KV. The drafts are
+// verified next step by the target model through the SAME rejection/verify loop as
+// MTP/DFlash. UNREACHABLE unless method=="ngram".
+void GPUModelRunner::propose_drafts_ngram(
+    const std::vector<int32_t>& num_sampled_in,
+    const std::vector<int32_t>& /*num_rejected_in*/) {
+  const int num_reqs = exec_state_.num_reqs;
+  if (num_reqs == 0) {
+    pending_drafts_.reset();
+    return;
+  }
+  // valid_ngram_requests filter: a row proposes only if it committed >= 1 token
+  // this step AND is not a discarded (still-prefilling) chunk (ngram_proposer.py:
+  // 157-172; sampled_token_ids empty -> skip). num_tokens_no_spec / token_ids_cpu
+  // are already updated with this step's committed tokens by the caller.
+  vllm::v1::spec_decode::NgramConfig cfg;
+  cfg.min_n = spec_config_->prompt_lookup_min.value_or(0);
+  cfg.max_n = spec_config_->prompt_lookup_max.value_or(0);
+  cfg.max_model_len = input_batch_.max_model_len;
+  const int k = num_spec();
+
+  std::vector<bool> has_sampled(static_cast<size_t>(num_reqs), false);
+  std::vector<int32_t> num_tokens_no_spec(static_cast<size_t>(num_reqs), 0);
+  std::vector<const int32_t*> token_rows(static_cast<size_t>(num_reqs), nullptr);
+  for (int i = 0; i < num_reqs; ++i) {
+    const bool discarded = i < static_cast<int>(exec_state_.discard.size()) &&
+                           exec_state_.discard[static_cast<size_t>(i)];
+    has_sampled[static_cast<size_t>(i)] =
+        !discarded && num_sampled_in[static_cast<size_t>(i)] > 0;
+    num_tokens_no_spec[static_cast<size_t>(i)] =
+        input_batch_.num_tokens_no_spec[static_cast<size_t>(i)];
+    token_rows[static_cast<size_t>(i)] =
+        input_batch_.token_ids_cpu.data() +
+        static_cast<size_t>(i) * static_cast<size_t>(input_batch_.max_model_len);
+  }
+
+  std::vector<std::vector<int32_t>> drafts = vllm::v1::spec_decode::NgramPropose(
+      cfg, k, has_sampled, num_tokens_no_spec, token_rows);
+
+  // Stash the per-request drafts (variable length 0..k) for the out-of-band pull.
+  // An empty list clears a request's spec tokens (a plain decode next step).
+  DraftTokenIds out;
+  out.req_ids.reserve(static_cast<size_t>(num_reqs));
+  out.draft_token_ids.reserve(static_cast<size_t>(num_reqs));
+  for (int i = 0; i < num_reqs; ++i) {
+    out.req_ids.push_back(exec_state_.req_ids[static_cast<size_t>(i)]);
+    out.draft_token_ids.push_back(std::move(drafts[static_cast<size_t>(i)]));
   }
   pending_drafts_ = std::move(out);
 }

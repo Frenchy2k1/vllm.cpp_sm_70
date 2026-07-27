@@ -262,6 +262,10 @@ vllm_cpp_add_test(test_dflash_kvprep vllm/v1/spec_decode/test_dflash_kvprep.cpp)
 target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)
 target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-NGRAM (ROAD-V1-D3) — the draft-free n-gram matcher unit gate (ports
+# vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).
+vllm_cpp_add_test(test_ngram_proposer vllm/v1/spec_decode/test_ngram_proposer.cpp)
+target_include_directories(test_ngram_proposer PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_structured_output vllm/v1/structured_output/test_structured_output.cpp)
 vllm_cpp_add_test(test_apply_grammar_bitmask vllm/v1/structured_output/test_apply_grammar_bitmask.cpp)
 vllm_cpp_add_test(test_backend_native vllm/v1/structured_output/test_backend_native.cpp)
@@ -841,6 +845,16 @@ vllm_cpp_add_test(test_qwen36_spec_decode parity/test_qwen36_spec_decode.cpp)
 target_compile_definitions(test_qwen36_spec_decode PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen36_spec_decode PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# SPEC-NGRAM (ROAD-V1-D3) — the 27B draft-free ngram e2e gate: our ngram-ON ==
+# the committed vLLM-ngram-ON golden (STRICT, exactness-preserving greedy) +
+# measured nonzero acceptance ~ vLLM's. dgx-only; loud SKIP on the CPU dev box.
+vllm_cpp_add_test(test_qwen27_ngram_spec_decode
+  parity/test_qwen27_ngram_spec_decode.cpp)
+target_compile_definitions(test_qwen27_ngram_spec_decode PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen27_ngram_spec_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 vllm_cpp_add_test(test_qwen27_spec_decode_concurrent

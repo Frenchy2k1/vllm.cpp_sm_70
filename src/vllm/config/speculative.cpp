@@ -32,14 +32,15 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
         "speculative-config: a string \"method\" is required");
   }
   cfg.method = doc.at("method").get<std::string>();
-  // SPEC-DFLASH D4: accept "dflash" alongside "mtp". Both are draft-hidden-state
+  // SPEC-DFLASH D4: accept "dflash" alongside "mtp". SPEC-NGRAM (ROAD-V1-D3):
+  // accept "ngram" — the draft-free proposer. "mtp"/"dflash" are draft-hidden-state
   // methods; the loader resolves the concrete draft (MTP head vs the z-lab DFlash
-  // checkpoint) and the block-derived k from the model config. Any other method
-  // is still rejected at this pin (the two implemented speculators).
-  if (cfg.method != "mtp" && cfg.method != "dflash") {
+  // checkpoint) and the block-derived k from the model config. "ngram" needs no
+  // draft model. Any other method is still rejected at this pin.
+  if (cfg.method != "mtp" && cfg.method != "dflash" && cfg.method != "ngram") {
     throw std::invalid_argument(
-        "speculative-config: only methods \"mtp\" and \"dflash\" are supported at "
-        "this pin (got \"" +
+        "speculative-config: only methods \"mtp\", \"dflash\" and \"ngram\" are "
+        "supported at this pin (got \"" +
         cfg.method + "\")");
   }
 
@@ -54,6 +55,27 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
     }
     cfg.num_speculative_tokens = k.get<int>();
   }
+  // SPEC-NGRAM (ROAD-V1-D3): the n-gram proposer window (speculative.py:157-161).
+  // Optional; ResolveNgram defaults both to 5 when absent. Ignored for mtp/dflash.
+  auto parse_lookup = [&](const char* key) -> std::optional<int> {
+    if (doc.contains(key) && !doc.at(key).is_null()) {
+      const nlohmann::json& v = doc.at(key);
+      if (!v.is_number_integer() || v.get<int>() < 1) {
+        throw std::invalid_argument(std::string("speculative-config: ") + key +
+                                    " must be an integer >= 1");
+      }
+      return v.get<int>();
+    }
+    return std::nullopt;
+  };
+  cfg.prompt_lookup_min = parse_lookup("prompt_lookup_min");
+  cfg.prompt_lookup_max = parse_lookup("prompt_lookup_max");
+  if (cfg.method == "ngram" && !cfg.num_speculative_tokens.has_value()) {
+    throw std::invalid_argument(
+        "speculative-config: method \"ngram\" requires \"num_speculative_tokens\" "
+        "(speculative.py:1224-1234)");
+  }
+
   // SPEC-DFLASH D5: the DFlash draft is a SEPARATE checkpoint (unlike MTP's
   // in-target mtp.* tensors), so `--speculative-config` carries a `model` key
   // (vllm/config/speculative.py `model`) pointing at the z-lab draft. Required
