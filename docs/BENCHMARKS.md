@@ -4908,3 +4908,15 @@ re-capture list EMPTY; W4 kernel re-sync NONE. OUR engine (unchanged at `36381c1
 Release/sm_121a/cutlass-4.5.0/TRITON=ON (-Werror clean, 0 warnings) and re-gated on GB10 via
 full serial `ctest` under `flock`. A throughput-parity benchmark is out of scope for this
 correctness re-gate and remains PENDING for the W5 pin flip. Evidence on dgx `~/work/pin-drift/`.
+
+## roadmap_v1 completion punch-list (2026-07-27) - NOT APPLICABLE (records-only)
+
+Planning/classification record only; introduces no benchmark and shifts no
+feature lifecycle state. The authoritative per-row DONE / reachable-incomplete /
+HW-blocked / external-blocked classification and the ranked reachable execution
+plan are in `.agents/specs/roadmap-v1-completion.md`. No new measured number; all
+existing binding results and pending/void dispositions above stand unchanged. The
+dominant OPEN performance gate across the reachable portfolio remains every-axis
+SPEED closure (multimodal serving c2+, the 35B c1/c2 residual, the ~20
+correctness-complete text families, GGUF decode >=10x at M=1). Reproduction:
+none - this entry is a pointer, not a run.

@@ -25416,3 +25416,49 @@ NOT paused (the pause script correctly refused to boot a runner mid-job).
 **Next.** A small-m GEMM for batched decode (m=2..16), and the simdgroup-matrix
 GEMM for the 168 prefill dispatches, which is now a much smaller row than `M3d`
 originally implied. `M3c-3`/`M3c-4` unchanged.
+
+## 2026-07-27 — roadmap_v1 COMPLETION PUNCH-LIST (records-only plan of record) — `CLAIM-ROADMAP-V1-COMPLETION`
+
+Base `origin/main` `76d2b8ea`. READ-ONLY analysis; no `src/`/`tests/` touched (SACRED
+byte-identical). Deliverable: `.agents/specs/roadmap-v1-completion.md` — the
+authoritative classification of EVERY `ROAD-V1-*` portfolio row plus the ranked
+reachable execution order for finishing the whole portfolio (not just the 6
+delivered headline priorities). Cross-checked against all six area matrices + the
+roadmap portfolio table + state/ledger at the base SHA.
+
+**Classification counts (18 portfolio rows):**
+- **DONE (merged+gated) = 2:** `ROAD-V1-C1` (extensibility ABI + Platform seam + model
+  self-registration + the portable op-fusion ORDER-1 cornerstone `KERNEL-FUSION-FRAMEWORK`
+  W0-W4; row stays SPIKE-open only for non-blocking perf-interpreter / non-CUDA
+  realization) and `ROAD-V1-C3` (MTP k=1 `SPEC-MTP` DONE both gate models + DFlash
+  `SPEC-DFLASH` D14 speed gate MET; only DSpark/TLI tail remains, overlaps D3).
+- **REACHABLE-INCOMPLETE = 15:** A, MM, C2, C2a, C4, C5, C6, C7, C8, C9, D1, D3, D4,
+  D4-APC, D5. The single dominant remaining gate across the reachable set is **every-axis
+  SPEED** — it is the entire remaining work for MM (image/video/audio are correctness-DONE)
+  and the ~20 correctness-complete text families, plus a major part of A (35B), C4 (GGUF
+  10x decode), C5, C6, D1 (Metal/CPU). The feature-parity gaps (C7 sampling/logprobs, C8
+  metrics/`/metrics`/streaming-parser, D3 ngram/EAGLE3, D4-APC prefix cache-ON gate, D5
+  LoRA) are ordinary ports with existing harnesses.
+- **HW-BLOCKED primary = 1:** `ROAD-V1-D2` multi-GPU/TP (needs a ≥2-GPU box; build-only
+  mock/ABI reachable). MM/C2/D1/D4 additionally carry HW/EXT sub-items.
+
+**Blocked set that BOUNDS "complete roadmap_v1" (NOT fully reachable on current HW):**
+- HW: D2 multi-GPU; D1 ROCm / Intel-XPU / discrete-Vulkan / ANE runtimes + CUDA arch
+  fan-out beyond sm_120/121 (only GB10 sm_121 gateable); RDMA/multi-node KV connectors
+  (NIXL/Mooncake/HF3FS + P/D disaggregation); frontier models over the 119 GiB unified
+  pool (DeepSeek-V3/V3.2, GLM-5, MiniMax-M2/M3, Kimi-K2). Kimi-Linear-48B (91.5 GiB) +
+  GLM-4.5-Air-FP8 (104.8 GiB) DO fit → reachable.
+- EXTERNAL: Gemma-4 mm/audio (transformers module cleared by the 0.26 pin, but checkpoints
+  HF-token-gated + USM-Conformer tower owed), Command-R/Cohere (HF-token-gated ckpts,
+  dgx disk-full), DeepSeek-V3.2/GLM-5 DSA (DSA indexer dep). The 0.26 pin advance
+  UNBLOCKED OLMo-3 W5 and DFlash (both moved out of blocked).
+
+**Bottom line:** full portfolio completion is REACHABLE for the entire C-track feature
+parity + all speed closure + the reachable model zoo + Metal/CPU, and is BOUNDED only by
+the HW/external set above. Every blocked item has a landable additive/build-only portion
+(honesty-pass ceiling); none has a runtime gate without the missing board/token/dep.
+
+**Records:** spec `.agents/specs/roadmap-v1-completion.md`; pointer added to
+`roadmap_v1.md` (portfolio intro), README (Project record), BENCHMARKS (NOT-APPLICABLE),
+ledger (`CLAIM-ROADMAP-V1-COMPLETION`). No src/tests. Seven checkers bare RC green.
+NOT pushed; FULL SHA reported to caller.

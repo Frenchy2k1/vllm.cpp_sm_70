@@ -345,7 +345,7 @@ vLLM is an excellent serving framework, but running it drags in a heavy Python /
 
 ## Project record
 
-The canonical project record lives under [`.agents/`](.agents/), indexed by [AGENTS.md](AGENTS.md). This README is a human-readable current-state snapshot, not a chronological log: detailed status and evidence live in [`.agents/state.md`](.agents/state.md), the [parity ledger](.agents/parity-ledger.md), the [area matrices](.agents/model-matrix.md), and [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+The canonical project record lives under [`.agents/`](.agents/), indexed by [AGENTS.md](AGENTS.md). This README is a human-readable current-state snapshot, not a chronological log: detailed status and evidence live in [`.agents/state.md`](.agents/state.md), the [parity ledger](.agents/parity-ledger.md), the [area matrices](.agents/model-matrix.md), and [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The portfolio-completion plan (what is done, reachable, or hardware/external blocked) is tracked in [`.agents/specs/roadmap-v1-completion.md`](.agents/specs/roadmap-v1-completion.md).
 
 ## Citation
 

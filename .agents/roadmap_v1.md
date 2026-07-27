@@ -204,6 +204,16 @@ only in the linked area matrix; active agents/worktrees live in
 close the MVP operational gates, establish the kernel porting seam, execute T1,
 then expand backends and scale-out.
 
+**Completion plan of record (2026-07-27):** the authoritative per-row
+DONE / reachable-incomplete / HW-blocked / external-blocked classification, the
+ranked reachable punch-list, and the blocked set that bounds full completion live
+in [specs/roadmap-v1-completion.md](specs/roadmap-v1-completion.md). Bottom line:
+2 rows gate-DONE (C1 cornerstone, C3 MTP+DFlash), 15 reachable-incomplete on
+GB10/CPU/M4 (dominant remaining gate = every-axis SPEED), and completeness is
+bounded by the HW/external set (D2 multi-GPU; D1 ROCm/XPU/Vulkan-discrete/ANE +
+CUDA arch beyond sm_121; RDMA KV connectors; >119 GiB frontier models; HF-token /
+DSA-dep models).
+
 **RE-PRIORITIZATION (user-directed 2026-07-25, [[multimodal-is-top-priority-gate-models-already-mm]]):**
 **Multimodal support (Audio/Video/Image) with Gemma-4 and Qwen3.6 is now the TOP
 feature priority** (block `ROAD-V1-MM` below, sequenced immediately after the
