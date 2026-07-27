@@ -115,6 +115,28 @@ correctness-complete AND at/above vLLM throughput - the roadmap's final open spe
 The warp-kernel close + its GPU gate landed in commit `164453a2`; `SPEC-DFLASH` is `DONE`
 across the engine/model/kernel matrices.
 
+**ngram speculative decode (draft-free) - CORRECTNESS + ACCEPTANCE GATE PASSES (2026-07-27,
+`SPEC-NGRAM`, `CLAIM-ROADMAP-D3`, `benchmark_binding=false`).** The draft-FREE n-gram
+proposer (1:1 port of vLLM `v1/spec_decode/ngram_proposer.py`; no draft model, reuses the
+MTP/DFlash verify/reject loop). On the 27B NVFP4 target with `--speculative-config
+'{"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":3}'`,
+e2e `test_qwen27_ngram_spec_decode` is **5/5 prompts STRICT token-exact vs the committed
+vLLM-ngram-ON golden** (`tests/parity/goldens/ngram_27b/ngram_27b_spec_on.json`, captured with
+vLLM 0.26.0.dev0) on a deterministic repetitive battery (ngram's design workload), with
+**180/180 drafts accepted** (acceptance_len 4.0 == max 1+k on every prompt, exactly matching
+vLLM's num_accepted_delta 36/prompt) - the drafter is maximally alive, not the dead-drafter
+trap. Unit `test_ngram_proposer` 19/19 (ports `tests/v1/spec_decode/test_ngram.py`). No speed
+A/B claimed (correctness/acceptance gate only; ngram is host-side, no new kernel). Note: on
+factual single-answer prompts ngram has near-zero acceptance (no repetition) AND hits bf16
+near-ties where even spec-OFF greedy diverges cross-engine (our-spec-OFF "capital of France" =
+"...\\n\\n<think>..." vs vLLM-spec-OFF "...The capital of Germany is Berlin..."), so the gate
+uses the repetitive battery to measure ngram correctness free of near-tie roulette; our ngram
+verify is exactness-preserving (our-ngram-ON == our-spec-OFF on those same prompts). Inertness:
+spec-OFF byte-identical - 27B SACRED 235/235 + MTP 9/9 + DFlash 27/27; CUDA `-Werror` clean.
+Repro: golden `scripts/spec/ngram_27b_golden.py`; gate `test_qwen27_ngram_spec_decode` (dgx).
+EAGLE3 (`SPEC-EAGLE3`) is honestly reachable-BLOCKED: no ungated oracle-runnable EAGLE3 draft
+arch/checkpoint for a Qwen3.6 gate model at pin `555967922` (no measurement possible).
+
 **DFlash D0-D12 history (superseded by D13; retained for the campaign record).** D0 ORACLE
 BASELINE CAPTURED, D1 landed (2026-07-26, `CLAIM-DFLASH-D0D1`,
 [spec §0](../.agents/specs/dflash-spec-decode.md)). `benchmark_binding=false` (a

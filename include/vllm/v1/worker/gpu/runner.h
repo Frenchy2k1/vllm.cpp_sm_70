@@ -465,6 +465,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   // and stashes the k drafts/request. Only reachable when use_dflash().
   void propose_drafts_dflash(const std::vector<int32_t>& num_sampled,
                              const std::vector<int32_t>& num_rejected);
+  // SPEC-NGRAM (ROAD-V1-D3): the draft-FREE branch of propose_drafts. Runs the
+  // host-side n-gram matcher (v1/spec_decode/ngram_proposer) over each generating
+  // request's own committed context (input_batch_.token_ids_cpu[i,
+  // :num_tokens_no_spec[i]]) and stashes the variable-length (0..k) drafts. No
+  // draft model, no hidden tap, no draft KV. Only reachable when use_ngram().
+  void propose_drafts_ngram(const std::vector<int32_t>& num_sampled,
+                            const std::vector<int32_t>& num_rejected);
+  // method=="ngram": the draft-free proposer. Distinct from spec_on() (which is
+  // any speculator) and use_dflash(); gates the propose routing + suppresses the
+  // (unused) hidden-tap capture on the verify forward.
+  bool use_ngram() const {
+    return spec_config_.has_value() && spec_config_->use_ngram();
+  }
   // The drafts produced this step, pending pull by EngineCore::post_step. Empty
   // (nullopt) on the default path.
   std::optional<DraftTokenIds> pending_drafts_;

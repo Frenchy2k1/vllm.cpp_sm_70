@@ -50,6 +50,14 @@ struct SpeculativeConfig {
   // (speculative.py:482-486,860-863). 0 when not an n_predict-style method.
   int n_predict = 0;
 
+  // SPEC-NGRAM (ROAD-V1-D3): the n-gram proposer window (speculative.py:157-161
+  // prompt_lookup_max/prompt_lookup_min). Only meaningful for method=="ngram";
+  // the draft-free matcher looks for a suffix ngram of length in
+  // [prompt_lookup_min, prompt_lookup_max]. Defaulted to 5/5 by ResolveNgram when
+  // the user gives neither (speculative.py:737-742). std::nullopt for non-ngram.
+  std::optional<int> prompt_lookup_min = std::nullopt;
+  std::optional<int> prompt_lookup_max = std::nullopt;
+
   // ResolveMtp: build the scheduler-facing SpeculativeConfig for a Qwen3.5 MTP
   // checkpoint. Mirrors speculative.py:480-489 (method "mtp",
   // n_predict = mtp_num_hidden_layers) + :865-875 (default k = n_predict). A user
@@ -93,10 +101,59 @@ struct SpeculativeConfig {
     return cfg;
   }
 
+  // ResolveNgram: build the scheduler-facing SpeculativeConfig for the draft-free
+  // n-gram proposer (SPEC-NGRAM, ROAD-V1-D3). Mirrors speculative.py:734-762 —
+  // num_speculative_tokens (k) is REQUIRED (:1224-1234), and the prompt_lookup
+  // window defaults to 5/5 when the user gives neither, or fills the missing bound
+  // from the given one (:737-758). There is NO draft model and NO n_predict-module
+  // constraint. NumLookaheadTokens() returns 0 for ngram (the scheduler reserves no
+  // extra lookahead slots, scheduler.py:250-265 — none of the ngram branches fire),
+  // exactly like upstream; the drafts are verified via the scheduled spec tokens.
+  static SpeculativeConfig ResolveNgram(int k, std::optional<int> user_min,
+                                        std::optional<int> user_max) {
+    SpeculativeConfig cfg;
+    cfg.method = "ngram";
+    cfg.n_predict = 0;
+    if (k <= 0) {
+      throw std::invalid_argument(
+          "speculative-config: method \"ngram\" requires a positive "
+          "num_speculative_tokens");
+    }
+    cfg.num_speculative_tokens = k;
+    // Default resolution (speculative.py:737-758).
+    if (!user_min.has_value() && !user_max.has_value()) {
+      cfg.prompt_lookup_min = 5;
+      cfg.prompt_lookup_max = 5;
+    } else if (!user_min.has_value()) {
+      cfg.prompt_lookup_min = user_max;
+      cfg.prompt_lookup_max = user_max;
+    } else if (!user_max.has_value()) {
+      cfg.prompt_lookup_min = user_min;
+      cfg.prompt_lookup_max = user_min;
+    } else {
+      cfg.prompt_lookup_min = user_min;
+      cfg.prompt_lookup_max = user_max;
+    }
+    if (*cfg.prompt_lookup_min < 1 || *cfg.prompt_lookup_max < 1) {
+      throw std::invalid_argument(
+          "speculative-config: prompt_lookup_min/max must be >= 1");
+    }
+    if (*cfg.prompt_lookup_min > *cfg.prompt_lookup_max) {
+      throw std::invalid_argument(
+          "speculative-config: prompt_lookup_min must be <= prompt_lookup_max");
+    }
+    return cfg;
+  }
+
   // num_speculative_tokens resolved to a concrete k (falls back to n_predict).
   int ResolvedNumSpeculativeTokens() const {
     return num_speculative_tokens.value_or(n_predict);
   }
+
+  // use_ngram (speculative.py method=="ngram"): the draft-FREE proposer. It is NOT
+  // a target-hidden-state method, so it is deliberately absent from use_eagle()
+  // and contributes 0 to NumLookaheadTokens() (scheduler.py:250-265).
+  bool use_ngram() const { return method == "ngram"; }
 
   // use_eagle (speculative.py:1163-1170): true for the target-hidden-state
   // methods — eagle/eagle3/mtp/dflash/dspark. This is the predicate that sets the
