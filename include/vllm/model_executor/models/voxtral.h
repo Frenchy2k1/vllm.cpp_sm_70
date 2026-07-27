@@ -32,6 +32,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3.h"           // Qwen3DenseWeights, PagedKvCache
@@ -90,5 +91,67 @@ std::vector<int32_t> VoxtralGenerateGreedy(
     const std::vector<int32_t>& prompt_ids, const std::vector<float>& audio_embeds,
     int32_t audio_token_id, int32_t eos_token_id, const VoxtralWeights& weights,
     const HfConfig& config, vt::Queue& queue, int max_new_tokens);
+
+// BF16 Mistral/Llama full-attention decode CUDA-graph driver (ROAD-V1-MM lever #3
+// W1) — the Voxtral-text sibling of `Qwen3MoeDecodeGraph` (qwen3_moe.h, Qwen3-Coder
+// full-attention MoE) and `Qwen3_5DenseDecodeGraph` (qwen3_5_dense.h, 27B GDN-hybrid
+// dense). SAME cold -> warm -> capture -> replay state machine, SAME padded-batch
+// capture set (`decode_graph_sizes.h`, mirroring vLLM `_set_cudagraph_sizes`
+// reduced to the full-decode-cudagraph regime), the SAME persistent fixed-address
+// host inputs + persistent embed/logits buffers.
+//
+// It drives the Voxtral text stack (the shared `dense_attn::AttnBlock` full
+// attention + SwiGLU MLP + UNTIED lm_head — no GDN, no MoE), i.e. it captures the
+// EXACT `ForwardLastLogits` op sequence the eager decode already ran, so at the
+// single-sequence B==S==1 point the graph output is a bit-identical rebuild of the
+// eager forward (the same value flows through the same ops, launched from a graph
+// instead of per-step). The embedding stays OUTSIDE the capture (its device
+// bounds-flag alloc + stream sync are illegal inside a capture region; mirror
+// `EmbedInto`), run per step into the persistent hidden buffer.
+//
+// WHY THIS IS THE AUDIO LEVER (multimodal-speed.md §8/§9): the Voxtral 3B decode is
+// NOT bandwidth-floored (unlike the 27B, whose ~222 ms/token weight-streaming floor
+// hides the ~1 ms/token launch tax), so removing the eager per-step launch overhead
+// is where the audio 1.52x-vs-vLLM decode gap can actually close.
+//
+// Ported from: vllm/v1/worker/gpu_model_runner.py::GPUModelRunner (the
+// capture/replay dispatch, `_dummy_run` warm-up then `capture_model`) +
+// vllm/compilation/cuda_graph.py (pad-to-nearest-captured-size dispatch) @ pin
+// 555967922; in-repo template `Qwen3MoeDecodeGraph` (qwen3_moe.cpp).
+//
+// Enabled on CUDA when the backend supports capture; `VLLM_CPP_CUDAGRAPH=0` rolls
+// it back to the eager forward for a same-binary A/B. The mm greedy driver also
+// keeps the whole graph path behind `VT_MM_DECODE_EAGER` (default = graph;
+// parity-enabler-as-default), mirroring the 27B mm decode-graph brick.
+class VoxtralDecodeGraph {
+ public:
+  // `weights` is the Voxtral TEXT backbone (Qwen3DenseWeights: embed_tokens,
+  // per-layer Mistral/Llama full-attention + SwiGLU MLP, untied lm_head); `config`
+  // the Mistral/Llama text HfConfig. `max_num_reqs` caps the padded decode batch
+  // (== the single-sequence mm driver's 1).
+  VoxtralDecodeGraph(const Qwen3DenseWeights& weights, const HfConfig& config,
+                     vt::Queue queue, int64_t max_num_reqs);
+  ~VoxtralDecodeGraph();
+  VoxtralDecodeGraph(const VoxtralDecodeGraph&) = delete;
+  VoxtralDecodeGraph& operator=(const VoxtralDecodeGraph&) = delete;
+
+  // ONE pure-decode step for `token_ids.size()` requests (one token each). Pads to
+  // the nearest captured size, replays that size's graph and returns a NON-OWNING
+  // device view over the first B (real) rows of the slot's persistent [S, vocab]
+  // f32 logits (fed straight to `vt::GreedyArgmax`, no full-vocab D2H). Falls back
+  // to the eager forward (owning logits) when graphs are disabled or the batch
+  // exceeds the capture set.
+  ForwardLogits Step(const std::vector<int32_t>& token_ids,
+                     const std::vector<int32_t>& positions,
+                     const v1::CommonAttentionMetadata& attn_meta,
+                     const std::vector<PagedKvCache>& attn_kv);
+
+  bool captured() const;         // diagnostics: at least one live graph
+  int64_t replay_count() const;  // diagnostics: total replays
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 }  // namespace vllm
