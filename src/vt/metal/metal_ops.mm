@@ -114,6 +114,12 @@ struct RopeApplyParams {
   uint32_t t, hq, hk, rot, rhalf, is_neox, q_dt, k_dt, cache_dt, pos_i64, has_k, pad;
 };
 struct BwParams { uint32_t n_chunks, chunk_f4, stride_f4, tg, chunks_per_tg, pad; };
+struct QkNormRopeParams {
+  uint64_t q_s0, q_s1, k_s0, k_s1;
+  uint32_t t, hq, hk, d, rot, rhalf, is_neox, pos_i64;
+  uint32_t q_dt, k_dt, qw_dt, kw_dt, cache_dt, gemma, tg, pad;
+  float eps, pad2;
+};
 struct FStepGpu { uint32_t op, out, in0, in1, gemma, pad; };
 struct FcParams { uint32_t t, h, nsteps, x_dt, w_dt, res_dt, out_dt, tg; float eps; };
 
@@ -949,6 +955,43 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   e.DispatchGrid2D(hq, tq, tg);
 }
 
+// Fused Qwen3-dense attention preamble: RMSNorm(q) + RMSNorm(k) + partial NeoX
+// RoPE in ONE dispatch, replacing three. See vt_attn_qk_norm_rope in metal_msl.h
+// for why this is a launch-count win rather than a bandwidth one.
+void AttnQkNormRopeKernel(Queue&, Tensor& q3, Tensor& k3, const Tensor& q_norm,
+                          const Tensor& k_norm, const Tensor& cos_sin, const Tensor& positions,
+                          const RmsNormArgs& na, const RopeArgs& ra) {
+  VT_CHECK(q3.rank == 3 && k3.rank == 3, "metal qk_norm_rope: q/k must be [T,H,Dh]");
+  const int64_t T = q3.shape[0], Hq = q3.shape[1], Dh = q3.shape[2];
+  const int64_t Hk = k3.shape[1];
+  VT_CHECK(k3.shape[0] == T && k3.shape[2] == Dh, "metal qk_norm_rope: k shape mismatch");
+  const uint32_t rot = static_cast<uint32_t>(ra.rotary_dim > 0 ? ra.rotary_dim : Dh);
+  VT_CHECK((rot & 1u) == 0u && rot <= Dh, "metal qk_norm_rope: bad rotary_dim");
+  const uint32_t tg = ChooseThreadgroupSize(
+      static_cast<uint32_t>(Dh), MetalContext::Get().PipelineMaxThreads("vt_attn_qk_norm_rope"));
+  QkNormRopeParams p{
+      static_cast<uint64_t>(q3.stride[0]), static_cast<uint64_t>(q3.stride[1]),
+      static_cast<uint64_t>(k3.stride[0]), static_cast<uint64_t>(k3.stride[1]),
+      static_cast<uint32_t>(T),  static_cast<uint32_t>(Hq),
+      static_cast<uint32_t>(Hk), static_cast<uint32_t>(Dh),
+      rot, rot / 2u, 1u,
+      positions.dtype == DType::kI64 ? 1u : 0u,
+      DtypeCode(q3.dtype),     DtypeCode(k3.dtype),
+      DtypeCode(q_norm.dtype), DtypeCode(k_norm.dtype),
+      DtypeCode(cos_sin.dtype), na.gemma ? 1u : 0u, tg, 0u,
+      na.eps, 0.0f};
+  Encoder e("vt_attn_qk_norm_rope");
+  e.BindTensor(q3, 0, "qk_norm_rope: q");
+  e.BindTensor(k3, 1, "qk_norm_rope: k");
+  e.BindTensor(q_norm, 2, "qk_norm_rope: q_norm");
+  e.BindTensor(k_norm, 3, "qk_norm_rope: k_norm");
+  e.BindTensor(cos_sin, 4, "qk_norm_rope: cos_sin");
+  e.BindTensor(positions, 5, "qk_norm_rope: positions");
+  e.BindBytes(&p, sizeof(p), 6);
+  // One threadgroup per (token, head), q heads then k heads.
+  e.DispatchGrid2D(static_cast<uint32_t>(T), static_cast<uint32_t>(Hq + Hk), tg);
+}
+
 // cpu_sample.cpp:40-57 GreedyArgmaxKernel — one threadgroup per logits row.
 void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
@@ -1077,6 +1120,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
     RegisterOp(OpId::kRopeCosSinCache, DeviceType::kMETAL,
                reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernel)));
+    RegisterOp(OpId::kAttnQkNormRope, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<AttnQkNormRopeFn>(&AttnQkNormRopeKernel)));
     RegisterOp(OpId::kRopeFromCache, DeviceType::kMETAL,
                reinterpret_cast<void*>(static_cast<RopeFromCacheFn>(&RopeFromCacheKernel)));
   }

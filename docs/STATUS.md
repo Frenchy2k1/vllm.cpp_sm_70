@@ -272,7 +272,10 @@ parallelism under the paired harness confirmed the earlier exclusion at -1.03%.
 The decode residual is non-GEMV overhead (2.7 ms/token against MLX's implied
 2.0), so the next lever is a fused qk-norm-RoPE attention
 preamble. The dense recipe (kAttnQkNormRope) is composite-only on every backend
-(fast_op = kNoFastOp), so this means writing the kernel, not porting one. The V-accumulation win came from BISECTING the attention
+(fast_op = kNoFastOp), so this meant writing the kernel rather than porting one.
+That kernel now exists and is validated on Metal (worst element error 1.4e-06 vs
+the composite); routing the default bf16 attention path through the recipe is the
+remaining step before it moves the benchmark. The V-accumulation win came from BISECTING the attention
 kernel once a paired ABBA harness with cooldown made 0.2% differences
 measurable: the V loop moved 2 bytes per lane per load where the score loop
 moved 8, giving 29 GB/s against 64 on identical traffic. That also explains why

@@ -905,6 +905,21 @@ void DispatchFusedFast(Queue& q, const FusedRecipe& r, const FusedBinding& b,
                       residual, p.quant_scale);
       break;
     }
+    case OpId::kAttnQkNormRope: {
+      // operands: 0=q2[T*Hq,Dh] 1=q_norm 2=k2[T*Hkv,Dh] 3=k_norm
+      //           4=q3[T,Hq,Dh] 5=k3[T,Hkv,Dh] 6=cos_sin 7=positions
+      // The fused kernel norms and rotates q3/k3 IN PLACE; slots 0 and 2 are the
+      // 2-D aliases of the same buffers and are not passed on.
+      Tensor* q3 = FusedOp(b, 4, "fused_chain fast: null qk-norm-rope q3");
+      Tensor* k3 = FusedOp(b, 5, "fused_chain fast: null qk-norm-rope k3");
+      Tensor* qw = FusedOp(b, 1, "fused_chain fast: null qk-norm-rope q_norm");
+      Tensor* kw = FusedOp(b, 3, "fused_chain fast: null qk-norm-rope k_norm");
+      Tensor* cs = FusedOp(b, 6, "fused_chain fast: null qk-norm-rope cos_sin");
+      Tensor* po = FusedOp(b, 7, "fused_chain fast: null qk-norm-rope positions");
+      reinterpret_cast<AttnQkNormRopeFn>(GetOp(OpId::kAttnQkNormRope, q.device.type))(
+          q, *q3, *k3, *qw, *kw, *cs, *po, RmsNormArgs{p.eps, r.steps[0].gemma}, p.rope);
+      break;
+    }
     case OpId::kRmsNormGatedQuantFp8: {
       // operands: 0=x, 1=gate, 2=weight, 3=tmp_bf16 (unused), 4=out_fp8
       Tensor* out_fp8 = FusedOp(b, 4, "fused_chain fast: null gated fp8 out");
