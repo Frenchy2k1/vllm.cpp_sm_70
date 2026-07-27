@@ -1417,7 +1417,7 @@ void GPUModelRunner::set_dflash_draft(const vllm::Qwen3DFlashWeights* weights,
       dflash_tap_layer_ids_.push_back(id.get<int32_t>());
     }
   }
-  dflash_ctx_feats_.clear();
+  dflash_kv_store_.clear();
   dflash_ctx_len_.clear();
   dflash_ctx_reqid_.clear();
 }
@@ -1454,7 +1454,7 @@ void GPUModelRunner::propose_drafts_dflash(
   const StepInputs& step = exec_state_.step;
 
   if (static_cast<int>(dflash_ctx_len_.size()) < num_reqs) {
-    dflash_ctx_feats_.resize(static_cast<size_t>(num_reqs));
+    dflash_kv_store_.resize(static_cast<size_t>(num_reqs));
     dflash_ctx_len_.resize(static_cast<size_t>(num_reqs), 0);
     dflash_ctx_reqid_.resize(static_cast<size_t>(num_reqs));
   }
@@ -1481,11 +1481,9 @@ void GPUModelRunner::propose_drafts_dflash(
   const std::vector<float> combined = Qwen3DFlashModel::CombineAuxFeatures(
       aux_f32, T_total, *dflash_weights_, *dflash_config_, queue_);
 
-  // 3. Per request: reset a reused slot, accumulate the accepted-prefix features,
-  //    and (for a generating row) build the next (1+k) mask block.
-  std::vector<float> ctx_states;               // flat [sum L_i * H]
-  std::vector<int32_t> ctx_pos;                // [sum L_i]
-  std::vector<int32_t> ctx_cu = {0};           // [P+1]
+  // 3. Per request: reset a reused slot, PROJECT+APPEND only the newly-accepted
+  //    rows to the persistent per-request KV store (D9 — no full recompute), and
+  //    (for a generating row) build the next (1+k) mask block.
   std::vector<int32_t> blk_ids;                // [P*(1+k)]
   std::vector<int32_t> blk_pos;                // [P*(1+k)]
   std::vector<int32_t> blk_cu = {0};           // [P+1]
@@ -1495,7 +1493,7 @@ void GPUModelRunner::propose_drafts_dflash(
     // Reset a reused dense slot (a new request now occupies this row).
     if (dflash_ctx_reqid_[static_cast<size_t>(i)] !=
         exec_state_.req_ids[static_cast<size_t>(i)]) {
-      dflash_ctx_feats_[static_cast<size_t>(i)].clear();
+      dflash_kv_store_[static_cast<size_t>(i)] = {};
       dflash_ctx_len_[static_cast<size_t>(i)] = 0;
       dflash_ctx_reqid_[static_cast<size_t>(i)] =
           exec_state_.req_ids[static_cast<size_t>(i)];
@@ -1523,12 +1521,21 @@ void GPUModelRunner::propose_drafts_dflash(
     VT_CHECK(step.positions[static_cast<size_t>(rows[0])] == L,
              "propose_drafts_dflash: context position discontinuity (accumulation "
              "out of sync with the target's committed positions)");
-    std::vector<float>& feats = dflash_ctx_feats_[static_cast<size_t>(i)];
+    // Gather this step's `append` accepted-prefix combined features (in ascending
+    // position order) + their absolute positions [L, L+append), then project+append
+    // to the persistent KV store. This projects ONLY the new rows (D9) — bit-identical
+    // to the D5/D7 full recompute of the whole context by per-row projection independence.
+    std::vector<float> new_feats;
+    new_feats.reserve(static_cast<size_t>(append) * static_cast<size_t>(H));
+    std::vector<int32_t> new_pos(static_cast<size_t>(append));
     for (int j = 0; j < append; ++j) {
       const float* src =
           combined.data() + static_cast<size_t>(rows[j]) * static_cast<size_t>(H);
-      feats.insert(feats.end(), src, src + H);
+      new_feats.insert(new_feats.end(), src, src + H);
+      new_pos[static_cast<size_t>(j)] = static_cast<int32_t>(L + j);
     }
+    Qwen3DFlashModel::AppendContextKVHost(dflash_kv_store_[static_cast<size_t>(i)], new_feats,
+                                          new_pos, *dflash_weights_, *dflash_config_, queue_);
     dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
 
     // A discarded (still-prefilling chunk) row commits its chunk's features but
@@ -1548,13 +1555,12 @@ void GPUModelRunner::propose_drafts_dflash(
       blk_pos.push_back(static_cast<int32_t>(Lp + j));
     }
     blk_cu.push_back(static_cast<int32_t>(blk_ids.size()));
-    ctx_states.insert(ctx_states.end(), feats.begin(), feats.end());
-    for (int64_t p = 0; p < Lp; ++p) ctx_pos.push_back(static_cast<int32_t>(p));
-    ctx_cu.push_back(static_cast<int32_t>(ctx_pos.size()));
     propose_rows.push_back(i);
   }
 
-  // 4. Non-autoregressive (1+k) block propose over the accumulated context.
+  // 4. Non-autoregressive (1+k) block propose over the PERSISTENT context KV store.
+  //    Concatenate the propose rows' per-layer stores (ctx_cu order) into one combined
+  //    PrecomputedContextKV and run the context-aware block forward with NO re-projection.
   DraftTokenIds out;
   out.req_ids.reserve(static_cast<size_t>(num_reqs));
   out.draft_token_ids.assign(static_cast<size_t>(num_reqs), {});
@@ -1563,15 +1569,35 @@ void GPUModelRunner::propose_drafts_dflash(
 
   if (!propose_rows.empty()) {
     const int P = static_cast<int>(propose_rows.size());
-    DflashProposeResult res =
-        DflashProposeBlock(*dflash_weights_, *dflash_config_, ctx_states, ctx_pos,
-                           ctx_cu, blk_ids, blk_pos, blk_cu, P, k, queue_);
+    const int64_t Ldraft = dflash_config_->num_hidden_layers;
+    Qwen3DFlashModel::PrecomputedContextKV comb;
+    comb.k.assign(static_cast<size_t>(Ldraft), {});
+    comb.v.assign(static_cast<size_t>(Ldraft), {});
+    std::vector<int32_t> ctx_cu = {0};
+    int64_t total_ctx = 0;
+    for (int r = 0; r < P; ++r) {
+      const Qwen3DFlashModel::PrecomputedContextKV& st =
+          dflash_kv_store_[static_cast<size_t>(propose_rows[static_cast<size_t>(r)])];
+      for (int64_t l = 0; l < Ldraft; ++l) {
+        comb.k[static_cast<size_t>(l)].insert(comb.k[static_cast<size_t>(l)].end(),
+                                              st.k[static_cast<size_t>(l)].begin(),
+                                              st.k[static_cast<size_t>(l)].end());
+        comb.v[static_cast<size_t>(l)].insert(comb.v[static_cast<size_t>(l)].end(),
+                                              st.v[static_cast<size_t>(l)].begin(),
+                                              st.v[static_cast<size_t>(l)].end());
+      }
+      total_ctx += st.num_ctx;
+      ctx_cu.push_back(static_cast<int32_t>(total_ctx));
+    }
+    comb.num_ctx = total_ctx;
+    const std::vector<float> block_logits =
+        Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
+            comb, ctx_cu, blk_ids, blk_pos, blk_cu, *dflash_weights_, *dflash_config_, queue_);
+    const std::vector<std::vector<int32_t>> drafts = SampleDflashBlockDrafts(
+        block_logits, P, k, dflash_weights_->draft_vocab_size);
     for (int r = 0; r < P; ++r) {
       const int row = propose_rows[static_cast<size_t>(r)];
-      out.draft_token_ids[static_cast<size_t>(row)] =
-          res.draft_token_ids[static_cast<size_t>(r)];
-      // Acceptance telemetry seed: count proposals here (accepted counted on the
-      // next verify step's rejection walk, sample_tokens_with_rejection).
+      out.draft_token_ids[static_cast<size_t>(row)] = drafts[static_cast<size_t>(r)];
     }
   }
   pending_drafts_ = std::move(out);

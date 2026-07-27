@@ -410,13 +410,16 @@ Qwen3DFlashModel::ContextKV Qwen3DFlashModel::PrecomputeContextKV(
   return ckv;
 }
 
-std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithContext(
-    const std::vector<float>& context_states, const std::vector<int32_t>& context_positions,
-    const std::vector<int32_t>& ctx_cu, const std::vector<int32_t>& block_input_ids,
-    const std::vector<int32_t>& block_positions, const std::vector<int32_t>& cu,
-    const Qwen3DFlashWeights& weights, const HfConfig& config, vt::Queue& queue,
+// Shared core (D9): the [context; block] block forward GIVEN a device-resident
+// per-layer context K/V (ContextKVDev). Both ForwardBlockLogitsWithContext (which
+// re-projects the whole context every step) and ForwardBlockLogitsWithPrecomputedKV
+// (which uploads the persistent append-only store) build the ckv and delegate here,
+// so the two paths are byte-identical downstream of how ckv's bits were obtained.
+static std::vector<float> ForwardWithCtxKVDev(
+    Dev d, const ContextKVDev& ckv, const std::vector<int32_t>& ctx_cu,
+    const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
+    const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
     std::vector<std::vector<float>>* per_layer_out, std::vector<float>* final_out) {
-  Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t Tq = static_cast<int64_t>(block_input_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t Hq = config.num_attention_heads;
@@ -427,21 +430,14 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithContext(
   const float eps = static_cast<float>(config.rms_norm_eps);
   const int num_reqs = static_cast<int>(cu.size()) - 1;
   VT_CHECK(static_cast<int64_t>(block_positions.size()) == Tq,
-           "ForwardBlockLogitsWithContext: block_positions length must match input_ids");
+           "ForwardWithCtxKVDev: block_positions length must match input_ids");
   VT_CHECK(cu.size() >= 2 && cu.front() == 0 && cu.back() == static_cast<int32_t>(Tq),
-           "ForwardBlockLogitsWithContext: cu must span [0,Tq]");
+           "ForwardWithCtxKVDev: cu must span [0,Tq]");
   VT_CHECK(static_cast<int>(ctx_cu.size()) == num_reqs + 1 && ctx_cu.front() == 0,
-           "ForwardBlockLogitsWithContext: ctx_cu must be [num_reqs+1]");
-
-  // Precompute per-layer context K/V from the target features (D3 pre-insert),
-  // DEVICE-RESIDENT (D7): the per-layer K/V stay in bf16 device buffers (no D->H).
-  ContextKVDev ckv = PrecomputeContextKVDevice(d, context_states.data(),
-                                               context_positions.data(),
-                                               static_cast<int64_t>(context_positions.size()),
-                                               weights, config);
+           "ForwardWithCtxKVDev: ctx_cu must be [num_reqs+1]");
   const int64_t C = ckv.num_ctx;
   VT_CHECK(ctx_cu.back() == static_cast<int32_t>(C),
-           "ForwardBlockLogitsWithContext: ctx_cu.back() must equal num_ctx");
+           "ForwardWithCtxKVDev: ctx_cu.back() must equal num_ctx");
 
   // Combined [context; block] per-request layout for the attention (cu_comb), plus
   // the DEVICE index maps (D7) that place context/block rows into the combined
@@ -621,6 +617,101 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithContext(
   std::vector<float> out(static_cast<size_t>(Tq) * vocab);
   logits.Download(d, out.data());
   return out;
+}
+
+// Upload a persistent host bf16 PrecomputedContextKV into per-layer device buffers,
+// producing the SAME ContextKVDev the full recompute (PrecomputeContextKVDevice) would
+// build — the stored bf16 bits ARE the projection output (bit-identical, D9).
+static ContextKVDev UploadContextKV(Dev d,
+                                    const Qwen3DFlashModel::PrecomputedContextKV& store,
+                                    const HfConfig& config) {
+  const int64_t C = store.num_ctx;
+  const int64_t kdim = config.num_key_value_heads * config.head_dim;
+  ContextKVDev out;
+  out.num_ctx = C;
+  VT_CHECK(store.k.size() == static_cast<size_t>(config.num_hidden_layers) &&
+               store.v.size() == static_cast<size_t>(config.num_hidden_layers),
+           "UploadContextKV: store must hold one K/V per hidden layer");
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    VT_CHECK(static_cast<int64_t>(store.k[static_cast<size_t>(l)].size()) == C * kdim &&
+                 static_cast<int64_t>(store.v[static_cast<size_t>(l)].size()) == C * kdim,
+             "UploadContextKV: per-layer K/V size must be num_ctx*kv_dim");
+    DBuf k(d, DType::kBF16, {C, kdim},
+           C > 0 ? store.k[static_cast<size_t>(l)].data() : nullptr);
+    DBuf v(d, DType::kBF16, {C, kdim},
+           C > 0 ? store.v[static_cast<size_t>(l)].data() : nullptr);
+    out.k.push_back(std::move(k));
+    out.v.push_back(std::move(v));
+  }
+  return out;
+}
+
+std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithContext(
+    const std::vector<float>& context_states, const std::vector<int32_t>& context_positions,
+    const std::vector<int32_t>& ctx_cu, const std::vector<int32_t>& block_input_ids,
+    const std::vector<int32_t>& block_positions, const std::vector<int32_t>& cu,
+    const Qwen3DFlashWeights& weights, const HfConfig& config, vt::Queue& queue,
+    std::vector<std::vector<float>>* per_layer_out, std::vector<float>* final_out) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  // Per-step FULL recompute of the context K/V (D5/D7 path): re-projects the ENTIRE
+  // growing context every step (O(context^2) total). The D9 persistent path
+  // (ForwardBlockLogitsWithPrecomputedKV) replaces this with an append-only store.
+  ContextKVDev ckv = PrecomputeContextKVDevice(d, context_states.data(),
+                                               context_positions.data(),
+                                               static_cast<int64_t>(context_positions.size()),
+                                               weights, config);
+  return ForwardWithCtxKVDev(d, ckv, ctx_cu, block_input_ids, block_positions, cu, weights,
+                             config, per_layer_out, final_out);
+}
+
+void Qwen3DFlashModel::AppendContextKVHost(PrecomputedContextKV& store,
+                                           const std::vector<float>& new_features,
+                                           const std::vector<int32_t>& new_positions,
+                                           const Qwen3DFlashWeights& weights,
+                                           const HfConfig& config, vt::Queue& queue) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t H = config.hidden_size;
+  const int64_t kdim = config.num_key_value_heads * config.head_dim;
+  const int64_t L = config.num_hidden_layers;
+  const int64_t count = static_cast<int64_t>(new_positions.size());
+  if (store.k.empty()) {
+    store.k.assign(static_cast<size_t>(L), {});
+    store.v.assign(static_cast<size_t>(L), {});
+  }
+  VT_CHECK(store.k.size() == static_cast<size_t>(L) && store.v.size() == static_cast<size_t>(L),
+           "AppendContextKVHost: store layer count mismatch");
+  VT_CHECK(static_cast<int64_t>(new_features.size()) == count * H,
+           "AppendContextKVHost: new_features must be [count, H]");
+  if (count == 0) return;
+  // Project ONLY the `count` new rows (positions == their absolute positions), reusing
+  // the EXACT per-row projection the full recompute runs, then download the bf16 K/V
+  // and append. Per-row independence (hidden_norm/KV-GEMM/k_norm/RoPE) => these bits
+  // equal what a full C-row recompute would produce for these same rows.
+  ContextKVDev dev = PrecomputeContextKVDevice(d, new_features.data(), new_positions.data(),
+                                               count, weights, config);
+  for (int64_t l = 0; l < L; ++l) {
+    std::vector<uint16_t> kh(static_cast<size_t>(count) * kdim);
+    std::vector<uint16_t> vh(static_cast<size_t>(count) * kdim);
+    dev.k[static_cast<size_t>(l)].Download(d, kh.data());  // raw bf16 bits
+    dev.v[static_cast<size_t>(l)].Download(d, vh.data());
+    std::vector<uint16_t>& sk = store.k[static_cast<size_t>(l)];
+    std::vector<uint16_t>& sv = store.v[static_cast<size_t>(l)];
+    sk.insert(sk.end(), kh.begin(), kh.end());
+    sv.insert(sv.end(), vh.begin(), vh.end());
+  }
+  store.num_ctx += count;
+}
+
+std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
+    const PrecomputedContextKV& ckv_host, const std::vector<int32_t>& ctx_cu,
+    const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
+    const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
+    vt::Queue& queue, std::vector<std::vector<float>>* per_layer_out,
+    std::vector<float>* final_out) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  ContextKVDev ckv = UploadContextKV(d, ckv_host, config);
+  return ForwardWithCtxKVDev(d, ckv, ctx_cu, block_input_ids, block_positions, cu, weights,
+                             config, per_layer_out, final_out);
 }
 
 }  // namespace vllm
