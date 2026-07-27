@@ -2555,6 +2555,45 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## MEASUREMENT FLOOR: this machine's noise now exceeds the remaining gap (2026-07-27)
+
+Five IDENTICAL runs of the same binary, back to back under one GPU lock:
+
+```
+23.49  23.50  23.61  22.10  21.31   tok/s
+```
+
+**A 10% spread**, with the drop appearing as the machine heats. The remaining gap
+to MLX-LM is 5.5%. **Single measurements on this host, in this thermal state,
+cannot resolve the changes still worth making**, and every small-margin verdict
+below was taken under a floor that was not quantified until now.
+
+Concretely, this session's small-margin results should be read as provisional:
+the flash-decoding losses (1.9-6.3%) and the epilogue win (+0.4%) sit at or under
+this floor. The LARGE results are unaffected and stand: mma prefill attention
+(4.3x on the kernel, 270 -> 63 ms), query-tiled prefill attention (+32% at
+p=4096), the 4x4 GEMM regression (3.3x), and BM=128 (58%).
+
+**Two rejected changes, both now correctly classified as INCONCLUSIVE rather than
+negative:**
+
+- **Wider decode threadgroups** (tg = 8*d, VT_PA_VGROUPS 8): motivated by the
+  bandwidth probe's thread-count scaling. First read as a loss; under the floor
+  it is not separable from noise.
+- **SIMD-first threadgroup reductions.** `vt_tg_sum`/`vt_tg_max` did log2(tg)
+  barrier steps — eleven at tg=512 — and the attention softmax calls them twice
+  per key chunk. Replacing the tree with `simd_sum`/`simd_max` plus a 16-entry
+  combine cuts that to three barriers. Ordered A/B: 23.52 (new) vs 23.42 (base),
+  i.e. TIED. Reverted for lack of evidence, not because it is wrong; it is
+  structurally cheaper and worth retrying on a cooled host.
+
+**What this means for the goal.** Closing the last 5.5% requires a measurement
+setup that can resolve 1-2%: a cooled host, interleaved and order-balanced A/Bs,
+and many more repetitions than used here. That is a prerequisite for the work,
+not part of it.
+
+---
+
 ## KV-LAYOUT hypothesis REFUTED by direct measurement (2026-07-27)
 
 The entry below proposed that decode attention's ~29 GB/s comes from the KV

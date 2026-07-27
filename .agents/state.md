@@ -26848,3 +26848,50 @@ but flash-decoding at 128 groups lost, meaning its per-split overhead (redundant
 Q reads, redundant reductions, a combine pass) outweighed the gain rather than
 the direction being wrong. The next thing to look for is a way to add memory
 streams WITHOUT a combine pass.
+
+---
+
+## 2026-07-27 — MEASUREMENT FLOOR: the machine's noise now exceeds the remaining gap
+
+Five IDENTICAL runs of one binary, back to back under a single GPU lock:
+
+```
+23.49  23.50  23.61  22.10  21.31   tok/s      (10% spread)
+```
+
+The drop tracks the machine heating. **The remaining gap to MLX-LM is 5.5%, so
+single measurements here cannot resolve the changes still worth making** — and
+every small-margin verdict in this log was taken under a floor I did not quantify
+until now.
+
+**Reclassifying this session's small-margin results as PROVISIONAL:** the
+flash-decoding losses (1.9-6.3%) and the per-simdgroup epilogue win (+0.4%) sit
+at or under this floor. The large results are unaffected and stand: mma prefill
+attention (270 -> 63 ms), query-tiled prefill attention (+32% at p=4096), the
+4x4 GEMM regression (3.3x), BM=128 (58%), and the MLX provider's 46% decode cost.
+
+**Two changes tried this turn, both now INCONCLUSIVE rather than negative:**
+
+1. **Wider decode threadgroups** (tg = 8*d with VT_PA_VGROUPS = 8), motivated by
+   the bandwidth probe's thread-count scaling. Read as a loss on first
+   measurement; not separable from noise under the floor.
+2. **SIMD-first threadgroup reductions.** `vt_tg_sum`/`vt_tg_max` did log2(tg)
+   barrier steps — ELEVEN at tg=512 — and the attention softmax calls them twice
+   per key chunk, which was a coherent explanation for decode attention's 29 GB/s
+   against the probe's 69 (the probe has no reductions). Replacing the tree with
+   `simd_sum`/`simd_max` + a 16-entry combine gives three barriers. Ordered A/B:
+   **23.52 new vs 23.42 base — TIED.** Reverted for lack of evidence, NOT because
+   it is wrong: it is structurally cheaper and should be retried on a cooled host.
+   Note the first (unbalanced) A/B showed it 6% WORSE, which was pure drift — the
+   new binary ran second in every pair.
+
+**Order effects are real here:** the same build measured 23.57 standalone, 20.76
+running second in a pair, and 23.43 running first. Any A/B on this host must
+balance order, not just alternate.
+
+**Consequence for the standing goal.** Closing the last 5.5% needs a measurement
+setup that resolves 1-2%: cooled host, order-balanced interleaving, many more
+reps. That is a PREREQUISITE for the remaining work rather than part of it, and
+attempting further micro-optimisation without it will generate confident
+conclusions that are noise — which, reading back, is a risk several entries in
+this log already ran.
