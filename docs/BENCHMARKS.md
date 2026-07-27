@@ -2862,6 +2862,48 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Standing at 96.0-96.4%, and the largest remaining lead (2026-07-27)
+
+Thermally matched, warm, after four landed kernels:
+
+| | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| decode | 27.24 | 27.79 | **98.0%** |
+| total | 23.91 | 24.90 | **96.0%** |
+| prefill TTFT | 613 ms | 534 ms | 87% |
+
+```
+gap 172 ms = prefill 80 ms + decode 93 ms
+prefill excess ~= 35 ms attention + 15 ms GEMM + 30 ms other
+```
+
+**Largest single lead: prefill attention is STILL 5.2x slower per FLOP than our
+own GEMM.**
+
+```
+prefill attention   30.1 GFLOP in 55 ms  =  547 GFLOP/s
+prefill GEMM      1440   GFLOP in 505 ms = 2851 GFLOP/s
+at GEMM rate attention would be 10.6 ms (MLX implied ~20)
+```
+
+This is the same roofline signal that found the original 21x gap — the mma
+rewrite took attention from 108 to 547 GFLOP/s, which was the big structural win,
+but it did NOT reach the rate the same device sustains on a GEMM. ~44 ms of the
+80 ms prefill gap is here.
+
+**Likely cause, stated as hypothesis:** the tiling is BQ=32 x BK=16, so each
+threadgroup runs a full online-softmax pass (threadgroup reductions, per-row
+rescale via `diag(corr) @ O`) for only 16 keys, giving ~40 mma per softmax. A
+deeper BK amortises the softmax over more keys, but `sv` is f32 (needed for
+probability precision — see the mma landing entry) so BK=32 would put the K/V
+tiles at 24 KB and collide with the 32 KB budget. A bf16 `sv` with an f32 P would
+free the room; whether that keeps the near-tie goldens is the open question.
+
+**Not measured. Hypothesis with a roofline behind it, which is the same standing
+the KV-layout lead had before a probe refuted it.**
+
+---
+
 ## Fused preamble ROUTED onto the default path: +0.35% (2026-07-27)
 
 Closes the second blocker. The recipe branch in `dense_attn_block.h` now covers
