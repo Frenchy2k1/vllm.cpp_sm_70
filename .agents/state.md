@@ -26675,3 +26675,43 @@ kPagedAttention test uses head_dim 64 with no GQA — so the second output colum
 half and the shared-kv-head path had NO coverage and the first version passed
 everything while being wrong in the engine. The Qwen3-geometry test added here is
 what should have existed first.
+
+---
+
+## 2026-07-27 — GEMM tile closed both ways; sync-attribution correction; DECODE is now the majority
+
+**REJECTED — BM=128 via 16 simdgroups.** Every earlier tile-enlargement attempt
+added accumulators per simdgroup (4x2 -> 4x4) and hit the register wall. Adding
+SIMDGROUPS instead keeps the proven 8 accumulators each while cutting B-tile
+re-reads (traffic is `M*K*(N/BN) + K*N*(M/BM)`, and only the second term scales
+with BM). Measured GEMM 642 -> **1016 ms**, warm throughput 23.42 -> 22.2:
+512-thread threadgroups cost more residency than the traffic saves. Correctness
+held (112298 assertions). **Tile enlargement is closed in BOTH directions.**
+
+**MEASUREMENT CORRECTION (the 4th this session).** `VT_METAL_SYNC_DISPATCH=1`
+gives every dispatch its own command buffer, so per-kernel GPU times carry a
+per-command-buffer overhead. Quoting the GEMM's rate from it (642 ms ->
+2.24 TFLOP/s) UNDERSTATES the kernel. Backing it out of the warm batched total —
+634 ms TTFT less 63 ms attention less ~30 ms small kernels — gives ~541 ms, i.e.
+**2.66 TFLOP/s, ~91% of MLX's implied 2.94**, not the 73% asserted in earlier
+entries. Sync mode RANKS kernels; it must not be used to quote an absolute rate.
+Several earlier entries overstate the GEMM gap for exactly this reason.
+
+**Re-decomposed gap (warm, thermally matched):**
+
+```
+ours : prefill 0.634s + decode 4.799s = 5.433s
+mlx  : prefill 0.535s + decode 4.629s = 5.164s
+gap 269 ms = prefill 99 ms (37%) + decode 170 ms (63%)
+```
+
+**The attention fix flipped the balance — DECODE is now 63% of the remaining
+gap.** That reverses the standing assumption in every earlier entry. Decode is
+92% GEMV at ~99 GB/s, matching MLX's implied rate, so the residual is the 398
+dispatches per token: the FUSION project (rmsnorm into the GEMV, rope +
+reshape_and_cache into attention), not a faster kernel. Prefill's remaining 99 ms
+is ~50 ms of GEMM plus attention's 63 ms against MLX's implied ~20.
+
+**Standing goal: 94.5%, not met.** The two remaining projects are now ranked by
+evidence rather than assumption: decode fusion first (63% of the gap), then
+attention tile tuning and the last ~9% of GEMM.

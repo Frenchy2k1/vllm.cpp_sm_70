@@ -2555,6 +2555,41 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## GEMM tile enlargement closed in BOTH directions; the gap is now mostly DECODE (2026-07-27)
+
+**REJECTED - BM=128 via SIXTEEN simdgroups.** Every earlier attempt to enlarge
+the GEMM tile added accumulators per simdgroup (4x2 -> 4x4) and hit the register
+wall. Adding SIMDGROUPS instead keeps 8 accumulators each — the configuration
+already proven to fit — while cutting B-tile re-reads, since traffic is
+`M*K*(N/BN) + K*N*(M/BM)`. Measured: GEMM 642 -> **1016 ms**, warm throughput
+23.42 -> 22.2. 512-thread threadgroups cost more in residency than the traffic
+saves. **Tile enlargement is now closed in both directions.**
+
+**MEASUREMENT CORRECTION: sync-dispatch attribution inflates per-kernel times.**
+`VT_METAL_SYNC_DISPATCH=1` gives every dispatch its OWN command buffer, so each
+kernel's reported GPU time carries a per-command-buffer overhead. Reading the
+GEMM's rate off it (642 ms -> 2.24 TFLOP/s) UNDERSTATES the kernel. Backing it
+out of the warm batched total instead — 634 ms TTFT less 63 ms attention and
+~30 ms of small kernels — puts the GEMM at ~541 ms, i.e. **2.66 TFLOP/s, about
+91% of MLX's implied ~2.94**, not the 73% recorded in the entries below. Use sync
+mode to RANK kernels, never to quote an absolute rate.
+
+**Re-decomposed gap (warm, thermally matched):**
+
+```
+ours : prefill 0.634s + decode 4.799s = 5.433s
+mlx  : prefill 0.535s + decode 4.629s = 5.164s
+gap 269 ms = prefill 99 ms (37%) + decode 170 ms (63%)
+```
+
+**The attention fix flipped the balance: DECODE is now the majority of what is
+left**, not prefill. Decode is 92% GEMV at ~99 GB/s, matching MLX's implied rate,
+so the residual is the 398 dispatches per token — the fusion project, not a
+faster kernel. Prefill's remaining 99 ms is ~50 ms of GEMM (at 91% of MLX) plus
+attention's 63 ms against MLX's implied ~20.
+
+---
+
 ## Prefill attention on the MATRIX UNITS: 4.3x, and 94.5% of MLX-LM (2026-07-27)
 
 Closes the open lead below. `vt_paged_attention_mma` is flash attention on
