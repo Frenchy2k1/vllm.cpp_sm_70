@@ -2840,6 +2840,1086 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## The harness works: floor 10% -> 0.9%, and SIMD-first reductions are NEUTRAL (2026-07-27)
+
+First use of `scripts/metal-paired-ab.py`, and it validates itself. The baseline
+arm across six ABBA blocks:
+
+```
+23.18  23.38  23.37  23.38  23.36  23.37   tok/s   (0.9% spread)
+```
+
+**0.9% where the naive alternating loop gave 10%.** Cooldown plus order balancing
+turned an unusable host into one that resolves roughly 0.2% — better than the
+1-2% named as the prerequisite. The remaining 5.5% is now measurable.
+
+**Verdict on SIMD-first threadgroup reductions: NEUTRAL, not landed.**
+
+| block | A (base) | B (simd-first) | delta |
+|---|--:|--:|--:|
+| 0 | 23.18 | 23.36 | +0.18 |
+| 1 | 23.38 | 23.32 | -0.05 |
+| 2 | 23.37 | 23.35 | -0.02 |
+| 3 | 23.38 | 23.32 | -0.05 |
+| 4 | 23.36 | 23.36 | +0.00 |
+| 5 | 23.37 | 23.38 | +0.01 |
+
+Median -0.04%, B faster in 2 of 6 blocks. Cutting `vt_tg_sum`/`vt_tg_max` from
+eleven barrier steps to three changes nothing measurable, so **the barrier-chain
+explanation for decode attention's 29 GB/s is refuted too** — the fifth decode
+hypothesis to fall. Both earlier readings of this change (+0.5% standalone, -6%
+alternating) were noise; only the paired run is trustworthy.
+
+**Decode attention's 29 GB/s is now known NOT to be:** dispatch count / fusion,
+split-K parallelism, KV layout, threadgroup width, or reduction barrier depth.
+Five mechanisms tested and eliminated. It is still unexplained, but it is now
+measurable to 0.2%, which is the difference between guessing and bisecting.
+
+---
+
+## A paired A/B harness, because the alternating loop lies (2026-07-27)
+
+`scripts/metal-paired-ab.py`. The floor documented below makes the obvious
+comparison unusable: five identical runs spread 10%, and the SAME build reads
+23.57 standalone, 23.43 running first in a pair and 20.76 running second. A plain
+alternating loop hands that drift to whichever binary runs second — which is
+exactly how a TIED change first measured "6% worse" here.
+
+Two corrections, both required:
+
+- **ABBA blocks.** Each block runs A, B, B, A. Linear drift cancels within the
+  block instead of accumulating against one arm.
+- **Cooldown.** Idle seconds between every run so each starts from a comparable
+  thermal state.
+
+It reports the per-block PAIRED delta — the only quantity drift does not
+contaminate — plus a sign test, since with 6 blocks a consistent direction is
+p = 0.031 two-sided, which is a far stronger claim than any single pair of
+numbers.
+
+Use it for anything under ~5% on this host. The eyeballed alternating loop is
+fine for a 4.3x kernel win and worthless for a 1% one.
+
+---
+
+## MEASUREMENT FLOOR: this machine's noise now exceeds the remaining gap (2026-07-27)
+
+Five IDENTICAL runs of the same binary, back to back under one GPU lock:
+
+```
+23.49  23.50  23.61  22.10  21.31   tok/s
+```
+
+**A 10% spread**, with the drop appearing as the machine heats. The remaining gap
+to MLX-LM is 5.5%. **Single measurements on this host, in this thermal state,
+cannot resolve the changes still worth making**, and every small-margin verdict
+below was taken under a floor that was not quantified until now.
+
+Concretely, this session's small-margin results should be read as provisional:
+the flash-decoding losses (1.9-6.3%) and the epilogue win (+0.4%) sit at or under
+this floor. The LARGE results are unaffected and stand: mma prefill attention
+(4.3x on the kernel, 270 -> 63 ms), query-tiled prefill attention (+32% at
+p=4096), the 4x4 GEMM regression (3.3x), and BM=128 (58%).
+
+**Two rejected changes, both now correctly classified as INCONCLUSIVE rather than
+negative:**
+
+- **Wider decode threadgroups** (tg = 8*d, VT_PA_VGROUPS 8): motivated by the
+  bandwidth probe's thread-count scaling. First read as a loss; under the floor
+  it is not separable from noise.
+- **SIMD-first threadgroup reductions.** `vt_tg_sum`/`vt_tg_max` did log2(tg)
+  barrier steps — eleven at tg=512 — and the attention softmax calls them twice
+  per key chunk. Replacing the tree with `simd_sum`/`simd_max` plus a 16-entry
+  combine cuts that to three barriers. Ordered A/B: 23.52 (new) vs 23.42 (base),
+  i.e. TIED. Reverted for lack of evidence, not because it is wrong; it is
+  structurally cheaper and worth retrying on a cooled host.
+
+**What this means for the goal.** Closing the last 5.5% requires a measurement
+setup that can resolve 1-2%: a cooled host, interleaved and order-balanced A/Bs,
+and many more repetitions than used here. That is a prerequisite for the work,
+not part of it.
+
+---
+
+## KV-LAYOUT hypothesis REFUTED by direct measurement (2026-07-27)
+
+The entry below proposed that decode attention's ~29 GB/s comes from the KV
+cache's `[block][slot][kv_head][dim]` layout, whose single-head walk is 12.5%
+dense. **That is wrong**, and a strided-read probe (`vt_bw_probe`, opt-in via
+`VT_BW_PROBE=1`) settles it without touching the cache. Same 8 MB of USEFUL
+bytes at every stride; stride x8 IS the KV pattern:
+
+| stride | pattern | useful GB/s |
+|---|---|--:|
+| x1 | contiguous | 54.5 |
+| x2 | | 55.8 |
+| x4 | | 74.6 |
+| **x8** | **the KV single-head walk** | **69.1** |
+| x16 | | 77.1 |
+
+Striding does not reduce useful bandwidth here — it slightly increases it, a
+wider span spreading across more channels. A 12.5%-dense walk sustains 69 GB/s
+against decode attention's 29, so **the layout does not explain the gap** and the
+head-major cache refactor (which would have touched reshape_and_cache, every
+attention kernel and the CUDA path) is not worth doing on this evidence.
+
+**The probe's own first version was wrong and is worth recording.** It used one
+threadgroup per 256-byte chunk, so `ChooseThreadgroupSize(16)` gave each group 16
+threads and 32768 groups: it measured DISPATCH, not memory, reporting a flat
+~28 GB/s at every stride — which by coincidence matched decode attention's 29 and
+would have "confirmed" any hypothesis put to it. The fixed probe walks 64 chunks
+per group with 256 threads. **A probe that returns the number you expected is the
+one to double-check.**
+
+**Where this leaves the decode gap: open.** Three hypotheses have now been tested
+and refuted — dispatch/fusion (decode is 97% GPU-busy), split-K parallelism
+(flash-decoding measured slower), and layout (this probe). The probe does show
+bandwidth scaling with threadgroup count (512 groups reach 69 GB/s where decode
+attention's 16 groups get 29), so parallelism is implicated, yet flash-decoding
+at 128 groups was slower — meaning its overhead outweighed the gain, not that the
+direction is wrong. A cheaper way to add streams without a combine pass is the
+next thing to look for.
+
+---
+
+## Flash-decoding REJECTED — the decode bandwidth limit is LAYOUT, not parallelism (2026-07-27)
+
+**This refutes the fix proposed in the entry below, which was recorded one commit
+earlier.** Flash-decoding was implemented in full — a `vt_paged_attention_split`
+kernel reducing each key slice to a partial (max, sumexp, accumulator) triple,
+a `vt_paged_attention_combine` merge pass, process-lifetime scratch, and a
+`VT_METAL_NO_FLASH_DECODE` A/B lever — and it is SLOWER at every context length:
+
+| context | splits | decode OFF | decode ON |
+|---|--:|--:|--:|
+| 512 | 4 | 26.43 | 25.93 (-1.9%) |
+| 2048 | 8 | 22.88 | 22.26 (-2.7%) |
+| 4096 | 8 | 20.25 | 18.97 (-6.3%) |
+
+Sizing each split to own a FULL 256-key chunk (so the two threadgroup reductions
+per chunk are amortised) did not rescue it; the loss grows with context, i.e.
+with the number of splits. Reverted.
+
+**The hypothesis was wrong.** 16 threadgroups x 512 threads is 8192 threads on a
+part with roughly 10240 concurrent thread slots — already ~80% occupancy. Decode
+attention is not starved of parallelism, so adding threadgroups only adds
+redundant Q re-reads, redundant reductions and a combine pass.
+
+**What the arithmetic points at instead: the KV cache LAYOUT.** The cache is
+`[block][slot][kv_head][dim]`, so walking one kv head across slots touches 256
+contiguous bytes then skips 1792:
+
+```
+one kv head at one slot   =  256 B contiguous
+stride to the next slot   = 2048 B
+density of a head walk    = 12.5%
+measured decode KV stream = 29 GB/s = 24% of ~120 GB/s peak
+```
+
+A 12.5%-dense strided walk explaining a 24%-of-peak stream is the right order.
+The fix would be a head-major cache (`[block][kv_head][slot][dim]`), making one
+head's keys contiguous across slots — but that touches `reshape_and_cache`, every
+attention kernel, and the CUDA path, so it is a cross-cutting change and NOT a
+Metal-local one. It is a hypothesis with arithmetic behind it, not a measured
+result: the honest test is a model with `num_kv_heads == 1` (density 100%), or an
+experimental head-major cache behind a flag.
+
+---
+
+## OPEN LEAD 2: decode attention streams KV at 24% of peak bandwidth (2026-07-27)
+
+**This overturns the "decode residual is dispatch count / fusion" conclusion in
+the entry below, which was recorded one measurement earlier.** Decode dispatch
+overhead is only 3%: a decode-dominated run (p=8) reports gpu_busy at **97.0%**
+of wall and **28.02 tok/s**, which already matches MLX-LM's 27.65. There is
+almost nothing for fusion to win.
+
+The decode gap appears only WITH CONTEXT, and it is a clean bandwidth limit:
+
+| prompt | decode | ms/tok | KV read/tok | delta vs p=8 | implied |
+|---|--:|--:|--:|--:|--:|
+| 8 | 28.02 | 35.69 | 0.9 MB | - | - |
+| 512 | 26.53 | 37.69 | 58.7 MB | 2.00 ms | **29.3 GB/s** |
+| 2048 | 22.87 | 43.73 | 234.9 MB | 8.04 ms | **29.2 GB/s** |
+
+The same 29 GB/s at two context lengths is a steady-state bandwidth, not a fixed
+overhead — and it is **24% of the M4's ~120 GB/s peak** for what is a pure
+streaming read of the KV cache.
+
+**Cause is structural and already named in the source.** `PagedAttentionKernel`
+launches one threadgroup per (q-head, query token); at decode that is `hq`
+threadgroups — 16 for this model. Widening the threadgroup (tg = 4*d) was the
+earlier mitigation, but 16 threadgroups cannot expose enough independent memory
+streams to saturate the fabric no matter how wide each one is.
+
+**The fix is flash-decoding**: split the key range across G threadgroups per
+(head, token), each producing a partial (running max, sumexp, accumulator), then
+a combine pass. Grid goes 16 -> 16*G.
+
+| decode attention at | p=512 | p=2048 |
+|---|--:|--:|
+| 29 GB/s (today) | 26.53 | 22.87 |
+| 60 GB/s | 27.27 | 25.25 |
+| 90 GB/s | **27.52** | **26.11** |
+
+At 90 GB/s p=512 decode reaches 27.52 against MLX-LM's 27.65 — decode parity —
+and long-context decode gains 14%. This is the largest remaining item and, like
+the prefill attention lead before it, it has a mechanism rather than an exhausted
+exclusion list. It needs a scratch buffer for the partials and a combine kernel,
+so it is a real change, not a parameter.
+
+---
+
+## GEMM tile enlargement closed in BOTH directions; the gap is now mostly DECODE (2026-07-27)
+
+**REJECTED - BM=128 via SIXTEEN simdgroups.** Every earlier attempt to enlarge
+the GEMM tile added accumulators per simdgroup (4x2 -> 4x4) and hit the register
+wall. Adding SIMDGROUPS instead keeps 8 accumulators each — the configuration
+already proven to fit — while cutting B-tile re-reads, since traffic is
+`M*K*(N/BN) + K*N*(M/BM)`. Measured: GEMM 642 -> **1016 ms**, warm throughput
+23.42 -> 22.2. 512-thread threadgroups cost more in residency than the traffic
+saves. **Tile enlargement is now closed in both directions.**
+
+**MEASUREMENT CORRECTION: sync-dispatch attribution inflates per-kernel times.**
+`VT_METAL_SYNC_DISPATCH=1` gives every dispatch its OWN command buffer, so each
+kernel's reported GPU time carries a per-command-buffer overhead. Reading the
+GEMM's rate off it (642 ms -> 2.24 TFLOP/s) UNDERSTATES the kernel. Backing it
+out of the warm batched total instead — 634 ms TTFT less 63 ms attention and
+~30 ms of small kernels — puts the GEMM at ~541 ms, i.e. **2.66 TFLOP/s, about
+91% of MLX's implied ~2.94**, not the 73% recorded in the entries below. Use sync
+mode to RANK kernels, never to quote an absolute rate.
+
+**Re-decomposed gap (warm, thermally matched):**
+
+```
+ours : prefill 0.634s + decode 4.799s = 5.433s
+mlx  : prefill 0.535s + decode 4.629s = 5.164s
+gap 269 ms = prefill 99 ms (37%) + decode 170 ms (63%)
+```
+
+**The attention fix flipped the balance: DECODE is now the majority of what is
+left**, not prefill. Decode is 92% GEMV at ~99 GB/s, matching MLX's implied rate,
+so the residual is the 398 dispatches per token — the fusion project, not a
+faster kernel. Prefill's remaining 99 ms is ~50 ms of GEMM (at 91% of MLX) plus
+attention's 63 ms against MLX's implied ~20.
+
+---
+
+## Prefill attention on the MATRIX UNITS: 4.3x, and 94.5% of MLX-LM (2026-07-27)
+
+Closes the open lead below. `vt_paged_attention_mma` is flash attention on
+`simdgroup_matrix`: S = Q@K^T by mma with K loaded transposed, online softmax,
+then O += P@V by mma with O register-resident across the key loop. MSL has no
+elementwise operation on a `simdgroup_matrix`, so the per-row softmax rescale is
+applied as `diag(corr) @ O`. Tiling is BQ=32 x BK=16 over 8 simdgroups arranged
+4 row blocks x 2 column halves, giving each simdgroup one S tile and eight O
+tiles. `VT_METAL_NO_ATTN_MMA=1` is the same-binary A/B lever.
+
+Warm, b=1, Qwen3-1.7B-bf16, p=512 g=128, alternating in one GPU-locked window:
+
+| | mma OFF | mma ON | MLX-LM |
+|---|--:|--:|--:|
+| prefill attention GPU | 270 ms | **63 ms** | ~20-68 implied |
+| median TTFT | 832 ms | **634 ms** | ~535 ms |
+| total throughput | 22.54 | **23.42** | 24.79 |
+| **% of MLX total** | 90.9% | **94.5%** | - |
+
+Attention went 108 -> ~475 GFLOP/s. The estimate recorded below was 94.1%.
+
+**Correctness.** The greedy sequence changed at two near-tie positions, so the
+Metal goldens were RE-ANCHORED the only legitimate way: dump the new sequence,
+teacher-force vLLM 0.25.0 on it, verify the band. Max gap **0.125 nats** against
+a 0.5 bar, the same worst as the previous golden, 0 positions over bar, 0 tokens
+outside vLLM's top-K. One flip is the case the gate's own comment documents
+(prompt[0] tok=5, France vs Italy at a 0.003-0.007-nat margin, where vLLM's own
+teacher-forced argmax is Italy) — the mma kernel now picks Italy.
+
+---
+
+## OPEN LEAD: prefill attention never uses the matrix units (2026-07-27)
+
+**This overturns the "no identified lever remains" conclusion recorded below.**
+It was reached by dividing FLOPs by time for each prefill kernel rather than by
+any new measurement, which is exactly the check that should have been run first.
+
+Prefill attention is 30.1 GFLOP (28 layers, 512 queries, 256 average causal keys,
+16 heads, d=128). At 279 ms that is **108 GFLOP/s**. Our own GEMM, on the same
+device in the same forward pass, sustains ~2250 GFLOP/s. **Attention is 21x
+slower PER FLOP than our GEMM**, and the reason is structural: `vt_paged_attention`
+computes scores with `simd_sum` dot products and accumulates V with scalar FMAs.
+It never issues a single `simdgroup_multiply_accumulate`. The matrix units sit
+idle for the whole kernel.
+
+MLX's implied attention cost is ~20-68 ms, consistent with running QK^T and PV
+through the matrix units at roughly GEMM rate.
+
+| attention at | prefill attention | saved |
+|---|--:|--:|
+| 108 GFLOP/s (today) | 279 ms | - |
+| 1000 GFLOP/s | 30 ms | 249 ms |
+| 2000 GFLOP/s | 15 ms | 264 ms |
+
+At 2000 GFLOP/s prefill drops 0.905 -> 0.641 s and the warm total reaches
+**94.1%** of MLX-LM, from 89.4%, with no change to the GEMM. That is the single
+largest remaining item: ~250 ms against a 600 ms total gap, and larger than the
+GEMM's own 180 ms shortfall.
+
+The work is a flash-attention rewrite using `simdgroup_matrix`: stage K/V tiles
+from the paged blocks into threadgroup memory, compute S = Q@K^T with mma
+(loading K transposed), online-softmax in threadgroup memory, then O += P@V with
+mma, rescaling the register-resident O by a DIAGONAL correction matrix (MSL has
+no elementwise op on `simdgroup_matrix`, but `diag(corr) @ O` is a normal mma).
+The query tiling landed in f746d2f5 is the prerequisite and is already in place.
+
+---
+
+## Last two levers closed: bf16+4x4 GEMM, and Tier-1 fusion (2026-07-27)
+
+**REJECTED - bf16 operand fragments WITH 4x4 blocks (MLX's actual config).**
+Tested separately these both lost: 4x4 with f32 fragments regressed 3.3x, and
+bf16 tiles at 4x2 were 5.7% slower. The pairing is what MLX's steel GEMM does,
+and there was a mechanism linking them: a bf16 simdgroup_matrix is half the
+registers, so bf16 operands are what should make the 4x4 accumulator block
+affordable (32+8 registers rather than 32+16). Measured: GEMM 650 -> **1419 ms**,
+warm throughput 22.34 -> 19.98, median TTFT 904 -> 1579 ms.
+
+Partial vindication of the register story - bf16 operands took 4x4 from 2113 ms
+to 1419 - but 4x4 is still 2.2x worse than 4x2. **The fattening direction is now
+closed at BOTH operand precisions**, so whatever MLX gains from its block shape
+does not transfer to this kernel.
+
+**REJECTED - VT_FUSED_TIER=1.** The portable fusion framework's Tier-1 single-
+pass interpreter is registered for Metal but off by default. Enabling it changed
+the decode dispatch count not at all (25472 either way) and cost ~0.5%: the
+Tier-0 composite ALREADY folds the residual kAdd into the following
+RmsNorm(residual) call, so both tiers issue one dispatch for the recipe. No
+fusion win was available there to take.
+
+---
+
+## What parity actually requires, and the MLX provider verdict (2026-07-27)
+
+**The MLX GEMM provider settles its own question.** Same-binary A/B
+(`VT_OP_PROVIDER_DISABLE=mlx`), warm, one lock window:
+
+| | prefill TTFT | warm g=128 throughput |
+|---|--:|--:|
+| MLX provider ON | 1370 ms | **11.98** |
+| MLX provider OFF | 1400 ms | **22.06** |
+
+MLX's steel GEMM is ~20% faster than ours in isolation, yet routing prefill to it
+buys only 2% — the per-op `mx::eval` sync and the output memcpy (the provider
+cannot write into our buffer, see metal_mlx_provider.mm) eat the advantage. On
+decode, with ~112 matmuls per token each paying that sync, it costs 46%.
+**MLX must default to OFF**, and it is not a route to parity.
+
+**The gap, decomposed.** Warm, thermally matched, b=1, p=512, g=128:
+
+```
+ours : prefill 0.905s + decode 5.085s = 5.990s -> 21.37 tok/s
+mlx  : prefill 0.538s + decode 4.852s = 5.390s -> 23.75 tok/s
+gap 600 ms = prefill 367 ms (61%) + decode 233 ms (39%)
+```
+
+Fixing either ALONE is not enough:
+
+- perfect prefill, decode unchanged -> 22.76 tok/s = **95.9%**
+- perfect decode, prefill unchanged -> 22.23 tok/s = **93.6%**
+
+**Parity requires both.** And prefill at 0.538 s needs the GEMM at 3.78 TFLOP/s
+from today's 2.25 (+68%) — more than MLX's own steel GEMM achieves (~3.07),
+because our prefill also carries attention and elementwise work. Matching MLX's
+GEMM exactly would land prefill near 0.733 s and the total at ~92.6%.
+
+**Decode is bandwidth-bound and already at the wall.** Attribution over 128
+tokens: 92% of decode GPU time is GEMV (4379 of 4777 ms), running at ~99 GB/s
+against the M4's ~120 GB/s peak. MLX's implied rate is the same. The 4.8% decode
+gap is not in the GEMV — it is in the **398 dispatches per token** (168 GEMV, 113
+rms_norm, and the rest), whose small kernels are only ~5% of GPU time but carry
+~2.7 us of encode each. Closing it means FUSION (fewer dispatches), not faster
+kernels.
+
+---
+
+## COLD vs WARM, and a thermally matched MLX-LM comparison (2026-07-27)
+
+Two corrections to how this document has been comparing against MLX-LM, plus one
+rejected optimisation. Nothing landed in code.
+
+**Our headline number was COLD, MLX-LM's was WARM.** A single-prompt run stages
+every weight into Metal buffers during the first forward. Measured on the same
+build: cold (1 prompt) 19.6 tok/s at 1495 ms TTFT; warm (8 prompts) 21.3 tok/s at
+905 ms median TTFT. About 530 ms of the single-prompt TTFT is one-time weight
+staging. `mlx_lm.generate` loads its model BEFORE the region it times, so
+comparing our cold number to its prompt/generation rates charged us a startup
+cost it never reports. Warm is the fair comparison, and it is also what a server
+sees after the first request.
+
+**Absolute tok/s drifts across a long session; ratios do not.** Re-measuring
+MLX-LM in the same lock window as ours gave 26.33/26.43 generation tok/s where
+earlier in the day it gave 27.89 — the machine is thermally slower now. Ours
+moved the same way (26.6 -> 25.2 decode). Any comparison in this document
+between numbers captured at different times is therefore unsafe; only
+same-window A/Bs are. The decode RATIO was stable at 95.4% across both windows,
+which is what makes the earlier entries still meaningful.
+
+**Thermally matched, warm, like-for-like (b=1, Qwen3-1.7B-bf16, p=512, g=128):**
+
+| basis | ours | MLX-LM | ours as % | remaining |
+|---|--:|--:|--:|--:|
+| decode-only | 25.17 | 26.38 | **95.4%** | 1.048x |
+| total, incl. prefill | 21.24 | 23.75 | **89.4%** | 1.118x |
+
+MLX-LM's total basis is derived from its own output: 520 prompt tokens at
+930/1004 tok/s (0.538 s) plus 128 tokens at 26.38 tok/s (4.852 s).
+
+**REJECTED - skipping the GPU drain on fresh-buffer host copies.** Copy/Memset
+are flush points, and weight staging does Alloc-then-Copy ~200 times, so a cold
+prefill committed 200 command buffers for 398 dispatches (2.0 per commit, against
+20.5 once warm). Tracking buffers allocated since the last bind, and skipping the
+drain when the destination is one of them and the source is host memory, fixed
+the structure completely: **commits 200 -> 3, dispatches per commit 2.0 -> 132.7**.
+End to end it changed nothing: over 4 alternating reps, prefill TTFT 1445 ms
+(base) vs 1452 ms, and p=512 g=128 throughput 20.56 vs 20.41. Reverted.
+
+The reason is worth keeping: those flushes wait on GPU work that has to happen
+anyway. Batching defers the wait, it does not remove the work, and the CPU had
+nothing else to do. **A pathological-looking command-buffer structure is not by
+itself a cost.**
+
+---
+
+## Metal GEMM: fatter simdgroup blocks and deeper K both REJECTED (2026-07-27)
+
+Two more attempts on `vt_matmul_bt_mm`, the whole remaining prefill gap at 642 ms
+/ 2.25 TFLOP/s against MLX steel's ~3.07. Both rejected, nothing landed.
+
+**32x32 per simdgroup (BN 64 -> 128, acc 4x2 -> 4x4).** The one structural
+difference from MLX that had never been tested: not tile width, which was
+excluded earlier, but how many fragments each SIMDGROUP accumulates. A 32x32
+block issues 16 mma from 8 fragment loads where 32x16 issues 8 from 6, cutting
+simdgroup_load traffic per FLOP by a third. Measured: GEMM **642 -> 2113 ms, 3.3x
+WORSE**; p=512 throughput 20.9 -> 16.5, TTFT 1351 -> 2880 ms. A regression that
+size is a spill, not a scheduling effect: 16 accumulator matrices plus 8 operand
+fragments exceed the register budget and land in thread-private memory. **The
+fattening direction is closed** — we are already at about the largest per-thread
+accumulator this GPU will hold.
+
+**BK 16 -> 32.** Halves the number of staging rounds and barriers per k loop.
+Measured: GEMM 642.3 vs 642.0 ms — no change at all, at either prompt length.
+Independent confirmation of the earlier barrier-traffic exclusion.
+
+Excluded as this GEMM's limiter, cumulatively: tile width, per-simdgroup block
+size (register-bound), barrier traffic, K-tile depth, staging latency, mma
+precision (half and bf16), and epilogue occupancy. Landed: staging vectorisation,
+per-simdgroup epilogue. **2.25 vs 3.07 TFLOP/s is still unexplained**, and there
+is no further identified lever. Prior "exhausted the levers" claims in this log
+were twice wrong, so this is a statement about what is currently identified, not
+a claim that nothing remains.
+
+---
+
+## Metal GEMM: epilogue LDS cut 16 KB -> 2 KB, and bf16 tiles REJECTED (2026-07-27)
+
+Two experiments against the last big prefill item, `vt_matmul_bt_mm` at 653 ms
+(2.2 TFLOP/s against MLX steel's ~3.07).
+
+**Landed - per-simdgroup epilogue.** `sc` staged the whole 64x64 f32 tile: 16 KB
+of the kernel's 24 KB. A simdgroup only reads back the 8x8 fragment it just
+stored, so a per-simdgroup 8x8 scratch needs no threadgroup barrier and takes the
+kernel to 10 KB. GEMM **653 -> 642 ms (-1.7%)**, TTFT 1388 -> 1351 ms, throughput
++0.4% at both p=512 and p=2048.
+
+The small size IS the result: freeing 14 KB of threadgroup memory, enough to take
+residency from 2 threadgroups per core to 6, bought under 2%. **This kernel is
+not occupancy-limited.** Kept because it is faster, simpler and drops a barrier.
+
+**Rejected - bf16 threadgroup tiles with f32 accumulate.** MLX's steel GEMM keeps
+tiles in the source dtype and multiplies bf16; ours widened every element to f32
+while staging. Numerically this is a no-op (a bf16 x bf16 product needs 16
+mantissa bits and is exact in f32) and it halves LDS write traffic, so it looked
+like the last structural difference. Measured: GEMM **640 -> 677 ms, 5.7% WORSE**;
+p=512 20.84 -> 20.77, p=2048 10.32 -> 10.25. Reverted. Apple's bf16 simdgroup
+path does not beat f32 mma here, so tile dtype is not where MLX's advantage lives.
+
+Running list of things measured and EXCLUDED as this GEMM's limiter: tile width,
+barrier traffic, staging latency (double buffering), mma precision (half, and now
+bf16), and epilogue occupancy. Staging vectorisation was the one that landed.
+
+---
+
+## Metal query-tiled PREFILL attention on Apple M4 (2026-07-27) - up to +32%
+
+Prefill attention ran one threadgroup per (head, query token), so every one of
+the 8192 threadgroups per layer re-read the whole K/V range: ~28 GB for a
+512-token prompt, ~81 GB/s of a ~120 GB/s part, 33% of prefill GPU time at
+~175 GFLOP/s against MLX's ~3000. `vt_paged_attention_tiled` serves
+`VT_PA_QTILE`=4 consecutive query tokens of one request from a single
+threadgroup: the K row is held in REGISTERS across the tile and each V element
+is loaded once, cutting K/V traffic ~4x.
+
+Prefill attention GPU time at p=512: **344 ms -> 279 ms (-19%)**.
+
+End to end, Qwen3-1.7B-bf16, b=1, g=128, alternating A/B under one GPU lock with
+the BASELINE running first (so thermals disfavour the new build):
+
+| prompt | TTFT base -> tiled | out tok/s base -> tiled |
+|---|---|---|
+| 512 | 1518 -> 1391 ms (-8%) | 20.26 -> 20.72 (+2%) |
+| 2048 | 8946 -> 6802 ms (-24%) | 8.78 -> 10.31 (+17%) |
+| 4096 | 29997 -> 21235 ms (-29%) | 3.53 -> **4.66 (+32%)** |
+
+The p=512 gain is small because prefill is only 23% of that run; attention is
+quadratic in prompt length while the GEMMs are linear, so the win grows with the
+prompt. **Judging this at p=512 alone would have read as noise and thrown away a
+32% win at p=4096.**
+
+DECODE IS UNTOUCHED and deliberately so: it keeps its own pipeline, restored
+verbatim. Three attempts to share one kernel body each cost decode 15-17% and
+were reverted — a runtime tile bound (MSL spills the per-query arrays to
+thread-private memory, and one sits in the innermost V loop: prefill attention
+386 ms), a compile-time bound of 4 (decode then computes and masks 3 dead slots:
+23.7 tok/s), and sized threadgroup references to rule out pointer aliasing (22.3
+tok/s, so aliasing was NOT the cause). Decode runs 128x more often than prefill
+here, so any decode regression outweighs the prefill win.
+
+Gate: test_ops_paged_attn 1643 assertions, test_metal_backend 20135, and the
+SACRED Qwen3 near-tie gate 16/16 prompts, max gap 0.125 nats, 0
+forward-divergent, 7168 kPagedAttention selections with 0 declines.
+
+---
+
+## BENCHMARK EQUIVALENCE: the MLX-LM comparison was NOT like-for-like (2026-07-27)
+
+**A correction to this record's own reporting, found by auditing the two
+harnesses' definitions rather than by measuring anything new.**
+
+`mlx_lm` reports `generation_tps = (n + 1) / (time - tic)` with `tic` set AFTER
+prompt processing (`mlx_lm/generate.py:718`) — it is **decode-only and excludes
+prefill**. Our headline "Output token throughput" is generated tokens over the
+TOTAL benchmark duration, prefill included. Every "X of 27.9" figure in the
+entries below compared OUR total-basis number against THEIR decode-only number,
+which overstates the gap.
+
+Our equivalent metric already exists: "Mean per-stream decode rate" =
+`1 / mean_TPOT` = 127/(E2EL - TTFT), against MLX's 128/T. Those agree to ~1% at
+n=128.
+
+**Both honest comparisons at b=1, Qwen3-1.7B-bf16, p=512 g=128:**
+
+| basis | ours | MLX-LM | ours as % | remaining |
+|---|--:|--:|--:|--:|
+| **decode-only** (MLX's own headline) | **26.42** | 27.89 | **94.7%** | 1.056x |
+| **total, incl. prefill** (like-for-like) | 20.24 | 25.31 | 80.0% | 1.250x |
+
+MLX's total-basis figure is derived from its own measured 1091.18 prompt tok/s
+and 27.893 generation tok/s: prefill 0.469 s + decode 4.589 s = 5.058 s.
+
+**Neither number is parity, and this is not a redefinition of the goal.** What it
+establishes is WHERE the remaining gap lives: decode is within 5.6%, and the
+total-basis gap is almost entirely PREFILL (ours ~1.5 s against MLX's 0.469 s,
+3.2x). Prefill is now the whole story, which the per-kernel attribution already
+implied but the mismatched headline obscured.
+
+---
+
+## Metal attention V-split across key groups on Apple M4 (2026-07-27) - +4.8%
+
+The fix the width experiment named. Parallelising V over `d` alone used only `d`
+threads, which is exactly why 4d measured WORSE than the baseline. Each key-group
+now walks a strided slice of the chunk's keys into its own partial accumulator in
+threadgroup memory, and the partials are summed once per chunk. Coalescing is
+preserved: adjacent threads still read adjacent elements of the same V row.
+
+| config | throughput | attention GPU |
+|---|--:|--:|
+| 2d, no split (before) | 19.51 tok/s | 966 ms |
+| 2d + V-split | 20.07 | 710 ms |
+| **4d + V-split** | **20.44** (20.35 / 20.53) | — |
+| 8d + 8 groups | 19.87 | — |
+
+**4d is now the optimum where it was previously worse than baseline** — the V
+split is precisely what unlocked the extra width, confirming the diagnosis rather
+than merely tuning. 8d over-shoots. Attention is now **1636 -> 710 ms across four
+changes, 2.3x**.
+
+**Honest cost:** the golden re-capture is slightly WORSE than the one it
+replaces. 255/256 tokens are vLLM's argmax against the previous 256/256, mean gap
+0.49 vs 0.00 mnats, max 0.125 vs 0.0000. Zero outside top-K and zero beyond the
+0.5-nat band, so the gate criterion holds (16/16), but the perfect agreement
+reported last round was a property of the old accumulation order and is now
+traded for 4.8% speed. Recorded rather than glossed.
+
+---
+
+## Metal attention threadgroup width on Apple M4 (2026-07-27) - +2.3%
+
+Decode launches one threadgroup per (head, query token), which for a single token
+is just `hq` = 16 threadgroups — far too few to fill the GPU. The group was sized
+by `d` alone, capping it at 128 threads. Since the score loop now scales with
+SIMDGROUP count (one simdgroup per key), a wider group buys real parallelism
+there even though the V accumulation is still bounded by `d`.
+
+| threadgroup | throughput | attention GPU |
+|---|--:|--:|
+| `d` = 128 (before) | 19.07 tok/s | 1039 ms |
+| **`2d` = 256** | **19.51** (19.42 / 19.60) | **966 ms** |
+| `4d` = 512 | 18.66 | — |
+
+**2d is the optimum and 4d is worse than the baseline**, which locates the
+trade-off exactly: the score loop gains from more simdgroups, but the V loop uses
+only `d` threads, so beyond 2d the idle majority costs more than the scores gain.
+That also says what the real fix is — parallelising V across simdgroups, or
+flash-decoding style KV splitting — rather than more width.
+
+SACRED gate **16/16 unchanged, max gap still 0, no golden re-capture** (thread
+count does not change accumulation order).
+
+---
+
+## Metal decode GEMV is at its practical limit (2026-07-27) - MLP increase NEUTRAL
+
+Two vector loads in flight per lane instead of one, to add memory-level
+parallelism. **NEUTRAL: 19.00 vs 19.07 tok/s. Reverted.**
+
+The GEMV moves 435 GB of weights in 4.45 s = **97.7 GB/s, ~81% of the M4's
+~120 GB/s**, and it is not traffic-limited: the activation is ~4 KB and stays in
+L1, so the only DRAM stream is the weight row, already read exactly once and
+fully coalesced. Adding load parallelism changes nothing, so **this kernel is
+done**; 81% of peak on a pure streaming loop is close to what the hardware gives.
+
+**This reframes the remaining decode gap as ATTENTION, not the GEMV.** MLX-LM's
+entire decode is 4.59 s for the same 435 GB = 94.8 GB/s aggregate — and that
+budget includes its attention. Ours: GEMV 4.45 s (comparable) PLUS 1.04 s of
+attention on top. So the ~0.6 s decode gap is almost exactly our attention cost.
+
+**Identified remaining decode lever:** attention parallelism. For decode the
+kernel launches one threadgroup per (head, token) = 16 threadgroups for this
+model, each walking the whole sequence in chunks. Splitting along the KV sequence
+(flash-decoding style, partial results plus a combine pass) is the standard fix
+and would raise occupancy by an order of magnitude. That is a structural change,
+not a tuning knob.
+
+---
+
+## Metal paged-attention V accumulation on Apple M4 (2026-07-27) - +4.2%
+
+The follow-up the score-loop change deliberately left alone. The V loop's memory
+access was already coalesced (adjacent threads read adjacent elements of the same
+V row), but **every thread re-read the block table from DEVICE memory and
+recomputed the same `vbase` for every key it accumulated** — `jc * tg` block-table
+loads per chunk where `jc` would do. Resolved once per chunk into threadgroup
+memory instead.
+
+| | before | after |
+|---|--:|--:|
+| throughput | 18.30 tok/s | **19.07** (18.82 / 19.31) |
+| duration | 7.00 s | 6.72 s |
+| attention GPU | 1370 ms | **1039 ms (-24%)** |
+| total GPU busy | 6.58 s | 6.24 s |
+
+**Numerics are bit-identical** — only the address computation moved, not the
+accumulation order — so the SACRED gate passes **16/16 with max gap still 0**
+and no golden re-capture. Attention is now 1636 -> 1039 ms across the two
+changes, a 1.57x on the kernel.
+
+---
+
+## Metal paged-attention score loop on Apple M4 (2026-07-27) - +3.7%, and a PERFECT oracle result
+
+**Re-attribution moved the target.** After the GEMM work, GPU time was: decode
+GEMV 4452 ms (64%), **paged attention 1636 ms (24%)**, prefill GEMM 645 ms (9%,
+down from 3863). The GEMV moves 435 GB in 4.45 s = **97.7 GB/s, ~81% of the M4's
+peak — essentially done**. Paged attention moved ~8.4 GB of KV cache in 1.64 s =
+**~5 GB/s, about 4% of peak.** That kernel was written for the OPT bring-up and
+never revisited.
+
+**Cause: the score loop gave ONE THREAD an entire d-length dot product**, so
+adjacent threads read entirely different K rows (`kbase` varies per key) and the
+loads never coalesced. Restructured so one SIMDGROUP handles one key with lanes
+splitting `d`, which makes neighbouring lanes read neighbouring elements of the
+same K row, plus a 4-wide vector load where dtype and alignment allow.
+
+| | before | after |
+|---|--:|--:|
+| throughput | 17.65 tok/s | **18.30** (18.19 / 18.41) |
+| duration | 7.25 s | 7.00 s |
+| TTFT | 1664 ms | **1515 ms** |
+| attention GPU | 1636 ms | **1370 ms** |
+
+**The oracle result is the best of the session: 256/256 tokens are vLLM's OWN
+teacher-forced argmax**, mean gap 0.00 mnats, max gap 0.0000 nats, 0 outside
+top-K (previous golden: 254/256, mean 0.98, max 0.125). The improved attention
+numerics agree with vLLM 0.25.0 EXACTLY at every position, including the p0 tok5
+France/Italy tie the record has tracked all along — our engine now picks 9625
+(" France"), which is what vLLM's own argmax says. 37 of 256 tokens changed
+across 4 prompts. Gate 16/16.
+
+---
+
+## Metal BK=16 + fully-utilised vectorised staging (2026-07-27)
+
+**The fix the previous negative result prescribed.** B-tile vectorisation was
+net neutral at BK=8 because it left half the threadgroup idle: `(BK/4)*BN = 128`
+vector loads across 256 threads. BK=16 makes both tiles exactly 256 loads, one
+per thread, and the B win then survives instead of trading against the qkv shape.
+
+| shape | BK=8, scalar B | BK=8, vector B | **BK=16, vector B** | MLX |
+|---|--:|--:|--:|--:|
+| qkv 512x2048x2048 | 2282 | 1939 | **2292** | 2640 (87%) |
+| mlp-up 512x2048x6144 | 2501 | 2618 | **2753** | 3325 (83%) |
+| mlp-dn 512x6144x2048 | 2382 | 2517 | **2612** | 3293 (79%) |
+
+The qkv regression disappears and both 6144-dimension shapes gain ~10%. End to
+end **17.41 -> 17.65 tok/s**, TTFT **1749 -> 1664 ms (-4.9%)**. The end-to-end
+gain is small because prefill is now only ~23% of the run.
+
+**Our GEMM is now at 79-87% of MLX's steel kernel**, from 45% two changes ago.
+SACRED gate **16/16 unchanged, no golden re-capture**; row diagnostic NONE; suite
+21 cases / 20,135 assertions.
+
+---
+
+## Metal B-tile vectorisation - shape-split, NET NEUTRAL, reverted (2026-07-27)
+
+The A tile's vectorisation was worth 1.55x, so the B tile was the obvious other
+half. BT forces the load to run along k and scatter down the tile, a different
+loop shape. Correct but **net neutral end to end (17.44 vs 17.41 tok/s)**:
+
+| shape | scalar B | vectorised B | change |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 2282 GFLOP/s | 1939 | **-15%** |
+| mlp-up 512x2048x6144 | 2501 | 2618 | +4.7% |
+| mlp-dn 512x6144x2048 | 2382 | 2517 | +5.7% |
+
+**Cause of the regression: thread under-utilisation.** Scalar B staging walks
+BK*BN = 512 elements over 256 threads; the vectorised form walks (BK/4)*BN = 128
+vector loads over the same 256, so half the threadgroup idles. Larger K amortises
+that, which is why only the 6144-dimension shapes gain. If retried, fix the
+utilisation (BK=16, or stage A with the idle half) before touching vector width.
+
+---
+
+## Metal vectorised decode GEMV on Apple M4 (2026-07-27) - +9.8%
+
+The same vectorisation applied to the op that dominates DECODE, which is now the
+larger pool (decode ~5.6 s of a 7.4 s run against MLX-LM's 4.59 s). The GEMV had
+already lost `vt_load`'s per-element branches, but each lane still issued one
+2-byte load per element; a `ushort4` makes that one 8-byte load, so a simdgroup
+fetches 256 contiguous bytes per iteration instead of 64.
+
+| | before | after |
+|---|--:|--:|
+| throughput | 15.85 tok/s | **17.41** (17.24 / 17.58) |
+| duration | 8.07 s | 7.36 s |
+| TTFT | 1774 ms | 1749 ms (unchanged; decode-only change) |
+
+**+9.8%.** Guarded on bf16 x bf16 and `k % 4 == 0` (the vector cast needs the
+element index to be a multiple of 4, and `brow = col * k` carries every row
+start); every other dtype and shape keeps the scalar paths. bf16-in/f32-out NMSE
+5.19e-15, effectively unchanged from 5.11e-15.
+
+**Golden re-captured, oracle-validated (vLLM 0.25.0, version read from the
+interpreter), and the profile is IDENTICAL:**
+
+| | new | previous |
+|---|--:|--:|
+| per-token == vLLM argmax | 254/256 | 254/256 |
+| mean gap | 0.98 mnats | 0.98 |
+| max gap | 0.125 nats | 0.125 |
+| outside vLLM top-K | 0 | 0 |
+
+12 of 256 tokens changed across 2 prompts; the near-tie character is unchanged,
+those positions simply resolve the other way. Gate 16/16 (10 strict + 6 band).
+
+---
+
+## Metal vectorised GEMM staging on Apple M4 (2026-07-27) - 1.55x on the kernel
+
+**Found by reading MLX's steel loader**, which the exclusion list below made the
+obvious next move: tile width, barriers, staging latency and mma precision had
+each been measured and only the per-element staging WORK remained.
+`steel/gemm/loader.h` copies a whole vector per instruction
+(`*(threadgroup ReadVector*)dst = *(const device ReadVector*)src`) where ours paid
+two branches inside `vt_load` per element plus a scalar threadgroup write.
+
+Vectorising the A-tile staging (bf16 `ushort4` loads, guarded on alignment):
+
+| shape | before | after | MLX steel |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 1484 GFLOP/s | **2282** | 2640 |
+| mlp-up 512x2048x6144 | 1574 | **2501** | 3325 |
+| mlp-dn 512x6144x2048 | 1507 | **2382** | 3293 |
+
+**~1.55x on the kernel, taking us from 45% of MLX's GEMM to 76-86% of it.**
+End to end 15.30 -> **15.85 tok/s**, TTFT **2065 -> 1774 ms (-14%)**. The
+end-to-end gain is much smaller than the kernel gain because prefill is now only
+~22% of the run.
+
+**Guards, so nothing loses correctness for another gaining speed:** the vector
+cast needs 8-byte alignment, so the fast path is taken only for bf16 x bf16 with
+`k % 4 == 0`, `lda % 4 == 0`, BT orientation, and a fully interior tile. Every
+other shape and dtype keeps the generic path. SACRED gate **16/16 unchanged, no
+golden re-capture**; row diagnostic NONE; suite 21 cases / 20,135 assertions.
+
+---
+
+## GEMM limit: four hypotheses excluded (2026-07-27)
+
+Our GEMM is ~1.5 TFLOP/s against MLX's ~3.3. Four explanations were each built
+and measured; three are refuted and one was the real win:
+
+| hypothesis | result | verdict |
+|---|--:|---|
+| barrier traffic (BK 8 -> 32) | 13.28 vs 13.27 tok/s | neutral |
+| tile too narrow (32x32 -> 64x64) | 990 -> 1484 GFLOP/s | **REAL, landed** |
+| staging latency (double buffering) | 1478/1560/1481 vs 1484/1574/1507 | neutral |
+| mma precision-bound (`simdgroup_half8x8`) | 1465/1556/1496 | neutral |
+
+**The precision negative is the most useful.** MLX runs its mma at reduced
+precision, so the obvious theory was that our f32 `simdgroup_matrix` is half-rate.
+The half-precision variant measured IDENTICAL, refuting it and removing the
+motivation for a half/bf16 staging path that carried a real overflow hazard.
+
+Both neutral changes were correct (row diagnostic NONE, suite 21/21) and were
+reverted. What remains untested: the per-element staging WORK (not its latency)
+and the simdgroup_load-to-mma issue ratio at the 64x64 tile.
+
+---
+
+## Metal 64x64 simdgroup GEMM on Apple M4 (2026-07-27) - RESOLVED and landed
+
+The open lead is closed. Tile is now 64x64 with 8 simdgroups (2 row groups of 32
+x 4 column groups of 16), each owning 4x2 blocks of `simdgroup_float8x8`.
+
+| shape | before (32x32) | after (64x64) | MLX steel |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 990 GFLOP/s | **1484** | 2640 |
+| mlp-up 512x2048x6144 | 1019 | **1574** | 3325 |
+| mlp-dn 512x6144x2048 | 1002 | **1507** | 3293 |
+
+End to end **14.25 -> 15.30 tok/s (+7.4%)**, TTFT **2534 -> 2065 ms (-18%)**,
+SACRED gate **16/16 unchanged with no golden re-capture**, unit suite 21 cases /
+20,135 assertions.
+
+**The root cause was self-inflicted, not a compiler subtlety.** The half-spacing
+fingerprint was read as threadgroup-array padding defeating `simdgroup_load`'s
+`elements_per_row`. In fact an earlier incomplete edit had left the mma block on
+the OLD 32x32 offsets (16-row groups) while the tile had grown to 64 rows. This
+also means the earlier bisect that "exonerated the simdgroup mapping" was right
+by accident: both decompositions carried the same stale block. Flat threadgroup
+tiles were adopted for the wrong hypothesis and kept anyway, because they make
+that class of bug unrepresentable.
+
+Ours is now ~1.5 TFLOP/s against MLX's ~3.3; the rest needs register blocking and
+double-buffered staging.
+
+---
+
+## MLX provider is now NET SLOWER than our own kernels (2026-07-27) - action for LocalAI
+
+**Our Metal kernels have overtaken the MLX provider.** Measured on current main,
+b=1 p=512 g=128, same binary, GPU lock, 2 reps:
+
+| arm | throughput | duration | TTFT |
+|---|--:|--:|--:|
+| MLX provider ON | 11.92 / 11.94 | 10.74 / 10.72 s | **1583 ms** |
+| MLX provider OFF (ours) | **14.19 / 14.50** | 9.02 / 8.83 s | 2543 ms |
+
+**MLX wins prefill decisively and loses overall.** TTFT is 38% better with MLX,
+which independently corroborates the roofline finding below (its GEMM is 3.3x
+ours). But total throughput is 17% WORSE.
+
+**Where it goes, measured rather than inferred.** With MLX on, OUR dispatch path
+gets faster (wait 7.06 s vs 8.54 s) because MLX absorbs 112 prefill GEMMs. Total
+wall time still rises, so MLX's own path costs **3.67 s of non-dispatch time**
+against 0.39 s for the native arm. That is the integration, not the kernel: a
+host `memcpy` of every output (`Matmul::eval_gpu` re-`set_data`s from MLX's
+allocator), a per-call `mx::eval` commit+wait on MLX's own stream, and MLX
+allocator pressure on a 16 GB box already ~13 GB committed.
+
+**ACTION FOR LocalAI PR #11137**, which enables the MLX provider by default on
+darwin: that default was correct when measured (MLX GEMM 1.5x-2.2x our then-current
+kernels) and is now **inverted**. With `M3c-1`, `M3d`, the simdgroup GEMM and typed
+loads landed, the provider should default OFF until its output path is fixed.
+The ~124 MB of vendored `libmlx.dylib` + `mlx.metallib` buys nothing at present.
+
+**Not pursued:** declining m=1 inside the provider (so MLX serves only prefill)
+was tried and does improve the MLX arm, but it still loses to MLX-off overall and
+it breaks the M5 provider tests' select-and-do-not-decline contract. Reverted;
+the useful output is the recommendation above, not the re-routing.
+
+---
+
+## Metal GEMM roofline vs MLX on Apple M4 (2026-07-27) - the kernel is 3x off
+
+**Timed in ISOLATION at real prefill shapes, against MLX's steel GEMM in the same
+binary via the provider seam** (opt-in `VT_MM_BENCH=1` microbenchmark). End-to-end
+deltas could not say whether the kernel or its surroundings were at fault.
+
+| shape | ours | MLX steel | ratio |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 990 GFLOP/s | 2640 | **2.7x** |
+| mlp-up 512x2048x6144 | 1019 | 3325 | **3.3x** |
+| mlp-dn 512x6144x2048 | 1002 | 3293 | **3.3x** |
+
+Ours ~1.0 TFLOP/s (~23% of the M4's ~4.3 TFLOPS fp32 peak); MLX ~77%. **The gap
+is inside our kernel.** Dispatch, staging branches, barriers and tile width were
+each measured and excluded beforehand.
+
+**This also reframes the MLX provider.** MLX's raw GEMM is 3x ours, yet enabling
+the provider measured no faster end to end (12.21 vs 12.17 s). Study §5.2 says
+`Matmul::eval_gpu` re-`set_data`s its output from MLX's allocator, so every
+delegated GEMM pays an O(M*N) copy back plus its own commit+wait — megabytes per
+call at prefill shapes. **Fixing the provider's output path is now the cheaper
+route to prefill parity than rewriting our kernel.**
+
+**Dead end:** keeping operands in bf16 through the mma (what MLX does) does NOT
+compile — `simdgroup_load` has no bfloat-matrix overload on this toolchain. MSL
+supports half and float simdgroup matrices only. Staging as `half` was refused:
+it saturates at 65504 and activation outliers can exceed that.
+
+---
+
+## Metal typed GEMV load path on Apple M4 (2026-07-27) - INDICATIVE
+
+**Third parity lever.** The decode GEMV is ~50% of GPU time and every element
+went through `vt_load`, which costs two branches. Specialising the bf16xbf16 case
+outside the K loop and splitting the reduction across four independent
+accumulators (the single `acc` serialised the FMA chain in a latency-bound loop):
+
+| | before | after |
+|---|--:|--:|
+| throughput | 13.27 | **14.25** (14.08 / 14.42) |
+| duration | 9.65 s | 8.99 s |
+| TTFT | 2524 ms | 2586 ms (unchanged; this touches decode only) |
+
+**+7.4%.** Every non-bf16 dtype keeps the generic path, so nothing loses
+correctness for one case gaining speed.
+
+**Accuracy improved, and is now MEASURABLE.** The existing arms could not see
+this change at all: the all-f32 arm does not take the bf16 path, and the all-bf16
+arms are dominated by output store rounding. A **bf16-in / f32-out** arm was
+added for exactly this, and it discriminates:
+
+| kernel | NMSE vs f64 oracle |
+|---|--:|
+| typed GEMV, 4 accumulators | **5.11e-15** |
+| tile GEMM | 9.77e-14 |
+
+**Golden re-captured, oracle-validated, and the result stated in full.** The
+reduction-order change drifted the anchor (prompt[5] tok 10). Re-capture used
+vLLM **0.25.0** (version recorded explicitly this time, see the caveat below).
+6 of 256 tokens changed, all in prompt 5. Against the previous golden the new
+sequence is better on the gate's own metric and slightly worse on one other:
+
+| | new | previous |
+|---|--:|--:|
+| gate STRICT token-exact | **11/16** | 10/16 |
+| gate near-tie band only | 5/16 | 6/16 |
+| max gap | **0.125 nats** | 0.188 |
+| per-token == vLLM argmax | 254/256 | 255/256 |
+| mean gap | 0.98 mnats | 0.73 |
+| outside vLLM top-K | 0 | 0 |
+
+Gate passes **16/16**. Unit suite 21 cases / 20,135 assertions.
+
+**CAVEAT ON THE EARLIER RE-CAPTURES.** The `~/venvs/vllm-oracle` used for the
+`M3d` golden re-capture NO LONGER CONTAINS vLLM; it changed during this session.
+Its version at the time therefore cannot be confirmed retroactively, so the
+"vLLM 0.25.0" attribution on that earlier re-capture is UNVERIFIED. This run used
+`~/venvs/vllm-oracle-v0.25.0-stage` and recorded the version from the interpreter
+before running. Future re-captures should do the same.
+
+**Rejected in the same pass:** the identical typed-staging treatment applied to
+the mm kernel measured WORSE (14.10 vs 14.42 tok/s, TTFT +120 ms) and was
+reverted. Staging is amortised over the tile's compute, so the branch was never
+its cost, unlike the GEMV's inner loop.
+
+**Status: INDICATIVE.** Goal progress: 10.5 -> 14.25 of 27.9 tok/s.
+
+---
+
+## Metal 2-D blocked simdgroup GEMM on Apple M4 (2026-07-27) - INDICATIVE
+
+**The top-ranked lever from the attribution below, built and measured.** Prefill
+was 33.7% of GPU time from 168 dispatches and ~8.2x behind MLX-LM, still on the
+16x16 scalar tile loop. This replaces it for every m > 1 with a 2-D blocked
+kernel: a 32x32 output tile per threadgroup, 4 simdgroups in a 2x2 grid each
+owning a 2x2 block of `simdgroup_float8x8` accumulators, with A and B tiles
+staged through threadgroup memory so one kernel still serves every runtime dtype.
+
+Isolated same-binary A/B via `VT_METAL_NO_MM` (a lever added specifically so this
+kernel could be measured independently of the m=1 GEMV), 2 reps, GPU lock, CI
+runners idle:
+
+| | without mm | with mm | change |
+|---|--:|--:|--:|
+| throughput | 10.52 / 10.57 | **13.30 / 13.23** | **+26%** |
+| duration | 12.17 / 12.11 s | 9.63 / 9.67 s | -2.5 s |
+| TTFT | 4982 / 4928 ms | **2504 / 2545 ms** | **halved** |
+
+TTFT halving is the prefill win landing directly, as the attribution predicted.
+
+**Accuracy:** f32 NMSE 1.63e-13 against an f64 oracle, better than the tile
+kernel's 6.61e-13. **The SACRED gate passed UNCHANGED (16/16, max gap 0.188
+nats), with no golden re-capture required** — the kernel's numerics stay on the
+same side of every near-tie in the gate set.
+
+**Progress against the parity goal:** 10.5 -> 13.3 tok/s of the 27.9 target. The
+next ranked lever is the decode GEMV, still 50% of GPU time and using scalar
+per-element dtype-switched loads that cannot saturate bandwidth.
+
+**Tuning attempts on this kernel, both measured and both rejected:** 32x32/BK=32
+was NEUTRAL (13.28 tok/s, refuting the barrier hypothesis) and 64x64/BK=16 was
+14% WORSE (11.48 tok/s, TTFT 4004 ms) because 24 KB of threadgroup memory plus 16
+accumulators per simdgroup collapses occupancy to one threadgroup per core. A
+64x64 tile needs 8 simdgroups rather than wider blocks over the same 128 threads.
+Detail in the spec's "Tuning attempts" section.
+
+**Status: INDICATIVE** (worker daemon and wallpaper up), CI runners idle.
+
+---
+
+## Metal GPU-time attribution after `M3c-1`+`M3d` (2026-07-27) - PREFILL is the outlier
+
+**Re-profiled because the two landed levers moved the bottleneck, and the answer
+reorders the remaining work.** Native arm, Qwen3-1.7B-bf16 p=512 g=128 b=1,
+`VT_METAL_SYNC_DISPATCH=1` for per-kernel GPU attribution, under the GPU lock.
+Total GPU busy 11.47 s.
+
+| kernel | dispatches | GPU ms | share |
+|---|--:|--:|--:|
+| `vt_matmul_bt_gemv` (decode) | 21,464 | 5,788 | **50.5%** |
+| `vt_matmul_bt` tile GEMM (**prefill**) | **168** | 3,863 | **33.7%** |
+| `vt_paged_attention` | 3,584 | 1,627 | 14.2% |
+| all 6 other kernels | 25,216 | 188 | 1.6% |
+
+**Prefill is a third of GPU time from 168 dispatches**, and the gap to MLX-LM is
+not where it was assumed to be:
+
+| phase | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill | 3.86 s | ~0.47 s | **~8.2x** |
+| decode (GEMV + attention) | ~7.4 s | ~4.59 s | ~1.6x |
+
+Decode is already close. **Prefill is the outlier and still runs the 16x16 tile
+GEMM.** The remaining levers, with the arithmetic that ranks them: a 2-D blocked
+simdgroup-matrix GEMM for m>1 (3.86 s -> ~0.6 s), then a vectorised
+dtype-specialised GEMV for decode (5.79 s -> ~3.5 s). Together those put the run
+near 6.3 s (~20 tok/s); parity with MLX-LM's 27.9 tok/s needs ~5.1 s, so paged
+attention likely decides the last stretch.
+
+**Also settled here:** the MLX provider is NOT slower than the native path on
+current main. Both arms measure 12.0-12.2 s at b=1, and our GEMV still serves
+7,112 dispatches even with MLX enabled (MLX takes 14,352). An earlier suspicion
+that MLX-on had become the slower default is REFUTED.
+
+**Status: INDICATIVE** (worker daemon and wallpaper up), CI runners paused for
+this measurement.
+
+---
+
 ## Metal small-m batched-decode GEMM on Apple M4 (2026-07-27) - FAILED, REVERTED
 
 **A negative result, recorded because it cost a day's reasoning and the next

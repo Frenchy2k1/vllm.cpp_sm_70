@@ -113,6 +113,7 @@ struct RopeApplyParams {
   uint64_t q_s0, q_s1, k_s0, k_s1;
   uint32_t t, hq, hk, rot, rhalf, is_neox, q_dt, k_dt, cache_dt, pos_i64, has_k, pad;
 };
+struct BwParams { uint32_t n_chunks, chunk_f4, stride_f4, tg, chunks_per_tg, pad; };
 struct FStepGpu { uint32_t op, out, in0, in1, gemma, pad; };
 struct FcParams { uint32_t t, h, nsteps, x_dt, w_dt, res_dt, out_dt, tg; float eps; };
 
@@ -309,6 +310,11 @@ struct Batch {
   id<MTLCommandBuffer> cmd = nil;
   id<MTLComputeCommandEncoder> enc = nil;
   unsigned long long pending = 0;
+  // Name of the last dispatch encoded. Only meaningful when a commit carries
+  // exactly ONE dispatch (VT_METAL_SYNC_DISPATCH), which is the mode used to
+  // recover a PER-KERNEL GPU breakdown: batching deliberately makes wait/GPU a
+  // property of the commit, so the per-kernel view has to come from somewhere.
+  const char* last_kernel = "";
   const bool sync_mode = [] {
     const char* e = std::getenv("VT_METAL_SYNC_DISPATCH");
     return e != nullptr && e[0] == '1';
@@ -334,9 +340,21 @@ void FlushLocked(Batch& b) {
     const double gpu = [b.cmd GPUEndTime] - [b.cmd GPUStartTime];
     vtprof::Table& tbl = vtprof::Get();
     tbl.commits.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(tbl.mu);
-    tbl.commit_wait_s += t_done - t_commit;
-    tbl.commit_gpu_s += gpu > 0.0 ? gpu : 0.0;
+    const double gpu_pos = gpu > 0.0 ? gpu : 0.0;
+    {
+      std::lock_guard<std::mutex> lock(tbl.mu);
+      tbl.commit_wait_s += t_done - t_commit;
+      tbl.commit_gpu_s += gpu_pos;
+      // One dispatch in this commit => the whole GPU interval belongs to it.
+      // With many dispatches batched there is no honest way to split it, so the
+      // per-kernel columns stay 0 rather than being invented.
+      if (b.pending == 1 && b.last_kernel[0] != '\0') {
+        vtprof::Row& r = tbl.rows[b.last_kernel];
+        if (r.name.empty()) r.name = b.last_kernel;
+        r.wait_s += t_done - t_commit;
+        r.gpu_s += gpu_pos;
+      }
+    }
   }
   // Capture the error BEFORE releasing, and clear the batch BEFORE throwing:
   // an exception must not leave a committed buffer installed as "pending".
@@ -454,6 +472,18 @@ class Encoder {
   // owns one (q-head, query token) pair and cooperatively reduces over keys.
   void DispatchGrid2D(int64_t gx, int64_t gy, uint32_t tg) {
     if (gx <= 0 || gy <= 0) { Finish(); return; }
+    // A threadgroup wider than THIS pipeline's limit is undefined behaviour, and
+    // in a Release build with no Metal validation layer it does not fault: it
+    // silently computes garbage. `maxTotalThreadsPerThreadgroup` shrinks with
+    // register and threadgroup-memory pressure, so a kernel that grows its tile
+    // can cross the limit without any source-level hint. DispatchFlat already
+    // clamps; this path asserts instead, because a 2-D kernel's threadgroup
+    // shape is part of its correctness (clamping would silently drop simdgroups
+    // and produce a wrong answer just as quietly).
+    VT_CHECK(size_t(tg) <= max_threads_,
+             std::string("metal: threadgroup of ") + std::to_string(tg) +
+                 " threads exceeds this pipeline's maxTotalThreadsPerThreadgroup (" +
+                 std::to_string(max_threads_) + ")");
     [enc_ dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(gx),
                                            static_cast<NSUInteger>(gy), 1)
          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
@@ -479,6 +509,7 @@ class Encoder {
     finished_ = true;
     Batch& b = TheBatch();
     ++b.pending;
+    b.last_kernel = prof_name_;
     if (prof_) {
       // Only encode time is per-dispatch now; wait and GPU time belong to the
       // batch and are accumulated in FlushLocked.
@@ -531,11 +562,26 @@ void AddKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 constexpr uint32_t kGemmTile = 16;
 // Must match VT_GEMV_SGS in metal_msl.h; Apple simdgroups are 32-wide.
 constexpr uint32_t kGemvSimdgroups = 8;
+// Must match VT_MM_BM/VT_MM_BN/VT_MM_SGS in metal_msl.h.
+constexpr int64_t kMmTile = 64;
+constexpr uint32_t kMmSimdgroups = 8;
 
 // Same-binary A/B lever for the GEMV fast path, which the benchmark protocol
 // requires ("use a same-binary A/B") and which doubles as the bisect switch if
 // a decode result is ever suspected of coming from this kernel.
 // VT_METAL_NO_GEMV=1 routes m=1 back through the tile GEMM.
+// Separate lever for the m>1 simdgroup GEMM, so it can be A/B'd INDEPENDENTLY of
+// the m=1 GEMV. VT_METAL_NO_GEMV disables the whole fast-path family;
+// VT_METAL_NO_MM disables only this kernel. Without the split, an A/B of one
+// lever silently measures both.
+bool MmEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_METAL_NO_MM");
+    return !(e != nullptr && e[0] == '1');
+  }();
+  return on;
+}
+
 bool GemvEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_METAL_NO_GEMV");
@@ -578,6 +624,18 @@ void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
     // One simdgroup per output column, kGemvSimdgroups of them per threadgroup.
     e.DispatchGrid2D((n + kGemvSimdgroups - 1) / kGemvSimdgroups, 1,
                      kGemvSimdgroups * kSimdWidth);
+    return;
+  }
+  // m > 1: the 2-D blocked simdgroup GEMM. One 32x32 output tile per
+  // threadgroup, 4 simdgroups of 32 threads.
+  if (GemvEnabled() && MmEnabled()) {
+    Encoder e("vt_matmul_bt_mm");
+    e.BindTensor(a, 0, "matmul_bt: a");
+    e.BindTensor(b, 1, "matmul_bt: b");
+    e.BindTensor(out, 2, "matmul_bt: out");
+    e.BindBytes(&p, sizeof(p), 3);
+    e.DispatchGrid2D((n + kMmTile - 1) / kMmTile, (m + kMmTile - 1) / kMmTile,
+                     kMmSimdgroups * kSimdWidth);
     return;
   }
   Encoder e("vt_matmul", "vt_matmul_bt(gemm m>1)");
@@ -828,8 +886,40 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
                      "(the threadgroup accumulator is VT_PA_MAXD wide)");
   VT_CHECK(num_kv_heads > 0 && hq % num_kv_heads == 0,
            "metal paged_attention: q-heads must be a multiple of kv-heads");
+  // Decode launches one threadgroup per (head, query token), which for a single
+  // token is just `hq` threadgroups — 16 for a Qwen3-1.7B-class model, far too
+  // few to fill the GPU. Sizing the group by `d` alone caps it at 128 threads.
+  // The score loop now scales with SIMDGROUP count (one simdgroup per key), so
+  // a wider group buys real parallelism there even though the V accumulation is
+  // still bounded by `d`. Measured experiment, not an assumption.
+  // Any request with more than one query token is a PREFILL, which gets the
+  // query-tiled pipeline: it serves VT_PA_QTILE consecutive tokens from one
+  // threadgroup so each K row and V element is read once for the whole tile
+  // instead of once per token. Decode keeps the untiled pipeline — it has one
+  // token per request, so there is nothing to reuse and tiling would only cost
+  // it grid parallelism and threadgroup memory.
+  const bool tiled = tq > num_reqs;
+  // PREFILL on the matrix units. vt_paged_attention scores with simd_sum dot
+  // products and accumulates V with scalar FMAs, measured at 108 GFLOP/s against
+  // the GEMM's ~2250 on the same device in the same forward. The mma kernel needs
+  // exactly 8 simdgroups (its 4x2 simdgroup map) and a head that fits its tiles.
+  // VT_METAL_NO_ATTN_MMA=1 routes back to the scalar kernel for a same-binary A/B.
+  const uint32_t kMmaTg = 256;
+  static const bool mma_off = [] {
+    const char* e = std::getenv("VT_METAL_NO_ATTN_MMA");
+    return e != nullptr && e[0] == '1';
+  }();
+  // Q and K are staged as bfloat for the mma, which is lossless ONLY if they are
+  // already bf16; an f32 query would be silently truncated.
+  const bool bf_in = query.dtype == DType::kBF16 && k_cache.dtype == DType::kBF16 &&
+                     v_cache.dtype == DType::kBF16;
+  const bool mma = tiled && !mma_off && bf_in && d <= 128 && (d % 8) == 0 &&
+                   MetalContext::Get().PipelineMaxThreads("vt_paged_attention_mma") >= kMmaTg;
+  const char* kname = mma ? "vt_paged_attention_mma"
+                          : (tiled ? "vt_paged_attention_tiled" : "vt_paged_attention");
   const uint32_t tg =
-      ChooseThreadgroupSize(d, MetalContext::Get().PipelineMaxThreads("vt_paged_attention"));
+      mma ? kMmaTg
+          : ChooseThreadgroupSize(d * 4, MetalContext::Get().PipelineMaxThreads(kname));
   PagedAttnParams p{
       static_cast<uint64_t>(k_cache.stride[0]), static_cast<uint64_t>(k_cache.stride[1]),
       static_cast<uint64_t>(k_cache.stride[2]), static_cast<uint64_t>(v_cache.stride[0]),
@@ -845,7 +935,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
       DtypeCode(query.dtype),                   DtypeCode(k_cache.dtype),
       DtypeCode(v_cache.dtype),                 DtypeCode(out.dtype),
       args.scale};
-  Encoder e("vt_paged_attention");
+  Encoder e(kname);
   e.BindTensor(query, 0, "paged_attention: query");
   e.BindTensor(k_cache, 1, "paged_attention: k_cache");
   e.BindTensor(v_cache, 2, "paged_attention: v_cache");
@@ -993,4 +1083,26 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// Test-only strided-read bandwidth probe; see vt_bw_probe in metal_msl.h. Lives
+// outside the anonymous namespace so the Metal test can link it.
+void BandwidthProbe(Queue&, void* src, void* out, uint32_t n_chunks, uint32_t chunk_f4,
+                    uint32_t stride_f4) {
+  // 256 threads walking 64 chunks each: enough work per threadgroup that this
+  // measures memory, not dispatch.
+  const uint32_t tg = std::min<uint32_t>(
+      256u, MetalContext::Get().PipelineMaxThreads("vt_bw_probe"));
+  const uint32_t chunks_per_tg = 64u;
+  const uint32_t groups = (n_chunks + chunks_per_tg - 1) / chunks_per_tg;
+  BwParams p{n_chunks, chunk_f4, stride_f4, tg, chunks_per_tg, 0u};
+  Encoder e("vt_bw_probe");
+  const Device dev{DeviceType::kMETAL, 0};
+  Tensor s = Tensor::Contiguous(src, DType::kF32, dev, {1});
+  Tensor o = Tensor::Contiguous(out, DType::kF32, dev, {1});
+  e.BindTensor(s, 0, "bw_probe: src");
+  e.BindTensor(o, 1, "bw_probe: out");
+  e.BindBytes(&p, sizeof(p), 2);
+  e.DispatchGrid2D(groups, 1, tg);
+}
+
 }  // namespace vt::metal

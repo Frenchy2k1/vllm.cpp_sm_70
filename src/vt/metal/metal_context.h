@@ -37,6 +37,12 @@ namespace vt::metal {
 // Synchronize/Copy/Memset/Free/DestroyQueue are all flush points.
 void FlushPendingBatch();
 
+// Test-only strided-read bandwidth probe (vt_bw_probe). `stride_f4 == chunk_f4`
+// is a contiguous stream; a larger stride reproduces the paged KV cache's
+// single-head access pattern.
+void BandwidthProbe(Queue& q, void* src, void* out, uint32_t n_chunks, uint32_t chunk_f4,
+                    uint32_t stride_f4);
+
 
 // Opaque handles into the ObjC world. Kept as void* so every non-.mm consumer
 // (metal_ops.mm is ObjC++, but ops.cpp/tests are not) can hold them.
