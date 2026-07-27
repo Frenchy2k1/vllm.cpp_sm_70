@@ -26916,3 +26916,38 @@ change first measured "6% worse".
 Use for anything under ~5% here. Eyeballed alternation is fine for a 4.3x kernel
 win and worthless for a 1% one — and several small-margin entries in this log
 predate the harness and should be re-run through it before being trusted.
+
+---
+
+## 2026-07-27 — harness validated (floor 10% -> 0.9%); SIMD-first reductions NEUTRAL
+
+First use of `scripts/metal-paired-ab.py`. It validates itself: the baseline arm
+across six ABBA blocks read 23.18 / 23.38 / 23.37 / 23.38 / 23.36 / 23.37 — a
+**0.9% spread where the naive alternating loop gave 10%**. Cooldown plus order
+balancing turns this host into one that resolves ~0.2%, better than the 1-2%
+named as the prerequisite. **The remaining 5.5% is now measurable.**
+
+**SIMD-first threadgroup reductions: NEUTRAL. Not landed.**
+
+| block | A base | B simd-first | delta |
+|---|--:|--:|--:|
+| 0 | 23.18 | 23.36 | +0.18 |
+| 1 | 23.38 | 23.32 | -0.05 |
+| 2 | 23.37 | 23.35 | -0.02 |
+| 3 | 23.38 | 23.32 | -0.05 |
+| 4 | 23.36 | 23.36 | +0.00 |
+| 5 | 23.37 | 23.38 | +0.01 |
+
+Median -0.04%; B faster in 2/6 blocks. Cutting `vt_tg_sum`/`vt_tg_max` from
+eleven barrier steps to three moves NOTHING, so the barrier-chain explanation for
+decode attention's 29 GB/s is **refuted** — the fifth decode hypothesis to fall.
+Note both earlier readings of this same change were noise: +0.5% standalone and
+-6% alternating. Only the paired run is trustworthy, which is the harness earning
+its keep on its first use.
+
+**Decode attention's 29 GB/s is now known NOT to be:** dispatch/fusion, split-K
+parallelism, KV layout, threadgroup width, or reduction barrier depth. Five
+mechanisms eliminated. Still unexplained — but now measurable to 0.2%, which is
+the difference between guessing and bisecting. The next honest step is a
+bisection over the decode attention kernel itself (stub out the V accumulation,
+then the score loop, and time each) rather than a sixth mechanism guess.

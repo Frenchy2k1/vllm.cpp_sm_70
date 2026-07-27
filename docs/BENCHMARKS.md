@@ -2555,6 +2555,43 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## The harness works: floor 10% -> 0.9%, and SIMD-first reductions are NEUTRAL (2026-07-27)
+
+First use of `scripts/metal-paired-ab.py`, and it validates itself. The baseline
+arm across six ABBA blocks:
+
+```
+23.18  23.38  23.37  23.38  23.36  23.37   tok/s   (0.9% spread)
+```
+
+**0.9% where the naive alternating loop gave 10%.** Cooldown plus order balancing
+turned an unusable host into one that resolves roughly 0.2% — better than the
+1-2% named as the prerequisite. The remaining 5.5% is now measurable.
+
+**Verdict on SIMD-first threadgroup reductions: NEUTRAL, not landed.**
+
+| block | A (base) | B (simd-first) | delta |
+|---|--:|--:|--:|
+| 0 | 23.18 | 23.36 | +0.18 |
+| 1 | 23.38 | 23.32 | -0.05 |
+| 2 | 23.37 | 23.35 | -0.02 |
+| 3 | 23.38 | 23.32 | -0.05 |
+| 4 | 23.36 | 23.36 | +0.00 |
+| 5 | 23.37 | 23.38 | +0.01 |
+
+Median -0.04%, B faster in 2 of 6 blocks. Cutting `vt_tg_sum`/`vt_tg_max` from
+eleven barrier steps to three changes nothing measurable, so **the barrier-chain
+explanation for decode attention's 29 GB/s is refuted too** — the fifth decode
+hypothesis to fall. Both earlier readings of this change (+0.5% standalone, -6%
+alternating) were noise; only the paired run is trustworthy.
+
+**Decode attention's 29 GB/s is now known NOT to be:** dispatch count / fusion,
+split-K parallelism, KV layout, threadgroup width, or reduction barrier depth.
+Five mechanisms tested and eliminated. It is still unexplained, but it is now
+measurable to 0.2%, which is the difference between guessing and bisecting.
+
+---
+
 ## A paired A/B harness, because the alternating loop lies (2026-07-27)
 
 `scripts/metal-paired-ab.py`. The floor documented below makes the obvious
