@@ -113,6 +113,7 @@ struct RopeApplyParams {
   uint64_t q_s0, q_s1, k_s0, k_s1;
   uint32_t t, hq, hk, rot, rhalf, is_neox, q_dt, k_dt, cache_dt, pos_i64, has_k, pad;
 };
+struct BwParams { uint32_t n_chunks, chunk_f4, stride_f4, tg, chunks_per_tg, pad; };
 struct FStepGpu { uint32_t op, out, in0, in1, gemma, pad; };
 struct FcParams { uint32_t t, h, nsteps, x_dt, w_dt, res_dt, out_dt, tg; float eps; };
 
@@ -1082,4 +1083,26 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// Test-only strided-read bandwidth probe; see vt_bw_probe in metal_msl.h. Lives
+// outside the anonymous namespace so the Metal test can link it.
+void BandwidthProbe(Queue&, void* src, void* out, uint32_t n_chunks, uint32_t chunk_f4,
+                    uint32_t stride_f4) {
+  // 256 threads walking 64 chunks each: enough work per threadgroup that this
+  // measures memory, not dispatch.
+  const uint32_t tg = std::min<uint32_t>(
+      256u, MetalContext::Get().PipelineMaxThreads("vt_bw_probe"));
+  const uint32_t chunks_per_tg = 64u;
+  const uint32_t groups = (n_chunks + chunks_per_tg - 1) / chunks_per_tg;
+  BwParams p{n_chunks, chunk_f4, stride_f4, tg, chunks_per_tg, 0u};
+  Encoder e("vt_bw_probe");
+  const Device dev{DeviceType::kMETAL, 0};
+  Tensor s = Tensor::Contiguous(src, DType::kF32, dev, {1});
+  Tensor o = Tensor::Contiguous(out, DType::kF32, dev, {1});
+  e.BindTensor(s, 0, "bw_probe: src");
+  e.BindTensor(o, 1, "bw_probe: out");
+  e.BindBytes(&p, sizeof(p), 2);
+  e.DispatchGrid2D(groups, 1, tg);
+}
+
 }  // namespace vt::metal

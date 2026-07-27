@@ -2555,6 +2555,47 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## KV-LAYOUT hypothesis REFUTED by direct measurement (2026-07-27)
+
+The entry below proposed that decode attention's ~29 GB/s comes from the KV
+cache's `[block][slot][kv_head][dim]` layout, whose single-head walk is 12.5%
+dense. **That is wrong**, and a strided-read probe (`vt_bw_probe`, opt-in via
+`VT_BW_PROBE=1`) settles it without touching the cache. Same 8 MB of USEFUL
+bytes at every stride; stride x8 IS the KV pattern:
+
+| stride | pattern | useful GB/s |
+|---|---|--:|
+| x1 | contiguous | 54.5 |
+| x2 | | 55.8 |
+| x4 | | 74.6 |
+| **x8** | **the KV single-head walk** | **69.1** |
+| x16 | | 77.1 |
+
+Striding does not reduce useful bandwidth here — it slightly increases it, a
+wider span spreading across more channels. A 12.5%-dense walk sustains 69 GB/s
+against decode attention's 29, so **the layout does not explain the gap** and the
+head-major cache refactor (which would have touched reshape_and_cache, every
+attention kernel and the CUDA path) is not worth doing on this evidence.
+
+**The probe's own first version was wrong and is worth recording.** It used one
+threadgroup per 256-byte chunk, so `ChooseThreadgroupSize(16)` gave each group 16
+threads and 32768 groups: it measured DISPATCH, not memory, reporting a flat
+~28 GB/s at every stride — which by coincidence matched decode attention's 29 and
+would have "confirmed" any hypothesis put to it. The fixed probe walks 64 chunks
+per group with 256 threads. **A probe that returns the number you expected is the
+one to double-check.**
+
+**Where this leaves the decode gap: open.** Three hypotheses have now been tested
+and refuted — dispatch/fusion (decode is 97% GPU-busy), split-K parallelism
+(flash-decoding measured slower), and layout (this probe). The probe does show
+bandwidth scaling with threadgroup count (512 groups reach 69 GB/s where decode
+attention's 16 groups get 29), so parallelism is implicated, yet flash-decoding
+at 128 groups was slower — meaning its overhead outweighed the gain, not that the
+direction is wrong. A cheaper way to add streams without a combine pass is the
+next thing to look for.
+
+---
+
 ## Flash-decoding REJECTED — the decode bandwidth limit is LAYOUT, not parallelism (2026-07-27)
 
 **This refutes the fix proposed in the entry below, which was recorded one commit

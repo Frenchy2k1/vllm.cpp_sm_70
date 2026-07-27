@@ -26803,3 +26803,48 @@ or an experimental head-major cache behind a flag on the Metal path only.
 **Standing goal: 94.5%, unchanged.** Two consecutive proposed fixes for the
 decode gap (fusion, then flash-decoding) have now been refuted by measurement.
 The remaining gap is real but its cause is not yet established.
+
+---
+
+## 2026-07-27 — KV-LAYOUT hypothesis REFUTED by a direct probe (and the probe's first version was wrong)
+
+The previous entry proposed that decode attention's ~29 GB/s comes from the KV
+cache layout `[block][slot][kv_head][dim]`, whose single-head walk is 12.5%
+dense. **Refuted.** `vt_bw_probe` (committed, opt-in via `VT_BW_PROBE=1`) reads a
+fixed 8 MB of USEFUL bytes while varying only the stride; x8 IS the KV pattern:
+
+| stride | pattern | useful GB/s |
+|---|---|--:|
+| x1 | contiguous | 54.5 |
+| x4 | | 74.6 |
+| **x8** | **KV single-head walk** | **69.1** |
+| x16 | | 77.1 |
+
+Striding does not cost useful bandwidth — it slightly helps, a wider span hitting
+more channels. 69 GB/s for the exact KV pattern against decode attention's 29
+means the layout does not explain the gap. **The head-major cache refactor is
+NOT worth doing on this evidence**, which is the point of having run a 60-line
+probe before a cross-cutting change to reshape_and_cache, every attention kernel
+and the CUDA path.
+
+**The probe's first version was itself wrong, and that is the more useful
+lesson.** It used one threadgroup per 256-byte chunk, so ChooseThreadgroupSize(16)
+gave 16 threads per group across 32768 groups: it measured DISPATCH, not memory.
+It reported a flat ~28 GB/s at every stride — coincidentally matching decode
+attention's 29 — and would have "confirmed" whatever hypothesis it was pointed
+at. The fixed version walks 64 chunks per group with 256 threads.
+**A probe that returns the number you were expecting is the one to double-check.**
+
+**Decode gap status: OPEN, three hypotheses refuted.**
+1. dispatch count / fusion — decode is 97% GPU-busy at p=8 and already 28.02
+   tok/s vs MLX's 27.65, so there is nothing to win.
+2. split-K parallelism (flash-decoding) — implemented fully, measured slower at
+   every context length.
+3. KV layout — this probe.
+
+The probe DOES show bandwidth scaling with threadgroup count (512 groups reach
+69 GB/s; decode attention's 16 groups get 29), so parallelism is implicated —
+but flash-decoding at 128 groups lost, meaning its per-split overhead (redundant
+Q reads, redundant reductions, a combine pass) outweighed the gain rather than
+the direction being wrong. The next thing to look for is a way to add memory
+streams WITHOUT a combine pass.

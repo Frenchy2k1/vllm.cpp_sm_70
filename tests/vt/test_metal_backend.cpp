@@ -12,6 +12,7 @@
 // non-CPU backend and so covers Metal automatically.
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -26,6 +27,11 @@
 #include "vllm/platforms/interface.h"
 #include "vllm/v1/attention/registry.h"  // SelectAttentionBackendName
 #include "vt/backend.h"
+// Test-only bandwidth probe entry point.
+namespace vt::metal {
+void BandwidthProbe(vt::Queue& q, void* src, void* out, uint32_t n_chunks, uint32_t chunk_f4,
+                    uint32_t stride_f4);
+}
 #include "vt/ops.h"
 
 using vt::Backend;
@@ -980,6 +986,43 @@ TEST_CASE("Metal kPagedAttention matches the CPU oracle at Qwen3 geometry (GQA, 
           << worst_i % dh << ")");
   CHECK(nmse <= 5e-4);
   CHECK(worst <= 5e-2);
+  metal.DestroyQueue(q);
+}
+
+// Settles whether decode attention's measured ~29 GB/s is a LAYOUT effect.
+// Reads a fixed number of USEFUL bytes with the stride varied: stride == chunk is
+// a contiguous stream, stride == 8*chunk is exactly the paged KV cache's
+// single-head pattern ([block][slot][kv_head][dim] with 8 kv heads, so d
+// elements every 8*d). Opt-in: VT_BW_PROBE=1.
+TEST_CASE("Metal strided-read bandwidth probe" * doctest::skip(true)) {
+  if (std::getenv("VT_BW_PROBE") == nullptr) return;
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+
+  const uint32_t chunk_f4 = 16;              // 256 B, one head's d=128 bf16 row
+  const uint32_t n_chunks = 32768;           // 8 MB of USEFUL bytes
+  const size_t useful = static_cast<size_t>(n_chunks) * chunk_f4 * 16;
+  for (uint32_t mult : {1u, 2u, 4u, 8u, 16u}) {
+    const uint32_t stride_f4 = chunk_f4 * mult;
+    const size_t span = static_cast<size_t>(n_chunks) * stride_f4 * 16;
+    void* src = metal.Alloc(span);
+    void* dst = metal.Alloc((n_chunks + 64) * sizeof(float));
+    std::memset(src, 0, span);
+    metal.Synchronize(q);
+    // Warm, then time a batch of repeats.
+    vt::metal::BandwidthProbe(q, src, dst, n_chunks, chunk_f4, stride_f4);
+    metal.Synchronize(q);
+    const int reps = 20;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) vt::metal::BandwidthProbe(q, src, dst, n_chunks, chunk_f4, stride_f4);
+    metal.Synchronize(q);
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double gbs = static_cast<double>(useful) * reps / sec / 1e9;
+    MESSAGE("stride x" << mult << " (useful " << (useful >> 20) << " MB, span "
+            << (span >> 20) << " MB): " << gbs << " GB/s of USEFUL bytes");
+    metal.Free(src);
+    metal.Free(dst);
+  }
   metal.DestroyQueue(q);
 }
 

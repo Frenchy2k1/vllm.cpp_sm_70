@@ -1630,6 +1630,39 @@ kernel void vt_paged_attention_mma(device const uchar* q     [[buffer(0)]],
   }
 }
 
+
+// Bandwidth probe (test-only, opt-in). Reads `n_chunks` chunks of `chunk_f4`
+// float4s each, advancing `stride_f4` float4s between chunks. stride == chunk is
+// a contiguous stream; stride > chunk reproduces the paged KV cache's access
+// pattern, where one kv head's slot data is `d` elements every
+// `num_kv_heads * d`. This exists to settle whether decode attention's measured
+// 29 GB/s is a LAYOUT effect or something else, without changing the cache.
+struct VtBwParams { uint n_chunks; uint chunk_f4; uint stride_f4; uint tg; uint chunks_per_tg; uint pad; };
+
+kernel void vt_bw_probe(device const float4* src [[buffer(0)]],
+                        device float*        out [[buffer(1)]],
+                        constant VtBwParams& p   [[buffer(2)]],
+                        uint2 tgid [[threadgroup_position_in_grid]],
+                        uint2 tid2 [[thread_position_in_threadgroup]]) {
+  threadgroup float smem[VT_TG_MAX];
+  const uint tid = tid2.x;
+  // Each threadgroup walks MANY chunks. One threadgroup per chunk would size the
+  // group by chunk_f4 (16 threads) and measure launch overhead rather than
+  // bandwidth — which is exactly what the first version of this probe did.
+  const uint c0 = tgid.x * p.chunks_per_tg;
+  float acc = 0.0f;
+  for (uint i = tid; i < p.chunks_per_tg * p.chunk_f4; i += p.tg) {
+    const uint c = c0 + i / p.chunk_f4;
+    const uint e = i % p.chunk_f4;
+    if (c < p.n_chunks) {
+      const float4 v = src[ulong(c) * ulong(p.stride_f4) + ulong(e)];
+      acc += v.x + v.y + v.z + v.w;
+    }
+  }
+  const float s = vt_tg_sum(smem, tid, p.tg, acc);
+  if (tid == 0u) { out[tgid.x] = s; }
+}
+
 struct VtArgmaxParams {
   uint n;
   uint v;
