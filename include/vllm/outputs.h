@@ -16,10 +16,10 @@
 // DEFERRED upstream state, intentionally omitted — later units slot these in
 // without reshaping the structs:
 //   CompletionOutput: routed_experts (np.ndarray [seq_len,layer_num,topk]),
-//     lora_request; logprobs detail (SampleLogprobs payload) is kept as an
-//     opaque optional flag until the sampler/logprobs unit lands.
-//   RequestOutput: prompt_logprobs detail (PromptLogprobs payload) is kept as
-//     an opaque optional flag until the sampler/logprobs unit lands; metrics
+//     lora_request. (logprobs now carries the real SampleLogprobs payload —
+//     ROAD-V1-C7.)
+//   RequestOutput: prompt_logprobs now carries the real PromptLogprobs payload
+//     (ROAD-V1-C7 output plumbing); metrics
 //     (RequestStateStats), lora_request, encoder_prompt /
 //     encoder_prompt_token_ids (encoder/decoder models), num_cached_tokens
 //     (prefix-cache hit count), kv_transfer_params (P/D remote K/V), the
@@ -51,6 +51,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/logprobs.h"    // vllm::SampleLogprobs / PromptLogprobs
 #include "vllm/v1/request.h"  // vllm::v1::FinishReason (for the string mapping)
 
 namespace vllm {
@@ -71,9 +72,10 @@ struct CompletionOutput {
   std::vector<int32_t> token_ids;
   // The cumulative log probability of the generated output text.
   std::optional<double> cumulative_logprob;
-  // SampleLogprobs | None upstream. Payload deferred; the engaged/disengaged
-  // state is preserved so downstream branching still ports (opaque flag).
-  std::optional<bool> logprobs;
+  // SampleLogprobs | None upstream: one {token_id -> Logprob} dict per generated
+  // token (sampled + top-k). None when logprobs were not requested. Filled by
+  // the OutputProcessor's LogprobsProcessor (ROAD-V1-C7 SAMPLE-LOGPROBS).
+  std::optional<SampleLogprobs> logprobs;
   // The reason the sequence finished, as the upstream STRING form ("stop" /
   // "length" / ...). None while still generating. Set via SetFinishReason to
   // apply the FinishReason -> string mapping upstream uses.
@@ -104,11 +106,11 @@ struct RequestOutput {
   std::vector<int32_t> prompt_token_ids;
   // The output sequences of the request (one per requested `n`).
   std::vector<CompletionOutput> outputs;
-  // PromptLogprobs | None upstream (required-positional; None on the plain
-  // generate path). Payload deferred; the engaged/disengaged state is kept as
-  // an opaque optional flag (mirrors CompletionOutput.logprobs) until the
-  // sampler/logprobs unit lands.
-  std::optional<bool> prompt_logprobs;
+  // PromptLogprobs | None upstream: one {token_id -> Logprob} dict per prompt
+  // token (first is None). None on the plain generate path. Filled by the
+  // LogprobsProcessor when prompt_logprobs was requested (the tensor source is
+  // the runner/prefill path — SAMPLE-PROMPT-LOGPROBS).
+  std::optional<PromptLogprobs> prompt_logprobs;
   // Whether the whole request is finished.
   bool finished = false;
 

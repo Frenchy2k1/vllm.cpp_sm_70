@@ -1,9 +1,37 @@
 // vllm.cpp original — see serving_utils.h.
 #include "vllm/entrypoints/openai/serving_utils.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <map>
+#include <string>
 
 namespace vllm::entrypoints::openai {
+
+namespace {
+
+// _get_decoded_token (generate/base/serving.py:253-271, return_as_token_id
+// path off): prefer the LogprobsProcessor's decoded_token; fall back to the
+// `token_id:N` placeholder when detokenization was disabled (decoded_token is
+// None) — our serving layer holds no tokenizer, so this stands in for the
+// `tokenizer.decode([token_id])` branch (recorded deviation).
+std::string DecodedToken(const vllm::Logprob& lp, int32_t token_id) {
+  if (lp.decoded_token.has_value()) return *lp.decoded_token;
+  return "token_id:" + std::to_string(token_id);
+}
+
+// list(token.encode("utf-8", errors="replace")): our strings are already UTF-8
+// bytes, so map each byte to its unsigned value.
+std::vector<int> Utf8Bytes(const std::string& s) {
+  std::vector<int> out;
+  out.reserve(s.size());
+  for (unsigned char c : s) out.push_back(static_cast<int>(c));
+  return out;
+}
+
+constexpr float kLogprobFloor = -9999.0f;  // JSON-serializable -inf floor.
+
+}  // namespace
 
 StreamUsageSelection ShouldIncludeUsage(
     const std::optional<StreamOptions>& stream_options,
@@ -76,6 +104,105 @@ std::string SanitizeUtf8(const std::string& s) {
     out.append(s, i, len);  // a valid character — copied byte-for-byte
     i += len;
   }
+  return out;
+}
+
+CompletionLogProbs BuildCompletionLogProbs(const std::vector<int32_t>& token_ids,
+                                           const vllm::SampleLogprobs& top_logprobs,
+                                           int num_output_top_logprobs,
+                                           int initial_text_offset) {
+  CompletionLogProbs out;
+  int last_token_len = 0;
+  const std::size_t n = token_ids.size();
+  for (std::size_t i = 0; i < n; ++i) {
+    const int32_t token_id = token_ids[i];
+    // A position may lack a logprobs dict (e.g. an echoed prompt token with no
+    // prompt_logprobs): emit token + null logprob/top_logprobs (serving.py:677).
+    const vllm::LogprobsOnePosition* step =
+        i < top_logprobs.size() ? &top_logprobs[i] : nullptr;
+    const vllm::Logprob* step_token =
+        step != nullptr ? step->find(token_id) : nullptr;
+    if (step == nullptr || step->empty() || step_token == nullptr) {
+      out.tokens.push_back("token_id:" + std::to_string(token_id));
+      out.token_logprobs.push_back(std::nullopt);
+      out.top_logprobs.push_back(std::nullopt);
+    } else {
+      const std::string token = DecodedToken(*step_token, token_id);
+      out.tokens.push_back(token);
+      out.token_logprobs.push_back(std::max(step_token->logprob, kLogprobFloor));
+      // Keep the first num_output_top_logprobs+1 entries (OpenAI's N+1 rule):
+      // enumerate(step.items()) yields [sampled, top1, ...]; keep index <= N.
+      std::map<std::string, float> top;
+      int idx = 0;
+      for (const int32_t tid : step->order) {
+        if (idx > num_output_top_logprobs) break;
+        const vllm::Logprob& lp = step->entries.at(tid);
+        top[DecodedToken(lp, tid)] = std::max(lp.logprob, kLogprobFloor);
+        ++idx;
+      }
+      out.top_logprobs.push_back(std::move(top));
+    }
+    const std::string& emitted = out.tokens.back();
+    out.text_offset.push_back(out.text_offset.empty()
+                                  ? initial_text_offset
+                                  : out.text_offset.back() + last_token_len);
+    last_token_len = static_cast<int>(emitted.size());
+  }
+  return out;
+}
+
+namespace {
+
+// _get_top_logprobs (chat_completion/serving.py:1114-1139): keep the first
+// `top_logprobs` entries (0-based cutoff; -1 => all) in dict-iteration order.
+std::vector<ChatCompletionLogProb> ChatTopLogprobs(
+    const vllm::LogprobsOnePosition& step, int top_logprobs) {
+  std::vector<ChatCompletionLogProb> out;
+  int i = 0;
+  for (const int32_t tid : step.order) {
+    if (!(top_logprobs == -1 || i < top_logprobs)) break;
+    const vllm::Logprob& lp = step.entries.at(tid);
+    ChatCompletionLogProb e;
+    e.token = DecodedToken(lp, tid);
+    e.logprob = std::max(lp.logprob, kLogprobFloor);
+    e.bytes = Utf8Bytes(e.token);
+    out.push_back(std::move(e));
+    ++i;
+  }
+  return out;
+}
+
+}  // namespace
+
+ChatCompletionLogProbs BuildChatLogprobs(const std::vector<int32_t>& token_ids,
+                                         const vllm::SampleLogprobs& top_logprobs,
+                                         int num_output_top_logprobs) {
+  ChatCompletionLogProbs out;
+  std::vector<ChatCompletionLogProbsContent> content;
+  const std::size_t n = token_ids.size();
+  for (std::size_t i = 0; i < n; ++i) {
+    const int32_t token_id = token_ids[i];
+    const vllm::LogprobsOnePosition* step =
+        i < top_logprobs.size() ? &top_logprobs[i] : nullptr;
+    const vllm::Logprob* step_token =
+        step != nullptr ? step->find(token_id) : nullptr;
+    ChatCompletionLogProbsContent c;
+    if (step == nullptr || step->empty() || step_token == nullptr) {
+      // None branch (serving.py:1159-1174): token + its bytes, no logprob/top.
+      c.token = "token_id:" + std::to_string(token_id);
+      c.bytes = Utf8Bytes(c.token);
+    } else {
+      c.token = DecodedToken(*step_token, token_id);
+      c.logprob = std::max(step_token->logprob, kLogprobFloor);
+      // bytes = None when decoded_token is None, else its UTF-8 bytes (:1189).
+      if (step_token->decoded_token.has_value()) {
+        c.bytes = Utf8Bytes(*step_token->decoded_token);
+      }
+      c.top_logprobs = ChatTopLogprobs(*step, num_output_top_logprobs);
+    }
+    content.push_back(std::move(c));
+  }
+  out.content = std::move(content);
   return out;
 }
 

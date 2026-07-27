@@ -49,6 +49,14 @@ struct LogprobsTensors {
   // the given shape.
   static LogprobsTensors empty_cpu(int num_positions,
                                    int num_tokens_per_position);
+
+  // LogprobsLists.slice_request (vllm/v1/outputs.py:38-51): the scheduler's
+  // per-request cut of the batch-wide logprobs — rows [req_idx, req_idx +
+  // num_positions). At T0 non-spec decode num_positions == 1 (one generated
+  // token per request per step) and cu_num_generated_tokens is None, so req_idx
+  // indexes positions directly. (Our host-vector LogprobsTensors doubles as the
+  // numpy LogprobsLists twin — no torch/numpy split.)
+  LogprobsTensors slice_request(int req_idx, int num_positions) const;
 };
 
 }  // namespace vllm::v1

@@ -57,6 +57,7 @@
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/v1/engine/detokenizer.h"
+#include "vllm/v1/engine/logprobs.h"
 #include "vllm/v1/engine/types.h"
 #include "vllm/v1/request.h"
 
@@ -139,6 +140,10 @@ class RequestState {
   std::vector<int32_t> prompt_token_ids;
   size_t prompt_len = 0;
   std::unique_ptr<IncrementalDetokenizer> detokenizer;
+  // LogprobsProcessor (output_processor.py:166): engaged only when the request
+  // asked for sample and/or prompt logprobs (else nullopt => inert). Consumes
+  // each EngineCoreOutput's new_logprobs / new_prompt_logprobs_tensors.
+  std::optional<LogprobsProcessor> logprobs_processor;
   std::optional<int> max_tokens_param;
   bool is_prefilling = true;
   int num_cached_tokens = 0;  // deferred (no prefill_stats at T0); stays 0.

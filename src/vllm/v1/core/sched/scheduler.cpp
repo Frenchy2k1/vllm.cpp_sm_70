@@ -671,7 +671,26 @@ EngineCoreOutputs Scheduler::update_from_output(
       }
     }
 
-    // DEFERRED: sample logprobs / prompt logprobs / num_nans_in_logits.
+    // Extract sample logprobs if needed (scheduler.py:1815-1821). Only when the
+    // request asked for logprobs and the runner produced them this step; slice
+    // this request's rows out of the batch-wide LogprobsLists.
+    std::optional<LogprobsTensors> new_logprobs;
+    if (request->sampling_params.logprobs.has_value() &&
+        model_runner_output.logprobs.has_value() &&
+        model_runner_output.logprobs->num_positions > 0) {
+      new_logprobs = model_runner_output.logprobs->slice_request(
+          req_index, static_cast<int>(new_token_ids.size()));
+    }
+    // Get prompt logprobs for this request (scheduler.py:1826-1827). Populated
+    // only during prefill for a prompt_logprobs request (runner source pending).
+    std::optional<LogprobsTensors> new_prompt_logprobs_tensors;
+    {
+      auto plp_it = model_runner_output.prompt_logprobs_dict.find(req_id);
+      if (plp_it != model_runner_output.prompt_logprobs_dict.end()) {
+        new_prompt_logprobs_tensors = plp_it->second;
+      }
+    }
+    // num_nans_in_logits: deferred.
 
     // Emit an EngineCoreOutput only when the request produced tokens or finished
     // (upstream's `if new_token_ids or ... or stopped`). A partial-prefill
@@ -682,6 +701,8 @@ EngineCoreOutputs Scheduler::update_from_output(
       out.request_id = req_id;
       out.new_token_ids = new_token_ids;
       out.finish_reason = finish_reason;
+      out.new_logprobs = std::move(new_logprobs);
+      out.new_prompt_logprobs_tensors = std::move(new_prompt_logprobs_tensors);
       // stop_reason is int|str|None upstream; our EngineCoreOutput carries an
       // optional<string> (see engine/types.h). Only a stop_token_ids match sets
       // request.stop_reason at T0 — stringify that token id; otherwise nullopt.

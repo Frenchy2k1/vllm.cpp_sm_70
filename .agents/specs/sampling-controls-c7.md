@@ -2,8 +2,10 @@
 
 *(Live spec, 2026-07-27. Base `origin/main` `489f7771`. Pin vLLM 0.26.0.dev0
 `555967922`. Owner claim `CLAIM-ROADMAP-C7`. This spec covers the leaf rows
-`SAMPLE-CORE`, `SAMPLE-LOGIT-FILTERS` (advanced to `ACTIVE`) and the count-side of
-`SAMPLE-LOGPROBS` (stays `PARTIAL` — payload end-to-end is the named residual).)*
+`SAMPLE-CORE`, `SAMPLE-LOGIT-FILTERS` (advanced to `ACTIVE`) and
+`SAMPLE-LOGPROBS` (payload end-to-end now `DONE`, W5, `CLAIM-ROADMAP-C7-LOGPROBS`).
+`SAMPLE-PROMPT-LOGPROBS` payload path is DONE; its row stays `ACTIVE` pending the
+runner prompt-logits source.)*
 
 ## Scope
 
@@ -100,12 +102,24 @@ execution is dgx-pending exactly like the rest of the sampler, not new work).
 - W2 OpenAI protocol parse + logit_bias clamp (DONE).
 - W3 `InputBatch` per-slot wiring + `build_sampling_metadata` + maintenance (DONE).
 - W4 `InputProcessor` bad_words tokenization + eos stop-set (DONE).
-- W5 (residual) `SAMPLE-LOGPROBS` payload: LogprobsProcessor port
-  (`vllm/v1/engine/logprobs.py`) -> `CompletionOutput.logprobs` ->
-  OpenAI `CompletionLogProbs` / `ChatCompletionLogProbs` serialization, gated on a
-  running engine (CPU reference or tiny model). Sampler already PRODUCES the
-  `LogprobsTensors` and `max_num_logprobs` now reaches it; only the
-  engine-output/serialization plumbing remains.
+- W5 (DONE 2026-07-27, `CLAIM-ROADMAP-C7-LOGPROBS`) `SAMPLE-LOGPROBS` payload:
+  ported `vllm/logprobs.py` (`Logprob`/`LogprobsOnePosition`/
+  `append_logprobs_for_next_position` -> `include/vllm/logprobs.h`) +
+  `vllm/v1/engine/logprobs.py` (`LogprobsProcessor` ->
+  `include/vllm/v1/engine/logprobs.h`+`src/.../logprobs.cpp`). Threaded
+  `SamplerOutput.logprobs_tensors` -> `ModelRunnerOutput.logprobs` (runner) ->
+  `LogprobsTensors::slice_request` -> `EngineCoreOutput.new_logprobs` (scheduler)
+  -> `OutputProcessor` LogprobsProcessor -> `CompletionOutput.logprobs` ->
+  OpenAI `CompletionLogProbs`/`ChatCompletionLogProbs` serialization
+  (`BuildCompletionLogProbs`/`BuildChatLogprobs` in `serving_utils.cpp` +
+  `to_json` in `protocol.cpp`). Gated on the CPU reference engine
+  (`test_openai_serving`) + a vLLM-0.26 serialization oracle
+  (`test_openai_logprobs`, RED-first). The prompt-logprobs OUTPUT path
+  (`_update_prompt_logprobs`/`pop_prompt_logprobs` -> `RequestOutput.prompt_logprobs`
+  -> serving) is DONE too, but `SAMPLE-PROMPT-LOGPROBS` stays `ACTIVE`: the runner
+  does not yet compute prompt-position logits (the tensor SOURCE — a runner/prefill
+  addition adjacent to C5). `echo` prompt-prepend + the `num_logprobs==-1`
+  full-vocab payload shape remain deferred (finite-K is the gated path).
 
 ## Risks/decisions
 

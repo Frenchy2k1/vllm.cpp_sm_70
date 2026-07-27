@@ -20,10 +20,13 @@
 #ifndef VLLM_ENTRYPOINTS_OPENAI_SERVING_UTILS_H_
 #define VLLM_ENTRYPOINTS_OPENAI_SERVING_UTILS_H_
 
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/logprobs.h"  // vllm::SampleLogprobs / Logprob
 
 namespace vllm::entrypoints::openai {
 
@@ -42,6 +45,25 @@ struct StreamUsageSelection {
 StreamUsageSelection ShouldIncludeUsage(
     const std::optional<StreamOptions>& stream_options,
     bool enable_force_include_usage);
+
+// Ported from: vllm/entrypoints/openai/completion/serving.py:652-741
+// (_create_completion_logprobs). Assemble the /v1/completions logprobs payload
+// from a run of generated (or echoed) tokens and their per-position SampleLogprobs.
+// `num_output_top_logprobs` == request.logprobs (keeps N+1 entries per position).
+// `initial_text_offset` seeds the running character offset (nonzero when the
+// echoed prompt precedes the completion). Relies on the LogprobsProcessor's
+// per-token decoded_token; falls back to a `token_id:N` placeholder when absent.
+CompletionLogProbs BuildCompletionLogProbs(const std::vector<int32_t>& token_ids,
+                                           const vllm::SampleLogprobs& top_logprobs,
+                                           int num_output_top_logprobs,
+                                           int initial_text_offset = 0);
+
+// Ported from: vllm/entrypoints/openai/chat_completion/serving.py:1141-1210
+// (_create_chat_logprobs + _get_top_logprobs). `num_output_top_logprobs` ==
+// request.top_logprobs (keeps N entries per position, 0-based cutoff; -1 => all).
+ChatCompletionLogProbs BuildChatLogprobs(const std::vector<int32_t>& token_ids,
+                                         const vllm::SampleLogprobs& top_logprobs,
+                                         int num_output_top_logprobs);
 
 }  // namespace vllm::entrypoints::openai
 
