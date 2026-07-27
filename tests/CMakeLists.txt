@@ -398,6 +398,17 @@ if(VLLM_CPP_SERVER)
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
   vllm_cpp_add_test(test_openai_conformance vllm/entrypoints/openai/test_conformance.cpp)
+  # Both spin up a REAL cpp-httplib server (background accept thread) and drive it
+  # with a client on a bounded connect/read timeout. They pass reliably run alone,
+  # but under a saturated `ctest -jN` (the multi-minute paged-engine/bench tests
+  # peg every core) the server's accept thread starves and the client sees
+  # connection failures / an abort. RUN_SERIAL reproduces the standalone
+  # condition — the test runs with no other ctest test concurrent — so the
+  # parallel suite is deterministic. (A shared RESOURCE_LOCK would only serialize
+  # these two against each other, not against the CPU-hog tests that actually
+  # cause the starvation.)
+  set_tests_properties(test_openai_api_server test_openai_conformance
+    PROPERTIES RUN_SERIAL ON)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

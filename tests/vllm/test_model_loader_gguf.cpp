@@ -53,10 +53,16 @@ TEST_CASE("FromModelDir keeps the directory path for non-.gguf inputs") {
 }
 
 TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
+  // The rejection must fire during architecture resolution, BEFORE any tokenizer
+  // or weight I/O — so the arch must be one the registry does NOT know. (Note:
+  // LlamaForCausalLM, which this case originally used, is now a SUPPORTED arch,
+  // so it would sail past resolve and fail later on a missing tokenizer instead.)
+  // Gemma4ForCausalLM is a real-but-still-unported Gemma arch: it is absent from
+  // the registry, so Resolve throws the "not supported" error up front.
   TempDir dir;
   nlohmann::json config{
-      {"model_type", "llama"},
-      {"architectures", nlohmann::json::array({"LlamaForCausalLM"})},
+      {"model_type", "gemma"},
+      {"architectures", nlohmann::json::array({"Gemma4ForCausalLM"})},
       {"hidden_size", 8},
       {"num_hidden_layers", 1},
       {"num_attention_heads", 1},
@@ -66,11 +72,16 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
 
   CHECK_THROWS_WITH_AS(
       LoadedEngine::FromModelDir(dir.path().string(), EngineParams{}),
-      "Model architectures ['LlamaForCausalLM'] are not supported for now. "
+      "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['DeepseekV2ForCausalLM', 'OPTForCausalLM', 'Qwen3ForCausalLM', "
-      "'Qwen3MoeForCausalLM', "
-      "'Qwen3_5ForConditionalGeneration', "
-      "'Qwen3_5MoeForConditionalGeneration'])",
+      "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
+      "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', 'GemmaForCausalLM', "
+      "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
+      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', 'LlamaForCausalLM', "
+      "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
+      "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
+      "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
+      "'Qwen3MoeForCausalLM', 'Qwen3_5ForConditionalGeneration', "
+      "'Qwen3_5MoeForConditionalGeneration', 'StableLmForCausalLM'])",
       std::runtime_error);
 }

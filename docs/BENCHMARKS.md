@@ -6447,3 +6447,16 @@ this entry records a correctness closure, not a speed run.
 ---
 
 **ROAD-V1-D4-APC W2 - prefix-cache block-hash `extra_keys` (mm / LoRA / `cache_salt`): CORRECTNESS LANDED + CPU-GATED, cache-on SPEED PENDING (2026-07-27, `CLAIM-ROADMAP-D4APC`, NOT pushed).** `benchmark_binding=false` - this is a behavioral-parity closure, not a throughput number. `generate_block_hash_extra_keys` ported 1:1 from `vllm/v1/core/kv_cache_utils.py:451-591` (mm hash + LoRA name + `cache_salt`, order lora->mm->salt) and gated on dgx GB10 with a CPU build (`-DVLLM_CPP_CUDA=OFF` Release): `test_kv_cache_utils` 29/29 (253 assertions), `test_kv_cache_manager` 10/10 (74). RED-first proven: restoring the stub makes a differently-salted request FALSE-HIT the prior tenant's 48 cached tokens (`n1==48`); with extra keys `n1==0`. No speed A/B is claimed - the hash cost is a sub-1%-of-prefill lever (per the spike's B1) and was not measured. **The cache-on prefill-reuse speedup (W3) is PENDING/RI:** it needs a PURE-DENSE (full-attention, APC-default-ON) model to measure our-APC-ON TTFT-drop vs our-APC-OFF and vs vLLM-APC-ON on a shared-prefix workload. Both synthetic CPU engine harnesses are Qwen3_5-HYBRID (APC inert by design), and the only real dense checkpoint on dgx is OPT-125m (noise-dominated, non-binding). No APC cache-on throughput number is claimed. Reproduction: `ssh dgx.casa; cd ~/scratch_apc_w2/vllm.cpp; cmake --build build-cpu --target test_kv_cache_utils test_kv_cache_manager -j$(nproc); ./build-cpu/tests/test_kv_cache_utils; ./build-cpu/tests/test_kv_cache_manager`. Evidence: `.agents/parity-ledger.md` / `.agents/state.md` (`CLAIM-ROADMAP-D4APC`).
+
+---
+
+## CPU test-suite hygiene (2026-07-27) - NOT APPLICABLE (test-only, no perf number)
+
+`benchmark_binding=false` - a test-suite triage, not a speed run. The previously-red
+CPU CTest cases were verified stale-assertion or `-j` contention, not regressions:
+`test_model_registry` count updated to the 24 registered architectures,
+`test_model_loader_gguf` rejection switched to a genuinely-unregistered arch,
+`test_dflash_propose` given the now-required `"model"` key, and the two HTTP-server
+tests marked CTest `RUN_SERIAL`. No throughput or latency number is claimed.
+Reproduction: `cmake --build build-cpu --target test_model_registry test_model_loader_gguf test_dflash_propose && ctest --test-dir build-cpu -R "model_registry|model_loader_gguf|dflash_propose|openai"`.
+Evidence: `.agents/parity-ledger.md` / `.agents/state.md`.

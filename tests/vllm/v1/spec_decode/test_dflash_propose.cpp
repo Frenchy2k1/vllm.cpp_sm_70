@@ -398,9 +398,15 @@ TEST_CASE("dflash DflashProposeBlock: empty context degenerates to context-free 
 }
 
 TEST_CASE("dflash config: ParseSpeculativeConfigJson accepts method dflash + k, lookahead k+1") {
-  const SpeculativeConfig cfg =
-      ParseSpeculativeConfigJson(R"({"method":"dflash","num_speculative_tokens":15})");
+  // SPEC-DFLASH D5 (speculative.cpp:83-90): the DFlash draft is a SEPARATE
+  // checkpoint, so `method:"dflash"` now REQUIRES a `model` key naming it (unlike
+  // MTP's in-target tensors). The parser only records the string — it does NOT
+  // open the path — so this stays a CPU-only, checkpoint-free config test.
+  const SpeculativeConfig cfg = ParseSpeculativeConfigJson(
+      R"({"method":"dflash","num_speculative_tokens":15,"model":"z-lab/dflash-draft"})");
   CHECK(cfg.method == "dflash");
+  REQUIRE(cfg.draft_model_path.has_value());
+  CHECK(*cfg.draft_model_path == "z-lab/dflash-draft");
   CHECK(cfg.use_dflash());
   CHECK(cfg.use_eagle());  // dflash is a draft-hidden-state method
   REQUIRE(cfg.num_speculative_tokens.has_value());
