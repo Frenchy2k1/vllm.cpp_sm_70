@@ -2437,6 +2437,53 @@ in that evidence document before publishing these values as binding for the
 development branch.
 This 4B diagnostic does not establish 27B/35B support.
 
+## Metal `M3c-1` batched command buffers on Apple M4 (2026-07-27) - INDICATIVE
+
+**The lever the attribution below identified, implemented and measured.** Same
+binary, arms selected by `VT_METAL_SYNC_DISPATCH=1` (restores one command buffer
+per op), Qwen3-1.7B-bf16 p=512 g=128, 2 reps with arm order alternated, CI
+runners paused, whole series under the GPU lock.
+
+| B | serial agg tok/s | batched agg tok/s | speedup | serial duration | batched duration |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 3.68 / 3.69 | 5.51 / 5.53 | **1.50x** | 34.79 s | 23.22 s |
+| 16 | 19.12 / 19.13 | 21.64 / 21.61 | **1.13x** | 107.13 s | 94.65 s |
+
+| B | commits serial | commits batched | dispatches/commit | gpu_busy_frac serial | batched |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 50,944 | **454** | 112.2 | 66.6% | **98.4%** |
+| 16 | 52,536 | **469** | 112.0 | 88.4% | **99.6%** |
+
+**The control that makes this a clean result: GPU busy time is UNCHANGED**
+(22.566 s -> 22.490 s at b=1; 93.957 s -> 93.845 s at b=16). The change removed
+overhead, not work. The ~11.0 s recovered at b=1 matches the 11.316 s the
+attribution attributed to command-buffer round trips, so this is the prediction
+being confirmed rather than a fresh claim. TTFT b=1 5369 -> 4937 ms.
+
+**b=16 gains less because it was already 88.4% GPU bound**: larger per-dispatch
+work amortises the fixed ~186 us round trip. That is self-consistent with the
+attribution, not a shortfall.
+
+**The backend is now COMPUTE bound (98.4% to 99.6%).** That promotes `M3d`
+(simdgroup-matrix GEMM) to the next lever, exactly as the attribution predicted,
+and it means further dispatch-side work has almost nothing left to recover.
+
+**Shipping config (MLX GEMM provider + batching), b=1: 9.32 / 9.52 tok/s**
+(13.74 / 13.44 s) against 6.23 with MLX serial. The MLX-LM gap at b=1 narrows
+from ~4.8x to **~2.96x**.
+
+**Correctness precondition MET, and stated precisely.** The Qwen3-dense Metal
+gate ran on device type 2 (METAL) and passes **128/128** against Metal's own
+oracle-backed golden; `test_metal_backend` is **19 cases / 20,118 assertions**,
+including three new tests pinning batching, flush-before-host-read, and in-order
+chaining. **The OPT-125m gate SKIPPED** (dgx-only checkpoint) and is not
+evidence here.
+
+**Status: INDICATIVE, NOT BINDING** (worker daemon and aerial wallpaper up), but
+rep spread was 0.4% and the GPU-busy control is arm-independent.
+
+---
+
 ## Metal dispatch attribution on Apple M4 (2026-07-27) - the backend is SUBMIT bound
 
 **This is the section that explains every other Metal number below it.** Full

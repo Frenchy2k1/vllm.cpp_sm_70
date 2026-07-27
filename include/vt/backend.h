@@ -41,6 +41,13 @@ class Backend {
   // override with a stream sync.
   virtual void Synchronize(Queue&) {}
 
+  // Drains any deferred submission WITHOUT a Queue in hand. Needed because the
+  // portable CPU reference tier (op_provider.cpp) runs a HOST kernel directly
+  // over device memory on a unified-memory backend, and must not observe bytes
+  // a batched-but-uncommitted GPU submission has not written yet. Default no-op
+  // suits every backend that submits eagerly; Metal overrides it (M3c-1).
+  virtual void FlushPending() {}
+
   // True when host and device share one memory space (CPU, GB10, Apple).
   virtual bool UnifiedMemory() const = 0;
 

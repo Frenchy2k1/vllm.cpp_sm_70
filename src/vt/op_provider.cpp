@@ -61,6 +61,9 @@ struct Slot {
   std::atomic<int8_t> native_registered{-1};
   // One-time loud reference-tier warning per (op, device) — see Resolve.
   std::atomic<bool> ref_announced{false};
+  // Is the CURRENT selection the portable CPU reference tier? Read on every
+  // GetOp, so it is a plain relaxed bool rather than a string compare.
+  std::atomic<bool> ref_selected{false};
   std::atomic<const char*> last_selected{nullptr};
   std::atomic<unsigned long long> selections{0};
   std::atomic<unsigned long long> declines{0};
@@ -256,6 +259,7 @@ void* Resolve(OpId op, DeviceType device, Slot& slot) {
   // Reference-tier accounting: count it, and warn LOUDLY exactly once per
   // (op, device) so "this backend ran op X on the portable tier" is never silent.
   if (std::strcmp(chosen->name, kReferenceProviderName) == 0) {
+    slot.ref_selected.store(true, std::memory_order_relaxed);
     RefTierHits().fetch_add(1, std::memory_order_relaxed);
     if (!slot.ref_announced.exchange(true, std::memory_order_relaxed)) {
       std::fprintf(stderr,
@@ -274,6 +278,7 @@ void InvalidateAll() {
   for (size_t i = 0; i < kOpCount * kNumDeviceTypes; ++i) {
     t[i].selected.store(nullptr, std::memory_order_relaxed);
     t[i].resolved_none.store(false, std::memory_order_relaxed);
+    t[i].ref_selected.store(false, std::memory_order_relaxed);
     t[i].native_registered.store(-1, std::memory_order_relaxed);
   }
 }
@@ -321,6 +326,7 @@ void RegisterOpProvider(OpId op, DeviceType device, const OpProvider& provider) 
   slot.providers[slot.count++] = provider;
   slot.selected.store(nullptr, std::memory_order_relaxed);
   slot.resolved_none.store(false, std::memory_order_relaxed);
+  slot.ref_selected.store(false, std::memory_order_relaxed);
   slot.native_registered.store(-1, std::memory_order_relaxed);
 }
 
@@ -339,6 +345,15 @@ void* GetOp(OpId op, DeviceType device) {
   Slot& slot = At(op, device);
   void* fn = slot.selected.load(std::memory_order_relaxed);
   if (fn == nullptr) fn = Resolve(op, device, slot);
+  // The portable reference tier is a HOST kernel about to read and write DEVICE
+  // memory directly (it is only ever installed on unified memory, op_provider.h
+  // SAFETY). A backend that defers submission must therefore drain before it
+  // runs, or the CPU reads bytes the GPU has not written yet. No-op on every
+  // eagerly-submitting backend, and skipped entirely on the common path.
+  if (slot.ref_selected.load(std::memory_order_relaxed)) {
+    Backend* b = TryGetBackend(device);
+    if (b != nullptr) b->FlushPending();
+  }
   if (CallStatsFlag().load(std::memory_order_relaxed)) {
     slot.selections.fetch_add(1, std::memory_order_relaxed);
   }

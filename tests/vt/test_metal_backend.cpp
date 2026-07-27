@@ -1087,16 +1087,18 @@ TEST_CASE("Metal dispatch profile attributes host encode, wait and GPU busy") {
   // ON: the same dispatch must produce exactly one named row plus the total.
   vt::metal::SetProfileEnabled(true);
   vt::Relu(q, t, t);
-  metal.Synchronize(q);
+  metal.Synchronize(q);  // M3c-1: the commit happens HERE, not in the op
   std::vector<vt::metal::ProfileRow> rows = vt::metal::GetProfileRows();
   REQUIRE(rows.size() >= 2);
   const vt::metal::ProfileRow& total = rows.back();
   CHECK(total.name.empty());
   CHECK(total.count == 1);
-  // Every phase must be a real, non-negative duration, and the GPU can never
-  // have been busy LONGER than the wall time we blocked for. That ordering is
-  // the property the whole attribution rests on: if it inverted, the
-  // gpu/wait ratio driving the optimisation decisions would be meaningless.
+  // `count` is DISPATCHES; since M3c-1 batched them, wait and GPU time are
+  // properties of the COMMIT and appear on the total row only. Every phase must
+  // be a real, non-negative duration, and the GPU can never have been busy
+  // LONGER than the wall time we blocked for. That ordering is the property the
+  // whole attribution rests on: if it inverted, the gpu/wait ratio driving the
+  // optimisation decisions would be meaningless.
   CHECK(total.encode_s >= 0.0);
   CHECK(total.wait_s > 0.0);
   CHECK(total.gpu_s >= 0.0);
@@ -1110,6 +1112,109 @@ TEST_CASE("Metal dispatch profile attributes host encode, wait and GPU busy") {
   vt::metal::ResetProfile();
   CHECK(vt::metal::GetProfileRows().empty());
   vt::metal::SetProfileEnabled(was_on);
+  metal.Free(x);
+  metal.DestroyQueue(q);
+}
+
+// ===========================================================================
+// M3c-1 — batched encoders. Attribution measured 50,944 command buffers for a
+// 128-token generation, each costing a ~186 us commit+wait round trip that is
+// 33% of total runtime (.agents/specs/metal-dispatch-attribution.md). These
+// pin the contract that makes that cost collapsible: many dispatches share ONE
+// command buffer, and every path that lets the HOST observe device memory
+// flushes first. The dispatch count alone cannot distinguish batched from
+// serialised, which is why these assert on the COMMIT count.
+TEST_CASE("Metal batches many dispatches into ONE command buffer per flush") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+
+  const bool was_on = vt::metal::ProfileEnabled();
+  vt::metal::SetProfileEnabled(true);
+  vt::metal::ResetProfile();
+
+  const int64_t n = 1024;
+  float* x = static_cast<float*>(metal.Alloc(n * sizeof(float)));
+  std::vector<float> host(static_cast<size_t>(n), 1.0f);
+  metal.Copy(q, x, host.data(), host.size() * sizeof(float));
+  Tensor t = Tensor::Contiguous(x, vt::DType::kF32, d, {n});
+
+  // Eight independent dispatches with NO synchronisation between them.
+  const int kOps = 8;
+  vt::metal::ResetProfile();
+  for (int i = 0; i < kOps; ++i) vt::Relu(q, t, t);
+
+  // Nothing forced a flush yet, so nothing may have been committed.
+  CHECK(vt::metal::GetProfileCommits() == 0);
+
+  metal.Synchronize(q);
+
+  // Synchronize is the flush point: exactly ONE command buffer for all eight.
+  CHECK(vt::metal::GetProfileCommits() == 1);
+  std::vector<vt::metal::ProfileRow> rows = vt::metal::GetProfileRows();
+  REQUIRE(!rows.empty());
+  CHECK(rows.back().count == static_cast<unsigned long long>(kOps));
+
+  vt::metal::SetProfileEnabled(was_on);
+  vt::metal::ResetProfile();
+  metal.Free(x);
+  metal.DestroyQueue(q);
+}
+
+TEST_CASE("Metal flushes pending work before the host can observe device memory") {
+  // The correctness half. Batching is only safe if every host-visible read
+  // drains the queue first; otherwise `Copy` hands back stale bytes and the
+  // failure is silent, intermittent and data-dependent. Deliberately NO
+  // explicit Synchronize: Copy itself must be a flush point.
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+
+  const int64_t n = 512;
+  float* x = static_cast<float*>(metal.Alloc(n * sizeof(float)));
+  std::vector<float> host(static_cast<size_t>(n), -3.0f);
+  metal.Copy(q, x, host.data(), host.size() * sizeof(float));
+  Tensor t = Tensor::Contiguous(x, vt::DType::kF32, d, {n});
+
+  vt::Relu(q, t, t);  // -3 -> 0, entirely on the GPU, never synchronised
+
+  std::vector<float> back(static_cast<size_t>(n), 12345.0f);
+  metal.Copy(q, back.data(), x, back.size() * sizeof(float));
+  for (int64_t i = 0; i < n; ++i) {
+    REQUIRE(back[static_cast<size_t>(i)] == 0.0f);
+  }
+
+  metal.Free(x);
+  metal.DestroyQueue(q);
+}
+
+TEST_CASE("Metal chains batched dispatches in order without intermediate sync") {
+  // Ordering inside one command buffer. A compute encoder created with the
+  // default MTLDispatchTypeSerial serialises its dispatches, so a read-modify
+  // -write chain must still compose exactly. If batching ever moved to
+  // concurrent dispatch without explicit barriers, THIS is what would break,
+  // and it would break as wrong numbers rather than as a crash.
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+
+  const int64_t n = 256;
+  float* x = static_cast<float*>(metal.Alloc(n * sizeof(float)));
+  std::vector<float> host(static_cast<size_t>(n), 2.0f);
+  metal.Copy(q, x, host.data(), host.size() * sizeof(float));
+  Tensor t = Tensor::Contiguous(x, vt::DType::kF32, d, {n});
+
+  // x += x, three times, no sync between: 2 -> 4 -> 8 -> 16.
+  vt::Add(q, t, t, t);
+  vt::Add(q, t, t, t);
+  vt::Add(q, t, t, t);
+
+  std::vector<float> back(static_cast<size_t>(n), 0.0f);
+  metal.Copy(q, back.data(), x, back.size() * sizeof(float));
+  for (int64_t i = 0; i < n; ++i) {
+    REQUIRE(back[static_cast<size_t>(i)] == 16.0f);
+  }
+
   metal.Free(x);
   metal.DestroyQueue(q);
 }

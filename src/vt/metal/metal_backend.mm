@@ -66,20 +66,41 @@ class MetalBackend final : public Backend {
 
   void Free(void* p) override {
     if (p == nullptr) return;
+    // A batched command buffer may still reference this allocation. Releasing
+    // it underneath an in-flight GPU read is a use-after-free that would
+    // present as corrupt output or a GPU fault, so drain first.
+    FlushPendingBatch();
     void* buf = UnregisterAllocation(p);
     VT_CHECK(buf != nullptr, "metal: Free() on a pointer this backend did not allocate");
     [static_cast<id<MTLBuffer>>(buf) release];
   }
 
-  // Shared storage + synchronous dispatch => the host may touch the bytes
-  // directly. Both are BIT-EXACT byte operations, which is why the gate keeps
-  // bit-exactness for pure copy/layout paths while reductions only owe NMSE.
+  // Shared storage => these are host memcpy/memset over the SAME pages the GPU
+  // writes. With dispatch batched (M3c-1) the GPU work may still be pending, so
+  // each is a flush point: without it the host would read stale bytes, silently
+  // and intermittently. Both remain BIT-EXACT byte operations, which is why the
+  // gate keeps bit-exactness for pure copy/layout paths while reductions only
+  // owe NMSE.
   void Memset(Queue&, void* p, int value, size_t bytes) override {
+    FlushPendingBatch();
     std::memset(p, value, bytes);
   }
   void Copy(Queue&, void* dst, const void* src, size_t bytes) override {
+    FlushPendingBatch();
     std::memcpy(dst, src, bytes);
   }
+
+  // Was a no-op while every op committed and waited by itself. It is now the
+  // primary flush point: "blocks until all work previously submitted has
+  // completed" is exactly what committing the open batch and waiting does.
+  void Synchronize(Queue&) override { FlushPendingBatch(); }
+
+  // Reached from op_provider before a portable CPU-reference kernel runs
+  // directly over Metal memory (S5). That kernel is HOST code touching device
+  // pages, so it needs the same drain Copy does, and it has no Queue to hand us.
+  void FlushPending() override { FlushPendingBatch(); }
+
+  void DestroyQueue(Queue&) override { FlushPendingBatch(); }
 
   // One process-wide MTLCommandQueue is shared by every vt::Queue: the queue
   // handle is the ORDERING domain and, with synchronous dispatch, every op is
