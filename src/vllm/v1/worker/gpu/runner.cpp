@@ -1875,13 +1875,16 @@ bool GPUModelRunner::async_device_mirror() const {
   if (async_device_mirror_cached_ >= 0) return async_device_mirror_cached_ != 0;
   bool on = false;
 #ifdef VLLM_CPP_CUDA
-  // Integrated GPUs keep the W3 in-place path: their pageable host arrays ARE
-  // device-addressable, so mirroring would only add copies. Everything else on
-  // CUDA (every discrete GPU) needs the mirror, because the alternative is the
-  // host fallback's main-stream Synchronize.
+  // The question is not "is this CUDA" but "is device memory addressable from
+  // the host", which is exactly what the BACKEND already answers. A unified
+  // memory device (GB10, and the CPU backend trivially) keeps the W3 in-place
+  // path, because its host arrays ARE device-addressable and mirroring would
+  // only add copies; a device with separate memory needs the mirror, because the
+  // alternative is the host fallback's main-stream Synchronize. Asking the
+  // capability rather than the device type is also what keeps this file out of
+  // the shared-layer device-leakage ratchet.
   on = async_input_combine_ && AsyncDeviceMirrorEnvDefault() &&
-       queue_.device.type == vt::DeviceType::kCUDA &&
-       !vllm::platforms::GetPlatform(queue_.device.type).is_integrated_gpu();
+       !vt::GetBackend(queue_.device.type).UnifiedMemory();
 #endif
   async_device_mirror_cached_ = on ? 1 : 0;
   return on;

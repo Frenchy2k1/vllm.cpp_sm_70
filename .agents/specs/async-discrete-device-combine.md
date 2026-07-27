@@ -147,6 +147,14 @@ forced by something the spike did not anticipate:
    the front of a step; the staged copy is the better trade against per-upload
    regions plus a per-step event.
 
+A fourth correction came from the shared-layer device-leakage ratchet: the
+mirror's enable predicate first asked "is this device CUDA and not integrated",
+which put a `kCUDA` token in the device-agnostic layer and failed the ratchet.
+The right question was already available and is more precise — `vt::Backend::
+UnifiedMemory()`, i.e. "is device memory addressable from the host". A unified
+device (GB10, and the CPU backend trivially) keeps the in-place path; a device
+with separate memory needs the mirror. Same behaviour, no device-type test.
+
 Also landed alongside: `VT_ASYNC_DEVICE_MIRROR=0`, the same-binary rollback that
 returns a discrete GPU to the pre-W4 host path WITHOUT disabling async scheduling
 (which `VT_ASYNC_RUNNER=0` would also do). That separation is what makes an
