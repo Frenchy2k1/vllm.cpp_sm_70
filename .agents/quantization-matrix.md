@@ -2,8 +2,10 @@
 
 This is the canonical per-scheme support inventory for roadmap C4/D1. The
 coverage spike is [specs/quantization-coverage.md](specs/quantization-coverage.md).
-Sources are pinned to vLLM `e24d1b24`, llama.cpp `237ad9b` plus the documented
-local type-40/41 fork, MLX `4367c73b`, and MLX-LM `a790972f`.
+Sources are pinned to vLLM `555967922` (0.26.0.dev0 + transformers 5.14.1;
+advanced 2026-07-26 from the prior `e24d1b24`/0.25.0 pin, see
+[specs/pin-advance.md](specs/pin-advance.md)), llama.cpp `237ad9b` plus the
+documented local type-40/41 fork, MLX `4367c73b`, and MLX-LM `a790972f`.
 
 ## Status contract
 

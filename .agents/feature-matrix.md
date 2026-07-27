@@ -92,12 +92,12 @@ Transformers-compatibility path. The complete alias-preserving inventory is
 
 | ID | Category / mechanism | Pinned upstream | State | Grounded summary | Detailed evidence / spike |
 |---|---|---|---|---|---|
-| `MODEL-GATE-QWEN35` | Qwen3.5/3.6 dense + MoE wrappers | `models/registry.py:556-560` | `PARTIAL` | 27B/35B **text submodels** pass token/perf gates; both upstream IDs are multimodal wrappers and their ViT/merger paths are absent | model matrix + existing Qwen specs |
+| `MODEL-GATE-QWEN35` | Qwen3.5/3.6 dense + MoE wrappers | `models/registry.py:556-560` | `PARTIAL` | 27B text submodel STRICT + 27B image+video e2e STRICT 32/32 (M3-b/M3d: ViT/merger present); 35B text submodel STRICT, its ViT/merger still pending | model matrix + existing Qwen specs |
 | `MODEL-FACTORY` | architecture -> model factory + reject unknown | `models/registry.py:998-1404` | `PARTIAL` | central ordered type-erased registry now covers both implemented Qwen IDs; live loading resolves the full `architectures` list and rejects unknown/previous/OOT IDs with pinned messages instead of using `num_experts`; execution row `MODEL-FACTORY-registry` is `GATING` on the two-model GPU no-regression campaign | [model-factory-registry.md](specs/model-factory-registry.md) |
-| `MODEL-TEXT` | 130 text-generation IDs | `models/registry.py:71-208` | `INVENTORIED` | 0/130 static text-generation IDs directly supported | model matrix |
+| `MODEL-TEXT` | 130 text-generation IDs | `models/registry.py:71-208` | `PARTIAL` | ~19/130 text archs supported+gated (Llama/Qwen3/Qwen3-MoE/Mistral/OPT/DeepSeek-V2/GLM-4/GLM-4.7-Flash/Granite/StableLM/InternLM2/InternLM3/Phi-1-2/Phi-3-4/MiniCPM/MiniCPM3/OLMo-2/Gemma-1-2-3/Yi); OLMo-3 oracle-blocked, Command-R gate-blocked | model matrix |
 | `MODEL-POOLING` | embedding, late-interaction, reward, token/sequence classification | `models/registry.py:210-329` | `INVENTORIED` | five distinct work fronts; no pooling runtime | model matrix |
-| `MODEL-MM` | 115 v0.25.0-target multimodal IDs | `models/registry.py:331-583` | `PARTIAL` | 2 wrappers run text-only; encoder/processors/cache absent; MOSS-Transcribe-Diarize is target-pending | model matrix |
-| `MODEL-SPEC` | 46 v0.25.0-target speculative-draft IDs | `models/registry.py:585-638` | `ACTIVE` | `Qwen3_5MTP` (27B) draft `DONE` 2026-07-26 — MTP k=1 spec-decode runs e2e + gated; `Qwen3_5MoeMTP` (35B) mechanism landed, e2e gate pending (`GATING`); `DFlashDraftModel` oracle-BLOCKED (vllm#40898); the remaining 43 IDs INVENTORIED | model matrix + [spec-decode specs](specs/mtp-spec-decode.md) |
+| `MODEL-MM` | 115 v0.25.0-target multimodal IDs | `models/registry.py:331-583` | `PARTIAL` | image+video e2e (Qwen3-VL-4B + 27B `Qwen3_5ForConditionalGeneration` STRICT 32/32) + audio e2e (Voxtral-Mini-3B 14/14) + Whisper encoder 203/203 LANDED; processors + encoder-cache present; 35B ViT and broader mm breadth pending | model matrix |
+| `MODEL-SPEC` | 46 v0.25.0-target speculative-draft IDs | `models/registry.py:585-638` | `ACTIVE` | `Qwen3_5MTP` (27B) MTP k=1 `DONE` 2026-07-26; `Qwen3_5MoeMTP` (35B) MoE-MTP `DONE` 2026-07-26 (`383f03db`); `DFlashDraftModel` `DONE` 2026-07-27 (`04dff573`, speed gate met 1.003x; the pin advance to 0.26.0.dev0 resolved vllm#40898); the remaining 43 IDs INVENTORIED | model matrix + [spec-decode specs](specs/mtp-spec-decode.md) |
 | `MODEL-TRANSFORMERS` | 14 static aliases + dynamic compatible classes | `models/registry.py:635-680,1096-1164` | `INVENTORIED` | C++ policy/factory not spiked | model matrix |
 
 ## 5. Quantization
@@ -109,7 +109,7 @@ and reference-engine performance.
 
 | ID | Block | State | Grounded summary | Detailed evidence / spike |
 |---|---|---|---|---|
-| `QUANT-CUDA-GATES` | NVFP4 W4A16, NVFP4 W4A4, gate-specific FP8 W8A8 | `DONE` | support/correctness stays closed; performance remains `ACTIVE` at `3f256ab` **55/124**. FP4 tactics match, and clean `f344dec` closes W1D2/G2 with 27B **235/235** in default+rollback arms plus 35B/GGUF inertness. Component evidence remains open; no quantization speed credit follows | quant matrix §2 + [coverage spike](specs/quantization-coverage.md) |
+| `QUANT-CUDA-GATES` | NVFP4 W4A16, NVFP4 W4A4, gate-specific FP8 W8A8 | `DONE` | support/correctness stays closed; performance remains `ACTIVE` at the current binding `9ecd9d0` **114/124**. FP4 tactics match, and clean `f344dec` closes W1D2/G2 with 27B **235/235** in default+rollback arms plus 35B/GGUF inertness. Component evidence remains open; no quantization speed credit follows | quant matrix §2 + [coverage spike](specs/quantization-coverage.md) |
 | `QUANT-GGUF` | llama.cpp encodings and output presets | `PARTIAL` | F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K materialize; F16 was corrected to reader-only; CPU threadpool/chunked dispatch is correctness-gated but its B4 speed/RSS checkpoint is pending; no direct compute-in-quant or llama.cpp speed parity | quant matrix §1 |
 | `QUANT-VLLM-BREADTH` | generic FP8/MX, AWQ/GPTQ, CT integer, vendor methods, KV | `PARTIAL` | gate-specific implementations exist; generic dispatch/modes remain inventoried | quant matrix §§2-3 |
 | `QUANT-MLX` | affine Q2-8, MXFP4/MXFP8/NVFP4, QQ, mixed recipes/imports | `INVENTORIED` | required for Apple backend; no MLX runtime yet | quant matrix §4 |
@@ -212,10 +212,10 @@ evidence.
 | ID | Platform block | State | Grounded summary | Detailed table / spike |
 |---|---|---|---|---|
 | `BACKEND-CUDA-SM121` | GB10/sm121a | `PARTIAL` | gate workload built, traced, token/perf gated; full component-family coverage is open | [backend row](backend-matrix.md#cuda-target-rows) |
-| `BACKEND-CUDA-OTHER` | vLLM sm70/75/80/86/87/89/90/100/101/103/110/120 targets | `INVENTORIED` | our global build defaults to 121a; no other target is validated | [backend matrix](backend-matrix.md), [CUDA inventory](specs/cuda-architecture-inventory.md) |
+| `BACKEND-CUDA-OTHER` | vLLM sm70/75/80/86/87/89/90/100/101/103/110/120 targets | `ACTIVE` | 9 CUDA arches build-supported (sm80/86/87/89/90a/100a/103a/110/120a, single-arch portable-kernels-only, `-Werror` clean, SASS emitted); sm70/75/101 not build-supported; no non-121a target is runtime-validated | [backend matrix](backend-matrix.md), [CUDA inventory](specs/cuda-architecture-inventory.md) |
 | `BACKEND-CPU` | production CPU | `PARTIAL` | persistent threadpool + chunked GEMM/row dispatch is 1/3/20-thread bit-identical and TSAN-clean; idle-host performance/RSS gate and compute-in-quant remain open | [backend matrix](backend-matrix.md) |
 | `BACKEND-ROCM` | ROCm | `INVENTORIED` | source/dispatch spike required; no "one flag" support claim | [backend matrix](backend-matrix.md) |
-| `BACKEND-MLX` | Apple Metal through MLX | `INVENTORIED` | M4/16 GB host available; runtime absent | [backend matrix](backend-matrix.md) |
+| `BACKEND-MLX` | Apple Metal through MLX | `ACTIVE` | Metal/MLX skeleton ACTIVE: two models (OPT-125m, Qwen3-0.6B) run e2e + pass correctness, native-MSL GEMM, batched command buffers 1.50x (compute-bound at 98%+); optional MLX GEMM provider | [backend matrix](backend-matrix.md) |
 | `BACKEND-VULKAN` | Vulkan | `INVENTORIED` | runtime absent | [backend matrix](backend-matrix.md) |
 | `BACKEND-XPU` | Intel XPU | `INVENTORIED` | loyal upstream-platform port, runtime absent | [backend matrix](backend-matrix.md) |
 | `BACKEND-ANE` | encoder/pooling accelerator | `INVENTORIED` | specialized CoreML route only | [backend matrix](backend-matrix.md) |

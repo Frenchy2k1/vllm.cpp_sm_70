@@ -4,16 +4,21 @@ The reference checkout, fetch remote and eligible gate host come from the
 untracked `developer-preferences.md`. The parity pin and classification rules
 are repository-wide; machine paths are not.
 
-**Active cycle (2026-07-12):** current parity pin `e24d1b24`; audited target
-v0.25.0 `702f4814fe54`; report
+**Active pin (advanced 2026-07-26):** current parity pin `555967922` (vLLM
+0.26.0.dev0 + transformers 5.14.1, Torch 2.13.0, FlashInfer 0.6.15.post1, CUTLASS
+DSL 4.6.0), FLIPPED from the prior `e24d1b24`/0.25.0 pin at W5 (`bc415a3e`), see
+[specs/pin-advance.md](specs/pin-advance.md) §7. The advance re-validated with
+zero real golden drift (27B-W4A4 + 32B-NVFP4A16 bit-identical, 35B/Coder
+byte-stable) and unblocked DFlash (vllm#40898), Gemma-4 (`transformers.gemma4`),
+and OLMo-3 (nested rope); a `vllm-oracle-v0.25.0-stage` rollback is preserved.
+
+**Prior cycle (2026-07-12):** audited target v0.25.0 `702f4814fe54`; report
 [`sync/2026-07-12-702f481.md`](sync/2026-07-12-702f481.md). The exact 145-commit
-pin delta is classified (94 `INVENTORY`, 51 `IGNORE`, no trace-independent
-`PORT-NOW` change in the implemented Qwen T0 slice). The pin remains unchanged
-until target goldens/model behavior gates are re-run and exact 27B→35B
-performance closes. The executable v0.25.0/FlashInfer 0.6.13 oracle is already
-validated and active with a preserved v0.24.0 rollback; immutable `9cc7191`
-established the first new 27B denominator, while immutable `3f256ab` supersedes
-it and remains failed/open at **55/124 axes pass, 69 fail**.
+`e24d1b24..702f481` delta was classified (94 `INVENTORY`, 51 `IGNORE`, no
+trace-independent `PORT-NOW` change in the implemented Qwen T0 slice). Immutable
+`9cc7191` established the first new 27B denominator, while immutable `3f256ab`
+superseded it at **55/124 axes pass, 69 fail**; the current binding is `9ecd9d0`
+**114/124** (see roadmap_v1.md).
 
 - **Reference checkout:** `${VLLM_SOURCE}`, branch selected by the developer
   preferences (normally `main`)
