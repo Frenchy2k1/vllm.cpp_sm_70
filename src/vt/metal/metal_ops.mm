@@ -562,8 +562,8 @@ constexpr uint32_t kGemmTile = 16;
 // Must match VT_GEMV_SGS in metal_msl.h; Apple simdgroups are 32-wide.
 constexpr uint32_t kGemvSimdgroups = 8;
 // Must match VT_MM_BM/VT_MM_BN/VT_MM_SGS in metal_msl.h.
-constexpr int64_t kMmTile = 32;
-constexpr uint32_t kMmSimdgroups = 4;
+constexpr int64_t kMmTile = 64;
+constexpr uint32_t kMmSimdgroups = 8;
 
 // Same-binary A/B lever for the GEMV fast path, which the benchmark protocol
 // requires ("use a same-binary A/B") and which doubles as the bisect switch if

@@ -361,88 +361,47 @@ runtime MSL compile). MSL's simdgroup_matrix supports half and float only.
 Staging as `half` would work but is REFUSED: half saturates at 65504 and
 activation outliers can exceed it, which trades a correctness hazard for speed.
 
-### OPEN LEAD: 64x64 with 8 simdgroups is 1.8x faster and currently WRONG
+### RESOLVED 2026-07-27: 64x64 with 8 simdgroups, and what the defect actually was
 
-The strongest unclosed lead for the parity goal. The failed 4-simdgroup 64x64
-attempt concluded it needed MORE THREADS rather than wider blocks; that form was
-then built and measured:
+**Landed.** The tile is now 64x64 with 8 simdgroups (2 row groups of 32 x 4
+column groups of 16), each simdgroup owning 4x2 blocks of `simdgroup_float8x8`.
 
-| kernel | qkv 512x2048x2048 | mlp-up 512x2048x6144 | mlp-dn 512x6144x2048 |
+| shape | before (32x32, 4 sg) | after (64x64, 8 sg) | MLX steel |
 |---|--:|--:|--:|
-| shipped 32x32, 4 simdgroups | 990 GFLOP/s | 1019 | 1002 |
-| **64x64, 8 simdgroups (2x4)** | **1712** | **1907** | **1821** |
-| MLX steel (target) | 2640 | 3325 | 3293 |
+| qkv 512x2048x2048 | 990 GFLOP/s | **1484** | 2640 |
+| mlp-up 512x2048x6144 | 1019 | **1574** | 3325 |
+| mlp-dn 512x6144x2048 | 1002 | **1507** | 3293 |
 
-**1.8x, closing roughly half the distance to MLX.** Each simdgroup owns a 32x16
-quadrant = 4x2 blocks of 8x8, i.e. 8 accumulators, deliberately not the 16 that
-sank the 4-simdgroup version on occupancy. Threadgroup memory 20 KB
-(sa 2 + sb 2 + sc 16).
+End to end: **14.25 -> 15.30 tok/s (+7.4%)**, TTFT **2534 -> 2065 ms (-18%)**.
+SACRED gate **16/16 UNCHANGED, no golden re-capture required**. Unit suite 21
+cases / 20,135 assertions.
 
-**IT IS NUMERICALLY WRONG AND WAS NOT SHIPPED.** NMSE 0.994 (i.e. garbage) on
-f32 64x512x128 — a shape with NO ragged edge in M, N or K, so this is an indexing
-or synchronisation defect, not an edge-guard slip. Inspection of the tile
-coverage (sg_r = sgitg/4 over 2x32 rows, sg_c = sgitg%4 over 4x16 columns), the
-accumulator-to-`sc` mapping, the barrier order and every stride did not locate
-it. Recorded rather than guessed at further.
+**THE ROOT CAUSE WAS NOT WHAT THE FINGERPRINT SUGGESTED, and the correction
+matters more than the fix.** The half-spacing pattern was read as the compiler
+padding a 2-D `threadgroup float sa[BM][BK]` so that `simdgroup_load`'s
+`elements_per_row` disagreed with the writes. It was simpler and entirely
+self-inflicted: an earlier incomplete edit had left the mma block using the OLD
+32x32 offsets (`&sa[sg_r * 16u + i * 8u][0]`, 16-row groups) while the tile had
+grown to 64 rows. Reads walked 16-row groups against 64-row writes, which is
+precisely "64 source rows landing in 32 destination rows".
 
-**BISECTED 2026-07-27. Three hypotheses tested and REFUTED; the search space is
-now much smaller.**
+**That also invalidates an earlier conclusion.** The bisect that "exonerated the
+simdgroup mapping" because both the 2x4 and 4x2 decompositions failed identically
+was right by accident: both carried the same stale block, so the experiment could
+not have distinguished them. The lesson is that a bisect only isolates a variable
+if the OTHER code genuinely changed, and a pattern-based edit that silently
+matches nothing does not change it. The `assert count == 1` discipline used
+elsewhere in this work is exactly what was missing on those replacements.
 
-1. **The simdgroup mapping is EXONERATED.** Both decompositions were built and
-   both fail identically: 2x4 (sg_r = sgitg/4 over 2x32 rows, acc[4][2]) and 4x2
-   (sg_r = sgitg/2 over 4x16 rows, acc[2][4]). Speed is the same either way
-   (1712/1907/1821 vs 1640/1861/1781 GFLOP/s), so the defect is in the STAGING or
-   BARRIER structure, not in how simdgroups divide the tile.
-2. **The threadgroup-size limit is REFUTED.** The suspicion was that 20 KB of
-   threadgroup memory pushes `maxTotalThreadsPerThreadgroup` below the 256
-   threads dispatched, which in a Release build is silent UB rather than a fault.
-   `DispatchGrid2D` now asserts that limit (a fix worth having regardless, kept
-   in the tree) and **it does not fire**.
-3. **A host/kernel thread-count mismatch is REFUTED.** `kMmTile = 64` and
-   `kMmSimdgroups = 8` are both correctly applied, so 256 threads really are
-   dispatched and the kernel's `nthreads` matches.
+**Kept from the investigation:** the tiles are now FLAT
+(`threadgroup float sa[BM * BK]`) with the stride named once and shared by the
+writes and the `simdgroup_load` calls. That was adopted for a hypothesis that
+turned out to be wrong, but it is retained deliberately: it makes the class of
+bug that did occur unrepresentable, because there is no second place for an
+offset to disagree.
 
-**THE SHARPEST CLUE, and where to resume: the failure is m-dependent.**
-m=2 and m=16 PASS (2.5e-06, 2.7e-06); m=64 and m=512 FAIL (NMSE 0.994, 1.001).
-With BM=64, small m means tile rows >= m are zero-padded and masked at write-out,
-so **the defect only affects tile rows >= 16**. That is consistent with part of
-`sa` never being staged, or being staged after it is read. Instrument the sa
-staging for rows 16..63 first: dump `sa` for a single threadgroup, or stage a
-known constant and check which rows survive to the output.
-
-**THE DEFECT IS NOW FINGERPRINTED (2026-07-27).** A per-row diagnostic
-(`VT_MM_ROWDIAG=1`, committed and skipped by default) feeds A[r][*] = r+1 and
-B = 1 so each output row's VALUE names the source row it actually read. At
-m=n=k=64 on the 64x64/8-simdgroup kernel:
-
-```
-rows  0..15  correct
-rows 16..31  ZERO            (never written)
-rows 32..47  read A[16..31]  (written, WRONG source row)
-rows 48..63  ZERO            (never written)
-```
-
-**Read this carefully, because it excludes the obvious explanations.** Pure
-thread under-coverage would leave zeros but every written row would carry its
-CORRECT source. Here the written rows are correct in count but shifted: the tile
-is being filled at HALF the expected row spacing, so 64 rows of source land in
-32 rows of destination, and the rest is never touched.
-
-That is a STRIDE disagreement between the staging writes (`sa[r][kk]`, which the
-compiler lays out with whatever row pitch it chooses for
-`threadgroup float sa[VT_MM_BM][VT_MM_BK]`) and the `simdgroup_load(..., &sa[R][kk],
-VT_MM_BK)` calls, which assume the pitch is exactly `VT_MM_BK`. It works at
-BM=32 and breaks at BM=64, which is consistent with the compiler padding the
-inner dimension for bank-conflict avoidance at the larger size.
-
-**Next step, and it is concrete:** stop passing `VT_MM_BK` as the
-`elements_per_row` argument and derive the ACTUAL pitch, or restructure `sa` as a
-flat `threadgroup float[]` with an explicitly computed stride so the write and
-the read cannot disagree. Verify with `VT_MM_ROWDIAG=1` (expects "NONE"), then
-`VT_MM_BENCH=1` for the 1.8x, then the f32 64x512x128 arm.
-
-**Reproduce:** the f32 64x512x128 arm catches the defect in one run;
-`VT_MM_ROWDIAG=1` says which rows and which sources; `VT_MM_BENCH=1` gives speed.
+**Still open toward parity:** ours is ~1.5 TFLOP/s against MLX's ~3.3. The
+remaining distance needs register blocking and double-buffered staging.
 
 ### Risks/decisions
 
