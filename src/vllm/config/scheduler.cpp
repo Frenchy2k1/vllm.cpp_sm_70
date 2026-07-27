@@ -23,6 +23,8 @@ const char* SchedulerPolicyToString(SchedulerPolicy policy) {
       return "fcfs";
     case SchedulerPolicy::kPriority:
       return "priority";
+    case SchedulerPolicy::kLPM:
+      return "lpm";
   }
   return "fcfs";
 }
@@ -33,6 +35,12 @@ SchedulerPolicy SchedulerPolicyFromString(const std::string& value) {
   }
   if (value == "priority") {
     return SchedulerPolicy::kPriority;
+  }
+  // "lpm" (ENG-SGLANG-BEHAVIOR-FLAG): SGLang's cache-aware longest-prefix-match
+  // admission ordering. Accepted here as a scoped opt-in behavior flag (SGLang's
+  // wire value, schedule_policy.py:142); vLLM itself has no such policy.
+  if (value == "lpm") {
+    return SchedulerPolicy::kLPM;
   }
   // Mirrors upstream SchedulingPolicy(value) raising ValueError.
   throw std::invalid_argument("Unknown scheduling policy: " + value);

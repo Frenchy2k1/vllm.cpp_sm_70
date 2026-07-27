@@ -4,6 +4,7 @@
 #include "vllm/v1/core/sched/request_queue.h"
 
 #include <algorithm>
+#include <cassert>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -84,6 +85,17 @@ void FCFSRequestQueue::remove_requests(
     }
   }
   queue_.swap(filtered);
+}
+
+void FCFSRequestQueue::reorder(const std::vector<Request*>& order) {
+  // ENG-SGLANG-BEHAVIOR-FLAG (SW1): the Scheduler hands us the cache-aware
+  // (lpm) order it computed over the current contents; adopt it verbatim. The
+  // caller guarantees `order` is a permutation of the current deque (same
+  // multiset), so this only permutes admission order — no request is added or
+  // dropped.
+  assert(order.size() == queue_.size() &&
+         "reorder() must be given a permutation of the current queue");
+  queue_.assign(order.begin(), order.end());
 }
 
 std::size_t FCFSRequestQueue::size() const { return queue_.size(); }

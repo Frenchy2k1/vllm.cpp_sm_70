@@ -412,6 +412,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.tool_parser = nullptr;  // AUTO-detect from the chat template (ABI v4).
   p.reasoning_parser = nullptr;  // AUTO-detect / disabled (ABI v5).
   p.speculative_config = nullptr;  // speculation disabled (ABI v6).
+  p.enable_prefix_caching = 0;     // 0 => model default (ABI v7).
   return p;
 }
 
@@ -465,6 +466,25 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
         params->speculative_config[0] != '\0') {
       ep.speculative_config =
           vllm::ParseSpeculativeConfigJson(params->speculative_config);
+    }
+    // ABI v7: tri-state prefix-caching toggle (0=model default, 1=on, 2=off).
+    // 0 leaves ep.enable_prefix_caching unset (nullopt) so the model-capability
+    // default resolves — the byte-identical default. --enable-radix-attention
+    // maps to state 1 (RadixAttention is fused into our APC).
+    switch (params->enable_prefix_caching) {
+      case 0:
+        break;  // model default (nullopt).
+      case 1:
+        ep.enable_prefix_caching = true;
+        break;
+      case 2:
+        ep.enable_prefix_caching = false;
+        break;
+      default:
+        SetError(
+            "vllm_engine_load: enable_prefix_caching must be 0 (model "
+            "default), 1 (on), or 2 (off)");
+        return VLLM_ERR_INVALID_ARGUMENT;
     }
 
     auto loaded =

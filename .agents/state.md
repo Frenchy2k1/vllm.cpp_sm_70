@@ -28087,3 +28087,63 @@ code, `benchmark_binding=false`. Not pushed.
 **Non-collision.** Cross-references (does NOT re-own) `KV-SGLANG-RADIX-CACHE` + `ENG-SGLANG-BEHAVIOR-FLAG` (owned by `CLAIM-SGLANG-RADIX-SCOPE`) and the `BACKEND-GATE-CUDA-SGLANG*` benchmark rows (sibling track, unchanged). Umbrella docs-only claim owning NO new claimable execution rows (the SGLANG-* matrix IDs are an inventory/classification, not the count-checked canonical matrices). Touches NO source/README/Metal/demo (concurrent session).
 
 **Records.** NEW sglang-matrix + oracle spec; AGENTS.md Index pointer; roadmap_v1 note (deepens `ROAD-V1-A`, NO new portfolio row); feature-matrix cross-ref; coordination `CLAIM-SGLANG-PARITY-PROGRAM` prose note; STATUS capability line; BENCHMARKS NOT-APPLICABLE note; ledger row; this entry. All record checkers rc=0. `benchmark_binding=false`. Not pushed. NEXT: stand up the SGLang perf oracle on GB10 (rank 1) once disk + the async server allow.
+## 2026-07-27 — SGLang behavior-parity W1+W2 IMPLEMENTATION (`CLAIM-SGLANG-IMPL`)
+
+**What.** Implemented the just-merged SGLang behavior-parity scope
+(`CLAIM-SGLANG-RADIX-SCOPE`): the flag surface (W1/RW1) + the cache-aware LPM
+admission (W2/SW1). Base local `main` `b0a1bc4c` (confirmed, hard-reset onto it),
+isolated worktree `.claude/worktrees/agent-a338dccee4c21abc3`. CPU-only, engine-side,
+NO dgx. SGLang pin v0.5.15 `f63458b`; vLLM pin `555967922`. NOT pushed.
+
+**W1 — the flag surface (RW1).** `--enable-radix-attention` /
+`--disable-radix-attention` server aliases for the APC toggle
+(`examples/server/main.cpp`), sharing the SAME `enable_prefix_caching` tri-state +
+once-only guard as `--[no-]enable-prefix-caching`. RadixAttention is fused into our
+block-hash APC (spec §1), so the alias is a no-op wrapper, NOT a distinct path.
+A C-ABI tri-state `int32_t vllm_model_params.enable_prefix_caching` (0=model
+default / 1=on / 2=off), ABI v6→v7 (`include/vllm.h`), mapped to
+`EngineParams::enable_prefix_caching` in `src/capi/vllm_c.cpp` (out-of-range →
+`VLLM_ERR_INVALID_ARGUMENT`); default 0 = byte-identical model-default resolution.
+`--schedule-policy` added as an SGLang-compatible alias of `--scheduling-policy`
+(both take fcfs / priority / lpm).
+
+**W2 — the LPM cache-aware admission (SW1), the genuinely-new behavior.**
+`SchedulerPolicy::kLPM` (`include/vllm/config/scheduler.h`,
+`src/vllm/config/scheduler.cpp`), maps to the FCFS deque (`ToQueuePolicy`).
+`Scheduler::maybe_reorder_waiting_for_lpm()` reorders the waiting deque before the
+UNCHANGED admission loop by a STABLE descending sort on longest cached-prefix
+match, with SGLang's >128-waiting fcfs fallback — ported FROM
+`schedule_policy.py:205` (`_sort_by_longest_prefix`) + `:229-233`
+(`_determine_active_policy`). The match reuses OUR block-hash APC via a NEW
+side-effect-free `KVCacheManager::num_matched_prefix_tokens()` (pure
+`find_longest_cache_hit` — NO stats record so it never double-counts the
+admission-loop query, NO LRU touch); `RequestQueue::reorder()` added (FCFS adopts
+the order; Priority ignores it). `lpm` + caching-off → fcfs + a load-time warn.
+Output-neutral by construction: only admission ORDER changes, never any request's
+tokens. NO second trie (the recorded anti-pattern) — reuses the existing APC index.
+
+**Gate (RED-first, CPU).** NEW `tests/vllm/v1/test_scheduler_lpm.cpp` 3 cases /
+20 asserts: (a) output-neutral — per-request new-token work + total prefix hits
+identical lpm vs fcfs on a warm-cached shared-prefix workload; (b) reorder — RED
+baseline fcfs admits the earlier no-match request first, GREEN lpm admits the
+later high-match request first (both captured in one run); (c) hits-earlier —
+under one-free-slot pressure lpm serves 64 hit tokens by the contended step vs
+fcfs 0 (`PrefixCacheStats.aggregated_query_hit()`); plus lpm+cache-off→fcfs.
+C-ABI tri-state round-trip `test_capi` 9/9 (default 0, valid 0/1/2, out-of-range
+→ INVALID_ARGUMENT). **Inertness (default fcfs, no flags):** `test_scheduler`
+36/36, `test_prefix_cache_stats` 12/12, `test_request_queue` 26/26 UNCHANGED. Clean
+full-library CPU `-Werror`, 0 warnings.
+
+**Residual (named).** SW2 in-batch prefix-collision de-prioritization
+(`schedule_policy.py:253`, `IN_BATCH_PREFIX_CACHING_*_THRESHOLD`) NOT ported —
+LPM lands output-neutral without it. SW3 jump-forward + SW4 eviction-policy knob
+deferred. Cache-ON throughput A/B of `--schedule-policy=lpm` vs the SGLang floor
+stays owned by `BACKEND-GATE-CUDA-SGLANG-PREFIX` (GB10), not this CPU lane.
+
+**Records.** Rows `KV-SGLANG-RADIX-CACHE` + `ENG-SGLANG-BEHAVIOR-FLAG`
+`SPIKE`→`ACTIVE` + engine-matrix summary Total recompute (spike 4→2, active
+32→34); feature-matrix; spec §7 status + §11 structured record; roadmap
+ROAD-V1-A note; docs/STATUS.md + docs/BENCHMARKS.md; coordination
+`CLAIM-SGLANG-IMPL` claim-row + note; ledger; this entry. NO model/kernel source,
+NO README/Metal/demo (concurrent session), NOT the `BACKEND-GATE-CUDA-SGLANG*`
+benchmark rows. All record checkers rc=0. `benchmark_binding=false`.

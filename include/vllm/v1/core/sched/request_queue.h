@@ -65,6 +65,15 @@ class RequestQueue {
   // Remove multiple specific requests from the queue.
   virtual void remove_requests(const std::vector<Request*>& requests) = 0;
 
+  // ENG-SGLANG-BEHAVIOR-FLAG (SW1): replace the queue's contents with `order`
+  // (which MUST be a permutation of the current contents), so the front of the
+  // queue becomes order.front(). Used by the Scheduler under the `lpm` policy to
+  // impose the cache-aware admission order it computes each step. The FCFS deque
+  // adopts the order verbatim; a PriorityRequestQueue keeps its intrinsic
+  // (priority, arrival_time) order and ignores `order` (LPM never drives a
+  // priority queue — it maps to the FCFS queue). Default: ignore.
+  virtual void reorder(const std::vector<Request*>& order) { (void)order; }
+
   // __len__ / __bool__.
   virtual std::size_t size() const = 0;
   virtual bool empty() const = 0;
@@ -85,6 +94,8 @@ class FCFSRequestQueue final : public RequestQueue {
   void prepend_requests(const RequestQueue& requests) override;
   void remove_request(Request* request) override;
   void remove_requests(const std::vector<Request*>& requests) override;
+  // Adopt `order` verbatim as the new deque contents (front = next to pop).
+  void reorder(const std::vector<Request*>& order) override;
   std::size_t size() const override;
   bool empty() const override;
   std::vector<Request*> ToList() const override;

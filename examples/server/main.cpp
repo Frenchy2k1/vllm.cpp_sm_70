@@ -101,8 +101,11 @@ struct Args {
   std::string benchmark_shutdown_fifo;  // paired trace-only control path.
   std::optional<bool> enable_prefix_caching = std::nullopt;
   bool enable_force_include_usage = false;
-  // Scheduling policy: "fcfs" (default) or "priority" (mirrors vLLM's
-  // --scheduling-policy / SchedulerConfig.policy).
+  // Scheduling policy: "fcfs" (default), "priority" (mirrors vLLM's
+  // --scheduling-policy / SchedulerConfig.policy), or "lpm" (SGLang's
+  // cache-aware longest-prefix-match admission ordering, ENG-SGLANG-BEHAVIOR-FLAG;
+  // opt-in, output-neutral, resolves to fcfs when prefix caching is off).
+  // --schedule-policy is accepted as an SGLang-compatible alias.
   std::string scheduling_policy = "fcfs";
   // Tool-call / reasoning dialect selection (mirrors vLLM's --tool-call-parser
   // and --reasoning-parser). THE DEFAULTS ARE TODAY'S HARDCODED BEHAVIOUR:
@@ -135,7 +138,8 @@ struct Args {
          "               [--benchmark-shutdown-fifo F]\n"
          "               [--enable-force-include-usage]\n"
          "               [--[no-]enable-prefix-caching]\n"
-         "               [--scheduling-policy fcfs|priority]\n"
+         "               [--[no-]enable-radix-attention]\n"
+         "               [--scheduling-policy fcfs|priority|lpm]\n"
          "               [--tool-call-parser <name>|auto|none]\n"
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"
@@ -183,13 +187,26 @@ Args ParseArgs(int argc, char** argv) {
     } else if (flag == "--enable-force-include-usage") {
       a.enable_force_include_usage = true;
     } else if (flag == "--enable-prefix-caching" ||
-               flag == "--no-enable-prefix-caching") {
+               flag == "--no-enable-prefix-caching" ||
+               flag == "--enable-radix-attention" ||
+               flag == "--disable-radix-attention") {
+      // --[no-]enable-prefix-caching is vLLM's flag. --enable-radix-attention /
+      // --disable-radix-attention are SGLang-compatible ALIASES for the SAME
+      // toggle (RadixAttention is fused into our block-hash APC — there is no
+      // distinct radix code path; see .agents/specs/sglang-radixattention.md §1).
+      // They set the identical tri-state as the vLLM flag; last-wins is rejected
+      // (mirrors passing the vLLM flag twice) so a contradictory pair is caught.
       if (a.enable_prefix_caching.has_value()) {
-        std::cerr << "server: prefix-caching flag specified more than once\n";
+        std::cerr << "server: prefix-caching flag (--[no-]enable-prefix-caching "
+                     "/ --[disable|enable]-radix-attention) specified more than "
+                     "once\n";
         Usage(argv[0], 2);
       }
-      a.enable_prefix_caching = flag == "--enable-prefix-caching";
-    } else if (flag == "--scheduling-policy") {
+      a.enable_prefix_caching =
+          flag == "--enable-prefix-caching" || flag == "--enable-radix-attention";
+    } else if (flag == "--scheduling-policy" || flag == "--schedule-policy") {
+      // --scheduling-policy is vLLM's flag; --schedule-policy is SGLang's name,
+      // accepted as an alias. Both take fcfs|priority|lpm.
       a.scheduling_policy = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--tool-call-parser") {
       a.tool_call_parser = NextArg(argc, argv, i, argv[0]);
@@ -282,6 +299,16 @@ int main(int argc, char** argv) {
     engine_params.enable_prefix_caching = args.enable_prefix_caching;
     // Reject an unknown policy string (mirrors upstream SchedulingPolicy(value)).
     engine_params.policy = vllm::SchedulerPolicyFromString(args.scheduling_policy);
+    // ENG-SGLANG-BEHAVIOR-FLAG (SW1): `lpm` needs prefix caching to have any
+    // cache to match against; with APC explicitly off it degrades to fcfs
+    // (the scheduler leaves arrival order intact). Warn once at load so the
+    // no-op is visible (mirrors the spec's lpm+cache-off resolution).
+    if (engine_params.policy == vllm::SchedulerPolicy::kLPM &&
+        args.enable_prefix_caching.has_value() &&
+        !args.enable_prefix_caching.value()) {
+      std::cerr << "server: --scheduling-policy lpm has no effect with prefix "
+                   "caching disabled; falling back to fcfs admission order\n";
+    }
     // --kv-transfer-config: the external KV connector, mirroring vLLM's own
     // flag and JSON shape. Absent (default) leaves the optional unset, which is
     // the inert no-connector path the server has always run. A malformed

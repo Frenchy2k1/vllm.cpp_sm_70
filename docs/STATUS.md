@@ -398,17 +398,22 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   for several steps and checks the values track the run. The remaining work is
   the async production-serving path wiring and the config-gated metric families
   (speculative decoding, KV connector, multimodal cache, LoRA).
-- **SGLang RadixAttention behavior parity** is scoped (fuse-or-flag,
-  2026-07-27). SGLang's radix-tree prefix cache is functionally equivalent to our
-  block-hash APC (both do automatic longest-prefix KV sharing with LRU eviction;
-  the only delta is token/page vs block sharing granularity, which is bounded and
-  never changes the output), so RadixAttention is already fused into APC and an
-  `--enable-radix-attention` flag would be an alias for the existing prefix-cache
-  toggle, not a second cache. SGLang's overlap scheduler is likewise already our
-  async scheduler. The one genuinely-distinct SGLang behavior is cache-aware
-  scheduling (reordering the queue by longest prefix match, `--schedule-policy=lpm`),
-  which is scoped as an opt-in flag; jump-forward constrained decoding is a
-  deferred opt-in. See `.agents/specs/sglang-radixattention.md`.
+- **SGLang RadixAttention behavior parity** — scoped 2026-07-27, W1+W2 flags now
+  IMPLEMENTED (CPU-gated). SGLang's radix-tree prefix cache is functionally
+  equivalent to our block-hash APC (both do automatic longest-prefix KV sharing
+  with LRU eviction; the only delta is token/page vs block sharing granularity,
+  which is bounded and never changes the output), so RadixAttention is fused into
+  APC and `--enable-radix-attention` / `--disable-radix-attention` are aliases for
+  the existing prefix-cache toggle (also reachable via the C-ABI tri-state
+  `vllm_model_params.enable_prefix_caching`, ABI v7), not a second cache. SGLang's
+  overlap scheduler is likewise already our async scheduler. The one
+  genuinely-distinct SGLang behavior — cache-aware admission that reorders the
+  waiting queue by longest prefix match — is implemented behind
+  `--schedule-policy=lpm` (`SchedulerPolicy::kLPM`, output-neutral: it changes only
+  which request is admitted first, never any request's tokens; default stays
+  `fcfs`). Residual: SGLang's in-batch prefix-collision de-prioritization and
+  jump-forward constrained decoding stay named/deferred opt-ins. See
+  `.agents/specs/sglang-radixattention.md`.
 - **KV persistence to disk / CPU offload** is built (CPU and disk tiers,
   identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the
   scheduler through an abstract `KVConnector` ABI selected by a

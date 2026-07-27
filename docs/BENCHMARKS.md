@@ -157,6 +157,20 @@ track (`BACKEND-GATE-CUDA-SGLANG*`), unchanged by this scope; any flag-worthy
 follow-on (cache-aware LPM scheduling) carries its own token-neutral A/B + a
 cache-ON throughput A/B under `BACKEND-GATE-CUDA-SGLANG-PREFIX` when implemented.
 
+**SGLang behavior-parity W1+W2 implementation (2026-07-27, `CLAIM-SGLANG-IMPL`,
+NOT pushed).** Disposition: **W1 (flag surface) NOT APPLICABLE** — the
+`--enable-radix-attention` alias + the C-ABI `enable_prefix_caching` tri-state
+add no runtime path (RadixAttention is fused into APC), so no throughput number
+is owed (`benchmark_binding=false`). **W2 (LPM admission) throughput A/B
+PENDING** — the CPU gate `tests/vllm/v1/test_scheduler_lpm.cpp` establishes the
+lever's semantics rather than a speed number: it MEASURES, on a shared-prefix
+workload, that `--schedule-policy=lpm` is output-neutral vs `fcfs` (each request
+computes identical tokens; total prefix-cache hits equal) and that under capacity
+pressure lpm realizes cache hits EARLIER (64 hit tokens served by the contended
+step vs 0 under fcfs, via the `PrefixCacheStats` counters). The binding cache-ON
+throughput A/B of `--schedule-policy=lpm` vs the SGLang floor stays owned by
+`BACKEND-GATE-CUDA-SGLANG-PREFIX` (GB10), not this CPU lane.
+
 **DOCS user-facing split: README landing page + `docs/STATUS.md` ledger
 (2026-07-27, `CLAIM-DOCS-README-SPLIT`).** Disposition: **NOT APPLICABLE (no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Documentation

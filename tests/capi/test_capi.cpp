@@ -392,6 +392,34 @@ TEST_CASE("capi: vllm_engine_load with a bad path returns an error and sets last
   // No throw / crash reaching here proves the ABI boundary caught the exception.
 }
 
+// ─── (c2) ABI v7 tri-state prefix-caching field round-trip ───────────────────
+TEST_CASE("capi: enable_prefix_caching tri-state defaults to 0 and validates") {
+  // Default is 0 == model default (the byte-identical default). This is the
+  // field the server's --enable-radix-attention alias sets (RadixAttention is
+  // fused into our APC; see .agents/specs/sglang-radixattention.md §1).
+  vllm_model_params mp = vllm_model_params_default();
+  CHECK(mp.enable_prefix_caching == 0);
+
+  // Valid states 0/1/2 pass the tri-state gate (they then reach model load,
+  // which fails on the fake path with MODEL_LOAD — not INVALID_ARGUMENT).
+  for (int v : {0, 1, 2}) {
+    vllm_model_params p = vllm_model_params_default();
+    p.model_path = "/nonexistent/vllm-cpp/model/dir";
+    p.enable_prefix_caching = v;
+    vllm_engine* eng = nullptr;
+    CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+    CHECK(eng == nullptr);
+  }
+
+  // An out-of-range tri-state is rejected BEFORE any load attempt.
+  vllm_model_params bad = vllm_model_params_default();
+  bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+  bad.enable_prefix_caching = 3;
+  vllm_engine* eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&bad, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng == nullptr);
+}
+
 // ─── (d) null-argument path: VLLM_ERR_INVALID_ARGUMENT, no crash ─────────────
 TEST_CASE("capi: null arguments return VLLM_ERR_INVALID_ARGUMENT without crashing") {
   // Null out-handle on load.
