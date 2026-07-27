@@ -27400,3 +27400,47 @@ mechanisms eliminated. Still unexplained — but now measurable to 0.2%, which i
 the difference between guessing and bisecting. The next honest step is a
 bisection over the decode attention kernel itself (stub out the V accumulation,
 then the score loop, and time each) rather than a sixth mechanism guess.
+
+---
+
+## 2026-07-27 — decode attention: VECTORISED V accumulation, +1.66% (95.8% of MLX-LM)
+
+**Found by BISECTING the kernel instead of guessing a sixth mechanism.** Stubbing
+each half in turn (`VT_PA_BISECT`, measurement-only) at 2048 context, where decode
+attention costs 5.79 ms/token:
+
+| component | cost | traffic | achieved |
+|---|--:|--:|--:|
+| **V accumulation** | **4.03 ms (70%)** | 117 MB | **29 GB/s** |
+| K / scores | 1.83 ms (30%) | 117 MB | **64 GB/s** |
+
+Parts sum to the whole (5.86 vs 5.79). Identical traffic, 2.2x apart. Cause was
+in plain sight: the score loop had a vectorised `ushort4` bf16 path, the V
+accumulation used scalar `vt_load` per element — 2 bytes per lane per load
+against 8. The score loop's 64 GB/s matches the bandwidth probe's 69, so V's 29
+was the outlier all along.
+
+**This retro-explains all five refuted decode hypotheses.** Fusion, split-K,
+layout, threadgroup width, barrier depth — every one failed because the limiter
+was never parallelism or layout but BYTES PER INSTRUCTION in one loop. Five
+guesses cost far more than the bisect that found it, and the bisect only became
+possible once the paired harness made 0.2% measurable.
+
+**Landed:** four consecutive head elements per thread via `ushort4`, scalar
+fallback for unaligned/non-bf16. `VT_PA_VGROUPS` 4 -> 16 (a key-group now needs
+d/4 = 32 threads; pacc 16 KB, kernel ~24 KB of 32).
+
+**The first version was SLOWER and the harness caught it.** Leaving the cap at 4
+ran 4x32 = 128 of a 512-thread group — workers quartered while bytes/load
+quadrupled. Paired: **-1.65%, consistent 6/6, p = 0.031.** One block read -2.84
+against the others' -0.3, exactly the outlier that makes unpaired measurement lie.
+
+**Paired verdict on the fix** (warm p=512 g=128): +0.41 +0.37 +0.41 +0.43 +0.37
++0.36 -> **+1.66% median, 6/6 blocks, p = 0.031.** Decode 26.52 -> 27.07 (p=512)
+and 23.10 -> 24.60 (p=2048).
+
+**Warm total 23.36 -> 23.74 vs MLX-LM 24.79: 94.5% -> 95.8%.**
+
+Correctness: re-anchored through the oracle a second time (vLLM 0.25.0
+teacher-forced on the new sequence). Max gap **0.125 nats**, same worst as the
+golden replaced, 0 over bar, 0 outside top-K, 16/16 PASS.
