@@ -2555,6 +2555,50 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## OPEN LEAD 2: decode attention streams KV at 24% of peak bandwidth (2026-07-27)
+
+**This overturns the "decode residual is dispatch count / fusion" conclusion in
+the entry below, which was recorded one measurement earlier.** Decode dispatch
+overhead is only 3%: a decode-dominated run (p=8) reports gpu_busy at **97.0%**
+of wall and **28.02 tok/s**, which already matches MLX-LM's 27.65. There is
+almost nothing for fusion to win.
+
+The decode gap appears only WITH CONTEXT, and it is a clean bandwidth limit:
+
+| prompt | decode | ms/tok | KV read/tok | delta vs p=8 | implied |
+|---|--:|--:|--:|--:|--:|
+| 8 | 28.02 | 35.69 | 0.9 MB | - | - |
+| 512 | 26.53 | 37.69 | 58.7 MB | 2.00 ms | **29.3 GB/s** |
+| 2048 | 22.87 | 43.73 | 234.9 MB | 8.04 ms | **29.2 GB/s** |
+
+The same 29 GB/s at two context lengths is a steady-state bandwidth, not a fixed
+overhead — and it is **24% of the M4's ~120 GB/s peak** for what is a pure
+streaming read of the KV cache.
+
+**Cause is structural and already named in the source.** `PagedAttentionKernel`
+launches one threadgroup per (q-head, query token); at decode that is `hq`
+threadgroups — 16 for this model. Widening the threadgroup (tg = 4*d) was the
+earlier mitigation, but 16 threadgroups cannot expose enough independent memory
+streams to saturate the fabric no matter how wide each one is.
+
+**The fix is flash-decoding**: split the key range across G threadgroups per
+(head, token), each producing a partial (running max, sumexp, accumulator), then
+a combine pass. Grid goes 16 -> 16*G.
+
+| decode attention at | p=512 | p=2048 |
+|---|--:|--:|
+| 29 GB/s (today) | 26.53 | 22.87 |
+| 60 GB/s | 27.27 | 25.25 |
+| 90 GB/s | **27.52** | **26.11** |
+
+At 90 GB/s p=512 decode reaches 27.52 against MLX-LM's 27.65 — decode parity —
+and long-context decode gains 14%. This is the largest remaining item and, like
+the prefill attention lead before it, it has a mechanism rather than an exhausted
+exclusion list. It needs a scratch buffer for the partials and a combine kernel,
+so it is a real change, not a parameter.
+
+---
+
 ## GEMM tile enlargement closed in BOTH directions; the gap is now mostly DECODE (2026-07-27)
 
 **REJECTED - BM=128 via SIXTEEN simdgroups.** Every earlier attempt to enlarge
