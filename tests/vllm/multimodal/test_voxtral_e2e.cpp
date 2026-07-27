@@ -203,21 +203,36 @@ TEST_CASE("voxtral_audio_to_text_e2e_strict_vs_vllm_0_25_0") {
     for (size_t i = 0; i < got.size(); ++i) of << (i ? "," : "") << got[i];
   }
 
-  // ---- GATE (BY MEASUREMENT) ----
-  // vLLM's own greedy is K=5 deterministic, so the STRICT bar is token-exact and is
-  // reported: the pipeline reproduces vLLM's greedy EXACTLY up to the first genuine
-  // bf16 near-tie (measured: the first 33 tokens). Because our audio ENCODER uses
-  // DIFFERENT bf16 GEMM/attn kernels than vLLM (cuBLASLt + FLASH_ATTN) — bit-exact is
-  // infeasible (A2 §tolerance) — the binding gate is the ratified near-tie-robust
-  // gate (exactly as M3c/M3d): teacher-force vLLM on OUR sequence, PASS iff every
-  // divergence is a genuine near-tie (<= 0.5 nats). Captured offline
-  // (scripts/mm/a3_voxtral_neartie_gate.py) into voxtral_neartie.json: the SOLE
-  // greedy branch point (pos 33) is a 4-way EXACT tie at -2.0685 nats (gap 0.000),
-  // and every one of our 48 tokens is vLLM's teacher-forced argmax (worst gap 0.0).
+  // ---- GATE (near-tie DISTRIBUTIONAL, user-ratified [[near-tie-distributional-gate]]) ----
+  //
+  // WHY distributional (not byte-exact to one branch): Voxtral text decode now runs
+  // through the FA2 varlen split-KV kernel (LaunchDecodeVarlenFA2Bf16), routed since
+  // block_size is rounded UP to a multiple of 16 (voxtral.cpp; multimodal-speed.md
+  // §11-12 — this is the audio decode-speed win: TPOT 59.4->38.2 ms/tok, BEATS vLLM).
+  // vLLM's OWN greedy at bf16 is NON-DETERMINISTIC at exact logit ties, and this
+  // decode has TWO such ties inside 48 tokens: pos 18 (2-way, gap 0.000: FA2 tok
+  // 24466 vs golden 1584, IDENTICAL logprob) and pos 33 (4-way, gap 0.000). A 1-ULP
+  // reduction-order difference decides each. The FA2 f32 reduction takes the OTHER
+  // side of the pos-18 tie than the vLLM greedy golden did, after which the equally
+  // valid divergent context yields a different continuation. BOTH sequences are vLLM
+  // greedy: teacher-forcing vLLM 0.25.0 on the FA2 sequence gives 0 divergent
+  // positions, worst gap 0.0000 nats, RESULT PASS (scripts/mm/a3_voxtral_neartie_gate.py
+  // -> voxtral_neartie.json). So pinning a byte-match to ONE arbitrary branch (the old
+  // scalar-kernel golden) over-constrains a true tie; the correct bar is the ratified
+  // distributional PASS: every produced token is within vLLM's near-tie band (<= 0.5
+  // nats of its argmax), the strict prefix is token-exact vs vLLM greedy up to the
+  // FIRST genuine tie, and the sequence teacher-forces PASS. This gate is
+  // KERNEL-INDEPENDENT: both the scalar and the FA2 branch PASS it.
+  //
+  // voxtral_neartie.json::our_tokens is regenerated to the SHIPPING kernel's sequence
+  // (FA2) purely as a determinism anchor; the pass/fail VERDICT is the teacher-force
+  // PASS below (result==PASS + zero divergent + worst_gap<=0.5), NOT the byte identity.
   nlohmann::json nt;
   { std::ifstream f(Fix() + "/voxtral_neartie.json"); f >> nt; }
   std::vector<int32_t> nt_tokens = nt["our_tokens"].get<std::vector<int32_t>>();
   const double worst_gap = nt["worst_gap_nats"].get<double>();
+  const int n_divergent = nt["n_divergent"].get<int>();
+  const size_t over_band = nt["over_band_failures"].size();
 
   int strict_prefix = 0;
   for (size_t i = 0; i < std::min(got.size(), golden_tokens.size()); ++i) {
@@ -227,16 +242,31 @@ TEST_CASE("voxtral_audio_to_text_e2e_strict_vs_vllm_0_25_0") {
   int repro = 0;
   for (size_t i = 0; i < std::min(got.size(), nt_tokens.size()); ++i)
     if (got[i] == nt_tokens[i]) ++repro;
-  MESSAGE("STRICT prefix vs vLLM greedy: ", strict_prefix, "/", golden_tokens.size());
-  MESSAGE("near-tie gate: result=", nt["result"].get<std::string>(),
-          " worst_gap_nats=", worst_gap, "  reproduces near-tie seq ", repro, "/",
+  MESSAGE("STRICT prefix vs vLLM greedy: ", strict_prefix, "/", golden_tokens.size(),
+          " (exact up to the first genuine bf16 tie; FA2 branch: pos 18)");
+  MESSAGE("near-tie teacher-force gate: result=", nt["result"].get<std::string>(),
+          " divergent=", n_divergent, " worst_gap_nats=", worst_gap,
+          " over-band(>0.5nats)=", over_band, "  reproduces FA2 seq ", repro, "/",
           nt_tokens.size());
 
-  // Our pipeline must produce exactly 48 tokens and deterministically reproduce the
-  // near-tie-validated sequence, whose every token is within the 0.5-nat band.
+  // Length: exactly the golden's token count.
   CHECK(static_cast<int>(got.size()) == static_cast<int>(golden_tokens.size()));
-  CHECK(repro == static_cast<int>(nt_tokens.size()));
+
+  // BINDING CORRECTNESS = the distributional teacher-force PASS (kernel-independent).
   CHECK(nt["result"].get<std::string>() == "PASS");
+  CHECK(n_divergent == 0);  // every produced token IS vLLM's teacher-forced argmax
+  CHECK(over_band == 0);    // no divergence exceeds the 0.5-nat near-tie band
   CHECK(worst_gap <= 0.5);
-  CHECK(strict_prefix >= 33);  // exact vs vLLM greedy up to the first bf16 near-tie
+
+  // Strict prefix: token-exact vs vLLM greedy up to the first genuine bf16 exact tie.
+  // The FA2 kernel takes the other side of the pos-18 2-way exact tie (gap 0.000) than
+  // the greedy golden, so its exact-match prefix is 18 (the scalar kernel's was 33 at
+  // the pos-33 4-way tie; both branches are teacher-force-valid). We require the
+  // pipeline to reproduce vLLM greedy EXACTLY up to that first tie.
+  CHECK(strict_prefix >= 18);
+
+  // Determinism anchor (NOT the correctness bar): the build reproduces the exact
+  // offline-teacher-force-validated FA2 sequence, guarding against silent decode
+  // regressions. Regenerated with the decode kernel via a3_voxtral_neartie_gate.py.
+  CHECK(repro == static_cast<int>(nt_tokens.size()));
 }
