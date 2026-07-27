@@ -90,6 +90,32 @@ gate stay green). Residual: the AsyncLLM production-serving wiring and the
 config-gated metric families (spec-decode, kv-connector, mm, LoRA). Reproduce:
 `cmake --build build-cpu --target test_llm_engine && ./build-cpu/tests/test_llm_engine`.
 
+**ROAD-V1-C8 per-request timing from EngineCoreEvents (2026-07-27,
+`CLAIM-ROADMAP-C8-RESPONSE-METRICS`, NOT pushed).** Disposition: **NOT APPLICABLE
+(no throughput number, `benchmark_binding=false`; observational events off the
+compute path).** The live-metrics wiring left the per-request queue/prefill/
+inference timing histograms and the preemption counter at zero for lack of
+events. The scheduler now records QUEUED (add_request), SCHEDULED (batch
+admission) and PREEMPTED (KV-pressure eviction) engine-core events 1:1 with vLLM
+0.26.0.dev0 (`555967922`: `scheduler.py:2135`/`:1003`/`:1221`), drained onto
+`EngineCoreOutput.events`; the `OutputProcessor` folds them into the request's
+queue/prefill/inference intervals and the `num_preemptions` counter
+(`stats.py:428-476`). Behavioural CPU gates: `test_scheduler` +1 case (15
+assertions) asserts the events fire at the right sites in order (incl. a real
+KV-exhaustion preemption); `test_llm_engine` +1 case (26 assertions) drives the
+reference engine to completion and asserts the timing histogram sums flip from 0
+to positive and satisfy `inference = prefill + decode`, `prefill <= inference <=
+e2e`. RED-first: with the intervals left at 0 (the pre-wiring state), 5
+`test_llm_engine` assertions fail (queue/prefill/inference sums stuck at 0, the
+interval algebra broken) and the whole `test_scheduler` case fails at the first
+`req0->events.size() == 1`; wired gives 15/15 + 26/26. Inertness: the default
+no-logger path is byte-identical (events are produced but never consumed; the 5
+existing determinism cases and `test_prometheus_metrics` 4/4 stay green).
+Residual: the streaming/non-streaming response-body timing surface, AsyncLLM prod
+metrics. Reproduce: `cmake --build build-cpu --target test_scheduler
+test_llm_engine && ./build-cpu/tests/test_scheduler &&
+./build-cpu/tests/test_llm_engine`.
+
 **ROAD-V1-C8 unified streaming parser engine (2026-07-27, `CLAIM-ROADMAP-C8-PARSER`,
 NOT pushed).** Disposition: **CORRECTNESS gate, no throughput number
 (`benchmark_binding=false`).** A parser is a pure function of the

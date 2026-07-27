@@ -28,8 +28,11 @@
 //     num_nans_in_logits, cudagraph_stats, routed_experts, and the
 //     with_kv_conn_output_only / EMPTY_MODEL_RUNNER_OUTPUT helpers stay deferred.
 //   EngineCoreOutput: new_logprobs / new_prompt_logprobs_tensors are now PRESENT
-//     (ROAD-V1-C7); pooling_output, events (EngineCoreEvent), kv_transfer_params,
-//     trace_headers, prefill_stats, routed_experts, num_nans_in_logits deferred.
+//     (ROAD-V1-C7); events (EngineCoreEvent) is now PRESENT
+//     (SERVE-RESPONSE-METRICS — the per-request QUEUED/SCHEDULED/PREEMPTED
+//     timing events the scheduler drains onto each output); pooling_output,
+//     kv_transfer_params, trace_headers, prefill_stats, routed_experts,
+//     num_nans_in_logits deferred.
 //   EngineCoreOutputs: scheduler_stats (SchedulerStats), utility_output,
 //     finished_requests, wave_complete / start_wave (DP wave signalling), and
 //     the __post_init__ monotonic-timestamp default (the frontend stamps it).
@@ -168,6 +171,14 @@ struct EngineCoreOutput {
   // LogprobsTensors | None): the prompt-position logprobs produced during
   // prefill for a prompt_logprobs request (scheduler.py:1827/1836).
   std::optional<LogprobsTensors> new_prompt_logprobs_tensors;
+  // events (EngineCoreOutput.events, list[EngineCoreEvent] | None): the
+  // per-request QUEUED/SCHEDULED/PREEMPTED events the scheduler recorded for
+  // this request since the last step, drained here via Request::take_events in
+  // update_from_output. nullopt (omit-default) when log_stats is off or no event
+  // fired this step -> byte-identical no-stats path. Consumed by
+  // IterationStats.update_from_events (stats.py:428-450) to fill the request's
+  // queue/prefill/inference timing intervals + the preemption counter.
+  std::optional<std::vector<EngineCoreEvent>> events;
 
   // finished (property): a request is finished iff finish_reason is set.
   bool Finished() const { return finish_reason.has_value(); }

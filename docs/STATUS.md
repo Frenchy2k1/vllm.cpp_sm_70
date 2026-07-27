@@ -294,10 +294,15 @@ per-lever chronology: [docs/BENCHMARKS.md](BENCHMARKS.md) and
   usage, prefix-cache queries and hits) and the iteration stats (prompt and
   generation token counts, request-success counts, and the time-to-first-token,
   inter-token-latency and end-to-end latency histograms) into the registry,
-  matching vLLM's own mapping. A behavioural CPU gate drives the reference engine
-  for several steps and checks the values track the run. The remaining work is
-  the async production-serving path wiring and the config-gated metric families
-  (speculative decoding, KV connector, multimodal cache, LoRA).
+  matching vLLM's own mapping. The scheduler also records per-request
+  QUEUED/SCHEDULED/PREEMPTED engine-core events (1:1 with vLLM, behind the same
+  stats gate), which the frontend folds into the per-request queue, prefill and
+  inference timing histograms and the preemption counter, so those series now
+  carry real durations rather than staying at zero. A behavioural CPU gate drives
+  the reference engine for several steps and checks the values track the run. The
+  remaining work is the async production-serving path wiring, the chat/completion
+  response-body timing surface, and the config-gated metric families (speculative
+  decoding, KV connector, multimodal cache, LoRA).
 - **KV persistence to disk / CPU offload** is built (CPU and disk tiers,
   identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the
   scheduler through an abstract `KVConnector` ABI selected by a

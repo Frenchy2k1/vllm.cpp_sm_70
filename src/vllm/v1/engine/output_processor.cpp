@@ -341,6 +341,31 @@ OutputProcessorOutput OutputProcessor::process_outputs(
       const int64_t num_new = static_cast<int64_t>(new_token_ids.size());
       iteration_stats->num_generation_tokens += num_new;
       iteration_stats->iteration_tokens += num_new;
+
+      // update_from_events (stats.py:428-450): fold this output's engine-core
+      // events into the request's timing endpoints. QUEUED / SCHEDULED mark the
+      // queued->prefill boundary (the first SCHEDULED wins; later resume
+      // SCHEDULED events are ignored); each PREEMPTED bumps the per-step
+      // preemption counter. LoRA request_waiting/request_running bookkeeping is
+      // deferred with LoRA. nullopt (no events this output) -> no-op.
+      if (eco.events.has_value()) {
+        for (const EngineCoreEvent& ev : *eco.events) {
+          switch (ev.type) {
+            case EngineCoreEventType::kQueued:
+              req_state.queued_ts = ev.timestamp;
+              break;
+            case EngineCoreEventType::kScheduled:
+              if (req_state.scheduled_ts == 0.0) {  // ignore preemptions
+                req_state.scheduled_ts = ev.timestamp;
+              }
+              break;
+            case EngineCoreEventType::kPreempted:
+              iteration_stats->num_preempted_reqs += 1;
+              break;
+          }
+        }
+      }
+
       if (is_prefilling_output) {
         // prompt_token_stats.update_from_output (stats.py:328-335). No
         // prefill_stats at T0 → num_prompt_tokens_cached stays 0; the whole
@@ -425,9 +450,17 @@ OutputProcessorOutput OutputProcessor::process_outputs(
                 ? decode_time / static_cast<double>(
                                     req_state.num_generation_tokens - 1)
                 : 0.0;
-        // queued_time/prefill_time/inference_time derive from the QUEUED/
-        // SCHEDULED EngineCoreEvents, deferred at T0 → left 0.0 (documented
-        // SERVE-RESPONSE-METRICS residual). num_cached_tokens deferred → 0.
+        // The event-derived intervals (stats.py:459-476), now that QUEUED /
+        // SCHEDULED events populate queued_ts / scheduled_ts:
+        //   queued    = first SCHEDULED - QUEUED  (time in the WAITING queue)
+        //   prefill   = first NEW_TOKEN - first SCHEDULED (any preemption during
+        //               prefill is included)
+        //   inference = last NEW_TOKEN - first SCHEDULED (= prefill + decode;
+        //               any preemption during prefill or decode is included)
+        f.queued_time = req_state.scheduled_ts - req_state.queued_ts;
+        f.prefill_time = req_state.first_token_ts - req_state.scheduled_ts;
+        f.inference_time = req_state.last_token_ts - req_state.scheduled_ts;
+        // num_cached_tokens deferred → 0.
         iteration_stats->finished_requests.push_back(f);
       }
 

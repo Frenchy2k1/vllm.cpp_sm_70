@@ -383,6 +383,15 @@ int64_t HistogramCount(const std::string& text, const std::string& name) {
       MetricValue(text, name + "_count" + std::string(kL)));
 }
 
+// The observation SUM of a histogram family (its _sum series). This is what
+// flips from 0 to positive once the QUEUED/SCHEDULED events populate the
+// per-request timing intervals: before the event wiring the histogram is still
+// observed once per finished request, but always with value 0.0, so _count is
+// nonzero while _sum stays exactly 0.
+double HistogramSum(const std::string& text, const std::string& name) {
+  return MetricValue(text, name + "_sum" + std::string(kL));
+}
+
 }  // namespace
 
 // ─── 1. Greedy determinism + termination ─────────────────────────────────────
@@ -665,4 +674,77 @@ TEST_CASE("llm_engine: live per-step stats populate the Prometheus registry") {
   CHECK(HistogramCount(t, "vllm:request_time_per_output_token_seconds") == 2);
   CHECK(HistogramCount(t, "vllm:iteration_tokens_total") >= 1);
   CHECK(HistogramCount(t, "vllm:request_generation_tokens") == 2);
+}
+
+// ─── 7. Per-request queue/prefill/inference timing from EngineCoreEvents ──────
+// The scheduler records QUEUED (add_request), SCHEDULED (batch admission) and
+// PREEMPTED events per request; the OutputProcessor folds them into the
+// queue/prefill/inference timing intervals update_from_finished_request observes
+// (stats.py:459-476), feeding the Prometheus timing histograms. Before this
+// wiring these histograms were STILL observed once per finished request, but
+// always with value 0.0 — so their _sum stayed exactly 0. This drives the real
+// CPU engine to completion and asserts the sums now flip POSITIVE and the
+// intervals are correctly ordered. RED-first: reverting the event
+// emission/consumption leaves every _sum below at 0.0 and each CHECK fails.
+TEST_CASE("llm_engine: per-request queue/prefill/inference timing populates") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 4;  // max_tokens per request (length stop).
+
+  Harness h(c, w, tok);
+  PrometheusStatLogger logger("m", kMaxModelLen);
+  h.engine.set_stat_logger(&logger);
+
+  const char* kQueue = "vllm:request_queue_time_seconds";
+  const char* kPrefill = "vllm:request_prefill_time_seconds";
+  const char* kInference = "vllm:request_inference_time_seconds";
+  const char* kDecode = "vllm:request_decode_time_seconds";
+  const char* kE2E = "vllm:e2e_request_latency_seconds";
+
+  // Baseline: nothing observed yet, so every timing _sum is 0.
+  {
+    const std::string t = logger.Expose();
+    CHECK(HistogramSum(t, kQueue) == 0.0);
+    CHECK(HistogramSum(t, kPrefill) == 0.0);
+    CHECK(HistogramSum(t, kInference) == 0.0);
+  }
+
+  h.engine.add_request("A", "hello", Greedy(kN));
+  h.engine.add_request("B", "hello", Greedy(kN));
+  std::map<std::string, RequestOutput> finished;
+  while (h.engine.has_unfinished_requests()) {
+    for (RequestOutput& o : h.engine.step()) {
+      if (o.finished) finished[o.request_id] = o;
+    }
+  }
+  REQUIRE(finished.size() == 2);
+
+  const std::string t = logger.Expose();
+  // Every finished request contributes one observation to each timing family.
+  CHECK(HistogramCount(t, kQueue) == 2);
+  CHECK(HistogramCount(t, kPrefill) == 2);
+  CHECK(HistogramCount(t, kInference) == 2);
+
+  const double queue_sum = HistogramSum(t, kQueue);
+  const double prefill_sum = HistogramSum(t, kPrefill);
+  const double inference_sum = HistogramSum(t, kInference);
+  const double decode_sum = HistogramSum(t, kDecode);
+  const double e2e_sum = HistogramSum(t, kE2E);
+
+  // THE FLIP: each interval is now a real positive duration (was exactly 0).
+  CHECK(queue_sum > 0.0);
+  CHECK(prefill_sum > 0.0);
+  CHECK(inference_sum > 0.0);
+  CHECK(decode_sum > 0.0);
+
+  // Interval algebra (stats.py): inference = prefill + decode (both measured
+  // from the SAME scheduled_ts / first_token_ts / last_token_ts endpoints), so
+  // the aggregate sums satisfy it too, within float tolerance.
+  CHECK(inference_sum == doctest::Approx(prefill_sum + decode_sum));
+  // Ordering: the queued span precedes scheduling, inference sits inside e2e,
+  // and prefill is a sub-interval of inference.
+  CHECK(inference_sum <= e2e_sum);
+  CHECK(prefill_sum <= inference_sum);
+  CHECK(queue_sum > 0.0);
 }

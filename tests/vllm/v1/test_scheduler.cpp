@@ -408,6 +408,63 @@ TEST_CASE("Scheduler.schedule: KV exhaustion preempts the FCFS tail") {
 }
 
 // ---------------------------------------------------------------------------
+// SERVE-RESPONSE-METRICS: the scheduler records the per-request engine-core
+// events the frontend derives queue/prefill/inference timing + the preemption
+// counter from — QUEUED at add_request (scheduler.py:2135), SCHEDULED when a
+// request is admitted to the running batch (:1003), PREEMPTED when the FCFS tail
+// is evicted under KV pressure (:1221), all gated on log_stats. This reuses the
+// KV-exhaustion preemption mechanics above and asserts the events fire at the
+// right sites, in order. RED-first: before the event wiring Request.events is
+// always empty and every assertion below fails.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.schedule: records QUEUED/SCHEDULED/PREEMPTED engine-core events") {
+  using vllm::v1::EngineCoreEventType;
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/16,
+                                   /*max_num_batched_tokens=*/100,
+                                   /*enable_chunked_prefill=*/true,
+                                   /*num_blocks=*/11, /*block_size=*/16);
+  auto requests = CreateRequests(/*num_requests=*/2, /*num_tokens=*/80,
+                                 {"0", "1"});
+  Request* req0 = requests[0].get();
+  Request* req1 = requests[1].get();
+
+  // QUEUED recorded immediately at add_request.
+  AddRequest(*scheduler, std::move(requests[0]));
+  REQUIRE(req0->events.size() == 1);
+  CHECK(req0->events[0].type == EngineCoreEventType::kQueued);
+
+  // Admitting req0 to the running batch records a SCHEDULED after the QUEUED,
+  // ordered queued <= scheduled.
+  auto out0 = scheduler->schedule();
+  REQUIRE(req0->events.size() == 2);
+  CHECK(req0->events[1].type == EngineCoreEventType::kScheduled);
+  CHECK(req0->events[0].timestamp <= req0->events[1].timestamp);
+
+  AddRequest(*scheduler, std::move(requests[1]));
+  auto out1 = scheduler->schedule();
+  REQUIRE(req1->status == RequestStatus::kRunning);
+  // req1: QUEUED (add) then SCHEDULED (this admission). req0 stays at 2 (an
+  // already-running decode request is NOT re-SCHEDULED).
+  REQUIRE(req1->events.size() == 2);
+  CHECK(req1->events[0].type == EngineCoreEventType::kQueued);
+  CHECK(req1->events[1].type == EngineCoreEventType::kScheduled);
+  CHECK(req0->events.size() == 2);
+
+  // req0 samples a token -> it needs a 6th block next step, KV is full, so the
+  // FCFS tail (req1) is preempted, recording a PREEMPTED event on top.
+  req0->AppendOutputToken(0);
+  auto out2 = scheduler->schedule();
+  REQUIRE(req1->status == RequestStatus::kPreempted);
+  REQUIRE(req1->events.size() == 3);
+  CHECK(req1->events[2].type == EngineCoreEventType::kPreempted);
+  // The preemption shares this step's scheduled timestamp -> ordered after the
+  // request's own SCHEDULED.
+  CHECK(req1->events[1].timestamp <= req1->events[2].timestamp);
+  // num_preemptions bumped 1:1 with the event.
+  CHECK(req1->num_preemptions == 1);
+}
+
+// ---------------------------------------------------------------------------
 // Resumed-as-new (MRV2 output fold): a preempted request that is re-scheduled
 // after KV frees appears in scheduled_new_reqs (NOT the cached diff), carrying
 // prefill_token_ids == its full token ids. This exercises the V2 output tail
