@@ -804,6 +804,26 @@ is where the host round-trips BITE is REFINED: our audio decode is ~62 ms/tok ea
 per-step launch overhead (lever #3, graphed/batched decode, for which on-GPU sampling is
 now a prerequisite in place). No mm row advances to DONE (speed-pending).
 
+**MULTIMODAL SPEED - DECODE LEVER #3 FIRST BRICK: the 27B mm decode is now graph-capturable
+(2026-07-27, `CLAIM-MULTIMODAL-SPEED-GRAPH` [spec](../.agents/specs/multimodal-speed.md)
+S9).** `benchmark_binding=false` (single-seq test driver; vLLM graphed is the honest
+denominator). dgx GB10 sm_121a, build cutlass 4.5.0 + FA2 + Triton arch 121a; GPU under
+`flock`, cold rep0 discarded; same-binary A/B via throwaway toggle `VT_MM_DECODE_EAGER`.
+The shared `VLGenerateCoreGdn` decode step (27B image+video) now routes through the
+production `Qwen3_5DenseDecodeGraph` cold->warm->replay captured decode instead of the
+eager per-step forward (closes the un-graphed-eager-loop structural gap). Single-seq ->
+B=1, padded size S==B==1 (the bit-identical-rebuild case); decode-time 1-D device RoPE at
+p reproduces the degenerate MRoPE {p,p,p}. **Token-exact HELD:** 27B image STRICT 32/32 +
+27B video STRICT 32/32, golden md5 unchanged, 30 graph replays confirmed
+(`VT_DECODE_GRAPH_STATS`). **A/B (Qwen3.6-27B image, 32 tok, tpot=gen32_wall/31):**
+graphed **232.5 ms/tok** (231.8-233.9) vs eager **233.4** (233.35-233.5) = **-0.9 ms/tok
+(~0.4%, graphed faster) = NEUTRAL at the 27B bandwidth floor** (the ~1 ms/tok launch
+overhead the graph removes is hidden under the ~222 ms weight-streaming floor - as S8
+predicted). Value is STRUCTURAL (decode now graph-capturable, prerequisite for batched c2+
+and the audio launch-overhead win). W-plan: Voxtral decode-graph (audio 1.52x gap-closer,
+NOT bandwidth-floored) + batched multi-seq (c2+) + `image_url`/`audio_url` serving
+ingestion. No mm row advances to DONE (speed-pending).
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =

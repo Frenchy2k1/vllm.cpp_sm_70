@@ -6869,26 +6869,64 @@ static std::vector<int32_t> VLGenerateCoreGdn(
   }
 
   // ---- DECODE: one token/step; MRoPE positions equal on all 3 axes (text). ----
+  //
+  // Lever #3 (multimodal-speed.md §5.3): route the pure-DECODE steps through the
+  // production graphed decode driver Qwen3_5DenseDecodeGraph (the SAME captured
+  // cold->warm->replay step the text runner uses; qwen3_5_dense.h:314), instead
+  // of the eager per-step DenseForwardLayers loop. The mm decode is single-seq
+  // (B=1) so the padded capture size is S=1 == B — the "bit-identical rebuild of
+  // the eager inputs" case (BuildPaddedDecode, qwen3_5.cpp:7151): at S==B the
+  // captured graph output equals the eager Forward exactly. This makes the mm
+  // decode step graph-capturable (closes the §3 "un-graphed eager loop" structural
+  // gap) and drops the per-step host launch tax that dominates the audio-decode
+  // 1.52x gap.
+  //
+  // ROPE EQUIVALENCE: during decode every position is a text token with the MRoPE
+  // 3-axis positions equal on all axes (pos3_dec = {p,p,p}), so MRoPE degenerates
+  // to standard 1-D RoPE at position p. The graph's forward applies 1-D device
+  // RoPE from the `positions` vector, so passing positions = {p} (p = abs_idx +
+  // delta, the MRoPE-adjusted decode position) reproduces the eager mrope decode's
+  // rope angle. The KV physical slot stays abs_idx (attn_meta), unaffected. The
+  // eager mrope path stays reachable via VT_MM_DECODE_EAGER=1 for the A/B.
+  const bool decode_eager =
+      (std::getenv("VT_MM_DECODE_EAGER") != nullptr &&
+       std::string(std::getenv("VT_MM_DECODE_EAGER")) == "1");
+  std::unique_ptr<Qwen3_5DenseDecodeGraph> dgraph;
+  if (!decode_eager)
+    dgraph = std::make_unique<Qwen3_5DenseDecodeGraph>(weights, config, d.q,
+                                                       /*max_num_reqs=*/1);
   for (int step = 1; step < max_new_tokens; ++step) {
     if (generated.back() == eos_token_id) break;
     const int64_t abs_idx = T0 + (step - 1);  // sequence index of the fed token
     const int32_t p = static_cast<int32_t>(abs_idx + delta);
-    const std::vector<int32_t> pos3_dec = {p, p, p};
-    const std::vector<int32_t> pos1d_dec = {static_cast<int32_t>(abs_idx)};
-    const std::vector<float> mrope_dec = BuildMropeCosSinHost(pos3_dec, 1, config);
-
     const std::vector<int32_t> one_id = {generated.back()};
-    // Embed the fed token ON DEVICE and hand it straight to the forward — no
-    // D2H->H2D round-trip (the old path Downloaded the [1,H] embed to host only
-    // to re-Upload it as a fresh DBuf). The token embed never leaves the device.
-    DBuf tok(d, DType::kBF16, {1, H});
-    DenseEmbedInto(d, tok, one_id, weights, config);
     const CommonAttentionMetadata am = attn_meta(1, abs_idx);
     const GDNAttentionMetadata gm = gdn_decode_meta();
-    DBuf dlogits = DenseForwardLayers(d, tok.t(), pos1d_dec, am, gm, attn_kv,
-                                      gdn_state, weights, config, {},
-                                      /*hidden_tap=*/nullptr, &mrope_dec);
-    generated.push_back(VLArgMaxDevice(d, dlogits));
+    if (dgraph) {
+      // Graphed pure-decode step (embed happens ON DEVICE inside Step). The 1-D
+      // position p drives the device RoPE (== degenerate MRoPE {p,p,p}); the
+      // returned logits stay on device and feed GreedyArgmax with no full-vocab
+      // D2H.
+      const std::vector<int32_t> pos_dec = {p};
+      ForwardLogits fl =
+          dgraph->Step(one_id, pos_dec, am, gm, attn_kv, gdn_state);
+      DBuf ids(d, DType::kI64, {1});
+      vt::GreedyArgmax(d.q, ids.t(), fl.device_tensor);
+      int64_t id = 0;
+      ids.Download(d, &id);
+      generated.push_back(static_cast<int32_t>(id));
+    } else {
+      // Eager fallback (VT_MM_DECODE_EAGER=1): the original per-step mrope forward.
+      const std::vector<int32_t> pos3_dec = {p, p, p};
+      const std::vector<int32_t> pos1d_dec = {static_cast<int32_t>(abs_idx)};
+      const std::vector<float> mrope_dec = BuildMropeCosSinHost(pos3_dec, 1, config);
+      DBuf tok(d, DType::kBF16, {1, H});
+      DenseEmbedInto(d, tok, one_id, weights, config);
+      DBuf dlogits = DenseForwardLayers(d, tok.t(), pos1d_dec, am, gm, attn_kv,
+                                        gdn_state, weights, config, {},
+                                        /*hidden_tap=*/nullptr, &mrope_dec);
+      generated.push_back(VLArgMaxDevice(d, dlogits));
+    }
   }
   return generated;
 }
