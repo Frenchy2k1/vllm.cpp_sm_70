@@ -41,6 +41,11 @@ function(expect_feature TARGETS FEATURE EXPECTED)
 endfunction()
 
 set(_ALL_FEATURES fp4-mma cutlass-nvfp4 cutlass-fp8 marlin-nvfp4 fa2)
+# The fp4/cutlass/marlin fast paths are sm_12x-only bodies; FA2 is the ONE feature
+# that also has an Ampere (major-8) body (the vendored `_sm80.cu` FA2 kernels,
+# WA-1). Cases where an Ampere/cross-family target must resolve EMPTY therefore
+# iterate this narrower list and FA2 gets its own explicit Ampere assertions.
+set(_NON_FA2_FEATURES fp4-mma cutlass-nvfp4 cutlass-fp8 marlin-nvfp4)
 
 # --- GB10, the production default. The full sm_12x capability set. -----------
 foreach(_f IN LISTS _ALL_FEATURES)
@@ -76,6 +81,11 @@ endforeach()
 # .agents/specs/cuda-arch-additivity.md Risks #1.)
 foreach(_f IN LISTS _ALL_FEATURES)
   expect_feature("90a;121a" "${_f}" "121a")
+endforeach()
+# For a single-arch cross-family sm_80 target, the sm_12x-only features resolve
+# EMPTY; FA2 now resolves ENABLED for sm_80 (WA-1, Ampere body) and is asserted
+# with the rest of the Ampere fan-out below.
+foreach(_f IN LISTS _NON_FA2_FEATURES)
   expect_feature("80" "${_f}" "")
 endforeach()
 
@@ -111,7 +121,7 @@ endforeach()
 # SASS. Pinned so a future table edit cannot silently claim a fast path we do not
 # have. See backend-matrix.md BACKEND-CUDA-SM0{80,86,87,89}/SM10{0,3}/SM110 and
 # .agents/specs/cuda-arch-additivity.md §W10.
-foreach(_f IN LISTS _ALL_FEATURES)
+foreach(_f IN LISTS _NON_FA2_FEATURES)
   expect_feature("80" "${_f}" "")      # (already asserted above; kept for locality)
   expect_feature("86" "${_f}" "")
   expect_feature("87" "${_f}" "")
@@ -120,6 +130,29 @@ foreach(_f IN LISTS _ALL_FEATURES)
   expect_feature("103a" "${_f}" "")
   expect_feature("110" "${_f}" "")
 endforeach()
+
+# --- FA2 AMPERE ENABLEMENT (WA-1, BACKEND-CUDA-SM080/086/087/089 + COMP-FA).
+# The vendored FlashAttention-2 kernel bodies are `#if __CUDA_ARCH__ >= 800`
+# (src/vt/cuda/flash_attn/src/flash_fwd_split_hdim*_sm80.cu); the `fa2` FEATURE
+# cell now lists 8.0,8.6,8.7,8.9,12.0a,12.1a, so a single-arch Ampere build
+# resolves the feature ENABLED and compiles + emits real per-arch SASS. LABEL:
+# DERIVED+BUILD-VERIFIED (testing-welcome) — no Ampere board ran it here. This is
+# the mutation check that a future edit cannot silently un-support Ampere FA2, and
+# cannot claim FA2 on the non-Ampere cross-family targets (which have no FA2 body).
+expect_feature("80" "fa2" "80")
+expect_feature("86" "fa2" "86")
+expect_feature("87" "fa2" "87")
+expect_feature("89" "fa2" "89")
+expect_feature("100a" "fa2" "")
+expect_feature("103a" "fa2" "")
+expect_feature("110" "fa2" "")
+# A same-major-8 FAT build keeps FA2 for every requested Ampere arch; nothing is
+# dropped and no non-requested arch is enabled.
+expect_feature("80;86;87;89" "fa2" "80;86;87;89")
+# The sm_12x production/consumer targets are UNCHANGED by the widened cell.
+expect_feature("121a" "fa2" "121a")
+expect_feature("120a" "fa2" "120a")
+expect_feature("120a;121a" "fa2" "120a;121a")
 
 if(_failures GREATER 0)
   message(FATAL_ERROR "${_failures} CUDA feature-table expectation(s) failed")

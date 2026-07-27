@@ -221,7 +221,18 @@ if(VLLM_CPP_CUDA)
   # v4.5.0 (header-only). Default OFF so a tight-disk box (dgx) builds against an
   # existing clone via -DVLLM_CPP_CUTLASS_DIR instead of a 200MB download.
   option(VLLM_CPP_CUTLASS_FETCH "FetchContent CUTLASS v4.5.0 if not found locally" OFF)
-  if(VT_CUTLASS_NVFP4_ARCHS
+  # CUTLASS is needed by TWO independent consumers with DIFFERENT arch scopes:
+  #   (1) the sm_12x NVFP4 block-scaled GEMM  -> gated on VT_CUTLASS_NVFP4_ARCHS;
+  #   (2) the vendored FlashAttention-2 kernels -> gated on VT_FA2_ARCHS, which now
+  #       ALSO covers Ampere sm_8x (CudaArchFeatures.cmake fa2 cell, WA-1). FA2 only
+  #       `-isystem`s the CUTLASS include tree (see the FA2 target below); it does
+  #       NOT use the NVFP4 collective. So "CUTLASS headers present + >=4.5.0" is an
+  #       arch-INDEPENDENT fact (VLLM_CPP_CUTLASS_HEADERS), while VLLM_CPP_CUTLASS
+  #       stays the strict sm_12x NVFP4 feature flag. This is the additive host
+  #       predicate the Ampere FA2 fast path needs
+  #       (.agents/specs/cuda-arch-ampere-fastpath.md WA-1). sm_121 is UNCHANGED:
+  #       there VT_CUTLASS_NVFP4_ARCHS resolves, so both flags are ON exactly as before.
+  if((VT_CUTLASS_NVFP4_ARCHS OR VT_FA2_ARCHS)
      AND NOT EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h"
      AND VLLM_CPP_CUTLASS_FETCH)
     include(FetchContent)
@@ -230,7 +241,7 @@ if(VLLM_CPP_CUDA)
     FetchContent_MakeAvailable(cutlass)
     set(VLLM_CPP_CUTLASS_DIR "${cutlass_SOURCE_DIR}")
   endif()
-  if(VT_CUTLASS_NVFP4_ARCHS
+  if((VT_CUTLASS_NVFP4_ARCHS OR VT_FA2_ARCHS)
      AND EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h")
     file(STRINGS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/version.h"
       _CUTLASS_VERSION_LINES
@@ -252,15 +263,29 @@ if(VLLM_CPP_CUDA)
       "${_CUTLASS_MAJOR} * 10000 + ${_CUTLASS_MINOR} * 100 + ${_CUTLASS_PATCH}")
     if(_CUTLASS_VERSION_NUMBER LESS 40500)
       message(FATAL_ERROR
-        "CUTLASS >=4.5.0 is required for SM12 narrow-N NVFP4 tactics; found "
+        "CUTLASS >=4.5.0 is required for SM12 narrow-N NVFP4 tactics and the "
+        "vendored FlashAttention-2 kernels; found "
         "${_CUTLASS_MAJOR}.${_CUTLASS_MINOR}.${_CUTLASS_PATCH} at "
         "${VLLM_CPP_CUTLASS_DIR}")
     endif()
-    set(VLLM_CPP_CUTLASS ON)
-    message(STATUS "CUTLASS found at ${VLLM_CPP_CUTLASS_DIR}; enabling sm120a NVFP4 cutlass GEMM")
+    # Headers are present + new enough: usable by FA2 on ANY arch it resolves for.
+    set(VLLM_CPP_CUTLASS_HEADERS ON)
+    if(VT_CUTLASS_NVFP4_ARCHS)
+      set(VLLM_CPP_CUTLASS ON)
+      message(STATUS "CUTLASS found at ${VLLM_CPP_CUTLASS_DIR}; enabling sm120a NVFP4 cutlass GEMM")
+    else()
+      # Ampere / non-sm_12x single-arch build: headers available for FA2, but the
+      # sm_12x NVFP4 GEMM is not requested for this arch, so keep that flag OFF.
+      set(VLLM_CPP_CUTLASS OFF)
+      message(STATUS "CUTLASS headers found at ${VLLM_CPP_CUTLASS_DIR} "
+                     "(available to FA2 for arch(es) [${VT_FA2_ARCHS}]); "
+                     "sm120a NVFP4 GEMM not requested for this target")
+    endif()
   else()
     set(VLLM_CPP_CUTLASS OFF)
-    message(STATUS "CUTLASS not found / arch not sm_12xa; cutlass NVFP4 GEMM disabled "
+    set(VLLM_CPP_CUTLASS_HEADERS OFF)
+    message(STATUS "CUTLASS not found / no CUTLASS-dependent feature for this arch; "
+                   "NVFP4 GEMM + FA2 disabled "
                    "(set -DVLLM_CPP_CUTLASS_DIR=<cutlass> or -DVLLM_CPP_CUTLASS_FETCH=ON)")
   endif()
   # Marlin NVFP4 W4A16 grouped-MoE GEMM drop-in (the 35B expert kernel). Vendored
@@ -1057,8 +1082,11 @@ if(VLLM_CPP_CUDA)
   # toggles VT_FA2_PREFILL and VT_FA2_DECODE (each default ON when compiled;
   # =0 restores its same-binary fallback). Prefill was validated token-for-token
   # + over the throughput bar on GB10 2026-07-10; ratio-6 decode remains GATING.
-  option(VLLM_CPP_FLASH_ATTN "Build vendored FlashAttention-2 sm_121a prefill/decode kernels (needs CUTLASS)" ON)
-  if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS AND VT_FA2_ARCHS)
+  option(VLLM_CPP_FLASH_ATTN "Build vendored FlashAttention-2 prefill/decode kernels (needs CUTLASS headers)" ON)
+  # Gate on VLLM_CPP_CUTLASS_HEADERS (arch-independent header availability), NOT
+  # VLLM_CPP_CUTLASS (the sm_12x NVFP4 feature flag): FA2 also resolves for Ampere
+  # sm_8x now (WA-1), where the NVFP4 GEMM is absent but the headers still compile.
+  if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS_HEADERS AND VT_FA2_ARCHS)
     set(_FA2_ROOT "${CMAKE_SOURCE_DIR}/src/vt/cuda/flash_attn")
     set(_FA2_KERNEL_SRCS
       src/vt/cuda/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu
@@ -1084,7 +1112,7 @@ if(VLLM_CPP_CUDA)
       ${_FA2_KERNEL_SRCS} PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-DFLASH_NAMESPACE=flash;-include;${_FA2_ROOT}/fa2_compat_prelude.h;-isystem;${_FA2_ROOT}/src;-isystem;${_FA2_ROOT}/stubs;-isystem;${VLLM_CPP_CUTLASS_DIR}/include>")
-    message(STATUS "FlashAttention-2 sm_121a prefill/decode: ENABLED (runtime toggles VT_FA2_PREFILL, VT_FA2_DECODE)")
+    message(STATUS "FlashAttention-2 prefill/decode: ENABLED for arch(es) [${VT_FA2_ARCHS}] (runtime toggles VT_FA2_PREFILL, VT_FA2_DECODE)")
   endif()
 endif()
 

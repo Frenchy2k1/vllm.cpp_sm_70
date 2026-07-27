@@ -100,6 +100,27 @@ measured and is deliberately NOT estimated, so no ratio is asserted between the
 two. Reproduce: `python3 benchmarks/demo/concurrency_race.py` and `python3
 benchmarks/demo/footprint.py`.
 
+**FA2 Ampere enablement (WA-1) BUILD-VERIFY — `ROAD-V1-D1-CUDA` first brick
+(2026-07-27, `CLAIM-CUDA-AMPERE-SCOPE`).** Disposition: **ACCEPTED BUILD-VERIFY
+evidence — NO throughput number (a board is needed for that; `benchmark_binding=false`).**
+DERIVED+BUILD-VERIFIED (testing-welcome): the `fa2` FEATURE-TABLE cell widened to
+`8.0,8.6,8.7,8.9,12.0a,12.1a` + FA2 build gate decoupled onto
+`VLLM_CPP_CUTLASS_HEADERS`. Evidence on dgx (GB10, nvcc 13.0 V13.0.88, cutlass
+4.5.0, base local `main` `2bf1aaa9`): single-arch `-DVLLM_CPP_CUDA_ARCHITECTURES=87`
+and `=80` each configure `fa2 ENABLED`, build the `vllm` target `-Werror`
+**0 warnings / 0 errors**, and `cuobjdump` shows all 7 FA2 TUs
+(`flash_fwd_split_hdim{128,192,256}_bf16[_causal]_sm80` + `cuda_flash_attn_fa2`)
+carrying real `sm_87` / `sm_80` cubins (whole archive = 46 single-arch cubins),
+TUs that were ABSENT from the prior portable-only Ampere build. `86`/`89` inherit
+the identical same-major `_sm80.cu` bodies. `cmake -P CudaArchFeaturesTest.cmake`
+resolves `fa2` ENABLED for `80/86/87/89`, EMPTY for `100a/103a/110`, unchanged for
+sm_12x. sm_121 inertness: default `sm_121a` build `-Werror` 0-warn (`fa2`→`121a`,
+NVFP4 GEMM still ON), OLMo-2-1B SACRED gate `test_olmo2_paged_engine` PASSES
+**16/16** (13/16 strict token-exact + 3/16 near-tie-band, 0 forward-divergent) —
+bit-identical to the committed golden. **NO Ampere board ran it here; a green build
+is not a runtime claim.** The only real throughput numbers come later from the Orin
+RUNTIME-VERIFIED gate.
+
 **Ampere major-8 CUDA fast-path bring-up SPIKE (2026-07-27,
 `CLAIM-CUDA-AMPERE-SCOPE`).** Disposition: **NOT APPLICABLE (scoping spike; no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Read-only on

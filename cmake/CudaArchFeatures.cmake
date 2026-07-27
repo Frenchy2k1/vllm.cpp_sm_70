@@ -229,9 +229,18 @@ set(VT_CUDA_FEATURE_TABLE
   # instantiation only and has never been built or run outside sm_12x.
   "marlin-nvfp4|12.0a,12.1a|vendored Marlin NVFP4 W4A16 MoE GEMM (VT_MARLIN_NVFP4)"
   # Vendored FlashAttention-2 prefill/decode split-KV kernels.
-  # upstream: vllm-project/flash-attention builds sm80..sm90; our vendored slice
-  # is compiled and validated for sm_12x only (cuda_flash_attn_fa2.cu:428).
-  "fa2|12.0a,12.1a|vendored FlashAttention-2 prefill/decode (VLLM_CPP_FLASH_ATTN)")
+  # upstream: vLLM builds FA2 for the WHOLE requested CUDA_ARCHS list, incl
+  # 8.0;8.6;8.7;8.9 (vllm/cmake/external_projects/vllm_flash_attn.cmake:6-8 @ pin
+  # 555967922; VLLM_GPU_ARCHES = CUDA_ARCHS). Our vendored kernel bodies
+  # src/vt/cuda/flash_attn/src/flash_fwd_split_hdim{128,192,256}_bf16[_causal]_sm80.cu
+  # are all `#if __CUDA_ARCH__ >= 800`, so they compile + emit real per-arch SASS
+  # for every major-8 arch, not just sm_12x. Ampere selection is already wired:
+  # LookupAttnPriority(major==8) returns FLASH_ATTN (cuda_attn_priority.h:80,86-96).
+  # LABEL: the sm_12x cells are RUNTIME-VERIFIED (GB10 token-exact + benchmarked);
+  # the Ampere sm_8x cells are DERIVED+BUILD-VERIFIED (testing-welcome) — compiled
+  # + cuobjdump-proven sm_8x cubins, NO Ampere board ran them here. A green build
+  # is never a runtime claim. See .agents/specs/cuda-arch-ampere-fastpath.md WA-1.
+  "fa2|8.0,8.6,8.7,8.9,12.0a,12.1a|vendored FlashAttention-2 prefill/decode (VLLM_CPP_FLASH_ATTN)")
 
 # vt_cuda_feature_archs(<OUT_ARCHS> <FEATURE>)
 #   Resolves FEATURE against the requested VLLM_CPP_CUDA_ARCHITECTURES and sets

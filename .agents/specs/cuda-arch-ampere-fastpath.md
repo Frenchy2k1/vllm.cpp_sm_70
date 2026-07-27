@@ -1,6 +1,14 @@
 # Ampere major-8 CUDA fast-path bring-up — DERIVE-AND-SHIP spike
 
-Status: **SPIKE (scoping only; read-only on production code).** This spec scopes
+Status: **SPIKE (scoping) + WA-1 LANDED.** **WA-1 (FA2 Ampere enablement) is DONE
+— DERIVED+BUILD-VERIFIED (testing-welcome), 2026-07-27, `ROAD-V1-D1-CUDA` first
+brick.** The `fa2` FEATURE-TABLE cell was widened to `8.0,8.6,8.7,8.9,12.0a,12.1a`
+and the FA2 build gate decoupled from the sm_12x NVFP4 flag onto arch-independent
+`VLLM_CPP_CUTLASS_HEADERS`; single-arch `87`+`80` dgx builds are `-Werror` 0-warn
+with `cuobjdump`-proven `sm_87`/`sm_80` FA2 cubins (7 TUs; `86`/`89` inherit
+same-major), the resolver test asserts `fa2` ENABLED 80/86/87/89, and sm_121a is
+unchanged (OLMo-2 SACRED gate 16/16). NO Ampere board ran it — build-verify only.
+The remaining work items (WA-2..WA-6, Orin WA-O*) stay SPIKE. This spec scopes
 porting the Ampere (`sm_80/86/87/89`) FAST-PATH kernel bodies from vLLM into the
 already-landed arch-additivity framework, and the concrete **AGX Orin (`sm_87`)**
 runtime-gate plan — Orin being the ONE reachable non-GB10 board. It is the
@@ -297,7 +305,7 @@ non-overlapping, claimable in parallel with `isolation: worktree`.
 
 | # | Item | Files (destination) | Class | Board→RUNTIME-VERIFIED |
 |---|---|---|---|---|
-| WA-1 | FA2 Ampere enablement | `cmake/CudaArchFeatures.cmake` (`fa2` cell), `CudaArchFeaturesTest.cmake` | table edit | Orin (WA-O2); `80/86/89` DERIVED |
+| WA-1 ✅ **DONE (DERIVED+BUILD-VERIFIED)** | FA2 Ampere enablement — `fa2` cell → `8.0,8.6,8.7,8.9,12.0a,12.1a`; FA2 gate decoupled onto `VLLM_CPP_CUTLASS_HEADERS` (additive host predicate); resolver test asserts 80/86/87/89 ENABLED | `cmake/CudaArchFeatures.cmake` (`fa2` cell), `CMakeLists.txt` (`VLLM_CPP_CUTLASS_HEADERS` + FA2 gate), `CudaArchFeaturesTest.cmake` | table edit + host-predicate | Orin (WA-O2); `80/86/89` DERIVED. **Build-verified:** `87`+`80` `-Werror` 0-warn, `cuobjdump` sm_87/sm_80 FA2 cubins; sm_121a OLMo-2 gate 16/16 |
 | WA-2 | Marlin int4 W4A16 (GPTQ/AWQ) instantiations + tactic + `vt::` op | new `marlin-int4` cell, `cuda_moe_marlin.cu` TU set, `cuda_marlin_repack.cu`, a tactic | new instantiations | Orin (WA-O3); `80/86/89` DERIVED |
 | WA-3 | Marlin fp8-input (`sm_89`) | `sm89_kernel_*.cu` port, new `marlin-fp8` cell + tactic | new body | `sm_89` DERIVED (no Ada board here) |
 | WA-4 | AllSpark W8A16 GEMM + repack | `src/vt/cuda/allspark/*`, new `allspark` cell + `vt::` op + tactic | new body | Orin (WA-O4); `80/86/89` DERIVED |
@@ -316,10 +324,14 @@ non-overlapping, claimable in parallel with `isolation: worktree`.
 | **`sm_87` (Orin)** | **RV** | **RV** | **RV** | N/A | **RV** | **RV** | N/A |
 | `sm_89` (Ada 40-series) | DBV | DBV | DBV | DBV | DBV | DBV | DBV |
 
-Today (SPIKE, nothing ported) every fast-path cell is `—` (NOT-YET-BUILDABLE);
-only the portable columns are DBV (§W10 build-support). This matrix is the
-help-wanted board: everything DBV is a faithful 1:1 port awaiting a community
-board; only Orin's row reaches RV in this campaign.
+As of 2026-07-27 the **FA2 column is DBV for `sm_80/86/87/89`** (WA-1 landed:
+compiled + `cuobjdump` SASS proof on `87`+`80`, same-major inheritance for
+`86`/`89`) — `sm_87` shows DBV here (not yet RV: no Orin board has run it; the Orin
+WA-O2 gate is what upgrades that cell to RV). The portable columns are DBV
+(§W10 build-support). Every OTHER fast-path cell (Marlin int4, Marlin fp8,
+AllSpark, C2x) is still `—` (NOT-YET-BUILDABLE). This matrix is the help-wanted
+board: everything DBV is a faithful 1:1 port awaiting a community board; only
+Orin's row reaches RV in this campaign.
 
 ## Risks/decisions
 

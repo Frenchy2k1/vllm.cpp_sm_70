@@ -326,9 +326,16 @@ fp8-input, AllSpark W8A16, CUTLASS scaled-mm C2x) will be ported 1:1, build-veri
 and shipped **labeled** DERIVED+BUILD-VERIFIED (testing-welcome) — a build is never
 a runtime claim. AGX Orin (`sm_87`) is the one reachable non-GB10 board and the
 sole target that reaches RUNTIME-VERIFIED, gating the first non-GB10 runtime proof
-token-exact vs the vLLM 0.25.0 oracle. FA2 is a one-cell table edit (the vendored
-kernels are already the sm_80 FlashAttention-2 bodies); AllSpark and scaled-mm C2x
-are new bodies; Marlin needs its int4/fp8 instantiations. The whole CUDA-arch
+token-exact vs the vLLM 0.25.0 oracle. **FA2 Ampere (WA-1) has LANDED
+DERIVED+BUILD-VERIFIED (testing-welcome) — the `ROAD-V1-D1-CUDA` first brick:** the
+`fa2` FEATURE-TABLE cell was widened to `8.0,8.6,8.7,8.9,12.0a,12.1a` (the vendored
+kernels are already the `_sm80.cu` FlashAttention-2 bodies, `__CUDA_ARCH__>=800`)
+and the FA2 build gate decoupled from the sm_12x NVFP4 flag onto arch-independent
+CUTLASS-header availability; single-arch `87` and `80` dgx builds are `-Werror`
+0-warn with `cuobjdump`-proven real `sm_87`/`sm_80` FA2 cubins (`86`/`89` inherit
+same-major), and `sm_121a` is unchanged (still resolves `121a`, NVFP4 GEMM still
+ON) — verified by a re-run gate. NO Ampere board ran it here. AllSpark and
+scaled-mm C2x are new bodies; Marlin needs its int4/fp8 instantiations. The whole CUDA-arch
 fast-path + beyond-vLLM breadth effort is tracked on the roadmap as
 `ROAD-V1-D1-CUDA` (derive-and-ship + a public tested/untested signal matrix), with
 AGX Orin (sm_87) and NVIDIA Thor (Blackwell) as the reachable runtime-gate boards.
