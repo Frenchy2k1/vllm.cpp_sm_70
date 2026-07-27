@@ -28,11 +28,6 @@
 //     _get_partial_block_parent_hash_and_start: throw-if-called stubs (partial
 //     prefix entries, not needed by the gate models).
 //   - evict_blocks (KV-connector-driven cache eviction): throw-if-called stub.
-//   - KV-cache events: enable_kv_cache_events, kv_event_queue, take_events(),
-//     and the BlockStored / BlockRemoved / AllBlocksCleared emission inside
-//     cache_full_blocks / _remove_cached_block_hashes / reset_prefix_cache.
-//     KVCacheEvent is a placeholder struct; the emission branches are omitted
-//     (marked in the .cpp). Mirrors upstream vllm/distributed/kv_events.py.
 //   - metrics_collector (KVCacheMetricsCollector): the on_block_allocated /
 //     _accessed / _evicted / reset hooks are omitted. Not part of the
 //     correctness core.
@@ -71,16 +66,18 @@
 #include <unordered_map>
 #include <vector>
 
+#include "vllm/distributed/kv_events.h"  // KVCacheEvent + event data types
 #include "vllm/v1/core/kv_cache_utils.h"
 
 namespace vllm::v1 {
 
 struct Request;
 
-// KVCacheEvent — DEFERRED placeholder (see file header). Upstream events live in
-// vllm/distributed/kv_events.py (BlockStored / BlockRemoved / AllBlocksCleared).
-// Kept as an empty type so take_events() retains its 1:1 signature.
-struct KVCacheEvent {};
+// KVCacheEvent — the tagged union of KV-cache events (KV-EVENTS, ROAD-V1-D4),
+// ported in vllm/distributed/kv_events.h (BlockStored / BlockRemoved /
+// AllBlocksCleared). Re-exported into vllm::v1 so take_events() keeps its 1:1
+// signature and downstream callers (KVCacheManager) are unchanged.
+using KVCacheEvent = vllm::distributed::KVCacheEvent;
 
 // BlockPool manages KVCacheBlocks. It provides methods to allocate, free and
 // cache the kv cache blocks. The free_block_queue stores the free blocks in
@@ -135,6 +132,17 @@ class BlockPool {
       int kv_cache_group_id,
       const std::optional<std::vector<bool>>& block_mask = std::nullopt);
 
+  // Generate BlockStored events for blocks REUSED from the prefix cache
+  // (kv_events / block_pool.py:373-443). Unlike cache_full_blocks this does NOT
+  // modify block state; it only appends events so external consumers learn about
+  // reused blocks. No-op unless enable_kv_cache_events and num_cached_blocks > 0.
+  // NOTE: upstream calls this only under the non-default kv_cache_report_mode ==
+  // "full" (kv_cache_manager.py:265-280); our Request has no report_mode field,
+  // so the MANAGER wiring is deferred (the default "incremental" mode never
+  // fires it). The BlockPool method itself is ported + directly gated.
+  void emit_cached_block_events(const Request& request, int num_cached_blocks,
+                                int block_size, int kv_cache_group_id);
+
   // Register a partial prefix-cache entry for an existing block. DEFERRED 1:1
   // stub (partial primitives, not needed by the gate models): throws if called.
   std::optional<BlockHashWithGroupId> cache_partial_block(
@@ -160,6 +168,23 @@ class BlockPool {
   // _remove_cached_block_hashes.
   std::vector<BlockHashWithGroupId> _remove_cached_block_hashes(
       KVCacheBlock* block);
+
+  // Build a BlockStored event for `request` over a contiguous token range.
+  // Shared by cache_full_blocks (newly cached blocks) and emit_cached_block_events
+  // (reused blocks) so both emit identical event shapes. Mirrors upstream
+  // _build_block_stored_event (block_pool.py:344-371).
+  vllm::distributed::BlockStored _build_block_stored_event(
+      const Request& request,
+      std::vector<vllm::distributed::ExternalBlockHash> block_hashes,
+      std::optional<vllm::distributed::ExternalBlockHash> parent_block_hash,
+      int start_token_idx, int end_token_idx, int block_size,
+      int kv_cache_group_id,
+      std::vector<vllm::distributed::EventExtraKey> extra_keys_list) const;
+
+  // Append a BlockRemoved event for each removed hash key, when events are
+  // enabled. Mirrors upstream _emit_block_removed_events (block_pool.py:592-605).
+  void _emit_block_removed_events(
+      const std::vector<BlockHashWithGroupId>& block_hashes);
 
   // Insert a hash key for `block` into cached_block_hash_to_block. If the block
   // has no primary hash yet, the key becomes its primary hash (with num_tokens);
@@ -188,8 +213,8 @@ class BlockPool {
   // KV cache usage in [0.0, 1.0] (the null block is excluded from the total).
   double get_usage() const;
 
-  // Atomically take all events and clear the queue. DEFERRED: always returns an
-  // empty list (see file header).
+  // Atomically take all events and clear the queue (block_pool.py:820-830).
+  // Returns an empty list when enable_kv_cache_events is false.
   std::vector<KVCacheEvent> take_events();
 
   // --- Public state (mirrors upstream's accessible attributes; the ported

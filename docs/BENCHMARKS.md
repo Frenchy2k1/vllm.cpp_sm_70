@@ -1740,6 +1740,28 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
+### KV-EVENTS event generation + `msgpack` payload, ROAD-V1-D4 (2026-07-27, `CLAIM-ROADMAP-D4-KV-EVENTS`) - exactness/behavioral only, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - additive, off-by-default serving
+feature; no throughput claim, `benchmark_binding=false`.** Ported vLLM's
+KV-cache event stream (`BlockStored`/`BlockRemoved`/`AllBlocksCleared` +
+`KVEventBatch`, the emission at the prefix-cache block store/remove/clear sites,
+and the `msgpack` payload) additively behind `enable_kv_cache_events` (default
+OFF). The gate is exactness, not speed: `test_kv_events` 6 cases / 62 assertions
+- the encoder output is BYTE-EXACT vs `msgspec.msgpack.Encoder()` on the 1:1
+upstream structs (goldens captured from a local `msgspec` 0.21.1 for both the
+default int-truncated block-hash form and the raw-bytes form), and the
+store/reuse/evict/reset event SEQUENCE carries the correct block hashes, token
+ids, parent linkage, `group_idx`, and `medium`. RED-first: a mis-wired stored
+hash + a dropped `AllBlocksCleared` fail 4 assertions; revert to GREEN. The
+default-off path is byte-identical, proven by the unchanged prefix-cache/APC
+gates (`test_block_pool` 132/132, `test_prefix_cache_stats` 36/36,
+`test_kv_cache_manager` 74/74, `test_kv_cache_coordinator` 106/106,
+`test_kv_cache_utils` 253/253). No throughput number is affected. The live ZMQ
+socket transport is deferred (see the KV-EVENTS spec), so no end-to-end
+publish-to-router latency number is owed yet. Reproduce (CPU):
+`cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build build-cpu --target test_kv_events && ./build-cpu/tests/test_kv_events`.
+
 ### Red-gate RCA + fix - tokenizer `lstrip`/`rstrip`, `anchor drift` (2026-07-24, `CLAIM-REDGATE-RCA`) - correctness only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - correctness fix + RCA, no performance

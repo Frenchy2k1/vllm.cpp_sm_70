@@ -26534,3 +26534,42 @@ config-gated metric families (spec-decode/kv-connector/mm/LoRA); per-request
 queue/prefill/inference timing + preemption counter (EngineCoreEvents deferred →
 `SERVE-RESPONSE-METRICS`); chat-form `/tokenize`; JSON-schema arg coercion.
 Base `main` `6bde6b88`; NOT pushed; FULL SHA reported to the dispatcher.
+
+## 2026-07-27 — ROAD-V1-D4 `KV-EVENTS` generation + payload LANDED (CPU), `SPIKE`→`ACTIVE`
+
+`CLAIM-ROADMAP-D4-KV-EVENTS`, isolated worktree `agent-add5bb82fe2773676`, base
+`main` `ffff4eb` (hard-reset onto local `main` HEAD first — the harness had
+branched the worktree off a stale metal-bench ref). CPU-only, no dgx. Pin
+`555967922`. NOT pushed.
+
+Ported vLLM's KV-cache event stream additively (new
+`include/vllm/distributed/kv_events.{h}` + `src/vllm/distributed/kv_events.cpp`):
+the `BlockStored`/`BlockRemoved`/`AllBlocksCleared` + `KVEventBatch` types, the
+`EventPublisher`/`NullEventPublisher`/`CollectingEventPublisher`/`EventPublisherFactory`
+seam (faithful to `--kv-events-config`), and a `msgpack` payload encoder
+BYTE-EXACT vs `msgspec.msgpack.Encoder()` on the 1:1 upstream structs.
+`ExternalBlockHash` + `maybe_convert_block_hash` added to `kv_cache_utils.{h,cpp}`
+(env `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES`, upstream default True). Emission
+wired at the BlockPool store/remove/clear sites + `emit_cached_block_events`,
+guarded by `enable_kv_cache_events` (default OFF ⇒ default path byte-identical);
+the SPIKE placeholder `KVCacheEvent{}` + always-empty `take_events` are replaced.
+
+**Key discovery (why the byte-exact gate mattered):** msgspec's `array_like`
+`EventBatch` KEEPS the trailing `data_parallel_rank` even when `None` (outer
+array length 3, not 2), and the store path's `extra_keys` is a non-empty list of
+`None` (encoded, not omitted) — a hand-derived encoder would have been wrong.
+Captured the goldens from a local `msgspec` 0.21.1 pip.
+
+Gate `test_kv_events` 6/62. RED-first: mis-wired hash + dropped `AllBlocksCleared`
+⇒ 4 failing asserts; revert → GREEN. Default-off + APC byte-identical:
+`test_block_pool` 132/132, `test_prefix_cache_stats` 36/36, manager 74/74,
+coordinator 106/106, utils 253/253. Clean full-library CPU `-Werror`, 0 warnings.
+
+**DEFERRED (honest D4 residual):** the live ZMQ transport (sockets/replay/thread/
+DP-offset — factory throws loudly on `"zmq"`), the engine/scheduler batch wiring
++ `report_mode=="full"` reuse call (no `Request.kv_cache_report_mode`), DP
+aggregation, `lora_id`. W6/W7 + the larger-model LMCache grid remain the broader
+D4 residuals. Records: engine-matrix `KV-EVENTS` `ACTIVE`, feature-matrix,
+coordination `CLAIM-ROADMAP-D4-KV-EVENTS`, roadmap_v1 D4-APC tail, completion
+spec, README, BENCHMARKS, spec [kv-events.md](specs/kv-events.md). Base SHA
+reported to the dispatcher.
