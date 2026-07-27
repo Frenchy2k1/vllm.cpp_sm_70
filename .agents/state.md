@@ -26199,3 +26199,26 @@ vLLM's own argmax. 37 of 256 tokens changed across 4 prompts. Gate 16/16.
 
 **Goal:** 18.30 of 27.9 tok/s, 1.52x remaining. Decode ~5.5 s vs MLX-LM's 4.59 s
 (1.20x); prefill ~1.52 s vs ~0.47 s.
+
+---
+
+## 2026-07-27 — paged-attention V accumulation: +4.2%, numerics bit-identical
+
+The follow-up the score-loop change deliberately left alone, so its effect could
+be attributed cleanly. The V loop's access was already coalesced; the waste was
+that **every thread re-read `btab` from DEVICE memory and recomputed the same
+`vbase` for every key**, i.e. `jc * tg` block-table loads per chunk where `jc`
+would do. Now resolved once per chunk into threadgroup memory.
+
+**18.30 -> 19.07 tok/s (+4.2%)**, duration 7.00 -> 6.72 s, attention GPU
+**1370 -> 1039 ms (-24%)**, total GPU busy 6.58 -> 6.24 s. Across both attention
+changes the kernel is **1636 -> 1039 ms, 1.57x**.
+
+**Numerics bit-identical** (only the address computation moved, not the
+accumulation order), so the SACRED gate passes 16/16 with max gap still 0 and NO
+golden re-capture. That is the cheapest possible kind of win and worth noting as
+a pattern: hoisting redundant index/address work costs nothing in correctness
+risk, unlike anything that touches reduction order.
+
+**Goal:** 19.07 of 27.9 tok/s, 1.46x remaining. Decode ~5.2 s vs MLX-LM's 4.59 s
+(1.13x); prefill ~1.5 s vs ~0.47 s.
