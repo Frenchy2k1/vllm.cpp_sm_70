@@ -1593,3 +1593,42 @@ TEST_CASE("Metal GEMM microbenchmark" * doctest::skip(true)) {
   }
   metal.DestroyQueue(q);
 }
+
+// Diagnostic for the 64x64 GEMM defect: reports WHICH output rows are wrong.
+// The m-dependence (m<=16 pass, m>=64 fail) has two competing explanations that
+// predict different row patterns, and NMSE cannot distinguish them.
+TEST_CASE("Metal GEMM per-row diagnostic" * doctest::skip(true)) {
+  if (std::getenv("VT_MM_ROWDIAG") == nullptr) return;
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  const int64_t m = 64, k = 64, n = 64;
+  // A[r][*] = r+1, B[c][*] = 1  =>  out[r][c] = (r+1)*k exactly, so a wrong row
+  // is unmistakable and its VALUE says which source row it actually read.
+  std::vector<float> ah(static_cast<size_t>(m * k)), bh(static_cast<size_t>(n * k), 1.0f);
+  for (int64_t r = 0; r < m; ++r)
+    for (int64_t j = 0; j < k; ++j) ah[static_cast<size_t>(r * k + j)] = float(r + 1);
+  auto up = [&](const std::vector<float>& h) {
+    void* p = metal.Alloc(h.size() * sizeof(float));
+    metal.Copy(q, p, h.data(), h.size() * sizeof(float));
+    return p;
+  };
+  void* da = up(ah); void* db = up(bh);
+  void* dc = metal.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {m, k});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {n, k});
+  Tensor tc = Tensor::Contiguous(dc, vt::DType::kF32, d, {m, n});
+  vt::MatmulBT(q, tc, ta, tb);
+  metal.Synchronize(q);
+  std::vector<float> got(static_cast<size_t>(m * n));
+  metal.Copy(q, got.data(), dc, got.size() * sizeof(float));
+  std::string bad;
+  for (int64_t r = 0; r < m; ++r) {
+    const float want = float(r + 1) * float(k);
+    const float g = got[static_cast<size_t>(r * n)];
+    if (g != want) bad += std::to_string(r) + "(got " + std::to_string(int(g / k)) + ") ";
+  }
+  MESSAGE("rows wrong [row(source row it actually read)]: " << (bad.empty() ? "NONE" : bad));
+  metal.Free(da); metal.Free(db); metal.Free(dc);
+  metal.DestroyQueue(q);
+}
