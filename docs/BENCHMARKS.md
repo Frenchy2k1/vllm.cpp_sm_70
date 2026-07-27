@@ -2862,6 +2862,35 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Prefill attention: vectorised K/V/Q staging, +0.50% (2026-07-27)
+
+The same defect, in the mma kernel written earlier THIS session.
+`vt_paged_attention_mma` staged K, V and Q with scalar `vt_load` per element —
+exactly the pattern that had decode's V loop at 29 GB/s against the score loop's
+64. Vectorised to `ushort4` with a scalar fallback for unaligned or non-bf16
+caches.
+
+**Prefill attention 78.6 -> 55.3 ms (-30%).**
+
+Paired verdict (warm, p=512 g=128, 6 ABBA blocks): +0.12 +0.16 +0.05 +0.12 +0.17
++0.05 -> **+0.50% median, faster in 6/6 blocks, p = 0.031.** Warm total
+23.65 -> 23.76.
+
+Correctness needed NO re-anchor: this is a load-WIDTH change only — same values,
+same order, same accumulation — so the greedy sequence is untouched. 16/16 PASS
+with the existing goldens, which is the expected result and worth stating,
+because the two preceding kernel changes both DID move a near-tie and needed the
+oracle.
+
+**Cumulative on this axis: 94.5% -> ~96.3% of MLX-LM.**
+
+The lesson generalised: a kernel that reads bf16 through `vt_load` element by
+element is leaving 4x of its load width on the floor. Both attention kernels had
+it; the GEMM's staging was already vectorised, which is why it never showed up
+there.
+
+---
+
 ## Decode attention: VECTORISED V accumulation, +1.66% (2026-07-27)
 
 Found by BISECTING the kernel rather than guessing a sixth mechanism. Stubbing

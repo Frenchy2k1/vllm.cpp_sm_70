@@ -1534,14 +1534,41 @@ kernel void vt_paged_attention_mma(device const uchar* q     [[buffer(0)]],
   }
   if (jhi < jlo) { return; }
 
-  // Stage Q once for the whole key loop.
-  for (uint e = tid; e < VT_PAM_BQ * p.d; e += p.tg) {
-    const uint rr = e / p.d, dd = e % p.d;
-    if (int(rr) < nq) {
-      const ulong qoff = (ulong(uint(int(t) + int(rr))) * ulong(p.hq) + ulong(h)) * ulong(p.d);
-      sq[rr * VT_PAM_MAXD + dd] = bfloat(vt_load(q, p.q_dt, qoff + ulong(dd)));
-    } else {
-      sq[rr * VT_PAM_MAXD + dd] = bfloat(0.0f);
+  // Stage Q once for the whole key loop. VECTORISED: bisecting the DECODE
+  // attention kernel showed a scalar-`vt_load` loop moving 2 bytes per lane per
+  // load against a vectorised one's 8, and running at 29 GB/s against 64 on
+  // identical traffic. This kernel staged K, V and Q the same scalar way.
+  const uint d4 = p.d >> 2u;
+  const bool vec4 = p.q_dt == VT_DT_BF16 && p.kc_dt == VT_DT_BF16 &&
+                    p.vc_dt == VT_DT_BF16 && (p.d & 3u) == 0u;
+  if (vec4) {
+    for (uint e = tid; e < VT_PAM_BQ * d4; e += p.tg) {
+      const uint rr = e / d4, dd = (e % d4) * 4u;
+      threadgroup bfloat* dst = &sq[rr * VT_PAM_MAXD + dd];
+      const ulong qoff = (ulong(uint(int(t) + int(min(int(rr), max(nq - 1, 0))))) * ulong(p.hq) +
+                          ulong(h)) * ulong(p.d) + ulong(dd);
+      if (int(rr) < nq && (qoff & 3ul) == 0ul) {
+        const ushort4 v = *((device const ushort4*)((device const ushort*)q + qoff));
+        dst[0] = as_type<bfloat>(v.x); dst[1] = as_type<bfloat>(v.y);
+        dst[2] = as_type<bfloat>(v.z); dst[3] = as_type<bfloat>(v.w);
+      } else if (int(rr) < nq) {
+        for (uint i = 0u; i < 4u; ++i) {
+          dst[i] = bfloat(vt_load(q, p.q_dt, qoff + ulong(i)));
+        }
+      } else {
+        dst[0] = bfloat(0.0f); dst[1] = bfloat(0.0f);
+        dst[2] = bfloat(0.0f); dst[3] = bfloat(0.0f);
+      }
+    }
+  } else {
+    for (uint e = tid; e < VT_PAM_BQ * p.d; e += p.tg) {
+      const uint rr = e / p.d, dd = e % p.d;
+      if (int(rr) < nq) {
+        const ulong qoff = (ulong(uint(int(t) + int(rr))) * ulong(p.hq) + ulong(h)) * ulong(p.d);
+        sq[rr * VT_PAM_MAXD + dd] = bfloat(vt_load(q, p.q_dt, qoff + ulong(dd)));
+      } else {
+        sq[rr * VT_PAM_MAXD + dd] = bfloat(0.0f);
+      }
     }
   }
   if (tid < VT_PAM_BQ) { smax[tid] = -INFINITY; slsum[tid] = 0.0f; }
@@ -1554,21 +1581,39 @@ kernel void vt_paged_attention_mma(device const uchar* q     [[buffer(0)]],
     const int jc = min(int(VT_PAM_BK), jhi - j0 + 1);
 
     // Gather this key block out of the paged cache into contiguous tiles.
-    for (uint e = tid; e < VT_PAM_BK * p.d; e += p.tg) {
-      const uint kk = e / p.d, dd = e % p.d;
+    const uint kv_span = vec4 ? (VT_PAM_BK * d4) : (VT_PAM_BK * p.d);
+    for (uint e = tid; e < kv_span; e += p.tg) {
+      const uint kk = vec4 ? (e / d4) : (e / p.d);
+      const uint dd = vec4 ? ((e % d4) * 4u) : (e % p.d);
+      const uint n = vec4 ? 4u : 1u;
       if (int(kk) < jc) {
         const int j = j0 + int(kk);
         const int blk = btab[r * p.bt_row + (j / int(p.block_size)) * p.bt_col];
         const int off = j % int(p.block_size);
-        const ulong kbase = ulong(blk) * p.kc_blk + ulong(off) * p.kc_pg + ulong(g) * p.kc_hd;
-        const ulong vbase = ulong(blk) * p.vc_blk + ulong(off) * p.vc_pg + ulong(g) * p.vc_hd;
-        sk[kk * VT_PAM_MAXD + dd] = bfloat(vt_load(kc, p.kc_dt, kbase + ulong(dd)));
-        sv[kk * VT_PAM_MAXD + dd] = vt_load(vc, p.vc_dt, vbase + ulong(dd));
+        const ulong kbase = ulong(blk) * p.kc_blk + ulong(off) * p.kc_pg + ulong(g) * p.kc_hd + ulong(dd);
+        const ulong vbase = ulong(blk) * p.vc_blk + ulong(off) * p.vc_pg + ulong(g) * p.vc_hd + ulong(dd);
+        if (vec4 && ((kbase | vbase) & 3ul) == 0ul) {
+          const ushort4 kv = *((device const ushort4*)((device const ushort*)kc + kbase));
+          const ushort4 vv = *((device const ushort4*)((device const ushort*)vc + vbase));
+          threadgroup bfloat* kd = &sk[kk * VT_PAM_MAXD + dd];
+          threadgroup float*  vd = &sv[kk * VT_PAM_MAXD + dd];
+          kd[0] = as_type<bfloat>(kv.x); kd[1] = as_type<bfloat>(kv.y);
+          kd[2] = as_type<bfloat>(kv.z); kd[3] = as_type<bfloat>(kv.w);
+          vd[0] = vt_bf16_to_f32(vv.x); vd[1] = vt_bf16_to_f32(vv.y);
+          vd[2] = vt_bf16_to_f32(vv.z); vd[3] = vt_bf16_to_f32(vv.w);
+        } else {
+          for (uint i = 0u; i < n; ++i) {
+            sk[kk * VT_PAM_MAXD + dd + i] = bfloat(vt_load(kc, p.kc_dt, kbase + ulong(i)));
+            sv[kk * VT_PAM_MAXD + dd + i] = vt_load(vc, p.vc_dt, vbase + ulong(i));
+          }
+        }
       } else {
         // Padding keys score to -INFINITY below and carry zero V, so a partial
         // block needs no special case in the mma.
-        sk[kk * VT_PAM_MAXD + dd] = bfloat(0.0f);
-        sv[kk * VT_PAM_MAXD + dd] = 0.0f;
+        for (uint i = 0u; i < n; ++i) {
+          sk[kk * VT_PAM_MAXD + dd + i] = bfloat(0.0f);
+          sv[kk * VT_PAM_MAXD + dd + i] = 0.0f;
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
