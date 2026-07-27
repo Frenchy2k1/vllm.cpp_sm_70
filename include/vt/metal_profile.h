@@ -62,5 +62,11 @@ std::vector<ProfileRow> GetProfileRows();
 // Drop all accumulated rows. Does not change the enabled flag.
 void ResetProfile();
 
+// Command buffers COMMITTED since the last ResetProfile. Distinct from the
+// dispatch count, and the whole point of `M3c-1`: batching many dispatches into
+// one command buffer is visible HERE and nowhere else, because a dispatch count
+// alone cannot tell a batched submission from a serialised one.
+unsigned long long GetProfileCommits();
+
 }  // namespace metal
 }  // namespace vt

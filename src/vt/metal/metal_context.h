@@ -32,6 +32,12 @@
 
 namespace vt::metal {
 
+// Commit and drain the batched command buffer (M3c-1). Defined in
+// metal_ops.mm, which owns the batch; declared here because the backend's
+// Synchronize/Copy/Memset/Free/DestroyQueue are all flush points.
+void FlushPendingBatch();
+
+
 // Opaque handles into the ObjC world. Kept as void* so every non-.mm consumer
 // (metal_ops.mm is ObjC++, but ops.cpp/tests are not) can hold them.
 using PipelineHandle = void*;  // id<MTLComputePipelineState>

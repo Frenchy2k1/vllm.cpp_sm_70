@@ -244,8 +244,8 @@ unchanged.
 
 | row | work | why ranked here |
 |---|---|---|
-| `M3c-1` | Batch dispatches into one command buffer per forward segment: keep one encoder open, encode many ops, commit at a synchronisation point | Attacks the measured 11.3 s (33% of runtime). Highest gain/effort by a wide margin |
-| `M3c-2` | Remove the per-op `waitUntilCompleted`; synchronise only where a host read or cross-queue dependency demands it | The other half of the same cost; `M3c-1` alone still serialises |
+| `M3c-1` | **LANDED 2026-07-27.** Batch dispatches into one command buffer, commit at a flush point | Recovered ~11.0 s of the measured 11.3 s: b=1 1.50x (3.68 -> 5.52 tok/s), commits 50,944 -> 454, GPU busy time UNCHANGED, gpu_busy_frac 66.6% -> 98.4%. `M3d` is now the live lever |
+| `M3c-2` | **SUBSUMED BY `M3c-1`, 2026-07-27.** The batched design already waits only at flush points (`Synchronize`/`Copy`/`Memset`/`Free`/`DestroyQueue`), never per op | The spec expected these to be separable; the implementation showed they are not. Recorded rather than left as phantom remaining work. What is still owed is ASYNC flush (commit without `waitUntilCompleted`, double-buffered), which the 98.4% GPU-bound result says is now worth little |
 | `M3c-3` | Route the tiny elementwise chain (rms_norm, silu, rope, reshape_and_cache) through the existing `kFusedChain` Tier-1 interpreter on Metal | Cuts dispatch COUNT at source: those four are 25,216 of 50,944 dispatches for 0.8% of GPU work |
 | `M3c-4` | Instrument the MLX provider path so the MLX arm is fully attributed | Removes the 10.08 s blind spot; a gate cannot bind on a partially attributed arm |
 | `M3d` | Simdgroup-matrix GEMM replacing the threadgroup tile loop | Real (20.75 s GPU, 78.3% efficient) but BLOCKED behind `M3c` |

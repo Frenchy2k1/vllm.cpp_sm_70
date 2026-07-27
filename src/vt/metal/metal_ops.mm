@@ -31,8 +31,11 @@
 // greedy argmax. `vt::GetOp` throws its normal "no kernel for op N on device type
 // 2" for them (a partial backend is a supported, tested state).
 //
-// DISPATCH MODEL: one command buffer per op, committed and waited. See
-// metal_backend.mm § SCOPE for why, and what it costs.
+// DISPATCH MODEL (M3c-1): dispatches are BATCHED into one shared command buffer
+// and committed at a flush point, not one buffer per op. See the Batch struct
+// below for the three correctness facts that rests on, and
+// .agents/specs/metal-dispatch-attribution.md for the measurement that forced
+// it. VT_METAL_SYNC_DISPATCH=1 restores the old one-buffer-per-op behaviour.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -131,10 +134,12 @@ static_assert(offsetof(CacheParams, num_slots) == 48, "CacheParams: no interior 
 // Instruments has no Metal System Trace without a full Xcode, which the Apple
 // box does not have, so the attribution the benchmark protocol requires
 // ("trace the execution, not just the code") is collected in-process instead.
-// Three phases per dispatch, which is exactly the host-build vs compute split:
-//   encode_s  — Encoder ctor to the start of commit (pipeline lookup, binds)
-//   wait_s    — wall time inside commit + waitUntilCompleted
-//   gpu_s     — MTLCommandBuffer GPUEndTime - GPUStartTime, the REAL GPU busy
+// The phases, which are exactly the host-build vs compute split:
+//   encode_s  — PER DISPATCH: Encoder ctor through the appended dispatch
+//   wait_s    — PER BATCH: wall time inside commit + waitUntilCompleted
+//   gpu_s     — PER BATCH: MTLCommandBuffer GPUEndTime - GPUStartTime
+// Since M3c-1 batched the dispatches, wait and GPU time are properties of the
+// COMMIT, not of any one op, so they are reported on the total row only.
 // gpu_s << wait_s means the backend is submit/synchronisation bound and tuning
 // kernels cannot pay; gpu_s ~= wait_s means it is genuinely compute bound.
 // OFF unless VT_METAL_PROFILE=1, and it adds nothing to the hot path but two
@@ -153,6 +158,12 @@ struct Table {
     return e != nullptr && e[0] == '1';
   }();
   std::atomic<bool> enabled{env_enabled};
+  // Batch-level, NOT per-dispatch. Once dispatches share a command buffer
+  // there is no per-dispatch wait or GPU time to attribute, so the flush
+  // cost is accumulated here and the per-kernel rows keep only encode time.
+  std::atomic<unsigned long long> commits{0};
+  double commit_wait_s = 0.0;
+  double commit_gpu_s = 0.0;
 
   void Add(const char* name, double encode_s, double wait_s, double gpu_s) {
     std::lock_guard<std::mutex> lock(mu);
@@ -172,13 +183,17 @@ struct Table {
     for (const auto& kv : rows) {
       tot.count += kv.second.count;
       tot.encode_s += kv.second.encode_s;
-      tot.wait_s += kv.second.wait_s;
-      tot.gpu_s += kv.second.gpu_s;
     }
+    tot.wait_s = commit_wait_s;
+    tot.gpu_s = commit_gpu_s;
+    const unsigned long long n_commits = commits.load(std::memory_order_relaxed);
     std::fprintf(stderr,
-                 "\n[vt metal-profile] dispatches=%llu encode=%.3fs wait=%.3fs "
+                 "\n[vt metal-profile] dispatches=%llu commits=%llu "
+                 "dispatches_per_commit=%.1f encode=%.3fs wait=%.3fs "
                  "gpu_busy=%.3fs gpu_busy_frac_of_wait=%.1f%%\n",
-                 tot.count, tot.encode_s, tot.wait_s, tot.gpu_s,
+                 tot.count, n_commits,
+                 n_commits > 0 ? static_cast<double>(tot.count) / n_commits : 0.0,
+                 tot.encode_s, tot.wait_s, tot.gpu_s,
                  tot.wait_s > 0.0 ? 100.0 * tot.gpu_s / tot.wait_s : 0.0);
     std::fprintf(stderr,
                  "[vt metal-profile] %-28s %10s %10s %10s %10s %9s\n", "kernel",
@@ -232,9 +247,12 @@ std::vector<ProfileRow> GetProfileRows() {
     out.push_back(kv.second);
     tot.count += kv.second.count;
     tot.encode_s += kv.second.encode_s;
-    tot.wait_s += kv.second.wait_s;
-    tot.gpu_s += kv.second.gpu_s;
   }
+  // Since M3c-1 wait and GPU time are properties of the BATCH, not of any one
+  // dispatch, so the total takes them from the flush accounting. `count` stays
+  // the DISPATCH count, which is what makes count-vs-commits the batching ratio.
+  tot.wait_s = t.commit_wait_s;
+  tot.gpu_s = t.commit_gpu_s;
   out.push_back(tot);  // total last, with an empty name
   return out;
 }
@@ -243,15 +261,117 @@ void ResetProfile() {
   vtprof::Table& t = vtprof::Get();
   std::lock_guard<std::mutex> lock(t.mu);
   t.rows.clear();
+  t.commits.store(0, std::memory_order_relaxed);
+  t.commit_wait_s = 0.0;
+  t.commit_gpu_s = 0.0;
+}
+
+unsigned long long GetProfileCommits() {
+  return vtprof::Get().commits.load(std::memory_order_relaxed);
 }
 
 namespace {
 
-// A small RAII-ish encode helper: opens a command buffer + compute encoder for
-// `fn_name`, lets the caller bind, then dispatches and BLOCKS.
+// --- M3c-1: the batched command buffer -------------------------------------
+// Attribution (.agents/specs/metal-dispatch-attribution.md) measured 50,944
+// command buffers for a 128-token generation, each costing a ~186 us
+// commit+waitUntilCompleted round trip: 11.3 s, a third of the run, spent NOT
+// computing. The fix is to stop making the command buffer the unit of the op.
+//
+// ONE command buffer and ONE compute encoder are kept open across dispatches
+// and committed at a flush point. Correctness rests on three facts, each of
+// which is pinned by a test in tests/vt/test_metal_backend.cpp:
+//
+//   1. ORDERING IS FREE INSIDE THE ENCODER. `computeCommandEncoder` creates a
+//      MTLDispatchTypeSerial encoder, which serialises its dispatches, so a
+//      read-modify-write chain composes exactly as it did when every op had its
+//      own buffer. (Moving to a concurrent encoder would need explicit
+//      memoryBarrier calls; we deliberately do not.)
+//   2. THE HOST MUST NEVER SEE STALE BYTES. Metal storage here is Shared, so
+//      Copy/Memset are host memcpy over the same pages the GPU writes, and Free
+//      releases a buffer the GPU may still reference. Every one of those paths
+//      flushes first (metal_backend.mm), as does Synchronize.
+//   3. A HALF-BOUND ENCODER MUST NOT LEAK. A bind can throw (Resolve rejects
+//      foreign memory) after the pipeline state is set; the shared encoder would
+//      then carry that state into the NEXT op. The destructor flushes on that
+//      path so the next dispatch starts from a clean encoder.
+//
+// The batch is process-wide because the MTLCommandQueue is: metal_backend.mm
+// hands every vt::Queue the same underlying queue, so one batch preserves
+// exactly the global ordering the synchronous design had.
+//
+// `VT_METAL_SYNC_DISPATCH=1` restores one-command-buffer-per-op. This is the
+// debug mode the spec's risk section requires: batched, a command-buffer error
+// covers a span of ops instead of naming one, so a bisect needs the old
+// behaviour available without a rebuild.
+struct Batch {
+  std::recursive_mutex mu;
+  id<MTLCommandBuffer> cmd = nil;
+  id<MTLComputeCommandEncoder> enc = nil;
+  unsigned long long pending = 0;
+  const bool sync_mode = [] {
+    const char* e = std::getenv("VT_METAL_SYNC_DISPATCH");
+    return e != nullptr && e[0] == '1';
+  }();
+};
+
+Batch& TheBatch() {
+  static Batch b;
+  return b;
+}
+
+// Commit whatever is open and block until the GPU is done with it. Caller holds
+// `mu`. No-op when nothing is pending, so flush points can call it freely.
+void FlushLocked(Batch& b) {
+  if (b.enc == nil) return;
+  [b.enc endEncoding];
+  const bool prof = vtprof::Get().enabled.load(std::memory_order_relaxed);
+  const double t_commit = prof ? vtprof::Now() : 0.0;
+  [b.cmd commit];
+  [b.cmd waitUntilCompleted];
+  if (prof) {
+    const double t_done = vtprof::Now();
+    const double gpu = [b.cmd GPUEndTime] - [b.cmd GPUStartTime];
+    vtprof::Table& tbl = vtprof::Get();
+    tbl.commits.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(tbl.mu);
+    tbl.commit_wait_s += t_done - t_commit;
+    tbl.commit_gpu_s += gpu > 0.0 ? gpu : 0.0;
+  }
+  // Capture the error BEFORE releasing, and clear the batch BEFORE throwing:
+  // an exception must not leave a committed buffer installed as "pending".
+  NSError* err = [b.cmd error];
+  std::string msg;
+  if (err != nil) msg = [[err localizedDescription] UTF8String];
+  [b.enc release];
+  [b.cmd release];
+  b.enc = nil;
+  b.cmd = nil;
+  b.pending = 0;
+  VT_CHECK(msg.empty(), std::string("metal: command buffer failed: ") + msg);
+}
+
+}  // namespace
+
+// The flush entry point the backend's Synchronize/Copy/Memset/Free call, and
+// the one op_provider reaches through Backend::FlushPending before running a
+// portable CPU-reference kernel directly over Metal memory.
+void FlushPendingBatch() {
+  Batch& b = TheBatch();
+  std::lock_guard<std::recursive_mutex> lock(b.mu);
+  FlushLocked(b);
+}
+
+namespace {
+
+// A small RAII-ish encode helper: appends one dispatch to the shared batch.
+// Holds the batch lock for the whole encode, because a single
+// MTLComputeCommandEncoder cannot be written by two threads at once (each op
+// used to own its encoder, so this serialisation is new; it costs the ~4 us an
+// encode takes, against the ~186 us it saves).
 class Encoder {
  public:
-  explicit Encoder(const char* fn_name) {
+  explicit Encoder(const char* fn_name) : lock_(TheBatch().mu) {
     prof_ = vtprof::Get().enabled.load(std::memory_order_relaxed);
     if (prof_) {
       prof_name_ = fn_name;
@@ -259,21 +379,31 @@ class Encoder {
     }
     pool_ = [[NSAutoreleasePool alloc] init];
     auto& ctx = MetalContext::Get();
-    id<MTLCommandQueue> q = static_cast<id<MTLCommandQueue>>(ctx.command_queue());
-    cmd_ = [q commandBuffer];
-    enc_ = [cmd_ computeCommandEncoder];
+    Batch& b = TheBatch();
+    if (b.enc == nil) {
+      id<MTLCommandQueue> q = static_cast<id<MTLCommandQueue>>(ctx.command_queue());
+      // RETAINED: [q commandBuffer] is autoreleased, and the batch outlives this
+      // Encoder's pool by design. Released in FlushLocked.
+      b.cmd = [[q commandBuffer] retain];
+      VT_CHECK(b.cmd != nil, "metal: commandBuffer failed");
+      b.enc = [[b.cmd computeCommandEncoder] retain];
+      VT_CHECK(b.enc != nil, "metal: computeCommandEncoder failed");
+    }
+    enc_ = b.enc;
     auto pso = static_cast<id<MTLComputePipelineState>>(ctx.Pipeline(std::string(fn_name)));
     [enc_ setComputePipelineState:pso];
     max_threads_ = static_cast<size_t>([pso maxTotalThreadsPerThreadgroup]);
   }
   // A bind can THROW (Resolve rejects memory this backend did not allocate),
-  // unwinding past the dispatch. Metal asserts and aborts the process if a
-  // command encoder is released without endEncoding, which would turn a clean,
-  // catchable vt:: error into SIGABRT — so close the encoder here whenever the
-  // happy path did not. `finished_` makes this idempotent.
+  // unwinding past the dispatch. The encoder is now SHARED, so the failure mode
+  // changed: the half-bound state (pipeline set, some buffers bound, no
+  // dispatch) would otherwise leak into the NEXT op, whose own binds might not
+  // overwrite every index. Flushing here ends the encoder and commits the
+  // dispatches already legitimately encoded, so the next Encoder starts clean.
+  // `finished_` makes this idempotent.
   ~Encoder() {
-    if (!finished_ && enc_ != nil) {
-      [enc_ endEncoding];
+    if (!finished_) {
+      FlushLocked(TheBatch());
       finished_ = true;
     }
     [pool_ release];
@@ -337,26 +467,28 @@ class Encoder {
   }
 
  private:
+  // The dispatch is now APPENDED, not submitted. Nothing here blocks: the
+  // command buffer stays open for the next op and is committed at a flush
+  // point. That removal of ~186 us per op is the whole of M3c-1.
   void Finish() {
-    [enc_ endEncoding];
     finished_ = true;
-    const double t_commit = prof_ ? vtprof::Now() : 0.0;
-    [cmd_ commit];
-    [cmd_ waitUntilCompleted];
+    Batch& b = TheBatch();
+    ++b.pending;
     if (prof_) {
-      const double t_done = vtprof::Now();
-      // GPUStartTime/GPUEndTime are only valid once the buffer has completed,
-      // which waitUntilCompleted just guaranteed.
-      const double gpu = [cmd_ GPUEndTime] - [cmd_ GPUStartTime];
-      vtprof::Get().Add(prof_name_, t_commit - t_ctor_, t_done - t_commit,
-                        gpu > 0.0 ? gpu : 0.0);
+      // Only encode time is per-dispatch now; wait and GPU time belong to the
+      // batch and are accumulated in FlushLocked.
+      vtprof::Get().Add(prof_name_, vtprof::Now() - t_ctor_, 0.0, 0.0);
     }
-    VT_CHECK([cmd_ error] == nil,
-             std::string("metal: command buffer failed: ") +
-                 [[[cmd_ error] localizedDescription] UTF8String]);
+    // A batch that nothing ever flushes would grow without bound and hold every
+    // buffer it references alive. The engine flushes constantly (the sampler
+    // reads through Copy every step), so this cap is a backstop for pathological
+    // callers, not a tuning knob.
+    if (b.sync_mode || b.pending >= kMaxPendingDispatches) FlushLocked(b);
   }
+  static constexpr unsigned long long kMaxPendingDispatches = 4096;
+
+  std::unique_lock<std::recursive_mutex> lock_;
   NSAutoreleasePool* pool_ = nil;
-  id<MTLCommandBuffer> cmd_ = nil;
   id<MTLComputeCommandEncoder> enc_ = nil;
   size_t max_threads_ = 0;
   bool finished_ = false;

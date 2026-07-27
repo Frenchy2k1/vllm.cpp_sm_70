@@ -25329,3 +25329,42 @@ reordering that changes tokens is a bug, not a win.
 **W1 — the close.** `DFlashPagedBlockAttentionWarpKernel<Tin,Tout>`: ONE WARP per (block-query row, q-head), `__shfl_xor_sync` butterfly head_dim reduction (no `__syncthreads`), register accumulator, per-lane online-softmax stats — mirrors the shipped `AttentionWarpKernel` (grounded in `src/vt/cuda/flash_attn/`) with the IDENTICAL paged/block combined-index read, `btbl`/`seq_lens` indirection, causal/SWA `jlo..jhi` mask, and GQA broadcast copied verbatim from the block kernel. Default ON; `VT_DFLASH_ATTN_BLOCK=1` = the bit-identical block kernel. Not bit-identical to the block kernel (32-lane butterfly vs 256-thread tree) but same f32-online-softmax math within the CUDA==CPU envelope; spec-decode output is exact by construction (the target verify is untouched — only which draft proposals are accepted can shift, within the ratified ±4 gate).
 
 **RESULT.** Draft attn 242.9 → 77.9 ms (3.1×, −68%); our-ON c1 28.60 → 29.32 tok/s (+2.5%). **THE SPEED GATE (MET):** FINAL same-session 3-rep A/B (8 prose+code prompts × 256 tok, input 512, c1, greedy, cold leg discarded, one flock): our-ON graphed 29.42/29.27/29.32 (median 29.32) vs vLLM-ON graphed MRV2 29.240/29.247/29.233 (median 29.240) — our WORST rep (29.27) exceeds vLLM's BEST (29.247), non-overlapping bands, **1.003× ⇒ our-DFlash-ON ≥ vLLM-DFlash-ON**; our OFF 10.16 ≥ vLLM OFF. **Correctness (UNCHANGED):** e2e `test_qwen27_dflash_spec_decode` 27/27 with graph (VT_DFLASH_GRAPH=1) AND eager (=0), bit-identical to each other and to D13; acceptance 19/39/29/25 unchanged (1629 draft accepted identical warp-vs-block across the whole A/B set); CUDA==CPU `test_ops_dflash_paged_block_attn` 795648/795648 + compute-sanitizer memcheck 0. **Inertness:** SACRED 235/235 + MTP 9/9 byte-identical; CUDA `-Werror` clean; `check-device-leakage` not increased. `benchmark_binding=true`. **SPEC-DFLASH → DONE** (engine-matrix `SPEC-DFLASH` DONE/`CLAIM-DFLASH-D14`, model-matrix DFlash row DONE + checklist ✅, kernel-matrix `KERNEL-ATTN-DFLASH-PAGED-BLOCK` DONE, roadmap DFlash DONE, README + BENCHMARKS updated). No irreducible ceiling hit — the residual was a concrete portable single-kernel lever, closed. Raw nsys `/tmp/d14_ours_specon.nsys-rep` (block) + `/tmp/d14_ours_warp.nsys-rep` (warp); harnesses `d14_ab.sh` + `scripts/spec/vllm_dflash_timing3.py`.
+## 2026-07-27 — `M3c-1` LANDED: batched command buffers; the Metal backend is now COMPUTE bound
+
+**Row:** `BACKEND-METAL-MLX` (work row `M3c-1`).
+**Spec:** [metal-dispatch-attribution.md](specs/metal-dispatch-attribution.md).
+**Box:** M4, same-binary A/B, runners paused, whole series under the GPU lock.
+
+**What changed.** Dispatches are appended to ONE shared command buffer/encoder
+and committed at a flush point, instead of one `commit`+`waitUntilCompleted` per
+op. Correctness rests on three things, each pinned by a new test: ordering is
+free inside a `MTLDispatchTypeSerial` encoder; every host-visible path
+(`Synchronize`/`Copy`/`Memset`/`Free`/`DestroyQueue`) flushes first; and a bind
+that throws flushes rather than leaking a half-bound shared encoder.
+
+**One new seam, required for correctness, not convenience.**
+`Backend::FlushPending()` (default no-op) called from `GetOp` when the S5
+portable CPU tier is the selection: that tier is a HOST kernel about to touch
+DEVICE memory, so a deferred submission must drain first. Without it, batching
+would have been silently wrong on any op Metal lacks natively.
+
+**Measured.** b=1 **3.68 -> 5.52 tok/s (1.50x)**, b=16 **19.12 -> 21.64 (1.13x)**.
+Command buffers **50,944 -> 454** (112 dispatches each). **GPU busy time is
+UNCHANGED** (22.566 -> 22.490 s), which is the control proving this removed
+overhead rather than work, and `gpu_busy_frac_of_wait` goes **66.6% -> 98.4%**.
+The ~11.0 s recovered matches the 11.316 s the attribution predicted.
+Shipping config (MLX + batched) b=1 **9.4 tok/s**, narrowing the MLX-LM gap from
+~4.8x to ~2.96x.
+
+**Correctness.** Qwen3-dense Metal gate **128/128 on device type 2 (METAL)**;
+`test_metal_backend` **19 cases / 20,118 assertions**. The OPT gate **SKIPPED**
+(dgx-only checkpoint) and is not evidence.
+
+**Record correction made in the same change:** `M3c-2` (remove the per-op wait)
+is **SUBSUMED** — the batched design already waits only at flush points. The
+spec expected them separable; they are not. What remains is ASYNC flush, which
+the 98.4% GPU-bound result says is now worth little.
+
+**Next.** `M3d` (simdgroup-matrix GEMM) is the live lever: at 98.4% GPU-bound
+the dispatch path has almost nothing left to give, and `vt_matmul` still holds
+the bulk of GPU time. `M3c-3`/`M3c-4` unchanged.
