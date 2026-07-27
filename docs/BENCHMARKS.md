@@ -2555,6 +2555,54 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## COLD vs WARM, and a thermally matched MLX-LM comparison (2026-07-27)
+
+Two corrections to how this document has been comparing against MLX-LM, plus one
+rejected optimisation. Nothing landed in code.
+
+**Our headline number was COLD, MLX-LM's was WARM.** A single-prompt run stages
+every weight into Metal buffers during the first forward. Measured on the same
+build: cold (1 prompt) 19.6 tok/s at 1495 ms TTFT; warm (8 prompts) 21.3 tok/s at
+905 ms median TTFT. About 530 ms of the single-prompt TTFT is one-time weight
+staging. `mlx_lm.generate` loads its model BEFORE the region it times, so
+comparing our cold number to its prompt/generation rates charged us a startup
+cost it never reports. Warm is the fair comparison, and it is also what a server
+sees after the first request.
+
+**Absolute tok/s drifts across a long session; ratios do not.** Re-measuring
+MLX-LM in the same lock window as ours gave 26.33/26.43 generation tok/s where
+earlier in the day it gave 27.89 — the machine is thermally slower now. Ours
+moved the same way (26.6 -> 25.2 decode). Any comparison in this document
+between numbers captured at different times is therefore unsafe; only
+same-window A/Bs are. The decode RATIO was stable at 95.4% across both windows,
+which is what makes the earlier entries still meaningful.
+
+**Thermally matched, warm, like-for-like (b=1, Qwen3-1.7B-bf16, p=512, g=128):**
+
+| basis | ours | MLX-LM | ours as % | remaining |
+|---|--:|--:|--:|--:|
+| decode-only | 25.17 | 26.38 | **95.4%** | 1.048x |
+| total, incl. prefill | 21.24 | 23.75 | **89.4%** | 1.118x |
+
+MLX-LM's total basis is derived from its own output: 520 prompt tokens at
+930/1004 tok/s (0.538 s) plus 128 tokens at 26.38 tok/s (4.852 s).
+
+**REJECTED - skipping the GPU drain on fresh-buffer host copies.** Copy/Memset
+are flush points, and weight staging does Alloc-then-Copy ~200 times, so a cold
+prefill committed 200 command buffers for 398 dispatches (2.0 per commit, against
+20.5 once warm). Tracking buffers allocated since the last bind, and skipping the
+drain when the destination is one of them and the source is host memory, fixed
+the structure completely: **commits 200 -> 3, dispatches per commit 2.0 -> 132.7**.
+End to end it changed nothing: over 4 alternating reps, prefill TTFT 1445 ms
+(base) vs 1452 ms, and p=512 g=128 throughput 20.56 vs 20.41. Reverted.
+
+The reason is worth keeping: those flushes wait on GPU work that has to happen
+anyway. Batching defers the wait, it does not remove the work, and the CPU had
+nothing else to do. **A pathological-looking command-buffer structure is not by
+itself a cost.**
+
+---
+
 ## Metal GEMM: fatter simdgroup blocks and deeper K both REJECTED (2026-07-27)
 
 Two more attempts on `vt_matmul_bt_mm`, the whole remaining prefill gap at 642 ms

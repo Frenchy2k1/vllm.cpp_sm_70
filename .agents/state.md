@@ -26433,3 +26433,58 @@ exclusion list for exactly that reason before assuming the well is dry.
 **Standing goal NOT met.** b=1, Qwen3-1.7B-bf16, p=512 g=128: decode 26.6 vs
 MLX-LM 27.89 = 95.4%; total-basis 20.9 vs 25.31 = 82.6%. Long prompts improved
 substantially this session (p=4096 +32%) but neither basis reaches parity.
+
+---
+
+## 2026-07-27 — COLD vs WARM: a second benchmark-equivalence error, and the flush storm is a red herring
+
+Chasing the prefill gap into the HOST side. Nothing landed; two corrections and
+one rejected optimisation.
+
+**Prefill is only ~30% non-GPU, and most of that is one-time.** TTFT 1469 ms
+against 1027 ms GPU busy looked like 440 ms of host overhead. Sampling the
+process (`/usr/bin/sample`, 87% of main-thread samples in
+ForwardBody -> Copy -> FlushPendingBatch -> waitUntilCompleted) pointed at
+weight staging, and the warm/cold split confirmed it:
+
+| | dispatches/commit | GPU busy per prefill | TTFT |
+|---|--:|--:|--:|
+| cold (1 prompt) | 2.0 | 1013 ms | 1414 ms |
+| warm (12 prompts) | 20.5 | 930 ms | 970 ms |
+
+Warm, overhead is 40 ms — 98.8% GPU. The cold run's `commits=200` matches the
+~200 weight-staging Copy calls one-for-one.
+
+**CORRECTION 2 (the first was the decode/total basis, 340528d9): our headline
+number is COLD, MLX-LM's is WARM.** `mlx_lm.generate` loads the model before the
+region it times; our single-prompt run stages every weight into Metal buffers
+inside the first forward. Cold 19.6 tok/s / 1495 ms TTFT vs warm 21.3 / 905 ms.
+We were charging ourselves ~530 ms of startup that MLX never reports.
+
+**CORRECTION 3: absolute tok/s drifts thermally across a long session; ratios do
+not.** MLX-LM re-measured in the same window as ours gave 26.33/26.43 gen tok/s
+where it gave 27.89 earlier today. Ours moved identically (26.6 -> 25.2). Every
+cross-time absolute comparison in this log is unsafe; the same-window ratio is
+the durable quantity, and it held at 95.4% decode across both windows.
+
+**Thermally matched, warm, like-for-like:** decode 25.17 vs 26.38 = **95.4%**;
+total-basis 21.24 vs 23.75 = **89.4%** (MLX total derived from its own 520 tok at
+930/1004 tok/s + 128 tok at 26.38). NOT parity, but 89.4% where this log
+previously said 82.6% — the difference was entirely cold-vs-warm.
+
+**REJECTED — skipping the GPU drain on fresh-buffer host copies.** Track buffers
+allocated since the last bind (any dispatch must bind a buffer to name it, so a
+bind retires the set); skip the drain in Copy/Memset when the destination is
+fresh AND the source is host memory. Structurally a complete fix: commits
+200 -> 3, dispatches per commit 2.0 -> 132.7. End to end, over 4 alternating
+reps: TTFT 1445 (base) vs 1452 ms, throughput 20.56 vs 20.41. Reverted.
+
+Why it cannot help: those flushes wait on GPU work that must happen anyway.
+Batching defers the wait; it does not remove work, and the CPU had nothing else
+to do meanwhile. **A pathological-looking command-buffer structure is not itself
+a cost.** Worth revisiting ONLY if the CPU ever gains independent work to overlap
+(async weight staging at load time, or multi-request pipelining).
+
+**Remaining gap, restated on the warm basis:** decode 4.8%, total 11.8%. Prefill
+GPU is 930 ms warm against MLX's ~538 ms, and `vt_matmul_bt_mm` is still the bulk
+of it with its exclusion list unchanged.
