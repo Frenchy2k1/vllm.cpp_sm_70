@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,7 +59,8 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
           scheduler_config.long_prefill_token_threshold),
       enable_chunked_prefill_(scheduler_config.enable_chunked_prefill),
       scheduler_reserve_full_isl_(
-          scheduler_config.scheduler_reserve_full_isl) {
+          scheduler_config.scheduler_reserve_full_isl),
+      block_size_(block_size) {
   // num_lookahead_tokens (scheduler.py:275-292): 0 when no speculator is
   // configured (the default — every spec-decode path stays inert), else derived
   // from the SpeculativeConfig (k for MTP). Threaded into allocate_slots below.
@@ -178,14 +180,65 @@ void Scheduler::maybe_reorder_waiting_for_lpm() {
     matched[r] = kv_cache_manager->num_matched_prefix_tokens(*r);
   }
 
-  // _sort_by_longest_prefix: sort DESCENDING by num_matched_prefix_tokens. A
-  // STABLE sort keeps arrival (fcfs) order among equal-match requests, matching
-  // Python's list.sort with key=-num_matched_prefix_tokens (SW2 in-batch
-  // collision de-prioritization is a named residual — not yet ported).
-  std::stable_sort(order.begin(), order.end(),
-                   [&matched](const Request* a, const Request* b) {
-                     return matched[a] > matched[b];
-                   });
+  // SW2 — in-batch prefix-collision de-prioritization. Ported 1:1 from SGLang
+  // SchedulePolicy._compute_prefix_matches (schedule_policy.py:253-301 @ f63458b).
+  // We walk the waiting queue in ARRIVAL order (the pre-sort order — SGLang runs
+  // this BEFORE _sort_by_longest_prefix) and build up an ephemeral set of block-
+  // hash APC keys seen so far (SGLang's `waiting_queue_radix_tree`, a simulated
+  // radix built only from the waiting queue — here reused via OUR block hashes,
+  // NOT a second trie). A request whose REAL cached match is small
+  // (<= kInBatchCheckThreshold; schedule_policy.py:277) and whose longest prefix
+  // against the already-seen requests is large (>= kInBatchDeprioritizeThreshold;
+  // schedule_policy.py:288-292) is temporarily de-prioritized; otherwise its
+  // prefix is inserted into the seen set so a later collider matches it
+  // (schedule_policy.py:293-300). Block hashes are chained over the prefix, so a
+  // shared k-block prefix yields k identical leading hashes: the in-batch match
+  // is the contiguous run of leading hashes already in the seen set.
+  std::unordered_set<const Request*> temporary_deprioritized;
+  {
+    std::unordered_set<BlockHash> seen;  // block-hash keys of inserted prefixes.
+    for (Request* r : order) {
+      // schedule_policy.py:277 — only check requests with a small real match.
+      if (matched[r] > kInBatchCheckThreshold) {
+        continue;
+      }
+      // Longest in-batch prefix match: contiguous leading block hashes of r that
+      // some earlier-seen request already contributed (chained hashes make the
+      // run contiguous-from-front). Measured in tokens for the threshold.
+      int in_batch_match_tokens = 0;
+      for (const BlockHash& h : r->block_hashes) {
+        if (seen.find(h) == seen.end()) {
+          break;
+        }
+        in_batch_match_tokens += block_size_;
+      }
+      if (in_batch_match_tokens >= kInBatchDeprioritizeThreshold) {
+        // schedule_policy.py:292 — collides with an in-flight uncached prefix.
+        temporary_deprioritized.insert(r);
+      } else {
+        // schedule_policy.py:295-300 — first seer of this prefix; record it.
+        for (const BlockHash& h : r->block_hashes) {
+          seen.insert(h);
+        }
+      }
+    }
+  }
+
+  // _sort_by_longest_prefix (schedule_policy.py:303-314): sort DESCENDING by
+  // num_matched_prefix_tokens, but a de-prioritized request takes the sort key
+  // `float("inf")` — i.e. it sorts BEHIND every non-de-prioritized request. A
+  // STABLE sort keeps arrival (fcfs) order among equal-key requests, matching
+  // Python's list.sort.
+  std::stable_sort(
+      order.begin(), order.end(),
+      [&matched, &temporary_deprioritized](const Request* a, const Request* b) {
+        const bool a_dep = temporary_deprioritized.count(a) != 0;
+        const bool b_dep = temporary_deprioritized.count(b) != 0;
+        if (a_dep != b_dep) {
+          return !a_dep;  // non-de-prioritized sorts ahead of de-prioritized.
+        }
+        return matched[a] > matched[b];
+      });
   waiting->reorder(order);
 }
 

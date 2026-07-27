@@ -118,6 +118,31 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**SGLang SW2 in-batch prefix-collision de-prioritization note (2026-07-27,
+`CLAIM-SGLANG-SW2`, LANDED + CPU-GATED, NOT pushed — FULL SHA reported to
+caller).** Ports the named SW1 residual on base local `main` `cc5d2348`,
+isolated worktree `.claude/worktrees/agent-afeedca484fb784ed`. Extends the
+`kLPM` reorder (`maybe_reorder_waiting_for_lpm`, `scheduler.cpp:183-243`): walks
+the pre-sort (arrival) waiting queue building an ephemeral seen-set of OUR
+block-hash APC keys (`Request::block_hashes` — NOT a second trie), and
+de-prioritizes a later request whose in-batch prefix match ≥
+`kInBatchDeprioritizeThreshold` when its real cached match ≤
+`kInBatchCheckThreshold` (both 32 tokens, `scheduler.h`), sort key mirrors
+SGLang's `float("inf")`. Ported 1:1 FROM `schedule_policy.py:253-301,311`
+(`_compute_prefix_matches` + `_sort_by_longest_prefix`). Output-neutral
+(admission ORDER only). **Honest finding:** the redundant-prefill / hit-rate
+lever SW2 provides in SGLang is **NOT-APPLICABLE** here — our APC caches blocks
+at ALLOCATION time (`kv_cache_manager.cpp:267`), so the second same-step collider
+already HITS the first's just-cached prefix; SGLang needs SW2 only because its
+radix updates post-forward. Gate `test_scheduler_lpm` 6/6 (47 asserts; SW2:
+de-prioritizes-collider RED-first, output-neutral hits=112, within-step-dedup
+NOT-APPLICABLE proof, inert-when-cached gate) + inertness `test_scheduler`
+36/36 + `test_prefix_cache_stats` 12/12 unchanged; CPU `-Werror` 0-warn clean
+full lib. Row `ENG-SGLANG-BEHAVIOR-FLAG` (stays `ACTIVE`), `sglang-matrix.md`
+`SGLANG-SCHED-INBATCH` SGLANG-DISTINCT→ACTIVE. Residual: SW3 jump-forward + SW4
+eviction knob (named/deferred). Did NOT touch model/kernel source, README,
+Metal/demo, or the competitor benchmark rows.
+
 **SGLang behavior-parity IMPLEMENTATION note (2026-07-27, `CLAIM-SGLANG-IMPL`,
 W1+W2 LANDED + CPU-GATED, NOT pushed — FULL SHA reported to caller).**
 Implements the just-merged scope (`CLAIM-SGLANG-RADIX-SCOPE`) on base local
