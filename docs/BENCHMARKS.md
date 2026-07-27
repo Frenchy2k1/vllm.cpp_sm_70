@@ -69,6 +69,8 @@ harness `d14_ab.sh` (env `VT_DFLASH_GRAPH=1 VT_DFLASH_PAGED=1`), vLLM `vllm_dfla
 gate form unchanged (strict run-deterministic match to vLLM-DFlash-ON; the ratified near-tie
 is the honest final correctness form, bf16-irreducible). Block-diffusion drafting is now
 correctness-complete AND at/above vLLM throughput - the roadmap's final open speed item.
+The warp-kernel close + its GPU gate landed in commit `164453a2`; `SPEC-DFLASH` is `DONE`
+across the engine/model/kernel matrices.
 
 **DFlash D0-D12 history (superseded by D13; retained for the campaign record).** D0 ORACLE
 BASELINE CAPTURED, D1 landed (2026-07-26, `CLAIM-DFLASH-D0D1`,

@@ -59,6 +59,7 @@ portable/reference path. In normal operation leave them unset.
 | `VT_CPU_REF` | off | Set on to force the portable reference path (dequantize-everything oracle), the standard "is this a kernel bug?" bisect switch |
 | `VT_DFLASH_PAGED` | on (CUDA, DFlash spec-decode) | The materialized `[context;block]` draft forward instead of the fixed-capacity paged draft-KV store read through `vt::DFlashPagedBlockAttention` (bit-identical; only the DFlash single-request propose path) |
 | `VT_DFLASH_GRAPH` | on (CUDA, DFlash spec-decode) | The eager paged draft step instead of the captured/replayed draft-step CUDA graph (replayed==eager bit-identical; only the DFlash single-request propose path) |
+| `VT_DFLASH_ATTN_BLOCK` | off (CUDA, DFlash spec-decode) | `=1` selects the D12/D13 block-per-(query,head) draft paged-attention kernel instead of the D14 default warp-scoped online-softmax kernel (same f32-softmax math within the bf16 envelope; the D14 warp kernel is ~3x faster and closed the ~2% speed residual; only the DFlash single-request propose path) |
 
 ## Diagnostic
 
