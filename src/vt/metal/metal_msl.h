@@ -913,6 +913,11 @@ kernel void vt_paged_attention(device const uchar* q     [[buffer(0)]],
   const uint tid = tid2.x;
   threadgroup float smem[VT_TG_MAX];
   threadgroup float scores[VT_PA_CHUNK];
+  // Per-key V base addresses, computed ONCE per chunk. Without this every thread
+  // re-reads `btab` from DEVICE memory and recomputes the same address for every
+  // key it accumulates, i.e. jc * tg block-table loads per chunk where jc would
+  // do. The block table is small but it is device memory in the inner loop.
+  threadgroup ulong vbases[VT_PA_CHUNK];
   threadgroup float acc[VT_PA_MAXD];
   threadgroup float sh_m;
   threadgroup float sh_l;
@@ -1012,16 +1017,23 @@ kernel void vt_paged_attention(device const uchar* q     [[buffer(0)]],
     // visible to the V accumulation below, which reads the WHOLE chunk.
     const float lchunk = vt_tg_sum(smem, tid, p.tg, ps);
 
+    // Resolve each key's V base address ONCE for the whole threadgroup.
+    for (int idx = int(tid); idx < jc; idx += int(p.tg)) {
+      const int j = j0 + idx;
+      const int blk = btab[r * p.bt_row + (j / int(p.block_size)) * p.bt_col];
+      const int off = j % int(p.block_size);
+      vbases[idx] = ulong(blk) * p.vc_blk + ulong(off) * p.vc_pg + ulong(g) * p.vc_hd;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // Weighted V accumulation, parallel over the head dimension so each thread
-    // owns its own acc[] slots.
+    // owns its own acc[] slots. Adjacent threads read adjacent elements of the
+    // same V row, which is already the coalesced direction; the win here is
+    // dropping the redundant block-table traffic above.
     for (uint e = tid; e < p.d; e += p.tg) {
       float s = 0.0f;
       for (int idx = 0; idx < jc; ++idx) {
-        const int j = j0 + idx;
-        const int blk = btab[r * p.bt_row + (j / int(p.block_size)) * p.bt_col];
-        const int off = j % int(p.block_size);
-        const ulong vbase = ulong(blk) * p.vc_blk + ulong(off) * p.vc_pg + ulong(g) * p.vc_hd;
-        s += scores[idx] * vt_load(vc, p.vc_dt, vbase + ulong(e));
+        s += scores[idx] * vt_load(vc, p.vc_dt, vbases[idx] + ulong(e));
       }
       acc[e] += s;
     }

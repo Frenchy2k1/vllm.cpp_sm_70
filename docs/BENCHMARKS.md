@@ -2555,6 +2555,29 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal paged-attention V accumulation on Apple M4 (2026-07-27) - +4.2%
+
+The follow-up the score-loop change deliberately left alone. The V loop's memory
+access was already coalesced (adjacent threads read adjacent elements of the same
+V row), but **every thread re-read the block table from DEVICE memory and
+recomputed the same `vbase` for every key it accumulated** — `jc * tg` block-table
+loads per chunk where `jc` would do. Resolved once per chunk into threadgroup
+memory instead.
+
+| | before | after |
+|---|--:|--:|
+| throughput | 18.30 tok/s | **19.07** (18.82 / 19.31) |
+| duration | 7.00 s | 6.72 s |
+| attention GPU | 1370 ms | **1039 ms (-24%)** |
+| total GPU busy | 6.58 s | 6.24 s |
+
+**Numerics are bit-identical** — only the address computation moved, not the
+accumulation order — so the SACRED gate passes **16/16 with max gap still 0**
+and no golden re-capture. Attention is now 1636 -> 1039 ms across the two
+changes, a 1.57x on the kernel.
+
+---
+
 ## Metal paged-attention score loop on Apple M4 (2026-07-27) - +3.7%, and a PERFECT oracle result
 
 **Re-attribution moved the target.** After the GEMM work, GPU time was: decode
