@@ -2862,6 +2862,31 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## REJECTED: eliding the identity softmax rescale (2026-07-27)
+
+Per 16-key chunk each simdgroup issues 40 mma: 16 for QK, **8 for the diagonal
+softmax rescale**, and 16 for PV. `corr` is exp(mold - mnew), exactly 1.0 whenever
+the running max does not move, and `diag(1) @ O` is bit-identical to O — so
+skipping it when all eight rows have corr == 1.0 should have removed 20% of the
+inner loop's matrix ops for free.
+
+Measured: prefill attention **46.6 -> 47.5 ms**, i.e. no gain and slightly worse.
+Reverted.
+
+**The exactness argument was right even though the perf was not.** Correctness
+held at 16/16 PASS with NO golden re-anchor, which is the outcome predicted from
+`diag(1) @ O` being bit-identical — worth noting because the three preceding
+kernel changes all moved a near-tie and needed the oracle. Predicting which
+changes perturb numerics is now reliable; predicting which ones pay is not.
+
+Why it does not pay: in CAUSAL prefill each query's window grows as key blocks
+arrive, so the running max keeps moving and corr is rarely exactly 1.0. The eight
+scalar `sdiag` reads plus the branch then cost more than the eight mma they guard.
+The idea would fare better on a non-causal or short-context shape, which is not
+this workload.
+
+---
+
 ## Prefill attention softmax: one simdgroup per row, +0.19% (2026-07-27)
 
 Implements the target identified below. The online softmax ran ONE THREAD PER
