@@ -36,8 +36,18 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "vt/metal_profile.h"
 
 #include "metal_buffers.h"
 #include "metal_context.h"
@@ -117,11 +127,136 @@ static_assert(sizeof(PagedAttnParams) == 112, "PagedAttnParams layout must match
 static_assert(offsetof(PagedAttnParams, num_reqs) == 48, "PagedAttnParams: no interior padding");
 static_assert(offsetof(CacheParams, num_slots) == 48, "CacheParams: no interior padding");
 
+// --- VT_METAL_PROFILE: per-dispatch time attribution -----------------------
+// Instruments has no Metal System Trace without a full Xcode, which the Apple
+// box does not have, so the attribution the benchmark protocol requires
+// ("trace the execution, not just the code") is collected in-process instead.
+// Three phases per dispatch, which is exactly the host-build vs compute split:
+//   encode_s  — Encoder ctor to the start of commit (pipeline lookup, binds)
+//   wait_s    — wall time inside commit + waitUntilCompleted
+//   gpu_s     — MTLCommandBuffer GPUEndTime - GPUStartTime, the REAL GPU busy
+// gpu_s << wait_s means the backend is submit/synchronisation bound and tuning
+// kernels cannot pay; gpu_s ~= wait_s means it is genuinely compute bound.
+// OFF unless VT_METAL_PROFILE=1, and it adds nothing to the hot path but two
+// clock reads next to an already-blocking round trip.
+namespace vtprof {
+
+using Row = vt::metal::ProfileRow;
+
+struct Table {
+  std::mutex mu;
+  std::map<std::string, Row> rows;
+  // The end-of-process report is tied to the ENVIRONMENT only, never to
+  // SetProfileEnabled: a test that flips the flag must not print to stderr.
+  const bool env_enabled = [] {
+    const char* e = std::getenv("VT_METAL_PROFILE");
+    return e != nullptr && e[0] == '1';
+  }();
+  std::atomic<bool> enabled{env_enabled};
+
+  void Add(const char* name, double encode_s, double wait_s, double gpu_s) {
+    std::lock_guard<std::mutex> lock(mu);
+    Row& r = rows[name];
+    if (r.name.empty()) r.name = name;
+    ++r.count;
+    r.encode_s += encode_s;
+    r.wait_s += wait_s;
+    r.gpu_s += gpu_s;
+  }
+
+  ~Table() {
+    if (!env_enabled) return;
+    std::lock_guard<std::mutex> lock(mu);
+    if (rows.empty()) return;
+    Row tot;
+    for (const auto& kv : rows) {
+      tot.count += kv.second.count;
+      tot.encode_s += kv.second.encode_s;
+      tot.wait_s += kv.second.wait_s;
+      tot.gpu_s += kv.second.gpu_s;
+    }
+    std::fprintf(stderr,
+                 "\n[vt metal-profile] dispatches=%llu encode=%.3fs wait=%.3fs "
+                 "gpu_busy=%.3fs gpu_busy_frac_of_wait=%.1f%%\n",
+                 tot.count, tot.encode_s, tot.wait_s, tot.gpu_s,
+                 tot.wait_s > 0.0 ? 100.0 * tot.gpu_s / tot.wait_s : 0.0);
+    std::fprintf(stderr,
+                 "[vt metal-profile] %-28s %10s %10s %10s %10s %9s\n", "kernel",
+                 "count", "encode_ms", "wait_ms", "gpu_ms", "gpu/wait");
+    std::vector<std::pair<std::string, Row>> v(rows.begin(), rows.end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+      return a.second.wait_s > b.second.wait_s;
+    });
+    for (const auto& kv : v) {
+      std::fprintf(stderr,
+                   "[vt metal-profile] %-28s %10llu %10.1f %10.1f %10.1f %8.1f%%\n",
+                   kv.first.c_str(), kv.second.count, 1e3 * kv.second.encode_s,
+                   1e3 * kv.second.wait_s, 1e3 * kv.second.gpu_s,
+                   kv.second.wait_s > 0.0 ? 100.0 * kv.second.gpu_s / kv.second.wait_s
+                                          : 0.0);
+    }
+  }
+};
+
+inline Table& Get() {
+  static Table t;
+  return t;
+}
+
+inline double Now() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+}  // namespace vtprof
+
+}  // namespace — closed so the public profile API below has external linkage
+
+bool ProfileEnabled() {
+  return vtprof::Get().enabled.load(std::memory_order_relaxed);
+}
+
+void SetProfileEnabled(bool on) {
+  vtprof::Get().enabled.store(on, std::memory_order_relaxed);
+}
+
+std::vector<ProfileRow> GetProfileRows() {
+  vtprof::Table& t = vtprof::Get();
+  std::lock_guard<std::mutex> lock(t.mu);
+  std::vector<ProfileRow> out;
+  if (t.rows.empty()) return out;
+  out.reserve(t.rows.size() + 1);
+  ProfileRow tot;
+  for (const auto& kv : t.rows) {
+    out.push_back(kv.second);
+    tot.count += kv.second.count;
+    tot.encode_s += kv.second.encode_s;
+    tot.wait_s += kv.second.wait_s;
+    tot.gpu_s += kv.second.gpu_s;
+  }
+  out.push_back(tot);  // total last, with an empty name
+  return out;
+}
+
+void ResetProfile() {
+  vtprof::Table& t = vtprof::Get();
+  std::lock_guard<std::mutex> lock(t.mu);
+  t.rows.clear();
+}
+
+namespace {
+
 // A small RAII-ish encode helper: opens a command buffer + compute encoder for
 // `fn_name`, lets the caller bind, then dispatches and BLOCKS.
 class Encoder {
  public:
   explicit Encoder(const char* fn_name) {
+    prof_ = vtprof::Get().enabled.load(std::memory_order_relaxed);
+    if (prof_) {
+      prof_name_ = fn_name;
+      t_ctor_ = vtprof::Now();
+    }
     pool_ = [[NSAutoreleasePool alloc] init];
     auto& ctx = MetalContext::Get();
     id<MTLCommandQueue> q = static_cast<id<MTLCommandQueue>>(ctx.command_queue());
@@ -205,8 +340,17 @@ class Encoder {
   void Finish() {
     [enc_ endEncoding];
     finished_ = true;
+    const double t_commit = prof_ ? vtprof::Now() : 0.0;
     [cmd_ commit];
     [cmd_ waitUntilCompleted];
+    if (prof_) {
+      const double t_done = vtprof::Now();
+      // GPUStartTime/GPUEndTime are only valid once the buffer has completed,
+      // which waitUntilCompleted just guaranteed.
+      const double gpu = [cmd_ GPUEndTime] - [cmd_ GPUStartTime];
+      vtprof::Get().Add(prof_name_, t_commit - t_ctor_, t_done - t_commit,
+                        gpu > 0.0 ? gpu : 0.0);
+    }
     VT_CHECK([cmd_ error] == nil,
              std::string("metal: command buffer failed: ") +
                  [[[cmd_ error] localizedDescription] UTF8String]);
@@ -216,6 +360,9 @@ class Encoder {
   id<MTLComputeCommandEncoder> enc_ = nil;
   size_t max_threads_ = 0;
   bool finished_ = false;
+  bool prof_ = false;
+  const char* prof_name_ = "";
+  double t_ctor_ = 0.0;
 };
 
 // ---------------------------------------------------------------------------

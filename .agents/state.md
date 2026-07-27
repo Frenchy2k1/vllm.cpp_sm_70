@@ -25273,3 +25273,47 @@ changed).
 **c1 speed A/B (one flock series, cold rep discarded, 8 prose+code prompts x 256 tok, input 512, greedy):** our OFF 10.24 tok/s (TPOT 97.6) / our ON eager-paged 28.65 (28.69,28.61) / **our ON GRAPHED 28.70 (28.70,28.70), TPOT 34.40** / vLLM-ON graphed steady-state **29.35 tok/s** (tight 3-rep 29.33/29.37/29.33, TPOT 34.07, acc_len 4.44); the D9 28.09 was a colder cross-session outlier. **VERDICT: NEAR-PARITY, ours 0.978x (~2% below)** on the rigorous same-session band (across sessions ours 28.70 falls inside vLLM's observed 28.09-29.37 range). ON/OFF 2.80x (vLLM ~2.98x); our OFF >= vLLM OFF. Per the acceptance rule ("below on any axis = an open gap; near-parity is NOT met") the >=vLLM bar is NOT met ⇒ SPEC-DFLASH stays `ACTIVE`. **ATTRIBUTION (supersedes the D9 hypothesis):** the CUDA graph is perf-NEUTRAL (+0.3% over eager-paged); the ACTUAL lever was the paged context read (C.1/C.2), which removed the D9/D12 per-layer `[context;block]` `IndexCopy` materialization of the whole growing context (O(context)/layer/step), lifting 25.75 (D9 materialized) -> 28.65 eager-paged (+11%) and CLOSING the vLLM gap 0.917x -> 0.978x. The roadmap's "the full CG closes the gap" premise is corrected by measurement: the paged read closed most of it; the graph is architectural parity, perf-neutral. Residual (~2%, data-grounded): NOT acceptance (ours ~3.68 accepted draft-tok/step > vLLM 3.44) and NOT launch/graph (both graphed) — per-step COMPUTE; the nsys of both draft steps (`--cuda-graph-trace=node`) is the concrete next lever (no premature ceiling — same arch, closeable).
 
 **Inertness — VERIFIED on the capture binary:** SACRED `test_qwen27_paged_engine` 235/235 + MTP `test_qwen27_spec_decode` 9/9 byte-identical; CUDA `-Werror` clean; no new CUDA kernel (reuses the D12-sanitized paged kernel + `IndexCopy`/`Embedding`/`MatmulBT`/`RmsNorm`/`RopeNeox`/`SiluAndMul`); `check-device-leakage` not increased (paged path REMOVES the materialized-buffer allocs + host uploads). `benchmark_binding=true`. **SPEC-DFLASH: correctness-complete (ratified near-tie); throughput NEAR-PARITY (0.978×) — the capture-correctness gate is MET, the ≥vLLM speed bar (a ~2% per-step-compute residual) is the sole remaining item ⇒ stays `ACTIVE`.** Raw logs on dgx `/tmp/d13_ab.log` (ours) + `/tmp/d13_vllm_on.log` (vLLM 1 rep) + task band (3 reps 29.33/29.37/29.33); harness `/tmp/d13_ab.sh`, `/tmp/d13_vllm_reps.sh`, `scripts/spec/vllm_dflash_timing.py`.
+---
+
+## 2026-07-27 — Metal dispatch attribution: the backend is SUBMIT bound, and the recorded lever ranking was wrong
+
+**Rows:** `BACKEND-METAL-MLX` (work row `M3c`), `BACKEND-GATE-METAL-MLXLM`.
+**Spec:** [metal-dispatch-attribution.md](specs/metal-dispatch-attribution.md).
+**Commit:** this change. **Box:** M4, commit `41d7f8d7`, all runs under the GPU lock.
+
+**Why this exists.** The Metal backend had **no execution trace**, because
+Instruments' Metal System Trace needs a full Xcode and the M4 has CLT only. Every
+Metal perf statement to date therefore rested on reading dispatch code, which
+AGENTS.md § "TRACE THE EXECUTION" explicitly says is necessary but not
+sufficient. `VT_METAL_PROFILE` closes that gap from inside the process.
+
+**The finding.** Native MSL arm, Qwen3-1.7B-bf16 p=512 g=128 b=1: **50,944
+dispatches**, submit+wait **33.882 s = 98.3% of the 34.47 s run**, real GPU busy
+**22.566 s = 66.6% of that**, host encode a negligible 0.213 s. The round-trip
+constant is **~186 us**, agreed by four independent near-zero-work kernels. At
+**~395 dispatches per decode token** that is a **~13.6 tok/s ceiling with
+infinitely fast kernels**, against MLX-LM's re-measured **27.9 tok/s**.
+
+**What it changes.** The M3b narrative named `M3c` and a simdgroup GEMM as
+co-equal next levers. **Corrected: `M3c` is the precondition and the GEMM lever
+cannot be cashed until it lands**, because the GEMM's ceiling sits above the
+dispatch ceiling. Work breakdown `M3c-1`..`M3c-4`, `M3d`, `M5b` in the spec.
+
+**Closed, not left open.** `GetReferenceTierHits()` = **0** in both arms: no op
+is silently running on the S5 portable CPU tier.
+
+**Also this pass.** MLX-LM floor **re-measured and reproduced** (+0.15% to +1.6%
+on generation, peak memory identical to three decimals, spread tightened to
+0.05%-0.28%), so the competitor line is now a reproduced number rather than a
+single observation.
+
+**Honest limits.** (1) The MLX-provider arm is **partially attributed** — MLX
+GEMMs bypass our `Encoder`, leaving 10.08 s of 20.55 s unaccounted (row
+`M3c-4`); do not quote it as complete. (2) Still **INDICATIVE, not binding**: the
+worker daemon and aerial wallpaper stayed up (no passwordless sudo). The
+gpu/wait ratios are contention-robust in a way absolute throughput is not, since
+both terms are measured inside the same dispatch. (3) The ~186 us is this box.
+
+**Next.** `M3c-1` (one command buffer per forward segment) then `M3c-2` (drop the
+per-op `waitUntilCompleted`), re-running the M3b oracle gate after each — a
+reordering that changes tokens is a bug, not a win.

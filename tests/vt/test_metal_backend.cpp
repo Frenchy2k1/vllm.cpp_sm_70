@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "vt/dtype.h"
+#include "vt/metal_profile.h"
 #include "vt/op_provider.h"
 
 #include "vllm/platforms/interface.h"
@@ -1054,5 +1055,61 @@ TEST_CASE("Metal kRopeFromCache is BIT-EXACT vs the CPU oracle") {
   // No in-kernel transcendental and no reduction, so the bits must be IDENTICAL.
   CHECK(gq == qcpu);
   CHECK(gk == kcpu);
+  metal.DestroyQueue(q);
+}
+
+// ===========================================================================
+// VT_METAL_PROFILE — the dispatch attribution facility itself
+// (.agents/specs/metal-dispatch-attribution.md). Instruments' Metal System
+// Trace needs a full Xcode that the project's Apple box does not have, so this
+// is the only execution trace available there; if it silently stopped counting,
+// every future Metal perf claim would lose its evidence base. Hence a test.
+TEST_CASE("Metal dispatch profile attributes host encode, wait and GPU busy") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+
+  const bool was_on = vt::metal::ProfileEnabled();
+  vt::metal::ResetProfile();
+  vt::metal::SetProfileEnabled(false);
+
+  // OFF: a dispatch must leave no row. This is the "costs nothing when off"
+  // half of the contract, asserted rather than assumed.
+  const int64_t n = 4096;
+  float* x = static_cast<float*>(metal.Alloc(n * sizeof(float)));
+  std::vector<float> host(static_cast<size_t>(n), -1.0f);
+  metal.Copy(q, x, host.data(), host.size() * sizeof(float));
+  Tensor t = Tensor::Contiguous(x, vt::DType::kF32, d, {n});
+  vt::Relu(q, t, t);
+  metal.Synchronize(q);
+  CHECK(vt::metal::GetProfileRows().empty());
+
+  // ON: the same dispatch must produce exactly one named row plus the total.
+  vt::metal::SetProfileEnabled(true);
+  vt::Relu(q, t, t);
+  metal.Synchronize(q);
+  std::vector<vt::metal::ProfileRow> rows = vt::metal::GetProfileRows();
+  REQUIRE(rows.size() >= 2);
+  const vt::metal::ProfileRow& total = rows.back();
+  CHECK(total.name.empty());
+  CHECK(total.count == 1);
+  // Every phase must be a real, non-negative duration, and the GPU can never
+  // have been busy LONGER than the wall time we blocked for. That ordering is
+  // the property the whole attribution rests on: if it inverted, the
+  // gpu/wait ratio driving the optimisation decisions would be meaningless.
+  CHECK(total.encode_s >= 0.0);
+  CHECK(total.wait_s > 0.0);
+  CHECK(total.gpu_s >= 0.0);
+  CHECK(total.gpu_s <= total.wait_s);
+  bool saw_relu = false;
+  for (const vt::metal::ProfileRow& r : rows) {
+    if (r.name == "vt_relu") saw_relu = true;
+  }
+  CHECK(saw_relu);
+
+  vt::metal::ResetProfile();
+  CHECK(vt::metal::GetProfileRows().empty());
+  vt::metal::SetProfileEnabled(was_on);
+  metal.Free(x);
   metal.DestroyQueue(q);
 }
