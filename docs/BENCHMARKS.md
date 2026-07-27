@@ -214,6 +214,36 @@ only structural difference left is our eager draft step vs vLLM's graphed one (o
 CUDA) is the sole un-landed increment. Raw logs dgx `/tmp/d9_ab.log` + `/tmp/d9_vllm_on.log`; harness
 `/tmp/dflash_ab.sh`, `/tmp/vllm_on.sh`, `scripts/spec/vllm_dflash_timing.py`.
 
+**DFlash D12 - A-wire (device store IS the production path, GPU-gated bit-identical) + Part B
+(`vt::DFlashPagedBlockAttention` capture-safe kernel, CPU==CUDA + sanitizer-0) LANDED; Part C (capture)
+remaining; speed UNCHANGED 0.917x (2026-07-27, `CLAIM-DFLASH-D12`, dgx GB10 sm_121a, pin
+`555967922`/vLLM 0.26.0.dev0).** `benchmark_binding=false` (the production path is bit-identical eager and
+Part B is not yet wired into the forward - nothing measured changed; the binding 0.917x A/B remains the D9
+number). D12 advanced the FULL uniform-(1+k) CUDA-graph build by two of its three parts, each independently
+GPU-gated on this build (`~/work/dflash-d12/tree/build-cuda`, one `flock $HOME/gpu.lock`):
+
+- **A-wire** makes the D11 Part-A `DflashDeviceKVStore` the PRODUCTION path (`runner.{h,cpp}`:
+  `dflash_kv_store_` -> `std::vector<std::shared_ptr<DflashDeviceKVStore>>`, reset -> `MakeDeviceKVStore`,
+  append -> `AppendContextKVDevice` (on-device projection, no D<->H round-trip), propose ->
+  `ForwardBlockLogitsWithDeviceKV` (device `IndexCopy` concat)). Bit-identical to the D9/D11 host path. GATE:
+  e2e `test_qwen27_dflash_spec_decode` **27/27** SAME tokens (all 4 prompts exact, acceptance 19/39/29/25) +
+  27B SACRED `test_qwen27_paged_engine` **235/235** + 27B MTP `test_qwen27_spec_decode` **9/9**
+  byte-identical; CUDA `-Werror` clean.
+- **Part B** adds `vt::DFlashPagedBlockAttention` (`OpId::kDFlashPagedBlockAttention`): the capture-safe
+  paged variant - STATIC grid over `(1+k)*num_reqs`, context as DATA (paged K/V + `seq_lens` +
+  `block_table`), EVERY metadata input a persistent DEVICE tensor read in place (NO function-local host
+  `cu_seqlens` upload = the `cuda_ops.cu:1277-1280` capture-UAF class fixed). Same f32 online-softmax + the
+  D2 in-block mask, bit-identical to `DFlashBlockAttention` over the materialized `[context;block]` buffer.
+  GATE: `tests/vt/test_ops_dflash_paged_block_attn.cpp` - CPU-paged == materialized `DFlashBlockAttention`
+  across 6 corners (non-causal, causal-SWA, block isolation, GQA, multi-page, zero-context) + CUDA==CPU
+  (f32+bf16) = **795648/795648 assertions PASS**; compute-sanitizer memcheck **0 errors**; 0 build warnings.
+
+**Part C remaining (the ONLY piece that moves the speed gate):** the static-shape capture (rework the draft
+forward onto persistent buffers + device mask-scatter, drive the block phase through Part B's paged kernel,
+`BeginCapture`/replay), then the c1 A/B our-ON-graphed vs vLLM-ON (`scripts/spec/vllm_dflash_timing.py`,
+>=2 reps, cold leg discarded); GATE ours >= vLLM (the CG should lift the ON/OFF ratio 2.60x->~2.91x, closing
+0.917x->>=1.0x). If >= vLLM -> SPEC-DFLASH DONE.
+
 **DFlash D11 - FULL-CG build OPENED; Part A device-store PRIMITIVE landed + CPU-bit-identity-GATED; speed
 UNCHANGED 0.917x.** `benchmark_binding=false` (NO new measurement - nothing in the measured production
 path changed this cycle). D11 opened the FULL uniform-(1+k) CUDA-graph build (the sole D9 residual). It

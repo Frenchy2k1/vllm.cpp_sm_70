@@ -494,7 +494,14 @@ class GPUModelRunner final : public ModelRunnerBase {
   // dflash_ctx_reqid_[i] tracks the occupant so a reused batch slot resets its
   // store; rejected drafts' rows are never appended (rollback = don't-append).
   // Indexed by the runner's condensed-dense batch row. Sized on set_dflash_draft.
-  std::vector<vllm::Qwen3DFlashModel::PrecomputedContextKV> dflash_kv_store_;
+  // D11 A-wire: the store is now the DEVICE-RESIDENT append-only draft-KV store
+  // (DflashDeviceKVStore, opaque, one shared_ptr per condensed-dense batch row).
+  // AppendContextKVDevice keeps the projected bf16 K/V on-device (no D<->H round
+  // trip) and ForwardBlockLogitsWithDeviceKV runs the block forward straight off
+  // the device store — bit-identical to the D9 host path, and the capture-ready
+  // substrate for Parts B/C. shared_ptr-to-incomplete is safe: MakeDeviceKVStore
+  // constructs the control block (with its deleter) in qwen3_dflash.cpp.
+  std::vector<std::shared_ptr<vllm::DflashDeviceKVStore>> dflash_kv_store_;
   std::vector<int32_t> dflash_ctx_len_;
   std::vector<std::string> dflash_ctx_reqid_;
   // Draft KV cache (`fa_draft` group) backing storage, owned by the runner and

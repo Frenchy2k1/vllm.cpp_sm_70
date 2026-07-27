@@ -1311,6 +1311,167 @@ void DFlashBlockAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query, 
 }
 
 // ---------------------------------------------------------------------------
+// DFlash PAGED in-block attention (SPEC-DFLASH D12 Part B) — the CAPTURE-SAFE form
+// of DFlashBlockAttentionKernel. Same block-cooperative f32 online-softmax
+// recurrence, but each (1+k) block query attends over [PAGED context ; its own
+// (1+k) block] with the context supplied as DATA: a paged K/V cache
+// ([pages, block_size, Hkv, D]) + per-request seq_lens (context length C_r) +
+// block_table (logical page -> physical page), mirroring PagedAttentionKernel's
+// paged read. Grid is STATIC over the fixed Nq=(1+k)*num_reqs query rows; EVERY
+// metadata input is a persistent device pointer read in place — NO cudaMallocAsync
+// / cudaMemcpyAsync of a function-local host buffer (the eager DFlash launcher's
+// cu_seqlens upload was the cudagraph-capture-bakes-stack-addresses UAF class).
+// The D2 mask is applied over the COMBINED index: context rows occupy combined
+// positions [0,C_r) (position-ordered) and block rows [C_r, C_r+blen_r), so a
+// query's combined offset is C_r+ii and the mask/order match the materialized
+// combined buffer bit-for-bit.
+template <typename Tin, typename Tout>
+__global__ void DFlashPagedBlockAttentionKernel(
+    Tout* out, const Tin* query, const Tin* block_key, const Tin* block_value,
+    const Tin* ctx_key, const Tin* ctx_value, const int32_t* cu, const int32_t* slen,
+    const int32_t* btbl, int num_reqs, int64_t hq, int64_t hk, int64_t d, int64_t block_size,
+    int64_t max_pages, int64_t ck_blk, int64_t ck_pg, int64_t ck_hd, float scale, bool causal,
+    int64_t window) {
+  const int64_t i = blockIdx.x;  // GLOBAL block-query row
+  const int64_t h = blockIdx.y;  // q-head
+  const int64_t g = h / (hq / hk);
+  int req = -1;
+  int64_t qs = 0, qe = 0;
+  for (int r = 0; r < num_reqs; ++r) {
+    if (i >= cu[r] && i < cu[r + 1]) {
+      qs = cu[r];
+      qe = cu[r + 1];
+      req = r;
+      break;
+    }
+  }
+  if (req < 0) return;  // padding row beyond the last request
+  const int64_t blen = qe - qs;
+  const int64_t C = slen[req];
+  const int64_t N = C + blen;  // combined key length
+  const int64_t ii_comb = C + (i - qs);
+  const int64_t jhi = causal ? ii_comb : (N - 1);
+  int64_t jlo = 0;
+  if (causal && window > 0) jlo = ii_comb - (window - 1) > 0 ? ii_comb - (window - 1) : 0;
+  const int64_t qoff = (i * hq + h) * d;
+
+  extern __shared__ float smem[];
+  float* acc = smem;                   // [d] running output accumulator
+  float* red = smem + d;               // [blockDim.x] reduction scratch
+  __shared__ float s_score, s_m, s_l;  // block-wide score / running max / denom
+  for (int64_t e = threadIdx.x; e < d; e += blockDim.x) acc[e] = 0.0f;
+  if (threadIdx.x == 0) {
+    s_m = -CUDART_INF_F;
+    s_l = 0.0f;
+  }
+  __syncthreads();
+
+  for (int64_t cj = jlo; cj <= jhi; ++cj) {
+    int64_t koff;
+    const Tin* ksrc;
+    const Tin* vsrc;
+    if (cj < C) {  // paged context key/value (k and v share the [pages,bs,Hkv,D] layout)
+      const int64_t page = btbl[req * max_pages + cj / block_size];
+      const int64_t off = cj % block_size;
+      koff = page * ck_blk + off * ck_pg + g * ck_hd;
+      ksrc = ctx_key;
+      vsrc = ctx_value;
+    } else {  // contiguous block key/value
+      const int64_t brow = qs + (cj - C);
+      koff = (brow * hk + g) * d;
+      ksrc = block_key;
+      vsrc = block_value;
+    }
+    float part = 0.0f;
+    for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
+      part += Load(query, qoff + e) * Load(ksrc, koff + e);
+    red[threadIdx.x] = part;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) s_score = red[0] * scale;
+    __syncthreads();
+
+    const float s = s_score;
+    const float m_new = fmaxf(s_m, s);
+    const float corr = expf(s_m - m_new);
+    const float p = expf(s - m_new);
+    for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
+      acc[e] = acc[e] * corr + p * Load(vsrc, koff + e);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      s_l = s_l * corr + p;
+      s_m = m_new;
+    }
+    __syncthreads();
+  }
+
+  const float inv = 1.0f / s_l;
+  for (int64_t e = threadIdx.x; e < d; e += blockDim.x) Store(out, qoff + e, acc[e] * inv);
+}
+
+template <typename Tin>
+void LaunchDFlashPagedBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query,
+                                     const Tensor& block_key, const Tensor& block_value,
+                                     const Tensor& ctx_key, const Tensor& ctx_value,
+                                     const Tensor& cu_seqlens, const Tensor& seq_lens,
+                                     const Tensor& block_table,
+                                     const DFlashPagedBlockAttentionArgs& args) {
+  const int64_t nq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = block_key.shape[1];
+  if (nq == 0 || hq == 0 || d == 0) return;
+  const int64_t block_size = args.block_size;
+  const int64_t max_pages = block_table.shape[1];
+  // Contiguous paged cache strides: [num_pages, block_size, Hkv, D].
+  const int64_t ck_blk = block_size * hk * d, ck_pg = hk * d, ck_hd = d;
+  const dim3 grid(static_cast<unsigned>(nq), static_cast<unsigned>(hq));
+  const size_t shmem = (static_cast<size_t>(d) + kBlock) * sizeof(float);
+  switch (out.dtype) {
+    case DType::kF32:
+      DFlashPagedBlockAttentionKernel<Tin, float><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<float>(), query.Ptr<Tin>(), block_key.Ptr<Tin>(), block_value.Ptr<Tin>(),
+          ctx_key.Ptr<Tin>(), ctx_value.Ptr<Tin>(), cu_seqlens.Ptr<int32_t>(),
+          seq_lens.Ptr<int32_t>(), block_table.Ptr<int32_t>(), args.num_reqs, hq, hk, d, block_size,
+          max_pages, ck_blk, ck_pg, ck_hd, args.scale, args.causal, args.sliding_window);
+      break;
+    case DType::kBF16:
+      DFlashPagedBlockAttentionKernel<Tin, __nv_bfloat16><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), block_key.Ptr<Tin>(),
+          block_value.Ptr<Tin>(), ctx_key.Ptr<Tin>(), ctx_value.Ptr<Tin>(),
+          cu_seqlens.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), block_table.Ptr<int32_t>(),
+          args.num_reqs, hq, hk, d, block_size, max_pages, ck_blk, ck_pg, ck_hd, args.scale,
+          args.causal, args.sliding_window);
+      break;
+    default: VT_CHECK(false, "cuda dflash-paged-block-attn: unsupported out dtype");
+  }
+  Check(cudaGetLastError(), "dflash-paged-block-attn launch");
+}
+
+void DFlashPagedBlockAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query,
+                                         const Tensor& block_key, const Tensor& block_value,
+                                         const Tensor& ctx_key, const Tensor& ctx_value,
+                                         const Tensor& cu_seqlens, const Tensor& seq_lens,
+                                         const Tensor& block_table,
+                                         const DFlashPagedBlockAttentionArgs& args) {
+  switch (query.dtype) {
+    case DType::kF32:
+      LaunchDFlashPagedBlockAttention<float>(AsStream(q), out, query, block_key, block_value,
+                                             ctx_key, ctx_value, cu_seqlens, seq_lens, block_table,
+                                             args);
+      break;
+    case DType::kBF16:
+      LaunchDFlashPagedBlockAttention<__nv_bfloat16>(AsStream(q), out, query, block_key,
+                                                     block_value, ctx_key, ctx_value, cu_seqlens,
+                                                     seq_lens, block_table, args);
+      break;
+    default:
+      VT_CHECK(false, "cuda dflash-paged-block-attn: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // AttentionDenseFast — a WARP-scoped variant of the AttentionKernel above with
 // the IDENTICAL online-softmax recurrence (flash-style, f32 accumulation), for
 // dense full/causal attention over small head_dim (the Qwen3-VL vision tower:
@@ -1605,6 +1766,9 @@ struct Registrar {
     RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernelCuda)));
+    RegisterOp(OpId::kDFlashPagedBlockAttention, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<DFlashPagedBlockAttentionFn>(&DFlashPagedBlockAttentionKernelCuda)));
     RegisterOp(OpId::kFusedChain, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernelCuda)));
   }

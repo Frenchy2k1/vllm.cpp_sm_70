@@ -2099,6 +2099,57 @@ void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tens
       q, out, query, key, value, args);
 }
 
+void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
+                               const Tensor& block_key, const Tensor& block_value,
+                               const Tensor& ctx_key, const Tensor& ctx_value,
+                               const Tensor& cu_seqlens, const Tensor& seq_lens,
+                               const Tensor& block_table,
+                               const DFlashPagedBlockAttentionArgs& args) {
+  VT_CHECK(query.rank == 3 && block_key.rank == 3 && block_value.rank == 3 && out.rank == 3,
+           "dflash-paged-block-attn: query/block_key/block_value/out rank-3 [Nq,Hq/Hkv,D]");
+  const int64_t nq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = block_key.shape[1];
+  VT_CHECK(block_key.shape[0] == nq && block_value.shape[0] == nq,
+           "dflash-paged-block-attn: block key/value row count must match query");
+  VT_CHECK(block_key.shape[2] == d && block_value.shape[2] == d && block_value.shape[1] == hk,
+           "dflash-paged-block-attn: block key/value head geometry mismatch");
+  VT_CHECK(out.shape[0] == nq && out.shape[1] == hq && out.shape[2] == d,
+           "dflash-paged-block-attn: out must be [Nq,Hq,D] matching query");
+  VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
+           "dflash-paged-block-attn: Hq must be a positive multiple of Hk (GQA broadcast)");
+  VT_CHECK(ctx_key.rank == 4 && ctx_value.rank == 4,
+           "dflash-paged-block-attn: ctx key/value rank-4 [pages,block_size,Hkv,D]");
+  VT_CHECK(ctx_key.shape[2] == hk && ctx_key.shape[3] == d && ctx_value.shape[2] == hk &&
+               ctx_value.shape[3] == d,
+           "dflash-paged-block-attn: ctx cache head geometry must match block");
+  VT_CHECK(args.scale > 0.0f, "dflash-paged-block-attn: scale must be set (> 0)");
+  VT_CHECK(args.num_reqs >= 1 && args.block_size > 0,
+           "dflash-paged-block-attn: num_reqs>=1 and block_size>0 required");
+  VT_CHECK(cu_seqlens.dtype == DType::kI32 && seq_lens.dtype == DType::kI32 &&
+               block_table.dtype == DType::kI32,
+           "dflash-paged-block-attn: cu_seqlens/seq_lens/block_table must be i32");
+  VT_CHECK(cu_seqlens.shape[0] == args.num_reqs + 1 && seq_lens.shape[0] == args.num_reqs,
+           "dflash-paged-block-attn: cu_seqlens[num_reqs+1] / seq_lens[num_reqs] required");
+  VT_CHECK(block_table.rank == 2 && block_table.shape[0] == args.num_reqs,
+           "dflash-paged-block-attn: block_table must be [num_reqs, max_pages]");
+  VT_CHECK(IsFloat(query.dtype) && block_key.dtype == query.dtype &&
+               block_value.dtype == query.dtype && ctx_key.dtype == query.dtype &&
+               ctx_value.dtype == query.dtype,
+           "dflash-paged-block-attn: query/block/ctx must share one float dtype");
+  VT_CHECK(IsOutFloat(out.dtype), "dflash-paged-block-attn: out must be f32 or bf16");
+  VT_CHECK(query.IsContiguous() && block_key.IsContiguous() && block_value.IsContiguous() &&
+               ctx_key.IsContiguous() && ctx_value.IsContiguous() && out.IsContiguous(),
+           "dflash-paged-block-attn: contiguous float tensors required");
+  VT_CHECK(query.device == q.device && ctx_key.device == q.device &&
+               cu_seqlens.device == q.device && seq_lens.device == q.device &&
+               block_table.device == q.device,
+           "dflash-paged-block-attn: device mismatch (tensors/queue)");
+  reinterpret_cast<DFlashPagedBlockAttentionFn>(
+      GetOp(OpId::kDFlashPagedBlockAttention, q.device.type))(
+      q, out, query, block_key, block_value, ctx_key, ctx_value, cu_seqlens, seq_lens, block_table,
+      args);
+}
+
 void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                      Tensor& v_cache, const Tensor& slot_mapping) {
   VT_CHECK(k.rank == 3 && v.rank == 3,

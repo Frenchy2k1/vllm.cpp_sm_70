@@ -1493,7 +1493,8 @@ void GPUModelRunner::propose_drafts_dflash(
     // Reset a reused dense slot (a new request now occupies this row).
     if (dflash_ctx_reqid_[static_cast<size_t>(i)] !=
         exec_state_.req_ids[static_cast<size_t>(i)]) {
-      dflash_kv_store_[static_cast<size_t>(i)] = {};
+      dflash_kv_store_[static_cast<size_t>(i)] =
+          Qwen3DFlashModel::MakeDeviceKVStore(*dflash_config_, queue_);
       dflash_ctx_len_[static_cast<size_t>(i)] = 0;
       dflash_ctx_reqid_[static_cast<size_t>(i)] =
           exec_state_.req_ids[static_cast<size_t>(i)];
@@ -1534,8 +1535,8 @@ void GPUModelRunner::propose_drafts_dflash(
       new_feats.insert(new_feats.end(), src, src + H);
       new_pos[static_cast<size_t>(j)] = static_cast<int32_t>(L + j);
     }
-    Qwen3DFlashModel::AppendContextKVHost(dflash_kv_store_[static_cast<size_t>(i)], new_feats,
-                                          new_pos, *dflash_weights_, *dflash_config_, queue_);
+    Qwen3DFlashModel::AppendContextKVDevice(*dflash_kv_store_[static_cast<size_t>(i)], new_feats,
+                                            new_pos, *dflash_weights_, *dflash_config_, queue_);
     dflash_ctx_len_[static_cast<size_t>(i)] = static_cast<int32_t>(L + append);
 
     // A discarded (still-prefilling chunk) row commits its chunk's features but
@@ -1569,30 +1570,25 @@ void GPUModelRunner::propose_drafts_dflash(
 
   if (!propose_rows.empty()) {
     const int P = static_cast<int>(propose_rows.size());
-    const int64_t Ldraft = dflash_config_->num_hidden_layers;
-    Qwen3DFlashModel::PrecomputedContextKV comb;
-    comb.k.assign(static_cast<size_t>(Ldraft), {});
-    comb.v.assign(static_cast<size_t>(Ldraft), {});
+    // D11 A-wire: run the block forward straight off the per-request DEVICE stores
+    // (ForwardBlockLogitsWithDeviceKV) — no host concat, no D<->H round-trip. The
+    // device-side IndexCopy concat reproduces the exact ascending-position layout
+    // the D9 host path built, so tokens+acceptance are bit-identical. ctx_cu =
+    // running sums of each store's on-device context length (DeviceKVNumCtx).
+    std::vector<vllm::DflashDeviceKVStore*> stores;
+    stores.reserve(static_cast<size_t>(P));
     std::vector<int32_t> ctx_cu = {0};
     int64_t total_ctx = 0;
     for (int r = 0; r < P; ++r) {
-      const Qwen3DFlashModel::PrecomputedContextKV& st =
-          dflash_kv_store_[static_cast<size_t>(propose_rows[static_cast<size_t>(r)])];
-      for (int64_t l = 0; l < Ldraft; ++l) {
-        comb.k[static_cast<size_t>(l)].insert(comb.k[static_cast<size_t>(l)].end(),
-                                              st.k[static_cast<size_t>(l)].begin(),
-                                              st.k[static_cast<size_t>(l)].end());
-        comb.v[static_cast<size_t>(l)].insert(comb.v[static_cast<size_t>(l)].end(),
-                                              st.v[static_cast<size_t>(l)].begin(),
-                                              st.v[static_cast<size_t>(l)].end());
-      }
-      total_ctx += st.num_ctx;
+      vllm::DflashDeviceKVStore* st =
+          dflash_kv_store_[static_cast<size_t>(propose_rows[static_cast<size_t>(r)])].get();
+      stores.push_back(st);
+      total_ctx += Qwen3DFlashModel::DeviceKVNumCtx(*st);
       ctx_cu.push_back(static_cast<int32_t>(total_ctx));
     }
-    comb.num_ctx = total_ctx;
     const std::vector<float> block_logits =
-        Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
-            comb, ctx_cu, blk_ids, blk_pos, blk_cu, *dflash_weights_, *dflash_config_, queue_);
+        Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+            stores, ctx_cu, blk_ids, blk_pos, blk_cu, *dflash_weights_, *dflash_config_, queue_);
     const std::vector<std::vector<int32_t>> drafts = SampleDflashBlockDrafts(
         block_logits, P, k, dflash_weights_->draft_vocab_size);
     for (int r = 0; r < P; ++r) {
