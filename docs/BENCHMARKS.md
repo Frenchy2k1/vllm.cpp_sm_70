@@ -2555,6 +2555,31 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal attention threadgroup width on Apple M4 (2026-07-27) - +2.3%
+
+Decode launches one threadgroup per (head, query token), which for a single token
+is just `hq` = 16 threadgroups — far too few to fill the GPU. The group was sized
+by `d` alone, capping it at 128 threads. Since the score loop now scales with
+SIMDGROUP count (one simdgroup per key), a wider group buys real parallelism
+there even though the V accumulation is still bounded by `d`.
+
+| threadgroup | throughput | attention GPU |
+|---|--:|--:|
+| `d` = 128 (before) | 19.07 tok/s | 1039 ms |
+| **`2d` = 256** | **19.51** (19.42 / 19.60) | **966 ms** |
+| `4d` = 512 | 18.66 | — |
+
+**2d is the optimum and 4d is worse than the baseline**, which locates the
+trade-off exactly: the score loop gains from more simdgroups, but the V loop uses
+only `d` threads, so beyond 2d the idle majority costs more than the scores gain.
+That also says what the real fix is — parallelising V across simdgroups, or
+flash-decoding style KV splitting — rather than more width.
+
+SACRED gate **16/16 unchanged, max gap still 0, no golden re-capture** (thread
+count does not change accumulation order).
+
+---
+
 ## Metal decode GEMV is at its practical limit (2026-07-27) - MLP increase NEUTRAL
 
 Two vector loads in flight per lane instead of one, to add memory-level

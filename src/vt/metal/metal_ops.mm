@@ -885,8 +885,14 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
                      "(the threadgroup accumulator is VT_PA_MAXD wide)");
   VT_CHECK(num_kv_heads > 0 && hq % num_kv_heads == 0,
            "metal paged_attention: q-heads must be a multiple of kv-heads");
-  const uint32_t tg =
-      ChooseThreadgroupSize(d, MetalContext::Get().PipelineMaxThreads("vt_paged_attention"));
+  // Decode launches one threadgroup per (head, query token), which for a single
+  // token is just `hq` threadgroups — 16 for a Qwen3-1.7B-class model, far too
+  // few to fill the GPU. Sizing the group by `d` alone caps it at 128 threads.
+  // The score loop now scales with SIMDGROUP count (one simdgroup per key), so
+  // a wider group buys real parallelism there even though the V accumulation is
+  // still bounded by `d`. Measured experiment, not an assumption.
+  const uint32_t tg = ChooseThreadgroupSize(
+      d * 2, MetalContext::Get().PipelineMaxThreads("vt_paged_attention"));
   PagedAttnParams p{
       static_cast<uint64_t>(k_cache.stride[0]), static_cast<uint64_t>(k_cache.stride[1]),
       static_cast<uint64_t>(k_cache.stride[2]), static_cast<uint64_t>(v_cache.stride[0]),
