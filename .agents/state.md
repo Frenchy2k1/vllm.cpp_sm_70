@@ -32524,3 +32524,27 @@ only the 27B/35B model keys, neither available here. A minimal serving driver fo
 the 4B on this host is the unblocking task.
 
 Evidence: [../docs/bench-evidence/w4-async-mirror-20260727.md](../docs/bench-evidence/w4-async-mirror-20260727.md).
+
+## 2026-07-27 (close) — OPEN LEAD from the same trace: cuBLASLt picks Ampere-class GEMM kernels on sm_120
+
+Recorded as a lead, NOT a claim, from `/tmp/w4-attrib.nsys-rep`. The two largest
+GPU kernels on the 4B workload are
+
+- `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8`,
+  1,664 instances, 2.099 s, **47.1%** of GPU kernel time;
+- `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_32x3_tn_align8`,
+  544 instances, 0.570 s, 12.8%.
+
+Both are `cutlass_80` — SM80 / Ampere-class tensorop kernels — selected by
+cuBLASLt's heuristic and executing on a Blackwell sm_120 device. The house
+parity-lever protocol already names this exact phenomenon (`nvjet_sm121` vs
+`cutlass_80`) as something only an execution trace reveals.
+
+Two reasons this is a LEAD and not a lever yet. First, these instance counts and
+the `_relu_` epilogue point at the PREFILL projections, and prefill is the axis
+we already PASS (TTFT 0.798x vs the oracle); the failing axis is TPOT. Second,
+nobody has checked what the vLLM oracle resolves to on the SAME workload on THIS
+device — if vLLM also lands on `cutlass_80` there is no gap to close, and the
+protocol is explicit that the oracle's trace, not ours alone, decides. The
+honest next step is a matched pair of traces (ours and vLLM's) on the identical
+corpus, diffed by kernel name, before anyone tries to force a tactic.
