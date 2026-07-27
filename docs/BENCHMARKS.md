@@ -184,6 +184,41 @@ recompute envelope) plus the uniform-1+k FULL CG. Repro: run
 `./build-cuda/tests/test_qwen27_dflash_spec_decode` under `flock` with the bf16-lm_head 27B snapshot
 (single-file `model.safetensors`) + the z-lab draft in the HF cache.
 
+**DFlash D7 - device-resident within-step draft forward: bit-identical, but the direct old-vs-new A/B
+= +2% (in-noise) REFUTES D6's download-gap hypothesis; our DFlash-ON is STILL ~33% below vLLM-DFlash-ON
+on this set (2026-07-27, `CLAIM-DFLASH-D7`, dgx GB10 sm_121a, oracle vLLM 0.26.0.dev0).**
+`benchmark_binding=true`. The within-step DFlash draft forward was made device-resident
+(`PrecomputeContextKVDevice` + `ForwardBlockLogitsWithContext` build `[context;block]` with device
+`vt::IndexCopy`/`IndexSelect` instead of ~30 host `Download`s/step), bit-identical (identity `bf16<->f32`
+round-trips replaced; e2e tokens unchanged). Workload: 27B NVFP4 single-file bf16 target (`890bdef7`) +
+z-lab 27B DFlash draft, reconstructed 8 prose+code prompts x 256 output tokens (the D6 8-prompt set was
+cleaned off the box; this set is more prose-heavy, so acceptance is lower and the absolute gap wider),
+greedy, c1, idle box under one `flock $HOME/gpu.lock`, cold leg discarded, >=2 reps (rep-stable).
+
+| axis (c1, median) | our OFF | our ON (D5/D6 host) | our ON (D7 device) | vLLM OFF graphed | vLLM ON graphed |
+|---|---|---|---|---|---|
+| Output throughput (tok/s) | 9.97 | 19.39 / 19.20 | **19.73 / 19.62** | 9.66 | 29.53 / 28.83 |
+| Median TPOT (ms) | 100.2 | 47.12 / 47.56 | **46.28 / 46.58** | 103.5 | 33.9 / 34.7 |
+| accepted draft-tok/step | - | 2.49 | 2.49 | - | ~3.13 (acc_len 4.08-4.18) |
+
+The decisive **old-vs-new device-residency A/B = +2.0% output-tput (19.68 vs 19.30 mean), IN-NOISE** -
+removing the ~30 host `Download`s/step gained ~2%, NOT the ~14% D6 attributed to them, so D6's
+"downloads = the gap" is REFUTED by direct measurement. vs vLLM-DFlash-ON graphed (29.2 tok/s mean /
+33.9-34.7 ms TPOT): **ours (19.68) is ~33% BELOW** on this set. OFF parity: our 9.97 >= vLLM 9.66 tok/s
+(our base engine matches/beats vLLM - the gap is DFlash-draft-specific). ON/OFF speedup: ours 1.97x,
+vLLM 3.02x. **Re-attributed residual (measured):** acceptance (ours 2.49 vs vLLM ~3.13 accepted
+draft-tok/step, bf16-irreducible near-tie drift over 256 tokens) + a per-step context-KV RECOMPUTE
+(O(context^2); D7 made it device-resident but did not eliminate it - that needs the cross-step
+persistent paged draft-KV store) + eager-vs-graphed. The full CUDA graph stays blocked on the persistent
+paged store (varying context length gives non-static shapes), and this A/B shows the download-elimination
+it would build on is not the dominant cost. Correctness bit-identical to D5: e2e
+`test_qwen27_dflash_spec_decode` 27/27, SAME tokens (2/4 STRICT + 2/4 near-tie at identical divergence
+points, acceptance 19/39/29/25). Inertness: 27B SACRED `test_qwen27_paged_engine` 235/235 + MTP
+`test_qwen27_spec_decode` 9/9 byte-identical; CUDA `-Werror` clean; compute-sanitizer memcheck 0 on
+`DFlashBlockAttention` (198412 assertions; no new kernel). **DONE speed bar (ours >= vLLM) NOT met;
+SPEC-DFLASH stays `ACTIVE`.** Repro: `~/dflash-d5/dflash_ab.sh <binary> on|off <label>` (ours) +
+`vllm_dflash_timing.py --mode spec-on --use-cudagraph` (vLLM) on `~/dflash-d5/dflash_bench8.json`.
+
 **DFlash D6 - c1 SPEED A/B: our DFlash-ON is a 2.5x speculative speedup over our OFF, but ~14% below
 vLLM-DFlash-ON (honest residual) (2026-07-27, `CLAIM-DFLASH-D6`, dgx GB10 sm_121a, oracle vLLM
 0.26.0.dev0).** `benchmark_binding=true` (the first DFlash throughput number). Workload: 27B

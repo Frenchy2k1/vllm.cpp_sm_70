@@ -25035,3 +25035,64 @@ honest form) + the c1 speculative speedup MEASURED (2.48x). The device-resident 
 (persistent paged draft-KV in its perf form + the FULL CG) is the remaining throughput-parity
 increment. Raw logs on dgx `/tmp/dflash_ab.log`, `/tmp/vllm_arm2.log`; scripts `/tmp/dflash_ab.sh`,
 `/tmp/vllm_arm.sh`.
+
+## 2026-07-27 — SPEC-DFLASH D7 (`CLAIM-DFLASH-D7`): within-step draft forward made DEVICE-RESIDENT (bit-identical); D6 download-hypothesis REFUTED by A/B; speed bar STILL NOT met, residual re-attributed to acceptance + context-KV recompute + graphing
+
+Branch `dflash-d7` off `origin/main` `755bb880`; isolated worktree `/home/mudler/_git/wt-dflash-d7`
+(edit) + dgx build/gate in the ONE reused tree `~/dflash-d5/vllm.cpp/build-cuda` (GB10 sm_121a, pin
+`555967922`/vLLM 0.26.0.dev0, `~/venvs/vllm-oracle`, all GPU work under one `flock $HOME/gpu.lock`).
+
+**What landed (bit-identical, source-owning — unlike D6):** the within-step DFlash draft forward is now
+DEVICE-RESIDENT. `src/vllm/model_executor/models/qwen3_dflash.cpp`: a new file-local
+`PrecomputeContextKVDevice` keeps each draft layer's projected K/V in bf16 device buffers
+(`std::vector<DBuf>`, no `Download`); `ForwardBlockLogitsWithContext` builds the `[context;block]`
+combined sequence with `vt::IndexCopy` (scatter this layer's device context K/V + the block q/k/v) and
+extracts the block-query outputs with `vt::IndexSelect`, replacing the D5 path's ~30 device→host
+`Download`s/step + host `std::vector` interleave + re-upload. The public `PrecomputeContextKV` (D3 kvprep
+gate host API) now wraps the device helper + downloads (unchanged behavior). Bit-identical by
+construction: the D5 `bf16→CastF32→Download→host→upload→CastBf16` is an identity round-trip of
+already-bf16 values, so the device `IndexCopy` places the SAME bits; no float op changed, same order.
+NO new CUDA kernel (reuses the pre-sanitized `IndexCopy`/`IndexSelect` + D2 `DFlashBlockAttention`).
+Grounded in `precompute_and_store_context_kv` (`qwen3_dflash.py:548-619`).
+
+**THE HEADLINE (honest, measurement-grounded):** the device-residency rewrite is correct + a clean
+architectural improvement, but the direct old-vs-new A/B shows it is NOT the speed lever, and the speed
+bar is STILL NOT met. Same box/model/flock, 8 prose+code prompts × 256 tok, greedy, c1, cold leg
+discarded, ≥2 reps (reconstructed dataset — the D6 8-prompt set was cleaned off the box; all arms run on
+THIS set):
+- **old-vs-new device-residency A/B: +2.0% output-tput** (our-ON-device 19.73/19.62 vs our-ON-host
+  19.39/19.20 tok/s; TPOT 46.3/46.6 vs 47.1/47.6 ms), IN-NOISE. **D6's "~13 downloads/step = the ~14%
+  gap" is REFUTED by direct measurement** — removing the ~30 host downloads gained ~2%. The draft-step
+  wall time is dominated by GPU compute (draft GEMMs + per-step context-KV recompute + the 248320-wide
+  lm_head), not download-sync latency.
+- **vs vLLM-DFlash-ON graphed = 29.53/28.83 tok/s / 33.9–34.7 ms TPOT:** ours (19.68) is **~33% BELOW**
+  on this set (more prose-heavy than D6's ⇒ acceptance ~2.5 vs 3.56 draft-tok/step ⇒ wider absolute gap).
+- **OFF parity: our 9.97 ≥ vLLM 9.66 tok/s** (TPOT 100.2 vs 103.5 ms) — base engine matches/beats vLLM;
+  the gap is DFlash-DRAFT-specific. ON/OFF: ours 1.97x, vLLM 3.02x.
+- **Re-attributed residual (measured, supersedes the D6 download hypothesis):** (1) acceptance — ours
+  ~2.49 vs vLLM ~3.13 accepted draft-tok/step (~20% fewer); our 2/4 near-tie divergences compound over
+  256 tok → lower-acceptance trajectory. bf16-IRREDUCIBLE (D6 RCA). (2) per-step context-KV RECOMPUTE —
+  O(context²) total vs vLLM's append-only paged store; D7 made it device-resident but did NOT eliminate
+  it (that = the cross-step persistent paged draft-KV store, a bigger multi-file increment). (3) eager
+  vs CUDA-graphed. FULL CG stays blocked on the persistent paged store (varying context ⇒ non-static
+  shapes); and this A/B shows the download-elimination it would build on is not the dominant cost anyway.
+
+**Correctness re-gate (bit-identical to D5):** e2e `test_qwen27_dflash_spec_decode` **27/27** — SAME
+tokens: 2/4 STRICT (fibonacci, three-laws), 2/4 near-tie flips at the IDENTICAL divergence points
+(France@11 got 2972 vs 11751; 17*23@12 got 567 vs 488, re-converges), acceptance 19/39/29/25 unchanged.
+
+**Inertness GREEN (config-gated, re-run on the D7 build):** 27B SACRED `test_qwen27_paged_engine`
+**235/235** (16/16 token-exact vs vLLM) + 27B MTP `test_qwen27_spec_decode` **9/9** byte-identical.
+CUDA `-Werror`/`-Werror=all-warnings` clean on the changed TU. NO new CUDA kernel ⇒ compute-sanitizer
+memcheck **0 errors** / 198412 assertions re-run on `DFlashBlockAttention`; `IndexCopy`/`IndexSelect`
+pre-sanitized (GDN mixed-spec). `check-device-leakage` not increased (change REMOVES `Download`s).
+Seven checkers green by bare RC.
+
+**DONE-bar disposition (NOT met):** correctness = ratified near-tie envelope (FINAL, bf16-irreducible);
+device-resident within-step forward LANDED + bit-identical; but our-DFlash-ON 19.68 tok/s is ~33% BELOW
+vLLM-DFlash-ON 29.2 tok/s on this set, so "on par or above" is NOT met. **SPEC-DFLASH stays `ACTIVE`.**
+Next increment = the **persistent paged draft-KV store** (append-only cross-step device KV; kills the
+O(context²) recompute) which then unblocks the FULL uniform-(1+k) CUDA graph. Acceptance is
+bf16-irreducible, so it stays at the ratified near-tie envelope. Reconstructed dataset on dgx
+`~/dflash-d5/dflash_bench8.json`; runner `~/dflash-d5/dflash_ab.sh`; timing harness
+`~/dflash-d5/vllm_dflash_timing.py`. NOT pushed; FULL SHA reported to caller.
