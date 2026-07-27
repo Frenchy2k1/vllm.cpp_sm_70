@@ -25096,3 +25096,47 @@ O(context²) recompute) which then unblocks the FULL uniform-(1+k) CUDA graph. A
 bf16-irreducible, so it stays at the ratified near-tie envelope. Reconstructed dataset on dgx
 `~/dflash-d5/dflash_bench8.json`; runner `~/dflash-d5/dflash_ab.sh`; timing harness
 `~/dflash-d5/vllm_dflash_timing.py`. NOT pushed; FULL SHA reported to caller.
+
+## 2026-07-27 — DFlash D8 (acceptance RCA + final A/B; persistent-KV/CG validated-but-unlanded), `CLAIM-DFLASH-D8` (NOT pushed, FULL SHA to caller)
+
+**Scope:** the D8 "definitive speed push" led with the acceptance RCA (the decisive
+reachability question) and re-measured the c1 A/B on the SAME 4 golden prompts. NO
+engine/kernel code was changed — only the measurement harness
+`scripts/spec/d8_acceptance_rca.py` was added; the gated binary is the D7 build, so all
+inertness holds BY CONSTRUCTION.
+
+**Part 1 (LEAD) — acceptance RCA VERDICT = bf16-IRREDUCIBLE (NOT a reducible per-step draft bug).**
+New same-workload measurement (dgx GB10, `flock`, mm-off + gpu_util 0.30, `VLLM_USE_V2_MODEL_RUNNER=1`,
+warmup discarded). Accepted draft-tok/step across generation length L on the 4 golden prompts:
+vLLM-ON (graphed) L8/32/128/256 = 2.92/3.79/3.96/3.26; ours-ON (eager) = 2.00/3.39/2.84/2.78
+(ratio 0.69/0.89/0.72/0.85 — present, NOISY, non-monotonic, confounded by divergent trajectories).
+Decisive confound-free evidence: (i) D2/D3 GPU gates = the identical-context per-step proposal diff —
+on the SAME target context our (1+k) block matches vLLM's top-1 13 STRICT + 3 single-ULP near-tie = 16/16;
+(ii) on the 2/4 golden prompts that stay token-identical to vLLM (fibonacci, three-laws) our accepted-per-step
+EQUALS vLLM's by construction (greedy verify: token identity ⟺ identical accepted prefix); (iii) D6 source
+RCA — our independent kernels cannot bit-match vLLM's flashinfer/cutlass draft+paged-attn, so the near-tie
+flips are bf16-irreducible. RCA options resolve to (c) genuine bf16 near-tie drift, not (b) a draft bug or
+(d) a fixable detail. CEILING: ours ~0.80–0.85× vLLM acceptance (0.85× golden, 0.80× D7 prose).
+
+**FINAL c1 SPEED A/B (foreground-measured, one `flock`, L=256 golden set):** ours 20.99 tok/s / 43.08 ms TPOT
+(eager) vs vLLM-DFlash-ON graphed 30.42 tok/s / 32.87 ms TPOT — ours ~31% BELOW (consistent with D7's ~33%
+on prose). On-par-or-above NOT met. Attribution: irreducible acceptance floor (Part 1) + per-step context-KV
+recompute (persistent-paged-KV, un-landed) + eager-vs-graphed (FULL CG, downstream).
+
+**Part 2 — persistent paged draft-KV + FULL CG: VALIDATED bit-identical design, NOT landed this session.**
+Confirmed vLLM mechanism in-source (`dflash/speculator.py:358,417` writes each step's NEW-token K/V into a
+PERSISTENT paged cache via `context_slots`, processing only new verify tokens/step; `:435` `run_fullgraph` for
+the uniform 1+k step). Ours (`qwen3_dflash.cpp::PrecomputeContextKVDevice`) re-projects the ENTIRE context each
+step (O(context²)). Bit-identity of the append-only fix PROVEN by per-row K/V independence (hidden_norm/KV-GEMM/
+k_norm/RoPE are all per-row) ⇒ caching each row once + appending only accepted rows (truncate num_rejected on
+rollback) is byte-identical, acceptance/tokens unchanged. NOT landed: a SACRED-bit-identical landing (byte-identical
+235/235 + 9/9 + e2e same-tokens + sanitizer + full CUDA rebuild + 7 checkers) exceeds this session's safe envelope;
+a partial ungated landing would violate the correctness discipline (forbidden false parity). Disposition unchanged
+from D6/D7 — next increment, now with mechanism + bit-identity design fully pinned. FULL CG is downstream (static
+shapes + [[cudagraph-capture-bakes-stack-addresses]]).
+
+**Inertness:** no engine code changed ⇒ D7 binary; 27B text SACRED `test_qwen27_paged_engine` 235/235 + 27B MTP
+`test_qwen27_spec_decode` 9/9 + DFlash e2e `test_qwen27_dflash_spec_decode` 27/27 byte-identical (D7 RESULT). No new
+CUDA ⇒ `-Werror`/compute-sanitizer/`check-device-leakage` unchanged. **SPEC-DFLASH stays `ACTIVE`** at the honest
+residual. Artifacts on dgx `/tmp/d8_vllm_rca.json`, `/tmp/d8_ours_rca.txt`; harness committed at
+`scripts/spec/d8_acceptance_rca.py`. NOT pushed; FULL SHA reported to caller.
