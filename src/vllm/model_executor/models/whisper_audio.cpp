@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -212,7 +213,31 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
     Tensor v3 = vb.tensor(); v3.rank = 3; v3.shape[0] = L; v3.shape[1] = nh; v3.shape[2] = hd;
     v3.stride[0] = nh * hd; v3.stride[1] = hd; v3.stride[2] = 1;
     Buf ao(b, q, DType::kBF16, {L, nh, hd});
-    vt::Attention(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
+    // Whisper encoder attention is FULL bidirectional (non-causal) over the fixed
+    // 1500-frame context. The naive vt::Attention (kAttention) is O(t^2) with a
+    // per-key block __syncthreads reduction — one CTA per (query,head) streaming all
+    // 1500 keys — so nsys attributes the overwhelming majority of the 32-layer
+    // encoder forward to it (the exact anti-pattern §7 fixed for the Qwen3-VL vision
+    // tower). Route to the warp-scoped online-softmax vt::AttentionDenseFast
+    // (head_dim 64, non-causal), the SAME kernel that beat vLLM's eager vision
+    // encode: one WARP per (query,head), the head_dim reduction a butterfly
+    // __shfl_xor (no __syncthreads), accumulator in registers — the IDENTICAL f32
+    // online-softmax recurrence within the bf16 envelope. kAttention (the text
+    // decode path, qwen3_5.cpp / voxtral text) is untouched ⇒ byte-identical by
+    // construction. Grounded 1:1 in vLLM's fast encoder attention:
+    // vllm/model_executor/models/whisper.py WhisperEncoderAttention (:255) ->
+    // forward (:298-317) self.attn(q,k,v) dispatches the encoder self-attention to
+    // the flash-attn varlen (non-causal, full) backend @ e24d1b24 — a
+    // fully-SM-filling flash kernel, never the O(t^2) scalar path. VT_WHISPER_ENC_EAGER=1
+    // restores the naive kernel for the same-binary A/B.
+    static const bool enc_eager = [] {
+      const char* e = std::getenv("VT_WHISPER_ENC_EAGER");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (enc_eager)
+      vt::Attention(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
+    else
+      vt::AttentionDenseFast(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
     // out_proj + residual.
     Tensor ao2 = ao.tensor(); ao2.rank = 2; ao2.shape[0] = L; ao2.shape[1] = H;
     ao2.stride[0] = H; ao2.stride[1] = 1;
