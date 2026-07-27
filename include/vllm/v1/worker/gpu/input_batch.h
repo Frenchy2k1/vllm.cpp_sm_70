@@ -235,6 +235,33 @@ class InputBatch {
   // writes it each step; add_request seeds it for a resumed/PD-disagg request
   // (0 < num_computed <= prefill_len) so its first decode reads the right id.
   std::vector<int32_t> last_sampled_tokens;
+  // ENG-ASYNC-SCHED W4: the ordered log of STRUCTURAL edits made to
+  // last_sampled_tokens since the runner last drained it — the seed at
+  // add_request, the row move at condense, the row swap at swap_states.
+  //
+  // On a DISCRETE GPU the authoritative copy of last_sampled_tokens is a device
+  // buffer (upstream keeps it device-resident on every platform,
+  // states.py:64), so the host no longer holds the VALUES those edits move
+  // around. It does know the INDICES, which is all a device replay needs. The
+  // runner drains this each step and applies it in stream order before the
+  // combine reads the buffer; see vt::cuda::LaunchApplyLastSampledOps.
+  //
+  // Upstream needs no equivalent because it never condenses: states.py:132
+  // returns a finished request's slot to a free list and the slot index is
+  // stable for the request's lifetime. This log is the price of our condensed
+  // dense batch, not a deviation in what the state MEANS.
+  //
+  // Inert unless the async runner path is engaged on a device that mirrors the
+  // array: the ops are recorded unconditionally (a few ints per admitted or
+  // finished request, off the per-token path) and simply discarded otherwise.
+  struct LastSampledOp {
+    enum Kind : int32_t { kSeed = 0, kMove = 1, kSwap = 2 };
+    int32_t kind = kSeed;
+    int32_t a = 0;      // seed/move destination, or the first swapped slot
+    int32_t b = 0;      // move source, or the second swapped slot
+    int32_t value = 0;  // seed value; unused by move/swap
+  };
+  std::vector<LastSampledOp> last_sampled_ops;
   // prefill_len[slot]: the number of tokens KNOWN at admission (prompt + any
   // pre-existing output = num_tokens() at add_request), fixed for the request's
   // lifetime. combine gates on seq_len > prefill_len to tell a decode row (splice

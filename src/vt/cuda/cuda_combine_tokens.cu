@@ -85,6 +85,29 @@ __global__ void ScatterLastSampledKernel(int32_t* last_sampled_tokens,
   last_sampled_tokens[req_state_idx] = static_cast<int32_t>(sampled_ids[i]);
 }
 
+// W4 structural replay (see combine_tokens.h). ONE thread, strictly in order:
+// the ops are dependent (a condense move can read a slot an earlier move wrote)
+// and there are a handful per step at most.
+__global__ void ApplyLastSampledOpsKernel(int32_t* last_sampled_tokens,
+                                          const int32_t* ops, int num_ops) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  for (int i = 0; i < num_ops; ++i) {
+    const int32_t kind = ops[4 * i + 0];
+    const int32_t a = ops[4 * i + 1];
+    const int32_t b = ops[4 * i + 2];
+    const int32_t value = ops[4 * i + 3];
+    if (kind == 0) {
+      last_sampled_tokens[a] = value;
+    } else if (kind == 1) {
+      last_sampled_tokens[a] = last_sampled_tokens[b];
+    } else if (kind == 2) {
+      const int32_t tmp = last_sampled_tokens[a];
+      last_sampled_tokens[a] = last_sampled_tokens[b];
+      last_sampled_tokens[b] = tmp;
+    }
+  }
+}
+
 }  // namespace
 
 void LaunchCombineSampledAndDraftTokens(Queue& queue, int32_t* input_ids,
@@ -110,6 +133,14 @@ void LaunchScatterLastSampled(Queue& queue, int32_t* last_sampled_tokens,
   ScatterLastSampledKernel<<<grid, kBlock, 0, AsStream(queue)>>>(
       last_sampled_tokens, sampled_ids, idx_mapping, num_reqs);
   Check(cudaGetLastError(), "ScatterLastSampledKernel launch");
+}
+
+void LaunchApplyLastSampledOps(Queue& queue, int32_t* last_sampled_tokens,
+                               const int32_t* ops, int num_ops) {
+  if (num_ops <= 0) return;
+  ApplyLastSampledOpsKernel<<<1, 1, 0, AsStream(queue)>>>(last_sampled_tokens, ops,
+                                                          num_ops);
+  Check(cudaGetLastError(), "ApplyLastSampledOpsKernel launch");
 }
 
 }  // namespace vt::cuda

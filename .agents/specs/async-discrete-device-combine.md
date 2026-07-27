@@ -117,7 +117,50 @@ removal/condensation hazard, and it would be latent rather than loud.
   must be watched (upstream pays a TTFT premium for async scheduling).
 - No 4B result implies anything about the 27B/35B release gates.
 
+## What was actually built (2026-07-27)
+
+Implemented as scoped, with three deviations worth recording because each was
+forced by something the spike did not anticipate:
+
+1. **The forward reads the device ids through a scoped override, not a
+   parameter.** `ModelForwardInput::device_token_ids` reaches the two Qwen3.5
+   registry forwards, which publish it as an RAII, thread-local
+   `detail::DeviceTokenIdsScope` that the embed consults. The alternative was a
+   defaulted pointer parameter on five entry points plus the decode-graph class.
+   The override is consumed on first use so a second, unrelated embed inside the
+   same forward (the multimodal helper embeds a prompt and then single tokens)
+   cannot pick up ids that were never meant for it.
+2. **The embed PATCHES a prefix rather than embedding the runner's buffer
+   directly.** The decode-graph path does not embed `token_ids` as given — it
+   embeds a version padded up to the captured batch size, real rows first. So
+   the correct operation is "overwrite the first `count` rows", which is right
+   for the padded case and degenerates to "overwrite everything" on the eager
+   path. Embedding the runner's buffer directly would have silently mis-shaped
+   the graph path.
+3. **The per-step uploads copy from PAGEABLE host memory on purpose.** The
+   spike said "pinned staging so the copies are real async copies". That is a
+   correctness trap here: pinned copies are truly asynchronous, so reusing one
+   staging buffer for the next upload can overwrite bytes an in-flight DMA has
+   not read, and with a depth-2 scheduler that window spans steps. For a
+   pageable source the driver stages the bytes before `cudaMemcpyAsync` returns,
+   so the source is immediately reusable. These arrays are a few kilobytes at
+   the front of a step; the staged copy is the better trade against per-upload
+   regions plus a per-step event.
+
+Also landed alongside: `VT_ASYNC_DEVICE_MIRROR=0`, the same-binary rollback that
+returns a discrete GPU to the pre-W4 host path WITHOUT disabling async scheduling
+(which `VT_ASYNC_RUNNER=0` would also do). That separation is what makes an
+honest A/B of W4 alone possible.
+
+W4e (the embedding barrier) landed as a persistent ring of flag slots with a
+deferred, event-queried check. The reporting contract changed deliberately and
+its test changed with it: an out-of-range id is now raised no later than the NEXT
+embedding on the queue, carrying the same message and the same id, instead of on
+the offending call. The gather itself is unchanged, so the offending call never
+read out of bounds either way.
+
 ## Status
 
-`SPIKE` — scoped here, not implemented. The 2026-07-27 post-pull revalidation
-must land first, because it re-measures the denominator this row is aimed at.
+`ACTIVE` — implemented; gates and the A/B are the closing step. Nothing here may
+be called DONE until the token-identity gate and the same-binary A/B are on the
+record.

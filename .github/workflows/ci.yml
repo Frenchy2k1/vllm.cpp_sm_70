@@ -144,3 +144,41 @@ jobs:
         run: cmake --build build -j 2
       - name: Test
         run: ctest --test-dir build --output-on-failure
+  sanitize-cpu:
+    # The DYNAMIC detector lanes (VLLM_CPP_SANITIZE, see CMakeLists.txt). The
+    # plain build-test-cpu job above proves the suite PASSES; it cannot see a
+    # read one past a tensor row, a use-after-free of an engine-owned container,
+    # a signed-overflow index computation, or an unsynchronized access between
+    # the serving threads — every one of which stays green under -O2 until it
+    # silently corrupts a token stream. These jobs run the SAME suite with
+    # ASan+UBSan and with TSan.
+    #
+    # Two jobs, not one: the runtimes are mutually exclusive. Both are CPU-tier
+    # (the lane refuses to configure with the CUDA backend on) and both are
+    # `continue-on-error` for their FIRST landing so a pre-existing finding
+    # cannot block unrelated work — the finding is triaged, then this flag is
+    # removed and the lane becomes binding. Removing it is tracked as the
+    # closing step of the hardening-adoption row.
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ["address,undefined", "thread"]
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          cmake -S . -B build-sanitize \
+            -DVLLM_CPP_BUILD_TESTS=ON \
+            -DVLLM_CPP_CUDA=OFF \
+            -DVLLM_CPP_SANITIZE='${{ matrix.lane }}'
+      - name: Build
+        run: cmake --build build-sanitize -j 2
+      - name: Test
+        # ctest runs the suite serially: the sanitizer runtimes multiply peak RSS,
+        # and a parallel run OOM-kills the runner before it reports a finding.
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+        run: ctest --test-dir build-sanitize --output-on-failure

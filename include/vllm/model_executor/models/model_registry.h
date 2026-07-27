@@ -217,6 +217,17 @@ struct ModelForwardInput {
   // tower/merge/MRoPE/DeepStack-conditioned decode. Default-nullopt keeps every
   // existing (text) call site byte-identical by construction.
   std::optional<MultiModalForwardInput> mm = std::nullopt;
+  // ENG-ASYNC-SCHED W4: when non-null, the [token_ids.size()] input ids already
+  // live in THIS device buffer and `token_ids` is stale for decode rows. The
+  // async runner's device combine spliced each decode row's sampled token here
+  // on the main queue, so the host copy never saw it — which is the whole point,
+  // since materializing it on the host is the synchronize W4 removes.
+  //
+  // A model that honors this embeds from the device pointer instead of uploading
+  // `token_ids`; a model that ignores it is simply never given one (the runner
+  // only sets it on the discrete-CUDA async path, which the Qwen3.5 gate vehicle
+  // owns). Null on every other path, so every other forward is byte-identical.
+  const int32_t* device_token_ids = nullptr;
 };
 
 using ModelConfigHook = void (*)(const HfConfig& config);

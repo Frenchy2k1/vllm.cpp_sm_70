@@ -547,6 +547,24 @@ The remaining recent-dense families are the trivial tail only: **Yi**
 (`YiForCausalLM`, a Llama alias) and **InternLM3** (`InternLM3ForCausalLM`,
 InternLM2 plus a sliding window).
 
+## Build and test lanes
+
+Alongside the default build, `-DVLLM_CPP_SANITIZE=address,undefined` and
+`-DVLLM_CPP_SANITIZE=thread` build the CPU tier under the dynamic detectors, and
+CI runs both as separate jobs. The lane refuses to configure with the CUDA
+backend on, because a host sanitizer runtime does not instrument nvcc device
+translation units and reports false positives against the CUDA driver; the CUDA
+tier's equivalent is `compute-sanitizer`, and `VT_POOL_BYPASS=1` makes the device
+scratch pool hand out exact-size, really-freed allocations so that tool can see
+tensor boundaries and use-after-free the caching pool otherwise hides.
+
+Known failing on discrete sm_120 (RTX 5070 Ti), pre-existing and not introduced
+by the lanes: `test_cuda_ops` "CUDA matmul (cuBLASLt) matches CPU on odd sizes"
+fails 11 of 442 elements on the bf16-in/bf16-out 17x31x13 case. Verified present
+on a pristine build of the same commit. The project's development GPU is GB10 /
+sm_121a, so this is an unattributed per-architecture numerics difference, not a
+regression.
+
 ## Performance detail
 
 **Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** revalidated on
