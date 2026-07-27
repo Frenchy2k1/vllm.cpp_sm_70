@@ -2555,6 +2555,36 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal GEMM: fatter simdgroup blocks and deeper K both REJECTED (2026-07-27)
+
+Two more attempts on `vt_matmul_bt_mm`, the whole remaining prefill gap at 642 ms
+/ 2.25 TFLOP/s against MLX steel's ~3.07. Both rejected, nothing landed.
+
+**32x32 per simdgroup (BN 64 -> 128, acc 4x2 -> 4x4).** The one structural
+difference from MLX that had never been tested: not tile width, which was
+excluded earlier, but how many fragments each SIMDGROUP accumulates. A 32x32
+block issues 16 mma from 8 fragment loads where 32x16 issues 8 from 6, cutting
+simdgroup_load traffic per FLOP by a third. Measured: GEMM **642 -> 2113 ms, 3.3x
+WORSE**; p=512 throughput 20.9 -> 16.5, TTFT 1351 -> 2880 ms. A regression that
+size is a spill, not a scheduling effect: 16 accumulator matrices plus 8 operand
+fragments exceed the register budget and land in thread-private memory. **The
+fattening direction is closed** — we are already at about the largest per-thread
+accumulator this GPU will hold.
+
+**BK 16 -> 32.** Halves the number of staging rounds and barriers per k loop.
+Measured: GEMM 642.3 vs 642.0 ms — no change at all, at either prompt length.
+Independent confirmation of the earlier barrier-traffic exclusion.
+
+Excluded as this GEMM's limiter, cumulatively: tile width, per-simdgroup block
+size (register-bound), barrier traffic, K-tile depth, staging latency, mma
+precision (half and bf16), and epilogue occupancy. Landed: staging vectorisation,
+per-simdgroup epilogue. **2.25 vs 3.07 TFLOP/s is still unexplained**, and there
+is no further identified lever. Prior "exhausted the levers" claims in this log
+were twice wrong, so this is a statement about what is currently identified, not
+a claim that nothing remains.
+
+---
+
 ## Metal GEMM: epilogue LDS cut 16 KB -> 2 KB, and bf16 tiles REJECTED (2026-07-27)
 
 Two experiments against the last big prefill item, `vt_matmul_bt_mm` at 653 ms
