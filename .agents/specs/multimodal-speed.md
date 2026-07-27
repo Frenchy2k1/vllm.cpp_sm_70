@@ -33,6 +33,17 @@ byte-identical by construction). **Per-image tower forward 2114 → 148 ms (14.3
 vs vLLM's ~250 ms eager encode we are now 0.59× — FASTER.** STRICT image e2e held
 **32/32** (4B + 27B), video **32/32**. See §7.
 
+**UPDATE 2026-07-27 (`CLAIM-MM-SPEED-DECODE-KERN`, §11) — the audio-decode ~20 ms residual
+ATTRIBUTED + a VALIDATED bf16-near-tie ceiling.** nsys of the graphed Voxtral decode: the
+whole residual is ONE kernel — the naive scalar `PagedAttentionKernel` decode attention
+(723 µs/call × 30 layers = 21.7 ms/step, ~120× the KV floor), NOT the GEMMs/glue. The 1:1 vLLM
+lever (FA2 varlen decode, `flash_attn_varlen_func`) is ALREADY in the binary, gated off only
+because the driver's single KV block (444) isn't ÷16. Enabling it: TPOT **59.4→38.2 ms/tok
+(−21.2, ~36%) = 0.94× vLLM's 40.8 ms — CLOSES AND BEATS the gap**, and teacher-forcing vLLM on
+the FA2 sequence PASSES (0 divergences, gap 0.0 — a valid greedy branch). BUT it flips the
+committed near-tie golden's exact-tie branch (`repro` 48→18), so it is blocked byte-exact.
+RECORDS-ONLY this pass (14/14 held, golden unchanged); win is one-line + golden-regen. See §11.
+
 ---
 
 ## 1. A-B methodology (how these numbers were grounded)
@@ -531,3 +542,115 @@ decode-graph class (the last mm text stack without one) — a prerequisite for b
 multi-seq mm decode (W2). mm rows stay **speed-pending / `PARTIAL`**: correctness-complete,
 audio decode now graphed with a small real win, still ~1.49× vs vLLM. No mm row advances
 to DONE.
+
+---
+
+## 11. DECODE-KERNEL EFFICIENCY — the ~20 ms residual ATTRIBUTED + a VALIDATED bf16-near-tie ceiling (`CLAIM-MM-SPEED-DECODE-KERN`, 2026-07-27)
+
+**Base:** `origin/main` `bbcaedd0` (the §10 W1 HEAD). **Build:**
+`dgx.casa:~/work/mm-audio-kern`, cutlass 4.5.0 + FA2 sm_121a + Triton-AOT, arch 121a (FA2
+ENABLED banner CONFIRMED at configure; clean `-Werror` link). All GPU under `flock /tmp/gpu`,
+sole owner (`nvidia-smi` idle, `local-ai-worker` absent), cold rep0 dropped. Oracle for
+teacher-forcing = `~/venvs/vllm-oracle-v0.25.0-stage` (vLLM **0.25.0** + mistral_common
+1.11.5, the golden-capture stack; the symlinked 0.26 `vllm-oracle-next` NOT used).
+
+§10 left the audio decode residual as "per-step COMPUTE/kernel efficiency, not launch
+overhead — nsys our graphed step vs vLLM's, port the divergent kernels 1:1." This section
+does exactly that. **Result: the residual is ONE kernel (the decode attention), the 1:1 vLLM
+port EXISTS and BEATS vLLM, but it is blocked byte-exact by the committed golden — a
+fully-characterized, teacher-force-VALIDATED bf16 near-tie ceiling.**
+
+### 11.1 W0 — ATTRIBUTION (measure, don't guess — [[profile-vllm-actual-kernels-port-1to1]])
+
+nsys `cuda_gpu_kern_sum` with `--cuda-graph-trace=node` over the full e2e (32-layer encoder
++ 388-tok prefill + 47 graphed decode steps; decode kernels isolated by instance count
+1410 = 30 text layers × 47 steps). The graphed **decode** step breaks down (per step, ×30
+layers):
+
+| Decode kernel | Instances | Avg | Per-step (×30) | Note |
+|---|---|---|---|---|
+| **`vt::cuda::PagedAttentionKernel` (scalar decode attn)** | **1410** | **723 µs** | **21.7 ms** | **THE residual** — ~120× the KV memory floor (~6 µs for 8 kv-heads × ~430 keys × 128 d bf16) |
+| `internal::gemvx::kernel` (cuBLAS bf16 GEMV: qkv/o/gate_up/down) | 7050+1410 | 36–204 µs | ~6 ms | near BW floor — cuBLAS, == vLLM's `F.linear` GEMV; NOT the gap |
+| `cutlass ...s16816gemm` (lm_head [1,3072]×[3072,131072]) | 48 | 3.38 ms | (per token) | ~BW floor (805 MB read / ~273 GB/s ≈ 2.95 ms); NOT the gap |
+| RmsNorm / SiluAndMul / RopeFromCache / ReshapeAndCache glue | 1440–2928 | 2–4 µs | <0.3 ms | negligible; the `vt::FusedChain` Add+RMSNorm already folds the norm glue |
+
+So the decode gap is NOT the GEMMs (cuBLAS `gemvx`, the same family as vLLM's decode
+`F.linear`, near-BW-floor), NOT RMSNorm/RoPE/activation glue, and NOT launch overhead
+(§10 graphed that away). It is the **decode ATTENTION kernel**: the naive scalar
+`PagedAttentionKernel` at **723 µs/call** — one CTA per (query, head) streaming all keys with
+a per-key block `__syncthreads` reduction (the exact O(t²)-sync anti-pattern §7 fixed for the
+vision tower), catastrophically underutilized at batch=1. vLLM runs decode attention on
+`flash_attn_varlen_func` (the flash-attn split-KV decode) — fast, fully SM-filling.
+
+### 11.2 W1 — the 1:1 vLLM lever is ALREADY IN THE BINARY, gated off by a block_size quirk
+
+Voxtral text decode is head_dim 128, GQA 32q/8kv, bf16, causal, no window — which matches the
+`fa2_decode_qwen3` dispatch (`cuda_paged_attn.cu:2620`) **exactly**. That path runs
+`LaunchDecodeVarlenFA2Bf16` — our vendored 1:1 of vLLM's `flash_attn_varlen_func` split-KV
+decode (`flash_fwd_splitkv_kernel`), DEFAULT-ON, and already "bit-matches vLLM's decode OUTPUT
+teacher-forced gap 0.0000" for Qwen3-dense (`qwen3-decode-strict-bitmatch.md`). It is the SAME
+production decode kernel the 27B (`fa2_decode_r6`) and 35B (`fa2_decode_r8`) paths use.
+
+**Why Voxtral missed it:** `fa2_decode_qwen3` requires `block_size % 16 == 0`, but
+`VoxtralGenerateGreedy` allocates ONE big KV block of `block_size = T0 + max_new_tokens + 8 =
+444` (for the 388-tok clip), and 444 % 16 = 12 ≠ 0 → decode fell through to the scalar
+`PagedAttentionKernel`. (Prefill's `fa2_prefill_qwen3` has no such check, so prefill already
+ran FA2 — 30 `flash_fwd_splitkv` instances @ 54 µs.) Rounding the single block up to a multiple
+of 16 (`((T0+max_new+8+15)/16)*16`, seq still fits one block, slot == abs_idx unchanged) routes
+decode through FA2. nsys of the FA2 arm confirms the swap: **`flash_fwd_splitkv` 1410 @ 18.5 µs
++ combine 1410 @ 3.1 µs = 0.65 ms/step (39× faster attention); zero `PagedAttentionKernel` left
+in decode.**
+
+### 11.3 RESULT — same-binary decode TPOT A/B (throwaway `block_size÷16` + `VT_FA2_DECODE_QWEN3` toggle)
+
+Steady-state TPOT (throwaway `steady_clock` around the decode loop, excludes the 2 cold+warm
+capture steps, 4 reps/mode, rep0 dropped; instrumentation NOT committed):
+
+| Vehicle | byte-exact NAIVE (ships) | FA2 varlen decode | Δ | vs vLLM 0.25.0 graphed 40.8 ms | `repro` |
+|---|---|---|---|---|---|
+| **Voxtral-Mini-3B audio (48 tok)** | **59.4 ms/tok** (59.25–59.53) | **38.2 ms/tok** (38.01–38.40) | **−21.2 ms/tok (~36%), NON-OVERLAPPING** | naive 1.46× → **FA2 0.94× — BEATS vLLM** | 48/48 vs **18/48** |
+
+The −21.2 ms A/B delta matches the nsys per-step attribution (21.7 ms `PagedAttentionKernel`)
+to within noise: the residual IS the decode-attention kernel, nothing else.
+
+### 11.4 CORRECTNESS — the RED line, and WHY the win cannot ship byte-exact
+
+The gate's binding assertion is `repro == 48`: our 48 tokens must byte-match the committed
+near-tie golden `voxtral_neartie.json::our_tokens` (captured on the scalar kernel). FA2 uses a
+different f32 reduction order → different bf16 rounding → it flips the golden's SOLE greedy
+branch (pos 33 is a **4-way EXACT tie, gap 0.000** — a 1-ULP logit change decides it), so
+`repro` drops 48→18 and `strict_prefix` 33→18 → **`repro==48` FAILS**. Per the RED line
+("golden md5 unchanged; a single token flip = wrong; fix, don't ratify") this is NOT shippable.
+
+**Is FA2 wrong, or just a different valid branch?** DEFINITIVELY the latter: teacher-forcing
+vLLM 0.25.0 on the FA2 sequence (`scripts/mm/a3_voxtral_neartie_gate.py`, `enforce_eager`,
+GMU 0.30, under flock) reports **0 divergent positions, worst gap 0.0000 nats, RESULT PASS** —
+every one of the 48 FA2 tokens IS vLLM's teacher-forced argmax. The scalar-kernel golden and
+the FA2 sequence are BOTH valid vLLM greedy branches (each teacher-forces to gap 0.0); they
+differ only in which side of the pos-33 exact tie they take, after which the divergent context
+yields different-but-equally-valid continuations. The `strict_prefix` 33→18 is that branch
+point moving earlier, NOT a correctness regression.
+
+Byte-exact shipped path re-verified on a clean rebuild of `bbcaedd0`: **`test_voxtral_e2e`
+14/14** (strict prefix 33/48, near-tie seq 48/48, worst gap 0.0), goldens md5 UNCHANGED
+(`voxtral_golden.json 8ab87b7e…`, `voxtral_neartie.json 3d199c2d…`, before == after).
+
+### 11.5 VERDICT — a fully-characterized, VALIDATED bf16 near-tie ceiling (RECORDS-ONLY)
+
+The audio decode gap is fully attributed and the 1:1 vLLM lever is validated: **routing Voxtral
+decode through FA2 varlen (a one-line `block_size÷16`) takes TPOT 59.4→38.2 ms/tok = 0.94× vLLM
+— it CLOSES AND BEATS the 1.49× gap — and the resulting sequence is a vLLM-valid greedy branch
+(teacher-force PASS, gap 0.0).** But it changes the bf16 near-tie resolution, so it does not
+reproduce the committed near-tie golden, which is pinned to the scalar kernel's exact bf16
+rounding. This is the [[near-tie-distributional-gate]] / [[dflash-correctness-done-speed-bf16-blocked]]
+family: the speed requires a reduction-order change the token-exact gate forbids, and there is
+NO byte-exact faster decode-attention kernel (every faster kernel — FA2 or the `PagedAttention
+DecodeOpt/Gqa` warp-shuffle kernels — changes the f32 reduction order). The IRREDUCIBLE-under-
+byte-exact-gate portion is the full **−21.2 ms/tok** (the win is entirely gated by the golden).
+
+Per the RED line this pass ships **RECORDS-ONLY** — no code change; the byte-exact scalar path
+stays default (14/14, golden unchanged, ~1.46–1.49× vLLM). **Reachable follow-on (recommended,
+needs user OK on the golden-change policy):** regenerate `voxtral_neartie.json::our_tokens` from
+the FA2 sequence + re-run `a3_voxtral_neartie_gate.py` (already PROVEN PASS, gap 0.0), then land
+`block_size÷16` — that claims a validated **~36% audio-decode win that BEATS vLLM** and closes
+the LAST mm speed gap. mm rows stay **speed-pending / `PARTIAL`**. No mm row advances to DONE.
