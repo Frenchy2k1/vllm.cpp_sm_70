@@ -549,6 +549,10 @@ InternLM2 plus a sliding window).
 
 ## Build and test lanes
 
+Benchmark provenance is gated as well as measured: both the comparison and the
+same-binary A/B harness refuse to start a leg on a GPU that is not idle, after
+a cooldown rather than before it.
+
 Alongside the default build, `-DVLLM_CPP_SANITIZE=address,undefined` and
 `-DVLLM_CPP_SANITIZE=thread` build the CPU tier under the dynamic detectors, and
 CI runs both as separate jobs. Verified end to end: the ASan+UBSan lane builds

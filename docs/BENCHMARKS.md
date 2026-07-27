@@ -4973,7 +4973,11 @@ of extra resident VRAM; today's nine ran at 0%. Both arms gained ~14% on the
 idle box, which is exactly why the ratio barely moved (0.9864x -> 0.9819x). The
 cause was a harness hole - `prepare_leg` gated idleness on
 `--query-compute-apps`, which cannot see a GRAPHICS consumer - now closed by an
-explicit `utilization.gpu` check (`GPU_IDLE_UTIL_MAX`, default 2%). The prior
+explicit `utilization.gpu` check (`GPU_IDLE_UTIL_MAX`, default 2%), carried by
+the new same-binary A/B harness `tools/bench/run_qwen35_4b_ab.sh` too - where
+running it promptly proved the gate works, refusing an arm at 14% because that
+harness sampled idleness BEFORE its inter-leg cooldown and so read the previous
+leg still draining; the cooldown now precedes the snapshot. The prior
 entry's RATIOS, its same-binary component attributions (H32 AOT **+4.5906%**,
 decode graph **+0.3873%**, ratio-4 FA2 **+1.6004%**) and its profiling
 attribution survive, because each was internal to one uniformly-contended series.

@@ -71,6 +71,12 @@ gpu_snapshot() {
 run_leg() {
   local name=$1 arm_env=$2 rep=$3
   local leg="$name-r$rep"
+  # Cooldown FIRST, then snapshot. Without it the second arm inherits the first
+  # arm's thermal and clock state and the A/B measures the order, not the toggle
+  # - and the idle check below would read the previous leg's GPU still draining
+  # and refuse to run at all, which is exactly what it did when this slept after
+  # sampling instead of before.
+  sleep "${COOLDOWN:-20}"
   gpu_snapshot "$out/$leg.gpu-before"
   if test -s "$out/$leg.gpu-before.compute-apps.csv"; then
     echo "GPU is not compute-idle before $leg" >&2
@@ -87,9 +93,6 @@ run_leg() {
       "${GPU_IDLE_UTIL_MAX:-2}%" >&2
     return 1
   fi
-  # Cooldown between legs: without it the second arm inherits the first arm's
-  # thermal/clock state and the A/B measures the order, not the toggle.
-  sleep "${COOLDOWN:-20}"
   printf '%s\n' "$arm_env" >"$out/$leg.env"
   # shellcheck disable=SC2086 # arm_env is a deliberate list of NAME=VALUE words
   env LD_LIBRARY_PATH="$ld_path" VT_RELEASE_HOST_WEIGHTS=1 \
