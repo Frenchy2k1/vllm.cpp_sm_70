@@ -361,6 +361,38 @@ runtime MSL compile). MSL's simdgroup_matrix supports half and float only.
 Staging as `half` would work but is REFUSED: half saturates at 65504 and
 activation outliers can exceed it, which trades a correctness hazard for speed.
 
+### OPEN LEAD: 64x64 with 8 simdgroups is 1.8x faster and currently WRONG
+
+The strongest unclosed lead for the parity goal. The failed 4-simdgroup 64x64
+attempt concluded it needed MORE THREADS rather than wider blocks; that form was
+then built and measured:
+
+| kernel | qkv 512x2048x2048 | mlp-up 512x2048x6144 | mlp-dn 512x6144x2048 |
+|---|--:|--:|--:|
+| shipped 32x32, 4 simdgroups | 990 GFLOP/s | 1019 | 1002 |
+| **64x64, 8 simdgroups (2x4)** | **1712** | **1907** | **1821** |
+| MLX steel (target) | 2640 | 3325 | 3293 |
+
+**1.8x, closing roughly half the distance to MLX.** Each simdgroup owns a 32x16
+quadrant = 4x2 blocks of 8x8, i.e. 8 accumulators, deliberately not the 16 that
+sank the 4-simdgroup version on occupancy. Threadgroup memory 20 KB
+(sa 2 + sb 2 + sc 16).
+
+**IT IS NUMERICALLY WRONG AND WAS NOT SHIPPED.** NMSE 0.994 (i.e. garbage) on
+f32 64x512x128 — a shape with NO ragged edge in M, N or K, so this is an indexing
+or synchronisation defect, not an edge-guard slip. Inspection of the tile
+coverage (sg_r = sgitg/4 over 2x32 rows, sg_c = sgitg%4 over 4x16 columns), the
+accumulator-to-`sc` mapping, the barrier order and every stride did not locate
+it. Recorded rather than guessed at further.
+
+**Where to start when picking this up:** the shipped 32x32/4-simdgroup kernel is
+correct, so diff the two and bisect the simdgroup mapping. Try the 4x2
+arrangement (sg_r = sgitg/2 over 4x16 rows, sg_c = sgitg%2 over 2x32 columns,
+acc[2][4]) as the alternate decomposition; if that is also wrong, the defect is
+in the staging or barrier structure rather than the mapping. Verify with
+`VT_MM_BENCH=1` for speed and the f32 64x512x128 arm for correctness — that arm
+catches this in one run.
+
 ### Risks/decisions
 
 - **Batching changes failure semantics (accepted, mitigated).** Today a failed

@@ -25894,3 +25894,33 @@ caught it correctly. The deliverable is the recommendation, not the re-routing.
 
 **Goal:** 14.25 of 27.9 tok/s. The best available configuration is now our own
 kernels with MLX OFF.
+
+---
+
+## 2026-07-27 — OPEN LEAD: 64x64 GEMM with 8 simdgroups is 1.8x and currently WRONG
+
+**Measured, not shipped.** The failed 4-simdgroup 64x64 attempt concluded it
+needed MORE THREADS rather than wider blocks. That form was built:
+
+| kernel | qkv | mlp-up | mlp-dn |
+|---|--:|--:|--:|
+| shipped 32x32, 4 sg | 990 GFLOP/s | 1019 | 1002 |
+| 64x64, 8 sg (2x4) | **1712** | **1907** | **1821** |
+| MLX steel (target) | 2640 | 3325 | 3293 |
+
+**1.8x, about half the remaining distance to MLX.** Each simdgroup owns a 32x16
+quadrant (8 accumulators, not the 16 that sank the 4-simdgroup version); 20 KB
+threadgroup memory.
+
+**It is numerically WRONG: NMSE 0.994 on f32 64x512x128**, a shape with no ragged
+edge in M, N or K, so an indexing or synchronisation defect rather than an edge
+guard. Tile coverage, accumulator-to-`sc` mapping, barrier order and strides were
+all inspected without locating it. Reverted; a broken kernel is worse than a slow
+one, and guessing further under time pressure is how a silent numeric bug ships.
+
+**Pick-up instructions are in the spec** (bisect against the correct 32x32
+kernel; try the 4x2 simdgroup decomposition; the f32 64x512x128 arm catches the
+defect in one run, and `VT_MM_BENCH=1` gives the speed in another).
+
+**Goal:** 14.25 of 27.9 tok/s. This lead, if fixed, is worth roughly half the
+remaining GEMM gap.
