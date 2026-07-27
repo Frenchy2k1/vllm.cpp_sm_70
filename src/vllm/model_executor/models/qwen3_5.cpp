@@ -6691,16 +6691,20 @@ static std::vector<float> BuildMropeCosSinHost(
 }
 
 namespace {
-int64_t VLArgMax(const std::vector<float>& logits, int64_t vocab) {
-  int64_t best = 0;
-  float bv = logits[0];
-  for (int64_t i = 1; i < vocab; ++i) {
-    if (logits[static_cast<size_t>(i)] > bv) {
-      bv = logits[static_cast<size_t>(i)];
-      best = i;
-    }
-  }
-  return best;
+// On-GPU greedy argmax: reduce the [1,vocab] f32 logits ON DEVICE and download
+// ONLY the winning int64 token id, instead of the full-vocab (~993 KiB) f32
+// D2H + a host argmax scan. Mirrors vLLM's greedy sampler device path
+// (src/vllm/v1/sample/sampler.cpp Sampler::sample -> vt::GreedyArgmax; upstream
+// vllm/v1/sample/ops greedy). vt::GreedyArgmax uses the LOWEST-index tie-break
+// (torch.argmax), byte-for-byte the same winner the old host scan produced, so
+// the greedy token stream is unchanged. The host argmax is GONE — this is the
+// ONLY greedy path on the mm decode loop (multimodal-speed.md §5 #2).
+int32_t VLArgMaxDevice(Dev d, DBuf& dlogits) {
+  DBuf ids(d, DType::kI64, {1});
+  vt::GreedyArgmax(d.q, ids.t(), dlogits.t());
+  int64_t id = 0;
+  ids.Download(d, &id);
+  return static_cast<int32_t>(id);
 }
 }  // namespace
 
@@ -6725,7 +6729,6 @@ static std::vector<int32_t> VLGenerateCoreGdn(
     const HfConfig& config, int max_new_tokens) {
   Backend& backend = d.b;
   const int64_t H = config.hidden_size;
-  const int64_t vocab = config.vocab_size;
   const int64_t Hkv = config.num_key_value_heads;
   const int64_t Dh = config.head_dim;
   const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
@@ -6862,9 +6865,7 @@ static std::vector<int32_t> VLGenerateCoreGdn(
                                       attn_kv, gdn_state, weights, config,
                                       last_idx, /*hidden_tap=*/nullptr,
                                       &mrope_prefill);
-    std::vector<float> logits(static_cast<size_t>(vocab));
-    dlogits.Download(d, logits.data());
-    generated.push_back(static_cast<int32_t>(VLArgMax(logits, vocab)));
+    generated.push_back(VLArgMaxDevice(d, dlogits));
   }
 
   // ---- DECODE: one token/step; MRoPE positions equal on all 3 axes (text). ----
@@ -6877,21 +6878,17 @@ static std::vector<int32_t> VLGenerateCoreGdn(
     const std::vector<float> mrope_dec = BuildMropeCosSinHost(pos3_dec, 1, config);
 
     const std::vector<int32_t> one_id = {generated.back()};
-    std::vector<uint16_t> tok_bits(static_cast<size_t>(H));
-    {
-      DBuf hemb(d, DType::kBF16, {1, H});
-      DenseEmbedInto(d, hemb, one_id, weights, config);
-      hemb.Download(d, tok_bits.data());
-    }
-    DBuf tok(d, DType::kBF16, {1, H}, tok_bits.data());
+    // Embed the fed token ON DEVICE and hand it straight to the forward — no
+    // D2H->H2D round-trip (the old path Downloaded the [1,H] embed to host only
+    // to re-Upload it as a fresh DBuf). The token embed never leaves the device.
+    DBuf tok(d, DType::kBF16, {1, H});
+    DenseEmbedInto(d, tok, one_id, weights, config);
     const CommonAttentionMetadata am = attn_meta(1, abs_idx);
     const GDNAttentionMetadata gm = gdn_decode_meta();
     DBuf dlogits = DenseForwardLayers(d, tok.t(), pos1d_dec, am, gm, attn_kv,
                                       gdn_state, weights, config, {},
                                       /*hidden_tap=*/nullptr, &mrope_dec);
-    std::vector<float> logits(static_cast<size_t>(vocab));
-    dlogits.Download(d, logits.data());
-    generated.push_back(static_cast<int32_t>(VLArgMax(logits, vocab)));
+    generated.push_back(VLArgMaxDevice(d, dlogits));
   }
   return generated;
 }

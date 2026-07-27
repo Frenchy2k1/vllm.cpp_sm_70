@@ -61,12 +61,6 @@ std::vector<uint16_t> F32ToBf16Bits(const float* p, int64_t n) {
 void RoundToBf16(std::vector<float>& v) {
   for (float& x : v) x = vt::BF16ToF32(vt::F32ToBF16(x));
 }
-int64_t ArgMax(const std::vector<float>& logits) {
-  int64_t am = 0;
-  for (int64_t v = 1; v < static_cast<int64_t>(logits.size()); ++v)
-    if (logits[static_cast<size_t>(v)] > logits[static_cast<size_t>(am)]) am = v;
-  return am;
-}
 
 // Single-sequence CommonAttentionMetadata (mirror qwen3_vl.cpp StepMeta).
 CommonAttentionMetadata StepMeta(int64_t T, int64_t seq_len, int64_t first_slot) {
@@ -121,19 +115,26 @@ void RunTextLayer(Dev d, const Qwen3DenseLayerWeights& layer, const HfConfig& cf
 }
 
 // Forked dense forward from a merged inputs_embeds: N layers -> final RMSNorm ->
-// UNTIED lm_head, returning the LAST row's logits [vocab] host f32. Mirrors
-// qwen3.cpp ForwardBody but (1) starts from provided embeds and (2) always untied.
-std::vector<float> ForwardLastLogits(Dev d, const std::vector<uint16_t>& embeds_bf16,
-                                     const std::vector<int32_t>& positions, int64_t T,
-                                     const CommonAttentionMetadata& meta,
-                                     const std::vector<PagedKvCache>& attn_kv,
-                                     const Qwen3DenseWeights& weights,
-                                     const HfConfig& config) {
+// UNTIED lm_head, returning the LAST row's logits [1,vocab] f32 ON DEVICE.
+// Mirrors qwen3.cpp ForwardBody but (1) starts from provided device embeds and
+// (2) always untied. The logits stay on device so the caller can run the greedy
+// argmax there (no full-vocab D2H); the input embeds are a device Tensor so the
+// decode path feeds the on-device token embed straight in (no D2H->H2D).
+DBuf ForwardLastLogits(Dev d, const Tensor& hidden_in,
+                       const std::vector<int32_t>& positions, int64_t T,
+                       const CommonAttentionMetadata& meta,
+                       const std::vector<PagedKvCache>& attn_kv,
+                       const Qwen3DenseWeights& weights,
+                       const HfConfig& config) {
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
 
-  DBuf hidden(d, DType::kBF16, {T, H}, embeds_bf16.data());
+  // Working copy (device->device): RunTextLayer mutates `hidden`, so it must not
+  // alias the caller's embed buffer.
+  DBuf hidden(d, DType::kBF16, {T, H});
+  d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
+           static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
   DBuf res(d, DType::kBF16, {T, H});
   res.Zero(d);
 
@@ -158,10 +159,20 @@ std::vector<float> ForwardLastLogits(Dev d, const std::vector<uint16_t>& embeds_
   Tensor lm = ResidentWeight(d, weights.lm_head);  // [H, vocab]
   DBuf logits(d, DType::kF32, {1, vocab});
   vt::Matmul(d.q, logits.t(), last.t(), lm);
+  return logits;
+}
 
-  std::vector<float> out(static_cast<size_t>(vocab));
-  logits.Download(d, out.data());
-  return out;
+// On-GPU greedy argmax: reduce the [1,vocab] f32 logits ON DEVICE and download
+// ONLY the winning int64 token id, instead of the full-vocab f32 D2H + a host
+// argmax scan. Mirrors vLLM's greedy sampler device path (vt::GreedyArgmax);
+// LOWEST-index tie-break (torch.argmax), byte-for-byte the same winner the host
+// scan produced, so the greedy token stream is unchanged (multimodal-speed.md §5 #2).
+int32_t ArgMaxDevice(Dev d, DBuf& dlogits) {
+  DBuf ids(d, DType::kI64, {1});
+  vt::GreedyArgmax(d.q, ids.t(), dlogits.t());
+  int64_t id = 0;
+  ids.Download(d, &id);
+  return static_cast<int32_t>(id);
 }
 
 // --- weight loading helpers -----------------------------------------------------
@@ -414,31 +425,34 @@ std::vector<int32_t> VoxtralGenerateGreedy(
   std::vector<int32_t> pos_prefill(static_cast<size_t>(T0));
   for (int64_t t = 0; t < T0; ++t) pos_prefill[static_cast<size_t>(t)] = static_cast<int32_t>(t);
   const CommonAttentionMetadata pm = StepMeta(T0, T0, 0);
-  std::vector<float> logits =
-      ForwardLastLogits(d, merged_bits, pos_prefill, T0, pm, attn_kv, weights.text, config);
-
   std::vector<int32_t> generated;
-  int32_t next = static_cast<int32_t>(ArgMax(logits));
+  int32_t next;
+  {
+    DBuf merged(d, DType::kBF16, {T0, H}, merged_bits.data());
+    DBuf dlogits =
+        ForwardLastLogits(d, merged.t(), pos_prefill, T0, pm, attn_kv, weights.text, config);
+    next = ArgMaxDevice(d, dlogits);
+  }
   generated.push_back(next);
 
-  // DECODE: one token per step (no audio), 1-D position abs_idx.
+  // DECODE: one token per step (no audio), 1-D position abs_idx. The fed token is
+  // embedded ON DEVICE and handed straight to the forward — no D2H->H2D embed
+  // round-trip — and the greedy pick runs on-GPU (no full-vocab logits D2H).
   for (int step = 1; step < max_new_tokens; ++step) {
     if (next == eos_token_id) break;
     const int64_t abs_idx = T0 + (step - 1);
-    std::vector<uint16_t> tok_emb(static_cast<size_t>(H));
+    DBuf emb(d, DType::kBF16, {1, H});
     {
       const std::vector<int32_t> one = {next};
       DBuf ids(d, DType::kI32, {1}, one.data());
-      DBuf emb(d, DType::kBF16, {1, H});
       Tensor tab = ResidentWeight(d, weights.text.embed_tokens, {config.vocab_size, H});
       vt::Embedding(d.q, emb.t(), tab, ids.t());
-      emb.Download(d, tok_emb.data());
     }
     const std::vector<int32_t> pos1 = {static_cast<int32_t>(abs_idx)};
     const int64_t seq_len = abs_idx + 1;
     const CommonAttentionMetadata dm = StepMeta(1, seq_len, abs_idx);
-    logits = ForwardLastLogits(d, tok_emb, pos1, 1, dm, attn_kv, weights.text, config);
-    next = static_cast<int32_t>(ArgMax(logits));
+    DBuf dlogits = ForwardLastLogits(d, emb.t(), pos1, 1, dm, attn_kv, weights.text, config);
+    next = ArgMaxDevice(d, dlogits);
     generated.push_back(next);
   }
   return generated;

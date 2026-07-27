@@ -296,78 +296,63 @@ and `image_url` ingestion) and the audio our-side measurement (§5 lever #4).
 
 ---
 
-## 8. 2026-07-27 pass — environment-blocked; refined lever-#2 attribution + dgx handoff
+## 8. DECODE SAMPLING — lever #2 executed (`CLAIM-MULTIMODAL-SPEED-DECODE`, 2026-07-27)
 
-**Status: NO NEW MEASUREMENT. This pass ran on the DEV BOX (`mudler-ubuntu-box`),
-not the dgx.** The box has NO NVIDIA GPU (virtual VGA only, no `/dev/nvidia*`, no
-`nvcc`, no CUDA toolkit), the dgx is unreachable (`dgx` hostname does not resolve;
-`prem-vm` proxy handshake fails), NO `~/venvs/vllm-oracle*` exists, and the root disk
-is **99 % full (5.7 GiB free)** — so a CUDA build, an nsys profile, the vLLM oracle,
-and the correctness-gate re-run are ALL impossible here, and even a CPU build is
-disk-infeasible. No repo CODE was touched, no gate was run, no number was produced;
-this pass is a code-verified attribution refinement + a paste-ready dgx handoff so the
-next GPU-equipped agent starts from an exact recipe rather than re-deriving it. Nothing
-advances to DONE; all three mm rows stay `PARTIAL` / speed-pending, exactly as §6.
+**Base:** `origin/main` `f2facf3c`. **Build:** `dgx.casa:~/work/mm-argmax-speed`,
+cutlass 4.5.0 + FA2 + Triton-AOT, arch 121a (FA2 banner confirmed, clean configure).
+All GPU under `flock $HOME/gpu.lock`, sole owner, cold rep0 discarded.
 
-### 8.1 Lever #2 attribution — the exact per-token host round-trips (verified from OUR source)
+**What §5 lever #2 asked for, closed:** the mm eager greedy decode loops
+`VLGenerateCoreGdn` (`qwen3_5.cpp`, the shared 27B image+video core) and
+`VoxtralGenerateGreedy` (`voxtral.cpp`) now (a) run the greedy pick ON the GPU via
+`vt::GreedyArgmax` (device vocab reduction, download only the winning int64 id —
+not the full `[1,vocab]` f32 logits) and (b) embed the fed decode token ON DEVICE
+and hand it straight to the forward, eliminating the redundant embed D2H→H2D
+round-trip. The host `VLArgMax`/`ArgMax` scans are REMOVED — the device argmax is
+the ONLY greedy path (proof-of-run: the gates below cannot pass unless it ran).
 
-Read directly from the tree (not inferred). Per DECODE step both eager mm drivers do,
-in order:
+### 8.1 Grounding (ours + vLLM, file:line)
+- Ours: `vt::GreedyArgmax` (`src/vt/ops.cpp:2574`; CUDA two-pass lowest-index-tie
+  reduction `src/vt/cuda/cuda_sample.cu:83-215`) — the SAME device sampler the
+  production paged runner uses (`src/vllm/v1/sample/sampler.cpp:315-318`).
+- vLLM: greedy sampler path `vllm/v1/sample/sampler.py` (`sample`→`greedy_sample`,
+  `torch.argmax(logits, dim=-1)`, lowest-index tie). Our `GreedyArgmax` mirrors the
+  lowest-index tie-break exactly, so the winning token is byte-for-byte the token
+  the removed host scan produced.
 
-1. **Host MRoPE build** — `BuildMropeCosSinHost` on the CPU each step
-   (`qwen3_5.cpp:6877`; for text-continuation decode it is a `[1, rotary_dim=64]`
-   cache of `std::pow`/`std::cos`/`std::sin`, cheap but host-serial). Voxtral has no
-   MRoPE (plain 1-D rope), so its decode omits this.
-2. **Embed D2H→H2D round-trip** — `DenseEmbedInto` writes the fed token's `[1,H=5120]`
-   bf16 embedding to a device buffer, then `hemb.Download(...)` copies it to host
-   (`qwen3_5.cpp:6884`), and the very next line re-uploads it as a fresh `DBuf`
-   (`:6886`). The embedding is produced on-device and immediately round-tripped
-   through the host for no reason — a pure redundant D2H+H2D of ~10 KB each way.
-   Voxtral is identical (`voxtral.cpp:435` download, re-upload following).
-3. **Full-vocab logits D2H + host argmax** — `dlogits.Download(...)` copies the whole
-   `[1, vocab=248 320]` f32 logits row to host (~993 KB) (`qwen3_5.cpp:6893`), then
-   `VLArgMax` scans all 248 320 floats on the CPU (`:6894`, defined `:6694`). Voxtral:
-   `logits.Download` (`voxtral.cpp:163` inside the forward) + host `ArgMax`
-   (`voxtral.cpp:64`, called `:421/:441`).
+### 8.2 CORRECTNESS (the RED line — HELD, bit-exact)
+The change is bit-identical BY CONSTRUCTION: the removed embed round-trip was a
+LOSSLESS bf16 D2H→H2D (same bits), and the device argmax reduces the SAME f32
+logits with the SAME lowest-index tie-break as the host scan (argmax winner is
+comparison-reduction, order-independent). Verified on a clean dgx build of
+`f2facf3c`, goldens md5-identical before+after:
+- **27B image `test_qwen3_5_vl_e2e`: STRICT 32/32** (54/54 assertions).
+- **27B video `test_qwen3_5_vl_video_e2e`: STRICT 32/32** (27/27, teacher-forced gap 0 nats).
+- **4B image `test_qwen3vl_e2e` (unchanged code): STRICT 32/32** (46/46) — no collateral.
+- **Voxtral audio `test_voxtral_e2e`: PASS 14/14** — reproduces the committed
+  near-tie sequence **48/48** exactly, strict prefix 33/48. Both the device path
+  AND the (throwaway A/B) host path produce the identical 48 tokens.
 
-vLLM keeps all of this on-device (logits stay in the sampler, argmax/sampling is a GPU
-kernel, the sampled id is embedded on-device without a host hop) and replays the decode
-under `cudagraph_mode FULL_AND_PIECEWISE`. At **c1-27B these host hops are ~1–3 ms/token,
-invisible under the 226 ms/token weight-streaming compute floor** (§2.1) — which is why
-lever #2 measured NEUTRAL there. They become a real lever only where the decode compute
-is cheap enough to un-hide them: **Voxtral audio (~41 ms/token, §2.3)** and **c2+** (where
-the per-step host serialization also blocks batching). This confirms the §3/§5 premise
-with exact anchors; it does not change the ranking.
+### 8.3 RESULT — decode TPOT A/B (same-binary, throwaway env toggle `VT_MM_HOST_ARGMAX`)
+Same-binary A/B (dgx-only throwaway instrumentation, NOT committed): `DEV_NEW` =
+shipped device path, `HOST_OLD` = restored full-vocab D2H + host argmax + embed
+round-trip. 5 reps audio / 4 reps 27B, rep0 dropped.
 
-### 8.2 Paste-ready dgx handoff (do these on the dgx, in this order)
+| Vehicle | DEV_NEW TPOT (band) | HOST_OLD TPOT (band) | Δ | vs vLLM 0.25.0 graphed | Verdict |
+|---|---|---|---|---|---|
+| **Voxtral audio (3B)** | **61.85 ms** (61.73–61.94) | 62.08 ms (61.90–62.23) | **−0.25 ms/tok (~0.4%)** | vLLM 40.8 ms → **1.52× slower** | small REAL win; gap is NOT this lever |
+| **Qwen3.6-27B image** | **223.0 ms** (221.7–225.2) | 224.0 ms (221.7–227.7) | ~0 (within ±1.5% noise) | vLLM 226.9 ms → **at parity** | **NEUTRAL** (bandwidth floor) |
+| Qwen3.6-27B video | = image by construction (shared `VLGenerateCoreGdn`) | — | ~0 | at parity | NEUTRAL |
 
-Ordered cheapest-high-information first, matching §5's ranking (do #4 before #2):
-
-- **Lever #4 — measure Voxtral audio our-side (the missing denominator half).** Build
-  `test_voxtral_e2e` on a disk-SAFE tree (prune old `~/work/source-*`/`grid` trees
-  first — see [[grid-per-sha-trees-fill-disk]] — the A3 blocker in §4 was pure disk).
-  Instrument `VoxtralGenerateGreedy` (`voxtral.cpp:364`) with `steady_clock` +
-  `gpu->Synchronize(q)` brackets around encode+prefill (TTFT) and around the decode
-  loop (`:425-442`), `TPOT=(t_N33−t_N1)/32`, exactly as §1 did for the 27B image driver;
-  keep the run asserting the A3 gate (14/14) so the timed path is PROVEN to run the
-  correct forward. Compare vs the captured vLLM denominator **TTFT 43 ms / TPOT 41 ms**
-  (§2.3). This is the first place lever #2's host overhead can actually bite. All GPU
-  under `flock $HOME/gpu.lock`, oracle and our engine never co-resident, cold rep dropped.
-- **Lever #2 — on-GPU argmax + kill the embed round-trip (only after #4 quantifies it).**
-  Replace the host `VLArgMax`/`ArgMax` with a device argmax reduction over the resident
-  `dlogits` (no full-vocab D2H) and feed the sampled id back into `DenseEmbedInto` on
-  device (drop the `Download`+re-`DBuf` at `qwen3_5.cpp:6884-6886` / `voxtral.cpp:435`).
-  Ground the device argmax 1:1 in vLLM's greedy sampler (on-GPU `argmax`) and cite
-  `file:line`. Verify: re-run STRICT image/video 32/32 + the Voxtral A3 14/14 near-tie
-  gate BIT-for-BIT and prove they RAN (md5 the goldens before/after per
-  [[dgx-transfer-git-archive-not-rsync]]); then re-time via lever #4's harness for the
-  A/B. Expect neutral at c1-27B, positive on audio/small-model decode.
-- **Lever #3 — batched/graphed mm serving (largest, structural; the c2+ DONE-bar).**
-  Route the mm decode through the production paged runner (`qwen3_5.cpp:7231/7448`) with
-  the `EncoderCacheManager` seam already landed (`ENG-MM-INPUT-PIPELINE`), mirroring
-  vLLM's `v1/core/encoder_cache_manager.py:17` + scheduler mm hooks
-  (`sched/scheduler.py:1356-1467`) + `v1/worker/gpu/mm/encoder_runner.py`. Prereq for
-  c2+ throughput and `image_url`/`audio_url` server ingestion (still unwired —
-  `grep image_url src/vllm/entrypoints` = 0). Own spike + own benchmark checkpoint.
-
-Until a GPU-equipped agent runs §8.2, the mm-speed verdict is unchanged from §6.
+### 8.4 Honest disposition — lever #2 is CLOSED, the win is small; the audio gap is lever #3
+The §5 #2 / §2.3 hypothesis was that audio (cheap ~41 ms decode) is where the
+per-token host round-trips would BITE. **Measurement REFINES this:** our audio
+decode is **~62 ms/token eager** (not 41 ms), and the host round-trips removed are
+only **~0.25 ms of it** — a consistent ~0.4% win, not a large one. Even at 3B the
+eager per-step forward dominates, so the host overhead was a thin slice. At 27B the
+lever is NEUTRAL (decode sits on the ~222 ms weight-streaming floor; host round-trips
+hidden — confirms §2.1). **The real audio-decode gap vs vLLM (1.52×) is eager
+per-step launch overhead** — i.e. graphed/batched decode (lever #3), for which
+on-GPU sampling is a PREREQUISITE this lever now supplies, but which it does not by
+itself close. mm rows stay **speed-pending / `PARTIAL`**: correctness-complete,
+decode at-parity on 27B, still 1.52× on audio (lever #3). No mm row advances to DONE.
