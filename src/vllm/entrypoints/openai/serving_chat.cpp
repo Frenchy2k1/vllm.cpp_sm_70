@@ -208,6 +208,93 @@ std::optional<DeltaMessage> ShapeChatDelta(const std::string& previous_text,
 
 namespace {
 
+// The ChatCompletionRequest -> engine ParserRequest projection (the minimal
+// subset parser_engine.py reads: include_reasoning, tool_choice, tools, and the
+// history tool-call count). chat_completion/serving.py passes the request object
+// straight to parse_delta / parse; we model only the fields the assembly path
+// consumes. history_tool_call_cnt is derived only for kimi_k2's id_type (base
+// count_history_tool_calls == 0 for a fresh request), matching
+// abstract_parser.py:_initialize_history_tool_call_cnt.
+vllm::parser::engine::ParserRequest ToParserRequest(
+    const ChatCompletionRequest& request) {
+  vllm::parser::engine::ParserRequest pr;
+  pr.include_reasoning = request.include_reasoning;
+  pr.tool_choice = request.tool_choice.has_value() ? request.tool_choice->mode
+                                                    : std::string("auto");
+  if (request.tools.has_value()) {
+    for (const ChatCompletionToolsParam& t : *request.tools) {
+      pr.tools.push_back({t.function.name});
+    }
+  }
+  pr.history_tool_call_cnt = 0;
+  return pr;
+}
+
+}  // namespace
+
+std::optional<DeltaMessage> ShapeChatDeltaEngine(
+    vllm::parser::engine::ParserEngine* parser, const std::string& delta_text,
+    const std::vector<int>& delta_token_ids,
+    const ChatCompletionRequest& request, bool finished) {
+  // chat_completion/serving.py:607 — the unified parser drives BOTH reasoning
+  // and tool parsing over the raw delta; no separate reasoning parser runs.
+  if (parser == nullptr) {
+    DeltaMessage msg;
+    msg.content = delta_text;
+    return msg;
+  }
+  const vllm::parser::engine::ParserRequest req = ToParserRequest(request);
+  return parser->parse_delta(delta_text, delta_token_ids, req, finished);
+}
+
+ShapedChatMessage ShapeChatMessageEngine(
+    const std::string& role, const std::string& model_output,
+    std::optional<std::string> output_finish_reason,
+    const ChatCompletionRequest& request,
+    vllm::parser::engine::ParserEngine* parser) {
+  ShapedChatMessage shaped;
+  shaped.message.role = role;
+
+  // chat_completion/serving.py:893 — parser.parse(text, request) returns the
+  // (reasoning, content, tool_calls) triple with reasoning already split off.
+  const vllm::parser::engine::ParserRequest req = ToParserRequest(request);
+  auto [reasoning, content, tool_calls] = parser->parse(model_output, req);
+
+  const auto attach_reasoning = [&]() {
+    if (reasoning.has_value() && !reasoning->empty()) {
+      shaped.message.reasoning = SanitizeUtf8(*reasoning);
+    }
+  };
+
+  // :908-923 — a tool call flips finish_reason to "tool_calls"; ids come from
+  // make_tool_call_id (:918) since parse() returns id-less FunctionCalls.
+  if (ToolsEnabled(request) && tool_calls.has_value() && !tool_calls->empty()) {
+    if (content.has_value()) {
+      shaped.message.content = SanitizeUtf8(*content);
+    } else {
+      shaped.message.content = std::nullopt;
+    }
+    std::vector<ToolCall> calls;
+    calls.reserve(tool_calls->size());
+    for (const FunctionCall& fc : *tool_calls) {
+      calls.push_back(ToolCall{make_tool_call_id(), "function", fc});
+    }
+    shaped.message.tool_calls = std::move(calls);
+    shaped.finish_reason = "tool_calls";
+    attach_reasoning();
+    return shaped;
+  }
+
+  // No tool call: plain-content message carrying the reasoning span.
+  shaped.message.content = SanitizeUtf8(content.value_or(model_output));
+  shaped.finish_reason = std::move(output_finish_reason);
+  if (!shaped.finish_reason.has_value()) shaped.finish_reason = "stop";
+  attach_reasoning();
+  return shaped;
+}
+
+namespace {
+
 // chat_completion_stream_generator (serving.py:404-802) as W2's live,
 // pull-based SSE source. Continuous usage waits for and buffers the first
 // result so the role frame carries a native prompt-token count; subsequent
@@ -218,6 +305,7 @@ class ChatSseStream final : public SseStream {
                 std::string response_id, int64_t created, std::string model,
                 ChatCompletionRequest request,
                 std::unique_ptr<ToolParser> parser,
+                std::unique_ptr<vllm::parser::engine::ParserEngine> engine_parser,
                 std::unique_ptr<ReasoningParser> reasoning_parser,
                 bool named_tool_choice, StreamUsageSelection usage)
       : engine_(engine),
@@ -227,6 +315,7 @@ class ChatSseStream final : public SseStream {
         model_(std::move(model)),
         request_(std::move(request)),
         parser_(std::move(parser)),
+        engine_parser_(std::move(engine_parser)),
         reasoning_parser_(std::move(reasoning_parser)),
         named_tool_choice_(named_tool_choice),
         usage_(usage) {}
@@ -317,9 +406,16 @@ class ChatSseStream final : public SseStream {
       }
       previous_num_tokens_ += static_cast<int>(output.token_ids.size());
       const std::string current_text = previous_text_ + delta_text;
-      std::optional<DeltaMessage> delta = ShapeChatDelta(
-          previous_text_, current_text, delta_text, request_, parser_.get(),
-          reasoning_parser_.get());
+      const bool finished = output.finish_reason.has_value() || response.finished;
+      std::optional<DeltaMessage> delta =
+          engine_parser_ != nullptr
+              ? ShapeChatDeltaEngine(
+                    engine_parser_.get(), delta_text,
+                    std::vector<int>(output.token_ids.begin(),
+                                     output.token_ids.end()),
+                    request_, finished)
+              : ShapeChatDelta(previous_text_, current_text, delta_text, request_,
+                               parser_.get(), reasoning_parser_.get());
       previous_text_ = current_text;
 
       if (delta.has_value() && delta->tool_calls.has_value() &&
@@ -379,6 +475,7 @@ class ChatSseStream final : public SseStream {
   std::string model_;
   ChatCompletionRequest request_;
   std::unique_ptr<ToolParser> parser_;
+  std::unique_ptr<vllm::parser::engine::ParserEngine> engine_parser_;
   std::unique_ptr<ReasoningParser> reasoning_parser_;
   bool named_tool_choice_ = false;
   StreamUsageSelection usage_;
@@ -400,7 +497,22 @@ class ChatSseStream final : public SseStream {
 std::unique_ptr<ToolParser> OpenAIServingChat::MakeToolParser(
     const ChatCompletionRequest& request) const {
   if (tool_parser_name_.empty() || !ToolsEnabled(request)) return nullptr;
+  // An engine-backed name is served by MakeParserEngine, not the legacy seam.
+  if (vllm::parser::get_parser_engine(tool_parser_name_) != nullptr) {
+    return nullptr;
+  }
   return get_tool_parser(tool_parser_name_);
+}
+
+std::unique_ptr<vllm::parser::engine::ParserEngine>
+OpenAIServingChat::MakeParserEngine(const ChatCompletionRequest& request) const {
+  if (tool_parser_name_.empty() || !ToolsEnabled(request)) return nullptr;
+  // parser_manager get_parser_engine returns nullptr for a name that is not an
+  // engine-backed format, so the legacy MakeToolParser seam handles those. This
+  // is the name-selected dispatch swap: engine-backed (qwen3/seed_oss/kimi_k2)
+  // formats drive the unified ParserEngine, every other name keeps the legacy
+  // tool_parsers path unchanged (parser/parser_manager.py:76).
+  return vllm::parser::get_parser_engine(tool_parser_name_);
 }
 
 std::unique_ptr<ReasoningParser> OpenAIServingChat::MakeReasoningParser() const {
@@ -457,11 +569,17 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
       prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools);
 
   // One tool parser per request (the streaming parse is stateful); null when the
-  // request has no tools (or the parser is disabled).
+  // request has no tools (or the parser is disabled). When `tool_parser_name_`
+  // is an engine-backed format (qwen3/seed_oss/kimi_k2) `parser` stays null and
+  // `engine_parser` is used instead — the name-selected 0.26 dispatch swap.
   std::unique_ptr<ToolParser> parser = MakeToolParser(request);
+  std::unique_ptr<vllm::parser::engine::ParserEngine> engine_parser =
+      MakeParserEngine(request);
   // One reasoning parser per request (streaming may be stateful, olmo3); null
-  // when disabled (empty reasoning_parser_name_). Independent of tools.
-  std::unique_ptr<ReasoningParser> reasoning_parser = MakeReasoningParser();
+  // when disabled (empty reasoning_parser_name_). Independent of tools. The
+  // engine-backed parser does reasoning itself, so it is bypassed there.
+  std::unique_ptr<ReasoningParser> reasoning_parser =
+      engine_parser != nullptr ? nullptr : MakeReasoningParser();
   const bool named_tool_choice = IsNamedToolChoice(request);
 
   SamplingParams sampling_params = request.to_sampling_params();
@@ -490,8 +608,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
       try {
         result.sse_stream = std::make_shared<ChatSseStream>(
             *async_engine_, async_request, request_id, created_time, model_name,
-            request, std::move(parser), std::move(reasoning_parser),
-            named_tool_choice, usage);
+            request, std::move(parser), std::move(engine_parser),
+            std::move(reasoning_parser), named_tool_choice, usage);
       } catch (...) {
         async_engine_->abort(async_request.request_id);
         throw;
@@ -552,9 +670,15 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
           const bool finished = output.finish_reason.has_value();
 
           const std::string current_text = previous_text + delta_text;
-          std::optional<DeltaMessage> delta_message = ShapeChatDelta(
-              previous_text, current_text, delta_text, request, parser.get(),
-              reasoning_parser.get());
+          std::optional<DeltaMessage> delta_message =
+              engine_parser != nullptr
+                  ? ShapeChatDeltaEngine(
+                        engine_parser.get(), delta_text,
+                        std::vector<int>(output.token_ids.begin(),
+                                         output.token_ids.end()),
+                        request, finished)
+                  : ShapeChatDelta(previous_text, current_text, delta_text,
+                                   request, parser.get(), reasoning_parser.get());
           previous_text = current_text;
 
           // :598-599 — a tool-call delta flips the finish_reason to tool_calls.
@@ -634,9 +758,13 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     // Tool shaping (:857-966): with a parser + active tools, attach tool_calls
     // and set finish_reason="tool_calls"; else a plain-content assistant message
     // (finish_reason = output.finish_reason or "stop", :956-960).
-    ShapedChatMessage shaped = ShapeChatMessage(
-        kAssistantRole, output.text, output.finish_reason, request, parser.get(),
-        reasoning_parser.get());
+    ShapedChatMessage shaped =
+        engine_parser != nullptr
+            ? ShapeChatMessageEngine(kAssistantRole, output.text,
+                                     output.finish_reason, request,
+                                     engine_parser.get())
+            : ShapeChatMessage(kAssistantRole, output.text, output.finish_reason,
+                               request, parser.get(), reasoning_parser.get());
     choice.message = std::move(shaped.message);
     // logprobs (chat_completion/serving.py:875-887): when request.logprobs is
     // set, attach the ChatCompletionLogProbs payload built from the generated
