@@ -72,6 +72,31 @@ plain generation byte-identical. Reproduce:
 cmake --build build-cpu --target test_parser_engine_assembly &&
 ./build-cpu/tests/test_parser_engine_assembly`.
 
+**ROAD-V1-C8 serving-SSE dispatch swap (2026-07-27, `CLAIM-ROADMAP-C8-SERVING`,
+NOT pushed).** Disposition: **CORRECTNESS gate, no throughput number
+(`benchmark_binding=false`).** Wires the engine-backed `ParserEngine` into the
+OpenAI `/v1/chat/completions` streaming path behind the `--tool-call-parser`
+seam (off by default): an engine-backed name (qwen3/seed_oss/kimi_k2) resolves
+through `parser_manager get_parser_engine` and drives the streamed
+`DeltaMessage`s. The parser is a pure function of the streamed deltas, so the
+SSE stream is gated EXACTLY, chunk for chunk: for the same 9 fixed streams the
+production serving dispatch plus the production `ChatCompletionStreamResponse`
+framing emit the SAME `data:` chunk sequence (role frame; per-delta
+`delta.{reasoning,content,tool_calls[].function.{name,arguments}}`; withheld-null
+skip; terminal `finish_reason` tool_calls flip) that vLLM 0.26.0.dev0
+(`555967922`) `chat_completion_stream_generator` emits.
+`test_openai_serving_chat_stream` 2 cases / 210 assertions on CPU. RED-first:
+mis-wiring the dispatch (parser not driven, plain-content delta) fails 6
+CHECKs, first divergent boundary `qwen3_reasoning_xml_wholedelta chunk[1]` (want
+`delta.reasoning`, got raw `delta.content`) plus a chunk-count divergence (189 vs
+62); restoring returns 210/210. Goldens captured by
+`tools/parity/dump_serving_chat_stream.py`. Inertness: name-selected and off by
+default, so the legacy tool_parsers path is byte-identical
+(`test_openai_serving` 421/421 unchanged). Reproduce:
+`VLLM_SOURCE=/path/to/vllm python3 tools/parity/dump_serving_chat_stream.py --out tests/vllm/entrypoints/openai/test_serving_chat_stream_goldens.inc &&
+cmake --build build --target test_openai_serving_chat_stream &&
+./build/tests/test_openai_serving_chat_stream`.
+
 **ROAD-V1-C7 sampling controls + logprobs (2026-07-27, `CLAIM-ROADMAP-C7`, NOT
 pushed).** Disposition: **CORRECTNESS gate, no throughput number
 (`benchmark_binding=false`).** A sampling transform is a pure function of

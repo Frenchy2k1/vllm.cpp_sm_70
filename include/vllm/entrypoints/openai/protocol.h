@@ -407,6 +407,11 @@ struct ChatCompletionRequest {
   std::optional<std::vector<ChatCompletionToolsParam>> tools;
   std::optional<ToolChoice> tool_choice;
 
+  // include_reasoning (chat_completion/protocol.py:242, default True). When
+  // false the parser drops the reasoning span (parser_engine.py:451); the
+  // engine-backed serving path maps this onto ParserRequest.include_reasoning.
+  bool include_reasoning = true;
+
   // to_sampling_params — chat_completion/protocol.py:585. See CompletionRequest.
   SamplingParams to_sampling_params(
       std::optional<int> default_max_tokens = std::nullopt) const;

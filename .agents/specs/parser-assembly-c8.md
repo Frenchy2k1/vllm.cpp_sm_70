@@ -71,7 +71,13 @@ serving TU modified. Plain generation (no tool parser) byte-identical.
 ## RESIDUALS (honest, stay open under C8)
 
 - **Serving-SSE dispatch swap** (wire the assembled parser behind
-  `--tool-call-parser` in the OpenAI serving path) — NOT done; recorded residual.
+  `--tool-call-parser` in the OpenAI serving path) — **DONE + CPU-GATED 2026-07-27
+  (`CLAIM-ROADMAP-C8-SERVING`):** the chat streaming path routes engine-backed
+  names through `parser_manager get_parser_engine` (`ShapeChatDeltaEngine` ->
+  `parse_delta`; `ShapeChatMessageEngine` -> `parse`), EXACT chunk-for-chunk vs
+  vLLM 0.26 `chat_completion_stream_generator` (`test_openai_serving_chat_stream`
+  210/210, RED-first 6 CHECKs; goldens `tools/parity/dump_serving_chat_stream.py`).
+  OFF by default (name-selected), legacy `tool_parsers` path byte-identical.
 - **JSON-schema type coercion** (`_fix_arg_types` with a non-empty tool schema,
   `_streamable_string_keys` from properties, `find_tool_properties`) — modeled as
   identity because no tool schema is carried; only triggers when tools with

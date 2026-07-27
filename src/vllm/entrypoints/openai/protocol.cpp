@@ -380,6 +380,8 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   }
   ParseLogitFilters(j, r.logit_bias, r.allowed_token_ids, r.bad_words);
   ParseToolChoice(j, r.tool_choice);
+  // include_reasoning (chat_completion/protocol.py:242, default True).
+  GetOr(j, "include_reasoning", r.include_reasoning);
   // DEFERRED: parallel_tool_calls, legacy functions / function_call — parsed and
   // ignored (nlohmann skips unknown keys; no field mapped here at T0).
 }

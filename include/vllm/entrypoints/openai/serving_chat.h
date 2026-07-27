@@ -36,6 +36,7 @@
 #include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"
 #include "vllm/entrypoints/openai/serving_completion.h"  // SseStream
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
+#include "vllm/parser/parser_manager.h"  // engine-backed ParserEngine dispatch
 #include "vllm/sampling_params.h"
 #include "vllm/v1/engine/llm_engine.h"
 
@@ -115,6 +116,32 @@ std::optional<DeltaMessage> ShapeChatDelta(const std::string& previous_text,
                                            ToolParser* parser,
                                            ReasoningParser* reasoning_parser = nullptr);
 
+// ENGINE-BACKED per-delta stream shaping (chat_completion/serving.py:607 —
+// `parser.parse_delta(delta_text, delta_token_ids, request, finished)`). The
+// 0.26 replacement for the legacy ShapeChatDelta seam: when an engine-backed
+// tool-call parser (qwen3 / seed_oss / kimi_k2) is selected, the unified
+// ParserEngine consumes the RAW (delta_text, delta_token_ids) stream and emits
+// the streamed DeltaMessage (reasoning + content + tool-call name-first then
+// argument deltas), or nullopt when it is withholding. The ParserEngine does
+// BOTH reasoning and tool parsing, so no separate ReasoningParser runs on this
+// path (mirrors vLLM's composed Parser). `finished` flushes any held-back tail.
+std::optional<DeltaMessage> ShapeChatDeltaEngine(
+    vllm::parser::engine::ParserEngine* parser, const std::string& delta_text,
+    const std::vector<int>& delta_token_ids,
+    const ChatCompletionRequest& request, bool finished);
+
+// ENGINE-BACKED non-stream shaping (chat_completion/serving.py:893 —
+// `parser.parse(output.text, request)` -> (reasoning, content, tool_calls)).
+// The one-shot analogue of ShapeChatMessage for the engine-backed parser. On a
+// tool call: attach tool_calls (ids from make_tool_call_id, :918) + leading
+// content and set finish_reason="tool_calls"; else a plain-content assistant
+// message carrying the reasoning span.
+ShapedChatMessage ShapeChatMessageEngine(
+    const std::string& role, const std::string& model_output,
+    std::optional<std::string> output_finish_reason,
+    const ChatCompletionRequest& request,
+    vllm::parser::engine::ParserEngine* parser);
+
 // Ported from: vllm/tool_parsers/structural_tag_registry.py @ e24d1b24
 // (get_hermes_structural_tag:237-269 + _hermes_tool_tags:213-234).
 //
@@ -168,6 +195,16 @@ class OpenAIServingChat {
   // parser name is configured; else nullptr. ONE instance per request (the
   // streaming parse is stateful).
   std::unique_ptr<ToolParser> MakeToolParser(
+      const ChatCompletionRequest& request) const;
+
+  // Build the per-request ENGINE-BACKED parser (parser_manager get_parser_engine)
+  // when ToolsEnabled and `tool_parser_name_` names an engine-backed format
+  // (qwen3 / seed_oss / kimi_k2); else nullptr — a nullptr here means the legacy
+  // MakeToolParser seam is used instead (the dispatch is name-selected, and the
+  // default no-tool-parser path stays on the legacy seam byte-for-byte). ONE
+  // instance per request (the streaming parse is stateful). Mirrors vLLM 0.26
+  // ParserManager.get_parser (parser/parser_manager.py:76).
+  std::unique_ptr<vllm::parser::engine::ParserEngine> MakeParserEngine(
       const ChatCompletionRequest& request) const;
 
   // Build the per-request reasoning parser (get_reasoning_parser) when a parser

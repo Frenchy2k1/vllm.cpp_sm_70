@@ -26333,3 +26333,38 @@ device-only). Seven checkers bare RC green. FULL SHA reported to the dispatcher.
 
 **Next (unchanged DONE-bar residual):** lever #3 — batched/graphed mm serving
 (c2+, `image_url`/`audio_url` ingestion) + graphed decode to close the audio 1.52×.
+
+## 2026-07-27 — ROAD-V1-C8 serving-SSE dispatch swap LANDED + CPU-GATED (`CLAIM-ROADMAP-C8-SERVING`)
+
+Wired the merged engine-backed `ParserEngine` into the OpenAI chat serving SSE
+path, behind the existing `--tool-call-parser` seam, OFF by default. Base `main`
+`bd3e15ed` (isolated worktree; NOT pushed).
+
+**What landed.** `MakeParserEngine` selects an engine-backed parser
+(qwen3/seed_oss/kimi_k2) via `parser_manager get_parser_engine`; `MakeToolParser`
+returns null for those names so only they bypass the legacy `tool_parsers` seam
+(every other name / no-parser path unchanged). NEW `ShapeChatDeltaEngine`
+(`parse_delta` per streamed delta, vLLM serving.py:607) + `ShapeChatMessageEngine`
+(one-shot `parse`, serving.py:893) wired into the 3 drive sites (sync stream loop,
+`ChatSseStream` async loop + new engine member, non-stream). The engine parser
+handles reasoning itself, so the legacy `ReasoningParser` is bypassed on that path
+(mirrors vLLM's composed Parser). Added the faithful `include_reasoning` request
+field (protocol.py:242) + `from_json`, projected onto `ParserRequest`.
+
+**Gate (exact, RED-first, CPU).** NEW `test_openai_serving_chat_stream` 210/210
+over 9 scenarios: production dispatch + production `ChatCompletionStreamResponse`
+SSE framing matched chunk-for-chunk vs the vLLM 0.26 `chat_completion_stream_
+generator` stream captured by `tools/parity/dump_serving_chat_stream.py` (role
+frame; per-delta reasoning/content/tool-call name+arg deltas; withheld-null skip;
+terminal tool_calls flip) + a name-selected dispatch case. RED-first: mis-wiring
+(parser not driven -> plain content) fails 6 CHECKs, first boundary `chunk[1]`
+(want `reasoning=...`, got raw `content=<think>...`) + a chunk-count divergence
+(189 vs 62); restoring -> 210/210. Inertness: `test_openai_serving` 421/421,
+`test_parser_engine_assembly` 1652/1652, `test_openai_protocol` 171/171 all
+unchanged; legacy path byte-identical. CPU `-Werror` 0-warn (full lib + full test
+suite).
+
+**Residual (C8 stays PARTIAL).** JSON-schema arg-type coercion; the other 6 engine
+configs (gemma4/deepseek_v4/v32/minimax_m2/nemotron_v3/glm47_moe/inkling);
+`SERVE-RESPONSE-METRICS` (INVENTORIED); live-engine per-step metric value wiring;
+chat-form `/tokenize`.
