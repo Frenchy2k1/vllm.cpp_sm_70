@@ -366,9 +366,20 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
   // forward down the provider stack — fan-out spike Risk 4).
   if (metal) {
     vt::EnableOpProviderCallStats(false);
+    // A FUSED realisation can subsume a standalone op: the Qwen3-dense preamble
+    // recipe (kAttnQkNormRope) absorbs the two qk RMSNorms and the RoPE into one
+    // kernel, so kRopeFromCache legitimately reports zero selections when the
+    // fused path is taken. The proof's intent — every piece of this forward ran on
+    // the Metal device and nothing silently declined to CPU — is preserved by
+    // requiring the SUBSUMING op to have run instead, and by still demanding zero
+    // declines from the subsumed one.
+    const auto fused_pre = vt::GetOpProviderStats(vt::OpId::kAttnQkNormRope, run_dev);
     for (vt::OpId op : kQwen3Ops) {
       const auto st = vt::GetOpProviderStats(op, run_dev);
-      CHECK_MESSAGE(st.selections > 0,
+      const bool subsumed = (op == vt::OpId::kRopeFromCache) && fused_pre.selections > 0;
+      // Precomputed: doctest cannot decompose a compound expression here.
+      const bool ran_on_metal = st.selections > 0 || subsumed;
+      CHECK_MESSAGE(ran_on_metal,
                     label << ": op " << static_cast<int>(op)
                           << " was never dispatched on the Metal device — the token "
                              "result cannot be attributed to this backend");
@@ -377,7 +388,8 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
                           << " DECLINED on Metal and fell back");
     }
     MESSAGE(label << ": BACKEND PROOF — all " << kQwen3Ops.size()
-            << " Qwen3-dense ops dispatched on Metal with 0 declines (kRopeFromCache "
+            << " Qwen3-dense ops dispatched on Metal with 0 declines (kAttnQkNormRope "
+               "selections=" << fused_pre.selections << ", kRopeFromCache "
                "selections=" << vt::GetOpProviderStats(vt::OpId::kRopeFromCache, run_dev).selections
             << ", kPagedAttention selections="
             << vt::GetOpProviderStats(vt::OpId::kPagedAttention, run_dev).selections << ")");

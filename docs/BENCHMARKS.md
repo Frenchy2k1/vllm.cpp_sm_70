@@ -2862,6 +2862,40 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Fused preamble ROUTED onto the default path: +0.35% (2026-07-27)
+
+Closes the second blocker. The recipe branch in `dense_attn_block.h` now covers
+bf16 as well as f32, **gated on the rope cache being enabled** — the bf16
+branch's default RoPE is `RopeNeox` while the recipe's step is `RopeFromCache`,
+so without that guard adoption would silently swap one RoPE implementation for
+another and move the near-tie goldens for a reason unrelated to fusion. With it,
+the recipe's Tier-0 composite is exactly the standalone sequence the else-branch
+ran, for either dtype, so adoption is behaviour-preserving by construction.
+
+`vt_rms_norm` 3616 -> 1824 dispatches; 896 fused replace 2688.
+
+**Paired verdict** (warm, p=512 g=128, 6 ABBA blocks): +0.12 +0.08 +0.08 +0.09
++0.14 +0.07 -> **+0.35% median, faster in 6/6 blocks, p = 0.031.** Warm total
+23.81 -> 23.90 against MLX-LM's 24.79: **96.0% -> 96.4%**.
+
+**No golden re-anchor needed** and 16/16 PASS, with `kAttnQkNormRope
+selections=7168` proving the fused kernel is what ran on Metal.
+
+**One test change, flagged deliberately.** The backend proof asserted every op in
+`kQwen3Ops` had `selections > 0`, and `kRopeFromCache` now legitimately reports
+ZERO because the fusion absorbs it. The proof is now subsumption-aware: it
+accepts zero selections for `kRopeFromCache` only when the subsuming
+`kAttnQkNormRope` actually ran, and still demands zero declines from both. That
+preserves the assertion's intent — nothing silently fell back to CPU — rather
+than relaxing it. "The test failed so I edited the test" deserves scrutiny even
+when justified, which is why it is called out here rather than buried.
+
+**Measured value was below the estimate**: ~0.35% against a predicted ~0.5-1%.
+The dispatch reduction is real and large (2688 -> 896) but the small kernels it
+removes are cheaper per launch than the 6.7 us average used for sizing.
+
+---
+
 ## Fused qk-norm-RoPE preamble: kernel LANDED and validated, not yet on the hot path
 
 `vt_attn_qk_norm_rope` — per-head RMSNorm(q) + RMSNorm(k) + partial NeoX RoPE in

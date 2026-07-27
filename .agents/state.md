@@ -27693,3 +27693,37 @@ is `RopeNeox`, not `RopeFromCache`; the recipe's kRope step is RopeFromCache. So
 extending the condition must be gated on whatever enables the rope cache,
 otherwise it silently swaps one RoPE implementation for another and the near-tie
 goldens move for a reason that has nothing to do with fusion.
+
+---
+
+## 2026-07-27 — fused preamble ROUTED onto the default path: +0.35% (96.4% of MLX-LM)
+
+Blocker 2 closed. The recipe branch now covers bf16 as well as f32, **gated on
+`RopeCacheEnabled()`**: the bf16 branch's default RoPE is `RopeNeox` while the
+recipe's third step is `RopeFromCache`, so ungated adoption would have swapped
+RoPE implementations silently and moved the near-tie goldens for a reason having
+nothing to do with fusion. With the guard the composite IS the else-branch's
+sequence for either dtype, so adoption is behaviour-preserving by construction.
+
+`vt_rms_norm` 3616 -> 1824; 896 fused dispatches replace 2688.
+
+**Paired:** +0.12 +0.08 +0.08 +0.09 +0.14 +0.07 -> **+0.35% median, 6/6 blocks,
+p = 0.031.** Warm total 23.81 -> 23.90 vs MLX 24.79 = **96.0% -> 96.4%**.
+16/16 PASS, NO re-anchor, `kAttnQkNormRope selections=7168`.
+
+**Test change, called out rather than buried:** the backend proof required
+`selections > 0` for every op in kQwen3Ops, and kRopeFromCache now legitimately
+reports ZERO because the fusion absorbs it. The proof is now subsumption-aware —
+zero is accepted for kRopeFromCache ONLY when the subsuming kAttnQkNormRope ran,
+and zero declines is still required of both. Intent (nothing silently fell back
+to CPU) preserved, not relaxed. Editing a test to make it pass deserves scrutiny
+even when correct; reviewers should look here first.
+
+**Estimate vs measurement: predicted ~0.5-1%, got 0.35%.** The dispatch reduction
+was as large as predicted (2688 -> 896); the error was in valuing each removed
+dispatch at the 6.7 us average, when the q/k norms are among the cheapest. Worth
+remembering the next time a dispatch-count saving is sized from an average.
+
+**Cumulative: 89.4% -> 96.4%**, four kernels landed. Remaining ~3.6% has no
+single dominant item: prefill GEMM 15 ms (97% of MLX's already), prefill
+attention ~35 ms, prefill other ~55 ms, decode ~85 ms.
