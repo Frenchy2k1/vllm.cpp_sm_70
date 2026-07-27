@@ -714,4 +714,126 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
                              config, per_layer_out, final_out);
 }
 
+// ============================ D11 Part A ==================================
+// DEVICE-RESIDENT append-only draft-KV store. Per request, the projected bf16 K/V for
+// every draft layer is kept as resident device chunks (one per append) that persist
+// ACROSS verify steps. Supersedes D9's host-vector PrecomputedContextKV + the
+// download-on-append / upload-on-forward round-trip (AppendContextKVHost +
+// UploadContextKV). BIT-IDENTICAL to that host path by per-row projection independence
+// (same PrecomputeContextKVDevice, same ascending-position append order, same IndexCopy
+// concat) — tokens+acceptance unchanged; only the D<->H round-trip is removed and the
+// K/V now live on-device where the Part B paged-attention kernel + Part C static-shape
+// CUDA-graph draft step will read them (block-table over these slots).
+struct DflashDeviceKVStore {
+  // per draft layer -> a list of resident bf16 chunks, each [chunk_rows, kdim]. k[l][c]
+  // / v[l][c] is the c-th appended chunk for layer l. Append order == ascending absolute
+  // position (the D9 store invariant), and chunk_rows is identical across layers for a
+  // given append (the projection produces [count,kdim] for every layer).
+  std::vector<std::vector<DBuf>> k;
+  std::vector<std::vector<DBuf>> v;
+  int64_t num_layers = 0;
+  int64_t num_ctx = 0;
+};
+
+std::shared_ptr<DflashDeviceKVStore> Qwen3DFlashModel::MakeDeviceKVStore(
+    const HfConfig& config, vt::Queue& /*queue*/) {
+  auto s = std::make_shared<DflashDeviceKVStore>();
+  s->num_layers = config.num_hidden_layers;
+  s->k.resize(static_cast<size_t>(s->num_layers));
+  s->v.resize(static_cast<size_t>(s->num_layers));
+  return s;
+}
+
+int64_t Qwen3DFlashModel::DeviceKVNumCtx(const DflashDeviceKVStore& store) {
+  return store.num_ctx;
+}
+
+void Qwen3DFlashModel::AppendContextKVDevice(DflashDeviceKVStore& store,
+                                             const std::vector<float>& new_features,
+                                             const std::vector<int32_t>& new_positions,
+                                             const Qwen3DFlashWeights& weights,
+                                             const HfConfig& config, vt::Queue& queue) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t L = config.num_hidden_layers;
+  const int64_t count = static_cast<int64_t>(new_positions.size());
+  if (store.k.empty()) {  // defensive: MakeDeviceKVStore normally sizes these already
+    store.num_layers = L;
+    store.k.resize(static_cast<size_t>(L));
+    store.v.resize(static_cast<size_t>(L));
+  }
+  VT_CHECK(store.k.size() == static_cast<size_t>(L) && store.v.size() == static_cast<size_t>(L),
+           "AppendContextKVDevice: store layer count mismatch");
+  VT_CHECK(static_cast<int64_t>(new_features.size()) == count * config.hidden_size,
+           "AppendContextKVDevice: new_features must be [count, H]");
+  if (count == 0) return;
+  // Project ONLY the `count` new rows on device (the EXACT op the host AppendContextKVHost
+  // runs), then MOVE the per-layer device K/V into the store as a resident chunk. No
+  // Download: the bits stay on device. Per-row projection independence => these bits equal
+  // what a full recompute would produce for the same rows (D9 RESULT Part 2a).
+  ContextKVDev dev = PrecomputeContextKVDevice(d, new_features.data(), new_positions.data(),
+                                               count, weights, config);
+  for (int64_t l = 0; l < L; ++l) {
+    store.k[static_cast<size_t>(l)].push_back(std::move(dev.k[static_cast<size_t>(l)]));
+    store.v[static_cast<size_t>(l)].push_back(std::move(dev.v[static_cast<size_t>(l)]));
+  }
+  store.num_ctx += count;
+}
+
+std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
+    const std::vector<DflashDeviceKVStore*>& stores, const std::vector<int32_t>& ctx_cu,
+    const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
+    const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
+    vt::Queue& queue, std::vector<std::vector<float>>* per_layer_out,
+    std::vector<float>* final_out) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t L = config.num_hidden_layers;
+  const int64_t kdim = config.num_key_value_heads * config.head_dim;
+  const int P = static_cast<int>(stores.size());
+  VT_CHECK(static_cast<int>(ctx_cu.size()) == P + 1 && ctx_cu.front() == 0,
+           "ForwardBlockLogitsWithDeviceKV: ctx_cu must be [num_reqs+1]");
+  const int64_t C = ctx_cu.back();
+
+  // Concatenate the per-request device chunks into one combined per-layer [C, kdim] bf16
+  // ContextKVDev ON DEVICE, in ctx_cu order == ascending-append == ascending-position
+  // order. This is the SAME contiguous ascending-position layout UploadContextKV built
+  // from the host store, so downstream ForwardWithCtxKVDev sees bit-identical inputs.
+  ContextKVDev ckv;
+  ckv.num_ctx = C;
+  for (int64_t l = 0; l < L; ++l) {
+    ckv.k.emplace_back(d, DType::kBF16, std::vector<int64_t>{C, kdim});
+    ckv.v.emplace_back(d, DType::kBF16, std::vector<int64_t>{C, kdim});
+  }
+  if (C > 0) {
+    int64_t off = 0;
+    for (int r = 0; r < P; ++r) {
+      const DflashDeviceKVStore& st = *stores[static_cast<size_t>(r)];
+      VT_CHECK(static_cast<int64_t>(st.k.size()) == L && static_cast<int64_t>(st.v.size()) == L,
+               "ForwardBlockLogitsWithDeviceKV: store layer count mismatch");
+      const size_t nch = st.k[0].size();
+      for (size_t c = 0; c < nch; ++c) {
+        const int64_t chunk_rows = st.k[0][c].t().shape[0];
+        if (chunk_rows == 0) continue;
+        std::vector<int32_t> idx(static_cast<size_t>(chunk_rows));
+        for (int64_t i = 0; i < chunk_rows; ++i)
+          idx[static_cast<size_t>(i)] = static_cast<int32_t>(off + i);
+        DBuf idx_d(d, DType::kI32, {chunk_rows}, idx.data());
+        Tensor idx_t = idx_d.t();
+        for (int64_t l = 0; l < L; ++l) {
+          Tensor cin_k = st.k[static_cast<size_t>(l)][c].t();  // [chunk_rows, kdim]
+          Tensor cin_v = st.v[static_cast<size_t>(l)][c].t();
+          Tensor cok = ckv.k[static_cast<size_t>(l)].t();
+          Tensor cov = ckv.v[static_cast<size_t>(l)].t();
+          vt::IndexCopy(d.q, cok, cin_k, idx_t);
+          vt::IndexCopy(d.q, cov, cin_v, idx_t);
+        }
+        off += chunk_rows;
+      }
+    }
+    VT_CHECK(off == C,
+             "ForwardBlockLogitsWithDeviceKV: concatenated ctx rows != ctx_cu.back()");
+  }
+  return ForwardWithCtxKVDev(d, ckv, ctx_cu, block_input_ids, block_positions, cu, weights,
+                             config, per_layer_out, final_out);
+}
+
 }  // namespace vllm
