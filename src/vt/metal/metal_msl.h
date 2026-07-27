@@ -906,7 +906,10 @@ kernel void vt_paged_attention(device const uchar* q     [[buffer(0)]],
                                // signature to have the SAME dimensionality, so
                                // the thread index is uint2 with an unused .y even
                                // though the threadgroup is 1-D.
-                               uint2 tid2 [[thread_position_in_threadgroup]]) {
+                               uint2 tid2 [[thread_position_in_threadgroup]],
+                               uint tiisg [[thread_index_in_simdgroup]],
+                               uint sgitg [[simdgroup_index_in_threadgroup]],
+                               uint sgsize [[threads_per_simdgroup]]) {
   const uint tid = tid2.x;
   threadgroup float smem[VT_TG_MAX];
   threadgroup float scores[VT_PA_CHUNK];
@@ -947,17 +950,47 @@ kernel void vt_paged_attention(device const uchar* q     [[buffer(0)]],
   for (int j0 = jmin; j0 <= jmax; j0 += int(VT_PA_CHUNK)) {
     const int jc = min(int(VT_PA_CHUNK), jmax - j0 + 1);
 
-    // Scores for this chunk (scaled), one thread per key.
-    for (int idx = int(tid); idx < jc; idx += int(p.tg)) {
+    // Scores for this chunk (scaled), ONE SIMDGROUP PER KEY.
+    //
+    // The original form gave one THREAD the whole d-length dot product. Adjacent
+    // threads then read entirely different K rows (kbase varies per key), so the
+    // loads never coalesced and this kernel ran at roughly 4% of the M4's memory
+    // bandwidth while holding 24% of GPU time. Splitting `d` across a
+    // simdgroup's lanes makes neighbouring lanes read neighbouring elements of
+    // the SAME K row, which is the coalesced direction, and lets each lane take a
+    // 4-wide vector load when the dtype and alignment allow.
+    //
+    // `simd_sum` requires every lane to participate, so the loop bound is the
+    // SIMDGROUP index and the tail is handled by having idle simdgroups still
+    // execute the reduction; `jc` is uniform across the threadgroup, so no lane
+    // diverges on the loop itself.
+    const uint n_sg = p.tg / sgsize;
+    for (int idx = int(sgitg); idx < jc; idx += int(n_sg)) {
       const int j = j0 + idx;
       const int blk = btab[r * p.bt_row + (j / int(p.block_size)) * p.bt_col];
       const int off = j % int(p.block_size);
       const ulong kbase = ulong(blk) * p.kc_blk + ulong(off) * p.kc_pg + ulong(g) * p.kc_hd;
-      float dot = 0.0f;
-      for (uint e = 0u; e < p.d; ++e) {
-        dot += vt_load(q, p.q_dt, qoff + ulong(e)) * vt_load(kc, p.kc_dt, kbase + ulong(e));
+      float part = 0.0f;
+      if (p.q_dt == VT_DT_BF16 && p.kc_dt == VT_DT_BF16 && (p.d & 3u) == 0u &&
+          ((qoff | kbase) & 3ul) == 0ul) {
+        device const ushort4* q4 = (device const ushort4*)((device const ushort*)q + qoff);
+        device const ushort4* k4 = (device const ushort4*)((device const ushort*)kc + kbase);
+        const uint d4 = p.d >> 2u;
+        for (uint e = tiisg; e < d4; e += sgsize) {
+          const ushort4 qv = q4[e];
+          const ushort4 kv = k4[e];
+          part += vt_bf16_to_f32(qv.x) * vt_bf16_to_f32(kv.x);
+          part += vt_bf16_to_f32(qv.y) * vt_bf16_to_f32(kv.y);
+          part += vt_bf16_to_f32(qv.z) * vt_bf16_to_f32(kv.z);
+          part += vt_bf16_to_f32(qv.w) * vt_bf16_to_f32(kv.w);
+        }
+      } else {
+        for (uint e = tiisg; e < p.d; e += sgsize) {
+          part += vt_load(q, p.q_dt, qoff + ulong(e)) * vt_load(kc, p.kc_dt, kbase + ulong(e));
+        }
       }
-      scores[idx] = dot * p.scale;
+      const float dot = simd_sum(part);
+      if (tiisg == 0u) { scores[idx] = dot * p.scale; }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

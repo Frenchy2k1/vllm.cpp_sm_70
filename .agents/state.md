@@ -26170,3 +26170,32 @@ cause was the whole fix.
 
 **Goal:** 17.65 of 27.9 tok/s, 1.58x remaining. Decode ~5.6 s vs MLX-LM's 4.59 s
 (1.22x); prefill ~1.66 s vs ~0.47 s (3.5x).
+
+---
+
+## 2026-07-27 — paged-attention score loop: +3.7%, and 256/256 vs the vLLM oracle
+
+**Re-attribution moved the target.** After the GEMM work: decode GEMV 4452 ms
+(64%), **paged attention 1636 ms (24%)**, prefill GEMM 645 ms (9%, down from
+3863). The GEMV is at **97.7 GB/s, ~81% of the M4's peak — essentially done**.
+Paged attention was at **~5 GB/s, ~4% of peak**.
+
+**Cause:** the score loop gave ONE THREAD the whole d-length dot product, so
+adjacent threads read different K rows and nothing coalesced. Restructured to one
+SIMDGROUP per key with lanes splitting `d` (neighbouring lanes now read
+neighbouring elements of the same K row), plus a 4-wide vector load where dtype
+and alignment allow.
+
+**17.65 -> 18.30 tok/s (+3.7%)**, TTFT 1664 -> 1515 ms, attention GPU 1636 ->
+1370 ms (-16%). Less than the coalescing fix alone implied: the V accumulation
+and chunk/barrier structure are untouched and are the obvious next step.
+
+**THE ORACLE RESULT IS THE BEST OF THE SESSION: 256/256 tokens are vLLM's own
+teacher-forced argmax** (previous golden 254/256), mean gap 0.00 mnats, max
+0.0000 nats, 0 outside top-K. The improved numerics agree with vLLM 0.25.0
+EXACTLY at every position — including p0 tok5, the France/Italy near-tie the
+record has tracked since M3b: our engine now returns 9625 (" France"), which is
+vLLM's own argmax. 37 of 256 tokens changed across 4 prompts. Gate 16/16.
+
+**Goal:** 18.30 of 27.9 tok/s, 1.52x remaining. Decode ~5.5 s vs MLX-LM's 4.59 s
+(1.20x); prefill ~1.52 s vs ~0.47 s.
