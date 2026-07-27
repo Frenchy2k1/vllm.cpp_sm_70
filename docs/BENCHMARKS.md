@@ -2862,6 +2862,35 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Prefill attention softmax: one simdgroup per row, +0.19% (2026-07-27)
+
+Implements the target identified below. The online softmax ran ONE THREAD PER
+QUERY ROW — 32 of 256 threads, 12% — looping serially over the chunk's keys while
+224 waited at the barrier, wedged between two mma passes that use all 256. It is
+now ONE SIMDGROUP PER ROW, four rows each, with lanes covering the keys and
+`simd_max`/`simd_sum` reductions that need no barrier.
+
+**Prefill attention 55.3 -> 46.6 ms (-16%).**
+
+**Paired verdict** (warm, p=512 g=128, 6 ABBA blocks): +0.15 +0.06 +0.02 +0.07
++0.03 +0.02 -> **+0.19% median, faster in 6/6 blocks, p = 0.031.** Warm total
+23.88 -> 23.94.
+
+The end-to-end figure is small because 8.7 ms of kernel time sits in a ~5.3 s
+run; it was predicted at ~0.15% before measuring, and the paired harness is what
+makes a change this size resolvable at all.
+
+**Re-anchored, as predicted.** The reduction-order change flipped a near-tie
+(prompt[5] tok=10), which was budgeted for. Oracle: max gap **0.125 nats**, the
+same bar as the golden replaced, 0 over bar, 0 outside top-K — and **59
+token-divergent positions against the previous 60**, so the new sequence is
+marginally CLOSER to vLLM's greedy rather than further from it.
+
+Attention is now at 646 GFLOP/s (30.1 GFLOP / 46.6 ms) against the GEMM's 2851 —
+4.4x, down from 5.2x. The remaining ratio is still unexplained.
+
+---
+
 ## Prefill attention: "deepen BK" is BLOCKED; the softmax is the real target
 
 Two results from scoping the lead below before building on it. The first kills

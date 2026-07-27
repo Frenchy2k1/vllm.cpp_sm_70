@@ -27800,3 +27800,29 @@ re-anchor — the flow is proven twice in this session.
 
 **Both results are arithmetic, not measurement.** The LDS table and the 12% are
 exact; the causal link to 547 GFLOP/s is the hypothesis to test first.
+
+---
+
+## 2026-07-27 — prefill attention softmax: one simdgroup per row, +0.19%
+
+Implements the target from the previous entry. The online softmax ran ONE THREAD
+PER QUERY ROW (32 of 256 = 12%) looping serially over the chunk's keys while 224
+threads waited, between two mma passes using all 256. Now ONE SIMDGROUP PER ROW,
+four rows each, lanes over the keys, `simd_max`/`simd_sum` — no barrier needed.
+
+**Prefill attention 55.3 -> 46.6 ms (-16%).**
+**Paired:** +0.15 +0.06 +0.02 +0.07 +0.03 +0.02 -> **+0.19% median, 6/6 blocks,
+p = 0.031.** Warm total 23.88 -> 23.94.
+
+Predicted ~0.15% before measuring and got 0.19% — the first estimate this session
+that came in ABOVE rather than below, and the third data point that dispatch- and
+occupancy-sized predictions are good to roughly a factor of two.
+
+**Re-anchored as predicted:** the reduction-order change flipped prompt[5] tok=10.
+Oracle gap **0.125 nats**, same bar, 0 over, 0 outside top-K, and **59 divergent
+positions vs the previous 60** — marginally CLOSER to vLLM greedy.
+
+Attention is now 646 GFLOP/s against the GEMM's 2851: **4.4x, down from 5.2x**.
+The residual ratio is still unexplained, and the remaining structural difference
+is the BK=16 amortisation blocked by the bf16-P precision constraint recorded
+above.

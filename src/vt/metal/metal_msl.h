@@ -1638,47 +1638,48 @@ kernel void vt_paged_attention_mma(device const uchar* q     [[buffer(0)]],
     // about.
     for (uint e = tid; e < 4u * 64u; e += p.tg) { sdiag[e] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < VT_PAM_BQ) {
-      const uint rr = tid;
-      float corr = 1.0f;
-      if (int(rr) < nq) {
-        const int pos = context + loc + int(rr);
+    // ONE SIMDGROUP PER QUERY ROW, four rows each. The previous form ran one
+    // THREAD per row — 32 of 256 threads, 12% — looping serially over the chunk's
+    // keys while 224 threads waited at the barrier, wedged between two mma passes
+    // that use all 256. Lanes now cover the keys (jc <= VT_PAM_BK <= 32) and the
+    // reductions are simd_max/simd_sum, which need no barrier at all.
+    for (uint rr = sgitg * 4u; rr < sgitg * 4u + 4u; ++rr) {
+      const int ir = int(rr);
+      float sc = -INFINITY;
+      bool inwin = false;
+      if (ir < nq && int(tiisg) < jc) {
+        const int pos = context + loc + ir;
         int a = p.window_left >= 0 ? max(0, pos - p.window_left) : 0;
         int b = p.causal != 0u ? pos : seqlen - 1;
         if (p.window_right >= 0) { b = min(b, pos + p.window_right); }
         b = min(b, seqlen - 1);
-        float mc = -INFINITY;
-        for (int idx = 0; idx < jc; ++idx) {
-          const int j = j0 + idx;
-          const bool inwin = (b >= a) && j >= a && j <= b;
-          const float s = inwin ? ss[rr * VT_PAM_BK + uint(idx)] * p.scale : -INFINITY;
-          ss[rr * VT_PAM_BK + uint(idx)] = s;
-          mc = max(mc, s);
+        const int j = j0 + int(tiisg);
+        inwin = (b >= a) && j >= a && j <= b;
+        sc = inwin ? ss[rr * VT_PAM_BK + tiisg] * p.scale : -INFINITY;
+      }
+      const float mc = simd_max(sc);
+      float corr = 1.0f;
+      if (mc > -INFINITY) {
+        const float mold = smax[rr];
+        const float mnew = max(mold, mc);
+        corr = mold == -INFINITY ? 0.0f : exp(mold - mnew);
+        const float e0 = inwin ? exp(sc - mnew) : 0.0f;
+        const float ls = simd_sum(e0);
+        if (int(tiisg) < int(VT_PAM_BK)) {
+          sp[rr * VT_PAM_BK + tiisg] = (int(tiisg) < jc) ? e0 : 0.0f;
         }
-        if (mc > -INFINITY) {
-          const float mold = smax[rr];
-          const float mnew = max(mold, mc);
-          corr = mold == -INFINITY ? 0.0f : exp(mold - mnew);
-          float ls = 0.0f;
-          for (int idx = 0; idx < jc; ++idx) {
-            const float e0 = exp(ss[rr * VT_PAM_BK + uint(idx)] - mnew);
-            sp[rr * VT_PAM_BK + uint(idx)] = e0;
-            ls += e0;
-          }
+        if (tiisg == 0u) {
           smax[rr] = mnew;
           slsum[rr] = slsum[rr] * corr + ls;
-        } else {
-          corr = 1.0f;  // nothing in window this block: O and l stay as they are
-          for (int idx = 0; idx < jc; ++idx) { sp[rr * VT_PAM_BK + uint(idx)] = 0.0f; }
         }
       } else {
-        for (int idx = 0; idx < jc; ++idx) { sp[rr * VT_PAM_BK + uint(idx)] = 0.0f; }
+        // Nothing in this row's window this chunk: zero the row so the shared V
+        // accumulation contributes nothing, and leave O untouched (corr = 1).
+        if (int(tiisg) < int(VT_PAM_BK)) { sp[rr * VT_PAM_BK + tiisg] = 0.0f; }
       }
-      for (int idx = jc; idx < int(VT_PAM_BK); ++idx) {
-        sp[rr * VT_PAM_BK + uint(idx)] = 0.0f;
+      if (tiisg == 0u) {
+        sdiag[(rr / 8u) * 64u + (rr % 8u) * 8u + (rr % 8u)] = corr;
       }
-      // diag(corr) for this row, in its row block's 8x8.
-      sdiag[(rr / 8u) * 64u + (rr % 8u) * 8u + (rr % 8u)] = corr;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
