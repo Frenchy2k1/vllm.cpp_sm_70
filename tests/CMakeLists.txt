@@ -706,6 +706,16 @@ target_compile_definitions(test_qwen3_paged_engine PRIVATE
 target_include_directories(test_qwen3_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# ROAD-V1-D4-APC W3 — the cache-ON automatic-prefix-caching e2e gate on Qwen3-4B
+# (dense, full-attention, APC-eligible): APC-ON == APC-OFF token-exact (RED-first
+# cache-bug catch) + non-zero hit counters + vLLM K-run membership + prefill/TTFT
+# drop (checkpoint-gated, dgx-only; skips on CPU/CI when the snapshot is absent).
+vllm_cpp_add_test(test_qwen3_apc_e2e parity/test_qwen3_apc_e2e.cpp)
+target_compile_definitions(test_qwen3_apc_e2e PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen3_apc_e2e PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # GLM-4-9B-0414 (Glm4ForCausalLM) dense SACRED gate — first GLM-family model (G2).
 vllm_cpp_add_test(test_glm4_paged_engine parity/test_glm4_paged_engine.cpp)
 target_compile_definitions(test_glm4_paged_engine PRIVATE
