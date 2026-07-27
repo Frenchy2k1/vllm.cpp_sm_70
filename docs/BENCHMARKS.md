@@ -2555,6 +2555,36 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal GEMM roofline vs MLX on Apple M4 (2026-07-27) - the kernel is 3x off
+
+**Timed in ISOLATION at real prefill shapes, against MLX's steel GEMM in the same
+binary via the provider seam** (opt-in `VT_MM_BENCH=1` microbenchmark). End-to-end
+deltas could not say whether the kernel or its surroundings were at fault.
+
+| shape | ours | MLX steel | ratio |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 990 GFLOP/s | 2640 | **2.7x** |
+| mlp-up 512x2048x6144 | 1019 | 3325 | **3.3x** |
+| mlp-dn 512x6144x2048 | 1002 | 3293 | **3.3x** |
+
+Ours ~1.0 TFLOP/s (~23% of the M4's ~4.3 TFLOPS fp32 peak); MLX ~77%. **The gap
+is inside our kernel.** Dispatch, staging branches, barriers and tile width were
+each measured and excluded beforehand.
+
+**This also reframes the MLX provider.** MLX's raw GEMM is 3x ours, yet enabling
+the provider measured no faster end to end (12.21 vs 12.17 s). Study §5.2 says
+`Matmul::eval_gpu` re-`set_data`s its output from MLX's allocator, so every
+delegated GEMM pays an O(M*N) copy back plus its own commit+wait — megabytes per
+call at prefill shapes. **Fixing the provider's output path is now the cheaper
+route to prefill parity than rewriting our kernel.**
+
+**Dead end:** keeping operands in bf16 through the mma (what MLX does) does NOT
+compile — `simdgroup_load` has no bfloat-matrix overload on this toolchain. MSL
+supports half and float simdgroup matrices only. Staging as `half` was refused:
+it saturates at 65504 and activation outliers can exceed that.
+
+---
+
 ## Metal typed GEMV load path on Apple M4 (2026-07-27) - INDICATIVE
 
 **Third parity lever.** The decode GEMV is ~50% of GPU time and every element

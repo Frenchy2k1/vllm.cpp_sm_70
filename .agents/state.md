@@ -25824,3 +25824,39 @@ the tile's compute; the branch was never its cost, unlike the GEMV's inner loop.
 against MLX-LM's 4.59 s; prefill ~2.5 s against ~0.47 s. Prefill is again the
 dominant gap, and the mm kernel's limit is still unidentified: barriers (BK=32),
 tile width (64x64) and staging branches have all been measured and excluded.
+
+---
+
+## 2026-07-27 — GEMM roofline: our kernel is 3x off MLX; the provider's output copy is the cheaper fix
+
+**The decisive diagnostic for the parity goal**, and the reason to stop guessing.
+End-to-end deltas could not attribute the prefill gap, so the mm kernel was timed
+in ISOLATION at real prefill shapes against MLX's steel GEMM in the same binary
+(opt-in `VT_MM_BENCH=1` microbenchmark, committed as a permanent tool).
+
+| shape | ours | MLX steel | ratio |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 990 GFLOP/s | 2640 | 2.7x |
+| mlp-up 512x2048x6144 | 1019 | 3325 | 3.3x |
+| mlp-dn 512x6144x2048 | 1002 | 3293 | 3.3x |
+
+Ours ~1.0 TFLOP/s = ~23% of the M4's ~4.3 TFLOPS fp32 peak; MLX ~77%. **The gap
+is inside our kernel.** Dispatch, staging branches, barriers and tile width were
+each measured and excluded first.
+
+**This reframes the MLX provider and changes the recommended next step.** MLX's
+raw GEMM is 3x ours, yet enabling the provider measured NO faster end to end
+(12.21 vs 12.17 s at b=1). Study §5.2 already recorded why: `Matmul::eval_gpu`
+re-`set_data`s its output from MLX's own allocator, so every delegated GEMM pays
+an O(M*N) copy back plus its own commit+wait, which at prefill shapes is
+megabytes per call. **Fixing the provider's output path is now cheaper than
+rewriting our kernel, and it would inherit MLX's 3x directly.**
+
+**Dead end recorded:** keeping operands in bf16 through the mma (what MLX does,
+halving LDS traffic) does NOT compile — `simdgroup_load` has no bfloat-matrix
+overload on this toolchain; MSL's simdgroup_matrix supports half and float only.
+Staging as `half` was REFUSED rather than tried: half saturates at 65504 and
+activation outliers can exceed it, which trades a correctness hazard for speed.
+
+**Goal:** 14.25 of 27.9 tok/s. Ranked next steps are now (1) the MLX provider
+output path, (2) our own GEMM toward MLX's 77% of peak.

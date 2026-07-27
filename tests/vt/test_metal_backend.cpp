@@ -1541,3 +1541,55 @@ TEST_CASE("Metal routes m>1 BT matmul to the simdgroup GEMM and matches the CPU 
   }
   metal.DestroyQueue(q);
 }
+
+// ===========================================================================
+// GEMM micro-benchmark (opt-in via VT_MM_BENCH=1). Prefill is the dominant
+// remaining gap to MLX-LM and the mm kernel's limit is unidentified: barriers,
+// tile width and staging branches have each been measured and excluded. This
+// times the kernel in ISOLATION at the model's real prefill shapes and reports
+// achieved GFLOP/s, so the next decision rests on the kernel's own roofline
+// rather than on an end-to-end delta. With MLX built in, the same binary times
+// MLX's steel GEMM on the identical shape, which is the only apples-to-apples
+// answer to "how far off is our kernel".
+TEST_CASE("Metal GEMM microbenchmark" * doctest::skip(true)) {
+  if (std::getenv("VT_MM_BENCH") == nullptr) return;
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+
+  struct Shape { const char* name; int64_t m, k, n; };
+  const Shape shapes[] = {
+      {"qkv     512x2048x2048", 512, 2048, 2048},
+      {"mlp-up  512x2048x6144", 512, 2048, 6144},
+      {"mlp-dn  512x6144x2048", 512, 6144, 2048},
+  };
+  for (const Shape& s : shapes) {
+    std::vector<uint16_t> ah(static_cast<size_t>(s.m * s.k), vt::F32ToBF16(0.01f));
+    std::vector<uint16_t> bh(static_cast<size_t>(s.n * s.k), vt::F32ToBF16(0.02f));
+    void* da = metal.Alloc(ah.size() * 2);
+    void* db = metal.Alloc(bh.size() * 2);
+    void* dc = metal.Alloc(static_cast<size_t>(s.m * s.n) * 2);
+    metal.Copy(q, da, ah.data(), ah.size() * 2);
+    metal.Copy(q, db, bh.data(), bh.size() * 2);
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {s.m, s.k});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {s.n, s.k});
+    Tensor tc = Tensor::Contiguous(dc, vt::DType::kBF16, d, {s.m, s.n});
+
+    vt::MatmulBT(q, tc, ta, tb);  // warm up: pipeline build, first-touch
+    metal.Synchronize(q);
+
+    const int iters = 20;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) vt::MatmulBT(q, tc, ta, tb);
+    metal.Synchronize(q);
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double flops = 2.0 * double(s.m) * double(s.k) * double(s.n) * iters;
+    const double bytes = 2.0 * (double(s.m) * s.k + double(s.n) * s.k) * iters;
+    MESSAGE("GEMM " << s.name << ": " << (secs / iters * 1e3) << " ms/iter, "
+                    << (flops / secs / 1e9) << " GFLOP/s, "
+                    << (bytes / secs / 1e9) << " GB/s operand read");
+    metal.Free(da); metal.Free(db); metal.Free(dc);
+  }
+  metal.DestroyQueue(q);
+}
