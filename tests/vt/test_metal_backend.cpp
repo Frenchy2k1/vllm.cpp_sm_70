@@ -1218,3 +1218,152 @@ TEST_CASE("Metal chains batched dispatches in order without intermediate sync") 
   metal.Free(x);
   metal.DestroyQueue(q);
 }
+
+// ===========================================================================
+// M3d — the decode GEMV fast path. Shape-class profiling showed 21,464 of the
+// 21,632 matmuls in a 128-token generation are m=1 (decode) and ALL take the BT
+// orientation; only 168 are prefill GEMMs. The 16x16 tile kernel wastes 15 of
+// every 16 threadgroup rows on m=1, so decode gets its own kernel. BT is what
+// makes it worth doing: B row `col` is contiguous over k, so a simdgroup can
+// read it fully coalesced and reduce with simd_sum.
+TEST_CASE("Metal routes m=1 BT matmul to the GEMV kernel and matches the CPU oracle") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+
+  // Ragged K included deliberately: the GEMV strides k by the simd width, so a
+  // K that is not a multiple of it exercises the remainder tail, which is where
+  // a hand-rolled reduction loop goes wrong.
+  struct Case { const char* name; int64_t k, n; };
+  const Case cases[] = {
+      {"decode 1x2048x2048", 2048, 2048},
+      {"mlp-width 1x2048x6144", 2048, 6144},
+      {"ragged K 1x1000x777", 1000, 777},
+  };
+  // An f32 arm FIRST, because the bf16 arms below cannot discriminate kernels:
+  // at bf16 output the NMSE is dominated by store rounding (~1.7e-3 relative,
+  // i.e. ~2.8e-6 NMSE) and two kernels with different accumulation orders land
+  // on identical bf16 values. Only f32 exposes the accumulation itself.
+  {
+    const int64_t k = 2048, n = 512;
+    std::mt19937 rng(0xF00Du);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> ah(static_cast<size_t>(k)), bh(static_cast<size_t>(k * n));
+    for (auto& x : ah) x = dist(rng);
+    for (auto& x : bh) x = dist(rng);
+    std::vector<double> ref(static_cast<size_t>(n), 0.0);
+    for (int64_t col = 0; col < n; ++col) {
+      double acc = 0.0;
+      for (int64_t kk = 0; kk < k; ++kk) {
+        acc += double(ah[static_cast<size_t>(kk)]) * double(bh[static_cast<size_t>(col * k + kk)]);
+      }
+      ref[static_cast<size_t>(col)] = acc;
+    }
+    auto up = [&](const std::vector<float>& h) {
+      void* q2 = metal.Alloc(h.size() * sizeof(float));
+      metal.Copy(q, q2, h.data(), h.size() * sizeof(float));
+      return q2;
+    };
+    void* da = up(ah);
+    void* db = up(bh);
+    void* dc = metal.Alloc(static_cast<size_t>(n) * sizeof(float));
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {1, k});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {n, k});
+    Tensor tc = Tensor::Contiguous(dc, vt::DType::kF32, d, {1, n});
+    vt::MatmulBT(q, tc, ta, tb);
+    metal.Synchronize(q);
+    std::vector<float> got(static_cast<size_t>(n));
+    metal.Copy(q, got.data(), dc, got.size() * sizeof(float));
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      const double diff = double(got[i]) - ref[i];
+      num += diff * diff;
+      den += ref[i] * ref[i];
+    }
+    const double f32_nmse = den > 0.0 ? num / den : num;
+    MESSAGE("GEMV f32 1x2048x512 NMSE vs f64 oracle = " << f32_nmse);
+    // f32 accumulation over K=2048 should sit near 1e-14, as the tile GEMM's
+    // f32 arm does (3.7e-14). Orders above that would mean a real defect, not a
+    // reduction-order difference.
+    CHECK(f32_nmse <= 1e-10);
+    metal.Free(da);
+    metal.Free(db);
+    metal.Free(dc);
+  }
+
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    std::mt19937 rng(0xBEEFu);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> ah(static_cast<size_t>(c.k));
+    std::vector<float> bh(static_cast<size_t>(c.k * c.n));
+    for (auto& x : ah) x = Bf16RT(dist(rng));
+    for (auto& x : bh) x = Bf16RT(dist(rng));
+
+    // CPU oracle: f32 accumulation over K, exactly the reference math.
+    std::vector<float> ref(static_cast<size_t>(c.n), 0.0f);
+    for (int64_t col = 0; col < c.n; ++col) {
+      float acc = 0.0f;
+      for (int64_t kk = 0; kk < c.k; ++kk) {
+        acc += ah[static_cast<size_t>(kk)] * bh[static_cast<size_t>(col * c.k + kk)];
+      }
+      ref[static_cast<size_t>(col)] = acc;
+    }
+
+    auto upload_bf16 = [&](const std::vector<float>& h) {
+      void* p = metal.Alloc(h.size() * sizeof(uint16_t));
+      std::vector<uint16_t> packed(h.size());
+      for (size_t i = 0; i < h.size(); ++i) packed[i] = vt::F32ToBF16(h[i]);
+      metal.Copy(q, p, packed.data(), packed.size() * sizeof(uint16_t));
+      return p;
+    };
+    void* da = upload_bf16(ah);
+    void* db = upload_bf16(bh);
+    void* dc = metal.Alloc(static_cast<size_t>(c.n) * sizeof(uint16_t));
+
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {1, c.k});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {c.n, c.k});
+    Tensor tc = Tensor::Contiguous(dc, vt::DType::kBF16, d, {1, c.n});
+
+    const bool was_on = vt::metal::ProfileEnabled();
+    vt::metal::SetProfileEnabled(true);
+    vt::metal::ResetProfile();
+
+    vt::MatmulBT(q, tc, ta, tb);
+    metal.Synchronize(q);
+
+    // PROVE THE FAST PATH RAN. A numeric check alone cannot: the tile kernel
+    // computes the same answer, so a silent failure to route would look
+    // identical to success.
+    bool saw_gemv = false;
+    for (const vt::metal::ProfileRow& r : vt::metal::GetProfileRows()) {
+      if (r.name == "vt_matmul_bt_gemv") saw_gemv = true;
+    }
+    CHECK(saw_gemv);
+    vt::metal::SetProfileEnabled(was_on);
+    vt::metal::ResetProfile();
+
+    std::vector<uint16_t> packed_out(static_cast<size_t>(c.n));
+    metal.Copy(q, packed_out.data(), dc, packed_out.size() * sizeof(uint16_t));
+    std::vector<float> got(static_cast<size_t>(c.n));
+    for (size_t i = 0; i < got.size(); ++i) got[i] = vt::BF16ToF32(packed_out[i]);
+
+    // NMSE, not bit-exactness: simd_sum is a tree reduction where the CPU
+    // reference is sequential, so a different rounding order is expected and
+    // stated rather than papered over.
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      const double diff = double(got[i]) - double(ref[i]);
+      num += diff * diff;
+      den += double(ref[i]) * double(ref[i]);
+    }
+    const double nmse = den > 0.0 ? num / den : num;
+    CAPTURE(nmse);
+    CHECK(nmse <= 5e-4);
+
+    metal.Free(da);
+    metal.Free(db);
+    metal.Free(dc);
+  }
+  metal.DestroyQueue(q);
+}

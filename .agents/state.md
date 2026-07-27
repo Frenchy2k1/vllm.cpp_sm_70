@@ -25368,3 +25368,51 @@ the 98.4% GPU-bound result says is now worth little.
 **Next.** `M3d` (simdgroup-matrix GEMM) is the live lever: at 98.4% GPU-bound
 the dispatch path has almost nothing left to give, and `vt_matmul` still holds
 the bulk of GPU time. `M3c-3`/`M3c-4` unchanged.
+
+---
+
+## 2026-07-27 — `M3d` LANDED as a decode GEMV (the row's premise was wrong), plus a Metal golden re-capture
+
+**Row:** `BACKEND-METAL-MLX` (work row `M3d`). **Spec:**
+[metal-dispatch-attribution.md](specs/metal-dispatch-attribution.md).
+
+**The premise was refuted before any kernel was written.** `M3d` said
+"simdgroup-matrix GEMM". Shape-class profiling after `M3c-1` showed **21,464 of
+21,632 matmuls are m=1 decode GEMVs, all BT**; only 168 are prefill GEMMs. A
+simdgroup-matrix kernel would have optimised 0.8% of the dispatches. Built a
+GEMV instead: one simdgroup per output column over the contiguous BT weight row,
+`simd_sum` reduction.
+
+**Measured.** b=1 **5.41 -> 10.51 tok/s = 1.94x**. b=16 unchanged (1.00x) and
+that is an INERTNESS CONTROL: at b=16 the decode m is 16 so the path is not
+taken, and the arms match to 0.1%. Batched decode (m=2..16) still uses the tile
+kernel; that is the obvious follow-up.
+
+**It is 27x MORE accurate** (f32 NMSE 2.68e-14 vs 7.40e-13), which is what broke
+the gate. The bf16 parity arms cannot discriminate the kernels at all (store
+rounding dominates; both print 2.8e-06), so an f32 arm was added to the suite to
+separate a defect from a rounding-order change. Without it I would have been
+guessing.
+
+**The SACRED gate went red and was RE-CAPTURED, not weakened.**
+`our_ids_metal.npy` was captured with the LESS accurate kernel, so it is
+kernel-specific and went stale the moment numerics improved. Documented flow
+followed: M4 dump, then vLLM 0.25.0 teacher-forced on dgx in a SCRATCH dir so the
+CUDA goldens could not be touched. 4 of 256 tokens changed, all prompt 10. The
+oracle likes the NEW sequence better: **255/256 tokens are vLLM's own argmax
+(old: 253/256)**, mean gap 0.7 vs 1.5 mnats, 0 outside top-K. Gate 16/16, same
+10 strict + 6 band split, max gap 0.188 nats.
+
+**Harness fix that the procedure required:** the anchor `REQUIRE` fired before
+the `VT_DUMP_IDS` dump was written, making the documented re-capture impossible
+to execute. The anchor assertion is now skipped in dump mode only. Teeth
+unchanged, and demonstrated empirically: the gate failed on this very change
+before the re-capture.
+
+**Isolation, stated:** weaker than the `M3c-1` numbers. The GPU lock was held
+across the alternating A/B, but darwin CI jobs were active and the runners were
+NOT paused (the pause script correctly refused to boot a runner mid-job).
+
+**Next.** A small-m GEMM for batched decode (m=2..16), and the simdgroup-matrix
+GEMM for the 168 prefill dispatches, which is now a much smaller row than `M3d`
+originally implied. `M3c-3`/`M3c-4` unchanged.

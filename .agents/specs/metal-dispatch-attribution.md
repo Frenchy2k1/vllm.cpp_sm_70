@@ -196,7 +196,8 @@ FOLLOW-UP rows will touch, named now so the work breakdown is grounded:
 `metal_ops.mm` (`Encoder` lifetime, `M3c-1`/`M3c-2`), `metal_msl.h` +
 `metal_ops.mm` (`kFusedChain` coverage for the elementwise chain, `M3c-3`),
 `metal_mlx_provider.mm` (provider-side attribution and command-buffer sharing,
-`M3c-4`/`M5b`), `metal_msl.h` (simdgroup GEMM, `M3d`).
+`M3c-4`/`M5b`), `metal_msl.h` (`vt_matmul_bt_gemv`, `M3d`; a simdgroup-matrix
+GEMM for prefill remains unbuilt).
 
 ### Tests to port
 
@@ -230,8 +231,10 @@ unchanged.
 - **Hardware:** the M4 is the only Apple box available; it has Command Line
   Tools only, so Instruments/`xctrace` is unavailable and this in-process
   instrument is the sole trace source. No other Apple silicon is claimed.
-- **Blocking order:** `M3d` (simdgroup GEMM) DEPENDS on `M3c-1`+`M3c-2`; its win
-  is unobservable end to end while dispatch dominates. `M5b` depends on `M3c-4`
+- **Blocking order (CONFIRMED, then re-scoped):** `M3d` depended on `M3c-1`, and
+  with dispatch fixed it did land a 1.89x win. But the SHAPE of `M3d` named here
+  was wrong: profiling after `M3c-1` showed the time is in m=1 GEMVs, not in the
+  prefill GEMMs a simdgroup-matrix kernel would serve. `M5b` depends on `M3c-4`
   for the evidence to judge it.
 - **Quiet-box dependency:** a BINDING number additionally needs
   `com.localai.worker` booted out and the aerial wallpaper disabled, both of
@@ -248,7 +251,7 @@ unchanged.
 | `M3c-2` | **SUBSUMED BY `M3c-1`, 2026-07-27.** The batched design already waits only at flush points (`Synchronize`/`Copy`/`Memset`/`Free`/`DestroyQueue`), never per op | The spec expected these to be separable; the implementation showed they are not. Recorded rather than left as phantom remaining work. What is still owed is ASYNC flush (commit without `waitUntilCompleted`, double-buffered), which the 98.4% GPU-bound result says is now worth little |
 | `M3c-3` | Route the tiny elementwise chain (rms_norm, silu, rope, reshape_and_cache) through the existing `kFusedChain` Tier-1 interpreter on Metal | Cuts dispatch COUNT at source: those four are 25,216 of 50,944 dispatches for 0.8% of GPU work |
 | `M3c-4` | Instrument the MLX provider path so the MLX arm is fully attributed | Removes the 10.08 s blind spot; a gate cannot bind on a partially attributed arm |
-| `M3d` | Simdgroup-matrix GEMM replacing the threadgroup tile loop | Real (20.75 s GPU, 78.3% efficient) but BLOCKED behind `M3c` |
+| `M3d` | **RE-SCOPED AND LANDED 2026-07-27 as a decode GEMV, NOT the simdgroup GEMM this row assumed.** Shape-class profiling after `M3c-1` showed **21,464 of 21,632 matmuls are m=1 decode GEMVs, all BT**; only 168 are prefill GEMMs, so the simdgroup-matrix GEMM would have optimised 0.8% of the dispatches. Implemented instead: one simdgroup per output column, streaming the contiguous BT weight row coalesced, reduced with `simd_sum` | **1.89x** decode and **27x more accurate** (f32 NMSE 2.68e-14 vs the tile kernel's 7.40e-13). Required a Metal golden re-capture with vLLM-oracle re-validation, because the committed golden was captured with the less accurate kernel. The simdgroup-matrix GEMM for the 168 prefill dispatches is UNBUILT and is now a separate, much smaller row |
 | `M5b` | Share a command buffer with MLX's stream instead of committing per delegated op | The measured form of study §5.3's sync tax |
 
 ### Risks/decisions
