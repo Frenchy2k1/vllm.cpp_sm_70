@@ -270,6 +270,24 @@ the remaining gap. An optional MLX GEMM provider is available via
 per-lever chronology: [docs/BENCHMARKS.md](BENCHMARKS.md) and
 [.agents/specs/metal-dispatch-attribution.md](../.agents/specs/metal-dispatch-attribution.md).
 
+**CUDA architectures.** The production target is GB10/`sm_121a` (runtime-gated,
+both gate models token-exact + at/above vLLM speed). The arch-additivity
+framework makes adding a CUDA architecture a data edit; `sm_120a`, `sm_90a`,
+Ampere/Ada `sm_80/86/87/89`, datacenter Blackwell `sm_100a/103a` and `sm_110` are
+**BUILD-supported, portable-kernels-only** (they compile `-Werror`-clean and emit
+real per-arch SASS on dgx, but no such board runs here, so none is runtime
+support). The **Ampere major-8 fast-path bring-up is now SPIKED** as a
+derive-and-ship campaign
+([.agents/specs/cuda-arch-ampere-fastpath.md](../.agents/specs/cuda-arch-ampere-fastpath.md)):
+the fast-path kernel bodies vLLM builds for Ampere (FA2, Marlin int4 W4A16 +
+fp8-input, AllSpark W8A16, CUTLASS scaled-mm C2x) will be ported 1:1, build-verified,
+and shipped **labeled** DERIVED+BUILD-VERIFIED (testing-welcome) — a build is never
+a runtime claim. AGX Orin (`sm_87`) is the one reachable non-GB10 board and the
+sole target that reaches RUNTIME-VERIFIED, gating the first non-GB10 runtime proof
+token-exact vs the vLLM 0.25.0 oracle. FA2 is a one-cell table edit (the vendored
+kernels are already the sm_80 FlashAttention-2 bodies); AllSpark and scaled-mm C2x
+are new bodies; Marlin needs its int4/fp8 instantiations.
+
 ## Serving and API notes
 
 - **Automatic prefix caching (APC)** is on by default for dense models (hybrid /
