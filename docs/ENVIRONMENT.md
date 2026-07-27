@@ -19,6 +19,7 @@ These change how the engine runs and have no CLI flag (or complement one).
 |---|---|---|
 | `VLLM_CPP_CPU_THREADS` | hardware concurrency | Overrides the CPU threadpool width. The single most useful CPU-deployment knob; there is no CLI flag for it |
 | `VLLM_PREFIX_CACHING_HASH_SEED` | `0` (fixed) | Seed for the prefix-cache block hash, mirroring vLLM's `PYTHONHASHSEED`. `random` makes block hashes non-deterministic across processes, which takes any persisted or shared KV cache to a 0% hit rate. Keep it fixed if you rely on cross-process prefix reuse |
+| `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES` | `1` (on) | Whether published KV-cache events carry block hashes as an int (the low 64 bits of the sha256 digest) rather than the raw 32 bytes, mirroring vLLM's env of the same name and its default. Set `0` to publish the raw bytes. Only affects the KV-cache event payload (`--kv-events-config`); it does not change the internal block hashing or the cache itself |
 | `VT_LMCACHE_HOST` | `127.0.0.1` | Default LMCache server host for the `lm://` connector. The `kv_connector_extra_config.host` key overrides it. See [KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `VT_LMCACHE_PORT` | `65432` | Default LMCache server port. The `kv_connector_extra_config.port` key overrides it |
 | `VT_LMCACHE_HASH_ALGO` | `blake3` | Default LMCache key-derivation algorithm. Set `vllm` (alias `sha256_cbor`) for byte-for-byte interop with a real vLLM + LMCache peer. The `kv_connector_extra_config.hash_algo` key overrides it |

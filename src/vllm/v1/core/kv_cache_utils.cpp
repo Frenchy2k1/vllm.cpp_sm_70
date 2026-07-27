@@ -342,6 +342,34 @@ const NoneHashProvenance& none_hash_provenance() {
   return g_none_hash_provenance;
 }
 
+ExternalBlockHash maybe_convert_block_hash(const BlockHash& hash_bytes) {
+  // kv_cache_utils.py:79-82. Upstream parses the env with
+  // `bool(int(os.getenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "1")))`
+  // (envs.py:1816-1817) — DEFAULT "1" => True => convert to int. Only "0"
+  // (or another falsy int) keeps the raw bytes.
+  bool use_int = true;  // upstream default.
+  if (auto env = GetEnvNonEmpty("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES")) {
+    try {
+      use_int = std::stoll(*env) != 0;
+    } catch (const std::exception&) {
+      // Mirror Python: a non-integer value raises; we conservatively keep the
+      // default rather than abort a running server on a malformed env.
+      use_int = true;
+    }
+  }
+  if (!use_int) {
+    return ExternalBlockHash{hash_bytes};
+  }
+  // Low 64 bits of the big-endian digest == the last 8 bytes, big-endian.
+  uint64_t value = 0;
+  const size_t n = hash_bytes.size();
+  const size_t start = n > 8 ? n - 8 : 0;
+  for (size_t i = start; i < n; ++i) {
+    value = (value << 8) | static_cast<uint8_t>(hash_bytes[i]);
+  }
+  return ExternalBlockHash{value};
+}
+
 void init_none_hash(const HashFn& hash_fn, std::optional<std::string> seed) {
   NoneHashSeedSource source = NoneHashSeedSource::kExplicit;
 

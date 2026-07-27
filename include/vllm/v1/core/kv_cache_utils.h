@@ -91,6 +91,24 @@ using BlockHash = std::string;
 // bytes. Upstream: `NewType("BlockHashWithGroupId", bytes)`.
 using BlockHashWithGroupId = std::string;
 
+// ExternalBlockHash — the reproducible, externally-published form of a block
+// hash (kv_cache_utils.py:51-54). A union of the raw sha256 bytes and an int
+// (the low 64 bits), kept for backward compatibility after block hashing
+// defaulted to sha256 bytes. It is consumed ONLY by the KV-cache event payload
+// (vllm/distributed/kv_events.py). std::string holds the raw bytes variant;
+// uint64_t holds the int-truncated variant.
+using ExternalBlockHash = std::variant<std::string, uint64_t>;
+
+// maybe_convert_block_hash (kv_cache_utils.py:79-82): the sole crossing point of
+// a block hash into the external event stream.
+//   - By DEFAULT (env VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES parses truthy; its
+//     upstream default is "1" -> True, envs.py:1816-1817), narrows the digest to
+//     its low 64 bits, i.e. `int.from_bytes(hash_bytes, "big") & ((1<<64)-1)` —
+//     the last 8 bytes interpreted big-endian.
+//   - When the env is set to a falsy value ("0"), passes the raw bytes through.
+// Mirrors upstream's `bool(int(os.getenv(name, "1")))` parse.
+ExternalBlockHash maybe_convert_block_hash(const BlockHash& hash_bytes);
+
 // ---------------------------------------------------------------------------
 // Block-hash packing (make_block_hash_with_group_id / get_block_hash /
 // get_group_id). Mirrors upstream: the group id is encoded using 4 bytes in

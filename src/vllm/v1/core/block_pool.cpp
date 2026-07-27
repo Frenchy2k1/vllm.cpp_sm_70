@@ -100,7 +100,9 @@ void BlockPool::cache_full_blocks(
 
   // new_block_hashes = block_hashes[num_cached_blocks:]; indexed as
   // block_hashes[num_cached_blocks + i] below.
-  // new_hashes (KV-cache events) — DEFERRED (see header).
+  // new_hashes collects the external hashes for the BlockStored event, in the
+  // same block order (only when events are enabled). Mirrors block_pool.py:268.
+  std::vector<distributed::ExternalBlockHash> new_hashes;
   for (int i = 0; i < num_new_full; ++i) {
     KVCacheBlock* blk = blocks_arg[num_cached_blocks + i];
     // Some blocks may be null or masked out (sparse/sliding-window attention or
@@ -117,15 +119,135 @@ void BlockPool::cache_full_blocks(
     if (blk->block_hash().has_value()) {
       // The only valid case where a "new full block" already has a hash is a
       // partial->full promotion of the same cache block — DEFERRED (requires the
-      // partial primitives). See header.
+      // partial primitives). See header. (Upstream emits BlockRemoved for the
+      // superseded hashes here; unreachable while promotion throws.)
       throw std::runtime_error(
           "BlockPool::cache_full_blocks: partial->full promotion not yet "
           "ported");
     }
     _insert_block_hash(block_hash_with_group_id, blk, num_hash_tokens);
-    // enable_kv_cache_events (maybe_convert_block_hash append) — DEFERRED.
+    if (enable_kv_cache_events) {
+      new_hashes.push_back(maybe_convert_block_hash(block_hash));
+    }
   }
-  // enable_kv_cache_events (BlockStored emission) — DEFERRED (see header).
+
+  // BlockStored emission (block_pool.py:301-342). Guarded: the default
+  // (events-off) path never runs any of this, so it stays byte-identical.
+  if (!enable_kv_cache_events) {
+    return;
+  }
+  std::optional<distributed::ExternalBlockHash> parent_block_hash;
+  if (num_cached_blocks != 0) {
+    parent_block_hash =
+        maybe_convert_block_hash(block_hashes[num_cached_blocks - 1]);
+  }
+  const int start_token_idx = num_cached_blocks * block_size;
+  const int end_token_idx = num_full_blocks * block_size;
+
+  // Per-block extra keys (one entry per non-null / non-masked block), matching
+  // the length of new_hashes. block_pool.py:317-329.
+  std::vector<distributed::EventExtraKey> extra_keys_list;
+  int curr_mm_idx = 0;
+  for (int i = num_cached_blocks; i < num_full_blocks; ++i) {
+    if (blocks_arg[i]->is_null) {
+      continue;
+    }
+    if (block_mask.has_value() && !(*block_mask)[i - num_cached_blocks]) {
+      continue;
+    }
+    const int block_start = i * block_size;
+    const int block_end = block_start + block_size;
+    std::pair<ExtraKeys, int> extra = generate_block_hash_extra_keys(
+        request, block_start, block_end, curr_mm_idx);
+    curr_mm_idx = extra.second;
+    extra_keys_list.push_back(std::move(extra.first));
+  }
+
+  kv_event_queue.emplace_back(_build_block_stored_event(
+      request, std::move(new_hashes), parent_block_hash, start_token_idx,
+      end_token_idx, block_size, kv_cache_group_id, std::move(extra_keys_list)));
+}
+
+distributed::BlockStored BlockPool::_build_block_stored_event(
+    const Request& request,
+    std::vector<distributed::ExternalBlockHash> block_hashes,
+    std::optional<distributed::ExternalBlockHash> parent_block_hash,
+    int start_token_idx, int end_token_idx, int block_size,
+    int kv_cache_group_id,
+    std::vector<distributed::EventExtraKey> extra_keys_list) const {
+  // block_pool.py:344-371.
+  const std::vector<int32_t> all_tokens = request.AllTokenIds();
+  std::vector<int64_t> token_ids;
+  const int lo = start_token_idx < 0 ? 0 : start_token_idx;
+  const int hi = end_token_idx > static_cast<int>(all_tokens.size())
+                     ? static_cast<int>(all_tokens.size())
+                     : end_token_idx;
+  token_ids.reserve(static_cast<size_t>(hi > lo ? hi - lo : 0));
+  for (int i = lo; i < hi; ++i) {
+    token_ids.push_back(static_cast<int64_t>(all_tokens[i]));
+  }
+
+  distributed::BlockStored event;
+  event.block_hashes = std::move(block_hashes);
+  event.parent_block_hash = std::move(parent_block_hash);
+  event.token_ids = std::move(token_ids);
+  event.block_size = block_size;
+  // lora_id: the DEPRECATED int adapter id. The T0 Request carries only
+  // lora_name (LORA-RUNTIME defers the adapter id), so this stays None — exactly
+  // upstream's value on the base-model path (lora_request is None). On the
+  // text/base path lora_name is also None, so the event is byte-identical.
+  event.lora_id = std::nullopt;
+  event.medium = std::string(distributed::MEDIUM_GPU);
+  event.lora_name = request.lora_name;
+  // extra_keys=extra_keys_list if extra_keys_list else None (block_pool.py:369).
+  if (!extra_keys_list.empty()) {
+    event.extra_keys = std::move(extra_keys_list);
+  }
+  event.group_idx = kv_cache_group_id;
+  return event;
+}
+
+void BlockPool::emit_cached_block_events(const Request& request,
+                                         int num_cached_blocks, int block_size,
+                                         int kv_cache_group_id) {
+  // block_pool.py:373-443. Reuse events for prefix-cache hits; state unchanged.
+  if (!enable_kv_cache_events || num_cached_blocks == 0) {
+    return;
+  }
+  // Common path: block_size == hash_block_size, so resolve_block_hashes is the
+  // request's own block_hashes (the align path is DEFERRED, as in
+  // cache_full_blocks).
+  if (block_size != hash_block_size) {
+    throw std::runtime_error(
+        "BlockPool::emit_cached_block_events: align mode "
+        "(block_size != hash_block_size) not yet ported");
+  }
+  const std::vector<BlockHash>& block_hashes = request.block_hashes;
+
+  std::vector<distributed::ExternalBlockHash> cached_hashes;
+  std::vector<distributed::EventExtraKey> extra_keys_list;
+  int curr_mm_idx = 0;
+  for (int i = 0; i < num_cached_blocks; ++i) {
+    const int block_start = i * block_size;
+    const int block_end = block_start + block_size;
+    cached_hashes.push_back(maybe_convert_block_hash(block_hashes[i]));
+    std::pair<ExtraKeys, int> extra = generate_block_hash_extra_keys(
+        request, block_start, block_end, curr_mm_idx);
+    curr_mm_idx = extra.second;
+    extra_keys_list.push_back(std::move(extra.first));
+  }
+  if (cached_hashes.empty()) {
+    return;
+  }
+
+  // Prefix-cache hits always form a contiguous prefix from block 0, so the
+  // parent is None.
+  const int start_token_idx = 0;
+  const int end_token_idx = num_cached_blocks * block_size;
+  kv_event_queue.emplace_back(_build_block_stored_event(
+      request, std::move(cached_hashes), /*parent=*/std::nullopt,
+      start_token_idx, end_token_idx, block_size, kv_cache_group_id,
+      std::move(extra_keys_list)));
 }
 
 std::optional<BlockHashWithGroupId> BlockPool::cache_partial_block(
@@ -240,6 +362,21 @@ std::vector<KVCacheBlock*> BlockPool::get_new_blocks(int num_blocks) {
   return ret;
 }
 
+void BlockPool::_emit_block_removed_events(
+    const std::vector<BlockHashWithGroupId>& block_hashes) {
+  // block_pool.py:592-605.
+  if (!enable_kv_cache_events) {
+    return;
+  }
+  for (const BlockHashWithGroupId& bh : block_hashes) {
+    distributed::BlockRemoved event;
+    event.block_hashes.push_back(maybe_convert_block_hash(get_block_hash(bh)));
+    event.medium = std::string(distributed::MEDIUM_GPU);
+    event.group_idx = static_cast<int64_t>(get_group_id(bh));
+    kv_event_queue.emplace_back(std::move(event));
+  }
+}
+
 bool BlockPool::_maybe_evict_cached_block(KVCacheBlock* block) {
   // metrics_collector.on_block_evicted — DEFERRED (see header).
   std::vector<BlockHashWithGroupId> evicted_hashes =
@@ -248,7 +385,7 @@ bool BlockPool::_maybe_evict_cached_block(KVCacheBlock* block) {
     // The block doesn't have a hash, eviction is not needed.
     return false;
   }
-  // enable_kv_cache_events (BlockRemoved emission) — DEFERRED (see header).
+  _emit_block_removed_events(evicted_hashes);
   return true;
 }
 
@@ -302,7 +439,9 @@ bool BlockPool::reset_prefix_cache() {
     block.reset_hash();
   }
 
-  // enable_kv_cache_events (AllBlocksCleared emission) — DEFERRED (see header).
+  if (enable_kv_cache_events) {
+    kv_event_queue.emplace_back(distributed::AllBlocksCleared{});
+  }
   return true;
 }
 
@@ -321,8 +460,7 @@ double BlockPool::get_usage() const {
 }
 
 std::vector<KVCacheEvent> BlockPool::take_events() {
-  // DEFERRED: KV-cache events are not emitted (see file header). Upstream would
-  // atomically drain kv_event_queue here.
+  // block_pool.py:820-830: atomically drain kv_event_queue (KV-EVENTS).
   if (!enable_kv_cache_events) {
     return {};
   }
