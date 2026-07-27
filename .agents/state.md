@@ -26397,3 +26397,39 @@ more register reuse per staged element).
 
 **Standing goal status (b=1, Qwen3-1.7B-bf16, p=512 g=128):** decode 26.6 vs
 MLX-LM 27.89 = **95.4%**; total-basis 20.91 vs 25.31 = **82.6%**. NOT parity.
+
+---
+
+## 2026-07-27 — Metal GEMM: fatter simdgroup blocks and deeper K both REJECTED
+
+Two more attempts on `vt_matmul_bt_mm` (642 ms, 2.25 TFLOP/s vs MLX steel ~3.07,
+the entire remaining prefill gap). NOTHING LANDED.
+
+**REJECTED — 32x32 per simdgroup (BN 64 -> 128, acc 4x2 -> 4x4).** The last
+untested structural difference from MLX: not tile width (excluded earlier) but
+the number of fragments each SIMDGROUP accumulates. 32x32 issues 16 mma from 8
+fragment loads vs 32x16's 8 from 6, a third less simdgroup_load traffic per FLOP.
+Measured GEMM 642 -> **2113 ms, 3.3x WORSE**; p=512 20.9 -> 16.5 tok/s, TTFT
+1351 -> 2880 ms. That magnitude is a register spill to thread-private memory: 16
+accumulator matrices plus 8 operand fragments exceed the budget. **The fattening
+direction is closed** — the current 8 accumulators are near this GPU's ceiling,
+so the mma-per-load ratio cannot be raised this way.
+
+**REJECTED — BK 16 -> 32.** Halves staging rounds and barriers per k loop.
+GEMM 642.3 vs 642.0 ms: no change whatsoever. Independently reconfirms the
+earlier barrier-traffic exclusion.
+
+**Cumulative exclusion list for this kernel:** tile width, per-simdgroup block
+size (register-bound), barrier traffic, K-tile depth, staging latency, mma
+precision (half AND bf16), epilogue occupancy. Landed over the session: staging
+vectorisation, per-simdgroup epilogue.
+
+**2.25 vs 3.07 TFLOP/s remains unexplained and I have no further identified
+lever.** Recording that plainly rather than as "exhausted": that claim was made
+twice earlier in this log and was wrong both times, each time because a recorded
+negative contained the next step. Anyone picking this up should re-read the
+exclusion list for exactly that reason before assuming the well is dry.
+
+**Standing goal NOT met.** b=1, Qwen3-1.7B-bf16, p=512 g=128: decode 26.6 vs
+MLX-LM 27.89 = 95.4%; total-basis 20.9 vs 25.31 = 82.6%. Long prompts improved
+substantially this session (p=4096 +32%) but neither basis reaches parity.
