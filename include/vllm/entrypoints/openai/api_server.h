@@ -24,6 +24,7 @@
 #define VLLM_ENTRYPOINTS_OPENAI_API_SERVER_H_
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +32,14 @@
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
+
+namespace vllm::tok {
+class Tokenizer;
+}  // namespace vllm::tok
+
+namespace vllm::v1::metrics {
+class PrometheusStatLogger;
+}  // namespace vllm::v1::metrics
 
 namespace vllm::entrypoints::openai {
 
@@ -83,6 +92,49 @@ class ApiServer {
   DispatchResult handle_health() const;
   DispatchResult handle_version() const;
 
+  // ── C8 utility + observability surface (SERVE-METRICS /
+  // SERVE-UTILITY-ENDPOINTS). Each is ADDITIVE and OPT-IN: a route is only
+  // registered when its backing dependency is configured below, so a server
+  // constructed without them behaves byte-identically to before. ──────────────
+
+  // GET /metrics — Prometheus text-0.0.4 exposition
+  // (serve/instrumentator/metrics.py). Registered only when a metrics logger is
+  // attached. Returns 404 (route absent) otherwise; the handler itself returns
+  // the exposition with the prometheus content type.
+  DispatchResult handle_metrics() const;
+  // POST /tokenize, POST /detokenize (serve/tokenize/api_router.py). Registered
+  // only when a tokenizer is attached. Chat-form tokenize (messages+template) is
+  // deferred; the prompt/tokens forms match the vLLM schema exactly.
+  DispatchResult handle_tokenize(const std::string& request_body) const;
+  DispatchResult handle_detokenize(const std::string& request_body) const;
+  // POST /reset_prefix_cache (serve/dev/cache/api_router.py) → {"success": b}.
+  DispatchResult handle_reset_prefix_cache(bool reset_running_requests,
+                                           bool reset_external) const;
+  // GET /ping (serve/sagemaker/api_router.py) — liveness, mirrors /health.
+  DispatchResult handle_ping() const;
+  // GET /server_info (serve/dev/server_info/api_router.py).
+  DispatchResult handle_server_info() const;
+
+  // Attach the Prometheus stat logger backing GET /metrics (non-owning; must
+  // outlive the server). Enables the /metrics route.
+  void set_metrics_logger(const v1::metrics::PrometheusStatLogger* logger) {
+    metrics_ = logger;
+  }
+  // Attach the tokenizer + max_model_len backing /tokenize and /detokenize
+  // (non-owning; must outlive the server).
+  void set_tokenizer(const vllm::tok::Tokenizer* tokenizer,
+                     int64_t max_model_len) {
+    tokenizer_ = tokenizer;
+    max_model_len_ = max_model_len;
+  }
+  // Attach the prefix-cache reset callback backing POST /reset_prefix_cache.
+  // Signature mirrors EngineClient.reset_prefix_cache(reset_running_requests,
+  // reset_external) → success.
+  void set_reset_prefix_cache(
+      std::function<bool(bool, bool)> reset_prefix_cache) {
+    reset_prefix_cache_ = std::move(reset_prefix_cache);
+  }
+
   // Bind host:port, register the routes and serve until stop() (blocking).
   // Returns false if the bind fails.
   bool listen(const std::string& host, int port);
@@ -108,6 +160,12 @@ class ApiServer {
   OpenAIServingChat& chat_;
   OpenAIServingModels& models_;
   std::string version_;
+
+  // Opt-in C8 backings (all nullptr/empty by default → routes not registered).
+  const v1::metrics::PrometheusStatLogger* metrics_ = nullptr;
+  const vllm::tok::Tokenizer* tokenizer_ = nullptr;
+  int64_t max_model_len_ = 0;
+  std::function<bool(bool, bool)> reset_prefix_cache_;
 
   // Opaque httplib::Server (pimpl keeps third_party/httplib.h out of this
   // header — only api_server.cpp and the smoke test pull it in).

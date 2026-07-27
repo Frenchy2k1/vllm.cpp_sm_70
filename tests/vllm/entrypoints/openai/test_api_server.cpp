@@ -63,6 +63,7 @@
 #include "vllm/v1/engine/output_processor.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/metrics/loggers.h"
 #include "vllm/v1/worker/gpu/runner.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -870,6 +871,95 @@ TEST_CASE("api_server: /v1/models, /health, /version dispatch") {
 
   json ver = json::parse(h.server.handle_version().body);
   CHECK(ver.at("version") == "9.9.9");
+}
+
+// ─── 1b. C8 utility + observability endpoints (SERVE-UTILITY-ENDPOINTS /
+// SERVE-METRICS). Additive/opt-in: attaching a tokenizer/metrics/reset backing
+// enables the routes; the schemas match vLLM 0.26. ──────────────────────────
+TEST_CASE("api_server: /tokenize + /detokenize round-trip and schema") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  h.server.set_tokenizer(&Fixture(), /*max_model_len=*/kMaxModelLen);
+
+  // tokenize (TokenizeCompletionRequest → TokenizeResponse). "hello world" is
+  // within the tiny BPE fixture's vocab.
+  ApiServer::DispatchResult tok = h.server.handle_tokenize(
+      R"({"prompt":"hello world","add_special_tokens":false,"return_token_strs":true})");
+  REQUIRE(tok.status == 200);
+  json tj = json::parse(tok.body);
+  CHECK(tj.contains("count"));
+  CHECK(tj.contains("max_model_len"));
+  CHECK(tj.at("max_model_len") == kMaxModelLen);
+  REQUIRE(tj.at("tokens").is_array());
+  CHECK(tj.at("count") == tj.at("tokens").size());
+  CHECK(tj.at("token_strs").is_array());
+  CHECK(tj.at("token_strs").size() == tj.at("tokens").size());
+
+  // detokenize round-trips the token ids back through DetokenizeResponse.
+  std::vector<int> ids = tj.at("tokens").get<std::vector<int>>();
+  json detok_req;
+  detok_req["tokens"] = ids;
+  ApiServer::DispatchResult detok =
+      h.server.handle_detokenize(detok_req.dump());
+  REQUIRE(detok.status == 200);
+  json dj = json::parse(detok.body);
+  REQUIRE(dj.contains("prompt"));
+  CHECK(dj.at("prompt").is_string());
+
+  // return_token_strs omitted → null (schema default).
+  json plain = json::parse(
+      h.server.handle_tokenize(R"({"prompt":"hello"})").body);
+  CHECK(plain.at("token_strs").is_null());
+
+  // Errors: missing prompt → 400; chat-form messages → 400.
+  CHECK(h.server.handle_tokenize(R"({})").status == 400);
+  CHECK(h.server.handle_tokenize(R"({"messages":[]})").status == 400);
+  CHECK(h.server.handle_detokenize(R"({})").status == 400);
+}
+
+TEST_CASE("api_server: /metrics exposition through the server handler") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  vllm::v1::metrics::PrometheusStatLogger logger("test-model", kMaxModelLen);
+  logger.SetCacheConfigInfo(1024, 1.0);
+  h.server.set_metrics_logger(&logger);
+
+  ApiServer::DispatchResult m = h.server.handle_metrics();
+  CHECK(m.status == 200);
+  CHECK(m.content_type == "text/plain; version=0.0.4; charset=utf-8");
+  CHECK(m.body.find("vllm:num_requests_running") != std::string::npos);
+  CHECK(m.body.find("vllm:prompt_tokens_total") != std::string::npos);
+  CHECK(m.body.find("vllm:time_to_first_token_seconds_bucket") !=
+        std::string::npos);
+}
+
+TEST_CASE("api_server: /ping mirrors /health, /server_info shape") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  CHECK(h.server.handle_ping().status == 200);
+  json info = json::parse(h.server.handle_server_info().body);
+  CHECK(info.contains("vllm_config"));
+  CHECK(info.contains("vllm_env"));
+  CHECK(info.contains("system_env"));
+}
+
+TEST_CASE("api_server: /reset_prefix_cache → {\"success\": bool}") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  bool called = false;
+  h.server.set_reset_prefix_cache(
+      [&called](bool /*running*/, bool /*external*/) {
+        called = true;
+        return true;
+      });
+  json r = json::parse(h.server.handle_reset_prefix_cache(false, false).body);
+  CHECK(called);
+  CHECK(r.at("success") == true);
 }
 
 // ─── 2. Socket smoke test (real HTTP over an ephemeral port) ─────────────────

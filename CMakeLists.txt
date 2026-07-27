@@ -404,6 +404,8 @@ add_library(vllm STATIC
   src/vllm/v1/core/single_type_kv_cache_manager.cpp
   src/vllm/v1/core/kv_cache_coordinator.cpp
   src/vllm/v1/core/kv_cache_manager.cpp
+  src/vllm/v1/metrics/prometheus.cpp
+  src/vllm/v1/metrics/loggers.cpp
   src/vllm/v1/kv_offload/cache_identity.cpp
   src/vllm/v1/kv_offload/cache_policy.cpp
   src/vllm/v1/kv_offload/cpu_manager.cpp

@@ -25637,3 +25637,53 @@ NOT pushed; FULL SHA reported to caller.
   - **Unblocks** the MM + LoRA prefix-cache consumers (per R1: land W2 before the first multimodal/LoRA consumer). `generate_block_hash_extra_keys` (feature #10) → DONE; `cache_salt` engine path (#11) DONE, OpenAI API field pending (serving follow-up).
   - **W3 (cache-ON e2e) = REACHABLE-INCOMPLETE, honest.** The full-engine token-identity (our-APC-ON == our-APC-OFF == vLLM-APC-ON) + non-zero hit counters + TTFT-drop gate needs a PURE-DENSE (full-attention, APC-default-ON) model. Both synthetic CPU engine harnesses (`test_loaded_engine_dense.cpp`, `test_llm_engine.cpp`) are Qwen3_5-HYBRID (linear+full attention ⇒ `is_prefix_caching_supported`=false ⇒ APC inert by design, block_size==max_model_len keeps prefixes sub-block); the only real dense checkpoint on dgx is OPT-125m (noise-dominated, non-binding for the perf grid per the punch-list). CPU manager-level cache-reuse + no-false-share IS proven (this checkpoint). Remaining W3: a real dense checkpoint on GPU (or a new pure-full-attention synthetic harness) + a vLLM-APC-ON oracle for the token-identity and every-axis arm. `KV-PREFIX-CACHE` `PARTIAL`→`ACTIVE` (under `CLAIM-ROADMAP-D4APC`); `ROAD-V1-D4-APC` `SPIKE`→`PARTIAL`.
   - Not pushed; FULL SHA reported to caller.
+- **2026-07-27** — **ROAD-V1-C8 `/metrics` + utility endpoints LANDED + CPU-GATED
+  (`CLAIM-ROADMAP-C8`, rows `SERVE-METRICS` + `SERVE-UTILITY-ENDPOINTS` → `ACTIVE`;
+  isolated worktree `.claude/worktrees/agent-aacc5633789269baf`, base `origin/main`
+  `05a2e0d0`, NOT pushed).** Closed the oldest open T0 serving debt (`/metrics`
+  Prometheus) plus the utility endpoints, mirroring vLLM 0.26.0.dev0 (`555967922`).
+  - **SERVE-METRICS:** NEW self-contained Prometheus registry (`PromRegistry`,
+    `include/vllm/v1/metrics/prometheus.h` + `src/vllm/v1/metrics/prometheus.cpp`):
+    Counter/Gauge/Histogram/Info families with multi-label series and the
+    text-format-0.0.4 exposition (counter `_total`, histogram `_bucket{le}`/`_sum`/
+    `_count`, Info `{labels} 1.0`, whole-number Go `floatToGoString` `N.0`). NEW
+    `PrometheusStatLogger` (`loggers.{h,cpp}`) registers vLLM's ALWAYS-ON metric
+    catalog 1:1 (every name/help/type + TTFT/ITL/request-latency/1-2-5 bucket
+    schedules + the `{model_name, engine}` label schema, extra labels
+    finished_reason/reason), with `Build1_2_5Buckets`, `Record(SchedulerStats,
+    IterationStats)` and `SetCacheConfigInfo`. Added `SchedulerStats`/
+    `IterationStats`/`FinishedRequestStats` to `stats.h`. Wired `GET /metrics` on
+    the ApiServer via opt-in `set_metrics_logger` + a conditional route.
+  - **SERVE-UTILITY-ENDPOINTS:** `handle_tokenize` (prompt form →
+    `{count,max_model_len,tokens,token_strs?}`), `handle_detokenize`
+    (`{tokens[]}`→`{prompt}`), `handle_ping` (mirrors `/health`),
+    `handle_server_info` (`{vllm_config,vllm_env,system_env}`),
+    `handle_reset_prefix_cache` (`{"success":bool}` via an injected callback), all
+    ADDITIVE + opt-in (tokenize/detokenize/reset registered only when their backing
+    is attached; ping/server_info always). Chat-form `/tokenize` rejected 400
+    (bounded deferral).
+  - **GATE (RED-first, CPU):** the executable spec is vLLM's own scrape assertion
+    `tests/entrypoints/serve/instrumentator/test_metrics.py::EXPECTED_METRICS_V1`
+    (`metric in response.text` substring). `test_prometheus_metrics` 4/4 (81
+    assertions): every EXPECTED_METRICS_V1 name present, label schema, TYPE lines,
+    bucket schedules, `build_1_2_5_buckets` docstring example, `record()` folding,
+    cumulative-bucket monotonicity — RED-first proven (initial run failed 8/81 on
+    formatting/expectation mismatches, fixed histogram-count formatting to
+    prometheus_client's `N.0` + corrected whole-number `le` labels). Endpoint layer
+    `test_openai_api_server` 26/26 (297 assertions) incl. 4 new utility cases.
+  - **INERTNESS:** opt-in — a server without the backings registers no new routes;
+    the 22 pre-existing api_server cases stay green; tracked `git diff --stat` =
+    api_server.{h,cpp} additive + stats.h additive + CMake 2 lines + 2 test files.
+    CPU `-Werror` clean (full `vllm` lib built). `check-device-leakage` not
+    increased (no `vt::`/CUDA touched). `benchmark_binding=false` (serving surface,
+    no throughput A/B).
+  - **RESIDUAL (honest):** live-engine per-step SchedulerStats/IterationStats wiring
+    into `Record()` at the running server (W4), config-gated metric families
+    (spec-decode/kv-connector/mm-cache/LoRA), `TOOLS-STREAMING-PARSER` unified engine
+    (per-parser streaming already ships + is gated) and `SERVE-RESPONSE-METRICS`
+    (both INVENTORIED), chat-form `/tokenize`. So `ROAD-V1-C8` → `PARTIAL` (metrics +
+    utility leaves closed; parser/response-timing leaves remain). NOT pushed; FULL
+    SHA reported to caller. Ledger + coordination `CLAIM-ROADMAP-C8` + specs
+    `.agents/specs/{prometheus-metrics,utility-endpoints}.md` same date. Sibling
+    `D4-APC` (prefix-cache/KV) untouched — `/reset_prefix_cache` uses an injected
+    callback only.

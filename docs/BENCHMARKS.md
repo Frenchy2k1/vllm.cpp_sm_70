@@ -15,6 +15,22 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+**ROAD-V1-C8 /metrics + utility endpoints (2026-07-27, `CLAIM-ROADMAP-C8`, NOT
+pushed).** Disposition: **NOT APPLICABLE (no throughput number, `benchmark_binding=false`).**
+`SERVE-METRICS` (Prometheus `/metrics`) and `SERVE-UTILITY-ENDPOINTS`
+(`/tokenize`, `/detokenize`, `/ping`, `/server_info`, `/reset_prefix_cache`) are
+serving-surface parity, not a compute path, so no vLLM throughput A/B applies.
+The gate is metric-NAME + label-schema + endpoint-schema parity vs vLLM
+0.26.0.dev0 (`555967922`), gated on CPU: `test_prometheus_metrics` 4/4 (81
+assertions, the `EXPECTED_METRICS_V1` substring scrape gate RED-first) and
+`test_openai_api_server` 26/26 (297 assertions, 4 new utility cases). Inertness:
+opt-in, existing serving byte-identical (the 22 pre-existing api_server cases
+stay green). The `/metrics` exposition currently reports the registered families
+at their primed zero (or values folded via `record()` in tests); wiring the live
+per-step engine values is the recorded residual. Reproduce:
+`cmake --build build-cpu --target test_prometheus_metrics test_openai_api_server &&
+./build-cpu/tests/test_prometheus_metrics && ./build-cpu/tests/test_openai_api_server`.
+
 **ROAD-V1-C7 sampling controls + logprobs (2026-07-27, `CLAIM-ROADMAP-C7`, NOT
 pushed).** Disposition: **CORRECTNESS gate, no throughput number
 (`benchmark_binding=false`).** A sampling transform is a pure function of

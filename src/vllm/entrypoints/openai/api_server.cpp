@@ -16,6 +16,8 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/tokenizer/tokenizer.h"
+#include "vllm/v1/metrics/loggers.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -240,6 +242,145 @@ ApiServer::DispatchResult ApiServer::handle_version() const {
   return out;
 }
 
+ApiServer::DispatchResult ApiServer::handle_ping() const {
+  // sagemaker/api_router.py:47-50 — GET/POST /ping is a liveness probe that
+  // returns the same empty 200 as /health.
+  return handle_health();
+}
+
+ApiServer::DispatchResult ApiServer::handle_metrics() const {
+  // serve/instrumentator/metrics.py:82 — the prometheus text exposition served
+  // by make_asgi_app(registry). The PrometheusResponse content type is
+  // "text/plain; version=0.0.4; charset=utf-8".
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = v1::metrics::kContentTypeLatest;
+  out.body = (metrics_ != nullptr) ? metrics_->Expose() : std::string();
+  return out;
+}
+
+ApiServer::DispatchResult ApiServer::handle_tokenize(
+    const std::string& request_body) const {
+  // serve/tokenize/api_router.py:46 (tokenize) over TokenizeCompletionRequest
+  // (serve/tokenize/protocol.py:23). Chat-form tokenize (messages + template)
+  // is deferred; the prompt form matches the schema exactly.
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                     std::string("Invalid JSON body: ") + e.what());
+  }
+  if (body.contains("messages")) {
+    return MakeError(400, "BadRequestError",
+                     "Chat-form /tokenize (messages) is not supported; supply "
+                     "`prompt`.");
+  }
+  if (!body.contains("prompt") || !body.at("prompt").is_string()) {
+    return MakeError(400, "BadRequestError",
+                     "`prompt` (string) is required.");
+  }
+  if (tokenizer_ == nullptr) {
+    return MakeError(500, "InternalServerError", "No tokenizer configured.");
+  }
+  const std::string prompt = body.at("prompt").get<std::string>();
+  const bool add_special_tokens =
+      body.value("add_special_tokens", true);
+  const bool return_token_strs = body.value("return_token_strs", false);
+
+  std::vector<int32_t> ids = add_special_tokens
+                                 ? tokenizer_->EncodeWithSpecialTokens(prompt)
+                                 : tokenizer_->Encode(prompt);
+
+  nlohmann::json resp;
+  resp["count"] = ids.size();
+  resp["max_model_len"] = max_model_len_;
+  resp["tokens"] = ids;
+  if (return_token_strs) {
+    std::vector<std::string> token_strs;
+    token_strs.reserve(ids.size());
+    for (int32_t id : ids) token_strs.push_back(tokenizer_->TokenText(id));
+    resp["token_strs"] = token_strs;
+  } else {
+    resp["token_strs"] = nullptr;
+  }
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = "application/json";
+  out.body = resp.dump();
+  return out;
+}
+
+ApiServer::DispatchResult ApiServer::handle_detokenize(
+    const std::string& request_body) const {
+  // serve/tokenize/api_router.py:73 (detokenize) over DetokenizeRequest
+  // (serve/tokenize/protocol.py:166) → DetokenizeResponse{prompt}.
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                     std::string("Invalid JSON body: ") + e.what());
+  }
+  if (!body.contains("tokens") || !body.at("tokens").is_array()) {
+    return MakeError(400, "BadRequestError",
+                     "`tokens` (array of token ids) is required.");
+  }
+  if (tokenizer_ == nullptr) {
+    return MakeError(500, "InternalServerError", "No tokenizer configured.");
+  }
+  std::vector<int32_t> ids;
+  try {
+    for (const auto& t : body.at("tokens")) {
+      ids.push_back(t.get<int32_t>());
+    }
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                     std::string("Invalid token id: ") + e.what());
+  }
+  nlohmann::json resp;
+  resp["prompt"] = tokenizer_->Decode(ids);
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = "application/json";
+  out.body = resp.dump();
+  return out;
+}
+
+ApiServer::DispatchResult ApiServer::handle_reset_prefix_cache(
+    bool reset_running_requests, bool reset_external) const {
+  // serve/dev/cache/api_router.py:20 → {"success": bool}.
+  bool success = false;
+  if (reset_prefix_cache_) {
+    try {
+      success = reset_prefix_cache_(reset_running_requests, reset_external);
+    } catch (const std::exception& e) {
+      return MakeError(500, "InternalServerError", e.what());
+    }
+  }
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = "application/json";
+  out.body = nlohmann::json{{"success", success}}.dump();
+  return out;
+}
+
+ApiServer::DispatchResult ApiServer::handle_server_info() const {
+  // serve/dev/server_info/api_router.py:43 — the three-key server_info shape.
+  // vllm_config is rendered as a string; vllm_env/system_env are objects. This
+  // bounded server exposes version + served model rather than the full config.
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = "application/json";
+  nlohmann::json info;
+  info["vllm_config"] = std::string("served_model_name=") + models_.model_name();
+  info["vllm_env"] = nlohmann::json::object();
+  info["system_env"] =
+      nlohmann::json{{"vllm_cpp_version", version_}};
+  out.body = info.dump();
+  return out;
+}
+
 void ApiServer::register_routes() {
   httplib::Server& server = impl_->server;
 
@@ -328,6 +469,55 @@ void ApiServer::register_routes() {
              [this, write](const httplib::Request&, httplib::Response& res) {
                write(handle_version(), res);
              });
+
+  // ── C8 additive routes: each registered only when its backing is attached,
+  // so a default-constructed server is byte-identical to before. /ping and
+  // /server_info are read-only liveness/introspection and always present. ─────
+  server.Get("/ping",
+             [this, write](const httplib::Request&, httplib::Response& res) {
+               write(handle_ping(), res);
+             });
+  server.Post("/ping",
+              [this, write](const httplib::Request&, httplib::Response& res) {
+                write(handle_ping(), res);
+              });
+  server.Get("/server_info",
+             [this, write](const httplib::Request&, httplib::Response& res) {
+               write(handle_server_info(), res);
+             });
+
+  if (metrics_ != nullptr) {
+    server.Get("/metrics",
+               [this, write](const httplib::Request&, httplib::Response& res) {
+                 write(handle_metrics(), res);
+               });
+  }
+  if (tokenizer_ != nullptr) {
+    server.Post(
+        "/tokenize",
+        [this, write](const httplib::Request& req, httplib::Response& res) {
+          write(handle_tokenize(req.body), res);
+        });
+    server.Post(
+        "/detokenize",
+        [this, write](const httplib::Request& req, httplib::Response& res) {
+          write(handle_detokenize(req.body), res);
+        });
+  }
+  if (reset_prefix_cache_) {
+    server.Post(
+        "/reset_prefix_cache",
+        [this, write](const httplib::Request& req, httplib::Response& res) {
+          // Query params default false (cache/api_router.py:22-26).
+          const bool reset_running =
+              req.has_param("reset_running_requests") &&
+              req.get_param_value("reset_running_requests") == "true";
+          const bool reset_external =
+              req.has_param("reset_external") &&
+              req.get_param_value("reset_external") == "true";
+          write(handle_reset_prefix_cache(reset_running, reset_external), res);
+        });
+  }
 }
 
 bool ApiServer::listen(const std::string& host, int port) {

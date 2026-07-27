@@ -40,7 +40,9 @@
 
 #include <cstdint>
 #include <deque>
+#include <string>
 #include <tuple>
+#include <vector>
 
 namespace vllm::v1 {
 
@@ -148,6 +150,60 @@ class CachingMetrics {
   int64_t aggregated_query_hit_ = 0;
   // (requests, queries, hits) for the most recent observations.
   std::deque<std::tuple<int64_t, int64_t, int64_t>> queue_;
+};
+
+// Ported from: @dataclass SchedulerStats (vllm/v1/metrics/stats.py:186-215).
+// The always-on subset the Prometheus scheduler-state metrics read (loggers.py
+// PrometheusStatLogger.record). Advanced fields (DP wave, cudagraph, spec-decode,
+// kv-connector, lora, eviction events) are deferred with their config-gated
+// metric families and are not part of the SERVE-METRICS core.
+struct SchedulerStats {
+  // Number of requests currently in a model-execution batch.
+  int64_t num_running_reqs = 0;
+  // Length of the waiting request queue.
+  int64_t num_waiting_reqs = 0;
+  // KV-cache usage fraction in [0, 1]. 1.0 == 100% usage.
+  double kv_cache_usage = 0.0;
+  // This step's take-and-swap prefix-cache observation (TOKEN counts).
+  PrefixCacheStats prefix_cache_stats;
+};
+
+// Ported from: @dataclass FinishedRequestStats (vllm/v1/metrics/stats.py:236-259).
+// One finished request's per-request timing/token breakdown. `finish_reason`
+// is the stringified FinishReason ("stop"/"length"/"abort") that labels
+// vllm:request_success_total.
+struct FinishedRequestStats {
+  std::string finish_reason = "stop";
+  double e2e_latency = 0.0;
+  int64_t num_prompt_tokens = 0;
+  int64_t num_generation_tokens = 0;
+  // Present when the request set max_tokens (< 0 == unset → not observed).
+  int64_t max_tokens_param = -1;
+  double queued_time = 0.0;
+  double prefill_time = 0.0;
+  double inference_time = 0.0;
+  double decode_time = 0.0;
+  double mean_time_per_output_token = 0.0;
+  int64_t num_cached_tokens = 0;
+};
+
+// Ported from: @dataclass IterationStats (vllm/v1/metrics/stats.py, the frontend
+// per-step aggregate consumed by PrometheusStatLogger.record). The always-on
+// subset: token counters, per-step iteration-token count, preemptions, and the
+// per-request TTFT/ITL/n samples plus finished-request breakdowns.
+struct IterationStats {
+  int64_t num_prompt_tokens = 0;      // vllm:prompt_tokens_total
+  int64_t num_generation_tokens = 0;  // vllm:generation_tokens_total
+  int64_t num_preempted_reqs = 0;     // vllm:num_preemptions_total
+  int64_t num_prompt_tokens_cached = 0;  // vllm:prompt_tokens_cached
+  // vllm:iteration_tokens_total observes (prompt + generation) for this step.
+  int64_t iteration_tokens = 0;
+  // Per-request samples observed this step.
+  std::vector<double> time_to_first_tokens_iter;     // seconds
+  std::vector<double> inter_token_latencies_iter;    // seconds
+  std::vector<int64_t> n_params_iter;                // request `n`
+  std::vector<int64_t> max_num_generation_tokens_iter;
+  std::vector<FinishedRequestStats> finished_requests;
 };
 
 }  // namespace vllm::v1
