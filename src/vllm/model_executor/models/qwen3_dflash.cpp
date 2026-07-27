@@ -27,6 +27,70 @@ using namespace dense_attn;  // Dev, DBuf, ResidentWeight, Reshape, MakeRopeArgs
 
 constexpr int64_t kPadSlotId = -1;  // vLLM PAD_SLOT_ID (attention/backends/utils.py:45)
 
+// Device-resident per-layer context K/V (D7). The D5 path downloaded each layer's
+// projected K/V to host (2 D->H copies/layer) and re-uploaded them in the block
+// forward's [context;block] host interleave. This helper keeps the projected K/V
+// ON DEVICE as bf16 [num_ctx, kv_size] buffers, so the block forward can build the
+// combined sequence with device vt::IndexCopy instead of host round-trips. The
+// float ops (cast/RMSNorm/GEMM/k-norm/RoPE) are IDENTICAL to the D5 path and run in
+// the same order, so the stored K/V bits are bit-identical to the D5 download.
+// Mirrors precompute_and_store_context_kv (qwen3_dflash.py:548-619), minus the
+// paged-cache write (our within-step store is these DBufs).
+struct ContextKVDev {
+  std::vector<DBuf> k;  // per attention layer: bf16 [num_ctx, Hkv*Dh] (normed+RoPE'd)
+  std::vector<DBuf> v;  // per attention layer: bf16 [num_ctx, Hkv*Dh] (raw)
+  int64_t num_ctx = 0;
+};
+
+ContextKVDev PrecomputeContextKVDevice(Dev d, const float* context_states,
+                                       const int32_t* context_positions, int64_t C,
+                                       const Qwen3DFlashWeights& weights,
+                                       const HfConfig& config) {
+  const int64_t H = config.hidden_size;
+  const int64_t Hq = config.num_attention_heads;
+  const int64_t Hkv = config.num_key_value_heads;
+  const int64_t Dh = config.head_dim;
+  const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
+  const float eps = static_cast<float>(config.rms_norm_eps);
+
+  ContextKVDev out;
+  out.num_ctx = C;
+  if (C == 0) return out;
+
+  // normed = RMSNorm(context_states, hidden_norm) — the ONE shared hidden_norm
+  // over the combined target features (qwen3_dflash.py:505-520).
+  DBuf ctx32(d, DType::kF32, {C, H}, context_states);
+  DBuf ctxb(d, DType::kBF16, {C, H});
+  vt::CastBf16(d.q, ctxb.t(), ctx32.t());
+  Tensor w_hn = ResidentWeight(d, weights.hidden_norm, {H});
+  DBuf normed(d, DType::kBF16, {C, H});
+  vt::RmsNorm(d.q, normed.t(), ctxb.t(), w_hn, vt::RmsNormArgs{eps, false});
+  DBuf cpos(d, DType::kI32, {C}, context_positions);
+
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    const Qwen3DFlashLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
+    Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
+    Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
+    Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
+    DBuf k(d, DType::kBF16, {C, kdim});
+    DBuf v(d, DType::kBF16, {C, kdim});
+    vt::MatmulBT(d.q, k.t(), normed.t(), wk);
+    vt::MatmulBT(d.q, v.t(), normed.t(), wv);
+    // K-norm over head_dim, then NeoX RoPE on K at the context positions (V raw).
+    Tensor k2 = Reshape(k.t(), {C * Hkv, Dh});
+    Tensor wkn = ResidentWeight(d, layer.k_norm, {Dh});
+    vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
+    Tensor k3 = Reshape(k.t(), {C, Hkv, Dh});
+    DBuf rope_scratch(d, DType::kBF16, {C, Hkv, Dh});
+    rope_scratch.Zero(d);
+    Tensor scratch3 = rope_scratch.t();
+    vt::RopeNeox(d.q, k3, scratch3, cpos.t(), MakeRopeArgs(config));
+    out.k.push_back(std::move(k));  // bf16 [C, kdim] contiguous (RoPE'd view aliases it)
+    out.v.push_back(std::move(v));  // bf16 [C, kdim] raw
+  }
+  return out;
+}
+
 }  // namespace
 
 DflashPrepareOutputs PrepareDflashInputs(const DflashPrepareBatch& b) {
@@ -311,11 +375,8 @@ Qwen3DFlashModel::ContextKV Qwen3DFlashModel::PrecomputeContextKV(
     const Qwen3DFlashWeights& weights, const HfConfig& config, vt::Queue& queue) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t H = config.hidden_size;
-  const int64_t Hq = config.num_attention_heads;
   const int64_t Hkv = config.num_key_value_heads;
   const int64_t Dh = config.head_dim;
-  const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
-  const float eps = static_cast<float>(config.rms_norm_eps);
   const int64_t C = static_cast<int64_t>(context_positions.size());
   VT_CHECK(static_cast<int64_t>(context_states.size()) == C * H,
            "PrecomputeContextKV: context_states must be [num_ctx, H]");
@@ -328,48 +389,21 @@ Qwen3DFlashModel::ContextKV Qwen3DFlashModel::PrecomputeContextKV(
     return ckv;
   }
 
-  // normed = RMSNorm(context_states, hidden_norm) — the ONE shared hidden_norm
-  // applied to the combined target features (qwen3_dflash.py:505-520).
-  DBuf ctx32(d, DType::kF32, {C, H}, context_states.data());
-  DBuf ctxb(d, DType::kBF16, {C, H});
-  vt::CastBf16(d.q, ctxb.t(), ctx32.t());
-  Tensor w_hn = ResidentWeight(d, weights.hidden_norm, {H});
-  DBuf normed(d, DType::kBF16, {C, H});
-  vt::RmsNorm(d.q, normed.t(), ctxb.t(), w_hn, vt::RmsNormArgs{eps, false});
-
-  DBuf cpos(d, DType::kI32, {C}, context_positions.data());
-
+  // Device-resident projection (D7); download each layer's K/V to the host host
+  // ContextKV the CPU/parity gates read. Bit-identical to the old inline path
+  // (same ops, same order) — this public host API exists ONLY for the D3 kvprep
+  // gates; production reaches the device buffers directly (ForwardBlockLogitsWithContext).
+  ContextKVDev dev = PrecomputeContextKVDevice(d, context_states.data(),
+                                               context_positions.data(), C, weights, config);
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
-    const Qwen3DFlashLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
-    Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
-    Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
-    Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
-    DBuf k(d, DType::kBF16, {C, kdim});
-    DBuf v(d, DType::kBF16, {C, kdim});
-    vt::MatmulBT(d.q, k.t(), normed.t(), wk);
-    vt::MatmulBT(d.q, v.t(), normed.t(), wv);
-    // K-norm (per head over Dh), then NeoX RoPE on K at the context positions.
-    Tensor k2 = Reshape(k.t(), {C * Hkv, Dh});
-    Tensor wkn = ResidentWeight(d, layer.k_norm, {Dh});
-    vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
-    Tensor k3 = Reshape(k.t(), {C, Hkv, Dh});
-    // K-only RoPE: rotate K via the q_states arg, throwaway k_states scratch.
-    DBuf rope_scratch(d, DType::kBF16, {C, Hkv, Dh});
-    rope_scratch.Zero(d);
-    Tensor scratch3 = rope_scratch.t();
-    vt::RopeNeox(d.q, k3, scratch3, cpos.t(), MakeRopeArgs(config));
-    // Download K (normed+RoPE'd) and V (raw) as [C, Hkv, Dh] f32.
     std::vector<float> kh(static_cast<size_t>(C) * Hkv * Dh);
     std::vector<float> vh(static_cast<size_t>(C) * Hkv * Dh);
-    {
-      DBuf tk(d, DType::kF32, {C, Hkv, Dh});
-      vt::CastF32(d.q, tk.t(), k3);
-      tk.Download(d, kh.data());
-      DBuf tv(d, DType::kF32, {C, Hkv, Dh});
-      Tensor v3 = Reshape(v.t(), {C, Hkv, Dh});
-      vt::CastF32(d.q, tv.t(), v3);
-      tv.Download(d, vh.data());
-    }
+    DBuf tk(d, DType::kF32, {C, Hkv, Dh});
+    vt::CastF32(d.q, tk.t(), Reshape(dev.k[static_cast<size_t>(l)].t(), {C, Hkv, Dh}));
+    tk.Download(d, kh.data());
+    DBuf tv(d, DType::kF32, {C, Hkv, Dh});
+    vt::CastF32(d.q, tv.t(), Reshape(dev.v[static_cast<size_t>(l)].t(), {C, Hkv, Dh}));
+    tv.Download(d, vh.data());
     ckv.k.push_back(std::move(kh));
     ckv.v.push_back(std::move(vh));
   }
@@ -399,13 +433,21 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithContext(
   VT_CHECK(static_cast<int>(ctx_cu.size()) == num_reqs + 1 && ctx_cu.front() == 0,
            "ForwardBlockLogitsWithContext: ctx_cu must be [num_reqs+1]");
 
-  // Precompute per-layer context K/V from the target features (D3 pre-insert).
-  ContextKV ckv = PrecomputeContextKV(context_states, context_positions, weights, config, queue);
+  // Precompute per-layer context K/V from the target features (D3 pre-insert),
+  // DEVICE-RESIDENT (D7): the per-layer K/V stay in bf16 device buffers (no D->H).
+  ContextKVDev ckv = PrecomputeContextKVDevice(d, context_states.data(),
+                                               context_positions.data(),
+                                               static_cast<int64_t>(context_positions.size()),
+                                               weights, config);
   const int64_t C = ckv.num_ctx;
   VT_CHECK(ctx_cu.back() == static_cast<int32_t>(C),
            "ForwardBlockLogitsWithContext: ctx_cu.back() must equal num_ctx");
 
-  // Combined [context; block] per-request layout for the attention (cu_comb).
+  // Combined [context; block] per-request layout for the attention (cu_comb), plus
+  // the DEVICE index maps (D7) that place context/block rows into the combined
+  // buffer with vt::IndexCopy and extract the block-query rows with vt::IndexSelect
+  // — replacing the D5 host download + std::vector interleave + re-upload. These are
+  // tiny integer maps computed once from the cu vectors and uploaded once.
   const int64_t Ncomb = C + Tq;
   std::vector<int32_t> cu_comb(static_cast<size_t>(num_reqs) + 1, 0);
   for (int r = 0; r < num_reqs; ++r) {
@@ -413,6 +455,22 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithContext(
     const int32_t bl = cu[static_cast<size_t>(r) + 1] - cu[static_cast<size_t>(r)];
     cu_comb[static_cast<size_t>(r) + 1] = cu_comb[static_cast<size_t>(r)] + cl + bl;
   }
+  // ctx_dest[j] = combined row for context source row j (ctx_cu order).
+  // blk_idx[i]  = combined row for block source row i (cu order); used BOTH to
+  // scatter block q/k/v in (IndexCopy: comb[blk_idx[i]] = block[i]) AND to gather
+  // block outputs back out (IndexSelect: out[i] = comb[blk_idx[i]]).
+  std::vector<int32_t> ctx_dest(static_cast<size_t>(C));
+  std::vector<int32_t> blk_idx(static_cast<size_t>(Tq));
+  for (int r = 0; r < num_reqs; ++r) {
+    const int32_t c0 = ctx_cu[static_cast<size_t>(r)], c1 = ctx_cu[static_cast<size_t>(r) + 1];
+    const int32_t b0 = cu[static_cast<size_t>(r)], b1 = cu[static_cast<size_t>(r) + 1];
+    const int32_t base = cu_comb[static_cast<size_t>(r)];
+    for (int32_t j = c0; j < c1; ++j) ctx_dest[static_cast<size_t>(j)] = base + (j - c0);
+    const int32_t bbase = base + (c1 - c0);
+    for (int32_t i = b0; i < b1; ++i) blk_idx[static_cast<size_t>(i)] = bbase + (i - b0);
+  }
+  DBuf ctx_dest_d(d, DType::kI32, {C}, ctx_dest.data());
+  DBuf blk_idx_d(d, DType::kI32, {Tq}, blk_idx.data());
 
   // Embed block tokens; substitute the dedicated mask embedding when present.
   DBuf hidden(d, DType::kBF16, {Tq, H});
@@ -473,55 +531,31 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithContext(
     vt::RmsNorm(d.q, k2, k2, ResidentWeight(d, layer.k_norm, {Dh}), vt::RmsNormArgs{eps, false});
     vt::RopeNeox(d.q, q3, k3, dpos.t(), MakeRopeArgs(config));
 
-    // Download block q/k/v (f32) and interleave with the layer's context K/V into
-    // the combined [context; block] sequence per request.
-    std::vector<float> bq(static_cast<size_t>(Tq) * Hq * Dh);
-    std::vector<float> bk(static_cast<size_t>(Tq) * Hkv * Dh);
-    std::vector<float> bv(static_cast<size_t>(Tq) * Hkv * Dh);
-    {
-      DBuf tq(d, DType::kF32, {Tq, Hq, Dh});
-      vt::CastF32(d.q, tq.t(), q3);
-      tq.Download(d, bq.data());
-      DBuf tk(d, DType::kF32, {Tq, Hkv, Dh});
-      vt::CastF32(d.q, tk.t(), k3);
-      tk.Download(d, bk.data());
-      DBuf tv(d, DType::kF32, {Tq, Hkv, Dh});
-      vt::CastF32(d.q, tv.t(), Reshape(v.t(), {Tq, Hkv, Dh}));
-      tv.Download(d, bv.data());
+    // Build the combined [context; block] q/k/v ON DEVICE (D7): scatter the layer's
+    // device context K/V and this block's q/k/v into the packed combined buffer via
+    // vt::IndexCopy — NO D->H download, NO host std::vector interleave, NO re-upload.
+    // The bf16 values are bit-identical to the D5 f32-roundtrip path (bf16->f32->bf16
+    // is an identity round-trip), so DFlashBlockAttention sees identical inputs.
+    Tensor v3 = Reshape(v.t(), {Tq, Hkv, Dh});
+    DBuf qcb(d, DType::kBF16, {Ncomb, Hq, Dh});
+    DBuf kcb(d, DType::kBF16, {Ncomb, Hkv, Dh});
+    DBuf vcb(d, DType::kBF16, {Ncomb, Hkv, Dh});
+    qcb.Zero(d);  // context query rows are unused (their attn output is discarded)
+    Tensor qcb3 = qcb.t(), kcb3 = kcb.t(), vcb3 = vcb.t();
+    if (C > 0) {  // this layer's device context K/V -> combined at ctx_dest
+      Tensor ck2 = Reshape(ckv.k[static_cast<size_t>(l)].t(), {C, Hkv, Dh});
+      Tensor cv2 = Reshape(ckv.v[static_cast<size_t>(l)].t(), {C, Hkv, Dh});
+      Tensor cdst = ctx_dest_d.t();
+      vt::IndexCopy(d.q, kcb3, ck2, cdst);
+      vt::IndexCopy(d.q, vcb3, cv2, cdst);
     }
-    const std::vector<float>& ck = ckv.k[static_cast<size_t>(l)];
-    const std::vector<float>& cv = ckv.v[static_cast<size_t>(l)];
-    std::vector<float> qc(static_cast<size_t>(Ncomb) * Hq * Dh, 0.0f);
-    std::vector<float> kc(static_cast<size_t>(Ncomb) * Hkv * Dh, 0.0f);
-    std::vector<float> vc(static_cast<size_t>(Ncomb) * Hkv * Dh, 0.0f);
-    for (int r = 0; r < num_reqs; ++r) {
-      const int64_t c0 = ctx_cu[static_cast<size_t>(r)], c1 = ctx_cu[static_cast<size_t>(r) + 1];
-      const int64_t b0 = cu[static_cast<size_t>(r)], b1 = cu[static_cast<size_t>(r) + 1];
-      int64_t w = cu_comb[static_cast<size_t>(r)];
-      for (int64_t i = c0; i < c1; ++i, ++w) {  // context rows (query = 0)
-        for (int64_t e = 0; e < Hkv * Dh; ++e) {
-          kc[static_cast<size_t>(w * Hkv * Dh + e)] = ck[static_cast<size_t>(i * Hkv * Dh + e)];
-          vc[static_cast<size_t>(w * Hkv * Dh + e)] = cv[static_cast<size_t>(i * Hkv * Dh + e)];
-        }
-      }
-      for (int64_t i = b0; i < b1; ++i, ++w) {  // block rows
-        for (int64_t e = 0; e < Hq * Dh; ++e)
-          qc[static_cast<size_t>(w * Hq * Dh + e)] = bq[static_cast<size_t>(i * Hq * Dh + e)];
-        for (int64_t e = 0; e < Hkv * Dh; ++e) {
-          kc[static_cast<size_t>(w * Hkv * Dh + e)] = bk[static_cast<size_t>(i * Hkv * Dh + e)];
-          vc[static_cast<size_t>(w * Hkv * Dh + e)] = bv[static_cast<size_t>(i * Hkv * Dh + e)];
-        }
-      }
+    {  // block q/k/v -> combined at blk_idx
+      Tensor bidx = blk_idx_d.t();
+      vt::IndexCopy(d.q, qcb3, q3, bidx);
+      vt::IndexCopy(d.q, kcb3, k3, bidx);
+      vt::IndexCopy(d.q, vcb3, v3, bidx);
     }
     // Attention over the combined sequence via the UNCHANGED D2 primitive.
-    DBuf qcd(d, DType::kF32, {Ncomb, Hq, Dh}, qc.data());
-    DBuf kcd(d, DType::kF32, {Ncomb, Hkv, Dh}, kc.data());
-    DBuf vcd(d, DType::kF32, {Ncomb, Hkv, Dh}, vc.data());
-    DBuf qcb(d, DType::kBF16, {Ncomb, Hq, Dh}), kcb(d, DType::kBF16, {Ncomb, Hkv, Dh}),
-        vcb(d, DType::kBF16, {Ncomb, Hkv, Dh});
-    vt::CastBf16(d.q, qcb.t(), qcd.t());
-    vt::CastBf16(d.q, kcb.t(), kcd.t());
-    vt::CastBf16(d.q, vcb.t(), vcd.t());
     DBuf acomb(d, DType::kBF16, {Ncomb, Hq, Dh});
     vt::DFlashBlockAttentionArgs pa;
     pa.scale = scale;
@@ -530,25 +564,15 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithContext(
     pa.cu_seqlens = cu_comb.data();
     pa.num_reqs = num_reqs;
     vt::DFlashBlockAttention(d.q, acomb.t(), qcb.t(), kcb.t(), vcb.t(), pa);
-    // Extract the block query rows [ctx_len_r, ctx_len_r+block_len_r) per request.
-    std::vector<float> ah(static_cast<size_t>(Ncomb) * Hq * Dh);
-    {
-      DBuf ta(d, DType::kF32, {Ncomb, Hq, Dh});
-      vt::CastF32(d.q, ta.t(), acomb.t());
-      ta.Download(d, ah.data());
-    }
-    std::vector<float> abh(static_cast<size_t>(Tq) * Hq * Dh, 0.0f);
-    for (int r = 0; r < num_reqs; ++r) {
-      const int64_t cl = ctx_cu[static_cast<size_t>(r) + 1] - ctx_cu[static_cast<size_t>(r)];
-      const int64_t b0 = cu[static_cast<size_t>(r)], b1 = cu[static_cast<size_t>(r) + 1];
-      int64_t src = cu_comb[static_cast<size_t>(r)] + cl;
-      for (int64_t i = b0; i < b1; ++i, ++src)
-        for (int64_t e = 0; e < Hq * Dh; ++e)
-          abh[static_cast<size_t>(i * Hq * Dh + e)] = ah[static_cast<size_t>(src * Hq * Dh + e)];
-    }
-    DBuf a32(d, DType::kF32, {Tq, Hq * Dh}, abh.data());
+    // Extract the block-query rows out of the combined output ON DEVICE (IndexSelect:
+    // a[i] = acomb[blk_idx[i]]), replacing the D5 download + host row-scatter.
     DBuf a(d, DType::kBF16, {Tq, Hq * Dh});
-    vt::CastBf16(d.q, a.t(), a32.t());
+    {
+      Tensor acomb2 = Reshape(acomb.t(), {Ncomb, Hq * Dh});
+      Tensor a2 = Reshape(a.t(), {Tq, Hq * Dh});
+      Tensor bidx = blk_idx_d.t();
+      vt::IndexSelect(d.q, a2, acomb2, bidx);
+    }
     Tensor wo = ResidentWeight(d, layer.o_proj);
     DBuf attn(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, attn.t(), a.t(), wo);
