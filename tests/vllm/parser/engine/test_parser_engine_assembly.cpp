@@ -4,7 +4,18 @@
 // Ported/gated against vLLM 0.26.0.dev0 (@ 555967922):
 //   vllm/parser/engine/parser_engine.py (ParserEngine — event -> DeltaMessage
 //   assembly + one-shot extract_tool_calls), vllm/parser/qwen3.py,
-//   vllm/parser/seed_oss.py, vllm/parser/kimi_k2.py.
+//   vllm/parser/seed_oss.py, vllm/parser/kimi_k2.py, and the ROAD-V1-C8 engine
+//   families vllm/parser/{minimax_m2,glm47_moe,deepseek_v4,deepseek_v32,
+//   nemotron_v3}.py.
+//
+// ROAD-V1-C8 coverage (goldens 10-19, whole-delta AND char-by-char per family):
+//   minimax_m2 (<invoke>/<parameter> XML, held-back JSON arg diffs),
+//   glm47_moe (<arg_key>/<arg_value>, function-name .strip() via the
+//   Glm47MoeParser hook), deepseek_v4 (<think> + DSML tool_calls, string=
+//   "true|false" typed-value coercion), deepseek_v32 (DSML function_calls,
+//   no reasoning), nemotron_v3 (qwen3 grammar, strip_trailing_reasoning).
+//   gemma4 + inkling are DEFERRED (need unported assembly hooks — see
+//   .agents/specs/parser-assembly-c8.md).
 //
 // The assembly layer is a PURE FUNCTION of the (delta_text, delta_token_ids)
 // stream, so it gates EXACTLY like the engine core: our per-delta DeltaMessage

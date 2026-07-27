@@ -14,6 +14,11 @@ std::optional<ParserEngineConfig> get_engine_config(const std::string& name) {
                         "<seed:tool_call>", "</seed:tool_call>");
   }
   if (name == "kimi_k2") return kimi_k2_config(true);
+  if (name == "minimax_m2") return minimax_m2_config();
+  if (name == "glm47_moe") return glm47_moe_config(true);
+  if (name == "deepseek_v4") return deepseek_v4_config(true);
+  if (name == "deepseek_v32") return deepseek_v32_config();
+  if (name == "nemotron_v3") return nemotron_v3_config(true);
   return std::nullopt;
 }
 
@@ -22,7 +27,8 @@ bool is_engine_backed(const std::string& name) {
 }
 
 std::vector<std::string> engine_backed_names() {
-  return {"qwen3", "seed_oss", "kimi_k2"};
+  return {"qwen3",      "seed_oss",     "kimi_k2",     "minimax_m2",
+          "glm47_moe",  "deepseek_v4",  "deepseek_v32", "nemotron_v3"};
 }
 
 }  // namespace vllm::parser::engine

@@ -536,6 +536,7 @@ add_library(vllm STATIC
   src/vllm/parser/engine/registry.cpp
   src/vllm/parser/engine/parser_engine.cpp
   src/vllm/parser/kimi_k2.cpp
+  src/vllm/parser/glm47_moe.cpp
   src/vllm/parser/parser_manager.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
