@@ -471,6 +471,18 @@ class Encoder {
   // owns one (q-head, query token) pair and cooperatively reduces over keys.
   void DispatchGrid2D(int64_t gx, int64_t gy, uint32_t tg) {
     if (gx <= 0 || gy <= 0) { Finish(); return; }
+    // A threadgroup wider than THIS pipeline's limit is undefined behaviour, and
+    // in a Release build with no Metal validation layer it does not fault: it
+    // silently computes garbage. `maxTotalThreadsPerThreadgroup` shrinks with
+    // register and threadgroup-memory pressure, so a kernel that grows its tile
+    // can cross the limit without any source-level hint. DispatchFlat already
+    // clamps; this path asserts instead, because a 2-D kernel's threadgroup
+    // shape is part of its correctness (clamping would silently drop simdgroups
+    // and produce a wrong answer just as quietly).
+    VT_CHECK(size_t(tg) <= max_threads_,
+             std::string("metal: threadgroup of ") + std::to_string(tg) +
+                 " threads exceeds this pipeline's maxTotalThreadsPerThreadgroup (" +
+                 std::to_string(max_threads_) + ")");
     [enc_ dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(gx),
                                            static_cast<NSUInteger>(gy), 1)
          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
