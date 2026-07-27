@@ -510,7 +510,7 @@ kernel void vt_matmul_bt_gemv(device const uchar* a   [[buffer(0)]],
 // limit, so occupancy is not the constraint here.
 #define VT_MM_BM 64u
 #define VT_MM_BN 64u
-#define VT_MM_BK 8u
+#define VT_MM_BK 16u
 #define VT_MM_SGS 8u  // 2x4 simdgroups => 256 threads
 
 kernel void vt_matmul_bt_mm(device const uchar* a   [[buffer(0)]],
@@ -576,16 +576,20 @@ kernel void vt_matmul_bt_mm(device const uchar* a   [[buffer(0)]],
         d[0] = vt_bf16_to_f32(v.x); d[1] = vt_bf16_to_f32(v.y);
         d[2] = vt_bf16_to_f32(v.z); d[3] = vt_bf16_to_f32(v.w);
       }
-      for (uint e = tid * 4u; e < VT_MM_BK * VT_MM_BN; e += nthreads * 4u) {
-        const uint kk = e / VT_MM_BN, c = e % VT_MM_BN;
-        // BT: row `gc` is contiguous over k, so four CONSECUTIVE columns of the
-        // staged tile come from four DIFFERENT B rows; the vector load therefore
-        // runs along k for one column, and the four results are scattered into
-        // the tile row. Reading along k is the coalesced direction here.
-        for (uint q = 0u; q < 4u; ++q) {
-          const ulong idx = ulong(col0 + c + q) * ulong(p.k) + ulong(k0 + kk);
-          sb[kk * VT_MM_BN + c + q] = vt_bf16_to_f32(bu[idx]);
-        }
+      // B tile, vectorised ALONG K. BT means row `gc` is contiguous over k, so a
+      // vector load runs along k for one column and scatters four results down
+      // the tile's k dimension. At BK=16 this is (BK/4)*BN = 256 loads over 256
+      // threads, exactly one each; at BK=8 it was 128 and half the threadgroup
+      // idled, which is what made this a shape-dependent wash before.
+      for (uint e = tid; e < (VT_MM_BK / 4u) * VT_MM_BN; e += nthreads) {
+        const uint kq = e / VT_MM_BN, c = e % VT_MM_BN;
+        const uint kk = kq * 4u;
+        const ulong idx = ulong(col0 + c) * ulong(p.k) + ulong(k0 + kk);
+        const ushort4 v = *((device const ushort4*)(bu + idx));
+        sb[(kk + 0u) * VT_MM_BN + c] = vt_bf16_to_f32(v.x);
+        sb[(kk + 1u) * VT_MM_BN + c] = vt_bf16_to_f32(v.y);
+        sb[(kk + 2u) * VT_MM_BN + c] = vt_bf16_to_f32(v.z);
+        sb[(kk + 3u) * VT_MM_BN + c] = vt_bf16_to_f32(v.w);
       }
     } else {
     for (uint e = tid; e < VT_MM_BM * VT_MM_BK; e += nthreads) {
@@ -611,16 +615,19 @@ kernel void vt_matmul_bt_mm(device const uchar* a   [[buffer(0)]],
     // 4 row blocks x 2 column blocks per simdgroup, over the FLAT tiles: the
     // stride is VT_MM_BK / VT_MM_BN in both the address arithmetic and the
     // elements_per_row argument, so the two cannot disagree.
-    simdgroup_float8x8 ma[4], mb[2];
-    for (uint i = 0u; i < 4u; ++i) {
-      simdgroup_load(ma[i], &sa[(sg_r * 32u + i * 8u) * VT_MM_BK], VT_MM_BK);
+    // BK=16 is consumed as two 8-deep fragments; the simdgroup matrices are 8x8.
+    for (uint kk = 0u; kk < VT_MM_BK; kk += 8u) {
+      simdgroup_float8x8 ma[4], mb[2];
+      for (uint i = 0u; i < 4u; ++i) {
+        simdgroup_load(ma[i], &sa[(sg_r * 32u + i * 8u) * VT_MM_BK + kk], VT_MM_BK);
+      }
+      for (uint j = 0u; j < 2u; ++j) {
+        simdgroup_load(mb[j], &sb[kk * VT_MM_BN + sg_c * 16u + j * 8u], VT_MM_BN);
+      }
+      for (uint i = 0u; i < 4u; ++i)
+        for (uint j = 0u; j < 2u; ++j)
+          simdgroup_multiply_accumulate(acc[i][j], ma[i], mb[j], acc[i][j]);
     }
-    for (uint j = 0u; j < 2u; ++j) {
-      simdgroup_load(mb[j], &sb[sg_c * 16u + j * 8u], VT_MM_BN);
-    }
-    for (uint i = 0u; i < 4u; ++i)
-      for (uint j = 0u; j < 2u; ++j)
-        simdgroup_multiply_accumulate(acc[i][j], ma[i], mb[j], acc[i][j]);
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

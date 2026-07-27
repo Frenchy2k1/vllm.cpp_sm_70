@@ -2555,6 +2555,29 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal BK=16 + fully-utilised vectorised staging (2026-07-27)
+
+**The fix the previous negative result prescribed.** B-tile vectorisation was
+net neutral at BK=8 because it left half the threadgroup idle: `(BK/4)*BN = 128`
+vector loads across 256 threads. BK=16 makes both tiles exactly 256 loads, one
+per thread, and the B win then survives instead of trading against the qkv shape.
+
+| shape | BK=8, scalar B | BK=8, vector B | **BK=16, vector B** | MLX |
+|---|--:|--:|--:|--:|
+| qkv 512x2048x2048 | 2282 | 1939 | **2292** | 2640 (87%) |
+| mlp-up 512x2048x6144 | 2501 | 2618 | **2753** | 3325 (83%) |
+| mlp-dn 512x6144x2048 | 2382 | 2517 | **2612** | 3293 (79%) |
+
+The qkv regression disappears and both 6144-dimension shapes gain ~10%. End to
+end **17.41 -> 17.65 tok/s**, TTFT **1749 -> 1664 ms (-4.9%)**. The end-to-end
+gain is small because prefill is now only ~23% of the run.
+
+**Our GEMM is now at 79-87% of MLX's steel kernel**, from 45% two changes ago.
+SACRED gate **16/16 unchanged, no golden re-capture**; row diagnostic NONE; suite
+21 cases / 20,135 assertions.
+
+---
+
 ## Metal B-tile vectorisation - shape-split, NET NEUTRAL, reverted (2026-07-27)
 
 The A tile's vectorisation was worth 1.55x, so the B tile was the obvious other

@@ -26142,3 +26142,31 @@ against another.
 
 **Goal:** 17.41 of 27.9 tok/s, 1.60x remaining. Decode ~5.6 s vs MLX-LM's 4.59 s
 (1.22x); prefill ~1.75 s vs ~0.47 s (3.7x).
+
+---
+
+## 2026-07-27 — BK=16 + fully-utilised vectorised staging: 17.41 -> 17.65 tok/s
+
+**This is the fix the previous negative result prescribed, and it worked.**
+B-tile vectorisation was net neutral at BK=8 because it left half the threadgroup
+idle (`(BK/4)*BN = 128` vector loads across 256 threads). BK=16 makes BOTH tiles
+exactly 256 vector loads, one per thread.
+
+| shape | BK=8 scalar B | BK=8 vector B | **BK=16 vector B** | MLX |
+|---|--:|--:|--:|--:|
+| qkv | 2282 | 1939 | **2292** | 2640 (87%) |
+| mlp-up | 2501 | 2618 | **2753** | 3325 (83%) |
+| mlp-dn | 2382 | 2517 | **2612** | 3293 (79%) |
+
+The qkv regression is gone and both 6144-dimension shapes gain ~10%. End to end
+**17.41 -> 17.65 tok/s**, TTFT **1749 -> 1664 ms**. Small end-to-end because
+prefill is ~23% of the run. **GEMM now 79-87% of MLX, from 45% two changes ago.**
+
+SACRED gate **16/16 UNCHANGED, no golden re-capture**; row diagnostic NONE.
+
+**Method note:** the previous round's "neutral" result was only useful because it
+recorded WHY (thread under-utilisation) rather than just the number. The named
+cause was the whole fix.
+
+**Goal:** 17.65 of 27.9 tok/s, 1.58x remaining. Decode ~5.6 s vs MLX-LM's 4.59 s
+(1.22x); prefill ~1.66 s vs ~0.47 s (3.5x).
