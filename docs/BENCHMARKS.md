@@ -2555,6 +2555,40 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## BENCHMARK EQUIVALENCE: the MLX-LM comparison was NOT like-for-like (2026-07-27)
+
+**A correction to this record's own reporting, found by auditing the two
+harnesses' definitions rather than by measuring anything new.**
+
+`mlx_lm` reports `generation_tps = (n + 1) / (time - tic)` with `tic` set AFTER
+prompt processing (`mlx_lm/generate.py:718`) — it is **decode-only and excludes
+prefill**. Our headline "Output token throughput" is generated tokens over the
+TOTAL benchmark duration, prefill included. Every "X of 27.9" figure in the
+entries below compared OUR total-basis number against THEIR decode-only number,
+which overstates the gap.
+
+Our equivalent metric already exists: "Mean per-stream decode rate" =
+`1 / mean_TPOT` = 127/(E2EL - TTFT), against MLX's 128/T. Those agree to ~1% at
+n=128.
+
+**Both honest comparisons at b=1, Qwen3-1.7B-bf16, p=512 g=128:**
+
+| basis | ours | MLX-LM | ours as % | remaining |
+|---|--:|--:|--:|--:|
+| **decode-only** (MLX's own headline) | **26.42** | 27.89 | **94.7%** | 1.056x |
+| **total, incl. prefill** (like-for-like) | 20.24 | 25.31 | 80.0% | 1.250x |
+
+MLX's total-basis figure is derived from its own measured 1091.18 prompt tok/s
+and 27.893 generation tok/s: prefill 0.469 s + decode 4.589 s = 5.058 s.
+
+**Neither number is parity, and this is not a redefinition of the goal.** What it
+establishes is WHERE the remaining gap lives: decode is within 5.6%, and the
+total-basis gap is almost entirely PREFILL (ours ~1.5 s against MLX's 0.469 s,
+3.2x). Prefill is now the whole story, which the per-kernel attribution already
+implied but the mismatched headline obscured.
+
+---
+
 ## Metal attention V-split across key groups on Apple M4 (2026-07-27) - +4.8%
 
 The fix the width experiment named. Parallelising V over `d` alone used only `d`
