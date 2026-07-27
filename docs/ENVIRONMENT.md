@@ -49,6 +49,7 @@ portable/reference path. In normal operation leave them unset.
 | `VT_ASYNC_SCHED` | on | Synchronous scheduling (no scheduler/execution overlap). The documented first-line workaround for a suspected scheduling bug |
 | `VLLM_CPP_CUDAGRAPH` | on (CUDA) | Eager launches instead of a captured CUDA graph |
 | `VLLM_CPP_DENSE_DECODE_GRAPH` | on (CUDA dense) | Non-graphed dense decode |
+| `VT_MM_DECODE_EAGER` | off (graph on) | Set to `1` to force the eager per-step multimodal (Qwen3.6-27B image/video) decode instead of routing it through the captured dense decode graph. Rollback / A-B knob; the graphed path is token-exact with the eager path |
 | `VT_DEVICE_KV_CACHE` | on (CUDA) | Host-side KV cache instead of the on-device one |
 | `VT_GPU_SAMPLE` | on (CUDA) | Host-side sampling instead of on-GPU sampling |
 | `VT_GDN_PACKED_DECODE` | on (CUDA GDN) | Unpacked GDN decode path |

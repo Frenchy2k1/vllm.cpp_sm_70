@@ -356,3 +356,115 @@ per-step launch overhead** — i.e. graphed/batched decode (lever #3), for which
 on-GPU sampling is a PREREQUISITE this lever now supplies, but which it does not by
 itself close. mm rows stay **speed-pending / `PARTIAL`**: correctness-complete,
 decode at-parity on 27B, still 1.52× on audio (lever #3). No mm row advances to DONE.
+
+---
+
+## 9. DECODE GRAPH — lever #3 FIRST BRICK executed (`CLAIM-MULTIMODAL-SPEED-GRAPH`, 2026-07-27)
+
+**Base:** `origin/main` `bd3e15ed`. **Build:** `dgx.casa:~/work/mm-decode-graph`,
+cutlass 4.5.0 + FA2 sm_121a + Triton-AOT, arch 121a (FA2 ENABLED banner + Triton
+vendored MANIFEST-OK confirmed at configure; clean `-Werror`, 0 warn). All GPU under
+`flock /tmp/gpu`, sole owner (`nvidia-smi` idle), cold rep0 discarded.
+
+Lever #3 is "batched/graphed multimodal serving" — the dominant remaining mm speed
+residual (§8: the audio 1.52× is eager per-step LAUNCH overhead, closed only by
+graphed/batched mm decode). It is a large multi-step effort; this is the SCOPE + the
+first reachable, correctness-held brick.
+
+### 9.1 SCOPE — the current mm serving/decode path, grounded (file:line)
+
+- **mm SERVING ingestion is UNWIRED, and the engine cannot consume mm data yet.**
+  `from_json(ChatMessage)` parses ONLY bare-string `content`
+  (`src/vllm/entrypoints/openai/protocol.cpp:298-300`, comment "multimodal
+  content-part arrays deferred"); `grep image_url|audio_url src/vllm/entrypoints` = 0.
+  No `multi_modal_data` field reaches `LLMEngine`/`serving_chat` (grep in
+  `entrypoints/`+`engine/` = 0). So `image_url`/`audio_url` ingestion is not a
+  one-file parse brick — it needs the parse layer AND an engine mm-request path AND
+  processor invocation (a multi-W chain; W-plan below). The lever-#2 agent's note is
+  CONFIRMED: single-sequence, `image_url`/`audio_url` unwired.
+- **mm DECODE was single-sequence + eager + un-graphed.** The 27B image+video share
+  `VLGenerateCoreGdn` (`qwen3_5.cpp:6724`); Voxtral audio is `VoxtralGenerateGreedy`
+  (`voxtral.cpp:375`). Both ran an eager per-step forward (`DenseForwardLayers` /
+  `ForwardLastLogits`) rebuilding host metadata each step — NOT the production paged
+  runner's captured decode.
+- **The graphed decode step ALREADY EXISTS for the 27B-dense family**, unused by the
+  mm path: `Qwen3_5DenseDecodeGraph` (`include/vllm/model_executor/models/qwen3_5_dense.h:314`;
+  impl `qwen3_5.cpp:7428`) — the production cold→warm→replay captured decode the text
+  runner uses, `BuildPaddedDecode` (`qwen3_5.cpp:7153`) padding a real batch B up to a
+  captured size S (`PadToCaptureSize`, `decode_graph_sizes.h:47`). At **S==B it is a
+  bit-identical rebuild of the eager inputs** (`qwen3_5.cpp:7151`). Voxtral's Llama/
+  Mistral text stack has **NO** decode-graph class (only Qwen3.5/MoE/DeepSeek do).
+- **vLLM port target (HARD-rule grounding):** vLLM graphs decode over mm requests via
+  the generic decode cudagraph dispatcher (`vllm/compilation/` + `gpu_model_runner`
+  `_dummy_run`/capture), with the mm ENCODER kept eager (`compile_mm_encoder:False`)
+  and the EncoderCacheManager (`vllm/v1/core/encoder_cache_manager.py:17`) + scheduler
+  mm hooks (`sched/scheduler.py:1356-1467`) admitting batched mm requests into the same
+  graphed decode step. `Qwen3_5DenseDecodeGraph` is our 1:1 of that per-size captured
+  decode; this brick makes the mm decode USE it.
+
+### 9.2 FIRST BRICK — route the 27B mm dense decode through `Qwen3_5DenseDecodeGraph`
+
+`VLGenerateCoreGdn`'s decode loop (shared by 27B image + video) now runs each
+pure-decode step through `Qwen3_5DenseDecodeGraph::Step` (a single instance built per
+generate, `max_num_reqs=1`), instead of the eager `DenseForwardLayers(...,&mrope_dec)`.
+Single-seq ⇒ B=1, `PadToCaptureSize(1,1)=1` ⇒ **S==B==1**, the bit-identical-rebuild
+case. The embed runs on device inside `Step`; the returned `[1,vocab]` logits stay on
+device and feed `vt::GreedyArgmax` directly (no full-vocab D2H). The eager mrope path
+is preserved behind `VT_MM_DECODE_EAGER=1` (default = graph; parity-enabler-as-default
+policy). One file touched: `src/vllm/model_executor/models/qwen3_5.cpp`.
+
+**ROPE EQUIVALENCE (why it is token-exact).** During decode every position is a text
+token with the MRoPE 3-axis positions equal on all axes (`pos3_dec={p,p,p}`), so
+MRoPE degenerates to 1-D RoPE at `p`. `Step` applies 1-D device RoPE from `positions`,
+so passing `positions={p}` (`p=abs_idx+delta`, the MRoPE-adjusted decode position)
+reproduces the eager mrope rope angle; the KV physical slot stays `abs_idx`. This was
+a HYPOTHESIS the token-exact gate ARBITRATES — and it PASSES STRICT (below): the
+host-MRoPE-cache vs device-1-D-rope difference flips zero argmax.
+
+### 9.3 CORRECTNESS (the RED line — HELD, token-exact, proven-to-run)
+Clean dgx build of `bd3e15ed` + this brick; golden md5 unchanged
+(`gen_tokens_i32.bin` = `3bc5f231…`, before==after). Proof-of-run: `VT_DECODE_GRAPH_STATS=1`
+printed `captured … padded size S=1 (real B=1)` + **30 replays** on each gate — the
+graphed path DID execute.
+- **27B image `test_qwen3_5_vl_e2e`: STRICT 32/32** (54/54 assertions; ours == golden
+  `760,1156,6587,728,310,10229,1092,369,…`).
+- **27B video `test_qwen3_5_vl_video_e2e`: STRICT 32/32** (27/27; teacher-forced gap 0
+  nats everywhere — the graphed decode lands the strict target, not just near-tie).
+
+### 9.4 RESULT — decode TPOT A/B (same-binary throwaway toggle `VT_MM_DECODE_EAGER`)
+Same-binary A/B (dgx-only throwaway instrumentation, NOT committed): 4 reps/mode in
+ONE model load, rep0 dropped. `tpot31 = gen32_wall/31` (includes amortized prefill;
+the A/B DELTA is definition-independent).
+
+| Vehicle | GRAPH (band) | EAGER (band) | Δ | vs vLLM 0.25.0 graphed | Verdict |
+|---|---|---|---|---|---|
+| **Qwen3.6-27B image (32 tok)** | **232.5 ms/tok** (231.8–233.9) | 233.4 ms/tok (233.35–233.5) | **−0.9 ms/tok (~0.4%, graphed faster)** | decode at parity (§2.1) | **NEUTRAL** (bandwidth floor) |
+| Qwen3.6-27B video | = image by construction (shared `VLGenerateCoreGdn`) | — | ~0 | at parity | NEUTRAL |
+
+**Honest disposition.** As §8 predicted, graphing 27B mm decode is NEUTRAL — the
+per-step host launch overhead the graph removes (~1 ms/tok) is hidden under the
+~222 ms weight-streaming floor. The brick's value is STRUCTURAL: it closes the §3
+"un-graphed eager loop" gap for the 27B image+video path (the decode step is now
+graph-capturable, reusing the production replay), a prerequisite for batched (c2+) mm
+decode and the mechanism the audio 1.52× needs. The measured launch-overhead win
+lands where decode is CHEAP — the Voxtral audio path — which has NO decode-graph class
+yet (W-plan W1). mm rows stay **speed-pending / `PARTIAL`**. No mm row advances to DONE.
+
+### 9.5 Remaining lever-#3 W-plan (W-step → gate → size)
+- **W1 — Voxtral (Llama/Mistral) decode-graph class (the 1.52× gap-closer).** Build a
+  `VoxtralDecodeGraph` cold→warm→replay driver (mirror `Qwen3_5DenseDecodeGraph`) over
+  `ForwardLastLogits`/`weights.text` (`voxtral.cpp:123,454`); route
+  `VoxtralGenerateGreedy`'s decode through it. GATE: `test_voxtral_e2e` 14/14 held
+  bit-exact + audio TPOT A/B toward vLLM's 40.8 ms (expect a REAL win — cheap 3B decode
+  is NOT bandwidth-floored, §8.3). Size: **M** (new graph class, no capture in the loop
+  region is a fresh capture-safety surface — [[cudagraph-capture-bakes-stack-addresses]]).
+- **W2 — batched multi-seq mm decode (S>1 / c2+).** Drive `VLGenerateCoreGdn` (and W1's
+  audio) with B>1 requests through the SAME graph at padded S∈{2,4,8,…}; needs multi-slot
+  GDN/KV caches + the per-request mm merge at prefill. GATE: 2-request batched decode
+  token-identical to two single-seq runs + a c2 throughput A/B. Size: **L**.
+- **W3 — mm SERVING ingestion (`image_url`/`audio_url`).** Parse content-part arrays in
+  `protocol.cpp` → mm feature extraction (the landed `src/vllm/multimodal/*` processors)
+  → an engine mm-request path (`multi_modal_data` on the request, the EncoderCacheManager
+  seam) → `serving_chat`. GATE: a served mm chat completion whose tokens == the e2e
+  driver's. Size: **L** (parse + engine request path + processor wiring; the true
+  prerequisite for a production-serving c2+ A/B).
