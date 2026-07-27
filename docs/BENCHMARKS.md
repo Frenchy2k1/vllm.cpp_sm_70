@@ -5025,9 +5025,16 @@ assigned the 497 `cudaStreamSynchronize` calls (20.975 s, 42.20 ms/call) to
 `GPUModelRunner::sample_tokens_async`'s discrete host path. That function is not
 called on the benchmarked path at all - verified directly, by instrumenting the
 branch and observing it never executes under `vllm-bench`. Whatever those
-synchronizations are, they are not the async sampler's, and the next profiling
-pass must re-attribute them before any further lever is chosen from that trace.
-Spec, deviations and gates:
+synchronizations are, they are not the async sampler's. A fresh
+attribution-complete profile re-attributes them: 112 `cudaStreamSynchronize`
+calls over ~64 decode steps plus prefill and warm-up at 10.12 ms each - **about
+one per engine step**, which scaled to the binding workload (~512 steps at ~38 ms)
+is ~500 calls at ~40 ms, i.e. the 2026-07-25 numbers almost exactly. The count
+and the time in that trace were right; the attribution was not. It is the depth-1
+engine loop waiting for its own sampling, not an async-sampler defect. The
+per-call embedding barrier is absent from the new trace, which is W4e working.
+Numbers, profile and reproduction:
+[W4 evidence](bench-evidence/w4-async-mirror-20260727.md). Spec and deviations:
 [.agents/specs/async-discrete-device-combine.md](../.agents/specs/async-discrete-device-combine.md).
 
 ### Hardening detector lanes (2026-07-27, `HARDEN-DETECTOR-LANES`) - infrastructure, NOT APPLICABLE

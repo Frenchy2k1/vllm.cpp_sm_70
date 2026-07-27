@@ -32492,3 +32492,35 @@ Also adopted from the external hardening study: `VLLM_CPP_SANITIZE` host lanes
 (ASan+UBSan, TSan) plus the `sanitize-cpu` CI matrix, and `VT_POOL_BYPASS=1` so
 compute-sanitizer can see through the caching device-scratch pool. Item-by-item
 transfer decisions: [specs/hardening-adoption-2026-07-27.md](specs/hardening-adoption-2026-07-27.md).
+
+## 2026-07-27 (close) — W4 A/B and the re-attribution that replaces the lever's premise
+
+**A/B (`/tmp/w4-ab-final`, 3 interleaved reps/arm, order flipped on even reps,
+one lock, idle box):** W4 ON vs OFF is **0.9996x** total and output throughput,
+**1.0004x** TPOT, **1.0002x** TTFT. Per-rep spread within each arm is larger than
+the gap between them. **NEUTRAL.** Token identity across all three pairs:
+**384/384 requests identical.**
+
+**Re-attribution (`/tmp/w4-attrib.nsys-rep`, `--cuda-graph-trace=node`).** The
+2026-07-25 record blamed 497 `cudaStreamSynchronize` calls (20.975 s, 42.20
+ms/call) on `sample_tokens_async`. A fresh profile of the benchmarked path shows
+112 `cudaStreamSynchronize` over ~64 decode steps plus prefill and warm-up at
+10.12 ms each — about ONE PER ENGINE STEP. Scaled to the binding workload (~512
+steps at ~38 ms TPOT) that is ~500 calls at ~40 ms, which is the old trace's
+numbers almost exactly. So the COUNT and the TIME were right and the ATTRIBUTION
+was wrong: it is the depth-1 `LLMEngine::step()` loop waiting for its own
+sampling (the sampler's greedy download, `sampler.cpp:191`), not an async-sampler
+defect. Also visible: the per-call embedding `cudaMalloc`+sync+`cudaFree` is gone
+from the trace, which is W4e working; `cudaMalloc` is down to 818 calls and
+`cudaFree` to 512 for the whole run, at 29 ms and 28 ms total.
+
+**So the lever list changes.** There is no per-step synchronize to delete on the
+synchronous path — the wait IS the step. Overlap requires running the ASYNC
+engine loop, and W4 is what makes that loop legal on a discrete GPU. The next
+step is therefore a SERVING A/B over `AsyncLLM` (`examples/server`), not another
+runner-level kernel change. It is blocked by the harness, not by the engine:
+`tools/bench/run_serve_low.py` needs a pinned SGLang container image and accepts
+only the 27B/35B model keys, neither available here. A minimal serving driver for
+the 4B on this host is the unblocking task.
+
+Evidence: [../docs/bench-evidence/w4-async-mirror-20260727.md](../docs/bench-evidence/w4-async-mirror-20260727.md).
