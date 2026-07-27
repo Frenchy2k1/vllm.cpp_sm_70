@@ -1920,6 +1920,94 @@ struct VtRopeApplyParams {
   uint  pad;
 };
 
+// FUSED Qwen3-DENSE attention preamble: per-head standard RMSNorm(q) +
+// RMSNorm(k) + partial NeoX RoPE, in ONE dispatch.
+//
+// The composite dispatches three standalone ops, which at decode is 28 q-norms +
+// 28 k-norms + 28 ropes per token. Each is launch-dominated: vt_rms_norm moves
+// ~4.3 KB per dispatch and measures 0.65 GB/s, three orders under peak, so its
+// cost is per-launch and lands in GPU-busy time rather than in the gaps. Folding
+// 84 dispatches into 28 removes that cost, it does not merely overlap it.
+//
+// BYTE-EXACTNESS is the reason for the store-then-reload between the two halves:
+// the composite's RmsNorm STORES the normed value (rounding it to the buffer
+// dtype) before RopeFromCache reads it back. Keeping it in registers would be a
+// different result for a bf16 buffer, so the device-memory barrier stays and the
+// rotation re-reads what was written — exactly the composite's data flow.
+struct VtQkNormRopeParams {
+  ulong q_s0; ulong q_s1; ulong k_s0; ulong k_s1;
+  uint  t; uint hq; uint hk; uint d;
+  uint  rot; uint rhalf; uint is_neox; uint pos_i64;
+  uint  q_dt; uint k_dt; uint qw_dt; uint kw_dt;
+  uint  cache_dt; uint gemma; uint tg; uint pad;
+  float eps;
+  float pad2;
+};
+
+kernel void vt_attn_qk_norm_rope(device uchar*       q         [[buffer(0)]],
+                                 device uchar*       k         [[buffer(1)]],
+                                 device const uchar* qw        [[buffer(2)]],
+                                 device const uchar* kw        [[buffer(3)]],
+                                 device const uchar* cache     [[buffer(4)]],
+                                 device const uchar* positions [[buffer(5)]],
+                                 constant VtQkNormRopeParams& p [[buffer(6)]],
+                                 uint2 tgid [[threadgroup_position_in_grid]],
+                                 uint2 tid2 [[thread_position_in_threadgroup]]) {
+  threadgroup float smem[VT_TG_MAX];
+  const uint tid = tid2.x;
+  const uint token = tgid.x;
+  const uint hidx = tgid.y;
+
+  device uchar* buf;
+  device const uchar* w;
+  uint dt, w_dt;
+  ulong off;
+  if (hidx < p.hq) {
+    buf = q; w = qw; dt = p.q_dt; w_dt = p.qw_dt;
+    off = ulong(token) * p.q_s0 + ulong(hidx) * p.q_s1;
+  } else {
+    const uint kh = hidx - p.hq;
+    if (kh >= p.hk) { return; }
+    buf = k; w = kw; dt = p.k_dt; w_dt = p.kw_dt;
+    off = ulong(token) * p.k_s0 + ulong(kh) * p.k_s1;
+  }
+
+  // --- RMSNorm over this head's row, identical arithmetic to vt_rms_norm.
+  float partial = 0.0f;
+  for (uint j = tid; j < p.d; j += p.tg) {
+    const float v = vt_load(buf, dt, off + ulong(j));
+    partial += v * v;
+  }
+  const float sumsq = vt_tg_sum(smem, tid, p.tg, partial);
+  const float inv = 1.0f / sqrt(sumsq / float(p.d) + p.eps);
+  for (uint j = tid; j < p.d; j += p.tg) {
+    const float v = vt_load(buf, dt, off + ulong(j));
+    float wj = vt_load(w, w_dt, ulong(j));
+    if (p.gemma != 0u) { wj += 1.0f; }
+    vt_store(buf, dt, off + ulong(j), v * inv * wj);
+  }
+  // The rotation below READS BACK what was just stored, so the store must be
+  // visible device-wide first. This is also what makes the fused result
+  // bit-identical to the composite for a rounding buffer dtype.
+  threadgroup_barrier(mem_flags::mem_device);
+
+  // --- Partial NeoX RoPE from the cache, identical to vt_rope_from_cache.
+  const long pos = p.pos_i64
+      ? ((device const long*)positions)[token]
+      : (long)((device const int*)positions)[token];
+  const ulong coff = ulong(pos) * p.rot;
+  for (uint pair = tid; pair < p.rhalf; pair += p.tg) {
+    const float c = vt_load(cache, p.cache_dt, coff + pair);
+    const float s = vt_load(cache, p.cache_dt, coff + p.rhalf + pair);
+    const uint first  = p.is_neox ? pair : pair * 2u;
+    const uint second = p.is_neox ? pair + p.rhalf : pair * 2u + 1u;
+    const float x = vt_load(buf, dt, off + first);
+    const float y = vt_load(buf, dt, off + second);
+    vt_store(buf, dt, off + first,  x * c - y * s);
+    vt_store(buf, dt, off + second, x * s + y * c);
+  }
+}
+
 kernel void vt_rope_from_cache(device uchar* q               [[buffer(0)]],
                                device uchar* k               [[buffer(1)]],
                                device const uchar* positions [[buffer(2)]],

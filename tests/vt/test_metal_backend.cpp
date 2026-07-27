@@ -33,6 +33,7 @@ void BandwidthProbe(vt::Queue& q, void* src, void* out, uint32_t n_chunks, uint3
                     uint32_t stride_f4);
 }
 #include "vt/ops.h"
+#include "vt/recipes.h"
 
 using vt::Backend;
 using vt::Device;
@@ -1023,6 +1024,98 @@ TEST_CASE("Metal strided-read bandwidth probe" * doctest::skip(true)) {
     metal.Free(src);
     metal.Free(dst);
   }
+  metal.DestroyQueue(q);
+}
+
+// The fused qk-norm-RoPE preamble (kAttnQkNormRope) against its own byte-exact
+// Tier-0 composite. This test exists because test_ops_fused_chain's Metal cases
+// are CUDA-gated and skip — the same coverage hole that let an incorrect version
+// of the mma attention kernel pass every existing test earlier. Metal registers
+// the recipe's fast_op, so FusedChain here dispatches the FUSED kernel; the CPU
+// side has no registration and runs the composite, which is the golden the
+// recipe's own documentation defines.
+TEST_CASE("Metal fused qk-norm-RoPE matches the CPU composite") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  // Qwen3 geometry with GQA, plus a partial rotation (rot < Dh) so the
+  // un-rotated tail is exercised too.
+  const int64_t T = 5, Hq = 16, Hkv = 8, Dh = 128, rot = 64, maxpos = 64;
+  const int64_t qn = T * Hq * Dh, kn = T * Hkv * Dh;
+
+  std::mt19937 rng(90210);
+  std::uniform_real_distribution<float> ud(-1.5f, 1.5f);
+  std::vector<float> qh(static_cast<size_t>(qn)), kh(static_cast<size_t>(kn));
+  std::vector<float> wq(static_cast<size_t>(Dh)), wk(static_cast<size_t>(Dh));
+  std::vector<float> cs(static_cast<size_t>(maxpos * rot));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (auto& x : qh) x = ud(rng);
+  for (auto& x : kh) x = ud(rng);
+  for (auto& x : wq) x = ud(rng);
+  for (auto& x : wk) x = ud(rng);
+  for (auto& x : cs) x = ud(rng);
+  for (int64_t i = 0; i < T; ++i) pos[static_cast<size_t>(i)] = static_cast<int32_t>(i * 3 + 1);
+
+  MBuf dq(metal, q, qh.size() * 4), dk(metal, q, kh.size() * 4), dwq(metal, q, wq.size() * 4),
+      dwk(metal, q, wk.size() * 4), dcs(metal, q, cs.size() * 4), dpos(metal, q, pos.size() * 4);
+  dq.Upload(qh.data()); dk.Upload(kh.data()); dwq.Upload(wq.data());
+  dwk.Upload(wk.data()); dcs.Upload(cs.data()); dpos.Upload(pos.data());
+  metal.Synchronize(q);
+
+  Tensor gq2 = Tensor::Contiguous(dq.ptr(), vt::DType::kF32, d, {T * Hq, Dh});
+  Tensor gk2 = Tensor::Contiguous(dk.ptr(), vt::DType::kF32, d, {T * Hkv, Dh});
+  Tensor gq3 = Tensor::Contiguous(dq.ptr(), vt::DType::kF32, d, {T, Hq, Dh});
+  Tensor gk3 = Tensor::Contiguous(dk.ptr(), vt::DType::kF32, d, {T, Hkv, Dh});
+  Tensor gwq = Tensor::Contiguous(dwq.ptr(), vt::DType::kF32, d, {Dh});
+  Tensor gwk = Tensor::Contiguous(dwk.ptr(), vt::DType::kF32, d, {Dh});
+  Tensor gcs = Tensor::Contiguous(dcs.ptr(), vt::DType::kF32, d, {maxpos, rot});
+  Tensor gpo = Tensor::Contiguous(dpos.ptr(), vt::DType::kI32, d, {T});
+
+  vt::FusedBinding gb;
+  gb.op[0] = &gq2; gb.op[1] = &gwq; gb.op[2] = &gk2; gb.op[3] = &gwk;
+  gb.op[4] = &gq3; gb.op[5] = &gk3; gb.op[6] = &gcs; gb.op[7] = &gpo;
+  gb.n = 8;
+  vt::FusedParams gp;
+  gp.eps = 1e-6f;
+  gp.rope = vt::RopeArgs{10000.0f, static_cast<int>(rot)};
+  // Proof the FUSED path is what ran: Metal registers kAttnQkNormRope, so this
+  // must take DispatchFusedFast, not the composite.
+  REQUIRE(vt::OpRegistered(vt::OpId::kAttnQkNormRope, DeviceType::kMETAL));
+  vt::FusedChain(q, vt::kAttnQkNormRope, gb, gp);
+  metal.Synchronize(q);
+
+  std::vector<float> gotq(static_cast<size_t>(qn)), gotk(static_cast<size_t>(kn));
+  dq.Download(gotq.data());
+  dk.Download(gotk.data());
+  metal.Synchronize(q);
+
+  // CPU composite on identical inputs.
+  std::vector<float> cq = qh, ck = kh, cwq = wq, cwk = wk, ccs = cs;
+  std::vector<int32_t> cpos = pos;
+  Queue cq_(Queue{Device{DeviceType::kCPU, 0}, nullptr});
+  const Device cd{DeviceType::kCPU, 0};
+  Tensor cq2 = Tensor::Contiguous(cq.data(), vt::DType::kF32, cd, {T * Hq, Dh});
+  Tensor ck2 = Tensor::Contiguous(ck.data(), vt::DType::kF32, cd, {T * Hkv, Dh});
+  Tensor cq3 = Tensor::Contiguous(cq.data(), vt::DType::kF32, cd, {T, Hq, Dh});
+  Tensor ck3 = Tensor::Contiguous(ck.data(), vt::DType::kF32, cd, {T, Hkv, Dh});
+  Tensor cwqt = Tensor::Contiguous(cwq.data(), vt::DType::kF32, cd, {Dh});
+  Tensor cwkt = Tensor::Contiguous(cwk.data(), vt::DType::kF32, cd, {Dh});
+  Tensor ccst = Tensor::Contiguous(ccs.data(), vt::DType::kF32, cd, {maxpos, rot});
+  Tensor cpot = Tensor::Contiguous(cpos.data(), vt::DType::kI32, cd, {T});
+  vt::FusedBinding cb;
+  cb.op[0] = &cq2; cb.op[1] = &cwqt; cb.op[2] = &ck2; cb.op[3] = &cwkt;
+  cb.op[4] = &cq3; cb.op[5] = &ck3; cb.op[6] = &ccst; cb.op[7] = &cpot;
+  cb.n = 8;
+  vt::FusedChain(cq_, vt::kAttnQkNormRope, cb, gp);
+
+  double worst = 0.0;
+  for (size_t i = 0; i < gotq.size(); ++i)
+    worst = std::max(worst, std::abs(static_cast<double>(gotq[i]) - static_cast<double>(cq[i])));
+  for (size_t i = 0; i < gotk.size(); ++i)
+    worst = std::max(worst, std::abs(static_cast<double>(gotk[i]) - static_cast<double>(ck[i])));
+  MESSAGE("Metal fused qk-norm-RoPE vs CPU composite: worst |elem| err = " << worst);
+  // f32 throughout on both sides; only the reduction order differs.
+  CHECK(worst <= 1e-4);
   metal.DestroyQueue(q);
 }
 

@@ -2862,6 +2862,38 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Fused qk-norm-RoPE preamble: kernel LANDED and validated, not yet on the hot path
+
+`vt_attn_qk_norm_rope` — per-head RMSNorm(q) + RMSNorm(k) + partial NeoX RoPE in
+one dispatch, replacing three. Registered as the `kAttnQkNormRope` recipe's
+`fast_op` on **Metal only**, so CPU and CUDA keep the byte-exact composite through
+FusedChain's `OpRegistered` guard and no CPU reference was needed.
+
+**Validated against its own golden:** a new Metal-vs-CPU-composite test gives a
+worst element error of **1.43e-06** (bar 1e-4), and asserts
+`OpRegistered(kAttnQkNormRope, kMETAL)` first so the FUSED path is provably what
+ran. That test exists because `test_ops_fused_chain`'s Metal cases are CUDA-gated
+and skip — the same coverage hole that let an incorrect mma attention kernel pass
+everything earlier in this session.
+
+**Dispatch reduction, measured:** on the f32 attention path, 896 fused dispatches
+replace 1792 rms_norm + 896 rope = 2688; `vt_rms_norm` drops 3616 -> 1824.
+
+**It does NOT move the benchmark yet, and the reason is recorded rather than
+glossed:** `dense_attn_block.h:392` routes the preamble through the recipe only
+when `attn_f32`, and the benchmarked Qwen3-1.7B runs the bf16 preamble
+(`VT_QWEN3_ATTN_F32=1` selects the f32 diagnostic path). Extending that condition
+to bf16 is the remaining step. Both the recipe and this kernel are dtype-generic,
+but the bf16 branch's default RoPE is `RopeNeox` rather than `RopeFromCache`
+unless the rope cache is enabled, so the extension must be gated on whatever
+selects the cache — otherwise it silently swaps one RoPE implementation for
+another and the near-tie goldens move for the wrong reason.
+
+Estimated value once routed: 84 dispatches/token -> 28, ~0.38 ms/token against a
+0.7 ms/token decode deficit.
+
+---
+
 ## The fused attention preamble: scoped precisely (2026-07-27)
 
 Correcting the entry below, which said `kAttnQkNormRopeGate` is "CUDA only" and

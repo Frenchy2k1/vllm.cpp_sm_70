@@ -27646,3 +27646,50 @@ boundary rather than starting a multi-hour kernel and leaving it half-done: the
 diagnosis, the sizing, the exact call site
 (`include/vllm/model_executor/models/dense_attn_block.h:412`) and the golden
 definition are all recorded.
+
+---
+
+## 2026-07-27 — fused qk-norm-RoPE preamble: kernel LANDED + validated; routing remains
+
+Blocker 1 (validation) is CLOSED and the kernel is on main. Blocker 2 (routing)
+remains. Original entry follows, amended.
+
+**Done.** `vt_attn_qk_norm_rope`: one threadgroup per (token, head) doing per-head
+RMSNorm then partial NeoX RoPE, reproducing `vt_rms_norm` and
+`vt_rope_from_cache` arithmetic line for line. The store-then-reload between the
+halves is deliberate: the composite STORES the normed value (rounding it to the
+buffer dtype) before RoPE reads it back, so keeping it in registers would differ
+for a bf16 buffer. Plumbing: `OpId::kAttnQkNormRope`, `AttnQkNormRopeFn`, a
+`DispatchFusedFast` binding, `fast_op` on the recipe, and a Metal-only
+registration — which means CPU and CUDA keep the byte-exact composite
+automatically via FusedChain's `OpRegistered` guard, so no CPU reference was
+needed.
+
+**Verified dispatching:** on the f32 attention path, 896 `vt_attn_qk_norm_rope`
+dispatches REPLACE 1792 rms_norm + 896 rope = 2688. `vt_rms_norm` drops
+3616 -> 1824 (the remainder being the hidden-state norms).
+test_metal_backend 112298 assertions and test_ops_fused_chain 370 both green.
+
+**Blocker 1 — CLOSED.** A targeted Metal-vs-CPU-composite test now exists
+(`Metal fused qk-norm-RoPE matches the CPU composite`): worst element error
+**1.43e-06** against a 1e-4 bar, and it REQUIREs
+`OpRegistered(kAttnQkNormRope, kMETAL)` first so the fused path is provably what
+ran. Written before landing, which is the sequencing the mma kernel got wrong.
+
+**Blocker 2 — OPEN.**
+**Unreachable by default.** `dense_attn_block.h:392` routes the preamble
+   through the recipe only when `attn_f32`, and Qwen3-1.7B runs the bf16 preamble
+   (`VT_QWEN3_ATTN_F32=1` selects the f32 diagnostic path). So the win is not
+   realised for the benchmarked model. Extending the condition to bf16 is
+   plausible — the recipe and my kernel are both dtype-generic — but it changes
+   which path the model takes and needs its own byte-exactness argument.
+
+**Estimated value once both are closed:** 84 dispatches/token -> 28, ~0.38 ms/token
+of a 0.7 ms/token decode deficit. Not measured; the harness run has not been done
+because there is nothing correct to measure yet.
+
+**Extra hazard found while scoping the routing:** the bf16 branch's DEFAULT RoPE
+is `RopeNeox`, not `RopeFromCache`; the recipe's kRope step is RopeFromCache. So
+extending the condition must be gated on whatever enables the rope cache,
+otherwise it silently swaps one RoPE implementation for another and the near-tie
+goldens move for a reason that has nothing to do with fusion.
