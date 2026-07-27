@@ -31,6 +31,24 @@ per-step engine values is the recorded residual. Reproduce:
 `cmake --build build-cpu --target test_prometheus_metrics test_openai_api_server &&
 ./build-cpu/tests/test_prometheus_metrics && ./build-cpu/tests/test_openai_api_server`.
 
+**ROAD-V1-C8 unified streaming parser engine (2026-07-27, `CLAIM-ROADMAP-C8-PARSER`,
+NOT pushed).** Disposition: **CORRECTNESS gate, no throughput number
+(`benchmark_binding=false`).** A parser is a pure function of the
+`(delta_text, delta_token_ids)` stream, so the vLLM 0.26 unified
+`StreamingParserEngine` is gated EXACTLY (event-for-event, not near-tie): for 8
+fixed deterministic streams the C++ engine's emitted SemanticEvent sequence
+(type, value, tool_index) equals, event for event, the sequence vLLM 0.26.0.dev0
+(`555967922`) emits for the identical stream. `test_streaming_parser_engine` 2
+cases / 586 assertions on CPU. RED-first: dropping the held-back argument delta
+on tool-args exit fails 12 assertions at the divergent `}` boundary; restoring
+returns 586/586. Goldens are captured from the pinned source by
+`tools/parity/dump_streaming_parser_engine.py` and reproduce the committed `.inc`
+byte-identically. Inertness: additive opt-in subsystem, plain generation
+byte-identical. Reproduce:
+`VLLM_SOURCE=/path/to/vllm python3 tools/parity/dump_streaming_parser_engine.py --out /tmp/g.inc &&
+cmake --build build-cpu --target test_streaming_parser_engine &&
+./build-cpu/tests/test_streaming_parser_engine`.
+
 **ROAD-V1-C7 sampling controls + logprobs (2026-07-27, `CLAIM-ROADMAP-C7`, NOT
 pushed).** Disposition: **CORRECTNESS gate, no throughput number
 (`benchmark_binding=false`).** A sampling transform is a pure function of
