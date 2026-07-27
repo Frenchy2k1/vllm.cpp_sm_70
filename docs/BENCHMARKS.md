@@ -2555,6 +2555,31 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## A paired A/B harness, because the alternating loop lies (2026-07-27)
+
+`scripts/metal-paired-ab.py`. The floor documented below makes the obvious
+comparison unusable: five identical runs spread 10%, and the SAME build reads
+23.57 standalone, 23.43 running first in a pair and 20.76 running second. A plain
+alternating loop hands that drift to whichever binary runs second — which is
+exactly how a TIED change first measured "6% worse" here.
+
+Two corrections, both required:
+
+- **ABBA blocks.** Each block runs A, B, B, A. Linear drift cancels within the
+  block instead of accumulating against one arm.
+- **Cooldown.** Idle seconds between every run so each starts from a comparable
+  thermal state.
+
+It reports the per-block PAIRED delta — the only quantity drift does not
+contaminate — plus a sign test, since with 6 blocks a consistent direction is
+p = 0.031 two-sided, which is a far stronger claim than any single pair of
+numbers.
+
+Use it for anything under ~5% on this host. The eyeballed alternating loop is
+fine for a 4.3x kernel win and worthless for a 1% one.
+
+---
+
 ## MEASUREMENT FLOOR: this machine's noise now exceeds the remaining gap (2026-07-27)
 
 Five IDENTICAL runs of the same binary, back to back under one GPU lock:
