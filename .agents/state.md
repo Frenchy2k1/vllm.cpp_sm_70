@@ -25462,3 +25462,38 @@ the HW/external set above. Every blocked item has a landable additive/build-only
 `roadmap_v1.md` (portfolio intro), README (Project record), BENCHMARKS (NOT-APPLICABLE),
 ledger (`CLAIM-ROADMAP-V1-COMPLETION`). No src/tests. Seven checkers bare RC green.
 NOT pushed; FULL SHA reported to caller.
+---
+
+## 2026-07-27 — small-m batched-decode GEMM: TRIED, MEASURED SLOWER, REVERTED
+
+**Row:** `BACKEND-METAL-MLX`. **Spec:**
+[metal-dispatch-attribution.md](specs/metal-dispatch-attribution.md) § Dead ends.
+**Nothing of this attempt survives in code**; this entry and the spec/BENCHMARKS
+sections are the whole deliverable.
+
+**What was tried.** Extend the `M3d` one-simdgroup-per-column GEMV to carry m
+activation rows (m=2..16), reusing each B row across all m, so batched decode
+would stop falling to the 16x16 tile GEMM.
+
+**Correct, and slower.** f32 NMSE 2.42e-14 vs the tile kernel's 6.61e-13 (27x
+better); SACRED gate passed on a re-captured oracle-validated golden. But two
+reps of a same-binary A/B under the GPU lock show a regression at every m > 1
+that worsens with m: **0.87x (b=2), 0.78x (b=4), 0.71x (b=8), 0.66x (b=16)**.
+b=1 unchanged at ~1.9x.
+
+**Root cause is structural.** One simdgroup per output column means each
+simdgroup re-reads ALL of A from device memory: `N * m * K` of A traffic, growing
+with m, which is exactly the shape of the regression. The tile GEMM stages A and
+B tiles in threadgroup memory shared across a 16x16 output tile (16x less A
+traffic). At m=1, A is one row and stays cache-resident, which is why the same
+structure wins there and only there.
+
+**Do not re-try by tuning this shape** (unroll, simdgroups per threadgroup,
+accumulator count). The missing property is A reuse ACROSS COLUMNS, which needs
+2-D blocking. Batched decode and prefill want the SAME kernel: a 2-D blocked
+simdgroup-matrix GEMM, i.e. the original `M3d` idea now correctly scoped to m > 1.
+
+**Process lesson, recorded because it cost real work:** the golden was
+re-captured (with full oracle re-validation) BEFORE the speed A/B was run, then
+had to be reverted with the kernel. Benchmark first; re-capture a golden only
+once the change is known to be worth keeping.

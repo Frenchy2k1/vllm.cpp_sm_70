@@ -254,6 +254,45 @@ unchanged.
 | `M3d` | **RE-SCOPED AND LANDED 2026-07-27 as a decode GEMV, NOT the simdgroup GEMM this row assumed.** Shape-class profiling after `M3c-1` showed **21,464 of 21,632 matmuls are m=1 decode GEMVs, all BT**; only 168 are prefill GEMMs, so the simdgroup-matrix GEMM would have optimised 0.8% of the dispatches. Implemented instead: one simdgroup per output column, streaming the contiguous BT weight row coalesced, reduced with `simd_sum` | **1.89x** decode and **27x more accurate** (f32 NMSE 2.68e-14 vs the tile kernel's 7.40e-13). Required a Metal golden re-capture with vLLM-oracle re-validation, because the committed golden was captured with the less accurate kernel. The simdgroup-matrix GEMM for the 168 prefill dispatches is UNBUILT and is now a separate, much smaller row |
 | `M5b` | Share a command buffer with MLX's stream instead of committing per delegated op | The measured form of study §5.3's sync tax |
 
+### Dead ends (recorded so the next pass does not re-try them)
+
+**Small-m BT GEMV-style kernel for batched decode (m=2..16) — TRIED 2026-07-27,
+MEASURED SLOWER, REVERTED.** The obvious follow-up to `M3d` was to extend the
+one-simdgroup-per-column GEMV to carry m activation rows, reusing each B row
+across all m. It is CORRECT (f32 NMSE 2.42e-14 vs the tile kernel's 6.61e-13,
+27x better, and the SACRED gate passed on a re-captured golden) and it is a
+REGRESSION at every m > 1, monotonically worse as m grows. Two reps, same-binary
+A/B under the GPU lock:
+
+| B | tile | small-m | ratio |
+|--:|--:|--:|--:|
+| 1 | 5.41 / 5.54 | 10.72 / 10.54 | 1.98x / 1.90x (the `M3d` GEMV, unchanged) |
+| 2 | 9.33 / 9.28 | 8.08 / 8.07 | **0.87x** |
+| 4 | 13.92 / 13.88 | 10.83 / 10.81 | **0.78x** |
+| 8 | 18.32 / 18.18 | 12.91 / 12.92 | **0.71x** |
+| 16 | 21.60 / 21.64 | 14.28 | **0.66x** |
+
+**Root cause, and it is structural rather than a tuning miss.** The kernel gives
+each simdgroup one output column and therefore re-reads ALL of A from device
+memory per simdgroup: with N columns that is `N * m * K` of A traffic, which
+GROWS with m. That is exactly the observed shape of the regression. The tile GEMM
+stages both the A and B tiles in threadgroup memory shared across a 16x16 output
+tile, so its A traffic is 16x lower. At m=1 A is a single row, small enough to
+stay cache-resident, which is why the same structure WINS there and loses
+everywhere else.
+
+**Do not re-try by tuning this shape** (unroll factor, simdgroups per
+threadgroup, accumulator count). The missing property is A REUSE ACROSS COLUMNS,
+which needs 2-D blocking. The correct kernel for batched decode is therefore the
+same one prefill wants: a **2-D blocked simdgroup-matrix GEMM**, i.e. the
+original `M3d` idea, now correctly scoped to m > 1 rather than to the m=1 case
+that turned out to dominate the dispatch count.
+
+**Process note worth keeping:** the golden was re-captured (with full oracle
+re-validation) BEFORE the speed A/B was run, and then had to be reverted along
+with the kernel. Benchmark first, re-capture only once the change is known to be
+worth keeping.
+
 ### Risks/decisions
 
 - **Batching changes failure semantics (accepted, mitigated).** Today a failed

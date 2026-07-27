@@ -2474,6 +2474,42 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal small-m batched-decode GEMM on Apple M4 (2026-07-27) - FAILED, REVERTED
+
+**A negative result, recorded because it cost a day's reasoning and the next
+person should not repeat it.** The obvious follow-up to `M3d` was to extend the
+one-simdgroup-per-column GEMV to carry m activation rows (m=2..16), reusing each
+B row across all m. It is CORRECT and it is SLOWER at every m > 1.
+
+Same binary, arms by `VT_METAL_NO_GEMV`, 2 reps, under the GPU lock:
+
+| B | tile | small-m | ratio |
+|--:|--:|--:|--:|
+| 1 | 5.41 / 5.54 | 10.72 / 10.54 | 1.98x / 1.90x (the `M3d` GEMV, unchanged) |
+| 2 | 9.33 / 9.28 | 8.08 / 8.07 | **0.87x** |
+| 4 | 13.92 / 13.88 | 10.83 / 10.81 | **0.78x** |
+| 8 | 18.32 / 18.18 | 12.91 / 12.92 | **0.71x** |
+| 16 | 21.60 / 21.64 | 14.28 | **0.66x** |
+
+Correctness was never the problem: f32 NMSE 2.42e-14 against the tile kernel's
+6.61e-13 (27x better), and the SACRED gate passed on a re-captured,
+oracle-validated golden (max gap 0.062 nats, 0 outside vLLM's top-K).
+
+**Root cause is structural, not a tuning miss.** One simdgroup per output column
+means every simdgroup re-reads ALL of A from device memory: `N * m * K` of A
+traffic, which grows with m, matching the observed shape of the regression
+exactly. The tile GEMM stages A and B tiles in threadgroup memory shared across a
+16x16 output tile, so its A traffic is 16x lower. At m=1 A is one row and stays
+cache-resident, which is why the identical structure wins there.
+
+**Do not re-try by tuning this shape.** The missing property is A reuse across
+columns, which requires 2-D blocking. Batched decode and prefill therefore want
+the SAME kernel: a 2-D blocked simdgroup-matrix GEMM.
+
+Everything from this attempt was reverted, including the golden re-capture.
+
+---
+
 ## Metal `M3d` decode GEMV on Apple M4 (2026-07-27) - INDICATIVE
 
 **The row's own premise was wrong, and measurement corrected it before any
