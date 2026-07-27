@@ -583,6 +583,14 @@ GiB, and mean TTFT from 835.0 to 729.2 ms. Mean TPOT/ITL is 38.22 ms versus
 vLLM's 33.53 ms. Every token matches the previous series exactly (128/128 per
 repetition, both arms), so the 109-commit upstream advance moved no output here.
 
+The failing TPOT axis has a corrected diagnosis as of the W4 work below: the
+per-step synchronization it was blamed on is the synchronous engine loop
+waiting for its own sampling, about one per step, not a removable defect in
+the async sampler. Closing it means running the async engine loop, which is
+what the (opt-in) device-resident sampled-token mirror now makes legal on a
+discrete GPU; the measurement that would bind it is a serving A/B and is
+pending a harness this host can run.
+
 Two things to know about the numbers. First, the earlier 5769.99 tok/s figure is
 VOID, not superseded by an improvement: that whole series ran against a GPU held
 at 11-13% utilization by a graphics consumer the harness's idle check could not
