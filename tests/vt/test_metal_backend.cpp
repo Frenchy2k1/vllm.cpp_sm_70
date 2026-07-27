@@ -12,6 +12,7 @@
 // non-CPU backend and so covers Metal automatically.
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -26,6 +27,11 @@
 #include "vllm/platforms/interface.h"
 #include "vllm/v1/attention/registry.h"  // SelectAttentionBackendName
 #include "vt/backend.h"
+// Test-only bandwidth probe entry point.
+namespace vt::metal {
+void BandwidthProbe(vt::Queue& q, void* src, void* out, uint32_t n_chunks, uint32_t chunk_f4,
+                    uint32_t stride_f4);
+}
 #include "vt/ops.h"
 
 using vt::Backend;
@@ -883,6 +889,143 @@ TEST_CASE("Metal kPagedAttention matches the CPU oracle within NMSE <= 5e-4") {
   metal.DestroyQueue(q);
 }
 
+// Qwen3-dense attention geometry, which the OPT-shaped case above does NOT
+// reach: GQA (qpk=2, so h/qpk indexes a SHARED kv head) and head_dim 128. The
+// mma prefill kernel splits its output over TWO column halves of 64, and at
+// head_dim 64 the second half is entirely out of range and discarded — so that
+// test exercises exactly half of it. Query lengths 40 and 5 also force a PARTIAL
+// second query tile (40 = 32 + 8) and a partial key block.
+TEST_CASE("Metal kPagedAttention matches the CPU oracle at Qwen3 geometry (GQA, head_dim 128)") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  const int64_t nblocks = 24, bsz = 16, hq = 16, hkv = 8, dh = 128;
+  const int64_t num_reqs = 2;
+  const std::vector<int32_t> qsl{0, 40, 45};
+  const std::vector<int32_t> slens{40, 71};  // req1 carries 66 context tokens
+  const int64_t t_total = qsl.back();
+  const int64_t max_blocks = 6;
+  std::vector<int32_t> btab(static_cast<size_t>(num_reqs * max_blocks));
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    for (int64_t c = 0; c < max_blocks; ++c) {
+      btab[static_cast<size_t>(r * max_blocks + c)] = static_cast<int32_t>(r * max_blocks + c);
+    }
+  }
+
+  std::mt19937 rng(4127);
+  std::uniform_real_distribution<float> ud(-1.5f, 1.5f);
+  const size_t cache_elems = static_cast<size_t>(nblocks * bsz * hkv * dh);
+  std::vector<float> qf(static_cast<size_t>(t_total * hq * dh)), kf(cache_elems), vf(cache_elems);
+  for (auto& x : qf) x = Bf16RT(ud(rng));
+  for (auto& x : kf) x = Bf16RT(ud(rng));
+  for (auto& x : vf) x = Bf16RT(ud(rng));
+  const std::vector<uint16_t> qb = PackBf16(qf), kb = PackBf16(kf), vb = PackBf16(vf);
+
+  MBuf dqy(metal, q, qb.size() * 2), dkc(metal, q, kb.size() * 2), dvc(metal, q, vb.size() * 2),
+      dbt(metal, q, btab.size() * 4), dsl(metal, q, slens.size() * 4),
+      dqsl(metal, q, qsl.size() * 4), dout(metal, q, qb.size() * 2);
+  dqy.Upload(qb.data());
+  dkc.Upload(kb.data());
+  dvc.Upload(vb.data());
+  dbt.Upload(btab.data());
+  dsl.Upload(slens.data());
+  dqsl.Upload(qsl.data());
+  dout.PoisonNaN(2);
+  metal.Synchronize(q);
+
+  Tensor tq = Tensor::Contiguous(dqy.ptr(), vt::DType::kBF16, d, {t_total, hq, dh});
+  Tensor tkc = Tensor::Contiguous(dkc.ptr(), vt::DType::kBF16, d, {nblocks, bsz, hkv, dh});
+  Tensor tvc = Tensor::Contiguous(dvc.ptr(), vt::DType::kBF16, d, {nblocks, bsz, hkv, dh});
+  Tensor tbt = Tensor::Contiguous(dbt.ptr(), vt::DType::kI32, d, {num_reqs, max_blocks});
+  Tensor tsl = Tensor::Contiguous(dsl.ptr(), vt::DType::kI32, d, {num_reqs});
+  Tensor tqsl = Tensor::Contiguous(dqsl.ptr(), vt::DType::kI32, d, {num_reqs + 1});
+  Tensor tout = Tensor::Contiguous(dout.ptr(), vt::DType::kBF16, d, {t_total, hq, dh});
+
+  vt::PagedAttentionArgs pa{1.0f / std::sqrt(static_cast<float>(dh)), true};
+  pa.query_start_loc_host = qsl.data();
+  pa.max_seq_len = 71;
+  vt::ResetOpProviderStats(vt::OpId::kPagedAttention, DeviceType::kMETAL);
+  vt::PagedAttention(q, tout, tq, tkc, tvc, tbt, tsl, tqsl, pa);
+  metal.Synchronize(q);
+  CHECK(DeclinesAfter(vt::OpId::kPagedAttention) == 0);
+
+  std::vector<uint16_t> gpacked(qb.size());
+  dout.Download(gpacked.data());
+  metal.Synchronize(q);
+  std::vector<float> got(gpacked.size());
+  for (size_t i = 0; i < got.size(); ++i) got[i] = vt::BF16ToF32(gpacked[i]);
+  for (float x : got) REQUIRE(std::isfinite(x));
+
+  std::vector<uint16_t> qcpu = qb, kcpu = kb, vcpu = vb, rpacked(qb.size(), 0);
+  std::vector<int32_t> bcpu = btab, scpu = slens, qscpu = qsl;
+  Queue cq{Device{DeviceType::kCPU, 0}, nullptr};
+  const Device cd{DeviceType::kCPU, 0};
+  Tensor cqt = Tensor::Contiguous(qcpu.data(), vt::DType::kBF16, cd, {t_total, hq, dh});
+  Tensor ckc = Tensor::Contiguous(kcpu.data(), vt::DType::kBF16, cd, {nblocks, bsz, hkv, dh});
+  Tensor cvc = Tensor::Contiguous(vcpu.data(), vt::DType::kBF16, cd, {nblocks, bsz, hkv, dh});
+  Tensor cbt = Tensor::Contiguous(bcpu.data(), vt::DType::kI32, cd, {num_reqs, max_blocks});
+  Tensor csl = Tensor::Contiguous(scpu.data(), vt::DType::kI32, cd, {num_reqs});
+  Tensor cqsl = Tensor::Contiguous(qscpu.data(), vt::DType::kI32, cd, {num_reqs + 1});
+  Tensor cout = Tensor::Contiguous(rpacked.data(), vt::DType::kBF16, cd, {t_total, hq, dh});
+  vt::PagedAttention(cq, cout, cqt, ckc, cvc, cbt, csl, cqsl, pa);
+
+  std::vector<float> ref(rpacked.size());
+  for (size_t i = 0; i < ref.size(); ++i) ref[i] = vt::BF16ToF32(rpacked[i]);
+
+  // Worst SINGLE element, not just the aggregate: a wrong column half or a
+  // mis-set kv group shows up in a slice that an averaged NMSE can bury.
+  double worst = 0.0;
+  size_t worst_i = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double e = std::abs(static_cast<double>(got[i]) - static_cast<double>(ref[i]));
+    if (e > worst) { worst = e; worst_i = i; }
+  }
+  const double nmse = Nmse(got, ref);
+  MESSAGE("Metal kPagedAttention (Qwen3 geom) NMSE = " << nmse << ", worst |elem| err = " << worst
+          << " at flat index " << worst_i << " (head " << (worst_i / dh) % hq << ", col "
+          << worst_i % dh << ")");
+  CHECK(nmse <= 5e-4);
+  CHECK(worst <= 5e-2);
+  metal.DestroyQueue(q);
+}
+
+// Settles whether decode attention's measured ~29 GB/s is a LAYOUT effect.
+// Reads a fixed number of USEFUL bytes with the stride varied: stride == chunk is
+// a contiguous stream, stride == 8*chunk is exactly the paged KV cache's
+// single-head pattern ([block][slot][kv_head][dim] with 8 kv heads, so d
+// elements every 8*d). Opt-in: VT_BW_PROBE=1.
+TEST_CASE("Metal strided-read bandwidth probe" * doctest::skip(true)) {
+  if (std::getenv("VT_BW_PROBE") == nullptr) return;
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+
+  const uint32_t chunk_f4 = 16;              // 256 B, one head's d=128 bf16 row
+  const uint32_t n_chunks = 32768;           // 8 MB of USEFUL bytes
+  const size_t useful = static_cast<size_t>(n_chunks) * chunk_f4 * 16;
+  for (uint32_t mult : {1u, 2u, 4u, 8u, 16u}) {
+    const uint32_t stride_f4 = chunk_f4 * mult;
+    const size_t span = static_cast<size_t>(n_chunks) * stride_f4 * 16;
+    void* src = metal.Alloc(span);
+    void* dst = metal.Alloc((n_chunks + 64) * sizeof(float));
+    std::memset(src, 0, span);
+    metal.Synchronize(q);
+    // Warm, then time a batch of repeats.
+    vt::metal::BandwidthProbe(q, src, dst, n_chunks, chunk_f4, stride_f4);
+    metal.Synchronize(q);
+    const int reps = 20;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) vt::metal::BandwidthProbe(q, src, dst, n_chunks, chunk_f4, stride_f4);
+    metal.Synchronize(q);
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double gbs = static_cast<double>(useful) * reps / sec / 1e9;
+    MESSAGE("stride x" << mult << " (useful " << (useful >> 20) << " MB, span "
+            << (span >> 20) << " MB): " << gbs << " GB/s of USEFUL bytes");
+    metal.Free(src);
+    metal.Free(dst);
+  }
+  metal.DestroyQueue(q);
+}
+
 // M3b — the two ops Qwen3-dense adds to OPT's Metal set. Both compute f32
 // transcendentals in-kernel (Metal has no double), so the bar is NMSE <= 5e-4 vs
 // the CPU oracle, NOT bit-exactness — the same posture as kPagedAttention.
@@ -1282,6 +1425,54 @@ TEST_CASE("Metal routes m=1 BT matmul to the GEMV kernel and matches the CPU ora
     }
     const double f32_nmse = den > 0.0 ? num / den : num;
     MESSAGE("GEMV f32 1x2048x512 NMSE vs f64 oracle = " << f32_nmse);
+    // bf16 INPUTS with an f32 OUTPUT. This is the only arm that can see the
+    // GEMV's bf16 accumulation: the all-bf16 arms below are dominated by output
+    // store rounding (~2.8e-06 for any correct kernel), and the all-f32 arm
+    // above does not take the bf16 code path at all. Without this, a change to
+    // the bf16 reduction order is unmeasurable.
+    {
+      const int64_t k2 = 2048, n2 = 512;
+      std::mt19937 rng2(0xBEE5u);
+      std::uniform_real_distribution<float> dd(-1.0f, 1.0f);
+      std::vector<float> ah2(static_cast<size_t>(k2)), bh2(static_cast<size_t>(k2 * n2));
+      for (auto& x : ah2) x = Bf16RT(dd(rng2));
+      for (auto& x : bh2) x = Bf16RT(dd(rng2));
+      std::vector<double> ref2(static_cast<size_t>(n2), 0.0);
+      for (int64_t col = 0; col < n2; ++col) {
+        double acc2 = 0.0;
+        for (int64_t kk = 0; kk < k2; ++kk)
+          acc2 += double(ah2[static_cast<size_t>(kk)]) *
+                  double(bh2[static_cast<size_t>(col * k2 + kk)]);
+        ref2[static_cast<size_t>(col)] = acc2;
+      }
+      auto upb = [&](const std::vector<float>& h) {
+        void* pp = metal.Alloc(h.size() * sizeof(uint16_t));
+        std::vector<uint16_t> pk(h.size());
+        for (size_t i = 0; i < h.size(); ++i) pk[i] = vt::F32ToBF16(h[i]);
+        metal.Copy(q, pp, pk.data(), pk.size() * sizeof(uint16_t));
+        return pp;
+      };
+      void* da2 = upb(ah2);
+      void* db2 = upb(bh2);
+      void* dc2 = metal.Alloc(static_cast<size_t>(n2) * sizeof(float));
+      Tensor ta2 = Tensor::Contiguous(da2, vt::DType::kBF16, d, {1, k2});
+      Tensor tb2 = Tensor::Contiguous(db2, vt::DType::kBF16, d, {n2, k2});
+      Tensor tc2 = Tensor::Contiguous(dc2, vt::DType::kF32, d, {1, n2});
+      vt::MatmulBT(q, tc2, ta2, tb2);
+      metal.Synchronize(q);
+      std::vector<float> got2(static_cast<size_t>(n2));
+      metal.Copy(q, got2.data(), dc2, got2.size() * sizeof(float));
+      double nu = 0.0, de = 0.0;
+      for (size_t i = 0; i < got2.size(); ++i) {
+        const double df = double(got2[i]) - ref2[i];
+        nu += df * df;
+        de += ref2[i] * ref2[i];
+      }
+      const double bf_nmse = de > 0.0 ? nu / de : nu;
+      MESSAGE("GEMV bf16-in/f32-out 1x2048x512 NMSE vs f64 oracle = " << bf_nmse);
+      CHECK(bf_nmse <= 5e-4);
+      metal.Free(da2); metal.Free(db2); metal.Free(dc2);
+    }
     // f32 accumulation over K=2048 should sit near 1e-14, as the tile GEMM's
     // f32 arm does (3.7e-14). Orders above that would mean a real defect, not a
     // reduction-order difference.
@@ -1365,5 +1556,222 @@ TEST_CASE("Metal routes m=1 BT matmul to the GEMV kernel and matches the CPU ora
     metal.Free(db);
     metal.Free(dc);
   }
+  metal.DestroyQueue(q);
+}
+
+// ===========================================================================
+// 2-D blocked simdgroup-matrix GEMM (m > 1). Attribution put PREFILL at 33.7%
+// of GPU time from only 168 dispatches, ~8.2x slower than MLX-LM, still on the
+// 16x16 scalar tile loop. The small-m dead-end established the missing property
+// precisely: A reuse ACROSS COLUMNS, which needs 2-D blocking. This kernel
+// stages A and B tiles in threadgroup memory and multiplies them with
+// simdgroup_float8x8, so one kernel serves prefill AND batched decode.
+TEST_CASE("Metal routes m>1 BT matmul to the simdgroup GEMM and matches the CPU oracle") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+
+  // f32 arm first: at bf16 output the NMSE is dominated by store rounding and
+  // cannot discriminate kernels (that lesson cost a golden re-capture once).
+  {
+    const int64_t m = 64, k = 512, n = 128;
+    std::mt19937 rng(0x5EEDu);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> ah(static_cast<size_t>(m * k)), bh(static_cast<size_t>(n * k));
+    for (auto& x : ah) x = dist(rng);
+    for (auto& x : bh) x = dist(rng);
+    std::vector<double> ref(static_cast<size_t>(m * n), 0.0);
+    for (int64_t r = 0; r < m; ++r)
+      for (int64_t c2 = 0; c2 < n; ++c2) {
+        double acc = 0.0;
+        for (int64_t kk = 0; kk < k; ++kk)
+          acc += double(ah[static_cast<size_t>(r * k + kk)]) *
+                 double(bh[static_cast<size_t>(c2 * k + kk)]);
+        ref[static_cast<size_t>(r * n + c2)] = acc;
+      }
+    auto up = [&](const std::vector<float>& h) {
+      void* pp = metal.Alloc(h.size() * sizeof(float));
+      metal.Copy(q, pp, h.data(), h.size() * sizeof(float));
+      return pp;
+    };
+    void* da = up(ah);
+    void* db = up(bh);
+    void* dc = metal.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {m, k});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {n, k});
+    Tensor tc = Tensor::Contiguous(dc, vt::DType::kF32, d, {m, n});
+    vt::MatmulBT(q, tc, ta, tb);
+    metal.Synchronize(q);
+    std::vector<float> got(static_cast<size_t>(m * n));
+    metal.Copy(q, got.data(), dc, got.size() * sizeof(float));
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      const double diff = double(got[i]) - ref[i];
+      num += diff * diff;
+      den += ref[i] * ref[i];
+    }
+    const double nmse = den > 0.0 ? num / den : num;
+    MESSAGE("simdgroup GEMM f32 64x512x128 NMSE vs f64 oracle = " << nmse);
+    CHECK(nmse <= 1e-10);
+    metal.Free(da); metal.Free(db); metal.Free(dc);
+  }
+
+  struct Case { const char* name; int64_t m, k, n; };
+  const Case cases[] = {
+      {"prefill 512x2048x2048", 512, 2048, 2048},
+      {"batched decode m=16", 16, 2048, 512},
+      {"batched decode m=2", 2, 1024, 256},
+      // Ragged on all three dims at once: tile edges in M, N and K together are
+      // where a blocked kernel's guards break.
+      {"ragged 37x333x201", 37, 333, 201},
+  };
+
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    std::mt19937 rng(0x1234u);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> ah(static_cast<size_t>(c.m * c.k));
+    std::vector<float> bh(static_cast<size_t>(c.n * c.k));
+    for (auto& x : ah) x = Bf16RT(dist(rng));
+    for (auto& x : bh) x = Bf16RT(dist(rng));
+    std::vector<float> ref(static_cast<size_t>(c.m * c.n), 0.0f);
+    for (int64_t r = 0; r < c.m; ++r)
+      for (int64_t c2 = 0; c2 < c.n; ++c2) {
+        float acc = 0.0f;
+        for (int64_t kk = 0; kk < c.k; ++kk)
+          acc += ah[static_cast<size_t>(r * c.k + kk)] * bh[static_cast<size_t>(c2 * c.k + kk)];
+        ref[static_cast<size_t>(r * c.n + c2)] = acc;
+      }
+    auto up = [&](const std::vector<float>& h) {
+      void* pp = metal.Alloc(h.size() * sizeof(uint16_t));
+      std::vector<uint16_t> packed(h.size());
+      for (size_t i = 0; i < h.size(); ++i) packed[i] = vt::F32ToBF16(h[i]);
+      metal.Copy(q, pp, packed.data(), packed.size() * sizeof(uint16_t));
+      return pp;
+    };
+    void* da = up(ah);
+    void* db = up(bh);
+    void* dc = metal.Alloc(static_cast<size_t>(c.m * c.n) * sizeof(uint16_t));
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {c.m, c.k});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {c.n, c.k});
+    Tensor tc = Tensor::Contiguous(dc, vt::DType::kBF16, d, {c.m, c.n});
+
+    const bool was_on = vt::metal::ProfileEnabled();
+    vt::metal::SetProfileEnabled(true);
+    vt::metal::ResetProfile();
+    vt::MatmulBT(q, tc, ta, tb);
+    metal.Synchronize(q);
+    bool saw_mm = false;
+    for (const vt::metal::ProfileRow& r : vt::metal::GetProfileRows()) {
+      if (r.name == "vt_matmul_bt_mm") saw_mm = true;
+    }
+    CHECK(saw_mm);  // a numeric check cannot prove WHICH kernel ran
+    vt::metal::SetProfileEnabled(was_on);
+    vt::metal::ResetProfile();
+
+    std::vector<uint16_t> po(static_cast<size_t>(c.m * c.n));
+    metal.Copy(q, po.data(), dc, po.size() * sizeof(uint16_t));
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < po.size(); ++i) {
+      const double got = double(vt::BF16ToF32(po[i]));
+      num += (got - double(ref[i])) * (got - double(ref[i]));
+      den += double(ref[i]) * double(ref[i]);
+    }
+    const double nmse = den > 0.0 ? num / den : num;
+    CAPTURE(nmse);
+    CHECK(nmse <= 5e-4);
+    metal.Free(da); metal.Free(db); metal.Free(dc);
+  }
+  metal.DestroyQueue(q);
+}
+
+// ===========================================================================
+// GEMM micro-benchmark (opt-in via VT_MM_BENCH=1). Prefill is the dominant
+// remaining gap to MLX-LM and the mm kernel's limit is unidentified: barriers,
+// tile width and staging branches have each been measured and excluded. This
+// times the kernel in ISOLATION at the model's real prefill shapes and reports
+// achieved GFLOP/s, so the next decision rests on the kernel's own roofline
+// rather than on an end-to-end delta. With MLX built in, the same binary times
+// MLX's steel GEMM on the identical shape, which is the only apples-to-apples
+// answer to "how far off is our kernel".
+TEST_CASE("Metal GEMM microbenchmark" * doctest::skip(true)) {
+  if (std::getenv("VT_MM_BENCH") == nullptr) return;
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+
+  struct Shape { const char* name; int64_t m, k, n; };
+  const Shape shapes[] = {
+      {"qkv     512x2048x2048", 512, 2048, 2048},
+      {"mlp-up  512x2048x6144", 512, 2048, 6144},
+      {"mlp-dn  512x6144x2048", 512, 6144, 2048},
+  };
+  for (const Shape& s : shapes) {
+    std::vector<uint16_t> ah(static_cast<size_t>(s.m * s.k), vt::F32ToBF16(0.01f));
+    std::vector<uint16_t> bh(static_cast<size_t>(s.n * s.k), vt::F32ToBF16(0.02f));
+    void* da = metal.Alloc(ah.size() * 2);
+    void* db = metal.Alloc(bh.size() * 2);
+    void* dc = metal.Alloc(static_cast<size_t>(s.m * s.n) * 2);
+    metal.Copy(q, da, ah.data(), ah.size() * 2);
+    metal.Copy(q, db, bh.data(), bh.size() * 2);
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {s.m, s.k});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {s.n, s.k});
+    Tensor tc = Tensor::Contiguous(dc, vt::DType::kBF16, d, {s.m, s.n});
+
+    vt::MatmulBT(q, tc, ta, tb);  // warm up: pipeline build, first-touch
+    metal.Synchronize(q);
+
+    const int iters = 20;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) vt::MatmulBT(q, tc, ta, tb);
+    metal.Synchronize(q);
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double flops = 2.0 * double(s.m) * double(s.k) * double(s.n) * iters;
+    const double bytes = 2.0 * (double(s.m) * s.k + double(s.n) * s.k) * iters;
+    MESSAGE("GEMM " << s.name << ": " << (secs / iters * 1e3) << " ms/iter, "
+                    << (flops / secs / 1e9) << " GFLOP/s, "
+                    << (bytes / secs / 1e9) << " GB/s operand read");
+    metal.Free(da); metal.Free(db); metal.Free(dc);
+  }
+  metal.DestroyQueue(q);
+}
+
+// Diagnostic for the 64x64 GEMM defect: reports WHICH output rows are wrong.
+// The m-dependence (m<=16 pass, m>=64 fail) has two competing explanations that
+// predict different row patterns, and NMSE cannot distinguish them.
+TEST_CASE("Metal GEMM per-row diagnostic" * doctest::skip(true)) {
+  if (std::getenv("VT_MM_ROWDIAG") == nullptr) return;
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  const int64_t m = 64, k = 64, n = 64;
+  // A[r][*] = r+1, B[c][*] = 1  =>  out[r][c] = (r+1)*k exactly, so a wrong row
+  // is unmistakable and its VALUE says which source row it actually read.
+  std::vector<float> ah(static_cast<size_t>(m * k)), bh(static_cast<size_t>(n * k), 1.0f);
+  for (int64_t r = 0; r < m; ++r)
+    for (int64_t j = 0; j < k; ++j) ah[static_cast<size_t>(r * k + j)] = float(r + 1);
+  auto up = [&](const std::vector<float>& h) {
+    void* p = metal.Alloc(h.size() * sizeof(float));
+    metal.Copy(q, p, h.data(), h.size() * sizeof(float));
+    return p;
+  };
+  void* da = up(ah); void* db = up(bh);
+  void* dc = metal.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {m, k});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {n, k});
+  Tensor tc = Tensor::Contiguous(dc, vt::DType::kF32, d, {m, n});
+  vt::MatmulBT(q, tc, ta, tb);
+  metal.Synchronize(q);
+  std::vector<float> got(static_cast<size_t>(m * n));
+  metal.Copy(q, got.data(), dc, got.size() * sizeof(float));
+  std::string bad;
+  for (int64_t r = 0; r < m; ++r) {
+    const float want = float(r + 1) * float(k);
+    const float g = got[static_cast<size_t>(r * n)];
+    if (g != want) bad += std::to_string(r) + "(got " + std::to_string(int(g / k)) + ") ";
+  }
+  MESSAGE("rows wrong [row(source row it actually read)]: " << (bad.empty() ? "NONE" : bad));
+  metal.Free(da); metal.Free(db); metal.Free(dc);
   metal.DestroyQueue(q);
 }

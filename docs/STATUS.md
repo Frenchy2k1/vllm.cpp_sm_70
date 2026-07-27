@@ -256,6 +256,20 @@ reproduction:
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).
 
+## Backend detail
+
+**Metal (Apple Silicon), indicative, not binding.** Two models run end to end
+and pass correctness (OPT-125m, Qwen3-0.6B); 18 of 75 ops are native, the rest
+fall back to CPU on unified memory. Kernel work including mma prefill attention
+(4.3x) puts warm b=1 throughput at 94.5% of MLX-LM. The residual is decode
+attention running at 24% of peak bandwidth; the decode hypotheses tested so far
+are refuted (the KV-layout and flash-decoding leads both closed), and a paired
+ABBA harness with cooldown now resolves differences down to about 0.2%, below
+the remaining gap. An optional MLX GEMM provider is available via
+`-DVLLM_CPP_MLX=ON` and currently measures net slower than our own kernels. Full
+per-lever chronology: [docs/BENCHMARKS.md](BENCHMARKS.md) and
+[.agents/specs/metal-dispatch-attribution.md](../.agents/specs/metal-dispatch-attribution.md).
+
 ## Serving and API notes
 
 - **Automatic prefix caching (APC)** is on by default for dense models (hybrid /

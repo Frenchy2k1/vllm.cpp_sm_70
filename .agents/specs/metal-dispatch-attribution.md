@@ -293,6 +293,174 @@ re-validation) BEFORE the speed A/B was run, and then had to be reverted along
 with the kernel. Benchmark first, re-capture only once the change is known to be
 worth keeping.
 
+### Tuning attempts on the simdgroup GEMM (both measured, both rejected)
+
+The 32x32 / BK=8 shape that shipped was not assumed to be optimal; two obvious
+widenings were tried and MEASURED, and both are recorded so they are not retried.
+Same-binary runs, GPU lock, b=1 p=512 g=128.
+
+| shape | tok/s | TTFT | verdict |
+|---|--:|--:|---|
+| **32x32, BK=8 (shipped)** | **13.27** | 2524 ms | baseline |
+| 32x32, BK=32 | 13.28 | 2546 ms | **NEUTRAL** — reverted |
+| 64x64, BK=16 | 11.48 | 4004 ms | **WORSE (-14%)** — reverted |
+
+**BK=32 was neutral, which refutes the barrier hypothesis.** The reasoning for it
+was that BK=8 pays two threadgroup barriers per 8 elements of K, so BK=32 would
+amortise the same barriers over 4x the MACs. It changed nothing, so barrier
+traffic is not this kernel's limit.
+
+**64x64 was materially worse, and the cause is occupancy.** A 64x64 tile with 128
+threads needs 16 `simdgroup_float8x8` accumulators per simdgroup and 24 KB of
+threadgroup memory (sa 4 KB + sb 4 KB + sc 16 KB), which leaves room for only one
+threadgroup per core and removes the latency hiding the smaller tile enjoyed. A
+64x64 tile is not wrong in principle, but it needs MORE THREADS (8 simdgroups,
+256 threads) and a smaller output staging buffer, not simply wider blocks over
+the same 128 threads. That is the form worth trying next, if any.
+
+**What this means for the remaining gap.** With barriers and tile width both
+excluded, the mm kernel's cost is most likely the staging itself: every element
+of A and B passes through a branchy scalar `vt_load` and is written to
+threadgroup memory as f32, doubling LDS traffic for bf16 operands. A
+dtype-specialised staging path (vector loads, no per-element switch) is the next
+hypothesis, and it is the SAME hypothesis as the decode GEMV's.
+
+### GEMM roofline: the kernel is 3x off MLX, measured in isolation
+
+**The decisive diagnostic for the parity goal.** End-to-end deltas could not say
+whether the mm kernel or its surroundings were at fault, so it was timed in
+ISOLATION at the model's real prefill shapes, against MLX's steel GEMM in the
+SAME binary through the provider seam (`VT_MM_BENCH=1`, opt-in microbenchmark in
+`tests/vt/test_metal_backend.cpp`).
+
+| shape | ours | MLX steel | ratio |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 990 GFLOP/s | 2640 | **2.7x** |
+| mlp-up 512x2048x6144 | 1019 | 3325 | **3.3x** |
+| mlp-dn 512x6144x2048 | 1002 | 3293 | **3.3x** |
+
+Ours sits at **~1.0 TFLOP/s, ~23% of the M4's ~4.3 TFLOPS fp32 peak**; MLX is at
+**~77%**. **The gap is inside our kernel**, not in dispatch, staging branches,
+barriers or tile width, all of which were separately measured and excluded.
+
+**A note that reframes the MLX provider.** MLX's raw GEMM is 3x ours, yet
+enabling the MLX provider end to end measured NO faster (12.21 s vs 12.17 s at
+b=1). Those two facts together locate the provider's cost precisely: study §5.2's
+correction says `Matmul::eval_gpu` re-`set_data`s its output from MLX's own
+allocator, so every delegated GEMM pays an O(M*N) copy back plus its own
+commit+wait. At prefill shapes that output is megabytes per call. **Fixing the
+provider's output path may be worth more than rewriting our kernel**, and it is
+now the cheaper of the two routes to prefill parity.
+
+**Dead end recorded — bfloat simdgroup matrices are NOT available.** The obvious
+fix, and what MLX does, is to keep operands in bf16 through the mma instead of
+expanding to f32 in threadgroup memory (half the LDS traffic, faster mma).
+Attempted and it does not compile: `simdgroup_load` has no overload for a bfloat
+matrix on this toolchain (`no matching function for call to 'simdgroup_load'`,
+runtime MSL compile). MSL's simdgroup_matrix supports half and float only.
+Staging as `half` would work but is REFUSED: half saturates at 65504 and
+activation outliers can exceed it, which trades a correctness hazard for speed.
+
+### RESOLVED 2026-07-27: 64x64 with 8 simdgroups, and what the defect actually was
+
+**Landed.** The tile is now 64x64 with 8 simdgroups (2 row groups of 32 x 4
+column groups of 16), each simdgroup owning 4x2 blocks of `simdgroup_float8x8`.
+
+| shape | before (32x32, 4 sg) | after (64x64, 8 sg) | MLX steel |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 990 GFLOP/s | **1484** | 2640 |
+| mlp-up 512x2048x6144 | 1019 | **1574** | 3325 |
+| mlp-dn 512x6144x2048 | 1002 | **1507** | 3293 |
+
+End to end: **14.25 -> 15.30 tok/s (+7.4%)**, TTFT **2534 -> 2065 ms (-18%)**.
+SACRED gate **16/16 UNCHANGED, no golden re-capture required**. Unit suite 21
+cases / 20,135 assertions.
+
+**THE ROOT CAUSE WAS NOT WHAT THE FINGERPRINT SUGGESTED, and the correction
+matters more than the fix.** The half-spacing pattern was read as the compiler
+padding a 2-D `threadgroup float sa[BM][BK]` so that `simdgroup_load`'s
+`elements_per_row` disagreed with the writes. It was simpler and entirely
+self-inflicted: an earlier incomplete edit had left the mma block using the OLD
+32x32 offsets (`&sa[sg_r * 16u + i * 8u][0]`, 16-row groups) while the tile had
+grown to 64 rows. Reads walked 16-row groups against 64-row writes, which is
+precisely "64 source rows landing in 32 destination rows".
+
+**That also invalidates an earlier conclusion.** The bisect that "exonerated the
+simdgroup mapping" because both the 2x4 and 4x2 decompositions failed identically
+was right by accident: both carried the same stale block, so the experiment could
+not have distinguished them. The lesson is that a bisect only isolates a variable
+if the OTHER code genuinely changed, and a pattern-based edit that silently
+matches nothing does not change it. The `assert count == 1` discipline used
+elsewhere in this work is exactly what was missing on those replacements.
+
+**Kept from the investigation:** the tiles are now FLAT
+(`threadgroup float sa[BM * BK]`) with the stride named once and shared by the
+writes and the `simdgroup_load` calls. That was adopted for a hypothesis that
+turned out to be wrong, but it is retained deliberately: it makes the class of
+bug that did occur unrepresentable, because there is no second place for an
+offset to disagree.
+
+**Still open toward parity:** ours is ~1.5 TFLOP/s against MLX's ~3.3. The
+remaining distance needs register blocking and double-buffered staging.
+
+### GEMM limit: four hypotheses now EXCLUDED by measurement
+
+Our GEMM sits at ~1.5 TFLOP/s against MLX's ~3.3. Four candidate explanations
+have each been built and measured on the M4 with the `VT_MM_BENCH` harness, and
+all four are refuted. Recorded so the next attempt starts from what is LEFT
+rather than re-running these.
+
+| hypothesis | change built | result | verdict |
+|---|---|--:|---|
+| barrier traffic | BK 8 -> 32 | 13.28 vs 13.27 tok/s | **neutral** |
+| tile too narrow | 32x32 -> 64x64 | 990 -> 1484 GFLOP/s | **REAL, landed** |
+| staging latency exposed | double-buffered tiles, 1 barrier/block | 1478/1560/1481 vs 1484/1574/1507 | **neutral** |
+| mma precision-bound | `simdgroup_half8x8` + f32 accumulate | 1465/1556/1496 | **neutral** |
+
+**The precision result is the most useful of the three negatives.** MLX runs its
+mma at reduced precision, so the natural theory was that our f32
+`simdgroup_matrix` is half-rate and that MLX's advantage is precision. Building
+the half-precision variant produced IDENTICAL throughput. That refutes the
+theory AND removes the motivation for a `half`/bf16 staging path, which carried a
+real overflow hazard (half saturates at 65504). **Do not spend effort there.**
+
+**Double buffering is likewise a closed question.** It is correct (row diagnostic
+NONE, suite 21/21) and worth nothing here, so the kernel is not stalled waiting
+on tile fetches.
+
+**What is left, given the exclusions:** the per-element staging WORK rather than
+its latency (each element passes a branchy `vt_load` and a threadgroup write),
+and the simdgroup_load-to-mma issue ratio (6 loads per 8 mma per K-block of 8;
+a larger BK amortises the loads and was only ever tested at the 32x32 tile, where
+it was neutral for a different reason). Both are worth one measurement each
+before any larger rewrite.
+
+### B-tile vectorisation: shape-split, net NEUTRAL, reverted
+
+The A tile's vectorisation was worth 1.55x, so the B tile was the obvious
+remaining half. BT layout forces a different loop shape: row `gc` is contiguous
+over k, so the vector load must run ALONG K for one column and scatter four
+results down the tile's k dimension. Built, correct (row diagnostic NONE, suite
+21/21), and **net neutral end to end (17.44 vs 17.41 tok/s), so reverted.**
+
+| shape | scalar B | vectorised B | change |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 2282 GFLOP/s | 1939 | **-15%** |
+| mlp-up 512x2048x6144 | 2501 | 2618 | +4.7% |
+| mlp-dn 512x6144x2048 | 2382 | 2517 | +5.7% |
+
+**The regression has a clear cause: thread under-utilisation.** Scalar B staging
+walks `BK * BN = 512` elements over 256 threads, two apiece. The vectorised form
+walks `(BK/4) * BN = 128` vector loads over the same 256 threads, so **half the
+threadgroup idles during B staging**. The A tile does not suffer this as badly
+because it is consumed differently. Larger K amortises the idle half over more
+k-blocks, which is why only the two 6144-dimension shapes come out ahead.
+
+**If this is retried, fix the utilisation first**, not the vector width: either
+give each thread two vector loads (BK=16, restoring 256 items) or have the idle
+half stage A concurrently. Vectorising harder without that will keep trading one
+shape against another.
+
 ### Risks/decisions
 
 - **Batching changes failure semantics (accepted, mitigated).** Today a failed
