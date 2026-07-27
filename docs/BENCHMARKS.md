@@ -2862,6 +2862,42 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## What closing the LAST 3.7% would require (2026-07-27)
+
+Decode is the largest single remaining item (99 ms of the ~205 ms gap). Its
+composition, per token:
+
+| | ms/token | share |
+|---|--:|--:|
+| GEMV (weight streaming) | 34.2 | 93% |
+| everything else | 2.7 | 7% |
+
+The GEMV reads ~3.4 GB of weights per token at **99 GB/s, 83% of this part's
+~120 GB/s peak**. Matching MLX-LM's decode needs **-0.7 ms/token**, which means
+either:
+
+- the GEMV at **101 GB/s (85% of peak)** — a 2% bandwidth gain on a kernel
+  already near the memory roof, or
+- removing **26% of ALL non-GEMV decode time** — every norm, rope, cache write
+  and softmax, collectively.
+
+**`vt_rms_norm` is NOT the lever, despite matching the pattern.** It is entirely
+scalar `vt_load`/`vt_store`, which is exactly the defect that paid off three
+times — but the arithmetic says otherwise: 113 dispatches per token at 6.7 us
+each, touching ~4.3 KB apiece, is **0.65 GB/s**, three orders of magnitude below
+peak. It is LAUNCH-LATENCY bound, not load-width bound, so vectorising it would
+buy nothing. Cutting it needs fewer dispatches, and fusion was already measured
+at only 3% headroom total.
+
+**Honest assessment.** The remaining 3.7% is four items of 15-100 ms with no
+dominant cause, against kernels already at 83-97% of their respective roofs. That
+is a materially different regime from the session's opening, where a single
+kernel ran at 4% of peak. Further gains are available but the per-item return has
+dropped by roughly an order of magnitude, and each now needs the paired harness
+to even be visible.
+
+---
+
 ## GEMM bisected: it is at 97% of MLX and NOT the remaining bottleneck (2026-07-27)
 
 Bisecting `vt_matmul_bt_mm` the same way (measurement-only stubs on the A stage,

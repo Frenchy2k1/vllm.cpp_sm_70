@@ -27514,3 +27514,30 @@ The bisect levers were NOT landed: they put a branch in the k-loop's init and
 their value is diagnostic, not runtime. Re-add them behind `VT_MM_BISECT` when
 next needed; the patch is small and the method is now proven three times
 (decode attention, prefill attention, GEMM).
+
+---
+
+## 2026-07-27 — what the LAST 3.7% would cost, and why rms_norm is not the lever
+
+Decode is the largest single remaining item (99 ms of ~205 ms). Per token: GEMV
+34.2 ms (93%), everything else 2.7 ms. The GEMV streams ~3.4 GB of weights at
+**99 GB/s = 83% of the ~120 GB/s peak**.
+
+Matching MLX-LM's decode needs **-0.7 ms/token**, i.e. either the GEMV at
+**101 GB/s (85% of peak)** — 2% more on a kernel already near the memory roof —
+or removing **26% of ALL non-GEMV decode time**.
+
+**`vt_rms_norm` matches the winning pattern and is still NOT the lever.** It is
+entirely scalar `vt_load`/`vt_store`, the exact defect that paid off three times.
+But: 113 dispatches/token at 6.7 us each, ~4.3 KB touched apiece = **0.65 GB/s**,
+three orders below peak. It is LAUNCH-LATENCY bound, so vectorising buys nothing;
+cutting it needs fewer dispatches, and fusion measured only 3% headroom total.
+**Checked the arithmetic before pattern-matching the fix — worth doing, because
+the pattern was a very good match and the answer was still no.**
+
+**Regime change, stated plainly.** The session opened with a kernel at 4% of its
+roofline (prefill attention, 108 GFLOP/s vs the GEMM's 2250). It now has four
+items of 15-100 ms against kernels at 83-97% of their roofs. Gains remain
+available but per-item return has fallen roughly an order of magnitude, and each
+now needs the paired harness to be visible at all. That is the honest reason to
+treat further work here as optional rather than obvious.
