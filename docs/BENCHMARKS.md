@@ -134,6 +134,17 @@ build-verified only (compile + `cuobjdump` SASS, no throughput claim); the only
 real numbers the campaign will produce come later from the Orin RUNTIME-VERIFIED
 gate (token-exact vs the vLLM 0.25.0 oracle, then benchmarked vs llama.cpp and
 vLLM on that box, all axes).
+**SGLang parity PROGRAM scope (2026-07-27, `CLAIM-SGLANG-PARITY-PROGRAM`, NOT
+pushed).** Disposition: **NOT APPLICABLE (inventory / scoping spike; no build,
+no run, no measurement taken, claimed, or owed; `benchmark_binding=false`).**
+Establishes the SGLang parity program: a whole-surface inventory
+(`.agents/sglang-matrix.md`, 44 rows) + the SGLang-as-oracle gate methodology
+(`.agents/specs/sglang-parity-oracle.md`). The BINDING SGLang performance numbers
+remain the separate benchmark track (`BACKEND-GATE-CUDA-SGLANG` cache-neutral +
+`BACKEND-GATE-CUDA-SGLANG-PREFIX` shared-prefix cache-ON), each every-axis vs
+`sglang bench_serving` on the idle GB10 once the oracle is stood up (arm64 cu130
+image) and our-side `SERVE-ASYNC-LLM` lands. No source/engine path touched here.
+
 **SGLang RadixAttention behavior-parity scope (2026-07-27,
 `CLAIM-SGLANG-RADIX-SCOPE`, NOT pushed).** Disposition: **NOT APPLICABLE
 (scoping spike; no measurement taken, claimed, or owed; `benchmark_binding=false`).**

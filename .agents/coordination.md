@@ -141,6 +141,34 @@ note. Did NOT touch any model/kernel/runtime source, README, Metal/demo, or the
 `BACKEND-GATE-CUDA-SGLANG*` competitor benchmark rows (sibling track). No engine
 code, no measurement (`benchmark_binding=false`).
 
+**SGLang parity PROGRAM SCOPE note (2026-07-27, `CLAIM-SGLANG-PARITY-PROGRAM`,
+DONE, NOT pushed — FULL SHA reported to caller).** A read-only SCOPING /
+infrastructure spike establishing the SGLang parity PROGRAM — the vLLM-parity
+approach replicated for SGLang (user-directed: "we need the same vLLM approach
+there for reaching parity"). Base `main` HEAD `b0a1bc4c`, isolated worktree
+`.claude/worktrees/agent-ab6f8d9efa4c20195`. SGLang grounded at pin **v0.5.15
+`f63458b`** (cloned to `/home/mudler/_git/sglang`); every SGLang claim cites
+`file:line`. **DELIVERABLES (docs-only, umbrella — owns NO new claimable
+execution rows):** NEW [.agents/sglang-matrix.md](sglang-matrix.md) — the
+whole-surface inventory (44 rows classified **FUSED 23 / SGLANG-DISTINCT 8 /
+INVENTORIED 5 / OUT-OF-SCOPE 8**); NEW
+[.agents/specs/sglang-parity-oracle.md](specs/sglang-parity-oracle.md) — SGLang
+stood up as a correctness cross-check + a binding perf floor (dgx GB10 via the
+digest-pinned arm64 cu130 image — NO from-source build needed; the perf-gate
+blocker is our-side `SERVE-ASYNC-LLM`, not SGLang runnability) + the ranked
+execution plan. Cross-references (does NOT re-own) the existing rows
+`KV-SGLANG-RADIX-CACHE` + `ENG-SGLANG-BEHAVIOR-FLAG` (owned by
+`CLAIM-SGLANG-RADIX-SCOPE`) and the benchmark rows `BACKEND-GATE-CUDA-SGLANG`,
+`BACKEND-GATE-CUDA-SGLANG-PREFIX`, `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT`
+(sibling benchmark track, unchanged). Also touches: AGENTS.md Index pointer,
+`.agents/roadmap_v1.md` note (elevates the `ROAD-V1-A` SGLang floor; NO new
+portfolio row), `.agents/feature-matrix.md` cross-ref, `docs/STATUS.md`,
+`docs/BENCHMARKS.md`, `.agents/parity-ledger.md`, `.agents/state.md`, this note.
+Touches NO `src/`/`include/`/`cmake/`/`tests/` source, NO README/Metal/demo
+(concurrent session), and does NOT modify the `BACKEND-GATE-CUDA-SGLANG*` rows.
+No engine code, no measurement (`benchmark_binding=false`). SGLang is a COMPETITOR
+floor + correctness cross-check, NOT the mirror source — vLLM stays behavior truth.
+
 **Pin-advance SCOPE note (2026-07-26, `CLAIM-PIN-ADVANCE-SCOPE`, DONE, NOT pushed —
 FULL SHA reported to caller).** A CPU/repo-research SCOPE + PLAN for advancing the
 vLLM parity pin past `e24d1b24` (v0.25.0-era) — no venv, no pin swap, no code, no
