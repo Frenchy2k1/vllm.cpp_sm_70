@@ -12,6 +12,8 @@ It ships llama.cpp-style as one library behind a flat C ABI, plus a CLI and an O
 server. It loads Hugging Face **safetensors** and **GGUF** checkpoints, and builds for CUDA, CPU,
 Metal, and Vulkan from one source tree.
 
+![vllm.cpp vs vLLM on Qwen3.6-27B: ahead at every concurrency](benchmarks/media/concurrency_race.gif)
+
 **It holds up under load.** Against vLLM itself on Qwen3.6-27B (NVFP4, GB10), the output is
 token-for-token identical and the total throughput is higher at every concurrency:
 
@@ -22,7 +24,9 @@ token-for-token identical and the total throughput is higher at every concurrenc
 | **Ratio** | **1.045x** | **1.011x** | **1.007x** | **1.007x** | **1.016x** | **1.017x** |
 
 It does that in 24.88 GiB of peak host memory against vLLM's 28.18 GiB, from a binary with no Python
-stack behind it.
+stack behind it. That last part is not a detail:
+
+![What you install: 9.4 GiB venv vs one 10 MiB binary](benchmarks/media/footprint.png)
 
 > **Pre-release, under heavy development.** Correctness is gated token-for-token against a pinned
 > vLLM oracle across 25+ architectures. Speed is proven on one GPU (NVIDIA GB10 / DGX Spark,
@@ -133,8 +137,11 @@ time-to-first-token, tracked as active work.
 the output tokens are byte-identical to llama.cpp's greedy decode. This comparison is single-stream
 only; no concurrent-serving comparison against llama.cpp has been measured yet.
 
-There is no front-page race clip yet; when one is produced it will follow the LocalAI house style
-(side-by-side, identical output, honest measured ratios).
+The two figures above are rendered from these measured numbers by
+[`benchmarks/demo/`](benchmarks/demo/), which reads its values from a committed spec so any figure
+can be traced back to the run that produced it. There is no side-by-side race clip against
+llama.cpp's server yet, because the concurrent-serving comparison behind it has not been measured;
+when it is, it will follow the LocalAI house style (identical output, honest measured ratios).
 
 ## Build
 

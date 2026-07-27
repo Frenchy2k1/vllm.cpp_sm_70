@@ -16,6 +16,28 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+**DEMO figures: concurrency sweep + install footprint (2026-07-27,
+`CLAIM-DEMO-FIGURES`).** Disposition: **NO NEW ENGINE MEASUREMENT (the throughput
+figure RE-RENDERS the existing binding grid; `benchmark_binding=false`). One NEW
+non-engine measurement is taken and recorded below.** Two renderers land under
+`benchmarks/demo/`, each reading a committed spec so every drawn value traces to
+its run: `concurrency_race.py` (the 27B c1-c32 sweep, values copied verbatim from
+the binding online-serving grid: 86.05/82.32, 159.68/158.03, 292.34/290.31,
+508.77/505.46, 801.76/789.16, 1095.01/1076.25 tok/s) and `footprint.py`. Playback
+pacing (`--dilate`) never alters a drawn number. **NEW measurement, install
+footprint (2026-07-27):** the pinned oracle venv `du -sk -L
+~/venvs/vllm-oracle` = 9,899,580 KiB (9.44 GiB) on dgx.casa, components
+`nvidia` 3,235,588 KiB, `flashinfer_cubin` 2,554,000 KiB, `torch` 935,624 KiB,
+`triton` 666,768 KiB, `nvidia_cutlass_dsl` 441,012 KiB; ours
+`build-demo/examples/server` (CPU, `CMAKE_BUILD_TYPE=Release`, stripped) =
+10,330,088 bytes, statically linked against `libvllm.a` (`ldd` shows no `libvllm`
+dependency). **HONEST CAVEAT, drawn on the card itself: this is NOT a
+like-for-like build pairing** (the vLLM venv is CUDA-enabled, our build is CPU); a
+CUDA build of vllm.cpp embeds device code and is larger, that figure is NOT
+measured and is deliberately NOT estimated, so no ratio is asserted between the
+two. Reproduce: `python3 benchmarks/demo/concurrency_race.py` and `python3
+benchmarks/demo/footprint.py`.
+
 **DOCS user-facing split: README landing page + `docs/STATUS.md` ledger
 (2026-07-27, `CLAIM-DOCS-README-SPLIT`).** Disposition: **NOT APPLICABLE (no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Documentation
