@@ -484,15 +484,17 @@ class GPUModelRunner final : public ModelRunnerBase {
   int dflash_k_ = 0;
   std::vector<int32_t> dflash_tap_layer_ids_;
   bool use_dflash() const { return dflash_weights_ != nullptr; }
-  // Per-request ACCUMULATED combined-feature context (the inline analogue of
-  // vLLM's incrementally-written draft KV cache). dflash_ctx_feats_[i] is a flat
-  // [L_i * H] f32 buffer of fc(cat(aux)) for request i's committed sequence
-  // positions 0..L_i-1 (L_i = dflash_ctx_len_[i]); dflash_ctx_reqid_[i] tracks the
-  // occupant so a reused batch slot resets its context. Indexed by the runner's
-  // condensed-dense batch row (== req_state slot). Grown per verify step by the
-  // accepted count (num_sampled), rolled back by dropping the rejected drafts'
-  // features (they are never appended). Sized to max_num_reqs on set_dflash_draft.
-  std::vector<std::vector<float>> dflash_ctx_feats_;
+  // Per-request PERSISTENT context KV store (D9 persistent paged draft-KV — the
+  // perf form of vLLM's incrementally-written draft KV cache). dflash_kv_store_[i]
+  // holds request i's per-layer bf16 context K/V (K normed+RoPE'd, V raw) for its
+  // committed positions 0..L_i-1 (L_i = dflash_ctx_len_[i]). Each verify step
+  // projects ONLY the newly-accepted rows (AppendContextKVHost) and APPENDS them,
+  // instead of re-projecting the whole growing context (the D5/D7 O(context^2)
+  // recompute). Bit-identical to the recompute by per-row projection independence.
+  // dflash_ctx_reqid_[i] tracks the occupant so a reused batch slot resets its
+  // store; rejected drafts' rows are never appended (rollback = don't-append).
+  // Indexed by the runner's condensed-dense batch row. Sized on set_dflash_draft.
+  std::vector<vllm::Qwen3DFlashModel::PrecomputedContextKV> dflash_kv_store_;
   std::vector<int32_t> dflash_ctx_len_;
   std::vector<std::string> dflash_ctx_reqid_;
   // Draft KV cache (`fa_draft` group) backing storage, owned by the runner and

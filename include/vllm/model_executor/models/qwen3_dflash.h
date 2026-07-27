@@ -193,6 +193,51 @@ class Qwen3DFlashModel {
       const Qwen3DFlashWeights& weights, const HfConfig& config, vt::Queue& queue,
       std::vector<std::vector<float>>* per_layer_out = nullptr,
       std::vector<float>* final_out = nullptr);
+
+  // ---- D9 (persistent paged draft-KV) -------------------------------------
+  //
+  // PERSISTENT context-KV store: the per-layer draft context K/V held as bf16 host
+  // buffers ACROSS verify steps, so each step projects ONLY the newly-accepted rows
+  // (AppendContextKVHost) instead of re-projecting the whole growing context every
+  // step (the O(context^2) recompute PrecomputeContextKV does). This is the perf
+  // form of vLLM's append-only paged draft KV cache (precompute_and_store_context_kv
+  // writes only the step's NEW tokens, dflash/speculator.py:358,548-619). BIT-IDENTICAL
+  // to the full recompute by per-row independence: hidden_norm is a per-row RMSNorm,
+  // the KV GEMM an independent per-row dot product, k_norm per-row-per-head, and RoPE
+  // per-row at that row's absolute position — so projecting a row once (when accepted)
+  // yields the SAME bf16 bits as projecting it later inside a C-row batch. Tokens +
+  // acceptance are therefore UNCHANGED; only the recompute cost drops O(ctx^2) -> O(ctx).
+  struct PrecomputedContextKV {
+    // Per draft attention layer: bf16 K (normed+RoPE'd) / V (raw), each flat
+    // [num_ctx*Hkv*Dh] in ascending-position row order (== ctx_cu order per request).
+    std::vector<std::vector<uint16_t>> k;
+    std::vector<std::vector<uint16_t>> v;
+    int64_t num_ctx = 0;
+  };
+
+  // Project `count` NEW context rows (combined features `new_features` [count,H] f32
+  // at absolute `new_positions` [count]) to per-layer bf16 K/V and APPEND them to
+  // `store` (one entry per config.num_hidden_layers, growing num_ctx by count). Reuses
+  // the EXACT projection the full recompute runs (same ops, same order, each row RoPE'd
+  // at its own position), so the appended bits equal the recompute's for those rows.
+  static void AppendContextKVHost(PrecomputedContextKV& store,
+                                  const std::vector<float>& new_features,
+                                  const std::vector<int32_t>& new_positions,
+                                  const Qwen3DFlashWeights& weights, const HfConfig& config,
+                                  vt::Queue& queue);
+
+  // CONTEXT-AWARE block forward over a PRECOMPUTED (persistent) context KV store —
+  // identical to ForwardBlockLogitsWithContext EXCEPT it uploads `ckv`'s per-layer bf16
+  // K/V instead of re-projecting the context each step (D9). `ctx_cu`/`cu` are the
+  // per-request context/query boundaries (length num_reqs+1); ckv.num_ctx == ctx_cu.back().
+  // The K is already normed+RoPE'd and V raw (as PrecomputeContextKVDevice produces), so
+  // the [context; block] attention (the UNCHANGED D2 primitive) sees bit-identical inputs.
+  static std::vector<float> ForwardBlockLogitsWithPrecomputedKV(
+      const PrecomputedContextKV& ckv, const std::vector<int32_t>& ctx_cu,
+      const std::vector<int32_t>& block_input_ids, const std::vector<int32_t>& block_positions,
+      const std::vector<int32_t>& cu, const Qwen3DFlashWeights& weights, const HfConfig& config,
+      vt::Queue& queue, std::vector<std::vector<float>>* per_layer_out = nullptr,
+      std::vector<float>* final_out = nullptr);
 };
 
 // prepare_dflash_inputs (dflash/speculator.py:472-687, the _prepare_dflash_inputs_kernel

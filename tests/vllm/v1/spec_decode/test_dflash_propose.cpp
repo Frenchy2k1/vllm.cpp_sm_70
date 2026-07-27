@@ -200,6 +200,101 @@ TEST_CASE("dflash DflashProposeBlock == sampler(ForwardBlockLogitsWithContext) c
   CHECK(res.draft_token_ids == ref);  // brick composes forward + sampler exactly
 }
 
+TEST_CASE("dflash D9 persistent-KV: incremental append == full recompute, BIT-IDENTICAL (c1)") {
+  // The D9 persistent paged draft-KV must be bit-for-bit identical to the D5/D7 full
+  // per-step recompute. Build a 3-token context in TWO appends (pos 0,1 then pos 2) via
+  // AppendContextKVHost + ForwardBlockLogitsWithPrecomputedKV, and compare to the single
+  // ForwardBlockLogitsWithContext recompute over the whole context. Per-row projection
+  // independence => IDENTICAL bf16 K/V => IDENTICAL f32 logits (exact equality).
+  Dims dm;
+  HfConfig cfg = MakeConfig(dm);
+  Qwen3DFlashWeights w = MakeWeights(dm);
+  vt::Queue q = Cpu();
+  const int64_t H = dm.H;
+  std::vector<int32_t> ids = {2, 7, 7};
+  std::vector<int32_t> pos = {3, 4, 5};
+  std::vector<int32_t> block_cu = {0, 3};
+  std::vector<int32_t> ctx_cu = {0, 3};
+  std::vector<int32_t> ctx_pos = {0, 1, 2};
+  std::vector<float> ctx(static_cast<size_t>(3) * H);
+  for (size_t i = 0; i < ctx.size(); ++i)
+    ctx[i] = 0.2f * std::sin(0.13 * static_cast<double>(i) + 0.4);
+
+  const std::vector<float> recompute = Qwen3DFlashModel::ForwardBlockLogitsWithContext(
+      ctx, ctx_pos, ctx_cu, ids, pos, block_cu, w, cfg, q);
+
+  // Persistent: two appends (rows 0-1 @ pos {0,1}, then row 2 @ pos {2}).
+  Qwen3DFlashModel::PrecomputedContextKV store;
+  std::vector<float> f01(ctx.begin(), ctx.begin() + 2 * H);
+  std::vector<float> f2(ctx.begin() + 2 * H, ctx.end());
+  Qwen3DFlashModel::AppendContextKVHost(store, f01, {0, 1}, w, cfg, q);
+  Qwen3DFlashModel::AppendContextKVHost(store, f2, {2}, w, cfg, q);
+  REQUIRE(store.num_ctx == 3);
+  const std::vector<float> persistent = Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
+      store, ctx_cu, ids, pos, block_cu, w, cfg, q);
+
+  REQUIRE(persistent.size() == recompute.size());
+  bool bit_identical = true;
+  for (size_t i = 0; i < persistent.size(); ++i)
+    if (persistent[i] != recompute[i]) { bit_identical = false; break; }
+  CHECK(bit_identical);  // exact equality: persistent paged KV is not an approximation
+}
+
+TEST_CASE("dflash D9 persistent-KV: multi-request concat == full recompute, BIT-IDENTICAL") {
+  // Two requests (ctx 2 + 1), stores concatenated in ctx_cu order == the recompute over
+  // the [req0; req1] combined context. Exercises the runner's per-request store concat.
+  Dims dm;
+  HfConfig cfg = MakeConfig(dm);
+  Qwen3DFlashWeights w = MakeWeights(dm);
+  vt::Queue q = Cpu();
+  const int64_t H = dm.H;
+  const int num_reqs = 2, k = 2;
+  std::vector<int32_t> ids = {2, 7, 7, 3, 7, 7};
+  std::vector<int32_t> pos = {5, 6, 7, 4, 5, 6};
+  std::vector<int32_t> block_cu = {0, 3, 6};
+  std::vector<int32_t> ctx_cu = {0, 2, 3};
+  std::vector<int32_t> ctx_pos = {0, 1, 0};
+  std::vector<float> ctx(static_cast<size_t>(3) * H);
+  for (size_t i = 0; i < ctx.size(); ++i)
+    ctx[i] = 0.2f * std::sin(0.13 * static_cast<double>(i) + 0.4);
+
+  const std::vector<float> recompute = Qwen3DFlashModel::ForwardBlockLogitsWithContext(
+      ctx, ctx_pos, ctx_cu, ids, pos, block_cu, w, cfg, q);
+
+  Qwen3DFlashModel::PrecomputedContextKV s0, s1;
+  std::vector<float> f0(ctx.begin(), ctx.begin() + 2 * H);  // req0 rows @ pos {0,1}
+  std::vector<float> f1(ctx.begin() + 2 * H, ctx.end());     // req1 row  @ pos {0}
+  Qwen3DFlashModel::AppendContextKVHost(s0, f0, {0, 1}, w, cfg, q);
+  Qwen3DFlashModel::AppendContextKVHost(s1, f1, {0}, w, cfg, q);
+  Qwen3DFlashModel::PrecomputedContextKV comb;
+  comb.k.assign(static_cast<size_t>(dm.layers), {});
+  comb.v.assign(static_cast<size_t>(dm.layers), {});
+  for (int64_t l = 0; l < dm.layers; ++l) {
+    comb.k[static_cast<size_t>(l)].insert(comb.k[static_cast<size_t>(l)].end(),
+                                          s0.k[static_cast<size_t>(l)].begin(),
+                                          s0.k[static_cast<size_t>(l)].end());
+    comb.k[static_cast<size_t>(l)].insert(comb.k[static_cast<size_t>(l)].end(),
+                                          s1.k[static_cast<size_t>(l)].begin(),
+                                          s1.k[static_cast<size_t>(l)].end());
+    comb.v[static_cast<size_t>(l)].insert(comb.v[static_cast<size_t>(l)].end(),
+                                          s0.v[static_cast<size_t>(l)].begin(),
+                                          s0.v[static_cast<size_t>(l)].end());
+    comb.v[static_cast<size_t>(l)].insert(comb.v[static_cast<size_t>(l)].end(),
+                                          s1.v[static_cast<size_t>(l)].begin(),
+                                          s1.v[static_cast<size_t>(l)].end());
+  }
+  comb.num_ctx = 3;
+  const std::vector<float> persistent = Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
+      comb, ctx_cu, ids, pos, block_cu, w, cfg, q);
+
+  REQUIRE(persistent.size() == recompute.size());
+  bool bit_identical = true;
+  for (size_t i = 0; i < persistent.size(); ++i)
+    if (persistent[i] != recompute[i]) { bit_identical = false; break; }
+  CHECK(bit_identical);
+  (void)num_reqs; (void)k;
+}
+
 TEST_CASE("dflash DflashProposeBlock: empty context degenerates to context-free ForwardBlockLogits") {
   Dims dm;
   HfConfig cfg = MakeConfig(dm);

@@ -25140,3 +25140,58 @@ shapes + [[cudagraph-capture-bakes-stack-addresses]]).
 CUDA ⇒ `-Werror`/compute-sanitizer/`check-device-leakage` unchanged. **SPEC-DFLASH stays `ACTIVE`** at the honest
 residual. Artifacts on dgx `/tmp/d8_vllm_rca.json`, `/tmp/d8_ours_rca.txt`; harness committed at
 `scripts/spec/d8_acceptance_rca.py`. NOT pushed; FULL SHA reported to caller.
+
+## 2026-07-27 — SPEC-DFLASH D9 (`CLAIM-DFLASH-D9`): persistent paged draft-KV LANDED (bit-identical, +22.7%); D8 acceptance-ceiling REFUTED; residual = FULL CG only
+
+DFlash D9 landed the persistent paged draft-KV (the biggest bit-identical perf win) and
+answered Part 1 (the same-trajectory acceptance confound). Base `origin/main` `4139e55f`;
+worktree `/home/mudler/_git/wt-dflash-d9`; dgx build/gate in the reused tree
+`~/dflash-d5/vllm.cpp/build-cuda` (GB10 sm_121a, pin `555967922`/vLLM 0.26.0.dev0,
+`~/venvs/vllm-oracle`, all GPU under one `flock $HOME/gpu.lock`). NOT pushed; FULL SHA reported.
+
+**What landed (source-owning, bit-identical):** `src/vllm/model_executor/models/qwen3_dflash.cpp`
++ `include/.../qwen3_dflash.h`: `AppendContextKVHost` (project ONLY newly-accepted rows →
+per-layer bf16 K/V, append to `PrecomputedContextKV`) + `ForwardBlockLogitsWithPrecomputedKV`
+(upload the store, no re-projection); both delegate to a shared `ForwardWithCtxKVDev` core with
+the old `ForwardBlockLogitsWithContext` (full recompute), so they differ ONLY in how the
+`ContextKVDev` bits are obtained. `runner.cpp::propose_drafts_dflash` swaps the O(context²)
+per-step recompute (`dflash_ctx_feats_` → full re-projection) for a per-request persistent
+`dflash_kv_store_` appended by only the accepted rows (rollback = don't-append, mirroring the
+existing `T_req − num_rejected` accumulation). Mirrors vLLM `precompute_and_store_context_kv`
+(append-only paged draft KV, `dflash/speculator.py:358,548-619`). NO new CUDA kernel; config-gated.
+
+**Bit-identity PROVEN + VERIFIED:** per-row projection independence (hidden_norm/KV-GEMM/k_norm/RoPE
+are per-row; each row RoPE'd at its own absolute position). CPU `test_dflash_propose.cpp` two new
+D9 cases (incremental 2-append c1 + multi-request concat) = exact float equality vs full recompute
+(RED-first structure). GPU e2e `test_qwen27_dflash_spec_decode` **27/27 SAME tokens** as D5/D7
+(2/4 STRICT + 2/4 near-tie, acceptance 19/39/29/25, same divergence indices France@11=2972 /
+17×23@12=567 — the DFlash-specific signature proves the new path RAN). Inertness on the D9 build:
+27B SACRED `test_qwen27_paged_engine` **235/235** + 27B MTP `test_qwen27_spec_decode` **9/9**
+byte-identical (config-gated). CUDA `-Werror` clean; no new kernel ⇒ compute-sanitizer/
+`check-device-leakage` transitively covered (as D5/D7).
+
+**Part 1 — D8's 0.85× acceptance ceiling is a CONFOUND, REFUTED.** D8 compared ours' acceptance on
+OUR trajectory vs vLLM's on vLLM's — different streams after near-tie flips. Confound-free measure:
+on the 2/4 e2e prompts whose greedy output is TOKEN-IDENTICAL to vLLM (fibonacci, three-laws — the
+real same-trajectory arm) our accepted-draft-tok/step EXACTLY equals vLLM's (fibonacci 39/5=7.80
+both; three-laws 25/7=3.571 both; ratio 1.00). Corroborated by the A/B: on the 8-prompt set our
+realized acceptance 3.68/step is HIGHER than vLLM's 3.31. So the per-step draft QUALITY is at parity;
+acceptance is NOT the throughput blocker.
+
+**Part 3 — FINAL c1 A/B (8 prose+code prompts × 256 tok, input-len 512, greedy, 2 reps <0.1%,
+`benchmark_binding=true`):** ours DFlash-ON **25.75 tok/s** / 38.40 ms TPOT / acc 3.68 vs
+vLLM-DFlash-ON graphed **28.09** / 35.60 / acc 3.31 — ours **0.917×** (~8% below). vs D8 (20.99,
+0.69×): the persistent KV gained **+22.7%** and closed 0.69× → 0.917×. spec-OFF: ours 9.92 ≥ vLLM
+~9.66. ON/OFF: ours 2.60× vs vLLM 2.91×. **VERDICT: on-par-or-above bar STILL NOT met, but the
+residual is now a SINGLE closeable increment — the FULL CG (eager-vs-graphed).** Since OFF is at
+parity, the recompute is eliminated, and our acceptance is HIGHER, the only structural difference
+is our-eager-vs-vLLM's-graphed draft step. NOT an irreducible ceiling (D8's acceptance-ceiling
+refuted); it is the un-landed FULL uniform-(1+k) CG (needs a device paged-KV store + paged attention
++ capture-safety — new-CUDA multi-file, honestly deferred; a partial ungated landing would risk
+false parity). A per-kernel nsys of both draft steps (eager N-launches vs 1 graph launch) is the
+entry point for the CG work.
+
+**Disposition: SPEC-DFLASH stays `ACTIVE`** — correctness at the ratified near-tie envelope
+(unchanged), speed improved to 0.917× vLLM with the acceptance-ceiling REFUTED and the residual
+isolated to the FULL CG. Raw logs on dgx `/tmp/d9_ab.log` + `/tmp/d9_vllm_on.log`; harness
+`/tmp/dflash_ab.sh`, `/tmp/vllm_on.sh`, `scripts/spec/vllm_dflash_timing.py`.

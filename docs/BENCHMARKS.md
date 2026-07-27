@@ -184,6 +184,36 @@ recompute envelope) plus the uniform-1+k FULL CG. Repro: run
 `./build-cuda/tests/test_qwen27_dflash_spec_decode` under `flock` with the bf16-lm_head 27B snapshot
 (single-file `model.safetensors`) + the z-lab draft in the HF cache.
 
+**DFlash D9 - PERSISTENT PAGED DRAFT-KV LANDED (bit-identical, +22.7% throughput); D8's "bf16
+acceptance ceiling" REFUTED; residual = FULL CG only (2026-07-27, `CLAIM-DFLASH-D9`,
+`benchmark_binding=true`).** The append-only persistent draft-KV store (`AppendContextKVHost` +
+`ForwardBlockLogitsWithPrecomputedKV`, replacing the O(context^2) per-step recompute) is bit-identical
+(e2e `test_qwen27_dflash_spec_decode` 27/27 SAME tokens, SACRED 235/235 + MTP 9/9 byte-identical, CUDA
+`-Werror` clean, no new kernel) and improves throughput. FINAL c1 A/B (dgx GB10, one `flock`, 8 prose+code
+prompts x 256 tok, input-len 512, greedy, 2 reps rep-stable <0.1%, mm-off gpu_util 0.30,
+`VLLM_USE_V2_MODEL_RUNNER=1`):
+
+| axis (c1, L=256, 8-prompt set) | ours D9 DFlash-ON (persistent-KV, eager) | vLLM DFlash-ON (graphed) | verdict |
+|---|---|---|---|
+| Output throughput (tok/s) | 25.75 (25.76 / 25.74) | 28.09 | ours 0.917x (~8% below; was D8 0.69x) |
+| Mean TPOT (ms) | 38.40 | 35.60 | ours +7.9% |
+| accepted draft-tok/step | 3.68 | 3.31 | ours 1.11x HIGHER |
+| spec-OFF base (tok/s) | 9.92 | ~9.66 | ours >= vLLM |
+| ON/OFF speedup | 2.60x | 2.91x | - |
+
+The persistent KV took ours-ON from D8's 20.99 to 25.75 tok/s (+22.7%, 0.69x -> 0.917x). **Part 1
+(same-trajectory acceptance):** on the 2/4 e2e prompts whose greedy output is TOKEN-IDENTICAL to vLLM
+(fibonacci, three-laws) our accepted-draft-tok/step EXACTLY equals vLLM's (7.80/7.80 and 3.571/3.571,
+ratio 1.00), and on the 8-prompt A/B our realized acceptance (3.68/step) is HIGHER than vLLM's (3.31) -
+so D8's aggregate 0.80-0.85x "bf16 acceptance ceiling" is a trajectory-divergence CONFOUND, REFUTED; the
+per-step draft QUALITY is at parity. **VERDICT: on-par-or-above NOT met (ours 25.75 < vLLM 28.09, ~8%
+below), but the residual is now a SINGLE closeable increment - the FULL uniform-(1+k) CUDA graph
+(eager-vs-graphed):** OFF is at parity, the recompute is eliminated, and our acceptance is higher, so the
+only structural difference left is our eager draft step vs vLLM's graphed one (ours ON/OFF 2.60x vs vLLM
+2.91x). NOT an irreducible ceiling. The FULL CG (needs a device paged-KV store + paged attention, new
+CUDA) is the sole un-landed increment. Raw logs dgx `/tmp/d9_ab.log` + `/tmp/d9_vllm_on.log`; harness
+`/tmp/dflash_ab.sh`, `/tmp/vllm_on.sh`, `scripts/spec/vllm_dflash_timing.py`.
+
 **DFlash D8 - ACCEPTANCE RCA closed by measurement = bf16-IRREDUCIBLE (NOT a reducible per-step draft
 bug); FINAL c1 speed A/B on the golden set = ours ~31% below vLLM-DFlash-ON (2026-07-27,
 `CLAIM-DFLASH-D8`, dgx GB10 sm_121a, oracle vLLM 0.26.0.dev0).** `benchmark_binding=true`. NO engine code
