@@ -2555,6 +2555,26 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal B-tile vectorisation - shape-split, NET NEUTRAL, reverted (2026-07-27)
+
+The A tile's vectorisation was worth 1.55x, so the B tile was the obvious other
+half. BT forces the load to run along k and scatter down the tile, a different
+loop shape. Correct but **net neutral end to end (17.44 vs 17.41 tok/s)**:
+
+| shape | scalar B | vectorised B | change |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 2282 GFLOP/s | 1939 | **-15%** |
+| mlp-up 512x2048x6144 | 2501 | 2618 | +4.7% |
+| mlp-dn 512x6144x2048 | 2382 | 2517 | +5.7% |
+
+**Cause of the regression: thread under-utilisation.** Scalar B staging walks
+BK*BN = 512 elements over 256 threads; the vectorised form walks (BK/4)*BN = 128
+vector loads over the same 256, so half the threadgroup idles. Larger K amortises
+that, which is why only the 6144-dimension shapes gain. If retried, fix the
+utilisation (BK=16, or stage A with the idle half) before touching vector width.
+
+---
+
 ## Metal vectorised decode GEMV on Apple M4 (2026-07-27) - +9.8%
 
 The same vectorisation applied to the op that dominates DECODE, which is now the
