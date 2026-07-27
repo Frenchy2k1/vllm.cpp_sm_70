@@ -26310,3 +26310,57 @@ attribution already implied that; the mismatched headline obscured it.
 **Consequence for the remaining work:** stop tuning decode. Prefill is the whole
 story — the mm kernel at 79-87% of MLX's steel GEMM, and whatever prefill-side
 host work sits outside GPU-busy time.
+
+---
+
+## 2026-07-27 — Metal query-tiled PREFILL attention: up to +32% end to end
+
+Follows directly from the equivalence correction above, which said the remaining
+like-for-like gap is PREFILL. Attribution of prefill alone (`--output-len 1`,
+sync dispatch) put it at: `vt_matmul_bt_mm` 650 ms (63%) and
+**`vt_paged_attention` 344 ms (33%)** of 1.03 s GPU busy.
+
+The arithmetic condemned attention, not the GEMM: prefill GEMMs are 1.44 TFLOP,
+so MLX's ENTIRE 469 ms prefill is just its GEMMs at ~3.07 TFLOP/s, leaving ~20 ms
+for its attention. Ours was 344 ms — ~17x. Cause was structural: one threadgroup
+per (head, query token) meant each of 8192 threadgroups per layer re-read the
+whole K/V range (~28 GB per prefill, ~81 GB/s of a ~120 GB/s part).
+
+**Landed:** `vt_paged_attention_tiled`, a second pipeline serving VT_PA_QTILE=4
+consecutive query tokens of one request per threadgroup. K row held in REGISTERS
+across the tile, V loaded once. Host picks it when `tq > num_reqs`.
+Prefill attention 344 -> 279 ms (-19%).
+
+| prompt | TTFT base -> tiled | out tok/s base -> tiled |
+|---|---|---|
+| 512 | 1518 -> 1391 ms (-8%) | 20.26 -> 20.72 (+2%) |
+| 2048 | 8946 -> 6802 ms (-24%) | 8.78 -> 10.31 (+17%) |
+| 4096 | 29997 -> 21235 ms (-29%) | 3.53 -> 4.66 (+32%) |
+
+**Methodological lesson, and nearly a discarded win.** At p=512 the gain sat
+inside the run-to-run band and I read it as "did not move end to end" — the
+correct call by the usual rule. It was wrong here because attention is quadratic
+in prompt length while the GEMMs are linear: the same change is +32% at p=4096.
+**When a change targets a component whose cost scales differently from the rest
+of the workload, one benchmark point cannot judge it. Sweep the axis it scales
+on.**
+
+**Three reverted attempts, all measured, all costing DECODE 15-17%:**
+1. Runtime tile bound — MSL spills the per-query arrays (qjmin/qjmax/qok/s) to
+   thread-private memory and `s[u]` sits in the innermost V loop. Prefill
+   attention got WORSE, 344 -> 386 ms.
+2. Compile-time bound of 4 for one shared kernel — fixed the spills (attention
+   386 -> 276 ms) but decode then computes and masks 3 dead slots: 23.7 tok/s.
+3. Sized threadgroup references instead of pointers, to test aliasing — 22.3
+   tok/s, so **pointer aliasing was NOT the cause**; the shared body itself is
+   wrong for decode (it stages K through registers in two passes where decode
+   wants one fused pass, plus per-query barriers decode does not need).
+
+Resolution: decode keeps its ORIGINAL source verbatim as a separate kernel. The
+duplication is deliberate and commented on both sides; the two bodies implement
+the same online softmax and both are covered by test_ops_paged_attn because
+PagedAttentionKernel picks by query length.
+
+**Where prefill stands now:** GEMM 650 ms vs MLX's ~469 ms whole prefill, so
+`vt_matmul_bt_mm` (79-87% of MLX's steel GEMM) is now essentially the entire
+remaining prefill gap. Attention is no longer the story.

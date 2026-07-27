@@ -2555,6 +2555,47 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal query-tiled PREFILL attention on Apple M4 (2026-07-27) - up to +32%
+
+Prefill attention ran one threadgroup per (head, query token), so every one of
+the 8192 threadgroups per layer re-read the whole K/V range: ~28 GB for a
+512-token prompt, ~81 GB/s of a ~120 GB/s part, 33% of prefill GPU time at
+~175 GFLOP/s against MLX's ~3000. `vt_paged_attention_tiled` serves
+`VT_PA_QTILE`=4 consecutive query tokens of one request from a single
+threadgroup: the K row is held in REGISTERS across the tile and each V element
+is loaded once, cutting K/V traffic ~4x.
+
+Prefill attention GPU time at p=512: **344 ms -> 279 ms (-19%)**.
+
+End to end, Qwen3-1.7B-bf16, b=1, g=128, alternating A/B under one GPU lock with
+the BASELINE running first (so thermals disfavour the new build):
+
+| prompt | TTFT base -> tiled | out tok/s base -> tiled |
+|---|---|---|
+| 512 | 1518 -> 1391 ms (-8%) | 20.26 -> 20.72 (+2%) |
+| 2048 | 8946 -> 6802 ms (-24%) | 8.78 -> 10.31 (+17%) |
+| 4096 | 29997 -> 21235 ms (-29%) | 3.53 -> **4.66 (+32%)** |
+
+The p=512 gain is small because prefill is only 23% of that run; attention is
+quadratic in prompt length while the GEMMs are linear, so the win grows with the
+prompt. **Judging this at p=512 alone would have read as noise and thrown away a
+32% win at p=4096.**
+
+DECODE IS UNTOUCHED and deliberately so: it keeps its own pipeline, restored
+verbatim. Three attempts to share one kernel body each cost decode 15-17% and
+were reverted — a runtime tile bound (MSL spills the per-query arrays to
+thread-private memory, and one sits in the innermost V loop: prefill attention
+386 ms), a compile-time bound of 4 (decode then computes and masks 3 dead slots:
+23.7 tok/s), and sized threadgroup references to rule out pointer aliasing (22.3
+tok/s, so aliasing was NOT the cause). Decode runs 128x more often than prefill
+here, so any decode regression outweighs the prefill win.
+
+Gate: test_ops_paged_attn 1643 assertions, test_metal_backend 20135, and the
+SACRED Qwen3 near-tie gate 16/16 prompts, max gap 0.125 nats, 0
+forward-divergent, 7168 kPagedAttention selections with 0 declines.
+
+---
+
 ## BENCHMARK EQUIVALENCE: the MLX-LM comparison was NOT like-for-like (2026-07-27)
 
 **A correction to this record's own reporting, found by auditing the two
