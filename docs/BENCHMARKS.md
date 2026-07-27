@@ -2555,6 +2555,65 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal typed GEMV load path on Apple M4 (2026-07-27) - INDICATIVE
+
+**Third parity lever.** The decode GEMV is ~50% of GPU time and every element
+went through `vt_load`, which costs two branches. Specialising the bf16xbf16 case
+outside the K loop and splitting the reduction across four independent
+accumulators (the single `acc` serialised the FMA chain in a latency-bound loop):
+
+| | before | after |
+|---|--:|--:|
+| throughput | 13.27 | **14.25** (14.08 / 14.42) |
+| duration | 9.65 s | 8.99 s |
+| TTFT | 2524 ms | 2586 ms (unchanged; this touches decode only) |
+
+**+7.4%.** Every non-bf16 dtype keeps the generic path, so nothing loses
+correctness for one case gaining speed.
+
+**Accuracy improved, and is now MEASURABLE.** The existing arms could not see
+this change at all: the all-f32 arm does not take the bf16 path, and the all-bf16
+arms are dominated by output store rounding. A **bf16-in / f32-out** arm was
+added for exactly this, and it discriminates:
+
+| kernel | NMSE vs f64 oracle |
+|---|--:|
+| typed GEMV, 4 accumulators | **5.11e-15** |
+| tile GEMM | 9.77e-14 |
+
+**Golden re-captured, oracle-validated, and the result stated in full.** The
+reduction-order change drifted the anchor (prompt[5] tok 10). Re-capture used
+vLLM **0.25.0** (version recorded explicitly this time, see the caveat below).
+6 of 256 tokens changed, all in prompt 5. Against the previous golden the new
+sequence is better on the gate's own metric and slightly worse on one other:
+
+| | new | previous |
+|---|--:|--:|
+| gate STRICT token-exact | **11/16** | 10/16 |
+| gate near-tie band only | 5/16 | 6/16 |
+| max gap | **0.125 nats** | 0.188 |
+| per-token == vLLM argmax | 254/256 | 255/256 |
+| mean gap | 0.98 mnats | 0.73 |
+| outside vLLM top-K | 0 | 0 |
+
+Gate passes **16/16**. Unit suite 21 cases / 20,135 assertions.
+
+**CAVEAT ON THE EARLIER RE-CAPTURES.** The `~/venvs/vllm-oracle` used for the
+`M3d` golden re-capture NO LONGER CONTAINS vLLM; it changed during this session.
+Its version at the time therefore cannot be confirmed retroactively, so the
+"vLLM 0.25.0" attribution on that earlier re-capture is UNVERIFIED. This run used
+`~/venvs/vllm-oracle-v0.25.0-stage` and recorded the version from the interpreter
+before running. Future re-captures should do the same.
+
+**Rejected in the same pass:** the identical typed-staging treatment applied to
+the mm kernel measured WORSE (14.10 vs 14.42 tok/s, TTFT +120 ms) and was
+reverted. Staging is amortised over the tile's compute, so the branch was never
+its cost, unlike the GEMV's inner loop.
+
+**Status: INDICATIVE.** Goal progress: 10.5 -> 14.25 of 27.9 tok/s.
+
+---
+
 ## Metal 2-D blocked simdgroup GEMM on Apple M4 (2026-07-27) - INDICATIVE
 
 **The top-ranked lever from the attribution below, built and measured.** Prefill

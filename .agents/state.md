@@ -25785,3 +25785,42 @@ corrects an earlier over-estimate: the decode GEMV already runs at 75 GB/s, 63% 
 the M4's ~120 GB/s peak, against MLX-LM's ~95 GB/s (79%), so that lever is worth
 ~1.2 s rather than the ~2.3 s first projected. Prefill remains the larger gap
 (~2.5 s vs MLX-LM's ~0.47 s).
+
+---
+
+## 2026-07-27 — typed GEMV load path: 13.3 -> 14.25 tok/s; plus a caveat on the earlier oracle venv
+
+**Third parity lever.** The decode GEMV is ~50% of GPU time and ran every element
+through `vt_load` (two branches). Specialised the bf16xbf16 case outside the K
+loop and split the reduction across four accumulators, since a single `acc`
+serialises the FMA chain in a latency-bound loop. **13.27 -> 14.25 tok/s
+(+7.4%)**, TTFT unchanged (decode-only change). Non-bf16 dtypes keep the generic
+path.
+
+**Accuracy improved and is now measurable.** Neither existing arm could see this:
+the all-f32 arm does not take the bf16 path, and the all-bf16 arms are dominated
+by output store rounding. Added a **bf16-in / f32-out** arm, which discriminates:
+**5.11e-15** vs the tile GEMM's 9.77e-14.
+
+**Golden re-captured (third time), oracle-validated, result stated in full.** New
+sequence is BETTER on the gate's metric (STRICT 11/16 vs 10/16, max gap 0.125 vs
+0.188 nats) and marginally worse on another (per-token == vLLM argmax 254/256 vs
+255/256, mean gap 0.98 vs 0.73 mnats). 0 outside top-K, 0 beyond the band. Gate
+16/16.
+
+**CAVEAT OWED ON THE EARLIER RE-CAPTURE.** `~/venvs/vllm-oracle`, used for the
+`M3d` golden re-capture earlier this session, NO LONGER CONTAINS vLLM — it changed
+under us mid-session. The version used then cannot be confirmed retroactively, so
+the "vLLM 0.25.0" attribution on that re-capture is UNVERIFIED. This run used
+`~/venvs/vllm-oracle-v0.25.0-stage` and read the version from the interpreter
+before running (0.25.0). Every future re-capture must record the version the same
+way. The dgx box mutates during a session; do not assume a venv is stable.
+
+**Rejected in the same pass:** the same typed-staging treatment on the mm kernel
+measured WORSE (14.10 vs 14.42 tok/s) and was reverted. Staging is amortised over
+the tile's compute; the branch was never its cost, unlike the GEMV's inner loop.
+
+**Goal:** 10.5 -> 14.25 of 27.9 tok/s. Remaining 1.96x. Decode is now ~5.5 s
+against MLX-LM's 4.59 s; prefill ~2.5 s against ~0.47 s. Prefill is again the
+dominant gap, and the mm kernel's limit is still unidentified: barriers (BK=32),
+tile width (64x64) and staging branches have all been measured and excluded.

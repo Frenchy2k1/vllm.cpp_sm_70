@@ -421,8 +421,39 @@ kernel void vt_matmul_bt_gemv(device const uchar* a   [[buffer(0)]],
   // m == 1, so the activation row is row 0 and `lda` cannot contribute.
   const ulong brow = ulong(col) * ulong(p.k);
   float acc = 0.0f;
-  for (uint kk = tiisg; kk < p.k; kk += sgsize) {
-    acc += vt_load(a, p.a_dt, ulong(kk)) * vt_load(b, p.b_dt, brow + ulong(kk));
+
+  // TYPED, HOISTED LOAD PATH. `vt_load` costs two branches per element, and this
+  // loop runs K times per lane over the whole weight matrix: at 21,464 dispatches
+  // it is ~50% of decode GPU time. Specialising on the dtype pair OUTSIDE the
+  // loop removes the branches and lets the compiler widen the loads; the lane
+  // stride is unchanged, so consecutive lanes still read consecutive addresses
+  // and the access stays fully coalesced.
+  //
+  // bf16xbf16 is the case that matters (it is what the gate model runs); every
+  // other combination keeps the generic path, so no dtype loses correctness for
+  // one gaining speed.
+  if (p.a_dt == VT_DT_BF16 && p.b_dt == VT_DT_BF16) {
+    device const ushort* au = (device const ushort*)a;
+    device const ushort* bu = (device const ushort*)b + brow;
+    uint kk = tiisg;
+    // Four independent accumulators: the dependency chain on a single `acc`
+    // serialises the FMAs, and this loop is latency- not throughput-bound.
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    const uint step = sgsize * 4u;
+    for (; kk + sgsize * 3u < p.k; kk += step) {
+      a0 += vt_bf16_to_f32(au[kk]) * vt_bf16_to_f32(bu[kk]);
+      a1 += vt_bf16_to_f32(au[kk + sgsize]) * vt_bf16_to_f32(bu[kk + sgsize]);
+      a2 += vt_bf16_to_f32(au[kk + sgsize * 2u]) * vt_bf16_to_f32(bu[kk + sgsize * 2u]);
+      a3 += vt_bf16_to_f32(au[kk + sgsize * 3u]) * vt_bf16_to_f32(bu[kk + sgsize * 3u]);
+    }
+    for (; kk < p.k; kk += sgsize) {
+      a0 += vt_bf16_to_f32(au[kk]) * vt_bf16_to_f32(bu[kk]);
+    }
+    acc = (a0 + a1) + (a2 + a3);
+  } else {
+    for (uint kk = tiisg; kk < p.k; kk += sgsize) {
+      acc += vt_load(a, p.a_dt, ulong(kk)) * vt_load(b, p.b_dt, brow + ulong(kk));
+    }
   }
   acc = simd_sum(acc);
   if (tiisg == 0u) {
