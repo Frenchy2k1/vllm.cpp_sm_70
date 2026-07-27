@@ -26761,3 +26761,45 @@ outlier — here bytes/second rather than FLOP/s. Both times the answer was a
 kernel running at a small fraction of the hardware's ceiling for structural
 reasons, and both times the preceding entry had confidently ranked something
 else. Sweep the roofline of EVERY component before ranking projects.
+
+---
+
+## 2026-07-27 — flash-decoding REJECTED; the decode bandwidth limit is LAYOUT, not parallelism
+
+**Refutes the fix I proposed one commit earlier in OPEN LEAD 2.** Implemented in
+full: `vt_paged_attention_split` (per-slice partial max/sumexp/accumulator),
+`vt_paged_attention_combine`, process-lifetime scratch for the partials, a
+`splits` field on the params struct with explicit padding on both sides, and a
+`VT_METAL_NO_FLASH_DECODE=1` A/B lever. Metal + op parity stayed green
+(112298 + 1643 assertions). It is SLOWER at every context length:
+
+| context | splits | decode OFF | decode ON |
+|---|--:|--:|--:|
+| 512 | 4 | 26.43 | 25.93 (-1.9%) |
+| 2048 | 8 | 22.88 | 22.26 (-2.7%) |
+| 4096 | 8 | 20.25 | 18.97 (-6.3%) |
+
+Sizing splits to own a full 256-key chunk each did not rescue it, and the loss
+GROWS with the number of splits. Reverted.
+
+**Why the hypothesis was wrong:** 16 threadgroups x 512 threads = 8192 threads
+against roughly 10240 concurrent slots on this part — already ~80% occupancy.
+Decode attention was never starved of parallelism, so extra threadgroups buy
+nothing and cost redundant Q reads, redundant reductions and a combine pass.
+
+**Where the arithmetic points now — the KV cache LAYOUT.** `[block][slot]
+[kv_head][dim]` means a single head's walk across slots reads 256 contiguous
+bytes then skips 1792: **12.5% density**, against a measured stream of 29 GB/s =
+24% of peak. Right order of magnitude. A head-major cache
+(`[block][kv_head][slot][dim]`) would make a head's keys contiguous, but it
+touches reshape_and_cache, every attention kernel and the CUDA path — a
+cross-cutting change, not a Metal-local one.
+
+**This is a HYPOTHESIS with arithmetic, not a measured result.** Do not repeat my
+mistake of ranking it as the answer before testing it. The cheap tests are: a
+model with num_kv_heads == 1 (density 100%, so the stream should approach peak),
+or an experimental head-major cache behind a flag on the Metal path only.
+
+**Standing goal: 94.5%, unchanged.** Two consecutive proposed fixes for the
+decode gap (fusion, then flash-decoding) have now been refuted by measurement.
+The remaining gap is real but its cause is not yet established.

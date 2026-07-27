@@ -2555,6 +2555,50 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Flash-decoding REJECTED — the decode bandwidth limit is LAYOUT, not parallelism (2026-07-27)
+
+**This refutes the fix proposed in the entry below, which was recorded one commit
+earlier.** Flash-decoding was implemented in full — a `vt_paged_attention_split`
+kernel reducing each key slice to a partial (max, sumexp, accumulator) triple,
+a `vt_paged_attention_combine` merge pass, process-lifetime scratch, and a
+`VT_METAL_NO_FLASH_DECODE` A/B lever — and it is SLOWER at every context length:
+
+| context | splits | decode OFF | decode ON |
+|---|--:|--:|--:|
+| 512 | 4 | 26.43 | 25.93 (-1.9%) |
+| 2048 | 8 | 22.88 | 22.26 (-2.7%) |
+| 4096 | 8 | 20.25 | 18.97 (-6.3%) |
+
+Sizing each split to own a FULL 256-key chunk (so the two threadgroup reductions
+per chunk are amortised) did not rescue it; the loss grows with context, i.e.
+with the number of splits. Reverted.
+
+**The hypothesis was wrong.** 16 threadgroups x 512 threads is 8192 threads on a
+part with roughly 10240 concurrent thread slots — already ~80% occupancy. Decode
+attention is not starved of parallelism, so adding threadgroups only adds
+redundant Q re-reads, redundant reductions and a combine pass.
+
+**What the arithmetic points at instead: the KV cache LAYOUT.** The cache is
+`[block][slot][kv_head][dim]`, so walking one kv head across slots touches 256
+contiguous bytes then skips 1792:
+
+```
+one kv head at one slot   =  256 B contiguous
+stride to the next slot   = 2048 B
+density of a head walk    = 12.5%
+measured decode KV stream = 29 GB/s = 24% of ~120 GB/s peak
+```
+
+A 12.5%-dense strided walk explaining a 24%-of-peak stream is the right order.
+The fix would be a head-major cache (`[block][kv_head][slot][dim]`), making one
+head's keys contiguous across slots — but that touches `reshape_and_cache`, every
+attention kernel, and the CUDA path, so it is a cross-cutting change and NOT a
+Metal-local one. It is a hypothesis with arithmetic behind it, not a measured
+result: the honest test is a model with `num_kv_heads == 1` (density 100%), or an
+experimental head-major cache behind a flag.
+
+---
+
 ## OPEN LEAD 2: decode attention streams KV at 24% of peak bandwidth (2026-07-27)
 
 **This overturns the "decode residual is dispatch count / fusion" conclusion in
