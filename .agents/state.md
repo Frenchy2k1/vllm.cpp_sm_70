@@ -27444,3 +27444,32 @@ and 23.10 -> 24.60 (p=2048).
 Correctness: re-anchored through the oracle a second time (vLLM 0.25.0
 teacher-forced on the new sequence). Max gap **0.125 nats**, same worst as the
 golden replaced, 0 over bar, 0 outside top-K, 16/16 PASS.
+
+---
+
+## 2026-07-27 — prefill attention: vectorised K/V/Q staging, +0.50% (~96.3% of MLX-LM)
+
+**The same defect, in the mma kernel I wrote earlier THIS session.**
+`vt_paged_attention_mma` staged K, V and Q with scalar `vt_load` per element —
+the exact pattern that had decode's V loop at 29 GB/s against the score loop's
+64. Vectorised to `ushort4`, scalar fallback for unaligned/non-bf16.
+
+**Prefill attention 78.6 -> 55.3 ms (-30%).**
+
+Paired verdict (warm p=512 g=128): +0.12 +0.16 +0.05 +0.12 +0.17 +0.05 ->
+**+0.50% median, 6/6 blocks, p = 0.031.** Warm total 23.65 -> 23.76.
+
+**No golden re-anchor needed** — a load-WIDTH change only: same values, same
+order, same accumulation, so the greedy sequence is untouched. 16/16 PASS on the
+existing goldens. Worth stating explicitly because the two preceding kernel
+changes both moved a near-tie and needed the oracle; predicting which changes
+perturb numerics is part of knowing what you changed.
+
+**Generalised lesson:** any kernel reading bf16 through `vt_load` element by
+element leaves 4x of its load width on the floor. BOTH attention kernels had it.
+The GEMM's staging was already vectorised, which is why the defect never showed
+up there and why five decode hypotheses missed it — the bug was in the loop
+nobody had profiled in isolation.
+
+**Cumulative on this axis: 94.5% -> ~96.3%.** Remaining gap ~3.7%, now
+prefill-GEMM-led again (~540 ms against MLX's implied ~490).
