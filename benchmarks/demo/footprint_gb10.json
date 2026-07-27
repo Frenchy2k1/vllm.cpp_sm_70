@@ -1,0 +1,38 @@
+{
+  "_source_vllm": "MEASURED 2026-07-27 on dgx.casa (GB10): `du -sk -L ~/venvs/vllm-oracle` = 9899580 KiB total; component sizes from `du -sk site-packages/*`. This is the pinned parity oracle venv (vLLM 0.26.0.dev0, built from source for sm_121a).",
+  "_source_ours": "MEASURED 2026-07-27 on the dev box: build-demo/examples/server, CMAKE_BUILD_TYPE=Release, CPU backend, stripped = 10330088 bytes. The server links libvllm.a statically (ldd shows no libvllm dependency), so this single file is the whole deployment.",
+  "_caveat": "NOT a like-for-like build pairing: the vLLM figure is a CUDA-enabled venv, ours is a CPU Release build. A CUDA build of vllm.cpp embeds device code and is larger; that figure is not yet measured and is deliberately not estimated here. The caveat is drawn on the card.",
+  "headline": "9.4 GiB of Python and CUDA userspace, or one 10 MiB binary.",
+  "title": "What you install before it serves a token",
+  "subtitle": "vLLM 0.26.0.dev0 pinned oracle venv vs the vllm.cpp server binary, both measured on disk",
+  "groups": [
+    {
+      "label": "vLLM",
+      "detail": "Python venv, CUDA-enabled, built from source for sm_121a",
+      "accent": "slate",
+      "total_mib": 9667,
+      "parts": [
+        {"label": "nvidia CUDA libs", "mib": 3160},
+        {"label": "flashinfer cubins", "mib": 2494},
+        {"label": "torch", "mib": 914},
+        {"label": "triton", "mib": 651},
+        {"label": "cutlass DSL", "mib": 431},
+        {"label": "everything else", "mib": 2017}
+      ]
+    },
+    {
+      "label": "vllm.cpp",
+      "detail": "one statically linked server binary, CPU Release build, stripped",
+      "accent": "teal",
+      "total_mib": 9.85,
+      "parts": [
+        {"label": "server", "mib": 9.85}
+      ]
+    }
+  ],
+  "footnotes": [
+    "Measured 2026-07-27: du -sk -L on the pinned oracle venv (9899580 KiB); stat on the stripped server binary (10330088 bytes).",
+    "Not a like-for-like build pairing: the vLLM venv is CUDA-enabled, this vllm.cpp build is CPU. A CUDA build embeds device code and is larger.",
+    "vllm.cpp needs no Python, PyTorch, or ggml at inference. Repro: docs/BENCHMARKS.md"
+  ]
+}

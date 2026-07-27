@@ -1,0 +1,28 @@
+{
+  "_source": "docs/BENCHMARKS.md binding online-serving grid; README Performance table. Every number here is a MEASURED binding value, not a projection.",
+  "title": "Ahead of vLLM at every concurrency",
+  "model": "Qwen3.6-27B (NVFP4), greedy, token-identical output",
+  "hardware": "NVIDIA GB10 / DGX Spark, sm_121a",
+  "workload": "input 1024 tokens to output 128, closed loop, 3 interleaved repetitions, vLLM in its graphed production config",
+  "headline": "at or above vLLM at every concurrency",
+  "subline": "token-identical output, 24.88 GiB vs 28.18 GiB host memory, no Python",
+  "ours": {"label": "vllm.cpp", "accent": "teal"},
+  "theirs": {"label": "vLLM 0.25.0", "accent": "slate"},
+  "points": [
+    {"c": 1,  "ours": 86.05,   "theirs": 82.32},
+    {"c": 2,  "ours": 159.68,  "theirs": 158.03},
+    {"c": 4,  "ours": 292.34,  "theirs": 290.31},
+    {"c": 8,  "ours": 508.77,  "theirs": 505.46},
+    {"c": 16, "ours": 801.76,  "theirs": 789.16},
+    {"c": 32, "ours": 1095.01, "theirs": 1076.25}
+  ],
+  "footnotes": [
+    "Total throughput, tokens/s. Peak host memory 24.88 GiB vs vLLM 28.18 GiB.",
+    "Effective parity 115/124 per-axis metrics. Full grids and repro: docs/BENCHMARKS.md"
+  ],
+  "links": [
+    "localai.io",
+    "github.com/mudler/LocalAI",
+    "github.com/mudler/vllm.cpp"
+  ]
+}
