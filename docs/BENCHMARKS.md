@@ -2555,6 +2555,41 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## MLX provider is now NET SLOWER than our own kernels (2026-07-27) - action for LocalAI
+
+**Our Metal kernels have overtaken the MLX provider.** Measured on current main,
+b=1 p=512 g=128, same binary, GPU lock, 2 reps:
+
+| arm | throughput | duration | TTFT |
+|---|--:|--:|--:|
+| MLX provider ON | 11.92 / 11.94 | 10.74 / 10.72 s | **1583 ms** |
+| MLX provider OFF (ours) | **14.19 / 14.50** | 9.02 / 8.83 s | 2543 ms |
+
+**MLX wins prefill decisively and loses overall.** TTFT is 38% better with MLX,
+which independently corroborates the roofline finding below (its GEMM is 3.3x
+ours). But total throughput is 17% WORSE.
+
+**Where it goes, measured rather than inferred.** With MLX on, OUR dispatch path
+gets faster (wait 7.06 s vs 8.54 s) because MLX absorbs 112 prefill GEMMs. Total
+wall time still rises, so MLX's own path costs **3.67 s of non-dispatch time**
+against 0.39 s for the native arm. That is the integration, not the kernel: a
+host `memcpy` of every output (`Matmul::eval_gpu` re-`set_data`s from MLX's
+allocator), a per-call `mx::eval` commit+wait on MLX's own stream, and MLX
+allocator pressure on a 16 GB box already ~13 GB committed.
+
+**ACTION FOR LocalAI PR #11137**, which enables the MLX provider by default on
+darwin: that default was correct when measured (MLX GEMM 1.5x-2.2x our then-current
+kernels) and is now **inverted**. With `M3c-1`, `M3d`, the simdgroup GEMM and typed
+loads landed, the provider should default OFF until its output path is fixed.
+The ~124 MB of vendored `libmlx.dylib` + `mlx.metallib` buys nothing at present.
+
+**Not pursued:** declining m=1 inside the provider (so MLX serves only prefill)
+was tried and does improve the MLX arm, but it still loses to MLX-off overall and
+it breaks the M5 provider tests' select-and-do-not-decline contract. Reverted;
+the useful output is the recommendation above, not the re-routing.
+
+---
+
 ## Metal GEMM roofline vs MLX on Apple M4 (2026-07-27) - the kernel is 3x off
 
 **Timed in ISOLATION at real prefill shapes, against MLX's steel GEMM in the same

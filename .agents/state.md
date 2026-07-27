@@ -25860,3 +25860,37 @@ activation outliers can exceed it, which trades a correctness hazard for speed.
 
 **Goal:** 14.25 of 27.9 tok/s. Ranked next steps are now (1) the MLX provider
 output path, (2) our own GEMM toward MLX's 77% of peak.
+
+---
+
+## 2026-07-27 — the MLX provider is now NET SLOWER than our kernels; LocalAI default should flip
+
+**Measured, same binary, b=1 p=512 g=128, GPU lock, 2 reps:** MLX provider ON
+11.93 tok/s / 10.73 s / TTFT 1583 ms; MLX OFF **14.35 tok/s / 8.93 s** / TTFT
+2543 ms.
+
+**MLX wins prefill decisively and loses overall.** TTFT is 38% better with MLX,
+independently corroborating the roofline result (its GEMM is 3.3x ours), but
+total throughput is 17% worse.
+
+**Attribution, measured not inferred.** With MLX on, OUR dispatch path gets
+FASTER (wait 7.06 vs 8.54 s) because MLX absorbs 112 prefill GEMMs, yet wall time
+rises: MLX's own path costs **3.67 s of non-dispatch time** against 0.39 s for
+native. That is integration cost, not kernel cost — the per-output host `memcpy`
+(`Matmul::eval_gpu` re-`set_data`s from MLX's allocator), a per-call `mx::eval`
+commit+wait on MLX's stream, and allocator pressure on a 16 GB box already ~13 GB
+committed.
+
+**ACTION FOR LocalAI PR #11137:** it enables the MLX provider by default on
+darwin. That default was right when measured (MLX GEMM was 1.5x-2.2x our
+then-current kernels) and is now INVERTED by `M3c-1`, `M3d`, the simdgroup GEMM
+and typed loads. It should default OFF until the provider's output path is fixed;
+the ~124 MB of vendored libmlx + metallib currently buys nothing.
+
+**Tried and reverted:** declining m=1 inside the provider so MLX serves only
+prefill. It does improve the MLX arm (10.5 -> 11.93) but still loses to MLX-off,
+and it breaks the M5 tests' select-and-do-not-decline contract — those tests
+caught it correctly. The deliverable is the recommendation, not the re-routing.
+
+**Goal:** 14.25 of 27.9 tok/s. The best available configuration is now our own
+kernels with MLX OFF.
