@@ -534,6 +534,9 @@ add_library(vllm STATIC
   src/vllm/parser/engine/streaming_parser_engine.cpp
   src/vllm/parser/engine/configs.cpp
   src/vllm/parser/engine/registry.cpp
+  src/vllm/parser/engine/parser_engine.cpp
+  src/vllm/parser/kimi_k2.cpp
+  src/vllm/parser/parser_manager.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

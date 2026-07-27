@@ -1,0 +1,434 @@
+# vllm.cpp parity harness; oracle = upstream vLLM unified parser ASSEMBLY layer.
+"""Capture golden DeltaMessage / ExtractedToolCallInformation sequences from the
+vLLM 0.26 parser ASSEMBLY layer (``vllm/parser/engine/parser_engine.py`` +
+``vllm/parser/qwen3.py`` + ``vllm/parser/kimi_k2.py``) and emit the C++ gate's
+goldens ``.inc``.
+
+Like the engine-core dump, the assembly layer is a PURE FUNCTION of the
+(delta_text, delta_token_ids) stream, so this needs no GPU, no model and no
+installed vLLM wheel: it copies the engine + assembly + family modules from the
+pinned vLLM source tree, rewrites their intra-engine imports to a local package
+``pe``, and stubs the few serving-layer imports the assembly touches
+(protocol DeltaMessage/ToolCall structs, a deterministic make_tool_call_id, the
+Parser base's history-count init, and the no-schema tool_parsers.utils helpers).
+
+The tool-call id for the qwen3 "random" id_type is normally a random uuid; the
+stub make_tool_call_id is DETERMINISTIC (``chatcmpl-tool-<idx>``) so the gate can
+compare ids exactly. The C++ gate injects the identical deterministic factory.
+
+Usage::
+
+    VLLM_SOURCE=/home/mudler/_git/vllm python3 \
+      tools/parity/dump_parser_engine_assembly.py \
+      --out tests/vllm/parser/engine/test_parser_engine_assembly_goldens.inc
+
+Regenerate whenever the pin advances and re-run the C++ gate
+``test_parser_engine_assembly``; any changed sequence is a real divergence to
+reconcile 1:1 with upstream.
+"""
+
+import argparse
+import importlib
+import os
+import shutil
+import sys
+import tempfile
+
+ENGINE_MODULES = [
+    "events",
+    "token_id_scanner",
+    "incremental_lexer",
+    "parser_engine_config",
+    "streaming_parser_engine",
+    "parser_engine",
+]
+FAMILY_MODULES = ["qwen3", "kimi_k2", "seed_oss"]
+
+
+def build_sandbox(vllm_source):
+    """Copy the engine + assembly + family modules into a temp package ``pe``
+    and lay down stub ``vllm.*`` modules for the serving-layer imports."""
+    tmp = tempfile.mkdtemp(prefix="peasm_")
+    pkg = os.path.join(tmp, "pe")
+    os.makedirs(pkg)
+    open(os.path.join(pkg, "__init__.py"), "w").close()
+
+    src_engine = os.path.join(vllm_source, "vllm", "parser", "engine")
+    src_parser = os.path.join(vllm_source, "vllm", "parser")
+
+    def copy_rewrite(text):
+        # Engine modules live under pe.*; family modules import each other via
+        # vllm.parser.<name> and the engine via vllm.parser.engine.<name>.
+        text = text.replace("from vllm.parser.engine.", "from pe.")
+        text = text.replace("from vllm.parser.qwen3 import", "from pe.qwen3 import")
+        text = text.replace("from vllm.parser.kimi_k2 import", "from pe.kimi_k2 import")
+        return text
+
+    for m in ENGINE_MODULES:
+        text = open(os.path.join(src_engine, m + ".py")).read()
+        open(os.path.join(pkg, m + ".py"), "w").write(copy_rewrite(text))
+    for m in FAMILY_MODULES:
+        text = open(os.path.join(src_parser, m + ".py")).read()
+        open(os.path.join(pkg, m + ".py"), "w").write(copy_rewrite(text))
+
+    # ---- stub vllm.* package tree ----
+    def write(relpath, text):
+        full = os.path.join(tmp, relpath)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        open(full, "w").write(text)
+
+    write("vllm/__init__.py", "")
+    write("vllm/logger.py", "import logging\n"
+          "def init_logger(name):\n    return logging.getLogger(name)\n")
+
+    write("vllm/parser/__init__.py", "")
+    write("vllm/parser/utils.py",
+          "def count_history_tool_calls(request):\n    return 0\n")
+    write("vllm/parser/abstract_parser.py", _ABSTRACT_PARSER_STUB)
+
+    write("vllm/entrypoints/__init__.py", "")
+    write("vllm/entrypoints/chat_utils.py", _CHAT_UTILS_STUB)
+    write("vllm/entrypoints/openai/__init__.py", "")
+    write("vllm/entrypoints/openai/engine/__init__.py", "")
+    write("vllm/entrypoints/openai/engine/protocol.py", _PROTOCOL_STUB)
+
+    write("vllm/tool_parsers/__init__.py", "")
+    write("vllm/tool_parsers/utils.py", _TOOL_UTILS_STUB)
+
+    sys.path.insert(0, tmp)
+    return tmp
+
+
+_ABSTRACT_PARSER_STUB = '''
+from dataclasses import dataclass, field
+
+@dataclass
+class StreamState:
+    reasoning_ended: bool = False
+    tool_call_text_started: bool = False
+    prompt_reasoning_checked: bool = False
+    previous_text: str = ""
+    previous_token_ids: list = field(default_factory=list)
+    history_tool_call_cnt: int = 0
+    history_tool_call_cnt_initialized: bool = False
+    tool_call_id_type: str = "random"
+    function_name_returned: bool = False
+    engine_based: bool = False
+
+class Parser:
+    def _initialize_history_tool_call_cnt(self, request):
+        state = self._stream_state
+        if state.history_tool_call_cnt_initialized:
+            return
+        if state.tool_call_id_type != "kimi_k2":
+            state.history_tool_call_cnt_initialized = True
+            return
+        state.history_tool_call_cnt = 0  # empty history in the gate
+        state.history_tool_call_cnt_initialized = True
+'''
+
+_CHAT_UTILS_STUB = '''
+def get_tool_call_id_type(model_config):
+    return "random"
+
+def make_tool_call_id(id_type="random", func_name=None, idx=None):
+    # DETERMINISTIC for gate parity (the real impl uses a random uuid for
+    # id_type="random"). The C++ gate injects the identical factory.
+    if id_type == "kimi_k2":
+        return f"functions.{func_name}:{idx}"
+    return f"chatcmpl-tool-{idx}"
+'''
+
+_PROTOCOL_STUB = '''
+class DeltaFunctionCall:
+    def __init__(self, name=None, arguments=None):
+        self.name = name
+        self.arguments = arguments
+
+class DeltaToolCall:
+    def __init__(self, index=0, id=None, type=None, function=None):
+        self.index = index
+        self.id = id
+        self.type = type
+        self.function = function
+
+class DeltaMessage:
+    def __init__(self, role=None, content=None, reasoning=None, tool_calls=None):
+        self.role = role
+        self.content = content
+        self.reasoning = reasoning
+        self.tool_calls = tool_calls
+
+class FunctionCall:
+    def __init__(self, id=None, name=None, arguments=None):
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+
+class ToolCall:
+    def __init__(self, id=None, function=None, type="function"):
+        self.id = id
+        self.function = function
+        self.type = type
+
+class ExtractedToolCallInformation:
+    def __init__(self, tools_called=False, tool_calls=None, content=None):
+        self.tools_called = tools_called
+        self.tool_calls = tool_calls or []
+        self.content = content
+
+class FunctionDefinition:
+    pass
+'''
+
+_TOOL_UTILS_STUB = '''
+# No tool schema is carried in the gate, so these degenerate exactly as upstream
+# does for tools=None (find_tool_properties -> {}, find_tool_name -> False).
+def find_tool_properties(tools, tool_name):
+    return {}
+
+def find_tool_name(tools, tool_name):
+    return False
+
+def extract_types_from_schema(schema):
+    return []
+
+def coerce_to_schema_type(value, schema_type):
+    return value
+'''
+
+
+class Req:
+    def __init__(self, include_reasoning=True, tools=None, tool_choice="auto"):
+        self.include_reasoning = include_reasoning
+        self.tools = tools
+        self.tool_choice = tool_choice
+        self.messages = []
+
+
+class MockTok:
+    """Text-only mock: get_vocab() maps terminal texts to ids (never used since
+    the gate streams carry no token ids), and exposes no all_special table."""
+
+    def __init__(self):
+        self._vocab = {
+            "<think>": 1001, "</think>": 1002,
+            "<seed:think>": 1011, "</seed:think>": 1012,
+            "<tool_call>": 1020, "</tool_call>": 1021,
+            "<seed:tool_call>": 1022, "</seed:tool_call>": 1023,
+            "<|tool_calls_section_begin|>": 1003,
+            "<|tool_calls_section_end|>": 1004,
+            "<|tool_call_begin|>": 1005,
+            "<|tool_call_end|>": 1006,
+            "<|tool_call_argument_begin|>": 1007,
+        }
+
+    def get_vocab(self):
+        return self._vocab
+
+
+# --------------------------------------------------------------------------- #
+# Scenarios: each is (name, cfg, thinking, include_reasoning, [delta_text, ...])
+# The deltas are streamed with finished=True on the last one; the full text is
+# the concatenation and is also fed to extract_tool_calls.
+# --------------------------------------------------------------------------- #
+def chars(s):
+    return list(s)
+
+
+def make_scenarios():
+    QWEN_FULL = (
+        "<think>Let me check the weather.</think>"
+        "Sure, checking now."
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>Tokyo</parameter>\n"
+        "<parameter=unit>celsius</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    QWEN_TWO = (
+        "<tool_call>\n<function=alpha>\n<parameter=x>1</parameter>\n"
+        "</function>\n</tool_call>"
+        "<tool_call>\n<function=beta>\n<parameter=y>2</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    QWEN_UNFINISHED = (
+        "<tool_call>\n<function=get_weather>\n<parameter=city>Tokyo"
+    )
+    KIMI_FULL = (
+        "<think>picking a tool</think>"
+        "<|tool_calls_section_begin|><|tool_call_begin|>"
+        "functions.get_weather:0<|tool_call_argument_begin|>"
+        '{"city": "Tokyo", "unit": "celsius"}'
+        "<|tool_call_end|><|tool_calls_section_end|>"
+    )
+
+    scenarios = []
+    # 1. qwen3 reasoning + XML tool call, whole-delta cadence.
+    scenarios.append(("qwen3_reasoning_xml_wholedelta", "qwen3", True, True, [
+        "<think>Let me check the weather.</think>",
+        "Sure, checking now.",
+        "<tool_call>\n<function=get_weather>\n",
+        "<parameter=city>Tokyo</parameter>\n",
+        "<parameter=unit>celsius</parameter>\n",
+        "</function>\n</tool_call>",
+    ]))
+    # 2. same, char-by-char cadence (streaming stability).
+    scenarios.append(("qwen3_reasoning_xml_charwise", "qwen3", True, True,
+                      chars(QWEN_FULL)))
+    # 3. reasoning suppressed (include_reasoning=False).
+    scenarios.append(("qwen3_reasoning_suppressed", "qwen3", True, False, [
+        "<think>Let me check the weather.</think>",
+        "Sure, checking now.",
+        "<tool_call>\n<function=get_weather>\n",
+        "<parameter=city>Tokyo</parameter>\n",
+        "</function>\n</tool_call>",
+    ]))
+    # 4. thinking-off plain content.
+    scenarios.append(("qwen3_thinking_off_content", "qwen3", False, True,
+                      chars("Just plain content, no tools at all.")))
+    # 5. two consecutive tool calls (tool_index increments).
+    scenarios.append(("qwen3_two_consecutive_tools", "qwen3", False, True,
+                      chars(QWEN_TWO)))
+    # 6. unfinished tool call flushed by finish().
+    scenarios.append(("qwen3_unfinished_flush", "qwen3", False, True,
+                      chars(QWEN_UNFINISHED)))
+    # 7. seed_oss variant (same grammar, different wrapper tokens).
+    scenarios.append(("seed_oss_reasoning_xml", "seed_oss", True, True, [
+        "<seed:think>hmm</seed:think>",
+        "<seed:tool_call>\n<function=ping>\n<parameter=host>localhost"
+        "</parameter>\n</function>\n</seed:tool_call>",
+    ]))
+    # 8. kimi_k2 JSON args, char-by-char (held-back top-level brace).
+    scenarios.append(("kimi_json_heldback_brace", "kimi_k2", True, True,
+                      chars(KIMI_FULL)))
+    # 9. kimi_k2 whole-delta cadence.
+    scenarios.append(("kimi_json_wholedelta", "kimi_k2", True, True, [
+        "<think>picking a tool</think>",
+        "<|tool_calls_section_begin|>",
+        "<|tool_call_begin|>functions.get_weather:0",
+        "<|tool_call_argument_begin|>",
+        '{"city": "Tokyo", "unit": "celsius"}',
+        "<|tool_call_end|><|tool_calls_section_end|>",
+    ]))
+    return scenarios
+
+
+def make_parser(pe_pkg, cfg, thinking, tok):
+    if cfg == "qwen3":
+        return pe_pkg["qwen3"].Qwen3Parser(tok, chat_template_kwargs={
+            "enable_thinking": thinking})
+    if cfg == "seed_oss":
+        return pe_pkg["seed_oss"].SeedOssParser(tok, chat_template_kwargs={
+            "enable_thinking": thinking})
+    if cfg == "kimi_k2":
+        return pe_pkg["kimi_k2"].KimiK2Parser(tok, chat_template_kwargs={
+            "thinking": thinking})
+    raise SystemExit("unknown cfg: " + cfg)
+
+
+# --------------------------------------------------------------------------- #
+# .inc emission
+# --------------------------------------------------------------------------- #
+def esc(s):
+    out = []
+    for ch in s:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 0x20:
+            out.append("\\x%02x" % ord(ch))
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def opt(s):
+    return "std::nullopt" if s is None else "std::optional<std::string>(" + esc(s) + ")"
+
+
+def emit_tc(tc):
+    # streaming DeltaToolCall
+    return "GTC{%d, %s, %s, %s, %s}" % (
+        tc.index, opt(tc.id), opt(tc.type),
+        opt(tc.function.name if tc.function else None),
+        opt(tc.function.arguments if tc.function else None),
+    )
+
+
+def emit_delta(msg):
+    if msg is None:
+        return "GDelta{false, std::nullopt, std::nullopt, {}}"
+    tcs = ""
+    if msg.tool_calls:
+        tcs = ", ".join(emit_tc(t) for t in msg.tool_calls)
+    return "GDelta{true, %s, %s, {%s}}" % (opt(msg.content), opt(msg.reasoning), tcs)
+
+
+def emit_extract(info):
+    xtcs = ", ".join(
+        'GXTC{%s, %s, %s}' % (esc(tc.id), esc(tc.function.name), esc(tc.function.arguments))
+        for tc in info.tool_calls)
+    return "GExtract{%s, %s, {%s}}" % (
+        "true" if info.tools_called else "false", opt(info.content), xtcs)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--vllm-source", default=os.environ.get("VLLM_SOURCE",
+                    "/home/mudler/_git/vllm"))
+    args = ap.parse_args()
+
+    tmp = build_sandbox(args.vllm_source)
+    try:
+        pe_pkg = {m: importlib.import_module("pe." + m) for m in FAMILY_MODULES}
+
+        lines = []
+        lines.append("// GENERATED by tools/parity/dump_parser_engine_assembly.py")
+        lines.append("// Oracle: vLLM 0.26.0.dev0 @ 555967922 parser ASSEMBLY layer.")
+        lines.append("// DO NOT EDIT — regenerate from the pinned oracle.")
+        lines.append("static const std::vector<GScenario> kAssemblyGoldens = {")
+
+        for name, cfg, thinking, incl, deltas in make_scenarios():
+            tok = MockTok()
+            # --- streaming pass ---
+            parser = make_parser(pe_pkg, cfg, thinking, tok)
+            req = Req(include_reasoning=incl)
+            stream_out = []
+            for i, dt in enumerate(deltas):
+                finished = (i == len(deltas) - 1)
+                msg = parser.parse_delta(dt, [], req, finished=finished)
+                stream_out.append(emit_delta(msg))
+            # --- one-shot extract pass ---
+            parser2 = make_parser(pe_pkg, cfg, thinking, tok)
+            full = "".join(deltas)
+            info = parser2.extract_tool_calls(full, Req(include_reasoning=incl))
+
+            deltas_cpp = ", ".join(esc(d) for d in deltas)
+            stream_cpp = ",\n      ".join(stream_out)
+            lines.append("  GScenario{")
+            lines.append("    %s, %s, %s, %s," % (
+                esc(name), esc(cfg),
+                "true" if thinking else "false",
+                "true" if incl else "false"))
+            lines.append("    {%s}," % deltas_cpp)
+            lines.append("    {\n      %s\n    }," % stream_cpp)
+            lines.append("    %s," % emit_extract(info))
+            lines.append("  },")
+
+        lines.append("};")
+        open(args.out, "w").write("\n".join(lines) + "\n")
+        print("wrote", args.out, "(%d scenarios)" % len(make_scenarios()))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

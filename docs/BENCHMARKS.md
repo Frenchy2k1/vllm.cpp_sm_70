@@ -49,6 +49,29 @@ byte-identical. Reproduce:
 cmake --build build-cpu --target test_streaming_parser_engine &&
 ./build-cpu/tests/test_streaming_parser_engine`.
 
+**ROAD-V1-C8 parser ASSEMBLY layer (2026-07-27, `CLAIM-ROADMAP-C8-ASSEMBLY`,
+NOT pushed).** Disposition: **CORRECTNESS gate, no throughput number
+(`benchmark_binding=false`).** The vLLM 0.26 `ParserEngine` assembly layer that
+turns the engine CORE's SemanticEvent stream into serving-visible output is a
+pure function of the `(delta_text, delta_token_ids)` stream, so it is gated
+EXACTLY (field-for-field, not near-tie): for 9 fixed deterministic streams the
+C++ per-delta `DeltaMessage` sequence (content, reasoning, and
+`tool_calls[i].{index,id,type,function.name,function.arguments}`) AND the
+one-shot `extract_tool_calls` result equal, field for field, what vLLM
+0.26.0.dev0 (`555967922`) emits for the identical stream.
+`test_parser_engine_assembly` 2 cases / 1652 assertions on CPU. Tool-call ids
+are made deterministic on both sides (`chatcmpl-tool-<idx>`; production keeps
+the random uuid factory). RED-first: dropping the held-back tool-args tail in
+`_safe_arg_prefix` fails 32 assertions at the divergent
+`qwen3_reasoning_xml_wholedelta delta[3]` argument boundary; restoring returns
+1652/1652. Goldens are captured from the pinned source by
+`tools/parity/dump_parser_engine_assembly.py` and reproduce the committed `.inc`
+byte-identically. Inertness: additive opt-in, engine-core gate still 586/586,
+plain generation byte-identical. Reproduce:
+`VLLM_SOURCE=/path/to/vllm python3 tools/parity/dump_parser_engine_assembly.py --out /tmp/a.inc &&
+cmake --build build-cpu --target test_parser_engine_assembly &&
+./build-cpu/tests/test_parser_engine_assembly`.
+
 **ROAD-V1-C7 sampling controls + logprobs (2026-07-27, `CLAIM-ROADMAP-C7`, NOT
 pushed).** Disposition: **CORRECTNESS gate, no throughput number
 (`benchmark_binding=false`).** A sampling transform is a pure function of

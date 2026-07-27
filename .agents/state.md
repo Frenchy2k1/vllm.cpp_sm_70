@@ -25750,3 +25750,46 @@ dgx contention with the D4-APC-W3 sibling), pin `555967922`/vLLM 0.26.0.dev0.
   minimax_m2/nemotron_v3/glm47_moe/inkling); regex (non-literal) terminals. NOT
   pushed; FULL SHA reported to caller. Sibling `D4-APC-W3` (prefix-cache/KV/§2, GPU)
   untouched.
+
+## 2026-07-27 — ROAD-V1-C8 residual: parser ASSEMBLY layer LANDED (CLAIM-ROADMAP-C8-ASSEMBLY, NOT pushed)
+
+- **What landed.** The vLLM 0.26 parser ASSEMBLY layer on top of the merged
+  `StreamingParserEngine` CORE. `ParserEngine` (`parser_engine.py:79`) consumes the
+  `SemanticEvent` stream and emits serving-visible output: streaming `DeltaMessage`
+  (reasoning/content + tool-call name-first-then-args deltas, held-back streaming-arg
+  prefix `_safe_arg_prefix`, `tool_index` increment, `finish()` flush) and the one-shot
+  `ExtractedToolCallInformation` (`extract_tool_calls`) + non-streaming
+  `extract_reasoning`/`parse`.
+- **Files (additive).** NEW `include/vllm/parser/engine/{parser_engine,py_json}.h` +
+  `src/vllm/parser/engine/parser_engine.cpp`; NEW `include/vllm/parser/{kimi_k2,parser_manager}.h`
+  + `src/vllm/parser/{kimi_k2,parser_manager}.cpp` (kimi native-header
+  `functions.<name>:<idx>` id/name overrides + name->parser dispatch); the qwen3
+  `<parameter=NAME>VALUE</parameter>` arg-converter added to `configs.cpp`; assembly-layer
+  fields added to the existing `ParserEngineConfig` (`parser_engine_config.h`, streaming
+  engine ignores them); `py_json.h` reproduces `json.dumps(ensure_ascii=False)` default
+  `(", ", ": ")` separators. Reuses `DeltaMessage`/`DeltaToolCall`/`FunctionCall`/`ToolCall`/
+  `ExtractedToolCallInformation`. CMake: 3 lib src lines + 1 test line. NEW gate
+  `tests/vllm/parser/engine/test_parser_engine_assembly.cpp` + `..._goldens.inc` + dump
+  `tools/parity/dump_parser_engine_assembly.py` + spec `.agents/specs/parser-assembly-c8.md`.
+- **Gate (exact, RED-first, CPU).** `test_parser_engine_assembly` 2 cases / 1652/1652
+  assertions over 9 scenarios, matched FIELD-for-FIELD (streaming DeltaMessage per delta
+  AND one-shot extract_tool_calls) vs the vLLM 0.26 Python assembly: qwen3 reasoning+XML
+  tool call (whole-delta & char-by-char), reasoning-suppressed (include_reasoning=false),
+  thinking-off plain content, two consecutive tools (tool_index 0->1), unfinished call
+  flushed by finish(), seed_oss variant, kimi_k2 JSON args held-back top-level brace
+  (char-by-char & whole-delta). Tool-call ids deterministic on both sides
+  (chatcmpl-tool-<idx>; production keeps random uuid). Goldens byte-reproduced from the
+  pin. RED-first: dropping the held-back tool-args tail in `_safe_arg_prefix` fails 32
+  asserts, first boundary `qwen3_reasoning_xml_wholedelta delta[3] tc[0] tc args` (expected
+  `{"city": "Tokyo`, break emitted `{"city": `); restoring → 1652/1652.
+- **Inertness.** Additive opt-in; engine-core gate still 586/586 (config additions inert to
+  the streaming engine); no existing tool_parsers/serving TU altered; plain generation
+  byte-identical; serving-SSE dispatch swap NOT wired (named residual). CPU `-Werror` 0-warn
+  (clean full `vllm` lib). `benchmark_binding=false` (correctness/payload change).
+- **RESIDUAL (honest, stays open under the row):** serving-SSE DISPATCH swap (route
+  engine-backed families in `serving_chat` behind the existing `--tool-call-parser` seam —
+  legacy per-family parsers remain the live path); JSON-schema arg-type coercion
+  (`_fix_arg_types` with a tool schema — modeled identity, no schema carried); the other 6
+  engine configs (gemma4/deepseek_v4/v32/minimax_m2/nemotron_v3/glm47_moe/inkling);
+  live-engine metric wiring; chat-form `/tokenize`. NOT pushed; FULL SHA reported to caller.
+  Sibling `D4-APC W3` (prefix-cache/KV/§2, GPU) untouched.
