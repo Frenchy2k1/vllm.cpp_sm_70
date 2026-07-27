@@ -54,26 +54,37 @@ library / C ABI, as the CLI, and as the OpenAI server, with a runnable example
 each). Every argument, flag, and endpoint documented MUST be grounded in actual
 source, never invented.
 
-**Keep `README.md` CURRENT at EVERY feature/iteration checkpoint, but as a
-current-state SNAPSHOT, not a chronological log.** In the SAME change that shifts
-a feature's lifecycle state, update its ONE binding current-state line in the
-matching README section or table (typically the **Features** or **Supported
-models** table, which is where a new feature's status line goes) with the exact
-current stage: correctness-complete / speed-pending / build-only /
+**Keep [`docs/STATUS.md`](docs/STATUS.md) CURRENT at EVERY feature/iteration
+checkpoint. THAT is the per-capability status surface, NOT `README.md`.** In the
+SAME change that shifts a feature's lifecycle state, update its ONE binding
+current-state line in the matching `docs/STATUS.md` section or table (typically
+the **Capability status** table, which is where a new feature's status line goes)
+with the exact current stage: correctness-complete / speed-pending / build-only /
 hardware-blocked / `ACTIVE` / `GATING`, plus active gaps and the next gate. Do
 not wait for a feature to land or a gate to pass, and do not turn progress into a
-support claim. The README must never lag reality. It keeps ONE binding result
-and the current lifecycle state per feature; **the detailed status, forensic
-chronology, and evidence live in the append-only `.agents/state.md`,
+support claim. `docs/STATUS.md` must never lag reality. It keeps ONE binding
+result and the current lifecycle state per feature; **the detailed status,
+forensic chronology, and evidence live in the append-only `.agents/state.md`,
 `.agents/parity-ledger.md`, the area matrices, and `docs/BENCHMARKS.md`, NOT in
-README prose.** A README table cell must never grow into a wall of per-attempt
+STATUS prose.** A STATUS table cell must never grow into a wall of per-attempt
 prose; at each checkpoint collapse superseded narratives and stale intermediate
 numbers into a concise disposition and relocate the detail to the record (move
-it, never delete evidence). Do not preserve history in the README merely because
-an older paragraph already exists. `scripts/check-readme-structure.py` (CI-gated,
-with its mutation test `tests/scripts/test_check_readme_structure.py`) enforces
-that the required user-facing sections exist and that no table cell exceeds the
-prose-length threshold; do not weaken the checker to bypass the obligation.
+it, never delete evidence). Do not preserve history merely because an older
+paragraph already exists.
+
+**`README.md` changes ONLY when a USER-VISIBLE HEADLINE shifts**, never on a
+routine lifecycle transition. A headline shift is: a new supported architecture
+family (one compact row), a new backend or quantization format, a change to the
+headline performance numbers, or a change to the honest pre-release caveat. A
+capability moving `ACTIVE` -> `GATING` -> `DONE`, a new gate count, a new
+per-attempt number, or any forensic detail goes to `docs/STATUS.md` ALONE and
+MUST NOT be added to the README. If you are tempted to add a sentence of nuance
+to the README, that sentence belongs in `docs/STATUS.md` with a link.
+`scripts/check-readme-structure.py` (CI-gated, with its mutation test
+`tests/scripts/test_check_readme_structure.py`) enforces that the required
+user-facing sections exist, that `docs/STATUS.md` exists and carries the
+capability ledger, and that the README stays inside its length, paragraph, and
+table-cell budgets; do not weaken the checker to bypass the obligation.
 
 **Keep [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) CURRENT at the SAME
 checkpoint.** Every feature/iteration records its benchmark disposition there
