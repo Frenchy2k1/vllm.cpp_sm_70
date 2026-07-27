@@ -2555,6 +2555,43 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## OPEN LEAD: prefill attention never uses the matrix units (2026-07-27)
+
+**This overturns the "no identified lever remains" conclusion recorded below.**
+It was reached by dividing FLOPs by time for each prefill kernel rather than by
+any new measurement, which is exactly the check that should have been run first.
+
+Prefill attention is 30.1 GFLOP (28 layers, 512 queries, 256 average causal keys,
+16 heads, d=128). At 279 ms that is **108 GFLOP/s**. Our own GEMM, on the same
+device in the same forward pass, sustains ~2250 GFLOP/s. **Attention is 21x
+slower PER FLOP than our GEMM**, and the reason is structural: `vt_paged_attention`
+computes scores with `simd_sum` dot products and accumulates V with scalar FMAs.
+It never issues a single `simdgroup_multiply_accumulate`. The matrix units sit
+idle for the whole kernel.
+
+MLX's implied attention cost is ~20-68 ms, consistent with running QK^T and PV
+through the matrix units at roughly GEMM rate.
+
+| attention at | prefill attention | saved |
+|---|--:|--:|
+| 108 GFLOP/s (today) | 279 ms | - |
+| 1000 GFLOP/s | 30 ms | 249 ms |
+| 2000 GFLOP/s | 15 ms | 264 ms |
+
+At 2000 GFLOP/s prefill drops 0.905 -> 0.641 s and the warm total reaches
+**94.1%** of MLX-LM, from 89.4%, with no change to the GEMM. That is the single
+largest remaining item: ~250 ms against a 600 ms total gap, and larger than the
+GEMM's own 180 ms shortfall.
+
+The work is a flash-attention rewrite using `simdgroup_matrix`: stage K/V tiles
+from the paged blocks into threadgroup memory, compute S = Q@K^T with mma
+(loading K transposed), online-softmax in threadgroup memory, then O += P@V with
+mma, rescaling the register-resident O by a DIAGONAL correction matrix (MSL has
+no elementwise op on `simdgroup_matrix`, but `diag(corr) @ O` is a normal mma).
+The query tiling landed in f746d2f5 is the prerequisite and is already in place.
+
+---
+
 ## Last two levers closed: bf16+4x4 GEMM, and Tier-1 fusion (2026-07-27)
 
 **REJECTED - bf16 operand fragments WITH 4x4 blocks (MLX's actual config).**

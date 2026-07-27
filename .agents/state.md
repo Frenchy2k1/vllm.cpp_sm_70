@@ -26560,3 +26560,46 @@ Warm, thermally matched: decode 95.4%, total 89.4%. The 600 ms gap is 61% prefil
 GEMM and 39% decode dispatch overhead, and fixing either alone caps at 95.9% /
 93.6% — parity needs both. Everything short of two new kernel projects has now
 been measured and recorded, negatives included.
+
+---
+
+## 2026-07-27 — OPEN LEAD: prefill attention never uses the matrix units (I was wrong to close the list)
+
+**This overturns the "out of identified levers" conclusion in the entry above,
+and I found it by dividing FLOPs by time per kernel — the check that should have
+come first, before any of the GEMM parameter sweeps.**
+
+Prefill attention is 30.1 GFLOP (28 layers, 512 queries, 256 avg causal keys, 16
+heads, d=128). At 279 ms that is **108 GFLOP/s**, against our own GEMM's ~2250
+GFLOP/s on the same device in the same forward. **21x slower per FLOP.** The
+cause is structural: `vt_paged_attention` computes scores with `simd_sum` dot
+products and accumulates V with scalar FMAs — it never issues a single
+`simdgroup_multiply_accumulate`. The matrix units are idle for the entire kernel.
+
+MLX's implied attention cost is ~20-68 ms, i.e. QK^T and PV through the matrix
+units at roughly GEMM rate.
+
+| attention at | prefill attn | saved | warm total vs MLX |
+|---|--:|--:|--:|
+| 108 GFLOP/s (today) | 279 ms | - | 89.4% |
+| 1000 GFLOP/s | 30 ms | 249 ms | ~94% |
+| 2000 GFLOP/s | 15 ms | 264 ms | 94.1% |
+
+**This is the largest single remaining item** — ~250 ms of a 600 ms gap, bigger
+than the GEMM's own 180 ms shortfall — and unlike the GEMM it has an obvious
+mechanism rather than an exhausted exclusion list.
+
+**Design sketch (the work):** flash attention on `simdgroup_matrix`. Stage K/V
+tiles from the paged blocks into threadgroup memory; S = Q@K^T by mma with K
+loaded transposed; online softmax in threadgroup memory; O += P@V by mma with O
+register-resident across the key loop. The one subtlety: MSL has no elementwise
+operation on `simdgroup_matrix`, so the per-row online-softmax rescale of O is
+done as `diag(corr) @ O`, an ordinary mma against a diagonal matrix built in
+threadgroup memory. Suggested tiling: BQ=32 queries, BKC=16 keys, 8 simdgroups
+mapped as 4 row blocks x 2 column halves, giving each simdgroup one S tile and
+eight O tiles. The query tiling landed in f746d2f5 is the prerequisite.
+
+**Lesson worth keeping:** I ran seven structural experiments on the GEMM and
+declared the levers exhausted, without ever computing the achieved FLOP/s of the
+OTHER prefill kernel. A per-kernel roofline check is cheap and should gate any
+claim that a bottleneck list is complete.
