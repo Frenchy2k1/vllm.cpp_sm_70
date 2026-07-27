@@ -44,7 +44,7 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  REQUIRE(registrations.size() == 13);
+  REQUIRE(registrations.size() == 24);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -106,32 +106,64 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   CHECK(has_arch("GemmaForCausalLM"));
   // GLM-4.7-Flash (MLA + GLM MoE), likewise one TU + one REGISTER line.
   CHECK(has_arch("Glm4MoeLiteForCausalLM"));
+  // The additive-family sweep since: each below is likewise ONE new
+  // forward/loader/registry TU + one REGISTER_VLLM_MODEL line, ZERO shared-array
+  // edit — the cross-family dense/MoE seam absorbing the recent-model breadth pass.
+  CHECK(has_arch("CohereForCausalLM"));        // Cohere Command-R
+  CHECK(has_arch("GraniteForCausalLM"));       // IBM Granite-3
+  CHECK(has_arch("InternLM2ForCausalLM"));     // InternLM2
+  CHECK(has_arch("InternLM3ForCausalLM"));     // InternLM3 (reuses the Llama TU)
+  CHECK(has_arch("MiniCPMForCausalLM"));       // MiniCPM
+  CHECK(has_arch("MiniCPM3ForCausalLM"));      // MiniCPM3 (MLA)
+  CHECK(has_arch("Olmo2ForCausalLM"));         // OLMo-2
+  CHECK(has_arch("Olmo3ForCausalLM"));         // OLMo-3 (reuses the OLMo-2 TU)
+  CHECK(has_arch("PhiForCausalLM"));           // Phi-1/1.5/2
+  CHECK(has_arch("Phi3ForCausalLM"));          // Phi-3
+  CHECK(has_arch("StableLmForCausalLM"));      // StableLM
 
   // Registration arrival order across TUs is unspecified under C++ static init,
-  // so the registry imposes a stable canonical sort by architecture name. This
-  // makes SupportedArchs()/error-message order deterministic. Byte order puts
-  // "Qwen3ForCausalLM" first ('F' (0x46) < 'M' (0x4D) < '_' (0x5F) after the
-  // "Qwen3" prefix), then the full-attention MoE "Qwen3MoeForCausalLM", then the
-  // two hybrid Qwen3.5 wrappers; resolution is order-independent.
+  // so the registry imposes a stable canonical sort by architecture name (byte
+  // order — std::string operator<). This makes SupportedArchs()/error-message
+  // order deterministic. Kept alias-for-alias with the enumerated set below and
+  // with the kExampleConfigArchitectures ledger; adding a model appends its two
+  // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 13);
+  REQUIRE(supported.size() == 24);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
-  // 'D' sorts first; among the Gemmas "Gemma2" < "Gemma3" < "GemmaF" ('2' 0x32 <
-  // '3' 0x33 < 'F' 0x46), and all "Gemma*" < "Glm*" ('e' 0x65 < 'l' 0x6C); "Glm4F"
-  // < "Glm4M" puts Glm4ForCausalLM before Glm4MoeLiteForCausalLM; then 'L'lama <
-  // 'M'istral < 'O'PT < 'Q'wen.
-  CHECK(supported.front() == "DeepseekV2ForCausalLM");
-  CHECK(supported[1] == "Gemma2ForCausalLM");
-  CHECK(supported[2] == "Gemma3ForCausalLM");
-  CHECK(supported[3] == "GemmaForCausalLM");
-  CHECK(supported[4] == "Glm4ForCausalLM");
-  CHECK(supported[5] == "Glm4MoeLiteForCausalLM");
-  CHECK(supported[6] == "LlamaForCausalLM");
-  CHECK(supported[7] == "MistralForCausalLM");
-  CHECK(supported[8] == "OPTForCausalLM");
-  CHECK(supported[9] == "Qwen3ForCausalLM");
-  CHECK(supported[10] == "Qwen3MoeForCausalLM");
-  CHECK(supported.back() == "Qwen3_5MoeForConditionalGeneration");
+  // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
+  // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
+  // the Qwens "Qwen3F" < "Qwen3M" < "Qwen3_" ('F' < 'M' < '_' 0x5F).
+  const std::vector<std::string_view> kSortedArchs{
+      "CohereForCausalLM",
+      "DeepseekV2ForCausalLM",
+      "Gemma2ForCausalLM",
+      "Gemma3ForCausalLM",
+      "GemmaForCausalLM",
+      "Glm4ForCausalLM",
+      "Glm4MoeLiteForCausalLM",
+      "GraniteForCausalLM",
+      "InternLM2ForCausalLM",
+      "InternLM3ForCausalLM",
+      "LlamaForCausalLM",
+      "MiniCPM3ForCausalLM",
+      "MiniCPMForCausalLM",
+      "MistralForCausalLM",
+      "OPTForCausalLM",
+      "Olmo2ForCausalLM",
+      "Olmo3ForCausalLM",
+      "Phi3ForCausalLM",
+      "PhiForCausalLM",
+      "Qwen3ForCausalLM",
+      "Qwen3MoeForCausalLM",
+      "Qwen3_5ForConditionalGeneration",
+      "Qwen3_5MoeForConditionalGeneration",
+      "StableLmForCausalLM",
+  };
+  REQUIRE(supported.size() == kSortedArchs.size());
+  for (size_t i = 0; i < supported.size(); ++i) {
+    CAPTURE(i);
+    CHECK(supported[i] == kSortedArchs[i]);
+  }
 
   // The dense/MoE scheduler policy split survives the per-variant TU move.
   std::unique_ptr<vllm::LoadedModel> dense =
@@ -146,26 +178,19 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
     CHECK_FALSE(registration.info.is_pooling_model);
     CHECK_FALSE(registration.info.has_inner_state);
     CHECK(registration.info.score_type == "bi-encoder");
-    if (registration.architecture == "Qwen3ForCausalLM" ||
-        registration.architecture == "Qwen3MoeForCausalLM" ||
-        registration.architecture == "DeepseekV2ForCausalLM" ||
-        registration.architecture == "LlamaForCausalLM" ||
-        registration.architecture == "MistralForCausalLM" ||
-        registration.architecture == "Glm4ForCausalLM" ||
-        registration.architecture == "Glm4MoeLiteForCausalLM" ||
-        registration.architecture == "Gemma3ForCausalLM" ||
-        registration.architecture == "Gemma2ForCausalLM" ||
-        registration.architecture == "GemmaForCausalLM" ||
-        registration.architecture == "OPTForCausalLM") {
-      // Pure text-only full-attention arch (dense OR MoE): NOT hybrid (no GDN),
-      // NOT multimodal (no vision tower).
-      CHECK_FALSE(registration.info.is_hybrid);
-      CHECK_FALSE(registration.info.supports_multimodal);
-    } else {
+    if (registration.architecture == "Qwen3_5ForConditionalGeneration" ||
+        registration.architecture == "Qwen3_5MoeForConditionalGeneration") {
       // The outer Qwen3.5 multimodal wrappers inherit IsHybrid but not
       // HasInnerState; their inner language-model classes carry HasInnerState.
+      // These two ConditionalGeneration wrappers are the ONLY hybrid+multimodal
+      // registrations; every other registered arch is a pure text-only model.
       CHECK(registration.info.is_hybrid);
       CHECK(registration.info.supports_multimodal);
+    } else {
+      // Pure text-only full-attention/MLA arch (dense OR MoE): NOT hybrid (no
+      // GDN linear-attention state), NOT multimodal (no vision/audio tower).
+      CHECK_FALSE(registration.info.is_hybrid);
+      CHECK_FALSE(registration.info.supports_multimodal);
     }
   }
 }
@@ -474,20 +499,31 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 13> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 24> kExampleConfigArchitectures{
+      "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "Gemma2ForCausalLM",
       "Gemma3ForCausalLM",
       "GemmaForCausalLM",
       "Glm4ForCausalLM",
       "Glm4MoeLiteForCausalLM",
+      "GraniteForCausalLM",
+      "InternLM2ForCausalLM",
+      "InternLM3ForCausalLM",
       "LlamaForCausalLM",
+      "MiniCPM3ForCausalLM",
+      "MiniCPMForCausalLM",
       "MistralForCausalLM",
       "OPTForCausalLM",
+      "Olmo2ForCausalLM",
+      "Olmo3ForCausalLM",
+      "Phi3ForCausalLM",
+      "PhiForCausalLM",
       "Qwen3ForCausalLM",
       "Qwen3MoeForCausalLM",
       "Qwen3_5ForConditionalGeneration",
       "Qwen3_5MoeForConditionalGeneration",
+      "StableLmForCausalLM",
   };
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
   REQUIRE(supported.size() == kExampleConfigArchitectures.size());
@@ -558,14 +594,15 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(unknown),
       "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['DeepseekV2ForCausalLM', 'Gemma2ForCausalLM', "
-      "'Gemma3ForCausalLM', 'GemmaForCausalLM', 'Glm4ForCausalLM', "
-      "'Glm4MoeLiteForCausalLM', 'LlamaForCausalLM', "
-      "'MistralForCausalLM', 'OPTForCausalLM', "
-      "'Qwen3ForCausalLM', "
-      "'Qwen3MoeForCausalLM', "
-      "'Qwen3_5ForConditionalGeneration', "
-      "'Qwen3_5MoeForConditionalGeneration'])",
+      "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
+      "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', 'GemmaForCausalLM', "
+      "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
+      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', 'LlamaForCausalLM', "
+      "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
+      "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
+      "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
+      "'Qwen3MoeForCausalLM', 'Qwen3_5ForConditionalGeneration', "
+      "'Qwen3_5MoeForConditionalGeneration', 'StableLmForCausalLM'])",
       std::runtime_error);
 
   const HfConfig multiple = Config({"UnknownA", "UnknownB"});
@@ -573,14 +610,15 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(multiple),
       "Model architectures ['UnknownA', 'UnknownB'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['DeepseekV2ForCausalLM', 'Gemma2ForCausalLM', "
-      "'Gemma3ForCausalLM', 'GemmaForCausalLM', 'Glm4ForCausalLM', "
-      "'Glm4MoeLiteForCausalLM', 'LlamaForCausalLM', "
-      "'MistralForCausalLM', 'OPTForCausalLM', "
-      "'Qwen3ForCausalLM', "
-      "'Qwen3MoeForCausalLM', "
-      "'Qwen3_5ForConditionalGeneration', "
-      "'Qwen3_5MoeForConditionalGeneration'])",
+      "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
+      "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', 'GemmaForCausalLM', "
+      "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
+      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', 'LlamaForCausalLM', "
+      "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
+      "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
+      "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
+      "'Qwen3MoeForCausalLM', 'Qwen3_5ForConditionalGeneration', "
+      "'Qwen3_5MoeForConditionalGeneration', 'StableLmForCausalLM'])",
       std::runtime_error);
 }
 

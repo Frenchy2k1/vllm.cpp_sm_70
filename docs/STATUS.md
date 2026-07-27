@@ -426,3 +426,11 @@ The protocol is in [`.agents/gates.md`](../.agents/gates.md) and
 (`scripts/check-fusion-consistency.py`) additionally keeps model forwards routing
 their fusable add+RMSNorm glue through the portable fusion catalog rather than
 hand-fusing it.
+
+The CPU CTest suite is green (0 real regressions). A 2026-07-27 hygiene pass
+triaged the previously-red tests as stale assertions or `-j` contention, not
+regressions: the model-registry count assertion tracks the 24 registered
+architectures, the GGUF loader rejection case uses a genuinely-unregistered arch,
+the DFlash proposer test supplies the now-required `"model"` key, and the two
+HTTP-server tests run under CTest `RUN_SERIAL` so a CPU-hog concurrent test can no
+longer starve their accept thread.
