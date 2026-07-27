@@ -45,9 +45,37 @@ separate jobs. Design points, all from the guide:
   green run containing a real report.
 - The lane keeps `-ffp-contract=off`, so a bit-identity assertion still means in
   the lane what it means in production.
+- `-Werror` is dropped IN THIS LANE ONLY, in `cmake/CompilerWarnings.cmake`
+  where the per-target warning flags are set (a global `-Wno-error` is overridden
+  by those PRIVATE target options and does nothing). Sanitizer instrumentation
+  changes inlining enough that GCC's range and initialization analyses fire
+  inside LIBSTDC++ on correct code: a one-element
+  `std::vector<int32_t> v = {x}` in `voxtral.cpp` draws "forming offset 4 is out
+  of the bounds [0, 4]" for a 4-byte read of a 4-byte array, and `<regex>` draws
+  26 `-Wmaybe-uninitialized` reports from `std::function` internals. None is
+  project code, and the plain build — the one that DOES enforce `-Werror` — stays
+  clean. Letting a false positive in a system header stop the runtime detectors
+  would defeat the point.
 - Landed `continue-on-error: true` because the lanes have never run: their FIRST
   run is a survey, and a pre-existing finding must not block unrelated work. The
   closing step of this row is triaging that first run and REMOVING the flag.
+
+**The lane paid for itself before it was even committed.** Its first real build
+failed on `-Werror=unused-function`: `AsyncDeviceMirrorEnvDefault()`, added by the
+W4 work in the same session, is referenced only inside `#ifdef VLLM_CPP_CUDA` and
+is therefore dead on a CPU build. That would have broken the EXISTING
+`build-test-cpu` CI job too — the sanitizer lane just happened to compile the
+CPU configuration first. Fixed by guarding the definition with the same `#ifdef`
+as its use. This is precisely the guide's §8 point: a single default build never
+compiles the other `cfg` branches.
+
+**Verified end to end**, not merely configured: `address,undefined` and `thread`
+both configure; the two guards fire (a lane value outside the allowlist, and a
+lane with the CUDA backend on, are both `FATAL_ERROR`); the ASan+UBSan lane
+builds `test_input_batch`, `test_combine_tokens` and `test_arena` clean and all
+three PASS under `ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1`
+(25/25 + 183 asserts, 7/7 + 14, 4/4 + 18), which includes the new W4 op-log
+cases. The plain CPU build was re-verified clean and green in the same pass.
 
 ### 2. Allocator-blind-spot bypass (§4)
 

@@ -551,7 +551,11 @@ InternLM2 plus a sliding window).
 
 Alongside the default build, `-DVLLM_CPP_SANITIZE=address,undefined` and
 `-DVLLM_CPP_SANITIZE=thread` build the CPU tier under the dynamic detectors, and
-CI runs both as separate jobs. The lane refuses to configure with the CUDA
+CI runs both as separate jobs. Verified end to end: the ASan+UBSan lane builds
+and passes `test_input_batch`, `test_combine_tokens` and `test_arena` with leak
+detection on. The lanes keep the warnings but drop `-Werror`, because sanitizer
+instrumentation makes GCC's range and initialization analyses fire inside
+libstdc++ on correct code; the plain build is the one that enforces `-Werror`. The lane refuses to configure with the CUDA
 backend on, because a host sanitizer runtime does not instrument nvcc device
 translation units and reports false positives against the CUDA driver; the CUDA
 tier's equivalent is `compute-sanitizer`, and `VT_POOL_BYPASS=1` makes the device
