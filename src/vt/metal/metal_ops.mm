@@ -309,6 +309,11 @@ struct Batch {
   id<MTLCommandBuffer> cmd = nil;
   id<MTLComputeCommandEncoder> enc = nil;
   unsigned long long pending = 0;
+  // Name of the last dispatch encoded. Only meaningful when a commit carries
+  // exactly ONE dispatch (VT_METAL_SYNC_DISPATCH), which is the mode used to
+  // recover a PER-KERNEL GPU breakdown: batching deliberately makes wait/GPU a
+  // property of the commit, so the per-kernel view has to come from somewhere.
+  const char* last_kernel = "";
   const bool sync_mode = [] {
     const char* e = std::getenv("VT_METAL_SYNC_DISPATCH");
     return e != nullptr && e[0] == '1';
@@ -334,9 +339,21 @@ void FlushLocked(Batch& b) {
     const double gpu = [b.cmd GPUEndTime] - [b.cmd GPUStartTime];
     vtprof::Table& tbl = vtprof::Get();
     tbl.commits.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(tbl.mu);
-    tbl.commit_wait_s += t_done - t_commit;
-    tbl.commit_gpu_s += gpu > 0.0 ? gpu : 0.0;
+    const double gpu_pos = gpu > 0.0 ? gpu : 0.0;
+    {
+      std::lock_guard<std::mutex> lock(tbl.mu);
+      tbl.commit_wait_s += t_done - t_commit;
+      tbl.commit_gpu_s += gpu_pos;
+      // One dispatch in this commit => the whole GPU interval belongs to it.
+      // With many dispatches batched there is no honest way to split it, so the
+      // per-kernel columns stay 0 rather than being invented.
+      if (b.pending == 1 && b.last_kernel[0] != '\0') {
+        vtprof::Row& r = tbl.rows[b.last_kernel];
+        if (r.name.empty()) r.name = b.last_kernel;
+        r.wait_s += t_done - t_commit;
+        r.gpu_s += gpu_pos;
+      }
+    }
   }
   // Capture the error BEFORE releasing, and clear the batch BEFORE throwing:
   // an exception must not leave a committed buffer installed as "pending".
@@ -479,6 +496,7 @@ class Encoder {
     finished_ = true;
     Batch& b = TheBatch();
     ++b.pending;
+    b.last_kernel = prof_name_;
     if (prof_) {
       // Only encode time is per-dispatch now; wait and GPU time belong to the
       // batch and are accumulated in FlushLocked.

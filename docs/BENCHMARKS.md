@@ -2555,6 +2555,45 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal GPU-time attribution after `M3c-1`+`M3d` (2026-07-27) - PREFILL is the outlier
+
+**Re-profiled because the two landed levers moved the bottleneck, and the answer
+reorders the remaining work.** Native arm, Qwen3-1.7B-bf16 p=512 g=128 b=1,
+`VT_METAL_SYNC_DISPATCH=1` for per-kernel GPU attribution, under the GPU lock.
+Total GPU busy 11.47 s.
+
+| kernel | dispatches | GPU ms | share |
+|---|--:|--:|--:|
+| `vt_matmul_bt_gemv` (decode) | 21,464 | 5,788 | **50.5%** |
+| `vt_matmul_bt` tile GEMM (**prefill**) | **168** | 3,863 | **33.7%** |
+| `vt_paged_attention` | 3,584 | 1,627 | 14.2% |
+| all 6 other kernels | 25,216 | 188 | 1.6% |
+
+**Prefill is a third of GPU time from 168 dispatches**, and the gap to MLX-LM is
+not where it was assumed to be:
+
+| phase | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill | 3.86 s | ~0.47 s | **~8.2x** |
+| decode (GEMV + attention) | ~7.4 s | ~4.59 s | ~1.6x |
+
+Decode is already close. **Prefill is the outlier and still runs the 16x16 tile
+GEMM.** The remaining levers, with the arithmetic that ranks them: a 2-D blocked
+simdgroup-matrix GEMM for m>1 (3.86 s -> ~0.6 s), then a vectorised
+dtype-specialised GEMV for decode (5.79 s -> ~3.5 s). Together those put the run
+near 6.3 s (~20 tok/s); parity with MLX-LM's 27.9 tok/s needs ~5.1 s, so paged
+attention likely decides the last stretch.
+
+**Also settled here:** the MLX provider is NOT slower than the native path on
+current main. Both arms measure 12.0-12.2 s at b=1, and our GEMV still serves
+7,112 dispatches even with MLX enabled (MLX takes 14,352). An earlier suspicion
+that MLX-on had become the slower default is REFUTED.
+
+**Status: INDICATIVE** (worker daemon and wallpaper up), CI runners paused for
+this measurement.
+
+---
+
 ## Metal small-m batched-decode GEMM on Apple M4 (2026-07-27) - FAILED, REVERTED
 
 **A negative result, recorded because it cost a day's reasoning and the next

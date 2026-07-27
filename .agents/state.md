@@ -25687,3 +25687,37 @@ NOT pushed; FULL SHA reported to caller.
     `.agents/specs/{prometheus-metrics,utility-endpoints}.md` same date. Sibling
     `D4-APC` (prefix-cache/KV) untouched — `/reset_prefix_cache` uses an injected
     callback only.
+
+---
+
+## 2026-07-27 — GOAL SET: MLX-LM speed parity on Metal. Re-attributed; PREFILL is the outlier
+
+**Goal (user-directed):** reach MLX-LM parity at b=1 on Qwen3-1.7B-bf16, i.e.
+10.5 -> 27.9 tok/s, a 2.66x gap.
+
+**Re-profiled because `M3c-1` and `M3d` moved the bottleneck.** `VT_METAL_PROFILE`
+lost its per-kernel GPU column when `M3c-1` made wait/GPU a property of the
+COMMIT rather than the dispatch; restored here for `VT_METAL_SYNC_DISPATCH` runs,
+where a commit carries exactly one dispatch and can be attributed exactly. With
+many dispatches batched the per-kernel columns stay 0 rather than being invented.
+
+**Attribution (native, b=1, total GPU busy 11.47 s):** decode GEMV **5,788 ms
+(50.5%)**, prefill tile GEMM **3,863 ms (33.7%) from only 168 dispatches**, paged
+attention 1,627 ms (14.2%), all six other kernels 188 ms (1.6%).
+
+**The gap is not where it was assumed.** Prefill: ours 3.86 s vs MLX-LM ~0.47 s,
+**~8.2x**. Decode: ours ~7.4 s vs ~4.59 s, ~1.6x. **Decode is already close;
+prefill is the outlier** and still runs the 16x16 tile GEMM.
+
+**Ranked plan, with the arithmetic:** (1) 2-D blocked simdgroup-matrix GEMM for
+m>1, 3.86 s -> ~0.6 s; this is also what the small-m dead-end concluded is needed,
+and it serves prefill AND batched decode with one kernel. (2) vectorised,
+dtype-specialised GEMV for decode, 5.79 s -> ~3.5 s (the current kernel does a
+per-element dtype switch and scalar loads, which cannot saturate bandwidth).
+Together ~6.3 s (~20 tok/s); parity needs ~5.1 s, so paged attention likely
+decides the last stretch.
+
+**Refuted in passing:** the suspicion that the MLX provider had become the SLOWER
+default. Both arms measure 12.0-12.2 s at b=1 on current main, and our GEMV still
+serves 7,112 dispatches with MLX enabled (MLX takes 14,352). LocalAI PR #11137's
+MLX-on default is fine.
