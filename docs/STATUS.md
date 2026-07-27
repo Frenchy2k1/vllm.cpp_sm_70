@@ -279,7 +279,10 @@ the composite); the default bf16 path is now routed through it
 to about 96.0-96.4% of MLX-LM, with decode at 98.0%. The largest remaining lead
 is prefill attention, which at 547 GFLOP/s is still 5.2x slower per FLOP than
 this device's own GEMM; its online softmax now runs one simdgroup per query
-row rather than one thread, worth -16% on the kernel and +0.19% end to end. The V-accumulation win came from BISECTING the attention
+row rather than one thread, worth -16% on the kernel and +0.19% end to end. Its
+remaining 4.4x FLOP-rate gap to this device's own GEMM has no open structural
+idea left: BK deepening is blocked by a bf16-P precision constraint and eliding
+the identity softmax rescale measured no gain. The V-accumulation win came from BISECTING the attention
 kernel once a paired ABBA harness with cooldown made 0.2% differences
 measurable: the V loop moved 2 bytes per lane per load where the score loop
 moved 8, giving 29 GB/s against 64 on identical traffic. That also explains why

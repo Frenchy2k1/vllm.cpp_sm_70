@@ -27826,3 +27826,31 @@ Attention is now 646 GFLOP/s against the GEMM's 2851: **4.4x, down from 5.2x**.
 The residual ratio is still unexplained, and the remaining structural difference
 is the BK=16 amortisation blocked by the bf16-P precision constraint recorded
 above.
+
+---
+
+## 2026-07-27 — REJECTED: eliding the identity softmax rescale
+
+Per 16-key chunk each simdgroup issues 40 mma: 16 QK + **8 diagonal rescale** +
+16 PV. `corr` is exactly 1.0 when the running max does not move, and
+`diag(1) @ O` is bit-identical to O, so skipping the rescale in that case should
+have removed 20% of the inner loop's mma for free.
+
+Measured: prefill attention **46.6 -> 47.5 ms** — no gain, marginally worse.
+Reverted.
+
+**The exactness prediction held even though the perf one did not:** 16/16 PASS
+with NO re-anchor, exactly as argued from `diag(1) @ O`. The three preceding
+kernel changes all moved a near-tie and needed the oracle. So: predicting which
+changes perturb numerics is now reliable, predicting which ones pay is not — a
+useful asymmetry to carry forward.
+
+Cause: in CAUSAL prefill each query's window grows as key blocks arrive, so the
+running max keeps moving and corr is seldom exactly 1.0. The eight scalar sdiag
+reads plus the branch then cost more than the eight mma they guard. The idea
+would fare better on non-causal or short-context shapes; not this workload.
+
+**Standing: ~96.4%, five kernels landed this session (89.4% -> 96.4%).** The
+attention:GEMM FLOP-rate ratio is 4.4x and the two structural ideas for it are
+now both closed — BK deepening by the bf16-P precision constraint, rescale
+elision by measurement.
