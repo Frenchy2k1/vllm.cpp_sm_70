@@ -70,6 +70,21 @@ both documents was MOVED verbatim, not restated or re-derived. Reproduce:
 tests/scripts/test_check_readme_structure.py` (18/18) and `python3
 scripts/check-doc-checkpoint.py --base <base> --head <head>`.
 
+**CUDA arch breadth beyond vLLM — Pascal/Volta/Turing fp16 lane, SCOPING ONLY
+(2026-07-27, `CLAIM-CUDA-BREADTH-SCOPE`,
+[spike](../.agents/specs/cuda-arch-breadth-fp16.md), NOT pushed).** Disposition:
+**NOT APPLICABLE (scoping spike; no build, no run, no measurement taken, claimed,
+or owed; `benchmark_binding=false`).** A read-only inventory of llama.cpp's
+(`237ad9b96`) fp16/non-tensor-core `ggml-cuda` kernels and a derive-and-ship plan
+for the pre-Ampere NVIDIA arches vLLM drops but llama.cpp supports. No production
+code, kernel, or build is touched. When this lane executes, the perf floor is
+**llama.cpp on the same old card** (T4/V100/P40/P100), pinned per run, ours ≥
+llama.cpp on every axis; there is no vLLM arm because vLLM does not run on these
+cards. Nothing is measurable here (no legacy card, and no CUDA `<13` toolkit for
+Volta/Pascal). Turing `sm_75` is the derive-and-ship-now target (buildable on
+CUDA 13); its first binding number is a build+SASS proof, not a throughput
+figure.
+
 **ROAD-V1-C8 /metrics + utility endpoints (2026-07-27, `CLAIM-ROADMAP-C8`, NOT
 pushed).** Disposition: **NOT APPLICABLE (no throughput number, `benchmark_binding=false`).**
 `SERVE-METRICS` (Prometheus `/metrics`) and `SERVE-UTILITY-ENDPOINTS`
