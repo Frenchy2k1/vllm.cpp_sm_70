@@ -1267,6 +1267,12 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   const SamplingMetadata sm = input_batch_.make_sampling_metadata();
   const SamplerOutput sampler_output = sampler_.forward(queue_, logits, sm);
 
+  // ModelRunnerOutput.logprobs (gpu_model_runner.py:3842-3851 / outputs.py):
+  // the sampler's batch-wide gather_logprobs result (one row per num_logits
+  // position, req order). None unless a request asked for logprobs; the
+  // scheduler slices it per request (slice_request). ROAD-V1-C7 SAMPLE-LOGPROBS.
+  out.logprobs = sampler_output.logprobs_tensors;
+
   // Build the ModelRunnerOutput + WRITE the sampled tokens BACK into the
   // InputBatch (upstream postprocess_sampled / post_update) so the next step's
   // prepare_inputs reads them at the decode position.

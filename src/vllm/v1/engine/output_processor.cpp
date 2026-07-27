@@ -4,6 +4,7 @@
 #include "vllm/v1/engine/output_processor.h"
 
 #include <algorithm>
+#include <iterator>
 #include <stdexcept>
 #include <utility>
 
@@ -96,8 +97,13 @@ void RequestOutputCollector::Merge(RequestOutput next) {
     it->token_ids.insert(it->token_ids.end(), next_completion.token_ids.begin(),
                          next_completion.token_ids.end());
     it->cumulative_logprob = next_completion.cumulative_logprob;
-    if (next_completion.logprobs.has_value()) {
-      it->logprobs = next_completion.logprobs;
+    // outputs.py:168-170: extend (concatenate) the DELTA logprobs, don't replace.
+    if (next_completion.logprobs.has_value() && !next_completion.logprobs->empty()) {
+      if (!it->logprobs.has_value()) it->logprobs = SampleLogprobs{};
+      it->logprobs->insert(
+          it->logprobs->end(),
+          std::make_move_iterator(next_completion.logprobs->begin()),
+          std::make_move_iterator(next_completion.logprobs->end()));
     }
     it->finish_reason = std::move(next_completion.finish_reason);
     it->stop_reason = std::move(next_completion.stop_reason);
@@ -144,6 +150,14 @@ RequestState RequestState::FromNewRequest(const tok::Tokenizer* tokenizer,
   state.prompt_len = request.prompt_token_ids.size();
   state.detokenizer =
       IncrementalDetokenizer::FromNewRequest(detok_tokenizer, std::move(dreq));
+  // LogprobsProcessor (output_processor.py:225-228): engaged only when the
+  // request asked for sample and/or prompt logprobs, so the default generate
+  // path leaves it nullopt (inert — SACRED greedy path unchanged). Uses the
+  // same detokenize-gated tokenizer as the detokenizer (:222-223).
+  if (sp.logprobs.has_value() || sp.prompt_logprobs.has_value()) {
+    state.logprobs_processor =
+        LogprobsProcessor::FromNewRequest(detok_tokenizer, sp);
+  }
   state.max_tokens_param = sp.max_tokens;
   state.stream_interval = stream_interval;
   return state;
@@ -205,6 +219,15 @@ RequestOutput RequestState::NewRequestOutput(
   ro.prompt_token_ids = prompt_token_ids;
   ro.outputs = std::move(outputs);
   ro.finished = finished;
+  // prompt_logprobs (output_processor.py:363-375): DELTA pops (emit-once), else
+  // read the accumulated value. nullopt unless prompt_logprobs was requested.
+  if (logprobs_processor.has_value()) {
+    if (output_kind == RequestOutputKind::kDelta) {
+      ro.prompt_logprobs = logprobs_processor->pop_prompt_logprobs();
+    } else {
+      ro.prompt_logprobs = logprobs_processor->prompt_logprobs();
+    }
+  }
   return ro;
 }
 
@@ -225,6 +248,22 @@ CompletionOutput RequestState::NewCompletionOutput(
   co.index = request_index;
   co.text = text;
   co.token_ids = std::move(token_ids);
+  // logprobs / cumulative_logprob (output_processor.py:401-417). In DELTA mode
+  // emit only this step's tail (logprobs[-len(token_ids):]); else the full
+  // accumulation. nullopt unless sample logprobs were requested.
+  if (logprobs_processor.has_value()) {
+    co.cumulative_logprob = logprobs_processor->cumulative_logprob();
+    const std::optional<SampleLogprobs>& all = logprobs_processor->logprobs();
+    if (all.has_value()) {
+      if (delta && !all->empty()) {
+        const std::size_t take = std::min(co.token_ids.size(), all->size());
+        co.logprobs = SampleLogprobs(all->end() - static_cast<std::ptrdiff_t>(take),
+                                     all->end());
+      } else {
+        co.logprobs = *all;
+      }
+    }
+  }
   // :409-410 finish_reason/stop_reason only reported once finished.
   if (finished) {
     co.SetFinishReason(*finish_reason);  // str(finish_reason)
@@ -306,7 +345,11 @@ OutputProcessorOutput OutputProcessor::process_outputs(
       stop_reason = *stop_string;
     }
 
-    // 3) Logprobs — deferred.
+    // 3) Compute sample and prompt logprobs for the request (:660-662). Inert
+    //    (nullopt) unless the request asked for logprobs.
+    if (req_state.logprobs_processor.has_value()) {
+      req_state.logprobs_processor->update_from_output(eco);
+    }
 
     // 4) Create and handle the RequestOutput (:650-666).
     std::optional<RequestOutput> request_output = req_state.make_request_output(

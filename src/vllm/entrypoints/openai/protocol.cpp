@@ -488,10 +488,60 @@ void to_json(nlohmann::json& j, const ErrorResponse& e) {
   j = nlohmann::json{{"error", e.error}};
 }
 
+// completion/protocol.py:580 (CompletionLogProbs). token_logprobs / top_logprobs
+// carry explicit nulls at positions without logprobs (list[float|None] /
+// list[dict|None]); text_offset + tokens are plain arrays.
+void to_json(nlohmann::json& j, const CompletionLogProbs& lp) {
+  j = nlohmann::json::object();
+  j["text_offset"] = lp.text_offset;
+  j["tokens"] = lp.tokens;
+  nlohmann::json tl = nlohmann::json::array();
+  for (const auto& v : lp.token_logprobs) {
+    tl.push_back(v.has_value() ? nlohmann::json(*v) : nlohmann::json(nullptr));
+  }
+  j["token_logprobs"] = std::move(tl);
+  nlohmann::json top = nlohmann::json::array();
+  for (const auto& m : lp.top_logprobs) {
+    if (!m.has_value()) {
+      top.push_back(nullptr);
+      continue;
+    }
+    nlohmann::json obj = nlohmann::json::object();
+    for (const auto& [tok, val] : *m) obj[tok] = val;
+    top.push_back(std::move(obj));
+  }
+  j["top_logprobs"] = std::move(top);
+}
+
+// chat_completion/protocol.py:75 (ChatCompletionLogProb). bytes is null only
+// when the token has no decoded form.
+void to_json(nlohmann::json& j, const ChatCompletionLogProb& lp) {
+  j = nlohmann::json{{"token", lp.token}, {"logprob", lp.logprob}};
+  j["bytes"] =
+      lp.bytes.has_value() ? nlohmann::json(*lp.bytes) : nlohmann::json(nullptr);
+}
+
+// chat_completion/protocol.py:81 (ChatCompletionLogProbsContent).
+void to_json(nlohmann::json& j, const ChatCompletionLogProbsContent& lp) {
+  j = nlohmann::json{{"token", lp.token}, {"logprob", lp.logprob}};
+  j["bytes"] =
+      lp.bytes.has_value() ? nlohmann::json(*lp.bytes) : nlohmann::json(nullptr);
+  j["top_logprobs"] = lp.top_logprobs;
+}
+
+// chat_completion/protocol.py:88 (ChatCompletionLogProbs).
+void to_json(nlohmann::json& j, const ChatCompletionLogProbs& lp) {
+  j = nlohmann::json::object();
+  j["content"] = lp.content.has_value() ? nlohmann::json(*lp.content)
+                                        : nlohmann::json(nullptr);
+}
+
 void to_json(nlohmann::json& j, const CompletionResponseChoice& c) {
   j = nlohmann::json{
       {"index", c.index},
       {"text", c.text},
+      {"logprobs",
+       c.logprobs.has_value() ? nlohmann::json(*c.logprobs) : nlohmann::json(nullptr)},
       {"finish_reason", OrNull(c.finish_reason)},
   };
 }
@@ -511,6 +561,8 @@ void to_json(nlohmann::json& j, const CompletionResponseStreamChoice& c) {
   j = nlohmann::json{
       {"index", c.index},
       {"text", c.text},
+      {"logprobs",
+       c.logprobs.has_value() ? nlohmann::json(*c.logprobs) : nlohmann::json(nullptr)},
       {"finish_reason", OrNull(c.finish_reason)},
   };
 }
@@ -591,6 +643,8 @@ void to_json(nlohmann::json& j, const ChatCompletionResponseChoice& c) {
   j = nlohmann::json{
       {"index", c.index},
       {"message", c.message},
+      {"logprobs",
+       c.logprobs.has_value() ? nlohmann::json(*c.logprobs) : nlohmann::json(nullptr)},
       {"finish_reason", OrNull(c.finish_reason)},
   };
 }
@@ -610,6 +664,8 @@ void to_json(nlohmann::json& j, const ChatCompletionResponseStreamChoice& c) {
   j = nlohmann::json{
       {"index", c.index},
       {"delta", c.delta},
+      {"logprobs",
+       c.logprobs.has_value() ? nlohmann::json(*c.logprobs) : nlohmann::json(nullptr)},
       {"finish_reason", OrNull(c.finish_reason)},
   };
 }

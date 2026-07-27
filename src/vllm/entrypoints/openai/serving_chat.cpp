@@ -638,6 +638,13 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
         kAssistantRole, output.text, output.finish_reason, request, parser.get(),
         reasoning_parser.get());
     choice.message = std::move(shaped.message);
+    // logprobs (chat_completion/serving.py:875-887): when request.logprobs is
+    // set, attach the ChatCompletionLogProbs payload built from the generated
+    // tokens' SampleLogprobs (top_logprobs count == request.top_logprobs).
+    if (request.logprobs && output.logprobs.has_value()) {
+      choice.logprobs = BuildChatLogprobs(output.token_ids, *output.logprobs,
+                                          request.top_logprobs);
+    }
     choice.finish_reason = std::move(shaped.finish_reason);
     response.choices.push_back(std::move(choice));
     num_generated_tokens += static_cast<int>(output.token_ids.size());

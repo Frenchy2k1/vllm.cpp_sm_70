@@ -275,6 +275,13 @@ CompletionResult OpenAIServingCompletion::create_completion(
     CompletionResponseChoice choice;
     choice.index = static_cast<int>(response.choices.size());
     choice.text = SanitizeUtf8(output.text);  // echo deferred; see serving_utils.h
+    // logprobs (completion/serving.py:559-567): build the payload when the
+    // request asked for logprobs and the engine produced them. echo (prepending
+    // prompt tokens/prompt_logprobs) stays deferred — see SAMPLE-PROMPT-LOGPROBS.
+    if (request.logprobs.has_value() && output.logprobs.has_value()) {
+      choice.logprobs = BuildCompletionLogProbs(output.token_ids, *output.logprobs,
+                                                *request.logprobs);
+    }
     choice.finish_reason = output.finish_reason;
     response.choices.push_back(std::move(choice));
     num_generated_tokens += static_cast<int>(output.token_ids.size());

@@ -404,6 +404,81 @@ TEST_CASE("serving_completion: non-stream response carries text, length finish, 
         resp.usage.prompt_tokens + resp.usage.completion_tokens);
 }
 
+// ─── (a2) logprobs payload runs end-to-end through the CPU engine ────────────
+// Proves the whole SAMPLE-LOGPROBS path RAN: sampler gather_logprobs -> runner
+// ModelRunnerOutput.logprobs -> scheduler slice_request -> LogprobsProcessor ->
+// CompletionOutput.logprobs -> CompletionLogProbs serialization.
+TEST_CASE("serving_completion: logprobs=K returns a well-formed CompletionLogProbs") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 5;
+  const int kK = 2;
+
+  Harness h(c, w, tok);
+  OpenAIServingCompletion serving(h.engine, "test-model");
+
+  CompletionRequest req = MakeCompletionRequest("hello", kN, /*stream=*/false);
+  req.logprobs = kK;
+  CompletionResult res = serving.create_completion(req);
+
+  REQUIRE(res.response.has_value());
+  REQUIRE(res.response->choices.size() == 1);
+  const auto& choice = res.response->choices[0];
+  REQUIRE(choice.logprobs.has_value());
+  const auto& lp = *choice.logprobs;
+
+  // One entry per generated token, all four parallel arrays aligned.
+  REQUIRE(lp.tokens.size() == static_cast<size_t>(kN));
+  CHECK(lp.token_logprobs.size() == static_cast<size_t>(kN));
+  CHECK(lp.top_logprobs.size() == static_cast<size_t>(kN));
+  CHECK(lp.text_offset.size() == static_cast<size_t>(kN));
+
+  int prev_offset = -1;
+  for (int i = 0; i < kN; ++i) {
+    REQUIRE(lp.top_logprobs[i].has_value());
+    // OpenAI N+1 rule: request kK -> up to kK+1 alternatives per position.
+    CHECK(lp.top_logprobs[i]->size() <= static_cast<size_t>(kK + 1));
+    CHECK(lp.top_logprobs[i]->size() >= 1);
+    // Greedy: the sampled token is the argmax, so its logprob is the MAX at the
+    // position and it appears in the top-k map with that same value.
+    REQUIRE(lp.token_logprobs[i].has_value());
+    const auto it = lp.top_logprobs[i]->find(lp.tokens[i]);
+    REQUIRE(it != lp.top_logprobs[i]->end());
+    CHECK(it->second == doctest::Approx(*lp.token_logprobs[i]));
+    float max_v = -1e30f;
+    for (const auto& [t, v] : *lp.top_logprobs[i]) max_v = std::max(max_v, v);
+    CHECK(*lp.token_logprobs[i] == doctest::Approx(max_v));
+    // A logprob is a log-probability: <= 0.
+    CHECK(*lp.token_logprobs[i] <= 0.0f);
+    // text_offset is monotonic non-decreasing, first == 0.
+    CHECK(lp.text_offset[i] >= prev_offset);
+    prev_offset = lp.text_offset[i];
+  }
+  CHECK(lp.text_offset.front() == 0);
+
+  // The response serializes (dump()-safe) with a non-null logprobs object.
+  const json body = json(*res.response);
+  CHECK(body["choices"][0]["logprobs"].is_object());
+  CHECK(body["choices"][0]["logprobs"]["tokens"].size() == static_cast<size_t>(kN));
+}
+
+// ─── (a3) inertness: no logprobs requested -> null, greedy text unchanged ─────
+TEST_CASE("serving_completion: default request emits null logprobs (inert)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+
+  Harness h(c, w, tok);
+  OpenAIServingCompletion serving(h.engine, "test-model");
+  CompletionResult res = serving.create_completion(
+      MakeCompletionRequest("hello", 5, /*stream=*/false));
+  REQUIRE(res.response.has_value());
+  CHECK_FALSE(res.response->choices[0].logprobs.has_value());
+  const json body = json(*res.response);
+  CHECK(body["choices"][0]["logprobs"].is_null());
+}
+
 // ─── (b) Streaming completion → deltas concat to full text, [DONE], finish ───
 TEST_CASE("serving_completion: streamed deltas concatenate to the non-stream text") {
   const HfConfig c = MakeConfig();
@@ -587,6 +662,44 @@ TEST_CASE("serving_chat: non-stream response carries assistant message + usage")
   CHECK(resp.usage.completion_tokens == kN);
   CHECK(resp.usage.total_tokens ==
         resp.usage.prompt_tokens + resp.usage.completion_tokens);
+}
+
+// ─── (c2) chat logprobs run end-to-end -> ChatCompletionLogProbs ─────────────
+TEST_CASE("serving_chat: logprobs=true returns per-token ChatCompletionLogProbs") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 4;
+
+  Harness h(c, w, tok);
+  OpenAIServingChat serving(h.engine, "test-model", InVocabChatPrompt);
+
+  ChatCompletionRequest req = MakeChatRequest(
+      {ChatMessage{"user", std::string("hello")}}, kN, /*stream=*/false);
+  req.logprobs = true;
+  req.top_logprobs = 2;
+  ChatCompletionResult res = serving.create_chat_completion(req);
+
+  REQUIRE(res.response.has_value());
+  REQUIRE(res.response->choices.size() == 1);
+  const auto& choice = res.response->choices[0];
+  REQUIRE(choice.logprobs.has_value());
+  REQUIRE(choice.logprobs->content.has_value());
+  const auto& content = *choice.logprobs->content;
+  REQUIRE(content.size() == static_cast<size_t>(kN));
+  for (const auto& item : content) {
+    CHECK_FALSE(item.token.empty());
+    CHECK(item.logprob <= 0.0f);
+    REQUIRE(item.bytes.has_value());
+    CHECK_FALSE(item.bytes->empty());
+    // top_logprobs keeps at most top_logprobs (== 2) entries.
+    CHECK(item.top_logprobs.size() <= 2u);
+    CHECK(item.top_logprobs.size() >= 1u);
+  }
+  // Serializes with a non-null logprobs.content array.
+  const json body = json(*res.response);
+  CHECK(body["choices"][0]["logprobs"]["content"].size() ==
+        static_cast<size_t>(kN));
 }
 
 // ─── (d) Streaming chat → role delta, content deltas, finish, [DONE] ─────────

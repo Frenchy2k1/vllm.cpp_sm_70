@@ -25583,3 +25583,43 @@ consumers). `ROAD-V1-C5` therefore stays `PARTIAL`/RI with the residual recorded
 docs only) ⇒ compute-sanitizer N/A, `check-device-leakage` not increased, every other SACRED
 gate byte-identical by construction. `benchmark_binding=false`. Seven checkers bare RC green.
 NOT pushed; FULL SHA reported to caller. Coordination `CLAIM-ROADMAP-C5`; ledger row same date.
+## 2026-07-27 — ROAD-V1-C7 W5: logprobs PAYLOAD end-to-end DONE (CPU-gated); `SAMPLE-LOGPROBS` → DONE, C7-core DONE
+
+`CLAIM-ROADMAP-C7-LOGPROBS` (worktree `scratchpad/wt-c7`, branch `c7-logprobs-payload`,
+base `origin/main` `fc6fd7fd`, CPU-only, NOT pushed). Closes the named C7 W5 residual:
+the sample-logprobs payload from sampler to the OpenAI wire.
+
+**What landed.** Ported `vllm/logprobs.py` → `include/vllm/logprobs.h` (`Logprob`,
+`LogprobsOnePosition` = insertion-ordered dict, `AppendLogprobsForNextPosition`) and
+`vllm/v1/engine/logprobs.py` → `include/vllm/v1/engine/logprobs.{h,cpp}`
+(`LogprobsProcessor`). Threaded the payload end to end: `SamplerOutput.logprobs_tensors`
+→ `ModelRunnerOutput.logprobs` (runner, 1 line) → `LogprobsTensors::slice_request`
+→ `EngineCoreOutput.new_logprobs` (scheduler, mirrors `scheduler.py:1815-1836`) →
+`OutputProcessor` LogprobsProcessor → `CompletionOutput.logprobs` (real `SampleLogprobs`)
+/ `RequestOutput.prompt_logprobs` (real `PromptLogprobs`) → OpenAI serialization
+(`CompletionLogProbs`/`ChatCompletionLogProbs` structs + `to_json` in `protocol.{h,cpp}`,
+`BuildCompletionLogProbs`/`BuildChatLogprobs` in `serving_utils.cpp`, wired into
+`serving_{completion,chat}.cpp`). Grounded 1:1 in vLLM 0.26 `555967922`.
+
+**Gate (RED-first, vLLM-0.26 oracle + running engine).** `test_openai_logprobs` 7/40:
+serialization vs a hand-computed vLLM oracle (completion N+1 vs chat N top-k cutoff,
+dict-order dedup of sampled-in-topk, `bytes`, `text_offset`, -9999 floor) + LogprobsProcessor
+accumulation/`cumulative_logprob`/inertness. RED-first PROVEN: flipping the cutoff `idx > N`
+→ `idx >= N` fails 2 cases; restored → 40/40. `test_openai_serving` 27/421: e2e through the
+CPU Qwen3.6-MoE reference engine — `logprobs=K` greedy sampled==argmax==max-logprob==rank1,
+≤K+1 alternatives, monotone `text_offset`; chat `logprobs`+`top_logprobs=2` per-token; and
+inertness (`logprobs: null` off, greedy text byte-identical). CPU `-Werror` 0-warn (full
+`vllm` lib). Seven record checkers bare RC green.
+
+**Honest scope.** `SAMPLE-LOGPROBS` → `DONE`; C7-core DONE. `SAMPLE-PROMPT-LOGPROBS`
+→ `ACTIVE`: its OUTPUT/serialization path is DONE, but the runner does not yet compute
+prompt-position logits (the tensor SOURCE — a runner/prefill addition adjacent to C5).
+`echo` prompt-prepend + `num_logprobs==-1` full-vocab payload shape remain deferred
+(finite-K is the gated path). Remaining C7 rows are separate INVENTORIED items (`n>1`,
+`SAMPLE-PHILOX`, `SAMPLE-LOGPROB-TOKEN-IDS`, beam, logits-plugins). A live vLLM
+cross-check on the random tiny fixture is infeasible (vLLM cannot load it); value-parity
+rests on the ported-algorithm + bit-exact-forward argument, oracle-gated at the
+serialization boundary. Env note: the box disk hit 100% mid-session (known
+grid-per-SHA-trees-fill-disk), so the full ctest suite was disk-blocked — the changed
+code all lives in the `vllm` lib (built warning-free) + the two gate tests (built + green).
+NOT pushed; FULL SHA reported to caller.

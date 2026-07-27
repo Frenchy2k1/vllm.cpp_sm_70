@@ -22,13 +22,14 @@
 //   SamplerOutput: logprobs_tensors now carries the real LogprobsTensors payload
 //     (vllm/v1/outputs.py, ported at M1.7); the sampler's gather_logprobs fills
 //     it. It stays std::optional (None => no logprobs requested this step).
-//   ModelRunnerOutput: logprobs (LogprobsLists), prompt_logprobs_dict,
-//     pooler_output, kv_connector_output / ec_connector_output (P/D KV
-//     transfer), num_nans_in_logits, cudagraph_stats, routed_experts, and the
-//     with_kv_conn_output_only / EMPTY_MODEL_RUNNER_OUTPUT helpers.
-//   EngineCoreOutput: new_logprobs / new_prompt_logprobs_tensors,
-//     pooling_output, events (EngineCoreEvent), kv_transfer_params,
-//     trace_headers, prefill_stats, routed_experts, num_nans_in_logits.
+//   ModelRunnerOutput: logprobs (LogprobsLists) and prompt_logprobs_dict are
+//     now PRESENT (ROAD-V1-C7 SAMPLE-LOGPROBS payload); pooler_output,
+//     kv_connector_output / ec_connector_output (P/D KV transfer),
+//     num_nans_in_logits, cudagraph_stats, routed_experts, and the
+//     with_kv_conn_output_only / EMPTY_MODEL_RUNNER_OUTPUT helpers stay deferred.
+//   EngineCoreOutput: new_logprobs / new_prompt_logprobs_tensors are now PRESENT
+//     (ROAD-V1-C7); pooling_output, events (EngineCoreEvent), kv_transfer_params,
+//     trace_headers, prefill_stats, routed_experts, num_nans_in_logits deferred.
 //   EngineCoreOutputs: scheduler_stats (SchedulerStats), utility_output,
 //     finished_requests, wave_complete / start_wave (DP wave signalling), and
 //     the __post_init__ monotonic-timestamp default (the frontend stamps it).
@@ -114,6 +115,18 @@ struct ModelRunnerOutput {
   // num_reqs x num_generated_tokens (ragged; per-request length can differ
   // under speculative/jump decode). T0 non-spec decode is [num_reqs, 1].
   std::vector<std::vector<int32_t>> sampled_token_ids;
+  // logprobs (ModelRunnerOutput.logprobs, LogprobsLists | None): the batch-wide
+  // sample logprobs the sampler's gather_logprobs produced this step (one row
+  // per num_logits position, in req order). None when no request asked for
+  // logprobs. The scheduler slices it per request (slice_request). Our
+  // host-vector LogprobsTensors doubles as the LogprobsLists twin.
+  std::optional<LogprobsTensors> logprobs;
+  // prompt_logprobs_dict (ModelRunnerOutput.prompt_logprobs_dict): req_id ->
+  // the prompt-position logprobs tensors, populated during prefill for requests
+  // that asked for prompt_logprobs. Empty on the pure sample-logprobs path. The
+  // tensor SOURCE (lm_head over prompt positions) is a runner/prefill addition
+  // (SAMPLE-PROMPT-LOGPROBS); the OUTPUT plumbing below consumes it 1:1.
+  std::map<std::string, LogprobsTensors> prompt_logprobs_dict;
 };
 
 // DraftTokenIds (vllm/v1/outputs.py:310-315): the drafter's proposal for the
@@ -138,6 +151,14 @@ struct EngineCoreOutput {
   std::optional<FinishReason> finish_reason;
   // int | str | None upstream — see DEVIATIONS in the file header.
   std::optional<std::string> stop_reason;
+  // new_logprobs (EngineCoreOutput.new_logprobs, LogprobsLists | None): this
+  // request's slice of the step's sample logprobs (scheduler.py:1821
+  // logprobs.slice_request), None unless the request asked for logprobs.
+  std::optional<LogprobsTensors> new_logprobs;
+  // new_prompt_logprobs_tensors (EngineCoreOutput.new_prompt_logprobs_tensors,
+  // LogprobsTensors | None): the prompt-position logprobs produced during
+  // prefill for a prompt_logprobs request (scheduler.py:1827/1836).
+  std::optional<LogprobsTensors> new_prompt_logprobs_tensors;
 
   // finished (property): a request is finished iff finish_reason is set.
   bool Finished() const { return finish_reason.has_value(); }

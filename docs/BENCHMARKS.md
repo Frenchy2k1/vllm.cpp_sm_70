@@ -31,11 +31,32 @@ unchanged. Inertness: the default/greedy path builds a byte-identical
 SamplingMetadata (all filters empty, `max_num_logprobs` None), so the SACRED
 greedy gates are untouched; CPU `-Werror` 0-warn on the full `vllm` lib. No GPU
 run (transforms are device-neutral; the CUDA-Queue execution is dgx-pending like
-the rest of the sampler). RESIDUAL (not measured, not faked): the `SAMPLE-LOGPROBS`
-payload serialization end to end (LogprobsProcessor + OpenAI `CompletionLogProbs`)
-needs the engine-output plumbing + a running-engine gate. Repro:
+the rest of the sampler). Repro:
 `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build build-cpu -j &&
 ctest -R "test_sampling_params|test_openai_protocol|test_input_batch|test_input_processor|test_sampler|test_logits_processors"`.
+
+**W5 logprobs payload (2026-07-27, `CLAIM-ROADMAP-C7-LOGPROBS`, NOT pushed).**
+Disposition: **CORRECTNESS gate, no throughput number
+(`benchmark_binding=false`).** The C7 W5 residual is CLOSED: the sample-logprobs
+payload is wired sampler -> runner -> scheduler -> LogprobsProcessor ->
+`CompletionOutput.logprobs` -> OpenAI `CompletionLogProbs`/`ChatCompletionLogProbs`
+serialization, grounded 1:1 in vLLM 0.26 `555967922`. Gated on the CPU reference
+engine + a vLLM-0.26 serialization oracle: `test_openai_logprobs` 7/40 (the
+completion N+1 vs chat N top-k cutoff, dict-order dedup, `bytes`, `text_offset`,
+-9999 floor, LogprobsProcessor accumulation + inertness) - **RED-first proven**
+(off-by-one cutoff fails 2 cases); `test_openai_serving` 27/421 (e2e through the
+CPU Qwen3.6 engine: `logprobs=K` greedy sampled==argmax==rank-1, chat
+`top_logprobs`, `logprobs: null` when off - the SACRED greedy path is byte-identical
+because the runner/scheduler logprobs blocks are guarded and `logprobs_tensors` is
+`nullopt` by default). The logprob VALUES are exact given identical logits (the
+sampler's log_softmax+rank gather is gated in `test_sampler`; the forward is
+SACRED-bit-exact). A live vLLM cross-check on the random tiny fixture is infeasible
+(vLLM cannot load it); value-parity rests on the ported-algorithm + bit-exact-forward
+argument, oracle-gated at the serialization boundary. CPU `-Werror` 0-warn.
+`SAMPLE-PROMPT-LOGPROBS` stays `ACTIVE` (payload path DONE; the runner
+prompt-position-logits source is pending). Repro:
+`cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build build-cpu -j &&
+ctest -R "test_openai_logprobs|test_openai_serving"`.
 
 **Roadmap note (2026-07-20):** the first additive-model bring-up (Qwen3 dense on
 `Qwen3-0.6B`, [spike](../.agents/specs/first-additive-model-qwen3-dense.md)) is a

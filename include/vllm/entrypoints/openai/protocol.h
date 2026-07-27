@@ -237,11 +237,47 @@ struct CompletionRequest {
       std::optional<int> default_max_tokens = std::nullopt) const;
 };
 
+// Ported from: vllm/entrypoints/openai/completion/protocol.py:580-584
+// (CompletionLogProbs). The /v1/completions logprobs payload: per generated (or
+// echoed) token, its text, sampled logprob, the running text offset, and the
+// {token_str -> logprob} top-N map. token_logprobs / top_logprobs are None at a
+// position with no logprobs.
+struct CompletionLogProbs {
+  std::vector<int> text_offset;
+  std::vector<std::optional<float>> token_logprobs;
+  std::vector<std::string> tokens;
+  std::vector<std::optional<std::map<std::string, float>>> top_logprobs;
+};
+
+// Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:75-78
+// (ChatCompletionLogProb).
+struct ChatCompletionLogProb {
+  std::string token;
+  float logprob = -9999.0f;
+  // bytes: UTF-8 bytes of `token` (None only when the token has no decoded form).
+  std::optional<std::vector<int>> bytes;
+};
+
+// Ported from: chat_completion/protocol.py:81-85 (ChatCompletionLogProbsContent,
+// extends ChatCompletionLogProb with the per-token top_logprobs alternatives).
+struct ChatCompletionLogProbsContent {
+  std::string token;
+  float logprob = -9999.0f;
+  std::optional<std::vector<int>> bytes;
+  std::vector<ChatCompletionLogProb> top_logprobs;
+};
+
+// Ported from: chat_completion/protocol.py:88-89 (ChatCompletionLogProbs).
+struct ChatCompletionLogProbs {
+  std::optional<std::vector<ChatCompletionLogProbsContent>> content;
+};
+
 // Ported from: vllm/entrypoints/openai/completion/protocol.py:519
-// (CompletionResponseChoice). logprobs / stop_reason / token payloads deferred.
+// (CompletionResponseChoice). stop_reason / token payloads deferred.
 struct CompletionResponseChoice {
   int index = 0;
   std::string text;
+  std::optional<CompletionLogProbs> logprobs;
   std::optional<std::string> finish_reason;
 };
 
@@ -261,6 +297,7 @@ struct CompletionResponse {
 struct CompletionResponseStreamChoice {
   int index = 0;
   std::string text;
+  std::optional<CompletionLogProbs> logprobs;
   std::optional<std::string> finish_reason;
 };
 
@@ -380,6 +417,7 @@ struct ChatCompletionRequest {
 struct ChatCompletionResponseChoice {
   int index = 0;
   ChatMessage message;
+  std::optional<ChatCompletionLogProbs> logprobs;
   std::optional<std::string> finish_reason = "stop";
 };
 
@@ -399,6 +437,7 @@ struct ChatCompletionResponse {
 struct ChatCompletionResponseStreamChoice {
   int index = 0;
   DeltaMessage delta;
+  std::optional<ChatCompletionLogProbs> logprobs;
   std::optional<std::string> finish_reason;
 };
 
@@ -425,6 +464,10 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r);
 void to_json(nlohmann::json& j, const UsageInfo& u);
 void to_json(nlohmann::json& j, const ErrorInfo& e);
 void to_json(nlohmann::json& j, const ErrorResponse& e);
+void to_json(nlohmann::json& j, const CompletionLogProbs& lp);
+void to_json(nlohmann::json& j, const ChatCompletionLogProb& lp);
+void to_json(nlohmann::json& j, const ChatCompletionLogProbsContent& lp);
+void to_json(nlohmann::json& j, const ChatCompletionLogProbs& lp);
 void to_json(nlohmann::json& j, const CompletionResponseChoice& c);
 void to_json(nlohmann::json& j, const CompletionResponse& r);
 void to_json(nlohmann::json& j, const CompletionResponseStreamChoice& c);
