@@ -6608,3 +6608,15 @@ CPU CTest cases were verified stale-assertion or `-j` contention, not regression
 tests marked CTest `RUN_SERIAL`. No throughput or latency number is claimed.
 Reproduction: `cmake --build build-cpu --target test_model_registry test_model_loader_gguf test_dflash_propose && ctest --test-dir build-cpu -R "model_registry|model_loader_gguf|dflash_propose|openai"`.
 Evidence: `.agents/parity-ledger.md` / `.agents/state.md`.
+
+---
+
+## CUDA-arch derive-and-ship campaign roadmapped (2026-07-27) - NOT APPLICABLE (roadmap/scoping)
+
+`benchmark_binding=false` - a roadmap + scoping checkpoint, not a speed run. The
+full CUDA-arch fast-path + beyond-vLLM breadth effort (three committed spikes:
+Ampere/Hopper+datacenter/Pascal-Volta-Turing) is now tracked as roadmap row
+`ROAD-V1-D1-CUDA`. No throughput number is claimed here; per-arch numbers land as
+each fast-path is derive-and-shipped and (where a board is reachable) runtime-gated
+- AGX Orin (sm_87) and NVIDIA Thor (Blackwell) first. Evidence:
+`.agents/specs/cuda-arch-*.md`, `.agents/backend-matrix.md`.
