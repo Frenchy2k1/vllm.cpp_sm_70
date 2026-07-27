@@ -26603,3 +26603,75 @@ eight O tiles. The query tiling landed in f746d2f5 is the prerequisite.
 declared the levers exhausted, without ever computing the achieved FLOP/s of the
 OTHER prefill kernel. A per-kernel roofline check is cheap and should gate any
 claim that a bottleneck list is complete.
+
+---
+
+## 2026-07-27 — mma prefill attention LANDED: 4.3x, 90.9% -> 94.5% of MLX-LM
+
+Implements the open lead recorded in dc7280e8. **On branch `perf/attn-mma`, NOT
+on main**, because it does not pass the SACRED gate yet (see the blocker).
+
+`vt_paged_attention_mma`: flash attention on `simdgroup_matrix`. BQ=32 queries x
+BK=16 keys, 8 simdgroups as 4 row blocks x 2 column halves, so each simdgroup
+owns ONE S tile and EIGHT O tiles and O stays in registers across the key loop.
+S = Q@K^T by mma with K loaded transposed; online softmax by one thread per row;
+O += P@V by mma. The per-row softmax rescale of a register-resident
+simdgroup_matrix is done as `diag(corr) @ O`, since MSL has no elementwise op on
+one. Host picks it when prefill AND bf16 in AND d<=128 AND d%8==0;
+`VT_METAL_NO_ATTN_MMA=1` is the same-binary A/B lever.
+
+**Measured, warm, same lock window as MLX-LM:**
+
+| | mma OFF | mma ON | MLX-LM |
+|---|--:|--:|--:|
+| prefill attention GPU | 270 ms | **63 ms** | ~20-68 ms (implied) |
+| median TTFT | 832 ms | **634 ms** | ~535 ms |
+| total throughput | 22.54 | **23.42** | 24.79 |
+| **% of MLX total** | 90.9% | **94.5%** | - |
+
+Attention went 108 -> ~475 GFLOP/s. The projection in dc7280e8 said 94.1%;
+measured 94.5%.
+
+**RE-ANCHORED AND LANDED.** The gate initially failed, and the resolution is the
+point of this entry. With mma on, prompt[0] token 5 differs from the
+committed anchor (engine 15344 vs anchor 96251); with `VT_METAL_NO_ATTN_MMA=1` on
+the SAME binary it is 16/16 PASS. Evidence that this is a near-tie flip from
+changed summation order and NOT an error:
+- new unit test at Qwen3 geometry (GQA qpk=2, head_dim 128, partial query tile
+  40=32+8, partial key block) vs the CPU oracle: **NMSE 5.1e-10**, worst single
+  element 0.00195, which is one bf16 ulp at that magnitude;
+- the first four generated tokens match, and decode does not use this kernel;
+- this model's gate already reports 6/16 prompts passing on the near-tie band
+  only, i.e. it is dense with near-ties.
+
+**It could NOT be landed by re-capturing our ids alone** — that would leave the
+band check ill-posed, since the committed gaps must describe the sequence they
+gate. The full re-anchor was run instead:
+
+1. `VT_DUMP_IDS=1` on the M4 dumped the new sequence (2 divergence points,
+   prompt[0] tok=5 and prompt[5] tok=10, each cascading to 16 changed tokens).
+2. On dgx.casa, `qwen3-neartie-gap.py` teacher-forced vLLM 0.25.0 on THAT
+   sequence (`~/venvs/vllm-oracle-v0.25.0-stage`; the venv's bin must be on PATH
+   or the in-process JIT dies with `FileNotFoundError: 'ninja'`).
+3. Result: **max near-tie gap 0.125 nats**, the same worst as the previous
+   golden, 0 positions over the 0.5-nat bar, 0 tokens outside vLLM's top-K.
+4. Both goldens committed with the kernel; the M4 then reports 16/16 PASS.
+
+The flipped token is the one the test's OWN comment documents: prompt[0] tok=5 is
+France 9625 vs Italy 15344 at a 0.003-0.007-nat margin, where "vLLM's own
+teacher-forced argmax on the identical prefix is Italy". The mma kernel picks
+Italy. The summation order changed; the answer did not get worse.
+
+**Diagnostic trap worth recording:** the first comparison of the new dump against
+`our_ids_metal.npy` was run in `/home/mudler/_git/vllm.cpp`, which sits on an OLD
+commit, and showed only prompt[10] differing — inconsistent with the gate's
+report of prompt[0] tok=5, which briefly looked like kernel nondeterminism. The
+working tree carried a stale golden. Diff against `git show origin/main:<path>`,
+never the local checkout.
+
+**Process note:** I wrote this kernel before its test. test_ops_paged_attn's
+Metal-relevant cases are CUDA-gated and skipped, and the existing Metal
+kPagedAttention test uses head_dim 64 with no GQA — so the second output column
+half and the shared-kv-head path had NO coverage and the first version passed
+everything while being wrong in the engine. The Qwen3-geometry test added here is
+what should have existed first.

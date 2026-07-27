@@ -2555,6 +2555,37 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Prefill attention on the MATRIX UNITS: 4.3x, and 94.5% of MLX-LM (2026-07-27)
+
+Closes the open lead below. `vt_paged_attention_mma` is flash attention on
+`simdgroup_matrix`: S = Q@K^T by mma with K loaded transposed, online softmax,
+then O += P@V by mma with O register-resident across the key loop. MSL has no
+elementwise operation on a `simdgroup_matrix`, so the per-row softmax rescale is
+applied as `diag(corr) @ O`. Tiling is BQ=32 x BK=16 over 8 simdgroups arranged
+4 row blocks x 2 column halves, giving each simdgroup one S tile and eight O
+tiles. `VT_METAL_NO_ATTN_MMA=1` is the same-binary A/B lever.
+
+Warm, b=1, Qwen3-1.7B-bf16, p=512 g=128, alternating in one GPU-locked window:
+
+| | mma OFF | mma ON | MLX-LM |
+|---|--:|--:|--:|
+| prefill attention GPU | 270 ms | **63 ms** | ~20-68 implied |
+| median TTFT | 832 ms | **634 ms** | ~535 ms |
+| total throughput | 22.54 | **23.42** | 24.79 |
+| **% of MLX total** | 90.9% | **94.5%** | - |
+
+Attention went 108 -> ~475 GFLOP/s. The estimate recorded below was 94.1%.
+
+**Correctness.** The greedy sequence changed at two near-tie positions, so the
+Metal goldens were RE-ANCHORED the only legitimate way: dump the new sequence,
+teacher-force vLLM 0.25.0 on it, verify the band. Max gap **0.125 nats** against
+a 0.5 bar, the same worst as the previous golden, 0 positions over bar, 0 tokens
+outside vLLM's top-K. One flip is the case the gate's own comment documents
+(prompt[0] tok=5, France vs Italy at a 0.003-0.007-nat margin, where vLLM's own
+teacher-forced argmax is Italy) — the mma kernel now picks Italy.
+
+---
+
 ## OPEN LEAD: prefill attention never uses the matrix units (2026-07-27)
 
 **This overturns the "no identified lever remains" conclusion recorded below.**

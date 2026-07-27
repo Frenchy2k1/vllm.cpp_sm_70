@@ -883,6 +883,106 @@ TEST_CASE("Metal kPagedAttention matches the CPU oracle within NMSE <= 5e-4") {
   metal.DestroyQueue(q);
 }
 
+// Qwen3-dense attention geometry, which the OPT-shaped case above does NOT
+// reach: GQA (qpk=2, so h/qpk indexes a SHARED kv head) and head_dim 128. The
+// mma prefill kernel splits its output over TWO column halves of 64, and at
+// head_dim 64 the second half is entirely out of range and discarded — so that
+// test exercises exactly half of it. Query lengths 40 and 5 also force a PARTIAL
+// second query tile (40 = 32 + 8) and a partial key block.
+TEST_CASE("Metal kPagedAttention matches the CPU oracle at Qwen3 geometry (GQA, head_dim 128)") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  const int64_t nblocks = 24, bsz = 16, hq = 16, hkv = 8, dh = 128;
+  const int64_t num_reqs = 2;
+  const std::vector<int32_t> qsl{0, 40, 45};
+  const std::vector<int32_t> slens{40, 71};  // req1 carries 66 context tokens
+  const int64_t t_total = qsl.back();
+  const int64_t max_blocks = 6;
+  std::vector<int32_t> btab(static_cast<size_t>(num_reqs * max_blocks));
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    for (int64_t c = 0; c < max_blocks; ++c) {
+      btab[static_cast<size_t>(r * max_blocks + c)] = static_cast<int32_t>(r * max_blocks + c);
+    }
+  }
+
+  std::mt19937 rng(4127);
+  std::uniform_real_distribution<float> ud(-1.5f, 1.5f);
+  const size_t cache_elems = static_cast<size_t>(nblocks * bsz * hkv * dh);
+  std::vector<float> qf(static_cast<size_t>(t_total * hq * dh)), kf(cache_elems), vf(cache_elems);
+  for (auto& x : qf) x = Bf16RT(ud(rng));
+  for (auto& x : kf) x = Bf16RT(ud(rng));
+  for (auto& x : vf) x = Bf16RT(ud(rng));
+  const std::vector<uint16_t> qb = PackBf16(qf), kb = PackBf16(kf), vb = PackBf16(vf);
+
+  MBuf dqy(metal, q, qb.size() * 2), dkc(metal, q, kb.size() * 2), dvc(metal, q, vb.size() * 2),
+      dbt(metal, q, btab.size() * 4), dsl(metal, q, slens.size() * 4),
+      dqsl(metal, q, qsl.size() * 4), dout(metal, q, qb.size() * 2);
+  dqy.Upload(qb.data());
+  dkc.Upload(kb.data());
+  dvc.Upload(vb.data());
+  dbt.Upload(btab.data());
+  dsl.Upload(slens.data());
+  dqsl.Upload(qsl.data());
+  dout.PoisonNaN(2);
+  metal.Synchronize(q);
+
+  Tensor tq = Tensor::Contiguous(dqy.ptr(), vt::DType::kBF16, d, {t_total, hq, dh});
+  Tensor tkc = Tensor::Contiguous(dkc.ptr(), vt::DType::kBF16, d, {nblocks, bsz, hkv, dh});
+  Tensor tvc = Tensor::Contiguous(dvc.ptr(), vt::DType::kBF16, d, {nblocks, bsz, hkv, dh});
+  Tensor tbt = Tensor::Contiguous(dbt.ptr(), vt::DType::kI32, d, {num_reqs, max_blocks});
+  Tensor tsl = Tensor::Contiguous(dsl.ptr(), vt::DType::kI32, d, {num_reqs});
+  Tensor tqsl = Tensor::Contiguous(dqsl.ptr(), vt::DType::kI32, d, {num_reqs + 1});
+  Tensor tout = Tensor::Contiguous(dout.ptr(), vt::DType::kBF16, d, {t_total, hq, dh});
+
+  vt::PagedAttentionArgs pa{1.0f / std::sqrt(static_cast<float>(dh)), true};
+  pa.query_start_loc_host = qsl.data();
+  pa.max_seq_len = 71;
+  vt::ResetOpProviderStats(vt::OpId::kPagedAttention, DeviceType::kMETAL);
+  vt::PagedAttention(q, tout, tq, tkc, tvc, tbt, tsl, tqsl, pa);
+  metal.Synchronize(q);
+  CHECK(DeclinesAfter(vt::OpId::kPagedAttention) == 0);
+
+  std::vector<uint16_t> gpacked(qb.size());
+  dout.Download(gpacked.data());
+  metal.Synchronize(q);
+  std::vector<float> got(gpacked.size());
+  for (size_t i = 0; i < got.size(); ++i) got[i] = vt::BF16ToF32(gpacked[i]);
+  for (float x : got) REQUIRE(std::isfinite(x));
+
+  std::vector<uint16_t> qcpu = qb, kcpu = kb, vcpu = vb, rpacked(qb.size(), 0);
+  std::vector<int32_t> bcpu = btab, scpu = slens, qscpu = qsl;
+  Queue cq{Device{DeviceType::kCPU, 0}, nullptr};
+  const Device cd{DeviceType::kCPU, 0};
+  Tensor cqt = Tensor::Contiguous(qcpu.data(), vt::DType::kBF16, cd, {t_total, hq, dh});
+  Tensor ckc = Tensor::Contiguous(kcpu.data(), vt::DType::kBF16, cd, {nblocks, bsz, hkv, dh});
+  Tensor cvc = Tensor::Contiguous(vcpu.data(), vt::DType::kBF16, cd, {nblocks, bsz, hkv, dh});
+  Tensor cbt = Tensor::Contiguous(bcpu.data(), vt::DType::kI32, cd, {num_reqs, max_blocks});
+  Tensor csl = Tensor::Contiguous(scpu.data(), vt::DType::kI32, cd, {num_reqs});
+  Tensor cqsl = Tensor::Contiguous(qscpu.data(), vt::DType::kI32, cd, {num_reqs + 1});
+  Tensor cout = Tensor::Contiguous(rpacked.data(), vt::DType::kBF16, cd, {t_total, hq, dh});
+  vt::PagedAttention(cq, cout, cqt, ckc, cvc, cbt, csl, cqsl, pa);
+
+  std::vector<float> ref(rpacked.size());
+  for (size_t i = 0; i < ref.size(); ++i) ref[i] = vt::BF16ToF32(rpacked[i]);
+
+  // Worst SINGLE element, not just the aggregate: a wrong column half or a
+  // mis-set kv group shows up in a slice that an averaged NMSE can bury.
+  double worst = 0.0;
+  size_t worst_i = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double e = std::abs(static_cast<double>(got[i]) - static_cast<double>(ref[i]));
+    if (e > worst) { worst = e; worst_i = i; }
+  }
+  const double nmse = Nmse(got, ref);
+  MESSAGE("Metal kPagedAttention (Qwen3 geom) NMSE = " << nmse << ", worst |elem| err = " << worst
+          << " at flat index " << worst_i << " (head " << (worst_i / dh) % hq << ", col "
+          << worst_i % dh << ")");
+  CHECK(nmse <= 5e-4);
+  CHECK(worst <= 5e-2);
+  metal.DestroyQueue(q);
+}
+
 // M3b — the two ops Qwen3-dense adds to OPT's Metal set. Both compute f32
 // transcendentals in-kernel (Metal has no double), so the bar is NMSE <= 5e-4 vs
 // the CPU oracle, NOT bit-exactness — the same posture as kPagedAttention.
