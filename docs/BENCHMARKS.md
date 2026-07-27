@@ -2565,11 +2565,14 @@ Measured, not shipped. The strongest unclosed lead toward parity:
 | 64x64, 8 simdgroups | **1712** | **1907** | **1821** |
 | MLX steel (target) | 2640 | 3325 | 3293 |
 
-**1.8x, roughly half the remaining distance to MLX** — and **numerically wrong**:
-NMSE 0.994 on f32 64x512x128, a shape with no ragged edge in M, N or K, so an
-indexing or synchronisation defect rather than an edge guard. Not located, not
-shipped. Reproduction and a bisect starting point are in the spec's "OPEN LEAD"
-section.
+**1.8x, roughly half the remaining distance to MLX** — and **numerically wrong**.
+Bisected: the simdgroup mapping is EXONERATED (2x4 and 4x2 decompositions fail
+identically at the same speed), the threadgroup-size limit is REFUTED (a new
+`DispatchGrid2D` assert does not fire), and a host/kernel thread-count mismatch
+is REFUTED. Sharpest clue: the failure is m-DEPENDENT. m=2 and m=16 PASS,
+m=64 and m=512 FAIL, so only tile rows >= 16 are affected, consistent with part
+of the A tile never being staged or being staged after it is read. Not located,
+not shipped; resume notes in the spec's "OPEN LEAD" section.
 
 ---
 

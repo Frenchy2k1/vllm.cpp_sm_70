@@ -25924,3 +25924,33 @@ defect in one run, and `VT_MM_BENCH=1` gives the speed in another).
 
 **Goal:** 14.25 of 27.9 tok/s. This lead, if fixed, is worth roughly half the
 remaining GEMM gap.
+
+---
+
+## 2026-07-27 — 64x64 GEMM lead BISECTED (still open) + DispatchGrid2D thread-limit assert
+
+**Shipped:** `Encoder::DispatchGrid2D` now asserts that the requested threadgroup
+size fits the pipeline's `maxTotalThreadsPerThreadgroup`. `DispatchFlat` already
+clamped; this path did neither, and an over-wide threadgroup is silent UB in a
+Release build with no Metal validation layer — it computes garbage rather than
+faulting. A 2-D kernel's threadgroup shape is part of its correctness, so this
+asserts rather than clamps: clamping would drop simdgroups and be just as quiet.
+Unit suite 21/21 and the SACRED gate 128/128 unchanged.
+
+**The 64x64/8-simdgroup lead (1.8x, wrong) is now BISECTED. Three hypotheses
+tested and refuted, so the next session starts much closer:**
+
+1. **Simdgroup mapping EXONERATED.** Both decompositions fail identically at the
+   same speed: 2x4 (acc[4][2], 1712/1907/1821 GFLOP/s) and 4x2 (acc[2][4],
+   1640/1861/1781). The defect is in STAGING or BARRIERS, not the tile division.
+2. **Threadgroup-size limit REFUTED** — the new assert does not fire.
+3. **Host/kernel thread-count mismatch REFUTED** — `kMmTile=64`,
+   `kMmSimdgroups=8`, so 256 threads are genuinely dispatched.
+
+**Sharpest clue: the failure is m-DEPENDENT.** m=2 and m=16 PASS (2.5e-06,
+2.7e-06); m=64 and m=512 FAIL (0.994, 1.001). With BM=64, tile rows >= m are
+zero-padded and masked at write-out, so **only tile rows >= 16 are wrong** —
+consistent with part of the A tile never being staged, or staged after it is
+read. Next step: stage a known constant into `sa` and check which rows survive.
+
+**Goal:** 14.25 of 27.9 tok/s. This lead is worth ~half the remaining GEMM gap.

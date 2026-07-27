@@ -385,13 +385,33 @@ coverage (sg_r = sgitg/4 over 2x32 rows, sg_c = sgitg%4 over 4x16 columns), the
 accumulator-to-`sc` mapping, the barrier order and every stride did not locate
 it. Recorded rather than guessed at further.
 
-**Where to start when picking this up:** the shipped 32x32/4-simdgroup kernel is
-correct, so diff the two and bisect the simdgroup mapping. Try the 4x2
-arrangement (sg_r = sgitg/2 over 4x16 rows, sg_c = sgitg%2 over 2x32 columns,
-acc[2][4]) as the alternate decomposition; if that is also wrong, the defect is
-in the staging or barrier structure rather than the mapping. Verify with
-`VT_MM_BENCH=1` for speed and the f32 64x512x128 arm for correctness — that arm
-catches this in one run.
+**BISECTED 2026-07-27. Three hypotheses tested and REFUTED; the search space is
+now much smaller.**
+
+1. **The simdgroup mapping is EXONERATED.** Both decompositions were built and
+   both fail identically: 2x4 (sg_r = sgitg/4 over 2x32 rows, acc[4][2]) and 4x2
+   (sg_r = sgitg/2 over 4x16 rows, acc[2][4]). Speed is the same either way
+   (1712/1907/1821 vs 1640/1861/1781 GFLOP/s), so the defect is in the STAGING or
+   BARRIER structure, not in how simdgroups divide the tile.
+2. **The threadgroup-size limit is REFUTED.** The suspicion was that 20 KB of
+   threadgroup memory pushes `maxTotalThreadsPerThreadgroup` below the 256
+   threads dispatched, which in a Release build is silent UB rather than a fault.
+   `DispatchGrid2D` now asserts that limit (a fix worth having regardless, kept
+   in the tree) and **it does not fire**.
+3. **A host/kernel thread-count mismatch is REFUTED.** `kMmTile = 64` and
+   `kMmSimdgroups = 8` are both correctly applied, so 256 threads really are
+   dispatched and the kernel's `nthreads` matches.
+
+**THE SHARPEST CLUE, and where to resume: the failure is m-dependent.**
+m=2 and m=16 PASS (2.5e-06, 2.7e-06); m=64 and m=512 FAIL (NMSE 0.994, 1.001).
+With BM=64, small m means tile rows >= m are zero-padded and masked at write-out,
+so **the defect only affects tile rows >= 16**. That is consistent with part of
+`sa` never being staged, or being staged after it is read. Instrument the sa
+staging for rows 16..63 first: dump `sa` for a single threadgroup, or stage a
+known constant and check which rows survive to the output.
+
+**Reproduce:** the f32 64x512x128 arm catches it in one run; `VT_MM_BENCH=1`
+gives the speed.
 
 ### Risks/decisions
 
