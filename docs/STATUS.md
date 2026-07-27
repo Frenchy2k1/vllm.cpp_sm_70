@@ -268,7 +268,10 @@ across prefill attention, small prefill kernels and decode, none dominant. The
 decode share is 93% weight streaming at 83% of the part's memory peak, so the
 remaining items sit against roofs rather than against defects: GEMV at 83% of
 memory peak, GEMM at 97% of MLX's, and a re-test of GEMV memory-level
-parallelism under the paired harness confirmed the earlier exclusion at -1.03%. The V-accumulation win came from BISECTING the attention
+parallelism under the paired harness confirmed the earlier exclusion at -1.03%.
+The decode residual is non-GEMV overhead (2.7 ms/token against MLX's implied
+2.0), so the next lever is a Metal realisation of the fused qk-norm-RoPE
+attention preamble, which exists for CUDA only. The V-accumulation win came from BISECTING the attention
 kernel once a paired ABBA harness with cooldown made 0.2% differences
 measurable: the V loop moved 2 bytes per lane per load where the score loop
 moved 8, giving 29 GB/s against 64 on identical traffic. That also explains why

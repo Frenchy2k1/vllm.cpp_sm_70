@@ -27570,3 +27570,43 @@ pressure. Re-test pre-harness exclusions when cheap; do not assume they are wron
 (above MLX's 3.07 overall), prefill attention post-vectorisation, and decode's
 small kernels which are launch-bound. Every cheap structural lever this session
 identified has been either landed or measured away.
+
+---
+
+## 2026-07-27 — CORRECTION: I dismissed fusion on a bad inference; it IS the decode lever
+
+**An earlier entry in this log is wrong and steered three later experiments away
+from the answer.** I wrote that decode's residual could not be fusion "because
+decode is 97% GPU-busy, so there is nothing for fusion to win".
+
+97% GPU-busy bounds the dispatch GAPS. It says NOTHING about launch-dominated GPU
+time *inside* the small kernels. `vt_rms_norm` runs at 0.65 GB/s — that cost is
+counted as busy and is almost entirely per-launch. Fusing removes it from the
+busy time itself.
+
+**Corrected decode arithmetic:**
+
+```
+ours    36.9 ms/tok = GEMV 34.2 + other 2.7
+MLX-LM  36.2 ms/tok ; if their GEMV is also ~99 GB/s, their "other" is 2.0
+=> the decode gap IS the non-GEMV overhead: 2.7 vs 2.0 ms/token
+```
+
+Closing it needs **-0.7 ms/token = 27% of small-kernel time**. Not bandwidth, not
+FLOPs.
+
+**Concrete lever, sized:** `kAttnQkNormRopeGate` (fused q_norm + k_norm + RoPE)
+is registered for **CUDA ONLY**; Metal falls back to the composite and dispatches
+all three separately. That is 28+28+28 = **84 dispatches/token collapsing to 28**,
+worth ~56 x 6.7 us = **~0.38 ms/token, over half the deficit** — with the CUDA
+kernel as reference and the recipe/gate machinery already in place. Then
+`vt_silu_and_mul` and `vt_reshape_and_cache` (28 each, both launch-dominated).
+
+**Hypothesis with arithmetic, NOT a measured result** — the same standard that
+the KV-layout lead failed. Recorded as the next experiment, not the answer.
+
+**Lesson:** the bad inference was a category error — bounding one quantity (gaps)
+and concluding about another (in-kernel launch cost). It survived three
+experiments because each new result was read as confirming "not fusion" rather
+than re-examining why fusion had been excluded. When several hypotheses in a row
+fail, re-audit the one that was ruled out FIRST.

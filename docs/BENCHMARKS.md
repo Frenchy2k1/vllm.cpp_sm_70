@@ -2862,6 +2862,45 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## CORRECTION: fusion was dismissed on a bad inference, and IS the decode lever
+
+Earlier in this log I wrote that decode's residual could not be fusion "because
+decode is 97% GPU-busy, so there is nothing for fusion to win". **That inference
+was wrong** and it steered three subsequent experiments away from the answer.
+
+97% GPU-busy bounds the dispatch GAPS. It says nothing about launch-dominated GPU
+time INSIDE the small kernels — and `vt_rms_norm` runs at **0.65 GB/s**, which is
+almost entirely per-launch cost that is counted as busy. Fusing removes that from
+the busy time itself, not merely from the gaps.
+
+**The corrected decode arithmetic:**
+
+```
+ours    36.9 ms/tok = GEMV 34.2 + other 2.7
+MLX-LM  36.2 ms/tok
+if MLX's GEMV also runs ~99 GB/s (34.2 ms), their "other" is 2.0 ms
+=> the decode gap IS the non-GEMV overhead: 2.7 vs 2.0 ms/token
+```
+
+Closing it needs **-0.7 ms/token, i.e. 27% of small-kernel time** — not a
+bandwidth or FLOP gain anywhere.
+
+**The concrete lever, sized.** `kAttnQkNormRopeGate` — a fused q_norm + k_norm +
+RoPE attention preamble — is registered for **CUDA only**. Metal falls back to
+the composite and dispatches all three separately: 28 + 28 + 28 = **84 dispatches
+per token that a Metal realisation would collapse to 28**, saving ~56 x 6.7 us =
+**~0.38 ms/token, over half the deficit**, with the CUDA kernel as a reference
+implementation and the recipe/gate machinery already in place.
+
+Remaining candidates after that: `vt_silu_and_mul` and `vt_reshape_and_cache`
+(28 dispatches each per token, both launch-dominated).
+
+**This is a hypothesis with arithmetic, not a measured result** — the same
+standard applied to the KV-layout lead, which the probe then refuted. It is
+recorded as the next experiment, not as the answer.
+
+---
+
 ## GEMV memory-level parallelism RE-TESTED under the harness: still a loss (2026-07-27)
 
 The highest-value remaining experiment, run rather than left as a suggestion.
