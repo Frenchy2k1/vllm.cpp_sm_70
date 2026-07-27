@@ -289,6 +289,8 @@ vllm_cpp_add_test(test_openai_logprobs vllm/entrypoints/openai/test_logprobs.cpp
 vllm_cpp_add_test(test_openai_utf8 vllm/entrypoints/openai/test_utf8.cpp)
 vllm_cpp_add_test(test_streaming_parser_engine
   vllm/parser/engine/test_streaming_parser_engine.cpp)
+vllm_cpp_add_test(test_parser_engine_assembly
+  vllm/parser/engine/test_parser_engine_assembly.cpp)
 vllm_cpp_add_test(test_openai_tool_parsers
   vllm/entrypoints/openai/tool_parsers/test_tool_parsers.cpp)
 vllm_cpp_add_test(test_tool_parser_detect
