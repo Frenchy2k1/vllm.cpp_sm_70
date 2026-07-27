@@ -293,6 +293,38 @@ re-validation) BEFORE the speed A/B was run, and then had to be reverted along
 with the kernel. Benchmark first, re-capture only once the change is known to be
 worth keeping.
 
+### Tuning attempts on the simdgroup GEMM (both measured, both rejected)
+
+The 32x32 / BK=8 shape that shipped was not assumed to be optimal; two obvious
+widenings were tried and MEASURED, and both are recorded so they are not retried.
+Same-binary runs, GPU lock, b=1 p=512 g=128.
+
+| shape | tok/s | TTFT | verdict |
+|---|--:|--:|---|
+| **32x32, BK=8 (shipped)** | **13.27** | 2524 ms | baseline |
+| 32x32, BK=32 | 13.28 | 2546 ms | **NEUTRAL** — reverted |
+| 64x64, BK=16 | 11.48 | 4004 ms | **WORSE (-14%)** — reverted |
+
+**BK=32 was neutral, which refutes the barrier hypothesis.** The reasoning for it
+was that BK=8 pays two threadgroup barriers per 8 elements of K, so BK=32 would
+amortise the same barriers over 4x the MACs. It changed nothing, so barrier
+traffic is not this kernel's limit.
+
+**64x64 was materially worse, and the cause is occupancy.** A 64x64 tile with 128
+threads needs 16 `simdgroup_float8x8` accumulators per simdgroup and 24 KB of
+threadgroup memory (sa 4 KB + sb 4 KB + sc 16 KB), which leaves room for only one
+threadgroup per core and removes the latency hiding the smaller tile enjoyed. A
+64x64 tile is not wrong in principle, but it needs MORE THREADS (8 simdgroups,
+256 threads) and a smaller output staging buffer, not simply wider blocks over
+the same 128 threads. That is the form worth trying next, if any.
+
+**What this means for the remaining gap.** With barriers and tile width both
+excluded, the mm kernel's cost is most likely the staging itself: every element
+of A and B passes through a branchy scalar `vt_load` and is written to
+threadgroup memory as f32, doubling LDS traffic for bf16 operands. A
+dtype-specialised staging path (vector loads, no per-element switch) is the next
+hypothesis, and it is the SAME hypothesis as the decode GEMV's.
+
 ### Risks/decisions
 
 - **Batching changes failure semantics (accepted, mitigated).** Today a failed

@@ -2585,6 +2585,13 @@ same side of every near-tie in the gate set.
 next ranked lever is the decode GEMV, still 50% of GPU time and using scalar
 per-element dtype-switched loads that cannot saturate bandwidth.
 
+**Tuning attempts on this kernel, both measured and both rejected:** 32x32/BK=32
+was NEUTRAL (13.28 tok/s, refuting the barrier hypothesis) and 64x64/BK=16 was
+14% WORSE (11.48 tok/s, TTFT 4004 ms) because 24 KB of threadgroup memory plus 16
+accumulators per simdgroup collapses occupancy to one threadgroup per core. A
+64x64 tile needs 8 simdgroups rather than wider blocks over the same 128 threads.
+Detail in the spec's "Tuning attempts" section.
+
 **Status: INDICATIVE** (worker daemon and wallpaper up), CI runners idle.
 
 ---

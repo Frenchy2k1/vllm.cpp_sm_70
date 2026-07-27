@@ -25756,3 +25756,32 @@ Weaker than a true red-first, and recorded as such.
 **Next:** the decode GEMV, still ~50% of GPU time. It does a per-element dtype
 switch with scalar loads, which cannot saturate bandwidth; vectorised
 dtype-specialised loads are the lever. Remaining gap to parity: 2.1x.
+
+---
+
+## 2026-07-27 — simdgroup GEMM tuning: BK=32 NEUTRAL, 64x64 WORSE; both reverted
+
+Two obvious widenings of the shipped 32x32/BK=8 simdgroup GEMM were tried and
+measured. Neither survived; both are recorded so they are not retried.
+
+**BK=32: NEUTRAL** (13.28 vs 13.27 tok/s). The rationale was that BK=8 pays two
+threadgroup barriers per 8 elements of K. It changed nothing, so **barrier
+traffic is not this kernel's limit** — a hypothesis now closed by measurement.
+
+**64x64/BK=16: 14% WORSE** (11.48 tok/s, TTFT 4004 vs 2524 ms). Cause is
+occupancy: 16 accumulators per simdgroup plus 24 KB of threadgroup memory leaves
+one threadgroup per core and removes latency hiding. A 64x64 tile is not wrong in
+principle but needs 8 simdgroups (256 threads) and a smaller output staging
+buffer, not wider blocks over the same 128 threads.
+
+**Remaining hypothesis, now the leading one for BOTH kernels:** the staging and
+load path. Every element passes through a branchy scalar `vt_load`, and mm also
+writes f32 into threadgroup memory, doubling LDS traffic for bf16 operands. A
+dtype-specialised, vectorised load path is the next lever and it serves the mm
+kernel and the decode GEMV alike.
+
+**Goal status:** 10.5 -> 13.3 tok/s of the 27.9 target. Bandwidth analysis
+corrects an earlier over-estimate: the decode GEMV already runs at 75 GB/s, 63% of
+the M4's ~120 GB/s peak, against MLX-LM's ~95 GB/s (79%), so that lever is worth
+~1.2 s rather than the ~2.3 s first projected. Prefill remains the larger gap
+(~2.5 s vs MLX-LM's ~0.47 s).
