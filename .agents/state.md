@@ -27473,3 +27473,44 @@ nobody had profiled in isolation.
 
 **Cumulative on this axis: 94.5% -> ~96.3%.** Remaining gap ~3.7%, now
 prefill-GEMM-led again (~540 ms against MLX's implied ~490).
+
+---
+
+## 2026-07-27 — GEMM bisected: 97% of MLX, and NOT the remaining bottleneck
+
+Bisected `vt_matmul_bt_mm` with measurement-only stubs (A stage / B stage / mma /
+epilogue store), sync attribution at p=512:
+
+| stub | GPU ms |
+|---|--:|
+| none | 694.4 |
+| no A | 659.8 |
+| no B | 645.4 |
+| no mma | 325.8 |
+| no epilogue store | 690.3 |
+| **all four** | **189.7** |
+
+**189.7 ms with everything stubbed is NOT kernel time** — it is 168 dispatches x
+1.13 ms of `VT_METAL_SYNC_DISPATCH` per-command-buffer overhead, the artifact
+already recorded in the sync-attribution correction. Subtract this floor from any
+sync-mode bisect.
+
+**Corrected:** real GEMM **505 ms** (vs MLX implied ~490 = **97%**); mma 369 ms =
+**3.91 TFLOP/s**, which is ABOVE MLX's 3.07 overall rate; staging ~65 ms;
+epilogue 4 ms.
+
+**This overturns my own repeated claim that the residual is "prefill-GEMM-led".**
+It is not. The GEMM is nearly at parity and its matrix issue rate is excellent.
+I asserted GEMM-led in several entries above on the strength of sync-mode numbers
+that carried this floor.
+
+**Where the ~205 ms gap actually sits:** prefill GEMM 15 ms, prefill attention
+35 ms (55 vs ~20), prefill other ~55 ms, decode 99 ms. **No single item
+dominates.** That is a different kind of problem from the one this session
+started with — the big structural wins are taken, and what is left is four
+moderate items.
+
+The bisect levers were NOT landed: they put a branch in the k-loop's init and
+their value is diagnostic, not runtime. Re-add them behind `VT_MM_BISECT` when
+next needed; the patch is small and the method is now proven three times
+(decode attention, prefill attention, GEMM).

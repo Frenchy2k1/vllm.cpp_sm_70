@@ -2862,6 +2862,56 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## GEMM bisected: it is at 97% of MLX and NOT the remaining bottleneck (2026-07-27)
+
+Bisecting `vt_matmul_bt_mm` the same way (measurement-only stubs on the A stage,
+the B stage, the mma and the epilogue store), sync attribution at p=512:
+
+| stub | GPU ms |
+|---|--:|
+| none | 694.4 |
+| no A stage | 659.8 |
+| no B stage | 645.4 |
+| no mma | 325.8 |
+| no epilogue store | 690.3 |
+| **all four** | **189.7** |
+
+**189.7 ms with EVERY component stubbed is not kernel time.** It is 168
+dispatches x 1.13 ms of per-command-buffer overhead from
+`VT_METAL_SYNC_DISPATCH`, the artifact already documented in the
+sync-attribution correction below. Every figure from a sync-mode bisect must have
+this floor subtracted.
+
+**Corrected breakdown:**
+
+| component | ms | note |
+|---|--:|---|
+| **real GEMM total** | **505** | vs MLX's implied ~490 -> **97%** |
+| mma | 369 | 1.44 TFLOP / 0.369 s = **3.91 TFLOP/s** |
+| staging (A+B) | ~65 | already vectorised |
+| epilogue store | 4 | negligible |
+
+**This overturns the standing claim that the residual is "prefill-GEMM-led".**
+The GEMM is at 97% of MLX's and its mma issue rate (3.91 TFLOP/s) is ABOVE MLX's
+3.07 overall. It is not where the remaining time is.
+
+**Where the gap actually sits now** (warm, p=512 g=128; ours ~5.37 s vs MLX
+5.16 s, gap ~205 ms):
+
+| | ours | MLX | excess |
+|---|--:|--:|--:|
+| prefill GEMM | 505 | ~490 | 15 ms |
+| prefill attention | 55 | ~20 | 35 ms |
+| prefill other (small kernels, host) | ~80 | ~25 | ~55 ms |
+| decode | 4728 | 4629 | 99 ms |
+
+**No single item dominates any more.** The remaining ~3.7% is four items of
+15-100 ms each, which is a different kind of problem from the one this session
+started with, and worth saying plainly rather than naming a next bottleneck that
+the measurement does not support.
+
+---
+
 ## Prefill attention: vectorised K/V/Q staging, +0.50% (2026-07-27)
 
 The same defect, in the mma kernel written earlier THIS session.
