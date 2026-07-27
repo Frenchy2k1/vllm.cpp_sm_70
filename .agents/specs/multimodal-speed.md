@@ -451,13 +451,10 @@ lands where decode is CHEAP — the Voxtral audio path — which has NO decode-g
 yet (W-plan W1). mm rows stay **speed-pending / `PARTIAL`**. No mm row advances to DONE.
 
 ### 9.5 Remaining lever-#3 W-plan (W-step → gate → size)
-- **W1 — Voxtral (Llama/Mistral) decode-graph class (the 1.52× gap-closer).** Build a
-  `VoxtralDecodeGraph` cold→warm→replay driver (mirror `Qwen3_5DenseDecodeGraph`) over
-  `ForwardLastLogits`/`weights.text` (`voxtral.cpp:123,454`); route
-  `VoxtralGenerateGreedy`'s decode through it. GATE: `test_voxtral_e2e` 14/14 held
-  bit-exact + audio TPOT A/B toward vLLM's 40.8 ms (expect a REAL win — cheap 3B decode
-  is NOT bandwidth-floored, §8.3). Size: **M** (new graph class, no capture in the loop
-  region is a fresh capture-safety surface — [[cudagraph-capture-bakes-stack-addresses]]).
+- **W1 — Voxtral (Llama/Mistral) decode-graph class — DONE 2026-07-27
+  (`CLAIM-MM-SPEED-GRAPH-W1`, §9.6). Real non-overlapping win, but it NARROWS (does
+  NOT close) the 1.52× gap.** Built `VoxtralDecodeGraph` and routed
+  `VoxtralGenerateGreedy`'s decode through it. See §9.6.
 - **W2 — batched multi-seq mm decode (S>1 / c2+).** Drive `VLGenerateCoreGdn` (and W1's
   audio) with B>1 requests through the SAME graph at padded S∈{2,4,8,…}; needs multi-slot
   GDN/KV caches + the per-request mm merge at prefill. GATE: 2-request batched decode
@@ -468,3 +465,69 @@ yet (W-plan W1). mm rows stay **speed-pending / `PARTIAL`**. No mm row advances 
   seam) → `serving_chat`. GATE: a served mm chat completion whose tokens == the e2e
   driver's. Size: **L** (parse + engine request path + processor wiring; the true
   prerequisite for a production-serving c2+ A/B).
+
+---
+
+## 10. W1 — VoxtralDecodeGraph (`CLAIM-MM-SPEED-GRAPH-W1`, 2026-07-27)
+
+**Base:** `origin/main` `e2b18fc8` (the §9 FIRST-BRICK HEAD). **Build:**
+`dgx.casa:~/work/mm-voxtral-graph`, cutlass 4.5.0 + FA2 sm_121a + Triton-AOT, arch 121a
+(FA2 ENABLED banner + Triton vendored MANIFEST-OK confirmed at configure; clean build).
+All GPU under `flock /tmp/gpu`, sole owner (`nvidia-smi` idle), cold rep0 dropped.
+
+**What §9.5 W1 asked for, closed:** Voxtral's Mistral/Llama text stack was the ONLY mm
+text stack with **no decode-graph class** (Qwen3.5-dense/MoE/DeepSeek all had one). Built
+`VoxtralDecodeGraph` (`voxtral.{h,cpp}`) — the Voxtral-text sibling of `Qwen3MoeDecodeGraph`
+(Qwen3-Coder, the closest precedent: pure full-attention over the SAME
+`dense_attn::AttnBlock` + `vt::PagedAttention` stack Voxtral uses, no GDN) — with the SAME
+cold→warm→replay state machine, padded-batch capture set (`decode_graph_sizes.h`) and
+persistent fixed-address host inputs + persistent embed/logits buffers. Routed
+`VoxtralGenerateGreedy`'s pure-decode loop through `VoxtralDecodeGraph::Step`; the eager
+path stays behind `VT_MM_DECODE_EAGER=1` (default = graph). One src file + its header.
+
+### 10.1 Grounding (ours + vLLM, file:line)
+- Ours: template `Qwen3MoeDecodeGraph` (`qwen3_moe.cpp:332`); the captured region is the
+  EXACT `ForwardLastLogits` op sequence (`voxtral.cpp`) the eager decode already ran; the
+  embed is kept OUTSIDE the capture (`VoxtralEmbedInto`, mirror `EmbedInto`).
+- vLLM: the generic decode cudagraph dispatch — `gpu_model_runner.py::GPUModelRunner`
+  (`_dummy_run` warm-up then `capture_model`) + `compilation/cuda_graph.py`
+  (pad-to-nearest-captured-size) @ pin `555967922`.
+- Capture-safety with growing seq_len: the paged full-attention decode (hd-128, GQA 32/8)
+  is the SAME path the already-gated Qwen3-Coder decode graph captures — host `max_seq_len`
+  only sizes the split grid; per-request geometry is read from the DEVICE `seq_lens`
+  (`cuda_flash_attn_fa2.cu:23-31`), so a captured graph stays correct as the sequence grows.
+
+### 10.2 CORRECTNESS (the RED line — HELD, token-exact, proven-to-run)
+Clean dgx build; golden md5 UNCHANGED before+after (`voxtral_golden.json`
+`8ab87b7e…`, `voxtral_neartie.json` `3d199c2d…`). Proof-of-run: `VT_DECODE_GRAPH_STATS=1`
+printed `captured Voxtral text decode graph … S=1 (real B=1)` + **46 replays** on the gate
+— the graphed path DID execute. **`test_voxtral_e2e`: PASS 14/14** — reproduces the
+committed near-tie seq **48/48** exactly, **STRICT prefix 33/48**, near-tie result PASS,
+worst gap 0.0 nats. Held across all 12 A/B runs (both modes, every run 14/14). The S==B==1
+bit-identical-rebuild premise is arbitrated by the token-exact gate and PASSES.
+
+### 10.3 RESULT — decode TPOT A/B (same-binary throwaway toggle `VT_MM_DECODE_EAGER`)
+Same-binary A/B (dgx-only throwaway steady-clock instrumentation around the decode loop,
+NOT committed): steady-state TPOT excludes the 2 cold+warm decode steps; 6 reps/mode in
+separate loads under ONE `flock`, rep0 dropped.
+
+| Vehicle | GRAPH steady (band) | EAGER steady (band) | Δ | vs vLLM 0.25.0 graphed 40.8 ms | Verdict |
+|---|---|---|---|---|---|
+| **Voxtral-Mini-3B audio (48 tok)** | **60.94 ms/tok** (60.79–61.07) | **61.71 ms/tok** (61.57–61.88) | **−0.77 ms/tok (~1.25%, graphed faster), NON-OVERLAPPING** | **1.52× → 1.49×** | small REAL win; gap NARROWS, does NOT close |
+
+### 10.4 Honest disposition — real non-overlapping win, but the §9.5 hypothesis is REFINED
+§9.5 hypothesized W1 is "the 1.52× gap-closer" because the 3B decode is not
+bandwidth-floored, so removing the eager per-step LAUNCH overhead would win big.
+**Measurement REFINES this:** graphing the decode IS a real, statistically-clean win
+(−0.77 ms/tok, ~1.25%, non-overlapping bands) — so there genuinely WAS ~0.77 ms/tok of
+removable per-step launch overhead — **but it is a small slice, and it does NOT close the
+gap** (1.52×→1.49× vs vLLM's 40.8 ms). The residual ~20 ms/tok is therefore **NOT launch
+overhead** (the graph removes essentially all of it): it is per-step **compute / kernel
+efficiency** — our eager-C++ decode does more GPU work per step than vLLM's torch.compile-
+fused + graphed decode. Closing the audio gap needs a decode-kernel-efficiency pass
+(nsys our graphed step vs vLLM's, port the divergent kernels 1:1) and/or batched c2+ (W2),
+not more graphing. **STRUCTURAL value delivered:** Voxtral's Mistral/Llama stack now HAS a
+decode-graph class (the last mm text stack without one) — a prerequisite for batched
+multi-seq mm decode (W2). mm rows stay **speed-pending / `PARTIAL`**: correctness-complete,
+audio decode now graphed with a small real win, still ~1.49× vs vLLM. No mm row advances
+to DONE.

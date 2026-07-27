@@ -824,6 +824,36 @@ and the audio launch-overhead win). W-plan: Voxtral decode-graph (audio 1.52x ga
 NOT bandwidth-floored) + batched multi-seq (c2+) + `image_url`/`audio_url` serving
 ingestion. No mm row advances to DONE (speed-pending).
 
+**MULTIMODAL SPEED - DECODE LEVER #3 W1: Voxtral (Mistral/Llama) decode-graph - real
+non-overlapping win but the audio 1.52x gap does NOT close (2026-07-27,
+`CLAIM-MM-SPEED-GRAPH-W1` [spec](../.agents/specs/multimodal-speed.md) S10).**
+`benchmark_binding=false` (single-seq test driver; vLLM graphed is the honest denominator).
+dgx GB10 sm_121a, build cutlass 4.5.0 + FA2 + Triton arch 121a; GPU under `flock /tmp/gpu`
+sole owner, cold rep0 discarded; same-binary A/B via throwaway toggle `VT_MM_DECODE_EAGER`
+(6 reps/mode, steady-state TPOT excludes the 2 cold+warm decode steps). Voxtral's
+Mistral/Llama text stack was the ONLY mm text stack with no decode-graph class (Qwen3.5
+dense/MoE/DeepSeek all had one); new `VoxtralDecodeGraph` (`voxtral.{h,cpp}`, sibling of
+`Qwen3MoeDecodeGraph`: pure full attention over `dense_attn::AttnBlock` + `vt::PagedAttention`,
+no GDN) captures the exact `ForwardLastLogits` op sequence; `VoxtralGenerateGreedy`'s decode
+now routes through it (S==B==1 bit-identical rebuild), eager fallback `VT_MM_DECODE_EAGER=1`.
+**Token-exact HELD (proven-to-run `VT_DECODE_GRAPH_STATS`: captured S=1 + 46 replays):**
+`test_voxtral_e2e` **14/14** (near-tie seq 48/48, strict prefix 33/48); golden md5 unchanged
+(`voxtral_golden.json` `8ab87b7e...`, `voxtral_neartie.json` `3d199c2d...`).
+
+| Vehicle | GRAPH steady (band) | EAGER steady (band) | delta | vs vLLM 0.25.0 graphed 40.8 ms |
+|---|---|---|---|---|
+| Voxtral audio (3B, 48 tok) | **60.94 ms/tok** (60.79-61.07) | **61.71 ms/tok** (61.57-61.88) | -0.77 ms/tok (~1.25%, NON-OVERLAPPING) | 1.52x -> 1.49x (narrows, does NOT close) |
+
+**HONEST verdict:** graphing the Voxtral decode is a real, statistically-clean win (bands
+non-overlapping), so there genuinely was ~0.77 ms/tok of removable per-step launch overhead,
+but it is a small slice and the gap does NOT close. The residual ~20 ms/tok vs vLLM's 40.8 ms
+is therefore NOT launch overhead (the graph removes essentially all of it): it is per-step
+COMPUTE / kernel efficiency (vLLM's torch.compile-fused + graphed decode does less GPU work
+per step). This REFINES the S9.5 hypothesis (W1 was framed as "the 1.52x gap-closer"). Closing
+the audio gap needs a decode-kernel nsys/port pass and/or batched c2+ (W2), not more graphing.
+STRUCTURAL value: Voxtral now has a decode-graph class (prerequisite for batched multi-seq mm
+decode). No mm row advances to DONE (speed-pending).
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =
