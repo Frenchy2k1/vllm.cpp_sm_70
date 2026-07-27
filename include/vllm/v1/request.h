@@ -14,8 +14,10 @@
 // slot these in without reshaping the struct:
 //   - prompt_embeds / prompt_is_token_ids / _prompt_embeds_per_block_hashes,
 //     mm_features (multimodal), pooling_params,
-//     lora_request, cache_salt (prefix caching salt), events /
-//     kv_transfer_params,
+//     events / kv_transfer_params,
+//     (cache_salt and the LoRA adapter name are un-deferred below for the
+//     prefix-cache extra-key path — KV-PREFIX-CACHE W2 / ROAD-V1-D4-APC; the
+//     full LoRARequest / LoRA runtime stays deferred to LORA-RUNTIME.)
 //     client_index, streaming / resumable
 //     state, prefill_stats, last_sched_seq (defer_block_free fence),
 //     num_nans_in_logits.
@@ -143,6 +145,23 @@ struct Request {
   // EngineCoreRequest.mm_features in FromEngineCoreRequest; consumed by the
   // encoder cache (M1 seam) and the vision tower (M2).
   std::vector<multimodal::MultiModalFeatureSpec> mm_features;
+  // cache_salt (Request.cache_salt, vllm/v1/request.py:154): an optional
+  // per-request string that partitions the prefix-cache namespace. When set it
+  // is folded into the FIRST block's hash only (chaining transitively
+  // thereafter), so two otherwise-identical prompts with different salts never
+  // share a cache block. Populated from EngineCoreRequest.cache_salt in
+  // FromEngineCoreRequest; consumed by generate_block_hash_extra_keys
+  // (kv_cache_utils.cpp). nullopt for the ordinary text path -> byte-identical.
+  std::optional<std::string> cache_salt;
+  // lora_name (Request.lora_request.lora_name, vllm/v1/request.py + vllm/lora/
+  // request.py:25): the LoRA adapter NAME of a LoRA request, or nullopt for a
+  // base-model request. Only the name is needed by the prefix-cache path: it is
+  // added to EVERY block's extra keys (kv_cache_utils.cpp
+  // _gen_lora_extra_hash_keys) so a LoRA request can never reuse a base-model
+  // (or different-adapter) cache block. The full LoRARequest / LoRA runtime is
+  // deferred to LORA-RUNTIME; this field carries just the hash key so the cache
+  // consumer is correct the moment LoRA lands. nullopt -> byte-identical.
+  std::optional<std::string> lora_name;
   // Already PostInit'd / validated by the frontend (upstream stores the
   // already-validated params; construction here does not re-validate). The
   // model's EOS token id (for the stop check) rides on sampling_params, as

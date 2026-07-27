@@ -162,6 +162,67 @@ TEST_CASE(
 }
 
 // ---------------------------------------------------------------------------
+// KV-PREFIX-CACHE W2: extra_keys (cache_salt) partition the cache — RED-first
+// no-false-share at the MANAGER level. Two requests with IDENTICAL tokens but
+// different cache_salt must NOT share a cached block: the second is a full miss.
+// A third request with the SAME salt as the first DOES hit — proving the salt is
+// the only differentiator and the cache is otherwise live. Were extra_keys
+// dropped (the pre-W2 stub), the differently-salted request would false-hit the
+// first request's blocks and be served the wrong tenant's KV.
+// Ported behaviour from vllm/tests/v1/core/test_prefix_caching.py
+// test_cache_key_salting @ 555967922.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "KVCacheManager: cache_salt partitions the prefix cache (no false-share)") {
+  init_none_hash(sha256_cbor);
+  const int block_size = 16;
+  auto mgr = MakeManager(MakeFullConfig(block_size, 11), block_size);
+
+  // 3 full blocks (48 tokens) of a shared prompt + a unique tail.
+  std::vector<int32_t> common;
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < block_size; ++j) common.push_back(i);
+  std::vector<int32_t> tokens = common;
+  for (int i = 0; i < 7; ++i) tokens.push_back(3);
+
+  auto make_salted = [&](const std::string& id, const std::string& salt) {
+    // Set cache_salt BEFORE installing the hasher (fields precede the first
+    // hash, as FromEngineCoreRequest does).
+    Request req(id, tokens, vllm::SamplingParams{}, /*arrival_time=*/0.0);
+    req.cache_salt = salt;
+    req.block_hasher_ = get_request_block_hasher(block_size, sha256_cbor);
+    req.update_block_hashes();
+    return req;
+  };
+
+  // req0 (tenant A) populates the cache.
+  Request req0 = make_salted("0", "tenantA");
+  REQUIRE(req0.block_hashes.size() == 3);
+  auto [c0, n0] = mgr->get_computed_blocks(req0);
+  CHECK(c0.blocks[0].empty());
+  CHECK(n0 == 0);
+  auto b0 = mgr->allocate_slots(req0, /*num_new_tokens=*/55, n0,
+                                std::optional<KVCacheBlocks>(c0));
+  REQUIRE(b0.has_value());
+
+  // req1 (tenant B) has the SAME tokens but a different salt -> FULL MISS.
+  Request req1 = make_salted("1", "tenantB");
+  // Different salt -> different block hashes than tenant A.
+  CHECK(req1.block_hashes != req0.block_hashes);
+  auto [c1, n1] = mgr->get_computed_blocks(req1);
+  CHECK(c1.blocks[0].empty());
+  CHECK(n1 == 0);  // no false-share across the salt boundary
+
+  // req2 (tenant A again) HITS req0's cached 3-block prefix.
+  Request req2 = make_salted("2", "tenantA");
+  CHECK(req2.block_hashes == req0.block_hashes);
+  auto [c2, n2] = mgr->get_computed_blocks(req2);
+  CHECK(c2.get_block_ids() == std::vector<std::vector<int>>{{1, 2, 3}});
+  CHECK(n2 == 3 * block_size);  // the cache is live for the matching salt
+}
+
+// ---------------------------------------------------------------------------
 // allocate_slots: OOM -> std::nullopt (the Scheduler preempts)
 // ---------------------------------------------------------------------------
 

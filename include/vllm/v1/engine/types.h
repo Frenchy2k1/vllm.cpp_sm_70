@@ -85,6 +85,14 @@ struct EngineCoreRequest {
   // downstream mm hook is a no-op and the engine is byte-identical. Populated by
   // the mm input pipeline (M1); consumed by the encoder cache / vision tower (M2).
   std::vector<multimodal::MultiModalFeatureSpec> mm_features = {};
+  // cache_salt (EngineCoreRequest.cache_salt): optional prefix-cache namespace
+  // salt carried from the frontend (OpenAI `cache_salt`) into Request.cache_salt
+  // and folded into the first block's hash. nullopt -> byte-identical text path.
+  std::optional<std::string> cache_salt = std::nullopt;
+  // lora_name (EngineCoreRequest.lora_request.lora_name): the LoRA adapter name,
+  // carried into Request.lora_name for the prefix-cache extra-key path. nullopt
+  // for a base-model request. Full LoRA runtime is LORA-RUNTIME.
+  std::optional<std::string> lora_name = std::nullopt;
 };
 
 // SamplerOutput (vllm/v1/outputs.py): the raw sampler result for a step.

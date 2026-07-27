@@ -485,6 +485,224 @@ TEST_CASE("test_request_block_hasher") {
   CHECK(hashes[1] != no_mm[1]);
 }
 
+// ---------------------------------------------------------------------------
+// generate_block_hash_extra_keys (KV-PREFIX-CACHE W2), ported 1:1 from
+// vllm/tests/v1/core/test_kv_cache_utils.py @ 555967922:
+//   - test_generate_block_hash_extra_keys
+//   - test_generate_block_hash_extra_keys_no_mm_inputs
+//   - test_generate_block_hash_extra_keys_cache_salt
+//   - test_generate_block_hash_extra_keys_lora
+// (The prompt_embeds cases are NOT ported: this tree has no prompt-embeds path;
+//  see the DEFERRED note in include/vllm/v1/request.h.)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using vllm::v1::generate_block_hash_extra_keys;
+using vllm::v1::Request;
+
+// Build a text Request (no block hasher) whose mm_features are the given
+// (offset, length) placeholders with the given mm hashes (identifiers).
+Request MakeMmRequest(const std::string& id, int num_tokens,
+                      const std::vector<std::pair<int, int>>& mm_positions,
+                      const std::vector<std::string>& mm_hashes) {
+  std::vector<int32_t> tokens;
+  for (int i = 0; i < num_tokens; ++i) tokens.push_back(i);
+  Request req(id, tokens, vllm::SamplingParams{}, /*arrival_time=*/0.0);
+  for (size_t i = 0; i < mm_positions.size(); ++i) {
+    vllm::multimodal::MultiModalFeatureSpec f;
+    f.mm_hash = mm_hashes[i];
+    f.offset = mm_positions[i].first;
+    f.length = mm_positions[i].second;
+    req.mm_features.push_back(f);
+  }
+  return req;
+}
+
+// A single mm extra key (identifier, offset).
+ExtraKey MmKey(const std::string& id, int64_t offset) {
+  return ExtraKey(std::pair<std::string, int64_t>(id, offset));
+}
+
+}  // namespace
+
+TEST_CASE("test_generate_block_hash_extra_keys") {
+  Request req = MakeMmRequest("0", /*num_tokens=*/20,
+                              {{0, 5}, {10, 5}}, {"hash1", "hash2"});
+
+  // No extra keys beyond the first mm input.
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 0, 5, 0);
+    REQUIRE(keys.has_value());
+    REQUIRE(keys->size() == 1);
+    CHECK((*keys)[0] == MmKey("hash1", 0));
+    CHECK(next == 1);
+  }
+  // Partial overlap -> negative relative offset.
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 3, 8, 0);
+    REQUIRE(keys.has_value());
+    REQUIRE(keys->size() == 1);
+    CHECK((*keys)[0] == MmKey("hash1", -3));
+    CHECK(next == 1);
+  }
+  // No overlap -> None, but the mm cursor still advanced past hash1.
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 6, 10, 0);
+    CHECK(!keys.has_value());
+    CHECK(next == 1);
+  }
+  // Multiple extra keys in one block.
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 0, 15, 0);
+    REQUIRE(keys.has_value());
+    REQUIRE(keys->size() == 2);
+    CHECK((*keys)[0] == MmKey("hash1", 0));
+    CHECK((*keys)[1] == MmKey("hash2", 10));
+    CHECK(next == 2);
+  }
+}
+
+TEST_CASE("test_generate_block_hash_extra_keys_no_mm_inputs") {
+  Request req = MakeMmRequest("0", /*num_tokens=*/6, {}, {});
+  auto [keys, next] = generate_block_hash_extra_keys(req, 0, 5, 0);
+  CHECK(!keys.has_value());
+  CHECK(next == 0);
+}
+
+TEST_CASE("test_generate_block_hash_extra_keys_cache_salt") {
+  Request req = MakeMmRequest("0", /*num_tokens=*/6, {}, {});
+  req.cache_salt = "salt";
+
+  // Salt is added for the first block only.
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 0, 1, 0);
+    REQUIRE(keys.has_value());
+    REQUIRE(keys->size() == 1);
+    CHECK((*keys)[0] == ExtraKey(std::string("salt")));
+    (void)next;
+  }
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 0, 10, 0);
+    REQUIRE(keys.has_value());
+    CHECK((*keys)[0] == ExtraKey(std::string("salt")));
+    (void)next;
+  }
+  // No salt for non-first blocks.
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 1, 2, 0);
+    CHECK(!keys.has_value());
+    (void)next;
+  }
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 6, 10, 0);
+    CHECK(!keys.has_value());
+    (void)next;
+  }
+
+  // Salt composes with mm keys, in order mm -> salt.
+  Request req_mm = MakeMmRequest("0", /*num_tokens=*/20, {{0, 5}}, {"hash1"});
+  req_mm.cache_salt = "salt";
+  auto [keys, next] = generate_block_hash_extra_keys(req_mm, 0, 5, 0);
+  REQUIRE(keys.has_value());
+  REQUIRE(keys->size() == 2);
+  CHECK((*keys)[0] == MmKey("hash1", 0));
+  CHECK((*keys)[1] == ExtraKey(std::string("salt")));
+  CHECK(next == 1);
+}
+
+TEST_CASE("test_generate_block_hash_extra_keys_lora") {
+  Request req = MakeMmRequest("0", /*num_tokens=*/6, {}, {});
+  req.lora_name = "test_lora_adapter";
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 0, 3, 0);
+    REQUIRE(keys.has_value());
+    REQUIRE(keys->size() == 1);
+    CHECK((*keys)[0] == ExtraKey(std::string("test_lora_adapter")));
+    (void)next;
+  }
+  // Cleared -> no extra keys.
+  req.lora_name = std::nullopt;
+  {
+    auto [keys, next] = generate_block_hash_extra_keys(req, 0, 3, 0);
+    CHECK(!keys.has_value());
+    (void)next;
+  }
+}
+
+// Order is lora -> mm -> cache_salt (upstream generate_block_hash_extra_keys
+// concatenation; R8(b) in the prefix-caching-parity spike).
+TEST_CASE("generate_block_hash_extra_keys ordering lora->mm->salt") {
+  Request req = MakeMmRequest("0", /*num_tokens=*/20, {{0, 5}}, {"hashX"});
+  req.lora_name = "adapterY";
+  req.cache_salt = "saltZ";
+  auto [keys, next] = generate_block_hash_extra_keys(req, 0, 5, 0);
+  REQUIRE(keys.has_value());
+  REQUIRE(keys->size() == 3);
+  CHECK((*keys)[0] == ExtraKey(std::string("adapterY")));  // lora first
+  CHECK((*keys)[1] == MmKey("hashX", 0));                   // mm second
+  CHECK((*keys)[2] == ExtraKey(std::string("saltZ")));      // salt last
+  CHECK(next == 1);
+}
+
+// RED-first no-false-share at the HASH level: two requests with IDENTICAL tokens
+// but different extra keys (mm hash / cache salt / lora) must hash to DIFFERENT
+// block hashes. The negative control (same tokens, no extra keys) hashes the
+// SAME, proving the extra key is the load-bearing differentiator. If the W2 stub
+// were still in place (extra_keys always None), every pair below would collide
+// and the two requests would false-share a cache block.
+TEST_CASE("extra_keys differentiate block hashes (no false-share)") {
+  using vllm::v1::get_request_block_hasher;
+  init_none_hash(sha256_cbor, "seed42");
+  const int block_size = 4;
+  std::vector<int32_t> tokens;
+  for (int i = 0; i < 8; ++i) tokens.push_back(i);  // 2 full blocks
+
+  auto hashes_of = [&](const std::optional<std::string>& salt,
+                       const std::optional<std::string>& lora,
+                       const std::vector<std::pair<int, int>>& mm_pos,
+                       const std::vector<std::string>& mm_hashes) {
+    // Set the extra-key inputs BEFORE installing the hasher (fields must be set
+    // before the first hash, as the real FromEngineCoreRequest path does).
+    Request req("r", tokens, vllm::SamplingParams{}, 0.0);
+    req.cache_salt = salt;
+    req.lora_name = lora;
+    for (size_t i = 0; i < mm_pos.size(); ++i) {
+      vllm::multimodal::MultiModalFeatureSpec f;
+      f.mm_hash = mm_hashes[i];
+      f.offset = mm_pos[i].first;
+      f.length = mm_pos[i].second;
+      req.mm_features.push_back(f);
+    }
+    req.block_hasher_ = get_request_block_hasher(block_size, sha256_cbor);
+    req.update_block_hashes();
+    return req.block_hashes;
+  };
+
+  const auto base = hashes_of(std::nullopt, std::nullopt, {}, {});
+  REQUIRE(base.size() == 2);
+
+  // cache_salt differentiates (and transitively chains into block 1).
+  const auto salted = hashes_of("tenantA", std::nullopt, {}, {});
+  CHECK(salted[0] != base[0]);
+  CHECK(salted[1] != base[1]);
+  // A different salt differs again.
+  const auto salted_b = hashes_of("tenantB", std::nullopt, {}, {});
+  CHECK(salted_b[0] != salted[0]);
+
+  // lora name differentiates every block.
+  const auto lora = hashes_of(std::nullopt, "adapter1", {}, {});
+  CHECK(lora[0] != base[0]);
+  CHECK(lora[1] != base[1]);
+  CHECK(lora != hashes_of(std::nullopt, "adapter2", {}, {}));
+
+  // mm hash differentiates the block it overlaps.
+  const auto mm1 = hashes_of(std::nullopt, std::nullopt, {{0, 4}}, {"img1"});
+  const auto mm2 = hashes_of(std::nullopt, std::nullopt, {{0, 4}}, {"img2"});
+  CHECK(mm1[0] != base[0]);
+  CHECK(mm1[0] != mm2[0]);
+}
+
 // Parent chaining: block N's hash depends on block N-1's (and on NONE_HASH for
 // block 0).
 TEST_CASE("hash_block_tokens_parent_chaining") {

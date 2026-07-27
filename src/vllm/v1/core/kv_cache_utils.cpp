@@ -382,12 +382,108 @@ void init_none_hash(const HashFn& hash_fn, std::optional<std::string> seed) {
 
 // --- Hashing -----------------------------------------------------------------
 
-std::pair<ExtraKeys, int> generate_block_hash_extra_keys(const Request& /*request*/,
-                                                         int /*start_token_idx*/,
-                                                         int /*end_token_idx*/,
+namespace {
+
+// _gen_mm_extra_hash_keys (vllm/v1/core/kv_cache_utils.py:451-517). For each
+// multimodal input that OVERLAPS this block, emit (mm_hash, offset-in-block).
+// mm_features are assumed sorted by mm_position.offset. Returns the extra keys
+// for this block plus the next mm index to resume from.
+std::vector<ExtraKey> GenMmExtraHashKeys(const Request& request,
+                                         int start_token_idx, int end_token_idx,
+                                         int start_mm_idx, int* next_mm_idx) {
+  std::vector<ExtraKey> extra_keys;
+  const auto& mm_features = request.mm_features;
+  if (mm_features.empty()) {
+    *next_mm_idx = start_mm_idx;
+    return extra_keys;
+  }
+
+  // Skip the whole scan once the block starts past the last mm input (the late
+  // prefill / decode phase). Mirrors the last_pos short-circuit.
+  const auto& last = mm_features.back();
+  if (last.offset + last.length <= start_token_idx) {
+    *next_mm_idx = start_mm_idx;
+    return extra_keys;
+  }
+
+  const int n = static_cast<int>(mm_features.size());
+  // start_mm_idx == -1 indicates the last mm input (block completed by
+  // generated tokens, so only the final mm input can matter).
+  if (start_mm_idx < 0) {
+    assert(-start_mm_idx <= n);
+    start_mm_idx = n + start_mm_idx;
+  }
+
+  int curr_mm_idx = start_mm_idx;
+  while (curr_mm_idx < n) {
+    const auto& mm_feature = mm_features[curr_mm_idx];
+    // Upstream asserts mm_feature.identifier is not None; mm_hash is that id.
+    const int offset = mm_feature.offset;
+    const int length = mm_feature.length;
+    if (end_token_idx > offset) {
+      if (start_token_idx >= offset + length) {
+        // This block has passed the current mm input.
+        ++curr_mm_idx;
+        continue;
+      }
+      // The block contains the current mm input. Include the mm hash and its
+      // offset RELATIVE to the start of the block, so identical placeholder
+      // blocks at different positions stay distinct.
+      extra_keys.emplace_back(std::pair<std::string, int64_t>(
+          mm_feature.mm_hash,
+          static_cast<int64_t>(offset) - static_cast<int64_t>(start_token_idx)));
+      if (end_token_idx >= offset + length) {
+        // This block also ends the current mm input; it may contain the next.
+        ++curr_mm_idx;
+      } else {
+        // Otherwise this block is done with mm inputs.
+        break;
+      }
+    } else {
+      // This block has not reached the current mm input.
+      break;
+    }
+  }
+  *next_mm_idx = curr_mm_idx;
+  return extra_keys;
+}
+
+}  // namespace
+
+std::pair<ExtraKeys, int> generate_block_hash_extra_keys(const Request& request,
+                                                         int start_token_idx,
+                                                         int end_token_idx,
                                                          int start_mm_idx) {
-  // T0 Request carries no mm/LoRA/salt/embeds, so there are never extra keys.
-  return {std::nullopt, start_mm_idx};
+  // Mirrors generate_block_hash_extra_keys
+  // (vllm/v1/core/kv_cache_utils.py:562-591). Fixed concatenation order:
+  //   lora -> mm -> cache_salt -> (prompt_embeds, deferred: no prompt-embeds
+  //   path in this tree). An empty result hashes as None (nullopt), which is
+  //   DISTINCT from an empty tuple.
+  int next_mm_idx = start_mm_idx;
+  std::vector<ExtraKey> mm_extra_keys =
+      GenMmExtraHashKeys(request, start_token_idx, end_token_idx, start_mm_idx,
+                         &next_mm_idx);
+
+  std::vector<ExtraKey> extra_keys;
+  // LoRA name applies to every block (_gen_lora_extra_hash_keys, :523-534).
+  if (request.lora_name.has_value()) {
+    extra_keys.emplace_back(*request.lora_name);
+  }
+  // mm keys next.
+  for (auto& key : mm_extra_keys) {
+    extra_keys.push_back(std::move(key));
+  }
+  // cache_salt applies to the FIRST block only (:579-581); chaining carries it
+  // transitively into later blocks' parent hash.
+  if (start_token_idx == 0 && request.cache_salt.has_value() &&
+      !request.cache_salt->empty()) {
+    extra_keys.emplace_back(*request.cache_salt);
+  }
+
+  if (extra_keys.empty()) {
+    return {std::nullopt, next_mm_idx};
+  }
+  return {std::move(extra_keys), next_mm_idx};
 }
 
 BlockHash hash_block_tokens(const HashFn& hash_function,
@@ -490,7 +586,8 @@ BlockHasher get_request_block_hasher(int hash_block_size,
         break;
       }
 
-      // MM and LoRA requests need extra keys (deferred; always none for T0).
+      // MM / LoRA / cache_salt requests fold extra keys into the block hash
+      // (generate_block_hash_extra_keys). None for the ordinary text path.
       std::pair<ExtraKeys, int> extra = generate_block_hash_extra_keys(
           request, start_token_idx, end_token_idx, curr_mm_idx);
       curr_mm_idx = extra.second;
