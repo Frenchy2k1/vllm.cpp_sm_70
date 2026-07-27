@@ -7,13 +7,32 @@ binding result, the active performance diagnosis, pending gates, and current
 reproduction entry points. For the user-facing overview (what the project is,
 how to build it, the CLI, the OpenAI server, and how to consume it), see the
 [README](../README.md); this page is the detailed numbers behind its
-[Performance](../README.md#performance) section. Attempt chronology and failure
+[Performance](../README.md#performance) section, and the per-capability
+lifecycle ledger is [docs/STATUS.md](STATUS.md). Attempt chronology and failure
 forensics live in the [parity ledger](../.agents/parity-ledger.md),
 [state log](../.agents/state.md), linked specs, and Git. Those raw records are
 append-only within the current era and are frozen under `.agents/completed/`
 when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
+
+**DOCS user-facing split: README landing page + `docs/STATUS.md` ledger
+(2026-07-27, `CLAIM-DOCS-README-SPLIT`).** Disposition: **NOT APPLICABLE (no
+measurement taken, claimed, or owed; `benchmark_binding=false`).** Documentation
+and CI-checker change only: no source, kernel, or engine path is touched, so no
+throughput or correctness number moves and none is quoted. The per-capability
+status ledger moved OUT of `README.md` into the new user-facing
+[`docs/STATUS.md`](STATUS.md) (capability table, model-family notes, serving and
+API notes, verification protocol), leaving the README a landing page (61,909 ->
+22,965 chars). The obligation moved with it: `AGENTS.md` and
+`scripts/check-doc-checkpoint.py` now require `docs/STATUS.md` (not `README.md`)
+at every feature checkpoint, and `scripts/check-readme-structure.py` gained a
+README size budget, a prose-paragraph cap, a tightened table-cell cap (400 ->
+220), and a required `docs/STATUS.md` capability-table check. Every number in
+both documents was MOVED verbatim, not restated or re-derived. Reproduce:
+`python3 scripts/check-readme-structure.py && python3
+tests/scripts/test_check_readme_structure.py` (18/18) and `python3
+scripts/check-doc-checkpoint.py --base <base> --head <head>`.
 
 **ROAD-V1-C8 /metrics + utility endpoints (2026-07-27, `CLAIM-ROADMAP-C8`, NOT
 pushed).** Disposition: **NOT APPLICABLE (no throughput number, `benchmark_binding=false`).**

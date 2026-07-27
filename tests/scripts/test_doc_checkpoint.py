@@ -22,12 +22,12 @@ class DocumentationCheckpointTests(unittest.TestCase):
     def test_production_change_requires_both_public_documents(self) -> None:
         errors = doc_checkpoint.checkpoint_errors({"src/vllm/example.cpp"})
         self.assertEqual(len(errors), 2)
-        self.assertIn("README.md", errors[0])
+        self.assertIn("docs/STATUS.md", errors[0])
         self.assertIn("docs/BENCHMARKS.md", errors[1])
 
     def test_one_public_document_does_not_satisfy_checkpoint(self) -> None:
         errors = doc_checkpoint.checkpoint_errors(
-            {"tests/vllm/test_example.cpp", "README.md"}
+            {"tests/vllm/test_example.cpp", "docs/STATUS.md"}
         )
         self.assertEqual(len(errors), 1)
         self.assertIn("docs/BENCHMARKS.md", errors[0])
@@ -47,7 +47,7 @@ class DocumentationCheckpointTests(unittest.TestCase):
             doc_checkpoint.checkpoint_errors(
                 {
                     ".agents/engine-matrix.md",
-                    "README.md",
+                    "docs/STATUS.md",
                     "docs/BENCHMARKS.md",
                 }
             ),

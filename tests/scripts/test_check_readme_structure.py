@@ -57,6 +57,22 @@ VALID = "\n".join(
         "",
         "Link libvllm.",
         "",
+        "Status ledger: docs/STATUS.md",
+        "",
+    ]
+)
+
+# A minimal docs/STATUS.md that satisfies the ledger rules.
+VALID_STATUS = "\n".join(
+    [
+        "# vllm.cpp status",
+        "",
+        "## Capability status",
+        "",
+        "| Capability | State |",
+        "|---|---|",
+        "| Thing | Works |",
+        "",
     ]
 )
 
@@ -107,11 +123,58 @@ class ReadmeStructureTests(unittest.TestCase):
         errors = readme_structure.readme_errors(mutated)
         self.assertTrue(any("wall-of-prose" in e for e in errors), errors)
 
-    def test_long_prose_outside_a_table_is_allowed(self) -> None:
-        # A long paragraph (not a table cell) must NOT trip the cell check.
+    def test_long_prose_paragraph_fails(self) -> None:
+        # A wall-of-prose paragraph is the drift this rule exists to stop. It is
+        # reported as a paragraph problem, not as a table-cell one.
         mutated = VALID.replace("Measured numbers.", "word " * 300)
         errors = readme_structure.readme_errors(mutated)
-        self.assertFalse(any("wall-of-prose" in e for e in errors), errors)
+        self.assertTrue(any("prose paragraph" in e for e in errors), errors)
+
+    def test_long_code_block_is_allowed(self) -> None:
+        # Fenced code is exempt: a long build recipe is not wall-of-prose.
+        mutated = VALID.replace(
+            "cmake -S . -B build", "\n".join(["cmake -S . -B build"] * 60)
+        )
+        errors = readme_structure.readme_errors(mutated)
+        self.assertEqual(errors, [])
+
+    def test_long_table_is_allowed(self) -> None:
+        # Many short rows are fine; it is long CELLS that are the smell.
+        rows = "\n".join(["| Thing | Works |"] * 80)
+        mutated = VALID.replace("| Thing | Works |", rows)
+        errors = readme_structure.readme_errors(mutated)
+        self.assertEqual(errors, [])
+
+    def test_oversized_readme_fails(self) -> None:
+        mutated = VALID + "\n" + ("- a filler bullet line\n" * 3000)
+        errors = readme_structure.readme_errors(mutated)
+        self.assertTrue(any("landing-page budget" in e for e in errors), errors)
+
+    def test_missing_status_link_fails(self) -> None:
+        mutated = VALID.replace("Status ledger: docs/STATUS.md", "No ledger.")
+        errors = readme_structure.readme_errors(mutated)
+        self.assertTrue(any("STATUS.md" in e for e in errors), errors)
+
+    def test_tightened_cell_budget_catches_mid_length_cells(self) -> None:
+        # 300 chars passed under the old 400-char threshold; it must not now.
+        cell = "x" * 300
+        mutated = VALID.replace("| Thing | Works |", f"| Thing | {cell} |")
+        errors = readme_structure.readme_errors(mutated)
+        self.assertTrue(any("wall-of-prose" in e for e in errors), errors)
+
+
+class StatusStructureTests(unittest.TestCase):
+    def test_minimal_valid_status_passes(self) -> None:
+        self.assertEqual(readme_structure.status_errors(VALID_STATUS), [])
+
+    def test_shipped_status_passes(self) -> None:
+        text = (ROOT / "docs/STATUS.md").read_text(encoding="utf-8")
+        self.assertEqual(readme_structure.status_errors(text), [])
+
+    def test_missing_capability_table_fails(self) -> None:
+        mutated = VALID_STATUS.replace("## Capability status", "## Misc notes")
+        errors = readme_structure.status_errors(mutated)
+        self.assertTrue(any("capability status" in e for e in errors), errors)
 
 
 if __name__ == "__main__":

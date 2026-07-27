@@ -10,7 +10,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PUBLIC_CHECKPOINTS = ("README.md", "docs/BENCHMARKS.md")
+# The per-capability status surface is docs/STATUS.md, NOT README.md: pointing
+# this obligation at the README is what drifted it from a landing page into a
+# status log. README.md changes only when a user-visible headline shifts, which
+# is a judgement call this checker deliberately does not force.
+PUBLIC_CHECKPOINTS = ("docs/STATUS.md", "docs/BENCHMARKS.md")
 
 CHECKPOINT_PREFIXES = (
     ".agents/completed/",
@@ -130,13 +134,13 @@ def main() -> int:
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)
         print(
-            "Update README.md and docs/BENCHMARKS.md with the current "
+            "Update docs/STATUS.md and docs/BENCHMARKS.md with the current "
             "stage/result, including explicit pending or void outcomes.",
             file=sys.stderr,
         )
         return 1
 
-    print("OK: feature checkpoints update README.md and docs/BENCHMARKS.md.")
+    print("OK: feature checkpoints update docs/STATUS.md and docs/BENCHMARKS.md.")
     return 0
 
 
