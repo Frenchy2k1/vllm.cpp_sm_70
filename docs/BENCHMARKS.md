@@ -40,34 +40,35 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
-**DFlash speculative decode (block-diffusion) - D13 c1 NEAR-PARITY (ours 0.978x, ~2%
-below vLLM; gap CLOSED 0.917x->0.978x); `SPEC-DFLASH` stays `ACTIVE` (2026-07-27,
-`CLAIM-DFLASH-D13`, `benchmark_binding=true`,
+**DFlash speculative decode (block-diffusion) - D14 c1 SPEED GATE MET (ours 29.32 >= vLLM
+29.24 tok/s, non-overlapping 3-rep bands, 1.003x); `SPEC-DFLASH` = `DONE` (2026-07-27,
+`CLAIM-DFLASH-D14`, `benchmark_binding=true`,
 dgx GB10 sm_121a, pin `555967922`/vLLM 0.26.0.dev0, one `flock` series, cold rep
-discarded, 8 prose+code prompts x 256 out tok, input-len 512, greedy, c1).** Part C
-landed the fixed-capacity paged draft-KV store wired through `vt::DFlashPagedBlockAttention`
-plus the static-shape draft-step CUDA graph (capture+replay); capture-correctness PROVEN
-(replayed==eager BIT-IDENTICAL, `test_qwen27_dflash_spec_decode` 27/27 with the graph
-producing the same tokens + acceptance 19/39/29/25 as eager). c1 A/B: our OFF 10.24 tok/s
-(TPOT 97.6 ms); our DFlash-ON eager-paged 28.65 (28.69/28.61); **our DFlash-ON GRAPHED
-28.70 tok/s (28.70/28.70), TPOT 34.40 ms**; vLLM-DFlash-ON graphed MRV2 steady-state
-**29.35 tok/s** (tight 3-rep 29.33/29.37/29.33, TPOT 34.07, acc_len 4.44); the D9 28.09 was a
-colder cross-session outlier. VERDICT = **NEAR-PARITY: ours 0.978x (~2% below)** on the rigorous
-same-session band (across sessions ours 28.70 falls inside vLLM's observed 28.09-29.37 range),
-ON/OFF 2.80x (vLLM ~2.98x), our OFF >= vLLM OFF. Per the acceptance rule ("below on any axis =
-an open gap; near-parity is NOT met") the >=vLLM bar is NOT met, so SPEC-DFLASH stays `ACTIVE`;
-the residual ~2% is per-step compute (ours acceptance ~3.68 accepted draft-tok/step > vLLM 3.44,
-both graphed) - nsys both draft steps is the next lever. HONEST ATTRIBUTION (supersedes
-the D9 "eager-vs-graphed" hypothesis): the CUDA graph is performance-NEUTRAL here (+0.3% over
-the eager paged path); the ACTUAL lever was the paged context read, which removed the
-D9/D12 per-layer [context;block] `IndexCopy` materialization of the whole growing context
-(25.75 D9 materialized -> 28.65 eager-paged, +11%). Inertness on the capture binary: 27B
-SACRED 235/235 + 27B MTP 9/9 byte-identical; CUDA `-Werror` clean; no new kernel (the D12
-paged kernel was already memcheck-0 across 795648 assertions; the token-diff is the
-capture-safety proof). Repro: `/tmp/d13_ab.sh` (ours), `scripts/spec/vllm_dflash_timing.py`
-(vLLM), dataset `/tmp/dflash_bench_prompts.json`; raw dgx logs `/tmp/d13_ab.log`,
-`/tmp/d13_vllm_on.log`. Correctness gate form unchanged (strict run-deterministic match to
-vLLM-DFlash-ON; the ratified near-tie is the honest final correctness form, bf16-irreducible).
+discarded, 8 prose+code prompts x 256 out tok, input-len 512, greedy, c1).** D14 closed
+the D13 ~2% residual. An nsys (`--cuda-graph-trace=node`) of the graphed spec-on step
+attributed it to OUR from-scratch draft attention `DFlashPagedBlockAttentionKernel`
+(242.9 ms = 1.8% of the 13.7 s GPU total, median ~460 us/call over context ~500-640, vs
+vLLM's fused flash draft-attn ~0.15%; BOTH engines run identical `cutlass_80_wmma` for the
+draft bf16 GEMMs, so the GEMMs were NOT the gap). Ported it to a WARP-scoped online-softmax
+variant `DFlashPagedBlockAttentionWarpKernel` (one warp per (query,head), `__shfl_xor`
+butterfly, register accumulator, no `__syncthreads` storm; same paged/block read + mask +
+GQA; default ON, `VT_DFLASH_ATTN_BLOCK=1` = the bit-identical D12/D13 block kernel). Draft
+attn **242.9 -> 77.9 ms (3.1x)**; our-ON c1 **28.60 -> 29.32 tok/s (+2.5%)**. **FINAL 3-rep
+A/B: our OFF 10.16 tok/s; our DFlash-ON GRAPHED 29.42/29.27/29.32 (median 29.32), TPOT ~33.6
+ms; vLLM-DFlash-ON graphed MRV2 29.240/29.247/29.233 (median 29.240), TPOT ~34.2, acc_len
+~4.45.** VERDICT = **>=vLLM MET: our WORST rep (29.27) exceeds vLLM's BEST (29.247), bands do
+not overlap, 1.003x.** Correctness UNCHANGED (output is exact by spec-decode construction):
+e2e `test_qwen27_dflash_spec_decode` 27/27 graph==eager BIT-IDENTICAL, acceptance 19/39/29/25
+unchanged (1629 draft tokens accepted, identical warp-vs-block across the whole A/B set),
+2/4 STRICT; CUDA==CPU `test_ops_dflash_paged_block_attn` 795648/795648 (warp within f32 1e-4 /
+bf16 3e-2 envelope) + compute-sanitizer memcheck 0. Inertness: 27B SACRED 235/235 + 27B MTP
+9/9 byte-identical; CUDA `-Werror` clean; `check-device-leakage` not increased. Repro: our A/B
+harness `d14_ab.sh` (env `VT_DFLASH_GRAPH=1 VT_DFLASH_PAGED=1`), vLLM `vllm_dflash_timing3.py`
+(load-once 3-rep, `--use-cudagraph`), dataset `/tmp/dflash_bench_prompts.json`; nsys
+`/tmp/d14_ours_specon.nsys-rep` (block) + `/tmp/d14_ours_warp.nsys-rep` (warp). Correctness
+gate form unchanged (strict run-deterministic match to vLLM-DFlash-ON; the ratified near-tie
+is the honest final correctness form, bf16-irreducible). Block-diffusion drafting is now
+correctness-complete AND at/above vLLM throughput - the roadmap's final open speed item.
 
 **DFlash D0-D12 history (superseded by D13; retained for the campaign record).** D0 ORACLE
 BASELINE CAPTURED, D1 landed (2026-07-26, `CLAIM-DFLASH-D0D1`,
