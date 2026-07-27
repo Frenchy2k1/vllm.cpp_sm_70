@@ -26198,3 +26198,138 @@ before/after). Then #3 (batched serving via the landed `EncoderCacheManager` sea
 **Records:** `specs/multimodal-speed.md` §3/§5 citation fixes + new §8; ledger + this
 entry + `CLAIM-MULTIMODAL-SPEED-ATTR`; minimal honest README/BENCHMARKS touch. Did NOT
 touch the sibling CPU/quant-GGUF agent's files. One commit on this worktree; NOT pushed.
+**Running exclusion list for the GEMM gap:** barrier traffic (BK=32, neutral),
+tile width (64x64, REAL — landed), staging latency (double buffering, neutral),
+mma precision (half, neutral). What remains untested: the per-element staging
+WORK rather than its latency, and the simdgroup_load-to-mma issue ratio at the
+64x64 tile (BK was only ever varied at 32x32).
+
+**Goal:** 15.30 of 27.9 tok/s, 1.82x remaining.
+
+---
+
+## 2026-07-27 — vectorised GEMM staging: kernel 1.55x, now 76-86% of MLX
+
+**Found by reading MLX's steel loader**, which the exclusion list made the
+obvious move: tile width, barriers, staging latency and mma precision were each
+measured and only the per-element staging WORK remained.
+`steel/gemm/loader.h:77` copies a whole vector per instruction
+(`*(threadgroup ReadVector*)dst = *(const device ReadVector*)src`); ours paid two
+branches inside `vt_load` per element plus a scalar threadgroup write.
+
+| shape | before | after | MLX steel |
+|---|--:|--:|--:|
+| qkv | 1484 GFLOP/s | **2282** | 2640 |
+| mlp-up | 1574 | **2501** | 3325 |
+| mlp-dn | 1507 | **2382** | 3293 |
+
+**1.55x on the kernel: 45% of MLX's GEMM -> 76-86% of it.** End to end 15.30 ->
+**15.85 tok/s**, TTFT **2065 -> 1774 ms**. The end-to-end gain is far smaller
+than the kernel gain because prefill is now only ~22% of the run.
+
+**Guarded:** bf16 x bf16, `k % 4 == 0`, `lda % 4 == 0`, BT, fully interior tile.
+Everything else keeps the generic path. SACRED gate 16/16 UNCHANGED, row
+diagnostic NONE, suite 21 cases / 20,135 assertions.
+
+**Method note worth keeping:** the four excluded hypotheses were what made this
+findable. Reading a competitor's source is far more productive once measurement
+has narrowed WHAT to look for; scanning `loader.h` first would have been one
+guess among many.
+
+**Goal:** 15.85 of 27.9 tok/s, 1.76x remaining. Decode is now dominant again
+(~6.3 s vs MLX-LM's 4.59 s, 1.37x); prefill ~1.77 s vs ~0.47 s.
+
+---
+
+## 2026-07-27 — vectorised decode GEMV: 15.85 -> 17.41 tok/s (+9.8%)
+
+Applied the loader lesson from MLX's steel GEMM to the op that dominates DECODE,
+which became the larger pool once prefill fell to ~22% of the run. The GEMV had
+already lost `vt_load`'s per-element branches; each lane still issued one 2-byte
+load per element. A `ushort4` makes that one 8-byte load, so a simdgroup fetches
+256 contiguous bytes per iteration instead of 64.
+
+**15.85 -> 17.41 tok/s (+9.8%)**, duration 8.07 -> 7.36 s, TTFT unchanged
+(decode-only). Guarded on bf16 x bf16 and `k % 4 == 0`; other dtypes and shapes
+keep the scalar paths. bf16-in/f32-out NMSE 5.19e-15 vs 5.11e-15 before.
+
+**Golden re-captured and oracle-validated (vLLM 0.25.0, version read from the
+interpreter first). The quality profile is IDENTICAL:** 254/256 tokens are
+vLLM's own argmax, mean gap 0.98 mnats, max 0.125 nats, 0 outside top-K — all
+unchanged. 12 of 256 tokens differ across 2 prompts; those near-tie positions
+simply resolve the other way. Gate 16/16.
+
+**Goal:** 17.41 of 27.9 tok/s, **1.60x remaining**. Decode ~5.6 s vs MLX-LM's
+4.59 s (1.22x); prefill ~1.75 s vs ~0.47 s (3.7x). Prefill is now the larger
+RATIO but the smaller pool. Untested: the same vectorisation on the mm kernel's
+B tile (only A was done), whose BT layout needs the load to run along k.
+
+---
+
+## 2026-07-27 — B-tile vectorisation: shape-split, net NEUTRAL, reverted
+
+The A tile's vectorisation was worth 1.55x, so the B tile was the obvious other
+half. BT forces a different loop shape (load along k for one column, scatter four
+results down the tile's k dimension). Built, correct (row diagnostic NONE, suite
+21/21), **net neutral end to end: 17.44 vs 17.41 tok/s. Reverted.**
+
+| shape | scalar B | vectorised B |
+|---|--:|--:|
+| qkv 512x2048x2048 | 2282 GFLOP/s | **1939 (-15%)** |
+| mlp-up 512x2048x6144 | 2501 | 2618 (+4.7%) |
+| mlp-dn 512x6144x2048 | 2382 | 2517 (+5.7%) |
+
+**Cause: thread under-utilisation, not the vectorisation itself.** Scalar B
+staging walks `BK*BN = 512` elements over 256 threads (two each); the vectorised
+form walks `(BK/4)*BN = 128` vector loads over the same 256, so **half the
+threadgroup idles during B staging**. Larger K amortises that over more k-blocks,
+which is exactly why only the two 6144-dimension shapes gain.
+
+**If retried, fix utilisation FIRST** (BK=16 to restore 256 items, or stage A
+with the idle half); vectorising harder without that just trades one shape
+against another.
+
+**Goal:** 17.41 of 27.9 tok/s, 1.60x remaining. Decode ~5.6 s vs MLX-LM's 4.59 s
+(1.22x); prefill ~1.75 s vs ~0.47 s (3.7x).
+
+## 2026-07-27 — MM speed lever #2 CLOSED: on-GPU greedy argmax + decode embed round-trip removed (bit-exact; small-to-neutral)
+
+**Claim:** `CLAIM-MULTIMODAL-SPEED-DECODE`. Base `origin/main` `f2facf3c`, isolated
+worktree `.claude/worktrees/agent-a35c1368005c99f87`. dgx GB10 sm_121a build+gate
+`~/work/mm-argmax-speed` (git-archive of the code commit, cutlass 4.5.0 + FA2 +
+Triton-AOT, arch 121a), all GPU under `flock $HOME/gpu.lock` sole owner,
+local-ai-worker stopped. NOT pushed.
+
+**Lever (multimodal-speed.md §5 #2), closed on both mm eager decode loops:**
+`VLGenerateCoreGdn` (qwen3_5.cpp, shared 27B image+video) and
+`VoxtralGenerateGreedy` (voxtral.cpp). (a) greedy argmax runs ON the GPU via
+`vt::GreedyArgmax` (device vocab reduction, download only the winning int64 id) —
+the host `VLArgMax`/`ArgMax` scans are REMOVED (device path is the only greedy
+path). (b) the decode token is embedded ON DEVICE and fed straight to the forward;
+the redundant embed D2H→H2D round-trip is gone. Grounded in our production sampler
+(`sampler.cpp:315-318` → `vt::GreedyArgmax`) and vLLM `sampler.py` greedy
+(`torch.argmax`, lowest-index tie).
+
+**Correctness (RED line HELD, bit-exact):** goldens md5-identical before+after.
+27B image STRICT 32/32 (54/54), 27B video STRICT 32/32 (27/27), 4B image STRICT
+32/32 (46/46, unchanged code), Voxtral audio 14/14 (reproduces near-tie seq 48/48,
+strict prefix 33/48). Bit-identical BY CONSTRUCTION (lossless bf16 round-trip;
+identical f32 argmax + lowest-index tie).
+
+**Speed (same-binary A/B, throwaway `VT_MM_HOST_ARGMAX` toggle, rep0 dropped):**
+Voxtral decode TPOT 61.85 ms (band 61.73–61.94) DEV_NEW vs 62.08 ms (61.90–62.23)
+HOST_OLD = ~0.25 ms/tok (~0.4%) consistent win. 27B image decode TPOT 223.0 ms
+(221.7–225.2) vs 224.0 ms (221.7–227.7) = NEUTRAL (within ±1.5% noise, ~222 ms
+weight-streaming floor). Both bit-exact each rep.
+
+**Honest disposition:** lever #2 CLOSED, but the win is small (audio) to neutral
+(27B) — even at 3B the ~62 ms eager forward dominates the ~0.25 ms host round-trip,
+so §5's "audio is where #2 bites" hypothesis is REFINED: our audio decode is 62 ms
+(not 41), and the host round-trips are a thin slice. The real audio gap vs vLLM
+(1.52×) is eager per-step launch overhead = lever #3 (graphed/batched decode), for
+which on-GPU sampling is now a prerequisite in place. mm rows stay `PARTIAL`
+(speed-pending). Throwaway dgx A/B instrumentation NOT committed (repo commit is
+device-only). Seven checkers bare RC green. FULL SHA reported to the dispatcher.
+
+**Next (unchanged DONE-bar residual):** lever #3 — batched/graphed mm serving
+(c2+, `image_url`/`audio_url` ingestion) + graphed decode to close the audio 1.52×.

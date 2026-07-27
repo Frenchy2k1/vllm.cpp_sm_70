@@ -750,17 +750,34 @@ compute-sanitizer memcheck **0 errors**. Lever #1 CLOSED; remaining DONE-bar = b
 graphed mm serving (c2+) + audio our-side. `benchmark_binding=false`, SPEED still pending
 on the batched-serving axis.
 
-**MULTIMODAL SPEED - attribution refined, next steps queued (2026-07-27,
-`CLAIM-MULTIMODAL-SPEED-ATTR` [spec](../.agents/specs/multimodal-speed.md) S8).** NO NEW
-NUMBER: this pass ran on a dev box with no GPU/dgx/oracle and a 99%-full disk, so no
-profile/build/oracle/gate was possible; nothing changed vs the 2026-07-26 measured passes
-above. Verified from our source the exact per-token host round-trips of the eager mm
-decode loop (`qwen3_5.cpp:6871-6895`: host MRoPE build + a redundant embed D2H->H2D + a
-full-vocab logits D2H + host argmax; Voxtral `voxtral.cpp:425-442` identical) and pinned
-the paste-ready dgx recipe (do audio our-side timing first, then on-GPU argmax, then
-batched serving). PENDING axes unchanged: audio our-side (vLLM denominator TTFT 43 / TPOT
-41 ms captured, ours still UNMEASURED) and c2+ batched-serving throughput. Next repro:
-spec S8.2.
+**MULTIMODAL SPEED - DECODE LEVER #2 EXECUTED: on-GPU greedy argmax + decode embed
+round-trip removed; bit-exact, small-to-neutral (2026-07-27,
+`CLAIM-MULTIMODAL-SPEED-DECODE` [spec](../.agents/specs/multimodal-speed.md) S8).**
+`benchmark_binding=false` (decode A-B via the e2e test driver, not a production serving
+binding). dgx GB10 sm_121a, build cutlass 4.5.0 + FA2 + Triton-AOT arch 121a; ALL GPU
+under `flock` sole owner, cold rep0 discarded. **Change:** both mm eager decode loops
+(`VLGenerateCoreGdn` 27B image+video; `VoxtralGenerateGreedy` audio) now (a) run the
+greedy pick ON the GPU via `vt::GreedyArgmax` (device vocab reduction, download only the
+winning int64 id) instead of D2H-ing the full `[1,vocab]` f32 logits + host scan, and (b)
+embed the decode token on-device (the redundant embed D2H->H2D round-trip is gone). Host
+argmax REMOVED = the device path is the only greedy path. **SAME-BINARY A-B** (throwaway
+`VT_MM_HOST_ARGMAX` toggle, DEV_NEW = shipped, HOST_OLD = restored round-trips):
+
+| Vehicle | DEV_NEW TPOT (band) | HOST_OLD TPOT (band) | Delta | vs vLLM 0.25.0 graphed |
+|---|---|---|---|---|
+| Voxtral audio (3B) | **61.85 ms** (61.73-61.94) | 62.08 ms (61.90-62.23) | -0.25 ms/tok (~0.4%) | vLLM 40.8 ms = 1.52x slower |
+| Qwen3.6-27B image | **223.0 ms** (221.7-225.2) | 224.0 ms (221.7-227.7) | ~0 (within +-1.5% noise) | vLLM 226.9 ms = at parity |
+
+**Correctness (RED line, HELD, bit-exact):** goldens md5-identical before+after; 27B image
+STRICT **32/32** (54/54), 27B video STRICT **32/32** (27/27), 4B image STRICT **32/32**
+(46/46, unchanged code), Voxtral **14/14** (reproduces near-tie seq 48/48, strict prefix
+33/48). Bit-identical BY CONSTRUCTION (lossless bf16 round-trip; identical f32 argmax +
+lowest-index tie). **HONEST verdict:** lever #2 is CLOSED but the win is small (audio ~0.4%)
+to neutral (27B, on the ~222 ms weight-streaming floor). The S5/S2.3 hypothesis that audio
+is where the host round-trips BITE is REFINED: our audio decode is ~62 ms/tok eager (not
+41), so the host round-trips are a thin slice; the real 1.52x audio gap vs vLLM is eager
+per-step launch overhead (lever #3, graphed/batched decode, for which on-GPU sampling is
+now a prerequisite in place). No mm row advances to DONE (speed-pending).
 
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
