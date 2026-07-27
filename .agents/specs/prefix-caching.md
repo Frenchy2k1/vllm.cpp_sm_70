@@ -109,7 +109,7 @@ same decision is made without importing a model class.
 | W0 | no-prefix coordinator, model-default/CLI resolution, cache-off online contract and CPU tests | implemented; GPU gating open |
 | W1 | cache salt/skip-reading and partial-block semantics/tests | open |
 | W2 | retention interval, connector/event/metrics surfaces | open |
-| W3 | model-positive APC on supported decoder families and cache-on performance/memory gates | blocked on a supported non-hybrid model family |
+| W3 | model-positive APC on supported decoder families and cache-on performance/memory gates | **DONE 2026-07-27** (`CLAIM-ROADMAP-D4APC-W3`, dgx GB10) — the "blocked on a supported non-hybrid family" note was STALE; `Qwen/Qwen3-4B` (dense, full-attention, APC-default-ON) is the vehicle. `test_qwen3_apc_e2e` 2/2: APC-ON==APC-OFF token-exact 5/6 (1 vLLM-confirmed 0.125-nat near-tie), == vLLM-APC-ON teacher-forced, hits 2240/2777 (0.807), TTFT 70.1→39.9 ms = 1.76×. Every-axis cache-on grid = separate perf follow-on |
 | W4 | distributed/context-parallel and cross-attention breadth | open |
 
 ## Risks and decisions
