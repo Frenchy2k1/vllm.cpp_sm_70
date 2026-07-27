@@ -1039,6 +1039,51 @@ prefill) is UNMEASURED our-side vs vLLM's 43 ms, and there is no batched c2+ mm 
 `audio_url` serving ingestion (the same structural gaps that keep image/video PARTIAL). No mm row
 reaches full DONE this pass.
 
+**MULTIMODAL SPEED - AUDIO ENCODER TTFT: measured our-side + warp-attention brick landed (4.7x),
+still NOT at parity - residual attributed to O(t-squared) attention + host marshalling (2026-07-27,
+`CLAIM-MM-SPEED-AUDIO-ENC` [spec](../.agents/specs/multimodal-speed.md) S13).**
+`benchmark_binding=false` (single-seq test driver; vLLM graphed is the honest denominator). dgx GB10
+sm_121a `~/work/mm-audio-fa2`, build cutlass 4.5.0 + FA2 + Triton arch 121a (incremental on the S12
+tree, same flags); ALL GPU under `flock /tmp/gpu` sole owner (`nvidia-smi` idle, `local-ai-worker`
+absent), cold rep0 dropped. Closes the S12 open item (audio TTFT unmeasured our-side). Base local
+`main` `9e34a19c`. **ATTRIBUTION (nsys `cuda_gpu_kern_sum --cuda-graph-trace=node`):** the naive
+Whisper encoder attention `vt::cuda::AttentionKernel` (one CTA per (query,head) streaming all 1500
+keys with a per-key block `__syncthreads` reduction - the exact O(t-squared)-sync anti-pattern S7
+fixed for the Qwen3-VL vision tower) dominates the 32-layer encoder forward. **LEVER (1:1 the S7
+vision-tower fix):** route the encoder self-attention (head_dim 64, non-causal, bidirectional) to the
+warp-scoped online-softmax `vt::AttentionDenseFast` (one WARP per (query,head), head_dim reduction a
+butterfly `__shfl_xor`, no `__syncthreads`, register accumulator - identical f32 online-softmax within
+the bf16 envelope; `kAttention` for the text decode is untouched). Grounded in vLLM
+`model_executor/models/whisper.py` `WhisperEncoderAttention` (:255) forward (:298-317) -> the
+flash-attn varlen non-causal backend @ e24d1b24. `VT_WHISPER_ENC_EAGER=1` restores the naive kernel
+for the A/B. **SAME-BINARY A/B** (throwaway env-gated steady_clock around the encoder forward, NOT
+committed, `VT_WHISPER_ENC_TIME` toggle, 6 reps rep0 dropped):
+
+| Vehicle | naive `AttentionKernel` (`VT_WHISPER_ENC_EAGER=1`) | warp `AttentionDenseFast` (ships, default) | delta | vs vLLM 0.25.0 TTFT 43 ms |
+|---|---|---|---|---|
+| Voxtral Whisper encoder forward (1500 frames, 32 layers) | **8870 ms** (8858-8882) | **1890 ms** (1872-1903) | **-6980 ms (4.7x faster), NON-OVERLAPPING** | 206x -> **44x slower (NOT closed)** |
+
+**Proof-of-run:** nsys of the shipping (default) arm shows `vt::cuda::AttentionWarpKernel` 32
+instances (= 32 encoder layers) and ZERO naive `AttentionKernel` in the encoder. **Correctness (RED
+line, HELD):** `test_voxtral_e2e` **16/16** with the fast kernel default (strict prefix 18/48,
+teacher-force result=PASS divergent=0 worst_gap=0.0 over-band=0, reproduces near-tie seq 48/48); the
+naive arm (`VT_WHISPER_ENC_EAGER=1`) also passes 16/16 with the SAME tokens => the warp kernel flips
+ZERO tokens (bit-exact at the token level, like the S7 vision tower's 32/32). Goldens md5 UNCHANGED
+(`voxtral_golden.json 8ab87b7e...`, `voxtral_neartie.json 937b9ad3...`, before == after). **HONEST
+verdict - NOT at parity, residual attributed:** the warp brick is a real 4.7x win but encoder TTFT
+(~1.89 s) is still ~44x above vLLM's 43 ms (which is encode + 388-tok prefill). nsys of the fast arm:
+`AttentionWarpKernel` is STILL **31.8 ms/layer x 32 = 1.02 s** - the warp kernel is O(t-squared) and
+memory-bound on redundant K/V global reads (~1500^2 x 64 x 2 B x 20 heads ~= 5.7 GB/layer /
+~273 GB/s ~= 21 ms/layer of K reads alone, no shared-mem tile reuse across queries); the remaining
+~0.6-0.9 s is per-call host weight marshalling (f32->bf16 convert + H2D of all 32 layers EVERY
+forward) + the conv1->host->conv2 round-trip. **Ranked residual levers (grounded, not implemented):**
+(1) a flash-TILED non-causal head_dim-64 encoder attention (shared-mem K/V reuse - vLLM's
+`flash_attn_varlen_func`; the vendored FA2 has non-causal templates but only head_dim {128,192,256}
+paged, so this needs an hd-64 instantiation + a dense/single-request layout - LARGE); (2) resident
+one-time encoder weights (bit-identical, the S7 fix #1 for the tower's marshalling) + drop the conv
+round-trip (MEDIUM, byte-exact). The audio DECODE axis stays DONE-on-speed (S12, 0.97x, BEATS);
+audio TTFT/encoder stays **speed-pending / PARTIAL**. No mm row advances to DONE this pass.
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =
