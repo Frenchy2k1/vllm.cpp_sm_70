@@ -25990,3 +25990,42 @@ f32 64x512x128 arm.
 
 **Goal:** 14.25 of 27.9 tok/s. This lead is worth ~half the remaining GEMM gap
 and is now one hypothesis from resolution.
+
+---
+
+## 2026-07-27 — 64x64 simdgroup GEMM LANDED: 14.25 -> 15.30 tok/s; root cause was self-inflicted
+
+**Landed.** Tile 64x64, 8 simdgroups (2 row groups of 32 x 4 column groups of
+16), each owning 4x2 `simdgroup_float8x8` blocks. Threadgroup tiles are now FLAT
+with the stride named once.
+
+| shape | 32x32 | 64x64 | MLX steel |
+|---|--:|--:|--:|
+| qkv | 990 GFLOP/s | **1484** | 2640 |
+| mlp-up | 1019 | **1574** | 3325 |
+| mlp-dn | 1002 | **1507** | 3293 |
+
+End to end **14.25 -> 15.30 tok/s (+7.4%)**, TTFT **2534 -> 2065 ms (-18%)**.
+SACRED gate **16/16 UNCHANGED, no golden re-capture**. Unit 21 cases / 20,135.
+
+**THE ROOT CAUSE WAS NOT THE ONE I DIAGNOSED, and that correction is the more
+useful record.** The half-spacing fingerprint was interpreted as the compiler
+padding a 2-D `threadgroup float sa[BM][BK]` so `simdgroup_load`'s
+`elements_per_row` disagreed with the writes. The truth was simpler and mine: an
+earlier incomplete edit left the mma block on the OLD 32x32 offsets
+(`&sa[sg_r*16 + i*8][0]`, 16-row groups) while the tile had grown to 64 rows.
+
+**This also invalidates the earlier bisect conclusion.** "Both decompositions
+fail identically, therefore the mapping is exonerated" was right by accident:
+both carried the same stale block, so the experiment never varied what it claimed
+to vary. A bisect isolates a variable only if the other code actually changed,
+and a pattern-based edit that silently matches nothing does not change it. The
+`assert count == 1` discipline used on other replacements in this work is exactly
+what was missing on those.
+
+**Flat tiles were kept** even though the hypothesis behind them was wrong: they
+remove the second place an offset could disagree, making this bug class
+unrepresentable.
+
+**Goal:** 15.30 of 27.9 tok/s, 1.82x remaining. Ours ~1.5 TFLOP/s vs MLX's ~3.3;
+the rest needs register blocking and double-buffered staging.

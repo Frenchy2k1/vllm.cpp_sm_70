@@ -2555,28 +2555,32 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
-## OPEN LEAD: 64x64 GEMM with 8 simdgroups - 1.8x but INCORRECT (2026-07-27)
+## Metal 64x64 simdgroup GEMM on Apple M4 (2026-07-27) - RESOLVED and landed
 
-Measured, not shipped. The strongest unclosed lead toward parity:
+The open lead is closed. Tile is now 64x64 with 8 simdgroups (2 row groups of 32
+x 4 column groups of 16), each owning 4x2 blocks of `simdgroup_float8x8`.
 
-| kernel | qkv | mlp-up | mlp-dn |
+| shape | before (32x32) | after (64x64) | MLX steel |
 |---|--:|--:|--:|
-| shipped 32x32, 4 simdgroups | 990 GFLOP/s | 1019 | 1002 |
-| 64x64, 8 simdgroups | **1712** | **1907** | **1821** |
-| MLX steel (target) | 2640 | 3325 | 3293 |
+| qkv 512x2048x2048 | 990 GFLOP/s | **1484** | 2640 |
+| mlp-up 512x2048x6144 | 1019 | **1574** | 3325 |
+| mlp-dn 512x6144x2048 | 1002 | **1507** | 3293 |
 
-**1.8x, roughly half the remaining distance to MLX** — and **numerically wrong**.
-Bisected: the simdgroup mapping is EXONERATED (2x4 and 4x2 decompositions fail
-identically at the same speed), the threadgroup-size limit is REFUTED (a new
-`DispatchGrid2D` assert does not fire), and a host/kernel thread-count mismatch
-is REFUTED. Sharpest clue: the failure is m-DEPENDENT. m=2 and m=16 PASS,
-m=64 and m=512 FAIL, so only tile rows >= 16 are affected, consistent with part
-of the A tile never being staged or being staged after it is read. Now FINGERPRINTED: a per-row diagnostic (`VT_MM_ROWDIAG=1`) shows rows 0-15
-correct, 16-31 zero, 32-47 reading A[16..31], 48-63 zero — the tile is filled at
-HALF the expected row spacing, which excludes thread under-coverage (that would
-leave correct sources) and points at a STRIDE disagreement between the staging
-writes and `simdgroup_load`'s assumed `VT_MM_BK` pitch. Not shipped; concrete
-next step in the spec's "OPEN LEAD" section.
+End to end **14.25 -> 15.30 tok/s (+7.4%)**, TTFT **2534 -> 2065 ms (-18%)**,
+SACRED gate **16/16 unchanged with no golden re-capture**, unit suite 21 cases /
+20,135 assertions.
+
+**The root cause was self-inflicted, not a compiler subtlety.** The half-spacing
+fingerprint was read as threadgroup-array padding defeating `simdgroup_load`'s
+`elements_per_row`. In fact an earlier incomplete edit had left the mma block on
+the OLD 32x32 offsets (16-row groups) while the tile had grown to 64 rows. This
+also means the earlier bisect that "exonerated the simdgroup mapping" was right
+by accident: both decompositions carried the same stale block. Flat threadgroup
+tiles were adopted for the wrong hypothesis and kept anyway, because they make
+that class of bug unrepresentable.
+
+Ours is now ~1.5 TFLOP/s against MLX's ~3.3; the rest needs register blocking and
+double-buffered staging.
 
 ---
 
