@@ -80,6 +80,39 @@ use only the current local host and mark unavailable hardware gates `PENDING`.
     gate checkpoints, APEX GGUF evidence and sources were preserved; the volume
     had 359 GB free afterward. Maintain at least 200 GB headroom before adding
     competitor images.
+- **Ettore Jetson Thor profile (sm_110 CUDA runtime gate)**: `ssh 192.168.68.23`
+  — hostname `thor`, NVIDIA Jetson Thor (Blackwell, **sm_110**), aarch64, JetPack
+  R38, driver 580.00, 14 CPU cores, ~122 GB UNIFIED memory, `~91 GB` disk free.
+  On-box `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` returns
+  **11.0** — this CONFIRMS the inferred sm_110. This is the FIRST non-GB10 CUDA
+  board here and the host of the first non-GB10 runtime proof
+  (`CLAIM-CUDA-SM110-RUNTIME`, `BACKEND-CUDA-SM110` RUNTIME-VERIFIED for the
+  portable bf16 path, 2026-07-27).
+  - Non-interactive SSH does NOT put nvcc on PATH — prepend
+    `export PATH=/usr/local/cuda-13.0/bin:$PATH` (nvcc is **`/usr/local/cuda-13.0/bin/nvcc`
+    V13.0.48**, the `>=13` compiler branch, sm_110 in its global target list).
+  - **cutlass is NOT installed on Thor** — and the sm_110 portable path needs none
+    (every fast-path FEATURE-TABLE cell resolves EMPTY, so the CMake cutlass block
+    is skipped). Build with `-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_CUDA=ON
+    -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_METAL=OFF -DVLLM_CPP_VULKAN=OFF`, Release. Do
+    NOT enable the sm12x fp4 features on sm_110. If a future cutlass-dependent build
+    is ever needed, `scp ~/cutlass-4.5.0` from dgx.casa and point
+    `-DVLLM_CPP_CUTLASS_DIR` at it (still do not enable sm12x features on sm_110).
+  - **GPU-lock discipline (CRITICAL):** Thor runs a `local-ai-worker` docker
+    container that holds the GPU (restart policy `always`). BEFORE any GPU run:
+    `ssh 192.168.68.23 'docker stop local-ai-worker'` (frees the GPU). AFTER all GPU
+    work: `ssh 192.168.68.23 'docker start local-ai-worker'` — RESTORE it, leave
+    Thor exactly as found; NEVER leave the worker stopped on exit. Hold
+    `flock $HOME/gpu.lock` on Thor for the GPU run series. Transfer code with
+    `git archive` (NOT rsync — see [[dgx-transfer-git-archive-not-rsync]]); dgx→Thor
+    scp works after a one-time `-o StrictHostKeyChecking=accept-new`.
+  - **Oracle CAVEAT (2026-07-27):** the pinned vLLM oracle on dgx.casa was found
+    DEGRADED — `~/venvs/vllm-oracle`→`vllm-oracle-next` (0.26.0.dev0) is an editable
+    install whose source tree `~/work/vllm-src-5559679` was pruned (dangling; `import
+    vllm` fails), and `~/venvs/vllm-oracle-v0.25.0-stage` (vLLM 0.25.0) now crashes in
+    EngineCore KV-cache/model init. A fresh teacher-force could not be run this
+    session; the sm_110 near-tie verdict rests on the COMMITTED gap-0 golden. Repair
+    the oracle before the next gate that needs a fresh capture.
 - **Ettore Apple/Metal profile**: `ssh 192.168.68.103` — Mac mini, Apple M4 (10 CPU
   cores), 16 GB unified memory, arm64, macOS 26.5.2. Use it for the MLX-backed
   `vt::` backend, Metal op parity, and small-model bring-up. It cannot hold the
