@@ -25497,3 +25497,40 @@ simdgroup-matrix GEMM, i.e. the original `M3d` idea now correctly scoped to m > 
 re-captured (with full oracle re-validation) BEFORE the speed A/B was run, then
 had to be reverted with the kernel. Benchmark first; re-capture a golden only
 once the change is known to be worth keeping.
+
+## 2026-07-27 — ROAD-V1-C7 sampling controls W1-W4 (CLAIM-ROADMAP-C7, NOT pushed)
+
+**What landed.** The full sampling-control surface is WIRED end to end + gated
+exactly on the CPU reference backend; `SAMPLE-CORE` + `SAMPLE-LOGIT-FILTERS` →
+`ACTIVE`. Base `origin/main` `489f7771`, isolated worktree `scratchpad/wt-c7`,
+branch `road-v1-c7-sampling`, CPU-only (transforms are device-neutral pure
+functions; no dgx contention — a sibling owns the GPU for C5).
+
+- W1 SamplingParams (`include/vllm/sampling_params.h`, `src/vllm/sampling_params.cpp`):
+  undefer + validate `logit_bias`/`allowed_token_ids`/`bad_words`/
+  `bad_words_token_ids`/`all_stop_token_ids`.
+- W2 OpenAI protocol (`entrypoints/openai/protocol.{h,cpp}`): parse the three
+  fields both endpoints; logit_bias string→int + clamp [-100,100].
+- W3 InputBatch (`v1/worker/gpu/input_batch.{h,cpp}`): per-slot tracking +
+  `build_sampling_metadata` for min_p/min_tokens/logit_bias/allowed_token_ids_mask/
+  bad_words/max_num_logprobs + condense/swap/remove maintenance.
+- W4 InputProcessor (`v1/engine/input_processor.cpp`): bad_words tokenization +
+  eos → all_stop_token_ids.
+
+**Gates (CPU, RED-first).** test_sampling_params 9/90, test_openai_protocol 28/171,
+test_input_batch 22/163 (RED: disabling `md.logit_bias` fails 1), test_input_processor
+8/37; test_sampler / test_logits_processors unchanged. Inertness: default/greedy
+builds byte-identical SamplingMetadata; full `vllm` lib CPU `-Werror` 0-warn. Seven
+checkers bare RC green.
+
+**Residual / resume point.** W5 `SAMPLE-LOGPROBS` payload end to end: port the
+LogprobsProcessor (`vllm/v1/engine/logprobs.py`) so the sampler's LogprobsTensors
+flow ModelRunnerOutput → EngineCoreOutput → OutputProcessor → CompletionOutput,
+then add the OpenAI `CompletionLogProbs` / `ChatCompletionLogProbs` response structs
++ to_json + serving wiring, and gate the payload shape+values on a running engine
+(CPU reference or a tiny model). `max_num_logprobs` already reaches the sampler and
+the sampler already produces the tensors — only the engine-output/serialization
+plumbing remains. Also INVENTORIED (separate rows): `n>1` execution, `SAMPLE-PHILOX`
+exact RNG, `SAMPLE-LOGPROB-TOKEN-IDS`/logprobs_mode, beam search, custom
+logits-processor plugins. Spec: `.agents/specs/sampling-controls-c7.md`. NOT pushed;
+FULL SHA reported to caller.

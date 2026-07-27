@@ -28,14 +28,13 @@
 //     (rope-scaling etc.), so max_position_embeddings stands in for it at T0.
 //   - process_inputs signature reordered to (request_id, prompt, params,
 //     arrival_time): only the text prompt + SamplingParams path is kept.
-//   - update_from_generation_config: our SamplingParams dropped the
-//     _all_stop_token_ids field (M1.1 — the detokenizer computes its own stop
-//     buffer), so the only observable T0 effect is setting eos_token_id and
-//     merging the SECONDARY eos ids into stop_token_ids (both gated on
-//     ignore_eos), matching sampling_params.py:627-655.
-//   - update_from_tokenizer is a no-op stub: upstream only processes bad_words
-//     there (sampling_params.py:657), and bad_words is a deferred SamplingParams
-//     field (M1.1).
+//   - update_from_generation_config: sets eos_token_id, adds the eos id(s) to
+//     all_stop_token_ids (for MinTokens masking) and merges the SECONDARY eos
+//     ids into stop_token_ids, matching sampling_params.py:627-655 (ROAD-V1-C7
+//     wired all_stop_token_ids; it was previously dropped).
+//   - update_from_tokenizer tokenizes bad_words into bad_words_token_ids
+//     (sampling_params.py:659-698), ROAD-V1-C7 (previously a no-op stub while
+//     bad_words was deferred on SamplingParams).
 //
 // DEFERRED (marked; matches upstream so re-adding is mechanical): dict/EngineInput
 // prompts, prompt_embeds, encoder/decoder split, multimodal (mm_features),

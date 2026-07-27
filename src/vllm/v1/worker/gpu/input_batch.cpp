@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <map>
+#include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -131,6 +133,7 @@ InputBatch::InputBatch(int max_num_reqs, int max_model_len,
   frequency_penalties_cpu.assign(n, 0.0f);
   presence_penalties_cpu.assign(n, 0.0f);
   repetition_penalties_cpu.assign(n, 0.0f);
+  min_p_cpu.assign(n, 0.0f);
   seeds.assign(n, std::nullopt);
   // Speculative decoding: by default 1 token is generated per request
   // (gpu_input_batch.py:240-243). Overwritten by the rejection sampler after a
@@ -249,6 +252,77 @@ int InputBatch::add_request(const CachedRequestState& request) {
   // Per-request RNG seed (upstream request.generator == sampling_params.seed).
   seeds[static_cast<size_t>(req_index)] = sp.seed;
 
+  // ─── ROAD-V1-C7 SAMPLE-CORE / SAMPLE-LOGIT-FILTERS per-slot controls ───────
+  // min_p (gpu_input_batch.py:414-419-style; MinPLogitsProcessor).
+  min_p_cpu[static_cast<size_t>(req_index)] = static_cast<float>(sp.min_p);
+  if (sp.min_p > 0.0) {
+    min_p_reqs[req_id] = 1;
+  } else {
+    min_p_reqs.erase(req_id);
+  }
+
+  // min_tokens: only tracked when a floor is set (MinTokensLogitsProcessor). The
+  // stop set is params.all_stop_token_ids (stop_token_ids + engine eos ids).
+  min_tokens.erase(req_index);
+  if (sp.min_tokens > 0) {
+    min_tokens[req_index] = MinTokensState{
+        sp.min_tokens,
+        std::set<int32_t>(sp.all_stop_token_ids.begin(),
+                          sp.all_stop_token_ids.end())};
+  }
+
+  // logit_bias (LogitBiasLogitsProcessor; gpu_input_batch.py analogue).
+  logit_bias.erase(req_index);
+  if (sp.logit_bias.has_value() && !sp.logit_bias->empty()) {
+    logit_bias[req_index] = *sp.logit_bias;
+  }
+
+  // num_logprobs (gpu_input_batch.py:435-440). Keep the -1 sentinel; our Sampler
+  // reads it directly (upstream stores vocab_size).
+  num_logprobs.erase(req_id);
+  if (sp.logprobs.has_value()) {
+    num_logprobs[req_id] = *sp.logprobs;
+  }
+
+  // allowed_token_ids (gpu_input_batch.py:446-467). Lazily allocate the
+  // [max_num_reqs][vocab] exclude mask; set the row all-TRUE (exclude) then clear
+  // the allowed ids to FALSE (keep).
+  has_allowed_token_ids.erase(req_id);
+  if (allowed_token_ids_mask.empty() ||
+      static_cast<int>(allowed_token_ids_mask[static_cast<size_t>(req_index)]
+                           .size()) == vocab_size) {
+    // Reset this row to all-false (keep every token) when the mask already
+    // exists; the block below re-fills it for a request that restricts ids.
+    if (!allowed_token_ids_mask.empty()) {
+      std::fill(allowed_token_ids_mask[static_cast<size_t>(req_index)].begin(),
+                allowed_token_ids_mask[static_cast<size_t>(req_index)].end(),
+                static_cast<uint8_t>(0));
+    }
+  }
+  if (sp.allowed_token_ids.has_value() && !sp.allowed_token_ids->empty()) {
+    has_allowed_token_ids[req_id] = 1;
+    if (allowed_token_ids_mask.empty()) {
+      allowed_token_ids_mask.assign(
+          static_cast<size_t>(max_num_reqs),
+          std::vector<uint8_t>(static_cast<size_t>(vocab_size), 0));
+    }
+    std::vector<uint8_t>& mask_row =
+        allowed_token_ids_mask[static_cast<size_t>(req_index)];
+    std::fill(mask_row.begin(), mask_row.end(), static_cast<uint8_t>(1));
+    for (int32_t tid : *sp.allowed_token_ids) {
+      if (0 <= tid && tid < vocab_size) {
+        mask_row[static_cast<size_t>(tid)] = 0;  // FALSE == keep this token
+      }
+    }
+  }
+
+  // bad_words (gpu_input_batch.py:469-471). Tokenized engine-side into
+  // sampling_params.bad_words_token_ids (InputProcessor::UpdateFromTokenizer).
+  bad_words_token_ids.erase(req_index);
+  if (sp.bad_words_token_ids.has_value() && !sp.bad_words_token_ids->empty()) {
+    bad_words_token_ids[req_index] = *sp.bad_words_token_ids;
+  }
+
   return req_index;
 }
 
@@ -261,8 +335,10 @@ const SamplingMetadata& InputBatch::make_sampling_metadata() const {
   // per-step-growing output tokens — we rebuild every call to keep them fresh.
   // For the greedy / no-penalties gate workload the metadata depends only on the
   // (unchanged) request set + static sampling params, so the cache is
-  // bit-identical to a fresh build.
-  if (sampling_metadata_dirty_ || !no_penalties()) {
+  // bit-identical to a fresh build. ROAD-V1-C7: min_tokens / bad_words also embed
+  // the per-step-growing output tokens, so rebuild when either is active.
+  if (sampling_metadata_dirty_ || !no_penalties() || !min_tokens.empty() ||
+      !bad_words_token_ids.empty()) {
     sampling_metadata_cache_ = build_sampling_metadata();
     sampling_metadata_dirty_ = false;
   }
@@ -325,10 +401,12 @@ SamplingMetadata InputBatch::build_sampling_metadata() const {
     md.prompt_token_ids = std::move(prompts);
   }
 
-  // output_token_ids: only when a proc needs them (gpu_input_batch.py:884-894).
-  // At T0 that is !no_penalties (bad_words / logitsprocs_need_output_token_ids
-  // are always empty/false). Empty [] otherwise, matching upstream.
-  const bool needs_output_token_ids = !md.no_penalties;
+  // output_token_ids: only when a proc needs them (gpu_input_batch.py:906-922).
+  // needs_output_token_ids = not no_penalties OR bad_words present OR a
+  // logitsproc needs them (min_tokens is such a proc — it compares output_len to
+  // the floor). thinking-budget stays deferred.
+  const bool needs_output_token_ids =
+      !md.no_penalties || !bad_words_token_ids.empty() || !min_tokens.empty();
   if (needs_output_token_ids) {
     md.output_token_ids.resize(nn);
     for (int i = 0; i < n; ++i) {
@@ -355,26 +433,47 @@ SamplingMetadata InputBatch::build_sampling_metadata() const {
     }
   }
 
-  // ─── Fields whose InputBatch-side tracking is NOT yet landed (marked) ──────
-  // Each is a faithful upstream default (empty/None) with its dependency cite;
-  // wiring them requires per-slot state this InputBatch does not yet keep.
-  //
-  //  * max_num_logprobs (gpu_input_batch.py:922 / :1122, from the num_logprobs
-  //    dict populated by sampling_params.logprobs): no num_logprobs tracking
-  //    here — left None (no logprobs). Logprobs wiring is an M1.8 dependency.
-  //  * allowed_token_ids_mask (gpu_input_batch.py:896-904) + bad_words_token_ids
-  //    (:932): no has_allowed_token_ids / bad_words slot tracking — left
-  //    None / empty. A Task-3 / M1.8 dependency (SamplingParams also defers
-  //    allowed_token_ids / bad_words_token_ids).
-  //  * min_tokens / logit_bias / min_p (the T0 builtins,
-  //    logits_processor/builtin.py): InputBatch keeps no per-slot min_p array /
-  //    min_tokens+stop set / logit_bias map yet — left empty. Populating them
-  //    (min_p is on SamplingParams; logit_bias / all_stop_token_ids are
-  //    deferred on SamplingParams) is a Task-3 dependency.
-  // md.generators / max_num_logprobs / allowed_token_ids_mask /
-  // bad_words_token_ids / min_tokens / logit_bias / min_p keep their defaults.
+  // ─── ROAD-V1-C7 SAMPLE-CORE / SAMPLE-LOGPROBS / SAMPLE-LOGIT-FILTERS ───────
+  // max_num_logprobs (gpu_input_batch.py:950 / :1150-1151): max requested count
+  // across the batch, or None. Default (no request asked) => None => the sampler
+  // computes no logprobs (byte-identical to before).
+  md.max_num_logprobs = max_num_logprobs();
+
+  // allowed_token_ids_mask (gpu_input_batch.py:924-932): None unless some request
+  // restricts ids; else the dense [:num_reqs] EXCLUDE-mask rows.
+  if (!no_allowed_token_ids() && !allowed_token_ids_mask.empty()) {
+    md.allowed_token_ids_mask = std::vector<std::vector<uint8_t>>(
+        allowed_token_ids_mask.begin(), allowed_token_ids_mask.begin() + nn);
+  }
+
+  // bad_words_token_ids (gpu_input_batch.py:960): req_index -> n-grams, passed
+  // through directly (the sampler indexes by req).
+  md.bad_words_token_ids = bad_words_token_ids;
+
+  // min_tokens / logit_bias / min_p (the T0 builtins). min_p is None-skipped like
+  // top_p (empty vector => sampler no-ops the row); we pass the dense slice only
+  // when some row is active, matching the "skip when unneeded" pattern.
+  md.min_tokens = min_tokens;
+  md.logit_bias = logit_bias;
+  if (!no_min_p()) {
+    md.min_p = std::vector<float>(min_p_cpu.begin(), min_p_cpu.begin() + nn);
+  }
 
   return md;
+}
+
+std::optional<int> InputBatch::max_num_logprobs() const {
+  // gpu_input_batch.py:1150-1151: max(num_logprobs.values()) or None. Our -1
+  // ("all") sentinel dominates any finite request (it means the full vocab).
+  if (num_logprobs.empty()) return std::nullopt;
+  int best = 0;
+  bool any_all = false;
+  for (const auto& [req_id, k] : num_logprobs) {
+    (void)req_id;
+    if (k == -1) any_all = true;
+    else best = std::max(best, k);
+  }
+  return any_all ? std::optional<int>(-1) : std::optional<int>(best);
 }
 
 std::optional<int> InputBatch::remove_request(const std::string& req_id) {
@@ -402,8 +501,55 @@ std::optional<int> InputBatch::remove_request(const std::string& req_id) {
   frequency_penalties_reqs.erase(req_id);
   presence_penalties_reqs.erase(req_id);
   repetition_penalties_reqs.erase(req_id);
+  // ROAD-V1-C7 per-slot controls (gpu_input_batch.py:573-582). req_id-keyed
+  // sets erase by id; req_index-keyed maps pop by index; the allowed-ids mask
+  // row is cleared to all-false (keep).
+  min_p_reqs.erase(req_id);
+  has_allowed_token_ids.erase(req_id);
+  num_logprobs.erase(req_id);
+  min_tokens.erase(req_index);
+  logit_bias.erase(req_index);
+  bad_words_token_ids.erase(req_index);
+  if (!allowed_token_ids_mask.empty()) {
+    std::fill(allowed_token_ids_mask[static_cast<size_t>(req_index)].begin(),
+              allowed_token_ids_mask[static_cast<size_t>(req_index)].end(),
+              static_cast<uint8_t>(0));
+  }
   return req_index;
 }
+
+namespace {
+// Move an index-keyed map value from `from` to `to`, popping any prior `to`
+// (mirrors gpu_input_batch.py:828-830 condense's pop-and-reinsert).
+template <typename V>
+void MoveDictValue(std::map<int, V>& m, int from, int to) {
+  auto it = m.find(from);
+  if (it == m.end()) {
+    m.erase(to);
+    return;
+  }
+  m[to] = std::move(it->second);
+  m.erase(it);
+}
+// Swap two index-keyed map values (mirrors swap_dict_values,
+// gpu_input_batch.py:692).
+template <typename V>
+void SwapDictValues(std::map<int, V>& m, int i1, int i2) {
+  auto a = m.find(i1);
+  auto b = m.find(i2);
+  const bool has_a = a != m.end();
+  const bool has_b = b != m.end();
+  if (has_a && has_b) {
+    std::swap(a->second, b->second);
+  } else if (has_a) {
+    m[i2] = std::move(a->second);
+    m.erase(i1);
+  } else if (has_b) {
+    m[i1] = std::move(b->second);
+    m.erase(i2);
+  }
+}
+}  // namespace
 
 void InputBatch::condense() {
   const int num = num_reqs();
@@ -516,6 +662,25 @@ void InputBatch::condense() {
         seeds[static_cast<size_t>(last_req_index)];
     seeds[static_cast<size_t>(last_req_index)] = std::nullopt;
 
+    // ROAD-V1-C7 per-slot controls move with the row (gpu_input_batch.py
+    // :819-830). min_p is an array; the index-keyed maps pop-and-reinsert; the
+    // allowed-ids mask row is copied then the vacated row cleared. The req_id-
+    // keyed predicate sets (min_p_reqs / has_allowed_token_ids / num_logprobs)
+    // need no move — they survive reindexing.
+    min_p_cpu[static_cast<size_t>(empty_index)] =
+        min_p_cpu[static_cast<size_t>(last_req_index)];
+    MoveDictValue(min_tokens, last_req_index, empty_index);
+    MoveDictValue(logit_bias, last_req_index, empty_index);
+    MoveDictValue(bad_words_token_ids, last_req_index, empty_index);
+    if (!allowed_token_ids_mask.empty()) {
+      allowed_token_ids_mask[static_cast<size_t>(empty_index)] =
+          allowed_token_ids_mask[static_cast<size_t>(last_req_index)];
+      std::fill(
+          allowed_token_ids_mask[static_cast<size_t>(last_req_index)].begin(),
+          allowed_token_ids_mask[static_cast<size_t>(last_req_index)].end(),
+          static_cast<uint8_t>(0));
+    }
+
     // Decrement last_req_index since it is now empty.
     --last_req_index;
   }
@@ -601,6 +766,19 @@ void InputBatch::swap_states(int i1, int i2) {
   std::swap(repetition_penalties_cpu[static_cast<size_t>(i1)],
             repetition_penalties_cpu[static_cast<size_t>(i2)]);
   std::swap(seeds[static_cast<size_t>(i1)], seeds[static_cast<size_t>(i2)]);
+
+  // ROAD-V1-C7 per-slot controls (gpu_input_batch.py:686-700). min_p is an
+  // array swap; the index-keyed maps use swap_dict_values; the allowed-ids mask
+  // rows swap. The req_id-keyed predicate sets are keyed by id, so no swap.
+  std::swap(min_p_cpu[static_cast<size_t>(i1)],
+            min_p_cpu[static_cast<size_t>(i2)]);
+  SwapDictValues(min_tokens, i1, i2);
+  SwapDictValues(logit_bias, i1, i2);
+  SwapDictValues(bad_words_token_ids, i1, i2);
+  if (!allowed_token_ids_mask.empty()) {
+    std::swap(allowed_token_ids_mask[static_cast<size_t>(i1)],
+              allowed_token_ids_mask[static_cast<size_t>(i2)]);
+  }
 }
 
 void InputBatch::update_req_spec_token_ids(

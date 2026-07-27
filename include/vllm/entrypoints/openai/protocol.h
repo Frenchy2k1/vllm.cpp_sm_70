@@ -34,6 +34,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -210,6 +211,13 @@ struct CompletionRequest {
   bool skip_special_tokens = true;
   bool spaces_between_special_tokens = true;
 
+  // ROAD-V1-C7 SAMPLE-LOGIT-FILTERS (completion/protocol.py:58,93,108). OpenAI
+  // `logit_bias` has STRING token-id keys; to_sampling_params converts them to
+  // int and clamps each bias to [-100, 100] (sampling_params.py:388-413).
+  std::optional<std::map<std::string, double>> logit_bias;
+  std::optional<std::vector<int32_t>> allowed_token_ids;
+  std::vector<std::string> bad_words;  // default_factory=list upstream
+
   // priority (completion/protocol.py): the request's scheduling priority for
   // the priority policy (lower = handled first). Default 0. Not a sampling
   // param — the serving layer forwards it to engine add_request/process_inputs.
@@ -339,6 +347,12 @@ struct ChatCompletionRequest {
   bool include_stop_str_in_output = false;
   bool skip_special_tokens = true;
   bool spaces_between_special_tokens = true;
+
+  // ROAD-V1-C7 SAMPLE-LOGIT-FILTERS (chat_completion/protocol.py:202,282,283).
+  // See CompletionRequest for the logit_bias string-key -> int + clamp contract.
+  std::optional<std::map<std::string, double>> logit_bias;
+  std::optional<std::vector<int32_t>> allowed_token_ids;
+  std::vector<std::string> bad_words;
 
   // priority (chat_completion/protocol.py). See CompletionRequest.priority.
   int priority = 0;

@@ -123,6 +123,28 @@ void SamplingParams::Verify() const {
         "stop strings are only supported when detokenize is True. "
         "Set detokenize=True to use stop.");
   }
+  // bad_words cannot contain an empty string (sampling_params.py:618-623).
+  for (const std::string& bad_word : bad_words) {
+    if (bad_word.empty()) {
+      throw std::runtime_error(
+          "bad_words cannot contain an empty string. Got bad_words=[" +
+          [&] {
+            std::string joined;
+            for (size_t i = 0; i < bad_words.size(); ++i) {
+              if (i != 0) joined += ", ";
+              joined += "'" + bad_words[i] + "'";
+            }
+            return joined;
+          }() +
+          "]");
+    }
+  }
+  // allowed_token_ids, if provided, must be a non-empty list
+  // (serving-side validation, mirrored here so a bad request throws early;
+  // the model-config vocab-range check stays engine-time / deferred).
+  if (allowed_token_ids.has_value() && allowed_token_ids->empty()) {
+    throw std::runtime_error("allowed_token_ids is not None and empty!");
+  }
 }
 
 void SamplingParams::VerifyGreedySampling() const {
@@ -188,6 +210,11 @@ void SamplingParams::PostInit() {
     min_p = 0.0;
     VerifyGreedySampling();
   }
+
+  // eos_token_id is added to this by the engine (InputProcessor::
+  // UpdateFromGenerationConfig). Seed it from stop_token_ids
+  // (sampling_params.py:500).
+  all_stop_token_ids.insert(stop_token_ids.begin(), stop_token_ids.end());
 }
 
 }  // namespace vllm

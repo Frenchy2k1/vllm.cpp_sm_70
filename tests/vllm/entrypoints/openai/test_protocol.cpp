@@ -562,3 +562,53 @@ TEST_CASE("DeltaMessage without tool_calls omits the key") {
   CHECK(j["content"] == "hi");
   CHECK(j.contains("tool_calls") == false);
 }
+
+// ─── ROAD-V1-C7 SAMPLE-LOGIT-FILTERS: logit_bias / allowed_token_ids / bad_words ─
+TEST_CASE("CompletionRequest parses logit_bias (string keys) + clamp") {
+  auto req = json::parse(R"({
+    "prompt":"x",
+    "logit_bias":{"100":250.0,"7":-999.0,"42":3.5},
+    "allowed_token_ids":[5,9,900],
+    "bad_words":["foo","bar"]
+  })").get<CompletionRequest>();
+  SamplingParams sp = req.to_sampling_params();
+
+  // string keys -> int token ids; bias clamped to [-100, 100].
+  REQUIRE(sp.logit_bias.has_value());
+  CHECK(sp.logit_bias->at(100) == doctest::Approx(100.0f));   // clamped down
+  CHECK(sp.logit_bias->at(7) == doctest::Approx(-100.0f));    // clamped up
+  CHECK(sp.logit_bias->at(42) == doctest::Approx(3.5f));
+
+  REQUIRE(sp.allowed_token_ids.has_value());
+  CHECK(*sp.allowed_token_ids == std::vector<int32_t>{5, 9, 900});
+  CHECK(sp.bad_words == std::vector<std::string>{"foo", "bar"});
+}
+
+TEST_CASE("ChatCompletionRequest parses logit_bias + allowed_token_ids + bad_words") {
+  auto req = json::parse(R"({
+    "messages":[{"role":"user","content":"hi"}],
+    "logit_bias":{"11":50.0},
+    "allowed_token_ids":[1,2],
+    "bad_words":["x"]
+  })").get<ChatCompletionRequest>();
+  SamplingParams sp = req.to_sampling_params();
+  REQUIRE(sp.logit_bias.has_value());
+  CHECK(sp.logit_bias->at(11) == doctest::Approx(50.0f));
+  REQUIRE(sp.allowed_token_ids.has_value());
+  CHECK(*sp.allowed_token_ids == std::vector<int32_t>{1, 2});
+  CHECK(sp.bad_words == std::vector<std::string>{"x"});
+}
+
+TEST_CASE("logit_bias with a non-integer key is rejected (400)") {
+  auto req = json::parse(R"({
+    "prompt":"x","logit_bias":{"notanint":1.0}
+  })").get<CompletionRequest>();
+  CHECK_THROWS_AS(req.to_sampling_params(), std::runtime_error);
+}
+
+TEST_CASE("empty allowed_token_ids is rejected via PostInit") {
+  auto req = json::parse(R"({
+    "prompt":"x","allowed_token_ids":[]
+  })").get<CompletionRequest>();
+  CHECK_THROWS_AS(req.to_sampling_params(), std::runtime_error);
+}

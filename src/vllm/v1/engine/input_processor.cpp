@@ -5,7 +5,10 @@
 
 #include <chrono>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "vllm/tokenizer/tokenizer.h"
 
@@ -67,11 +70,16 @@ void InputProcessor::ValidateParams(SamplingParams& params) const {
 }
 
 void InputProcessor::UpdateFromGenerationConfig(SamplingParams& params) const {
-  // sampling_params.py:627-655 (T0 subset). _all_stop_token_ids is deferred
-  // (M1.1), so its side of this is dropped; the observable effects are setting
-  // eos_token_id and merging the SECONDARY eos ids into stop_token_ids.
+  // sampling_params.py:627-655. Sets eos_token_id, adds eos id(s) to
+  // all_stop_token_ids (so the MinTokens processor masks them), and merges the
+  // SECONDARY eos ids into stop_token_ids.
   if (!params.ignore_eos) {
     params.eos_token_id = eos_token_id_;
+  }
+
+  // The primary eos id feeds min_tokens masking (sampling_params.py:638-641).
+  if (eos_token_id_.has_value()) {
+    params.all_stop_token_ids.insert(*eos_token_id_);
   }
 
   if (generation_config_eos_ids_.empty()) {
@@ -83,18 +91,68 @@ void InputProcessor::UpdateFromGenerationConfig(SamplingParams& params) const {
   if (eos_token_id_.has_value()) {
     eos_ids.erase(*eos_token_id_);
   }
-  if (!eos_ids.empty() && !params.ignore_eos) {
-    for (int32_t id : params.stop_token_ids) {
-      eos_ids.insert(id);
+  if (!eos_ids.empty()) {
+    // The full eos set contributes to min_tokens masking regardless of
+    // ignore_eos (sampling_params.py:653).
+    params.all_stop_token_ids.insert(eos_ids.begin(), eos_ids.end());
+    if (!params.ignore_eos) {
+      for (int32_t id : params.stop_token_ids) {
+        eos_ids.insert(id);
+      }
+      params.stop_token_ids.assign(eos_ids.begin(), eos_ids.end());
     }
-    params.stop_token_ids.assign(eos_ids.begin(), eos_ids.end());
   }
 }
 
 void InputProcessor::UpdateFromTokenizer(SamplingParams& params) const {
-  // sampling_params.py:657 only processes bad_words, a deferred SamplingParams
-  // field (M1.1) -> no-op at T0.
-  (void)params;
+  // sampling_params.py:659-698 (update_from_tokenizer): tokenize bad_words into
+  // per-word token-id n-grams the sampler masks. Each word is encoded both
+  // without and with a leading space (add_prefix_space) to catch it at the start
+  // of and mid-text; the prefix-space variant is kept only when it produces a
+  // genuinely different same-length token sequence.
+  if (params.bad_words.empty()) {
+    return;
+  }
+  std::vector<std::vector<int32_t>> bad_ids;
+  for (const std::string& bad_word : params.bad_words) {
+    // lstrip the word (add_prefix_space controls the leading space instead).
+    size_t start = bad_word.find_first_not_of(" \t\n\r\f\v");
+    const std::string stripped =
+        start == std::string::npos ? std::string() : bad_word.substr(start);
+    for (int variant = 0; variant < 2; ++variant) {
+      const bool add_prefix_space = variant == 1;
+      const std::string prompt =
+          (add_prefix_space ? std::string(" ") : std::string()) + stripped;
+      // Encode() adds no special tokens (== add_special_tokens=False).
+      std::vector<int32_t> ids = tokenizer_.Encode(prompt);
+      if (ids.empty()) continue;
+      if (!add_prefix_space) {
+        bad_ids.push_back(std::move(ids));
+      } else if (!bad_ids.empty()) {
+        const std::vector<int32_t>& last = bad_ids.back();
+        if (!last.empty() && ids[0] != last[0] && ids.size() == last.size()) {
+          bad_ids.push_back(std::move(ids));
+        }
+      }
+    }
+  }
+
+  // Vocabulary-range check (sampling_params.py:683-698).
+  const int32_t max_token_id = tokenizer_.VocabSize() - 1;
+  for (const std::vector<int32_t>& ngram : bad_ids) {
+    for (int32_t token_id : ngram) {
+      if (token_id < 0 || token_id > max_token_id) {
+        throw std::runtime_error(
+            "The model vocabulary size is " +
+            std::to_string(max_token_id + 1) +
+            ", but a token specified as bad is out of range. All token id "
+            "values should satisfy 0 <= token_id <= " +
+            std::to_string(max_token_id) + ".");
+      }
+    }
+  }
+
+  params.bad_words_token_ids = std::move(bad_ids);
 }
 
 EngineCoreRequest InputProcessor::process_inputs(

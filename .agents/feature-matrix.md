@@ -118,11 +118,11 @@ and reference-engine performance.
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| Core sampler pipeline (temperature, top-k/p, min-p, penalties, seed, n, stop, min/max_tokens, output_kind) | `v1/sample/sampler.py` | `PARTIAL` T0 | greedy and bounded controls work; `n` is parsed but not executed and random/logprob paths synchronize to host | `planned: specs/core-sampler.md` |
+| Core sampler pipeline (temperature, top-k/p, min-p, penalties, seed, n, stop, min/max_tokens, output_kind) | `v1/sample/sampler.py` | `ACTIVE` T0 | ordered pipeline + every control now WIRED params->metadata->sampler (ROAD-V1-C7: min_p/min_tokens/logit_bias/logprobs-count reach SamplingMetadata; CPU-gated). `n>1` still parsed-not-executed; random/logprob paths synchronize to host | [specs/sampling-controls-c7.md](specs/sampling-controls-c7.md) |
 | torch-Philox bit-exact random parity | `v1/sample/ops/` | ☐ T1 | current RNG gumbel-max distribution-correct only | `planned: specs/philox-rng-parity.md` |
-| logprobs payload end-to-end | `v1/sample/`, serving | `PARTIAL` T1 | sampler tensors/protocol fields exist; engine/output/OpenAI payload absent | `planned: specs/logprobs-payload.md` |
+| logprobs payload end-to-end | `v1/sample/`, serving | `PARTIAL` T1 | sampler produces LogprobsTensors + the count (`max_num_logprobs`) now WIRED through SamplingMetadata (ROAD-V1-C7); the engine-output LogprobsProcessor + OpenAI `CompletionLogProbs` payload serialization is still absent (residual W5) | [specs/sampling-controls-c7.md](specs/sampling-controls-c7.md) |
 | prompt_logprobs | `v1/sample/` | ☐ T1 | protocol field parsed; no engine path | `planned: specs/prompt-logprobs.md` |
-| logit_bias / allowed_token_ids / bad_words | `sampling_params.py`, `v1/sample/` | `PARTIAL` T1 | internal ops exist; request metadata and OpenAI wiring absent | `planned: specs/logit-bias-bad-words.md` |
+| logit_bias / allowed_token_ids / bad_words | `sampling_params.py`, `v1/sample/` | `ACTIVE` T1 | WIRED end-to-end (ROAD-V1-C7): SamplingParams fields+validation, OpenAI parse+logit_bias clamp, InputBatch per-slot + build_sampling_metadata + condense/swap, InputProcessor bad_words tokenization; CPU-gated (RED-first) | [specs/sampling-controls-c7.md](specs/sampling-controls-c7.md) |
 | best_of / echo / suffix / user fields | `protocol.py` | `PARTIAL` T1 | echo parses but behavior is deferred; remaining fields absent | `planned: specs/completions-longtail-fields.md` |
 | Beam search wrapper | `beam_search.py` | ☐ T1 | | `planned: specs/beam-search.md` |
 | Reasoning parsers (+ reasoning-gated grammar) | `reasoning/` | ☐ T1 | | `planned: specs/reasoning-parsers.md` |
