@@ -57,8 +57,9 @@
 //     skipped_waiting, priority scheduling (SchedulingPolicy::kPriority throws).
 //   - Structured-output grammar, LoRA gating, KV-connector / EC-connector,
 //     mamba block-aligned split, defer_block_free / deferred_frees, kv-cache
-//     metrics, MFU perf metrics, log-stats events, take_events /
-//     kv_cache_events.
+//     metrics, MFU perf metrics, kv_cache_events. (log-stats events /
+//     take_events are un-deferred for SERVE-RESPONSE-METRICS: schedule() records
+//     QUEUED/SCHEDULED/PREEMPTED per request, drained onto EngineCoreOutput.)
 //   This ports the MRV2 (V2 model runner, use_v2_model_runner = true) output
 //   path — resumed reqs fold into new_reqs carrying prefill_token_ids — to
 //   match the MRV2 gpu runner M1.5 lands. The MRV1 output path (resumed reqs
@@ -303,10 +304,12 @@ class Scheduler {
   // stale delta.
   PrefixCacheStats last_prefix_cache_stats_;
 
-  // _preempt_request: free the request's KV, mark it PREEMPTED, reset its
-  // computed tokens, and re-queue it to the FRONT of waiting (FCFS retry). The
-  // request must already have been popped from running by the caller.
-  void preempt_request(Request* request);
+  // _preempt_request (scheduler.py:1203-1224): free the request's KV, mark it
+  // PREEMPTED, reset its computed tokens, and re-queue it to the FRONT of waiting
+  // (FCFS retry). The request must already have been popped from running by the
+  // caller. `timestamp` is schedule()'s shared step reading, used to stamp the
+  // PREEMPTED event when log_stats_ is on.
+  void preempt_request(Request* request, double timestamp);
 
   // _make_cached_request_data: build the diff payload for the already-running
   // (running_reqs) + resumed-from-preemption (resumed_reqs) requests. MRV2:
@@ -335,6 +338,14 @@ class Scheduler {
   // it in the ctor via SpeculativeConfig::NumLookaheadTokens (k for MTP). Threaded
   // into allocate_slots (schedule() lines below).
   int num_lookahead_tokens_ = 0;
+  // log_stats (scheduler.py: `self.log_stats = ... not disable_log_stats`,
+  // default True): gate for recording the per-request QUEUED/SCHEDULED/PREEMPTED
+  // engine-core events. ON by default — upstream disable_log_stats defaults
+  // False, and (as with the KVCacheManager log_stats above) the observability
+  // surface is always-on; the events are inert unless a frontend stat logger
+  // consumes them. When off, no event is ever appended, so the request path is
+  // byte-identical.
+  bool log_stats_ = true;
   // T0: 1 (not a diffusion model).
   int num_sampled_tokens_per_step_ = 1;
   // Scheduler iteration counter (upstream current_step; inert at T0 since

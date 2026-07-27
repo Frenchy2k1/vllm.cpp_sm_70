@@ -150,11 +150,14 @@ class RequestState {
 
   // RequestStateStats (stats.py:218-236) — the per-request timing/token running
   // state IterationStats.update_from_output threads through. The event-derived
-  // fields (queued_ts/scheduled_ts) are deferred with EngineCoreEvents, so the
-  // queue/prefill/inference intervals they feed stay 0 (a documented residual);
-  // arrival/first/last-token timestamps and the generation-token count are live.
+  // endpoints (queued_ts / scheduled_ts) are set by update_from_events from the
+  // QUEUED / SCHEDULED EngineCoreEvents (SERVE-RESPONSE-METRICS), which — with
+  // the arrival/first/last-token timestamps — yield the queue, prefill and
+  // inference intervals update_from_finished_request observes.
   double arrival_time = 0.0;      // MonotonicSeconds() at add_request.
   int64_t num_generation_tokens = 0;
+  double queued_ts = 0.0;         // QUEUED event timestamp (engine-core clock).
+  double scheduled_ts = 0.0;      // FIRST SCHEDULED event timestamp.
   double first_token_ts = 0.0;    // engine_core_timestamp of the first token.
   double last_token_ts = 0.0;     // engine_core_timestamp of the latest token.
   int stream_interval = 1;

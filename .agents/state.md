@@ -27403,3 +27403,85 @@ then the score loop, and time each) rather than a sixth mechanism guess.
 - **2026-07-27** — **ROAD-V1-MM speed lever #3 decode-kernel ADOPTED: FA2 decode SHIPS as the Voxtral default — the LAST mm decode-speed gap is CLOSED (audio decode BEATS vLLM 0.97×)** (`CLAIM-MM-SPEED-DECODE-KERN-ADOPT`; USER-APPROVED §11.5 follow-on; base local `main` `57df9a92`; dgx GB10 `~/work/mm-audio-fa2`, cutlass 4.5.0 + FA2 + Triton-AOT arch 121a, GPU under `flock $HOME/gpu.lock` sole owner; teacher-force oracle `~/venvs/vllm-oracle-v0.25.0-stage` = vLLM 0.25.0). **Code (one line):** `VoxtralGenerateGreedy` rounds the single KV `block_size` UP to ÷16 (`((T0+max_new+8+15)/16)*16`) → decode routes through FA2 varlen `LaunchDecodeVarlenFA2Bf16` instead of the scalar `PagedAttentionKernel` (dispatch `fa2_decode_qwen3` needs `block_size%16==0`, `cuda_paged_attn.cu:2621`; seq still one block, `slot==abs_idx` unchanged). **FA2-routing PROVEN:** nsys `flash_fwd_splitkv` 1410 @ 18.5 µs, **zero `PagedAttentionKernel`** in decode. **Gate:** converted `test_voxtral_e2e` to the ratified near-tie DISTRIBUTIONAL form — binding correctness = the teacher-force PASS (kernel-INDEPENDENT: scalar AND FA2 both PASS); strict prefix exact to the first bf16 tie (FA2 takes the OTHER side of the pos-18 2-way EXACT tie ⇒ prefix 18, `>=18`); byte-match to the FA2 seq is a determinism anchor, not the correctness bar. Regenerated `voxtral_neartie.json` (md5 `3d199c2d…`→`937b9ad3…`); STRICT golden `voxtral_golden.json` `8ab87b7e…` **UNCHANGED**. **Gate PASS 16/16** (strict prefix 18/48; teacher-force result=PASS, divergent=0, gap 0.0, over-band=0; FA2 seq 48/48). **Teacher-force (fresh, vLLM 0.25.0 on FA2 seq):** 0 divergent, worst gap 0.0000, PASS. **Capture safety (FA2 inside the captured `VoxtralDecodeGraph`):** captured S=1 + 46 replays (all tokens valid); compute-sanitizer memcheck **0 errors** on the graphed-FA2-decode path (text-only 22/22, 20 replays, exit 0); 3 runs byte-identical ⇒ capture-safe, ships as DEFAULT graph path. **A/B (same-binary, throwaway timer, 6 reps rep0 dropped, steady-state):** scalar **60.50 ms/tok** (60.39–60.62) vs FA2 **39.50** (39.41–39.58) = **−21.0 ms (~35%), NON-OVERLAPPING; 39.50 = 0.97× vLLM 40.8 ms — BEATS.** Clean CUDA `-Werror` 0-warn. **Audio DECODE now correctness- AND speed-DONE**; **`ENG-MM-AUDIO-E2E` / umbrella MM row stays `ACTIVE`/`PARTIAL`** — audio TTFT (32-layer Whisper encoder, UNMEASURED vs vLLM 43 ms) + batched c2+ / `audio_url` serving ingestion still open (same as image/video). Records: multimodal-speed.md §12 (+ headline pointer), engine `ENG-MM-AUDIO-E2E` + Voxtral model-matrix row + checklist + feature-matrix mm row + roadmap MM + completion-spec MM line (by-key), README/BENCHMARKS, ledger, this entry, coordination CLAIM. Record checkers RC green. Not pushed; FULL SHA reported.
 - **Next (audio, after adoption):** audio DECODE is now DONE (BEATS vLLM 0.97×). Remaining for the umbrella MM DONE bar: (1) MEASURE audio TTFT our-side (32-layer Whisper encoder + prefill) vs vLLM's 43 ms — the last unmeasured audio axis; (2) W2 batched multi-seq mm decode (S>1 / c2+); (3) W3 `image_url`/`audio_url` serving ingestion for the production-serving A/B.
 - **2026-07-27** — **ROAD-V1-MM audio ENCODER TTFT MEASURED our-side + a warp-attention brick LANDED (encoder forward 8870→1890 ms, 4.7×) — NOT at parity vs vLLM's 43 ms; residual attributed** (`CLAIM-MM-SPEED-AUDIO-ENC`, multimodal-speed.md §13; base local `main` `9e34a19c` (the §12 decode-adopt HEAD); dgx GB10 sm_121a `~/work/mm-audio-fa2` incremental on the §12 tree — source verified == current `main` by md5, only `whisper_audio.cpp` edited; cutlass 4.5.0 + FA2 + Triton-AOT arch 121a; ALL GPU under `flock /tmp/gpu` sole owner, `nvidia-smi` idle, `local-ai-worker` absent; nsys inside `env -i`). Closes §12's open item (audio TTFT unmeasured our-side). **ATTRIBUTION (nsys `cuda_gpu_kern_sum --cuda-graph-trace=node`):** the Whisper encoder ran the naive `vt::Attention` (`kAttention`, O(t²) with a per-key block-`__syncthreads` reduction, one CTA per (query,head) streaming all 1500 keys — the exact anti-pattern §7 fixed for the vision tower) as the dominant encoder kernel. **LEVER (1:1 the §7 vision-tower fix):** routed the encoder self-attention (head_dim 64, non-causal, bidirectional) to the warp-scoped online-softmax `vt::AttentionDenseFast` (butterfly `__shfl_xor`, register accumulator, no `__syncthreads`; `kAttention` untouched ⇒ text byte-identical). One src file (`whisper_audio.cpp`), `VT_WHISPER_ENC_EAGER=1` fallback. Grounded in vLLM `model_executor/models/whisper.py` `WhisperEncoderAttention` (:255) forward (:298-317) → the flash-attn varlen non-causal backend @ e24d1b24. **RED line HELD:** `test_voxtral_e2e` **16/16** with the fast kernel default (strict prefix 18/48, teacher-force PASS, divergent=0, gap 0.0, seq 48/48); the naive arm (`VT_WHISPER_ENC_EAGER=1`) ALSO passes 16/16 with the SAME tokens ⇒ the warp kernel flips ZERO tokens (bit-exact at token level, like §7's 32/32). Goldens md5 UNCHANGED (`voxtral_golden.json 8ab87b7e…`, `voxtral_neartie.json 937b9ad3…`, before==after — NO golden regen). Proof-of-run: nsys of the shipping arm shows `AttentionWarpKernel` 32 inst (= 32 layers), ZERO naive `AttentionKernel`. **A/B (same-binary, throwaway `VT_WHISPER_ENC_TIME` timer NOT committed, 6 reps rep0 dropped):** encoder forward **8870 ms** (8858–8882) → **1890 ms** (1872–1903) = **−6980 ms (4.7×), NON-OVERLAPPING**. **HONEST verdict — NOT closed:** ~1.89 s vs vLLM's 43 ms TTFT (~44×). nsys of the fast arm: `AttentionWarpKernel` STILL **31.8 ms/layer × 32 = 1.02 s** — O(t²), memory-bound on redundant K/V global reads (~5.7 GB/layer at ~273 GB/s ≈ 21 ms/layer of K reads alone, no shared-mem tile reuse across queries); the rest is per-call host weight marshalling (f32→bf16 + H2D of all 32 layers EVERY forward) + the conv1→host→conv2 round-trip. **Ranked residual levers (grounded, NOT implemented):** (1) flash-TILED non-causal head_dim-64 encoder attention (vLLM `flash_attn_varlen_func`; the vendored FA2 has non-causal templates but only hd {128,192,256} paged → needs an hd-64 instantiation + dense/single-request layout — LARGE, the true gap-closer); (2) resident one-time encoder weights (bit-identical, the §7 fix #1) + drop the conv round-trip (MEDIUM, byte-exact). Audio DECODE stays DONE-on-speed; audio **TTFT/encoder stays speed-pending / `PARTIAL`**. Records: multimodal-speed.md §13 (+ headline pointer), engine `ENG-MM-AUDIO-E2E`, Voxtral model-matrix row + checklist, feature-matrix mm row, roadmap MM + completion-spec MM line (by-key), docs/STATUS.md audio line + docs/BENCHMARKS.md, ledger, this entry, coordination CLAIM. Record checkers RC green. `benchmark_binding=false`. Not pushed; FULL SHA reported.
+
+## 2026-07-27 — ROAD-V1-C8 `SERVE-RESPONSE-METRICS`: EngineCoreEvents + per-request timing LANDED + CPU-GATED (`CLAIM-ROADMAP-C8-RESPONSE-METRICS`) — the metric families the live-metrics wiring left at 0 now populate
+
+**What/why.** The live per-step metrics wiring (`CLAIM-ROADMAP-C8-METRICS-WIRE`)
+retired the oldest T0 debt (`/metrics` serves live counts) but explicitly named
+one residual: "per-request queue/prefill/inference timing + preemption counter
+(EngineCoreEvents deferred → `SERVE-RESPONSE-METRICS`)". Those series
+(`vllm:request_{queue,prefill,inference}_time_seconds`,
+`vllm:num_preemptions_total`) already existed in the catalog and were already
+observed once per finished request by `PrometheusStatLogger::Record`
+(`loggers.cpp:225,254-257`) — but observed with value 0, because nothing produced
+the intervals. In vLLM those intervals are derived from EngineCoreEvents the
+scheduler emits per request. This checkpoint ports that event surface + the
+consumer. `SERVE-RESPONSE-METRICS` `INVENTORIED`→`ACTIVE`.
+
+**What landed (additive, pin `555967922`).**
+- NEW `include/vllm/v1/engine/event.h`: `EngineCoreEventType{QUEUED=1,SCHEDULED=2,
+  PREEMPTED=3}` + `EngineCoreEvent{type,timestamp}`+`new_event` (1:1
+  `engine/__init__.py:150-176`). Small standalone header so `request.h` and
+  `engine/types.h` both use it without a circular include.
+- `Request.events` + `record_event`/`take_events` (`request.py:98,309-320`);
+  `EngineCoreOutput.events` (`optional<vector>`, omit-default).
+- Scheduler: `log_stats_` (default true, mirrors upstream `not disable_log_stats`);
+  QUEUED at `add_request` (`scheduler.py:2135`), a shared per-step
+  `scheduled_timestamp` (`:461`), SCHEDULED on running-batch admission (`:1003`),
+  PREEMPTED in `preempt_request` (now takes a timestamp, `:1221`); `out.events =
+  request->take_events()` on each `EngineCoreOutput` in `update_from_output`
+  (`:1839`).
+- `OutputProcessor::process_outputs`: `update_from_events` folds `eco.events`
+  (`stats.py:428-450`) into NEW `RequestState.queued_ts/scheduled_ts` (QUEUED→
+  queued_ts; FIRST SCHEDULED→scheduled_ts, resume SCHEDULED ignored; PREEMPTED→
+  `IterationStats.num_preempted_reqs++`); fills `FinishedRequestStats.queued_time`
+  (=scheduled−queued)/`prefill_time`(=first_token−scheduled)/`inference_time`
+  (=last_token−scheduled) (`stats.py:459-476`).
+- NO logger/registry change — the Prometheus logger already observed the four
+  timing fields + the preemption counter.
+
+**Clock consistency (the subtle bit).** `first_token_ts`/`last_token_ts` are the
+`EngineCoreOutputs.timestamp` (stamped by `core.cpp` via `MonotonicSeconds`,
+steady_clock); `scheduled_ts`/`queued_ts` are event timestamps stamped in the
+scheduler via `MonotonicSeconds`/`new_event`. Same steady clock → every interval
+is non-negative. `add_request` runs before `schedule()` → `queued_time>0`;
+`schedule()` runs before the step's `core.cpp` timestamp → `prefill_time>0`;
+`inference = prefill + decode` exactly (both off the same three endpoints).
+
+**Gates (behavioural, RED-first, CPU).**
+- `test_scheduler` NEW "records QUEUED/SCHEDULED/PREEMPTED engine-core events"
+  (15 asserts): reuses the KV-exhaustion preemption mechanics; QUEUED at
+  add_request, SCHEDULED on admission (ordered), a real FCFS-tail preemption
+  appends PREEMPTED (ordered) with `num_preemptions==1`.
+- `test_llm_engine` NEW "per-request queue/prefill/inference timing populates"
+  (26 asserts): drives the CPU reference engine to completion; the `_sum` of the
+  three timing histograms flips 0→positive and satisfies `inference=prefill+
+  decode`, `prefill≤inference≤e2e`.
+- RED evidence (two levers, both re-run this session): (a) intervals left at 0.0
+  (true pre-wiring `main` state) → **5** `test_llm_engine` asserts fail —
+  queue/prefill/inference `_sum` stuck at 0, `inference==prefill+decode` broken
+  (`0 == Approx(7.52)`); the flipped metric is
+  `vllm:request_{queue,prefill,inference}_time_seconds` `_sum`. (b) `log_stats_`
+  off → the whole scheduler case fails at the first `req0->events.size()==1`.
+  Restoring → 15/15 + 26/26.
+
+**Inertness + rebase.** Additive; `log_stats_` default-on but events are inert
+unless a stat logger consumes them (no-logger `process_outputs` byte-identical).
+The 5 pre-existing `test_llm_engine` determinism cases + `test_prometheus_metrics`
+4/4 + `test_output_processor`/`test_async_scheduler`/`test_sched_output`/
+`test_prefix_cache_stats` all UNCHANGED; token stream untouched (the new
+`EngineCoreOutput.events` field is omit-default). CPU `-Werror` 0-warn on a clean
+full `vllm` library rebuild. The worktree base (`7f620e74`) was stale behind local
+`main` (`11e0ba36`, which advanced with MM/Voxtral/Whisper/metal/vt work + record
+compactions); rebased by hard-resetting to `main` HEAD and re-applying the (disjoint)
+code files + redoing the record edits on main's current content — main's MM/metal/vt
+advance is fully preserved (my code files do not overlap main's changed files).
+
+**Residual (C8 stays PARTIAL).** The chat/completion RESPONSE-BODY timing surface
+(protocol field + streaming/non-streaming serving emission + invalid multi-output
+suppression + CLI validation, `serving.py:461-481,765-784`); AsyncLLM
+production-serving metric wiring; config-gated metric families (spec-decode/
+kv-connector/mm/LoRA); the `:1318` streaming-session QUEUED site; chat-form
+`/tokenize`; JSON-schema arg coercion. Spec:
+[per-request-response-metrics.md](specs/per-request-response-metrics.md). Not
+pushed; FULL SHA reported in the closing commit.

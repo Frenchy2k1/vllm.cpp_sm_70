@@ -82,6 +82,12 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
 void Scheduler::add_request(std::unique_ptr<Request> request) {
   const std::string request_id = request->request_id;
   waiting->add_request(request.get());
+  // QUEUED event (scheduler.py:2135): stamp the wait-queue entry time so the
+  // frontend can measure the queued interval (scheduled_ts - queued_ts). Default
+  // (nullopt) timestamp -> record_event stamps the current monotonic time.
+  if (log_stats_) {
+    request->record_event(EngineCoreEventType::kQueued);
+  }
   requests[request_id] = std::move(request);
 }
 
@@ -112,7 +118,7 @@ void Scheduler::finish_requests(const std::string& request_id,
   requests.erase(it);
 }
 
-void Scheduler::preempt_request(Request* request) {
+void Scheduler::preempt_request(Request* request, double timestamp) {
   assert(request->status == RequestStatus::kRunning &&
          "Only running requests can be preempted");
   // _free_request_blocks (T0: defer_block_free off -> free immediately).
@@ -122,6 +128,12 @@ void Scheduler::preempt_request(Request* request) {
   // Upstream Request.num_preemptions (read by PrefixCacheStats.record at
   // vllm/v1/core/kv_cache_manager.py:239).
   request->num_preemptions += 1;
+  // PREEMPTED event (scheduler.py:1221): a preemption occurred; the frontend
+  // bumps its num_preemptions counter and the interval derivations fold the
+  // preempted span into prefill/inference. Uses schedule()'s shared timestamp.
+  if (log_stats_) {
+    request->record_event(EngineCoreEventType::kPreempted, timestamp);
+  }
   // Put the request back to the FRONT of the waiting queue (FCFS retry).
   waiting->prepend_request(request);
   reset_preempted_req_ids.insert(request->request_id);
@@ -129,6 +141,11 @@ void Scheduler::preempt_request(Request* request) {
 
 SchedulerOutput Scheduler::schedule() {
   current_step_ += 1;
+  // scheduled_timestamp (scheduler.py:461): one monotonic reading for the whole
+  // step, shared by every SCHEDULED event and by any PREEMPTED event a
+  // scheduling-time preemption records, so a request scheduled and a request
+  // preempted in the same step carry a consistent instant.
+  const double scheduled_timestamp = MonotonicSeconds();
   // NOTE(woosuk): there is no "prefill" nor "decode" phase — each request just
   // has num_computed_tokens and num_tokens, and each step assigns tokens so the
   // former catches up to the latter (covers chunked prefill uniformly).
@@ -250,7 +267,7 @@ SchedulerOutput Scheduler::schedule() {
         running.pop_back();
       }
 
-      preempt_request(preempted_req);
+      preempt_request(preempted_req, scheduled_timestamp);
       preempted_reqs.push_back(preempted_req);
       if (preempted_req == request) {
         // No more requests to preempt; cannot schedule this request.
@@ -375,6 +392,15 @@ SchedulerOutput Scheduler::schedule() {
 
       request = waiting->pop_request();
       running.push_back(request);
+      // SCHEDULED event (scheduler.py:1003): this request was admitted to the
+      // running batch this step (from WAITING or resumed from PREEMPTED). The
+      // frontend keeps the FIRST such timestamp as scheduled_ts (later resume
+      // SCHEDULED events are ignored), the boundary between the queued and
+      // prefill intervals. Uses the shared step timestamp.
+      if (log_stats_) {
+        request->record_event(EngineCoreEventType::kScheduled,
+                              scheduled_timestamp);
+      }
       if (request->status == RequestStatus::kWaiting) {
         scheduled_new_reqs.push_back(request);
       } else if (request->status == RequestStatus::kPreempted) {
@@ -717,6 +743,10 @@ EngineCoreOutputs Scheduler::update_from_output(
       if (request->stop_reason.has_value()) {
         out.stop_reason = std::to_string(*request->stop_reason);
       }
+      // events=request.take_events() (scheduler.py:1839): drain the request's
+      // accumulated QUEUED/SCHEDULED/PREEMPTED events onto this output and clear
+      // them. nullopt (omit-default) when log_stats is off or none fired.
+      out.events = request->take_events();
       outputs.push_back(std::move(out));
     }
   }

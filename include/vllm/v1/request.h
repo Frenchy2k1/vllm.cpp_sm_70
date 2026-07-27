@@ -14,7 +14,12 @@
 // slot these in without reshaping the struct:
 //   - prompt_embeds / prompt_is_token_ids / _prompt_embeds_per_block_hashes,
 //     mm_features (multimodal), pooling_params,
-//     events / kv_transfer_params,
+//     kv_transfer_params,
+//     (events is un-deferred below for SERVE-RESPONSE-METRICS — the scheduler
+//     records QUEUED / SCHEDULED / PREEMPTED events on the request, drained onto
+//     EngineCoreOutput.events, so the frontend can derive the per-request
+//     queue/prefill/inference timing intervals + the preemption counter;
+//     vllm/v1/request.py:98,309-320.)
 //     (cache_salt and the LoRA adapter name are un-deferred below for the
 //     prefix-cache extra-key path — KV-PREFIX-CACHE W2 / ROAD-V1-D4-APC; the
 //     full LoRARequest / LoRA runtime stays deferred to LORA-RUNTIME.)
@@ -56,6 +61,7 @@
 #include "vllm/multimodal/inputs.h"            // multimodal::MultiModalFeatureSpec
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"       // BlockHash, BlockHasher
+#include "vllm/v1/engine/event.h"              // EngineCoreEvent(Type)
 #include "vllm/v1/structured_output/request.h"  // StructuredOutputRequest
 
 namespace vllm::v1 {
@@ -193,6 +199,13 @@ struct Request {
   // PrefixCacheStats' preempted_* counters, so a preempted request's
   // guaranteed second-pass hit cannot inflate the headline hit rate.
   int num_preemptions = 0;
+  // Per-request engine-core events accumulated since the last take_events()
+  // (upstream Request.events, request.py:98). The scheduler appends a QUEUED /
+  // SCHEDULED / PREEMPTED event (gated on log_stats) at the matching lifecycle
+  // site; update_from_output drains them onto the request's EngineCoreOutput so
+  // the frontend can derive its queue/prefill/inference timing. Empty (and never
+  // appended to) when log_stats is off -> byte-identical no-stats path.
+  std::vector<EngineCoreEvent> events;
   RequestStatus status = RequestStatus::kWaiting;
   // stop_reason (upstream Request.stop_reason: int | str | None = None). Set by
   // check_stop (sched/utils) when a stop_token_ids match ends the request — it
@@ -289,6 +302,26 @@ struct Request {
   // structured-output constraint (structured_output_request is set).
   bool use_structured_output() const {
     return structured_output_request.has_value();
+  }
+
+  // record_event (request.py:309-314): append a timestamped engine-core event.
+  // A nullopt timestamp stamps the current monotonic time (the QUEUED site); the
+  // SCHEDULED / PREEMPTED sites pass schedule()'s shared step timestamp.
+  void record_event(EngineCoreEventType event_type,
+                    std::optional<double> timestamp = std::nullopt) {
+    events.push_back(EngineCoreEvent::new_event(event_type, timestamp));
+  }
+
+  // take_events (request.py:316-320): return the accumulated events and clear
+  // them, or nullopt when there are none (mirrors upstream's list | None so the
+  // no-event path leaves EngineCoreOutput.events unset / omit-default).
+  std::optional<std::vector<EngineCoreEvent>> take_events() {
+    if (events.empty()) {
+      return std::nullopt;
+    }
+    std::vector<EngineCoreEvent> taken;
+    taken.swap(events);
+    return taken;
   }
 
   // is_finished / get_finished_reason: delegate to RequestStatus.

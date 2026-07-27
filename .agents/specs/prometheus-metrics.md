@@ -102,10 +102,17 @@ the same into the AsyncLLM production-serving loop is the remaining follow-on.
   Opt-in `set_stat_logger` (null default) ⇒ byte-identical no-stats path.
   Behavioural CPU gate `test_llm_engine.cpp` case 6 (44 asserts, RED-first: 14
   flip 0→correct when `Record` is disabled).
-- W5 (residual): the AsyncLLM production-serving metric wiring; the config-gated
+- W5: the per-request queue/prefill/inference timing + preemption counter via
+  EngineCoreEvents — **LANDED + CPU-GATED 2026-07-27 (`CLAIM-ROADMAP-C8-RESPONSE-METRICS`,
+  `SERVE-RESPONSE-METRICS` → `ACTIVE`).** The scheduler records
+  QUEUED/SCHEDULED/PREEMPTED events, the `OutputProcessor` folds them into the
+  timing intervals + `num_preemptions`, so `vllm:request_{queue,prefill,inference}
+  _time_seconds` + `vllm:num_preemptions_total` now carry real durations (they
+  were observed at 0 before). See
+  [per-request-response-metrics.md](per-request-response-metrics.md).
+- W6 (residual): the AsyncLLM production-serving metric wiring; the config-gated
   families (spec-decode/kv-connector/mm/LoRA) as their configs land; the
-  per-request queue/prefill/inference timing + preemption counter (needs
-  EngineCoreEvents → `SERVE-RESPONSE-METRICS`) — OPEN.
+  chat/completion RESPONSE-BODY per-request timing surface — OPEN.
 
 ## Risks/decisions
 
