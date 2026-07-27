@@ -1367,3 +1367,129 @@ TEST_CASE("Metal routes m=1 BT matmul to the GEMV kernel and matches the CPU ora
   }
   metal.DestroyQueue(q);
 }
+
+// ===========================================================================
+// 2-D blocked simdgroup-matrix GEMM (m > 1). Attribution put PREFILL at 33.7%
+// of GPU time from only 168 dispatches, ~8.2x slower than MLX-LM, still on the
+// 16x16 scalar tile loop. The small-m dead-end established the missing property
+// precisely: A reuse ACROSS COLUMNS, which needs 2-D blocking. This kernel
+// stages A and B tiles in threadgroup memory and multiplies them with
+// simdgroup_float8x8, so one kernel serves prefill AND batched decode.
+TEST_CASE("Metal routes m>1 BT matmul to the simdgroup GEMM and matches the CPU oracle") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+
+  // f32 arm first: at bf16 output the NMSE is dominated by store rounding and
+  // cannot discriminate kernels (that lesson cost a golden re-capture once).
+  {
+    const int64_t m = 64, k = 512, n = 128;
+    std::mt19937 rng(0x5EEDu);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> ah(static_cast<size_t>(m * k)), bh(static_cast<size_t>(n * k));
+    for (auto& x : ah) x = dist(rng);
+    for (auto& x : bh) x = dist(rng);
+    std::vector<double> ref(static_cast<size_t>(m * n), 0.0);
+    for (int64_t r = 0; r < m; ++r)
+      for (int64_t c2 = 0; c2 < n; ++c2) {
+        double acc = 0.0;
+        for (int64_t kk = 0; kk < k; ++kk)
+          acc += double(ah[static_cast<size_t>(r * k + kk)]) *
+                 double(bh[static_cast<size_t>(c2 * k + kk)]);
+        ref[static_cast<size_t>(r * n + c2)] = acc;
+      }
+    auto up = [&](const std::vector<float>& h) {
+      void* pp = metal.Alloc(h.size() * sizeof(float));
+      metal.Copy(q, pp, h.data(), h.size() * sizeof(float));
+      return pp;
+    };
+    void* da = up(ah);
+    void* db = up(bh);
+    void* dc = metal.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {m, k});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {n, k});
+    Tensor tc = Tensor::Contiguous(dc, vt::DType::kF32, d, {m, n});
+    vt::MatmulBT(q, tc, ta, tb);
+    metal.Synchronize(q);
+    std::vector<float> got(static_cast<size_t>(m * n));
+    metal.Copy(q, got.data(), dc, got.size() * sizeof(float));
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      const double diff = double(got[i]) - ref[i];
+      num += diff * diff;
+      den += ref[i] * ref[i];
+    }
+    const double nmse = den > 0.0 ? num / den : num;
+    MESSAGE("simdgroup GEMM f32 64x512x128 NMSE vs f64 oracle = " << nmse);
+    CHECK(nmse <= 1e-10);
+    metal.Free(da); metal.Free(db); metal.Free(dc);
+  }
+
+  struct Case { const char* name; int64_t m, k, n; };
+  const Case cases[] = {
+      {"prefill 512x2048x2048", 512, 2048, 2048},
+      {"batched decode m=16", 16, 2048, 512},
+      {"batched decode m=2", 2, 1024, 256},
+      // Ragged on all three dims at once: tile edges in M, N and K together are
+      // where a blocked kernel's guards break.
+      {"ragged 37x333x201", 37, 333, 201},
+  };
+
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    std::mt19937 rng(0x1234u);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> ah(static_cast<size_t>(c.m * c.k));
+    std::vector<float> bh(static_cast<size_t>(c.n * c.k));
+    for (auto& x : ah) x = Bf16RT(dist(rng));
+    for (auto& x : bh) x = Bf16RT(dist(rng));
+    std::vector<float> ref(static_cast<size_t>(c.m * c.n), 0.0f);
+    for (int64_t r = 0; r < c.m; ++r)
+      for (int64_t c2 = 0; c2 < c.n; ++c2) {
+        float acc = 0.0f;
+        for (int64_t kk = 0; kk < c.k; ++kk)
+          acc += ah[static_cast<size_t>(r * c.k + kk)] * bh[static_cast<size_t>(c2 * c.k + kk)];
+        ref[static_cast<size_t>(r * c.n + c2)] = acc;
+      }
+    auto up = [&](const std::vector<float>& h) {
+      void* pp = metal.Alloc(h.size() * sizeof(uint16_t));
+      std::vector<uint16_t> packed(h.size());
+      for (size_t i = 0; i < h.size(); ++i) packed[i] = vt::F32ToBF16(h[i]);
+      metal.Copy(q, pp, packed.data(), packed.size() * sizeof(uint16_t));
+      return pp;
+    };
+    void* da = up(ah);
+    void* db = up(bh);
+    void* dc = metal.Alloc(static_cast<size_t>(c.m * c.n) * sizeof(uint16_t));
+    Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {c.m, c.k});
+    Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {c.n, c.k});
+    Tensor tc = Tensor::Contiguous(dc, vt::DType::kBF16, d, {c.m, c.n});
+
+    const bool was_on = vt::metal::ProfileEnabled();
+    vt::metal::SetProfileEnabled(true);
+    vt::metal::ResetProfile();
+    vt::MatmulBT(q, tc, ta, tb);
+    metal.Synchronize(q);
+    bool saw_mm = false;
+    for (const vt::metal::ProfileRow& r : vt::metal::GetProfileRows()) {
+      if (r.name == "vt_matmul_bt_mm") saw_mm = true;
+    }
+    CHECK(saw_mm);  // a numeric check cannot prove WHICH kernel ran
+    vt::metal::SetProfileEnabled(was_on);
+    vt::metal::ResetProfile();
+
+    std::vector<uint16_t> po(static_cast<size_t>(c.m * c.n));
+    metal.Copy(q, po.data(), dc, po.size() * sizeof(uint16_t));
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < po.size(); ++i) {
+      const double got = double(vt::BF16ToF32(po[i]));
+      num += (got - double(ref[i])) * (got - double(ref[i]));
+      den += double(ref[i]) * double(ref[i]);
+    }
+    const double nmse = den > 0.0 ? num / den : num;
+    CAPTURE(nmse);
+    CHECK(nmse <= 5e-4);
+    metal.Free(da); metal.Free(db); metal.Free(dc);
+  }
+  metal.DestroyQueue(q);
+}

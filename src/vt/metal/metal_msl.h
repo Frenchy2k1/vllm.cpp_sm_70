@@ -430,6 +430,109 @@ kernel void vt_matmul_bt_gemv(device const uchar* a   [[buffer(0)]],
   }
 }
 
+// --- 2-D blocked simdgroup-matrix GEMM (m > 1) -------------------------------
+// Replaces the 16x16 scalar tile loop for every m > 1. Attribution put PREFILL
+// at 33.7% of GPU time from only 168 dispatches and ~8.2x behind MLX-LM, and the
+// small-m dead-end identified the missing property exactly: A REUSE ACROSS
+// COLUMNS, which a one-column-per-simdgroup kernel cannot have and 2-D blocking
+// does.
+//
+// SHAPE. A threadgroup owns a 32x32 output tile and holds 4 simdgroups in a 2x2
+// grid, so each simdgroup owns 16x16 = a 2x2 block of simdgroup_float8x8
+// accumulators. The K loop advances in steps of 8.
+//
+// WHY STAGE THROUGH THREADGROUP MEMORY. `simdgroup_load` needs a TYPED pointer,
+// but our operands carry a runtime dtype code (f32/f16/bf16) and the output does
+// too. Staging each tile into threadgroup `float` lets ONE kernel serve every
+// dtype combination, which is the same reason the scalar kernels use vt_load.
+// It also gives the reuse: each staged A tile is consumed by all 32 columns of
+// the tile, and each staged B tile by all 32 rows.
+//
+// Accumulators are stored back through threadgroup memory for the same reason:
+// `simdgroup_store` cannot write a runtime-dtype output buffer directly.
+//
+// Threadgroup memory: 32*8 + 8*32 + 32*32 floats = 6 KB, well inside the 32 KB
+// limit, so occupancy is not the constraint here.
+#define VT_MM_BM 32u
+#define VT_MM_BN 32u
+#define VT_MM_BK 8u
+#define VT_MM_SGS 4u  // 2x2 simdgroups => 128 threads
+
+kernel void vt_matmul_bt_mm(device const uchar* a   [[buffer(0)]],
+                            device const uchar* b   [[buffer(1)]],
+                            device uchar*       out [[buffer(2)]],
+                            constant VtGemmParams& p [[buffer(3)]],
+                            uint2 tgid [[threadgroup_position_in_grid]],
+                            uint  tid  [[thread_index_in_threadgroup]],
+                            uint  sgitg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float sa[VT_MM_BM][VT_MM_BK];
+  threadgroup float sb[VT_MM_BK][VT_MM_BN];
+  threadgroup float sc[VT_MM_BM][VT_MM_BN];
+
+  const uint row0 = tgid.y * VT_MM_BM;
+  const uint col0 = tgid.x * VT_MM_BN;
+
+  simdgroup_float8x8 acc[2][2];
+  for (uint i = 0u; i < 2u; ++i)
+    for (uint j = 0u; j < 2u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+  const uint sg_r = sgitg / 2u;  // 0..1
+  const uint sg_c = sgitg % 2u;  // 0..1
+  const uint nthreads = VT_MM_SGS * 32u;
+
+  for (uint k0 = 0u; k0 < p.k; k0 += VT_MM_BK) {
+    // Stage A[BM x BK] and B[BK x BN]. 256 elements each, 128 threads => 2 apiece.
+    // Out-of-range lanes stage ZERO so the accumulate stays correct at the edges
+    // without any special-casing in the inner loop.
+    for (uint e = tid; e < VT_MM_BM * VT_MM_BK; e += nthreads) {
+      const uint r = e / VT_MM_BK, kk = e % VT_MM_BK;
+      const uint gr = row0 + r, gk = k0 + kk;
+      sa[r][kk] = (gr < p.m && gk < p.k)
+                      ? vt_load(a, p.a_dt, ulong(gr) * ulong(p.lda) + ulong(gk))
+                      : 0.0f;
+    }
+    for (uint e = tid; e < VT_MM_BK * VT_MM_BN; e += nthreads) {
+      const uint kk = e / VT_MM_BN, c = e % VT_MM_BN;
+      const uint gc = col0 + c, gk = k0 + kk;
+      float v = 0.0f;
+      if (gc < p.n && gk < p.k) {
+        v = (p.bt != 0u) ? vt_load(b, p.b_dt, ulong(gc) * ulong(p.k) + ulong(gk))
+                         : vt_load(b, p.b_dt, ulong(gk) * ulong(p.n) + ulong(gc));
+      }
+      sb[kk][c] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 ma[2], mb[2];
+    for (uint i = 0u; i < 2u; ++i) {
+      simdgroup_load(ma[i], &sa[sg_r * 16u + i * 8u][0], VT_MM_BK);
+    }
+    for (uint j = 0u; j < 2u; ++j) {
+      simdgroup_load(mb[j], &sb[0][sg_c * 16u + j * 8u], VT_MM_BN);
+    }
+    for (uint i = 0u; i < 2u; ++i)
+      for (uint j = 0u; j < 2u; ++j)
+        simdgroup_multiply_accumulate(acc[i][j], ma[i], mb[j], acc[i][j]);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Land the accumulators in threadgroup memory, then write out with vt_store so
+  // the runtime output dtype is honoured.
+  for (uint i = 0u; i < 2u; ++i)
+    for (uint j = 0u; j < 2u; ++j)
+      simdgroup_store(acc[i][j], &sc[sg_r * 16u + i * 8u][sg_c * 16u + j * 8u], VT_MM_BN);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint e = tid; e < VT_MM_BM * VT_MM_BN; e += nthreads) {
+    const uint r = e / VT_MM_BN, c = e % VT_MM_BN;
+    const uint gr = row0 + r, gc = col0 + c;
+    if (gr < p.m && gc < p.n) {
+      vt_store(out, p.out_dt, ulong(gr) * ulong(p.n) + ulong(gc), sc[r][c]);
+    }
+  }
+}
+
 struct VtFcParams {
   uint  t;
   uint  h;
