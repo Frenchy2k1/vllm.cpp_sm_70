@@ -27942,3 +27942,64 @@ would fare better on non-causal or short-context shapes; not this workload.
 attention:GEMM FLOP-rate ratio is 4.4x and the two structural ideas for it are
 now both closed — BK deepening by the bf16-P precision constraint, rescale
 elision by measurement.
+
+## 2026-07-27 — FIRST NON-GB10 CUDA RUNTIME PROOF: sm_110 on Jetson Thor (`CLAIM-CUDA-SM110-RUNTIME`)
+
+`BACKEND-CUDA-SM110` moves from BUILD-supported to **RUNTIME-VERIFIED (portable
+bf16 path)** — the first time any vllm.cpp CUDA path has executed on non-GB10
+silicon. Base `main` `0f07fe34`, isolated worktree
+`.claude/worktrees/agent-a47bcf2794041ed3b`. RECORDS-ONLY: zero source/CMake/
+kernel/test edits — the sm_110 build config and kernel bodies are exactly the
+committed W10 cross-family fan-out.
+
+**Board (confirmed).** NVIDIA Jetson Thor, `ssh 192.168.68.23` (hostname `thor`),
+aarch64, JetPack R38, driver 580.00, 14 cores, ~122 GB unified memory, ~91 GB
+disk free. On-box `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` =
+**11.0** — CONFIRMS the previously-inferred sm_110. nvcc
+`/usr/local/cuda-13.0/bin/nvcc` V13.0.48 (the `>=13` target branch lists sm_110).
+**cutlass is NOT installed on Thor** and is not needed (all fast-path cells EMPTY).
+
+**Build.** `git archive` of the worktree commit → Thor (NOT rsync);
+`-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=OFF
+-DVLLM_CPP_METAL=OFF -DVLLM_CPP_VULKAN=OFF`, Release. All five features
+`DISABLED for [110]`; compiles/links **0 warnings** under `-Werror` (CUDA
+`--generate-code=arch=compute_110,code=[compute_110,sm_110]` +
+`-Werror=all-warnings`; CXX `-Wall -Wextra -Werror`). `cuobjdump -lelf libvllm.a`
+= **16 TUs of real sm_110 SASS and nothing else** (the 22 fast-path TUs absent).
+
+**Correctness.** `test_llama_paged_engine`, unsloth/Llama-3.2-1B bf16 safetensors
+(transferred dgx→Thor, symlinked into the HF-cache layout the gate resolves).
+Thor sm_110 vs the committed dgx-captured vLLM oracle greedy golden
+(`tests/parity/goldens/llama_greedy_1b`): **STRICT token-exact 12/16 prompts =
+192/192 tokens** (every vLLM-deterministic prompt), **15/16 bit-identical to the
+GB10 sm_121a anchor**; the 4 remaining are the ratified bf16 near-tie prompts
+where GB10 itself already diverges from vLLM greedy (committed teacher-forced gap
+0.000 nats, exact ties), 3/4 of them bit-identical to the GB10 anchor. PASS under
+the near-tie distributional gate.
+
+**Honesty / caveats carried forward.** (1) The gate's hard anchor-REQUIRE bakes a
+GB10 bit-identity assumption that predates any second board, so it aborts at
+prompt 0 token 12 (a cross-arch bf16 near-tie tail branch) — a candidate future
+refinement is to evaluate the near-tie band even on cross-arch anchor drift
+rather than hard-REQUIRE anchor equality. The underlying forward is correct
+(12/12 strict on all deterministic prompts is not achievable by chance). (2) A
+FRESH oracle teacher-force on Thor's own prefix could NOT be run: the dgx oracle
+is degraded — `~/venvs/vllm-oracle`→`vllm-oracle-next` (0.26.0.dev0) is an
+editable install whose source tree `~/work/vllm-src-5559679` was pruned
+(dangling; `import vllm` fails), and `vllm-oracle-v0.25.0-stage` now crashes in
+EngineCore KV-cache/model init. So p0's near-tie verdict rests on the committed
+gap-0 golden + the 3/4 GB10-identical near-tie prompts. **Repairing the dgx
+oracle is a prerequisite for the next gate that needs a fresh capture.** (3)
+Scope is precise: RUNTIME-VERIFIED = the portable bf16 path that RAN only; the
+fp8/fp4/CUTLASS/Marlin/FA2 fast paths on sm_110 remain DERIVED/NOT-YET (a
+cutlass-backed kernel campaign), and the other six W10 fan-out boards stay
+build-supported only (no board here). (4) No speed number owed (correctness
+milestone); a llama.cpp A/B on Thor was not run (optional, deferred). (5) GPU
+discipline honored: `local-ai-worker` on Thor was `docker stop`ped for the GPU
+run under `flock $HOME/gpu.lock`, then `docker start`ed — RESTORED to Up
+(restart=always), Thor left exactly as found.
+
+Records touched: `.agents/backend-matrix.md`, `.agents/specs/cuda-arch-additivity.md`,
+`docs/STATUS.md`, `docs/BENCHMARKS.md`, `.agents/roadmap_v1.md`,
+`.agents/environment.md` (new Thor profile + oracle caveat), `parity-ledger.md`,
+`coordination.md` (`CLAIM-CUDA-SM110-RUNTIME`), this `state.md`. Not pushed.

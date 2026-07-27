@@ -16,6 +16,68 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## sm_110 (Jetson Thor) runtime gate, the first non-GB10 runtime proof (2026-07-27, `CLAIM-CUDA-SM110-RUNTIME`) - CORRECTNESS milestone, no speed number owed
+
+**What ran.** vllm.cpp built natively for `sm_110` on a real NVIDIA Jetson Thor
+board and ran the Llama-3.2-1B paged-engine greedy gate token-exact against the
+committed vLLM oracle golden. This is the FIRST time any vllm.cpp CUDA path has
+executed on non-GB10 silicon. Scope: PORTABLE bf16 path only (the fp8/fp4/CUTLASS
+fast paths resolve EMPTY on sm_110 and did not run; cutlass is not installed on
+Thor).
+
+**Board (confirmed on-box).** `ssh 192.168.68.23` (hostname `thor`), aarch64,
+JetPack R38, driver 580.00, ~122 GB unified memory, 14 cores. On-box
+`nvidia-smi --query-gpu=compute_cap --format=csv,noheader` = **11.0** (confirms
+the inferred sm_110). nvcc `/usr/local/cuda-13.0/bin/nvcc` V13.0.48.
+
+**Build result.** `-DVLLM_CPP_CUDA_ARCHITECTURES=110`, all five fast-path features
+`DISABLED for [110]`, Release, compiles/links **0 warnings** under `-Werror`
+(CUDA `--generate-code=arch=compute_110,code=[compute_110,sm_110]` +
+`-Werror=all-warnings`; CXX `-Wall -Wextra -Werror`). `cuobjdump -lelf libvllm.a`
+= **16 TUs of real `sm_110` SASS and nothing else** (the 22 fast-path TUs absent,
+the documented per-major-11 shape).
+
+**Correctness result.** `test_llama_paged_engine`, unsloth/Llama-3.2-1B bf16
+safetensors (transferred dgx→Thor). Thor sm_110 output vs the committed
+dgx-captured vLLM oracle greedy golden (`tests/parity/goldens/llama_greedy_1b`):
+- **STRICT token-exact 12/16 prompts = 192/192 tokens** - every prompt where
+  vLLM's greedy is DETERMINISTIC (unambiguous).
+- **15/16 prompts bit-identical to the GB10 `sm_121a` anchor** (`our_ids.npy`).
+- The other 4/16 are the ratified bf16 near-tie prompts where GB10 itself already
+  diverges from vLLM greedy; the committed teacher-forced gap golden is 0.000 nats
+  (exact ties) at every such position. On 3/4 Thor is bit-identical to the GB10
+  anchor; on prompt 0 Thor takes an alternate near-tie tail branch (token 12).
+  PASS under the ratified near-tie distributional gate.
+
+Honest note: the committed gate's hard anchor-REQUIRE (a GB10 bit-identity
+assumption predating any second board) aborts at prompt 0 token 12; the underlying
+forward is correct (12/12 strict on all deterministic prompts is not achievable by
+chance). A fresh oracle teacher-force on Thor's own prefix could NOT be run this
+session: the dgx oracle was degraded (0.26 editable install dangling after its
+source tree was pruned; 0.25.0-stage EngineCore init crashes). The p0 near-tie
+verdict therefore rests on the committed gap-0 golden plus the 3/4 GB10-identical
+near-tie prompts.
+
+**No speed number.** This is a correctness milestone; no tok/s is claimed or owed
+for sm_110. A llama.cpp A/B on Thor was NOT run this session (optional, deferred).
+
+**Repro (exact).**
+```
+# base commit 0f07fe34 (main HEAD); archive -> Thor (NOT rsync)
+git archive --format=tar.gz -o vllmcpp-thor.tar.gz HEAD
+scp vllmcpp-thor.tar.gz 192.168.68.23:~/ ; ssh 192.168.68.23 'mkdir -p vllmcpp-thor && tar xzf vllmcpp-thor.tar.gz -C vllmcpp-thor'
+# checkpoint (single hop dgx->Thor after one-time host-key accept)
+ssh dgx.casa 'scp -o StrictHostKeyChecking=accept-new ~/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B/snapshots/*/{model.safetensors,config.json,tokenizer.json,tokenizer_config.json,generation_config.json,special_tokens_map.json} 192.168.68.23:~/llama32-1b/'
+# on Thor: symlink into HF-cache layout the gate resolves
+ssh 192.168.68.23 'D=~/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B/snapshots/thor; mkdir -p $D; ln -sf ~/llama32-1b/* $D/'
+# build (portable, cutlass absent + not needed)
+ssh 192.168.68.23 'export PATH=/usr/local/cuda-13.0/bin:$PATH; cd ~/vllmcpp-thor && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_METAL=OFF -DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_BUILD_EXAMPLES=OFF && cmake --build build --target test_llama_paged_engine -j8'
+# GPU run (free the GPU first, restore after)
+ssh 192.168.68.23 'docker stop local-ai-worker'
+ssh 192.168.68.23 'export PATH=/usr/local/cuda-13.0/bin:$PATH; cd ~/vllmcpp-thor/build && flock $HOME/gpu.lock ./tests/test_llama_paged_engine'
+ssh 192.168.68.23 'docker start local-ai-worker'   # RESTORE the worker
+```
+
 **DEMO figures: concurrency sweep + install footprint (2026-07-27,
 `CLAIM-DEMO-FIGURES`).** Disposition: **NO NEW ENGINE MEASUREMENT (the throughput
 figure RE-RENDERS the existing binding grid; `benchmark_binding=false`). One NEW

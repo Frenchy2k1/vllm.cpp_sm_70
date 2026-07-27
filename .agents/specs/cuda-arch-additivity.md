@@ -219,7 +219,7 @@ predicate over an 8-entry table, off the gate models' default path entirely
 | W7 | **NAMED NEXT ROW, HW-BLOCKED value** — per-source `-gencode` narrowing (vLLM `set_gencode_flags_for_srcs`, `utils.cmake:265-345`) so a CROSS-FAMILY FAT build (`"90a;121a"`) can compile the sm12x-only TUs for sm12x only. Requires target-level `CUDA_ARCHITECTURES OFF` + manual per-TU gencode across every CUDA target. Buys nothing runtime until a cross-family tactic body exists, and it re-codegens the arch we DO run (GB10) so it must be proven byte-identical. **W9 measured that the fat build is the ONLY thing that needs it** — a single-arch cross-family build does not. | `cmake/CudaArchFeatures.cmake`, every `target_sources` CUDA block | NOT STARTED |
 | W8 | **sm_120a bring-up — the first ADDITIVE architecture exercised end to end.** Same-family fat build proven to compile; Triton-AOT multi-arch diagnosis; configure-tier feature-table test + CI job | `cmake/TritonAOT.cmake`, `cmake/CudaArchFeaturesTest.cmake` (new), `CMakeLists.txt`, `.github/workflows/ci.yml` | DONE (BUILD-supported; runtime UNPROVEN — no sm_120 board here) |
 | W9 | **sm_90a (Hopper) bring-up — the first CROSS-FAMILY architecture, single-arch, PORTABLE-KERNELS-ONLY.** Guard the native fp4 helpers so the TU compiles when `VT_FP4_MMA_SM120A` is off; feature-table test pins `90a`→all-features-EMPTY; registry cross-family additivity test | `src/vt/cuda/cuda_matmul_nvfp4.cu`, `cmake/CudaArchFeaturesTest.cmake`, `tests/vt/test_ops_nvfp4_fp4.cpp` | DONE (single-arch BUILD-supported, portable-only, NO fast paths, runtime UNPROVEN — no Hopper board here; fat cross-family build still blocked, W7) |
-| W10 | **CROSS-FAMILY BUILD-SUPPORTED FAN-OUT — every remaining vLLM CUDA arch that is cleanly additive (portable-only, mirror W9).** Ampere `sm_80/86/87/89`, datacenter Blackwell `sm_100a/103a`, `sm_110`: feature-table test pins each → all-features-EMPTY; doc the supported values. ZERO kernel/model/runner edits (W9's helper guards already generalized the single-arch cross-family compile). SCOPED-OUT as non-additive: `sm_70` (Volta, dropped by nvcc 13) and `sm_75` (Turing) — no bf16 tensor cores, so the portable bf16-WMMA path does not compile; `sm_101a` (not in nvcc 13.0). | `cmake/CudaArchFeaturesTest.cmake`, the `VLLM_CPP_CUDA_ARCHITECTURES` doc in `CMakeLists.txt`, records | DONE (build-config + test + records only; representatives sm_80/sm_100a/sm_110 compiled `-Werror` 0-warn on dgx; siblings share the identical portable bodies; runtime UNPROVEN — no such board here) |
+| W10 | **CROSS-FAMILY BUILD-SUPPORTED FAN-OUT — every remaining vLLM CUDA arch that is cleanly additive (portable-only, mirror W9).** Ampere `sm_80/86/87/89`, datacenter Blackwell `sm_100a/103a`, `sm_110`: feature-table test pins each → all-features-EMPTY; doc the supported values. ZERO kernel/model/runner edits (W9's helper guards already generalized the single-arch cross-family compile). SCOPED-OUT as non-additive: `sm_70` (Volta, dropped by nvcc 13) and `sm_75` (Turing) — no bf16 tensor cores, so the portable bf16-WMMA path does not compile; `sm_101a` (not in nvcc 13.0). | `cmake/CudaArchFeaturesTest.cmake`, the `VLLM_CPP_CUDA_ARCHITECTURES` doc in `CMakeLists.txt`, records | DONE (build-config + test + records; representatives sm_80/sm_100a/sm_110 compiled `-Werror` 0-warn on dgx; siblings share the identical portable bodies). **RUNTIME LEG 2026-07-27: `sm_110` RUNTIME-VERIFIED (portable bf16) on a real Jetson Thor board — built natively + Llama-1B paged gate STRICT 12/16 vs the vLLM oracle, 15/16 == GB10 anchor (`CLAIM-CUDA-SM110-RUNTIME`); the FIRST non-GB10 runtime proof. The other six rows stay runtime-UNPROVEN — no board here** |
 
 ### W9 — sm_90a (Hopper), measured
 
@@ -423,15 +423,35 @@ fast paths DISABLED — portable-only) for all seven added arches; a clean
 each new major (8, 10, 11); the resolution asserted, not eyeballed, in
 `CudaArchFeaturesTest.cmake` (`cmake -P`, no GPU, CI-gated).
 
-**What is NOT proven:** any execution on any of these boards. None exists here.
-A green single-arch link is not execution evidence, and — as for `sm_90a` — there
-are NO fast-path kernels at all for these families, so even an owner of one of
+**RUNTIME LEG LANDED 2026-07-27 — `sm_110` is now RUNTIME-VERIFIED (portable bf16
+path), the FIRST non-GB10 runtime proof (`CLAIM-CUDA-SM110-RUNTIME`).** A real
+NVIDIA Jetson Thor board became reachable (`ssh 192.168.68.23`, hostname `thor`,
+aarch64, JetPack R38, driver 580.00, nvcc `/usr/local/cuda-13.0` V13.0.48; on-box
+`nvidia-smi --query-gpu=compute_cap` = **11.0**, CONFIRMING the inferred sm_110;
+cutlass ABSENT — and NOT needed, since every fast-path cell resolves EMPTY for
+sm_110). vllm.cpp was built natively there (`git archive` of the worktree commit →
+Thor, `-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`, Release `-Werror`):
+0 warnings, `cuobjdump` shows 16 `sm_110` TUs and nothing else, matching the
+representative build above. Then the portable bf16 forward RAN and was CORRECT:
+`test_llama_paged_engine` (unsloth/Llama-3.2-1B bf16 safetensors) drove the full
+paged LLMEngine on sm_110 and is **STRICT token-exact 12/16 prompts (192/192
+tokens) vs the committed vLLM oracle greedy golden** (every vLLM-deterministic
+prompt), **15/16 bit-identical to the GB10 sm_121a anchor**; the 4 remaining are
+the ratified bf16 near-tie prompts (GB10 itself diverges from vLLM there; committed
+teacher-forced gap 0.000 nats), 3/4 bit-identical to the GB10 anchor. This flips
+`BACKEND-CUDA-SM110` to RUNTIME-VERIFIED for the PORTABLE path only — the fp8/fp4/
+CUTLASS/Marlin/FA2 fast paths on sm_110 remain DERIVED/NOT-YET (a cutlass-backed
+kernel campaign).
+
+**What is NOT proven:** any execution on the OTHER six added boards — none exists
+here. A green single-arch link is not execution evidence, and — as for `sm_90a` —
+there are NO fast-path kernels at all for these families, so even an owner of one of
 these cards gets only the portable path, not vLLM-competitive throughput. Moving
-any of these rows past build-supported requires the owner to run the unit tier
-and a gate model end to end and report token counts (same four-step protocol as
-§W9), and a competitive path requires the fast-path tactic BODIES ported for the
-family (wgmma / tcgen05 / Ampere-mma) and the FEATURE-TABLE cells widened — the
-kernel campaign, out of scope here.
+any of the remaining rows past build-supported requires the owner to run the unit
+tier and a gate model end to end and report token counts (same four-step protocol as
+§W9, now demonstrated on sm_110), and a competitive path requires the fast-path
+tactic BODIES ported for the family (wgmma / tcgen05 / Ampere-mma) and the
+FEATURE-TABLE cells widened — the kernel campaign, out of scope here.
 
 **Additivity.** W10 touched ONLY build-config + test + records:
 `cmake/CudaArchFeaturesTest.cmake` (new EMPTY-resolution expectations), the

@@ -258,6 +258,25 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 
 ## Backend detail
 
+**CUDA architectures.** The runtime-gated production arch is GB10 `sm_121a`
+(every gate model, every benchmark). A build-supported cross-family fan-out
+(`sm_80/86/87/89`, `sm_90a`, `sm_100a/103a`, `sm_110`) compiles single-arch,
+portable-kernels-only (all fp8/fp4/CUTLASS/Marlin/FA2 fast paths resolve EMPTY).
+**As of 2026-07-27, `sm_110` is RUNTIME-VERIFIED (portable bf16 path) on real
+silicon — the FIRST non-GB10 runtime proof.** vllm.cpp was built natively for
+`sm_110` on an NVIDIA Jetson Thor board (aarch64, JetPack R38, nvcc 13.0,
+on-box `compute_cap=11.0`; cutlass absent and not needed), Release `-Werror`
+0 warnings, 16 TUs of real `sm_110` SASS. It then ran the Llama-3.2-1B
+paged-engine greedy gate and was **STRICT token-exact 12/16 prompts (192/192
+tokens) vs the committed vLLM oracle golden** (every vLLM-deterministic prompt),
+**15/16 bit-identical to the GB10 `sm_121a` anchor**; the remaining 4/16 are the
+ratified bf16 near-tie prompts (committed teacher-forced gap 0.000 nats). Scope
+is precise: RUNTIME-VERIFIED covers only the portable bf16 path that actually ran;
+the fp8/fp4/CUTLASS fast paths on `sm_110` remain DERIVED/NOT-YET (a cutlass-backed
+kernel campaign). The other fan-out boards remain build-supported only (no board
+here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
+[.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
+
 **Metal (Apple Silicon), indicative, not binding.** Two models run end to end
 and pass correctness (OPT-125m, Qwen3-0.6B); 18 of 75 ops are native, the rest
 fall back to CPU on unified memory. Kernel work including mma prefill attention
