@@ -26277,3 +26277,36 @@ the gate holds at 16/16, but the perfect agreement reported last round was a
 property of the old accumulation order and has been traded for 4.8% speed.
 
 **Goal:** 20.44 of 27.9 tok/s, **1.36x remaining**.
+
+---
+
+## 2026-07-27 — BENCHMARK EQUIVALENCE CORRECTION: the MLX comparison was not like-for-like
+
+**This corrects my own reporting throughout this session, and it was found by
+auditing definitions rather than by measuring anything new.**
+
+`mlx_lm` reports `generation_tps = (n+1) / (time - tic)` with `tic` set AFTER
+prompt processing (`mlx_lm/generate.py:718`): **decode-only, prefill excluded**.
+Our headline "Output token throughput" divides generated tokens by the TOTAL
+duration, prefill included. Every "X of 27.9 tok/s" in this log compared OUR
+total-basis number against THEIR decode-only number.
+
+Our equivalent already exists: "Mean per-stream decode rate" = 1/mean_TPOT =
+127/(E2EL-TTFT) vs MLX's 128/T; equal to ~1% at n=128.
+
+| basis | ours | MLX-LM | % | remaining |
+|---|--:|--:|--:|--:|
+| decode-only (MLX's headline) | **26.42** | 27.89 | **94.7%** | 1.056x |
+| total incl. prefill (like-for-like) | 20.24 | 25.31 | 80.0% | 1.250x |
+
+MLX's total-basis figure derives from its own measured 1091.18 prompt tok/s and
+27.893 gen tok/s: 0.469 s prefill + 4.589 s decode = 5.058 s.
+
+**This is NOT a redefinition of the goal and neither number is parity.** What it
+establishes is where the gap lives: **decode is within 5.6%; the total-basis gap
+is almost entirely PREFILL** (ours ~1.5 s vs 0.469 s, 3.2x). The per-kernel
+attribution already implied that; the mismatched headline obscured it.
+
+**Consequence for the remaining work:** stop tuning decode. Prefill is the whole
+story — the mm kernel at 79-87% of MLX's steel GEMM, and whatever prefill-side
+host work sits outside GPU-busy time.
