@@ -3,7 +3,9 @@
 This is the canonical practical kernel-family inventory for roadmap C1 and the
 backend expansion blocks. The accepted inventory spike is
 [specs/kernel-family-inventory.md](specs/kernel-family-inventory.md). Upstream
-references are pinned to vLLM `e24d1b24` and include the dependency that owns
+references are pinned to vLLM `555967922` (0.26.0.dev0 + transformers 5.14.1;
+advanced 2026-07-26 from the prior `e24d1b24`/0.25.0 pin, see
+[specs/pin-advance.md](specs/pin-advance.md)) and include the dependency that owns
 execution when vLLM only orchestrates dispatch.
 
 `ANCHOR-BACKFILL` means legacy code exists but the new per-row evidence and
@@ -25,9 +27,10 @@ default (`VT_GDN_PACKED_DECODE=0` rollback), with **no `complete-pass` marker
 and no speed credit** claimed. qkvz (`KERNEL-GEMM-BF16` W2A) is now
 **implemented (2026-07-15) and `GATING` on the orchestrator's DGX gates**; the
 exact grid stays authorized (fresh vLLM denominators; explicit
-`--mamba-ssm-cache-dtype float32`; cite `702f481`). Binding `3f256ab` stays
-**55/124** with `benchmark_binding=false` until that authorized exact-grid
-rerun.
+`--mamba-ssm-cache-dtype float32`; cite `702f481`). The authorized exact-grid
+rerun has since landed: the current binding is `9ecd9d0` **114/124**
+(`benchmark_binding` refers here, superseding `3f256ab`'s 55/124, retained
+immutable); see roadmap_v1.md and engine-matrix.md `SERVE-GATE-ONLINE`.
 
 The C1 implementation spike is accepted at
 [dropin-kernel-abi.md](specs/dropin-kernel-abi.md). Its additive

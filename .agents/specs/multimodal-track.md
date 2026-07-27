@@ -1,11 +1,15 @@
 # SPIKE: Multimodal track (Audio / Video / Image) — Gemma-4 + Qwen3.6
 
-**SPIKE ONLY — READ-ONLY design + a checkpoint/oracle-availability check. No
-implementation, no vision tower built, no build, no download, no gate.** Grounds
-the user's NEW TOP `roadmap_v1` priority (2026-07-25): *"Multimodal support
-Audio/Video/Image with Gemma-4 and Qwen3.6"*, ahead of GPU-arch expansion, model
-expansion, KV-to-disk, LMCache, and BEFORE DFlash (which moves to last). Framing
-memory: [[multimodal-is-top-priority-gate-models-already-mm]].
+**STATUS 2026-07-25: M0-M3 LANDED (image + video). The design below is the
+original spike and is preserved as reference.** Landed: the mm input pipeline
+(M0/M1), the Qwen3-VL vision tower (M2a), the MRoPE/DeepStack text backbone
+(M2b/M2c), Qwen3-VL-4B image + video e2e, and Qwen3.6-27B image (M3-b) + video
+(M3d) STRICT 32/32 vs vLLM 0.25.0. The audio track (A0-A3) is also up (Voxtral-Mini-3B
+e2e 14/14). Speed and Gemma-4 remain. Original spike scope: READ-ONLY design +
+oracle/checkpoint availability check, grounding the user's TOP `roadmap_v1` priority
+(2026-07-25): *"Multimodal support Audio/Video/Image with Gemma-4 and Qwen3.6"*,
+ahead of GPU-arch expansion, model expansion, KV-to-disk, LMCache. Framing memory:
+[[multimodal-is-top-priority-gate-models-already-mm]].
 
 **Base:** `72f9fb1` (`origin/main`, SPEC-MTP I7 landed). **Oracle pin:**
 `/home/mudler/_git/vllm` @ `e24d1b24`. **dgx oracle:** `~/venvs/vllm-oracle` =

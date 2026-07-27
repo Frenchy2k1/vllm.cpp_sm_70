@@ -3,7 +3,9 @@
 This is the canonical platform, CUDA-target, and native-competitor inventory for
 roadmap D1. The accepted spike is
 [specs/cuda-architecture-inventory.md](specs/cuda-architecture-inventory.md).
-Upstream references are pinned to vLLM `e24d1b24`; local references describe
+Upstream references are pinned to vLLM `555967922` (0.26.0.dev0 + transformers
+5.14.1; advanced 2026-07-26 from the prior `e24d1b24`/0.25.0 pin, see
+[specs/pin-advance.md](specs/pin-advance.md)); local references describe
 `vllm.cpp` at the inventory baseline `f7ccaa7`.
 
 Build availability is not runtime support. A target remains `INVENTORIED` until

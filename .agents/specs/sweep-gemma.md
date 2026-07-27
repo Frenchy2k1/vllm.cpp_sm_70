@@ -1,8 +1,9 @@
 # SPIKE: Gemma family (Gemma 1 / 2 / 3 / 4)
 
-**SPIKE ONLY — no implementation, no kernels, no build, no benchmark, nothing
-downloaded.** Grounds the user's explicit next model target after GLM ("and then we
-do gemma", said as "gemma 4"). Design + records only.
+**STATUS: Gemma-1/2/3 text LANDED (SACRED gate 48/48 vs vLLM 0.25.0 each), rows
+`ACTIVE` (correctness-complete, speed-pending); Gemma-4 is `BLOCKED` (W6 honesty
+pass). The design below is the original spike, preserved as reference.** Grounded
+the user's next model target after GLM ("and then we do gemma", said as "gemma 4").
 
 **Base:** `d85fd04` (`Glm4MoeLiteForCausalLM` G1 landed). **Oracle pin:**
 `/home/mudler/_git/vllm` @ `e24d1b24`. **dgx oracle:** `~/venvs/vllm-oracle` = vLLM
@@ -11,7 +12,7 @@ do gemma", said as "gemma 4"). Design + records only.
 here to the whole family. **Gold-standard spike shape mirrored:**
 [`glm-dsa-latest-deepseek.md`](glm-dsa-latest-deepseek.md).
 
-Rows covered (advanced `INVENTORIED` -> `SPIKE`):
+Rows covered (Gemma-1/2/3 since advanced `INVENTORIED` -> `SPIKE` -> `ACTIVE`, gated 48/48; Gemma-4 -> `BLOCKED`):
 `MODEL-TEXT-gemma-gemma-for-causal-lm`,
 `MODEL-TEXT-gemma2-gemma2-for-causal-lm`,
 `MODEL-TEXT-gemma3-gemma3-for-causal-lm`,

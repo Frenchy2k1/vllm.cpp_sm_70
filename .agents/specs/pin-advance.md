@@ -1,11 +1,14 @@
 # SPEC: Advance the vLLM parity pin past `e24d1b24` (v0.25.0-era) — SCOPE + PLAN
 
-**SCOPE + PLAN ONLY. No venv, no pin swap, no code, no golden re-capture.** This
-is the CPU/repo-research phase the user directed (2026-07-26: *"advance the pin
-then and let's assess what we need to port that vLLM advanced"*). EXECUTION (build
-the staged venv → smoke-test the 3 unblocks → re-capture drifted goldens → flip
-the pin) is GPU-gated and happens AFTER the sibling 35B-MTP agent frees the
-`~/venvs/vllm-oracle` (0.25.0) oracle. Claim `CLAIM-PIN-ADVANCE-SCOPE`.
+**EXECUTED - the pin was FLIPPED at W5 (`bc415a3e`, 2026-07-26) to `555967922` /
+vLLM 0.26.0.dev0 + transformers 5.14.1; see §7.** The plan below (build the staged
+venv → smoke-test the 3 unblocks → re-capture drifted goldens → flip the pin) ran
+end-to-end: zero real golden drift (27B-W4A4 + 32B-NVFP4A16 bit-identical, 35B/Coder
+byte-stable), full re-gate 296/299 GREEN on GB10, and DFlash/Gemma-4/OLMo-3 unblocked.
+This document began as the CPU/repo-research SCOPE + PLAN the user directed (2026-07-26:
+*"advance the pin then and let's assess what we need to port that vLLM advanced"*);
+the scope/plan body is preserved below and §7 records the execution. Claims
+`CLAIM-PIN-ADVANCE-SCOPE` → `CLAIM-PIN-ADVANCE-W5`.
 
 - **Current pin:** `/home/mudler/_git/vllm` @ `e24d1b24` (`v0.23.1rc0-734-ge24d1b24`,
   2026-07-02). Active oracle `~/venvs/vllm-oracle` = **vLLM 0.25.0** + transformers

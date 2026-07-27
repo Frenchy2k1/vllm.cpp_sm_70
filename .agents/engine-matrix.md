@@ -1,8 +1,10 @@
 # Engine and serving execution matrix
 
 This is the canonical stable-ID inventory for cross-cutting engine behavior at
-the parity pin `e24d1b24fe96`, plus explicitly marked additions from the active
-v0.25.0 sync target `702f4814fe54`. Model, quantization, kernel, and platform support
+the parity pin `555967922` (vLLM 0.26.0.dev0 + transformers 5.14.1; advanced
+2026-07-26 from the prior `e24d1b24`/0.25.0 pin, see
+[specs/pin-advance.md](specs/pin-advance.md)), plus the historical additions from
+the v0.25.0 sync target `702f4814fe54`. Model, quantization, kernel, and platform support
 remain in their own matrices. The inventory audit that established the 26
 code-bearing baselines is recorded in
 [feature-anchor-backfill.md](specs/feature-anchor-backfill.md).
@@ -21,19 +23,16 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 `planned: specs/...` entry is not an accepted spike and cannot make a row
 `READY`.
 
-Current `SERVE-GATE-ONLINE` substage: **NEW BINDING `246a23c`: 49/124** (fresh
-interleaved exact-grid rerun; supersedes `3f256ab`'s 55/124, retained immutable).
-Per concurrency c1 **20/20**, c2 4, c4 5, c8 4, c16 6, c32 6, memory **4/4** —
-memory + c1 + every TTFT axis sweep clean for the first time (windowed-load
-`cb2d310` binding). The remaining 75 failing axes are the decode-coupled family at
-c2–c32 (TPOT/ITL/E2EL 2.2–6.5% slower, throughput inversely coupled) + two ITL tail
-anomalies (c8 p99_itl 0.5599, c32 p90_itl 0.7925). HONEST regression: ours c16/c32
-total throughput dropped −2.67%/−3.64% vs `3f256ab` while vLLM held (hypothesis:
-the silent slot-sharing defect removed by `c172336`; era A/B in-flight). The
-binding binary carries the slot-fix (`c172336`), windowed-load (`cb2d310`), qkvz
-(`45f9e6d`, DGX-green), and packed-decode default. Next: the era-A/B verdict +
-nsys c2/c8 full-step attribution → `ENG-ASYNC-SCHED` W3 → the tail mechanism.
-A **22.920 GiB** steady CPU weight mirror remains (deeper streaming fix, for 35B).
+Current `SERVE-GATE-ONLINE` binding: **`9ecd9d0`: 114/124** (mem 4/4, c1 20/20,
+c2 20/20, c16 19/20, c4 & c32 18/20, c8 15/20); two-grid totality with `f0fb727`
+(111/124) is **115/124 effective parity** against vLLM 0.25.0 (27B). The
+bit-identical fast decode-kernel stack (`348d12d`+`9ecd9d0`) plus async-default-ON
+(`a0013a2`), the vendored Triton GDN cubin (`a321d7c`) and packed-decode equivalence
+(`e47b4d6`) closed +62 axes over the prior superseded bindings (`3f256ab` 55/124,
+`246a23c` 49/124, `a875397` 52/124, all retained immutable). The residuals are the
+low-concurrency-median edge of a net-positive determinism tradeoff (we win the tails
++ high concurrency + throughput); no closeable real 27B deficit. Full grid +
+forensics: roadmap_v1.md and the parity ledger.
 
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `DONE` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -179,7 +178,7 @@ claims it.
 | `SERVE-C-ABI` | Stable LocalAI-style C FFI (**19** exported `VLLM_API` symbols at `VLLM_ABI_VERSION 5`; blocking and nonblocking request handles. Count corrected 2026-07-24 from a stale `17`, which predated ABI v4/v5 adding `tool_parser`/`reasoning_parser` and the chat entry points; `include/vllm.h` is the source of truth and README:231 already said 19) | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143,181,207`; `src/capi/vllm_c.cpp:229,264,327,391` | `tests/capi/test_capi.cpp:320,428,505,574,606,640`; `tests/capi/test_dlopen.cpp:77,86`; `tests/capi/c_header_compile.c:1` | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
 | `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
 | `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries + explicit scheduler-capacity flags `examples/server/main.cpp:63,96,116,170`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | server help contract `examples/CMakeLists.txt:34`; benchmark `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |
-| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); `tests/benchmarks/test_serve_cli.py:1` | Schema-v5 harness plus [trace controller](../include/vt/cuda/cuda_profiler_control.h#L13), [production component driver](../scripts/dgx-gdn-packed-component.sh), and fail-closed [component finalizer](../tools/bench/gdn_packed_component.py) | **NEW BINDING `246a23c`: 49/124** (fresh interleaved exact-grid rerun; supersedes `3f256ab`'s 55/124, retained immutable). c1 **20/20**, c2 4, c4 5, c8 4, c16 6, c32 6, memory **4/4** — memory + c1 + every TTFT axis sweep clean (windowed-load `cb2d310` binding). Failure mass is the decode-coupled family at c2–c32 (2.2–6.5% slower) + two ITL tails (c8 p99, c32 p90) — the tails are DISCRIMINATED (2026-07-16, `CLAIM-ITL-TAIL-1`) to async-runtime output-timing phasing = W3, NOT a scheduler divergence (our sync `Scheduler` == vLLM's async `AsyncScheduler` wave-boundary composition, byte-identical; `tests/vllm/v1/test_scheduler_wave.cpp`, [spec](specs/tail-stall-analysis-2026-07-16.md)). **RESOLVED at binding `9ecd9d0` (114/124, async default ON):** async CLOSED the c16/c32 tails (ours now BEATS vLLM — c16 p99 1.055, c32 p90 1.034/p99 1.078) but leaves a stable c8 `p99_itl` 0.857/0.862/0.867 residual, ROOT-CAUSED (2026-07-18, `CLAIM-C8-P99-TAIL-1`, [spec](specs/c8-p99-itl-tail-2026-07-18.md)) as IRREDUCIBLE-AS-MIRRORED: at c8, ours' deterministic synchronous forward keeps co-admitted requests in byte-identical lockstep pairs (843.3/843.3 ms) packing 22 uniform 2-full-prefill ~840 ms stalls/rep (lockstep 0.77) where vLLM's async-future runtime jitter de-phases them (0.51) into 11 + graded 440/660; the c16/c32 INVERSION proves it is NOT a capability gap but the trailing edge of the per-step determinism that wins c16/c32 + throughput; scheduler + async placeholder byte-identical (no policy to mirror), the only fix (true async-forward executor) risks the c16/c32 wins with no throughput basis, forced de-phase = fake fix → honest residual, no code change. HONEST regression: ours c16/c32 total throughput −2.67%/−3.64% vs `3f256ab` while vLLM held; hypothesis (labeled) = the silent slot-sharing defect removed by `c172336`, era A/B in-flight. Evidence root `~/work/vllm.cpp-online-gate/evidence/246a23c…`; ratios.json `f784ba01…e046`. This root is the binding grid (`benchmark_binding` now refers here, superseding `3f256ab`); no packed speed credit | [online serving gate](specs/cuda-online-serving-gate.md); [merged GDN projections](specs/gdn-merged-input-projections.md); [packed decode](specs/gdn-packed-decode.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
+| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); `tests/benchmarks/test_serve_cli.py:1` | Schema-v5 harness plus [trace controller](../include/vt/cuda/cuda_profiler_control.h#L13), [production component driver](../scripts/dgx-gdn-packed-component.sh), and fail-closed [component finalizer](../tools/bench/gdn_packed_component.py) | **BINDING `9ecd9d0`: 114/124** (async default ON; mem 4/4, c1 20/20, c2 20/20, c16 19/20, c4 & c32 18/20, c8 15/20; `benchmark_binding` refers here, superseding `3f256ab` 55/124 and `246a23c` 49/124, both retained immutable). Two-grid totality with `f0fb727` (111/124) is 115/124 effective parity vs vLLM 0.25.0 (27B). Async CLOSED the c16/c32 ITL tails (ours now BEATS vLLM: c16 p99 1.055, c32 p90 1.034/p99 1.078) and leaves a stable c8 `p99_itl` ~0.86 residual, ROOT-CAUSED (2026-07-18, `CLAIM-C8-P99-TAIL-1`, [spec](specs/c8-p99-itl-tail-2026-07-18.md)) as IRREDUCIBLE-AS-MIRRORED: our deterministic synchronous forward keeps co-admitted c8 requests in byte-identical lockstep where vLLM's async-future jitter de-phases them; the c16/c32 INVERSION proves this is the trailing edge of the per-step determinism that wins c16/c32 + throughput, not a capability gap (scheduler + async placeholder byte-identical, `tests/vllm/v1/test_scheduler_wave.cpp`, [tail spec](specs/tail-stall-analysis-2026-07-16.md)). Full grid + per-binding forensics: roadmap_v1.md + parity ledger; no packed speed credit | [online serving gate](specs/cuda-online-serving-gate.md); [merged GDN projections](specs/gdn-merged-input-projections.md); [packed decode](specs/gdn-packed-decode.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
 | `SERVE-E2E-NIGHTLY` | Server conformance and real-model nightly suites for all release gates | T0 | `tests/entrypoints/openai/`; `tests/v1/e2e/`; `.buildkite/test-pipeline.yaml` | current unit/conformance tests only; no scheduled DGX suite | `tests/vllm/entrypoints/openai/test_conformance.cpp:1`; `tests/parity/test_qwen36_paged_engine.cpp:78`; `tests/parity/test_qwen27_paged_engine.cpp:110` | `planned: specs/server-e2e-nightly.md` | `INVENTORIED` | - |
 | `SERVE-CLI-CHAT` | Interactive chat and complete commands | T1 | `vllm/entrypoints/cli/main.py:18-34` has no direct chat/complete command at the pin; project extension | - | - | `planned: specs/cli-chat-complete.md` | `INVENTORIED` | - |
 | `SERVE-POOLING-ENDPOINTS` | Embeddings, pooling, score, rerank | T2 | `vllm/entrypoints/pooling/embed/api_router.py:25`; `vllm/entrypoints/pooling/scoring/api_router.py:1` | - | - | `planned: specs/pooling-endpoints.md` | `INVENTORIED` | - |

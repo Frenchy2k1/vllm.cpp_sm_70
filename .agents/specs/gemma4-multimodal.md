@@ -28,7 +28,18 @@ Rows this spike advances (owned; the concurrent Qwen3.6-video agent owns the Qwe
 
 ## 0. Headline findings
 
-### 0.0 The DECISIVE gating fact: the pinned oracle CANNOT construct Gemma-4 mm (transformers 5.13.1 has no `gemma4`)
+> **POST-PIN-ADVANCE UPDATE (2026-07-26): the decisive block is DISSOLVED.** The
+> parity pin advanced to `555967922` / vLLM 0.26.0.dev0, which carries **transformers
+> 5.14.1 - and 5.14.1 SHIPS `transformers.models.gemma4`** (environment.md:39-40;
+> the advance explicitly lists Gemma-4 among its unblocks). So the "oracle cannot
+> construct the mm path" verdict below was correct against the *gate-time* 0.25.0 /
+> transformers-5.13.1 oracle but no longer holds on the current pin. Re-assessed
+> verdict: Gemma-4 multimodal is **reachable on the advanced pin, implementation
+> pending** (the ≥12B HF-gated mm-wrapped checkpoint + the PLE/YOCO/Gemma-4-MoE
+> backbone + the SigLIP/USM-Conformer towers remain the real work; the oracle is no
+> longer the blocker). The analysis below is preserved as the gate-time record.
+
+### 0.0 The DECISIVE gating fact (AT GATE TIME): the 0.25.0 oracle CANNOT construct Gemma-4 mm (transformers 5.13.1 has no `gemma4`)
 
 The Gemma-4 mm wrapper does **not** implement its towers natively. It loads them
 from **Transformers** via `AutoModel.from_config`:
@@ -142,7 +153,7 @@ backbone**; the SigLIP vision tower is a REUSE-with-simplification of M2a.
 
 | Fact | Verdict |
 |---|---|
-| **Oracle constructs the mm path?** | **NO (decisive)** — transformers 5.13.1 has no `gemma4`; `AutoModel.from_config(vision_config)` fails (0.0). gemma3n present, gemma4 absent. |
+| **Oracle constructs the mm path?** | **NO at gate time (decisive then; DISSOLVED on the advanced pin)** — transformers 5.13.1 had no `gemma4`; `AutoModel.from_config(vision_config)` failed (0.0). The current 0.26.0.dev0 pin carries transformers 5.14.1, which ships `gemma4`, so the oracle can now construct it. |
 | Oracle ships the vLLM files? | Yes (`gemma4_mm.py`,`gemma4_unified.py` present) — necessary but NOT sufficient; the towers are Transformers modules. |
 | Smallest checkpoint | `google/gemma-4-12B-it` (11.96B, **Unified/encoder-free**); next `26B-A4B`/`31B` (Variant A). All **≥12B, mm-wrapped, `google/*` HF-gated**. No ungated bare-text or small mirror. Audio-capable variant = whichever carries `audio_config` (per-checkpoint, unverified). |
 | dgx cache | **none** — `ssh dgx 'ls ~/.cache/huggingface/hub ~/bench \| grep -i gemma'` = gemma-3-1b-it, unsloth gemma-2/2b only. No Gemma-4, no audio-LLM. |
@@ -192,8 +203,8 @@ not by Whisper/Voxtral.
 
 | Target | Image | Video | Audio | Disposition |
 |---|:--:|:--:|:--:|---|
-| **Gemma-4 `Gemma4ForConditionalGeneration`** | ✅ (SigLIP) | ✅ (SigLIP) | ✅ (if `audio_config`) | **HONESTY-PASS-BLOCKED / STAGED** — oracle-BLOCKED (transformers 5.13.1 no `gemma4`), ≥12B gated mm-wrapped, backbone+audio-tower unbuilt. No e2e. Gateable subset = the honesty verdict + the primitive inventory. |
-| **Gemma-4 `Gemma4UnifiedForConditionalGeneration`** | ✅ (encoder-free embedder) | ✅ | ✅ (if `audio_config`) | **HONESTY-PASS-BLOCKED / STAGED** — same oracle block; simpler (no SigLIP/audio `AutoModel` tower) but still imports `transformers.gemma4_unified`; the 12B smallest checkpoint IS this variant. No e2e. |
+| **Gemma-4 `Gemma4ForConditionalGeneration`** | ✅ (SigLIP) | ✅ (SigLIP) | ✅ (if `audio_config`) | **REACHABLE ON THE ADVANCED PIN, IMPLEMENTATION PENDING** — the gate-time oracle block (transformers 5.13.1 no `gemma4`) is DISSOLVED (5.14.1 ships it); remaining work is the ≥12B gated mm-wrapped checkpoint + the PLE/YOCO/MoE backbone + the SigLIP/audio towers, all unbuilt. No e2e yet. |
+| **Gemma-4 `Gemma4UnifiedForConditionalGeneration`** | ✅ (encoder-free embedder) | ✅ | ✅ (if `audio_config`) | **REACHABLE ON THE ADVANCED PIN, IMPLEMENTATION PENDING** — same dissolved oracle block; simpler (no SigLIP/audio `AutoModel` tower) but still imports `transformers.gemma4_unified`; the 12B smallest checkpoint IS this variant. No e2e yet. |
 | **AUDIO modality** (as a subsystem) | — | — | ✅ | **STAGED — reachable, land it first on the smallest oracle-runnable vehicle** (Whisper→Voxtral-Mini-3B), NOT on Gemma-4. This is the genuinely-new work. |
 | Whisper (vehicle) | — | — | ✅ ASR | IMPLEMENTABLE-ADDITIVE — oracle-runnable, fits; the audio-pipeline standup vehicle |
 | Voxtral-Mini-3B (vehicle) | — | — | ✅ | IMPLEMENTABLE-ADDITIVE — oracle-runnable, fits, Mistral backbone LANDED; the e2e audio-merge vehicle |

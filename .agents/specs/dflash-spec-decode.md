@@ -1,13 +1,12 @@
 # Spec: DFlash speculative decoding (task #51, from B5 scoping)
 
-Block-diffusion drafting — the headline speculative method after MTP. Derived from
-[.agents/specs/spec-decode-scoping-2026-07-10.md](spec-decode-scoping-2026-07-10.md);
-re-grounded against the pin (`/home/mudler/_git/vllm` @ `e24d1b24`) and, for the
-reuse map, **against the NOW-LANDED MTP machinery on `origin/main` `72f9fb1`**
-(the MTP campaign closed I1..I7 — `SPEC-MTP` `ACTIVE`, single-request greedy
-token-identical to vLLM + ~1.04x TPOT / +4% output-tput at c1, on-par-or-above at
-c2/c4/c8). **Readiness re-assessment: 2026-07-25.** This is a READINESS ASSESSMENT
-+ dispatch-sized W-plan; no DFlash code exists yet.
+**STATUS 2026-07-27: DFlash DONE (D0-D14, closing commit `04dff573`; speed gate
+met 1.003x at c1) on the advanced pin `555967922` / vLLM 0.26.0.dev0.** Block-diffusion
+drafting, the headline speculative method after MTP; derived from
+[.agents/specs/spec-decode-scoping-2026-07-10.md](spec-decode-scoping-2026-07-10.md).
+The readiness assessment and the full D0-D14 dispatch/execution history are preserved
+in the section bodies below (the original assessment was written against the prior
+`e24d1b24` pin, before any DFlash code existed).
 
 ## 0. READINESS VERDICT
 
