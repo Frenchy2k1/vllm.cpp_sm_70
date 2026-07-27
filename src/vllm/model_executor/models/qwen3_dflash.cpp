@@ -10,9 +10,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <memory>
 #include <vector>
 
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/Reshape/MakeRopeArgs
+#include "vllm/platforms/interface.h"                     // platforms::GetPlatform (static-graph gate)
 #include "vt/backend.h"
 #include "vt/ops.h"
 
@@ -714,33 +717,83 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
                              config, per_layer_out, final_out);
 }
 
-// ============================ D11 Part A ==================================
-// DEVICE-RESIDENT append-only draft-KV store. Per request, the projected bf16 K/V for
-// every draft layer is kept as resident device chunks (one per append) that persist
-// ACROSS verify steps. Supersedes D9's host-vector PrecomputedContextKV + the
-// download-on-append / upload-on-forward round-trip (AppendContextKVHost +
-// UploadContextKV). BIT-IDENTICAL to that host path by per-row projection independence
-// (same PrecomputeContextKVDevice, same ascending-position append order, same IndexCopy
-// concat) — tokens+acceptance unchanged; only the D<->H round-trip is removed and the
-// K/V now live on-device where the Part B paged-attention kernel + Part C static-shape
-// CUDA-graph draft step will read them (block-table over these slots).
+// ============================ D11 Part A + D13 Part C substrate ============
+// DEVICE-RESIDENT append-only draft-KV store, now a FIXED-CAPACITY PAGED cache (D13
+// Part C substrate). Per draft layer a persistent pool [max_pages, block_size, Hkv, Dh]
+// holds the projected bf16 K/V; a context row at absolute position p lives at flat slot
+// p (page p/block_size, offset p%block_size), so the block_table is the IDENTITY and
+// appending rows [L,L+count) is an IndexCopy scatter to slots [L,L+count). The store's
+// shapes are STATIC (only seq_lens/block_table DATA changes as the context grows), so the
+// Part B vt::DFlashPagedBlockAttention kernel reads it capture-safely and the Part C
+// draft-step CUDA graph can be captured over these persistent buffers. BIT-IDENTICAL to
+// the D9/D11 contiguous store by per-row projection independence (same
+// PrecomputeContextKVDevice, same ascending-position append order) — the bf16 bits are
+// merely placed at fixed paged slots instead of appended chunks; tokens+acceptance are
+// unchanged.
+constexpr int64_t kDflashPageSize = 16;       // rows per paged context page (block_size)
+constexpr int64_t kDflashMaxCtxSlots = 4096;  // fixed store capacity (== max_pages*page)
+
 struct DflashDeviceKVStore {
-  // per draft layer -> a list of resident bf16 chunks, each [chunk_rows, kdim]. k[l][c]
-  // / v[l][c] is the c-th appended chunk for layer l. Append order == ascending absolute
-  // position (the D9 store invariant), and chunk_rows is identical across layers for a
-  // given append (the projection produces [count,kdim] for every layer).
-  std::vector<std::vector<DBuf>> k;
-  std::vector<std::vector<DBuf>> v;
+  // Per draft layer: a persistent bf16 paged pool [max_pages, block_size, Hkv, Dh].
+  std::vector<DBuf> pool_k;
+  std::vector<DBuf> pool_v;
+  std::unique_ptr<DBuf> block_table;  // [1, max_pages] i32 identity (persistent)
+  std::unique_ptr<DBuf> seq_lens;     // [1] i32 = num_ctx (persistent, updated on append)
   int64_t num_layers = 0;
   int64_t num_ctx = 0;
+  int64_t max_pages = 0;
+  int64_t block_size = 0;
+  int64_t kdim = 0;  // Hkv*Dh
+
+  // D13 Part C — per-request CUDA graph over the persistent (1+k) paged draft step.
+  // All graph inputs are persistent device buffers: g_hidden (embed target, refreshed
+  // OUTSIDE the graph each step), g_dpos (block positions, refreshed in place), g_cu
+  // (cu_seqlens {0,Tq}, constant), plus the store's own pools/block_table/seq_lens.
+  // The growing context enters purely through the in-place seq_lens VALUE, so the same
+  // captured graph replays as the context grows. g_logits holds the graph output.
+  std::unique_ptr<DBuf> g_hidden;   // [Tq, H] bf16
+  std::unique_ptr<DBuf> g_dpos;     // [Tq] i32
+  std::unique_ptr<DBuf> g_cu;       // [2] i32 {0, Tq}
+  std::unique_ptr<DBuf> g_logits;   // [Tq, vocab] f32 (persistent graph output)
+  void* g_graph = nullptr;          // cudaGraphExec (opaque)
+  int64_t g_tq = -1;                // captured (1+k); -1 = not yet
+  int g_state = 0;                  // 0 cold, 1 warm (pool warmed, capture next), 2 captured
+  Backend* g_backend = nullptr;     // for DestroyGraph in the dtor
+
+  ~DflashDeviceKVStore() {
+    if (g_graph != nullptr && g_backend != nullptr) g_backend->DestroyGraph(g_graph);
+  }
 };
 
 std::shared_ptr<DflashDeviceKVStore> Qwen3DFlashModel::MakeDeviceKVStore(
-    const HfConfig& config, vt::Queue& /*queue*/) {
+    const HfConfig& config, vt::Queue& queue) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t Hkv = config.num_key_value_heads;
+  const int64_t Dh = config.head_dim;
+  const int64_t L = config.num_hidden_layers;
   auto s = std::make_shared<DflashDeviceKVStore>();
-  s->num_layers = config.num_hidden_layers;
-  s->k.resize(static_cast<size_t>(s->num_layers));
-  s->v.resize(static_cast<size_t>(s->num_layers));
+  s->g_backend = &d.b;
+  s->num_layers = L;
+  s->block_size = kDflashPageSize;
+  s->max_pages = kDflashMaxCtxSlots / kDflashPageSize;
+  s->kdim = Hkv * Dh;
+  s->pool_k.reserve(static_cast<size_t>(L));
+  s->pool_v.reserve(static_cast<size_t>(L));
+  for (int64_t l = 0; l < L; ++l) {
+    s->pool_k.emplace_back(d, DType::kBF16,
+                           std::vector<int64_t>{s->max_pages, s->block_size, Hkv, Dh});
+    s->pool_v.emplace_back(d, DType::kBF16,
+                           std::vector<int64_t>{s->max_pages, s->block_size, Hkv, Dh});
+  }
+  // Identity block_table (logical page p -> physical page p) + zero seq_lens, uploaded
+  // once; these persistent device buffers never move, so a captured graph reads the
+  // growing context purely through the in-place seq_lens value.
+  std::vector<int32_t> bt(static_cast<size_t>(s->max_pages));
+  for (int64_t p = 0; p < s->max_pages; ++p) bt[static_cast<size_t>(p)] = static_cast<int32_t>(p);
+  s->block_table = std::make_unique<DBuf>(d, DType::kI32,
+                                          std::vector<int64_t>{1, s->max_pages}, bt.data());
+  const int32_t zero = 0;
+  s->seq_lens = std::make_unique<DBuf>(d, DType::kI32, std::vector<int64_t>{1}, &zero);
   return s;
 }
 
@@ -756,27 +809,161 @@ void Qwen3DFlashModel::AppendContextKVDevice(DflashDeviceKVStore& store,
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t L = config.num_hidden_layers;
   const int64_t count = static_cast<int64_t>(new_positions.size());
-  if (store.k.empty()) {  // defensive: MakeDeviceKVStore normally sizes these already
-    store.num_layers = L;
-    store.k.resize(static_cast<size_t>(L));
-    store.v.resize(static_cast<size_t>(L));
-  }
-  VT_CHECK(store.k.size() == static_cast<size_t>(L) && store.v.size() == static_cast<size_t>(L),
-           "AppendContextKVDevice: store layer count mismatch");
+  VT_CHECK(store.pool_k.size() == static_cast<size_t>(L) &&
+               store.pool_v.size() == static_cast<size_t>(L),
+           "AppendContextKVDevice: store layer count mismatch (call MakeDeviceKVStore)");
   VT_CHECK(static_cast<int64_t>(new_features.size()) == count * config.hidden_size,
            "AppendContextKVDevice: new_features must be [count, H]");
   if (count == 0) return;
-  // Project ONLY the `count` new rows on device (the EXACT op the host AppendContextKVHost
-  // runs), then MOVE the per-layer device K/V into the store as a resident chunk. No
-  // Download: the bits stay on device. Per-row projection independence => these bits equal
-  // what a full recompute would produce for the same rows (D9 RESULT Part 2a).
+  const int64_t L0 = store.num_ctx;
+  const int64_t max_slots = store.max_pages * store.block_size;
+  VT_CHECK(L0 + count <= max_slots,
+           "AppendContextKVDevice: paged store capacity exceeded (raise kDflashMaxCtxSlots)");
+  // The runner appends only accepted-prefix rows in ascending order, so the new rows sit
+  // at contiguous absolute positions [L0, L0+count) == identity paged slots [L0, L0+count).
+  VT_CHECK(new_positions.front() == static_cast<int32_t>(L0) &&
+               new_positions.back() == static_cast<int32_t>(L0 + count - 1),
+           "AppendContextKVDevice: new_positions must be contiguous [num_ctx, num_ctx+count)");
+  // Project the new rows on device (the EXACT op the D9/D11 store ran), then IndexCopy-
+  // scatter each layer's [count,kdim] K/V into the fixed pools at slots [L0,L0+count).
   ContextKVDev dev = PrecomputeContextKVDevice(d, new_features.data(), new_positions.data(),
                                                count, weights, config);
+  std::vector<int32_t> slot(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) slot[static_cast<size_t>(i)] = static_cast<int32_t>(L0 + i);
+  DBuf slot_d(d, DType::kI32, {count}, slot.data());
   for (int64_t l = 0; l < L; ++l) {
-    store.k[static_cast<size_t>(l)].push_back(std::move(dev.k[static_cast<size_t>(l)]));
-    store.v[static_cast<size_t>(l)].push_back(std::move(dev.v[static_cast<size_t>(l)]));
+    Tensor pk = Reshape(store.pool_k[static_cast<size_t>(l)].t(), {max_slots, store.kdim});
+    Tensor pv = Reshape(store.pool_v[static_cast<size_t>(l)].t(), {max_slots, store.kdim});
+    vt::IndexCopy(d.q, pk, dev.k[static_cast<size_t>(l)].t(), slot_d.t());
+    vt::IndexCopy(d.q, pv, dev.v[static_cast<size_t>(l)].t(), slot_d.t());
   }
-  store.num_ctx += count;
+  store.num_ctx = L0 + count;
+  // Update the persistent seq_lens (the paged kernel's context bound) in place.
+  const int32_t nc = static_cast<int32_t>(store.num_ctx);
+  d.b.Copy(queue, store.seq_lens->ptr(), &nc, sizeof(int32_t));
+}
+
+// Whether the single-request DFlash block forward runs through the capture-safe PAGED
+// kernel (Part B) reading the persistent paged store, vs the D11 materialized
+// [context;block] path. Default ON (the D13 production path); VT_DFLASH_PAGED=0 selects
+// the materialized fallback for a same-binary A/B.
+static bool UsePagedDflashForward() {
+  const char* e = std::getenv("VT_DFLASH_PAGED");
+  return e == nullptr || e[0] != '0';
+}
+
+// Whether the single-request paged draft step is CUDA-graph captured + replayed (D13
+// Part C). Default ON; VT_DFLASH_GRAPH=0 keeps the eager paged path (a same-binary A/B
+// of exactly the capture lever, over the identical paged forward).
+static bool UseDflashGraph() {
+  const char* e = std::getenv("VT_DFLASH_GRAPH");
+  return e == nullptr || e[0] != '0';
+}
+
+// Capture/replay counters (proof the graph path RAN; printed when VT_DFLASH_GRAPH_STATS set).
+static int64_t g_dflash_captures = 0;
+static int64_t g_dflash_replays = 0;
+static bool DflashGraphStats() {
+  static const bool on = std::getenv("VT_DFLASH_GRAPH_STATS") != nullptr;
+  return on;
+}
+
+// Capture-safe static-shape single-request draft block forward (D13 Part C). Runs the
+// (1+k) block over the PAGED context store via vt::DFlashPagedBlockAttention (no
+// [context;block] materialization, no function-local host uploads of ctx/blk index maps).
+// The embedding is done OUTSIDE by the caller (device flag + sync stays out of any
+// capture region); `hidden_in`/`dpos`/`cu_seqlens` are the caller-owned inputs (eager:
+// per-call DBufs; capture: the graph slot's persistent buffers). Returns [Tq, vocab] f32
+// logits ON DEVICE (the caller downloads + samples OUTSIDE the graph). Bit-identical to
+// ForwardWithCtxKVDev over the same context (Part B == materialized DFlashBlockAttention).
+static DBuf ForwardPagedBody(Dev d, const DflashDeviceKVStore& store, const Tensor& hidden_in,
+                             const Tensor& dpos, const Tensor& cu_seqlens,
+                             const Qwen3DFlashWeights& weights, const HfConfig& config) {
+  const int64_t Tq = hidden_in.shape[0];
+  const int64_t H = config.hidden_size;
+  const int64_t Hq = config.num_attention_heads;
+  const int64_t Hkv = config.num_key_value_heads;
+  const int64_t Dh = config.head_dim;
+  const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
+  const int64_t vocab = weights.draft_vocab_size;
+  const float eps = static_cast<float>(config.rms_norm_eps);
+  Tensor cur = hidden_in;
+  std::vector<DBuf> keep;  // keep each layer's post-MLP `down` alive across iterations
+  keep.reserve(static_cast<size_t>(config.num_hidden_layers));
+  DBuf res(d, DType::kBF16, {Tq, H});
+  res.Zero(d);
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    const Qwen3DFlashLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
+    Tensor w_in = ResidentWeight(d, layer.input_layernorm, {H});
+    DBuf dhn(d, DType::kBF16, {Tq, H});
+    if (FusedChainAdoptEnabled())
+      vt::FusedChain(d.q, dhn.t(), cur, w_in, &res.t(), vt::kFusedAddRmsNormStd, eps);
+    else
+      vt::RmsNorm(d.q, dhn.t(), cur, w_in, vt::RmsNormArgs{eps, false}, &res.t());
+
+    const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
+    DBuf q(d, DType::kBF16, {Tq, qdim});
+    DBuf k(d, DType::kBF16, {Tq, kdim});
+    DBuf v(d, DType::kBF16, {Tq, kdim});
+    Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
+    vt::MatmulBT(d.q, q.t(), dhn.t(), wqkv.Slice(0, 0, qdim));
+    vt::MatmulBT(d.q, k.t(), dhn.t(), wqkv.Slice(0, qdim, qdim + kdim));
+    vt::MatmulBT(d.q, v.t(), dhn.t(), wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
+    Tensor q2 = Reshape(q.t(), {Tq * Hq, Dh});
+    Tensor k2 = Reshape(k.t(), {Tq * Hkv, Dh});
+    Tensor q3 = Reshape(q.t(), {Tq, Hq, Dh});
+    Tensor k3 = Reshape(k.t(), {Tq, Hkv, Dh});
+    Tensor v3 = Reshape(v.t(), {Tq, Hkv, Dh});
+    vt::RmsNorm(d.q, q2, q2, ResidentWeight(d, layer.q_norm, {Dh}), vt::RmsNormArgs{eps, false});
+    vt::RmsNorm(d.q, k2, k2, ResidentWeight(d, layer.k_norm, {Dh}), vt::RmsNormArgs{eps, false});
+    vt::RopeNeox(d.q, q3, k3, dpos, MakeRopeArgs(config));
+
+    // Paged in-block attention over the persistent paged context store (Part B). The
+    // output is the Tq block-query rows directly (no combined buffer, no IndexSelect).
+    DBuf a3(d, DType::kBF16, {Tq, Hq, Dh});
+    vt::DFlashPagedBlockAttentionArgs pa;
+    pa.scale = scale;
+    pa.causal = layer.attn_mode.causal;
+    pa.sliding_window = layer.attn_mode.sliding_window;
+    pa.num_reqs = 1;
+    pa.block_size = store.block_size;
+    vt::DFlashPagedBlockAttention(d.q, a3.t(), q3, k3, v3, store.pool_k[static_cast<size_t>(l)].t(),
+                                  store.pool_v[static_cast<size_t>(l)].t(), cu_seqlens,
+                                  store.seq_lens->t(), store.block_table->t(), pa);
+    Tensor a = Reshape(a3.t(), {Tq, Hq * Dh});
+    Tensor wo = ResidentWeight(d, layer.o_proj);
+    DBuf attn(d, DType::kBF16, {Tq, H});
+    vt::MatmulBT(d.q, attn.t(), a, wo);
+
+    Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
+    DBuf dh2(d, DType::kBF16, {Tq, H});
+    if (FusedChainAdoptEnabled())
+      vt::FusedChain(d.q, dh2.t(), attn.t(), w_post, &res.t(), vt::kFusedAddRmsNormStd, eps);
+    else
+      vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
+    const int64_t I = config.intermediate_size;
+    Tensor wgu = ResidentWeight(d, layer.gate_up_proj);
+    DBuf gu(d, DType::kBF16, {Tq, 2 * I});
+    vt::MatmulBT(d.q, gu.t(), dh2.t(), wgu);
+    DBuf act(d, DType::kBF16, {Tq, I});
+    vt::SiluAndMul(d.q, act.t(), gu.t());
+    Tensor wdn = ResidentWeight(d, layer.down_proj);
+    DBuf down(d, DType::kBF16, {Tq, H});
+    vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    keep.push_back(std::move(down));
+    cur = keep.back().t();
+  }
+
+  Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
+  DBuf dnorm(d, DType::kBF16, {Tq, H});
+  if (FusedChainAdoptEnabled())
+    vt::FusedChain(d.q, dnorm.t(), cur, w_fn, &res.t(), vt::kFusedAddRmsNormStd, eps);
+  else
+    vt::RmsNorm(d.q, dnorm.t(), cur, w_fn, vt::RmsNormArgs{eps, false}, &res.t());
+  Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, H});
+  DBuf logits(d, DType::kF32, {Tq, vocab});
+  vt::MatmulBT(d.q, logits.t(), dnorm.t(), lm);
+  return logits;
 }
 
 std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
@@ -793,10 +980,130 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
            "ForwardBlockLogitsWithDeviceKV: ctx_cu must be [num_reqs+1]");
   const int64_t C = ctx_cu.back();
 
-  // Concatenate the per-request device chunks into one combined per-layer [C, kdim] bf16
-  // ContextKVDev ON DEVICE, in ctx_cu order == ascending-append == ascending-position
-  // order. This is the SAME contiguous ascending-position layout UploadContextKV built
-  // from the host store, so downstream ForwardWithCtxKVDev sees bit-identical inputs.
+  // D13 Part C — the production single-request path: run the (1+k) block through the
+  // capture-safe PAGED kernel reading the persistent paged store directly (no combined
+  // buffer, no function-local host index maps). The single-request propose (c1 speed gate
+  // + the e2e gate, which drives one request at a time) is exactly this case.
+  if (P == 1 && weights.mask_embedding.Empty() && per_layer_out == nullptr &&
+      final_out == nullptr && UsePagedDflashForward()) {
+    DflashDeviceKVStore& st = *stores[0];
+    const int64_t Tq = static_cast<int64_t>(block_input_ids.size());
+    const int64_t H = config.hidden_size;
+    const int64_t vocab = weights.draft_vocab_size;
+    VT_CHECK(static_cast<int64_t>(block_positions.size()) == Tq,
+             "ForwardBlockLogitsWithDeviceKV(paged): positions length mismatch");
+    VT_CHECK(cu.size() == 2 && cu.front() == 0 && cu.back() == static_cast<int32_t>(Tq),
+             "ForwardBlockLogitsWithDeviceKV(paged): single-request cu must be {0,Tq}");
+    VT_CHECK(ctx_cu.back() == static_cast<int32_t>(st.num_ctx),
+             "ForwardBlockLogitsWithDeviceKV(paged): ctx_cu.back() must equal store num_ctx");
+
+    const bool graph_ok =
+        UseDflashGraph() && d.b.SupportsGraphCapture() &&
+        platforms::GetPlatform(queue.device.type).support_static_graph_mode();
+
+    // --- Eager paged path (VT_DFLASH_GRAPH=0, or capture unsupported) ---------
+    if (!graph_ok) {
+      DBuf hidden(d, DType::kBF16, {Tq, H});
+      {
+        Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+        DBuf dids(d, DType::kI32, {Tq}, block_input_ids.data());
+        vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+      }
+      DBuf dpos(d, DType::kI32, {Tq}, block_positions.data());
+      const std::vector<int32_t> cus = {0, static_cast<int32_t>(Tq)};
+      DBuf cu_d(d, DType::kI32, {2}, cus.data());
+      DBuf logits = ForwardPagedBody(d, st, hidden.t(), dpos.t(), cu_d.t(), weights, config);
+      std::vector<float> out(static_cast<size_t>(Tq) * vocab);
+      logits.Download(d, out.data());
+      return out;
+    }
+
+    // --- CUDA-graph path (D13 Part C): cold (eager warm) -> warm (capture) -> replay.
+    // (Re)allocate the persistent graph inputs when the block width changes (k is fixed
+    // per config, so this fires once per request lifetime). A width change invalidates a
+    // prior graph.
+    if (st.g_tq != Tq) {
+      if (st.g_graph != nullptr) {
+        d.b.DestroyGraph(st.g_graph);
+        st.g_graph = nullptr;
+      }
+      st.g_hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{Tq, H});
+      st.g_dpos = std::make_unique<DBuf>(d, DType::kI32, std::vector<int64_t>{Tq});
+      const std::vector<int32_t> cus = {0, static_cast<int32_t>(Tq)};
+      st.g_cu = std::make_unique<DBuf>(d, DType::kI32, std::vector<int64_t>{2}, cus.data());
+      st.g_logits.reset();
+      st.g_tq = Tq;
+      st.g_state = 0;
+    }
+    // Refresh the persistent graph inputs IN PLACE (fixed addresses; only contents move),
+    // ALWAYS OUTSIDE the captured region: embed the block tokens into g_hidden and copy
+    // this step's block positions into g_dpos. seq_lens/block_table already updated in the
+    // store (append), and cu_seqlens is the constant {0,Tq}.
+    {
+      Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+      DBuf dids(d, DType::kI32, {Tq}, block_input_ids.data());
+      vt::Embedding(d.q, st.g_hidden->t(), dtab, dids.t());
+    }
+    d.b.Copy(queue, st.g_dpos->ptr(), block_positions.data(),
+             static_cast<size_t>(Tq) * sizeof(int32_t));
+
+    std::vector<float> out(static_cast<size_t>(Tq) * vocab);
+    if (st.g_state == 2) {
+      // Captured: relaunch the graph over the refreshed persistent inputs + grown context
+      // (which enters purely via the in-place seq_lens value + paged store), then download.
+      d.b.ReplayGraph(queue, st.g_graph);
+      st.g_logits->Download(d, out.data());
+      if (DflashGraphStats()) {
+        ++g_dflash_replays;
+        if (g_dflash_replays % 32 == 0)
+          std::fprintf(stderr, "[DFLASH-GRAPH] replays=%lld captures=%lld\n",
+                       static_cast<long long>(g_dflash_replays),
+                       static_cast<long long>(g_dflash_captures));
+      }
+      return out;
+    }
+
+    // First propose step for this request (g_state 0): WARM-then-CAPTURE in this same step.
+    // A full 27B target verify forward + KV append runs between draft steps and perturbs
+    // the shared DevicePool, so an eager pass from a *previous* step does NOT guarantee the
+    // free-list holds the draft's size classes at capture time (a Get miss -> cudaMalloc is
+    // forbidden mid-capture). Running one eager ForwardPagedBody HERE, immediately before
+    // BeginCapture with no intervening allocation, returns exactly the draft's peak-concurrent
+    // blocks to the free-list (retire-don't-free, GB10 pool cap 0), so the capture's identical
+    // allocation sequence is a pure pool hit. The eager pass also warms resident draft weights,
+    // the RoPE cache and the cuBLASLt/workspace scratch. Its result IS this step's output.
+    {
+      DBuf warm_lg = ForwardPagedBody(d, st, st.g_hidden->t(), st.g_dpos->t(), st.g_cu->t(),
+                                      weights, config);
+      warm_lg.Download(d, out.data());
+    }  // warm_lg + all ForwardPagedBody scratch freed to the pool free-list here.
+    d.b.BeginCapture(queue);
+    try {
+      DBuf lg = ForwardPagedBody(d, st, st.g_hidden->t(), st.g_dpos->t(), st.g_cu->t(),
+                                 weights, config);
+      st.g_graph = d.b.EndCaptureGraph(queue);
+      st.g_logits = std::make_unique<DBuf>(std::move(lg));
+      if (DflashGraphStats()) {
+        ++g_dflash_captures;
+        std::fprintf(stderr, "[DFLASH-GRAPH] captured #%lld Tq=%lld C=%lld\n",
+                     static_cast<long long>(g_dflash_captures), static_cast<long long>(Tq),
+                     static_cast<long long>(st.num_ctx));
+      }
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "[DFLASH-GRAPH] capture FAILED: %s\n", e.what());
+      void* g = nullptr;
+      try { g = d.b.EndCaptureGraph(queue); } catch (...) {}  // drain, unstick the stream
+      if (g != nullptr) d.b.DestroyGraph(g);
+      throw;
+    }
+    st.g_state = 2;  // subsequent steps replay
+    return out;      // this step's output is the eager warm pass (bit-identical to the graph)
+  }
+
+  // Fallback (P>1, a separate mask embedding, a parity dump, or VT_DFLASH_PAGED=0):
+  // materialize one combined per-layer [C, kdim] context by gathering each store's
+  // [0,num_ctx) paged slots (ctx_cu order == ascending-position), then run the D11
+  // materialized forward. Bit-identical to the paged path; not capture-targeted.
   ContextKVDev ckv;
   ckv.num_ctx = C;
   for (int64_t l = 0; l < L; ++l) {
@@ -807,30 +1114,33 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     int64_t off = 0;
     for (int r = 0; r < P; ++r) {
       const DflashDeviceKVStore& st = *stores[static_cast<size_t>(r)];
-      VT_CHECK(static_cast<int64_t>(st.k.size()) == L && static_cast<int64_t>(st.v.size()) == L,
+      VT_CHECK(static_cast<int64_t>(st.pool_k.size()) == L &&
+                   static_cast<int64_t>(st.pool_v.size()) == L,
                "ForwardBlockLogitsWithDeviceKV: store layer count mismatch");
-      const size_t nch = st.k[0].size();
-      for (size_t c = 0; c < nch; ++c) {
-        const int64_t chunk_rows = st.k[0][c].t().shape[0];
-        if (chunk_rows == 0) continue;
-        std::vector<int32_t> idx(static_cast<size_t>(chunk_rows));
-        for (int64_t i = 0; i < chunk_rows; ++i)
-          idx[static_cast<size_t>(i)] = static_cast<int32_t>(off + i);
-        DBuf idx_d(d, DType::kI32, {chunk_rows}, idx.data());
-        Tensor idx_t = idx_d.t();
-        for (int64_t l = 0; l < L; ++l) {
-          Tensor cin_k = st.k[static_cast<size_t>(l)][c].t();  // [chunk_rows, kdim]
-          Tensor cin_v = st.v[static_cast<size_t>(l)][c].t();
-          Tensor cok = ckv.k[static_cast<size_t>(l)].t();
-          Tensor cov = ckv.v[static_cast<size_t>(l)].t();
-          vt::IndexCopy(d.q, cok, cin_k, idx_t);
-          vt::IndexCopy(d.q, cov, cin_v, idx_t);
-        }
-        off += chunk_rows;
+      const int64_t cr = st.num_ctx;
+      if (cr == 0) continue;
+      const int64_t max_slots = st.max_pages * st.block_size;
+      std::vector<int32_t> gidx(static_cast<size_t>(cr)), didx(static_cast<size_t>(cr));
+      for (int64_t i = 0; i < cr; ++i) {
+        gidx[static_cast<size_t>(i)] = static_cast<int32_t>(i);         // paged slot i
+        didx[static_cast<size_t>(i)] = static_cast<int32_t>(off + i);   // combined row
       }
+      DBuf gidx_d(d, DType::kI32, {cr}, gidx.data());
+      DBuf didx_d(d, DType::kI32, {cr}, didx.data());
+      for (int64_t l = 0; l < L; ++l) {
+        Tensor srck = Reshape(st.pool_k[static_cast<size_t>(l)].t(), {max_slots, kdim});
+        Tensor srcv = Reshape(st.pool_v[static_cast<size_t>(l)].t(), {max_slots, kdim});
+        DBuf tmpk(d, DType::kBF16, {cr, kdim});
+        DBuf tmpv(d, DType::kBF16, {cr, kdim});
+        vt::IndexSelect(d.q, tmpk.t(), srck, gidx_d.t());
+        vt::IndexSelect(d.q, tmpv.t(), srcv, gidx_d.t());
+        vt::IndexCopy(d.q, ckv.k[static_cast<size_t>(l)].t(), tmpk.t(), didx_d.t());
+        vt::IndexCopy(d.q, ckv.v[static_cast<size_t>(l)].t(), tmpv.t(), didx_d.t());
+      }
+      off += cr;
     }
     VT_CHECK(off == C,
-             "ForwardBlockLogitsWithDeviceKV: concatenated ctx rows != ctx_cu.back()");
+             "ForwardBlockLogitsWithDeviceKV: gathered ctx rows != ctx_cu.back()");
   }
   return ForwardWithCtxKVDev(d, ckv, ctx_cu, block_input_ids, block_positions, cu, weights,
                              config, per_layer_out, final_out);

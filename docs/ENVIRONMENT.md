@@ -57,6 +57,8 @@ portable/reference path. In normal operation leave them unset.
 | `VT_FA2_DECODE` | on (CUDA) | The portable decode attention instead of the vendored FA2 |
 | `VT_FA2_DECODE_4B` | on (CUDA, Qwen3.5-4B) | The portable paged decode attention instead of the ratio-4 vendored FA2 path; the 27B and 35B selectors are unchanged |
 | `VT_CPU_REF` | off | Set on to force the portable reference path (dequantize-everything oracle), the standard "is this a kernel bug?" bisect switch |
+| `VT_DFLASH_PAGED` | on (CUDA, DFlash spec-decode) | The materialized `[context;block]` draft forward instead of the fixed-capacity paged draft-KV store read through `vt::DFlashPagedBlockAttention` (bit-identical; only the DFlash single-request propose path) |
+| `VT_DFLASH_GRAPH` | on (CUDA, DFlash spec-decode) | The eager paged draft step instead of the captured/replayed draft-step CUDA graph (replayed==eager bit-identical; only the DFlash single-request propose path) |
 
 ## Diagnostic
 
@@ -64,6 +66,7 @@ Read-only observability; none change output.
 
 | Variable | Default | What it does |
 |---|---|---|
+| `VT_DFLASH_GRAPH_STATS` | unset | Print DFlash draft-step CUDA-graph capture/replay counts to stderr |
 | `VT_OP_PROVIDER_STATS` | off | Print per-op provider (which backend served each op) statistics |
 | `VT_OP_PROVIDER_DISABLE` | (none) | Comma-separated provider names to disable, forcing fallback (diagnostic) |
 | `VT_GDN_VALIDATE` | off | Run the GDN validation/cross-check path (slower; for kernel debugging) |

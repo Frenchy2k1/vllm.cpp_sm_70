@@ -209,7 +209,7 @@ then expand backends and scale-out.
 feature priority** (block `ROAD-V1-MM` below, sequenced immediately after the
 order-0 perf-closure), AHEAD of GPU-arch expansion, model expansion, KV-to-disk
 and LMCache; the **DFlash** speculator moves to LAST (after multimodal and the
-rest of the portfolio). The high-leverage framing: our two production gate models
+rest of the portfolio). **UPDATE 2026-07-27: the DFlash campaign advanced out-of-band to D13 (`CLAIM-DFLASH-D13`, [engine matrix](engine-matrix.md), STAYS `ACTIVE`): Part C landed (fixed-capacity paged draft-KV store + the draft-step CUDA graph, capture-correctness PROVEN replayed==eager bit-identical). Block-diffusion drafting is correctness-complete (ratified near-tie match to vLLM-DFlash-ON) and at c1 NEAR-PARITY — our 28.70 tok/s is 0.978x (~2% below) vLLM's tight 3-rep 29.35, gap CLOSED 0.917x→0.978x via the paged read (the CUDA graph is perf-neutral). Per the acceptance rule the ≥vLLM bar is NOT met, so SPEC-DFLASH stays `ACTIVE` (the sole open item is a ~2% per-step-compute residual for an nsys). Multimodal (`ROAD-V1-MM`) remains the TOP active priority and is mid-campaign.** The high-leverage framing: our two production gate models
 (`Qwen3_5ForConditionalGeneration` 27B, `Qwen3_5MoeForConditionalGeneration` 35B)
 are ALREADY multimodal architectures brought up text-only, so the track COMPLETES
 models we already ship + benchmark. Full seam map + M0–M5 W-plan:
