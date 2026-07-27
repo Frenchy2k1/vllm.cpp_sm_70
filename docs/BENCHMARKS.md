@@ -750,6 +750,18 @@ compute-sanitizer memcheck **0 errors**. Lever #1 CLOSED; remaining DONE-bar = b
 graphed mm serving (c2+) + audio our-side. `benchmark_binding=false`, SPEED still pending
 on the batched-serving axis.
 
+**MULTIMODAL SPEED - attribution refined, next steps queued (2026-07-27,
+`CLAIM-MULTIMODAL-SPEED-ATTR` [spec](../.agents/specs/multimodal-speed.md) S8).** NO NEW
+NUMBER: this pass ran on a dev box with no GPU/dgx/oracle and a 99%-full disk, so no
+profile/build/oracle/gate was possible; nothing changed vs the 2026-07-26 measured passes
+above. Verified from our source the exact per-token host round-trips of the eager mm
+decode loop (`qwen3_5.cpp:6871-6895`: host MRoPE build + a redundant embed D2H->H2D + a
+full-vocab logits D2H + host argmax; Voxtral `voxtral.cpp:425-442` identical) and pinned
+the paste-ready dgx recipe (do audio our-side timing first, then on-GPU argmax, then
+batched serving). PENDING axes unchanged: audio our-side (vLLM denominator TTFT 43 / TPOT
+41 ms captured, ours still UNMEASURED) and c2+ batched-serving throughput. Next repro:
+spec S8.2.
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =

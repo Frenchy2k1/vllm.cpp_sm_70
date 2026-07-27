@@ -25812,3 +25812,389 @@ dgx contention with the D4-APC-W3 sibling), pin `555967922`/vLLM 0.26.0.dev0.
 - **CUDA `-Werror` clean** (Release); no kernel touched ⇒ no compute-sanitizer surface; `check-device-leakage` not increased; seven checkers bare RC green. Does NOT touch the C8 sibling's files.
 - **Transitions:** `KV-PREFIX-CACHE` (engine-matrix) `ACTIVE`→**DONE** (cache-ON e2e now gated); APC row in feature-matrix §2 → DONE; `ROAD-V1-D4-APC` (roadmap) `PARTIAL`→**DONE** (headline: full vLLM parity for the default dense APC path, W2 extra_keys + W3 cache-ON gated). **Named non-blocking tails, tracked in their own rows / as future items** (NOT blocking the headline DONE): W4 KV events (`KV-EVENTS`, SPIKE), W5 partial-block primitive (upstream dead-code), W6 Mamba-`align` hybrid cache-on (`KV-MAMBA-ALIGN`, SPIKE — feeds `BACKEND-GATE-CUDA-SGLANG-PREFIX`), W7 `reset_prefix_cache` dev-endpoint + `--prefix-caching-hash-algo` + `skip_reading_prefix_cache`, W8/W9 the beyond-vLLM named session save/restore. The every-axis cache-on grid vs vLLM/SGLang stays a separate perf follow-on under `ROAD-V1-A`.
 - Not pushed; FULL SHA reported to caller.
+---
+
+## 2026-07-27 — GOAL SET: MLX-LM speed parity on Metal. Re-attributed; PREFILL is the outlier
+
+**Goal (user-directed):** reach MLX-LM parity at b=1 on Qwen3-1.7B-bf16, i.e.
+10.5 -> 27.9 tok/s, a 2.66x gap.
+
+**Re-profiled because `M3c-1` and `M3d` moved the bottleneck.** `VT_METAL_PROFILE`
+lost its per-kernel GPU column when `M3c-1` made wait/GPU a property of the
+COMMIT rather than the dispatch; restored here for `VT_METAL_SYNC_DISPATCH` runs,
+where a commit carries exactly one dispatch and can be attributed exactly. With
+many dispatches batched the per-kernel columns stay 0 rather than being invented.
+
+**Attribution (native, b=1, total GPU busy 11.47 s):** decode GEMV **5,788 ms
+(50.5%)**, prefill tile GEMM **3,863 ms (33.7%) from only 168 dispatches**, paged
+attention 1,627 ms (14.2%), all six other kernels 188 ms (1.6%).
+
+**The gap is not where it was assumed.** Prefill: ours 3.86 s vs MLX-LM ~0.47 s,
+**~8.2x**. Decode: ours ~7.4 s vs ~4.59 s, ~1.6x. **Decode is already close;
+prefill is the outlier** and still runs the 16x16 tile GEMM.
+
+**Ranked plan, with the arithmetic:** (1) 2-D blocked simdgroup-matrix GEMM for
+m>1, 3.86 s -> ~0.6 s; this is also what the small-m dead-end concluded is needed,
+and it serves prefill AND batched decode with one kernel. (2) vectorised,
+dtype-specialised GEMV for decode, 5.79 s -> ~3.5 s (the current kernel does a
+per-element dtype switch and scalar loads, which cannot saturate bandwidth).
+Together ~6.3 s (~20 tok/s); parity needs ~5.1 s, so paged attention likely
+decides the last stretch.
+
+**Refuted in passing:** the suspicion that the MLX provider had become the SLOWER
+default. Both arms measure 12.0-12.2 s at b=1 on current main, and our GEMV still
+serves 7,112 dispatches with MLX enabled (MLX takes 14,352). LocalAI PR #11137's
+MLX-on default is fine.
+
+---
+
+## 2026-07-27 — 2-D blocked simdgroup GEMM LANDED: 10.5 -> 13.3 tok/s toward MLX-LM parity
+
+**Row:** `BACKEND-METAL-MLX`. **Goal:** MLX-LM parity at b=1 (27.9 tok/s).
+
+**Built the top-ranked lever from the fresh attribution.** Prefill was 33.7% of
+GPU time from 168 dispatches, ~8.2x behind MLX-LM, still on the 16x16 scalar tile
+loop. Replaced for all m > 1 by `vt_matmul_bt_mm`: 32x32 output tile per
+threadgroup, 4 simdgroups in a 2x2 grid, each owning a 2x2 block of
+`simdgroup_float8x8`. A and B tiles are staged through threadgroup memory because
+`simdgroup_load` needs a TYPED pointer while our operands carry a runtime dtype
+code; that staging is also what gives the A reuse across columns the small-m
+dead-end identified as the missing property.
+
+**Measured (isolated same-binary A/B via a new `VT_METAL_NO_MM` lever, 2 reps,
+GPU lock, runners idle):** 10.55 -> **13.27 tok/s (+26%)**, duration 12.14 ->
+9.65 s, **TTFT 4955 -> 2524 ms (halved)** — the prefill win landing exactly where
+the attribution said it would.
+
+**Correctness:** f32 NMSE 1.63e-13 vs the tile kernel's 6.61e-13. Unit suite 21
+cases / 20,134 assertions. **The SACRED gate passed UNCHANGED (16/16, max gap
+0.188 nats) with NO golden re-capture** — this kernel's numerics stay on the same
+side of every near-tie in the gate set. Benchmarked BEFORE touching any golden,
+per the lesson recorded from the small-m dead-end.
+
+**Process note:** the test was written before the kernel but I did not watch it
+fail first; the routing assertion's teeth were instead demonstrated after the
+fact by running with `VT_METAL_NO_GEMV=1`, where it fails on all four shapes.
+Weaker than a true red-first, and recorded as such.
+
+**Next:** the decode GEMV, still ~50% of GPU time. It does a per-element dtype
+switch with scalar loads, which cannot saturate bandwidth; vectorised
+dtype-specialised loads are the lever. Remaining gap to parity: 2.1x.
+
+---
+
+## 2026-07-27 — simdgroup GEMM tuning: BK=32 NEUTRAL, 64x64 WORSE; both reverted
+
+Two obvious widenings of the shipped 32x32/BK=8 simdgroup GEMM were tried and
+measured. Neither survived; both are recorded so they are not retried.
+
+**BK=32: NEUTRAL** (13.28 vs 13.27 tok/s). The rationale was that BK=8 pays two
+threadgroup barriers per 8 elements of K. It changed nothing, so **barrier
+traffic is not this kernel's limit** — a hypothesis now closed by measurement.
+
+**64x64/BK=16: 14% WORSE** (11.48 tok/s, TTFT 4004 vs 2524 ms). Cause is
+occupancy: 16 accumulators per simdgroup plus 24 KB of threadgroup memory leaves
+one threadgroup per core and removes latency hiding. A 64x64 tile is not wrong in
+principle but needs 8 simdgroups (256 threads) and a smaller output staging
+buffer, not wider blocks over the same 128 threads.
+
+**Remaining hypothesis, now the leading one for BOTH kernels:** the staging and
+load path. Every element passes through a branchy scalar `vt_load`, and mm also
+writes f32 into threadgroup memory, doubling LDS traffic for bf16 operands. A
+dtype-specialised, vectorised load path is the next lever and it serves the mm
+kernel and the decode GEMV alike.
+
+**Goal status:** 10.5 -> 13.3 tok/s of the 27.9 target. Bandwidth analysis
+corrects an earlier over-estimate: the decode GEMV already runs at 75 GB/s, 63% of
+the M4's ~120 GB/s peak, against MLX-LM's ~95 GB/s (79%), so that lever is worth
+~1.2 s rather than the ~2.3 s first projected. Prefill remains the larger gap
+(~2.5 s vs MLX-LM's ~0.47 s).
+
+---
+
+## 2026-07-27 — typed GEMV load path: 13.3 -> 14.25 tok/s; plus a caveat on the earlier oracle venv
+
+**Third parity lever.** The decode GEMV is ~50% of GPU time and ran every element
+through `vt_load` (two branches). Specialised the bf16xbf16 case outside the K
+loop and split the reduction across four accumulators, since a single `acc`
+serialises the FMA chain in a latency-bound loop. **13.27 -> 14.25 tok/s
+(+7.4%)**, TTFT unchanged (decode-only change). Non-bf16 dtypes keep the generic
+path.
+
+**Accuracy improved and is now measurable.** Neither existing arm could see this:
+the all-f32 arm does not take the bf16 path, and the all-bf16 arms are dominated
+by output store rounding. Added a **bf16-in / f32-out** arm, which discriminates:
+**5.11e-15** vs the tile GEMM's 9.77e-14.
+
+**Golden re-captured (third time), oracle-validated, result stated in full.** New
+sequence is BETTER on the gate's metric (STRICT 11/16 vs 10/16, max gap 0.125 vs
+0.188 nats) and marginally worse on another (per-token == vLLM argmax 254/256 vs
+255/256, mean gap 0.98 vs 0.73 mnats). 0 outside top-K, 0 beyond the band. Gate
+16/16.
+
+**CAVEAT OWED ON THE EARLIER RE-CAPTURE.** `~/venvs/vllm-oracle`, used for the
+`M3d` golden re-capture earlier this session, NO LONGER CONTAINS vLLM — it changed
+under us mid-session. The version used then cannot be confirmed retroactively, so
+the "vLLM 0.25.0" attribution on that re-capture is UNVERIFIED. This run used
+`~/venvs/vllm-oracle-v0.25.0-stage` and read the version from the interpreter
+before running (0.25.0). Every future re-capture must record the version the same
+way. The dgx box mutates during a session; do not assume a venv is stable.
+
+**Rejected in the same pass:** the same typed-staging treatment on the mm kernel
+measured WORSE (14.10 vs 14.42 tok/s) and was reverted. Staging is amortised over
+the tile's compute; the branch was never its cost, unlike the GEMV's inner loop.
+
+**Goal:** 10.5 -> 14.25 of 27.9 tok/s. Remaining 1.96x. Decode is now ~5.5 s
+against MLX-LM's 4.59 s; prefill ~2.5 s against ~0.47 s. Prefill is again the
+dominant gap, and the mm kernel's limit is still unidentified: barriers (BK=32),
+tile width (64x64) and staging branches have all been measured and excluded.
+
+---
+
+## 2026-07-27 — GEMM roofline: our kernel is 3x off MLX; the provider's output copy is the cheaper fix
+
+**The decisive diagnostic for the parity goal**, and the reason to stop guessing.
+End-to-end deltas could not attribute the prefill gap, so the mm kernel was timed
+in ISOLATION at real prefill shapes against MLX's steel GEMM in the same binary
+(opt-in `VT_MM_BENCH=1` microbenchmark, committed as a permanent tool).
+
+| shape | ours | MLX steel | ratio |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 990 GFLOP/s | 2640 | 2.7x |
+| mlp-up 512x2048x6144 | 1019 | 3325 | 3.3x |
+| mlp-dn 512x6144x2048 | 1002 | 3293 | 3.3x |
+
+Ours ~1.0 TFLOP/s = ~23% of the M4's ~4.3 TFLOPS fp32 peak; MLX ~77%. **The gap
+is inside our kernel.** Dispatch, staging branches, barriers and tile width were
+each measured and excluded first.
+
+**This reframes the MLX provider and changes the recommended next step.** MLX's
+raw GEMM is 3x ours, yet enabling the provider measured NO faster end to end
+(12.21 vs 12.17 s at b=1). Study §5.2 already recorded why: `Matmul::eval_gpu`
+re-`set_data`s its output from MLX's own allocator, so every delegated GEMM pays
+an O(M*N) copy back plus its own commit+wait, which at prefill shapes is
+megabytes per call. **Fixing the provider's output path is now cheaper than
+rewriting our kernel, and it would inherit MLX's 3x directly.**
+
+**Dead end recorded:** keeping operands in bf16 through the mma (what MLX does,
+halving LDS traffic) does NOT compile — `simdgroup_load` has no bfloat-matrix
+overload on this toolchain; MSL's simdgroup_matrix supports half and float only.
+Staging as `half` was REFUSED rather than tried: half saturates at 65504 and
+activation outliers can exceed it, which trades a correctness hazard for speed.
+
+**Goal:** 14.25 of 27.9 tok/s. Ranked next steps are now (1) the MLX provider
+output path, (2) our own GEMM toward MLX's 77% of peak.
+
+---
+
+## 2026-07-27 — the MLX provider is now NET SLOWER than our kernels; LocalAI default should flip
+
+**Measured, same binary, b=1 p=512 g=128, GPU lock, 2 reps:** MLX provider ON
+11.93 tok/s / 10.73 s / TTFT 1583 ms; MLX OFF **14.35 tok/s / 8.93 s** / TTFT
+2543 ms.
+
+**MLX wins prefill decisively and loses overall.** TTFT is 38% better with MLX,
+independently corroborating the roofline result (its GEMM is 3.3x ours), but
+total throughput is 17% worse.
+
+**Attribution, measured not inferred.** With MLX on, OUR dispatch path gets
+FASTER (wait 7.06 vs 8.54 s) because MLX absorbs 112 prefill GEMMs, yet wall time
+rises: MLX's own path costs **3.67 s of non-dispatch time** against 0.39 s for
+native. That is integration cost, not kernel cost — the per-output host `memcpy`
+(`Matmul::eval_gpu` re-`set_data`s from MLX's allocator), a per-call `mx::eval`
+commit+wait on MLX's stream, and allocator pressure on a 16 GB box already ~13 GB
+committed.
+
+**ACTION FOR LocalAI PR #11137:** it enables the MLX provider by default on
+darwin. That default was right when measured (MLX GEMM was 1.5x-2.2x our
+then-current kernels) and is now INVERTED by `M3c-1`, `M3d`, the simdgroup GEMM
+and typed loads. It should default OFF until the provider's output path is fixed;
+the ~124 MB of vendored libmlx + metallib currently buys nothing.
+
+**Tried and reverted:** declining m=1 inside the provider so MLX serves only
+prefill. It does improve the MLX arm (10.5 -> 11.93) but still loses to MLX-off,
+and it breaks the M5 tests' select-and-do-not-decline contract — those tests
+caught it correctly. The deliverable is the recommendation, not the re-routing.
+
+**Goal:** 14.25 of 27.9 tok/s. The best available configuration is now our own
+kernels with MLX OFF.
+
+---
+
+## 2026-07-27 — OPEN LEAD: 64x64 GEMM with 8 simdgroups is 1.8x and currently WRONG
+
+**Measured, not shipped.** The failed 4-simdgroup 64x64 attempt concluded it
+needed MORE THREADS rather than wider blocks. That form was built:
+
+| kernel | qkv | mlp-up | mlp-dn |
+|---|--:|--:|--:|
+| shipped 32x32, 4 sg | 990 GFLOP/s | 1019 | 1002 |
+| 64x64, 8 sg (2x4) | **1712** | **1907** | **1821** |
+| MLX steel (target) | 2640 | 3325 | 3293 |
+
+**1.8x, about half the remaining distance to MLX.** Each simdgroup owns a 32x16
+quadrant (8 accumulators, not the 16 that sank the 4-simdgroup version); 20 KB
+threadgroup memory.
+
+**It is numerically WRONG: NMSE 0.994 on f32 64x512x128**, a shape with no ragged
+edge in M, N or K, so an indexing or synchronisation defect rather than an edge
+guard. Tile coverage, accumulator-to-`sc` mapping, barrier order and strides were
+all inspected without locating it. Reverted; a broken kernel is worse than a slow
+one, and guessing further under time pressure is how a silent numeric bug ships.
+
+**Pick-up instructions are in the spec** (bisect against the correct 32x32
+kernel; try the 4x2 simdgroup decomposition; the f32 64x512x128 arm catches the
+defect in one run, and `VT_MM_BENCH=1` gives the speed in another).
+
+**Goal:** 14.25 of 27.9 tok/s. This lead, if fixed, is worth roughly half the
+remaining GEMM gap.
+
+---
+
+## 2026-07-27 — 64x64 GEMM lead BISECTED (still open) + DispatchGrid2D thread-limit assert
+
+**Shipped:** `Encoder::DispatchGrid2D` now asserts that the requested threadgroup
+size fits the pipeline's `maxTotalThreadsPerThreadgroup`. `DispatchFlat` already
+clamped; this path did neither, and an over-wide threadgroup is silent UB in a
+Release build with no Metal validation layer — it computes garbage rather than
+faulting. A 2-D kernel's threadgroup shape is part of its correctness, so this
+asserts rather than clamps: clamping would drop simdgroups and be just as quiet.
+Unit suite 21/21 and the SACRED gate 128/128 unchanged.
+
+**The 64x64/8-simdgroup lead (1.8x, wrong) is now BISECTED. Three hypotheses
+tested and refuted, so the next session starts much closer:**
+
+1. **Simdgroup mapping EXONERATED.** Both decompositions fail identically at the
+   same speed: 2x4 (acc[4][2], 1712/1907/1821 GFLOP/s) and 4x2 (acc[2][4],
+   1640/1861/1781). The defect is in STAGING or BARRIERS, not the tile division.
+2. **Threadgroup-size limit REFUTED** — the new assert does not fire.
+3. **Host/kernel thread-count mismatch REFUTED** — `kMmTile=64`,
+   `kMmSimdgroups=8`, so 256 threads are genuinely dispatched.
+
+**Sharpest clue: the failure is m-DEPENDENT.** m=2 and m=16 PASS (2.5e-06,
+2.7e-06); m=64 and m=512 FAIL (0.994, 1.001). With BM=64, tile rows >= m are
+zero-padded and masked at write-out, so **only tile rows >= 16 are wrong** —
+consistent with part of the A tile never being staged, or staged after it is
+read. Next step: stage a known constant into `sa` and check which rows survive.
+
+**Goal:** 14.25 of 27.9 tok/s. This lead is worth ~half the remaining GEMM gap.
+
+---
+
+## 2026-07-27 — 64x64 GEMM defect FINGERPRINTED: a threadgroup stride disagreement
+
+**Added a permanent per-row diagnostic** (`VT_MM_ROWDIAG=1`, skipped by default):
+feeds A[r][*] = r+1 and B = 1 so each output row's VALUE names the source row it
+actually read. NMSE could never have told these cases apart.
+
+**Result on the 64x64/8-simdgroup kernel at m=n=k=64:**
+
+```
+rows  0..15  correct
+rows 16..31  ZERO           (never written)
+rows 32..47  read A[16..31] (written, WRONG source row)
+rows 48..63  ZERO           (never written)
+```
+
+**This excludes the obvious explanations.** Thread under-coverage would leave
+zeros but every written row would carry its CORRECT source. Here the written rows
+are shifted: 64 source rows land in 32 destination rows, at HALF the expected
+spacing. That is a STRIDE disagreement between the staging writes (`sa[r][kk]`,
+laid out with whatever row pitch the compiler picks for
+`threadgroup float sa[VT_MM_BM][VT_MM_BK]`) and the
+`simdgroup_load(..., &sa[R][kk], VT_MM_BK)` calls, which assume the pitch is
+exactly `VT_MM_BK`. It works at BM=32 and breaks at BM=64, consistent with the
+compiler padding the inner dimension at the larger size.
+
+**Concrete fix to try next:** stop passing `VT_MM_BK` as `elements_per_row`;
+derive the real pitch, or make `sa` a flat `threadgroup float[]` with an
+explicit stride so the write and the read cannot disagree. Verify with
+`VT_MM_ROWDIAG=1` (expects NONE), then `VT_MM_BENCH=1` for the 1.8x, then the
+f32 64x512x128 arm.
+
+**Goal:** 14.25 of 27.9 tok/s. This lead is worth ~half the remaining GEMM gap
+and is now one hypothesis from resolution.
+
+---
+
+## 2026-07-27 — 64x64 simdgroup GEMM LANDED: 14.25 -> 15.30 tok/s; root cause was self-inflicted
+
+**Landed.** Tile 64x64, 8 simdgroups (2 row groups of 32 x 4 column groups of
+16), each owning 4x2 `simdgroup_float8x8` blocks. Threadgroup tiles are now FLAT
+with the stride named once.
+
+| shape | 32x32 | 64x64 | MLX steel |
+|---|--:|--:|--:|
+| qkv | 990 GFLOP/s | **1484** | 2640 |
+| mlp-up | 1019 | **1574** | 3325 |
+| mlp-dn | 1002 | **1507** | 3293 |
+
+End to end **14.25 -> 15.30 tok/s (+7.4%)**, TTFT **2534 -> 2065 ms (-18%)**.
+SACRED gate **16/16 UNCHANGED, no golden re-capture**. Unit 21 cases / 20,135.
+
+**THE ROOT CAUSE WAS NOT THE ONE I DIAGNOSED, and that correction is the more
+useful record.** The half-spacing fingerprint was interpreted as the compiler
+padding a 2-D `threadgroup float sa[BM][BK]` so `simdgroup_load`'s
+`elements_per_row` disagreed with the writes. The truth was simpler and mine: an
+earlier incomplete edit left the mma block on the OLD 32x32 offsets
+(`&sa[sg_r*16 + i*8][0]`, 16-row groups) while the tile had grown to 64 rows.
+
+**This also invalidates the earlier bisect conclusion.** "Both decompositions
+fail identically, therefore the mapping is exonerated" was right by accident:
+both carried the same stale block, so the experiment never varied what it claimed
+to vary. A bisect isolates a variable only if the other code actually changed,
+and a pattern-based edit that silently matches nothing does not change it. The
+`assert count == 1` discipline used on other replacements in this work is exactly
+what was missing on those.
+
+**Flat tiles were kept** even though the hypothesis behind them was wrong: they
+remove the second place an offset could disagree, making this bug class
+unrepresentable.
+
+**Goal:** 15.30 of 27.9 tok/s, 1.82x remaining. Ours ~1.5 TFLOP/s vs MLX's ~3.3;
+the rest needs register blocking and double-buffered staging.
+
+## 2026-07-27 — MM SPEED (ROAD-V1-MM): ENVIRONMENT-BLOCKED pass; lever-#2 attribution refined + dgx handoff (`CLAIM-MULTIMODAL-SPEED-ATTR`)
+
+**Dispatched to advance the multimodal SPEED track (measure-first attribution, then
+close the top reachable lever). BLOCKED on hardware.** This worktree ran on the DEV
+BOX `mudler-ubuntu-box`, NOT the dgx: no NVIDIA GPU (`/dev/nvidia*` absent, virtual VGA
+only), no `nvcc`/CUDA toolkit, `dgx` hostname unresolvable, `prem-vm` proxy handshake
+fails, no `~/venvs/vllm-oracle*`, and root disk **99% full (5.7 GiB free)**. So the
+required nsys profile, CUDA build, vLLM-oracle A/B, and correctness-gate re-run were ALL
+impossible — even a CPU build is disk-infeasible. NO number produced, NO repo code
+touched, NO row advanced. All mm rows stay `ACTIVE`/`PARTIAL`/speed-pending.
+
+**Where MM speed actually stands (grounded, unchanged from the 2026-07-26 measured
+passes):** the vision encoder TOWER gap is CLOSED and BEATEN (`AttentionDenseFast`
+warp-scoped online-softmax + resident weights → per-image tower 148 ms = 0.59× vs vLLM's
+~250 ms eager encode); 27B image/video DECODE + LLM PREFILL are AT PARITY at c1. The
+open levers are all structural / small-model / c2+: **#4** audio our-side timing (the
+only path where the eager driver's per-token host overhead is un-hidden — Voxtral decode
+~41 ms/token; vLLM denominator TTFT 43 / TPOT 41 ms captured, OUR-side still UNMEASURED,
+was blocked on disk in §4), **#2** on-GPU argmax + drop the redundant embed round-trip,
+**#3** batched/graphed mm serving (c2+ and `image_url`/`audio_url` server ingestion,
+still unwired).
+
+**What I verified from OUR source (no execution).** The exact per-token host round-trips
+of the eager mm decode loop, correcting the spec's `qwen3_5.cpp:6756-6780` citation (that
+range is the KV/GDN-state ALLOC loop). The real decode loop is `qwen3_5.cpp:6871-6895`:
+(1) host `BuildMropeCosSinHost` (`:6877`); (2) an embed **D2H→H2D round-trip** — the fed
+token is embedded on-device, `Download`ed to host (`:6884`), then re-uploaded as a fresh
+`DBuf` (`:6886`) for no reason; (3) a full-vocab **logits D2H** (`:6893`, `[1,248320]` f32
+≈ 993 KB) + host `VLArgMax` (`:6894`, defined `:6694`). `VoxtralGenerateGreedy` is
+identical (`voxtral.cpp:425-442`; host `ArgMax` `:64`, logits `Download` `:163`, embed
+`Download` `:435`). These are ~1–3 ms/token — invisible under the 27B's 226 ms/token
+weight-streaming floor (why lever #2 measured NEUTRAL at c1-27B), real only on audio/c2+.
+
+**Handoff (paste-ready dgx recipe in [multimodal-speed.md](specs/multimodal-speed.md)
+§8.2), do #4 → #2 → #3.** #4 is cheapest-high-info: prune old `~/work/source-*` trees
+for disk, build a timed `test_voxtral_e2e`, bracket encode/prefill/decode with
+`steady_clock`+`Synchronize` (keep the 14/14 gate asserting so the timed path is proven
+to run), compare vs vLLM 43/41 ms. Then #2 (on-GPU argmax, ground 1:1 in vLLM's greedy
+sampler, re-run STRICT 32/32 image/video + A3 14/14 bit-for-bit, md5 goldens
+before/after). Then #3 (batched serving via the landed `EncoderCacheManager` seam).
+
+**Records:** `specs/multimodal-speed.md` §3/§5 citation fixes + new §8; ledger + this
+entry + `CLAIM-MULTIMODAL-SPEED-ATTR`; minimal honest README/BENCHMARKS touch. Did NOT
+touch the sibling CPU/quant-GGUF agent's files. One commit on this worktree; NOT pushed.
