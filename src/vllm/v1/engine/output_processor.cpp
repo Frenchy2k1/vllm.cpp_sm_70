@@ -160,6 +160,11 @@ RequestState RequestState::FromNewRequest(const tok::Tokenizer* tokenizer,
   }
   state.max_tokens_param = sp.max_tokens;
   state.stream_interval = stream_interval;
+  // RequestStateStats.arrival_time (stats.py:222): the reference the e2e latency
+  // and TTFT are measured from. Upstream uses request.arrival_time; at T0 we
+  // stamp it here from the same steady clock the engine stamps its step
+  // timestamps with, so the intervals are always non-negative.
+  state.arrival_time = MonotonicSeconds();
   return state;
 }
 
@@ -306,10 +311,13 @@ void OutputProcessor::add_request(const EngineCoreRequest& request,
 }
 
 OutputProcessorOutput OutputProcessor::process_outputs(
-    const EngineCoreOutputs& engine_core_outputs) {
-  // output_processor.py:576-693 (the synchronous LLMEngine path; stats /
-  // tracing / logprobs / pooling / streaming-input deferred).
+    const EngineCoreOutputs& engine_core_outputs,
+    IterationStats* iteration_stats) {
+  // output_processor.py:576-693 (the synchronous LLMEngine path; tracing /
+  // pooling / streaming-input deferred). `iteration_stats` is folded per output
+  // when non-null (llm_engine.py:308 builds it only when log_stats is on).
   OutputProcessorOutput result;
+  const double engine_core_timestamp = engine_core_outputs.timestamp;
 
   for (const EngineCoreOutput& eco : engine_core_outputs.outputs) {
     const std::string& req_id = eco.request_id;
@@ -320,12 +328,38 @@ OutputProcessorOutput OutputProcessor::process_outputs(
     }
     RequestState& req_state = *it->second;
 
-    // 1) Compute stats — deferred (no IterationStats at T0).
-
     const std::vector<int32_t>& new_token_ids = eco.new_token_ids;
     std::optional<FinishReason> finish_reason = eco.finish_reason;
     std::optional<std::string> stop_reason = eco.stop_reason;
     // routed_experts / prefill_stats deferred.
+
+    // 1) Compute stats for this iteration (IterationStats.update_from_output,
+    // stats.py:377-449). Whether this output is a prefill step is read BEFORE
+    // is_prefilling is flipped below, mirroring upstream ordering.
+    const bool is_prefilling_output = req_state.is_prefilling;
+    if (iteration_stats != nullptr) {
+      const int64_t num_new = static_cast<int64_t>(new_token_ids.size());
+      iteration_stats->num_generation_tokens += num_new;
+      iteration_stats->iteration_tokens += num_new;
+      if (is_prefilling_output) {
+        // prompt_token_stats.update_from_output (stats.py:328-335). No
+        // prefill_stats at T0 → num_prompt_tokens_cached stays 0; the whole
+        // prompt is the prefill token count.
+        const int64_t num_prompt = static_cast<int64_t>(req_state.prompt_len);
+        iteration_stats->num_prompt_tokens += num_prompt;
+        iteration_stats->iteration_tokens += num_prompt;
+        // TTFT = engine_core_timestamp - arrival_time (stats.py:441-443).
+        iteration_stats->time_to_first_tokens_iter.push_back(
+            engine_core_timestamp - req_state.arrival_time);
+        req_state.first_token_ts = engine_core_timestamp;
+      } else {
+        // ITL = engine_core_timestamp - last_token_ts (stats.py:471-473).
+        iteration_stats->inter_token_latencies_iter.push_back(
+            engine_core_timestamp - req_state.last_token_ts);
+      }
+      req_state.num_generation_tokens += num_new;
+      req_state.last_token_ts = engine_core_timestamp;
+    }
 
     if (req_state.is_prefilling) {
       // num_cached_tokens from prefill_stats deferred.
@@ -369,13 +403,41 @@ OutputProcessorOutput OutputProcessor::process_outputs(
     if (finish_reason.has_value()) {
       // streaming_input deferred (false) -> the finish branch.
       const bool engine_core_finished = eco.Finished();
+
+      // update_from_finished_request (stats.py:401-475) BEFORE FinishRequest
+      // invalidates req_state.
+      if (iteration_stats != nullptr) {
+        FinishedRequestStats f;
+        f.finish_reason = FinishReasonToString(*finish_reason);
+        f.e2e_latency = engine_core_timestamp - req_state.arrival_time;
+        f.num_prompt_tokens = static_cast<int64_t>(req_state.prompt_len);
+        f.num_generation_tokens = req_state.num_generation_tokens;
+        if (req_state.max_tokens_param.has_value()) {
+          f.max_tokens_param = *req_state.max_tokens_param;
+        }
+        // decode interval = first NEW_TOKEN -> last NEW_TOKEN (stats.py:434).
+        const double decode_time =
+            req_state.last_token_ts - req_state.first_token_ts;
+        f.decode_time = decode_time;
+        // TPOT excludes the prefill token (stats.py:438-442).
+        f.mean_time_per_output_token =
+            req_state.num_generation_tokens - 1 > 0
+                ? decode_time / static_cast<double>(
+                                    req_state.num_generation_tokens - 1)
+                : 0.0;
+        // queued_time/prefill_time/inference_time derive from the QUEUED/
+        // SCHEDULED EngineCoreEvents, deferred at T0 → left 0.0 (documented
+        // SERVE-RESPONSE-METRICS residual). num_cached_tokens deferred → 0.
+        iteration_stats->finished_requests.push_back(f);
+      }
+
       FinishRequest(req_state);  // invalidates req_state / it
       if (!engine_core_finished) {
         // :678 If req not finished in EngineCore but the detokenizer detected a
         // stop string, an abort is needed in EngineCore.
         result.reqs_to_abort.push_back(req_id);
       }
-      // stats / tracing deferred.
+      // tracing deferred.
     }
   }
 

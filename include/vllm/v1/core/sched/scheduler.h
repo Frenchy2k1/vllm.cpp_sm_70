@@ -252,6 +252,18 @@ class Scheduler {
     return prefix_cache_metrics_;
   }
 
+  // make_stats (scheduler.py:2399-2436): snapshot this step's always-on
+  // scheduler state for the Prometheus stat logger — running/waiting counts,
+  // KV-cache usage, and the per-step prefix-cache token delta. Upstream drains
+  // make_prefix_cache_stats() here and the frontend logger observes it into
+  // CachingMetrics; our schedule() already drains+observes that delta (it owns
+  // the CachingMetrics window, which non-logging callers read), so this returns
+  // the SAME per-step delta stashed by schedule() — identical values, no double
+  // take-and-swap. Const: reads the stash, never drains. The advanced fields
+  // (skipped-waiting, connector/spec/cudagraph/perf, eviction events) are
+  // deferred with their config-gated metric families (see loggers.h).
+  SchedulerStats make_stats() const;
+
  protected:
   // _update_after_schedule (scheduler.py:1166-1213): advance num_computed_tokens
   // for every scheduled request, refresh is_prefill_chunk (num_computed <
@@ -283,6 +295,13 @@ class Scheduler {
 
   // Backing store for prefix_cache_metrics(); written only by schedule().
   CachingMetrics prefix_cache_metrics_;
+
+  // This step's take-and-swap prefix-cache delta, stashed by schedule() when it
+  // drains make_prefix_cache_stats() (the SAME observation fed to CachingMetrics
+  // and, via make_stats(), to SchedulerStats.prefix_cache_stats). Reset to empty
+  // on a step that produced no observation so make_stats() never re-reports a
+  // stale delta.
+  PrefixCacheStats last_prefix_cache_stats_;
 
   // _preempt_request: free the request's KV, mark it PREEMPTED, reset its
   // computed tokens, and re-queue it to the FRONT of waiting (FCFS retry). The

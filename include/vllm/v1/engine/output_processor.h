@@ -147,6 +147,16 @@ class RequestState {
   std::optional<int> max_tokens_param;
   bool is_prefilling = true;
   int num_cached_tokens = 0;  // deferred (no prefill_stats at T0); stays 0.
+
+  // RequestStateStats (stats.py:218-236) — the per-request timing/token running
+  // state IterationStats.update_from_output threads through. The event-derived
+  // fields (queued_ts/scheduled_ts) are deferred with EngineCoreEvents, so the
+  // queue/prefill/inference intervals they feed stay 0 (a documented residual);
+  // arrival/first/last-token timestamps and the generation-token count are live.
+  double arrival_time = 0.0;      // MonotonicSeconds() at add_request.
+  int64_t num_generation_tokens = 0;
+  double first_token_ts = 0.0;    // engine_core_timestamp of the first token.
+  double last_token_ts = 0.0;     // engine_core_timestamp of the latest token.
   int stream_interval = 1;
   size_t sent_tokens_offset = 0;
   // AsyncLLM only (output_processor.py RequestState.queue): null on the
@@ -186,10 +196,16 @@ class OutputProcessor {
       std::shared_ptr<RequestOutputCollector> queue = nullptr);
 
   // process_outputs (:576): the per-EngineCoreOutput loop — detokenize + stop +
-  // RequestOutput assembly + reqs_to_abort feedback. Stats/tracing/timestamp
-  // args deferred.
+  // RequestOutput assembly + reqs_to_abort feedback. When `iteration_stats` is
+  // non-null it is filled from this step's outputs (token counts, per-request
+  // TTFT/ITL samples, finished-request breakdowns) exactly as upstream
+  // IterationStats.update_from_output / update_from_finished_request
+  // (stats.py:377-449 / 401-475). Null (the default) keeps the pure
+  // detokenize/assemble path byte-identical — no stats work, no clock reads.
+  // Tracing stays deferred.
   OutputProcessorOutput process_outputs(
-      const EngineCoreOutputs& engine_core_outputs);
+      const EngineCoreOutputs& engine_core_outputs,
+      IterationStats* iteration_stats = nullptr);
 
   // abort_requests (output_processor.py:534, the T0 subset): drop the tracked
   // RequestState for each id so a client-initiated abort (e.g. the C-ABI

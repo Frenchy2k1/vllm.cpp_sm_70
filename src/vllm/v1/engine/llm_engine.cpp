@@ -8,6 +8,8 @@
 #include <utility>
 
 #include "vllm/v1/engine/types.h"
+#include "vllm/v1/metrics/loggers.h"
+#include "vllm/v1/metrics/stats.h"
 #include "vllm/v1/request.h"
 
 namespace vllm::v1 {
@@ -75,13 +77,28 @@ std::vector<RequestOutput> LLMEngine::step() {
   for (auto& entry : outputs_by_client) {
     EngineCoreOutputs& engine_core_outputs = entry.second;
 
-    // llm_engine.py:309 process_outputs — detokenize + string-stop + assemble.
-    OutputProcessorOutput processed =
-        output_processor_.process_outputs(engine_core_outputs);
+    // llm_engine.py:308 iteration_stats = IterationStats() if self.log_stats.
+    // Built only when a stat logger is attached; otherwise process_outputs runs
+    // its byte-identical no-stats path.
+    IterationStats iteration_stats;
+    IterationStats* iteration_stats_ptr =
+        stat_logger_ != nullptr ? &iteration_stats : nullptr;
+
+    // llm_engine.py:309 process_outputs — detokenize + string-stop + assemble
+    // (+ fold IterationStats when logging).
+    OutputProcessorOutput processed = output_processor_.process_outputs(
+        engine_core_outputs, iteration_stats_ptr);
 
     // llm_engine.py:318 abort any reqs that finished due to stop strings (the
     // detokenizer stopped them but EngineCore did not signal it itself).
     engine_core_.abort_requests(processed.reqs_to_abort);
+
+    // llm_engine.py:319-329 record stats: fold this step's SchedulerStats +
+    // IterationStats into the Prometheus registry. Guarded by outputs>0 exactly
+    // as upstream (len(outputs.outputs) > 0).
+    if (stat_logger_ != nullptr && !engine_core_outputs.outputs.empty()) {
+      stat_logger_->Record(engine_core_outputs.scheduler_stats, iteration_stats);
+    }
 
     for (RequestOutput& ro : processed.request_outputs) {
       request_outputs.push_back(std::move(ro));

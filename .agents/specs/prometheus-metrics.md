@@ -2,7 +2,8 @@
 
 Live spec for the `SERVE-METRICS` engine-matrix row: the Prometheus text
 exposition served at `GET /metrics`, mirroring vLLM 0.26.0.dev0
-(`555967922`). The oldest open T0 serving debt.
+(`555967922`). The oldest open T0 serving debt — as of 2026-07-27 the endpoint
+serves LIVE per-step values (W4 below), not just the primed catalog.
 
 ## Scope
 
@@ -77,10 +78,11 @@ Endpoint-level cases in `tests/vllm/entrypoints/openai/test_api_server.cpp`.
 
 ## Dependencies
 
-None new. Reuses `PrefixCacheStats` (already in stats.h). The scheduler already
-exposes `prefix_cache_metrics()` and running/waiting counts; wiring the live
-engine's real per-step stats into `Record()` at the serving layer is a follow-on
-(the values are engine-fed; the NAME/label/format parity is what this row gates).
+None new. Reuses `PrefixCacheStats` (already in stats.h). The scheduler exposes
+`prefix_cache_metrics()` and running/waiting counts; the live per-step stats are
+now fed into `Record()` at the sync `LLMEngine` step site (W4, done) via
+`Scheduler::make_stats()` + the `OutputProcessor`-built `IterationStats`. Wiring
+the same into the AsyncLLM production-serving loop is the remaining follow-on.
 
 ## Work breakdown
 
@@ -88,9 +90,22 @@ engine's real per-step stats into `Record()` at the serving layer is a follow-on
 - W2: `PrometheusStatLogger` always-on catalog + `Record()` + cache_config_info —
   DONE.
 - W3: `ApiServer` `/metrics` route (opt-in) + endpoint test — DONE.
-- W4 (residual): fold the live EngineCore/Scheduler per-step SchedulerStats +
-  IterationStats into `Record()` at the running server, plus the config-gated
-  families (spec-decode/kv-connector/mm/LoRA) as their configs land — OPEN.
+- W4: fold the live EngineCore/Scheduler per-step SchedulerStats +
+  IterationStats into `Record()` — **DONE 2026-07-27 (`CLAIM-ROADMAP-C8-METRICS-WIRE`).**
+  `EngineCoreOutputs` carries `scheduler_stats` (new `Scheduler::make_stats()`,
+  `scheduler.py:2399-2436` — running/waiting/kv-usage + the per-step prefix-cache
+  delta STASHED by `schedule()`, no second take-and-swap) + a stamped monotonic
+  `timestamp`; `OutputProcessor::process_outputs` builds `IterationStats` (token
+  counts, TTFT/ITL samples, finished-request breakdowns off new `RequestState`
+  timing, `stats.py:377-475`); the sync `LLMEngine::step()` folds both into the
+  attached logger's `Record()` guarded by outputs>0 (`llm_engine.py:308-329`).
+  Opt-in `set_stat_logger` (null default) ⇒ byte-identical no-stats path.
+  Behavioural CPU gate `test_llm_engine.cpp` case 6 (44 asserts, RED-first: 14
+  flip 0→correct when `Record` is disabled).
+- W5 (residual): the AsyncLLM production-serving metric wiring; the config-gated
+  families (spec-decode/kv-connector/mm/LoRA) as their configs land; the
+  per-request queue/prefill/inference timing + preemption counter (needs
+  EngineCoreEvents → `SERVE-RESPONSE-METRICS`) — OPEN.
 
 ## Risks/decisions
 
