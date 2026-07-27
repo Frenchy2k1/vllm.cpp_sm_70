@@ -2555,6 +2555,29 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## GEMM limit: four hypotheses excluded (2026-07-27)
+
+Our GEMM is ~1.5 TFLOP/s against MLX's ~3.3. Four explanations were each built
+and measured; three are refuted and one was the real win:
+
+| hypothesis | result | verdict |
+|---|--:|---|
+| barrier traffic (BK 8 -> 32) | 13.28 vs 13.27 tok/s | neutral |
+| tile too narrow (32x32 -> 64x64) | 990 -> 1484 GFLOP/s | **REAL, landed** |
+| staging latency (double buffering) | 1478/1560/1481 vs 1484/1574/1507 | neutral |
+| mma precision-bound (`simdgroup_half8x8`) | 1465/1556/1496 | neutral |
+
+**The precision negative is the most useful.** MLX runs its mma at reduced
+precision, so the obvious theory was that our f32 `simdgroup_matrix` is half-rate.
+The half-precision variant measured IDENTICAL, refuting it and removing the
+motivation for a half/bf16 staging path that carried a real overflow hazard.
+
+Both neutral changes were correct (row diagnostic NONE, suite 21/21) and were
+reverted. What remains untested: the per-element staging WORK (not its latency)
+and the simdgroup_load-to-mma issue ratio at the 64x64 tile.
+
+---
+
 ## Metal 64x64 simdgroup GEMM on Apple M4 (2026-07-27) - RESOLVED and landed
 
 The open lead is closed. Tile is now 64x64 with 8 simdgroups (2 row groups of 32

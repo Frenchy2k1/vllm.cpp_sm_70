@@ -403,6 +403,38 @@ offset to disagree.
 **Still open toward parity:** ours is ~1.5 TFLOP/s against MLX's ~3.3. The
 remaining distance needs register blocking and double-buffered staging.
 
+### GEMM limit: four hypotheses now EXCLUDED by measurement
+
+Our GEMM sits at ~1.5 TFLOP/s against MLX's ~3.3. Four candidate explanations
+have each been built and measured on the M4 with the `VT_MM_BENCH` harness, and
+all four are refuted. Recorded so the next attempt starts from what is LEFT
+rather than re-running these.
+
+| hypothesis | change built | result | verdict |
+|---|---|--:|---|
+| barrier traffic | BK 8 -> 32 | 13.28 vs 13.27 tok/s | **neutral** |
+| tile too narrow | 32x32 -> 64x64 | 990 -> 1484 GFLOP/s | **REAL, landed** |
+| staging latency exposed | double-buffered tiles, 1 barrier/block | 1478/1560/1481 vs 1484/1574/1507 | **neutral** |
+| mma precision-bound | `simdgroup_half8x8` + f32 accumulate | 1465/1556/1496 | **neutral** |
+
+**The precision result is the most useful of the three negatives.** MLX runs its
+mma at reduced precision, so the natural theory was that our f32
+`simdgroup_matrix` is half-rate and that MLX's advantage is precision. Building
+the half-precision variant produced IDENTICAL throughput. That refutes the
+theory AND removes the motivation for a `half`/bf16 staging path, which carried a
+real overflow hazard (half saturates at 65504). **Do not spend effort there.**
+
+**Double buffering is likewise a closed question.** It is correct (row diagnostic
+NONE, suite 21/21) and worth nothing here, so the kernel is not stalled waiting
+on tile fetches.
+
+**What is left, given the exclusions:** the per-element staging WORK rather than
+its latency (each element passes a branchy `vt_load` and a threadgroup write),
+and the simdgroup_load-to-mma issue ratio (6 loads per 8 mma per K-block of 8;
+a larger BK amortises the loads and was only ever tested at the 32x32 tile, where
+it was neutral for a different reason). Both are worth one measurement each
+before any larger rewrite.
+
 ### Risks/decisions
 
 - **Batching changes failure semantics (accepted, mitigated).** Today a failed

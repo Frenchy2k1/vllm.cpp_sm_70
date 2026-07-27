@@ -26029,3 +26029,30 @@ unrepresentable.
 
 **Goal:** 15.30 of 27.9 tok/s, 1.82x remaining. Ours ~1.5 TFLOP/s vs MLX's ~3.3;
 the rest needs register blocking and double-buffered staging.
+
+---
+
+## 2026-07-27 — GEMM limit: double buffering and half-precision mma both NEUTRAL
+
+Two more candidate explanations for the ~1.5 vs ~3.3 TFLOP/s gap were built and
+measured. Both are correct and both are worth nothing; both reverted.
+
+**Double-buffered staging: NEUTRAL** (1478/1560/1481 vs 1484/1574/1507 GFLOP/s).
+Stages the next K-tile into an idle buffer while the mma consumes the current
+one, halving barriers to one per block. Row diagnostic NONE, suite 21/21. The
+kernel is therefore NOT stalled waiting on tile fetches.
+
+**Half-precision mma: NEUTRAL** (1465/1556/1496). `simdgroup_half8x8` operands
+with f32 accumulate. This is the most useful of the negatives: MLX runs its mma
+at reduced precision, so the natural theory was that our f32 `simdgroup_matrix`
+is half-rate and that precision IS MLX's advantage. Identical throughput refutes
+that, and it removes the motivation for a half/bf16 staging path that carried a
+genuine overflow hazard (half saturates at 65504). **Do not spend effort there.**
+
+**Running exclusion list for the GEMM gap:** barrier traffic (BK=32, neutral),
+tile width (64x64, REAL — landed), staging latency (double buffering, neutral),
+mma precision (half, neutral). What remains untested: the per-element staging
+WORK rather than its latency, and the simdgroup_load-to-mma issue ratio at the
+64x64 tile (BK was only ever varied at 32x32).
+
+**Goal:** 15.30 of 27.9 tok/s, 1.82x remaining.
