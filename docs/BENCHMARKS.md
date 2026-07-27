@@ -38,6 +38,20 @@ measured and is deliberately NOT estimated, so no ratio is asserted between the
 two. Reproduce: `python3 benchmarks/demo/concurrency_race.py` and `python3
 benchmarks/demo/footprint.py`.
 
+**Ampere major-8 CUDA fast-path bring-up SPIKE (2026-07-27,
+`CLAIM-CUDA-AMPERE-SCOPE`).** Disposition: **NOT APPLICABLE (scoping spike; no
+measurement taken, claimed, or owed; `benchmark_binding=false`).** Read-only on
+production code: the deliverable is the scoping spec
+[.agents/specs/cuda-arch-ampere-fastpath.md](../.agents/specs/cuda-arch-ampere-fastpath.md)
+inventorying the derive-and-ship port of the Ampere (`sm_80/86/87/89`) fast-path
+kernels from vLLM (FA2, Marlin int4 W4A16 + fp8-input, AllSpark W8A16, CUTLASS
+scaled-mm C2x) plus the AGX Orin (`sm_87`) runtime-gate plan. No kernel is ported,
+built, or run here, so no number moves. The DERIVED sub-targets ship
+build-verified only (compile + `cuobjdump` SASS, no throughput claim); the only
+real numbers the campaign will produce come later from the Orin RUNTIME-VERIFIED
+gate (token-exact vs the vLLM 0.25.0 oracle, then benchmarked vs llama.cpp and
+vLLM on that box, all axes).
+
 **DOCS user-facing split: README landing page + `docs/STATUS.md` ledger
 (2026-07-27, `CLAIM-DOCS-README-SPLIT`).** Disposition: **NOT APPLICABLE (no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Documentation
