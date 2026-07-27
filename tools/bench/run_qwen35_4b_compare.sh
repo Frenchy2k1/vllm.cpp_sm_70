@@ -140,6 +140,24 @@ prepare_leg() {
     echo "GPU is not compute-idle before $name" >&2
     return 1
   fi
+  # The compute-apps check above is NOT sufficient, and a whole series has
+  # already been measured through the hole: `--query-compute-apps` lists CUDA
+  # contexts only, so a GRAPHICS consumer (compositor, browser, X client) is
+  # invisible to it. The 2026-07-25 series ran every one of its nine legs against
+  # a GPU sitting at 11-13% utilization with 611 MiB of extra VRAM resident, and
+  # passed this gate; re-measuring on a genuinely idle GPU moved BOTH arms by
+  # ~14%. So also require the device to be actually idle. The ratio survived that
+  # contention because it hit both arms, but no absolute number from a contended
+  # series may be published, per .agents/benchmark-protocol.md.
+  local util
+  util=$(cut -d, -f6 "$out/$name.gpu-before.csv" | tr -dc '0-9')
+  if test -n "$util" && test "$util" -gt "${GPU_IDLE_UTIL_MAX:-2}"; then
+    echo "GPU is not idle before $name: utilization ${util}% exceeds" \
+      "${GPU_IDLE_UTIL_MAX:-2}% (a graphics consumer does not appear in" \
+      "--query-compute-apps; stop it, or set GPU_IDLE_UTIL_MAX to accept it" \
+      "and record the contention with the result)" >&2
+    return 1
+  fi
   awk '/^MemAvailable:/{print}' /proc/meminfo >"$out/$name.mem-before.txt"
   printf '%s\n' "$EPOCHREALTIME" >"$out/$name.started"
 }

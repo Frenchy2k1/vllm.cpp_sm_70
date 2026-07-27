@@ -37,7 +37,7 @@ token-for-token correctness against the pinned oracle.
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete, at/above vLLM speed | Token-exact greedy on GB10; beats vLLM 0.25.0 total throughput at every concurrency (1.007-1.045x), effective parity 115/124 axes |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete, decode at-parity, prefill speed-pending | Token-exact greedy; decode at or beyond vLLM, remaining gap is prefill TTFT |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual |
-| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical; direct loading cuts peak/stable host PSS by 72.0%/91.2%. The pre-transplant H32 AOT, decode-graph and ratio-4 FA2 result reached 0.9864x vLLM 0.25.0; the current-main development branch is pending revalidation |
+| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical, and token-identical to the previous series; direct loading cuts peak/stable host PSS by 73.4%/91.1% and mean TTFT by 12.7%. Revalidated on `main` @ `7f620e74`: 0.9819x vLLM 0.24.0 total throughput, TTFT passes, TPOT 14.0% high. The failing axis is the discrete-GPU async-overlap gap, scoped as ENG-ASYNC-SCHED W4 |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM |
 | Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
@@ -549,18 +549,28 @@ InternLM2 plus a sliding window).
 
 ## Performance detail
 
-**Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** the measured
-pre-transplant repair on an RTX 5070 Ti reached 5769.99 total tok/s versus vLLM
-0.25.0 at 5849.80 tok/s (0.9864x) on the identical 128-request workload. Direct
-loading reduced peak PSS from 8.59 to 2.41 GiB and stable PSS from 8.59 to 0.76
-GiB. Mean TPOT/ITL was 43.72 ms versus vLLM's 38.55 ms. Profiling attributes the
-residual to the discrete-CUDA sampled-token D2H path synchronizing the main
-stream instead of retaining vLLM's event-overlapped device mapping. The repair
-has since been transplanted onto current `main`; that development branch is
-pending the same-series revalidation, so these numbers do not yet bind to it.
+**Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** revalidated on
+current `main` (`7f620e74`) on an RTX 5070 Ti at 6600.66 total tok/s versus vLLM
+0.24.0 at 6722.24 tok/s (0.9819x) on the identical 128-request workload. Direct
+loading reduces peak PSS from 8.59 to 2.28 GiB, stable PSS from 8.59 to 0.76
+GiB, and mean TTFT from 835.0 to 729.2 ms. Mean TPOT/ITL is 38.22 ms versus
+vLLM's 33.53 ms. Every token matches the previous series exactly (128/128 per
+repetition, both arms), so the 109-commit upstream advance moved no output here.
+
+Two things to know about the numbers. First, the earlier 5769.99 tok/s figure is
+VOID, not superseded by an improvement: that whole series ran against a GPU held
+at 11-13% utilization by a graphics consumer the harness's idle check could not
+see, and both arms gained ~14% once measured on a genuinely idle box. The check
+now fails on non-idle utilization. Second, the residual is a specific missing
+mechanism rather than a diffuse gap: this GPU is discrete, so the async-scheduling
+device combine/scatter falls back to a host path that must synchronize the main
+stream for the sampled ids, and the depth-2 scheduler therefore has nothing to
+overlap. Upstream keeps that state GPU-resident unconditionally. Scoped as
+ENG-ASYNC-SCHED W4.
+
 This local 4B diagnostic does not establish 27B/35B support. Exact evidence and
 reproduction:
-[Qwen3.5-4B main repair](bench-evidence/qwen35-4b-main-repair-20260725.md).
+[Qwen3.5-4B post-pull revalidation](bench-evidence/qwen35-4b-postpull-20260727.md).
 
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).
