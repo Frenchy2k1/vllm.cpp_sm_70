@@ -97,6 +97,37 @@ default, so the legacy tool_parsers path is byte-identical
 cmake --build build --target test_openai_serving_chat_stream &&
 ./build/tests/test_openai_serving_chat_stream`.
 
+**ROAD-V1-C8 engine CONFIG families gemma4 + inkling (2026-07-27,
+`CLAIM-ROADMAP-C8-CONFIGS-2`, NOT pushed) - vLLM tool-parser family parity
+CLOSED.** Disposition: **CORRECTNESS gate, no throughput number
+(`benchmark_binding=false`).** Ports the last 2 deferred engine-backed families
+(after `CLAIM-ROADMAP-C8-CONFIGS` landed minimax_m2/glm47_moe/deepseek_v4/
+deepseek_v32/nemotron_v3) by adding 4 DEFAULT-INERT assembly-core virtual seams
+(`preprocess_feed`, virtual `events_to_delta`/`single_pass_parse`, and
+`args_wrapper_keys` from `_extract_args_value`; plus virtual
+`reset`/`extract_reasoning`) so the 8 existing families produce byte-identical
+output. gemma4 (`Gemma4Parser`) adds the first-feed channel-opener injection +
+the intrinsic `thought\n` reasoning-prefix strip; inkling (`InklingParser`) adds
+the `args` wrapper-key unwrap + the trailing-text single-pass flush. All 10
+engine-backed configs are now ported. `test_parser_engine_assembly` 3 cases /
+4526 assertions on CPU (was 3510), 26 scenarios (adds gemma4 explicit + elided
+channel, inkling think/tool/trailing-text + non-object-args, each whole-delta AND
+char-by-char) plus a new non-streaming `parse()` test case. RED-first for all 4
+new seams: gemma4 `events_to_delta` skip fails 13 asserts at
+`gemma4_channel_tool_wholedelta delta[0] reasoning`; gemma4 `preprocess_feed`
+identity fails 5 asserts only on `gemma4_elided_channel_wholedelta delta[0]
+content`; inkling `args_wrapper_keys` drop-`args` fails 4 asserts at
+`inkling_nonobject_args_wholedelta extract tc[0] arguments`; inkling
+`single_pass_parse` skip fails 2 asserts only on
+`inkling_think_tool_text_wholedelta parse content`; each restored returns
+4526/4526. Inertness: engine-core `test_streaming_parser_engine` 586/586 and
+serving-SSE `test_openai_serving_chat_stream` 210/210 both UNCHANGED
+byte-identical (the seams' bases reproduce prior behavior; the goldens `.inc`
+diff is pure insertions). Reproduce:
+`VLLM_SOURCE=/path/to/vllm python3 tools/parity/dump_parser_engine_assembly.py --out tests/vllm/parser/engine/test_parser_engine_assembly_goldens.inc &&
+cmake --build build-cpu --target test_parser_engine_assembly &&
+./build-cpu/tests/test_parser_engine_assembly`.
+
 **ROAD-V1-C7 sampling controls + logprobs (2026-07-27, `CLAIM-ROADMAP-C7`, NOT
 pushed).** Disposition: **CORRECTNESS gate, no throughput number
 (`benchmark_binding=false`).** A sampling transform is a pure function of

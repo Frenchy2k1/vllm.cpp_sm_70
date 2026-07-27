@@ -26419,3 +26419,55 @@ assembly hooks above); JSON-schema arg-type coercion; `SERVE-RESPONSE-METRICS`
 - **2026-07-27** — **ROAD-V1-MM speed lever #3 W1: the Voxtral (Mistral/Llama) decode-graph class LANDED — a real non-overlapping win that NARROWS but does NOT close the audio 1.52× gap** (`CLAIM-MM-SPEED-GRAPH-W1`; base local `main` `e2b18fc8` = the §9 FIRST-BRICK HEAD; dgx GB10 `~/work/mm-voxtral-graph`, cutlass 4.5.0 + FA2 + Triton-AOT arch 121a, GPU under `flock /tmp/gpu` sole owner). Voxtral's Mistral/Llama text stack was the ONLY mm text stack with no decode-graph class; built `VoxtralDecodeGraph` (`voxtral.{h,cpp}`, the Voxtral-text sibling of `Qwen3MoeDecodeGraph`: pure full-attention over `dense_attn::AttnBlock` + `vt::PagedAttention`, no GDN; same cold→warm→replay + persistent-buffer discipline), and routed `VoxtralGenerateGreedy`'s pure-decode loop through `VoxtralDecodeGraph::Step` — the captured region is the EXACT `ForwardLastLogits` op sequence (embed kept OUTSIDE via `VoxtralEmbedInto`; S==B==1 bit-identical rebuild). Eager fallback behind `VT_MM_DECODE_EAGER=1`. GATE (dgx, RED line HELD, proven-to-run via `VT_DECODE_GRAPH_STATS`: captured S=1 + 46 replays): `test_voxtral_e2e` **14/14** (near-tie seq 48/48, strict prefix 33/48), goldens md5 unchanged. A/B (throwaway `VT_MM_DECODE_EAGER` toggle, 6 reps/mode, rep0 dropped, steady-state): graphed **60.94 ms/tok** (60.79–61.07) vs eager **61.71** (61.57–61.88) = **−0.77 ms/tok (~1.25%, NON-OVERLAPPING)** — a real clean win, but it NARROWS the audio gap **1.52×→1.49×** vs vLLM's 40.8 ms and does NOT close it. **HONEST refinement of the §9.5 hypothesis:** the removable per-step launch overhead was only ~1.25% of TPOT, so the ~20 ms/tok residual is per-step COMPUTE / kernel efficiency (vLLM's torch.compile-fused + graphed decode), NOT launch overhead — closing the audio gap needs a decode-kernel nsys/port pass and/or batched c2+ (W2), not more graphing. STRUCTURAL value: Voxtral now graph-capturable (prerequisite for batched multi-seq mm decode). Records: multimodal-speed.md §9.5 (W1 marked done) + new §10 (result), engine/model/feature matrices + roadmap + completion-spec MM lines (by-key), README/BENCHMARKS, ledger, this entry, coordination CLAIM. Record checkers RC green. mm rows stay `PARTIAL` (speed-pending). Not pushed; FULL SHA reported to the dispatcher.
 
 - **Next (audio, after W1):** the audio gap vs vLLM (~1.49×, ~60.9 vs 40.8 ms/tok) is now attributed to per-step COMPUTE/kernel efficiency, not launch overhead — so an audio decode-kernel pass (nsys our graphed Voxtral step vs vLLM's, port the divergent kernels 1:1) plus W2 batched multi-seq mm decode (S>1 / c2+); W3 `image_url`/`audio_url` serving ingestion remains for the production-serving A/B.
+
+- **2026-07-27** — **ROAD-V1-C8 `TOOLS-STREAMING-PARSER` — LAST 2 engine CONFIG
+  FAMILIES gemma4 + inkling PORTED + CPU-GATED; vLLM tool-parser family parity
+  CLOSED** (`CLAIM-ROADMAP-C8-CONFIGS-2`; isolated worktree
+  `.claude/worktrees/agent-aca996f0b3f998b5b` off `main` `9b27e9c2`; CPU-only, NO
+  dgx; pin `555967922`; NOT pushed). Closed the two deferrals from
+  `CLAIM-ROADMAP-C8-CONFIGS` by ADDING the exact per-parser assembly-core seams
+  each needed, as DEFAULT-INERT virtual methods (the other 8 families byte-
+  identical). Seams on `ParserEngine` (`parser_engine.{h,cpp}`): `preprocess_feed`
+  (base identity, `parser_engine.py:210`), virtual `events_to_delta` (`:706`),
+  virtual `single_pass_parse` (`:645`), `args_wrapper_keys()` from
+  `_extract_args_value` (`:1064`), virtual `reset` (`:195`) / `extract_reasoning`
+  (`:490`), `engine_state()`, and ctor-resolved `_reasoning_{start,end}_token_id`
+  (`:141-149`).
+  - `gemma4` (`Gemma4Parser`, `parser/gemma4.{h,cpp}` + `gemma4_config`):
+    `_preprocess_feed` `<|channel>` first-feed injection (`gemma4.py:424`),
+    `_events_to_delta` intrinsic-`thought\n` prefix REWRITE (`:530`),
+    `extract_reasoning` strip (`:572`), `_gemma4_arg_converter` custom key:value
+    scanner (`:68/204/285`).
+  - `inkling` (`InklingParser`, `parser/inkling.{h,cpp}` + `inkling_config`):
+    `args_wrapper_keys` `args`-unwrap (`inkling.py:402`), `_single_pass_parse`
+    trailing-text flush (`:376`), `_inkling_arg_converter` JSON-span carver
+    (`:146/98/70`); MESSAGE_HEADER-initial.
+
+  **Gate:** `test_parser_engine_assembly` 3 cases / **4526/4526** (was 3510), 26
+  scenarios (+7) incl. a NEW non-streaming `parse()` case, field-for-field vs vLLM
+  0.26; goldens byte-reproduced by the extended `dump_parser_engine_assembly.py`
+  (copies the REAL gemma4/inkling modules; MockTok + a matching C++ gemma4 mock-
+  tokenizer carry the channel vocab so `_preprocess_feed` fires). **RED-first for
+  all 4 seams:** gemma4 `_events_to_delta` skip → 13 asserts at
+  `gemma4_channel_tool_wholedelta delta[0] reasoning`; gemma4 `_preprocess_feed`
+  identity → 5 asserts ONLY on `gemma4_elided_channel_wholedelta delta[0] content`
+  (isolated); inkling `args_wrapper_keys` drop-`args` → 4 asserts at
+  `inkling_nonobject_args_wholedelta extract tc[0] arguments`; inkling
+  `_single_pass_parse` skip → 2 asserts ONLY on
+  `inkling_think_tool_text_wholedelta parse content`; each restored → 4526/4526.
+  Note (honest): inkling's `_extract_args_value` is a converter-FAILURE fallback
+  (well-formed `args` unwrap via `_inkling_arg_converter`), gated via the
+  non-object-`args` scenario; the `_single_pass_parse` flush is reached only by
+  `parse()`, gated by the new parse() case.
+
+  **Inertness proven:** engine-core `test_streaming_parser_engine` **586/586** +
+  serving-SSE `test_openai_serving_chat_stream` **210/210** UNCHANGED byte-
+  identical; the existing 3510 stream/extract asserts unchanged (the goldens `.inc`
+  diff is PURE INSERTIONS, 0 deletions). CPU `-Werror` 0-warn on a clean full
+  `vllm` library rebuild. Additive: 4 virtual seams (bases reproduce prior
+  behavior) + 2 configs/converters + NEW `parser/{gemma4,inkling}.{h,cpp}` + 2
+  CMake lines + registry/manager dispatch + the extended assembly test/dump.
+
+  **Residual (C8 stays PARTIAL).** JSON-schema arg-type coercion;
+  `SERVE-RESPONSE-METRICS` (INVENTORIED); live-engine per-step metric value wiring;
+  chat-form `/tokenize`.

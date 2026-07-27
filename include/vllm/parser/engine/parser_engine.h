@@ -122,7 +122,9 @@ class ParserEngine {
       const std::string& delta_text, const ParserRequest& request);
 
   // ── Non-streaming ─────────────────────────────────────────────────
-  std::pair<std::optional<std::string>, std::optional<std::string>>
+  // virtual: gemma4 overrides to strip the intrinsic `thought\n` channel prefix
+  // (gemma4.py:572).
+  virtual std::pair<std::optional<std::string>, std::optional<std::string>>
   extract_reasoning(const std::string& model_output,
                     const ParserRequest& request);
 
@@ -148,26 +150,59 @@ class ParserEngine {
   virtual std::string extract_args_json(const std::string& raw_args,
                                         const std::string& func_name);
 
+  // parser_engine.py:210 _preprocess_feed — a first-feed hook that rewrites the
+  // (delta_text, delta_token_ids) before the streaming engine sees them. Base is
+  // the identity (inert for all families that don't override); gemma4 injects the
+  // `<|channel>` opener (gemma4.py:424).
+  virtual std::pair<std::string, std::vector<int>> preprocess_feed(
+      const std::string& delta_text, const std::vector<int>& delta_token_ids);
+
+  // parser_engine.py:706 _events_to_delta — virtual so gemma4 can post-process
+  // the reasoning delta (strip the intrinsic `thought\n` prefix; gemma4.py:530).
+  virtual std::optional<oai::DeltaMessage> events_to_delta(
+      const std::vector<SemanticEvent>& events, bool finished);
+
+  // parser_engine.py:645 _single_pass_parse — virtual so inkling can flush the
+  // trailing text block that follows a tool-call block (inkling.py:376). The
+  // tool_call_info the Python tuple carries is stashed in last_extracted_.
+  virtual std::pair<std::optional<std::string>, std::optional<std::string>>
+  single_pass_parse(const std::string& text, std::optional<ParserState> initial);
+
+  // parser_engine.py:1064 _extract_args_value key list, refactored to a virtual
+  // hook: inkling adds the "args" wrapper key (inkling.py:402). Base returns the
+  // fixed {"arguments","parameters"} the upstream base inlines.
+  virtual std::vector<std::string> args_wrapper_keys() const;
+
+  // parser_engine.py:195 _reset — virtual so gemma4 can also clear its
+  // prefix-strip / first-feed state (gemma4.py:418).
+  virtual void reset(std::optional<ParserState> initial_state = std::nullopt);
+
   // Helpers reused by family overrides.
   void ensure_tool_id(ToolCallSlot& slot, const std::string& name);
   bool is_valid_tool_name(const std::string& name) const;
+  std::optional<std::string> strip_content_whitespace(const std::string& content,
+                                                      bool tools_called) const;
+  ParserState engine_state() const { return engine_.state(); }
 
   ParserEngineConfig config_;
   std::vector<ToolCallSlot> tool_slots_;
+  std::string deferred_content_;
+  // parser_engine.py:141-149 _reasoning_start_token_id / _reasoning_end_token_id
+  // (resolved from the tokenizer vocab). Read by gemma4's _preprocess_feed.
+  std::optional<int> reasoning_start_token_id_;
+  std::optional<int> reasoning_end_token_id_;
+  // Stashes the last _build_extracted_result (mirrors the tuple returned by
+  // upstream _single_pass_parse, read by the non-streaming entrypoints).
+  oai::ExtractedToolCallInformation last_extracted_;
 
  private:
-  void reset(std::optional<ParserState> initial_state = std::nullopt);
   std::vector<SemanticEvent> feed(const std::string& delta_text,
                                   const std::vector<int>& delta_token_ids);
   void check_skip_tool_parsing(const ParserRequest& request);
   void initialize_history_tool_call_cnt(const ParserRequest& request);
 
-  std::optional<oai::DeltaMessage> events_to_delta(
-      const std::vector<SemanticEvent>& events, bool finished);
   std::optional<oai::DeltaMessage> strip_trailing_reasoning(
       std::optional<oai::DeltaMessage> delta);
-  std::optional<std::string> strip_content_whitespace(const std::string& content,
-                                                      bool tools_called) const;
 
   void ensure_slot(int idx);
   std::optional<std::string> try_extract_name(int idx) const;
@@ -182,8 +217,6 @@ class ParserEngine {
   static std::vector<oai::DeltaToolCall> coalesce_tool_call_deltas(
       const std::vector<oai::DeltaToolCall>& deltas);
 
-  std::pair<std::optional<std::string>, std::optional<std::string>>
-  single_pass_parse(const std::string& text, std::optional<ParserState> initial);
   oai::ExtractedToolCallInformation build_extracted_result(
       const std::vector<const oai::DeltaMessage*>& deltas);
   std::pair<std::string, std::string> extract_name_and_args(
@@ -201,14 +234,9 @@ class ParserEngine {
   bool streaming_initialized_ = false;
 
   std::vector<ParserTool> tools_;
-  std::string deferred_content_;
   std::string deferred_reasoning_;
   bool content_has_nonws_ = false;
   bool suppress_tool_calls_ = false;
-
-  // Stashes the last _build_extracted_result (mirrors the tuple returned by
-  // upstream _single_pass_parse, read by the non-streaming entrypoints).
-  oai::ExtractedToolCallInformation last_extracted_;
 };
 
 }  // namespace vllm::parser::engine

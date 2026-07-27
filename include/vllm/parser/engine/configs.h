@@ -50,4 +50,15 @@ ParserEngineConfig deepseek_v32_config();
 // strip_trailing_reasoning_whitespace=True and a distinct name.
 ParserEngineConfig nemotron_v3_config(bool thinking = true);
 
+// gemma4.py:296 (gemma4_config). Channel-based (<|channel>) reasoning +
+// <|tool_call> tool calls with a custom key:value arg format. The Gemma4Parser
+// subclass (parser/gemma4.{h,cpp}) adds the _preprocess_feed / _events_to_delta
+// hooks.
+ParserEngineConfig gemma4_config();
+
+// inkling.py:175 (inkling_config). Typed content blocks; MESSAGE_HEADER-initial.
+// The InklingParser subclass (parser/inkling.{h,cpp}) adds the "args" wrapper-key
+// unwrap + trailing-text single-pass flush.
+ParserEngineConfig inkling_config();
+
 }  // namespace vllm::parser::engine
