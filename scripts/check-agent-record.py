@@ -47,7 +47,12 @@ MATRICES = {
     # our MLX/Vulkan/Metal architecture actually port vLLM's CUDA-path strategy, and
     # what is the shared layer's device-leakage budget. A cross-backend structural
     # concern that owns no kernel and no platform, hence its own row).
-    "BACKEND": (AGENTS / "backend-matrix.md", 57),
+    # 60 since 2026-07-27: +`BACKEND-CUDA-SM060` + `BACKEND-CUDA-SM061` (the Pascal
+    # targets for the beyond-vLLM fp16/non-tensor-core breadth lane) + the
+    # `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` competitor floor (llama.cpp on the same
+    # old card, since vLLM has no entry on Pascal/Volta/Turing). See
+    # specs/cuda-arch-breadth-fp16.md.
+    "BACKEND": (AGENTS / "backend-matrix.md", 60),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

@@ -290,6 +290,23 @@ are new bodies; Marlin needs its int4/fp8 instantiations.
 
 **Datacenter CUDA arches (Hopper `sm_90a`, Blackwell `sm_100/103/110`) — build-only, fast-path SPIKED.** These arches compile today as **portable-kernels-only** (`build-only`; every wgmma/tcgen05 fast-path FEATURE-TABLE cell resolves EMPTY, no board here) — see [.agents/backend-matrix.md](../.agents/backend-matrix.md). The FRAMEWORK (arch-additivity seams) is done; the FAST-PATH kernel bodies are now scoped for **derive-and-ship** (the llama.cpp model) in [.agents/specs/cuda-arch-datacenter-fastpath.md](../.agents/specs/cuda-arch-datacenter-fastpath.md). The CUTLASS C3x / NVFP4-tcgen05 / grouped-MoE / MLA kernels are CUTLASS template instantiations (the wgmma/tcgen05 MMA lives in cutlass 4.5.0, selected by `ArchTag`), so they are 1:1-portable and BUILD-VERIFIABLE here via a single-arch `90a`/`100a` cross-compile + `cuobjdump` SASS proof, with NO Hopper/B200 board. Such kernels will ship LABELED `DERIVED+BUILD-VERIFIED (testing-welcome)` — a faithful port with a compile+SASS proof, HONESTLY untested (a green link is not execution evidence); cloud-GPU token-exact + every-axis runs upgrade the label to runtime-verified. DeepGEMM (runtime JIT/autotune) is the one path that is `not-yet-buildable / needs-real-port` and ships no fake.
 
+**CUDA arch breadth beyond vLLM (Pascal / Volta / Turing), scoping only.** These
+are older NVIDIA arches vLLM DROPS but llama.cpp still supports, so this is a
+"support more than vLLM" lane with llama.cpp as both the kernel source and the
+competitor floor. Our portable attention uses bf16 tensor-core WMMA, which does
+not exist before Ampere, so these arches need a new fp16/non-tensor-core kernel
+body (ported 1:1 from llama.cpp's `fattn-tile`/`fattn-vec`). State: a committed
+scoping spike ([.agents/specs/cuda-arch-breadth-fp16.md](../.agents/specs/cuda-arch-breadth-fp16.md)),
+no code. The lane is derive-and-ship: **Turing (`sm_75`, e.g. the cloud-common
+T4) is buildable on our current CUDA 13 toolkit** once the bf16-WMMA path is
+compile-guarded and the fp16 body is ported, and would ship labeled
+"derived from llama.cpp, build-verified, not hardware-tested here, community
+testing welcome". **Volta (`sm_70`, V100) and Pascal (`sm_60`/`sm_61`, P100/P40)
+are not-yet-buildable** because CUDA 13 dropped their code generation and no
+CUDA 12.x toolkit is provisioned here. There is no vLLM oracle on these cards
+(vLLM will not run there), so a real correctness test uses llama.cpp on the same
+card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
+
 ## Serving and API notes
 
 - **Automatic prefix caching (APC)** is on by default for dense models (hybrid /
