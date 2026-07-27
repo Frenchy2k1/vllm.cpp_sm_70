@@ -261,11 +261,14 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 **Metal (Apple Silicon), indicative, not binding.** Two models run end to end
 and pass correctness (OPT-125m, Qwen3-0.6B); 18 of 75 ops are native, the rest
 fall back to CPU on unified memory. Kernel work including mma prefill attention
-(4.3x) puts warm b=1 throughput at 94.5% of MLX-LM. The residual is decode
-attention running at 24% of peak bandwidth; the decode hypotheses tested so far
-are refuted (the KV-layout and flash-decoding leads both closed), and a paired
-ABBA harness with cooldown now resolves differences down to about 0.2%, below
-the remaining gap. An optional MLX GEMM provider is available via
+(4.3x) and a vectorised decode V accumulation (+1.66%) puts warm b=1 throughput
+at 95.8% of MLX-LM. The V-accumulation win came from BISECTING the attention
+kernel once a paired ABBA harness with cooldown made 0.2% differences
+measurable: the V loop moved 2 bytes per lane per load where the score loop
+moved 8, giving 29 GB/s against 64 on identical traffic. That also explains why
+five earlier decode hypotheses (fusion, split-K, KV layout, threadgroup width,
+barrier depth) were each refuted — the limiter was bytes per instruction in one
+loop, not parallelism or layout. An optional MLX GEMM provider is available via
 `-DVLLM_CPP_MLX=ON` and currently measures net slower than our own kernels. Full
 per-lever chronology: [docs/BENCHMARKS.md](BENCHMARKS.md) and
 [.agents/specs/metal-dispatch-attribution.md](../.agents/specs/metal-dispatch-attribution.md).

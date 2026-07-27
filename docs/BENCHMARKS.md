@@ -2862,6 +2862,59 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Decode attention: VECTORISED V accumulation, +1.66% (2026-07-27)
+
+Found by BISECTING the kernel rather than guessing a sixth mechanism. Stubbing
+each half in turn (`VT_PA_BISECT`) at 2048 context, where decode attention costs
+5.79 ms/token:
+
+| component | cost | traffic | achieved |
+|---|--:|--:|--:|
+| **V accumulation** | **4.03 ms (70%)** | 117 MB | **29 GB/s** |
+| K / scores | 1.83 ms (30%) | 117 MB | **64 GB/s** |
+
+The parts sum to the whole (5.86 vs 5.79 measured). Identical traffic, 2.2x
+apart, and the cause is in the source: the score loop had a vectorised `ushort4`
+bf16 fast path and the V accumulation called scalar `vt_load` per element — 2
+bytes per lane per load against 8. The score loop's 64 GB/s also matches the
+bandwidth probe's 69, which is what makes V's 29 the outlier rather than the norm.
+
+**This retro-explains all five refuted hypotheses.** Fusion, split-K, layout,
+threadgroup width and barrier depth all failed because the limiter was never
+parallelism or layout — it was bytes-per-instruction in ONE loop.
+
+**Landed:** each thread owns four consecutive head elements via `ushort4`, with a
+scalar fallback for unaligned or non-bf16 caches. `VT_PA_VGROUPS` 4 -> 16,
+because a key-group now needs only d/4 = 32 threads.
+
+**The first version was measured SLOWER and the harness caught it**: leaving the
+cap at 4 ran 4x32 = 128 of a 512-thread group, quartering the workers while
+quadrupling bytes/load — paired verdict **-1.65%, consistent 6/6, p = 0.031**.
+Uncapping restores full occupancy AND the wider loads.
+
+**Paired verdict on the fix** (warm, p=512 g=128, 6 ABBA blocks):
+
+| block | A | B | delta |
+|---|--:|--:|--:|
+| 0 | 23.34 | 23.74 | +0.41 |
+| 1 | 23.39 | 23.76 | +0.37 |
+| 2 | 23.34 | 23.75 | +0.41 |
+| 3 | 23.32 | 23.75 | +0.43 |
+| 4 | 23.36 | 23.73 | +0.37 |
+| 5 | 23.38 | 23.74 | +0.36 |
+
+**+1.66% median, faster in 6/6 blocks, sign test p = 0.031.** Single runs also
+show decode 26.52 -> 27.07 at p=512 and 23.10 -> 24.60 at p=2048.
+
+Warm total **23.36 -> 23.74 against MLX-LM's 24.79: 94.5% -> 95.8%.**
+
+Correctness: the reordered V summation flips one near-tie (prompt[10] tok=10), so
+the Metal goldens were re-anchored through the oracle again — vLLM 0.25.0
+teacher-forced on the new sequence, **max gap 0.125 nats**, the same worst as the
+golden it replaces, 0 over bar, 0 outside top-K. 16/16 PASS.
+
+---
+
 ## The harness works: floor 10% -> 0.9%, and SIMD-first reductions are NEUTRAL (2026-07-27)
 
 First use of `scripts/metal-paired-ab.py`, and it validates itself. The baseline

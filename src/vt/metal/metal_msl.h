@@ -877,7 +877,14 @@ kernel void vt_reshape_and_cache(device const uchar* k    [[buffer(0)]],
 // sized at 2*d, so the d-parallel V loop left half the threads idle; splitting
 // the chunk's KEYS across `tg/d` groups puts them all to work. Capped so the
 // partial-accumulator tile stays small (4 * 256 floats = 4 KB).
-#define VT_PA_VGROUPS 4u
+// 16, raised from 4 WITH the vectorised V path. That path gives each thread four
+// consecutive head elements, so a key-group needs only d/4 = 32 threads; leaving
+// the cap at 4 would have run 4*32 = 128 of a 512-thread group, quartering the
+// active threads while quadrupling bytes per load. Measured that way it was 1.4%
+// SLOWER. At 16 the group is 16*32 = 512 threads — full occupancy AND 4x
+// bytes/load. pacc grows to 16 KB, taking this kernel to ~24 KB of the 32 KB
+// budget. The scalar path is unaffected: tg/d = 4 there regardless of the cap.
+#define VT_PA_VGROUPS 16u
 // Query tokens per threadgroup. With one threadgroup per (head, query token),
 // PREFILL re-reads the entire K/V range once per query: ~57 GB for a 512-token
 // prompt on this model, which is why prefill attention measured ~175 GFLOP/s
@@ -1344,20 +1351,59 @@ kernel void vt_paged_attention(device const uchar* q     [[buffer(0)]],
     // of the keys into its own partial, and the partials are summed once.
     // Adjacent threads still read adjacent elements of the same V row, so the
     // coalescing that made this loop cheap is preserved.
-    const uint ngrp = min(max(p.tg / p.d, 1u), VT_PA_VGROUPS);
-    const uint grp = min(tid / p.d, ngrp - 1u);
-    const uint ge = tid % p.d;
-    if (tid < ngrp * p.d) {
-      float s = 0.0f;
-      for (int idx = int(grp); idx < jc; idx += int(ngrp)) {
-        s += scores[idx] * vt_load(vc, p.vc_dt, vbases[idx] + ulong(ge));
+    // VECTORISED V. Bisecting this kernel (VT_PA_BISECT) showed the V
+    // accumulation costing 4.03 ms/token at 2048 context against the score
+    // pass's 1.83 for the SAME 117 MB of traffic — 29 GB/s versus 64. The score
+    // loop had a ushort4 bf16 fast path and this loop did not, so it moved 2
+    // bytes per lane per load where the other moved 8. Same fix, applied here:
+    // each thread owns FOUR consecutive head elements.
+    const uint dv = p.d >> 2u;  // threads per key-group in the vectorised path
+    const bool vvec = p.vc_dt == VT_DT_BF16 && (p.d & 3u) == 0u && p.tg >= dv;
+    if (vvec) {
+      const uint ngrp = min(max(p.tg / dv, 1u), VT_PA_VGROUPS);
+      const uint grp = min(tid / dv, ngrp - 1u);
+      const uint ge4 = (tid % dv) * 4u;
+      if (tid < ngrp * dv) {
+        float4 s = float4(0.0f);
+        for (int idx = int(grp); idx < jc; idx += int(ngrp)) {
+          const ulong vb = vbases[idx] + ulong(ge4);
+          const float w = scores[idx];
+          if ((vb & 3ul) == 0ul) {
+            const ushort4 vv = *((device const ushort4*)((device const ushort*)vc + vb));
+            s.x += w * vt_bf16_to_f32(vv.x);
+            s.y += w * vt_bf16_to_f32(vv.y);
+            s.z += w * vt_bf16_to_f32(vv.z);
+            s.w += w * vt_bf16_to_f32(vv.w);
+          } else {
+            s.x += w * vt_load(vc, p.vc_dt, vb + 0ul);
+            s.y += w * vt_load(vc, p.vc_dt, vb + 1ul);
+            s.z += w * vt_load(vc, p.vc_dt, vb + 2ul);
+            s.w += w * vt_load(vc, p.vc_dt, vb + 3ul);
+          }
+        }
+        pacc[grp * VT_PA_MAXD + ge4 + 0u] = s.x;
+        pacc[grp * VT_PA_MAXD + ge4 + 1u] = s.y;
+        pacc[grp * VT_PA_MAXD + ge4 + 2u] = s.z;
+        pacc[grp * VT_PA_MAXD + ge4 + 3u] = s.w;
       }
-      pacc[grp * VT_PA_MAXD + ge] = s;
+    } else {
+      const uint ngrp = min(max(p.tg / p.d, 1u), VT_PA_VGROUPS);
+      const uint grp = min(tid / p.d, ngrp - 1u);
+      const uint ge = tid % p.d;
+      if (tid < ngrp * p.d) {
+        float s = 0.0f;
+        for (int idx = int(grp); idx < jc; idx += int(ngrp)) {
+          s += scores[idx] * vt_load(vc, p.vc_dt, vbases[idx] + ulong(ge));
+        }
+        pacc[grp * VT_PA_MAXD + ge] = s;
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint ngrp_r = vvec ? min(max(p.tg / dv, 1u), VT_PA_VGROUPS)
+                             : min(max(p.tg / p.d, 1u), VT_PA_VGROUPS);
     for (uint e = tid; e < p.d; e += p.tg) {
       float tot = 0.0f;
-      for (uint gg = 0u; gg < ngrp; ++gg) { tot += pacc[gg * VT_PA_MAXD + e]; }
+      for (uint gg = 0u; gg < ngrp_r; ++gg) { tot += pacc[gg * VT_PA_MAXD + e]; }
       acc[e] += tot;
     }
     if (tid == 0u) { sh_l = sh_l * corr + lchunk; sh_m = mnew; }
