@@ -2862,6 +2862,39 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## The fused attention preamble: scoped precisely (2026-07-27)
+
+Correcting the entry below, which said `kAttnQkNormRopeGate` is "CUDA only" and
+Metal falls back. True, but that is the GATED recipe used by the Qwen3.5
+full-attention path. **Qwen3 DENSE — the model being benchmarked — uses the
+gate-free `kAttnQkNormRope`, and that recipe carries `fast_op = kNoFastOp`: no
+fused kernel exists on ANY backend, by design.**
+
+`include/vt/recipes.h` states why: "Tier: composite-only (per-head 3-D rope
+operands are outside the generic 2-D Tier-1 interpreter)." So the composite
+faithfully dispatches the three standalone ops, which is exactly what the decode
+profile shows — 56 q-norm + 56 k-norm + 28 rope per token.
+
+**This makes the work larger than the previous entry implied.** It is not
+"register the existing CUDA kernel for Metal"; there is no kernel to register.
+The task is:
+
+1. a new standalone op (RMSNorm(q) + RMSNorm(k) + partial NeoX RoPE, per head,
+   from a cos/sin cache),
+2. a CPU reference so the parity gate has a golden,
+3. a Metal kernel,
+4. `fast_op` set on the recipe so `vt::FusedChain` routes to it,
+5. tests, plus a probable Metal golden re-anchor (RoPE after an in-place norm
+   changes nothing numerically, but the fused kernel's accumulation order might).
+
+Sizing is unchanged: 84 dispatches/token collapse to 28, worth ~0.38 ms/token
+against a 0.7 ms/token deficit. The recipe's byte-exact composite golden is
+already specified in recipes.h, which makes step 2 tractable.
+
+**Still a hypothesis with arithmetic, not a measured result.**
+
+---
+
 ## CORRECTION: fusion was dismissed on a bad inference, and IS the decode lever
 
 Earlier in this log I wrote that decode's residual could not be fusion "because

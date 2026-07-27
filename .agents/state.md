@@ -27610,3 +27610,39 @@ and concluding about another (in-kernel launch cost). It survived three
 experiments because each new result was read as confirming "not fusion" rather
 than re-examining why fusion had been excluded. When several hypotheses in a row
 fail, re-audit the one that was ruled out FIRST.
+
+---
+
+## 2026-07-27 — fused attention preamble: scoped precisely (larger than I said)
+
+**Correcting my own previous entry.** I wrote that `kAttnQkNormRopeGate` is "CUDA
+only" and Metal falls back, implying the fix is a Metal registration. That recipe
+is the GATED one, used by the Qwen3.5 full-attention path.
+
+**Qwen3 DENSE — the benchmarked model — uses the gate-free `kAttnQkNormRope`, and
+that recipe has `fast_op = kNoFastOp`. No fused kernel exists on ANY backend.**
+recipes.h says why: "composite-only (per-head 3-D rope operands are outside the
+generic 2-D Tier-1 interpreter)". The composite faithfully dispatches three
+standalone ops, which is exactly the 56 q-norm + 56 k-norm + 28 rope per token
+the decode profile shows.
+
+**Revised scope — write a kernel, do not port one:**
+1. new standalone op: per-head RMSNorm(q) + RMSNorm(k) + partial NeoX RoPE from a
+   cos/sin cache;
+2. CPU reference (the byte-exact composite golden is already SPECIFIED in
+   recipes.h, which makes this tractable);
+3. Metal kernel;
+4. set `fast_op` so `vt::FusedChain` routes to it;
+5. tests + probable Metal golden re-anchor (the fused accumulation order may move
+   a near-tie, as two of this session's three kernels did).
+
+Sizing unchanged: 84 dispatches/token -> 28, ~0.38 ms/token against a 0.7 ms/token
+deficit. So it is over half the decode gap and NOT the whole of it;
+`vt_silu_and_mul` and `vt_reshape_and_cache` (28 each, launch-dominated) are the
+follow-ons.
+
+**Hypothesis with arithmetic, not a measured result.** Handing over at a clean
+boundary rather than starting a multi-hour kernel and leaving it half-done: the
+diagnosis, the sizing, the exact call site
+(`include/vllm/model_executor/models/dense_attn_block.h:412`) and the golden
+definition are all recorded.
