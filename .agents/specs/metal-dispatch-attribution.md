@@ -325,6 +325,42 @@ threadgroup memory as f32, doubling LDS traffic for bf16 operands. A
 dtype-specialised staging path (vector loads, no per-element switch) is the next
 hypothesis, and it is the SAME hypothesis as the decode GEMV's.
 
+### GEMM roofline: the kernel is 3x off MLX, measured in isolation
+
+**The decisive diagnostic for the parity goal.** End-to-end deltas could not say
+whether the mm kernel or its surroundings were at fault, so it was timed in
+ISOLATION at the model's real prefill shapes, against MLX's steel GEMM in the
+SAME binary through the provider seam (`VT_MM_BENCH=1`, opt-in microbenchmark in
+`tests/vt/test_metal_backend.cpp`).
+
+| shape | ours | MLX steel | ratio |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 990 GFLOP/s | 2640 | **2.7x** |
+| mlp-up 512x2048x6144 | 1019 | 3325 | **3.3x** |
+| mlp-dn 512x6144x2048 | 1002 | 3293 | **3.3x** |
+
+Ours sits at **~1.0 TFLOP/s, ~23% of the M4's ~4.3 TFLOPS fp32 peak**; MLX is at
+**~77%**. **The gap is inside our kernel**, not in dispatch, staging branches,
+barriers or tile width, all of which were separately measured and excluded.
+
+**A note that reframes the MLX provider.** MLX's raw GEMM is 3x ours, yet
+enabling the MLX provider end to end measured NO faster (12.21 s vs 12.17 s at
+b=1). Those two facts together locate the provider's cost precisely: study §5.2's
+correction says `Matmul::eval_gpu` re-`set_data`s its output from MLX's own
+allocator, so every delegated GEMM pays an O(M*N) copy back plus its own
+commit+wait. At prefill shapes that output is megabytes per call. **Fixing the
+provider's output path may be worth more than rewriting our kernel**, and it is
+now the cheaper of the two routes to prefill parity.
+
+**Dead end recorded — bfloat simdgroup matrices are NOT available.** The obvious
+fix, and what MLX does, is to keep operands in bf16 through the mma instead of
+expanding to f32 in threadgroup memory (half the LDS traffic, faster mma).
+Attempted and it does not compile: `simdgroup_load` has no overload for a bfloat
+matrix on this toolchain (`no matching function for call to 'simdgroup_load'`,
+runtime MSL compile). MSL's simdgroup_matrix supports half and float only.
+Staging as `half` would work but is REFUSED: half saturates at 65504 and
+activation outliers can exceed it, which trades a correctness hazard for speed.
+
 ### Risks/decisions
 
 - **Batching changes failure semantics (accepted, mitigated).** Today a failed
