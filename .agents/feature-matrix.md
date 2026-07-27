@@ -168,7 +168,7 @@ is configured, exactly as upstream loads its draft model on demand.
 |---|---|---|---|---|
 | `/v1/chat/completions` + `/v1/completions` (SSE streaming) | `entrypoints/openai/` | `ANCHOR-BACKFILL` T0 | basic transport/framing plus W2 live incremental AsyncLLM delivery and disconnect abort are CPU/TSan-proven; full protocol and GB10 online gates remain in leaf rows | `planned: specs/chat-completions-endpoints.md` |
 | `/v1/models`, `/health`, `/version` | same | `PARTIAL` T0 | routes work; `/health` always returns 200 instead of checking engine health | `planned: specs/models-health-version.md` |
-| **`/metrics` Prometheus, names 1:1** (`vllm:*`) | `v1/metrics/` | `ACTIVE` T0-core | **LANDED + CPU-GATED 2026-07-27 (`SERVE-METRICS`, `CLAIM-ROADMAP-C8`):** self-contained Prometheus registry + text-0.0.4 exposition + the always-on vLLM metric catalog (`PrometheusStatLogger`, names/help/type/buckets/`{model_name,engine}` labels 1:1) + `GET /metrics`; gated by the vLLM scrape spec `EXPECTED_METRICS_V1` (substring, RED-first). Residual: live-engine per-step wiring + config-gated families | [specs/prometheus-metrics.md](specs/prometheus-metrics.md) |
+| **`/metrics` Prometheus, names 1:1** (`vllm:*`) | `v1/metrics/` | `ACTIVE` T0-core | **LANDED + CPU-GATED 2026-07-27 (`SERVE-METRICS`, `CLAIM-ROADMAP-C8`):** self-contained Prometheus registry + text-0.0.4 exposition + the always-on vLLM metric catalog (`PrometheusStatLogger`, names/help/type/buckets/`{model_name,engine}` labels 1:1) + `GET /metrics`; gated by the vLLM scrape spec `EXPECTED_METRICS_V1` (substring, RED-first). **Live per-step wiring LANDED 2026-07-27 (`CLAIM-ROADMAP-C8-METRICS-WIRE`):** `Scheduler::make_stats()` + `OutputProcessor`-built `IterationStats` fold into the logger at the `LLMEngine` step site (`llm_engine.py:308-329`), so a scrape returns LIVE counts; behavioural CPU gate drives the reference engine for several steps (RED-first, 14 asserts flip 0→correct); default (no-logger) path byte-identical. Residual: AsyncLLM serving-path wiring + config-gated families + per-request event timing (`SERVE-RESPONSE-METRICS`) | [specs/prometheus-metrics.md](specs/prometheus-metrics.md) |
 | Per-request timing metrics in chat/completion response bodies | `entrypoints/generate/base/serving.py`, OpenAI protocols/serving | ☐ T1 | v0.25.0 opt-in surface for TTFT/prefill/decode timing, streaming/non-streaming and invalid multi-output suppression; inventory row `SERVE-RESPONSE-METRICS` | `planned: specs/per-request-response-metrics.md` |
 | `stream_options` / `include_usage` | `engine/protocol.py`, completion/chat `protocol.py` + `serving.py`, `serve/utils/api_utils.py` | 🚧 **GATING** T1 | native-ID final/continuous completion+chat frames, non-stream validation and force mode are implemented; CPU 105/105, focused ASan+UBSan 3/3 and TSan 1/1 pass. Fresh merged-SHA 27B→35B online evidence remains before `DONE` | [stream-options.md](specs/stream-options.md) |
 | `/tokenize`, `/detokenize`, `/ready`, `/ping`, `/server_info`, `/reset_prefix_cache` | various routers | `ACTIVE` T1 | **LANDED + CPU-GATED 2026-07-27 (`SERVE-UTILITY-ENDPOINTS`, `CLAIM-ROADMAP-C8`):** `/tokenize` (prompt form) + `/detokenize` + `/ping` + `/server_info` + `/reset_prefix_cache` (injected callback), all additive/opt-in on the ApiServer, schema-matched to vLLM 0.26. Residual: chat-form `/tokenize`, `/tokenizer_info`, `/ready`, full server_info config dump | [specs/utility-endpoints.md](specs/utility-endpoints.md) |
@@ -248,6 +248,10 @@ evidence.
    plus the roadmap, README, inventory, ledger and state updates in the same
    change. Legacy emoji rows are migrated by the anchor-backfill workstream.
 
-Currently open T0 debt (pre-existing, tracked): `/metrics` core set (§9),
-`SERVE-GATE-ONLINE`, and `SERVE-E2E-NIGHTLY`. GGUF real-file parity A2 passed;
-its remaining format/model breadth stays tracked in §5/§13.
+Currently open T0 debt (pre-existing, tracked): `SERVE-GATE-ONLINE` and
+`SERVE-E2E-NIGHTLY`. The `/metrics` core set (§9) is RETIRED — the catalog landed
+(`SERVE-METRICS`) and the live per-step values are now wired into the registry at
+the engine step site (behavioural CPU gate, 2026-07-27); the residual AsyncLLM
+serving-path wiring + config-gated families are tracked on the `SERVE-METRICS` row.
+GGUF real-file parity A2 passed; its remaining format/model breadth stays tracked
+in §5/§13.

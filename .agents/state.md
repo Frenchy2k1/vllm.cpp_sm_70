@@ -26473,3 +26473,64 @@ assembly hooks above); JSON-schema arg-type coercion; `SERVE-RESPONSE-METRICS`
   chat-form `/tokenize`.
 - **2026-07-27** — **ROAD-V1-MM speed lever #3 decode-kernel efficiency: the audio ~20 ms/tok residual ATTRIBUTED to ONE kernel + a teacher-force-VALIDATED bf16 near-tie ceiling; RECORDS-ONLY** (`CLAIM-MM-SPEED-DECODE-KERN`; base local `main` `bbcaedd0` = the §10 W1 HEAD; dgx GB10 `~/work/mm-audio-kern`, cutlass 4.5.0 + FA2 + Triton-AOT arch 121a, GPU under `flock /tmp/gpu` sole owner; teacher-force oracle `~/venvs/vllm-oracle-v0.25.0-stage` = vLLM 0.25.0). Closed §10's follow-on (nsys our graphed Voxtral decode step vs vLLM's). **ATTRIBUTION (nsys graph-node trace):** the whole ~20 ms/tok residual is the decode ATTENTION — the naive scalar `PagedAttentionKernel` (1410 inst = 30 layers × 47 steps @ **723 µs/call = 21.7 ms/step**, ~120× the KV floor), NOT the GEMMs (cuBLAS `gemvx`, near-BW-floor, == vLLM's decode `F.linear`), lm_head (~BW floor), or norm/rope/silu glue (<0.3 ms/step, already FusedChain-folded). **LEVER (already in-binary, gated off by a block_size quirk):** Voxtral (hd128, GQA 32q/8kv bf16 causal) matches the DEFAULT-ON `fa2_decode_qwen3` path (our 1:1 `flash_attn_varlen_func` split-KV decode, `flash_fwd_splitkv`) EXCEPT it needs `block_size % 16 == 0`, and the driver's single KV block (444) isn't ÷16 → decode fell to the scalar fallback. `block_size÷16` routes decode through FA2 (nsys confirms: `flash_fwd_splitkv` 1410 @ 18.5 µs = 0.65 ms/step, **39× faster**). **A/B (throwaway same-binary, steady-state, 4 reps rep0 dropped):** byte-exact NAIVE **59.4 ms/tok** (`repro` 48/48) vs FA2 **38.2 ms/tok** (`repro` 18/48) = **−21.2 ms (~36%), NON-OVERLAPPING; 38.2 = 0.94× vLLM 40.8 ms — BEATS parity.** **CEILING:** FA2's reduction-order change flips the committed near-tie golden's pos-33 EXACT-tie branch (`repro` 48→18) → `repro==48` FAILS (RED line forbids touching the golden). But the FA2 sequence is FULLY VALID — teacher-force vLLM 0.25.0: **0 divergences, worst gap 0.0000 nats, PASS** (a different-but-equal greedy branch, not a bug). So it is a bf16 near-tie / golden-pinning ceiling; NO byte-exact faster decode-attention kernel exists. **RECORDS-ONLY** (no code change): shipped byte-exact scalar path re-verified `test_voxtral_e2e` **14/14** on a clean rebuild, goldens md5 unchanged. Recommended follow-on (needs user OK on golden policy): regenerate `voxtral_neartie.json::our_tokens` from the FA2 sequence (teacher-force already PASSES) + land `block_size÷16` → claims a validated ~36% audio-decode win that BEATS vLLM. Records: multimodal-speed.md §11 (+ headline pointer), engine `ENG-MM-AUDIO-E2E` + model/feature matrices + roadmap + completion-spec MM lines (by-key), README/BENCHMARKS, ledger, this entry, coordination CLAIM. Record checkers RC green. mm rows stay `PARTIAL`. Not pushed; FULL SHA reported.
 - **Next (audio, after the ceiling record):** the audio 1.49× gap is now a FULLY-CHARACTERIZED, teacher-force-VALIDATED bf16 near-tie ceiling — the win (FA2 decode, 38.2 ms, BEATS vLLM) is one `block_size÷16` + a golden regen away (USER DECISION: adopt FA2 decode as the Voxtral default and regenerate `voxtral_neartie.json`?). Beyond that: W2 batched multi-seq mm decode (S>1 / c2+); W3 `image_url`/`audio_url` serving ingestion for the production-serving A/B.
+
+---
+
+## 2026-07-27 — ROAD-V1-C8 `SERVE-METRICS` LIVE PER-STEP STAT WIRING LANDED + CPU-GATED (`CLAIM-ROADMAP-C8-METRICS-WIRE`) — oldest T0 metrics debt RETIRED
+
+**What/why.** `SERVE-METRICS` had landed the Prometheus registry + text-0.0.4
+exposition + the always-on vLLM metric CATALOG + `PrometheusStatLogger::Record`,
+but nothing computed the per-step stats or CALLED `Record`, so a `/metrics`
+scrape returned the primed schema (all zeros), not live counts. This wires the
+live values in, making the endpoint functional.
+
+**Scope gap (grounded).** OUR tree: `EngineCoreOutputs` had no `scheduler_stats`
+(`include/vllm/v1/engine/types.h`); no `Scheduler::make_stats()`; `process_outputs`
+carried a `// 1) Compute stats — deferred (no IterationStats at T0)` comment
+(`src/vllm/v1/engine/output_processor.cpp`); `LLMEngine::step()` never touched a
+logger (`src/vllm/v1/engine/llm_engine.cpp`). vLLM: `scheduler.py:2399-2436`
+(`make_stats`), `stats.py:377-475` (`IterationStats.update_from_output` /
+`update_from_finished_request`), `llm_engine.py:308-329` (build IterationStats +
+`logger_manager.record` guarded by `len(outputs.outputs)>0`).
+
+**Wired (metric-for-metric, 1:1 from vLLM).**
+- `Scheduler::make_stats()` → `SchedulerStats{num_running, num_waiting,
+  kv_cache_usage, prefix_cache_stats}` (`scheduler.py:2399-2436`). The per-step
+  prefix-cache delta is STASHED by `schedule()` (which already drains
+  `make_prefix_cache_stats()` into the CachingMetrics window) so there is no
+  second take-and-swap; the window non-logging callers read is unchanged.
+- `EngineCoreOutputs` gains `scheduler_stats` + a stamped monotonic `timestamp`,
+  both filled in `EngineCore::step()`.
+- `OutputProcessor::process_outputs(..., IterationStats*)` builds the stats in
+  the per-output loop: prompt/generation/iteration token counts, TTFT (prefill:
+  `timestamp-arrival_time`) / ITL (decode: `timestamp-last_token_ts`) samples,
+  and finished-request breakdowns (e2e/decode/TPOT + finish_reason via
+  `FinishReasonToString`) off new `RequestState` timing (`arrival_time` stamped
+  at `FromNewRequest` from new `MonotonicSeconds()` in `stats.h`). Null pointer
+  ⇒ byte-identical no-stats branch (default path untouched).
+- `LLMEngine::set_stat_logger()` (opt-in, null default) + step-site
+  `stat_logger_->Record(scheduler_stats, iteration_stats)` guarded by outputs>0
+  (`llm_engine.py:308-329`). The Record mapping (loggers.cpp) was already ported.
+
+**Gate (RED-first, behavioural, CPU).** NEW `test_llm_engine.cpp` case 6, **44
+assertions**: drives the CPU reference `LLMEngine` for several real steps with 2
+concurrent requests, scrapes `logger.Expose()`, asserts values evolve — prefill
+`num_requests_running==2`,`prompt_tokens_total==2`,`generation_tokens_total==2`,
+TTFT `_count==2`; final `generation_tokens_total==2*kN` (== summed output ids),
+`request_success_total{finished_reason="length"}==2`, gauges→0, histogram counts
+TTFT==2 / ITL==2*(kN-1) / e2e==2 / TPOT==2 / iteration>=1. **RED:** with `Record`
+disabled, 14 asserts fail (all live values 0 — `prompt_tokens_total 0!=2`,
+`generation_tokens_total 0!=8`, histograms `_count 0`); restored → 44/44.
+
+**Inertness.** No-logger path builds no IterationStats + byte-identical
+`process_outputs`; the 5 pre-existing `test_llm_engine` determinism cases stay
+green (greedy token stream unchanged); scheduler stash is a copy
+(`test_prefix_cache_stats` 12/12 unchanged). Catalog gate `test_prometheus_metrics`
+4/4 (81) + `test_openai_api_server` 26/26 UNCHANGED (exposition format untouched).
+Clean full-`vllm` CPU `-Werror` rebuild 0 warnings; full CPU ctest green.
+
+**Residual (C8 stays PARTIAL).** AsyncLLM production-serving metric wiring;
+config-gated metric families (spec-decode/kv-connector/mm/LoRA); per-request
+queue/prefill/inference timing + preemption counter (EngineCoreEvents deferred →
+`SERVE-RESPONSE-METRICS`); chat-form `/tokenize`; JSON-schema arg coercion.
+Base `main` `6bde6b88`; NOT pushed; FULL SHA reported to the dispatcher.

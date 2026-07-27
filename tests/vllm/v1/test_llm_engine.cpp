@@ -51,6 +51,9 @@
 #include "vllm/v1/engine/core.h"
 #include "vllm/v1/engine/input_processor.h"
 #include "vllm/v1/engine/output_processor.h"
+#include "vllm/v1/metrics/loggers.h"
+#include "vllm/v1/metrics/prometheus.h"
+#include "vllm/v1/metrics/stats.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/worker/gpu/runner.h"
@@ -81,6 +84,7 @@ using vllm::v1::MambaSpec;
 using vllm::v1::OutputProcessor;
 using vllm::v1::Scheduler;
 using vllm::v1::sha256_cbor;
+using vllm::v1::metrics::PrometheusStatLogger;
 using vt::DType;
 
 namespace {
@@ -358,6 +362,27 @@ struct Harness {
   LLMEngine engine;
 };
 
+// The {model_name, engine} label suffix every series carries for model "m".
+constexpr const char* kL = "{model_name=\"m\",engine=\"0\"}";
+
+// Parse the scalar a Prometheus text line carries: find "<series> " and read the
+// value to end of line. `series` is the full "name{labels}" (or a
+// histogram/counter suffixed name). Fails the test if the series is absent.
+double MetricValue(const std::string& text, const std::string& series) {
+  const std::string needle = series + " ";
+  const size_t p = text.find(needle);
+  REQUIRE_MESSAGE(p != std::string::npos, "series absent: " << series);
+  const size_t v = p + needle.size();
+  const size_t e = text.find('\n', v);
+  return std::stod(text.substr(v, e - v));
+}
+
+// The observation count of a histogram family (its _count series).
+int64_t HistogramCount(const std::string& text, const std::string& name) {
+  return static_cast<int64_t>(
+      MetricValue(text, name + "_count" + std::string(kL)));
+}
+
 }  // namespace
 
 // ─── 1. Greedy determinism + termination ─────────────────────────────────────
@@ -552,4 +577,92 @@ TEST_CASE("llm_engine: a stop string ends the request through the full loop") {
   CHECK(h.scheduler.get_num_unfinished_requests() == 0);
   // Output truncated before the stop string (include_stop_str_in_output=false).
   CHECK(result.outputs[0].text.find(stop) == std::string::npos);
+}
+
+// ─── 6. Live per-step metrics feed the Prometheus registry (SERVE-METRICS) ────
+// The step loop folds this step's SchedulerStats + IterationStats into the
+// attached PrometheusStatLogger (llm_engine.py:308-329). Before this wiring the
+// registry stayed primed at zero forever (a scrape returned the schema, not the
+// counts). This drives the CPU reference engine for several real steps and
+// asserts the LIVE values are correct and evolve.
+TEST_CASE("llm_engine: live per-step stats populate the Prometheus registry") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 4;  // max_tokens per request (length stop).
+
+  Harness h(c, w, tok);
+  PrometheusStatLogger logger("m", kMaxModelLen);
+  h.engine.set_stat_logger(&logger);
+
+  const std::string kRun = std::string("vllm:num_requests_running") + kL;
+  const std::string kWait = std::string("vllm:num_requests_waiting") + kL;
+  const std::string kPrompt = std::string("vllm:prompt_tokens_total") + kL;
+  const std::string kGen = std::string("vllm:generation_tokens_total") + kL;
+  const std::string kSuccessLen =
+      "vllm:request_success_total{model_name=\"m\",engine=\"0\",finished_reason="
+      "\"length\"}";
+
+  // Baseline: primed at zero, no histogram observations — exactly the state a
+  // scrape saw when the step site never recorded (the pre-wiring behaviour).
+  {
+    const std::string t = logger.Expose();
+    CHECK(MetricValue(t, kPrompt) == 0.0);
+    CHECK(MetricValue(t, kGen) == 0.0);
+    CHECK(HistogramCount(t, "vllm:time_to_first_token_seconds") == 0);
+    CHECK(HistogramCount(t, "vllm:e2e_request_latency_seconds") == 0);
+  }
+
+  h.engine.add_request("A", "hello", Greedy(kN));
+  h.engine.add_request("B", "hello", Greedy(kN));
+
+  // Step 1 = prefill: both requests enter the running batch and emit their first
+  // token. Gauges track the batch; prompt tokens (1 per "hello") are counted and
+  // one TTFT sample is observed per request.
+  std::map<std::string, RequestOutput> finished;
+  for (RequestOutput& o : h.engine.step()) {
+    if (o.finished) finished[o.request_id] = o;
+  }
+  {
+    const std::string t = logger.Expose();
+    CHECK(MetricValue(t, kRun) == 2.0);
+    CHECK(MetricValue(t, kWait) == 0.0);
+    CHECK(MetricValue(t, kPrompt) == 2.0);   // 1 token per "hello" x2 prefilled.
+    CHECK(MetricValue(t, kGen) == 2.0);      // first token per request.
+    CHECK(HistogramCount(t, "vllm:time_to_first_token_seconds") == 2);
+    CHECK(HistogramCount(t, "vllm:inter_token_latency_seconds") == 0);
+  }
+
+  // Drive to completion.
+  while (h.engine.has_unfinished_requests()) {
+    for (RequestOutput& o : h.engine.step()) {
+      if (o.finished) finished[o.request_id] = o;
+    }
+  }
+  REQUIRE(finished.size() == 2);
+
+  int64_t total_gen = 0;
+  for (const auto& kv : finished) {
+    total_gen += static_cast<int64_t>(kv.second.outputs[0].token_ids.size());
+  }
+  CHECK(total_gen == 2 * kN);  // deterministic greedy, length-stopped.
+
+  const std::string t = logger.Expose();
+  // Token counters == the EXACT counts the run produced.
+  CHECK(MetricValue(t, kPrompt) == 2.0);
+  CHECK(MetricValue(t, kGen) == static_cast<double>(total_gen));
+  // Both requests finished with the "length" reason.
+  CHECK(MetricValue(t, kSuccessLen) == 2.0);
+  // All requests drained: the gauges fall back to zero.
+  CHECK(MetricValue(t, kRun) == 0.0);
+  CHECK(MetricValue(t, kWait) == 0.0);
+  // Histogram sample counts: TTFT once per request; ITL once per decode token
+  // (kN-1 per request, the first token being the prefill TTFT); e2e + TPOT once
+  // per finished request; iteration-tokens observed on at least the prefill step.
+  CHECK(HistogramCount(t, "vllm:time_to_first_token_seconds") == 2);
+  CHECK(HistogramCount(t, "vllm:inter_token_latency_seconds") == 2 * (kN - 1));
+  CHECK(HistogramCount(t, "vllm:e2e_request_latency_seconds") == 2);
+  CHECK(HistogramCount(t, "vllm:request_time_per_output_token_seconds") == 2);
+  CHECK(HistogramCount(t, "vllm:iteration_tokens_total") >= 1);
+  CHECK(HistogramCount(t, "vllm:request_generation_tokens") == 2);
 }

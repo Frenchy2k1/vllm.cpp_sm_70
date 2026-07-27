@@ -63,6 +63,10 @@
 #include "vllm/v1/engine/input_processor.h"
 #include "vllm/v1/engine/output_processor.h"
 
+namespace vllm::v1::metrics {
+class PrometheusStatLogger;
+}  // namespace vllm::v1::metrics
+
 namespace vllm::v1 {
 
 // The synchronous offline LLMEngine (T0 subset). Holds non-owning references to
@@ -136,11 +140,22 @@ class LLMEngine {
     return engine_core_.prefix_cache_metrics();
   }
 
+  // Attach the Prometheus stat logger the step loop records into (llm_engine.py
+  // stat_loggers / StatLoggerManager). Non-owning; must outlive the engine. Null
+  // (the default) leaves the step loop's stats path fully inert — no IterationStats
+  // is built, process_outputs runs its byte-identical no-stats path, and the
+  // SACRED greedy token stream is untouched. Mirrors upstream's log_stats gate.
+  void set_stat_logger(metrics::PrometheusStatLogger* logger) {
+    stat_logger_ = logger;
+  }
+
  private:
   InputProcessor& input_processor_;
   EngineCore& engine_core_;
   OutputProcessor& output_processor_;
   BlockHasher block_hasher_;
+  // Opt-in metrics sink (llm_engine.py logger_manager). Null => stats disabled.
+  metrics::PrometheusStatLogger* stat_logger_ = nullptr;
 };
 
 }  // namespace vllm::v1

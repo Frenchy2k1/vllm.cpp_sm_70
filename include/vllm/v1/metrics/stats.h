@@ -38,6 +38,7 @@
 #ifndef VLLM_V1_METRICS_STATS_H_
 #define VLLM_V1_METRICS_STATS_H_
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -45,6 +46,18 @@
 #include <vector>
 
 namespace vllm::v1 {
+
+// Seconds from a steady monotonic clock. The engine stamps EngineCoreOutputs
+// with this (upstream: time.monotonic() in EngineCoreOutputs.__post_init__) and
+// RequestState records arrival time from the same clock, so the TTFT / ITL /
+// e2e intervals IterationStats derives are always non-negative. Wall-clock vs
+// monotonic is elided (a single steady clock) — the intervals, not absolute
+// timestamps, are what the histograms observe.
+inline double MonotonicSeconds() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // Upstream: @dataclass BaseCacheStats (vllm/v1/metrics/stats.py:18-32).
 struct BaseCacheStats {

@@ -56,6 +56,7 @@
 
 #include "vllm/multimodal/inputs.h"  // multimodal::MultiModalFeatureSpec (mm seam)
 #include "vllm/sampling_params.h"
+#include "vllm/v1/metrics/stats.h"  // vllm::v1::SchedulerStats (per-step stats)
 #include "vllm/v1/outputs.h"  // vllm::v1::LogprobsTensors (SamplerOutput payload)
 #include "vllm/v1/request.h"  // vllm::v1::FinishReason (reused, not redefined)
 
@@ -179,8 +180,15 @@ struct EngineCoreOutputs {
   // [num_reqs]
   std::vector<EngineCoreOutput> outputs;
   // Monotonic timestamp; upstream __post_init__ stamps time.monotonic() when
-  // left at 0.0 — deferred (the frontend sets it), default preserved.
+  // left at 0.0. EngineCore::step() stamps it (the engine_core_timestamp the
+  // frontend threads into IterationStats.update_from_output for TTFT/ITL).
   double timestamp = 0.0;
+  // This step's scheduler snapshot (running/waiting/kv-usage + the per-step
+  // prefix-cache delta). Upstream: EngineCoreOutputs.scheduler_stats
+  // (vllm/v1/engine/__init__.py), filled by Scheduler.make_stats()
+  // (vllm/v1/core/sched/scheduler.py:2399-2436). Default-constructed (all zero)
+  // on the no-stats path so it is inert unless a stat logger consumes it.
+  SchedulerStats scheduler_stats;
 };
 
 }  // namespace vllm::v1

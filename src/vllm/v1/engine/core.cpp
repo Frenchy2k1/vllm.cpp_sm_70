@@ -77,6 +77,12 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
   // so the entry is present iff there are token outputs.
   EngineCoreOutputs engine_core_outputs =
       scheduler_.update_from_output(scheduler_output, *model_output);
+  // Attach this step's scheduler snapshot + the engine_core_timestamp the
+  // frontend threads into IterationStats for TTFT/ITL (core.py builds
+  // EngineCoreOutputs(scheduler_stats=scheduler.make_stats(), timestamp=...)).
+  // Inert on the no-logger path (the frontend never reads it).
+  engine_core_outputs.scheduler_stats = scheduler_.make_stats();
+  engine_core_outputs.timestamp = MonotonicSeconds();
   std::map<int, EngineCoreOutputs> outputs_by_client;
   if (!engine_core_outputs.outputs.empty()) {
     const int client_index = engine_core_outputs.engine_index;

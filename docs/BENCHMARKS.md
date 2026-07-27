@@ -25,11 +25,29 @@ The gate is metric-NAME + label-schema + endpoint-schema parity vs vLLM
 assertions, the `EXPECTED_METRICS_V1` substring scrape gate RED-first) and
 `test_openai_api_server` 26/26 (297 assertions, 4 new utility cases). Inertness:
 opt-in, existing serving byte-identical (the 22 pre-existing api_server cases
-stay green). The `/metrics` exposition currently reports the registered families
-at their primed zero (or values folded via `record()` in tests); wiring the live
-per-step engine values is the recorded residual. Reproduce:
+stay green). Reproduce:
 `cmake --build build-cpu --target test_prometheus_metrics test_openai_api_server &&
 ./build-cpu/tests/test_prometheus_metrics && ./build-cpu/tests/test_openai_api_server`.
+
+**ROAD-V1-C8 /metrics LIVE per-step wiring (2026-07-27,
+`CLAIM-ROADMAP-C8-METRICS-WIRE`, NOT pushed).** Disposition: **NOT APPLICABLE (no
+throughput number, `benchmark_binding=false`; metrics are observational, off the
+compute path).** The oldest T0 metrics debt is now retired: the `/metrics`
+endpoint serves LIVE per-step values, not the primed schema. `EngineCoreOutputs`
+carries `scheduler_stats` (new `Scheduler::make_stats()`) plus a stamped
+timestamp; `OutputProcessor` builds `IterationStats` (token counts, TTFT/ITL
+samples, finished-request breakdowns); the sync `LLMEngine` step folds both into
+the attached Prometheus logger. Behavioural CPU gate: `test_llm_engine.cpp` case
+6 (44 assertions) drives the reference engine for several steps and asserts the
+live values evolve (running/waiting gauges track the batch, prompt/generation
+counters match the exact token counts, request-success counts finished requests,
+TTFT/ITL/e2e/TPOT histograms observe the right sample counts). RED-first: with
+the record call disabled, 14 assertions fail (values stay zero); restoring gives
+44/44. Inertness: the default no-logger path is byte-identical (the 5 existing
+`test_llm_engine` determinism cases and the `test_prometheus_metrics` catalog
+gate stay green). Residual: the AsyncLLM production-serving wiring and the
+config-gated metric families (spec-decode, kv-connector, mm, LoRA). Reproduce:
+`cmake --build build-cpu --target test_llm_engine && ./build-cpu/tests/test_llm_engine`.
 
 **ROAD-V1-C8 unified streaming parser engine (2026-07-27, `CLAIM-ROADMAP-C8-PARSER`,
 NOT pushed).** Disposition: **CORRECTNESS gate, no throughput number

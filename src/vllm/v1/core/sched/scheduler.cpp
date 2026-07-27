@@ -488,6 +488,14 @@ SchedulerOutput Scheduler::schedule() {
   // history out of the window.
   if (auto stats = kv_cache_manager->make_prefix_cache_stats()) {
     prefix_cache_metrics_.observe(*stats);
+    // Stash the SAME per-step delta so make_stats() can hand it to the
+    // Prometheus logger without a second take-and-swap (which would return an
+    // empty observation). scheduler.py builds SchedulerStats from this delta.
+    last_prefix_cache_stats_ = *stats;
+  } else {
+    // No observation this step (prefix caching off): make_stats() must not
+    // re-report the prior step's delta.
+    last_prefix_cache_stats_ = PrefixCacheStats{};
   }
 
   // KV-OFFLOAD W4: build_connector_meta drains + RESETS the connector's per-step
@@ -862,6 +870,20 @@ std::pair<int, int> Scheduler::get_request_counts() const {
 
 bool Scheduler::has_finished_requests() const {
   return !finished_req_ids.empty();
+}
+
+SchedulerStats Scheduler::make_stats() const {
+  // scheduler.py:2399-2436. The always-on core: running/waiting counts, KV-cache
+  // usage, and this step's prefix-cache token delta (stashed by schedule()). The
+  // advanced SchedulerStats fields upstream carries (num_skipped_waiting_reqs,
+  // connector/spec/cudagraph/perf stats, kv_cache_eviction_events) are deferred
+  // with their config-gated metric families.
+  SchedulerStats stats;
+  stats.num_running_reqs = static_cast<int64_t>(running.size());
+  stats.num_waiting_reqs = static_cast<int64_t>(waiting->size());
+  stats.kv_cache_usage = kv_cache_manager->usage();
+  stats.prefix_cache_stats = last_prefix_cache_stats_;
+  return stats;
 }
 
 }  // namespace vllm::v1
