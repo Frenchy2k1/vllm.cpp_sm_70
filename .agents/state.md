@@ -26895,3 +26895,24 @@ reps. That is a PREREQUISITE for the remaining work rather than part of it, and
 attempting further micro-optimisation without it will generate confident
 conclusions that are noise — which, reading back, is a risk several entries in
 this log already ran.
+
+---
+
+## 2026-07-27 — paired A/B harness (scripts/metal-paired-ab.py)
+
+Built the prerequisite identified in the entry above. The alternating loop cannot
+be trusted on this host: identical runs spread 10%, and the same build reads
+23.57 standalone / 23.43 first-in-pair / 20.76 second-in-pair, so a plain
+alternation attributes drift to whichever arm runs second — which is how a tied
+change first measured "6% worse".
+
+`scripts/metal-paired-ab.py`:
+- **ABBA blocks** (A,B,B,A per block) so linear drift cancels WITHIN a block.
+- **Cooldown** between every run for a comparable thermal start.
+- Reports the per-block **paired delta** (drift-immune) plus a **sign test**: a
+  consistent direction across 6 blocks is p = 0.031 two-sided, a much stronger
+  claim than any single pair.
+
+Use for anything under ~5% here. Eyeballed alternation is fine for a 4.3x kernel
+win and worthless for a 1% one — and several small-margin entries in this log
+predate the harness and should be re-run through it before being trusted.
