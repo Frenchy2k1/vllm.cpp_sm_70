@@ -79,12 +79,28 @@ Request::Request(std::string request_id,
 // engine injects block_hasher exactly as upstream.
 Request Request::FromEngineCoreRequest(const EngineCoreRequest& request,
                                        BlockHasher block_hasher) {
+  // Construct WITHOUT the hasher so the ctor's update_block_hashes() is a no-op:
+  // the extra-key inputs (mm_features / cache_salt / lora_name) must be set
+  // BEFORE the first hash, exactly as upstream Request.__init__ sets every field
+  // before computing block_hashes. Installing the hasher after and hashing then
+  // folds the extra keys into the FIRST block hash (otherwise a salted/mm/LoRA
+  // request's prompt blocks would hash as if unsalted -> false-share).
   Request req(request.request_id, request.prompt_token_ids,
               request.sampling_params, request.arrival_time,
-              std::move(block_hasher), request.priority);
+              /*block_hasher=*/nullptr, request.priority);
   // Carry the multimodal placeholder specs through (empty for text-only ->
-  // byte-identical). Consumed by the encoder-cache / vision seam (M1/M2).
+  // byte-identical). Consumed by the encoder-cache / vision seam (M1/M2) and by
+  // the prefix-cache extra keys (generate_block_hash_extra_keys).
   req.mm_features = request.mm_features;
+  // Prefix-cache extra-key inputs (KV-PREFIX-CACHE W2): the cache salt and the
+  // LoRA adapter name partition the block-hash namespace. Both nullopt for the
+  // ordinary text path -> byte-identical hashes.
+  req.cache_salt = request.cache_salt;
+  req.lora_name = request.lora_name;
+  // Now install the hasher and compute the initial block hashes over the fully
+  // populated request.
+  req.block_hasher_ = std::move(block_hasher);
+  req.update_block_hashes();
   return req;
 }
 
