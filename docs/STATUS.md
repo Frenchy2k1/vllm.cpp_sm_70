@@ -276,7 +276,9 @@ preamble. The dense recipe (kAttnQkNormRope) is composite-only on every backend
 That kernel now exists and is validated on Metal (worst element error 1.4e-06 vs
 the composite); the default bf16 path is now routed through it
 (gated on the rope cache), worth a measured +0.35% and taking warm b=1 throughput
-to about 96.4% of MLX-LM. The V-accumulation win came from BISECTING the attention
+to about 96.0-96.4% of MLX-LM, with decode at 98.0%. The largest remaining lead
+is prefill attention, which at 547 GFLOP/s is still 5.2x slower per FLOP than
+this device's own GEMM. The V-accumulation win came from BISECTING the attention
 kernel once a paired ABBA harness with cooldown made 0.2% differences
 measurable: the V loop moved 2 bytes per lane per load where the score loop
 moved 8, giving 29 GB/s against 64 on identical traffic. That also explains why

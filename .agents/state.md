@@ -27727,3 +27727,40 @@ remembering the next time a dispatch-count saving is sized from an average.
 **Cumulative: 89.4% -> 96.4%**, four kernels landed. Remaining ~3.6% has no
 single dominant item: prefill GEMM 15 ms (97% of MLX's already), prefill
 attention ~35 ms, prefill other ~55 ms, decode ~85 ms.
+
+---
+
+## 2026-07-27 — standing at 96.0-96.4%; largest remaining lead is prefill attention's FLOP rate
+
+Thermally matched after four landed kernels: decode **27.24 vs 27.79 = 98.0%**,
+total **23.91 vs 24.90 = 96.0%**, prefill TTFT 613 vs 534 ms.
+
+```
+gap 172 ms = prefill 80 ms + decode 93 ms
+prefill excess ~= 35 ms attention + 15 ms GEMM + 30 ms other
+```
+
+**LEAD: prefill attention is still 5.2x slower PER FLOP than our own GEMM.**
+547 GFLOP/s against the GEMM's 2851 on the same device in the same forward. At
+GEMM rate it would be 10.6 ms rather than 55 — about 44 ms of the 80 ms prefill
+gap. This is the SAME roofline signal that found the original 21x: the mma
+rewrite moved attention 108 -> 547 GFLOP/s, a large structural win, but did not
+reach the rate this device sustains on a GEMM.
+
+**Hypothesis (not measured):** tiling is BQ=32 x BK=16, so a full online-softmax
+pass — threadgroup reductions plus the per-row `diag(corr) @ O` rescale — runs for
+only 16 keys, roughly 40 mma per softmax. Deepening BK amortises it, but `sv` is
+f32 (required for probability precision; bf16 P moved a greedy token when the mma
+kernel landed) so BK=32 puts K/V tiles at 24 KB against a 32 KB budget. A bf16
+`sv` with an f32 P would free the room; whether that holds the near-tie goldens is
+the open question.
+
+**Same standing as the KV-layout lead had before a probe refuted it: arithmetic,
+not measurement.** Test it before building on it.
+
+**Method that produced this session's four wins, for whoever continues:** compute
+achieved FLOP/s or GB/s per kernel, compare against what the SAME device sustains
+elsewhere, and treat any large ratio as a defect rather than a ceiling. It found
+prefill attention (21x), decode V accumulation (2.2x), and this. Bisect with
+measurement-only stubs to localise; verify with scripts/metal-paired-ab.py, never
+with single runs.
