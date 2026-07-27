@@ -435,6 +435,32 @@ a larger BK amortises the loads and was only ever tested at the 32x32 tile, wher
 it was neutral for a different reason). Both are worth one measurement each
 before any larger rewrite.
 
+### B-tile vectorisation: shape-split, net NEUTRAL, reverted
+
+The A tile's vectorisation was worth 1.55x, so the B tile was the obvious
+remaining half. BT layout forces a different loop shape: row `gc` is contiguous
+over k, so the vector load must run ALONG K for one column and scatter four
+results down the tile's k dimension. Built, correct (row diagnostic NONE, suite
+21/21), and **net neutral end to end (17.44 vs 17.41 tok/s), so reverted.**
+
+| shape | scalar B | vectorised B | change |
+|---|--:|--:|--:|
+| qkv 512x2048x2048 | 2282 GFLOP/s | 1939 | **-15%** |
+| mlp-up 512x2048x6144 | 2501 | 2618 | +4.7% |
+| mlp-dn 512x6144x2048 | 2382 | 2517 | +5.7% |
+
+**The regression has a clear cause: thread under-utilisation.** Scalar B staging
+walks `BK * BN = 512` elements over 256 threads, two apiece. The vectorised form
+walks `(BK/4) * BN = 128` vector loads over the same 256 threads, so **half the
+threadgroup idles during B staging**. The A tile does not suffer this as badly
+because it is consumed differently. Larger K amortises the idle half over more
+k-blocks, which is why only the two 6144-dimension shapes come out ahead.
+
+**If this is retried, fix the utilisation first**, not the vector width: either
+give each thread two vector loads (BK=16, restoring 256 items) or have the idle
+half stage A concurrently. Vectorising harder without that will keep trading one
+shape against another.
+
 ### Risks/decisions
 
 - **Batching changes failure semantics (accepted, mitigated).** Today a failed

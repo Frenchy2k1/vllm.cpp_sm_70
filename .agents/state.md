@@ -26114,3 +26114,31 @@ simply resolve the other way. Gate 16/16.
 4.59 s (1.22x); prefill ~1.75 s vs ~0.47 s (3.7x). Prefill is now the larger
 RATIO but the smaller pool. Untested: the same vectorisation on the mm kernel's
 B tile (only A was done), whose BT layout needs the load to run along k.
+
+---
+
+## 2026-07-27 — B-tile vectorisation: shape-split, net NEUTRAL, reverted
+
+The A tile's vectorisation was worth 1.55x, so the B tile was the obvious other
+half. BT forces a different loop shape (load along k for one column, scatter four
+results down the tile's k dimension). Built, correct (row diagnostic NONE, suite
+21/21), **net neutral end to end: 17.44 vs 17.41 tok/s. Reverted.**
+
+| shape | scalar B | vectorised B |
+|---|--:|--:|
+| qkv 512x2048x2048 | 2282 GFLOP/s | **1939 (-15%)** |
+| mlp-up 512x2048x6144 | 2501 | 2618 (+4.7%) |
+| mlp-dn 512x6144x2048 | 2382 | 2517 (+5.7%) |
+
+**Cause: thread under-utilisation, not the vectorisation itself.** Scalar B
+staging walks `BK*BN = 512` elements over 256 threads (two each); the vectorised
+form walks `(BK/4)*BN = 128` vector loads over the same 256, so **half the
+threadgroup idles during B staging**. Larger K amortises that over more k-blocks,
+which is exactly why only the two 6144-dimension shapes gain.
+
+**If retried, fix utilisation FIRST** (BK=16 to restore 256 items, or stage A
+with the idle half); vectorising harder without that just trades one shape
+against another.
+
+**Goal:** 17.41 of 27.9 tok/s, 1.60x remaining. Decode ~5.6 s vs MLX-LM's 4.59 s
+(1.22x); prefill ~1.75 s vs ~0.47 s (3.7x).
