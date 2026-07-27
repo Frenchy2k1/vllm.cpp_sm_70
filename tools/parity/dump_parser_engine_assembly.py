@@ -52,6 +52,9 @@ FAMILY_MODULES = [
     "deepseek_v4",
     "deepseek_v32",
     "nemotron_v3",
+    # ROAD-V1-C8 (C8-2): the last two deferred engine-backed families.
+    "gemma4",
+    "inkling",
 ]
 
 
@@ -246,6 +249,13 @@ class MockTok:
             # construction (never fired: gate streams carry no token ids).
             "<minimax:tool_call>": 1030,
             "</minimax:tool_call>": 1031,
+            # gemma4: the channel markers must resolve to non-None token ids so
+            # _reasoning_start/end_token_id are set (gates _preprocess_feed). The
+            # C++ gate injects the identical vocab for gemma4.
+            "<|channel>": 1040,
+            "<channel|>": 1041,
+            "<|tool_call>": 1042,
+            "<tool_call|>": 1043,
         }
 
     def get_vocab(self):
@@ -444,6 +454,69 @@ def make_scenarios():
     )
     scenarios.append(("nemotron_reasoning_xml_charwise", "nemotron_v3", True,
                       True, chars(NEMO_FULL)))
+
+    # ── ROAD-V1-C8 (C8-2): gemma4 + inkling ───────────────────────────────
+    # 20. gemma4 explicit <|channel> reasoning (intrinsic `thought\n` prefix
+    #     stripped by _events_to_delta) + <|tool_call> custom key:value args,
+    #     whole-delta.
+    D = '<|"|>'  # STRING_DELIM
+    GEMMA_TOOL = (
+        "<|tool_call>call:get_weather{"
+        f"city:{D}Tokyo{D},unit:{D}celsius{D}"
+        "}<tool_call|>"
+    )
+    GEMMA_EXPLICIT_FULL = (
+        "<|channel>thought\nLet me check the weather.<channel|>"
+        "Sure, checking now." + GEMMA_TOOL
+    )
+    scenarios.append(("gemma4_channel_tool_wholedelta", "gemma4", True, True, [
+        "<|channel>thought\nLet me check the weather.<channel|>",
+        "Sure, checking now.",
+        GEMMA_TOOL,
+    ]))
+    # 21. gemma4 explicit-channel char-by-char (prefix strip under fine cadence).
+    scenarios.append(("gemma4_channel_tool_charwise", "gemma4", True, True,
+                      chars(GEMMA_EXPLICIT_FULL)))
+    # 22. gemma4 ELIDED channel opener — the first delta starts with `thought\n`
+    #     (the <|channel> token was consumed upstream), so _preprocess_feed injects
+    #     it. whole-delta (char-by-char would not inject: only the first feed is
+    #     eligible and a single leading char is not a `thought\n`/<channel|> cue).
+    scenarios.append(("gemma4_elided_channel_wholedelta", "gemma4", True, True, [
+        "thought\nWeighing the options.<channel|>",
+        GEMMA_TOOL,
+    ]))
+
+    # 23. inkling typed content blocks: thinking + invoke_tool_json + a trailing
+    #     text block AFTER the tool block (exercises the "args" wrapper unwrap in
+    #     extract/parse AND the _single_pass_parse trailing flush), whole-delta.
+    INK_THINK = "<|message_model|><|content_thinking|>Deciding.<|end_message|>"
+    INK_TOOL = (
+        "<|message_model|><|content_invoke_tool_json|>"
+        '{"name": "get_weather", "args": {"city": "SF", "unit": "celsius"}}'
+        "<|end_message|>"
+    )
+    INK_TEXT = "<|message_model|><|content_text|>Here you go.<|end_message|>"
+    INK_FULL = INK_THINK + INK_TOOL + INK_TEXT
+    scenarios.append(("inkling_think_tool_text_wholedelta", "inkling", True, True,
+                      [INK_THINK, INK_TOOL, INK_TEXT]))
+    # 24. inkling char-by-char (held-back JSON arg carve under fine cadence).
+    scenarios.append(("inkling_think_tool_text_charwise", "inkling", True, True,
+                      chars(INK_FULL)))
+    # 25. inkling with a NON-OBJECT "args" value (JSON array) — the
+    #     inkling_arg_converter raises, so extract/parse fall back to the
+    #     name-from-args path (_extract_name_and_args -> _extract_args_value),
+    #     which is where the "args" wrapper-key override matters (without it the
+    #     {"args":[…]} wrapper leaks). whole-delta.
+    INK_NONOBJ = (
+        "<|message_model|><|content_invoke_tool_json|>"
+        '{"name": "lookup", "args": [1, 2, 3]}'
+        "<|end_message|>"
+    )
+    scenarios.append(("inkling_nonobject_args_wholedelta", "inkling", True, True,
+                      [INK_NONOBJ]))
+    # 26. inkling non-object args, char-by-char.
+    scenarios.append(("inkling_nonobject_args_charwise", "inkling", True, True,
+                      chars(INK_NONOBJ)))
     return scenarios
 
 
@@ -471,6 +544,11 @@ def make_parser(pe_pkg, cfg, thinking, tok):
     if cfg == "nemotron_v3":
         return pe_pkg["nemotron_v3"].NemotronV3Parser(tok, chat_template_kwargs={
             "enable_thinking": thinking})
+    if cfg == "gemma4":
+        return pe_pkg["gemma4"].Gemma4Parser(tok, chat_template_kwargs={
+            "enable_thinking": thinking})
+    if cfg == "inkling":
+        return pe_pkg["inkling"].InklingParser(tok)
     raise SystemExit("unknown cfg: " + cfg)
 
 
@@ -527,6 +605,19 @@ def emit_extract(info):
         "true" if info.tools_called else "false", opt(info.content), xtcs)
 
 
+def emit_parse(check, reasoning, content, tool_calls):
+    # `parse()` returns (reasoning, content, tool_calls|None). The C++ parse()
+    # tuple carries FunctionCall{name, arguments} (no id), so gate name+arguments.
+    if tool_calls is None:
+        has, tcs = "false", ""
+    else:
+        has = "true"
+        tcs = ", ".join('{%s, %s}' % (esc(t.name), esc(t.arguments))
+                        for t in tool_calls)
+    return "%s, GParse{%s, %s, %s, {%s}}" % (
+        "true" if check else "false", opt(reasoning), opt(content), has, tcs)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -559,6 +650,15 @@ def main():
             full = "".join(deltas)
             info = parser2.extract_tool_calls(full, Req(include_reasoning=incl))
 
+            # --- non-streaming parse() pass (gates the gemma4/inkling seams that
+            #     the streaming/extract paths do not reach: inkling's
+            #     _single_pass_parse trailing flush). Checked only for the two new
+            #     configs; captured for all for a uniform golden record. ---
+            parser3 = make_parser(pe_pkg, cfg, thinking, tok)
+            p_reasoning, p_content, p_tools = parser3.parse(
+                full, Req(include_reasoning=incl))
+            check_parse = cfg in ("gemma4", "inkling")
+
             deltas_cpp = ", ".join(esc(d) for d in deltas)
             stream_cpp = ",\n      ".join(stream_out)
             lines.append("  GScenario{")
@@ -569,6 +669,8 @@ def main():
             lines.append("    {%s}," % deltas_cpp)
             lines.append("    {\n      %s\n    }," % stream_cpp)
             lines.append("    %s," % emit_extract(info))
+            lines.append("    %s," % emit_parse(
+                check_parse, p_reasoning, p_content, p_tools))
             lines.append("  },")
 
         lines.append("};")

@@ -4,8 +4,10 @@
 #include "vllm/parser/engine/configs.h"
 
 #include <algorithm>
+#include <optional>
 #include <regex>
 #include <set>
+#include <stdexcept>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -588,6 +590,425 @@ ParserEngineConfig deepseek_v32_config() {
 ParserEngineConfig nemotron_v3_config(bool thinking) {
   ParserEngineConfig c = qwen3_config(thinking, "nemotron_v3");
   c.strip_trailing_reasoning_whitespace = true;
+  return c;
+}
+
+// ── gemma4 (gemma4.py) ────────────────────────────────────────────────────
+namespace {
+
+// gemma4.py:42 STRING_DELIM (`<|"|>`) + _DELIM_LEN.
+const std::string GEMMA4_STRING_DELIM = "<|\"|>";
+constexpr std::size_t GEMMA4_DELIM_LEN = 5;
+
+// gemma4.py:57 _strip_partial_delim — strip a trailing partial STRING_DELIM.
+std::string gemma4_strip_partial_delim(const std::string& value) {
+  for (std::size_t k = GEMMA4_DELIM_LEN; k >= 1; --k) {
+    const std::string suffix = GEMMA4_STRING_DELIM.substr(0, k);
+    if (value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0)
+      return value.substr(0, value.size() - suffix.size());
+  }
+  return value;
+}
+
+nlohmann::ordered_json gemma4_parse_args(const std::string& s, bool partial);
+
+// gemma4.py:204 _parse_gemma4_array.
+nlohmann::ordered_json gemma4_parse_array(const std::string& a, bool partial) {
+  nlohmann::ordered_json items = nlohmann::ordered_json::array();
+  const long n = static_cast<long>(a.size());
+  long i = 0;
+  auto at = [&](long k) { return a[static_cast<std::size_t>(k)]; };
+  auto sub = [&](long b, long e) {
+    return a.substr(static_cast<std::size_t>(b), static_cast<std::size_t>(e - b));
+  };
+  auto is_delim = [&](long k) {
+    return k + static_cast<long>(GEMMA4_DELIM_LEN) <= n &&
+           sub(k, k + static_cast<long>(GEMMA4_DELIM_LEN)) == GEMMA4_STRING_DELIM;
+  };
+  auto find_delim = [&](long from) -> long {
+    std::size_t p = a.find(GEMMA4_STRING_DELIM, static_cast<std::size_t>(from));
+    return p == std::string::npos ? -1 : static_cast<long>(p);
+  };
+  while (i < n) {
+    while (i < n && (at(i) == ' ' || at(i) == ',' || at(i) == '\n' || at(i) == '\t'))
+      ++i;
+    if (i >= n) break;
+    if (is_delim(i)) {
+      i += static_cast<long>(GEMMA4_DELIM_LEN);
+      long end_pos = find_delim(i);
+      if (end_pos == -1) {
+        items.push_back(sub(i, n));
+        break;
+      }
+      items.push_back(sub(i, end_pos));
+      i = end_pos + static_cast<long>(GEMMA4_DELIM_LEN);
+    } else if (at(i) == '{') {
+      int depth = 1;
+      long obj_start = i + 1;
+      ++i;
+      while (i < n && depth > 0) {
+        if (is_delim(i)) {
+          i += static_cast<long>(GEMMA4_DELIM_LEN);
+          long nd = find_delim(i);
+          i = nd == -1 ? n : nd + static_cast<long>(GEMMA4_DELIM_LEN);
+          continue;
+        }
+        if (at(i) == '{') ++depth;
+        else if (at(i) == '}') --depth;
+        ++i;
+      }
+      if (depth > 0) items.push_back(gemma4_parse_args(sub(obj_start, i), true));
+      else items.push_back(gemma4_parse_args(sub(obj_start, i - 1), false));
+    } else if (at(i) == '[') {
+      int depth = 1;
+      long sub_start = i + 1;
+      ++i;
+      while (i < n && depth > 0) {
+        if (is_delim(i)) {
+          i += static_cast<long>(GEMMA4_DELIM_LEN);
+          long nd = find_delim(i);
+          i = nd == -1 ? n : nd + static_cast<long>(GEMMA4_DELIM_LEN);
+          continue;
+        }
+        if (at(i) == '[') ++depth;
+        else if (at(i) == ']') --depth;
+        ++i;
+      }
+      if (depth > 0) items.push_back(gemma4_parse_array(sub(sub_start, i), true));
+      else items.push_back(gemma4_parse_array(sub(sub_start, i - 1), false));
+    } else {
+      long val_start = i;
+      while (i < n && at(i) != ',' && at(i) != ']') ++i;
+      if (partial && i >= n) break;
+      if (i == val_start) break;  // no progress (malformed) — abort
+      std::string raw_val = strip(sub(val_start, i));
+      if (partial && !raw_val.empty() && raw_val.back() == '.') break;
+      items.push_back(raw_val);
+    }
+  }
+  return items;
+}
+
+// gemma4.py:68 _parse_gemma4_args.
+nlohmann::ordered_json gemma4_parse_args(const std::string& s, bool partial) {
+  nlohmann::ordered_json result = nlohmann::ordered_json::object();
+  if (s.empty() || strip(s).empty()) return result;
+  const long n = static_cast<long>(s.size());
+  long i = 0;
+  auto at = [&](long k) { return s[static_cast<std::size_t>(k)]; };
+  auto sub = [&](long b, long e) {
+    return s.substr(static_cast<std::size_t>(b), static_cast<std::size_t>(e - b));
+  };
+  auto is_delim = [&](long k) {
+    return k + static_cast<long>(GEMMA4_DELIM_LEN) <= n &&
+           sub(k, k + static_cast<long>(GEMMA4_DELIM_LEN)) == GEMMA4_STRING_DELIM;
+  };
+  auto find_delim = [&](long from) -> long {
+    std::size_t p = s.find(GEMMA4_STRING_DELIM, static_cast<std::size_t>(from));
+    return p == std::string::npos ? -1 : static_cast<long>(p);
+  };
+  while (i < n) {
+    while (i < n && (at(i) == ' ' || at(i) == ',' || at(i) == '\n' || at(i) == '\t'))
+      ++i;
+    if (i >= n) break;
+    long key_start = i;
+    while (i < n && at(i) != ':') ++i;
+    if (i >= n) break;
+    std::string key = strip(sub(key_start, i));
+    // key[_DELIM_LEN:-_DELIM_LEN] when wrapped in STRING_DELIM.
+    if (key.size() >= GEMMA4_DELIM_LEN &&
+        key.compare(0, GEMMA4_DELIM_LEN, GEMMA4_STRING_DELIM) == 0 &&
+        key.compare(key.size() - GEMMA4_DELIM_LEN, GEMMA4_DELIM_LEN,
+                    GEMMA4_STRING_DELIM) == 0) {
+      long lo = static_cast<long>(GEMMA4_DELIM_LEN);
+      long hi = static_cast<long>(key.size()) - static_cast<long>(GEMMA4_DELIM_LEN);
+      key = hi > lo ? key.substr(static_cast<std::size_t>(lo),
+                                 static_cast<std::size_t>(hi - lo))
+                    : std::string();
+    }
+    ++i;  // skip ':'
+    if (i >= n) {
+      if (!partial) result[key] = "";
+      break;
+    }
+    while (i < n && (at(i) == ' ' || at(i) == '\n' || at(i) == '\t')) ++i;
+    if (i >= n) {
+      if (!partial) result[key] = "";
+      break;
+    }
+    if (is_delim(i)) {
+      i += static_cast<long>(GEMMA4_DELIM_LEN);
+      long val_start = i;
+      long end_pos = find_delim(i);
+      if (end_pos == -1) {
+        std::string value = sub(val_start, n);
+        if (partial) value = gemma4_strip_partial_delim(value);
+        result[key] = value;
+        break;
+      }
+      result[key] = sub(val_start, end_pos);
+      i = end_pos + static_cast<long>(GEMMA4_DELIM_LEN);
+    } else if (at(i) == '{') {
+      int depth = 1;
+      long obj_start = i + 1;
+      ++i;
+      while (i < n && depth > 0) {
+        if (is_delim(i)) {
+          i += static_cast<long>(GEMMA4_DELIM_LEN);
+          long nd = find_delim(i);
+          i = nd == -1 ? n : nd + static_cast<long>(GEMMA4_DELIM_LEN);
+          continue;
+        }
+        if (at(i) == '{') ++depth;
+        else if (at(i) == '}') --depth;
+        ++i;
+      }
+      if (depth > 0) result[key] = gemma4_parse_args(sub(obj_start, i), true);
+      else result[key] = gemma4_parse_args(sub(obj_start, i - 1), false);
+    } else if (at(i) == '[') {
+      int depth = 1;
+      long arr_start = i + 1;
+      ++i;
+      while (i < n && depth > 0) {
+        if (is_delim(i)) {
+          i += static_cast<long>(GEMMA4_DELIM_LEN);
+          long nd = find_delim(i);
+          i = nd == -1 ? n : nd + static_cast<long>(GEMMA4_DELIM_LEN);
+          continue;
+        }
+        if (at(i) == '[') ++depth;
+        else if (at(i) == ']') --depth;
+        ++i;
+      }
+      if (depth > 0) result[key] = gemma4_parse_array(sub(arr_start, i), true);
+      else result[key] = gemma4_parse_array(sub(arr_start, i - 1), false);
+    } else {
+      long val_start = i;
+      while (i < n && at(i) != ',' && at(i) != '}' && at(i) != ']') ++i;
+      if (partial && i >= n) break;
+      if (i == val_start) break;  // no progress (malformed) — abort
+      std::string raw_val = strip(sub(val_start, i));
+      if (partial && !raw_val.empty() && raw_val.back() == '.') break;
+      result[key] = raw_val;
+    }
+  }
+  return result;
+}
+
+// gemma4.py:285 _gemma4_arg_converter.
+std::string gemma4_arg_converter(const std::string& raw_args, bool partial) {
+  std::string text = strip(raw_args);
+  if (!text.empty() && text.back() == '}') text.pop_back();
+  return python_json_dumps(gemma4_parse_args(text, partial));
+}
+
+}  // namespace
+
+// gemma4.py:296 (gemma4_config). Channel-based reasoning + <|tool_call> tool
+// calls; custom key:value arg format via gemma4_arg_converter. The Gemma4Parser
+// subclass adds the _preprocess_feed / _events_to_delta hooks (parser/gemma4.*).
+ParserEngineConfig gemma4_config() {
+  const std::string CHANNEL_START = "<|channel>";
+  const std::string CHANNEL_END = "<channel|>";
+  const std::string TOOL_CALL_START = "<|tool_call>";
+  const std::string TOOL_CALL_END = "<tool_call|>";
+
+  ParserEngineConfig c;
+  c.name = "gemma4";
+  c.initial_state = S::CONTENT;
+  c.terminals = {
+      {"THINK_START", CHANNEL_START}, {"THINK_END", CHANNEL_END},
+      {"TOOL_START", TOOL_CALL_START}, {"TOOL_END", TOOL_CALL_END},
+      {"CALL_PREFIX", "call:"}, {"OPEN_BRACE", "{"},
+  };
+  c.token_id_terminals = {
+      {"THINK_START", CHANNEL_START}, {"THINK_END", CHANNEL_END},
+      {"TOOL_START", TOOL_CALL_START}, {"TOOL_END", TOOL_CALL_END},
+  };
+  c.transitions = {
+      {{S::CONTENT, "THINK_START"}, Transition(S::REASONING, {E::REASONING_START})},
+      {{S::REASONING, "THINK_START"}, Transition(S::REASONING, {})},
+      {{S::REASONING, "THINK_END"}, Transition(S::CONTENT, {E::REASONING_END})},
+      {{S::REASONING, "TOOL_START"},
+       Transition(S::TOOL_PREAMBLE, {E::REASONING_END, E::TOOL_CALL_START})},
+      {{S::CONTENT, "TOOL_START"},
+       Transition(S::TOOL_PREAMBLE, {E::REASONING_END, E::TOOL_CALL_START})},
+      {{S::TOOL_PREAMBLE, "TOOL_END"}, Transition(S::CONTENT, {E::TOOL_CALL_END})},
+      {{S::TOOL_PREAMBLE, "CALL_PREFIX"}, Transition(S::TOOL_NAME, {})},
+      {{S::TOOL_NAME, "OPEN_BRACE"}, Transition(S::TOOL_ARGS, {})},
+      {{S::TOOL_ARGS, "TOOL_END"}, Transition(S::CONTENT, {E::TOOL_CALL_END})},
+      {{S::CONTENT, "TOOL_END"}, Transition(S::CONTENT, {})},
+      {{S::CONTENT, "THINK_END"}, Transition(S::CONTENT, {})},
+  };
+  // gemma4.py:370 content_events (== default; set explicitly to mirror upstream).
+  c.content_events = {
+      {S::CONTENT, E::TEXT_CHUNK}, {S::REASONING, E::REASONING_CHUNK},
+      {S::TOOL_NAME, E::TOOL_NAME}, {S::TOOL_ARGS, E::ARG_VALUE_CHUNK},
+  };
+  // gemma4.py:376-379 assembly fields.
+  c.arg_converter = gemma4_arg_converter;
+  c.tool_args_json = false;
+  c.arg_structural_chars = std::set<char>{',', ':', '{', '}', '[', ']', '<'};
+  c.preserve_tokens = {GEMMA4_STRING_DELIM};
+  return c;
+}
+
+// ── inkling (inkling.py) ──────────────────────────────────────────────────
+namespace {
+
+// inkling.py:70 _scan_json_value — end index (exclusive) of the JSON object at
+// raw[start], or -1 when still unterminated.
+long inkling_scan_json_value(const std::string& raw, long start) {
+  int depth = 0;
+  bool in_string = false, escape = false;
+  const long n = static_cast<long>(raw.size());
+  for (long i = start; i < n; ++i) {
+    char ch = raw[static_cast<std::size_t>(i)];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (in_string) {
+      if (ch == '\\') escape = true;
+      else if (ch == '"') in_string = false;
+      continue;
+    }
+    if (ch == '"') in_string = true;
+    else if (ch == '{') ++depth;
+    else if (ch == '}') {
+      --depth;
+      if (depth == 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+// inkling.py:98 _args_value_span — verbatim span of the top-level "args" value
+// from a (possibly incomplete) {"name":...,"args":{...}} wrapper. std::nullopt
+// when the value has not started; throws (mirrors Python ValueError, caught by
+// the arg-converter callers) when the value is not a JSON object.
+std::optional<std::string> inkling_args_value_span(const std::string& raw) {
+  int depth = 0;
+  bool in_string = false, escape = false;
+  long string_start = -1;
+  std::optional<std::string> last_string;
+  const long n = static_cast<long>(raw.size());
+  static const std::string WS = " \t\r\n";
+  for (long i = 0; i < n; ++i) {
+    char ch = raw[static_cast<std::size_t>(i)];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (in_string) {
+      if (ch == '\\') {
+        escape = true;
+      } else if (ch == '"') {
+        in_string = false;
+        if (depth == 1)
+          last_string = raw.substr(static_cast<std::size_t>(string_start + 1),
+                                   static_cast<std::size_t>(i - string_start - 1));
+      }
+      continue;
+    }
+    if (ch == '"') {
+      in_string = true;
+      string_start = i;
+    } else if (ch == ':' && depth == 1 && last_string && *last_string == "args") {
+      long value_start = i + 1;
+      while (value_start < n &&
+             WS.find(raw[static_cast<std::size_t>(value_start)]) != std::string::npos)
+        ++value_start;
+      if (value_start >= n) return std::nullopt;
+      if (raw[static_cast<std::size_t>(value_start)] != '{')
+        throw std::runtime_error("Inkling tool call args must be a JSON object");
+      long value_end = inkling_scan_json_value(raw, value_start);
+      if (value_end == -1)
+        return raw.substr(static_cast<std::size_t>(value_start));
+      return raw.substr(static_cast<std::size_t>(value_start),
+                        static_cast<std::size_t>(value_end - value_start));
+    } else if (ch == '{' || ch == '[') {
+      ++depth;
+    } else if (ch == '}' || ch == ']') {
+      --depth;
+    }
+  }
+  return std::nullopt;
+}
+
+// inkling.py:146 _inkling_arg_converter — carve the "args" object out of the
+// tool-call JSON wrapper.
+std::string inkling_arg_converter(const std::string& raw_args, bool partial) {
+  std::optional<std::string> span = inkling_args_value_span(raw_args);
+  if (!span) return partial ? std::string() : std::string("{}");
+  return *span;
+}
+
+}  // namespace
+
+// inkling.py:175 (inkling_config). Typed content blocks (thinking / text /
+// invoke_tool_json) in a single state machine; the InklingParser subclass adds
+// the "args" wrapper-key unwrap + trailing-text flush (parser/inkling.*).
+ParserEngineConfig inkling_config() {
+  const std::string MESSAGE_MODEL = "<|message_model|>";
+  const std::string CONTENT_TEXT = "<|content_text|>";
+  const std::string CONTENT_THINKING = "<|content_thinking|>";
+  const std::string CONTENT_INVOKE_TOOL_JSON = "<|content_invoke_tool_json|>";
+  const std::string CONTENT_INVOKE_TOOL_TEXT = "<|content_invoke_tool_text|>";
+  const std::string CONTENT_TOOL_ERROR = "<|content_tool_error|>";
+  const std::string CONTENT_MODEL_END_SAMPLING = "<|content_model_end_sampling|>";
+  const std::string END_MESSAGE = "<|end_message|>";
+
+  ParserEngineConfig c;
+  c.name = "inkling";
+  c.initial_state = S::MESSAGE_HEADER;
+  c.terminals = {
+      {"MSG_MODEL", MESSAGE_MODEL},
+      {"TEXT_START", CONTENT_TEXT},
+      {"THINK_START", CONTENT_THINKING},
+      {"THINK_END", END_MESSAGE},
+      {"END_SAMPLING", CONTENT_MODEL_END_SAMPLING},
+      {"TOOL_START", CONTENT_INVOKE_TOOL_JSON},
+      {"TOOL_TEXT", CONTENT_INVOKE_TOOL_TEXT},
+      {"TOOL_ERROR", CONTENT_TOOL_ERROR},
+  };
+  c.token_id_terminals = {};
+  c.transitions = {
+      {{S::CONTENT, "MSG_MODEL"}, Transition(S::MESSAGE_HEADER, {})},
+      {{S::CONTENT, "TEXT_START"}, Transition(S::CONTENT, {})},
+      {{S::CONTENT, "THINK_START"}, Transition(S::REASONING, {E::REASONING_START})},
+      {{S::CONTENT, "TOOL_START"}, Transition(S::TOOL_ARGS, {E::TOOL_CALL_START})},
+      {{S::CONTENT, "TOOL_TEXT"}, Transition(S::CONTENT, {})},
+      {{S::CONTENT, "TOOL_ERROR"}, Transition(S::CONTENT, {})},
+      {{S::MESSAGE_HEADER, "MSG_MODEL"}, Transition(S::MESSAGE_HEADER, {})},
+      {{S::MESSAGE_HEADER, "TEXT_START"}, Transition(S::CONTENT, {})},
+      {{S::MESSAGE_HEADER, "THINK_START"},
+       Transition(S::REASONING, {E::REASONING_START})},
+      {{S::MESSAGE_HEADER, "TOOL_START"},
+       Transition(S::TOOL_ARGS, {E::TOOL_CALL_START})},
+      {{S::MESSAGE_HEADER, "TOOL_TEXT"}, Transition(S::CONTENT, {})},
+      {{S::MESSAGE_HEADER, "TOOL_ERROR"}, Transition(S::CONTENT, {})},
+      {{S::REASONING, "THINK_START"}, Transition(S::REASONING, {})},
+      {{S::REASONING, "TOOL_START"},
+       Transition(S::TOOL_ARGS, {E::REASONING_END, E::TOOL_CALL_START})},
+  };
+  // inkling.py:256 — block-end terminals (THINK_END / END_SAMPLING) behave
+  // identically regardless of label.
+  for (const char* end : {"THINK_END", "END_SAMPLING"}) {
+    c.transitions[{S::CONTENT, end}] = Transition(S::CONTENT, {});
+    c.transitions[{S::REASONING, end}] = Transition(S::CONTENT, {E::REASONING_END});
+    c.transitions[{S::TOOL_ARGS, end}] = Transition(S::CONTENT, {E::TOOL_CALL_END});
+    c.transitions[{S::MESSAGE_HEADER, end}] = Transition(S::CONTENT, {});
+  }
+  // inkling.py:288-295 assembly fields.
+  c.arg_converter = inkling_arg_converter;
+  c.stream_arg_deltas = true;
+  c.tool_args_json = true;
+  c.strip_trailing_reasoning_whitespace = true;
+  c.drop_whitespace_only_content_before_tools = true;
+  c.strip_content_whitespace_with_tools = false;
+  c.validate_tool_names = false;
   return c;
 }
 

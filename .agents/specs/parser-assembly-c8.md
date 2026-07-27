@@ -1,12 +1,14 @@
 # ROAD-V1-C8 — parser ASSEMBLY layer (`TOOLS-STREAMING-PARSER` assembly)
 
 Status: **LANDED + CPU-gated 2026-07-27** (`CLAIM-ROADMAP-C8-ASSEMBLY`; config
-families `CLAIM-ROADMAP-C8-CONFIGS`; not pushed). Builds directly on the merged
-engine CORE ([streaming-parser-engine.md](streaming-parser-engine.md)); do NOT
-re-port the engine core. Engine-backed families now ported: qwen3, seed_oss,
-kimi_k2, **minimax_m2, glm47_moe, deepseek_v4, deepseek_v32, nemotron_v3**;
-**DEFERRED: gemma4, inkling** (each needs an unported assembly hook — see
-RESIDUALS).
+families `CLAIM-ROADMAP-C8-CONFIGS`; last 2 families `CLAIM-ROADMAP-C8-CONFIGS-2`;
+not pushed). Builds directly on the merged engine CORE
+([streaming-parser-engine.md](streaming-parser-engine.md)); do NOT re-port the
+engine core. **ALL 10 engine-backed families now ported — vLLM tool-parser family
+parity CLOSED:** qwen3, seed_oss, kimi_k2, minimax_m2, glm47_moe, deepseek_v4,
+deepseek_v32, nemotron_v3, **gemma4, inkling** (the last two ported 2026-07-27 by
+adding the specific default-inert assembly-core virtual seams each needs — see
+"gemma4 + inkling seams" below).
 
 ## What this is
 
@@ -31,6 +33,7 @@ serving-visible output:
 | `parser_engine_config.py:76-97` assembly fields (arg_converter, stream_arg_deltas, strip_*/validate_tool_names/drop_ws/arg_structural_chars) | `include/vllm/parser/engine/parser_engine_config.h` (added to the existing struct) |
 | `json.dumps(…, ensure_ascii=False)` default `(", ", ": ")` separators | `include/vllm/parser/engine/py_json.h` |
 | **ROAD-V1-C8 config families (`CLAIM-ROADMAP-C8-CONFIGS`, 2026-07-27):** `vllm/parser/minimax_m2.py:94` (`minimax_m2_config` + `_minimax_m2_arg_converter`), `vllm/parser/glm47_moe.py:74` (`glm47_moe_config` + `_glm47_arg_converter`), `vllm/parser/deepseek_v4.py:125` (`deepseek_v4_config` + `_dsml_arg_converter`), `vllm/parser/deepseek_v32.py:51` (`deepseek_v32_config`), `vllm/parser/nemotron_v3.py:34` (`nemotron_v3_config`) | `src/vllm/parser/engine/configs.cpp` (5 builders + 3 std::regex arg-converters), `src/vllm/parser/engine/registry.cpp` + `src/vllm/parser/parser_manager.cpp` (dispatch), and the `glm47_moe.py:198,203` name-`.strip()` overrides as `include/vllm/parser/glm47_moe.{h,cpp}` (existing `emit_name_delta`/`handle_tool_end` hooks) |
+| **ROAD-V1-C8 last-2 families (`CLAIM-ROADMAP-C8-CONFIGS-2`, 2026-07-27):** `vllm/parser/gemma4.py:296` (`gemma4_config` + `_gemma4_arg_converter`/`_parse_gemma4_args`/`_parse_gemma4_array`) + `gemma4.py:387` `Gemma4Parser` (`_preprocess_feed`:424, `_events_to_delta`:530, `_reset`:418, `extract_reasoning`:572); `vllm/parser/inkling.py:175` (`inkling_config` + `_inkling_arg_converter`/`_args_value_span`/`_scan_json_value`) + `inkling.py:298` `InklingParser` (`_extract_args_value`:402, `_single_pass_parse`:376); base seams `parser_engine.py:210` `_preprocess_feed`, `:706` `_events_to_delta`, `:645` `_single_pass_parse`, `:1064` `_extract_args_value`, `:195` `_reset`, `:141-149` reasoning token-id resolve | `src/vllm/parser/engine/configs.cpp` (`gemma4_config`/`inkling_config` + 2 hand-rolled arg-converters), `include/vllm/parser/{gemma4,inkling}.{h,cpp}` + `src/vllm/parser/{gemma4,inkling}.cpp` (the two subclasses), the 4 additive virtual seams + `args_wrapper_keys`/`engine_state`/reasoning-token-id members on `parser_engine.{h,cpp}`, `registry.cpp` + `parser_manager.cpp` (dispatch) |
 
 Types reused (not re-defined): `DeltaMessage`, `DeltaToolCall`,
 `DeltaFunctionCall`, `FunctionCall`, `ToolCall`
@@ -47,18 +50,26 @@ EXACTLY: our per-delta `DeltaMessage` sequence AND the one-shot
 `extract_tool_calls` result equal, field-for-field, the vLLM 0.26 assembly's for
 the identical stream.
 
-- **2 cases / 3510 assertions, 19 scenarios:** scenarios 1-9 as before (qwen3
+- **3 cases / 4526 assertions, 26 scenarios:** scenarios 1-9 as before (qwen3
   reasoning+XML tool call whole-delta AND char-by-char, reasoning-suppressed
   `include_reasoning=false`, thinking-off plain content, two consecutive tool
   calls `tool_index` 0→1, unfinished call flushed by `finish()`, seed_oss
   wrapper-token variant, kimi_k2 JSON args held-back top-level brace char-by-char
-  AND whole-delta); **scenarios 10-19 (ROAD-V1-C8 config families, 1858 added
-  assertions), each whole-delta AND char-by-char:** minimax_m2 (`<invoke>` /
-  `<parameter>` XML, held-back JSON arg diffs), glm47_moe (`<arg_key>` /
-  `<arg_value>`, function-name `.strip()`), deepseek_v4 (`<think>` + DSML
-  tool_calls, `string="true/false"` typed-value coercion — `days` streamed as int
-  `5`), deepseek_v32 (DSML `function_calls`, no reasoning, `count` int `3`),
-  nemotron_v3 (qwen3 grammar + `strip_trailing_reasoning`).
+  AND whole-delta); **scenarios 10-19 (ROAD-V1-C8 config families), each
+  whole-delta AND char-by-char:** minimax_m2 (`<invoke>` / `<parameter>` XML,
+  held-back JSON arg diffs), glm47_moe (`<arg_key>` / `<arg_value>`, function-name
+  `.strip()`), deepseek_v4 (`<think>` + DSML tool_calls, `string="true/false"`
+  typed-value coercion — `days` streamed as int `5`), deepseek_v32 (DSML
+  `function_calls`, no reasoning, `count` int `3`), nemotron_v3 (qwen3 grammar +
+  `strip_trailing_reasoning`); **scenarios 20-26 (`CLAIM-ROADMAP-C8-CONFIGS-2`),
+  each whole-delta AND char-by-char:** gemma4 explicit-`<|channel>` reasoning +
+  `<|tool_call>` custom key:value args (intrinsic `thought\n` stripped), gemma4
+  ELIDED-channel (first delta starts `thought\n`, `_preprocess_feed` injects the
+  opener; whole-delta only), inkling thinking + `invoke_tool_json` + trailing text
+  block (args unwrap + `_single_pass_parse` flush), inkling non-object `args`
+  (converter-failure → `_extract_args_value` fallback). A THIRD test case gates
+  the non-streaming `parse()` (reasoning/content/tool_calls) for the gemma4/inkling
+  scenarios — the only path that reaches inkling's `_single_pass_parse` flush.
 - **RED-first (engine core, assembly):** dropping the held-back tool-args tail in
   `_safe_arg_prefix` fails 32 assertions; first divergent boundary
   `qwen3_reasoning_xml_wholedelta delta[3] tc[0] tc args` (expected held-back
@@ -68,6 +79,18 @@ the identical stream.
   `glm47_reasoning_xml_wholedelta delta[2] tc[0] tc name` (and the char-by-char
   twin `delta[54]`): expected `get_weather`, break emitted `get_weather\n`.
   Restoring → 3510/3510.
+- **RED-first (`CLAIM-ROADMAP-C8-CONFIGS-2`, all 4 new seams):** gemma4
+  `events_to_delta` skip → 13 asserts, first boundary
+  `gemma4_channel_tool_wholedelta delta[0] reasoning` (expected `Let me check the
+  weather.`, break kept `thought\nLet me check the weather.`); gemma4
+  `preprocess_feed` identity → 5 asserts, ONLY `gemma4_elided_channel_wholedelta
+  delta[0] content` (reasoning leaked as content — explicit-channel scenarios
+  still pass, isolating the inject); inkling `args_wrapper_keys` drop-`args` → 4
+  asserts, first boundary `inkling_nonobject_args_wholedelta extract tc[0]
+  arguments` (expected `[1, 2, 3]`, break emitted the `{"args": [1, 2, 3]}`
+  wrapper); inkling `single_pass_parse` skip-flush → 2 asserts, ONLY
+  `inkling_think_tool_text_wholedelta parse content` (expected `Here you go.`,
+  break emitted none). Each restored → 4526/4526.
 - Goldens reproduce byte-identically from the pinned oracle.
 - **Deterministic ids:** the qwen3 "random" id_type normally yields a random
   uuid; both the dump (monkeypatched `make_tool_call_id`) and the gate (injected
@@ -78,13 +101,18 @@ the identical stream.
 
 Additive opt-in subsystem. `git diff --stat` for code = new files
 (`parser_engine.{h,cpp}`, `kimi_k2.{h,cpp}`, `parser_manager.{h,cpp}`,
-`py_json.h`; ROAD-V1-C8: `glm47_moe.{h,cpp}`) + config builders/converters
-appended to `configs.{h,cpp}` + registry/manager dispatch lines (the streaming
-engine ignores the assembly fields: engine-core gate still 586/586; serving-SSE
-still 210/210) + 1 lib src line in CMake. The engine CORE, assembly, and serving
-logic are UNCHANGED — only new configs/adapters + registration were added. No
-existing tool_parsers / serving TU modified. Plain generation (no tool parser)
-byte-identical.
+`py_json.h`; ROAD-V1-C8: `glm47_moe.{h,cpp}`; C8-2: `gemma4.{h,cpp}`,
+`inkling.{h,cpp}`) + config builders/converters appended to `configs.{h,cpp}` +
+registry/manager dispatch lines (the streaming engine ignores the assembly
+fields: engine-core gate still 586/586; serving-SSE still 210/210) + lib src
+lines in CMake. For C8-2 the ONLY assembly-core change is 4 ADDITIVE virtual
+methods (`preprocess_feed`, `events_to_delta`, `single_pass_parse`,
+`args_wrapper_keys`) + virtual `reset`/`extract_reasoning` + `engine_state()`
+accessor + `_reasoning_{start,end}_token_id` members whose bases reproduce the
+prior behavior EXACTLY — the 8 non-overriding families are byte-identical (the
+existing 3510 stream/extract asserts, 586/586, 210/210 all UNCHANGED; the goldens
+`.inc` diff is pure insertions). No existing tool_parsers / serving TU modified.
+Plain generation (no tool parser) byte-identical.
 
 ## RESIDUALS (honest, stay open under C8)
 
@@ -101,8 +129,8 @@ byte-identical.
   identity because no tool schema is carried; only triggers when tools with
   schemas are supplied. `validate_tool_names` path is ported (gate configs have
   it false).
-- **The other engine configs — 5 PORTED, 2 DEFERRED (`CLAIM-ROADMAP-C8-CONFIGS`,
-  2026-07-27):**
+- **The other engine configs — ALL 7 PORTED (`CLAIM-ROADMAP-C8-CONFIGS` +
+  `-CONFIGS-2`, 2026-07-27); vLLM tool-parser family parity CLOSED:**
   - **PORTED (exact-gated, scenarios 10-19):** `minimax_m2`, `glm47_moe`,
     `deepseek_v4`, `deepseek_v32`, `nemotron_v3`. Each maps onto the literal
     `LexerShape` engine; the regex arg-converters mirror qwen3's `std::regex`
@@ -118,23 +146,34 @@ byte-identical.
     `request.chat_template_kwargs` (unmodeled in `ParserRequest`) and fires only
     on `enable_thinking=False`/`force_nonempty_content` — a serving-edge residual,
     not exercised by the normal streaming/extract gate; the config maps cleanly.
-  - **DEFERRED — 2, each needs a specific UNPORTED assembly hook (do NOT stub):**
-    - **`gemma4`** — needs a per-parser `_events_to_delta` reasoning-REWRITE hook
-      (`gemma4.py:530` strips the `thought\n` channel prefix from streamed
-      reasoning; the `<|channel>thought\n…` header is intrinsic to the format, so
-      every realistic stream hits it) AND `_preprocess_feed` first-feed
-      `<|channel>` injection (`gemma4.py:424`). The current `ParserEngine` has no
-      per-parser `_events_to_delta`/`_preprocess_feed` override seam; adding it
-      modifies the assembly core (out of scope). The custom `_parse_gemma4_args`
-      scanner itself is portable — only the delta-rewrite/feed hooks block it.
-    - **`inkling`** — needs a virtual `_extract_args_value` hook to unwrap the
-      Inkling `args` wrapper key in the non-streaming name-from-args path
-      (`inkling.py:402`; the base `extract_name_and_args` inlines a fixed
-      `{"arguments","parameters"}` key list, so `extract_tool_calls` would keep
-      the `{"name":…,"args":{…}}` wrapper) AND the `_single_pass_parse`
-      trailing-text flush (`inkling.py:376`, text blocks after a tool block). Both
-      require editing the private non-virtual assembly methods. The
-      `_inkling_arg_converter` JSON-span scanner itself is portable.
+  - **PORTED (`CLAIM-ROADMAP-C8-CONFIGS-2`, exact-gated, scenarios 20-26) — the
+    last 2, each by ADDING the specific assembly-core seam it needs as a
+    DEFAULT-INERT virtual (the other 8 families byte-identical: 586/586 + the 3510
+    existing stream/extract asserts + 210/210 UNCHANGED; `.inc` diff = pure
+    insertions):**
+    - **`gemma4`** (`Gemma4Parser`, `parser/gemma4.{h,cpp}` + `gemma4_config`) —
+      virtual `preprocess_feed` (base identity, parser_engine.py:210) for the
+      first-feed `<|channel>` injection (gemma4.py:424), virtual `events_to_delta`
+      (parser_engine.py:706) for the `thought\n` channel-prefix REWRITE
+      (gemma4.py:530), + virtual `reset` (:195) and `extract_reasoning` (:490,
+      gemma4.py:572). The `_gemma4_arg_converter` key:value scanner lives in
+      `gemma4_config`. `_reasoning_{start,end}_token_id` are resolved from the
+      tokenizer vocab in the ctor (parser_engine.py:141) — the gate passes a
+      gemma4 mock-tokenizer so the injection guard fires. Two RED-first scenarios:
+      explicit-channel (`_events_to_delta` strip → 13 asserts) + ELIDED-channel
+      (`_preprocess_feed` inject → 5 asserts, isolated).
+    - **`inkling`** (`InklingParser`, `parser/inkling.{h,cpp}` + `inkling_config`)
+      — `_extract_args_value` (inkling.py:402) refactored to a virtual
+      `args_wrapper_keys()` (base returns the fixed `{"arguments","parameters"}`;
+      inkling prepends `"args"`) + virtual `single_pass_parse`
+      (parser_engine.py:645) for the trailing-text flush (inkling.py:376). The
+      `_inkling_arg_converter` JSON-span carver lives in `inkling_config`. NOTE:
+      for well-formed inkling the `args` unwrap happens in the CONVERTER (streaming
+      + extract both), so `args_wrapper_keys` is only reached on a converter
+      FAILURE (non-object `args`) — gated by the dedicated `inkling_nonobject_args_*`
+      scenario (RED-first 4 asserts); the `_single_pass_parse` flush is reached
+      ONLY by `parse()` (extract_tool_calls flushes via finish_streaming), gated by
+      the NEW non-streaming parse() test case (RED-first 2 asserts).
 - **Prompt-state hooks** (`adjust_initial_state_from_prompt`) — base no-op ported;
   family token-ID `is_reasoning_end` overrides not needed by the assembly gate.
 - **Live-engine metric wiring, `SERVE-RESPONSE-METRICS`, chat-form `/tokenize`**

@@ -146,6 +146,22 @@ ParserEngine::ParserEngine(ParserEngineConfig config,
                    config_.terminals.count("THINK_END") > 0 ||
                    config_.initial_state == ParserState::REASONING;
   reasoning_ended_ = !has_reasoning_;
+
+  // parser_engine.py:141-149 — resolve the reasoning start/end token ids from the
+  // tokenizer vocab (used by per-family _preprocess_feed hooks, e.g. gemma4).
+  if (tokenizer) {
+    const std::map<std::string, int>& vocab = tokenizer->get_vocab();
+    auto resolve = [&](const char* key) -> std::optional<int> {
+      auto it = config_.token_id_terminals.find(key);
+      if (it == config_.token_id_terminals.end() || it->second.empty())
+        return std::nullopt;
+      auto v = vocab.find(it->second);
+      if (v == vocab.end()) return std::nullopt;
+      return v->second;
+    };
+    reasoning_start_token_id_ = resolve("THINK_START");
+    reasoning_end_token_id_ = resolve("THINK_END");
+  }
 }
 
 std::optional<std::string> ParserEngine::reasoning_start_str() const {
@@ -176,9 +192,24 @@ void ParserEngine::reset(std::optional<ParserState> initial_state) {
   content_has_nonws_ = false;
 }
 
+std::pair<std::string, std::vector<int>> ParserEngine::preprocess_feed(
+    const std::string& delta_text, const std::vector<int>& delta_token_ids) {
+  // parser_engine.py:210 — base identity. Inert for every family that does not
+  // override it (all but gemma4).
+  return {delta_text, delta_token_ids};
+}
+
+std::vector<std::string> ParserEngine::args_wrapper_keys() const {
+  // parser_engine.py:1064 _extract_args_value — the base key list. inkling
+  // prepends "args" (inkling.py:402).
+  return {"arguments", "parameters"};
+}
+
 std::vector<SemanticEvent> ParserEngine::feed(
     const std::string& delta_text, const std::vector<int>& delta_token_ids) {
-  return engine_.feed(delta_text, delta_token_ids);
+  // parser_engine.py:217 _feed — run the (overridable) preprocess hook first.
+  auto [text, ids] = preprocess_feed(delta_text, delta_token_ids);
+  return engine_.feed(text, ids);
 }
 
 void ParserEngine::initialize_history_tool_call_cnt(
@@ -612,7 +643,9 @@ std::pair<std::string, std::string> ParserEngine::extract_name_and_args(
   if (parsed.contains("name") && parsed["name"].is_string())
     name = parsed["name"].get<std::string>();
 
-  for (const char* key : {"arguments", "parameters"}) {
+  // parser_engine.py:1088 args = self._extract_args_value(parsed): iterate the
+  // (overridable) wrapper-key list; inkling adds "args".
+  for (const std::string& key : args_wrapper_keys()) {
     if (parsed.contains(key)) {
       const auto& val = parsed[key];
       if (val.is_string()) return {name, val.get<std::string>()};

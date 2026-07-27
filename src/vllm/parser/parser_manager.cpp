@@ -3,7 +3,9 @@
 #include "vllm/parser/parser_manager.h"
 
 #include "vllm/parser/engine/configs.h"
+#include "vllm/parser/gemma4.h"
 #include "vllm/parser/glm47_moe.h"
+#include "vllm/parser/inkling.h"
 #include "vllm/parser/kimi_k2.h"
 
 namespace vllm::parser {
@@ -54,6 +56,17 @@ std::unique_ptr<engine::ParserEngine> get_parser_engine(
   // hooks (glm47_moe.py).
   if (name == "glm47_moe") {
     return std::make_unique<Glm47MoeParser>(thinking, tokenizer);
+  }
+  // gemma4 adds the _preprocess_feed (channel-opener injection) + _events_to_delta
+  // (thought-prefix strip) hooks (gemma4.py). thinking selects is_reasoning_end
+  // behaviour only (not the assembly config), so it is not threaded here.
+  if (name == "gemma4") {
+    return std::make_unique<Gemma4Parser>(tokenizer);
+  }
+  // inkling adds the "args" wrapper-key unwrap + trailing-text single-pass flush
+  // hooks (inkling.py); MESSAGE_HEADER-initial, no reasoning tokens.
+  if (name == "inkling") {
+    return std::make_unique<InklingParser>(tokenizer);
   }
   return nullptr;
 }

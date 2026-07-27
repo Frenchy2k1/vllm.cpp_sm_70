@@ -33,9 +33,11 @@
 // JSON args with the held-back top-level brace (char-by-char AND whole-delta).
 #include <doctest/doctest.h>
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vllm/entrypoints/openai/protocol.h"
@@ -73,6 +75,14 @@ struct GExtract {
   std::optional<std::string> content;
   std::vector<GXTC> tool_calls;
 };
+// Non-streaming parse() golden: (reasoning, content, tool_calls). The parse()
+// tuple carries FunctionCall{name, arguments} (no id).
+struct GParse {
+  std::optional<std::string> reasoning;
+  std::optional<std::string> content;
+  bool has_tool_calls;
+  std::vector<std::pair<std::string, std::string>> tool_calls;  // {name, args}
+};
 struct GScenario {
   std::string name;
   std::string cfg;
@@ -81,6 +91,8 @@ struct GScenario {
   std::vector<std::string> deltas;
   std::vector<GDelta> stream;
   GExtract extract;
+  bool check_parse;
+  GParse parse;
 };
 
 #include "test_parser_engine_assembly_goldens.inc"
@@ -95,8 +107,35 @@ vllm::parser::engine::ParserEngine::IdFactory det_id_factory() {
   };
 }
 
+// gemma4's _preprocess_feed only injects the <|channel> opener when the channel
+// markers resolve to non-None token ids, so gemma4 needs a tokenizer whose vocab
+// carries them. Mirrors the Python MockTok vocab used to capture the goldens
+// (only non-None-ness matters; the ids are never fed — gate streams carry none).
+class GemmaMockTok : public vllm::parser::engine::EngineTokenizer {
+ public:
+  GemmaMockTok() {
+    vocab_ = {{"<|channel>", 1040},
+              {"<channel|>", 1041},
+              {"<|tool_call>", 1042},
+              {"<tool_call|>", 1043}};
+    for (const auto& [t, i] : vocab_) rev_[i] = t;
+  }
+  std::string decode(int token_id) const override {
+    auto it = rev_.find(token_id);
+    return it == rev_.end() ? std::string() : it->second;
+  }
+  const std::map<std::string, int>& get_vocab() const override { return vocab_; }
+
+ private:
+  std::map<std::string, int> vocab_;
+  std::map<int, std::string> rev_;
+};
+
 std::unique_ptr<vllm::parser::engine::ParserEngine> make(const GScenario& s) {
-  auto p = get_parser_engine(s.cfg, s.thinking, /*tokenizer=*/nullptr);
+  static const GemmaMockTok gemma_tok;
+  const vllm::parser::engine::EngineTokenizer* tok =
+      (s.cfg == "gemma4") ? &gemma_tok : nullptr;
+  auto p = get_parser_engine(s.cfg, s.thinking, tok);
   REQUIRE_MESSAGE(p != nullptr, "no engine parser for cfg " << s.cfg);
   p->set_id_factory(det_id_factory());
   return p;
@@ -172,6 +211,41 @@ TEST_CASE("parser assembly: one-shot extract_tool_calls parity, field-for-field"
                     w << " name");
       CHECK_MESSAGE(info.tool_calls[i].function.arguments ==
                         s.extract.tool_calls[i].arguments,
+                    w << " arguments");
+    }
+  }
+}
+
+// Non-streaming parse() parity. Checked for the gemma4/inkling scenarios only
+// (check_parse) — this is the ONLY path that reaches inkling's _single_pass_parse
+// trailing-text flush (extract_tool_calls flushes via finish_streaming instead).
+TEST_CASE("parser assembly: non-streaming parse() parity (gemma4/inkling seams)") {
+  for (const GScenario& s : kAssemblyGoldens) {
+    if (!s.check_parse) continue;
+    CAPTURE(s.name);
+    auto parser = make(s);
+    ParserRequest req;
+    req.include_reasoning = s.include_reasoning;
+    std::string full;
+    for (const auto& d : s.deltas) full += d;
+
+    auto [reasoning, content, tool_calls] = parser->parse(full, req);
+
+    const std::string where = s.name + " parse";
+    CHECK_MESSAGE(reasoning == s.parse.reasoning, where << " reasoning");
+    CHECK_MESSAGE(content == s.parse.content, where << " content");
+    CHECK_MESSAGE(tool_calls.has_value() == s.parse.has_tool_calls,
+                  where << " has_tool_calls");
+    if (tool_calls.has_value() != s.parse.has_tool_calls) continue;
+    if (!tool_calls.has_value()) continue;
+    CHECK_MESSAGE(tool_calls->size() == s.parse.tool_calls.size(),
+                  where << " tool_calls size");
+    if (tool_calls->size() != s.parse.tool_calls.size()) continue;
+    for (std::size_t i = 0; i < tool_calls->size(); ++i) {
+      const std::string w = where + " tc[" + std::to_string(i) + "]";
+      CHECK_MESSAGE((*tool_calls)[i].name == s.parse.tool_calls[i].first,
+                    w << " name");
+      CHECK_MESSAGE((*tool_calls)[i].arguments == s.parse.tool_calls[i].second,
                     w << " arguments");
     }
   }
