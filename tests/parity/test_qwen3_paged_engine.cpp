@@ -315,7 +315,16 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
     for (int64_t j = 0; j < T; ++j) {
       if (got[static_cast<size_t>(j)] != anchor_ids[i * T + j]) { first_div = static_cast<int>(j); break; }
     }
-    REQUIRE_MESSAGE(first_div < 0,
+    // RE-CAPTURE MODE. With VT_DUMP_IDS set you are, by definition, replacing the
+    // anchor, so asserting the OLD anchor makes the documented re-capture
+    // procedure impossible to run: the fatal REQUIRE below aborts the loop before
+    // the dump is ever written. Skipping it here does NOT weaken the gate — the
+    // dump path writes no golden and asserts nothing; the committed goldens are
+    // only ever replaced by qwen3-neartie-gap.py, whose gaps come from the vLLM
+    // oracle rather than from us. A normal (non-dump) run is unchanged.
+    // Precomputed: doctest cannot decompose a compound expression here.
+    const bool anchor_ok = dump || first_div < 0;
+    REQUIRE_MESSAGE(anchor_ok,
                     label << " anchor drift prompt[" << i << "] tok=" << first_div
                     << " engine=" << (first_div < 0 ? -1 : got[static_cast<size_t>(first_div)])
                     << " committed anchor=" << (first_div < 0 ? -1 : anchor_ids[i * T + first_div])

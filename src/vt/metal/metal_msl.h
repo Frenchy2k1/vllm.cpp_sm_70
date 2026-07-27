@@ -386,6 +386,50 @@ kernel void vt_matmul(device const uchar* a   [[buffer(0)]],
   }
 }
 
+// --- M3d: the DECODE GEMV fast path (kMatmulBT, m == 1) --------------------
+// Shape-class profiling of a 128-token generation found 21,464 of 21,632
+// matmuls are m=1 and ALL of them BT; only 168 are prefill GEMMs. The tile
+// kernel above is the wrong shape for that: with m=1 only one of its
+// VT_GEMM_TILE threadgroup ROWS holds a valid activation, so 15/16 of every
+// threadgroup is wasted, and each thread re-walks the K loop with two
+// threadgroup barriers per tile.
+//
+// BT is what makes the fast path worth writing: with B laid out [N,K], row
+// `col` is CONTIGUOUS over k, so one simdgroup can stream it fully coalesced.
+// One simdgroup owns one output column; each lane accumulates a strided slice
+// of K and `simd_sum` reduces across the lanes. That is a tree reduction where
+// the CPU reference is sequential, so the bar is NMSE (<= 5e-4), never
+// bit-exactness, exactly as for the tile GEMM and paged attention.
+//
+// The `col >= p.n` early-out is SIMD-UNIFORM (col depends on the simdgroup
+// index, not the lane), so every lane of a given simdgroup takes the same
+// branch and `simd_sum` is never reached with a partial simdgroup. That is a
+// correctness precondition of this kernel, not an incidental detail.
+#define VT_GEMV_SGS 8u  // simdgroups per threadgroup => 8 output columns each
+
+kernel void vt_matmul_bt_gemv(device const uchar* a   [[buffer(0)]],
+                              device const uchar* b   [[buffer(1)]],
+                              device uchar*       out [[buffer(2)]],
+                              constant VtGemmParams& p [[buffer(3)]],
+                              uint tgid  [[threadgroup_position_in_grid]],
+                              uint sgitg [[simdgroup_index_in_threadgroup]],
+                              uint tiisg [[thread_index_in_simdgroup]],
+                              uint sgsize [[threads_per_simdgroup]]) {
+  const uint col = tgid * VT_GEMV_SGS + sgitg;
+  if (col >= p.n) return;
+
+  // m == 1, so the activation row is row 0 and `lda` cannot contribute.
+  const ulong brow = ulong(col) * ulong(p.k);
+  float acc = 0.0f;
+  for (uint kk = tiisg; kk < p.k; kk += sgsize) {
+    acc += vt_load(a, p.a_dt, ulong(kk)) * vt_load(b, p.b_dt, brow + ulong(kk));
+  }
+  acc = simd_sum(acc);
+  if (tiisg == 0u) {
+    vt_store(out, p.out_dt, ulong(col), acc);
+  }
+}
+
 struct VtFcParams {
   uint  t;
   uint  h;

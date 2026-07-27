@@ -2474,6 +2474,69 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal `M3d` decode GEMV on Apple M4 (2026-07-27) - INDICATIVE
+
+**The row's own premise was wrong, and measurement corrected it before any
+kernel was written.** `M3d` was specified as a simdgroup-matrix GEMM. Shape-class
+profiling after `M3c-1` showed **21,464 of 21,632 matmuls are m=1 decode GEMVs,
+all BT**; only **168** are prefill GEMMs. A simdgroup-matrix kernel would have
+optimised 0.8% of the dispatches. Built instead: one simdgroup per output
+column, streaming the contiguous BT weight row coalesced, reduced with
+`simd_sum`.
+
+Same binary, arms by `VT_METAL_NO_GEMV`, 2 reps alternated, under the GPU lock:
+
+| B | tile kernel | GEMV | ratio |
+|--:|--:|--:|--:|
+| 1 | 5.34 / 5.47 | 10.43 / 10.59 | **1.94x** |
+| 16 | 21.47 / 21.62 | 21.64 / 21.64 | 1.00x |
+
+**b=16 is an INERTNESS CONTROL, not a disappointment.** At b=16 the decode m is
+16, so the GEMV path is not taken and the arms should be identical; they are
+(21.62 vs 21.64). Batched decode (m=2..16) still runs the tile kernel and is the
+obvious follow-up.
+
+**It is also 27x more accurate**, which is what forced the golden re-capture:
+
+| kernel | f32 NMSE vs f64 oracle |
+|---|--:|
+| `vt_matmul_bt_gemv` | **2.68e-14** |
+| tile GEMM | 7.40e-13 |
+
+The bf16 parity arms cannot discriminate the two kernels at all: at bf16 output
+the NMSE is dominated by store rounding and both print 2.8e-06 to six digits. An
+f32 arm was added to the suite specifically to separate a defect from a
+rounding-order change.
+
+**The SACRED gate was re-captured, not weakened.** `our_ids_metal.npy` had been
+captured with the LESS accurate tile kernel, so it was kernel-specific and went
+stale the moment the numerics improved; the gate correctly went red (hard anchor
+drift p10 tok12). Re-capture followed the documented flow: dump the new Metal
+sequence on the M4, then teacher-force vLLM 0.25.0 on dgx
+(`scripts/qwen3-neartie-gap.py`, oracle venv, run in a SCRATCH dir so the CUDA
+goldens could not be touched). **4 of 256 tokens changed, all in prompt 10.** The
+oracle's verdict on the new sequence is better than on the old:
+
+| | new golden | old committed |
+|---|--:|--:|
+| tokens that ARE vLLM's argmax | **255 / 256** | 253 / 256 |
+| mean gap | 0.7 mnats | 1.5 mnats |
+| max gap | 0.188 nats | 0.125 nats |
+| outside vLLM top-K | **0** | 0 |
+
+Gate now **16/16 (10 strict token-exact + 6 near-tie band, max gap 0.188 nats, 0
+forward-divergent)**, the same strict/band split as before. Unit suite 20 cases /
+20,125 assertions, including a test that proves the GEMV actually routed, since a
+numeric check alone cannot (the tile kernel computes the same answer).
+
+**Status: INDICATIVE, NOT BINDING.** Weaker isolation than the `M3c-1` numbers:
+the GPU lock was held for the whole alternating A/B, but darwin CI jobs were
+active on the box and the runners were NOT paused (the pause script correctly
+refused to boot a runner mid-job). Both arms alternate and so see the same
+contention, and the b=16 inertness control landed within 0.1%.
+
+---
+
 ## Metal `M3c-1` batched command buffers on Apple M4 (2026-07-27) - INDICATIVE
 
 **The lever the attribution below identified, implemented and measured.** Same

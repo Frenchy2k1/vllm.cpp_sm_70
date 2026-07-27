@@ -371,10 +371,15 @@ namespace {
 // encode takes, against the ~186 us it saves).
 class Encoder {
  public:
-  explicit Encoder(const char* fn_name) : lock_(TheBatch().mu) {
+  // `prof_label`, when given, is what the profile attributes this dispatch to.
+  // It exists so ONE pipeline can be split by shape class in the report (a
+  // decode GEMV and a prefill GEMM are the same kernel but not the same
+  // performance problem), without inventing a second pipeline.
+  explicit Encoder(const char* fn_name, const char* prof_label = nullptr)
+      : lock_(TheBatch().mu) {
     prof_ = vtprof::Get().enabled.load(std::memory_order_relaxed);
     if (prof_) {
-      prof_name_ = fn_name;
+      prof_name_ = prof_label != nullptr ? prof_label : fn_name;
       t_ctor_ = vtprof::Now();
     }
     pool_ = [[NSAutoreleasePool alloc] init];
@@ -524,6 +529,21 @@ void AddKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 // in — and can be switched back off in the same binary with
 // VT_OP_PROVIDER_DISABLE=mlx.
 constexpr uint32_t kGemmTile = 16;
+// Must match VT_GEMV_SGS in metal_msl.h; Apple simdgroups are 32-wide.
+constexpr uint32_t kGemvSimdgroups = 8;
+
+// Same-binary A/B lever for the GEMV fast path, which the benchmark protocol
+// requires ("use a same-binary A/B") and which doubles as the bisect switch if
+// a decode result is ever suspected of coming from this kernel.
+// VT_METAL_NO_GEMV=1 routes m=1 back through the tile GEMM.
+bool GemvEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_METAL_NO_GEMV");
+    return !(e != nullptr && e[0] == '1');
+  }();
+  return on;
+}
+constexpr uint32_t kSimdWidth = 32;
 
 void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[1];
@@ -531,7 +551,7 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
                static_cast<uint32_t>(k),       static_cast<uint32_t>(a.stride[0]),
                DtypeCode(a.dtype),             DtypeCode(b.dtype),
                DtypeCode(out.dtype),           0u};
-  Encoder e("vt_matmul");
+  Encoder e("vt_matmul", m == 1 ? "vt_matmul(gemv m=1)" : "vt_matmul(gemm m>1)");
   e.BindTensor(a, 0, "matmul: a");
   e.BindTensor(b, 1, "matmul: b");
   e.BindTensor(out, 2, "matmul: out");
@@ -545,7 +565,22 @@ void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
                static_cast<uint32_t>(k),       static_cast<uint32_t>(a.stride[0]),
                DtypeCode(a.dtype),             DtypeCode(b.dtype),
                DtypeCode(out.dtype),           1u};
-  Encoder e("vt_matmul");
+  // M3d: decode (m == 1) takes the GEMV kernel, which is the shape 21,464 of
+  // 21,632 matmuls in a generation actually have. Everything else keeps the
+  // tile GEMM. Routing on m alone keeps the gate narrow: same op, same operands,
+  // one kernel swapped for a shape it is strictly better suited to.
+  if (m == 1 && GemvEnabled()) {
+    Encoder e("vt_matmul_bt_gemv");
+    e.BindTensor(a, 0, "matmul_bt: a");
+    e.BindTensor(b, 1, "matmul_bt: b");
+    e.BindTensor(out, 2, "matmul_bt: out");
+    e.BindBytes(&p, sizeof(p), 3);
+    // One simdgroup per output column, kGemvSimdgroups of them per threadgroup.
+    e.DispatchGrid2D((n + kGemvSimdgroups - 1) / kGemvSimdgroups, 1,
+                     kGemvSimdgroups * kSimdWidth);
+    return;
+  }
+  Encoder e("vt_matmul", "vt_matmul_bt(gemm m>1)");
   e.BindTensor(a, 0, "matmul_bt: a");
   e.BindTensor(b, 1, "matmul_bt: b");
   e.BindTensor(out, 2, "matmul_bt: out");
