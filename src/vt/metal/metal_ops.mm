@@ -892,7 +892,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   // a wider group buys real parallelism there even though the V accumulation is
   // still bounded by `d`. Measured experiment, not an assumption.
   const uint32_t tg = ChooseThreadgroupSize(
-      d * 2, MetalContext::Get().PipelineMaxThreads("vt_paged_attention"));
+      d * 4, MetalContext::Get().PipelineMaxThreads("vt_paged_attention"));
   PagedAttnParams p{
       static_cast<uint64_t>(k_cache.stride[0]), static_cast<uint64_t>(k_cache.stride[1]),
       static_cast<uint64_t>(k_cache.stride[2]), static_cast<uint64_t>(v_cache.stride[0]),

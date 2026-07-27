@@ -2555,6 +2555,35 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Metal attention V-split across key groups on Apple M4 (2026-07-27) - +4.8%
+
+The fix the width experiment named. Parallelising V over `d` alone used only `d`
+threads, which is exactly why 4d measured WORSE than the baseline. Each key-group
+now walks a strided slice of the chunk's keys into its own partial accumulator in
+threadgroup memory, and the partials are summed once per chunk. Coalescing is
+preserved: adjacent threads still read adjacent elements of the same V row.
+
+| config | throughput | attention GPU |
+|---|--:|--:|
+| 2d, no split (before) | 19.51 tok/s | 966 ms |
+| 2d + V-split | 20.07 | 710 ms |
+| **4d + V-split** | **20.44** (20.35 / 20.53) | — |
+| 8d + 8 groups | 19.87 | — |
+
+**4d is now the optimum where it was previously worse than baseline** — the V
+split is precisely what unlocked the extra width, confirming the diagnosis rather
+than merely tuning. 8d over-shoots. Attention is now **1636 -> 710 ms across four
+changes, 2.3x**.
+
+**Honest cost:** the golden re-capture is slightly WORSE than the one it
+replaces. 255/256 tokens are vLLM's argmax against the previous 256/256, mean gap
+0.49 vs 0.00 mnats, max 0.125 vs 0.0000. Zero outside top-K and zero beyond the
+0.5-nat band, so the gate criterion holds (16/16), but the perfect agreement
+reported last round was a property of the old accumulation order and is now
+traded for 4.8% speed. Recorded rather than glossed.
+
+---
+
 ## Metal attention threadgroup width on Apple M4 (2026-07-27) - +2.3%
 
 Decode launches one threadgroup per (head, query token), which for a single token

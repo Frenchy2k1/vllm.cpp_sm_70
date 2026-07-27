@@ -26249,3 +26249,31 @@ Gate 16/16 unchanged, max gap still 0, no re-capture (thread count does not
 change accumulation order).
 
 **Goal:** 19.51 of 27.9 tok/s, 1.43x remaining.
+
+---
+
+## 2026-07-27 — attention V-split across key groups: +4.8%, 19.51 -> 20.44 tok/s
+
+The fix the width experiment named. Parallelising V over `d` alone used only `d`
+threads, which is why 4d had measured WORSE than baseline. Each key-group now
+walks a strided slice of the chunk's keys into its own partial accumulator in
+threadgroup memory; partials are summed once per chunk. Coalescing preserved.
+
+| config | throughput | attention GPU |
+|---|--:|--:|
+| 2d, no split | 19.51 | 966 ms |
+| 2d + split | 20.07 | 710 ms |
+| **4d + split** | **20.44** | — |
+| 8d + 8 groups | 19.87 | — |
+
+**4d is now optimal where it was previously worse than baseline**: the V split is
+what unlocked the width, which confirms the diagnosis rather than just tuning a
+constant. Attention **1636 -> 710 ms across four changes, 2.3x**.
+
+**HONEST COST:** the re-captured golden is slightly worse than the one it
+replaces — 255/256 vs 256/256 tokens equal to vLLM's argmax, mean gap 0.49 vs
+0.00 mnats, max 0.125 vs 0.0000. Still 0 outside top-K and 0 beyond the band, so
+the gate holds at 16/16, but the perfect agreement reported last round was a
+property of the old accumulation order and has been traded for 4.8% speed.
+
+**Goal:** 20.44 of 27.9 tok/s, **1.36x remaining**.
