@@ -2437,6 +2437,43 @@ in that evidence document before publishing these values as binding for the
 development branch.
 This 4B diagnostic does not establish 27B/35B support.
 
+## `M3c-1` CUDA-path neutrality on GB10 (2026-07-27) - NO MEASURABLE REGRESSION
+
+**Discharges the debt the `M3c-1` commit declared.** That change edited two files
+on every backend's path, not just Metal: `include/vt/backend.h` gained the
+`FlushPending()` virtual, and `src/vt/op_provider.cpp` added a relaxed atomic
+load plus a branch inside `GetOp`, which every op dispatch calls. The reasoning
+says that is free on CUDA (`ref_selected` can never be true on a discrete GPU,
+since the reference tier is gated on unified memory, and the load hits a cache
+line `GetOp` just read). Reasoning is not evidence, so it was measured.
+
+**Method.** Two trees on the same box, `489a7544` (before) against `a9c6d41e`
+(after), identical CUDA 13 / sm_121a build flags, 3 reps with the arms
+alternated, **the whole A/B inside one `flock /tmp/gpu`** so no foreign job could
+interleave between arms. Workload deliberately chosen for SENSITIVITY rather
+than realism: OPT-125m, `--input-len 128 --output-len 256 --concurrency 1`. A
+small model in a decode-heavy loop maximises dispatches per second, which is
+exactly where a per-`GetOp` cost would show up first.
+
+| rep | before (`489a7544`) | after (`a9c6d41e`) |
+|--:|--:|--:|
+| 1 | 114.43 | 114.07 |
+| 2 | 114.60 | 114.74 |
+| 3 | 114.83 | 114.95 |
+| **mean** | **114.62** | **114.59** |
+
+**-0.03% on the mean, against a run-to-run spread of up to 0.77%.** No
+measurable regression on the CUDA path.
+
+**What this does NOT claim.** It is not a gate-model run: the 27B/35B throughput
+gates against the vLLM oracle were NOT re-run, and this does not substitute for
+them. It bounds the cost of one hot-path edit on the most dispatch-intensive
+workload available, nothing wider. Correctness on CUDA was separately checked
+with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
+`test_backend_cross_device` 6/6 (162 assertions) on the same box.
+
+---
+
 ## Metal `M3c-1` batched command buffers on Apple M4 (2026-07-27) - INDICATIVE
 
 **The lever the attribution below identified, implemented and measured.** Same
