@@ -26488,3 +26488,44 @@ a cost.** Worth revisiting ONLY if the CPU ever gains independent work to overla
 **Remaining gap, restated on the warm basis:** decode 4.8%, total 11.8%. Prefill
 GPU is 930 ms warm against MLX's ~538 ms, and `vt_matmul_bt_mm` is still the bulk
 of it with its exclusion list unchanged.
+
+---
+
+## 2026-07-27 — MLX provider verdict, and exactly what parity requires
+
+**MLX GEMM provider: settled, and it must default to OFF.** Same-binary A/B
+(`VT_OP_PROVIDER_DISABLE=mlx`), warm, one lock window: prefill TTFT 1370 ms ON vs
+1400 ms OFF; warm g=128 throughput **11.98 ON vs 22.06 OFF**. MLX's steel GEMM is
+~20% faster than ours in isolation, but the provider pays a per-op `mx::eval`
+sync plus an output memcpy (it cannot write into our buffer). On prefill's 112
+GEMMs that leaves +2%; on decode's ~112 matmuls PER TOKEN it costs 46%.
+Consequence for LocalAI PR #11137: the darwin default is inverted and must flip.
+
+**The gap, decomposed (warm, thermally matched, b=1 p=512 g=128):**
+
+```
+ours : prefill 0.905s + decode 5.085s = 5.990s -> 21.37 tok/s
+mlx  : prefill 0.538s + decode 4.852s = 5.390s -> 23.75 tok/s
+gap 600 ms = prefill 367 ms (61%) + decode 233 ms (39%)
+```
+
+Fixing either alone falls short: perfect prefill -> 95.9%; perfect decode ->
+93.6%. **PARITY REQUIRES BOTH.** Worse, prefill at 0.538 s needs the GEMM at
+3.78 TFLOP/s from 2.25 (+68%) — MORE than MLX's own steel GEMM does (~3.07),
+because our prefill also carries attention and elementwise work. Matching MLX's
+GEMM exactly lands prefill at ~0.733 s and the total at ~92.6%, still short.
+
+**Decode is bandwidth-bound and at the wall.** 92% of decode GPU time is GEMV
+(4379 of 4777 ms over 128 tokens) at ~99 GB/s against the M4's ~120 GB/s peak;
+MLX's implied rate is the same. The 4.8% is NOT in the GEMV. It is in **398
+dispatches per token** (168 GEMV, 113 rms_norm, 28 each of attention/rope/
+silu/reshape_cache), where the small kernels are ~5% of GPU time but carry
+~2.7 us of encode apiece. The decode lever is FUSION — fewer dispatches — not a
+faster kernel.
+
+**Honest status of the standing goal.** Not met, and not reachable by any lever
+now identified. Two concrete projects would be required, in parallel:
+1. A prefill GEMM beating MLX's steel (the exclusion list says this needs a
+   different algorithm, not another parameter).
+2. Decode kernel fusion to cut 398 dispatches/token materially.
+Each is a project, not a patch. Everything cheaper has been measured.

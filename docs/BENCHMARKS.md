@@ -2555,6 +2555,50 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## What parity actually requires, and the MLX provider verdict (2026-07-27)
+
+**The MLX GEMM provider settles its own question.** Same-binary A/B
+(`VT_OP_PROVIDER_DISABLE=mlx`), warm, one lock window:
+
+| | prefill TTFT | warm g=128 throughput |
+|---|--:|--:|
+| MLX provider ON | 1370 ms | **11.98** |
+| MLX provider OFF | 1400 ms | **22.06** |
+
+MLX's steel GEMM is ~20% faster than ours in isolation, yet routing prefill to it
+buys only 2% — the per-op `mx::eval` sync and the output memcpy (the provider
+cannot write into our buffer, see metal_mlx_provider.mm) eat the advantage. On
+decode, with ~112 matmuls per token each paying that sync, it costs 46%.
+**MLX must default to OFF**, and it is not a route to parity.
+
+**The gap, decomposed.** Warm, thermally matched, b=1, p=512, g=128:
+
+```
+ours : prefill 0.905s + decode 5.085s = 5.990s -> 21.37 tok/s
+mlx  : prefill 0.538s + decode 4.852s = 5.390s -> 23.75 tok/s
+gap 600 ms = prefill 367 ms (61%) + decode 233 ms (39%)
+```
+
+Fixing either ALONE is not enough:
+
+- perfect prefill, decode unchanged -> 22.76 tok/s = **95.9%**
+- perfect decode, prefill unchanged -> 22.23 tok/s = **93.6%**
+
+**Parity requires both.** And prefill at 0.538 s needs the GEMM at 3.78 TFLOP/s
+from today's 2.25 (+68%) — more than MLX's own steel GEMM achieves (~3.07),
+because our prefill also carries attention and elementwise work. Matching MLX's
+GEMM exactly would land prefill near 0.733 s and the total at ~92.6%.
+
+**Decode is bandwidth-bound and already at the wall.** Attribution over 128
+tokens: 92% of decode GPU time is GEMV (4379 of 4777 ms), running at ~99 GB/s
+against the M4's ~120 GB/s peak. MLX's implied rate is the same. The 4.8% decode
+gap is not in the GEMV — it is in the **398 dispatches per token** (168 GEMV, 113
+rms_norm, and the rest), whose small kernels are only ~5% of GPU time but carry
+~2.7 us of encode each. Closing it means FUSION (fewer dispatches), not faster
+kernels.
+
+---
+
 ## COLD vs WARM, and a thermally matched MLX-LM comparison (2026-07-27)
 
 Two corrections to how this document has been comparing against MLX-LM, plus one
