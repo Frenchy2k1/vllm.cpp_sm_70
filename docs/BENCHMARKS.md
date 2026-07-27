@@ -53,8 +53,8 @@ sampler's log_softmax+rank gather is gated in `test_sampler`; the forward is
 SACRED-bit-exact). A live vLLM cross-check on the random tiny fixture is infeasible
 (vLLM cannot load it); value-parity rests on the ported-algorithm + bit-exact-forward
 argument, oracle-gated at the serialization boundary. CPU `-Werror` 0-warn.
-`SAMPLE-PROMPT-LOGPROBS` stays `ACTIVE` (payload path DONE; the runner
-prompt-position-logits source is pending). Repro:
+`SAMPLE-PROMPT-LOGPROBS` stays `PARTIAL` (payload path done; the runner
+prompt-position-logits source is pending). Closing commit `7a3f04b2`. Repro:
 `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build build-cpu -j &&
 ctest -R "test_openai_logprobs|test_openai_serving"`.
 
