@@ -2862,6 +2862,46 @@ with `test_op_provider` 11/11, `test_reference_tier` 5/5, `test_backend` 7/7 and
 
 ---
 
+## Prefill attention: "deepen BK" is BLOCKED; the softmax is the real target
+
+Two results from scoping the lead below before building on it. The first kills
+the fix I proposed; the second replaces it with a better one.
+
+**"Deepen BK" is blocked by a precision/LDS tension, not merely unimplemented.**
+Threadgroup budget is 32 KB:
+
+| config | LDS |
+|---|--:|
+| current BQ=32 BK=16 sv=f32 | 27.0 KB |
+| BQ=32 BK=32 sv=f32 | 43.0 KB |
+| BQ=16 BK=32 sv=f32 | 34.5 KB |
+| BQ=32 BK=32 sv=bf16 | 35.0 KB |
+| **BQ=16 BK=32 sv=bf16** | **26.5 KB (fits)** |
+
+Every configuration that fits needs a bf16 `sv` — and bf16 `sv` FORCES bf16 `P`,
+because `simdgroup_multiply_accumulate` requires matching operand types. bf16 P
+is exactly what moved a greedy token when the mma kernel landed (prompt[0]
+tok=5). So this direction costs precision to buy amortisation, which is a real
+trade rather than a free win, and should not be attempted without deciding that
+question first.
+
+**The better target, which needs NO extra LDS: the online softmax runs ONE THREAD
+PER QUERY ROW — 32 of 256 threads, 12% occupancy** — each looping serially over
+the chunk's 16 keys, while the other 224 threads wait at the barrier. The mma
+stages either side of it use all 256. That idle fraction sits between two mma
+passes in the innermost loop, which is consistent with attention measuring
+547 GFLOP/s where the GEMM sustains 2851.
+
+Reworking it as one simdgroup per query row (8 simdgroups covering 32 rows, 4
+rows each, with `simd_max`/`simd_sum` over the 16 keys) uses all 256 threads and
+changes no allocation. It DOES change the reduction order, so expect a near-tie
+flip and budget for a golden re-anchor.
+
+**Both are arithmetic, not measurement.** The LDS table is exact; the 12% figure
+is exact; the causal link to 547 GFLOP/s is a hypothesis.
+
+---
+
 ## Standing at 96.0-96.4%, and the largest remaining lead (2026-07-27)
 
 Thermally matched, warm, after four landed kernels:

@@ -27764,3 +27764,39 @@ elsewhere, and treat any large ratio as a defect rather than a ceiling. It found
 prefill attention (21x), decode V accumulation (2.2x), and this. Bisect with
 measurement-only stubs to localise; verify with scripts/metal-paired-ab.py, never
 with single runs.
+
+---
+
+## 2026-07-27 — prefill attention: "deepen BK" is BLOCKED; the softmax is the real target
+
+Scoped the lead from the previous entry before building on it. The first result
+kills the fix I proposed there; the second replaces it.
+
+**"Deepen BK" is blocked.** 32 KB threadgroup budget:
+
+| config | LDS |
+|---|--:|
+| current BQ=32 BK=16 sv=f32 | 27.0 KB |
+| BQ=32 BK=32 sv=f32 | 43.0 KB |
+| BQ=16 BK=32 sv=f32 | 34.5 KB |
+| BQ=32 BK=32 sv=bf16 | 35.0 KB |
+| **BQ=16 BK=32 sv=bf16** | **26.5 KB fits** |
+
+Every fitting config needs bf16 `sv`, and bf16 `sv` FORCES bf16 `P` because
+`simdgroup_multiply_accumulate` needs matching operand types. bf16 P is precisely
+what moved a greedy token when the mma kernel landed. So the direction trades
+precision for amortisation; decide that question before writing code.
+
+**Better target, needs NO extra LDS: the online softmax runs ONE THREAD PER QUERY
+ROW — 32 of 256 threads = 12% occupancy** — looping serially over the chunk's 16
+keys while 224 threads wait at the barrier. The mma stages either side use all
+256. That idle fraction sits between two mma passes in the innermost loop, which
+is consistent with 547 GFLOP/s against the GEMM's 2851.
+
+Rework as ONE SIMDGROUP PER QUERY ROW (8 simdgroups over 32 rows, 4 rows each,
+`simd_max`/`simd_sum` across the 16 keys): all 256 threads busy, no allocation
+change. It changes reduction order, so expect a near-tie flip and budget a golden
+re-anchor — the flow is proven twice in this session.
+
+**Both results are arithmetic, not measurement.** The LDS table and the 12% are
+exact; the causal link to 547 GFLOP/s is the hypothesis to test first.
