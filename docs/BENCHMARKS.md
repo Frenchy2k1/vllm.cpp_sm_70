@@ -1538,6 +1538,9 @@ zero-new-kernel so it is honesty-pass gateable (config/loader/unit/build), e2e H
 (104.8 GiB)** is the fitting variant that would yield the first GLM-MoE e2e if fp8-checkpoint loading lands.
 Kimi-K2 (958.5 GiB) / MiniMax-M3 (795.5 GiB + sm100 sparse + multimodal) / GLM-5 (1404 GiB + DSA
 DEP-blocked) are registry/config-resolution only. No number is claimed here.
+
+**Datacenter CUDA fast-path (Hopper `sm_90a` + datacenter-Blackwell `sm_100/103/110`) - SPIKE ONLY, DESIGN, no build/run (2026-07-27, `CLAIM-CUDA-DATACENTER-SCOPE` [spike](../.agents/specs/cuda-arch-datacenter-fastpath.md)).**
+Disposition: **NOT APPLICABLE - scoping spike, read-only on production code; NO code written, NO build, NO GPU, NO benchmark (`benchmark_binding=false`).** Scopes the DERIVE-AND-SHIP plan for the datacenter fast-path kernel bodies (framework done; every wgmma/tcgen05 fast-path FEATURE-TABLE cell EMPTY, no board here). The perf/correctness numbers are FUTURE gates, tiered by a SIGNAL matrix: `DERIVED+BUILD-VERIFIED (testing-welcome)` = 1:1 CUTLASS-template port + compile + `cuobjdump` SASS proof HERE via a single-arch `90a`/`100a` cross-compile (NO Hopper/B200 board), HONESTLY labeled untested (a green link is not execution evidence); `RUNTIME-VERIFIED` = a cloud H100/B200 token-exact-vs-vLLM + every-axis (throughput/req-s/TTFT/TPOT/peak-mem) run, which is the only number that would be claimed. DeepGEMM (runtime JIT/autotune) is `NOT-YET-BUILDABLE / needs-real-port` and ships no fake. No number is claimed here.
 **Multimodal M0+M1 (input pipeline + encoder-cache seam, Qwen3-VL) - PROCESSOR-PARITY GATE PASS,
 correctness only, `benchmark_binding=false` (2026-07-25, `CLAIM-MULTIMODAL-M1`
 [spec](../.agents/specs/multimodal-track.md)).**
