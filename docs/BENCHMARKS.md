@@ -100,6 +100,40 @@ measured and is deliberately NOT estimated, so no ratio is asserted between the
 two. Reproduce: `python3 benchmarks/demo/concurrency_race.py` and `python3
 benchmarks/demo/footprint.py`.
 
+**FOOTPRINT RE-MEASURED APPLES-TO-APPLE ON THE CUDA BINARY (2026-07-28,
+`CLAIM-DEMO-FOOTPRINT-CUDA`).** Disposition: **the 2026-07-27 caveat is RESOLVED —
+both sides now freshly measured on the SAME GB10 (dgx.casa), and the vllm.cpp side
+is the CUDA fast-path build, not CPU.** Build: `cmake -S . -B build-cuda
+-DVLLM_CPP_CUDA=ON -DVLLM_CPP_SERVER=ON -DCMAKE_BUILD_TYPE=Release
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`; configure banners confirm
+`cutlass-nvfp4 ENABLED [121a]`, `cutlass-fp8 ENABLED [121a]`, `FlashAttention-2
+prefill/decode ENABLED [121a]` (so cutlass 4.5.0 + the vendored FA-2 device code
+are really linked). `cmake --build build-cuda --target server vllm_shared`.
+**vllm.cpp install = one stripped CUDA `server` binary = 68,974,608 bytes
+(65.78 MiB)** (`strip`; `stat -c %s`); it statically links `libvllm.a`, so this
+single file is the whole deployment (`libvllm.so`, 65.66 MiB stripped, is the
+alternative library form of the same code, NOT an additional file). **`ldd
+build-cuda/examples/server`: the ONLY non-system deps are `libcudart.so.13`
+(0.67 MiB) and `libcublasLt.so.13` (600.76 MiB), both from the SYSTEM CUDA toolkit
+`/usr/local/cuda-13.0` present on any GB10;** everything else is base OS runtime
+(libc/libm/libstdc++/libgcc_s/...). **vllm.cpp therefore BUNDLES ZERO CUDA
+userspace** and reuses the system CUDA runtime, whereas vLLM bundles its own copies
+inside its pip `nvidia-*` wheels (3,144.7 MiB, counted in its bar) — the system
+CUDA bytes are named in the card footnote, NOT silently dropped. **vLLM side
+re-measured same box (`du -sk -L ~/venvs/vllm-oracle` = 9,542,288 KiB = 9,318.6 MiB
+= 9.10 GiB; venv symlink resolves to `vllm-oracle-v0.25.0-stage`, `import vllm` →
+0.25.0, torch 2.11.0+cu130 — the 0.26.0.dev0 pin is currently rolled back on this
+box):** `nvidia` 3,144.7 MiB, `flashinfer_cubin` 1,853.8 MiB, `torch` 912.8 MiB,
+`triton` 600.3 MiB, `nvidia_cutlass_dsl` 192.4 MiB, everything else 2,614.6 MiB.
+**HONEST STORY CHANGE:** the earlier CPU figure (9.85 MiB) understated the real
+install; the true CUDA binary is 65.8 MiB, so the install gap is **9.10 GiB vs
+65.8 MiB = ~142× smaller** (or ~14× even if the system `libcublasLt` is charged
+against vllm.cpp) — materially smaller than the old CPU-vs-CUDA framing implied,
+but still a large, honest, like-for-like gap. Reproduce: rebuild as above on a
+GB10, then `python3 benchmarks/demo/footprint.py` renders
+`benchmarks/media/footprint.png` from `benchmarks/demo/footprint_gb10.json` (every
+value carries a `_source` naming the measuring command).
+
 **FA2 Ampere enablement (WA-1) BUILD-VERIFY — `ROAD-V1-D1-CUDA` first brick
 (2026-07-27, `CLAIM-CUDA-AMPERE-SCOPE`).** Disposition: **ACCEPTED BUILD-VERIFY
 evidence — NO throughput number (a board is needed for that; `benchmark_binding=false`).**
