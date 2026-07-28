@@ -2783,6 +2783,13 @@ capi 232, runner 257.
 **Owed later, on GPU:** the axis-A token-identity gate and an acceptance number,
 mirroring how `SPEC-DFLASH` itself was measured. Not owed by a loader row.
 
+**GPU attempt 2026-07-28 for the MTP sibling row: BLOCKED, no number.** Both
+head-carrying GGUFs on the GPU box are NVFP4 and GGUF dequant does not
+implement type 40, so the end-to-end cases threw at load with zero GPU work
+(`nvidia-smi --query-compute-apps` empty). Pre-existing engine gap. The loader
+gate did pass 18/18 there against the 35B A3B MoE GGUF - a loader result, not
+inference.
+
 ### DFlash-from-GGUF asset survey, `SPEC-DFLASH-GGUF` D0 (2026-07-28) - survey only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - an availability survey, zero code.

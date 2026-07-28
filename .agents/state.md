@@ -29978,3 +29978,36 @@ green.
   `roadmap_v1.md`, `coordination.md` claim, `docs/STATUS.md`, `docs/BENCHMARKS.md`,
   ledger, this log. NOT pushed. NEXT: fix the sm_87 async-runner illegal access;
   GGUF leg; FA2 (needs cutlass on the Orin); llama.cpp A/B.
+
+## 2026-07-28 — GPU run ATTEMPTED and BLOCKED: NVFP4 GGUF dequant is unimplemented
+
+Ran the `SPEC-MTP-GGUF` end-to-end gate on dgx.casa (GB10, CUDA 13,
+`main@5a03f112`, arch 121a). **It did not run.** Both cases threw at model load:
+
+    gguf dequant: unsupported ggml type 40 (NVFP4) (Task 2/i-quant)
+
+Both head-carrying GGUFs on that box (`q36-27b-nvfp4.gguf`,
+`q36-35b-a3b-nvfp4.gguf`) are NVFP4-quantized and the GGUF dequant path does not
+implement type 40. ZERO GPU work occurred: `nvidia-smi --query-compute-apps`
+listed no compute processes. NVFP4 is supported for SAFETENSORS, not for GGUF -
+a pre-existing engine gap, independent of this row.
+
+**Real result from the same session:** the loader gate `test_qwen3_5_gguf_mtp`
+passed 18/18 against the 35B A3B MoE GGUF, exercising the `kMoe` head branch
+(`LoadMoeGguf`, `moe_layers`) on real weights for the first time. It succeeds
+because the MTP head BLOCK's tensors are not NVFP4 - only the trunk's are. That
+is a LOADER result; no MoE inference ran, and it must not be cited as one.
+`test_qwen3_dflash_gguf` also passed 47/47 there.
+
+**Process failure, mine, recorded.** I reported the run as "RUNNING" and told the
+user the GPU was in use. It had already failed. I had read `[N/A]` from
+`nvidia-smi --query-gpu=memory.used` and explained it away as a GB10
+unified-memory quirk instead of checking `--query-compute-apps` or `ps`; a
+`pgrep` that matched nothing was read as liveness. The user challenged it
+("are you sure the gpu is being used?") and the challenge was correct.
+Lesson: for "is it running", check the PROCESS TABLE and the compute-app list.
+A metric that returns N/A is a reason to verify, not a quirk to excuse.
+
+**Next:** the dense 2B Q8_K_XL GGUF is dequantable and is the file the CPU gate
+already passes on; uploading it gives a genuine GPU end-to-end run. NVFP4 GGUF
+dequant is a SEPARATE capability and must not be filed under this row.

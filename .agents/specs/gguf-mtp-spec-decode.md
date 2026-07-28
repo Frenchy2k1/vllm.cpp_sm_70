@@ -232,6 +232,31 @@ the drafter -> identical divergence at 0 acceptance, so not the head; (2) `ngram
 itself; (3) instrument both conv kernels -> 3-vs-4 stride split, pointing at the
 state movement between them.
 
+## GPU-run attempt 2026-07-28: BLOCKED on NVFP4 GGUF dequant (not this row)
+
+The `G4`/`G5` GPU run was attempted on dgx.casa (GB10, CUDA 13, `main@5a03f112`,
+`-DVLLM_CPP_CUDA_ARCHITECTURES=121a`). **It did not run.** Both cases threw at
+model load:
+
+    gguf dequant: unsupported ggml type 40 (NVFP4) (Task 2/i-quant)
+
+Both head-carrying GGUFs available on that box (`q36-27b-nvfp4.gguf`,
+`q36-35b-a3b-nvfp4.gguf`) are NVFP4-quantized, and the GGUF dequant path does not
+implement type 40. No GPU work occurred - `nvidia-smi --query-compute-apps`
+listed zero compute processes. This is a PRE-EXISTING engine gap (NVFP4 is
+supported for safetensors, not for GGUF), independent of this row.
+
+**What DID pass on the GPU box**, and is a real result: the loader gate
+`test_qwen3_5_gguf_mtp` 18/18 against the **35B A3B MoE** GGUF. That exercises
+the `kMoe` head branch (`LoadMoeGguf` per head layer, `moe_layers`) on real
+weights for the first time - it succeeds because the MTP head block's own tensors
+are not NVFP4, only the trunk's are. It is a LOADER result: no MoE inference ran.
+
+**Consequence for the row.** `G4` stays satisfied by the CPU run only (dense 2B,
+token-exact, 13/11 acceptance). A GPU end-to-end run needs a head-carrying GGUF
+in a dequantable encoding; the dense 2B Q8_K_XL is one. NVFP4 GGUF dequant is a
+separate capability and should not be filed under this row.
+
 ## Risks/decisions
 
 - **RISK (highest): the test asset may not exist publicly.** Most published

@@ -623,9 +623,15 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   Gated on CPU against a real llama.cpp-converted Qwen3.5-2B: **spec-ON output is
   token-identical to spec-OFF with 13 drafts proposed / 11 accepted**, plus an
   `ngram` regression guard. A GGUF exported without the head is refused, naming
-  that as the reason. `GATING` rather than `DONE`: no GPU run and no
-  cross-format (F16 GGUF vs safetensors) agreement check yet, and no throughput
-  number.
+  that as the reason. `GATING` rather than `DONE`: the GPU end-to-end run was
+  ATTEMPTED and is BLOCKED - every head-carrying GGUF on the GPU box is NVFP4 and
+  GGUF dequant does not implement type 40 (`unsupported ggml type 40 (NVFP4)`),
+  so both cases threw at load with ZERO GPU work. That is a pre-existing engine
+  gap, not a defect in this row. The loader gate DID pass 18/18 there against the
+  35B A3B MoE GGUF, exercising the MoE head branch on real weights for the first
+  time (the head block's own tensors are not NVFP4) - a loader result, with no
+  MoE inference run. Still outstanding: a GPU end-to-end run on a dequantable
+  head-carrying GGUF, cross-format agreement, and a throughput number.
 - **Speculative decoding on CPU corrupted the target's own state, and is FIXED**
   (`CPU-SPEC-DIVERGENCE`). `qwen3_5.cpp:3616` sized the GDN state gather/scatter
   row by `(Kw-1)` while the speculative persistent row is `(Kw-1)+num_spec`, so
