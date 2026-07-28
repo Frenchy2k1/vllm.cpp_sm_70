@@ -294,10 +294,31 @@ ONE abstraction, three transports — mirroring vLLM's `device_communicators`:
 ## Non-overlapping work breakdown (W-plan)
 
 - **W0 (this spike):** scope + seam map + rows + records. DONE.
-- **W1 — `vt::Communicator` skeleton (`BACKEND-DISTRIBUTED-COMM`):** the
-  process-group interface + `world_size==1` no-op path + new collective `OpId`s +
-  a CPU 2-proc-loopback provider to gate all-reduce/all-gather correctness with
-  NO GPU. Proves the abstraction; byte-neutral at world_size 1.
+- **W1 — `vt::Communicator` skeleton (`BACKEND-DISTRIBUTED-COMM`): DONE
+  (2026-07-28, CPU exact-gate, `CLAIM-SCALE-OUT-W1`).** Landed the process-group
+  interface (`include/vt/communicator.h`: `rank()`/`world_size()` +
+  `AllReduce(sum/max/min/prod)`/`AllGather`/`Send`/`Recv`, each stream-ordered on a
+  `Queue&`, ported 1:1 from `DeviceCommunicatorBase base_device_communicator.py:147`
+  and the `world_size==1` bypass `parallel_state.py:638`) and a CPU **in-process
+  multi-rank** transport (`src/vt/communicator.cpp`: N ranks = N host threads over
+  ONE generation-barrier + staging slots + a Send/Recv rendezvous mailbox — a REAL
+  cross-rank reduction, no IPC). Chose in-process multi-rank over a 2-proc loopback
+  (cleanest correctness gate, needs no IPC, and sidesteps the W2 per-device
+  registry blocker entirely). **Direct `Communicator` methods, NOT `OpId`
+  dispatch** — routing collectives through `OpProvider`/new `OpId`s
+  (`kAllReduce`/…) is deferred to W2 (a direct method is the cleaner W1 gate, and
+  the enum stays unpolluted by unregistered ops). Gate `tests/vt/test_communicator.cpp`:
+  **8 cases / 50 assertions PASS** — 2- & 4-rank AllReduce-sum exact on every rank
+  (f32/i32/i64/bf16), max/min, 2/4-rank AllGather concat, Send/Recv rendezvous, and
+  the `world_size==1` **byte-identical** no-op (identity for AllReduce, memcpy for
+  AllGather). **RED-first proven**: a non-reducing AllReduce stub failed 4 cases /
+  37 assertions; the real impl passes. Clean full-library CPU `-Werror` build, 0
+  warnings; the full vt/engine suite stays green (the abstraction is additive,
+  unused by the single-GPU path). **W2+ transport residuals (HW/registry-gated,
+  NOT this pass):** collective `OpId`/`OpProvider` routing; the NCCL (kCUDA),
+  multi-Spark RoCE, and MLX-ring (kMETAL) transports; the one-`Backend*`-per-
+  DeviceType registry (`backend.cpp:42`) + device-0 hardcoding
+  (`cuda_backend.cu:297-299`); and real TP/PP in the model forwards.
 - **W2 — TP forward + loader (`BACKEND-DISTRIBUTED-TP`):** shard the merged-weight
   memcpy (`dense_weight_loaders.h:131-138`) + divide heads (`dense_attn_block.h`)
   + insert all-reduce after o_proj (`:530`) and MLP down (`qwen3.cpp:90`); MoE EP

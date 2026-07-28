@@ -449,11 +449,13 @@ collective abstraction (mirroring vLLM's `device_communicators`). This is an
 extensibility-track concern (`ROAD-V1-C1`/`ROAD-V1-D1` adjacent) — a new
 interconnect becomes one transport provider, not a model-forward edit. Full
 scope, seam map and W-plan: [scale-out-distributed.md](specs/scale-out-distributed.md).
-All `SPIKE`, owned by `CLAIM-SCALE-OUT-SPIKE`.
+Scoped by `CLAIM-SCALE-OUT-SPIKE`; **W1 landed** the abstraction leg
+(`CLAIM-SCALE-OUT-W1`, 2026-07-28) — `BACKEND-DISTRIBUTED-COMM` is now `ACTIVE`,
+the other 4 rows stay `SPIKE`.
 
 | Leg | Scale-out row | What it adds | Gate HW |
 |---|---|---|---|
-| 0 — abstraction | [`BACKEND-DISTRIBUTED-COMM`](backend-matrix.md) | the `vt::Communicator` / process-group + collective `OpId`s; nccl/RDMA/MLX-ring transports; `world_size==1` byte-identical | CPU 2-proc loopback (W1, no GPU) |
+| 0 — abstraction ✅ **W1 DONE** | [`BACKEND-DISTRIBUTED-COMM`](backend-matrix.md) `ACTIVE` | the `vt::Communicator` / process-group (`include/vt/communicator.h` + `src/vt/communicator.cpp`) — AllReduce/AllGather/Send/Recv + `world_size==1` byte-identical; CPU in-process multi-rank transport proven (`test_communicator`, 50/50, RED-verified). W2+: collective `OpId` routing + NCCL/RDMA/MLX-ring transports | CPU in-process gate (W1, no GPU) — **PASSED** |
 | 1 — multi-GPU | [`BACKEND-DISTRIBUTED-TP`](backend-matrix.md), [`BACKEND-DISTRIBUTED-PP`](backend-matrix.md) | tensor + pipeline parallel (sharded linears/heads/experts/KV; stage split + send/recv) | ≥2-GPU box (absent — GB10 single-GPU) |
 | 2 — multi-Spark | [`BACKEND-DISTRIBUTED-MULTINODE-SPARK`](backend-matrix.md) | 2× DGX Spark over ConnectX-7 200GbE RoCE; unlocks DeepSeek-V4 fp8 (~167 GiB) across 238 GiB | 2 Sparks + QSFP cable |
 | 3 — MLX multi-node | [`BACKEND-DISTRIBUTED-MLX-RING`](backend-matrix.md) | `mlx.core.distributed` ring/JACCL over Thunderbolt; shards the Metal forward across Macs | 2 Thunderbolt-linked Macs |

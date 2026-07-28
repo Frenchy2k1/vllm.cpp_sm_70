@@ -30675,3 +30675,28 @@ same-quant IQ2_XXS GGUF benchmark is blocked on BOTH engines.**
 
 Appended to specs/deepseek-v4-flash.md §GGUF benchmark loadability + BENCHMARKS + STATUS +
 ledger. Records-only; no build/GPU/download/benchmark.
+- **2026-07-28** — **Scale-out W1 LANDED (`CLAIM-SCALE-OUT-W1`, CPU exact-gate, NOT
+  pushed).** First distributed-execution brick: `vt::Communicator`
+  (`include/vt/communicator.h`) — a device-bound process-group ported 1:1 from
+  vLLM's `DeviceCommunicatorBase` (`base_device_communicator.py:147`) + the
+  `GroupCoordinator` `world_size==1` bypass (`parallel_state.py:638`), exposing
+  `rank()`/`world_size()` + `AllReduce`(sum/max/min/prod)/`AllGather`/`Send`/`Recv`,
+  each stream-ordered on a `Queue&` (composes with compute via the existing
+  `Backend::RecordEvent`/`QueueWaitEvent`, `backend.h:87-104`). Transport = a CPU
+  **in-process multi-rank** communicator (`src/vt/communicator.cpp`, `CpuCommGroup`):
+  N ranks = N host threads sharing ONE generation-barrier + staging slots + a
+  Send/Recv rendezvous mailbox — a REAL cross-rank reduction, no IPC, which
+  sidesteps the W2 per-device backend-registry blocker (`backend.cpp:42`,
+  untouched). Chose direct `Communicator` methods over `OpId` dispatch (cleaner W1
+  gate; collective-op `OpProvider` routing deferred to W2, enum unpolluted). Gate
+  `tests/vt/test_communicator.cpp`: **8 cases / 50 assertions PASS** — 2- & 4-rank
+  AllReduce-sum exact on every rank (f32/i32/i64/bf16), max/min, 2/4-rank AllGather
+  concat, Send/Recv rendezvous, `world_size==1` byte-identical no-op. **RED-first
+  proven** (non-reducing stub fails 4 cases / 37 assertions). Clean full-library
+  CPU `-Werror` build, 0 warnings; full vt/engine suite stays green (additive,
+  unused by the single-GPU path). Records: `BACKEND-DISTRIBUTED-COMM` SPIKE→ACTIVE
+  (other 4 stay SPIKE); spec §W1 done; feature-matrix §3, roadmap scale-out,
+  coordination, STATUS, BENCHMARKS (NOT-APPLICABLE — infra), parity-ledger. All 6
+  record checkers rc=0. W2+ residuals: collective `OpId`/`OpProvider` routing, TP
+  forward+loader, NCCL(kCUDA)/RoCE(Spark)/MLX-ring(kMETAL) transports, the
+  per-device backend registry, real TP/PP in the model forwards.
