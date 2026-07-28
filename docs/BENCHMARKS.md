@@ -2605,9 +2605,15 @@ to be produced locally with llama.cpp master's `--target-model-dir`. It does not
 pre-converted `dflash`-arch drafts are published, and they are small because a
 DFlash draft is a few layers rather than a whole model (Q4_K_M ~1.03 GB, BF16
 ~3.47 GB for the Qwen3.6-27B draft). That removes a conversion run from the
-critical path. The fetch is gated by the AGENTS.md safe defaults; the matching
-TARGET remains the expensive dependency for the end-to-end gates but is not
-needed for the loader rows.
+critical path. The matching TARGET remains the expensive dependency for the
+end-to-end gates but is not needed for the loader rows.
+
+**`D0` is now CLOSED against the real file** (Q4_K_M, 1.03 GB, fetched): the full
+KV + tensor dump is recorded in the spike and every name in the Upstream chain
+holds. Two corrections to that chain fell out: `dflash.block_size` IS emitted as
+its own KV, and `dflash.target_hidden_size` is NOT emitted by this converter
+even though llama.cpp declares the key, so it must not be required. Still zero
+code, still `benchmark_binding=false`.
 
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 
