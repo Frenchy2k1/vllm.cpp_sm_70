@@ -29425,3 +29425,40 @@ established as the cause. Do not "fix" it without first proving `nat` reaches 0.
 variable instead of adding a checkpoint: a dead drafter makes the expected output
 provable a priori (it MUST equal spec-OFF), so a single run discriminates. Prefer
 that shape when a component can be neutralised rather than duplicated.
+
+## 2026-07-28 — `CPU-SPEC-DIVERGENCE` narrowed to the GDN conv row geometry
+
+Instrumented both CPU conv kernels during a spec run on the 2B GGUF (K=4 =>
+width=3, num_spec=1):
+
+    [DBG fwd]     state_len=3  width=3   CausalConv1dFwdKernel   (prefill)
+    [DBG specupd] state_len=4  width=3   CausalConv1dSpecUpdate  (decode)
+
+and established that `CausalConv1dUpdateKernel` (the non-spec single-token
+update) is NEVER called under speculation - decode runs exclusively through the
+spec update.
+
+The 3-vs-4 split is not by itself the bug. The narrow buffer is a GATHERED
+working copy (`qwen3_5.cpp:3648` `cs_shape = {nreq, conv_dim, Kw - 1}`), conv'd
+and then scattered back into the widened persistent row; the spec update then
+reads at `off = nat - 1 = 0`, i.e. the same leading taps. On inspection the two
+halves agree. Inspection is not proof, and this is precisely the seam I5e already
+had to repair once (its RCA was `gdn_state_gather: working/cache row shapes must
+match`), so `conv_row_elems` / `GdnStateGather` / `GdnStateScatter` agreeing on
+the widened geometry at RUNTIME is the open question.
+
+**Next probe (concrete, cheap):** dump one conv_state row (4 taps, one channel)
+right after the prefill scatter and right before the first spec-update read,
+spec-ON vs spec-OFF. Leading 3 taps differ => gather/scatter geometry is the
+defect. Leading 3 taps match => the defect is downstream of the conv, in the
+SSM / state-slot remap.
+
+**Attempted and REVERTED, recorded so nobody retries it blind.** Striding
+`CausalConv1dFwdKernel` by `conv_state.shape[2]` instead of `width` is a NO-OP
+here: that kernel only ever sees the narrow working buffer, and output did not
+move. Possibly correct hardening for a caller that hands it a widened row, but it
+fixes nothing on this path, so it was reverted rather than shipped unverified.
+`src/vt/cpu/cpu_ops.cpp` is untouched by this session.
+
+Prior lead (negative `srow[-1]` index) remains REFUTED: `runner.cpp:1187` clamps
+`num_accepted_tokens >= 1`.
