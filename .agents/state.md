@@ -28758,3 +28758,34 @@ Records: `specs/multimodal-speed.md` (§14 + headline pointer), `kernel-matrix.m
 (`CLAIM-MM-SPEED-AUDIO-ENC-KERNEL`), `parity-ledger.md`, `docs/STATUS.md`,
 `docs/BENCHMARKS.md`, this entry. All record checkers rc=0. NOT pushed; FULL SHA
 reported to caller.
+
+- **2026-07-28** — **footprint.png fixed to be apples-to-apple (CUDA server binary).**
+  `CLAIM-DEMO-FOOTPRINT-CUDA`; isolated worktree `agent-aa0ef12fb6326e380` off local
+  `main` `0e2c667a`. The demo footprint visual drew the vllm.cpp side as a **CPU** build
+  (9.85 MiB), which is not what you install to serve on a GB10. Rebuilt the **CUDA
+  fast-path** `server`+`vllm_shared` on dgx.casa (GB10 sm_121a) from a `git archive` of
+  `0e2c667a` — `cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_SERVER=ON
+  -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`; configure
+  banners confirm **`cutlass-nvfp4 ENABLED [121a]`, `cutlass-fp8 ENABLED [121a]`,
+  `FlashAttention-2 prefill/decode ENABLED [121a]`** (real CUDA fast-path binary). No GPU
+  run needed (static footprint). **RAW MEASUREMENTS (dgx, same box for both sides):**
+  vllm.cpp `server` stripped = **68,974,608 B = 65.78 MiB** (`strip`; `stat -c %s`;
+  `ls -l`), statically links `libvllm.a` so it is the whole install (`libvllm.so` 65.66
+  MiB stripped = alt library form, NOT additive). `ldd build-cuda/examples/server`: only
+  non-system deps are **`libcudart.so.13` 0.67 MiB + `libcublasLt.so.13` 600.76 MiB from
+  system `/usr/local/cuda-13.0`** (any GB10 has it); all else base OS runtime ⇒ vllm.cpp
+  **bundles 0 CUDA userspace**. vLLM `du -sk -L ~/venvs/vllm-oracle` = 9,542,288 KiB =
+  **9,318.6 MiB (9.10 GiB)**; symlink resolves to `vllm-oracle-v0.25.0-stage`, `import
+  vllm`→**0.25.0**, torch 2.11.0+cu130 (the 0.26.0.dev0 pin is currently rolled back on
+  this box); components `nvidia` 3,144.7 / `flashinfer_cubin` 1,853.8 / `torch` 912.8 /
+  `triton` 600.3 / `nvidia_cutlass_dsl` 192.4 / everything-else 2,614.6 MiB. **HONEST STORY
+  CHANGE:** old CPU figure 9.85 MiB understated the real install; true CUDA binary is 65.8
+  MiB ⇒ gap **9.10 GiB vs 65.8 MiB ≈ 142×** (≈14× even charging system `libcublasLt` to
+  vllm.cpp) — smaller than the old CPU-vs-CUDA framing implied but a real, like-for-like,
+  honestly-larger gap; system CUDA bytes are NAMED in the card footnote, not dropped.
+  Updated `benchmarks/demo/footprint_gb10.json` (every value carries a `_source` naming
+  its measuring command) + re-rendered `benchmarks/media/footprint.png` (1280×720, PIL,
+  no error). Records: `benchmarks/demo/footprint_gb10.json`, `benchmarks/media/footprint.png`,
+  `docs/BENCHMARKS.md` (new `CLAIM-DEMO-FOOTPRINT-CUDA` entry resolving the 2026-07-27
+  CPU caveat), `parity-ledger.md`, this entry. README alt-text (line 29) left untouched —
+  concurrent session owns README. Record checkers rc=0. NOT pushed; FULL SHA reported.
