@@ -524,7 +524,13 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   the target's embedding and lm_head. No conversion run was needed - pre-converted
   drafts are published at ~1 GB. Its work rows are `GD0`-`GD8`, renamed off the
   landed DFlash track's own `D0`-`D13` after a collision was spotted. The loader
-  rows can proceed from the draft alone;
+  rows can proceed from the draft alone. Two off-by-one traps are already
+  resolved from the converter's source, both invisible to name/shape checks and
+  pointing OPPOSITE ways: the draft's RMSNorm weights are stored RAW (its
+  converter class does not inherit the Qwen3Next `+1` shift, so unlike the trunk
+  and the MTP head it must NOT be un-shifted), and `dflash.target_layers` is
+  written offset by `+1` (so the tap indices must be decremented). Copying the
+  MTP loader by analogy would have been quietly wrong on both;
   only the end-to-end gates need the matching (expensive) target.
 - **MTP speculative decoding from a GGUF target WORKS** (`SPEC-MTP-GGUF`,
   `GATING`, [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads

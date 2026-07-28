@@ -112,12 +112,37 @@ Three implementation facts this pins down:
    NOT from the draft. `MakeDflashGgufConfig` must therefore leave `vocab_size`
    to the caller rather than VT_CHECK a missing key.
 
-Norm storage note carried from the MTP row: the trunk GGUF loader stores Qwen
-RMSNorm weights as `(w + 1)` and un-shifts with `OwnNormMinus1`. Whether the
-`dflash` converter does the same is NOT established by this dump (F32 values were
-not compared against the safetensors draft) and MUST be checked in `GD2` before
-the weights are trusted - it is exactly the class of defect that shape checks
-cannot see.
+## Two off-by-one traps, RESOLVED from the producer's source (`GD1` prerequisite)
+
+Both are invisible to name/shape validation and point in OPPOSITE directions.
+Settled by reading llama.cpp `origin/master` `conversion/qwen.py`, not by
+inspecting values (a value-distribution check was run first and was AMBIGUOUS -
+draft and trunk norms both cluster near ~1).
+
+**1. Norms are stored RAW. Do NOT apply the `-1` un-shift.**
+The `+1` shift lives in `Qwen3NextModel.modify_tensors`
+(`elif name.endswith("norm.weight") ...: data_torch = data_torch + 1`).
+`class DFlashModel(Qwen3Model)` inherits from `Qwen3Model`, NOT
+`Qwen3NextModel`, and overrides only `set_vocab`, `set_gguf_parameters` and
+`filter_tensors` - there is NO `modify_tensors` override, and `Qwen3Model`'s own
+`modify_tensors` does not touch norms.
+
+So the DFlash draft is the OPPOSITE of the Qwen3.5 trunk and the MTP head: those
+need `OwnNormMinus1`, this one needs a plain load. Copying the `SPEC-MTP-GGUF`
+approach - the natural move, since it is the sibling row - would compile, load,
+produce valid-looking logits, and be quietly wrong on every norm.
+
+**2. `dflash.target_layers` is written OFFSET BY +1.**
+`set_gguf_parameters` does `extract_layer_ids = [i + 1 for i in target_layer_ids]`
+before `add_target_layers(...)`. So the file's `[2, 17, 32, 47, 62]` means HF
+`target_layer_ids = [1, 16, 31, 46, 61]`. `MakeDflashGgufConfig` MUST subtract 1
+when synthesizing `raw["dflash_config"]["target_layer_ids"]`, or every
+hidden-state tap reads the wrong target layer - silently, because `num_taps`
+(5) stays correct and every shape check still passes.
+
+Consequence for `GD2`: the DFlash GGUF loader must NOT be written by analogy to
+the MTP one. It shares the dequant/quantization-routing helpers but differs on
+the norm convention, and its config differs on the tap indices.
 
 ## Our baseline
 
