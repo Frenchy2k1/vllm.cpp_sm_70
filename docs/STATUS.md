@@ -128,6 +128,12 @@ byte-identical `world_size==1` no-op. The multi-GPU (TP/PP), multi-Spark, and
 MLX transports remain unbuilt — those legs are HW-blocked (no ≥2-GPU box, no
 2-Spark cable, no 2-Mac cluster here). Full scope + seam map:
 [.agents/specs/scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
+Every parallelism MODE vLLM has (tensor / pipeline / data / expert / sequence /
+context parallel) is now enumerated and grounded in upstream source, mapped onto
+that one abstraction and priority-ranked, in
+[.agents/specs/parallelism-modes.md](../.agents/specs/parallelism-modes.md)
+(2026-07-28) — with the honest note that vLLM's "sequence parallel" is a
+tensor-parallel compilation pass, not a separate parallel axis.
 Multimodal
 (image/video/audio) is correctness-complete; its OpenAI-server wiring has landed
 all three CPU bricks (content-part parse + processor routing; the engine
