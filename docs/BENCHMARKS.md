@@ -8886,3 +8886,18 @@ number is only available on a Qwen3/dense k-quant that BOTH engines already load
 `qwen3_5_gguf_weights.cpp` ∩ the plugin's tested Qwen3 support), not DeepSeek-V4. IQ2_XXS
 port source = llama.cpp `ggml-quants.c` `dequantize_row_iq2_xxs` + `iq2xxs_grid` codebook.
 `benchmark_binding=false`.
+
+**Reasoning parsers `SAMPLE-REASONING` W0 spike + W1 brick (2026-07-28,
+`CLAIM-SAMPLE-REASONING`, NOT pushed).** Disposition: **NOT APPLICABLE (serving
+text-parse, off the GPU hot path; no throughput number owed;
+`benchmark_binding=false`).** W0 committed the spike `specs/reasoning-parsers.md`
+(the `ReasoningParser` contract, upstream's ~28-name registry, the coverage gap
+vs our landed seam, tests, gates, W-breakdown) and backfilled the row (the
+`<think>` reasoning/content split seam was already shipped but `SAMPLE-REASONING`
+still read INVENTORIED). W1 added `identity` + `deepseek_v3`/`holo2` thinking-gated
+delegates (7→9 registered names), gated by `test_deepseek_v3` (ports
+`tests/reasoning/test_deepseekv3_reasoning_parser.py`: thinking-gated selection +
+identity passthrough + no-think edge, RED-first) on a CPU `-Werror` build. A
+reasoning parser is a device-neutral pure function of the detokenized stream — the
+correctness oracle is the upstream test case, not a benchmark; an e2e
+`reasoning_content` check on a live `<think>` model is a follow-on.

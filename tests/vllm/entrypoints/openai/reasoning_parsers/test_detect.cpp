@@ -99,7 +99,9 @@ TEST_CASE("Registry: every enumerated reasoning-parser name resolves") {
     CHECK(ResolveReasoningParserName(name, "") == name);
   }
   // Pinned count: adding a factory branch without listing it fails here.
-  CHECK(names.size() == 7);
+  // 2026-07-28 (CLAIM-SAMPLE-REASONING): 7 -> 9, adding the deepseek_v3 +
+  // holo2 thinking-gated delegates (see specs/reasoning-parsers.md W1).
+  CHECK(names.size() == 9);
   std::size_t marker_count = 0;
   const ReasoningParserMarker* markers = ReasoningParserMarkerTable(&marker_count);
   for (std::size_t i = 0; i < marker_count; ++i) {

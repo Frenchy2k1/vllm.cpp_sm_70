@@ -31284,3 +31284,42 @@ resident loader → bf16 expand + CPU dense `E`; W4 Marlin repack+GEMM GPU `C`/`
   `feature-matrix.md` §3, `roadmap_v1.md` (scale-out row), `coordination.md`
   (`CLAIM-SCALE-OUT-W2`), `docs/STATUS.md` + `docs/BENCHMARKS.md` (NOT-APPLICABLE —
   infra), `parity-ledger.md` + this entry. All 6 record checkers rc=0.
+
+## 2026-07-28 — `SAMPLE-REASONING` W0 spike + record backfill + W1 brick (`CLAIM-SAMPLE-REASONING`)
+
+Isolated worktree `/home/mudler/_git/vllm.cpp-reasoning-sample`, branch
+`reasoning-sample-w0w1`, off local `main` `42c56b51`. CPU-only, NOT pushed.
+
+**Premise correction (important for cold resume):** the task was scoped as "we
+have NO reasoning parsers"; that is STALE. A mature `<think>` reasoning/content
+split SEAM was already shipped (wave-B2 `da933828`, ABI-v5 `eb9d1291`, think_auto
+`5fffe7e6`) with 7 registered names + tests + C ABI + serving wiring — but the
+`SAMPLE-REASONING` row was never advanced past INVENTORIED and no spike existed.
+So W1's literal "first brick" (base + registry + deepseek_r1 `<think>` split +
+streaming + no-think edge + upstream test) was ALREADY satisfied.
+
+**Delivered:**
+- W0: `.agents/specs/reasoning-parsers.md` — full spike (contract, upstream's
+  ~28-name registry classified by mechanism, coverage gap vs our 7 landed,
+  tests, gates, W0-W4 breakdown).
+- Record backfill: `SAMPLE-REASONING` INVENTORIED→PARTIAL with real code/test
+  anchors + spec link (engine-matrix, feature-matrix, roadmap row 6, STATUS,
+  BENCHMARKS).
+- W1: `identity.{h,cpp}` (passthrough `IdentityReasoningParser`) +
+  `deepseek_v3.{h,cpp}` (`DeepSeekV3ReasoningParser`/`...WithThinkingParser`,
+  thinking-gated delegation to R1/Identity); registered `deepseek_v3`
+  (default→Identity) + `holo2` (thinking→R1); 7→9 registered names.
+  `test_deepseek_v3.cpp` ports `tests/reasoning/test_deepseekv3_reasoning_parser.py`;
+  `test_detect.cpp` name-count pin 7→9.
+
+**Gate:** CPU `-Werror` build of the reasoning test targets; `test_reasoning_deepseek_v3`
++ `test_reasoning_detect` + `test_reasoning_deepseek_r1` GREEN (RED-first proven by
+the passthrough-vs-split boundary).
+
+**NEXT (residuals, all named in the spec):** W2 remaining text families
+(poolside_v1, ernie45, granite, hunyuan_a13b, step3p5, hy_v3, kimi_k2,
+minimax_m3, cohere_command3/4, openai_gptoss); W3 the engine-backed reasoning
+adapters (qwen3/mimo, gemma4, glm45/47, seed_oss, deepseek_v4, nemotron_v3,
+inkling) over the already-landed `TOOLS-STREAMING-PARSER` engine; W4 request-time
+`chat_template_kwargs` threading + reasoning-gated grammar FSM hold. README:68
+"7 reasoning" → 9 is a follow-up (this change scoped NOT to touch README).

@@ -591,6 +591,8 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/reasoning_parsers/think_auto.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/basic.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/deepseek_r1.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/identity.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/deepseek_v3.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/mistral.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/minimax_m2.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/step3.cpp
