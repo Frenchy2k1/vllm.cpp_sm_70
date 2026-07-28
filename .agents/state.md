@@ -29284,3 +29284,55 @@ pruned image + build tree back to the starting 78 GB free. (3) The manifest's
 overrode to 0.30 (the KV pool only needs ~few GB here). Residuals: 35B, the
 shared-prefix cache-ON arm, the token-exact cross-check, and the full P2 grid
 (vLLM arm + c1–c16).
+
+## 2026-07-28 — Qwen vision-forward SPEED (campaign #2): §14 flash kernel extended to the tower, byte-exact; ATTRIBUTION REFUTED the assumed lever — the tower already BEATS vLLM (`CLAIM-MM-SPEED-QWEN-IMAGE`)
+
+GPU campaign #2 (user-directed 2/3): close the Qwen image/video mm-forward SPEED gap
+to vLLM. Base local `main` `0a07ac76`. dgx GB10 sm_121a, `~/vllmcpp-mmspeed` (cutlass
+4.5.0 + FA2 arch 121a banners CONFIRMED, `-Werror` 0-warn), all GPU under
+`flock $HOME/gpu.lock`, sole owner, rep0 dropped. NOT pushed.
+
+**ATTRIBUTION-FIRST (the deliverable).** nsys `cuda_gpu_kern_sum` of the 27B vision
+tower forward (448×448 image, 784 patches, 27 ViT blocks, head_dim 72): the post-§7
+148 ms forward is **~85% the dense attention kernel** — `AttentionWarpKernel`
+(`AttentionDenseFast`) 4.66 ms/block × 27 = ~126 ms; cutlass/nvjet GEMMs (QKV/proj/FC)
+~10%; LayerNorm/Rope/Gelu/Add glue <5%. So attention IS the dominant kernel — but the
+question the profile actually answers is whether the §14 flash tiling *helps here*, and
+it barely does.
+
+**The lever (byte-exact).** Routed the vision-tower per-frame self-attention (hd-72,
+non-causal) from the warp `vt::AttentionDenseFast` to the §14 flash-tiled
+`vt::AttentionDenseFlash` (`qwen3_vl_vision.cpp` default + `VT_QWEN3VL_ATTN_WARP`/
+`VT_QWEN3VL_ATTN_EAGER` A/B knobs; bench extended with the warp-vs-flash arm +
+bit-identity assert). The flash op is head_dim-generic (`npl=(d+31)/32` handles 72; shmem
+18.4 KiB at d=72) and its per-warp online-softmax recurrence is copied VERBATIM from the
+warp kernel — only K/V read from shared-memory tiles ⇒ BIT-IDENTICAL output. No new
+kernel; `kAttention`/`kAttentionDenseFast` untouched ⇒ text/audio/other-model
+byte-identical by construction.
+
+**A/B REFUTES the big lever.** Same-binary, `flock`, rep0 dropped, 27B tower: warp
+**148.3 → flash 142.3 ms = 1.04×** (per-kernel 4.66 → 4.37 ms/block). Unlike audio
+(§14: t=1500, warp→flash 1.82×), the vision attention at t=784 (single image window) is
+**serial-latency-bound** — one warp per query steps a dependent 784-key online-softmax
+chain, and the GB10 L2 already serves the "redundant" global K/V reads flash eliminates —
+so tiling recovers only ~6 ms. **HONEST HEADLINE: the Qwen image/video mm-forward tower
+ALREADY BEATS vLLM — 142 ms vs vLLM 0.25.0 ~250 ms eager encode = 0.57×** (carried-forward
+§7 denominator; not re-measured — OOM-reboot risk of a big oracle alongside the tree, and
+we are well under it).
+
+**Gate (RED line HELD, byte-exact).** 27B image e2e STRICT 32/32 (54/54), 4B image 32/32
+(46/46), 27B video 32/32 (gap 0 nats, 27/27), `test_ops_attention` 37239/37239; bench
+flash-vs-warp tower 0/1,003,520 mismatches; goldens md5 UNCHANGED before==after
+(`qwen3_5_27b 3bc5f231…`, `qwen3vl_text b7221f22…`, `qwen3_5_27b_video bf14a962…`,
+`qwen3vl_video 09b2fce3…`). Proof-of-run: nsys default 4B e2e `AttentionDenseFlashKernel`
+24 inst (= 24 vision blocks), ZERO `AttentionWarpKernel` on the mm path. RED: corrupt
+flash V-accum → 30/46 FAIL → restore → 46/46. compute-sanitizer memcheck 0 errors. Clean
+CUDA `-Werror` 0-warn.
+
+**Disposition.** Byte-exact 1.04× landed (free, widens the lead, unifies the codebase —
+tower + audio encoder now both on `AttentionDenseFlash`). The profile REFUTED the
+assumption that the flash kernel closes a big gap here, because there is no gap to close
+on the tower: we already run it at 0.57× vLLM. Image/video mm-forward = correctness-DONE +
+speed-BEATS-vLLM; the umbrella MM row stays `PARTIAL` for batched c2+/serving. Residual
+(NOT needed for parity): a tensor-core MMA hd-72 non-causal attention (§14.5 lever #1)
+would widen the tower lead further. `benchmark_binding=false`.
