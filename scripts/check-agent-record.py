@@ -130,7 +130,15 @@ ENGINE_PREFIXES = (
 # Distinct again: a separate draft checkpoint with its own llama.cpp `dflash` arch
 # contract, plus a shared-head coupling to the target that `SPEC-MTP-GGUF` does not
 # have. `READY`, spiked.
-ENGINE_ROWS = 124
+# 125 since 2026-07-28: +`ENG-POOLER-SEQ` (the non-generative POOLER OP — the
+# sequence pooling methods CLS/LAST/MEAN + the normalize/classify activation heads
+# that turn hidden states into a pooled embedding/logit row instead of a sampled
+# token). HIGH-priority feature-gap #2 (pooling task class); a genuinely-new
+# engine capability, W1 CPU brick landed + unit-gated. `ACTIVE`, `CLAIM-POOLING`,
+# spec `specs/pooling-task-class.md`. Bumped for a real new row, never to make a
+# failing state transition pass. (`SERVE-POOLING-ENDPOINTS` INVENTORIED→SPIKE in
+# the same change is a state move on the existing row, not a new row.)
+ENGINE_ROWS = 125
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

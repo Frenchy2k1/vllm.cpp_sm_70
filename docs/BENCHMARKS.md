@@ -8917,3 +8917,26 @@ identity passthrough + no-think edge, RED-first) on a CPU `-Werror` build. A
 reasoning parser is a device-neutral pure function of the detokenized stream — the
 correctness oracle is the upstream test case, not a benchmark; an e2e
 `reasoning_content` check on a live `<think>` model is a follow-on.
+## Pooling task class W0 spike + W1 pooler op (2026-07-28, `CLAIM-POOLING`) - NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE (`benchmark_binding=false`) - a scoping
+spike plus a CPU pooler-OP unit brick; no engine forward, no token, no
+throughput.** HIGH-priority feature-gap #2 (the non-generative pooling task
+class: embeddings / classify / score / rerank). W0 committed the full spike
+(`.agents/specs/pooling-task-class.md`) over vLLM's pooling surface - the
+`Pooler` abstraction, the pooling runner, the `tasks.py` taxonomy, the
+`/v1/embeddings` + score/rerank/classify endpoints, and a concrete pooling
+model - with the exact port map, tests, gates, and W-breakdown. W1 landed the
+pooler OP on the CPU backend: the sequence pooling methods `CLSPool`/`LastPool`/
+`MeanPool` (+ `GetSeqPoolingMethod`) and the activation heads
+`PoolerIdentity`/`PoolerNormalize`/`PoolerMultiLabelClassify`/`PoolerClassify`,
+mirrored 1:1 from `vllm/model_executor/layers/pooler/{seqwise/methods,activations}.py`
+and `vllm/v1/pool/metadata.py` @ `555967922`. Gate is the `test_pooler` doctest
+unit suite vs DOUBLE-PRECISION references (CLS/LAST exact gathers; MeanPool and
+the activations recomputed in double, float-tolerance compared), RED-first
+(disabling the MeanPool division / the PoolerNormalize denominator fails the
+arithmetic subcases). No correctness-vs-oracle or throughput number is owed or
+claimed by a pooler-op unit brick - the pooling RUNNER + a concrete pooling
+model (W3) carry the future oracle cosine-parity gate, named in the spec.
+Reproduction: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release;
+cmake --build build-cpu --target test_pooler -j"$(nproc)"; ./build-cpu/tests/test_pooler`.

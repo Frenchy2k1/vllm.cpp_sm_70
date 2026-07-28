@@ -31378,3 +31378,54 @@ docs/BENCHMARKS, coordination (claim), parity-ledger, this entry. Row stays SPIK
 (no on-box e2e; device kernel + proxy gate are residuals). NEXT: the KDA CUDA
 device kernel unit-gated vs these host references, then the Kimi-Linear-48B proxy
 e2e gate on GB10.
+
+## 2026-07-28 — Pooling task class W0 spike + W1 pooler OP (`CLAIM-POOLING`)
+
+**HIGH-priority feature-gap #2 picked up.** The entire non-generative pooling
+task class (embeddings / classify / score / rerank) had NO runner, NO pooler op,
+and NO pooling model rows. This claim landed W0 (spike) + W1 (first CPU brick).
+
+Isolated worktree `.claude/worktrees/claim-pooling`, branch `claim-pooling`, off
+local `main` `42c56b51` (confirmed via `git rev-parse HEAD`). CPU-only
+(`build-cpu`, `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON`, Release). No GPU/dgx —
+the pooling reductions and activations are host arithmetic. NOT pushed.
+
+**W0 — spike committed** `.agents/specs/pooling-task-class.md`: inventories the
+whole vLLM pooling surface @ `555967922` — the `Pooler` abstraction
+(`layers/pooler/`: abstract/common/activations, seqwise CLS/LAST/MEAN + heads +
+poolers, tokwise, `special.py` DispatchPooler), the pooling runner
+(`v1/worker/gpu/pool/pooling_runner.py`, `v1/pool/metadata.py`), the `tasks.py`
+taxonomy (embed/classify/token_embed/token_classify; score/encode REMOVED), the
+`/v1/embeddings` + score/rerank/classify endpoints, and BERT/`*EmbeddingModel`
+as the first concrete model. Port map, tests-to-port, gates, and a 5-brick
+W-breakdown recorded.
+
+**W1 — pooler OP landed + CPU-gated.** Mirrored 1:1:
+- `include/vllm/model_executor/layers/pooler/pooling_metadata.h` — minimal
+  `PoolingCursor` (host index/length vectors, `is_partial_prefill`) +
+  `PoolingMetadata` (heads/tokwise/token-id fields deferred, documented).
+- `include/.../pooler/methods.h` + `src/.../pooler/methods.cpp` —
+  `SequencePoolingMethod` base + `CLSPool`/`LastPool`/`MeanPool` + the
+  `GetSeqPoolingMethod` factory (enum + string). CLS/MEAN reject partial
+  prefill, LAST allows it, MeanPool accumulates + upcasts to float32.
+- `include/.../pooler/activations.h` + `src/.../pooler/activations.cpp` —
+  `PoolerIdentity`/`PoolerNormalize` (L2 `F.normalize`, eps 1e-12)/
+  `PoolerMultiLabelClassify` (sigmoid)/`PoolerClassify` (sigmoid if
+  `num_labels<2` else softmax).
+- Gate `tests/vllm/model_executor/layers/pooler/test_pooler.cpp`, ported from
+  `tests/model_executor/layers/test_pooler_methods.py` +
+  `test_pooler_activations.py`, using DOUBLE-PRECISION references. RED-first
+  verified by disabling the MeanPool division / PoolerNormalize denominator
+  (arithmetic subcases fail).
+
+Records: new engine-matrix row `ENG-POOLER-SEQ` (`ACTIVE`), `SERVE-POOLING-
+ENDPOINTS` INVENTORIED→SPIKE (spec repointed), engine lifecycle summary,
+`check-agent-record.py` ENGINE 124→125 (dated rationale), roadmap gap #2, STATUS
+capability row, BENCHMARKS (NOT APPLICABLE), coordination claim, parity-ledger,
+this entry.
+
+**NEXT (named residuals, spec §Work breakdown):** W2 pooler HEADS composite +
+`SequencePooler` + `DispatchPooler` + `PoolerConfig`/`PoolingParams`; W3 pooling
+RUNNER + first concrete pooling model (`model-matrix.md` row + checklist +
+oracle cosine-parity gate); W4 endpoints `/v1/embeddings` + score/rerank/classify;
+W5 tokwise `AllPool`/`StepPool` + chunked-prefill ALL pooling.
