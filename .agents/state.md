@@ -30504,3 +30504,7 @@ narrative compacted away, `G5`/`G6`/`G7` rows + gate dispositions), `engine-matr
 `docs/BENCHMARKS.md` (new checkpoint entry, speed still PENDING),
 `docs/SPECULATIVE-DECODING.md` (the "safetensors (not GGUF)" limitation was stale;
 plus the NVFP4 exact-tie caveat), the probe case, this log.
+- **2026-07-28 (`SPEC-MTP-GGUF` closing-commit backfill)** — Recorded `edf91449` as the
+  row's closing commit in `engine-matrix.md`, `parity-ledger.md`, `docs/STATUS.md` and
+  `docs/BENCHMARKS.md`. Records only; a hash cannot name itself, so this follows the
+  same backfill pattern `a0013a22` used. No code, no gate, no number changes.

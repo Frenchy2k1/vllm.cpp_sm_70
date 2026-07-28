@@ -666,7 +666,7 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   accepted there vs 13 / 11 here. Cross-format token agreement is NOT
   APPLICABLE - it needs an F16/F32 GGUF sibling and every head-carrying export
   on hand is quantized. Throughput is the one open item and is deliberately
-  PENDING, see [docs/BENCHMARKS.md](BENCHMARKS.md).
+  PENDING, see [docs/BENCHMARKS.md](BENCHMARKS.md). Closing commit `edf91449`.
   Two things had held this row open and both are now settled by measurement.
   The build was believed to be `CMAKE_CUDA_ARCHITECTURES=75` on an sm_121 GB10:
   that came from `CMakeCache.txt`, which records the CUDA compiler's own probe
