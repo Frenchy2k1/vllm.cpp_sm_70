@@ -454,3 +454,103 @@ TEST_CASE("chat-mm full chain: image request -> engine request carries mm") {
   // E2E residual (MM-SERVE-E2E): the mm forward on the GPU worker consuming
   // built.mm_features to produce token-correct output on Qwen3-VL-4B.
 }
+
+// ---------------------------------------------------------------------------
+// 7. SEAM BODY (MM-SERVE-E2E, the RED-first gate): the ACTUAL MultiModalChatFn
+//    the server sets — MakeQwen3VLImageChatFn — driving the placeholder->token-id
+//    mapping through the REAL tokenizer + chat template + processor. Whereas the
+//    full-chain test above hand-builds {5, image_token_id, 6}, this exercises
+//    the seam that turns raw chat `messages` into the engine input:
+//      messages -> marker-inject -> chat template -> tokenize (single image_pad
+//      id) -> RouteImageRgb (EXPAND to N=196 + mm_features).
+//    RED line: the text-only path (DefaultChatPromptFallback over the joined-text
+//    content, image dropped) yields ZERO image tokens; the seam yields 196.
+// ---------------------------------------------------------------------------
+TEST_CASE("chat-mm seam body: MakeQwen3VLImageChatFn -> expanded engine input") {
+  namespace oai = vllm::entrypoints::openai;
+  const std::string dir = ImgFixDir();
+  const nlohmann::json manifest = ReadJson(dir + "/manifest.json");
+  auto cfg = ImageConfigFromManifest(manifest);
+  const int64_t H = manifest.at("image").at("shape")[0].get<int64_t>();
+  const int64_t W = manifest.at("image").at("shape")[1].get<int64_t>();
+  const std::vector<uint8_t> rgb =
+      ReadBytes(dir + "/image_rgb_uint8_448x448x3.bin");
+
+  // The committed Qwen3.6 tokenizer shares the Qwen vision special-token markers
+  // (<|vision_start|>/<|image_pad|>/<|vision_end|>) — at ITS ids. Align the
+  // processor's image_token_id to what THIS tokenizer maps <|image_pad|> to so
+  // RouteImageRgb expands exactly the id the tokenizer emits (in production both
+  // are the model's own 151655).
+  static const vllm::tok::Tokenizer tok = vllm::tok::Tokenizer::FromHfJson(
+      std::string(PARITY_GOLDENS_DIR) + "/tokenizer_qwen36/tokenizer.json");
+  const std::vector<int32_t> pad_ids =
+      tok.EncodeWithSpecialTokens("<|image_pad|>");
+  REQUIRE(pad_ids.size() == 1u);
+  cfg.image_token_id = pad_ids[0];
+
+  vllm::multimodal::Qwen3VLImageProcessor proc(cfg);
+
+  const int64_t merged =
+      (manifest.at("image_grid_thw").at("values")[0].get<int64_t>() *
+       manifest.at("image_grid_thw").at("values")[1].get<int64_t>() *
+       manifest.at("image_grid_thw").at("values")[2].get<int64_t>()) /
+      (cfg.merge_size * cfg.merge_size);  // 196
+  REQUIRE(merged == 196);
+
+  // A raw-RGB codec (the container-format decode is the named residual).
+  oai::ImageCodecFn codec =
+      [&](const oai::DecodedMedia& media) -> oai::DecodedImageRgb {
+    oai::DecodedImageRgb out;
+    out.rgb = media.bytes;
+    out.height = H;
+    out.width = W;
+    return out;
+  };
+
+  // The seam body, wired exactly as examples/server/main.cpp does (real
+  // tokenizer + the chat-prompt renderer).
+  auto mm_fn = oai::MakeQwen3VLImageChatFn(
+      proc, tok, oai::DefaultChatPromptFallback, std::move(codec));
+
+  // An OpenAI image chat request (image then text, matching the M0 golden order).
+  const std::string uri = "data:image/x-raw-rgb;base64," + EncodeBase64(rgb);
+  const nlohmann::json j = {
+      {"messages",
+       {{{"role", "user"},
+         {"content",
+          {{{"type", "image_url"}, {"image_url", {{"url", uri}}}},
+           {{"type", "text"}, {"text", "What is in this image?"}}}}}}}};
+  const ChatCompletionRequest req = j.get<ChatCompletionRequest>();
+
+  // RED: the text-only path (what a server WITHOUT the seam renders) drops the
+  // image — the tokenized prompt carries ZERO image tokens.
+  const std::string text_prompt = oai::DefaultChatPromptFallback(
+      req.messages, /*add_generation_prompt=*/true, {});
+  const std::vector<int32_t> text_ids = tok.EncodeWithSpecialTokens(text_prompt);
+  int64_t red_pad = 0;
+  for (int32_t id : text_ids)
+    if (id == cfg.image_token_id) ++red_pad;
+  CHECK(red_pad == 0);
+
+  // GREEN: the seam turns the SAME request into the placeholder-EXPANDED engine
+  // input — 196 image tokens + one image mm_feature.
+  const std::optional<vllm::multimodal::MultiModalInputs> mm =
+      mm_fn(req.messages);
+  REQUIRE(mm.has_value());
+  int64_t pad_slots = 0;
+  for (int32_t id : mm->prompt_token_ids)
+    if (id == cfg.image_token_id) ++pad_slots;
+  CHECK(pad_slots == merged);
+  REQUIRE(mm->mm_features.size() == 1u);
+  CHECK(mm->mm_features[0].modality == "image");
+  CHECK(mm->mm_features[0].length == merged);
+  CHECK(mm->mm_features[0].mm_hash == manifest.at("mm_hash").get<std::string>());
+  REQUIRE(mm->mm_features[0].data != nullptr);
+
+  // A text-only request (no mm parts) leaves the seam a no-op (nullopt) — the
+  // server then renders the byte-identical text path.
+  const nlohmann::json jt = {
+      {"messages", {{{"role", "user"}, {"content", "hello there"}}}}};
+  const ChatCompletionRequest text_req = jt.get<ChatCompletionRequest>();
+  CHECK_FALSE(mm_fn(text_req.messages).has_value());
+}

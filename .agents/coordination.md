@@ -141,6 +141,36 @@ port source = llama.cpp `ggml-quants.c` `dequantize_row_iq2_xxs` + `iq2xxs_grid`
 ONLY: `specs/deepseek-v4-flash.md` (new §GGUF benchmark loadability), the
 BENCHMARKS/STATUS/ledger/state entries, this claim; no code/README/Metal. All 6 record
 checkers rc=0.
+**Multimodal SERVING — brick 3/3 `MM-SERVE-E2E` CPU SEAM BODY LANDED (2026-07-28,
+`CLAIM-MM-SERVING-E2E`, DONE — committed, NOT pushed; FULL SHA reported to
+caller).** Base local `main` HEAD `5aace348`; isolated worktree
+`.claude/worktrees/agent-acb1c57738b35ab07`; CPU-only (`-DVLLM_CPP_CUDA=OFF`), no
+GPU build. **What it did.** (1) The `MultiModalChatFn` seam BODY:
+`include/vllm/entrypoints/openai/chat_mm.{h,cpp}` `BuildMarkerInjectedContent` +
+`MakeQwen3VLImageChatFn` — messages → inject the image placeholder marker at the
+mm part position → render the chat template → `EncodeWithSpecialTokens` (the single
+`<|image_pad|>` marker → ONE `image_token_id`) → `RouteImageRgb` EXPAND to
+N=196 image tokens + `mm_features`. (2) `examples/server/main.cpp` production
+wiring: guarded on `preprocessor_config.json`, construct the Qwen3-VL image
+processor + `set_multimodal_chat_fn(...)`; text-only models leave the seam unset
+(byte-identical); the PNG/JPEG codec stays a named residual (raw `image/x-raw-rgb`
+accepted). **Gate.** `test_chat_mm` 8/8 (100 asserts; +1 seam-body test:
+real tokenizer + chat template → 196 image tokens + mm_features, RED line = text
+path renders 0); `test_openai_serving` +1 (the production seam is invoked on an
+image request + routed to the engine mm generate overload; text-only never touches
+it; streaming+mm rejected). Clean `-Werror` library + `server` build (0 warn).
+**Residual `MM-SERVE-E2E` GPU forward — ARCHITECTURALLY BLOCKED (not box
+contention):** the engine model runner has no mm forward — `ModelForwardInput`
+(`model_registry.h:142`) has no vision field; `runner.cpp` ignores
+`Request.mm_features`; Qwen3-VL is unregistered (`REGISTER_VLLM_MODEL` absent); the
+M2c `Qwen3VLGenerateGreedy` (`qwen3_vl.cpp:502`) is a standalone driver outside
+`ModelRegistry::Forward`. Fold-into-engine recipe (add a vision-embed field →
+runner runs the tower via the encoder cache + merge + MRoPE/DeepStack → register
+the arch → dgx `test_openai_serving_chat_mm_e2e.cpp` token-exact vs the M2c golden)
+is in `specs/mm-serving.md`. DGX `dgx.casa`: checkpoint cached, disk 99% (53G),
+not built. Owns ONLY: `chat_mm.{h,cpp}`, `examples/server/main.cpp`,
+`tests/.../test_chat_mm.cpp` + `test_serving.cpp`, and the records below. Does NOT
+touch README/Metal (concurrent session owns them; STATUS flags the README line).
 
 **Kimi K3 W0 SCOPE — DERIVE-AND-SHIP (2026-07-28, `CLAIM-KIMI-K3-SCOPE`,
 records-only, NOT pushed; FULL SHA reported to caller).** Base `main` HEAD

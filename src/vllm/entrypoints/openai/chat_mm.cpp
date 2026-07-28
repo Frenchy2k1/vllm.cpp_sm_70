@@ -5,9 +5,13 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "vllm/tokenizer/tokenizer.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -218,6 +222,78 @@ std::vector<std::string> CollectChatPlaceholders(const ChatMessage& message) {
     if (!marker.empty()) markers.push_back(std::move(marker));
   }
   return markers;
+}
+
+std::string BuildMarkerInjectedContent(const ChatMessage& message) {
+  // Bare-string content: nothing to inject (byte-identical text path).
+  if (!message.content_parts.has_value()) {
+    return message.content.value_or(std::string());
+  }
+  std::string out;
+  int audio_index = 0;
+  for (const ChatContentPart& part : *message.content_parts) {
+    if (part.type == "text") {
+      out += part.text;
+      continue;
+    }
+    const bool is_audio =
+        part.type == "input_audio" || part.type == "audio_url";
+    if (is_audio) ++audio_index;
+    // The mm marker at THIS part's position (empty for unrouted residual kinds,
+    // which then contribute nothing — matching the text-only fallback).
+    out += ChatPlaceholderFor(part, audio_index);
+  }
+  return out;
+}
+
+std::function<std::optional<multimodal::MultiModalInputs>(
+    const std::vector<ChatMessage>&)>
+MakeQwen3VLImageChatFn(const multimodal::Qwen3VLImageProcessor& proc,
+                       const vllm::tok::Tokenizer& tokenizer,
+                       ChatPromptRenderFn prompt_fn, ImageCodecFn codec) {
+  return [&proc, &tokenizer, prompt_fn = std::move(prompt_fn),
+          codec = std::move(codec)](const std::vector<ChatMessage>& messages)
+             -> std::optional<multimodal::MultiModalInputs> {
+    // Locate the FIRST image part across the messages (single-image; multiple
+    // images / video / audio are named residuals).
+    const ChatContentPart* image_part = nullptr;
+    for (const ChatMessage& m : messages) {
+      if (!m.content_parts.has_value()) continue;
+      for (const ChatContentPart& part : *m.content_parts) {
+        if (part.type == "image_url") {
+          image_part = &part;
+          break;
+        }
+      }
+      if (image_part != nullptr) break;
+    }
+    if (image_part == nullptr) return std::nullopt;
+
+    // 1. Render the templated prompt with the placeholder marker injected at the
+    //    mm part position (the real chat template wraps <|im_start|>… around it).
+    std::vector<ChatMessage> rendered = messages;
+    for (ChatMessage& m : rendered) {
+      if (m.content_parts.has_value()) {
+        m.content = BuildMarkerInjectedContent(m);
+        m.content_parts.reset();
+      }
+    }
+    const std::string prompt =
+        prompt_fn(rendered, /*add_generation_prompt=*/true, {});
+
+    // 2. Tokenize WITH special tokens: the single <|image_pad|> marker becomes
+    //    ONE image_token_id (added tokens matched leftmost-longest).
+    const std::vector<int32_t> prompt_ids =
+        tokenizer.EncodeWithSpecialTokens(prompt);
+
+    // 3. Decode the image bytes + route through the processor: EXPAND the single
+    //    image_token_id to N = grid/merge^2 copies and build the mm_features the
+    //    engine mm generate overload carries onto Request.mm_features.
+    const DecodedMedia media = DecodeImageUrlPart(*image_part);
+    const DecodedImageRgb img = codec(media);
+    return RouteImageRgb(proc, img.rgb.data(), img.height, img.width,
+                         prompt_ids);
+  };
 }
 
 }  // namespace vllm::entrypoints::openai

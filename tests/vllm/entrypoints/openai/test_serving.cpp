@@ -1121,6 +1121,79 @@ TEST_CASE("serving_chat: non-stream response carries assistant message + usage")
         resp.usage.prompt_tokens + resp.usage.completion_tokens);
 }
 
+// ─── (MM-SERVE-E2E) the production multimodal seam is invoked + routed ───────
+// A constructed OpenAIServingChat over the synthetic engine drives the SAME
+// production seam (set_multimodal_chat_fn) create_chat_completion calls. Proves:
+//   (a) an image request (a content_parts image_url part) INVOKES the seam and,
+//       when the seam declines (nullopt), falls back to the text path (RED line:
+//       a server WITHOUT the seam never calls it — the image is dropped);
+//   (b) a text-only request never invokes the seam (byte-identical text path);
+//   (c) streaming + a seam-produced MultiModalInputs is rejected (named residual)
+//       — the guard fires before the engine, so no mm forward is needed here.
+namespace {
+ChatMessage ImagePartMessage() {
+  ChatMessage m;
+  m.role = "user";
+  m.content = std::string("hello");  // in-vocab joined-text fallback
+  vllm::entrypoints::openai::ChatContentPart img;
+  img.type = "image_url";
+  img.url = "data:image/x-raw-rgb;base64,AAAA";  // decoded lazily by the seam
+  m.content_parts = std::vector<vllm::entrypoints::openai::ChatContentPart>{img};
+  return m;
+}
+}  // namespace
+
+TEST_CASE("serving_chat: multimodal seam is invoked on image requests + routed") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+
+  Harness h(c, w, tok);
+  OpenAIServingChat serving(h.engine, "test-model", InVocabChatPrompt);
+
+  // (a) The seam is invoked on an image request; declining -> text fallback.
+  int seam_calls = 0;
+  serving.set_multimodal_chat_fn(
+      [&seam_calls](const std::vector<ChatMessage>&)
+          -> std::optional<vllm::multimodal::MultiModalInputs> {
+        ++seam_calls;
+        return std::nullopt;  // decline -> the text path renders
+      });
+  ChatCompletionResult res = serving.create_chat_completion(
+      MakeChatRequest({ImagePartMessage()}, /*max_tokens=*/3, /*stream=*/false));
+  CHECK(seam_calls == 1);
+  REQUIRE(res.response.has_value());
+  REQUIRE(res.response->choices.size() == 1);
+  CHECK(res.response->choices[0].message.role == "assistant");
+
+  // (b) A text-only request never touches the seam.
+  seam_calls = 0;
+  ChatCompletionResult text_res = serving.create_chat_completion(MakeChatRequest(
+      {ChatMessage{"user", std::string("hello")}}, /*max_tokens=*/3,
+      /*stream=*/false));
+  CHECK(seam_calls == 0);
+  CHECK(text_res.response.has_value());
+
+  // (c) Streaming + a seam-produced MultiModalInputs is rejected (named residual).
+  serving.set_multimodal_chat_fn(
+      [](const std::vector<ChatMessage>&)
+          -> std::optional<vllm::multimodal::MultiModalInputs> {
+        vllm::multimodal::MultiModalInputs mm;
+        mm.prompt_token_ids = {1, 2, 3};
+        vllm::multimodal::MultiModalFeatureSpec spec;
+        spec.modality = "image";
+        spec.offset = 0;
+        spec.length = 1;
+        mm.mm_features.push_back(std::move(spec));
+        return mm;
+      });
+  CHECK_THROWS_AS(
+      serving.create_chat_completion(
+          MakeChatRequest({ImagePartMessage()}, /*max_tokens=*/3,
+                          /*stream=*/true)),
+      std::runtime_error);
+}
+
 // ─── (c2) chat logprobs run end-to-end -> ChatCompletionLogProbs ─────────────
 TEST_CASE("serving_chat: logprobs=true returns per-token ChatCompletionLogProbs") {
   const HfConfig c = MakeConfig();

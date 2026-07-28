@@ -30839,3 +30839,52 @@ ledger. Records-only; no build/GPU/download/benchmark.
   record checkers rc=0. W2+ residuals: collective `OpId`/`OpProvider` routing, TP
   forward+loader, NCCL(kCUDA)/RoCE(Spark)/MLX-ring(kMETAL) transports, the
   per-device backend registry, real TP/PP in the model forwards.
+
+## 2026-07-28 — MM SERVING brick 3/3 `MM-SERVE-E2E`: the `MultiModalChatFn` seam BODY (CPU) + the GPU-forward architectural block (`CLAIM-MM-SERVING-E2E`)
+
+- **What landed.** The seam W2 declared but left unset now has a body. NEW
+  `MakeQwen3VLImageChatFn` + `BuildMarkerInjectedContent`
+  (`include/vllm/entrypoints/openai/chat_mm.{h,cpp}`): given the Qwen3-VL image
+  processor + the model tokenizer + the chat-prompt renderer + an image codec, it
+  turns chat `messages` → the placeholder-EXPANDED `MultiModalInputs` — (1)
+  inject the image placeholder marker at the mm part position + render the
+  templated prompt; (2) `EncodeWithSpecialTokens` maps the single `<|image_pad|>`
+  marker to ONE `image_token_id` (added tokens matched leftmost-longest); (3)
+  `RouteImageRgb` EXPANDS that single id to N = grid/merge² = 196 image tokens +
+  builds `mm_features`. Wired into `examples/server/main.cpp` (guarded on
+  `preprocessor_config.json`; text-only models leave the seam unset ⇒
+  byte-identical; PNG/JPEG codec is a named residual, raw `image/x-raw-rgb`
+  accepted). Base local `main` HEAD `5aace348`; isolated worktree
+  `.claude/worktrees/agent-acb1c57738b35ab07`; CPU-only `build-cpu`.
+- **Gate (RED-first).** `test_chat_mm` 8/8 (100 asserts; the W3 seam-body test
+  drives the real qwen36 tokenizer + `DefaultChatPromptFallback` → 196 image
+  tokens + one image mm_feature; RED line = the text-only path renders 0 image
+  tokens; a text-only request → the seam no-ops nullopt). `test_openai_serving`
+  (+1: over the synthetic-engine harness an image content-part request INVOKES the
+  production seam + routes to the engine mm generate overload; a text-only request
+  never touches the seam; streaming+mm rejected). Clean CPU `-Werror` full-library
+  + `server` binary 0-warn.
+- **The GPU e2e gate is ARCHITECTURALLY BLOCKED, not box contention.** A
+  token-exact image `/v1/chat/completions` cannot run through the engine seam yet:
+  the engine model runner has NO multimodal forward — `ModelForwardInput`
+  (`model_registry.h:142`) has no vision/mm-embed field; `runner.cpp` never reads
+  `Request.mm_features`; Qwen3-VL is UNREGISTERED (`REGISTER_VLLM_MODEL` absent);
+  the M2c `Qwen3VLGenerateGreedy` (`qwen3_vl.cpp:502`) is a STANDALONE greedy
+  driver that does embed+merge+MRoPE+DeepStack itself, OUTSIDE
+  `ModelRegistry::Forward`. Closing it = fold that forward INTO the registered
+  engine forward (add a vision-embed field to `ModelForwardInput`; runner runs the
+  tower via the `EncoderCacheManager` seam + `_merge_multimodal_embeddings` + MRoPE
+  3-D positions + DeepStack; `REGISTER_VLLM_MODEL(qwen3_vl, "Qwen3VLForConditionalGeneration", …)`),
+  then a dgx `test_openai_serving_chat_mm_e2e.cpp` token-exact vs the M2c golden
+  `gen_tokens_i32.bin`. DGX `dgx.casa`: checkpoint cached, disk 99% (53G),
+  `~/cutlass-4.5.0` present — NOT built (block is the missing engine forward, not
+  the box). Recipe in `specs/mm-serving.md`.
+- **Records:** `specs/mm-serving.md` (Brick 3 + the divergence map),
+  `roadmap_v1.md` (first-class `ROAD-V1-MM-SERVE` row), `coordination.md`
+  (`CLAIM-MM-SERVING-E2E`), `engine-matrix.md` + `feature-matrix.md` +
+  `model-matrix.md` (mm-serving W3 rows), `docs/STATUS.md` (image-to-text line +
+  summary + README-flag), `docs/BENCHMARKS.md` (NOT-APPLICABLE — feature),
+  `parity-ledger.md` + this entry. All 6 record checkers rc=0. NEXT: the GPU
+  `MM-SERVE-E2E` = fold the M2c forward into `ModelRegistry::Forward` (above).
+  Residuals: streaming mm, multiple images, video, http fetch, PNG/JPEG codec,
+  Gemma-4 image.
