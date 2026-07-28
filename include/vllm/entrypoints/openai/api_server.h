@@ -103,8 +103,11 @@ class ApiServer {
   // the exposition with the prometheus content type.
   DispatchResult handle_metrics() const;
   // POST /tokenize, POST /detokenize (serve/tokenize/api_router.py). Registered
-  // only when a tokenizer is attached. Chat-form tokenize (messages+template) is
-  // deferred; the prompt/tokens forms match the vLLM schema exactly.
+  // only when a tokenizer is attached. /tokenize accepts BOTH forms of the
+  // TokenizeRequest union (serve/tokenize/protocol.py:156): the raw
+  // TokenizeCompletionRequest{prompt} and the TokenizeChatRequest{messages, ...}
+  // — the chat form renders through chat_.prompt_fn() (the same model chat
+  // template create_chat_completion uses) then tokenizes. Schemas match vLLM.
   DispatchResult handle_tokenize(const std::string& request_body) const;
   DispatchResult handle_detokenize(const std::string& request_body) const;
   // POST /reset_prefix_cache (serve/dev/cache/api_router.py) → {"success": b}.

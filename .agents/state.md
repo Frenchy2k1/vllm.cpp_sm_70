@@ -28249,3 +28249,52 @@ flag stays default-OFF and no `--enable-jump-forward` CLI lands yet. SW4
 `specs/sglang-radixattention.md` §3/§6.3/§7, `feature-matrix.md`, `docs/STATUS.md`,
 `docs/BENCHMARKS.md`, ledger, coordination `CLAIM-SGLANG-SW3`, this entry. All
 record checkers rc=0. NOT pushed; FULL SHA reported to caller.
+
+---
+
+## 2026-07-28 — Chat-form `/tokenize` LANDED (`CLAIM-C8-CHAT-TOKENIZE`)
+
+**Base.** Local `main` `344a454b` (confirmed `git rev-parse HEAD`), isolated
+worktree `.claude/worktrees/agent-a7f0cf55aa2240e6a`, CPU-only, NO dgx. vLLM pin
+`555967922`/0.26.0.dev0. Closes the ROAD-V1-C8 serving residual "chat-form
+`/tokenize`" (`SERVE-UTILITY-ENDPOINTS` stays `ACTIVE`; C8 stays `PARTIAL`).
+
+**What landed.** `/tokenize` now accepts BOTH arms of vLLM's `TokenizeRequest`
+union. `handle_tokenize` (`src/vllm/entrypoints/openai/api_server.cpp`)
+discriminates on body shape: a `messages` array → the `TokenizeChatRequest` arm
+(`add_generation_prompt` default True, `continue_final_message` default False,
+`add_special_tokens` default False, optional `tools`), which renders through
+`chat_.prompt_fn()` — the IDENTICAL chat-template seam `create_chat_completion`
+tokenizes through (a new `prompt_fn()` getter on `OpenAIServingChat`,
+`serving_chat.h`), so template rendering is NOT reinvented — then tokenizes
+(`Encode`/`EncodeWithSpecialTokens` per the flag) and returns
+`{count,max_model_len,tokens,token_strs?}`. `check_generation_prompt`
+mutual-exclusion (`add_generation_prompt`+`continue_final_message` both true → 400).
+The raw-`prompt` arm is byte-identical (default `add_special_tokens` True).
+Grounded 1:1 in vLLM `serve/tokenize/protocol.py:24,50,78,120-146,156,159` +
+`serving.py:57-124`.
+
+**Gate (CPU, exact, RED-first).** NEW `test_api_server` case "/tokenize chat form
+renders template + tokenizes" (13 asserts): chat-form tokens ==
+`Fixture().Encode(render(messages))` EXACTLY; response shape matches vLLM;
+`return_token_strs` honored; `add_generation_prompt=false` accepted;
+`continue_final_message`+`add_generation_prompt` both true → 400; empty `messages`
+now a valid 200 (was 400). RED-first PROVEN: against pre-change source
+(git-stashed the 3 source files, kept the test, rebuilt) the chat case fails
+`REQUIRE(400 == 200)` — old code hard-rejected any `messages`; restored → 200 +
+exact tokens. Raw-`prompt` case hardened with an explicit `EncodeWithSpecialTokens`
+exact-id assertion (byte-identical). `test_api_server` 27/27 (337). Inertness:
+`test_chat_template` 21/21, `test_openai_serving_chat_stream` 2/2 (210) UNCHANGED.
+Clean full-library CPU `-Werror` (`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON`), 0
+warnings.
+
+**Residual (named, honest).** `chat_template_kwargs` + `continue_final_message`
+full template-render passthrough (our ChatPromptFn seam renders via the
+`add_generation_prompt` gate only); `/tokenizer_info`, `/ready`. Other C8
+residuals unchanged: JSON-schema arg coercion, AsyncLLM production-serving metric
+wiring, config-gated metric families. `benchmark_binding=false` (serving-surface
+parity, no compute path). Records: `engine-matrix.md`
+`SERVE-UTILITY-ENDPOINTS`, `feature-matrix.md`, `roadmap_v1.md` C8,
+`specs/roadmap-v1-completion.md` C8, `docs/STATUS.md`, `docs/BENCHMARKS.md`,
+ledger, coordination `CLAIM-C8-CHAT-TOKENIZE`, this entry. All record checkers
+rc=0. NOT pushed; FULL SHA reported to caller.

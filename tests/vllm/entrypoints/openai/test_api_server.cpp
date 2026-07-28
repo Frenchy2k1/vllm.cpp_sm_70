@@ -912,10 +912,100 @@ TEST_CASE("api_server: /tokenize + /detokenize round-trip and schema") {
       h.server.handle_tokenize(R"({"prompt":"hello"})").body);
   CHECK(plain.at("token_strs").is_null());
 
-  // Errors: missing prompt → 400; chat-form messages → 400.
+  // Raw-`prompt` form byte-identical to the pre-chat-form behavior: the exact
+  // token ids are Fixture().EncodeWithSpecialTokens("hello") (add_special_tokens
+  // default True for the completion form; protocol.py:28).
+  {
+    json raw = json::parse(
+        h.server.handle_tokenize(R"({"prompt":"hello world"})").body);
+    std::vector<int> expect = Fixture().EncodeWithSpecialTokens("hello world");
+    CHECK(raw.at("tokens").get<std::vector<int>>() == expect);
+    CHECK(raw.at("count") == expect.size());
+  }
+
+  // Errors: missing prompt → 400; detokenize missing tokens → 400.
   CHECK(h.server.handle_tokenize(R"({})").status == 400);
-  CHECK(h.server.handle_tokenize(R"({"messages":[]})").status == 400);
   CHECK(h.server.handle_detokenize(R"({})").status == 400);
+}
+
+// Chat-form /tokenize (serve/tokenize/protocol.py:50 TokenizeChatRequest):
+// messages are rendered through the SAME chat template create_chat_completion
+// uses (chat_.prompt_fn()) then tokenized, returning {count, max_model_len,
+// tokens} identically to vLLM 0.26 serving_tokenization. The harness wires
+// InVocabChatPrompt as that seam, so the expected ids are computed by rendering
+// the messages through it and Encode()-ing the result (add_special_tokens
+// default False for the chat form; protocol.py:78).
+TEST_CASE("api_server: /tokenize chat form renders template + tokenizes") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  h.server.set_tokenizer(&Fixture(), /*max_model_len=*/kMaxModelLen);
+
+  // A fixed messages array. InVocabChatPrompt concatenates the contents, so the
+  // rendered prompt is "helloworld"; the expected ids come from tokenizing that
+  // exact string with the chat-form default (add_special_tokens=False → Encode).
+  const char* kChatBody =
+      R"({"messages":[{"role":"user","content":"hello"},)"
+      R"({"role":"assistant","content":"world"}]})";
+  const std::vector<ChatMessage> kMessages = {
+      ChatMessage{"user", std::string("hello")},
+      ChatMessage{"assistant", std::string("world")}};
+  const std::string rendered = InVocabChatPrompt(
+      kMessages, /*add_generation_prompt=*/true, {});
+  const std::vector<int> expect = Fixture().Encode(rendered);
+
+  ApiServer::DispatchResult tok = h.server.handle_tokenize(kChatBody);
+  REQUIRE(tok.status == 200);
+  json tj = json::parse(tok.body);
+  // Response shape matches vLLM (count / max_model_len / tokens / token_strs).
+  CHECK(tj.contains("count"));
+  CHECK(tj.at("max_model_len") == kMaxModelLen);
+  REQUIRE(tj.at("tokens").is_array());
+  // Chat-form tokens are EXACTLY the template-render → tokenize result.
+  CHECK(tj.at("tokens").get<std::vector<int>>() == expect);
+  CHECK(tj.at("count") == expect.size());
+  CHECK(tj.at("token_strs").is_null());
+
+  // return_token_strs is honored on the chat form too.
+  json body_strs = json::parse(kChatBody);
+  body_strs["return_token_strs"] = true;
+  json ts = json::parse(h.server.handle_tokenize(body_strs.dump()).body);
+  CHECK(ts.at("token_strs").is_array());
+  CHECK(ts.at("token_strs").size() == expect.size());
+
+  // The chat form agrees with the chat-completions path's OWN prompt tokens:
+  // both render through chat_.prompt_fn() and tokenize the same string, so the
+  // chat-form token ids equal what create_chat_completion would feed the engine
+  // (add_generation_prompt is create_chat_completion's fixed True default).
+
+  // add_generation_prompt=false path still tokenizes (InVocabChatPrompt ignores
+  // the flag, but the request is accepted and produces the same ids here).
+  {
+    json b = json::parse(kChatBody);
+    b["add_generation_prompt"] = false;
+    ApiServer::DispatchResult r = h.server.handle_tokenize(b.dump());
+    REQUIRE(r.status == 200);
+    CHECK(json::parse(r.body).at("tokens").get<std::vector<int>>() == expect);
+  }
+
+  // check_generation_prompt: continue_final_message + add_generation_prompt both
+  // true → 400 (protocol.py:120-128).
+  {
+    json b = json::parse(kChatBody);
+    b["continue_final_message"] = true;
+    b["add_generation_prompt"] = true;
+    CHECK(h.server.handle_tokenize(b.dump()).status == 400);
+  }
+
+  // Empty messages array is a VALID chat request (renders to the empty prompt),
+  // not a 400 — the pre-chat-form behavior rejected it; now it tokenizes.
+  {
+    ApiServer::DispatchResult r =
+        h.server.handle_tokenize(R"({"messages":[]})");
+    REQUIRE(r.status == 200);
+    json rj = json::parse(r.body);
+    CHECK(rj.at("tokens").get<std::vector<int>>() == Fixture().Encode(""));
+  }
 }
 
 TEST_CASE("api_server: /metrics exposition through the server handler") {
