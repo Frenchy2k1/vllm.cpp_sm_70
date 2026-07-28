@@ -134,6 +134,27 @@ build-verified only (compile + `cuobjdump` SASS, no throughput claim); the only
 real numbers the campaign will produce come later from the Orin RUNTIME-VERIFIED
 gate (token-exact vs the vLLM 0.25.0 oracle, then benchmarked vs llama.cpp and
 vLLM on that box, all axes).
+
+**Turing `sm_75` W1 (bf16-WMMA guard) BUILD-VERIFY — beyond-vLLM breadth first
+brick (2026-07-28, `CLAIM-CUDA-TURING-SM75`).** Disposition: **NOT APPLICABLE
+(compile-only build-verify; no throughput number taken, claimed, or owed;
+`benchmark_binding=false`).** This is a COMPILE-ONLY brick — the bf16-WMMA prefill
+kernels were guarded `#if __CUDA_ARCH__ >= 800` so the `cuda_paged_attn` TU
+compiles on `sm_75` (bf16 tensor-core fragments are Ampere+ only), selecting the
+existing scalar CUDA-core fallback. Evidence on dgx (GB10, nvcc 13.0 V13.0.88,
+cutlass 4.5.0, base local `main` `034be66e`): single-arch
+`-DVLLM_CPP_CUDA_ARCHITECTURES=75 -DVLLM_CPP_TRITON=OFF` `cuda_paged_attn.cu`
+compile with `-Werror=all-warnings` is **0 warnings / EXIT=0**, and `cuobjdump
+-lelf` shows a real `cuda_paged_attn.cu.1.sm_75.cubin` (arch = sm_75); the
+previously-measured `incomplete type …__nv_bfloat16… fragment` failure at `:1797`
+is GONE (RED cross-check: the unguarded HEAD file fails with EXIT=1 / 21 errors).
+sm_121a neutrality: the same TU compiles `-Werror` 0-warn AND its sm_121a SASS is
+byte-identical to the unguarded build (0 instruction-level diffs). **NO Turing
+board ran it; there is no vLLM oracle on Turing (vLLM dropped it), so any
+correctness/perf gate uses llama.cpp-on-card + a portable cross-check — a green
+compile + SASS is not execution evidence.** The competitor floor
+`BACKEND-GATE-CUDA-LLAMACPP-LEGACY` stays INVENTORIED until a Turing card exists.
+
 **SGLang parity PROGRAM scope (2026-07-27, `CLAIM-SGLANG-PARITY-PROGRAM`, NOT
 pushed).** Disposition: **NOT APPLICABLE (inventory / scoping spike; no build,
 no run, no measurement taken, claimed, or owed; `benchmark_binding=false`).**
