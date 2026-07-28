@@ -214,6 +214,42 @@ CPU spec run, and the divergence is plausibly as old as the widened-cache work.
 `num_accepted_tokens[i] = ns > 1 ? ns : 1`, so `nat >= 1` and `off >= 0` always.
 The missing `>= 0` guard is a latent robustness gap, not this bug.
 
+**MEASURED, 2026-07-28 - the conv row is addressed with TWO different strides.**
+Instrumenting both kernels during a spec run on the 2B GGUF (K=4, so width=3,
+num_spec=1):
+
+    [DBG fwd]     state_len=3  width=3     <- CausalConv1dFwdKernel   (prefill)
+    [DBG specupd] state_len=4  width=3     <- CausalConv1dSpecUpdate  (decode)
+
+Also measured: `CausalConv1dUpdateKernel` (the NON-spec single-token update) is
+**never called** in a spec run - decode goes exclusively through the spec update.
+
+Reading of that evidence, and what is still open. The narrow (3) prefill buffer
+is a GATHERED working copy, not the cache: `qwen3_5.cpp:3648` builds
+`cs_shape = {nreq, conv_dim, Kw - 1}`, runs the conv on it, and scatters back
+into the widened persistent row. That is legitimate BY DESIGN provided the
+gather/scatter hit the LEADING `width` taps of the widened row and the spec
+update then reads from offset `off = nat - 1 = 0`, i.e. the same leading taps.
+Those two halves LOOK consistent on inspection, so the remaining question is
+whether `conv_row_elems` / `GdnStateGather` / `GdnStateScatter` actually agree on
+the widened row geometry at runtime - inspection is not proof, and this is the
+exact seam I5e had to repair once already (its RCA was
+`gdn_state_gather: working/cache row shapes must match`).
+
+**Next probe, concrete:** dump one conv_state row (all 4 taps, one channel)
+immediately after the prefill scatter and immediately before the first spec
+update read, under both spec-ON and spec-OFF. If the ON row's leading 3 taps do
+not equal the OFF row's 3 taps, the gather/scatter geometry is the defect; if
+they DO match, the defect is downstream of the conv, in the SSM/state-slot remap
+rather than the conv row.
+
+**Attempted and REVERTED (recorded so it is not retried blind).** Making
+`CausalConv1dFwdKernel` stride by `conv_state.shape[2]` instead of `width` is a
+NO-OP on this path, because that kernel only ever sees the narrow working buffer
+(state_len == width == 3), and it changed no output. It may still be correct
+hardening for a caller that passes a widened row directly, but it fixes nothing
+here and was reverted rather than shipped unverified.
+
 **Where to look next.** The op-level CPU suites PASS (`test_ops_gdn` 1825,
 `test_qwen3_5_gdn_spec_routing` 12), so the kernels are bit-exact and the defect
 is in what the runner FEEDS them. The spec-only branch that has no non-spec
