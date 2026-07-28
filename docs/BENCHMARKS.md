@@ -79,6 +79,29 @@ tower + Gemma-4 image processor + projector/merge are the named residual (image 
 yet engine-gated). Reproduce (dgx, needs the E4B checkpoint):
 `scripts/mm/g2_gemma4_image_oracle_capture.py` then `scripts/mm/g2_vision_ref_dump.py`.
 
+## Gemma-4 G2-impl C++ NaFlex SigLIP2 vision tower - per-stage gates PASS (2026-07-28, `CLAIM-GEMMA4-G2-IMPL`) - correctness gate landed, speed pending
+
+`benchmark_binding=false` (vision-tower correctness milestone - the tower is proven
+in ISOLATION vs the transformers-eager references, mirroring Qwen3-VL M2a before its
+M2c e2e; no engine image-decode path yet, so no throughput number is owed). The C++
+tower (`gemma4_vision.{h,cpp}`, an additive standalone TU) is proven faithful
+stage-by-stage vs the committed refs on the dgx GB10 sm_121a CUDA build under
+`flock ~/gpu.lock` (`tests/vllm/multimodal/test_gemma4_vision_tower.cpp`, 220/220):
+patch-embed rel-L2 **2.15e-3** (<5e-3, TIGHT), encoder last-hidden **3.14e-2**
+(<6e-2, 16-block bf16-depth envelope), pooled+stripped **1.36e-2** (<6e-2), projected
+merge-input **1.85e-2** (<7e-2); n_valid=2304, n_soft=256. **compute-sanitizer
+memcheck 0 errors** on the vision path. Found+implemented the FINITE QAT activation
+clamps (`use_clipped_linears=True`) on the 7 encoder linears that the G2 port-map had
+assumed were no-ops. Multidim vision-RoPE runs via two `vt::RopeFromCache` calls
+sharing one cos|sin cache; no new vt op was added (reused MatmulBT / RmsNorm /
+RopeFromCache / AttentionDenseFlash / GeluAndMul). Inertness: Gemma-4 text
+`test_gemma4_paged_engine` STRICT 32/32 UNCHANGED on the linking binary. Speed
+(device-resident weights + a fused device clamp) and the image->text e2e (C++ NaFlex
+image processor + engine merge-plumbing) are the named residuals. Reproduce (dgx,
+needs the E4B checkpoint): `scripts/mm/g2_vision_weight_dump.py` (weights),
+`scripts/mm/g2_vision_ref_dump.py` (intermediate refs), then run
+`test_gemma4_vision_tower` with `VLLM_GEMMA4_VISION_WEIGHTS` + `VLLM_GEMMA4_VISION_REFS`.
+
 ## Gemma-4 G1 text backbone (2026-07-28, `CLAIM-GEMMA4-G1`) - correctness bring-up, no speed number owed
 
 `benchmark_binding=false`. G1 implemented the `Gemma4ForConditionalGeneration` text
@@ -385,6 +408,18 @@ remain the separate benchmark track (`BACKEND-GATE-CUDA-SGLANG` cache-neutral +
 `BACKEND-GATE-CUDA-SGLANG-PREFIX` shared-prefix cache-ON), each every-axis vs
 `sglang bench_serving` on the idle GB10 once the oracle is stood up (arm64 cu130
 image) and our-side `SERVE-ASYNC-LLM` lands. No source/engine path touched here.
+
+**DeepSeek-V4-Flash W0 SCOPE spike (2026-07-28, `CLAIM-DEEPSEEK-V4-SCOPE`, NOT
+pushed).** Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no
+download, no measurement taken, claimed, or owed; `benchmark_binding=false`).**
+Scopes the ~167B/256-expert `DeepseekV4ForCausalLM` (a NEW arch: DeepSeek Sparse
+Attention MLA + Manifold Hyper-Connections + NVFP4/MegaMoE + sqrtsoftplus/hash
+MoE) and its GB10 HW-fit: `nvidia/DeepSeek-V4-Flash-NVFP4` (~83 GiB, W4) fits the
+119 GiB pool and runs on sm_121 (sparse-MLA sm_12x backend; MegaMoE SM100-only ⇒
+FusedMoE fallback); native fp8 (~167 GiB) does not fit. Spec + W-plan:
+[deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md). The binding
+throughput numbers are owed only after the W1 oracle-run gate and a real
+implementation land; none is taken or promised here. No source/engine path touched.
 
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —
