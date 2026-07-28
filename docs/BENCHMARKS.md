@@ -3484,6 +3484,44 @@ this workload.
 
 ---
 
+## The remaining gap is ENTIRELY decode, and GQA grouping covers 82% of it
+
+With MLX shape-gated, **prefill is ahead** (524.5 ms against 532.6, +1.5%) so the
+whole 2.4% deficit sits in decode:
+
+```
+decode  ours 36.72 ms/tok   mlx-lm 35.91   gap 0.81 ms/tok
+  our GEMV         34.2 ms  (weight streaming at ~99 GB/s, 83% of peak)
+  our attn+other    2.52 ms
+  their attn+other  1.71 ms (assuming equal GEMV, which the spike supports)
+```
+
+**The identified lever: GQA-grouped decode attention.** With `qpk=2` the current
+kernel launches one threadgroup per (q-head, token), so the SAME kv head is
+streamed twice — 117 MB per token where 59 MB is unique. The kernel is already at
+77 GB/s against a probed 69 GB/s ceiling, so it is not inefficient; it reads the
+data twice. One threadgroup per (KV head, token) serving both q-heads reads it
+once:
+
+| | ms/tok |
+|---|--:|
+| decode attention today | 1.52 |
+| GQA-grouped (arithmetic) | 0.85 |
+| **saving** | **0.67 = 82% of the remaining gap** |
+
+That would put decode at 27.74 against MLX-LM's 27.85.
+
+**Status: implemented once, single-run REGRESSION (26.53 vs 27.24), never
+verified with the paired harness, and the branch was deleted.** The suspected
+cause is the same trap flash-decoding hit: grouping halves the threadgroup count
+(16 -> 8) so traffic halves but so does parallelism. Whoever picks this up should
+(a) re-implement with QPK as a TEMPLATE parameter, not a runtime one — the prefill
+query tiling proved a runtime bound stops MSL unrolling and spills the
+accumulators — and (b) verify with `scripts/metal-paired-ab.py`, because a
+single run is exactly what mis-called it the first time.
+
+---
+
 ## CORRECTION: the MLX-gated result is 97.6%, not 99.1% (2026-07-28)
 
 The entry below claims 99.1%. **It is wrong, and the error is mine: a two-sample
