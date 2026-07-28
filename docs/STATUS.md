@@ -514,6 +514,13 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `VLLM_ERR_INVALID_ARGUMENT` rather than `VLLM_ERR_MODEL_LOAD` (the contract
   `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
   backend) could not expose LMCache or the prefill budget in a model config.
+- **DFlash from GGUF is SPIKED, not implemented** (`SPEC-DFLASH-GGUF`,
+  [spike](../.agents/specs/gguf-dflash-draft.md)). Its asset dependency is now
+  known to be far smaller than the spike assumed: pre-converted `dflash`-arch
+  GGUF drafts are published (smallest useful ~1 GB), so no local conversion run
+  is on the critical path. The draft is cheap; the matching TARGET is the
+  expensive dependency, and it is needed only for the end-to-end gates, not for
+  the loader work.
 - **MTP speculative decoding from a GGUF target WORKS** (`SPEC-MTP-GGUF`,
   `GATING`, [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads
   from a head-carrying GGUF - `HfConfigFromGguf` republishes the depth it already
