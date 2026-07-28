@@ -61,6 +61,67 @@ near-tie prompts.
 **No speed number.** This is a correctness milestone; no tok/s is claimed or owed
 for sm_110. A llama.cpp A/B on Thor was NOT run this session (optional, deferred).
 
+## sm_87 (Jetson AGX Orin) runtime gate, the second non-GB10 runtime proof (2026-07-28, `CLAIM-CUDA-ORIN-SM87-RUNTIME`) - CORRECTNESS milestone, no speed number owed
+
+**What ran.** vllm.cpp built portable-only for `sm_87` on a real NVIDIA Jetson AGX
+Orin and ran the Llama-3.2-1B paged-engine greedy gate against the committed vLLM
+oracle golden. The SECOND non-GB10 runtime proof (Ampere, after Thor's Blackwell
+sm_110). Scope: PORTABLE bf16 **synchronous** path only (Ampere has bf16 + int8,
+no fp8/fp4; all CUTLASS/fp8/fp4/FA2 fast paths resolve EMPTY and cutlass is not
+present on the Orin container).
+
+**Board (confirmed on-box).** `ssh kairos@192.168.68.113`, NVIDIA Jetson AGX Orin,
+Tegra R36.4.3 / JetPack 6, kernel 5.15.148-tegra, aarch64, Kairos immutable OS;
+29 GiB unified memory + 14 GiB swap, 12 CPUs. On-device the vt CUDA backend
+reports `CUDA compute capability: sm_87`, `integrated=1`. **Driver CUDA = 12.6**,
+so the cached CUDA-13 L4T image is refused by the NVIDIA container runtime
+(`unsatisfied condition: cuda>=13.0 (cuda=12.6)`); the build ran in
+`nvcr.io/nvidia/l4t-jetpack:r36.4.0` (nvcc **12.6** V12.6.68).
+
+**Toolchain lesson.** The image ships g++-11 + no cmake/ninja/pip. cmake 3.31.10 +
+ninja via pip. Compiler: g++-11 fails (`#pragma GCC diagnostic ignored
+"-Wdangling-pointer"` → `error: unknown option ... [-Werror=pragmas]`), g++-12
+fails (libstdc++ `-Werror=restrict` false positive on `std::string operator+`),
+**g++-13.4** (matching the dgx CUDA-13 GCC) builds clean — the tree assumes
+GCC ≥ 13.
+
+**Build result.** `git archive c14b9919` → Orin; `-DVLLM_CPP_CUDA_ARCHITECTURES=87
+-DVLLM_CPP_CUDA=ON -DCMAKE_BUILD_TYPE=Release` (g++-13 host + CUDA-host). All 7
+CUTLASS/fp8/fp4 features `DISABLED for [87]`; `fa2 ENABLED for [87]` in the arch
+table but CUTLASS headers ABSENT → FA2 actually OFF ⇒ PORTABLE-ONLY. Release
+`-Werror`, EXIT=0.
+
+**Runtime result (on the sm_87 GPU, `local-ai` container stopped for the run).**
+- `test_cuda_backend`: **6/6 cases, 25/25 assertions, 0 skipped** — device reports
+  sm_87, integrated unified memory; real on-device alloc/memset/H2D+D2H.
+- `test_cuda_ops`: **12/12 cases, 436/436 assertions, 0 skipped** — real portable
+  CUDA kernels executed and correct on sm_87.
+- `test_llama_paged_engine` (unsloth/Llama-3.2-1B bf16, fetched on-box), sync
+  runner (`VT_ASYNC_RUNNER=0`), vs the committed golden
+  `tests/parity/goldens/llama_greedy_1b`:
+  - **STRICT token-exact 13/16 prompts vs the vLLM 0.25.0 oracle greedy golden.**
+  - **16/16 prompts PASS the ratified near-tie distributional gate**, 3/16
+    near-tie-band only (max gap 0 nats), **0 forward-divergent** (exceeds Thor's
+    12/16).
+  - 1 benign anchor-drift vs the GB10 `sm_121a` anchor (`our_ids.npy`) at prompt 9
+    token 14 (a bf16 near-tie, committed gap 0 nats).
+
+**Honest note — sm_87 async-runner bug.** With the DEFAULT async runner /
+async-scheduling (`max_concurrent_batches=2`), the first forward CRASHES:
+`vt cuda drop-in: cudaFree(device resource): an illegal memory access was
+encountered` (SIGABRT). The synchronous runner (`VT_ASYNC_RUNNER=0`) runs
+correctly — hence RUNTIME-VERIFIED is scoped to the portable bf16 SYNC path; the
+async runner on sm_87 is a tracked unblock item (next diagnostic:
+compute-sanitizer on the async path). As with the Thor gate, the committed test's
+hard anchor-REQUIRE (GB10 bit-identity, pre-multi-arch) aborts at the first
+cross-arch near-tie (prompt 9); it was softened to a non-aborting counter on the
+Orin source copy ONLY (this tree unchanged) to read the 16-prompt count.
+
+**No speed number.** Correctness milestone; no tok/s claimed or owed for sm_87. A
+llama.cpp A/B on the Orin was NOT run this session (deferred). The `local-ai`
+serving container was stopped for the GPU run and RESTORED afterward; all scratch
+and the build container were removed; root `/` untouched.
+
 **Repro (exact).**
 ```
 # base commit 0f07fe34 (main HEAD); archive -> Thor (NOT rsync)

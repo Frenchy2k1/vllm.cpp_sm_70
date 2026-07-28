@@ -269,7 +269,7 @@ lock policy are recorded in `developer-preferences.md`.
 | # | Step | Gate |
 |---|---|---|
 | WA-O0 | Record the Orin host handle + lock in `developer-preferences.md`; SSH reachable; toolkit present (`nvcc` accepting `sm_87`, cutlass 4.5.0 stageable). Transfer by `git archive <commit> \| ssh orin tar -x -C <scratch>` — NEVER rsync (the rsync-overwrote-goldens hazard). | env recorded; toolchain probe clean |
-| WA-O1 | Build **portable-only** for `sm_87`; gate a small bf16 model AND a GGUF model TOKEN-EXACT vs the vLLM `0.25.0` oracle on the portable path. **This is the FIRST non-GB10 runtime proof of vllm.cpp.** | token-exact both models; moves `BACKEND-CUDA-SM087` portable cell → RUNTIME-VERIFIED |
+| WA-O1 | Build **portable-only** for `sm_87`; gate a small bf16 model AND a GGUF model TOKEN-EXACT vs the vLLM `0.25.0` oracle on the portable path. | **DONE 2026-07-28 (bf16 leg) — RUNTIME-VERIFIED, see §WA-O1 RESULT.** Llama-3.2-1B bf16 = 13/16 strict token-exact vs oracle, 16/16 near-tie gate, 0 divergent, on real sm_87 (SYNC runner). `BACKEND-CUDA-SM087` portable cell → RUNTIME-VERIFIED. Residual on this row: the GGUF-model leg (not yet run) + the async-runner sm_87 crash (illegal memory access — a real bug to fix) |
 | WA-O2 | Widen the `fa2` cell, rebuild with FA2 for `sm_87`; gate FA2 token-exact; assert `VT_ARCH_TACTIC_STATS`/backend selects FLASH_ATTN. | token-exact; FA2 cell → RUNTIME-VERIFIED |
 | WA-O3 | Land the Marlin int4 W4A16 instantiations (WA-2), build for `sm_87`; gate a GPTQ or AWQ int4 checkpoint token-exact; assert the `marlin-int4/sm8x` tactic SELECTED. | token-exact; Marlin-int4 cell → RUNTIME-VERIFIED |
 | WA-O4 | Land AllSpark (WA-4) + scaled-mm C2x int8 (WA-5); gate a W8A16 and an int8 W8A8 checkpoint token-exact. | token-exact; AllSpark + C2x-int8 cells → RUNTIME-VERIFIED |
@@ -286,6 +286,82 @@ distributional near-tie gate only where vLLM's own greedy is non-deterministic).
 `-DCMAKE_CUDA_ARCHITECTURES=87`), the exact model + workload, seed, the vLLM
 oracle command, the llama.cpp build + command; re-run ≥2-3× within run-noise;
 same-binary A/B; idle box under the Orin GPU lock.
+
+### WA-O1 RESULT — RUNTIME-VERIFIED on real Orin sm_87 (2026-07-28, `CLAIM-CUDA-ORIN-SM87-RUNTIME`)
+
+**Status: WA-O1 DONE (portable bf16 SYNC path).** The SECOND non-GB10 runtime
+proof after Thor sm_110 (WA-O2..WA-O5 remain open).
+
+**Orin env as found (memory-relevant — recorded here, not in the memory files).**
+`ssh kairos@192.168.68.113` (user `kairos`, passwordless `sudo`, NOT in docker
+group → `sudo docker`). NVIDIA Jetson AGX Orin, Tegra R36.4.3 / JetPack 6, kernel
+5.15.148-tegra, aarch64, Kairos immutable OS. Integrated Ampere **sm_87**
+(device self-reports `sm_87`, `integrated=1` unified memory; bf16+int8, no
+fp8/fp4). RAM 29 GiB + 14 GiB swap, 12 CPUs. **Disk:** root `/` = 5.3 G (~411 M
+free) — untouched; big partition = `COS_PERSISTENT` 1.8 T (~981 G free) mounted at
+`/home` AND `/var/lib/docker` (docker data-root is already on the big partition);
+`/tmp` = 15 G tmpfs; `/usr/local` is read-only to kairos → scratch went under
+`/home/kairos`. GPU held by container **`local-ai`**
+(`localai/localai:master-nvidia-l4t-arm64`) — `sudo docker stop local-ai` to free
+it, RESTORED with `sudo docker start local-ai` after (live serving node).
+
+**Container reality — the cached CUDA-13 image is BLOCKED.**
+`localai/localai:master-nvidia-l4t-arm64-cuda-13` fails
+`nvidia-container-runtime` with `unsatisfied condition: cuda>=13.0 (cuda=12.6)` —
+the Orin driver only advertises **CUDA 12.6**, so a CUDA-13 userspace cannot get
+the GPU. Used **`nvcr.io/nvidia/l4t-jetpack:r36.4.0`** instead (nvcc **12.6**
+V12.6.68, GPU access OK). That image ships g++-11 + no cmake/ninja/pip.
+
+**Toolchain stand-up (inside the l4t-jetpack container).** `apt install
+python3-pip ninja-build` + `pip install cmake` → cmake 3.31.10, ninja 1.10.1.
+**Compiler:** g++-11 FAILS (`#pragma GCC diagnostic ignored "-Wdangling-pointer"`
+→ `error: unknown option ... [-Werror=pragmas]`; the warning is GCC-12+); g++-12
+FAILS (libstdc++ `-Werror=restrict` false positive on `std::string operator+` in
+`kv_offload/fs_io.cpp`); **g++-13.4** (ubuntu-toolchain PPA — matches the dgx
+CUDA-13 GCC, supported by nvcc 12.6) builds CLEAN. This is the portable lesson:
+the tree assumes GCC ≥ 13.
+
+**Build (EXIT=0).** `git archive c14b9919` → `/home/kairos/orin-work/src`;
+`cmake -G Ninja -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13
+-DCMAKE_CUDA_HOST_COMPILER=g++-13 -DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=87 -DCMAKE_BUILD_TYPE=Release`. Feature table: all 7
+CUTLASS/fp8/fp4 features `DISABLED for [87]`; `fa2 ENABLED for [87]` in the arch
+table but **CUTLASS headers ABSENT** → FA2 actually OFF ⇒ **PORTABLE-ONLY**
+baseline (the mandatory minimal proof). Release `-Werror` build of the vllm lib +
+tests, EXIT=0.
+
+**Runtime (on the sm_87 GPU, `local-ai` stopped).**
+- `test_cuda_backend`: **6/6 cases, 25/25 assertions, 0 skipped** — device reports
+  `CUDA compute capability: sm_87`, `integrated=1`; real on-device
+  alloc/memset/H2D+D2H round-trips.
+- `test_cuda_ops`: **12/12 cases, 436/436 assertions, 0 skipped** — real portable
+  CUDA kernels executed and correct on sm_87.
+- `test_llama_paged_engine` (unsloth/Llama-3.2-1B bf16 safetensors, fetched on-box
+  via `snapshot_download`): full paged LLMEngine greedy, 16 prompts — **16/16 PASS
+  the near-tie distributional gate, 13/16 STRICT token-exact vs the committed vLLM
+  0.25.0 oracle greedy golden (`greedy_ids.npy`), 3/16 near-tie-band (max gap 0
+  nats), 0 forward-divergent.** Exceeds Thor sm_110's 12/16. 1 benign anchor-drift
+  vs the GB10 sm_121a CUDA anchor (`our_ids.npy`) at prompt 9 tok 14 (a bf16
+  near-tie, gap 0 nats).
+
+**HONEST CAVEAT — sm_87 async-runner bug (unblock item).** With the DEFAULT async
+runner / async scheduling (`max_concurrent_batches=2`), the first forward CRASHES:
+`vt cuda drop-in: cudaFree(device resource): an illegal memory access was
+encountered` (SIGABRT). The **SYNCHRONOUS runner (`VT_ASYNC_RUNNER=0`,
+`max_concurrent_batches=1`) runs correctly** — hence RUNTIME-VERIFIED is scoped to
+the portable bf16 **SYNC** path. Unblock = find the sm_87 out-of-bounds in the
+async-runner forward path (Ampere occupancy / dynamic-shared-mem or a
+capture/replay assumption differing from sm_121a/sm_110). `CUDA_LAUNCH_BLOCKING=1`
+did not surface the kernel before the sync path passed; `compute-sanitizer` on the
+async path is the next diagnostic.
+
+**Methodology note.** The committed `test_llama_paged_engine` has a hard
+anchor-REQUIRE (`REQUIRE(first_div < 0)` vs the GB10 `our_ids.npy`) that encodes
+GB10 bit-identity predating any second board, so it aborts at the first cross-arch
+near-tie (prompt 9). To read the full 16-prompt oracle count it was softened to a
+non-aborting counter **on the Orin source copy ONLY** (this tree unchanged) —
+identical to how the Thor sm_110 gate was handled. The underlying forward is
+correct; the anchor golden simply needs a per-arch refresh.
 
 ## Dependencies
 

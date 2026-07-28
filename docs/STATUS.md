@@ -279,6 +279,25 @@ kernel campaign). The other fan-out boards remain build-supported only (no board
 here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
 
+**As of 2026-07-28, `sm_87` is also RUNTIME-VERIFIED (portable bf16 SYNC path) on
+real silicon — the SECOND non-GB10 runtime proof.** vllm.cpp was built
+portable-only for `sm_87` on an NVIDIA Jetson AGX Orin (Tegra R36.4.3 / JetPack 6,
+aarch64; the integrated GPU self-reports `sm_87`, unified memory). Because the
+Orin driver advertises only CUDA 12.6, the CUDA-13 container is refused by the
+NVIDIA container runtime, so the build used the JetPack-6 `l4t-jetpack:r36.4.0`
+image (nvcc 12.6) with g++-13 (the tree needs GCC ≥ 13). All fp8/fp4/CUTLASS/FA2
+fast paths resolve EMPTY on `sm_87` (Ampere: bf16 + int8, no fp8/fp4; cutlass not
+present). It ran the Llama-3.2-1B paged-engine greedy gate and was **13/16 prompts
+STRICT token-exact vs the committed vLLM 0.25.0 oracle golden, 16/16 under the
+near-tie distributional gate, 0 forward-divergent** (exceeding Thor's 12/16), plus
+`test_cuda_backend`/`test_cuda_ops` (461 assertions of real on-device kernel
+execution). One honest `sm_87` bug surfaced: the DEFAULT asynchronous runner path
+crashes on the first forward with an illegal memory access, so RUNTIME-VERIFIED is
+scoped to the portable bf16 **synchronous** path (`VT_ASYNC_RUNNER=0`) — the async
+runner on `sm_87` is a tracked unblock item. Repro and evidence:
+[docs/BENCHMARKS.md](BENCHMARKS.md),
+[.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM087`.
+
 As of 2026-07-28, the datacenter-Blackwell `sm_100a` fan-out gained its first
 FAST-PATH body: the **NVFP4 tcgen05 block-scaled GEMM is BUILD-VERIFIED**
 (`DERIVED+BUILD-VERIFIED, testing-welcome`). A faithful 1:1 type-port of vLLM's
