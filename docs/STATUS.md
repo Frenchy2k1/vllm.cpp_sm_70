@@ -130,6 +130,14 @@ plumbing — `add_request(MultiModalInputs)` on both engines, default-inert to t
 text path), but is not yet servable end-to-end (the closing GPU gate `MM-SERVE-E2E`
 — the model tokenizer/processor seam body + the mm forward — is still pending).
 
+**Open, not root-caused (observed 2026-07-28):** the C-ABI custom logits
+processor case (`tests/capi/test_capi.cpp:410`, ABI v8) SIGSEGVs in a CUDA build
+on the GB10 box, while the same suite is 232/232 green on a CPU build. Confirmed
+present on pristine `main` `ee3d5960` with no local changes, so it is not a
+regression from any in-flight work, but it does mean the "supported" claim for
+custom logits processors in the capability table above is verified on CPU only.
+One build directory, not yet bisected.
+
 ## Model family notes
 
 ### Gemma
@@ -678,22 +686,30 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `VLLM_ERR_INVALID_ARGUMENT` rather than `VLLM_ERR_MODEL_LOAD` (the contract
   `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
   backend) could not expose LMCache or the prefill budget in a model config.
-- **DFlash from GGUF: the axis-A loader is IMPLEMENTED** (`SPEC-DFLASH-GGUF`,
-  `PARTIAL`, [spike](../.agents/specs/gguf-dflash-draft.md)). A DFlash draft
-  packaged as a single `dflash`-arch GGUF now loads: config from the `dflash.*`
-  KVs, weights through a resolver that reuses the existing safetensors
-  `LoadQwen3DFlash` body (so its qkv / gate_up row concatenation is shared), and
-  a `.gguf` branch in the draft-path resolution. The target-shared embedding and
-  lm_head still come from the target, as the GGUF contract intends. Gated at 47
-  assertions against the real published Qwen3.6-27B draft, RED-first, with every
-  GGUF/GDN/engine suite unchanged.
-  Two conventions this had to undo, BOTH invisible to shape and name checks and
-  pointing OPPOSITE ways: `dflash.target_layers` is stored `+1`-offset, and the
-  draft's RMSNorm weights are RAW (its converter class does not inherit the
-  Qwen3Next `+1` shift, so unlike the trunk and the MTP head they must NOT be
-  un-shifted). `PARTIAL`: the end-to-end token gate needs the matching
-  Qwen3.6-27B target and has not run, and axis B (GGUF target as well) is
-  untouched.
+- **DFlash speculative decoding from a GGUF DRAFT WORKS end to end on the GB10
+  release target** (`SPEC-DFLASH-GGUF`, `PARTIAL`,
+  [spike](../.agents/specs/gguf-dflash-draft.md)). A DFlash draft packaged as a
+  single `dflash`-arch GGUF now loads AND generates against a safetensors target
+  (axis A): config from the `dflash.*` KVs, weights through a resolver that
+  reuses the existing safetensors `LoadQwen3DFlash` body, a `.gguf` branch in the
+  draft-path resolution, and the target-shared embedding and lm_head still taken
+  from the target, as the GGUF contract intends.
+  **Binding result:** on the Qwen3.6-27B NVFP4 safetensors target, the published
+  `Q4_K_M` GGUF draft and the bf16 z-lab safetensors draft produce
+  token-for-token identical greedy continuations with identical accepted and
+  proposed draft counts (20/80 and 42/96 on two prompts, k=16, concurrency 1).
+  The 4-bit draft costs nothing in acceptance on this target, which the spike had
+  flagged as a real risk.
+  Three conventions this had to undo, all invisible to shape and name checks:
+  `dflash.target_layers` is stored `+1`-offset; the draft's RMSNorm weights are
+  RAW (its converter class does not inherit the Qwen3Next `+1` shift, so unlike
+  the trunk and the MTP head they must NOT be un-shifted, which points the
+  opposite way); and `vocab_size`, which the GGUF contract deliberately omits,
+  must be back-filled from the target or the draft's shared embedding table is
+  empty and the first proposal throws. Only the last survived the load-level
+  tests, and only generating found it.
+  `PARTIAL`: axis B (GGUF target as well, needing the `SharedHeadSource` retype)
+  is untouched, and no speed number is owed or measured yet.
 - **MTP speculative decoding from a GGUF target WORKS, on CPU and on the GB10
   release target** (`SPEC-MTP-GGUF`, `DONE`,
   [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads from a

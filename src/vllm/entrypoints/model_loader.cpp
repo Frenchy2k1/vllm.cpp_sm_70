@@ -236,9 +236,21 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
     VT_CHECK(!draft->weights.embed_tokens.Empty() && !draft->weights.lm_head.Empty(),
              "dflash gguf: target embed_tokens/lm_head (bf16) not found in target shards");
     draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
+    // The DFLASH GGUF arch carries NO vocab KV and no embedding tensor (the
+    // draft SHARES the target's), so MakeDflashGgufConfig leaves vocab_size 0 -
+    // right for the config, fatal for the forward: the draft sizes its embedding
+    // lookup as `{config.vocab_size, H}` (qwen3_dflash.cpp:245,477,1008,1043), so
+    // 0 is an EMPTY table and the first propose throws "cuda embedding: empty
+    // table (vocab 0) with nonempty ids". The safetensors draft never hit this
+    // because its config.json declares vocab_size. Take the row count from the
+    // TARGET tensor actually being indexed rather than from any declared value,
+    // so the view and the buffer cannot disagree. Found by SPEC-DFLASH-GGUF GD4,
+    // the first run that ever GENERATED through a GGUF-sourced DFlash draft.
+    draft->config.vocab_size = draft->weights.embed_tokens.shape[0];
     std::cerr << "vllm.cpp: DFlash draft loaded from GGUF " << draft_dir
               << " (k=" << draft->k << ", taps=" << num_taps
-              << ", mask=" << mask_id << ")\n";
+              << ", mask=" << mask_id
+              << ", vocab=" << draft->config.vocab_size << ")\n";
     return draft;
   }
   if (!fs::exists(fs::path(draft_dir) / "config.json", ec)) {

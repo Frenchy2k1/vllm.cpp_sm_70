@@ -30622,3 +30622,143 @@ M2a before the M2c e2e). dgx GB10 CUDA `flock`, weights via
   MEMORY-INFEASIBLE**, not merely disk-contended; reaching a runnable gate needs
   multi-node TP / CPU offload / a smaller quant. Row stays SPIKE. All 6 record checkers
   rc=0. NEXT: W3 (512-wide MLA dense-first) once a multi-GPU/offload run path exists.
+
+## 2026-07-28 - `SPEC-DFLASH-GGUF` GD4: axis A GENERATES, and generating found the defect
+
+Axis A (GGUF draft, safetensors target) now works end to end on the release
+target. Worktree `/home/mudler/_git/vllm.cpp-abi-v9` off `main` `ee3d5960`;
+dgx.casa GB10 sm_121a, CUDA 13 at `/usr/local/cuda/bin`; every GPU-executing run
+serialized behind `flock $HOME/gpu.lock`; dgx `/` 53G free before and after,
+nothing left behind.
+
+### 1. The defect: a field nothing had a reason to write
+
+`GD1`-`GD3` were green at 47 assertions and had never generated. The first
+generation threw immediately:
+
+    vt: cuda embedding: empty table (vocab 0) with nonempty ids
+      at src/vt/cuda/cuda_ops.cu:648
+
+`MakeDflashGgufConfig` leaves `HfConfig::vocab_size` at 0 and that is CORRECT:
+the DFLASH GGUF arch carries no vocab KV and no `token_embd`, because the draft
+shares the target's table. One of the 47 assertions pins exactly that. But the
+draft's forward sizes its shared embedding lookup as `{config.vocab_size, H}`
+(`qwen3_dflash.cpp:245,477,1008,1043`), so 0 is an EMPTY view over a buffer that
+was loaded correctly. The safetensors draft never met this because its
+`config.json` declares `vocab_size`.
+
+Fix in `LoadDflashDraft`'s GGUF branch (`model_loader.cpp:238-249`): take the row
+count from the TARGET tensor actually being indexed
+(`weights.embed_tokens.shape[0]` = 248320) rather than from any declared number,
+so the view and the buffer cannot disagree. Not in `MakeDflashGgufConfig`, which
+has no target and should keep saying "the file does not carry this".
+
+**The lesson is the sharper version of the `SPEC-MTP-GGUF` one.** There, a
+load-level green loader was end-to-end wrong. Here it was not even a wrong VALUE
+- it was a value nothing in the load path had a reason to write, and every
+load-time assertion (weights present, shared head found, `draft_vocab_size` set)
+passed. Load-level green is not a gate.
+
+### 2. The gate form was wrong the first time, and the reference arm proved it
+
+The case as first written asserted `spec-ON == spec-OFF`. That is the MTP k=1
+bar. It PASSED on a 24-token prompt for both draft formats, and FAILED on a
+48-token prompt for both - including the already-`DONE` safetensors reference
+arm, at the same index 16, with the same single dropped token (`279`) and the
+same re-convergence. A gate the reference arm fails is not measuring this row.
+
+This is not new information, it is `SPEC-DFLASH` `D5`, which measured **vLLM's
+OWN DFlash-ON against vLLM's OWN spec-OFF and found them token-different on 3 of
+the 4 golden prompts**, because the k=16 block verify diverges from sequential
+decode at bf16 near-ties; `D6` then root-caused our matching residual as
+bf16-IRREDUCIBLE and ratified the near-tie form as FINAL. The landed 27B DFlash
+case is already shaped that way (`DFlash-ON == vLLM-DFlash-ON`, plus acceptance).
+
+So the bar was corrected to the mode-matched, cross-format one - which is also
+what the spike's gate 3 says in its own words ("GGUF draft == safetensors
+draft"), and which the task framing had called a mere diagnostic:
+
+- **(a) BINDING:** with both `VLLM_DFLASH_DRAFT` and `VLLM_DFLASH_DRAFT_B` set,
+  the two DFlash-ON continuations must be token-identical and their
+  accepted/proposed counts must match exactly. Both arms run the identical code
+  path and differ only in where the bytes came from, so the near-tie envelope
+  cannot excuse a difference. Asserted in ONE process, not eyeballed across two.
+- **(b) BINDING:** nonzero acceptance per arm (the `I5e` dead-drafter trap).
+- **(c) near-tie-robust vs spec-OFF:** identical, or a non-trivial shared prefix.
+  A structural break diverges at index 0.
+
+### 3. Result: axis A PASSES, and Q4_K_M costs nothing
+
+Target `~/bench/q36-27b-nvfp4-vllm` (Qwen3.6-27B NVFP4 safetensors), drafts
+`~/bench/Qwen3.6-27B-DFlash-Q4_K_M.gguf` (986 MB) and `z-lab/Qwen3.6-27B-DFlash`
+(bf16 safetensors, HF cache snapshot `0919688658996800f86b895034249700e9481106`),
+k=16, greedy, concurrency 1.
+
+    prompt "The capital of France is", 24 tok
+      GGUF Q4_K_M   20/80 accepted (0.250)
+      safetensors   20/80 accepted (0.250)      tokens CROSS-FORMAT IDENTICAL
+      spec-ON vs spec-OFF: IDENTICAL
+      17/17 assertions, exit 0, wall 1:43.72, peak RSS 41506164 KiB (39.58 GiB)
+
+    prompt "Write a Python function that reverses a string:", 48 tok
+      GGUF Q4_K_M   42/96 accepted (0.4375)
+      safetensors   42/96 accepted (0.4375)     tokens CROSS-FORMAT IDENTICAL
+      spec-ON vs spec-OFF: first divergence at index 16 (BOTH formats, same
+        dropped token 279, tail re-converges) = the ratified D5 near-tie envelope
+
+Target-side control, same runs: spec-OFF reproduced its own sequence 3/3 (plain,
+repeat, and logprobs-on), with **ZERO exact top-1/top-2 ties** and min margin
+0.197319 / 0.399725 nats. So the 27B NVFP4 target is token-stable and the
+comparison is NOT hostage to tie-breaking - unlike the 35B A3B NVFP4 safetensors
+sibling recorded above, whose three exact ties made its own identity unmeasurable.
+That sibling finding is model-specific, not a property of "NVFP4 safetensors".
+
+**The spike's stated risk did not materialize.** It flagged that a Q4_K_M draft
+might be accepted less often than the bf16 one. Measured: identical counts on
+both prompts. Two prompts is the evidence; it is not a general claim.
+
+### 4. Build and honesty notes
+
+`~/wk-mtp-gguf/build-cuda`, configured with `-DVLLM_CPP_CUDA_ARCHITECTURES=121a`.
+Arch verified the ONLY reliable way: `flags.make` shows
+`--generate-code=arch=compute_121a` and `cuobjdump -lelf` on the test binary
+shows 20 `sm_121a` and nothing else. `CMakeCache.txt` still reads
+`CMAKE_CUDA_ARCHITECTURES:STRING=75` and is still a decoy.
+
+**Recorded, not hidden:** this build dir has `VLLM_CPP_CUTLASS_DIR` pointing at a
+nonexistent `third_party/cutlass`, so configure logs "CUTLASS not found ... NVFP4
+GEMM + FA2 disabled" and the target runs its non-CUTLASS NVFP4 path (Marlin
+NVFP4 W4A16 is enabled). This is the SAME build shape the `SPEC-MTP-GGUF`
+checkpoint used, so the two rows' numbers are comparable, but a CUTLASS-enabled
+build is a different numeric path and this row has not been run on one.
+
+**Regression sweep.** CPU dev box, all unchanged vs the `GD1`-`GD3` baseline:
+`llm_engine` 196, `capi` 232, `gguf` 103, `runner` 257, `qwen3_dflash_gguf` 0
+(asset-gated, inert without the draft). dgx with the assets present:
+`qwen3_dflash_gguf` **47/47**, `llm_engine` 196, `gguf` 103, `runner` 257,
+`qwen35_gguf_spec_decode` 0 (asset env unset, inert).
+
+**Separate PRE-EXISTING dgx failure, NOT attributable to this row and NOT fixed
+here.** `test_capi` SIGSEGVs on dgx in `capi: custom logits processor forces the
+generated token (ABI v8)` (`tests/capi/test_capi.cpp:410`). Verified pre-existing
+by reverting BOTH files of this change on the dgx tree, rebuilding `test_capi`
+from pristine `main` `ee3d5960` and re-running: the SAME SIGSEGV at the SAME
+line. The same suite is 232/232 green on the CPU dev box, so it is specific to
+the CUDA build/path, not to the C ABI logic. Recorded as an open item; nothing in
+this row touches that path.
+
+### 5. Row disposition
+
+`SPEC-DFLASH-GGUF` stays **`PARTIAL`**, which is what the spike's own work
+breakdown says the row rests at after `GD4`. Axis A is complete and gated; axis B
+(`GD5`-`GD8`: the `SharedHeadSource` retype, dropping `dflash` from the GGUF
+rejection, the axis-B token gate) is untouched, and gate 1 (spec-OFF byte-identical
+SACRED) is not owed until axis B touches that path. Gate 2 (weight-level
+cross-format bit-identity) is `NOT APPLICABLE`: it needs an F16 GGUF of this draft
+and only Q4_K_M is published, so it can never be met with the available asset -
+its purpose is served by gate 3 at the token level. Gate 6 (speed) PENDING by
+design.
+
+Records (ONE commit): the `GD4` case + the loader fix, `specs/gguf-dflash-draft.md`
+(the third trap, the gate dispositions, the `GD4` row), `engine-matrix.md`,
+`parity-ledger.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`, this entry.
