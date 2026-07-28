@@ -111,7 +111,7 @@ one deleted `throw`.
 | # | File | Change |
 |---|---|---|
 | 1 | `src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp:568` (`HfConfigFromGguf`) | Stop discarding `nextn`: set `c.raw["mtp_num_hidden_layers"] = nextn` so `ResolveSpecConfig` (`src/vllm/entrypoints/model_loader.cpp:458-470`) resolves the real depth instead of its `int64_t{1}` fallback. Keep `num_hidden_layers = block_count - nextn` unchanged. |
-| 2 | **CORRECTED at implementation time.** `LoadQwen3_5MTPFromGguf` in the EXISTING `src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp`, NOT a `TensorResolver` in a new TU. **The resolver seam is the wrong seam**: it hands out raw tensor views, but the GGUF conventions live one level up in that file's helpers, and there are three of them, all silent if missed. (a) Norm weights are stored **(w + 1)** and must be un-shifted (`OwnNormMinus1`) - a plain read leaves every norm off by one and poisons every proposal without failing anything. (b) Matmul weights carry the file's quantization + residency routing (`OwnMatmulWeight`, `RequireExpand`). (c) `GgufTensorInfo::shape` is already torch `[N, K]`, so `fc` is the VERBATIM path, not the transposing one - the transposing helper would yield `[2H, H]` and only fail deep inside the draft forward. Going through the resolver means re-deriving all three in a second place; reusing the trunk helpers is what makes the head obey the same conventions as the trunk it speculates for. |
+| 2 | `src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp` (`LoadQwen3_5MTPFromGguf`) | **CORRECTED at implementation time.** The head loader lives in the EXISTING GGUF weights TU, NOT as a `TensorResolver` in a new one. **The resolver seam is the wrong seam**: it hands out raw tensor views, but the GGUF conventions live one level up in that file's helpers, and there are three of them, all silent if missed. (a) Norm weights are stored **(w + 1)** and must be un-shifted (`OwnNormMinus1`) - a plain read leaves every norm off by one and poisons every proposal without failing anything. (b) Matmul weights carry the file's quantization + residency routing (`OwnMatmulWeight`, `RequireExpand`). (c) `GgufTensorInfo::shape` is already torch `[N, K]`, so `fc` is the VERBATIM path, not the transposing one - the transposing helper would yield `[2H, H]` and only fail deep inside the draft forward. Going through the resolver means re-deriving all three in a second place; reusing the trunk helpers is what makes the head obey the same conventions as the trunk it speculates for. |
 | 3 | same | Scalars resolve at block `L` (`nextn.eh_proj`/`enorm`/`hnorm`/`shared_head_norm`); the head's transformer block(s) at `L+i` reuse `LoadAttnGguf` / `OwnMatmulWeight` / `LoadMoeGguf`. The head block is ALWAYS full-attention and is deliberately NOT looked up in `config.layer_types`, which covers the trunk only (a lookup there would run off the end). |
 | 4 | `src/vllm/entrypoints/model_loader.cpp:717-723` | Narrow the rejection: keep it for `method == "dflash"` (until `SPEC-DFLASH-GGUF`), drop it for `"mtp"`. `"ngram"` is already unaffected. |
 | 5 | `src/vllm/entrypoints/model_loader.cpp` (GGUF branch, ~`:710-730`) | After `ModelRegistry::Load`, when a spec config is present call `LoadQwen3_5MTP` with the GGUF resolver and `AttachMtpDraftWeights`, mirroring the safetensors branch at `:770`. |
@@ -185,130 +185,52 @@ ours, built to the same shape as the safetensors MTP gates.
 `G0` is deliberately a work row, not an assumption. `G1` is independently
 landable and inert.
 
-## Open defect surfaced by this row: `CPU-SPEC-DIVERGENCE`
+## Defect surfaced AND FIXED by this row: `CPU-SPEC-DIVERGENCE`
 
-**Not caused by this row, and not fixed by it.** Turning speculative decoding ON
-changes the target's own greedy output on CPU even when NO draft is ever
-accepted. Established by bisect, not inference: with the head zeroed
-(23 proposed / 0 accepted) the spec-ON continuation is byte-identical to the
-live-head spec-ON continuation and still differs from spec-OFF.
-
-    spec-OFF          " Paris.\nA. True\nB. False..."      {11751, 13, 198, 32, ...}
-    spec-ON (live)    " Paris is the capital of France..."  {11751, 369, 279, 6511, ...}
-    spec-ON (dead)    identical to spec-ON (live)           {11751, 369, 279, 6511, ...}
-
-Why this is engine-level and not loader-level: with zero accepted drafts the
-verify path must emit exactly the target's argmax at every position. It does not.
-So the target's forward or its state bookkeeping differs under the widened
-speculative KV / conv cache.
-
-Scope note: there is NO CPU spec-decode gate anywhere in the tree. `SPEC-MTP`
-I5d/I5e/I6/I7 were all gated on GB10, so this is plausibly the first end-to-end
-CPU spec run, and the divergence is plausibly as old as the widened-cache work.
-
-**First lead RAISED AND REFUTED (do not re-chase).**
-`CausalConv1dSpecUpdateKernel` (`src/vt/cpu/cpu_ops.cpp:1010+`) computes
-`off = num_accepted_tokens[i] - 1` and guards the state read with
-`src < state_len` only, with no `src >= 0`, so a zero `nat` would read
-`srow[-1]`. It cannot: `src/vllm/v1/worker/gpu/runner.cpp:1187` clamps
-`num_accepted_tokens[i] = ns > 1 ? ns : 1`, so `nat >= 1` and `off >= 0` always.
-The missing `>= 0` guard is a latent robustness gap, not this bug.
-
-**MEASURED, 2026-07-28 - the conv row is addressed with TWO different strides.**
-Instrumenting both kernels during a spec run on the 2B GGUF (K=4, so width=3,
-num_spec=1):
-
-    [DBG fwd]     state_len=3  width=3     <- CausalConv1dFwdKernel   (prefill)
-    [DBG specupd] state_len=4  width=3     <- CausalConv1dSpecUpdate  (decode)
-
-Also measured: `CausalConv1dUpdateKernel` (the NON-spec single-token update) is
-**never called** in a spec run - decode goes exclusively through the spec update.
-
-Reading of that evidence, and what is still open. The narrow (3) prefill buffer
-is a GATHERED working copy, not the cache: `qwen3_5.cpp:3648` builds
-`cs_shape = {nreq, conv_dim, Kw - 1}`, runs the conv on it, and scatters back
-into the widened persistent row. That is legitimate BY DESIGN provided the
-gather/scatter hit the LEADING `width` taps of the widened row and the spec
-update then reads from offset `off = nat - 1 = 0`, i.e. the same leading taps.
-Those two halves LOOK consistent on inspection, so the remaining question is
-whether `conv_row_elems` / `GdnStateGather` / `GdnStateScatter` actually agree on
-the widened row geometry at runtime - inspection is not proof, and this is the
-exact seam I5e had to repair once already (its RCA was
-`gdn_state_gather: working/cache row shapes must match`).
-
-**PRIME SUSPECT IDENTIFIED (high confidence, one line).**
-`src/vllm/model_executor/models/qwen3_5.cpp:3616`:
+**FIXED 2026-07-28.** Speculative decoding changed the target's own greedy output
+on CPU. Root cause, in one line
+(`src/vllm/model_executor/models/qwen3_5.cpp:3616`):
 
     const int64_t conv_row_elems = conv_dim * (Kw - 1);
 
-That is the WIDTH-based row size, but under speculation the persistent
-`state.conv_state` row is `conv_dim * ((Kw - 1) + num_spec)` - measured as
-state_len=4 vs width=3 on the 2B (K=4, num_spec=1). It is then used as the
-per-slot extent for `GatherStateF32` / `ScatterStateF32` (`:3666`, `:3673`,
-`:3698`, `:3702`), which move a CONTIGUOUS `conv_row_elems` block. Gathering a
-contiguous `conv_dim*3` prefix out of a physically `conv_dim*4` row only lines up
-for channel 0; every subsequent channel is read (and written back) at a
-progressively larger offset error. That is exactly a corrupted post-prefill
-recurrent state, which is exactly the observed symptom - the first DECODE token
-after a correct prefill token is already wrong.
+Under speculation the persistent conv row is widened to
+`conv_dim * ((Kw - 1) + num_spec)` so a rejected step can roll back, but the
+prefill working copy is legitimately narrow (prefill produces only the K-1
+leading taps). `GatherRows`/`ScatterRows` use ONE size for BOTH the slot stride
+and the row contents, so once those differ they mis-stride the slot AND
+mis-address every channel past the first. Post-prefill recurrent state was
+therefore garbage, which is exactly the symptom: prefill token correct, first
+decode token wrong.
 
-The fix is not a one-character change: the working copy is legitimately narrow
-(prefill only produces K-1 taps), so gather/scatter must become STRIDE-AWARE
-(copy `width` taps per channel out of / into a `state_len`-strided row) rather
-than contiguous. The non-spec path must stay byte-identical, which it does by
-construction when `state_len == width`.
+**Fix:** `CopyStateRowsStrided` in the same TU, used by `GatherStateF32` /
+`ScatterStateF32` when `cache.shape[2] != work.shape[2]`. It copies `taps`
+elements per CHANNEL out of a `cache_taps`-strided row. When the two widths agree
+- every non-speculative path - the contiguous helpers are used unchanged, so
+non-spec behaviour is byte-identical by construction AND by gate.
 
-NOT applied here: it changes shared state-movement helpers used by every GDN
-path, and this session could not gate the non-spec paths it would touch. Whoever
-takes it should assert the leading-taps equality probe below FIRST, so the fix is
-verified against a measurement rather than against this reasoning.
+**Evidence (CPU, 2B GGUF):**
 
-**Confirming probe, concrete:** dump one conv_state row (all 4 taps, one channel)
-immediately after the prefill scatter and immediately before the first spec
-update read, under both spec-ON and spec-OFF. If the ON row's leading 3 taps do
-not equal the OFF row's 3 taps, the gather/scatter geometry is the defect; if
-they DO match, the defect is downstream of the conv, in the SSM/state-slot remap
-rather than the conv row.
+    before   spec-OFF " Paris.\nA. True..."   spec-ON " Paris is the capital..."   13/10
+    after    spec-OFF " Paris."               spec-ON " Paris."  IDENTICAL         13/11
 
-**Attempted and REVERTED (recorded so it is not retried blind).** Making
-`CausalConv1dFwdKernel` stride by `conv_state.shape[2]` instead of `width` is a
-NO-OP on this path, because that kernel only ever sees the narrow working buffer
-(state_len == width == 3), and it changed no output. It may still be correct
-hardening for a caller that passes a widened row directly, but it fixes nothing
-here and was reverted rather than shipped unverified.
+Regression sweep, all unchanged: `test_ops_gdn` 1825, `test_gdn_metadata_builder`
+483, `test_gdn_prefill_conv` 28, `test_qwen3_5_gdn_spec_routing` 12, `test_gguf`
+103, `test_gguf_qwen36_loader` 99, `test_gguf_keep_quant` 5958,
+`test_gguf_dequant` 215, `test_llm_engine` 196, `test_input_batch` 163,
+`test_runner` 257, `test_capi` 232.
 
-**DISCRIMINATOR RUN 2026-07-28 - the WIDENING is innocent, the spec conv PATH is not.**
-`ngram` speculation sets a SpeculativeConfig and widens the same cache, but loads
-no head and reads no `nextn` tensors. Result: `ngram` spec-ON output is
-**token-exact** to spec-OFF, and instrumentation shows `CausalConv1dSpecUpdate`
-is **never called** in that run. So:
+**Scope of the bug.** CPU-only in effect: the compressed-cache (fp16/bf16) arm
+routes through `GdnStateGather`/`GdnStateScatter` ops instead, which take tensors
+and carry their own geometry, so CUDA was never exposed. No GPU result is
+affected or retracted. It was invisible until now because it requires
+speculation ON (widened row) AND the f32 row-copy path AND an actual generation -
+and there was no CPU spec-decode gate anywhere in the tree.
 
-    widened cache alone (ngram)                        EXACT
-    spec conv/state update EXECUTING (mtp, 0 accepted) DIVERGES
-
-which narrows the defect from "the speculative path" to specifically the
-preparation/consumption of the GDN conv state around
-`CausalConv1dSpecUpdate` - and re-confirms, from a third independent angle, that
-neither MTP head weights nor the GGUF loader are involved. The ngram case is
-retained as a permanent regression guard in
-`tests/parity/test_qwen35_gguf_spec_decode.cpp`.
-
-**Where to look next.** The op-level CPU suites PASS (`test_ops_gdn` 1825,
-`test_qwen3_5_gdn_spec_routing` 12), so the kernels are bit-exact and the defect
-is in what the runner FEEDS them. The spec-only branch that has no non-spec
-counterpart is the GDN metadata spec overload,
-`src/vllm/v1/worker/gpu/runner.cpp:896-925`: `num_decode_draft_tokens` (-1 for a
-non-spec row, else the scheduled draft count), the PREVIOUS step's
-`num_accepted_tokens`, and the k+1 GDN state-slot remap behind `gdn_bt`. That
-triple is what changes the target's own recurrent state under speculation, which
-is exactly the observed symptom (target output moves with speculation ON even at
-zero acceptance). Suggested next probe: assert spec-ON vs spec-OFF equality of
-the GDN state itself after step 1 on a 1-token prompt, which localises to the
-state feed without needing a full generation.
-
-**Reproduction:**
-`VT_GDN_STATE_BF16=0 VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cpu/tests/test_qwen35_gguf_spec_decode`
-(CPU `causal_conv1d_spec_update` refuses bf16 conv state, hence the env var.)
+**How it was found.** Three-step bisect, each step removing a variable: (1) kill
+the drafter -> identical divergence at 0 acceptance, so not the head; (2) `ngram`
+-> token-exact while never calling the spec conv update, so not the widening
+itself; (3) instrument both conv kernels -> 3-vs-4 stride split, pointing at the
+state movement between them.
 
 ## Risks/decisions
 

@@ -514,62 +514,30 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `VLLM_ERR_INVALID_ARGUMENT` rather than `VLLM_ERR_MODEL_LOAD` (the contract
   `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
   backend) could not expose LMCache or the prefill budget in a model config.
-- **MTP speculative decoding from a GGUF target is PARTIAL** (`SPEC-MTP-GGUF`,
-  [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head now LOADS from a
-  head-carrying GGUF: `HfConfigFromGguf` republishes the depth it already read
-  from `<arch>.nextn_predict_layers` and then discarded, and
-  `LoadQwen3_5MTPFromGguf` reads the `nextn` block using the trunk loader's own
-  helpers, so the head inherits the GGUF (w+1) norm storage, the quantization /
-  residency routing and the torch [N, K] shape order. Gated against a real
-  llama.cpp-converted Qwen3.5-2B (2 cases / 18 assertions, env-gated so CI stays
-  asset-free), RED-first, with every GGUF trunk suite unchanged. A GGUF exported
-  without the head is still refused, now naming that as the reason.
-  **End-to-end it is NOT correct yet, and the row stays `PARTIAL` for a measured
-  reason rather than an unrun one.** The token gate
-  (`tests/parity/test_qwen35_gguf_spec_decode.cpp`) runs on CPU against the real
-  2B GGUF and FAILS: the drafter is demonstrably alive (13 drafts proposed, 10
-  accepted) but spec-ON output DIVERGES from spec-OFF, which greedy MTP must
-  never do. **The cause is now ATTRIBUTED, by bisect, and it is NOT the GGUF head
-  loader**: zeroing the head so every proposal is garbage (23 proposed, 0
-  accepted) produces byte-identical output to the live-head run and the same
-  divergence. With zero accepted drafts the emitted sequence must be the target's
-  own greedy sequence, so enabling speculation is changing the TARGET's forward
-  on CPU. With a live head the loader earns 10/13 acceptance. Do not describe
-  GGUF MTP as working end to end, but the remaining defect is engine-level.
-- **Speculative decoding diverges on CPU, independently of MTP or of GGUF**
-  (`CPU-SPEC-DIVERGENCE`, recorded in
-  [the GGUF MTP spike](../.agents/specs/gguf-mtp-spec-decode.md)). Turning
-  speculation on changes the target's own greedy output even with no draft ever
-  accepted. There is no CPU spec-decode gate anywhere in the tree - `SPEC-MTP`
-  was gated entirely on GB10 - so this is plausibly the first end-to-end CPU spec
-  run and the defect may be as old as the widened-cache work. GPU spec-decode
-  results are unaffected and unretracted; op-level CPU suites (`test_ops_gdn`,
-  `test_qwen3_5_gdn_spec_routing`) pass, so this is call-site bookkeeping rather
-  than kernel math. **Narrowed 2026-07-28** to the GDN conv row geometry: under
-  speculation the conv row is addressed with two strides (prefill's working copy
-  is `(K-1)` wide, the spec decode update reads a `(K-1)+num_spec` row), and the
-  non-spec single-token update is never called at all. The split is legitimate by
-  design - the narrow buffer is a gathered working copy scattered back into the
-  widened row - so the open question is whether the gather/scatter and the spec
-  read agree on that geometry at runtime. **Narrowed again**: `ngram` speculation, which widens the same cache but never
-  runs the spec conv update, is token-EXACT - so the widening is innocent and the
-  defect is in the GDN conv state prepared for / consumed by the spec update. A
-  one-line prime suspect is recorded in the spike
-  (`qwen3_5.cpp:3616` sizes the gather/scatter row by `(Kw-1)` while the
-  speculative row is `(Kw-1)+num_spec`, so only channel 0 lands correctly). The
-  fix requires stride-aware state gather/scatter and is NOT applied, because it
-  touches shared GDN state movement that this session could not gate.
-- **DFlash from GGUF is SPIKED, not implemented.** `mtp` and
-  `dflash` are refused on a `.gguf` target today; `ngram` works there and
-  always has. Two `READY` rows now carry the scoped plan:
-  `SPEC-DFLASH-GGUF` ([spike](../.agents/specs/gguf-dflash-draft.md)). The
-  original safetensors-only framing said GGUF exports carry no `mtp.*`; that
-  is stale as a general claim. llama.cpp's Qwen3.5 converter DOES emit the
-  head (under layer-indexed `nextn` naming) and llama.cpp master carries a
-  full `dflash` draft arch, so both are loader gaps on our side rather than
-  format limitations. Speculation also remains Qwen3.5/3.6-only at this pin
-  regardless of checkpoint format, because the widened speculative KV cache
-  is built directly for those families.
+- **MTP speculative decoding from a GGUF target WORKS** (`SPEC-MTP-GGUF`,
+  `GATING`, [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads
+  from a head-carrying GGUF - `HfConfigFromGguf` republishes the depth it already
+  read from `<arch>.nextn_predict_layers`, and `LoadQwen3_5MTPFromGguf` reads the
+  `nextn` block with the trunk loader's own helpers, so it inherits the GGUF
+  (w+1) norm storage, the quantization routing and the torch [N, K] shape order.
+  Gated on CPU against a real llama.cpp-converted Qwen3.5-2B: **spec-ON output is
+  token-identical to spec-OFF with 13 drafts proposed / 11 accepted**, plus an
+  `ngram` regression guard. A GGUF exported without the head is refused, naming
+  that as the reason. `GATING` rather than `DONE`: no GPU run and no
+  cross-format (F16 GGUF vs safetensors) agreement check yet, and no throughput
+  number.
+- **Speculative decoding on CPU corrupted the target's own state, and is FIXED**
+  (`CPU-SPEC-DIVERGENCE`). `qwen3_5.cpp:3616` sized the GDN state gather/scatter
+  row by `(Kw-1)` while the speculative persistent row is `(Kw-1)+num_spec`, so
+  the contiguous row helpers mis-strode the cache slot and every channel past the
+  first, corrupting post-prefill recurrent state; speculation therefore changed
+  the target's own greedy output even when no draft was accepted. Fixed with a
+  stride-aware per-channel state copy used only when the two widths differ, so
+  every non-speculative path stays byte-identical. CPU-only in effect - the
+  fp16/bf16 cache arm routes through the `GdnStateGather`/`Scatter` ops, so CUDA
+  was never exposed and no GPU result is affected or retracted. It survived
+  because there was no CPU spec-decode gate anywhere in the tree; there is one
+  now.
 - `/health` reports process liveness rather than a full engine-health probe.
 - **Speculative decoding** ships user-facing via `--speculative-config` (OpenAI
   server, example CLI, and C ABI v6), unset by default and byte-identical to the
