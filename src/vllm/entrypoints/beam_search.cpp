@@ -11,6 +11,7 @@
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/tokenizer.h"
+#include "vllm/v1/engine/async_llm.h"
 #include "vllm/v1/engine/llm_engine.h"
 
 namespace vllm {
@@ -106,11 +107,28 @@ bool BeamSearchStep(
   return false;
 }
 
-BeamSearchOutput BeamSearch(v1::LLMEngine& engine,
-                            const std::vector<int32_t>& prompt_tokens,
-                            const BeamSearchParams& params,
-                            std::optional<int> eos_token_id,
-                            const tok::Tokenizer* tokenizer) {
+namespace {
+
+// The engine-agnostic beam-search driver body, shared verbatim by the sync
+// BeamSearch(LLMEngine&) and async BeamSearchAsync(AsyncLLM&) wrappers. `Engine`
+// is any type exposing the pre-tokenized single-request driver
+//   RequestOutput generate(std::vector<int32_t> tokens, SamplingParams, const
+//                          std::string& req_id)
+// — both LLMEngine and AsyncLLM satisfy it. Extracting this keeps the sync path
+// BYTE-IDENTICAL to before (BeamSearch now forwards here) while the async path
+// reuses the SAME expand/score/select/EOS logic (BeamSearchStep) — only the
+// engine object differs, exactly as online.py mirrors offline.py.
+//
+// The per-step beam decodes are issued SEQUENTIALLY (one generate() at a time);
+// for AsyncLLM this makes each decode a single isolated request, byte-identical
+// to the sync driver. Concurrent per-beam stepping (online.py's asyncio.gather)
+// is a named residual — see beam_search.h.
+template <class Engine>
+BeamSearchOutput BeamSearchDrive(Engine& engine,
+                                 const std::vector<int32_t>& prompt_tokens,
+                                 const BeamSearchParams& params,
+                                 std::optional<int> eos_token_id,
+                                 const tok::Tokenizer* tokenizer) {
   // offline.py:80-88.
   const int beam_width = params.beam_width;
   const int max_tokens = params.max_tokens;
@@ -195,6 +213,29 @@ BeamSearchOutput BeamSearch(v1::LLMEngine& engine,
     output.sequences.push_back(std::move(beam));
   }
   return output;
+}
+
+}  // namespace
+
+BeamSearchOutput BeamSearch(v1::LLMEngine& engine,
+                            const std::vector<int32_t>& prompt_tokens,
+                            const BeamSearchParams& params,
+                            std::optional<int> eos_token_id,
+                            const tok::Tokenizer* tokenizer) {
+  // The sync (offline) driver: unchanged behavior, now forwarding to the shared
+  // engine-agnostic body. Ported from offline.py:58-191.
+  return BeamSearchDrive(engine, prompt_tokens, params, eos_token_id, tokenizer);
+}
+
+BeamSearchOutput BeamSearchAsync(v1::AsyncLLM& engine,
+                                 const std::vector<int32_t>& prompt_tokens,
+                                 const BeamSearchParams& params,
+                                 std::optional<int> eos_token_id,
+                                 const tok::Tokenizer* tokenizer) {
+  // The production-server (online) driver over AsyncLLM. Ported from
+  // online.py:28-220 (BeamSearchOnlineMixin.beam_search) — same algorithm as
+  // offline, different engine. See beam_search.h for the concurrency residual.
+  return BeamSearchDrive(engine, prompt_tokens, params, eos_token_id, tokenizer);
 }
 
 }  // namespace vllm

@@ -76,6 +76,17 @@ class AsyncLLM {
                            const std::string& prompt, SamplingParams params,
                            int priority = 0);
 
+  // add_request for a PRE-TOKENIZED prompt (vLLM TokensPrompt). Strictly
+  // ADDITIVE overload mirroring LLMEngine::add_request(tokens): builds the
+  // request from prompt_token_ids directly (InputProcessor::process_inputs_tokens),
+  // skipping tokenization, and passes no prompt string (std::nullopt) to the
+  // OutputProcessor. The string overload above is UNCHANGED. Used by the async
+  // beam-search driver (BeamSearchAsync), which sources each per-beam decode from
+  // the beam's growing token sequence, not a string.
+  AsyncRequest add_request(const std::string& request_id,
+                           std::vector<int32_t> prompt_token_ids,
+                           SamplingParams params, int priority = 0);
+
   // Consumer side of generate (:524-635). get_output blocks for this request
   // only; get_output_nowait is the fast path used before blocking.
   RequestOutput get_output(const AsyncRequest& request);
@@ -85,6 +96,16 @@ class AsyncLLM {
   // Blocking convenience for non-streaming callers: drain this request's
   // collector until its terminal RequestOutput. Other requests keep running.
   RequestOutput generate(const std::string& prompt, SamplingParams params,
+                         const std::string& request_id = "0",
+                         int priority = 0);
+
+  // generate for a PRE-TOKENIZED prompt (vLLM TokensPrompt). Strictly ADDITIVE
+  // overload of the blocking single-request driver (mirrors the string generate
+  // loop, and LLMEngine::generate(tokens)): add the pre-tokenized request, then
+  // drain its collector to the terminal RequestOutput. The async beam-search
+  // driver issues one such single-token decode per beam per step.
+  RequestOutput generate(std::vector<int32_t> prompt_token_ids,
+                         SamplingParams params,
                          const std::string& request_id = "0",
                          int priority = 0);
 

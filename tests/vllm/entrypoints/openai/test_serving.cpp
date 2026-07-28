@@ -36,6 +36,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/core/sched/scheduler.h"
+#include "vllm/v1/engine/async_llm.h"
 #include "vllm/v1/engine/core.h"
 #include "vllm/v1/engine/input_processor.h"
 #include "vllm/v1/engine/output_processor.h"
@@ -359,6 +360,30 @@ struct Harness {
   LLMEngine engine;
 };
 
+// The PRODUCTION serving stack: the AsyncLLM frontend the HTTP server holds
+// (examples/server/main.cpp), same model/config/tokenizer as Harness. Used to
+// gate use_beam_search over the async serving path (BeamSearchAsync).
+struct AsyncHarness {
+  AsyncHarness(const HfConfig& c, const Qwen3_5MoeWeights& w,
+               const Tokenizer& tok, int max_num_reqs = 8)
+      : scheduler(Harness::MakeSchedulerConfig(), MakeKvConfig(c), kBlockSize,
+                  /*enable_caching=*/true),
+        runner(c, w, MakeKvConfig(c), Q(), max_num_reqs, kMaxModelLen,
+               /*max_num_batched_tokens=*/kMaxModelLen * max_num_reqs),
+        executor(runner),
+        input_processor(tok, c),
+        output_processor(&tok),
+        engine(input_processor, scheduler, executor, output_processor,
+               Harness::Hasher()) {}
+
+  Scheduler scheduler;
+  GPUModelRunner runner;
+  Executor executor;
+  InputProcessor input_processor;
+  OutputProcessor output_processor;
+  vllm::v1::AsyncLLM engine;
+};
+
 // Strip the SSE `data: ` frame + trailing `\n\n` off a chunk line.
 std::string SsePayload(const std::string& chunk) {
   REQUIRE(chunk.rfind("data: ", 0) == 0);
@@ -663,6 +688,75 @@ TEST_CASE("serving_completion: use_beam_search choices match the driver") {
   }
 }
 
+// (bs1a) PRODUCTION path: a use_beam_search request over an AsyncLLM-backed
+// endpoint returns beam_width choices IDENTICAL to the direct BeamSearchAsync
+// driver — i.e. the server no longer rejects beam with "requires the synchronous
+// engine". Before this wiring the async beam block raised (the old code required
+// sync_engine_ != nullptr); now it routes through BeamSearchAsync. The choices
+// also match the sync BeamSearch oracle (async == sync, proven token-identical in
+// test_llm_engine.cpp), so the production endpoint is beam-correct end to end.
+TEST_CASE("serving_completion: use_beam_search runs on the async (production) engine") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kBeam = 2;
+  const int kMax = 4;
+
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.max_tokens = kMax;
+  req.n = kBeam;
+  req.use_beam_search = true;
+  req.stream = false;
+
+  const BeamSearchParams params = req.to_beam_search_params(kMax);
+  const std::vector<int32_t> prompt_ids = tok.Encode("hello");
+
+  // Oracle: the SYNC driver directly over a fresh engine (the merged path).
+  Harness ho(c, w, tok);
+  const BeamSearchOutput oracle =
+      BeamSearch(ho.engine, prompt_ids, params, std::nullopt, &tok);
+  REQUIRE(oracle.sequences.size() == static_cast<size_t>(kBeam));
+
+  // Actual: the endpoint over the PRODUCTION AsyncLLM engine.
+  AsyncHarness ha(c, w, tok);
+  OpenAIServingCompletion serving(ha.engine, "test-model");
+  REQUIRE(serving.uses_async_engine());
+  serving.set_beam_search_tokenizer(&tok, std::nullopt);
+  CompletionResult res = serving.create_completion(req);  // no longer throws
+
+  REQUIRE_FALSE(res.streaming);
+  REQUIRE(res.response.has_value());
+  const auto& resp = *res.response;
+  REQUIRE(resp.choices.size() == static_cast<size_t>(kBeam));
+  for (int i = 0; i < kBeam; ++i) {
+    CHECK(resp.choices[i].index == i);
+    CHECK(resp.choices[i].text ==
+          vllm::entrypoints::openai::SanitizeUtf8(
+              oracle.sequences[static_cast<size_t>(i)].text.value_or("")));
+    REQUIRE(resp.choices[i].finish_reason.has_value());
+    CHECK(*resp.choices[i].finish_reason == "length");
+  }
+}
+
+// (bs1b) The async endpoint STILL rejects beam when no tokenizer is attached
+// (the tokenizer is required for prompt tok + per-beam detok on either engine).
+TEST_CASE("serving_completion: async use_beam_search without a tokenizer is rejected") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  AsyncHarness ha(c, w, tok);
+  OpenAIServingCompletion serving(ha.engine, "test-model");
+  // No set_beam_search_tokenizer -> beam_tokenizer_ stays null.
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.max_tokens = 4;
+  req.n = 2;
+  req.use_beam_search = true;
+  req.stream = false;
+  CHECK_THROWS_AS(serving.create_completion(req), std::runtime_error);
+}
+
 // (bs2) streaming beam search is rejected (upstream serving.py:136).
 TEST_CASE("serving_completion: streaming + use_beam_search is rejected") {
   const HfConfig c = MakeConfig();
@@ -942,6 +1036,48 @@ TEST_CASE("serving_chat: use_beam_search choices match the driver") {
   OpenAIServingChat serving(ha.engine, "test-model", InVocabChatPrompt);
   serving.set_beam_search_tokenizer(&tok, std::nullopt);
   ChatCompletionResult res = serving.create_chat_completion(req);
+
+  REQUIRE(res.response.has_value());
+  const auto& resp = *res.response;
+  REQUIRE(resp.choices.size() == static_cast<size_t>(kBeam));
+  for (int i = 0; i < kBeam; ++i) {
+    CHECK(resp.choices[i].index == i);
+    CHECK(resp.choices[i].message.role == "assistant");
+    REQUIRE(resp.choices[i].message.content.has_value());
+    CHECK(*resp.choices[i].message.content ==
+          vllm::entrypoints::openai::SanitizeUtf8(
+              oracle.sequences[static_cast<size_t>(i)].text.value_or("")));
+  }
+}
+
+// (bs3a) PRODUCTION path: the chat endpoint use_beam_search over an AsyncLLM
+// backend returns choices identical to the direct driver — beam runs on the
+// production server, no longer rejected.
+TEST_CASE("serving_chat: use_beam_search runs on the async (production) engine") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kBeam = 2;
+  const int kMax = 4;
+
+  ChatCompletionRequest req = MakeChatRequest(
+      {ChatMessage{"user", std::string("hello")}}, kMax, /*stream=*/false);
+  req.temperature = std::nullopt;
+  req.n = kBeam;
+  req.use_beam_search = true;
+
+  const BeamSearchParams params = req.to_beam_search_params(kMax);
+  Harness ho(c, w, tok);
+  const std::vector<int32_t> prompt_ids = tok.Encode("hello");
+  const BeamSearchOutput oracle =
+      BeamSearch(ho.engine, prompt_ids, params, std::nullopt, &tok);
+  REQUIRE(oracle.sequences.size() == static_cast<size_t>(kBeam));
+
+  AsyncHarness ha(c, w, tok);
+  OpenAIServingChat serving(ha.engine, "test-model", InVocabChatPrompt);
+  REQUIRE(serving.uses_async_engine());
+  serving.set_beam_search_tokenizer(&tok, std::nullopt);
+  ChatCompletionResult res = serving.create_chat_completion(req);  // no throw
 
   REQUIRE(res.response.has_value());
   const auto& resp = *res.response;

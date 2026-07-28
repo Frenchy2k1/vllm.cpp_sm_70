@@ -28480,3 +28480,43 @@ All record checkers rc=0. NOT pushed; FULL SHA reported to caller.
   edited), streaming beam (rejected like upstream), C-ABI `best_of`/beam fields (ABI bump),
   AsyncLLM streaming per-child best_of collation, grammar-constrained beams. NOT pushed;
   FULL SHA reported to caller.
+
+- **2026-07-28** — **Async / production-server beam search (`SAMPLE-BEAM` async)
+  LANDED + CPU-GATED** (`CLAIM-C7-BEAM-ASYNC`; isolated worktree
+  `.claude/worktrees/agent-ae5914d10673378cc` off local `main` `aed4718e`, confirmed
+  via `git rev-parse HEAD`; CPU-only, NO dgx; NOT pushed). Closes the named residual
+  of `CLAIM-C7-BESTOF-BEAM-API`: `use_beam_search` worked only over the SYNC
+  `LLMEngine`, but the production server (`examples/server/main.cpp`) holds an
+  `AsyncLLM`, so a beam request there raised "requires the synchronous engine". Adds
+  `BeamSearchAsync(AsyncLLM&, …)` mirroring vLLM `entrypoints/generate/beam_search/
+  online.py:28-220` — drives the AsyncLLM per-beam single-token `generate` and calls
+  the SAME merged `BeamSearchStep`/`get_beam_search_score` (algorithm shared verbatim
+  via a `template <class Engine> BeamSearchDrive` body; only the engine object
+  differs). `AsyncLLM` gained pre-tokenized `add_request`/`generate` overloads (via
+  `InputProcessor::process_inputs_tokens`) since a beam steps on its growing token
+  sequence. `serving_completion.cpp`/`serving_chat.cpp` route `use_beam_search` to
+  `BeamSearchAsync` when async-backed; `examples/server/main.cpp` wires
+  `set_beam_search_tokenizer` on the production handlers. Gates: `test_llm_engine`
+  10/10 (NEW: `BeamSearchAsync` == sync `BeamSearch` token-IDENTICAL — tokens/order/
+  cum_logprob/finish_reason/text — for beam_width 1/2/3; the 9 prior incl. the sync
+  beam e2e UNCHANGED), `test_openai_serving` 40/40 (NEW: completion + chat beam over
+  the PRODUCTION AsyncLLM engine → choices IDENTICAL to the direct driver, no longer
+  rejected; tokenizer-less async beam still rejected; the prior 37 UNCHANGED),
+  `test_beam_search` 5/5 + `test_async_llm` 8/8 UNCHANGED. RED evidence: pre-wiring
+  the async block was `if (sync_engine_ == nullptr …) throw "requires the synchronous
+  engine and a tokenizer"` (removed in the diff). Clean full-lib CPU `-Werror`
+  (`-Wall -Wextra -Werror`, `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON` Release)
+  **0-warn** incl. the `server` binary. ENGINE row count UNCHANGED (existing
+  `SAMPLE-BEAM` row). Records: `engine-matrix.md` `SAMPLE-BEAM` row (async coverage,
+  owner→`CLAIM-C7-BEAM-ASYNC`), `feature-matrix.md` §6, `roadmap_v1.md` C7,
+  `specs/sampling-controls-c7.md` (NEW `SAMPLE-BEAM` async section + online.py
+  file:line + the concurrency finding), `docs/STATUS.md`, `docs/BENCHMARKS.md`
+  (NOT-APPLICABLE — feature), ledger, coordination `CLAIM-C7-BEAM-ASYNC`, this entry.
+  All record checkers rc=0. **HONEST CONCURRENCY FINDING:** per-step beam decodes are
+  driven SEQUENTIALLY (byte-identical to the sync driver); online.py's `asyncio.gather`
+  per-beam CONCURRENT stepping is a NAMED RESIDUAL (AsyncLLM supports concurrent
+  requests — a future throughput optimization; correctness-first here). NOT a hidden
+  sync fallback — the drive goes through the real AsyncLLM add_request →
+  output-handler-thread → collector path. **Residuals (named):** per-beam concurrent
+  stepping, streaming beam (rejected like upstream), C-ABI beam, grammar-constrained
+  beams, encoder-decoder/LoRA beams. NOT pushed; FULL SHA reported to caller.

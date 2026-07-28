@@ -357,6 +357,34 @@ streaming beam (rejected like upstream), C-ABI `best_of`/beam fields.
 Reproduce: `cmake --build build-cpu --target test_openai_serving &&
 ctest --test-dir build-cpu -R '^test_openai_serving$' --output-on-failure`.
 
+**ROAD-V1-C7 async / production-server beam search (`SAMPLE-BEAM` async)
+(2026-07-28, `CLAIM-C7-BEAM-ASYNC`, NOT pushed).** Disposition: **NOT APPLICABLE
+(no throughput number, `benchmark_binding=false`; a feature/correctness capability
+— beam search made to RUN on the production AsyncLLM server, with the non-beam and
+sync-beam paths byte-identical).** Closes the named residual of
+`CLAIM-C7-BESTOF-BEAM-API`: `use_beam_search` worked only over the SYNC `LLMEngine`,
+but the production server (`examples/server/main.cpp`) holds an `AsyncLLM`, so a beam
+request there raised "requires the synchronous engine". Adds
+`BeamSearchAsync(AsyncLLM&, …)` mirroring vLLM `entrypoints/generate/beam_search/
+online.py:28-220`, driving the AsyncLLM per-beam single-token `generate` and calling
+the SAME merged `BeamSearchStep`/`get_beam_search_score` (algorithm shared via a
+`template <class Engine> BeamSearchDrive` body; only the engine object differs).
+Gate: `test_llm_engine` 10/10 — `BeamSearchAsync` returns beams token-IDENTICAL to
+the sync `BeamSearch` (tokens/order/cum_logprob/finish_reason/text) for beam_width
+1/2/3 over the synthetic CPU Qwen3.6; `test_openai_serving` 40/40 — completion + chat
+beam over the PRODUCTION AsyncLLM engine → choices IDENTICAL to the direct driver,
+no longer rejected (RED evidence: pre-wiring the block threw "requires the
+synchronous engine and a tokenizer"); tokenizer-less async beam still rejected.
+Inertness: `test_beam_search` 5/5, `test_async_llm` 8/8, and the prior 37 serving +
+9 llm_engine cases UNCHANGED. Clean full-library CPU `-Werror` 0-warn incl. the
+`server` binary. **Honest concurrency finding:** per-step beam decodes are driven
+SEQUENTIALLY (byte-identical to the sync driver); online.py's `asyncio.gather`
+per-beam CONCURRENT stepping is a named residual (a future throughput optimization).
+Residuals (named): per-beam concurrent stepping, streaming beam, C-ABI beam,
+grammar-constrained beams. Reproduce: `cmake --build build-cpu --target
+test_llm_engine test_openai_serving && ./build-cpu/tests/test_llm_engine &&
+./build-cpu/tests/test_openai_serving`.
+
 **ROAD-V1-C8 /metrics LIVE per-step wiring (2026-07-27,
 `CLAIM-ROADMAP-C8-METRICS-WIRE`, NOT pushed).** Disposition: **NOT APPLICABLE (no
 throughput number, `benchmark_binding=false`; metrics are observational, off the

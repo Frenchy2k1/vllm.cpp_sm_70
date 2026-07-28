@@ -165,25 +165,31 @@ CompletionResult OpenAIServingCompletion::create_completion(
 
   // ── use_beam_search (completion/serving.py:173-205) ──────────────────────
   // Route the request through the merged BeamSearch driver instead of the
-  // sampler: beam_width == n, returns the n best beams as choices. This runs
-  // over the SYNC LLMEngine (the driver is LLMEngine&-based); the AsyncLLM beam
-  // path is a named residual. Streaming beam search is rejected exactly as
-  // upstream (serving.py:136-139).
+  // sampler: beam_width == n, returns the n best beams as choices. The
+  // production server holds an AsyncLLM → BeamSearchAsync (online.py); the sync
+  // LLMEngine seam (tests / offline) → BeamSearch (offline.py). Both call the
+  // SAME model-free scoring/selection, so the choices are identical. Streaming
+  // beam search is rejected exactly as upstream (serving.py:136-139).
   if (request.use_beam_search) {
     if (request.stream) {
       throw std::runtime_error(
           "Streaming is not currently supported with beam search");
     }
-    if (sync_engine_ == nullptr || beam_tokenizer_ == nullptr) {
+    if (beam_tokenizer_ == nullptr ||
+        (async_engine_ == nullptr && sync_engine_ == nullptr)) {
       throw std::runtime_error(
-          "beam search requires the synchronous engine and a tokenizer");
+          "beam search requires an engine and a tokenizer");
     }
     const int max_tok = request.max_tokens.value_or(16);
     const BeamSearchParams params = request.to_beam_search_params(max_tok);
     const std::vector<int32_t> prompt_ids =
         beam_tokenizer_->Encode(request.prompt);
-    const BeamSearchOutput beams = BeamSearch(
-        *sync_engine_, prompt_ids, params, beam_eos_token_id_, beam_tokenizer_);
+    const BeamSearchOutput beams =
+        async_engine_ != nullptr
+            ? BeamSearchAsync(*async_engine_, prompt_ids, params,
+                              beam_eos_token_id_, beam_tokenizer_)
+            : BeamSearch(*sync_engine_, prompt_ids, params, beam_eos_token_id_,
+                         beam_tokenizer_);
 
     CompletionResponse response;
     response.id = request_id;

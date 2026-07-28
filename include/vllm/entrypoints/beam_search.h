@@ -52,6 +52,7 @@ class Tokenizer;  // vllm/tokenizer/tokenizer.h
 
 namespace v1 {
 class LLMEngine;  // vllm/v1/engine/llm_engine.h
+class AsyncLLM;   // vllm/v1/engine/async_llm.h
 }  // namespace v1
 
 // BeamSearchParams (sampling_params.py:1114). Beam-search parameters for text
@@ -151,6 +152,31 @@ BeamSearchOutput BeamSearch(v1::LLMEngine& engine,
                             const BeamSearchParams& params,
                             std::optional<int> eos_token_id,
                             const tok::Tokenizer* tokenizer = nullptr);
+
+// BeamSearchAsync: the PRODUCTION-server (AsyncLLM) beam-search driver, ported
+// from vllm/entrypoints/generate/beam_search/online.py:28-220
+// (BeamSearchOnlineMixin.beam_search). Identical to BeamSearch above EXCEPT it
+// drives an AsyncLLM (the engine the HTTP server holds) instead of the sync
+// LLMEngine: per step, for each active beam it issues one async single-token
+// generate (logprobs=2*beam_width, the beam temperature) over the beam's growing
+// token sequence, awaits its terminal RequestOutput, and calls the SAME model-free
+// BeamSearchStep / get_beam_search_score scoring+selection+EOS logic. The
+// algorithm is NOT forked — only the engine drive differs (online.py mirrors
+// offline.py's `_beam_search_step`).
+//
+// CONCURRENCY (recorded): online.py fans the per-step beam decodes out
+// concurrently (asyncio.gather). This driver issues them SEQUENTIALLY per step —
+// one add_request+drain per beam — so each per-beam decode is a single isolated
+// request in its scheduler step, byte-identical to the sync BeamSearch driver
+// (which also decodes beams one at a time). AsyncLLM supports concurrent requests,
+// so per-beam CONCURRENT stepping is a valid future optimization; it is a NAMED
+// RESIDUAL here (correctness-first: sequential guarantees the async==sync
+// token-identical gate). See specs/sampling-controls-c7.md.
+BeamSearchOutput BeamSearchAsync(v1::AsyncLLM& engine,
+                                 const std::vector<int32_t>& prompt_tokens,
+                                 const BeamSearchParams& params,
+                                 std::optional<int> eos_token_id,
+                                 const tok::Tokenizer* tokenizer = nullptr);
 
 }  // namespace vllm
 
