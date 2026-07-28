@@ -386,6 +386,18 @@ remain the separate benchmark track (`BACKEND-GATE-CUDA-SGLANG` cache-neutral +
 `sglang bench_serving` on the idle GB10 once the oracle is stood up (arm64 cu130
 image) and our-side `SERVE-ASYNC-LLM` lands. No source/engine path touched here.
 
+**DeepSeek-V4-Flash W0 SCOPE spike (2026-07-28, `CLAIM-DEEPSEEK-V4-SCOPE`, NOT
+pushed).** Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no
+download, no measurement taken, claimed, or owed; `benchmark_binding=false`).**
+Scopes the ~167B/256-expert `DeepseekV4ForCausalLM` (a NEW arch: DeepSeek Sparse
+Attention MLA + Manifold Hyper-Connections + NVFP4/MegaMoE + sqrtsoftplus/hash
+MoE) and its GB10 HW-fit: `nvidia/DeepSeek-V4-Flash-NVFP4` (~83 GiB, W4) fits the
+119 GiB pool and runs on sm_121 (sparse-MLA sm_12x backend; MegaMoE SM100-only ⇒
+FusedMoE fallback); native fp8 (~167 GiB) does not fit. Spec + W-plan:
+[deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md). The binding
+throughput numbers are owed only after the W1 oracle-run gate and a real
+implementation land; none is taken or promised here. No source/engine path touched.
+
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —
 throughput/TTFT WIN, TPOT/ITL open GAP (`benchmark_binding` = competitor-floor,

@@ -200,7 +200,15 @@ oracle-blocked for a gate (see the capability table above).
 
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
-**spiked-only**, per the [model matrix](../.agents/model-matrix.md). The
+**spiked-only**, per the [model matrix](../.agents/model-matrix.md).
+**DeepSeek-V4-Flash** is scoped (not implemented) in
+[deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md): a ~167B/256-expert
+NEW architecture (DeepSeek Sparse Attention MLA + Manifold Hyper-Connections +
+NVFP4/MegaMoE + sqrtsoftplus/hash MoE). It is runnable on ONE GB10 via the
+`nvidia/DeepSeek-V4-Flash-NVFP4` W4 checkpoint (~83 GiB, fits the 119 GiB pool;
+the sparse-MLA path supports sm_12x, MegaMoE is SM100-only so the FusedMoE
+fallback is used); the native fp8 (~167 GiB) does not fit. The decisive next
+brick is proving the pinned oracle runs the NVFP4 checkpoint within 119 GiB. The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):
 Kimi-Linear-48B is the one that fits GB10 (91.5 GiB) and is e2e-gateable, while
