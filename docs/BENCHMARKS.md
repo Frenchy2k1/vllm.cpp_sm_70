@@ -3010,7 +3010,8 @@ then
 `flock $HOME/gpu.lock env VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cuda/tests/test_qwen35_gguf_spec_decode`.
 Add `VLLM_MTP_GGUF_PROBE=1 --test-case="gguf mtp probe*"` for the margin probe,
 and `CUDA_VISIBLE_DEVICES=` for its CPU arm. The still-owed speed number is the
-spec-ON/spec-OFF throughput A/B on the same file and box.
+spec-ON/spec-OFF throughput A/B on the same file and box. Closing commit for the
+row: `edf91449`.
 
 ### DFlash-from-GGUF axis-A loader, `SPEC-DFLASH-GGUF` GD1-GD3 (2026-07-28) - load-path correctness only, PENDING speed
 
