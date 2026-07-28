@@ -300,7 +300,14 @@ skeleton); net-new = the KDA kernel delta, MXFP4 (group-32/e8m0), AttnRes
 (~1.56 TB MXFP4, ~12× the 119 GiB pool) and is not in the pinned oracle, so there is
 no on-box golden — like the beyond-vLLM CUDA bricks; the real signal is a primitive
 gate on the fitting Kimi-Linear-48B proxy plus build-verify, with full K3
-verification left to a multi-Spark / 16×H200-class box. The matrix opens with an
+verification left to a multi-Spark / 16×H200-class box. The W2/W5 CPU scaffolding
+is now **build-only** (2026-07-28): an additive registry stub, nested
+text/vision/quant config descent, the 93-layer KDA/MLA + 896-expert MoE
+text-backbone structural name-map (grounded in `kimi_linear.py`), a REFUSE-by-name
+forward and an MXFP4-refuse loader, green on a CPU build with a 6/6 scaffold gate;
+MXFP4, the KDA kernel delta and the MoonViT-V2 tower stay not-yet-buildable
+(deferred to the shared DeepSeek-V4 MXFP4 row, the Kimi-Linear KDA row, and W7).
+The matrix opens with an
 architecture-support checklist (a per-architecture status roll-up covering every
 engaged model) that a CI checker keeps in lockstep with the detailed rows.
 

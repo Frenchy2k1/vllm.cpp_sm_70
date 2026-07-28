@@ -215,6 +215,31 @@ checkers rc=0. Owns ONLY: `specs/kimi-k3.md`, the K3 rows in model-matrix, the
 roadmap/STATUS/BENCHMARKS/ledger/state entries. NEXT: W1 proxy primitive gate (DGX
 busy — deferred). CORRECTS the 2026-07-25 sweep note ("loads as `DeepseekV3ForCausalLM`").
 
+**Kimi K3 W2/W5 — CPU structural bring-up (2026-07-28, `CLAIM-KIMI-K3-W2-W5`,
+DERIVED+BUILD-VERIFIED, committed on worktree branch, NOT pushed; FULL SHA reported
+to caller).** Base `main` HEAD `308c312a`; isolated worktree branch
+`feat/kimi-k3-w2-w5`; CPU-only (`-DVLLM_CPP_CUDA=OFF`), NO GPU/download. Implements
+W2 (registry stub + nested config parse) + W5 (scaled hybrid loader + text-forward
+skeleton, as far as CPU-buildable) for `KimiK3ForConditionalGeneration` (beyond the
+pin `555967922`). Additive registry TU (hybrid+mm info), `ParseKimiK3Params`
+(nested `text_config`/`vision_config`/`quantization_config` descent grounded in
+`configs/kimi_linear.py:11-148`), pure `EnumerateKimiK3TextBackboneTensors` (93-layer
+KDA/MLA + 896-expert MoE structural name-map grounded 1:1 in `kimi_linear.py` +
+`kimi_gdn_linear_attn.py`), REFUSE-by-name forward (mirrors `deepseek_v4.cpp`),
+MXFP4-refuse loader. Clean CPU build; scaffold gate `test_kimi_k3_scaffold` 6/6 · 63
+assertions. **NOT-YET-BUILDABLE, correctly deferred (NOT duplicated):** MXFP4 →
+shared DeepSeek-V4 MXFP4 scope (`CLAIM-DEEPSEEK-V4-*` / quantization-matrix MXFP4
+row); KDA kernel delta → Kimi-Linear row (`MODEL-TEXT-kimi-linear-*`,
+`CLAIM-MLA-DEEPSEEK`); MoonViT-V2 vision → W7. **Owns ONLY** (all NEW except the two
+CMake + the K3 records): `include/vllm/model_executor/models/kimi_k3.h`,
+`src/vllm/model_executor/models/kimi_k3{,_registry,_weights}.cpp`,
+`tests/vllm/models/test_kimi_k3_scaffold.cpp`, the `kimi_k3` lines in
+`CMakeLists.txt` + `tests/CMakeLists.txt`, and the K3 rows/entries in
+`model-matrix.md` / `roadmap_v1.md` / `docs/STATUS.md` / `docs/BENCHMARKS.md` /
+`parity-ledger.md` / `state.md` / this claim. Does NOT touch README/Metal or any
+other agent's rows. Row stays SPIKE (no on-box e2e). NEXT: W1 proxy primitive gate
+on Kimi-Linear-48B (DGX-blocked).
+
 **Multimodal SERVING — brick 2/3 `MM-SERVE-ENGINE` LANDED (2026-07-28,
 `CLAIM-MM-SERVING-W2`, DONE — committed, NOT pushed; FULL SHA reported to
 caller).** Carries brick 1's parsed `MultiModalInputs` into the engine request.

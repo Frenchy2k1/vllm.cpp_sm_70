@@ -31016,3 +31016,48 @@ ledger. Records-only; no build/GPU/download/benchmark.
   `parity-ledger.md` + this entry. All 6 record checkers rc=0. dgx
   `~/aot-regen-308c312a` pruned (disk 436G free after), local-ai-worker left Up
   as-found. NOT pushed.
+
+## 2026-07-28 — Kimi K3 W2/W5 CPU structural bring-up (`CLAIM-KIMI-K3-W2-W5`, DERIVE-AND-SHIP)
+
+Landed the CPU-buildable Kimi-K3 structural bricks on an isolated worktree off
+`main` `308c312a` (branch `feat/kimi-k3-w2-w5`; CPU-only `-DVLLM_CPP_CUDA=OFF`;
+NO GPU/download; NOT pushed — orchestrator cherry-picks). K3
+(`KimiK3ForConditionalGeneration`, released 2026-07-27) is BEYOND the pinned oracle
+`555967922` and does NOT fit GB10 (~1.56 TB MXFP4, ~12×), so there is no on-box e2e
+golden — the honest signal is DERIVED+BUILD-VERIFIED (a green compile is NOT
+execution evidence).
+
+**W2 (registry stub + config parse).** New additive registry TU registers
+`KimiK3ForConditionalGeneration` (info: text-gen + `is_hybrid` + `has_inner_state`
++ `supports_multimodal`). `ParseKimiK3Params` descends the wrapper's nested
+`text_config` (KimiLinear KDA+MLA+MoE hybrid scalars), `vision_config` (MoonViT-V2,
+PARTIAL), and `quantization_config` (MXFP4 detect), validating + throwing on
+unrepresentable configs. Grounded in `configs/kimi_linear.py:11-148`. Caught the
+upstream key name divergence (`num_experts_per_token`, not HfConfig's
+`num_experts_per_tok`).
+
+**W5 (scaled hybrid loader + text-forward skeleton, as far as CPU-buildable).**
+`EnumerateKimiK3TextBackboneTensors` is the pure, unit-tested 93-layer KDA/MLA +
+896-expert MoE text-backbone structural name-map, grounded 1:1 in
+`kimi_linear.py:104-378,460-554` + `kimi_gdn_linear_attn.py:102-226`, with per-layer
+KDA-vs-MLA(is_kda_layer) / MLA-qLoRA-vs-direct / MoE-vs-dense branching. Forward is
+REFUSE-by-name (`VT_CHECK(false)`, mirrors `deepseek_v4.cpp`); the loader REFUSES
+MXFP4 (the real K3 checkpoint dtype).
+
+**Correctly left NOT-YET-BUILDABLE (deferred, not duplicated):** MXFP4
+materialization → shared DeepSeek-V4 MegaMoE MXFP4 scope (`CLAIM-DEEPSEEK-V4-*`);
+the KDA kernel delta (per-channel `f_a`/`f_b` decay + sigmoid-gated `o_norm` + 3
+short convs) → Kimi-Linear row (`MODEL-TEXT-kimi-linear-*`); MoonViT-V2 vision → W7;
+K3 multimodal-wrapper weight prefix → post-pin.
+
+**Evidence.** Clean CPU full-library build (`libvllm.a` rc=0);
+`tests/vllm/models/test_kimi_k3_scaffold.cpp` 6/6 · 63 assertions GREEN
+(registry-resolve + config-descent at real K3 scale + KDA/MLA + MoE/dense split +
+enumeration faithfulness + reject + MXFP4-refuse). Files:
+`include/vllm/model_executor/models/kimi_k3.h`,
+`src/vllm/model_executor/models/kimi_k3{,_registry,_weights}.cpp`, the test, plus
+`CMakeLists.txt` + `tests/CMakeLists.txt` wiring. Records:
+`model-matrix.md` (row + checklist entry, stays SPIKE/📋), `roadmap_v1.md`,
+`docs/STATUS.md`, `docs/BENCHMARKS.md`, `parity-ledger.md`, `coordination.md`, this
+entry. Row stays SPIKE (no on-box e2e; forward not implemented). NEXT: W1 proxy
+primitive gate on Kimi-Linear-48B (shares the KDA kernel campaign, DGX-blocked).

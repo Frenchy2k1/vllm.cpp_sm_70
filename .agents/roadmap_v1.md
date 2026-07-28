@@ -303,7 +303,14 @@ Kimi-Linear row), MXFP4, AttnRes (report-only/UNCONFIRMED), MoonViT-V2. **HW: do
 golden, like the beyond-vLLM CUDA bricks): REAL proxy gate of KDA+MLA+MoE on the FITTING
 `Kimi-Linear-48B-A3B` (~89–91 GiB) vs the pin, + build-verify/structural review for the scale-up.
 The pin has no `kimi_k3` ⇒ oracle-gating K3 itself needs a pin advance. New SPIKE row
-`MODEL-MM-kimi-k3-*`. NEXT: W1 proxy primitive gate (shares the KDA kernel campaign).
+`MODEL-MM-kimi-k3-*`. **W2/W5 CPU SCAFFOLDING LANDED (2026-07-28, `CLAIM-KIMI-K3-W2-W5`,
+DERIVED+BUILD-VERIFIED):** additive registry stub (`KimiK3ForConditionalGeneration`, hybrid+mm),
+nested `text_config`/`vision_config`/`quantization_config` descent, the 93-layer KDA/MLA +
+896-expert MoE text-backbone structural name-map (grounded 1:1 in `kimi_linear.py` +
+`kimi_gdn_linear_attn.py`), REFUSE-by-name forward, MXFP4-refuse loader; clean CPU build + scaffold
+gate 6/6 (`kimi_k3{,_registry,_weights}.cpp`, `test_kimi_k3_scaffold.cpp`). MXFP4 / KDA delta /
+MoonViT-V2 correctly left NOT-YET-BUILDABLE (shared DeepSeek-V4 MXFP4 row, Kimi-Linear KDA row, W7).
+Row stays SPIKE. NEXT: W1 proxy primitive gate (shares the KDA kernel campaign).
 
 ## Top-level portfolio
 

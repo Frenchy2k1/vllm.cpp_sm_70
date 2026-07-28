@@ -480,8 +480,13 @@ one GB10 (~1.56 TB MXFP4, ~12× the 119 GiB pool) and is not in the pinned oracl
 bricks. The real correctness signal is a primitive gate (KDA+MLA+MoE) on the fitting
 `Kimi-Linear-48B-A3B` (~89–91 GiB) proxy plus build-verify; full K3 throughput/token
 numbers are owed only from a multi-Spark / 16×H200-class box, and none is taken or
-promised here. Spec + W-plan: [kimi-k3.md](../.agents/specs/kimi-k3.md). No
-source/engine path touched.
+promised here. Spec + W-plan: [kimi-k3.md](../.agents/specs/kimi-k3.md). **W2/W5 CPU
+scaffolding landed (2026-07-28, `CLAIM-KIMI-K3-W2-W5`):** registry stub + nested
+config descent + text-backbone structural name-map + REFUSE-by-name forward +
+MXFP4-refuse loader; **build-only, no measurement** (`benchmark_binding=false`) —
+clean CPU build + scaffold gate 6/6 (`test_kimi_k3_scaffold`), which is
+DERIVED+BUILD-VERIFIED, NOT execution evidence. No throughput/token numbers taken or
+owed on-box (K3 does not fit GB10 and is beyond the pinned oracle).
 **Scale-out / distributed execution W0 SCOPE spike (2026-07-28,
 `CLAIM-SCALE-OUT-SPIKE`, NOT pushed).** Disposition: **NOT APPLICABLE (scoping
 spike; no build, no run, no download, no measurement taken, claimed, or owed;
