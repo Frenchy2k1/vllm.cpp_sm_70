@@ -351,6 +351,29 @@ struct KVCacheConfig {
   std::vector<KVCacheTensor> kv_cache_tensors;
   std::vector<KVCacheGroupSpec> kv_cache_groups;
 
+  // OPTIONAL per-layer attention KV spec (index == model layer index). This is
+  // NOT an upstream field; it is the additive seam that lets a HETEROGENEOUS
+  // per-layer head_dim model (Gemma-4: sliding layers head_dim=256, global
+  // layers global_head_dim=512, same num_kv_heads) allocate each non-GDN
+  // layer's paged KV from its OWN head_size/num_kv_heads/page_size instead of
+  // the single uniform group spec.
+  //
+  // BYTE-NEUTRALITY CONTRACT: EMPTY for every uniform-KV model (all existing
+  // models leave it default-constructed), and when empty the runner falls back
+  // to the single group spec for every layer — byte-identical allocation, view,
+  // indexing and kernel dispatch to before this field existed. When NON-empty
+  // it MUST have exactly `num_hidden_layers` entries; entry [l] is the attention
+  // spec for non-GDN layer l (and is ignored for a GDN/linear-attention layer,
+  // which is still sized from its MambaSpec). The block table / KV manager /
+  // scheduler are head_dim-independent (they key on num_blocks + block_size,
+  // uniform across layers), so a single group + this per-layer allocation is
+  // sufficient — no per-group block table is introduced.
+  //
+  // The default member initializer keeps every existing positional aggregate
+  // initialization of KVCacheConfig valid (the field is optional) AND suppresses
+  // -Wmissing-field-initializers, so this addition is source-compatible too.
+  std::vector<std::shared_ptr<AttentionSpec>> per_layer_attn_specs = {};
+
   // Upstream property has_mamba_layers.
   bool has_mamba_layers() const;
   // Upstream property needs_kv_cache_zeroing.

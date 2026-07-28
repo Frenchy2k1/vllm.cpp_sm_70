@@ -49,6 +49,16 @@ using dense_loaders::LoadBf16Direct;
 using dense_loaders::LoadBf16Transposed;
 using dense_loaders::LoadMergedBf16RawNK;
 
+// HfConfig::raw is the FULL config.json (hf_config.cpp:414); the Gemma-4
+// language-model scalars (layer_types, global_head_dim, num_kv_shared_layers,
+// tie_word_embeddings) are nested under `text_config` in the mm wrapper. Read
+// them through this view — top-level for a plain config, text_config otherwise.
+const nlohmann::json& TextCfg(const nlohmann::json& raw) {
+  const auto it = raw.find("text_config");
+  if (it != raw.end() && it->is_object()) return *it;
+  return raw;
+}
+
 bool RawBool(const nlohmann::json& doc, const char* key, bool fallback) {
   const auto it = doc.find(key);
   if (it == doc.end() || it->is_null() || !it->is_boolean()) return fallback;
@@ -71,17 +81,18 @@ struct LayerTopo {
 };
 
 LayerTopo MakeTopo(const HfConfig& cfg) {
+  const nlohmann::json& raw = TextCfg(cfg.raw);
   const int64_t L = cfg.num_hidden_layers;
   const int64_t head_dim_sliding = cfg.head_dim;  // text_config head_dim (256)
   const int64_t head_dim_full =
-      RawInt(cfg.raw, "global_head_dim", cfg.head_dim);  // 512
-  const int64_t num_shared = RawInt(cfg.raw, "num_kv_shared_layers", 0);
+      RawInt(raw, "global_head_dim", cfg.head_dim);  // 512
+  const int64_t num_shared = RawInt(raw, "num_kv_shared_layers", 0);
   const int64_t first_shared = L - num_shared;
 
   LayerTopo t;
   t.is_full.assign(static_cast<size_t>(L), false);
-  const auto it = cfg.raw.find("layer_types");
-  if (it != cfg.raw.end() && it->is_array()) {
+  const auto it = raw.find("layer_types");
+  if (it != raw.end() && it->is_array()) {
     for (int64_t l = 0; l < L && static_cast<size_t>(l) < it->size(); ++l)
       t.is_full[static_cast<size_t>(l)] =
           it->at(static_cast<size_t>(l)).is_string() &&
@@ -179,7 +190,7 @@ Gemma4Weights LoadGemma4ForConditionalGenerationWeights(
 
   Gemma4Weights w;
   // Gemma-4 ties embeddings by default (text_config.tie_word_embeddings=true).
-  w.tie_word_embeddings = RawBool(config.raw, "tie_word_embeddings", true);
+  w.tie_word_embeddings = RawBool(TextCfg(config.raw), "tie_word_embeddings", true);
 
   w.embed_tokens = LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
   w.embed_tokens_per_layer =

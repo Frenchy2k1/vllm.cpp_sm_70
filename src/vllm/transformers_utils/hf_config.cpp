@@ -153,9 +153,21 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
   if (raw == nullptr) return params;
 
   if (LooksLikeNestedRopeParameters(*raw)) {
-    throw std::runtime_error(
-        "hf_config: nested per-layer rope parameters are not implemented in " +
-        path);
+    // Per-layer-TYPE nested rope (Gemma-4: rope_parameters =
+    // {full_attention:{rope_theta,partial_rotary_factor,rope_type:"proportional"},
+    //  sliding_attention:{rope_theta,rope_type:"default"}}). vLLM keeps these as
+    // per-layer-type rope configs on the model, and our Gemma-4 forward mirrors
+    // that by reading them directly from config.raw (gemma4.cpp::RopeField /
+    // MakeLayout — theta 1e6/1e4, proportional partial-RoPE). There is no single
+    // flat typed rope for such a model, so we DO NOT synthesize one (the
+    // "proportional" per-type rope_type is not a flat get_rope type either):
+    // record that rope parameters exist and return the top-level defaults, which
+    // the heterogeneous-rope model does not consume. ADDITIVE + byte-neutral:
+    // every existing model previously ERRORED on this branch (nested rope was
+    // unsupported), so no gate's typed rope can change — only a model that owns
+    // its per-type rope in-forward (Gemma-4) now loads instead of aborting.
+    *has_parameters = true;
+    return params;
   }
 
   std::string modern_type = GetString(*raw, "rope_type");

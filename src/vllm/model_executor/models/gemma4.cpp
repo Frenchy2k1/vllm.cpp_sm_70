@@ -22,10 +22,13 @@
 //   - GeGLU MLP, sqrt(hidden) embed normalizer, per-layer scalar, final logit
 //     soft-cap 30.0, tied lm_head.
 //
-// HONEST G1 STATUS: this forward compiles and is grounded, but the strict 32/32
-// end-to-end gate is BLOCKED — the runner allocates a single uniform KV head_dim
-// (runner.cpp:600-646); Gemma-4's per-layer 256/512 heads need a shared-path
-// change to attn_kv_ construction before this can RUN. Named as the G-next work.
+// G1b STATUS: the runner now allocates a PER-LAYER KV head_dim
+// (KVCacheConfig::per_layer_attn_specs, consumed in runner.cpp initialize_kv_cache),
+// so the per-layer VT_CHECK(kv.head_size == Dh) below is satisfied on both the
+// 256 (sliding) and 512 (global) layers and the strict e2e gate RUNS. YOCO
+// KV-sharing is handled in the forward (kv_idx = target for shared layers); the
+// shared layers' own — unused — buffers are still allocated (memory-only G1c
+// residual, not a correctness gap).
 #include "vllm/model_executor/models/gemma4.h"
 
 #include <cmath>
@@ -64,6 +67,17 @@ int64_t RawInt(const nlohmann::json& doc, const char* key, int64_t fallback) {
   const auto it = doc.find(key);
   if (it == doc.end() || it->is_null() || !it->is_number_integer()) return fallback;
   return it->get<int64_t>();
+}
+
+// The engine keeps HfConfig::raw as the FULL config.json (hf_config.cpp:414),
+// while the mm-wrapper nests the language-model scalars under `text_config`.
+// Gemma-4's per-arch fields (global_head_dim, hidden_size_per_layer_input,
+// layer_types, rope_parameters, sliding_window, *_softcapping) therefore live in
+// raw["text_config"], NOT at the top level — read them through this view.
+const nlohmann::json& TextCfg(const nlohmann::json& raw) {
+  const auto it = raw.find("text_config");
+  if (it != raw.end() && it->is_object()) return *it;
+  return raw;
 }
 
 // Read a per-layer-type rope field (rope_parameters[type][key]) with a fallback.
@@ -107,23 +121,24 @@ struct Gemma4Layout {
 
 Gemma4Layout MakeLayout(const HfConfig& cfg) {
   Gemma4Layout g;
+  const nlohmann::json& raw = TextCfg(cfg.raw);
   g.hidden = cfg.hidden_size;
   g.num_layers = cfg.num_hidden_layers;
   g.num_q_heads = cfg.num_attention_heads;
   g.num_kv_heads = cfg.num_key_value_heads;
   g.head_dim_sliding = cfg.head_dim;
-  g.head_dim_full = RawInt(cfg.raw, "global_head_dim", cfg.head_dim);
-  g.ple_dim = RawInt(cfg.raw, "hidden_size_per_layer_input", 0);
-  g.sliding_window = cfg.sliding_window.value_or(RawInt(cfg.raw, "sliding_window", 0));
-  g.rope_theta_full = RopeField(cfg.raw, "full_attention", "rope_theta", 1000000.0);
+  g.head_dim_full = RawInt(raw, "global_head_dim", cfg.head_dim);
+  g.ple_dim = RawInt(raw, "hidden_size_per_layer_input", 0);
+  g.sliding_window = cfg.sliding_window.value_or(RawInt(raw, "sliding_window", 0));
+  g.rope_theta_full = RopeField(raw, "full_attention", "rope_theta", 1000000.0);
   g.rope_partial_full =
-      RopeField(cfg.raw, "full_attention", "partial_rotary_factor", 1.0);
+      RopeField(raw, "full_attention", "partial_rotary_factor", 1.0);
   g.rope_theta_sliding =
-      RopeField(cfg.raw, "sliding_attention", "rope_theta", 10000.0);
+      RopeField(raw, "sliding_attention", "rope_theta", 10000.0);
   g.final_logit_softcap =
-      static_cast<float>(RawDouble(cfg.raw, "final_logit_softcapping", 0.0));
+      static_cast<float>(RawDouble(raw, "final_logit_softcapping", 0.0));
   g.attn_logit_softcap =
-      static_cast<float>(RawDouble(cfg.raw, "attn_logit_softcapping", 0.0));
+      static_cast<float>(RawDouble(raw, "attn_logit_softcapping", 0.0));
   g.embed_scale_ple = static_cast<float>(std::sqrt(static_cast<double>(g.ple_dim)));
   g.proj_scale = std::pow(static_cast<double>(g.hidden), -0.5);
   g.input_scale = 1.0 / std::sqrt(2.0);

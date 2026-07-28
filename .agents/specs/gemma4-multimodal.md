@@ -298,6 +298,78 @@ nuances (the f32-accumulated PLE combine in vLLM vs our per-op bf16; the proport
 cos/sin cache dtype) do not perturb the token match. G2 (SigLIP vision, reuses M2a)
 and G3 (USM-Conformer audio) remain separate and unbuilt.
 
+### G1b — TEXT PATH STRICT 32/32 LANDED (2026-07-28, `CLAIM-GEMMA4-G1B`)
+
+**The strict e2e gate PASSES: 32/32 token-exact.** `unsloth/gemma-4-E4B-it` loads
+through our engine (`LoadedEngine::FromModelDir`) and greedily emits the EXACT 32
+golden ids `[236776,2455,5192,…]`; gate `tests/parity/test_gemma4_paged_engine.cpp`
+(dgx CUDA, `flock`, FA2 on). The (1)/(2)/(3) checklist above is done; the two flagged
+bf16 nuances did NOT perturb the token match (32/32 exact).
+
+**(1) Runner per-layer KV head_dim — the named G1b deliverable, byte-neutral.**
+`KVCacheConfig` gains an OPTIONAL `per_layer_attn_specs` (index == layer). When set,
+`runner.cpp` `initialize_kv_cache` sizes each non-GDN layer's paged KV buffer + view
+from its OWN `FullAttentionSpec` (`page_size_bytes`/`num_kv_heads`/`head_size`); the
+model's `MakeGemma4…KVCache` publishes sliding 256 / global 512 per layer. EMPTY for
+every uniform-KV model ⇒ the loop collapses to the single group spec ⇒ byte-identical
+allocation, view, indexing and kernel dispatch (the sm_75-guard "additive, identical
+existing path" property). The block table / KV manager / scheduler are head_dim-
+independent (num_blocks + block_size, uniform), so a single group + per-layer
+allocation needs no per-group block table. YOCO sharing was already correct in the
+forward (`kv_idx = shared ? target : l`); the shared layers' own unused buffers are
+still allocated (memory-only **G1c** residual).
+
+**Inertness proof.** CPU: `test_runner` (120 s, the runner-KV path) + `test_scheduler`
++ `test_kv_cache_{interface,manager,coordinator}` + `test_single_type_kv_cache_manager`
++ `test_input_batch` + `test_hf_config` + `test_tokenizer_parity{,_mistral,_deepseek}`
+all green; full CPU suite `-Werror` 0-warn. GPU SACRED re-gate: OLMo-2-0425-1B 16/16
+UNCHANGED through the modified runner on the FINAL binary (13 strict + 3 near-tie, 0
+divergent).
+
+**(4) Three additive loader gaps found on the first-ever Gemma-4 forward** (each
+byte-neutral for existing models — all previously threw / were unreachable):
+- **nested per-layer `rope_parameters`** (`hf_config.cpp`): the loader threw on
+  `{full_attention:{…},sliding_attention:{…}}`; now it loads (records presence, keeps
+  the nested dict in `raw` for the model to read) instead of aborting.
+- **Gemma metaspace-via-normalizer** (`tokenizer.cpp`): E4B expresses metaspace as a
+  `Replace(" "→"▁")` normalizer + `Split(" ",MergedWithPrevious)` pre_tokenizer (not a
+  `Metaspace` node); folded onto the SAME validated metaspace machinery.
+- **`raw["text_config"]` resolution** (`gemma4.cpp`/`gemma4_weights.cpp`/
+  `gemma4_registry.cpp`): `HfConfig::raw` is the FULL config (`hf_config.cpp:414`), so
+  the G1 reads of `global_head_dim`/`layer_types`/`hidden_size_per_layer_input`/
+  `num_kv_shared_layers` from `raw` hit FALLBACKS — every layer was silently treated as
+  sliding (head_dim 256). This is the bug the 32/32 forward surfaced (a full layer's
+  o_proj `[2560,4096]` fed a 2048-wide input); all Gemma-4 raw reads now go through the
+  text_config view.
+
+**Residuals:** YOCO cache DEDUP (G1c, memory-only); G2 SigLIP vision (reuses M2a);
+G3 USM-Conformer audio; per-axis SPEED vs vLLM (text path is correctness-DONE,
+speed-pending).
+
+### Port map
+
+The G1b runner + loader port map (1:1 upstream anchors; forward primitives are the
+G1.1 primitive-by-primitive table above):
+
+| What | Ours | Upstream mirror |
+|---|---|---|
+| runner per-layer KV head_dim | `KVCacheConfig::per_layer_attn_specs` (`include/vllm/v1/kv_cache_interface.h`) consumed in `src/vllm/v1/worker/gpu/runner.cpp` `initialize_kv_cache`; published by `MakeGemma4…KVCache` (`gemma4_registry.cpp`) | per-layer KV-cache-spec grouping, `vllm/v1/worker/gpu/model_runner.py` `initialize_kv_cache` @ `e24d1b24` (single group + per-layer alloc, block table head_dim-independent) |
+| nested per-layer rope | `ParseRopeParameters` loads nested `rope_parameters` (`src/vllm/transformers_utils/hf_config.cpp`); model reads it from `raw` | vLLM keeps per-layer-type rope configs on the model (`gemma4.py` `Gemma4RotaryEmbedding` per attention type) |
+| Gemma metaspace normalizer | `DetectGemmaMetaspaceNormalizer` folds `Replace(" "→"▁")` + `Split` onto the metaspace path (`src/vllm/tokenizer/tokenizer.cpp`) | HF tokenizers: `Replace`+`Split(MergedWithPrevious)` == `Metaspace(replacement="▁", split=false)` |
+| text_config scalar reads | `TextCfg` view in `gemma4.cpp` / `gemma4_weights.cpp` / `gemma4_registry.cpp` | `PretrainedConfig.get_text_config()` (`vllm/transformers_utils/config.py`) — Gemma-4 scalars live under `text_config` |
+
+### Work breakdown
+
+- **G1b [DONE 2026-07-28]** — runner heterogeneous per-layer KV head_dim + the 3
+  loader gaps → text path STRICT 32/32 token-exact (this section).
+- **G1c** — YOCO shared-layer cache DEDUP (memory-only; correctness already right,
+  shared layers read the target's cache in-forward).
+- **G2** — SigLIP vision tower (reuses the landed M2a Qwen3-VL ViT scaffold).
+- **G3** — USM-Conformer audio tower (new: mel + 2×Conv2d subsample + conv-module +
+  relpos), staged behind the audio track.
+- **Speed** — per-axis throughput/latency vs vLLM for the text path (correctness
+  DONE, speed-pending).
+
 ---
 
 ## 1. Per-model / per-modality DISPOSITION

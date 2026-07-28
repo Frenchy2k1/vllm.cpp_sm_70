@@ -761,6 +761,14 @@ target_compile_definitions(test_olmo2_paged_engine PRIVATE
 target_include_directories(test_olmo2_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# Gemma-4 E4B (Gemma4ForConditionalGeneration) text STRICT gate — first Gemma-4
+# model; RED->GREEN proof of the G1b runner per-layer-KV head_dim change.
+vllm_cpp_add_test(test_gemma4_paged_engine parity/test_gemma4_paged_engine.cpp)
+target_compile_definitions(test_gemma4_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_gemma4_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_granite_paged_engine parity/test_granite_paged_engine.cpp)
 target_compile_definitions(test_granite_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

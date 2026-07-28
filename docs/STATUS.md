@@ -134,18 +134,25 @@ at 48/48 greedy vs the same oracle
 ([spike](../.agents/specs/sweep-gemma.md)): Gemma 2 proves the attention + final
 logit soft-cap primitives, Gemma 1 the original two-fused-norms block.
 
-**Gemma 4**, the newest registered variant, now has its **text backbone
-implemented** (G1, 2026-07-28): the `Gemma4ForConditionalGeneration` language_model
-stack of `unsloth/gemma-4-E4B-it` — registry + weight loader + forward, as new
-additive files, compiling clean (`-Werror`) with the loader verified against the
-real checkpoint's tensor header. It brings up the large new primitive stack
-(per-layer embeddings, YOCO KV-sharing, plain RMSNorm, proportional partial-RoPE,
-heterogeneous 256/512 head dims, GeGLU, a per-layer scalar; the Gemma-4 MoE /
-k_eq_v / double-wide MLP are off for the E4B checkpoint and stay the larger-variant
-follow-on). The strict 32-token gate vs the W0 golden is **not yet reached: it is
-blocked on the runner allocating a single uniform KV head dimension per layer, which
-cannot represent Gemma-4's per-layer 256/512 heads without a shared-path change to
-KV-cache construction** — named as the next step, not a numeric divergence. Its
+**Gemma 4**, the newest registered variant, now has its **text path
+correctness-complete and gated** (G1b, 2026-07-28): the
+`Gemma4ForConditionalGeneration` language_model stack of `unsloth/gemma-4-E4B-it`
+loads through our engine and greedily emits the **exact 32 golden token ids —
+STRICT 32/32 token-exact vs the vLLM 0.25.0 golden** (gate
+`tests/parity/test_gemma4_paged_engine.cpp`, dgx CUDA). It brings up the large new
+primitive stack (per-layer embeddings, YOCO KV-sharing, plain RMSNorm, proportional
+partial-RoPE, heterogeneous 256/512 head dims, GeGLU, a per-layer scalar; the
+Gemma-4 MoE / k_eq_v / double-wide MLP are off for the E4B checkpoint and stay the
+larger-variant follow-on). The G1-named blocker is resolved: **the runner now
+allocates a per-layer KV head dimension** (`KVCacheConfig::per_layer_attn_specs`),
+so Gemma-4's per-layer 256/512 heads each get a correctly-strided cache — and it is
+byte-neutral for every uniform-KV model (the field is empty ⇒ the previous single
+uniform allocation; the full CPU runner/KV suite plus the OLMo-2 SACRED GPU gate
+16/16 are unchanged). Three additive loader gaps were fixed en route to the
+first-ever Gemma-4 forward: nested per-layer `rope_parameters` (config loader), the
+Gemma `Replace(" "->"U+2581")` metaspace normalizer (tokenizer), and reading
+Gemma-4's per-arch scalars from `raw["text_config"]` rather than the full config
+(the real 256/512 head-dim source). Speed vs vLLM is pending. Its
 multimodal path (image + video + **audio**, the only
 audio-capable model in the pin) has been assessed
 ([spec](../.agents/specs/gemma4-multimodal.md)) and is now **oracle-gateable —
@@ -155,9 +162,10 @@ loads, runs, and greedily generates the ungated `unsloth/gemma-4-E4B-it`
 32-token greedy golden is captured
 (`tests/parity/goldens/gemma4_e4b_text/`). The earlier "oracle-blocked at gate
 time" concern (transformers lacking `gemma4`) is refuted — the module is present
-and the model runs. So Gemma-4 multimodal is blocked only on implementation now
-(the per-layer-embedding / YOCO / Gemma-4-MoE backbone plus the SigLIP vision and
-USM-Conformer audio towers, all unbuilt); the SigLIP vision tower reuses the
+and the model runs. With the text backbone now landed and gated, Gemma-4
+multimodal is blocked only on the remaining tower implementation (the SigLIP vision
+and USM-Conformer audio towers, both unbuilt; the Gemma-4 MoE / k_eq_v / double-MLP
+backbone stays the larger-variant follow-on); the SigLIP vision tower reuses the
 landed Qwen3-VL ViT scaffold. Audio, the genuinely-new modality, is staged first
 on the smallest oracle-runnable audio model (Whisper, then Voxtral-Mini-3B on the
 already-landed Mistral backbone).
