@@ -36,6 +36,7 @@
 
 #include "vllm/config/speculative.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/logprobs.h"
 #include "vllm/sampling_params.h"
 
 namespace fs = std::filesystem;
@@ -43,6 +44,10 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr int kMaxTokens = 24;
+// Alternatives requested per position by the device-delta probe below. Wide
+// enough that the OTHER device's pick is virtually certain to appear in the
+// row, which is what makes the two rows directly comparable.
+constexpr int kProbeTopK = 20;
 // Deliberately prosaic and low-entropy: a factual continuation keeps the greedy
 // path away from near-ties, so a divergence indicts the drafter rather than
 // bf16 rounding at a coin-flip step.
@@ -57,6 +62,18 @@ vllm::SamplingParams Greedy(int max_tokens) {
   vllm::SamplingParams sp;
   sp.temperature = 0.0;
   sp.max_tokens = max_tokens;
+  sp.PostInit();
+  return sp;
+}
+
+// Greedy, plus the per-position alternatives the probe needs. Built in one shot
+// rather than by mutating a Greedy() result, so PostInit() sees the final field
+// set exactly once.
+vllm::SamplingParams GreedyWithLogprobs(int max_tokens, int k) {
+  vllm::SamplingParams sp;
+  sp.temperature = 0.0;
+  sp.max_tokens = max_tokens;
+  sp.logprobs = k;
   sp.PostInit();
   return sp;
 }
@@ -166,4 +183,79 @@ TEST_CASE("cpu spec divergence: ngram needs no draft head and still diverges") {
   MESSAGE("ngram spec-ON: \"" << out.outputs[0].text << "\"");
   // Same exactness bar: greedy speculation never changes WHICH tokens come out.
   CHECK(out.outputs[0].token_ids == baseline_ids);
+}
+
+// DEVICE-DELTA PROBE: what the CPU-vs-GPU token difference actually IS.
+//
+// CPU-vs-GPU token equality is NOT this row's bar and is not generally
+// expected. The binding bar is spec-ON == spec-OFF WITHIN one device (the two
+// cases above). Across devices the kernels, the accumulation order and the
+// rounding differ, so a greedy sequence legitimately forks at the first
+// APPROXIMATE TIE - the same reason this repo gates several models on a
+// near-tie-robust form rather than a strict one. What the row does owe is
+// EVIDENCE for which of the two it is, so this probe MEASURES the margin
+// instead of arguing about it.
+//
+// It runs spec-OFF ONLY. Speculation is deliberately absent, so whatever the
+// probe shows can be neither blamed on nor credited to the draft head: this
+// isolates the plain forward.
+//
+// Why the two devices' rows are comparable at the ROOT divergence, and only
+// there: at the first position where the sampled tokens differ, both arms have
+// consumed a BIT-IDENTICAL token prefix (the prompt plus the agreed tokens), so
+// each arm's row is that same prefix's next-token distribution and the
+// comparison is teacher-forced by construction. From the NEXT position on the
+// prefixes differ and the rows are no longer comparable - which is exactly why
+// a root-divergence margin, not a token diff count, is the thing to read.
+//
+// The repo's ratified near-tie band is 0.5 nats (`kNearTieMnats = 500`): a root
+// margin inside it is bf16 rounding at a coin flip, one outside it is a
+// forward-path defect that must be bisected.
+//
+// DOUBLE-GATED (asset + `VLLM_MTP_GGUF_PROBE=1`) so the two binding cases above
+// keep their exact runtime, memory footprint and behaviour.
+TEST_CASE("gguf mtp probe: spec-OFF per-position logprob margins") {
+  const std::string model = MtpGgufPath();
+  if (model.empty() || !fs::exists(model)) {
+    MESSAGE("SKIP: set VLLM_MTP_GGUF_MODEL");
+    return;
+  }
+  if (std::getenv("VLLM_MTP_GGUF_PROBE") == nullptr) {
+    MESSAGE("SKIP: set VLLM_MTP_GGUF_PROBE=1 for the CPU-vs-GPU delta probe");
+    return;
+  }
+
+  auto loaded =
+      vllm::entrypoints::LoadedEngine::FromModelDir(model, BaseParams());
+  const vllm::RequestOutput out = loaded->engine().generate(
+      kPrompt, GreedyWithLogprobs(kMaxTokens, kProbeTopK), "gguf-mtp-probe");
+  REQUIRE(out.finished);
+  REQUIRE(out.outputs.size() == 1);
+  const vllm::CompletionOutput& co = out.outputs[0];
+
+  MESSAGE("PROBE text: \"" << co.text << "\"");
+  std::string ids;
+  for (const int32_t id : co.token_ids) ids += std::to_string(id) + " ";
+  MESSAGE("PROBE ids: " << ids);
+
+  REQUIRE(co.logprobs.has_value());
+  REQUIRE(co.logprobs->size() == co.token_ids.size());
+
+  // One greppable line per position: the sampled id, then every alternative as
+  // id:rank:logprob in the sampler's own insertion order (sampled first, then
+  // rank 1..k). Rank 1 and rank 2 give the margin at that position; the ranked
+  // list lets the OTHER device's pick be looked up by id.
+  for (std::size_t i = 0; i < co.logprobs->size(); ++i) {
+    const vllm::LogprobsOnePosition& pos = (*co.logprobs)[i];
+    std::string row;
+    for (const int32_t id : pos.order) {
+      const vllm::Logprob* lp = pos.find(id);
+      REQUIRE(lp != nullptr);
+      row += std::to_string(id) + ":" +
+             std::to_string(lp->rank.value_or(-1)) + ":" +
+             std::to_string(lp->logprob) + " ";
+    }
+    MESSAGE("PROBE pos=" << i << " sampled=" << co.token_ids[i] << " | "
+                         << row);
+  }
 }

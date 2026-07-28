@@ -90,7 +90,16 @@ and 8 on the 27B (about 1.5x our own speculative-off throughput).
 - **k=1 only.** `num_speculative_tokens` greater than 1 is not accepted.
 - **MTP only.** Other draft methods (n-gram, EAGLE, a separate draft model, the
   DFlash draft) are not wired; MTP is the one that ships.
-- **Qwen3.5/3.6 with an `mtp.*` head only**, safetensors (not GGUF).
+- **Qwen3.5/3.6 with an `mtp.*` head only.** The target may be a safetensors
+  directory or a `.gguf` converted WITH the head (llama.cpp's layer-indexed
+  `nextn` block); a GGUF exported `--no-mtp` is refused and says so.
+- **On an NVFP4 safetensors target the concurrency-1 identity below is not
+  currently reliable.** Measured on the 35B A3B NVFP4 safetensors: its logits
+  land on a coarse grid that yields EXACT ties between distinct tokens, and at
+  such a tie speculative-on and speculative-off, and even two speculative-off
+  runs, can pick differently. The same weights loaded from GGUF, which expands
+  to bf16, show no such ties and are token-identical. Open; see
+  [docs/STATUS.md](STATUS.md).
 - **Concurrency above 1 is not token-stable for the 27B.** Its greedy output is
   not bit-stable across batch shapes even with speculation off (changing the batch
   size flips a few near-tie tokens), so exact token-for-token agreement between

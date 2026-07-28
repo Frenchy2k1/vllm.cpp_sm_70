@@ -2899,15 +2899,13 @@ the known CPU restriction `causal_conv1d_spec_update: conv_state must be f32, or
 bf16 on CUDA` (1/2 cases, 69.1 GiB, 5m37s), so the passing arm really executed
 on the GB10.
 
-**That run is NOT accepted as `SPEC-MTP-GGUF`'s closing gate**, for two reasons
-recorded here rather than glossed: (1) the dgx build is configured
-`CMAKE_CUDA_ARCHITECTURES=75` on an sm_121 GB10, i.e. PTX-JIT'd Turing code, not
-the release target; (2) on the SAME loaded weights the GPU arm's 24 tokens
-differ materially from the CPU arm's (`" Paris.\nA. True\nB. False..."` vs
-`" Paris, a city renowned for its rich history..."`). Since the loader hands
-both arms IDENTICAL bf16 buffers, that divergence is a forward-path question and
-NOT attributable to this row's materialization, but it must be explained before
-the GPU arm binds anything.
+**That run was NOT accepted as `SPEC-MTP-GGUF`'s closing gate at the time**, for
+two reasons: the build was believed to be `CMAKE_CUDA_ARCHITECTURES=75` on an
+sm_121 GB10 (PTX-JIT'd Turing, not the release target), and on the SAME loaded
+weights the GPU arm's 24 tokens differed materially from the CPU arm's. BOTH are
+now resolved, and the first turned out to be a MISREAD cache line rather than a
+wrong-arch build. See the `SPEC-MTP-GGUF` GPU close-out entry below for the
+measured disposition of each.
 
 Reproduction: `cmake --build build-cpu --target test_gguf_nvfp4 && ./build-cpu/tests/test_gguf_nvfp4`;
 for the sweep, add the two env vars above on a host holding both files. The CI
@@ -2943,6 +2941,76 @@ The honest measurement is a GPU A/B on a gate checkpoint, mirroring how `SPEC-MT
 I6/I7 were measured for safetensors. Reproduction for the correctness gate:
 `VT_GDN_STATE_BF16=0 VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cpu/tests/test_qwen35_gguf_spec_decode`
 (the CPU `causal_conv1d_spec_update` requires f32 conv state).
+
+### GGUF MTP GPU close-out on sm_121a, `SPEC-MTP-GGUF` G5-G7 (2026-07-28) - correctness GREEN on the release target, speed still PENDING
+
+**Benchmark disposition: PENDING for speed, GREEN for correctness.
+`benchmark_binding=false`.** This checkpoint changes no engine code at all (one
+env-gated test case), so it claims no throughput number and moves none. The
+spec-ON/spec-OFF A/B on a GGUF target remains the row's single open speed item,
+exactly as the row's gate 5 always said.
+
+**Wall-clock figures below are reported for budgeting, NOT as benchmarks.** The
+box carried a concurrent `nvcc` build from another session during part of the
+series, so no timing here is contention-free and none of it is binding.
+
+Correctness, on dgx.casa GB10, CUDA 13, under `flock $HOME/gpu.lock`, on a
+from-scratch RELEASE-TARGET build (`-DVLLM_CPP_CUDA_ARCHITECTURES=121a`, build
+directory deleted first):
+
+| arm | result | notes |
+|---|---|---|
+| 35B A3B NVFP4 GGUF, spec-ON vs spec-OFF | **2/2 cases, 10/10 assertions, exit 0** | token-identical, 13 proposed / 11 accepted, 90.2 GiB peak RSS, 8m01s |
+| same, re-run on the EXACT committed source | **3/3 cases, 10/10 assertions, exit 0** | 7m25s; the added probe case SKIPs and contributes zero assertions |
+| device-delta probe, GPU arm | 484/484 assertions | spec-OFF only, 20 alternatives per position, 81.9 GiB, 2m51s |
+| device-delta probe, CPU arm (`CUDA_VISIBLE_DEVICES=`) | 484/484 assertions | same binary and file, 65.3 GiB, 2m05s |
+| safetensors sibling of the same quantization run | **1 case FAILED**, 6/7 assertions | acceptance 12 proposed / 11 accepted; spec-ON inserts one token, see below |
+
+**The architecture blocker was a misread, and that is the reusable finding.** A
+clean configure with `-DVLLM_CPP_CUDA_ARCHITECTURES=121a` still writes
+`CMAKE_CUDA_ARCHITECTURES:STRING=75` into `CMakeCache.txt`: that entry is what
+`enable_language(CUDA)` caches as the compiler's probe default, and the project
+then sets a normal variable of the same name which shadows it. Ground truth is
+`build-cuda/CMakeFiles/vllm.dir/flags.make`
+(`--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]`) and
+`cuobjdump -lelf` (20 cubins, every one `sm_121a`, zero sm_75). Ask those two,
+never the cache, which architecture a build really targets.
+
+**The CPU-vs-GPU token difference is a measured near-tie, and was never the
+gate.** The binding bar is spec-ON == spec-OFF within one device. Across devices
+the two arms agree at position 0 and fork at position 1 while still sharing a
+bit-identical prefix, so their rows are directly comparable there: GPU picks
+`13` at -0.773180 over `11` at -0.847055 (0.0739 nats), CPU picks `11` at
+-0.765499 over `13` at -0.830374 (0.0649 nats). Each device's pick is the
+other's rank 2, both margins sit roughly 7x inside the ratified 0.5-nat band,
+and the two devices disagree about those same tokens' logprobs by 0.057 and
+0.082 nats, i.e. **by more than the gap being decided**. The visible size of the
+24-token text difference measures the cascade, not the cause.
+
+**The safetensors sibling is not a token-exact reference, and the probe says
+why.** Sweeping the rank-1-minus-rank-2 margin across all 24 positions:
+
+| arm | exact ties (0.000 nats) | minimum margin |
+|---|---|---|
+| GGUF, GPU sm_121a | none | 0.0482 nats |
+| GGUF, CPU | none | 0.0649 nats |
+| safetensors NVFP4, GPU | **three (positions 7, 10, 16)** | 0.0000 nats |
+
+Both safetensors divergences (spec-ON inserting `31883` at position 10; two
+spec-OFF runs disagreeing at position 16) land on two of those three ties, where
+the top candidates carry bit-identical logprobs. Its logprob gaps are multiples
+of 1/16, the signature of the packed-NVFP4 quantized GEMM; the GGUF path expands
+to bf16 and its are not. So the GGUF result stands on its own numerics, and the
+safetensors behaviour is an open `SPEC-MTP` determinism item recorded in
+`docs/STATUS.md`, not a finding against this row.
+
+Reproduction, correctness:
+`cmake -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release`
+then
+`flock $HOME/gpu.lock env VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cuda/tests/test_qwen35_gguf_spec_decode`.
+Add `VLLM_MTP_GGUF_PROBE=1 --test-case="gguf mtp probe*"` for the margin probe,
+and `CUDA_VISIBLE_DEVICES=` for its CPU arm. The still-owed speed number is the
+spec-ON/spec-OFF throughput A/B on the same file and box.
 
 ### DFlash-from-GGUF axis-A loader, `SPEC-DFLASH-GGUF` GD1-GD3 (2026-07-28) - load-path correctness only, PENDING speed
 
@@ -3021,8 +3089,9 @@ a crash, and a quantized head may accept so rarely that spec-ON is SLOWER than s
 That risk is recorded in both spikes as a finding to document honestly rather than a bug
 to hide.
 
-**Not measured, and not owed by a scoping commit:** nothing. The first real number is
-owed by `SPEC-MTP-GGUF` row `G4` (acceptance) and, if a GGUF A/B is run, `G6`.
+**Not measured, and not owed by a scoping commit:** nothing. The first real number was
+owed by `SPEC-MTP-GGUF` row `G4` (acceptance), which has since landed; the spec-ON/OFF
+throughput A/B remains that row's one PENDING speed item.
 
 ### C-ABI engine-config growth to v9 (2026-07-28, `CLAIM-CAPI-ENGINE-CONFIG-V9`) - ABI surface only, NOT APPLICABLE
 

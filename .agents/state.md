@@ -30352,3 +30352,155 @@ run and both caveats instead of "outstanding"), `docs/BENCHMARKS.md` (the
   plan in spec §G2. **Residual (named, unbuilt):** the C++ SigLIP/NaFlex tower forward
   + Gemma-4 image processor + projector/merge — image is NOT yet engine-gated; no
   token-exact claim. dgx restored (model+tree pruned, worker `--restart=always`).
+
+---
+
+## 2026-07-28 — `SPEC-MTP-GGUF` CLOSED (`GATING` -> `DONE`): sm_121a GPU gate green, CPU/GPU delta measured as a near-tie
+
+Both blockers that held this row open are settled by measurement, and the second
+measurement turned up a third thing that belongs to `SPEC-MTP`, not here. Worktree
+`/home/mudler/_git/vllm.cpp-abi-v9` off `main` `c497668d`; dgx.casa GB10 CUDA 13; every
+GPU-executing run serialized behind `flock $HOME/gpu.lock`. NO `src/` or `include/`
+change: the only code is one env-gated test case.
+
+### 1. The arch blocker was a DECOY in `CMakeCache.txt`
+
+Deleted `~/wk-mtp-gguf/build-cuda` outright and configured from scratch:
+
+    cmake -B build-cuda -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+      -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+      -DVLLM_CPP_SERVER=OFF -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+      -DVLLM_CPP_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+
+The fresh cache STILL says `CMAKE_CUDA_ARCHITECTURES:STRING=75` next to
+`VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a`. That is not a stale cache and it is not a
+wrong build: `enable_language(CUDA)` caches the compiler's own probe default, and
+`CMakeLists.txt:186` then does a NORMAL `set(CMAKE_CUDA_ARCHITECTURES ...)` which
+shadows the cache entry for every target created after it. Ground truth:
+
+    build-cuda/CMakeFiles/vllm.dir/flags.make
+      CUDA_FLAGS = -O3 -DNDEBUG -std=c++20
+        "--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]"
+        -Xcompiler=-fPIC -Werror=all-warnings
+
+    cuobjdump -lelf tests/test_qwen35_gguf_spec_decode | grep -o 'sm_[0-9a-z]*' | sort | uniq -c
+      20 sm_121a          (and 20 sm_121a from -lptx; ZERO sm_75 anywhere)
+
+So the previous run was probably ALREADY 121a and was held open on a misread. That
+cannot be proven retroactively (the build dir was deleted to guarantee cleanliness),
+so the run was simply repeated rather than argued about. **Read `flags.make` or
+`cuobjdump`, never `CMakeCache.txt`.**
+
+**The repeat PASSES.** `flock $HOME/gpu.lock /usr/bin/time -v env
+VLLM_MTP_GGUF_MODEL=$HOME/bench/q36-35b-a3b-nvfp4.gguf ./test_qwen35_gguf_spec_decode`
+-> 2/2 cases, 10/10 assertions, `Status: SUCCESS!`, `Exit status: 0`, spec-OFF and
+spec-ON both `" Paris.\nA. True\nB. False\nAnswer:\nA\n\nWhat is the name of the
+largest island"`, 13 proposed / 11 accepted, peak RSS 94627300 KiB (90.24 GiB), wall
+8:01.63. Re-run afterwards on the EXACT committed source (probe case included, env
+unset): 3/3 cases, 10/10 assertions, exit 0, wall 7:25.24, RSS 94622740 KiB, with
+`SKIP: set VLLM_MTP_GGUF_PROBE=1` logged - so the added case is inert and adds zero
+assertions to the binding count.
+
+### 2. The CPU/GPU delta: disposition (a), a NEAR-TIE, measured not argued
+
+Framing first, because the previous wording invited the wrong chase: **CPU-vs-GPU
+token equality is NOT this row's bar and is not generally expected.** The bar is
+spec-ON == spec-OFF WITHIN a device.
+
+New third case in `tests/parity/test_qwen35_gguf_spec_decode.cpp:217`, DOUBLE-gated
+(asset + `VLLM_MTP_GGUF_PROBE=1`), spec-OFF ONLY (so nothing it shows can be blamed on
+or credited to the draft head), `sp.logprobs = 20`, one greppable line per position.
+GPU arm then `CUDA_VISIBLE_DEVICES=` arm, same binary, same file, ONE `flock` series.
+484/484 assertions each; GPU 2:51.64 / 85928976 KiB, CPU 2:05.76 / 68483480 KiB.
+
+Both arms pick `11751` (`" Paris"`) at position 0 with the same rank-2 (`264`), and
+fork at position 1 where they STILL share a bit-identical prefix, so the two rows are
+directly comparable and the comparison is teacher-forced by construction:
+
+    GPU  rank1 13 (".") -0.773180   rank2 11 (",") -0.847055   margin 0.073875 nats
+    CPU  rank1 11 (",") -0.765499   rank2 13 (".") -0.830374   margin 0.064875 nats
+
+Each device's pick is the OTHER device's rank 2. Both margins are ~7x inside the
+ratified band (`kNearTieMnats = 500`). The decisive comparison is margin vs
+cross-device noise on the SAME token: the arms differ by 0.057 nats on `13` and 0.082
+nats on `11`, i.e. **the disagreement between the two forwards is as large as, or
+larger than, the gap it is being asked to decide**. Rounding settles it. The 24-token
+texts look unrelated only because positions 2+ condition on different prefixes: the
+whole visible difference is one 0.07-nat coin flip cascading. **Text-difference size
+is not evidence of numerical-difference size.**
+
+Alternatives refuted rather than waved away: not materialization (identical bf16
+buffers both sides, and `QUANT-GGUF-NVFP4` proved the containers byte-equal); not the
+head (probe never speculates); not a state-dtype mismatch (`MakeQwen3_5KVCacheSpec`
+defaults conv+SSM state to bf16 on BOTH devices and `VT_GDN_STATE_BF16` was unset on
+both arms - the f32 requirement is specific to `causal_conv1d_spec_update`, which
+spec-OFF never calls, and the CPU arm indeed ran clean without it); not a structural
+divergence (the arms agree on the argmax and rank-2 at position 0 and on both
+contenders' logprobs to within 0.08 nats at position 1).
+
+### 3. Gate 4 measured on the safetensors sibling, which turned out to be the story
+
+`~/bench/q36-35b-a3b-nvfp4-vllm` is the safetensors sibling of the SAME quantization
+run and carries 19 `mtp.*` tensors, and `FromModelDir` takes a directory or a `.gguf`
+interchangeably, so the SAME test case runs on it with zero new code.
+
+**Gate 4 MET:** acceptance 12 proposed / 11 accepted (0.917) vs the GGUF's 13 / 11
+(0.846), same prompt, same params, same box. Neither is near the collapsed-acceptance
+failure mode the gate exists to catch.
+
+**But that arm FAILS spec-ON == spec-OFF at concurrency 1.** spec-ON emitted `31883`
+(`" vibrant"`) at position 10 where spec-OFF emitted `7431` (`" culture"`), inserting a
+token and shifting the tail (`CHECK( spec_ids == baseline_ids )` red, 6/7 assertions).
+It also did NOT reproduce its own spec-OFF sequence between two runs of the same
+binary, diverging at position 16 - while the GGUF arm reproduced its sequence across
+every run including the logprobs-on and logprobs-off variants.
+
+The probe attributes both. Margin sweep over all 24 positions of each arm:
+
+    GGUF  GPU sm_121a   exact ties: NONE   min margin 0.048231 nats (pos 23)
+    GGUF  CPU           exact ties: NONE   min margin 0.064875 nats (pos 1)
+    safetensors GPU     exact ties: pos 7, 10, 16   min margin 0.000000 nats
+
+Both safetensors divergences land on two of its three EXACT ties, where the top
+candidates are BIT-IDENTICAL: position 10 has `7431`, `12387` and `31883` all at
+-1.563910; position 16 has `11751` and `27480` both at -1.837616. Nothing but
+tie-break order decides those, and the batched verify forward, the sequential
+spec-OFF forward, and a second run of the latter are not obliged to break them alike.
+
+Mechanism: the safetensors arm's logprob gaps are multiples of 1/16 (-1.563910,
+-2.188910 = 0.625, -2.313910 = 0.75), the signature of the packed-NVFP4 quantized
+GEMM's coarse logits; the GGUF arm expands NVFP4 to bf16 (no `vec_dot`, so keep-quant
+expands) and its logprobs are fine-grained. That is exactly why the ties are in one
+arm and not the other. It also gives gate 3 a SECOND concrete reason to be NOT
+APPLICABLE beyond "no F16/F32 sibling exists": the only same-weights sibling is not
+token-stable against itself.
+
+**Split of ownership, stated so it is not silently absorbed:** the GGUF result is
+EXONERATED and stands on its own numerics. The safetensors behaviour contradicts the
+concurrency-1 identity `docs/SPECULATIVE-DECODING.md` claims, belongs to `SPEC-MTP`
+and the NVFP4 quantized-GEMM logit path, and is recorded OPEN and NOT root-caused
+(one prompt, two runs).
+
+### Row disposition
+
+`SPEC-MTP-GGUF` moves `GATING` -> `DONE`. Gates 1 and 2 met (both devices), gate 3 NOT
+APPLICABLE twice over, gate 4 met, gate 5 PENDING BY DESIGN (the spike says the row
+does not owe a speed number, only a `docs/BENCHMARKS.md` disposition). Named residuals,
+none of them a gate: the spec-ON/spec-OFF throughput A/B; identity established on one
+prompt and 24 tokens per device, which is the gate's own stated c1 form; and the
+`SPEC-MTP` safetensors NVFP4 tie item above.
+
+**Contention note:** a concurrent Gemma-4 G2 `nvcc` build from another session ran on
+the box during part of the series. It cannot move token or logprob values, but it does
+mean NO wall-clock figure from this checkpoint is contention-free, and none is
+published as binding. dgx `/` went 69G -> 56G free during the window from that other
+session's build artifacts, not from this work; nothing was left behind here beyond the
+run logs in `$HOME`.
+
+Records (ONE commit): `specs/gguf-mtp-spec-decode.md` (superseded blocked-on-NVFP4
+narrative compacted away, `G5`/`G6`/`G7` rows + gate dispositions), `engine-matrix.md`
+(`GATING` -> `DONE`, ledger link, closing commit), `parity-ledger.md`, `docs/STATUS.md`
+(row rewritten to the current binding result + the new open `SPEC-MTP` item),
+`docs/BENCHMARKS.md` (new checkpoint entry, speed still PENDING),
+`docs/SPECULATIVE-DECODING.md` (the "safetensors (not GGUF)" limitation was stale;
+plus the NVFP4 exact-tie caveat), the probe case, this log.

@@ -158,6 +158,16 @@ ours, built to the same shape as the safetensors MTP gates.
    entry, but it may legitimately be `PENDING` with the reproduction command
    until a GGUF A/B is run.
 
+### Gate dispositions as of 2026-07-28
+
+| Gate | Disposition | Evidence |
+|---|---|---|
+| 1 spec-OFF SACRED | **MET** | The trunk regression sweep recorded under `G4` is unchanged; the only later change is an env-gated test case, which touches no engine code |
+| 2 token identity c1 | **MET on BOTH devices** | CPU dense 2B token-exact; GPU sm_121a 35B A3B MoE token-exact, `G5` |
+| 3 cross-format agreement | **NOT APPLICABLE**, for two reasons | the gate's own precondition is an F16/F32 GGUF sibling and every head-carrying export on hand is quantized (2B Q8_0, 35B NVFP4); and per `G7` the same-weights NVFP4 safetensors sibling is not token-stable even against itself, so it could not serve as a reference either |
+| 4 acceptance parity | **MET** | GGUF 13 proposed / 11 accepted (0.846) vs safetensors 12 proposed / 11 accepted (0.917) on the SAME prompt, params and box, `G7` |
+| 5 speed | **PENDING by design** | not owed by this row; `docs/BENCHMARKS.md` carries the disposition and the repro command |
+
 ## Dependencies
 
 - `SPEC-MTP` `DONE` (the propose/verify loop, widened KV, GDN spec routing).
@@ -181,6 +191,9 @@ ours, built to the same shape as the safetensors MTP gates.
 | `G3` | Narrow the rejection; wire `LoadQwen3_5MTP` + `AttachMtpDraftWeights` into the GGUF branch | Rejection test; engine loads spec-ON on GGUF | `G2` |
 | `G4` | **RUNS and FAILS 2026-07-28 - gate landed, defect OPEN.** `tests/parity/test_qwen35_gguf_spec_decode.cpp` drives the real 2B GGUF twice (spec-OFF then spec-ON) on CPU. It found and fixed one real loader defect (`fc.nk` unset: shape checks passed, the draft forward refused with "fc must be raw bf16 [H,2H]"), then surfaced a SECOND, still-open failure: **spec-ON diverges from spec-OFF while acceptance is HIGH (13 proposed / 10 accepted)**. Greedy MTP is exactness-preserving, so this is a genuine correctness defect. NOT yet attributed - see `G4a`. Needs `VT_GDN_STATE_BF16=0` on CPU (`causal_conv1d_spec_update` requires f32 conv state off CUDA) | Gates 2 and 4 | `G3` |
 | `G4a` | **ANSWERED 2026-07-28 by bisect - the defect is NOT in this row.** Killing the drafter outright (zeroing `fc`, so every proposal is garbage) gives **23 proposed / 0 accepted** and *byte-identical output to the live-drafter run*, still diverging from spec-OFF. With ZERO drafts accepted the emitted sequence must be the target's own greedy sequence; it is not. So enabling speculation changes the TARGET's forward on CPU, independently of the head. This row's loader is EXONERATED (and, with a live head, earns 10/13 acceptance). Tracked below as `CPU-SPEC-DIVERGENCE`, which is a pre-existing engine defect this row merely surfaced | Attribution complete, no safetensors download needed | `G4` |
+| `G5` | **DONE 2026-07-28.** The GPU end-to-end gate re-run on a from-scratch RELEASE-TARGET build, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a`, verified by `flags.make` (`--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]`) and by `cuobjdump -lelf` (20 cubins, ALL sm_121a, zero sm_75) rather than by `CMakeCache.txt`, whose `CMAKE_CUDA_ARCHITECTURES:STRING=75` line is the compiler probe default and is shadowed by `CMakeLists.txt:186`. dgx.casa GB10 under `flock`, 35B A3B NVFP4 GGUF: 2/2 cases, 10/10 assertions, exit 0, spec-ON token-identical to spec-OFF, 13 proposed / 11 accepted, 90.2 GiB peak RSS, 8m01s | Gates 2 and 4 on the release target | `G4` |
+| `G6` | **ANSWERED 2026-07-28 by measurement - the CPU/GPU delta is a NEAR-TIE, not a defect.** The spec-OFF-only, double-gated probe case requests 20 alternatives per position and runs GPU then `CUDA_VISIBLE_DEVICES=`, same binary and file. Both arms pick `11751` at position 0 and fork at position 1 on a BIT-IDENTICAL prefix: GPU rank1 `13` -0.773180 vs rank2 `11` -0.847055 (margin 0.0739 nats); CPU rank1 `11` -0.765499 vs rank2 `13` -0.830374 (margin 0.0649 nats). Each device's pick is the other's rank 2, both margins ~7x inside the ratified 0.5-nat band, and the cross-device disagreement on the SAME token (0.057 and 0.082 nats) EXCEEDS the margin being decided, so the choice is settled by rounding. The 24-token texts diverge visibly only because positions 2+ condition on different prefixes | Attribution complete; no bisect owed | `G5` |
+| `G7` | **MEASURED 2026-07-28 - gate 4 MET, and the reference arm turned out to be the interesting result.** The same test case pointed at the same-quantization-run safetensors sibling (`FromModelDir` takes either) gives acceptance 12 proposed / 11 accepted vs the GGUF's 13 / 11, so gate 4 is met. But that arm FAILS spec-ON == spec-OFF at concurrency 1 (one inserted token at position 10) and does not reproduce its own spec-OFF sequence run to run (position 16). The probe attributes both: it carries THREE exact ties (positions 7, 10, 16) with BIT-IDENTICAL logprobs, and both divergences land on two of them, whereas BOTH GGUF arms have ZERO exact ties and a 0.048-nat minimum margin. Mechanism: the safetensors NVFP4 path's logprobs fall on a 1/16 grid (quantized GEMM), the GGUF path expands to bf16 and does not. This EXONERATES the GGUF result and OPENS a `SPEC-MTP` item that is recorded, not fixed here | Gate 4, plus the concrete reason gate 3 is NOT APPLICABLE | `G6` |
 
 `G0` is deliberately a work row, not an assumption. `G1` is independently
 landable and inert.
@@ -232,30 +245,168 @@ the drafter -> identical divergence at 0 acceptance, so not the head; (2) `ngram
 itself; (3) instrument both conv kernels -> 3-vs-4 stride split, pointing at the
 state movement between them.
 
-## GPU-run attempt 2026-07-28: BLOCKED on NVFP4 GGUF dequant (not this row)
+## GPU close-out 2026-07-28: the sm_121a arm PASSES, the CPU/GPU delta is a near-tie
 
-The `G4`/`G5` GPU run was attempted on dgx.casa (GB10, CUDA 13, `main@5a03f112`,
-`-DVLLM_CPP_CUDA_ARCHITECTURES=121a`). **It did not run.** Both cases threw at
-model load:
+Two things held the GPU arm open. NVFP4 GGUF dequant, which `QUANT-GGUF-NVFP4`
+removed, is the superseded first one and its chronology now lives in
+`.agents/state.md`. The two that remained are answered here as `G5` and `G6`.
 
-    gguf dequant: unsupported ggml type 40 (NVFP4) (Task 2/i-quant)
+### `G5`: the architecture claim was a MISREAD, and the trap is the keeper
 
-Both head-carrying GGUFs available on that box (`q36-27b-nvfp4.gguf`,
-`q36-35b-a3b-nvfp4.gguf`) are NVFP4-quantized, and the GGUF dequant path does not
-implement type 40. No GPU work occurred - `nvidia-smi --query-compute-apps`
-listed zero compute processes. This is a PRE-EXISTING engine gap (NVFP4 is
-supported for safetensors, not for GGUF), independent of this row.
+The build the prior GPU run used was recorded as
+`CMAKE_CUDA_ARCHITECTURES=75`, i.e. PTX-JIT'd Turing on an sm_121 GB10, and the
+row was correctly held open on that basis. Re-configuring from scratch (build
+directory DELETED first, so no stale cache) with the documented invocation
+`-DVLLM_CPP_CUDA_ARCHITECTURES=121a` reproduces that cache line exactly:
 
-**What DID pass on the GPU box**, and is a real result: the loader gate
-`test_qwen3_5_gguf_mtp` 18/18 against the **35B A3B MoE** GGUF. That exercises
-the `kMoe` head branch (`LoadMoeGguf` per head layer, `moe_layers`) on real
-weights for the first time - it succeeds because the MTP head block's own tensors
-are not NVFP4, only the trunk's are. It is a LOADER result: no MoE inference ran.
+    build-cuda/CMakeCache.txt
+      CMAKE_CUDA_ARCHITECTURES:STRING=75
+      VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a
 
-**Consequence for the row.** `G4` stays satisfied by the CPU run only (dense 2B,
-token-exact, 13/11 acceptance). A GPU end-to-end run needs a head-carrying GGUF
-in a dequantable encoding; the dense 2B Q8_K_XL is one. NVFP4 GGUF dequant is a
-separate capability and should not be filed under this row.
+**That cache entry is not evidence of the compiled architecture.**
+`enable_language(CUDA)` records the compiler's own probe default in the cache,
+and [CMakeLists.txt:186](../../CMakeLists.txt) then sets a NORMAL variable of the
+same name, which shadows the cache entry for every target created afterwards.
+The compiled arch is one level down, and says 121a on both counts:
+
+    build-cuda/CMakeFiles/vllm.dir/flags.make
+      CUDA_FLAGS = -O3 -DNDEBUG -std=c++20
+        "--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]"
+        -Xcompiler=-fPIC -Werror=all-warnings
+
+    cuobjdump -lelf tests/test_qwen35_gguf_spec_decode
+      -> 20 cubins, EVERY one sm_121a, zero sm_75 (native SASS, nothing JIT-only)
+
+So: ask `flags.make` or `cuobjdump`, never `CMakeCache.txt`, which architecture a
+build really targets. It also follows that the earlier run was probably ALREADY
+121a and was held open on a decoy; that cannot be proven retroactively (the build
+directory was deleted to guarantee a clean configure), which is why the run was
+simply repeated rather than argued about.
+
+**The repeated run PASSES.** dgx.casa GB10, CUDA 13, under `flock $HOME/gpu.lock`,
+`VLLM_MTP_GGUF_MODEL=~/bench/q36-35b-a3b-nvfp4.gguf ./tests/test_qwen35_gguf_spec_decode`:
+**2/2 cases, 10/10 assertions, exit 0**, spec-ON token-identical to spec-OFF,
+**13 drafts proposed / 11 accepted**, peak RSS 90.2 GiB, wall 8m01s. The
+sm_121a arm emits the same 24 tokens the earlier arm did, so the two builds agree
+token-for-token as well.
+
+### `G6`: the CPU-vs-GPU token difference is a MEASURED near-tie, not a defect
+
+State the bar first, because the previous framing invited the wrong chase:
+**CPU-vs-GPU token equality is NOT this row's gate and is not generally
+expected.** Different kernels accumulate bf16 in different orders, which is
+exactly why several rows in this repo gate on a near-tie-robust form rather than
+a strict one. The binding bar is spec-ON == spec-OFF WITHIN one device, and that
+is what `G5` passed.
+
+The probe (third, double-gated case in
+`tests/parity/test_qwen35_gguf_spec_decode.cpp`) runs spec-OFF ONLY, so nothing
+it shows can be blamed on or credited to the draft head, and requests 20
+alternatives per position. Same binary, same file, GPU arm then
+`CUDA_VISIBLE_DEVICES=` arm, one `flock` series.
+
+Both arms agree on position 0 (`11751` = `" Paris"`, same rank-2 `264`) and fork
+at position 1, where they still share a BIT-IDENTICAL prefix, so their rows are
+directly comparable and the comparison is teacher-forced by construction:
+
+| arm | rank 1 | rank 2 | margin |
+|---|---|---|---|
+| GPU (sm_121a) | `13` `"."` -0.773180 | `11` `","` -0.847055 | **0.0739 nats** |
+| CPU | `11` `","` -0.765499 | `13` `"."` -0.830374 | **0.0649 nats** |
+
+**Each device's pick is the other device's rank 2**, and both margins sit roughly
+7x inside the repo's ratified near-tie band (`kNearTieMnats = 500`, 0.5 nats).
+The decisive number is the comparison of those margins against the cross-device
+noise on the SAME token: the two arms disagree by 0.057 nats on `13` and 0.082
+nats on `11`, i.e. **the numerical disagreement between the two forwards is the
+same size as, or larger than, the gap it is being asked to decide**. Which of
+`"."` and `","` wins is therefore settled by rounding, not by the model. That is
+the textbook definition of an approximate tie, and it is disposition (a).
+
+The reason the two 24-token texts look nothing alike (`" Paris.\nA. True\nB.
+False..."` vs `" Paris, a city renowned for its rich history..."`) is that from
+position 2 on the two arms are conditioning on DIFFERENT prefixes: the entire
+visible difference is the cascade of one 0.07-nat coin flip. **The size of a text
+difference is not evidence of the size of its numerical cause**, which is the
+trap this row records.
+
+Refuted alternatives, so the reading is not merely plausible:
+
+- Not materialization: the loader hands both arms identical bf16 buffers (the
+  NVFP4 expansion is host-side and device-independent), and
+  `QUANT-GGUF-NVFP4` separately proved the containers byte-equal on 192 tensors.
+- Not the draft head: the probe never enables speculation.
+- Not a GDN state-dtype mismatch: `MakeQwen3_5KVCacheSpec`
+  (`src/vllm/model_executor/models/qwen3_5_common.cpp:52-63`) defaults the conv
+  and SSM state to bf16 on BOTH devices, and the probe left `VT_GDN_STATE_BF16`
+  unset on both arms, so the two arms carried the same state precision. The
+  known CPU f32 restriction is specific to `causal_conv1d_spec_update`, which
+  spec-OFF never calls, and indeed the CPU probe arm ran clean without it.
+- Not a structural forward divergence: the arms agree on the argmax at position
+  0 and on the rank-2 candidate there, and at position 1 they agree on WHICH two
+  tokens are in contention and on their logprobs to within 0.08 nats. A broken
+  forward does not agree to two decimal places.
+
+### `G7`: the safetensors sibling is NOT a token-exact reference, and why
+
+Gate 4 wants the GGUF acceptance rate compared against the safetensors rate on
+the same prompts. The 35B A3B NVFP4 GGUF has a safetensors sibling from the SAME
+quantization run (`~/bench/q36-35b-a3b-nvfp4-vllm`, 19 `mtp.*` tensors), and
+because `LoadedEngine::FromModelDir` takes a directory or a `.gguf`
+interchangeably, the SAME test case runs on it unchanged. That measurement was
+taken, and it produced a finding worth more than the rate it was after.
+
+**Acceptance parity: MET.** GGUF 13 proposed / 11 accepted (0.846) vs safetensors
+12 proposed / 11 accepted (0.917), same prompt, same engine params, same box.
+Both are far from the collapsed-acceptance failure mode gate 4 exists to catch.
+
+**But the safetensors arm FAILS the same-device token-identity bar** that the
+GGUF arm passes: spec-ON emitted `31883` (`" vibrant"`) at position 10 where
+spec-OFF emitted `7431` (`" culture"`), inserting one token and shifting the
+tail. It also did not reproduce its OWN spec-OFF sequence between two runs of the
+same binary, diverging at position 16.
+
+The probe explains both, and the explanation is quantitative. Running it on all
+three arms and reading the rank-1-minus-rank-2 margin at every one of the 24
+positions:
+
+| arm | exact ties (0.000 nats) | minimum margin | positions under 0.1 nats |
+|---|---|---|---|
+| GGUF, GPU sm_121a | **none** | 0.0482 nats (pos 23) | 1, 23 |
+| GGUF, CPU | **none** | 0.0649 nats (pos 1) | 1 |
+| safetensors, GPU | **three: pos 7, 10, 16** | 0.0000 nats | 7, 10, 16 |
+
+Both safetensors divergences land EXACTLY on two of its three exact ties. At
+position 10 the top THREE candidates (`7431`, `12387`, `31883`) carry
+BIT-IDENTICAL logprobs of -1.563910; at position 16 the top two (`11751`,
+`27480`) are bit-identical at -1.837616. Nothing decides those but tie-break
+order, and the batched verify forward and the sequential spec-OFF forward do not
+have to break them the same way (nor, evidently, does the same forward across
+runs).
+
+**Why the ties exist there and not in the GGUF arm.** The safetensors arm's
+logprobs fall on a coarse grid: the gaps between its ranked candidates are
+multiples of 1/16 (0.0625), e.g. -1.563910, -2.188910 (0.625 = 10/16), -2.313910
+(0.75 = 12/16). The GGUF arm's are not (-0.773180, -0.847055). The safetensors
+NVFP4 path keeps the weights packed and runs the quantized GEMM, whose logits
+land on that grid, so distinct tokens genuinely collide; the GGUF path expands
+NVFP4 to bf16 (`QUANT-GGUF-NVFP4` has no `vec_dot`, so keep-quant expands) and
+runs the bf16 GEMM, which resolves them.
+
+**Consequences, split by owner:**
+
+- FOR THIS ROW: the GGUF arm's token identity is a real property, not luck. It
+  has ZERO exact ties in the window and a 0.048-nat minimum margin, and it
+  reproduced its sequence across every run and across the logprobs-on and
+  logprobs-off variants. Gate 4 is met and gate 3 is NOT APPLICABLE for a second,
+  now concrete reason: the only same-weights sibling cannot serve as a token
+  reference because its own tokens are not stable.
+- NOT FOR THIS ROW, and newly OPEN: `docs/SPECULATIVE-DECODING.md` states
+  spec-ON == spec-OFF as a concurrency-1 property, and on the 35B A3B NVFP4
+  SAFETENSORS target on this build it does not hold. That belongs to `SPEC-MTP`
+  and the NVFP4 quantized-GEMM logit path, not to the GGUF loader. It is recorded
+  rather than fixed here, and it is not root-caused beyond the tie measurement
+  above (two runs, one prompt).
 
 ## Risks/decisions
 
