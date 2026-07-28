@@ -1052,6 +1052,125 @@ TEST_CASE("api_server: /reset_prefix_cache → {\"success\": bool}") {
   CHECK(r.at("success") == true);
 }
 
+// GET /tokenizer_info (serve/tokenize/api_router.py:95-108 attach_router →
+// serving.py:154-160 get_tokenizer_info → TokenizerInfoResponse). Surfaces the
+// tokenizer_config.json-equivalent fields our BPE tokenizer can genuinely back;
+// vLLM-only fields (raw chat_template string, HF init_kwargs, added-token
+// normalized/single_word) are omitted by design. Ported from
+// tests/entrypoints/openai/test_tokenization.py::test_get_tokenizer_info_*.
+TEST_CASE("api_server: /tokenizer_info surfaces backed tokenizer metadata") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  h.server.set_tokenizer(&Fixture(), /*max_model_len=*/kMaxModelLen);
+
+  ApiServer::DispatchResult info = h.server.handle_tokenizer_info();
+  REQUIRE(info.status == 200);
+  CHECK(info.content_type == "application/json");
+  json j = json::parse(info.body);
+
+  // tokenizer_class is required by TokenizerInfoResponse; the fixture is a
+  // byte-level BPE, so the genuine family name is reported.
+  CHECK(j.at("tokenizer_class") == "ByteLevelBPETokenizer");
+  CHECK(j.at("model_max_length") == kMaxModelLen);
+  CHECK(j.at("vocab_size") == Fixture().VocabSize());
+
+  // added_tokens_decoder mirrors HF tokenizer_config.json: id → {content,
+  // special, lstrip, rstrip}. The fixture declares three added tokens (ids
+  // 19/20/21), two of them special.
+  REQUIRE(j.contains("added_tokens_decoder"));
+  const json& added = j.at("added_tokens_decoder");
+  CHECK(added.size() == Fixture().AddedTokens().size());
+  REQUIRE(added.contains("19"));
+  CHECK(added.at("19").at("content") == "<|end|>");
+  CHECK(added.at("19").at("special") == true);
+  CHECK(added.at("20").at("content") == "<tool>");
+  CHECK(added.at("20").at("special") == false);
+  // Named gaps: the raw chat_template string is NOT surfaced (chat templates
+  // live in the ChatPromptFn seam), nor the HF init_kwargs, nor the added-token
+  // normalized/single_word flags.
+  CHECK_FALSE(j.contains("chat_template"));
+  CHECK_FALSE(added.at("19").contains("normalized"));
+
+  // Without a tokenizer attached the handler is a 500 (the route itself is
+  // only registered when a tokenizer is attached AND the flag is enabled).
+  ServerHarness bare(c, w, Fixture());
+  CHECK(bare.server.handle_tokenizer_info().status == 500);
+}
+
+// POST /abort_requests (serve/dev/rlhf/api_router.py:94-138): the abort
+// callback aborts the listed request ids; the response is
+// {"status":"aborted","aborted":<count>}. Malformed JSON → 400 {"detail":...}.
+TEST_CASE("api_server: /abort_requests shape + callback wiring") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  std::vector<std::string> seen_ids;
+  bool empty_seen = false;
+  h.server.set_abort_requests(
+      [&](const std::vector<std::string>& ids) -> int {
+        if (ids.empty()) {
+          empty_seen = true;
+          return 7;  // "abort all" → callback-reported count
+        }
+        seen_ids = ids;
+        return static_cast<int>(ids.size());
+      });
+
+  // Explicit ids → passed through verbatim; count == number of ids.
+  json r = json::parse(
+      h.server.handle_abort_requests(R"({"request_ids":["a","b","c"]})").body);
+  CHECK(r.at("status") == "aborted");
+  CHECK(r.at("aborted") == 3);
+  CHECK(seen_ids == std::vector<std::string>{"a", "b", "c"});
+
+  // Missing request_ids → empty list → "abort all" branch.
+  json all = json::parse(h.server.handle_abort_requests(R"({})").body);
+  CHECK(empty_seen);
+  CHECK(all.at("status") == "aborted");
+  CHECK(all.at("aborted") == 7);
+
+  // Malformed JSON → 400 with vLLM's HTTPException detail shape.
+  ApiServer::DispatchResult bad = h.server.handle_abort_requests("{not json");
+  CHECK(bad.status == 400);
+  CHECK(json::parse(bad.body).at("detail") == "Invalid JSON format");
+}
+
+// /abort_requests actually tears down an in-flight AsyncLLM request when the
+// callback is wired to the engine abort path (async_llm.h:115 abort). Ported
+// from tests/entrypoints/serve/dev/rlhf's abort behavior + test_async_llm abort.
+TEST_CASE("api_server: /abort_requests aborts an in-flight engine request") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  h.server.set_abort_requests(
+      [&](const std::vector<std::string>& ids) -> int {
+        h.async_engine.abort(ids);
+        return static_cast<int>(ids.size());
+      });
+
+  // Submit a long in-flight request directly to the engine under a known id so
+  // the abort target is deterministic (the serving layer mints its own
+  // "cmpl-<n>-0" engine ids).
+  vllm::SamplingParams params;
+  params.max_tokens = 30;
+  params.temperature = 0.0;
+  vllm::v1::AsyncRequest req =
+      h.async_engine.add_request("abort-me", "hello", params);
+  REQUIRE(h.async_engine.has_unfinished_requests());
+
+  json r = json::parse(
+      h.server.handle_abort_requests(R"({"request_ids":["abort-me"]})").body);
+  CHECK(r.at("status") == "aborted");
+  CHECK(r.at("aborted") == 1);
+
+  for (int i = 0; i < 500 && h.async_engine.has_unfinished_requests(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  CHECK_FALSE(h.async_engine.has_unfinished_requests());
+}
+
 // ─── 2. Socket smoke test (real HTTP over an ephemeral port) ─────────────────
 TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral port") {
   const HfConfig c = MakeConfig();
@@ -1121,6 +1240,77 @@ TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral por
 
   h.server.stop();
   server_thread.join();
+}
+
+// Route-registration gate over a real socket: /tokenizer_info is ABSENT (404)
+// unless a tokenizer is attached AND the info flag is enabled (mirrors vLLM
+// gating it behind enable_tokenizer_info_endpoint), and /abort_requests is
+// ABSENT until the abort callback is attached. This is the RED-first evidence
+// that the additive routes are opt-in and never perturb the base routing.
+TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+  SUBCASE("backings unattached → routes absent (404)") {
+    ServerHarness h(c, w, Fixture());
+    // Attach the tokenizer but leave the info flag OFF: /tokenize is enabled,
+    // /tokenizer_info stays absent.
+    h.server.set_tokenizer(&Fixture(), kMaxModelLen);
+    const int port = h.server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&h]() { h.server.serve(); });
+    for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(h.server.is_running());
+
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(5, 0);
+    auto info = client.Get("/tokenizer_info");
+    REQUIRE(info);
+    CHECK(info->status == 404);  // flag off → route not registered
+    auto abort = client.Post("/abort_requests", R"({"request_ids":[]})",
+                             "application/json");
+    REQUIRE(abort);
+    CHECK(abort->status == 404);  // no callback → route not registered
+
+    h.server.stop();
+    server_thread.join();
+  }
+
+  SUBCASE("backings attached → routes serve (200)") {
+    ServerHarness h(c, w, Fixture());
+    h.server.set_tokenizer(&Fixture(), kMaxModelLen);
+    h.server.set_tokenizer_info_enabled(true);
+    int aborted_calls = 0;
+    h.server.set_abort_requests(
+        [&](const std::vector<std::string>& ids) -> int {
+          ++aborted_calls;
+          return static_cast<int>(ids.size());
+        });
+    const int port = h.server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&h]() { h.server.serve(); });
+    for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(h.server.is_running());
+
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(5, 0);
+    auto info = client.Get("/tokenizer_info");
+    REQUIRE(info);
+    CHECK(info->status == 200);
+    CHECK(json::parse(info->body).at("tokenizer_class") ==
+          "ByteLevelBPETokenizer");
+    auto abort = client.Post("/abort_requests", R"({"request_ids":["x","y"]})",
+                             "application/json");
+    REQUIRE(abort);
+    CHECK(abort->status == 200);
+    CHECK(json::parse(abort->body).at("aborted") == 2);
+    CHECK(aborted_calls == 1);
+
+    h.server.stop();
+    server_thread.join();
+  }
 }
 
 // W2 port of test_async_llm.test_load at the HTTP boundary: concurrent workers

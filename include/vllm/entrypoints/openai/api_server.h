@@ -117,6 +117,19 @@ class ApiServer {
   DispatchResult handle_ping() const;
   // GET /server_info (serve/dev/server_info/api_router.py).
   DispatchResult handle_server_info() const;
+  // GET /tokenizer_info (serve/tokenize/api_router.py:95-108 attach_router +
+  // serving.py:154-160 get_tokenizer_info → TokenizerInfoResponse). Gated in
+  // vLLM behind `enable_tokenizer_info_endpoint`; we mirror that with the
+  // tokenizer-info flag below (default off → the route is not registered → 404).
+  // Surfaces the tokenizer_config.json-equivalent fields our BPE tokenizer can
+  // genuinely back (tokenizer_class, model_max_length, vocab_size,
+  // bos/eos_token_id, added_tokens_decoder); fields vLLM emits that our
+  // tokenizer does not carry are OMITTED + named in the spec.
+  DispatchResult handle_tokenizer_info() const;
+  // POST /abort_requests (serve/dev/rlhf/api_router.py:94-138) → {"status":
+  // "aborted","aborted":<count>}. Parses {request_ids:[...]}; empty/missing ids
+  // means "abort all in-flight". Wired to the injected abort callback below.
+  DispatchResult handle_abort_requests(const std::string& request_body) const;
 
   // Attach the Prometheus stat logger backing GET /metrics (non-owning; must
   // outlive the server). Enables the /metrics route.
@@ -129,6 +142,20 @@ class ApiServer {
                      int64_t max_model_len) {
     tokenizer_ = tokenizer;
     max_model_len_ = max_model_len;
+  }
+  // Enable GET /tokenizer_info (mirrors vLLM's `enable_tokenizer_info_endpoint`
+  // CLI flag: off by default, so the route is absent → 404 unless enabled AND a
+  // tokenizer is attached).
+  void set_tokenizer_info_enabled(bool enabled) {
+    tokenizer_info_enabled_ = enabled;
+  }
+  // Attach the abort callback backing POST /abort_requests. Mirrors
+  // EngineClient.abort(request_ids); an empty id list means "abort all
+  // in-flight". Returns the number of requests aborted (the response's
+  // "aborted" count).
+  void set_abort_requests(
+      std::function<int(const std::vector<std::string>&)> abort_requests) {
+    abort_requests_ = std::move(abort_requests);
   }
   // Attach the prefix-cache reset callback backing POST /reset_prefix_cache.
   // Signature mirrors EngineClient.reset_prefix_cache(reset_running_requests,
@@ -168,7 +195,9 @@ class ApiServer {
   const v1::metrics::PrometheusStatLogger* metrics_ = nullptr;
   const vllm::tok::Tokenizer* tokenizer_ = nullptr;
   int64_t max_model_len_ = 0;
+  bool tokenizer_info_enabled_ = false;
   std::function<bool(bool, bool)> reset_prefix_cache_;
+  std::function<int(const std::vector<std::string>&)> abort_requests_;
 
   // Opaque httplib::Server (pimpl keeps third_party/httplib.h out of this
   // header — only api_server.cpp and the smoke test pull it in).
