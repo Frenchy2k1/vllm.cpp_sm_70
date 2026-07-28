@@ -41,6 +41,7 @@
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
 
@@ -130,6 +131,20 @@ Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
 // SwiGLU MLP ("blk.%d.ffn_{gate,up,down}"). Targets the same
 // Qwen3_5DenseWeights the 27B safetensors loader produces (bf16 fields; the
 // fp4 variants stay empty).
+// Load the Multi-Token Prediction head from a head-carrying GGUF
+// (`SPEC-MTP-GGUF`). llama.cpp's Qwen3.5 converter folds the HF `mtp.*` block
+// into the block list at index `config.num_hidden_layers`, under the
+// DeepSeek-style `nextn` names; this reads it back using the same conventions
+// (norm (w+1) un-shift, quantized matmul routing, torch [N, K] shapes) as the
+// trunk loaders above, so the head matches the trunk it speculates for.
+// Requires `config.raw["mtp_num_hidden_layers"]`, which HfConfigFromGguf
+// publishes from `<arch>.nextn_predict_layers`. The head shares the target's
+// embed_tokens / lm_head and so loads neither.
+Qwen3_5MTPWeights LoadQwen3_5MTPFromGguf(const GgufFile& gguf,
+                                         const HfConfig& config,
+                                         Qwen3_5MTPKind kind,
+                                         const GgufLoadPolicy& pol);
+
 Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(
     const GgufFile& gguf, const HfConfig& config,
     const GgufLoadPolicy* policy = nullptr);

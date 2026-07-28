@@ -720,19 +720,44 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // `HfConfigFromGguf` mapping the GGUF `general.architecture` key
     // (`qwen35` dense / `qwen35moe` / `qwen3next`) onto the registered
     // architecture ID, which resolves to the owning arch TU's GGUF loader.
-    // SPEC-MTP I5d-pre: GGUF exports carry no `mtp.*` tensors (spec §4), so a
-    // speculative (MTP) config cannot be satisfied from a GGUF source. Reject
-    // deterministically rather than silently dropping speculation.
+    // SPEC-DFLASH-GGUF (not yet implemented): a DFlash draft shares the
+    // target's bf16 embed_tokens + lm_head, which LoadDflashDraft reads through
+    // a safetensors-typed seam. MTP no longer belongs here - see below.
     if (params.speculative_config.has_value() &&
-        (params.speculative_config->method == "mtp" ||
-         params.speculative_config->method == "dflash")) {
+        params.speculative_config->method == "dflash") {
       throw std::runtime_error(
-          "speculative decoding requires a safetensors target checkpoint: GGUF "
-          "exports lack the mtp.* draft tensors / bf16 target embed+lm_head the "
-          "DFlash draft shares");
+          "dflash speculative decoding requires a safetensors target "
+          "checkpoint: the DFlash draft shares the target's bf16 "
+          "embed_tokens + lm_head");
+    }
+    // SPEC-MTP-GGUF: MTP over GGUF used to be refused alongside dflash, on the
+    // premise that GGUF exports carry no `mtp.*` tensors. They can: llama.cpp's
+    // Qwen3.5 converter emits the head under layer-indexed `nextn` names and
+    // announces it with `<arch>.nextn_predict_layers`, which HfConfigFromGguf
+    // reads. A GGUF that genuinely lacks the head is still refused, but now for
+    // the true reason and with the fix in the message.
+    if (params.speculative_config.has_value() &&
+        params.speculative_config->method == "mtp" &&
+        !config.raw.contains("mtp_num_hidden_layers")) {
+      throw std::runtime_error(
+          "mtp speculative decoding needs a GGUF exported WITH the MTP head: "
+          "this file declares no <arch>.nextn_predict_layers (it was converted "
+          "with --no-mtp, or predates llama.cpp's Qwen3.5 MTP support)");
     }
     std::unique_ptr<LoadedModel> model =
         ModelRegistry::Load(config, ModelSource::FromGguf(gguf));
+    // SPEC-MTP-GGUF: attach the head from the SAME file, mirroring the
+    // safetensors branch's maybe_attach_mtp. The GGUF is still mapped here; the
+    // loader owns its dequantized copies, so nothing borrows past this scope.
+    if (params.speculative_config.has_value() &&
+        params.speculative_config->method == "mtp") {
+      const ModelRegistration& gguf_reg = ModelRegistry::Resolve(config);
+      const Qwen3_5MTPKind kind = gguf_reg.factory->is_dense_model
+                                      ? Qwen3_5MTPKind::kDense
+                                      : Qwen3_5MTPKind::kMoe;
+      model->AttachMtpDraftWeights(vllm::LoadQwen3_5MTPFromGguf(
+          gguf, config, kind, GgufLoadPolicy::FromEnv()));
+    }
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params));
   }

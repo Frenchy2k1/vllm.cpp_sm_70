@@ -32,6 +32,18 @@ struct Qwen3_5MTPWeights {
   int64_t NumLayers() const;
 };
 
+// The MTP head depth, read from the checkpoint config (`mtp_num_hidden_layers`,
+// under `text_config` when the config nests it). Defaults to 1, which is what
+// both Qwen3.5/3.6 gate checkpoints ship. Exported because the GGUF head loader
+// (`SPEC-MTP-GGUF`) resolves the same value from the same place, after
+// HfConfigFromGguf republishes it from `<arch>.nextn_predict_layers`.
+int64_t NumMtpLayers(const HfConfig& config);
+
+// Whether the checkpoint gives the MTP head its OWN embedding table rather than
+// sharing the target's (`mtp_use_dedicated_embeddings`). Both gate checkpoints
+// set it false, and the loaders reject the true case.
+bool UsesDedicatedEmbeddings(const HfConfig& config);
+
 // Load only `mtp.*` tensors through an existing checkpoint resolver. Every MTP
 // tensor is required to be BF16 (the NVFP4 checkpoint exclusion mirrored from
 // qwen3_5_mtp.py:86-103). Dedicated embeddings are rejected for this bounded
