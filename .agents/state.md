@@ -30297,3 +30297,38 @@ restriction `causal_conv1d_spec_update: conv_state must be f32, or bf16 on CUDA`
 Records: `docs/STATUS.md` (the `SPEC-MTP-GGUF` paragraph now states the measured
 run and both caveats instead of "outstanding"), `docs/BENCHMARKS.md` (the
 `QUANT-GGUF-NVFP4` entry's downstream-unblock paragraph), this log. No code change.
+- **2026-07-28 (Gemma-4 G1b — TEXT PATH STRICT 32/32, `CLAIM-GEMMA4-G1B`)** — The
+  runner heterogeneous per-layer KV head_dim change that unblocks the strict gate.
+  **The named deliverable: `KVCacheConfig` gains an OPTIONAL `per_layer_attn_specs`
+  (index==layer); `runner.cpp` `initialize_kv_cache` sizes each non-GDN layer's paged
+  KV buffer + PagedKvCache view from its OWN `FullAttentionSpec` when present, else the
+  single group spec** (a parallel per-buffer `FaDims`; the model's
+  `MakeGemma4…KVCache` publishes sliding 256 / global 512). BYTE-NEUTRAL: empty for
+  every uniform-KV model ⇒ collapses to today's uniform alloc/view/index/dispatch (the
+  sm_75-guard "additive, identical existing path" property); block table / KV manager /
+  scheduler stay head_dim-independent so no per-group block table. YOCO was already
+  correct in-forward (`kv_idx=shared?target:l`); shared layers' unused buffers still
+  allocated (memory-only G1c residual). **Gate: `unsloth/gemma-4-E4B-it` loads through
+  `LoadedEngine::FromModelDir` + greedily emits the EXACT 32 golden ids
+  `[236776,2455,5192,…]` — STRICT 32/32 token-exact vs vLLM 0.25.0**
+  (`tests/parity/test_gemma4_paged_engine.cpp`, NEW, dgx CUDA GB10 `flock` FA2-on).
+  RED→GREEN was a CHAIN: the runner fix cleared the forward's per-layer
+  `VT_CHECK(kv.head_size==Dh)`, then THREE additive loader gaps surfaced on the
+  first-ever Gemma-4 forward — (a) nested per-layer `rope_parameters` threw in
+  `hf_config.cpp` (now loads, model reads raw; test_hf_config subcase flipped to assert
+  the new load); (b) the Gemma `Replace(" "→"▁")` metaspace normalizer + `Split`
+  pre_tokenizer was rejected by the tokenizer (now folded onto the validated metaspace
+  machinery, `DetectGemmaMetaspaceNormalizer`); (c) THE forward bug — `HfConfig::raw`
+  is the FULL config (`hf_config.cpp:414`) but the G1 code read `global_head_dim`/
+  `layer_types`/`hidden_size_per_layer_input`/`num_kv_shared_layers` from `raw` where
+  they're nested under `text_config`, so EVERY layer was silently treated as sliding
+  (head_dim 256) → a full layer's o_proj `[2560,4096]` got a 2048-wide input (matmul
+  mismatch). All Gemma-4 raw reads (gemma4.cpp/gemma4_weights.cpp/gemma4_registry.cpp)
+  now go through a `text_config` view. **Inertness:** full CPU runner/KV/scheduler/
+  tokenizer/hf_config suite green (`-Werror` 0-warn, `test_runner` 120 s); OLMo-2
+  SACRED GPU re-gate 16/16 UNCHANGED on the final binary (13 strict + 3 near-tie, 0
+  divergent). The two flagged bf16 nuances (f32 PLE combine; proportional cos/sin
+  dtype) did NOT perturb the token match (32/32 exact). Residuals: YOCO cache dedup
+  (G1c), G2 vision (reuses M2a) / G3 audio, per-axis SPEED (text correctness-DONE,
+  speed-pending). dgx: re-fetched E4B (16 GB, `df` guarded ≥25 GiB), pruned after;
+  local-ai-worker restored. Not pushed.

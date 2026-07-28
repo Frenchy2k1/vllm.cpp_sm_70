@@ -657,11 +657,22 @@ TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
                          doctest::Contains("requires either alpha or factor"),
                          std::runtime_error);
   }
-  SUBCASE("nested per-layer parameters cannot silently become default") {
+  SUBCASE("nested per-layer rope loads; owning model reads it from raw (G1b)") {
+    // Gemma-4-shaped per-layer-TYPE rope. As of Gemma-4 G1b this is SUPPORTED
+    // (mirrors vLLM, which keeps per-layer-type rope configs on the model): the
+    // loader no longer aborts. There is no single flat typed rope for a
+    // heterogeneous-rope model, so the typed fields stay at their defaults and
+    // the nested structure is preserved verbatim in config.raw for the owning
+    // forward to consume (gemma4.cpp::RopeField). This is additive: no
+    // previously-loadable model reached this branch (it used to throw).
     TempJson f(prefix +
-               R"({"full_attention":{"rope_type":"default"},"sliding_attention":{"rope_type":"yarn"}}})");
-    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
-                         doctest::Contains("nested per-layer"),
-                         std::runtime_error);
+               R"({"full_attention":{"rope_type":"proportional","rope_theta":1000000.0,"partial_rotary_factor":0.25},"sliding_attention":{"rope_type":"default","rope_theta":10000.0}}})");
+    vllm::HfConfig cfg;
+    REQUIRE_NOTHROW(cfg = vllm::LoadHfConfig(f.path()));
+    CHECK(cfg.has_rope_parameters);
+    // The per-layer-type rope is intact in raw (what the model actually reads).
+    const auto& rp = cfg.raw.at("rope_parameters");
+    CHECK(rp.at("full_attention").at("rope_theta").get<double>() == 1000000.0);
+    CHECK(rp.at("sliding_attention").at("rope_theta").get<double>() == 10000.0);
   }
 }

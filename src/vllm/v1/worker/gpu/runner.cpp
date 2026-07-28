@@ -597,6 +597,29 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // group), then the per-layer layer_types tag. This is model-shape-agnostic:
   // the hybrid gate models keep a GDN group, so their path is byte-identical.
   const bool has_mamba_group = gdn_group_id_ >= 0;
+  // PER-LAYER KV head_dim (Gemma-4 G1b). When the model publishes a per-layer
+  // attention spec (heterogeneous head_dim: sliding 256 / global 512), each
+  // non-GDN layer allocates + views its OWN head_size/num_kv_heads/page_size.
+  // EMPTY for every uniform-KV model => `has_per_layer` is false => the loop
+  // uses the single group spec (Hkv/Dh/fa_page_bytes) for every layer, which is
+  // byte-identical to before this field existed (proven by the CPU paged-engine
+  // suite staying green). The block table / manager are head_dim-independent, so
+  // a single group + per-layer allocation is correct with no per-group changes.
+  const bool has_per_layer = !kv_cache_config.per_layer_attn_specs.empty();
+  if (has_per_layer) {
+    VT_CHECK(kv_cache_config.per_layer_attn_specs.size() ==
+                 static_cast<size_t>(config_.num_hidden_layers),
+             "runner: per_layer_attn_specs must have one entry per hidden layer");
+  }
+  // Per-full-attn-buffer view geometry, parallel to full_attn_buf_ (built here
+  // so the views loop below need not re-derive per-layer dims). In the uniform
+  // case every entry is {Hkv, Dh, kv_dtype} — identical to today.
+  struct FaDims {
+    int64_t num_kv_heads;
+    int64_t head_size;
+    vt::DType dtype;
+  };
+  std::vector<FaDims> fa_dims;
   for (int64_t l = 0; l < config_.num_hidden_layers; ++l) {
     const bool is_gdn =
         has_mamba_group && !config_.layer_types.empty() &&
@@ -626,23 +649,55 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       // `num_blocks * 2 * block * Hkv * Dh * sizeof(kv_dtype)`; for a future
       // MLAAttentionSpec it drops the factor 2 with no allocator change.
       // 0 bytes == 0.0 in both bf16 and f32.
+      //
+      // PER-LAYER (Gemma-4 G1b): the layer's own spec supplies its page bytes +
+      // view geometry when published; otherwise the single group spec (uniform
+      // path). `l_page` collapses to `fa_page_bytes` and `{l_Hkv,l_Dh,l_dtype}`
+      // to `{Hkv,Dh,kv_dtype}` when `has_per_layer` is false — byte-identical.
+      int64_t l_Hkv = Hkv;
+      int64_t l_Dh = Dh;
+      int64_t l_page = fa_page_bytes;
+      vt::DType l_dtype = kv_dtype;
+      if (has_per_layer) {
+        const std::shared_ptr<AttentionSpec>& sp =
+            kv_cache_config.per_layer_attn_specs[static_cast<size_t>(l)];
+        VT_CHECK(sp != nullptr,
+                 "runner: non-GDN layer has no per-layer attention spec");
+        l_Hkv = sp->num_kv_heads;
+        l_Dh = sp->head_size;
+        l_dtype = sp->dtype;
+        l_page = sp->page_size_bytes();
+        // Same guard as the group spec: the PagedKvCache view carries ONE
+        // head_size, so an asymmetric-V layer is not expressible in it.
+        if (const auto* full_sp = dynamic_cast<const FullAttentionSpec*>(sp.get())) {
+          VT_CHECK(full_sp->head_size_v == full_sp->head_size,
+                   "runner: asymmetric head_size_v is not expressible in the "
+                   "per-layer PagedKvCache view");
+        }
+        VT_CHECK(l_page > 0,
+                 "runner: per-layer attention spec reported a non-positive page");
+      }
       full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
-          static_cast<size_t>(num_blocks_) * static_cast<size_t>(fa_page_bytes),
+          static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
           kv_cache_backend_resident_));
+      fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype});
     }
   }
 
-  // Build the views over the (now stable) backing storage.
+  // Build the views over the (now stable) backing storage. `fa_dims` is parallel
+  // to `full_attn_buf_`; in the uniform case every entry is {Hkv, Dh, kv_dtype}.
+  VT_CHECK(fa_dims.size() == full_attn_buf_.size(),
+           "runner: per-layer KV view geometry out of sync with buffers");
   attn_kv_.clear();
-  for (auto& b : full_attn_buf_) {
+  for (size_t i = 0; i < full_attn_buf_.size(); ++i) {
     PagedKvCache kv;
-    kv.data = b->data();
-    kv.dtype = kv_dtype;
+    kv.data = full_attn_buf_[i]->data();
+    kv.dtype = fa_dims[i].dtype;
     kv.num_blocks = num_blocks_;
     kv.block_size = fa_block_size;
-    kv.num_kv_heads = Hkv;
-    kv.head_size = Dh;
+    kv.num_kv_heads = fa_dims[i].num_kv_heads;
+    kv.head_size = fa_dims[i].head_size;
     attn_kv_.push_back(kv);
   }
 

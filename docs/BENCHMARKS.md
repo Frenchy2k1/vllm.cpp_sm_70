@@ -38,6 +38,25 @@ a golden capture); the two `MODEL-MM-gemma4-*` rows stay SPIKE, now blocked only
 implementation (the PLE/YOCO/Gemma-4-MoE backbone plus the SigLIP and USM-Conformer
 towers).
 
+## Gemma-4 G1b text path STRICT 32/32 (2026-07-28, `CLAIM-GEMMA4-G1B`) - correctness gate landed, speed pending
+
+`benchmark_binding=false`. G1b landed the runner PER-LAYER KV head_dim change
+(`KVCacheConfig::per_layer_attn_specs`, consumed in `runner.cpp` initialize_kv_cache)
+that unblocked Gemma-4's heterogeneous 256 (sliding) / 512 (global) KV heads, plus
+three additive loader gaps (nested `rope_parameters`, the Gemma `Replace` metaspace
+normalizer, and reading Gemma-4 scalars from `raw["text_config"]`). **Correctness:
+`unsloth/gemma-4-E4B-it` loads through our engine and greedily emits the EXACT 32
+golden token ids — STRICT 32/32 token-exact vs the vLLM 0.25.0 golden**
+(`tests/parity/test_gemma4_paged_engine.cpp`, dgx CUDA GB10, `flock`, FA2 on).
+**Byte-neutral inertness (the RED line for existing models):** the per-layer field is
+empty for every uniform-KV model, so allocation/view/indexing/dispatch are
+unchanged - proven by the full CPU runner/KV/scheduler/tokenizer/hf_config suite
+(green, `test_runner` 120 s incl.) and the **OLMo-2-0425-1B SACRED GPU gate 16/16
+UNCHANGED** on the final binary. No throughput number is owed at this checkpoint:
+Gemma-4 text is correctness-complete, per-axis speed vs vLLM is the named residual
+(alongside G1c YOCO cache dedup + the G2 vision / G3 audio towers). Reproduce (dgx):
+`cmake --build build --target test_gemma4_paged_engine && flock ~/gpu.lock ./build/tests/test_gemma4_paged_engine`.
+
 ## Gemma-4 G1 text backbone (2026-07-28, `CLAIM-GEMMA4-G1`) - correctness bring-up, no speed number owed
 
 `benchmark_binding=false`. G1 implemented the `Gemma4ForConditionalGeneration` text

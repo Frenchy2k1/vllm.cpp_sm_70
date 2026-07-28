@@ -210,6 +210,35 @@ bool DetectMetaspace(const json& doc, std::string& replacement,
   return true;
 }
 
+// The modern SentencePiece tokenizer.json (Gemma-4, and some Llama-3-SP
+// variants) expresses metaspace NOT as a single `Metaspace` pre_tokenizer but
+// as a `Replace(" " -> "▁")` NORMALIZER plus a `Split(" ", MergedWithPrevious)`
+// pre_tokenizer. HF tokenizers treats this pair as EQUIVALENT to
+// Metaspace(replacement="▁", split=false, prepend_scheme="never"): the
+// normalizer maps every literal space to ▁ and the merged-with-previous split
+// keeps the ▁ attached to the following word — exactly the metaspace layout. We
+// fold it onto the SAME validated metaspace machinery (space->▁ encode, ▁->space
+// decode). Returns true iff the normalizer + pre_tokenizer are exactly this
+// Gemma pair. Additive: no previously-loadable tokenizer used this shape (the
+// bare `Replace` normalizer used to fail loudly in CheckNormalizer).
+bool DetectGemmaMetaspaceNormalizer(const json& doc) {
+  const auto nz = doc.find("normalizer");
+  if (nz == doc.end() || !nz->is_object()) return false;
+  if (nz->value("type", "") != "Replace") return false;
+  const auto pat = nz->find("pattern");
+  if (pat == nz->end() || !pat->is_object()) return false;
+  if (pat->value("String", "") != " ") return false;
+  if (nz->value("content", "") != "\xE2\x96\x81") return false;  // ▁ = U+2581
+  const auto pt = doc.find("pre_tokenizer");
+  if (pt == doc.end() || !pt->is_object()) return false;
+  if (pt->value("type", "") != "Split") return false;
+  if (pt->value("behavior", "") != "MergedWithPrevious") return false;
+  const auto ppat = pt->find("pattern");
+  if (ppat == pt->end() || !ppat->is_object()) return false;
+  if (ppat->value("String", "") != " ") return false;
+  return true;
+}
+
 // Parses an HF byte-fallback token "<0xNN>" (case-insensitive hex) to its byte
 // value, or -1 if `token` is not exactly a 6-char "<0xNN>" form. Mirrors HF
 // tokenizers `ByteFallback` decode (decoders/byte_fallback.rs).
@@ -484,7 +513,13 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
   if (!doc.is_object()) Fail("top-level JSON is not an object");
 
   Tokenizer tok;
-  CheckNormalizer(doc);
+  // Gemma-4 metaspace-via-normalizer+split (see DetectGemmaMetaspaceNormalizer):
+  // recognized BEFORE CheckNormalizer, whose whitelist would otherwise reject the
+  // `Replace(" "->"▁")` normalizer. Folded onto the SentencePiece family with the
+  // metaspace layout (replacement "▁", split=false, prepend "never" — the Replace
+  // form maps existing spaces only, no implicit prefix).
+  const bool gemma_metaspace = DetectGemmaMetaspaceNormalizer(doc);
+  if (!gemma_metaspace) CheckNormalizer(doc);
   // Dispatch on the pre_tokenizer FAMILY: a bare `Metaspace` node selects the
   // SentencePiece family (Mistral/Gemma); everything else is byte-level BPE and
   // goes through DetectPattern (which fails loudly on Metaspace, so the two
@@ -493,7 +528,12 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
   std::string ms_scheme;
   bool ms_split = true;
   std::string unk_token;  // model.unk_token, resolved to an id below
-  if (DetectMetaspace(doc, ms_repl, ms_scheme, ms_split)) {
+  if (gemma_metaspace) {
+    tok.family_ = Family::kSentencePiece;
+    tok.metaspace_replacement_ = "\xE2\x96\x81";  // ▁
+    tok.metaspace_split_ = false;
+    tok.prepend_scheme_ = PrependScheme::kNever;
+  } else if (DetectMetaspace(doc, ms_repl, ms_scheme, ms_split)) {
     tok.family_ = Family::kSentencePiece;
     if (ms_repl.empty()) Fail("Metaspace has empty replacement");
     tok.metaspace_replacement_ = ms_repl;
