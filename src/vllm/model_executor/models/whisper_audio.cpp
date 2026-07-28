@@ -205,7 +205,7 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
       LinearBias(q, kb, n1.tensor(), kw->tensor(), /*bias=*/nullptr);
       LinearBias(q, vb, n1.tensor(), vw->tensor(), &vbi->tensor());
     }
-    // full bidirectional attention, [L, nh, hd].
+    // full bidirectional attention, [L, nh, hd]. Kernel selection (default = flash).
     Tensor q3 = qb.tensor(); q3.rank = 3; q3.shape[0] = L; q3.shape[1] = nh; q3.shape[2] = hd;
     q3.stride[0] = nh * hd; q3.stride[1] = hd; q3.stride[2] = 1;
     Tensor k3 = kb.tensor(); k3.rank = 3; k3.shape[0] = L; k3.shape[1] = nh; k3.shape[2] = hd;
@@ -228,16 +228,29 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
     // vllm/model_executor/models/whisper.py WhisperEncoderAttention (:255) ->
     // forward (:298-317) self.attn(q,k,v) dispatches the encoder self-attention to
     // the flash-attn varlen (non-causal, full) backend @ e24d1b24 — a
-    // fully-SM-filling flash kernel, never the O(t^2) scalar path. VT_WHISPER_ENC_EAGER=1
-    // restores the naive kernel for the same-binary A/B.
-    static const bool enc_eager = [] {
+    // fully-SM-filling flash kernel, never the O(t^2) scalar path.
+    //
+    // DEFAULT: vt::AttentionDenseFlash — the SHARED-MEMORY-TILED flash kernel (§14).
+    // The warp AttentionDenseFast above is O(t^2) memory-bound: it re-reads all 1500
+    // keys/values from global memory once per (query,head), ~21 ms/layer of K reads
+    // alone with zero cross-query tile reuse. AttentionDenseFlash streams K/V in
+    // shared-memory tiles reused across a block of query-warps (FA2 tiling), with the
+    // BIT-IDENTICAL per-warp online-softmax recurrence ⇒ token-identical output.
+    // Same-binary A/B knobs: VT_WHISPER_ENC_EAGER=1 → naive kAttention;
+    // VT_WHISPER_ENC_WARP=1 → warp AttentionDenseFast (the pre-§14 default).
+    static const int enc_attn = [] {
       const char* e = std::getenv("VT_WHISPER_ENC_EAGER");
-      return e != nullptr && e[0] == '1';
+      if (e != nullptr && e[0] == '1') return 0;  // naive
+      const char* w = std::getenv("VT_WHISPER_ENC_WARP");
+      if (w != nullptr && w[0] == '1') return 1;  // warp
+      return 2;                                   // flash-tiled (default)
     }();
-    if (enc_eager)
+    if (enc_attn == 0)
       vt::Attention(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
-    else
+    else if (enc_attn == 1)
       vt::AttentionDenseFast(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
+    else
+      vt::AttentionDenseFlash(q, ao.tensor(), q3, k3, v3, vt::AttentionArgs{scale, /*causal=*/false});
     // out_proj + residual.
     Tensor ao2 = ao.tensor(); ao2.rank = 2; ao2.shape[0] = L; ao2.shape[1] = H;
     ao2.stride[0] = H; ao2.stride[1] = 1;

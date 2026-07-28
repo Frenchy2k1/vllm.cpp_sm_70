@@ -1488,6 +1488,58 @@ one-time encoder weights (bit-identical, the S7 fix #1 for the tower's marshalli
 round-trip (MEDIUM, byte-exact). The audio DECODE axis stays DONE-on-speed (S12, 0.97x, BEATS);
 audio TTFT/encoder stays **speed-pending / PARTIAL**. No mm row advances to DONE this pass.
 
+**MULTIMODAL SPEED - AUDIO ENCODER TTFT lever #1 LANDED: flash-TILED non-causal hd-64 attention -
+byte-exact, real 1.82x kernel win, still NOT at parity (2026-07-28, `CLAIM-MM-SPEED-AUDIO-ENC-KERNEL`
+[spec](../.agents/specs/multimodal-speed.md) S14).** `benchmark_binding=false` (single-seq test
+driver; vLLM graphed is the honest denominator). Base local `main` `af1ed76b`. dgx GB10 sm_121a
+`~/vllmcpp-mmspeed`, clean CUDA `build-cuda` cutlass 4.5.0 + FA2 arch 121a ("CUTLASS found" +
+"FlashAttention-2 ... ENABLED for [121a]" banners CONFIRMED, `-Werror` 0-warn); ALL GPU under
+`flock $HOME/gpu.lock` sole owner (`nvidia-smi` idle, `local-ai-worker` absent), rep0 dropped.
+Implements the S13.5 residual lever #1. **KERNEL:** new `vt::AttentionDenseFlash`
+(`OpId::kAttentionDenseFlash`, `src/vt/cuda/cuda_ops.cu`) - a block of `kFlashBr=16` query-warps
+(512 threads) SHARES each streamed `kFlashBc=64`-column K/V tile out of shared memory (classic
+FlashAttention K/V tiling, structure-ported from the vendored FA2
+`src/vt/cuda/flash_attn/src/flash_fwd_kernel.h:52` `compute_attn_1rowblock` - sK/sV shared tiles +
+the `for(int n_block...)` K/V-tile stream), killing the warp kernel's O(t-squared) redundant global
+K/V re-reads. The per-warp online-softmax math (per-lane head_dim grouping, butterfly `__shfl_xor`,
+sequential j-order, f32 accumulation) is copied VERBATIM from `AttentionWarpKernel`, so the only
+change is that K/V bytes come from shared memory instead of global => output BIT-IDENTICAL =>
+token-identical. Encoder routed to it by default (`whisper_audio.cpp`; `VT_WHISPER_ENC_WARP=1` = warp
+`AttentionDenseFast`, `VT_WHISPER_ENC_EAGER=1` = naive, for the A/B). `kAttention`/`kAttentionDenseFast`
+untouched => text/vision byte-identical. **SAME-BINARY A/B** (nsys `cuda_gpu_kern_sum` for the
+per-layer attention; throwaway env-gated `steady_clock` `VT_ENC_REPS` around the encoder forward, NOT
+committed; 5 reps rep0 dropped):
+
+| Vehicle | warp `AttentionDenseFast` (`VT_WHISPER_ENC_WARP=1`) | flash `AttentionDenseFlash` (ships, default) | delta | vs vLLM 0.25.0 TTFT 43 ms |
+|---|---|---|---|---|
+| Voxtral encoder self-attention (nsys, per layer x 32) | **35.11 ms/layer** (31.07-36.78, x32 = 1123 ms) | **19.29 ms/layer** (19.26-19.37, x32 = 617 ms) | **1.82x faster, NON-OVERLAPPING** | - |
+| Voxtral Whisper encoder forward (1500 frames, 32 layers) | **~1834 ms** (1827-1846) | **~1375 ms** (1368-1389) | **-459 ms (1.33x faster)** | 43x -> **~32x slower (NOT closed)** |
+
+**Proof-of-run:** nsys of the default arm shows `vt::cuda::AttentionDenseFlashKernel` 32 instances
+(= 32 encoder layers) and ZERO `AttentionWarpKernel` / naive `AttentionKernel` on the encoder path.
+**Correctness (RED line, HELD):** `test_voxtral_e2e` **16/16** default-flash (strict prefix 18/48,
+teacher-force PASS, seq 48/48); flash/warp/eager token dumps (`VLLM_VOXTRAL_OUT_TOKENS`) md5-IDENTICAL
+(`89923566...`) => the flash kernel flips ZERO tokens; goldens md5 UNCHANGED (`voxtral_golden.json
+8ab87b7e...`, `voxtral_neartie.json 937b9ad3...`, before == after). RED: corrupting the kernel
+(`p * Load(sV,...) * 2`) rebuilt => gate 13/16 FAILURE => restore => 16/16. `compute-sanitizer
+--tool memcheck` **0 errors**; 3 default runs byte-identical. **HONEST verdict - NOT at parity:**
+~1.37 s encoder TTFT vs vLLM's 43 ms (~32x, was ~44x). The flash tiling is a genuine same-math win but
+modest (1.8x not the naive ~16x reuse factor) because GB10 L2 already served much of the warp kernel's
+"redundant" global K/V reads - the real wall is now the serial-latency-bound scalar warp-per-query
+recurrence over 1500 keys, plus ~0.75 s of per-call host weight marshalling + conv round-trip. **Ranked
+residual (grounded, not implemented):** (1) a tensor-core MMA hd-64 non-causal FA2 instantiation
+(split-K across the 1500 keys - the vendored FA2 ships hd {128,192,256} only; the true gap-closer,
+LARGE); (2) resident one-time encoder weights + drop the conv round-trip (~0.75 s, MEDIUM, byte-exact).
+**Repro:** `git archive` the commit to `dgx.casa:~/vllmcpp-mmspeed`, `cmake -S . -B build-cuda
+-DVLLM_CPP_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DVLLM_CPP_CUDA_ARCHITECTURES=121a && cmake --build build-cuda --target test_voxtral_e2e`; then
+`STF=~/.cache/huggingface/hub/models--mistralai--Voxtral-Mini-3B-2507/snapshots/*/consolidated.safetensors;
+flock $HOME/gpu.lock env VLLM_VOXTRAL_SAFETENSORS=$STF nsys profile -t cuda --stats=false -o /tmp/f
+./build-cuda/tests/test_voxtral_e2e; nsys stats --report cuda_gpu_kern_sum /tmp/f.nsys-rep | grep
+AttentionDenseFlash` (add `VT_WHISPER_ENC_WARP=1` for the warp arm). The audio DECODE axis stays
+DONE-on-speed (S12, 0.97x, BEATS); audio TTFT/encoder stays **speed-pending / PARTIAL**. No mm row
+advances to DONE this pass.
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =

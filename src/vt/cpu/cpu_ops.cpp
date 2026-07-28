@@ -2375,6 +2375,10 @@ struct Registrar {
     // optimization); byte-identical to kAttention on CPU.
     RegisterOp(OpId::kAttentionDenseFast, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
+    // Flash-tiled dense attention is a CUDA shared-memory optimization; byte-identical
+    // to kAttention on CPU.
+    RegisterOp(OpId::kAttentionDenseFlash, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
     RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernel)));
