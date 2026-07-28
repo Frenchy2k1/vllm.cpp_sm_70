@@ -30939,3 +30939,30 @@ ledger. Records-only; no build/GPU/download/benchmark.
   rows created (no inventory-count bump); no `src/`/`tests/`/README/Metal
   touched. All six record checkers rc=0. NEXT (separate claims): create the
   three missing rows and pick up the HIGH gaps in priority order.
+- **2026-07-28** — **DeepSeek-V4-Flash W3 primitives landed (`CLAIM-DEEPSEEK-V4-W3`,
+  base `main` `308c312a`, isolated worktree, CPU-only, foreground, NOT pushed).**
+  User-directed "implement anyway": the full-model gate is multi-Spark-blocked
+  (156.7 GiB, does not fit one GB10; forward also needs MHC + sqrtsoftplus/hash MoE),
+  so W3 lands the FORWARD CODE for the genuinely-NEW-vs-V2/V3 attention math as
+  portable host references + unit-gates each. New additive TUs
+  `include/vllm/model_executor/models/deepseek_v4_dsa.h` +
+  `src/vllm/model_executor/models/deepseek_v4_dsa.cpp` (5 functions): **(A) DSA
+  "Lightning Indexer" sparse SELECTION** — `DsaIndexerWeightFold`,
+  `DsaIndexerLogits` (`Σ_h w·ReLU(q·k)`, the per-head ReLU is load-bearing),
+  `DsaTopkSelect` (short-context all-select / causal top-`index_topk=512`); **(B)
+  512-wide MLA output seams V2/V3 lack** — `SoftmaxWithSink` + `GroupedOutputLora`
+  (`wo_a` bmm→`wo_b`). Gate `tests/vllm/models/test_deepseek_v4_dsa.cpp` **13/13·38**
+  — hand-derived literals + double-precision references (rel-L2 < 1e-6), clean CPU
+  `-Wall -Werror -Wextra` 0-warn. Honest gate form: hand-case + structural review vs
+  vLLM `file:line`, NOT a dumped-oracle rel-L2 (the fixed-config 167B arch is not
+  constructible at a tiny shape) — stated as such. SACRED-inert: additive only, shared
+  `mla_attention`/`cuda_mla_attn` UNTOUCHED (shared-mla extraction = named W7 follow-on);
+  `test_deepseek_v4_scaffold` still 4/4·40. New kernel row `KERNEL-ATTN-DSA-SPARSE-INDEX`
+  (`SPIKE`, checker count 37→38). **SGLang `v0.5.15` DOES register+implement
+  `DeepseekV4ForCausalLM`** (full DSA/MHC/o_lora stack, 2856 LoC) ⇒ a viable second
+  benchmark/primitive-dump reference (same single-GB10 memory limit) — recorded.
+  Records: `specs/deepseek-v4-flash.md` §W3, `model-matrix.md`, `kernel-matrix.md`,
+  `feature-matrix.md`, `roadmap_v1.md`, `coordination.md`, `docs/STATUS.md`,
+  `docs/BENCHMARKS.md`, `parity-ledger.md`, this entry. Residuals: MHC (W5),
+  sqrtsoftplus/hash MoE (W6), device kernel + forward integration (W7), full strict
+  gate (W8) = multi-Spark. NEXT: W4/W5/W6 per the spec once ≥2 Sparks / offload stands up.

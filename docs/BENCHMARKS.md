@@ -432,6 +432,21 @@ single Spark (needs multi-node TP / offload / smaller quant), so no binding
 throughput number is reachable yet; none is taken or promised here. Spec + W-plan:
 [deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md). No source/engine path touched.
 
+**DeepSeek-V4-Flash W3 attention primitives (2026-07-28, `CLAIM-DEEPSEEK-V4-W3`, NOT
+pushed).** Disposition: **NOT APPLICABLE (correctness/primitive brick, host CPU
+reference + unit gate; no run, no download, no throughput number taken, claimed, or
+owed; `benchmark_binding=false`).** Ported + unit-gated the genuinely-new-vs-V2/V3
+attention math: the DSA "Lightning Indexer" sparse top-k SELECTION (weighted-MQA logit
+`Σ_h w·ReLU(q·k)` with a load-bearing per-head ReLU + causal top-512 select), per-head
+attention-sink softmax, and grouped output-LoRA (`deepseek_v4_dsa.{h,cpp}`,
+`test_deepseek_v4_dsa` 13/13·38, clean CPU `-Wall -Werror -Wextra`). Honest gate form:
+hand-derived literals + double-precision references (rel-L2 < 1e-6), NOT a dumped-oracle
+rel-L2 (the fixed-config 167B arch is not constructible at a tiny shape). SACRED-inert
+(shared `mla_attention` untouched). The full-model speed gate remains multi-Spark-blocked
+(156.7 GiB); MHC/MoE/device-kernel/forward-integration are named W5-W8 residuals. SGLang
+v0.5.15 registers `DeepseekV4ForCausalLM` (full DSA/MHC stack) — a viable second
+reference for a future primitive-dump or 2-Spark benchmark. No source/engine path touched.
+
 **Kimi K3 W0 SCOPE spike (2026-07-28, `CLAIM-KIMI-K3-SCOPE`, NOT pushed).**
 Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Scopes
