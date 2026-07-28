@@ -76,6 +76,11 @@ server, use `build/examples/vllm-cli --model <dir> --prompt "..."`.
   compressed blocks, with no BF16 expansion.
 - **External KV.** KV offload to CPU/disk and an `lm://` LMCache client, plus KV-cache events for
   external routers. Opt-in, off by default.
+- **SGLang-compatible knobs.** RadixAttention / prefix caching, LPM cache-aware scheduling,
+  jump-forward decoding, and custom logits processors, opt-in from the library, C ABI, or server
+  flags (`--enable-radix-attention`, `--scheduling-policy lpm`, `--enable-jump-forward`). Each
+  defaults to today's behavior; when and whether to turn them on is
+  [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md).
 - **Backends.** CUDA, CPU, Metal, and Vulkan from one source tree.
 
 Per-capability lifecycle state, active gaps, and the next gate for each: [docs/STATUS.md](docs/STATUS.md).

@@ -475,6 +475,26 @@ std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_value
   Buf f1(b, q, DType::kBF16, {L, I});
   Buf f2(b, q, DType::kBF16, {L, H});
 
+  // Vision self-attention kernel selection (per-forward; the forward runs once per
+  // image so getenv cost is nil). DEFAULT: vt::AttentionDenseFlash — the
+  // SHARED-MEMORY-TILED flash kernel (spec §14/§16). Its per-warp online-softmax
+  // recurrence is BYTE-FOR-BYTE the AttentionDenseFast (AttentionWarpKernel) math —
+  // identical per-lane head_dim grouping, identical butterfly reduction, identical
+  // sequential j-order — only K/V are read from shared-memory tiles reused across a
+  // block of query-warps instead of re-streamed from global per (query,head). So the
+  // output is BIT-IDENTICAL to the warp kernel (token-identical, goldens unchanged),
+  // while killing AttentionDenseFast's O(t^2) redundant global K/V reads over the 784
+  // non-causal patches. Same-binary A/B knobs: VT_QWEN3VL_ATTN_WARP=1 → warp
+  // AttentionDenseFast (the pre-§16 default); VT_QWEN3VL_ATTN_EAGER=1 → naive
+  // kAttention. kAttention (text/audio decode) is untouched by all three.
+  const int vis_attn = [] {
+    const char* e = std::getenv("VT_QWEN3VL_ATTN_EAGER");
+    if (e != nullptr && e[0] == '1') return 0;  // naive kAttention
+    const char* w = std::getenv("VT_QWEN3VL_ATTN_WARP");
+    if (w != nullptr && w[0] == '1') return 1;  // warp AttentionDenseFast
+    return 2;                                   // flash-tiled AttentionDenseFlash (default)
+  }();
+
   for (int64_t l = 0; l < cfg.depth; ++l) {
     const DevBlock& db = dw.blocks[static_cast<size_t>(l)];
     // norm1
@@ -516,12 +536,16 @@ std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_value
       for (int64_t f = 0; f < nframes; ++f) {
         Tensor qf = frame_slice(q3, f), kf = frame_slice(k3, f),
                vf = frame_slice(v3, f), aof = frame_slice(ao.tensor(), f);
-        // Warp-scoped fast dense attention (vision tower is head_dim 72,
-        // non-causal). nsys attributed ~99% of the tower forward to the naive
-        // AttentionKernel; the warp variant keeps the same f32 online-softmax
-        // math. kAttention (text/audio) is untouched. Gated by the STRICT image
-        // e2e (32/32) + tower unit gates.
-        vt::AttentionDenseFast(q, aof, qf, kf, vf, vt::AttentionArgs{scale, /*causal=*/false});
+        // Dense non-causal attention, head_dim 72, windowed per frame (image
+        // grid_t==1 == single 784-patch window). Default flash-tiled (byte-identical
+        // to warp; see vis_attn above). kAttention (text/audio) is untouched.
+        const vt::AttentionArgs aargs{scale, /*causal=*/false};
+        if (vis_attn == 0)
+          vt::Attention(q, aof, qf, kf, vf, aargs);
+        else if (vis_attn == 1)
+          vt::AttentionDenseFast(q, aof, qf, kf, vf, aargs);
+        else
+          vt::AttentionDenseFlash(q, aof, qf, kf, vf, aargs);
       }
     }
     // proj + residual.

@@ -159,9 +159,62 @@ share the idea) or OUT-OF-SCOPE.
 
 | ID | Item | Anchor | Our mapping / anchor | Class | Notes |
 |---|---|---|---|---|---|
-| `SGLANG-ORACLE-PERF` | stand up the SGLang PERF oracle on GB10 (arm64 cu130 image), wire into the existing preflight harness, re-pin P1→v0.5.15, close P2 image/model/GPU classification | image `lmsysorg/sglang:v0.5.15-cu130@sha256:d0a667e`; `bench_serving.py:874-887` | reuse `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` (`tools/bench/*serve_low*`, `scripts/dgx-sglang-low-concurrency.sh`) | INVENTORIED | Rank 1 in [oracle spec §6](specs/sglang-parity-oracle.md); unblocks every binding SGLang perf number. Blocker is disk + unified-memory caution, not new code. |
+| `SGLANG-ORACLE-PERF` | stand up the SGLang PERF oracle on GB10 (arm64 cu130 image), wire into the existing preflight harness, re-pin P1→v0.5.15, close P2 image/model/GPU classification | image `lmsysorg/sglang:v0.5.15-cu130@sha256:d0a667e`; `bench_serving.py:874-887` | reuse `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` (`tools/bench/*serve_low*`, `scripts/dgx-sglang-low-concurrency.sh`) | **STOOD UP + FIRST FLOOR MEASURED** (`CLAIM-SGLANG-PERF-BENCH`, 2026-07-28) | SGLang v0.5.15 arm64 cu130 image PULLED + RAN the 27B-NVFP4 gate model on GB10 sm_121a ("server is fired up and ready to roll", CUDA graphs captured) — **no from-source build, as predicted**. Cache-neutral c8/c16 floor measured (see § "Perf oracle results" below). Residuals: 35B, c1/c2/c4, and the shared-prefix cache-ON arm. |
 | `SGLANG-ORACLE-CORRECT` | SGLang greedy token-capture correctness cross-check on a shared dense model | oracle spec §3 | new parity capture reusing the SACRED harness | INVENTORIED | A regression net + divergence detector; vLLM already binds correctness, so lower urgency. |
 | `SGLANG-ALIAS` | `--enable-radix-attention` CLI alias + C-ABI `enable_prefix_caching` tri-state field | `server_args.py:755` | CLI `examples/server/main.cpp:185`; C-ABI `include/vllm.h:100` (field to add); engine row `KV-SGLANG-RADIX-CACHE` RW1 | INVENTORIED | Trivial ergonomics over the shipped APC; reuses `tests/parity/test_qwen3_apc_e2e.cpp`. (Counted under INVENTORIED as unstarted implementation work.) |
+
+## Perf oracle results — cache-neutral, 27B-NVFP4 (`CLAIM-SGLANG-PERF-BENCH`, 2026-07-28)
+
+First measured SGLang-vs-ours competitor-floor comparison. vllm.cpp `7e9ffbff`
+(main HEAD) vs SGLang `v0.5.15-cu130` arm64 (`@sha256:d0a667e`, arch digest
+`ce9667f4`) in SGLang's production config (overlap scheduler + radix cache
+default-on, CUDA graphs captured, `--mem-fraction-static 0.30`). **Model:**
+`unsloth/Qwen3.6-27B-NVFP4` snapshot `890bdef7` (dense hybrid mamba+attention,
+byte-identical weights both arms). **Workload:** deterministic custom corpus
+(seed 0, 80 prompts × 1024 in / 128 out tokens exact, common-prefix ≤32 =
+cache-neutral), greedy (temp 0, top-p 1, `ignore_eos`), `--request-rate inf`,
+KV capacity 20480 tokens matched both arms. **Client:** `sglang.bench_serving`
+(`sglang-oai` vs `vllm` OpenAI-completions path). **Box:** idle GB10 sm_121a,
+one `flock $GPU_LOCK`, engines strictly sequential (SGLang fully torn down — GPU
+freed + MemAvailable returned to baseline — before ours launched). **Reps:** 3
+each after an untimed warmup; all within run-noise (CV mostly <0.1%). Equivalence
+proof: both arms drove the identical corpus, both emitted exactly 80×128 output
+tokens with 0 errors, identical peak concurrency (c16→21, c8→13). Evidence
+(dgx): `~/work/sglang-bench-HEAD/evidence/raw/27/{sglang,ours}/c{8,16}-r{1,2,3}.jsonl`.
+
+Median of 3 reps; higher-is-better ↑, lower-is-better ↓; ratio normalized so
+`>1.0` = ours wins:
+
+| Axis | c16 SGLang | c16 ours | c16 ratio | c8 SGLang | c8 ours | c8 ratio |
+|---|---|---|---|---|---|---|
+| Total throughput tok/s ↑ | 367.3 | **812.5** | **2.21× WIN** | 367.2 | **529.1** | **1.44× WIN** |
+| Output throughput tok/s ↑ | 40.8 | **90.3** | **2.21× WIN** | 40.8 | **58.8** | **1.44× WIN** |
+| Requests/s ↑ | 0.319 | **0.705** | **2.21× WIN** | 0.319 | **0.459** | **1.44× WIN** |
+| Mean TTFT ms ↓ | 33425 | **2980** | **11.2× WIN** | 11289 | **1775** | **6.4× WIN** |
+| Median TTFT ms ↓ | 33867 | **2714** | **12.5× WIN** | 18158 | **1638** | **11.1× WIN** |
+| P99 TTFT ms ↓ | 49561 | **7220** | **6.9× WIN** | 18198 | **3589** | **5.1× WIN** |
+| Mean TPOT ms ↓ | **104.0** | 154.4 | 0.67× GAP | **104.0** | 122.9 | 0.85× GAP |
+| Mean ITL ms ↓ | **105.6** | 154.4 | 0.68× GAP | **105.7** | 122.9 | 0.86× GAP |
+| Median ITL ms ↓ | **105.5** | 125.2 | 0.84× GAP | **105.5** | 109.9 | 0.96× ~tie |
+| Peak mem GB (proxy) ↓ | **~54.9** | ~56.4 | ~1.03× ~tie | — | — | — |
+
+**Honest verdict.** Ours decisively BEATS the SGLang v0.5.15 floor on aggregate
+throughput (2.21× at c16, 1.44× at c8) and on TTFT/prefill (6–12× lower) on the
+cache-neutral burst — our scheduler admits and drains the burst with near-zero
+queue vs SGLang's 33 s / 11 s queue waits. SGLang WINS the steady-state
+per-token decode-latency axis (TPOT/ITL 1.18–1.49× lower than ours): our higher
+throughput comes from packing larger decode batches, which raises per-request
+per-token latency. **This TPOT/ITL deficit is a reproduced OPEN GAP — a candidate
+future lever, recorded honestly, not explained away.** Peak memory (system
+MemAvailable delta on the unified pool; nvidia-smi is N/A) is comparable, ours
+~1.5 GB higher — indicative not binding. **Residuals (named):** 35B-A3B-NVFP4 not
+run; low-concurrency c1/c2/c4 not run (SGLang c1 ran ~13.3 s/it → impractical for
+3-rep reproduction this pass); shared-prefix cache-ON arm
+(`BACKEND-GATE-CUDA-SGLANG-PREFIX`, RadixAttention vs our APC) not run; vLLM arm
+not re-measured here (this is the SGLang floor specifically; vLLM stays the
+behavior oracle); greedy token-exact cross-check (`SGLANG-ORACLE-CORRECT`)
+separate/pending. Not the full P2 binding grid (which additionally requires the
+vLLM arm + full c{1,2,4,8,16}).
 
 ---
 
