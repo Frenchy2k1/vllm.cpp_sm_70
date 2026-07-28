@@ -1717,6 +1717,161 @@ void AttentionDenseFastKernelCuda(Queue& q, Tensor& out, const Tensor& query, co
   }
 }
 
+// AttentionDenseFlash — a SHARED-MEMORY-TILED flash variant of AttentionWarpKernel
+// with the BIT-IDENTICAL per-warp online-softmax recurrence, structured so that a
+// block of `kFlashBr` query-warps SHARES each streamed K/V tile out of shared
+// memory instead of re-reading all K/V from global once PER (query,head). This is
+// the classic FlashAttention K/V-tiling: K and V are streamed into shared memory in
+// tiles of `kFlashBc` columns and reused across the whole query block, killing the
+// O(t^2) redundant global K/V reads that make AttentionWarpKernel memory-bound
+// (§13.5: ~21 ms/layer of K reads alone at 1500 frames, no cross-query tile reuse).
+// Ported 1:1 in STRUCTURE from the vendored FlashAttention-2 forward kernel
+// (src/vt/cuda/flash_attn/src/flash_fwd_kernel.h compute_attn_1rowblock :52 — sK/sV
+// shared tiles :163-165, the `for (int n_block ...)` K/V-tile stream + online
+// rescale), and cross-checked to vLLM's non-causal encoder attention dispatch
+// (vllm/model_executor/models/whisper.py WhisperEncoderAttention:255). Unlike the
+// cute/MMA FA2 (head_dim {128,192,256}, paged-KV), this is a scalar warp-per-query
+// kernel for the DENSE single-request head_dim-64 encoder layout — so the ARITHMETIC
+// is byte-for-byte the AttentionWarpKernel recurrence (same per-lane head_dim
+// grouping lane+32k, same butterfly __shfl_xor, same sequential j-order 0..t-1, same
+// f32 accumulation) with K/V bytes sourced from shared memory rather than global.
+// Because every float op and its order are unchanged, the output is BIT-IDENTICAL to
+// AttentionDenseFast ⇒ token-identical by construction; kAttention (text decode) is
+// untouched. One q-head per CTA (all warps share the same GQA kv-head g).
+constexpr int kFlashBr = 16;  // query-warps per CTA (= K/V global-read reuse factor)
+constexpr int kFlashBc = 64;  // key/value columns streamed per shared-memory tile
+
+template <typename Tin, typename Tout>
+__global__ void AttentionDenseFlashKernel(Tout* out, const Tin* query, const Tin* key,
+                                          const Tin* value, int64_t hq, int64_t hk, int64_t d,
+                                          int64_t t, float scale, bool causal) {
+  constexpr int kMaxPerLane = 8;  // head_dim up to 256
+  extern __shared__ __align__(16) char flash_smem[];
+  Tin* sK = reinterpret_cast<Tin*>(flash_smem);
+  Tin* sV = sK + static_cast<int64_t>(kFlashBc) * d;
+
+  const int warp = static_cast<int>(threadIdx.x >> 5);
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  const int nthreads = kFlashBr * 32;
+  const int64_t h = blockIdx.y;             // q-head (one per CTA)
+  const int64_t g = h / (hq / hk);          // shared kv-head for every warp in CTA
+  const int64_t qi = static_cast<int64_t>(blockIdx.x) * kFlashBr + warp;  // this warp's query
+  const bool active = qi < t;
+  const int npl = static_cast<int>((d + 31) / 32);  // head_dim elements this lane owns
+
+  // This warp's query row, in registers (identical layout to AttentionWarpKernel).
+  float qreg[kMaxPerLane];
+  float acc[kMaxPerLane];
+#pragma unroll
+  for (int k = 0; k < kMaxPerLane; ++k) {
+    qreg[k] = 0.0f;
+    acc[k] = 0.0f;
+  }
+  if (active) {
+    const int64_t qoff = (qi * hq + h) * d;
+    for (int k = 0; k < npl; ++k) {
+      const int e = lane + 32 * k;
+      if (e < d) qreg[k] = Load(query, qoff + e);
+    }
+  }
+  float m = -CUDART_INF_F, l = 0.0f;
+
+  // Non-causal: every warp scans keys [0, t). Causal: up to the max query in this
+  // block; each warp then stops at its own qi (same 0..jmax order as the warp kernel).
+  const int64_t block_qmax =
+      min(static_cast<int64_t>(blockIdx.x) * kFlashBr + (kFlashBr - 1), t - 1);
+  const int64_t key_end = causal ? (block_qmax + 1) : t;
+
+  for (int64_t c0 = 0; c0 < key_end; c0 += kFlashBc) {
+    const int tile = static_cast<int>(min(static_cast<int64_t>(kFlashBc), key_end - c0));
+    // Cooperative load of this K/V tile into shared memory (all warps participate).
+    __syncthreads();
+    for (int idx = static_cast<int>(threadIdx.x); idx < tile * static_cast<int>(d);
+         idx += nthreads) {
+      const int jj = idx / static_cast<int>(d);
+      const int e = idx % static_cast<int>(d);
+      const int64_t off = ((c0 + jj) * hk + g) * d + e;
+      sK[idx] = key[off];
+      sV[idx] = value[off];
+    }
+    __syncthreads();
+    if (!active) continue;
+    // This warp's online-softmax update over the tile — bit-identical math to
+    // AttentionWarpKernel, K/V now read from shared memory.
+    const int64_t jstop = causal ? min(static_cast<int64_t>(tile), qi - c0 + 1)
+                                 : static_cast<int64_t>(tile);
+    for (int64_t j = 0; j < jstop; ++j) {
+      const int64_t base = j * d;
+      float part = 0.0f;
+#pragma unroll
+      for (int k = 0; k < kMaxPerLane; ++k) {
+        const int e = lane + 32 * k;
+        if (k < npl && e < d) part += qreg[k] * Load(sK, base + e);
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
+      const float s = part * scale;
+      const float m_new = fmaxf(m, s);
+      const float corr = expf(m - m_new);
+      const float p = expf(s - m_new);
+#pragma unroll
+      for (int k = 0; k < kMaxPerLane; ++k) {
+        const int e = lane + 32 * k;
+        if (k < npl && e < d) acc[k] = acc[k] * corr + p * Load(sV, base + e);
+      }
+      l = l * corr + p;
+      m = m_new;
+    }
+  }
+  if (!active) return;
+  const int64_t qoff = (qi * hq + h) * d;
+  const float inv = 1.0f / l;
+  for (int k = 0; k < npl; ++k) {
+    const int e = lane + 32 * k;
+    if (e < d) Store(out, qoff + e, acc[k] * inv);
+  }
+}
+
+template <typename Tin>
+void LaunchAttentionDenseFlash(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& key,
+                               const Tensor& value, const AttentionArgs& args) {
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  if (t == 0 || hq == 0 || d == 0) return;
+  VT_CHECK(d <= 256, "cuda attention-dense-flash: head_dim <= 256 only");
+  const unsigned nblk = static_cast<unsigned>((t + kFlashBr - 1) / kFlashBr);
+  const dim3 grid(nblk, static_cast<unsigned>(hq));
+  const size_t shmem = static_cast<size_t>(2) * kFlashBc * d * sizeof(Tin);  // sK + sV
+  switch (out.dtype) {
+    case DType::kF32:
+      AttentionDenseFlashKernel<Tin, float><<<grid, kFlashBr * 32, shmem, s>>>(
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk, d, t,
+          args.scale, args.causal);
+      break;
+    case DType::kBF16:
+      AttentionDenseFlashKernel<Tin, __nv_bfloat16><<<grid, kFlashBr * 32, shmem, s>>>(
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk, d,
+          t, args.scale, args.causal);
+      break;
+    default: VT_CHECK(false, "cuda attention-dense-flash: unsupported out dtype");
+  }
+  Check(cudaGetLastError(), "attention-dense-flash launch");
+}
+
+void AttentionDenseFlashKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                                   const Tensor& value, const AttentionArgs& args) {
+  switch (query.dtype) {
+    case DType::kF32:
+      LaunchAttentionDenseFlash<float>(AsStream(q), out, query, key, value, args);
+      break;
+    case DType::kBF16:
+      LaunchAttentionDenseFlash<__nv_bfloat16>(AsStream(q), out, query, key, value, args);
+      break;
+    default:
+      VT_CHECK(false, "cuda attention-dense-flash: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // fused_chain (TDR): the Tier-1 single-pass INTERPRETER over the canonical
 // (out, x, weight, residual) 4-operand shape. The Tier-0 composite is device-
@@ -1902,6 +2057,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernelCuda)));
     RegisterOp(OpId::kAttentionDenseFast, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionDenseFastKernelCuda)));
+    RegisterOp(OpId::kAttentionDenseFlash, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionDenseFlashKernelCuda)));
     RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernelCuda)));
