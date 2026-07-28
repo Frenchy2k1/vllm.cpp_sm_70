@@ -25,6 +25,16 @@ used as new claims. Tier (T0–T3) remains per porting-inventory.
 the surpass track (roadmap_v1.md "Protocol evolution") builds beyond it, never
 instead of it.
 
+**Feature-gap sweep (2026-07-28, `CLAIM-FEATURE-GAP-SPIKE`):** a whole-surface
+scan of pinned vLLM `555967922` vs these matrices ranked what we are MISSING —
+8 HIGH, ~19 MED, ~16 LOW. Full grounded list (each gap with vLLM `file:line`,
+our-status, effort, priority) in
+[specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md). Top
+HIGH misses: LoRA runtime, the pooling/embedding/rerank task class, AWQ+GPTQ
+compute, xgrammar, fp8-KV, reasoning parsers. Three MED gaps have no stable row
+yet (flagged below): generic draft-model/Medusa spec decode, offline Batch API,
+the plugin system. Confirmed NON-gap: vLLM has removed prompt adapters.
+
 ---
 
 ## 1. Engine core & scheduling
@@ -188,6 +198,7 @@ is configured, exactly as upstream loads its draft model on demand.
 | TLI heterogeneous-vocabulary spec decode | `v1/spec_decode/vocab_mapping.py`, `config/speculative.py` | ☐ T1 | target↔draft ID mapping and shared-token constrained logits; current upstream validation is greedy draft only; inventory row `SPEC-TLI` | `planned: specs/tli-spec-decode.md` |
 | ngram (draft-free proposer) | `v1/spec_decode/ngram_proposer.py` | ✅ **DONE (`SPEC-NGRAM`, 2026-07-27)** | Draft-FREE suffix-ngram matcher (KMP-LPS, 1:1 port) wired as a third method reusing the MTP/DFlash verify/reject/`take_draft_token_ids` loop. 27B gate: 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted; unit 19/19; spec-OFF byte-identical (SACRED 235/235 + MTP 9/9 + DFlash 27/27); no new kernel | [specs/spec-decode-breadth-d3.md](specs/spec-decode-breadth-d3.md) |
 | EAGLE3 | `v1/spec_decode/eagle.py` | 🚫 **SCOPED — reachable-blocked (`SPEC-EAGLE3`)** | Port designed (reuses DFlash D5 separate-draft loader + D1 aux multi-tap). BLOCKED: no ungated oracle-runnable EAGLE3 draft arch/checkpoint for a Qwen3.6 gate model at pin `555967922` (registry has no `Eagle3Qwen3_5*`; z-lab published DFlash not EAGLE3). No fabricated gate | [specs/spec-decode-breadth-d3.md](specs/spec-decode-breadth-d3.md) |
+| Generic separate draft-model + Medusa + EAGLE-base + suffix (spec breadth) | `v1/spec_decode/draft_model.py:19` (`"draft_model"`), `medusa.py:18` (`"medusa"`), `eagle.py:10` (`"eagle"`), `suffix_decoding.py:9` (`"suffix"`) | ☐ **RECORDS-GAP** T1 | We have MTP/DFlash/ngram/DSpark/TLI/EAGLE3-scope, but NOT the classic model-agnostic separate-draft path, Medusa multi-head, base EAGLE, or suffix decoding. `mlp_speculator` is config-valid upstream but has NO v1 runtime branch (nothing owed). Recommend new rows `SPEC-DRAFT-MODEL` / `SPEC-MEDUSA` on pickup (feature-gap sweep) | [specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md) |
 
 ## 9. Serving surface (OpenAI API, endpoints, CLI, library)
 
@@ -206,7 +217,9 @@ is configured, exactly as upstream loads its draft model on demand.
 | CLI: `serve` + `bench {latency,throughput,serve}` | `entrypoints/cli/` | `PARTIAL` T0 | separate server/bench binaries and one in-process benchmark; server now exposes `max_num_seqs`/`max_num_batched_tokens` for reproducible operating points, but no matching command family | `planned: specs/cli-serve-bench.md` |
 | CLI: `chat`, `complete` | `entrypoints/cli/` | ☐ T1 | examples/cli covers basic complete | `planned: specs/cli-chat-complete.md` |
 | `/v1/embeddings`, `/pooling`, `/score`, `/rerank` | pooling routers | ☐ T2 | with pooling models (§4) | `planned: specs/pooling-endpoints.md` |
-| `/v1/responses`, `/v1/messages` (Anthropic-style), audio | responses/messages routers | ☐ T2 | | `planned: specs/responses-messages-endpoints.md` |
+| `/v1/responses`, `/v1/messages` (Anthropic-style), audio | responses/messages routers | ☐ T2 | includes `/v1/responses`(+retrieve/cancel) `responses/api_router.py:48`, `/v1/messages`(+count_tokens) `anthropic/api_router.py:49`, and the audio `/v1/audio/{transcriptions,translations}` `speech_to_text/transcription/api_router.py:31` — we have Whisper/Voxtral encode+decode but the transcription ENDPOINT is unwired (`SERVE-RESPONSES-MESSAGES`) | `planned: specs/responses-messages-endpoints.md` |
+| Offline Batch API (`/v1/batches`, file runner) | `entrypoints/openai/run_batch.py:793` (`run_batch`); batched chat/embed/score/transcription/translation | ☐ **RECORDS-GAP** T2 | async bulk-job format with no stable row; recommend `SERVE-BATCH-API` on pickup (feature-gap sweep) | [specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md) |
+| Plugin system (general / io_processor / platform / endpoint plugins) | `plugins/__init__.py:18,77`; `plugins/io_processors/interface.py:19`; `plugins/endpoint_plugins/interface.py:43` | ☐ **RECORDS-GAP** T2 | entry-point-discovered extensibility seam; directly serves the extensibility-first priority (additive HW/models/endpoints). Recommend `ENG-PLUGIN-SYSTEM` on pickup | [specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md) |
 | Sleep/pause/resume, profiling, RL weight-update endpoints | various | ☐ T2–T3 | | `planned: specs/admin-endpoints.md` |
 | OTLP tracing | `config/observability.py` | ☐ T2 | | `planned: specs/otlp-tracing.md` |
 
@@ -214,8 +227,9 @@ is configured, exactly as upstream loads its draft model on demand.
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| LoRA runtime (punica-style batched apply) | `lora/`, `v1/worker/lora_model_runner_mixin.py` | ☐ T2 | no runtime in-tree (verified: field placeholders only) | `planned: specs/lora-runtime.md` |
-| LoRA dynamic load/unload endpoints | `entrypoints/openai/` | ☐ T2 | after runtime | `planned: specs/lora-endpoints.md` |
+| LoRA runtime (punica-style batched apply) | `lora/lora_model.py:60`, `lora/punica_wrapper/punica_gpu.py:33`, `lora/ops/triton_ops/lora_shrink_op.py`, `v1/worker/lora_model_runner_mixin.py:30` | ☐ T2 (**HIGH**, feature-gap sweep) | no runtime in-tree (verified: field placeholders only); highest-demand missing user feature (`LORA-RUNTIME`) | `planned: specs/lora-runtime.md` |
+| LoRA dynamic load/unload endpoints + resolver | `entrypoints/serve/lora/api_router.py:43,59`, `lora/resolver.py:14` | ☐ T2 | `POST /v1/{load,unload}_lora_adapter`; after runtime (`LORA-ENDPOINTS`) | `planned: specs/lora-endpoints.md` |
+| Prompt adapters | — | ☑ **NON-GAP** | vLLM `555967922` has REMOVED prompt adapters entirely (no `PromptAdapter` in `vllm/`); nothing owed | — |
 
 ## 11. Long context & attention breadth
 

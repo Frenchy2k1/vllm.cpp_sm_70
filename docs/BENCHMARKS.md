@@ -16,6 +16,14 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## vLLM feature-gap analysis (2026-07-28, `CLAIM-FEATURE-GAP-SPIKE`) - NOT-APPLICABLE (records-only spike)
+
+No benchmark. A CPU/research sweep of pinned vLLM `555967922` (0.26.0.dev0) vs
+our matrices produced a ranked map of what we are MISSING (8 HIGH, ~19 MED, ~16
+LOW), grounded in vLLM `file:line`. No build, no GPU, no measurement; no speed
+number is owed. Full list in
+[`.agents/specs/vllm-feature-gap-analysis.md`](../.agents/specs/vllm-feature-gap-analysis.md).
+
 ## Gemma-4 multimodal W0, oracle-gateability run-verified + greedy golden captured (2026-07-28, `CLAIM-GEMMA4-W0`) - correctness anchor, no speed number owed
 
 **What ran.** The pinned vLLM 0.25.0 oracle (transformers 5.13.1) loaded, ran,
