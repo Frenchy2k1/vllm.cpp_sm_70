@@ -118,6 +118,43 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**Decode per-token latency (TPOT/ITL) lever EXPLORATION — hypothesis CONFIRMED
+(2026-07-28, `CLAIM-DECODE-LATENCY-EXPLORE`, DONE — measurement only, NOT pushed;
+FULL SHA reported to caller).** User-directed: CONFIRM/REFUTE the
+`CLAIM-SGLANG-PERF-BENCH` attributed hypothesis ("our throughput win IS the
+latency cost — larger decode batches raise per-request ITL") and characterize the
+lever. Base local `main` HEAD `348ae7c9`; isolated worktree
+`.claude/worktrees/agent-a435b290a37d1e715`; dgx GB10 sm_121a, ONE
+`flock $HOME/gpu.lock`, idle box, serialized vs campaign #2; build tree
+`~/work/decode-lat-348ae7c`. **PURE MEASUREMENT — no source/engine/kernel/scheduler
+changed, no default flipped.** **What it did.** (1) Source-scanned both step
+compositions: ours mixes prefill+decode via chunked prefill and packs to
+`max_num_seqs` (`src/vllm/v1/core/sched/scheduler.cpp:267,280,431,432`); SGLang
+runs **prefill-first, non-mixed** steps (`managers/scheduler.py:2598,2700,3041` @
+`f63458b`). (2) Swept OUR decode batch B∈{1,2,4,8,16} and measured ITL/TPOT
+(27B-NVFP4, 1024/128, greedy, ignore_eos, `--max-num-seqs 16`, 2 reps, CV<1%).
+(3) nsys'd the decode step at B=1 vs B=16. **Result — CONFIRMED batch-composition,
+REFUTED kernel-inefficiency:** ITL(1)=**101.75 ms** is already BELOW SGLang's
+op-point ITL (104–105 ms) → no per-token kernel deficiency; ITL rises
+monotonically with B (101.75→**158.5 ms** @ B16; median 101.7→131.1); nsys shows
+every hot kernel (NVFP4 nvjet/cutlass GEMMs, GDN mamba) is **sub-linear** in batch
+(1.6–1.8× for 16× tokens → per-token cost ↓~10×). SGLang's effective decode
+concurrency ≈4 (40.8 tok/s ÷ 1000/105 ms), not 16 — its 33 s admission queue keeps
+few decoding → low ITL, low throughput. **Same lever.** Tradeoff curve measured;
+knob = `max_num_seqs` / `max_num_batched_tokens` (both already exist); recommended
+latency-oriented point `max_num_seqs≈8` (ITL −21%, still 1.38× SGLang throughput);
+default stays throughput-oriented (unchanged). **Owns ONLY records (no source,
+README, or Metal):** `.agents/specs/decode-latency-lever.md` (new, full data),
+`.agents/sglang-matrix.md` (`SGLANG-ORACLE-PERF` gap row annotated), `docs/BENCHMARKS.md`
+(ITL-vs-batch measurement + repro), `.agents/roadmap_v1.md` (lever disposition),
+`docs/STATUS.md` (finding note — no source touched), this claim,
+`.agents/parity-ledger.md`, `.agents/state.md`. **Residuals:** 35B not swept; the
+~8% matched-batch step-overhead residual + mixed-prefill p99 tail not attributed
+to a named kernel (nsys shows no gross deficiency — low priority); SGLang not
+re-profiled (ITL from recorded floor per "no re-standup" scoping). Evidence dgx
+`~/work/decode-lat-348ae7c/{sweep_out/sweep_results.jsonl,nsys_out/decode_b{1,16}.nsys-rep}`;
+sqlite + source tarball pruned (disk 98%-full shared box).
+
 **SGLang PERF oracle stand-up + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, DONE — reproduced, NOT pushed; FULL SHA reported to
 caller).** User side-quest "do the benchmarks": stand up live SGLang and
