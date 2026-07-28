@@ -100,40 +100,6 @@ measured and is deliberately NOT estimated, so no ratio is asserted between the
 two. Reproduce: `python3 benchmarks/demo/concurrency_race.py` and `python3
 benchmarks/demo/footprint.py`.
 
-**FOOTPRINT RE-MEASURED APPLES-TO-APPLE ON THE CUDA BINARY (2026-07-28,
-`CLAIM-DEMO-FOOTPRINT-CUDA`).** Disposition: **the 2026-07-27 caveat is RESOLVED —
-both sides now freshly measured on the SAME GB10 (dgx.casa), and the vllm.cpp side
-is the CUDA fast-path build, not CPU.** Build: `cmake -S . -B build-cuda
--DVLLM_CPP_CUDA=ON -DVLLM_CPP_SERVER=ON -DCMAKE_BUILD_TYPE=Release
--DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`; configure banners confirm
-`cutlass-nvfp4 ENABLED [121a]`, `cutlass-fp8 ENABLED [121a]`, `FlashAttention-2
-prefill/decode ENABLED [121a]` (so cutlass 4.5.0 + the vendored FA-2 device code
-are really linked). `cmake --build build-cuda --target server vllm_shared`.
-**vllm.cpp install = one stripped CUDA `server` binary = 68,974,608 bytes
-(65.78 MiB)** (`strip`; `stat -c %s`); it statically links `libvllm.a`, so this
-single file is the whole deployment (`libvllm.so`, 65.66 MiB stripped, is the
-alternative library form of the same code, NOT an additional file). **`ldd
-build-cuda/examples/server`: the ONLY non-system deps are `libcudart.so.13`
-(0.67 MiB) and `libcublasLt.so.13` (600.76 MiB), both from the SYSTEM CUDA toolkit
-`/usr/local/cuda-13.0` present on any GB10;** everything else is base OS runtime
-(libc/libm/libstdc++/libgcc_s/...). **vllm.cpp therefore BUNDLES ZERO CUDA
-userspace** and reuses the system CUDA runtime, whereas vLLM bundles its own copies
-inside its pip `nvidia-*` wheels (3,144.7 MiB, counted in its bar) — the system
-CUDA bytes are named in the card footnote, NOT silently dropped. **vLLM side
-re-measured same box (`du -sk -L ~/venvs/vllm-oracle` = 9,542,288 KiB = 9,318.6 MiB
-= 9.10 GiB; venv symlink resolves to `vllm-oracle-v0.25.0-stage`, `import vllm` →
-0.25.0, torch 2.11.0+cu130 — the 0.26.0.dev0 pin is currently rolled back on this
-box):** `nvidia` 3,144.7 MiB, `flashinfer_cubin` 1,853.8 MiB, `torch` 912.8 MiB,
-`triton` 600.3 MiB, `nvidia_cutlass_dsl` 192.4 MiB, everything else 2,614.6 MiB.
-**HONEST STORY CHANGE:** the earlier CPU figure (9.85 MiB) understated the real
-install; the true CUDA binary is 65.8 MiB, so the install gap is **9.10 GiB vs
-65.8 MiB = ~142× smaller** (or ~14× even if the system `libcublasLt` is charged
-against vllm.cpp) — materially smaller than the old CPU-vs-CUDA framing implied,
-but still a large, honest, like-for-like gap. Reproduce: rebuild as above on a
-GB10, then `python3 benchmarks/demo/footprint.py` renders
-`benchmarks/media/footprint.png` from `benchmarks/demo/footprint_gb10.json` (every
-value carries a `_source` naming the measuring command).
-
 **FA2 Ampere enablement (WA-1) BUILD-VERIFY — `ROAD-V1-D1-CUDA` first brick
 (2026-07-27, `CLAIM-CUDA-AMPERE-SCOPE`).** Disposition: **ACCEPTED BUILD-VERIFY
 evidence — NO throughput number (a board is needed for that; `benchmark_binding=false`).**
@@ -3467,6 +3433,55 @@ arrive, so the running max keeps moving and corr is rarely exactly 1.0. The eigh
 scalar `sdiag` reads plus the branch then cost more than the eight mma they guard.
 The idea would fare better on a non-causal or short-context shape, which is not
 this workload.
+
+---
+
+## MLX SHAPE-GATED to prefill: 96.4% -> 99.1% of MLX-LM (2026-07-28)
+
+The question "should we drop MLX, since it is slower?" was tested and answered
+NO. Re-measured on current main with an MLX build and `VT_OP_PROVIDER_DISABLE=mlx`
+as the same-binary lever, MLX is **11% FASTER on prefill** (537 ms TTFT against
+602 — essentially mlx-lm's own 534) and 47% slower on decode. So the right
+disposition is neither on nor off but **shape-gated**.
+
+**Two changes, and the second is what made the first work.**
+
+1. **MLX declines `m < 2`** — exactly the decode GEMV. Its steel GEMM wins
+   prefill's ~112 large calls; its per-op `mx::eval` + output memcpy loses
+   decode's ~112 calls PER TOKEN.
+2. **The decline fallback is resolved once.** `GetOpFallback` walks the provider
+   stack, re-reads device caps and does an atomic on EVERY call. Fine when
+   declines are rare; a shape-gated provider declines ~21,500 times per decode
+   run, and paying it each time measured **27.2 -> 17.8 tok/s**. A function-local
+   static fixes it. **This was a latent cost for ANY declining provider.**
+   The decline COUNT is now taken separately via `NoteOpDecline`, because hoisting
+   the lookup must not silently hoist the accounting with it — that regression was
+   caught by `stats.declines >= 1` failing, which is the test doing its job.
+
+**Same-window result:**
+
+| | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill TTFT | **524.5 ms** | 537 ms | **2.3% faster** |
+| decode | 27.28 | 27.44 | 99.4% |
+| **warm total** | **24.40** | 24.61 | **99.1%** |
+
+**Correctness.** The DEFAULT build is byte-identical to before — the change lives
+entirely in `metal_mlx_provider.mm`, which is not compiled without
+`VLLM_CPP_MLX`. It passes 16/16 SACRED, 112300 Metal and 1643 op assertions. The
+MLX build passes 112327.
+
+An MLX build produces a DIFFERENT greedy sequence, because MLX's GEMM is not
+bit-identical to ours. That is **pre-existing and not introduced here**: verified
+by building `origin/main` WITH MLX and watching the same gate fail (anchor drift
+prompt[0] tok=1) before any of this. MLX remains a build-time opt-in and a
+numerics-deviating configuration; its own golden is future work, and the default
+golden must NOT be re-anchored to an MLX build.
+
+Test updates, all deliberate: `mlx_declines` now asserts the shape-gate DIRECTION
+(decode declines, prefill does not) rather than "never declines"; `saw_mm` is
+`#ifdef`-gated because with MLX built in, m > 1 is delegated by design and the
+native mm kernel is covered by the default build instead.
 
 ---
 

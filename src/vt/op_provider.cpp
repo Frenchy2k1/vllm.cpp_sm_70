@@ -382,6 +382,10 @@ void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) 
   return next->fn;
 }
 
+void NoteOpDecline(OpId op, DeviceType device) {
+  At(op, device).declines.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool OpRegistered(OpId op, DeviceType device) {
   // Meaning (unchanged, and load-bearing for the fused-recipe fast-realization
   // ladder and the cross-device harness): is there a NATIVE kernel for
