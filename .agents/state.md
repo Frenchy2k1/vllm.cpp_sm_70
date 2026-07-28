@@ -28919,3 +28919,37 @@ session building a paired harness so our own A/Bs would not be read off two runs
 then compared against a two-run external baseline. The reference needs the same
 discipline as the candidate. Downstream consumers of the wrong number (LocalAI
 PR #11137) were corrected in the same pass.
+
+---
+
+## 2026-07-28 — final standing: the remaining gap is ENTIRELY decode
+
+With MLX shape-gated, **prefill is AHEAD** (524.5 ms vs 532.6, +1.5%). The whole
+2.4% deficit is decode:
+
+```
+decode  ours 36.72 ms/tok  mlx-lm 35.91  gap 0.81 ms/tok
+  GEMV            34.2 ms  (~99 GB/s, 83% of peak — at the wall)
+  our attn+other   2.52 ms
+  their attn+other 1.71 ms
+```
+
+**Identified lever: GQA-grouped decode attention.** At qpk=2 the current kernel
+launches one threadgroup per (q-head, token), streaming the SAME kv head twice —
+117 MB/token where 59 is unique. It already runs at 77 GB/s against a probed
+69 GB/s ceiling, so it is NOT inefficient; it reads the data twice. Grouping to
+one threadgroup per (KV head, token) saves **0.67 ms/tok = 82% of the gap**,
+putting decode at 27.74 vs 27.85.
+
+**Implemented once; single-run regression (26.53 vs 27.24); never paired-verified;
+branch deleted, so the kernel is GONE.** Suspected cause is the flash-decoding
+trap: grouping halves threadgroups (16 -> 8), so traffic halves but parallelism
+does too. On re-attempt: (a) QPK must be a TEMPLATE parameter — the prefill query
+tiling proved a runtime bound stops MSL unrolling and spills the accumulators into
+thread-private memory; (b) verify with scripts/metal-paired-ab.py, since a single
+run is what mis-called it the first time.
+
+**Session close: 89.4% -> 95.9% default, 97.6% with MLX gated to prefill.** Six
+kernels landed plus the MLX shape gate and the provider fallback hoist. Not
+parity; the last 2.4% has one identified lever with arithmetic behind it and a
+known implementation hazard.
