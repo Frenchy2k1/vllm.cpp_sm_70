@@ -110,6 +110,37 @@ needs the E4B checkpoint): `scripts/mm/g2_vision_weight_dump.py` (weights),
 `scripts/mm/g2_vision_ref_dump.py` (intermediate refs), then run
 `test_gemma4_vision_tower` with `VLLM_GEMMA4_VISION_WEIGHTS` + `VLLM_GEMMA4_VISION_REFS`.
 
+## Gemma-4 G3 C++ USM-Conformer audio tower - per-stage gates PASS (2026-07-28, `CLAIM-GEMMA4-G3`) - correctness gate landed, speed pending
+
+`benchmark_binding=false` (audio-tower correctness milestone - the tower is proven in
+ISOLATION vs the transformers-eager reference, same cadence as the G2-impl vision
+tower and Qwen3-VL M2a; no engine audio-decode path yet, so no throughput number is
+owed). The C++ tower (`gemma4_audio.{h,cpp}`, an additive standalone host-f32 TU) +
+the audio projector are proven faithful stage-by-stage vs the committed refs on the
+dev-box CPU build (`tests/vllm/multimodal/test_gemma4_audio_tower.cpp`, 1256/1256):
+subsample rel-L2 **5.4e-7**, position-embeddings **8.9e-8**, block0 **4.2e-7**,
+block_mid **3.8e-7**, block_last **4.4e-6**, output_proj **5.9e-6**, projected
+merge-input **6.3e-6** - f32-EXACT (the residual is only f64-vs-f32 accumulation
+order). T=250 mel frames -> S=63 soft tokens; head_dim 128, 8 heads, 12 layers.
+Ported 1:1 from `modeling_gemma4.py` @ 5.13.1: 2xConv2d subsample (k3s2p1 +
+LayerNorm-no-bias + ReLU + mask stride) -> relative positional encoding -> 12
+Conformer layers (half-step feed-forwards, chunked-local attention [chunk 12, past
+window 12, Transformer-XL relative-position bias, tanh soft-cap 50, per-dim-scale
+softplus], GLU + depthwise-causal-conv light-conv k5) -> output_proj -> audio
+embedder. The FINITE QAT activation clamps (`use_clipped_linears=True`) are
+implemented; **RED-first**: an initial wrong sliding window (13 keys) drove
+block_mid to 2.8e-2 / projected to 0.31, and the fix to the source semantics
+(`dist = q_idx - kv_idx in [0,12)`, 12 keys) took every stage to ~1e-6. No new vt op
+(pure host f32, device-neutral). The tower is device-neutral so no GPU was used;
+the oracle reference was dumped on dgx CPU-only (no `gpu.lock`). Inertness by
+construction (standalone TU not referenced by the registry/runner - text
+`test_gemma4_paged_engine` STRICT 32/32 + the G2 vision gates byte-identical). Speed
+(a device-resident bf16 forward) and the audio->text e2e (the Gemma-4 audio feature
+extractor + engine merge-plumbing) are the named residuals. Reproduce: dump the
+reference + weights with `scripts/mm/g3_audio_tower_ref.py` (dgx CPU, E4B cached),
+then run `test_gemma4_audio_tower` with `VLLM_GEMMA4_AUDIO_WEIGHTS` set to the dumped
+weight dir (refs come from the committed golden `tests/parity/goldens/gemma4_e4b_audio/`).
+
 ## Gemma-4 G1 text backbone (2026-07-28, `CLAIM-GEMMA4-G1`) - correctness bring-up, no speed number owed
 
 `benchmark_binding=false`. G1 implemented the `Gemma4ForConditionalGeneration` text

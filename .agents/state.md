@@ -31061,3 +31061,48 @@ enumeration faithfulness + reject + MXFP4-refuse). Files:
 `docs/STATUS.md`, `docs/BENCHMARKS.md`, `parity-ledger.md`, `coordination.md`, this
 entry. Row stays SPIKE (no on-box e2e; forward not implemented). NEXT: W1 proxy
 primitive gate on Kimi-Linear-48B (shares the KDA kernel campaign, DGX-blocked).
+- **2026-07-28 — Gemma-4 G3: C++ USM-Conformer AUDIO tower + audio projector LANDED, per-stage gates PASS (`CLAIM-GEMMA4-G3`, NOT pushed; base `main` `308c312a`).**
+  The Gemma-4 third-modality tower is implemented as a standalone additive TU
+  (`include/vllm/model_executor/models/gemma4_audio.{h}` +
+  `src/…/gemma4_audio.cpp`) and proven faithful stage-by-stage vs the
+  transformers-eager reference (`test_gemma4_audio_tower`, dev-box host f32,
+  **1256/1256**): subsample rel-L2 5.4e-7, posemb 8.9e-8, block0 4.2e-7,
+  block_mid 3.8e-7, block_last 4.4e-6, output_proj 5.9e-6, projected 6.3e-6 —
+  f32-EXACT (residual = f64-vs-f32 accumulation order). T=250 mel frames → S=63
+  soft tokens; head_dim 128, 8 heads, 12 layers. Ported 1:1 from
+  `modeling_gemma4.py` @ 5.13.1: 2×Conv2d subsample (k3s2p1 + `nn.LayerNorm`-no-bias
+  over channels + ReLU + `mask[::2]`) → input_proj → rel-pos-enc → 12 Conformer
+  layers (ff1 half-step ·0.5 → CHUNKED-LOCAL attn [chunk 12, past window 12,
+  Transformer-XL `_rel_shift`, softcap 50, `per_dim_scale` softplus] → light-conv
+  [GLU + depthwise causal Conv1d k5] → ff2 → norm_out) → output_proj(+bias) →
+  embed_audio (RMSNorm-noweight + Linear→2560). E4B `use_clipped_linears=True`
+  FINITE trained QAT clamps implemented on every `Gemma4ClippableLinear`.
+  **RED-first:** the initial wrong sliding window (`kj∈[qi-12,qi]`, 13 keys) →
+  block_mid 2.8e-2 / block_last 0.22 / projected 0.31 RED; fixing to the source
+  `sliding_window_mask_function((12,0))` semantics (`dist=q_idx-kv_idx∈[0,12)`,
+  12 keys) → all ~1e-6 GREEN. ZERO new `vt::` op / kernel (host f32,
+  device-neutral, correctness-first). **Inertness by construction** (NEW standalone
+  TU not referenced by registry/runner ⇒ text `test_gemma4_paged_engine` STRICT
+  32/32 + the G2-impl vision gates byte-identical); full `libvllm` + every test TU
+  re-link clean; `-Werror` 0-warn both new TUs (CPU). **DGX** `dgx.casa` used ONLY
+  read-only CPU (`CUDA_VISIBLE_DEVICES=""`, NO GPU, NO `gpu.lock`) for the oracle
+  per-stage tower dump (`scripts/mm/g3_audio_tower_ref.py`) + E4B audio-weight
+  dump — E4B was ALREADY cached, NO fetch, disk left at 52 GiB. Gemma-4 now has
+  all three modalities tower-proven (text STRICT 32/32, vision per-stage, audio
+  per-stage). **RESIDUAL (named, honest):** audio→text e2e = the Gemma-4 audio
+  feature extractor (A1 mel frontend + soft-token count) + the engine mm-plumbing
+  (SupportsMultiModal, hasher/encoder-cache, masked-scatter merge at `<audio>`,
+  decode fork) — same residual class as the G2-impl vision tower; the tower +
+  projector (the merge INPUT) are proven; `input_features` here is a dumped golden.
+  The device-resident bf16 forward (speed) + the audio e2e GPU golden are named
+  residuals.
+- **Records:** `specs/gemma4-multimodal.md` (§G3 + USM-Conformer port map + the
+  per-stage gate table + §1 disposition), `model-matrix.md` (mm row + summary row
+  → tri-modal towers proven, owner `CLAIM-GEMMA4-G3`), `coordination.md`
+  (`CLAIM-GEMMA4-G3`), `kernel-matrix.md` (G3 note: no new kernel — host f32),
+  `feature-matrix.md`, `roadmap_v1.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`
+  (NOT-APPLICABLE — tower-in-isolation correctness gate), the golden fixture
+  `tests/parity/goldens/gemma4_e4b_audio/`, `parity-ledger.md` + this entry. All 6
+  record checkers rc=0. NEXT: the audio→text e2e (feature extractor + engine
+  merge-plumbing, shared with the G2 image e2e residual) + device-resident bf16
+  speed.

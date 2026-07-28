@@ -543,11 +543,99 @@ follow-on. Speed (device-resident weights + fused device clamp) is also pending.
 
 ---
 
+## G3 — C++ USM-Conformer AUDIO TOWER LANDED, per-stage gates PASS (2026-07-28, `CLAIM-GEMMA4-G3`)
+
+The C++ USM-Conformer audio tower is implemented as a standalone additive TU
+(`include/vllm/model_executor/models/gemma4_audio.h` +
+`src/vllm/model_executor/models/gemma4_audio.cpp`) and **proven faithful
+stage-by-stage vs the transformers-eager reference** — the A2/G2-impl ladder,
+committed golden `tests/parity/goldens/gemma4_e4b_audio/audio_refs/`, weights via
+`scripts/mm/g3_audio_tower_ref.py`, gate `tests/vllm/multimodal/test_gemma4_audio_tower.cpp`.
+Tower-in-isolation milestone; **audio→text e2e wiring is the named residual**
+(exactly the G2-impl vision cadence). Gemma-4 now has all three modalities
+tower-proven (text STRICT 32/32, vision per-stage, audio per-stage).
+
+### G3.0 Per-stage gate result (MEASURED, dev-box host f32)
+
+| Stage | rel-L2 vs ref | band | verdict |
+|---|---|---|---|
+| subsample (2×Conv2d k3s2p1 + LN-no-bias + ReLU + input_proj) | **5.4e-7** | 2e-4 | ✅ f32-exact |
+| position_embeddings (inv_timescales, sin\|cos, [13,1024]) | **8.9e-8** | 1e-5 | ✅ |
+| block0 (conformer layer 0) | **4.2e-7** | 5e-4 | ✅ |
+| block_mid (layer 6) | **3.8e-7** | 1e-3 | ✅ |
+| block_last (layer 11) | **4.4e-6** | 2e-3 | ✅ |
+| output_proj (== last_hidden_state, [63,1536]) | **5.9e-6** | 2e-3 | ✅ |
+| projected (embed_audio RMSNorm-noweight + Linear→2560) | **6.3e-6** | 3e-3 | ✅ merge-input |
+
+`T=250` mel frames → `S=63` soft tokens; head_dim 128, 8 heads, 12 layers.
+1256/1256 assertions, SUCCESS. The residual is pure f64-vs-f32 accumulation order
+— the USM-Conformer MATH is bit-faithful. **RED-first:** the initial wrong sliding
+window (`kj∈[qi-12,qi]`, 13 keys) drove block_mid 2.8e-2 / block_last 0.22 /
+projected 0.31 RED; the fix → all ~1e-6 GREEN.
+
+### G3.1 USM-Conformer port map (grounded 1:1, `modeling_gemma4.py` @ 5.13.1)
+
+- **Subsample** (`Gemma4AudioSubSampleConvProjection` :385-412) — `input_features`
+  [T,128] `unsqueeze(1)` → 2× `Gemma4AudioSubSampleConvProjectionLayer` (:357):
+  mask-zero the padded time rows → **Conv2d(k3,s2,p1,bias-free)** → **`nn.LayerNorm`
+  over the CHANNEL dim (elementwise_affine, NO bias)** → **ReLU** → `mask[:, ::2]`;
+  channels 1→128→32, then `permute(0,2,3,1).reshape(S, (128/4)*32=1024)` →
+  `input_proj_linear`(1024→1024). The reshape is **freq-major, channel-minor**.
+- **Rel-pos-enc** (`Gemma4AudioRelPositionalEncoding` :218-246) — `inv_timescales`
+  over `hidden//2=512` (min 1, max 10000), `position_ids=arange(ctx//2,-1,-1)` =
+  [12..0] (P=`ctx//2+1`=13, ctx=`chunk+past+future`=24), `pos=[sin|cos]` → [13,1024].
+- **Chunked-local attention** (`Gemma4AudioAttention` :249-354) — `q *= (hd^-0.5)/ln2
+  · softplus(per_dim_scale)`, `k *= ln(1+e)/ln2`; blocks of `chunk=12` with a context
+  window [past=`context_left-1`=12, future=`context_right`=0] (context_size 24);
+  matrix_ac = q·k over the extracted block context (OOB keys zero); matrix_bd =
+  q·relative_k_proj(pos) over 13 rel positions then **`_rel_shift`** (Transformer-XL:
+  pad to ctx+1, flatten, slice, reshape → 24); `attn = tanh((ac+bd)/50)·50`; **mask =
+  `sliding_window_mask_function((12,0))`**: valid iff `dist=q_idx-kv_idx ∈ [0,12)`
+  (★ the load-bearing off-by-one — 12 keys, not 13) AND kv valid; softmax f32;
+  `post` proj.
+- **Light-conv** (`Gemma4AudioLightConv1d` :484-522) — pre_norm → `linear_start`
+  (1024→2048) → **GLU** (`a·sigmoid(b)`) → **depthwise CAUSAL Conv1d** (k=5,
+  `left_pad = (K-1)+1-stride = 4`, per-channel groups) → conv_norm → SiLU →
+  `linear_end` → +res.
+- **FeedForward** (`Gemma4AudioFeedForward` :415-447) — pre_norm → ffw1(1024→4096) →
+  SiLU → ffw2(4096→1024) → post_norm → **·0.5 (`residual_weight`, half-step)** → +res.
+- **Layer** (`Gemma4AudioLayer` :525-573) — ff1 → clamp+norm_pre_attn → attn →
+  clamp+norm_post_attn+res → lconv → ff2 → clamp+norm_out. `output_proj` (Linear
+  **WITH bias** 1024→1536). All `Gemma4RMSNorm` (:197) = plain `x·w` (eps 1e-6).
+- **QAT clamps** — E4B `use_clipped_linears=True`: FINITE trained per-linear scalar
+  bounds `clamp(x,in)→Linear(bias-free)→clamp(out)` on every `Gemma4ClippableLinear`
+  (q/k/v/post, ffw1/2, linear_start/end); the subsample convs + input_proj +
+  relative_k_proj + output_proj + embed_audio are PLAIN. `gradient_clipping=1e10` is a
+  no-op at f32.
+- **Projector** (`Gemma4MultimodalEmbedder` audio, `gemma4_mm.py:908-960`) —
+  `RMSNorm(has_weight=False)` → `Linear(1536→text_hidden=2560, bias-free)`.
+- **ZERO new `vt::` op / kernel** — pure host f32 (correctness-first, device-neutral).
+
+### G3.2 Inertness (PROVEN by construction)
+
+NEW standalone TU, not referenced by the registry/runner ⇒ the text
+`test_gemma4_paged_engine` STRICT 32/32 + the G2-impl vision gates are byte-identical
+by construction; the full `libvllm` + every test TU re-link clean; `-Werror` 0-warn
+on both new TUs (CPU). No shared model/runner/registry/KV path touched.
+
+### G3.3 RESIDUAL (named, honest)
+
+Audio→text **e2e is NOT gated** this pass (same residual class as G2-impl vision).
+Remaining: the Gemma-4 audio **feature extractor** (A1 mel frontend: STFT + mel +
+`_unfold` framing → `input_features` [T,128] + mask + the soft-token count arithmetic
+`gemma4_mm.py:348-395`) — here `input_features` is a dumped golden; and the **engine
+mm-plumbing** (register Gemma-4 as SupportsMultiModal, hasher / encoder-cache seam,
+masked-scatter merge of the audio soft tokens at the `<audio>` rows, tower→merge→
+decode fork). The tower + projector (the merge INPUT) are proven. The **device-
+resident bf16 forward** (speed) and the **audio e2e GPU golden** are named residuals.
+
+---
+
 ## 1. Per-model / per-modality DISPOSITION
 
 | Target | Image | Video | Audio | Disposition |
 |---|:--:|:--:|:--:|---|
-| **Gemma-4 `Gemma4ForConditionalGeneration`** | ✅ (SigLIP) | ✅ (SigLIP) | ✅ (if `audio_config`) | **GATEABLE — W0 RUN-VERIFIED 2026-07-28, greedy golden captured, IMPLEMENTATION PENDING.** vLLM 0.25.0 (transformers 5.13.1) LOADS+RUNS+GENERATES `unsloth/gemma-4-E4B-it` (ungated, 15.99 GB) — STRICT K=5 golden in `tests/parity/goldens/gemma4_e4b_text/`. Oracle block RETIRED; remaining work is pure impl: the PLE/YOCO/Gemma-4-MoE backbone + the SigLIP/audio towers, all unbuilt. No engine e2e yet. |
+| **Gemma-4 `Gemma4ForConditionalGeneration`** | ✅ (SigLIP) | ✅ (SigLIP) | ✅ (if `audio_config`) | **TEXT STRICT 32/32 (G1b) + VISION tower per-stage (G2-impl) + AUDIO tower per-stage (G3) — TRI-MODAL TOWERS PROVEN; engine mm e2e pending.** vLLM 0.25.0 (transformers 5.13.1) LOADS+RUNS+GENERATES `unsloth/gemma-4-E4B-it` (ungated, 15.99 GB; carries `audio_config` = USM-Conformer). Text STRICT golden `tests/parity/goldens/gemma4_e4b_text/`; vision refs `…/gemma4_e4b_image/`; **audio USM-Conformer tower per-stage f32-exact `…/gemma4_e4b_audio/` (G3, 7/7)**. Residual = the image/audio feature extractors + engine mm-plumbing (SupportsMultiModal, encoder-cache, masked-scatter merge, decode fork); device-resident bf16 speed. |
 | **Gemma-4 `Gemma4UnifiedForConditionalGeneration`** | ✅ (encoder-free embedder) | ✅ | ✅ (if `audio_config`) | **GATEABLE (by the E4B W0 proof — same oracle path), IMPLEMENTATION PENDING** — simpler (no SigLIP/audio `AutoModel` tower); the ungated `unsloth/gemma-4-12b-it` (23.92 GB) is this variant and fits GB10. No standalone run this pass (E4B is the smaller vehicle); the oracle-runnability is proven by the shared registered path. No engine e2e yet. |
 | **AUDIO modality** (as a subsystem) | — | — | ✅ | **STAGED — reachable, land it first on the smallest oracle-runnable vehicle** (Whisper→Voxtral-Mini-3B), NOT on Gemma-4. This is the genuinely-new work. |
 | Whisper (vehicle) | — | — | ✅ ASR | IMPLEMENTABLE-ADDITIVE — oracle-runnable, fits; the audio-pipeline standup vehicle |
