@@ -31,6 +31,7 @@
 #define VLLM_V1_STRUCTURED_OUTPUT_JUMP_FORWARD_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,17 @@ namespace vllm::v1 {
 // scheduler splice (which must recompute KV for the jumped tokens) is a named
 // residual, so the default stays off until that lands.
 bool JumpForwardEnabled();
+
+// Config-aware resolution (ENG-SGLANG-BEHAVIOR-FLAG). Mirrors the house
+// AsyncSchedulingEnabled(resolved) convention (config/scheduler.h): the env var
+// VT_ENABLE_JUMP_FORWARD, WHEN SET, is the override and decides ("1"/"true"/
+// "TRUE"/"on" => on, anything else => off); when the env var is UNSET, the
+// caller's `configured` value decides (the C-ABI vllm_model_params.
+// enable_jump_forward / the C++ EngineParams.enable_jump_forward /
+// --enable-jump-forward server flag), defaulting OFF when nullopt. Resolved ONCE
+// at engine construction (LoadedEngine::jump_forward_enabled()), never per step.
+// The no-arg JumpForwardEnabled() above is exactly JumpForwardEnabled(nullopt).
+bool JumpForwardEnabled(std::optional<bool> configured);
 
 // Drain the token-unique forced run from `grammar` at its CURRENT state,
 // advancing the FSM one forced token at a time and appending each emitted id to

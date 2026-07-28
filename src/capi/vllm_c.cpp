@@ -436,6 +436,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.max_num_batched_tokens = 0;    // 0 => the per-arch default (ABI v9).
   p.scheduling_policy = nullptr;   // NULL => "fcfs" (ABI v9).
   p.kv_transfer_config = nullptr;  // NULL => no connector (ABI v9).
+  p.enable_jump_forward = 0;       // 0 => env-resolved, default OFF (ABI v10).
   return p;
 }
 
@@ -551,6 +552,26 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
         SetError(
             "vllm_engine_load: enable_prefix_caching must be 0 (model "
             "default), 1 (on), or 2 (off)");
+        return VLLM_ERR_INVALID_ARGUMENT;
+    }
+    // ABI v10: tri-state jump-forward toggle (0=default/env-resolved-OFF, 1=on,
+    // 2=off), mirroring enable_prefix_caching. 0 leaves ep.enable_jump_forward
+    // unset (nullopt), so JumpForwardEnabled resolves it from the environment
+    // (default OFF) — the byte-identical default. The VT_ENABLE_JUMP_FORWARD env
+    // var still overrides 1/2 at resolution time.
+    switch (params->enable_jump_forward) {
+      case 0:
+        break;  // default (nullopt) => env-resolved, OFF unless VT_ENABLE_JUMP_FORWARD.
+      case 1:
+        ep.enable_jump_forward = true;
+        break;
+      case 2:
+        ep.enable_jump_forward = false;
+        break;
+      default:
+        SetError(
+            "vllm_engine_load: enable_jump_forward must be 0 (default), 1 (on), "
+            "or 2 (off)");
         return VLLM_ERR_INVALID_ARGUMENT;
     }
 
