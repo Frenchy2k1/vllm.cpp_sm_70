@@ -29741,6 +29741,71 @@ the MTP row.
 Standing lesson, now twice-confirmed on this track: for a format produced by a
 tool we do not own, read the CONVERTER, not the artifact. Shape checks catch
 layout; they never catch convention.
+- **2026-07-28** — **Turing `sm_75` W1 (bf16-WMMA guard) LANDED + BUILD-VERIFIED**
+  (`CLAIM-CUDA-TURING-SM75`, spec `specs/cuda-arch-breadth-fp16.md` W1; base local
+  `main` `034be66e`; NOT pushed). The beyond-vLLM breadth lane's first shippable
+  brick. The 5 bf16-WMMA prefill kernels in `src/vt/cuda/cuda_paged_attn.cu`
+  (`:732,958,1197,1472,1716`) are now guarded `#if __CUDA_ARCH__ >= 800`
+  (`#else __trap()`) so the TU compiles on `sm_75` selecting the EXISTING scalar
+  CUDA-core fallback (`:2373`) — `nvcuda::wmma::fragment<…__nv_bfloat16…>` is a
+  complete type only on Ampere+. COMPILE-ONLY, GPU-SAFE (nvcc only, no kernels);
+  disk-guarded (dgx 73G ≥ 25G). **Evidence (dgx nvcc 13.0.88 + cutlass 4.5.0):**
+  single-arch `75` `cuda_paged_attn.cu` `-Werror=all-warnings` **0-warn EXIT=0**;
+  `cuobjdump -lelf` → real `cuda_paged_attn.cu.1.sm_75.cubin`. RED: unguarded HEAD
+  fails EXIT=1 / 21 errors (the `incomplete type …__nv_bfloat16… fragment` at
+  `:1797` gone). sm_121a NEUTRALITY: same TU `-Werror` 0-warn AND sm_121a SASS
+  byte-identical to unguarded (0 instruction diffs — preprocessor identity proven
+  empirically). SIGNAL `DERIVED+BUILD-VERIFIED (testing-welcome)`: **NO Turing
+  board ran it** — a green compile + SASS is not execution evidence; no vLLM oracle
+  on Turing (dropped), so correctness is testing-welcome (llama.cpp-on-card +
+  portable cross-check). Records: `backend-matrix.md` (`BACKEND-CUDA-SM075` cells +
+  intro, row stays `SPIKE`), spec W1/B0/B1, `roadmap_v1.md` `ROAD-V1-D1-CUDA`,
+  `docs/STATUS.md`, `docs/BENCHMARKS.md` (NOT-APPLICABLE, `benchmark_binding=false`),
+  ledger, this log, `coordination.md` claim. NEXT: W2/W3 llama.cpp fp16 tile/vec
+  fast body; W7 on-card runtime gate needs a Turing board.
+
+- **2026-07-28** — **Datacenter-Blackwell `sm_100a` NVFP4 tcgen05 GEMM (DC1) LANDED
+  + BUILD-VERIFIED** (`CLAIM-CUDA-SM100-NVFP4`, spec
+  `specs/cuda-arch-datacenter-fastpath.md` §9 DC1 / `ROAD-V1-D1-CUDA`; base local
+  `main` `64b08aea`; NOT pushed). The datacenter fast-path lane's first shippable
+  brick — the NVFP4 tcgen05 leg only (C3x/MoE/MXFP4/MLA are separate later bricks).
+  NEW TU `src/vt/cuda/cuda_matmul_nvfp4_sm100.cu` is a faithful 1:1 TYPE-port of
+  vLLM `Fp4GemmSm100` (`ArchTag=cutlass::arch::Sm100` + `KernelScheduleAuto`/
+  `EpilogueScheduleAuto` → CUTLASS 4.5.0 selects the 5th-gen **tcgen05** block-scaled
+  collective; `OpClassBlockScaledTensorOp`; exact `sm100_fp4_config_{default,M256,M16}`
+  tile/cluster/PerSm shapes), grounded in vLLM
+  `csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_kernels.cu:44-138` @
+  `5559679229`. **KEY HONESTY CALL:** this is NOT a plain `Sm120→Sm100` ArchTag swap
+  of our shipped sm_12x body — that body is `ArchTag=Sm120`+
+  `KernelTmaWarpSpecializedCooperative` (FlashInfer sm120 template, a DIFFERENT
+  collective) and the native `fp4-mma` path is `mma.sync kind::mxf4nvf4`
+  (consumer-Blackwell-only). Neither ports to sm_100's tcgen05, so the datacenter
+  leg gets its OWN dedicated FEATURE-TABLE cell `cutlass-nvfp4-sm100` (enabled ONLY
+  for `100a`); widening the sm_12x `cutlass-nvfp4` cell would drag the sm120 tactic
+  sweep into a 100a build, whose sm_120 PTX ptxas rejects for compute_100a. On the
+  gate arch sm_121a the flag is OFF → the TU is not built → byte-zero impact.
+  COMPILE-ONLY, GPU-SAFE (nvcc only, no kernels, no `gpu.lock`); disk-guarded
+  (dgx 73G ≥ 25G, twice ~20s apart, stable), scratch pruned after `cuobjdump`.
+  **Evidence (dgx nvcc 13.0 + cutlass 4.5.0):** single-arch `-arch=sm_100a` TU
+  compile with the production flag set (`-DVT_CUTLASS_NVFP4_SM100=1
+  --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress=20012 -isystem
+  cutlass`) **0 warnings / 0 errors EXIT=0**; `cuobjdump -lelf` → real
+  `cuda_matmul_nvfp4_sm100.1.sm_100a.cubin` (`arch = sm_100a`). Feature-table CI
+  (`cmake -P cmake/CudaArchFeaturesTest.cmake`, no GPU) ALL PASS: `100a`→
+  `cutlass-nvfp4-sm100` ENABLED; 121a/120a/120a;121a/103a/110/90a/80→EMPTY; RED-
+  preserving `100a`→`cutlass-nvfp4`/`fp4-mma` EMPTY. RED (HEAD table): single-arch
+  `100a` resolved `cutlass-nvfp4 DISABLED` + `fp4-mma DISABLED`, no sm100 cell.
+  sm_121a NEUTRALITY: GREEN banner 121a→`cutlass-nvfp4-sm100 DISABLED` +
+  `cutlass-nvfp4 ENABLED` (sm120 path unchanged); the new TU compiled for
+  `-arch=sm_121a` WITHOUT the define is inert (0-warn EXIT=0, 0 sm_100 content).
+  SIGNAL `DERIVED+BUILD-VERIFIED (testing-welcome)`: **NO B200/sm_100 board ran ANY
+  of this** — a green compile + SASS is not execution evidence, not runtime support,
+  not vLLM-competitive. Records: `backend-matrix.md` (`BACKEND-CUDA-SM100` cells +
+  intro, row stays `SPIKE`), spec §9 DC1, `kernel-matrix.md` (NVFP4 row cross-ref),
+  `roadmap_v1.md` `ROAD-V1-D1-CUDA`, `docs/STATUS.md`, `docs/BENCHMARKS.md`
+  (NOT-APPLICABLE, `benchmark_binding=false`), ledger, this log, `coordination.md`
+  claim. NEXT: DC2 CUTLASS C3x FP8 sm100/sm90, DC3 grouped-MoE; a cloud B200
+  upgrades DC1 to `RUNTIME-VERIFIED` (token-exact + every-axis perf).
 
 ## 2026-07-28 — `SPEC-DFLASH-GGUF` GD1-GD3 LANDED: the axis-A loader works
 
