@@ -150,6 +150,14 @@ use only the current local host and mark unavailable hardware gates `PENDING`.
 
   `test_capi` and `test_openai_conformance` are ctest-PARALLELISM flakes on this
   box (and on Linux); they pass on rerun. Prefer `ctest -j 3`.
+  `test_engine_core_proc` is likewise a timing flake under heavy parallel ctest:
+  the case "EngineCoreProc: abort-mode shutdown aborts in-flight requests"
+  (`test_engine_core_proc.cpp:315`) races the busy-loop teardown against the
+  abort-output enqueue and intermittently misses `abort_seen` (measured ~1/5 in
+  isolation under load, 2026-07-28); it is a pre-existing test-side timing race
+  (untouched by the C7 sampling work) and passes on rerun. A dedicated fix would
+  make the loop block for the abort frame (bounded wait) instead of a
+  best-effort non-blocking `try_get` sweep.
 
   **LOCALAI WORKER — must be DOWN for any timing/benchmark work on this box
   (user-directed 2026-07-22).** It is a **root LaunchDaemon**, not a container
