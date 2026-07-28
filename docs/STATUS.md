@@ -110,7 +110,20 @@ The correctness form and the full D0-D14 measured chronology live in
 
 ## Not supported yet
 
-LoRA, multi-GPU, and the full tool-calling template surface. Multimodal
+LoRA, multi-GPU, and the full tool-calling template surface. **Scale-out /
+distributed execution is scoped but unbuilt** (spike, 2026-07-28): the engine is
+single-GPU today (verified — no NCCL / tensor-parallel / process-group code in
+`src/`). A single-dimension design is on record covering all three legs —
+multi-GPU tensor+pipeline parallel, multiple DGX Sparks over the ConnectX-7
+200GbE RoCE/RDMA cable (the path that lets DeepSeek-V4-Flash fp8 ~167 GiB run
+across 2×119 GiB Sparks), and MLX multi-node over Thunderbolt — all expressed
+ONCE against one `vt::` collective / process-group abstraction with
+backend-specific transports (NCCL / RDMA / MLX-ring), mirroring vLLM's
+`device_communicators`. `world_size==1` stays byte-identical. No implementation,
+no gate run; correctness gating is HW-blocked (no ≥2-GPU box, no 2-Spark cable,
+no 2-Mac cluster here). Full scope + seam map:
+[.agents/specs/scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
+Multimodal
 (image/video/audio) is correctness-complete; its OpenAI-server wiring has landed
 its CPU bricks (content-part parse + processor routing + the engine mm-request
 plumbing — `add_request(MultiModalInputs)` on both engines, default-inert to the

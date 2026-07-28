@@ -434,6 +434,20 @@ bricks. The real correctness signal is a primitive gate (KDA+MLA+MoE) on the fit
 numbers are owed only from a multi-Spark / 16×H200-class box, and none is taken or
 promised here. Spec + W-plan: [kimi-k3.md](../.agents/specs/kimi-k3.md). No
 source/engine path touched.
+**Scale-out / distributed execution W0 SCOPE spike (2026-07-28,
+`CLAIM-SCALE-OUT-SPIKE`, NOT pushed).** Disposition: **NOT APPLICABLE (scoping
+spike; no build, no run, no download, no measurement taken, claimed, or owed;
+`benchmark_binding=false`).** Scopes the NEW distributed capability dimension
+(single-GPU today) across three legs — multi-GPU tensor+pipeline parallel,
+multiple DGX Sparks over the ConnectX-7 200GbE RoCE/RDMA cable, and MLX
+multi-node over Thunderbolt — sharing ONE `vt::` collective abstraction with
+NCCL/RDMA/MLX-ring transports (mirrors vLLM `device_communicators`). The only
+externally-relevant measured facts are third-party, not ours: 2-Spark NCCL
+all-reduce ~10.2 GB/s / sendrecv ~9 GB/s over the 200GbE RoCE link (raw RDMA
+~24.6 GB/s). No engine speed number exists or is owed — correctness gating is
+HW-blocked (no ≥2-GPU box / 2-Spark cable / 2-Mac cluster here). Spec + seam map
++ W-plan: [scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
+No source/engine path touched.
 
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —

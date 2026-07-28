@@ -30576,3 +30576,29 @@ M2a before the M2c e2e). dgx GB10 CUDA `flock`, weights via
   CORRECTS the 2026-07-25 sweep note ("loads as `DeepseekV3ForCausalLM`" — true for K2,
   NOT K3). All 6 record checkers rc=0. NEXT: W1 proxy primitive gate (DGX busy —
   deferred).
+- **2026-07-28** — **Scale-out / distributed execution W0 SCOPE spike (records-only,
+  `CLAIM-SCALE-OUT-SPIKE`, base `main` `df18ca91`, NOT pushed).** Scoped the NEW
+  distributed capability dimension — the engine is single-GPU today (VERIFIED: no
+  NCCL / tensor-parallel / process-group code in `src/`; the executor is a direct
+  single-worker call `v1/executor/executor.cpp:7-34`; latent `dcp/pcp_world_size`
+  fixed to 1). Three legs share ONE `vt::` collective abstraction (a
+  `vt::Communicator` / process-group, sibling of `vt::Queue`, collectives as new
+  `OpId`s via `OpProvider`, `world_size==1` byte-identical), mirroring vLLM's
+  `device_communicators`: **(1) multi-GPU** tensor+pipeline parallel (grounded in
+  `linear.py:418/1612/1766`, `vocab_parallel_embedding.py:198`,
+  `fused_moe/expert_map_manager.py:22`, PP `models/utils.py:785/798` +
+  `parallel_state.py:957`); **(2) multiple DGX Sparks** over the ConnectX-7 200GbE
+  RoCE/RDMA cable (`multiproc_executor.py:103`/`ray_executor.py:64` +
+  `init_distributed_environment parallel_state.py:1560` + `vllm_net_devices.py`) —
+  the path that lets DeepSeek-V4-Flash fp8 ~167 GiB run across 2×119 GiB Sparks;
+  **(3) MLX multi-node** over Thunderbolt (`mlx.core.distributed` ring/JACCL +
+  mlx-lm `--num-shards`, provider beside `metal_mlx_provider.mm:162`). Reuse-vs-new
+  seam map done file:line; the two structural blockers are the one-Backend-per-type
+  registry (`src/vt/backend.cpp:42`) + device-0-hardcoded CUDA registrar
+  (`cuda_backend.cu:297-299`). GB10 interconnect facts web-confirmed (NCCL
+  all-reduce ~10.2 GB/s measured on 2 Sparks); Leg-2 fp8-238GiB fit flagged
+  assumed-pending-W1. Records: NEW `specs/scale-out-distributed.md`; 5
+  `BACKEND-DISTRIBUTED-*` rows (backend-matrix 60→65 + `check-agent-record.py`);
+  feature-matrix §3, roadmap scale-out subsection, coordination, STATUS,
+  BENCHMARKS. All 6 record checkers rc=0. NEXT: W1 = `vt::Communicator` skeleton +
+  CPU 2-proc-loopback all-reduce gate (no GPU needed).

@@ -57,7 +57,12 @@ MATRICES = {
     # `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` competitor floor (llama.cpp on the same
     # old card, since vLLM has no entry on Pascal/Volta/Turing). See
     # specs/cuda-arch-breadth-fp16.md.
-    "BACKEND": (AGENTS / "backend-matrix.md", 60),
+    # 65 since 2026-07-28: +the distributed / scale-out family
+    # `BACKEND-DISTRIBUTED-COMM`/`-TP`/`-PP`/`-MULTINODE-SPARK`/`-MLX-RING` (the NEW
+    # scale-out capability dimension — one `vt::` collective abstraction with
+    # nccl/RDMA/MLX-ring transports; single-GPU today). All `SPIKE`,
+    # `CLAIM-SCALE-OUT-SPIKE`, spec specs/scale-out-distributed.md.
+    "BACKEND": (AGENTS / "backend-matrix.md", 65),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

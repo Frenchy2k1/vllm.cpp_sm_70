@@ -74,16 +74,26 @@ instead of it.
 
 No distributed runtime in-tree yet (verified: no NCCL/`tensor_parallel` in `src/`).
 Upstream's Ray/multiproc executor is replaced by the in-process seam (§9.2) —
-multi-process/multi-GPU re-enters through that seam.
+multi-process/multi-GPU re-enters through that seam. **Scale-out is now scoped as
+one capability dimension** ([scale-out-distributed.md](specs/scale-out-distributed.md),
+`CLAIM-SCALE-OUT-SPIKE`): all three legs (multi-GPU, multi-Spark, MLX-multi-node)
+express TP/PP ONCE against a single `vt::Communicator` / process-group abstraction
+(a sibling of `vt::Queue`, collectives as new `OpId`s via `OpProvider`), with
+backend-specific transports — NCCL (kCUDA), RDMA/TCP (Spark), MLX-ring (kMETAL) —
+mirroring vLLM's `device_communicators`. The backend-matrix carries the stable
+rows `BACKEND-DISTRIBUTED-COMM`/`-TP`/`-PP`/`-MULTINODE-SPARK`/`-MLX-RING`.
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| Tensor parallel (TP) | `distributed/`, `config/parallel.py` | 🚧 T2 (spec written, task #50) | weight-stacking semantics already ported (single-GPU shape); ⚠ impl needs a 2-GPU box (GB10 is single-GPU) | [specs/tensor-parallelism.md](specs/tensor-parallelism.md) |
-| Pipeline parallel (PP) | same | ☐ T2 | | `planned: specs/pipeline-parallel.md` |
-| Expert parallel (EP) + EPLB | `v1/worker/gpu/eplb_utils.py` | ☐ T2 | | `planned: specs/expert-parallel.md` |
+| Tensor parallel (TP) | `distributed/`, `layers/linear.py:418/1612/1766` | 🚧 T2 (spike written) | weight-stacking semantics already ported (single-GPU shape); seams file:line-mapped (`dense_attn_block.h:342,513-530`, weight chokepoint `dense_weight_loaders.h:131-138`); ⚠ impl needs a 2-GPU box (GB10 is single-GPU). Row `BACKEND-DISTRIBUTED-TP` | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
+| Pipeline parallel (PP) | `models/utils.py:785/798`, `parallel_state.py:957` | 🚧 T2 (spike written) | PPMissingLayer + stage send/recv + executor fan-out (`executor.cpp:7-34`); row `BACKEND-DISTRIBUTED-PP` | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
+| Collective / process-group abstraction | `base_device_communicator.py:147`, `parallel_state.py:358` | 🚧 T2 (spike written) | the unifying `vt::Communicator`; new collective `OpId`s via `OpProvider`; `world_size==1` byte-identical; row `BACKEND-DISTRIBUTED-COMM` | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
+| Expert parallel (EP) + EPLB | `v1/worker/gpu/eplb_utils.py` | ☐ T2 | scoped as the MoE shard within `BACKEND-DISTRIBUTED-TP` (EPLB beyond) | `planned: specs/expert-parallel.md` |
 | Data parallel (DP) | `config/parallel.py` | ☐ T2 | | `planned: specs/data-parallel.md` |
 | MoE sequence parallelism without DP | `config/parallel.py::use_sequence_parallel_moe`, `distributed/parallel_state.py` | ☐ T2 | v0.25.0 adds the non-DP path and reports 1.9–5.0% E2E throughput; inventory row `PAR-SEQUENCE-MOE` | `planned: specs/sequence-parallel-moe.md` |
-| Multi-node (Ray / multiproc executor) | `v1/executor/` | ☐ T3 | re-enters via §9.2 seam; not as-is | `planned: specs/multi-node.md` |
+| Multi-node (Ray / multiproc executor) | `v1/executor/multiproc_executor.py:103`, `ray_executor.py:64` | 🚧 T3 (spike written) | re-enters via §9.2 seam; not as-is; row `BACKEND-DISTRIBUTED-PP`/`-TP` cross-host | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
+| Multi-Spark interconnect (2× DGX Spark) | `parallel_state.py:1560`, `v1/executor/vllm_net_devices.py` | ☐ T3 (spike written) | ConnectX-7 200GbE RoCE/RDMA; NCCL over IB measured ~10.2 GB/s all-reduce; unlocks DeepSeek-V4 fp8 (~167 GiB) across 2×119 GiB; row `BACKEND-DISTRIBUTED-MULTINODE-SPARK` | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
+| MLX multi-node (Thunderbolt) | `mlx.core.distributed` (ring/JACCL); mlx-lm `--num-shards` | ☐ T3 (spike written) | Apple-Silicon cluster; provider beside `metal_mlx_provider.mm:162`; row `BACKEND-DISTRIBUTED-MLX-RING` | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
 
 ## 4. Model families
 

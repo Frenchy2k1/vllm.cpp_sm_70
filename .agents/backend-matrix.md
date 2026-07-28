@@ -226,6 +226,23 @@ memory. Floating competitor versions do not count.
 | `BACKEND-GATE-METAL-LLAMACPP` | Metal kernel/model parity vs llama.cpp Metal | pinned llama.cpp Metal build | - | - | [competitive benchmark spike](specs/competitive-benchmarks.md) | `INVENTORIED` | - |
 | `BACKEND-GATE-VULKAN-LLAMACPP` | Vulkan kernel/model parity vs llama.cpp Vulkan | pinned llama.cpp Vulkan build | - | - | [competitive benchmark spike](specs/competitive-benchmarks.md) | `INVENTORIED` | - |
 
+## Distributed / scale-out rows
+
+The NEW scale-out capability dimension (single-GPU today). All five express
+tensor/pipeline parallel ONCE against one `vt::` collective abstraction, with
+backend-specific transports — mirroring vLLM's `device_communicators`. Full
+3-leg scope, seam map and W-plan in
+[scale-out spike](specs/scale-out-distributed.md). No implementation yet; all
+`SPIKE` under `CLAIM-SCALE-OUT-SPIKE`.
+
+| ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|
+| `BACKEND-DISTRIBUTED-COMM` | The unifying `vt::Communicator` / process-group abstraction — rank/world_size + all-reduce/all-gather/reduce-scatter/send/recv as new `OpId`s dispatched via `OpProvider`; transports NCCL (kCUDA), RDMA/TCP (Spark), MLX-ring (kMETAL). `world_size==1` ⇒ every collective a no-op (byte-identical single-GPU) | vLLM `device_communicators/base_device_communicator.py:147` (DeviceCommunicatorBase interface, the port template) + `distributed/parallel_state.py:358` (GroupCoordinator dispatch; world_size==1 bypass :638) | NEW; sibling of `vt::Queue` `include/vt/device.h:50`; new `OpId`s via `include/vt/op_provider.h:108`; stream-order hooks exist `include/vt/backend.h:87-104` | - | [scale-out spike](specs/scale-out-distributed.md) | `SPIKE` | `CLAIM-SCALE-OUT-SPIKE` |
+| `BACKEND-DISTRIBUTED-TP` | Tensor parallel (intra-node multi-GPU) — sharded Column/Row/QKV linears, vocab-parallel embed + LM head, attention-head split, MoE expert-parallel; all-reduce after o_proj/MLP-down and the EP combine | vLLM `layers/linear.py:418` (Column, out-dim shard) / `:1612` (Row, all-reduce :1766) / `:1021` (QKV heads :1074) + `vocab_parallel_embedding.py:198` + `fused_moe/expert_map_manager.py:22` | seams `include/vllm/model_executor/models/dense_attn_block.h:342,513-530` + `qwen3.cpp:83-90`; weight chokepoint `dense_weight_loaders.h:131-138` | - | [scale-out spike](specs/scale-out-distributed.md) | `SPIKE` | `CLAIM-SCALE-OUT-SPIKE` |
+| `BACKEND-DISTRIBUTED-PP` | Pipeline parallel — PP stage split (`PPMissingLayer` analogue) + inter-stage `IntermediateTensors` send/recv over the comm layer + multi-worker executor fan-out | vLLM `models/utils.py:785` (PPMissingLayer) / `:798` (make_layers) + `distributed/utils.py:127` (get_pp_indices) + `parallel_state.py:957` (send_tensor_dict) | fan-out seam `src/vllm/v1/executor/executor.cpp:7-34` (direct single-worker call today) | - | [scale-out spike](specs/scale-out-distributed.md) | `SPIKE` | `CLAIM-SCALE-OUT-SPIKE` |
+| `BACKEND-DISTRIBUTED-MULTINODE-SPARK` | Multiple DGX Sparks over the ConnectX-7 200GbE RoCE/RDMA cable — cross-host TP×PP; reuses the NCCL transport over IB/RoCE. Payoff: DeepSeek-V4-Flash fp8 (~167 GiB) across 2×119 GiB Sparks (238 GiB), which one Spark cannot hold | vLLM `v1/executor/multiproc_executor.py:103` / `ray_executor.py:64` + `parallel_state.py:1560` (init_distributed_environment; master_addr :1597) + `v1/executor/vllm_net_devices.py` (RDMA NIC map) | reuses Leg-1 seams; NEW cross-host rendezvous (TCP store) + NIC pinning | - | [scale-out spike](specs/scale-out-distributed.md) | `SPIKE` | `CLAIM-SCALE-OUT-SPIKE` |
+| `BACKEND-DISTRIBUTED-MLX-RING` | MLX multi-node over Thunderbolt — `mlx.core.distributed` ring/JACCL collectives shard a Metal model forward across Thunderbolt-linked Macs (mlx-lm `--num-shards` parity: TP over heads+FFN dense, EP for MoE) | MLX `mlx.core.distributed` (backends ring/jaccl/mpi; `all_sum`/`all_gather`/`send`/`recv`) + mlx-lm `--num-shards` (MLX docs, not the vLLM tree) | provider seam beside `src/vt/metal/metal_mlx_provider.mm:162` (`mx::default_stream(gpu)`) + zero-copy `MTLBuffer↔mx::array` bridge `:24-46,101-118` | - | [scale-out spike](specs/scale-out-distributed.md) | `SPIKE` | `CLAIM-SCALE-OUT-SPIKE` |
+
 ## Count invariants
 
 - Compiler branch target counts are exactly `7`, `11`, and `9`; the union is
@@ -243,5 +260,10 @@ memory. Floating competitor versions do not count.
   claimable SGLang preflight, eleven binding platform/workload competitor gates
   (including distinct cache-neutral and shared-prefix CUDA rows), and the
   beyond-vLLM legacy-arch floor `BACKEND-GATE-CUDA-LLAMACPP-LEGACY`.
+- The distributed / scale-out table has exactly 5 stable rows
+  (`BACKEND-DISTRIBUTED-COMM`/`-TP`/`-PP`/`-MULTINODE-SPARK`/`-MLX-RING`), the NEW
+  scale-out capability dimension scoped by
+  [scale-out-distributed.md](specs/scale-out-distributed.md). This moves the total
+  BACKEND row count 60 -> 65.
 - Adding or removing an upstream target, component family, platform, or
   required competitor changes the corresponding count in the same commit.

@@ -427,6 +427,23 @@ architecture-support checklist (a per-architecture status roll-up over every
 engaged model), kept in lockstep with its detailed row states by the CI checker
 [../scripts/check-model-checklist.py](../scripts/check-model-checklist.py).
 
+## Scale-out / distributed execution (spike, user-directed 2026-07-28)
+
+The NEW capability dimension: the engine is single-GPU today; these rows scope
+distributed / scale-out execution across three legs that share ONE `vt::`
+collective abstraction (mirroring vLLM's `device_communicators`). This is an
+extensibility-track concern (`ROAD-V1-C1`/`ROAD-V1-D1` adjacent) — a new
+interconnect becomes one transport provider, not a model-forward edit. Full
+scope, seam map and W-plan: [scale-out-distributed.md](specs/scale-out-distributed.md).
+All `SPIKE`, owned by `CLAIM-SCALE-OUT-SPIKE`.
+
+| Leg | Scale-out row | What it adds | Gate HW |
+|---|---|---|---|
+| 0 — abstraction | [`BACKEND-DISTRIBUTED-COMM`](backend-matrix.md) | the `vt::Communicator` / process-group + collective `OpId`s; nccl/RDMA/MLX-ring transports; `world_size==1` byte-identical | CPU 2-proc loopback (W1, no GPU) |
+| 1 — multi-GPU | [`BACKEND-DISTRIBUTED-TP`](backend-matrix.md), [`BACKEND-DISTRIBUTED-PP`](backend-matrix.md) | tensor + pipeline parallel (sharded linears/heads/experts/KV; stage split + send/recv) | ≥2-GPU box (absent — GB10 single-GPU) |
+| 2 — multi-Spark | [`BACKEND-DISTRIBUTED-MULTINODE-SPARK`](backend-matrix.md) | 2× DGX Spark over ConnectX-7 200GbE RoCE; unlocks DeepSeek-V4 fp8 (~167 GiB) across 238 GiB | 2 Sparks + QSFP cable |
+| 3 — MLX multi-node | [`BACKEND-DISTRIBUTED-MLX-RING`](backend-matrix.md) | `mlx.core.distributed` ring/JACCL over Thunderbolt; shards the Metal forward across Macs | 2 Thunderbolt-linked Macs |
+
 ## Decision rules carried forward
 
 - Every perf claim: same-box A/B vs the reference, token-exact gated, fresh
