@@ -772,6 +772,29 @@ checkpoint) and is not measured here. Reproduce: `cmake --build build-cpu --targ
 test_input_processor test_chat_mm && ./build-cpu/tests/test_input_processor &&
 ./build-cpu/tests/test_chat_mm`.
 
+**ROAD-V1-MM `MultiModalChatFn` seam body — brick 3 `MM-SERVE-E2E` (CPU)
+(2026-07-28, `CLAIM-MM-SERVING-E2E`, NOT pushed).** Disposition: **NOT APPLICABLE
+(feature — serving-side request assembly, `benchmark_binding=false`; no compute
+path, no throughput number owed).** `MakeQwen3VLImageChatFn` renders an image chat
+request into the placeholder-EXPANDED engine input (marker-inject → chat template →
+tokenize the single `<|image_pad|>` → `RouteImageRgb` EXPAND to 196 image tokens +
+mm_features) and is wired into `examples/server/main.cpp`; it runs the CPU
+tokenizer + processor, schedules no kernel and runs no forward, so no vLLM
+throughput A/B applies. Gate is correctness + inertness: `test_chat_mm` 8/8 (100
+asserts; the W3 seam-body test drives the real tokenizer + chat template → 196
+image tokens + mm_features, RED line = the text-only path renders 0) +
+`test_openai_serving` (the production seam is invoked on an image request + routed
+to the engine mm generate overload; text-only never touches it; streaming+mm
+rejected), text-path suites byte-identical, clean `-Werror` library + `server`
+build. **The end-to-end serving SPEED — and the token-correct GPU e2e itself — are
+BLOCKED, not deferred by contention:** the engine model runner has no multimodal
+forward (`ModelForwardInput` has no vision field; `runner.cpp` ignores
+`Request.mm_features`; Qwen3-VL is unregistered; the M2c `Qwen3VLGenerateGreedy` is
+a standalone driver). The dgx TTFT/TPOT vs the mm oracle is owed only once that
+forward is folded into `ModelRegistry::Forward` (recipe in
+`.agents/specs/mm-serving.md`). Reproduce: `cmake --build build-cpu --target
+test_chat_mm server && ./build-cpu/tests/test_chat_mm`.
+
 **ROAD-V1-C8 production endpoint wiring (2026-07-28, `CLAIM-C8-SERVE-PROD-WIRING`,
 NOT pushed).** Disposition: **NOT APPLICABLE (no throughput number,
 `benchmark_binding=false`).** Wiring the shipped `vllm-server` binary to call its

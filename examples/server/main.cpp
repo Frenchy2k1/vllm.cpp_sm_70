@@ -27,6 +27,7 @@
 // this binary is only built + smoke-tested against a synthetic engine (see
 // tests/vllm/entrypoints/openai/test_api_server.cpp). The wiring below is the
 // same either way.
+#include <cmath>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -52,6 +53,7 @@
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/entrypoints/openai/api_server.h"
+#include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
@@ -467,6 +469,65 @@ int main(int argc, char** argv) {
             : std::nullopt;
     completion.set_beam_search_tokenizer(&tokenizer, beam_eos);
     chat.set_beam_search_tokenizer(&tokenizer, beam_eos);
+
+    // ── MM-SERVE-E2E: wire the multimodal chat seam for image-capable models.
+    // When the model dir carries a preprocessor_config.json the Qwen3-VL image
+    // processor loads, we construct the seam body (MakeQwen3VLImageChatFn) so an
+    // OpenAI image_url request renders the placeholder marker → tokenizes to the
+    // single image_pad id → EXPANDS to N image tokens + mm_features carried onto
+    // the engine request. A text-only model (no preprocessor_config.json) leaves
+    // the seam UNSET → the chat path is byte-identical. The container-format
+    // image codec (PNG/JPEG → RGB) is a NAMED residual: no codec is vendored, so
+    // the production codec rejects encoded images with a clear message (the M2c
+    // single-sequence gate consumes pre-decoded raw RGB). The mm FORWARD (vision
+    // tower + merge + MRoPE/DeepStack on the GPU worker consuming
+    // Request.mm_features) is the remaining MM-SERVE-E2E residual — the engine
+    // model runner has no mm-forward path yet. Kept alive for the server loop.
+    std::unique_ptr<vllm::multimodal::Qwen3VLImageProcessor> mm_image_proc;
+    const std::string preprocessor_config_path =
+        (dir / "preprocessor_config.json").string();
+    if (fs::exists(preprocessor_config_path)) {
+      try {
+        vllm::multimodal::Qwen3VLProcessorConfig pcfg =
+            vllm::multimodal::LoadQwen3VLProcessorConfig(
+                preprocessor_config_path, config_path, served_model_name);
+        mm_image_proc =
+            std::make_unique<vllm::multimodal::Qwen3VLImageProcessor>(pcfg);
+        oai::ImageCodecFn codec =
+            [](const oai::DecodedMedia& media) -> oai::DecodedImageRgb {
+          // Raw-RGB passthrough (image/x-raw-rgb): the single-sequence e2e /
+          // gate fixture format. A square raw-RGB payload is decoded directly;
+          // any container format (PNG/JPEG) is the NAMED codec residual.
+          if (media.media_type == "image/x-raw-rgb") {
+            const std::size_t n = media.bytes.size();
+            const std::size_t px = n / 3;
+            const auto side =
+                static_cast<int64_t>(std::llround(std::sqrt(
+                    static_cast<double>(px))));
+            if (side <= 0 || static_cast<std::size_t>(side * side * 3) != n) {
+              throw std::runtime_error(
+                  "image/x-raw-rgb payload is not a square HxWx3 buffer");
+            }
+            oai::DecodedImageRgb out;
+            out.rgb = media.bytes;
+            out.height = side;
+            out.width = side;
+            return out;
+          }
+          throw std::runtime_error(
+              "multimodal image: container-format decode (PNG/JPEG -> RGB) is a "
+              "named MM-SERVE residual; supply raw RGB (image/x-raw-rgb)");
+        };
+        chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
+            *mm_image_proc, tokenizer, chat_prompt_fn, std::move(codec)));
+        std::cerr << "server: multimodal image seam wired (Qwen3-VL processor "
+                     "from "
+                  << preprocessor_config_path << ")\n";
+      } catch (const std::exception& e) {
+        std::cerr << "server: no multimodal image seam (" << e.what()
+                  << "); image requests fall back to the text path\n";
+      }
+    }
 
     // Diagnostic opt-out exists only for same-binary attribution. Production
     // defaults to the capacity-derived fixed pool.

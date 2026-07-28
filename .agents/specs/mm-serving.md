@@ -1,8 +1,8 @@
 # Multimodal serving — wiring image/audio/video into the OpenAI server (`ROAD-V1-MM` serving)
 
-Row IDs: `MM-SERVE-PARSE` (this brick), `MM-SERVE-ENGINE`, `MM-SERVE-E2E`.
-Owner claim: `CLAIM-MM-SERVING-W1`. Pinned vLLM oracle: `${VLLM_SOURCE}` @ `555967922`
-(0.26.0.dev0).
+Row IDs: `MM-SERVE-PARSE` (W1), `MM-SERVE-ENGINE` (W2), `MM-SERVE-E2E` (W3, this brick).
+Owner claim: `CLAIM-MM-SERVING-E2E` (W1 `CLAIM-MM-SERVING-W1`, W2 `CLAIM-MM-SERVING-W2`).
+Pinned vLLM oracle: `${VLLM_SOURCE}` @ `555967922` (0.26.0.dev0).
 
 ## Problem
 
@@ -93,7 +93,7 @@ chat request content-part array          [MM-SERVE-PARSE — CPU, THIS BRICK]
 |-----|-------|-------------|---------------|----|
 | `MM-SERVE-PARSE` (**LANDED, this commit**) | content-part parse + base64/data-URI decode + route to the existing processor → `MultiModalInputs` (shapes asserted) | `chat_utils.py:1478,1524`; `multimodal/utils.py:35-113` | `tests/entrypoints/test_chat_utils.py` (`test_parse_chat_messages_*`, the `image_url`/`input_audio` cases) → `test_chat_mm.cpp` | CPU |
 | `MM-SERVE-ENGINE` (**LANDED, brick 2**) | attach `MultiModalInputs` to the engine request (`add_request(MultiModalInputs)` overload on `LLMEngine`+`AsyncLLM` via `InputProcessor::process_inputs_mm` → `mm_features` on `EngineCoreRequest`/`Request`; placeholder-STRING helpers mirroring `get_placeholder_str`; serving_chat `MultiModalChatFn` seam) | `v1/engine/input_processor.py:333-379`; `chat_utils.py _add_placeholder:886` + `get_placeholder_str` (qwen3_vl.py:1714 / qwen2_audio.py:333) | `test_input_processor` (`process_inputs_mm`) + `test_chat_mm` (placeholder strings + full chain) | CPU-verifiable (shapes/counts); no forward |
-| `MM-SERVE-E2E` (**MANDATORY closing gate, residual**) | a real image+prompt OpenAI `/v1/chat/completions` request → token-correct output on **Qwen3-VL-4B**, gated vs the mm oracle (reuse the M2c e2e golden `gen_tokens_i32.bin`) | `entrypoints/openai/chat_completion/serving.py` full mm path | new `test_openai_serving_chat_mm_e2e.cpp` (dgx-only, skip without ckpt+CUDA) | **DGX GB10 + Qwen3-VL-4B checkpoint** |
+| `MM-SERVE-E2E` (**W3 — CPU SEAM BODY LANDED; GPU forward DEFERRED**) | the `MultiModalChatFn` seam BODY (`MakeQwen3VLImageChatFn`: messages → marker-inject → chat template → tokenize (single image_pad id) → RouteImageRgb EXPAND to N + mm_features), wired in `examples/server/main.cpp`. GPU forward = the closing gate (a real image+prompt request → token-correct on Qwen3-VL-4B vs the M2c golden) — **architecturally blocked** (see below) | `entrypoints/openai/chat_completion/serving.py` full mm path | `test_chat_mm` seam-body (real tokenizer + chat template → 196 image tokens, RED=0) + `test_openai_serving` (the production seam is invoked + routed) | CPU landed; **GPU e2e needs the engine mm-forward first** |
 
 ## This brick (`MM-SERVE-PARSE`) — landed
 
@@ -161,19 +161,65 @@ chat request content-part array          [MM-SERVE-PARSE — CPU, THIS BRICK]
   196 image_pad feature count). Text-path inertness suites byte-identical; clean
   CPU `-Werror` library + server build.
 
-### What `MM-SERVE-E2E` must still run (the seam BODY + the forward)
-The `MultiModalChatFn` seam body is UNIMPLEMENTED on CPU (it needs the model): the
-model TOKENIZER that turns the inserted placeholder markers into the single
-`<|image_pad|>` token ids the processor expands, plus the qwen3vl/whisper
-processors, plus the mm FORWARD (encoder tower + DeepStack/MRoPE) consuming
-`Request.mm_features` on the GPU worker. E2E = wire that seam on Qwen3-VL-4B (DGX +
-checkpoint) and gate a real image+prompt `/v1/chat/completions` request
-token-correct vs the mm oracle (reuse M2c `gen_tokens_i32.bin`).
+## Brick 3 (`MM-SERVE-E2E`) — CPU seam BODY landed; GPU forward deferred
+
+The `MultiModalChatFn` seam body is now IMPLEMENTED on CPU:
+- `include/vllm/entrypoints/openai/chat_mm.{h,cpp}` — `BuildMarkerInjectedContent`
+  (walk content_parts in order, inject the placeholder MARKER at the mm part
+  position; mirror `chat_utils.py:886 _add_placeholder`) + `MakeQwen3VLImageChatFn`,
+  the seam body the server sets. Given the image processor + the model tokenizer +
+  the chat-template renderer + an image codec, it turns chat `messages` into the
+  engine's placeholder-EXPANDED `MultiModalInputs`:
+  (1) marker-inject + render the templated prompt;
+  (2) `tokenizer.EncodeWithSpecialTokens` → the single `<|image_pad|>` marker maps
+      to ONE `image_token_id` (added tokens matched leftmost-longest, tokenizer.h:55);
+  (3) decode the image (codec) + `RouteImageRgb` → EXPAND that single id to
+      N = prod(grid_thw)/merge² copies + build `mm_features`.
+  IMAGE only; video/audio/multiple-image are named residuals.
+- `examples/server/main.cpp` — production wiring: when the model dir carries
+  `preprocessor_config.json`, construct the Qwen3-VL image processor and
+  `set_multimodal_chat_fn(MakeQwen3VLImageChatFn(...))`. A text-only model leaves
+  the seam UNSET ⇒ the chat path is byte-identical. The container-format codec
+  (PNG/JPEG → RGB) stays a NAMED residual: the production codec accepts
+  `image/x-raw-rgb` (the fixture format) and rejects encoded images with a clear
+  message.
+
+### The GPU e2e gate is ARCHITECTURALLY BLOCKED (not box contention)
+A real token-exact image `/v1/chat/completions` CANNOT run through the production
+engine seam yet — the engine MODEL RUNNER has no multimodal forward:
+- `include/vllm/model_executor/models/model_registry.h:142` `ModelForwardInput`
+  (the per-forward struct `ModelRegistry::Forward` consumes) has NO vision /
+  mm-embedding / inputs_embeds field — token_ids + positions + attn/kv only.
+- `src/vllm/v1/worker/gpu/runner.cpp` never reads `Request.mm_features` (it is
+  carried onto Request for the scheduler/encoder-cache extra-keys, but no forward
+  consumes it).
+- Qwen3-VL is NOT engine-registered — there is no `REGISTER_VLLM_MODEL` in
+  `qwen3_vl*.cpp`; the M2c vision forward is the STANDALONE `Qwen3VLGenerateGreedy`
+  (`qwen3_vl.cpp:502`), a bespoke greedy driver that does embed+merge+MRoPE+DeepStack
+  itself, OUTSIDE `ModelRegistry::Forward`.
+
+Closing the GPU gate (the exact residual, DGX GB10 + Qwen3-VL-4B checkpoint):
+1. add a vision-embedding / inputs_embeds field to `ModelForwardInput`;
+2. `runner.cpp`: run the vision tower on `Request.mm_features` via the
+   `EncoderCacheManager` seam, `_merge_multimodal_embeddings` into the token
+   embeddings, and pass MRoPE 3-D positions + DeepStack multiscale — i.e. fold the
+   `Qwen3VLGenerateGreedy` forward INTO the registered engine forward;
+3. `REGISTER_VLLM_MODEL(qwen3_vl, "Qwen3VLForConditionalGeneration", …)`;
+4. then a `test_openai_serving_chat_mm_e2e.cpp` (dgx-only) drives a real image
+   `/v1/chat/completions` through the running server / the constructed ApiServer
+   harness and asserts token-exact vs the committed M2c golden `gen_tokens_i32.bin`
+   (STRICT, K-deterministic). Recipe: `flock $HOME/gpu.lock`, `df` disk-guard
+   (tree ~21G; box was 99% full 2026-07-28), `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`,
+   `ssh dgx.casa`.
 
 ## Correctness / gates
-- CPU (brick 1): `test_chat_mm` 5/5, 65 asserts; inertness suites
-  `test_openai_protocol`/`test_openai_serving`/`test_openai_serving_chat_stream`
-  byte-identical for bare-string; clean `-Werror` full-library + `server` build.
-- **GPU closing gate (`MM-SERVE-E2E`):** a real image+prompt OpenAI request →
-  token-correct output on Qwen3-VL-4B vs the mm oracle. Needs the DGX + the
-  Qwen3-VL-4B checkpoint; out of scope for the CPU commit.
+- CPU (bricks 1+2+3): `test_chat_mm` 8/8, 100 asserts (W3 +1 seam-body test:
+  the real tokenizer + chat template render 196 image tokens + mm_features; RED
+  line = the text-only path renders 0 image tokens); `test_openai_serving` +1 (the
+  production seam is invoked on an image request + routed to the engine mm generate
+  overload; text-only never touches the seam; streaming+mm rejected). Inertness
+  suites byte-identical for bare-string; clean `-Werror` full-library + `server`
+  build (0 warnings).
+- **GPU closing gate (`MM-SERVE-E2E`):** DEFERRED — architecturally blocked on the
+  engine mm-forward (above), not on the DGX being unavailable. The CPU seam body is
+  wired + gated; the forward integration is the named residual.

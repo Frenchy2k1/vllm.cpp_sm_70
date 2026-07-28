@@ -24,6 +24,8 @@
 #define VLLM_ENTRYPOINTS_OPENAI_CHAT_MM_H_
 
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,6 +33,12 @@
 #include "vllm/multimodal/audio_processor.h"
 #include "vllm/multimodal/inputs.h"
 #include "vllm/multimodal/qwen3vl_processor.h"
+
+namespace vllm {
+namespace tok {
+class Tokenizer;  // vllm/tokenizer/tokenizer.h (the placeholder->id mapping)
+}  // namespace tok
+}  // namespace vllm
 
 namespace vllm::entrypoints::openai {
 
@@ -118,6 +126,71 @@ std::string ChatPlaceholderFor(const ChatContentPart& part, int audio_index);
 // no marker; audio parts are numbered 1..k. Empty when the message has no mm
 // parts (a bare-string content is byte-identical — content_parts is nullopt).
 std::vector<std::string> CollectChatPlaceholders(const ChatMessage& message);
+
+// Build the marker-INJECTED content string for one message: walk its
+// content_parts IN ORDER, appending each text part's text and each mm part's
+// placeholder MARKER (ChatPlaceholderFor) at its position. Mirrors vLLM
+// interleaving the placeholder string into the message content at the mm part
+// offset (chat_utils.py:886 `_add_placeholder`); the single <|image_pad|> in the
+// marker is what the tokenizer maps to ONE image_token_id, which the mm processor
+// then EXPANDS to N. A bare-string message (content_parts nullopt) returns its
+// content unchanged (byte-identical text path).
+std::string BuildMarkerInjectedContent(const ChatMessage& message);
+
+// ── The multimodal chat SEAM BODY (MM-SERVE-E2E) ───────────────────────────
+//
+// A decoded RGB image: raw HWC uint8 (height*width*3) + dims. Turning the
+// container-format `image_url` bytes (PNG/JPEG/…) into this is the NAMED codec
+// residual (no codec is vendored — the single-sequence e2e path itself consumes
+// pre-decoded raw RGB); the production wiring supplies the codec.
+struct DecodedImageRgb {
+  std::vector<uint8_t> rgb;
+  int64_t height = 0;
+  int64_t width = 0;
+};
+
+// Image codec seam: decoded media bytes -> raw RGB + dims. Throws on an
+// unsupported container. The default production codec rejects PNG/JPEG with a
+// clear "codec residual" message; the e2e/test path supplies a raw-RGB
+// passthrough (dims known from the fixture), exactly as the M2c single-sequence
+// gate consumes raw 448x448x3 RGB (test_qwen3vl_e2e.cpp:116).
+using ImageCodecFn = std::function<DecodedImageRgb(const DecodedMedia&)>;
+
+// The chat-prompt renderer seam (structurally IDENTICAL to serving_chat.h
+// ChatPromptFn — kept local so chat_mm.h need not pull serving_chat.h). The
+// server's real chat-template renderer (MakeChatTemplatePromptFn) plugs in here.
+using ChatPromptRenderFn = std::function<std::string(
+    const std::vector<ChatMessage>&, bool,
+    const std::vector<ChatCompletionToolsParam>&)>;
+
+// Build the Qwen3-VL IMAGE multimodal chat seam body (the MultiModalChatFn the
+// server sets via set_multimodal_chat_fn). The returned function turns chat
+// `messages` into the engine's placeholder-EXPANDED MultiModalInputs:
+//   1. inject the image placeholder marker at each image part's position
+//      (BuildMarkerInjectedContent) and render the templated prompt via
+//      `prompt_fn` (the real chat template);
+//   2. tokenize the rendered prompt WITH special tokens — the tokenizer maps the
+//      single <|image_pad|> marker to ONE `proc.config().image_token_id`
+//      (tokenizer.h EncodeWithSpecialTokens, added tokens matched
+//      leftmost-longest);
+//   3. decode the image bytes (`codec`) and RouteImageRgb → EXPAND that single
+//      id to N = prod(grid_thw)/merge^2 copies + build the mm_features handle
+//      the engine mm generate overload carries onto Request.mm_features.
+// Returns nullopt when no message carries an image part (the text path stays
+// byte-identical). IMAGE only for now — video / audio / multiple-image are named
+// residuals. `proc` and `tokenizer` must outlive the returned function (the
+// server owns them for the process lifetime, like set_beam_search_tokenizer).
+//
+// This is the seam-body half of MM-SERVE-E2E: it produces the token-correct
+// engine input; the GPU worker consuming Request.mm_features through the vision
+// tower + merge + MRoPE/DeepStack forward is the remaining residual (the engine
+// model runner has no mm-forward path yet — the M2c Qwen3VLGenerateGreedy driver
+// runs it standalone, outside ModelRegistry::Forward).
+std::function<std::optional<multimodal::MultiModalInputs>(
+    const std::vector<ChatMessage>&)>
+MakeQwen3VLImageChatFn(const multimodal::Qwen3VLImageProcessor& proc,
+                       const vllm::tok::Tokenizer& tokenizer,
+                       ChatPromptRenderFn prompt_fn, ImageCodecFn codec);
 
 }  // namespace vllm::entrypoints::openai
 
