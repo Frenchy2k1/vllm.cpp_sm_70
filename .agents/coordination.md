@@ -118,6 +118,44 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**SGLang PERF oracle stand-up + first floor MEASURED (2026-07-28,
+`CLAIM-SGLANG-PERF-BENCH`, DONE — reproduced, NOT pushed; FULL SHA reported to
+caller).** User side-quest "do the benchmarks": stand up live SGLang and
+benchmark our CUDA engine vs the SGLang perf floor. Base local `main` HEAD
+`7e9ffbff` (`git rev-parse HEAD`, ≥ the `c26ec71e` floor); records committed
+from isolated worktree `.claude/worktrees/agent-a5d76a681850df61d`; dgx GB10
+sm_121a. **What it did.** Pulled the oracle-spec SGLang `v0.5.15-cu130` arm64
+image (`@sha256:d0a667e`, arch digest `ce9667f4`, 25.6 GB) — it RAN the 27B-NVFP4
+gate model (`unsloth/Qwen3.6-27B-NVFP4` `890bdef7`) on GB10 with **no from-source
+build**, confirming oracle spec §2. Built ours from HEAD (CUDA, cutlass-ON +
+FA2-ENABLED, arch 121a). Ran a cache-neutral SGLang-vs-ours comparison at c8/c16
+(3 reps + warmup) via the existing `tools/bench/run_serve_low.py` `bench`
+subcommand driving `sglang.bench_serving` (`sglang-oai` vs `vllm`) on a
+deterministic corpus (80×1024-in/128-out exact, common-prefix ≤32), greedy
+`ignore_eos`, KV 20480 tokens matched, idle box, ONE `flock $HOME/gpu.lock`,
+engines strictly sequential (SGLang torn down + GPU freed + MemAvailable returned
+to baseline before ours). All within run-noise (CV mostly <0.1%); both emitted
+exactly 80×128 tokens, 0 errors. **Result (median of 3):** ours BEATS the SGLang
+floor on total/output throughput + req/s (**2.21×@c16, 1.44×@c8**) and TTFT
+(**6–12× lower**); SGLang WINS per-token latency (**TPOT/ITL 1.18–1.49× below
+ours** — reproduced OPEN GAP, candidate lever); peak memory ~comparable (proxy).
+**Owns ONLY records (no source/engine/kernel/README/Metal path):**
+`.agents/sglang-matrix.md` (`SGLANG-ORACLE-PERF` row INVENTORIED→STOOD UP +
+new "Perf oracle results" section), `.agents/specs/sglang-parity-oracle.md`
+(new §9 Results), `docs/BENCHMARKS.md` (scoreboard entry + full repro recipe),
+`.agents/roadmap_v1.md` (SGLang lane note), this claim, `.agents/parity-ledger.md`,
+`.agents/state.md`, `docs/STATUS.md`. **Residuals (named, not hidden):** 35B-A3B
+not run; c1/c2/c4 low-conc sweep not run (SGLang c1 ~13.3 s/it, impractical for
+3-rep reproduction this pass); shared-prefix cache-ON arm
+(`BACKEND-GATE-CUDA-SGLANG-PREFIX`) not run; vLLM arm not re-measured (SGLang
+floor specifically; vLLM stays behavior oracle); `SGLANG-ORACLE-CORRECT`
+token-exact cross-check separate/pending; not the full P2 binding grid. Image +
+build tree PRUNED from the 98%-full shared box after extraction (disk restored to
+78 GB); evidence kept at dgx `~/work/sglang-bench-HEAD/evidence`. **NON-COLLISION:**
+a concurrent session owns README/Metal — untouched; the harness `SGLANG_IMAGE`
+pin (`serve_low_common.py`, still v0.5.13) NOT edited (deliberate re-pin to
+v0.5.15 recorded, not silently changed in code).
+
 **C8 OpenAI-server endpoint-parity note (2026-07-28, `CLAIM-C8-SERVE-ENDPOINTS`,
 LANDED + CPU-GATED, NOT pushed — FULL SHA reported to caller).** Closes two
 `ROAD-V1-C8` OpenAI-server endpoint-parity gaps under MIRROR-vLLM on base local

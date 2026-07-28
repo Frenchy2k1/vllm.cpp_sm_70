@@ -145,6 +145,84 @@ remain the separate benchmark track (`BACKEND-GATE-CUDA-SGLANG` cache-neutral +
 `sglang bench_serving` on the idle GB10 once the oracle is stood up (arm64 cu130
 image) and our-side `SERVE-ASYNC-LLM` lands. No source/engine path touched here.
 
+**SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
+`CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —
+throughput/TTFT WIN, TPOT/ITL open GAP (`benchmark_binding` = competitor-floor,
+cache-neutral arm only; NOT the full P2 binding grid).** The SGLang
+`v0.5.15-cu130` arm64 image (`docker.io/lmsysorg/sglang:v0.5.15-cu130@sha256:d0a667eca4e6…`,
+arch digest `sha256:ce9667f4…`) PULLED and RAN the 27B-NVFP4 gate model on GB10
+sm_121a with **no from-source build** ("server is fired up and ready to roll",
+CUDA graphs captured). First SGLang-vs-ours competitor-floor comparison, idle
+GB10, one `flock`, engines strictly sequential (SGLang torn down + GPU freed +
+MemAvailable returned to baseline before ours launched), 3 reps + warmup, all
+within run-noise (CV mostly <0.1%).
+
+**Model/workload equivalence.** vllm.cpp `7e9ffbff` vs SGLang `v0.5.15` both load
+byte-identical `unsloth/Qwen3.6-27B-NVFP4` snapshot `890bdef7` (dense hybrid
+mamba+attention). Deterministic custom corpus (seed 0, 80 prompts × **1024 input
+/ 128 output tokens exact**, common-prefix ≤32 = **cache-neutral**), greedy
+(temp 0, top-p 1, `ignore_eos`), `--request-rate inf`, KV capacity **20480
+tokens matched both arms**. Both emitted exactly 80×128 output tokens, 0 errors,
+identical peak concurrency (c16→21, c8→13). Client = `sglang.bench_serving` from
+the pinned image (`--backend sglang-oai` vs `vllm`, same OpenAI-completions path).
+
+**Results (median of 3 reps; ratio normalized so >1.0 = ours wins):**
+
+| Axis | c16 SGLang | c16 ours | c16 | c8 SGLang | c8 ours | c8 |
+|---|---|---|---|---|---|---|
+| Total tput tok/s ↑ | 367.3 | **812.5** | **2.21×** | 367.2 | **529.1** | **1.44×** |
+| Output tput tok/s ↑ | 40.8 | **90.3** | **2.21×** | 40.8 | **58.8** | **1.44×** |
+| Requests/s ↑ | 0.319 | **0.705** | **2.21×** | 0.319 | **0.459** | **1.44×** |
+| Mean TTFT ms ↓ | 33425 | **2980** | **11.2×** | 11289 | **1775** | **6.4×** |
+| Median TTFT ms ↓ | 33867 | **2714** | **12.5×** | 18158 | **1638** | **11.1×** |
+| P99 TTFT ms ↓ | 49561 | **7220** | **6.9×** | 18198 | **3589** | **5.1×** |
+| Mean TPOT ms ↓ | **104.0** | 154.4 | 0.67× GAP | **104.0** | 122.9 | 0.85× GAP |
+| Mean ITL ms ↓ | **105.6** | 154.4 | 0.68× GAP | **105.7** | 122.9 | 0.86× GAP |
+| Median ITL ms ↓ | **105.5** | 125.2 | 0.84× GAP | **105.5** | 109.9 | 0.96× ~tie |
+| Peak mem GB proxy ↓ | **~54.9** | ~56.4 | ~1.03× | — | — | — |
+
+**Honest verdict.** Ours BEATS the SGLang v0.5.15 floor on aggregate throughput
+(2.21×/1.44×) and TTFT (6–12× lower) — near-zero admission queue vs SGLang's
+33 s/11 s. **SGLang WINS the steady-state per-token decode latency (TPOT/ITL
+1.18–1.49× below ours): a reproduced OPEN GAP, candidate future lever** (our
+throughput comes from larger decode batches that raise per-request per-token
+latency). Peak memory (unified-pool MemAvailable delta; nvidia-smi N/A)
+comparable, ours ~1.5 GB higher — indicative not binding. **Residuals:** 35B not
+run; c1/c2/c4 not run (SGLang c1 ~13.3 s/it, impractical for 3-rep reproduction);
+shared-prefix cache-ON arm (`BACKEND-GATE-CUDA-SGLANG-PREFIX`) not run; vLLM arm
+not re-measured (SGLang floor specifically); `SGLANG-ORACLE-CORRECT` token-exact
+cross-check separate/pending.
+
+**Repro recipe.** vllm.cpp build (dgx GB10): `git archive 7e9ffbff` →
+`cmake -S . -B build-cuda -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_SERVER=ON
+-DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` (cutlass-ON + FA2-ENABLED banners) →
+`cmake --build build-cuda --target server`. SGLang server:
+`docker run -d --gpus all --ipc=host --network=host --pull=never --mount
+type=bind,src=<27B-repo>,dst=/models/gate,readonly sglang-bench:v0.5.15-cu130
+python3 -m sglang.launch_server --model-path /models/gate/snapshots/890bdef7…
+--served-model-name gate --host 127.0.0.1 --port 30000 --context-length 1152
+--max-running-requests 16 --max-total-tokens 20480 --mem-fraction-static 0.30
+--stream-interval 1`. Ours server:
+`build-cuda/examples/server --model <27B-snapshot> --served-model-name gate
+--host 127.0.0.1 --port 30000 --block-size 32 --num-blocks 640 --max-model-len
+1152 --max-num-seqs 16` (LD_LIBRARY_PATH=/usr/local/cuda/lib64). Corpus:
+`tools/bench/make_serve_low_corpus.py --tokenizer-json <27B>/tokenizer.json
+--tokenizer-revision 890bdef7… --model-key 27 --out <ev>/corpus/27`. Client (per
+arm/conc/rep): `docker run --rm --network=host --pull=never --mount …:/models/gate
+--mount <ev>:/evidence sglang-bench:v0.5.15-cu130 python3 -m sglang.bench_serving
+--backend <sglang-oai|vllm> --base-url http://127.0.0.1:30000 --model gate
+--tokenizer /models/gate/snapshots/890bdef7… --dataset-name custom --dataset-path
+/evidence/corpus/27/c<C>-r<R>.jsonl --num-prompts 80 --sharegpt-output-len 128
+--request-rate inf --max-concurrency <8|16> --warmup-requests 0 --seed 0
+--temperature 0 --top-p 1 --extra-request-body '{"ignore_eos":true}'
+--output-details --output-file /evidence/raw/27/<engine>/c<C>-r<R>.jsonl`.
+Wrap the whole SGLang-then-ours series in one `flock $HOME/gpu.lock`; verify
+`nvidia-smi` shows only the measured process; keep `--mem-fraction-static` LOW
+(0.30 — the unified 119 GiB pool OOM-reboots at 0.85). Evidence (dgx):
+`~/work/sglang-bench-HEAD/evidence/raw/27/{sglang,ours}/c{8,16}-r{1,2,3}.jsonl`.
+
 **SGLang RadixAttention behavior-parity scope (2026-07-27,
 `CLAIM-SGLANG-RADIX-SCOPE`, NOT pushed).** Disposition: **NOT APPLICABLE
 (scoping spike; no measurement taken, claimed, or owed; `benchmark_binding=false`).**
