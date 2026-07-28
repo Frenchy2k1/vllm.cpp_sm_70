@@ -29741,3 +29741,25 @@ the MTP row.
 Standing lesson, now twice-confirmed on this track: for a format produced by a
 tool we do not own, read the CONVERTER, not the artifact. Shape checks catch
 layout; they never catch convention.
+- **2026-07-28** — **Turing `sm_75` W1 (bf16-WMMA guard) LANDED + BUILD-VERIFIED**
+  (`CLAIM-CUDA-TURING-SM75`, spec `specs/cuda-arch-breadth-fp16.md` W1; base local
+  `main` `034be66e`; NOT pushed). The beyond-vLLM breadth lane's first shippable
+  brick. The 5 bf16-WMMA prefill kernels in `src/vt/cuda/cuda_paged_attn.cu`
+  (`:732,958,1197,1472,1716`) are now guarded `#if __CUDA_ARCH__ >= 800`
+  (`#else __trap()`) so the TU compiles on `sm_75` selecting the EXISTING scalar
+  CUDA-core fallback (`:2373`) — `nvcuda::wmma::fragment<…__nv_bfloat16…>` is a
+  complete type only on Ampere+. COMPILE-ONLY, GPU-SAFE (nvcc only, no kernels);
+  disk-guarded (dgx 73G ≥ 25G). **Evidence (dgx nvcc 13.0.88 + cutlass 4.5.0):**
+  single-arch `75` `cuda_paged_attn.cu` `-Werror=all-warnings` **0-warn EXIT=0**;
+  `cuobjdump -lelf` → real `cuda_paged_attn.cu.1.sm_75.cubin`. RED: unguarded HEAD
+  fails EXIT=1 / 21 errors (the `incomplete type …__nv_bfloat16… fragment` at
+  `:1797` gone). sm_121a NEUTRALITY: same TU `-Werror` 0-warn AND sm_121a SASS
+  byte-identical to unguarded (0 instruction diffs — preprocessor identity proven
+  empirically). SIGNAL `DERIVED+BUILD-VERIFIED (testing-welcome)`: **NO Turing
+  board ran it** — a green compile + SASS is not execution evidence; no vLLM oracle
+  on Turing (dropped), so correctness is testing-welcome (llama.cpp-on-card +
+  portable cross-check). Records: `backend-matrix.md` (`BACKEND-CUDA-SM075` cells +
+  intro, row stays `SPIKE`), spec W1/B0/B1, `roadmap_v1.md` `ROAD-V1-D1-CUDA`,
+  `docs/STATUS.md`, `docs/BENCHMARKS.md` (NOT-APPLICABLE, `benchmark_binding=false`),
+  ledger, this log, `coordination.md` claim. NEXT: W2/W3 llama.cpp fp16 tile/vec
+  fast body; W7 on-card runtime gate needs a Turing board.

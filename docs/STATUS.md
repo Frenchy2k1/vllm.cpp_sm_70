@@ -279,6 +279,21 @@ kernel campaign). The other fan-out boards remain build-supported only (no board
 here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
 
+A separate **beyond-vLLM breadth lane** targets the older NVIDIA arches vLLM
+DROPS but llama.cpp still runs (Pascal/Volta/Turing). Its first brick landed
+2026-07-28: **Turing `sm_75` is BUILD-VERIFIED.** The bf16-WMMA prefill kernels
+(bf16 tensor-core fragments are Ampere+ only) are now guarded
+`#if __CUDA_ARCH__ >= 800`, so a single-arch `75` build compiles `-Werror` 0
+warnings on nvcc 13.0 and `cuobjdump` shows real `sm_75` cubins — the TU falls
+back to the existing scalar CUDA-core attention path (the llama.cpp fp16 fast
+body is a later brick). On `sm_80`+ the guard is a no-op (preprocessor identity),
+so the GB10 gate build is byte-identical. This is
+**DERIVED+BUILD-VERIFIED (testing-welcome), NOT runtime** — no Turing board ran
+it; there is no vLLM oracle on Turing (vLLM dropped it), so correctness is
+referenced against llama.cpp-on-card plus a portable cross-check. Volta/Pascal
+need a CUDA `<13` toolkit (nvcc 13 rejects `sm_70`/`sm_60`/`sm_61`). See
+[.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM075`.
+
 **Metal (Apple Silicon), indicative, not binding.** Two models run end to end
 and pass correctness (OPT-125m, Qwen3-0.6B); 18 of 75 ops are native, the rest
 fall back to CPU on unified memory. Kernel work including mma prefill attention
@@ -357,18 +372,22 @@ AGX Orin (sm_87) and NVIDIA Thor (Blackwell) as the reachable runtime-gate board
 
 **Datacenter CUDA arches (Hopper `sm_90a`, Blackwell `sm_100/103/110`) — build-only, fast-path SPIKED.** These arches compile today as **portable-kernels-only** (`build-only`; every wgmma/tcgen05 fast-path FEATURE-TABLE cell resolves EMPTY, no board here) — see [.agents/backend-matrix.md](../.agents/backend-matrix.md). The FRAMEWORK (arch-additivity seams) is done; the FAST-PATH kernel bodies are now scoped for **derive-and-ship** (the llama.cpp model) in [.agents/specs/cuda-arch-datacenter-fastpath.md](../.agents/specs/cuda-arch-datacenter-fastpath.md). The CUTLASS C3x / NVFP4-tcgen05 / grouped-MoE / MLA kernels are CUTLASS template instantiations (the wgmma/tcgen05 MMA lives in cutlass 4.5.0, selected by `ArchTag`), so they are 1:1-portable and BUILD-VERIFIABLE here via a single-arch `90a`/`100a` cross-compile + `cuobjdump` SASS proof, with NO Hopper/B200 board. Such kernels will ship LABELED `DERIVED+BUILD-VERIFIED (testing-welcome)` — a faithful port with a compile+SASS proof, HONESTLY untested (a green link is not execution evidence); cloud-GPU token-exact + every-axis runs upgrade the label to runtime-verified. DeepGEMM (runtime JIT/autotune) is the one path that is `not-yet-buildable / needs-real-port` and ships no fake.
 
-**CUDA arch breadth beyond vLLM (Pascal / Volta / Turing), scoping only.** These
+**CUDA arch breadth beyond vLLM (Pascal / Volta / Turing).** These
 are older NVIDIA arches vLLM DROPS but llama.cpp still supports, so this is a
 "support more than vLLM" lane with llama.cpp as both the kernel source and the
 competitor floor. Our portable attention uses bf16 tensor-core WMMA, which does
-not exist before Ampere, so these arches need a new fp16/non-tensor-core kernel
-body (ported 1:1 from llama.cpp's `fattn-tile`/`fattn-vec`). State: a committed
-scoping spike ([.agents/specs/cuda-arch-breadth-fp16.md](../.agents/specs/cuda-arch-breadth-fp16.md)),
-no code. The lane is derive-and-ship: **Turing (`sm_75`, e.g. the cloud-common
-T4) is buildable on our current CUDA 13 toolkit** once the bf16-WMMA path is
-compile-guarded and the fp16 body is ported, and would ship labeled
-"derived from llama.cpp, build-verified, not hardware-tested here, community
-testing welcome". **Volta (`sm_70`, V100) and Pascal (`sm_60`/`sm_61`, P100/P40)
+not exist before Ampere, so these arches need the bf16-WMMA path compile-guarded
+(and, for a fast path, a new fp16/non-tensor-core kernel body ported 1:1 from
+llama.cpp's `fattn-tile`/`fattn-vec`). The lane is derive-and-ship, and its first
+brick has LANDED: **Turing (`sm_75`, e.g. the cloud-common T4) is BUILD-VERIFIED**
+(2026-07-28, `CLAIM-CUDA-TURING-SM75`). The bf16-WMMA prefill kernels are now
+guarded `#if __CUDA_ARCH__ >= 800`, so a single-arch `75` build compiles `-Werror`
+0-warn on our current CUDA 13 toolkit and `cuobjdump` shows real `sm_75` cubins —
+the TU falls back to the existing scalar CUDA-core attention path (the fp16 fast
+body is a separate later brick). On `sm_80`+ the guard is a no-op (byte-identical
+GB10 build). It ships labeled "derived, build-verified, not hardware-tested here,
+community testing welcome" — no Turing board ran it; a green compile + SASS is not
+execution evidence. **Volta (`sm_70`, V100) and Pascal (`sm_60`/`sm_61`, P100/P40)
 are not-yet-buildable** because CUDA 13 dropped their code generation and no
 CUDA 12.x toolkit is provisioned here. There is no vLLM oracle on these cards
 (vLLM will not run there), so a real correctness test uses llama.cpp on the same
