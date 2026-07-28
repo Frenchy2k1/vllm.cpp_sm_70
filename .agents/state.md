@@ -28520,3 +28520,58 @@ All record checkers rc=0. NOT pushed; FULL SHA reported to caller.
   output-handler-thread → collector path. **Residuals (named):** per-beam concurrent
   stepping, streaming beam (rejected like upstream), C-ABI beam, grammar-constrained
   beams, encoder-decoder/LoRA beams. NOT pushed; FULL SHA reported to caller.
+
+## 2026-07-28 — OpenAI-server `/tokenizer_info` + `/abort_requests` LANDED (`CLAIM-C8-SERVE-ENDPOINTS`)
+
+**Base.** Local `main` `a2544e75` (confirmed `git rev-parse HEAD`), isolated
+worktree `.claude/worktrees/agent-a77ef0d33874d7aee`, CPU-only, NO dgx. vLLM pin
+`555967922`/0.26.0.dev0. Closes two ROAD-V1-C8 OpenAI-server endpoint-parity gaps
+under MIRROR-vLLM (`SERVE-UTILITY-ENDPOINTS` stays `ACTIVE` + gains `/tokenizer_info`;
+`SERVE-ADMIN` INVENTORIED→ACTIVE with `/abort_requests`; C8 stays `PARTIAL`).
+
+**What landed.** Two ADDITIVE, opt-in routes on `ApiServer` (a server without the
+backing is byte-identical — the route simply 404s). (1) `GET /tokenizer_info`
+(`handle_tokenizer_info`, `api_server.cpp:438`) gated behind
+`set_tokenizer_info_enabled` mirroring vLLM's `enable_tokenizer_info_endpoint` CLI
+flag (off by default → route absent → 404). Surfaces the `tokenizer_config.json`-
+equivalent fields our byte-level/SentencePiece BPE tokenizer can GENUINELY back —
+`tokenizer_class` (BPE family name), `model_max_length`, `vocab_size`,
+`bos`/`eos_token_id`, `added_tokens_decoder` (id→`{content,special,lstrip,rstrip}`)
+— and OMITS+NAMES the gaps it cannot: the raw `chat_template` string (lives in the
+ChatPromptFn seam), the HF `init_kwargs`, and added-token `normalized`/`single_word`.
+Grounded 1:1 in `serve/tokenize/api_router.py:95-108` + `serving.py:154-195` +
+`protocol.py:185`. (2) `POST /abort_requests` (`handle_abort_requests`,
+`api_server.cpp:488`) parses `{request_ids}`, aborts the listed ids via an injected
+callback wired to `AsyncLLM::abort` (empty→"abort all"), returns
+`{"status":"aborted","aborted":N}` (malformed→400 `{"detail":...}`, failure→500
+`{"error":...}`) — all shapes 1:1 `serve/dev/rlhf/api_router.py:94-138`. The third
+targeted endpoint `/reset_prefix_cache` was ALREADY landed (`CLAIM-ROADMAP-C8`) —
+confirmed present + untouched. NO new engine-matrix row → ENGINE count unchanged (122).
+
+**Gate (CPU, schema+behaviour EXACT, RED-first).** `test_openai_api_server` 31/31
+(379 asserts, was 27/27); 4 NEW: `/tokenizer_info` backed fields + named-gap
+omissions + no-tokenizer 500; `/abort_requests` shape+wiring (explicit ids
+passthrough, empty→abort-all, malformed→400 `{"detail":...}`); aborts an in-flight
+AsyncLLM request (added under a known id) → `has_unfinished_requests()`→false;
+opt-in route gate over a REAL socket (404 flag-off/no-callback → 200 attached).
+**RED evidence:** rebuilding with the two route registrations disabled (`if (false
+&& …)`) flips the enabled-path to 404/empty-body → the socket-gate "attached→200"
+subcase fails 5 asserts; restored → 31/31. **Inertness (existing routes
+byte-identical):** `test_openai_conformance` 23/23 (252) + `test_openai_serving`
+40/40 (527) UNCHANGED. Clean full-library CPU `-Werror` (`-Wall -Wextra -Werror`,
+`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON` Release) **0-warn** incl. the `server`
+binary. Records: `engine-matrix.md` `SERVE-UTILITY-ENDPOINTS` + `SERVE-ADMIN` rows,
+`feature-matrix.md` §serving, `roadmap_v1.md` C8, `specs/utility-endpoints.md`
+(`/tokenizer_info` section) + NEW `specs/admin-endpoints.md` (`/abort_requests`),
+`docs/STATUS.md`, `docs/BENCHMARKS.md` (NOT-APPLICABLE — feature), ledger,
+coordination `CLAIM-C8-SERVE-ENDPOINTS`, this entry. All record checkers rc=0.
+**HONEST LANDED-vs-RESIDUAL:** 2 of the 3 targeted endpoints landed here
+(`/tokenizer_info`, `/abort_requests`); `/reset_prefix_cache` was already present.
+Residuals (named): production `examples/server/main.cpp` wiring of the whole opt-in
+C8 endpoint family (none attached in the production binary yet — deferred exactly as
+the already-landed tokenize/detokenize/metrics/reset are); `/abort_requests`
+empty-list "abort ALL" enumeration needs an `AsyncLLM` active-request-id accessor
+not exposed today (callback contract IS wired). Broader vLLM admin endpoints
+(`/sleep`/`/wake_up`/`/is_sleeping`, `/pause`/`/resume`, `/start_profile`/
+`/stop_profile`, weight-update/EP) remain INVENTORIED + OUT OF SCOPE. NOT pushed;
+FULL SHA reported to caller.

@@ -250,6 +250,23 @@ stay green). Reproduce:
 `cmake --build build-cpu --target test_prometheus_metrics test_openai_api_server &&
 ./build-cpu/tests/test_prometheus_metrics && ./build-cpu/tests/test_openai_api_server`.
 
+**ROAD-V1-C8 `/tokenizer_info` + `/abort_requests` (2026-07-28,
+`CLAIM-C8-SERVE-ENDPOINTS`, NOT pushed).** Disposition: **NOT APPLICABLE (no
+throughput number, `benchmark_binding=false`).** Two additive, opt-in
+OpenAI-server admin/utility endpoints — `GET /tokenizer_info` (flag-gated like
+vLLM's `enable_tokenizer_info_endpoint`, surfacing the tokenizer-config fields the
+BPE tokenizer can genuinely back and omitting the named gaps) and `POST
+/abort_requests` (abort in-flight requests by id via an injected engine-abort
+callback) — are serving-surface parity, not compute paths, so no vLLM throughput
+A/B applies. Gates are schema/behaviour exactness: response shapes 1:1 vLLM
+0.26.0.dev0 (`555967922`), `/tokenizer_info` returns the backed fields, and
+`/abort_requests` tears down an in-flight AsyncLLM request. Gated on CPU:
+`test_openai_api_server` 31/31 (379 assertions; the two new endpoints RED-first
+via the opt-in route gate — 404 flag-off/no-callback → 200 attached). Inertness:
+`test_openai_conformance` 23/23 + `test_openai_serving` 40/40 byte-identical.
+Reproduce: `cmake --build build-cpu --target test_openai_api_server &&
+./build-cpu/tests/test_openai_api_server`.
+
 **ROAD-V1-C8 chat-form `/tokenize` (2026-07-28, `CLAIM-C8-CHAT-TOKENIZE`, NOT
 pushed).** Disposition: **NOT APPLICABLE (no throughput number,
 `benchmark_binding=false`).** Extending `/tokenize` to accept the chat

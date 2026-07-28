@@ -29,6 +29,44 @@ rejected loudly rather than mis-answered.
 - `vllm/entrypoints/serve/dev/cache/api_router.py:20` — POST `/reset_prefix_cache`
   with `reset_running_requests`/`reset_external` query params → `{"success":
   bool}`.
+- `vllm/entrypoints/serve/tokenize/api_router.py:95-108` — `attach_router` only
+  registers `GET /tokenizer_info` when
+  `app.state.args.enable_tokenizer_info_endpoint`; `serve/tokenize/serving.py:154-195`
+  — `get_tokenizer_info` → `TokenizerInfo(tokenizer, chat_template).to_dict()`
+  (`_get_tokenizer_config` = the HF `tokenizer.init_kwargs` minus
+  `vocab_file`/`merges_file`, plus `tokenizer_class` + optional `chat_template`);
+  `serve/tokenize/protocol.py:185` — `TokenizerInfoResponse(ConfigDict
+  extra="allow", tokenizer_class: str)`.
+
+## `/tokenizer_info` (`CLAIM-C8-SERVE-ENDPOINTS`, 2026-07-28)
+
+`GET /tokenizer_info` is gated behind `set_tokenizer_info_enabled(true)` mirroring
+vLLM's `enable_tokenizer_info_endpoint` CLI flag: OFF by default, so the route is
+not registered (→ 404) unless the flag is on AND a tokenizer is attached. vLLM
+emits the whole `tokenizer_config.json`-equivalent `init_kwargs` dict verbatim
+(`extra="allow"`) plus the required `tokenizer_class`. We surface EXACTLY the
+fields our byte-level / SentencePiece BPE tokenizer can GENUINELY back and OMIT
+(never fabricate) the ones it does not carry:
+
+- `tokenizer_class` (REQUIRED): the genuine BPE family — `ByteLevelBPETokenizer`
+  or `SentencePieceBPETokenizer` (the HF `tokenizers` library's own class names),
+  from `Tokenizer::GetFamily()`.
+- `model_max_length`: the attached `max_model_len` (omitted when ≤0).
+- `vocab_size`: `Tokenizer::VocabSize()`.
+- `bos_token_id` / `eos_token_id`: `Tokenizer::BosId()`/`EosId()`, omitted when -1.
+- `added_tokens_decoder`: id → `{content, special, lstrip, rstrip}` for each
+  `Tokenizer::AddedTokens()` entry (the HF `tokenizer_config.json` map shape).
+
+NAMED GAPS (vLLM emits, our tokenizer cannot back, so OMITTED — recorded honestly):
+
+- The raw `chat_template` string — our chat template lives in the `ChatPromptFn`
+  render seam (`chat_.prompt_fn()`), not on the `Tokenizer` object, so we cannot
+  echo the source template here.
+- The HF `init_kwargs` general contents (`clean_up_tokenization_spaces`,
+  `add_bos_token`, `model_input_names`, padding/truncation defaults, …) — not
+  parsed by our loader.
+- The added-token `normalized` / `single_word` flags — not stored on
+  `vllm::tok::SpecialToken` (which carries only content/id/special/lstrip/rstrip).
 
 ## Our baseline
 
@@ -78,8 +116,14 @@ KV-block-hash code touched).
 
 - W1: `/tokenize` + `/detokenize` (prompt/tokens forms) + tests — DONE.
 - W2: `/ping` + `/server_info` + `/reset_prefix_cache` + tests — DONE.
-- W3 (residual): chat-form `/tokenize` (messages + chat template + tools),
-  `/tokenizer_info`, `/ready`, and the full `server_info` config dump — OPEN.
+- W3: chat-form `/tokenize` (messages + chat template + tools) — DONE
+  (`CLAIM-C8-CHAT-TOKENIZE`); `/tokenizer_info` — DONE (`CLAIM-C8-SERVE-ENDPOINTS`,
+  2026-07-28, with the named-gap omissions above).
+- W4 (residual): `/ready`, the full `server_info` config dump, and production
+  `main.cpp` wiring of the whole opt-in C8 endpoint family (tokenize/detokenize/
+  metrics/reset/tokenizer_info are handler+setter+route+test complete but NOT yet
+  attached in the production server binary — the same deferred state for all of
+  them) — OPEN.
 
 ## Risks/decisions
 

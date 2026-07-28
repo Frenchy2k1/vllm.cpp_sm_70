@@ -435,6 +435,113 @@ ApiServer::DispatchResult ApiServer::handle_server_info() const {
   return out;
 }
 
+ApiServer::DispatchResult ApiServer::handle_tokenizer_info() const {
+  // serve/tokenize/api_router.py:95-108 (attach_router → get_tokenizer_info,
+  // registered only when app.state.args.enable_tokenizer_info_endpoint) →
+  // serve/tokenize/serving.py:154-160 get_tokenizer_info →
+  // TokenizerInfo(tokenizer, chat_template).to_dict() (:164-195) →
+  // TokenizerInfoResponse (serve/tokenize/protocol.py:185, ConfigDict
+  // extra="allow", required `tokenizer_class`).
+  //
+  // vLLM emits the HF `tokenizer_config.json` init_kwargs verbatim (minus the
+  // vocab_file/merges_file paths) plus `tokenizer_class` and optional
+  // `chat_template`. We surface EXACTLY the fields our byte-level /
+  // SentencePiece BPE tokenizer can genuinely back. Fields vLLM emits that our
+  // tokenizer does not carry are OMITTED (never fabricated) and NAMED in
+  // specs/utility-endpoints.md: the raw `chat_template` string (our chat
+  // template lives in the ChatPromptFn render seam, not the tokenizer), the HF
+  // init_kwargs (clean_up_tokenization_spaces / add_bos_token /
+  // model_input_names / padding-truncation defaults — not parsed), and the
+  // added-token `normalized` / `single_word` flags (not stored on SpecialToken).
+  if (tokenizer_ == nullptr) {
+    return MakeError(500, "InternalServerError", "No tokenizer configured.");
+  }
+  nlohmann::json info;
+  // `tokenizer_class` (REQUIRED by TokenizerInfoResponse): the genuine BPE
+  // family (the HF `tokenizers` library's own class names for these two
+  // byte-level / SentencePiece BPE tokenizers).
+  info["tokenizer_class"] = tokenizer_->IsSentencePiece()
+                                ? "SentencePieceBPETokenizer"
+                                : "ByteLevelBPETokenizer";
+  if (max_model_len_ > 0) info["model_max_length"] = max_model_len_;
+  info["vocab_size"] = tokenizer_->VocabSize();
+  if (tokenizer_->BosId() >= 0) info["bos_token_id"] = tokenizer_->BosId();
+  if (tokenizer_->EosId() >= 0) info["eos_token_id"] = tokenizer_->EosId();
+  // `added_tokens_decoder` mirrors the HF tokenizer_config.json map id →
+  // {content, special, lstrip, rstrip}. `normalized`/`single_word` are not
+  // tracked by our SpecialToken, so they are omitted (named above).
+  nlohmann::json added = nlohmann::json::object();
+  for (const vllm::tok::SpecialToken& t : tokenizer_->AddedTokens()) {
+    added[std::to_string(t.id)] = {{"content", t.text},
+                                   {"special", t.special},
+                                   {"lstrip", t.lstrip},
+                                   {"rstrip", t.rstrip}};
+  }
+  info["added_tokens_decoder"] = added;
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = "application/json";
+  out.body = info.dump();
+  return out;
+}
+
+ApiServer::DispatchResult ApiServer::handle_abort_requests(
+    const std::string& request_body) const {
+  // serve/dev/rlhf/api_router.py:94-138 (abort_requests): parse the body,
+  // extract `request_ids`; a non-empty list aborts exactly those (external)
+  // ids via engine.abort(request_ids); an empty/missing list aborts ALL
+  // in-flight requests. Response {"status":"aborted","aborted":<count>}. A
+  // malformed body → 400 {"detail":"Invalid JSON format"}; an abort failure →
+  // 500 {"error": "..."} (both mirror the upstream router shapes exactly).
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception&) {
+    DispatchResult err;
+    err.status = 400;
+    err.content_type = "application/json";
+    err.body = nlohmann::json{{"detail", "Invalid JSON format"}}.dump();
+    return err;
+  }
+  std::vector<std::string> request_ids;
+  if (auto it = body.find("request_ids");
+      it != body.end() && it->is_array()) {
+    try {
+      request_ids = it->get<std::vector<std::string>>();
+    } catch (const std::exception& e) {
+      DispatchResult err;
+      err.status = 400;
+      err.content_type = "application/json";
+      err.body =
+          nlohmann::json{{"detail",
+                          std::string("Invalid request_ids: ") + e.what()}}
+              .dump();
+      return err;
+    }
+  }
+  int aborted = 0;
+  if (abort_requests_) {
+    try {
+      aborted = abort_requests_(request_ids);
+    } catch (const std::exception& e) {
+      DispatchResult err;
+      err.status = 500;
+      err.content_type = "application/json";
+      err.body =
+          nlohmann::json{
+              {"error", std::string("Failed to abort requests: ") + e.what()}}
+              .dump();
+      return err;
+    }
+  }
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = "application/json";
+  out.body =
+      nlohmann::json{{"status", "aborted"}, {"aborted", aborted}}.dump();
+  return out;
+}
+
 void ApiServer::register_routes() {
   httplib::Server& server = impl_->server;
 
@@ -570,6 +677,25 @@ void ApiServer::register_routes() {
               req.has_param("reset_external") &&
               req.get_param_value("reset_external") == "true";
           write(handle_reset_prefix_cache(reset_running, reset_external), res);
+        });
+  }
+  // GET /tokenizer_info registered only when a tokenizer is attached AND the
+  // info endpoint is enabled — mirrors vLLM gating it behind
+  // enable_tokenizer_info_endpoint (serve/tokenize/api_router.py:95).
+  if (tokenizer_ != nullptr && tokenizer_info_enabled_) {
+    server.Get(
+        "/tokenizer_info",
+        [this, write](const httplib::Request&, httplib::Response& res) {
+          write(handle_tokenizer_info(), res);
+        });
+  }
+  // POST /abort_requests registered only when the abort callback is attached
+  // (serve/dev/rlhf/api_router.py:94).
+  if (abort_requests_) {
+    server.Post(
+        "/abort_requests",
+        [this, write](const httplib::Request& req, httplib::Response& res) {
+          write(handle_abort_requests(req.body), res);
         });
   }
 }
