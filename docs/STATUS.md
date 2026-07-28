@@ -37,7 +37,7 @@ token-for-token correctness against the pinned oracle.
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete, at/above vLLM speed | Token-exact greedy on GB10; beats vLLM 0.25.0 total throughput at every concurrency (1.007-1.045x), effective parity 115/124 axes |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete, decode at-parity, prefill speed-pending | Token-exact greedy; decode at or beyond vLLM, remaining gap is prefill TTFT |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual |
-| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical, and token-identical to the previous series; direct loading cuts peak/stable host PSS by 73.4%/91.1% and mean TTFT by 12.7%. Revalidated on `main` @ `7f620e74`: 0.9819x vLLM 0.24.0 total throughput, TTFT passes, TPOT 14.0% high. The failing axis is the discrete-GPU async-overlap gap, scoped as ENG-ASYNC-SCHED W4 |
+| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical, and token-identical to the previous series; direct loading cuts peak/stable host PSS by 73.4%/91.1% and mean TTFT by 12.7%. Against an oracle built at the actual parity pin: 0.9970x total throughput, TTFT passes (0.773x), TPOT 12.4% high. The failing axis is the discrete-GPU async-overlap gap, scoped as ENG-ASYNC-SCHED W4 |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM |
 | Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
@@ -549,8 +549,10 @@ InternLM2 plus a sliding window).
 
 ## Build and test lanes
 
-An oracle built from source at the actual parity pin now exists alongside the
-0.24.0 one; re-measuring the denominator against it is pending.
+Measured against an oracle built from source at the ACTUAL parity pin, the gap
+is 0.9970x total throughput, not the 0.9819x published against the older
+pip-installed 0.24.0 release: that release is 1.25% faster than the pin, so
+the old denominator was understating us. TPOT (+12.4%) is the one real gap.
 
 One open lead is on record from the same profiling pass: cuBLASLt resolves
 Ampere-class GEMM kernels on this Blackwell device. It is unmeasured and may be

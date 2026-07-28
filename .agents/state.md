@@ -32548,3 +32548,56 @@ device — if vLLM also lands on `cutlass_80` there is no gap to close, and the
 protocol is explicit that the oracle's trace, not ours alone, decides. The
 honest next step is a matched pair of traces (ours and vLLM's) on the identical
 corpus, diffed by kernel name, before anyone tries to force a tactic.
+
+## 2026-07-28 — oracle rebuilt AT the parity pin; the published ratio was PESSIMISTIC, not flattering
+
+The local oracle was two versions behind the pin and, on investigation, could
+never have matched it by installation: the pin `555967922` is a vLLM **main**
+commit with no release tag and **no prebuilt wheel on any platform** (x86_64
+verified here; the pin spec verified aarch64). `pip install vllm` reaches only
+PyPI releases, so the 2026-07-09 provisioning got 0.24.0 and drifted from there.
+The records compounded it by labelling that venv "0.25.0".
+
+**Built from source at the pin** into a SEPARATE venv (`.venv-vllm-pin`,
+`vllm 0.23.1rc1.dev1511+g555967922.cu132`, sm_120 only) with the pinned stack
+(torch 2.13.0, torchvision 0.28.0, triton 3.7.1, transformers 5.14.1, flashinfer
+0.6.15.post1, cutlass-dsl 4.6.0, tilelang 0.1.9). The 0.24.0 venv is untouched
+and retained as a rollback denominator. `${VLLM_SOURCE}` is now a real checkout
+at the pin (`/home/rich/c/vllm-upstream`), so pin-era mirror claims no longer
+have to be hedged.
+
+**THE RESULT — the direction is the surprise.** vLLM at the pin is **0.9875x**
+the 0.24.0 release on this workload, i.e. the old denominator was the FASTER
+vLLM. So the published 0.9819x was understating us. Against the true pin:
+total/output throughput **0.9970x** (6618.160 vs 6638.129), req/s 0.9969x, TTFT
+**0.7731x PASS**, TPOT **1.1241x FAIL**. The throughput gap is 0.3%, not 1.8%,
+with no change to our code; TPOT (+12.4%) is confirmed as the one real gap.
+Control: our own arm reproduces the previous series exactly (1.0027x,
+token-identical 128/128 per repetition), which is what makes the delta
+attributable to the oracle rather than to us. Spread 0.11% (pin) / 0.08% (ours).
+
+**The CUDA toolkit ceiling, recorded because it cost two full builds.** The
+usable CUDA version is set by what the DRIVER can JIT, not by what is newest.
+vLLM ships FA2 as `8.0+PTX`, so the driver JIT-compiles its PTX for Blackwell at
+load; driver 595.71.05 tops out at 13.2 and rejects nvcc-13.3 PTX with
+`cudaErrorUnsupportedPtxVersion` — visible only at RUNTIME, after a clean build.
+CUDA 13.0 is separately unusable (headers predate glibc 2.42's `rsqrt`; fixed
+from 13.1 via `_NV_RSQRT_SPECIFIER`). 13.2 is the only version clearing both, the
+whole toolkit must match (cccl hard-errors on a mixed compiler/header pair), and
+vLLM must be installed `--no-deps` or pip re-resolves the runtime down to 13.0
+after the build and reintroduces the mismatch. pip's CUDA wheels also ship no
+unversioned `.so`, so `find_library` needs dev symlinks.
+
+`run_qwen35_4b_compare.sh` gains `VLLM_CUDA_HOME` for a venv carrying its own
+toolkit; unset, behaviour is unchanged.
+
+**Correction to an earlier claim in this session:** I reported that the repo's
+`triton_kernels/` directory shadows Triton's package in benchmark runs. It does
+NOT. The harness invokes the metrics script BY PATH, so `sys.path[0]` is
+`tools/bench` and the repo root is never on `sys.path` — verified directly. The
+shadowing only occurred in an ad-hoc test that piped a script via stdin. The
+`Failed to import Triton kernels` warning is a genuinely absent optional package
+that is not in vLLM's own `requirements/cuda.txt`, so a stock install lacks it
+too; the oracle is faithful.
+
+Evidence: [../docs/bench-evidence/qwen35-4b-pinned-oracle-20260728.md](../docs/bench-evidence/qwen35-4b-pinned-oracle-20260728.md).
