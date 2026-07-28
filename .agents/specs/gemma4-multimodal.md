@@ -372,6 +372,104 @@ G1.1 primitive-by-primitive table above):
 
 ---
 
+## G2 — IMAGE oracle + SigLIP/NaFlex port map LANDED (2026-07-28, `CLAIM-GEMMA4-G2`)
+
+**Deliverable this pass (golden-first, mirroring M2a + the G1 honest-partial cadence):**
+the IMAGE→text oracle golden + the four staged vision-tower reference tensors +
+the corrected SigLIP/NaFlex port map. The C++ tower forward + the Gemma-4 NaFlex
+image processor + projector/merge wiring are the **named residual** (unbuilt this
+pass — NO token-exact claimed for our engine yet).
+
+### G2.0 The IMAGE golden — CAPTURED, STRICT (the SACRED anchor)
+
+`unsloth/gemma-4-E4B-it` on the pinned vLLM 0.25.0 oracle (dgx, `flock`, GMU 0.30,
+`enforce_eager`, bf16), fixed committed image `g2_fixed_112.png` (112×112 gradient,
+array-sha `306c792d…`) + chat prompt `[{image},{text:"Describe this image in one
+sentence."}]`:
+
+- **K=5 DETERMINISTIC ⇒ STRICT gate form** (same bar as Qwen3-VL image STRICT 32/32;
+  measured, not assumed — `scripts/mm/g2_gemma4_image_oracle_capture.py`).
+- 18 greedy output tokens `[2094,563,496,28239,…,236761,106]` →
+  `"This is a vibrant, abstract background featuring a smooth gradient of bright,
+  blended colors."` — a COHERENT description of the gradient image ⇒ the vision path
+  is genuinely exercised e2e (not a text-only fallback).
+- `prompt_token_ids` len **274** = `boi`(255999) + **256** image soft-tokens +
+  `eoi`(258882) + template/text (~16). The image yields **256** valid soft tokens
+  after pool+strip (of the 280 `default_output_length` budget).
+- Fixture `tests/parity/goldens/gemma4_e4b_image/` (11 MB): `gen_manifest.json`
+  (token ids, determinism, gate form, prompt ids, processor shapes/shas), the fixed
+  PNG, `vision_refs/` (below), all sha-verified locally.
+
+### G2.1 Staged vision references — CAPTURED (the M2a per-stage unit-gate targets)
+
+Dumped by `scripts/mm/g2_vision_ref_dump.py` (transformers-eager
+`Gemma4VisionModel` + `Gemma4MultimodalEmbedder`, vision weights only, run on the
+golden's EXACT processor outputs; vLLM runs this same tower in eager per
+`gemma4_mm.py` docstring ⇒ faithful stage refs). All four stage shas in
+`vision_refs/vision_ref_manifest.json`:
+
+| Stage | Ref | Shape | Committed? | Unit-gate it localizes |
+|---|---|---|:--:|---|
+| image processor out | `proc_pixel_values.npy` + `proc_image_position_ids.npy` | `[1,2520,768]` f32 / `[1,2520,2]` i64 | ✅ | **C++ NaFlex image processor** (patchify + (x,y) ids + padding) |
+| patch-embed out | `ref_patch_embedder` (sha only; regen from committed inputs) | `[1,2520,768]` | sha | patch-embed: `input_proj` + learned 2D pos-embed |
+| encoder last-hidden | `ref_encoder_last_hidden` (sha only; regen) | `[1,2520,768]` | sha | 16 ViT blocks (RoPE+q/k/v-norm+sandwich) |
+| pooled+stripped | `ref_pooled_stripped.npy` | `[256,768]` | ✅ | pooler (avg-by-position + √hidden fp32) + padding strip |
+| projected (merge input) | `ref_projected.npy` | `[256,2560]` | ✅ | `embed_vision` projector — THE tensor that scatters into text |
+
+`2520 = 280 × 3²` (max soft tokens × pooling_kernel²); `768 = 3·16²` (patch pixels).
+The two 7.4 MB intermediates are regenerable (committed script + committed proc
+inputs) so only their shas ship — the image-processor target and the final two
+stages are committed as `.npy`.
+
+### G2.2 SigLIP/NaFlex port map — GROUNDED (corrects the §0.1 "no RoPE" error)
+
+**★ CORRECTION to §0.1:** the earlier spike claimed the Gemma-4 vision tower has
+"NO vision-RoPE … simpler than Qwen3-VL". **This is WRONG.** Grounding
+`transformers/models/gemma4/modeling_gemma4.py` proves it is a custom **NaFlex
+SigLIP2** with, per E4B `vision_config` (hidden 768, 16 layers, 12 heads, head_dim
+64 MHA, intermediate 3072, patch 16, pooling_kernel 3, pos_embed_size 10240,
+rope_theta 100, standardize=False, gelu_pytorch_tanh, rms_eps 1e-6):
+
+| Sub-module | transformers anchor | vLLM anchor | Reuse-vs-new |
+|---|---|---|---|
+| **NaFlex image processor** (pre-patchified `pixel_values [P,3·16²]` + `(x,y)` position ids + `-1` padding; resize each dim to `patch·pooling` multiple; `max_soft_tokens` budget) | `image_processing_gemma4.py`; `_compute_num_soft_tokens` `gemma4_mm.py:287-322` | processor feeds `_process_image_input` `gemma4_mm.py:1258` | **NEW** — NOT covered by `qwen3vl_processor.cpp` (Qwen uses smart-resize + temporal patch); genuinely new C++ |
+| **Patch embedder** | `Gemma4VisionPatchEmbedder:575` — `input_proj` Linear(768→768) `:583`; scale `2·(x−0.5)` `:612`; learned **2D pos-embed** `position_embedding_table[2,10240,768]` `:584`, `x_emb+y_emb` via `F.embedding` `:602-604`, zeroed at padding `:605` | `vt.patch_embedder(pv,pp,pad)` `gemma4_mm.py:1315` | **NEW** — learned 2D lookup pos-embed (not Qwen's) |
+| **Vision RoPE** (multidim) | `Gemma4VisionRotaryEmbedding:701` theta 100 `:739`, `spatial_dim=head_dim//2=32` `:746`, `inv_freq` over `arange(0,32,2)` `:749`; `apply_multidimensional_rope:855` splits head_dim into 2 dims × 32 ch each | `pixel_position_ids` → `vt.encoder(...)` `:1320` | **NEW** — ★ the spike's "no RoPE" was false |
+| **Attention** (non-causal full) | `Gemma4VisionAttention:911` — `scaling=1.0` `:921`, **q_norm/k_norm** RMSNorm + **v_norm no-scale** `:929-931`, MHA (kv_heads=heads=12), o_proj | eager | **REUSE (M2a full-attn `AttentionDenseFlash` non-causal)** + NEW q/k/v-norm + rope wiring |
+| **MLP** | `Gemma4VisionMLP:685` — gate/up/down, `gelu_pytorch_tanh` `:694` | eager | **REUSE** (`vt::` GEMM + `GeluTanh`) |
+| **Encoder block** (Gemma2 sandwich) | `Gemma4VisionEncoderLayer:980` — `input_ln→attn→post_attn_ln→+res`; `pre_ff_ln→mlp→post_ff_ln→+res` (4 RMSNorms) | eager | **NEW block wiring** — differs from Qwen3-VL block norm structure; RMSNorm op REUSED |
+| **Pooler** | `Gemma4VisionPooler:618` — mask padding `:671`; `_avg_pool_by_positions` k²-grid via `one_hot` weights `:631-656`; `×√hidden` in **fp32** `:681`; padding-strip mask | `vt.pooler(...)` `gemma4_mm.py:1342` | **NEW** — avg-pool-by-position + √hidden fp32 scale |
+| **Projector** `Gemma4MultimodalEmbedder` | modeling `:2078`; vLLM `gemma4_mm.py:918-970` — `RMSNorm(has_weight=False)` `:952` → `ReplicatedLinear(768→2560,bias=False)` `:958` | `self.embed_vision(...)` `:1358` | **REUSE** ops (`vt::RmsNorm`+GEMM), trivial |
+| **Merge** (masked scatter) | soft tokens → image-token rows between `boi`/`eoi` | `SupportsMultiModal` mixin | **REUSE** — `Qwen3VLMergeMultimodal` pattern; NEW = Gemma-4 `image_token`/`boi`/`eoi` ids + count arithmetic |
+
+**Net reuse-vs-new (corrected):** REUSE = the mm spine (input container /
+`MultiModalHasher` / `EncoderCacheManager` / masked-scatter merge / decode-fork) +
+the M2a full-attention ViT-block GEMMs + `RmsNorm`/`GeluTanh`. **NEW** = (1) the
+Gemma-4 NaFlex image processor, (2) the learned-2D-pos-embed patch embedder,
+(3) multidim **vision RoPE** + q/k/v-norm attention wiring, (4) the Gemma2 sandwich
+block wiring, (5) the avg-pool-by-position + √hidden fp32 pooler. This is
+materially MORE than the "drop merger/DeepStack/RoPE, keep blocks" the spike
+assumed — the tower is closer to a *Gemma-2 transformer with vision RoPE* than to a
+plain learned-pos-embed ViT.
+
+### G2.3 Gate plan (RED-first) + the named residual
+
+- **Unit gates (localize before e2e, M2a rel-L2):** C++ NaFlex processor →
+  `proc_pixel_values` (exact/rel-L2); patch-embed / encoder / pooled / projected →
+  the four staged refs.
+- **e2e image→text:** the fixed PNG + prompt through our engine emits the 18 golden
+  tokens; **STRICT** (oracle is K=5 deterministic). RED-first: pre-tower the image
+  request cannot run / wrong tokens; post-tower it matches.
+- **Inertness (must hold when the tower lands):** `test_gemma4_paged_engine` text
+  32/32 UNCHANGED (mm gated on image input; text path byte-identical); Qwen3-VL
+  image/video 32/32 UNCHANGED; SACRED models untouched.
+- **RESIDUAL (unbuilt this pass, named):** the C++ SigLIP/NaFlex tower forward,
+  the Gemma-4 NaFlex image processor, and the projector/merge wiring. This pass
+  landed the oracle + staged refs + corrected port map only — no C++ vision code,
+  no token-exact claim. Follow-on `G2-impl` is turnkey against the committed refs.
+
+---
+
 ## 1. Per-model / per-modality DISPOSITION
 
 | Target | Image | Video | Audio | Disposition |

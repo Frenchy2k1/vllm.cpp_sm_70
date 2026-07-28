@@ -162,13 +162,23 @@ loads, runs, and greedily generates the ungated `unsloth/gemma-4-E4B-it`
 32-token greedy golden is captured
 (`tests/parity/goldens/gemma4_e4b_text/`). The earlier "oracle-blocked at gate
 time" concern (transformers lacking `gemma4`) is refuted — the module is present
-and the model runs. With the text backbone now landed and gated, Gemma-4
-multimodal is blocked only on the remaining tower implementation (the SigLIP vision
-and USM-Conformer audio towers, both unbuilt; the Gemma-4 MoE / k_eq_v / double-MLP
-backbone stays the larger-variant follow-on); the SigLIP vision tower reuses the
-landed Qwen3-VL ViT scaffold. Audio, the genuinely-new modality, is staged first
-on the smallest oracle-runnable audio model (Whisper, then Voxtral-Mini-3B on the
-already-landed Mistral backbone).
+and the model runs. **The IMAGE modality oracle is now captured too** (G2,
+2026-07-28): the same E4B model on the pinned 0.25.0 oracle greedily describes a
+fixed image (K=5 deterministic ⇒ STRICT gate form, 18 tokens → a coherent
+gradient-image caption, 256 soft tokens), committed with four staged vision-tower
+reference tensors for per-stage unit-gating
+(`tests/parity/goldens/gemma4_e4b_image/`). Grounding the tower corrected an
+earlier assumption: the Gemma-4 vision tower is a **custom NaFlex SigLIP2 with
+multidimensional vision-RoPE, q/k/v RMSNorm, Gemma-2 sandwich norms, a learned 2-D
+position embedding, and a √hidden average-pool-by-position pooler** — it does *not*
+drop-in reuse the Qwen3-VL ViT (the block GEMMs/attention are reusable; the
+patch-embed, RoPE, norms, pooler and the Gemma-4 NaFlex image processor are new).
+So Gemma-4 multimodal is blocked only on the remaining tower implementation: the
+C++ SigLIP/NaFlex vision tower + Gemma-4 image processor (image, port-mapped this
+pass, C++ unbuilt) and the USM-Conformer audio tower; the Gemma-4 MoE / k_eq_v /
+double-MLP backbone stays the larger-variant follow-on. Audio, the genuinely-new
+modality, is staged first on the smallest oracle-runnable audio model (Whisper,
+then Voxtral-Mini-3B on the already-landed Mistral backbone).
 
 ### OLMo
 

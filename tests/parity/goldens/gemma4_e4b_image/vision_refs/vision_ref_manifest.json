@@ -1,0 +1,40 @@
+{
+  "note": "transformers-eager Gemma4VisionModel+embed_vision on the vLLM golden's processor outputs; vLLM runs this tower in eager \u2192 faithful stage refs for C++ unit-gating",
+  "dtype": "bfloat16",
+  "stages": {
+    "patch_embedder": {
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "dtype": "float32",
+      "sha256": "6bca7706b8ebd16019915ad6a79c2544e8199a348f577cf4610bf85e53c187eb"
+    },
+    "encoder_last_hidden": {
+      "shape": [
+        1,
+        2520,
+        768
+      ],
+      "dtype": "float32",
+      "sha256": "0872d3d92a73abd36133ba54169a344bdebbbfde476659de2242d024ddcd6c59"
+    },
+    "pooled_stripped": {
+      "shape": [
+        256,
+        768
+      ],
+      "dtype": "float32",
+      "sha256": "69c7b94ac8da771ad99425076f8d7d11b45ec1c80fc780c453f4538b6145a5d1"
+    },
+    "projected_merge_input": {
+      "shape": [
+        256,
+        2560
+      ],
+      "dtype": "float32",
+      "sha256": "3499ac790cb1396c69027a00a2c4c2a1e3fe47245207239a52e5aaac6db131c2"
+    }
+  }
+}

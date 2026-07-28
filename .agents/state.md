@@ -30332,3 +30332,23 @@ run and both caveats instead of "outstanding"), `docs/BENCHMARKS.md` (the
   (G1c), G2 vision (reuses M2a) / G3 audio, per-axis SPEED (text correctness-DONE,
   speed-pending). dgx: re-fetched E4B (16 GB, `df` guarded ≥25 GiB), pruned after;
   local-ai-worker restored. Not pushed.
+- **2026-07-28 (Gemma-4 G2 — IMAGE oracle + SigLIP/NaFlex port map, honest partial;
+  `CLAIM-GEMMA4-G2`; worktree `.claude/worktrees/agent-a232a21e6580e48ca` off `main`
+  `bfc8cf5d` confirmed via `git rev-parse HEAD`; not pushed)** — Landed the IMAGE
+  modality oracle + the corrected vision-tower port map (golden-first M2a playbook;
+  NO C++ vision code this pass). Golden: `unsloth/gemma-4-E4B-it` fixed 112×112 image
+  + chat prompt on the pinned vLLM 0.25.0 oracle (dgx `flock /tmp/gpu`, GMU 0.30,
+  bf16 eager), greedy K=5 DETERMINISTIC ⇒ **STRICT** (18 tokens →
+  `"This is a vibrant, abstract background featuring a smooth gradient of bright,
+  blended colors."` — coherent, so the vision path genuinely ran; 256 soft tokens,
+  prompt ids 274). Committed `tests/parity/goldens/gemma4_e4b_image/` (11 MB:
+  gen_manifest + PNG + 4 staged vision refs — proc_pixel_values/pooled/projected
+  `.npy` + all-stage shas) + scripts `g2_gemma4_image_oracle_capture.py` /
+  `g2_vision_ref_dump.py`; all shas verified locally. ★ CORRECTION to spec §0.1:
+  the tower is a custom **NaFlex SigLIP2 WITH multidim vision-RoPE (θ100) + q/k/v-norm
+  + Gemma2 sandwich norms + learned-2D one_hot pos-embed + √hidden avg-pool-by-position
+  pooler** — the "no vision-RoPE, simpler than Qwen3-VL" claim is REFUTED; also NEW =
+  the Gemma-4 NaFlex image processor (not `qwen3vl_processor`). Full port map + gate
+  plan in spec §G2. **Residual (named, unbuilt):** the C++ SigLIP/NaFlex tower forward
+  + Gemma-4 image processor + projector/merge — image is NOT yet engine-gated; no
+  token-exact claim. dgx restored (model+tree pruned, worker `--restart=always`).
