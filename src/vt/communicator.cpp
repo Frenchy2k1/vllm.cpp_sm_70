@@ -10,6 +10,8 @@
 #include <mutex>
 
 #include "vt/dtype.h"
+#include "vt/ops.h"
+#include "vt/op_provider.h"
 
 namespace vt {
 namespace {
@@ -157,8 +159,39 @@ class CpuRankCommunicator final : public Communicator {
   int rank() const override { return rank_; }
   int world_size() const override { return shared_->world; }
 
+  // The virtual overrides ROUTE through OpProvider (BACKEND-DISTRIBUTED-COMM W2):
+  // the queue's DeviceType selects the transport data plane (kCPU -> the Do*
+  // bodies below; kCUDA -> the NCCL provider). Dispatching for world_size==1 is
+  // harmless — the Do* bodies short-circuit to the byte-identical no-op before
+  // touching the group — and it keeps the single seam every backend plugs into.
   void AllReduce(Queue& q, void* data, size_t count, DType dtype,
                  ReduceOp op) override {
+    auto fn = reinterpret_cast<CommAllReduceFn>(
+        GetOp(OpId::kAllReduce, q.device.type));
+    fn(*this, q, data, count, dtype, op);
+  }
+  void AllGather(Queue& q, const void* sendbuf, void* recvbuf, size_t count,
+                 DType dtype) override {
+    auto fn = reinterpret_cast<CommAllGatherFn>(
+        GetOp(OpId::kAllGather, q.device.type));
+    fn(*this, q, sendbuf, recvbuf, count, dtype);
+  }
+  void Send(Queue& q, const void* data, size_t count, DType dtype,
+            int peer) override {
+    auto fn = reinterpret_cast<CommSendFn>(GetOp(OpId::kSend, q.device.type));
+    fn(*this, q, data, count, dtype, peer);
+  }
+  void Recv(Queue& q, void* data, size_t count, DType dtype,
+            int peer) override {
+    auto fn = reinterpret_cast<CommRecvFn>(GetOp(OpId::kRecv, q.device.type));
+    fn(*this, q, data, count, dtype, peer);
+  }
+
+  // CPU in-process data planes (registered as the kCPU providers below). These
+  // hold the REAL cross-rank reduction/rendezvous — the barrier + staging slots +
+  // mailbox in Shared. Public so the free-function providers can forward here.
+  void DoAllReduce(Queue& q, void* data, size_t count, DType dtype,
+                   ReduceOp op) {
     (void)q;  // CPU backend is synchronous: no stream to order against.
     if (shared_->world == 1) return;  // identity: reduction of one input.
     if (count == 0) return;
@@ -175,8 +208,8 @@ class CpuRankCommunicator final : public Communicator {
     shared_->Barrier();  // slots reusable by the next collective.
   }
 
-  void AllGather(Queue& q, const void* sendbuf, void* recvbuf, size_t count,
-                 DType dtype) override {
+  void DoAllGather(Queue& q, const void* sendbuf, void* recvbuf, size_t count,
+                   DType dtype) {
     (void)q;
     const size_t elem = SizeOf(dtype);
     if (shared_->world == 1) {
@@ -196,8 +229,8 @@ class CpuRankCommunicator final : public Communicator {
     shared_->Barrier();  // all reads done before slots are reused.
   }
 
-  void Send(Queue& q, const void* data, size_t count, DType dtype,
-            int peer) override {
+  void DoSend(Queue& q, const void* data, size_t count, DType dtype,
+              int peer) {
     (void)q;
     if (peer == rank_) return;  // self-send is a no-op (no copy needed).
     const size_t idx =
@@ -214,8 +247,8 @@ class CpuRankCommunicator final : public Communicator {
     shared_->mb_cv.wait(lk, [&] { return !box.full; });  // rendezvous: consumed.
   }
 
-  void Recv(Queue& q, void* data, size_t count, DType dtype,
-            int peer) override {
+  void DoRecv(Queue& q, void* data, size_t count, DType dtype,
+              int peer) {
     (void)q;
     if (peer == rank_) return;
     const size_t idx =
@@ -235,6 +268,40 @@ class CpuRankCommunicator final : public Communicator {
   std::shared_ptr<CpuCommGroup::Shared> shared_;
   const int rank_;
 };
+
+// kCPU collective providers (BACKEND-DISTRIBUTED-COMM W2). Every CPU-bound
+// Communicator IS a CpuRankCommunicator, so the provider forwards to the Do*
+// body that owns the barrier/mailbox. Registering a faster CPU reduce later is a
+// provider swap here — the model forward and the Communicator interface never
+// change (the OpProvider selection seam, op_provider.h).
+void CpuAllReduce(Communicator& c, Queue& q, void* data, size_t count,
+                  DType dtype, ReduceOp op) {
+  static_cast<CpuRankCommunicator&>(c).DoAllReduce(q, data, count, dtype, op);
+}
+void CpuAllGather(Communicator& c, Queue& q, const void* sendbuf, void* recvbuf,
+                  size_t count, DType dtype) {
+  static_cast<CpuRankCommunicator&>(c).DoAllGather(q, sendbuf, recvbuf, count,
+                                                   dtype);
+}
+void CpuSend(Communicator& c, Queue& q, const void* data, size_t count,
+             DType dtype, int peer) {
+  static_cast<CpuRankCommunicator&>(c).DoSend(q, data, count, dtype, peer);
+}
+void CpuRecv(Communicator& c, Queue& q, void* data, size_t count, DType dtype,
+             int peer) {
+  static_cast<CpuRankCommunicator&>(c).DoRecv(q, data, count, dtype, peer);
+}
+
+struct CpuCollectiveRegistrar {
+  CpuCollectiveRegistrar() {
+    RegisterOp(OpId::kAllReduce, DeviceType::kCPU,
+               reinterpret_cast<void*>(&CpuAllReduce));
+    RegisterOp(OpId::kAllGather, DeviceType::kCPU,
+               reinterpret_cast<void*>(&CpuAllGather));
+    RegisterOp(OpId::kSend, DeviceType::kCPU, reinterpret_cast<void*>(&CpuSend));
+    RegisterOp(OpId::kRecv, DeviceType::kCPU, reinterpret_cast<void*>(&CpuRecv));
+  }
+} cpu_collective_registrar;
 
 }  // namespace
 

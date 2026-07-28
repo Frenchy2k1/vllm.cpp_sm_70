@@ -564,6 +564,19 @@ HW-blocked exactly as scale-out (no ≥2-GPU box here); no engine speed number
 exists or is owed. Spec: [parallelism-modes.md](../.agents/specs/parallelism-modes.md).
 No source/engine path touched.
 
+**Scale-out W2 — same-host multi-GPU TP (CPU-gated) + NCCL derive-and-ship
+(2026-07-28, `CLAIM-SCALE-OUT-W2`, NOT pushed).** Disposition: **NOT APPLICABLE
+(infra / correctness brick; `benchmark_binding=false`; no speed number owed per
+the spec §Gates).** W2 landed the multi-device backend registry, collective
+`OpId` routing, the NCCL transport (mirrors `pynccl.py`, built only under
+`-DVLLM_CPP_NCCL=ON` — NOT built/run here, no ≥2-GPU box), and `TensorParallel`
+wired into the Qwen3-dense forward. Gated by `tests/vt/test_tp_forward.cpp` (60/60,
+RED-verified): a TP-2 sharded-matmul + all-reduce == the unsharded tp=1 forward
+over the CPU communicator, NO GPU. `tp_size==1` is byte-identical (zero extra vt::
+ops), so the single-GPU decode/prefill hot path is untouched — no throughput
+delta possible. A real TP-2 speed comparison is owed only once the transport runs
+on a ≥2-GPU host (W3+).
+
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —
 throughput/TTFT WIN, TPOT/ITL open GAP (`benchmark_binding` = competitor-floor,

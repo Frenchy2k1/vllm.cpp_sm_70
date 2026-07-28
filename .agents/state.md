@@ -31253,3 +31253,34 @@ resident loader → bf16 expand + CPU dense `E`; W4 Marlin repack+GEMM GPU `C`/`
 (kernel-matrix row, bump the KERNEL constant, coordinate before touching shared
 `marlin_template.h`); W5 GPTQ 8/2/3-bit; W6 AWQ/GPTQ MoE. Upstream e2e tests
 (`test_auto_awq.py`/`test_auto_gptq.py`) named, to be checked in SKIPPED at W3.
+
+## Scale-out W2 — same-host multi-GPU TP (CPU-gated + NCCL derive-and-ship), 2026-07-28
+
+- **Claim/base:** `CLAIM-SCALE-OUT-W2`, isolated worktree
+  `.claude/worktrees/agent-a97ee0c03218f753d` off local `main` `308c312a`
+  (confirmed `git rev-parse HEAD`). CPU-gated, NO ≥2-GPU box. Additive +
+  default-inert; NOT pushed.
+- **Landed:** (1) multi-device backend registry per-`Device{type,index}`
+  (`src/vt/backend.cpp`, `include/vt/backend.h`, `cuda_backend.cu` registrar) —
+  byte-neutral device 0; (2) collective `OpId` routing (`OpId::kAllReduce/
+  kAllGather/kSend/kRecv`, `include/vt/ops.h`; `Communicator` dispatches via
+  `GetOp(OpId, queue.device.type)`, `src/vt/communicator.cpp`); (3) NCCL transport
+  `src/vt/cuda/nccl_communicator.cu` (mirrors `pynccl.py`, `VLLM_CPP_NCCL` OFF by
+  default — NOT built here); (4) `TensorParallel` (`include/vllm/model_executor/
+  models/tensor_parallel.h`) wired into the Qwen3-dense forward (o_proj + MLP-down
+  all-reduce, MergedColumn loader shard) via a default-null `tp`.
+- **Gate (the real one, no GPU):** `tests/vt/test_tp_forward.cpp` 60/60 — TP-2
+  sharded-matmul + RowParallel all-reduce == unsharded tp=1 over the CPU
+  communicator; **RED-verified** (dropping the all-reduce fails 24/60). Plus
+  `test_backend_multidevice` 14 assertions and `test_communicator` 50/50 through
+  the OpId path. Clean CPU `-Werror`, 0 warnings; full ctest suite green
+  (single-device inertness).
+- **HW residual (honest):** NCCL build-verify + the TP-2 token-exact multi-GPU RUN
+  are UNEXECUTED (no ≥2-GPU box). Also: QKV head-aware KV replication, vocab/LM-head
+  + MoE-EP sharding, per-op `cudaSetDevice` affinity, PP. Same-host 2×RTX-6000-Ada
+  recipe (launch/NCCL-init/tp-size) is in `specs/scale-out-distributed.md §W2 result`.
+- **Records:** `backend-matrix.md` (`BACKEND-DISTRIBUTED-TP` SPIKE→ACTIVE + COMM
+  OpId-routing note), `specs/scale-out-distributed.md` (§W2 result + recipe),
+  `feature-matrix.md` §3, `roadmap_v1.md` (scale-out row), `coordination.md`
+  (`CLAIM-SCALE-OUT-W2`), `docs/STATUS.md` + `docs/BENCHMARKS.md` (NOT-APPLICABLE —
+  infra), `parity-ledger.md` + this entry. All 6 record checkers rc=0.

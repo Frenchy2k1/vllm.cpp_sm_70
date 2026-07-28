@@ -169,4 +169,23 @@ void RegisterBackend(DeviceType type, Backend* backend);
 // fallback serves index 0 when no device-specific table is registered.
 void RegisterDeviceResourceOps(DeviceType type, const DeviceResourceOps* ops);
 
+// --- Multi-device registry (BACKEND-DISTRIBUTED-TP W2) ------------------------
+// The type-level API above resolves ONE backend per DeviceType, which is device
+// index 0 by construction — the single-GPU engine. Tensor/pipeline parallel needs
+// N discrete devices of one type (device 0..N-1) each addressable by its own
+// `Backend*`/resource table, mirroring vLLM spawning one worker per local GPU
+// (multiproc_executor.py:176 `for local_rank in range(local_world_size)`). These
+// overloads register/resolve a backend for a SPECIFIC `Device{type,index}`.
+//
+// BYTE-NEUTRAL for the single-device path: `Device{type,0}` shares the same
+// registry slot the type-level API writes/reads, so `GetBackend(type)` and
+// `GetBackend(Device{type,0})` return the identical `Backend*`, and a build that
+// only ever touches index 0 is unchanged. The maximum addressable index per type
+// is `kMaxDevicesPerType`.
+inline constexpr size_t kMaxDevicesPerType = 16;
+Backend& GetBackend(Device device);
+Backend* TryGetBackend(Device device);
+void RegisterBackend(Device device, Backend* backend);
+void RegisterDeviceResourceOps(Device device, const DeviceResourceOps* ops);
+
 }  // namespace vt

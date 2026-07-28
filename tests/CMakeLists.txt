@@ -547,6 +547,16 @@ vllm_cpp_add_test(test_reference_tier vt/test_reference_tier.cpp)
 vllm_cpp_add_test(test_communicator vt/test_communicator.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(test_communicator PRIVATE Threads::Threads)
+# Scale-out W2 (scale-out-distributed.md §W2): the tensor-parallel CORRECTNESS
+# gate with NO GPU — sharded-matmul + RowParallel all-reduce == the unsharded
+# tp=1 forward, through the ACTUAL W2 helpers (TpShard/TpAllReduceSum) over the
+# W1 CPU communicator; RED-first (a dropped all-reduce is the wrong partial).
+vllm_cpp_add_test(test_tp_forward vt/test_tp_forward.cpp)
+target_link_libraries(test_tp_forward PRIVATE Threads::Threads)
+# Scale-out W2 multi-device backend registry: Device{type,index} addressability
+# and the byte-neutral device-0 proof (a second backend at index 1 leaves index 0
+# and the type-level API identical). Hardware-free (a fake backend on kXPU).
+vllm_cpp_add_test(test_backend_multidevice vt/test_backend_multidevice.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 # QUANT-GGUF-CIQ-GEMM G1: block dtypes, the quant traits table and its

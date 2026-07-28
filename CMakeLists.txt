@@ -794,6 +794,7 @@ if(VLLM_CPP_CUDA)
     src/vllm/platforms/cuda.cpp
     src/vt/cuda/cuda_arch_tactics.cu
     src/vt/cuda/cuda_backend.cu
+    src/vt/cuda/nccl_communicator.cu
     src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu
     src/vt/cuda/cuda_matmul_nvfp4.cu
@@ -811,6 +812,21 @@ if(VLLM_CPP_CUDA)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)
+  # NCCL tensor-parallel transport (BACKEND-DISTRIBUTED-COMM W2, DERIVE-AND-SHIP).
+  # OFF by default so the standing single-GPU CUDA gate is untouched: without it
+  # src/vt/cuda/nccl_communicator.cu compiles to a stub (no kCUDA collective
+  # provider). Turn ON on a >=2-GPU host to build-verify + run the real
+  # ncclAllReduce/Send/Recv path (pynccl.py mirror). AUTO-detect could be added,
+  # but an explicit opt-in keeps the default CUDA build reproducible.
+  option(VLLM_CPP_NCCL "Build the NCCL tensor-parallel transport (needs nccl.h + libnccl)" OFF)
+  if(VLLM_CPP_NCCL)
+    find_library(NCCL_LIBRARY NAMES nccl REQUIRED)
+    find_path(NCCL_INCLUDE_DIR NAMES nccl.h REQUIRED)
+    target_compile_definitions(vllm PRIVATE VT_NCCL=1)
+    target_include_directories(vllm PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(vllm PUBLIC ${NCCL_LIBRARY})
+    message(STATUS "NCCL TP transport: ON (${NCCL_LIBRARY})")
+  endif()
   # The cutlass sm120a NVFP4 GEMM TU is isolated: its own heavy cutlass include
   # tree + relaxed-constexpr/extended-lambda, so it never touches the general
   # build. Gated by VT_CUTLASS_NVFP4 so the host op path no-ops if not compiled.
