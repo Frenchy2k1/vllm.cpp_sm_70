@@ -951,6 +951,28 @@ forward is folded into `ModelRegistry::Forward` (recipe in
 `.agents/specs/mm-serving.md`). Reproduce: `cmake --build build-cpu --target
 test_chat_mm server && ./build-cpu/tests/test_chat_mm`.
 
+**ROAD-V1-MM engine mm-forward integration — the fold into `ModelRegistry::Forward`
+(2026-07-28, `CLAIM-ENGINE-MM-FORWARD`, NOT pushed).** Disposition: **NOT APPLICABLE
+for a throughput A/B this pass (architectural correctness landing, `benchmark_binding=
+false`; single-sequence gate driver, no batched/serving compute path).** Multimodal
+now runs THROUGH the engine's registered forward: `ModelForwardInput` gains an
+additive default-nullopt `mm` field, `Qwen3VLForConditionalGeneration` is
+`REGISTER_VLLM_MODEL`-registered, and the registered forward folds the M2c decode via
+the shared `Qwen3VLForwardStepLastLogits`. Gate is TOKEN-EXACTNESS + text inertness,
+not speed: GPU `test_qwen3vl_registry_e2e` (dgx.casa GB10, cached Qwen3-VL-4B,
+`flock $HOME/gpu.lock`) runs image→text THROUGH `ModelRegistry::Forward` and matches
+the M2c golden **32/32 STRICT** (RED-first — unregistered ⇒ resolve throws); the M2c
+standalone `test_qwen3vl_e2e` holds 32/32 (the StepFn refactor is byte-neutral); text
+inertness `test_runner` 16/16 + `test_scheduler` 36/36 + `test_model_registry` 24/24 +
+`test_chat_mm` 8/8 + `test_openai_serving` 41/41 all green (nullopt-for-text ⇒
+byte-identical). The mm-forward SPEED (image TTFT/TPOT vs the mm oracle through the
+batched serving loop) is owed only once the FULL in-runner scheduler-fed tower run +
+the server `/v1/chat/completions` GPU e2e land (named residual). Reproduce (dgx):
+git-archive the commit → `dgx.casa`, `export PATH=/usr/local/cuda/bin:$PATH`,
+`cmake -B build-cuda -DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_CUDA_ARCHITECTURES=121a`,
+`flock $HOME/gpu.lock ./build-cuda/tests/test_qwen3vl_registry_e2e`.
+
 **ROAD-V1-C8 production endpoint wiring (2026-07-28, `CLAIM-C8-SERVE-PROD-WIRING`,
 NOT pushed).** Disposition: **NOT APPLICABLE (no throughput number,
 `benchmark_binding=false`).** Wiring the shipped `vllm-server` binary to call its

@@ -31515,3 +31515,41 @@ DeepSeek-V4 + Kimi-K3 loaders drop their MXFP4 refusal.
   checkers rc=0. RESIDUAL (named): W2 config/CLI/ABI field, W3 scheduler threading
   of `hash_block_size != block_size` + mamba partial-tail stop (blocked on the
   `KV-BLOCK-POOL` align path that still throws in `block_pool.cpp`), W4 benchmark.
+
+## 2026-07-28 — ENGINE MM-FORWARD integration (`CLAIM-ENGINE-MM-FORWARD`, DONE, NOT pushed)
+
+- **What.** The architectural unlock so multimodal runs through the engine's
+  REGISTERED forward (`ModelRegistry::Forward`), closing the `MM-SERVE-E2E`/M2c
+  block. Base local `main` `308c312a`; isolated worktree
+  `.claude/worktrees/agent-a2c400785ae707c48`.
+- **Code.** (1) `ModelForwardInput` gains an ADDITIVE default-nullopt
+  `std::optional<MultiModalForwardInput> mm` (merged inputs_embeds + 3-D MRoPE
+  positions + DeepStack, borrowed handles) in `model_registry.h` — nullopt on every
+  text step ⇒ text forwards never read it ⇒ shared runner path byte-identical BY
+  CONSTRUCTION. (2) `Qwen3VLForConditionalGeneration` `REGISTER_VLLM_MODEL`-registered
+  (new `qwen3_vl_registry.cpp`, `supports_multimodal=true`, non-hybrid dense backbone,
+  full-attention KV spec, owns the persistent cos|sin cache). The registered forward
+  FOLDS the M2c decode into the per-step contract via the SHARED
+  `Qwen3VLForwardStepLastLogits` (= the standalone `VLForwardLastLogits`);
+  `VLGenerateCore` refactored to a shared `VLStepFn` driven by BOTH the standalone
+  driver AND `Qwen3VLGenerateGreedyViaRegistry` (the engine mm-forward entry the
+  MM-SERVE seam uses — every step goes through `ModelRegistry::Forward`). (3)
+  `test_model_registry` synced 24→27 archs (+Qwen3VL, + pre-existing base-red
+  DeepseekV4/Gemma4 list drift).
+- **Gates.** GPU engine mm-forward TOKEN-EXACT (dgx.casa GB10 + cached Qwen3-VL-4B,
+  `flock $HOME/gpu.lock`): `test_qwen3vl_registry_e2e` image→text THROUGH
+  `ModelRegistry::Forward` == M2c golden `gen_tokens_i32.bin` **32/32 STRICT** (51/51),
+  RED-first (unregistered ⇒ `Resolve` throws). M2c standalone cross-check
+  `test_qwen3vl_e2e` **32/32** (46/46) ⇒ StepFn refactor byte-neutral. TEXT INERTNESS
+  (RED line): `test_runner` 16/16 + `test_scheduler` 36/36 + `test_model_registry`
+  24/24 + `test_chat_mm` 8/8 + `test_openai_serving` 41/41 all green (nullopt-for-text
+  ⇒ byte-neutral). Clean `-Werror` full-library build CPU + CUDA/nvcc on DGX;
+  compute-sanitizer memcheck **0 errors** on the registered mm forward (dgx).
+- **Records:** `specs/mm-serving.md` (block RESOLVED section), `model-matrix.md`
+  (Qwen3-VL row → registered/in-engine, stays `PARTIAL`), `engine-matrix.md`
+  (runner mm-forward row), `feature-matrix.md`, `roadmap_v1.md` (ROAD-V1-MM),
+  `coordination.md` (`CLAIM-ENGINE-MM-FORWARD`), `docs/STATUS.md` + `docs/BENCHMARKS.md`,
+  `parity-ledger.md` + this entry. NEXT / residual: the FULL in-runner scheduler-fed
+  tower run (batched-loop mm + cross-step per-request MRoPE-delta state), the real
+  server `/v1/chat/completions` GPU e2e, and video/multi-image/audio/Gemma-4-image
+  through the registered path.

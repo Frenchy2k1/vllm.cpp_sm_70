@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -136,6 +137,35 @@ class LoadedModel {
   const ModelRegistration& registration_;
 };
 
+// MM-ENGINE-FORWARD: one multimodal (vision/audio-language) forward step's
+// vision-conditioned inputs, carried as an OPTIONAL sub-field of ModelForwardInput
+// (below). Set (non-nullopt) ONLY by the runner mm-path when the request carries
+// Request.mm_features; nullopt on every text step, so the registered TEXT forwards
+// never read it and the shared runner path stays byte-identical (the field is
+// additive and default-nullopt — text inertness is by construction).
+//
+// The handles are BORROWED (owned by the runner/driver for the forward's
+// duration). The tower + `_merge_multimodal_embeddings` + MRoPE index math already
+// ran on the host side (or the encoder runner) to fill these, so the registered
+// forward is a pure per-step function of them:
+//   * inputs_embeds_bf16 — the ALREADY-MERGED [num_tokens*hidden] host bf16 input
+//     embeddings: embed(token_ids) with the projected vision features
+//     masked-scattered into the placeholder rows. When set, the forward consumes
+//     THESE instead of embedding token_ids.
+//   * positions3 — the 3-D MRoPE positions, row-major [3, num_tokens]
+//     (3*num_tokens int32), replacing the 1-D ModelForwardInput::positions for the
+//     vision-language backbone.
+//   * deepstack_bf16 — the [levels*num_tokens*hidden] host bf16 DeepStack
+//     multiscale tensor added after decoder layers 0..levels-1 (EMPTY on decode
+//     steps and on models without DeepStack, e.g. the 27B GDN-hybrid VL path).
+//   * deepstack_levels — `levels` (0 ⇒ no DeepStack inject).
+struct MultiModalForwardInput {
+  const std::vector<uint16_t>* inputs_embeds_bf16 = nullptr;
+  const std::vector<int32_t>* positions3 = nullptr;
+  const std::vector<uint16_t>* deepstack_bf16 = nullptr;
+  int64_t deepstack_levels = 0;
+};
+
 // One MRV2 forward invocation. References stay valid for the duration of the
 // registered forward hook; model-specific decode-graph state lives in the
 // concrete LoadedModel rather than leaking concrete weight types into runner.
@@ -170,6 +200,13 @@ struct ModelForwardInput {
   // and is byte-identical. Mutually exclusive with hidden_tap. Models other than
   // Qwen3.5 ignore this field.
   Qwen3_5AuxTaps* aux_tap = nullptr;
+  // MM-ENGINE-FORWARD: the optional vision-language per-step inputs. nullopt on
+  // every TEXT step (text models never read it ⇒ byte-identical shared-path). Set
+  // only by the runner mm-path when the request carries Request.mm_features, and
+  // consumed by the registered multimodal forward (Qwen3-VL) which routes the
+  // tower/merge/MRoPE/DeepStack-conditioned decode. Default-nullopt keeps every
+  // existing (text) call site byte-identical by construction.
+  std::optional<MultiModalForwardInput> mm = std::nullopt;
 };
 
 using ModelConfigHook = void (*)(const HfConfig& config);
