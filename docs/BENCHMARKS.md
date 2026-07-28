@@ -57,6 +57,28 @@ Gemma-4 text is correctness-complete, per-axis speed vs vLLM is the named residu
 (alongside G1c YOCO cache dedup + the G2 vision / G3 audio towers). Reproduce (dgx):
 `cmake --build build --target test_gemma4_paged_engine && flock ~/gpu.lock ./build/tests/test_gemma4_paged_engine`.
 
+## Gemma-4 G2 image oracle + SigLIP/NaFlex port map (2026-07-28, `CLAIM-GEMMA4-G2`) - correctness anchor, no speed number owed
+
+`benchmark_binding=false` (oracle capture + port-map milestone; no compute path in
+our engine yet, so no throughput number is owed). G2 captured the IMAGE modality
+oracle for `unsloth/gemma-4-E4B-it`: a fixed committed 112x112 image + chat prompt
+through the pinned vLLM 0.25.0 oracle (dgx GB10, `flock /tmp/gpu`, GMU 0.30, bf16
+eager), greedy K=5 **DETERMINISTIC => STRICT gate form** (same bar as Qwen3-VL image
+STRICT 32/32). The oracle emits 18 tokens describing the image ("This is a vibrant,
+abstract background featuring a smooth gradient of bright, blended colors.") - a
+coherent caption, so the vision path is genuinely exercised - across 256 soft tokens
+(prompt token ids 274). Committed `tests/parity/goldens/gemma4_e4b_image/`
+(gen_manifest + fixed PNG + four staged vision references: image-processor output,
+patch-embed, encoder, pooled, and the projected merge-input tensor - the M2a-style
+per-stage unit-gate targets), all sha-verified. Grounding the tower CORRECTED the
+earlier "no vision-RoPE, reuses Qwen3-VL as-is" assumption: it is a custom NaFlex
+SigLIP2 with multidim vision-RoPE + q/k/v-norm + Gemma-2 sandwich norms + learned
+2-D position embedding + √hidden avg-pool-by-position pooler (full port map in
+`.agents/specs/gemma4-multimodal.md` §G2). No throughput is owed; the C++ SigLIP/NaFlex
+tower + Gemma-4 image processor + projector/merge are the named residual (image not
+yet engine-gated). Reproduce (dgx, needs the E4B checkpoint):
+`scripts/mm/g2_gemma4_image_oracle_capture.py` then `scripts/mm/g2_vision_ref_dump.py`.
+
 ## Gemma-4 G1 text backbone (2026-07-28, `CLAIM-GEMMA4-G1`) - correctness bring-up, no speed number owed
 
 `benchmark_binding=false`. G1 implemented the `Gemma4ForConditionalGeneration` text
