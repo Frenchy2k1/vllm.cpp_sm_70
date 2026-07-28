@@ -318,10 +318,10 @@ vllm_engine_free(engine);
 The ABI covers lifecycle, blocking and streaming completion, non-blocking concurrent requests,
 memory helpers, and diagnostics. Later ABI versions add structured output (v2), chat with tools and
 templates (v3), tool-parser selection (v4), reasoning-parser selection (v5), speculative decoding
-(v6), prefix caching (v7), custom logits processors (v8), and the remaining engine-sizing config the
-bundled server exposes — chunked-prefill token budget, scheduling policy and the external KV
-connector / LMCache (v9); chat templates render through the vendored google/minja engine, the same
-renderer llama.cpp ships. Full surface: [`include/vllm.h`](include/vllm.h) and
+(v6), prefix caching (v7), custom logits processors (v8), and the engine-sizing config the bundled
+server exposes: chunked-prefill token budget, scheduling policy, and the external KV connector /
+LMCache (v9). Chat templates render through the vendored google/minja engine, the same renderer
+llama.cpp ships. Full surface: [`include/vllm.h`](include/vllm.h) and
 [docs/STATUS.md](docs/STATUS.md).
 
 For C++ consumers, the higher-level surface lives under [`include/vllm/`](include/vllm/):

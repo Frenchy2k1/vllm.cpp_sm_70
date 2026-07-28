@@ -483,6 +483,18 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `auto` to opt into the same chat-template detection the C ABI uses, take `none`
   to disable, and abort startup listing every registered name if given an unknown
   one.
+- **Engine configuration through the C ABI** reached parity with the bundled
+  server's flags at **ABI v9** (2026-07-28). `vllm_model_params` now carries
+  `max_num_batched_tokens` (chunked-prefill token budget), `scheduling_policy`
+  (`fcfs`/`priority`/`lpm`), and `kv_transfer_config` (the external KV connector /
+  LMCache JSON, connector name validated against `KVConnectorFactory` at load),
+  and honours `tokenizer_config_path`, which had been declared since v1 and never
+  read. Every addition is inert at its default, so a v8 caller that zero-fills the
+  struct growth gets the byte-identical pre-v9 engine. Malformed
+  `speculative_config` / `kv_transfer_config` documents report
+  `VLLM_ERR_INVALID_ARGUMENT` rather than `VLLM_ERR_MODEL_LOAD` (the contract
+  `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
+  backend) could not expose LMCache or the prefill budget in a model config.
 - `/health` reports process liveness rather than a full engine-health probe.
 - **Speculative decoding** ships user-facing via `--speculative-config` (OpenAI
   server, example CLI, and C ABI v6), unset by default and byte-identical to the

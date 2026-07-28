@@ -2330,6 +2330,38 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
+### C-ABI engine-config growth to v9 (2026-07-28, `CLAIM-CAPI-ENGINE-CONFIG-V9`) - ABI surface only, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - ABI surface growth carrying already-benchmarked
+engine knobs to a new caller; no new engine path, no throughput claim,
+`benchmark_binding=false`.** `vllm_model_params` gained `max_num_batched_tokens`,
+`scheduling_policy`, and `kv_transfer_config`, and started honouring the
+declared-since-v1 `tokenizer_config_path`. Each maps onto an `EngineParams` field the
+bundled server already sets from its own flag, so the engine paths behind them are the
+ones already measured under their owning rows (chunked prefill, `KV-SGLANG-RADIX-CACHE`,
+`KV-EXTERNAL-CACHE`); nothing new executes. Every field is inert at its default, so a v8
+caller zero-filling the struct growth gets the byte-identical pre-v9 engine - which is
+what makes a speed claim meaningless here rather than merely unmeasured.
+
+The gate is contract behaviour, not speed: `tests/capi/test_capi.cpp` 31 cases / 219
+assertions on a CPU-only build, covering the new defaults (`max_num_batched_tokens == 0`,
+the two pointers NULL), the policy accept set (`fcfs`/`priority`/`lpm` reach model load)
+and its reject path (an unknown name returns `VLLM_ERR_INVALID_ARGUMENT` BEFORE any load
+attempt, with the offending name in `vllm_last_error()`), `kv_transfer_config` parse plus
+unregistered-connector rejection, and the error-code correction for a malformed
+`speculative_config` (`VLLM_ERR_INVALID_ARGUMENT`, the contract `vllm.h` documented since
+v6, previously reported as `VLLM_ERR_MODEL_LOAD` because the throw fell through to the
+generic `std::exception` catch). RED-first: the new fields did not compile against the v8
+struct, and the speculative error-code case failed behaviourally on the v8 build.
+
+Consumer-side confirmation: the LocalAI `vllm-cpp` backend's purego bindings bind all 19
+exported symbols against a CPU `libvllm.so` at this commit and `vllm_abi_version()`
+returns 9.
+
+**Not measured, and not owed:** no GPU run, no live generation through the new fields.
+An LMCache or `max_num_batched_tokens` throughput claim belongs to `KV-EXTERNAL-CACHE`
+and the chunked-prefill rows respectively, on a real workload, not to this ABI change.
+
 ### KV-EVENTS event generation + `msgpack` payload, ROAD-V1-D4 (2026-07-27, `CLAIM-ROADMAP-D4-KV-EVENTS`) - exactness/behavioral only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - additive, off-by-default serving
