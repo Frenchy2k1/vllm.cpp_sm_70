@@ -50,6 +50,7 @@
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/entrypoints/beam_search.h"
 #include "vllm/v1/core/sched/scheduler.h"
+#include "vllm/v1/engine/async_llm.h"
 #include "vllm/v1/engine/core.h"
 #include "vllm/v1/engine/input_processor.h"
 #include "vllm/v1/engine/output_processor.h"
@@ -364,6 +365,31 @@ struct Harness {
   LLMEngine engine;
 };
 
+// The PRODUCTION-server stack: identical model/config/tokenizer to Harness but
+// the asynchronous AsyncLLM frontend (the engine examples/server/main.cpp holds)
+// instead of the sync LLMEngine. Used to gate BeamSearchAsync (online.py driver)
+// token-for-token against the sync BeamSearch (offline.py) over the same weights.
+struct AsyncHarness {
+  AsyncHarness(const HfConfig& c, const Qwen3_5MoeWeights& w,
+               const Tokenizer& tok, int max_num_reqs = 8)
+      : scheduler(Harness::MakeSchedulerConfig(), MakeKvConfig(c), kBlockSize,
+                  /*enable_caching=*/true),
+        runner(c, w, MakeKvConfig(c), Q(), max_num_reqs, kMaxModelLen,
+               /*max_num_batched_tokens=*/kMaxModelLen * max_num_reqs),
+        executor(runner),
+        input_processor(tok, c),
+        output_processor(&tok),
+        engine(input_processor, scheduler, executor, output_processor,
+               Harness::Hasher()) {}
+
+  Scheduler scheduler;
+  GPUModelRunner runner;
+  Executor executor;
+  InputProcessor input_processor;
+  OutputProcessor output_processor;
+  vllm::v1::AsyncLLM engine;
+};
+
 // The {model_name, engine} label suffix every series carries for model "m".
 constexpr const char* kL = "{model_name=\"m\",engine=\"0\"}";
 
@@ -593,6 +619,64 @@ TEST_CASE("llm_engine: beam search returns beam_width scored continuations, bw=1
   // Beam search never does WORSE than greedy in cumulative logprob: the best
   // beam_width=3 beam's cum_logprob >= the beam_width=1 (greedy) beam's.
   CHECK(bw3.sequences[0].cum_logprob >= bw1.sequences[0].cum_logprob - 1e-6);
+}
+
+// ─── 1d. ASYNC beam search: BeamSearchAsync == BeamSearch, token-identical ────
+// The CORE async gate (SAMPLE-BEAM async/production). BeamSearchAsync drives an
+// AsyncLLM (the production-server engine, online.py) instead of the sync
+// LLMEngine (offline.py), but calls the SAME model-free BeamSearchStep scoring.
+// Over the SAME synthetic model/prompt/params, the async driver must return beams
+// token-IDENTICAL to the sync driver — same tokens, same order, same scores,
+// same text. This proves the async engine-drive did NOT change the algorithm.
+TEST_CASE("llm_engine: BeamSearchAsync returns beams token-identical to sync BeamSearch") {
+  const HfConfig c = MakeConfig();  // synthetic Qwen3.6, no eos -> runs to length
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kSteps = 4;
+  const std::optional<int> kNoEos = std::nullopt;
+
+  const std::vector<int32_t> prompt_tokens = tok.Encode("hello");
+  REQUIRE(!prompt_tokens.empty());
+
+  auto Params = [&](int beam_width) {
+    vllm::BeamSearchParams p;
+    p.beam_width = beam_width;
+    p.max_tokens = kSteps;
+    p.temperature = 0.0;  // greedy per-beam -> deterministic
+    p.length_penalty = 1.0;
+    p.ignore_eos = false;
+    return p;
+  };
+
+  for (const int beam_width : {1, 2, 3}) {
+    // Sync (offline) driver over a fresh LLMEngine stack.
+    vllm::BeamSearchOutput sync_out;
+    {
+      Harness h(c, w, tok);
+      sync_out = vllm::BeamSearch(h.engine, prompt_tokens, Params(beam_width),
+                                  kNoEos, &tok);
+    }
+    // Async (online) driver over a fresh, identical AsyncLLM stack.
+    vllm::BeamSearchOutput async_out;
+    {
+      AsyncHarness h(c, w, tok);
+      async_out = vllm::BeamSearchAsync(h.engine, prompt_tokens,
+                                        Params(beam_width), kNoEos, &tok);
+    }
+
+    // Token-identical: same beam count, and per beam same tokens / cum_logprob /
+    // finish_reason / decoded text, in the SAME descending-score order.
+    REQUIRE(async_out.sequences.size() == sync_out.sequences.size());
+    REQUIRE(static_cast<int>(async_out.sequences.size()) == beam_width);
+    for (std::size_t i = 0; i < sync_out.sequences.size(); ++i) {
+      const vllm::BeamSearchSequence& s = sync_out.sequences[i];
+      const vllm::BeamSearchSequence& a = async_out.sequences[i];
+      CHECK(a.tokens == s.tokens);
+      CHECK(a.cum_logprob == doctest::Approx(s.cum_logprob));
+      CHECK(a.finish_reason == s.finish_reason);
+      CHECK(a.text == s.text);
+    }
+  }
 }
 
 // ─── 2. Two-request concurrent batch ─────────────────────────────────────────

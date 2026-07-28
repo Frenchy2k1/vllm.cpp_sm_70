@@ -416,6 +416,18 @@ int main(int argc, char** argv) {
                                 tool_parser_name, reasoning_parser_name,
                                 args.enable_force_include_usage);
 
+    // SAMPLE-BEAM (C7): enable use_beam_search on the production AsyncLLM path.
+    // Both handlers need the tokenizer (prompt tok + per-beam detok) and the eos
+    // id (beam retirement); a use_beam_search request then routes through
+    // BeamSearchAsync (online.py) over the async engine. Without this, beam
+    // requests reject with "requires an engine and a tokenizer".
+    const std::optional<int32_t> beam_eos =
+        tokenizer.EosId() >= 0
+            ? std::optional<int32_t>(tokenizer.EosId())
+            : std::nullopt;
+    completion.set_beam_search_tokenizer(&tokenizer, beam_eos);
+    chat.set_beam_search_tokenizer(&tokenizer, beam_eos);
+
     // Diagnostic opt-out exists only for same-binary attribution. Production
     // defaults to the capacity-derived fixed pool.
     const char* fixed_pool_env = std::getenv("VLLM_CPP_HTTP_FIXED_POOL");

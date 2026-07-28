@@ -578,18 +578,20 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
       prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools);
 
   // ── use_beam_search (chat_completion/serving.py:319-343) ─────────────────
-  // Route the rendered chat prompt through the merged BeamSearch driver (over
-  // the SYNC LLMEngine); beam_width == n, returns the n best beams as assistant
-  // choices. Streaming beam search is rejected as upstream; the AsyncLLM beam
-  // path is a named residual.
+  // Route the rendered chat prompt through the merged BeamSearch driver;
+  // beam_width == n, returns the n best beams as assistant choices. The
+  // production server holds an AsyncLLM → BeamSearchAsync (online.py); the sync
+  // LLMEngine seam → BeamSearch (offline.py). Both call the SAME scoring, so the
+  // choices are identical. Streaming beam search is rejected as upstream.
   if (request.use_beam_search) {
     if (request.stream) {
       throw std::runtime_error(
           "Streaming is not currently supported with beam search");
     }
-    if (sync_engine_ == nullptr || beam_tokenizer_ == nullptr) {
+    if (beam_tokenizer_ == nullptr ||
+        (async_engine_ == nullptr && sync_engine_ == nullptr)) {
       throw std::runtime_error(
-          "beam search requires the synchronous engine and a tokenizer");
+          "beam search requires an engine and a tokenizer");
     }
     const int max_tok =
         request.max_completion_tokens.has_value()
@@ -597,8 +599,12 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
             : request.max_tokens.value_or(16);
     const BeamSearchParams params = request.to_beam_search_params(max_tok);
     const std::vector<int32_t> prompt_ids = beam_tokenizer_->Encode(prompt);
-    const BeamSearchOutput beams = BeamSearch(
-        *sync_engine_, prompt_ids, params, beam_eos_token_id_, beam_tokenizer_);
+    const BeamSearchOutput beams =
+        async_engine_ != nullptr
+            ? BeamSearchAsync(*async_engine_, prompt_ids, params,
+                              beam_eos_token_id_, beam_tokenizer_)
+            : BeamSearch(*sync_engine_, prompt_ids, params, beam_eos_token_id_,
+                         beam_tokenizer_);
 
     ChatCompletionResponse response;
     response.id = request_id;
