@@ -29616,3 +29616,33 @@ narrow working buffer).
 cross-format (F16 GGUF vs safetensors) agreement, no throughput number. A speed
 number is now genuinely OWED and belongs on GPU, not on a 2B CPU decode whose
 wall-clock is overhead-dominated.
+
+## 2026-07-28 — `SPEC-DFLASH-GGUF` D0: the asset is available pre-converted
+
+The spike planned to CONVERT a dflash draft locally with llama.cpp master's
+`convert_hf_to_gguf.py --target-model-dir`. Unnecessary: pre-converted
+`dflash`-arch GGUF drafts are published, and they are small because a DFlash
+draft is a few layers, not a whole model.
+
+    Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp
+      BF16 3.47 GB | Q8_0 1.85 | Q6_K 1.43 | Q5_K 1.23 | Q4_K_M 1.03
+    Alittlehammmer/Qwen3.6-35B-A3B-DFlash-GGUF-llama.cpp   (MoE counterpart)
+
+So `D0` no longer needs a conversion run, only a ~1 GB fetch. That fetch is the
+one blocked step: AGENTS.md safe defaults forbid downloading large assets from
+external hosts without developer approval, and no `.agents/developer-preferences.md`
+exists in this workspace. (Pushing and merging this session were separately and
+explicitly authorised by the developer; the download was not.)
+
+Scope correction worth carrying: the draft is CHEAP, the TARGET is expensive.
+`D1`-`D3` (config from GGUF KVs, the weight resolver, `.gguf` path
+discrimination) only read the DRAFT's KVs and tensor names, so they need the
+1 GB file and nothing else. Only `D4`+ (token identity, acceptance) need the
+matching Qwen3.6-27B target.
+
+Deliberately NOT written blind: the `D2` weight loader. The MTP row is the
+cautionary precedent - its two real defects (`fc.nk` unset, and the trunk's
+(w+1) norm storage) were BOTH invisible to shape-level reasoning and were caught
+only by loading a real file and generating from it. Writing the DFlash loader
+without its asset would produce exactly that class of plausible-but-wrong code,
+and calling it "implemented" would be an unverifiable claim.

@@ -147,9 +147,13 @@ gates.
 - `SPEC-MTP-GGUF` `G2`'s dequant-cache helper. Not a hard dependency; if this
   row lands first it owns the helper and the MTP row reuses it. Sequence
   whichever starts first, do not duplicate the cache.
-- A `dflash`-arch GGUF draft asset, produced by llama.cpp `origin/master`
-  `convert_hf_to_gguf.py --target-model-dir <target>` from a z-lab DFlash
-  checkpoint. Required for gates 2-5.
+- A `dflash`-arch GGUF draft asset. **Producing one is NOT required** (see `D0`):
+  pre-converted drafts are published, smallest useful being
+  `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` `Q4_K_M` at 1.03 GB. The
+  fetch is the only blocked step and needs developer approval per the AGENTS.md
+  safe defaults. Required for gates 2-5; NOT required for `D1`-`D3`.
+- For `D4`+ only: the matching TARGET (Qwen3.6-27B safetensors for axis A). This
+  is the expensive dependency, not the draft.
 - llama.cpp at a commit that HAS the DFLASH arch. Pin and record it; a stale
   checkout silently lacks the whole contract.
 - The GGUF trunk loader + `gguf_dequant.h`, unchanged.
@@ -158,7 +162,7 @@ gates.
 
 | Row | Work | Gate | Blocked by |
 |---|---|---|---|
-| `D0` | Produce a `dflash` GGUF draft with a pinned llama.cpp master; dump tensors + KVs; CONFIRM the names/KVs in Upstream chain against the real file; record the dump here | Mapping is evidence-backed | - |
+| `D0` | **UNBLOCKED 2026-07-28 - the asset need not be converted, it already exists.** The spike assumed we would have to run llama.cpp master's `convert_hf_to_gguf.py --target-model-dir` ourselves against a z-lab checkpoint. Not required: PRE-CONVERTED `dflash`-arch GGUFs are published, and they are small because a DFlash draft is a few layers, not a whole model. `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` carries BF16 3.47 GB / Q8_0 1.85 GB / Q6_K 1.43 GB / Q5_K 1.23 GB / **Q4_K_M 1.03 GB**; `Alittlehammmer/Qwen3.6-35B-A3B-DFlash-GGUF-llama.cpp` is the MoE counterpart. Remaining step is a ~1 GB fetch, which AGENTS.md safe defaults gate behind explicit developer approval (no `.agents/developer-preferences.md` present). Note the TARGET (Qwen3.6-27B) is still needed for `D4`+ but NOT for `D1`-`D3`, which only read the draft's KVs/tensor names | Asset identified, fetch pending approval | - |
 | `D1` | `MakeDflashGgufConfig` + KV unit tests | Config unit tests, RED-first | `D0` |
 | `D2` | `MakeDflashGgufResolver` + shared dequant cache | Resolver unit tests; gate 2 | `D0` |
 | `D3` | `ResolveDflashDraftDir` accepts a `.gguf`; `LoadDflashDraft` branches | Path-discrimination test | `D1`, `D2` |

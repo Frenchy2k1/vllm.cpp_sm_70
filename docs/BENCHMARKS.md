@@ -2597,6 +2597,18 @@ I6/I7 were measured for safetensors. Reproduction for the correctness gate:
 `VT_GDN_STATE_BF16=0 VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cpu/tests/test_qwen35_gguf_spec_decode`
 (the CPU `causal_conv1d_spec_update` requires f32 conv state).
 
+### DFlash-from-GGUF asset survey, `SPEC-DFLASH-GGUF` D0 (2026-07-28) - survey only, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - an availability survey, zero code.
+`benchmark_binding=false`.** The spike assumed the `dflash` GGUF draft would have
+to be produced locally with llama.cpp master's `--target-model-dir`. It does not:
+pre-converted `dflash`-arch drafts are published, and they are small because a
+DFlash draft is a few layers rather than a whole model (Q4_K_M ~1.03 GB, BF16
+~3.47 GB for the Qwen3.6-27B draft). That removes a conversion run from the
+critical path. The fetch is gated by the AGENTS.md safe defaults; the matching
+TARGET remains the expensive dependency for the end-to-end gates but is not
+needed for the loader rows.
+
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - scoping documents, ZERO code.
