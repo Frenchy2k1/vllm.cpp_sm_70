@@ -59,6 +59,24 @@ forward-divergent** (see the `BACKEND-CUDA-SM087` row). One honest sm_87 bug
 surfaced: the DEFAULT async runner path crashes with an illegal memory access
 (portable SYNC path is the verified one). Benchmark vs llama.cpp still pending.
 
+**GDN Triton-AOT per-arch cubins landed (`CLAIM-TRITON-AOT-PER-ARCH`, spec
+[triton-aot-per-arch.md](specs/triton-aot-per-arch.md), 2026-07-28).** HONEST GAP
+CORRECTED: the vendored Triton-AOT GDN fast-path cubins (the MEASURED codegen-win
+GDN decode + the delta_h/chunk_o/kkt/tril/wu FLA kernels) previously existed for
+**`sm_121a` ONLY**. Because a cubin loads only on the SM it was compiled for, and
+every committed cross-family arch build above ships **`-DVLLM_CPP_TRITON=OFF`**
+(portable-kernels-only), GDN decode on `sm_80/86/89/90a/100a` ran the **spilling
+hand kernel** — the Triton-AOT GDN-decode parity was `sm_121a`-runtime-only, NOT
+at parity on any other arch. The full GDN AOT set is now regenerated + vendored
+for `sm_80/86/89/90a/100a` (dgx GB10, Triton 3.6.0 / ptxas 12.8 cross-compile; 57
+artifacts + MANIFEST per arch, `cuobjdump` real per-target SASS `sm=80/86/89/90/
+100`, decode REG 209–217/0-spill), so a `-DVLLM_CPP_TRITON=ON` single-arch build
+on those arches now selects the non-spilling FLA path — **DERIVED+BUILD-VERIFIED
+(testing-welcome); no non-`sm_121` board runs a GDN model here, so this is NOT a
+runtime GDN-decode-parity claim on any arch.** `sm_121a` is byte-untouched (SACRED
+27B/35B gate structurally unchanged); the build-time cubin selection is already
+additive.
+
 **WA-1 (FA2 Ampere enablement) has LANDED — `DERIVED+BUILD-VERIFIED
 (testing-welcome)` (2026-07-27, `ROAD-V1-D1-CUDA` first brick).** The `fa2`
 FEATURE-TABLE cell (`cmake/CudaArchFeatures.cmake`) was widened
@@ -228,18 +246,24 @@ memory. Floating competitor versions do not count.
 
 ## Distributed / scale-out rows
 
-The NEW scale-out capability dimension (single-GPU today). All five express
-tensor/pipeline parallel ONCE against one `vt::` collective abstraction, with
-backend-specific transports — mirroring vLLM's `device_communicators`. Full
+The NEW scale-out capability dimension (single-GPU today). The transport legs
+express tensor/pipeline parallel ONCE against one `vt::` collective abstraction,
+with backend-specific transports — mirroring vLLM's `device_communicators`. Full
 3-leg scope, seam map and W-plan in
-[scale-out spike](specs/scale-out-distributed.md). No implementation yet; all
-`SPIKE` under `CLAIM-SCALE-OUT-SPIKE`.
+[scale-out spike](specs/scale-out-distributed.md); the parallelism-*mode*
+enumeration (TP/PP/DP/EP/SP/context, each grounded in vLLM `file:line` + mapped
+onto `vt::Communicator`) is in
+[parallelism-modes spike](specs/parallelism-modes.md). `-COMM` is `ACTIVE` (W1);
+the rest are `SPIKE`.
 
 | ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|
 | `BACKEND-DISTRIBUTED-COMM` | The unifying `vt::Communicator` / process-group abstraction — rank/world_size + AllReduce(sum/max/min/prod)/AllGather/Send/Recv, stream-ordered (each takes a `Queue&`). **W1 LANDED**: abstraction (`include/vt/communicator.h`) + a CPU in-process multi-rank transport (`src/vt/communicator.cpp`, N ranks = N host threads over one barrier+staging+mailbox) proven by `tests/vt/test_communicator.cpp` (2/4-rank AllReduce-sum + AllGather exact on every rank, Send/Recv rendezvous, RED-verified; 8 cases/50 assertions). `world_size==1` ⇒ every collective a byte-identical no-op (asserted). W2+ residuals: collective `OpId` routing via `OpProvider`, NCCL (kCUDA), RDMA/TCP (Spark), MLX-ring (kMETAL) transports | vLLM `device_communicators/base_device_communicator.py:147` (DeviceCommunicatorBase interface, the port template) + `distributed/parallel_state.py:358` (GroupCoordinator dispatch; world_size==1 bypass :638) | LANDED: `include/vt/communicator.h` + `src/vt/communicator.cpp` (sibling of `vt::Queue` `include/vt/device.h:50`); stream-order hooks reused `include/vt/backend.h:87-104`; W2 = `OpId`s via `include/vt/op_provider.h:108` | CPU exact-gate (`test_communicator`, 50/50) | [scale-out spike](specs/scale-out-distributed.md) | `ACTIVE` | `CLAIM-SCALE-OUT-W1` |
 | `BACKEND-DISTRIBUTED-TP` | Tensor parallel (intra-node multi-GPU) — sharded Column/Row/QKV linears, vocab-parallel embed + LM head, attention-head split, MoE expert-parallel; all-reduce after o_proj/MLP-down and the EP combine | vLLM `layers/linear.py:418` (Column, out-dim shard) / `:1612` (Row, all-reduce :1766) / `:1021` (QKV heads :1074) + `vocab_parallel_embedding.py:198` + `fused_moe/expert_map_manager.py:22` | seams `include/vllm/model_executor/models/dense_attn_block.h:342,513-530` + `qwen3.cpp:83-90`; weight chokepoint `dense_weight_loaders.h:131-138` | - | [scale-out spike](specs/scale-out-distributed.md) | `SPIKE` | `CLAIM-SCALE-OUT-SPIKE` |
 | `BACKEND-DISTRIBUTED-PP` | Pipeline parallel — PP stage split (`PPMissingLayer` analogue) + inter-stage `IntermediateTensors` send/recv over the comm layer + multi-worker executor fan-out | vLLM `models/utils.py:785` (PPMissingLayer) / `:798` (make_layers) + `distributed/utils.py:127` (get_pp_indices) + `parallel_state.py:957` (send_tensor_dict) | fan-out seam `src/vllm/v1/executor/executor.cpp:7-34` (direct single-worker call today) | - | [scale-out spike](specs/scale-out-distributed.md) | `SPIKE` | `CLAIM-SCALE-OUT-SPIKE` |
+| `BACKEND-DISTRIBUTED-DP` | Data parallel — N independent engine replicas over the SAME weights + a DP coordinator (global "request wave" so all DP ranks step together) + a per-step token-count all-reduce; DP×EP is the large-scale DeepSeek serving topology (DP-replicated attention + EP-sharded experts). NOT part of `world_size` (DP is outside: `world_size_across_dp = world_size × DP`) | vLLM `v1/engine/coordinator.py:23` (`DPCoordinator`, wave :33-56) + `v1/worker/dp_utils.py:164` (`coordinate_batch_across_dp`; per-step `num_tokens_across_dp` all-reduce :53) + group `distributed/parallel_state.py:1866` + flags `config/parallel.py:129-145` | reuses W1 `Communicator::AllReduce` for the token-count sync; NEW engine-replica executor + coordinator; **depends on the multi-worker executor (`executor.cpp:7-34`)** | - | [parallelism-modes spike](specs/parallelism-modes.md) | `SPIKE` | `CLAIM-PARALLELISM-MODES-SPIKE` |
+| `BACKEND-DISTRIBUTED-EP` | Expert parallel — each rank owns a DISJOINT subset of WHOLE experts (vs TP's every-rank-all-experts intermediate-dim shard); all-to-all dispatch (tokens→expert-owner) + all-to-all combine. EP group = DP×PCP×TP ranks (MoE-only), a re-grouping NOT a new `world_size` knob; EPLB is a separate same-ranks group. DeepEP HT/LL/V2 all-to-all backends present upstream | vLLM `fused_moe/expert_map_manager.py:22` (`determine_expert_map`, local_num_experts :69) + `use_ep` `fused_moe/config.py:1204` + EP group `distributed/parallel_state.py:1892` + all-to-all backends `fused_moe/all2all_utils.py:44` (`prepare_finalize/deepep_{ht,ll,v2}.py`); flags `--enable-expert-parallel` `config/parallel.py:165` + `--all2all-backend` `:188` | NEW `OpId::kAllToAll` (dispatch/combine) on the same `vt::Communicator` + the expert-subset loader (`qwen3_moe_weights.cpp:35-38` per-expert loop); `vt::MoeCombine` (`include/vt/ops.h:104`) becomes the combine | - | [parallelism-modes spike](specs/parallelism-modes.md) | `SPIKE` | `CLAIM-PARALLELISM-MODES-SPIKE` |
+| `BACKEND-DISTRIBUTED-SP` | Sequence parallel — **NOT a standalone dimension**: a compilation pass that (when TP is on) rewrites `AllReduce → RMSNorm(→Quant)` into `ReduceScatter → local RMSNorm(→Quant) → AllGather`, sharding the residual/norm along the sequence dim and enabling GEMM+RS / AG+GEMM fusions. vLLM has no `sequence_parallel_size` knob and no SP process group | vLLM `compilation/passes/fusion/sequence_parallelism.py:498` (`SequenceParallelismPass`) + `compilation/passes/pass_manager.py:147` + gate `config/compilation.py:1506` (`tp_size>1 and enable_sp`); flag `compilation_config.pass_config.enable_sp` `config/compilation.py:129` (+ `sp_min_token_num` :179, AsyncTP `fuse_gemm_comms` :133). MoE-specific non-DP variant = engine `PAR-SEQUENCE-MOE` | NEW `Communicator::ReduceScatter` (the one collective W1 lacks) + the norm-residual sequence-split; a portable-fusion surpass-track item (`glue-fusion-2026-07-19.md`), rides W2-TP, NOT correctness-critical | - | [parallelism-modes spike](specs/parallelism-modes.md) | `SPIKE` | `CLAIM-PARALLELISM-MODES-SPIKE` |
 | `BACKEND-DISTRIBUTED-MULTINODE-SPARK` | Multiple DGX Sparks over the ConnectX-7 200GbE RoCE/RDMA cable — cross-host TP×PP; reuses the NCCL transport over IB/RoCE. Payoff: DeepSeek-V4-Flash fp8 (~167 GiB) across 2×119 GiB Sparks (238 GiB), which one Spark cannot hold | vLLM `v1/executor/multiproc_executor.py:103` / `ray_executor.py:64` + `parallel_state.py:1560` (init_distributed_environment; master_addr :1597) + `v1/executor/vllm_net_devices.py` (RDMA NIC map) | reuses Leg-1 seams; NEW cross-host rendezvous (TCP store) + NIC pinning | - | [scale-out spike](specs/scale-out-distributed.md) | `SPIKE` | `CLAIM-SCALE-OUT-SPIKE` |
 | `BACKEND-DISTRIBUTED-MLX-RING` | MLX multi-node over Thunderbolt — `mlx.core.distributed` ring/JACCL collectives shard a Metal model forward across Thunderbolt-linked Macs (mlx-lm `--num-shards` parity: TP over heads+FFN dense, EP for MoE) | MLX `mlx.core.distributed` (backends ring/jaccl/mpi; `all_sum`/`all_gather`/`send`/`recv`) + mlx-lm `--num-shards` (MLX docs, not the vLLM tree) | provider seam beside `src/vt/metal/metal_mlx_provider.mm:162` (`mx::default_stream(gpu)`) + zero-copy `MTLBuffer↔mx::array` bridge `:24-46,101-118` | - | [scale-out spike](specs/scale-out-distributed.md) | `SPIKE` | `CLAIM-SCALE-OUT-SPIKE` |
 
@@ -260,10 +284,13 @@ backend-specific transports — mirroring vLLM's `device_communicators`. Full
   claimable SGLang preflight, eleven binding platform/workload competitor gates
   (including distinct cache-neutral and shared-prefix CUDA rows), and the
   beyond-vLLM legacy-arch floor `BACKEND-GATE-CUDA-LLAMACPP-LEGACY`.
-- The distributed / scale-out table has exactly 5 stable rows
-  (`BACKEND-DISTRIBUTED-COMM`/`-TP`/`-PP`/`-MULTINODE-SPARK`/`-MLX-RING`), the NEW
-  scale-out capability dimension scoped by
-  [scale-out-distributed.md](specs/scale-out-distributed.md). This moves the total
-  BACKEND row count 60 -> 65.
+- The distributed / scale-out table has exactly 8 stable rows: the 5 transport
+  legs (`BACKEND-DISTRIBUTED-COMM`/`-TP`/`-PP`/`-MULTINODE-SPARK`/`-MLX-RING`,
+  scoped by [scale-out-distributed.md](specs/scale-out-distributed.md)) plus the 3
+  parallelism modes `BACKEND-DISTRIBUTED-DP`/`-EP`/`-SP` (scoped by
+  [parallelism-modes.md](specs/parallelism-modes.md); SP is a TP-mode compilation
+  pass, not a world dimension). Context/CP rides the same abstraction and takes no
+  row. The scale-out spike moved the BACKEND count 60 -> 65; the modes spike moves
+  it 65 -> 68.
 - Adding or removing an upstream target, component family, platform, or
   required competitor changes the corresponding count in the same commit.

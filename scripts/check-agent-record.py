@@ -43,9 +43,16 @@ MATRICES = {
     # separate op `kAttentionDenseFlash` that tiles K/V across a block of query-warps
     # in shared memory, for the Whisper AUDIO encoder; multimodal-speed §14,
     # `CLAIM-MM-SPEED-AUDIO-ENC-KERNEL`).
+    # 38 since 2026-07-28: +`KERNEL-ATTN-DSA-SPARSE-INDEX` (the DeepSeek-V4 DSA
+    # "Lightning Indexer" sparse-attention SELECTION op — weighted MQA logits with a
+    # per-head ReLU + causal top-k token selection, the project's FIRST sparse-
+    # attention candidate-selection primitive, distinct from every dense/paged/MLA
+    # attention family above which score ALL keys. W3 landed a portable host
+    # reference + unit gate; the device kernel is a W7 residual. `SPIKE`,
+    # `CLAIM-DEEPSEEK-V4-W3`, spec specs/deepseek-v4-flash.md).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 37),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 38),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -62,7 +69,13 @@ MATRICES = {
     # scale-out capability dimension — one `vt::` collective abstraction with
     # nccl/RDMA/MLX-ring transports; single-GPU today). All `SPIKE`,
     # `CLAIM-SCALE-OUT-SPIKE`, spec specs/scale-out-distributed.md.
-    "BACKEND": (AGENTS / "backend-matrix.md", 65),
+    # 68 since 2026-07-28: +the parallelism-MODE rows `BACKEND-DISTRIBUTED-DP`/
+    # `-EP`/`-SP` (the enumeration of vLLM's parallelism modes onto our transport
+    # abstraction — DP engine-replica scale-out, EP whole-expert all-to-all, SP the
+    # TP-mode reduce-scatter compilation pass; TP/PP already existed, context/CP
+    # rides the same abstraction and takes no row). All `SPIKE`,
+    # `CLAIM-PARALLELISM-MODES-SPIKE`, spec specs/parallelism-modes.md.
+    "BACKEND": (AGENTS / "backend-matrix.md", 68),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

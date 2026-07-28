@@ -128,6 +128,12 @@ byte-identical `world_size==1` no-op. The multi-GPU (TP/PP), multi-Spark, and
 MLX transports remain unbuilt — those legs are HW-blocked (no ≥2-GPU box, no
 2-Spark cable, no 2-Mac cluster here). Full scope + seam map:
 [.agents/specs/scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
+Every parallelism MODE vLLM has (tensor / pipeline / data / expert / sequence /
+context parallel) is now enumerated and grounded in upstream source, mapped onto
+that one abstraction and priority-ranked, in
+[.agents/specs/parallelism-modes.md](../.agents/specs/parallelism-modes.md)
+(2026-07-28) — with the honest note that vLLM's "sequence parallel" is a
+tensor-parallel compilation pass, not a separate parallel axis.
 Multimodal
 (image/video/audio) is correctness-complete; its OpenAI-server wiring has landed
 all three CPU bricks (content-part parse + processor routing; the engine
@@ -214,10 +220,24 @@ activation clamps (not the no-ops the port-map assumed), now implemented. So Gem
 multimodal image is blocked only on the remaining engine wiring: the C++ Gemma-4
 NaFlex image processor + the mm merge-plumbing (register SupportsMultiModal, the
 masked-scatter merge of the 256 projected soft tokens at the image placeholder rows,
-the tower→merge→decode fork) for the image→text e2e, plus the USM-Conformer audio
-tower; the Gemma-4 MoE / k_eq_v / double-MLP backbone stays the larger-variant
-follow-on. Audio, the genuinely-new
-modality, is staged first on the smallest oracle-runnable audio model (Whisper,
+the tower→merge→decode fork) for the image→text e2e. **The USM-Conformer AUDIO
+tower is now IMPLEMENTED too** (G3, 2026-07-28): the additive
+`gemma4_audio.{h,cpp}` forward (`Gemma4AudioModel` + the audio projector) PASSES all
+seven per-stage gates f32-exact vs the transformers-eager reference (host f32,
+1256/1256: subsample rel-L2 5.4e-7, position-embeddings 8.9e-8, block0 4.2e-7,
+block_mid 3.8e-7, block_last 4.4e-6, output_proj 5.9e-6, projected 6.3e-6), ported
+1:1 from `modeling_gemma4.py` — a 2×Conv2d subsample, a relative positional
+encoding, and 12 Conformer layers (half-step feed-forwards, a chunked-local
+attention with Transformer-XL relative-position bias + a tanh soft-cap +
+per-dim-scale softplus, and a GLU + depthwise-causal-conv light-conv module), then
+`output_proj` and the audio embedder; the FINITE QAT clamps and the exact sliding
+window (`dist ∈ [0,12)` — a RED-first-caught off-by-one) are grounded in the source.
+So Gemma-4 now has all three modalities tower-proven (text STRICT 32/32, vision and
+audio per-stage), and the remaining audio work is the same engine wiring as image —
+the Gemma-4 audio feature extractor (mel frontend) + the mm merge-plumbing — plus
+a device-resident bf16 forward for speed. The Gemma-4 MoE / k_eq_v / double-MLP
+backbone stays the larger-variant follow-on. Audio as a standalone modality is also
+proven end-to-end on the smallest oracle-runnable audio models (Whisper encoder,
 then Voxtral-Mini-3B on the already-landed Mistral backbone).
 
 ### OLMo
@@ -265,7 +285,20 @@ out-of-tree to the uninstalled `vllm-gguf-plugin` (which *does* dequant IQ2_XXS)
 hard-rejects GGUF for DeepSeek-V4/V2 and lacks IQ2_XXS/Q2_K dequant — so even the
 `UD-Q2_K_XL` k-quant fallback does not rescue it. Apples-to-apples for DeepSeek-V4 is
 the NVFP4 vehicle; a true same-GGUF cross-engine number is only available on a
-Qwen3/dense k-quant both engines already load.
+Qwen3/dense k-quant both engines already load. **W3 attention primitives landed
+(2026-07-28):** the genuinely-new-vs-V2/V3 math is ported as portable host references
+and unit-gated — the DSA "Lightning Indexer" sparse top-k SELECTION (a weighted
+multi-query logit with a load-bearing per-head ReLU, then a causal top-512 token
+select), plus the two 512-wide-MLA output pieces V2/V3 lack: per-head attention-sink
+softmax and grouped output-LoRA. `test_deepseek_v4_dsa` passes 13/13 (hand-derived
+literal cases plus double-precision references, clean CPU `-Wall -Werror -Wextra`);
+the gate is honest hand-case + structural review, not a dumped-oracle comparison
+(the fixed-config 167B model cannot be built at a tiny shape). It is additive and
+byte-neutral for DeepSeek-V2. SGLang v0.5.15 registers and implements
+`DeepseekV4ForCausalLM` (the full DSA/MHC stack), so it is a viable second reference,
+subject to the same single-GB10 memory limit. The remaining bricks — Manifold
+Hyper-Connections, the sqrtsoftplus/hash MoE, the device kernels, and the full model
+gate — stay multi-Spark-blocked.
 The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):
@@ -281,7 +314,14 @@ skeleton); net-new = the KDA kernel delta, MXFP4 (group-32/e8m0), AttnRes
 (~1.56 TB MXFP4, ~12× the 119 GiB pool) and is not in the pinned oracle, so there is
 no on-box golden — like the beyond-vLLM CUDA bricks; the real signal is a primitive
 gate on the fitting Kimi-Linear-48B proxy plus build-verify, with full K3
-verification left to a multi-Spark / 16×H200-class box. The matrix opens with an
+verification left to a multi-Spark / 16×H200-class box. The W2/W5 CPU scaffolding
+is now **build-only** (2026-07-28): an additive registry stub, nested
+text/vision/quant config descent, the 93-layer KDA/MLA + 896-expert MoE
+text-backbone structural name-map (grounded in `kimi_linear.py`), a REFUSE-by-name
+forward and an MXFP4-refuse loader, green on a CPU build with a 6/6 scaffold gate;
+MXFP4, the KDA kernel delta and the MoonViT-V2 tower stay not-yet-buildable
+(deferred to the shared DeepSeek-V4 MXFP4 row, the Kimi-Linear KDA row, and W7).
+The matrix opens with an
 architecture-support checklist (a per-architecture status roll-up covering every
 engaged model) that a CI checker keeps in lockstep with the detailed rows.
 
@@ -389,6 +429,19 @@ the fp8/fp4/CUTLASS fast paths on `sm_110` remain DERIVED/NOT-YET (a cutlass-bac
 kernel campaign). The other fan-out boards remain build-supported only (no board
 here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
+
+**GDN Triton-AOT cubins are now vendored per-arch (2026-07-28).** The vendored
+Triton-AOT GDN fast-path cubins (the measured codegen-win packed decode plus the
+delta_h/chunk_o FLA kernels for the Qwen3.6 GDN-hybrid models) previously existed
+for GB10 `sm_121a` ONLY. Because a cubin loads only on the SM it was compiled for
+and the cross-family arch builds ship `-DVLLM_CPP_TRITON=OFF`, GDN decode on the
+other arches ran the slower spilling hand kernel. The full GDN AOT set is now
+regenerated and vendored for `sm_80/86/89/90a/100a` (`cuobjdump` shows real
+per-target SASS), so a `-DVLLM_CPP_TRITON=ON` single-arch build on those arches
+selects the non-spilling path too — **DERIVED+BUILD-VERIFIED (testing-welcome):
+no non-`sm_121` board runs a GDN model here, so this is not a runtime
+GDN-decode-parity claim on any arch.** `sm_121a` is byte-unchanged (SACRED gate
+intact). Evidence: [.agents/specs/triton-aot-per-arch.md](../.agents/specs/triton-aot-per-arch.md).
 
 **As of 2026-07-28, `sm_87` is also RUNTIME-VERIFIED (portable bf16 SYNC path) on
 real silicon — the SECOND non-GB10 runtime proof.** vllm.cpp was built
@@ -899,6 +952,20 @@ The protocol is in [`.agents/gates.md`](../.agents/gates.md) and
 (`scripts/check-fusion-consistency.py`) additionally keeps model forwards routing
 their fusable add+RMSNorm glue through the portable fusion catalog rather than
 hand-fusing it.
+
+### Feature-gap map vs pinned vLLM 0.26 (2026-07-28)
+
+A whole-surface sweep of pinned vLLM `555967922` (0.26.0.dev0) against our
+matrices ranked what vllm.cpp is MISSING: 8 HIGH, ~19 MED, ~16 LOW gaps, each
+grounded in vLLM `file:line`. The material HIGH-priority misses (common,
+single-box, user-facing) are LoRA / multi-LoRA runtime, the
+pooling/embedding/classify/rerank task class, AWQ + GPTQ native quantized
+compute, the xgrammar structured-output backend, fp8 KV cache, and reasoning
+parsers. Three medium gaps have no tracked row yet (generic draft-model + Medusa
+speculative decode, the offline Batch API, and the plugin system). vLLM has
+removed prompt adapters, so that is not a gap. The full prioritized list lives
+in [`.agents/specs/vllm-feature-gap-analysis.md`](../.agents/specs/vllm-feature-gap-analysis.md);
+this is analysis only, no capability state changed.
 
 The CPU CTest suite is green (0 real regressions). A 2026-07-27 hygiene pass
 triaged the previously-red tests as stale assertions or `-j` contention, not
