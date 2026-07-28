@@ -29953,3 +29953,28 @@ green.
   `benchmark_binding=false`), ledger, this log, `coordination.md` claim. NEXT: DC3
   residuals (sm100 int8/blockwise C3x, MoE Sm100, MXFP4, CUTLASS MLA); a cloud B200
   upgrades DC3 to `RUNTIME-VERIFIED` (token-exact + every-axis perf).
+- **2026-07-28 (Orin sm_87 RUNTIME gate — SECOND non-GB10 runtime proof)** —
+  `CLAIM-CUDA-ORIN-SM87-RUNTIME`, `ROAD-V1-D1-CUDA` / spec WA-O1; isolated worktree
+  `.claude/worktrees/agent-a6e411e998298fdb5` off local `main` `c14b9919` (confirmed
+  via `git rev-parse HEAD`). Drove a REAL NVIDIA Jetson AGX Orin over SSH
+  (`kairos@192.168.68.113`, Tegra R36.4.3 / JetPack 6, integrated sm_87). **Env
+  findings:** the cached CUDA-13 L4T image is BLOCKED by the NVIDIA container runtime
+  (Orin driver = CUDA 12.6 → `cuda>=13.0` unsatisfied), so built in
+  `l4t-jetpack:r36.4.0` (nvcc 12.6); the tree needs **GCC ≥ 13** (g++-11 fails the
+  `-Wdangling-pointer` pragma, g++-12 the libstdc++ `-Wrestrict` false positive) →
+  installed g++-13.4. Docker root + `/home` are on the 981 G partition; root `/`
+  (411 M free) untouched. **Build (EXIT=0):** `git archive c14b9919` → Orin;
+  `-DVLLM_CPP_CUDA_ARCHITECTURES=87 -DVLLM_CPP_CUDA=ON Release`, all 7 fast-path
+  features `DISABLED for [87]`, FA2 arch-listed but cutlass headers absent → OFF ⇒
+  PORTABLE-ONLY. **Runtime on the sm_87 GPU (`local-ai` stopped):** `test_cuda_backend`
+  6/6 (device reports sm_87) + `test_cuda_ops` 12/12 (461 assertions total, 0 skipped)
+  = real on-device kernels; `test_llama_paged_engine` (Llama-3.2-1B bf16, sync runner
+  `VT_ASYNC_RUNNER=0`) = **13/16 STRICT token-exact vs the vLLM 0.25.0 oracle, 16/16
+  near-tie gate, 0 divergent** (exceeds Thor's 12/16). **HONEST sm_87 BUG:** the DEFAULT
+  async runner crashes on first forward (`cudaFree: illegal memory access`) — SYNC path
+  is the verified one; async runner = tracked unblock item. `local-ai` RESTORED, build
+  container + scratch removed. Records (ONE commit): `backend-matrix.md`
+  (`BACKEND-CUDA-SM087` → RUNTIME-VERIFIED + Orin intro), spec WA-O1 result + Orin env,
+  `roadmap_v1.md`, `coordination.md` claim, `docs/STATUS.md`, `docs/BENCHMARKS.md`,
+  ledger, this log. NOT pushed. NEXT: fix the sm_87 async-runner illegal access;
+  GGUF leg; FA2 (needs cutlass on the Orin); llama.cpp A/B.
