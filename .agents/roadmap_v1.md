@@ -516,7 +516,7 @@ single-box, common, user-facing):
 | 3 | AWQ + GPTQ native quantized compute | [`QUANT-AWQ`](quantization-matrix.md), [`QUANT-GPTQ`](quantization-matrix.md) | M | The two most common community weight formats. **W0 spike + W1 CPU INT4 dequant LANDED (2026-07-28, `CLAIM-QUANT-AWQ-GPTQ`, both rows INVENTORIED→ACTIVE, [spike](specs/awq-gptq-quant.md)):** AWQ (reverse-order `awq_triton.py`) + GPTQ (`qdq_4.cuh` zero_offset v1/v2, act-order g_idx) unpack+dequant-to-bf16, unit-gated RED-first. Remaining: loader `R` (W2), Marlin GPU `C` (W4, rides the vendored NVFP4 Marlin), e2e `E` (W3), GPTQ 8/2/3-bit (W5), MoE (W6). |
 | 4 | xgrammar structured-output backend | [`TOOLS-XGRAMMAR`](engine-matrix.md) | M | Closes JSON-schema parity beyond our bounded native subset (default auto backend upstream). |
 | 5 | fp8 KV cache (`cache_dtype=fp8`) | [`KV-FP8`](engine-matrix.md) | M | Standard memory/throughput lever, halves KV footprint. |
-| 6 | Reasoning parsers (+ reasoning-gated grammar) | [`SAMPLE-REASONING`](engine-matrix.md) | M | `<think>` split for mainstream reasoning models; gates reasoning-conditioned structured output. |
+| 6 | Reasoning parsers (+ reasoning-gated grammar) — **ACTIVE** (partial coverage; spiked + seam landed 2026-07-28 `CLAIM-SAMPLE-REASONING`: 9 registered names of upstream's ~28; W2 remaining text families / W3 engine-backed adapters / W4 reasoning-gated grammar remain) | [`SAMPLE-REASONING`](engine-matrix.md), [spec](specs/reasoning-parsers.md) | M | `<think>` split for mainstream reasoning models; gates reasoning-conditioned structured output. |
 
 Three MED gaps have NO stable row yet (records gaps, recommend creating on
 pickup, IDs named in the spec): generic separate draft-model + Medusa spec
