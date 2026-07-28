@@ -30135,3 +30135,37 @@ decode. Records: spec `mm-serving.md` (`MM-SERVE-ENGINE`→done), `engine-matrix
 `model-matrix.md` (Qwen3-VL row), `roadmap_v1.md` (`ROAD-V1-MM`), `coordination.md`
 (`CLAIM-MM-SERVING-W2`), `docs/STATUS.md` + `docs/BENCHMARKS.md` (NOT-APPLICABLE —
 feature), `parity-ledger.md`, this entry.
+2026-07-28 (`CLAIM-GEMMA4-W0`, base local `main` `01105b11`, isolated worktree
+`.claude/worktrees/agent-a32070ea95648ba3c`, DGX-driven over SSH; NOT pushed):
+**Gemma-4 mm W0 — oracle-gateability RUN-VERIFIED, the checkpoint block is now
+retired.** The prior entry's unblock condition (an ungated Gemma-4 checkpoint) is
+MET: `unsloth` republished the Gemma-4 checkpoints ungated (`gated=False`, no HF
+token needed). Fetched `unsloth/gemma-4-E4B-it` (`Gemma4ForConditionalGeneration`,
+15.99 GB bf16, smallest full mm variant with vision+audio+text configs) to the dgx
+HF cache. Ran the DECISIVE oracle gate under `flock $HOME/gpu.lock`, GMU 0.30: the
+pinned vLLM 0.25.0 oracle (transformers 5.13.1 — which DOES carry `gemma4`, refuting
+the older "absent at 5.13.1" verdict) **LOADS + RUNS + GENERATES** — it resolved the
+arch, configured Gemma-4's heterogeneous head dims (head_dim 256 / global 512 →
+forced TRITON_ATTN), loaded the weights onto the GB10, built the KV cache (85.28x @
+4096), and greedily generated 32 coherent tokens. K=5 self-determinism =
+ALL-DETERMINISTIC ⇒ the future bring-up bar is STRICT token-exact. This is the
+opposite of OLMo-3 (which constructs but ABORTS on run): Gemma-4 constructs AND runs.
+Captured the greedy golden `tests/parity/goldens/gemma4_e4b_text/gen_manifest.json`
+(prompt + 32 ref ids + K=5 runs + sha256) + capture script
+`scripts/mm/g0_gemma4_oracle_capture.py`. Records moved: `gemma4-multimodal.md` (W0
+banner + G0 [DONE] + §3 retired-block), the three Gemma-4 rows in `model-matrix.md`
+(both mm rows CHECKPOINT-GATED→GATEABLE/W0-RUN-VERIFIED, stay `SPIKE`;
+`Gemma4ForCausalLM` oracle sub-blocker REFUTED, stays `BLOCKED` as a standalone
+bare-text vehicle), roadmap ROAD-V1-MM, coordination, STATUS, BENCHMARKS,
+parity-ledger. Honest scope: gateability PROVEN by a real generation (not an
+AutoConfig success), NOT an engine gate — vllm.cpp has no Gemma-4 forward yet, so the
+mm rows stay SPIKE, now blocked ONLY on implementation (the PLE/YOCO/Gemma-4-MoE
+backbone + the SigLIP vision and USM-Conformer audio towers; SigLIP reuses the M2a
+ViT scaffold). The G1 backbone campaign is unblocked to start. Box restored: GPU
+freed (run finished, `flock` released), `local-ai-worker` already stopped (left
+as-found), scratch pruned. The E4B checkpoint was REMOVED post-run to relieve the
+shared box: disk had filled to 100% / 6.4 GiB free during the run (largely the
+concurrent session's writes), and removing the 15 GiB E4B restored it to 17 GiB free.
+The committed golden JSON is the durable W0 anchor; the ungated E4B re-fetches in ~3
+min for G1. Records + golden fixture + one capture script only; ZERO src/kernel/CMake/
+model edits (every model/regression gate inert by construction); not pushed.

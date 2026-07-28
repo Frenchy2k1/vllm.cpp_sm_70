@@ -16,6 +16,28 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Gemma-4 multimodal W0, oracle-gateability run-verified + greedy golden captured (2026-07-28, `CLAIM-GEMMA4-W0`) - correctness anchor, no speed number owed
+
+**What ran.** The pinned vLLM 0.25.0 oracle (transformers 5.13.1) loaded, ran,
+and greedily generated the ungated `unsloth/gemma-4-E4B-it`
+(`Gemma4ForConditionalGeneration`, 15.99 GB bf16) on the GB10, capturing the
+future bring-up golden. This is the decisive oracle-gateability gate (model RUNS,
+not just config constructs): the oracle resolved the architecture, configured
+Gemma-4's heterogeneous head dimensions (head_dim 256 / global 512, forcing the
+TRITON_ATTN backend), loaded the weights, built the KV cache (85.28x concurrency
+at 4096 tokens), and produced 32 coherent greedy tokens. K=5 self-determinism was
+ALL-DETERMINISTIC, so the future implementation bar is STRICT token-exact.
+
+**Oracle config.** `vllm.LLM(model=unsloth/gemma-4-E4B-it, dtype=bfloat16,
+enforce_eager=True, gpu_memory_utilization=0.30, max_model_len=4096)`,
+`SamplingParams(temperature=0.0, max_tokens=32)`, run under `flock $HOME/gpu.lock`
+on dgx.casa. Golden fixture: `tests/parity/goldens/gemma4_e4b_text/gen_manifest.json`
+(prompt + 32 reference token ids + all K=5 runs + sha256); capture script
+`scripts/mm/g0_gemma4_oracle_capture.py`. No throughput benchmark applies (this is
+a golden capture); the two `MODEL-MM-gemma4-*` rows stay SPIKE, now blocked only on
+implementation (the PLE/YOCO/Gemma-4-MoE backbone plus the SigLIP and USM-Conformer
+towers).
+
 ## sm_110 (Jetson Thor) runtime gate, the first non-GB10 runtime proof (2026-07-27, `CLAIM-CUDA-SM110-RUNTIME`) - CORRECTNESS milestone, no speed number owed
 
 **What ran.** vllm.cpp built natively for `sm_110` on a real NVIDIA Jetson Thor

@@ -28,6 +28,34 @@ Rows this spike advances (owned; the concurrent Qwen3.6-video agent owns the Qwe
 
 ## 0. Headline findings
 
+> **W0 RUN-VERIFIED (2026-07-28, `CLAIM-GEMMA4-W0`): the oracle LOADS + RUNS +
+> GENERATES — Gemma-4 is GATEABLE, greedy golden captured.** The decisive
+> oracle-gateability gate ([[oracle-gateability-model-runs-not-config-constructs]])
+> is now PASSED, not inferred: on dgx, `~/venvs/vllm-oracle` = vLLM **0.25.0** +
+> transformers **5.13.1**, `vllm.LLM(model=unsloth/gemma-4-E4B-it)` (ungated,
+> `Gemma4ForConditionalGeneration`, 15.99 GB bf16 single shard) **resolved the arch,
+> loaded the weights onto the GB10, built the KV cache, and greedily generated 32
+> coherent tokens** (`enforce_eager`, `temperature=0`, GMU 0.30 under `flock`). vLLM
+> configured Gemma-4's heterogeneous head dims (head_dim=256 / global_head_dim=512 →
+> forced `TRITON_ATTN`) and ran the PLE/YOCO/Gemma-4-MoE backbone e2e. **K=5
+> self-determinism = ALL-DETERMINISTIC ⇒ the future bring-up bar is STRICT
+> token-exact.** This is the opposite of OLMo-3 (which CONSTRUCTS but ABORTS on run):
+> Gemma-4 CONSTRUCTS **and RUNS**. Golden fixture:
+> `tests/parity/goldens/gemma4_e4b_text/gen_manifest.json` (prompt + exact 32 output
+> token ids + K=5 runs + sha256; capture script `scripts/mm/g0_gemma4_oracle_capture.py`).
+> **Verdict: the oracle-block is fully retired; the ONLY remaining work is
+> implementation** (the PLE/YOCO/Gemma-4-MoE backbone + the SigLIP/USM-Conformer
+> towers — see the G-plan §2.2). Text-only ran (sufficient for W0 — it exercises the
+> full backbone); an image/audio prompt was NOT run this pass (staged to G2/G3).
+> Golden greedy tokens (ref, STRICT): `[236776, 2455, 5192, 2028, 563, 496, 3996,
+> 16477, 14020, 1948, 15453, 580, 12566, 12136, 529, 1816, 1262, 531, 3050, 236764,
+> 8729, 236764, 532, 8932, 531, 3246, 5192, 528, 496, 40137, 532, 4403]` = *"A large
+> language model is a complex artificial intelligence program trained on massive
+> amounts of text data to understand, generate, and respond to human language in a
+> coherent and context"*. Oracle input prompt ids (chat-templated, len 20): BOS 2 →
+> `<|turn>user…`. The two subsections below are preserved as the (now-superseded)
+> gate-time record.
+
 > **POST-PIN-ADVANCE UPDATE (2026-07-26): the decisive block is DISSOLVED.** The
 > parity pin advanced to `555967922` / vLLM 0.26.0.dev0, which carries **transformers
 > 5.14.1 - and 5.14.1 SHIPS `transformers.models.gemma4`** (environment.md:39-40;
@@ -203,8 +231,8 @@ not by Whisper/Voxtral.
 
 | Target | Image | Video | Audio | Disposition |
 |---|:--:|:--:|:--:|---|
-| **Gemma-4 `Gemma4ForConditionalGeneration`** | ✅ (SigLIP) | ✅ (SigLIP) | ✅ (if `audio_config`) | **REACHABLE ON THE ADVANCED PIN, IMPLEMENTATION PENDING** — the gate-time oracle block (transformers 5.13.1 no `gemma4`) is DISSOLVED (5.14.1 ships it); remaining work is the ≥12B gated mm-wrapped checkpoint + the PLE/YOCO/MoE backbone + the SigLIP/audio towers, all unbuilt. No e2e yet. |
-| **Gemma-4 `Gemma4UnifiedForConditionalGeneration`** | ✅ (encoder-free embedder) | ✅ | ✅ (if `audio_config`) | **REACHABLE ON THE ADVANCED PIN, IMPLEMENTATION PENDING** — same dissolved oracle block; simpler (no SigLIP/audio `AutoModel` tower) but still imports `transformers.gemma4_unified`; the 12B smallest checkpoint IS this variant. No e2e yet. |
+| **Gemma-4 `Gemma4ForConditionalGeneration`** | ✅ (SigLIP) | ✅ (SigLIP) | ✅ (if `audio_config`) | **GATEABLE — W0 RUN-VERIFIED 2026-07-28, greedy golden captured, IMPLEMENTATION PENDING.** vLLM 0.25.0 (transformers 5.13.1) LOADS+RUNS+GENERATES `unsloth/gemma-4-E4B-it` (ungated, 15.99 GB) — STRICT K=5 golden in `tests/parity/goldens/gemma4_e4b_text/`. Oracle block RETIRED; remaining work is pure impl: the PLE/YOCO/Gemma-4-MoE backbone + the SigLIP/audio towers, all unbuilt. No engine e2e yet. |
+| **Gemma-4 `Gemma4UnifiedForConditionalGeneration`** | ✅ (encoder-free embedder) | ✅ | ✅ (if `audio_config`) | **GATEABLE (by the E4B W0 proof — same oracle path), IMPLEMENTATION PENDING** — simpler (no SigLIP/audio `AutoModel` tower); the ungated `unsloth/gemma-4-12b-it` (23.92 GB) is this variant and fits GB10. No standalone run this pass (E4B is the smaller vehicle); the oracle-runnability is proven by the shared registered path. No engine e2e yet. |
 | **AUDIO modality** (as a subsystem) | — | — | ✅ | **STAGED — reachable, land it first on the smallest oracle-runnable vehicle** (Whisper→Voxtral-Mini-3B), NOT on Gemma-4. This is the genuinely-new work. |
 | Whisper (vehicle) | — | — | ✅ ASR | IMPLEMENTABLE-ADDITIVE — oracle-runnable, fits; the audio-pipeline standup vehicle |
 | Voxtral-Mini-3B (vehicle) | — | — | ✅ | IMPLEMENTABLE-ADDITIVE — oracle-runnable, fits, Mistral backbone LANDED; the e2e audio-merge vehicle |
@@ -283,13 +311,14 @@ and gated on mm input, exactly as the landed vision track proved).
  G3  Gemma-4 AUDIO (REUSE the A-track pipeline + the USM Conformer tower from A2) → AUDIO gate
 ```
 
-- **G0 — Honesty pass (reachable NOW; this spike).** Record the decisive
-  oracle-block (0.0), the two-variant architecture (0.1), the reuse-vs-new map
-  (0.2), the checkpoint/HW verdict (0.3). Config/registry resolution from the real
-  MM `text_config` is the only unit-gateable slice — and even that is limited
-  because the oracle can't construct the towers. **Gate:** the blocked-row honesty
-  gate (records `SPIKE`/BLOCKED with measured reasons, claims nothing more).
-  **GPU:** none.
+- **G0 — Oracle-gateability + greedy golden [DONE 2026-07-28, `CLAIM-GEMMA4-W0`].**
+  Supersedes the original honesty-pass scope: the oracle does NOT merely construct —
+  it **LOADS+RUNS+GENERATES** `unsloth/gemma-4-E4B-it` on vLLM 0.25.0 (§0 banner).
+  Captured: the STRICT K=5 greedy golden (`tests/parity/goldens/gemma4_e4b_text/gen_manifest.json`),
+  the oracle command/versions, the arch/head-dim config resolution, the two-variant
+  architecture (0.1), the reuse-vs-new map (0.2). **Gate PASSED:** a real greedy
+  generation (32 coherent tokens, deterministic ⇒ STRICT bar for G-bringup). **GPU:**
+  used (E4B under `flock`, GMU 0.30). This is the anchor for the future G1–G3 gates.
 - **G1 — Gemma-4 backbone** (only after the block clears): the PLE/YOCO/Gemma-4-MoE/
   k_eq_v/double-wide-MLP/layer-scalar stack ([`sweep-gemma.md`](sweep-gemma.md)
   §0.1), reusing the landed Gemma text primitives (gemma-RMSNorm, sandwich norms,
@@ -311,13 +340,16 @@ on the Gemma-4 critical path too.
 
 ## 3. Honest blockers (mirror the GLM/DeepSeek blocked-row precedent)
 
-- **Gemma-4 mm — oracle-BLOCKED (decisive) + checkpoint-gated + backbone-unbuilt.**
-  The pinned oracle (vLLM 0.25.0 + transformers 5.13.1) cannot construct the mm
-  path (no `transformers.models.gemma4`); every checkpoint is ≥12B, mm-wrapped,
-  `google/*` HF-gated, none cached; the PLE/YOCO/Gemma-4-MoE backbone + USM
-  Conformer audio tower are unbuilt (only the SigLIP tower is a reuse). HW is fine
-  (12B fits). **No e2e; honesty-pass only.** Reopen when Transformers carries
-  `gemma4` (or the pin advances) AND a fitting checkpoint downloads.
+- **Gemma-4 mm — oracle block RETIRED (W0 RUN-VERIFIED 2026-07-28); now
+  IMPLEMENTATION-BLOCKED only (backbone + towers unbuilt).** The two gate-time
+  blockers are both dissolved by measurement: (1) the pinned oracle vLLM 0.25.0 +
+  transformers 5.13.1 DOES carry `transformers.models.gemma4` and **loads + runs +
+  generates** the mm wrapper (STRICT greedy golden captured on `unsloth/gemma-4-E4B-it`);
+  (2) an **ungated** vehicle exists and is cached (`unsloth/gemma-4-E4B-it` 15.99 GB,
+  `unsloth/gemma-4-12b-it` 23.92 GB — no HF token needed). The ONLY remaining
+  blockers are implementation: the PLE/YOCO/Gemma-4-MoE backbone + the USM-Conformer
+  audio tower are unbuilt (the SigLIP vision tower is a reuse of M2a). HW fits (E4B
+  ~15 GB in the 119 GiB pool). **The G-campaign is now unblocked to start.**
 - **AUDIO modality — NOT blocked; STAGED on a smaller vehicle.** Reachable via
   native oracle-runnable audio models (Whisper, Voxtral-Mini-3B, Qwen2-Audio,
   Granite-Speech). Genuinely-new subsystems (audio pipeline + encoder tower), no

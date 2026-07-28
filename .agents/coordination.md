@@ -164,6 +164,40 @@ the GPU worker. Also named: streaming mm, multiple images, video, http(s) fetch,
 PNG/JPEG container decode. Records: `.agents/specs/mm-serving.md`, `engine-matrix.md`,
 `feature-matrix.md`, `model-matrix.md`, `roadmap_v1.md`, this claim, `docs/STATUS.md`,
 `docs/BENCHMARKS.md` (NOT-APPLICABLE — feature), `parity-ledger.md`, `state.md`.
+**Gemma-4 W0 — oracle-gateability RUN-VERIFIED, greedy golden captured (2026-07-28,
+`CLAIM-GEMMA4-W0`, DONE — committed, NOT pushed; FULL SHA reported to caller).**
+Retires the Gemma-4 mm oracle block by MEASUREMENT (the decisive
+[[oracle-gateability-model-runs-not-config-constructs]] gate). Base local `main`
+HEAD `01105b11`; isolated worktree `.claude/worktrees/agent-a32070ea95648ba3c`;
+DGX-driven over SSH. **What it did.** (1) Fetched the ungated
+`unsloth/gemma-4-E4B-it` (`Gemma4ForConditionalGeneration`, 15.99 GB bf16 single
+shard, `gated=False`) to the dgx HF cache. (2) Under `flock $HOME/gpu.lock`, GMU
+0.30, ran the DECISIVE gate: `vllm.LLM(model=E4B)` on the pinned oracle (vLLM
+**0.25.0** + transformers **5.13.1**) — it **LOADS + RUNS + GENERATES**: arch
+resolved, Gemma-4 heterogeneous head dims configured (256/512 → forced
+`TRITON_ATTN`), weights loaded onto the GB10, KV cache built (85.28x @ 4096), 32
+coherent greedy tokens (`enforce_eager`, temp 0). **K=5 self-determinism
+ALL-DETERMINISTIC ⇒ STRICT** future bring-up bar. This is the OPPOSITE of OLMo-3
+(constructs but aborts) — Gemma-4 constructs AND runs. (3) Committed the greedy
+golden fixture `tests/parity/goldens/gemma4_e4b_text/gen_manifest.json` (prompt +
+32 ref token ids + K=5 runs + sha256) + the capture script
+`scripts/mm/g0_gemma4_oracle_capture.py`. (4) Updated `gemma4-multimodal.md` (W0
+banner + G0 [DONE] + retired-block §3) and the three Gemma-4 rows in
+`model-matrix.md` (both mm rows: CHECKPOINT-GATED → GATEABLE/W0-RUN-VERIFIED, stay
+`SPIKE`; the `Gemma4ForCausalLM` text row: the oracle-support sub-blocker REFUTED,
+stays `BLOCKED` as a standalone bare-text vehicle). **Owns:** the golden fixture +
+capture script + these record edits. **NON-COLLISION:** records + a golden fixture +
+one new capture script ONLY — NO src/include/kernel/model/CMake edit, so every
+model/regression gate is inert by construction; does NOT touch the Qwen mm rows,
+`multimodal-track.md`, README, or Metal. **Box restored:** GPU freed (run finished,
+`flock` released), `local-ai-worker` was already stopped (left as-found), scratch
+(`/tmp/gemma4_w0_out`, `/tmp/g0_*.py`) pruned; the E4B checkpoint was REMOVED
+post-run to relieve the shared box (disk had filled to 100% / 6.4 GiB free during
+the run, largely the concurrent session — removing the 15 GiB E4B restored it to
+17 GiB free). The committed golden JSON is the durable anchor; the ungated E4B
+re-fetches in ~3 min (`snapshot_download`, max_workers=4) when G1 starts.
+**NEXT (future, out of this claim):** the G1 Gemma-4 backbone campaign
+(PLE/YOCO/Gemma-4-MoE, sweep-gemma §0.1) — now unblocked to start.
 
 **Multimodal SERVING — first CPU brick LANDED (2026-07-28, `CLAIM-MM-SERVING-W1`,
 DONE — committed, NOT pushed; FULL SHA reported to caller).** Opens the
