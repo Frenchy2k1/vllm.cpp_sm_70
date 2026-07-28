@@ -28953,3 +28953,36 @@ run is what mis-called it the first time.
 kernels landed plus the MLX shape gate and the provider fallback hoist. Not
 parity; the last 2.4% has one identified lever with arithmetic behind it and a
 known implementation hazard.
+
+---
+
+## 2026-07-28 — GQA grouping CLOSED: the traffic it would save is already free
+
+The previous entry proposed GQA-grouped decode attention as 82% of the remaining
+gap. **The arithmetic double-counts, and two numbers already recorded prove it:**
+
+```
+decode attention "traffic"  117 MB / 1.52 ms = 77 GB/s
+strided bandwidth probe ceiling            = 69 GB/s
+```
+
+Achievable bandwidth cannot be exceeded, so the 117 MB is not all from DRAM. The
+two q-head threadgroups sharing a kv head read the same 64 KB per chunk and the
+second hits cache: **the hardware already deduplicates it.** Grouping would save
+traffic nobody pays, while halving threadgroups 16 -> 8 — under one per core on a
+~10-core part at tq=1. That explains the measured 26.53 vs 27.24 mechanistically
+rather than as noise.
+
+**Untested prediction:** GQA grouping is a BATCH lever, not a b=1 one. At tq > 1
+the grid is hkv*tq so the parallelism floor lifts, and the reuse distance grows
+past what cache covers. Worth revisiting for throughput serving.
+
+**The last identified b=1 decode lever is therefore closed.** Gap 0.81 ms/token;
+GEMV holds 34.2 ms of it at 83% of memory peak; the remaining 2.52 ms of
+attention + small kernels has no mechanism this session found.
+
+**Method note, and it is the session's most repeated lesson:** the 77 > 69
+contradiction was sitting in the record for hours before I read it as a
+contradiction. When a derived quantity exceeds a measured ceiling, the derivation
+is wrong — that is a free correctness check on any traffic or FLOP estimate, and
+it cost one arithmetic comparison to apply.

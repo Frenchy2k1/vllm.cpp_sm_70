@@ -3484,6 +3484,41 @@ this workload.
 
 ---
 
+## GQA grouping CLOSED: the traffic it would save is already free (2026-07-28)
+
+The entry below proposes GQA-grouped decode attention as worth 82% of the
+remaining gap, on the arithmetic that qpk=2 makes us stream each kv head twice.
+**That arithmetic double-counts, and two numbers already in this document say so:**
+
+```
+decode attention measures 77 GB/s of "traffic" (117 MB / 1.52 ms)
+the strided bandwidth probe tops out at  69 GB/s on the same access pattern
+```
+
+You cannot exceed achievable bandwidth. So the 117 MB is not all coming from
+DRAM: the two q-head threadgroups sharing a kv head read the same 64 KB per chunk
+(256 keys x 128 elem x 2 B), and the second reader hits cache. **The duplicate is
+already being deduplicated by the hardware.** Grouping would save traffic nobody
+is paying, while still halving the threadgroup count.
+
+And at the b=1 parity workload that halving is severe: tq=1 means 16 threadgroups
+today and **8** if grouped, on a roughly 10-core part. That is under one
+threadgroup per core, and it explains the measured 26.53 against 27.24
+mechanistically rather than as noise.
+
+**Prediction, untested:** GQA grouping should be a BATCH-serving lever, not a b=1
+one — at tq > 1 the grid is hkv*tq and the parallelism floor disappears while the
+cache no longer covers the reuse distance. Worth revisiting for throughput
+serving; not for this target.
+
+**Consequence: the last identified lever for b=1 decode is closed.** The gap is
+0.81 ms/token, the GEMV holds 34.2 of it at 83% of memory peak, and the remaining
+2.52 ms of attention plus small kernels has no mechanism left that this session
+found. That is where it stands: 95.9% default, 97.6% MLX-gated, with prefill
+already ahead.
+
+---
+
 ## The remaining gap is ENTIRELY decode, and GQA grouping covers 82% of it
 
 With MLX shape-gated, **prefill is ahead** (524.5 ms against 532.6, +1.5%) so the
