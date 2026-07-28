@@ -888,6 +888,20 @@ The protocol is in [`.agents/gates.md`](../.agents/gates.md) and
 their fusable add+RMSNorm glue through the portable fusion catalog rather than
 hand-fusing it.
 
+### Feature-gap map vs pinned vLLM 0.26 (2026-07-28)
+
+A whole-surface sweep of pinned vLLM `555967922` (0.26.0.dev0) against our
+matrices ranked what vllm.cpp is MISSING: 8 HIGH, ~19 MED, ~16 LOW gaps, each
+grounded in vLLM `file:line`. The material HIGH-priority misses (common,
+single-box, user-facing) are LoRA / multi-LoRA runtime, the
+pooling/embedding/classify/rerank task class, AWQ + GPTQ native quantized
+compute, the xgrammar structured-output backend, fp8 KV cache, and reasoning
+parsers. Three medium gaps have no tracked row yet (generic draft-model + Medusa
+speculative decode, the offline Batch API, and the plugin system). vLLM has
+removed prompt adapters, so that is not a gap. The full prioritized list lives
+in [`.agents/specs/vllm-feature-gap-analysis.md`](../.agents/specs/vllm-feature-gap-analysis.md);
+this is analysis only, no capability state changed.
+
 The CPU CTest suite is green (0 real regressions). A 2026-07-27 hygiene pass
 triaged the previously-red tests as stale assertions or `-j` contention, not
 regressions: the model-registry count assertion tracks the 24 registered

@@ -30889,3 +30889,53 @@ ledger. Records-only; no build/GPU/download/benchmark.
   Residuals: streaming mm, multiple images, video, http fetch, PNG/JPEG codec,
   Gemma-4 image.
 - **2026-07-28** — **Parallelism-mode enumeration spike (`CLAIM-PARALLELISM-MODES-SPIKE`, records-only, NOT pushed).** User-directed: enumerate EVERY parallelism / distributed-execution mode vLLM has, grounded 1:1 in pinned vLLM `555967922` `file:line`, mapped onto the `vt::Communicator` seam landed by W1. Base `main` `308c312a` (isolated worktree `.claude/worktrees/agent-a6656edcf7ff0251f`; CPU-only, NO build/GPU/download). NEW `.agents/specs/parallelism-modes.md` — the enumeration table (mode / what / vLLM file:line / config flag / comm pattern / our-seam-map / reuse-vs-new / priority) + per-mode detail + the mode→collective map + priority ranking. **Five true world dimensions** (TP/PP/DP/PCP/DCP) laid out as one rank tensor `ExternalDP×DP×PP×PCP×TP` (`parallel_state.py:1785`), plus **two modes that are NOT their own axis**: EP (a DP×PCP×TP re-grouping, `parallel_state.py:1892`) and SP (a compilation pass `sequence_parallelism.py:498`, flag `pass_config.enable_sp`, rewrites TP all-reduce→reduce-scatter/all-gather — flagged honestly). DeepEP HT/LL/V2 all-to-all backends confirmed present upstream; vLLM has NO interleaved/virtual pipeline. Added `BACKEND-DISTRIBUTED-DP`/`-EP`/`-SP` rows (distributed table 5→8, BACKEND total 65→68, `check-agent-record.py` bumped); roadmap mode-priority sub-table (TP→EP+NCCL→PP→DP→SP→context); feature-matrix §3 EP/DP/SP/context rows repointed to the new spec; docs/STATUS scale-out line + docs/BENCHMARKS NOT-APPLICABLE + ledger + coordination + this entry. Each mode → `vt::Communicator` collective: W1 has AllReduce/AllGather/Send/Recv; EP needs NEW AllToAll, SP needs NEW ReduceScatter, comm-strategy selection = the existing `OpProvider (OpId,DeviceType)` table. All 6 record checkers rc=0. NEXT: W2 = `BACKEND-DISTRIBUTED-TP` forward+loader (still ≥2-GPU-gated).
+
+## 2026-07-28 — vLLM feature-gap analysis: whole-surface sweep vs pinned vLLM 0.26 (`CLAIM-FEATURE-GAP-SPIKE`, records-only)
+
+- **What ran.** A CPU/research sweep (base `main` `308c312a`, isolated worktree
+  `.claude/worktrees/agent-a76b7ae648f3cd7d3`, NO build / NO GPU) of pinned vLLM
+  `555967922` (0.26.0.dev0, read at `/home/mudler/_git/vllm` HEAD `5559679`)
+  against our five matrices, to find what we are MISSING. Four parallel area
+  agents grounded every vLLM capability in `file:line`: adapters (`vllm/lora/`),
+  spec-decode breadth (`vllm/v1/spec_decode/` + `config/speculative.py`), the
+  quant registry (`quantization/__init__.py:141`), structured-output backends
+  (`vllm/v1/structured_output/`) + reasoning parsers (`vllm/reasoning/`),
+  pooling tasks (`vllm/model_executor/layers/pooler/`, `vllm/tasks.py`), the
+  OpenAI serving surface (`vllm/entrypoints/`), KV connectors / offload
+  (`vllm/distributed/kv_transfer/`, `vllm/v1/kv_offload/`), parallelism
+  (`config/parallel.py`), engine/runtime (`vllm/plugins/`, `device_allocator/`,
+  `model_loader/`) and platforms (`vllm/platforms/`).
+- **Verdict: 8 HIGH, ~19 MED, ~16 LOW gaps.** Full grounded table in
+  `.agents/specs/vllm-feature-gap-analysis.md`. Top HIGH (common, single-box,
+  user-facing): (1) LoRA / multi-LoRA runtime + load/unload endpoints
+  (`lora/punica_wrapper/punica_gpu.py:33`, `serve/lora/api_router.py:43`) —
+  whole adapter subsystem absent; (2) the pooling task class —
+  embeddings/classify/score/rerank models + endpoints
+  (`layers/pooler/abstract.py:16`, `pooling/embed/api_router.py:28`) — no
+  pooling runner at all; (3) AWQ + GPTQ native compute (`auto_awq.py:171`,
+  `auto_gptq.py:97`); (4) xgrammar backend (`backend_xgrammar.py:36`); (5)
+  fp8-KV (`quantization/kv_cache.py:42`); (6) reasoning parsers
+  (`vllm/reasoning/__init__.py:22`, 25+ parsers).
+- **Three MED capabilities have NO stable row (records gaps).** Recommended new
+  rows named in the spec: generic separate draft-model + Medusa spec decode
+  (`spec_decode/draft_model.py:19`, `medusa.py:18` — we have
+  MTP/DFlash/ngram/DSpark/TLI/EAGLE3 but not the classic model-agnostic draft
+  path or Medusa); offline Batch API (`entrypoints/openai/run_batch.py:793`);
+  plugin system (`vllm/plugins/__init__.py:18` — directly serves the
+  extensibility-first priority).
+- **Honesty — already HAVE (naive-scan false-positives, NOT re-roadmapped):**
+  ngram/MTP/DFlash spec decode, Prometheus `/metrics`, custom logits
+  processors, `n>1`/`best_of`/beam/logprobs/logit_bias, priority scheduling,
+  APC, chunked prefill, the streaming tool-parser engine, the utility endpoints,
+  YaRN/llama3/longrope/NTK rope, sliding-window + chunked-local attention, the
+  collective/process-group abstraction (W1). Confirmed NON-gap: vLLM has
+  REMOVED prompt adapters, so we owe nothing there.
+- **Records:** NEW `specs/vllm-feature-gap-analysis.md`; `roadmap_v1.md`
+  (feature-gap-sweep section + 6 promoted HIGH rows referencing existing IDs);
+  `feature-matrix.md` (sweep callout + spec-breadth / batch-API / plugin gap
+  rows + LoRA anchors + prompt-adapter NON-GAP); `coordination.md`
+  (`CLAIM-FEATURE-GAP-SPIKE` note); `docs/STATUS.md`; `docs/BENCHMARKS.md`
+  (NOT-APPLICABLE — spike); `parity-ledger.md` + this entry. No counted-matrix
+  rows created (no inventory-count bump); no `src/`/`tests/`/README/Metal
+  touched. All six record checkers rc=0. NEXT (separate claims): create the
+  three missing rows and pick up the HIGH gaps in priority order.

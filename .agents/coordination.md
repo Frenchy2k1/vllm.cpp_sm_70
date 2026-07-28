@@ -118,6 +118,28 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**vLLM feature-gap analysis — whole-surface sweep (2026-07-28,
+`CLAIM-FEATURE-GAP-SPIKE`, records-only, NOT pushed; FULL SHA reported to caller).**
+Base `main` HEAD `308c312a`; isolated worktree
+`.claude/worktrees/agent-a76b7ae648f3cd7d3`; CPU/research only — NO build, NO
+GPU. Scanned pinned vLLM `555967922` (0.26.0.dev0, `/home/mudler/_git/vllm`
+HEAD `5559679`) across adapters, spec-decode breadth, the quant registry,
+structured-output backends, pooling tasks, the OpenAI serving surface,
+engine/runtime (plugins, sleep/wake, RLHF, offload, loaders), parallelism and
+platforms; cross-checked every candidate against the five matrices so nothing
+we already HAVE was re-flagged. Verdict: 8 HIGH, ~19 MED, ~16 LOW gaps. Top
+HIGH (single-box, common): LoRA runtime + endpoints, the
+pooling/embedding/rerank task class, AWQ+GPTQ native compute, xgrammar backend,
+fp8-KV, reasoning parsers. Three MED capabilities have NO stable row (records
+gaps, recommended for future rows named in the spec): generic draft-model +
+Medusa spec decode, offline Batch API, plugin system. Confirmed NON-gap: vLLM removed prompt
+adapters. Owns ONLY records: NEW
+`.agents/specs/vllm-feature-gap-analysis.md`, the roadmap feature-gap-sweep
+section + `feature-matrix.md` callout/gap rows, this note, `docs/STATUS.md`,
+`docs/BENCHMARKS.md` (NOT-APPLICABLE — spike), `parity-ledger.md`, `state.md`.
+Touches NO `src/`/`include/`/`cmake/`/`tests/`, no counted-matrix rows (no
+inventory-count bump), no README/Metal. DONE — records committed.
+
 **DeepSeek-V4 GGUF benchmark loadability — source-level spike (2026-07-28,
 `CLAIM-DSV4-GGUF-SPIKE`, records-only, NOT pushed; FULL SHA reported to caller).**
 Base `main` HEAD `e0b233df`; isolated worktree `.claude/worktrees/agent-a19a1d1e4dc82becb`;

@@ -479,6 +479,39 @@ DP×PCP×TP ranks (no size knob); vLLM has no interleaved/virtual pipeline.
 | P4 | DP — [`BACKEND-DISTRIBUTED-DP`](backend-matrix.md) | engine-replica scale-out + coordinator wave + token-count all-reduce; completes DP×EP | `AllReduce` (✅ W1) | ≥2-GPU (+W4 executor) |
 | P5 | SP — [`BACKEND-DISTRIBUTED-SP`](backend-matrix.md) | TP-mode all-reduce → reduce-scatter/all-gather fusion (surpass-track, not correctness) | `ReduceScatter` (❌ NEW) | ≥2-GPU |
 | P6 | Context / PCP+DCP (no new backend row) | shard the KV/sequence dim for long context (ring/all-to-all attention) | `AllToAll` + partial-attn reduce (❌ NEW) | ≥2-GPU |
+## vLLM feature-gap sweep (2026-07-28, `CLAIM-FEATURE-GAP-SPIKE`)
+
+A whole-surface scan of pinned vLLM `555967922` (0.26.0.dev0) vs our matrices,
+ranking what we are MISSING. Full grounded list (every gap with vLLM
+`file:line`, our-status, effort) in
+[specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md). Count:
+8 HIGH, ~19 MED, ~16 LOW. The material HIGH-priority misses, promoted here (all
+single-box, common, user-facing):
+
+| # | Gap | Rows | Effort | Why HIGH |
+|---|---|---|---|---|
+| 1 | LoRA / multi-LoRA runtime + load/unload endpoints | [`LORA-RUNTIME`](engine-matrix.md), [`LORA-ENDPOINTS`](engine-matrix.md) | L | Highest-demand missing user feature; whole adapter subsystem absent. |
+| 2 | Pooling task class — embeddings / classify / score / rerank (runner + endpoints) | [`SERVE-POOLING-ENDPOINTS`](engine-matrix.md) (+ no pooling model rows yet) | L | An entire task class we cannot serve; embeddings/rerank are ubiquitous. |
+| 3 | AWQ + GPTQ native quantized compute | [`QUANT-AWQ`](quantization-matrix.md), [`QUANT-GPTQ`](quantization-matrix.md) | M | The two most common community weight formats; no compute path. |
+| 4 | xgrammar structured-output backend | [`TOOLS-XGRAMMAR`](engine-matrix.md) | M | Closes JSON-schema parity beyond our bounded native subset (default auto backend upstream). |
+| 5 | fp8 KV cache (`cache_dtype=fp8`) | [`KV-FP8`](engine-matrix.md) | M | Standard memory/throughput lever, halves KV footprint. |
+| 6 | Reasoning parsers (+ reasoning-gated grammar) | [`SAMPLE-REASONING`](engine-matrix.md) | M | `<think>` split for mainstream reasoning models; gates reasoning-conditioned structured output. |
+
+Three MED gaps have NO stable row yet (records gaps, recommend creating on
+pickup, IDs named in the spec): generic separate draft-model + Medusa spec
+decode (`vllm/v1/spec_decode/draft_model.py:19`, `medusa.py:18`); offline Batch
+API (`vllm/entrypoints/openai/run_batch.py:793`); plugin system
+(`vllm/plugins/__init__.py:18`, directly serves the extensibility-first priority).
+Confirmed NON-gap: vLLM has REMOVED prompt adapters. Other MED/LOW gaps
+(DP/EP+EPLB [`PAR-DP`](engine-matrix.md)/[`PAR-EP-EPLB`](engine-matrix.md), KV
+offload [`KV-OFFLOAD`](engine-matrix.md), external KV connectors / PD
+disaggregation [`KV-EXTERNAL-CACHE`](engine-matrix.md)/[`KV-CONNECTORS`](engine-matrix.md),
+responses/messages+transcription [`SERVE-RESPONSES-MESSAGES`](engine-matrix.md),
+sleep/wake+RLHF [`SERVE-ADMIN`](engine-matrix.md), guidance/outlines
+[`TOOLS-GUIDANCE-OUTLINES`](engine-matrix.md), weight offload
+[`ENG-WEIGHT-OFFLOAD`](engine-matrix.md), EAGLE-base/suffix
+[`SPEC-EAGLE3`](engine-matrix.md)/[`SPEC-DSPARK`](engine-matrix.md)) stay in the
+spec table, not promoted.
 
 ## Decision rules carried forward
 
