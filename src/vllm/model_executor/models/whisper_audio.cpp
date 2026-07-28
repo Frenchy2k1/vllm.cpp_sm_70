@@ -83,6 +83,56 @@ std::unique_ptr<Buf> UpBf16(Backend& b, Queue& q, const std::vector<float>& f,
   return std::make_unique<Buf>(b, q, DType::kBF16, std::move(shape), bf.data());
 }
 
+// A/B + RED knob: VT_WHISPER_ENC_REMARSHAL=1 disables weight residency, forcing
+// the pre-lever per-call marshalling (f32->bf16 convert + H2D) on EVERY forward —
+// the same-binary "before" arm and the proof-it-ran RED (force re-upload → the
+// host time returns; unset → weights upload once).
+bool RemarshalWeights() {
+  static const bool v = [] {
+    const char* e = std::getenv("VT_WHISPER_ENC_REMARSHAL");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
+// Build a bf16 Tensor view of a device pointer with row-major strides for `shape`.
+Tensor ViewBf16(void* data, Queue& q, const std::vector<int64_t>& shape) {
+  Tensor t;
+  t.data = data;
+  t.dtype = DType::kBF16;
+  t.device = q.device;
+  t.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
+    t.shape[i] = shape[static_cast<size_t>(i)];
+    t.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return t;
+}
+
+// Device-resident bf16 view of a host-f32 weight. On first use (handle null) the
+// weight is f32->bf16 converted and uploaded ONCE, then wrapped in a shared_ptr
+// whose deleter frees through the vt::Backend; every later forward reuses the
+// SAME device bytes with ZERO host conversion or H2D. Mirrors qwen3_5.cpp's
+// ResidentWeight (:797) d_dev seam. Byte-identical to the old per-call UpBf16:
+// the ToBf16 round-trip is deterministic, so the resident bytes equal what each
+// call previously re-uploaded. With VT_WHISPER_ENC_REMARSHAL=1 it re-uploads
+// every call (reassigning handle; the old buffer frees via shared_ptr), exactly
+// reproducing the pre-lever marshalling cost for the A/B "before" arm.
+Tensor ResidentBf16(Backend& b, Queue& q, const std::vector<float>& f,
+                    std::vector<int64_t> shape, std::shared_ptr<void>& handle) {
+  if (!handle || RemarshalWeights()) {
+    auto bf = ToBf16(f);
+    const size_t nb = bf.size() * sizeof(uint16_t);
+    void* p = b.Alloc(nb == 0 ? 1 : nb);
+    b.Copy(q, p, bf.data(), nb);
+    Backend* bk = &b;
+    handle = std::shared_ptr<void>(p, [bk](void* r) { bk->Free(r); });
+  }
+  return ViewBf16(handle.get(), q, shape);
+}
+
 // out[M,N] = x[M,K] @ W[N,K]^T + bias[N] (bias optional). All bf16.
 void LinearBias(Queue& q, Buf& out, Tensor x, Tensor w, const Tensor* bias) {
   vt::MatmulBT(q, out.tensor(), x, w);
@@ -146,10 +196,10 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
                                    });
   Buf conv1(b, q, DType::kBF16, {Tin, H});
   {
-    auto c1 = UpBf16(b, q, col1, {Tin, Cmel * 3});
-    auto w1 = UpBf16(b, q, w.conv1_w, {H, Cmel * 3});
-    auto b1 = UpBf16(b, q, w.conv1_b, {H});
-    LinearBias(q, conv1, c1->tensor(), w1->tensor(), &b1->tensor());
+    auto c1 = UpBf16(b, q, col1, {Tin, Cmel * 3});  // per-call activation (im2col)
+    Tensor w1 = ResidentBf16(b, q, w.conv1_w, {H, Cmel * 3}, w.d_conv1_w);
+    Tensor b1 = ResidentBf16(b, q, w.conv1_b, {H}, w.d_conv1_b);
+    LinearBias(q, conv1, c1->tensor(), w1, &b1);
     vt::GeluErf(q, conv1.tensor(), conv1.tensor());
   }
   std::vector<float> h1 = DownloadF32(conv1, q, Tin, H);  // [Tin, H]
@@ -162,20 +212,23 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
                                    });
   Buf hidden(b, q, DType::kBF16, {L, H});
   {
-    auto c2 = UpBf16(b, q, col2, {L, H * 3});
-    auto w2 = UpBf16(b, q, w.conv2_w, {H, H * 3});
-    auto b2 = UpBf16(b, q, w.conv2_b, {H});
-    LinearBias(q, hidden, c2->tensor(), w2->tensor(), &b2->tensor());
+    auto c2 = UpBf16(b, q, col2, {L, H * 3});  // per-call activation (im2col)
+    Tensor w2 = ResidentBf16(b, q, w.conv2_w, {H, H * 3}, w.d_conv2_w);
+    Tensor b2 = ResidentBf16(b, q, w.conv2_b, {H}, w.d_conv2_b);
+    LinearBias(q, hidden, c2->tensor(), w2, &b2);
     vt::GeluErf(q, hidden.tensor(), hidden.tensor());
   }
   if (cap != nullptr) cap->post_conv = DownloadF32(hidden, q, L, H);
 
   // --- + embed_positions (fixed sinusoid, first L rows) --------------------------
   {
-    std::vector<float> pos(w.embed_positions_w.begin(),
-                           w.embed_positions_w.begin() + static_cast<size_t>(L) * H);
-    auto pe = UpBf16(b, q, pos, {L, H});
-    vt::Add(q, hidden.tensor(), hidden.tensor(), pe->tensor());
+    // Slice the first L sinusoid rows only when (re)uploading; cached calls reuse.
+    std::vector<float> pos;
+    if (!w.d_embed_pos || RemarshalWeights())
+      pos.assign(w.embed_positions_w.begin(),
+                 w.embed_positions_w.begin() + static_cast<size_t>(L) * H);
+    Tensor pe = ResidentBf16(b, q, pos, {L, H}, w.d_embed_pos);
+    vt::Add(q, hidden.tensor(), hidden.tensor(), pe);
   }
   if (cap != nullptr) cap->post_pos = DownloadF32(hidden, q, L, H);
 
@@ -185,10 +238,9 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
     // residual + self_attn_layer_norm.
     Buf n1(b, q, DType::kBF16, {L, H});
     {
-      auto nw = UpBf16(b, q, lw.attn_ln_w, {H});
-      auto nb = UpBf16(b, q, lw.attn_ln_b, {H});
-      vt::LayerNorm(q, n1.tensor(), hidden.tensor(), &nw->tensor(), &nb->tensor(),
-                    vt::LayerNormArgs{eps});
+      Tensor nw = ResidentBf16(b, q, lw.attn_ln_w, {H}, lw.d_attn_ln_w);
+      Tensor nb = ResidentBf16(b, q, lw.attn_ln_b, {H}, lw.d_attn_ln_b);
+      vt::LayerNorm(q, n1.tensor(), hidden.tensor(), &nw, &nb, vt::LayerNormArgs{eps});
     }
     // q/k/v projections. k_proj has NO bias (Whisper). q is pre-scaled in
     // transformers; we fold the identical scaling into vt::Attention (scale =
@@ -196,14 +248,14 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
     Buf qb(b, q, DType::kBF16, {L, H}), kb(b, q, DType::kBF16, {L, H}),
         vb(b, q, DType::kBF16, {L, H});
     {
-      auto qw = UpBf16(b, q, lw.q_w, {H, H});
-      auto qbi = UpBf16(b, q, lw.q_b, {H});
-      auto kw = UpBf16(b, q, lw.k_w, {H, H});
-      auto vw = UpBf16(b, q, lw.v_w, {H, H});
-      auto vbi = UpBf16(b, q, lw.v_b, {H});
-      LinearBias(q, qb, n1.tensor(), qw->tensor(), &qbi->tensor());
-      LinearBias(q, kb, n1.tensor(), kw->tensor(), /*bias=*/nullptr);
-      LinearBias(q, vb, n1.tensor(), vw->tensor(), &vbi->tensor());
+      Tensor qw = ResidentBf16(b, q, lw.q_w, {H, H}, lw.d_q_w);
+      Tensor qbi = ResidentBf16(b, q, lw.q_b, {H}, lw.d_q_b);
+      Tensor kw = ResidentBf16(b, q, lw.k_w, {H, H}, lw.d_k_w);
+      Tensor vw = ResidentBf16(b, q, lw.v_w, {H, H}, lw.d_v_w);
+      Tensor vbi = ResidentBf16(b, q, lw.v_b, {H}, lw.d_v_b);
+      LinearBias(q, qb, n1.tensor(), qw, &qbi);
+      LinearBias(q, kb, n1.tensor(), kw, /*bias=*/nullptr);
+      LinearBias(q, vb, n1.tensor(), vw, &vbi);
     }
     // full bidirectional attention, [L, nh, hd]. Kernel selection (default = flash).
     Tensor q3 = qb.tensor(); q3.rank = 3; q3.shape[0] = L; q3.shape[1] = nh; q3.shape[2] = hd;
@@ -256,31 +308,30 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
     ao2.stride[0] = H; ao2.stride[1] = 1;
     Buf attn(b, q, DType::kBF16, {L, H});
     {
-      auto ow = UpBf16(b, q, lw.out_w, {H, H});
-      auto ob = UpBf16(b, q, lw.out_b, {H});
-      LinearBias(q, attn, ao2, ow->tensor(), &ob->tensor());
+      Tensor ow = ResidentBf16(b, q, lw.out_w, {H, H}, lw.d_out_w);
+      Tensor ob = ResidentBf16(b, q, lw.out_b, {H}, lw.d_out_b);
+      LinearBias(q, attn, ao2, ow, &ob);
     }
     vt::Add(q, hidden.tensor(), hidden.tensor(), attn.tensor());
     // residual + final_layer_norm + MLP (fc1 -> gelu-erf -> fc2) + residual.
     Buf n2(b, q, DType::kBF16, {L, H});
     {
-      auto nw = UpBf16(b, q, lw.final_ln_w, {H});
-      auto nb = UpBf16(b, q, lw.final_ln_b, {H});
-      vt::LayerNorm(q, n2.tensor(), hidden.tensor(), &nw->tensor(), &nb->tensor(),
-                    vt::LayerNormArgs{eps});
+      Tensor nw = ResidentBf16(b, q, lw.final_ln_w, {H}, lw.d_final_ln_w);
+      Tensor nb = ResidentBf16(b, q, lw.final_ln_b, {H}, lw.d_final_ln_b);
+      vt::LayerNorm(q, n2.tensor(), hidden.tensor(), &nw, &nb, vt::LayerNormArgs{eps});
     }
     Buf f1(b, q, DType::kBF16, {L, I});
     {
-      auto w1 = UpBf16(b, q, lw.fc1_w, {I, H});
-      auto b1 = UpBf16(b, q, lw.fc1_b, {I});
-      LinearBias(q, f1, n2.tensor(), w1->tensor(), &b1->tensor());
+      Tensor w1 = ResidentBf16(b, q, lw.fc1_w, {I, H}, lw.d_fc1_w);
+      Tensor b1 = ResidentBf16(b, q, lw.fc1_b, {I}, lw.d_fc1_b);
+      LinearBias(q, f1, n2.tensor(), w1, &b1);
     }
     vt::GeluErf(q, f1.tensor(), f1.tensor());
     Buf f2(b, q, DType::kBF16, {L, H});
     {
-      auto w2 = UpBf16(b, q, lw.fc2_w, {H, I});
-      auto b2 = UpBf16(b, q, lw.fc2_b, {H});
-      LinearBias(q, f2, f1.tensor(), w2->tensor(), &b2->tensor());
+      Tensor w2 = ResidentBf16(b, q, lw.fc2_w, {H, I}, lw.d_fc2_w);
+      Tensor b2 = ResidentBf16(b, q, lw.fc2_b, {H}, lw.d_fc2_b);
+      LinearBias(q, f2, f1.tensor(), w2, &b2);
     }
     vt::Add(q, hidden.tensor(), hidden.tensor(), f2.tensor());
 
@@ -290,10 +341,9 @@ std::vector<float> WhisperAudioEncoderForward(const std::vector<float>& input_fe
   // --- final encoder layer_norm --------------------------------------------------
   Buf out(b, q, DType::kBF16, {L, H});
   {
-    auto nw = UpBf16(b, q, w.final_ln_w, {H});
-    auto nb = UpBf16(b, q, w.final_ln_b, {H});
-    vt::LayerNorm(q, out.tensor(), hidden.tensor(), &nw->tensor(), &nb->tensor(),
-                  vt::LayerNormArgs{eps});
+    Tensor nw = ResidentBf16(b, q, w.final_ln_w, {H}, w.d_final_ln_w);
+    Tensor nb = ResidentBf16(b, q, w.final_ln_b, {H}, w.d_final_ln_b);
+    vt::LayerNorm(q, out.tensor(), hidden.tensor(), &nw, &nb, vt::LayerNormArgs{eps});
   }
   std::vector<float> result = DownloadF32(out, q, L, H);
   if (cap != nullptr) cap->final_ln_out = result;

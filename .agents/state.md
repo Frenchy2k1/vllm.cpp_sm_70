@@ -28832,3 +28832,61 @@ work and the DEFAULT golden must never be re-anchored to an MLX build.
 
 **Standing: 96.4% default, 99.1% with MLX-prefill.** The remaining ~0.9% is
 decode (27.28 vs 27.44).
+## 2026-07-28 — Audio ENCODER TTFT device-resident encoder weights LANDED (`CLAIM-MM-SPEED-AUDIO-ENC-RESIDENT`)
+
+Executes multimodal-speed.md §14.5 residual lever #2 (the MEDIUM, byte-exact
+host-data-movement half). Base `main` `0e2c667a` (the §14 flash HEAD, confirmed
+`git rev-parse HEAD`). dgx GB10 sm_121a `~/vllmcpp-whisper-resid`, `git archive` of the
+code tree, CUDA cutlass 4.5.0 + FA2 arch 121a banners CONFIRMED, `-Werror` 0-warn; ALL
+GPU under `flock $HOME/gpu.lock` (a concurrent CPU-build agent was on the box; GPU idle).
+
+**PROFILE-CONFIRMED attribution (premise grounded first).** The ~0.75 s host chunk §14.5
+attributed to "per-call weight marshalling + a conv round-trip" is DOMINATED by weight
+marshalling, NOT the conv round-trip. Same-binary A/B via a new `VT_WHISPER_ENC_REMARSHAL`
+knob: re-marshal-every-call **1377 ms** (== §14's pre-lever ~1375 ms EXACTLY) → resident
+**729 ms** = **−648 ms**. The conv round-trip (`whisper_audio.cpp:205` `DownloadF32(conv1)`
+→ `:209` host `Im2Col(stride 2)` → `:216` re-upload) is a SMALL part of the residual 729 ms
+and its removal needs a DEVICE im2col kernel for the full cross-channel Whisper conv (vt has
+only depthwise `kCausalConv1dFwd`) — DEFERRED (a new-kernel task, out of scope for this
+host-data-movement slot). Premise verified, not blindly optimized.
+
+**The lever — device-resident encoder weights (mirror the decoder residency seam).** Each
+host-f32 weight is f32→bf16-converted + H2D-uploaded ONCE into a `mutable std::shared_ptr<void>`
+handle (Backend-Free deleter) and reused across every forward, mirroring the Qwen decoder
+`d_dev` seam (`qwen3_5_weights.h`; `qwen3_5.cpp` `ResidentWeight:797`). Upstream: vLLM loads
+Whisper weights once at model-init (`whisper.py` `WhisperEncoder:458`), never per `forward` —
+our per-call `UpBf16` was the divergence. Added handles to `WhisperEncoderLayerWeights`
+(15/layer) + `WhisperAudioEncoderWeights` (conv1/2 w+b, embed_pos, final_ln w+b) in
+`whisper_audio.h`; new `ResidentBf16` helper replaces `UpBf16` at every WEIGHT site in
+`whisper_audio.cpp` (im2col activation columns stay per-call).
+
+**BYTE-EXACT (RED line HELD).** Residency moves data, not math ⇒ token-identical by
+construction. `test_voxtral_e2e` **16/16** (strict prefix 18/48, teacher-force PASS,
+divergent=0, seq 48/48) — IDENTICAL to §14. Goldens md5 UNCHANGED — `voxtral_golden.json`
+`8ab87b7e9d374a38ab84d0231f13a53d`, `voxtral_neartie.json` `937b9ad3a61a9e98848635a15b132e58`
+(before == after). **Proof-of-run + RED (`VT_WHISPER_ENC_REMARSHAL`):** nsys `memcpy
+Host-to-Device` over the e2e — resident **740 ops / 9,400 MB** vs re-marshal **1,714 ops /
+11,948 MB** = **−974 HtoD ops (487 encoder weight tensors × 2 saved re-uploads) / −2.5 GB**.
+compute-sanitizer memcheck **0 errors** (16/16 under sanitizer; encoder path NOT graphed ⇒
+capture-safety N/A).
+
+**A/B (same-binary `VT_ENC_REPS`, `flock`, 6 reps rep0 dropped, steady-state).** Encoder
+forward total **~1377 → ~729 ms (−648 ms, 1.89×, NON-OVERLAPPING)**. Trajectory across the
+two ENC levers: **§13 warp 1834 → §14 flash 1375 → §15 resident 729 ms**. rep0 (cold, the
+one-time upload) ~1740 ms both arms — residency amortizes across calls 2+, not the first.
+
+**HONEST VERDICT — real byte-exact 1.89× host win, encoder still NOT at parity.** ~729 ms vs
+vLLM 0.25.0's ~43 ms (~17×, was ~32× after §14). The −648 ms removed is the confirmed host
+marshalling; the residual 729 ms is now GPU-compute-bound (scalar warp-per-query attention
+617 ms/32L + conv GEMMs). The LARGE gap-closer remains §14.5 lever #1: a tensor-core MMA
+hd-64 non-causal flash attention (dedicated slot). vLLM not re-measured (OOM-reboot risk of a
+big oracle alongside the active tree; residual ~17× regardless). Clean CUDA `-Werror` 0-warn
+(banners CONFIRMED) + CPU `-Werror` 0-warn (`whisper_audio.cpp`). Audio DECODE stays
+DONE-on-speed (§12, 0.97×, BEATS); audio TTFT/encoder stays speed-pending/PARTIAL; no mm row
+advances to DONE.
+
+Records: `specs/multimodal-speed.md` (§15 + headline pointer), `model-matrix.md` (Voxtral
+row), `feature-matrix.md` (mm row), `roadmap_v1.md` (ROAD-V1-MM), `coordination.md`
+(`CLAIM-MM-SPEED-AUDIO-ENC-RESIDENT`), `docs/ENVIRONMENT.md` (`VT_WHISPER_ENC_REMARSHAL`),
+`docs/STATUS.md`, `docs/BENCHMARKS.md`, `parity-ledger.md`, this entry. All record checkers
+rc=0. NOT pushed; FULL SHA reported to caller.

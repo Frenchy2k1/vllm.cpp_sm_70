@@ -103,6 +103,25 @@ round-trip. Ranked residual (NOT implemented): (1) a tensor-core MMA hd-64 non-c
 ~vLLM; (2) resident one-time encoder weights + drop the conv round-trip (MEDIUM, byte-exact, ~0.75 s).
 Audio TTFT/encoder stays speed-pending / PARTIAL. See §14.
 
+**UPDATE 2026-07-28 (`CLAIM-MM-SPEED-AUDIO-ENC-RESIDENT`, §15) — the §14 lever #2 LANDED: DEVICE-RESIDENT
+one-time encoder weights, byte-exact, real 1.89× encoder-forward host win; encoder TTFT closes to ~17×
+(from ~32×), still NOT at parity.** PROFILE-CONFIRMED the ~0.75 s host chunk is DOMINATED by per-call
+weight marshalling (host f32→bf16 + H2D of 487 encoder weight tensors / ~635 M f32 EVERY forward), NOT
+the conv round-trip (small; deferred — needs a device im2col kernel). Mirrored the Qwen decoder residency
+seam (`qwen3_5_weights.h` `d_dev`; `qwen3_5.cpp` `ResidentWeight:797`): each weight f32→bf16-converted +
+uploaded ONCE into a `mutable std::shared_ptr<void>` handle (Backend-Free deleter), reused across
+forwards; `VT_WHISPER_ENC_REMARSHAL=1` A-B/RED knob restores per-call marshalling. Pure DATA-MOVEMENT (no
+kernel/op-registry edit) ⇒ byte-identical. **BYTE-EXACT:** `test_voxtral_e2e` **16/16** (IDENTICAL to
+§14); goldens md5 UNCHANGED (`voxtral_golden.json 8ab87b7e…`, `voxtral_neartie.json 937b9ad3…`,
+before==after). Proof-of-run/RED: nsys `memcpy HtoD` resident **740 ops / 9.4 GB** vs re-marshal **1714
+ops / 11.9 GB** (−974 ops = 487 weights × 2 saved re-uploads, −2.5 GB). compute-sanitizer 0 errors
+(encoder path not graphed). **A/B (same binary, `VT_ENC_REPS`, 6 reps rep0 dropped, `flock`):** encoder
+forward **~1377 → ~729 ms (−648 ms, 1.89×, NON-OVERLAPPING)** — the re-marshal arm reproduces §14's ~1375
+ms EXACTLY. Trajectory §13→§14→§15: **1834 → 1375 → 729 ms.** **HONEST — NOT closed:** ~729 ms vs vLLM's
+~43 ms (~17×); the residual is now GPU-compute-bound (scalar warp attention 617 ms/32L + conv GEMMs) —
+the LARGE gap-closer remains lever #1 (tensor-core MMA hd-64 non-causal FA2). Audio TTFT/encoder stays
+speed-pending / PARTIAL. See §15.
+
 ---
 
 ## 1. A-B methodology (how these numbers were grounded)
@@ -993,3 +1012,102 @@ vLLM parity. No mm row advances to DONE this pass.
 | Dependencies | The vendored FlashAttention-2 headers (`src/vt/cuda/flash_attn/`, structure reference only — no cute/MMA used); the existing `vt::AttentionDenseFast`/`AttentionWarpKernel` math; the Voxtral e2e fixtures + oracle (§13). No new external dependency. |
 | Work breakdown | (1) `AttentionDenseFlashKernel` + launcher + `AttentionDenseFlashKernelCuda` + registration (`cuda_ops.cu`); (2) op decl/enum (`ops.h`) + wrapper/validation (`ops.cpp`) + CPU registration (`cpu_ops.cpp`); (3) default wiring + A/B knobs (`whisper_audio.cpp`); (4) GPU verify (byte-exact + proof-of-run + RED + sanitizer) + same-binary A/B; (5) records. |
 | Risks/decisions | Correctness risk (encoder-output bf16 change flipping the pos-18 near-tie) is RETIRED: the kernel is bit-identical to `AttentionDenseFast` (per-warp math copied verbatim; only K/V source changes) ⇒ token-identical, goldens unchanged. DECISION: ship as a SEPARATE op (not a replacement of `AttentionDenseFast`) so the vision tower + any other DenseFast caller are untouched. HONEST residual: the kernel is NOT at vLLM parity (~32× on encoder TTFT) — the scalar warp-per-query recurrence is serial-latency-bound; the gap-closer is a tensor-core MMA hd-64 non-causal FA2 (LARGE) + resident encoder weights (MEDIUM), both deferred. |
+
+## 15. Audio ENCODER TTFT lever #2 — resident one-time encoder weights (`CLAIM-MM-SPEED-AUDIO-ENC-RESIDENT`, 2026-07-28)
+
+Executes §14.5 residual lever #2 (the MEDIUM, byte-exact host-data-movement half).
+**Base `main` `0e2c667a`** (the §14 flash-kernel HEAD, confirmed via `git rev-parse HEAD`).
+dgx GB10 sm_121a, cutlass 4.5.0 + FA2 arch 121a ("CUTLASS found"+FA2-ENABLED banners
+CONFIRMED), `-Werror` 0-warn CUDA + CPU. ALL GPU under `flock $HOME/gpu.lock`.
+
+### 15.1 PROFILE-CONFIRMED attribution (the premise, GROUNDED before optimizing)
+
+The ~0.75 s host chunk §14.5 attributed to "per-call weight marshalling + a conv
+round-trip" was **profile-confirmed and quantified** — it is DOMINATED by weight
+marshalling, NOT the conv round-trip:
+
+- **Per-call weight marshalling (the ~0.75 s):** every `WhisperAudioEncoderForward`
+  re-ran `UpBf16` (host f32→bf16 conversion loop `ToBf16` + `Backend::Copy` H2D) for
+  ALL encoder weights on EVERY forward — 4 conv + 1 embed_positions + 2 final_ln +
+  32 layers × 15 = **487 weight tensors, ~635 M f32 elements** re-converted and
+  re-uploaded (~1.27 GB H2D) each call. Call sites: the `UpBf16(b, q, w.<weight>, …)`
+  in `whisper_audio.cpp` (the conv/embed/final blocks + the per-layer q/k/v/out/fc1/
+  fc2/norms). **MEASURED (same-binary A/B, `VT_WHISPER_ENC_REMARSHAL` toggle, dgx,
+  `flock`, 6 reps rep0 dropped): 1377 ms (re-marshal every call) → 729 ms (resident)
+  = −648 ms.** The 1377 ms re-marshal arm reproduces §14's pre-lever ~1375 ms encoder
+  forward EXACTLY ⇒ the marshalling IS the confirmed ~0.75 s chunk.
+- **Conv round-trip (small):** `whisper_audio.cpp:205` `h1 = DownloadF32(conv1,…)`
+  (device→host) → `:209` host `Im2Col(H, Tin, stride=2,…)` → `:216` re-upload of the
+  im2col columns. It is a real host bounce but a SMALL part of the residual 729 ms —
+  removing it needs a DEVICE im2col/gather kernel for the FULL cross-channel Whisper
+  conv (`vt` has only depthwise `kCausalConv1dFwd`, not a general im2col op) ⇒ a
+  NEW-kernel task, out of scope for this host-data-movement / minimal-kernel slot.
+  **DEFERRED and re-attributed** to the LARGE lever below; NOT forced here.
+
+### 15.2 The lever — device-resident encoder weights (mirror the decoder residency seam)
+
+Mirror the Qwen decoder's lazy device-residency (`qwen3_5_weights.h` `d_dev` fields;
+`qwen3_5.cpp` `ResidentWeight` :797): each host-f32 weight is f32→bf16 converted and
+uploaded to the device **ONCE** into a `mutable std::shared_ptr<void>` handle (deleter
+frees through the `vt::Backend`), then reused across every forward. Upstream grounding:
+vLLM loads Whisper weights once at model-init (`WhisperEncoder` holds `nn.Module`
+params resident, `vllm/model_executor/models/whisper.py` `WhisperEncoder:458`,
+weight_loader), never re-uploading per `forward` — our per-call `UpBf16` was the
+divergence this closes.
+
+- Header (`include/…/whisper_audio.h`): added `mutable std::shared_ptr<void>` resident
+  handles to `WhisperEncoderLayerWeights` (15 per layer) and `WhisperAudioEncoderWeights`
+  (conv1/2 w+b, embed_pos, final_ln w+b) — populated on a `const` weight exactly as the
+  Qwen `d_dev` seam. Same lifetime contract (weights must not outlive the backend).
+- Impl (`whisper_audio.cpp`): new `ResidentBf16(b, q, host_f32, shape, handle)` helper
+  (:123) replaces the per-call `UpBf16` at every WEIGHT site; the im2col column matrices
+  (`c1`/`c2`, which depend on the input) stay per-call `UpBf16` (activations, not
+  weights). `embed_positions` is sliced to the first `L` rows only on (re)upload.
+
+### 15.3 BYTE-EXACT correctness (the RED line — HELD)
+
+Residency MOVES data, it does not change math ⇒ token-identical by construction (the
+`ToBf16` round-trip is deterministic, so the resident bytes equal what each call
+previously re-uploaded).
+
+- `test_voxtral_e2e` **16/16** (strict prefix 18/48, teacher-force result=PASS,
+  divergent=0, worst_gap=0.0, over-band=0, reproduces near-tie seq 48/48) — IDENTICAL
+  to the §14 result.
+- Goldens md5 **UNCHANGED** — `voxtral_golden.json 8ab87b7e9d374a38ab84d0231f13a53d`,
+  `voxtral_neartie.json 937b9ad3a61a9e98848635a15b132e58` (before == after). No regen.
+- **Proof-of-run + RED (`VT_WHISPER_ENC_REMARSHAL`):** nsys `cuda memcpy Host-to-Device`
+  over the e2e — resident **740 ops / 9,400 MB** vs re-marshal **1,714 ops / 11,948 MB**:
+  the resident arm eliminates **974 HtoD ops (= 487 encoder weight tensors × 2 saved
+  re-uploads) and ~2.5 GB of H2D traffic**. RED: `VT_WHISPER_ENC_REMARSHAL=1` → the per-
+  call uploads and the +648 ms return; unset → weights upload once, time drops. The
+  encoder path is NOT graph-captured (own queue per call) ⇒ capture-safety N/A.
+- **compute-sanitizer** `--tool memcheck` on the resident path = 0 errors (touched path
+  is pure `Backend` Alloc/Copy/Free via shared_ptr — no new kernel).
+
+### 15.4 A/B (same binary, `flock`, idle box, 6 reps rep0 dropped)
+
+| Vehicle | re-marshal every call (`VT_WHISPER_ENC_REMARSHAL=1`) | resident (ships) | Δ |
+|---|---|---|---|
+| **encoder forward total** (`VT_ENC_REPS`, steady-state reps 1–5) | **~1377 ms** (1373.9–1383.7) | **~729 ms** (728.0–730.7) | **−648 ms, 1.89×, NON-OVERLAPPING** |
+| rep0 (cold, one-time upload — both arms) | ~1733 ms | ~1741 ms | tie (residency amortizes across calls 2+, not the first) |
+
+Encoder-forward trajectory across the two ENC levers: **§13 warp 1834 ms → §14
+flash 1375 ms → §15 resident 729 ms.** vs vLLM 0.25.0's ~43 ms captured audio TTFT
+(§2.3 denominator): **~729 ms / 43 ms ≈ 17×** (was ~32× after §14). vLLM was NOT
+re-measured this pass (a big Voxtral oracle alongside the active DGX tree risks the
+unified-memory OOM-reboot — same call §14.4 made; the residual is ~17× regardless of
+the exact denominator). `benchmark_binding=false`.
+
+### 15.5 HONEST VERDICT — real byte-exact 1.89× host win, encoder still NOT at vLLM parity
+
+The resident-weights lever removes the single biggest host chunk (−648 ms, the
+confirmed ~0.75 s marshalling) fully byte-exact, and it is the correct architectural
+fix (weights belong device-resident, uploaded at load, as vLLM does). But the encoder
+is still ~17× above vLLM's ~43 ms: the residual **729 ms is now GPU-compute-bound** —
+dominated by the scalar warp-per-query flash attention (§14: 617 ms/32-layers) plus the
+conv GEMMs/im2col host bounce. **The LARGE gap-closer remains §14.5 lever #1: a
+tensor-core MMA hd-64 non-causal flash attention** (replace the serial-latency-bound
+scalar recurrence with an `mma.sync` parallel reduction) — that is the dedicated-slot
+lever that can actually approach vLLM parity. The conv round-trip removal (needs a
+device im2col kernel) is a smaller follow-on. Audio **TTFT/encoder stays speed-pending
+/ `PARTIAL`**; audio DECODE stays DONE-on-speed (§12, BEATS). No mm row advances to DONE.

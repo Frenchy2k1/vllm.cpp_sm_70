@@ -40,6 +40,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "vt/backend.h"
@@ -73,6 +74,20 @@ struct WhisperEncoderLayerWeights {
   std::vector<float> out_w, out_b;             // out_proj [d_model,d_model], bias
   std::vector<float> fc1_w, fc1_b;             // [ffn_dim,d_model], [ffn_dim]
   std::vector<float> fc2_w, fc2_b;             // [d_model,ffn_dim], [d_model]
+
+  // Lazily-populated device-resident bf16 copies (CUDA/device forward only; null
+  // before first use). Each host-f32 weight above is f32->bf16 converted and
+  // uploaded to the device ONCE, then reused across every encoder forward — so
+  // the per-call weight marshalling (host f32->bf16 conversion + H2D upload) that
+  // dominated the encoder's host-side TTFT stops repeating. Mirrors the d_dev
+  // residency seam in qwen3_5_weights.h (WhisperAudioEncoderForward populates
+  // these on a const weight, exactly as the Qwen forward does; the shared_ptr
+  // deleter frees through the vt::Backend, so the weights must NOT outlive the
+  // backend — the same lifetime contract the decoder residents carry).
+  mutable std::shared_ptr<void> d_attn_ln_w, d_attn_ln_b;
+  mutable std::shared_ptr<void> d_final_ln_w, d_final_ln_b;
+  mutable std::shared_ptr<void> d_q_w, d_q_b, d_k_w, d_v_w, d_v_b, d_out_w, d_out_b;
+  mutable std::shared_ptr<void> d_fc1_w, d_fc1_b, d_fc2_w, d_fc2_b;
 };
 
 struct WhisperAudioEncoderWeights {
@@ -81,6 +96,14 @@ struct WhisperAudioEncoderWeights {
   std::vector<float> embed_positions_w;  // [max_source_positions, d_model] (sinusoid)
   std::vector<WhisperEncoderLayerWeights> layers;  // num_layers
   std::vector<float> final_ln_w, final_ln_b;       // final encoder layer_norm [d_model]
+
+  // Device-resident bf16 copies of the non-layer weights, uploaded once and
+  // reused (see the residency note in WhisperEncoderLayerWeights). d_embed_pos
+  // holds only the first max_source_positions rows actually added (the sinusoid
+  // table can be longer than L).
+  mutable std::shared_ptr<void> d_conv1_w, d_conv1_b, d_conv2_w, d_conv2_b;
+  mutable std::shared_ptr<void> d_embed_pos;
+  mutable std::shared_ptr<void> d_final_ln_w, d_final_ln_b;
 };
 
 // Optional intermediate capture for the A2 unit gates (all host f32). When a
