@@ -1,0 +1,96 @@
+{
+  "model_id": "unsloth/gemma-4-E4B-it",
+  "vehicle": "unsloth/gemma-4-E4B-it Gemma4AudioModel (USM-Conformer) + embed_audio, transformers 5.13.1, CPU fp32",
+  "ref_dtype": "float32",
+  "note": "audio tower constructed from audio_config; weights loaded from the single safetensors shard; input_features from the checkpoint feature extractor on a fixed synthetic waveform; f32-vs-f32 tower-math gate",
+  "config": {
+    "hidden_size": 1024,
+    "num_hidden_layers": 12,
+    "num_attention_heads": 8,
+    "head_dim": 128,
+    "output_proj_dims": 1536,
+    "conv_kernel_size": 5,
+    "subsampling_conv_channels": [
+      128,
+      32
+    ],
+    "attention_chunk_size": 12,
+    "attention_context_left": 13,
+    "attention_context_right": 0,
+    "attention_logit_cap": 50.0,
+    "attention_invalid_logits_value": -1000000000.0,
+    "gradient_clipping": 10000000000.0,
+    "residual_weight": 0.5,
+    "rms_norm_eps": 1e-06,
+    "hidden_act": "silu",
+    "use_clipped_linears": true,
+    "feature_size": 128,
+    "text_hidden_size": 2560,
+    "T": 250,
+    "S": 63
+  },
+  "tap_layers": {
+    "0": "block0",
+    "6": "block_mid",
+    "11": "block_last"
+  },
+  "stages": {
+    "input_features_f32": {
+      "shape": [
+        250,
+        128
+      ],
+      "sha256": "30d27e0cc68b416ec310b7afd6d7e469a5327f2a79d5742abae10fd802ec320a"
+    },
+    "subsample_out_f32": {
+      "shape": [
+        63,
+        1024
+      ],
+      "sha256": "2cf4ada884bd0df9e00282a3927dfd40d3badc5755d8c0758ad0a4d4ac076f37"
+    },
+    "position_embeddings_f32": {
+      "shape": [
+        13,
+        1024
+      ],
+      "sha256": "838139998438a68904f70b3b9a02b20a683185251bcc7fd146b8b750bebe3a67"
+    },
+    "block0_f32": {
+      "shape": [
+        63,
+        1024
+      ],
+      "sha256": "467df369baf2ef4ac4a45ca43bb60218aa5a3040c9251f854f7d6f9e7de2302e"
+    },
+    "block_mid_f32": {
+      "shape": [
+        63,
+        1024
+      ],
+      "sha256": "57552f94d35c0d89f163aef99435e574bd288522b1aaebe1748f90cb614257a7"
+    },
+    "block_last_f32": {
+      "shape": [
+        63,
+        1024
+      ],
+      "sha256": "cdcd968d2af092daf219c60cb49113fdea3f7a5fe84aaeb9cc416c0d1e253622"
+    },
+    "output_proj_f32": {
+      "shape": [
+        63,
+        1536
+      ],
+      "sha256": "ea54853464b3d4f223d6b9b080408f18e69a7a00b610d64c450598cae503f6f7"
+    },
+    "projected_f32": {
+      "shape": [
+        63,
+        2560
+      ],
+      "sha256": "c3fe68fff242a27f94801872037d925f4a527f4dd2c3b51569d2be6397c374c5"
+    }
+  },
+  "upstream": "transformers modeling_gemma4.py:1985-2014,385-412,525-573,249-354,484-522,415-447,197,218-246 @ 5.13.1; vllm gemma4_mm.py:908-960,1473-1497"
+}

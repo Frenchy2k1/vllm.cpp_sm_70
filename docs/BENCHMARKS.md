@@ -16,6 +16,14 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## vLLM feature-gap analysis (2026-07-28, `CLAIM-FEATURE-GAP-SPIKE`) - NOT-APPLICABLE (records-only spike)
+
+No benchmark. A CPU/research sweep of pinned vLLM `555967922` (0.26.0.dev0) vs
+our matrices produced a ranked map of what we are MISSING (8 HIGH, ~19 MED, ~16
+LOW), grounded in vLLM `file:line`. No build, no GPU, no measurement; no speed
+number is owed. Full list in
+[`.agents/specs/vllm-feature-gap-analysis.md`](../.agents/specs/vllm-feature-gap-analysis.md).
+
 ## Gemma-4 multimodal W0, oracle-gateability run-verified + greedy golden captured (2026-07-28, `CLAIM-GEMMA4-W0`) - correctness anchor, no speed number owed
 
 **What ran.** The pinned vLLM 0.25.0 oracle (transformers 5.13.1) loaded, ran,
@@ -101,6 +109,37 @@ image processor + engine merge-plumbing) are the named residuals. Reproduce (dgx
 needs the E4B checkpoint): `scripts/mm/g2_vision_weight_dump.py` (weights),
 `scripts/mm/g2_vision_ref_dump.py` (intermediate refs), then run
 `test_gemma4_vision_tower` with `VLLM_GEMMA4_VISION_WEIGHTS` + `VLLM_GEMMA4_VISION_REFS`.
+
+## Gemma-4 G3 C++ USM-Conformer audio tower - per-stage gates PASS (2026-07-28, `CLAIM-GEMMA4-G3`) - correctness gate landed, speed pending
+
+`benchmark_binding=false` (audio-tower correctness milestone - the tower is proven in
+ISOLATION vs the transformers-eager reference, same cadence as the G2-impl vision
+tower and Qwen3-VL M2a; no engine audio-decode path yet, so no throughput number is
+owed). The C++ tower (`gemma4_audio.{h,cpp}`, an additive standalone host-f32 TU) +
+the audio projector are proven faithful stage-by-stage vs the committed refs on the
+dev-box CPU build (`tests/vllm/multimodal/test_gemma4_audio_tower.cpp`, 1256/1256):
+subsample rel-L2 **5.4e-7**, position-embeddings **8.9e-8**, block0 **4.2e-7**,
+block_mid **3.8e-7**, block_last **4.4e-6**, output_proj **5.9e-6**, projected
+merge-input **6.3e-6** - f32-EXACT (the residual is only f64-vs-f32 accumulation
+order). T=250 mel frames -> S=63 soft tokens; head_dim 128, 8 heads, 12 layers.
+Ported 1:1 from `modeling_gemma4.py` @ 5.13.1: 2xConv2d subsample (k3s2p1 +
+LayerNorm-no-bias + ReLU + mask stride) -> relative positional encoding -> 12
+Conformer layers (half-step feed-forwards, chunked-local attention [chunk 12, past
+window 12, Transformer-XL relative-position bias, tanh soft-cap 50, per-dim-scale
+softplus], GLU + depthwise-causal-conv light-conv k5) -> output_proj -> audio
+embedder. The FINITE QAT activation clamps (`use_clipped_linears=True`) are
+implemented; **RED-first**: an initial wrong sliding window (13 keys) drove
+block_mid to 2.8e-2 / projected to 0.31, and the fix to the source semantics
+(`dist = q_idx - kv_idx in [0,12)`, 12 keys) took every stage to ~1e-6. No new vt op
+(pure host f32, device-neutral). The tower is device-neutral so no GPU was used;
+the oracle reference was dumped on dgx CPU-only (no `gpu.lock`). Inertness by
+construction (standalone TU not referenced by the registry/runner - text
+`test_gemma4_paged_engine` STRICT 32/32 + the G2 vision gates byte-identical). Speed
+(a device-resident bf16 forward) and the audio->text e2e (the Gemma-4 audio feature
+extractor + engine merge-plumbing) are the named residuals. Reproduce: dump the
+reference + weights with `scripts/mm/g3_audio_tower_ref.py` (dgx CPU, E4B cached),
+then run `test_gemma4_audio_tower` with `VLLM_GEMMA4_AUDIO_WEIGHTS` set to the dumped
+weight dir (refs come from the committed golden `tests/parity/goldens/gemma4_e4b_audio/`).
 
 ## Gemma-4 G1 text backbone (2026-07-28, `CLAIM-GEMMA4-G1`) - correctness bring-up, no speed number owed
 
@@ -282,6 +321,28 @@ bit-identical to the committed golden. **NO Ampere board ran it here; a green bu
 is not a runtime claim.** The only real throughput numbers come later from the Orin
 RUNTIME-VERIFIED gate.
 
+**Per-arch Triton-AOT GDN cubins (2026-07-28, `CLAIM-TRITON-AOT-PER-ARCH`).**
+Disposition: **NOT APPLICABLE for a new benchmark number (build-verified
+derive-and-ship; `benchmark_binding=false`).** The vendored Triton-AOT GDN
+fast-path cubins — the MEASURED codegen-win packed decode (Triton REG:205/0-spill
+vs hand-CUDA REG:255+STACK:48 spills, +0.67% throughput / −0.78% TPOT on GB10
+c16) plus the delta_h/chunk_o/kkt/tril/wu FLA set — existed for `sm_121a` ONLY, so
+GDN decode on every other arch (all cross-family builds ship
+`-DVLLM_CPP_TRITON=OFF`) ran the spilling hand kernel. The full GDN AOT set is now
+regenerated + vendored for `sm_80/86/89/90a/100a` on dgx GB10 (Triton 3.6.0 /
+ptxas 12.8 cross-compile — ptxas is a cross-compiler, no target board needed;
+57 artifacts + MANIFEST per arch matching the `sm_121a` fileset). BUILD EVIDENCE:
+`cuobjdump --dump-elf` shows real per-target SASS (`sm=80/86/89/90/100`), nvdisasm
+`EF_CUDA_SM80/86/89`, decode `SHI_REGISTERS` 209–217 with 0 spill (under the
+hand-CUDA REG:255+STACK:48 floor); the builder-path configure (`-DVLLM_CPP_TRITON=ON`,
+no REGEN) selects + integrity-verifies each tree (`Triton AOT: … <- vendored …
+(no Python)`); the generated AOT C compiles clean; `scripts/check-triton-aot-drift.sh`
+rc=0 across all six trees. **NO non-`sm_121` board runs a GDN-hybrid model here —
+the decode-parity claim on these arches is BUILD-VERIFIED, NOT runtime-measured;
+the only measured GDN-decode codegen win is the GB10 `sm_121a` number above.**
+`sm_121a` cubins are byte-identical to base (SACRED 27B/35B gate unchanged).
+Evidence: [.agents/specs/triton-aot-per-arch.md](../.agents/specs/triton-aot-per-arch.md).
+
 **Ampere major-8 CUDA fast-path bring-up SPIKE (2026-07-27,
 `CLAIM-CUDA-AMPERE-SCOPE`).** Disposition: **NOT APPLICABLE (scoping spike; no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Read-only on
@@ -424,6 +485,21 @@ single Spark (needs multi-node TP / offload / smaller quant), so no binding
 throughput number is reachable yet; none is taken or promised here. Spec + W-plan:
 [deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md). No source/engine path touched.
 
+**DeepSeek-V4-Flash W3 attention primitives (2026-07-28, `CLAIM-DEEPSEEK-V4-W3`, NOT
+pushed).** Disposition: **NOT APPLICABLE (correctness/primitive brick, host CPU
+reference + unit gate; no run, no download, no throughput number taken, claimed, or
+owed; `benchmark_binding=false`).** Ported + unit-gated the genuinely-new-vs-V2/V3
+attention math: the DSA "Lightning Indexer" sparse top-k SELECTION (weighted-MQA logit
+`Σ_h w·ReLU(q·k)` with a load-bearing per-head ReLU + causal top-512 select), per-head
+attention-sink softmax, and grouped output-LoRA (`deepseek_v4_dsa.{h,cpp}`,
+`test_deepseek_v4_dsa` 13/13·38, clean CPU `-Wall -Werror -Wextra`). Honest gate form:
+hand-derived literals + double-precision references (rel-L2 < 1e-6), NOT a dumped-oracle
+rel-L2 (the fixed-config 167B arch is not constructible at a tiny shape). SACRED-inert
+(shared `mla_attention` untouched). The full-model speed gate remains multi-Spark-blocked
+(156.7 GiB); MHC/MoE/device-kernel/forward-integration are named W5-W8 residuals. SGLang
+v0.5.15 registers `DeepseekV4ForCausalLM` (full DSA/MHC stack) — a viable second
+reference for a future primitive-dump or 2-Spark benchmark. No source/engine path touched.
+
 **Kimi K3 W0 SCOPE spike (2026-07-28, `CLAIM-KIMI-K3-SCOPE`, NOT pushed).**
 Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Scopes
@@ -435,8 +511,13 @@ one GB10 (~1.56 TB MXFP4, ~12× the 119 GiB pool) and is not in the pinned oracl
 bricks. The real correctness signal is a primitive gate (KDA+MLA+MoE) on the fitting
 `Kimi-Linear-48B-A3B` (~89–91 GiB) proxy plus build-verify; full K3 throughput/token
 numbers are owed only from a multi-Spark / 16×H200-class box, and none is taken or
-promised here. Spec + W-plan: [kimi-k3.md](../.agents/specs/kimi-k3.md). No
-source/engine path touched.
+promised here. Spec + W-plan: [kimi-k3.md](../.agents/specs/kimi-k3.md). **W2/W5 CPU
+scaffolding landed (2026-07-28, `CLAIM-KIMI-K3-W2-W5`):** registry stub + nested
+config descent + text-backbone structural name-map + REFUSE-by-name forward +
+MXFP4-refuse loader; **build-only, no measurement** (`benchmark_binding=false`) —
+clean CPU build + scaffold gate 6/6 (`test_kimi_k3_scaffold`), which is
+DERIVED+BUILD-VERIFIED, NOT execution evidence. No throughput/token numbers taken or
+owed on-box (K3 does not fit GB10 and is beyond the pinned oracle).
 **Scale-out / distributed execution W0 SCOPE spike (2026-07-28,
 `CLAIM-SCALE-OUT-SPIKE`, NOT pushed).** Disposition: **NOT APPLICABLE (scoping
 spike; no build, no run, no download, no measurement taken, claimed, or owed;
@@ -461,6 +542,17 @@ byte-identical `world_size==1` no-op. Pure CPU, no GPU, no model run — a
 throughput comparison is meaningless here and is not owed until the NCCL/RoCE
 transports and TP/PP forwards land on a ≥2-GPU host (W3+). No
 performance-relevant source/engine path touched.
+**Parallelism-mode enumeration spike (2026-07-28, `CLAIM-PARALLELISM-MODES-SPIKE`,
+NOT pushed).** Disposition: **NOT APPLICABLE (records-only enumeration spike; no
+build, no run, no download, no measurement taken, claimed, or owed;
+`benchmark_binding=false`).** Enumerates every parallelism mode vLLM has
+(TP/PP/DP/EP/SP/context + comm-strategies + combos), each grounded 1:1 in pinned
+vLLM `555967922` `file:line` and mapped onto the `vt::Communicator` seam;
+priority-ranked (TP → EP → PP → DP → SP → context). Adds the mode rows
+`BACKEND-DISTRIBUTED-DP`/`-EP`/`-SP`. Correctness gating for every mode is
+HW-blocked exactly as scale-out (no ≥2-GPU box here); no engine speed number
+exists or is owed. Spec: [parallelism-modes.md](../.agents/specs/parallelism-modes.md).
+No source/engine path touched.
 
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —

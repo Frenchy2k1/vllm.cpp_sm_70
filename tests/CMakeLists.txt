@@ -85,6 +85,17 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 # named W3-W8 residuals (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
 
+# DeepSeek-V4-Flash W3: the NEW attention primitives (DSA Lightning-Indexer
+# top-k selection + 512-wide MLA attention sinks + grouped output-LoRA) unit-
+# gated vs hand-derived cases + double-precision references. Full-model gate is
+# multi-Spark-blocked (156.7 GiB); MHC/MoE are W5/W6 (.agents/specs/deepseek-v4-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_dsa vllm/models/test_deepseek_v4_dsa.cpp)
+# KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
+# structural gate: registry-resolve + nested-config descent + text-backbone
+# enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
+# K3 is beyond the pinned oracle (.agents/specs/kimi-k3.md).
+vllm_cpp_add_test(test_kimi_k3_scaffold vllm/models/test_kimi_k3_scaffold.cpp)
+
 # MLA CAMPAIGN W8 (DeepSeek-V2-Lite, DeepseekV2ForCausalLM) — the SACRED MLA
 # greedy correctness gate: drives a compact prompt battery through the paged
 # engine and checks STRICT token-exact agreement with the vLLM 0.25.0 oracle
@@ -158,6 +169,14 @@ vllm_cpp_add_test(test_gemma4_vision_tower vllm/multimodal/test_gemma4_vision_to
 target_include_directories(test_gemma4_vision_tower PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_definitions(test_gemma4_vision_tower PRIVATE
   GEMMA4_VISION_REF_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/gemma4_e4b_image/vision_refs")
+# Gemma-4 G3: USM-Conformer audio-tower per-stage faithfulness gate (subsample ->
+# rel-pos-enc -> N conformer layers -> output_proj -> projected vs the dumped
+# transformers-eager refs). Host f32, no GPU. Weights via VLLM_GEMMA4_AUDIO_WEIGHTS
+# (dumped, uncommitted); refs from the committed golden audio_refs dir.
+vllm_cpp_add_test(test_gemma4_audio_tower vllm/multimodal/test_gemma4_audio_tower.cpp)
+target_include_directories(test_gemma4_audio_tower PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(test_gemma4_audio_tower PRIVATE
+  GEMMA4_AUDIO_REF_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/gemma4_e4b_audio/audio_refs")
 # Multimodal M2b/M2c text-backbone unit gates: MRoPE get_rope_index, 3-section
 # rope application (vt::RopeFromCache), DeepStack scatter, and embed-merge —
 # BIT/near-exact vs the dumped vLLM 0.25.0 reference (CPU-only, no weights).

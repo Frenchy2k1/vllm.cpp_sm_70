@@ -445,3 +445,95 @@ In vLLM 0.26 **GGUF migrated OUT-OF-TREE** to `vllm-gguf-plugin` (`vllm-src/docs
 3. **For a genuine same-GGUF-quant CROSS-ENGINE number, pick a model both already load** (not DeepSeek-V4): a k-quant (e.g. `Q4_K_M`/`Q6_K`) on a **Qwen3 / dense arch** — our `qwen3_5_gguf_weights.cpp` path + the plugin's tested Qwen3 support overlap on k-quants we both dequant. That is the only apples-to-apples GGUF cross-engine bench available without net-new work on both sides.
 
 **To make DeepSeek-V4 GGUF IQ2_XXS truly apples-to-apples would require, on BOTH engines:** (ours) lift the V4 registry GGUF rejection + wire a V4-GGUF loader + port IQ2_XXS (and/or Q2_K) dequant; (vLLM) add `packed_modules_mapping`/GGUF compat to `DeepseekV4ForCausalLM` in the plugin (upstream work) — neither exists today.
+
+---
+
+## W3 — 512-wide MLA output seams + DSA Lightning-Indexer SELECTION (2026-07-28, `CLAIM-DEEPSEEK-V4-W3`)
+
+**Base:** current `main` HEAD `308c312a` (`git rev-parse HEAD`). Isolated worktree, CPU-only,
+foreground, NOT pushed. User-directed: "implement anyway" — the full-model gate is multi-Spark-
+blocked (156.7 GiB, does not fit one GB10; the forward also needs MHC + the sqrtsoftplus/hash MoE,
+neither ported), so W3 lands the FORWARD CODE for the genuinely-NEW primitives + UNIT-gates each.
+
+### W3.1 What landed (additive, SACRED-inert)
+New TUs `include/vllm/model_executor/models/deepseek_v4_dsa.h` +
+`src/vllm/model_executor/models/deepseek_v4_dsa.cpp` — portable HOST (CPU) reference
+implementations of the two things W3 owns, each ported 1:1 with `file:line` on both sides:
+
+- **(A) DSA "Lightning Indexer" sparse SELECTION** — the genuinely-new primitive (our MLA is dense
+  V2/V3; V3.2 sparse was never landed):
+  - `DsaIndexerWeightFold` <- `sparse_attn_indexer.py:203-207` (`weight * softmax_scale *
+    head_scale`, `softmax_scale = index_head_dim**-0.5` `attention.py:735`, `head_scale =
+    index_n_heads**-0.5` `attention.py:843`; the fp8 per-token `q_scale` is 1 in the fp32 reference,
+    documented not silently dropped).
+  - `DsaIndexerLogits` <- `v1/attention/ops/triton_fp8_mqa_logits.py:120-156` — the weighted MQA
+    logit `logit[t,s] = Σ_h folded_w[t,h] · ReLU( dot(q[t,h,:], k[s,:]) )` over the causal
+    candidate window, out-of-window keys `-inf`. **The per-head `ReLU` is the load-bearing
+    nuance** (`:129`): it is what makes the indexer a learned sparse SELECTOR rather than a plain
+    attention score — a unit case pins it (a negative q·k that WOULD flip the top-k without the
+    clip).
+  - `DsaTopkSelect` <- `sparse_attn_indexer.py:488-497` (`top_k_per_row`) + the short-context
+    all-candidate select `attention.py:70-86,:813-831`: `#candidates ≤ topk` ⇒ every candidate in
+    ascending key order then `-1` padding; else the `index_topk=512` largest-logit keys (ties →
+    smaller key index, stable).
+
+- **(B) 512-wide MLA OUTPUT seams V2/V3 do NOT have:**
+  - `SoftmaxWithSink` <- per-head attention sinks `flashinfer_sparse.py:777,:896` +
+    `attention.py:219-222` (the `-inf` init = no effect): an extra per-head sink logit in the
+    softmax DENOMINATOR that carries no value, so the returned probs sum to `< 1` by the sink's
+    share; numerically stable (max-subtraction).
+  - `GroupedOutputLora` <- `nvidia/ops/o_proj.py:58-73`: reshape the per-head attention output into
+    `o_groups=8` groups of `heads_per_group*head_dim`, per-group `wo_a` matmul (the bmm einsum
+    `"bhr,hdr->bhd"`), concat to `n_groups*o_lora_rank`, then `wo_b` to hidden. (The inverse-RoPE +
+    fp8 quant that precede the einsum on GPU reuse our decoupled-RoPE machinery with a negated
+    angle — a W7 seam, omitted so the gate isolates the grouped-LoRA linear algebra.)
+
+### W3.2 Gate (unit, honest) — hand-case + structural review, NOT a dumped-oracle rel-L2
+The arch is a fixed-config 167B and CANNOT be constructed at a tiny synthetic shape (nor run — it
+does not fit one GB10), so per the brief the gate is the MATH against HAND-DERIVED small cases with
+literal expected numbers verified from the vLLM source, PLUS a from-first-principles
+double-precision reference on randomized shapes. `tests/vllm/models/test_deepseek_v4_dsa.cpp`:
+**13/13 cases · 38 assertions GREEN**, clean CPU `-Wall -Werror -Wextra` 0-warn (new lib TU + test).
+Literal cases: weight fold `= D^-0.5·H^-0.5`; MQA logit `Σ w·ReLU(q·k)` (the ReLU clip proven load-
+bearing); causal-window `-inf`; short-context all-select; full top-k largest-logit; tie→smaller-
+index; windowed top-k offset; sink removes probability mass (`Σp = 2/3`); sink stable at large
+logits; grouped-LoRA `[1,6]`. Randomized: indexer logits + grouped output-LoRA vs independent
+double-precision loops, rel-L2 `< 1e-6`.
+
+### W3.3 SACRED inertness
+Additive ONLY. Zero edits to any existing forward — in particular the shared DeepSeek-V2 MLA
+(`src/vllm/model_executor/layers/attention/mla_attention.{h,cpp}`, `src/vt/cuda/cuda_mla_attn.cu`)
+is UNTOUCHED. Per the brief, extending the SHARED MLA block risks V2, so V4's 512-wide geometry +
+sinks + output-LoRA land as a V4-specific path and the shared-mla extraction is a NAMED W7 follow-
+on. Proof: `test_deepseek_v4_scaffold` still 4/4·40; the only non-additive edits are the CMake
+source/test wiring, the `KERNEL-ATTN-DSA-SPARSE-INDEX` kernel-matrix row (+ its checker count bump
+37→38), and the record surfaces.
+
+### W3.4 SGLang benchmark-reference finding (user asked "maybe sglang?")
+The same-quant vLLM benchmark is out (V4 has no in-tree vLLM-GGUF path + NVFP4 needs 2 Sparks — see
+the GGUF-loadability section). **SGLang `v0.5.15`** (`/home/mudler/_git/sglang`, `git describe` =
+`v0.5.15`) **DOES register and implement `DeepseekV4ForCausalLM`** — `EntryClass =
+[DeepseekV4ForCausalLM]` in `python/sglang/srt/models/deepseek_v4.py` (2856 LoC) plus
+`deepseek_v4_nextn.py`, carrying the FULL V4 stack: the DSA indexer (`C4Indexer`) + `Compressor`
+(`python/sglang/srt/layers/attention/dsv4/{indexer,compressor}.py`), MHC (`hc_split_sinkhorn` /
+`mhc_fused_post_pre` in `python/sglang/srt/layers/mhc`), grouped `o_lora`, per-head `attn_sink`, the
+`compress_ratio ∈ {0,4,128}` per-layer topology, dual-theta RoPE. So SGLang is a **viable second
+reference**, and its DSA/compressor kernels are an independent implementation to cross-check our
+math against. HOW it would be gated:
+- **(a) tiny-shape primitive DUMP oracle** — IF `C4Indexer` / `Compressor` construct at small
+  synthetic dims (they take explicit `head_dim`/`n_heads`/`compress_ratio` ctor args, unlike the
+  fixed-config full model), dump their reference tensors and gate our `DsaIndexerLogits` /
+  `DsaTopkSelect` rel-L2 vs SGLang's — a STRONGER gate than the hand case. This is the recommended
+  W4/W7 follow-on (needs an SGLang venv + a GPU or CPU-constructible path — not run this pass).
+- **(b) multi-node / 2-Spark benchmark reference** — SGLang faces the SAME single-GB10 memory
+  infeasibility (NVFP4 156.7 GiB / fp8 167 GiB), so an END-TO-END SGLang benchmark is only a
+  cross-engine number on ≥2 Sparks (the `scale-out-distributed.md` path), same as vLLM.
+
+### W3.5 Landed-vs-residual
+- **Landed (W3):** DSA Lightning-Indexer sparse selection math + 512-wide MLA attention-sink softmax
+  + grouped output-LoRA — host references + unit gate; `KERNEL-ATTN-DSA-SPARSE-INDEX` (`SPIKE`).
+- **Residual (kept as precise stubs/TODOs):** MHC hyper-connections (W5, no eager ref — hardest),
+  the sqrtsoftplus + hash-routed MoE over the FusedMoE fallback (W6), the DSA compressor state
+  cache + paged backend + the fp8_ds_mla KV insert (W4 device side), the device kernels for the W3
+  primitives + folding them into `DeepseekV4Model::Forward` and the shared-mla extraction (W7), and
+  the full strict/near-tie engine gate (W8) — all multi-Spark-blocked on one GB10.

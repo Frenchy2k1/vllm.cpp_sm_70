@@ -110,6 +110,28 @@ above. Neither is ever updated speculatively: `DONE` means merged and gated,
 with non-empty code and test anchors. Applies to every sub-agent; reviewers
 treat a state-shifting diff without its matrix/roadmap update as incomplete.
 
+**Adding a CUDA architecture requires its Triton-AOT cubins — same-change
+obligation (user-directed 2026-07-28).** The vendored Triton-AOT GDN kernels
+(`src/vt/cuda/triton_aot_vendored/sm_XX/`) are PER-ARCH: a cubin loads only on
+the SM it was compiled for, so a build whose target arch has no vendored tree
+silently falls back to the spilling hand-CUDA kernel (the codegen regression the
+`ROAD-V1-D1-GDN-AOT` gap corrected — Triton REG:205/0-spill vs hand REG:255 +
+stack spills). Therefore any change that introduces a NEW CUDA-architecture
+target — a new `VLLM_CPP_CUDA_ARCHITECTURES` value or a new
+`.agents/backend-matrix.md` CUDA-arch row — MUST, in the SAME change, do ONE of:
+(a) regenerate and vendor that arch's FULL AOT set via the sanctioned
+configure-time pipeline (`-DVLLM_CPP_TRITON=ON -DVLLM_CPP_TRITON_REGEN=ON
+-DVLLM_CPP_TRITON_VENDORED_ARCH=sm_XX`; cross-compiled, no target board needed;
+57 artifacts + MANIFEST matching the `sm_121a` fileset — see
+[.agents/specs/triton-aot-per-arch.md](.agents/specs/triton-aot-per-arch.md) and
+`cmake/TritonAOT.cmake`), with `scripts/check-triton-aot-drift.sh` rc=0; or
+(b) if regen is not yet possible on that arch, record the GDN-decode gap
+HONESTLY in `backend-matrix.md`/`kernel-matrix.md` (that arch runs the hand
+kernel, build-verified-only, NOT AOT-parity) rather than leaving a silent
+fallback. The `sm_121a` cubins are SACRED (the 27B/35B GDN gate) and MUST stay
+byte-identical when adding any other arch — prove it (git-untouched) in the same
+change.
+
 **Doc lifecycle — live context vs completed record (user-directed 2026-07-10).**
 `.agents/` holds documents that are LIVE context for current work; era-closed
 documents move to **`.agents/completed/`** (version/era-stamped name, e.g.

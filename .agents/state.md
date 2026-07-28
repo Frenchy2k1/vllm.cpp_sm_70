@@ -30888,6 +30888,224 @@ ledger. Records-only; no build/GPU/download/benchmark.
   `MM-SERVE-E2E` = fold the M2c forward into `ModelRegistry::Forward` (above).
   Residuals: streaming mm, multiple images, video, http fetch, PNG/JPEG codec,
   Gemma-4 image.
+- **2026-07-28** — **Parallelism-mode enumeration spike (`CLAIM-PARALLELISM-MODES-SPIKE`, records-only, NOT pushed).** User-directed: enumerate EVERY parallelism / distributed-execution mode vLLM has, grounded 1:1 in pinned vLLM `555967922` `file:line`, mapped onto the `vt::Communicator` seam landed by W1. Base `main` `308c312a` (isolated worktree `.claude/worktrees/agent-a6656edcf7ff0251f`; CPU-only, NO build/GPU/download). NEW `.agents/specs/parallelism-modes.md` — the enumeration table (mode / what / vLLM file:line / config flag / comm pattern / our-seam-map / reuse-vs-new / priority) + per-mode detail + the mode→collective map + priority ranking. **Five true world dimensions** (TP/PP/DP/PCP/DCP) laid out as one rank tensor `ExternalDP×DP×PP×PCP×TP` (`parallel_state.py:1785`), plus **two modes that are NOT their own axis**: EP (a DP×PCP×TP re-grouping, `parallel_state.py:1892`) and SP (a compilation pass `sequence_parallelism.py:498`, flag `pass_config.enable_sp`, rewrites TP all-reduce→reduce-scatter/all-gather — flagged honestly). DeepEP HT/LL/V2 all-to-all backends confirmed present upstream; vLLM has NO interleaved/virtual pipeline. Added `BACKEND-DISTRIBUTED-DP`/`-EP`/`-SP` rows (distributed table 5→8, BACKEND total 65→68, `check-agent-record.py` bumped); roadmap mode-priority sub-table (TP→EP+NCCL→PP→DP→SP→context); feature-matrix §3 EP/DP/SP/context rows repointed to the new spec; docs/STATUS scale-out line + docs/BENCHMARKS NOT-APPLICABLE + ledger + coordination + this entry. Each mode → `vt::Communicator` collective: W1 has AllReduce/AllGather/Send/Recv; EP needs NEW AllToAll, SP needs NEW ReduceScatter, comm-strategy selection = the existing `OpProvider (OpId,DeviceType)` table. All 6 record checkers rc=0. NEXT: W2 = `BACKEND-DISTRIBUTED-TP` forward+loader (still ≥2-GPU-gated).
+
+## 2026-07-28 — vLLM feature-gap analysis: whole-surface sweep vs pinned vLLM 0.26 (`CLAIM-FEATURE-GAP-SPIKE`, records-only)
+
+- **What ran.** A CPU/research sweep (base `main` `308c312a`, isolated worktree
+  `.claude/worktrees/agent-a76b7ae648f3cd7d3`, NO build / NO GPU) of pinned vLLM
+  `555967922` (0.26.0.dev0, read at `/home/mudler/_git/vllm` HEAD `5559679`)
+  against our five matrices, to find what we are MISSING. Four parallel area
+  agents grounded every vLLM capability in `file:line`: adapters (`vllm/lora/`),
+  spec-decode breadth (`vllm/v1/spec_decode/` + `config/speculative.py`), the
+  quant registry (`quantization/__init__.py:141`), structured-output backends
+  (`vllm/v1/structured_output/`) + reasoning parsers (`vllm/reasoning/`),
+  pooling tasks (`vllm/model_executor/layers/pooler/`, `vllm/tasks.py`), the
+  OpenAI serving surface (`vllm/entrypoints/`), KV connectors / offload
+  (`vllm/distributed/kv_transfer/`, `vllm/v1/kv_offload/`), parallelism
+  (`config/parallel.py`), engine/runtime (`vllm/plugins/`, `device_allocator/`,
+  `model_loader/`) and platforms (`vllm/platforms/`).
+- **Verdict: 8 HIGH, ~19 MED, ~16 LOW gaps.** Full grounded table in
+  `.agents/specs/vllm-feature-gap-analysis.md`. Top HIGH (common, single-box,
+  user-facing): (1) LoRA / multi-LoRA runtime + load/unload endpoints
+  (`lora/punica_wrapper/punica_gpu.py:33`, `serve/lora/api_router.py:43`) —
+  whole adapter subsystem absent; (2) the pooling task class —
+  embeddings/classify/score/rerank models + endpoints
+  (`layers/pooler/abstract.py:16`, `pooling/embed/api_router.py:28`) — no
+  pooling runner at all; (3) AWQ + GPTQ native compute (`auto_awq.py:171`,
+  `auto_gptq.py:97`); (4) xgrammar backend (`backend_xgrammar.py:36`); (5)
+  fp8-KV (`quantization/kv_cache.py:42`); (6) reasoning parsers
+  (`vllm/reasoning/__init__.py:22`, 25+ parsers).
+- **Three MED capabilities have NO stable row (records gaps).** Recommended new
+  rows named in the spec: generic separate draft-model + Medusa spec decode
+  (`spec_decode/draft_model.py:19`, `medusa.py:18` — we have
+  MTP/DFlash/ngram/DSpark/TLI/EAGLE3 but not the classic model-agnostic draft
+  path or Medusa); offline Batch API (`entrypoints/openai/run_batch.py:793`);
+  plugin system (`vllm/plugins/__init__.py:18` — directly serves the
+  extensibility-first priority).
+- **Honesty — already HAVE (naive-scan false-positives, NOT re-roadmapped):**
+  ngram/MTP/DFlash spec decode, Prometheus `/metrics`, custom logits
+  processors, `n>1`/`best_of`/beam/logprobs/logit_bias, priority scheduling,
+  APC, chunked prefill, the streaming tool-parser engine, the utility endpoints,
+  YaRN/llama3/longrope/NTK rope, sliding-window + chunked-local attention, the
+  collective/process-group abstraction (W1). Confirmed NON-gap: vLLM has
+  REMOVED prompt adapters, so we owe nothing there.
+- **Records:** NEW `specs/vllm-feature-gap-analysis.md`; `roadmap_v1.md`
+  (feature-gap-sweep section + 6 promoted HIGH rows referencing existing IDs);
+  `feature-matrix.md` (sweep callout + spec-breadth / batch-API / plugin gap
+  rows + LoRA anchors + prompt-adapter NON-GAP); `coordination.md`
+  (`CLAIM-FEATURE-GAP-SPIKE` note); `docs/STATUS.md`; `docs/BENCHMARKS.md`
+  (NOT-APPLICABLE — spike); `parity-ledger.md` + this entry. No counted-matrix
+  rows created (no inventory-count bump); no `src/`/`tests/`/README/Metal
+  touched. All six record checkers rc=0. NEXT (separate claims): create the
+  three missing rows and pick up the HIGH gaps in priority order.
+- **2026-07-28** — **DeepSeek-V4-Flash W3 primitives landed (`CLAIM-DEEPSEEK-V4-W3`,
+  base `main` `308c312a`, isolated worktree, CPU-only, foreground, NOT pushed).**
+  User-directed "implement anyway": the full-model gate is multi-Spark-blocked
+  (156.7 GiB, does not fit one GB10; forward also needs MHC + sqrtsoftplus/hash MoE),
+  so W3 lands the FORWARD CODE for the genuinely-NEW-vs-V2/V3 attention math as
+  portable host references + unit-gates each. New additive TUs
+  `include/vllm/model_executor/models/deepseek_v4_dsa.h` +
+  `src/vllm/model_executor/models/deepseek_v4_dsa.cpp` (5 functions): **(A) DSA
+  "Lightning Indexer" sparse SELECTION** — `DsaIndexerWeightFold`,
+  `DsaIndexerLogits` (`Σ_h w·ReLU(q·k)`, the per-head ReLU is load-bearing),
+  `DsaTopkSelect` (short-context all-select / causal top-`index_topk=512`); **(B)
+  512-wide MLA output seams V2/V3 lack** — `SoftmaxWithSink` + `GroupedOutputLora`
+  (`wo_a` bmm→`wo_b`). Gate `tests/vllm/models/test_deepseek_v4_dsa.cpp` **13/13·38**
+  — hand-derived literals + double-precision references (rel-L2 < 1e-6), clean CPU
+  `-Wall -Werror -Wextra` 0-warn. Honest gate form: hand-case + structural review vs
+  vLLM `file:line`, NOT a dumped-oracle rel-L2 (the fixed-config 167B arch is not
+  constructible at a tiny shape) — stated as such. SACRED-inert: additive only, shared
+  `mla_attention`/`cuda_mla_attn` UNTOUCHED (shared-mla extraction = named W7 follow-on);
+  `test_deepseek_v4_scaffold` still 4/4·40. New kernel row `KERNEL-ATTN-DSA-SPARSE-INDEX`
+  (`SPIKE`, checker count 37→38). **SGLang `v0.5.15` DOES register+implement
+  `DeepseekV4ForCausalLM`** (full DSA/MHC/o_lora stack, 2856 LoC) ⇒ a viable second
+  benchmark/primitive-dump reference (same single-GB10 memory limit) — recorded.
+  Records: `specs/deepseek-v4-flash.md` §W3, `model-matrix.md`, `kernel-matrix.md`,
+  `feature-matrix.md`, `roadmap_v1.md`, `coordination.md`, `docs/STATUS.md`,
+  `docs/BENCHMARKS.md`, `parity-ledger.md`, this entry. Residuals: MHC (W5),
+  sqrtsoftplus/hash MoE (W6), device kernel + forward integration (W7), full strict
+  gate (W8) = multi-Spark. NEXT: W4/W5/W6 per the spec once ≥2 Sparks / offload stands up.
+- **2026-07-28 (later)** — **Per-arch Triton-AOT GDN packed-decode cubins landed
+  (`CLAIM-TRITON-AOT-PER-ARCH`, base `main` `308c312a` confirmed via
+  `git rev-parse HEAD`; isolated worktree `agent-a136dd3a01293a3dd`; NOT pushed).**
+  HONEST GAP CORRECTED: the vendored Triton-AOT GDN fast-path cubins (the MEASURED
+  codegen-win packed decode — Triton REG:205/0-spill vs hand-CUDA REG:255+STACK:48
+  spills — plus the delta_h/chunk_o/kkt/tril/wu FLA set) existed for `sm_121a`
+  ONLY. Because a cubin loads only on its compiled SM and every cross-family arch
+  build ships `-DVLLM_CPP_TRITON=OFF` (portable-kernels-only), GDN decode on
+  `sm_80/86/89/90a/100a` ran the SPILLING hand kernel — the Triton-AOT GDN-decode
+  parity was `sm_121`-runtime-only, NOT at parity on any other arch.
+- **The deliverable.** Regenerated the WHOLE GDN AOT set (one configure per arch
+  regenerates decode+deltah+chunko[+bf16]+kkt+tril+wu, h48+h32) for
+  `sm_80/86/89/90a/100a` on dgx GB10 via the sanctioned pipeline
+  (`-DVLLM_CPP_TRITON_REGEN=ON -DVLLM_CPP_TRITON_VENDORED_ARCH=sm_XX`, Triton
+  3.6.0 / bundled ptxas 12.8). ptxas is a cross-compiler + AOT compile does no
+  autotuning, so the cubins were cross-compiled with NO target board present and
+  NO GPU execution. Each arch = 57 artifacts + MANIFEST matching the `sm_121a`
+  fileset (verified). Vendored into `src/vt/cuda/triton_aot_vendored/sm_XX/`.
+- **Dispatch = build-time selection, already additive.**
+  `cmake/TritonAOT.cmake::_triton_aot_arch_name` derives the vendored subdir as
+  `sm_${VLLM_CPP_CUDA_ARCHITECTURES}` and `_triton_aot_resolved_target` derives
+  `cuda:<cc>:32`; dropping a new `sm_XX/` tree makes a
+  `-DVLLM_CPP_CUDA_ARCHITECTURES=XX -DVLLM_CPP_TRITON=ON` build select the
+  non-spilling FLA path with ZERO code change. No `cuda_gdn.cu`/CMake edits.
+- **Proof.** `cuobjdump --dump-elf` shows real per-target SASS
+  (`sm=80/86/89/90/100`), nvdisasm `EF_CUDA_SM80/86/89`, decode `SHI_REGISTERS`
+  209–217 / 0-spill (all under the hand-CUDA spill floor, so the codegen-win
+  rationale carries — build-verified). Builder-path configure (no REGEN) selects +
+  integrity-verifies both `sm_121a` (unchanged) and the new trees
+  (`Triton AOT: … <- vendored … (no Python)`); the generated AOT C compiles clean;
+  `check-triton-aot-drift.sh` rc=0 across all six trees. **`sm_121a` is git
+  byte-identical to base — the SACRED 27B/35B GDN gate is structurally unchanged
+  (same cubin bytes, loaders, dispatch); no full sm_121a rebuild was re-run
+  because the change adds ZERO inputs to a `sm_121a` build (the new trees are
+  selected only by their own arch) and HEAD is already green.**
+- **HONEST SIGNAL: DERIVED+BUILD-VERIFIED (testing-welcome).** No non-`sm_121`
+  board runs a GDN-hybrid model here, so GDN-decode parity on `sm_80/86/89/90a/
+  100a` is BUILD-VERIFIED (real SASS + selection + clean compile), NOT
+  runtime-measured. The only measured GDN-decode codegen win is the GB10 `sm_121a`
+  number. Residual: runtime GDN-model verification on Ampere/Ada/Hopper/DC-Blackwell
+  silicon when reachable.
+- **Records:** `.agents/specs/triton-aot-per-arch.md` (NEW — gap + regen recipe +
+  per-arch status table + honest signal), `kernel-matrix.md` (per-arch AOT
+  checkpoint + `KERNEL-CUDA-DISPATCH-AOT` "only SM121" correction),
+  `backend-matrix.md` (intro gap-correction), `feature-matrix.md` (GDN row),
+  `roadmap_v1.md` (`ROAD-V1-D1-GDN-AOT`), `coordination.md`
+  (`CLAIM-TRITON-AOT-PER-ARCH`), `docs/STATUS.md` + `docs/BENCHMARKS.md`,
+  `parity-ledger.md` + this entry. All 6 record checkers rc=0. dgx
+  `~/aot-regen-308c312a` pruned (disk 436G free after), local-ai-worker left Up
+  as-found. NOT pushed.
+
+## 2026-07-28 — Kimi K3 W2/W5 CPU structural bring-up (`CLAIM-KIMI-K3-W2-W5`, DERIVE-AND-SHIP)
+
+Landed the CPU-buildable Kimi-K3 structural bricks on an isolated worktree off
+`main` `308c312a` (branch `feat/kimi-k3-w2-w5`; CPU-only `-DVLLM_CPP_CUDA=OFF`;
+NO GPU/download; NOT pushed — orchestrator cherry-picks). K3
+(`KimiK3ForConditionalGeneration`, released 2026-07-27) is BEYOND the pinned oracle
+`555967922` and does NOT fit GB10 (~1.56 TB MXFP4, ~12×), so there is no on-box e2e
+golden — the honest signal is DERIVED+BUILD-VERIFIED (a green compile is NOT
+execution evidence).
+
+**W2 (registry stub + config parse).** New additive registry TU registers
+`KimiK3ForConditionalGeneration` (info: text-gen + `is_hybrid` + `has_inner_state`
++ `supports_multimodal`). `ParseKimiK3Params` descends the wrapper's nested
+`text_config` (KimiLinear KDA+MLA+MoE hybrid scalars), `vision_config` (MoonViT-V2,
+PARTIAL), and `quantization_config` (MXFP4 detect), validating + throwing on
+unrepresentable configs. Grounded in `configs/kimi_linear.py:11-148`. Caught the
+upstream key name divergence (`num_experts_per_token`, not HfConfig's
+`num_experts_per_tok`).
+
+**W5 (scaled hybrid loader + text-forward skeleton, as far as CPU-buildable).**
+`EnumerateKimiK3TextBackboneTensors` is the pure, unit-tested 93-layer KDA/MLA +
+896-expert MoE text-backbone structural name-map, grounded 1:1 in
+`kimi_linear.py:104-378,460-554` + `kimi_gdn_linear_attn.py:102-226`, with per-layer
+KDA-vs-MLA(is_kda_layer) / MLA-qLoRA-vs-direct / MoE-vs-dense branching. Forward is
+REFUSE-by-name (`VT_CHECK(false)`, mirrors `deepseek_v4.cpp`); the loader REFUSES
+MXFP4 (the real K3 checkpoint dtype).
+
+**Correctly left NOT-YET-BUILDABLE (deferred, not duplicated):** MXFP4
+materialization → shared DeepSeek-V4 MegaMoE MXFP4 scope (`CLAIM-DEEPSEEK-V4-*`);
+the KDA kernel delta (per-channel `f_a`/`f_b` decay + sigmoid-gated `o_norm` + 3
+short convs) → Kimi-Linear row (`MODEL-TEXT-kimi-linear-*`); MoonViT-V2 vision → W7;
+K3 multimodal-wrapper weight prefix → post-pin.
+
+**Evidence.** Clean CPU full-library build (`libvllm.a` rc=0);
+`tests/vllm/models/test_kimi_k3_scaffold.cpp` 6/6 · 63 assertions GREEN
+(registry-resolve + config-descent at real K3 scale + KDA/MLA + MoE/dense split +
+enumeration faithfulness + reject + MXFP4-refuse). Files:
+`include/vllm/model_executor/models/kimi_k3.h`,
+`src/vllm/model_executor/models/kimi_k3{,_registry,_weights}.cpp`, the test, plus
+`CMakeLists.txt` + `tests/CMakeLists.txt` wiring. Records:
+`model-matrix.md` (row + checklist entry, stays SPIKE/📋), `roadmap_v1.md`,
+`docs/STATUS.md`, `docs/BENCHMARKS.md`, `parity-ledger.md`, `coordination.md`, this
+entry. Row stays SPIKE (no on-box e2e; forward not implemented). NEXT: W1 proxy
+primitive gate on Kimi-Linear-48B (shares the KDA kernel campaign, DGX-blocked).
+- **2026-07-28 — Gemma-4 G3: C++ USM-Conformer AUDIO tower + audio projector LANDED, per-stage gates PASS (`CLAIM-GEMMA4-G3`, NOT pushed; base `main` `308c312a`).**
+  The Gemma-4 third-modality tower is implemented as a standalone additive TU
+  (`include/vllm/model_executor/models/gemma4_audio.{h}` +
+  `src/…/gemma4_audio.cpp`) and proven faithful stage-by-stage vs the
+  transformers-eager reference (`test_gemma4_audio_tower`, dev-box host f32,
+  **1256/1256**): subsample rel-L2 5.4e-7, posemb 8.9e-8, block0 4.2e-7,
+  block_mid 3.8e-7, block_last 4.4e-6, output_proj 5.9e-6, projected 6.3e-6 —
+  f32-EXACT (residual = f64-vs-f32 accumulation order). T=250 mel frames → S=63
+  soft tokens; head_dim 128, 8 heads, 12 layers. Ported 1:1 from
+  `modeling_gemma4.py` @ 5.13.1: 2×Conv2d subsample (k3s2p1 + `nn.LayerNorm`-no-bias
+  over channels + ReLU + `mask[::2]`) → input_proj → rel-pos-enc → 12 Conformer
+  layers (ff1 half-step ·0.5 → CHUNKED-LOCAL attn [chunk 12, past window 12,
+  Transformer-XL `_rel_shift`, softcap 50, `per_dim_scale` softplus] → light-conv
+  [GLU + depthwise causal Conv1d k5] → ff2 → norm_out) → output_proj(+bias) →
+  embed_audio (RMSNorm-noweight + Linear→2560). E4B `use_clipped_linears=True`
+  FINITE trained QAT clamps implemented on every `Gemma4ClippableLinear`.
+  **RED-first:** the initial wrong sliding window (`kj∈[qi-12,qi]`, 13 keys) →
+  block_mid 2.8e-2 / block_last 0.22 / projected 0.31 RED; fixing to the source
+  `sliding_window_mask_function((12,0))` semantics (`dist=q_idx-kv_idx∈[0,12)`,
+  12 keys) → all ~1e-6 GREEN. ZERO new `vt::` op / kernel (host f32,
+  device-neutral, correctness-first). **Inertness by construction** (NEW standalone
+  TU not referenced by registry/runner ⇒ text `test_gemma4_paged_engine` STRICT
+  32/32 + the G2-impl vision gates byte-identical); full `libvllm` + every test TU
+  re-link clean; `-Werror` 0-warn both new TUs (CPU). **DGX** `dgx.casa` used ONLY
+  read-only CPU (`CUDA_VISIBLE_DEVICES=""`, NO GPU, NO `gpu.lock`) for the oracle
+  per-stage tower dump (`scripts/mm/g3_audio_tower_ref.py`) + E4B audio-weight
+  dump — E4B was ALREADY cached, NO fetch, disk left at 52 GiB. Gemma-4 now has
+  all three modalities tower-proven (text STRICT 32/32, vision per-stage, audio
+  per-stage). **RESIDUAL (named, honest):** audio→text e2e = the Gemma-4 audio
+  feature extractor (A1 mel frontend + soft-token count) + the engine mm-plumbing
+  (SupportsMultiModal, hasher/encoder-cache, masked-scatter merge at `<audio>`,
+  decode fork) — same residual class as the G2-impl vision tower; the tower +
+  projector (the merge INPUT) are proven; `input_features` here is a dumped golden.
+  The device-resident bf16 forward (speed) + the audio e2e GPU golden are named
+  residuals.
+- **Records:** `specs/gemma4-multimodal.md` (§G3 + USM-Conformer port map + the
+  per-stage gate table + §1 disposition), `model-matrix.md` (mm row + summary row
+  → tri-modal towers proven, owner `CLAIM-GEMMA4-G3`), `coordination.md`
+  (`CLAIM-GEMMA4-G3`), `kernel-matrix.md` (G3 note: no new kernel — host f32),
+  `feature-matrix.md`, `roadmap_v1.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`
+  (NOT-APPLICABLE — tower-in-isolation correctness gate), the golden fixture
+  `tests/parity/goldens/gemma4_e4b_audio/`, `parity-ledger.md` + this entry. All 6
+  record checkers rc=0. NEXT: the audio→text e2e (feature extractor + engine
+  merge-plumbing, shared with the G2 image e2e residual) + device-resident bf16
+  speed.
 
 ## 2026-07-28 - `SPEC-DFLASH-GGUF` `GD5`-`GD8`: axis B (GGUF TARGET too) GENERATES on GB10
 

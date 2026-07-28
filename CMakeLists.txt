@@ -398,6 +398,10 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_registry.cpp
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp
+  src/vllm/model_executor/models/deepseek_v4_dsa.cpp
+  src/vllm/model_executor/models/kimi_k3_registry.cpp
+  src/vllm/model_executor/models/kimi_k3_weights.cpp
+  src/vllm/model_executor/models/kimi_k3.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
   src/vllm/model_executor/models/glm4_weights.cpp
   src/vllm/model_executor/models/glm4.cpp
@@ -450,6 +454,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/model_registry.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp
+  src/vllm/model_executor/models/gemma4_audio.cpp
   src/vllm/model_executor/models/whisper_audio.cpp
   src/vllm/model_executor/models/qwen3_vl_text.cpp
   src/vllm/model_executor/models/qwen3_vl.cpp
