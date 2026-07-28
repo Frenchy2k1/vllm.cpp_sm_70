@@ -11,11 +11,14 @@
 // SCOPE (ROAD-V1-C8 TOOLS-STREAMING-PARSER-ASSEMBLY). Ported: the full event ->
 // delta assembly, held-back streaming-arg prefix logic, tool-index increment,
 // finish() flush, and the one-shot extract path, for the three engine configs
-// (qwen3 / seed_oss / kimi_k2). RESIDUAL (tracked, .agents/specs/
-// parser-assembly-c8.md): JSON-schema type coercion (_fix_arg_types with a
-// non-empty tool schema) — modeled as identity here because no tool schema is
-// carried; and the responses/prompt-state hooks (adjust_initial_state_from_prompt
-// is a base no-op).
+// (qwen3 / seed_oss / kimi_k2). JSON-schema tool-argument type coercion
+// (_fix_arg_types / _streamable_string_keys with a non-empty tool schema) is now
+// PORTED: ParserTool carries the function `parameters` schema, so a request whose
+// tools declare typed params has its assembled arguments coerced to the declared
+// types (parser_engine.py:365 _fix_arg_types); with no schema the path is identity
+// (byte-identical, unchanged). RESIDUAL (tracked, .agents/specs/
+// parser-assembly-c8.md): the responses/prompt-state hooks
+// (adjust_initial_state_from_prompt is a base no-op).
 #pragma once
 
 #include <functional>
@@ -23,6 +26,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
@@ -42,6 +47,10 @@ namespace oai = vllm::entrypoints::openai;
 // tool_parsers/abstract.h subset deviation).
 struct ParserTool {
   std::string name;  // function tool name (find_tool_name / find_tool_properties)
+  // The function's JSON-Schema `parameters` object (FunctionDefinition.parameters,
+  // upstream dict[str,Any]|None). nullopt / absent `properties` => no schema, so
+  // _fix_arg_types is identity and _streamable_string_keys is None (unchanged).
+  std::optional<nlohmann::json> parameters;
 };
 
 struct ParserRequest {
@@ -213,6 +222,11 @@ class ParserEngine {
                             const std::string& func_name) const;
   std::optional<std::vector<std::string>> streamable_string_keys(
       const std::string& func_name) const;
+  // tool_parsers/utils.py:271 find_tool_properties — the named function tool's
+  // `parameters.properties` object, or an empty object when the tool / params /
+  // properties are absent. (Models only the FunctionTool form the assembly
+  // ParserRequest carries; NamespaceTool / Responses variants unmodeled.)
+  nlohmann::json find_tool_properties(const std::string& func_name) const;
 
   static std::vector<oai::DeltaToolCall> coalesce_tool_call_deltas(
       const std::vector<oai::DeltaToolCall>& deltas);

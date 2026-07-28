@@ -40,6 +40,8 @@
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
 #include "vllm/parser/engine/parser_engine.h"
@@ -83,6 +85,13 @@ struct GParse {
   bool has_tool_calls;
   std::vector<std::pair<std::string, std::string>> tool_calls;  // {name, args}
 };
+// A request function tool: name + raw JSON-Schema `parameters` string (empty ""
+// means the tool declares no parameters). Drives the JSON-schema arg-type
+// coercion path (_fix_arg_types); an empty tools list is the no-schema identity.
+struct GTool {
+  std::string name;
+  std::string parameters_json;
+};
 struct GScenario {
   std::string name;
   std::string cfg;
@@ -93,6 +102,7 @@ struct GScenario {
   GExtract extract;
   bool check_parse;
   GParse parse;
+  std::vector<GTool> tools;
 };
 
 #include "test_parser_engine_assembly_goldens.inc"
@@ -130,6 +140,22 @@ class GemmaMockTok : public vllm::parser::engine::EngineTokenizer {
   std::map<std::string, int> vocab_;
   std::map<int, std::string> rev_;
 };
+
+// Build the ParserRequest the scenario drives, including the typed tool schemas
+// (parsed from each GTool's raw JSON) that gate the arg-type coercion path. An
+// empty tools list leaves req.tools empty => the no-schema identity path.
+ParserRequest make_req(const GScenario& s) {
+  ParserRequest req;
+  req.include_reasoning = s.include_reasoning;
+  for (const GTool& t : s.tools) {
+    vllm::parser::engine::ParserTool pt;
+    pt.name = t.name;
+    if (!t.parameters_json.empty())
+      pt.parameters = nlohmann::json::parse(t.parameters_json);
+    req.tools.push_back(std::move(pt));
+  }
+  return req;
+}
 
 std::unique_ptr<vllm::parser::engine::ParserEngine> make(const GScenario& s) {
   static const GemmaMockTok gemma_tok;
@@ -170,8 +196,7 @@ TEST_CASE("parser assembly: streaming DeltaMessage parity, event-for-event") {
   for (const GScenario& s : kAssemblyGoldens) {
     CAPTURE(s.name);
     auto parser = make(s);
-    ParserRequest req;
-    req.include_reasoning = s.include_reasoning;
+    ParserRequest req = make_req(s);
     REQUIRE(s.stream.size() == s.deltas.size());
     for (std::size_t i = 0; i < s.deltas.size(); ++i) {
       const bool finished = (i + 1 == s.deltas.size());
@@ -187,8 +212,7 @@ TEST_CASE("parser assembly: one-shot extract_tool_calls parity, field-for-field"
   for (const GScenario& s : kAssemblyGoldens) {
     CAPTURE(s.name);
     auto parser = make(s);
-    ParserRequest req;
-    req.include_reasoning = s.include_reasoning;
+    ParserRequest req = make_req(s);
     std::string full;
     for (const auto& d : s.deltas) full += d;
 
@@ -224,8 +248,7 @@ TEST_CASE("parser assembly: non-streaming parse() parity (gemma4/inkling seams)"
     if (!s.check_parse) continue;
     CAPTURE(s.name);
     auto parser = make(s);
-    ParserRequest req;
-    req.include_reasoning = s.include_reasoning;
+    ParserRequest req = make_req(s);
     std::string full;
     for (const auto& d : s.deltas) full += d;
 

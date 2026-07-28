@@ -28298,3 +28298,50 @@ parity, no compute path). Records: `engine-matrix.md`
 `specs/roadmap-v1-completion.md` C8, `docs/STATUS.md`, `docs/BENCHMARKS.md`,
 ledger, coordination `CLAIM-C8-CHAT-TOKENIZE`, this entry. All record checkers
 rc=0. NOT pushed; FULL SHA reported to caller.
+
+---
+
+## 2026-07-28 — JSON-schema tool-arg type coercion LANDED (`CLAIM-C8-ARG-COERCION`)
+
+Closed the `ROAD-V1-C8` parser-correctness residual `_fix_arg_types` (JSON-schema
+tool-argument type coercion). Base local `main` `6925aec7` (confirmed via
+`git rev-parse HEAD`), isolated worktree `.claude/worktrees/agent-abac4e98f77f088e8`,
+vLLM pin `555967922`/0.26.0.dev0. CPU-only, exact gate.
+
+**What it does.** `ParserTool` now carries the function `parameters` JSON-schema,
+threaded from `serving_chat.cpp` `ToParserRequest`. The assembly coerces the
+assembled `tool_calls[].function.arguments` to the schema-declared JSON types
+(int/number/bool/string/array/null) in BOTH streaming (`parse_delta`, per-tick
+coercion + `_streamable_string_keys` held-back string keys) and one-shot
+(`extract_tool_calls`/`parse`). Ported 1:1 FROM `parser_engine.py:365`
+(`_fix_arg_types`), `:269`/`:227` (`_coerce_dict`/`_coerce_value`), `:348`
+(`_streamable_string_keys`), `tool_parsers/utils.py:271` (`find_tool_properties`) —
+reusing the ALREADY-ported `extract_types_from_schema`/`coerce_to_schema_type`
+(`tool_parsers/utils.cpp`; priority null>int>number>bool>object>array>string, alias
+map, non-finite rejection). Uncoercible values and non-object args are left as-is;
+no schema / no tools = IDENTITY (byte-identical).
+
+**Additive.** Only `parser_engine.{h,cpp}` (recursive `_coerce_dict`/`_coerce_value`
++ `find_tool_properties`; `ParserTool.parameters`) + `serving_chat.cpp` schema
+threading + the extended dump script. No other TU touched; the streaming engine
+ignores the new fields.
+
+**Gate.** `test_parser_engine_assembly` extended to 3 cases / 5038 asserts (was
+4526), 30 scenarios (+27-30: qwen3 typed-schema whole+char, qwen3 schema-mismatch +
+nullable, kimi_k2 JSON-native `"5"`->int in the converter-less extract path —
+streaming raw / extract coerced, divergence gated). RED-first 38 asserts, first
+boundary `qwen3_typed_schema_wholedelta extract tc[0] arguments` (identity
+`{"days": "5", ...}` vs coerced `{"days": 5, "unit": "celsius", "active": true,
+"temp": 3.14, "tags": [1, 2, 3]}`); restore -> 5038/5038. No-schema inertness: the
+26 prior scenarios + `test_streaming_parser_engine` 586/586 +
+`test_openai_serving_chat_stream` 210/210 UNCHANGED byte-identical (`.inc` diff =
+pure insertions). CPU `-Werror` 0-warn clean full-library build. Goldens
+byte-reproduced by the extended `tools/parity/dump_parser_engine_assembly.py` (real
+coercion oracle copied verbatim from the pin).
+
+`benchmark_binding=false` (correctness feature, no compute path; NOT-APPLICABLE for
+throughput). Records: `engine-matrix.md` `TOOLS-STREAMING-PARSER`,
+`feature-matrix.md` §7, `roadmap_v1.md` C8, `specs/roadmap-v1-completion.md` C8,
+`specs/parser-assembly-c8.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`, ledger,
+coordination `CLAIM-C8-ARG-COERCION`, this entry. All record checkers rc=0. NOT
+pushed; FULL SHA reported to caller.

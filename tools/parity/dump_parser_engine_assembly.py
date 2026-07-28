@@ -29,6 +29,7 @@ reconcile 1:1 with upstream.
 
 import argparse
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -205,20 +206,149 @@ class FunctionDefinition:
     pass
 '''
 
+# The schema-aware coercion helpers are copied VERBATIM from the pinned oracle
+# vllm/tool_parsers/utils.py @ 555967922 (extract_types_from_schema:620,
+# coerce_to_schema_type:693, _TYPE_ALIASES:666, _is_json_finite:151) so the
+# captured goldens exercise the REAL _fix_arg_types / _streamable_string_keys
+# behavior when a request carries typed tool schemas. find_tool_properties /
+# find_tool_name are faithful reductions over the gate's simple tool objects
+# (.function.name / .function.parameters); with tools=None they degenerate
+# exactly as upstream ({} / False), keeping the no-schema path byte-identical.
 _TOOL_UTILS_STUB = '''
-# No tool schema is carried in the gate, so these degenerate exactly as upstream
-# does for tools=None (find_tool_properties -> {}, find_tool_name -> False).
+import json
+import math
+
+
 def find_tool_properties(tools, tool_name):
+    if not tools:
+        return {}
+    for tool in tools:
+        fn = getattr(tool, "function", None)
+        if fn is None:
+            continue
+        if fn.name == tool_name:
+            params = fn.parameters or {}
+            return params.get("properties", {})
     return {}
 
+
 def find_tool_name(tools, tool_name):
+    if not tools:
+        return False
+    for tool in tools:
+        fn = getattr(tool, "function", None)
+        if fn is not None and fn.name == tool_name:
+            return True
     return False
 
+
+def _is_json_finite(obj):
+    try:
+        json.dumps(obj, allow_nan=False)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def extract_types_from_schema(schema):
-    return []
+    if schema is None or not isinstance(schema, dict):
+        return ["string"]
+    types = set()
+    if "type" in schema:
+        type_value = schema["type"]
+        if isinstance(type_value, str):
+            types.add(type_value)
+        elif isinstance(type_value, list):
+            for t in type_value:
+                if isinstance(t, str):
+                    types.add(t)
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        for value in schema["enum"]:
+            if value is None:
+                types.add("null")
+            elif isinstance(value, bool):
+                types.add("boolean")
+            elif isinstance(value, int):
+                types.add("integer")
+            elif isinstance(value, float):
+                types.add("number")
+            elif isinstance(value, str):
+                types.add("string")
+            elif isinstance(value, list):
+                types.add("array")
+            elif isinstance(value, dict):
+                types.add("object")
+    for choice_field in ("anyOf", "oneOf", "allOf"):
+        if choice_field in schema and isinstance(schema[choice_field], list):
+            for choice in schema[choice_field]:
+                types.update(extract_types_from_schema(choice))
+    return list(types) if types else ["string"]
+
+
+_TYPE_ALIASES = {
+    "str": "string", "text": "string", "varchar": "string", "char": "string",
+    "enum": "string", "int": "integer", "int32": "integer", "int64": "integer",
+    "uint": "integer", "uint32": "integer", "uint64": "integer", "long": "integer",
+    "short": "integer", "unsigned": "integer", "float": "number",
+    "float32": "number", "float64": "number", "double": "number", "bool": "boolean",
+    "dict": "object", "arr": "array", "list": "array", "sequence": "array",
+}
+
 
 def coerce_to_schema_type(value, schema_type):
-    return value
+    if isinstance(schema_type, str):
+        schema_type = [schema_type]
+    normalized_types = {
+        _TYPE_ALIASES.get(key, key)
+        for t in schema_type for key in [t.strip().lower()]
+    }
+    type_priority = [
+        "null", "integer", "number", "boolean", "object", "array", "string",
+    ]
+    for candidate_type in type_priority:
+        if candidate_type not in normalized_types:
+            continue
+        if candidate_type == "null":
+            if value.lower() == "null":
+                return None
+            continue
+        if candidate_type == "string":
+            return value
+        if candidate_type == "integer":
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                continue
+        if candidate_type == "number":
+            try:
+                val = float(value)
+            except (ValueError, TypeError):
+                continue
+            if not math.isfinite(val):
+                continue
+            return val if val != int(val) else int(val)
+        if candidate_type == "boolean":
+            lower_val = value.lower().strip()
+            if lower_val in ("true", "1"):
+                return True
+            if lower_val in ("false", "0"):
+                return False
+            continue
+        if candidate_type in ("object", "array"):
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+            if _is_json_finite(parsed):
+                return parsed
+            continue
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return value
+    if not _is_json_finite(parsed):
+        return value
+    return parsed
 '''
 
 
@@ -228,6 +358,26 @@ class Req:
         self.tools = tools
         self.tool_choice = tool_choice
         self.messages = []
+
+
+# Minimal function-tool objects mirroring ChatCompletionToolsParam
+# (.function.name / .function.parameters) — the only fields the assembly's
+# find_tool_properties / find_tool_name read.
+class _Fn:
+    def __init__(self, name, parameters):
+        self.name = name
+        self.parameters = parameters
+
+
+class _Tool:
+    def __init__(self, name, parameters):
+        self.type = "function"
+        self.function = _Fn(name, parameters)
+
+
+def tool(name, properties):
+    """A function tool whose parameters carry the given typed `properties`."""
+    return _Tool(name, {"type": "object", "properties": properties})
 
 
 class MockTok:
@@ -517,6 +667,79 @@ def make_scenarios():
     # 26. inkling non-object args, char-by-char.
     scenarios.append(("inkling_nonobject_args_charwise", "inkling", True, True,
                       chars(INK_NONOBJ)))
+
+    # ── JSON-schema tool-argument type coercion (_fix_arg_types) ───────────
+    # These carry a request `tools` array whose function `parameters` declare
+    # typed params, so the assembly coerces the raw-string arguments to the
+    # declared JSON types (int/number/bool/string/array/null). Each scenario is
+    # a 6-tuple (…, tools). Without these tools the same streams emit the raw
+    # strings verbatim (the RED-first identity output the C++ gate proves fails).
+    TYPED_TOOL = [tool("get_weather", {
+        "days": {"type": "integer"},
+        "unit": {"type": "string"},
+        "active": {"type": "boolean"},
+        "temp": {"type": "number"},
+        "tags": {"type": "array", "items": {"type": "integer"}},
+    })]
+    # 27. qwen3 XML tool call with a typed schema, whole-delta. days "5"->5,
+    #     active "true"->true, temp "3.14"->3.14, unit stays "celsius" (string),
+    #     tags "[1, 2, 3]"->[1, 2, 3] (array).
+    scenarios.append(("qwen3_typed_schema_wholedelta", "qwen3", False, True, [
+        "<tool_call>\n<function=get_weather>\n",
+        "<parameter=days>5</parameter>\n",
+        "<parameter=unit>celsius</parameter>\n",
+        "<parameter=active>true</parameter>\n",
+        "<parameter=temp>3.14</parameter>\n",
+        "<parameter=tags>[1, 2, 3]</parameter>\n",
+        "</function>\n</tool_call>",
+    ], TYPED_TOOL))
+    # 28. same, char-by-char — exercises per-tick _fix_arg_types + the
+    #     _streamable_string_keys held-back streaming (only `unit` streams its
+    #     open string; the typed values are withheld until closed).
+    QWEN_TYPED_FULL = (
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=days>5</parameter>\n"
+        "<parameter=unit>celsius</parameter>\n"
+        "<parameter=active>true</parameter>\n"
+        "<parameter=temp>3.14</parameter>\n"
+        "<parameter=tags>[1, 2, 3]</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    scenarios.append(("qwen3_typed_schema_charwise", "qwen3", False, True,
+                      chars(QWEN_TYPED_FULL), TYPED_TOOL))
+    # 29. schema MISMATCH + nullable: `days` (integer) gets "abc" (uncoercible,
+    #     stays the string "abc"); `count` (["integer","null"]) gets "null"
+    #     (-> null); `n` (integer) gets "7" (-> 7). Proves a value that does not
+    #     match its type is left as-is exactly as vLLM, while siblings coerce.
+    MISMATCH_TOOL = [tool("configure", {
+        "days": {"type": "integer"},
+        "count": {"type": ["integer", "null"]},
+        "n": {"type": "integer"},
+    })]
+    scenarios.append(("qwen3_schema_mismatch_wholedelta", "qwen3", False, True, [
+        "<tool_call>\n<function=configure>\n",
+        "<parameter=days>abc</parameter>\n",
+        "<parameter=count>null</parameter>\n",
+        "<parameter=n>7</parameter>\n",
+        "</function>\n</tool_call>",
+    ], MISMATCH_TOOL))
+    # 30. kimi_k2 JSON-native args coerced in the one-shot extract path: the
+    #     model emits `"days": "5"` (string) which the schema coerces to int 5.
+    KIMI_TYPED = (
+        "<think>picking a tool</think>"
+        "<|tool_calls_section_begin|><|tool_call_begin|>"
+        "functions.get_weather:0<|tool_call_argument_begin|>"
+        '{"unit": "celsius", "days": "5"}'
+        "<|tool_call_end|><|tool_calls_section_end|>"
+    )
+    scenarios.append(("kimi_typed_schema_wholedelta", "kimi_k2", True, True, [
+        "<think>picking a tool</think>",
+        "<|tool_calls_section_begin|>",
+        "<|tool_call_begin|>functions.get_weather:0",
+        "<|tool_call_argument_begin|>",
+        '{"unit": "celsius", "days": "5"}',
+        "<|tool_call_end|><|tool_calls_section_end|>",
+    ], TYPED_TOOL))
     return scenarios
 
 
@@ -605,6 +828,19 @@ def emit_extract(info):
         "true" if info.tools_called else "false", opt(info.content), xtcs)
 
 
+def emit_tools(tools):
+    # GTool{name, parameters_json} — parameters_json is the raw JSON schema the
+    # C++ gate parses into ParserTool.parameters (empty string => no parameters).
+    if not tools:
+        return "{}"
+    items = []
+    for t in tools:
+        params = t.function.parameters
+        pj = "" if params is None else json.dumps(params)
+        items.append("GTool{%s, %s}" % (esc(t.function.name), esc(pj)))
+    return "{%s}" % ", ".join(items)
+
+
 def emit_parse(check, reasoning, content, tool_calls):
     # `parse()` returns (reasoning, content, tool_calls|None). The C++ parse()
     # tuple carries FunctionCall{name, arguments} (no id), so gate name+arguments.
@@ -635,11 +871,13 @@ def main():
         lines.append("// DO NOT EDIT — regenerate from the pinned oracle.")
         lines.append("static const std::vector<GScenario> kAssemblyGoldens = {")
 
-        for name, cfg, thinking, incl, deltas in make_scenarios():
+        for scen in make_scenarios():
+            name, cfg, thinking, incl, deltas = scen[:5]
+            tools = scen[5] if len(scen) > 5 else None
             tok = MockTok()
             # --- streaming pass ---
             parser = make_parser(pe_pkg, cfg, thinking, tok)
-            req = Req(include_reasoning=incl)
+            req = Req(include_reasoning=incl, tools=tools)
             stream_out = []
             for i, dt in enumerate(deltas):
                 finished = (i == len(deltas) - 1)
@@ -648,7 +886,8 @@ def main():
             # --- one-shot extract pass ---
             parser2 = make_parser(pe_pkg, cfg, thinking, tok)
             full = "".join(deltas)
-            info = parser2.extract_tool_calls(full, Req(include_reasoning=incl))
+            info = parser2.extract_tool_calls(
+                full, Req(include_reasoning=incl, tools=tools))
 
             # --- non-streaming parse() pass (gates the gemma4/inkling seams that
             #     the streaming/extract paths do not reach: inkling's
@@ -656,7 +895,7 @@ def main():
             #     configs; captured for all for a uniform golden record. ---
             parser3 = make_parser(pe_pkg, cfg, thinking, tok)
             p_reasoning, p_content, p_tools = parser3.parse(
-                full, Req(include_reasoning=incl))
+                full, Req(include_reasoning=incl, tools=tools))
             check_parse = cfg in ("gemma4", "inkling")
 
             deltas_cpp = ", ".join(esc(d) for d in deltas)
@@ -671,6 +910,7 @@ def main():
             lines.append("    %s," % emit_extract(info))
             lines.append("    %s," % emit_parse(
                 check_parse, p_reasoning, p_content, p_tools))
+            lines.append("    %s," % emit_tools(tools))
             lines.append("  },")
 
         lines.append("};")

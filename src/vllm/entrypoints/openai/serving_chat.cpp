@@ -223,7 +223,13 @@ vllm::parser::engine::ParserRequest ToParserRequest(
                                                     : std::string("auto");
   if (request.tools.has_value()) {
     for (const ChatCompletionToolsParam& t : *request.tools) {
-      pr.tools.push_back({t.function.name});
+      vllm::parser::engine::ParserTool pt;
+      pt.name = t.function.name;
+      // Carry the function's JSON-Schema parameters so the assembly can coerce
+      // argument values to their declared types (parser_engine.py _fix_arg_types /
+      // find_tool_properties). Absent parameters => no schema (identity path).
+      pt.parameters = t.function.parameters;
+      pr.tools.push_back(std::move(pt));
     }
   }
   pr.history_tool_call_cnt = 0;
