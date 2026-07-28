@@ -85,7 +85,15 @@ ranked in the oracle spec §6. This program does NOT add a new portfolio row —
 deepens `ROAD-V1-A`; the implementation rows (`KV-SGLANG-RADIX-CACHE`,
 `ENG-SGLANG-BEHAVIOR-FLAG`) remain owned by `CLAIM-SGLANG-RADIX-SCOPE`, and the
 residual perf-gate blocker stays `SERVE-ASYNC-LLM` (our comparable async server),
-not SGLang runnability.
+not SGLang runnability. **ENABLEMENT/DOCS side-quest 2026-07-28
+(`CLAIM-SGLANG-ABI-DOCS`, reconciled to ABI v10):** the SGLANG-DISTINCT opt-ins are
+now first-class, DOCUMENTED knobs exposed on the C++ API AND the C ABI (not
+env-var/internal-only) — LPM scheduling via the concurrent session's v9 **string**
+field `scheduling_policy="lpm"` + jump-forward (`enable_jump_forward`, ABI **v10**)
+joined the already-exposed RadixAttention/APC (v7) and custom logits processors
+(v8); user doc [docs/SGLANG-COMPAT.md](../docs/SGLANG-COMPAT.md) + spec
+[specs/sglang-enablement.md](specs/sglang-enablement.md). Default-inert (all-zero
+⇒ byte-identical); CPU exact-gate; `vllm_abi_version()`==10.
 
 **★ ACTIVE PHASE (user-directed 2026-07-20/21) — the BREADTH SWEEP.** With 27B/35B parity,
 the `KERNEL-FUSION-FRAMEWORK` extensibility cornerstone (W0-W4), and the FIRST additive model

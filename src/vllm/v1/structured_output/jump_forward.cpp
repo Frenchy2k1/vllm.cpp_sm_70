@@ -8,12 +8,19 @@
 
 namespace vllm::v1 {
 
-bool JumpForwardEnabled() {
+bool JumpForwardEnabled(std::optional<bool> configured) {
   const char* e = std::getenv("VT_ENABLE_JUMP_FORWARD");
-  if (e == nullptr) return false;
-  const std::string v(e);
-  return v == "1" || v == "true" || v == "TRUE" || v == "on";
+  if (e != nullptr) {
+    // Env override present: it decides, mirroring AsyncSchedulingEnabled's
+    // VT_ASYNC_SCHED convention ("1"/"true"/"TRUE"/"on" => on, else off).
+    const std::string v(e);
+    return v == "1" || v == "true" || v == "TRUE" || v == "on";
+  }
+  // No env override: the config/ABI field decides (default OFF when unset).
+  return configured.value_or(false);
 }
+
+bool JumpForwardEnabled() { return JumpForwardEnabled(std::nullopt); }
 
 int DrainForcedTokens(StructuredOutputGrammar& grammar,
                       const std::string& request_id, std::vector<int32_t>& out,

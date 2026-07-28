@@ -444,6 +444,19 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   named residual — so the flag stays off by default. The radix eviction-policy
   knob (SW4) stays a named/deferred opt-in. See
   `.agents/specs/sglang-radixattention.md`.
+- **SGLang-compatible knobs are now first-class, documented toggles** (2026-07-28,
+  `CLAIM-SGLANG-ABI-DOCS`, reconciled to ABI v10). LPM scheduling and jump-forward
+  are exposed on the C++ library API AND the C ABI (not env-var/internal-only),
+  joining the already-exposed prefix-caching/RadixAttention and
+  custom-logits-processor knobs. LPM is selected through the ABI v9 **string** field
+  `vllm_model_params.scheduling_policy` (`"fcfs"`/`"priority"`/`"lpm"`); jump-forward
+  through the new ABI **v10** tri-state field `vllm_model_params.enable_jump_forward`
+  (`0`=default/`1`=on/`2`=off). The server has `--scheduling-policy lpm` and
+  `--enable-jump-forward` / `--disable-jump-forward`. All default to today's
+  behavior — an all-zero config is byte-identical to before ABI v10, and
+  `vllm_abi_version()` returns 10. `VT_ENABLE_JUMP_FORWARD` is retained as an env
+  override (wins when set). The user-facing enablement guide for all four behaviors
+  is `docs/SGLANG-COMPAT.md` (engineering record: `.agents/specs/sglang-enablement.md`).
 - **KV persistence to disk / CPU offload** is built (CPU and disk tiers,
   identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the
   scheduler through an abstract `KVConnector` ABI selected by a

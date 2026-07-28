@@ -117,6 +117,12 @@ struct Args {
   // opt-in, output-neutral, resolves to fcfs when prefix caching is off).
   // --schedule-policy is accepted as an SGLang-compatible alias.
   std::string scheduling_policy = "fcfs";
+  // Jump-forward decoding (ENG-SGLANG-BEHAVIOR-FLAG SW3): tri-state, mirrors the
+  // C-ABI vllm_model_params.enable_jump_forward. Unset (default) => OFF unless
+  // VT_ENABLE_JUMP_FORWARD is set; --enable-jump-forward forces on,
+  // --disable-jump-forward forces off (the env var still overrides). The
+  // token-unique forced-run subset only; see .agents/specs/sglang-enablement.md.
+  std::optional<bool> enable_jump_forward = std::nullopt;
   // Tool-call / reasoning dialect selection (mirrors vLLM's --tool-call-parser
   // and --reasoning-parser). THE DEFAULTS ARE TODAY'S HARDCODED BEHAVIOUR:
   // "hermes" is exactly what OpenAIServingChat was constructed with before this
@@ -152,6 +158,7 @@ struct Args {
          "               [--[no-]enable-prefix-caching]\n"
          "               [--[no-]enable-radix-attention]\n"
          "               [--scheduling-policy fcfs|priority|lpm]\n"
+         "               [--[enable|disable]-jump-forward]\n"
          "               [--tool-call-parser <name>|auto|none]\n"
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"
@@ -224,6 +231,19 @@ Args ParseArgs(int argc, char** argv) {
       // --scheduling-policy is vLLM's flag; --schedule-policy is SGLang's name,
       // accepted as an alias. Both take fcfs|priority|lpm.
       a.scheduling_policy = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--enable-jump-forward" ||
+               flag == "--disable-jump-forward") {
+      // ENG-SGLANG-BEHAVIOR-FLAG SW3: opt into (or force off) jump-forward
+      // decoding — the token-unique grammar-speed subset (see
+      // .agents/specs/sglang-enablement.md). Absent => the default (OFF unless
+      // VT_ENABLE_JUMP_FORWARD is set). The env var, when set, still overrides.
+      if (a.enable_jump_forward.has_value()) {
+        std::cerr << "server: jump-forward flag "
+                     "(--[enable|disable]-jump-forward) specified more than "
+                     "once\n";
+        Usage(argv[0], 2);
+      }
+      a.enable_jump_forward = flag == "--enable-jump-forward";
     } else if (flag == "--tool-call-parser") {
       a.tool_call_parser = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--reasoning-parser") {
@@ -325,6 +345,10 @@ int main(int argc, char** argv) {
       std::cerr << "server: --scheduling-policy lpm has no effect with prefix "
                    "caching disabled; falling back to fcfs admission order\n";
     }
+    // ENG-SGLANG-BEHAVIOR-FLAG SW3: jump-forward decoding. Unset => the default
+    // (env-resolved, OFF); --[enable|disable]-jump-forward forces it, and
+    // VT_ENABLE_JUMP_FORWARD still overrides at resolution time.
+    engine_params.enable_jump_forward = args.enable_jump_forward;
     // --kv-transfer-config: the external KV connector, mirroring vLLM's own
     // flag and JSON shape. Absent (default) leaves the optional unset, which is
     // the inert no-connector path the server has always run. A malformed
