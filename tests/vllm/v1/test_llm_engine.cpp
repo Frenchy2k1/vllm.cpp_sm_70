@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <string>
@@ -425,6 +426,80 @@ TEST_CASE("llm_engine: greedy generate is deterministic and terminates at max_to
   REQUIRE(run2.outputs.size() == 1);
   CHECK(run1.outputs[0].token_ids == run2.outputs[0].token_ids);
   CHECK(run1.outputs[0].text == run2.outputs[0].text);
+}
+
+// ─── 1b. n>1 parallel sampling: deterministic fan-out into n outputs ─────────
+// SAMPLE-N (ROAD-V1-C7). A single request with n>1 is fanned out by the engine
+// into n child sequences that SHARE the prompt (llm_engine.py:280 ParentRequest),
+// each aggregated back into ONE RequestOutput carrying n CompletionOutputs
+// (parallel_sampling.py get_outputs / output_processor.py:326).
+//
+// The gate is deterministic-exact: vLLM FORBIDS n>1 under greedy sampling
+// (sampling_params.py::_verify_greedy_sampling), so the clean n>1 determinism
+// gate uses top_k=1 sampling — a LEGAL n>1 config whose sampling collapses to the
+// argmax, i.e. every child is token-identical to the single greedy result. RED
+// before the fan-out: an n>1 request returns exactly ONE output; GREEN after: n.
+TEST_CASE("llm_engine: n>1 fans out into n token-identical deterministic outputs") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const std::string prompt = "hello";
+  const int kTok = 6;    // tokens per sequence
+  const int kSeqs = 4;   // n
+
+  // A deterministic n==1 sampling config: top_k=1 collapses random sampling to
+  // the argmax. Seeded so seeded children take the seed+index clone path.
+  auto DeterministicN = [&](int n) {
+    SamplingParams sp;
+    sp.n = n;
+    sp.temperature = 1.0;  // random sampling path (legal for n>1)
+    sp.top_k = 1;          // only the argmax survives -> deterministic
+    sp.seed = 1234;        // seeded -> each child gets seed+index
+    sp.max_tokens = kTok;
+    sp.output_kind = RequestOutputKind::kFinalOnly;  // aggregate the n outputs
+    sp.PostInit();         // n>1 sampling is accepted (not greedy)
+    return sp;
+  };
+
+  // Reference sequences from FRESH stacks (each run gets clean KV/scheduler state).
+  std::vector<int32_t> greedy_ref;
+  {
+    Harness h(c, w, tok);
+    greedy_ref = h.engine.generate(prompt, Greedy(kTok), "g").outputs.at(0).token_ids;
+  }
+  std::vector<int32_t> topk1_ref;  // same sampler path as the children
+  {
+    Harness h(c, w, tok);
+    topk1_ref =
+        h.engine.generate(prompt, DeterministicN(1), "s").outputs.at(0).token_ids;
+  }
+  REQUIRE(static_cast<int>(greedy_ref.size()) == kTok);
+  REQUIRE(static_cast<int>(topk1_ref.size()) == kTok);
+
+  // n>1: one RequestOutput aggregating n child completions.
+  Harness h(c, w, tok);
+  RequestOutput r = h.engine.generate(prompt, DeterministicN(kSeqs), "par");
+
+  REQUIRE(r.finished);
+  CHECK(r.request_id == "par");                 // aggregated under the PARENT id
+  CHECK_FALSE(h.engine.has_unfinished_requests());
+  // RED before fan-out: this is 1. GREEN after: exactly n.
+  REQUIRE(static_cast<int>(r.outputs.size()) == kSeqs);
+
+  // Each of the n completions carries its own index 0..n-1 and is token-identical
+  // to the deterministic single-sequence result.
+  std::set<int> seen;
+  for (const vllm::CompletionOutput& o : r.outputs) {
+    seen.insert(o.index);
+    CHECK(static_cast<int>(o.token_ids.size()) == kTok);
+    CHECK(o.token_ids == topk1_ref);   // same sampler path => identical
+    CHECK(o.token_ids == greedy_ref);  // top_k=1 == greedy argmax
+    REQUIRE(o.finish_reason.has_value());
+    CHECK(*o.finish_reason == "length");
+  }
+  for (int i = 0; i < kSeqs; ++i) {
+    CHECK_MESSAGE(seen.count(i) == 1, "missing completion index " << i);
+  }
 }
 
 // ─── 2. Two-request concurrent batch ─────────────────────────────────────────

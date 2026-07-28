@@ -28391,3 +28391,26 @@ summary recompute, `sglang-matrix.md` `SGLANG-SAMPLING-CUSTOM`, `feature-matrix.
 `roadmap_v1.md` C7, `specs/sampling-controls-c7.md`, `docs/STATUS.md`,
 `docs/BENCHMARKS.md`, ledger, coordination `CLAIM-C7-CUSTOM-LOGITS`, this entry.
 All record checkers rc=0. NOT pushed; FULL SHA reported to caller.
+- **2026-07-28** — **Parallel sampling `n>1` (`SAMPLE-N`) LANDED + CPU-GATED
+  (`CLAIM-C7-N-SAMPLING`, NOT pushed).** The OpenAI `n` parameter now EXECUTES:
+  a request with `n>1` fans out (`LLMEngine::FanOutParallelSampling`) into n
+  prompt-sharing child sequences aggregated back into one `RequestOutput` / n
+  indexed OpenAI `choices` by a NEW `ParentRequest` (`parallel_sampling.{h,cpp}`)
+  threaded through `RequestState.parent_req` + the `make_request_output`
+  aggregation branch + `parent_requests_` cleanup. Mirrors vLLM
+  `parallel_sampling.py` + `llm_engine.py:270-293` + `output_processor.py:323-331`.
+  **`n==1` (default) byte-identical** — never constructs a `ParentRequest`. Gate is
+  exact CPU, RED-first: `test_llm_engine` NEW n>1 case (before fan-out an n>1
+  request returns ONE output, `REQUIRE(1 == 4)`; after: n outputs, each index
+  0..n-1 token-identical to BOTH top_k=1 and greedy — vLLM forbids greedy n>1, so
+  the determinism gate uses `top_k=1`), `test_openai_serving` NEW n>1 (n indexed
+  deterministic choices). Inertness: `test_llm_engine` 8/8, `test_output_processor`
+  64, `test_scheduler` 423, `test_engine_core` 44, `test_async_llm` 309,
+  `test_input_processor` 37 UNCHANGED. Clean full-library CPU `-Werror` 0-warn;
+  ENGINE row count 120→121. Records: `engine-matrix.md` NEW `SAMPLE-N` row + Total/
+  Sampling rollup + `check-agent-record.py` ENGINE 120→121, `feature-matrix.md` §6,
+  `roadmap_v1.md` C7, `specs/sampling-controls-c7.md` (`SAMPLE-N` section),
+  `docs/STATUS.md`, `docs/BENCHMARKS.md` (NOT-APPLICABLE), ledger, coordination
+  `CLAIM-C7-N-SAMPLING`, this entry. All record checkers rc=0. **Residuals (named):**
+  `best_of`/beam, async-streaming per-child collation, C-ABI `n` field. NOT pushed;
+  FULL SHA reported to caller.

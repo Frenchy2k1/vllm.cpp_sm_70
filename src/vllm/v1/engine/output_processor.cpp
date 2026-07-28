@@ -122,7 +122,8 @@ RequestState RequestState::FromNewRequest(const tok::Tokenizer* tokenizer,
                                           const EngineCoreRequest& request,
                                           std::optional<std::string> prompt,
                                           int request_index,
-                                          int stream_interval) {
+                                          int stream_interval,
+                                          std::shared_ptr<ParentRequest> parent_req) {
   // output_processor.py:222-234 (the sampling_params branch; pooling deferred).
   const SamplingParams& sp = request.sampling_params;
   // :223 if not sampling_params.detokenize: tokenizer = None
@@ -144,6 +145,9 @@ RequestState RequestState::FromNewRequest(const tok::Tokenizer* tokenizer,
   // external_req_id == request_id at T0 (see header).
   state.external_req_id = request.request_id;
   state.request_index = request_index;
+  // parent_req (output_processor.py:225): null for a single-sequence request; the
+  // shared parent for a child of an n>1 parallel-sampling fan-out.
+  state.parent_req = std::move(parent_req);
   state.output_kind = sp.output_kind;
   state.prompt = std::move(prompt);
   state.prompt_token_ids = request.prompt_token_ids;
@@ -206,11 +210,30 @@ std::optional<RequestOutput> RequestState::make_request_output(
   CompletionOutput output =
       NewCompletionOutput(std::move(token_ids), finish_reason, std::move(stop_reason));
 
-  // parent_req is None at T0 (:321) -> outputs = [output].
+  // output_processor.py:319-331. Without a parent (single sequence): outputs =
+  // [output], keyed by this request's external id. With a parent (n>1 child):
+  // route the child output through ParentRequest::get_outputs — it either passes
+  // the child output through (streaming) or aggregates the n final outputs, and
+  // reports whether the whole parallel-sampling request is now finished. An empty
+  // aggregation (children still pending under FINAL_ONLY) suppresses this step's
+  // RequestOutput (return nullopt).
   std::vector<CompletionOutput> outputs;
-  outputs.push_back(std::move(output));
+  std::string out_external_req_id = external_req_id;
+  bool out_finished = finished;
+  if (parent_req == nullptr) {
+    outputs.push_back(std::move(output));
+  } else {
+    std::pair<std::vector<CompletionOutput>, bool> aggregated =
+        parent_req->get_outputs(request_id, std::move(output));
+    if (aggregated.first.empty()) {
+      return std::nullopt;
+    }
+    outputs = std::move(aggregated.first);
+    out_finished = aggregated.second;
+    out_external_req_id = parent_req->external_req_id();
+  }
 
-  return NewRequestOutput(external_req_id, std::move(outputs), finished);
+  return NewRequestOutput(out_external_req_id, std::move(outputs), out_finished);
 }
 
 RequestOutput RequestState::NewRequestOutput(
@@ -288,9 +311,10 @@ OutputProcessor::OutputProcessor(const tok::Tokenizer* tokenizer,
 void OutputProcessor::add_request(const EngineCoreRequest& request,
                                   std::optional<std::string> prompt,
                                   int request_index,
-                                  std::shared_ptr<RequestOutputCollector> queue) {
-  // output_processor.py:512-541 (T0: no parent_req; the streaming-input
-  // re-entry — a request_id already present — is deferred).
+                                  std::shared_ptr<RequestOutputCollector> queue,
+                                  std::shared_ptr<ParentRequest> parent_req) {
+  // output_processor.py:512-541 (T0: the streaming-input re-entry — a request_id
+  // already present — is deferred).
   const std::string& request_id = request.request_id;
   if (request_states_.find(request_id) != request_states_.end()) {
     // Upstream routes this case only through the explicitly resumable
@@ -299,8 +323,16 @@ void OutputProcessor::add_request(const EngineCoreRequest& request,
     throw std::invalid_argument("duplicate live request id: " + request_id);
   }
 
+  // :547-548 Track the parent (n>1 parallel sampling) so it outlives its children
+  // and can be cleared once the last child finishes (FinishRequest). Stored once
+  // per parent; each child's RequestState below references the same instance.
+  if (parent_req != nullptr) {
+    parent_requests_[parent_req->request_id()] = parent_req;
+  }
+
   RequestState state = RequestState::FromNewRequest(
-      tokenizer_, request, std::move(prompt), request_index, stream_interval_);
+      tokenizer_, request, std::move(prompt), request_index, stream_interval_,
+      std::move(parent_req));
   state.queue = std::move(queue);
   const std::string external_req_id = state.external_req_id;
   request_states_[request_id] =
@@ -532,7 +564,12 @@ void OutputProcessor::FinishRequest(RequestState& req_state) {
     }
   }
 
-  // parent_req cleanup deferred (no parallel sampling at T0).
+  // output_processor.py:720-722: once a parallel-sampling parent has no child
+  // left in flight, drop it from parent_requests_ (its aggregation is done).
+  if (req_state.parent_req != nullptr && !req_state.parent_req->has_children()) {
+    parent_requests_.erase(req_state.parent_req->request_id());
+  }
+
   request_states_.erase(req_id);  // destroys req_state — must be last.
 }
 

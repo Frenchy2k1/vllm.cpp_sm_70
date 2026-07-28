@@ -177,3 +177,51 @@ request's logits.
   output-token view the callback sees is fed back by the scheduler (may lag) — the
   strict per-step token-ids contract is gated deterministically at the sampler
   level, not through the async engine.
+
+## `SAMPLE-N` — parallel sampling / `n>1` fan-out (ACTIVE, `CLAIM-C7-N-SAMPLING`)
+
+Closes the C7 `SAMPLE-N` inventory row: the OpenAI `n` sampling parameter
+(multiple output sequences per request), previously `n==1`-only.
+
+- Upstream chain: a request with `n>1` is expanded by the frontend into n CHILD
+  requests that SHARE the prompt (and its prefill KV) — `ParentRequest`
+  (`vllm/v1/engine/parallel_sampling.py:13`) hands out child ids
+  `"{index}_{parent}"` + n==1 child sampling params (seeded children get
+  `seed+index`, `:52-81`), the `LLMEngine` fans out
+  (`vllm/v1/engine/llm_engine.py:270-293`; `n==1` returns before the fan-out), and
+  the `OutputProcessor` aggregates the n child `CompletionOutput`s back into one
+  `RequestOutput` via `parent_req.get_outputs`
+  (`vllm/v1/engine/output_processor.py:323-331`), popping the parent once its last
+  child finishes (`:720-722`). The offline driver sets `output_kind = FINAL_ONLY`
+  (`vllm/entrypoints/offline_utils.py:561`), the aggregation mode.
+- Our port: `vllm::v1::ParentRequest`
+  (`include/vllm/v1/engine/parallel_sampling.h` + `.cpp`) mirrors
+  `get_child_info`/`_get_child_sampling_params`/`get_outputs` 1:1;
+  `LLMEngine::FanOutParallelSampling` (`src/vllm/v1/engine/llm_engine.cpp`) is the
+  n>1 branch of both `add_request` overloads (n==1 falls through untouched);
+  `RequestState.parent_req` + the `make_request_output` aggregation branch +
+  `parent_requests_` cleanup (`src/vllm/v1/engine/output_processor.cpp`); the
+  OpenAI layer already builds one indexed `choice` per `CompletionOutput`
+  (`src/vllm/entrypoints/openai/serving_completion.cpp`), and `n` already rode on
+  `SamplingParams` (`include/vllm/sampling_params.h:128`) + `to_sampling_params`
+  (`src/vllm/entrypoints/openai/protocol.cpp:398,433`).
+- Determinism gate design: vLLM FORBIDS `n>1` under greedy sampling
+  (`vllm/sampling_params.py:625` `_verify_greedy_sampling`, which we mirror in
+  `SamplingParams::VerifyGreedySampling`). So the clean exact n>1 gate uses
+  `top_k=1` sampling — a LEGAL n>1 config whose sampling collapses to the argmax,
+  i.e. every child is token-identical to the single greedy result.
+- Gates: `tests/vllm/v1/test_llm_engine.cpp` ("n>1 fans out into n token-identical
+  deterministic outputs" — RED-first: before the fan-out an n>1 request returns
+  exactly ONE output (`REQUIRE(1 == 4)`); GREEN after: n outputs, each index 0..n-1
+  token-identical to BOTH the top_k=1 and the greedy single-sequence result; the
+  other 7 `test_llm_engine` cases + `test_output_processor` prove n==1 inertness);
+  `tests/vllm/entrypoints/openai/test_serving.cpp` ("n>1 returns n indexed
+  deterministic choices" — n choices, index fields 0..n-1, identical text, usage
+  counts all n).
+- RESIDUALS (honest, named): `best_of` (`SAMPLE-BEAM` / `SERVE-COMPLETION-LONGTAIL`)
+  and beam search stay INVENTORIED; the async-streaming per-child collation through
+  `RequestOutputCollector::Merge` is structurally present but the AsyncLLM n>1 wiring
+  path is not gated (sync + non-streaming OpenAI paths are); the C-ABI carries no
+  `n` field (needs an ABI bump + a multi-output return shape) so C-ABI requests stay
+  `n==1`. Prompt tokens are shared; prefill-KV sharing rides on the existing
+  block-hash APC (no dedicated n>1 KV-share optimization added).

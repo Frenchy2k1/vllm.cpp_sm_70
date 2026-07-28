@@ -7,6 +7,7 @@
 #include <optional>
 #include <utility>
 
+#include "vllm/v1/engine/parallel_sampling.h"
 #include "vllm/v1/engine/types.h"
 #include "vllm/v1/metrics/loggers.h"
 #include "vllm/v1/metrics/stats.h"
@@ -30,6 +31,16 @@ std::string LLMEngine::add_request(const std::string& request_id,
       request_id, prompt, std::move(params), /*arrival_time=*/std::nullopt,
       priority);
   const std::string req_id = request.request_id;
+
+  // llm_engine.py:278-293 parallel-sampling fan-out. n==1 falls through to the
+  // original single-sequence path below (byte-identical); n>1 expands into n
+  // child requests that SHARE the prompt tokens (and its prefill KV via prefix
+  // caching), each with its own decode state + RNG offset, aggregated back into
+  // one RequestOutput by the OutputProcessor's ParentRequest.
+  if (request.sampling_params.n > 1) {
+    FanOutParallelSampling(request, prompt);
+    return req_id;
+  }
 
   // llm_engine.py:274 self.output_processor.add_request(request, prompt_text,
   // None, 0) — BEFORE engine_core.add_request. Register the RequestState (with
@@ -57,6 +68,13 @@ std::string LLMEngine::add_request(const std::string& request_id,
       /*arrival_time=*/std::nullopt, priority);
   const std::string req_id = request.request_id;
 
+  // Parallel-sampling fan-out (see the string overload). n==1 keeps the original
+  // single-sequence path byte-identical.
+  if (request.sampling_params.n > 1) {
+    FanOutParallelSampling(request, /*prompt=*/std::nullopt);
+    return req_id;
+  }
+
   output_processor_.add_request(request, /*prompt=*/std::nullopt,
                                 /*request_index=*/0);
 
@@ -64,6 +82,31 @@ std::string LLMEngine::add_request(const std::string& request_id,
       Request::FromEngineCoreRequest(request, block_hasher_));
   engine_core_.add_request(std::move(req));
   return req_id;
+}
+
+void LLMEngine::FanOutParallelSampling(const EngineCoreRequest& request,
+                                       std::optional<std::string> prompt) {
+  // llm_engine.py:280-291. Build the shared ParentRequest, then register n child
+  // requests: each child gets id "{idx}_{parent}", n==1 sampling params (seeded
+  // children get seed+idx), the SAME prompt tokens, and the shared parent so the
+  // OutputProcessor aggregates the n child CompletionOutputs into one
+  // RequestOutput. Output-processor add BEFORE engine-core add, mirroring the
+  // single-sequence order (:274-276).
+  auto parent = std::make_shared<ParentRequest>(request);
+  const int n = request.sampling_params.n;
+  for (int idx = 0; idx < n; ++idx) {
+    std::pair<std::string, SamplingParams> child_info =
+        parent->get_child_info(idx);
+    EngineCoreRequest child = request;  // copy — shares the prompt token ids
+    child.request_id = child_info.first;
+    child.sampling_params = std::move(child_info.second);
+
+    output_processor_.add_request(child, prompt, /*request_index=*/idx,
+                                  /*queue=*/nullptr, parent);
+    auto child_req = std::make_unique<Request>(
+        Request::FromEngineCoreRequest(child, block_hasher_));
+    engine_core_.add_request(std::move(child_req));
+  }
 }
 
 std::vector<RequestOutput> LLMEngine::step() {
