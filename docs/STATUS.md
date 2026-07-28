@@ -220,10 +220,24 @@ activation clamps (not the no-ops the port-map assumed), now implemented. So Gem
 multimodal image is blocked only on the remaining engine wiring: the C++ Gemma-4
 NaFlex image processor + the mm merge-plumbing (register SupportsMultiModal, the
 masked-scatter merge of the 256 projected soft tokens at the image placeholder rows,
-the tower→merge→decode fork) for the image→text e2e, plus the USM-Conformer audio
-tower; the Gemma-4 MoE / k_eq_v / double-MLP backbone stays the larger-variant
-follow-on. Audio, the genuinely-new
-modality, is staged first on the smallest oracle-runnable audio model (Whisper,
+the tower→merge→decode fork) for the image→text e2e. **The USM-Conformer AUDIO
+tower is now IMPLEMENTED too** (G3, 2026-07-28): the additive
+`gemma4_audio.{h,cpp}` forward (`Gemma4AudioModel` + the audio projector) PASSES all
+seven per-stage gates f32-exact vs the transformers-eager reference (host f32,
+1256/1256: subsample rel-L2 5.4e-7, position-embeddings 8.9e-8, block0 4.2e-7,
+block_mid 3.8e-7, block_last 4.4e-6, output_proj 5.9e-6, projected 6.3e-6), ported
+1:1 from `modeling_gemma4.py` — a 2×Conv2d subsample, a relative positional
+encoding, and 12 Conformer layers (half-step feed-forwards, a chunked-local
+attention with Transformer-XL relative-position bias + a tanh soft-cap +
+per-dim-scale softplus, and a GLU + depthwise-causal-conv light-conv module), then
+`output_proj` and the audio embedder; the FINITE QAT clamps and the exact sliding
+window (`dist ∈ [0,12)` — a RED-first-caught off-by-one) are grounded in the source.
+So Gemma-4 now has all three modalities tower-proven (text STRICT 32/32, vision and
+audio per-stage), and the remaining audio work is the same engine wiring as image —
+the Gemma-4 audio feature extractor (mel frontend) + the mm merge-plumbing — plus
+a device-resident bf16 forward for speed. The Gemma-4 MoE / k_eq_v / double-MLP
+backbone stays the larger-variant follow-on. Audio as a standalone modality is also
+proven end-to-end on the smallest oracle-runnable audio models (Whisper encoder,
 then Voxtral-Mini-3B on the already-landed Mistral backbone).
 
 ### OLMo
