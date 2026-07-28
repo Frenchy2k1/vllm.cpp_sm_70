@@ -300,6 +300,12 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
   // Invariant == false): min_tokens then logit_bias.
   apply_min_tokens(q, logits, sm.min_tokens, sm.output_token_ids);
   apply_logit_bias(q, logits, sm.logit_bias);
+  // Custom host logits processors (ROAD-V1-C7 `custom_logit_processor`). Run at
+  // the END of the non-argmax-invariant stage — after the builtin min_tokens /
+  // logit_bias, before penalties — mirroring vLLM's ordering (builtins precede
+  // custom procs in the non_argmax_invariant list; sampler.py:399). Absent =>
+  // no-op (byte-identical default).
+  apply_logits_processors(q, logits, sm.logits_processors, sm.output_token_ids);
   // Penalties (repetition, frequency, presence).
   if (!sm.no_penalties) {
     VT_CHECK(sm.prompt_token_ids.has_value(),

@@ -378,6 +378,97 @@ TEST_CASE("capi: two greedy completions of the same prompt are identical") {
   vllm_engine_free(eng);
 }
 
+// ─── (b2) ABI v8 custom logits processor: forces a token end-to-end ──────────
+namespace {
+// Force-a-token processor: state carried through vllm_logits_processor_user_data.
+struct CApiForceState {
+  int32_t forced = 0;         // the token id to force every decode step.
+  int calls = 0;              // number of callback invocations.
+  int32_t last_vocab = 0;     // vocab_size seen (all rows share the model vocab).
+  int max_n_tokens = -1;      // largest n_token_ids observed.
+  bool all_prev_forced = true;  // every observed prior token == forced.
+  bool tokens_ptr_ok = true;  // token_ids non-null whenever n_token_ids > 0.
+};
+
+// Matches vllm_logits_processor exactly. Forces greedy argmax to `forced` and
+// records the arity/contract the sampler handed it.
+void CApiForceCb(const int32_t* token_ids, int32_t n_token_ids, float* logits,
+                 int32_t vocab_size, void* user_data) {
+  auto* s = static_cast<CApiForceState*>(user_data);
+  s->calls += 1;
+  s->last_vocab = vocab_size;
+  if (n_token_ids > s->max_n_tokens) s->max_n_tokens = n_token_ids;
+  if (n_token_ids > 0 && token_ids == nullptr) s->tokens_ptr_ok = false;
+  for (int32_t i = 0; i < n_token_ids; ++i)
+    if (token_ids[i] != s->forced) s->all_prev_forced = false;
+  for (int32_t j = 0; j < vocab_size; ++j) logits[j] = -1e30f;
+  if (s->forced >= 0 && s->forced < vocab_size) logits[s->forced] = 1e30f;
+}
+}  // namespace
+
+TEST_CASE("capi: custom logits processor forces the generated token (ABI v8)") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+
+  const int32_t kMax = 6;
+
+  // Baseline greedy (no processor) — the byte-identical default path.
+  vllm_sampling_params base = GreedyParams(kMax);
+  CHECK(base.logits_processor == nullptr);  // default is unset
+  vllm_completion baseline;
+  REQUIRE(vllm_complete(eng, "hello", &base, &baseline) == VLLM_OK);
+  REQUIRE(baseline.text != nullptr);
+  const std::string baseline_text = baseline.text;
+
+  // Force token id 5 every step. vocab is 0..23, all decodable.
+  CApiForceState st;
+  st.forced = 5;
+  vllm_sampling_params sp = GreedyParams(kMax);
+  sp.logits_processor = &CApiForceCb;
+  sp.logits_processor_user_data = &st;
+  vllm_completion forced;
+  REQUIRE(vllm_complete(eng, "hello", &sp, &forced) == VLLM_OK);
+  REQUIRE(forced.text != nullptr);
+
+  // (a) The callback fired ONCE PER DECODE STEP with the correct arity.
+  CHECK(st.calls == forced.completion_tokens);  // one call per generated token
+  CHECK(st.calls == kMax);
+  CHECK(st.last_vocab == kVocab);               // full model vocab exposed
+  CHECK(st.tokens_ptr_ok);                      // ptr non-null whenever len > 0
+  CHECK(st.max_n_tokens >= 0);                  // well-formed token_ids view
+  // Every prior token the callback observed was the forced one (vacuously true
+  // when the async engine has not yet fed back output tokens; see residual note).
+  CHECK(st.all_prev_forced);
+  // RESIDUAL (async scheduling): under the async scheduler the generated
+  // output-token bookkeeping is fed back by the scheduler's update_from_output
+  // (exactly like penalties / min_tokens / bad_words on the async path), so the
+  // token_ids view a callback sees end-to-end can lag the emitted tokens. The
+  // STRICT per-step token_ids contract (n_token_ids == the generated prefix, the
+  // ptr valid) is gated deterministically at the sampler level in
+  // tests/vllm/v1/sample/test_sampler.cpp ("custom logits processor forces the
+  // greedy token exactly", which passes output_token_ids and asserts n == 2).
+
+  // (b) RED-first: forcing changed the output vs the untouched greedy baseline.
+  CHECK(std::string(forced.text) != baseline_text);
+
+  // Determinism: forcing a DIFFERENT token yields a DIFFERENT output.
+  CApiForceState st2;
+  st2.forced = 9;
+  vllm_sampling_params sp2 = GreedyParams(kMax);
+  sp2.logits_processor = &CApiForceCb;
+  sp2.logits_processor_user_data = &st2;
+  vllm_completion forced2;
+  REQUIRE(vllm_complete(eng, "hello", &sp2, &forced2) == VLLM_OK);
+  REQUIRE(forced2.text != nullptr);
+  CHECK(std::string(forced2.text) != std::string(forced.text));
+  CHECK(st2.all_prev_forced);
+
+  vllm_completion_free(&baseline);
+  vllm_completion_free(&forced);
+  vllm_completion_free(&forced2);
+  vllm_engine_free(eng);
+}
+
 // ─── (c) error path: bad model path -> status + last_error, no crash ─────────
 TEST_CASE("capi: vllm_engine_load with a bad path returns an error and sets last_error") {
   vllm_model_params mp = vllm_model_params_default();

@@ -261,6 +261,10 @@ class InputBatch {
   std::map<int, MinTokensState> min_tokens;
   // req_index -> (token_id -> additive bias) (LogitBiasLogitsProcessor).
   std::map<int, std::map<int32_t, float>> logit_bias;
+  // req_index -> custom host logits-processor callback (ROAD-V1-C7
+  // `custom_logit_processor`). Only present for a request that registered one;
+  // make_sampling_metadata emits it as SamplingMetadata.logits_processors.
+  std::map<int, LogitsProcessorCallback> logits_processors;
   // req_id -> requested sample-logprob count (gpu_input_batch.py:435-440); the
   // -1 "all" sentinel is preserved (our Sampler consumes it directly, whereas
   // upstream stores vocab_size — recorded deviation).

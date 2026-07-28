@@ -44,6 +44,8 @@
 #include <string>
 #include <vector>
 
+#include "vllm/logits_processor_callback.h"
+
 namespace vllm {
 
 // sampling_params._SAMPLING_EPS: below this temperature, sampling is greedy.
@@ -200,6 +202,16 @@ struct SamplingParams {
   // from stop_token_ids (sampling_params.py:500); the engine adds eos ids via
   // InputProcessor::UpdateFromGenerationConfig.
   std::set<int32_t> all_stop_token_ids;
+
+  // Custom logits processor (ROAD-V1-C7 `custom_logit_processor`). A single host
+  // callback invoked per decode step, before sampling, to modify THIS request's
+  // logits (see logits_processor_callback.h). Recorded deviation: vLLM carries a
+  // `logits_processors` plugin list (sampling_params.py) and SGLang a per-request
+  // Python callable (custom_logit_processor.py:24); we carry one C-ABI function
+  // pointer + user_data (the C ABI's `vllm_logits_processor`). fn == nullptr (the
+  // default) => no processor, the byte-identical sampler path. Not validated by
+  // Verify() (an opaque host callback has no upstream validation analogue).
+  LogitsProcessorCallback logits_processor;
 
   // The model's EOS token id. Upstream: `_eos_token_id` — a non-init field set
   // engine-side by update_from_generation_config, exposed via the read-only

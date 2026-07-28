@@ -2,8 +2,10 @@
 #include "vllm/v1/sample/logits_processor/builtin.h"
 
 #include <cstddef>
+#include <vector>
 
 #include "vllm/v1/sample/device_scratch.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -68,6 +70,57 @@ void apply_min_p(vt::Queue& q, vt::Tensor& logits, const std::vector<float>& min
   VT_CHECK(static_cast<int64_t>(min_p.size()) == n, "apply_min_p: min_p must have num_reqs rows");
   DeviceScratch mp(logits.device, q, min_p.data(), vt::DType::kF32, {n});
   vt::ApplyMinP(q, logits, mp.tensor());
+}
+
+void apply_logits_processors(
+    vt::Queue& q, vt::Tensor& logits,
+    const std::map<int, LogitsProcessorCallback>& procs,
+    const std::vector<std::vector<int32_t>>& output_token_ids) {
+  if (procs.empty()) return;
+  VT_CHECK(logits.rank == 2, "apply_logits_processors: logits must be [num_reqs, vocab]");
+  const int64_t n = logits.shape[0];
+  const int64_t vocab = logits.shape[1];
+
+  vt::Backend& b = vt::GetBackend(logits.device.type);
+  // The callbacks read+mutate the logits on the HOST, so any prior async op that
+  // produced/mutated the logits must complete first (a no-op on the synchronous
+  // CPU backend; a real sync on CUDA).
+  b.Synchronize(q);
+
+  // Obtain a host-addressable view of the [n, vocab] logits. On a unified-memory
+  // backend (CPU / GB10) `logits.data` IS host memory; on a discrete backend we
+  // stage down, run the callbacks, then copy the edited logits back.
+  const bool unified = b.UnifiedMemory();
+  const size_t total = static_cast<size_t>(n) * static_cast<size_t>(vocab);
+  std::vector<float> staging;
+  float* host = nullptr;
+  if (unified) {
+    host = static_cast<float*>(logits.data);
+  } else {
+    staging.resize(total);
+    if (total != 0) b.Copy(q, staging.data(), logits.data, total * sizeof(float));
+    b.Synchronize(q);
+    host = staging.data();
+  }
+
+  static const std::vector<int32_t> kNoTokens;
+  for (const auto& [i, cb] : procs) {
+    if (cb.fn == nullptr) continue;
+    VT_CHECK(i >= 0 && static_cast<int64_t>(i) < n,
+             "apply_logits_processors: request index out of range");
+    const std::vector<int32_t>& toks =
+        (static_cast<size_t>(i) < output_token_ids.size())
+            ? output_token_ids[static_cast<size_t>(i)]
+            : kNoTokens;
+    float* row = host + static_cast<size_t>(i) * static_cast<size_t>(vocab);
+    cb.fn(toks.data(), static_cast<int32_t>(toks.size()), row,
+          static_cast<int32_t>(vocab), cb.user_data);
+  }
+
+  if (!unified) {
+    if (total != 0) b.Copy(q, logits.data, staging.data(), total * sizeof(float));
+    b.Synchronize(q);
+  }
 }
 
 }  // namespace vllm::v1

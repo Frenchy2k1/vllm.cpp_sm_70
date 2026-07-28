@@ -29,6 +29,8 @@
 #include <set>
 #include <vector>
 
+#include "vllm/logits_processor_callback.h"
+
 namespace vllm::v1 {
 
 // Per-request min-tokens state (the flattened MinTokensLogitsProcessor input,
@@ -88,6 +90,15 @@ struct SamplingMetadata {
   std::map<int, std::map<int32_t, float>> logit_bias;
   // [num_reqs] min-p thresholds (MinPLogitsProcessor); 0 disables per row.
   std::vector<float> min_p;
+
+  // req_index -> custom host logits-processor callback (ROAD-V1-C7
+  // `custom_logit_processor`). Empty => none (the byte-identical default). Each
+  // callback is invoked once per decode step, in the sampler's non-argmax-
+  // invariant logits-processor stage (after min_tokens / logit_bias, before
+  // penalties — mirroring vLLM's custom-logitsproc application order,
+  // sampler.py:399), over this request's mutable logits row. Requests with no
+  // registered processor are absent from the map. See logits_processor_callback.h.
+  std::map<int, LogitsProcessorCallback> logits_processors;
 
   // ─── STUBS (marked; defaulted empty/None at T0) ────────────────────────────
   // Upstream `logitsprocs: LogitsProcessors` plugin graph — NOT ported (the

@@ -201,6 +201,12 @@ vllm::SamplingParams ToSamplingParams(const vllm_sampling_params& c,
     if (c.structured_json_object != 0) so.json_object = true;
     sp.structured_outputs = std::move(so);
   }
+  // Custom logits processor (ABI v8): carry the host callback + user_data onto
+  // the SamplingParams. NULL fn => no processor (byte-identical default).
+  if (c.logits_processor != nullptr) {
+    sp.logits_processor.fn = c.logits_processor;
+    sp.logits_processor.user_data = c.logits_processor_user_data;
+  }
   sp.output_kind = output_kind;
   sp.PostInit();
   return sp;
@@ -439,6 +445,8 @@ VLLM_API vllm_sampling_params vllm_sampling_params_default(void) {
   p.n_structured_choice = 0;
   p.structured_grammar = nullptr;
   p.structured_json_object = 0;
+  p.logits_processor = nullptr;
+  p.logits_processor_user_data = nullptr;
   return p;
 }
 

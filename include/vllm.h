@@ -59,8 +59,13 @@ extern "C" {
  * speculation (the byte-identical default).
  * v7: vllm_model_params.enable_prefix_caching — tri-state APC toggle
  * (0=model default, 1=on, 2=off). The server's --enable-radix-attention is a
- * documented alias for the ON state (RadixAttention is fused into our APC). */
-#define VLLM_ABI_VERSION 7
+ * documented alias for the ON state (RadixAttention is fused into our APC).
+ * v8: vllm_sampling_params.logits_processor / logits_processor_user_data — a
+ * per-request custom logits-processor callback (vllm_logits_processor) invoked
+ * each decode step to modify the request's logits before sampling. Mirrors
+ * vLLM's SamplingParams.logits_processors and SGLang's CustomLogitProcessor.
+ * NULL => no processor (the byte-identical default). */
+#define VLLM_ABI_VERSION 8
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -161,6 +166,27 @@ typedef struct vllm_model_params {
   int32_t enable_prefix_caching;
 } vllm_model_params;
 
+/* ── Custom logits processor (ABI v8) ─────────────────────────────────────────
+ * A host callback the sampler invokes ONCE PER DECODE STEP for the request,
+ * BEFORE sampling, to inspect the tokens generated so far and modify the logits.
+ * It runs at vLLM's non-argmax-invariant logits-processor stage — after
+ * allowed_token_ids / bad_words / min_tokens / logit_bias, before penalties —
+ * mirroring SamplingParams.logits_processors (and satisfying SGLang's
+ * custom_logit_processor capability with the same callback).
+ *   - token_ids / n_token_ids: the request's generated output token ids so far
+ *     (n_token_ids == 0 on the first decode step). BORROWED — valid only for the
+ *     duration of the call; copy them if you need to retain them.
+ *   - logits / vocab_size: a MUTABLE view of THIS request's logits row, a
+ *     contiguous float[vocab_size]. Edit it in place (add a bias, mask tokens to
+ *     -inf, force a token to +inf, ...); the edited row is what the sampler then
+ *     samples from. Greedy decoding takes the argmax of the edited row.
+ *   - user_data: the opaque pointer registered in
+ *     vllm_sampling_params.logits_processor_user_data, round-tripped unchanged.
+ * The callback is C code and MUST NOT throw across the ABI boundary. */
+typedef void (*vllm_logits_processor)(const int32_t* token_ids,
+                                      int32_t n_token_ids, float* logits,
+                                      int32_t vocab_size, void* user_data);
+
 /* ── Sampling parameters ──────────────────────────────────────────────────────
  * POD mirror of the T0 fields of vllm::SamplingParams. Populate with
  * vllm_sampling_params_default() then override; a zero-initialized struct is NOT
@@ -204,6 +230,14 @@ typedef struct vllm_sampling_params {
   int32_t n_structured_choice;          /* entries in structured_choice. */
   const char* structured_grammar;       /* GBNF grammar, or NULL. */
   int32_t structured_json_object;       /* 0/1: schema-free JSON-object mode. */
+  /* ── Custom logits processor (ABI v8) ───────────────────────────────────────
+   * Per-request host callback invoked each decode step to modify the logits
+   * before sampling (see vllm_logits_processor). NULL => no processor (the
+   * byte-identical default: the sampler path is unchanged). The function pointer
+   * and user_data are borrowed for the duration of the generation call; the
+   * library copies the pair. */
+  vllm_logits_processor logits_processor;   /* NULL => no custom processor. */
+  void* logits_processor_user_data;         /* opaque; passed to the callback. */
 } vllm_sampling_params;
 
 /* ── Completion result ────────────────────────────────────────────────────────

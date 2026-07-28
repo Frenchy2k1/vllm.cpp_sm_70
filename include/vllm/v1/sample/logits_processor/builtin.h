@@ -46,6 +46,21 @@ void apply_logit_bias(vt::Queue& q, vt::Tensor& logits,
 // below min_p[i] * max_prob to -inf. Rows with min_p[i] == 0 are unaffected.
 void apply_min_p(vt::Queue& q, vt::Tensor& logits, const std::vector<float>& min_p);
 
+// Custom host logits processors (ROAD-V1-C7 `custom_logit_processor`). For each
+// (req_index -> callback) entry, invoke the callback once over the request's
+// mutable logits row [vocab], passing the request's generated output token ids so
+// far. Non-argmax-invariant: runs at the end of the non-argmax-invariant stage
+// (after min_tokens / logit_bias, before penalties), mirroring vLLM's
+// custom-logitsproc placement (sampler.py:399). The callbacks read+mutate logits
+// on the HOST: this syncs the queue first, then (on a non-unified backend) stages
+// the logits down to host memory, runs the callbacks, and copies the edited
+// logits back. On a unified-memory backend (CPU / GB10) the row is edited in
+// place with no staging copy. Empty `procs` => no-op (byte-identical default).
+void apply_logits_processors(
+    vt::Queue& q, vt::Tensor& logits,
+    const std::map<int, LogitsProcessorCallback>& procs,
+    const std::vector<std::vector<int32_t>>& output_token_ids);
+
 }  // namespace vllm::v1
 
 #endif  // VLLM_V1_SAMPLE_LOGITS_PROCESSOR_BUILTIN_H_

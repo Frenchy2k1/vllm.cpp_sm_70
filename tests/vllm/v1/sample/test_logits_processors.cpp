@@ -209,3 +209,66 @@ TEST_CASE("apply_allowed_token_ids: only whitelisted tokens survive") {
   CHECK(logits[2] == doctest::Approx(3.0f));
   CHECK(logits[3] == kNegInf);
 }
+
+// ---------------------------------------------------------------------------
+// apply_logits_processors — the custom host-callback stage (ROAD-V1-C7
+// `custom_logit_processor`). Additive-bias callback mutates the row in place,
+// receiving the request's output token ids so far; an empty map is a no-op.
+namespace {
+// Adds +10 to token `bias_token`, and records the (n_token_ids) it observed.
+struct BiasProbe {
+  int32_t bias_token = 0;
+  int32_t observed_n = -1;
+  int32_t observed_first_tok = -1;
+  int calls = 0;
+};
+void BiasCb(const int32_t* token_ids, int32_t n_token_ids, float* logits,
+            int32_t vocab_size, void* user_data) {
+  auto* p = static_cast<BiasProbe*>(user_data);
+  p->calls += 1;
+  p->observed_n = n_token_ids;
+  p->observed_first_tok = (n_token_ids > 0) ? token_ids[0] : -1;
+  if (p->bias_token >= 0 && p->bias_token < vocab_size)
+    logits[p->bias_token] += 10.0f;
+}
+}  // namespace
+
+TEST_CASE("apply_logits_processors: callback mutates the row + sees output tokens") {
+  std::vector<float> logits = {1.0f, 2.0f, 3.0f, 4.0f};
+  Tensor tl = Logits(logits, 1, 4);
+  BiasProbe probe;
+  probe.bias_token = 0;  // lift token 0 by +10 -> 11.0
+  std::map<int, vllm::LogitsProcessorCallback> procs;
+  procs[0] = vllm::LogitsProcessorCallback{&BiasCb, &probe};
+  std::vector<std::vector<int32_t>> outputs = {{42, 43}};
+  Queue q = Q();
+  vllm::v1::apply_logits_processors(q, tl, procs, outputs);
+  CHECK(logits[0] == doctest::Approx(11.0f));  // mutated in place
+  CHECK(logits[1] == doctest::Approx(2.0f));   // untouched
+  CHECK(probe.calls == 1);
+  CHECK(probe.observed_n == 2);          // saw the two generated tokens
+  CHECK(probe.observed_first_tok == 42);
+}
+
+TEST_CASE("apply_logits_processors: empty map is a no-op") {
+  std::vector<float> logits = {1.0f, 2.0f, 3.0f};
+  const std::vector<float> before = logits;
+  Tensor tl = Logits(logits, 1, 3);
+  std::map<int, vllm::LogitsProcessorCallback> procs;  // empty
+  std::vector<std::vector<int32_t>> outputs = {{}};
+  Queue q = Q();
+  vllm::v1::apply_logits_processors(q, tl, procs, outputs);
+  CHECK(logits == before);  // byte-identical
+}
+
+TEST_CASE("apply_logits_processors: null fn entry is skipped") {
+  std::vector<float> logits = {1.0f, 2.0f, 3.0f};
+  const std::vector<float> before = logits;
+  Tensor tl = Logits(logits, 1, 3);
+  std::map<int, vllm::LogitsProcessorCallback> procs;
+  procs[0] = vllm::LogitsProcessorCallback{};  // fn == nullptr
+  std::vector<std::vector<int32_t>> outputs = {{}};
+  Queue q = Q();
+  vllm::v1::apply_logits_processors(q, tl, procs, outputs);
+  CHECK(logits == before);  // no-op
+}
