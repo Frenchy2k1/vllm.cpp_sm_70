@@ -130,7 +130,7 @@ and reference-engine performance.
 | Reasoning parsers (+ reasoning-gated grammar) | `reasoning/` | ☐ T1 | | `planned: specs/reasoning-parsers.md` |
 | Thinking budget | `v1/sample/` | ☐ T1 | stub marked | `planned: specs/thinking-budget.md` |
 | Repetition detection | `v1/sample/` | ☐ T1 | | `planned: specs/repetition-detection.md` |
-| Custom logits processors (plugin point) | `v1/sample/logits_processor/` | ☐ T2 | → C ABI callback registry (§9.4) | `planned: specs/custom-logits-processors.md` |
+| Custom logits processors (plugin point) | `v1/sample/logits_processor/` | `ACTIVE` T2 | LANDED 2026-07-28 (`CLAIM-C7-CUSTOM-LOGITS`): per-request host callback through the C-ABI (`vllm_logits_processor`, ABI v8), wired at the sampler's non-argmax-invariant stage (`sampler.cpp` after logit_bias). Default (no callback) byte-identical. Also closes SGLang `SGLANG-SAMPLING-CUSTOM`. Residual: single C callback (not a batched plugin graph), no Python-side registration | [sampling-controls-c7.md](specs/sampling-controls-c7.md) (`SAMPLE-CUSTOM-PROCESSORS`) |
 
 ## 7. Structured outputs & tool calling
 

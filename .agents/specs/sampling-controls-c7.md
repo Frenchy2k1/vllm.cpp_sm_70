@@ -133,3 +133,47 @@ execution is dgx-pending exactly like the rest of the sampler, not new work).
 - RISK: the index-keyed control maps (min_tokens / logit_bias / bad_words) must
   follow the row through condense/swap; mirrored on `swap_dict_values` /
   pop-reinsert and gated by the swap/condense test.
+
+## `SAMPLE-CUSTOM-PROCESSORS` — custom logits processors (ACTIVE, `CLAIM-C7-CUSTOM-LOGITS`)
+
+Closes the C7 `SAMPLE-CUSTOM-PROCESSORS` inventory row AND the SGLANG-DISTINCT
+`SGLANG-SAMPLING-CUSTOM` row (same capability). A host-registered per-request
+callback the sampler invokes each decode step, BEFORE sampling, to modify the
+request's logits.
+
+- Upstream chain: vLLM `SamplingParams.logits_processors` +
+  `vllm/v1/sample/logits_processor/interface.py:60` (`LogitsProcessor.apply`) +
+  application at `vllm/v1/sample/sampler.py:399` (the non-argmax-invariant loop,
+  AFTER allowed_token_ids/bad_words and the builtin min_tokens/logit_bias, BEFORE
+  penalties; custom procs append after builtins in the manager,
+  `logits_processor/state.py:152-165`). SGLang
+  `python/sglang/srt/sampling/custom_logit_processor.py:24`
+  (`CustomLogitProcessor`).
+- Port map (deviation, recorded): we do NOT port vLLM's `LogitsProcessors` plugin
+  object graph nor SGLang's dill-serialized Python callable. Instead we carry a
+  single per-request C-ABI callback (fn ptr + `void* user_data`), exposed as
+  `vllm_logits_processor` (`include/vllm.h`, ABI bumped 7→8). Carrier struct
+  `vllm::LogitsProcessorCallback` (`include/vllm/logits_processor_callback.h`),
+  field on `vllm::SamplingParams.logits_processor` and
+  `SamplingMetadata.logits_processors` (req_index -> callback), applied by
+  `apply_logits_processors` (`src/vllm/v1/sample/logits_processor/builtin.cpp`)
+  wired at `src/vllm/v1/sample/sampler.cpp` right after `apply_logit_bias`. The
+  callback receives the generated token-ids so far + a mutable f32 logits row
+  view [vocab] and edits in place. On a unified-memory backend (CPU/GB10) the row
+  is edited in place; on a discrete backend it stages down/up.
+- Contract: fn == nullptr (default) => byte-identical to a build with no
+  processor. `InputBatch` tracks the callback per-slot and follows the row through
+  remove/condense/swap exactly like logit_bias; `needs_output_token_ids` and the
+  metadata rebuild gate now also fire when a processor is registered.
+- Gates: `tests/vllm/v1/sample/test_sampler.cpp` (forces-token EXACT + per-request
+  + empty-map inert, RED-first: reverting the sampler wiring flips the forced
+  token back to the baseline argmax); `test_logits_processors.cpp` (mutate row /
+  no-op empty / null-fn skip); `tests/capi/test_capi.cpp` (ABI v8 end-to-end: the
+  processor forces the generated token, fires once per decode step, differs from
+  the untouched greedy baseline). Default inertness = the pre-existing SAMPLE-*
+  gates unchanged.
+- RESIDUAL (honest): a single per-request C callback, not a batched multi-processor
+  plugin graph; no Python-side registration; on the async scheduler the generated
+  output-token view the callback sees is fed back by the scheduler (may lag) — the
+  strict per-step token-ids contract is gated deterministically at the sampler
+  level, not through the async engine.

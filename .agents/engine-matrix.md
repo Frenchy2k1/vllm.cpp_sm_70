@@ -39,14 +39,14 @@ forensics: roadmap_v1.md and the parity ledger.
 | Engine and scheduling | 25 | 3 | 3 | 1 | 0 | 11 | 2 | 1 | 4 |
 | KV cache and memory | 21 | 1 | 2 | 2 | 2 | 6 | 2 | 1 | 5 |
 | Parallelism | 6 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 5 |
-| Sampling and generation | 13 | 0 | 2 | 0 | 0 | 2 | 0 | 1 | 8 |
+| Sampling and generation | 13 | 0 | 2 | 0 | 0 | 3 | 0 | 1 | 7 |
 | Structured output and tools | 7 | 0 | 3 | 0 | 0 | 1 | 0 | 0 | 3 |
 | Speculative decoding | 8 | 0 | 0 | 0 | 0 | 3 | 0 | 2 | 2 |
 | Serving, API, CLI, library | 19 | 3 | 2 | 0 | 0 | 4 | 2 | 1 | 7 |
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 10 | 0 | 0 | 0 | 1 | 5 | 1 | 0 | 3 |
 | Loading, tokenizer, config | 9 | 1 | 3 | 0 | 0 | 2 | 1 | 1 | 1 |
-| **Total** | **120** | **8** | **15** | **2** | **4** | **34** | **8** | **7** | **41** |
+| **Total** | **120** | **8** | **15** | **2** | **4** | **35** | **8** | **7** | **40** |
 
 ## Engine core and scheduling
 
@@ -130,7 +130,7 @@ forensics: roadmap_v1.md and the parity ledger.
 | `SAMPLE-REASONING` | Reasoning parsers and grammar integration | T1 | `vllm/reasoning/abs_reasoning_parsers.py:26,213` | - | - | `planned: specs/reasoning-parsers.md` | `INVENTORIED` | - |
 | `SAMPLE-THINKING-BUDGET` | Thinking budget state and logit combination | T1 | `vllm/v1/sample/sampler.py:381-386` | - | - | `planned: specs/thinking-budget.md` | `INVENTORIED` | - |
 | `SAMPLE-REPETITION` | Repetition detection and penalty state | T1 | `vllm/v1/sample/sampler.py:437` | - | - | `planned: specs/repetition-detection.md` | `INVENTORIED` | - |
-| `SAMPLE-CUSTOM-PROCESSORS` | Custom logits-processor plugin point | T2 | `vllm/v1/sample/logits_processor/__init__.py:49-97` | - | - | `planned: specs/custom-logits-processors.md` | `INVENTORIED` | - |
+| `SAMPLE-CUSTOM-PROCESSORS` | Custom logits-processor plugin point — a host-registered per-request callback the sampler invokes each decode step (generated token-ids + a mutable logits view) BEFORE sampling, at vLLM's non-argmax-invariant stage (after allowed_token_ids/bad_words/min_tokens/logit_bias, before penalties). Exposed through the C-ABI (`vllm_logits_processor`, ABI v8); default (no processor) byte-identical. Mirrors vLLM's `SamplingParams.logits_processors` structure/ordering; also satisfies SGLang's `custom_logit_processor`. Residual: single per-request C callback (not a batched plugin graph); no Python-side registration; on the async scheduler the generated-token view is fed by the scheduler (may lag) — the strict token-ids contract is gated at the sampler level | T2 | `vllm/v1/sample/logits_processor/__init__.py:49-97`; `vllm/v1/sample/logits_processor/interface.py:60`; `vllm/v1/sample/sampler.py:399`; sglang `python/sglang/srt/sampling/custom_logit_processor.py:24` | ABI `include/vllm.h:186` (typedef) + `:239` (field, v8); `include/vllm/logits_processor_callback.h:40`; `src/capi/vllm_c.cpp:207`; `include/vllm/sampling_params.h:214`; `include/vllm/v1/sample/metadata.h:101`; `src/vllm/v1/sample/logits_processor/builtin.cpp:75` (`apply_logits_processors`) + `include/vllm/v1/sample/logits_processor/builtin.h:59`; wired `src/vllm/v1/sample/sampler.cpp:308`; per-slot `src/vllm/v1/worker/gpu/input_batch.cpp:284` + emit `:468` | `tests/vllm/v1/sample/test_sampler.cpp:310,353,378` (forces-token EXACT + per-request + inert; RED-first); `tests/vllm/v1/sample/test_logits_processors.cpp:236,253,264` (mutate/no-op/null-skip); `tests/capi/test_capi.cpp:409` (ABI v8 e2e forces token, fires per step) | [sampling-controls-c7.md](specs/sampling-controls-c7.md) (`SAMPLE-CUSTOM-PROCESSORS`) | `ACTIVE` | `CLAIM-C7-CUSTOM-LOGITS` |
 | `SAMPLE-ROUTED-EXPERTS` | Routed-experts return (`enable_return_routed_experts` per-token expert-routing output); carried from porting-inventory §6 (T2) at the v1 fold | T2 | `vllm/v1/outputs.py:281`; `vllm/sampling_params.py:328` | - | - | `planned: specs/routed-experts-return.md` | `INVENTORIED` | - |
 
 ## Structured outputs and tool calling

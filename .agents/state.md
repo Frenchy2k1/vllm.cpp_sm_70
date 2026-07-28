@@ -28345,3 +28345,49 @@ throughput). Records: `engine-matrix.md` `TOOLS-STREAMING-PARSER`,
 `specs/parser-assembly-c8.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`, ledger,
 coordination `CLAIM-C8-ARG-COERCION`, this entry. All record checkers rc=0. NOT
 pushed; FULL SHA reported to caller.
+
+## 2026-07-28 — Custom logits processors LANDED (`CLAIM-C7-CUSTOM-LOGITS`)
+
+Closed the C7 `SAMPLE-CUSTOM-PROCESSORS` inventory row AND the SGLANG-DISTINCT
+`SGLANG-SAMPLING-CUSTOM` cross-ref (same capability) — both → `ACTIVE`. Base local
+`main` `05237562` (confirmed via `git rev-parse HEAD`), isolated worktree
+`.claude/worktrees/agent-adf2a9da6f7a92c47`, vLLM pin `555967922`/0.26.0.dev0,
+SGLang pin `f63458b`. CPU-only, exact gate.
+
+A per-request custom logits-processor callback exposed through the C-ABI
+(`vllm_logits_processor`, ABI bumped 7→8): a host function pointer + `void*
+user_data` on `vllm_sampling_params`, invoked by the sampler each decode step
+BEFORE sampling with the request's generated token-ids so far + a MUTABLE f32
+logits-row view [vocab], edited in place. Wired at the sampler's
+non-argmax-invariant stage (`src/vllm/v1/sample/sampler.cpp:308`, after
+`apply_logit_bias`, before penalties) — mirrors vLLM's ordering (builtins precede
+custom procs; `sampler.py:399`). Carrier `vllm::LogitsProcessorCallback` (NEW
+`include/vllm/logits_processor_callback.h`) flows `vllm_sampling_params` →
+`ToSamplingParams` → `SamplingParams` → `InputBatch` per-slot map (follows the row
+through remove/condense/swap like logit_bias) → `SamplingMetadata.logits_processors`
+→ `apply_logits_processors` (`builtin.cpp`). Default (fn==nullptr / empty map) is
+byte-identical: the sampler early-returns, zero added hot-path work.
+
+Grounded FROM vLLM `interface.py:60` (`LogitsProcessor.apply`) + `sampler.py:399`
+(application point) and SGLang `custom_logit_processor.py:24`. Recorded deviation:
+one C-ABI callback instead of vLLM's plugin object graph / SGLang's dill-serialized
+Python callable — same capability, different delivery.
+
+Gates (exact, RED-first, CPU): `test_sampler` 11/11 (forces-token EXACT +
+per-request + inert; RED-first: disabling the wiring flips the forced token back to
+the baseline argmax, `-1 == 2` fail), `test_logits_processors` 15/15
+(mutate/no-op/null-skip), `test_capi` 26/26 (ABI v8 e2e forces the generated token,
+fires once per decode step, differs from baseline). Default inertness:
+`test_input_batch` 22/163, `test_sampling_metadata` 6/56, `test_sampling_params`
+9/90 UNCHANGED. Clean full-library CPU `-Werror` 0-warn; C header compiles under
+`-Wall -Wextra -Werror -std=c11` (`vllm_capi_c_check`).
+
+Residual (named): single per-request C callback (not a batched multi-processor
+plugin graph); no Python-side registration; on the async scheduler the generated
+output-token view fed by the scheduler may lag — the strict per-step token-ids
+contract is gated at the sampler level. `benchmark_binding=false` (feature;
+default byte-identical). Records: `engine-matrix.md` `SAMPLE-CUSTOM-PROCESSORS` +
+summary recompute, `sglang-matrix.md` `SGLANG-SAMPLING-CUSTOM`, `feature-matrix.md`,
+`roadmap_v1.md` C7, `specs/sampling-controls-c7.md`, `docs/STATUS.md`,
+`docs/BENCHMARKS.md`, ledger, coordination `CLAIM-C7-CUSTOM-LOGITS`, this entry.
+All record checkers rc=0. NOT pushed; FULL SHA reported to caller.

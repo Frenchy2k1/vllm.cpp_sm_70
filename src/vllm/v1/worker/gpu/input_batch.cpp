@@ -277,6 +277,13 @@ int InputBatch::add_request(const CachedRequestState& request) {
     logit_bias[req_index] = *sp.logit_bias;
   }
 
+  // custom logits processor (ROAD-V1-C7 `custom_logit_processor`): a host
+  // callback carried on the SamplingParams. Track only when one is registered.
+  logits_processors.erase(req_index);
+  if (sp.logits_processor.fn != nullptr) {
+    logits_processors[req_index] = sp.logits_processor;
+  }
+
   // num_logprobs (gpu_input_batch.py:435-440). Keep the -1 sentinel; our Sampler
   // reads it directly (upstream stores vocab_size).
   num_logprobs.erase(req_id);
@@ -336,9 +343,11 @@ const SamplingMetadata& InputBatch::make_sampling_metadata() const {
   // For the greedy / no-penalties gate workload the metadata depends only on the
   // (unchanged) request set + static sampling params, so the cache is
   // bit-identical to a fresh build. ROAD-V1-C7: min_tokens / bad_words also embed
-  // the per-step-growing output tokens, so rebuild when either is active.
+  // the per-step-growing output tokens, so rebuild when either is active. A
+  // custom logits processor is passed the per-step-growing output tokens too, so
+  // rebuild when one is registered.
   if (sampling_metadata_dirty_ || !no_penalties() || !min_tokens.empty() ||
-      !bad_words_token_ids.empty()) {
+      !bad_words_token_ids.empty() || !logits_processors.empty()) {
     sampling_metadata_cache_ = build_sampling_metadata();
     sampling_metadata_dirty_ = false;
   }
@@ -406,7 +415,8 @@ SamplingMetadata InputBatch::build_sampling_metadata() const {
   // logitsproc needs them (min_tokens is such a proc — it compares output_len to
   // the floor). thinking-budget stays deferred.
   const bool needs_output_token_ids =
-      !md.no_penalties || !bad_words_token_ids.empty() || !min_tokens.empty();
+      !md.no_penalties || !bad_words_token_ids.empty() || !min_tokens.empty() ||
+      !logits_processors.empty();
   if (needs_output_token_ids) {
     md.output_token_ids.resize(nn);
     for (int i = 0; i < n; ++i) {
@@ -455,6 +465,7 @@ SamplingMetadata InputBatch::build_sampling_metadata() const {
   // when some row is active, matching the "skip when unneeded" pattern.
   md.min_tokens = min_tokens;
   md.logit_bias = logit_bias;
+  md.logits_processors = logits_processors;
   if (!no_min_p()) {
     md.min_p = std::vector<float>(min_p_cpu.begin(), min_p_cpu.begin() + nn);
   }
@@ -509,6 +520,7 @@ std::optional<int> InputBatch::remove_request(const std::string& req_id) {
   num_logprobs.erase(req_id);
   min_tokens.erase(req_index);
   logit_bias.erase(req_index);
+  logits_processors.erase(req_index);
   bad_words_token_ids.erase(req_index);
   if (!allowed_token_ids_mask.empty()) {
     std::fill(allowed_token_ids_mask[static_cast<size_t>(req_index)].begin(),
@@ -671,6 +683,7 @@ void InputBatch::condense() {
         min_p_cpu[static_cast<size_t>(last_req_index)];
     MoveDictValue(min_tokens, last_req_index, empty_index);
     MoveDictValue(logit_bias, last_req_index, empty_index);
+    MoveDictValue(logits_processors, last_req_index, empty_index);
     MoveDictValue(bad_words_token_ids, last_req_index, empty_index);
     if (!allowed_token_ids_mask.empty()) {
       allowed_token_ids_mask[static_cast<size_t>(empty_index)] =
@@ -774,6 +787,7 @@ void InputBatch::swap_states(int i1, int i2) {
             min_p_cpu[static_cast<size_t>(i2)]);
   SwapDictValues(min_tokens, i1, i2);
   SwapDictValues(logit_bias, i1, i2);
+  SwapDictValues(logits_processors, i1, i2);
   SwapDictValues(bad_words_token_ids, i1, i2);
   if (!allowed_token_ids_mask.empty()) {
     std::swap(allowed_token_ids_mask[static_cast<size_t>(i1)],

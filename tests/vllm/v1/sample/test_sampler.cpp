@@ -275,3 +275,115 @@ TEST_CASE("Sampler: full pipeline on a 2-req batch (greedy + random) with logpro
   CHECK(lt.logprob_token_ids[0] == 1);
   CHECK(lt.logprob_token_ids[2] == 3);
 }
+
+// ---------------------------------------------------------------------------
+// Custom logits processor (ROAD-V1-C7 `custom_logit_processor`): a host callback
+// that FORCES a chosen token wins greedy sampling EXACTLY, and — RED-first — the
+// same batch without the processor samples a DIFFERENT token. Also proves the
+// callback fires once per request with the right (token_ids, vocab_size) view.
+namespace {
+// Force-a-token processor state. Records the arity the sampler handed it so the
+// test can assert the contract (fire count, vocab_size, token_ids ptr/len).
+struct ForceProcState {
+  int32_t forced = 0;      // the token id to force.
+  int calls = 0;           // number of callback invocations.
+  int32_t last_vocab = 0;  // vocab_size seen on the last call.
+  int last_n_tokens = -1;  // n_token_ids seen on the last call.
+  bool tokens_ptr_ok = true;  // token_ids non-null whenever n_token_ids > 0.
+};
+
+// C-style callback matching vllm::LogitsProcessorFn. Sets the forced token's
+// logit far above every other (finite, so no nan under softmax), leaving greedy
+// argmax == forced.
+void ForceTokenCb(const int32_t* token_ids, int32_t n_token_ids, float* logits,
+                  int32_t vocab_size, void* user_data) {
+  auto* s = static_cast<ForceProcState*>(user_data);
+  s->calls += 1;
+  s->last_vocab = vocab_size;
+  s->last_n_tokens = n_token_ids;
+  if (n_token_ids > 0 && token_ids == nullptr) s->tokens_ptr_ok = false;
+  for (int32_t j = 0; j < vocab_size; ++j) logits[j] = -1e30f;
+  if (s->forced >= 0 && s->forced < vocab_size) logits[s->forced] = 1e30f;
+}
+}  // namespace
+
+TEST_CASE("Sampler: custom logits processor forces the greedy token exactly") {
+  // Baseline argmax is token 1; the processor forces token 3.
+  std::vector<float> baseline = {0.1f, 5.0f, 0.2f, 0.3f};
+  Sampler sampler;
+  Queue q = Q();
+
+  // RED reference: no processor -> the untouched argmax (token 1).
+  {
+    std::vector<float> logits = baseline;
+    Tensor tl = Logits(logits, 1, 4);
+    SamplingMetadata sm;
+    sm.all_greedy = true;
+    sm.max_num_logprobs = std::nullopt;
+    auto out = sampler.forward(q, tl, sm);
+    CHECK(out.sampled_token_ids[0][0] == 1);  // untouched argmax
+  }
+
+  // With the processor -> the FORCED token (3), not the baseline argmax (1).
+  ForceProcState st;
+  st.forced = 3;
+  {
+    std::vector<float> logits = baseline;
+    Tensor tl = Logits(logits, 1, 4);
+    SamplingMetadata sm;
+    sm.all_greedy = true;
+    sm.max_num_logprobs = std::nullopt;
+    sm.output_token_ids = {{7, 8}};  // pretend two tokens already generated
+    sm.logits_processors[0] = vllm::LogitsProcessorCallback{&ForceTokenCb, &st};
+    auto out = sampler.forward(q, tl, sm);
+    CHECK(out.sampled_token_ids[0][0] == 3);  // forced token wins EXACTLY
+  }
+  // Callback contract: fired exactly once, saw the full vocab and the request's
+  // generated tokens so far (len 2, non-null pointer).
+  CHECK(st.calls == 1);
+  CHECK(st.last_vocab == 4);
+  CHECK(st.last_n_tokens == 2);
+  CHECK(st.tokens_ptr_ok);
+}
+
+// ---------------------------------------------------------------------------
+// Per-request scoping: in a 2-row batch only row 1 registers a processor, so
+// only row 1's argmax is forced; row 0 keeps its untouched argmax. Proves the
+// callback fires once per REGISTERED request over the correct row.
+TEST_CASE("Sampler: custom logits processor is per-request (only the wired row)") {
+  std::vector<float> logits = {9.0f, 1.0f, 1.0f, 2.0f,    // row 0 argmax 0
+                               0.1f, 0.2f, 5.0f, 0.3f};   // row 1 argmax 2
+  Tensor tl = Logits(logits, 2, 4);
+  ForceProcState st;
+  st.forced = 1;  // force row 1 to token 1 (its untouched argmax is 2)
+  SamplingMetadata sm;
+  sm.all_greedy = true;
+  sm.max_num_logprobs = std::nullopt;
+  sm.output_token_ids = {{}, {}};
+  sm.logits_processors[1] = vllm::LogitsProcessorCallback{&ForceTokenCb, &st};
+
+  Sampler sampler;
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+
+  CHECK(out.sampled_token_ids[0][0] == 0);  // row 0 untouched
+  CHECK(out.sampled_token_ids[1][0] == 1);  // row 1 forced
+  CHECK(st.calls == 1);                     // fired only for the registered row
+  CHECK(st.last_vocab == 4);
+}
+
+// ---------------------------------------------------------------------------
+// Default inertness: an EMPTY logits_processors map leaves the pipeline
+// byte-identical (same argmax as with no field set at all).
+TEST_CASE("Sampler: empty custom-logits-processor map is inert") {
+  std::vector<float> logits = {0.1f, 5.0f, 0.2f, 0.3f};
+  Tensor tl = Logits(logits, 1, 4);
+  SamplingMetadata sm;
+  sm.all_greedy = true;
+  sm.max_num_logprobs = std::nullopt;
+  // logits_processors default-constructed empty.
+  Sampler sampler;
+  Queue q = Q();
+  auto out = sampler.forward(q, tl, sm);
+  CHECK(out.sampled_token_ids[0][0] == 1);  // untouched argmax
+}

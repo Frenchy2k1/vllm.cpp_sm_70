@@ -265,6 +265,26 @@ against the pre-change 400-reject). Inertness: additive union branch, the raw
 `cmake --build build-cpu --target test_openai_api_server &&
 ./build-cpu/tests/test_openai_api_server`.
 
+**ROAD-V1-C7 custom logits processors (2026-07-28, `CLAIM-C7-CUSTOM-LOGITS`, NOT
+pushed).** Disposition: **NOT APPLICABLE (no throughput number,
+`benchmark_binding=false`; a feature/correctness capability, and the default —
+no processor registered — is byte-identical to today with ZERO added work on the
+sampler hot path).** A per-request custom logits-processor callback exposed
+through the C-ABI (`vllm_logits_processor`, ABI v8), invoked each decode step to
+modify the request's logits before sampling, at vLLM's non-argmax-invariant stage
+(after allowed_token_ids/bad_words/min_tokens/logit_bias, before penalties;
+mirrors `SamplingParams.logits_processors`). No compute-path A/B applies: with no
+processor the sampler path is unchanged (the callback map is empty → early
+return). Gate is exact correctness on CPU: `test_sampler` 11/11 (forces-token
+EXACT + per-request + inert; RED-first: reverting the sampler wiring flips the
+forced token back to the baseline argmax), `test_logits_processors` 15/15
+(mutate/no-op/null-skip), `test_capi` 26/26 (ABI v8 end-to-end forces the
+generated token, fires once per decode step, differs from the untouched greedy
+baseline). Also closes the SGLang `SGLANG-SAMPLING-CUSTOM` cross-ref. Reproduce:
+`cmake --build build-cpu --target test_sampler test_logits_processors test_capi &&
+./build-cpu/tests/test_sampler && ./build-cpu/tests/test_logits_processors &&
+./build-cpu/tests/test_capi`.
+
 **ROAD-V1-C8 /metrics LIVE per-step wiring (2026-07-27,
 `CLAIM-ROADMAP-C8-METRICS-WIRE`, NOT pushed).** Disposition: **NOT APPLICABLE (no
 throughput number, `benchmark_binding=false`; metrics are observational, off the
