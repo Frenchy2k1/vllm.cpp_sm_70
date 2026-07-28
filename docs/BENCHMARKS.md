@@ -285,6 +285,26 @@ baseline). Also closes the SGLang `SGLANG-SAMPLING-CUSTOM` cross-ref. Reproduce:
 ./build-cpu/tests/test_sampler && ./build-cpu/tests/test_logits_processors &&
 ./build-cpu/tests/test_capi`.
 
+**ROAD-V1-C7 parallel sampling `n>1` (`SAMPLE-N`) (2026-07-28,
+`CLAIM-C7-N-SAMPLING`, NOT pushed).** Disposition: **NOT APPLICABLE (no throughput
+number, `benchmark_binding=false`; a feature/correctness capability, and the
+default `n==1` path is byte-identical to today).** The OpenAI `n` sampling
+parameter: a request with `n>1` fans out into n prompt-sharing child sequences
+(`ParentRequest`/`FanOutParallelSampling`, mirroring vLLM `parallel_sampling.py` +
+`llm_engine.py:270-293`), each aggregated back into one `RequestOutput` carrying n
+`CompletionOutput`s (n indexed OpenAI `choices`). No compute-path A/B applies:
+`n==1` never constructs a `ParentRequest` (the single-sequence engine path is
+unchanged); `n>1` simply schedules n independent decode streams. Gate is exact
+correctness on CPU: `test_llm_engine` 8/8 (NEW n>1 case RED-first: before the
+fan-out an n>1 request returns exactly ONE output, `REQUIRE(1 == 4)`; GREEN after:
+n outputs, each index 0..n-1 token-identical to BOTH the `top_k=1` and greedy
+single-sequence result — vLLM forbids greedy n>1, so the determinism gate uses
+`top_k=1`; the other 7 cases prove n==1 inertness), `test_openai_serving` 28/28
+(NEW: n>1 returns n indexed deterministic choices). Residuals (named):
+`best_of`/beam, async-streaming per-child collation, C-ABI `n` field. Reproduce:
+`cmake --build build-cpu --target test_llm_engine test_openai_serving &&
+./build-cpu/tests/test_llm_engine && ./build-cpu/tests/test_openai_serving`.
+
 **ROAD-V1-C8 /metrics LIVE per-step wiring (2026-07-27,
 `CLAIM-ROADMAP-C8-METRICS-WIRE`, NOT pushed).** Disposition: **NOT APPLICABLE (no
 throughput number, `benchmark_binding=false`; metrics are observational, off the

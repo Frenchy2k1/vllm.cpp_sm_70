@@ -404,6 +404,54 @@ TEST_CASE("serving_completion: non-stream response carries text, length finish, 
         resp.usage.prompt_tokens + resp.usage.completion_tokens);
 }
 
+// ─── (a1b) n>1 parallel sampling: the response carries n indexed choices ─────
+// SAMPLE-N (ROAD-V1-C7). An OpenAI completion request with n>1 must return n
+// choices, each with its own `index`. top_k=1 sampling makes each sequence
+// deterministic (== the argmax) while staying a legal n>1 config (vLLM forbids
+// n>1 under greedy). Non-streaming => output_kind FINAL_ONLY => the engine
+// aggregates the n child outputs into one response.
+TEST_CASE("serving_completion: n>1 returns n indexed, deterministic choices") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 5;
+  const int kSeqs = 3;
+
+  Harness h(c, w, tok);
+  OpenAIServingCompletion serving(h.engine, "test-model");
+
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.max_tokens = kN;
+  req.n = kSeqs;
+  req.temperature = 1.0;  // random sampling path (legal for n>1)
+  req.top_k = 1;          // deterministic: collapses to the argmax
+  req.seed = 7;           // seeded -> each child gets seed+index
+  req.stream = false;
+
+  CompletionResult res = serving.create_completion(req);
+  REQUIRE_FALSE(res.streaming);
+  REQUIRE(res.response.has_value());
+  const auto& resp = *res.response;
+
+  // n choices, indices 0..n-1, each token-identical (deterministic sampling).
+  REQUIRE(resp.choices.size() == static_cast<size_t>(kSeqs));
+  std::string first_text;
+  for (int i = 0; i < kSeqs; ++i) {
+    CHECK(resp.choices[i].index == i);
+    CHECK_FALSE(resp.choices[i].text.empty());
+    REQUIRE(resp.choices[i].finish_reason.has_value());
+    CHECK(*resp.choices[i].finish_reason == "length");
+    if (i == 0) {
+      first_text = resp.choices[i].text;
+    } else {
+      CHECK(resp.choices[i].text == first_text);  // deterministic => identical
+    }
+  }
+  // Usage counts all n sequences.
+  CHECK(resp.usage.completion_tokens == kN * kSeqs);
+}
+
 // ─── (a2) logprobs payload runs end-to-end through the CPU engine ────────────
 // Proves the whole SAMPLE-LOGPROBS path RAN: sampler gather_logprobs -> runner
 // ModelRunnerOutput.logprobs -> scheduler slice_request -> LogprobsProcessor ->

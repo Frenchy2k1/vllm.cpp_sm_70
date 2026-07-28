@@ -80,7 +80,11 @@ ENGINE_PREFIXES = (
 # scheduling is the one genuinely-distinct flag-worthy behavior; overlap ==
 # `ENG-ASYNC-SCHED`, jump-forward deferred). Both `SPIKE`,
 # `CLAIM-SGLANG-RADIX-SCOPE`, spec `specs/sglang-radixattention.md`.
-ENGINE_ROWS = 120
+# 121 since 2026-07-28: +`SAMPLE-N` (parallel sampling — a request with n>1 fans
+# out into n prompt-sharing child sequences aggregated into one RequestOutput /
+# n OpenAI choices; the n==1 default path stays byte-identical). A real new engine
+# capability, `ACTIVE`, `CLAIM-C7-N-SAMPLING`.
+ENGINE_ROWS = 121
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

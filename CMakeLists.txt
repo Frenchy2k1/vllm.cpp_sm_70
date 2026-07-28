@@ -482,6 +482,7 @@ add_library(vllm STATIC
   src/vllm/v1/engine/core_client.cpp
   src/vllm/v1/engine/async_llm.cpp
   src/vllm/v1/engine/input_processor.cpp
+  src/vllm/v1/engine/parallel_sampling.cpp
   src/vllm/v1/engine/output_processor.cpp
   src/vllm/v1/engine/logprobs.cpp
   src/vllm/v1/engine/llm_engine.cpp

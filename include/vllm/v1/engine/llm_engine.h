@@ -53,6 +53,7 @@
 #ifndef VLLM_V1_ENGINE_LLM_ENGINE_H_
 #define VLLM_V1_ENGINE_LLM_ENGINE_H_
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -150,6 +151,14 @@ class LLMEngine {
   }
 
  private:
+  // Parallel-sampling fan-out (llm_engine.py:278-293, SAMPLE-N). Called only when
+  // sampling_params.n > 1: expand `request` into n child requests sharing its
+  // prompt tokens, each registered with the OutputProcessor (under a shared
+  // ParentRequest) + EngineCore. The n==1 path never calls this — it stays
+  // byte-identical.
+  void FanOutParallelSampling(const EngineCoreRequest& request,
+                              std::optional<std::string> prompt);
+
   InputProcessor& input_processor_;
   EngineCore& engine_core_;
   OutputProcessor& output_processor_;

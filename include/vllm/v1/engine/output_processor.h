@@ -58,6 +58,7 @@
 #include "vllm/sampling_params.h"
 #include "vllm/v1/engine/detokenizer.h"
 #include "vllm/v1/engine/logprobs.h"
+#include "vllm/v1/engine/parallel_sampling.h"
 #include "vllm/v1/engine/types.h"
 #include "vllm/v1/request.h"
 
@@ -121,7 +122,8 @@ class RequestState {
   static RequestState FromNewRequest(const tok::Tokenizer* tokenizer,
                                      const EngineCoreRequest& request,
                                      std::optional<std::string> prompt,
-                                     int request_index, int stream_interval);
+                                     int request_index, int stream_interval,
+                                     std::shared_ptr<ParentRequest> parent_req);
 
   // make_request_output (:272): assemble the streaming-delta vs full
   // CompletionOutput/RequestOutput honoring output_kind. Returns nullopt when
@@ -135,6 +137,11 @@ class RequestState {
   std::string request_id;
   std::string external_req_id;  // == request_id at T0 (see header).
   int request_index = 0;
+  // parent_req (output_processor.py RequestState.parent_req): non-null only for a
+  // child of an n>1 parallel-sampling request. make_request_output routes the
+  // child's CompletionOutput through it to aggregate the n outputs into one
+  // RequestOutput. Null for every single-sequence request (byte-identical path).
+  std::shared_ptr<ParentRequest> parent_req;
   RequestOutputKind output_kind = RequestOutputKind::kCumulative;
   std::optional<std::string> prompt;
   std::vector<int32_t> prompt_token_ids;
@@ -191,12 +198,17 @@ class OutputProcessor {
   }
   bool has_unfinished_requests() const { return !request_states_.empty(); }
 
-  // add_request (:512): build + register a RequestState. parent_req / queue /
-  // the streaming-update re-entry are deferred (T0: duplicate live ids throw).
+  // add_request (:512): build + register a RequestState. `parent_req` is non-null
+  // only for a child of an n>1 parallel-sampling request (SAMPLE-N); it is stored
+  // once in parent_requests_ and referenced by every child's RequestState so the
+  // final RequestOutput aggregates the n child outputs. Null (the default) keeps
+  // the single-sequence path byte-identical. The streaming-update re-entry is
+  // deferred (T0: duplicate live ids throw).
   void add_request(
       const EngineCoreRequest& request, std::optional<std::string> prompt,
       int request_index = 0,
-      std::shared_ptr<RequestOutputCollector> queue = nullptr);
+      std::shared_ptr<RequestOutputCollector> queue = nullptr,
+      std::shared_ptr<ParentRequest> parent_req = nullptr);
 
   // process_outputs (:576): the per-EngineCoreOutput loop — detokenize + stop +
   // RequestOutput assembly + reqs_to_abort feedback. When `iteration_stats` is
@@ -239,6 +251,10 @@ class OutputProcessor {
   std::map<std::string, std::unique_ptr<RequestState>> request_states_;
   // external_req_id -> [internal request_id, ...] (1:1 at T0, see header).
   std::map<std::string, std::vector<std::string>> external_req_ids_;
+  // parent_req.request_id -> ParentRequest (output_processor.py:441): the live
+  // parallel-sampling parents, cleared once their last child finishes
+  // (FinishRequest, output_processor.py:720-722). Empty for single-sequence runs.
+  std::map<std::string, std::shared_ptr<ParentRequest>> parent_requests_;
 };
 
 }  // namespace vllm::v1
