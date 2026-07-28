@@ -854,6 +854,7 @@ target_include_directories(test_qwen3_dflash_kvprep_parity PRIVATE
 
 # SPEC-MTP I5d — the 27B k=1 MTP speculative-decode three-way identity gate
 # (our spec-ON == our spec-OFF == vLLM greedy) + measured nonzero acceptance.
+vllm_cpp_add_test(test_qwen35_gguf_spec_decode parity/test_qwen35_gguf_spec_decode.cpp)
 vllm_cpp_add_test(test_qwen27_spec_decode parity/test_qwen27_spec_decode.cpp)
 target_compile_definitions(test_qwen27_spec_decode PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

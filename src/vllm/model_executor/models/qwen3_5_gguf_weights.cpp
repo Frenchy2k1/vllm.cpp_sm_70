@@ -992,6 +992,12 @@ Qwen3_5MTPWeights LoadQwen3_5MTPFromGguf(const GgufFile& gguf,
     const std::string name = Blk(L, "nextn.eh_proj.weight");
     RequireExpand(pol, gguf, name, GgufTensorRole::kTransformedWeight);
     out.fc = OwnBf16(gguf, name, gguf.Get(name).shape);
+    // The draft forward requires fc in RAW [N, K] with the nk flag SET
+    // (qwen3_5.cpp "fc must be raw bf16 [H,2H]"); the safetensors path gets it
+    // from LoadBf16RawNK. GGUF already stores this orientation, so only the
+    // flag is missing - and without it the shape check passes while the forward
+    // refuses, which is exactly how the G4 gate caught this.
+    out.fc.nk = true;
   }
   for (const auto& [field, stem] :
        std::initializer_list<std::pair<OwnedTensor*, const char*>>{

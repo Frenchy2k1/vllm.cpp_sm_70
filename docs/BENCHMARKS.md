@@ -2415,12 +2415,27 @@ republication fails both cases. Trunk inertness: `test_gguf` 103,
 `test_gguf_qwen36_loader` 99, `test_gguf_keep_quant` 5958, `test_gguf_dequant` 215,
 `test_capi` 33/232, all unchanged.
 
-**Reproduction for the owed number** (spike row `G4`): build with
-`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=ON`, then run the three-way token gate
-once it exists - GGUF spec-ON vs GGUF spec-OFF at c1 greedy, plus the acceptance
-rate. A quantized head may accept rarely enough that spec-ON is SLOWER than
-spec-OFF; that is a documented risk in the spike and the reason no speedup is
-implied here.
+**The token gate now EXISTS and FAILS, which is why no number is claimed.**
+`tests/parity/test_qwen35_gguf_spec_decode.cpp`, run on CPU against the real 2B
+GGUF with `VT_GDN_STATE_BF16=0` (the CPU `causal_conv1d_spec_update` requires f32
+conv state), reports 13 drafts proposed / 10 accepted - so the head loads well
+enough to make proposals the target believes 77% of the time - but the spec-ON
+continuation DIVERGES from spec-OFF. Greedy speculative decoding is
+exactness-preserving, so that is a correctness defect, not a tuning result, and a
+throughput number measured on a diverging path would be meaningless.
+
+En route it did earn its cost: it caught a real loader defect (`fc.nk` unset,
+which the shape assertions could not see and which the draft forward rejected)
+that is now fixed and asserted in the unit gate.
+
+**Reproduction:**
+`VT_GDN_STATE_BF16=0 VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cpu/tests/test_qwen35_gguf_spec_decode`
+
+**Next, before any number** (spike row `G4a`): run the same gate over a
+SAFETENSORS Qwen3.5 on CPU to attribute the divergence. There is no CPU spec-decode
+gate anywhere in this tree - `SPEC-MTP` was gated entirely on GB10 - so a
+pre-existing CPU defect is a live hypothesis and must be ruled in or out before
+this row is blamed or cleared.
 
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 

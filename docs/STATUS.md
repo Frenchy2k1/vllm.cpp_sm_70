@@ -522,10 +522,18 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   helpers, so the head inherits the GGUF (w+1) norm storage, the quantization /
   residency routing and the torch [N, K] shape order. Gated against a real
   llama.cpp-converted Qwen3.5-2B (2 cases / 18 assertions, env-gated so CI stays
-  asset-free), RED-first, with every GGUF trunk suite unchanged. **NOT yet
-  gated end to end**: no spec-ON generation over a GGUF target has been run, so
-  token identity and acceptance are unmeasured and the row stays `PARTIAL`. A
-  GGUF exported without the head is still refused, now naming that as the reason.
+  asset-free), RED-first, with every GGUF trunk suite unchanged. A GGUF exported
+  without the head is still refused, now naming that as the reason.
+  **End-to-end it is NOT correct yet, and the row stays `PARTIAL` for a measured
+  reason rather than an unrun one.** The token gate
+  (`tests/parity/test_qwen35_gguf_spec_decode.cpp`) runs on CPU against the real
+  2B GGUF and FAILS: the drafter is demonstrably alive (13 drafts proposed, 10
+  accepted) but spec-ON output DIVERGES from spec-OFF, which greedy MTP must
+  never do. It is not yet attributed between this row's head load and a
+  pre-existing CPU spec-decode defect - there is no CPU spec gate anywhere in the
+  tree, the whole `SPEC-MTP` program having been gated on GB10 - and the
+  discriminating run (the same gate over a safetensors Qwen3.5 on CPU) is the
+  next step. Do not describe GGUF MTP as working.
 - **DFlash from GGUF is SPIKED, not implemented.** `mtp` and
   `dflash` are refused on a `.gguf` target today; `ngram` works there and
   always has. Two `READY` rows now carry the scoped plan:
