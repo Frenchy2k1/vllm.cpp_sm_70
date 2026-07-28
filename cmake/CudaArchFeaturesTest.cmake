@@ -199,6 +199,40 @@ expect_feature("80" "scaledmm-c3x-sm90" "")
 # separate sm90 cell is exactly what keeps the sm_12x sweep off compute_90a.
 expect_feature("90a" "cutlass-fp8" "")
 
+# --- DATACENTER-BLACKWELL sm_100a CUTLASS C3x FP8 scaled-mm BUILD-VERIFY
+# (BACKEND-CUDA-SM100, ROAD-V1-D1-CUDA, datacenter fast-path §9 DC3). The
+# `scaledmm-c3x-sm100` cell is a DISTINCT feature from BOTH the consumer sm_12x
+# `cutlass-fp8` cell AND the Hopper `scaledmm-c3x-sm90` cell: it gates the
+# ArchTag=Sm100 tcgen05 body (cuda_scaled_mm_c3x_sm100.cu), which is
+# DERIVED+BUILD-VERIFIED — compiled + cuobjdump-proven sm_100a SASS on GB10, NO
+# B200/sm_100 board ran it. It must resolve ENABLED for 100a ALONE. Pinned so (a) a
+# future edit cannot widen it onto the gate arch, and (b) the gate arch sm_121a /
+# consumer 120a stay EMPTY → the sm_12x `cutlass-fp8` scaled-mm is byte-unchanged.
+# The Hopper sm_90a stays EMPTY (its own separate cell); sm_103a/sm_110 stay EMPTY
+# (separate later bricks); cross-family 80 stays EMPTY (no body). It coexists with
+# the sm100 NVFP4 cell: both resolve for 100a (independent TUs) but neither widens
+# onto the other's arch.
+expect_feature("100a" "scaledmm-c3x-sm100" "100a")
+expect_feature("121a" "scaledmm-c3x-sm100" "")
+expect_feature("120a" "scaledmm-c3x-sm100" "")
+expect_feature("120a;121a" "scaledmm-c3x-sm100" "")
+expect_feature("90a" "scaledmm-c3x-sm100" "")
+expect_feature("103a" "scaledmm-c3x-sm100" "")
+expect_feature("110" "scaledmm-c3x-sm100" "")
+expect_feature("80" "scaledmm-c3x-sm100" "")
+# RED-preserving companion: the CONSUMER sm_12x `cutlass-fp8` (and the Hopper
+# `scaledmm-c3x-sm90`) cells must stay EMPTY for 100a — neither the sm_120
+# scaled-mm body nor the Sm90 wgmma body can compile for a datacenter tcgen05
+# target. The separate sm100 cell is exactly what keeps them off compute_100a.
+expect_feature("100a" "cutlass-fp8" "")
+expect_feature("100a" "scaledmm-c3x-sm90" "")
+# The gate arch sm_121a resolution of the OTHER cutlass cells is byte-unchanged by
+# this addition (neutrality): the sm_12x consumer cells stay ENABLED for 121a and
+# the sm100 NVFP4 build-verify cell stays DISABLED for 121a.
+expect_feature("121a" "cutlass-fp8" "121a")
+expect_feature("121a" "cutlass-nvfp4" "121a")
+expect_feature("121a" "cutlass-nvfp4-sm100" "")
+
 if(_failures GREATER 0)
   message(FATAL_ERROR "${_failures} CUDA feature-table expectation(s) failed")
 endif()

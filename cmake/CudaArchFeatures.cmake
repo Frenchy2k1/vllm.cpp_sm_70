@@ -257,6 +257,27 @@ set(VT_CUDA_FEATURE_TABLE
   # .agents/specs/cuda-arch-datacenter-fastpath.md §3a/§9 (DC2) + backend-matrix.md
   # BACKEND-CUDA-SM090.
   "scaledmm-c3x-sm90|9.0a|CUTLASS C3x FP8 scaled-mm wgmma/TMA GEMM, sm90 build-verify (VT_SCALEDMM_C3X_SM90)"
+  # Datacenter-Blackwell (sm_100a) CUTLASS C3x FP8 scaled-mm tcgen05 GEMM
+  # build-verify TU (cuda_scaled_mm_c3x_sm100.cu). DELIBERATELY its OWN cell, NOT a
+  # widening of the consumer `cutlass-fp8` row above, NOR of the Hopper
+  # `scaledmm-c3x-sm90` row: the datacenter body is ArchTag=Sm100 +
+  # KernelScheduleAuto/EpilogueScheduleAuto — CUTLASS selects the 5th-gen tcgen05
+  # collective — whereas the sm_12x body is ArchTag=Sm120 and the Hopper body is
+  # ArchTag=Sm90 + explicit KernelTmaWarpSpecialized*FP8FastAccum (4th-gen wgmma).
+  # All three are a DIFFERENT collective/schedule and cannot share a compile:
+  # widening the sm_12x cell to 10.0a would drag the sm120 tensor-op PTX into a
+  # 100a build, whose sm_120 PTX ptxas rejects for compute_100a (the cross-family
+  # gencode blocker, arch-additivity §W7/§W9). Enabled ONLY for 100a so the gate
+  # arch sm_121a resolution is byte-unchanged. LABEL: DERIVED+BUILD-VERIFIED
+  # (testing-welcome) — compiled + cuobjdump-proven sm_100a SASS on GB10, NO
+  # B200/sm_100 board ran it here. upstream: vLLM SCALED_MM_SM100_ARCHS
+  # "10.0a;10.1a;10.3a" (CMakeLists.txt); only 10.0a is build-verified here —
+  # sm_103a/sm_110 are separate later bricks. The sm100 int8 C3x leg
+  # (scaled_mm_sm100_int8.cu) + the sm100 blockwise-fp8 leg + the sm100 MoE/MXFP4/MLA
+  # legs are separate residual bricks. See
+  # .agents/specs/cuda-arch-datacenter-fastpath.md §3a/§9 (DC3) + backend-matrix.md
+  # BACKEND-CUDA-SM100.
+  "scaledmm-c3x-sm100|10.0a|CUTLASS C3x FP8 scaled-mm tcgen05 GEMM, sm100 build-verify (VT_SCALEDMM_C3X_SM100)"
   # Vendored Marlin NVFP4 W4A16 grouped-MoE GEMM (src/vt/cuda/marlin/).
   # upstream: vLLM MARLIN_ARCHS "8.0+PTX;12.0a;12.1a" (CMakeLists.txt:558) — the
   # sm80+PTX leg is NOT claimed here: our vendored slice is the bf16 NVFP4
