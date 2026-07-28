@@ -319,7 +319,7 @@ The ABI covers lifecycle, blocking and streaming completion, non-blocking concur
 memory helpers, and diagnostics. Later ABI versions add structured output (v2), chat with tools and
 templates (v3), tool-parser selection (v4), reasoning-parser selection (v5), speculative decoding
 (v6), prefix caching (v7), custom logits processors (v8), and the remaining engine-sizing config the
-bundled server exposes — chunked-prefill token budget, scheduling policy and the external KV
+bundled server exposes: chunked-prefill token budget, scheduling policy and the external KV
 connector / LMCache (v9); chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships. Full surface: [`include/vllm.h`](include/vllm.h) and
 [docs/STATUS.md](docs/STATUS.md).
@@ -350,7 +350,7 @@ carries no ggml or PyTorch dependency.
 | CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
 | CUDA | Hopper, sm_90a | Build-supported, portable-kernels-only (accelerated paths disabled); not runtime-proven here |
 | CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a), sm_110 | Build-supported, portable-kernels-only; not runtime-proven here. sm_70/sm_75 are not build-supported (no bf16 tensor cores) |
-| Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 96.4% of MLX-LM, or 99.1% with the optional MLX provider gated to prefill. Indicative ([BENCHMARKS](docs/BENCHMARKS.md)) |
+| Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill. Indicative ([BENCHMARKS](docs/BENCHMARKS.md)) |
 | Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet; off unless `-DVLLM_CPP_VULKAN=ON` |
 | Intel XPU | Intel GPUs | Spiked, hardware-blocked |
 | ROCm / ANE | AMD GPUs / Apple Neural Engine | Post-parity roadmap |

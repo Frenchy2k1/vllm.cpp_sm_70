@@ -3484,6 +3484,38 @@ this workload.
 
 ---
 
+## CORRECTION: the MLX-gated result is 97.6%, not 99.1% (2026-07-28)
+
+The entry below claims 99.1%. **It is wrong, and the error is mine: a two-sample
+baseline.** MLX-LM was measured twice, 27.135 and 27.744 generation tok/s, and I
+averaged them to 27.44. Re-measured INTERLEAVED with ours over 4 ABBA blocks,
+MLX-LM's decode is **27.848 with a 0.34% spread** across six runs — extremely
+stable. The 27.135 was an outlier, and including it in a two-sample mean flattered
+us by about 1.5 points.
+
+**Corrected, from the interleaved run** (ours spread 0.12%, MLX-LM's 0.34%):
+
+| | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill TTFT | **524.5 ms** | 532.6 ms | **+1.5% (we are faster)** |
+| decode | 27.23 | 27.85 | 97.8% |
+| **warm total** | **24.37** | 24.96 | **97.6%** |
+
+The default (non-MLX) build is **95.9%** against this corrected baseline, not
+96.4%.
+
+**Everything qualitative in the entry below still holds** — MLX wins prefill, the
+shape gate is the right disposition, the fallback hoist was worth 27.2 vs 17.8 —
+only the headline ratio moves. The gate is still worth about +1.7 points over the
+default build.
+
+**Lesson, and it is one this log has now taught twice:** a ratio is only as good
+as its DENOMINATOR's sample count. I applied the paired-harness discipline to our
+own A/Bs all session and then compared against a two-run external baseline. The
+reference needs the same treatment as the candidate.
+
+---
+
 ## MLX SHAPE-GATED to prefill: 96.4% -> 99.1% of MLX-LM (2026-07-28)
 
 The question "should we drop MLX, since it is slower?" was tested and answered
