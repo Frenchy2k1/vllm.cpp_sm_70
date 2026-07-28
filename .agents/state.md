@@ -31214,3 +31214,42 @@ result section, the highest-risk OUTCOME), `engine-matrix.md`
 (axis-B paragraph + the NVFP4-GGUF capability correction), `docs/BENCHMARKS.md`
 (axis-B section, `PENDING` with the reason a cross-container throughput A/B would
 be meaningless today), `parity-ledger.md`, this log.
+## 2026-07-28 — AWQ + GPTQ native quant: W0 spike + W1 CPU INT4 dequant (`CLAIM-QUANT-AWQ-GPTQ`)
+
+Isolated worktree `/home/mudler/_git/vllm.cpp-awqgptq` branch `feat/quant-awq-gptq`,
+base `main` `d77d7dba` (`git rev-parse HEAD`). CPU-only, local `-Werror` build
+`build-cpu` (`VLLM_CPP_CUDA=OFF`). NO GPU, NOT pushed. HIGH-priority gap #3 from
+the feature-gap analysis.
+
+**Landed (foreground):**
+- **W0** — `.agents/specs/awq-gptq-quant.md`: whole-chain spike over vLLM's AWQ +
+  GPTQ path. Config parse (`auto_awq.py`/`auto_gptq.py`), the packed layout
+  (pack axis, reverse-AWQ vs standard bit order, zeros/scales, act-order
+  `g_idx`), the CPU reference dequant, the Marlin repack+GEMM vLLM actually runs
+  on GB10 (rides the SAME Marlin family we vendor for NVFP4), the
+  `choose_mp_linear_kernel` selection, upstream tests, gates, W0-W6 breakdown.
+- **W1** — first CPU brick, standalone (no loader/model change): INT4
+  unpack+dequant-to-bf16 for both formats in new additive TUs
+  `src/vllm/model_executor/model_loader/awq_gptq_dequant.{cpp,h}`, wired into the
+  `vllm` lib source list + a new `test_awq_gptq_dequant` test target.
+  - `DequantAwq4ToBf16` mirrors `awq_triton.py:11-105`: reverse-AWQ order
+    `[0,4,1,5,2,6,3,7]`, `(w - z) * s`, N-axis packing.
+  - `DequantGptq4ToBf16` mirrors `qdq_4.cuh` + `q_gemm.cu:201-202`: standard
+    order, K-axis packing, optional act-order `g_idx`, explicit `zero_offset`
+    (1=GPTQv1 classic / 0=GPTQv2), `(w - (z + off)) * s`. Payloads read as
+    `uint32` so a set MSB never corrupts a nibble.
+  - Gate RED-first: hand-computed known packed int32 (independent arithmetic
+    oracle; AWQ `col7=15` set-MSB sign-safety; GPTQ zero_offset v1 AND v2;
+    act-order `g_idx`) + randomized double-precision layout roundtrip through an
+    INDEPENDENT reference packer. Argument-validation aborts covered.
+
+**Records (same change):** `quantization-matrix.md` QUANT-AWQ/QUANT-GPTQ rows
+(INVENTORIED→ACTIVE, `M`=part, code+test+spike anchors), roadmap HIGH-gap #3
+row, `docs/STATUS.md` capability row, `docs/BENCHMARKS.md` NOT-APPLICABLE,
+`coordination.md` `CLAIM-QUANT-AWQ-GPTQ` claim, `parity-ledger.md`, this entry.
+
+**Next bricks (unclaimed):** W2 config recognizer + safetensors probe (`R`); W3
+resident loader → bf16 expand + CPU dense `E`; W4 Marlin repack+GEMM GPU `C`/`P`
+(kernel-matrix row, bump the KERNEL constant, coordinate before touching shared
+`marlin_template.h`); W5 GPTQ 8/2/3-bit; W6 AWQ/GPTQ MoE. Upstream e2e tests
+(`test_auto_awq.py`/`test_auto_gptq.py`) named, to be checked in SKIPPED at W3.

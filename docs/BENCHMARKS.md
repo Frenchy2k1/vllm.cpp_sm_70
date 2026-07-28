@@ -16,6 +16,16 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## AWQ + GPTQ native quant W0 spike + W1 CPU dequant (2026-07-28, `CLAIM-QUANT-AWQ-GPTQ`) - NOT-APPLICABLE (CPU dequant primitive, no throughput owed)
+
+No benchmark. W1 lands the INT4 unpack+dequant-to-bf16 CPU primitive for AWQ and
+GPTQ (`src/vllm/model_executor/model_loader/awq_gptq_dequant.cpp`), unit-gated
+for correctness only (`tests/vllm/test_awq_gptq_dequant.cpp`: hand-computed known
+packed int32 + randomized double-precision roundtrip). A dequant primitive not
+yet wired to a loader or GPU GEMM owes no throughput number; the performance gate
+is W4 (Marlin GPU compute vs vLLM on the same workload). Spike:
+[`.agents/specs/awq-gptq-quant.md`](../.agents/specs/awq-gptq-quant.md).
+
 ## vLLM feature-gap analysis (2026-07-28, `CLAIM-FEATURE-GAP-SPIKE`) - NOT-APPLICABLE (records-only spike)
 
 No benchmark. A CPU/research sweep of pinned vLLM `555967922` (0.26.0.dev0) vs
