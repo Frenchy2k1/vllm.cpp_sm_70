@@ -88,12 +88,39 @@ injected callback, no engine internals touched).
 
 - W1: `POST /abort_requests` (explicit-ids + empty→abort-all callback contract) +
   tests — DONE (`CLAIM-C8-SERVE-ENDPOINTS`, 2026-07-28).
-- W2 (residual): the empty-list "abort ALL" enumeration in production `main.cpp`
-  needs an `AsyncLLM` active-request-id accessor (not exposed today — the callback
-  contract IS wired; production enumeration deferred with the rest of the opt-in
-  C8 endpoint family) — OPEN.
-- W3+ (residual): `/sleep`/`/wake_up`/`/is_sleeping`, `/pause`/`/resume`,
+- W2: production `main.cpp` wiring of `/abort_requests` — DONE
+  (`CLAIM-C8-SERVE-PROD-WIRING`, 2026-07-28). See "Production wiring" below.
+- W3 (residual): the empty-list "abort ALL" enumeration needs an `AsyncLLM`
+  active-request-id accessor (not exposed today — explicit-id abort IS wired to
+  the live engine; empty ids report 0 aborted rather than fabricate an all-abort
+  we cannot reach) — OPEN.
+- W4+ (residual): `/sleep`/`/wake_up`/`/is_sleeping`, `/pause`/`/resume`,
   `/start_profile`/`/stop_profile`, weight-update/EP endpoints — INVENTORIED, OPEN.
+
+## Production wiring (`CLAIM-C8-SERVE-PROD-WIRING`, 2026-07-28)
+
+`examples/server/main.cpp` now wires `POST /abort_requests` to the LIVE `AsyncLLM`
+through the shared `ConfigureUtilityEndpoints` seam
+(`src/vllm/entrypoints/openai/api_server.cpp`), mirroring vLLM 0.26 @ `555967922`.
+
+Default gating: `/abort_requests` is a DEV-mode endpoint in vLLM — `build_app`
+registers the dev/rlhf router ONLY under `if envs.VLLM_SERVER_DEV_MODE`
+(`vllm/entrypoints/openai/api_server.py:238-240` →
+`vllm/entrypoints/serve/__init__.py:35` `register_vllm_dev_api_routers` →
+`serve/dev/rlhf/api_router.py:94`); `VLLM_SERVER_DEV_MODE` defaults `0`
+(`vllm/envs.py:157,1350`). We mirror that gate with a new CLI flag
+`--enable-server-dev-mode` (default off) — a default production server 404s
+`/abort_requests`, byte-identical to before.
+
+When `--enable-server-dev-mode` is set, the abort callback routes explicit
+`request_ids` through `AsyncLLM::abort` (`include/vllm/v1/engine/async_llm.h:115`)
+and reports the exact drop in unfinished requests (`get_num_unfinished_requests()`
+before − after; `abort()` synchronously removes the request states under the
+output-processor lock, so the delta is exact). The empty-`request_ids` "abort ALL"
+contract is a NAMED RESIDUAL: `AsyncLLM` exposes no active-request-id enumeration
+(missing accessor: `AsyncLLM::active_request_ids()` / an internal abort-all path),
+so empty ids abort nothing and report `0` rather than fabricate an all-abort the
+frontend cannot reach.
 
 ## Risks/decisions
 

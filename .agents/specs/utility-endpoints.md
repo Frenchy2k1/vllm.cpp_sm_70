@@ -119,11 +119,55 @@ KV-block-hash code touched).
 - W3: chat-form `/tokenize` (messages + chat template + tools) — DONE
   (`CLAIM-C8-CHAT-TOKENIZE`); `/tokenizer_info` — DONE (`CLAIM-C8-SERVE-ENDPOINTS`,
   2026-07-28, with the named-gap omissions above).
-- W4 (residual): `/ready`, the full `server_info` config dump, and production
-  `main.cpp` wiring of the whole opt-in C8 endpoint family (tokenize/detokenize/
-  metrics/reset/tokenizer_info are handler+setter+route+test complete but NOT yet
-  attached in the production server binary — the same deferred state for all of
-  them) — OPEN.
+- W4: production `main.cpp` wiring of the opt-in utility endpoints — DONE
+  (`CLAIM-C8-SERVE-PROD-WIRING`, 2026-07-28). See "Production wiring" below.
+- W5 (residual): `/ready`, the full `server_info` config dump, and the two
+  endpoints that stay unwired for lack of a live backing (`/metrics`,
+  `/reset_prefix_cache` — see "Production wiring") — OPEN.
+
+## Production wiring (`CLAIM-C8-SERVE-PROD-WIRING`, 2026-07-28)
+
+The shipped `vllm-server` binary (`examples/server/main.cpp`) now lights the C8
+utility endpoints from the LIVE engine + tokenizer through a single shared seam,
+`ConfigureUtilityEndpoints` (`include/vllm/entrypoints/openai/api_server.h`,
+`src/vllm/entrypoints/openai/api_server.cpp`), mirroring vLLM 0.26 @ `555967922`'s
+PER-ENDPOINT default gating. The gate (`test_api_server.cpp` "ConfigureUtilityEndpoints
+wires the production C8 surface") drives the EXACT same seam over a real socket, so
+the test exercises the production wiring, not a parallel copy.
+
+Per-endpoint default gating (vLLM ↔ ours):
+
+- `/tokenize`, `/detokenize` — ON by default when a tokenizer exists. vLLM's
+  `build_app` always calls `register_vllm_serve_api_routers` →
+  `attach_tokenize_router` (`vllm/entrypoints/serve/__init__.py:11-31`;
+  `vllm/entrypoints/openai/api_server.py:222`), which registers the two POST routes
+  (`serve/tokenize/api_router.py:36,62`). → we call `set_tokenizer(&tokenizer,
+  max_model_len)` unconditionally.
+- `/tokenizer_info` — OFF by default, behind
+  `app.state.args.enable_tokenizer_info_endpoint` (`serve/tokenize/api_router.py:95`;
+  `vllm/entrypoints/openai/cli_args.py:140` default `False`). → new CLI flag
+  `--enable-tokenizer-info-endpoint` (default off) drives `set_tokenizer_info_enabled`.
+- `/metrics` — NOT wired (deliberate, honest residual). vLLM mounts it by default
+  (via the instrumentator), but the production frontend here is `AsyncLLM`
+  (`main.cpp`: `loaded->async_engine()`), whose output handler records NO
+  iteration/scheduler stats to any `PrometheusStatLogger` (async stats deferred,
+  see `specs/async-serving.md`); neither `LoadedEngine` nor `AsyncLLM` constructs or
+  exposes one (`model_loader.cpp` has zero stat-logger references; the only
+  `Record()` site is the synchronous `LLMEngine::step()`, which the server does not
+  use). Missing accessor: `LoadedEngine::stat_logger()` + a `Record()` call site in
+  `AsyncLLM::RunOutputHandler`. Attaching a freshly-constructed logger would serve a
+  permanently-zero exposition (a fabricated wiring that never reaches the live
+  engine), so it is left unwired. The library handler + its unit test
+  (`test_api_server.cpp:1011`) remain, exercised via an explicitly-attached logger.
+- `/reset_prefix_cache` — NOT wired (deliberate, honest residual). `reset_prefix_cache()`
+  exists only on `KVCacheManager` (owned privately by `Scheduler`, exposed const via
+  `LoadedEngine::scheduler()`) and is mutated exclusively on the `EngineCore` engine
+  thread; there is no thread-safe engine-core RPC (`EngineCore`/`InprocClient` expose
+  only add_request/abort_requests/step). Missing accessor:
+  `AsyncLLM::reset_prefix_cache(bool,bool)` backed by an `EngineCore`
+  RESET_PREFIX_CACHE control message. A direct call from the HTTP thread would
+  data-race the running scheduler, so it is left unwired. The library handler + its
+  unit test (`test_api_server.cpp:1040`) remain, exercised via an injected callback.
 
 ## Risks/decisions
 

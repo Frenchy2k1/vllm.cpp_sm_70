@@ -75,6 +75,8 @@ using vllm::OwnedTensor;
 using vllm::Qwen3_5MoeWeights;
 using vllm::SchedulerConfig;
 using vllm::entrypoints::openai::ApiServer;
+using vllm::entrypoints::openai::ConfigureUtilityEndpoints;
+using vllm::entrypoints::openai::UtilityEndpointOptions;
 using vllm::entrypoints::openai::ChatMessage;
 using vllm::entrypoints::openai::OpenAIServingChat;
 using vllm::entrypoints::openai::OpenAIServingCompletion;
@@ -1310,6 +1312,153 @@ TEST_CASE("api_server: /tokenizer_info + /abort_requests are opt-in routes") {
 
     h.server.stop();
     server_thread.join();
+  }
+}
+
+// ─── 1c. PRODUCTION WIRING (CLAIM-C8-SERVE-PROD-WIRING) ──────────────────────
+// ConfigureUtilityEndpoints is the SINGLE seam examples/server/main.cpp uses to
+// light the C8 endpoints from the LIVE engine + tokenizer. This drives that exact
+// seam over the synthetic engine and asserts the production server now serves each
+// newly-wired route under vLLM 0.26's per-endpoint default gating. RED-first:
+// without the seam the C8 routes 404; the seam turns on exactly what vLLM turns on
+// by default, and gates /tokenizer_info + /abort_requests behind their flags.
+TEST_CASE("api_server: ConfigureUtilityEndpoints wires the production C8 surface") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+  // Run `body` against a client bound to a freshly-served harness, then stop.
+  auto with_server = [](ServerHarness& h, auto&& body) {
+    const int port = h.server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&h]() { h.server.serve(); });
+    for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(h.server.is_running());
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(5, 0);
+    body(client);
+    h.server.stop();
+    server_thread.join();
+  };
+
+  // RED: a default production server WITHOUT the wiring seam 404s every C8 route,
+  // while the core routes are unaffected — the inertness baseline.
+  SUBCASE("without the wiring seam every C8 route is 404 (RED); core routes 200") {
+    ServerHarness h(c, w, Fixture());
+    with_server(h, [](httplib::Client& client) {
+      auto tok =
+          client.Post("/tokenize", R"({"prompt":"hi"})", "application/json");
+      REQUIRE(tok);
+      CHECK(tok->status == 404);
+      auto detok =
+          client.Post("/detokenize", R"({"tokens":[0]})", "application/json");
+      REQUIRE(detok);
+      CHECK(detok->status == 404);
+      auto info = client.Get("/tokenizer_info");
+      REQUIRE(info);
+      CHECK(info->status == 404);
+      auto abort = client.Post("/abort_requests", R"({"request_ids":["x"]})",
+                               "application/json");
+      REQUIRE(abort);
+      CHECK(abort->status == 404);
+      // Core routes remain served + unchanged.
+      auto health = client.Get("/health");
+      REQUIRE(health);
+      CHECK(health->status == 200);
+      auto models = client.Get("/v1/models");
+      REQUIRE(models);
+      CHECK(models->status == 200);
+      CHECK(json::parse(models->body).at("data").at(0).at("id") == "test-model");
+    });
+  }
+
+  // GREEN, production defaults (both flags OFF): /tokenize + /detokenize serve
+  // (on by default when a tokenizer exists), while /tokenizer_info and
+  // /abort_requests stay 404 — exactly vLLM's default gating.
+  SUBCASE("production defaults: tokenize/detokenize on, info+abort gated 404") {
+    ServerHarness h(c, w, Fixture());
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              UtilityEndpointOptions{});
+    with_server(h, [](httplib::Client& client) {
+      auto tok = client.Post("/tokenize", R"({"prompt":"hello world"})",
+                             "application/json");
+      REQUIRE(tok);
+      CHECK(tok->status == 200);
+      json tj = json::parse(tok->body);
+      CHECK(tj.at("max_model_len") == kMaxModelLen);
+      std::vector<int> ids = tj.at("tokens").get<std::vector<int>>();
+      json detok_req;
+      detok_req["tokens"] = ids;
+      auto detok =
+          client.Post("/detokenize", detok_req.dump(), "application/json");
+      REQUIRE(detok);
+      CHECK(detok->status == 200);
+      CHECK(json::parse(detok->body).at("prompt").is_string());
+      // Flag/dev-mode-gated routes stay off.
+      auto info = client.Get("/tokenizer_info");
+      REQUIRE(info);
+      CHECK(info->status == 404);
+      auto abort = client.Post("/abort_requests", R"({"request_ids":["x"]})",
+                               "application/json");
+      REQUIRE(abort);
+      CHECK(abort->status == 404);
+    });
+  }
+
+  // GREEN, both flags ON: /tokenizer_info + /abort_requests are now served over a
+  // real socket by the production seam.
+  SUBCASE("flags on: tokenizer_info + abort_requests serve over the socket") {
+    ServerHarness h(c, w, Fixture());
+    UtilityEndpointOptions opts;
+    opts.enable_tokenizer_info_endpoint = true;
+    opts.enable_server_dev_mode = true;
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              opts);
+    with_server(h, [](httplib::Client& client) {
+      auto info = client.Get("/tokenizer_info");
+      REQUIRE(info);
+      CHECK(info->status == 200);
+      CHECK(json::parse(info->body).at("tokenizer_class") ==
+            "ByteLevelBPETokenizer");
+      auto abort = client.Post("/abort_requests", R"({"request_ids":["nope"]})",
+                               "application/json");
+      REQUIRE(abort);
+      CHECK(abort->status == 200);
+      CHECK(json::parse(abort->body).at("status") == "aborted");
+    });
+  }
+
+  // The production abort callback installed by ConfigureUtilityEndpoints reaches
+  // the LIVE AsyncLLM: an explicit-id abort tears the in-flight request down and
+  // reports the exact drop in unfinished requests (before − after). Driven
+  // in-process (handle_abort_requests, no socket) so the count is deterministic.
+  SUBCASE("dev-mode abort callback tears down the live request (exact count)") {
+    ServerHarness h(c, w, Fixture());
+    UtilityEndpointOptions opts;
+    opts.enable_server_dev_mode = true;
+    ConfigureUtilityEndpoints(h.server, Fixture(), kMaxModelLen, h.async_engine,
+                              opts);
+
+    vllm::SamplingParams params;
+    params.max_tokens = 30;
+    params.temperature = 0.0;
+    h.async_engine.add_request("abort-me", "hello", params);
+    REQUIRE(h.async_engine.has_unfinished_requests());
+
+    json r = json::parse(
+        h.server.handle_abort_requests(R"({"request_ids":["abort-me"]})").body);
+    CHECK(r.at("status") == "aborted");
+    CHECK(r.at("aborted") == 1);  // production before/after delta
+    for (int i = 0; i < 500 && h.async_engine.has_unfinished_requests(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK_FALSE(h.async_engine.has_unfinished_requests());
+
+    // Empty request_ids → the abort-ALL residual → 0 aborted (AsyncLLM exposes
+    // no active-request-id accessor; explicit-id abort is the supported path).
+    json all = json::parse(
+        h.server.handle_abort_requests(R"({"request_ids":[]})").body);
+    CHECK(all.at("status") == "aborted");
+    CHECK(all.at("aborted") == 0);
   }
 }
 
