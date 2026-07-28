@@ -486,6 +486,7 @@ add_library(vllm STATIC
   src/vllm/v1/engine/output_processor.cpp
   src/vllm/v1/engine/logprobs.cpp
   src/vllm/v1/engine/llm_engine.cpp
+  src/vllm/entrypoints/beam_search.cpp
   src/vllm/v1/executor/executor.cpp
   src/vllm/model_executor/layers/attention/attention.cpp
   src/vllm/model_executor/layers/attention/chunked_local_attention.cpp

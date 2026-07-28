@@ -225,3 +225,77 @@ Closes the C7 `SAMPLE-N` inventory row: the OpenAI `n` sampling parameter
   `n` field (needs an ABI bump + a multi-output return shape) so C-ABI requests stay
   `n==1`. Prompt tokens are shared; prefill-KV sharing rides on the existing
   block-hash APC (no dedicated n>1 KV-share optimization added).
+
+## `SAMPLE-BEAM` — beam search (ACTIVE, `CLAIM-C7-BEAM`)
+
+Closes the C7 `SAMPLE-BEAM` inventory row: beam search as an OUTER loop over the
+engine (it is NOT a core-sampler param), the sibling multi-sequence feature to
+`SAMPLE-N` — it REUSES the multi-output return, does not perturb the n>1 / n=1 /
+plain-sampling paths.
+
+- Upstream chain: `BeamSearchParams` (`vllm/sampling_params.py:1114`:
+  `beam_width`, `max_tokens`, `ignore_eos`, `temperature`, `length_penalty`);
+  `BeamSearchSequence` / `BeamSearchOutput` / `BeamSearchInstance` /
+  `get_beam_search_score` / `create_sort_beams_key_function`
+  (`vllm/entrypoints/generate/beam_search/utils.py:18,102,112,137,156`); the
+  driver `BeamSearchOfflineMixin.beam_search` + `_beam_search_step`
+  (`vllm/entrypoints/generate/beam_search/offline.py:58,193`). The per-step loop:
+  run ONE decode per beam with `SamplingParams(logprobs=2*beam_width, max_tokens=1,
+  temperature=temperature)` (`offline.py:118-123`), read each beam's single
+  generated position's `logprobs[0]` dict (`offline.py:303`), form a candidate per
+  `(token_id, logprob)` with `cum_logprob += logprob` (`offline.py:308-314`), send
+  EOS candidates (`token_id == eos && !ignore_eos`) to `completed`
+  (`offline.py:316-317`) and the rest to `new_beams`, sort `new_beams` by the
+  length-penalty score DESCENDING and keep the top-`beam_width`
+  (`offline.py:320-325`); stop at `max_tokens` or when all beams are exhausted
+  (`offline.py:219-220`). Final: append the surviving active beams to `completed`,
+  sort DESCENDING, return the top-`beam_width` (`offline.py:178-189`).
+- Scoring formula (the correctness content, `utils.py:137-153`):
+  `get_beam_search_score(tokens, cum_logprob, eos, length_penalty) = cum_logprob /
+  (seq_len ** length_penalty)` where `seq_len = len(tokens)` (which INCLUDES the
+  prompt, since `BeamSearchSequence.tokens` starts at the prompt ids) minus one
+  when `tokens[-1] == eos`. `create_sort_beams_key_function` closes over
+  `(eos, length_penalty)` and sorts by this key.
+- Our port: `include/vllm/entrypoints/beam_search.h` + `.cpp` (namespace `vllm`).
+  The correctness content is a MODEL-FREE core — `get_beam_search_score`,
+  `SortBeamsKey`, `BeamSearchStep(instance, per_beam_logprobs, eos, ignore_eos,
+  beam_width, length_penalty)` (mirrors `_beam_search_step`'s non-structured path
+  1:1) — plus a thin engine driver `BeamSearch(LLMEngine&, prompt_tokens, params,
+  eos, tokenizer?)` that sources each step's per-beam next-token dict from
+  `LLMEngine::generate(beam.tokens, SamplingParams{logprobs=2*beam_width,
+  max_tokens=1, temperature})` and calls `BeamSearchStep`, then does the final
+  sort/select. `std::stable_sort` with a strict-`>` comparator reproduces Python's
+  `sorted(reverse=True)` EXACTLY (Timsort is stable; `reverse=True` keeps the input
+  order of equal-key elements).
+- Determinism gate design: beam search under `temperature=0` (the default) is
+  greedy per-beam ⇒ fully DETERMINISTIC, so it is gated token-for-token. The
+  MANDATORY gate is model-free: a hand-computed beam tree (`beam_width=2`, a fixed
+  toy logprob table, two full steps) whose expected beams/tokens/scores/EOS
+  routing/length-penalty are computed by hand and asserted against `BeamSearchStep`
+  + `get_beam_search_score` EXACTLY — this is the real correctness content and
+  needs no model.
+- Gates: `tests/vllm/entrypoints/test_beam_search.cpp` (5 cases / 45 assertions):
+  (1) `get_beam_search_score` exact — no-eos, EOS seq_len decrement, `length_penalty
+  != 1.0`, `eos == nullopt`; (2) two full steps token-EXACT vs the reference tree
+  (expand → score → keep top-`beam_width` → EOS→completed) + the final top-k tail;
+  (3) `ignore_eos` keeps the EOS token as a normal beam; (4) a null per-beam dict
+  (completed/aborted sequence) yields no continuations; (5) an exhausted instance
+  stops. **RED-first:** with `BeamSearchStep` stubbed to no-op the toy fails
+  `REQUIRE(instance.beams.size() == 2)` (`1 == 2`) and the e2e fails `1 == 5`; the
+  real expand/select flips both to GREEN. Plus `tests/vllm/v1/test_llm_engine.cpp`
+  ("beam search returns beam_width scored continuations, bw=1 == greedy") — e2e over
+  the synthetic CPU Qwen3.6 engine: `beam_width` distinct full-length continuations
+  of the prompt ordered by descending score, `beam_width=1` beam search is
+  token-identical to plain greedy `generate`, and the wider beam finds `>=`
+  cumulative logprob.
+- Inertness: the sampling/serving suites stay byte-identical — the feature is a NEW
+  additive TU + header with ZERO edits to any existing compiled path (the only test
+  edit is a new case + one include in `test_llm_engine.cpp`): `test_sampler` 11/11,
+  `test_output_processor` 8/8, `test_scheduler` 36/36, `test_openai_serving` 28/28
+  UNCHANGED; the n>1 / n=1 / plain-sampling paths are untouched.
+- RESIDUALS (honest, named): the OpenAI-endpoint `use_beam_search` / `best_of`→beam
+  mapping and the C-ABI beam params are NOT wired (the `LLM`-API `BeamSearch` driver
+  is the entry point); grammar-constrained beam search (the structured-output
+  bitmask branch of `_beam_search_step`, `offline.py:222-258,329-455`) and the
+  encoder-decoder / LoRA beam variants are out of scope; the multi-prompt batch loop
+  (`offline.py:141-173`) is single-prompt here.

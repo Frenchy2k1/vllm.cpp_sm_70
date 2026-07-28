@@ -48,6 +48,7 @@
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
+#include "vllm/entrypoints/beam_search.h"
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/engine/core.h"
 #include "vllm/v1/engine/input_processor.h"
@@ -500,6 +501,98 @@ TEST_CASE("llm_engine: n>1 fans out into n token-identical deterministic outputs
   for (int i = 0; i < kSeqs; ++i) {
     CHECK_MESSAGE(seen.count(i) == 1, "missing completion index " << i);
   }
+}
+
+// ─── 1c. Beam search: end-to-end over the CPU engine (SAMPLE-BEAM) ───────────
+// Beam search is an OUTER loop over the engine: each step runs one decode per beam
+// (logprobs=2*beam_width, max_tokens=1), expands each beam to those next tokens,
+// keeps the top-beam_width by the length-penalty score, and returns beam_width
+// beams ordered by descending score (vllm/entrypoints/generate/beam_search/
+// offline.py). Deterministic (greedy per-beam) ⇒ exact. The model-free scoring /
+// selection / EOS / length-penalty gate is tests/vllm/entrypoints/test_beam_search
+// .cpp; here we prove the driver runs the real engine and returns beam_width valid
+// continuations, anchored to the deterministic greedy path: beam_width=1 beam
+// search IS greedy (keep top-1 each step), so its tokens must equal plain greedy
+// generate, and a wider beam must find >= cumulative logprob.
+TEST_CASE("llm_engine: beam search returns beam_width scored continuations, bw=1 == greedy") {
+  const HfConfig c = MakeConfig();  // synthetic Qwen3.6, no eos -> runs to length
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kSteps = 4;
+  const std::optional<int> kNoEos = std::nullopt;  // config has no eos_token_id
+
+  // Greedy reference (+ the exact prompt token ids the engine tokenizes "hello"
+  // into, reused verbatim for the beam-search prompt so tokenization matches).
+  std::vector<int32_t> prompt_tokens;
+  std::vector<int32_t> greedy_gen;
+  {
+    Harness h(c, w, tok);
+    RequestOutput g = h.engine.generate("hello", Greedy(kSteps), "g");
+    prompt_tokens = g.prompt_token_ids;
+    greedy_gen = g.outputs.at(0).token_ids;
+  }
+  REQUIRE(!prompt_tokens.empty());
+  REQUIRE(static_cast<int>(greedy_gen.size()) == kSteps);
+
+  auto Params = [&](int beam_width) {
+    vllm::BeamSearchParams p;
+    p.beam_width = beam_width;
+    p.max_tokens = kSteps;
+    p.temperature = 0.0;  // greedy per-beam -> deterministic
+    p.length_penalty = 1.0;
+    p.ignore_eos = false;
+    return p;
+  };
+
+  // beam_width == 1 collapses to greedy: keep top-1 of the 2 candidates each step
+  // (score with length_penalty 1.0 and equal length == argmax cum_logprob).
+  vllm::BeamSearchOutput bw1;
+  {
+    Harness h(c, w, tok);
+    bw1 = vllm::BeamSearch(h.engine, prompt_tokens, Params(1), kNoEos, &tok);
+  }
+  REQUIRE(bw1.sequences.size() == 1);
+  // Full tokens == prompt + generated; the generated tail must equal greedy.
+  REQUIRE(bw1.sequences[0].tokens.size() == prompt_tokens.size() + kSteps);
+  std::vector<int32_t> bw1_gen(
+      bw1.sequences[0].tokens.begin() +
+          static_cast<std::ptrdiff_t>(prompt_tokens.size()),
+      bw1.sequences[0].tokens.end());
+  CHECK(bw1_gen == greedy_gen);
+
+  // beam_width == 3: exactly 3 outputs, each a valid full-length continuation of
+  // the prompt, distinct, ordered by descending score.
+  const int kBeam = 3;
+  vllm::BeamSearchOutput bw3;
+  {
+    Harness h(c, w, tok);
+    bw3 = vllm::BeamSearch(h.engine, prompt_tokens, Params(kBeam), kNoEos, &tok);
+  }
+  REQUIRE(static_cast<int>(bw3.sequences.size()) == kBeam);
+
+  std::set<std::vector<int32_t>> seen;
+  double prev_score = 1e18;
+  for (const vllm::BeamSearchSequence& s : bw3.sequences) {
+    // Valid continuation: prompt prefix + kSteps generated tokens.
+    REQUIRE(s.tokens.size() == prompt_tokens.size() + kSteps);
+    CHECK(std::equal(prompt_tokens.begin(), prompt_tokens.end(),
+                     s.tokens.begin()));
+    // Distinct beams.
+    CHECK(seen.insert(s.tokens).second);
+    // No eos configured -> length finish; text decoded (tokenizer supplied).
+    REQUIRE(s.finish_reason.has_value());
+    CHECK(*s.finish_reason == "length");
+    CHECK(s.text.has_value());
+    // Descending by beam-search score.
+    const double score =
+        vllm::get_beam_search_score(s.tokens, s.cum_logprob, kNoEos, 1.0);
+    CHECK(score <= prev_score + 1e-9);
+    prev_score = score;
+  }
+
+  // Beam search never does WORSE than greedy in cumulative logprob: the best
+  // beam_width=3 beam's cum_logprob >= the beam_width=1 (greedy) beam's.
+  CHECK(bw3.sequences[0].cum_logprob >= bw1.sequences[0].cum_logprob - 1e-6);
 }
 
 // ─── 2. Two-request concurrent batch ─────────────────────────────────────────

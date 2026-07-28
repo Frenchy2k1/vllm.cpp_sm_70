@@ -305,6 +305,32 @@ single-sequence result — vLLM forbids greedy n>1, so the determinism gate uses
 `cmake --build build-cpu --target test_llm_engine test_openai_serving &&
 ./build-cpu/tests/test_llm_engine && ./build-cpu/tests/test_openai_serving`.
 
+**ROAD-V1-C7 beam search (`SAMPLE-BEAM`) (2026-07-28, `CLAIM-C7-BEAM`, NOT
+pushed).** Disposition: **NOT APPLICABLE (no throughput number,
+`benchmark_binding=false`; a feature/correctness capability, and the existing
+sampling / n>1 / n=1 paths are byte-identical — beam search is a NEW additive
+outer-loop TU that touches no compute path).** Beam search runs as an OUTER loop
+over the engine (mirroring vLLM `entrypoints/generate/beam_search/{utils,offline}
+.py`): each step runs one decode per beam (`logprobs=2*beam_width`, `max_tokens=1`),
+expands each beam to those next tokens (`cum_logprob += logprob`), keeps the
+top-`beam_width` by `get_beam_search_score = cum_logprob / seq_len**length_penalty`,
+retires EOS beams, and returns the top-`beam_width` completed beams. Deterministic
+(greedy per-beam) ⇒ token-EXACT vs vLLM's algorithm: the MANDATORY gate is
+model-free — `test_beam_search` 5/5 (45 asserts) asserts `BeamSearchStep` +
+`get_beam_search_score` against a HAND-COMPUTED beam tree (scoring incl.
+`length_penalty != 1.0` + EOS seq_len decrement, two full expand/score/select/EOS
+steps + final top-k, ignore_eos, null-dict, exhaustion). RED-first: stubbing
+`BeamSearchStep` to no-op fails the toy `REQUIRE(1 == 2)` beams and the e2e
+`1 == 5`; the real expand/select flips both to GREEN. E2e over the synthetic CPU
+Qwen3.6 engine (`test_llm_engine` 9/9): `beam_width` distinct descending-score
+continuations, `beam_width=1` beam search token-identical to plain greedy, wider
+beam finds `>=` cumulative logprob. Inertness: `test_sampler` 11/11,
+`test_output_processor` 8/8, `test_scheduler` 36/36, `test_openai_serving` 28/28
+UNCHANGED. Clean full-library CPU `-Werror` 0-warn. Residuals (named): OpenAI
+`use_beam_search`/`best_of`→beam wiring, C-ABI beam params, grammar-constrained
+beams. Reproduce: `cmake --build build-cpu --target test_beam_search test_llm_engine
+&& ./build-cpu/tests/test_beam_search && ./build-cpu/tests/test_llm_engine`.
+
 **ROAD-V1-C8 /metrics LIVE per-step wiring (2026-07-27,
 `CLAIM-ROADMAP-C8-METRICS-WIRE`, NOT pushed).** Disposition: **NOT APPLICABLE (no
 throughput number, `benchmark_binding=false`; metrics are observational, off the
