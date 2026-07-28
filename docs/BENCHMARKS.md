@@ -5069,8 +5069,25 @@ that clears both, and the whole toolkit must match (cccl refuses a mixed
 compiler/header pair). Install vLLM with `--no-deps`, or pip re-resolves the CUDA
 runtime downward after the build and reintroduces the mismatch.
 
-The re-measured denominator is **PENDING**; until it lands, the binding 0.9819x
-ratio stands against 0.24.0 and is labelled as such.
+**RE-MEASURED (2026-07-28): the 0.9819x was PESSIMISTIC.** vLLM at the pin is
+0.9875x the 0.24.0 release on this workload, so the old denominator was the
+FASTER vLLM and was understating us. Against the true pin:
+
+| Axis | Direct ON | vLLM @ pin | ratio | Disposition |
+|---|---:|---:|---:|---|
+| Total throughput (tok/s) | 6618.160 | 6638.129 | 0.9970x | FAIL |
+| Output throughput (tok/s) | 731.817 | 734.026 | 0.9970x | FAIL |
+| Requests/s | 5.717 | 5.735 | 0.9969x | FAIL |
+| Mean TTFT (ms) | 729.217 | 943.198 | 0.7731x | PASS |
+| Mean TPOT (ms) | 38.107 | 33.900 | 1.1241x | FAIL |
+
+So the throughput gap is **0.3%, not 1.8%**, with no change to our code, and TPOT
+(+12.4%) is confirmed as the one real gap. Our own arm reproduces the previous
+series exactly (1.0027x, token-identical 128/128 per rep), which is the control
+that makes the oracle delta attributable to the oracle. Spread is 0.11% (pin) and
+0.08% (ours). Full provenance, the CUDA toolkit ceiling that constrained the
+build, and token identity:
+[pinned-oracle comparison](bench-evidence/qwen35-4b-pinned-oracle-20260728.md).
 
 ### OPEN LEAD - cuBLASLt resolves Ampere-class GEMM kernels on sm_120 (2026-07-27) - NOT MEASURED
 
