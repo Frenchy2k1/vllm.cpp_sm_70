@@ -85,6 +85,12 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 # named W3-W8 residuals (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
 
+# DeepSeek-V4-Flash W3: the NEW attention primitives (DSA Lightning-Indexer
+# top-k selection + 512-wide MLA attention sinks + grouped output-LoRA) unit-
+# gated vs hand-derived cases + double-precision references. Full-model gate is
+# multi-Spark-blocked (156.7 GiB); MHC/MoE are W5/W6 (.agents/specs/deepseek-v4-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_dsa vllm/models/test_deepseek_v4_dsa.cpp)
+
 # MLA CAMPAIGN W8 (DeepSeek-V2-Lite, DeepseekV2ForCausalLM) — the SACRED MLA
 # greedy correctness gate: drives a compact prompt battery through the paged
 # engine and checks STRICT token-exact agreement with the vLLM 0.25.0 oracle

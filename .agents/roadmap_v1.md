@@ -172,7 +172,19 @@ So the C4/GGUF roadmap item to make the single-Spark GGUF vehicle real is: lift 
 reject + wire a V4-GGUF loader + port IQ2_XXS (llama.cpp `dequantize_row_iq2_xxs` + `iq2xxs_grid`)
 and/or Q2_K dequant — gated vs llama.cpp-on-card (vLLM cannot oracle V4-from-GGUF). Apples-to-apples
 DeepSeek-V4 is the NVFP4 2×-Spark vehicle; a true same-GGUF cross-engine number is only available on
-a Qwen3/dense k-quant both engines already load. **NEXT-TIER BATCH TRIAGE (2026-07-24,
+a Qwen3/dense k-quant both engines already load. **W3 PRIMITIVES LANDED (2026-07-28,
+`CLAIM-DEEPSEEK-V4-W3`, base `308c312a`):** the genuinely-NEW attention math is ported + unit-gated
+as portable host references — the DSA "Lightning Indexer" sparse SELECTION (weighted-MQA logit
+`Σ_h w·ReLU(q·k)` with the load-bearing per-head ReLU + causal top-k `index_topk=512` + short-context
+all-select) and the two 512-wide-MLA output seams V2/V3 lack (per-head attention-sink softmax +
+grouped output-LoRA `wo_a` bmm→`wo_b`); new TUs `deepseek_v4_dsa.{h,cpp}` + `test_deepseek_v4_dsa`
+**13/13·38** (hand-derived literals + double-precision references rel-L2 < 1e-6), clean CPU
+`-Wall -Werror -Wextra`, SACRED-inert (shared `mla_attention` untouched — extraction is a W7
+follow-on); new kernel row `KERNEL-ATTN-DSA-SPARSE-INDEX` (`SPIKE`). **SGLang `v0.5.15` registers +
+implements `DeepseekV4ForCausalLM`** (full DSA/MHC/o_lora stack, 2856 LoC) ⇒ a viable SECOND
+benchmark/primitive-dump reference (same single-GB10 memory constraint). Residuals: MHC (W5),
+sqrtsoftplus/hash MoE (W6), device kernel + forward integration + strict gate (W7-W8 = multi-Spark).
+**NEXT-TIER BATCH TRIAGE (2026-07-24,
 `sweep-recent-dense-batch.md`, `CLAIM-SWEEP-RECENT-DENSE`):** 8 recent dense/small-MoE families
 advanced `INVENTORIED` -> `SPIKE` with a ranked one-agent-each queue — **4 ZERO-NEW-KERNEL
 near-additive** (Phi-3/Phi-4 `Phi3ForCausalLM` a Llama subclass, Granite-3 4-scalar-multipliers,

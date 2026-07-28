@@ -271,7 +271,20 @@ out-of-tree to the uninstalled `vllm-gguf-plugin` (which *does* dequant IQ2_XXS)
 hard-rejects GGUF for DeepSeek-V4/V2 and lacks IQ2_XXS/Q2_K dequant — so even the
 `UD-Q2_K_XL` k-quant fallback does not rescue it. Apples-to-apples for DeepSeek-V4 is
 the NVFP4 vehicle; a true same-GGUF cross-engine number is only available on a
-Qwen3/dense k-quant both engines already load.
+Qwen3/dense k-quant both engines already load. **W3 attention primitives landed
+(2026-07-28):** the genuinely-new-vs-V2/V3 math is ported as portable host references
+and unit-gated — the DSA "Lightning Indexer" sparse top-k SELECTION (a weighted
+multi-query logit with a load-bearing per-head ReLU, then a causal top-512 token
+select), plus the two 512-wide-MLA output pieces V2/V3 lack: per-head attention-sink
+softmax and grouped output-LoRA. `test_deepseek_v4_dsa` passes 13/13 (hand-derived
+literal cases plus double-precision references, clean CPU `-Wall -Werror -Wextra`);
+the gate is honest hand-case + structural review, not a dumped-oracle comparison
+(the fixed-config 167B model cannot be built at a tiny shape). It is additive and
+byte-neutral for DeepSeek-V2. SGLang v0.5.15 registers and implements
+`DeepseekV4ForCausalLM` (the full DSA/MHC stack), so it is a viable second reference,
+subject to the same single-GB10 memory limit. The remaining bricks — Manifold
+Hyper-Connections, the sqrtsoftplus/hash MoE, the device kernels, and the full model
+gate — stay multi-Spark-blocked.
 The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):
