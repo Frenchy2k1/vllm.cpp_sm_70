@@ -725,6 +725,11 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
                                      int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
                                      int64_t vc_pg, int64_t vc_hd, float scale, float softcap, bool causal,
                                      int window_left, int window_right) {
+// bf16 WMMA tensor-core body is Ampere+ (bf16 fragments are complete only for
+// __CUDA_ARCH__ >= 800). Guard so Turing/Volta/Pascal device passes compile the
+// TU selecting the scalar CUDA-core fallback path; sm_80+ keeps the body verbatim
+// (preprocessor identity → byte-identical). Never launched on <sm_80 at runtime.
+#if __CUDA_ARCH__ >= 800
   const int tile_idx = blockIdx.x;
   const int h = blockIdx.y;  // q-head
   if (tile_idx >= num_tiles) return;
@@ -900,6 +905,9 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
       Store(out, qoff + col, Osm[e] * inv);
     }
   }
+#else
+  __trap();  // bf16-WMMA path is not built for __CUDA_ARCH__ < 800 (see guard above)
+#endif
 }
 
 // ===========================================================================
@@ -947,6 +955,7 @@ __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k
                                         int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
                                         int64_t vc_pg, int64_t vc_hd, float scale, float softcap, bool causal,
                                         int window_left, int window_right) {
+#if __CUDA_ARCH__ >= 800  // bf16 WMMA body is Ampere+; <sm_80 uses scalar fallback (byte-identical on sm_80+)
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;  // group over hq/QG groups of QG consecutive q-heads
   if (tile_idx >= num_tiles) return;
@@ -1134,6 +1143,9 @@ __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k
       Store(out, qoff + col, Osm[e] * inv);
     }
   }
+#else
+  __trap();  // bf16-WMMA path is not built for __CUDA_ARCH__ < 800 (see guard above)
+#endif
 }
 
 // ===========================================================================
@@ -1182,6 +1194,7 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
                                               int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
                                               float scale, float softcap, bool causal, int window_left,
                                               int window_right) {
+#if __CUDA_ARCH__ >= 800  // bf16 WMMA body is Ampere+; <sm_80 uses scalar fallback (byte-identical on sm_80+)
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;
   if (tile_idx >= num_tiles) return;
@@ -1399,6 +1412,9 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
       __syncwarp();
     }
   }
+#else
+  __trap();  // bf16-WMMA path is not built for __CUDA_ARCH__ < 800 (see guard above)
+#endif
 }
 
 // ===========================================================================
@@ -1453,6 +1469,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
                                                  int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
                                                  float scale, float softcap, bool causal, int window_left,
                                                  int window_right) {
+#if __CUDA_ARCH__ >= 800  // bf16 WMMA body is Ampere+; <sm_80 uses scalar fallback (byte-identical on sm_80+)
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;
   if (tile_idx >= num_tiles) return;
@@ -1664,6 +1681,9 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
       __syncwarp();
     }
   }
+#else
+  __trap();  // bf16-WMMA path is not built for __CUDA_ARCH__ < 800 (see guard above)
+#endif
 }
 
 // PREFILL flash-attn, LARGER-QUERY-TILE variant (VT_ATTN_PREFILL_BM). Generalizes
@@ -1693,6 +1713,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
                                                    int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
                                                    float scale, float softcap, bool causal, int window_left,
                                                    int window_right) {
+#if __CUDA_ARCH__ >= 800  // bf16 WMMA body is Ampere+; <sm_80 uses scalar fallback (byte-identical on sm_80+)
   constexpr int BM = MT * kWmmaM;  // query rows per block (MT WMMA M-tiles)
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;
@@ -1915,6 +1936,9 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
       }
     }
   }
+#else
+  __trap();  // bf16-WMMA path is not built for __CUDA_ARCH__ < 800 (see guard above)
+#endif
 }
 
 

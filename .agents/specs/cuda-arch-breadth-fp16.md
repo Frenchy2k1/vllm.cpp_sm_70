@@ -1,7 +1,10 @@
 # CUDA architecture breadth — the fp16 / non-tensor-core lane (Pascal / Volta / Turing)
 
-Status: **SPIKE (scoping) — DERIVE-AND-SHIP framed.** Read-only on production
-code; this document is the committed scope for a "support MORE than vLLM" lane
+Status: **SPIKE (scoping) — DERIVE-AND-SHIP framed. W1 (Turing `sm_75` bf16-WMMA
+guard) has LANDED and is BUILD-VERIFIED + SASS on nvcc 13.0 (base `034be66e`,
+`CLAIM-CUDA-TURING-SM75`); W2+ (the fp16 fast body) and all runtime gates remain
+open.** Read-only on production code except the W1 guard; this document is the
+committed scope for a "support MORE than vLLM" lane
 that vLLM **drops** but llama.cpp **still supports**: the pre-Ampere NVIDIA
 arches Pascal (`sm_60`/`sm_61`), Volta (`sm_70`) and Turing (`sm_75`). The port
 source is **llama.cpp's `ggml-cuda`** (vLLM has NO kernel for any of these); the
@@ -257,8 +260,8 @@ top stage is honestly hardware-blocked.
 
 | Gate | Requirement | Reachable here? |
 |---|---|---|
-| **B0 guard** | bf16-WMMA TU guarded; `sm_121a` GB10 build byte-identical (default path untouched); FEATURE-TABLE test green | YES (dgx nvcc 13) |
-| **B1 build (Turing)** | clean `-DVLLM_CPP_CUDA_ARCHITECTURES=75 -DVLLM_CPP_TRITON=OFF` build, `-Werror` 0-warn; `cuobjdump -lelf libvllm.a` shows real `sm_75` cubins incl. the fp16 attn TU | **YES** (nvcc 13 accepts `sm_75`) → this is the DERIVE-AND-SHIP proof for Turing |
+| **B0 guard** ✅ PASSED | bf16-WMMA TU guarded; `sm_121a` GB10 build byte-identical (default path untouched) | **PASSED** (base `034be66e`): guard landed; sm_121a same TU `-Werror` 0-warn + 0 SASS instruction diffs vs unguarded (byte-identical) |
+| **B1 build (Turing)** ✅ PASSED (TU) | clean `-DVLLM_CPP_CUDA_ARCHITECTURES=75 -DVLLM_CPP_TRITON=OFF` build, `-Werror` 0-warn; `cuobjdump -lelf` shows real `sm_75` cubins | **PASSED for the `cuda_paged_attn` TU** (dgx nvcc 13.0.88): single-arch `75` compile `-Werror=all-warnings` 0-warn EXIT=0, `cuobjdump -lelf` → real `cuda_paged_attn.cu.1.sm_75.cubin`. Full-lib link / fp16 attn TU await W2 |
 | **B1 build (Volta/Pascal)** | same for `70`/`61`/`60` | **NO** until a `<13` toolkit is provisioned (`NOT-YET-BUILDABLE`) |
 | **C1 kernel correctness** | ported tile/vec numerics vs CPU oracle (NMSE ≤ 5e-4); FEATURE-TABLE + registry-selection asserted host-side | YES (no GPU needed for the host asserts; numerics run on any CUDA dev) |
 | **C3 e2e / P performance** | a gate model token-checked AND ≥ llama.cpp on the same old card | **NO — hardware-blocked**; this is the `testing-welcome` frontier |
@@ -313,7 +316,7 @@ until a card exists.
 
 | # | Row | Deliverable | Blocked on |
 |---|---|---|---|
-| W1 | guard the bf16-WMMA TU | `#if __CUDA_ARCH__ >= 800` around `cuda_paged_attn.cu:706-717` (+ the WMMA launch bodies); GB10 build byte-identical; the TU now COMPILES on `sm_75` selecting the existing scalar path | — (mechanical, nvcc 13) |
+| W1 ✅ **DONE** | guard the bf16-WMMA TU | `#if __CUDA_ARCH__ >= 800` wraps the bodies of all 5 bf16-WMMA prefill kernels (`cuda_paged_attn.cu:732,958,1197,1472,1716`; `#else __trap()`), so `__CUDA_ARCH__ < 800` compiles the TU selecting the existing scalar path. **Build-verified (dgx nvcc 13.0.88 + cutlass 4.5.0, base `034be66e`):** single-arch `75` `-Werror=all-warnings` 0-warn EXIT=0, `cuobjdump -lelf` → real `cuda_paged_attn.cu.1.sm_75.cubin`; the `:1797 __nv_bfloat16 fragment` error GONE (RED: unguarded HEAD FAILS 21 errors). GB10 sm_121a byte-identical — same TU `-Werror` 0-warn AND 0 SASS instruction diffs vs unguarded. NO Turing board ran it | DONE — (mechanical, nvcc 13) |
 | W2 | port `fattn-tile`+`fattn-vec` fp16 body | new `cuda_paged_attn_fp16.cu`, 1:1 from `fattn-tile.cuh`/`fattn-vec.cuh:21`; fp16 accum + `sm_61` fp32 variant; C1 numerics vs CPU oracle | W1 |
 | W3 | FEATURE-TABLE + tactic registration | `fattn-fp16` feature row + `sm_75/70/61/60` cells; register `fattn-fp16-tile/vec` tactics; selector arch term at `:2562`; `CudaArchFeaturesTest.cmake` + registry-selection tests | W2 |
 | W4 | **Turing derive-and-ship** | `sm_75` `-Werror` build + `cuobjdump` SASS proof; row → `DERIVED+BUILD-VERIFIED (testing-welcome)`; labeled untested | W3, nvcc 13 (**doable now**) |
