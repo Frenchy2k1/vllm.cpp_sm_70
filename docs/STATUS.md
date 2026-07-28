@@ -514,10 +514,21 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `VLLM_ERR_INVALID_ARGUMENT` rather than `VLLM_ERR_MODEL_LOAD` (the contract
   `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
   backend) could not expose LMCache or the prefill budget in a model config.
-- **Speculative decoding from GGUF is SPIKED, not implemented.** `mtp` and
+- **MTP speculative decoding from a GGUF target is PARTIAL** (`SPEC-MTP-GGUF`,
+  [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head now LOADS from a
+  head-carrying GGUF: `HfConfigFromGguf` republishes the depth it already read
+  from `<arch>.nextn_predict_layers` and then discarded, and
+  `LoadQwen3_5MTPFromGguf` reads the `nextn` block using the trunk loader's own
+  helpers, so the head inherits the GGUF (w+1) norm storage, the quantization /
+  residency routing and the torch [N, K] shape order. Gated against a real
+  llama.cpp-converted Qwen3.5-2B (2 cases / 18 assertions, env-gated so CI stays
+  asset-free), RED-first, with every GGUF trunk suite unchanged. **NOT yet
+  gated end to end**: no spec-ON generation over a GGUF target has been run, so
+  token identity and acceptance are unmeasured and the row stays `PARTIAL`. A
+  GGUF exported without the head is still refused, now naming that as the reason.
+- **DFlash from GGUF is SPIKED, not implemented.** `mtp` and
   `dflash` are refused on a `.gguf` target today; `ngram` works there and
   always has. Two `READY` rows now carry the scoped plan:
-  `SPEC-MTP-GGUF` ([spike](../.agents/specs/gguf-mtp-spec-decode.md)) and
   `SPEC-DFLASH-GGUF` ([spike](../.agents/specs/gguf-dflash-draft.md)). The
   original safetensors-only framing said GGUF exports carry no `mtp.*`; that
   is stale as a general claim. llama.cpp's Qwen3.5 converter DOES emit the

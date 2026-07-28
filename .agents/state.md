@@ -29194,3 +29194,55 @@ hide.
 implementation is claimed, so neither takes a coordination claim.
 `scripts/check-agent-record.py` `ENGINE_ROWS` ratcheted 122 -> 124 with a
 documented reason per increment (its own mutation suite, 87 tests, still green).
+
+## 2026-07-28 — `SPEC-MTP-GGUF` G1-G3 LANDED (`PARTIAL`): the MTP head loads from GGUF
+
+**G0 closed with real evidence, not inference.** A llama.cpp-converted Qwen3.5-2B
+(Q8_0 body) already on disk carries the head exactly where the spike predicted:
+`qwen35.block_count=25`, `qwen35.nextn_predict_layers=1` => trunk `L=24`, head at
+`blk.24` with `nextn.eh_proj [2048,4096]` (torch `[N,K]`),
+`nextn.{enorm,hnorm,shared_head_norm} [2048]`, plus that block's own
+`attn_*`/`ffn_*`/`attn_norm`/`post_attention_norm`. There is NO
+`nextn.embed_tokens` and NO `nextn.shared_head_head`: Qwen3.5's head SHARES the
+target's embedding and lm_head, so the converter emits neither.
+
+**The spike's Port map was WRONG about the seam, and the implementation says so.**
+It planned a `TensorResolver` over `GgufFile`, reasoning that `LoadQwen3_5MTP` is
+already source-agnostic. It is - but the resolver hands out raw tensor views, and
+the GGUF conventions live one level up in `qwen3_5_gguf_weights.cpp`'s helpers.
+Three of them, each silent if missed:
+
+  (a) norm weights are stored **(w + 1)** and must be un-shifted
+      (`OwnNormMinus1`) - a plain read leaves every norm off by one and poisons
+      every draft proposal WITHOUT failing anything;
+  (b) matmul weights carry the file's quantization + residency routing
+      (`OwnMatmulWeight` / `RequireExpand`);
+  (c) `GgufTensorInfo::shape` is ALREADY torch `[N, K]`, so `fc` is the verbatim
+      path - the transposing helper yields `[2H, H]` and only fails deep inside
+      the draft forward.
+
+So the head loader is `LoadQwen3_5MTPFromGguf` inside the existing GGUF weights
+TU, reusing those helpers, rather than a resolver in a new one. That is what makes
+the head obey the same conventions as the trunk it speculates for. Spike Port map
+corrected in place with the reason.
+
+**Landed.** G1 `HfConfigFromGguf` republishes `mtp_num_hidden_layers` (it already
+READ `nextn_predict_layers` to compute the trunk layer count, then discarded it,
+so a head-carrying GGUF looked head-less to `ResolveSpecConfig` and fell back to
+depth 1). G2 the head loader. G3 the rejection narrowed to dflash plus a
+head-less-GGUF check that names the real cause, and the head attached in the GGUF
+branch. `NumMtpLayers`/`UsesDedicatedEmbeddings` moved out of the anonymous
+namespace since the GGUF loader resolves the same values from the same place.
+
+**Gates.** `tests/vllm/models/test_qwen3_5_gguf_mtp.cpp` 2 cases / 18 assertions
+against the REAL file (env-gated `VLLM_MTP_GGUF_MODEL`, CI stays asset-free),
+**RED-first behaviourally**: reverting only the G1 line fails both cases 2/2.
+Trunk inertness `test_gguf` 103, `test_gguf_qwen36_loader` 99,
+`test_gguf_keep_quant` 5958, `test_gguf_dequant` 215, `test_capi` 33/232 unchanged.
+
+**Why `PARTIAL`, honestly.** The head LOADS; nothing has yet GENERATED with it. No
+spec-ON run over a GGUF target, so the spike's `G4` (three-way token identity) and
+acceptance rate are unmeasured, and `G5` (cross-format agreement at F16) is
+untouched. The attach site in the GGUF branch is compile-verified only. A
+quantized head may accept rarely enough that spec-ON is SLOWER than spec-OFF -
+recorded in the spike as a finding to publish, not a bug to hide. Next: `G4`.

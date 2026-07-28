@@ -2396,6 +2396,32 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
+### GGUF MTP head loading, `SPEC-MTP-GGUF` G1-G3 (2026-07-28) - load-path correctness only, PENDING speed
+
+**Benchmark disposition: PENDING - the feature is not yet reachable end to end, so
+there is nothing to measure. `benchmark_binding=false`.** G1-G3 make the MTP head
+LOAD from a head-carrying GGUF (config depth republished, head weights read with the
+trunk's conventions, rejection narrowed, head attached in the GGUF branch). No
+spec-ON generation over a GGUF target has been run, so acceptance rate and
+throughput are both unmeasured and NOT claimed.
+
+The gate that DID run is load-path correctness, against a real llama.cpp-converted
+Qwen3.5-2B (Q8_0 body) rather than a synthetic fixture:
+`tests/vllm/models/test_qwen3_5_gguf_mtp.cpp` 2 cases / 18 assertions - the head
+depth reaches `config.raw`, `fc` is `[H, 2H]` (the verbatim orientation, not the
+transposed one), the three RMSNorm weights are `[H]`, and the head block is
+full-attention. RED-first and BEHAVIOURAL: reverting only the one-line config
+republication fails both cases. Trunk inertness: `test_gguf` 103,
+`test_gguf_qwen36_loader` 99, `test_gguf_keep_quant` 5958, `test_gguf_dequant` 215,
+`test_capi` 33/232, all unchanged.
+
+**Reproduction for the owed number** (spike row `G4`): build with
+`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=ON`, then run the three-way token gate
+once it exists - GGUF spec-ON vs GGUF spec-OFF at c1 greedy, plus the acceptance
+rate. A quantized head may accept rarely enough that spec-ON is SLOWER than
+spec-OFF; that is a documented risk in the spike and the reason no speedup is
+implied here.
+
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - scoping documents, ZERO code.

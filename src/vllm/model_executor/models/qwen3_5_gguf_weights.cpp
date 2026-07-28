@@ -588,6 +588,14 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf) {
   const int64_t block_count = ReqInt(gguf, p + "block_count");
   const int64_t nextn = OptInt(gguf, p + "nextn_predict_layers", 0);
   c.num_hidden_layers = block_count - nextn;
+  // The MTP head depth, republished under the HF spelling the rest of the
+  // engine reads (ResolveSpecConfig -> NumMtpLayers -> raw
+  // "mtp_num_hidden_layers"). llama.cpp's converter writes it as
+  // `<arch>.nextn_predict_layers` and folds the head blocks into block_count,
+  // which is why the trunk layer count above subtracts it. Without this the
+  // spec resolver would silently fall back to its depth-1 default on a GGUF
+  // whose head is deeper. Absent key => 0 => no head, and we publish nothing.
+  if (nextn > 0) c.raw["mtp_num_hidden_layers"] = nextn;
 
   c.num_attention_heads = ReqInt(gguf, p + "attention.head_count");
   c.num_key_value_heads =
@@ -930,6 +938,106 @@ Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
     w.layers.push_back(std::move(layer));
   }
   return w;
+}
+
+// ─── MTP head from GGUF (SPEC-MTP-GGUF) ──────────────────────────────────────
+//
+// llama.cpp's Qwen3.5 converter (conversion/qwen.py `_Qwen35MtpMixin`) folds the
+// HF `mtp.*` block into the ordinary block list: it extends `block_count` by
+// `mtp_num_hidden_layers`, emits the `nextn_predict_layers` key, and remaps the
+// four scalar tensors onto block L (= the ORIGINAL num_hidden_layers) under the
+// DeepSeek-style `nextn` names, with `mtp.layers.{i}.*` landing on block L+i as
+// ordinary layer tensors:
+//
+//   mtp.fc                     -> blk.{L}.nextn.eh_proj
+//   mtp.pre_fc_norm_embedding  -> blk.{L}.nextn.enorm
+//   mtp.pre_fc_norm_hidden     -> blk.{L}.nextn.hnorm
+//   mtp.norm                   -> blk.{L}.nextn.shared_head_norm
+//   mtp.layers.{i}.<rest>      -> blk.{L+i}.<rest>
+//
+// This is deliberately NOT routed through the TensorResolver seam that
+// LoadQwen3_5MTP's safetensors entry point uses. That seam hands out raw tensor
+// views, but the GGUF conventions live one level up in THIS file's helpers: norm
+// weights are stored as (w + 1) and must be un-shifted (OwnNormMinus1), matmul
+// weights carry the file's quantization and residency routing
+// (OwnMatmulWeight), and shapes arrive in torch [N, K] order. Reusing those
+// helpers is what makes the head obey exactly the same conventions as the trunk
+// it speculates for; going through the resolver would mean re-deriving all three
+// in a second place.
+//
+// The head SHARES the target's embed_tokens and lm_head (Qwen3.5 ships no
+// dedicated ones, which is why the converter emits no nextn.embed_tokens /
+// nextn.shared_head_head for it), so nothing here loads them.
+Qwen3_5MTPWeights LoadQwen3_5MTPFromGguf(const GgufFile& gguf,
+                                         const HfConfig& config,
+                                         Qwen3_5MTPKind kind,
+                                         const GgufLoadPolicy& pol) {
+  const int64_t n_mtp = NumMtpLayers(config);
+  VT_CHECK(n_mtp > 0,
+           "qwen3_5 gguf MTP: mtp_num_hidden_layers must be > 0 (is the GGUF "
+           "missing <arch>.nextn_predict_layers?)");
+  VT_CHECK(!UsesDedicatedEmbeddings(config),
+           "qwen3_5 gguf MTP: dedicated MTP embeddings are not supported");
+  // Block index of the FIRST head block. HfConfigFromGguf already subtracted the
+  // head depth from block_count, so num_hidden_layers is exactly that index.
+  const int64_t L = config.num_hidden_layers;
+
+  Qwen3_5MTPWeights out;
+  out.kind = kind;
+
+  // fc is kept in raw [N=out, K=in] (LoadBf16RawNK on the safetensors path), and
+  // GgufTensorInfo::shape is already torch [N, K], so this is the verbatim path
+  // rather than the transposing one.
+  {
+    const std::string name = Blk(L, "nextn.eh_proj.weight");
+    RequireExpand(pol, gguf, name, GgufTensorRole::kTransformedWeight);
+    out.fc = OwnBf16(gguf, name, gguf.Get(name).shape);
+  }
+  for (const auto& [field, stem] :
+       std::initializer_list<std::pair<OwnedTensor*, const char*>>{
+           {&out.pre_fc_norm_embedding, "nextn.enorm.weight"},
+           {&out.pre_fc_norm_hidden, "nextn.hnorm.weight"},
+           {&out.final_norm, "nextn.shared_head_norm.weight"}}) {
+    const std::string name = Blk(L, stem);
+    RequireExpand(pol, gguf, name, GgufTensorRole::kTransformedWeight);
+    *field = OwnNormMinus1(gguf, name);
+  }
+
+  for (int64_t i = 0; i < n_mtp; ++i) {
+    const int64_t il = L + i;
+    RequireExpand(pol, gguf, Blk(il, "attn_norm.weight"),
+                  GgufTensorRole::kTransformedWeight);
+    RequireExpand(pol, gguf, Blk(il, "post_attention_norm.weight"),
+                  GgufTensorRole::kTransformedWeight);
+    OwnedTensor input_ln = OwnNormMinus1(gguf, Blk(il, "attn_norm.weight"));
+    OwnedTensor post_ln =
+        OwnNormMinus1(gguf, Blk(il, "post_attention_norm.weight"));
+    // The MTP block is always full-attention (it is a transformer block over the
+    // fused [embedding; hidden] state), never GDN - so it is not looked up in
+    // config.layer_types, which only covers the trunk.
+    FullAttnLayerWeights attn = LoadAttnGguf(gguf, il, pol);
+
+    if (kind == Qwen3_5MTPKind::kDense) {
+      Qwen3_5DenseLayerWeights layer;
+      layer.is_linear_attention = false;
+      layer.input_layernorm = std::move(input_ln);
+      layer.post_attention_layernorm = std::move(post_ln);
+      layer.attn = std::move(attn);
+      layer.mlp.gate_proj = OwnMatmulWeight(gguf, Blk(il, "ffn_gate.weight"), pol);
+      layer.mlp.up_proj = OwnMatmulWeight(gguf, Blk(il, "ffn_up.weight"), pol);
+      layer.mlp.down_proj = OwnMatmulWeight(gguf, Blk(il, "ffn_down.weight"), pol);
+      out.dense_layers.push_back(std::move(layer));
+    } else {
+      Qwen3_5MoeLayerWeights layer;
+      layer.is_linear_attention = false;
+      layer.input_layernorm = std::move(input_ln);
+      layer.post_attention_layernorm = std::move(post_ln);
+      layer.attn = std::move(attn);
+      layer.moe = LoadMoeGguf(gguf, il, config, pol);
+      out.moe_layers.push_back(std::move(layer));
+    }
+  }
+  return out;
 }
 
 Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,

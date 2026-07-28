@@ -154,18 +154,6 @@ const nlohmann::json& TextConfig(const HfConfig& config) {
   return config.raw;
 }
 
-int64_t NumMtpLayers(const HfConfig& config) {
-  const nlohmann::json& text = TextConfig(config);
-  if (!text.is_object()) return 1;
-  return text.value("mtp_num_hidden_layers", int64_t{1});
-}
-
-bool UsesDedicatedEmbeddings(const HfConfig& config) {
-  const nlohmann::json& text = TextConfig(config);
-  return text.is_object() &&
-         text.value("mtp_use_dedicated_embeddings", false);
-}
-
 void RequireShape(const OwnedTensor& tensor,
                   std::initializer_list<int64_t> expected,
                   const std::string& name) {
@@ -262,6 +250,19 @@ void ValidateMoeLayer(const Qwen3_5MoeLayerWeights& layer,
 }
 
 }  // namespace
+
+int64_t NumMtpLayers(const HfConfig& config) {
+  const nlohmann::json& text = TextConfig(config);
+  if (!text.is_object()) return 1;
+  return text.value("mtp_num_hidden_layers", int64_t{1});
+}
+
+bool UsesDedicatedEmbeddings(const HfConfig& config) {
+  const nlohmann::json& text = TextConfig(config);
+  return text.is_object() &&
+         text.value("mtp_use_dedicated_embeddings", false);
+}
+
 
 int64_t Qwen3_5MTPWeights::NumLayers() const {
   return kind == Qwen3_5MTPKind::kDense
