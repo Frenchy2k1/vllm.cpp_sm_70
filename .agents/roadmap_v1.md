@@ -109,6 +109,22 @@ Residuals: 35B, c1/c2/c4 low-conc sweep, the shared-prefix cache-ON arm
 (`SGLANG-ORACLE-CORRECT`). The existing `run_serve_low.py bench` harness drove
 both arms; note its `SGLANG_IMAGE` pin is still v0.5.13 vs the oracle-spec v0.5.15.
 
+**★ SGLang TPOT/ITL gap EXPLAINED — batch-composition, disposition set (2026-07-28,
+`CLAIM-DECODE-LATENCY-EXPLORE`).** The above SGLang per-token-latency OPEN GAP is
+now CHARACTERIZED (exploration, no source changed): it is **batch-composition, not
+a decode-kernel deficiency.** On our engine, ITL(decode-batch=1)=**101.75 ms** is
+already ≤ SGLang's op-point ITL (104–105 ms), and ITL rises monotonically with the
+decode batch we pack (→158.5 ms @ B16); nsys shows every hot decode kernel
+sub-linear in batch (per-token cost ↓~10×). SGLang's effective decode concurrency
+is ~4 (not 16) because of its 33 s admission queue — its low ITL is the ITL of a
+small batch. **Our throughput win IS the ITL cost — the same lever.** Disposition:
+**NOT a bug/kernel-lever; a throughput↔latency operating-point choice.** Knob
+already exists (`max_num_seqs` / `max_num_batched_tokens`); latency-oriented point
+`max_num_seqs≈8` = ITL −21% at 1.38× SGLang throughput. Default stays
+throughput-oriented (unchanged). Full curve + repro:
+[specs/decode-latency-lever.md](specs/decode-latency-lever.md),
+[docs/BENCHMARKS.md](../docs/BENCHMARKS.md).
+
 **★ ACTIVE PHASE (user-directed 2026-07-20/21) — the BREADTH SWEEP.** With 27B/35B parity,
 the `KERNEL-FUSION-FRAMEWORK` extensibility cornerstone (W0-W4), and the FIRST additive model
 (Qwen3 dense: correctness-complete + c1 effective every-axis parity, c8 within a cross-cutting

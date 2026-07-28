@@ -205,7 +205,25 @@ queue vs SGLang's 33 s / 11 s queue waits. SGLang WINS the steady-state
 per-token decode-latency axis (TPOT/ITL 1.18–1.49× lower than ours): our higher
 throughput comes from packing larger decode batches, which raises per-request
 per-token latency. **This TPOT/ITL deficit is a reproduced OPEN GAP — a candidate
-future lever, recorded honestly, not explained away.** Peak memory (system
+future lever, recorded honestly, not explained away.**
+
+> **UPDATE 2026-07-28 (`CLAIM-DECODE-LATENCY-EXPLORE`) — hypothesis CONFIRMED by
+> direct measurement; the gap is BATCH-COMPOSITION, not a per-token kernel
+> deficiency.** On OUR engine, sweeping the decode batch B∈{1,2,4,8,16} (27B-NVFP4,
+> `--max-num-seqs 16`) gives ITL(1)=**101.75 ms** (already ≤ SGLang's op-point
+> 104–105 ms) rising monotonically to **158.5 ms** @ B16 (median 101.7→131.1).
+> nsys (`decode_b{1,16}.nsys-rep`) shows every hot kernel (NVFP4 nvjet/cutlass
+> GEMMs, GDN mamba) is **sub-linear** in batch (1.6–1.8× for 16× tokens → per-token
+> GPU cost ↓~10×) — "more requests × cheaper-per-token", not "each token costs
+> more". SGLang's **effective decode concurrency ≈4** (40.8 tok/s ÷ 1000/105 ms),
+> not 16 — its 33 s admission queue (prefill-first, non-mixed steps,
+> `managers/scheduler.py:2700`) keeps few requests decoding at once. **Throughput
+> win and ITL loss are the same lever.** Knob = `max_num_seqs` /
+> `max_num_batched_tokens` (both exist); latency-oriented point `max_num_seqs≈8`
+> = ITL −21% at 1.38× SGLang throughput. Default stays throughput-oriented
+> (unchanged). Full curve + repro: [specs/decode-latency-lever.md](specs/decode-latency-lever.md).
+
+Peak memory (system
 MemAvailable delta on the unified pool; nvidia-smi is N/A) is comparable, ours
 ~1.5 GB higher — indicative not binding. **Residuals (named):** 35B-A3B-NVFP4 not
 run; low-concurrency c1/c2/c4 not run (SGLang c1 ran ~13.3 s/it → impractical for

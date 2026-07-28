@@ -223,6 +223,60 @@ Wrap the whole SGLang-then-ours series in one `flock $HOME/gpu.lock`; verify
 (0.30 — the unified 119 GiB pool OOM-reboots at 0.85). Evidence (dgx):
 `~/work/sglang-bench-HEAD/evidence/raw/27/{sglang,ours}/c{8,16}-r{1,2,3}.jsonl`.
 
+**Decode per-token latency (ITL/TPOT) vs decode-batch size — hypothesis CONFIRMED
+(2026-07-28, `CLAIM-DECODE-LATENCY-EXPLORE`, NOT pushed).** Disposition:
+**EXPLORATION — the SGLang TPOT/ITL gap is BATCH-COMPOSITION, not a per-token
+kernel deficiency; measured on OUR engine alone (no SGLang re-standup).** Base
+local `main` `348ae7c9`; dgx GB10 sm_121a, idle box, one `flock $HOME/gpu.lock`,
+serialized vs a concurrent campaign. Same 27B-NVFP4 gate model / corpus
+(`unsloth/Qwen3.6-27B-NVFP4` `890bdef7`, 1024-in/128-out exact, greedy,
+`ignore_eos`), server `--block-size 32 --num-blocks 640 --max-model-len 1152
+--max-num-seqs 16`; async streaming ITL probe at concurrency = steady-state decode
+batch B; 2 reps, CV<1%.
+
+**ITL vs decode batch B (ours; SGLang c16 op-point row for reference):**
+
+| conc = decode batch B | out tput tok/s | ITL mean ms | ITL median ms | ITL p99 ms | TPOT mean ms | TTFT mean ms |
+|---|---|---|---|---|---|---|
+| 1  | 9.58  | **101.75** | 101.68 | ~104 | 101.75 | 441 |
+| 2  | 17.84 | **106.92** | 105.96 | 109  | 106.92 | 763 |
+| 4  | 32.39 | **113.77** | 110.46 | ~118–222 | 113.77 | 1324 |
+| 8  | 56.40 | **125.20** | 115.75 | 493  | 125.20 | 2178 |
+| 16 | 87.66 | **158.48** | 131.11 | 900  | 158.48 | 3126 |
+| *SGLang c16 (recorded above)* | *40.8* | *105.6* | *105.5* | — | *104.0* | *33425* |
+
+**Verdict.** CONFIRMED batch-composition; REFUTED kernel-inefficiency. (1) At B=1
+our ITL (**101.75 ms**) is already ≤ SGLang's op-point ITL (104–105 ms) → no
+per-token kernel deficiency. (2) ITL rises monotonically with the decode batch we
+pack (+56% mean / +29% median, B1→B16), reproducing the recorded c16 gap. (3) nsys
+(`decode_b{1,16}.nsys-rep`, `cuda_gpu_kern_sum`) shows every hot kernel — NVFP4
+`nvjet_sm121`/`cutlass GemmUniversal` GEMMs, GDN mamba (`GdnChunk*`) — is
+**sub-linear** in batch (per-instance 1.6–1.8× for **16×** tokens ⇒ per-token GPU
+cost ↓ ~9–10×): "more requests × cheaper-per-token", not "each token costs more".
+SGLang's **effective decode concurrency ≈ 4** (40.8 tok/s ÷ 1000/105 ms), not its
+`--max-running-requests 16` — its prefill-first non-mixed scheduling
+(`managers/scheduler.py:2700`) + 33 s admission queue keep few requests decoding
+at once. Our low-TTFT chunked-prefill admission keeps ~16 concurrently decoding →
+2.21× throughput at the ITL cost. **Same lever.**
+
+**Tradeoff curve + knob (no new code).** Capping the decode batch trades
+throughput for ITL: cap `max_num_seqs`=8 → ITL mean −21% (median −12%), throughput
+−36% (still 1.38× SGLang); =4 → ITL −28%, tput −63%; =2 (≈ matches SGLang ITL
+~105) → tput −80%. Knobs already exist: `--max-num-seqs` /
+`max_num_batched_tokens` (C-ABI v9); `scheduling_policy` is the ordering axis.
+**Recommended latency-oriented operating point: `max_num_seqs≈8`** (balanced);
+default stays throughput-oriented — NOT changed this pass (exploration only).
+
+**Repro.** Build `git archive 348ae7c9` on dgx (cutlass-nvfp4 + FA2 banners) →
+`build-cuda/examples/server … --max-num-seqs <B>`; drive the ITL probe
+`itl_client.py --port 30000 --conc <B> --corpus <27B-corpus> --num-prompts <4B>
+--max-tokens 128` (`/v1/completions` stream, temp 0, `ignore_eos`); nsys via
+`nsys profile -t cuda,nvtx -s none --delay 60 --duration 30 -o decode_b<B> …
+server …` under continuous batch-B load. All under `flock $HOME/gpu.lock`, idle
+box. Full data + source scan file:line: `.agents/specs/decode-latency-lever.md`.
+Evidence (dgx): `~/work/decode-lat-348ae7c/{sweep_out/sweep_results.jsonl,
+nsys_out/decode_b{1,16}.nsys-rep}`.
+
 **SGLang RadixAttention behavior-parity scope (2026-07-27,
 `CLAIM-SGLANG-RADIX-SCOPE`, NOT pushed).** Disposition: **NOT APPLICABLE
 (scoping spike; no measurement taken, claimed, or owed; `benchmark_binding=false`).**
