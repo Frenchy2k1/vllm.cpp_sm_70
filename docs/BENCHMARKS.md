@@ -290,6 +290,28 @@ bit-identical to the committed golden. **NO Ampere board ran it here; a green bu
 is not a runtime claim.** The only real throughput numbers come later from the Orin
 RUNTIME-VERIFIED gate.
 
+**Per-arch Triton-AOT GDN cubins (2026-07-28, `CLAIM-TRITON-AOT-PER-ARCH`).**
+Disposition: **NOT APPLICABLE for a new benchmark number (build-verified
+derive-and-ship; `benchmark_binding=false`).** The vendored Triton-AOT GDN
+fast-path cubins — the MEASURED codegen-win packed decode (Triton REG:205/0-spill
+vs hand-CUDA REG:255+STACK:48 spills, +0.67% throughput / −0.78% TPOT on GB10
+c16) plus the delta_h/chunk_o/kkt/tril/wu FLA set — existed for `sm_121a` ONLY, so
+GDN decode on every other arch (all cross-family builds ship
+`-DVLLM_CPP_TRITON=OFF`) ran the spilling hand kernel. The full GDN AOT set is now
+regenerated + vendored for `sm_80/86/89/90a/100a` on dgx GB10 (Triton 3.6.0 /
+ptxas 12.8 cross-compile — ptxas is a cross-compiler, no target board needed;
+57 artifacts + MANIFEST per arch matching the `sm_121a` fileset). BUILD EVIDENCE:
+`cuobjdump --dump-elf` shows real per-target SASS (`sm=80/86/89/90/100`), nvdisasm
+`EF_CUDA_SM80/86/89`, decode `SHI_REGISTERS` 209–217 with 0 spill (under the
+hand-CUDA REG:255+STACK:48 floor); the builder-path configure (`-DVLLM_CPP_TRITON=ON`,
+no REGEN) selects + integrity-verifies each tree (`Triton AOT: … <- vendored …
+(no Python)`); the generated AOT C compiles clean; `scripts/check-triton-aot-drift.sh`
+rc=0 across all six trees. **NO non-`sm_121` board runs a GDN-hybrid model here —
+the decode-parity claim on these arches is BUILD-VERIFIED, NOT runtime-measured;
+the only measured GDN-decode codegen win is the GB10 `sm_121a` number above.**
+`sm_121a` cubins are byte-identical to base (SACRED 27B/35B gate unchanged).
+Evidence: [.agents/specs/triton-aot-per-arch.md](../.agents/specs/triton-aot-per-arch.md).
+
 **Ampere major-8 CUDA fast-path bring-up SPIKE (2026-07-27,
 `CLAIM-CUDA-AMPERE-SCOPE`).** Disposition: **NOT APPLICABLE (scoping spike; no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Read-only on

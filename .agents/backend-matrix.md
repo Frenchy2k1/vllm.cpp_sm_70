@@ -59,6 +59,24 @@ forward-divergent** (see the `BACKEND-CUDA-SM087` row). One honest sm_87 bug
 surfaced: the DEFAULT async runner path crashes with an illegal memory access
 (portable SYNC path is the verified one). Benchmark vs llama.cpp still pending.
 
+**GDN Triton-AOT per-arch cubins landed (`CLAIM-TRITON-AOT-PER-ARCH`, spec
+[triton-aot-per-arch.md](specs/triton-aot-per-arch.md), 2026-07-28).** HONEST GAP
+CORRECTED: the vendored Triton-AOT GDN fast-path cubins (the MEASURED codegen-win
+GDN decode + the delta_h/chunk_o/kkt/tril/wu FLA kernels) previously existed for
+**`sm_121a` ONLY**. Because a cubin loads only on the SM it was compiled for, and
+every committed cross-family arch build above ships **`-DVLLM_CPP_TRITON=OFF`**
+(portable-kernels-only), GDN decode on `sm_80/86/89/90a/100a` ran the **spilling
+hand kernel** — the Triton-AOT GDN-decode parity was `sm_121a`-runtime-only, NOT
+at parity on any other arch. The full GDN AOT set is now regenerated + vendored
+for `sm_80/86/89/90a/100a` (dgx GB10, Triton 3.6.0 / ptxas 12.8 cross-compile; 57
+artifacts + MANIFEST per arch, `cuobjdump` real per-target SASS `sm=80/86/89/90/
+100`, decode REG 209–217/0-spill), so a `-DVLLM_CPP_TRITON=ON` single-arch build
+on those arches now selects the non-spilling FLA path — **DERIVED+BUILD-VERIFIED
+(testing-welcome); no non-`sm_121` board runs a GDN model here, so this is NOT a
+runtime GDN-decode-parity claim on any arch.** `sm_121a` is byte-untouched (SACRED
+27B/35B gate structurally unchanged); the build-time cubin selection is already
+additive.
+
 **WA-1 (FA2 Ampere enablement) has LANDED — `DERIVED+BUILD-VERIFIED
 (testing-welcome)` (2026-07-27, `ROAD-V1-D1-CUDA` first brick).** The `fa2`
 FEATURE-TABLE cell (`cmake/CudaArchFeatures.cmake`) was widened
