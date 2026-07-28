@@ -421,6 +421,20 @@ FusedMoE fallback); native fp8 (~167 GiB) does not fit. Spec + W-plan:
 throughput numbers are owed only after the W1 oracle-run gate and a real
 implementation land; none is taken or promised here. No source/engine path touched.
 
+**Kimi K3 W0 SCOPE spike (2026-07-28, `CLAIM-KIMI-K3-SCOPE`, NOT pushed).**
+Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
+measurement taken, claimed, or owed; `benchmark_binding=false`).** Scopes
+`KimiK3ForConditionalGeneration` (released 2026-07-27, beyond the pin) — a 2.8T MoE
+whose text backbone is the Kimi-Linear KDA+MLA+MoE hybrid scaled to H=7168 / 93
+layers (69 KDA + 24 MLA) / 896 experts, MXFP4 + MoonViT-V2 vision. It **does not fit**
+one GB10 (~1.56 TB MXFP4, ~12× the 119 GiB pool) and is not in the pinned oracle, so
+**no on-box golden exists** — a **derive-and-ship** row like the beyond-vLLM CUDA
+bricks. The real correctness signal is a primitive gate (KDA+MLA+MoE) on the fitting
+`Kimi-Linear-48B-A3B` (~89–91 GiB) proxy plus build-verify; full K3 throughput/token
+numbers are owed only from a multi-Spark / 16×H200-class box, and none is taken or
+promised here. Spec + W-plan: [kimi-k3.md](../.agents/specs/kimi-k3.md). No
+source/engine path touched.
+
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —
 throughput/TTFT WIN, TPOT/ITL open GAP (`benchmark_binding` = competitor-floor,

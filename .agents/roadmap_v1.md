@@ -264,6 +264,21 @@ honesty-pass at bf16, with **GLM-4.5-Air-FP8 (104.8 GiB) the fitting variant** t
 real e2e gate if fp8-checkpoint loading lands. Kimi-K2 (958.5 GiB) / MiniMax-M3 (795.5 GiB + sm100 sparse
 + multimodal) / GLM-5 (1404 GiB + DSA DEP-blocked) = registry/config-resolution only.
 
+**KIMI K3 W0 SCOPE — DERIVE-AND-SHIP (2026-07-28, [kimi-k3.md](specs/kimi-k3.md),
+`CLAIM-KIMI-K3-SCOPE`):** Kimi K3 RELEASED 2026-07-27 (post-pin) — this SUPERSEDES the sweep's
+"Kimi K3 ABSENT / loads as `DeepseekV3ForCausalLM`" line. From the HF `config.json`:
+`KimiK3ForConditionalGeneration` wraps a `text_config.architectures:["KimiLinearForCausalLM"]`
+backbone (the pinned Kimi-Linear KDA+MLA+MoE hybrid) massively scaled — **H=7168, L=93 (69 KDA +
+24 MLA), 896 experts/top-16/2 shared**, DeepSeek-V3 MLA geometry, **MXFP4 (group-32/e8m0) + MXFP8
+acts**, **MoonViT-V2** vision. **HEAVY REUSE** (GDN=KDA parent, our landed DeepSeek-MLA, DeepSeek
+MoE, the Qwen3.6-35B GDN-hybrid-MoE skeleton); NET-NEW = the KDA kernel delta (shared with the
+Kimi-Linear row), MXFP4, AttnRes (report-only/UNCONFIRMED), MoonViT-V2. **HW: does NOT fit GB10 —
+~1.56 TB MXFP4 ≈ ~12× the 119 GiB pool**; no small K3 exists. **DERIVE-AND-SHIP** (no on-box
+golden, like the beyond-vLLM CUDA bricks): REAL proxy gate of KDA+MLA+MoE on the FITTING
+`Kimi-Linear-48B-A3B` (~89–91 GiB) vs the pin, + build-verify/structural review for the scale-up.
+The pin has no `kimi_k3` ⇒ oracle-gating K3 itself needs a pin advance. New SPIKE row
+`MODEL-MM-kimi-k3-*`. NEXT: W1 proxy primitive gate (shares the KDA kernel campaign).
+
 ## Top-level portfolio
 
 This is the single ordered roadmap table. Detailed capability/status rows live

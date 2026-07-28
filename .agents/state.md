@@ -30553,3 +30553,26 @@ M2a before the M2c e2e). dgx GB10 CUDA `flock`, weights via
   masked-scatter merge of the 256 soft tokens at `<image_pad>`, decode fork) is the
   M2c-equivalent follow-on; the tower + projector (the merge INPUT) are proven.
   Speed pending. Not pushed; FULL SHA reported.
+- **2026-07-28** — **Kimi K3 W0 SCOPE spike (`CLAIM-KIMI-K3-SCOPE`, DERIVE-AND-SHIP,
+  records-only, NOT pushed).** Base `main` `df18ca91`. Scoped
+  `KimiK3ForConditionalGeneration` (Kimi K3, released 2026-07-27, **beyond the pin
+  `555967922`**) from the HF `config.json` (fetch-derived) + its literal text backbone
+  `KimiLinearForCausalLM` (registered `registry.py:140`). VERDICT: **HEAVY REUSE** — K3
+  text = the pinned Kimi-Linear **KDA + MLA + MoE** hybrid MASSIVELY scaled (H=7168,
+  L=93 = 69 KDA + 24 full-attn MLA, 896 experts / top-16 / 2 shared, DeepSeek-V3 MLA
+  geometry, `moe_intermediate_size=3072`); reuses our landed GDN (KDA's parent family),
+  DeepSeek MLA (exact geometry), DeepSeek MoE, and the Qwen3.6-35B GDN-hybrid-MoE model
+  skeleton + Kimi-K2 tokenizer/tool parser. NET-NEW = the KDA kernel delta (shared with
+  the Kimi-Linear row), **MXFP4** (compressed-tensors group-32/e8m0; we have NVFP4
+  group-16 only), **AttnRes** (report-only, UNCONFIRMED — absent from config.json + the
+  pinned `kimi_linear.py`), and the **MoonViT-V2** vision tower. **HW-fit: does NOT fit
+  GB10** — 2.8T MXFP4 ≈ **1.56 TB ≈ ~12×** the 119 GiB pool; no small K3 exists.
+  **DERIVE-AND-SHIP** (no on-box golden, like the beyond-vLLM CUDA bricks): the REAL
+  signal is a primitive gate of KDA+MLA+MoE on the FITTING `Kimi-Linear-48B-A3B`
+  (~89–91 GiB) proxy vs the pin, + build-verify/structural review; the pinned oracle has
+  NO `kimi_k3` so oracle-gating K3 itself needs a pin advance. NEW `specs/kimi-k3.md`
+  (arch map, reuse-vs-new, HW-fit, derive-and-ship plan, W-plan). New SPIKE row
+  `MODEL-MM-kimi-k3-*` (INVENTORIED→SPIKE); roadmap/STATUS/BENCHMARKS/ledger lines added.
+  CORRECTS the 2026-07-25 sweep note ("loads as `DeepseekV3ForCausalLM`" — true for K2,
+  NOT K3). All 6 record checkers rc=0. NEXT: W1 proxy primitive gate (DGX busy —
+  deferred).
