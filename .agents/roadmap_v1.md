@@ -283,7 +283,11 @@ MECHANICAL PORTS (honesty-pass gates substitute for HW-blocked e2e). User-named 
 not an arch** (loads as `MiniMaxM2ForCausalLM`; newest registered = M3 `MiniMaxM3Sparse`); **GLM latest**
 = `Glm4Moe`/`GlmMoeDsa` (owned by the GLM/DSA claim). Ranked: (1) **Kimi-Linear-48B FITS GB10
 (91.5 GiB, 0.77× pool)** = the ONLY frontier model with a REAL e2e SACRED gate — reuses MLA + sigmoid
-router + bf16 grouped-MoE + GDN base, ONE genuinely-new kernel (the **KDA gated-delta gate**), needs
+router + bf16 grouped-MoE + GDN base, ONE genuinely-new kernel (the **KDA gated-delta gate** — first
+buildable brick landed 2026-07-28, `KERNEL-KDA-DELTA`: the per-channel `[H,D]` low-rank decay
+(`f_a`/`f_b`), the sigmoid-gated output norm, the 3 q/k/v convs + q/k L2-norm as portable host
+references, `test_kimi_kda` 14/14 CPU; KDA subclasses GDN so the recurrence is reused and the brick is
+GDN-inert; device kernel + Kimi-Linear-48B proxy e2e are named residuals), needs
 ~10 GiB dgx-disk reclaim; (2) **MiniMax-M2** HW-blocked (**214.3 GiB fp8-native, 1.80× over** — corrects
 the matrix's wrong "428 GiB bf16/4×"), ZERO-new-kernel port → honesty-pass; (3) **`Glm4Moe`** 0-new-kernel,
 honesty-pass at bf16, with **GLM-4.5-Air-FP8 (104.8 GiB) the fitting variant** that jumps the queue to a

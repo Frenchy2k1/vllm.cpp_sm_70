@@ -97,6 +97,14 @@ vllm_cpp_add_test(test_deepseek_v4_dsa vllm/models/test_deepseek_v4_dsa.cpp)
 # K3 is beyond the pinned oracle (.agents/specs/kimi-k3.md).
 vllm_cpp_add_test(test_kimi_k3_scaffold vllm/models/test_kimi_k3_scaffold.cpp)
 
+# KDA (Kimi Delta Attention) net-new gated-linear-attention primitives — host
+# reference + unit gate (KERNEL-KDA-DELTA). Shared unblocker for Kimi-Linear-48B
+# and Kimi-K3 (W4). Hand-derived literal cases + double-precision references over
+# the per-channel [H,D] low-rank decay, the sigmoid-gated output norm, the 3 q/k/v
+# short convs and q/k L2-norm. Full-model gate is the Kimi-Linear-48B proxy
+# (DGX-blocked); mirrors the DSA lane (.agents/specs/kda-kernel-delta.md).
+vllm_cpp_add_test(test_kimi_kda vllm/models/test_kimi_kda.cpp)
+
 # MLA CAMPAIGN W8 (DeepSeek-V2-Lite, DeepseekV2ForCausalLM) — the SACRED MLA
 # greedy correctness gate: drives a compact prompt battery through the paged
 # engine and checks STRICT token-exact agreement with the vLLM 0.25.0 oracle
