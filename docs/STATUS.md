@@ -522,7 +522,9 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `dflash.target_layers` (whose length is `num_taps`), and the mask token on the
   standard tokenizer KV. No `token_embd` / `output`, confirming the draft shares
   the target's embedding and lm_head. No conversion run was needed - pre-converted
-  drafts are published at ~1 GB. The loader rows can proceed from the draft alone;
+  drafts are published at ~1 GB. Its work rows are `GD0`-`GD8`, renamed off the
+  landed DFlash track's own `D0`-`D13` after a collision was spotted. The loader
+  rows can proceed from the draft alone;
   only the end-to-end gates need the matching (expensive) target.
 - **MTP speculative decoding from a GGUF target WORKS** (`SPEC-MTP-GGUF`,
   `GATING`, [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads

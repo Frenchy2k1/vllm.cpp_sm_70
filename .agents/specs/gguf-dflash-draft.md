@@ -4,6 +4,20 @@ Stable row: `SPEC-DFLASH-GGUF` (`.agents/engine-matrix.md`).
 Depends on: `SPEC-DFLASH`, [dflash-spec-decode.md](dflash-spec-decode.md);
 sibling: [gguf-mtp-spec-decode.md](gguf-mtp-spec-decode.md) (`SPEC-MTP-GGUF`).
 
+**Row-ID namespace.** This spike's work rows are `GD0`-`GD8`. They are NOT the
+`D0`-`D13` of [dflash-spec-decode.md](dflash-spec-decode.md), which are that
+track's own rows for the safetensors DFlash engine (landed through D13: paged
+draft-KV + capture-safe CUDA graph, 0.978x vLLM, `SPEC-DFLASH` `DONE`). Renamed
+after the collision was spotted; do not renumber back.
+
+**Relationship to the landed DFlash track.** That work is merged and is the
+BASELINE this row builds on, not a parallel effort: it contains no GGUF handling
+whatsoever (`grep -i gguf` over its spec returns nothing), so the draft SOURCE is
+the one axis it never varied. The three loader seams this row must change
+(`ResolveDflashDraftDir` `model_loader.cpp:116`, `MakeDflashDraftConfig` `:173`,
+`LoadDflashDraft` `:197`, still typed on `std::vector<SafetensorsFile>`) are
+unchanged by D13 and verified against post-merge `main`.
+
 Upstream reference pin for this spike: llama.cpp `origin/master` as fetched
 2026-07-28 (tag era `b10158`). This matters: a local checkout at `237ad9b9`
 (2026-07-01, 334 commits behind) has NO dflash GGUF contract at all, and reading
@@ -58,7 +72,7 @@ llama.cpp `origin/master` (the producer contract; vLLM has no GGUF path):
   with target metadata (tokenizer, hidden size, layer count). This is the
   producer-side reason `dflash.target_hidden_size` exists.
 
-## `D0` verified dump (the implementation contract)
+## `GD0` verified dump (the implementation contract)
 
 From the real Q4_K_M draft. `H = 5120`, `num_taps = 5`.
 
@@ -101,7 +115,7 @@ Three implementation facts this pins down:
 Norm storage note carried from the MTP row: the trunk GGUF loader stores Qwen
 RMSNorm weights as `(w + 1)` and un-shifts with `OwnNormMinus1`. Whether the
 `dflash` converter does the same is NOT established by this dump (F32 values were
-not compared against the safetensors draft) and MUST be checked in `D2` before
+not compared against the safetensors draft) and MUST be checked in `GD2` before
 the weights are trusted - it is exactly the class of defect that shape checks
 cannot see.
 
@@ -194,12 +208,12 @@ gates.
 - `SPEC-MTP-GGUF` `G2`'s dequant-cache helper. Not a hard dependency; if this
   row lands first it owns the helper and the MTP row reuses it. Sequence
   whichever starts first, do not duplicate the cache.
-- A `dflash`-arch GGUF draft asset. **Producing one is NOT required** (see `D0`):
+- A `dflash`-arch GGUF draft asset. **Producing one is NOT required** (see `GD0`):
   pre-converted drafts are published, smallest useful being
   `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` `Q4_K_M` at 1.03 GB. The
   fetch is the only blocked step and needs developer approval per the AGENTS.md
-  safe defaults. Required for gates 2-5; NOT required for `D1`-`D3`.
-- For `D4`+ only: the matching TARGET (Qwen3.6-27B safetensors for axis A). This
+  safe defaults. Required for gates 2-5; NOT required for `GD1`-`GD3`.
+- For `GD4`+ only: the matching TARGET (Qwen3.6-27B safetensors for axis A). This
   is the expensive dependency, not the draft.
 - llama.cpp at a commit that HAS the DFLASH arch. Pin and record it; a stale
   checkout silently lacks the whole contract.
@@ -209,18 +223,18 @@ gates.
 
 | Row | Work | Gate | Blocked by |
 |---|---|---|---|
-| `D0` | **DONE 2026-07-28 - contract CONFIRMED against a real file**, `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` Q4_K_M (1.03 GB, fetched; no local conversion run was needed, contrary to the original plan). Verified dump below. Every name and KV in Upstream chain holds, and two gaps in it are now closed: `dflash.block_size` IS emitted as its own KV, and `dflash.target_hidden_size` is NOT emitted by this converter (llama.cpp declares the key; do not require it) | Evidence-backed | - |
-| `D1` | `MakeDflashGgufConfig` + KV unit tests | Config unit tests, RED-first | `D0` |
-| `D2` | `MakeDflashGgufResolver` + shared dequant cache | Resolver unit tests; gate 2 | `D0` |
-| `D3` | `ResolveDflashDraftDir` accepts a `.gguf`; `LoadDflashDraft` branches | Path-discrimination test | `D1`, `D2` |
-| `D4` | Axis-A token + acceptance gate | Gates 3, 5 | `D3` |
-| `D5` | `SharedHeadSource` + its equivalence test | Gate 7 | `D4` |
-| `D6` | Drop `dflash` from the GGUF rejection; wire the GGUF branch | Gate 1 | `D5` |
-| `D7` | Axis-B token gate | Gate 4 | `D6` |
-| `D8` | Record: STATUS, BENCHMARKS, matrix, ledger | Checkers green | `D7` |
+| `GD0` | **DONE 2026-07-28 - contract CONFIRMED against a real file**, `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` Q4_K_M (1.03 GB, fetched; no local conversion run was needed, contrary to the original plan). Verified dump below. Every name and KV in Upstream chain holds, and two gaps in it are now closed: `dflash.block_size` IS emitted as its own KV, and `dflash.target_hidden_size` is NOT emitted by this converter (llama.cpp declares the key; do not require it) | Evidence-backed | - |
+| `GD1` | `MakeDflashGgufConfig` + KV unit tests | Config unit tests, RED-first | `GD0` |
+| `GD2` | `MakeDflashGgufResolver` + shared dequant cache | Resolver unit tests; gate 2 | `GD0` |
+| `GD3` | `ResolveDflashDraftDir` accepts a `.gguf`; `LoadDflashDraft` branches | Path-discrimination test | `GD1`, `GD2` |
+| `GD4` | Axis-A token + acceptance gate | Gates 3, 5 | `GD3` |
+| `GD5` | `SharedHeadSource` + its equivalence test | Gate 7 | `GD4` |
+| `GD6` | Drop `dflash` from the GGUF rejection; wire the GGUF branch | Gate 1 | `GD5` |
+| `GD7` | Axis-B token gate | Gate 4 | `GD6` |
+| `GD8` | Record: STATUS, BENCHMARKS, matrix, ledger | Checkers green | `GD7` |
 
-`D0`-`D4` are axis A and independently shippable; the row can legitimately rest
-at `PARTIAL` after `D4`.
+`GD0`-`GD4` are axis A and independently shippable; the row can legitimately rest
+at `PARTIAL` after `GD4`.
 
 ## Risks/decisions
 
@@ -247,12 +261,12 @@ at `PARTIAL` after `D4`.
   path.** Ours reads `dflash_config.mask_token_id` from `config.json`; the GGUF
   carries it as the standard tokenizer mask KV (`conversion/qwen.py:351`). If a
   given export omits it, `mask_token_id` stays -1 and the block drafter masks
-  nothing. `D1` must VT_CHECK it present rather than defaulting.
+  nothing. `GD1` must VT_CHECK it present rather than defaulting.
 - **RISK: my earlier reading was wrong on a stale checkout, and the same trap is
   live for the implementer.** At llama.cpp `237ad9b9` there is no DFLASH arch,
   no dflash tensors and no dflash KVs; only a `--target-model-dir` help string
   mentioning DFlash next to EAGLE3. Anyone who greps a stale tree will conclude
-  no contract exists and start inventing one. `D0` exists to prevent that.
+  no contract exists and start inventing one. `GD0` exists to prevent that.
   Record the exact llama.cpp commit used.
 - **DECISION: mirror llama.cpp's contract, do not invent one.** The house rule
   is MIRROR upstream. Where our loader wants something the GGUF contract does

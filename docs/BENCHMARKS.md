@@ -2613,7 +2613,10 @@ KV + tensor dump is recorded in the spike and every name in the Upstream chain
 holds. Two corrections to that chain fell out: `dflash.block_size` IS emitted as
 its own KV, and `dflash.target_hidden_size` is NOT emitted by this converter
 even though llama.cpp declares the key, so it must not be required. Still zero
-code, still `benchmark_binding=false`.
+code, still `benchmark_binding=false`. Work rows renamed `D*` -> `GD*` after a
+collision with the landed DFlash track's own `D0`-`D13` was spotted; that track
+(`SPEC-DFLASH`, paged draft-KV + capture-safe CUDA graph, 0.978x vLLM) is the
+BASELINE this row builds on and contains no GGUF handling of its own.
 
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 
