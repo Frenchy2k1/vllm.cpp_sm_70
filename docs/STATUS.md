@@ -240,6 +240,14 @@ Q2_K_XL). So two vehicles: single-Spark ~2-bit GGUF, or 2x-Spark NVFP4/fp8 over 
 interconnect. The GGUF vehicle's correctness reference is llama.cpp-on-box (the
 pinned vLLM cannot load V4-from-GGUF) and needs a V4-GGUF loader + IQ i-quant dequant
 (IQ1_S/IQ2_XXS — not in our C4 K-quant set). The NVFP4/fp8 vehicle stays multi-node.
+A source-level spike (2026-07-28) confirmed a **same-quant IQ2_XXS GGUF benchmark of
+our engine vs vLLM is NOT viable today**, blocked on both sides: vLLM 0.26 moved GGUF
+out-of-tree to the uninstalled `vllm-gguf-plugin` (which *does* dequant IQ2_XXS) but
+`DeepseekV4ForCausalLM` has no `packed_modules_mapping`/GGUF wiring; and our engine
+hard-rejects GGUF for DeepSeek-V4/V2 and lacks IQ2_XXS/Q2_K dequant — so even the
+`UD-Q2_K_XL` k-quant fallback does not rescue it. Apples-to-apples for DeepSeek-V4 is
+the NVFP4 vehicle; a true same-GGUF cross-engine number is only available on a
+Qwen3/dense k-quant both engines already load.
 The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):

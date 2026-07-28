@@ -162,7 +162,17 @@ parse + checkpoint loader name-map VERIFIED vs the real `nvidia/DeepSeek-V4-Flas
 ~83 GiB — only the 256 experts are W4; the MLA + shared linears are FP8 + NVFP4 double-scale ⇒ it
 does NOT fit ONE GB10's 119 GiB pool. **W1 (single-GB10 oracle run) is therefore MEMORY-INFEASIBLE**
 (needs multi-node TP / CPU offload / smaller quant), not merely disk-contended. Forward + strict gate
-= W3-W8. `DeepSeekV4MTPModel` promoted INVENTORIED→SPIKE. **NEXT-TIER BATCH TRIAGE (2026-07-24,
+= W3-W8. `DeepSeekV4MTPModel` promoted INVENTORIED→SPIKE. **GGUF BENCHMARK LOADABILITY spike
+(2026-07-28, `CLAIM-DSV4-GGUF-SPIKE`):** a same-quant `UD-IQ2_XXS` GGUF benchmark of our engine vs
+vLLM is **NOT viable today, blocked on BOTH sides** — vLLM 0.26 moved GGUF out-of-tree to
+`vllm-gguf-plugin` (uninstalled; DOES dequant IQ2_XXS) but `DeepseekV4ForCausalLM` has no
+`packed_modules_mapping`/GGUF wiring; our engine hard-rejects GGUF for DeepSeek-V4/V2
+(`deepseek_v4_registry.cpp:61-64`) and lacks IQ2_XXS AND Q2_K dequant (only F32/F16/BF16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/NVFP4).
+So the C4/GGUF roadmap item to make the single-Spark GGUF vehicle real is: lift the V4 GGUF
+reject + wire a V4-GGUF loader + port IQ2_XXS (llama.cpp `dequantize_row_iq2_xxs` + `iq2xxs_grid`)
+and/or Q2_K dequant — gated vs llama.cpp-on-card (vLLM cannot oracle V4-from-GGUF). Apples-to-apples
+DeepSeek-V4 is the NVFP4 2×-Spark vehicle; a true same-GGUF cross-engine number is only available on
+a Qwen3/dense k-quant both engines already load. **NEXT-TIER BATCH TRIAGE (2026-07-24,
 `sweep-recent-dense-batch.md`, `CLAIM-SWEEP-RECENT-DENSE`):** 8 recent dense/small-MoE families
 advanced `INVENTORIED` -> `SPIKE` with a ranked one-agent-each queue — **4 ZERO-NEW-KERNEL
 near-additive** (Phi-3/Phi-4 `Phi3ForCausalLM` a Llama subclass, Granite-3 4-scalar-multipliers,
