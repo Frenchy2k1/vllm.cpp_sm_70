@@ -267,6 +267,22 @@ via the opt-in route gate — 404 flag-off/no-callback → 200 attached). Inertn
 Reproduce: `cmake --build build-cpu --target test_openai_api_server &&
 ./build-cpu/tests/test_openai_api_server`.
 
+**ROAD-V1-C8 production endpoint wiring (2026-07-28, `CLAIM-C8-SERVE-PROD-WIRING`,
+NOT pushed).** Disposition: **NOT APPLICABLE (no throughput number,
+`benchmark_binding=false`).** Wiring the shipped `vllm-server` binary to call its
+opt-in endpoint setters (`/tokenize`, `/detokenize`, `/tokenizer_info`,
+`/abort_requests`) through a shared `ConfigureUtilityEndpoints` seam is
+serving-surface parity, not a compute path, so no vLLM throughput A/B applies.
+Gates are route-registration + behaviour exactness under vLLM 0.26's per-endpoint
+default gating: production defaults serve `/tokenize`+`/detokenize` and 404
+`/tokenizer_info`+`/abort_requests`; the flags (`--enable-tokenizer-info-endpoint`,
+`--enable-server-dev-mode`) turn them on; the live abort reports an exact
+before/after delta-count. Gated on CPU: `test_openai_api_server` 32/32 (420
+assertions; the new production-wiring case RED-first — a no-seam harness 404s every
+C8 route while core routes 200). Inertness: `test_openai_conformance` 23/23 +
+`test_openai_serving` 40/40 byte-identical. Reproduce: `cmake --build build-cpu
+--target test_openai_api_server && ./build-cpu/tests/test_openai_api_server`.
+
 **ROAD-V1-C8 chat-form `/tokenize` (2026-07-28, `CLAIM-C8-CHAT-TOKENIZE`, NOT
 pushed).** Disposition: **NOT APPLICABLE (no throughput number,
 `benchmark_binding=false`).** Extending `/tokenize` to accept the chat

@@ -17,6 +17,7 @@
 
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/tokenizer/tokenizer.h"
+#include "vllm/v1/engine/async_llm.h"
 #include "vllm/v1/metrics/loggers.h"
 
 namespace vllm::entrypoints::openai {
@@ -718,6 +719,50 @@ bool ApiServer::is_running() const { return impl_->server.is_running(); }
 
 size_t ApiServer::http_worker_count() const {
   return impl_->http_worker_count;
+}
+
+void ConfigureUtilityEndpoints(ApiServer& server,
+                               const vllm::tok::Tokenizer& tokenizer,
+                               int64_t max_model_len, vllm::v1::AsyncLLM& engine,
+                               const UtilityEndpointOptions& options) {
+  // /tokenize + /detokenize — ON by default whenever a tokenizer exists (vLLM
+  // always calls attach_tokenize_router, serve/tokenize/api_router.py:36,62).
+  server.set_tokenizer(&tokenizer, max_model_len);
+
+  // /tokenizer_info — OFF unless --enable-tokenizer-info-endpoint, mirroring
+  // vLLM's enable_tokenizer_info_endpoint gate (serve/tokenize/api_router.py:95;
+  // cli_args.py:140 default False). When off, the route is never registered → 404.
+  if (options.enable_tokenizer_info_endpoint) {
+    server.set_tokenizer_info_enabled(true);
+  }
+
+  // /abort_requests — DEV-mode gated. vLLM only registers the dev/rlhf router
+  // under `if envs.VLLM_SERVER_DEV_MODE` (api_server.py:238; envs.py:157 default
+  // 0), so it stays 404 in a default production server. Under
+  // --enable-server-dev-mode we wire the abort callback to the live engine:
+  // explicit request_ids are aborted via AsyncLLM::abort (async_llm.h:115), and
+  // the returned "aborted" count is the drop in unfinished requests (abort()
+  // synchronously removes the request states under the output-processor lock, so
+  // the delta is exact). The empty-request_ids "abort ALL" contract is a NAMED
+  // RESIDUAL: AsyncLLM exposes no active-request-id enumeration, so empty ids
+  // abort nothing and report 0 rather than fabricate an all-abort we cannot reach.
+  if (options.enable_server_dev_mode) {
+    server.set_abort_requests(
+        [&engine](const std::vector<std::string>& request_ids) -> int {
+          if (request_ids.empty()) {
+            return 0;  // abort-ALL residual: no active-request-id accessor.
+          }
+          const int before = engine.get_num_unfinished_requests();
+          engine.abort(request_ids);
+          const int after = engine.get_num_unfinished_requests();
+          return before > after ? before - after : 0;
+        });
+  }
+
+  // /metrics and /reset_prefix_cache are deliberately NOT wired here — the
+  // production AsyncLLM frontend exposes no live PrometheusStatLogger and no
+  // thread-safe prefix-cache reset RPC (see the header block comment +
+  // specs/{utility,admin}-endpoints.md). They stay 404, byte-identical to before.
 }
 
 }  // namespace vllm::entrypoints::openai

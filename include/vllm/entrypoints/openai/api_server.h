@@ -41,6 +41,10 @@ namespace vllm::v1::metrics {
 class PrometheusStatLogger;
 }  // namespace vllm::v1::metrics
 
+namespace vllm::v1 {
+class AsyncLLM;
+}  // namespace vllm::v1
+
 namespace vllm::entrypoints::openai {
 
 // The HTTP api_server. Holds non-owning references to the serving handlers +
@@ -206,6 +210,51 @@ class ApiServer {
 
   void register_routes();
 };
+
+// ── Production wiring of the opt-in C8 utility/admin endpoints (SERVE-METRICS /
+// SERVE-UTILITY-ENDPOINTS / SERVE-ADMIN) from the LIVE engine + tokenizer,
+// mirroring vLLM 0.26 @ 555967922's PER-ENDPOINT default gating. This is the
+// SINGLE seam shared by the production server (examples/server/main.cpp) and its
+// integration gate, so the gate exercises the exact wiring main() runs — the
+// setters are never called twice or diverge between the two.
+//
+// Per-endpoint default gating (vLLM file:line ↔ ours):
+//   /tokenize,/detokenize — ON by default when a tokenizer exists. vLLM's
+//     build_app always calls register_vllm_serve_api_routers →
+//     attach_tokenize_router (serve/__init__.py:11-31; api_server.py:222), which
+//     registers POST /tokenize + /detokenize
+//     (serve/tokenize/api_router.py:36,62). → set_tokenizer.
+//   /tokenizer_info — OFF unless enable_tokenizer_info_endpoint
+//     (serve/tokenize/api_router.py:95 gates attach on
+//     app.state.args.enable_tokenizer_info_endpoint; cli_args.py:140 default
+//     False). → our --enable-tokenizer-info-endpoint flag (opts.tokenizer_info).
+//   /abort_requests — DEV-mode gated. vLLM registers the dev/rlhf router ONLY
+//     under `if envs.VLLM_SERVER_DEV_MODE` (api_server.py:238-240 →
+//     register_vllm_dev_api_routers → dev/rlhf/api_router.py:94); VLLM_SERVER_DEV_MODE
+//     defaults 0 (envs.py:157,1350). → our --enable-server-dev-mode flag
+//     (opts.server_dev_mode). Explicit-id abort routes through AsyncLLM::abort;
+//     the abort-ALL (empty request_ids) path is a NAMED RESIDUAL — AsyncLLM
+//     exposes no active-request-id enumeration, so empty ids abort nothing and
+//     report 0 (explicit-id abort is the supported production path).
+//   /metrics, /reset_prefix_cache — NOT wired (deliberate, honest residuals).
+//     The production frontend is AsyncLLM (main.cpp: loaded->async_engine()),
+//     whose output handler records no iteration/scheduler stats to any
+//     PrometheusStatLogger (async stats deferred, specs/async-serving.md) and
+//     neither LoadedEngine nor AsyncLLM constructs/exposes one; and
+//     reset_prefix_cache() lives only on the scheduler's KVCacheManager, mutated
+//     exclusively on the EngineCore engine thread with no thread-safe RPC.
+//     Attaching either backing from main.cpp would be a fabricated wiring that
+//     never reaches the live engine, so it is left unwired and named in
+//     specs/{utility,admin}-endpoints.md.
+struct UtilityEndpointOptions {
+  bool enable_tokenizer_info_endpoint = false;  // --enable-tokenizer-info-endpoint
+  bool enable_server_dev_mode = false;          // mirrors VLLM_SERVER_DEV_MODE
+};
+
+void ConfigureUtilityEndpoints(ApiServer& server,
+                               const vllm::tok::Tokenizer& tokenizer,
+                               int64_t max_model_len, vllm::v1::AsyncLLM& engine,
+                               const UtilityEndpointOptions& options);
 
 }  // namespace vllm::entrypoints::openai
 

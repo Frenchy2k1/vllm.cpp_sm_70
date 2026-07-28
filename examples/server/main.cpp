@@ -101,6 +101,16 @@ struct Args {
   std::string benchmark_shutdown_fifo;  // paired trace-only control path.
   std::optional<bool> enable_prefix_caching = std::nullopt;
   bool enable_force_include_usage = false;
+  // GET /tokenizer_info gate. Mirrors vLLM's --enable-tokenizer-info-endpoint
+  // (entrypoints/openai/cli_args.py:140, default False; the route is registered
+  // only when serve/tokenize/api_router.py:95 sees the flag). Default off → the
+  // route 404s, byte-identical to before.
+  bool enable_tokenizer_info_endpoint = false;
+  // Dev/admin endpoint gate. Mirrors vLLM's VLLM_SERVER_DEV_MODE env
+  // (envs.py:157, default 0): build_app registers the dev/rlhf + dev/cache
+  // routers only under `if envs.VLLM_SERVER_DEV_MODE` (api_server.py:238). Off by
+  // default → /abort_requests 404s. Enables the /abort_requests production wiring.
+  bool enable_server_dev_mode = false;
   // Scheduling policy: "fcfs" (default), "priority" (mirrors vLLM's
   // --scheduling-policy / SchedulerConfig.policy), or "lpm" (SGLang's
   // cache-aware longest-prefix-match admission ordering, ENG-SGLANG-BEHAVIOR-FLAG;
@@ -137,6 +147,8 @@ struct Args {
          "               [--cuda-profile-graph-batch N]\n"
          "               [--benchmark-shutdown-fifo F]\n"
          "               [--enable-force-include-usage]\n"
+         "               [--enable-tokenizer-info-endpoint]\n"
+         "               [--enable-server-dev-mode]\n"
          "               [--[no-]enable-prefix-caching]\n"
          "               [--[no-]enable-radix-attention]\n"
          "               [--scheduling-policy fcfs|priority|lpm]\n"
@@ -186,6 +198,10 @@ Args ParseArgs(int argc, char** argv) {
       a.benchmark_shutdown_fifo = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--enable-force-include-usage") {
       a.enable_force_include_usage = true;
+    } else if (flag == "--enable-tokenizer-info-endpoint") {
+      a.enable_tokenizer_info_endpoint = true;
+    } else if (flag == "--enable-server-dev-mode") {
+      a.enable_server_dev_mode = true;
     } else if (flag == "--enable-prefix-caching" ||
                flag == "--no-enable-prefix-caching" ||
                flag == "--enable-radix-attention" ||
@@ -438,6 +454,27 @@ int main(int argc, char** argv) {
     oai::ApiServer server(completion, chat, models, vllm::Version(),
                           static_cast<size_t>(args.max_num_seqs),
                           worker_pool_mode);
+
+    // ── C8 opt-in utility/admin endpoints (SERVE-UTILITY-ENDPOINTS /
+    // SERVE-ADMIN). Wire the setters from the LIVE engine + tokenizer through the
+    // single shared seam so the production server actually serves /tokenize,
+    // /detokenize, /tokenizer_info (flag) and /abort_requests (dev-mode flag),
+    // mirroring vLLM 0.26's per-endpoint default gating. /metrics and
+    // /reset_prefix_cache stay unwired (no live backing on the AsyncLLM path) —
+    // see ConfigureUtilityEndpoints + specs/{utility,admin}-endpoints.md. ────────
+    oai::UtilityEndpointOptions endpoint_opts;
+    endpoint_opts.enable_tokenizer_info_endpoint =
+        args.enable_tokenizer_info_endpoint;
+    endpoint_opts.enable_server_dev_mode = args.enable_server_dev_mode;
+    oai::ConfigureUtilityEndpoints(server, tokenizer, loaded->max_model_len(),
+                                   engine, endpoint_opts);
+    std::cerr << "server: utility endpoints: /tokenize /detokenize on"
+              << (args.enable_tokenizer_info_endpoint ? ", /tokenizer_info on"
+                                                      : "")
+              << (args.enable_server_dev_mode ? ", /abort_requests on (dev-mode)"
+                                              : "")
+              << "\n";
+
     std::cerr << "server: listening on http://" << args.host << ":" << args.port
               << " (model '" << served_model_name << "', HTTP worker pool ";
     if (server.http_worker_count() == 0) {

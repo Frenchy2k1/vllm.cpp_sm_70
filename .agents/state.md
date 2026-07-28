@@ -28575,3 +28575,59 @@ not exposed today (callback contract IS wired). Broader vLLM admin endpoints
 (`/sleep`/`/wake_up`/`/is_sleeping`, `/pause`/`/resume`, `/start_profile`/
 `/stop_profile`, weight-update/EP) remain INVENTORIED + OUT OF SCOPE. NOT pushed;
 FULL SHA reported to caller.
+
+## 2026-07-28 — Production server endpoint wiring LANDED (`CLAIM-C8-SERVE-PROD-WIRING`)
+
+**Base.** Local `main` `aeb6dccd` (confirmed `git rev-parse HEAD`), isolated
+worktree `.claude/worktrees/agent-a302a31d62e5fefe1`, CPU-only, NO dgx. vLLM pin
+`555967922`/0.26.0.dev0. Closes the production-wiring residual named by
+`CLAIM-C8-SERVE-ENDPOINTS` (`SERVE-UTILITY-ENDPOINTS`/`SERVE-ADMIN`/`SERVE-METRICS`
+stay `ACTIVE`; C8 stays `PARTIAL`).
+
+**The gap.** `examples/server/main.cpp` instantiated `oai::ApiServer` but called
+NONE of its opt-in endpoint setters (`set_tokenizer`, `set_metrics_logger`,
+`set_tokenizer_info_enabled`, `set_abort_requests`, `set_reset_prefix_cache`), so a
+whole family of unit-tested endpoints was DARK in the actual shipped server.
+
+**What landed.** A SINGLE shared wiring seam `ConfigureUtilityEndpoints`
+(`include/vllm/entrypoints/openai/api_server.h` decl + `UtilityEndpointOptions`;
+`src/vllm/entrypoints/openai/api_server.cpp` impl), called by BOTH `main.cpp` and
+the gate over a real socket, mirroring vLLM 0.26's per-endpoint default gating:
+`/tokenize`+`/detokenize` ON by default when a tokenizer exists (vLLM always calls
+`attach_tokenize_router`, `api_server.py:222`) → `set_tokenizer(&tokenizer,
+max_model_len)`; `/tokenizer_info` OFF behind new CLI flag
+`--enable-tokenizer-info-endpoint` (mirrors `cli_args.py:140`); `/abort_requests`
+DEV-mode gated behind new CLI flag `--enable-server-dev-mode` (mirrors
+`envs.VLLM_SERVER_DEV_MODE`, `api_server.py:238`) wired to the LIVE `AsyncLLM::abort`
+with an EXACT before/after unfinished-count delta.
+
+**Landed vs blocked (honest).** WIRED: `/tokenize`, `/detokenize`,
+`/tokenizer_info` (flag), `/abort_requests` explicit-id (dev-mode flag).
+NAMED-BLOCKED, deliberately NOT wired (attaching would fabricate a wiring that
+never reaches the live engine): `/metrics` — the production frontend is `AsyncLLM`
+(`loaded->async_engine()`), whose output handler records no stats to any
+`PrometheusStatLogger` and neither `LoadedEngine` nor `AsyncLLM` constructs/exposes
+one (missing `LoadedEngine::stat_logger()` + a `Record()` site in
+`AsyncLLM::RunOutputHandler`); `/reset_prefix_cache` — `reset_prefix_cache()` is
+`KVCacheManager`-private, mutated only on the EngineCore engine thread, no
+thread-safe RPC (missing `AsyncLLM::reset_prefix_cache`). NAMED RESIDUAL: the
+`/abort_requests` empty-list "abort ALL" path needs `AsyncLLM::active_request_ids()`
+(not exposed) → empty ids report 0.
+
+**Gate (CPU, RED-first).** NEW `test_api_server.cpp` case "ConfigureUtilityEndpoints
+wires the production C8 surface" drives the exact seam over a real ephemeral-port
+socket: (RED) no-seam harness 404s every C8 route while core routes 200; (defaults)
+`/tokenize`+`/detokenize` 200, `/tokenizer_info`+`/abort_requests` 404; (flags on)
+both 200; (live abort) exact `aborted`==1 + `has_unfinished_requests()`→false, empty
+→ 0. `test_openai_api_server` 32/32 (420 asserts, was 31/31/379). Inertness:
+`test_openai_conformance` 23/23 + `test_openai_serving` 40/40 byte-identical; core
+routes unchanged. Clean full-library CPU `-Werror` (`-DVLLM_CPP_CUDA=OFF
+-DVLLM_CPP_SERVER=ON`, Release) 0-warn incl. the `server` binary; `server --help`
+lists both new flags.
+
+**Records.** engine-matrix `SERVE-UTILITY-ENDPOINTS`/`SERVE-ADMIN`/`SERVE-METRICS`
+(state unchanged → Total rollup + ENGINE count 122 unchanged), `feature-matrix.md`
+§9, `roadmap_v1.md` C8, `.agents/specs/{utility,admin}-endpoints.md` (Production
+wiring sections), coordination `CLAIM-C8-SERVE-PROD-WIRING` note + claim-table row,
+`parity-ledger.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`, this entry. All record
+checkers rc=0. NOT pushed; FULL SHA reported to caller.
