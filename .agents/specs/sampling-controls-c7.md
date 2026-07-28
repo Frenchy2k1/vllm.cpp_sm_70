@@ -299,3 +299,75 @@ plain-sampling paths.
   bitmask branch of `_beam_search_step`, `offline.py:222-258,329-455`) and the
   encoder-decoder / LoRA beam variants are out of scope; the multi-prompt batch loop
   (`offline.py:141-173`) is single-prompt here.
+  UPDATE 2026-07-28 (`CLAIM-C7-BESTOF-BEAM-API`): the `use_beam_search`→beam and
+  `best_of`→fan-out ENDPOINT mappings are now WIRED (see the section below); the
+  C-ABI beam params + grammar/enc-dec/LoRA beams remain residual.
+
+## `SAMPLE-BEST-OF` + `use_beam_search` — the OpenAI-endpoint surface (ACTIVE, `CLAIM-C7-BESTOF-BEAM-API`)
+
+Wires the two named `SAMPLE-N`/`SAMPLE-BEAM` endpoint residuals so the C7 sampling
+track is usable end-to-end from the HTTP API. Strict default-path inertness: a
+request with NEITHER `best_of>n` NOR `use_beam_search` set is byte-identical to
+before.
+
+### Honest vLLM-0.26 endpoint-availability finding (`555967922`)
+- `use_beam_search` **IS** a real vLLM-0.26 OpenAI-server surface, on BOTH endpoints:
+  `vllm/entrypoints/openai/completion/protocol.py:73` (field) + `:260`
+  (`to_beam_search_params`); `vllm/entrypoints/openai/completion/serving.py:173-205`
+  (`if request.use_beam_search: … self.beam_search(...)`);
+  `vllm/entrypoints/openai/chat_completion/protocol.py:249` + `:589`;
+  `vllm/entrypoints/openai/chat_completion/serving.py:319-343`. The per-beam
+  generator is `vllm/entrypoints/generate/beam_search/online.py:28-220` (yields ONE
+  `RequestOutput` whose `outputs` list is the `beam_width` best beams → choices).
+- `best_of` **HAS BEEN DROPPED** from vLLM 0.26's live path. `grep -rn best_of vllm/`
+  finds it ONLY at `vllm/entrypoints/openai/chat_completion/protocol.py:1048`, a
+  vestigial field on `BatchChatCompletionRequest` that is **never consumed** (no
+  `SamplingParams.best_of`, no ranking, no `best_of` on `CompletionRequest`/
+  `ChatCompletionRequest`). We therefore implement the CLASSIC OpenAI-spec / vLLM-V0
+  `best_of` contract (generate `best_of`, return the `n` highest-cumulative-logprob),
+  gated on OUR deterministic fan-out — there is no 0.26 `best_of` oracle to gate
+  token-exactness against, which is recorded honestly rather than fabricated.
+
+### Port map
+- `include/vllm/entrypoints/openai/protocol.h`: `best_of` / `use_beam_search` /
+  `length_penalty` fields on `CompletionRequest` + `ChatCompletionRequest` (best_of on
+  chat is a recorded deviation — upstream carries it only on Batch); the
+  `to_beam_search_params(int)` declarations.
+- `src/vllm/entrypoints/openai/protocol.cpp`: `from_json` parses the three fields;
+  `ApplyBestOf` (anon ns) maps `best_of`→`sp.n` fan-out count + forces `sp.logprobs=0`
+  for cumulative-logprob ranking (AFTER `sp.logprobs` is assigned, so a user count is
+  not clobbered) + rejects `best_of<n`; `to_beam_search_params` mirrors
+  completion/protocol.py:260 & chat_completion/protocol.py:589 (`beam_width=n`,
+  `temperature` None→1.0, `length_penalty`, `ignore_eos`).
+- `include/vllm/entrypoints/openai/serving_utils.h` + `.cpp`: `SelectBestOf` — stable
+  sort by DESCENDING cumulative logprob, keep top-n, re-index 0..n-1; INERT (returns
+  input unchanged, indices preserved) when nothing to trim.
+- `src/vllm/entrypoints/openai/serving_completion.cpp` + `serving_chat.cpp`:
+  `use_beam_search` routing (tokenize the (chat-rendered) prompt → `BeamSearch(sync
+  LLMEngine, …)` → `beam_width` beams as choices; reject streaming beam as upstream
+  serving.py:136); `set_beam_search_tokenizer` seam (the driver needs a tokenizer +
+  eos); the `best_of` top-n trim guarded on `request.best_of` (default path binds the
+  outputs with NO copy/re-rank).
+
+### Gates (CPU, exact, RED-first) — `tests/vllm/entrypoints/openai/test_serving.cpp`
+- `SelectBestOf` unit: ranks by cumulative logprob, keeps top-n, re-indexes, stable on
+  ties, INERT when return_n≥size.
+- `best_of`→`sp.n` + forced ranking logprob (RED-first: before, best_of was an unknown
+  ignored field); user logprob count NOT clobbered; `best_of<n` rejected.
+- e2e `best_of=4, n=2` (top_k=1 collapse) returns EXACTLY n=2 ranked, re-indexed
+  choices; `best_of` unset / `==n` inertness (params identical, no forced logprob).
+- `use_beam_search` `to_beam_search_params` round-trip; endpoint beam choices IDENTICAL
+  to the direct `BeamSearch` driver call over a fresh identical engine (completion +
+  chat); streaming+beam rejected.
+- Inertness: the full `test_openai_serving` (37 cases, incl. n>1 / logprobs / streaming
+  / stop) stays byte-identical; clean CPU `-Werror` 0-warn.
+
+### RESIDUALS (honest, named)
+- Beam search over the PRODUCTION AsyncLLM HTTP server: the merged `BeamSearch` driver
+  is `LLMEngine&`-based (sync), the production `examples/server/main.cpp` runs AsyncLLM
+  → `set_beam_search_tokenizer` is a no-op there and a beam request raises "requires the
+  synchronous engine". Needs an async `BeamSearch` driver (a separate porting task,
+  mirroring `online.py`).
+- Streaming beam search (upstream also rejects it, serving.py:136).
+- C-ABI `best_of`/beam fields (ABI bump), AsyncLLM streaming per-child best_of
+  collation, grammar-constrained beams.

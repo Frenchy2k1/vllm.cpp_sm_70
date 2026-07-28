@@ -331,6 +331,32 @@ UNCHANGED. Clean full-library CPU `-Werror` 0-warn. Residuals (named): OpenAI
 beams. Reproduce: `cmake --build build-cpu --target test_beam_search test_llm_engine
 && ./build-cpu/tests/test_beam_search && ./build-cpu/tests/test_llm_engine`.
 
+**ROAD-V1-C7 `best_of` + `use_beam_search` OpenAI-endpoint surface
+(`SAMPLE-BEST-OF` + `SAMPLE-BEAM` endpoint) (2026-07-28,
+`CLAIM-C7-BESTOF-BEAM-API`, NOT pushed).** Disposition: **NOT APPLICABLE (no
+throughput number, `benchmark_binding=false`; an endpoint-surface / correctness
+capability, and the default (no best_of / no beam) request path is
+byte-identical).** Wires the two named `SAMPLE-N`/`SAMPLE-BEAM` endpoint residuals:
+`best_of>n` fans out via the `ParentRequest` machinery (`sp.n=best_of`, forced
+ranking `logprobs=0`) and the serving layer returns the top-`n` by cumulative
+logprob (`SelectBestOf`, re-indexed); `use_beam_search`+`length_penalty` route
+through the merged `BeamSearch` driver over the sync `LLMEngine` seam and return
+`beam_width` beams as choices (completion + chat). **Honest 0.26 finding:**
+`use_beam_search` IS a real 0.26 OpenAI-server surface; `best_of` HAS BEEN DROPPED
+from 0.26's live path (only a vestigial `BatchChatCompletionRequest` field) → we
+implement the classic OpenAI/V0 `best_of` contract gated on our own deterministic
+fan-out (no 0.26 best_of oracle). Gate: `test_openai_serving` 9 NEW cases / 62
+asserts (`SelectBestOf` rank/tie/inert; `best_of`→`sp.n` + forced logprob RED-first;
+`best_of<n` rejected; e2e best_of=4,n=2→EXACTLY 2 ranked choices; unset/==n
+inertness; `to_beam_search_params` round-trip; completion + chat endpoint beam
+choices IDENTICAL to the direct `BeamSearch` driver; streaming+beam rejected);
+full suite 37/37, pre-existing 28 UNCHANGED. Clean full-library CPU `-Werror`
+0-warn incl. the `server` binary. Residuals (named): beam over the production
+AsyncLLM HTTP server (driver is sync-`LLMEngine&`-based — needs an async driver),
+streaming beam (rejected like upstream), C-ABI `best_of`/beam fields.
+Reproduce: `cmake --build build-cpu --target test_openai_serving &&
+ctest --test-dir build-cpu -R '^test_openai_serving$' --output-on-failure`.
+
 **ROAD-V1-C8 /metrics LIVE per-step wiring (2026-07-27,
 `CLAIM-ROADMAP-C8-METRICS-WIRE`, NOT pushed).** Disposition: **NOT APPLICABLE (no
 throughput number, `benchmark_binding=false`; metrics are observational, off the

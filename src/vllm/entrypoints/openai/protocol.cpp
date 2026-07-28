@@ -245,6 +245,29 @@ void ParseToolChoice(const nlohmann::json& j, std::optional<ToolChoice>& out) {
   out = std::move(choice);
 }
 
+// SAMPLE-BEST-OF: map the OpenAI `best_of` onto the engine fan-out count.
+// Classic OpenAI/vLLM-V0 semantics (vLLM 0.26 dropped best_of from the live path
+// — see protocol.h): best_of >= n; when best_of > n, generate `best_of` children
+// (sp.n = best_of, via the existing ParentRequest fan-out) and let the serving
+// layer rank by cumulative logprob and return the top-n. Ranking needs the
+// per-sequence cumulative logprob, which our engine only accumulates when
+// logprobs are computed (v1/engine/logprobs.cpp:37-39), so force the sampled-token
+// logprob (logprobs=0, no user-visible payload) when the caller didn't ask for it.
+// INERT when best_of is unset or <= n (sp.n unchanged; no forced logprobs). Reject
+// best_of < n (OpenAI: best_of must be >= n). The greedy restriction (n>1 requires
+// non-greedy sampling) is enforced downstream by SamplingParams::PostInit().
+void ApplyBestOf(SamplingParams& sp, const std::optional<int>& best_of, int n) {
+  if (!best_of.has_value()) return;
+  if (*best_of < n) {
+    throw std::runtime_error(
+        "best_of must be greater than or equal to n");
+  }
+  if (*best_of > n) {
+    sp.n = *best_of;
+    if (!sp.logprobs.has_value()) sp.logprobs = 0;
+  }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -268,6 +291,10 @@ void from_json(const nlohmann::json& j, CompletionRequest& r) {
     }
   }
   GetOr(j, "n", r.n);
+  // SAMPLE-BEST-OF / SAMPLE-BEAM (completion/protocol.py:73,77 + best_of).
+  GetOpt(j, "best_of", r.best_of);
+  GetOr(j, "use_beam_search", r.use_beam_search);
+  GetOr(j, "length_penalty", r.length_penalty);
   GetOpt(j, "temperature", r.temperature);
   GetOpt(j, "top_p", r.top_p);
   GetOpt(j, "top_k", r.top_k);
@@ -351,6 +378,10 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   GetOpt(j, "max_tokens", r.max_tokens);
   GetOpt(j, "max_completion_tokens", r.max_completion_tokens);
   GetOpt(j, "n", r.n);
+  // SAMPLE-BEST-OF / SAMPLE-BEAM (chat_completion/protocol.py:249,597 + best_of).
+  GetOpt(j, "best_of", r.best_of);
+  GetOr(j, "use_beam_search", r.use_beam_search);
+  GetOr(j, "length_penalty", r.length_penalty);
   GetOpt(j, "temperature", r.temperature);
   GetOpt(j, "top_p", r.top_p);
   GetOpt(j, "top_k", r.top_k);
@@ -422,6 +453,10 @@ SamplingParams CompletionRequest::to_sampling_params(
   ApplyLogitFilters(sp, logit_bias, allowed_token_ids, bad_words);
   // response_format -> structured_outputs (completion/protocol.py:309-338).
   ApplyResponseFormat(response_format, sp);
+  // best_of: fan-out count + forced ranking logprob (AFTER sp.logprobs is set so
+  // the forced logprob is not overwritten). PostInit() then runs the greedy n
+  // check on the (possibly best_of) n.
+  ApplyBestOf(sp, best_of, n);
   sp.PostInit();
   return sp;
 }
@@ -461,8 +496,38 @@ SamplingParams ChatCompletionRequest::to_sampling_params(
   ApplyLogitFilters(sp, logit_bias, allowed_token_ids, bad_words);
   // response_format -> structured_outputs (chat_completion/protocol.py:629-658).
   ApplyResponseFormat(response_format, sp);
+  // best_of: see CompletionRequest::to_sampling_params.
+  ApplyBestOf(sp, best_of, n.value_or(1));
   sp.PostInit();
   return sp;
+}
+
+// ---------------------------------------------------------------------------
+// to_beam_search_params
+// ---------------------------------------------------------------------------
+
+vllm::BeamSearchParams CompletionRequest::to_beam_search_params(
+    int max_tokens_in) const {
+  // completion/protocol.py:260-279. beam_width == n; temperature None => 1.0.
+  vllm::BeamSearchParams bp;
+  bp.beam_width = n;
+  bp.max_tokens = max_tokens_in;
+  bp.ignore_eos = ignore_eos;
+  bp.temperature = temperature.value_or(kDefaultTemperature);
+  bp.length_penalty = length_penalty;
+  return bp;
+}
+
+vllm::BeamSearchParams ChatCompletionRequest::to_beam_search_params(
+    int max_tokens_in) const {
+  // chat_completion/protocol.py:589-606. beam_width == n; temperature None => 1.0.
+  vllm::BeamSearchParams bp;
+  bp.beam_width = n.value_or(1);
+  bp.max_tokens = max_tokens_in;
+  bp.ignore_eos = ignore_eos;
+  bp.temperature = temperature.value_or(kDefaultTemperature);
+  bp.length_penalty = length_penalty;
+  return bp;
 }
 
 // ---------------------------------------------------------------------------

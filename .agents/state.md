@@ -28447,3 +28447,36 @@ All record checkers rc=0. NOT pushed; FULL SHA reported to caller.
   entry. All record checkers rc=0. **Residuals (named):** OpenAI `use_beam_search`/
   `best_of` wiring, C-ABI beam params, grammar-constrained beams, encoder-decoder/
   LoRA beams. NOT pushed; FULL SHA reported to caller.
+- **2026-07-28** — **`best_of` + `use_beam_search` OpenAI-ENDPOINT surface LANDED +
+  CPU-GATED** (`CLAIM-C7-BESTOF-BEAM-API`; isolated worktree
+  `.claude/worktrees/agent-a4354159cb677d86b` off local `main` `54767c9f`, confirmed
+  via `git rev-parse HEAD`; CPU-only, NO dgx; NOT pushed). Wires the two named
+  `SAMPLE-N`/`SAMPLE-BEAM` endpoint residuals. `best_of>n` → `sp.n=best_of` fan-out
+  (reusing `ParentRequest`) + forced ranking `logprobs=0`; serving trims to top-`n`
+  by cumulative logprob (`SelectBestOf`, re-indexed). `use_beam_search`+`length_penalty`
+  → `to_beam_search_params` → the merged `BeamSearch` driver over the SYNC `LLMEngine`
+  seam (`set_beam_search_tokenizer`), returning `beam_width` beams as choices; both
+  completion + chat. Default (no best_of/beam) path byte-identical (trim guarded on
+  `request.best_of`, no copy). **HONEST 0.26 FINDING:** `use_beam_search` IS a real
+  0.26 OpenAI-server surface (completion/serving.py:173-205 + chat serving.py:319-343);
+  `best_of` HAS BEEN DROPPED from 0.26's live path (`grep -rn best_of vllm/` → only a
+  vestigial NEVER-consumed `BatchChatCompletionRequest` field, protocol.py:1048) → we
+  implement the CLASSIC OpenAI/V0 `best_of` contract gated on our own fan-out (no 0.26
+  best_of oracle). Gate: `test_openai_serving` 9 NEW cases / 62 asserts
+  (`SelectBestOf` rank/tie/inert; `best_of`→`sp.n` + forced logprob RED-first; reject
+  `best_of<n`; e2e best_of=4,n=2→EXACTLY 2 ranked choices; unset/==n inertness;
+  `to_beam_search_params` round-trip; completion + chat endpoint beam choices IDENTICAL
+  to the direct `BeamSearch` driver; streaming+beam rejected) — full suite 37/37, the
+  pre-existing 28 UNCHANGED. Clean full-library CPU `-Werror` (`-Wall -Wextra -Werror`,
+  `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON` Release) **0 warnings** incl. the `server`
+  binary. ENGINE row count 121→122 (NEW `SAMPLE-BEST-OF`, `scripts/check-agent-record.py`
+  bumped). Records: `engine-matrix.md` (NEW `SAMPLE-BEST-OF` row + `SAMPLE-N`/`SAMPLE-BEAM`
+  residual edits + Total/Sampling rollup ACTIVE 37→38, Total 121→122), `feature-matrix.md`
+  §6, `roadmap_v1.md` C7, `specs/sampling-controls-c7.md` (NEW endpoint section),
+  `docs/STATUS.md`, `docs/BENCHMARKS.md` (NOT-APPLICABLE), ledger, coordination
+  `CLAIM-C7-BESTOF-BEAM-API`, this entry. All record checkers rc=0. **Residuals (named):**
+  beam over the PRODUCTION AsyncLLM HTTP server (driver is sync-`LLMEngine&`-based; needs
+  an async driver mirroring `online.py`; `examples/server/main.cpp` intentionally NOT
+  edited), streaming beam (rejected like upstream), C-ABI `best_of`/beam fields (ABI bump),
+  AsyncLLM streaming per-child best_of collation, grammar-constrained beams. NOT pushed;
+  FULL SHA reported to caller.

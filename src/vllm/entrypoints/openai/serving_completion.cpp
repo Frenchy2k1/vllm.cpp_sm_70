@@ -7,10 +7,13 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/entrypoints/beam_search.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
+#include "vllm/tokenizer/tokenizer.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -160,6 +163,57 @@ CompletionResult OpenAIServingCompletion::create_completion(
   const StreamUsageSelection usage = ShouldIncludeUsage(
       request.stream_options, enable_force_include_usage_);
 
+  // ── use_beam_search (completion/serving.py:173-205) ──────────────────────
+  // Route the request through the merged BeamSearch driver instead of the
+  // sampler: beam_width == n, returns the n best beams as choices. This runs
+  // over the SYNC LLMEngine (the driver is LLMEngine&-based); the AsyncLLM beam
+  // path is a named residual. Streaming beam search is rejected exactly as
+  // upstream (serving.py:136-139).
+  if (request.use_beam_search) {
+    if (request.stream) {
+      throw std::runtime_error(
+          "Streaming is not currently supported with beam search");
+    }
+    if (sync_engine_ == nullptr || beam_tokenizer_ == nullptr) {
+      throw std::runtime_error(
+          "beam search requires the synchronous engine and a tokenizer");
+    }
+    const int max_tok = request.max_tokens.value_or(16);
+    const BeamSearchParams params = request.to_beam_search_params(max_tok);
+    const std::vector<int32_t> prompt_ids =
+        beam_tokenizer_->Encode(request.prompt);
+    const BeamSearchOutput beams = BeamSearch(
+        *sync_engine_, prompt_ids, params, beam_eos_token_id_, beam_tokenizer_);
+
+    CompletionResponse response;
+    response.id = request_id;
+    response.created = created_time;
+    response.model = model_name;
+    const int num_prompt_tokens = static_cast<int>(prompt_ids.size());
+    int num_generated_tokens = 0;
+    for (std::size_t i = 0; i < beams.sequences.size(); ++i) {
+      const BeamSearchSequence& beam = beams.sequences[i];
+      CompletionResponseChoice choice;
+      choice.index = static_cast<int>(i);
+      choice.text = SanitizeUtf8(beam.text.value_or(""));
+      choice.finish_reason = beam.finish_reason;
+      response.choices.push_back(std::move(choice));
+      // Generated tokens are the beam's tokens past the shared prompt.
+      if (beam.tokens.size() > prompt_ids.size()) {
+        num_generated_tokens +=
+            static_cast<int>(beam.tokens.size() - prompt_ids.size());
+      }
+    }
+    response.usage.prompt_tokens = num_prompt_tokens;
+    response.usage.completion_tokens = num_generated_tokens;
+    response.usage.total_tokens = num_prompt_tokens + num_generated_tokens;
+
+    CompletionResult result;
+    result.streaming = false;
+    result.response = std::move(response);
+    return result;
+  }
+
   // request → SamplingParams. to_sampling_params sets output_kind to kDelta
   // when stream, kFinalOnly otherwise (protocol.cpp) — matching upstream's
   // per-request RequestOutputKind (completion/serving.py:174).
@@ -271,7 +325,17 @@ CompletionResult OpenAIServingCompletion::create_completion(
 
   int num_prompt_tokens = static_cast<int>(final_res.prompt_token_ids.size());
   int num_generated_tokens = 0;
-  for (const CompletionOutput& output : final_res.outputs) {
+  // SAMPLE-BEST-OF: when best_of > n the engine produced best_of children; keep
+  // the top-n by cumulative logprob. Guarded on request.best_of so the default
+  // (and plain n>1) path binds `outs` to final_res.outputs with NO copy/re-rank.
+  std::vector<CompletionOutput> selected_outputs;
+  const bool trim_best_of =
+      request.best_of.has_value() && *request.best_of > request.n;
+  const std::vector<CompletionOutput>& outs =
+      trim_best_of
+          ? (selected_outputs = SelectBestOf(final_res.outputs, request.n))
+          : final_res.outputs;
+  for (const CompletionOutput& output : outs) {
     CompletionResponseChoice choice;
     choice.index = static_cast<int>(response.choices.size());
     choice.text = SanitizeUtf8(output.text);  // echo deferred; see serving_utils.h

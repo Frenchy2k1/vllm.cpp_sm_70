@@ -9,6 +9,8 @@
 // serving.py @ e24d1b24.
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
+#include "vllm/entrypoints/openai/serving_utils.h"
+#include "vllm/entrypoints/beam_search.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
 #include "vllm/entrypoints/openai/tool_parsers/hermes.h"
@@ -66,6 +68,11 @@ using vllm::entrypoints::openai::get_tool_parser;
 using vllm::entrypoints::openai::HermesToolParser;
 using vllm::entrypoints::openai::OpenAIServingChat;
 using vllm::entrypoints::openai::OpenAIServingCompletion;
+using vllm::BeamSearch;
+using vllm::BeamSearchOutput;
+using vllm::BeamSearchParams;
+using vllm::CompletionOutput;
+using vllm::entrypoints::openai::SelectBestOf;
 using vllm::entrypoints::openai::ShapeChatDelta;
 using vllm::entrypoints::openai::ShapeChatMessage;
 using vllm::entrypoints::openai::ShapedChatMessage;
@@ -452,6 +459,231 @@ TEST_CASE("serving_completion: n>1 returns n indexed, deterministic choices") {
   CHECK(resp.usage.completion_tokens == kN * kSeqs);
 }
 
+// ─── SAMPLE-BEST-OF (ROAD-V1-C7) ─────────────────────────────────────────────
+// best_of generates `best_of` children and returns the `n` highest-cumulative-
+// logprob ones. HONEST NOTE: vLLM 0.26 dropped best_of from the live path (only a
+// vestigial field on BatchChatCompletionRequest), so this is the classic OpenAI /
+// vLLM-V0 contract gated on OUR deterministic fan-out, not a 0.26 oracle.
+
+// (bo0) SelectBestOf unit: ranks by DESCENDING cumulative logprob, keeps top-n,
+// re-indexes 0..n-1, stable on ties, and is INERT when nothing to trim.
+TEST_CASE("SelectBestOf: ranks by cumulative logprob and re-indexes top-n") {
+  auto make = [](int idx, double cum) {
+    CompletionOutput o;
+    o.index = idx;
+    o.cumulative_logprob = cum;
+    o.text = "seq" + std::to_string(idx);
+    return o;
+  };
+  // Four children with distinct cumulative logprobs; best_of=4, return n=2.
+  std::vector<CompletionOutput> outs = {
+      make(0, -3.0), make(1, -1.0), make(2, -5.0), make(3, -2.0)};
+  std::vector<CompletionOutput> top = SelectBestOf(outs, 2);
+  REQUIRE(top.size() == 2u);
+  // Highest cum_logprob first: child 1 (-1.0), then child 3 (-2.0).
+  CHECK(top[0].text == "seq1");
+  CHECK(top[1].text == "seq3");
+  // Re-indexed 0..n-1.
+  CHECK(top[0].index == 0);
+  CHECK(top[1].index == 1);
+
+  // Stable on ties (equal cum keeps engine order).
+  std::vector<CompletionOutput> tied = {make(0, -1.0), make(1, -1.0),
+                                        make(2, -9.0)};
+  std::vector<CompletionOutput> keep = SelectBestOf(tied, 2);
+  REQUIRE(keep.size() == 2u);
+  CHECK(keep[0].text == "seq0");
+  CHECK(keep[1].text == "seq1");
+
+  // INERT: return_n >= size returns the input unchanged (indices preserved).
+  std::vector<CompletionOutput> passthrough = SelectBestOf(outs, 4);
+  REQUIRE(passthrough.size() == 4u);
+  CHECK(passthrough[0].index == 0);  // NOT re-ranked / re-indexed
+  CHECK(passthrough[2].index == 2);
+}
+
+// (bo1) RED-first: BEFORE wiring, best_of>n was ignored (to_sampling_params kept
+// n). AFTER: best_of maps to the engine fan-out count (sp.n == best_of) and forces
+// a ranking logprob when the caller asked for none.
+TEST_CASE("best_of: to_sampling_params fans out to best_of and forces logprob") {
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.n = 2;
+  req.best_of = 4;
+  req.temperature = 1.0;  // non-greedy (best_of>1 requires it)
+  req.top_k = 1;
+  SamplingParams sp = req.to_sampling_params();
+  CHECK(sp.n == 4);                    // fan out to best_of
+  REQUIRE(sp.logprobs.has_value());    // forced for cumulative-logprob ranking
+  CHECK(*sp.logprobs == 0);
+
+  // A user-requested logprobs count is NOT clobbered by the forced ranking.
+  CompletionRequest req2 = req;
+  req2.logprobs = 3;
+  SamplingParams sp2 = req2.to_sampling_params();
+  REQUIRE(sp2.logprobs.has_value());
+  CHECK(*sp2.logprobs == 3);
+}
+
+// (bo2) best_of < n is rejected (OpenAI: best_of must be >= n).
+TEST_CASE("best_of: best_of < n is rejected") {
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.n = 4;
+  req.best_of = 2;
+  req.temperature = 1.0;
+  req.top_k = 1;
+  CHECK_THROWS_AS(req.to_sampling_params(), std::runtime_error);
+}
+
+// (bo3) e2e: best_of=4, n=2 returns exactly n=2 choices, each a valid
+// continuation. top_k=1 collapses every child to the argmax so all four share the
+// same cumulative logprob — the trim deterministically returns 2 of the identical
+// sequences (proves the fan-out count + trim-to-n + re-index end-to-end).
+TEST_CASE("serving_completion: best_of>n returns exactly n ranked choices") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kMax = 5;
+
+  Harness h(c, w, tok);
+  OpenAIServingCompletion serving(h.engine, "test-model");
+
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.max_tokens = kMax;
+  req.n = 2;
+  req.best_of = 4;
+  req.temperature = 1.0;  // random path (legal for best_of>1)
+  req.top_k = 1;          // deterministic collapse to the argmax
+  req.seed = 11;
+  req.stream = false;
+
+  CompletionResult res = serving.create_completion(req);
+  REQUIRE_FALSE(res.streaming);
+  REQUIRE(res.response.has_value());
+  const auto& resp = *res.response;
+  // Exactly n=2 choices (NOT best_of=4), indexed 0..1, each a valid continuation.
+  REQUIRE(resp.choices.size() == 2u);
+  for (int i = 0; i < 2; ++i) {
+    CHECK(resp.choices[i].index == i);
+    CHECK_FALSE(resp.choices[i].text.empty());
+    REQUIRE(resp.choices[i].finish_reason.has_value());
+    CHECK(*resp.choices[i].finish_reason == "length");
+  }
+  // top_k=1 => all children identical => the two kept are identical.
+  CHECK(resp.choices[0].text == resp.choices[1].text);
+}
+
+// (bo4) inertness: best_of unset (== default) leaves to_sampling_params IDENTICAL
+// to a request without the field — n unchanged, logprobs unset, no fan-out.
+TEST_CASE("best_of: unset best_of is inert (params identical)") {
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.n = 3;
+  req.temperature = 1.0;
+  req.top_k = 1;
+  SamplingParams sp = req.to_sampling_params();
+  CHECK(sp.n == 3);                       // n untouched
+  CHECK_FALSE(sp.logprobs.has_value());   // no forced ranking logprob
+
+  // best_of == n is also inert (the default relationship).
+  CompletionRequest eq = req;
+  eq.best_of = 3;
+  SamplingParams sp_eq = eq.to_sampling_params();
+  CHECK(sp_eq.n == 3);
+  CHECK_FALSE(sp_eq.logprobs.has_value());
+}
+
+// ─── SAMPLE-BEAM (ROAD-V1-C7) endpoint wiring ────────────────────────────────
+// A use_beam_search request routes through the merged BeamSearch driver: the
+// endpoint's choices must be IDENTICAL to calling BeamSearch(engine, ...) directly
+// with the request's to_beam_search_params (the beam gate's determinism reused).
+
+// (bs0) round-trip: use_beam_search maps request → BeamSearchParams.
+TEST_CASE("use_beam_search: to_beam_search_params mirrors the request") {
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.n = 3;                 // beam_width
+  req.max_tokens = 7;
+  req.use_beam_search = true;
+  req.length_penalty = 1.5;
+  req.ignore_eos = true;
+  // temperature unset -> defaults to 1.0 (completion/protocol.py:269-271).
+  BeamSearchParams bp = req.to_beam_search_params(7);
+  CHECK(bp.beam_width == 3);
+  CHECK(bp.max_tokens == 7);
+  CHECK(bp.ignore_eos == true);
+  CHECK(bp.length_penalty == doctest::Approx(1.5));
+  CHECK(bp.temperature == doctest::Approx(1.0));
+}
+
+// (bs1) e2e: the endpoint's beam choices == the direct BeamSearch driver output.
+TEST_CASE("serving_completion: use_beam_search choices match the driver") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kBeam = 2;
+  const int kMax = 4;
+
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.max_tokens = kMax;
+  req.n = kBeam;
+  req.use_beam_search = true;
+  req.stream = false;
+
+  // Oracle: the merged driver directly over a fresh engine. eos is unset (the
+  // fixture config has no eos), so beams run the full max_tokens (finish "length").
+  const BeamSearchParams params = req.to_beam_search_params(kMax);
+  Harness ho(c, w, tok);
+  const std::vector<int32_t> prompt_ids = tok.Encode("hello");
+  const BeamSearchOutput oracle =
+      BeamSearch(ho.engine, prompt_ids, params, std::nullopt, &tok);
+  REQUIRE(oracle.sequences.size() == static_cast<size_t>(kBeam));
+
+  // Actual: the endpoint over a fresh, identical engine.
+  Harness ha(c, w, tok);
+  OpenAIServingCompletion serving(ha.engine, "test-model");
+  serving.set_beam_search_tokenizer(&tok, std::nullopt);
+  CompletionResult res = serving.create_completion(req);
+
+  REQUIRE_FALSE(res.streaming);
+  REQUIRE(res.response.has_value());
+  const auto& resp = *res.response;
+  REQUIRE(resp.choices.size() == static_cast<size_t>(kBeam));
+  for (int i = 0; i < kBeam; ++i) {
+    CHECK(resp.choices[i].index == i);
+    // Descending-score beam text, identical to the direct driver call.
+    CHECK(resp.choices[i].text ==
+          vllm::entrypoints::openai::SanitizeUtf8(
+              oracle.sequences[static_cast<size_t>(i)].text.value_or("")));
+    REQUIRE(resp.choices[i].finish_reason.has_value());
+    CHECK(*resp.choices[i].finish_reason == "length");
+  }
+}
+
+// (bs2) streaming beam search is rejected (upstream serving.py:136).
+TEST_CASE("serving_completion: streaming + use_beam_search is rejected") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  Harness h(c, w, tok);
+  OpenAIServingCompletion serving(h.engine, "test-model");
+  serving.set_beam_search_tokenizer(&tok, std::nullopt);
+
+  CompletionRequest req;
+  req.prompt = "hello";
+  req.max_tokens = 4;
+  req.n = 2;
+  req.use_beam_search = true;
+  req.stream = true;  // rejected
+  CHECK_THROWS_AS(serving.create_completion(req), std::runtime_error);
+}
+
+// (bs3) chat endpoint beam search lives after the chat helpers (MakeChatRequest /
+// InVocabChatPrompt) are declared — see "serving_chat: use_beam_search ...".
+
 // ─── (a2) logprobs payload runs end-to-end through the CPU engine ────────────
 // Proves the whole SAMPLE-LOGPROBS path RAN: sampler gather_logprobs -> runner
 // ModelRunnerOutput.logprobs -> scheduler slice_request -> LogprobsProcessor ->
@@ -682,6 +914,47 @@ ChatCompletionRequest MakeChatRequest(std::vector<ChatMessage> messages,
   return r;
 }
 }  // namespace
+
+// (bs3) SAMPLE-BEAM chat endpoint: use_beam_search choices match the driver over
+// the rendered chat prompt (proves the chat request → to_beam_search_params →
+// BeamSearch driver seam). InVocabChatPrompt renders {"user","hello"} -> "hello".
+TEST_CASE("serving_chat: use_beam_search choices match the driver") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kBeam = 2;
+  const int kMax = 4;
+
+  ChatCompletionRequest req = MakeChatRequest(
+      {ChatMessage{"user", std::string("hello")}}, kMax, /*stream=*/false);
+  req.temperature = std::nullopt;  // driver default 1.0
+  req.n = kBeam;
+  req.use_beam_search = true;
+
+  const BeamSearchParams params = req.to_beam_search_params(kMax);
+  Harness ho(c, w, tok);
+  const std::vector<int32_t> prompt_ids = tok.Encode("hello");
+  const BeamSearchOutput oracle =
+      BeamSearch(ho.engine, prompt_ids, params, std::nullopt, &tok);
+  REQUIRE(oracle.sequences.size() == static_cast<size_t>(kBeam));
+
+  Harness ha(c, w, tok);
+  OpenAIServingChat serving(ha.engine, "test-model", InVocabChatPrompt);
+  serving.set_beam_search_tokenizer(&tok, std::nullopt);
+  ChatCompletionResult res = serving.create_chat_completion(req);
+
+  REQUIRE(res.response.has_value());
+  const auto& resp = *res.response;
+  REQUIRE(resp.choices.size() == static_cast<size_t>(kBeam));
+  for (int i = 0; i < kBeam; ++i) {
+    CHECK(resp.choices[i].index == i);
+    CHECK(resp.choices[i].message.role == "assistant");
+    REQUIRE(resp.choices[i].message.content.has_value());
+    CHECK(*resp.choices[i].message.content ==
+          vllm::entrypoints::openai::SanitizeUtf8(
+              oracle.sequences[static_cast<size_t>(i)].text.value_or("")));
+  }
+}
 
 // ─── (c) Non-streaming chat → message{role:assistant, content} ───────────────
 TEST_CASE("serving_chat: non-stream response carries assistant message + usage") {

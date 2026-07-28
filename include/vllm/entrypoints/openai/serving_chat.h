@@ -40,6 +40,12 @@
 #include "vllm/sampling_params.h"
 #include "vllm/v1/engine/llm_engine.h"
 
+namespace vllm {
+namespace tok {
+class Tokenizer;  // vllm/tokenizer/tokenizer.h (beam-search prompt tok/detok)
+}  // namespace tok
+}  // namespace vllm
+
 namespace vllm::entrypoints::openai {
 
 // The result of create_chat_completion. Mirrors upstream's
@@ -190,6 +196,15 @@ class OpenAIServingChat {
   // See OpenAIServingCompletion::uses_async_engine().
   bool uses_async_engine() const { return async_engine_ != nullptr; }
 
+  // SAMPLE-BEAM: attach the tokenizer + eos id the beam-search path needs (it
+  // tokenizes the rendered chat prompt and detokenizes each beam). See
+  // OpenAIServingCompletion::set_beam_search_tokenizer.
+  void set_beam_search_tokenizer(const vllm::tok::Tokenizer* tokenizer,
+                                 std::optional<int32_t> eos_token_id) {
+    beam_tokenizer_ = tokenizer;
+    beam_eos_token_id_ = eos_token_id;
+  }
+
   // The chat-prompt renderer this handler applies to `messages` (the same seam
   // create_chat_completion tokenizes through). Exposed so the /tokenize chat
   // form (serve/tokenize/serving.py:70-92, TokenizeChatRequest) renders through
@@ -226,6 +241,10 @@ class OpenAIServingChat {
   std::string tool_parser_name_;
   std::string reasoning_parser_name_;
   bool enable_force_include_usage_ = false;
+  // Beam-search context (see set_beam_search_tokenizer). Null => beam search
+  // unavailable on this handler.
+  const vllm::tok::Tokenizer* beam_tokenizer_ = nullptr;
+  std::optional<int32_t> beam_eos_token_id_;
   // request_id is "chatcmpl-<counter>" (upstream f"chatcmpl-{random_uuid()}").
   std::atomic<int64_t> request_counter_{0};
 };

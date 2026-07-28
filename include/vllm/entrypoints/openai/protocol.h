@@ -20,16 +20,21 @@
 // the OpenAI SDK + LocalAI depend on. Field NAMES and the `object` string
 // literals are load-bearing for client compat and are mirrored 1:1.
 //
+// WIRED (ROAD-V1-C7 SAMPLE-BEST-OF / SAMPLE-BEAM): best_of + use_beam_search are
+// now mapped on both request types (best_of → ParentRequest fan-out + top-n rank;
+// use_beam_search → BeamSearchParams + the merged BeamSearch driver). See the
+// per-field notes below for the honest vLLM-0.26 endpoint-availability finding.
+//
 // DEFERRED (parsed-and-ignored via OpenAI's extra="allow" — nlohmann simply
 // does not read unknown keys — or explicitly marked below):
-//   - logit_bias, allowed_token_ids, best_of, suffix, user, prompt_embeds
+//   - logit_bias, allowed_token_ids, suffix, user, prompt_embeds
 //   - response_format / structured_outputs / tools / tool_choice / functions
 //     (M3.3 tool calling, M3.4 grammars)
 //   - logprobs *payload* shapes (CompletionLogProbs / ChatCompletionLogProbs);
 //     the request-side `logprobs` counts ARE mapped into SamplingParams.
 //   - multimodal message content parts (T0 chat content is a bare string)
 //   - array / token-id `prompt` forms (T0 completion prompt is a bare string)
-//   - beam search, kv_transfer_params, vllm_xargs, cache_salt, etc.
+//   - kv_transfer_params, vllm_xargs, cache_salt, etc.
 //     (`priority` IS parsed now — it feeds the priority scheduler; see below.)
 #pragma once
 
@@ -41,6 +46,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/entrypoints/beam_search.h"  // BeamSearchParams (use_beam_search)
 #include "vllm/sampling_params.h"
 
 namespace vllm::entrypoints::openai {
@@ -188,6 +194,29 @@ struct CompletionRequest {
   // effectively always populated. Kept optional to model "field absent".
   std::optional<int> max_tokens = 16;
   int n = 1;
+
+  // ROAD-V1-C7 SAMPLE-BEST-OF / SAMPLE-BEAM (the OpenAI-endpoint surface).
+  //
+  // best_of (OpenAI Completions `best_of`): generate `best_of` sequences and
+  // return the `n` highest-cumulative-logprob ones (best_of >= n; best_of == n
+  // is the default no-op). HONEST FINDING: vLLM 0.26 (555967922) has DROPPED
+  // best_of from the live path — it is NOT on CompletionRequest / the regular
+  // ChatCompletionRequest and there is no SamplingParams.best_of; the only
+  // surviving `best_of` is a vestigial, NEVER-consumed field on
+  // BatchChatCompletionRequest (chat_completion/protocol.py:1048). We therefore
+  // implement the CLASSIC OpenAI-spec / vLLM-V0 best_of contract (fan-out via the
+  // merged ParentRequest path, rank by cumulative logprob, return top-n), gated
+  // against our OWN deterministic fan-out (there is no 0.26 best_of oracle).
+  std::optional<int> best_of;
+
+  // use_beam_search (completion/protocol.py:73): route the request through the
+  // BeamSearch driver instead of the sampler. beam_width == n; returns the n
+  // best beams as choices. REAL vLLM-0.26 OpenAI surface
+  // (completion/serving.py:173-205 → to_beam_search_params → self.beam_search).
+  bool use_beam_search = false;
+  // length_penalty (completion/protocol.py:77): beam-score length-penalty exponent.
+  double length_penalty = 1.0;
+
   // Sampling knobs are Optional upstream (None => resolve to _DEFAULT_SAMPLING_
   // PARAMS in to_sampling_params); mirrored as std::optional here.
   std::optional<double> temperature;
@@ -235,6 +264,10 @@ struct CompletionRequest {
   // model-derived value; unset => our SamplingParams default).
   SamplingParams to_sampling_params(
       std::optional<int> default_max_tokens = std::nullopt) const;
+
+  // to_beam_search_params — completion/protocol.py:260. beam_width == n, the
+  // resolved max_tokens, ignore_eos, temperature (None => 1.0) and length_penalty.
+  vllm::BeamSearchParams to_beam_search_params(int max_tokens) const;
 };
 
 // Ported from: vllm/entrypoints/openai/completion/protocol.py:580-584
@@ -362,6 +395,18 @@ struct ChatCompletionRequest {
   std::optional<int> max_tokens;
   std::optional<int> max_completion_tokens;
   std::optional<int> n = 1;
+
+  // ROAD-V1-C7 SAMPLE-BEST-OF / SAMPLE-BEAM. See CompletionRequest for the honest
+  // best_of finding (vLLM 0.26 dropped it from the live path; classic semantics
+  // implemented). use_beam_search / length_penalty mirror
+  // chat_completion/protocol.py:249,597 (→ to_beam_search_params → self.beam_search,
+  // chat_completion/serving.py:319-343). best_of on chat is a DEVIATION: upstream
+  // carries it only on BatchChatCompletionRequest (protocol.py:1048), we expose it
+  // on ChatCompletionRequest too for endpoint symmetry with /v1/completions.
+  std::optional<int> best_of;
+  bool use_beam_search = false;
+  double length_penalty = 1.0;
+
   std::optional<double> temperature;
   std::optional<double> top_p;
   std::optional<int> top_k;
@@ -415,6 +460,9 @@ struct ChatCompletionRequest {
   // to_sampling_params — chat_completion/protocol.py:585. See CompletionRequest.
   SamplingParams to_sampling_params(
       std::optional<int> default_max_tokens = std::nullopt) const;
+
+  // to_beam_search_params — chat_completion/protocol.py:589. See CompletionRequest.
+  vllm::BeamSearchParams to_beam_search_params(int max_tokens) const;
 };
 
 // Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:94
