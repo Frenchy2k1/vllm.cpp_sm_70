@@ -510,6 +510,22 @@ rel-L2 (the fixed-config 167B arch is not constructible at a tiny shape). SACRED
 v0.5.15 registers `DeepseekV4ForCausalLM` (full DSA/MHC stack) — a viable second
 reference for a future primitive-dump or 2-Spark benchmark. No source/engine path touched.
 
+**KDA (Kimi Delta Attention) kernel delta W1 (2026-07-28, `CLAIM-KDA-KERNEL`, NOT
+pushed).** Disposition: **NOT APPLICABLE (correctness/kernel-primitive brick, host CPU
+reference + unit gate; no run, no download, no throughput number taken, claimed, or
+owed; `benchmark_binding=false`).** Ported + unit-gated the four gated-linear-attention
+pieces KDA adds on top of plain GDN: the per-channel `[H,D]` low-rank decay (`f_a`/`f_b`
+bottleneck), the decay gate `-exp(A_log)·softplus` (+ its chunk-cumsum `RCP_LN2` variant),
+the sigmoid-gated output norm `FusedRMSNormGated`, the three q/k/v short convs and the q/k
+L2-norm (`kimi_kda.{h,cpp}`, `test_kimi_kda` 14/14·36, clean CPU `-Wall -Werror -Wextra`).
+Honest gate form: hand-derived literals + double-precision references (rel-L2 < 1e-6), NOT
+a dumped-oracle rel-L2 — KDA subclasses GDN so its recurrence is reused, and the REAL e2e
+gate is the DGX-blocked Kimi-Linear-48B-A3B proxy vs the pinned oracle (the 2.8T Kimi-K3
+does not fit one GB10). Additive/GDN-inert (`cuda_gdn.cu`/`gdn_attn.cpp` untouched ⇒ the
+Qwen3.6-27B/35B GDN gate is byte-identical by construction). The KDA CUDA device kernel +
+the proxy e2e gate are named residuals. Shared unblocker for Kimi-Linear-48B and Kimi-K3
+(W4). No source/engine compute path touched.
+
 **Kimi K3 W0 SCOPE spike (2026-07-28, `CLAIM-KIMI-K3-SCOPE`, NOT pushed).**
 Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Scopes

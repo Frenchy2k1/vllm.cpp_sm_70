@@ -50,9 +50,19 @@ MATRICES = {
     # attention family above which score ALL keys. W3 landed a portable host
     # reference + unit gate; the device kernel is a W7 residual. `SPIKE`,
     # `CLAIM-DEEPSEEK-V4-W3`, spec specs/deepseek-v4-flash.md).
+    # 39 since 2026-07-28: +`KERNEL-KDA-DELTA` (the Kimi Delta Attention gated-
+    # linear-attention delta vs plain GDN — the per-channel [H,D] low-rank decay
+    # (f_a/f_b bottleneck), the sigmoid-gated output norm (FusedRMSNormGated), the
+    # 3 q/k/v short convs + q/k L2-norm. A genuinely new gated-linear-attention
+    # family distinct from GDN, which has only a per-head scalar decay and no gated
+    # output norm; SUBCLASSES GDN so its recurrence is REUSED, not re-ported. W1
+    # landed a portable host reference + unit gate; the device kernel + the
+    # Kimi-Linear-48B proxy e2e gate are named residuals. Shared unblocker for
+    # Kimi-Linear-48B and Kimi-K3 (W4). `SPIKE`, `CLAIM-KDA-KERNEL`, spec
+    # specs/kda-kernel-delta.md).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 38),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 39),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

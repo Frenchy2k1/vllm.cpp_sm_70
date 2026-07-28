@@ -31323,3 +31323,58 @@ adapters (qwen3/mimo, gemma4, glm45/47, seed_oss, deepseek_v4, nemotron_v3,
 inkling) over the already-landed `TOOLS-STREAMING-PARSER` engine; W4 request-time
 `chat_template_kwargs` threading + reasoning-gated grammar FSM hold. README:68
 "7 reasoning" → 9 is a follow-up (this change scoped NOT to touch README).
+
+## 2026-07-28 — KDA (Kimi Delta Attention) kernel delta: W0 spike + W1 host-reference brick (`CLAIM-KDA-KERNEL`)
+
+**What (host-reference-first kernel brick, mirroring the DeepSeek-V4 DSA lane).**
+Landed the genuinely-new-vs-GDN KDA numerics as portable CPU references + a unit
+gate, the shared unblocker for BOTH `MODEL-TEXT-kimi-linear-*` (KDA kernel
+campaign named on that row) and `MODEL-MM-kimi-k3-*` (K3 W4, loader defers here).
+`KimiGatedDeltaNetAttention` SUBCLASSES `GatedDeltaNetAttention`
+(`kimi_gdn_linear_attn.py:85`), so its conv-state/cache layout,
+`GDNAttentionMetadata`, chunked-delta recurrence and WY solve are REUSED from our
+landed GDN — this brick owns ONLY the four deltas plain GDN lacks.
+
+**W0 spike:** `.agents/specs/kda-kernel-delta.md` — the KDA-delta map (decay
+projection math, sigmoid-gated output norm, 3 short convs, gate variants), each
+grounded in `kimi_gdn_linear_attn.py`/`kda.py` `file:line`; port map, tests,
+gates, W-breakdown, reuse-vs-new.
+
+**W1 host references** (`include/vllm/model_executor/models/kimi_kda.h` +
+`src/vllm/model_executor/models/kimi_kda.cpp`, 6 functions):
+- `KdaLowRankDecay` — the per-channel `[H,D]` low-rank decay via the
+  `f_a_proj→f_b_proj` bottleneck (`kimi_gdn_linear_attn.py:142-156,:245`); GDN has
+  only a per-HEAD scalar decay.
+- `KdaDecayGate` — `-exp(A_log[h])·softplus_β(g1+dt_bias)` per channel, β=1,
+  thr=20 with the `>thr` linear regime (`kda.py:1541-1600,:1603-1646`).
+- `KdaDecayGateChunkCumsum` — the prefill variant: same gate then chunk-local
+  cumulative sum · `RCP_LN2` (`kda.py:1182-1254,:1257-1303`); `log2_domain` flag
+  exposes the raw-ln cumsum.
+- `FusedRMSNormGated` — `rmsnorm(x over head_dim)·weight·σ(g)`, sigmoid (KDA) +
+  swish branches, eps=1e-5 (`kda.py:463-487,:436`).
+- `KdaShortConv` — one of the 3 q/k/v depthwise causal short convs (conv_size 4)
+  + silu, zero initial state (`kimi_gdn_linear_attn.py:171-198,:324-356`).
+- `L2NormRows` — the q/k L2-norm preprocessing `x/sqrt(Σx²+eps)`, eps=1e-6, SUM
+  not mean (`kda.py:1511-1513`, `ops/l2norm.py:42-43,:96`).
+
+**Left out of scope (named residuals, NOT duplicated):** the chunked gated-delta
+RECURRENCE itself (reuses GDN — `chunk_kda_with_fused_gate`/`fused_recurrent_kda`
+compose our GDN WY-solve/`recompute_w_u`/`chunk_gla_fwd_o` machinery); the KDA
+CUDA device kernel; the Kimi-Linear/K3 model forward + loader; the Kimi-Linear-48B
+proxy e2e gate (the REAL signal, DGX-blocked — K3 2.8T does not fit one GB10).
+
+**Evidence.** Clean CPU full-library build (`libvllm.a`, `-Wall -Werror -Wextra`
+rc=0); `tests/vllm/models/test_kimi_kda.cpp` 14/14 · 36 assertions GREEN
+(hand-derived literals + double-precision rel-L2<1e-6). Honest gate form:
+host-reference + structural review vs vLLM `file:line`, NOT a dumped-oracle
+rel-L2. **GDN-inertness PROVEN:** additive only; empty `git diff` over
+`src/vt/cuda/cuda_gdn.cu` + `src/vllm/v1/attention/backends/gdn_attn.cpp` ⇒ the
+Qwen3.6-27B/35B GDN gate is byte-identical by construction. Files: the header +
+cpp + test, `CMakeLists.txt` + `tests/CMakeLists.txt` wiring, NEW
+`.agents/specs/kda-kernel-delta.md`, the NEW `KERNEL-KDA-DELTA` kernel-matrix row
++ `check-agent-record.py` KERNEL 38→39. Records: kernel-matrix (row),
+model-matrix (Kimi-Linear + K3 row notes), roadmap breadth, docs/STATUS,
+docs/BENCHMARKS, coordination (claim), parity-ledger, this entry. Row stays SPIKE
+(no on-box e2e; device kernel + proxy gate are residuals). NEXT: the KDA CUDA
+device kernel unit-gated vs these host references, then the Kimi-Linear-48B proxy
+e2e gate on GB10.

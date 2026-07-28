@@ -327,8 +327,19 @@ is now **build-only** (2026-07-28): an additive registry stub, nested
 text/vision/quant config descent, the 93-layer KDA/MLA + 896-expert MoE
 text-backbone structural name-map (grounded in `kimi_linear.py`), a REFUSE-by-name
 forward and an MXFP4-refuse loader, green on a CPU build with a 6/6 scaffold gate;
-MXFP4, the KDA kernel delta and the MoonViT-V2 tower stay not-yet-buildable
-(deferred to the shared DeepSeek-V4 MXFP4 row, the Kimi-Linear KDA row, and W7).
+MXFP4 and the MoonViT-V2 tower stay not-yet-buildable
+(deferred to the shared DeepSeek-V4 MXFP4 row and W7). The **KDA kernel delta**
+itself now has a first buildable brick (2026-07-28, `KERNEL-KDA-DELTA`): the four
+gated-linear-attention pieces plain GDN lacks — the per-channel `[H,D]` low-rank
+decay (`f_a`/`f_b` bottleneck), the sigmoid-gated output norm
+(`FusedRMSNormGated`), the three q/k/v short convs and the q/k L2-norm — are
+ported as portable host references and unit-gated (`test_kimi_kda` 14/14, clean
+CPU `-Wall -Werror -Wextra`) against hand-derived literal cases plus
+double-precision references. KDA subclasses GDN, so its recurrence is reused and
+the brick is additive (the Qwen3.6 GDN gate is byte-untouched); the gate is
+host-reference + structural review, not a dumped-oracle comparison — the real
+e2e gate stays the DGX-blocked Kimi-Linear-48B proxy, and the CUDA device kernel
+is a named residual.
 The matrix opens with an
 architecture-support checklist (a per-architecture status roll-up covering every
 engaged model) that a CI checker keeps in lockstep with the detailed rows.
