@@ -19,8 +19,9 @@ a practical unit that one agent can spike without silently dropping aliases.
 ## Architecture-support checklist
 
 At-a-glance view of which architectures we have actually engaged, and how far.
-**326 architecture rows are inventoried at the pin**; 41 are past `INVENTORIED`
-(engaged), the remaining 285 are known-but-not-started long tail. Every mark
+**326 architecture rows are inventoried at the pin, plus 1 beyond-pin row
+(`KimiK3ForConditionalGeneration`, released after the pin) = 327 total**; 42 are
+past `INVENTORIED` (engaged), the remaining 285 are known-but-not-started long tail. Every mark
 below is grounded in the row's lifecycle `State` cell plus its ledger evidence,
 and this section is CI-enforced against those rows by
 [`scripts/check-model-checklist.py`](../scripts/check-model-checklist.py): a mark
@@ -44,13 +45,13 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 | GATING | 1 |
 | PARTIAL | 3 |
 | READY | 0 |
-| SPIKE | 8 |
+| SPIKE | 9 |
 | BLOCKED | 5 |
 | INVENTORIED | 285 |
 | DONE | 3 |
-| **Total** | **326** |
+| **Total** | **327** |
 
-Engaged architectures (the 41 non-`INVENTORIED` rows):
+Engaged architectures (the 42 non-`INVENTORIED` rows):
 
 | Support | Architecture | Family / example | Status | Row |
 |---|---|---|---|---|
@@ -77,6 +78,7 @@ Engaged architectures (the 41 non-`INVENTORIED` rows):
 | 📋 | `Glm4MoeForCausalLM` | GLM-4 MoE | scoped in the GLM/DSA spike, not implemented | `MODEL-TEXT-glm4-moe-glm4-moe-for-causal-lm` |
 | ✅ | `Glm4MoeLiteForCausalLM` | GLM-4.7-Flash (31.2B MLA + GLM MoE) | SACRED gate 8/8 vs vLLM 0.25.0 (STRICT token-exact 1/8 + near-tie-band 7/8, 69/128 tokens strictly exact, max teacher-forced gap 0.0 nats, 0 forward-divergent; vLLM K=5 self-deterministic → STRICT bar); FIRST e2e coverage of the q_lora query branch AND the noaux_tc sigmoid router (closes the MLA campaign's two gaps, C2); speed pending | `MODEL-TEXT-glm4-moe-lite-glm4-moe-lite-for-causal-lm` |
 | 📋 | `KimiLinearForCausalLM` | Kimi-Linear | MLA half unlocked by the shared MLA campaign; the full model is not gated, row stays `SPIKE` | `MODEL-TEXT-kimi-linear-kimi-linear-for-causal-lm` |
+| 📋 | `KimiK3ForConditionalGeneration` | Kimi K3 (2.8T MoE + MoonViT-V2, DERIVE-AND-SHIP) | scoped in the Kimi-K3 W0 spike; text backbone IS `KimiLinearForCausalLM` (KDA+MLA+MoE hybrid, HEAVY reuse); **does NOT fit GB10 (~1.56 TB MXFP4, ~12×)** and NOT in the pinned oracle ⇒ no on-box golden — DERIVED, proxy-gated on Kimi-Linear-48B; not implemented | `MODEL-MM-kimi-k3-kimi-k3-for-conditional-generation` |
 | 🚫 | `DeepseekV3ForCausalLM` / `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | HW-blocked (671B, ~642 GiB fp8 vs 119 GiB unified memory); V3.2 additionally DEP-blocked (DSA indexer) | `MODEL-TEXT-deepseek-v2-deepseek-v3-for-causal-lm` |
 | 🚫 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | HW-blocked (1404 GiB bf16) and DEP-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) | `MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm` |
 | 🚫 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | HW-blocked (~230B / ~428 GiB bf16, ~4x over unified memory) | `MODEL-TEXT-minimax-m2-mini-max-m2-for-causal-lm` |
@@ -399,6 +401,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-MM-kimi-vl-kimi-vlfor-conditional-generation` | `KimiVLForConditionalGeneration` | `registry.py:447`; `vllm/model_executor/models/kimi_vl.py::KimiVLForConditionalGeneration` | conditional generation / image | MM processor; encoder/merge; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-kimi-k25-kimi-k25-for-conditional-generation` | `KimiK25ForConditionalGeneration` | `registry.py:448`; `vllm/model_executor/models/kimi_k25.py::KimiK25ForConditionalGeneration` | conditional generation / video+image | MM processor; encoder/merge; vision encoder; video path | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-kimi-audio-kimi-audio-for-conditional-generation` | `MoonshotKimiaForCausalLM` | `registry.py:449`; `vllm/model_executor/models/kimi_audio.py::KimiAudioForConditionalGeneration` | conditional generation / audio+image | MM processor; encoder/merge; audio/ASR frontend; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-kimi-k3-kimi-k3-for-conditional-generation` | `KimiK3ForConditionalGeneration` | **BEYOND-PIN — NOT in `555967922`** (K3 released 2026-07-27, after the pin); closest registered = its literal text backbone `KimiLinearForCausalLM` (`registry.py:140`; `vllm/model_executor/models/kimi_linear.py`) + the K2.5 vision wrapper `kimi_k25.py:290` / tower `kimi_k25_vit.py` | conditional generation / image (text-first) | model loader/forward; FusedMoE/grouped GEMM; GDN/linear-attention state (KDA); MLA/latent KV; MXFP4 compressed-tensors quant; MM processor + MoonViT-V2 encoder/merge | [kimi-k3 spike](specs/kimi-k3.md) | `SPIKE` | **W0 SCOPE (2026-07-28, `CLAIM-KIMI-K3-SCOPE`, DERIVE-AND-SHIP, records-only).** From the HF `config.json` (fetch-derived): `architectures:["KimiK3ForConditionalGeneration"]`, `text_config.architectures:["KimiLinearForCausalLM"]` — the text backbone IS the pinned Kimi-Linear hybrid, MASSIVELY scaled: **H=7168, L=93 (69 KDA + 24 MLA full-attn), 896 experts / top-16 / 2 shared, `moe_intermediate_size=3072`**; MLA geometry `kv_lora=512`/`q_lora=1536`/`qk_nope=128`/`qk_rope=64` (= our landed DeepSeek-V3 dims); KDA `head_dim=128`/`num_heads=96`/`short_conv=4`/`gate_lower_bound=-5.0`; quant **`mxfp4-pack-quantized` (compressed-tensors, group 32, e8m0) + MXFP8 acts (QAT)**; vision **MoonViT-V2** (~401M, patch 14, 27L). **HEAVY REUSE** — GDN (KDA's parent, `cuda_gdn.cu`/`gdn_attn.cpp`), DeepSeek MLA (`deepseek_v2.cpp`/`mla_attention.*`, exact geometry), DeepSeek-style MoE (`qwen3_moe.cpp`/`cuda_moe.cu`, scale to 896), and the Qwen3.6-35B GDN-hybrid-MoE model skeleton (`qwen3_5_moe.cpp`) are the structural twins; Kimi-K2 tokenizer/tool parser (`parser/kimi_k2.cpp`) reused. **NET-NEW:** the KDA kernel delta (per-channel `[H,D]` low-rank decay `f_a_proj`/`f_b_proj` + sigmoid-gated output norm + 3 q/k/v convs — already scoped on the Kimi-Linear row), **MXFP4** (we have NVFP4 group-16, not MXFP4 group-32/e8m0), **AttnRes** (report-only, UNCONFIRMED — not in config.json nor pinned `kimi_linear.py`), and the **MoonViT-V2 tower**. **HW-fit: DOES NOT FIT GB10** — 2.8T MXFP4 ≈ **1.56 TB ≈ ~12× over the 119 GiB pool**; no small K3 exists. **DERIVE-AND-SHIP** (no on-box golden, like the beyond-vLLM CUDA bricks): (a) REAL proxy gate of KDA+MLA+MoE on the FITTING `Kimi-Linear-48B-A3B` (~89–91 GiB) vs the pinned oracle, (b) build-verify + structural review for the K3 scale-up. The pinned oracle has NO `kimi_k3` ⇒ even HW-rich users need a pin advance to oracle-gate K3 itself. CORRECTS the 2026-07-25 sweep note ("loads as `DeepseekV3ForCausalLM`" — true for K2, NOT K3). W-plan W1-W8 in the spec | `CLAIM-KIMI-K3-SCOPE` |
 | `MODEL-MM-moss-transcribe-diarize-moss-transcribe-diarize-for-conditional-generation` | `MossTranscribeDiarizeForConditionalGeneration` (v0.25.0 target-pending) | v0.25.0 target `registry.py:450-453`; `vllm/model_executor/models/moss_transcribe_diarize.py::MossTranscribeDiarizeForConditionalGeneration` @ `702f481` | conditional generation / audio | MM processor; Whisper encoder; VQ adaptor; Qwen3 decoder; speech-to-text/diarization frontend | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-lightonocr-light-on-ocrfor-conditional-generation` | `LightOnOCRForConditionalGeneration` | `registry.py:450-453`; `vllm/model_executor/models/lightonocr.py::LightOnOCRForConditionalGeneration` | conditional generation / image | MM processor; encoder/merge; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-lfm2-vl-lfm2-vlfor-conditional-generation` | `Lfm2VlForConditionalGeneration` | `registry.py:454`; `vllm/model_executor/models/lfm2_vl.py::Lfm2VLForConditionalGeneration` | conditional generation / image | MM processor; encoder/merge; Mamba/SSM state; vision encoder; video path | ☐ required | `INVENTORIED` | none | unassigned |

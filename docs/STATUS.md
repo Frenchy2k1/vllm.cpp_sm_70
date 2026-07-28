@@ -222,7 +222,17 @@ frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):
 Kimi-Linear-48B is the one that fits GB10 (91.5 GiB) and is e2e-gateable, while
 MiniMax-M2 (214.3 GiB fp8), Kimi-K2, MiniMax-M3 and GLM-5 remain hardware- or
-dependency-blocked (honesty-pass only). The matrix opens with an
+dependency-blocked (honesty-pass only). **Kimi K3** (released 2026-07-27, after the
+pin) is scoped **derive-and-ship** in [kimi-k3.md](../.agents/specs/kimi-k3.md): a
+2.8T MoE whose text backbone is the Kimi-Linear KDA+MLA+MoE hybrid massively scaled
+(H=7168, 93 layers = 69 KDA + 24 MLA, 896 experts, MXFP4 + MoonViT-V2 vision). It
+reuses heavily (our GDN, DeepSeek MLA, DeepSeek MoE, the Qwen3.6-35B GDN-hybrid
+skeleton); net-new = the KDA kernel delta, MXFP4 (group-32/e8m0), AttnRes
+(report-only, unconfirmed) and the MoonViT-V2 tower. It **does not fit** one GB10
+(~1.56 TB MXFP4, ~12× the 119 GiB pool) and is not in the pinned oracle, so there is
+no on-box golden — like the beyond-vLLM CUDA bricks; the real signal is a primitive
+gate on the fitting Kimi-Linear-48B proxy plus build-verify, with full K3
+verification left to a multi-Spark / 16×H200-class box. The matrix opens with an
 architecture-support checklist (a per-architecture status roll-up covering every
 engaged model) that a CI checker keeps in lockstep with the detailed rows.
 
