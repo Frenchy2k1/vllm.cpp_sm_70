@@ -31461,3 +31461,39 @@ NEXT (named residuals, NOT this change): W2 scheme-selection method + loader pro
 (mirror `schemes/nvfp4.h`); W3 GPU W4A4 fp4xfp4 GEMM + activation quant + Marlin W4A16
 fallback (GB10 dispatch mirror); W4 MoE MXFP4 expert path; W5 e2e model gate; then the
 DeepSeek-V4 + Kimi-K3 loaders drop their MXFP4 refusal.
+## 2026-07-28 — LoRA adapter subsystem W0 spike + W1 CPU runtime brick (`CLAIM-LORA-RUNTIME`)
+
+- **What landed (foreground, NOT pushed, FULL SHA reported).** The first brick
+  of the #1 HIGH-priority missing feature (whole adapter subsystem was ABSENT,
+  `LORA-RUNTIME`/`LORA-ENDPOINTS` INVENTORIED). W0 = `.agents/specs/lora-adapter.md`
+  (full spike inventorying the entire `vllm/lora/` chain + endpoints, port map,
+  tests to port, gates, W2-W7 breakdown). W1 = the CPU punica brick.
+- **Files (additive only):** `include/vllm/lora/lora_weights.h` (`LoRALayerWeights`),
+  `include/vllm/lora/punica.h` + `src/vllm/lora/punica_cpu.cpp` (`BgmvShrink`/
+  `BgmvExpand`/`BgmvExpandSlice` + `AddLoraLinear` + `LoRALinear` ReplicatedLinear
+  wrapper), `tests/vllm/lora/test_punica_cpu.cpp`. CMake: library line
+  `CMakeLists.txt` + `tests/CMakeLists.txt` `test_punica_cpu`.
+- **Signal: RUNTIME-VERIFIED on CPU.** `test_punica_cpu` 6/6 (101 assertions)
+  vs independent double-precision per-LoRA matmul references; RED-first proven
+  (base-only ≠ applied; `-1` slot skip; `ResetLora`→identity). Clean CPU
+  `-Werror` full-library build (worktree `build-cpu`, `-DVLLM_CPP_CUDA=OFF
+  -DVLLM_CPP_METAL=OFF`), 0 warnings.
+- **Mirror + deviation.** 1:1 from vLLM `555967922`: `lora_weights.py:13-96`,
+  `lora/ops/torch_ops/lora_ops.py:24-128`, `punica_wrapper/punica_cpu.py:265-312`,
+  `layers/base_linear.py:100-238`. Recorded deviation: the `-1` "no adapter"
+  slot is SKIP (triton early-exit + test CPU refs), not the torch `w[-1]` wrap;
+  scaling folded into `b` at `SetLora` so the batched apply uses scale 1.0.
+- **Records (same change):** `engine-matrix.md` `LORA-RUNTIME` INVENTORIED→ACTIVE
+  (+ LoRA-area/Total rollup ACTIVE 39→40, INVENTORIED 38→37), `coordination.md`
+  `CLAIM-LORA-RUNTIME`, `feature-matrix.md` LoRA rows, `roadmap_v1.md` ORDER-1,
+  `docs/STATUS.md` (capability row + Not-supported note), `docs/BENCHMARKS.md`
+  (NOT APPLICABLE), `parity-ledger.md`, this entry. No counted matrix row added
+  ⇒ no `check-agent-record.py` constant change. All 4 record checkers rc=0.
+- **Resume / next (W2-W7 per spec):** W2 packed + column/row/merged layers +
+  embedding/logits LoRA (`PackedLoRALayerWeights`, TP slice); W3 mapping metadata
+  (`convert_mapping`/`compute_meta`/sgmv); W4 adapter load (`PEFTHelper` +
+  safetensors); W5 LRU multi-adapter manager + runner mixin; W6 the OpenAI
+  load/unload endpoints + resolver (`LORA-ENDPOINTS`); W7 GPU vt/CUDA punica
+  kernels + a token-exact multi-LoRA model gate vs the vLLM oracle + throughput
+  parity. First resume cmd: `cmake --build .claude/worktrees/lora-adapter/build-cpu
+  --target test_punica_cpu && ./.claude/worktrees/lora-adapter/build-cpu/tests/test_punica_cpu`.

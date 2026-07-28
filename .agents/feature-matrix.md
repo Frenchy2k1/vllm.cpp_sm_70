@@ -243,8 +243,8 @@ is configured, exactly as upstream loads its draft model on demand.
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| LoRA runtime (punica-style batched apply) | `lora/lora_model.py:60`, `lora/punica_wrapper/punica_gpu.py:33`, `lora/ops/triton_ops/lora_shrink_op.py`, `v1/worker/lora_model_runner_mixin.py:30` | ☐ T2 (**HIGH**, feature-gap sweep) | no runtime in-tree (verified: field placeholders only); highest-demand missing user feature (`LORA-RUNTIME`) | `planned: specs/lora-runtime.md` |
-| LoRA dynamic load/unload endpoints + resolver | `entrypoints/serve/lora/api_router.py:43,59`, `lora/resolver.py:14` | ☐ T2 | `POST /v1/{load,unload}_lora_adapter`; after runtime (`LORA-ENDPOINTS`) | `planned: specs/lora-endpoints.md` |
+| LoRA runtime (punica-style batched apply) | `lora/lora_model.py:60`, `lora/punica_wrapper/punica_gpu.py:33`, `lora/ops/triton_ops/lora_shrink_op.py`, `v1/worker/lora_model_runner_mixin.py:30` | ◧ T2 `ACTIVE` (**HIGH**; W1 CPU brick landed) | W1 CPU brick: `LoRALayerWeights` + punica shrink/expand + `AddLoraLinear` + `LoRALinear` (ReplicatedLinear), `test_punica_cpu` 6/6 CPU (`LORA-RUNTIME`); W2-W7 named in spec | [lora-adapter.md](specs/lora-adapter.md) |
+| LoRA dynamic load/unload endpoints + resolver | `entrypoints/serve/lora/api_router.py:43,59`, `lora/resolver.py:14` | ☐ T2 | `POST /v1/{load,unload}_lora_adapter`; W6 on the runtime (`LORA-ENDPOINTS`) | `planned: specs/lora-adapter.md` |
 | Prompt adapters | — | ☑ **NON-GAP** | vLLM `555967922` has REMOVED prompt adapters entirely (no `PromptAdapter` in `vllm/`); nothing owed | — |
 
 ## 11. Long context & attention breadth

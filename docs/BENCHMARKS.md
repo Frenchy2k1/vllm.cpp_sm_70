@@ -34,6 +34,20 @@ LOW), grounded in vLLM `file:line`. No build, no GPU, no measurement; no speed
 number is owed. Full list in
 [`.agents/specs/vllm-feature-gap-analysis.md`](../.agents/specs/vllm-feature-gap-analysis.md).
 
+## LoRA adapter subsystem W0 spike + W1 CPU brick (2026-07-28, `CLAIM-LORA-RUNTIME`, NOT pushed) - correctness brick, no speed number owed
+
+Disposition: **NOT APPLICABLE (correctness unit brick, host CPU; no throughput
+number owed at W1).** The W1 CPU punica brick (`LoRALayerWeights` + shrink/expand
+ops + `AddLoraLinear` + single-linear `LoRALinear`) is gated for CORRECTNESS only:
+`test_punica_cpu` 6/6 (101 assertions) vs an independent double-precision
+per-LoRA matmul reference, RED-first proven, clean CPU `-Werror` build. The
+subsystem PERFORMANCE gate — vLLM throughput parity with adapters active on a
+real multi-LoRA model — is **PENDING** the GPU-kernel + model-gate W (W7 in
+[`.agents/specs/lora-adapter.md`](../.agents/specs/lora-adapter.md)); no LoRA
+model can be served yet. Repro: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF
+-DVLLM_CPP_METAL=OFF && cmake --build build-cpu --target test_punica_cpu &&
+./build-cpu/tests/test_punica_cpu`.
+
 ## Gemma-4 multimodal W0, oracle-gateability run-verified + greedy golden captured (2026-07-28, `CLAIM-GEMMA4-W0`) - correctness anchor, no speed number owed
 
 **What ran.** The pinned vLLM 0.25.0 oracle (transformers 5.13.1) loaded, ran,
