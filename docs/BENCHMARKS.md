@@ -178,6 +178,33 @@ ran it — a green compile + SASS is not execution evidence, not runtime support
 vLLM-competitive.** A cloud B200 upgrades DC1 to RUNTIME-VERIFIED (token-exact +
 every-axis perf).
 
+**Hopper `sm_90a` CUTLASS C3x FP8 scaled-mm GEMM (DC2) BUILD-VERIFY (2026-07-28,
+`CLAIM-CUDA-SM90-C3X`, `ROAD-V1-D1-CUDA`).** Disposition: **NOT APPLICABLE
+(compile-only build-verify; no throughput number taken, claimed, or owed;
+`benchmark_binding=false`).** COMPILE-ONLY brick — a faithful 1:1 type-port of
+vLLM's `cutlass_3x_gemm_sm90_fp8` (`ArchTag=Sm90` +
+`KernelTmaWarpSpecialized{Pingpong,Cooperative,}FP8FastAccum`, the CUTLASS 4.5.0
+4th-gen wgmma/TMA warp-specialized collective) added as a new TU
+`src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu`, gated by a dedicated `scaledmm-c3x-sm90`
+feature cell (90a-only). Evidence on dgx (GB10, nvcc 13.0, cutlass 4.5.0, base
+local `main` `00dd512e`, disk-guarded 73G ≥ 25G twice ~20s apart): single-arch
+`-arch=sm_90a` TU compile with the production flag set (`-DVT_SCALEDMM_C3X_SM90=1
+--expt-relaxed-constexpr --expt-extended-lambda -diag-suppress=20012 -isystem
+cutlass`) is **0 compiler warnings / 0 errors / EXIT=0** (the only stderr is
+`ptxas info C7510` naming `wgmma.mma_async` + the `Sm90` warp-specialized
+FP8FastAccum kernels), and `cuobjdump -lelf` shows a real
+`cuda_scaled_mm_c3x_sm90.1.sm_90a.cubin` (arch = sm_90a). Configure single-arch
+`90a` reports `scaledmm-c3x-sm90: ENABLED for [90a]`. Feature-table CI
+(`cmake -P cmake/CudaArchFeaturesTest.cmake`, no GPU) ALL PASS: `90a`→ENABLED,
+121a/120a/100a/80→EMPTY. RED (HEAD): `90a` had no such cell (`vt_cuda_feature_archs`
+fatal `unknown CUDA feature`). sm_121a neutrality: the cell resolves DISABLED (TU
+not built) while `cutlass-fp8`/`cutlass-nvfp4` stay ENABLED for 121a, and the TU
+compiled for `sm_121a` without the define is inert (0-warn, 0 C3x symbols), so the
+GB10 gate build is byte-unchanged. The consumer `sm_12x` FP8 scaled-mm body
+(`ArchTag=Sm120`) is untouched. **NO H100/H200/sm_90 board ran it — a green compile
++ SASS is not execution evidence, not runtime support, not vLLM-competitive.** A
+cloud H100/H200 upgrades DC2 to RUNTIME-VERIFIED (token-exact + every-axis perf).
+
 **SGLang parity PROGRAM scope (2026-07-27, `CLAIM-SGLANG-PARITY-PROGRAM`, NOT
 pushed).** Disposition: **NOT APPLICABLE (inventory / scoping spike; no build,
 no run, no measurement taken, claimed, or owed; `benchmark_binding=false`).**

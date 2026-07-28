@@ -292,6 +292,20 @@ board ran it** — a green compile + SASS is not execution evidence, not runtime
 support, and not vLLM-competitive; the other sm_100 fast paths (CUTLASS C3x FP8,
 MoE, MXFP4, MLA) remain scoped.
 
+As of 2026-07-28, the Hopper `sm_90a` fan-out gained its first FAST-PATH body: the
+**CUTLASS C3x FP8 (W8A8) scaled-mm GEMM is BUILD-VERIFIED**
+(`DERIVED+BUILD-VERIFIED, testing-welcome`). A faithful 1:1 type-port of vLLM's
+`cutlass_3x_gemm_sm90_fp8` (`ArchTag=Sm90` + `KernelTmaWarpSpecialized*FP8FastAccum`
+— CUTLASS 4.5.0 emits the 4th-gen wgmma/TMA warp-specialized collective) compiles
+single-arch `90a` on nvcc 13.0 `-Werror` 0 warnings and `cuobjdump` shows a real
+`sm_90a` cubin (ptxas even names `wgmma.mma_async` in the emitted kernels); it is
+gated by its own `scaledmm-c3x-sm90` feature cell (enabled only for `90a`, so the
+GB10 `sm_121a` gate build is byte-unchanged). The consumer `sm_12x` FP8 scaled-mm
+body (`ArchTag=Sm120`) is untouched. **No H100/H200/sm_90 board ran it** — a green
+compile + SASS is not execution evidence, not runtime support, and not
+vLLM-competitive; the sm90 int8/blockwise C3x legs and the other Hopper fast paths
+(FA3, Machete, CUTLASS MoE) remain scoped.
+
 A separate **beyond-vLLM breadth lane** targets the older NVIDIA arches vLLM
 DROPS but llama.cpp still runs (Pascal/Volta/Turing). Its first brick landed
 2026-07-28: **Turing `sm_75` is BUILD-VERIFIED.** The bf16-WMMA prefill kernels

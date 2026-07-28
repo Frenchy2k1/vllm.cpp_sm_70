@@ -240,6 +240,23 @@ set(VT_CUDA_FEATURE_TABLE
   # CUTLASS FP8 scaled-mm (cuda_matmul_fp8_cutlass.cu, ArchTag=Sm120).
   # upstream: vLLM sm120 SCALED_MM_ARCHS "12.0a;12.1a" (CMakeLists.txt:777).
   "cutlass-fp8|12.0a,12.1a|CUTLASS FP8 scaled-mm (VT_CUTLASS_FP8)"
+  # Hopper (sm_90a) CUTLASS C3x FP8 scaled-mm wgmma/TMA GEMM build-verify TU
+  # (cuda_scaled_mm_c3x_sm90.cu). DELIBERATELY its OWN cell, NOT a widening of the
+  # consumer `cutlass-fp8` row above: the Hopper body is ArchTag=Sm90 +
+  # KernelTmaWarpSpecialized{Pingpong,Cooperative,}FP8FastAccum — CUTLASS selects
+  # the 4th-gen wgmma/TMA warp-specialized collective — whereas the sm_12x body is
+  # ArchTag=Sm120. The two are a DIFFERENT collective/schedule and cannot share a
+  # compile: widening the sm_12x cell to 9.0a would drag the sm120 tensor-op PTX
+  # into a 90a build, which ptxas rejects for compute_90a (the cross-family
+  # gencode blocker, arch-additivity §W7/§W9). Enabled ONLY for 90a so the gate
+  # arch sm_121a resolution is byte-unchanged. LABEL: DERIVED+BUILD-VERIFIED
+  # (testing-welcome) — compiled + cuobjdump-proven sm_90a SASS on GB10, NO
+  # H100/H200/sm_90 board ran it here. upstream: vLLM SCALED_MM_SM90_SRCS "9.0a"
+  # (CMakeLists.txt:760-772); the int8 sm90 C3x leg (scaled_mm_sm90_int8.cu, same
+  # Sm90 family, non-FP8FastAccum schedule) is a separate residual brick. See
+  # .agents/specs/cuda-arch-datacenter-fastpath.md §3a/§9 (DC2) + backend-matrix.md
+  # BACKEND-CUDA-SM090.
+  "scaledmm-c3x-sm90|9.0a|CUTLASS C3x FP8 scaled-mm wgmma/TMA GEMM, sm90 build-verify (VT_SCALEDMM_C3X_SM90)"
   # Vendored Marlin NVFP4 W4A16 grouped-MoE GEMM (src/vt/cuda/marlin/).
   # upstream: vLLM MARLIN_ARCHS "8.0+PTX;12.0a;12.1a" (CMakeLists.txt:558) — the
   # sm80+PTX leg is NOT claimed here: our vendored slice is the bf16 NVFP4

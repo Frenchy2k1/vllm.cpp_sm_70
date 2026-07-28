@@ -178,6 +178,27 @@ expect_feature("80" "cutlass-nvfp4-sm100" "")
 expect_feature("100a" "cutlass-nvfp4" "")
 expect_feature("100a" "fp4-mma" "")
 
+# --- HOPPER sm_90a CUTLASS C3x FP8 scaled-mm BUILD-VERIFY (BACKEND-CUDA-SM090,
+# ROAD-V1-D1-CUDA, datacenter fast-path §9 DC2). The `scaledmm-c3x-sm90` cell is a
+# DISTINCT feature from the consumer `cutlass-fp8` sm_12x cell: it gates the
+# ArchTag=Sm90 wgmma/TMA body (cuda_scaled_mm_c3x_sm90.cu), which is
+# DERIVED+BUILD-VERIFIED — compiled + cuobjdump-proven sm_90a SASS on GB10, NO
+# H100/H200 board ran it. It must resolve ENABLED for 90a ALONE. Pinned so (a) a
+# future edit cannot widen it onto the gate arch, and (b) the gate arch sm_121a /
+# consumer 120a stay EMPTY → the sm_12x `cutlass-fp8` scaled-mm is byte-unchanged.
+# The datacenter sm_100a stays EMPTY (its C3x FP8 leg is a separate later brick);
+# cross-family 80 stays EMPTY (no body).
+expect_feature("90a" "scaledmm-c3x-sm90" "90a")
+expect_feature("121a" "scaledmm-c3x-sm90" "")
+expect_feature("120a" "scaledmm-c3x-sm90" "")
+expect_feature("120a;121a" "scaledmm-c3x-sm90" "")
+expect_feature("100a" "scaledmm-c3x-sm90" "")
+expect_feature("80" "scaledmm-c3x-sm90" "")
+# RED-preserving companion: the CONSUMER sm_12x `cutlass-fp8` cell must stay EMPTY
+# for 90a — the sm_120 scaled-mm body cannot compile for a Hopper target. The
+# separate sm90 cell is exactly what keeps the sm_12x sweep off compute_90a.
+expect_feature("90a" "cutlass-fp8" "")
+
 if(_failures GREATER 0)
   message(FATAL_ERROR "${_failures} CUDA feature-table expectation(s) failed")
 endif()
