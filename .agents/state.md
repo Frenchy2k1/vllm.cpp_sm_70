@@ -31429,3 +31429,35 @@ this entry.
 RUNNER + first concrete pooling model (`model-matrix.md` row + checklist +
 oracle cosine-parity gate); W4 endpoints `/v1/embeddings` + score/rerank/classify;
 W5 tokwise `AllPool`/`StepPool` + chunked-prefill ALL pooling.
+
+## 2026-07-28 — MXFP4 compressed-tensors quant path W0 spec + W1 CPU dequant (`CLAIM-QUANT-MXFP4`)
+
+Base `main` `42c56b51` (isolated worktree `.claude/worktrees/mxfp4-ct`, branch
+`mxfp4-compressed-tensors`, CPU-only, foreground, NOT pushed). Shared unblocker for
+DeepSeek-V4-Flash (MXFP4 experts) + Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`);
+this claim OWNS the quant path only, does NOT touch those model files.
+
+W0: `.agents/specs/mxfp4-compressed-tensors.md` — full spike (scope, upstream chain,
+our baseline, port map, tests-to-port, gates, dependencies, work breakdown, risks),
+naming `QUANT-CT-MXFP4`. The explicit NVFP4 contrast: MXFP4 = group 32 + E8M0
+(`2^(byte-127)`) block scales + NO global scale; NVFP4 = group 16 + fp8-e4m3 scale +
+per-tensor global. E2M1 4-bit packing identical (reused `kE2M1Lut`).
+
+W1: `include/vllm/model_executor/model_loader/mxfp4_dequant.h` +
+`src/vllm/model_executor/model_loader/mxfp4_dequant.cpp` — `E8M0ToF32`,
+`DequantMxfp4ToBf16`, `DequantMxfp4ToF32`. Ports FROM `compressed_tensors_w4a4_mxfp4.py`
++ `mxfp8_utils.py:61-65,222` + golden `tests/quantization/reference_mxfp4.py:28-117`.
+Gate `tests/vllm/test_mxfp4_dequant.cpp` 5/5 · 1142 assertions vs a double-precision
+`dq_mxfp4_torch` port; RED-first proven (bias 127→128 fails 446 assertions, revert
+restores). Clean CPU `-Werror` 0-warn. `QUANT-CT-MXFP4` INVENTORIED→ACTIVE.
+
+Files: the two dequant TUs, the test, the spec, `CMakeLists.txt` (+source) and
+`tests/CMakeLists.txt` (+test) wiring. Records: quantization-matrix (row),
+coordination (claim), roadmap_v1, docs/STATUS, docs/BENCHMARKS, parity-ledger, this
+entry. No kernel-matrix row (CPU dequant reuses the E2M1 codec; no KERNEL count bump);
+no model-matrix change.
+
+NEXT (named residuals, NOT this change): W2 scheme-selection method + loader probe
+(mirror `schemes/nvfp4.h`); W3 GPU W4A4 fp4xfp4 GEMM + activation quant + Marlin W4A16
+fallback (GB10 dispatch mirror); W4 MoE MXFP4 expert path; W5 e2e model gate; then the
+DeepSeek-V4 + Kimi-K3 loaders drop their MXFP4 refusal.

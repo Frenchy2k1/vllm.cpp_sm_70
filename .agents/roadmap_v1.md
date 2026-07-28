@@ -184,6 +184,16 @@ follow-on); new kernel row `KERNEL-ATTN-DSA-SPARSE-INDEX` (`SPIKE`). **SGLang `v
 implements `DeepseekV4ForCausalLM`** (full DSA/MHC/o_lora stack, 2856 LoC) ⇒ a viable SECOND
 benchmark/primitive-dump reference (same single-GB10 memory constraint). Residuals: MHC (W5),
 sqrtsoftplus/hash MoE (W6), device kernel + forward integration + strict gate (W7-W8 = multi-Spark).
+**MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
+[`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
+DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)
+need to load — CPU weight unpack + E8M0 dequant (`2^(byte-127)`, group 32, NO global scale — the
+distinctions vs our NVFP4 group-16 fp8-scale path), new TUs `mxfp4_dequant.{h,cpp}` +
+`test_mxfp4_dequant` **5/5·1142** vs a double-precision `dq_mxfp4_torch` port (RED-first: a
+bias-128 mutation fails 446 assertions), clean CPU `-Werror`, ports FROM
+`compressed_tensors_w4a4_mxfp4.py` + `mxfp8_utils.py` + `reference_mxfp4.py`. Residual (NAMED
+W2-W5): scheme wiring, GPU W4A4 fp4 GEMM + Marlin W4A16 fallback, MoE expert path, e2e; the two
+model loaders keep their MXFP4 refusal until wired.
 **NEXT-TIER BATCH TRIAGE (2026-07-24,
 `sweep-recent-dense-batch.md`, `CLAIM-SWEEP-RECENT-DENSE`):** 8 recent dense/small-MoE families
 advanced `INVENTORIED` -> `SPIKE` with a ranked one-agent-each queue — **4 ZERO-NEW-KERNEL

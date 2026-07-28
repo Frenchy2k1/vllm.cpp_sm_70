@@ -8940,3 +8940,13 @@ claimed by a pooler-op unit brick - the pooling RUNNER + a concrete pooling
 model (W3) carry the future oracle cosine-parity gate, named in the spec.
 Reproduction: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release;
 cmake --build build-cpu --target test_pooler -j"$(nproc)"; ./build-cpu/tests/test_pooler`.
+## MXFP4 compressed-tensors quant path W0/W1 (2026-07-28) - NOT APPLICABLE (`benchmark_binding=false`)
+
+The MXFP4 (`mxfp4-pack-quantized`) W1 brick is a CPU weight-dequant REFERENCE
+(`mxfp4_dequant.{h,cpp}`: E2M1 unpack + E8M0 `2^(byte-127)` group-32 scale, no
+global scale), not a compute or throughput path. Gate is correctness-only:
+`test_mxfp4_dequant` 5 cases / 1142 assertions vs a double-precision `dq_mxfp4_torch`
+port (RED-first: bias-128 mutation fails 446 assertions). No throughput number is
+owed. The GPU W4A4 fp4xfp4 GEMM (FlashInfer W4A4 on GB10 with cute-dsl, else Marlin
+W4A16) is a named later brick and is where a benchmark binding will attach once the
+scheme wiring + a fitting MXFP4 checkpoint land. `benchmark_binding=false`.
