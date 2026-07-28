@@ -364,6 +364,7 @@ configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
+  src/vllm/lora/punica_cpu.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/speculative.cpp

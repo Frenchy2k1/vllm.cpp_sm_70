@@ -43,10 +43,10 @@ forensics: roadmap_v1.md and the parity ledger.
 | Structured output and tools | 7 | 0 | 3 | 0 | 0 | 1 | 0 | 0 | 3 |
 | Speculative decoding | 10 | 0 | 1 | 0 | 0 | 3 | 0 | 3 | 2 |
 | Serving, API, CLI, library | 20 | 3 | 2 | 1 | 0 | 5 | 2 | 1 | 6 |
-| LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
+| LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 1 |
 | Long context and attention | 10 | 0 | 0 | 0 | 1 | 5 | 1 | 0 | 3 |
 | Loading, tokenizer, config | 9 | 1 | 3 | 0 | 0 | 2 | 1 | 1 | 1 |
-| **Total** | **125** | **8** | **16** | **3** | **4** | **41** | **8** | **8** | **36** |
+| **Total** | **125** | **8** | **16** | **3** | **4** | **42** | **8** | **8** | **35** |
 
 ## Engine core and scheduling
 
@@ -197,8 +197,8 @@ claims it.
 
 | ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|---|
-| `LORA-RUNTIME` | Punica-style batched LoRA apply | T2 | `vllm/lora/lora_model.py:60`; `vllm/lora/lora_weights.py:13`; `vllm/lora/punica_wrapper/punica_gpu.py:33`; `vllm/v1/worker/lora_model_runner_mixin.py:30` | - | - | `planned: specs/lora-runtime.md` | `INVENTORIED` | - |
-| `LORA-ENDPOINTS` | Dynamic adapter load and unload | T2 | `vllm/entrypoints/serve/lora/api_router.py:43,60` | - | - | `planned: specs/lora-endpoints.md` | `INVENTORIED` | - |
+| `LORA-RUNTIME` | Punica-style batched LoRA apply. **W1 CPU BRICK LANDED + CPU-GATED 2026-07-28 (`CLAIM-LORA-RUNTIME`, NOT pushed):** the `LoRALayerWeights` container (`optimize` scaling-fold, dummy) + the portable punica shrink/expand ops (`BgmvShrink`/`BgmvExpand`/`BgmvExpandSlice`, `-1`-slot SKIP semantics mirroring the triton early-exit + the test CPU refs) + `AddLoraLinear` (buffer=shrink; y+=expand) + a `LoRALinear` (ReplicatedLinear n_slices=1: create/set/reset/apply, scaling folded into b at SetLora exactly like the manager optimize path). RUNTIME-VERIFIED on CPU: `test_punica_cpu` 6/6 (101 assertions) vs an independent double-precision per-LoRA matmul reference; RED-first proven (base-only output differs; `-1` base token unchanged; ResetLora → identity). Packed/TP/merged layers, mapping metadata, adapter load, LRU manager, GPU kernels + model gate are W2-W7 (see spec). | T2 | `vllm/lora/lora_model.py:60`; `vllm/lora/lora_weights.py:13`; `vllm/lora/ops/torch_ops/lora_ops.py:24`; `vllm/lora/punica_wrapper/punica_cpu.py:265`; `vllm/lora/layers/base_linear.py:100`; `vllm/lora/punica_wrapper/punica_gpu.py:33`; `vllm/v1/worker/lora_model_runner_mixin.py:30` | `include/vllm/lora/lora_weights.h:27`; `include/vllm/lora/punica.h:42,69,78`; `src/vllm/lora/punica_cpu.cpp:45,87,104,142`; `CMakeLists.txt:367` | `tests/vllm/lora/test_punica_cpu.cpp:76,91,109,138,161,219` (6/6, 101 assertions, CPU) | [lora-adapter.md](specs/lora-adapter.md) | `ACTIVE` | `CLAIM-LORA-RUNTIME` |
+| `LORA-ENDPOINTS` | Dynamic adapter load and unload (`POST /v1/{load,unload}_lora_adapter`); builds on the runtime, scoped as W6 of [lora-adapter.md](specs/lora-adapter.md) | T2 | `vllm/entrypoints/serve/lora/api_router.py:43,60` | - | - | `planned: specs/lora-adapter.md` | `INVENTORIED` | - |
 
 ## Long context and attention breadth
 
