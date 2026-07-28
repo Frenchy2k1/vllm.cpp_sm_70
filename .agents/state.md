@@ -29031,3 +29031,32 @@ done. Lesson for the next session: read AGENTS.md BEFORE the first edit, not
 after the push - the checkpoint surfaces are a same-change obligation, and a
 cross-repo driver (a LocalAI need) does not exempt a change from this repo's
 record protocol.
+---
+
+## 2026-07-28 — decode attention: a REAL 2.6x inefficiency, THREE failed exploits
+
+Re-derived rather than asserted, in answer to "are there any levers left".
+
+| | bytes/tok | ms/tok | achieved |
+|---|--:|--:|--:|
+| GEMV | 3400 MB | 34.2 | **99 GB/s** |
+| decode attention | 59 MB | 1.52 | **39 GB/s** |
+
+**2.6x slower per byte on the same device.** Structural cause is visible: at tq=1
+attention gets hq=16 threadgroups x 512 = 8,192 threads in flight; the GEMV gets
+256 x 256 = **65,536**. Reaching 70 GB/s would save 0.68 of the 0.81 ms gap.
+
+**Three exploits, three losses, three DIFFERENT reasons:**
+
+| approach | result | why |
+|---|--:|---|
+| flash-decoding (split keys) | -1.9..-6.3% | combine pass + per-chunk reduction re-paid per split |
+| GQA grouping (per kv head) | -2.6% | the traffic was already cache-deduped; only parallelism lost |
+| wider tg (8*d) | attn 1.52 -> 2.27 ms | longer log2(tg) reductions, fewer resident threadgroups |
+
+**"There is a 2.6x gap" and "there is a lever" are different claims. Only the
+first is supported.** The 16-threadgroup structure at b=1 resists every mechanism
+tried. Documented and quantified so it is not lost, not dressed up as actionable.
+
+This is a b=1 property: at tq > 1 the grid is hq*tq and none of these constraints
+bind. It is specific to the single-stream parity target.

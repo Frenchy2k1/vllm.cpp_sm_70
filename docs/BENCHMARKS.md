@@ -3516,6 +3516,45 @@ this workload.
 
 ---
 
+## Decode attention: a REAL 2.6x inefficiency with THREE failed exploits
+
+Answering "are there any levers left" by re-deriving rather than asserting. There
+is a genuine anomaly:
+
+| | bytes/token | ms/token | achieved |
+|---|--:|--:|--:|
+| GEMV (weight stream) | 3400 MB | 34.2 | **99 GB/s** |
+| decode attention (KV) | 59 MB | 1.52 | **39 GB/s** |
+
+**2.6x slower per byte on the same device**, and the structural reason is visible:
+at tq=1 attention gets `hq` = 16 threadgroups x 512 threads = 8,192 in flight,
+where the GEMV gets 256 x 256 = **65,536**, an 8x difference. Reaching 70 GB/s
+would save 0.68 ms of the 0.81 ms gap — 84% of it.
+
+**So the inefficiency is real. Three different ways of exploiting it have now been
+measured, and all three lose:**
+
+| approach | mechanism | result |
+|---|---|--:|
+| flash-decoding (split keys across threadgroups) | more threadgroups | **-1.9 to -6.3%** |
+| GQA grouping (one per kv head) | halve traffic | **-2.6%**; traffic already cache-deduped |
+| wider threadgroups (tg = 8*d) | more threads per group | attention **1.52 -> 2.27 ms**, decode -2.2% |
+
+Each fails for its own reason and they are not the same reason: splitting pays a
+combine pass and re-pays the per-chunk reduction; grouping trades parallelism for
+traffic that the cache was already saving; widening lengthens the threadgroup
+reductions (log2(tg) barrier steps) and cuts resident threadgroups per core.
+
+**Conclusion: the 16-threadgroup structure at b=1 is not obviously improvable by
+any mechanism this session found.** The inefficiency is documented and quantified
+so it is not lost, but "there is a 2.6x gap" and "there is a lever" are different
+claims, and only the first is supported.
+
+Note this is a b=1 property. At batch (tq > 1) the grid is hq*tq and none of these
+constraints bind — this is specifically about the single-stream parity target.
+
+---
+
 ## GQA grouping CLOSED: the traffic it would save is already free (2026-07-28)
 
 The entry below proposes GQA-grouped decode attention as worth 82% of the
