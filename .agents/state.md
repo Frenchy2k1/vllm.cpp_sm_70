@@ -29462,3 +29462,66 @@ fixes nothing on this path, so it was reverted rather than shipped unverified.
 
 Prior lead (negative `srow[-1]` index) remains REFUTED: `runner.cpp:1187` clamps
 `num_accepted_tokens >= 1`.
+## 2026-07-28 — Decode per-token latency (TPOT/ITL) lever EXPLORED: SGLang gap is BATCH-COMPOSITION (`CLAIM-DECODE-LATENCY-EXPLORE`)
+
+Base local `main` `348ae7c9` (confirmed `git rev-parse HEAD`), isolated worktree
+`.claude/worktrees/agent-a435b290a37d1e715`, dgx GB10 sm_121a, idle box, one
+`flock $HOME/gpu.lock`, serialized vs a concurrent campaign. **Measurement only —
+no source/scheduler/kernel changed, no default flipped.**
+
+**Question.** The SGLang competitor-floor benchmark (`CLAIM-SGLANG-PERF-BENCH`)
+found we win throughput (2.21×@c16) + TTFT (6–12×) but SGLang wins steady-state
+per-token latency (TPOT ~104 / ITL ~105.6 ms vs ours 122.9–154.4). Its attributed
+(unconfirmed) hypothesis: our throughput win IS the ITL cost via larger decode
+batches. CONFIRM or REFUTE, characterize the lever.
+
+**What I did.** (1) Source scan: ours mixes prefill+decode in one forward pass via
+chunked prefill and packs the running batch to `max_num_seqs`
+(`src/vllm/v1/core/sched/scheduler.cpp:267,280,431,432`); SGLang runs
+**prefill-first, NON-mixed** steps (`managers/scheduler.py:2700` "# Run prefill
+first if possible", decode via `update_running_batch:3041`) so a prefill step
+stalls decodes → huge admission queue. (2) Swept OUR decode batch B∈{1,2,4,8,16}
+(27B-NVFP4, 1024/128, greedy, ignore_eos, `--max-num-seqs 16`, async ITL probe, 2
+reps CV<1%). (3) nsys'd decode B=1 vs B=16.
+
+**Data.** ITL mean = 101.75 / 106.92 / 113.77 / 125.20 / **158.48** ms for
+B=1/2/4/8/16 (median 101.68 / 105.96 / 110.46 / 115.75 / 131.11); out-tput
+9.58→87.66 tok/s; c16 reproduces the recorded benchmark. nsys per-instance (=per
+decode step) AVG grows **sub-linearly**: nvjet NVFP4 GEMM 1.60×, cutlass
+GemmUniversal 1.63×, GdnChunkWUWmma (GDN mamba) 1.75×, RmsNormRowFast 1.81× — all
+for **16×** the tokens ⇒ per-token GPU cost ↓ ~10×.
+
+**Verdict — CONFIRMED batch-composition, REFUTED kernel-inefficiency.** (a)
+ITL(B=1)=101.75 ms is already ≤ SGLang's op-point 104–105 ms → no per-token kernel
+deficiency. (b) ITL rises monotonically with the decode batch we pack. (c) nsys:
+"more requests × cheaper-per-token", not "each token costs more". SGLang's
+effective decode concurrency ≈4 (40.8 tok/s ÷ 1000/105 ms), not its
+`--max-running-requests 16` — its 33 s admission queue keeps few requests decoding,
+so its low ITL is simply the ITL of a small batch. **Our throughput win IS the ITL
+cost — the same lever.** Knob (`max_num_seqs`/`max_num_batched_tokens`) already
+exists; latency-oriented point `max_num_seqs≈8` = ITL −21% at 1.38× SGLang
+throughput; default stays throughput-oriented (exploration only, not changed).
+
+**Reconciliation with the earlier "decode attention 2.6× inefficiency" note (this
+file, 2026-07-28).** No contradiction: on this hybrid mamba+attention model the
+softmax-attention kernel (`flash_fwd_splitkv`) is only ~1.7% of decode GPU time
+(GDN mamba kernels carry the sequence-mixing role), so that attention lever is a
+small-fraction, separate item; it does NOT explain the aggregate per-token-latency
+gap vs SGLang, which is batch composition.
+
+**Residuals.** 35B not swept; the ~8% matched-batch step-overhead residual + the
+mixed-prefill p99 tail (b16 ITL p99 900 ms) not attributed to a named kernel (nsys
+shows no gross per-token deficiency, low priority); SGLang not re-profiled (ITL
+from the recorded floor per the no-re-standup scoping). Full data +
+file:line + repro: `.agents/specs/decode-latency-lever.md`, `docs/BENCHMARKS.md`.
+Evidence dgx `~/work/decode-lat-348ae7c/{sweep_out/sweep_results.jsonl,
+nsys_out/decode_b{1,16}.nsys-rep}`.
+
+**Lessons.** (1) A batch=1 latency floor is the cleanest refutation of a "kernel
+is slow" story — if the single-stream token is already at/below the competitor,
+the gap is composition, full stop. (2) Per-instance nsys AVG (not total) is the
+right axis for composition-vs-kernel: sub-linear per-step growth = batching
+working as designed. (3) The competitor's low ITL can be an artifact of its OWN
+weakness (a 33 s admission queue starving its decode batch), not a strength to
+chase — always derive effective concurrency (tput÷per-stream-rate) before treating
+a latency number as a target.
