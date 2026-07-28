@@ -514,13 +514,16 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `VLLM_ERR_INVALID_ARGUMENT` rather than `VLLM_ERR_MODEL_LOAD` (the contract
   `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
   backend) could not expose LMCache or the prefill budget in a model config.
-- **DFlash from GGUF is SPIKED, not implemented** (`SPEC-DFLASH-GGUF`,
-  [spike](../.agents/specs/gguf-dflash-draft.md)). Its asset dependency is now
-  known to be far smaller than the spike assumed: pre-converted `dflash`-arch
-  GGUF drafts are published (smallest useful ~1 GB), so no local conversion run
-  is on the critical path. The draft is cheap; the matching TARGET is the
-  expensive dependency, and it is needed only for the end-to-end gates, not for
-  the loader work.
+- **DFlash from GGUF is SPIKED with its contract CONFIRMED, not yet implemented**
+  (`SPEC-DFLASH-GGUF`, [spike](../.agents/specs/gguf-dflash-draft.md)). The
+  `dflash` GGUF contract is now verified against a real published draft rather
+  than read off llama.cpp's constants: architecture `dflash`, `fc` /
+  `enc.output_norm` / `output_norm` plus the per-block tensors, `dflash.block_size`,
+  `dflash.target_layers` (whose length is `num_taps`), and the mask token on the
+  standard tokenizer KV. No `token_embd` / `output`, confirming the draft shares
+  the target's embedding and lm_head. No conversion run was needed - pre-converted
+  drafts are published at ~1 GB. The loader rows can proceed from the draft alone;
+  only the end-to-end gates need the matching (expensive) target.
 - **MTP speculative decoding from a GGUF target WORKS** (`SPEC-MTP-GGUF`,
   `GATING`, [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads
   from a head-carrying GGUF - `HfConfigFromGguf` republishes the depth it already

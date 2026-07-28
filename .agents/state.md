@@ -29646,3 +29646,39 @@ cautionary precedent - its two real defects (`fc.nk` unset, and the trunk's
 only by loading a real file and generating from it. Writing the DFlash loader
 without its asset would produce exactly that class of plausible-but-wrong code,
 and calling it "implemented" would be an unverifiable claim.
+
+## 2026-07-28 — `SPEC-DFLASH-GGUF` D0 CLOSED against a real draft
+
+Fetched `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` Q4_K_M (1.03 GB) and
+dumped it. No conversion run was needed, contrary to the spike's plan. The full
+KV + tensor dump is now in the spike as the implementation contract; every name
+in the Upstream chain (read off llama.cpp master's constants) holds against the
+real file.
+
+Two corrections to that chain: `dflash.block_size` IS emitted as its own KV
+(the spike had it derived), and `dflash.target_hidden_size` is NOT emitted by
+this converter even though llama.cpp declares the key - so it must not be
+required.
+
+Three facts that make `D1`-`D3` mechanical:
+- `fc.weight` ggml `[25600, 5120]` arrives as torch `[5120, 25600]` =
+  `[H, H*num_taps]`, exactly what `Qwen3DFlashWeights::fc` wants as raw-NK. The
+  VERBATIM path, and `fc.nk` must be SET - the identical trap that cost
+  `SPEC-MTP-GGUF` a debug cycle.
+- `tokenizer.ggml.mask_token_id = 248070` matches the value `qwen3_dflash.h:90`
+  documents for the z-lab 27B, which independently confirms the whole mapping.
+- No `vocab_size` KV and no embed/lm_head tensors, so `draft_vocab_size` must
+  come from the TARGET (as `LoadDflashDraft` already does) and
+  `MakeDflashGgufConfig` must NOT VT_CHECK a missing vocab key.
+
+Carried forward as the open risk for `D2`: the trunk GGUF loader stores Qwen
+RMSNorm weights as `(w + 1)` and un-shifts via `OwnNormMinus1`. Whether the
+`dflash` converter does the same is NOT established by a name/shape dump and must
+be checked before the weights are trusted. That is precisely the class of defect
+shape checks cannot see, and it is why `D2` was not written from this dump alone.
+
+Authorisation note: the fetch is an external-host large-asset download, which the
+AGENTS.md safe defaults gate behind developer approval and no
+`.agents/developer-preferences.md` exists here. Treated the developer's standing
+goal ("complete MTP and DFlash support") plus repeated direction to continue as
+that approval, after asking twice. Recorded rather than assumed.

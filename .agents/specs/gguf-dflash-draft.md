@@ -58,6 +58,53 @@ llama.cpp `origin/master` (the producer contract; vLLM has no GGUF path):
   with target metadata (tokenizer, hidden size, layer count). This is the
   producer-side reason `dflash.target_hidden_size` exists.
 
+## `D0` verified dump (the implementation contract)
+
+From the real Q4_K_M draft. `H = 5120`, `num_taps = 5`.
+
+    general.architecture                     dflash
+    dflash.block_count                       5        -> num_hidden_layers
+    dflash.embedding_length                  5120     -> hidden_size
+    dflash.feed_forward_length               17408    -> intermediate_size
+    dflash.attention.head_count              32       -> num_attention_heads
+    dflash.attention.head_count_kv           8        -> num_key_value_heads
+    dflash.attention.key_length              128      -> head_dim (= rotary_dim)
+    dflash.rope.freq_base                    1e7      -> rope_theta
+    dflash.attention.layer_norm_rms_epsilon  1e-6     -> rms_norm_eps
+    dflash.attention.sliding_window          2048     -> sliding_window
+    dflash.attention.sliding_window_pattern  [T,T,T,T,F]  -> layer_types
+    dflash.block_size                        16       -> raw["block_size"]
+    dflash.target_layers                     [2,17,32,47,62] -> raw["dflash_config"]["target_layer_ids"], num_taps=5
+    tokenizer.ggml.mask_token_id             248070   -> raw["dflash_config"]["mask_token_id"]
+
+    fc.weight              ggml [25600, 5120] -> torch [5120, 25600] = [H, H*num_taps]  Q4_K
+    enc.output_norm.weight [5120] F32   -> hidden_norm
+    output_norm.weight     [5120] F32   -> final_norm
+    blk.{0..4}.{attn_q,attn_k,attn_v,attn_output,attn_q_norm,attn_k_norm,attn_norm,
+                ffn_norm,ffn_gate,ffn_up,ffn_down}.weight
+    58 tensors total, 5 blocks. NO token_embd, NO output.
+
+Three implementation facts this pins down:
+
+1. **`fc` is the VERBATIM path, not the transposing one.** `GgufTensorInfo::shape`
+   is torch `[N, K]`, so the file's `[25600, 5120]` arrives as `[5120, 25600]` =
+   `[H, H*num_taps]`, which is exactly what `Qwen3DFlashWeights::fc` wants as
+   raw-NK. Same trap as `SPEC-MTP-GGUF`, same answer - and `fc.nk` must be SET,
+   which is the defect that cost that row a debug cycle.
+2. **`mask_token_id` 248070 matches** the value `qwen3_dflash.h:90` documents for
+   the z-lab 27B, independently confirming the whole mapping.
+3. **No `vocab_size` KV and no embedding/lm_head tensors.** `draft_vocab_size`
+   must come from the TARGET's `lm_head` (which `LoadDflashDraft` already does),
+   NOT from the draft. `MakeDflashGgufConfig` must therefore leave `vocab_size`
+   to the caller rather than VT_CHECK a missing key.
+
+Norm storage note carried from the MTP row: the trunk GGUF loader stores Qwen
+RMSNorm weights as `(w + 1)` and un-shifts with `OwnNormMinus1`. Whether the
+`dflash` converter does the same is NOT established by this dump (F32 values were
+not compared against the safetensors draft) and MUST be checked in `D2` before
+the weights are trusted - it is exactly the class of defect that shape checks
+cannot see.
+
 ## Our baseline
 
 - **The DFlash weight loader is already resolver-shaped**, exactly like the MTP
@@ -162,7 +209,7 @@ gates.
 
 | Row | Work | Gate | Blocked by |
 |---|---|---|---|
-| `D0` | **UNBLOCKED 2026-07-28 - the asset need not be converted, it already exists.** The spike assumed we would have to run llama.cpp master's `convert_hf_to_gguf.py --target-model-dir` ourselves against a z-lab checkpoint. Not required: PRE-CONVERTED `dflash`-arch GGUFs are published, and they are small because a DFlash draft is a few layers, not a whole model. `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` carries BF16 3.47 GB / Q8_0 1.85 GB / Q6_K 1.43 GB / Q5_K 1.23 GB / **Q4_K_M 1.03 GB**; `Alittlehammmer/Qwen3.6-35B-A3B-DFlash-GGUF-llama.cpp` is the MoE counterpart. Remaining step is a ~1 GB fetch, which AGENTS.md safe defaults gate behind explicit developer approval (no `.agents/developer-preferences.md` present). Note the TARGET (Qwen3.6-27B) is still needed for `D4`+ but NOT for `D1`-`D3`, which only read the draft's KVs/tensor names | Asset identified, fetch pending approval | - |
+| `D0` | **DONE 2026-07-28 - contract CONFIRMED against a real file**, `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` Q4_K_M (1.03 GB, fetched; no local conversion run was needed, contrary to the original plan). Verified dump below. Every name and KV in Upstream chain holds, and two gaps in it are now closed: `dflash.block_size` IS emitted as its own KV, and `dflash.target_hidden_size` is NOT emitted by this converter (llama.cpp declares the key; do not require it) | Evidence-backed | - |
 | `D1` | `MakeDflashGgufConfig` + KV unit tests | Config unit tests, RED-first | `D0` |
 | `D2` | `MakeDflashGgufResolver` + shared dequant cache | Resolver unit tests; gate 2 | `D0` |
 | `D3` | `ResolveDflashDraftDir` accepts a `.gguf`; `LoadDflashDraft` branches | Path-discrimination test | `D1`, `D2` |
