@@ -236,7 +236,34 @@ the widened row geometry at runtime - inspection is not proof, and this is the
 exact seam I5e had to repair once already (its RCA was
 `gdn_state_gather: working/cache row shapes must match`).
 
-**Next probe, concrete:** dump one conv_state row (all 4 taps, one channel)
+**PRIME SUSPECT IDENTIFIED (high confidence, one line).**
+`src/vllm/model_executor/models/qwen3_5.cpp:3616`:
+
+    const int64_t conv_row_elems = conv_dim * (Kw - 1);
+
+That is the WIDTH-based row size, but under speculation the persistent
+`state.conv_state` row is `conv_dim * ((Kw - 1) + num_spec)` - measured as
+state_len=4 vs width=3 on the 2B (K=4, num_spec=1). It is then used as the
+per-slot extent for `GatherStateF32` / `ScatterStateF32` (`:3666`, `:3673`,
+`:3698`, `:3702`), which move a CONTIGUOUS `conv_row_elems` block. Gathering a
+contiguous `conv_dim*3` prefix out of a physically `conv_dim*4` row only lines up
+for channel 0; every subsequent channel is read (and written back) at a
+progressively larger offset error. That is exactly a corrupted post-prefill
+recurrent state, which is exactly the observed symptom - the first DECODE token
+after a correct prefill token is already wrong.
+
+The fix is not a one-character change: the working copy is legitimately narrow
+(prefill only produces K-1 taps), so gather/scatter must become STRIDE-AWARE
+(copy `width` taps per channel out of / into a `state_len`-strided row) rather
+than contiguous. The non-spec path must stay byte-identical, which it does by
+construction when `state_len == width`.
+
+NOT applied here: it changes shared state-movement helpers used by every GDN
+path, and this session could not gate the non-spec paths it would touch. Whoever
+takes it should assert the leading-taps equality probe below FIRST, so the fix is
+verified against a measurement rather than against this reasoning.
+
+**Confirming probe, concrete:** dump one conv_state row (all 4 taps, one channel)
 immediately after the prefill scatter and immediately before the first spec
 update read, under both spec-ON and spec-OFF. If the ON row's leading 3 taps do
 not equal the OFF row's 3 taps, the gather/scatter geometry is the defect; if
@@ -249,6 +276,22 @@ NO-OP on this path, because that kernel only ever sees the narrow working buffer
 (state_len == width == 3), and it changed no output. It may still be correct
 hardening for a caller that passes a widened row directly, but it fixes nothing
 here and was reverted rather than shipped unverified.
+
+**DISCRIMINATOR RUN 2026-07-28 - the WIDENING is innocent, the spec conv PATH is not.**
+`ngram` speculation sets a SpeculativeConfig and widens the same cache, but loads
+no head and reads no `nextn` tensors. Result: `ngram` spec-ON output is
+**token-exact** to spec-OFF, and instrumentation shows `CausalConv1dSpecUpdate`
+is **never called** in that run. So:
+
+    widened cache alone (ngram)                        EXACT
+    spec conv/state update EXECUTING (mtp, 0 accepted) DIVERGES
+
+which narrows the defect from "the speculative path" to specifically the
+preparation/consumption of the GDN conv state around
+`CausalConv1dSpecUpdate` - and re-confirms, from a third independent angle, that
+neither MTP head weights nor the GGUF loader are involved. The ngram case is
+retained as a permanent regression guard in
+`tests/parity/test_qwen35_gguf_spec_decode.cpp`.
 
 **Where to look next.** The op-level CPU suites PASS (`test_ops_gdn` 1825,
 `test_qwen3_5_gdn_spec_routing` 12), so the kernels are bit-exact and the defect

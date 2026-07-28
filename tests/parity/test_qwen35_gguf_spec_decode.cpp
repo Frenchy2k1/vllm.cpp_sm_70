@@ -126,3 +126,44 @@ TEST_CASE("gguf mtp: spec-ON equals spec-OFF and the drafter is alive") {
   // step - identical output, zero speedup, and a silently broken loader.
   CHECK(loaded->runner().spec_drafts_accepted() > 0);
 }
+
+// MINIMAL REPRODUCER for `CPU-SPEC-DIVERGENCE`, deliberately with NO MTP head
+// and NO draft model of any kind.
+//
+// `ngram` speculation proposes from the prompt's own suffix history. It sets a
+// SpeculativeConfig, so the engine takes the SAME target-side speculative path
+// (widened KV / conv row, spec metadata, spec conv update) as MTP - but it loads
+// no head, reads no `nextn` tensors, and touches nothing SPEC-MTP-GGUF added. If
+// this ALSO diverges, the defect is proven independent of MTP and of the GGUF
+// head loader, and this becomes the reproducer to fix the engine against.
+TEST_CASE("cpu spec divergence: ngram needs no draft head and still diverges") {
+  const std::string model = MtpGgufPath();
+  if (model.empty() || !fs::exists(model)) {
+    MESSAGE("SKIP: set VLLM_MTP_GGUF_MODEL");
+    return;
+  }
+
+  std::vector<int32_t> baseline_ids;
+  {
+    auto loaded =
+        vllm::entrypoints::LoadedEngine::FromModelDir(model, BaseParams());
+    const vllm::RequestOutput out =
+        loaded->engine().generate(kPrompt, Greedy(kMaxTokens), "ngram-off");
+    REQUIRE(out.finished);
+    baseline_ids = out.outputs[0].token_ids;
+  }
+
+  vllm::entrypoints::EngineParams spec_params = BaseParams();
+  spec_params.speculative_config = vllm::ParseSpeculativeConfigJson(
+      R"({"method":"ngram","num_speculative_tokens":2})");
+
+  auto loaded =
+      vllm::entrypoints::LoadedEngine::FromModelDir(model, spec_params);
+  const vllm::RequestOutput out =
+      loaded->engine().generate(kPrompt, Greedy(kMaxTokens), "ngram-on");
+  REQUIRE(out.finished);
+
+  MESSAGE("ngram spec-ON: \"" << out.outputs[0].text << "\"");
+  // Same exactness bar: greedy speculation never changes WHICH tokens come out.
+  CHECK(out.outputs[0].token_ids == baseline_ids);
+}

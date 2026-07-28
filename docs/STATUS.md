@@ -551,7 +551,14 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   non-spec single-token update is never called at all. The split is legitimate by
   design - the narrow buffer is a gathered working copy scattered back into the
   widened row - so the open question is whether the gather/scatter and the spec
-  read agree on that geometry at runtime. The next probe is recorded in the spike.
+  read agree on that geometry at runtime. **Narrowed again**: `ngram` speculation, which widens the same cache but never
+  runs the spec conv update, is token-EXACT - so the widening is innocent and the
+  defect is in the GDN conv state prepared for / consumed by the spec update. A
+  one-line prime suspect is recorded in the spike
+  (`qwen3_5.cpp:3616` sizes the gather/scatter row by `(Kw-1)` while the
+  speculative row is `(Kw-1)+num_spec`, so only channel 0 lands correctly). The
+  fix requires stride-aware state gather/scatter and is NOT applied, because it
+  touches shared GDN state movement that this session could not gate.
 - **DFlash from GGUF is SPIKED, not implemented.** `mtp` and
   `dflash` are refused on a `.gguf` target today; `ngram` works there and
   always has. Two `READY` rows now carry the scoped plan:
