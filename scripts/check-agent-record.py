@@ -62,7 +62,13 @@ MATRICES = {
     # scale-out capability dimension — one `vt::` collective abstraction with
     # nccl/RDMA/MLX-ring transports; single-GPU today). All `SPIKE`,
     # `CLAIM-SCALE-OUT-SPIKE`, spec specs/scale-out-distributed.md.
-    "BACKEND": (AGENTS / "backend-matrix.md", 65),
+    # 68 since 2026-07-28: +the parallelism-MODE rows `BACKEND-DISTRIBUTED-DP`/
+    # `-EP`/`-SP` (the enumeration of vLLM's parallelism modes onto our transport
+    # abstraction — DP engine-replica scale-out, EP whole-expert all-to-all, SP the
+    # TP-mode reduce-scatter compilation pass; TP/PP already existed, context/CP
+    # rides the same abstraction and takes no row). All `SPIKE`,
+    # `CLAIM-PARALLELISM-MODES-SPIKE`, spec specs/parallelism-modes.md.
+    "BACKEND": (AGENTS / "backend-matrix.md", 68),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

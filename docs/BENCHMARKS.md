@@ -461,6 +461,17 @@ byte-identical `world_size==1` no-op. Pure CPU, no GPU, no model run — a
 throughput comparison is meaningless here and is not owed until the NCCL/RoCE
 transports and TP/PP forwards land on a ≥2-GPU host (W3+). No
 performance-relevant source/engine path touched.
+**Parallelism-mode enumeration spike (2026-07-28, `CLAIM-PARALLELISM-MODES-SPIKE`,
+NOT pushed).** Disposition: **NOT APPLICABLE (records-only enumeration spike; no
+build, no run, no download, no measurement taken, claimed, or owed;
+`benchmark_binding=false`).** Enumerates every parallelism mode vLLM has
+(TP/PP/DP/EP/SP/context + comm-strategies + combos), each grounded 1:1 in pinned
+vLLM `555967922` `file:line` and mapped onto the `vt::Communicator` seam;
+priority-ranked (TP → EP → PP → DP → SP → context). Adds the mode rows
+`BACKEND-DISTRIBUTED-DP`/`-EP`/`-SP`. Correctness gating for every mode is
+HW-blocked exactly as scale-out (no ≥2-GPU box here); no engine speed number
+exists or is owed. Spec: [parallelism-modes.md](../.agents/specs/parallelism-modes.md).
+No source/engine path touched.
 
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —

@@ -461,6 +461,25 @@ the other 4 rows stay `SPIKE`.
 | 2 — multi-Spark | [`BACKEND-DISTRIBUTED-MULTINODE-SPARK`](backend-matrix.md) | 2× DGX Spark over ConnectX-7 200GbE RoCE; unlocks DeepSeek-V4 fp8 (~167 GiB) across 238 GiB | 2 Sparks + QSFP cable |
 | 3 — MLX multi-node | [`BACKEND-DISTRIBUTED-MLX-RING`](backend-matrix.md) | `mlx.core.distributed` ring/JACCL over Thunderbolt; shards the Metal forward across Macs | 2 Thunderbolt-linked Macs |
 
+### Parallelism modes (enumeration spike, `CLAIM-PARALLELISM-MODES-SPIKE`, 2026-07-28)
+
+Every parallelism MODE vLLM has, grounded 1:1 in pinned vLLM `555967922` and
+mapped onto the one `vt::Communicator` seam (per-mode rank-group + collective).
+Full enumeration table + vLLM `file:line` + config flags + comm patterns:
+[parallelism-modes.md](specs/parallelism-modes.md). Priority-ranked per the user
+directive (same-host TP first, then EP/PP/DP, then SP/context). **Honest flags:**
+SP is a TP-mode compilation pass (no world dimension); EP is a re-grouping of
+DP×PCP×TP ranks (no size knob); vLLM has no interleaved/virtual pipeline.
+
+| Prio | Mode / row | What it adds | Collective (in W1?) | Gate HW |
+|---|---|---|---|---|
+| P1 | TP — [`BACKEND-DISTRIBUTED-TP`](backend-matrix.md) | sharded linears/heads/KV/vocab + all-reduce; the base every mode reuses | `AllReduce`+`AllGather` (✅ W1) | ≥2-GPU box |
+| P2 | EP — [`BACKEND-DISTRIBUTED-EP`](backend-matrix.md) + NCCL comm-strategy | whole-expert shard + all-to-all dispatch/combine (MoE payoff; gate models are MoE) | `AllToAll` (❌ NEW) | ≥2-GPU box |
+| P3 | PP — [`BACKEND-DISTRIBUTED-PP`](backend-matrix.md) | contiguous stage split + inter-stage send/recv + multi-worker executor | `Send`/`Recv` (✅ W1) | ≥2-GPU / multi-node |
+| P4 | DP — [`BACKEND-DISTRIBUTED-DP`](backend-matrix.md) | engine-replica scale-out + coordinator wave + token-count all-reduce; completes DP×EP | `AllReduce` (✅ W1) | ≥2-GPU (+W4 executor) |
+| P5 | SP — [`BACKEND-DISTRIBUTED-SP`](backend-matrix.md) | TP-mode all-reduce → reduce-scatter/all-gather fusion (surpass-track, not correctness) | `ReduceScatter` (❌ NEW) | ≥2-GPU |
+| P6 | Context / PCP+DCP (no new backend row) | shard the KV/sequence dim for long context (ring/all-to-all attention) | `AllToAll` + partial-attn reduce (❌ NEW) | ≥2-GPU |
+
 ## Decision rules carried forward
 
 - Every perf claim: same-box A/B vs the reference, token-exact gated, fresh
