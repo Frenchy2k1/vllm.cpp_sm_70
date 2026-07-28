@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <string>
+#include <utility>
 
 namespace vllm::entrypoints::openai {
 
@@ -204,6 +206,32 @@ ChatCompletionLogProbs BuildChatLogprobs(const std::vector<int32_t>& token_ids,
   }
   out.content = std::move(content);
   return out;
+}
+
+std::vector<vllm::CompletionOutput> SelectBestOf(
+    std::vector<vllm::CompletionOutput> outputs, int return_n) {
+  // INERT: nothing to trim (the default best_of == n path lands here and returns
+  // the outputs — and their original indices — byte-for-byte unchanged).
+  if (return_n <= 0 ||
+      static_cast<int>(outputs.size()) <= return_n) {
+    return outputs;
+  }
+  // Rank by DESCENDING cumulative logprob, stable (ties keep engine order); an
+  // output without a cumulative logprob sorts last.
+  std::stable_sort(outputs.begin(), outputs.end(),
+                   [](const vllm::CompletionOutput& a,
+                      const vllm::CompletionOutput& b) {
+                     const double no_lp =
+                         -std::numeric_limits<double>::infinity();
+                     const double la = a.cumulative_logprob.value_or(no_lp);
+                     const double lb = b.cumulative_logprob.value_or(no_lp);
+                     return la > lb;
+                   });
+  outputs.resize(static_cast<std::size_t>(return_n));
+  for (int i = 0; i < return_n; ++i) {
+    outputs[static_cast<std::size_t>(i)].index = i;
+  }
+  return outputs;
 }
 
 }  // namespace vllm::entrypoints::openai

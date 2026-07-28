@@ -10,11 +10,15 @@
 // constructor remains as a synchronous compatibility/test seam and still
 // returns a precomputed vector; the production server uses AsyncLLM.
 //
+// WIRED since T0 (ROAD-V1-C7): n > 1 (fan-out → n choices), best_of (fan-out +
+// top-n rank, SAMPLE-BEST-OF) and use_beam_search (SAMPLE-BEAM, over the SYNC
+// LLMEngine BeamSearch driver; the AsyncLLM beam path is a named residual).
+//
 // DEFERRED (marked; matches upstream so re-adding is mechanical):
 //   - tools / tool_choice / grammars (M3.3 / M3.4)
-//   - logprobs *payload* (CompletionLogProbs); echo; best_of; suffix
-//   - n > 1 (multiple choices) — T0 emits a single choice (index 0)
-//   - beam search, LoRA, data-parallel rank, trace headers, kv_transfer
+//   - logprobs *payload* (CompletionLogProbs); echo; suffix
+//   - LoRA, data-parallel rank, trace headers, kv_transfer
+//   - streaming beam search (upstream also rejects it, serving.py:136)
 #ifndef VLLM_ENTRYPOINTS_OPENAI_SERVING_COMPLETION_H_
 #define VLLM_ENTRYPOINTS_OPENAI_SERVING_COMPLETION_H_
 
@@ -28,6 +32,12 @@
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/v1/engine/async_llm.h"
 #include "vllm/v1/engine/llm_engine.h"
+
+namespace vllm {
+namespace tok {
+class Tokenizer;  // vllm/tokenizer/tokenizer.h (beam-search prompt tok/detok)
+}  // namespace tok
+}  // namespace vllm
 
 namespace vllm::entrypoints::openai {
 
@@ -76,11 +86,25 @@ class OpenAIServingCompletion {
   // constructor is synchronous and must still be serialized by ApiServer.
   bool uses_async_engine() const { return async_engine_ != nullptr; }
 
+  // SAMPLE-BEAM: attach the tokenizer + eos id the beam-search path needs (it
+  // tokenizes the prompt and detokenizes each beam). Beam search runs over the
+  // SYNC LLMEngine driver (the merged BeamSearch); leaving this unset makes a
+  // use_beam_search request raise. The default (no-beam) path never reads these.
+  void set_beam_search_tokenizer(const vllm::tok::Tokenizer* tokenizer,
+                                 std::optional<int32_t> eos_token_id) {
+    beam_tokenizer_ = tokenizer;
+    beam_eos_token_id_ = eos_token_id;
+  }
+
  private:
   v1::LLMEngine* sync_engine_ = nullptr;
   v1::AsyncLLM* async_engine_ = nullptr;
   std::string served_model_name_;
   bool enable_force_include_usage_ = false;
+  // Beam-search context (see set_beam_search_tokenizer). Null => beam search
+  // unavailable on this handler.
+  const vllm::tok::Tokenizer* beam_tokenizer_ = nullptr;
+  std::optional<int32_t> beam_eos_token_id_;
   // Monotonic request counter — the request_id is "cmpl-<counter>". Upstream
   // uses random_uuid() (serving/engine/serving.py:_base_request_id); no
   // random/uuid is wired at T0, so a counter stands in (id uniqueness only).

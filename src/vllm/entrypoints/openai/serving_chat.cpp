@@ -7,11 +7,14 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/entrypoints/beam_search.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/entrypoints/openai/tool_parsers/structural_tags.h"
+#include "vllm/tokenizer/tokenizer.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -574,6 +577,58 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const std::string prompt =
       prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools);
 
+  // ── use_beam_search (chat_completion/serving.py:319-343) ─────────────────
+  // Route the rendered chat prompt through the merged BeamSearch driver (over
+  // the SYNC LLMEngine); beam_width == n, returns the n best beams as assistant
+  // choices. Streaming beam search is rejected as upstream; the AsyncLLM beam
+  // path is a named residual.
+  if (request.use_beam_search) {
+    if (request.stream) {
+      throw std::runtime_error(
+          "Streaming is not currently supported with beam search");
+    }
+    if (sync_engine_ == nullptr || beam_tokenizer_ == nullptr) {
+      throw std::runtime_error(
+          "beam search requires the synchronous engine and a tokenizer");
+    }
+    const int max_tok =
+        request.max_completion_tokens.has_value()
+            ? *request.max_completion_tokens
+            : request.max_tokens.value_or(16);
+    const BeamSearchParams params = request.to_beam_search_params(max_tok);
+    const std::vector<int32_t> prompt_ids = beam_tokenizer_->Encode(prompt);
+    const BeamSearchOutput beams = BeamSearch(
+        *sync_engine_, prompt_ids, params, beam_eos_token_id_, beam_tokenizer_);
+
+    ChatCompletionResponse response;
+    response.id = request_id;
+    response.created = created_time;
+    response.model = model_name;
+    int num_generated_tokens = 0;
+    for (std::size_t i = 0; i < beams.sequences.size(); ++i) {
+      const BeamSearchSequence& beam = beams.sequences[i];
+      ChatCompletionResponseChoice choice;
+      choice.index = static_cast<int>(i);
+      choice.message.role = kAssistantRole;
+      choice.message.content = SanitizeUtf8(beam.text.value_or(""));
+      choice.finish_reason = beam.finish_reason;
+      response.choices.push_back(std::move(choice));
+      if (beam.tokens.size() > prompt_ids.size()) {
+        num_generated_tokens +=
+            static_cast<int>(beam.tokens.size() - prompt_ids.size());
+      }
+    }
+    const int num_prompt_tokens = static_cast<int>(prompt_ids.size());
+    response.usage.prompt_tokens = num_prompt_tokens;
+    response.usage.completion_tokens = num_generated_tokens;
+    response.usage.total_tokens = num_prompt_tokens + num_generated_tokens;
+
+    ChatCompletionResult result;
+    result.streaming = false;
+    result.response = std::move(response);
+    return result;
+  }
+
   // One tool parser per request (the streaming parse is stateful); null when the
   // request has no tools (or the parser is disabled). When `tool_parser_name_`
   // is an engine-backed format (qwen3/seed_oss/kimi_k2) `parser` stays null and
@@ -758,7 +813,18 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   response.model = model_name;
 
   int num_generated_tokens = 0;
-  for (const CompletionOutput& output : final_res.outputs) {
+  // SAMPLE-BEST-OF: keep the top-n children by cumulative logprob when best_of >
+  // n. Guarded on request.best_of so the default (and plain n>1) path binds
+  // `outs` to final_res.outputs with NO copy/re-rank (child indices preserved).
+  std::vector<CompletionOutput> selected_outputs;
+  const bool trim_best_of =
+      request.best_of.has_value() && *request.best_of > request.n.value_or(1);
+  const std::vector<CompletionOutput>& outs =
+      trim_best_of
+          ? (selected_outputs =
+                 SelectBestOf(final_res.outputs, request.n.value_or(1)))
+          : final_res.outputs;
+  for (const CompletionOutput& output : outs) {
     ChatCompletionResponseChoice choice;
     choice.index = output.index;
     // Tool shaping (:857-966): with a parser + active tools, attach tool_calls

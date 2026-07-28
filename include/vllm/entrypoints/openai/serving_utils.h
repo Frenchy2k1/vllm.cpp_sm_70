@@ -27,6 +27,7 @@
 
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/logprobs.h"  // vllm::SampleLogprobs / Logprob
+#include "vllm/outputs.h"    // vllm::CompletionOutput (best_of ranking)
 
 namespace vllm::entrypoints::openai {
 
@@ -64,6 +65,17 @@ CompletionLogProbs BuildCompletionLogProbs(const std::vector<int32_t>& token_ids
 ChatCompletionLogProbs BuildChatLogprobs(const std::vector<int32_t>& token_ids,
                                          const vllm::SampleLogprobs& top_logprobs,
                                          int num_output_top_logprobs);
+
+// SAMPLE-BEST-OF: rank `outputs` by descending cumulative logprob and keep the
+// top `return_n`, RE-INDEXING them 0..return_n-1 (classic OpenAI best_of: the
+// engine generated best_of children, the endpoint returns the n best). The sort
+// is STABLE (ties keep engine order); a child with no cumulative logprob sorts
+// last. INERT — returns `outputs` unchanged — when return_n <= 0 or
+// outputs.size() <= return_n (i.e. the default best_of == n path never re-ranks
+// or re-indexes, preserving the n>1 child indices byte-for-byte). Callers guard
+// the trim on request.best_of so the default path does not even copy.
+std::vector<vllm::CompletionOutput> SelectBestOf(
+    std::vector<vllm::CompletionOutput> outputs, int return_n);
 
 }  // namespace vllm::entrypoints::openai
 

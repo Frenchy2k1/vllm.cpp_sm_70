@@ -84,7 +84,11 @@ ENGINE_PREFIXES = (
 # out into n prompt-sharing child sequences aggregated into one RequestOutput /
 # n OpenAI choices; the n==1 default path stays byte-identical). A real new engine
 # capability, `ACTIVE`, `CLAIM-C7-N-SAMPLING`.
-ENGINE_ROWS = 121
+# 122 since 2026-07-28: +`SAMPLE-BEST-OF` (the OpenAI `best_of` endpoint control —
+# generate best_of children via the SAMPLE-N fan-out, rank by cumulative logprob,
+# return the top-n; a distinct request-surface capability from raw n-sampling). The
+# best_of==n default path is byte-identical. `ACTIVE`, `CLAIM-C7-BESTOF-BEAM-API`.
+ENGINE_ROWS = 122
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
