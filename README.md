@@ -289,7 +289,7 @@ behind a model gallery, multi-model serving, the full OpenAI API surface, auth, 
 ## Consuming it as a library (C API and C++)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](include/vllm.h). It exposes a flat,
-exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 6`, 19 exported symbols) suitable for
+exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 9`, 19 exported symbols) suitable for
 `dlopen` / FFI / LocalAI integration.
 
 ```c
@@ -317,9 +317,12 @@ vllm_engine_free(engine);
 
 The ABI covers lifecycle, blocking and streaming completion, non-blocking concurrent requests,
 memory helpers, and diagnostics. Later ABI versions add structured output (v2), chat with tools and
-templates (v3), tool-parser selection (v4), reasoning-parser selection (v5), and speculative decoding
-(v6); chat templates render through the vendored google/minja engine, the same renderer llama.cpp
-ships. Full surface: [`include/vllm.h`](include/vllm.h) and [docs/STATUS.md](docs/STATUS.md).
+templates (v3), tool-parser selection (v4), reasoning-parser selection (v5), speculative decoding
+(v6), prefix caching (v7), custom logits processors (v8), and the remaining engine-sizing config the
+bundled server exposes — chunked-prefill token budget, scheduling policy and the external KV
+connector / LMCache (v9); chat templates render through the vendored google/minja engine, the same
+renderer llama.cpp ships. Full surface: [`include/vllm.h`](include/vllm.h) and
+[docs/STATUS.md](docs/STATUS.md).
 
 For C++ consumers, the higher-level surface lives under [`include/vllm/`](include/vllm/):
 `LoadedEngine::FromModelDir(...)` ([`entrypoints/model_loader.h`](include/vllm/entrypoints/model_loader.h))

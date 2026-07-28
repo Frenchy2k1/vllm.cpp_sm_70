@@ -1058,8 +1058,109 @@ TEST_CASE("capi: explicit deepseek_r1 and the 'none' opt-out both serve chat") {
   }
 }
 
+// ─── (c3) ABI v9 engine-config fields ────────────────────────────────────────
+// The v9 additions close the gap between what the bundled server can configure
+// (examples/server/main.cpp flags) and what an embedder reaches through the C
+// ABI: the chunked-prefill token budget, the scheduling policy, and the external
+// KV connector (LMCache). Each is inert at its default, so a v8 caller that
+// zero-fills the growth gets the byte-identical pre-v9 engine.
+TEST_CASE("capi: v9 engine-config fields default to inert") {
+  vllm_model_params mp = vllm_model_params_default();
+  CHECK(mp.max_num_batched_tokens == 0);  // 0 => the per-arch default.
+  CHECK(mp.scheduling_policy == nullptr);  // NULL => "fcfs".
+  CHECK(mp.kv_transfer_config == nullptr);  // NULL => no connector.
+  CHECK(mp.tokenizer_config_path == nullptr);  // NULL => <model_dir>/....
+}
+
+TEST_CASE("capi: max_num_batched_tokens passes the load gate") {
+  // A positive budget is accepted and reaches model load (which fails on the
+  // fake path with MODEL_LOAD, not INVALID_ARGUMENT).
+  vllm_model_params p = vllm_model_params_default();
+  p.model_path = "/nonexistent/vllm-cpp/model/dir";
+  p.max_num_batched_tokens = 8192;
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+}
+
+TEST_CASE("capi: scheduling_policy accepts the wire names and rejects others") {
+  for (const char* policy : {"fcfs", "priority", "lpm"}) {
+    vllm_model_params p = vllm_model_params_default();
+    p.model_path = "/nonexistent/vllm-cpp/model/dir";
+    p.scheduling_policy = policy;
+    vllm_engine* eng = nullptr;
+    CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+    CHECK(eng == nullptr);
+  }
+
+  // An unknown policy is rejected BEFORE any load attempt, so the caller gets
+  // INVALID_ARGUMENT rather than a misleading "model load failed".
+  vllm_model_params bad = vllm_model_params_default();
+  bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+  bad.scheduling_policy = "round-robin";
+  vllm_engine* eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&bad, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng == nullptr);
+  CHECK(std::string(vllm_last_error()).find("round-robin") != std::string::npos);
+
+  // Empty string is the documented "unset" spelling, same as NULL.
+  vllm_model_params empty = vllm_model_params_default();
+  empty.model_path = "/nonexistent/vllm-cpp/model/dir";
+  empty.scheduling_policy = "";
+  vllm_engine* eng2 = nullptr;
+  CHECK(vllm_engine_load(&empty, &eng2) == VLLM_ERR_MODEL_LOAD);
+}
+
+TEST_CASE("capi: kv_transfer_config parses and validates the connector name") {
+  // A well-formed config naming a REGISTERED connector passes the gate and
+  // reaches model load.
+  vllm_model_params p = vllm_model_params_default();
+  p.model_path = "/nonexistent/vllm-cpp/model/dir";
+  p.kv_transfer_config =
+      "{\"kv_connector\":\"LMCacheConnector\",\"kv_role\":\"kv_both\","
+      "\"kv_connector_extra_config\":{\"host\":\"127.0.0.1\",\"port\":65432}}";
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+
+  // Malformed JSON is a caller error, not a model-load error.
+  vllm_model_params bad = vllm_model_params_default();
+  bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+  bad.kv_transfer_config = "{not json";
+  vllm_engine* eng2 = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&bad, &eng2) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng2 == nullptr);
+
+  // An unregistered connector name is caught HERE (mirroring the server's
+  // startup check) rather than surfacing as an opaque load failure.
+  vllm_model_params unknown = vllm_model_params_default();
+  unknown.model_path = "/nonexistent/vllm-cpp/model/dir";
+  unknown.kv_transfer_config =
+      "{\"kv_connector\":\"NoSuchConnector\",\"kv_role\":\"kv_both\"}";
+  vllm_engine* eng3 = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&unknown, &eng3) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng3 == nullptr);
+  CHECK(std::string(vllm_last_error()).find("NoSuchConnector") !=
+        std::string::npos);
+}
+
+// A malformed speculative-config is a CALLER error. vllm.h has documented this
+// as VLLM_ERR_INVALID_ARGUMENT since v6; before v9 the throw fell through to the
+// generic std::exception catch and was reported as VLLM_ERR_MODEL_LOAD.
+TEST_CASE("capi: malformed speculative_config is INVALID_ARGUMENT") {
+  vllm_model_params p = vllm_model_params_default();
+  p.model_path = "/nonexistent/vllm-cpp/model/dir";
+  p.speculative_config = "{\"method\":\"no-such-method\"}";
+  vllm_engine* eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng == nullptr);
+}
+
 // ─── version / abi ───────────────────────────────────────────────────────────
 TEST_CASE("capi: version and abi-version are exposed") {
   CHECK(std::string(vllm_version()).size() > 0);
   CHECK(vllm_abi_version() == VLLM_ABI_VERSION);
+  // The engine-config growth (max_num_batched_tokens / scheduling_policy /
+  // kv_transfer_config) is ABI v9.
+  CHECK(vllm_abi_version() >= 9);
 }
