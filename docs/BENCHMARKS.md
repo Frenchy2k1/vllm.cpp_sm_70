@@ -2597,6 +2597,28 @@ I6/I7 were measured for safetensors. Reproduction for the correctness gate:
 `VT_GDN_STATE_BF16=0 VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cpu/tests/test_qwen35_gguf_spec_decode`
 (the CPU `causal_conv1d_spec_update` requires f32 conv state).
 
+### DFlash-from-GGUF axis-A loader, `SPEC-DFLASH-GGUF` GD1-GD3 (2026-07-28) - load-path correctness only, PENDING speed
+
+**Benchmark disposition: PENDING - the path is not reachable end to end yet, so
+there is nothing to measure. `benchmark_binding=false`.** A `dflash`-arch GGUF
+draft now loads (config from KVs, weights via a resolver reusing the safetensors
+`LoadQwen3DFlash` body, `.gguf` draft-path branch). No generation has been run
+through it: axis A still needs the matching Qwen3.6-27B target, which does not
+fit this box.
+
+The gate that DID run is load-path correctness against the REAL published draft
+rather than a synthetic fixture: `tests/vllm/models/test_qwen3_dflash_gguf.cpp`,
+2 cases / 47 assertions, RED-first and behavioural (dropping the `-1` on the
+target-layer offset fails the offset checks). It pins the two conventions that no
+shape or name check can catch and that point in opposite directions: the
+`+1`-offset `dflash.target_layers`, and the RAW norm storage. Regression sweep
+all unchanged: gguf_mtp 19, qwen35_gguf_spec_decode 10, gguf 103,
+gguf_qwen36_loader 99, gguf_keep_quant 5958, ops_gdn 1825, llm_engine 196,
+capi 232, runner 257.
+
+**Owed later, on GPU:** the axis-A token-identity gate and an acceptance number,
+mirroring how `SPEC-DFLASH` itself was measured. Not owed by a loader row.
+
 ### DFlash-from-GGUF asset survey, `SPEC-DFLASH-GGUF` D0 (2026-07-28) - survey only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - an availability survey, zero code.

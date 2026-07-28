@@ -29741,3 +29741,42 @@ the MTP row.
 Standing lesson, now twice-confirmed on this track: for a format produced by a
 tool we do not own, read the CONVERTER, not the artifact. Shape checks catch
 layout; they never catch convention.
+
+## 2026-07-28 — `SPEC-DFLASH-GGUF` GD1-GD3 LANDED: the axis-A loader works
+
+A DFlash draft packaged as a single `dflash`-arch GGUF now loads.
+
+- **GD1** `MakeDflashGgufConfig` - HfConfig from the `dflash.*` KVs, undoing the
+  `+1` target-layer offset, rebuilding `raw["dflash_config"]` + `raw["block_size"]`
+  so downstream `config.raw` readers are untouched, and leaving `vocab_size` 0
+  because the draft shares the target's lm_head.
+- **GD2** `LoadQwen3DFlashFromGguf` - a `TensorResolver` over dequantized bf16
+  views, delegating to the EXISTING `LoadQwen3DFlash`, so its qkv / gate_up row
+  concatenation is reused rather than reimplemented.
+- **GD3** `IsDflashGgufDraft` + the `.gguf` branch in `ResolveDflashDraftDir` /
+  `LoadDflashDraft`. Target-shared embed/lm_head still come from `target_shards`.
+
+**Design note worth keeping: the resolver seam is right HERE and was wrong for
+the MTP head, for a concrete reason rather than taste.** The MTP head lives
+inside a Qwen3.5 TRUNK GGUF whose norms are `(w + 1)` and whose matmuls carry the
+trunk's keep-quant routing - conventions that live in the trunk loader's helpers,
+so the head had to reuse them directly. A DFlash draft is its OWN file written by
+`DFlashModel(Qwen3Model)`, which inherits NO norm shift, so bf16 resolver views
+reproduce the safetensors layout faithfully and the whole existing loader body
+applies unchanged. Same-looking problem, opposite correct answer.
+
+**Gate:** `tests/vllm/models/test_qwen3_dflash_gguf.cpp` 2 cases / 47 assertions
+against the REAL published Qwen3.6-27B draft (env-gated, CI asset-free).
+RED-first BEHAVIOURAL: dropping the `-1` fails the offset checks. It asserts the
+offset against the KV read back from the same file rather than hard-coded values,
+so it stays valid for any dflash draft. Regression sweep unchanged: gguf_mtp 19,
+qwen35_gguf_spec_decode 10 (the MTP spec gate still green), gguf 103,
+gguf_qwen36_loader 99, gguf_keep_quant 5958, ops_gdn 1825, llm_engine 196,
+capi 232, runner 257.
+
+**Why `PARTIAL`, not more.** Nothing has GENERATED through this path. Axis A's
+token gate needs the matching Qwen3.6-27B target (~55 GB) which does not fit
+here, and axis B (GGUF target as well, requiring the `SharedHeadSource` retype of
+`LoadDflashDraft`) is untouched. The loader is gated at the load level only, and
+the MTP row is the standing reminder that load-level green is not end-to-end
+green.

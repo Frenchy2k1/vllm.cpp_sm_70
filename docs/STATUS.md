@@ -514,24 +514,22 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `VLLM_ERR_INVALID_ARGUMENT` rather than `VLLM_ERR_MODEL_LOAD` (the contract
   `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
   backend) could not expose LMCache or the prefill budget in a model config.
-- **DFlash from GGUF is SPIKED with its contract CONFIRMED, not yet implemented**
-  (`SPEC-DFLASH-GGUF`, [spike](../.agents/specs/gguf-dflash-draft.md)). The
-  `dflash` GGUF contract is now verified against a real published draft rather
-  than read off llama.cpp's constants: architecture `dflash`, `fc` /
-  `enc.output_norm` / `output_norm` plus the per-block tensors, `dflash.block_size`,
-  `dflash.target_layers` (whose length is `num_taps`), and the mask token on the
-  standard tokenizer KV. No `token_embd` / `output`, confirming the draft shares
-  the target's embedding and lm_head. No conversion run was needed - pre-converted
-  drafts are published at ~1 GB. Its work rows are `GD0`-`GD8`, renamed off the
-  landed DFlash track's own `D0`-`D13` after a collision was spotted. The loader
-  rows can proceed from the draft alone. Two off-by-one traps are already
-  resolved from the converter's source, both invisible to name/shape checks and
-  pointing OPPOSITE ways: the draft's RMSNorm weights are stored RAW (its
-  converter class does not inherit the Qwen3Next `+1` shift, so unlike the trunk
-  and the MTP head it must NOT be un-shifted), and `dflash.target_layers` is
-  written offset by `+1` (so the tap indices must be decremented). Copying the
-  MTP loader by analogy would have been quietly wrong on both;
-  only the end-to-end gates need the matching (expensive) target.
+- **DFlash from GGUF: the axis-A loader is IMPLEMENTED** (`SPEC-DFLASH-GGUF`,
+  `PARTIAL`, [spike](../.agents/specs/gguf-dflash-draft.md)). A DFlash draft
+  packaged as a single `dflash`-arch GGUF now loads: config from the `dflash.*`
+  KVs, weights through a resolver that reuses the existing safetensors
+  `LoadQwen3DFlash` body (so its qkv / gate_up row concatenation is shared), and
+  a `.gguf` branch in the draft-path resolution. The target-shared embedding and
+  lm_head still come from the target, as the GGUF contract intends. Gated at 47
+  assertions against the real published Qwen3.6-27B draft, RED-first, with every
+  GGUF/GDN/engine suite unchanged.
+  Two conventions this had to undo, BOTH invisible to shape and name checks and
+  pointing OPPOSITE ways: `dflash.target_layers` is stored `+1`-offset, and the
+  draft's RMSNorm weights are RAW (its converter class does not inherit the
+  Qwen3Next `+1` shift, so unlike the trunk and the MTP head they must NOT be
+  un-shifted). `PARTIAL`: the end-to-end token gate needs the matching
+  Qwen3.6-27B target and has not run, and axis B (GGUF target as well) is
+  untouched.
 - **MTP speculative decoding from a GGUF target WORKS** (`SPEC-MTP-GGUF`,
   `GATING`, [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads
   from a head-carrying GGUF - `HfConfigFromGguf` republishes the depth it already

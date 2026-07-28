@@ -343,6 +343,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
   src/vllm/model_executor/models/qwen3_dflash.cpp
+  src/vllm/model_executor/models/qwen3_dflash_gguf.cpp
   src/vllm/model_executor/models/qwen3_dflash_weights.cpp
   src/vllm/model_executor/models/qwen3_moe_registry.cpp
   src/vllm/model_executor/models/qwen3_moe_weights.cpp
