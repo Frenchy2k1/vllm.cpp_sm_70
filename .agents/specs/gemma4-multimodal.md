@@ -227,6 +227,79 @@ not by Whisper/Voxtral.
 
 ---
 
+## G1 — TEXT backbone LANDED (2026-07-28, `CLAIM-GEMMA4-G1`)
+
+The Gemma-4 **text backbone** (`Gemma4ForConditionalGeneration` language_model
+stack of `unsloth/gemma-4-E4B-it`) is implemented as NEW additive files —
+`include/vllm/model_executor/models/gemma4.h`,
+`src/vllm/model_executor/models/{gemma4,gemma4_weights,gemma4_registry}.cpp` —
+mirroring the OLMo-2/gemma3 registration seam (one `REGISTER_VLLM_MODEL` line, no
+shared-array edit). CPU `-Werror` 0-warn on all three TUs + full `libvllm.a` link
+(SACRED inertness: the whole existing model set still builds).
+
+### G1.0 E4B config — which primitives are actually ON
+
+From `unsloth/gemma-4-E4B-it` `text_config` (fetched HF, 2026-07-28): hidden 2560,
+42 layers, GQA 8/2, head_dim 256 / **global_head_dim 512**, intermediate 10240,
+`hidden_size_per_layer_input` 256, `num_kv_shared_layers` 18, sliding_window 512,
+`final_logit_softcapping` 30.0, vocab 262144, tie_word_embeddings true. Crucially
+**`enable_moe_block=false`, `attention_k_eq_v=false`, `use_double_wide_mlp=false`**
+→ the Gemma-4 MoE router / per_expert_scale, k_eq_v, and double-wide MLP are OFF
+for E4B and are the ≥12B-checkpoint follow-on, NOT G1.
+
+### G1.1 Primitive-by-primitive port map (grounded, file:line)
+
+| Primitive | vLLM ground | Our realization | REUSE / NEW |
+|---|---|---|---|
+| **PLAIN RMSNorm** (`x·w`, NOT gemma `(1+w)`) | `gemma4.py:45` imports `layernorm.RMSNorm` (not `GemmaRMSNorm`); used at every norm | `vt::RmsNorm(...,{eps,false})` | REUSE (the `gemma=false` mode) — **the load-bearing divergence from gemma2/3** |
+| **PLE** (Per-Layer Embeddings) | `gemma4.py:986-1063` (tables) + `:845-898` (combine) + `:680-761` (per-layer gate/proj/norm) | `embed_tokens_per_layer` lookup·√ple + `per_layer_model_projection`·h^-0.5 → RMSNorm → `(proj+emb)·rsqrt2`; per layer `gelu(gate_lin(h))*ple` → proj → norm → add | NEW wiring; the gate reuses `vt::GeluAndMul` on `[gate_lin ‖ ple]` (no elementwise-Mul op exists) |
+| **YOCO KV-sharing** | `gemma4.py:463-489`, forward `:535-548` | shared layers (24-41) read the target layer's cache (sliding→22, full→23) IN-forward, compute no K/V | NEW (in-forward target-cache index; no runner aliasing) |
+| **heterogeneous head_dim** 256/512 | `gemma4.py:572-578` | per-layer `Dh` threaded through the attn block | NEW |
+| **proportional partial-RoPE** (full) | `gemma4_rope.py` (head_dim denom + zero-pad), `rope_parameters.full_attention` (θ 1e6, pf 0.25 → rotary 128/512) | custom host cos/sin cache → `vt::RopeFromCache` | REUSE `RopeFromCache` + NEW cache builder |
+| **standard sliding rope** | `rope_parameters.sliding_attention` (θ 1e4, full 256) | `vt::RopeNeox` | REUSE |
+| **weight-less V-norm** | `gemma4.py:437` `has_weight=False` | `vt::RmsNorm` with a ones[Dh] weight (identity) | REUSE |
+| **GeGLU MLP** | `gemma4.py:224-254` `gelu_pytorch_tanh` | `vt::GeluAndMul` | REUSE (gemma2/3 W1 primitive) |
+| **√hidden embed-scale** | `gemma4.py:1067-1074` | `vt::MulScalar` bf16 normalizer | REUSE |
+| **per-layer scalar** | `gemma4.py:707,765` `layer_scalar` [1] | host-read bf16 → `vt::MulScalar` | REUSE |
+| **final logit soft-cap 30** | `gemma4.py:1569-1572` | `vt::SoftCap` | REUSE (gemma2 W3 primitive) |
+| **tied lm_head** | `gemma4.py:1566-1567` | `MatmulBT` over embed table | REUSE |
+
+Residual pattern is standalone-norm + explicit `vt::Add` (NOT the gemma2/3 fused
+add-norm sandwich), because PLE + `layer_scalar` intervene after the second add.
+
+### G1.2 Weight loader — VERIFIED (no download)
+
+`LoadGemma4ForConditionalGenerationWeights` strips the `model.language_model.`
+prefix and skips the mm towers (`audio_tower`/`vision_tower`/`embed_audio`/
+`embed_vision`, per `gemma4.py:1716-1723`). VERIFIED against the real E4B
+safetensors HEADER (HTTP range, no 16 GB download): 2130 total tensors; every one
+of the 336 `language_model.*` names + shapes matches the loader's expected map
+(incl. per-layer q/k/v/o at the correct 256/512 head widths, PLE tables, per-layer
+gate/proj/norm, `layer_scalar` [1], tied embeddings). Shared layers (24-41) DO
+carry their own q/k/v_proj in the checkpoint (loaded but K/V discarded at forward).
+
+### G1.3 HONEST e2e GATE STATUS — BLOCKED on runner KV topology (named)
+
+The strict 32/32 gate vs `tests/parity/goldens/gemma4_e4b_text/gen_manifest.json`
+(golden `[236776, 2455, 5192, ...]`) is **NOT reached this pass**, and the reason is
+precise, not a numeric divergence: the runner allocates **one uniform KV head_dim**
+per non-GDN layer (`src/vllm/v1/worker/gpu/runner.cpp:600-646`, `attn_kv_` built
+with a single `Hkv`/`Dh`). Gemma-4's per-layer **256 (sliding) / 512 (full)** head
+dims cannot be represented without a shared-path change to `attn_kv_` construction
+(per-layer/per-group head_dim). The forward's per-layer
+`VT_CHECK(kv.head_size == Dh)` turns this into an explicit failure rather than a
+silent wrong answer. This is the additive-vs-shared-path boundary: G1 is clean
+additive files; the KV-topology change is a runner edit deferred to **G-next**.
+
+**G-next (to reach strict 32/32):** (1) runner heterogeneous per-layer KV head_dim
+(+ optional YOCO cache aliasing to reclaim the 18 shared caches' memory); (2) a full
+CUDA build + STRICT gate on dgx under `flock`; (3) verify the two named bf16-rounding
+nuances (the f32-accumulated PLE combine in vLLM vs our per-op bf16; the proportional
+cos/sin cache dtype) do not perturb the token match. G2 (SigLIP vision, reuses M2a)
+and G3 (USM-Conformer audio) remain separate and unbuilt.
+
+---
+
 ## 1. Per-model / per-modality DISPOSITION
 
 | Target | Image | Video | Audio | Disposition |
