@@ -206,15 +206,26 @@ Scope note: there is NO CPU spec-decode gate anywhere in the tree. `SPEC-MTP`
 I5d/I5e/I6/I7 were all gated on GB10, so this is plausibly the first end-to-end
 CPU spec run, and the divergence is plausibly as old as the widened-cache work.
 
-**Lead, NOT a diagnosis.** `CausalConv1dSpecUpdateKernel`
-(`src/vt/cpu/cpu_ops.cpp:1010+`) computes `off = num_accepted_tokens[i] - 1` and
-then guards the state read with `src < state_len` ONLY - no `src >= 0`. At
-`num_accepted_tokens == 0` that reads `srow[-1]`. Whether `nat` can be 0 here
-(upstream treats it as accepted-drafts + 1, so >= 1) is unverified. Worth
-checking FIRST because it is cheap; it is not established as the cause. Note the
-op-level suites pass on CPU (`test_ops_gdn` 1825, `test_qwen3_5_gdn_spec_routing`
-12), so if this is it, it is a call-site/bookkeeping issue rather than kernel
-math.
+**First lead RAISED AND REFUTED (do not re-chase).**
+`CausalConv1dSpecUpdateKernel` (`src/vt/cpu/cpu_ops.cpp:1010+`) computes
+`off = num_accepted_tokens[i] - 1` and guards the state read with
+`src < state_len` only, with no `src >= 0`, so a zero `nat` would read
+`srow[-1]`. It cannot: `src/vllm/v1/worker/gpu/runner.cpp:1187` clamps
+`num_accepted_tokens[i] = ns > 1 ? ns : 1`, so `nat >= 1` and `off >= 0` always.
+The missing `>= 0` guard is a latent robustness gap, not this bug.
+
+**Where to look next.** The op-level CPU suites PASS (`test_ops_gdn` 1825,
+`test_qwen3_5_gdn_spec_routing` 12), so the kernels are bit-exact and the defect
+is in what the runner FEEDS them. The spec-only branch that has no non-spec
+counterpart is the GDN metadata spec overload,
+`src/vllm/v1/worker/gpu/runner.cpp:896-925`: `num_decode_draft_tokens` (-1 for a
+non-spec row, else the scheduled draft count), the PREVIOUS step's
+`num_accepted_tokens`, and the k+1 GDN state-slot remap behind `gdn_bt`. That
+triple is what changes the target's own recurrent state under speculation, which
+is exactly the observed symptom (target output moves with speculation ON even at
+zero acceptance). Suggested next probe: assert spec-ON vs spec-OFF equality of
+the GDN state itself after step 1 on a 1-token prompt, which localises to the
+state feed without needing a full generation.
 
 **Reproduction:**
 `VT_GDN_STATE_BF16=0 VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cpu/tests/test_qwen35_gguf_spec_decode`
