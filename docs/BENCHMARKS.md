@@ -451,6 +451,16 @@ all-reduce ~10.2 GB/s / sendrecv ~9 GB/s over the 200GbE RoCE link (raw RDMA
 HW-blocked (no ≥2-GPU box / 2-Spark cable / 2-Mac cluster here). Spec + seam map
 + W-plan: [scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
 No source/engine path touched.
+**Scale-out W1 — `vt::Communicator` + CPU collective gate (2026-07-28,
+`CLAIM-SCALE-OUT-W1`, NOT pushed).** Disposition: **NOT APPLICABLE (infra /
+correctness brick; `benchmark_binding=false`; no speed number owed at spike per
+the spec §Gates).** W1 landed the collective abstraction + a CPU in-process
+multi-rank transport, gated by a real cross-rank AllReduce/AllGather correctness
+test (`tests/vt/test_communicator.cpp`, 50/50 assertions, RED-verified) and a
+byte-identical `world_size==1` no-op. Pure CPU, no GPU, no model run — a
+throughput comparison is meaningless here and is not owed until the NCCL/RoCE
+transports and TP/PP forwards land on a ≥2-GPU host (W3+). No
+performance-relevant source/engine path touched.
 
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —

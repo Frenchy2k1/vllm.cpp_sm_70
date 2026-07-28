@@ -82,12 +82,17 @@ express TP/PP ONCE against a single `vt::Communicator` / process-group abstracti
 backend-specific transports — NCCL (kCUDA), RDMA/TCP (Spark), MLX-ring (kMETAL) —
 mirroring vLLM's `device_communicators`. The backend-matrix carries the stable
 rows `BACKEND-DISTRIBUTED-COMM`/`-TP`/`-PP`/`-MULTINODE-SPARK`/`-MLX-RING`.
+**W1 landed (2026-07-28, `CLAIM-SCALE-OUT-W1`):** the `vt::Communicator`
+abstraction + a CPU in-process multi-rank transport is proven with a real
+cross-rank AllReduce/AllGather gate (NO GPU) and a byte-identical `world_size==1`
+no-op — `BACKEND-DISTRIBUTED-COMM` is now `ACTIVE`; the other 4 rows stay `SPIKE`
+(HW/registry-gated).
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
 | Tensor parallel (TP) | `distributed/`, `layers/linear.py:418/1612/1766` | 🚧 T2 (spike written) | weight-stacking semantics already ported (single-GPU shape); seams file:line-mapped (`dense_attn_block.h:342,513-530`, weight chokepoint `dense_weight_loaders.h:131-138`); ⚠ impl needs a 2-GPU box (GB10 is single-GPU). Row `BACKEND-DISTRIBUTED-TP` | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
 | Pipeline parallel (PP) | `models/utils.py:785/798`, `parallel_state.py:957` | 🚧 T2 (spike written) | PPMissingLayer + stage send/recv + executor fan-out (`executor.cpp:7-34`); row `BACKEND-DISTRIBUTED-PP` | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
-| Collective / process-group abstraction | `base_device_communicator.py:147`, `parallel_state.py:358` | 🚧 T2 (spike written) | the unifying `vt::Communicator`; new collective `OpId`s via `OpProvider`; `world_size==1` byte-identical; row `BACKEND-DISTRIBUTED-COMM` | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
+| Collective / process-group abstraction | `base_device_communicator.py:147`, `parallel_state.py:358` | ✅ W1 LANDED (CPU exact-gate) | the unifying `vt::Communicator` (`include/vt/communicator.h` + `src/vt/communicator.cpp`): `rank`/`world_size` + AllReduce(sum/max/min/prod)/AllGather/Send/Recv, stream-ordered on a `Queue&`. CPU **in-process multi-rank** transport (N ranks = N host threads over one barrier+staging+mailbox) — `tests/vt/test_communicator.cpp` 8 cases/50 assertions (2/4-rank AllReduce+AllGather exact, Send/Recv rendezvous, RED-verified) + `world_size==1` byte-identical no-op. W2+: collective `OpId`/`OpProvider` routing + NCCL/RoCE/MLX transports. Row `BACKEND-DISTRIBUTED-COMM` (`ACTIVE`, `CLAIM-SCALE-OUT-W1`) | [specs/scale-out-distributed.md](specs/scale-out-distributed.md) |
 | Expert parallel (EP) + EPLB | `v1/worker/gpu/eplb_utils.py` | ☐ T2 | scoped as the MoE shard within `BACKEND-DISTRIBUTED-TP` (EPLB beyond) | `planned: specs/expert-parallel.md` |
 | Data parallel (DP) | `config/parallel.py` | ☐ T2 | | `planned: specs/data-parallel.md` |
 | MoE sequence parallelism without DP | `config/parallel.py::use_sequence_parallel_moe`, `distributed/parallel_state.py` | ☐ T2 | v0.25.0 adds the non-DP path and reports 1.9–5.0% E2E throughput; inventory row `PAR-SEQUENCE-MOE` | `planned: specs/sequence-parallel-moe.md` |

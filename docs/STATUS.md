@@ -119,9 +119,14 @@ multi-GPU tensor+pipeline parallel, multiple DGX Sparks over the ConnectX-7
 across 2×119 GiB Sparks), and MLX multi-node over Thunderbolt — all expressed
 ONCE against one `vt::` collective / process-group abstraction with
 backend-specific transports (NCCL / RDMA / MLX-ring), mirroring vLLM's
-`device_communicators`. `world_size==1` stays byte-identical. No implementation,
-no gate run; correctness gating is HW-blocked (no ≥2-GPU box, no 2-Spark cable,
-no 2-Mac cluster here). Full scope + seam map:
+`device_communicators`. `world_size==1` stays byte-identical. **W1 landed
+(2026-07-28) the collective ABSTRACTION leg**: `vt::Communicator`
+(`include/vt/communicator.h` + `src/vt/communicator.cpp`) with
+AllReduce/AllGather/Send/Recv, proven by a CPU in-process multi-rank gate
+(`tests/vt/test_communicator.cpp`, a real cross-rank sum, no GPU) and a
+byte-identical `world_size==1` no-op. The multi-GPU (TP/PP), multi-Spark, and
+MLX transports remain unbuilt — those legs are HW-blocked (no ≥2-GPU box, no
+2-Spark cable, no 2-Mac cluster here). Full scope + seam map:
 [.agents/specs/scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
 Multimodal
 (image/video/audio) is correctness-complete; its OpenAI-server wiring has landed

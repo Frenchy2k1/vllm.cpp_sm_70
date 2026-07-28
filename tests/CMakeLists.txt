@@ -519,6 +519,14 @@ vllm_cpp_add_test(test_op_provider vt/test_op_provider.cpp)
 # native-wins / observability contract. Hardware-free — a fake backend on the
 # unused kXPU slot stands in for a unified accelerator, so it runs on every build.
 vllm_cpp_add_test(test_reference_tier vt/test_reference_tier.cpp)
+# Scale-out W1 (scale-out-distributed.md §W1): the vt::Communicator collective
+# abstraction proven on the CPU in-process multi-rank transport — 2/4-rank
+# AllReduce-sum + AllGather correctness, Send/Recv rendezvous, and the
+# world_size==1 byte-identical no-op that keeps the single-GPU path untouched.
+# Hardware-free (N host threads share one barrier); needs threads.
+vllm_cpp_add_test(test_communicator vt/test_communicator.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(test_communicator PRIVATE Threads::Threads)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 # QUANT-GGUF-CIQ-GEMM G1: block dtypes, the quant traits table and its
