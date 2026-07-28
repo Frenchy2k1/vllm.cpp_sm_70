@@ -30169,3 +30169,74 @@ concurrent session's writes), and removing the 15 GiB E4B restored it to 17 GiB 
 The committed golden JSON is the durable W0 anchor; the ungated E4B re-fetches in ~3
 min for G1. Records + golden fixture + one capture script only; ZERO src/kernel/CMake/
 model edits (every model/regression gate inert by construction); not pushed.
+---
+
+## 2026-07-28 — `QUANT-GGUF-NVFP4`: ggml type 40 dequant, container MEASURED not assumed
+
+`SPEC-MTP-GGUF`'s GPU end-to-end gate was blocked by
+`gguf dequant: unsupported ggml type 40 (NVFP4)`. Type 40 now dequantizes, and the
+container was determined by BYTE-COMPARING the real files rather than inferred from
+the fork sources.
+
+**The finding that mattered: `.agents/specs/gguf-nvfp4-notes.md` was RIGHT about the
+geometry and WRONG (for our files) about self-containment.** The killgate fork it was
+mined from writes self-contained `block_nvfp4`. The GGUFs we actually have to load
+(`dgx.casa:~/bench/q36-27b-nvfp4.gguf`, `~/bench/q36-35b-a3b-nvfp4.gguf`) are
+`compressed-tensors` `nvfp4-pack-quantized` REPACKS and carry a per-tensor
+`<stem>.scale` f32 sidecar TENSOR (plus an unused W4A4 `.input_scale`). Their blocks
+alone do NOT determine the weight; without the sidecar every weight is off by ~1e4,
+finite and plausible. Sec 5 of the spec is now the binding, measured description.
+
+Measured (byte-level, vs the `~/bench/q36-27b-nvfp4-vllm/` safetensors of the SAME
+quantization run):
+- `d[4]` fp8-e4m3 sub-block scales FIRST, then `qs[32]`, 64 elems / 36 bytes. The
+  scale bytes are BYTE-IDENTICAL across containers, so they are IEEE fp8-e4m3fn, not
+  a ggml UE4M3 variant.
+- ggml SPLIT-HALF nibble order: byte `j` of sub-block `s` holds element `j` low and
+  `j+8` high. NOT the torch pairwise order `nvfp4_dequant.cpp` reads.
+- `<stem>.scale` is bit-identical to `float32(1)/float32(weight_global_scale)`, i.e.
+  the modelopt `weight_scale_2` MULTIPLY convention, checked on 5 tensors.
+- Stacked experts carry ONE scale PER EXPERT (`[256]` on the 35B), expert axis
+  slowest, so a slab is whole rows / whole blocks.
+- `blk.N.ssm_out` is NVFP4 in both containers but NOT raw-comparable: it also carries
+  the GGUF v-head TILING, and the tiled->grouped mapping is EXACTLY the
+  `ReorderVCols` the loader already applies (verified on layer 0, 48/48 heads). So
+  that is not an NVFP4 question and is excluded from the cross-format sweep.
+- The 27B GGUF quantizes MORE than its safetensors sibling (the recipe ignores the
+  GDN `in_proj_*` family, which the GGUF stores as NVFP4 anyway), so the oracle
+  covers the MLP projections + ssm_out only.
+
+Implementation: `GgmlTypeNeedsGlobalScale` + 4-argument `DequantGgufRowTo{F32,Bf16}`
+overloads (`gguf_dequant.{h,cpp}`), the case-40 decode reusing `kE2M1Lut` /
+`F8E4M3ToF32` from `nvfp4_dequant.h` so the two containers cannot drift, and
+`GgufGlobalScales` / `DqSlabs` in `qwen3_5_gguf_weights.cpp` to resolve the sidecar
+and loop expert slabs. **DECISION: the 3-argument entry points THROW for type 40
+rather than defaulting to 1.0** — a silent per-tensor factor is exactly the
+degradation this row must not ship. Symmetrically, passing a non-1.0 scale to a
+self-contained encoding throws instead of being ignored.
+
+Gates: `tests/vllm/test_gguf_nvfp4.cpp` 7/7 cases, 2189/2189 assertions on CPU
+(real bytes from BOTH containers in `tests/vllm/gguf_nvfp4_goldens.inc`,
+regenerable with `scripts/gen-gguf-nvfp4-goldens.py`); asset-gated full-file sweep on
+dgx under `flock $HOME/gpu.lock` compared **192 NVFP4 tensors across both containers
+with zero differing elements** (6/6, 2718/2718, exit 0). TWO deliberate mutants,
+both caught: torch pairwise nibbles failed on 1686/2048, 1935/2048, 1678/2048 VALUES;
+`scales[0]`-for-every-expert failed 12 assertions. Regression sweep unchanged
+(gguf, gguf_dequant, gguf_keep_quant, gguf_qwen36_loader, qwen3_5_gguf_mtp, ops_gdn,
+capi, nvfp4_dequant, ct_nvfp4_emulation, model_loader_gguf, ops_quant_traits).
+
+**Row is `PARTIAL`, not `DONE`, and the honest residuals are named:**
+- `C` absent: no `vt::DType`, no `vec_dot`, so keep-quant correctly expands NVFP4.
+  A native NVFP4 GGUF GEMM is separate, unstarted work.
+- `E` absent: **dequant alone does NOT load the 27B/35B models end to end.**
+  `SPEC-MTP-GGUF`'s GPU gate has its FIRST blocker removed, not its last one; the
+  remaining gaps are model-level and were not chased in this change.
+- The load-time routing audit does not observe the `.scale` / `.input_scale`
+  sidecars (they are read directly, not routed), so a totality assertion over a real
+  NVFP4 file would count them unrouted.
+
+Records (ONE commit): `specs/gguf-nvfp4-notes.md` (rewritten head + spike record +
+Sec 5/6), `quantization-matrix.md` (`QUANT-GGUF-NVFP4` INVENTORIED -> PARTIAL, no new
+row so `ENGINE_ROWS` unchanged), `docs/STATUS.md` (capability row + the MTP-GGUF
+blocker paragraph), `docs/BENCHMARKS.md` (NOT APPLICABLE, loader-only, with the
+correctness evidence), this log.

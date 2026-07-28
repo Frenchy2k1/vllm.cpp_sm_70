@@ -62,7 +62,7 @@ token-for-token correctness against the pinned oracle.
 | InternLM3 (`InternLM3ForCausalLM`, Llama alias) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm3-8b-instruct): 14/16 strict + 2/16 bf16 near-ties (max gap 0.0 nats), 0 divergent; a plain Llama architecture in vLLM 0.25.0 (registered as a one-line Llama alias; dynamic-NTK RoPE factor 6.0, GQA kv=2, untied lm_head), not InternLM2 + sliding window; zero forward or loader delta |
 | Long-context RoPE + sliding-window attention | Correctness feature-positive on GB10, speed-pending | Shared scaled-RoPE (YaRN, Llama-3, Phi-3/4 LongRoPE, dynamic-NTK) + sliding-window attention, GPU-gated vs the vLLM 0.26 oracle: LongRoPE (Phi-4-mini) + llama3 (Llama-3.2-1B) + dynamic-NTK (InternLM2) 16/16, sliding-window (Gemma-2/Gemma-3) 48/48, operator local-mask kernel positive. YaRN and chunked-local model e2e are reachable-blocked (no cached vehicle); speed pending |
 | Safetensors loading | Supported | Both gate models plus every registered dense/MoE family |
-| GGUF loading (F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) | Supported; compute-in-quant on CPU | Weights in six block encodings stay compressed from file to matmul on CPU (no BF16 expansion) |
+| GGUF loading (F32/F16/BF16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/NVFP4) | Supported; compute-in-quant on CPU for the six block encodings; NVFP4 is materialize-only | Weights in six block encodings stay compressed from file to matmul on CPU (no BF16 expansion). NVFP4 (ggml type 40) now DEQUANTIZES, including the per-tensor (per-expert) `<stem>.scale` sidecar the container keeps outside the blocks; gated BIT-EXACT against the compressed-tensors NVFP4 path on real Qwen3.6-27B bytes from both containers. It expands to bf16 (no NVFP4 GGUF GEMM), and no NVFP4 GGUF model has been run end to end |
 | CPU backend vs llama.cpp | At or ahead on every axis (GGUF) | Prefill 1.18x ahead, decode at parity, peak memory 1.01x, byte-identical greedy tokens. Single-stream only; no concurrent-serving comparison has been measured |
 | Paged KV cache + prefix caching | Supported | Block-paged full attention, hybrid full-attention + GDN state groups, automatic prefix caching (APC) on by default for dense models (cache-ON gated end to end: token-identical output, cache hits, faster TTFT) |
 | KV offload to CPU / disk | Built, opt-in, off by default; the disk connector is engine-refused | CPU and disk tiers with identity-checked blocks, selected by `--kv-transfer-config` (or programmatically) over one abstract KVConnector ABI. Worker-side KV store/load is implemented for the LMCache connector only; the CPU/disk connector is scheduler-side only, so the engine now REFUSES it at construction (a loud error, not silently wrong output). Guide: [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
@@ -631,15 +631,16 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   Gated on CPU against a real llama.cpp-converted Qwen3.5-2B: **spec-ON output is
   token-identical to spec-OFF with 13 drafts proposed / 11 accepted**, plus an
   `ngram` regression guard. A GGUF exported without the head is refused, naming
-  that as the reason. `GATING` rather than `DONE`: the GPU end-to-end run was
-  ATTEMPTED and is BLOCKED - every head-carrying GGUF on the GPU box is NVFP4 and
-  GGUF dequant does not implement type 40 (`unsupported ggml type 40 (NVFP4)`),
-  so both cases threw at load with ZERO GPU work. That is a pre-existing engine
-  gap, not a defect in this row. The loader gate DID pass 18/18 there against the
-  35B A3B MoE GGUF, exercising the MoE head branch on real weights for the first
-  time (the head block's own tensors are not NVFP4) - a loader result, with no
-  MoE inference run. Still outstanding: a GPU end-to-end run on a dequantable
-  head-carrying GGUF, cross-format agreement, and a throughput number.
+  that as the reason. `GATING` rather than `DONE`: the GPU end-to-end run is
+  still outstanding. Its FIRST blocker is now REMOVED - GGUF dequant implements
+  ggml type 40, so `unsupported ggml type 40 (NVFP4)` no longer stops the load
+  (`QUANT-GGUF-NVFP4`, `PARTIAL`); the earlier attempt threw there with ZERO GPU
+  work. The loader gate DID pass 18/18 against the 35B A3B MoE GGUF, exercising
+  the MoE head branch on real weights for the first time (the head block's own
+  tensors are not NVFP4) - a loader result, with no MoE inference run. Still
+  outstanding: an actual GPU end-to-end run on a head-carrying NVFP4 GGUF (which
+  needs more than the dequant), cross-format agreement, and a throughput
+  number.
 - **Speculative decoding on CPU corrupted the target's own state, and is FIXED**
   (`CPU-SPEC-DIVERGENCE`). `qwen3_5.cpp:3616` sized the GDN state gather/scatter
   row by `(Kw-1)` while the speculative persistent row is `(Kw-1)+num_spec`, so

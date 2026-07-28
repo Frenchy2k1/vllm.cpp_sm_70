@@ -2795,6 +2795,48 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
+### NVFP4 in the GGUF loader, `QUANT-GGUF-NVFP4` (2026-07-28) - correctness only, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE. `benchmark_binding=false`.** This row
+adds a LOADER materialization path (ggml type 40 -> bf16) and no compute path,
+so there is nothing whose speed is comparable to vLLM or to llama.cpp. NVFP4 has
+no `vt::DType` block encoding and no `vec_dot`, so `RouteGgufTensor` expands it
+like any unported encoding; a keep-quant residency and a native NVFP4 GGUF GEMM
+are separate, unstarted work, and THOSE will owe a number. Load time was not
+measured either: it is dominated by the mmap/expand path this change does not
+touch.
+
+The correctness result IS binding, and it is a cross-format equivalence rather
+than a hand-written expectation. The two NVFP4 containers we support hold the
+SAME quantization of the SAME Qwen3.6-27B weights, so the GGUF dequant and the
+already-gated compressed-tensors path must agree BIT for BIT:
+
+    CI (asset-free, real bytes from both containers embedded)
+      tests/vllm/test_gguf_nvfp4.cpp          7/7 cases, 2189/2189 assertions
+    Asset-gated full-file sweep, dgx.casa, under flock $HOME/gpu.lock
+      VLLM_NVFP4_GGUF=~/bench/q36-27b-nvfp4.gguf
+      VLLM_NVFP4_ST=~/bench/q36-27b-nvfp4-vllm/model.safetensors
+      -> compared 192 NVFP4 tensors across both containers, 0 differing
+         elements, 6/6 cases, 2718/2718 assertions, exit 0
+
+The container was MEASURED, not assumed (`.agents/specs/gguf-nvfp4-notes.md`
+Sec 5): fp8-e4m3 sub-block scale bytes byte-identical between containers, the
+ggml SPLIT-HALF nibble order, and a per-tensor `<stem>.scale` f32 sidecar TENSOR
+bit-identical to `float32(1)/float32(weight_global_scale)`.
+
+Two deliberate mutants, both caught, so the gates discriminate behavior and not
+merely a symbol: the plausible torch PAIRWISE nibble order failed on 1686/2048,
+1935/2048 and 1678/2048 VALUES; reusing `scales[0]` for every expert failed 12
+assertions on the MoE per-expert case. Regression sweep unchanged on the same
+build: gguf 30/103, gguf_dequant 13/215, gguf_keep_quant 36/5958,
+gguf_qwen36_loader 3/99, qwen3_5_gguf_mtp 2/2, ops_gdn 58/1825, capi 33/232,
+nvfp4_dequant 4/47, ct_nvfp4_emulation 6/81, model_loader_gguf 3/3,
+ops_quant_traits 8/5615.
+
+Reproduction: `cmake --build build-cpu --target test_gguf_nvfp4 && ./build-cpu/tests/test_gguf_nvfp4`;
+for the sweep, add the two env vars above on a host holding both files. The CI
+goldens are regenerable with `scripts/gen-gguf-nvfp4-goldens.py <gguf> <safetensors>`.
+
 ### GGUF MTP end-to-end + the CPU spec-state fix, `SPEC-MTP-GGUF` G1-G4 (2026-07-28) - correctness GREEN, speed PENDING
 
 **Benchmark disposition: PENDING for speed, GREEN for correctness.
