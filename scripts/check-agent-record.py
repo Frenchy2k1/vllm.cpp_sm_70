@@ -93,7 +93,16 @@ ENGINE_PREFIXES = (
 # generate best_of children via the SAMPLE-N fan-out, rank by cumulative logprob,
 # return the top-n; a distinct request-surface capability from raw n-sampling). The
 # best_of==n default path is byte-identical. `ACTIVE`, `CLAIM-C7-BESTOF-BEAM-API`.
-ENGINE_ROWS = 122
+# 123 since 2026-07-28: +`SPEC-MTP-GGUF` (MTP speculative decoding from a GGUF
+# TARGET). Distinct from `SPEC-MTP` (`DONE`, safetensors): the engine currently
+# REFUSES mtp+GGUF on the assumption that GGUF exports carry no head, but
+# llama.cpp's Qwen3.5 converter does emit it and `HfConfigFromGguf` already reads
+# the announcing metadata key. `READY`, spiked.
+# 124 since 2026-07-28: +`SPEC-DFLASH-GGUF` (DFlash draft, then target, from GGUF).
+# Distinct again: a separate draft checkpoint with its own llama.cpp `dflash` arch
+# contract, plus a shared-head coupling to the target that `SPEC-MTP-GGUF` does not
+# have. `READY`, spiked.
+ENGINE_ROWS = 124
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

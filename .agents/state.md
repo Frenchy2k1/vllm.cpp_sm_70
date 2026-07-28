@@ -29031,3 +29031,63 @@ done. Lesson for the next session: read AGENTS.md BEFORE the first edit, not
 after the push - the checkpoint surfaces are a same-change obligation, and a
 cross-repo driver (a LocalAI need) does not exempt a change from this repo's
 record protocol.
+
+## 2026-07-28 — GGUF spec-decode SPIKED: `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF`
+
+**Scoping only, ZERO code.** Two spikes + their `READY` engine-matrix rows, in
+response to the question "llama.cpp reads MTP from GGUF, why don't we, and can
+DFlash drafts be GGUF too".
+
+**The premise behind the current refusal is stale.** `FromModelDir` refuses
+`mtp`/`dflash` on a GGUF target citing "GGUF exports lack the mtp.* draft
+tensors". [mtp-spec-decode.md](specs/mtp-spec-decode.md):979-980 shows that was
+always scoped as temporary ("until we re-export GGUFs with the head"), and it is
+not a property of the format:
+
+- llama.cpp `conversion/qwen.py:535-604` (`_Qwen35MtpMixin`) converts Qwen3.5's
+  `mtp.*` INTO GGUF, extending `block_count`, emitting
+  `add_nextn_predict_layers(n)`, and remapping onto the DeepSeek-style
+  layer-indexed `nextn` naming (`fc`->`eh_proj`,
+  `pre_fc_norm_embedding`->`enorm`, `pre_fc_norm_hidden`->`hnorm`,
+  `norm`->`shared_head.norm`, `mtp.layers.{i}`->`model.layers.{L+i}`).
+- **We already read the announcing key.** `HfConfigFromGguf`
+  (`qwen3_5_gguf_weights.cpp:568`) does
+  `OptInt(gguf, p + "nextn_predict_layers", 0)` and spends it on
+  `num_hidden_layers = block_count - nextn`, then discards it. The trunk layer
+  count on a head-carrying GGUF is therefore ALREADY right; the head is simply
+  never loaded.
+- **Both weight loaders are already resolver-shaped.**
+  `LoadQwen3_5MTP(const TensorResolver&, ...)` (`qwen3_5_mtp.cpp:272`) and
+  `LoadQwen3DFlash(const TensorResolver&, ...)` (`qwen3_dflash.h:104`) are
+  source-agnostic; `StTensor` is a plain `{dtype, shape, data, nbytes}` view, so
+  a GGUF resolver can hand out views over dequantized buffers.
+
+So `SPEC-MTP-GGUF` is a resolver, one config field, and a narrowed `throw`.
+
+**DFlash is the bigger one, and a stale checkout nearly sank the analysis.** At
+llama.cpp `237ad9b9` (2026-07-01) there is NO dflash GGUF contract: no arch, no
+tensors, no KVs, only a `--target-model-dir` help string naming DFlash beside
+EAGLE3. Reading only that tree leads to "no contract exists, we must invent
+one", which under MIRROR-upstream would be the wrong call. `origin/master` (334
+commits ahead) HAS the full contract: `MODEL_ARCH.DFLASH` /`"dflash"`
+(`constants.py:547,1151`), the tensor set at `:4350`, `dflash.target_layers` +
+`dflash.target_hidden_size`, `FC`<-`model.fc` and
+`ENC_OUTPUT_NORM`<-`model.hidden_norm` (`tensor_mapping.py:1297-1305`). Notably
+the DFLASH tensor set OMITS `token_embd`/`output` because the draft shares the
+target's embed+lm_head, which is exactly what `LoadDflashDraft` already does:
+the contract and our loader agree on the model's shape. The spike pins the
+upstream commit for this reason and makes "confirm against a real converted
+file" work row `D0`.
+
+**Split by cost, not by feature.** `SPEC-DFLASH-GGUF` axis A (GGUF draft,
+safetensors target) is a contained loader addition with a safetensors control;
+axis B (GGUF target too) additionally has to break `LoadDflashDraft`'s
+`std::vector<SafetensorsFile>` typing for the shared bf16 head, and lands the
+draft scoring with a dequantized head while the target computes on quantized
+blocks - an acceptance-rate risk recorded as a finding to document, not a bug to
+hide.
+
+**Both rows enter `READY`, not `ACTIVE`.** The spike is delivered; no
+implementation is claimed, so neither takes a coordination claim.
+`scripts/check-agent-record.py` `ENGINE_ROWS` ratcheted 122 -> 124 with a
+documented reason per increment (its own mutation suite, 87 tests, still green).

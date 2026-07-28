@@ -499,6 +499,18 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `VLLM_ERR_INVALID_ARGUMENT` rather than `VLLM_ERR_MODEL_LOAD` (the contract
   `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
   backend) could not expose LMCache or the prefill budget in a model config.
+- **Speculative decoding from GGUF is SPIKED, not implemented.** `mtp` and
+  `dflash` are refused on a `.gguf` target today; `ngram` works there and
+  always has. Two `READY` rows now carry the scoped plan:
+  `SPEC-MTP-GGUF` ([spike](../.agents/specs/gguf-mtp-spec-decode.md)) and
+  `SPEC-DFLASH-GGUF` ([spike](../.agents/specs/gguf-dflash-draft.md)). The
+  original safetensors-only framing said GGUF exports carry no `mtp.*`; that
+  is stale as a general claim. llama.cpp's Qwen3.5 converter DOES emit the
+  head (under layer-indexed `nextn` naming) and llama.cpp master carries a
+  full `dflash` draft arch, so both are loader gaps on our side rather than
+  format limitations. Speculation also remains Qwen3.5/3.6-only at this pin
+  regardless of checkpoint format, because the widened speculative KV cache
+  is built directly for those families.
 - `/health` reports process liveness rather than a full engine-health probe.
 - **Speculative decoding** ships user-facing via `--speculative-config` (OpenAI
   server, example CLI, and C ABI v6), unset by default and byte-identical to the
