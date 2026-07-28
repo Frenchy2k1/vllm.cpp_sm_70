@@ -3384,6 +3384,33 @@ this workload.
 
 ---
 
+## Fused preamble: one simdgroup per head, kernel -46% (below the e2e floor)
+
+Prefill's non-GEMM, non-attention time was never attributed. Doing so
+(`--output-len 1`, 4 prompts, sync mode) put it at ~36 ms per prefill, with
+`vt_attn_qk_norm_rope` the largest single item at 9.8 ms.
+
+That kernel was mine, and the defect was the launch geometry: one THREADGROUP per
+(token, head) sized by head_dim, so a 512-token prefill launched **12,288
+threadgroups**, each reducing 128 elements through `vt_tg_sum`'s 7 barrier steps.
+A head fits in ONE SIMDGROUP — 32 lanes over 128 elements — so `simd_sum` does the
+reduction with no barrier, the launch count drops 8x, and a threadgroup now
+carries 8 (token, head) pairs.
+
+**Kernel: 9.8 -> 5.3 ms per prefill, -46%.** 16/16 PASS with NO re-anchor.
+
+**End-to-end effect is BELOW the measurement floor and is not claimed.** 4.5 ms
+against a ~613 ms prefill inside a ~5.3 s run is ~0.08%, where the paired harness
+resolves ~0.2%. Landed because the kernel is strictly better — 8x fewer launches,
+no barriers, identical output — not because throughput was shown to move.
+
+**The ceiling on this direction, measured rather than guessed:** prefill's whole
+"other" bucket is ~36 ms against MLX-LM's implied ~25. Driving it to zero, which
+is impossible, would buy 36 ms of the 170 ms total gap. This is worth ~97%, not
+parity.
+
+---
+
 ## Prefill attention softmax: one simdgroup per row, +0.19% (2026-07-27)
 
 Implements the target identified below. The online softmax ran ONE THREAD PER

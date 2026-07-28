@@ -28631,3 +28631,31 @@ lists both new flags.
 wiring sections), coordination `CLAIM-C8-SERVE-PROD-WIRING` note + claim-table row,
 `parity-ledger.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`, this entry. All record
 checkers rc=0. NOT pushed; FULL SHA reported to caller.
+
+---
+
+## 2026-07-28 — fused preamble: one simdgroup per head, kernel -46%, e2e below the floor
+
+Attributed prefill's non-GEMM/non-attention time for the first time: ~36 ms per
+prefill, largest item `vt_attn_qk_norm_rope` at 9.8 ms.
+
+That kernel is mine and the defect was launch geometry: one THREADGROUP per
+(token, head) sized by head_dim → **12,288 threadgroups** for a 512-token prefill,
+each reducing 128 elements through `vt_tg_sum`'s 7 barrier steps. A head fits in
+ONE SIMDGROUP (32 lanes x 128 elements), so `simd_sum` reduces with no barrier,
+launches drop 8x, and a threadgroup carries 8 pairs.
+
+**Kernel 9.8 -> 5.3 ms/prefill (-46%). 16/16 PASS, NO re-anchor.**
+
+**e2e NOT claimed:** 4.5 ms of a ~613 ms prefill in a ~5.3 s run is ~0.08%,
+against a harness that resolves ~0.2%. Landed on the strength of the kernel being
+strictly better (8x fewer launches, no barriers, identical output), not on a
+throughput measurement. Recording that distinction rather than quoting the -46%
+as if it were an end-to-end number.
+
+**Ceiling on the "improve our own architecture" direction, now measured:** the
+whole prefill small-kernel bucket is ~36 ms against MLX-LM's implied ~25. Zeroing
+it entirely — impossible — buys 36 ms of the 170 ms gap. Prefill attention is
+27 ms and both its structural ideas are closed; the GEMM is 15 ms and already at
+97% of MLX's. **This direction is worth ~97%, not parity.** Parity needs the
+decode side too (92 ms), which is at 98.0% already and has no identified lever.

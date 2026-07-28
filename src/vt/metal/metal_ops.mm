@@ -967,8 +967,13 @@ void AttnQkNormRopeKernel(Queue&, Tensor& q3, Tensor& k3, const Tensor& q_norm,
   VT_CHECK(k3.shape[0] == T && k3.shape[2] == Dh, "metal qk_norm_rope: k shape mismatch");
   const uint32_t rot = static_cast<uint32_t>(ra.rotary_dim > 0 ? ra.rotary_dim : Dh);
   VT_CHECK((rot & 1u) == 0u && rot <= Dh, "metal qk_norm_rope: bad rotary_dim");
-  const uint32_t tg = ChooseThreadgroupSize(
-      static_cast<uint32_t>(Dh), MetalContext::Get().PipelineMaxThreads("vt_attn_qk_norm_rope"));
+  // 256 threads = 8 simdgroups, each owning one (token, head). The first version
+  // sized the group by head_dim and launched one group per pair — 12288 of them
+  // for a 512-token prefill, each paying a 7-step barrier reduction for 128
+  // elements.
+  const uint32_t tg = std::min<uint32_t>(
+      256u, MetalContext::Get().PipelineMaxThreads("vt_attn_qk_norm_rope"));
+  const uint32_t sgs = tg / 32u;
   QkNormRopeParams p{
       static_cast<uint64_t>(q3.stride[0]), static_cast<uint64_t>(q3.stride[1]),
       static_cast<uint64_t>(k3.stride[0]), static_cast<uint64_t>(k3.stride[1]),
@@ -988,8 +993,9 @@ void AttnQkNormRopeKernel(Queue&, Tensor& q3, Tensor& k3, const Tensor& q_norm,
   e.BindTensor(cos_sin, 4, "qk_norm_rope: cos_sin");
   e.BindTensor(positions, 5, "qk_norm_rope: positions");
   e.BindBytes(&p, sizeof(p), 6);
-  // One threadgroup per (token, head), q heads then k heads.
-  e.DispatchGrid2D(static_cast<uint32_t>(T), static_cast<uint32_t>(Hq + Hk), tg);
+  // One SIMDGROUP per (token, head), `sgs` pairs per threadgroup.
+  const uint32_t pairs = static_cast<uint32_t>(T * (Hq + Hk));
+  e.DispatchGrid2D((pairs + sgs - 1u) / sgs, 1u, tg);
 }
 
 // cpu_sample.cpp:40-57 GreedyArgmaxKernel — one threadgroup per logits row.

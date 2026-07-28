@@ -303,7 +303,9 @@ this device's own GEMM; its online softmax now runs one simdgroup per query
 row rather than one thread, worth -16% on the kernel and +0.19% end to end. Its
 remaining 4.4x FLOP-rate gap to this device's own GEMM has no open structural
 idea left: BK deepening is blocked by a bf16-P precision constraint and eliding
-the identity softmax rescale measured no gain. The V-accumulation win came from BISECTING the attention
+the identity softmax rescale measured no gain. Prefill's
+small-kernel bucket is ~36 ms against MLX-LM's implied ~25, so improving our own
+architecture there caps out near 97% rather than parity. The V-accumulation win came from BISECTING the attention
 kernel once a paired ABBA harness with cooldown made 0.2% differences
 measurable: the V loop moved 2 bytes per lane per load where the score loop
 moved 8, giving 29 GB/s against 64 on identical traffic. That also explains why
