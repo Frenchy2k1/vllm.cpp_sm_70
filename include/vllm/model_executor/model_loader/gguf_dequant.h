@@ -13,6 +13,13 @@
 // 16 blocks of 16 (Q3_K/Q6_K); the packed 6-bit scales/mins are the subtle
 // part (get_scale_min_k4 for Q4_K/Q5_K, the kmask aux shuffle for Q3_K, plain
 // int8 for Q6_K). A wrong bit-unpack yields garbage weights.
+//
+// NVFP4 (ggml type 40) is a fork/toolchain extension rather than mainline ggml,
+// and it is the ONE encoding here whose blocks are not self-contained: the
+// tensor also needs a `<stem>.scale` f32 sidecar TENSOR. Its numerics are the
+// same NVFP4 the safetensors path already implements
+// (nvfp4_dequant.h) — only the container differs. Layout evidence and the
+// container comparison: .agents/specs/gguf-nvfp4-notes.md Sec 5.
 #pragma once
 
 #include <cstdint>
@@ -20,12 +27,28 @@
 
 namespace vllm {
 
+// True when the encoding's blocks are NOT self-contained: the tensor value
+// needs a per-tensor scalar that lives OUTSIDE the block bytes, in a GGUF
+// sidecar tensor. NVFP4 (40) is the only such encoding we read — see
+// .agents/specs/gguf-nvfp4-notes.md Sec 5. Every K-quant, Q4_0/Q8_0, F16/BF16
+// and F32 is self-contained and returns false.
+//
+// This exists so the omission cannot be silent: a caller that has not resolved
+// the sidecar must be told, not handed values that are off by a per-tensor
+// factor of ~1e4 yet look perfectly finite.
+bool GgmlTypeNeedsGlobalScale(uint32_t ggml_type);
+
 // Dequantize `numel` elements from the packed GGUF block bytes at `data` to
 // f32. `ggml_type` is the ggml type id (see enum ggml_type / GgufValueType).
 // `numel` MUST be a multiple of the type's block_elems (GgmlTraits(type)) —
-// GGUF rows always are. Supported types: F32(0), Q4_0(2), Q8_0(8), Q3_K(11),
-// Q4_K(12), Q5_K(13), Q6_K(14). Any other id (e.g. IQ2_S(22)/IQ4_XS(23))
-// throws std::runtime_error("unsupported ggml type N (Task 2/i-quant)").
+// GGUF rows always are. Supported types: F32(0), F16(1), Q4_0(2), Q8_0(8),
+// Q3_K(11), Q4_K(12), Q5_K(13), Q6_K(14), BF16(30) and, through the 4-argument
+// overload below, NVFP4(40). Any other id (e.g. IQ2_S(22)/IQ4_XS(23)) throws
+// std::runtime_error("unsupported ggml type N (Task 2/i-quant)").
+//
+// These 3-argument forms THROW for an encoding with
+// GgmlTypeNeedsGlobalScale(ggml_type): they have no scale to apply and will not
+// guess 1.0.
 //
 // Reads exactly numel/block_elems * block_bytes bytes from `data`; the caller
 // (the GGUF loader) must have validated the tensor span (gguf_reader does).
@@ -37,5 +60,23 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
 // bf16 OwnedTensors, matching the safetensors path.
 std::vector<uint16_t> DequantGgufRowToBf16(uint32_t ggml_type,
                                            const uint8_t* data, int64_t numel);
+
+// The same two entry points, plus the per-tensor scalar the container keeps
+// outside the blocks. `global_scale` is the value of the GGUF `<stem>.scale`
+// sidecar tensor, applied as a MULTIPLIER: it is the reciprocal of the
+// compressed-tensors `weight_global_scale` DIVISOR, i.e. the same
+// `weight_scale_2` convention nvfp4_dequant.h already uses (measured
+// bit-identical on the real Qwen3.6 exports; see the spec). A stacked expert
+// tensor's sidecar holds ONE scalar PER EXPERT, so the caller dequantizes one
+// expert slab per call.
+//
+// `global_scale` must be finite and > 0 for a scale-carrying encoding, and must
+// be exactly 1.0 for a self-contained one — handing a scale to an encoding that
+// cannot apply it is a caller bug and throws rather than being ignored.
+std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
+                                       int64_t numel, float global_scale);
+std::vector<uint16_t> DequantGgufRowToBf16(uint32_t ggml_type,
+                                           const uint8_t* data, int64_t numel,
+                                           float global_scale);
 
 }  // namespace vllm

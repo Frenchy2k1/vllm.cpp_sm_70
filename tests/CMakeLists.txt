@@ -30,6 +30,10 @@ vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)
 vllm_cpp_add_test(test_nvfp4_dequant vllm/test_nvfp4_dequant.cpp)
 vllm_cpp_add_test(test_ct_nvfp4_emulation vllm/test_ct_nvfp4_emulation.cpp)
 vllm_cpp_add_test(test_gguf_dequant vllm/test_gguf_dequant.cpp)
+vllm_cpp_add_test(test_gguf_nvfp4 vllm/test_gguf_nvfp4.cpp)
+# gguf_nvfp4_goldens.inc lives next to the test source.
+target_include_directories(test_gguf_nvfp4 PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 vllm_cpp_add_test(test_qwen36_weights vllm/test_qwen36_weights.cpp)
 vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)

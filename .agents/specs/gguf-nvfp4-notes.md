@@ -1,4 +1,32 @@
-# NVFP4 GGUF extension types — killgate fork prior art (M0.4 Task 5)
+# NVFP4 GGUF (`QUANT-GGUF-NVFP4`, ggml type 40)
+
+**Current binding result (2026-07-28).** Type 40 is READ and MATERIALIZED. The
+container was determined by BYTE-COMPARING the real files, not inferred: Sec 5
+is the measured evidence and supersedes any earlier assumption from the fork
+sources in Sec 1-4, which remain the correct citation for the type ID and block
+GEOMETRY but describe a DIFFERENT, self-contained producer. **The GGUFs we must
+actually load carry a per-tensor `<stem>.scale` f32 sidecar TENSOR, so their
+blocks alone do NOT determine the weight.** Implementation
+[gguf_dequant.cpp:123](../../src/vllm/model_executor/model_loader/gguf_dequant.cpp#L123),
+loader plumbing
+[qwen3_5_gguf_weights.cpp:330](../../src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp#L330),
+gate [test_gguf_nvfp4.cpp](../../tests/vllm/test_gguf_nvfp4.cpp).
+
+## Spike record
+
+| Field | Content |
+|---|---|
+| Scope | `QUANT-GGUF-NVFP4`: read and dequantize ggml type 40 out of a GGUF, including the per-tensor / per-expert scale sidecar the container keeps outside the blocks. Loader materialization (`M`) only. NOT in scope: a keep-quant residency, a native NVFP4 GGUF GEMM (`C`), or an end-to-end model gate (`E`) |
+| Upstream chain | No mainline ggml type 40: it is a fork/toolchain extension. Fork enum + block geometry `ggml/include/ggml.h:429-431`, `ggml/src/ggml-common.h:211-217` (Sec 1-2). The NUMERICS are NVIDIA NVFP4 as vLLM already implements it: `vllm/model_executor/layers/quantization/modelopt.py` (W4A16 dequant) and `compressed_tensors` `nvfp4-pack-quantized`, both mirrored in `nvfp4_dequant.{h,cpp}` |
+| Our baseline | `gguf_reader.cpp:271-279` already tabulated (64, 36) traits for type 40; `nvfp4_dequant.cpp` already implemented the block math for the safetensors container. The ONLY gap was the container: `gguf_dequant.cpp` had no case 40 and no way to carry a per-tensor scale |
+| Port map | `gguf_dequant.{h,cpp}`: `GgmlTypeNeedsGlobalScale` + 4-argument `DequantGgufRowTo{F32,Bf16}` overloads + the case-40 block decode reusing `kE2M1Lut` / `F8E4M3ToF32`. `qwen3_5_gguf_weights.cpp`: `GgufGlobalScales` sidecar resolution and the `DqSlabs` per-expert slab loop behind the existing `DqBf16` / `DqF32` |
+| Tests to port | No upstream ggml test covers type 40 (it is not upstream). The executable spec is CROSS-FORMAT EQUIVALENCE against the already-gated safetensors NVFP4 path (`tests/vllm/test_nvfp4_dequant.cpp`, itself ported from `nvfp4_emulation_utils.dequantize_to_dtype`): `tests/vllm/test_gguf_nvfp4.cpp` with real bytes from both containers, plus the asset-gated full-file sweep |
+| Gates | (1) bit-identical to `DequantNvfp4ToBf16` on real Qwen3.6-27B bytes from both containers; (2) the scale-less entry point REFUSES type 40 rather than assuming 1.0; (3) the full-file sweep over every shared NVFP4 projection of the real 18.8 GB GGUF vs the 26.4 GB safetensors |
+| Dependencies | `nvfp4_dequant.h` (`kE2M1Lut`, `F8E4M3ToF32`, `kNvfp4GroupSize`); `gguf_reader` traits for type 40; the GDN v-head reorder (`ReorderVCols`) for `ssm_out`, which is orthogonal and already present |
+| Work breakdown | W1 container determination by byte comparison (done, Sec 5). W2 dequant + sidecar plumbing + gates (done). W3 OPEN: a real end-to-end NVFP4 GGUF model load / greedy gate, which needs more than dequant (Sec 6). W4 OPEN: keep-quant residency + a native NVFP4 GGUF GEMM |
+| Risks/decisions | The dangerous failure is a plausible-but-wrong dequant: a nibble permutation preserves the value histogram and the norms, so it yields finite, sane-looking logits and silently degrades output. DECISION: gate on BIT-EXACT cross-format equality, never a tolerance; and make the missing sidecar a THROW, never a 1.0 default. The wrong-order variant was run deliberately and the gate caught it on 1686/2048, 1935/2048 and 1678/2048 values (Sec 5.4) |
+
+## Prior art: killgate fork sources (mined 2026-07-03)
 
 Mined 2026-07-03 on dgx.casa from mudler's llama.cpp forks:
 
@@ -51,11 +79,13 @@ typedef struct {
 - **Nibble order** (`dequantize_row_nvfp4`, `ggml/src/ggml-quants.c:531-554`):
   within sub-block `s`, byte `qs[s*8 + j]` (j in 0..7) holds element `j` in the
   low nibble and element `j + 8` in the high nibble; `y = kvalue * d`.
-- **No per-tensor scale tensor.** Unlike NVIDIA's TensorRT NVFP4 recipe (per-16
-  FP8-E4M3 scale x per-tensor FP32 scale), the fork's GGUF encoding is fully
-  self-contained per block: quantization (`quantize_row_nvfp4_ref`,
-  ggml-quants.c:346) picks `d = ue4m3(amax_sub / 6)` per sub-block and stores
-  nothing outside the block. GGUF loaders need no side-channel tensors.
+- **No per-tensor scale tensor IN THIS FORK.** Its quantizer
+  (`quantize_row_nvfp4_ref`, ggml-quants.c:346) picks `d = ue4m3(amax_sub / 6)`
+  per sub-block and stores nothing outside the block, so a file from THIS
+  producer is self-contained. **SUPERSEDED as a general claim by Sec 5:** the
+  NVFP4 GGUFs we actually have to load come from a different producer and DO
+  carry the NVIDIA per-tensor global scale, as a sidecar tensor. A loader must
+  therefore never assume self-containment; ours refuses to guess.
 
 ### Q1_0 (id 41), for completeness
 
@@ -129,3 +159,104 @@ Qwen3.6-35B-A3B NVFP4 dense/MoE), so the reader supports id 40 for those.
 returns value × 0.5 to compensate for the 2×-scaled `kvalues_mxfp4` LUT (see
 ggml-impl.h comment; 0x7F decodes to 0). If you write your own UE4M3 decode
 from the bias=7 spec while reusing the fork LUT, you will be 2× off.
+
+## 5. MEASURED container evidence (2026-07-28) — this is what we load
+
+Sections 1-4 are the fork PRIOR ART. This section is the DIRECT MEASUREMENT of
+the two NVFP4 GGUFs on `dgx.casa` that block `SPEC-MTP-GGUF`'s GPU gate, and it
+is what the implementation follows. Method: a self-contained GGUF header walk
+(`scripts/gen-gguf-nvfp4-goldens.py` carries the same reader) plus a byte-level
+comparison against the compressed-tensors export of the SAME quantization run.
+
+### 5.1 The files
+
+| File | Arch | ftype | Tensor types | NVFP4 tensors | Sidecars |
+|---|---|---|---|---|---|
+| `~/bench/q36-27b-nvfp4.gguf` (18.8 GB) | `qwen35` | 39 | `{F32: 1345, BF16: 2, NVFP4: 496}` | 496, all 2-D | 496 x `.scale` `[1]` |
+| `~/bench/q36-35b-a3b-nvfp4.gguf` | `qwen35moe` | 39 | `{F32: 792, BF16: 202, NVFP4: 241}` | 121 2-D + 120 3-D `[E,out,in]` | 121 x `.scale` `[1]`, 120 x `.scale` `[256]` |
+
+Every NVFP4 weight has a matching `.scale` sidecar (0 missing, checked
+exhaustively), plus an `.input_scale` that is the W4A4 ACTIVATION scale and is
+unused on our weight-only path. `general.tags` on the 27B names
+`compressed-tensors`, and the oracle
+`~/bench/q36-27b-nvfp4-vllm/` is the `nvfp4-pack-quantized` export of the same
+model (`config.json` `quantization_config.format`, `group_size: 16`,
+`scale_dtype: torch.float8_e4m3fn`).
+
+### 5.2 The block layout, established by byte comparison
+
+`block_nvfp4` is 64 elements in 36 bytes, `uint8 d[4]` then `uint8 qs[32]`:
+
+- `d[s]` is an **IEEE fp8-e4m3fn** scale for 16-element sub-block `s`. Not a
+  ggml UE4M3: the four bytes of every GGUF block are **byte-identical** to the
+  corresponding four `weight_scale` bytes on the safetensors side.
+- sub-block `s` owns `qs[s*8 .. s*8+8)`; byte `j` holds element `s*16 + j` in
+  the LOW nibble and element `s*16 + j + 8` in the HIGH nibble. This is the ggml
+  SPLIT-HALF packing of Sec 2, and it differs from the torch PAIRWISE packing
+  (`2i` low, `2i+1` high) that `nvfp4_dequant.cpp` reads.
+- The scales come FIRST, the nibbles second.
+
+Verified by unpacking both containers and comparing element-for-element over
+the first 64 rows of `blk.0.ffn_gate`, `blk.0.ffn_down`, `blk.7.ffn_up` and
+`blk.63.ffn_down` (~4.4 M nibbles): scale bytes identical, nibbles identical
+under exactly this permutation, zero mismatches.
+
+### 5.3 The per-tensor scale: MULTIPLY, not divide
+
+`<stem>.scale` is f32 and is **bit-identical to `float32(1) /
+float32(weight_global_scale)`** on the safetensors side, i.e. the modelopt
+`weight_scale_2` convention `nvfp4_dequant.h` already documents, NOT the
+compressed-tensors divisor. Checked bit-for-bit on `blk.0.ffn_gate` (wgs 6624),
+`blk.0.ffn_down` (2880), `blk.0.ssm_out` (2160), `blk.7.ffn_up` (11904),
+`blk.63.ffn_down` (5344). So the value is
+
+```
+out[o, i] = bf16( e2m1_lut[nibble] * ( f8_e4m3(d[s]) * gguf_scale ) )
+```
+
+with the group scale formed FIRST, exactly as in `DequantNvfp4ToBf16`, which is
+why the two containers agree BIT for BIT rather than approximately.
+
+A stacked expert tensor's sidecar holds **one f32 per expert** (`[256]` on the
+35B), in expert order, matching vLLM's `w13_weight_scale_2`. The expert axis is
+the slowest, so each expert is a contiguous slab of whole blocks.
+
+### 5.4 Why the gate is bit-exact
+
+A nibble-permutation bug preserves the value histogram inside every group of
+16, so the tensor norms are unchanged and the model still produces finite,
+plausible logits: exactly the silent-degradation failure this row must not
+ship. The wrong (torch pairwise) order was therefore implemented and run
+DELIBERATELY before the right one, and the cross-format gate rejected it on
+1686/2048, 1935/2048 and 1678/2048 values across the three CI slices.
+
+### 5.5 `ssm_out` also carries the GGUF v-head tiling
+
+`blk.N.ssm_out` is NVFP4 in both containers but is NOT byte-comparable raw: the
+converter stores GDN value heads TILED, so GGUF head `r*num_k + k` is HF
+grouped head `k*num_v_per_k + r` (verified on layer 0 of the 27B: `num_k` 16,
+`num_v_per_k` 3, head dim 128, all 48 heads matched). That is exactly the
+mapping `ReorderVCols` in `qwen3_5_gguf_weights.cpp` already applies at load, so
+it is not an NVFP4 question. It IS why the cross-format sweep compares the MLP
+projections only.
+
+### 5.6 The 27B GGUF quantizes MORE than its safetensors sibling
+
+The checkpoint recipe (`recipe.yaml`) ignores `lm_head`, `mtp.*`, `visual.*` and
+the whole GDN `in_proj_{qkv,z,a,b}` family, which stay BF16 in the safetensors.
+The GGUF stores `attn_qkv`, `attn_gate`, `ssm_alpha` and `ssm_beta` as NVFP4
+anyway. Those tensors have no safetensors counterpart, so the oracle covers
+`ffn_{gate,up,down}` and `ssm_out` only; the container itself is proven by
+those, since the encoding does not vary per tensor.
+
+## 6. What is NOT done
+
+- `C` (native quantized compute): NVFP4 has no `vt::DType` block encoding and no
+  `vec_dot`, so `RouteGgufTensor` correctly sends it to `kExpandBf16`. A
+  keep-quant residency and an NVFP4 GGUF GEMM are separate, unstarted work.
+- `E` (end-to-end): dequant alone does not load the 27B/35B models. The
+  remaining gaps are model-level, not container-level, and are tracked on
+  `SPEC-MTP-GGUF`.
+- The load-time tensor-routing audit does not yet observe the `.scale` /
+  `.input_scale` sidecars (they are read directly, not routed), so a totality
+  assertion over an NVFP4 file would count them as unrouted.

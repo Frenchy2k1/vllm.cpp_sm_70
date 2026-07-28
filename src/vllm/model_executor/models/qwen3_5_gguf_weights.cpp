@@ -327,14 +327,85 @@ void ReorderVCols(std::vector<T>& buf, int64_t rows, int64_t cols,
   buf.swap(out);
 }
 
-// Dequant a named GGUF tensor to bf16 bit patterns (natural [out, in] row-major
-// order, ne0 = in fastest). Returns the flat buffer; `info` is filled in.
-std::vector<uint16_t> DqBf16(const GgufFile& g, const std::string& name,
-                             const GgufTensorInfo** info) {
+// The per-tensor scalars an encoding keeps OUTSIDE its blocks.
+//
+// Every ggml encoding we read is self-contained except NVFP4 (type 40): its
+// blocks carry the per-16 fp8 scales, but the tensor value ALSO needs the
+// `<stem>.scale` f32 sidecar TENSOR the converter emits beside the weight (the
+// reciprocal of the compressed-tensors `weight_global_scale` divisor). Without
+// it the weights are off by a per-tensor factor of ~1e4 — finite, plausible and
+// wrong — so this resolves it explicitly and fails loudly when it is missing.
+//
+// A 2-D weight has ONE scalar; a stacked expert weight (GGUF [E, out, in]) has
+// ONE PER EXPERT in expert order, exactly like vLLM's `w13_weight_scale_2`. The
+// result is therefore size 1 or size E, and {1.0f} for a self-contained
+// encoding. `<stem>.input_scale` is the W4A4 ACTIVATION scale and is
+// deliberately unused on this weight-only path.
+std::vector<float> GgufGlobalScales(const GgufFile& g, const std::string& name,
+                                    const GgufTensorInfo& t) {
+  if (!GgmlTypeNeedsGlobalScale(t.ggml_type)) return {1.0F};
+  const std::string kSuffix = ".weight";
+  VT_CHECK(name.size() > kSuffix.size() &&
+               name.compare(name.size() - kSuffix.size(), kSuffix.size(),
+                            kSuffix) == 0,
+           "qwen3_5 gguf: NVFP4 tensor without a .weight name: " + name);
+  const std::string sidecar =
+      name.substr(0, name.size() - kSuffix.size()) + ".scale";
+  VT_CHECK(HasTensor(g, sidecar),
+           "qwen3_5 gguf: " + name + " is NVFP4 but the file has no " +
+               sidecar + " sidecar; its blocks alone do not determine the "
+                         "weight");
+  const GgufTensorInfo& s = g.Get(sidecar);
+  VT_CHECK(s.ggml_type == 0, "qwen3_5 gguf: " + sidecar + " must be F32");
+  const int64_t n = ShapeNumel(s.shape);
+  VT_CHECK(n == 1 || (t.shape.size() == 3 && n == t.shape[0]),
+           "qwen3_5 gguf: " + sidecar +
+               " must hold one scalar, or one per expert");
+  std::vector<float> out(static_cast<size_t>(n));
+  std::memcpy(out.data(), s.data, static_cast<size_t>(n) * sizeof(float));
+  for (float v : out) {
+    VT_CHECK(std::isfinite(v) && v > 0.0F,
+             "qwen3_5 gguf: non-positive or non-finite scale in " + sidecar);
+  }
+  return out;
+}
+
+// Dequant a named GGUF tensor (natural [out, in] row-major order, ne0 = in
+// fastest). Returns the flat buffer; `info` is filled in.
+//
+// Templated only so the per-expert slab loop — one dequant call per sidecar
+// scale — is not written twice for the f32 and bf16 element types.
+template <typename T, typename Fn>
+std::vector<T> DqSlabs(const GgufFile& g, const std::string& name,
+                       const GgufTensorInfo** info, Fn dequant) {
   const GgufTensorInfo& t = g.Get(name);
   *info = &t;
-  std::vector<uint16_t> out =
-      DequantGgufRowToBf16(t.ggml_type, t.data, ShapeNumel(t.shape));
+  const int64_t numel = ShapeNumel(t.shape);
+  const std::vector<float> scales = GgufGlobalScales(g, name, t);
+
+  std::vector<T> out;
+  if (scales.size() == 1) {
+    out = dequant(t.ggml_type, t.data, numel, scales[0]);
+  } else {
+    // One contiguous slab per expert. The expert axis is the SLOWEST, so a slab
+    // is a whole number of rows and no block is ever straddled.
+    const int64_t slabs = static_cast<int64_t>(scales.size());
+    VT_CHECK(numel % slabs == 0,
+             "qwen3_5 gguf: expert count does not divide " + name);
+    const int64_t per = numel / slabs;
+    const GgmlTypeTraits& traits = GgmlTraits(t.ggml_type);
+    VT_CHECK(per % traits.block_elems == 0,
+             "qwen3_5 gguf: expert slab of " + name + " is not whole blocks");
+    const int64_t slab_bytes = per / traits.block_elems * traits.block_bytes;
+    out.resize(static_cast<size_t>(numel));
+    for (int64_t e = 0; e < slabs; ++e) {
+      const std::vector<T> part =
+          dequant(t.ggml_type, t.data + e * slab_bytes, per,
+                  scales[static_cast<size_t>(e)]);
+      std::memcpy(out.data() + e * per, part.data(),
+                  static_cast<size_t>(per) * sizeof(T));
+    }
+  }
   // The expansion is now the authority for this tensor; its file pages are
   // read-once and must not sit in RSS next to it (L5, no-op unless the load
   // enabled it). Re-reading the tensor later is still correct — the pages just
@@ -343,14 +414,21 @@ std::vector<uint16_t> DqBf16(const GgufFile& g, const std::string& name,
   return out;
 }
 
+std::vector<uint16_t> DqBf16(const GgufFile& g, const std::string& name,
+                             const GgufTensorInfo** info) {
+  return DqSlabs<uint16_t>(g, name, info,
+                           [](uint32_t ty, const uint8_t* d, int64_t n,
+                              float s) {
+                             return DequantGgufRowToBf16(ty, d, n, s);
+                           });
+}
+
 std::vector<float> DqF32(const GgufFile& g, const std::string& name,
                          const GgufTensorInfo** info) {
-  const GgufTensorInfo& t = g.Get(name);
-  *info = &t;
-  std::vector<float> out =
-      DequantGgufRowToF32(t.ggml_type, t.data, ShapeNumel(t.shape));
-  g.DropSpanResidency(t.data, t.nbytes);
-  return out;
+  return DqSlabs<float>(g, name, info,
+                        [](uint32_t ty, const uint8_t* d, int64_t n, float s) {
+                          return DequantGgufRowToF32(ty, d, n, s);
+                        });
 }
 
 // bf16 tensor copied verbatim with `shape` (dequant, then own the bytes).
