@@ -2833,6 +2833,27 @@ gguf_qwen36_loader 3/99, qwen3_5_gguf_mtp 2/2, ops_gdn 58/1825, capi 33/232,
 nvfp4_dequant 4/47, ct_nvfp4_emulation 6/81, model_loader_gguf 3/3,
 ops_quant_traits 8/5615.
 
+**Downstream unblock, MEASURED (not inferred).** `SPEC-MTP-GGUF`'s previously
+blocked gate now runs: on dgx.casa under `flock $HOME/gpu.lock`,
+`VLLM_MTP_GGUF_MODEL=~/bench/q36-35b-a3b-nvfp4.gguf ./tests/test_qwen35_gguf_spec_decode`
+is **2/2 cases, 10/10 assertions, spec-ON token-identical to spec-OFF, 13 drafts
+proposed / 11 accepted**, peak RSS **90.2 GiB**, wall **7m33s**. It previously
+threw at load with zero work. The device is PROVEN by an A/B rather than
+assumed: re-run with `CUDA_VISIBLE_DEVICES=` the tokens change and the run hits
+the known CPU restriction `causal_conv1d_spec_update: conv_state must be f32, or
+bf16 on CUDA` (1/2 cases, 69.1 GiB, 5m37s), so the passing arm really executed
+on the GB10.
+
+**That run is NOT accepted as `SPEC-MTP-GGUF`'s closing gate**, for two reasons
+recorded here rather than glossed: (1) the dgx build is configured
+`CMAKE_CUDA_ARCHITECTURES=75` on an sm_121 GB10, i.e. PTX-JIT'd Turing code, not
+the release target; (2) on the SAME loaded weights the GPU arm's 24 tokens
+differ materially from the CPU arm's (`" Paris.\nA. True\nB. False..."` vs
+`" Paris, a city renowned for its rich history..."`). Since the loader hands
+both arms IDENTICAL bf16 buffers, that divergence is a forward-path question and
+NOT attributable to this row's materialization, but it must be explained before
+the GPU arm binds anything.
+
 Reproduction: `cmake --build build-cpu --target test_gguf_nvfp4 && ./build-cpu/tests/test_gguf_nvfp4`;
 for the sweep, add the two env vars above on a host holding both files. The CI
 goldens are regenerable with `scripts/gen-gguf-nvfp4-goldens.py <gguf> <safetensors>`.
