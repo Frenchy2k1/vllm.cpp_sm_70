@@ -5040,6 +5040,38 @@ Numbers, profile and reproduction:
 [W4 evidence](bench-evidence/w4-async-mirror-20260727.md). Spec and deviations:
 [.agents/specs/async-discrete-device-combine.md](../.agents/specs/async-discrete-device-combine.md).
 
+### Pinned-oracle provisioning (2026-07-28) - infrastructure, measurement PENDING
+
+The local oracle was **vLLM 0.24.0**, two versions behind the parity pin
+(`555967922` / 0.26.0.dev0), because it was pip-installed from a PyPI RELEASE on
+2026-07-09 while the pin tracks a vLLM **main commit** that has no release tag
+and no prebuilt wheel on any platform. A pip install could never have matched it.
+
+An oracle at the actual pin now exists in a SEPARATE venv (`.venv-vllm-pin`,
+built from source at `5559679229bc...`, `vllm-0.23.1rc1.dev1511+g555967922.cu132`)
+with the pinned stack: torch 2.13.0, torchvision 0.28.0, triton 3.7.1,
+transformers 5.14.1, flashinfer 0.6.15.post1, nvidia-cutlass-dsl 4.6.0. The
+working 0.24.0 venv is untouched.
+
+`run_qwen35_4b_compare.sh` gains `VLLM_CUDA_HOME`. The harness previously derived
+the vLLM arm's CUDA toolkit from the Nix CMake cache (12.9), which is correct for
+a venv that borrows Nix's CUDA and WRONG for one carrying its own: it would put a
+12.9 toolkit ahead of the 13.x the venv's extensions were compiled against.
+
+**Toolkit ceiling, recorded because it is not obvious:** the usable CUDA version
+here is set by what the DRIVER can JIT, not by what is newest. vLLM ships
+FlashAttention-2 as `8.0+PTX`, so the driver JIT-compiles its PTX for Blackwell at
+load; driver 595.71.05 tops out at CUDA 13.2 and rejects nvcc-13.3 PTX with
+`cudaErrorUnsupportedPtxVersion` — a failure that appears only at RUNTIME, after a
+completely clean build. CUDA 13.0 is also unusable: its headers predate glibc
+2.42's `rsqrt` declaration and collide with it. 13.2 is the only version in range
+that clears both, and the whole toolkit must match (cccl refuses a mixed
+compiler/header pair). Install vLLM with `--no-deps`, or pip re-resolves the CUDA
+runtime downward after the build and reintroduces the mismatch.
+
+The re-measured denominator is **PENDING**; until it lands, the binding 0.9819x
+ratio stands against 0.24.0 and is labelled as such.
+
 ### OPEN LEAD - cuBLASLt resolves Ampere-class GEMM kernels on sm_120 (2026-07-27) - NOT MEASURED
 
 From the same profile: `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128`
