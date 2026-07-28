@@ -180,12 +180,45 @@ ours, built to the same shape as the safetensors MTP gates.
 | `G2` | `MakeGgufMtpResolver` + name-mapping and dequant-equivalence tests | Resolver unit tests, RED-first | `G0`, `G1` |
 | `G3` | Narrow the rejection; wire `LoadQwen3_5MTP` + `AttachMtpDraftWeights` into the GGUF branch | Rejection test; engine loads spec-ON on GGUF | `G2` |
 | `G4` | **RUNS and FAILS 2026-07-28 - gate landed, defect OPEN.** `tests/parity/test_qwen35_gguf_spec_decode.cpp` drives the real 2B GGUF twice (spec-OFF then spec-ON) on CPU. It found and fixed one real loader defect (`fc.nk` unset: shape checks passed, the draft forward refused with "fc must be raw bf16 [H,2H]"), then surfaced a SECOND, still-open failure: **spec-ON diverges from spec-OFF while acceptance is HIGH (13 proposed / 10 accepted)**. Greedy MTP is exactness-preserving, so this is a genuine correctness defect. NOT yet attributed - see `G4a`. Needs `VT_GDN_STATE_BF16=0` on CPU (`causal_conv1d_spec_update` requires f32 conv state off CUDA) | Gates 2 and 4 | `G3` |
-| `G4a` | **ATTRIBUTION, the next step.** Run the SAME two-way gate against a SAFETENSORS Qwen3.5 on CPU. If it also diverges, the defect is a pre-existing CPU spec-decode bug (the whole `SPEC-MTP` program was gated on GB10 - there is no CPU spec gate in the tree) and this row is done pending it. If safetensors is exact and GGUF is not, the defect is in this row's head load. High acceptance ARGUES AGAINST a badly-loaded head (garbage proposals get rejected, not accepted) and POINTS AT the verify/commit bookkeeping, but that is a hypothesis, not a finding | Attribution before any further code | `G4` |
-| `G5` | Cross-format agreement at F16, or an explicit NOT APPLICABLE | Gate 3 | `G4` |
-| `G6` | Record: `docs/STATUS.md`, `docs/BENCHMARKS.md` (PENDING or measured), matrix row to `GATING`/`DONE`, ledger | Checkers green | `G5` |
+| `G4a` | **ANSWERED 2026-07-28 by bisect - the defect is NOT in this row.** Killing the drafter outright (zeroing `fc`, so every proposal is garbage) gives **23 proposed / 0 accepted** and *byte-identical output to the live-drafter run*, still diverging from spec-OFF. With ZERO drafts accepted the emitted sequence must be the target's own greedy sequence; it is not. So enabling speculation changes the TARGET's forward on CPU, independently of the head. This row's loader is EXONERATED (and, with a live head, earns 10/13 acceptance). Tracked below as `CPU-SPEC-DIVERGENCE`, which is a pre-existing engine defect this row merely surfaced | Attribution complete, no safetensors download needed | `G4` |
 
 `G0` is deliberately a work row, not an assumption. `G1` is independently
 landable and inert.
+
+## Open defect surfaced by this row: `CPU-SPEC-DIVERGENCE`
+
+**Not caused by this row, and not fixed by it.** Turning speculative decoding ON
+changes the target's own greedy output on CPU even when NO draft is ever
+accepted. Established by bisect, not inference: with the head zeroed
+(23 proposed / 0 accepted) the spec-ON continuation is byte-identical to the
+live-head spec-ON continuation and still differs from spec-OFF.
+
+    spec-OFF          " Paris.\nA. True\nB. False..."      {11751, 13, 198, 32, ...}
+    spec-ON (live)    " Paris is the capital of France..."  {11751, 369, 279, 6511, ...}
+    spec-ON (dead)    identical to spec-ON (live)           {11751, 369, 279, 6511, ...}
+
+Why this is engine-level and not loader-level: with zero accepted drafts the
+verify path must emit exactly the target's argmax at every position. It does not.
+So the target's forward or its state bookkeeping differs under the widened
+speculative KV / conv cache.
+
+Scope note: there is NO CPU spec-decode gate anywhere in the tree. `SPEC-MTP`
+I5d/I5e/I6/I7 were all gated on GB10, so this is plausibly the first end-to-end
+CPU spec run, and the divergence is plausibly as old as the widened-cache work.
+
+**Lead, NOT a diagnosis.** `CausalConv1dSpecUpdateKernel`
+(`src/vt/cpu/cpu_ops.cpp:1010+`) computes `off = num_accepted_tokens[i] - 1` and
+then guards the state read with `src < state_len` ONLY - no `src >= 0`. At
+`num_accepted_tokens == 0` that reads `srow[-1]`. Whether `nat` can be 0 here
+(upstream treats it as accepted-drafts + 1, so >= 1) is unverified. Worth
+checking FIRST because it is cheap; it is not established as the cause. Note the
+op-level suites pass on CPU (`test_ops_gdn` 1825, `test_qwen3_5_gdn_spec_routing`
+12), so if this is it, it is a call-site/bookkeeping issue rather than kernel
+math.
+
+**Reproduction:**
+`VT_GDN_STATE_BF16=0 VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cpu/tests/test_qwen35_gguf_spec_decode`
+(CPU `causal_conv1d_spec_update` refuses bf16 conv state, hence the env var.)
 
 ## Risks/decisions
 

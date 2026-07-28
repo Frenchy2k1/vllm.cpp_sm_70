@@ -2547,11 +2547,13 @@ that is now fixed and asserted in the unit gate.
 **Reproduction:**
 `VT_GDN_STATE_BF16=0 VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cpu/tests/test_qwen35_gguf_spec_decode`
 
-**Next, before any number** (spike row `G4a`): run the same gate over a
-SAFETENSORS Qwen3.5 on CPU to attribute the divergence. There is no CPU spec-decode
-gate anywhere in this tree - `SPEC-MTP` was gated entirely on GB10 - so a
-pre-existing CPU defect is a live hypothesis and must be ruled in or out before
-this row is blamed or cleared.
+**Attribution COMPLETE (`G4a`), by bisect rather than by a second checkpoint.**
+Zeroing the MTP head so every proposal is garbage gives 23 proposed / 0 accepted
+and byte-identical output to the live-head run, still diverging from spec-OFF.
+With zero accepted drafts the emitted tokens must be the target's own greedy
+sequence, so the divergence is the TARGET's forward under speculation, not the
+head. The GGUF head loader is cleared; the open defect is engine-level and CPU-only
+(`CPU-SPEC-DIVERGENCE`). No GPU spec-decode result is affected or retracted.
 
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 
