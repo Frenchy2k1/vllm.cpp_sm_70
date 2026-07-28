@@ -119,9 +119,14 @@ multi-GPU tensor+pipeline parallel, multiple DGX Sparks over the ConnectX-7
 across 2×119 GiB Sparks), and MLX multi-node over Thunderbolt — all expressed
 ONCE against one `vt::` collective / process-group abstraction with
 backend-specific transports (NCCL / RDMA / MLX-ring), mirroring vLLM's
-`device_communicators`. `world_size==1` stays byte-identical. No implementation,
-no gate run; correctness gating is HW-blocked (no ≥2-GPU box, no 2-Spark cable,
-no 2-Mac cluster here). Full scope + seam map:
+`device_communicators`. `world_size==1` stays byte-identical. **W1 landed
+(2026-07-28) the collective ABSTRACTION leg**: `vt::Communicator`
+(`include/vt/communicator.h` + `src/vt/communicator.cpp`) with
+AllReduce/AllGather/Send/Recv, proven by a CPU in-process multi-rank gate
+(`tests/vt/test_communicator.cpp`, a real cross-rank sum, no GPU) and a
+byte-identical `world_size==1` no-op. The multi-GPU (TP/PP), multi-Spark, and
+MLX transports remain unbuilt — those legs are HW-blocked (no ≥2-GPU box, no
+2-Spark cable, no 2-Mac cluster here). Full scope + seam map:
 [.agents/specs/scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
 Multimodal
 (image/video/audio) is correctness-complete; its OpenAI-server wiring has landed
@@ -241,9 +246,22 @@ VERIFIED against the real `nvidia/DeepSeek-V4-Flash-NVFP4` safetensors header
 **HW-fit correction:** that NVFP4 checkpoint is **156.7 GiB**, NOT the ~83 GiB the
 scoping spike estimated (only the 256 routed experts are W4; the MLA and shared
 linears are FP8 plus NVFP4 double-scale overhead), so it does **not** fit ONE
-GB10's 119 GiB unified pool. A single-GB10 oracle run is therefore
-memory-infeasible; reaching a runnable gate needs multi-node tensor-parallel, CPU
-offload, or a smaller quant. The
+GB10's 119 GiB unified pool. **Single-Spark IS viable via a ~2-bit GGUF (user
+correction 2026-07-28):** `unsloth/DeepSeek-V4-Flash-GGUF` `UD-IQ2_XXS` = 90.9 GB
+(3 shards, ungated) FITS one GB10 with ~28 GiB headroom (also UD-IQ1_S/IQ1_M/IQ2_M/
+Q2_K_XL). So two vehicles: single-Spark ~2-bit GGUF, or 2x-Spark NVFP4/fp8 over the
+interconnect. The GGUF vehicle's correctness reference is llama.cpp-on-box (the
+pinned vLLM cannot load V4-from-GGUF) and needs a V4-GGUF loader + IQ i-quant dequant
+(IQ1_S/IQ2_XXS — not in our C4 K-quant set). The NVFP4/fp8 vehicle stays multi-node.
+A source-level spike (2026-07-28) confirmed a **same-quant IQ2_XXS GGUF benchmark of
+our engine vs vLLM is NOT viable today**, blocked on both sides: vLLM 0.26 moved GGUF
+out-of-tree to the uninstalled `vllm-gguf-plugin` (which *does* dequant IQ2_XXS) but
+`DeepseekV4ForCausalLM` has no `packed_modules_mapping`/GGUF wiring; and our engine
+hard-rejects GGUF for DeepSeek-V4/V2 and lacks IQ2_XXS/Q2_K dequant — so even the
+`UD-Q2_K_XL` k-quant fallback does not rescue it. Apples-to-apples for DeepSeek-V4 is
+the NVFP4 vehicle; a true same-GGUF cross-engine number is only available on a
+Qwen3/dense k-quant both engines already load.
+The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):
 Kimi-Linear-48B is the one that fits GB10 (91.5 GiB) and is e2e-gateable, while

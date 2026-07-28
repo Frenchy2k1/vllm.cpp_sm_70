@@ -451,6 +451,16 @@ all-reduce ~10.2 GB/s / sendrecv ~9 GB/s over the 200GbE RoCE link (raw RDMA
 HW-blocked (no ≥2-GPU box / 2-Spark cable / 2-Mac cluster here). Spec + seam map
 + W-plan: [scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
 No source/engine path touched.
+**Scale-out W1 — `vt::Communicator` + CPU collective gate (2026-07-28,
+`CLAIM-SCALE-OUT-W1`, NOT pushed).** Disposition: **NOT APPLICABLE (infra /
+correctness brick; `benchmark_binding=false`; no speed number owed at spike per
+the spec §Gates).** W1 landed the collective abstraction + a CPU in-process
+multi-rank transport, gated by a real cross-rank AllReduce/AllGather correctness
+test (`tests/vt/test_communicator.cpp`, 50/50 assertions, RED-verified) and a
+byte-identical `world_size==1` no-op. Pure CPU, no GPU, no model run — a
+throughput comparison is meaningless here and is not owed until the NCCL/RoCE
+transports and TP/PP forwards land on a ≥2-GPU host (W3+). No
+performance-relevant source/engine path touched.
 
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —
@@ -8656,3 +8666,33 @@ Ampere/Hopper+datacenter/Pascal-Volta-Turing) is now tracked as roadmap row
 each fast-path is derive-and-shipped and (where a board is reachable) runtime-gated
 - AGX Orin (sm_87) and NVIDIA Thor (Blackwell) first. Evidence:
 `.agents/specs/cuda-arch-*.md`, `.agents/backend-matrix.md`.
+
+**DeepSeek-V4-Flash HW-fit correction (2026-07-28, records-only, NOT APPLICABLE — no measurement).**
+The W1 "does not fit one GB10" verdict was NVFP4-only (156.7 GiB). The ungated
+`unsloth/DeepSeek-V4-Flash-GGUF` `UD-IQ2_XXS` (90.9 GB, 3 shards) FITS the 119 GiB
+GB10 with ~28 GiB headroom (measured via HF `files_metadata`). Two vehicles:
+single-Spark ~2-bit GGUF (reference: llama.cpp-on-box; needs a V4-GGUF loader + IQ
+i-quant dequant) or 2x-Spark NVFP4/fp8. No throughput number is taken or owed until
+the forward (W3-W8) lands. `benchmark_binding=false`.
+
+**DeepSeek-V4 same-quant GGUF benchmark loadability — source-level spike (2026-07-28,
+`CLAIM-DSV4-GGUF-SPIKE`, records-only, NOT APPLICABLE — no measurement).** Answers
+whether we can benchmark our engine vs vLLM on the SAME `UD-IQ2_XXS` GGUF (apples-to-apples).
+**VERDICT: NOT viable today — blocked on BOTH engines.** vLLM 0.26 moved GGUF out-of-tree
+to `vllm-gguf-plugin` (uninstalled on the oracle, along with the `gguf` lib); the plugin
+DOES dequant IQ2_XXS (`triton/dequantize/iq_quant/iq2_xxs.py` + CUDA `csrc/gguf/dequantize.cuh`),
+but `DeepseekV4ForCausalLM` (`vllm/models/deepseek_v4/nvidia/model.py:1333`) has no
+`packed_modules_mapping`/GGUF wiring and DeepSeek is absent from the plugin's tested
+models — so V4-from-GGUF is unproven/likely-broken in vLLM. Our engine hard-rejects GGUF
+for DeepSeek-V4/V2 (`deepseek_v4_registry.cpp:61-64`) and our dequant
+(`gguf_dequant.cpp:85-160`) covers only F32/F16/BF16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/NVFP4 —
+NO IQ2_XXS, NO Q2_K. The `UD-Q2_K_XL` k-quant fallback does NOT rescue it (same V4 reject +
+no Q2_K dequant our side; no V4 gguf wiring vLLM side). DGX `/` at 99% (~53 GiB free) — the
+91 GB won't fit without freeing to ~100 GiB. **Fallbacks (grounded):** (1) DeepSeek-V4
+apples-to-apples = the NVFP4 2×-Spark vehicle (both engines have a real NVFP4 path), NOT
+GGUF; (2) the GGUF vehicle's reference stays llama.cpp-on-card (ours-only; vLLM would run
+NVFP4/fp8 = cross-quant, not apples-to-apples); (3) a true same-GGUF-quant cross-engine
+number is only available on a Qwen3/dense k-quant that BOTH engines already load (our
+`qwen3_5_gguf_weights.cpp` ∩ the plugin's tested Qwen3 support), not DeepSeek-V4. IQ2_XXS
+port source = llama.cpp `ggml-quants.c` `dequantize_row_iq2_xxs` + `iq2xxs_grid` codebook.
+`benchmark_binding=false`.

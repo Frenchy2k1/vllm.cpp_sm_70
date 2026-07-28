@@ -30762,3 +30762,80 @@ design.
 Records (ONE commit): the `GD4` case + the loader fix, `specs/gguf-dflash-draft.md`
 (the third trap, the gate dispositions, the `GD4` row), `engine-matrix.md`,
 `parity-ledger.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`, this entry.
+---
+
+## 2026-07-28 — DeepSeek-V4-Flash single-Spark IS viable via UD-IQ2_XXS GGUF (user correction)
+
+User flagged `DeepSeek-V4-Flash-UD-IQ2_XXS-*.gguf` fits — CONFIRMED (HF files_metadata):
+`unsloth/DeepSeek-V4-Flash-GGUF` UD-IQ2_XXS = **90.9 GB** (3 shards), fits the 119 GiB
+GB10 with ~28 GiB headroom (also UD-IQ1_S 82.5 / UD-IQ1_M 86.9 / UD-IQ2_M 90.9 /
+UD-Q2_K_XL 96.8 all fit; UD-IQ3_S+ 117-162 GB don't). Corrects the W1 "does not fit"
+verdict, which was NVFP4-only (156.7 GiB). TWO vehicles: single-Spark IQ2_XXS GGUF vs
+2×-Spark NVFP4/fp8. GGUF caveat: pinned vLLM can't load V4-from-GGUF → reference is
+llama.cpp-on-box (derive-and-ship), and we need a V4-GGUF loader + IQ i-quant dequant
+(IQ1_S/IQ2_XXS/IQ2_M — NOT in our C4 K-quant set). Appended to specs/deepseek-v4-flash.md
+§HW-FIT CORRECTION. Records-only.
+
+## 2026-07-28 — DeepSeek-V4 GGUF benchmark loadability spike (`CLAIM-DSV4-GGUF-SPIKE`, records-only)
+
+Base `main` `e0b233df`, isolated worktree `.claude/worktrees/agent-a19a1d1e4dc82becb`.
+Question: can we bench our engine vs vLLM on the SAME `UD-IQ2_XXS` GGUF? Read-only
+source inspection on DGX `dgx.casa` (host `promaxgb10-4ad8`): pinned `/home/mudler/vllm-src`
+(0.26.0.dev0), installed oracle `~/venvs/vllm-oracle` (dist-info 0.25.0), and the
+`vllm-project/vllm-gguf-plugin@main` GitHub tree (via `gh api`). **VERDICT: NO —
+same-quant IQ2_XXS GGUF benchmark is blocked on BOTH engines.**
+
+- **Q1 (vLLM i-quant dequant): YES via the OOT plugin only.** vLLM 0.26 migrated GGUF
+  out-of-tree to `vllm-gguf-plugin` (`vllm-src/docs/features/quantization/gguf.md:9`).
+  Verified NO in-tree gguf: no `layers/quantization/gguf.py`, zero `GGMLQuantizationType`/
+  `import gguf` in the `vllm` pkg, no `csrc` gguf kernels, no `ggml_dequant` symbol in the
+  oracle `*.abi3.so`. The plugin DOES dequant IQ2_XXS: `triton/dequantize/iq_quant/iq2_xxs.py`
+  (+ iq1_s/iq1_m/iq2_s/iq2_xs/iq3_s/iq3_xxs/iq4_nl/iq4_xs) and CUDA `csrc/gguf/dequantize.cuh`+`vecdotq.cuh`.
+- **Q2 (DeepSeek-V4 gguf in vLLM): NO/unproven.** `DeepseekV4ForCausalLM`
+  (`vllm/models/deepseek_v4/nvidia/model.py:1333`) = `(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts)`
+  — no `SupportsQuant`, no class `packed_modules_mapping` (plugin `quantization/config.py:76,82`
+  needs it), zero gguf refs in the pkg; DeepSeek absent from the plugin's tested-model table.
+  (Contrast `deepseek_v2.py:1763` which DOES define packed_modules_mapping.)
+- **Q3 (gguf dep):** oracle has NEITHER `gguf` NOR the plugin installed. Plugin pyproject
+  pins `dependencies = ["gguf>=0.17.0", "vllm", "torch>=2.9"]`; `gguf>=0.17` reads i-quants.
+  Needs a scratch venv (never mutate the oracle).
+- **Q4 (ours):** `deepseek_v4_registry.cpp:61-64` (and `deepseek_v2_registry.cpp:67-69`)
+  hard-throw "does not support GGUF weights" unless `kSafetensors`. Our dequant
+  `gguf_dequant.cpp:85-160` + `vt/dtype.cpp:95-97` cover ONLY F32/F16/BF16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/NVFP4;
+  Q2_K(10) + IQ2_S(22)/IQ4_XS(23) have reader sizing traits only (`gguf_reader.cpp:210,230,236`),
+  IQ2_XXS/IQ1_S absent entirely. IQ2_XXS port source = llama.cpp `ggml-quants.c`
+  `dequantize_row_iq2_xxs` + `iq2xxs_grid` codebook.
+- **Ops:** DGX `/` at 99% (~53 GiB free); the 90.9 GB IQ2_XXS won't fit — HF cache holds
+  only config.json (28 KB). Freeing to ~100 GiB is a hard prereq.
+- **Q2_K_XL fallback does NOT rescue it** (same V4 GGUF-reject our side, no Q2_K dequant,
+  no V4 gguf wiring vLLM side). **FALLBACK:** DeepSeek-V4 apples-to-apples = the NVFP4
+  2×-Spark vehicle; the GGUF vehicle stays llama.cpp-on-card (ours-only); a true
+  same-GGUF cross-engine number is only available on a Qwen3/dense k-quant both load.
+
+Appended to specs/deepseek-v4-flash.md §GGUF benchmark loadability + BENCHMARKS + STATUS +
+ledger. Records-only; no build/GPU/download/benchmark.
+- **2026-07-28** — **Scale-out W1 LANDED (`CLAIM-SCALE-OUT-W1`, CPU exact-gate, NOT
+  pushed).** First distributed-execution brick: `vt::Communicator`
+  (`include/vt/communicator.h`) — a device-bound process-group ported 1:1 from
+  vLLM's `DeviceCommunicatorBase` (`base_device_communicator.py:147`) + the
+  `GroupCoordinator` `world_size==1` bypass (`parallel_state.py:638`), exposing
+  `rank()`/`world_size()` + `AllReduce`(sum/max/min/prod)/`AllGather`/`Send`/`Recv`,
+  each stream-ordered on a `Queue&` (composes with compute via the existing
+  `Backend::RecordEvent`/`QueueWaitEvent`, `backend.h:87-104`). Transport = a CPU
+  **in-process multi-rank** communicator (`src/vt/communicator.cpp`, `CpuCommGroup`):
+  N ranks = N host threads sharing ONE generation-barrier + staging slots + a
+  Send/Recv rendezvous mailbox — a REAL cross-rank reduction, no IPC, which
+  sidesteps the W2 per-device backend-registry blocker (`backend.cpp:42`,
+  untouched). Chose direct `Communicator` methods over `OpId` dispatch (cleaner W1
+  gate; collective-op `OpProvider` routing deferred to W2, enum unpolluted). Gate
+  `tests/vt/test_communicator.cpp`: **8 cases / 50 assertions PASS** — 2- & 4-rank
+  AllReduce-sum exact on every rank (f32/i32/i64/bf16), max/min, 2/4-rank AllGather
+  concat, Send/Recv rendezvous, `world_size==1` byte-identical no-op. **RED-first
+  proven** (non-reducing stub fails 4 cases / 37 assertions). Clean full-library
+  CPU `-Werror` build, 0 warnings; full vt/engine suite stays green (additive,
+  unused by the single-GPU path). Records: `BACKEND-DISTRIBUTED-COMM` SPIKE→ACTIVE
+  (other 4 stay SPIKE); spec §W1 done; feature-matrix §3, roadmap scale-out,
+  coordination, STATUS, BENCHMARKS (NOT-APPLICABLE — infra), parity-ledger. All 6
+  record checkers rc=0. W2+ residuals: collective `OpId`/`OpProvider` routing, TP
+  forward+loader, NCCL(kCUDA)/RoCE(Spark)/MLX-ring(kMETAL) transports, the
+  per-device backend registry, real TP/PP in the model forwards.
