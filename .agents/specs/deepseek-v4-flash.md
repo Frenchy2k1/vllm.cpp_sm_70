@@ -322,3 +322,66 @@ Construct ≠ run. W1 must PROVE the pinned oracle LOADS+RUNS+GENERATES the chos
   ships its own DSV4 sparse backend, so the V3.2 sm_120 XQA-dense block may not apply — W1 decides.
 - This is a MULTI-brick campaign, the largest single-model effort in the matrix; W1 is the gate
   that decides whether it is reachable at all on GB10.
+
+---
+
+## 8. W1/W2 IMPLEMENTATION LANDED (2026-07-28, `CLAIM-DEEPSEEK-V4-IMPL`)
+
+**Base:** current `main` HEAD `df18ca918160a8a8741382a07c7ee8a7323efd00` (`git rev-parse HEAD`).
+Row `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` TRANSFERRED here from the stale/no-worktree
+`CLAIM-GLM-DSA-LATEST-DEEPSEEK` (user-directed pickup). CPU-side scaffolding only — no GPU, no
+download; foreground; NOT pushed.
+
+### 8.1 Additive TUs (SACRED-inert — zero edits to existing model forwards)
+- `include/vllm/model_executor/models/deepseek_v4.h` — `DeepseekV4Params` + `ParseDeepseekV4Params`
+  + weights struct + `DeepseekV4Model` (stub forward) + `MakeDeepseekV4KVCache` (stub).
+- `src/vllm/model_executor/models/deepseek_v4_weights.cpp` — config parse + the checkpoint
+  name-map + the W2 accounting pass.
+- `src/vllm/model_executor/models/deepseek_v4.cpp` — forward SKELETON: both entrypoints
+  `VT_CHECK(false, "W3-W8 pending")` (loud, never a silent wrong answer) + the reuse-wiring plan.
+- `src/vllm/model_executor/models/deepseek_v4_registry.cpp` — `REGISTER_VLLM_MODEL(deepseek_v4,
+  "DeepseekV4ForCausalLM", ...)`, one REGISTER line, ZERO shared-array edit (mirrors
+  `deepseek_v2_registry.cpp` / `gemma4_registry.cpp`).
+- `tests/vllm/models/test_deepseek_v4_scaffold.cpp` — 4/4 cases, 40/40 assertions.
+
+### 8.2 Loader VERIFIED vs the REAL checkpoint header (the concrete W2 gate)
+Evidence: `nvidia/DeepSeek-V4-Flash-NVFP4` `model.safetensors.index.json` (135,235 tensors, 46
+shards) + shard-2 safetensors header, both fetched by HTTP range (NO ~156 GiB download). Confirmed
+name map + dtypes/shapes (checkpoint uses a FLAT `layers.N.` prefix):
+- **512-wide MLA (FP8-block E4M3 + E8M0 block scale):** `attn.wq_a` [1024,4096], `attn.wq_b`
+  [32768,1024] (= 64 heads × **512 head_dim**), `attn.wkv` [512,4096], **grouped OUTPUT-LoRA**
+  `attn.wo_a` [8192,4096] (= o_groups 8 × o_lora_rank 1024) / `attn.wo_b` [4096,8192],
+  `attn.q_norm` [1024] / `attn.kv_norm` [512] BF16, `attn.attn_sink` [64] F32 (per-head sink).
+- **DSA:** `attn.compressor.{ape,norm,wgate,wkv}` on 41 layers (compress_ratio≠0);
+  `attn.indexer.{compressor.*, weights_proj, wq_b}` on 21 layers (compress_ratio==4).
+- **MHC:** `hc_attn_fn` [24,16384] = (2+hc_mult)·hc_mult × hc_mult·H, `hc_{attn,ffn}_{base,fn,scale}`
+  F32 per layer + model-level `hc_head_{base,fn,scale}`.
+- **MoE:** `ffn.gate.weight` [256,4096]; **3 hash layers** (0,1,2) carry `ffn.gate.tid2eid` and NO
+  bias, the other 40 carry `ffn.gate.bias` (noaux_tc); `ffn.shared_experts.w{1,2,3}` FP8-block;
+  **256 NVFP4 routed experts** `ffn.experts.E.w{1,2,3}.{weight[U8], weight_scale[E4M3,group16],
+  weight_scale_2[F32], input_scale[F32]}`. `mtp.*` (num_nextn_predict_layers=1) SKIPPED (mirrors
+  vLLM `AutoWeightsLoader(skip_substrs=["mtp."])`, nvidia/model.py:1474).
+
+The loader's accounting pass (`deepseek_v4_weights.cpp`) enumerates this exact schema from the
+parsed params (array-driven per-layer branching for hash/compressor/indexer) and `VT_CHECK`s every
+expected tensor is present — the W2 "loader accounts for 100% of tensors" gate, encoded.
+
+### 8.3 HW-FIT REVERSAL (corrects §0 / §3 — the spike's central premise was wrong)
+The index `total_size` = **168,266,793,544 B = 156.7 GiB**. The spike's "~83 GiB (W4-everything)
+FITS" was a bad estimate: only the 256 routed experts are NVFP4/W4; the 512-wide MLA linears and
+the shared experts are FP8 block (`exclude_modules: *.attn.*, *.ffn.shared_experts.*, head,
+mtp.*`), and NVFP4 carries a double weight-scale + input-scale. So this "NVFP4" checkpoint is ~the
+same size as the native fp4 (148.7 GiB) and **does NOT fit ONE GB10's 119 GiB unified pool.**
+⇒ **W1 (single-GB10 oracle run) is MEMORY-INFEASIBLE**, not merely disk-contended. Reaching a
+runnable oracle gate needs: multi-node tensor-parallel (the cluster — Thor/Orin/DGX), CPU/unified
+offload, or a more aggressive quant (GGUF Q2 ~55 GiB — but V4 has no oracle/engine GGUF path).
+The disk-free recipe in §4 is necessary-but-insufficient; the binding constraint is memory.
+
+### 8.4 W1 disposition + residuals
+- **W1 — DEFERRED (memory-infeasible on one GB10, box also contended).** If/when a multi-GB10 TP
+  or offload path is stood up: free disk ≥170 GiB, fetch `nvidia/DeepSeek-V4-Flash-NVFP4`, `flock`,
+  do NOT pass `deep_gemm_mega_moe` (SM100-only), greedy golden. DEP-risk unchanged: flashinfer must
+  carry the DSV4 sparse-MLA symbols.
+- **W3-W8** unchanged from §5 (512-wide MLA dense-first → DSA indexer/compressor → MHC →
+  sqrtsoftplus/hash MoE → forward compose → strict gate). W2b = materialize the FP8-block + NVFP4
+  towers (reuse `cuda_matmul_nvfp4_sm100` + the fp8 block loaders) into the accounted layout.

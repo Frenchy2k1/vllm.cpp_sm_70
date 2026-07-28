@@ -79,6 +79,12 @@ vllm_cpp_add_test(test_deepseek_v2_load vllm/models/test_deepseek_v2_load.cpp)
 vllm_cpp_add_test(test_deepseek_v2_forward vllm/models/test_deepseek_v2_forward.cpp)
 target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# DeepSeek-V4-Flash (DeepseekV4ForCausalLM) W1/W2 scaffolding gate: the arch
+# resolves through the registry + the shipped config descends through
+# ParseDeepseekV4Params. No checkpoint / GPU — the forward + strict gate are
+# named W3-W8 residuals (.agents/specs/deepseek-v4-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
+
 # MLA CAMPAIGN W8 (DeepSeek-V2-Lite, DeepseekV2ForCausalLM) — the SACRED MLA
 # greedy correctness gate: drives a compact prompt battery through the paged
 # engine and checks STRICT token-exact agreement with the vLLM 0.25.0 oracle
