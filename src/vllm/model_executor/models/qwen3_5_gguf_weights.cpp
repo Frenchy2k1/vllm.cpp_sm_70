@@ -744,6 +744,47 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf) {
   return c;
 }
 
+// `SPEC-DFLASH-GGUF` B1. Contract + rationale in the header; the two things
+// worth restating at the code are why this is a plain bf16 read and what it
+// reuses.
+//
+// PLAIN BF16, on purpose, to match the safetensors side byte for byte: the
+// draft's `ResidentWeight` views are `{vocab, H}` gather + `[N, K]` MatmulBT,
+// so a keep-F16 or block-quantized residency would be a different tensor for
+// the same weight depending on the target's container. `OwnBf16` also carries
+// the `<stem>.scale` sidecar resolution (`DqSlabs` -> `GgufGlobalScales`), so
+// an NVFP4-stored head is dequantized with its per-tensor factor rather than
+// silently off by ~1e4.
+//
+// TIED FALLBACK, reusing the trunk's rule verbatim rather than a second one:
+// a GGUF that omits `output.weight` has the head aliased onto the embedding
+// (llama.cpp TENSOR_DUPLICATED), and `LoadEmbedAndHead` above resolves it the
+// same way. The two copies here are NOT buffer-shared the way that function's
+// L5 tied-head sharing is: these are the draft's own host tensors, one of them
+// transposed in meaning (nk) though not in bytes, and the draft is loaded once
+// at startup. Correctness first; the sharing is an RSS optimization that only
+// pays on a tied file, which neither gate model is.
+void LoadGgufSharedEmbedAndHeadBf16(const GgufFile& g, OwnedTensor* embed,
+                                    OwnedTensor* head) {
+  const std::string kEmbed = "token_embd.weight";
+  VT_CHECK(HasTensor(g, kEmbed),
+           "gguf shared head: the target file has no " + kEmbed +
+               " (a DFlash draft has no embedding of its own and reads the "
+               "target's)");
+  const GgufTensorInfo& et = g.Get(kEmbed);
+  VT_CHECK(et.shape.size() == 2, "gguf shared head: " + kEmbed + " must be 2-D");
+  *embed = OwnBf16(g, kEmbed, et.shape);  // [vocab, H]
+  embed->nk = false;                      // a gather table, not a GEMM weight.
+
+  const bool tied = !HasTensor(g, "output.weight");
+  const std::string head_name = tied ? kEmbed : "output.weight";
+  const GgufTensorInfo& ht = g.Get(head_name);
+  VT_CHECK(ht.shape.size() == 2,
+           "gguf shared head: " + head_name + " must be 2-D");
+  *head = OwnBf16(g, head_name, ht.shape);  // [N = vocab, K = H]
+  head->nk = true;
+}
+
 // --- weights -------------------------------------------------------------
 
 namespace {

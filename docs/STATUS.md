@@ -62,7 +62,7 @@ token-for-token correctness against the pinned oracle.
 | InternLM3 (`InternLM3ForCausalLM`, Llama alias) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm3-8b-instruct): 14/16 strict + 2/16 bf16 near-ties (max gap 0.0 nats), 0 divergent; a plain Llama architecture in vLLM 0.25.0 (registered as a one-line Llama alias; dynamic-NTK RoPE factor 6.0, GQA kv=2, untied lm_head), not InternLM2 + sliding window; zero forward or loader delta |
 | Long-context RoPE + sliding-window attention | Correctness feature-positive on GB10, speed-pending | Shared scaled-RoPE (YaRN, Llama-3, Phi-3/4 LongRoPE, dynamic-NTK) + sliding-window attention, GPU-gated vs the vLLM 0.26 oracle: LongRoPE (Phi-4-mini) + llama3 (Llama-3.2-1B) + dynamic-NTK (InternLM2) 16/16, sliding-window (Gemma-2/Gemma-3) 48/48, operator local-mask kernel positive. YaRN and chunked-local model e2e are reachable-blocked (no cached vehicle); speed pending |
 | Safetensors loading | Supported | Both gate models plus every registered dense/MoE family |
-| GGUF loading (F32/F16/BF16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/NVFP4) | Supported; compute-in-quant on CPU for the six block encodings; NVFP4 is materialize-only | Weights in six block encodings stay compressed from file to matmul on CPU (no BF16 expansion). NVFP4 (ggml type 40) now DEQUANTIZES, including the per-tensor (per-expert) `<stem>.scale` sidecar the container keeps outside the blocks; gated BIT-EXACT against the compressed-tensors NVFP4 path on real Qwen3.6-27B bytes from both containers. It expands to bf16 (no NVFP4 GGUF GEMM), and no NVFP4 GGUF model has been run end to end |
+| GGUF loading (F32/F16/BF16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/NVFP4) | Supported; compute-in-quant on CPU for the six block encodings; NVFP4 is materialize-only | Weights in six block encodings stay compressed from file to matmul on CPU (no BF16 expansion). NVFP4 (ggml type 40) now DEQUANTIZES, including the per-tensor (per-expert) `<stem>.scale` sidecar the container keeps outside the blocks; gated BIT-EXACT against the compressed-tensors NVFP4 path on real Qwen3.6-27B bytes from both containers. It expands to bf16 (no NVFP4 GGUF GEMM). An NVFP4 GGUF model HAS now been run end to end (Qwen3.6-27B, dgx GB10, coherent greedy output, and as a DFlash speculation target); because the expansion computes in bf16 it is a numerically different target from the safetensors sibling of the same quantization run, diverging at token 4 on a greedy prompt |
 | CPU backend vs llama.cpp | At or ahead on every axis (GGUF) | Prefill 1.18x ahead, decode at parity, peak memory 1.01x, byte-identical greedy tokens. Single-stream only; no concurrent-serving comparison has been measured |
 | Paged KV cache + prefix caching | Supported | Block-paged full attention, hybrid full-attention + GDN state groups, automatic prefix caching (APC) on by default for dense models (cache-ON gated end to end: token-identical output, cache hits, faster TTFT) |
 | KV offload to CPU / disk | Built, opt-in, off by default; the disk connector is engine-refused | CPU and disk tiers with identity-checked blocks, selected by `--kv-transfer-config` (or programmatically) over one abstract KVConnector ABI. Worker-side KV store/load is implemented for the LMCache connector only; the CPU/disk connector is scheduler-side only, so the engine now REFUSES it at construction (a loud error, not silently wrong output). Guide: [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
@@ -731,8 +731,26 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   must be back-filled from the target or the draft's shared embedding table is
   empty and the first proposal throws. Only the last survived the load-level
   tests, and only generating found it.
-  `PARTIAL`: axis B (GGUF target as well, needing the `SharedHeadSource` retype)
-  is untouched, and no speed number is owed or measured yet.
+  **Axis B (the TARGET is a GGUF too) now WORKS as well.** `SharedHeadSource`
+  replaces the safetensors-typed parameter that used to make the draft's shared
+  embedding and lm_head unavailable from a GGUF - which is why the GGUF path
+  refused dflash outright - and serves both tensors out of either container. On
+  the Qwen3.6-27B NVFP4 **GGUF** target with the same `Q4_K_M` GGUF draft, the
+  DFlash-ON continuation is token-for-token identical to that same target's
+  spec-OFF and the drafter is alive at 14/160 accepted.
+  Two things are worth stating plainly rather than rounding off. The spike's
+  highest-ranked risk - the draft scoring with a head dequantized out of a
+  quantized target - does not exist on this asset: the GGUF stores
+  `token_embd`/`output` as BF16 beside its NVFP4 body, byte-identical to the
+  safetensors sibling of the same quantization run, so the read is verbatim. And
+  acceptance IS lower than on the safetensors target (14/160 against 20/80, same
+  draft and prompt); that belongs to the GGUF target's compute path, not to the
+  shared head, because there is no NVFP4 GGUF GEMM yet, so the GGUF target
+  expands to bf16 while the safetensors target runs the true W4A4 kernels - the
+  two diverge at token 4 with no speculation anywhere.
+  Still `PARTIAL`: axis B is measured on one prompt at concurrency 1, the
+  acceptance characteristic above is understood but not addressed, and no speed
+  number is owed or measured yet.
 - **MTP speculative decoding from a GGUF target WORKS, on CPU and on the GB10
   release target** (`SPEC-MTP-GGUF`, `DONE`,
   [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads from a

@@ -473,3 +473,170 @@ TEST_CASE("dflash axis-A: a GGUF draft and a safetensors draft are the same draf
   CHECK(arm_a.proposed == arm_b.proposed);
   CHECK(arm_a.accepted == arm_b.accepted);
 }
+
+// ── SPEC-DFLASH-GGUF `GD7`: the axis-B end-to-end token + acceptance gate ───
+//
+// Axis B is "the TARGET is a GGUF too". Its whole content is `B1`: the draft
+// SHARES the target's bf16 `embed_tokens` + `lm_head`, and until `B1` that
+// sharing was typed as `const std::vector<SafetensorsFile>&`, so a GGUF target
+// could not supply it and `FromModelDir`'s GGUF branch REFUSED dflash outright.
+// `SharedHeadSource` re-expresses the seam as a source; `B2` deleted the
+// refusal; `B3` wired the load into the GGUF branch. This case is the first
+// thing that ever generated through it.
+//
+// WHAT IS ASSERTED, AND WHY IT IS NOT A CROSS-TARGET IDENTITY
+//
+// The axis-A case above could hard-assert cross-FORMAT token identity because
+// the two arms differed ONLY in where the DRAFT's bytes came from: same target,
+// same kernels, same numerics. Axis B cannot borrow that form, for a reason
+// that has nothing to do with this row: our two 27B containers do not compute
+// the same way. The safetensors NVFP4 target runs the true W4A4 fp4 GEMM path;
+// the GGUF NVFP4 target has no NVFP4 GGUF GEMM at all (`QUANT-GGUF-NVFP4` is
+// dequant-only, `docs/STATUS.md`), so on CUDA its weights EXPAND to bf16 and it
+// runs bf16 GEMMs. Two different kernel families over the same nominal weights
+// diverge at near-ties by construction. So a cross-target token identity would
+// be gating the containers' arithmetic, not axis B.
+//
+// The bars this case therefore binds are the ones axis B actually owns:
+//
+//   (a) MEASURED NONZERO ACCEPTANCE on the GGUF-target arm. This is the spike's
+//       HIGHEST-ranked risk made falsifiable: the draft scores with a bf16
+//       `lm_head` dequantized out of the target file while the target computes
+//       on its own path, so draft and target can score with numerically
+//       different heads and acceptance can move. Collapse to zero IS a defect
+//       (and is also exactly what a mis-wired shared head produces - a dead
+//       drafter still emits valid-looking logits). A lower-but-nonzero rate is
+//       a finding to record, not a failure, which is why the hard bar is
+//       nonzero and the COMPARISON below is reported.
+//   (b) NEAR-TIE-ROBUST vs the SAME target's spec-OFF, in the ratified `D5`
+//       form: identical, or a divergence that is not at index 0. Within one
+//       target this is meaningful and container-independent - a structural
+//       break in the shared-head wiring diverges at the very first token.
+//   (c) REPORTED, and CONDITIONALLY gated: the GGUF-target arm against the
+//       safetensors-target arm, DFlash-ON vs DFlash-ON, plus their spec-OFF
+//       controls. The spec-OFF pair is the honest discriminator: if the two
+//       containers agree token-for-token WITHOUT speculation then they are the
+//       same target numerically on this prompt, and only then is a difference
+//       in the DFlash-ON pair, or in the acceptance rate, chargeable to the
+//       shared head. In that case the acceptance rates are gated to agree
+//       within 25% relative. If the spec-OFF pair already differs, the arms are
+//       reported and nothing is charged to axis B.
+//
+// ASSET-GATED (dgx-only): `VLLM_DFLASH_TARGET_B` (the `.gguf` target) and
+// `VLLM_DFLASH_DRAFT`; `VLLM_DFLASH_TARGET` (the safetensors target) optional
+// and enables (c). Absent => loud SKIP, so CI stays asset-free.
+namespace {
+
+// One spec-OFF arm on its own engine, scoped so peak RSS stays at one 27B.
+std::vector<int32_t> RunSpecOff(const std::string& target,
+                                const std::string& prompt, int max_tokens,
+                                const vllm::entrypoints::EngineParams& base,
+                                const char* request_id) {
+  MESSAGE("GD7: loading target " << target << " spec-OFF...");
+  auto loaded = vllm::entrypoints::LoadedEngine::FromModelDir(target, base);
+  const vllm::RequestOutput out =
+      loaded->engine().generate(prompt, Greedy(max_tokens), request_id);
+  REQUIRE(out.finished);
+  REQUIRE(out.outputs.size() == 1);
+  MESSAGE("GD7 spec-OFF [" << target << "] text=\"" << out.outputs[0].text
+                           << "\"");
+  return out.outputs[0].token_ids;
+}
+
+double AcceptRate(const SpecArm& a) {
+  return a.proposed > 0 ? static_cast<double>(a.accepted) /
+                              static_cast<double>(a.proposed)
+                        : 0.0;
+}
+
+std::string DiffVerdict(const std::vector<int32_t>& a,
+                        const std::vector<int32_t>& b) {
+  const std::size_t d = FirstDiff(a, b);
+  return d == std::string::npos
+             ? std::string("IDENTICAL")
+             : "first divergence at index " + std::to_string(d);
+}
+
+}  // namespace
+
+TEST_CASE("dflash axis-B: a GGUF target serves the draft's shared head") {
+  const std::string target_g = Env("VLLM_DFLASH_TARGET_B");
+  const std::string target_s = Env("VLLM_DFLASH_TARGET");
+  const std::string draft = Env("VLLM_DFLASH_DRAFT");
+  if (target_g.empty() || draft.empty()) {
+    MESSAGE("SKIP: set VLLM_DFLASH_TARGET_B (a .gguf target) and "
+            "VLLM_DFLASH_DRAFT (a .gguf draft, a checkpoint dir, or an HF repo "
+            "id); VLLM_DFLASH_TARGET (the safetensors target) is optional and "
+            "enables the cross-target comparison");
+    return;
+  }
+  REQUIRE(fs::exists(target_g));
+
+  const int max_tokens = EnvInt("VLLM_DFLASH_MAX_TOKENS", 24);
+  const int k = EnvInt("VLLM_DFLASH_K", 16);
+  std::string prompt = Env("VLLM_DFLASH_PROMPT");
+  if (prompt.empty()) prompt = "The capital of France is";
+
+  vllm::entrypoints::EngineParams base;
+  base.max_num_seqs = 2;  // bound the k+1 GDN spec-state slots (~2.4 GiB/req).
+
+  const std::vector<int32_t> off_g =
+      RunSpecOff(target_g, prompt, max_tokens, base, "gd7-off-gguf");
+  REQUIRE(!off_g.empty());
+  MESSAGE("GD7 ids GGUF-target spec-OFF: " << Ids(off_g));
+
+  const SpecArm arm_g =
+      RunDflashOn(target_g, draft, k, prompt, max_tokens, base, "gd7-on-gguf");
+
+  // (a) The load-bearing half. Checked first: no near-tie envelope can excuse a
+  // collapsed acceptance, and a dead drafter is what a mis-wired shared head
+  // looks like from the outside.
+  CHECK(arm_g.proposed > 0);
+  CHECK(arm_g.accepted > 0);
+
+  // (b) The ratified `D5` near-tie form, WITHIN the GGUF target.
+  MESSAGE("GD7 GGUF-target spec-ON vs its own spec-OFF: "
+          << DiffVerdict(arm_g.ids, off_g));
+  CHECK(FirstDiff(arm_g.ids, off_g) != 0u);
+
+  if (target_s.empty()) {
+    MESSAGE("GD7: VLLM_DFLASH_TARGET unset, cross-target comparison (c) NOT "
+            "run");
+    return;
+  }
+
+  // (c) The cross-target comparison, with its own spec-OFF control so a
+  // difference is attributable before it is charged to anything.
+  const std::vector<int32_t> off_s =
+      RunSpecOff(target_s, prompt, max_tokens, base, "gd7-off-st");
+  const SpecArm arm_s =
+      RunDflashOn(target_s, draft, k, prompt, max_tokens, base, "gd7-on-st");
+  CHECK(arm_s.proposed > 0);
+  CHECK(arm_s.accepted > 0);
+
+  const bool targets_agree = FirstDiff(off_s, off_g) == std::string::npos;
+  MESSAGE("GD7 CROSS-TARGET spec-OFF " << target_s << " vs " << target_g << ": "
+          << DiffVerdict(off_s, off_g));
+  MESSAGE("GD7 CROSS-TARGET spec-ON  " << target_s << " vs " << target_g << ": "
+          << DiffVerdict(arm_s.ids, arm_g.ids));
+  MESSAGE("GD7 ACCEPTANCE safetensors-target " << arm_s.accepted << "/"
+          << arm_s.proposed << " (" << AcceptRate(arm_s)
+          << ") vs GGUF-target " << arm_g.accepted << "/" << arm_g.proposed
+          << " (" << AcceptRate(arm_g) << ")");
+
+  if (!targets_agree) {
+    MESSAGE("GD7: the two containers already disagree WITHOUT speculation, so "
+            "the DFlash-ON difference and the acceptance delta are NOT "
+            "chargeable to the shared head; reported only");
+    return;
+  }
+  // The containers are the same target on this prompt, so the shared head is
+  // the only thing left that could move acceptance. This is the spike's
+  // highest-ranked risk, gated.
+  const double rs = AcceptRate(arm_s);
+  const double rg = AcceptRate(arm_g);
+  MESSAGE("GD7: containers agree spec-OFF; gating the acceptance ratio "
+          << (rs > 0.0 ? rg / rs : 0.0));
+  CHECK(rs > 0.0);
+  CHECK(std::abs(rg - rs) <= 0.25 * rs);
+}

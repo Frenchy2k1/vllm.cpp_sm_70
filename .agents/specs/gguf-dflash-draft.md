@@ -258,13 +258,28 @@ gates.
    was "GGUF draft == safetensors draft", which is what is measured; an earlier
    attempt to gate on `spec-ON == spec-OFF` instead was wrong for DFlash and is
    recorded under `GD4` below.
-4. **Axis-B token identity, c1.** GGUF target spec-ON == spec-OFF.
-5. **Acceptance parity. MET 2026-07-28**, and stronger than "within noise":
-   EXACTLY equal on both prompts (20/80 and 42/96). Q4_K_M costs this draft
-   nothing in acceptance on this target, which the spike had flagged as a real
-   risk. Two prompts is the evidence, not a general claim.
+4. **Axis-B token identity, c1. MET 2026-07-28**, in its strict form: on the
+   GGUF target the DFlash-ON continuation is token-for-token identical to that
+   same target's spec-OFF, 24/24. Note this is a WITHIN-target bar. A
+   CROSS-target one was considered and rejected on evidence: the two containers
+   diverge at index 4 without any speculation, so it would gate their arithmetic
+   rather than this row (see the axis-B section above).
+5. **Acceptance parity. MET for axis A 2026-07-28**, and stronger than "within
+   noise": EXACTLY equal on both prompts (20/80 and 42/96). Q4_K_M costs this
+   draft nothing in acceptance on the safetensors target, which the spike had
+   flagged as a real risk. Two prompts is the evidence, not a general claim.
+   **For axis B: MEASURED, nonzero, and lower** - 14/160 vs 20/80 same-draft
+   same-prompt - with the cause established as the GGUF target's bf16 compute
+   path and the shared head EXCLUDED by a byte comparison. Recorded as a
+   finding, per the risk decision below.
 6. **Speed: PENDING, not owed by this row.** Owes a `docs/BENCHMARKS.md`
    disposition, which may be `PENDING` with the reproduction command.
+7. **Shared-head equivalence (B). MET 2026-07-28**, twice over: three synthetic
+   `LoadGgufSharedEmbedAndHeadBf16` unit cases (untied head really comes from
+   `output.weight`, the tied fallback, the `nk` orientations, a missing
+   `token_embd` refused) plus the byte comparison on the REAL 27B pair. The
+   spike wrote this gate as "over an F16 GGUF"; the real asset stores the pair
+   as ggml BF16, which is a strictly stronger substrate for the same claim.
 
 ## Dependencies
 
@@ -294,13 +309,49 @@ gates.
 | `GD2` | **DONE 2026-07-28.** `LoadQwen3DFlashFromGguf` via a `TensorResolver` over dequantized bf16 views, delegating to the EXISTING `LoadQwen3DFlash` so its qkv / gate_up row concatenation is reused unchanged. The resolver seam is correct HERE (unlike the MTP head) precisely because dflash norms are RAW and the draft is small enough to dequant wholesale. | Resolver unit tests; gate 2 | `GD0` |
 | `GD3` | **DONE 2026-07-28.** `IsDflashGgufDraft` + the `.gguf` branch in `ResolveDflashDraftDir` / `LoadDflashDraft` (`src/vllm/entrypoints/model_loader.cpp`). Target-shared embed/lm_head still come from `target_shards`, so axis A is complete. | Path-discrimination test | `GD1`, `GD2` |
 | `GD4` | **DONE 2026-07-28 - axis A PASSES end to end on GB10, and it found a defect that only generating could find.** `tests/parity/test_qwen27_dflash_spec_decode.cpp` second case, env-driven draft source. Fixed `LoadDflashDraft`'s GGUF branch to back-fill `config.vocab_size` from the target's `embed_tokens` rows: it was 0, the draft's embedding view was therefore EMPTY, and the first propose threw. Result: GGUF-draft DFlash-ON == safetensors-draft DFlash-ON token-for-token with identical accepted/proposed, on two prompts. See the gate-form correction below | Gates 3, 5 | `GD3` |
-| `GD5` | `SharedHeadSource` + its equivalence test | Gate 7 | `GD4` |
-| `GD6` | Drop `dflash` from the GGUF rejection; wire the GGUF branch | Gate 1 | `GD5` |
-| `GD7` | Axis-B token gate | Gate 4 | `GD6` |
+| `GD5` | **DONE 2026-07-28.** `SharedHeadSource` (`src/vllm/entrypoints/model_loader.cpp`) re-expresses the shared-head seam as a SOURCE and re-types `LoadDflashDraft`'s second parameter; its GGUF arm is `LoadGgufSharedEmbedAndHeadBf16` (`src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp`), which reuses the trunk loader's tied-embedding rule and its sidecar-aware dequant rather than restating either. The shared-head load also MOVED out of the two draft-source branches into one common tail, so the four (draft format x target container) combinations run identical code | Gate 7 | `GD4` |
+| `GD6` | **DONE 2026-07-28.** The `dflash` half of the GGUF-branch rejection is deleted (`model_loader.cpp`); the `mtp` half is untouched | Gate 1 | `GD5` |
+| `GD7` | **DONE 2026-07-28 - axis B GENERATES on GB10.** `maybe_load_dflash`'s equivalent wired into the GGUF branch; e2e gate `tests/parity/test_qwen27_dflash_spec_decode.cpp` third case. See the axis-B result below | Gate 4 | `GD6` |
 | `GD8` | Record: STATUS, BENCHMARKS, matrix, ledger | Checkers green | `GD7` |
 
 `GD0`-`GD4` are axis A and independently shippable; the row can legitimately rest
 at `PARTIAL` after `GD4`.
+
+## The axis-B result, and the risk that did NOT materialize (`GD5`-`GD7`)
+
+Axis B WORKS. On dgx GB10 sm_121a, the Qwen3.6-27B NVFP4 **GGUF** target plus the
+`Q4_K_M` **GGUF** draft loads, wires the shared head out of the target file
+(`shared head from the GGUF target file`) and generates a coherent continuation,
+with the DFlash-ON sequence **token-for-token IDENTICAL to that same target's
+spec-OFF** on the c1 24-token prompt - the strict form of gate 4, not merely the
+near-tie-robust one. Acceptance is alive at **14/160**. One prompt at c1; the
+case asserts the near-tie-robust form so it does not become brittle.
+
+**The spike ranked the shared-head dequant as its highest risk** (the draft would
+score with a bf16 head dequantized from quantized target blocks while the target
+computed on its own path). On this asset that risk is EMPTY, and the reason is
+worth recording because it is a property of the container, not of luck: the 27B
+NVFP4 GGUF stores `token_embd.weight` and `output.weight` as ggml **BF16 (type
+30)** beside its NVFP4 body. Byte-compared against the safetensors sibling of the
+same quantization run, both are **bit-identical - 2,542,796,800 bytes each, zero
+differing bytes**. So B1's "dequant" of the shared head is a verbatim bf16 read,
+and the draft scores with exactly the head it scores with on axis A. A GGUF that
+DID quantize its head would re-open the risk, which is why the gate stays a
+measurement rather than an assumption.
+
+**Acceptance IS lower on the GGUF target - 14/160 (0.0875) vs 20/80 (0.25) on the
+safetensors target, same draft, same prompt - and it is NOT chargeable to the
+shared head.** The two containers are not the same target: their spec-OFF
+continuations already diverge at index 4 with NO speculation anywhere, and the
+DFlash-ON pair diverges at exactly that same index 4. The cause is `QUANT-GGUF-NVFP4`
+being dequant-only - there is no NVFP4 GGUF GEMM, so on CUDA the GGUF target
+EXPANDS to bf16 and computes in bf16 while the safetensors target runs the true
+W4A4 fp4 kernels. A drafter proposing for a numerically different target agrees
+with it less often. The honest disposition is therefore: axis B's wiring is
+correct and proven, and the acceptance number belongs to the GGUF target's
+compute path, which a native NVFP4 GGUF GEMM would change. This also settles
+what a cross-target token gate would have measured: the containers' arithmetic,
+never this row.
 
 ## Risks/decisions
 
@@ -314,6 +365,16 @@ at `PARTIAL` after `GD4`.
   measures it. DECISION: treat an acceptance drop here as a finding to document,
   not a bug to hide; if it collapses, the honest output is a documented minimum
   target quantization for dflash.
+  **OUTCOME 2026-07-28: the premise is FALSE on this asset, and the decision
+  still stands for others.** "On axis B that lm_head is quantized in the target
+  GGUF" is what the spike assumed; the 27B NVFP4 GGUF actually stores
+  `token_embd`/`output` as ggml BF16 beside its NVFP4 body, byte-identical to the
+  safetensors sibling, so nothing is dequantized and both arms score with the
+  SAME head. Acceptance did drop (14/160 vs 20/80), and it is precisely the byte
+  comparison that let that be attributed to the GGUF target's bf16 compute path
+  instead. The "documented minimum target quantization" contingency is therefore
+  NOT owed; what a future quantized-head GGUF owes is a re-measurement, not a
+  re-design.
 - **RISK: `dflash.target_layers` must MATCH the target actually being served.**
   The draft taps specific target layers. A draft converted against a different
   target build, or paired with a different target than the one it was made for,

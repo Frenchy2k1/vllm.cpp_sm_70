@@ -3112,6 +3112,58 @@ and `CUDA_VISIBLE_DEVICES=` for its CPU arm. The still-owed speed number is the
 spec-ON/spec-OFF throughput A/B on the same file and box. Closing commit for the
 row: `edf91449`.
 
+### DFlash-from-GGUF axis B e2e, `SPEC-DFLASH-GGUF` GD5-GD7 (2026-07-28) - correctness MET, speed PENDING
+
+**Benchmark disposition: PENDING - a correctness checkpoint; no throughput number
+is owed by this row and none is published. `benchmark_binding=false`.** The
+spec's gate 6 says so explicitly. Axis B additionally cannot produce a
+meaningful throughput comparison against its safetensors sibling yet, for a
+reason that is not about speculation: `QUANT-GGUF-NVFP4` is dequant-only, so on
+CUDA the GGUF target expands to bf16 and runs bf16 GEMMs while the safetensors
+target runs the true W4A4 fp4 kernels. Any A/B between them would be measuring
+that, not the draft. The number this row will owe once a native NVFP4 GGUF GEMM
+exists is the DFlash-ON throughput A/B between the two target containers on the
+same box.
+
+**What DID get measured (dgx.casa GB10 sm_121a, CUDA 13, arch verified from
+`flags.make` = `arch=compute_121a,code=[compute_121a,sm_121a]`, never from
+`CMakeCache.txt`; every GPU run under `flock $HOME/gpu.lock`).** Draft
+`~/bench/Qwen3.6-27B-DFlash-Q4_K_M.gguf` (986 MB) in both arms, k=16, greedy,
+concurrency 1, prompt "The capital of France is", 24 tokens:
+
+| Target | Container | DFlash-ON vs its OWN spec-OFF | Accepted / proposed |
+|---|---|---|---:|
+| `~/bench/q36-27b-nvfp4.gguf` | NVFP4 GGUF | IDENTICAL, 24/24 | 14/160 (0.0875) |
+| `~/bench/q36-27b-nvfp4-vllm` | NVFP4 safetensors | IDENTICAL, 24/24 | 20/80 (0.250) |
+
+Cross-target, same draft: the two containers' **spec-OFF** continuations diverge
+at index 4, and their DFlash-ON continuations diverge at that same index 4. The
+containers are therefore not the same target and the acceptance delta is theirs,
+not the draft's.
+
+**Shared-head byte comparison** (no GPU, the evidence that excludes the spike's
+highest-ranked risk). The 27B NVFP4 GGUF stores `token_embd.weight` and
+`output.weight` as ggml BF16 (type 30) beside its NVFP4 body. Against the
+safetensors sibling of the same quantization run
+(`model.language_model.embed_tokens.weight`, `lm_head.weight`, both BF16
+`[248320, 5120]`): **2,542,796,800 bytes each, ZERO differing bytes, both
+tensors.** So the draft scores with exactly the same head in both arms and the
+acceptance difference cannot be the shared head.
+
+Reproduce:
+
+```
+VLLM_DFLASH_TARGET_B=$HOME/bench/q36-27b-nvfp4.gguf \
+VLLM_DFLASH_TARGET=$HOME/bench/q36-27b-nvfp4-vllm \
+VLLM_DFLASH_DRAFT=$HOME/bench/Qwen3.6-27B-DFlash-Q4_K_M.gguf \
+flock $HOME/gpu.lock ./build-cuda/tests/test_qwen27_dflash_spec_decode \
+  --test-case="dflash axis-B*"
+```
+
+1 case / 15 assertions, exit 0, four 27B engine loads plus four short
+generations on an otherwise idle box. That wall time is NOT a throughput
+measurement. Drop `VLLM_DFLASH_TARGET` to run the two GGUF-target arms alone.
+
 ### DFlash-from-GGUF axis A e2e, `SPEC-DFLASH-GGUF` GD4 (2026-07-28) - correctness MET, speed PENDING
 
 **Benchmark disposition: PENDING - a correctness checkpoint; no throughput number

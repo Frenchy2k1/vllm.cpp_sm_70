@@ -202,13 +202,62 @@ vllm::HfConfig MakeDflashDraftConfig(const nlohmann::json& c) {
   return cfg;
 }
 
-// Load the whole DFlash draft (layer weights + fc + norms from the z-lab
-// checkpoint; embed_tokens + lm_head SHARED bf16 from the target shards) plus the
-// resolved draft config + k. `target_shards` must still be alive (they are inside
+// SPEC-DFLASH-GGUF B1: WHERE the draft's SHARED bf16 embed_tokens + lm_head
+// come from.
+//
+// A DFlash draft owns neither. It runs the TARGET's embedding table and the
+// TARGET's lm_head over its own hidden states, which is why the z-lab
+// safetensors checkpoint and llama.cpp's DFLASH GGUF arch both omit them. Until
+// axis B that sharing was expressed as a `const std::vector<SafetensorsFile>&`
+// parameter on LoadDflashDraft, and THAT TYPE was the axis-B blocker: a GGUF
+// target has no shards to point at, so the whole feature was refused in
+// FromModelDir's GGUF branch. This is the same seam re-expressed as a SOURCE,
+// which makes every line of draft-side loading identical for both containers.
+//
+// It holds a non-owning pointer to whichever the caller has: both live inside
+// FromModelDir for the duration of the load.
+class SharedHeadSource {
+ public:
+  explicit SharedHeadSource(const std::vector<vllm::SafetensorsFile>* shards)
+      : shards_(shards) {}
+  explicit SharedHeadSource(const vllm::GgufFile* gguf) : gguf_(gguf) {}
+
+  // Fill the draft's two shared tensors. Both arms produce the SAME thing: bf16
+  // `[vocab, H]` with nk=false for the gather table and the same `[vocab, H]`
+  // with nk=true for the MatmulBT head. Throws naming the source on absence.
+  void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head) const {
+    if (gguf_ != nullptr) {
+      vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head);
+    } else {
+      *embed = LoadNamedBf16(
+          *shards_, "model.language_model.embed_tokens.weight", false);
+      *head = LoadNamedBf16(*shards_, "lm_head.weight", true);
+    }
+    if (embed->Empty() || head->Empty()) {
+      throw std::runtime_error(
+          "dflash: the target's bf16 embed_tokens + lm_head (which the draft "
+          "SHARES) were not found in " +
+          Describe());
+    }
+  }
+
+  std::string Describe() const {
+    return gguf_ != nullptr ? std::string("the GGUF target file")
+                            : std::string("the target safetensors shards");
+  }
+
+ private:
+  const std::vector<vllm::SafetensorsFile>* shards_ = nullptr;
+  const vllm::GgufFile* gguf_ = nullptr;
+};
+
+// Load the whole DFlash draft (layer weights + fc + norms from the draft
+// checkpoint, safetensors dir or `dflash`-arch GGUF; embed_tokens + lm_head
+// SHARED bf16 from the TARGET via `shared`) plus the resolved draft config + k.
+// The source `shared` points at must still be alive (both are inside
 // FromModelDir). Returns null when the config carries no dflash draft path.
 std::unique_ptr<DflashDraft> LoadDflashDraft(
-    const vllm::SpeculativeConfig& spec,
-    const std::vector<vllm::SafetensorsFile>& target_shards) {
+    const vllm::SpeculativeConfig& spec, const SharedHeadSource& shared) {
   if (spec.method != "dflash") return nullptr;
   if (!spec.draft_model_path.has_value()) {
     throw std::runtime_error("dflash: resolved config missing draft_model_path");
@@ -219,71 +268,66 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
   // single file. The target-shared embed/lm_head still come from *target_shards*
   // below, exactly as for a safetensors draft - the GGUF DFLASH arch omits
   // token_embd/output precisely because the draft shares the target's.
+  auto draft = std::make_unique<DflashDraft>();
+  draft->k = spec.ResolvedNumSpeculativeTokens();
+  int64_t num_taps = 0;
+  int32_t mask_id = -1;
+  const char* source_kind = nullptr;
   if (IsDflashGgufDraft(draft_dir)) {
     vllm::GgufFile dg = vllm::GgufFile::Open(draft_dir);
-    auto draft = std::make_unique<DflashDraft>();
     draft->config = vllm::MakeDflashGgufConfig(dg);
-    draft->k = spec.ResolvedNumSpeculativeTokens();
     const nlohmann::json& dcfg = draft->config.raw.at("dflash_config");
-    const int64_t num_taps =
-        static_cast<int64_t>(dcfg.at("target_layer_ids").size());
-    const int32_t mask_id = dcfg.at("mask_token_id").get<int32_t>();
-    draft->weights = vllm::LoadQwen3DFlashFromGguf(dg, draft->config, num_taps,
-                                                   mask_id);
-    draft->weights.embed_tokens =
-        LoadNamedBf16(target_shards, "model.language_model.embed_tokens.weight", false);
-    draft->weights.lm_head = LoadNamedBf16(target_shards, "lm_head.weight", true);
-    VT_CHECK(!draft->weights.embed_tokens.Empty() && !draft->weights.lm_head.Empty(),
-             "dflash gguf: target embed_tokens/lm_head (bf16) not found in target shards");
-    draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
-    // The DFLASH GGUF arch carries NO vocab KV and no embedding tensor (the
-    // draft SHARES the target's), so MakeDflashGgufConfig leaves vocab_size 0 -
-    // right for the config, fatal for the forward: the draft sizes its embedding
-    // lookup as `{config.vocab_size, H}` (qwen3_dflash.cpp:245,477,1008,1043), so
-    // 0 is an EMPTY table and the first propose throws "cuda embedding: empty
-    // table (vocab 0) with nonempty ids". The safetensors draft never hit this
-    // because its config.json declares vocab_size. Take the row count from the
-    // TARGET tensor actually being indexed rather than from any declared value,
-    // so the view and the buffer cannot disagree. Found by SPEC-DFLASH-GGUF GD4,
-    // the first run that ever GENERATED through a GGUF-sourced DFlash draft.
-    draft->config.vocab_size = draft->weights.embed_tokens.shape[0];
-    std::cerr << "vllm.cpp: DFlash draft loaded from GGUF " << draft_dir
-              << " (k=" << draft->k << ", taps=" << num_taps
-              << ", mask=" << mask_id
-              << ", vocab=" << draft->config.vocab_size << ")\n";
-    return draft;
+    num_taps = static_cast<int64_t>(dcfg.at("target_layer_ids").size());
+    mask_id = dcfg.at("mask_token_id").get<int32_t>();
+    draft->weights =
+        vllm::LoadQwen3DFlashFromGguf(dg, draft->config, num_taps, mask_id);
+    source_kind = "GGUF";
+  } else {
+    if (!fs::exists(fs::path(draft_dir) / "config.json", ec)) {
+      throw std::runtime_error("dflash: draft checkpoint not found at " +
+                               draft_dir + " (from \"" +
+                               *spec.draft_model_path + "\")");
+    }
+    std::ifstream cf((fs::path(draft_dir) / "config.json").string());
+    nlohmann::json cj;
+    cf >> cj;
+    draft->config = MakeDflashDraftConfig(cj);
+    num_taps = static_cast<int64_t>(
+        cj.at("dflash_config").at("target_layer_ids").size());
+    mask_id = cj.at("dflash_config").at("mask_token_id").get<int32_t>();
+    std::vector<vllm::SafetensorsFile> dshards = LoadShards(draft_dir);
+    draft->weights =
+        vllm::LoadQwen3DFlash(dshards, draft->config, num_taps, mask_id);
+    source_kind = "safetensors";
   }
-  if (!fs::exists(fs::path(draft_dir) / "config.json", ec)) {
-    throw std::runtime_error("dflash: draft checkpoint not found at " + draft_dir +
-                             " (from \"" + *spec.draft_model_path + "\")");
-  }
-  std::ifstream cf((fs::path(draft_dir) / "config.json").string());
-  nlohmann::json cj;
-  cf >> cj;
 
-  auto draft = std::make_unique<DflashDraft>();
-  draft->config = MakeDflashDraftConfig(cj);
-  draft->k = spec.ResolvedNumSpeculativeTokens();
-  const int64_t num_taps =
-      static_cast<int64_t>(cj.at("dflash_config").at("target_layer_ids").size());
-  const int32_t mask_id =
-      cj.at("dflash_config").at("mask_token_id").get<int32_t>();
-
-  std::vector<vllm::SafetensorsFile> dshards = LoadShards(draft_dir);
-  draft->weights =
-      vllm::LoadQwen3DFlash(dshards, draft->config, num_taps, mask_id);
-  // The draft SHARES the target's embed_tokens + lm_head (bf16, unquantized in the
-  // NVFP4 27B), exactly as vLLM's skip_substrs(embed_tokens)/tie handling.
-  draft->weights.embed_tokens =
-      LoadNamedBf16(target_shards, "model.language_model.embed_tokens.weight", false);
-  draft->weights.lm_head = LoadNamedBf16(target_shards, "lm_head.weight", true);
-  if (draft->weights.embed_tokens.Empty() || draft->weights.lm_head.Empty()) {
-    throw std::runtime_error(
-        "dflash: target embed_tokens/lm_head (bf16) not found in target shards");
-  }
+  // The draft SHARES the target's embed_tokens + lm_head (bf16 in both
+  // containers of the NVFP4 27B: the safetensors leaves them unquantized, and
+  // the GGUF stores token_embd/output as ggml BF16 next to its NVFP4 body),
+  // exactly as vLLM's skip_substrs(embed_tokens)/tie handling. Common to BOTH
+  // draft sources and BOTH target containers since B1 - the source abstraction
+  // is what lets the four combinations share one code path.
+  shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head);
   draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
-  std::cerr << "vllm.cpp: DFlash draft loaded from " << draft_dir << " (k="
-            << draft->k << ", taps=" << num_taps << ", mask=" << mask_id << ")\n";
+  // A DFLASH GGUF draft carries NO vocab KV and no embedding tensor (it SHARES
+  // the target's), so MakeDflashGgufConfig leaves vocab_size 0 - right for the
+  // config, fatal for the forward: the draft sizes its embedding lookup as
+  // `{config.vocab_size, H}` (qwen3_dflash.cpp:245,477,1008,1043), so 0 is an
+  // EMPTY table and the first propose throws "cuda embedding: empty table
+  // (vocab 0) with nonempty ids". A safetensors draft never hit this because
+  // its config.json declares vocab_size, which is why the condition is on the
+  // VALUE and not on the draft source. Take the row count from the TARGET
+  // tensor actually being indexed rather than from any declared number, so the
+  // view and the buffer cannot disagree. Found by SPEC-DFLASH-GGUF GD4, the
+  // first run that ever GENERATED through a GGUF-sourced DFlash draft; still
+  // the rule at B1, where the rows now come from a GGUF target's token_embd.
+  if (draft->config.vocab_size == 0) {
+    draft->config.vocab_size = draft->weights.embed_tokens.shape[0];
+  }
+  std::cerr << "vllm.cpp: DFlash draft loaded from " << source_kind << " "
+            << draft_dir << " (k=" << draft->k << ", taps=" << num_taps
+            << ", mask=" << mask_id << ", vocab=" << draft->config.vocab_size
+            << ", shared head from " << shared.Describe() << ")\n";
   return draft;
 }
 
@@ -770,16 +814,13 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // `HfConfigFromGguf` mapping the GGUF `general.architecture` key
     // (`qwen35` dense / `qwen35moe` / `qwen3next`) onto the registered
     // architecture ID, which resolves to the owning arch TU's GGUF loader.
-    // SPEC-DFLASH-GGUF (not yet implemented): a DFlash draft shares the
-    // target's bf16 embed_tokens + lm_head, which LoadDflashDraft reads through
-    // a safetensors-typed seam. MTP no longer belongs here - see below.
-    if (params.speculative_config.has_value() &&
-        params.speculative_config->method == "dflash") {
-      throw std::runtime_error(
-          "dflash speculative decoding requires a safetensors target "
-          "checkpoint: the DFlash draft shares the target's bf16 "
-          "embed_tokens + lm_head");
-    }
+    // SPEC-DFLASH-GGUF B2: dflash used to be REFUSED here, because the draft
+    // shares the target's bf16 embed_tokens + lm_head and LoadDflashDraft read
+    // them through a safetensors-TYPED seam. B1 replaced that parameter with
+    // SharedHeadSource, which serves the same two tensors out of a GGUF, so the
+    // refusal has no premise left and is gone. MTP left this ladder earlier for
+    // its own reason - see below.
+    //
     // SPEC-MTP-GGUF: MTP over GGUF used to be refused alongside dflash, on the
     // premise that GGUF exports carry no `mtp.*` tensors. They can: llama.cpp's
     // Qwen3.5 converter emits the head under layer-indexed `nextn` names and
@@ -808,8 +849,24 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       model->AttachMtpDraftWeights(vllm::LoadQwen3_5MTPFromGguf(
           gguf, config, kind, GgufLoadPolicy::FromEnv()));
     }
+    // SPEC-DFLASH-GGUF B3: the axis-B wiring. Structurally the same three lines
+    // as the safetensors branch's maybe_load_dflash - ResolveSpecConfig re-runs
+    // on the target config inside the LoadedEngine ctor, so the draft path + k
+    // are resolved here from the CLI config directly - and the ONE difference is
+    // the shared-head source. The draft is loaded while `gguf` is still mapped,
+    // and it copies out (its resolver owns its dequantized bf16), so nothing
+    // borrows past this scope.
+    std::unique_ptr<DflashDraft> dflash;
+    if (params.speculative_config.has_value() &&
+        params.speculative_config->method == "dflash") {
+      vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDflash(
+          params.speculative_config->ResolvedNumSpeculativeTokens());
+      resolved.draft_model_path = params.speculative_config->draft_model_path;
+      dflash = LoadDflashDraft(resolved, SharedHeadSource(&gguf));
+    }
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
-        std::move(config), std::move(model), std::move(tokenizer), params));
+        std::move(config), std::move(model), std::move(tokenizer), params,
+        /*preselected_queue=*/nullptr, std::move(dflash)));
   }
 
   if (!fs::exists(dir) || !fs::is_directory(dir)) {
@@ -865,7 +922,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     vllm::SpeculativeConfig resolved = vllm::SpeculativeConfig::ResolveDflash(
         params.speculative_config->ResolvedNumSpeculativeTokens());
     resolved.draft_model_path = params.speculative_config->draft_model_path;
-    return LoadDflashDraft(resolved, *shards);
+    return LoadDflashDraft(resolved, SharedHeadSource(shards.get()));
   };
 
   // Live architecture dispatch: consume config.architectures in order and let

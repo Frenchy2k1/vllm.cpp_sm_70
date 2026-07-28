@@ -149,4 +149,24 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(
     const GgufFile& gguf, const HfConfig& config,
     const GgufLoadPolicy* policy = nullptr);
 
+// `SPEC-DFLASH-GGUF` B1 - the TARGET-shared bf16 embedding table + lm_head,
+// read out of a GGUF target for a draft that owns neither.
+//
+// A DFlash draft runs the TARGET's embedding table and the TARGET's lm_head
+// over its OWN hidden states; llama.cpp's DFLASH arch omits `token_embd` and
+// `output` for exactly that reason, as does the z-lab safetensors checkpoint.
+// When the target is a GGUF this is where those two tensors come from, and it
+// is the GGUF half of `SharedHeadSource` (`model_loader.cpp`).
+//
+// Deliberately NOT `LoadEmbedAndHead`: that one is residency-policy driven and
+// may hand back kept-F16 or block-quantized tensors shaped for the TRUNK's own
+// GEMMs, whereas the draft's forward wants plain bf16 in the layout the
+// safetensors path produces - `[vocab, H]` with `nk = false` for the gather
+// table, the same `[vocab, H]` with `nk = true` for the MatmulBT head. What it
+// DOES reuse is the tied-embedding rule (`output.weight` absent => the head IS
+// `token_embd.weight`) and the sidecar-aware dequant, so an NVFP4 head cannot
+// silently lose the `<stem>.scale` factor its blocks do not carry.
+void LoadGgufSharedEmbedAndHeadBf16(const GgufFile& gguf, OwnedTensor* embed,
+                                    OwnedTensor* head);
+
 }  // namespace vllm

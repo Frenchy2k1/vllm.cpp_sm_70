@@ -30888,3 +30888,111 @@ ledger. Records-only; no build/GPU/download/benchmark.
   `MM-SERVE-E2E` = fold the M2c forward into `ModelRegistry::Forward` (above).
   Residuals: streaming mm, multiple images, video, http fetch, PNG/JPEG codec,
   Gemma-4 image.
+
+## 2026-07-28 - `SPEC-DFLASH-GGUF` `GD5`-`GD8`: axis B (GGUF TARGET too) GENERATES on GB10
+
+Axis A (GGUF draft, safetensors target) landed earlier today at `GD4`. This
+checkpoint closes axis B: the TARGET may be a `.gguf` as well. Both axes now work
+end to end on the release target. The row stays `PARTIAL` on purpose (below).
+
+**The blocker was a TYPE, and that is the whole change.** A DFlash draft owns
+neither an embedding table nor an lm_head - it runs the TARGET's over its own
+hidden states, which is exactly why llama.cpp's DFLASH arch omits `token_embd`
+and `output` and why the z-lab safetensors checkpoint omits them too. That
+sharing was expressed as `LoadDflashDraft(const SpeculativeConfig&, const
+std::vector<SafetensorsFile>&)`, so a GGUF target had nothing to pass, and
+`FromModelDir`'s GGUF branch REFUSED dflash outright with that as the stated
+reason.
+
+- `GD5`/B1: new `SharedHeadSource` (`src/vllm/entrypoints/model_loader.cpp`)
+  holds a non-owning pointer to whichever the caller has and serves the same two
+  tensors from either - bf16 `[vocab, H]` `nk=false` gather table plus the same
+  `[vocab, H]` `nk=true` MatmulBT head. Its GGUF arm is the new public
+  `LoadGgufSharedEmbedAndHeadBf16` (`qwen3_5_gguf_weights.cpp`), which REUSES
+  the trunk loader's tied-embedding rule (`output.weight` absent => the head IS
+  `token_embd.weight`) and its sidecar-aware `OwnBf16` rather than restating
+  either. Deliberately NOT `LoadEmbedAndHead`: that one is residency-policy
+  driven and would hand back keep-F16 or block-quantized tensors, making the
+  draft's shared head depend on the target's container.
+- The shared-head load also MOVED out of both draft-source branches into ONE
+  common tail, so the four (draft format x target container) combinations run
+  identical code. The `GD4` `vocab_size` back-fill moved with it and is now
+  conditioned on the VALUE being 0 rather than on the draft being a GGUF, which
+  is what makes it correct when the rows come from a GGUF target's `token_embd`.
+- `GD6`/B2: the `dflash` half of the GGUF-branch rejection deleted; the `mtp`
+  half untouched.
+- `GD7`/B3: the draft load wired into the GGUF branch, mirroring the safetensors
+  branch's `maybe_load_dflash` with the shared-head source as the one difference.
+
+**Result (dgx GB10 sm_121a, CUDA 13, arch read from `flags.make` =
+`arch=compute_121a,code=[compute_121a,sm_121a]`, never from `CMakeCache.txt`;
+every GPU run under `flock $HOME/gpu.lock`).** Qwen3.6-27B NVFP4 **GGUF** target
+(`~/bench/q36-27b-nvfp4.gguf`) + `Q4_K_M` GGUF draft, k=16, greedy, c1, 24
+tokens: loads, logs `shared head from the GGUF target file`, generates a coherent
+continuation, and its DFlash-ON sequence is **token-for-token IDENTICAL to that
+same target's spec-OFF** - the STRICT form of the spike's gate 4, not just the
+ratified near-tie-robust one. Acceptance ALIVE at **14/160**. 1 case / 15
+assertions, exit 0.
+
+**The spike's HIGHEST-ranked risk is EMPTY on this asset, and it took a
+measurement to say so.** The risk was that the draft would score with a bf16
+lm_head dequantized out of quantized target blocks while the target computed on
+its own path. The 27B NVFP4 GGUF actually stores `token_embd.weight` and
+`output.weight` as ggml **BF16 (type 30)** beside its NVFP4 body. Byte-compared
+against the safetensors sibling of the same quantization run: **2,542,796,800
+bytes each, ZERO differing bytes, both tensors.** So B1's read is verbatim and
+both arms score with the SAME head. A GGUF that DID quantize its head re-opens
+the risk; the gate stays a measurement, not an assumption.
+
+**Acceptance IS lower on the GGUF target and it is NOT the shared head.** 14/160
+(0.0875) vs 20/80 (0.250) on the safetensors target, same draft, same prompt.
+The two containers already diverge at index 4 with NO speculation anywhere, and
+the DFlash-ON pair diverges at that same index 4. Cause: `QUANT-GGUF-NVFP4` is
+dequant-only - there is no NVFP4 GGUF GEMM - so on CUDA the GGUF target EXPANDS
+to bf16 and computes in bf16 while the safetensors target runs the true W4A4 fp4
+kernels. A drafter proposing for a numerically different target agrees with it
+less often. This also settles the gate FORM: a cross-target token identity would
+have measured the containers' arithmetic, never this row, so the e2e case gates
+WITHIN a target and REPORTS the cross-target pair with its spec-OFF control.
+
+**Collateral STATUS correction.** `docs/STATUS.md` said "no NVFP4 GGUF model has
+been run end to end". That is now false - the 27B NVFP4 GGUF runs, both as a
+plain target and as a DFlash speculation target. Corrected in the same change,
+together with the honest caveat that its bf16 expansion makes it a numerically
+different target from its safetensors sibling.
+
+**Gates.** Unit: `tests/vllm/test_gguf_qwen36_loader.cpp` +3 synthetic-GGUF cases
+(6 cases / 286 assertions, CPU and the dgx CUDA build) - the untied head really
+comes from `output.weight` and not the embedding (distinct fill values), the tied
+fallback, the `nk` orientations (the only thing separating the two tensors in the
+tied case), a missing `token_embd` refused. 3-mutant battery, **3 caught** (`nk`
+flipped; head forced to the embedding; tied forced false). E2E:
+`tests/parity/test_qwen27_dflash_spec_decode.cpp` third case, targets env-driven,
+asset-gated so CI stays asset-free.
+
+**Regression (dgx, under `flock`, same binary set):** `gguf` 103, `gguf_keep_quant`
+5957, `gguf_nvfp4` 2189, `qwen3_5_gguf_mtp` 2/2, `qwen36_paged_engine` 315/315 all
+GREEN and unchanged. TWO failures were investigated and are **PRE-EXISTING, NOT
+from this change**, proven by stashing the patch and re-running the SAME binaries
+on the committed tree at `384d5b83`, where both reproduce identically:
+- `test_qwen27_paged_engine` **234/235** - the SACRED 27B production-stream
+  assertion diverges at index 6 (`198` vs `271`). Red on the committed tree
+  BEFORE this change. Flagged here; not this row's to chase, and NOT to be
+  treated as evidence that this change is inert until someone owns it.
+- `test_model_loader_gguf` 2/3 - the unsupported-architecture case hard-codes the
+  registered-architecture LIST, which has since grown (`DeepseekV4ForCausalLM`,
+  `Gemma4ForConditionalGeneration`). Also reproduces on a pristine CPU build of
+  the merged tree.
+
+**Row stays `PARTIAL`, and the residuals are named:** axis B is measured on ONE
+prompt at concurrency 1; the acceptance characteristic above is understood and
+attributed but not addressed (it needs a native NVFP4 GGUF GEMM, separate
+unstarted work); speed is `PENDING` and not owed by this row; and these commits
+are LOCAL - not pushed, so nothing is merged and nothing may claim `DONE`.
+
+Records: `specs/gguf-dflash-draft.md` (`GD5`-`GD7` rows, gates 4/5/7, the axis-B
+result section, the highest-risk OUTCOME), `engine-matrix.md`
+(`SPEC-DFLASH-GGUF` implementation + evidence, still `PARTIAL`), `docs/STATUS.md`
+(axis-B paragraph + the NVFP4-GGUF capability correction), `docs/BENCHMARKS.md`
+(axis-B section, `PENDING` with the reason a cross-container throughput A/B would
+be meaningless today), `parity-ledger.md`, this log.
