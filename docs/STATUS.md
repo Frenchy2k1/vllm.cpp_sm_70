@@ -173,10 +173,19 @@ multidimensional vision-RoPE, q/k/v RMSNorm, Gemma-2 sandwich norms, a learned 2
 position embedding, and a √hidden average-pool-by-position pooler** — it does *not*
 drop-in reuse the Qwen3-VL ViT (the block GEMMs/attention are reusable; the
 patch-embed, RoPE, norms, pooler and the Gemma-4 NaFlex image processor are new).
-So Gemma-4 multimodal is blocked only on the remaining tower implementation: the
-C++ SigLIP/NaFlex vision tower + Gemma-4 image processor (image, port-mapped this
-pass, C++ unbuilt) and the USM-Conformer audio tower; the Gemma-4 MoE / k_eq_v /
-double-MLP backbone stays the larger-variant follow-on. Audio, the genuinely-new
+The C++ NaFlex SigLIP2 vision tower is now IMPLEMENTED (additive
+`gemma4_vision.{h,cpp}`) and PASSES its four per-stage gates vs the
+transformers-eager references on the dgx CUDA build (patch-embed rel-L2 2.15e-3,
+encoder 3.14e-2, pooled 1.36e-2, projected 1.85e-2; 220/220; compute-sanitizer 0) —
+the tower-in-isolation milestone (mirrors Qwen3-VL M2a before its M2c e2e); grounding
+it also revealed the vision `Gemma4ClippableLinear` layers carry FINITE trained QAT
+activation clamps (not the no-ops the port-map assumed), now implemented. So Gemma-4
+multimodal image is blocked only on the remaining engine wiring: the C++ Gemma-4
+NaFlex image processor + the mm merge-plumbing (register SupportsMultiModal, the
+masked-scatter merge of the 256 projected soft tokens at the image placeholder rows,
+the tower→merge→decode fork) for the image→text e2e, plus the USM-Conformer audio
+tower; the Gemma-4 MoE / k_eq_v / double-MLP backbone stays the larger-variant
+follow-on. Audio, the genuinely-new
 modality, is staged first on the smallest oracle-runnable audio model (Whisper,
 then Voxtral-Mini-3B on the already-landed Mistral backbone).
 
