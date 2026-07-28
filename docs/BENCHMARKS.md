@@ -155,6 +155,29 @@ correctness/perf gate uses llama.cpp-on-card + a portable cross-check — a gree
 compile + SASS is not execution evidence.** The competitor floor
 `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` stays INVENTORIED until a Turing card exists.
 
+**Datacenter-Blackwell `sm_100a` NVFP4 tcgen05 GEMM (DC1) BUILD-VERIFY (2026-07-28,
+`CLAIM-CUDA-SM100-NVFP4`, `ROAD-V1-D1-CUDA`).** Disposition: **NOT APPLICABLE
+(compile-only build-verify; no throughput number taken, claimed, or owed;
+`benchmark_binding=false`).** COMPILE-ONLY brick — a faithful 1:1 type-port of
+vLLM's `Fp4GemmSm100` (`ArchTag=Sm100` + `KernelScheduleAuto`, the CUTLASS 4.5.0
+tcgen05 block-scaled collective) added as a new TU
+`src/vt/cuda/cuda_matmul_nvfp4_sm100.cu`, gated by a dedicated `cutlass-nvfp4-sm100`
+feature cell (100a-only). Evidence on dgx (GB10, nvcc 13.0, cutlass 4.5.0, base
+local `main` `64b08aea`, disk-guarded 73G ≥ 25G): single-arch `-arch=sm_100a` TU
+compile with the production flag set (`-DVT_CUTLASS_NVFP4_SM100=1
+--expt-relaxed-constexpr --expt-extended-lambda -diag-suppress=20012 -isystem
+cutlass`) is **0 warnings / 0 errors / EXIT=0**, and `cuobjdump -lelf` shows a real
+`cuda_matmul_nvfp4_sm100.1.sm_100a.cubin` (arch = sm_100a). Feature-table CI
+(`cmake -P cmake/CudaArchFeaturesTest.cmake`, no GPU) ALL PASS: `100a`→ENABLED,
+121a/120a/103a/110/90a/80→EMPTY. RED (HEAD): `100a`→`cutlass-nvfp4 DISABLED`, no
+sm100 cell. sm_121a neutrality: the cell resolves DISABLED (TU not built) and the
+TU compiled for `sm_121a` without the define is inert (0-warn, 0 sm_100 content), so
+the GB10 gate build is byte-unchanged. The native `mma.sync kind::mxf4nvf4` fp4 path
+stays `sm_12x`-only (it does not port to sm_100's tcgen05). **NO B200/sm_100 board
+ran it — a green compile + SASS is not execution evidence, not runtime support, not
+vLLM-competitive.** A cloud B200 upgrades DC1 to RUNTIME-VERIFIED (token-exact +
+every-axis perf).
+
 **SGLang parity PROGRAM scope (2026-07-27, `CLAIM-SGLANG-PARITY-PROGRAM`, NOT
 pushed).** Disposition: **NOT APPLICABLE (inventory / scoping spike; no build,
 no run, no measurement taken, claimed, or owed; `benchmark_binding=false`).**

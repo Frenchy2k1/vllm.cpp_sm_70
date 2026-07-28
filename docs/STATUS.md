@@ -279,6 +279,19 @@ kernel campaign). The other fan-out boards remain build-supported only (no board
 here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
 
+As of 2026-07-28, the datacenter-Blackwell `sm_100a` fan-out gained its first
+FAST-PATH body: the **NVFP4 tcgen05 block-scaled GEMM is BUILD-VERIFIED**
+(`DERIVED+BUILD-VERIFIED, testing-welcome`). A faithful 1:1 type-port of vLLM's
+`Fp4GemmSm100` (`ArchTag=Sm100` + `KernelScheduleAuto` — CUTLASS 4.5.0 selects the
+5th-gen tcgen05 collective) compiles single-arch `100a` on nvcc 13.0 `-Werror`-equiv
+0 warnings and `cuobjdump` shows a real `sm_100a` cubin; it is gated by its own
+`cutlass-nvfp4-sm100` feature cell (enabled only for `100a`, so the GB10 `sm_121a`
+gate build is byte-unchanged). The native consumer `mma.sync kind::mxf4nvf4` fp4
+path stays `sm_12x`-only (it does not port to sm_100's tcgen05). **No B200/sm_100
+board ran it** — a green compile + SASS is not execution evidence, not runtime
+support, and not vLLM-competitive; the other sm_100 fast paths (CUTLASS C3x FP8,
+MoE, MXFP4, MLA) remain scoped.
+
 A separate **beyond-vLLM breadth lane** targets the older NVIDIA arches vLLM
 DROPS but llama.cpp still runs (Pascal/Volta/Turing). Its first brick landed
 2026-07-28: **Turing `sm_75` is BUILD-VERIFIED.** The bf16-WMMA prefill kernels

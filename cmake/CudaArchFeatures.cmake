@@ -220,6 +220,23 @@ set(VT_CUDA_FEATURE_TABLE
   # CUTLASS NVFP4 block-scaled GEMM TUs (cuda_matmul_nvfp4_cutlass.cu + tactics).
   # upstream: vLLM FP4_SM120_ARCHS "12.0a;12.1a" (CMakeLists.txt:951).
   "cutlass-nvfp4|12.0a,12.1a|CUTLASS NVFP4 block-scaled GEMM (VT_CUTLASS_NVFP4)"
+  # Datacenter-Blackwell (sm_100a) NVFP4 block-scaled tcgen05 GEMM build-verify TU
+  # (cuda_matmul_nvfp4_sm100.cu). DELIBERATELY its OWN cell, NOT a widening of the
+  # consumer `cutlass-nvfp4` row above: the datacenter body is ArchTag=Sm100 +
+  # KernelScheduleAuto/EpilogueScheduleAuto — CUTLASS selects the 5th-gen tcgen05
+  # collective — whereas the sm_12x body is ArchTag=Sm120 +
+  # KernelTmaWarpSpecializedCooperative (FlashInfer sm120 template). The two are a
+  # DIFFERENT collective/tile/cluster and cannot share a compile: widening the
+  # sm_12x cell to 10.0a would drag the sm120 tactic sweep into a 100a build, whose
+  # sm_120 tensor-op PTX ptxas rejects for compute_100a. Enabled ONLY for 100a so
+  # the gate arch sm_121a resolution is byte-unchanged. LABEL: DERIVED+BUILD-
+  # VERIFIED (testing-welcome) — compiled + cuobjdump-proven sm_100a SASS on GB10,
+  # NO B200/sm_100 board ran it here. upstream: vLLM FP4_SM100_ARCHS
+  # "10.0a;10.1a;10.3a" (CMakeLists.txt:989-1002); only 10.0a is build-verified
+  # here — sm_103a/sm_110 are separate later bricks. See
+  # .agents/specs/cuda-arch-datacenter-fastpath.md §2/§9 (DC1) + backend-matrix.md
+  # BACKEND-CUDA-SM100.
+  "cutlass-nvfp4-sm100|10.0a|CUTLASS NVFP4 block-scaled tcgen05 GEMM, sm100 build-verify (VT_CUTLASS_NVFP4_SM100)"
   # CUTLASS FP8 scaled-mm (cuda_matmul_fp8_cutlass.cu, ArchTag=Sm120).
   # upstream: vLLM sm120 SCALED_MM_ARCHS "12.0a;12.1a" (CMakeLists.txt:777).
   "cutlass-fp8|12.0a,12.1a|CUTLASS FP8 scaled-mm (VT_CUTLASS_FP8)"

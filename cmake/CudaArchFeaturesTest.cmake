@@ -154,6 +154,30 @@ expect_feature("121a" "fa2" "121a")
 expect_feature("120a" "fa2" "120a")
 expect_feature("120a;121a" "fa2" "120a;121a")
 
+# --- DATACENTER-BLACKWELL sm_100a NVFP4 tcgen05 BUILD-VERIFY (BACKEND-CUDA-SM100,
+# ROAD-V1-D1-CUDA). The `cutlass-nvfp4-sm100` cell is a DISTINCT feature from the
+# consumer `cutlass-nvfp4` sm_12x cell: it gates the ArchTag=Sm100 tcgen05 body
+# (cuda_matmul_nvfp4_sm100.cu), which is DERIVED+BUILD-VERIFIED — compiled +
+# cuobjdump-proven sm_100a SASS on GB10, NO B200 board ran it. It must resolve
+# ENABLED for 100a ALONE. Pinned so (a) a future edit cannot widen it onto the
+# gate arch, and (b) the gate arch sm_121a / consumer 120a stay EMPTY → the sm_12x
+# `cutlass-nvfp4` tactic sweep is byte-unchanged. sm_103a/sm_110 stay EMPTY
+# (separate later bricks); cross-family 90a/80 stay EMPTY (no body).
+expect_feature("100a" "cutlass-nvfp4-sm100" "100a")
+expect_feature("121a" "cutlass-nvfp4-sm100" "")
+expect_feature("120a" "cutlass-nvfp4-sm100" "")
+expect_feature("120a;121a" "cutlass-nvfp4-sm100" "")
+expect_feature("103a" "cutlass-nvfp4-sm100" "")
+expect_feature("110" "cutlass-nvfp4-sm100" "")
+expect_feature("90a" "cutlass-nvfp4-sm100" "")
+expect_feature("80" "cutlass-nvfp4-sm100" "")
+# RED-preserving companion: the CONSUMER sm_12x `cutlass-nvfp4` (and native
+# `fp4-mma`) cells must stay EMPTY for 100a — the sm_120 tcgen05-less bodies (the
+# tactic sweep + the mma.sync kind::mxf4nvf4 native path) cannot compile for a
+# datacenter target. The separate sm100 cell is exactly what keeps them off it.
+expect_feature("100a" "cutlass-nvfp4" "")
+expect_feature("100a" "fp4-mma" "")
+
 if(_failures GREATER 0)
   message(FATAL_ERROR "${_failures} CUDA feature-table expectation(s) failed")
 endif()
