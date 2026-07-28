@@ -3384,6 +3384,46 @@ this workload.
 
 ---
 
+## SPIKE: does MLX's lazy-graph execution model beat ours? Matmuls say NO
+
+Before committing to an "MLX-graph Metal path" — which would match mlx-lm's
+execution model at the cost of the paged KV cache and the scheduler on that
+backend — the premise was tested directly, in five minutes rather than days.
+`scripts/mlx-execution-model-spike.py` runs one Qwen3-1.7B decode step's matmul
+chain in MLX two ways:
+
+| execution model | ms/step | tok/s equiv |
+|---|--:|--:|
+| **eager** (`mx.eval` per op — what our MLX PROVIDER does) | 67.51 | 14.81 |
+| **lazy** (one eval per step — what mlx-lm does) | 34.71 | 28.81 |
+
+**Result 1: eager is 1.94x slower than lazy.** That is the direct confirmation of
+why the MLX provider measures 11.98 against native 22.06 — the per-op
+synchronisation, not kernel quality.
+
+**Result 2, and the one that decides the architecture question:**
+
+```
+our decode            36.9 ms/tok   (includes attention, norms, rope, cache writes)
+  of which matmuls    34.2 ms/tok
+MLX lazy, MATMULS ONLY 34.7 ms/tok
+=> our matmul chain is +1.5% vs MLX's under ITS OWN ideal execution model
+```
+
+**We are already at or slightly above MLX's matmul ceiling.** An MLX-graph path
+would therefore buy ~nothing on decode's dominant cost. mlx-lm's remaining decode
+edge (27.79 vs our 27.24) comes from its NON-matmul ops — our "other" is
+2.7 ms/tok against their implied ~2.0 — i.e. from its graph compiler fusing
+norms, rope and elementwise work into fewer kernels.
+
+**Consequence: the benefit of option 3 is reachable without option 3.** The part
+where MLX's kernels would win is already ours; the part that is actually behind is
+small-op fusion, which we can do in our own kernels (as the fused qk-norm-RoPE
+preamble already did) without taking an MLX dependency or giving up paged
+attention.
+
+---
+
 ## Fused preamble: one simdgroup per head, kernel -46% (below the e2e floor)
 
 Prefill's non-GEMM, non-attention time was never attributed. Doing so
