@@ -320,11 +320,89 @@ void from_json(const nlohmann::json& j, CompletionRequest& r) {
   ParseResponseFormat(j, r.response_format);
 }
 
+// Parse ONE multimodal content part (chat_utils.py:1478 MM_PARSER_MAP +
+// _parse_chat_message_content_mm_part:1524). Reads the `type`-keyed payload into
+// a ChatContentPart. Unknown/absent type with a direct URL field is not modeled
+// here (the typed form is what OpenAI clients emit); such parts keep an empty
+// payload under their detected `type` and are named residuals.
+static ChatContentPart ParseChatContentPart(const nlohmann::json& part) {
+  ChatContentPart p;
+  if (!part.is_object()) return p;
+  GetOr(part, "type", p.type);
+  if (p.type == "text" || p.type == "input_text" || p.type == "output_text") {
+    // _TextParser(part).get("text") — normalize the response-input aliases to
+    // "text" so the joined prompt text is uniform.
+    if (auto t = part.find("text"); t != part.end() && t->is_string()) {
+      p.text = t->get<std::string>();
+    }
+    p.type = "text";
+  } else if (p.type == "image_url") {
+    // _ImageParser(part).get("image_url", {}).get("url") — the url lives under a
+    // nested object {url: "data:image/...;base64,..."}.
+    if (auto iu = part.find("image_url"); iu != part.end()) {
+      if (iu->is_object()) {
+        if (auto u = iu->find("url"); u != iu->end() && u->is_string())
+          p.url = u->get<std::string>();
+      } else if (iu->is_string()) {
+        p.url = iu->get<std::string>();  // simple-image param form
+      }
+    }
+  } else if (p.type == "audio_url") {
+    if (auto au = part.find("audio_url"); au != part.end()) {
+      if (au->is_object()) {
+        if (auto u = au->find("url"); u != au->end() && u->is_string())
+          p.url = u->get<std::string>();
+      } else if (au->is_string()) {
+        p.url = au->get<std::string>();
+      }
+    }
+  } else if (p.type == "input_audio") {
+    // _InputAudioParser(part).get("input_audio") — {data: <base64>, format: str}.
+    if (auto ia = part.find("input_audio"); ia != part.end() && ia->is_object()) {
+      if (auto d = ia->find("data"); d != ia->end() && d->is_string())
+        p.audio_data = d->get<std::string>();
+      if (auto f = ia->find("format"); f != ia->end() && f->is_string())
+        p.audio_format = f->get<std::string>();
+    }
+  }
+  return p;
+}
+
 void from_json(const nlohmann::json& j, ChatMessage& m) {
   GetOr(j, "role", m.role);
-  // T0: bare-string content (multimodal content-part arrays deferred).
-  if (auto it = j.find("content"); it != j.end() && it->is_string()) {
-    m.content = it->get<std::string>();
+  // Content may be a bare string (T0, byte-identical) OR a multimodal
+  // content-part array (ROAD-V1-MM serving W1; chat_utils.py
+  // _parse_chat_message_content_parts). The array form fills content_parts AND
+  // sets `content` to the joined text spans so the downstream text prompt path
+  // is unchanged; the mm parts are routed to the processor by chat_mm.cpp.
+  if (auto it = j.find("content"); it != j.end()) {
+    if (it->is_string()) {
+      m.content = it->get<std::string>();
+    } else if (it->is_array()) {
+      std::vector<ChatContentPart> parts;
+      std::string joined_text;
+      for (const nlohmann::json& part : *it) {
+        // A bare string element is treated as a text part (upstream accepts a
+        // list of strings/dicts; a str element is text content).
+        if (part.is_string()) {
+          ChatContentPart tp;
+          tp.type = "text";
+          tp.text = part.get<std::string>();
+          if (!joined_text.empty()) joined_text += "\n";
+          joined_text += tp.text;
+          parts.push_back(std::move(tp));
+          continue;
+        }
+        ChatContentPart p = ParseChatContentPart(part);
+        if (p.type == "text") {
+          if (!joined_text.empty()) joined_text += "\n";
+          joined_text += p.text;
+        }
+        parts.push_back(std::move(p));
+      }
+      m.content = std::move(joined_text);
+      m.content_parts = std::move(parts);
+    }
   }
   // Multi-turn tool conversations: the assistant-history tool_calls and the
   // role="tool" reply's tool_call_id/name must survive parsing, or the chat

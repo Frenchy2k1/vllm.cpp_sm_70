@@ -549,6 +549,7 @@ add_library(vllm STATIC
   src/capi/vllm_c.cpp
   src/capi/chat_prompt.cpp
   src/vllm/entrypoints/openai/protocol.cpp
+  src/vllm/entrypoints/openai/chat_mm.cpp
   src/vllm/entrypoints/openai/serving_utils.cpp
   src/vllm/entrypoints/openai/serving_completion.cpp
   src/vllm/entrypoints/openai/serving_chat.cpp

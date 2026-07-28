@@ -349,16 +349,44 @@ struct CompletionStreamResponse {
 // Chat completions — chat_completion/protocol.py
 // ---------------------------------------------------------------------------
 
+// One parsed multimodal content part of a chat message (ROAD-V1-MM serving W1).
+//
+// Ported from: vllm/entrypoints/chat_utils.py:1478 (MM_PARSER_MAP) +
+// _parse_chat_message_content_mm_part:1524. The OpenAI chat `content` may be a
+// bare string (T0) OR an array of typed parts; this struct is ONE parsed part.
+// We mirror the field NAMES / part `type` literals 1:1 (client-compat load-
+// bearing). Only the raw wire strings live here (pure JSON, no multimodal dep on
+// protocol.h); the base64/data-URI DECODE + processor ROUTE live in chat_mm.cpp.
+//
+// Coverage (this brick): "text", "image_url" ({image_url:{url}}), "input_audio"
+// ({input_audio:{data,format}}), "audio_url" ({audio_url:{url}}). Other part
+// kinds (image_embeds / video_url / prompt_embeds / image_pil / tool_reference)
+// are parsed as their `type` with empty payload and are named residuals.
+struct ChatContentPart {
+  std::string type;          // part `type` literal (chat_utils.py MM_PARSER_MAP key)
+  std::string text;          // set for type=="text" (the "text" field)
+  std::string url;           // image_url.url / audio_url.url (may be a data: URI)
+  std::string audio_data;    // input_audio.data (base64 payload)
+  std::string audio_format;  // input_audio.format ("wav" | "mp3" | ...)
+};
+
 // Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:57
-// (ChatMessage). T0: bare-string content; refusal / audio / function_call
-// (legacy) deferred. A response message carries EITHER content OR tool_calls;
-// when tool_calls is empty the key is omitted (upstream _serialize pop).
+// (ChatMessage). Bare-string content OR (ROAD-V1-MM serving) a multimodal
+// content-part array; refusal / function_call (legacy) deferred. A response
+// message carries EITHER content OR tool_calls; when tool_calls is empty the key
+// is omitted (upstream _serialize pop).
 struct ChatMessage {
   std::string role;
   // Default member initializers so a 2-field aggregate init
   // `ChatMessage{role, content}` (used across the serving/chat-template tests)
   // does not trip -Werror=missing-field-initializers now that tool_calls exists.
   std::optional<std::string> content{};
+  // Multimodal content-part array (chat_utils.py). nullopt for a bare-string
+  // request (the T0 path is byte-IDENTICAL). When the wire `content` is an
+  // array, this holds the parsed parts AND `content` is set to the joined text
+  // spans so the existing text prompt path keeps working; the mm parts are
+  // routed to the processor by chat_mm.cpp (ParseMultiModalContent).
+  std::optional<std::vector<ChatContentPart>> content_parts{};
   std::optional<std::vector<ToolCall>> tool_calls{};
   // reasoning (chat_completion/protocol.py:67). The chain-of-thought span split
   // off by the reasoning parser. Serialized only when present + non-empty, and
