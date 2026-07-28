@@ -161,6 +161,41 @@ section + `feature-matrix.md` callout/gap rows, this note, `docs/STATUS.md`,
 `docs/BENCHMARKS.md` (NOT-APPLICABLE — spike), `parity-ledger.md`, `state.md`.
 Touches NO `src/`/`include/`/`cmake/`/`tests/`, no counted-matrix rows (no
 inventory-count bump), no README/Metal. DONE — records committed.
+**ENGINE MM-FORWARD integration — the architectural unlock (2026-07-28,
+`CLAIM-ENGINE-MM-FORWARD`, DONE — committed, NOT pushed; FULL SHA reported to
+caller).** Base local `main` HEAD `308c312a`; isolated worktree
+`.claude/worktrees/agent-a2c400785ae707c48`; CPU build here (`-DVLLM_CPP_CUDA=OFF`)
++ DGX GB10 (`dgx.casa`) for the CUDA token-exact gate (git-archive transfer, md5
+verified, `flock $HOME/gpu.lock`). **What it did.** Multimodal now runs through the
+engine's REGISTERED forward (`ModelRegistry::Forward`), not only the standalone
+`Qwen3VLGenerateGreedy` driver — closing the `MM-SERVE-E2E`/M2c architectural block
+named in `specs/mm-serving.md`. (1) `ModelForwardInput` gains an ADDITIVE,
+default-`nullopt` `std::optional<MultiModalForwardInput> mm` field (merged
+inputs_embeds + 3-D MRoPE positions + DeepStack, borrowed handles) — nullopt on
+every text step ⇒ text forwards never read it ⇒ the shared runner/ModelForwardInput
+path is byte-identical by construction (`model_registry.h`). (2)
+`Qwen3VLForConditionalGeneration` is `REGISTER_VLLM_MODEL`-registered (new
+`qwen3_vl_registry.cpp` TU); the registered forward folds the M2c forked decode into
+the per-step contract, calling the SHARED `Qwen3VLForwardStepLastLogits` (= the
+standalone `VLForwardLastLogits`), so registered and standalone paths are numeric-
+identical. `VLGenerateCore` refactored to a shared `VLStepFn`, driven by both the
+standalone driver AND `Qwen3VLGenerateGreedyViaRegistry` (the engine mm-forward path
+the MM-SERVE seam uses). (3) `test_model_registry` synced to reality (24→27 archs:
++Qwen3VL, +pre-existing base-red DeepseekV4/Gemma4 list drift). **Gates.** CPU text
+inertness (the RED line, shared-path change): `test_runner` 16/16, `test_scheduler`
+36/36, `test_chat_mm` 8/8, `test_openai_serving` 41/41, `test_model_registry` 24/24
+— all green; nullopt-for-text ⇒ byte-neutral by construction. Clean `-Werror`
+full-library build (CPU + CUDA/nvcc on DGX, 0 warnings). GPU engine mm-forward
+token-exact gate `test_qwen3vl_registry_e2e` (image→text THROUGH
+`ModelRegistry::Forward` == the M2c golden `gen_tokens_i32.bin`, **32/32 STRICT**,
+RED-first) + M2c standalone cross-check `test_qwen3vl_e2e` 32/32 (byte-neutral
+refactor); compute-sanitizer memcheck **0 errors** on the registered mm forward. **Named
+residual:** the in-runner scheduler-fed tower run (runner.cpp builds the mm field
+from staged encoder outputs) + the full server `/v1/chat/completions` GPU e2e +
+multi-image/video/audio/Gemma-4-image through the registered path. Owns ONLY:
+`specs/mm-serving.md`, model/engine/feature matrices, roadmap ROAD-V1-MM, STATUS/
+BENCHMARKS/ledger/state, this claim, the code above + the two tests; no
+README/Metal.
 
 **DeepSeek-V4 GGUF benchmark loadability — source-level spike (2026-07-28,
 `CLAIM-DSV4-GGUF-SPIKE`, records-only, NOT pushed; FULL SHA reported to caller).**

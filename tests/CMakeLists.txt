@@ -203,6 +203,13 @@ vllm_cpp_add_test(test_qwen3vl_e2e vllm/multimodal/test_qwen3vl_e2e.cpp)
 target_compile_definitions(test_qwen3vl_e2e PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
   TEXT_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_text")
+# MM-ENGINE-FORWARD — the SAME STRICT image->text token-exact gate driven THROUGH
+# the ENGINE registered forward (ModelRegistry::Forward → ForwardQwen3VL...), the
+# engine-mm-forward closing gate. GPU + Qwen3-VL-4B checkpoint required, else skipped.
+vllm_cpp_add_test(test_qwen3vl_registry_e2e vllm/multimodal/test_qwen3vl_registry_e2e.cpp)
+target_compile_definitions(test_qwen3vl_registry_e2e PRIVATE
+  MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
+  TEXT_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_text")
 # M3-b — STRICT image->text token-exact on the Qwen3.6-27B GDN-hybrid gate model
 # vs the committed vLLM 0.25.0 golden. GPU + the vision-inclusive bf16 checkpoint
 # Qwen/Qwen3.6-27B required, else skipped (VLLM_QWEN36_CKPT or the HF cache path).

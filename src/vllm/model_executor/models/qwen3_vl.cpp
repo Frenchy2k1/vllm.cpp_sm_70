@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -18,7 +19,10 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_attn_block.h"    // Dev/DBuf/ResidentWeight/KvSlice
 #include "vllm/model_executor/models/dense_weight_loaders.h"  // dense_loaders::*
+#include "vllm/model_executor/models/model_registry.h"      // MM-ENGINE-FORWARD: ModelForwardInput/MultiModalForwardInput/ModelRegistry
+#include "vllm/model_executor/models/qwen3_5.h"             // GdnStateCache (ModelForwardInput field)
 #include "vllm/model_executor/models/qwen3_vl_text.h"       // Qwen3VL{GetRopeIndex,MergeMultimodal,ComputeDeepstack}
+#include "vllm/v1/attention/backends/gdn_attn.h"            // v1::GDNAttentionMetadata (ModelForwardInput field)
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -31,6 +35,20 @@ using vt::DType;
 using vt::Tensor;
 using v1::CommonAttentionMetadata;
 using namespace dense_attn;  // Dev, DBuf, ResidentWeight, ResidentWeightF32, KvSlice, MakeTensor, Reshape
+
+// One forward STEP of the forked VL decode: given the already-merged host bf16
+// embeddings [T*H], the 3-D MRoPE positions [3*T], the (possibly empty) DeepStack
+// [L*T*H], the step attention metadata, the persistent paged KV, and the bf16
+// cos|sin cache, return the LAST row's logits [vocab] (host f32). This is the seam
+// that lets VLGenerateCore be driven identically by (a) the standalone in-TU
+// forward (VLForwardLastLogits) and (b) the ENGINE registered forward
+// (ModelRegistry::Forward), so the two paths are numerically identical by
+// construction — the fold demanded by MM-ENGINE-FORWARD (no duplicated decode).
+using VLStepFn = std::function<std::vector<float>(
+    const std::vector<uint16_t>& inputs_embeds_bf16,
+    const std::vector<int32_t>& positions3, int64_t num_tokens,
+    const std::vector<uint16_t>& deepstack_bf16, const CommonAttentionMetadata& meta,
+    std::vector<PagedKvCache>& attn_kv, const Tensor& cos_sin_cache)>;
 
 // bf16 raw bits <-> f32 host conversions.
 std::vector<float> Bf16BitsToF32(const uint16_t* p, int64_t n) {
@@ -400,7 +418,7 @@ std::vector<int32_t> VLGenerateCore(
     const std::vector<float>& mm_deepstack, int64_t L, const std::vector<bool>& mask,
     const std::vector<int32_t>& pos_prefill, int64_t delta, int32_t eos_token_id,
     const Qwen3DenseWeights& weights_text, const HfConfig& config,
-    const vt::RopeArgs& rope, int max_new_tokens) {
+    int max_new_tokens, const VLStepFn& step) {
   Backend& backend = d.b;
   const int64_t H = config.hidden_size;
   const int64_t Hkv = config.num_key_value_heads;
@@ -408,16 +426,9 @@ std::vector<int32_t> VLGenerateCore(
   const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
   const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
 
-  // Global absolute-position cos|sin cache [Pmax, rotary_dim] bf16.
-  const int64_t Pmax = 8192;
-  const int rot = rope.rotary_dim;
-  std::vector<int32_t> arange(static_cast<size_t>(Pmax));
-  for (int64_t i = 0; i < Pmax; ++i) arange[static_cast<size_t>(i)] = static_cast<int32_t>(i);
-  DBuf ar(d, DType::kI32, {Pmax}, arange.data());
-  DBuf cache_f32(d, DType::kF32, {Pmax, rot});
-  vt::RopeCosSinCache(d.q, cache_f32.t(), ar.t(), rope);
-  DBuf cache_bf16(d, DType::kBF16, {Pmax, rot});
-  vt::CastBf16(d.q, cache_bf16.t(), cache_f32.t());
+  // Global absolute-position cos|sin cache [Pmax, rotary_dim] bf16 — the ONE
+  // build path shared with the registered forward (Qwen3VLMakeCosSinCache).
+  const Qwen3VLCosSinCache cos_sin = Qwen3VLMakeCosSinCache(d.q, config);
 
   // KV caches: one big block per layer sized for T0 + max_new_tokens.
   const int64_t block_size = T0 + max_new_tokens + 8;
@@ -462,9 +473,8 @@ std::vector<int32_t> VLGenerateCore(
   std::vector<uint16_t> ds_bits = F32ToBf16Bits(ds_f32.data(), L * T0 * H);
 
   const CommonAttentionMetadata pm = StepMeta(T0, T0, 0);
-  std::vector<float> logits = VLForwardLastLogits(
-      d, merged_bits, pos_prefill, T0, ds_bits, L, cache_bf16.t(), pm, attn_kv,
-      weights_text, config, rope);
+  std::vector<float> logits =
+      step(merged_bits, pos_prefill, T0, ds_bits, pm, attn_kv, cos_sin.tensor);
 
   std::vector<int32_t> generated;
   int32_t next = static_cast<int32_t>(ArgMax(logits));
@@ -472,9 +482,9 @@ std::vector<int32_t> VLGenerateCore(
 
   // ---- DECODE: single token per step, MRoPE decode position, no deepstack ----
   const std::vector<uint16_t> no_ds;
-  for (int step = 1; step < max_new_tokens; ++step) {
+  for (int dstep = 1; dstep < max_new_tokens; ++dstep) {
     if (next == eos_token_id) break;
-    const int64_t abs_idx = T0 + (step - 1);  // sequence index of the token being fed
+    const int64_t abs_idx = T0 + (dstep - 1);  // sequence index of the token being fed
     const int32_t p = static_cast<int32_t>(abs_idx + delta);
     const std::vector<int32_t> pos1 = {p, p, p};  // [3,1] all axes equal (text decode)
 
@@ -489,15 +499,65 @@ std::vector<int32_t> VLGenerateCore(
     }
     const int64_t seq_len = abs_idx + 1;
     const CommonAttentionMetadata dm = StepMeta(1, seq_len, abs_idx);
-    logits = VLForwardLastLogits(d, tok_emb, pos1, 1, no_ds, L, cache_bf16.t(), dm,
-                                 attn_kv, weights_text, config, rope);
+    logits = step(tok_emb, pos1, 1, no_ds, dm, attn_kv, cos_sin.tensor);
     next = static_cast<int32_t>(ArgMax(logits));
     generated.push_back(next);
   }
   return generated;
 }
 
+// The STANDALONE step: call the in-TU forked forward directly (the M2c gate path).
+VLStepFn MakeStandaloneStep(Dev d, const Qwen3DenseWeights& weights_text,
+                            const HfConfig& config, const vt::RopeArgs& rope,
+                            int64_t L) {
+  return [d, &weights_text, &config, &rope, L](
+             const std::vector<uint16_t>& embeds, const std::vector<int32_t>& pos3,
+             int64_t T, const std::vector<uint16_t>& ds,
+             const CommonAttentionMetadata& meta, std::vector<PagedKvCache>& attn_kv,
+             const Tensor& cos_sin) -> std::vector<float> {
+    return VLForwardLastLogits(d, embeds, pos3, T, ds, L, cos_sin, meta, attn_kv,
+                               weights_text, config, rope);
+  };
+}
+
 }  // namespace
+
+// ── MM-ENGINE-FORWARD shared building blocks (reused by the registered forward) ──
+
+Qwen3VLCosSinCache Qwen3VLMakeCosSinCache(vt::Queue& queue, const HfConfig& config) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const vt::RopeArgs rope = MropeArgs(config);
+  const int64_t Pmax = 8192;
+  const int rot = rope.rotary_dim;
+  std::vector<int32_t> arange(static_cast<size_t>(Pmax));
+  for (int64_t i = 0; i < Pmax; ++i) arange[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  DBuf ar(d, DType::kI32, {Pmax}, arange.data());
+  DBuf cache_f32(d, DType::kF32, {Pmax, rot});
+  vt::RopeCosSinCache(d.q, cache_f32.t(), ar.t(), rope);
+  // Persistent bf16 storage (owned by the returned cache; freed on last ref).
+  const size_t bytes = static_cast<size_t>(Pmax * rot) * vt::SizeOf(DType::kBF16);
+  void* p = backend.Alloc(bytes);
+  std::shared_ptr<void> storage(p, [&backend](void* q) { backend.Free(q); });
+  Tensor tensor = MakeTensor(p, DType::kBF16, d.q.device, {Pmax, rot});
+  vt::CastBf16(d.q, tensor, cache_f32.t());
+  return Qwen3VLCosSinCache{std::move(storage), tensor};
+}
+
+std::vector<float> Qwen3VLForwardStepLastLogits(
+    vt::Queue& queue, const Qwen3DenseWeights& weights_text, const HfConfig& config,
+    const std::vector<uint16_t>& inputs_embeds_bf16,
+    const std::vector<int32_t>& positions3, int64_t num_tokens,
+    const std::vector<uint16_t>& deepstack_bf16, int64_t deepstack_levels,
+    const vt::Tensor& cos_sin_cache_bf16, const v1::CommonAttentionMetadata& meta,
+    const std::vector<PagedKvCache>& attn_kv) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const vt::RopeArgs rope = MropeArgs(config);
+  return VLForwardLastLogits(d, inputs_embeds_bf16, positions3, num_tokens,
+                             deepstack_bf16, deepstack_levels, cos_sin_cache_bf16,
+                             meta, attn_kv, weights_text, config, rope);
+}
 
 std::vector<int32_t> Qwen3VLGenerateGreedy(
     const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
@@ -532,9 +592,11 @@ std::vector<int32_t> Qwen3VLGenerateGreedy(
   std::vector<int32_t> pos_prefill =
       multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, /*spatial_merge_size=*/2, &delta);
 
+  const VLStepFn step =
+      MakeStandaloneStep(d, weights.text, config, rope, num_deepstack_levels);
   return VLGenerateCore(d, prompt_ids, mm_main, mm_deepstack, num_deepstack_levels,
                         mask, pos_prefill, delta, eos_token_id, weights.text, config,
-                        rope, max_new_tokens);
+                        max_new_tokens, step);
 }
 
 std::vector<int32_t> Qwen3VLGenerateGreedyVideo(
@@ -569,9 +631,86 @@ std::vector<int32_t> Qwen3VLGenerateGreedyVideo(
       prompt_ids, grid_thw, /*spatial_merge_size=*/2, vision_start_token_id,
       video_token_id, vision_end_token_id, &delta);
 
+  const VLStepFn step =
+      MakeStandaloneStep(d, weights.text, config, rope, num_deepstack_levels);
   return VLGenerateCore(d, prompt_ids, mm_main, mm_deepstack, num_deepstack_levels,
                         mask, pos_prefill, delta, eos_token_id, weights.text, config,
-                        rope, max_new_tokens);
+                        max_new_tokens, step);
+}
+
+std::vector<int32_t> Qwen3VLGenerateGreedyViaRegistry(
+    LoadedModel& model, const std::vector<int32_t>& prompt_ids,
+    const std::vector<float>& mm_main, const std::vector<float>& mm_deepstack,
+    int64_t num_deepstack_levels, const std::array<int64_t, 3>& grid_thw,
+    int32_t image_token_id, int32_t eos_token_id, const Qwen3VLWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const int64_t H = config.hidden_size;
+  const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
+
+  // Image span offset + visual mask (identical to Qwen3VLGenerateGreedy).
+  int64_t offset = -1;
+  int64_t n_img = 0;
+  std::vector<bool> mask(static_cast<size_t>(T0), false);
+  for (int64_t t = 0; t < T0; ++t) {
+    if (prompt_ids[static_cast<size_t>(t)] == image_token_id) {
+      if (offset < 0) offset = t;
+      mask[static_cast<size_t>(t)] = true;
+      ++n_img;
+    }
+  }
+  VT_CHECK(offset >= 0, "qwen3-vl: no image token in prompt");
+  const int64_t N = static_cast<int64_t>(mm_main.size()) / (H > 0 ? H : 1);
+  VT_CHECK(N == n_img, "qwen3-vl: mm_main rows != image-token count");
+
+  std::vector<multimodal::MmImageSpan> spans = {{offset, grid_thw}};
+  int64_t delta = 0;
+  std::vector<int32_t> pos_prefill =
+      multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, /*spatial_merge_size=*/2, &delta);
+
+  // The REGISTERED step: pack the already-merged embeddings / 3-D MRoPE positions /
+  // DeepStack into ModelForwardInput.mm and drive ModelRegistry::Forward, which
+  // dispatches to the registered ForwardQwen3VL → the SAME
+  // Qwen3VLForwardStepLastLogits the standalone driver runs. Token-identical to
+  // Qwen3VLGenerateGreedy by construction (the ENGINE registered mm-forward path).
+  const VLStepFn step =
+      [&model, &config, &queue, num_deepstack_levels](
+          const std::vector<uint16_t>& embeds, const std::vector<int32_t>& pos3,
+          int64_t T, const std::vector<uint16_t>& ds,
+          const CommonAttentionMetadata& meta, std::vector<PagedKvCache>& attn_kv,
+          const Tensor& /*cos_sin (model owns an identical cache)*/)
+          -> std::vector<float> {
+    const std::vector<int32_t> no_tokens;
+    const std::vector<int32_t> no_pos;
+    std::vector<GdnStateCache> no_gdn_state;
+    v1::GDNAttentionMetadata gdn_meta{};
+    const std::vector<int32_t> gather_li = {static_cast<int32_t>(T - 1)};
+    const MultiModalForwardInput mm{&embeds, &pos3, &ds, num_deepstack_levels};
+    ModelForwardInput in{
+        .token_ids = no_tokens,
+        .positions = no_pos,
+        .attn_meta = meta,
+        .gdn_meta = gdn_meta,
+        .attn_kv = attn_kv,
+        .gdn_state = no_gdn_state,
+        .config = config,
+        .queue = queue,
+        .logits_indices = gather_li,
+        .num_reqs = meta.num_reqs,
+        .pure_decode = false,
+        .gather_logits = false,
+        .mm = mm,
+    };
+    ForwardLogits fl = ModelRegistry::Forward(model, in);
+    VT_CHECK(!fl.host.empty(),
+             "qwen3-vl registered forward returned no host logits");
+    return std::move(fl.host);
+  };
+
+  return VLGenerateCore(d, prompt_ids, mm_main, mm_deepstack, num_deepstack_levels,
+                        mask, pos_prefill, delta, eos_token_id, weights.text, config,
+                        max_new_tokens, step);
 }
 
 }  // namespace vllm
