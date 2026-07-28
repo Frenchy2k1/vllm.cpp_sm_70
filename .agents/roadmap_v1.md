@@ -162,7 +162,17 @@ parse + checkpoint loader name-map VERIFIED vs the real `nvidia/DeepSeek-V4-Flas
 ~83 GiB — only the 256 experts are W4; the MLA + shared linears are FP8 + NVFP4 double-scale ⇒ it
 does NOT fit ONE GB10's 119 GiB pool. **W1 (single-GB10 oracle run) is therefore MEMORY-INFEASIBLE**
 (needs multi-node TP / CPU offload / smaller quant), not merely disk-contended. Forward + strict gate
-= W3-W8. `DeepSeekV4MTPModel` promoted INVENTORIED→SPIKE. **NEXT-TIER BATCH TRIAGE (2026-07-24,
+= W3-W8. `DeepSeekV4MTPModel` promoted INVENTORIED→SPIKE. **GGUF BENCHMARK LOADABILITY spike
+(2026-07-28, `CLAIM-DSV4-GGUF-SPIKE`):** a same-quant `UD-IQ2_XXS` GGUF benchmark of our engine vs
+vLLM is **NOT viable today, blocked on BOTH sides** — vLLM 0.26 moved GGUF out-of-tree to
+`vllm-gguf-plugin` (uninstalled; DOES dequant IQ2_XXS) but `DeepseekV4ForCausalLM` has no
+`packed_modules_mapping`/GGUF wiring; our engine hard-rejects GGUF for DeepSeek-V4/V2
+(`deepseek_v4_registry.cpp:61-64`) and lacks IQ2_XXS AND Q2_K dequant (only F32/F16/BF16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/NVFP4).
+So the C4/GGUF roadmap item to make the single-Spark GGUF vehicle real is: lift the V4 GGUF
+reject + wire a V4-GGUF loader + port IQ2_XXS (llama.cpp `dequantize_row_iq2_xxs` + `iq2xxs_grid`)
+and/or Q2_K dequant — gated vs llama.cpp-on-card (vLLM cannot oracle V4-from-GGUF). Apples-to-apples
+DeepSeek-V4 is the NVFP4 2×-Spark vehicle; a true same-GGUF cross-engine number is only available on
+a Qwen3/dense k-quant both engines already load. **NEXT-TIER BATCH TRIAGE (2026-07-24,
 `sweep-recent-dense-batch.md`, `CLAIM-SWEEP-RECENT-DENSE`):** 8 recent dense/small-MoE families
 advanced `INVENTORIED` -> `SPIKE` with a ranked one-agent-each queue — **4 ZERO-NEW-KERNEL
 near-additive** (Phi-3/Phi-4 `Phi3ForCausalLM` a Llama subclass, Granite-3 4-scalar-multipliers,
@@ -439,11 +449,13 @@ collective abstraction (mirroring vLLM's `device_communicators`). This is an
 extensibility-track concern (`ROAD-V1-C1`/`ROAD-V1-D1` adjacent) — a new
 interconnect becomes one transport provider, not a model-forward edit. Full
 scope, seam map and W-plan: [scale-out-distributed.md](specs/scale-out-distributed.md).
-All `SPIKE`, owned by `CLAIM-SCALE-OUT-SPIKE`.
+Scoped by `CLAIM-SCALE-OUT-SPIKE`; **W1 landed** the abstraction leg
+(`CLAIM-SCALE-OUT-W1`, 2026-07-28) — `BACKEND-DISTRIBUTED-COMM` is now `ACTIVE`,
+the other 4 rows stay `SPIKE`.
 
 | Leg | Scale-out row | What it adds | Gate HW |
 |---|---|---|---|
-| 0 — abstraction | [`BACKEND-DISTRIBUTED-COMM`](backend-matrix.md) | the `vt::Communicator` / process-group + collective `OpId`s; nccl/RDMA/MLX-ring transports; `world_size==1` byte-identical | CPU 2-proc loopback (W1, no GPU) |
+| 0 — abstraction ✅ **W1 DONE** | [`BACKEND-DISTRIBUTED-COMM`](backend-matrix.md) `ACTIVE` | the `vt::Communicator` / process-group (`include/vt/communicator.h` + `src/vt/communicator.cpp`) — AllReduce/AllGather/Send/Recv + `world_size==1` byte-identical; CPU in-process multi-rank transport proven (`test_communicator`, 50/50, RED-verified). W2+: collective `OpId` routing + NCCL/RDMA/MLX-ring transports | CPU in-process gate (W1, no GPU) — **PASSED** |
 | 1 — multi-GPU | [`BACKEND-DISTRIBUTED-TP`](backend-matrix.md), [`BACKEND-DISTRIBUTED-PP`](backend-matrix.md) | tensor + pipeline parallel (sharded linears/heads/experts/KV; stage split + send/recv) | ≥2-GPU box (absent — GB10 single-GPU) |
 | 2 — multi-Spark | [`BACKEND-DISTRIBUTED-MULTINODE-SPARK`](backend-matrix.md) | 2× DGX Spark over ConnectX-7 200GbE RoCE; unlocks DeepSeek-V4 fp8 (~167 GiB) across 238 GiB | 2 Sparks + QSFP cable |
 | 3 — MLX multi-node | [`BACKEND-DISTRIBUTED-MLX-RING`](backend-matrix.md) | `mlx.core.distributed` ring/JACCL over Thunderbolt; shards the Metal forward across Macs | 2 Thunderbolt-linked Macs |
