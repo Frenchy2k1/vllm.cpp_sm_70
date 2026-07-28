@@ -29246,3 +29246,41 @@ acceptance rate are unmeasured, and `G5` (cross-format agreement at F16) is
 untouched. The attach site in the GGUF branch is compile-verified only. A
 quantized head may accept rarely enough that spec-ON is SLOWER than spec-OFF -
 recorded in the spike as a finding to publish, not a bug to hide. Next: `G4`.
+## 2026-07-28 — SGLang perf oracle stood up + first competitor floor measured (`CLAIM-SGLANG-PERF-BENCH`)
+
+User side-quest "do the benchmarks": stand up live SGLang and benchmark our CUDA
+engine vs the SGLang floor. Base `main` HEAD `7e9ffbff` (≥ the `c26ec71e` floor).
+dgx GB10.
+
+**The headline held: SGLang runs our gate model on GB10 with no from-source
+build.** The oracle-spec `v0.5.15-cu130` arm64 image pulled cleanly (after one
+gotcha — pulling by the *manifest-list* digest + `--platform` gave "manifest
+schema unsupported" on docker 29.2.1; pulling the *arm64 sub-manifest* digest
+`ce9667f4` directly worked) and served `unsloth/Qwen3.6-27B-NVFP4` — "server is
+fired up and ready to roll", CUDA graphs captured. Confirms oracle spec §2's
+crucial asymmetry vs the from-source vLLM oracle.
+
+**Result (cache-neutral, 27B, c8/c16, 3 reps, idle box, one flock, engines
+sequential):** ours BEATS the SGLang floor on aggregate throughput (**2.21×@c16,
+1.44×@c8**) and TTFT (**6–12× lower**), but SGLang WINS the steady-state
+per-token decode latency (**TPOT/ITL 1.18–1.49× below ours**). The tradeoff is
+mechanistic and honest: at `--request-rate inf`, ours admits and drains the
+80-request burst with near-zero queue (TTFT ~3 s vs SGLang's ~33 s) by packing
+larger decode batches — which raises per-request per-token latency. Both arms
+were byte-equivalent on the workload (identical corpus, greedy `ignore_eos`,
+exactly 80×128 output tokens, 0 errors, identical peak concurrency), and both
+engines were internally rock-solid across reps (CV ~0.01% on the throughput
+axes). The TPOT/ITL deficit is recorded as a reproduced OPEN GAP / candidate
+lever, not explained away.
+
+**Lessons.** (1) A trimmed grid beats a stalled full grid: SGLang c1 ran at
+~13.3 s/it (~18 min/rep) — 3-rep c1/c2/c4 would have been ~2 h with little
+marginal signal, so I retargeted to the large-concurrency gate points c8/c16 and
+NAMED the low-conc sweep as a residual rather than let it block the whole
+benchmark. (2) On a 98%-full shared production box, the image (25.6 GB) is the
+benchmark *client* for BOTH arms, so it's non-optional; I pulled it, ran, then
+pruned image + build tree back to the starting 78 GB free. (3) The manifest's
+`--mem-fraction-static 0.85` is a documented box-rebooter on the unified pool —
+overrode to 0.30 (the KV pool only needs ~few GB here). Residuals: 35B, the
+shared-prefix cache-ON arm, the token-exact cross-check, and the full P2 grid
+(vLLM arm + c1–c16).

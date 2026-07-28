@@ -95,6 +95,20 @@ joined the already-exposed RadixAttention/APC (v7) and custom logits processors
 [specs/sglang-enablement.md](specs/sglang-enablement.md). Default-inert (all-zero
 ⇒ byte-identical); CPU exact-gate; `vllm_abi_version()`==10.
 
+**★ SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
+`CLAIM-SGLANG-PERF-BENCH`).** The v0.5.15-cu130 arm64 image RAN the 27B-NVFP4
+gate model on GB10 sm_121a (no from-source build — as the oracle spec §2
+predicted). First reproduced cache-neutral SGLang-vs-ours comparison at c8/c16
+(27B, 3 reps, idle box, one flock): **ours BEATS the SGLang floor on throughput
+(2.21×@c16, 1.44×@c8) and TTFT (6–12× lower), but SGLang WINS per-token latency
+(TPOT/ITL 1.18–1.49× below ours) — a reproduced OPEN GAP / candidate lever.**
+Evidence + repro: [sglang-matrix.md](sglang-matrix.md) § "Perf oracle results",
+[docs/BENCHMARKS.md](../docs/BENCHMARKS.md), [oracle spec §9](specs/sglang-parity-oracle.md).
+Residuals: 35B, c1/c2/c4 low-conc sweep, the shared-prefix cache-ON arm
+(`BACKEND-GATE-CUDA-SGLANG-PREFIX`), and the token-exact correctness cross-check
+(`SGLANG-ORACLE-CORRECT`). The existing `run_serve_low.py bench` harness drove
+both arms; note its `SGLANG_IMAGE` pin is still v0.5.13 vs the oracle-spec v0.5.15.
+
 **★ ACTIVE PHASE (user-directed 2026-07-20/21) — the BREADTH SWEEP.** With 27B/35B parity,
 the `KERNEL-FUSION-FRAMEWORK` extensibility cornerstone (W0-W4), and the FIRST additive model
 (Qwen3 dense: correctness-complete + c1 effective every-axis parity, c8 within a cross-cutting
