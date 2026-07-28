@@ -52,7 +52,8 @@ portable/reference path. In normal operation leave them unset.
 | `VLLM_CPP_CUDAGRAPH` | on (CUDA) | Eager launches instead of a captured CUDA graph |
 | `VLLM_CPP_DENSE_DECODE_GRAPH` | on (CUDA dense) | Non-graphed dense decode |
 | `VT_MM_DECODE_EAGER` | off (graph on) | Set to `1` to force the eager per-step multimodal (Qwen3.6-27B image/video) decode instead of routing it through the captured dense decode graph. Rollback / A-B knob; the graphed path is token-exact with the eager path |
-| `VT_WHISPER_ENC_EAGER` | off (warp attention on) | Set to `1` to force the naive per-key block-reduction attention in the Voxtral/Whisper audio encoder instead of the warp-scoped online-softmax kernel. Rollback / A-B knob; the fast path is token-identical to the naive path (encoder forward ~4.7x faster) |
+| `VT_WHISPER_ENC_EAGER` | off (flash-tiled attention on) | Set to `1` to force the naive per-key block-reduction attention in the Voxtral/Whisper audio encoder instead of the default flash-tiled kernel. Rollback / A-B knob; token-identical to the default path |
+| `VT_WHISPER_ENC_WARP` | off (flash-tiled attention on) | Set to `1` to force the warp-scoped online-softmax attention (`vt::AttentionDenseFast`, the pre-flash default) in the Voxtral/Whisper audio encoder instead of the default flash-tiled kernel (`vt::AttentionDenseFlash`). Rollback / A-B knob; the flash-tiled path is bit-identical to the warp path (encoder self-attention ~1.82x faster) |
 | `VT_DEVICE_KV_CACHE` | on (CUDA) | Host-side KV cache instead of the on-device one |
 | `VT_GPU_SAMPLE` | on (CUDA) | Host-side sampling instead of on-GPU sampling |
 | `VT_GDN_PACKED_DECODE` | on (CUDA GDN) | Unpacked GDN decode path |

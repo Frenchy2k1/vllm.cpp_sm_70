@@ -1,38 +1,39 @@
 {
-  "_source_vllm": "MEASURED 2026-07-27 on dgx.casa (GB10): `du -sk -L ~/venvs/vllm-oracle` = 9899580 KiB total; component sizes from `du -sk site-packages/*`. This is the pinned parity oracle venv (vLLM 0.26.0.dev0, built from source for sm_121a).",
-  "_source_ours": "MEASURED 2026-07-27 on the dev box: build-demo/examples/server, CMAKE_BUILD_TYPE=Release, CPU backend, stripped = 10330088 bytes. The server links libvllm.a statically (ldd shows no libvllm dependency), so this single file is the whole deployment.",
-  "_caveat": "NOT a like-for-like build pairing: the vLLM figure is a CUDA-enabled venv, ours is a CPU Release build. A CUDA build of vllm.cpp embeds device code and is larger; that figure is not yet measured and is deliberately not estimated here. The caveat is drawn on the card.",
-  "headline": "9.4 GiB of Python and CUDA userspace, or one 10 MiB binary.",
+  "_source_vllm": "MEASURED 2026-07-28 on dgx.casa (GB10, aarch64): `du -sk -L ~/venvs/vllm-oracle` = 9542288 KiB total (9318.6 MiB); per-component from `du -sk .../site-packages/*` and `.../nvidia/*`. The venv symlink resolves to vllm-oracle-v0.25.0-stage; `python -c 'import vllm,torch'` reports vllm 0.25.0, torch 2.11.0+cu130. (The 0.26.0.dev0 pin recorded earlier is rolled back to 0.25.0 on this box; the figure names what is actually installed and measured.)",
+  "_source_ours": "MEASURED 2026-07-28 on dgx.casa (GB10, aarch64, nvcc 13.0). CUDA build: `cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_SERVER=ON -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`; configure banners confirm cutlass-nvfp4 ENABLED [121a], cutlass-fp8 ENABLED [121a], FlashAttention-2 prefill/decode ENABLED [121a]. `cmake --build build-cuda --target server vllm_shared`. Server binary `strip`ped = 68974608 bytes = 65.78 MiB (`stat -c %s`, `strip`, `ls -l`). The server statically links libvllm.a, so this one file is the entire deployment; `libvllm.so` (65.66 MiB stripped) is the alternative library form of the same code, not an additional shipped file.",
+  "_source_ldd": "`ldd build-cuda/examples/server` on dgx.casa: the ONLY non-system dependencies are libcudart.so.13 (707752 B = 0.67 MiB) and libcublasLt.so.13 (629945952 B = 600.76 MiB), both resolved from the SYSTEM CUDA toolkit at /usr/local/cuda-13.0 (present on any GB10 for the driver/toolkit stack). All other deps are base OS runtime (libc, libm, libstdc++, libgcc_s, libdl, libpthread, librt). vllm.cpp therefore BUNDLES 0 bytes of CUDA userspace and reuses the system CUDA runtime; vLLM instead bundles its own CUDA userspace as pip nvidia-* wheels (3144.7 MiB, counted in its bar). These system CUDA bytes are named in the footnote, not silently dropped.",
+  "_caveat": "Apples-to-apple as of 2026-07-28: BOTH sides freshly measured on the same GB10. vllm.cpp is now the CUDA fast-path build (cutlass 4.5.0 + vendored FlashAttention-2 device code embedded), NOT the earlier CPU build. What you install to serve on a GB10 = one 65.8 MiB server binary; it links the system CUDA runtime (libcudart + libcublasLt, ~601 MiB) already on the box, which vLLM ships its own copies of inside the 3.07 GiB nvidia wheels.",
+  "headline": "9.1 GiB of Python and CUDA userspace, or one 66 MiB CUDA binary.",
   "title": "What you install before it serves a token",
-  "subtitle": "vLLM 0.26.0.dev0 pinned oracle venv vs the vllm.cpp server binary, both measured on disk",
+  "subtitle": "vLLM 0.25.0 oracle venv vs the vllm.cpp CUDA server binary, both measured on the same GB10",
   "groups": [
     {
       "label": "vLLM",
-      "detail": "Python venv, CUDA-enabled, built from source for sm_121a",
+      "detail": "Python venv, CUDA-enabled, bundles its own CUDA userspace (vllm 0.25.0, torch 2.11.0+cu130)",
       "accent": "slate",
-      "total_mib": 9667,
+      "total_mib": 9318.6,
       "parts": [
-        {"label": "nvidia CUDA libs", "mib": 3160},
-        {"label": "flashinfer cubins", "mib": 2494},
-        {"label": "torch", "mib": 914},
-        {"label": "triton", "mib": 651},
-        {"label": "cutlass DSL", "mib": 431},
-        {"label": "everything else", "mib": 2017}
+        {"label": "nvidia CUDA libs", "mib": 3144.7, "_source": "du -sk site-packages/nvidia/* (cu13 2087.5 + cudnn 509.3 + cusparselt 261.2 + nccl 209.6 + nvshmem 77.0)"},
+        {"label": "flashinfer cubins", "mib": 1853.8, "_source": "du -sk site-packages/flashinfer_cubin"},
+        {"label": "torch", "mib": 912.8, "_source": "du -sk site-packages/torch"},
+        {"label": "triton", "mib": 600.3, "_source": "du -sk site-packages/triton"},
+        {"label": "cutlass DSL", "mib": 192.4, "_source": "du -sk site-packages/nvidia_cutlass_dsl"},
+        {"label": "everything else", "mib": 2614.6, "_source": "9318.6 total (du -sk -L venv) minus the five rows above; incl. vllm 604.8, tokenspeed_triton 266.6, tilelang 185.6, llvmlite 158.6, xgrammar 112.4, transformers 107.8, flashinfer 104.0, pandas, sympy, cv2, numpy, ..."}
       ]
     },
     {
       "label": "vllm.cpp",
-      "detail": "one statically linked server binary, CPU Release build, stripped",
+      "detail": "one CUDA server binary (cutlass 4.5.0 + FlashAttention-2 embedded), stripped; uses the system CUDA runtime",
       "accent": "teal",
-      "total_mib": 9.85,
+      "total_mib": 65.78,
       "parts": [
-        {"label": "server", "mib": 9.85}
+        {"label": "server binary", "mib": 65.78, "_source": "strip build-cuda/examples/server; stat -c %s = 68974608 bytes = 65.78 MiB. Statically links libvllm.a, so this single file is the whole install."}
       ]
     }
   ],
   "footnotes": [
-    "Measured 2026-07-27: du -sk -L on the pinned oracle venv (9899580 KiB); stat on the stripped server binary (10330088 bytes).",
-    "Not a like-for-like build pairing: the vLLM venv is CUDA-enabled, this vllm.cpp build is CPU. A CUDA build embeds device code and is larger.",
+    "Measured 2026-07-28 on dgx.casa (GB10): du -sk -L on the oracle venv (9542288 KiB); stripped CUDA server binary stat = 68974608 bytes.",
+    "vllm.cpp bundles 0 CUDA userspace: ldd shows only system libcudart (0.7 MiB) + libcublasLt (601 MiB) from /usr/local/cuda; vLLM ships its own copies inside the 3.07 GiB nvidia wheels.",
     "vllm.cpp needs no Python, PyTorch, or ggml at inference. Repro: docs/BENCHMARKS.md"
   ]
 }

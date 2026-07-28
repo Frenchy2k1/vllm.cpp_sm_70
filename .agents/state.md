@@ -28693,3 +28693,142 @@ without an MLX dependency or giving up paged attention.
 **Method note:** five minutes of synthetic benchmark replaced what would have been
 days of building a backend to find out. When an architectural option rests on a
 premise ("their execution model is faster"), test the premise in isolation first.
+
+---
+
+## 2026-07-28 — Audio ENCODER TTFT flash-tiled attention LANDED (`CLAIM-MM-SPEED-AUDIO-ENC-KERNEL`)
+
+Multimodal SPEED, audio encoder TTFT lever #1 (multimodal-speed.md §13.5 residual
+#1). Base local `main` `af1ed76b` (confirmed `git rev-parse HEAD`), isolated worktree
+`.claude/worktrees/agent-aa1bc27486712142a`. Implemented a flash-TILED non-causal
+head_dim-64 encoder attention and routed the Whisper audio encoder to it.
+
+**Kernel.** NEW `vt::AttentionDenseFlash` (`OpId::kAttentionDenseFlash`) —
+`AttentionDenseFlashKernel`/`LaunchAttentionDenseFlash`/`AttentionDenseFlashKernelCuda`
+in `src/vt/cuda/cuda_ops.cu` + registration; enum + prototype `include/vt/ops.h`;
+wrapper/validation `src/vt/ops.cpp`; CPU registration (maps to `AttentionKernel`,
+byte-identical) `src/vt/cpu/cpu_ops.cpp`. A block of `kFlashBr=16` query-warps (512
+threads) SHARES each streamed `kFlashBc=64`-column K/V tile out of dynamic shared
+memory (classic FlashAttention K/V tiling, structure-ported from the vendored FA2
+`flash_fwd_kernel.h:52` `compute_attn_1rowblock` — sK/sV shared tiles + the
+`for(int n_block…)` K/V-tile stream). The per-warp online-softmax arithmetic (per-lane
+head_dim grouping `lane+32k`, butterfly `__shfl_xor`, sequential j-order, f32
+`m`/`l`/`acc`) is copied VERBATIM from `AttentionWarpKernel`, so the only change is that
+K/V bytes come from shared memory instead of global ⇒ output BIT-IDENTICAL ⇒
+token-identical. Registered as a SEPARATE op so `kAttention`/`kAttentionDenseFast` stay
+untouched (text/vision byte-identical by construction). Wired default in
+`src/vllm/model_executor/models/whisper_audio.cpp` (`VT_WHISPER_ENC_WARP=1` → warp
+`AttentionDenseFast`, `VT_WHISPER_ENC_EAGER=1` → naive `kAttention`, for same-binary A/B).
+
+**Build (dgx `~/vllmcpp-mmspeed`).** `git archive` of the code commit, clean CUDA
+`build-cuda` cutlass 4.5.0 + FA2 sm_121a arch 121a — "CUTLASS found … enabling sm120a
+NVFP4 cutlass GEMM" + "FlashAttention-2 … ENABLED for [121a]" banners CONFIRMED,
+`-Werror` 0-warn. Local CPU `-Werror` 0-warn on the CPU-compiled files (`ops.cpp`,
+`cpu_ops.cpp`, `whisper_audio.cpp`). All GPU under `flock $HOME/gpu.lock`, sole owner
+(`nvidia-smi` idle, `local-ai-worker` absent), rep0 dropped.
+
+**BYTE-EXACT (RED line HELD).** Baseline WARP arm (pre-change behavior) `test_voxtral_e2e`
+**16/16** (env/oracle/golden sound). Default FLASH arm **16/16** (strict prefix 18/48,
+teacher-force PASS, seq 48/48). flash/warp/eager token dumps md5-IDENTICAL (`89923566…`)
+⇒ ZERO token flips. Goldens md5 UNCHANGED (`voxtral_golden.json 8ab87b7e…`,
+`voxtral_neartie.json 937b9ad3…`, before==after) — no golden regen. Proof-of-run: nsys
+`cuda_gpu_kern_sum` shows `AttentionDenseFlashKernel` 32 inst (= 32 encoder layers), ZERO
+`AttentionWarpKernel`/naive on the encoder path. RED: corrupting the kernel
+(`p·Load(sV,…)·2`) → gate 13/16 FAILURE → restore → 16/16. compute-sanitizer memcheck
+**0 errors**; 3 default runs byte-identical (encoder path NOT graphed ⇒ capture-safety N/A).
+
+**A/B (same-binary, nsys + throwaway `VT_ENC_REPS`, 5 reps rep0 dropped).** Attention
+**35.11 → 19.29 ms/layer (1.82×, NON-OVERLAPPING; warp min 31.07 > flash max 19.37)**;
+encoder forward total **~1834 → ~1375 ms (1.33×)**.
+
+**HONEST VERDICT — real byte-exact 1.82× kernel win, NOT at parity.** ~1.37 s encoder
+TTFT vs vLLM 0.25.0's ~43 ms (~32×, was ~44×). The flash tiling is a genuine same-math
+win but modest (1.8× not the naive ~16× reuse factor) because GB10 L2 already served much
+of the warp kernel's "redundant" global K/V reads — the real wall is now the
+serial-latency-bound scalar warp-per-query recurrence over 1500 keys. Residual levers
+(NOT implemented): (1) tensor-core MMA hd-64 non-causal FA2 instantiation (the vendored
+FA2 ships hd {128,192,256} only) — split-K across the 1500 keys, the true ~vLLM
+gap-closer, LARGE; (2) resident one-time encoder weights + drop the conv round-trip
+(~0.75 s, MEDIUM, byte-exact). Audio DECODE stays DONE-on-speed (§12, 0.97×, BEATS);
+audio TTFT/encoder stays speed-pending/PARTIAL; no mm row advances to DONE.
+
+Records: `specs/multimodal-speed.md` (§14 + headline pointer), `kernel-matrix.md`
+(`KERNEL-ATTN-DENSE-FLASH` new `ACTIVE` row), `model-matrix.md` (Voxtral rows),
+`feature-matrix.md` (mm row), `roadmap_v1.md` (ROAD-V1-MM), `coordination.md`
+(`CLAIM-MM-SPEED-AUDIO-ENC-KERNEL`), `parity-ledger.md`, `docs/STATUS.md`,
+`docs/BENCHMARKS.md`, this entry. All record checkers rc=0. NOT pushed; FULL SHA
+reported to caller.
+
+---
+
+## 2026-07-28 — MLX gated to PREFILL reaches 99.1% of mlx-lm; blocked on numerics policy
+
+**Result (branch `fix/mlx-decline-fallback`, NOT main), same-window:**
+
+| | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill TTFT | **524.5 ms** | 537 ms | **2.3% FASTER** |
+| decode | 27.28 | 27.44 | 99.4% |
+| **warm total** | **24.40** | 24.61 | **99.1%** |
+
+Up from 96.4%. Two changes, and the second is what made the first work:
+
+1. **Shape-gate MLX to prefill** (`a.shape[0] < 2` declines). MLX's steel GEMM
+   wins prefill; its per-op `mx::eval` + memcpy loses decode.
+2. **Hoist the fallback lookup.** `GetOpFallback` walks the provider stack,
+   re-reads device caps and does an atomic on EVERY call. Fine when declines are
+   rare; a shape-gated provider declines ~21,500 times per decode run, and paying
+   it each time measured **27.2 -> 17.8 tok/s**. A function-local static fixes it
+   (the stack is immutable after registration) and decode returns to 27.2.
+   **This is a latent bug for ANY declining provider, not just MLX.**
+
+**BLOCKERS — all three are real and none should be waved through:**
+
+1. **The SACRED gate fails: anchor drift at prompt[1] tok=0.** MLX's GEMM is not
+   bit-identical to ours, so an MLX build produces a different greedy sequence.
+   This is a POLICY question, not a bug: MLX is a build-time opt-in
+   (`VLLM_CPP_MLX`, default OFF), so the default build's goldens are untouched —
+   but an MLX build needs either its own golden or an explicit statement that it
+   is a numerics-deviating configuration. Do not re-anchor the DEFAULT golden to
+   an MLX build; that would silently move the non-MLX path's contract.
+2. `mlx_declines == 0` (x2) and `stats.declines == 1` encode "MLX handles every
+   shape". Wrong by design now; needs deliberate updating.
+3. `saw_mm` (x4): with MLX accepting m>1, the native mm kernel never runs in an
+   MLX build. That assertion needs to be conditional on the provider set.
+
+**The prize is 96.4% -> 99.1%, which is most of the remaining gap.** It is worth
+doing properly rather than fast.
+
+---
+
+## 2026-07-28 — LANDED: MLX shape-gated to prefill, 96.4% -> 99.1% of MLX-LM
+
+Answered "should we drop MLX?" with measurement: **no.** MLX is 11% FASTER on
+prefill (537 ms TTFT vs 602, against mlx-lm's own 534) and 47% slower on decode.
+Neither on nor off — SHAPE-GATED.
+
+1. MLX declines `m < 2` (the decode GEMV).
+2. **The fallback lookup is hoisted.** `GetOpFallback` walks the stack, re-reads
+   caps and does an atomic PER CALL; a shape-gated provider declines ~21,500
+   times per decode run and that cost **27.2 -> 17.8 tok/s**. Latent for ANY
+   declining provider. The decline COUNT now goes through `NoteOpDecline`, after
+   hoisting silently killed the accounting — caught by `stats.declines >= 1`
+   failing, i.e. the test doing exactly its job.
+
+| | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill TTFT | **524.5 ms** | 537 | **2.3% faster** |
+| decode | 27.28 | 27.44 | 99.4% |
+| **warm total** | **24.40** | 24.61 | **99.1%** |
+
+**Default build is byte-identical to before** (the change is entirely inside
+`metal_mlx_provider.mm`): 16/16 SACRED, 112300 Metal, 1643 op assertions. MLX
+build: 112327.
+
+**MLX builds deviate numerically — PRE-EXISTING, verified.** Built `origin/main`
+WITH MLX and the same gate already failed (anchor drift prompt[0] tok=1) before
+any change here. MLX stays a build-time opt-in; an MLX-specific golden is future
+work and the DEFAULT golden must never be re-anchored to an MLX build.
+
+**Standing: 96.4% default, 99.1% with MLX-prefill.** The remaining ~0.9% is
+decode (27.28 vs 27.44).

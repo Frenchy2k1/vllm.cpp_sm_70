@@ -166,6 +166,14 @@ OpProviderStats GetOpProviderStats(OpId op, DeviceType device);
 // pointer load; VT_OP_PROVIDER_STATS=1 turns it on, and tests turn it on
 // explicitly rather than depending on the environment.
 void EnableOpProviderCallStats(bool on);
+// Counts one decline WITHOUT re-resolving the fallback. `GetOpFallback` walks the
+// provider stack and re-reads device caps, which is fine when declines are rare
+// but not when a SHAPE-GATED provider declines on the hot path — a decode run
+// declines ~21,500 times. Such a provider caches the fallback pointer once and
+// calls this per decline, so `OpProviderStats::declines` stays exact while the
+// lookup cost disappears.
+void NoteOpDecline(OpId op, DeviceType device);
+
 void ResetOpProviderStats(OpId op, DeviceType device);
 
 // Runtime A/B lever: disables a provider by name, forcing selection to fall to
