@@ -29382,3 +29382,46 @@ Attribution first; guessing at the head would be debugging the wrong half.
 The gate is asset-gated (`VLLM_MTP_GGUF_MODEL`), so it skips in CI and the red
 stays local and reproducible rather than blocking the tree. `docs/STATUS.md` says
 plainly not to describe GGUF MTP as working.
+
+## 2026-07-28 — `G4a` ANSWERED by bisect: the GGUF head is exonerated, CPU spec-decode is not
+
+**The planned attribution needed a safetensors download. A bisect answered it for
+free and more decisively.** Zero the MTP head's `fc` so every proposal is
+garbage, then rerun the same gate:
+
+    spec-OFF            {11751, 13, 198, 32, ...}     " Paris.\\nA. True\\nB. False..."
+    spec-ON, live head  {11751, 369, 279, 6511, ...}  13 proposed / 10 accepted
+    spec-ON, DEAD head  {11751, 369, 279, 6511, ...}  23 proposed /  0 accepted
+
+The dead-head run is BYTE-IDENTICAL to the live-head run. With zero drafts
+accepted the emitted sequence must be the target's own greedy sequence by
+construction, and it is not. Therefore enabling speculation changes the TARGET's
+forward on CPU, independently of the head, of MTP, and of GGUF.
+
+**`SPEC-MTP-GGUF` is cleared of this.** The loader is fine; with a live head it
+earns 10/13 acceptance, which is a working drafter. The row stays `PARTIAL` only
+because it cannot demonstrate end-to-end exactness while the engine underneath it
+diverges.
+
+**New defect recorded: `CPU-SPEC-DIVERGENCE`** (in the GGUF MTP spike, since that
+is where the evidence lives). Scope-setting fact: there is NO CPU spec-decode gate
+anywhere in this tree. `SPEC-MTP` I5d/I5e/I6/I7 were gated on GB10 exclusively, so
+this is plausibly the first end-to-end CPU spec run ever done, and the defect may
+be as old as the widened-cache work (I5e). **No GPU result is affected or
+retracted** - the three-way 27B gate and the c1-c8 A/Bs stand on CUDA.
+
+Op-level CPU suites PASS (`test_ops_gdn` 1825, `test_qwen3_5_gdn_spec_routing`
+12), so the kernels are bit-exact and this is call-site / bookkeeping.
+
+**Lead for whoever takes it, explicitly NOT a diagnosis.**
+`CausalConv1dSpecUpdateKernel` (`src/vt/cpu/cpu_ops.cpp:1010+`) computes
+`off = num_accepted_tokens[i] - 1` and guards the state read with
+`src < state_len` only, with no `src >= 0`. At `nat == 0` that reads `srow[-1]`.
+Upstream treats `num_accepted_tokens` as accepted-drafts + 1 (so >= 1), and
+whether it can be 0 on our call path is UNVERIFIED. Cheap to check first; not
+established as the cause. Do not "fix" it without first proving `nat` reaches 0.
+
+**Method note.** The bisect beat the planned experiment because it removed a
+variable instead of adding a checkpoint: a dead drafter makes the expected output
+provable a priori (it MUST equal spec-OFF), so a single run discriminates. Prefer
+that shape when a component can be neutralised rather than duplicated.

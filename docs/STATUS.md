@@ -529,11 +529,23 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   (`tests/parity/test_qwen35_gguf_spec_decode.cpp`) runs on CPU against the real
   2B GGUF and FAILS: the drafter is demonstrably alive (13 drafts proposed, 10
   accepted) but spec-ON output DIVERGES from spec-OFF, which greedy MTP must
-  never do. It is not yet attributed between this row's head load and a
-  pre-existing CPU spec-decode defect - there is no CPU spec gate anywhere in the
-  tree, the whole `SPEC-MTP` program having been gated on GB10 - and the
-  discriminating run (the same gate over a safetensors Qwen3.5 on CPU) is the
-  next step. Do not describe GGUF MTP as working.
+  never do. **The cause is now ATTRIBUTED, by bisect, and it is NOT the GGUF head
+  loader**: zeroing the head so every proposal is garbage (23 proposed, 0
+  accepted) produces byte-identical output to the live-head run and the same
+  divergence. With zero accepted drafts the emitted sequence must be the target's
+  own greedy sequence, so enabling speculation is changing the TARGET's forward
+  on CPU. With a live head the loader earns 10/13 acceptance. Do not describe
+  GGUF MTP as working end to end, but the remaining defect is engine-level.
+- **Speculative decoding diverges on CPU, independently of MTP or of GGUF**
+  (`CPU-SPEC-DIVERGENCE`, recorded in
+  [the GGUF MTP spike](../.agents/specs/gguf-mtp-spec-decode.md)). Turning
+  speculation on changes the target's own greedy output even with no draft ever
+  accepted. There is no CPU spec-decode gate anywhere in the tree - `SPEC-MTP`
+  was gated entirely on GB10 - so this is plausibly the first end-to-end CPU spec
+  run and the defect may be as old as the widened-cache work. GPU spec-decode
+  results are unaffected and unretracted; op-level CPU suites (`test_ops_gdn`,
+  `test_qwen3_5_gdn_spec_routing`) pass, so this is call-site bookkeeping rather
+  than kernel math.
 - **DFlash from GGUF is SPIKED, not implemented.** `mtp` and
   `dflash` are refused on a `.gguf` target today; `ngram` works there and
   always has. Two `READY` rows now carry the scoped plan:
