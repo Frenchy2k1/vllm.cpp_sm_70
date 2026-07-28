@@ -2378,6 +2378,26 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
+### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - scoping documents, ZERO code.
+`benchmark_binding=false`.** Two spikes committed under `.agents/specs/` plus their
+`READY` matrix rows. No `src/`, `include/`, `tests/` or `examples/` file is touched, so
+there is nothing to measure and every existing gate stands unchanged.
+
+Both spikes explicitly DECLINE to owe a speed number at implementation time either:
+spec-decode throughput is already recorded under `SPEC-MTP` (I6/I7), and a GGUF A/B is
+listed as a legitimate `PENDING` with its reproduction entry point rather than a claim.
+What they DO owe, and what the gates section of each pins, is correctness: spec-OFF
+byte-identical (SACRED), token identity at c1, and acceptance parity - because an MTP or
+DFlash head that loads but is wired wrong shows up as a collapsed acceptance rate, not as
+a crash, and a quantized head may accept so rarely that spec-ON is SLOWER than spec-OFF.
+That risk is recorded in both spikes as a finding to document honestly rather than a bug
+to hide.
+
+**Not measured, and not owed by a scoping commit:** nothing. The first real number is
+owed by `SPEC-MTP-GGUF` row `G4` (acceptance) and, if a GGUF A/B is run, `G6`.
+
 ### C-ABI engine-config growth to v9 (2026-07-28, `CLAIM-CAPI-ENGINE-CONFIG-V9`) - ABI surface only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - ABI surface growth carrying already-benchmarked
