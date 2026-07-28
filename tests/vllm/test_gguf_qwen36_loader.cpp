@@ -336,3 +336,143 @@ TEST_CASE("LoadQwen3_5MoeFromGguf: V-head reorder when num_v != num_k") {
   CHECK(F32(gdn.dt_bias, 1) == doctest::Approx(4.0F));
   CHECK(F32(gdn.dt_bias, 2) == doctest::Approx(3.0F));
 }
+
+// ── SPEC-DFLASH-GGUF B1: the TARGET-shared bf16 embed_tokens + lm_head ──────
+//
+// `LoadGgufSharedEmbedAndHeadBf16` is the GGUF half of `SharedHeadSource`
+// (`model_loader.cpp`), which is what made axis B possible: a DFlash draft owns
+// no embedding and no lm_head - it runs the TARGET's over its own hidden states
+// - and until B1 that sharing was typed on safetensors shards, so a GGUF target
+// could not supply it and dflash was refused outright on the GGUF branch.
+//
+// Three things are gated here, and each of them is a way the seam could be
+// wrong while every shape still checks out:
+//
+//   1. the HEAD comes from `output.weight`, NOT from the embedding. A file
+//      where they happen to be equal (as the fixture above builds them) cannot
+//      tell those two apart, so these fixtures give them DIFFERENT values;
+//   2. the TIED fallback. A GGUF that omits `output.weight` has the head
+//      aliased onto `token_embd.weight` (llama.cpp TENSOR_DUPLICATED). Missing
+//      that, the load throws on a perfectly valid file;
+//   3. the ORIENTATION flags. Both tensors are `[vocab, H]` and their bytes are
+//      identical in the tied case, so `nk` is the ONLY thing distinguishing the
+//      gather table from the MatmulBT weight - and a wrong `nk` is invisible
+//      until deep inside the draft's forward (the exact defect that cost
+//      `SPEC-MTP-GGUF` a debug cycle on `fc`).
+namespace {
+
+// bf16 bit patterns for `n` values. Every value these fixtures use is a small
+// integer, which is EXACTLY representable in bf16 (8 mantissa bits), so the
+// high 16 bits of the f32 are the bf16 and no rounding decision is involved -
+// which is what lets the expectations below be exact equalities.
+template <typename F>
+std::string Bf16Data(int64_t n, F fill) {
+  std::string s;
+  s.reserve(static_cast<size_t>(n) * 2);
+  for (int64_t i = 0; i < n; ++i) {
+    const float v = fill(i);
+    uint32_t bits = 0;
+    std::memcpy(&bits, &v, 4);
+    REQUIRE((bits & 0xffffu) == 0u);  // the fixture value must be bf16-exact.
+    const uint16_t hi = static_cast<uint16_t>(bits >> 16);
+    s.push_back(static_cast<char>(hi & 0xff));
+    s.push_back(static_cast<char>((hi >> 8) & 0xff));
+  }
+  return s;
+}
+
+uint16_t ExpectBf16(float v) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &v, 4);
+  return static_cast<uint16_t>(bits >> 16);
+}
+
+// A minimal target file carrying only what the shared head needs. `tied` omits
+// `output.weight`; otherwise the head is given values DISTINCT from the
+// embedding's so the two cannot be confused. Stored BF16 (ggml type 30), which
+// is what the real Qwen3.6-27B NVFP4 GGUF stores these two as - its NVFP4 body
+// notwithstanding - so this fixture exercises the production encoding.
+std::string BuildSharedHeadGguf(bool tied, int64_t vocab, int64_t H) {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35"));
+  const std::vector<uint64_t> ggml_dims = {static_cast<uint64_t>(H),
+                                           static_cast<uint64_t>(vocab)};
+  b.AddTensor("token_embd.weight", ggml_dims, /*BF16=*/30,
+              Bf16Data(vocab * H, [](int64_t i) { return float(i); }));
+  if (!tied) {
+    b.AddTensor("output.weight", ggml_dims, /*BF16=*/30,
+                Bf16Data(vocab * H, [](int64_t i) { return -1.0F - float(i); }));
+  }
+  return b.Build();
+}
+
+}  // namespace
+
+TEST_CASE("LoadGgufSharedEmbedAndHeadBf16: untied head comes from output.weight") {
+  constexpr int64_t kVocab = 6;
+  constexpr int64_t kH = 4;
+  TempFile f(BuildSharedHeadGguf(/*tied=*/false, kVocab, kH));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+
+  vllm::OwnedTensor embed;
+  vllm::OwnedTensor head;
+  vllm::LoadGgufSharedEmbedAndHeadBf16(g, &embed, &head);
+
+  // Layout: both torch [vocab, H]; the gather table is NOT nk, the GEMM is.
+  REQUIRE(embed.rank == 2);
+  CHECK(embed.shape[0] == kVocab);
+  CHECK(embed.shape[1] == kH);
+  CHECK(embed.dtype == vt::DType::kBF16);
+  CHECK_FALSE(embed.nk);
+  REQUIRE(head.rank == 2);
+  CHECK(head.shape[0] == kVocab);
+  CHECK(head.shape[1] == kH);
+  CHECK(head.dtype == vt::DType::kBF16);
+  CHECK(head.nk);
+
+  // Values, exactly. The head's -(1+i) against the embedding's +i is what
+  // proves the head was read from `output.weight` and not from the embedding;
+  // both ranges stay inside bf16's exactly-representable integers.
+  for (int64_t i = 0; i < kVocab * kH; ++i) {
+    CHECK(Bf16(embed, i) == ExpectBf16(float(i)));
+    CHECK(Bf16(head, i) == ExpectBf16(-1.0F - float(i)));
+  }
+}
+
+TEST_CASE("LoadGgufSharedEmbedAndHeadBf16: tied file aliases the head onto the embedding") {
+  constexpr int64_t kVocab = 6;
+  constexpr int64_t kH = 4;
+  TempFile f(BuildSharedHeadGguf(/*tied=*/true, kVocab, kH));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+
+  vllm::OwnedTensor embed;
+  vllm::OwnedTensor head;
+  vllm::LoadGgufSharedEmbedAndHeadBf16(g, &embed, &head);
+
+  REQUIRE(embed.rank == 2);
+  REQUIRE(head.rank == 2);
+  CHECK(head.shape[0] == kVocab);
+  CHECK(head.shape[1] == kH);
+  // Same bytes, different meaning: only `nk` separates them.
+  CHECK_FALSE(embed.nk);
+  CHECK(head.nk);
+  REQUIRE(embed.bytes.size() == head.bytes.size());
+  CHECK(std::memcmp(embed.bytes.data(), head.bytes.data(),
+                    embed.bytes.size()) == 0);
+  for (int64_t i = 0; i < kVocab * kH; ++i) {
+    CHECK(Bf16(head, i) == ExpectBf16(float(i)));
+  }
+}
+
+TEST_CASE("LoadGgufSharedEmbedAndHeadBf16: a file with no token_embd is refused") {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35"));
+  b.AddTensor("output.weight", {4, 6}, /*BF16=*/30,
+              Bf16Data(24, [](int64_t i) { return float(i); }));
+  TempFile f(b.Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+
+  vllm::OwnedTensor embed;
+  vllm::OwnedTensor head;
+  CHECK_THROWS(vllm::LoadGgufSharedEmbedAndHeadBf16(g, &embed, &head));
+}
