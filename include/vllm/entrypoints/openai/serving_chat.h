@@ -190,6 +190,12 @@ class OpenAIServingChat {
   // See OpenAIServingCompletion::uses_async_engine().
   bool uses_async_engine() const { return async_engine_ != nullptr; }
 
+  // The chat-prompt renderer this handler applies to `messages` (the same seam
+  // create_chat_completion tokenizes through). Exposed so the /tokenize chat
+  // form (serve/tokenize/serving.py:70-92, TokenizeChatRequest) renders through
+  // the IDENTICAL chat template as chat-completions instead of reinventing it.
+  const ChatPromptFn& prompt_fn() const { return prompt_fn_; }
+
  private:
   // Build the per-request tool parser (get_tool_parser) when ToolsEnabled and a
   // parser name is configured; else nullptr. ONE instance per request (the

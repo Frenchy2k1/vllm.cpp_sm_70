@@ -250,6 +250,21 @@ stay green). Reproduce:
 `cmake --build build-cpu --target test_prometheus_metrics test_openai_api_server &&
 ./build-cpu/tests/test_prometheus_metrics && ./build-cpu/tests/test_openai_api_server`.
 
+**ROAD-V1-C8 chat-form `/tokenize` (2026-07-28, `CLAIM-C8-CHAT-TOKENIZE`, NOT
+pushed).** Disposition: **NOT APPLICABLE (no throughput number,
+`benchmark_binding=false`).** Extending `/tokenize` to accept the chat
+`messages` arm of vLLM's `TokenizeRequest` union is serving-surface parity, not a
+compute path, so no vLLM throughput A/B applies. The gate is EXACT token-id
+parity: the chat form renders through the same model chat template
+chat-completions uses (`chat_.prompt_fn()`) then tokenizes, and the produced ids
+equal `render->Encode` exactly, with the `{count,max_model_len,tokens}` response
+schema matching vLLM 0.26.0.dev0 (`555967922`). Gated on CPU:
+`test_openai_api_server` 27/27 (337 assertions, the new chat-form case RED-first
+against the pre-change 400-reject). Inertness: additive union branch, the raw
+`prompt` form byte-identical. Reproduce:
+`cmake --build build-cpu --target test_openai_api_server &&
+./build-cpu/tests/test_openai_api_server`.
+
 **ROAD-V1-C8 /metrics LIVE per-step wiring (2026-07-27,
 `CLAIM-ROADMAP-C8-METRICS-WIRE`, NOT pushed).** Disposition: **NOT APPLICABLE (no
 throughput number, `benchmark_binding=false`; metrics are observational, off the

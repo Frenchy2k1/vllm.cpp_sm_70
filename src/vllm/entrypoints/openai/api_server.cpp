@@ -261,9 +261,12 @@ ApiServer::DispatchResult ApiServer::handle_metrics() const {
 
 ApiServer::DispatchResult ApiServer::handle_tokenize(
     const std::string& request_body) const {
-  // serve/tokenize/api_router.py:46 (tokenize) over TokenizeCompletionRequest
-  // (serve/tokenize/protocol.py:23). Chat-form tokenize (messages + template)
-  // is deferred; the prompt form matches the schema exactly.
+  // serve/tokenize/api_router.py:46 (tokenize) over the TokenizeRequest union
+  // (serve/tokenize/protocol.py:156): TokenizeCompletionRequest{prompt} OR
+  // TokenizeChatRequest{messages, ...}. vLLM discriminates on the body shape
+  // (pydantic Union) and, for the chat form, renders the model chat template
+  // then tokenizes (serve/tokenize/serving.py:70-124). The response is
+  // {count, max_model_len, tokens, token_strs} for both forms (:119).
   nlohmann::json body;
   try {
     body = nlohmann::json::parse(request_body);
@@ -271,22 +274,73 @@ ApiServer::DispatchResult ApiServer::handle_tokenize(
     return MakeError(400, "BadRequestError",
                      std::string("Invalid JSON body: ") + e.what());
   }
-  if (body.contains("messages")) {
-    return MakeError(400, "BadRequestError",
-                     "Chat-form /tokenize (messages) is not supported; supply "
-                     "`prompt`.");
-  }
-  if (!body.contains("prompt") || !body.at("prompt").is_string()) {
-    return MakeError(400, "BadRequestError",
-                     "`prompt` (string) is required.");
-  }
   if (tokenizer_ == nullptr) {
     return MakeError(500, "InternalServerError", "No tokenizer configured.");
   }
-  const std::string prompt = body.at("prompt").get<std::string>();
-  const bool add_special_tokens =
-      body.value("add_special_tokens", true);
+
   const bool return_token_strs = body.value("return_token_strs", false);
+  std::string prompt;
+  // add_special_tokens default differs by form: True for the completion form
+  // (protocol.py:28), False for the chat form (protocol.py:78 — the chat
+  // template already emits the model's special tokens).
+  bool add_special_tokens;
+
+  if (body.contains("messages")) {
+    // ── TokenizeChatRequest (serve/tokenize/protocol.py:50). Render the
+    // messages through the SAME chat-template seam create_chat_completion
+    // tokenizes through (chat_.prompt_fn()), then tokenize — never reinvent
+    // template rendering here (serve/tokenize/serving.py:84 preprocess_chat).
+    if (!body.at("messages").is_array()) {
+      return MakeError(400, "BadRequestError",
+                       "`messages` must be an array.");
+    }
+    // check_generation_prompt (protocol.py:120-128): the two are exclusive.
+    const bool add_generation_prompt =
+        body.value("add_generation_prompt", true);
+    const bool continue_final_message =
+        body.value("continue_final_message", false);
+    if (add_generation_prompt && continue_final_message) {
+      return MakeError(400, "BadRequestError",
+                       "Cannot set both `continue_final_message` and "
+                       "`add_generation_prompt` to True.");
+    }
+    add_special_tokens = body.value("add_special_tokens", false);
+
+    std::vector<ChatMessage> messages;
+    std::vector<ChatCompletionToolsParam> tools;
+    try {
+      messages = body.at("messages").get<std::vector<ChatMessage>>();
+      if (auto it = body.find("tools");
+          it != body.end() && it->is_array()) {
+        tools = it->get<std::vector<ChatCompletionToolsParam>>();
+      }
+    } catch (const std::exception& e) {
+      return MakeError(400, "BadRequestError",
+                       std::string("Invalid request: ") + e.what());
+    }
+
+    // build_chat_params folds add_generation_prompt / continue_final_message
+    // into the template kwargs (protocol.py:130-146). Our ChatPromptFn seam
+    // renders through the `add_generation_prompt` gate; continue_final_message
+    // (open-ended final turn) suppresses the generation header, so it maps to
+    // add_generation_prompt=false here.
+    const bool render_generation_prompt =
+        add_generation_prompt && !continue_final_message;
+    try {
+      prompt = chat_.prompt_fn()(messages, render_generation_prompt, tools);
+    } catch (const std::exception& e) {
+      return MakeError(400, "BadRequestError",
+                       std::string("Chat template render failed: ") + e.what());
+    }
+  } else {
+    // ── TokenizeCompletionRequest (serve/tokenize/protocol.py:24).
+    if (!body.contains("prompt") || !body.at("prompt").is_string()) {
+      return MakeError(400, "BadRequestError",
+                       "`prompt` (string) is required.");
+    }
+    prompt = body.at("prompt").get<std::string>();
+    add_special_tokens = body.value("add_special_tokens", true);
+  }
 
   std::vector<int32_t> ids = add_special_tokens
                                  ? tokenizer_->EncodeWithSpecialTokens(prompt)
