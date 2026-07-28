@@ -92,6 +92,25 @@ class InputProcessor {
       std::optional<double> arrival_time = std::nullopt,
       int priority = 0) const;
 
+  // process_inputs for a MULTIMODAL prompt (ROAD-V1-MM MM-SERVE-ENGINE). The
+  // `prompt_token_ids` are the ALREADY placeholder-EXPANDED ids (one image_pad /
+  // audio_pad per feature slot) produced by the serving-side mm processor
+  // (chat_mm RouteImageRgb / RouteAudioWav) and `mm_features` the matching
+  // per-item specs (mm-hash + span + encoder input). Mirrors upstream
+  // input_processor.py:333-379, where process_inputs builds the EngineCoreRequest
+  // with mm_features from the mm-processor output alongside the expanded
+  // prompt_token_ids. Strictly ADDITIVE: identical to process_inputs_tokens (no
+  // tokenization; validate / default-max_tokens / eos+stop wiring byte-for-byte)
+  // EXCEPT it also carries mm_features onto the request. An EMPTY mm_features
+  // vector makes it byte-identical to process_inputs_tokens (every downstream mm
+  // hook a no-op), so the text path is never perturbed.
+  EngineCoreRequest process_inputs_mm(
+      const std::string& request_id, std::vector<int32_t> prompt_token_ids,
+      std::vector<multimodal::MultiModalFeatureSpec> mm_features,
+      SamplingParams params,
+      std::optional<double> arrival_time = std::nullopt,
+      int priority = 0) const;
+
  private:
   // _validate_params: runs SamplingParams::PostInit() (normalize + Verify) —
   // this closes the M1.1 deferred-__post_init__ carry.

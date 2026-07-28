@@ -57,6 +57,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/multimodal/inputs.h"  // multimodal::MultiModalInputs (mm request)
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"  // BlockHasher
@@ -97,6 +98,20 @@ class LLMEngine {
                           std::vector<int32_t> prompt_token_ids,
                           SamplingParams params, int priority = 0);
 
+  // add_request for a MULTIMODAL prompt (ROAD-V1-MM MM-SERVE-ENGINE). Strictly
+  // ADDITIVE overload: takes the serving-side mm processor output
+  // (MultiModalInputs = placeholder-EXPANDED prompt ids + the per-item
+  // mm_features) and threads BOTH onto the EngineCoreRequest / Request via
+  // process_inputs_mm. Mirrors the tokens overload step-for-step (output
+  // processor gets no prompt string; parallel-sampling fan-out shares the mm
+  // features) EXCEPT the request now carries mm_features for the encoder cache /
+  // vision tower (the M2 forward consumer). An mm_inputs with empty mm_features
+  // is byte-identical to the tokens overload. The string/tokens overloads above
+  // are UNCHANGED.
+  std::string add_request(const std::string& request_id,
+                          multimodal::MultiModalInputs mm_inputs,
+                          SamplingParams params, int priority = 0);
+
   // step (llm_engine.py:296): get the EngineCore outputs -> process_outputs ->
   // abort any reqs the detokenizer stopped -> return the RequestOutputs.
   std::vector<RequestOutput> step();
@@ -132,6 +147,15 @@ class LLMEngine {
   // loop step() to completion. Used to gate InternLM2's forward with the
   // oracle's exact prompt ids (its non-standard tokenizer is not ported).
   RequestOutput generate(std::vector<int32_t> prompt_token_ids,
+                         SamplingParams params, const std::string& request_id = "0",
+                         int priority = 0);
+
+  // generate for a MULTIMODAL prompt (ROAD-V1-MM MM-SERVE-ENGINE). Strictly
+  // ADDITIVE single-request driver mirroring the tokens generate loop: add the
+  // mm request, then loop step() to completion. The mm forward (encoder tower +
+  // DeepStack/MRoPE inject) is the GPU consumer of the carried mm_features
+  // (MM-SERVE-E2E).
+  RequestOutput generate(multimodal::MultiModalInputs mm_inputs,
                          SamplingParams params, const std::string& request_id = "0",
                          int priority = 0);
 

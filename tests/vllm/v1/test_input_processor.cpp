@@ -22,21 +22,29 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+
 #include <nlohmann/json.hpp>
 
+#include "vllm/multimodal/inputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/engine/input_processor.h"
 #include "vllm/v1/engine/types.h"
+#include "vllm/v1/request.h"
 
 using nlohmann::json;
 using vllm::HfConfig;
 using vllm::SamplingParams;
 using vllm::SamplingType;
+using vllm::multimodal::AudioKwargs;
+using vllm::multimodal::ImageKwargs;
+using vllm::multimodal::MultiModalFeatureSpec;
 using vllm::tok::Tokenizer;
 using vllm::v1::EngineCoreRequest;
 using vllm::v1::InputProcessor;
+using vllm::v1::Request;
 
 namespace {
 
@@ -248,4 +256,91 @@ TEST_CASE("process_inputs: empty bad_words leaves bad_words_token_ids unset") {
   SamplingParams params;  // no bad_words
   EngineCoreRequest req = proc.process_inputs("r", "hi", params);
   CHECK_FALSE(req.sampling_params.bad_words_token_ids.has_value());
+}
+
+// ─── ROAD-V1-MM MM-SERVE-ENGINE: process_inputs_mm carries mm_features ───────
+//
+// The mm request path (input_processor.py:333-379): the prompt ids are the
+// ALREADY placeholder-expanded stream (the serving-side processor ran) and the
+// per-item mm_features ride onto the EngineCoreRequest alongside them. This is
+// the CPU-verifiable half — everything UP TO the mm forward (which consumes
+// mm_features on the GPU worker, MM-SERVE-E2E). RED-first: before this brick the
+// engine had NO mm add_request path (process_inputs_tokens drops mm data);
+// after, the request provably carries the mm handles + the expanded prompt.
+TEST_CASE("process_inputs_mm carries mm_features + the expanded prompt") {
+  const Tokenizer& tok = GoldenTokenizer();
+  HfConfig cfg = MakeConfig(4096, json(151643));
+  InputProcessor proc(tok, cfg);
+
+  // A placeholder-EXPANDED prompt: 2 real ids + 4 image_pad slots + 1 real id.
+  const int32_t kImagePad = 151655;
+  std::vector<int32_t> expanded = {5, 6, kImagePad, kImagePad,
+                                   kImagePad, kImagePad, 7};
+
+  // One image feature spec (the RouteImageRgb output shape): span [2,4] + an
+  // opaque ImageKwargs handle + the mm-hash.
+  MultiModalFeatureSpec spec;
+  spec.mm_hash = "deadbeefcafe";
+  spec.modality = "image";
+  spec.offset = 2;
+  spec.length = 4;
+  auto kw = std::make_shared<ImageKwargs>();
+  kw->num_patches = 16;
+  kw->patch_feature_dim = 8;
+  kw->image_grid_thw = {1, 8, 8};
+  spec.data = kw;
+  std::vector<MultiModalFeatureSpec> mm_features = {spec};
+
+  SamplingParams params;  // default max_tokens=16
+  EngineCoreRequest req = proc.process_inputs_mm(
+      "mm-1", expanded, mm_features, params, /*arrival_time=*/42.0);
+
+  // The EXPANDED prompt ids pass through verbatim (no tokenization).
+  CHECK(req.request_id == "mm-1");
+  CHECK(req.arrival_time == doctest::Approx(42.0));
+  CHECK(req.prompt_token_ids == expanded);
+
+  // The mm_features are carried onto the request (the handles + span + hash).
+  REQUIRE(req.mm_features.size() == 1);
+  CHECK(req.mm_features[0].modality == "image");
+  CHECK(req.mm_features[0].mm_hash == "deadbeefcafe");
+  CHECK(req.mm_features[0].offset == 2);
+  CHECK(req.mm_features[0].length == 4);
+  REQUIRE(req.mm_features[0].data != nullptr);
+  CHECK(req.mm_features[0].data->num_patches == 16);
+  CHECK(req.mm_features[0].data->image_grid_thw[1] == 8);
+
+  // The eos/stop wiring is byte-for-byte the tokens path (scalar eos written).
+  REQUIRE(req.sampling_params.eos_token_id.has_value());
+  CHECK(*req.sampling_params.eos_token_id == 151643);
+
+  // Request::FromEngineCoreRequest threads mm_features onto the built Request —
+  // the exact handoff LLMEngine/AsyncLLM::add_request(MultiModalInputs) perform
+  // before enqueueing to the EngineCore (the encoder-cache / vision consumer).
+  Request built = Request::FromEngineCoreRequest(req);
+  REQUIRE(built.mm_features.size() == 1);
+  CHECK(built.mm_features[0].mm_hash == "deadbeefcafe");
+  CHECK(built.mm_features[0].length == 4);
+  CHECK(built.prompt_token_ids == expanded);
+}
+
+TEST_CASE("process_inputs_mm with EMPTY mm_features == the tokens path") {
+  const Tokenizer& tok = GoldenTokenizer();
+  HfConfig cfg = MakeConfig(4096, json(151643));
+  InputProcessor proc(tok, cfg);
+
+  std::vector<int32_t> ids = {10, 11, 12, 13};
+  SamplingParams params;
+  EngineCoreRequest mm_req = proc.process_inputs_mm(
+      "r", ids, /*mm_features=*/{}, params, /*arrival_time=*/7.0);
+  EngineCoreRequest tok_req =
+      proc.process_inputs_tokens("r", ids, params, /*arrival_time=*/7.0);
+
+  // INERTNESS: an empty mm_features request is identical to the tokens request
+  // (same ids, same eos/max_tokens wiring) with an empty mm_features vector.
+  CHECK(mm_req.mm_features.empty());
+  CHECK(mm_req.prompt_token_ids == tok_req.prompt_token_ids);
+  CHECK(mm_req.sampling_params.max_tokens == tok_req.sampling_params.max_tokens);
+  CHECK(mm_req.sampling_params.eos_token_id ==
+        tok_req.sampling_params.eos_token_id);
 }

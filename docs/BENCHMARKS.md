@@ -598,6 +598,27 @@ GPU closing brick `MM-SERVE-E2E` (DGX + Qwen3-VL-4B checkpoint) and is not measu
 here. Reproduce: `cmake --build build-cpu --target test_chat_mm &&
 ./build-cpu/tests/test_chat_mm`.
 
+**ROAD-V1-MM engine mm-request wiring — brick 2 `MM-SERVE-ENGINE`
+(2026-07-28, `CLAIM-MM-SERVING-W2`, NOT pushed).** Disposition: **NOT APPLICABLE
+(feature — engine request plumbing, `benchmark_binding=false`; no compute path,
+no throughput number owed).** Carrying the parsed `MultiModalInputs` into the
+engine request is a request-assembly overload (`InputProcessor::process_inputs_mm`
++ `add_request(MultiModalInputs)` on `LLMEngine`/`AsyncLLM`) plus CPU-only
+placeholder-string helpers and a default-inert serving_chat seam — it schedules no
+kernel and runs no forward, so no vLLM throughput A/B applies. Gate is correctness
++ inertness: `test_input_processor` 10/10 (`process_inputs_mm` carries mm_features
++ the expanded prompt; empty mm_features == the tokens path) and `test_chat_mm`
+7/7 (placeholder strings mirror vLLM `get_placeholder_str`; the full chain
+parse→route→`process_inputs_mm`→`FromEngineCoreRequest` asserts the engine request
+carries the mm handles + the 196-slot expanded prompt), with the text-path
+suites (`test_llm_engine`, `test_async_llm`, `test_openai_serving`,
+`test_openai_serving_chat_stream`) byte-identical. The end-to-end serving SPEED (a
+real mm request → token-correct output through the running server, TTFT/TPOT vs the
+mm oracle) belongs to the named GPU closing brick `MM-SERVE-E2E` (DGX + Qwen3-VL-4B
+checkpoint) and is not measured here. Reproduce: `cmake --build build-cpu --target
+test_input_processor test_chat_mm && ./build-cpu/tests/test_input_processor &&
+./build-cpu/tests/test_chat_mm`.
+
 **ROAD-V1-C8 production endpoint wiring (2026-07-28, `CLAIM-C8-SERVE-PROD-WIRING`,
 NOT pushed).** Disposition: **NOT APPLICABLE (no throughput number,
 `benchmark_binding=false`).** Wiring the shipped `vllm-server` binary to call its

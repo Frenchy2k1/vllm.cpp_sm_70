@@ -84,6 +84,35 @@ std::string LLMEngine::add_request(const std::string& request_id,
   return req_id;
 }
 
+std::string LLMEngine::add_request(const std::string& request_id,
+                                   multimodal::MultiModalInputs mm_inputs,
+                                   SamplingParams params, int priority) {
+  // Multimodal path: the MultiModalInputs already holds the placeholder-EXPANDED
+  // prompt ids + the per-item mm_features (the serving-side processor ran). Build
+  // the EngineCoreRequest via process_inputs_mm (no tokenization; carries
+  // mm_features), then mirror the tokens overload step-for-step.
+  EngineCoreRequest request = input_processor_.process_inputs_mm(
+      request_id, std::move(mm_inputs.prompt_token_ids),
+      std::move(mm_inputs.mm_features), std::move(params),
+      /*arrival_time=*/std::nullopt, priority);
+  const std::string req_id = request.request_id;
+
+  // Parallel-sampling fan-out: each child copies the parent EngineCoreRequest
+  // (mm_features included), so n>1 shares the mm inputs across children.
+  if (request.sampling_params.n > 1) {
+    FanOutParallelSampling(request, /*prompt=*/std::nullopt);
+    return req_id;
+  }
+
+  output_processor_.add_request(request, /*prompt=*/std::nullopt,
+                                /*request_index=*/0);
+
+  auto req = std::make_unique<Request>(
+      Request::FromEngineCoreRequest(request, block_hasher_));
+  engine_core_.add_request(std::move(req));
+  return req_id;
+}
+
 void LLMEngine::FanOutParallelSampling(const EngineCoreRequest& request,
                                        std::optional<std::string> prompt) {
   // llm_engine.py:280-291. Build the shared ParentRequest, then register n child
@@ -186,6 +215,25 @@ RequestOutput LLMEngine::generate(std::vector<int32_t> prompt_token_ids,
   // TokensPrompt single-request driver (mirrors the string generate loop).
   add_request(request_id, std::move(prompt_token_ids), std::move(params),
               priority);
+  RequestOutput result;
+  while (has_unfinished_requests()) {
+    std::vector<RequestOutput> step_outputs = step();
+    for (RequestOutput& out : step_outputs) {
+      if (out.finished) {
+        result = std::move(out);
+      }
+    }
+  }
+  return result;
+}
+
+RequestOutput LLMEngine::generate(multimodal::MultiModalInputs mm_inputs,
+                                  SamplingParams params,
+                                  const std::string& request_id, int priority) {
+  // Multimodal single-request driver (mirrors the tokens generate loop). The
+  // step() forward consumes the carried mm_features on the GPU worker
+  // (MM-SERVE-E2E) — this driver only proves the loop terminates.
+  add_request(request_id, std::move(mm_inputs), std::move(params), priority);
   RequestOutput result;
   while (has_unfinished_requests()) {
     std::vector<RequestOutput> step_outputs = step();

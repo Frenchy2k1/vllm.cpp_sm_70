@@ -295,7 +295,8 @@ vllm_cpp_add_test(test_beam_search vllm/entrypoints/test_beam_search.cpp)
 vllm_cpp_add_test(test_chat_mm vllm/entrypoints/openai/test_chat_mm.cpp)
 target_compile_definitions(test_chat_mm PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
-  MM_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/whisper_audio")
+  MM_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/whisper_audio"
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 vllm_cpp_add_test(test_openai_protocol vllm/entrypoints/openai/test_protocol.cpp)
 vllm_cpp_add_test(test_openai_serving vllm/entrypoints/openai/test_serving.cpp)
 vllm_cpp_add_test(test_openai_serving_chat_stream

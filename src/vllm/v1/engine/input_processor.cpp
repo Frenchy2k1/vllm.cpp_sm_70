@@ -221,4 +221,37 @@ EngineCoreRequest InputProcessor::process_inputs_tokens(
   return request;
 }
 
+EngineCoreRequest InputProcessor::process_inputs_mm(
+    const std::string& request_id, std::vector<int32_t> prompt_token_ids,
+    std::vector<multimodal::MultiModalFeatureSpec> mm_features,
+    SamplingParams params, std::optional<double> arrival_time,
+    int priority) const {
+  // Multimodal path: the prompt is the ALREADY placeholder-EXPANDED id stream
+  // (the serving-side mm processor ran and consumed the media), so like
+  // process_inputs_tokens there is no tokenizer call. The ONLY delta vs the
+  // tokens path is that mm_features is carried onto the EngineCoreRequest
+  // (upstream input_processor.py:370-379 sets mm_features alongside
+  // prompt_token_ids). Every other step is byte-for-byte identical.
+  ValidateParams(params);
+
+  const double t = arrival_time.has_value() ? *arrival_time : NowSeconds();
+
+  if (!params.max_tokens.has_value()) {
+    const int64_t seq_len = static_cast<int64_t>(prompt_token_ids.size());
+    params.max_tokens = static_cast<int>(max_model_len_ - seq_len);
+  }
+
+  UpdateFromGenerationConfig(params);
+  UpdateFromTokenizer(params);
+
+  EngineCoreRequest request;
+  request.request_id = request_id;
+  request.prompt_token_ids = std::move(prompt_token_ids);
+  request.sampling_params = std::move(params);
+  request.arrival_time = t;
+  request.priority = priority;
+  request.mm_features = std::move(mm_features);
+  return request;
+}
+
 }  // namespace vllm::v1

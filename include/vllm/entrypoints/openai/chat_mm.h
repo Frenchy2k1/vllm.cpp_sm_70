@@ -80,6 +80,45 @@ multimodal::MultiModalInputs RouteImageRgb(
     const multimodal::Qwen3VLImageProcessor& proc, const uint8_t* rgb,
     int64_t height, int64_t width, const std::vector<int32_t>& prompt_ids);
 
+// ── Chat-template placeholder insertion (MM-SERVE-ENGINE) ──────────────────
+//
+// Ported from: vllm/entrypoints/chat_utils.py:886 `_add_placeholder` +
+// :627 `get_placeholder_str`, and the per-model markers
+// vllm/model_executor/models/qwen3_vl.py:1714 (image/video) +
+// qwen2_audio.py:333 (audio). When a chat request carries a multimodal content
+// part, vLLM inserts the model's placeholder STRING into the templated prompt at
+// the part position; the tokenizer then maps it to ONE placeholder token, which
+// the mm processor EXPANDS to N (= the grid/feature count) — the token-level
+// expansion our RouteImageRgb / RouteAudioWav already perform
+// (ExpandImagePlaceholders / ExpandAudioPlaceholders). These helpers own the
+// STRING-level marker (the serving-layer half of the mirror); turning the marker
+// into token ids needs the model tokenizer (MM-SERVE-E2E).
+
+// The Qwen3-VL IMAGE placeholder marker: "<|vision_start|><|image_pad|><|vision_end|>"
+// (qwen3_vl.py:1716). The single <|image_pad|> is what ExpandImagePlaceholders
+// replaces with prod(grid_thw)/merge^2 copies of image_token_id.
+std::string ImagePlaceholderString();
+
+// The Qwen3-VL VIDEO placeholder marker: "<|vision_start|><|video_pad|><|vision_end|>"
+// (qwen3_vl.py:1718).
+std::string VideoPlaceholderString();
+
+// The Qwen2-Audio placeholder marker: "Audio {i}: <|audio_bos|><|AUDIO|><|audio_eos|>"
+// (qwen2_audio.py:335). `index` is the 1-based audio item number vLLM formats in.
+std::string AudioPlaceholderString(int index);
+
+// The placeholder marker for ONE parsed content part (get_placeholder_str
+// dispatch): image_url -> ImagePlaceholderString; input_audio / audio_url ->
+// AudioPlaceholderString(audio_index); "text" (and unrouted residual kinds) ->
+// empty. `audio_index` is the running 1-based audio counter (Qwen numbers audios).
+std::string ChatPlaceholderFor(const ChatContentPart& part, int audio_index);
+
+// Collect the placeholder markers for a message's mm parts IN ORDER (mirrors the
+// per-message mm_placeholder_storage, chat_utils.py:891). Text parts contribute
+// no marker; audio parts are numbered 1..k. Empty when the message has no mm
+// parts (a bare-string content is byte-identical — content_parts is nullopt).
+std::vector<std::string> CollectChatPlaceholders(const ChatMessage& message);
+
 }  // namespace vllm::entrypoints::openai
 
 #endif  // VLLM_ENTRYPOINTS_OPENAI_CHAT_MM_H_
