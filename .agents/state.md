@@ -29845,3 +29845,51 @@ here, and axis B (GGUF target as well, requiring the `SharedHeadSource` retype o
 `LoadDflashDraft`) is untouched. The loader is gated at the load level only, and
 the MTP row is the standing reminder that load-level green is not end-to-end
 green.
+- **2026-07-28** — **Hopper `sm_90a` CUTLASS C3x FP8 scaled-mm GEMM (DC2) LANDED
+  + BUILD-VERIFIED** (`CLAIM-CUDA-SM90-C3X`, spec
+  `specs/cuda-arch-datacenter-fastpath.md` §9 DC2 / `ROAD-V1-D1-CUDA`; base local
+  `main` `00dd512e`; NOT pushed). The datacenter fast-path lane's second shippable
+  brick — the Hopper C3x **FP8** scaled-mm leg only (the sm90 int8 + blockwise-fp8
+  C3x legs, the sm100 C3x legs, FA3/Machete/MoE Sm90 are separate later bricks).
+  NEW TU `src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu` is a faithful 1:1 TYPE-port of
+  vLLM `cutlass_3x_gemm_sm90_fp8` (`ArchTag=cutlass::arch::Sm90` + `OpClassTensorOp`
+  + `KernelTmaWarpSpecialized{Pingpong,Cooperative,}FP8FastAccum` +
+  `EpilogueSchedule=TmaWarpSpecialized{,Cooperative}` → CUTLASS 4.5.0 emits the
+  4th-gen **wgmma/TMA** warp-specialized collective; the exact
+  `sm90_fp8_config_{default,M8192_K6144,M64_N8192}` tile/cluster/schedule shapes,
+  covering all three schedule variants), grounded in vLLM
+  `csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_sm90_fp8_dispatch.cuh:22-205`
+  (+ entry `scaled_mm_sm90_fp8.cu:1-33`) @ `5559679229`. **DESIGN CALL (mirrors DC1):**
+  the leg gets its OWN dedicated FEATURE-TABLE cell `scaledmm-c3x-sm90` (enabled
+  ONLY for `90a`); widening the sm_12x `cutlass-fp8` cell (`ArchTag=Sm120`) to 9.0a
+  would drag the sm120 scaled-mm PTX into a 90a build, which ptxas rejects for
+  compute_90a. **DEVIATION (recorded):** the plain LinearCombination epilogue
+  (alpha_ptr) is instantiated rather than vLLM's ScaledEpilogue EVT — the two
+  per-tensor scalars fold to one accumulator multiply (the same fold the shipped
+  sm_12x fp8 drop-in uses); the wgmma/TMA MAINLOOP collective is vLLM's Sm90 config
+  1:1. On the gate arch sm_121a the flag is OFF → the TU is not built → byte-zero
+  impact. COMPILE-ONLY, GPU-SAFE (nvcc only, no kernels, no `gpu.lock`); disk-guarded
+  (dgx 73G ≥ 25G, twice ~20s apart, stable at 72–73G), scratch pruned after
+  `cuobjdump`. **Evidence (dgx nvcc 13.0 + cutlass 4.5.0):** single-arch
+  `-arch=sm_90a` TU compile with the production flag set (`-DVT_SCALEDMM_C3X_SM90=1
+  --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress=20012 -isystem
+  cutlass`) **0 compiler warnings / 0 errors EXIT=0** (only `ptxas info C7510`
+  naming `wgmma.mma_async` + the `Sm90` warp-specialized FP8FastAccum kernels — a
+  bonus wgmma proof); `cuobjdump -lelf` → real `cuda_scaled_mm_c3x_sm90.1.sm_90a.cubin`
+  (`arch = sm_90a`). Configure single-arch `90a` reports `scaledmm-c3x-sm90:
+  ENABLED for [90a]`. Feature-table CI (`cmake -P cmake/CudaArchFeaturesTest.cmake`,
+  no GPU) ALL PASS: `90a`→`scaledmm-c3x-sm90` ENABLED; 121a/120a/120a;121a/100a/80→
+  EMPTY; RED-preserving `90a`→`cutlass-fp8` EMPTY. RED (HEAD table): single-arch
+  `90a` had no such cell — `vt_cuda_feature_archs` fatally reported `unknown CUDA
+  feature 'scaledmm-c3x-sm90'`. sm_121a NEUTRALITY: configure 121a→`scaledmm-c3x-sm90
+  DISABLED` + `cutlass-fp8`/`cutlass-nvfp4 ENABLED` (sm_12x path unchanged); the new
+  TU compiled for `-arch=sm_121a` WITHOUT the define is inert (0-warn EXIT=0, 0 C3x
+  symbols vs 6 `RunProbe`/`WorkspaceProbe` in the sm_90a object). SIGNAL
+  `DERIVED+BUILD-VERIFIED (testing-welcome)`: **NO H100/H200/sm_90 board ran ANY of
+  this** — a green compile + SASS is not execution evidence, not runtime support,
+  not vLLM-competitive. Records: `backend-matrix.md` (`BACKEND-CUDA-SM090` cells,
+  row stays `SPIKE`), spec §9 DC2, `kernel-matrix.md` (`KERNEL-GEMM-FP8` arch
+  cross-ref), `roadmap_v1.md` `ROAD-V1-D1-CUDA`, `docs/STATUS.md`, `docs/BENCHMARKS.md`
+  (NOT-APPLICABLE, `benchmark_binding=false`), ledger, this log, `coordination.md`
+  claim. NEXT: DC2 residuals (sm90 int8/blockwise, sm100 C3x FP8), DC3 grouped-MoE;
+  a cloud H100/H200 upgrades DC2 to `RUNTIME-VERIFIED` (token-exact + every-axis perf).

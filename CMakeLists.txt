@@ -195,12 +195,14 @@ if(VLLM_CPP_CUDA)
   vt_cuda_feature_archs(VT_CUTLASS_NVFP4_ARCHS "cutlass-nvfp4")
   vt_cuda_feature_archs(VT_CUTLASS_NVFP4_SM100_ARCHS "cutlass-nvfp4-sm100")
   vt_cuda_feature_archs(VT_CUTLASS_FP8_ARCHS   "cutlass-fp8")
+  vt_cuda_feature_archs(VT_SCALEDMM_C3X_SM90_ARCHS "scaledmm-c3x-sm90")
   vt_cuda_feature_archs(VT_MARLIN_NVFP4_ARCHS  "marlin-nvfp4")
   vt_cuda_feature_archs(VT_FA2_ARCHS           "fa2")
   vt_cuda_report_feature("fp4-mma"       "${VT_FP4_MMA_ARCHS}")
   vt_cuda_report_feature("cutlass-nvfp4" "${VT_CUTLASS_NVFP4_ARCHS}")
   vt_cuda_report_feature("cutlass-nvfp4-sm100" "${VT_CUTLASS_NVFP4_SM100_ARCHS}")
   vt_cuda_report_feature("cutlass-fp8"   "${VT_CUTLASS_FP8_ARCHS}")
+  vt_cuda_report_feature("scaledmm-c3x-sm90" "${VT_SCALEDMM_C3X_SM90_ARCHS}")
   vt_cuda_report_feature("marlin-nvfp4"  "${VT_MARLIN_NVFP4_ARCHS}")
   vt_cuda_report_feature("fa2"           "${VT_FA2_ARCHS}")
   # The native block-scaled fp4xfp4 MMA (cuda_matmul_nvfp4.cu) needs the
@@ -234,7 +236,7 @@ if(VLLM_CPP_CUDA)
   #       predicate the Ampere FA2 fast path needs
   #       (.agents/specs/cuda-arch-ampere-fastpath.md WA-1). sm_121 is UNCHANGED:
   #       there VT_CUTLASS_NVFP4_ARCHS resolves, so both flags are ON exactly as before.
-  if((VT_CUTLASS_NVFP4_ARCHS OR VT_CUTLASS_NVFP4_SM100_ARCHS OR VT_FA2_ARCHS)
+  if((VT_CUTLASS_NVFP4_ARCHS OR VT_CUTLASS_NVFP4_SM100_ARCHS OR VT_SCALEDMM_C3X_SM90_ARCHS OR VT_FA2_ARCHS)
      AND NOT EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h"
      AND VLLM_CPP_CUTLASS_FETCH)
     include(FetchContent)
@@ -243,7 +245,7 @@ if(VLLM_CPP_CUDA)
     FetchContent_MakeAvailable(cutlass)
     set(VLLM_CPP_CUTLASS_DIR "${cutlass_SOURCE_DIR}")
   endif()
-  if((VT_CUTLASS_NVFP4_ARCHS OR VT_CUTLASS_NVFP4_SM100_ARCHS OR VT_FA2_ARCHS)
+  if((VT_CUTLASS_NVFP4_ARCHS OR VT_CUTLASS_NVFP4_SM100_ARCHS OR VT_SCALEDMM_C3X_SM90_ARCHS OR VT_FA2_ARCHS)
      AND EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h")
     file(STRINGS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/version.h"
       _CUTLASS_VERSION_LINES
@@ -283,6 +285,18 @@ if(VLLM_CPP_CUDA)
     else()
       set(VLLM_CPP_CUTLASS_NVFP4_SM100 OFF)
     endif()
+    # Hopper sm_90a CUTLASS C3x FP8 scaled-mm wgmma/TMA build-verify TU
+    # (BACKEND-CUDA-SM090). Its own flag, independent of the sm_12x
+    # VLLM_CPP_CUTLASS gate: resolves ON only for a 90a target (scaledmm-c3x-sm90
+    # FEATURE-TABLE cell). DERIVED+BUILD-VERIFIED — compiled + SASS-proven here, no
+    # Hopper board ran it.
+    if(VT_SCALEDMM_C3X_SM90_ARCHS)
+      set(VLLM_CPP_SCALEDMM_C3X_SM90 ON)
+      message(STATUS "CUTLASS found at ${VLLM_CPP_CUTLASS_DIR}; enabling sm_90a C3x FP8 "
+                     "scaled-mm wgmma/TMA build-verify TU (DERIVED+BUILD-VERIFIED, no board ran it)")
+    else()
+      set(VLLM_CPP_SCALEDMM_C3X_SM90 OFF)
+    endif()
     if(VT_CUTLASS_NVFP4_ARCHS)
       set(VLLM_CPP_CUTLASS ON)
       message(STATUS "CUTLASS found at ${VLLM_CPP_CUTLASS_DIR}; enabling sm120a NVFP4 cutlass GEMM")
@@ -298,6 +312,7 @@ if(VLLM_CPP_CUDA)
     set(VLLM_CPP_CUTLASS OFF)
     set(VLLM_CPP_CUTLASS_HEADERS OFF)
     set(VLLM_CPP_CUTLASS_NVFP4_SM100 OFF)
+    set(VLLM_CPP_SCALEDMM_C3X_SM90 OFF)
     message(STATUS "CUTLASS not found / no CUTLASS-dependent feature for this arch; "
                    "NVFP4 GEMM + FA2 disabled "
                    "(set -DVLLM_CPP_CUTLASS_DIR=<cutlass> or -DVLLM_CPP_CUTLASS_FETCH=ON)")
@@ -876,6 +891,30 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_matmul_nvfp4_sm100.cu PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-diag-suppress=20012;-isystem;${VLLM_CPP_CUTLASS_DIR}/include;-isystem;${VLLM_CPP_CUTLASS_DIR}/tools/util/include>")
+  endif()
+  # Hopper sm_90a CUTLASS C3x FP8 scaled-mm wgmma/TMA GEMM BUILD-VERIFY TU
+  # (BACKEND-CUDA-SM090, ROAD-V1-D1-CUDA, datacenter fast-path §9 DC2). Compiled
+  # ONLY for a single-arch 90a target — VLLM_CPP_SCALEDMM_C3X_SM90 is set (above)
+  # exclusively when the `scaledmm-c3x-sm90` FEATURE-TABLE cell resolves for the
+  # requested arch, which is 90a alone. It is SEPARATE from VLLM_CPP_CUTLASS (the
+  # consumer sm_12x scaled-mm): the Hopper body uses ArchTag=Sm90 +
+  # KernelTmaWarpSpecialized*FP8FastAccum (wgmma/TMA), a different collective than
+  # the sm_120 body, so the two never share a compile (widening the sm_12x gate to
+  # 90a would ptxas-reject the sm_120 PTX for compute_90a). On the gate arch
+  # sm_121a this flag is OFF, so the TU is not added to the build at all →
+  # byte-zero impact on GB10.
+  #   * -isystem cutlass so its headers are off the global -Werror=all-warnings
+  #     path (mirrors the sm_12x/sm_100a cutlass TUs above);
+  #   * --expt-relaxed-constexpr/--expt-extended-lambda: cutlass needs them.
+  # DERIVED+BUILD-VERIFIED (testing-welcome): a green compile + cuobjdump sm_90a
+  # SASS is NOT execution evidence — no H100/H200/sm_90 board ran this.
+  if(VLLM_CPP_SCALEDMM_C3X_SM90)
+    target_sources(vllm PRIVATE src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu)
+    target_compile_definitions(vllm PUBLIC VT_SCALEDMM_C3X_SM90=1)
+    set_source_files_properties(
+      src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu PROPERTIES
+      COMPILE_OPTIONS
+        "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-isystem;${VLLM_CPP_CUTLASS_DIR}/include;-isystem;${VLLM_CPP_CUTLASS_DIR}/tools/util/include>")
   endif()
   # Marlin NVFP4 MoE: two vendored TUs (the marlin_mm dispatcher + the generated
   # bf16 NVFP4 kernel instantiations) + the vt::Tensor launcher. All three need
