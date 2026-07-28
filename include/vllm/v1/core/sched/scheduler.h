@@ -221,6 +221,13 @@ class Scheduler {
   // has_finished_requests: whether any request finished since the last step.
   bool has_finished_requests() const;
 
+  // The resolved scheduling policy this scheduler was constructed with
+  // (SchedulerConfig.policy). Exposed so the ENG-SGLANG-BEHAVIOR-FLAG enablement
+  // gate can assert that `lpm` (or `priority`) selected through the C ABI / C++
+  // API / server flag actually reached the scheduler. Output-neutral (admission
+  // ORDER only); see order_waiting_queue().
+  SchedulerPolicy policy() const { return scheduler_config_.policy; }
+
   // --- Public state the ported tests inspect directly (mirrors upstream's
   // accessible attributes). --------------------------------------------------
 

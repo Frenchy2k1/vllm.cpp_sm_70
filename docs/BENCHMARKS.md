@@ -203,6 +203,24 @@ residual; until then the flag is opt-in/default-off and no throughput number is
 owed. Reproduce: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build
 build-cpu --target test_jump_forward && ./build-cpu/tests/test_jump_forward`.
 
+**SGLang-behavior enablement / ABI + docs (2026-07-28, `CLAIM-SGLANG-ABI-DOCS`,
+reconciled to ABI v10, NOT pushed).** Disposition: **NOT APPLICABLE (enablement +
+documentation; no runtime path added, no measurement taken, claimed, or owed;
+`benchmark_binding=false`).** Makes the SGLang-alike behaviors first-class,
+documented knobs on the C++ API and the C ABI: LPM scheduling is reached through
+the concurrent session's v9 string field `vllm_model_params.scheduling_policy`
+(no separate int knob), and jump-forward through the new tri-state field
+`vllm_model_params.enable_jump_forward` (ABI v9→**v10**); radix/APC (v7) and custom
+logits (v8) already present, plus the server `--[enable|disable]-jump-forward` flag
+and the user doc `docs/SGLANG-COMPAT.md`. This adds no new runtime path or kernel —
+an all-zero config is byte-identical to before ABI v10 — so no throughput number is
+owed. The binding throughput A/Bs for the underlying behaviors stay owned by their
+existing entries above (`CLAIM-SGLANG-IMPL` LPM, `CLAIM-SGLANG-SW3` jump-forward)
+and the `BACKEND-GATE-CUDA-SGLANG-PREFIX` GB10 lane. CPU exact-gate only: `test_capi`
+33/33 (2 new ABI v10 jump-forward cases), `test_scheduler`/`test_scheduler_lpm`/`test_jump_forward`
+unchanged. Reproduce: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build
+build-cpu --target test_capi && ./build-cpu/tests/test_capi`.
+
 **DOCS user-facing split: README landing page + `docs/STATUS.md` ledger
 (2026-07-27, `CLAIM-DOCS-README-SPLIT`).** Disposition: **NOT APPLICABLE (no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Documentation

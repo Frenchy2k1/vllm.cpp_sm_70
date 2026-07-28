@@ -73,8 +73,16 @@ extern "C" {
  * inert at its default, so zero-filling the struct growth keeps the pre-v9
  * engine byte-identical. Malformed speculative_config / kv_transfer_config
  * documents now report VLLM_ERR_INVALID_ARGUMENT (a caller error) rather than
- * VLLM_ERR_MODEL_LOAD, matching what v6 already documented. */
-#define VLLM_ABI_VERSION 9
+ * VLLM_ERR_MODEL_LOAD, matching what v6 already documented.
+ * v10: vllm_model_params.enable_jump_forward — a tri-state toggle for
+ * jump-forward decoding (0=default/env-resolved-OFF, 1=on, 2=off), the SGLang
+ * grammar-speed subset (ENG-SGLANG-BEHAVIOR-FLAG SW3). Appended at the END of
+ * vllm_model_params, after the v9 fields. The VT_ENABLE_JUMP_FORWARD env var,
+ * when set, overrides this field. 0 (the default) is the byte-identical
+ * default, so zero-filling the struct growth keeps a v9 engine byte-identical.
+ * Scheduler policy (incl. SGLang's cache-aware LPM) is selected through the v9
+ * string field .scheduling_policy = "lpm" — there is no separate int knob. */
+#define VLLM_ABI_VERSION 10
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -205,6 +213,22 @@ typedef struct vllm_model_params {
    * engine construction (VLLM_ERR_MODEL_LOAD). `kv_role` is REQUIRED whenever
    * `kv_connector` is set. Borrowed for the call only. See docs/KV-OFFLOAD.md. */
   const char* kv_transfer_config;
+  /* ── Jump-forward decoding (ABI v10) ───────────────────────────────────────
+   * Tri-state toggle for jump-forward decoding — the SGLang grammar-speed
+   * behavior (ENG-SGLANG-BEHAVIOR-FLAG SW3): when the structured-output grammar
+   * has a token-unique forced continuation, emit it without a model step. Only
+   * the PROVABLY byte-identical token-unique subset is jumped (see
+   * .agents/specs/sglang-enablement.md for the residual):
+   *   0 => DEFAULT: OFF unless the VT_ENABLE_JUMP_FORWARD env var turns it on
+   *        (the byte-identical default);
+   *   1 => force ON (the env var, if set, still overrides);
+   *   2 => force OFF (likewise env-overridable).
+   * The VT_ENABLE_JUMP_FORWARD env var, WHEN SET, always wins over this field
+   * (mirrors the VT_ASYNC_SCHED convention). Any value other than 0/1/2 fails
+   * vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. Scheduler policy (incl.
+   * SGLang's cache-aware LPM) is a SEPARATE knob — the v9 string field
+   * .scheduling_policy = "lpm", not an int here. */
+  int32_t enable_jump_forward;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────
