@@ -306,6 +306,25 @@ compile + SASS is not execution evidence, not runtime support, and not
 vLLM-competitive; the sm90 int8/blockwise C3x legs and the other Hopper fast paths
 (FA3, Machete, CUTLASS MoE) remain scoped.
 
+As of 2026-07-28, the datacenter-Blackwell `sm_100a` fan-out gained its second
+FAST-PATH body (after the DC1 NVFP4 tcgen05 GEMM): the **CUTLASS C3x FP8 (W8A8)
+scaled-mm tcgen05 GEMM is BUILD-VERIFIED** (`DERIVED+BUILD-VERIFIED,
+testing-welcome`) — the intersection of DC1's tcgen05 arch and the Hopper DC2 C3x
+fp8 kernel. A faithful 1:1 type-port of vLLM's `cutlass_3x_gemm_sm100_fp8`
+(`ArchTag=Sm100` + `KernelScheduleAuto`/`EpilogueScheduleAuto` — CUTLASS 4.5.0
+selects the 5th-gen **tcgen05** warp-specialized collective, a 2SM
+`ClusterShape<_2,_2,_1>` default) compiles single-arch `100a` on nvcc 13.0
+`-Werror all-warnings` 0 warnings and `cuobjdump` shows a real `sm_100a` cubin (the
+emitted kernels are `Sm100TmaUmmaWarpSpecialized` naming `SM100_MMA_F8F6F4`,
+`SM100_TMA_2SM_LOAD` and `SM100_TMEM_LOAD`; SASS carries `LDTM`/`tmem`
+tensor-memory ops); it is gated by its own `scaledmm-c3x-sm100` feature cell
+(enabled only for `100a`, so the GB10 `sm_121a` gate build is byte-unchanged). The
+consumer `sm_12x` FP8 body (`ArchTag=Sm120`) and the DC1 sm100 NVFP4 leg are
+untouched. **No B200/sm_100 board ran it** — a green compile + SASS is not
+execution evidence, not runtime support, and not vLLM-competitive; the sm100
+int8/blockwise C3x legs and the other datacenter fast paths (CUTLASS MoE Sm100,
+MXFP4, CUTLASS MLA) remain scoped.
+
 A separate **beyond-vLLM breadth lane** targets the older NVIDIA arches vLLM
 DROPS but llama.cpp still runs (Pascal/Volta/Turing). Its first brick landed
 2026-07-28: **Turing `sm_75` is BUILD-VERIFIED.** The bf16-WMMA prefill kernels

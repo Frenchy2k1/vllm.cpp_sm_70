@@ -205,6 +205,38 @@ GB10 gate build is byte-unchanged. The consumer `sm_12x` FP8 scaled-mm body
 + SASS is not execution evidence, not runtime support, not vLLM-competitive.** A
 cloud H100/H200 upgrades DC2 to RUNTIME-VERIFIED (token-exact + every-axis perf).
 
+**Datacenter-Blackwell `sm_100a` CUTLASS C3x FP8 scaled-mm tcgen05 GEMM (DC3)
+BUILD-VERIFY (2026-07-28, `CLAIM-CUDA-SM100-C3X`, `ROAD-V1-D1-CUDA`).**
+Disposition: **NOT APPLICABLE (compile-only build-verify; no throughput number
+taken, claimed, or owed; `benchmark_binding=false`).** COMPILE-ONLY brick — the
+intersection of DC1's tcgen05 arch + DC2's C3x fp8 kernel: a faithful 1:1
+type-port of vLLM's `cutlass_3x_gemm_sm100_fp8` (`ArchTag=Sm100` +
+`KernelScheduleAuto`/`EpilogueScheduleAuto` → CUTLASS 4.5.0 selects the 5th-gen
+**tcgen05** warp-specialized collective; `sm100_fp8_config_{default,M256,M64}`, 2SM
+`ClusterShape<_2,_2,_1>` default) added as a new TU
+`src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu`, gated by a dedicated `scaledmm-c3x-sm100`
+feature cell (100a-only). Evidence on dgx (GB10, nvcc 13.0.88, cutlass 4.5.0, base
+local `main` `65b0d522`, disk-guarded 71G ≥ 25G twice ~40s apart): single-arch
+`-arch=sm_100a` TU compile with the production flag set (`-DVT_SCALEDMM_C3X_SM100=1
+--expt-relaxed-constexpr --expt-extended-lambda -diag-suppress=20012 -isystem
+cutlass -Werror all-warnings`) is **0 compiler warnings / 0 errors / EXIT=0**, and
+`cuobjdump -lelf` shows a real `cuda_scaled_mm_c3x_sm100.1.sm_100a.cubin` (arch =
+sm_100a); bonus tcgen05 proof: 3 `Sm100TmaUmmaWarpSpecialized` kernels naming
+`SM100_MMA_F8F6F4_{SS,2x1SM_SS}` (2SM MMA atoms), `SM100_TMA_2SM_LOAD_MULTICAST` +
+`SM100_TMEM_LOAD` + `LinearCombination`, and SASS `LDTM`/`tmem` tensor-memory ops.
+Configure single-arch `100a` reports `scaledmm-c3x-sm100: ENABLED for [100a]`.
+Feature-table CI (`cmake -P cmake/CudaArchFeaturesTest.cmake`, no GPU) ALL PASS:
+`100a`→ENABLED, 121a/120a/120a;121a/103a/110/90a/80→EMPTY. RED (HEAD): `100a` had no
+such cell (`vt_cuda_feature_archs` fatal `unknown CUDA feature`). sm_121a
+neutrality: the cell resolves DISABLED (TU not built) while
+`cutlass-fp8`/`cutlass-nvfp4`/`cutlass-nvfp4-sm100` are byte-unchanged
+(ENABLED/ENABLED/DISABLED), and the TU compiled for `sm_121a` without the define is
+inert (0-warn, 0 tcgen05 symbols vs 3), so the GB10 gate build is byte-unchanged.
+The consumer `sm_12x` FP8 scaled-mm body (`ArchTag=Sm120`) and the DC1 sm100 NVFP4
+leg are untouched. **NO B200/sm_100 board ran it — a green compile + SASS is not
+execution evidence, not runtime support, not vLLM-competitive.** A cloud B200
+upgrades DC3 to RUNTIME-VERIFIED (token-exact + every-axis perf).
+
 **SGLang parity PROGRAM scope (2026-07-27, `CLAIM-SGLANG-PARITY-PROGRAM`, NOT
 pushed).** Disposition: **NOT APPLICABLE (inventory / scoping spike; no build,
 no run, no measurement taken, claimed, or owed; `benchmark_binding=false`).**

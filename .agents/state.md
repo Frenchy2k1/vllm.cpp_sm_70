@@ -29893,3 +29893,63 @@ green.
   (NOT-APPLICABLE, `benchmark_binding=false`), ledger, this log, `coordination.md`
   claim. NEXT: DC2 residuals (sm90 int8/blockwise, sm100 C3x FP8), DC3 grouped-MoE;
   a cloud H100/H200 upgrades DC2 to `RUNTIME-VERIFIED` (token-exact + every-axis perf).
+- **2026-07-28** — **datacenter-Blackwell `sm_100a` CUTLASS C3x FP8 scaled-mm
+  tcgen05 GEMM (DC3) LANDED + BUILD-VERIFIED** (`CLAIM-CUDA-SM100-C3X`, spec
+  `specs/cuda-arch-datacenter-fastpath.md` §9 DC3 / `ROAD-V1-D1-CUDA`; base local
+  `main` `65b0d522`, confirmed via `git rev-parse HEAD`; NOT pushed). The
+  intersection of the two just-landed bricks — the C3x **fp8 scaled-mm** kernel
+  (DC2's kernel family) for **sm_100a** (DC1's tcgen05 arch). NEW TU
+  `src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu` is a faithful 1:1 TYPE-port of vLLM
+  `cutlass_3x_gemm_sm100_fp8` (`ArchTag=cutlass::arch::Sm100` + `OpClassTensorOp` +
+  `KernelScheduleAuto`/`EpilogueScheduleAuto` → CUTLASS 4.5.0 selects the 5th-gen
+  **tcgen05** warp-specialized collective; e4m3 A/B; the exact
+  `sm100_fp8_config_{default,M256,M64}` tile/cluster shapes — the datacenter default
+  is `ClusterShape<_2,_2,_1>`, the 2SM tcgen05 MMA, distinct from Hopper's `<_2,_1,_1>`),
+  grounded in vLLM
+  `csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_sm100_fp8_dispatch.cuh:18-194`
+  (+ entry `scaled_mm_sm100_fp8.cu:1-40`) from the on-box `~/vllm-src` @ `a4e3cb40`
+  (0.26.0.dev0; the Sm100 C3x fp8 kernel is structurally identical to the pinned
+  oracle `5559679229` the DC1/DC2 bricks cite — the exact SHA is not checked out on
+  the box). **DESIGN CALL (mirrors DC1's tcgen05 lesson, NOT a copy of DC2's Sm90
+  config):** vLLM's Sm100 path does NOT name an explicit `FP8FastAccum` schedule —
+  it hands `KernelScheduleAuto` to the CollectiveBuilder, which is what makes CUTLASS
+  emit the Blackwell tcgen05 fp8 mainloop; the leg gets its OWN dedicated FEATURE-TABLE
+  cell `scaledmm-c3x-sm100` (enabled ONLY for `100a`), NOT a widening of the sm_12x
+  `cutlass-fp8` (Sm120) cell NOR the Hopper `scaledmm-c3x-sm90` cell — all three are
+  a DIFFERENT collective/schedule and the sm_120 scaled-mm PTX ptxas-rejects for
+  compute_100a. **DEVIATION (recorded):** the plain LinearCombination epilogue
+  (alpha_ptr) is instantiated rather than vLLM's ScaledEpilogue EVT — the two
+  per-tensor scalars fold to one accumulator multiply (the same fold the shipped
+  sm_12x fp8 drop-in uses); the low-M swap_ab operand transpose is omitted (a
+  dispatch knob, same collective); the tcgen05 MAINLOOP collective is vLLM's Sm100
+  config 1:1. On the gate arch sm_121a the flag is OFF → the TU is not built →
+  byte-zero impact. COMPILE-ONLY, GPU-SAFE (nvcc only, no kernels, no `gpu.lock`);
+  disk-guarded (dgx 71G ≥ 25G, twice ~40s apart, stable at 71G), scratch pruned
+  after `cuobjdump`. **Evidence (dgx nvcc 13.0.88 + cutlass 4.5.0):** single-arch
+  `-arch=sm_100a` TU compile with the production flag set (`-DVT_SCALEDMM_C3X_SM100=1
+  --expt-relaxed-constexpr --expt-extended-lambda -diag-suppress=20012 -isystem
+  cutlass -Werror all-warnings`) **0 compiler warnings / 0 errors EXIT=0**; `cuobjdump
+  -lelf` → real `cuda_scaled_mm_c3x_sm100.1.sm_100a.cubin` (`arch = sm_100a`). Bonus
+  tcgen05 proof: the object carries three `Sm100TmaUmmaWarpSpecialized` kernels naming
+  `SM100_MMA_F8F6F4_SS` / `SM100_MMA_F8F6F4_2x1SM_SS` (2SM MMA atoms),
+  `SM100_TMA_2SM_LOAD_MULTICAST` + `SM100_TMEM_LOAD` + `LinearCombination` over
+  `float_e4m3_t`, and the SASS contains `LDTM`/`tmem` tensor-memory ops. Configure
+  single-arch `100a` reports `scaledmm-c3x-sm100: ENABLED for [100a]`. Feature-table
+  CI (`cmake -P cmake/CudaArchFeaturesTest.cmake`, no GPU) ALL PASS: `100a`→
+  `scaledmm-c3x-sm100` ENABLED; 121a/120a/120a;121a/103a/110/90a/80→EMPTY;
+  RED-preserving `100a`→`cutlass-fp8`/`scaledmm-c3x-sm90` EMPTY; neutrality `121a`→
+  `cutlass-fp8`/`cutlass-nvfp4` ENABLED + `cutlass-nvfp4-sm100` DISABLED. RED (HEAD
+  table): single-arch `100a` had no such cell — `vt_cuda_feature_archs` fatally
+  reported `unknown CUDA feature 'scaledmm-c3x-sm100'`. sm_121a NEUTRALITY: configure
+  121a→`scaledmm-c3x-sm100 DISABLED` + `cutlass-fp8`/`cutlass-nvfp4 ENABLED` +
+  `cutlass-nvfp4-sm100 DISABLED` (sm_12x + DC1 paths byte-unchanged); the new TU
+  compiled for `-arch=sm_121a` WITHOUT the define is inert (0-warn EXIT=0, 0 tcgen05
+  symbols vs 3 `Sm100TmaUmma` in the sm_100a object). SIGNAL `DERIVED+BUILD-VERIFIED
+  (testing-welcome)`: **NO B200/sm_100 board ran ANY of this** — a green compile +
+  SASS is not execution evidence, not runtime support, not vLLM-competitive. Records:
+  `backend-matrix.md` (`BACKEND-CUDA-SM100` cells extended, row stays `SPIKE`), spec
+  §9 DC3, `kernel-matrix.md` (`KERNEL-GEMM-FP8` arch cross-ref), `roadmap_v1.md`
+  `ROAD-V1-D1-CUDA`, `docs/STATUS.md`, `docs/BENCHMARKS.md` (NOT-APPLICABLE,
+  `benchmark_binding=false`), ledger, this log, `coordination.md` claim. NEXT: DC3
+  residuals (sm100 int8/blockwise C3x, MoE Sm100, MXFP4, CUTLASS MLA); a cloud B200
+  upgrades DC3 to `RUNTIME-VERIFIED` (token-exact + every-axis perf).
