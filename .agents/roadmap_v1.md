@@ -149,7 +149,16 @@ OPT-125m, Llama-3.2-1B, Mistral-7B, Gemma-1/2/3, GLM-4-9B, GLM-4.7-Flash, DeepSe
 and now **OLMo-2 (`Olmo2ForCausalLM`/`Olmo3ForCausalLM`, SACRED 16/16, ZERO new kernels)** all
 landed with passing SACRED gates; OLMo-2's `Olmo3ForCausalLM` W5 sliding-window code landed too
 but its SACRED gate is oracle-BLOCKED (RUN-VERIFIED W0 2026-07-26 — see below); every landed
-model's speed close remains. **NEXT-TIER BATCH TRIAGE (2026-07-24,
+model's speed close remains. **DeepSeek-V4-Flash W0 SCOPE (2026-07-28, `CLAIM-DEEPSEEK-V4-SCOPE`,
+[deepseek-v4-flash.md](specs/deepseek-v4-flash.md)):** the ~167B/256-expert `DeepseekV4ForCausalLM`
+is a NEW multi-brick arch — DeepSeek Sparse Attention (Lightning Indexer + compressor + fp8_ds_mla
+KV + SWA) MLA, **Manifold Hyper-Connections** (`[T, hc_mult, H]` Sinkhorn streams, TileLang-only, no
+eager ref), MegaMoE/NVFP4 (SM100-only ⇒ GB10 uses the FusedMoE fallback), sqrtsoftplus + hash-routed
+MoE, clamped SwiGLU, grouped output LoRA, MTP + DSpark speculators. **Runnable on ONE GB10 via
+`nvidia/DeepSeek-V4-Flash-NVFP4` (~83 GiB, FITS 119 GiB; sparse-MLA sm_12x backend supported)** — the
+native fp8 (~167 GiB) does not fit. Decisive next brick W1 = prove the pinned oracle RUNS NVFP4
+within 119 GiB + a greedy golden (free DGX disk to ~90 GiB; flashinfer DSV4 sparse symbols are the
+DEP-risk). `DeepSeekV4MTPModel` promoted INVENTORIED→SPIKE. **NEXT-TIER BATCH TRIAGE (2026-07-24,
 `sweep-recent-dense-batch.md`, `CLAIM-SWEEP-RECENT-DENSE`):** 8 recent dense/small-MoE families
 advanced `INVENTORIED` -> `SPIKE` with a ranked one-agent-each queue — **4 ZERO-NEW-KERNEL
 near-additive** (Phi-3/Phi-4 `Phi3ForCausalLM` a Llama subclass, Granite-3 4-scalar-multipliers,

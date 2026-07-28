@@ -30352,3 +30352,19 @@ run and both caveats instead of "outstanding"), `docs/BENCHMARKS.md` (the
   plan in spec §G2. **Residual (named, unbuilt):** the C++ SigLIP/NaFlex tower forward
   + Gemma-4 image processor + projector/merge — image is NOT yet engine-gated; no
   token-exact claim. dgx restored (model+tree pruned, worker `--restart=always`).
+- **2026-07-28** — **DeepSeek-V4-Flash W0 SCOPE spike (`CLAIM-DEEPSEEK-V4-SCOPE`,
+  records-only, NOT pushed).** Base `main` `c497668d`. Scoped `DeepseekV4ForCausalLM`
+  (~167B, 256-expert MoE, H=4096, L=43) against the pinned oracle's NEW
+  `vllm/models/deepseek_v4/` package. VERDICT: a NEW multi-brick arch, not a V3
+  increment — DeepSeek Sparse Attention MLA (Lightning Indexer + compressor +
+  fp8_ds_mla KV + SWA + attention sinks + grouped output LoRA, 512=448NoPE+64RoPE),
+  **Manifold Hyper-Connections** (`[T, hc_mult, H]` Sinkhorn streams, TileLang-only,
+  no eager ref — the hardest correctness item), MegaMoE NVFP4 (SM100-only ⇒ GB10 uses
+  the FusedMoE fallback), sqrtsoftplus + hash-routed MoE, clamped SwiGLU, MTP + DSpark
+  speculators. HW-fit: **`nvidia/DeepSeek-V4-Flash-NVFP4` (W4, ~83 GiB) FITS the 119 GiB
+  GB10 pool and runs on sm_121** (sparse-MLA sm_12x backend supported); native fp8
+  (~167 GiB) does not fit; free DGX disk to ~90 GiB before download. NEW
+  `specs/deepseek-v4-flash.md` (arch map, reuse-vs-new, quant/HW-fit, W1 oracle-run
+  gate, W-plan). `DeepSeekV4MTPModel` promoted INVENTORIED→SPIKE; V4 ForCausalLM row
+  cross-referenced (stays owned by `CLAIM-GLM-DSA-LATEST-DEEPSEEK`). All 6 record
+  checkers rc=0. NEXT: W1 oracle-run gate (DGX busy — deferred).
