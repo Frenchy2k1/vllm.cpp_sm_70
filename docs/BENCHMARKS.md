@@ -2618,6 +2618,16 @@ collision with the landed DFlash track's own `D0`-`D13` was spotted; that track
 (`SPEC-DFLASH`, paged draft-KV + capture-safe CUDA graph, 0.978x vLLM) is the
 BASELINE this row builds on and contains no GGUF handling of its own.
 
+**Two correctness traps resolved ahead of `GD1`, from the converter's source
+rather than from measurement** (a value-distribution check was run first and was
+ambiguous): the DFlash draft stores RMSNorm weights RAW, opposite to the trunk
+and the MTP head which need the `-1` un-shift, because `DFlashModel` inherits
+`Qwen3Model` and not the `Qwen3Next` class that carries the `+1`; and
+`dflash.target_layers` is written offset by `+1`, so the tap indices must be
+decremented when rebuilding `dflash_config`. Neither is visible to name or shape
+validation, and both would have been inherited by writing the loader by analogy
+to the MTP one.
+
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - scoping documents, ZERO code.

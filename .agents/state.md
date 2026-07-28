@@ -29708,3 +29708,36 @@ Housekeeping in the same sweep: 38 merged+clean worktrees removed from the
 vllm.cpp checkout (3 dflash + 35 others), branches preserved, 60 -> 25. The
 stale-worktree confusion above is the concrete argument for keeping that number
 low: a merged branch left checked out reads exactly like live work.
+
+## 2026-07-28 — `SPEC-DFLASH-GGUF` GD1 prerequisite: two off-by-one traps resolved
+
+Before writing the DFlash GGUF loader, settled the one question a name/shape dump
+cannot answer. Method note: a value-distribution check was run FIRST and was
+AMBIGUOUS - draft and trunk norms both cluster near ~1 - so the answer came from
+the PRODUCER's source (llama.cpp `origin/master` `conversion/qwen.py`), not from
+inspecting numbers. Reading the producer beat measuring the artifact here.
+
+**Trap 1: DFlash norms are stored RAW; do NOT un-shift.** The `+1` lives in
+`Qwen3NextModel.modify_tensors`. `class DFlashModel(Qwen3Model)` inherits from
+`Qwen3Model`, NOT `Qwen3NextModel`, and overrides only `set_vocab`,
+`set_gguf_parameters`, `filter_tensors` - no `modify_tensors` - and
+`Qwen3Model`'s own `modify_tensors` does not touch norms. So the draft is the
+OPPOSITE of the trunk and the MTP head, which both require `OwnNormMinus1`.
+
+**Trap 2: `dflash.target_layers` is written OFFSET BY +1.**
+`extract_layer_ids = [i + 1 for i in target_layer_ids]` before
+`add_target_layers(...)`. The file's `[2,17,32,47,62]` means HF
+`[1,16,31,46,61]`, so `MakeDflashGgufConfig` must SUBTRACT 1 when rebuilding
+`raw["dflash_config"]["target_layer_ids"]`.
+
+Why this mattered enough to check first: both traps are invisible to name and
+shape validation, they point in OPPOSITE directions, and both would have been
+inherited by the natural move of writing this loader by analogy to the sibling
+`SPEC-MTP-GGUF` one. `num_taps` stays 5 either way and every shape assertion
+still passes, so trap 2 in particular would have surfaced only as degraded
+acceptance - the exact signature that took three bisect steps to attribute on
+the MTP row.
+
+Standing lesson, now twice-confirmed on this track: for a format produced by a
+tool we do not own, read the CONVERTER, not the artifact. Shape checks catch
+layout; they never catch convention.
