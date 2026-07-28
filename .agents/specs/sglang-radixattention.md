@@ -205,17 +205,55 @@ advance/undo the FSM (`include/vllm/v1/structured_output/backend_types.h:87,97`)
 and `json_schema_to_gbnf` compiles schemas. This is vLLM's xgrammar-style
 per-STEP masking — one model step per token, NO jump-forward token elision.
 
-### VERDICT — FLAG (opt-in, distinct, low priority)
+### VERDICT — FLAG (opt-in, distinct); safe subset LANDED 2026-07-28 (`CLAIM-SGLANG-SW3`)
 
 Jump-forward is a genuinely-distinct SGLang optimization our grammar path cannot
-express (it skips model steps for FSM-forced runs). It is an output-neutral
-speed optimization on constrained decoding. It is NOT a default in the mirror
-engine (vLLM has no jump-forward either), so it is an OPT-IN flag
-(`--enable-jump-forward`) if and when constrained-decoding throughput is
-prioritized. It requires FSM-run precomputation + cross-boundary retokenization
-— a substantial leaf, deferred behind the flag; not scheduled in this spike's
-W-breakdown beyond naming it. Tracked as a survey item under
-`ENG-SGLANG-BEHAVIOR-FLAG`.
+express by default (it skips model steps for FSM-forced runs). It is an
+output-neutral speed optimization on constrained decoding, NOT a default in the
+mirror engine (vLLM has no jump-forward either) ⇒ OPT-IN flag
+(`--enable-jump-forward` / env `VT_ENABLE_JUMP_FORWARD`, default OFF).
+
+**The correctness subtlety (why the naive form is unsafe).** The forced
+continuation is a byte STRING. Re-tokenizing `prefix + forced_string` can shift
+token boundaries versus appending token-by-token, so emitting forced token IDs
+blindly does NOT reproduce constrained decode. SGLang handles the general case by
+re-tokenizing the whole `origin_input_text + decoded_text + jump_forward_str` and
+ROLLING BACK the fused boundary token — the "token fusion between input and
+output" guard (`schedule_batch.py`@935cda944b^:520-526,
+`all_ids[prompt_tokens-1] != origin_input_ids_unpadded[-1]` ⇒ abort). (SGLang
+later REMOVED its scheduler wiring for jump-forward in commit `935cda944b`; the
+backend methods `try_jump_forward`/`jump_forward_byte`/`jump_and_retokenize`
+remain — `constrained/outlines_backend.py:80-111`,
+`outlines_jump_forward.py:146-172`.)
+
+**LANDED (the SAFE, provably output-identical subset).** We jump ONLY the
+TOKEN-UNIQUE forced run: while the grammar admits EXACTLY ONE valid non-stop
+token at a NON-accepting state, that token is the sampler's only finite-logit
+token, hence the argmax under ANY sampling params — emitting it without a model
+step is byte-identical to per-token constrained decode and needs NO
+re-tokenization.
+- Fusibility HOOK: `StructuredOutputGrammar::forced_token()`
+  (`include/vllm/v1/structured_output/backend_types.h`, §9 extension, default
+  nullopt); native impl reuses the trie×FSM DFS of `fill_bitmask`, short-circuits
+  on a 2nd valid token, excludes accepting states (EOS alternative) —
+  `src/vllm/v1/structured_output/backend_native.cpp`. **Our grammar path DID
+  already expose the forced span** (the byte-level FSM `AcceptableBytes` +
+  token-byte trie), so this is a detection hook over existing machinery, not a
+  new FSM.
+- DRIVER: `DrainForcedTokens` + `JumpForwardEnabled`
+  (`src/vllm/v1/structured_output/jump_forward.{h,cpp}`), opt-in, default OFF.
+- Gate: `tests/vllm/v1/structured_output/test_jump_forward.cpp` 5/5 (40 asserts)
+  — output-identity WITH vs WITHOUT jump over a forced span, jump-FIRED (4
+  steps→1), inert with no forced span, default-off untouched, and RED-first (a
+  naive longest-match re-tokenization of a boundary-ambiguous span emits
+  DIFFERENT tokens; the safe subset refuses that span and stays byte-identical).
+
+**RESIDUAL (named, honest).** (1) The general byte-forced-but-multi-tokenizable
+span (≥2 valid tokenizations, needing SGLang's re-tokenize + boundary rollback)
+is DELIBERATELY not jumped — `forced_token`→nullopt ⇒ normal decode. (2)
+Production scheduler splice: jumped tokens have no computed KV, so wiring the
+drain into the live decode loop needs the KV-recompute path (SGLang re-inserts
+into the tree cache) — the flag stays default-OFF until that lands.
 
 ---
 
@@ -312,13 +350,18 @@ already ship.
   meaningless with APC off (no cache to match against) → resolve `lpm` +
   cache-off to `fcfs` with a warning.
 
-### 6.3 `--enable-jump-forward` — opt-in constrained-decode optimization (deferred)
+### 6.3 `--enable-jump-forward` — opt-in constrained-decode optimization (safe subset LANDED)
 
 - **What it switches:** grammar FSM-forced token runs are emitted without model
   steps (§3). Distinct, output-neutral, opt-in.
-- **Surface:** CLI + config; interacts only with structured-output requests.
-- **Default:** OFF (neither mirror engine defaults it on). Deferred — named, not
-  scheduled here.
+- **Surface:** env `VT_ENABLE_JUMP_FORWARD` (opt-in) drives the driver today;
+  interacts only with structured-output requests. A `--enable-jump-forward` CLI
+  flag folds in with the production scheduler splice (the named residual).
+- **Default:** OFF (neither mirror engine defaults it on).
+- **Status (2026-07-28, `CLAIM-SGLANG-SW3`):** the safe TOKEN-UNIQUE subset is
+  LANDED (detection hook `forced_token()` + `DrainForcedTokens`, provably
+  byte-identical to per-token decode). The general re-tokenization span +
+  production scheduler splice are the named residual (§3).
 
 ### 6.4 Umbrella `--sglang-compat` (optional convenience)
 
@@ -356,7 +399,7 @@ the C-ABI field, both trivial and gated by existing APC tests.
 | SW0 | `ENG-SGLANG-BEHAVIOR-FLAG` | This spike: cache-aware / overlap / jump-forward survey + flag design | **this spec** |
 | SW1 | `ENG-SGLANG-BEHAVIOR-FLAG` | `SchedulerPolicy::kLPM` waiting-queue reorder by APC longest-match, large-queue fcfs fallback; port `schedule_policy.py` LPM cases as CPU behavioral tests; token-neutral A/B | **DONE 2026-07-27** (`CLAIM-SGLANG-IMPL`) |
 | SW2 | `ENG-SGLANG-BEHAVIOR-FLAG` | in-batch prefix-collision de-prioritization (`IN_BATCH_PREFIX_CACHING_*`) | **DONE 2026-07-27** (`CLAIM-SGLANG-SW2`) — order-only inside `kLPM`, output-neutral; throughput lever NOT-APPLICABLE (within-step APC dedup subsumes it) |
-| SW3 | `ENG-SGLANG-BEHAVIOR-FLAG` | jump-forward decoding behind `--enable-jump-forward` (FSM-run precompute + retokenize) | **deferred** (named) |
+| SW3 | `ENG-SGLANG-BEHAVIOR-FLAG` | jump-forward decoding behind `--enable-jump-forward` (FSM-run precompute + retokenize) | **PARTIAL 2026-07-28** (`CLAIM-SGLANG-SW3`) — safe TOKEN-UNIQUE subset LANDED (detection hook + driver, opt-in `VT_ENABLE_JUMP_FORWARD` default OFF, provably output-identical); general re-tokenization span + production scheduler splice = named residual (§3) |
 | SW4 | `ENG-SGLANG-BEHAVIOR-FLAG` | `--radix-eviction-policy` lfu/slru/priority knob over the block pool | **deferred** (minor) |
 
 ### W1/W2 implementation status (2026-07-27, `CLAIM-SGLANG-IMPL`, NOT pushed)

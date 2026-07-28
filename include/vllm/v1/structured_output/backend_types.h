@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -106,6 +107,25 @@ class StructuredOutputGrammar {
 
   // reset (backend_types.py:91-95): reset the FSM to its initial state.
   virtual void reset() = 0;
+
+  // forced_token (vllm.cpp §9 EXTENSION — NOT an upstream method). The
+  // jump-forward decoding HOOK (SGLANG-DISTINCT SW3). Return the SINGLE
+  // grammar-valid non-stop token at the CURRENT state iff it is the ONLY valid
+  // token AND the state is NON-accepting (no EOS alternative); else nullopt.
+  //
+  // Correctness contract (why this is the safe, output-identical subset): the
+  // constrained sampler masks every disallowed token to -inf, so when exactly
+  // ONE token is allowed it is the argmax under ANY sampling params
+  // (greedy/temp/top-k/top-p/seed) — a driver may emit it WITHOUT a model step
+  // and the emitted token IS byte-identical to what per-token constrained decode
+  // would produce. Returning nullopt when 0, >=2, or an EOS alternative exists
+  // (accepting state) makes the GENERAL byte-forced-but-multi-tokenizable span
+  // (SGLang's re-tokenize + rollback case, outlines_jump_forward.py:146-172)
+  // fall back to normal per-token decode — never a token-changing jump.
+  //
+  // Default nullopt = the backend does not support jump-forward (every step
+  // takes a model step, the unchanged behavior). See jump_forward.h.
+  virtual std::optional<int32_t> forced_token() { return std::nullopt; }
 };
 
 // StructuredOutputBackend (backend_types.py:98-137): the engine-level backend.

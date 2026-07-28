@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1258,6 +1259,52 @@ void NativeGrammar::fill_bitmask(TokenBitmask& bitmask, int batch_index) {
   if (IsAccepting(cur.state)) {
     for (const int32_t sid : shared_->stop_token_ids) set_bit(sid);
   }
+}
+
+std::optional<int32_t> NativeGrammar::forced_token() {
+  const Snapshot& cur = history_.back();
+  // done: nothing may follow (0 tokens). awaiting: a lazy grammar allows EVERY
+  // token (free text) — never forced. Neither is a jump source.
+  if (cur.done || cur.awaiting) return std::nullopt;
+  // An accepting state means EOS is a VALID alternative continuation, so the
+  // model has a real choice (stop vs continue) — not forced. This also excludes
+  // the fully-matched (terminated) state. Mirrors SGLang treating FSM final
+  // states as having an outgoing (terminate) edge, hence never jump-forward
+  // sources (outlines_jump_forward.py:82-84).
+  if (IsAccepting(cur.state)) return std::nullopt;
+
+  // Same DFS as fill_bitmask over (trie x FSM state), but we only need to know
+  // whether EXACTLY ONE vocab token is valid: bail out the instant a second is
+  // found. Stop/EOS tokens are NOT in the trie, so they never appear here (and
+  // we already excluded accepting states where EOS would be allowed).
+  const TokenByteTrie& trie = shared_->trie;
+  struct Frame {
+    int32_t node;
+    State state;
+  };
+  std::vector<Frame> stack;
+  stack.push_back(Frame{0, cur.state});
+  std::optional<int32_t> found;
+  while (!stack.empty()) {
+    Frame frame = std::move(stack.back());
+    stack.pop_back();
+    const TrieNode& node = trie.nodes[static_cast<size_t>(frame.node)];
+    for (const int32_t tid : node.token_ids) {
+      if (tid < 0 || tid >= shared_->vocab_size) continue;
+      if (found.has_value()) return std::nullopt;  // >= 2 valid tokens.
+      found = tid;
+    }
+    if (node.children.empty()) continue;
+    const ByteAcceptSet acc = AcceptableBytes(*grammar_, frame.state);
+    if (!acc.any) continue;
+    for (const auto& edge : node.children) {
+      if (!acc.allowed[static_cast<size_t>(edge.first)]) continue;
+      State ns = AcceptByte(*grammar_, frame.state, edge.first);
+      if (ns.empty()) continue;
+      stack.push_back(Frame{edge.second, std::move(ns)});
+    }
+  }
+  return found;  // exactly one valid token, or nullopt if zero.
 }
 
 // ===========================================================================
