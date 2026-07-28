@@ -187,6 +187,22 @@ tokens, not 64), and the shared uncached prefix is computed exactly once — so 
 here is admission-ORDER parity only, output- and hit-rate-neutral. No throughput
 number is owed; there is no positive redundant-prefill delta to measure.
 
+**SGLang behavior-parity SW3 (jump-forward decoding, safe subset, 2026-07-28,
+`CLAIM-SGLANG-SW3`, NOT pushed).** Disposition: **speed lever, throughput A/B NOT
+YET APPLICABLE on this CPU lane (`benchmark_binding=false`).** Jump-forward emits
+a grammar-forced token without a model step; the speed win is proportional to the
+forced-span length. The CPU gate `tests/vllm/v1/structured_output/test_jump_forward.cpp`
+establishes the lever's SEMANTICS and its FIRING, not a wall-clock number: it
+MEASURES that generation WITH jump-forward is byte-identical to per-token
+constrained decode over a forced span while spending FEWER model steps (4→1 on a
+3-token forced run + one free token — the elided steps ARE the win), that it is
+inert (equal steps) when no forced span exists, and RED-first that a naive
+re-tokenization jump would change the output tokens. The binding wall-clock A/B
+requires the production scheduler splice (with jumped-token KV recompute), a named
+residual; until then the flag is opt-in/default-off and no throughput number is
+owed. Reproduce: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build
+build-cpu --target test_jump_forward && ./build-cpu/tests/test_jump_forward`.
+
 **DOCS user-facing split: README landing page + `docs/STATUS.md` ledger
 (2026-07-27, `CLAIM-DOCS-README-SPLIT`).** Disposition: **NOT APPLICABLE (no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Documentation

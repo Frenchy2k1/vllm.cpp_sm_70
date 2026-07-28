@@ -419,8 +419,18 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   blocks at allocation time, so a second same-step request sharing an uncached
   prefix already reuses the first's blocks (the redundant-prefill this avoids in
   SGLang, whose cache updates only after the forward pass, does not occur for us).
-  Residual: jump-forward constrained decoding and the radix eviction-policy knob
-  stay named/deferred opt-ins. See `.agents/specs/sglang-radixattention.md`.
+  Jump-forward constrained decoding (SW3) now has its SAFE subset implemented: an
+  opt-in driver (env `VT_ENABLE_JUMP_FORWARD`, default off) emits a grammar-forced
+  token WITHOUT a model step ONLY where the grammar leaves exactly one valid token
+  at a non-accepting state — provably byte-identical to normal per-token
+  constrained decode (the constrained sampler has a single finite-logit token
+  there), so no re-tokenization is needed. The general case (a forced byte run
+  with several possible tokenizations, which SGLang handles by re-tokenizing and
+  rolling back the boundary token) is deliberately not jumped, and wiring the
+  driver into the live decode loop (jumped tokens need their KV recomputed) is a
+  named residual — so the flag stays off by default. The radix eviction-policy
+  knob (SW4) stays a named/deferred opt-in. See
+  `.agents/specs/sglang-radixattention.md`.
 - **KV persistence to disk / CPU offload** is built (CPU and disk tiers,
   identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the
   scheduler through an abstract `KVConnector` ABI selected by a

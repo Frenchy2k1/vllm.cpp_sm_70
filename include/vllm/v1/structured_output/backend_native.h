@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,14 @@ class NativeGrammar : public StructuredOutputGrammar {
   void fill_bitmask(TokenBitmask& bitmask, int batch_index) override;
   bool is_terminated() override;
   void reset() override;
+
+  // Jump-forward hook (§9; see StructuredOutputGrammar::forced_token). Reuses the
+  // trie x FSM DFS of fill_bitmask, but short-circuits the moment a SECOND valid
+  // token is seen: returns the unique valid non-stop token at a NON-accepting
+  // state, else nullopt. Provably output-identical to per-token constrained
+  // decode (the sampler has exactly one finite-logit token). O(reachable trie
+  // nodes) like fill_bitmask.
+  std::optional<int32_t> forced_token() override;
 
   // The number of (trie node) visits the LAST fill_bitmask performed. Used by
   // the perf test to assert the fill is sub-O(vocab): a restrictive grammar

@@ -472,6 +472,7 @@ add_library(vllm STATIC
   src/vllm/v1/structured_output/backend_types.cpp
   src/vllm/v1/structured_output/backend_native.cpp
   src/vllm/v1/structured_output/json_schema_to_gbnf.cpp
+  src/vllm/v1/structured_output/jump_forward.cpp
   src/vllm/v1/structured_output/request.cpp
   src/vllm/v1/structured_output/manager.cpp
   src/vllm/v1/engine/types.cpp

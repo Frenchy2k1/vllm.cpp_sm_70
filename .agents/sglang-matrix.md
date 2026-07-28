@@ -116,7 +116,7 @@ share the idea) or OUT-OF-SCOPE.
 | ID | SGLang surface | SGLang anchor (`file:line`) | Our mapping / anchor | Class | Notes |
 |---|---|---|---|---|---|
 | `SGLANG-CONSTRAIN-BACKENDS` | grammar backends xgrammar / outlines / llguidance + reasoner-aware wrapper | selector `constrained/base_grammar_backend.py:223`; default xgrammar `server_args.py:4585` | our `StructuredOutputManager` per-step bitmask (`structured_output/manager.cpp:50`), xgrammar-style; `json_schema_to_gbnf` | FUSED | We ship vLLM's xgrammar-style per-step masking. outlines/llguidance backend variety is breadth, not a distinct behavior. |
-| `SGLANG-CONSTRAIN-JUMP` | jump-forward decoding — emit FSM-forced token runs without model steps | `constrained/outlines_jump_forward.py:182,146,159` | our grammar path masks per-step, NO token elision; engine row `ENG-SGLANG-BEHAVIOR-FLAG` SW3 | SGLANG-DISTINCT | Output-neutral speed lever on constrained decoding. Neither mirror engine defaults it on ⇒ deferred opt-in `--enable-jump-forward` (FSM-run precompute + cross-boundary retokenization). |
+| `SGLANG-CONSTRAIN-JUMP` | jump-forward decoding — emit FSM-forced token runs without model steps | `constrained/outlines_jump_forward.py:182,146,159` | SAFE SUBSET LANDED (`CLAIM-SGLANG-SW3`): forced-token detection hook `StructuredOutputGrammar::forced_token()` (`include/vllm/v1/structured_output/backend_types.h`; native impl `src/vllm/v1/structured_output/backend_native.cpp` — reuses the trie×FSM DFS, short-circuits on a 2nd valid token) + driver `DrainForcedTokens` (`src/vllm/v1/structured_output/jump_forward.{h,cpp}`, opt-in `VT_ENABLE_JUMP_FORWARD`, default OFF); gate `tests/vllm/v1/structured_output/test_jump_forward.cpp`; engine row `ENG-SGLANG-BEHAVIOR-FLAG` SW3 | PARTIAL (token-unique subset) | Output-neutral speed lever. LANDED = the TOKEN-UNIQUE forced run (exactly one grammar-valid token at a non-accepting state ⇒ the constrained sampler's only finite-logit token ⇒ argmax under ANY params ⇒ PROVABLY byte-identical to per-token decode, no re-tokenization). RESIDUAL (named): the general byte-forced-but-multi-tokenizable span (SGLang's re-tokenize + boundary rollback, `outlines_jump_forward.py:146-172` / `schedule_batch.py`@935cda944b^:503-544) is DELIBERATELY not jumped (forced_token→nullopt ⇒ falls back to normal decode); and production scheduler splice (jumped tokens have no computed KV ⇒ needs the KV-recompute path). Opt-in `--enable-jump-forward`; stays default-off until the production splice lands. |
 
 ## Sampling
 
@@ -173,8 +173,10 @@ share the idea) or OUT-OF-SCOPE.
   MoE, xgrammar constrained decoding, sampling + penalties, multimodal, tokenizer,
   LoRA, OpenAI server core, tool + reasoning parsers. We and SGLang share the
   idea; our vLLM-derived code already expresses it.
-- **SGLANG-DISTINCT (8):** LPM scheduling, in-batch prefix de-prioritization,
-  radix eviction strategies, jump-forward decoding, custom logit processors,
+- **SGLANG-DISTINCT (8):** LPM scheduling (SW1 LANDED), in-batch prefix
+  de-prioritization (SW2 LANDED), radix eviction strategies, jump-forward
+  decoding (SW3 — safe TOKEN-UNIQUE subset LANDED, `CLAIM-SGLANG-SW3`; the
+  general re-tokenization span is a named residual), custom logit processors,
   batch-invariant determinism, PD disaggregation, two-batch EP overlap. Each is
   an OPT-IN over our vLLM-derived design, never a fork.
 - **INVENTORIED (5):** sparse/NSA attention + DeepSeek-V4 compressed-KV

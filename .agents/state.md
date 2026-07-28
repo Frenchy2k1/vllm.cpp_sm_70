@@ -28195,3 +28195,57 @@ this entry. NO model/kernel source, NO README/Metal/demo (concurrent session),
 NOT the `BACKEND-GATE-CUDA-SGLANG*` benchmark rows. All record checkers rc=0.
 `benchmark_binding=false` (throughput lever NOT-APPLICABLE by architecture). NOT
 pushed; FULL SHA reported to caller.
+
+## 2026-07-28 — SGLang SW3 jump-forward decoding, SAFE (token-unique) subset LANDED (`CLAIM-SGLANG-SW3`)
+
+**Base** local `main` `ca829692` (confirmed `git rev-parse HEAD`), isolated
+worktree `.claude/worktrees/agent-a5ce457e6884611b2`. CPU-only, NO dgx
+(constrained-decode FSM is device-neutral, exact). SGLang pin v0.5.15 `f63458b`;
+vLLM pin `555967922`/0.26.0.dev0. NOT pushed.
+
+**What jump-forward is + the subtlety.** When the grammar FSM has a deterministic
+forced continuation, emit it WITHOUT a model step per token (the speed win on
+constrained decoding). The subtlety: the forced continuation is a byte STRING, so
+re-tokenizing `prefix + forced_string` can shift token boundaries vs appending
+token-by-token — SGLang handles the general case by re-tokenizing the whole text
+and rolling back the fused boundary token (`schedule_batch.py`@935cda944b^:520-526,
+the `all_ids[prompt_tokens-1] != origin_input_ids_unpadded[-1]` guard). Emitting
+forced token IDs blindly does NOT reproduce constrained decode. (SGLang later
+REMOVED its own scheduler wiring for jump-forward, commit `935cda944b`.)
+
+**What LANDED (the safe subset — correctness over coverage).** We jump ONLY the
+TOKEN-UNIQUE forced run: while the grammar admits EXACTLY ONE valid non-stop token
+at a NON-accepting state, that token is the constrained sampler's only
+finite-logit token, hence the argmax under ANY sampling params — so emitting it
+without a model step is PROVABLY byte-identical to per-token constrained decode
+and needs NO re-tokenization.
+- HOOK `StructuredOutputGrammar::forced_token()` — §9 extension to the ABC
+  (default nullopt), native impl reuses the trie×FSM DFS of `fill_bitmask` and
+  short-circuits on a 2nd valid token, excluding accepting states (EOS
+  alternative). **Fusibility finding: our byte-level FSM (`AcceptableBytes` +
+  token-byte trie) ALREADY exposed the forced span** — detection hook over
+  existing machinery, not a new FSM.
+- DRIVER `DrainForcedTokens` / `JumpForwardEnabled`
+  (`src/vllm/v1/structured_output/jump_forward.{h,cpp}`), opt-in env
+  `VT_ENABLE_JUMP_FORWARD`, DEFAULT OFF.
+
+**Gate (RED-first, CPU).** `tests/vllm/v1/structured_output/test_jump_forward.cpp`
+5/5 (40 asserts): output-identity WITH vs WITHOUT jump over a forced span
+(`"!""!""!"[0-9]` ⇒ identical tokens), jump FIRED (4 model steps→1), inert when no
+forced span (`"yes"|"no"`, equal steps), default-off leaves the grammar untouched,
+and RED — a naive longest-match re-tokenization of a boundary-ambiguous span
+(`"ab"`) emits `[27]` ≠ per-token `[10,14]` (fails identity) while the safe subset
+refuses that span and stays byte-identical `[10,14]` yet still jumps the unique
+tail. Inertness `test_backend_native` 35/35 + `test_structured_output` 12/12 +
+`test_apply_grammar_bitmask` 5/5 + `test_response_format_e2e` 3/3 UNCHANGED. Clean
+full-library CPU `-Werror` (`-Wall -Wextra -Werror`), 0 warnings.
+
+**Residual (named).** (1) The general byte-forced multi-tokenizable span (SGLang's
+re-tokenize + boundary rollback) DELIBERATELY not jumped. (2) Production scheduler
+splice — jumped tokens have no computed KV, needs the KV-recompute path — so the
+flag stays default-OFF and no `--enable-jump-forward` CLI lands yet. SW4
+(eviction-policy) still deferred. `benchmark_binding=false`. Records:
+`sglang-matrix.md` jump row + roll-up, `engine-matrix.md` `ENG-SGLANG-BEHAVIOR-FLAG`,
+`specs/sglang-radixattention.md` §3/§6.3/§7, `feature-matrix.md`, `docs/STATUS.md`,
+`docs/BENCHMARKS.md`, ledger, coordination `CLAIM-SGLANG-SW3`, this entry. All
+record checkers rc=0. NOT pushed; FULL SHA reported to caller.
