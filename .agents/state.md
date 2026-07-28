@@ -30368,3 +30368,32 @@ run and both caveats instead of "outstanding"), `docs/BENCHMARKS.md` (the
   gate, W-plan). `DeepSeekV4MTPModel` promoted INVENTORIED→SPIKE; V4 ForCausalLM row
   cross-referenced (stays owned by `CLAIM-GLM-DSA-LATEST-DEEPSEEK`). All 6 record
   checkers rc=0. NEXT: W1 oracle-run gate (DGX busy — deferred).
+
+## 2026-07-28 — Gemma-4 G2-impl: C++ NaFlex SigLIP2 vision TOWER LANDED, per-stage gates PASS (`CLAIM-GEMMA4-G2-IMPL`)
+
+The C++ Gemma-4 vision tower is implemented as a standalone additive TU
+(`gemma4_vision.{h,cpp}`) and proven faithful stage-by-stage vs the committed
+transformers-eager refs — the M2a tower-in-isolation milestone (mirrors Qwen3-VL
+M2a before the M2c e2e). dgx GB10 CUDA `flock`, weights via
+`scripts/mm/g2_vision_weight_dump.py`, base `main` `c497668d`.
+
+- **Per-stage gate PASS** (`test_gemma4_vision_tower`, 220/220): patch-embed
+  rel-L2 2.15e-3, encoder 3.14e-2, pooled 1.36e-2, projected 1.85e-2;
+  `n_valid=2304, n_soft=256`. compute-sanitizer memcheck **0 errors**.
+- **★ Port-map correction:** E4B `use_clipped_linears=True` with FINITE trained
+  QAT clamps (`clamp(linear(clamp(x,in),out)`) on the 7 encoder linears — the G2
+  spec assumed plain Linear. Implemented (q/k/v share in-clamp; gate/up share both
+  clamps → fused gate_up GEMM survives).
+- **Multidim vision-RoPE** via 2× `vt::RopeFromCache` on offset head views sharing
+  one cos|sin cache; attn scale 1.0; weight-less v/projector norms = ones-weight
+  `vt::RmsNorm`. **ZERO new vt op** (reused MatmulBT/Add/RmsNorm/RopeFromCache/
+  AttentionDenseFlash/GeluAndMul).
+- **Inertness:** text `test_gemma4_paged_engine` STRICT 32/32 UNCHANGED on the
+  linking binary; Qwen3-VL mm additive-by-construction. `-Werror` 0-warn on both
+  new TUs; a pre-existing UNRELATED GCC-13 `-Warray-bounds` false positive in
+  `voxtral.cpp` was suppressed per-file on the dgx tree ONLY (not committed).
+- **RESIDUAL (named):** image→text e2e — the C++ NaFlex image processor + the
+  engine mm-plumbing (SupportsMultiModal registration, hasher/encoder-cache,
+  masked-scatter merge of the 256 soft tokens at `<image_pad>`, decode fork) is the
+  M2c-equivalent follow-on; the tower + projector (the merge INPUT) are proven.
+  Speed pending. Not pushed; FULL SHA reported.

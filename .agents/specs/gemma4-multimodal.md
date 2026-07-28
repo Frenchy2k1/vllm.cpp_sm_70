@@ -470,6 +470,79 @@ plain learned-pos-embed ViT.
 
 ---
 
+## G2-impl — C++ NaFlex SigLIP2 vision TOWER LANDED, per-stage gates PASS (2026-07-28, `CLAIM-GEMMA4-G2-IMPL`)
+
+The C++ NaFlex SigLIP2 tower is implemented as a standalone additive TU
+(`include/vllm/model_executor/models/gemma4_vision.h` +
+`src/vllm/model_executor/models/gemma4_vision.cpp`) and **proven faithful
+stage-by-stage vs the committed transformers-eager refs** — the M2a ladder
+(`tests/vllm/multimodal/test_gemma4_vision_tower.cpp`, dgx CUDA `flock`, weights
+via `scripts/mm/g2_vision_weight_dump.py`). This is the tower-in-isolation
+milestone (mirrors M2a for Qwen3-VL before the M2c e2e); image→text e2e wiring is
+the named residual.
+
+### G2-impl.0 Per-stage gate result (MEASURED, dgx sm_121a bf16)
+
+| Stage | rel-L2 vs ref | bound | verdict |
+|---|---|---|---|
+| patch-embed (input_proj + 2·(x−.5) + learned-2D pos-embed) | **2.15e-3** | 5e-3 | ✅ TIGHT |
+| encoder last-hidden (16 sandwich blocks, RoPE+qkv-norm) | **3.14e-2** | 6e-2 | ✅ bf16-depth envelope |
+| pooled+stripped (avg-pool-by-position + √hidden fp32, 256 soft) | **1.36e-2** | 6e-2 | ✅ |
+| projected (embed_vision RMSNorm-noweight + Linear→2560) | **1.85e-2** | 7e-2 | ✅ merge-input |
+
+`n_valid=2304, n_soft=256` (48×48 patch grid → 3² pool → 16×16). 220/220
+assertions, SUCCESS. **compute-sanitizer memcheck 0 errors** on the vision path.
+
+### G2-impl.1 Grounded implementation notes (deltas found vs the G2 port map)
+
+- **QAT ACTIVATION CLAMPS were real, not no-op (★ port-map correction).** E4B
+  `vision_config.use_clipped_linears=True` with FINITE trained bounds (e.g. L0
+  `o_proj` out ±21.25, L15 `q_proj` in ±20.75). `Gemma4ClippableLinear` applies
+  `clamp(linear(clamp(x,in_min,in_max)),out_min,out_max)` on the **7 encoder
+  attention/MLP linears** (q/k/v/o + gate/up/down); patch_embedder.input_proj and
+  embed_vision.embedding_projection are PLAIN nn.Linear (no clip). q/k/v share the
+  in-clamp (same source), gate/up share BOTH in- and out-clamp (verified identical
+  L0/L8/L15) → the fused gate_up GEMM survives with whole-buffer clamps. Bounds are
+  bf16-rounded to match torch's bf16 clamp buffers. Implemented host-side (a fused
+  device clamp is the perf follow-on; correctness-first for the one-shot gate).
+- **Padding is a trailing contiguous block** (valid patches [0:2304], padding
+  [2304:2520]). The bidirectional encoder mask excludes padding keys ⇒ full
+  non-causal attention over the valid prefix is exact; padding contributes nothing
+  (pos-embed zeroed, pooler masked_fill 0). The tower runs the valid prefix only.
+- **Multidim vision RoPE via TWO `vt::RopeFromCache` calls** sharing ONE cos|sin
+  cache (both axes use identical inv_freq, theta 100, spatial_dim 32/16 freqs):
+  call 1 rotates head channels [0:32] with x-positions, call 2 rotates [32:64] (a
+  +32-channel offset head view) with y-positions — bit-faithful to
+  `apply_multidimensional_rope`'s per-part `apply_rotary_pos_emb`.
+- **Attention scaling = 1.0** (NOT 1/√d — `Gemma4VisionAttention.scaling==1.0`;
+  the q/k RMSNorms bound the dot product). Weight-less v-norm + projector pre-norm
+  = `vt::RmsNorm` with a ones weight.
+- **REUSE, no new kernel:** `vt::MatmulBT` / `Add` / `RmsNorm` / `RopeFromCache` /
+  `AttentionDenseFlash` / `GeluAndMul` (fused gate_up GeGLU). No `vt::` op added.
+
+### G2-impl.2 Inertness (PROVEN)
+
+- Gemma-4 text `test_gemma4_paged_engine` **STRICT 32/32 UNCHANGED** (re-run on the
+  binary that links the new vision TU — the tower is standalone, not referenced by
+  the registry/runner, so the text path is byte-identical by construction).
+- Qwen3-VL mm gates additive-by-construction (new file touches no shared code; the
+  full `libvllm` re-links with every existing model TU compiling clean).
+- `-Werror` 0-warn on both new TUs (CPU + CUDA). One pre-existing, UNRELATED GCC-13
+  `-Warray-bounds` FALSE POSITIVE in `voxtral.cpp` (std::copy after vector::assign)
+  was suppressed per-file on the dgx build tree ONLY (NOT committed) to link.
+
+### G2-impl.3 RESIDUAL (named, honest)
+
+Image→text **e2e is NOT gated** this pass. Remaining: the C++ Gemma-4 NaFlex image
+**processor** (PNG → pre-patchified pixel_values + (x,y) position ids + padding)
+and the **engine mm-plumbing** (register Gemma-4 as SupportsMultiModal, hasher /
+encoder-cache seam, masked-scatter merge of the 256 soft tokens at the
+`<image_pad>` rows, the tower→merge→decode fork). The tower + projector (the merge
+INPUT) are proven; wiring them into a running image request is the M2c-equivalent
+follow-on. Speed (device-resident weights + fused device clamp) is also pending.
+
+---
+
 ## 1. Per-model / per-modality DISPOSITION
 
 | Target | Image | Video | Audio | Disposition |
