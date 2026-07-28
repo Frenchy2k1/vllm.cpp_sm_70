@@ -649,36 +649,51 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   un-shifted). `PARTIAL`: the end-to-end token gate needs the matching
   Qwen3.6-27B target and has not run, and axis B (GGUF target as well) is
   untouched.
-- **MTP speculative decoding from a GGUF target WORKS** (`SPEC-MTP-GGUF`,
-  `GATING`, [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads
-  from a head-carrying GGUF - `HfConfigFromGguf` republishes the depth it already
-  read from `<arch>.nextn_predict_layers`, and `LoadQwen3_5MTPFromGguf` reads the
+- **MTP speculative decoding from a GGUF target WORKS, on CPU and on the GB10
+  release target** (`SPEC-MTP-GGUF`, `DONE`,
+  [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads from a
+  head-carrying GGUF - `HfConfigFromGguf` republishes the depth it already read
+  from `<arch>.nextn_predict_layers`, and `LoadQwen3_5MTPFromGguf` reads the
   `nextn` block with the trunk loader's own helpers, so it inherits the GGUF
   (w+1) norm storage, the quantization routing and the torch [N, K] shape order.
-  Gated on CPU against a real llama.cpp-converted Qwen3.5-2B: **spec-ON output is
-  token-identical to spec-OFF with 13 drafts proposed / 11 accepted**, plus an
-  `ngram` regression guard. A GGUF exported without the head is refused, naming
-  that as the reason. `GATING` rather than `DONE`: the GPU end-to-end run is
-  still outstanding. Its FIRST blocker is now REMOVED - GGUF dequant implements
-  ggml type 40, so `unsupported ggml type 40 (NVFP4)` no longer stops the load
-  (`QUANT-GGUF-NVFP4`, `PARTIAL`); the earlier attempt threw there with ZERO GPU
-  work. The loader gate DID pass 18/18 against the 35B A3B MoE GGUF, exercising
-  the MoE head branch on real weights for the first time (the head block's own
-  tensors are not NVFP4) - a loader result, with no MoE inference run. **With
-  type 40 implemented the 35B A3B NVFP4 GGUF now LOADS AND GENERATES on the
-  GPU** (dgx.casa under `flock`, peak RSS 90.2 GiB, 7m33s): 2/2 cases, 10/10
-  assertions, spec-ON token-identical to spec-OFF, 13 drafts proposed / 11
-  accepted. Device attribution is proven by an A/B - hiding the GPU
-  (`CUDA_VISIBLE_DEVICES=`) changes the tokens and hits the known CPU
-  restriction `conv_state must be f32, or bf16 on CUDA`. That run is NOT
-  accepted as the closing gate, for two honest reasons: the dgx build is
-  configured `CMAKE_CUDA_ARCHITECTURES=75` on an sm_121 GB10, so it is PTX-JIT'd
-  Turing code and not the release target; and on the SAME loaded weights the GPU
-  arm's 24 tokens differ materially from the CPU arm's, which is a forward-path
-  question (the loader hands both arms identical bf16 buffers) rather than a
-  materialization one. Still outstanding: that run repeated on a
-  release-configured sm_121a build with the GPU/CPU token divergence explained,
-  cross-format agreement, and a throughput number.
+  A GGUF exported without the head is refused, naming that as the reason.
+  **Both correctness gates pass: spec-ON output is token-identical to spec-OFF**
+  on CPU against a real llama.cpp-converted Qwen3.5-2B, and on the GPU against
+  the 35B A3B NVFP4 GGUF with 13 drafts proposed / 11 accepted (dgx GB10 under
+  `flock`, sm_121a, 2/2 cases 10/10 assertions, 90.2 GiB peak RSS, 8m01s;
+  re-confirmed 3/3 on the committed source). Acceptance parity is measured
+  against the safetensors sibling of the same quantization run: 12 proposed / 11
+  accepted there vs 13 / 11 here. Cross-format token agreement is NOT
+  APPLICABLE - it needs an F16/F32 GGUF sibling and every head-carrying export
+  on hand is quantized. Throughput is the one open item and is deliberately
+  PENDING, see [docs/BENCHMARKS.md](BENCHMARKS.md).
+  Two things had held this row open and both are now settled by measurement.
+  The build was believed to be `CMAKE_CUDA_ARCHITECTURES=75` on an sm_121 GB10:
+  that came from `CMakeCache.txt`, which records the CUDA compiler's own probe
+  default and is shadowed by the normal variable the project sets, so it never
+  described the compiled code. The real flags and every emitted cubin are
+  `sm_121a`. And the GPU arm's 24 tokens differed from the CPU arm's: that is a
+  **near-tie, not a defect**, and CPU-vs-GPU token equality was never the bar
+  (spec-ON == spec-OFF within one device is). At the one position where the two
+  arms fork they still share a bit-identical prefix, and each device's pick is
+  the other's rank-2 candidate at a margin of 0.074 nats (GPU) and 0.065 nats
+  (CPU) - roughly 7x inside the ratified 0.5-nat near-tie band, and smaller than
+  the 0.057-0.082 nats by which the two devices disagree about those same
+  tokens' logprobs. Rounding decides it; everything after is one coin flip
+  cascading, which is why 24 tokens look unrelated for a 0.07-nat cause.
+- **The 35B A3B NVFP4 SAFETENSORS target has EXACT logit ties, and its
+  speculative token identity does not hold there** (open, surfaced by
+  `SPEC-MTP-GGUF`'s gate, owned by `SPEC-MTP`). Pointed at the safetensors
+  sibling of the same quantization run, the same concurrency-1 gate shows
+  spec-ON inserting one token relative to spec-OFF, and two runs of spec-OFF
+  itself disagreeing. Both divergences land exactly on positions where the top
+  candidates carry BIT-IDENTICAL logprobs: that arm has three such exact ties in
+  24 tokens, because keeping NVFP4 packed puts its logits on a 1/16 grid where
+  distinct tokens collide. The GGUF arm, which expands to bf16, has ZERO exact
+  ties over the same 24 tokens (minimum margin 0.048 nats) and reproduces its
+  sequence every run - so the GGUF result stands and this is a quantized-GEMM
+  determinism question, not a speculative-decoding logic one. Not root-caused
+  beyond the tie measurement (one prompt, two runs).
 - **Speculative decoding on CPU corrupted the target's own state, and is FIXED**
   (`CPU-SPEC-DIVERGENCE`). `qwen3_5.cpp:3616` sized the GDN state gather/scatter
   row by `(Kw-1)` while the speculative persistent row is `(Kw-1)+num_spec`, so
