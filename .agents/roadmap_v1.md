@@ -154,11 +154,15 @@ model's speed close remains. **DeepSeek-V4-Flash W0 SCOPE (2026-07-28, `CLAIM-DE
 is a NEW multi-brick arch — DeepSeek Sparse Attention (Lightning Indexer + compressor + fp8_ds_mla
 KV + SWA) MLA, **Manifold Hyper-Connections** (`[T, hc_mult, H]` Sinkhorn streams, TileLang-only, no
 eager ref), MegaMoE/NVFP4 (SM100-only ⇒ GB10 uses the FusedMoE fallback), sqrtsoftplus + hash-routed
-MoE, clamped SwiGLU, grouped output LoRA, MTP + DSpark speculators. **Runnable on ONE GB10 via
-`nvidia/DeepSeek-V4-Flash-NVFP4` (~83 GiB, FITS 119 GiB; sparse-MLA sm_12x backend supported)** — the
-native fp8 (~167 GiB) does not fit. Decisive next brick W1 = prove the pinned oracle RUNS NVFP4
-within 119 GiB + a greedy golden (free DGX disk to ~90 GiB; flashinfer DSV4 sparse symbols are the
-DEP-risk). `DeepSeekV4MTPModel` promoted INVENTORIED→SPIKE. **NEXT-TIER BATCH TRIAGE (2026-07-24,
+MoE, clamped SwiGLU, grouped output LoRA, MTP + DSpark speculators. **W1/W2 IMPL SCAFFOLDING
+LANDED (2026-07-28, `CLAIM-DEEPSEEK-V4-IMPL`, base `df18ca91`):** additive registry stub + config
+parse + checkpoint loader name-map VERIFIED vs the real `nvidia/DeepSeek-V4-Flash-NVFP4` header
+(HTTP-range, no download); clean CPU `-Werror`; forward is an honest W3-W8 `VT_CHECK` stub.
+**HW-FIT REVERSAL:** the NVFP4 checkpoint is **156.7 GiB** (index total_size), NOT the spike's
+~83 GiB — only the 256 experts are W4; the MLA + shared linears are FP8 + NVFP4 double-scale ⇒ it
+does NOT fit ONE GB10's 119 GiB pool. **W1 (single-GB10 oracle run) is therefore MEMORY-INFEASIBLE**
+(needs multi-node TP / CPU offload / smaller quant), not merely disk-contended. Forward + strict gate
+= W3-W8. `DeepSeekV4MTPModel` promoted INVENTORIED→SPIKE. **NEXT-TIER BATCH TRIAGE (2026-07-24,
 `sweep-recent-dense-batch.md`, `CLAIM-SWEEP-RECENT-DENSE`):** 8 recent dense/small-MoE families
 advanced `INVENTORIED` -> `SPIKE` with a ranked one-agent-each queue — **4 ZERO-NEW-KERNEL
 near-additive** (Phi-3/Phi-4 `Phi3ForCausalLM` a Llama subclass, Granite-3 4-scalar-multipliers,

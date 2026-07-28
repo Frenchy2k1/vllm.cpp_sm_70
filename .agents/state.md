@@ -30602,3 +30602,23 @@ M2a before the M2c e2e). dgx GB10 CUDA `flock`, weights via
   feature-matrix §3, roadmap scale-out subsection, coordination, STATUS,
   BENCHMARKS. All 6 record checkers rc=0. NEXT: W1 = `vt::Communicator` skeleton +
   CPU 2-proc-loopback all-reduce gate (no GPU needed).
+- **2026-07-28** — **DeepSeek-V4-Flash W1/W2 CPU scaffolding (`CLAIM-DEEPSEEK-V4-IMPL`,
+  foreground, NOT pushed).** Base `main` `df18ca91`. User-directed pickup: the
+  `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` row was TRANSFERRED from the
+  stale/no-worktree `CLAIM-GLM-DSA-LATEST-DEEPSEEK` to a new `CLAIM-DEEPSEEK-V4-IMPL`.
+  Landed ADDITIVE (SACRED-inert, zero edits to existing forwards): `deepseek_v4.h`,
+  `deepseek_v4_weights.cpp` (config parse + checkpoint name-map + W2 accounting),
+  `deepseek_v4.cpp` (forward = honest `VT_CHECK(false, "W3-W8 pending")` stub),
+  `deepseek_v4_registry.cpp` (`REGISTER_VLLM_MODEL`, one line), `test_deepseek_v4_scaffold.cpp`.
+  **Loader VERIFIED vs the REAL `nvidia/DeepSeek-V4-Flash-NVFP4` header** (HTTP-range,
+  NO download): index 135,235 tensors, shard-2 dtypes/shapes confirm 512-wide MLA
+  (`wq_b`[32768,1024]), grouped output-LoRA (`wo_a`/`wo_b`), NVFP4 U8 experts + double
+  scale, FP8-block MLA/shared linears, MHC `hc_attn_fn`[24,16384], 3 hash layers
+  (`tid2eid`), 41 compressor / 21 indexer layers. Clean CPU `-Werror` 0-warn; scaffold
+  test 4/4·40 (arch resolves + config descends + topology + reject). **HW-FIT REVERSAL:**
+  index `total_size` = **156.7 GiB** — the spike's "~83 GiB fits" was WRONG (only the 256
+  experts are W4; MLA + shared linears are FP8 + NVFP4 double-scale). So the NVFP4
+  checkpoint does NOT fit ONE GB10's 119 GiB pool ⇒ **W1 (single-GB10 oracle run) is
+  MEMORY-INFEASIBLE**, not merely disk-contended; reaching a runnable gate needs
+  multi-node TP / CPU offload / a smaller quant. Row stays SPIKE. All 6 record checkers
+  rc=0. NEXT: W3 (512-wide MLA dense-first) once a multi-GPU/offload run path exists.

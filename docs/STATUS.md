@@ -223,14 +223,19 @@ oracle-blocked for a gate (see the capability table above).
 Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as
 **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or
 **spiked-only**, per the [model matrix](../.agents/model-matrix.md).
-**DeepSeek-V4-Flash** is scoped (not implemented) in
-[deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md): a ~167B/256-expert
-NEW architecture (DeepSeek Sparse Attention MLA + Manifold Hyper-Connections +
-NVFP4/MegaMoE + sqrtsoftplus/hash MoE). It is runnable on ONE GB10 via the
-`nvidia/DeepSeek-V4-Flash-NVFP4` W4 checkpoint (~83 GiB, fits the 119 GiB pool;
-the sparse-MLA path supports sm_12x, MegaMoE is SM100-only so the FusedMoE
-fallback is used); the native fp8 (~167 GiB) does not fit. The decisive next
-brick is proving the pinned oracle runs the NVFP4 checkpoint within 119 GiB. The
+**DeepSeek-V4-Flash** is scoped with W1/W2 CPU scaffolding landed (not yet
+runnable) in [deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md): a
+~167B/256-expert NEW architecture (DeepSeek Sparse Attention MLA + Manifold
+Hyper-Connections + NVFP4/MegaMoE + sqrtsoftplus/hash MoE). As of 2026-07-28 the
+additive registry stub + config parse + checkpoint loader name-map are landed and
+VERIFIED against the real `nvidia/DeepSeek-V4-Flash-NVFP4` safetensors header
+(HTTP-range, no download); the forward is an honest not-yet-implemented stub.
+**HW-fit correction:** that NVFP4 checkpoint is **156.7 GiB**, NOT the ~83 GiB the
+scoping spike estimated (only the 256 routed experts are W4; the MLA and shared
+linears are FP8 plus NVFP4 double-scale overhead), so it does **not** fit ONE
+GB10's 119 GiB unified pool. A single-GB10 oracle run is therefore
+memory-infeasible; reaching a runnable gate needs multi-node tensor-parallel, CPU
+offload, or a smaller quant. The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):
 Kimi-Linear-48B is the one that fits GB10 (91.5 GiB) and is e2e-gateable, while

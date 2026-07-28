@@ -409,17 +409,20 @@ remain the separate benchmark track (`BACKEND-GATE-CUDA-SGLANG` cache-neutral +
 `sglang bench_serving` on the idle GB10 once the oracle is stood up (arm64 cu130
 image) and our-side `SERVE-ASYNC-LLM` lands. No source/engine path touched here.
 
-**DeepSeek-V4-Flash W0 SCOPE spike (2026-07-28, `CLAIM-DEEPSEEK-V4-SCOPE`, NOT
-pushed).** Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no
-download, no measurement taken, claimed, or owed; `benchmark_binding=false`).**
-Scopes the ~167B/256-expert `DeepseekV4ForCausalLM` (a NEW arch: DeepSeek Sparse
-Attention MLA + Manifold Hyper-Connections + NVFP4/MegaMoE + sqrtsoftplus/hash
-MoE) and its GB10 HW-fit: `nvidia/DeepSeek-V4-Flash-NVFP4` (~83 GiB, W4) fits the
-119 GiB pool and runs on sm_121 (sparse-MLA sm_12x backend; MegaMoE SM100-only ⇒
-FusedMoE fallback); native fp8 (~167 GiB) does not fit. Spec + W-plan:
-[deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md). The binding
-throughput numbers are owed only after the W1 oracle-run gate and a real
-implementation land; none is taken or promised here. No source/engine path touched.
+**DeepSeek-V4-Flash W1/W2 CPU scaffolding (2026-07-28, `CLAIM-DEEPSEEK-V4-IMPL`,
+NOT pushed).** Disposition: **NOT APPLICABLE (CPU-side scaffolding + loader
+verification; no run, no download, no measurement taken, claimed, or owed;
+`benchmark_binding=false`).** Landed the additive registry stub + config parse +
+checkpoint loader name-map for the ~167B/256-expert `DeepseekV4ForCausalLM` (a NEW
+arch: DeepSeek Sparse Attention MLA + Manifold Hyper-Connections + NVFP4/MegaMoE +
+sqrtsoftplus/hash MoE), VERIFIED against the real `nvidia/DeepSeek-V4-Flash-NVFP4`
+safetensors header (HTTP-range, no download). **HW-fit CORRECTION vs the W0 spike:**
+that NVFP4 checkpoint is **156.7 GiB** (index total_size), NOT ~83 GiB — only the
+256 experts are W4; the MLA + shared linears are FP8 + NVFP4 double-scale ⇒ it does
+NOT fit ONE GB10's 119 GiB pool. The W1 oracle-run gate is memory-infeasible on a
+single Spark (needs multi-node TP / offload / smaller quant), so no binding
+throughput number is reachable yet; none is taken or promised here. Spec + W-plan:
+[deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md). No source/engine path touched.
 
 **Kimi K3 W0 SCOPE spike (2026-07-28, `CLAIM-KIMI-K3-SCOPE`, NOT pushed).**
 Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
