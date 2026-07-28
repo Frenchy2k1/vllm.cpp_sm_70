@@ -1953,11 +1953,29 @@ kernel void vt_attn_qk_norm_rope(device uchar*       q         [[buffer(0)]],
                                  device const uchar* positions [[buffer(5)]],
                                  constant VtQkNormRopeParams& p [[buffer(6)]],
                                  uint2 tgid [[threadgroup_position_in_grid]],
-                                 uint2 tid2 [[thread_position_in_threadgroup]]) {
-  threadgroup float smem[VT_TG_MAX];
-  const uint tid = tid2.x;
-  const uint token = tgid.x;
-  const uint hidx = tgid.y;
+                                 uint2 tid2 [[thread_position_in_threadgroup]],
+                                 uint tiisg [[thread_index_in_simdgroup]],
+                                 uint sgitg [[simdgroup_index_in_threadgroup]],
+                                 uint sgsize [[threads_per_simdgroup]]) {
+  // ONE SIMDGROUP PER (token, head), eight per threadgroup.
+  //
+  // The first version used one THREADGROUP per (token, head) sized by head_dim,
+  // so a 512-token prefill launched 512*24 = 12288 threadgroups, each reducing
+  // 128 elements through vt_tg_sum's log2(128) = 7 BARRIER steps. A head fits
+  // entirely in one simdgroup: 32 lanes x 4 elements. simd_sum then does the
+  // reduction with no barrier at all, the launch count drops 8x, and the lane
+  // can move 8 bytes per load instead of 2.
+  //
+  // The norm still STORES before the rotation reads back, because the composite
+  // this must match stores the normed value (rounding it to the buffer dtype)
+  // before RopeFromCache loads it. Within one simdgroup a simdgroup_barrier is
+  // sufficient ordering — no threadgroup barrier is needed, since a head never
+  // spans simdgroups.
+  const uint pairs = p.t * (p.hq + p.hk);
+  const uint idx = tgid.x * (p.tg / sgsize) + sgitg;
+  if (idx >= pairs) { return; }
+  const uint token = idx / (p.hq + p.hk);
+  const uint hidx = idx % (p.hq + p.hk);
 
   device uchar* buf;
   device const uchar* w;
@@ -1967,37 +1985,35 @@ kernel void vt_attn_qk_norm_rope(device uchar*       q         [[buffer(0)]],
     buf = q; w = qw; dt = p.q_dt; w_dt = p.qw_dt;
     off = ulong(token) * p.q_s0 + ulong(hidx) * p.q_s1;
   } else {
-    const uint kh = hidx - p.hq;
-    if (kh >= p.hk) { return; }
     buf = k; w = kw; dt = p.k_dt; w_dt = p.kw_dt;
-    off = ulong(token) * p.k_s0 + ulong(kh) * p.k_s1;
+    off = ulong(token) * p.k_s0 + ulong(hidx - p.hq) * p.k_s1;
   }
 
-  // --- RMSNorm over this head's row, identical arithmetic to vt_rms_norm.
+  // --- RMSNorm over this head's row. Same arithmetic as vt_rms_norm; only the
+  // reduction shape differs (simd_sum instead of the threadgroup tree).
   float partial = 0.0f;
-  for (uint j = tid; j < p.d; j += p.tg) {
+  for (uint j = tiisg; j < p.d; j += sgsize) {
     const float v = vt_load(buf, dt, off + ulong(j));
     partial += v * v;
   }
-  const float sumsq = vt_tg_sum(smem, tid, p.tg, partial);
+  const float sumsq = simd_sum(partial);
   const float inv = 1.0f / sqrt(sumsq / float(p.d) + p.eps);
-  for (uint j = tid; j < p.d; j += p.tg) {
+  for (uint j = tiisg; j < p.d; j += sgsize) {
     const float v = vt_load(buf, dt, off + ulong(j));
     float wj = vt_load(w, w_dt, ulong(j));
     if (p.gemma != 0u) { wj += 1.0f; }
     vt_store(buf, dt, off + ulong(j), v * inv * wj);
   }
-  // The rotation below READS BACK what was just stored, so the store must be
-  // visible device-wide first. This is also what makes the fused result
-  // bit-identical to the composite for a rounding buffer dtype.
-  threadgroup_barrier(mem_flags::mem_device);
+  simdgroup_barrier(mem_flags::mem_device);
 
-  // --- Partial NeoX RoPE from the cache, identical to vt_rope_from_cache.
+  // --- Partial NeoX RoPE from the cache, identical to vt_rope_from_cache. The
+  // rotation pairs (i, i+rhalf) live on different lanes, which is why the store
+  // above and this read-back are separated by the barrier.
   const long pos = p.pos_i64
       ? ((device const long*)positions)[token]
       : (long)((device const int*)positions)[token];
   const ulong coff = ulong(pos) * p.rot;
-  for (uint pair = tid; pair < p.rhalf; pair += p.tg) {
+  for (uint pair = tiisg; pair < p.rhalf; pair += sgsize) {
     const float c = vt_load(cache, p.cache_dt, coff + pair);
     const float s = vt_load(cache, p.cache_dt, coff + p.rhalf + pair);
     const uint first  = p.is_neox ? pair : pair * 2u;
