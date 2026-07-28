@@ -233,9 +233,14 @@ VERIFIED against the real `nvidia/DeepSeek-V4-Flash-NVFP4` safetensors header
 **HW-fit correction:** that NVFP4 checkpoint is **156.7 GiB**, NOT the ~83 GiB the
 scoping spike estimated (only the 256 routed experts are W4; the MLA and shared
 linears are FP8 plus NVFP4 double-scale overhead), so it does **not** fit ONE
-GB10's 119 GiB unified pool. A single-GB10 oracle run is therefore
-memory-infeasible; reaching a runnable gate needs multi-node tensor-parallel, CPU
-offload, or a smaller quant. The
+GB10's 119 GiB unified pool. **Single-Spark IS viable via a ~2-bit GGUF (user
+correction 2026-07-28):** `unsloth/DeepSeek-V4-Flash-GGUF` `UD-IQ2_XXS` = 90.9 GB
+(3 shards, ungated) FITS one GB10 with ~28 GiB headroom (also UD-IQ1_S/IQ1_M/IQ2_M/
+Q2_K_XL). So two vehicles: single-Spark ~2-bit GGUF, or 2x-Spark NVFP4/fp8 over the
+interconnect. The GGUF vehicle's correctness reference is llama.cpp-on-box (the
+pinned vLLM cannot load V4-from-GGUF) and needs a V4-GGUF loader + IQ i-quant dequant
+(IQ1_S/IQ2_XXS — not in our C4 K-quant set). The NVFP4/fp8 vehicle stays multi-node.
+The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):
 Kimi-Linear-48B is the one that fits GB10 (91.5 GiB) and is e2e-gateable, while

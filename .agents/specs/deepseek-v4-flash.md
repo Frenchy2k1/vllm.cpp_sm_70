@@ -385,3 +385,34 @@ The disk-free recipe in §4 is necessary-but-insufficient; the binding constrain
 - **W3-W8** unchanged from §5 (512-wide MLA dense-first → DSA indexer/compressor → MHC →
   sqrtsoftplus/hash MoE → forward compose → strict gate). W2b = materialize the FP8-block + NVFP4
   towers (reuse `cuda_matmul_nvfp4_sm100` + the fp8 block loaders) into the accounted layout.
+
+---
+
+## HW-FIT CORRECTION (2026-07-28, user-directed): single-Spark IS viable via ~2-bit GGUF
+
+The W0/W1 "does NOT fit one GB10" verdict was specific to the **NVFP4 (156.7 GiB)**
+and **fp8 (167 GiB)** builds. **REFUTED for GGUF:** `unsloth/DeepSeek-V4-Flash-GGUF`
+(ungated) ships Unsloth-Dynamic i-quants that FIT the 119 GiB GB10 (measured file
+sizes, HF `files_metadata`):
+
+| variant | size | fits 119 GiB |
+|---|---|---|
+| `UD-IQ1_S` / `UD-IQ1_M` | 82.5 / 86.9 GB | ✅ |
+| **`UD-IQ2_XXS`** (user-cited) / `UD-IQ2_M` | **90.9 GB** | ✅ (~28 GiB KV/act headroom) |
+| `UD-Q2_K_XL` | 96.8 GB | ✅ (tighter) |
+| `UD-IQ3_XXS` | 103 GB | ~borderline |
+| `UD-IQ3_S` .. `UD-Q8_K_XL` | 117–162 GB | ❌ |
+
+**Two real vehicles now:** (a) **single Spark** via `UD-IQ2_XXS` GGUF (~91 GB);
+(b) **2× Sparks over the interconnect** via NVFP4 (156.7 GiB) / fp8 (167 GiB) — the
+`scale-out-distributed.md` multi-Spark path.
+
+**GGUF run-path caveat (honest):** the pinned vLLM oracle almost certainly cannot
+load DeepSeek-V4 (new DSA/MHC arch) from GGUF, so the **correctness reference for
+the GGUF vehicle is llama.cpp-on-box** (Unsloth publishes these GGUFs FOR llama.cpp),
+mirroring the beyond-vLLM CUDA-breadth bricks. This adds to the W3-W8 forward: a
+**DeepSeek-V4 GGUF loader** + **IQ2_XXS / i-quant dequant** (we have the C4 GGUF
+K-quant loaders — F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K — but NOT the IQ i-quants
+`IQ1_S`/`IQ2_XXS`/`IQ2_M`, which need their codebook dequant ported). So the
+single-Spark GGUF vehicle is: W3-W8 V4 forward + a V4-GGUF loader + IQ2_XXS dequant,
+gated vs llama.cpp-on-card (derive-and-ship correctness reference, no vLLM oracle).
