@@ -38,6 +38,20 @@ a golden capture); the two `MODEL-MM-gemma4-*` rows stay SPIKE, now blocked only
 implementation (the PLE/YOCO/Gemma-4-MoE backbone plus the SigLIP and USM-Conformer
 towers).
 
+## Gemma-4 G1 text backbone (2026-07-28, `CLAIM-GEMMA4-G1`) - correctness bring-up, no speed number owed
+
+`benchmark_binding=false`. G1 implemented the `Gemma4ForConditionalGeneration` text
+backbone (`unsloth/gemma-4-E4B-it` language_model stack) as new additive files
+(registry + weight loader + forward), CPU `-Werror` 0-warn + full `libvllm.a` link.
+No throughput benchmark applies: the strict 32-token gate vs the W0 golden could not
+be RUN — it is blocked on the runner allocating a single uniform KV head dimension
+per layer (`src/vllm/v1/worker/gpu/runner.cpp:600-646`), which cannot represent
+Gemma-4's per-layer heterogeneous 256 (sliding) / 512 (full) head dims without a
+shared-path change to `attn_kv_` construction. The loader was verified against the
+real E4B safetensors header (all 336 language_model tensors mapped, no 16 GB
+download). A full CUDA strict gate + the runner heterogeneous-KV change are the named
+G-next; no speed claim is made or owed at G1.
+
 ## sm_110 (Jetson Thor) runtime gate, the first non-GB10 runtime proof (2026-07-27, `CLAIM-CUDA-SM110-RUNTIME`) - CORRECTNESS milestone, no speed number owed
 
 **What ran.** vllm.cpp built natively for `sm_110` on a real NVIDIA Jetson Thor

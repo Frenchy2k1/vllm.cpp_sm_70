@@ -30240,6 +30240,27 @@ Sec 5/6), `quantization-matrix.md` (`QUANT-GGUF-NVFP4` INVENTORIED -> PARTIAL, n
 row so `ENGINE_ROWS` unchanged), `docs/STATUS.md` (capability row + the MTP-GGUF
 blocker paragraph), `docs/BENCHMARKS.md` (NOT APPLICABLE, loader-only, with the
 correctness evidence), this log.
+- **2026-07-28 (Gemma-4 G1 — text backbone landed, `CLAIM-GEMMA4-G1`)** — Implemented
+  the `Gemma4ForConditionalGeneration` TEXT backbone (`unsloth/gemma-4-E4B-it`
+  language_model stack) as NEW additive files: `include/vllm/model_executor/models/
+  gemma4.h` + `src/vllm/model_executor/models/{gemma4,gemma4_weights,gemma4_registry}.cpp`
+  + 3 CMake lines, mirroring the OLMo-2/gemma3 registration seam. Grounded 1:1 in
+  `gemma4.py`/`gemma4_rope.py`/`layernorm.py`: the load-bearing find is that Gemma-4 uses
+  **PLAIN RMSNorm** (`x·w`), NOT the Gemma `(1+w)` of gemma2/3. Landed primitives: PLE,
+  YOCO KV-sharing (in-forward target-cache read), heterogeneous head_dim 256/512,
+  proportional partial-RoPE (custom host cos/sin cache) + standard sliding rope,
+  weight-less V-norm (ones-weight), GeGLU, per-layer scalar, final soft-cap 30, tied
+  lm_head. E4B disables MoE/k_eq_v/double-MLP → the ≥12B follow-on. ZERO-NEW-KERNEL
+  (reuses GeluAndMul/RmsNorm/RopeFromCache/RopeNeox/Add/MulScalar/SoftCap/Embedding/
+  MatmulBT/PagedAttention). Loader VERIFIED vs the real E4B safetensors HEADER (2130
+  tensors; all 336 `language_model.*` names+shapes matched; mm towers skipped) — no 16 GB
+  download. Build: CPU `-Werror` 0-warn on all 3 TUs + full `libvllm.a` link (SACRED
+  inertness). **HONEST e2e BLOCKER:** the strict 32/32 gate vs the W0 golden
+  (`[236776,2455,5192,…]`) CANNOT RUN — the runner allocates ONE uniform KV head_dim per
+  layer (`runner.cpp:600-646`); Gemma-4's per-layer 256/512 heads need a shared-path
+  change to `attn_kv_` construction. Named as G-next (+ full CUDA gate + verify the two
+  bf16-rounding nuances). G2 vision / G3 audio separate. dgx used read-only (config +
+  safetensors header via HTTP range); NO GPU, NO download; not pushed.
 
 ---
 
