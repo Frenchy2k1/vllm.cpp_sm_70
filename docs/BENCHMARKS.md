@@ -2555,6 +2555,15 @@ sequence, so the divergence is the TARGET's forward under speculation, not the
 head. The GGUF head loader is cleared; the open defect is engine-level and CPU-only
 (`CPU-SPEC-DIVERGENCE`). No GPU spec-decode result is affected or retracted.
 
+**Narrowed further 2026-07-28, still no number owed or claimed.** Instrumentation
+localised the defect to the GDN conv row geometry under speculation (prefill's
+gathered working copy is `(K-1)` wide; the spec decode update reads a
+`(K-1)+num_spec` row; the non-spec update never runs). One candidate fix was
+attempted and REVERTED as a no-op rather than shipped unverified. Still
+`benchmark_binding=false`: a throughput figure on a diverging path would be
+meaningless, and the next step is a correctness probe (dump one conv_state row
+either side of the prefill scatter, spec-ON vs spec-OFF), not a measurement.
+
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - scoping documents, ZERO code.

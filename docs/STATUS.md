@@ -545,7 +545,13 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   run and the defect may be as old as the widened-cache work. GPU spec-decode
   results are unaffected and unretracted; op-level CPU suites (`test_ops_gdn`,
   `test_qwen3_5_gdn_spec_routing`) pass, so this is call-site bookkeeping rather
-  than kernel math.
+  than kernel math. **Narrowed 2026-07-28** to the GDN conv row geometry: under
+  speculation the conv row is addressed with two strides (prefill's working copy
+  is `(K-1)` wide, the spec decode update reads a `(K-1)+num_spec` row), and the
+  non-spec single-token update is never called at all. The split is legitimate by
+  design - the narrow buffer is a gathered working copy scattered back into the
+  widened row - so the open question is whether the gather/scatter and the spec
+  read agree on that geometry at runtime. The next probe is recorded in the spike.
 - **DFlash from GGUF is SPIKED, not implemented.** `mtp` and
   `dflash` are refused on a `.gguf` target today; `ngram` works there and
   always has. Two `READY` rows now carry the scoped plan:
