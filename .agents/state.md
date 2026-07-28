@@ -30052,3 +30052,25 @@ dequant is a SEPARATE capability and must not be filed under this row.
   (NOT-APPLICABLE — feature), ledger, this log. Did NOT touch README/Metal
   (concurrent session owns them; the README "not yet wired into the OpenAI server"
   line is flagged in STATUS for the e2e brick).
+
+---
+
+## 2026-07-28 — Gemma-4 oracle-block REFUTED: re-measured, it is CHECKPOINT-gated not toolchain-blocked
+
+Prompted by a user question ("why oracle lacks gemma4?"), re-measured the current
+oracle on dgx and REFUTED the stale "transformers 5.13.1 has no gemma4" verdict:
+- `~/venvs/vllm-oracle` (0.25.0-stage) transformers **5.13.1** DOES carry the
+  `gemma4`/`gemma4_unified`/`gemma4_assistant` modules; `AutoConfig.for_model("gemma4")`
+  constructs OK.
+- vLLM 0.25.0 REGISTERS all four Gemma4 arches: `Gemma4ForCausalLM`,
+  `Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration`,
+  `Gemma4MTPModel`.
+So Gemma-4 is NOT toolchain/oracle-blocked. The REAL blocker is **CHECKPOINT-GATED**:
+zero `gemma4` checkpoints cached, all public `google/*` Gemma-4 ckpts are >=12B
+HF-license-gated, and no `HF_TOKEN` on the box => no golden, no gate. The
+oracle-gateability construct-vs-run gate ([[oracle-gateability-model-runs-not-config-constructs]])
+stays UNVERIFIED without weights. Corrected the 4 stale `model-matrix.md` Gemma-4 rows
++ `docs/BENCHMARKS.md`; the `gemma4-multimodal.md` spec (07-26 header) and
+`coordination.md` (07-27 annotation) already self-corrected; `parity-ledger.md`
+gate-time entry left as dated history. Unblock = a Gemma-4 checkpoint (accept the HF
+license + a token, or cached weights); records-only, no code.

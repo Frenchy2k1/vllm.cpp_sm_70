@@ -1959,11 +1959,16 @@ zero warp on the default path.
 
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
-Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =
-**oracle-BLOCKED (decisive):** the vision/audio towers load via Transformers
-`AutoModel.from_config` but the dgx oracle transformers 5.13.1 has no `gemma4` module
-(measured; `gemma3n` present) => the mm path is unconstructible, no SACRED oracle, no
-gate; also >=12B `google/*` HF-gated mm-wrapped (none cached) + PLE/YOCO/Gemma-4-MoE
+Design + oracle/checkpoint/HW-fit spike only (no build, no run). **UPDATED 2026-07-28
+(supersedes the "oracle lacks gemma4" verdict below, now REFUTED):** re-measured, the
+current oracle venv (transformers 5.13.1) DOES carry `gemma4`/`gemma4_unified` and vLLM
+0.25.0 registers all four Gemma4 arches (`AutoConfig` constructs) — so Gemma-4 mm is
+**CHECKPOINT-GATED, not oracle/toolchain-blocked**: all public `google/*` ckpts are
+>=12B HF-license-gated, none cached, no HF token on the box => no golden, no gate; the
+construct-vs-run gate stays unverified without weights. Gate-time record follows: the
+vision/audio towers load via Transformers `AutoModel.from_config`; the 2026-07-25 verdict
+claimed the dgx oracle transformers 5.13.1 had no `gemma4` module (that measurement no
+longer holds); >=12B `google/*` HF-gated mm-wrapped (none cached) + PLE/YOCO/Gemma-4-MoE
 backbone + USM-Conformer audio tower unbuilt (SigLIP vision tower reuses the M2a
 scaffold); HW fits 12B. AUDIO (genuinely-new; Qwen3.6 has none) staged first on the
 smallest oracle-runnable native vehicle: `whisper-small` (pipeline+tower) then
