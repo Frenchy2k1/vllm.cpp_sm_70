@@ -144,6 +144,36 @@ Consequence for `GD2`: the DFlash GGUF loader must NOT be written by analogy to
 the MTP one. It shares the dequant/quantization-routing helpers but differs on
 the norm convention, and its config differs on the tap indices.
 
+## A THIRD trap, found by `GD4` and only findable by GENERATING
+
+The two above are load-time conventions and both were caught by unit tests. The
+third is not: it is a field the GGUF contract legitimately cannot supply, whose
+absence is invisible until the draft's first forward.
+
+**`vocab_size` must be back-filled from the TARGET; leaving it 0 is fatal.**
+`MakeDflashGgufConfig` deliberately leaves `HfConfig::vocab_size` at 0 (`GD1`),
+which is right: the DFLASH arch carries no vocab KV and no `token_embd`, because
+the draft SHARES the target's table. But the draft's forward sizes its embedding
+lookup as `ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H})`
+(`src/vllm/model_executor/models/qwen3_dflash.cpp:245,477,1008,1043`), so a 0
+there is an EMPTY table over a perfectly good buffer, and the FIRST propose
+throws `vt: cuda embedding: empty table (vocab 0) with nonempty ids`
+(`src/vt/cuda/cuda_ops.cu:648`). The safetensors draft never met this because its
+`config.json` declares `vocab_size`.
+
+Every load-time assertion passed: the weights were loaded, the shared bf16
+embed/lm_head were found, `draft_vocab_size` was set from `lm_head`, and the 47
+`GD1`-`GD3` assertions were green - including one asserting `vocab_size == 0`,
+which is correct for the config-building step and says nothing about the loader
+that consumes it. **The fix belongs in `LoadDflashDraft`, not in
+`MakeDflashGgufConfig`**: take the row count from the TARGET tensor actually
+being indexed (`weights.embed_tokens.shape[0]`) rather than from any declared
+number, so the view and the buffer cannot disagree.
+
+The general lesson this row now carries alongside the MTP row's: a loader gated
+only at load level is not gated. Here it was not even a wrong VALUE - it was a
+value nothing had a reason to write.
+
 ## Our baseline
 
 - **The DFlash weight loader is already resolver-shaped**, exactly like the MTP
@@ -206,7 +236,7 @@ gates.
 | Resolver name mapping | same | Every name `LoadQwen3DFlash` requests resolves; `fc`/`enc.output_norm`/`output_norm` land on the right fields. RED-first via a deliberately swapped norm. |
 | Draft-path discrimination | same or the model-loader test | `ResolveDflashDraftDir` accepts a `.gguf` file, a dir with `config.json`, and an HF-cache snapshot; rejects a dir with neither, with both the reference and the searched locations in the message. |
 | Cross-format draft equivalence | `tests/parity/` | The SAME draft, loaded from safetensors and from an F16 GGUF, produces bit-identical `Qwen3DFlashWeights` (compare tensor bytes). This is the strongest cheap gate and needs no GPU. |
-| Axis-A token gate | new `tests/parity/test_qwen36_dflash_gguf_draft.cpp`, modelled on `tests/parity/test_qwen36_spec_decode.cpp` | GGUF-draft spec-ON == safetensors-draft spec-ON, token-for-token, c1 greedy; acceptance within noise. |
+| Axis-A token gate | `tests/parity/test_qwen27_dflash_spec_decode.cpp` second case (NOT a new file: the existing one is the same engine path and only lacked a draft-source override) | MODE-MATCHED and CROSS-FORMAT, both drafts in ONE process: `VLLM_DFLASH_DRAFT` vs `VLLM_DFLASH_DRAFT_B` must produce identical DFlash-ON tokens AND identical accepted/proposed, each with nonzero acceptance. Companions: near-tie-robust vs spec-OFF (`D5` form), a spec-OFF self-reproducibility control, and a target margin sweep. **Not `spec-ON == spec-OFF`**: that is the MTP bar, and `SPEC-DFLASH` `D5` measured vLLM's own DFlash-ON as token-different from vLLM's own spec-OFF on 3 of 4 prompts. |
 | Axis-B token gate | same file, second case | GGUF-target spec-ON == GGUF-target spec-OFF at c1; plus acceptance > 0. |
 | Shared-head equivalence (B) | unit | `SharedHeadSource` over an F16 GGUF yields bf16 bit-identical to the safetensors path. |
 
@@ -214,14 +244,25 @@ gates.
 
 1. **Spec-OFF byte-identical (SACRED).** 27B 235/235, 35B 315/315, Coder 138/138.
    Axis B touches the GGUF branch, so this is mandatory there.
-2. **Cross-format draft equivalence.** Bit-identical weights from F16 GGUF vs
-   safetensors for the same draft. Cheap, CPU-only, and it is what makes the
-   token gates interpretable.
-3. **Axis-A token identity, c1.** GGUF draft == safetensors draft, token-exact,
-   greedy, single request.
+2. **Cross-format draft equivalence (weights).** `NOT APPLICABLE`, and for a
+   reason the spike did not anticipate: the gate as written needs an **F16** GGUF
+   of this draft, and the only published one is `Q4_K_M`. Q4_K dequantized to
+   bf16 is not bit-equal to the bf16 safetensors by construction, so this can
+   never be met with the available asset. Its purpose - making the token gates
+   interpretable - is served instead by gate 3, which compares the two formats at
+   the TOKEN level end to end.
+3. **Axis-A cross-format equivalence, c1. MET 2026-07-28.** The DFlash-ON greedy
+   continuation from the Q4_K_M GGUF draft is token-for-token identical to the
+   one from the bf16 safetensors draft, with identical proposed/accepted counts,
+   on two prompts. **Note the restatement:** the original wording of this gate
+   was "GGUF draft == safetensors draft", which is what is measured; an earlier
+   attempt to gate on `spec-ON == spec-OFF` instead was wrong for DFlash and is
+   recorded under `GD4` below.
 4. **Axis-B token identity, c1.** GGUF target spec-ON == spec-OFF.
-5. **Acceptance parity.** Within noise of the safetensors-draft rate on the same
-   prompts. A collapsed rate means the draft loaded but is wired wrong.
+5. **Acceptance parity. MET 2026-07-28**, and stronger than "within noise":
+   EXACTLY equal on both prompts (20/80 and 42/96). Q4_K_M costs this draft
+   nothing in acceptance on this target, which the spike had flagged as a real
+   risk. Two prompts is the evidence, not a general claim.
 6. **Speed: PENDING, not owed by this row.** Owes a `docs/BENCHMARKS.md`
    disposition, which may be `PENDING` with the reproduction command.
 
@@ -252,7 +293,7 @@ gates.
 | `GD1` | **DONE 2026-07-28.** `MakeDflashGgufConfig` (`src/vllm/model_executor/models/qwen3_dflash_gguf.cpp`) builds the draft HfConfig from the `dflash.*` KVs, undoing the +1 target-layer offset and rebuilding `raw["dflash_config"]` + `raw["block_size"]` so downstream `config.raw` readers are unchanged. `vocab_size` deliberately left 0 (the draft shares the target's lm_head). | Config unit tests, RED-first | `GD0` |
 | `GD2` | **DONE 2026-07-28.** `LoadQwen3DFlashFromGguf` via a `TensorResolver` over dequantized bf16 views, delegating to the EXISTING `LoadQwen3DFlash` so its qkv / gate_up row concatenation is reused unchanged. The resolver seam is correct HERE (unlike the MTP head) precisely because dflash norms are RAW and the draft is small enough to dequant wholesale. | Resolver unit tests; gate 2 | `GD0` |
 | `GD3` | **DONE 2026-07-28.** `IsDflashGgufDraft` + the `.gguf` branch in `ResolveDflashDraftDir` / `LoadDflashDraft` (`src/vllm/entrypoints/model_loader.cpp`). Target-shared embed/lm_head still come from `target_shards`, so axis A is complete. | Path-discrimination test | `GD1`, `GD2` |
-| `GD4` | Axis-A token + acceptance gate | Gates 3, 5 | `GD3` |
+| `GD4` | **DONE 2026-07-28 - axis A PASSES end to end on GB10, and it found a defect that only generating could find.** `tests/parity/test_qwen27_dflash_spec_decode.cpp` second case, env-driven draft source. Fixed `LoadDflashDraft`'s GGUF branch to back-fill `config.vocab_size` from the target's `embed_tokens` rows: it was 0, the draft's embedding view was therefore EMPTY, and the first propose threw. Result: GGUF-draft DFlash-ON == safetensors-draft DFlash-ON token-for-token with identical accepted/proposed, on two prompts. See the gate-form correction below | Gates 3, 5 | `GD3` |
 | `GD5` | `SharedHeadSource` + its equivalence test | Gate 7 | `GD4` |
 | `GD6` | Drop `dflash` from the GGUF rejection; wire the GGUF branch | Gate 1 | `GD5` |
 | `GD7` | Axis-B token gate | Gate 4 | `GD6` |

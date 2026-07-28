@@ -3079,6 +3079,48 @@ and `CUDA_VISIBLE_DEVICES=` for its CPU arm. The still-owed speed number is the
 spec-ON/spec-OFF throughput A/B on the same file and box. Closing commit for the
 row: `edf91449`.
 
+### DFlash-from-GGUF axis A e2e, `SPEC-DFLASH-GGUF` GD4 (2026-07-28) - correctness MET, speed PENDING
+
+**Benchmark disposition: PENDING - a correctness checkpoint; no throughput number
+is owed by this row and none is published. `benchmark_binding=false`.** The
+spec's gate 6 says so explicitly. The number this row WILL owe, whenever axis A
+gets a speed disposition, is the DFlash-ON throughput A/B between the two draft
+formats on the same target and box, which needs a steady-state harness rather
+than the 24/48-token correctness run below.
+
+**What DID get measured (dgx.casa GB10 sm_121a, CUDA 13, arch verified from
+`flags.make` + `cuobjdump -lelf` = `sm_121a` only, never from `CMakeCache.txt`;
+every run under `flock $HOME/gpu.lock`).** Target
+`~/bench/q36-27b-nvfp4-vllm` (Qwen3.6-27B NVFP4 safetensors), drafts
+`~/bench/Qwen3.6-27B-DFlash-Q4_K_M.gguf` (986 MB) and `z-lab/Qwen3.6-27B-DFlash`
+(bf16 safetensors), k=16, greedy, concurrency 1:
+
+| Prompt | Tokens | GGUF Q4_K_M draft | safetensors bf16 draft | Cross-format tokens |
+|---|---:|---|---|---|
+| "The capital of France is" | 24 | 20/80 accepted (0.250) | 20/80 accepted (0.250) | IDENTICAL |
+| "Write a Python function that reverses a string:" | 48 | 42/96 accepted (0.4375) | 42/96 accepted (0.4375) | IDENTICAL |
+
+Target-side control on the same runs: spec-OFF reproduced its own sequence 3/3,
+with ZERO exact top-1/top-2 logit ties and a minimum margin of 0.197 / 0.400
+nats. So unlike the 35B A3B NVFP4 safetensors sibling recorded above, this target
+is token-stable and the comparison is not hostage to tie-breaking.
+
+Reproduce (both prompts, cross-format bar asserted in-process):
+
+```
+VLLM_DFLASH_TARGET=$HOME/bench/q36-27b-nvfp4-vllm \
+VLLM_DFLASH_DRAFT=$HOME/bench/Qwen3.6-27B-DFlash-Q4_K_M.gguf \
+VLLM_DFLASH_DRAFT_B=z-lab/Qwen3.6-27B-DFlash \
+flock $HOME/gpu.lock ./build-cuda/tests/test_qwen27_dflash_spec_decode \
+  -tc="dflash axis-A*"
+```
+
+Add `VLLM_DFLASH_PROMPT=... VLLM_DFLASH_MAX_TOKENS=48` for the second row. 17/17
+assertions per prompt, exit 0, wall 1:43.72 and 2:12.02, peak RSS 39.58 GiB, on an
+otherwise idle box, from a binary whose sources md5-match the committed ones.
+These wall times cover three engine loads plus five short generations and are NOT
+a throughput measurement.
+
 ### DFlash-from-GGUF axis-A loader, `SPEC-DFLASH-GGUF` GD1-GD3 (2026-07-28) - load-path correctness only, PENDING speed
 
 **Benchmark disposition: PENDING - the path is not reachable end to end yet, so
