@@ -581,6 +581,23 @@ via the opt-in route gate — 404 flag-off/no-callback → 200 attached). Inertn
 Reproduce: `cmake --build build-cpu --target test_openai_api_server &&
 ./build-cpu/tests/test_openai_api_server`.
 
+**ROAD-V1-MM OpenAI multimodal content-part parse/route — first CPU brick
+(2026-07-28, `CLAIM-MM-SERVING-W1`, NOT pushed).** Disposition: **NOT APPLICABLE
+(feature — serving-surface parse/decode/route, `benchmark_binding=false`; no compute
+path, no throughput number owed).** Wiring the OpenAI multimodal content-part array
+into the chat request and routing the decoded media through the EXISTING
+single-sequence processors is request-parsing + a CPU-only processor call, not a
+kernel/engine step, so no vLLM throughput A/B applies. Gate is correctness:
+`test_chat_mm` 5/5 (65 asserts) — bare-string inertness, base64/data-URI decode
+vectors, `input_audio`→features [80,3000]+1500 placeholder tokens+byte-exact mm-hash,
+`image_url`→grid [1,28,28]+196 merged tokens; inertness suites `test_openai_protocol`
+28/171 + `test_openai_serving` 40/527 + `test_openai_serving_chat_stream` 2/210
+byte-identical. The end-to-end serving SPEED (a real mm request → token-correct output
+through the running server, and its TTFT/TPOT vs the mm oracle) belongs to the named
+GPU closing brick `MM-SERVE-E2E` (DGX + Qwen3-VL-4B checkpoint) and is not measured
+here. Reproduce: `cmake --build build-cpu --target test_chat_mm &&
+./build-cpu/tests/test_chat_mm`.
+
 **ROAD-V1-C8 production endpoint wiring (2026-07-28, `CLAIM-C8-SERVE-PROD-WIRING`,
 NOT pushed).** Disposition: **NOT APPLICABLE (no throughput number,
 `benchmark_binding=false`).** Wiring the shipped `vllm-server` binary to call its

@@ -30011,3 +30011,44 @@ A metric that returns N/A is a reason to verify, not a quirk to excuse.
 **Next:** the dense 2B Q8_K_XL GGUF is dequantable and is the file the CPU gate
 already passes on; uploading it gives a genuine GPU end-to-end run. NVFP4 GGUF
 dequant is a SEPARATE capability and must not be filed under this row.
+- 2026-07-28 (**Multimodal SERVING — first CPU brick `MM-SERVE-PARSE`**;
+  `CLAIM-MM-SERVING-W1`, spec `specs/mm-serving.md`; isolated worktree
+  `.claude/worktrees/agent-a632b85d06e584d4c` off local `main` `aca8d7d7`
+  (confirmed base via `git rev-parse HEAD`); CPU-only `build-cpu`
+  `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON` Release; NO dgx/GPU — content-part
+  parse + base64 decode + a CPU-only processor call are device-neutral; NOT
+  pushed; FULL SHA reported to caller). **Opened the `ROAD-V1-MM` serving track:**
+  wire OpenAI multimodal content parts into the chat request and route them to the
+  EXISTING single-sequence mm processors. SCOPED the full path (content-part parse
+  → base64/data-URI decode → existing processor → placeholder expansion → engine
+  mm_features + encoder-cache) into 3 bricks with vLLM `file:line` + tests-to-port
+  (`MM-SERVE-PARSE`/`MM-SERVE-ENGINE`/`MM-SERVE-E2E`). Implemented brick 1: mirror
+  vLLM `chat_utils.py` MM_PARSER_MAP:1478 / _parse_chat_message_content_mm_part:1524
+  — `ChatContentPart` + `ChatMessage.content_parts` (`protocol.h`), array-form
+  `from_json(ChatMessage)` + `ParseChatContentPart` (`protocol.cpp`), NEW
+  `entrypoints/openai/chat_mm.{h,cpp}` (`DecodeBase64` RFC4648, `DecodeDataUri`
+  RFC2397, `RouteAudioWav`/`RouteImageRgb` reusing `qwen3vl_processor`/
+  `audio_processor` seams → `MultiModalInputs`), CPU-only, no model weights. **Gate
+  `test_chat_mm` 5/5 (65 asserts):** bare-string INERTNESS (content_parts nullopt,
+  `DefaultChatPromptFallback` byte-identical), base64/data-URI decode vectors,
+  `input_audio` (base64 of the committed whisper WAV) → Whisper processor →
+  input_features [80,3000] + 1500 placeholder tokens + byte-exact mm-hash,
+  `image_url` (raw-RGB fixture data URI) → Qwen3-VL processor → grid [1,28,28] + 196
+  merged tokens (numbers vs the M1/A1 processor-parity fixtures). Inertness suites
+  `test_openai_protocol` 28/171 + `test_openai_serving` 40/527 +
+  `test_openai_serving_chat_stream` 2/210 byte-identical for bare-string; clean CPU
+  `-Werror` full-library + `server` binary 0-warn. **RED-first:** the pre-wiring
+  parser handled only `content.is_string()` (array dropped ⇒ content_parts nullopt,
+  the asserted inert path); after, the array populates content_parts + routes.
+  **Residuals (named):** `MM-SERVE-ENGINE` (attach mm_features to the engine request
+  — no `add_request` mm overload yet; placeholder-string insertion into the chat
+  template); `MM-SERVE-E2E` (**MANDATORY closing gate** — a real image+prompt OpenAI
+  request → token-correct output on Qwen3-VL-4B vs the mm oracle, DGX + checkpoint);
+  container-format image decode (PNG/JPEG→RGB — no codec vendored, route takes raw
+  RGB); http(s) media fetch; streaming/multi-image/video parts. Records (ONE commit):
+  `specs/mm-serving.md` (new), `engine-matrix.md`(via feature roll-up),
+  `feature-matrix.md`, `model-matrix.md` (`MODEL-MM` Qwen3-VL-4B serving note),
+  `roadmap_v1.md`, `coordination.md` claim, `docs/STATUS.md`, `docs/BENCHMARKS.md`
+  (NOT-APPLICABLE — feature), ledger, this log. Did NOT touch README/Metal
+  (concurrent session owns them; the README "not yet wired into the OpenAI server"
+  line is flagged in STATUS for the e2e brick).

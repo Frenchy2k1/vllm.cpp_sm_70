@@ -118,6 +118,44 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**Multimodal SERVING — first CPU brick LANDED (2026-07-28, `CLAIM-MM-SERVING-W1`,
+DONE — committed, NOT pushed; FULL SHA reported to caller).** Opens the
+`ROAD-V1-MM` serving track: wire OpenAI multimodal content parts into the chat
+request and route them to the EXISTING single-sequence mm processors. Base local
+`main` HEAD `aca8d7d7`; isolated worktree
+`.claude/worktrees/agent-a632b85d06e584d4c`; CPU-only (`-DVLLM_CPP_CUDA=OFF`), no
+GPU. **What it did.** (1) SCOPED the full wiring path (content-part parse → base64/
+data-URI decode → existing processor → placeholder expansion → engine mm_features +
+encoder-cache) into 3 bricks with vLLM file:line + tests-to-port
+(`.agents/specs/mm-serving.md`, rows `MM-SERVE-PARSE`/`MM-SERVE-ENGINE`/
+`MM-SERVE-E2E`). (2) Implemented brick 1 `MM-SERVE-PARSE`: `ChatContentPart` +
+`ChatMessage.content_parts` (protocol.h), array-form `from_json(ChatMessage)` +
+`ParseChatContentPart` (protocol.cpp, mirrors `chat_utils.py` MM_PARSER_MAP:1478 /
+_parse_chat_message_content_mm_part:1524), new `entrypoints/openai/chat_mm.{h,cpp}`
+(`DecodeBase64` RFC4648, `DecodeDataUri` RFC2397, `RouteAudioWav`/`RouteImageRgb`
+reusing `qwen3vl_processor`/`audio_processor` seams → `MultiModalInputs`). (3) Gate
+`test_chat_mm` 5/5 (65 asserts): bare-string INERTNESS (content_parts nullopt,
+prompt byte-identical), base64/data-URI decode vectors, `input_audio` part → Whisper
+processor → features [80,3000] + 1500 placeholder tokens + byte-exact mm-hash,
+`image_url` part → Qwen3-VL processor → grid [1,28,28] + 196 merged tokens; reuses
+the M1/A1 processor-parity fixtures. Inertness suites `test_openai_protocol`
+(28/171) + serving/chat-stream byte-identical for bare-string; clean CPU `-Werror`
+library+server build. **Owns:** `include/vllm/entrypoints/openai/{protocol.h,chat_mm.h}`,
+`src/vllm/entrypoints/openai/{protocol.cpp,chat_mm.cpp}`, `CMakeLists.txt` (+chat_mm),
+`tests/CMakeLists.txt` + `tests/vllm/entrypoints/openai/test_chat_mm.cpp`, plus the
+records below. **Does NOT touch** README/Metal (concurrent session owns them; the
+README "not yet wired into the OpenAI server" line is flagged in STATUS for the e2e
+brick). **Residuals (named):** `MM-SERVE-ENGINE` (attach mm_features to the engine
+request — no `add_request` mm overload yet; placeholder-string insertion into the
+chat template); `MM-SERVE-E2E` (**MANDATORY closing gate** — a real image+prompt
+OpenAI request → token-correct output on Qwen3-VL-4B vs the mm oracle, needs DGX +
+checkpoint); container-format image decode (PNG/JPEG→RGB — no codec vendored, route
+takes raw RGB); http(s) media fetch; streaming mm / multiple images / video parts.
+Records: `.agents/specs/mm-serving.md` (new), `engine-matrix.md`, `feature-matrix.md`,
+`model-matrix.md` (the MODEL-MM Qwen3-VL-4B serving note + checklist), `roadmap_v1.md`, this claim,
+`docs/STATUS.md`, `docs/BENCHMARKS.md` (NOT-APPLICABLE — feature), `parity-ledger.md`,
+`state.md`.
+
 **Decode per-token latency (TPOT/ITL) lever EXPLORATION — hypothesis CONFIRMED
 (2026-07-28, `CLAIM-DECODE-LATENCY-EXPLORE`, DONE — measurement only, NOT pushed;
 FULL SHA reported to caller).** User-directed: CONFIRM/REFUTE the
