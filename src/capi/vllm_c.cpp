@@ -27,6 +27,9 @@
 
 #include "capi/chat_prompt.h"
 #include "capi/engine_handle.h"
+#include "vllm/config/kv_transfer.h"   // ParseKVTransferConfigJson (ABI v9)
+#include "vllm/config/scheduler.h"     // SchedulerPolicyFromString (ABI v9)
+#include "vllm/v1/kv_offload/kv_connector.h"  // KVConnectorFactory (ABI v9)
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/entrypoints/openai/protocol.h"
@@ -56,6 +59,11 @@ struct vllm_engine {
   // The model path vllm_engine_load received; empty for a test-hook handle.
   // Used to resolve the chat template + the served model name.
   std::string model_path;
+  // ABI v9 vllm_model_params.tokenizer_config_path: an explicit override for the
+  // tokenizer_config.json the chat template is read from. Empty => the
+  // <model_path>/tokenizer_config.json default. Ignored for a .gguf model_path
+  // (its template lives in GGUF metadata).
+  std::string tokenizer_config_path;
   // Test-hook override for the chat-prompt seam (MakeEngineHandle overload):
   // when set, chat_serving is built with it instead of the resolved template.
   vllm::entrypoints::openai::ChatPromptFn test_prompt_fn;
@@ -226,7 +234,8 @@ vllm::SamplingParams ToSamplingParams(const vllm_sampling_params& c,
 vllm::entrypoints::openai::ChatPromptFn ResolveChatPromptFn(
     const std::string& model_path,
     const vllm::entrypoints::LoadedEngine& loaded,
-    std::string* out_raw_template = nullptr) {
+    std::string* out_raw_template = nullptr,
+    const std::string& tokenizer_config_path = std::string()) {
   namespace fs = std::filesystem;
   try {
     std::string tmpl;
@@ -234,8 +243,12 @@ vllm::entrypoints::openai::ChatPromptFn ResolveChatPromptFn(
         fs::path(model_path).extension() == ".gguf") {
       tmpl = vllm::entrypoints::LoadChatTemplateFromGguf(model_path);
     } else {
+      // ABI v9: an explicit tokenizer_config_path wins over the sibling default,
+      // mirroring the server's --tokenizer-config.
       tmpl = vllm::entrypoints::LoadChatTemplateFromConfig(
-          (fs::path(model_path) / "tokenizer_config.json").string());
+          tokenizer_config_path.empty()
+              ? (fs::path(model_path) / "tokenizer_config.json").string()
+              : tokenizer_config_path);
     }
     if (out_raw_template != nullptr) *out_raw_template = tmpl;
     const vllm::tok::Tokenizer& tok = loaded.tokenizer();
@@ -272,7 +285,8 @@ vllm::entrypoints::openai::OpenAIServingChat& EnsureChatServing(
         engine->test_prompt_fn
             ? engine->test_prompt_fn
             : ResolveChatPromptFn(engine->model_path, *engine->loaded,
-                                  &raw_template);
+                                  &raw_template,
+                                  engine->tokenizer_config_path);
 
     std::string parser_name;
     if (!engine->tool_parser.empty()) {
@@ -419,6 +433,9 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.reasoning_parser = nullptr;  // AUTO-detect / disabled (ABI v5).
   p.speculative_config = nullptr;  // speculation disabled (ABI v6).
   p.enable_prefix_caching = 0;     // 0 => model default (ABI v7).
+  p.max_num_batched_tokens = 0;    // 0 => the per-arch default (ABI v9).
+  p.scheduling_policy = nullptr;   // NULL => "fcfs" (ABI v9).
+  p.kv_transfer_config = nullptr;  // NULL => no connector (ABI v9).
   return p;
 }
 
@@ -467,13 +484,55 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
     if (params->num_blocks > 0) ep.num_blocks = params->num_blocks;
     if (params->max_model_len > 0) ep.max_model_len = params->max_model_len;
     if (params->max_num_seqs > 0) ep.max_num_seqs = params->max_num_seqs;
-    // ABI v6: speculative-decoding config. NULL/empty => unset => the
-    // byte-identical no-speculation engine; a malformed/unsupported document
-    // throws out of ParseSpeculativeConfigJson and is reported as a load error.
-    if (params->speculative_config != nullptr &&
-        params->speculative_config[0] != '\0') {
-      ep.speculative_config =
-          vllm::ParseSpeculativeConfigJson(params->speculative_config);
+    // ABI v9: chunked-prefill per-step token budget. <= 0 leaves the per-arch
+    // default resolution (LoadedEngine::ResolveMaxNumBatchedTokens) untouched.
+    if (params->max_num_batched_tokens > 0)
+      ep.max_num_batched_tokens = params->max_num_batched_tokens;
+    // The config DOCUMENTS below are caller input, so a malformed one is
+    // VLLM_ERR_INVALID_ARGUMENT — what vllm.h has documented for
+    // speculative_config since v6. Scoped to just the parsing: a genuine
+    // std::invalid_argument out of FromModelDir (a bad checkpoint) must keep
+    // reporting as VLLM_ERR_MODEL_LOAD.
+    try {
+      // ABI v9: scheduler admission policy. NULL/empty => the default fcfs.
+      if (params->scheduling_policy != nullptr &&
+          params->scheduling_policy[0] != '\0') {
+        ep.policy = vllm::SchedulerPolicyFromString(params->scheduling_policy);
+      }
+      // ABI v6: speculative-decoding config. NULL/empty => unset => the
+      // byte-identical no-speculation engine.
+      if (params->speculative_config != nullptr &&
+          params->speculative_config[0] != '\0') {
+        ep.speculative_config =
+            vllm::ParseSpeculativeConfigJson(params->speculative_config);
+      }
+      // ABI v9: external KV connector (LMCache). NULL/empty => no connector ==
+      // the inert default path. The connector NAME is validated here, mirroring
+      // the server's startup check, so a typo reports as a caller error instead
+      // of surfacing later as an opaque engine-construction failure.
+      if (params->kv_transfer_config != nullptr &&
+          params->kv_transfer_config[0] != '\0') {
+        vllm::KVTransferConfig kv_cfg =
+            vllm::ParseKVTransferConfigJson(params->kv_transfer_config);
+        if (kv_cfg.kv_connector.has_value() &&
+            !vllm::v1::kv_offload::KVConnectorFactory::IsRegistered(
+                *kv_cfg.kv_connector)) {
+          std::string msg = "unknown kv_connector \"" + *kv_cfg.kv_connector +
+                            "\" (registered connectors: ";
+          const std::vector<std::string> names =
+              vllm::v1::kv_offload::KVConnectorFactory::RegisteredNames();
+          for (size_t n = 0; n < names.size(); ++n) {
+            if (n != 0) msg += ", ";
+            msg += names[n];
+          }
+          msg += ")";
+          throw std::invalid_argument(msg);
+        }
+        ep.kv_transfer_config = std::move(kv_cfg);
+      }
+    } catch (const std::invalid_argument& e) {
+      SetError(std::string("vllm_engine_load: ") + e.what());
+      return VLLM_ERR_INVALID_ARGUMENT;
     }
     // ABI v7: tri-state prefix-caching toggle (0=model default, 1=on, 2=off).
     // 0 leaves ep.enable_prefix_caching unset (nullopt) so the model-capability
@@ -500,6 +559,9 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
     auto* handle = new vllm_engine;
     handle->loaded = std::move(loaded);
     handle->model_path = params->model_path;
+    // ABI v9: an explicit tokenizer_config.json override for the chat template.
+    if (params->tokenizer_config_path != nullptr)
+      handle->tokenizer_config_path = params->tokenizer_config_path;
     // ABI v4: copy the caller's tool-parser selection (NULL => empty => AUTO).
     if (params->tool_parser != nullptr) handle->tool_parser = params->tool_parser;
     if (params->reasoning_parser != nullptr)

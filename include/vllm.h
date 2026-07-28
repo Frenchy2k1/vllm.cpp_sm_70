@@ -64,8 +64,17 @@ extern "C" {
  * per-request custom logits-processor callback (vllm_logits_processor) invoked
  * each decode step to modify the request's logits before sampling. Mirrors
  * vLLM's SamplingParams.logits_processors and SGLang's CustomLogitProcessor.
- * NULL => no processor (the byte-identical default). */
-#define VLLM_ABI_VERSION 8
+ * NULL => no processor (the byte-identical default).
+ * v9: vllm_model_params.max_num_batched_tokens / scheduling_policy /
+ * kv_transfer_config, and tokenizer_config_path is now honoured. These close the
+ * gap between what the bundled OpenAI server can configure and what an embedder
+ * reaches through this ABI: the chunked-prefill token budget, the scheduler
+ * admission policy, and the external KV connector (LMCache `lm://`). Every one is
+ * inert at its default, so zero-filling the struct growth keeps the pre-v9
+ * engine byte-identical. Malformed speculative_config / kv_transfer_config
+ * documents now report VLLM_ERR_INVALID_ARGUMENT (a caller error) rather than
+ * VLLM_ERR_MODEL_LOAD, matching what v6 already documented. */
+#define VLLM_ABI_VERSION 9
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -109,7 +118,10 @@ typedef struct vllm_model_params {
   /* Supported model directory or GGUF file. Required. */
   const char* model_path;
   /* Optional override for tokenizer_config.json; NULL => <model_path>/
-   * tokenizer_config.json (unused at T0 blocking-complete, reserved). */
+   * tokenizer_config.json. Honoured since ABI v9: it selects the file the chat
+   * entry points read `chat_template` from, mirroring the server's
+   * --tokenizer-config. Ignored for a .gguf model_path, whose template comes
+   * from the GGUF `tokenizer.chat_template` metadata. */
   const char* tokenizer_config_path;
   /* KV-cache block size (tokens per block). <= 0 => 32. */
   int32_t block_size;
@@ -164,6 +176,35 @@ typedef struct vllm_model_params {
    * exactly this field — there is no distinct radix code path. Any value other
    * than 0/1/2 fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. */
   int32_t enable_prefix_caching;
+  /* ── Chunked-prefill token budget (ABI v9) ─────────────────────────────────
+   * The per-step token budget the scheduler admits (vLLM's
+   * --max-num-batched-tokens). <= 0 => the bounded PER-ARCH default: 2048 flat
+   * for a dense arch (vLLM's own DEFAULT_MAX_NUM_BATCHED_TOKENS), 8192/4096 for
+   * MoE depending on max_num_seqs. Raising it lets more prefill land in one
+   * step at the cost of decode latency behind it (and, on the hybrid archs, a
+   * larger per-step GDN activation — the reason the default does not scale with
+   * max_num_seqs). Constrained to >= max_num_seqs by the scheduler. */
+  int32_t max_num_batched_tokens;
+  /* ── Scheduler admission policy (ABI v9) ───────────────────────────────────
+   * One of "fcfs" (arrival order, the default), "priority" ((priority,
+   * arrival_time) ordering — requests then carry a `priority` field), or "lpm"
+   * (SGLang's cache-aware longest-prefix-match ordering; output-neutral, and it
+   * degrades to fcfs when prefix caching is off since there is no cache to match
+   * against). NULL or "" => "fcfs". An unknown name fails vllm_engine_load with
+   * VLLM_ERR_INVALID_ARGUMENT. Borrowed for the call only. */
+  const char* scheduling_policy;
+  /* ── External KV connector / LMCache (ABI v9) ──────────────────────────────
+   * The JSON object vLLM's --kv-transfer-config takes, selecting an external
+   * KV-cache connector, e.g.
+   *   {"kv_connector":"LMCacheConnector","kv_role":"kv_both",
+   *    "kv_connector_extra_config":{"host":"127.0.0.1","port":65432}}
+   * NULL or "" => NO connector == the byte-identical default engine. A malformed
+   * document, an unknown role, or a connector name that is not registered in
+   * this build fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT; a
+   * connector whose worker half cannot move bytes on this device is refused at
+   * engine construction (VLLM_ERR_MODEL_LOAD). `kv_role` is REQUIRED whenever
+   * `kv_connector` is set. Borrowed for the call only. See docs/KV-OFFLOAD.md. */
+  const char* kv_transfer_config;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────
