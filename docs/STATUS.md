@@ -409,6 +409,19 @@ kernel campaign). The other fan-out boards remain build-supported only (no board
 here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
 
+**GDN Triton-AOT cubins are now vendored per-arch (2026-07-28).** The vendored
+Triton-AOT GDN fast-path cubins (the measured codegen-win packed decode plus the
+delta_h/chunk_o FLA kernels for the Qwen3.6 GDN-hybrid models) previously existed
+for GB10 `sm_121a` ONLY. Because a cubin loads only on the SM it was compiled for
+and the cross-family arch builds ship `-DVLLM_CPP_TRITON=OFF`, GDN decode on the
+other arches ran the slower spilling hand kernel. The full GDN AOT set is now
+regenerated and vendored for `sm_80/86/89/90a/100a` (`cuobjdump` shows real
+per-target SASS), so a `-DVLLM_CPP_TRITON=ON` single-arch build on those arches
+selects the non-spilling path too — **DERIVED+BUILD-VERIFIED (testing-welcome):
+no non-`sm_121` board runs a GDN model here, so this is not a runtime
+GDN-decode-parity claim on any arch.** `sm_121a` is byte-unchanged (SACRED gate
+intact). Evidence: [.agents/specs/triton-aot-per-arch.md](../.agents/specs/triton-aot-per-arch.md).
+
 **As of 2026-07-28, `sm_87` is also RUNTIME-VERIFIED (portable bf16 SYNC path) on
 real silicon — the SECOND non-GB10 runtime proof.** vllm.cpp was built
 portable-only for `sm_87` on an NVIDIA Jetson AGX Orin (Tegra R36.4.3 / JetPack 6,

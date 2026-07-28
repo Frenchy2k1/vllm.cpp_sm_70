@@ -30966,3 +30966,53 @@ ledger. Records-only; no build/GPU/download/benchmark.
   `docs/BENCHMARKS.md`, `parity-ledger.md`, this entry. Residuals: MHC (W5),
   sqrtsoftplus/hash MoE (W6), device kernel + forward integration (W7), full strict
   gate (W8) = multi-Spark. NEXT: W4/W5/W6 per the spec once ≥2 Sparks / offload stands up.
+- **2026-07-28 (later)** — **Per-arch Triton-AOT GDN packed-decode cubins landed
+  (`CLAIM-TRITON-AOT-PER-ARCH`, base `main` `308c312a` confirmed via
+  `git rev-parse HEAD`; isolated worktree `agent-a136dd3a01293a3dd`; NOT pushed).**
+  HONEST GAP CORRECTED: the vendored Triton-AOT GDN fast-path cubins (the MEASURED
+  codegen-win packed decode — Triton REG:205/0-spill vs hand-CUDA REG:255+STACK:48
+  spills — plus the delta_h/chunk_o/kkt/tril/wu FLA set) existed for `sm_121a`
+  ONLY. Because a cubin loads only on its compiled SM and every cross-family arch
+  build ships `-DVLLM_CPP_TRITON=OFF` (portable-kernels-only), GDN decode on
+  `sm_80/86/89/90a/100a` ran the SPILLING hand kernel — the Triton-AOT GDN-decode
+  parity was `sm_121`-runtime-only, NOT at parity on any other arch.
+- **The deliverable.** Regenerated the WHOLE GDN AOT set (one configure per arch
+  regenerates decode+deltah+chunko[+bf16]+kkt+tril+wu, h48+h32) for
+  `sm_80/86/89/90a/100a` on dgx GB10 via the sanctioned pipeline
+  (`-DVLLM_CPP_TRITON_REGEN=ON -DVLLM_CPP_TRITON_VENDORED_ARCH=sm_XX`, Triton
+  3.6.0 / bundled ptxas 12.8). ptxas is a cross-compiler + AOT compile does no
+  autotuning, so the cubins were cross-compiled with NO target board present and
+  NO GPU execution. Each arch = 57 artifacts + MANIFEST matching the `sm_121a`
+  fileset (verified). Vendored into `src/vt/cuda/triton_aot_vendored/sm_XX/`.
+- **Dispatch = build-time selection, already additive.**
+  `cmake/TritonAOT.cmake::_triton_aot_arch_name` derives the vendored subdir as
+  `sm_${VLLM_CPP_CUDA_ARCHITECTURES}` and `_triton_aot_resolved_target` derives
+  `cuda:<cc>:32`; dropping a new `sm_XX/` tree makes a
+  `-DVLLM_CPP_CUDA_ARCHITECTURES=XX -DVLLM_CPP_TRITON=ON` build select the
+  non-spilling FLA path with ZERO code change. No `cuda_gdn.cu`/CMake edits.
+- **Proof.** `cuobjdump --dump-elf` shows real per-target SASS
+  (`sm=80/86/89/90/100`), nvdisasm `EF_CUDA_SM80/86/89`, decode `SHI_REGISTERS`
+  209–217 / 0-spill (all under the hand-CUDA spill floor, so the codegen-win
+  rationale carries — build-verified). Builder-path configure (no REGEN) selects +
+  integrity-verifies both `sm_121a` (unchanged) and the new trees
+  (`Triton AOT: … <- vendored … (no Python)`); the generated AOT C compiles clean;
+  `check-triton-aot-drift.sh` rc=0 across all six trees. **`sm_121a` is git
+  byte-identical to base — the SACRED 27B/35B GDN gate is structurally unchanged
+  (same cubin bytes, loaders, dispatch); no full sm_121a rebuild was re-run
+  because the change adds ZERO inputs to a `sm_121a` build (the new trees are
+  selected only by their own arch) and HEAD is already green.**
+- **HONEST SIGNAL: DERIVED+BUILD-VERIFIED (testing-welcome).** No non-`sm_121`
+  board runs a GDN-hybrid model here, so GDN-decode parity on `sm_80/86/89/90a/
+  100a` is BUILD-VERIFIED (real SASS + selection + clean compile), NOT
+  runtime-measured. The only measured GDN-decode codegen win is the GB10 `sm_121a`
+  number. Residual: runtime GDN-model verification on Ampere/Ada/Hopper/DC-Blackwell
+  silicon when reachable.
+- **Records:** `.agents/specs/triton-aot-per-arch.md` (NEW — gap + regen recipe +
+  per-arch status table + honest signal), `kernel-matrix.md` (per-arch AOT
+  checkpoint + `KERNEL-CUDA-DISPATCH-AOT` "only SM121" correction),
+  `backend-matrix.md` (intro gap-correction), `feature-matrix.md` (GDN row),
+  `roadmap_v1.md` (`ROAD-V1-D1-GDN-AOT`), `coordination.md`
+  (`CLAIM-TRITON-AOT-PER-ARCH`), `docs/STATUS.md` + `docs/BENCHMARKS.md`,
+  `parity-ledger.md` + this entry. All 6 record checkers rc=0. dgx
+  `~/aot-regen-308c312a` pruned (disk 436G free after), local-ai-worker left Up
+  as-found. NOT pushed.
