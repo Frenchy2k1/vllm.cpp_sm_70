@@ -29525,3 +29525,42 @@ working as designed. (3) The competitor's low ITL can be an artifact of its OWN
 weakness (a 33 s admission queue starving its decode batch), not a strength to
 chase — always derive effective concurrency (tput÷per-stream-rate) before treating
 a latency number as a target.
+
+## 2026-07-28 — `CPU-SPEC-DIVERGENCE`: widening cleared, one-line prime suspect named
+
+**Discriminator: `ngram`.** It sets a SpeculativeConfig and widens the same conv
+cache, but loads no head and reads no `nextn` tensors. Its spec-ON output is
+**token-EXACT** to spec-OFF, and instrumentation shows `CausalConv1dSpecUpdate`
+is **never called** in that run.
+
+    widened cache alone (ngram)                          EXACT
+    spec conv/state update EXECUTING (mtp, 0 accepted)   DIVERGES
+
+So the widening is innocent; the defect is in the GDN conv state prepared for and
+consumed by the spec update. Third independent confirmation that neither the MTP
+head weights nor the GGUF loader are involved. The ngram case is kept as a
+permanent regression guard in `tests/parity/test_qwen35_gguf_spec_decode.cpp`.
+
+**Prime suspect, one line.** `src/vllm/model_executor/models/qwen3_5.cpp:3616`:
+
+    const int64_t conv_row_elems = conv_dim * (Kw - 1);
+
+Width-based, but the speculative persistent row is
+`conv_dim * ((Kw-1) + num_spec)` (measured state_len=4 vs width=3 on the 2B). It
+is the per-slot extent for `GatherStateF32`/`ScatterStateF32` (`:3666`, `:3673`,
+`:3698`, `:3702`), which move a CONTIGUOUS block. A contiguous `conv_dim*3` prefix
+of a physically `conv_dim*4` row lines up only for channel 0; every later channel
+is off by a growing offset. That is a corrupted post-prefill recurrent state,
+which is precisely the symptom (prefill token correct, first decode token wrong).
+
+**Deliberately NOT fixed here.** The working copy is legitimately narrow (prefill
+produces K-1 taps), so the repair is to make gather/scatter STRIDE-AWARE - copy
+`width` taps per channel across a `state_len`-strided row - not to resize a
+constant. That touches shared GDN state movement on every path, and this session
+could not gate the non-spec paths it would affect. It stays byte-identical when
+`state_len == width` by construction, but "by construction" is not a gate.
+
+**Order of work for whoever takes it:** run the leading-taps equality probe
+first (dump one conv_state row either side of the prefill scatter, spec-ON vs
+spec-OFF), so the fix is verified against a measurement rather than against this
+reasoning. The reasoning is strong; it is still reasoning.

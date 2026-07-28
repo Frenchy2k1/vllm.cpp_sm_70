@@ -2617,6 +2617,9 @@ attempted and REVERTED as a no-op rather than shipped unverified. Still
 `benchmark_binding=false`: a throughput figure on a diverging path would be
 meaningless, and the next step is a correctness probe (dump one conv_state row
 either side of the prefill scatter, spec-ON vs spec-OFF), not a measurement.
+An `ngram` discriminator (widens the cache, never runs the spec conv update) is
+token-EXACT, which clears the widening and the MTP head both, and is retained as
+a regression guard.
 
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 
