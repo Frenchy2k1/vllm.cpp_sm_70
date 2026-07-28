@@ -3,6 +3,7 @@
 // C ABI. Mirrors the M1.8 LLMEngine __init__ (vllm/v1/engine/llm_engine.py @
 // e24d1b24) as exercised by examples/server/main.cpp and the test harness.
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/model_executor/models/qwen3_dflash_gguf.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -113,8 +114,19 @@ bool EnvironmentEnabled(const char* name) {
 // Resolve the DFlash draft path: a local directory (with config.json) is used
 // as-is; an HF repo id ("z-lab/Qwen3.6-27B-DFlash") resolves to the newest
 // ~/.cache/huggingface/hub/models--<org>--<name>/snapshots/<hash>/ dir.
+// True when `path` names a DFlash draft packaged as a single `dflash`-arch GGUF
+// rather than a safetensors directory (SPEC-DFLASH-GGUF GD3). Checked before the
+// config.json probe because a .gguf file has no config.json and would otherwise
+// fall through to the HF-cache search and be reported as "not found".
+bool IsDflashGgufDraft(const std::string& path) {
+  std::error_code ec;
+  return fs::is_regular_file(path, ec) &&
+         fs::path(path).extension() == ".gguf";
+}
+
 std::string ResolveDflashDraftDir(const std::string& path) {
   std::error_code ec;
+  if (IsDflashGgufDraft(path)) return path;
   if (fs::exists(fs::path(path) / "config.json", ec)) return path;
   // HF repo id -> local cache snapshot.
   std::string slug = "models--";
@@ -203,6 +215,32 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
   }
   const std::string draft_dir = ResolveDflashDraftDir(*spec.draft_model_path);
   std::error_code ec;
+  // GGUF draft (SPEC-DFLASH-GGUF axis A): config + weights both come out of the
+  // single file. The target-shared embed/lm_head still come from *target_shards*
+  // below, exactly as for a safetensors draft - the GGUF DFLASH arch omits
+  // token_embd/output precisely because the draft shares the target's.
+  if (IsDflashGgufDraft(draft_dir)) {
+    vllm::GgufFile dg = vllm::GgufFile::Open(draft_dir);
+    auto draft = std::make_unique<DflashDraft>();
+    draft->config = vllm::MakeDflashGgufConfig(dg);
+    draft->k = spec.ResolvedNumSpeculativeTokens();
+    const nlohmann::json& dcfg = draft->config.raw.at("dflash_config");
+    const int64_t num_taps =
+        static_cast<int64_t>(dcfg.at("target_layer_ids").size());
+    const int32_t mask_id = dcfg.at("mask_token_id").get<int32_t>();
+    draft->weights = vllm::LoadQwen3DFlashFromGguf(dg, draft->config, num_taps,
+                                                   mask_id);
+    draft->weights.embed_tokens =
+        LoadNamedBf16(target_shards, "model.language_model.embed_tokens.weight", false);
+    draft->weights.lm_head = LoadNamedBf16(target_shards, "lm_head.weight", true);
+    VT_CHECK(!draft->weights.embed_tokens.Empty() && !draft->weights.lm_head.Empty(),
+             "dflash gguf: target embed_tokens/lm_head (bf16) not found in target shards");
+    draft->weights.draft_vocab_size = draft->weights.lm_head.shape[0];
+    std::cerr << "vllm.cpp: DFlash draft loaded from GGUF " << draft_dir
+              << " (k=" << draft->k << ", taps=" << num_taps
+              << ", mask=" << mask_id << ")\n";
+    return draft;
+  }
   if (!fs::exists(fs::path(draft_dir) / "config.json", ec)) {
     throw std::runtime_error("dflash: draft checkpoint not found at " + draft_dir +
                              " (from \"" + *spec.draft_model_path + "\")");

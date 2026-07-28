@@ -249,9 +249,9 @@ gates.
 | Row | Work | Gate | Blocked by |
 |---|---|---|---|
 | `GD0` | **DONE 2026-07-28 - contract CONFIRMED against a real file**, `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` Q4_K_M (1.03 GB, fetched; no local conversion run was needed, contrary to the original plan). Verified dump below. Every name and KV in Upstream chain holds, and two gaps in it are now closed: `dflash.block_size` IS emitted as its own KV, and `dflash.target_hidden_size` is NOT emitted by this converter (llama.cpp declares the key; do not require it) | Evidence-backed | - |
-| `GD1` | `MakeDflashGgufConfig` + KV unit tests | Config unit tests, RED-first | `GD0` |
-| `GD2` | `MakeDflashGgufResolver` + shared dequant cache | Resolver unit tests; gate 2 | `GD0` |
-| `GD3` | `ResolveDflashDraftDir` accepts a `.gguf`; `LoadDflashDraft` branches | Path-discrimination test | `GD1`, `GD2` |
+| `GD1` | **DONE 2026-07-28.** `MakeDflashGgufConfig` (`src/vllm/model_executor/models/qwen3_dflash_gguf.cpp`) builds the draft HfConfig from the `dflash.*` KVs, undoing the +1 target-layer offset and rebuilding `raw["dflash_config"]` + `raw["block_size"]` so downstream `config.raw` readers are unchanged. `vocab_size` deliberately left 0 (the draft shares the target's lm_head). | Config unit tests, RED-first | `GD0` |
+| `GD2` | **DONE 2026-07-28.** `LoadQwen3DFlashFromGguf` via a `TensorResolver` over dequantized bf16 views, delegating to the EXISTING `LoadQwen3DFlash` so its qkv / gate_up row concatenation is reused unchanged. The resolver seam is correct HERE (unlike the MTP head) precisely because dflash norms are RAW and the draft is small enough to dequant wholesale. | Resolver unit tests; gate 2 | `GD0` |
+| `GD3` | **DONE 2026-07-28.** `IsDflashGgufDraft` + the `.gguf` branch in `ResolveDflashDraftDir` / `LoadDflashDraft` (`src/vllm/entrypoints/model_loader.cpp`). Target-shared embed/lm_head still come from `target_shards`, so axis A is complete. | Path-discrimination test | `GD1`, `GD2` |
 | `GD4` | Axis-A token + acceptance gate | Gates 3, 5 | `GD3` |
 | `GD5` | `SharedHeadSource` + its equivalence test | Gate 7 | `GD4` |
 | `GD6` | Drop `dflash` from the GGUF rejection; wire the GGUF branch | Gate 1 | `GD5` |
