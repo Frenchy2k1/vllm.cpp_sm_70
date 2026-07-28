@@ -118,6 +118,28 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**`--prefix-match-unit` (fine-grained prefix-cache matching unit) — W0 spike +
+W1 resolver (2026-07-28, `CLAIM-PREFIX-MATCH-UNIT`, LANDED + CPU-GATED, NOT
+pushed; FULL SHA reported to caller).** Base `main` HEAD `646add3c`; isolated
+worktree off it; branch `feat/prefix-match-unit`; CPU-only Release `-Werror`
+build. Row `KV-PREFIX-MATCH-UNIT` (engine-matrix). Ports the 0.26-new
+`prefix_match_unit`/`--prefix-match-unit` knob semantics: `resolve_kv_cache_block_sizes`
+(vLLM `kv_cache_utils.py:626-688`) computing `(scheduler_block_size,
+hash_block_size)`, where `hash_block_size` is the matching unit
+(`prefix_match_unit` if set else `gcd(group_block_sizes)`). W1 = resolver +
+RED-first unit tests (default gcd `!=` `=16` override; hasher granularity coarse
+2 vs fine 4). **Owns ONLY** (all NEW except the two shared-TU appends):
+`.agents/specs/prefix-match-unit.md` (NEW), `tests/vllm/v1/test_prefix_match_unit.cpp`
+(NEW), append-only additions to `src/vllm/v1/core/kv_cache_utils.cpp` +
+`include/vllm/v1/core/kv_cache_utils.h` (a NEW free function + decl, no existing
+symbol touched), one line in `tests/CMakeLists.txt`, this note + the
+`KV-PREFIX-MATCH-UNIT` engine-matrix row + `feature-matrix.md` row +
+`roadmap_v1.md` + `docs/STATUS.md` + `docs/BENCHMARKS.md` (PENDING) +
+`parity-ledger.md` + `state.md`. Touches NO scheduler/block_pool/model_loader/ABI
+(those are W2/W3, some shared with `KV-BLOCK-POOL`/`CLAIM-KV-PERSISTENCE-LMCACHE`
+— coordinate before touching). No counted checker constant bumped. NO
+README/Metal. DONE for W0+W1 — records + code committed.
+
 **vLLM feature-gap analysis — whole-surface sweep (2026-07-28,
 `CLAIM-FEATURE-GAP-SPIKE`, records-only, NOT pushed; FULL SHA reported to caller).**
 Base `main` HEAD `308c312a`; isolated worktree

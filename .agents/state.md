@@ -31497,3 +31497,21 @@ DeepSeek-V4 + Kimi-K3 loaders drop their MXFP4 refusal.
   kernels + a token-exact multi-LoRA model gate vs the vLLM oracle + throughput
   parity. First resume cmd: `cmake --build .claude/worktrees/lora-adapter/build-cpu
   --target test_punica_cpu && ./.claude/worktrees/lora-adapter/build-cpu/tests/test_punica_cpu`.
+- **2026-07-28** — **`--prefix-match-unit` W0 spike + W1 resolver** (`CLAIM-PREFIX-MATCH-UNIT`,
+  row `KV-PREFIX-MATCH-UNIT`, branch `feat/prefix-match-unit` off `main`
+  `646add3c`, isolated worktree, CPU-only, NOT pushed). Investigated the 0.26-new
+  `prefix_match_unit`/`--prefix-match-unit` knob in pinned vLLM `555967922`: it is
+  the finest token boundary a prefix-cache hit can land on == the `hash_block_size`
+  the block hasher uses; `resolve_kv_cache_block_sizes` (`kv_cache_utils.py:626-688`)
+  computes it as `prefix_match_unit if set else gcd(group_block_sizes)` for
+  hybrid/multi-group models (single-group models ignore it), backing off to the
+  scheduler block size when no cache/connector consumer or a mamba group diverges
+  (mamba_cache_mode != align), throwing on a non-divisible unit. Landed W0 spec
+  `.agents/specs/prefix-match-unit.md` + W1 the resolver (additive free function in
+  `kv_cache_utils.{cpp,h}`, no existing symbol touched; scheduler still passes
+  `block_size`, so default path byte-identical) + `tests/vllm/v1/test_prefix_match_unit.cpp`
+  8/8 (29 asserts, RED-first default-gcd-vs-16). CPU `-Werror` clean;
+  `test_kv_cache_utils`/`_coordinator`/`test_block_pool` no-regression; four record
+  checkers rc=0. RESIDUAL (named): W2 config/CLI/ABI field, W3 scheduler threading
+  of `hash_block_size != block_size` + mamba partial-tail stop (blocked on the
+  `KV-BLOCK-POOL` align path that still throws in `block_pool.cpp`), W4 benchmark.

@@ -25,6 +25,17 @@ packed int32 + randomized double-precision roundtrip). A dequant primitive not
 yet wired to a loader or GPU GEMM owes no throughput number; the performance gate
 is W4 (Marlin GPU compute vs vLLM on the same workload). Spike:
 [`.agents/specs/awq-gptq-quant.md`](../.agents/specs/awq-gptq-quant.md).
+## `--prefix-match-unit` fine-grained matching unit (2026-07-28, `CLAIM-PREFIX-MATCH-UNIT`) - PENDING (W1 resolver + CPU unit gate only)
+
+No throughput number yet. W1 landed `resolve_kv_cache_block_sizes` (the
+`prefix_match_unit` -> `hash_block_size` semantics) + a CPU unit gate
+(`tests/vllm/v1/test_prefix_match_unit.cpp`, 8/8, 29 assertions, RED-first:
+default gcd `!=` `=16`). The real matching-unit effect (hit-rate + TTFT/throughput
+A/B on a hybrid model, finer unit enabling intra-block prefix-cache hits) is a
+NAMED later brick (W4) that requires the scheduler threading of a resolved
+`hash_block_size != block_size` (W3, blocked on the `KV-BLOCK-POOL` align path
+that still throws). Reproduce W1: `cmake -DVLLM_CPP_CUDA=OFF ...` then
+`ctest -R test_prefix_match_unit`. PENDING until W3/W4.
 
 ## vLLM feature-gap analysis (2026-07-28, `CLAIM-FEATURE-GAP-SPIKE`) - NOT-APPLICABLE (records-only spike)
 

@@ -138,7 +138,12 @@ ENGINE_PREFIXES = (
 # spec `specs/pooling-task-class.md`. Bumped for a real new row, never to make a
 # failing state transition pass. (`SERVE-POOLING-ENDPOINTS` INVENTORIED→SPIKE in
 # the same change is a state move on the existing row, not a new row.)
-ENGINE_ROWS = 125
+# 126 since 2026-07-28: +`KV-PREFIX-MATCH-UNIT` (`--prefix-match-unit` / config
+# `prefix_match_unit`, NEW in vLLM 0.26). A distinct capability: the fine-grained
+# prefix-cache matching unit (`resolve_kv_cache_block_sizes` -> `hash_block_size`),
+# not covered by the `KV-PREFIX-CACHE` block-hash row (which hashes at
+# `block_size`). W0 spike + W1 resolver landed; `PARTIAL`.
+ENGINE_ROWS = 126
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
