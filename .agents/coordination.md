@@ -118,6 +118,38 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**C8 JSON-schema tool-arg type coercion note (2026-07-28, `CLAIM-C8-ARG-COERCION`,
+LANDED + CPU-GATED, NOT pushed — FULL SHA reported to caller).** Closes the
+`ROAD-V1-C8` parser-correctness residual `_fix_arg_types` on base local `main`
+`6925aec7`, isolated worktree `.claude/worktrees/agent-abac4e98f77f088e8`. Ported
+1:1 FROM `vllm/parser/engine/parser_engine.py:365` (`_fix_arg_types`), `:269`/`:227`
+(`_coerce_dict`/`_coerce_value`), `:348` (`_streamable_string_keys`), and
+`vllm/tool_parsers/utils.py:271` (`find_tool_properties`) — reusing the
+ALREADY-ported `extract_types_from_schema`/`coerce_to_schema_type`
+(`tool_parsers/utils.cpp`, priority null>int>number>bool>object>array>string, alias
+map, `_is_json_finite` rejection). `ParserTool` gains the function `parameters`
+JSON-schema, threaded from `serving_chat.cpp` `ToParserRequest`; both streaming
+(`parse_delta`, per-tick coercion + `_streamable_string_keys` held-back string
+keys) and one-shot (`extract_tool_calls`/`parse`) coerce the assembled
+`tool_calls[].function.arguments` to the declared types (int/number/bool/string/
+array/null; uncoercible values + non-object args left as-is). With no schema / no
+tools it is IDENTITY (byte-identical). Additive: `parser_engine.{h,cpp}` (recursive
+coercion + `find_tool_properties`) + `serving_chat.cpp` schema threading; NO other
+TU touched; the streaming engine ignores the new fields. Gate
+`test_parser_engine_assembly` extended to 30 scenarios / 5038 asserts (27-30: qwen3
+typed-schema whole+char, qwen3 schema-mismatch + nullable, kimi_k2 JSON-native
+`"5"`->int in the converter-less extract path — streaming raw / extract coerced,
+divergence gated); RED-first 38 asserts, first boundary
+`qwen3_typed_schema_wholedelta extract tc[0] arguments` (`{"days": "5", …}` vs
+coerced `{"days": 5, "unit": "celsius", "active": true, "temp": 3.14,
+"tags": [1, 2, 3]}`). No-schema inertness: the 26 prior scenarios + `test_streaming_parser_engine`
+586/586 + `test_openai_serving_chat_stream` 210/210 UNCHANGED (`.inc` diff = pure
+insertions). CPU `-Werror` 0-warn clean full-library build. Goldens byte-reproduced
+by the extended `tools/parity/dump_parser_engine_assembly.py` (real coercion oracle
+copied verbatim from the pin). Row `TOOLS-STREAMING-PARSER` stays `ACTIVE`. Did NOT
+touch model/kernel source, README, Metal/demo, or the metrics/response-timing rows
+(a concurrent session owns README/Metal/demo).
+
 **SGLang SW2 in-batch prefix-collision de-prioritization note (2026-07-27,
 `CLAIM-SGLANG-SW2`, LANDED + CPU-GATED, NOT pushed — FULL SHA reported to
 caller).** Ports the named SW1 residual on base local `main` `cc5d2348`,

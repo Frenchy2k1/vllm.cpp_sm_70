@@ -408,6 +408,36 @@ diff is pure insertions). Reproduce:
 cmake --build build-cpu --target test_parser_engine_assembly &&
 ./build-cpu/tests/test_parser_engine_assembly`.
 
+**ROAD-V1-C8 JSON-schema tool-arg type coercion (2026-07-28,
+`CLAIM-C8-ARG-COERCION`, NOT pushed).** Disposition: **NOT APPLICABLE (no
+throughput number owed; CORRECTNESS gate, `benchmark_binding=false`).** Argument
+type coercion is a pure function of the assembled arguments JSON and the tool's
+JSON-schema, so it is gated EXACTLY (field-for-field), not by any speed number.
+When a request's tools declare typed parameters, the assembled
+`tool_calls[].function.arguments` are coerced to the declared JSON types
+(int/number/bool/string/array/null) 1:1 with vLLM 0.26 `_fix_arg_types`
+(priority null > integer > number > boolean > object > array > string;
+uncoercible values and non-object args left as-is), in BOTH streaming
+(`parse_delta`, with `_streamable_string_keys` deciding which string values may
+stream open) and one-shot (`extract_tool_calls`/`parse`); with no schema the
+arguments pass through as strings unchanged (byte-identical). The tool
+`parameters` schema is threaded from the OpenAI serving layer into the parser.
+`test_parser_engine_assembly` 3 cases / 5038 assertions on CPU (was 4526), 30
+scenarios (adds scenarios 27-30: qwen3 typed-schema whole-delta AND char-by-char,
+qwen3 schema-mismatch + nullable, kimi_k2 JSON-native `"5"`->int in the
+converter-less extract path where streaming stays raw and extract coerces).
+RED-first: reverting the coercion to identity fails 38 assertions, first boundary
+`qwen3_typed_schema_wholedelta extract tc[0] arguments` (identity
+`{"days": "5", …}` vs coerced `{"days": 5, "unit": "celsius", "active": true,
+"temp": 3.14, "tags": [1, 2, 3]}`); restoring returns 5038/5038. Inertness: the 26
+prior scenarios, engine-core `test_streaming_parser_engine` 586/586, and
+serving-SSE `test_openai_serving_chat_stream` 210/210 all UNCHANGED byte-identical
+(no-schema path is identity; the goldens `.inc` diff is pure insertions).
+Reproduce:
+`VLLM_SOURCE=/path/to/vllm python3 tools/parity/dump_parser_engine_assembly.py --out tests/vllm/parser/engine/test_parser_engine_assembly_goldens.inc &&
+cmake --build build-cpu --target test_parser_engine_assembly &&
+./build-cpu/tests/test_parser_engine_assembly`.
+
 **ROAD-V1-C7 sampling controls + logprobs (2026-07-27, `CLAIM-ROADMAP-C7`, NOT
 pushed).** Disposition: **CORRECTNESS gate, no throughput number
 (`benchmark_binding=false`).** A sampling transform is a pure function of

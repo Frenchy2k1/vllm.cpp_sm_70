@@ -3,16 +3,105 @@
 
 #include <cctype>
 #include <regex>
+#include <set>
 #include <string>
 #include <tuple>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/entrypoints/openai/tool_parsers/utils.h"
 #include "vllm/parser/engine/py_json.h"
 
 namespace vllm::parser::engine {
 
 namespace {
+
+namespace oai = vllm::entrypoints::openai;
+
+// Python-type category of a JSON value, used to model parser_engine.py:264
+// `type(coerced) is not type(value)`: CPython has a single `int` type, so
+// nlohmann's number_integer / number_unsigned collapse to one rank (bool is a
+// distinct Python type from int, mirroring isinstance semantics here).
+int py_type_rank(const nlohmann::json& v) {
+  if (v.is_boolean()) return 1;
+  if (v.is_number_integer() || v.is_number_unsigned()) return 2;
+  if (v.is_number_float()) return 3;
+  if (v.is_string()) return 4;
+  if (v.is_null()) return 5;
+  if (v.is_array()) return 6;
+  if (v.is_object()) return 7;
+  return 0;
+}
+
+std::pair<nlohmann::ordered_json, bool> coerce_value(
+    const nlohmann::ordered_json& value, const nlohmann::json& schema);
+
+// parser_engine.py:269 _coerce_dict — coerce every value in `args` whose key has
+// a schema-object property. Mutates `args`; returns whether anything changed.
+bool coerce_dict(nlohmann::ordered_json& args, const nlohmann::json& properties) {
+  bool changed = false;
+  for (auto it = args.begin(); it != args.end(); ++it) {
+    if (!properties.is_object() || !properties.contains(it.key())) continue;
+    const nlohmann::json& prop = properties.at(it.key());
+    if (!prop.is_object()) continue;  // properties.get(key) not a dict -> skip
+    auto [coerced, val_changed] = coerce_value(it.value(), prop);
+    if (val_changed) {
+      it.value() = std::move(coerced);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// parser_engine.py:227 _coerce_value — coerce a single value against its schema,
+// recursing into nested object `properties` and array `items`.
+std::pair<nlohmann::ordered_json, bool> coerce_value(
+    const nlohmann::ordered_json& value, const nlohmann::json& schema) {
+  if (value.is_string()) {
+    const std::set<std::string> types = oai::extract_types_from_schema(schema);
+    nlohmann::ordered_json coerced =
+        oai::coerce_to_schema_type(value.get<std::string>(), types);
+    // Upstream tests `coerced is not value`: coerce_to_schema_type returns the
+    // SAME string only for the string candidate / parse-failure fallback, so a
+    // string result whose content equals the input means "unchanged".
+    const bool changed =
+        !(coerced.is_string() && coerced.get<std::string>() == value.get<std::string>());
+    if (changed) return {std::move(coerced), true};
+    return {value, false};
+  }
+  if (value.is_object()) {
+    if (schema.contains("properties") && schema.at("properties").is_object()) {
+      nlohmann::ordered_json nested = value;
+      const bool changed = coerce_dict(nested, schema.at("properties"));
+      return {std::move(nested), changed};
+    }
+    return {value, false};
+  }
+  if (value.is_array()) {
+    if (schema.contains("items") && schema.at("items").is_object()) {
+      nlohmann::ordered_json arr = value;
+      bool changed = false;
+      for (auto& item : arr) {
+        auto [coerced, item_changed] = coerce_value(item, schema.at("items"));
+        if (item_changed) {
+          item = std::move(coerced);
+          changed = true;
+        }
+      }
+      return {std::move(arr), changed};
+    }
+    return {value, false};
+  }
+  // Non-string scalar (number / bool / null): re-serialize and re-coerce.
+  const std::set<std::string> types = oai::extract_types_from_schema(schema);
+  const std::string as_str = python_json_dumps(value);
+  nlohmann::ordered_json coerced = oai::coerce_to_schema_type(as_str, types);
+  if (py_type_rank(coerced) != py_type_rank(value) || coerced != value) {
+    return {std::move(coerced), true};
+  }
+  return {value, false};
+}
 
 // Python str.strip()/rstrip() over ASCII whitespace (the values the parser
 // handles are ASCII/UTF-8; whitespace boundaries are ASCII).
@@ -413,11 +502,37 @@ void ParserEngine::handle_tool_name(const SemanticEvent& event) {
   tool_slots_[static_cast<std::size_t>(event.tool_index)].name += event.value;
 }
 
+nlohmann::json ParserEngine::find_tool_properties(
+    const std::string& func_name) const {
+  // tool_parsers/utils.py:271 — return the named tool's parameters.properties,
+  // else an empty object.
+  for (const ParserTool& t : tools_) {
+    if (t.name != func_name) continue;
+    if (!t.parameters.has_value()) return nlohmann::json::object();
+    const nlohmann::json& params = *t.parameters;
+    if (!params.is_object() || !params.contains("properties"))
+      return nlohmann::json::object();
+    const nlohmann::json& props = params.at("properties");
+    if (!props.is_object()) return nlohmann::json::object();
+    return props;
+  }
+  return nlohmann::json::object();
+}
+
 std::optional<std::vector<std::string>> ParserEngine::streamable_string_keys(
-    const std::string& /*func_name*/) const {
-  // find_tool_properties(...) is always {} here (no tool schema modeled), and
-  // _streamable_string_keys({}) -> None. RESIDUAL: schema-driven key set.
-  return std::nullopt;
+    const std::string& func_name) const {
+  // parser_engine.py:348 _streamable_string_keys — no schema (empty properties)
+  // yields None (all string values keep their JSON string form); otherwise the
+  // set of keys whose schema type is EXACTLY {"string"} (safe to stream before
+  // the value closes, since coercion won't change their serialized form).
+  const nlohmann::json props = find_tool_properties(func_name);
+  if (!props.is_object() || props.empty()) return std::nullopt;
+  std::vector<std::string> keys;
+  for (auto it = props.begin(); it != props.end(); ++it) {
+    const std::set<std::string> types = oai::extract_types_from_schema(it.value());
+    if (types.size() == 1 && *types.begin() == "string") keys.push_back(it.key());
+  }
+  return keys;
 }
 
 bool ParserEngine::is_valid_tool_name(const std::string& name) const {
@@ -604,9 +719,20 @@ std::optional<std::string> ParserEngine::flush_arg_converter(int idx) {
 
 std::string ParserEngine::fix_arg_types(const std::string& args_json,
                                         const std::string& func_name) const {
+  // parser_engine.py:365 _fix_arg_types. No tools / no name / unparseable /
+  // non-object / no schema all pass the raw string through unchanged (identity);
+  // only a successful, schema-changed coercion is re-serialized.
   if (tools_.empty() || func_name.empty()) return args_json;
-  // find_tool_properties(...) == {} (no schema modeled) -> unchanged.
-  // RESIDUAL: JSON-schema coercion when a tool schema is supplied.
+  nlohmann::ordered_json args;
+  try {
+    args = nlohmann::ordered_json::parse(args_json);
+  } catch (const std::exception&) {
+    return args_json;
+  }
+  if (!args.is_object()) return args_json;
+  const nlohmann::json properties = find_tool_properties(func_name);
+  if (!properties.is_object() || properties.empty()) return args_json;
+  if (coerce_dict(args, properties)) return python_json_dumps(args);
   return args_json;
 }
 

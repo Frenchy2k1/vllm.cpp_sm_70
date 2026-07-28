@@ -50,7 +50,9 @@ EXACTLY: our per-delta `DeltaMessage` sequence AND the one-shot
 `extract_tool_calls` result equal, field-for-field, the vLLM 0.26 assembly's for
 the identical stream.
 
-- **3 cases / 4526 assertions, 26 scenarios:** scenarios 1-9 as before (qwen3
+- **3 cases / 5038 assertions, 30 scenarios** (scenarios 27-30 =
+  `CLAIM-C8-ARG-COERCION` JSON-schema arg-type coercion; see RESIDUALS below)**:**
+  scenarios 1-9 as before (qwen3
   reasoning+XML tool call whole-delta AND char-by-char, reasoning-suppressed
   `include_reasoning=false`, thinking-off plain content, two consecutive tool
   calls `tool_index` 0→1, unfinished call flushed by `finish()`, seed_oss
@@ -125,10 +127,29 @@ Plain generation (no tool parser) byte-identical.
   210/210, RED-first 6 CHECKs; goldens `tools/parity/dump_serving_chat_stream.py`).
   OFF by default (name-selected), legacy `tool_parsers` path byte-identical.
 - **JSON-schema type coercion** (`_fix_arg_types` with a non-empty tool schema,
-  `_streamable_string_keys` from properties, `find_tool_properties`) — modeled as
-  identity because no tool schema is carried; only triggers when tools with
-  schemas are supplied. `validate_tool_names` path is ported (gate configs have
-  it false).
+  `_streamable_string_keys` from properties, `find_tool_properties`) — **DONE +
+  CPU-GATED 2026-07-28 (`CLAIM-C8-ARG-COERCION`; not pushed):** `ParserTool` now
+  carries the function `parameters` JSON-schema (threaded from `serving_chat.cpp`
+  `ToParserRequest`); `_fix_arg_types` (parser_engine.py:365) + the recursive
+  `_coerce_dict`/`_coerce_value` (parser_engine.py:227,269) + `_streamable_string_keys`
+  (:348) + `find_tool_properties` (tool_parsers/utils.py:271) are ported in
+  `parser_engine.{h,cpp}`, reusing the ALREADY-ported `extract_types_from_schema` /
+  `coerce_to_schema_type` (`tool_parsers/utils.cpp`). A request whose tools declare
+  typed params has its assembled `tool_calls[].function.arguments` coerced to the
+  declared JSON types (int/number/bool/string/array/null; priority
+  null>int>number>bool>object>array>string, uncoercible values left as-is, non-object
+  args left as-is) in BOTH streaming (`parse_delta`, per-tick + held-back
+  `_streamable_string_keys` string keys) and one-shot (`extract_tool_calls`/`parse`).
+  With no schema / no tools the path is IDENTITY (byte-identical). Gate:
+  `test_parser_engine_assembly` extended to 30 scenarios / 5038 asserts (27-30: qwen3
+  typed-schema whole+char, qwen3 schema-mismatch + nullable, kimi_k2 JSON-native
+  `"5"`->int in the converter-less extract path — streaming stays raw, extract
+  coerces, divergence gated); RED-first 38 asserts, first boundary
+  `qwen3_typed_schema_wholedelta extract tc[0] arguments` (identity
+  `{"days": "5", …}` vs coerced `{"days": 5, "unit": "celsius", "active": true,
+  "temp": 3.14, "tags": [1, 2, 3]}`); no-schema path byte-identical (the 26 prior
+  scenarios + 586/586 engine-core + 210/210 serving unchanged; `.inc` diff = pure
+  insertions). `validate_tool_names` path is ported (gate configs have it false).
 - **The other engine configs — ALL 7 PORTED (`CLAIM-ROADMAP-C8-CONFIGS` +
   `-CONFIGS-2`, 2026-07-27); vLLM tool-parser family parity CLOSED:**
   - **PORTED (exact-gated, scenarios 10-19):** `minimax_m2`, `glm47_moe`,
