@@ -406,6 +406,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/llama_weights.cpp
   src/vllm/model_executor/models/mistral_registry.cpp
   src/vllm/model_executor/models/mistral_weights.cpp
+  src/vllm/model_executor/models/gemma4_registry.cpp
+  src/vllm/model_executor/models/gemma4_weights.cpp
+  src/vllm/model_executor/models/gemma4.cpp
   src/vllm/model_executor/models/gemma3_registry.cpp
   src/vllm/model_executor/models/gemma3_weights.cpp
   src/vllm/model_executor/models/gemma3.cpp

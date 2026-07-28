@@ -134,10 +134,19 @@ at 48/48 greedy vs the same oracle
 ([spike](../.agents/specs/sweep-gemma.md)): Gemma 2 proves the attention + final
 logit soft-cap primitives, Gemma 1 the original two-fused-norms block.
 
-Only **Gemma 4**, the newest registered variant, remains unimplemented: it needs
-a large new primitive stack (per-layer embeddings, YOCO KV-sharing, a Gemma-4
-MoE) and has only multimodal-wrapped checkpoints, so it is recorded as blocked
-rather than supported. Its multimodal path (image + video + **audio**, the only
+**Gemma 4**, the newest registered variant, now has its **text backbone
+implemented** (G1, 2026-07-28): the `Gemma4ForConditionalGeneration` language_model
+stack of `unsloth/gemma-4-E4B-it` — registry + weight loader + forward, as new
+additive files, compiling clean (`-Werror`) with the loader verified against the
+real checkpoint's tensor header. It brings up the large new primitive stack
+(per-layer embeddings, YOCO KV-sharing, plain RMSNorm, proportional partial-RoPE,
+heterogeneous 256/512 head dims, GeGLU, a per-layer scalar; the Gemma-4 MoE /
+k_eq_v / double-wide MLP are off for the E4B checkpoint and stay the larger-variant
+follow-on). The strict 32-token gate vs the W0 golden is **not yet reached: it is
+blocked on the runner allocating a single uniform KV head dimension per layer, which
+cannot represent Gemma-4's per-layer 256/512 heads without a shared-path change to
+KV-cache construction** — named as the next step, not a numeric divergence. Its
+multimodal path (image + video + **audio**, the only
 audio-capable model in the pin) has been assessed
 ([spec](../.agents/specs/gemma4-multimodal.md)) and is now **oracle-gateable —
 run-verified** (W0, 2026-07-28): the pinned 0.25.0 oracle (transformers 5.13.1)
