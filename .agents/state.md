@@ -28414,3 +28414,36 @@ All record checkers rc=0. NOT pushed; FULL SHA reported to caller.
   `CLAIM-C7-N-SAMPLING`, this entry. All record checkers rc=0. **Residuals (named):**
   `best_of`/beam, async-streaming per-child collation, C-ABI `n` field. NOT pushed;
   FULL SHA reported to caller.
+- **2026-07-28** — **Beam search (`SAMPLE-BEAM`) LANDED + CPU-GATED
+  (`CLAIM-C7-BEAM`, NOT pushed).** Beam search as an OUTER loop over the engine —
+  the sibling multi-sequence feature to `SAMPLE-N`, REUSING its multi-output return
+  and perturbing NONE of the n>1 / n=1 / plain-sampling paths. Each step runs one
+  decode per active beam (`logprobs=2*beam_width`, `max_tokens=1`, the beam
+  temperature), expands each beam to those next tokens (`cum_logprob += logprob`),
+  keeps the top-`beam_width` by `get_beam_search_score = cum_logprob /
+  seq_len**length_penalty` (seq_len INCLUDES the prompt, −1 on EOS), retires EOS
+  beams into `completed`, and after `max_tokens` (or once all beams complete)
+  returns the top-`beam_width` completed beams. NEW `include/vllm/entrypoints/
+  beam_search.{h}` + `src/vllm/entrypoints/beam_search.cpp` (namespace `vllm`): a
+  MODEL-FREE core (`get_beam_search_score`/`SortBeamsKey`/`BeamSearchStep` +
+  `BeamSearchParams`/`BeamSearchSequence`/`BeamSearchInstance`) + the engine driver
+  `BeamSearch(LLMEngine&, …)`. Mirrors vLLM `entrypoints/generate/beam_search/
+  {utils,offline}.py` + `sampling_params.py:1114`; `std::stable_sort` DESCENDING
+  reproduces `sorted(reverse=True)`. Deterministic ⇒ token-EXACT. Gate is exact
+  CPU, RED-first: NEW `test_beam_search` 5/5 (45 asserts) MODEL-FREE vs a
+  hand-computed beam tree (scoring incl. length_penalty≠1 + EOS decrement, two full
+  expand/score/select/EOS steps + final top-k, ignore_eos, null-dict, exhaustion) —
+  stubbing `BeamSearchStep` to no-op fails the toy `REQUIRE(1 == 2)` and the e2e
+  `1 == 5`, real logic → GREEN; NEW e2e case in `test_llm_engine` (9/9) over the
+  synthetic CPU Qwen3.6 (`beam_width` distinct descending-score continuations,
+  `bw=1`==greedy token-identical, wider beam ≥ cumulative logprob). Inertness:
+  `test_sampler` 11/11, `test_output_processor` 8/8, `test_scheduler` 36/36,
+  `test_openai_serving` 28/28 UNCHANGED. Clean full-library CPU `-Werror` 0-warn;
+  ENGINE row count UNCHANGED (existing `SAMPLE-BEAM` row, INVENTORIED→ACTIVE).
+  Records: `engine-matrix.md` `SAMPLE-BEAM` row + Total/Sampling rollup
+  (INVENTORIED 40→39, ACTIVE 36→37), `feature-matrix.md` §6, `roadmap_v1.md` C7,
+  `specs/sampling-controls-c7.md` (`SAMPLE-BEAM` section), `docs/STATUS.md`,
+  `docs/BENCHMARKS.md` (NOT-APPLICABLE), ledger, coordination `CLAIM-C7-BEAM`, this
+  entry. All record checkers rc=0. **Residuals (named):** OpenAI `use_beam_search`/
+  `best_of` wiring, C-ABI beam params, grammar-constrained beams, encoder-decoder/
+  LoRA beams. NOT pushed; FULL SHA reported to caller.

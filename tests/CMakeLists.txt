@@ -286,6 +286,7 @@ vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_async_llm vllm/v1/test_async_llm.cpp)
 vllm_cpp_add_test(test_llm_engine vllm/v1/test_llm_engine.cpp)
 vllm_cpp_add_test(test_loaded_engine_dense vllm/entrypoints/test_loaded_engine_dense.cpp)
+vllm_cpp_add_test(test_beam_search vllm/entrypoints/test_beam_search.cpp)
 vllm_cpp_add_test(test_openai_protocol vllm/entrypoints/openai/test_protocol.cpp)
 vllm_cpp_add_test(test_openai_serving vllm/entrypoints/openai/test_serving.cpp)
 vllm_cpp_add_test(test_openai_serving_chat_stream
