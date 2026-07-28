@@ -347,7 +347,7 @@ carries no ggml or PyTorch dependency.
 | CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
 | CUDA | Hopper, sm_90a | Build-supported, portable-kernels-only (accelerated paths disabled); not runtime-proven here |
 | CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a), sm_110 | Build-supported, portable-kernels-only; not runtime-proven here. sm_70/sm_75 are not build-supported (no bf16 tensor cores) |
-| Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is about 96.4% of MLX-LM. Indicative ([BENCHMARKS](docs/BENCHMARKS.md)) |
+| Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 96.4% of MLX-LM, or 99.1% with the optional MLX provider gated to prefill. Indicative ([BENCHMARKS](docs/BENCHMARKS.md)) |
 | Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet; off unless `-DVLLM_CPP_VULKAN=ON` |
 | Intel XPU | Intel GPUs | Spiked, hardware-blocked |
 | ROCm / ANE | AMD GPUs / Apple Neural Engine | Post-parity roadmap |

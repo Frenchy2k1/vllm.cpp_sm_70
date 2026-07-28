@@ -131,9 +131,21 @@ bool WrapTensor(const Tensor& t, const std::vector<int64_t>& strides, mx::array*
 // Linear / kMatmulBT orientation), expressed to MLX as a transposed VIEW so its
 // Matmul primitive picks the transposed steel kernel rather than materializing a
 // transpose.
+// Minimum activation rows for the MLX path: decode is m == 1, prefill is the
+// token count. The eval+memcpy tax is per CALL, so call count decides, and only
+// decode has a call per token.
+constexpr int64_t kMlxMinRows = 2;
+
 bool TryMlxMatmul(Tensor& out, const Tensor& a, const Tensor& b, bool bt) {
   // --- per-call DECLINE conditions. Each one falls back to our MSL kernel via
   // GetOpFallback below; none of them is an error.
+  // DECODE DECLINE. MLX's steel GEMM genuinely wins prefill — 537 ms of TTFT
+  // against our 602, essentially mlx-lm's own 534 — but the provider pays an
+  // mx::eval synchronisation plus an output memcpy on EVERY call, because it
+  // cannot write into our buffer. Prefill's ~112 large GEMMs amortise that;
+  // decode's ~112 matmuls PER TOKEN do not, measuring 12.74 tok/s against the
+  // native path's 23.92. m == 1 is exactly the decode GEMV.
+  if (a.shape[0] < kMlxMinRows) return false;
   if (a.dtype != b.dtype) return false;                 // MLX matmul needs one dtype
   if (a.stride[1] != 1 || b.stride[1] != 1) return false;
   if (a.stride[0] != a.shape[1]) return false;          // row-strided activation
@@ -162,20 +174,39 @@ bool TryMlxMatmul(Tensor& out, const Tensor& a, const Tensor& b, bool bt) {
   return true;
 }
 
+// The fallback pointer is resolved ONCE, and the decline is counted separately
+// via NoteOpDecline so `OpProviderStats::declines` stays exact — hoisting the
+// lookup must not silently hoist the accounting with it. GetOpFallback walks the provider stack,
+// re-reads the device caps and does an atomic decline count on every call — fine
+// when declines are rare, but a shape-gated provider declines on the hot path:
+// a 128-token decode run declines ~21,500 times, and paying the lookup each time
+// measured as a 27.2 -> 17.8 tok/s regression. The provider stack is immutable
+// after registration, so a function-local static is the right lifetime.
+MatmulFn MlxFallback(OpId op) {
+  if (op == OpId::kMatmul) {
+    static MatmulFn f = reinterpret_cast<MatmulFn>(
+        GetOpFallback(OpId::kMatmul, DeviceType::kMETAL, kMlxProvider));
+    return f;
+  }
+  static MatmulFn f = reinterpret_cast<MatmulFn>(
+      GetOpFallback(OpId::kMatmulBT, DeviceType::kMETAL, kMlxProvider));
+  return f;
+}
+
 void MlxMatmulKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   if (TryMlxMatmul(out, a, b, /*bt=*/false)) return;
+  NoteOpDecline(OpId::kMatmul, DeviceType::kMETAL);
   // DECLINE-AND-FALL-BACK — the seam's second axis. `GetOp` cannot express this
   // because it never sees a shape; the kernel can, so the kernel asks for the
   // provider immediately below itself and forwards. This is what keeps all ~70
   // op entry points in src/vt/ops.cpp free of any edit.
-  reinterpret_cast<MatmulFn>(GetOpFallback(OpId::kMatmul, DeviceType::kMETAL, kMlxProvider))(
-      q, out, a, b);
+  MlxFallback(OpId::kMatmul)(q, out, a, b);
 }
 
 void MlxMatmulBTKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   if (TryMlxMatmul(out, a, b, /*bt=*/true)) return;
-  reinterpret_cast<MatmulFn>(GetOpFallback(OpId::kMatmulBT, DeviceType::kMETAL, kMlxProvider))(
-      q, out, a, b);
+  NoteOpDecline(OpId::kMatmulBT, DeviceType::kMETAL);
+  MlxFallback(OpId::kMatmulBT)(q, out, a, b);
 }
 
 // Capability predicate. MLX only exists here at all if the build asked for it,
