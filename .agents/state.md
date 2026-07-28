@@ -28832,6 +28832,160 @@ work and the DEFAULT golden must never be re-anchored to an MLX build.
 
 **Standing: 96.4% default, 99.1% with MLX-prefill.** The remaining ~0.9% is
 decode (27.28 vs 27.44).
+## 2026-07-28 — Audio ENCODER TTFT device-resident encoder weights LANDED (`CLAIM-MM-SPEED-AUDIO-ENC-RESIDENT`)
+
+Executes multimodal-speed.md §14.5 residual lever #2 (the MEDIUM, byte-exact
+host-data-movement half). Base `main` `0e2c667a` (the §14 flash HEAD, confirmed
+`git rev-parse HEAD`). dgx GB10 sm_121a `~/vllmcpp-whisper-resid`, `git archive` of the
+code tree, CUDA cutlass 4.5.0 + FA2 arch 121a banners CONFIRMED, `-Werror` 0-warn; ALL
+GPU under `flock $HOME/gpu.lock` (a concurrent CPU-build agent was on the box; GPU idle).
+
+**PROFILE-CONFIRMED attribution (premise grounded first).** The ~0.75 s host chunk §14.5
+attributed to "per-call weight marshalling + a conv round-trip" is DOMINATED by weight
+marshalling, NOT the conv round-trip. Same-binary A/B via a new `VT_WHISPER_ENC_REMARSHAL`
+knob: re-marshal-every-call **1377 ms** (== §14's pre-lever ~1375 ms EXACTLY) → resident
+**729 ms** = **−648 ms**. The conv round-trip (`whisper_audio.cpp:205` `DownloadF32(conv1)`
+→ `:209` host `Im2Col(stride 2)` → `:216` re-upload) is a SMALL part of the residual 729 ms
+and its removal needs a DEVICE im2col kernel for the full cross-channel Whisper conv (vt has
+only depthwise `kCausalConv1dFwd`) — DEFERRED (a new-kernel task, out of scope for this
+host-data-movement slot). Premise verified, not blindly optimized.
+
+**The lever — device-resident encoder weights (mirror the decoder residency seam).** Each
+host-f32 weight is f32→bf16-converted + H2D-uploaded ONCE into a `mutable std::shared_ptr<void>`
+handle (Backend-Free deleter) and reused across every forward, mirroring the Qwen decoder
+`d_dev` seam (`qwen3_5_weights.h`; `qwen3_5.cpp` `ResidentWeight:797`). Upstream: vLLM loads
+Whisper weights once at model-init (`whisper.py` `WhisperEncoder:458`), never per `forward` —
+our per-call `UpBf16` was the divergence. Added handles to `WhisperEncoderLayerWeights`
+(15/layer) + `WhisperAudioEncoderWeights` (conv1/2 w+b, embed_pos, final_ln w+b) in
+`whisper_audio.h`; new `ResidentBf16` helper replaces `UpBf16` at every WEIGHT site in
+`whisper_audio.cpp` (im2col activation columns stay per-call).
+
+**BYTE-EXACT (RED line HELD).** Residency moves data, not math ⇒ token-identical by
+construction. `test_voxtral_e2e` **16/16** (strict prefix 18/48, teacher-force PASS,
+divergent=0, seq 48/48) — IDENTICAL to §14. Goldens md5 UNCHANGED — `voxtral_golden.json`
+`8ab87b7e9d374a38ab84d0231f13a53d`, `voxtral_neartie.json` `937b9ad3a61a9e98848635a15b132e58`
+(before == after). **Proof-of-run + RED (`VT_WHISPER_ENC_REMARSHAL`):** nsys `memcpy
+Host-to-Device` over the e2e — resident **740 ops / 9,400 MB** vs re-marshal **1,714 ops /
+11,948 MB** = **−974 HtoD ops (487 encoder weight tensors × 2 saved re-uploads) / −2.5 GB**.
+compute-sanitizer memcheck **0 errors** (16/16 under sanitizer; encoder path NOT graphed ⇒
+capture-safety N/A).
+
+**A/B (same-binary `VT_ENC_REPS`, `flock`, 6 reps rep0 dropped, steady-state).** Encoder
+forward total **~1377 → ~729 ms (−648 ms, 1.89×, NON-OVERLAPPING)**. Trajectory across the
+two ENC levers: **§13 warp 1834 → §14 flash 1375 → §15 resident 729 ms**. rep0 (cold, the
+one-time upload) ~1740 ms both arms — residency amortizes across calls 2+, not the first.
+
+**HONEST VERDICT — real byte-exact 1.89× host win, encoder still NOT at parity.** ~729 ms vs
+vLLM 0.25.0's ~43 ms (~17×, was ~32× after §14). The −648 ms removed is the confirmed host
+marshalling; the residual 729 ms is now GPU-compute-bound (scalar warp-per-query attention
+617 ms/32L + conv GEMMs). The LARGE gap-closer remains §14.5 lever #1: a tensor-core MMA
+hd-64 non-causal flash attention (dedicated slot). vLLM not re-measured (OOM-reboot risk of a
+big oracle alongside the active tree; residual ~17× regardless). Clean CUDA `-Werror` 0-warn
+(banners CONFIRMED) + CPU `-Werror` 0-warn (`whisper_audio.cpp`). Audio DECODE stays
+DONE-on-speed (§12, 0.97×, BEATS); audio TTFT/encoder stays speed-pending/PARTIAL; no mm row
+advances to DONE.
+
+Records: `specs/multimodal-speed.md` (§15 + headline pointer), `model-matrix.md` (Voxtral
+row), `feature-matrix.md` (mm row), `roadmap_v1.md` (ROAD-V1-MM), `coordination.md`
+(`CLAIM-MM-SPEED-AUDIO-ENC-RESIDENT`), `docs/ENVIRONMENT.md` (`VT_WHISPER_ENC_REMARSHAL`),
+`docs/STATUS.md`, `docs/BENCHMARKS.md`, `parity-ledger.md`, this entry. All record checkers
+rc=0. NOT pushed; FULL SHA reported to caller.
+
+---
+
+## 2026-07-28 — CORRECTION: MLX-gated is 97.6%, not 99.1% (two-sample baseline error)
+
+**My 99.1% claim was wrong.** It divided by a two-sample MLX-LM baseline: 27.135
+and 27.744 gen tok/s, averaged to 27.44. Re-measured INTERLEAVED with ours over 4
+ABBA blocks, MLX-LM's decode is **27.848, spread 0.34%** across six runs. The
+27.135 was an outlier and averaging it in flattered us by ~1.5 points.
+
+**Corrected** (ours spread 0.12%, MLX-LM 0.34%):
+
+| | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill TTFT | **524.5 ms** | 532.6 | **+1.5% we are faster** |
+| decode | 27.23 | 27.85 | 97.8% |
+| **warm total** | **24.37** | 24.96 | **97.6%** |
+
+Default build: **95.9%**, not 96.4%.
+
+Everything qualitative stands — MLX wins prefill, the shape gate is right, the
+fallback hoist was worth 27.2 vs 17.8 — only the headline moves. The gate is
+still ~+1.7 points over default.
+
+**Lesson: a ratio is only as good as its DENOMINATOR's sample count.** I spent the
+session building a paired harness so our own A/Bs would not be read off two runs,
+then compared against a two-run external baseline. The reference needs the same
+discipline as the candidate. Downstream consumers of the wrong number (LocalAI
+PR #11137) were corrected in the same pass.
+
+---
+
+## 2026-07-28 — final standing: the remaining gap is ENTIRELY decode
+
+With MLX shape-gated, **prefill is AHEAD** (524.5 ms vs 532.6, +1.5%). The whole
+2.4% deficit is decode:
+
+```
+decode  ours 36.72 ms/tok  mlx-lm 35.91  gap 0.81 ms/tok
+  GEMV            34.2 ms  (~99 GB/s, 83% of peak — at the wall)
+  our attn+other   2.52 ms
+  their attn+other 1.71 ms
+```
+
+**Identified lever: GQA-grouped decode attention.** At qpk=2 the current kernel
+launches one threadgroup per (q-head, token), streaming the SAME kv head twice —
+117 MB/token where 59 is unique. It already runs at 77 GB/s against a probed
+69 GB/s ceiling, so it is NOT inefficient; it reads the data twice. Grouping to
+one threadgroup per (KV head, token) saves **0.67 ms/tok = 82% of the gap**,
+putting decode at 27.74 vs 27.85.
+
+**Implemented once; single-run regression (26.53 vs 27.24); never paired-verified;
+branch deleted, so the kernel is GONE.** Suspected cause is the flash-decoding
+trap: grouping halves threadgroups (16 -> 8), so traffic halves but parallelism
+does too. On re-attempt: (a) QPK must be a TEMPLATE parameter — the prefill query
+tiling proved a runtime bound stops MSL unrolling and spills the accumulators into
+thread-private memory; (b) verify with scripts/metal-paired-ab.py, since a single
+run is what mis-called it the first time.
+
+**Session close: 89.4% -> 95.9% default, 97.6% with MLX gated to prefill.** Six
+kernels landed plus the MLX shape gate and the provider fallback hoist. Not
+parity; the last 2.4% has one identified lever with arithmetic behind it and a
+known implementation hazard.
+
+---
+
+## 2026-07-28 — GQA grouping CLOSED: the traffic it would save is already free
+
+The previous entry proposed GQA-grouped decode attention as 82% of the remaining
+gap. **The arithmetic double-counts, and two numbers already recorded prove it:**
+
+```
+decode attention "traffic"  117 MB / 1.52 ms = 77 GB/s
+strided bandwidth probe ceiling            = 69 GB/s
+```
+
+Achievable bandwidth cannot be exceeded, so the 117 MB is not all from DRAM. The
+two q-head threadgroups sharing a kv head read the same 64 KB per chunk and the
+second hits cache: **the hardware already deduplicates it.** Grouping would save
+traffic nobody pays, while halving threadgroups 16 -> 8 — under one per core on a
+~10-core part at tq=1. That explains the measured 26.53 vs 27.24 mechanistically
+rather than as noise.
+
+**Untested prediction:** GQA grouping is a BATCH lever, not a b=1 one. At tq > 1
+the grid is hkv*tq so the parallelism floor lifts, and the reuse distance grows
+past what cache covers. Worth revisiting for throughput serving.
+
+**The last identified b=1 decode lever is therefore closed.** Gap 0.81 ms/token;
+GEMV holds 34.2 ms of it at 83% of memory peak; the remaining 2.52 ms of
+attention + small kernels has no mechanism this session found.
+
+**Method note, and it is the session's most repeated lesson:** the 77 > 69
+contradiction was sitting in the record for hours before I read it as a
+contradiction. When a derived quantity exceeds a measured ceiling, the derivation
+is wrong — that is a free correctness check on any traffic or FLOP estimate, and
+it cost one arithmetic comparison to apply.
 
 ## 2026-07-28 — C-ABI engine-config growth to v9 (`CLAIM-CAPI-ENGINE-CONFIG-V9`)
 

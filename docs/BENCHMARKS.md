@@ -1540,6 +1540,54 @@ AttentionDenseFlash` (add `VT_WHISPER_ENC_WARP=1` for the warp arm). The audio D
 DONE-on-speed (S12, 0.97x, BEATS); audio TTFT/encoder stays **speed-pending / PARTIAL**. No mm row
 advances to DONE this pass.
 
+**AUDIO ENCODER TTFT - device-resident one-time encoder weights (S14 lever #2 LANDED, byte-exact,
+1.89x encoder-forward host win; NOT at parity) (`CLAIM-MM-SPEED-AUDIO-ENC-RESIDENT`, 2026-07-28
+[spec](../.agents/specs/multimodal-speed.md) S15).** `benchmark_binding=false`. Base `main` `0e2c667a`,
+dgx GB10 sm_121a, cutlass 4.5.0 + FA2 arch 121a banners CONFIRMED, `-Werror` 0-warn, all GPU under
+`flock $HOME/gpu.lock` (a concurrent CPU-build agent was on the box; GPU idle), rep0 dropped.
+**PROFILE-CONFIRMED premise:** the ~0.75 s host chunk S14 attributed to "weight marshalling + a conv
+round-trip" is DOMINATED by weight marshalling - every `WhisperAudioEncoderForward` re-ran the host
+f32->bf16 conversion + H2D upload of 487 encoder weight tensors (~635 M f32) EVERY call; the
+conv1->host->conv2 round-trip is a SMALL part of the residual and its removal needs a device im2col
+kernel (deferred). **LEVER:** device-resident encoder weights - each weight is f32->bf16-converted and
+uploaded ONCE into a `mutable std::shared_ptr<void>` handle (Backend-Free deleter) and reused across
+forwards, mirroring the Qwen decoder residency seam (`qwen3_5_weights.h` `d_dev`; `qwen3_5.cpp`
+`ResidentWeight:797`). Upstream: vLLM loads Whisper weights once at model-init (`whisper.py`
+`WhisperEncoder:458`), never per forward. Pure data-movement (no kernel/op-registry edit) => byte-exact.
+`VT_WHISPER_ENC_REMARSHAL=1` restores per-call marshalling for the same-binary A/B. **SAME-BINARY A/B**
+(throwaway `VT_ENC_REPS` loop with `steady_clock` around the encoder forward, NOT committed, 6 reps rep0
+dropped, `flock`):
+
+| Vehicle | re-marshal every call (`VT_WHISPER_ENC_REMARSHAL=1`) | resident (ships, default) | delta | vs vLLM 0.25.0 TTFT 43 ms |
+|---|---|---|---|---|
+| Voxtral Whisper encoder forward (1500 frames, 32 layers), steady-state reps 1-5 | **~1377 ms** (1373.9-1383.7) | **~729 ms** (728.0-730.7) | **-648 ms (1.89x faster), NON-OVERLAPPING** | ~32x -> **~17x slower (NOT closed)** |
+
+The re-marshal arm reproduces S14's pre-lever ~1375 ms EXACTLY. rep0 (cold, the one-time upload) ~1740 ms
+both arms - residency amortizes across calls 2+, not the first. Trajectory across the two ENC levers:
+**S13 warp 1834 -> S14 flash 1375 -> S15 resident 729 ms.** **Proof-of-run + RED (`VT_WHISPER_ENC_REMARSHAL`):**
+nsys `cuda memcpy Host-to-Device` over the e2e - resident **740 ops / 9,400 MB** vs re-marshal **1,714
+ops / 11,948 MB** = **-974 HtoD ops (487 encoder weight tensors x 2 saved re-uploads) / -2.5 GB**; forcing
+per-call re-upload returns the +648 ms. **Correctness (RED line, HELD):** `test_voxtral_e2e` **16/16**
+(IDENTICAL to S14); goldens md5 UNCHANGED (`voxtral_golden.json 8ab87b7e...`, `voxtral_neartie.json
+937b9ad3...`, before == after). `compute-sanitizer --tool memcheck` **0 errors** (16/16 under sanitizer;
+encoder path not graphed => capture-safety N/A). **HONEST verdict - NOT at parity:** ~729 ms encoder TTFT
+vs vLLM's 43 ms (~17x, was ~32x). The -648 ms removed is the confirmed per-call host marshalling; the
+residual 729 ms is now GPU-compute-bound (the scalar warp-per-query attention 617 ms/32L + the conv
+GEMMs). vLLM not re-measured (OOM-reboot risk of a big oracle alongside the active tree; residual ~17x
+regardless). The LARGE gap-closer remains S14 lever #1 (tensor-core MMA hd-64 non-causal FA2); dropping
+the conv host round-trip (a device im2col kernel) is a smaller follow-on. **Repro (committed-code, nsys
+HtoD proof):** `git archive` the commit to `dgx.casa:~/vllmcpp-whisper-resid`, `cmake -S . -B build
+-DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON -DCMAKE_CUDA_ARCHITECTURES=121a
+&& cmake --build build --target test_voxtral_e2e`; then `STF=~/.cache/huggingface/hub/models--mistralai--Voxtral-Mini-3B-2507/snapshots/*/consolidated.safetensors;
+flock $HOME/gpu.lock env VLLM_VOXTRAL_SAFETENSORS=$STF nsys profile -t cuda --force-overwrite true -o
+/tmp/r ./build/tests/test_voxtral_e2e; nsys stats --report cuda_gpu_mem_size_sum /tmp/r.nsys-rep | grep
+Host-to-Device` (resident ~740 HtoD ops; add `VT_WHISPER_ENC_REMARSHAL=1` for the ~1714-op re-marshal
+arm). The ms A/B above used a throwaway env-gated `steady_clock` `VT_ENC_REPS` loop around the encoder
+forward (NOT committed). The audio DECODE axis stays DONE-on-speed
+(S12, 0.97x, BEATS); audio TTFT/encoder stays **speed-pending / PARTIAL**. No mm row advances to DONE
+this pass.
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =
@@ -3465,6 +3513,111 @@ arrive, so the running max keeps moving and corr is rarely exactly 1.0. The eigh
 scalar `sdiag` reads plus the branch then cost more than the eight mma they guard.
 The idea would fare better on a non-causal or short-context shape, which is not
 this workload.
+
+---
+
+## GQA grouping CLOSED: the traffic it would save is already free (2026-07-28)
+
+The entry below proposes GQA-grouped decode attention as worth 82% of the
+remaining gap, on the arithmetic that qpk=2 makes us stream each kv head twice.
+**That arithmetic double-counts, and two numbers already in this document say so:**
+
+```
+decode attention measures 77 GB/s of "traffic" (117 MB / 1.52 ms)
+the strided bandwidth probe tops out at  69 GB/s on the same access pattern
+```
+
+You cannot exceed achievable bandwidth. So the 117 MB is not all coming from
+DRAM: the two q-head threadgroups sharing a kv head read the same 64 KB per chunk
+(256 keys x 128 elem x 2 B), and the second reader hits cache. **The duplicate is
+already being deduplicated by the hardware.** Grouping would save traffic nobody
+is paying, while still halving the threadgroup count.
+
+And at the b=1 parity workload that halving is severe: tq=1 means 16 threadgroups
+today and **8** if grouped, on a roughly 10-core part. That is under one
+threadgroup per core, and it explains the measured 26.53 against 27.24
+mechanistically rather than as noise.
+
+**Prediction, untested:** GQA grouping should be a BATCH-serving lever, not a b=1
+one — at tq > 1 the grid is hkv*tq and the parallelism floor disappears while the
+cache no longer covers the reuse distance. Worth revisiting for throughput
+serving; not for this target.
+
+**Consequence: the last identified lever for b=1 decode is closed.** The gap is
+0.81 ms/token, the GEMV holds 34.2 of it at 83% of memory peak, and the remaining
+2.52 ms of attention plus small kernels has no mechanism left that this session
+found. That is where it stands: 95.9% default, 97.6% MLX-gated, with prefill
+already ahead.
+
+---
+
+## The remaining gap is ENTIRELY decode, and GQA grouping covers 82% of it
+
+With MLX shape-gated, **prefill is ahead** (524.5 ms against 532.6, +1.5%) so the
+whole 2.4% deficit sits in decode:
+
+```
+decode  ours 36.72 ms/tok   mlx-lm 35.91   gap 0.81 ms/tok
+  our GEMV         34.2 ms  (weight streaming at ~99 GB/s, 83% of peak)
+  our attn+other    2.52 ms
+  their attn+other  1.71 ms (assuming equal GEMV, which the spike supports)
+```
+
+**The identified lever: GQA-grouped decode attention.** With `qpk=2` the current
+kernel launches one threadgroup per (q-head, token), so the SAME kv head is
+streamed twice — 117 MB per token where 59 MB is unique. The kernel is already at
+77 GB/s against a probed 69 GB/s ceiling, so it is not inefficient; it reads the
+data twice. One threadgroup per (KV head, token) serving both q-heads reads it
+once:
+
+| | ms/tok |
+|---|--:|
+| decode attention today | 1.52 |
+| GQA-grouped (arithmetic) | 0.85 |
+| **saving** | **0.67 = 82% of the remaining gap** |
+
+That would put decode at 27.74 against MLX-LM's 27.85.
+
+**Status: implemented once, single-run REGRESSION (26.53 vs 27.24), never
+verified with the paired harness, and the branch was deleted.** The suspected
+cause is the same trap flash-decoding hit: grouping halves the threadgroup count
+(16 -> 8) so traffic halves but so does parallelism. Whoever picks this up should
+(a) re-implement with QPK as a TEMPLATE parameter, not a runtime one — the prefill
+query tiling proved a runtime bound stops MSL unrolling and spills the
+accumulators — and (b) verify with `scripts/metal-paired-ab.py`, because a
+single run is exactly what mis-called it the first time.
+
+---
+
+## CORRECTION: the MLX-gated result is 97.6%, not 99.1% (2026-07-28)
+
+The entry below claims 99.1%. **It is wrong, and the error is mine: a two-sample
+baseline.** MLX-LM was measured twice, 27.135 and 27.744 generation tok/s, and I
+averaged them to 27.44. Re-measured INTERLEAVED with ours over 4 ABBA blocks,
+MLX-LM's decode is **27.848 with a 0.34% spread** across six runs — extremely
+stable. The 27.135 was an outlier, and including it in a two-sample mean flattered
+us by about 1.5 points.
+
+**Corrected, from the interleaved run** (ours spread 0.12%, MLX-LM's 0.34%):
+
+| | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill TTFT | **524.5 ms** | 532.6 ms | **+1.5% (we are faster)** |
+| decode | 27.23 | 27.85 | 97.8% |
+| **warm total** | **24.37** | 24.96 | **97.6%** |
+
+The default (non-MLX) build is **95.9%** against this corrected baseline, not
+96.4%.
+
+**Everything qualitative in the entry below still holds** — MLX wins prefill, the
+shape gate is the right disposition, the fallback hoist was worth 27.2 vs 17.8 —
+only the headline ratio moves. The gate is still worth about +1.7 points over the
+default build.
+
+**Lesson, and it is one this log has now taught twice:** a ratio is only as good
+as its DENOMINATOR's sample count. I applied the paired-harness discipline to our
+own A/Bs all session and then compared against a two-run external baseline. The
+reference needs the same treatment as the candidate.
 
 ---
 
