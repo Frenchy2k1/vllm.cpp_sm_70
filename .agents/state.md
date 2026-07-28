@@ -29564,3 +29564,55 @@ could not gate the non-spec paths it would affect. It stays byte-identical when
 first (dump one conv_state row either side of the prefill scatter, spec-ON vs
 spec-OFF), so the fix is verified against a measurement rather than against this
 reasoning. The reasoning is strong; it is still reasoning.
+
+## 2026-07-28 — `CPU-SPEC-DIVERGENCE` FIXED; `SPEC-MTP-GGUF` G4 GREEN
+
+**Root cause, one line** (`src/vllm/model_executor/models/qwen3_5.cpp:3616`):
+
+    const int64_t conv_row_elems = conv_dim * (Kw - 1);
+
+Under speculation the persistent conv row is widened to
+`conv_dim * ((Kw-1) + num_spec)` for rollback, while the prefill working copy is
+legitimately narrow (prefill produces only the K-1 leading taps).
+`GatherRows`/`ScatterRows` use ONE size for BOTH the slot stride and the row
+contents, so once those differ they mis-stride the slot AND mis-address every
+channel past the first. Post-prefill recurrent state was garbage; speculation
+changed the TARGET's own greedy output even at zero acceptance.
+
+**Fix:** `CopyStateRowsStrided`, used by `GatherStateF32`/`ScatterStateF32` when
+`cache.shape[2] != work.shape[2]` - copies `taps` elements per CHANNEL across a
+`cache_taps`-strided row. When the widths agree (every non-spec path) the
+contiguous helpers are used unchanged, so non-spec is byte-identical by
+construction and by gate.
+
+    before   spec-OFF " Paris.\\nA. True..."   spec-ON " Paris is the capital..."  13/10
+    after    spec-OFF " Paris."               spec-ON " Paris."  IDENTICAL        13/11
+
+**Why it survived.** It needs speculation ON (widened row) AND the f32 row-copy
+path AND a real generation. The fp16/bf16 cache arm routes through the
+`GdnStateGather`/`Scatter` OPS, which carry their own geometry, so CUDA was never
+exposed - and every `SPEC-MTP` gate ran on GB10. There was no CPU spec-decode gate
+anywhere in the tree. There is one now, and it is the thing that caught this.
+
+**Method that found it - three bisect steps, each removing a variable:**
+1. Kill the drafter (zero `fc`): identical divergence at 0 acceptance => not the
+   head, not the GGUF loader.
+2. `ngram` speculation: token-EXACT, and instrumentation showed it never calls
+   the spec conv update => the widening itself is innocent; executing the spec
+   conv path is what breaks.
+3. Instrument both conv kernels: prefill sees state_len=3, spec update sees 4 =>
+   the state MOVEMENT between them is where the geometry is lost.
+
+Each step made the next hypothesis cheaper. Worth reusing: prefer neutralising a
+component over duplicating one, because a neutralised component makes the expected
+output provable a priori and a single run then discriminates.
+
+**Two false leads, both recorded as refuted** so they are not re-chased: the
+`srow[-1]` negative index (`runner.cpp:1187` clamps `nat >= 1`), and striding
+`CausalConv1dFwdKernel` by `shape[2]` (no-op - that kernel only ever sees the
+narrow working buffer).
+
+`SPEC-MTP-GGUF` moves `PARTIAL` -> `GATING`. Not `DONE`: no GPU run, no
+cross-format (F16 GGUF vs safetensors) agreement, no throughput number. A speed
+number is now genuinely OWED and belongs on GPU, not on a 2B CPU decode whose
+wall-clock is overhead-dominated.

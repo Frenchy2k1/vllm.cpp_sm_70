@@ -2552,6 +2552,42 @@ void ScatterRows(Dev d, const Tensor& dst, const void* src,
     d.b.Copy(d.q, dp + static_cast<size_t>(idx[s]) * rb, sp + s * rb, rb);
 }
 
+// Strided GDN state row copy (CPU/f32 reference path).
+//
+// The persistent conv row is WIDENED to (K-1)+num_spec under speculative
+// decoding so a rejected step can roll back, but the prefill working copy is
+// legitimately narrow: prefill only produces the K-1 leading taps. GatherRows /
+// ScatterRows assume ONE row size for both the slot stride and the row contents,
+// which silently mis-addresses every channel past the first once those differ
+// (and mis-strides the slot itself). Copy per CHANNEL instead: `taps` elements
+// out of a `cache_taps`-strided cache row into a `taps`-strided working row.
+//
+// `gather` selects direction. Byte-identical to the contiguous helpers whenever
+// cache_taps == taps, which is every non-speculative path.
+void CopyStateRowsStrided(Dev d, void* work, const Tensor& cache,
+                          const std::vector<int32_t>& idx, int64_t channels,
+                          int64_t taps, int64_t cache_taps, bool gather) {
+  const size_t esz = vt::SizeOf(cache.dtype);
+  const size_t cache_slot = static_cast<size_t>(channels * cache_taps) * esz;
+  const size_t work_slot = static_cast<size_t>(channels * taps) * esz;
+  const size_t chunk = static_cast<size_t>(taps) * esz;
+  auto* wp = static_cast<char*>(work);
+  auto* cp = static_cast<char*>(cache.data);
+  for (size_t s = 0; s < idx.size(); ++s) {
+    char* crow = cp + static_cast<size_t>(idx[s]) * cache_slot;
+    char* wrow = wp + s * work_slot;
+    for (int64_t c = 0; c < channels; ++c) {
+      char* csrc = crow + static_cast<size_t>(c * cache_taps) * esz;
+      char* wdst = wrow + static_cast<size_t>(c * taps) * esz;
+      if (gather) {
+        d.b.Copy(d.q, wdst, csrc, chunk);
+      } else {
+        d.b.Copy(d.q, csrc, wdst, chunk);
+      }
+    }
+  }
+}
+
 // Gather idx-indexed rows of a persistent GDN state cache into a fresh f32
 // working buffer. Compressed cache dtypes round-trip at the cache boundary;
 // the temporal state may independently be fp16/bf16/fp32 while the conv cache
@@ -2567,6 +2603,10 @@ DBuf GatherStateF32(Dev d, const Tensor& cache, const std::vector<int32_t>& idx,
     DBuf didx(d, DType::kI32,
               {static_cast<int64_t>(idx.size())}, idx.data());
     vt::GdnStateGather(d.q, f32buf.t(), cache, didx.t());
+  } else if (cache.rank == 3 && shape.size() == 3 && cache.shape[2] != shape[2]) {
+    // Widened speculative conv row vs narrow prefill working row.
+    CopyStateRowsStrided(d, f32buf.ptr(), cache, idx, shape[1], shape[2],
+                         cache.shape[2], /*gather=*/true);
   } else {
     GatherRows(d, f32buf.ptr(), cache, idx, row_elems);
   }
@@ -2587,6 +2627,11 @@ void ScatterStateF32(Dev d, const Tensor& cache, DBuf& f32buf,
               {static_cast<int64_t>(idx.size())}, idx.data());
     Tensor mutable_cache = cache;
     vt::GdnStateScatter(d.q, mutable_cache, f32buf.t(), didx.t());
+  } else if (cache.rank == 3 && f32buf.t().rank == 3 &&
+             cache.shape[2] != f32buf.t().shape[2]) {
+    CopyStateRowsStrided(d, f32buf.ptr(), cache, idx, f32buf.t().shape[1],
+                         f32buf.t().shape[2], cache.shape[2],
+                         /*gather=*/false);
   } else {
     ScatterRows(d, cache, f32buf.ptr(), idx, row_elems);
   }

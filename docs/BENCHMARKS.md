@@ -2566,60 +2566,36 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
-### GGUF MTP head loading, `SPEC-MTP-GGUF` G1-G3 (2026-07-28) - load-path correctness only, PENDING speed
+### GGUF MTP end-to-end + the CPU spec-state fix, `SPEC-MTP-GGUF` G1-G4 (2026-07-28) - correctness GREEN, speed PENDING
 
-**Benchmark disposition: PENDING - the feature is not yet reachable end to end, so
-there is nothing to measure. `benchmark_binding=false`.** G1-G3 make the MTP head
-LOAD from a head-carrying GGUF (config depth republished, head weights read with the
-trunk's conventions, rejection narrowed, head attached in the GGUF branch). No
-spec-ON generation over a GGUF target has been run, so acceptance rate and
-throughput are both unmeasured and NOT claimed.
+**Benchmark disposition: PENDING for speed, GREEN for correctness.
+`benchmark_binding=false`.** MTP speculative decoding now runs end to end from a
+GGUF target on CPU and is token-exact:
 
-The gate that DID run is load-path correctness, against a real llama.cpp-converted
-Qwen3.5-2B (Q8_0 body) rather than a synthetic fixture:
-`tests/vllm/models/test_qwen3_5_gguf_mtp.cpp` 2 cases / 18 assertions - the head
-depth reaches `config.raw`, `fc` is `[H, 2H]` (the verbatim orientation, not the
-transposed one), the three RMSNorm weights are `[H]`, and the head block is
-full-attention. RED-first and BEHAVIOURAL: reverting only the one-line config
-republication fails both cases. Trunk inertness: `test_gguf` 103,
-`test_gguf_qwen36_loader` 99, `test_gguf_keep_quant` 5958, `test_gguf_dequant` 215,
-`test_capi` 33/232, all unchanged.
+    spec-OFF  " Paris."   24 tokens
+    spec-ON   " Paris."   24 tokens, IDENTICAL, 13 drafts proposed / 11 accepted
 
-**The token gate now EXISTS and FAILS, which is why no number is claimed.**
-`tests/parity/test_qwen35_gguf_spec_decode.cpp`, run on CPU against the real 2B
-GGUF with `VT_GDN_STATE_BF16=0` (the CPU `causal_conv1d_spec_update` requires f32
-conv state), reports 13 drafts proposed / 10 accepted - so the head loads well
-enough to make proposals the target believes 77% of the time - but the spec-ON
-continuation DIVERGES from spec-OFF. Greedy speculative decoding is
-exactness-preserving, so that is a correctness defect, not a tuning result, and a
-throughput number measured on a diverging path would be meaningless.
+Getting there fixed a pre-existing engine defect, `CPU-SPEC-DIVERGENCE`: the GDN
+state gather/scatter row was sized `(Kw-1)` while the speculative row is
+`(Kw-1)+num_spec`, so the contiguous helpers mis-strode the slot and every channel
+past the first and corrupted post-prefill recurrent state. Speculation changed the
+target's own greedy output even at zero acceptance. Fixed with a stride-aware
+per-channel copy engaged only when the widths differ; non-spec paths byte-identical.
 
-En route it did earn its cost: it caught a real loader defect (`fc.nk` unset,
-which the shape assertions could not see and which the draft forward rejected)
-that is now fixed and asserted in the unit gate.
+Gates: `tests/parity/test_qwen35_gguf_spec_decode.cpp` (token identity + nonzero
+acceptance + an `ngram` guard) and `tests/vllm/models/test_qwen3_5_gguf_mtp.cpp`
+(19 assertions). Regression sweep all unchanged: ops_gdn 1825,
+gdn_metadata_builder 483, gdn_prefill_conv 28, gdn_spec_routing 12, gguf 103,
+gguf_qwen36_loader 99, gguf_keep_quant 5958, gguf_dequant 215, llm_engine 196,
+input_batch 163, runner 257, capi 232.
 
-**Reproduction:**
+**No speed number is claimed, and one IS now owed.** The 2B CPU run is a
+correctness vehicle, not a throughput vehicle: wall-clock on a 2B Q8 CPU decode is
+dominated by fixed overheads, so a spec-ON/OFF ratio there would not be binding.
+The honest measurement is a GPU A/B on a gate checkpoint, mirroring how `SPEC-MTP`
+I6/I7 were measured for safetensors. Reproduction for the correctness gate:
 `VT_GDN_STATE_BF16=0 VLLM_MTP_GGUF_MODEL=<head-carrying .gguf> ./build-cpu/tests/test_qwen35_gguf_spec_decode`
-
-**Attribution COMPLETE (`G4a`), by bisect rather than by a second checkpoint.**
-Zeroing the MTP head so every proposal is garbage gives 23 proposed / 0 accepted
-and byte-identical output to the live-head run, still diverging from spec-OFF.
-With zero accepted drafts the emitted tokens must be the target's own greedy
-sequence, so the divergence is the TARGET's forward under speculation, not the
-head. The GGUF head loader is cleared; the open defect is engine-level and CPU-only
-(`CPU-SPEC-DIVERGENCE`). No GPU spec-decode result is affected or retracted.
-
-**Narrowed further 2026-07-28, still no number owed or claimed.** Instrumentation
-localised the defect to the GDN conv row geometry under speculation (prefill's
-gathered working copy is `(K-1)` wide; the spec decode update reads a
-`(K-1)+num_spec` row; the non-spec update never runs). One candidate fix was
-attempted and REVERTED as a no-op rather than shipped unverified. Still
-`benchmark_binding=false`: a throughput figure on a diverging path would be
-meaningless, and the next step is a correctness probe (dump one conv_state row
-either side of the prefill scatter, spec-ON vs spec-OFF), not a measurement.
-An `ngram` discriminator (widens the cache, never runs the spec conv update) is
-token-EXACT, which clears the widening and the MTP head both, and is retained as
-a regression guard.
+(the CPU `causal_conv1d_spec_update` requires f32 conv state).
 
 ### GGUF speculative-decoding spikes, `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF` (2026-07-28) - scoping only, NOT APPLICABLE
 
