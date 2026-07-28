@@ -77,6 +77,12 @@ TEST_CASE("gguf mtp: the head loads with trunk-consistent conventions") {
   REQUIRE(w.fc.rank == 2);
   CHECK(w.fc.shape[0] == H);
   CHECK(w.fc.shape[1] == 2 * H);
+  // The ORIENTATION FLAG, not just the shape. The draft forward requires
+  // `fc.nk` set ("fc must be raw bf16 [H,2H]"); GGUF already stores [N, K] so
+  // the shape assertions above pass either way, and an unset flag fails only
+  // later inside the forward. The G4 token gate caught exactly that, which is
+  // why it is asserted here too.
+  CHECK(w.fc.nk);
 
   // The three RMSNorm weights are [H]. They also carry the GGUF (w + 1) storage
   // convention, which is why the loader routes them through the same

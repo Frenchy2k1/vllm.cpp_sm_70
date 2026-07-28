@@ -29246,3 +29246,49 @@ acceptance rate are unmeasured, and `G5` (cross-format agreement at F16) is
 untouched. The attach site in the GGUF branch is compile-verified only. A
 quantized head may accept rarely enough that spec-ON is SLOWER than spec-OFF -
 recorded in the spike as a finding to publish, not a bug to hide. Next: `G4`.
+
+## 2026-07-28 — `SPEC-MTP-GGUF` G4: the token gate RUNS, finds one defect, exposes a second
+
+**G4 landed as a gate and immediately paid for itself.**
+`tests/parity/test_qwen35_gguf_spec_decode.cpp` drives the real 2B GGUF twice
+(spec-OFF, then spec-ON) on CPU. It is TWO-way, not three-way like the
+safetensors sibling, because there is no vLLM oracle for a GGUF target at all -
+vLLM has no GGUF MTP path - so the bar is self-referential: spec-ON must equal
+spec-OFF, and acceptance must be nonzero (identity alone also passes on a
+completely dead drafter, which is exactly what a mis-loaded head produces).
+
+**Defect 1, FOUND AND FIXED: `fc.nk` was unset.** The unit gate asserted `fc`'s
+SHAPE and passed, because GGUF already stores `[N, K]`. But the draft forward
+requires the `nk` FLAG set (`qwen3_5.cpp` "fc must be raw bf16 [H,2H]"), which the
+safetensors path gets from `LoadBf16RawNK` and `OwnBf16` does not set. Shape-right,
+flag-wrong: invisible to the unit test, fatal in the forward. Fixed, and the unit
+gate now asserts the flag rather than only the shape.
+
+**Defect 2, OPEN and NOT attributed: spec-ON diverges from spec-OFF.** With
+`VT_GDN_STATE_BF16=0` (the CPU `causal_conv1d_spec_update` refuses bf16 conv
+state; bf16 is CUDA-only) the spec run completes and reports **13 drafts proposed
+/ 10 accepted**, so the head is loaded well enough to make proposals the target
+believes 77% of the time. But the continuations differ from token 1:
+
+    spec-OFF  " Paris.\\nA. True\\nB. False..."   {11751, 13, 198, 32, ...}
+    spec-ON   " Paris is the capital of France..." {11751, 369, 279, 6511, ...}
+
+Greedy MTP is exactness-preserving. This is a correctness defect.
+
+**Why it is NOT yet blamed on this row.** A badly-loaded head produces proposals
+the target REJECTS - low acceptance, identical output. We measured the opposite:
+high acceptance, divergent output. That pattern points at verify/commit
+bookkeeping rather than at the weights, but that is a hypothesis, not a finding.
+And there is NO CPU spec-decode gate anywhere in this tree: the entire `SPEC-MTP`
+program (I5d/I5e/I6/I7) was gated on GB10, so this may be the first time the
+CPU spec path has ever been driven end to end, and a pre-existing CPU defect is a
+live possibility.
+
+**Next (`G4a`), before any further code or any number:** run the SAME two-way gate
+against a SAFETENSORS Qwen3.5 on CPU. Diverges too => pre-existing CPU defect,
+this row is done pending it. Safetensors exact, GGUF not => the defect is here.
+Attribution first; guessing at the head would be debugging the wrong half.
+
+The gate is asset-gated (`VLLM_MTP_GGUF_MODEL`), so it skips in CI and the red
+stays local and reproducible rather than blocking the tree. `docs/STATUS.md` says
+plainly not to describe GGUF MTP as working.
