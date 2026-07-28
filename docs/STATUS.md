@@ -139,14 +139,19 @@ a large new primitive stack (per-layer embeddings, YOCO KV-sharing, a Gemma-4
 MoE) and has only multimodal-wrapped checkpoints, so it is recorded as blocked
 rather than supported. Its multimodal path (image + video + **audio**, the only
 audio-capable model in the pin) has been assessed
-([spec](../.agents/specs/gemma4-multimodal.md)) and was **oracle-blocked at gate
-time**: the Gemma-4 vision and audio towers load through Transformers
-`AutoModel`, and the gate-time 0.25.0 oracle's transformers (5.13.1) had no
-`gemma4` module, so no gate was constructible then. The current 0.26.0.dev0 pin
-carries transformers 5.14.1, which ships `gemma4`, so Gemma-4 multimodal is now
-reachable on the pin (implementation pending). Audio, the genuinely-new
-modality, is staged first on the smallest oracle-runnable audio model (Whisper,
-then Voxtral-Mini-3B on the already-landed Mistral backbone).
+([spec](../.agents/specs/gemma4-multimodal.md)) and is now **oracle-gateable —
+run-verified** (W0, 2026-07-28): the pinned 0.25.0 oracle (transformers 5.13.1)
+loads, runs, and greedily generates the ungated `unsloth/gemma-4-E4B-it`
+(`Gemma4ForConditionalGeneration`, 15.99 GB) on GB10, K=5 deterministic, and the
+32-token greedy golden is captured
+(`tests/parity/goldens/gemma4_e4b_text/`). The earlier "oracle-blocked at gate
+time" concern (transformers lacking `gemma4`) is refuted — the module is present
+and the model runs. So Gemma-4 multimodal is blocked only on implementation now
+(the per-layer-embedding / YOCO / Gemma-4-MoE backbone plus the SigLIP vision and
+USM-Conformer audio towers, all unbuilt); the SigLIP vision tower reuses the
+landed Qwen3-VL ViT scaffold. Audio, the genuinely-new modality, is staged first
+on the smallest oracle-runnable audio model (Whisper, then Voxtral-Mini-3B on the
+already-landed Mistral backbone).
 
 ### OLMo
 
