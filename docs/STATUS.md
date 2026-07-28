@@ -283,9 +283,10 @@ here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 and pass correctness (OPT-125m, Qwen3-0.6B); 18 of 75 ops are native, the rest
 fall back to CPU on unified memory. Kernel work including mma prefill attention
 (4.3x), a vectorised decode V accumulation (+1.66%) and vectorised prefill
-attention staging (+0.50%) puts warm b=1 throughput at about 96.4% of MLX-LM by default, and 99.1% with the optional MLX GEMM provider
+attention staging (+0.50%) puts warm b=1 throughput at about 95.9% of MLX-LM by default, and 97.6% with the optional MLX GEMM provider
 shape-gated to prefill (`-DVLLM_CPP_MLX=ON`), which is a numerics-deviating
-configuration. Bisecting the GEMM puts it at 97% of MLX's own
+configuration. Both figures are against an interleaved 6-run MLX-LM baseline;
+an earlier 99.1% claim used a 2-run baseline containing an outlier. Bisecting the GEMM puts it at 97% of MLX's own
 (mma issue rate 3.91 TFLOP/s), so the residual is NOT GEMM-led: it is spread
 across prefill attention, small prefill kernels and decode, none dominant. The
 decode share is 93% weight streaming at 83% of the part's memory peak, so the

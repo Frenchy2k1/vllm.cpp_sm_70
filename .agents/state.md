@@ -28890,3 +28890,32 @@ row), `feature-matrix.md` (mm row), `roadmap_v1.md` (ROAD-V1-MM), `coordination.
 (`CLAIM-MM-SPEED-AUDIO-ENC-RESIDENT`), `docs/ENVIRONMENT.md` (`VT_WHISPER_ENC_REMARSHAL`),
 `docs/STATUS.md`, `docs/BENCHMARKS.md`, `parity-ledger.md`, this entry. All record checkers
 rc=0. NOT pushed; FULL SHA reported to caller.
+
+---
+
+## 2026-07-28 — CORRECTION: MLX-gated is 97.6%, not 99.1% (two-sample baseline error)
+
+**My 99.1% claim was wrong.** It divided by a two-sample MLX-LM baseline: 27.135
+and 27.744 gen tok/s, averaged to 27.44. Re-measured INTERLEAVED with ours over 4
+ABBA blocks, MLX-LM's decode is **27.848, spread 0.34%** across six runs. The
+27.135 was an outlier and averaging it in flattered us by ~1.5 points.
+
+**Corrected** (ours spread 0.12%, MLX-LM 0.34%):
+
+| | ours | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill TTFT | **524.5 ms** | 532.6 | **+1.5% we are faster** |
+| decode | 27.23 | 27.85 | 97.8% |
+| **warm total** | **24.37** | 24.96 | **97.6%** |
+
+Default build: **95.9%**, not 96.4%.
+
+Everything qualitative stands — MLX wins prefill, the shape gate is right, the
+fallback hoist was worth 27.2 vs 17.8 — only the headline moves. The gate is
+still ~+1.7 points over default.
+
+**Lesson: a ratio is only as good as its DENOMINATOR's sample count.** I spent the
+session building a paired harness so our own A/Bs would not be read off two runs,
+then compared against a two-run external baseline. The reference needs the same
+discipline as the candidate. Downstream consumers of the wrong number (LocalAI
+PR #11137) were corrected in the same pass.
