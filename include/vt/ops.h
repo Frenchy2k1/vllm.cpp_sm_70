@@ -104,6 +104,7 @@ enum class OpId : uint8_t {
   kMoeCombine,
   kAttention,
   kAttentionDenseFast,
+  kAttentionDenseFlash,
   kDFlashBlockAttention,
   kDFlashPagedBlockAttention,
   kReshapeAndCache,
@@ -1736,6 +1737,19 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
 // Attention (byte-identical there). Separate op so kAttention stays untouched.
 void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                         const Tensor& value, const AttentionArgs& args);
+
+// Same contract and math as AttentionDenseFast, but the CUDA impl is FLASH-TILED:
+// a block of query-warps SHARES each streamed K/V tile out of shared memory (classic
+// FlashAttention K/V tiling, ported in structure from src/vt/cuda/flash_attn/src/
+// flash_fwd_kernel.h), eliminating the O(t^2) redundant global K/V reads that make
+// AttentionDenseFast memory-bound on long non-causal contexts (the Whisper audio
+// encoder, 1500 frames × 32 layers). The per-warp online-softmax arithmetic and its
+// order are UNCHANGED from AttentionDenseFast, so the CUDA output is BIT-IDENTICAL to
+// it (K/V bytes merely sourced from shared memory) ⇒ token-identical by construction.
+// On CPU it dispatches to the SAME kernel as Attention (byte-identical). Separate op
+// so kAttention / kAttentionDenseFast stay untouched.
+void AttentionDenseFlash(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                         const Tensor& value, const AttentionArgs& args);
 
 // DFlash in-block attention (SPEC-DFLASH D2, DF-DRAFT-MODEL) — the project's FIRST
 // non-causal / bidirectional attention primitive. See DFlashBlockAttentionArgs for

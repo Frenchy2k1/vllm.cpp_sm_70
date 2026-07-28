@@ -38,9 +38,14 @@ MATRICES = {
     # `kDFlashPagedBlockAttention` reading the growing context from a paged K/V cache +
     # persistent device block_table instead of a materialized combined buffer, the
     # CUDA-graph draft-attention primitive; SPEC-DFLASH D12 Part B, `CLAIM-DFLASH-D12`).
+    # 37 since 2026-07-28: +`KERNEL-ATTN-DENSE-FLASH` (the SHARED-MEMORY-TILED flash
+    # variant of `AttentionDenseFast` for long non-causal contexts — a genuinely
+    # separate op `kAttentionDenseFlash` that tiles K/V across a block of query-warps
+    # in shared memory, for the Whisper AUDIO encoder; multimodal-speed §14,
+    # `CLAIM-MM-SPEED-AUDIO-ENC-KERNEL`).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 36),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 37),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
