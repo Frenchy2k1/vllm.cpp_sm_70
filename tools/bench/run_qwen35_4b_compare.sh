@@ -42,11 +42,32 @@ fi
 ninja=$(sed -n 's/^CMAKE_MAKE_PROGRAM:[^=]*=//p' "$cmake_cache")
 nvcc=$(sed -n 's/^CMAKE_CUDA_COMPILER:[^=]*=//p' "$cmake_cache")
 host_cxx=$(sed -n 's/^CMAKE_CUDA_HOST_COMPILER:[^=]*=//p' "$cmake_cache")
-cudart=$(sed -n 's/^CUDA_CUDART:[^=]*=//p' "$cmake_cache")
-curand=$(sed -n 's/^CUDA_curand_LIBRARY:[^=]*=//p' "$cmake_cache")
 test -x "$ninja"
 test -x "$nvcc"
 test -x "$host_cxx"
+libstdcpp=$($host_cxx -print-file-name=libstdc++.so.6)
+test -f "$libstdcpp"
+
+# A venv may carry its OWN CUDA toolkit rather than borrowing the Nix one. The
+# pinned oracle does: installing torch from the CUDA-13 wheels brings nvcc,
+# cudart, nvrtc and the headers into site-packages/nvidia. For that venv the
+# symlink farm below is not merely redundant, it is WRONG — it would put a 12.9
+# toolkit ahead of the 13.x the venv's extensions were compiled against, and
+# FlashInfer's JIT would then compile against mismatched headers. VLLM_CUDA_HOME
+# selects the venv's own toolkit and skips the farm entirely.
+if test -n "${VLLM_CUDA_HOME:-}"; then
+  cuda_combined=$VLLM_CUDA_HOME
+  test -x "$cuda_combined/bin/nvcc"
+  test -d "$cuda_combined/include"
+  test -d "$cuda_combined/lib"
+  vllm_path=$cuda_combined/bin:$(dirname "$ninja"):$(dirname "$host_cxx"):$PATH
+  vllm_ld_library_path=$(dirname "$libstdcpp"):$cuda_combined/lib:/run/opengl-driver/lib
+  vllm_cpath=$cuda_combined/include
+  vllm_library_path=$cuda_combined/lib
+  vllm_nix_ldflags="-L$cuda_combined/lib -L/run/opengl-driver/lib"
+else
+cudart=$(sed -n 's/^CUDA_CUDART:[^=]*=//p' "$cmake_cache")
+curand=$(sed -n 's/^CUDA_curand_LIBRARY:[^=]*=//p' "$cmake_cache")
 test -f "$cudart"
 test -f "$curand"
 cuda_home=$(dirname "$(dirname "$nvcc")")
@@ -79,10 +100,12 @@ ln -sfn /run/opengl-driver/lib/libcuda.so \
 if test -d "$cuda_home/nvvm"; then
   ln -sfn "$cuda_home/nvvm" "$cuda_combined/nvvm"
 fi
-libstdcpp=$($host_cxx -print-file-name=libstdc++.so.6)
-test -f "$libstdcpp"
 vllm_path=$(dirname "$ninja"):$(dirname "$nvcc"):$(dirname "$host_cxx"):$PATH
 vllm_ld_library_path=$(dirname "$libstdcpp"):$(dirname "$cudart"):$(dirname "$curand"):/run/opengl-driver/lib
+vllm_cpath="$cudart_home/include:$curand_include"
+vllm_library_path="$cudart_home/lib:$(dirname "$curand")"
+vllm_nix_ldflags="-L$cudart_home/lib -L$(dirname "$curand") -L/run/opengl-driver/lib"
+fi
 
 cpp_args=(
   --model "$model" --dataset-path "$dataset" --num-prompts 128
@@ -101,9 +124,9 @@ vllm_env=(
   LD_LIBRARY_PATH="$vllm_ld_library_path"
   CUDA_HOME="$cuda_combined"
   CUDA_PATH="$cuda_combined"
-  CPATH="$cudart_home/include:$curand_include"
-  LIBRARY_PATH="$cudart_home/lib:$(dirname "$curand")"
-  NIX_LDFLAGS="-L$cudart_home/lib -L$(dirname "$curand") -L/run/opengl-driver/lib"
+  CPATH="$vllm_cpath"
+  LIBRARY_PATH="$vllm_library_path"
+  NIX_LDFLAGS="$vllm_nix_ldflags"
   HF_HOME="$root/.hf-cache"
   XDG_CACHE_HOME="$root/.vllm-cache"
   TORCHINDUCTOR_CACHE_DIR="$root/.torchinductor-cache"

@@ -549,6 +549,9 @@ InternLM2 plus a sliding window).
 
 ## Build and test lanes
 
+An oracle built from source at the actual parity pin now exists alongside the
+0.24.0 one; re-measuring the denominator against it is pending.
+
 One open lead is on record from the same profiling pass: cuBLASLt resolves
 Ampere-class GEMM kernels on this Blackwell device. It is unmeasured and may be
 a non-issue, since it lands on the axis we already pass.
