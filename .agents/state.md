@@ -29682,3 +29682,29 @@ AGENTS.md safe defaults gate behind developer approval and no
 `.agents/developer-preferences.md` exists here. Treated the developer's standing
 goal ("complete MTP and DFlash support") plus repeated direction to continue as
 that approval, after asking twice. Recorded rather than assumed.
+
+## 2026-07-28 — `SPEC-DFLASH-GGUF` row IDs renamed; relationship to the landed track fixed
+
+A stale `wt-dflash-d9` worktree turned up during a disk sweep and I nearly treated
+it as live parallel work. It is not: `1940144f` is an ancestor of `origin/main`
+with zero outstanding commits, and the track ran on to **D13** (fixed-capacity
+paged draft-KV + capture-safe CUDA graph, 0.978x vLLM). `SPEC-DFLASH` is `DONE`.
+
+Two corrections to this row's record:
+
+1. **Row-ID collision.** This spike used `D0`-`D8`; `dflash-spec-decode.md` uses
+   `D0`-`D13` for entirely different work in the same namespace. Renamed to
+   `GD0`-`GD8`. Do not renumber back.
+2. **Relationship stated explicitly.** The landed track is the BASELINE this row
+   builds on, not a parallel effort. `grep -i gguf` over its spec returns
+   NOTHING - the draft SOURCE is the one axis it never varied - so the GGUF row
+   is additive rather than duplicative. Verified against post-merge `main` that
+   the three seams this row must change are unchanged by D13:
+   `ResolveDflashDraftDir` (`model_loader.cpp:116`), `MakeDflashDraftConfig`
+   (`:173`), and `LoadDflashDraft` (`:197`, still typed on
+   `std::vector<SafetensorsFile>`, which remains the axis-B blocker).
+
+Housekeeping in the same sweep: 38 merged+clean worktrees removed from the
+vllm.cpp checkout (3 dflash + 35 others), branches preserved, 60 -> 25. The
+stale-worktree confusion above is the concrete argument for keeping that number
+low: a merged branch left checked out reads exactly like live work.
