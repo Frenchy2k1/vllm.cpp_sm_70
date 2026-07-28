@@ -288,7 +288,8 @@ shape-gated to prefill (`-DVLLM_CPP_MLX=ON`), which is a numerics-deviating
 configuration. Both figures are against an interleaved 6-run MLX-LM baseline;
 an earlier 99.1% claim used a 2-run baseline containing an outlier. With MLX
 gated, prefill is 1.5% AHEAD of MLX-LM and the entire remaining deficit is
-decode. Bisecting the GEMM puts it at 97% of MLX's own
+decode, where the GEMV already runs at 83% of memory peak and no further lever is
+currently identified for single-stream. Bisecting the GEMM puts it at 97% of MLX's own
 (mma issue rate 3.91 TFLOP/s), so the residual is NOT GEMM-led: it is spread
 across prefill attention, small prefill kernels and decode, none dominant. The
 decode share is 93% weight streaming at 83% of the part's memory peak, so the
