@@ -8614,3 +8614,11 @@ Ampere/Hopper+datacenter/Pascal-Volta-Turing) is now tracked as roadmap row
 each fast-path is derive-and-shipped and (where a board is reachable) runtime-gated
 - AGX Orin (sm_87) and NVIDIA Thor (Blackwell) first. Evidence:
 `.agents/specs/cuda-arch-*.md`, `.agents/backend-matrix.md`.
+
+**DeepSeek-V4-Flash HW-fit correction (2026-07-28, records-only, NOT APPLICABLE — no measurement).**
+The W1 "does not fit one GB10" verdict was NVFP4-only (156.7 GiB). The ungated
+`unsloth/DeepSeek-V4-Flash-GGUF` `UD-IQ2_XXS` (90.9 GB, 3 shards) FITS the 119 GiB
+GB10 with ~28 GiB headroom (measured via HF `files_metadata`). Two vehicles:
+single-Spark ~2-bit GGUF (reference: llama.cpp-on-box; needs a V4-GGUF loader + IQ
+i-quant dequant) or 2x-Spark NVFP4/fp8. No throughput number is taken or owed until
+the forward (W3-W8) lands. `benchmark_binding=false`.

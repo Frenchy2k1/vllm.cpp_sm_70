@@ -30622,3 +30622,17 @@ M2a before the M2c e2e). dgx GB10 CUDA `flock`, weights via
   MEMORY-INFEASIBLE**, not merely disk-contended; reaching a runnable gate needs
   multi-node TP / CPU offload / a smaller quant. Row stays SPIKE. All 6 record checkers
   rc=0. NEXT: W3 (512-wide MLA dense-first) once a multi-GPU/offload run path exists.
+
+---
+
+## 2026-07-28 — DeepSeek-V4-Flash single-Spark IS viable via UD-IQ2_XXS GGUF (user correction)
+
+User flagged `DeepSeek-V4-Flash-UD-IQ2_XXS-*.gguf` fits — CONFIRMED (HF files_metadata):
+`unsloth/DeepSeek-V4-Flash-GGUF` UD-IQ2_XXS = **90.9 GB** (3 shards), fits the 119 GiB
+GB10 with ~28 GiB headroom (also UD-IQ1_S 82.5 / UD-IQ1_M 86.9 / UD-IQ2_M 90.9 /
+UD-Q2_K_XL 96.8 all fit; UD-IQ3_S+ 117-162 GB don't). Corrects the W1 "does not fit"
+verdict, which was NVFP4-only (156.7 GiB). TWO vehicles: single-Spark IQ2_XXS GGUF vs
+2×-Spark NVFP4/fp8. GGUF caveat: pinned vLLM can't load V4-from-GGUF → reference is
+llama.cpp-on-box (derive-and-ship), and we need a V4-GGUF loader + IQ i-quant dequant
+(IQ1_S/IQ2_XXS/IQ2_M — NOT in our C4 K-quant set). Appended to specs/deepseek-v4-flash.md
+§HW-FIT CORRECTION. Records-only.
