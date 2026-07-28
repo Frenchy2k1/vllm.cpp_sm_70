@@ -146,30 +146,53 @@ TEST_CASE("qwen3_5_27b_vision_tower_speed_AB") {
   const auto p1 = clock::now();
   const double prepare_ms = std::chrono::duration<double, std::milli>(p1 - p0).count();
 
-  std::vector<double> fast_ms;
-  std::vector<float> tower_fast;
-  for (int r = 0; r < kReps; ++r) {
-    const auto t0 = clock::now();
-    std::vector<float> tower =
-        vllm::multimodal::Qwen3VLVisionForward(img.pixel_values_bf16, grid, *dw, vcfg, *gpu);
-    const auto t1 = clock::now();
-    if (r == 0) tower_fast = tower;
-    if (r > 0) fast_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
-  }
+  // Same-binary attention A/B: warp AttentionDenseFast (VT_QWEN3VL_ATTN_WARP=1) vs the
+  // default flash-tiled AttentionDenseFlash. Both use resident weights. The flash
+  // kernel is byte-identical to the warp kernel by construction (spec §16), so the
+  // tower output must match to the bit — asserted below.
+  auto run_arm = [&](const char* warp_env) {
+    if (warp_env != nullptr)
+      setenv("VT_QWEN3VL_ATTN_WARP", warp_env, 1);
+    else
+      unsetenv("VT_QWEN3VL_ATTN_WARP");
+    std::vector<double> ms;
+    std::vector<float> out;
+    for (int r = 0; r < kReps; ++r) {
+      const auto t0 = clock::now();
+      std::vector<float> tower =
+          vllm::multimodal::Qwen3VLVisionForward(img.pixel_values_bf16, grid, *dw, vcfg, *gpu);
+      const auto t1 = clock::now();
+      if (r == 0) out = tower;
+      if (r > 0) ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    return std::make_pair(Median(ms), out);
+  };
 
-  // fast-path output BIT-identical to the baseline host path.
-  REQUIRE(tower_fast.size() == tower_ref.size());
+  const auto [warp_med, tower_warp] = run_arm("1");     // warp AttentionDenseFast
+  const auto [flash_med, tower_flash] = run_arm(nullptr);  // flash AttentionDenseFlash (default)
+
+  // FAST(warp) output BIT-identical to the baseline host path.
+  REQUIRE(tower_warp.size() == tower_ref.size());
   size_t mism = 0;
-  for (size_t i = 0; i < tower_fast.size(); ++i)
-    if (tower_fast[i] != tower_ref[i]) ++mism;
-  MESSAGE("fast vs baseline tower mismatches: " << mism << "/" << tower_fast.size());
+  for (size_t i = 0; i < tower_warp.size(); ++i)
+    if (tower_warp[i] != tower_ref[i]) ++mism;
+  MESSAGE("warp vs baseline tower mismatches: " << mism << "/" << tower_warp.size());
   CHECK(mism == 0);
 
+  // Flash output BIT-identical to warp (byte-exact lever contract).
+  REQUIRE(tower_flash.size() == tower_warp.size());
+  size_t mism_fw = 0;
+  for (size_t i = 0; i < tower_flash.size(); ++i)
+    if (tower_flash[i] != tower_warp[i]) ++mism_fw;
+  MESSAGE("flash vs warp tower mismatches: " << mism_fw << "/" << tower_flash.size());
+  CHECK(mism_fw == 0);
+
   const double base_med = Median(base_ms);
-  const double fast_med = Median(fast_ms);
   MESSAGE("=== Qwen3.6-27B vision-tower A-B (448x448 image, 784 patches, 196 tokens) ===");
   MESSAGE("BASELINE (host overload: marshal+compute per call) median = " << base_med << " ms");
-  MESSAGE("FAST     (resident forward, compute only)         median = " << fast_med << " ms");
+  MESSAGE("FAST warp  (resident, AttentionDenseFast)          median = " << warp_med << " ms");
+  MESSAGE("FAST flash (resident, AttentionDenseFlash, ships)  median = " << flash_med << " ms");
   MESSAGE("one-time PrepareVisionDeviceWeights (marshal)             = " << prepare_ms << " ms");
-  MESSAGE("=> per-image tower speedup " << (base_med / fast_med) << "x  (denominator vLLM ~250 ms)");
+  MESSAGE("=> per-image tower warp->flash speedup " << (warp_med / flash_med)
+          << "x  (denominator vLLM ~250 ms)");
 }

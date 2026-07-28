@@ -1684,6 +1684,44 @@ forward (NOT committed). The audio DECODE axis stays DONE-on-speed
 (S12, 0.97x, BEATS); audio TTFT/encoder stays **speed-pending / PARTIAL**. No mm row advances to DONE
 this pass.
 
+**MULTIMODAL SPEED - QWEN VISION-FORWARD: the S14 flash kernel extended to the tower, byte-exact;
+ATTRIBUTION REFUTED the assumed lever - the tower already BEATS vLLM (2026-07-28,
+`CLAIM-MM-SPEED-QWEN-IMAGE` [spec](../.agents/specs/multimodal-speed.md) S16).**
+`benchmark_binding=false` (tower A-B via a test driver; vLLM eager encode is the honest denominator -
+vLLM does NOT graph the encoder, `compile_mm_encoder:False`). dgx GB10 sm_121a, build cutlass 4.5.0 +
+FA2 arch 121a (banners CONFIRMED), `-Werror` 0-warn; GPU under `flock`, sole owner, cold rep dropped.
+GPU CAMPAIGN #2 (user-directed 2/3). **W0 attribution** (nsys `cuda_gpu_kern_sum`, 27B tower, 448x448
+image / 784 patches / 27 ViT blocks / head_dim 72): the post-S7 148 ms tower forward is **~85% the dense
+attention** (`AttentionWarpKernel` **4.66 ms/block x 27 = ~126 ms**), cutlass/nvjet GEMMs ~10%, glue <5%.
+**W1 lever (byte-exact):** routed the vision-tower per-frame self-attention (hd-72, non-causal) from the
+warp `vt::AttentionDenseFast` to the S14 flash-tiled `vt::AttentionDenseFlash` (head_dim-generic
+`npl=(d+31)/32`; per-warp online-softmax copied verbatim from the warp kernel, only K/V from shared-memory
+tiles => BIT-IDENTICAL). No new kernel; `kAttention`/`kAttentionDenseFast` untouched => text/audio
+byte-identical. **A/B (same-binary, `flock`, rep0 dropped, 27B tower):** warp **148.3 -> flash 142.3 ms
+= 1.04x** (per-kernel 4.66 -> 4.37 ms/block). **This REFUTES the assumed attention lever:** unlike audio
+(S14, t=1500, warp->flash 1.82x), the vision attention at t=784 (single image window) is
+serial-latency-bound - one warp per query steps a dependent 784-key online-softmax chain, and the GB10 L2
+already serves the "redundant" global K/V reads flash eliminates - so tiling recovers only ~6 ms.
+**HONEST HEADLINE: the Qwen image/video mm-forward tower ALREADY BEATS vLLM - 142 ms vs vLLM 0.25.0
+~250 ms eager encode = 0.57x** (carried-forward S7 denominator; not re-measured - OOM-reboot risk of a
+big oracle alongside the tree, and we are well under it). **Correctness (RED line, HELD, byte-exact):**
+27B image e2e STRICT 32/32 (54/54), 4B image 32/32 (46/46), 27B video 32/32 (gap 0 nats, 27/27),
+`test_ops_attention` 37239/37239; bench flash-vs-warp tower **0/1,003,520 mismatches**; goldens md5
+UNCHANGED before==after (`qwen3_5_27b 3bc5f231...`, `qwen3vl_text b7221f22...`, `qwen3_5_27b_video
+bf14a962...`, `qwen3vl_video 09b2fce3...`). **Proof-of-run:** nsys default 4B e2e `AttentionDenseFlashKernel`
+**24 inst** (= 24 vision blocks), ZERO `AttentionWarpKernel` on the mm path. **RED:** corrupt flash
+V-accum (`p*Load(sV) -> 2*p*Load(sV)`) -> 4B e2e 30/46 FAIL -> restore -> 46/46. **compute-sanitizer
+--tool memcheck 0 errors.** The lever lands FREE + byte-exact + unifies the codebase (tower + audio
+encoder now both on `AttentionDenseFlash`). Residual (NOT needed for parity): tensor-core MMA hd-72
+non-causal attention (S14.5 lever #1) + batched c2+/serving. **Repro:** `git archive` the commit to
+`dgx.casa:~/vllmcpp-mmspeed`, `cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a && cmake
+--build build-cuda --target bench_qwen3_5_vl_tower test_qwen3_5_vl_e2e test_qwen3vl_e2e`; then
+`flock $HOME/gpu.lock ./build-cuda/tests/bench_qwen3_5_vl_tower` prints the warp (`VT_QWEN3VL_ATTN_WARP=1`)
+vs flash A/B + the bit-identity assert; `nsys profile -t cuda -o /tmp/e ./build-cuda/tests/test_qwen3vl_e2e;
+nsys stats --report cuda_gpu_kern_sum /tmp/e.nsys-rep | grep Attention` proves 24 flash-kernel instances /
+zero warp on the default path.
+
 **Gemma-4 MULTIMODAL (image+video+audio) + AUDIO track - READINESS ASSESSED, NO GATE
 (2026-07-25, `CLAIM-GEMMA4-MULTIMODAL` [spec](../.agents/specs/gemma4-multimodal.md)).**
 Design + oracle/checkpoint/HW-fit spike only (no build, no run). Gemma-4 mm =

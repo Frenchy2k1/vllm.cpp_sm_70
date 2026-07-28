@@ -122,6 +122,31 @@ ms EXACTLY. Trajectory §13→§14→§15: **1834 → 1375 → 729 ms.** **HONES
 the LARGE gap-closer remains lever #1 (tensor-core MMA hd-64 non-causal FA2). Audio TTFT/encoder stays
 speed-pending / PARTIAL. See §15.
 
+**UPDATE 2026-07-28 (`CLAIM-MM-SPEED-QWEN-IMAGE`, §16) — the §14 flash kernel EXTENDED to the Qwen VISION
+tower, byte-exact; ATTRIBUTION-FIRST REFUTED the assumed big lever — the tower is ALREADY 0.57× vLLM.**
+Campaign #2 target = the Qwen image/video mm-forward SPEED. ATTRIBUTION (nsys `cuda_gpu_kern_sum`, 27B
+tower, 448×448 image / 784 patches): the post-§7 148 ms forward is **~85% the dense attention kernel**
+(`AttentionWarpKernel` **4.66 ms/block × 27 = ~126 ms**), GEMMs ~10% (cutlass/nvjet), norm/rope/gelu/add
+<5%. Routed the tower attention (head_dim 72, non-causal) from the warp `AttentionDenseFast` to the §14
+flash-tiled `vt::AttentionDenseFlash` (byte-identical by construction — same per-warp online-softmax, only
+K/V read from shared-memory tiles; head_dim-generic, `npl=(d+31)/32` handles 72). **BYTE-EXACT:** bench
+flash-vs-warp tower output **0/1,003,520 mismatches**; 27B image e2e STRICT **32/32** (54/54), 4B image
+**32/32** (46/46), 27B video **32/32** (gap 0 nats, 27/27), `test_ops_attention` 37239/37239; goldens md5
+UNCHANGED (`qwen3_5_27b 3bc5f231…`, `qwen3vl_text b7221f22…`, `qwen3_5_27b_video bf14a962…`, `qwen3vl_video
+09b2fce3…`, before==after). Proof-of-run: nsys default 4B e2e = `AttentionDenseFlashKernel` 24 inst (= 24
+vision blocks), ZERO `AttentionWarpKernel` on the mm path. RED (corrupt flash V-accum → 30/46 FAIL →
+restore → 46/46); compute-sanitizer memcheck **0 errors**. **A/B (same-binary, `flock`, rep0 dropped, 27B
+tower):** warp **148.3 → flash 142.3 ms = 1.04×** — **REFUTES** the assumed attention lever: unlike audio
+(§14, t=1500, 1.82×) the vision attention at t=784 is **serial-latency-bound, NOT K/V-bandwidth-bound**
+(one warp per query stepping a dependent 784-key online-softmax chain; L2 already serves the redundant
+reads), so flash tiling recovers only ~6 ms. **The honest finding: the Qwen image mm-forward tower ALREADY
+BEATS vLLM — 142 ms vs vLLM 0.25.0 ~250 ms eager encode = 0.57×** (carried-forward §7 denominator; not
+re-measured — OOM-reboot risk, and we are well under it). This lever lands the free byte-exact 1.04× and
+unifies the codebase (tower + audio encoder now both use the best dense kernel). The ONE remaining large
+lever (a tensor-core MMA hd-72 non-causal attention, §14.5 lever #1) would widen the lead further but is
+NOT needed for parity. Image/video mm-forward = correctness-DONE + speed-BEATS-vLLM; the umbrella MM row
+stays PARTIAL for batched c2+/serving ingestion. See §16.
+
 ---
 
 ## 1. A-B methodology (how these numbers were grounded)
@@ -1111,3 +1136,98 @@ scalar recurrence with an `mma.sync` parallel reduction) — that is the dedicat
 lever that can actually approach vLLM parity. The conv round-trip removal (needs a
 device im2col kernel) is a smaller follow-on. Audio **TTFT/encoder stays speed-pending
 / `PARTIAL`**; audio DECODE stays DONE-on-speed (§12, BEATS). No mm row advances to DONE.
+
+## 16. QWEN VISION TOWER — flash kernel extended to the image/video mm-forward; attribution REFUTES the assumed lever (`CLAIM-MM-SPEED-QWEN-IMAGE`, 2026-07-28)
+
+**Base:** local `main` `0a07ac76` (confirmed `git rev-parse HEAD`; working edits on top).
+**Build:** `dgx.casa:~/vllmcpp-mmspeed` (`git archive` of the working tree over the reused
+§14/§15 tree; CUDA `build-cuda`, cutlass 4.5.0 + FA2 sm_121a arch 121a — "CUTLASS found"
++ "FlashAttention-2 … ENABLED" banners CONFIRMED, `-Werror` 0-warn, exit 0). ALL GPU
+under `flock $HOME/gpu.lock`, sole owner (`nvidia-smi` idle, `local-ai-worker` absent),
+cold rep0 dropped. GPU CAMPAIGN #2 (user-directed 2/3): close the Qwen image/video
+mm-forward SPEED gap. ATTRIBUTION-FIRST.
+
+### 16.1 W0 — ATTRIBUTION (measure-first — [[profile-vllm-actual-kernels-port-1to1]])
+
+The task's assumed lever was the vision-tower attention kernel (the §7/§14 story). nsys
+`cuda_gpu_kern_sum` of the 27B tower forward (448×448 image, 784 patches, 27 ViT blocks,
+head_dim 72), warp arm:
+
+| Kernel | avg / instance | × per forward | share |
+|---|---|---|---|
+| `AttentionWarpKernel` (`AttentionDenseFast`) | **4.66 ms** | ×27 = **~126 ms** | **~85%** |
+| cutlass `s16816gemm` + nvjet mma (QKV/proj/FC GEMMs) | 43–255 µs | (many) | ~10% |
+| `AddKernel` / `LayerNormKernel` / `RopeFromCacheKernel` / `GeluKernel` | 12–25 µs | (glue) | <5% |
+
+So attention IS the dominant kernel — but the question the profile actually answers is
+whether the §14 flash tiling *helps here*. It barely does (§16.3): the vision attention
+is **serial-latency-bound**, not K/V-bandwidth-bound.
+
+### 16.2 W1 — the lever (extend the §14 flash kernel to the vision tower, byte-exact)
+
+`src/vllm/model_executor/models/qwen3_vl_vision.cpp`: the per-frame windowed
+self-attention now defaults to `vt::AttentionDenseFlash` (was `vt::AttentionDenseFast`).
+A/B knobs: `VT_QWEN3VL_ATTN_WARP=1` → warp `AttentionDenseFast` (the pre-§16 default),
+`VT_QWEN3VL_ATTN_EAGER=1` → naive `kAttention`. The flash op is head_dim-generic
+(`npl=(d+31)/32` handles 72; shmem `2·kFlashBc·d·sizeof` = 18.4 KiB at d=72 < 48 KiB) and
+its per-warp online-softmax recurrence is copied VERBATIM from `AttentionWarpKernel`
+(identical per-lane grouping `lane+32k`, butterfly `__shfl_xor`, sequential j-order, f32
+`m`/`l`/`acc`) — only K/V come from shared-memory tiles ⇒ **BIT-IDENTICAL output**. No new
+kernel (`KERNEL-ATTN-DENSE-FLASH` scope extended); `kAttention`/`kAttentionDenseFast`
+untouched ⇒ text/audio/other-model byte-identical by construction. Upstream grounding:
+the flash STRUCTURE is the vendored FA2 `compute_attn_1rowblock`
+(`src/vt/cuda/flash_attn/src/flash_fwd_kernel.h:52`); the vision non-causal dispatch
+mirrors vLLM `Qwen2_5_VisionAttention.forward` (`qwen2_5_vl.py:397-460`,
+`flash_attn_varlen_func`) @ e24d1b24. Bench extended with the warp-vs-flash arm +
+bit-identity assert (`tests/vllm/multimodal/bench_qwen3_5_vl_tower.cpp`).
+
+### 16.3 RESULT — A/B REFUTES the big lever; the tower already BEATS vLLM
+
+| Vehicle | warp `AttentionDenseFast` (`VT_QWEN3VL_ATTN_WARP=1`) | flash `AttentionDenseFlash` (ships) | Δ |
+|---|---|---|---|
+| **per-image tower forward** (27B, resident weights, rep0 dropped) | **148.3 ms** | **142.3 ms** | **1.04×** |
+| dense-attention kernel (nsys, /block) | 4.66 ms | 4.37 ms | 1.06× |
+
+- **1.04× — small, and it REFUTES the assumed lever.** Unlike audio (§14: t=1500, warp→flash
+  1.82×), the vision attention at t=784 (single image window) is **serial-latency-bound**: one
+  warp per query steps a dependent 784-key online-softmax chain, and the GB10 L2 already serves
+  the "redundant" global K/V reads the flash tiling eliminates — so tiling recovers only ~6 ms.
+- **The honest headline: the Qwen image mm-forward tower ALREADY BEATS vLLM.** Flash 142 ms vs
+  vLLM 0.25.0 ~250 ms eager encode (`compile_mm_encoder:False`, fair eager-vs-eager) = **0.57×**.
+  Denominator carried forward from §7 (not re-measured: OOM-reboot risk of a big oracle alongside
+  the tree, and we are well under it). Video shares this tower per frame ⇒ same verdict.
+- The lever still lands: it is FREE, byte-exact, widens our lead, and unifies the codebase (vision
+  tower + audio encoder now both on the best dense kernel `AttentionDenseFlash`).
+
+### 16.4 CORRECTNESS (the RED line — HELD, byte-exact)
+
+- 27B image e2e `test_qwen3_5_vl_e2e` STRICT **32/32** (54/54); 4B image `test_qwen3vl_e2e`
+  STRICT **32/32** (46/46); 27B video `test_qwen3_5_vl_video_e2e` STRICT **32/32** (gap 0 nats,
+  27/27); `test_ops_attention` **37239/37239** (`kAttention` intact).
+- Bench flash-vs-warp tower output **0/1,003,520 mismatches** (byte-identical); warp-vs-baseline
+  0/1,003,520 (resident path intact).
+- Goldens md5 **UNCHANGED** before==after: `qwen3_5_27b/gen_tokens_i32.bin 3bc5f231…`,
+  `qwen3vl_text/gen_tokens_i32.bin b7221f22…`, `qwen3_5_27b_video/gen_tokens_i32.bin bf14a962…`,
+  `qwen3vl_video/gen_tokens_i32.bin 09b2fce3…`.
+- **Proof-of-run:** nsys `cuda_gpu_kern_sum` of the DEFAULT 4B image e2e = `AttentionDenseFlashKernel`
+  **24 instances** (= 24 vision blocks), **ZERO `AttentionWarpKernel`** on the mm path
+  (`PagedAttentionKernel` is the untouched text decode).
+- **RED:** corrupt the flash V-accumulation (`p·Load(sV,…) → 2·p·Load(sV,…)`) → 4B e2e **30/46
+  FAIL** → restore → **46/46**.
+- **compute-sanitizer** `--tool memcheck` on the flash 4B e2e = **0 errors** (tower not graphed ⇒
+  capture-safety N/A).
+- Text/other-model SACRED: additive op-select, `kAttention`/`kAttentionDenseFast` untouched
+  (`git diff`) ⇒ byte-identical by construction.
+
+### 16.5 HONEST VERDICT + ranked residual
+
+Byte-exact 1.04× landed; the profile REFUTED the assumption that the flash kernel would
+close a big gap here — because there is no gap to close on the tower: **we already run it
+at 0.57× vLLM**. The image/video mm-forward is correctness-DONE (STRICT 32/32) AND
+speed-BEATS-vLLM. **Ranked residual (NOT needed for parity, NOT implemented):**
+1. **Tensor-core MMA hd-72 non-causal attention** (§14.5 lever #1, the same LARGE
+   dedicated-slot lever as the audio encoder) — replaces the serial-latency-bound scalar
+   recurrence with an `mma.sync` parallel reduction; would widen the tower lead further.
+2. **Batched/graphed mm SERVING (c2+) + `image_url`/`video_url` ingestion** — the
+   structural umbrella-MM gap (lever #3), unchanged. The umbrella MM row stays `PARTIAL`
+   for this; the vision-forward speed axis is done (beats vLLM). `benchmark_binding=false`.
