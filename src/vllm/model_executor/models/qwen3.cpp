@@ -81,13 +81,21 @@ using namespace dense_attn;
 // quantization scheme headers. Byte-identical: the methods run the exact same
 // vt:: ops in the same order the inline path did.
 DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
-              const Tensor& dh2, int64_t /*T*/) {
+              const Tensor& dh2, int64_t /*T*/,
+              const TensorParallel* tp = nullptr) {
   const int64_t I = cfg.intermediate_size;
+  // gate_up is a MergedColumnParallelLinear (sharded on I, no comm); down is a
+  // RowParallelLinear whose per-rank partial [T,H] products are all-reduced below
+  // (linear.py:1766). tp_size==1 ⇒ whole tensors + the all-reduce is a no-op, so
+  // this is byte-identical to the single-GPU MLP.
   auto gate_up = layers::MakeMlpGateUpMethod(w.gate_up_proj, w.gate_proj_fp4,
                                              w.up_proj_fp4, I);
   DBuf act = gate_up->Apply(d, dh2);
   auto down = layers::MakeLinearMethod(w.down_proj, w.down_proj_fp4);
-  return down->Apply(d, act.t(), DType::kBF16);
+  DBuf out = down->Apply(d, act.t(), DType::kBF16);
+  Tensor ot = out.t();
+  TpAllReduceSum(tp, d.q, ot);
+  return out;
 }
 
 // One dense decoder layer (qwen3.py::Qwen3DecoderLayer): input norm (std
@@ -95,7 +103,8 @@ DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
 // [T,H]) is the delta; `res` (bf16 [T,H]) the residual accumulator.
 void RunLayer(Dev d, const Qwen3DenseLayerWeights& layer, const HfConfig& cfg,
               DBuf& hidden, DBuf& res, const StepInputs& si,
-              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T) {
+              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
+              const TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
@@ -107,7 +116,7 @@ void RunLayer(Dev d, const Qwen3DenseLayerWeights& layer, const HfConfig& cfg,
     vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, vt::RmsNormArgs{eps, false}, &res.t());
   }
 
-  DBuf attn = AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T);
+  DBuf attn = AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T, tp);
 
   Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
@@ -117,7 +126,7 @@ void RunLayer(Dev d, const Qwen3DenseLayerWeights& layer, const HfConfig& cfg,
     vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
   }
 
-  hidden = MlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+  hidden = MlpBlock(d, layer.mlp, cfg, dh2.t(), T, tp);
 }
 
 // GatherRows: gather the idx-indexed rows of `src` [.,H] into contiguous `dst`.

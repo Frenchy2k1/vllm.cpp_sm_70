@@ -125,9 +125,16 @@ backend-specific transports (NCCL / RDMA / MLX-ring), mirroring vLLM's
 (`include/vt/communicator.h` + `src/vt/communicator.cpp`) with
 AllReduce/AllGather/Send/Recv, proven by a CPU in-process multi-rank gate
 (`tests/vt/test_communicator.cpp`, a real cross-rank sum, no GPU) and a
-byte-identical `world_size==1` no-op. The multi-GPU (TP/PP), multi-Spark, and
-MLX transports remain unbuilt — those legs are HW-blocked (no ≥2-GPU box, no
-2-Spark cable, no 2-Mac cluster here). Full scope + seam map:
+byte-identical `world_size==1` no-op. **W2 landed (2026-07-28) same-host
+multi-GPU tensor parallel (CPU-gated)**: the multi-device backend registry
+(per-`Device{type,index}`, byte-neutral device 0), collective `OpId` routing, the
+NCCL transport (mirrors `pynccl.py`, built only under `-DVLLM_CPP_NCCL=ON`), and
+`TensorParallel` wired into the Qwen3-dense forward — the sharded-matmul +
+all-reduce is proven **equal to the unsharded tp=1 forward** (`test_tp_forward`,
+60/60, RED-verified, no GPU); `tp_size==1` byte-identical. The **real TP-2
+multi-GPU RUN + the NCCL build-verify remain HW-blocked** (no ≥2-GPU box), as do
+pipeline parallel, multi-Spark and MLX. Full scope + seam map + the 2× RTX-6000-Ada
+recipe:
 [.agents/specs/scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
 Every parallelism MODE vLLM has (tensor / pipeline / data / expert / sequence /
 context parallel) is now enumerated and grounded in upstream source, mapped onto

@@ -471,13 +471,14 @@ extensibility-track concern (`ROAD-V1-C1`/`ROAD-V1-D1` adjacent) — a new
 interconnect becomes one transport provider, not a model-forward edit. Full
 scope, seam map and W-plan: [scale-out-distributed.md](specs/scale-out-distributed.md).
 Scoped by `CLAIM-SCALE-OUT-SPIKE`; **W1 landed** the abstraction leg
-(`CLAIM-SCALE-OUT-W1`, 2026-07-28) — `BACKEND-DISTRIBUTED-COMM` is now `ACTIVE`,
-the other 4 rows stay `SPIKE`.
+(`CLAIM-SCALE-OUT-W1`, 2026-07-28) and **W2 landed** same-host multi-GPU TP
+(`CLAIM-SCALE-OUT-W2`, 2026-07-28) — `BACKEND-DISTRIBUTED-COMM` and
+`BACKEND-DISTRIBUTED-TP` are now `ACTIVE`, the other 3 rows stay `SPIKE`.
 
 | Leg | Scale-out row | What it adds | Gate HW |
 |---|---|---|---|
-| 0 — abstraction ✅ **W1 DONE** | [`BACKEND-DISTRIBUTED-COMM`](backend-matrix.md) `ACTIVE` | the `vt::Communicator` / process-group (`include/vt/communicator.h` + `src/vt/communicator.cpp`) — AllReduce/AllGather/Send/Recv + `world_size==1` byte-identical; CPU in-process multi-rank transport proven (`test_communicator`, 50/50, RED-verified). W2+: collective `OpId` routing + NCCL/RDMA/MLX-ring transports | CPU in-process gate (W1, no GPU) — **PASSED** |
-| 1 — multi-GPU | [`BACKEND-DISTRIBUTED-TP`](backend-matrix.md), [`BACKEND-DISTRIBUTED-PP`](backend-matrix.md) | tensor + pipeline parallel (sharded linears/heads/experts/KV; stage split + send/recv) | ≥2-GPU box (absent — GB10 single-GPU) |
+| 0 — abstraction ✅ **W1 DONE** | [`BACKEND-DISTRIBUTED-COMM`](backend-matrix.md) `ACTIVE` | the `vt::Communicator` / process-group (`include/vt/communicator.h` + `src/vt/communicator.cpp`) — AllReduce/AllGather/Send/Recv + `world_size==1` byte-identical; CPU in-process multi-rank transport proven (`test_communicator`, 50/50, RED-verified). **W2**: collectives route through `OpProvider`/`OpId` (`kAllReduce/…`) — CPU on kCPU, NCCL on kCUDA | CPU in-process gate (W1, no GPU) — **PASSED** |
+| 1 — multi-GPU 🚧 **W2 TP DONE (CPU-gated)** | [`BACKEND-DISTRIBUTED-TP`](backend-matrix.md) `ACTIVE`, [`BACKEND-DISTRIBUTED-PP`](backend-matrix.md) `SPIKE` | **W2**: multi-device backend registry (per-`Device{type,index}`, byte-neutral device 0) + `TensorParallel` wired into the Qwen3-dense forward (o_proj/MLP-down all-reduce, MergedColumn loader shard) + the NCCL transport (mirrors `pynccl.py`, derive-and-ship). Gate `test_tp_forward` 60/60 (RED-verified): sharded+all-reduce == tp=1, NO GPU. PP + real TP-2 GPU run = residual | ≥2-GPU box for the TP-2 token-exact run + NCCL build-verify (absent — GB10 single-GPU); **CPU TP gate PASSED** |
 | 2 — multi-Spark | [`BACKEND-DISTRIBUTED-MULTINODE-SPARK`](backend-matrix.md) | 2× DGX Spark over ConnectX-7 200GbE RoCE; unlocks DeepSeek-V4 fp8 (~167 GiB) across 238 GiB | 2 Sparks + QSFP cable |
 | 3 — MLX multi-node | [`BACKEND-DISTRIBUTED-MLX-RING`](backend-matrix.md) | `mlx.core.distributed` ring/JACCL over Thunderbolt; shards the Metal forward across Macs | 2 Thunderbolt-linked Macs |
 
