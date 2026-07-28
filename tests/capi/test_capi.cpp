@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -1111,6 +1112,67 @@ TEST_CASE("capi: scheduling_policy accepts the wire names and rejects others") {
   CHECK(vllm_engine_load(&empty, &eng2) == VLLM_ERR_MODEL_LOAD);
 }
 
+// ─── (c4) ABI v10 jump-forward toggle ────────────────────────────────────────
+// Grounds .agents/specs/sglang-enablement.md: the tri-state enable_jump_forward
+// field defaults to 0 (byte-identical to ABI v9), validates its range at the
+// load gate, and — set through EngineParams (the SAME field vllm_engine_load
+// translates onto) — actually reaches the built engine
+// (LoadedEngine::jump_forward_enabled()). LPM/scheduler policy is NOT retested
+// here: it is the v9 string field .scheduling_policy, covered above.
+TEST_CASE("capi: enable_jump_forward defaults to 0 and validates (ABI v10)") {
+  vllm_model_params mp = vllm_model_params_default();
+  CHECK(mp.enable_jump_forward == 0);  // env-resolved, default OFF.
+
+  // Valid tri-states pass the gate (then fail at model load on the fake path).
+  for (int v : {0, 1, 2}) {
+    vllm_model_params p = vllm_model_params_default();
+    p.model_path = "/nonexistent/vllm-cpp/model/dir";
+    p.enable_jump_forward = v;
+    vllm_engine* eng = nullptr;
+    CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+    CHECK(eng == nullptr);
+  }
+
+  // An out-of-range value is rejected BEFORE any load attempt.
+  vllm_model_params bad = vllm_model_params_default();
+  bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+  bad.enable_jump_forward = 7;
+  vllm_engine* eng = reinterpret_cast<vllm_engine*>(0x1);
+  CHECK(vllm_engine_load(&bad, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng == nullptr);
+}
+
+TEST_CASE("capi: enable_jump_forward=on reaches the engine; default is inert (ABI v10)") {
+  // Resolution reads VT_ENABLE_JUMP_FORWARD as an override; clear it so this
+  // test asserts the FIELD's effect, not an ambient env override.
+  ::unsetenv("VT_ENABLE_JUMP_FORWARD");
+  const HfConfig c = MakeConfig();
+
+  // Default (nullopt): jump-forward resolves OFF — byte-identical to before v10.
+  {
+    EngineParams p = SyntheticParams();
+    CHECK_FALSE(p.enable_jump_forward.has_value());
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.jump_forward_enabled() == false);
+  }
+
+  // enable_jump_forward = true reaches the built engine.
+  {
+    EngineParams p = SyntheticParams();
+    p.enable_jump_forward = true;
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.jump_forward_enabled() == true);
+  }
+
+  // enable_jump_forward = false is explicit OFF.
+  {
+    EngineParams p = SyntheticParams();
+    p.enable_jump_forward = false;
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.jump_forward_enabled() == false);
+  }
+}
+
 TEST_CASE("capi: kv_transfer_config parses and validates the connector name") {
   // A well-formed config naming a REGISTERED connector passes the gate and
   // reaches model load.
@@ -1161,6 +1223,6 @@ TEST_CASE("capi: version and abi-version are exposed") {
   CHECK(std::string(vllm_version()).size() > 0);
   CHECK(vllm_abi_version() == VLLM_ABI_VERSION);
   // The engine-config growth (max_num_batched_tokens / scheduling_policy /
-  // kv_transfer_config) is ABI v9.
-  CHECK(vllm_abi_version() >= 9);
+  // kv_transfer_config) is ABI v9; the jump-forward toggle is ABI v10.
+  CHECK(vllm_abi_version() >= 10);
 }

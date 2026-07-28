@@ -76,8 +76,24 @@ struct EngineParams {
   std::optional<bool> enable_prefix_caching = std::nullopt;
   // Scheduling policy (mirrors SchedulerConfig.policy / the vLLM
   // --scheduling-policy flag). Default fcfs. Set kPriority to schedule by
-  // (priority, arrival_time); requests then carry a `priority` field.
+  // (priority, arrival_time); requests then carry a `priority` field. kLPM is
+  // SGLang's cache-aware longest-prefix-match admission ordering
+  // (ENG-SGLANG-BEHAVIOR-FLAG SW1) — output-neutral, meaningful only with prefix
+  // caching ON (resolves to fcfs otherwise). Exposed on the C ABI as the v9
+  // string field vllm_model_params.scheduling_policy = "lpm".
   vllm::SchedulerPolicy policy = vllm::SchedulerPolicy::kFCFS;
+
+  // Jump-forward decoding toggle (ENG-SGLANG-BEHAVIOR-FLAG SW3; the token-unique
+  // forced-run subset — see structured_output/jump_forward.h). Tri-state,
+  // resolved once at construction by vllm::v1::JumpForwardEnabled(this):
+  //   * nullopt (default) => OFF unless the VT_ENABLE_JUMP_FORWARD env override
+  //     turns it on (the byte-identical default);
+  //   * true  => ON  (unless VT_ENABLE_JUMP_FORWARD is set, which then overrides);
+  //   * false => OFF (likewise overridable by the env var).
+  // The env var, WHEN SET, always wins (mirrors the VT_ASYNC_SCHED convention).
+  // Exposed on the C ABI as vllm_model_params.enable_jump_forward (ABI v10) and
+  // on the server as --enable-jump-forward / --disable-jump-forward.
+  std::optional<bool> enable_jump_forward = std::nullopt;
 
   // KV-EXTERNAL-CACHE (LMCache): opt-in external KV-cache connector selection.
   // Empty/absent (default) == NO connector == byte-identical production engine
@@ -164,6 +180,11 @@ class LoadedEngine {
   const HfConfig& config() const { return config_; }
   int max_model_len() const { return max_model_len_; }
   bool prefix_caching_enabled() const { return prefix_caching_enabled_; }
+  // ENG-SGLANG-BEHAVIOR-FLAG SW3: the jump-forward enable, resolved ONCE at
+  // construction from EngineParams::enable_jump_forward + the
+  // VT_ENABLE_JUMP_FORWARD env override (vllm::v1::JumpForwardEnabled). Exposed so
+  // the enablement gate can assert the C-ABI/C++/flag toggle took effect.
+  bool jump_forward_enabled() const { return jump_forward_enabled_; }
   const vllm::v1::GPUModelRunner& runner() const { return runner_; }
 
   // KV-EXTERNAL-CACHE (LMCache): the wired external KV connector, or null when
@@ -268,6 +289,10 @@ class LoadedEngine {
   int max_model_len_;
   int max_num_batched_tokens_;
   bool prefix_caching_enabled_;
+  // ENG-SGLANG-BEHAVIOR-FLAG SW3: jump-forward enable, resolved once from
+  // EngineParams::enable_jump_forward + the VT_ENABLE_JUMP_FORWARD env override.
+  // Depends only on params + env (no member deps), so its init order is free.
+  bool jump_forward_enabled_;
   vllm::v1::KVCacheConfig kv_cfg_;
   // runner_ is declared BEFORE the scheduler (W3): the async-scheduling flip is
   // resolved from runner_.runner_supports_async(), so the runner must be fully

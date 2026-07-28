@@ -288,8 +288,10 @@ shape-gated to prefill (`-DVLLM_CPP_MLX=ON`), which is a numerics-deviating
 configuration. Both figures are against an interleaved 6-run MLX-LM baseline;
 an earlier 99.1% claim used a 2-run baseline containing an outlier. With MLX
 gated, prefill is 1.5% AHEAD of MLX-LM and the entire remaining deficit is
-decode, where the GEMV already runs at 83% of memory peak and no further lever is
-currently identified for single-stream. Bisecting the GEMM puts it at 97% of MLX's own
+decode. The GEMV runs at 83% of memory peak; decode attention runs 2.6x slower
+per byte than the GEMV because at b=1 it gets 8x fewer threads in flight, and
+three separate attempts to exploit that (flash-decoding, GQA grouping, wider
+threadgroups) have each measured worse. Bisecting the GEMM puts it at 97% of MLX's own
 (mma issue rate 3.91 TFLOP/s), so the residual is NOT GEMM-led: it is spread
 across prefill attention, small prefill kernels and decode, none dominant. The
 decode share is 93% weight streaming at 83% of the part's memory peak, so the
@@ -442,6 +444,19 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   named residual — so the flag stays off by default. The radix eviction-policy
   knob (SW4) stays a named/deferred opt-in. See
   `.agents/specs/sglang-radixattention.md`.
+- **SGLang-compatible knobs are now first-class, documented toggles** (2026-07-28,
+  `CLAIM-SGLANG-ABI-DOCS`, reconciled to ABI v10). LPM scheduling and jump-forward
+  are exposed on the C++ library API AND the C ABI (not env-var/internal-only),
+  joining the already-exposed prefix-caching/RadixAttention and
+  custom-logits-processor knobs. LPM is selected through the ABI v9 **string** field
+  `vllm_model_params.scheduling_policy` (`"fcfs"`/`"priority"`/`"lpm"`); jump-forward
+  through the new ABI **v10** tri-state field `vllm_model_params.enable_jump_forward`
+  (`0`=default/`1`=on/`2`=off). The server has `--scheduling-policy lpm` and
+  `--enable-jump-forward` / `--disable-jump-forward`. All default to today's
+  behavior — an all-zero config is byte-identical to before ABI v10, and
+  `vllm_abi_version()` returns 10. `VT_ENABLE_JUMP_FORWARD` is retained as an env
+  override (wins when set). The user-facing enablement guide for all four behaviors
+  is `docs/SGLANG-COMPAT.md` (engineering record: `.agents/specs/sglang-enablement.md`).
 - **KV persistence to disk / CPU offload** is built (CPU and disk tiers,
   identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the
   scheduler through an abstract `KVConnector` ABI selected by a

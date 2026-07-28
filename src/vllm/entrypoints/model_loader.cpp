@@ -27,6 +27,7 @@
 #include "vllm/transformers_utils/hf_config.h"  // SPEC-DFLASH D5 draft config
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
+#include "vllm/v1/structured_output/jump_forward.h"     // JumpForwardEnabled (SW3)
 #include "vt/dtype.h"
 #include "vt/tensor.h"
 #if defined(VLLM_CPP_CUDA) && defined(VT_CUTLASS_NVFP4)
@@ -519,6 +520,11 @@ LoadedEngine::LoadedEngine(HfConfig config,
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
           params, model_->registration().info)),
+      // ENG-SGLANG-BEHAVIOR-FLAG SW3: resolve jump-forward once (config field +
+      // VT_ENABLE_JUMP_FORWARD env override). Default nullopt+no-env => false =>
+      // the byte-identical decode path (jump-forward is inert until enabled).
+      jump_forward_enabled_(
+          vllm::v1::JumpForwardEnabled(params.enable_jump_forward)),
       kv_cfg_(MakeKVCacheMaybeSpec(
           *model_, config_, params.block_size > 0 ? params.block_size : 32,
           params.num_blocks > 0 ? params.num_blocks : 256,

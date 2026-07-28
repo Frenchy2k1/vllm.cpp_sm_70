@@ -203,6 +203,24 @@ residual; until then the flag is opt-in/default-off and no throughput number is
 owed. Reproduce: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build
 build-cpu --target test_jump_forward && ./build-cpu/tests/test_jump_forward`.
 
+**SGLang-behavior enablement / ABI + docs (2026-07-28, `CLAIM-SGLANG-ABI-DOCS`,
+reconciled to ABI v10, NOT pushed).** Disposition: **NOT APPLICABLE (enablement +
+documentation; no runtime path added, no measurement taken, claimed, or owed;
+`benchmark_binding=false`).** Makes the SGLang-alike behaviors first-class,
+documented knobs on the C++ API and the C ABI: LPM scheduling is reached through
+the concurrent session's v9 string field `vllm_model_params.scheduling_policy`
+(no separate int knob), and jump-forward through the new tri-state field
+`vllm_model_params.enable_jump_forward` (ABI v9→**v10**); radix/APC (v7) and custom
+logits (v8) already present, plus the server `--[enable|disable]-jump-forward` flag
+and the user doc `docs/SGLANG-COMPAT.md`. This adds no new runtime path or kernel —
+an all-zero config is byte-identical to before ABI v10 — so no throughput number is
+owed. The binding throughput A/Bs for the underlying behaviors stay owned by their
+existing entries above (`CLAIM-SGLANG-IMPL` LPM, `CLAIM-SGLANG-SW3` jump-forward)
+and the `BACKEND-GATE-CUDA-SGLANG-PREFIX` GB10 lane. CPU exact-gate only: `test_capi`
+33/33 (2 new ABI v10 jump-forward cases), `test_scheduler`/`test_scheduler_lpm`/`test_jump_forward`
+unchanged. Reproduce: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF && cmake --build
+build-cpu --target test_capi && ./build-cpu/tests/test_capi`.
+
 **DOCS user-facing split: README landing page + `docs/STATUS.md` ledger
 (2026-07-27, `CLAIM-DOCS-README-SPLIT`).** Disposition: **NOT APPLICABLE (no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** Documentation
@@ -3533,6 +3551,45 @@ arrive, so the running max keeps moving and corr is rarely exactly 1.0. The eigh
 scalar `sdiag` reads plus the branch then cost more than the eight mma they guard.
 The idea would fare better on a non-causal or short-context shape, which is not
 this workload.
+
+---
+
+## Decode attention: a REAL 2.6x inefficiency with THREE failed exploits
+
+Answering "are there any levers left" by re-deriving rather than asserting. There
+is a genuine anomaly:
+
+| | bytes/token | ms/token | achieved |
+|---|--:|--:|--:|
+| GEMV (weight stream) | 3400 MB | 34.2 | **99 GB/s** |
+| decode attention (KV) | 59 MB | 1.52 | **39 GB/s** |
+
+**2.6x slower per byte on the same device**, and the structural reason is visible:
+at tq=1 attention gets `hq` = 16 threadgroups x 512 threads = 8,192 in flight,
+where the GEMV gets 256 x 256 = **65,536**, an 8x difference. Reaching 70 GB/s
+would save 0.68 ms of the 0.81 ms gap — 84% of it.
+
+**So the inefficiency is real. Three different ways of exploiting it have now been
+measured, and all three lose:**
+
+| approach | mechanism | result |
+|---|---|--:|
+| flash-decoding (split keys across threadgroups) | more threadgroups | **-1.9 to -6.3%** |
+| GQA grouping (one per kv head) | halve traffic | **-2.6%**; traffic already cache-deduped |
+| wider threadgroups (tg = 8*d) | more threads per group | attention **1.52 -> 2.27 ms**, decode -2.2% |
+
+Each fails for its own reason and they are not the same reason: splitting pays a
+combine pass and re-pays the per-chunk reduction; grouping trades parallelism for
+traffic that the cache was already saving; widening lengthens the threadgroup
+reductions (log2(tg) barrier steps) and cuts resident threadgroups per core.
+
+**Conclusion: the 16-threadgroup structure at b=1 is not obviously improvable by
+any mechanism this session found.** The inefficiency is documented and quantified
+so it is not lost, but "there is a 2.6x gap" and "there is a lever" are different
+claims, and only the first is supported.
+
+Note this is a b=1 property. At batch (tq > 1) the grid is hq*tq and none of these
+constraints bind — this is specifically about the single-stream parity target.
 
 ---
 

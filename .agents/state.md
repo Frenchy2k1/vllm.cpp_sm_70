@@ -29031,6 +29031,109 @@ done. Lesson for the next session: read AGENTS.md BEFORE the first edit, not
 after the push - the checkpoint surfaces are a same-change obligation, and a
 cross-repo driver (a LocalAI need) does not exempt a change from this repo's
 record protocol.
+---
+
+## 2026-07-28 — decode attention: a REAL 2.6x inefficiency, THREE failed exploits
+
+Re-derived rather than asserted, in answer to "are there any levers left".
+
+| | bytes/tok | ms/tok | achieved |
+|---|--:|--:|--:|
+| GEMV | 3400 MB | 34.2 | **99 GB/s** |
+| decode attention | 59 MB | 1.52 | **39 GB/s** |
+
+**2.6x slower per byte on the same device.** Structural cause is visible: at tq=1
+attention gets hq=16 threadgroups x 512 = 8,192 threads in flight; the GEMV gets
+256 x 256 = **65,536**. Reaching 70 GB/s would save 0.68 of the 0.81 ms gap.
+
+**Three exploits, three losses, three DIFFERENT reasons:**
+
+| approach | result | why |
+|---|--:|---|
+| flash-decoding (split keys) | -1.9..-6.3% | combine pass + per-chunk reduction re-paid per split |
+| GQA grouping (per kv head) | -2.6% | the traffic was already cache-deduped; only parallelism lost |
+| wider tg (8*d) | attn 1.52 -> 2.27 ms | longer log2(tg) reductions, fewer resident threadgroups |
+
+**"There is a 2.6x gap" and "there is a lever" are different claims. Only the
+first is supported.** The 16-threadgroup structure at b=1 resists every mechanism
+tried. Documented and quantified so it is not lost, not dressed up as actionable.
+
+This is a b=1 property: at tq > 1 the grid is hq*tq and none of these constraints
+bind. It is specific to the single-stream parity target.
+## 2026-07-28 — SGLang-behavior enablement RECONCILED: jump-forward as ABI v10 (`CLAIM-SGLANG-ABI-DOCS`)
+
+Reconciled an ABI collision between two concurrent sessions. A prior SGLang-ABI
+commit (`266f5568`, base `0e2c667a`) could not land: it appended, under its own
+"v9", an int `scheduler_policy` (enum ordinal) AND `enable_jump_forward`. A
+concurrent session independently shipped ABI **v9** first
+(`feat/capi-abi-v9-engine-config`, now on canonical `main`) whose engine-config
+growth added a **string** `vllm_model_params.scheduling_policy`
+(`"fcfs"`/`"priority"`/`"lpm"`) that already exposes scheduler policy incl. LPM,
+plus `max_num_batched_tokens` and `kv_transfer_config`. Re-applied ONLY the
+still-needed parts on top of current `main`. Isolated worktree
+`.claude/worktrees/agent-a9f3521210c39f0a4`, base local `main` `c26ec71e`
+(confirmed `git rev-parse HEAD`; HEAD == local `main`). CPU-only, exact-gate,
+strict default-inertness. NOT pushed.
+
+DROPPED (the duplicate): the prior commit's int `scheduler_policy` field and its
+whole reference cascade — the shared helper `vllm::capi::ApplyAbiSchedulerAndJumpForward`
++ its `src/capi/engine_handle.h` decl, and the `scheduler_policy=2` int assertion
+in `test_capi.cpp`. LPM via ABI is now the concurrent session's `scheduling_policy`
+string (`SchedulerPolicyFromString`, already wired in `vllm_engine_load`).
+
+KEPT (genuinely new): `enable_jump_forward` as ABI **v10** (the NEXT version):
+- `include/vllm.h`: `VLLM_ABI_VERSION` 9→10 + a v10 doc block; `int32_t
+  enable_jump_forward` appended at the END of `vllm_model_params` AFTER the
+  concurrent session's v9 fields (`kv_transfer_config`). Default 0 ⇒ byte-identical
+  to v9.
+- `src/capi/vllm_c.cpp`: default `p.enable_jump_forward = 0` in
+  `vllm_model_params_default`; the tri-state translation (0/1/2 →
+  `ep.enable_jump_forward` nullopt/true/false; out-of-range ⇒
+  `VLLM_ERR_INVALID_ARGUMENT`) folded INLINE in `vllm_engine_load` (single field,
+  no shared helper — mirrors the `enable_prefix_caching` switch directly above it).
+- `include/vllm/entrypoints/model_loader.h`: `EngineParams::enable_jump_forward`
+  (`std::optional<bool>`) + `LoadedEngine::jump_forward_enabled()` accessor + member;
+  `src/vllm/entrypoints/model_loader.cpp`: `jump_forward_enabled_` resolved once via
+  `JumpForwardEnabled(params.enable_jump_forward)` (+ `jump_forward.h` include).
+- `src/vllm/v1/structured_output/jump_forward.{h,cpp}`: new
+  `JumpForwardEnabled(std::optional<bool>)` — env `VT_ENABLE_JUMP_FORWARD` overrides
+  when set, else the field, default OFF; no-arg overload = `JumpForwardEnabled(nullopt)`.
+- `include/vllm/v1/core/sched/scheduler.h`: new public `Scheduler::policy()`
+  accessor (the concurrent session did not add it, so re-added here).
+- `examples/server/main.cpp`: `--[enable|disable]-jump-forward` (double-specify
+  rejected), wired to `engine_params.enable_jump_forward`.
+- Docs re-applied + updated to LPM-via-`scheduling_policy`-string: `docs/SGLANG-COMPAT.md`
+  (§2 LPM now uses the string field, §3 jump-forward ABI v10) + `.agents/specs/sglang-enablement.md`
+  (reconciliation note, v10 field table, no shared helper).
+
+Gate (CPU exact, RED-first): `tests/capi/test_capi.cpp` **33/33 / 232 asserts** —
+2 NEW ABI v10 jump-forward cases (defaults `0` + tri-state validation; through
+`EngineParams` a built `LoadedEngine` with `enable_jump_forward=true` has
+`jump_forward_enabled()==true`, `nullopt`/`false` inert), `vllm_abi_version()`==10
+asserted. The prior `scheduler_policy=2` int assertion was DROPPED; LPM-via-ABI
+stays covered by the concurrent session's `scheduling_policy` string cases. RED:
+default (all-zero/NULL) byte-identical to v9. Inertness: `test_scheduler` 36/36,
+`test_scheduler_lpm` 6/6, `test_jump_forward` 5/5, `test_scheduler_config` 13/13
+UNCHANGED; the v9 fields still work. Clean full-library CPU `-Werror` (`-Wall
+-Wextra -Werror`, `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON` Release) **0 warnings**
+incl. the `server` binary — the reconciliation removed a field with a reference
+cascade (helper, decl, test), so the clean build is the proof the untangle is
+complete.
+
+Honest residual (unchanged): jump-forward stays DEFAULT-OFF — only the
+token-unique subset is implemented and the live-decode scheduler splice (KV
+recompute for jumped tokens) is unimplemented; SGLang itself removed its own
+jump-forward scheduler wiring upstream. No new engine-matrix row ⇒ ENGINE count
+unchanged (122). Did NOT touch README/Metal (concurrent session owns them); the
+pre-existing README em-dash `check-readme-structure` failure is theirs, not
+introduced here.
+
+Records: `sglang-matrix.md` (4 impl-anchors, LPM→`scheduling_policy` string),
+`engine-matrix.md` (`ENG-SGLANG-BEHAVIOR-FLAG` exposure note), `feature-matrix.md`,
+`roadmap_v1.md` (SGLang lane), `coordination.md` (`CLAIM-SGLANG-ABI-DOCS`, noting
+the v10 reconciliation), `docs/SGLANG-COMPAT.md` + `specs/sglang-enablement.md`
+(updated), `docs/STATUS.md`, `docs/BENCHMARKS.md` (NOT-APPLICABLE), `parity-ledger.md`,
+this entry. All 6 record checkers rc=0. NOT pushed; FULL SHA reported to caller.
 
 ## 2026-07-28 — GGUF spec-decode SPIKED: `SPEC-MTP-GGUF` + `SPEC-DFLASH-GGUF`
 
