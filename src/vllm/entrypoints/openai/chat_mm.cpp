@@ -181,4 +181,43 @@ multimodal::MultiModalInputs RouteImageRgb(
   return out;
 }
 
+std::string ImagePlaceholderString() {
+  // qwen3_vl.py:1716.
+  return "<|vision_start|><|image_pad|><|vision_end|>";
+}
+
+std::string VideoPlaceholderString() {
+  // qwen3_vl.py:1718.
+  return "<|vision_start|><|video_pad|><|vision_end|>";
+}
+
+std::string AudioPlaceholderString(int index) {
+  // qwen2_audio.py:335 — f"Audio {i}: <|audio_bos|><|AUDIO|><|audio_eos|>".
+  return "Audio " + std::to_string(index) +
+         ": <|audio_bos|><|AUDIO|><|audio_eos|>";
+}
+
+std::string ChatPlaceholderFor(const ChatContentPart& part, int audio_index) {
+  if (part.type == "image_url") return ImagePlaceholderString();
+  if (part.type == "video_url") return VideoPlaceholderString();
+  if (part.type == "input_audio" || part.type == "audio_url") {
+    return AudioPlaceholderString(audio_index);
+  }
+  return std::string();  // "text" and unrouted residual kinds carry no marker
+}
+
+std::vector<std::string> CollectChatPlaceholders(const ChatMessage& message) {
+  std::vector<std::string> markers;
+  if (!message.content_parts.has_value()) return markers;
+  int audio_index = 0;
+  for (const ChatContentPart& part : *message.content_parts) {
+    const bool is_audio =
+        part.type == "input_audio" || part.type == "audio_url";
+    if (is_audio) ++audio_index;
+    std::string marker = ChatPlaceholderFor(part, audio_index);
+    if (!marker.empty()) markers.push_back(std::move(marker));
+  }
+  return markers;
+}
+
 }  // namespace vllm::entrypoints::openai

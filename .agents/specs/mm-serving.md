@@ -92,7 +92,7 @@ chat request content-part array          [MM-SERVE-PARSE — CPU, THIS BRICK]
 | Row | Scope | vLLM mirror | Tests to port | HW |
 |-----|-------|-------------|---------------|----|
 | `MM-SERVE-PARSE` (**LANDED, this commit**) | content-part parse + base64/data-URI decode + route to the existing processor → `MultiModalInputs` (shapes asserted) | `chat_utils.py:1478,1524`; `multimodal/utils.py:35-113` | `tests/entrypoints/test_chat_utils.py` (`test_parse_chat_messages_*`, the `image_url`/`input_audio` cases) → `test_chat_mm.cpp` | CPU |
-| `MM-SERVE-ENGINE` (residual) | attach `MultiModalInputs` to the engine request (new `add_request` mm overload + `Request`/`EngineCoreRequest` plumbing + encoder-cache budget + placeholder-string insertion into the chat template) | `v1/engine/llm_engine.py add_request`; `v1/engine/core.py`; `chat_utils.py _add_placeholder:886` | `tests/v1/engine/test_processor_multi_modal_uuids.py`; `tests/entrypoints/test_chat_utils.py` placeholder-insertion cases | CPU-verifiable (shapes/counts); no forward |
+| `MM-SERVE-ENGINE` (**LANDED, brick 2**) | attach `MultiModalInputs` to the engine request (`add_request(MultiModalInputs)` overload on `LLMEngine`+`AsyncLLM` via `InputProcessor::process_inputs_mm` → `mm_features` on `EngineCoreRequest`/`Request`; placeholder-STRING helpers mirroring `get_placeholder_str`; serving_chat `MultiModalChatFn` seam) | `v1/engine/input_processor.py:333-379`; `chat_utils.py _add_placeholder:886` + `get_placeholder_str` (qwen3_vl.py:1714 / qwen2_audio.py:333) | `test_input_processor` (`process_inputs_mm`) + `test_chat_mm` (placeholder strings + full chain) | CPU-verifiable (shapes/counts); no forward |
 | `MM-SERVE-E2E` (**MANDATORY closing gate, residual**) | a real image+prompt OpenAI `/v1/chat/completions` request → token-correct output on **Qwen3-VL-4B**, gated vs the mm oracle (reuse the M2c e2e golden `gen_tokens_i32.bin`) | `entrypoints/openai/chat_completion/serving.py` full mm path | new `test_openai_serving_chat_mm_e2e.cpp` (dgx-only, skip without ckpt+CUDA) | **DGX GB10 + Qwen3-VL-4B checkpoint** |
 
 ## This brick (`MM-SERVE-PARSE`) — landed
@@ -120,13 +120,58 @@ chat request content-part array          [MM-SERVE-PARSE — CPU, THIS BRICK]
   small codec brick.
 - **http(s) media-URL fetch** (vs inline `data:`/base64) — `DecodeDataUri`/
   `DecodeInputAudioPart` handle only inline payloads.
-- **Engine plumbing** (`MM-SERVE-ENGINE`): no `add_request` mm overload yet; the
-  produced `MultiModalInputs` is asserted but not yet handed to the engine.
+- **Engine plumbing** (`MM-SERVE-ENGINE`): **LANDED (brick 2).** `LLMEngine`/
+  `AsyncLLM` `add_request(MultiModalInputs)` + `generate(MultiModalInputs)`
+  overloads via `InputProcessor::process_inputs_mm` carry the expanded prompt +
+  `mm_features` onto `EngineCoreRequest`/`Request`; serving_chat routes mm
+  requests through them via the `MultiModalChatFn` seam. See "Brick 2 — landed".
 - **Streaming mm, multiple images, video parts, image_embeds/prompt_embeds** — the
   parse tolerates them (empty payload under their `type`) but they are not routed.
 
+## Brick 2 (`MM-SERVE-ENGINE`) — landed
+
+- `include/vllm/v1/engine/input_processor.{h,cpp}` — `process_inputs_mm`: the
+  MULTIMODAL request builder (mirror of upstream `input_processor.py:333-379`).
+  Takes the placeholder-EXPANDED prompt ids + `mm_features` and carries BOTH onto
+  the `EngineCoreRequest`; otherwise byte-for-byte `process_inputs_tokens`
+  (validate / default-max_tokens / eos+stop). Empty `mm_features` ⇒ identical to
+  the tokens path (text never perturbed).
+- `include/vllm/v1/engine/llm_engine.{h,cpp}` + `async_llm.{h,cpp}` — strictly
+  ADDITIVE `add_request(MultiModalInputs)` + `generate(MultiModalInputs)`
+  overloads on both engines. `mm_features` rides through
+  `Request::FromEngineCoreRequest` (already wired) to the scheduler/encoder-cache
+  seam. Parallel-sampling fan-out shares the mm inputs (child copies carry them).
+- `include/vllm/entrypoints/openai/chat_mm.{h,cpp}` — the chat-template
+  placeholder-STRING helpers: `ImagePlaceholderString` (`<|vision_start|><|image_pad|><|vision_end|>`,
+  qwen3_vl.py:1716), `VideoPlaceholderString`, `AudioPlaceholderString(i)`
+  (`Audio {i}: <|audio_bos|><|AUDIO|><|audio_eos|>`, qwen2_audio.py:335),
+  `ChatPlaceholderFor` / `CollectChatPlaceholders` (mirror `get_placeholder_str`
+  + `_add_placeholder`). The single marker is what `ExpandImagePlaceholders`
+  (brick 1) expands to N = grid/feature-count copies.
+- `include/vllm/entrypoints/openai/serving_chat.{h,cpp}` — `MultiModalChatFn`
+  seam (`set_multimodal_chat_fn`). Default UNSET ⇒ the text path is byte-identical
+  (mm parts fall back to the joined-text content, brick-1 behavior). When set AND
+  a request carries a mm part, `create_chat_completion` builds the
+  `MultiModalInputs` and drives the non-stream engine mm `generate` overload;
+  streaming mm is rejected (named residual).
+- Gate: `test_input_processor` +2 (`process_inputs_mm` carries mm_features + the
+  expanded prompt; empty == tokens path) + `test_chat_mm` +2 (placeholder strings
+  mirror vLLM; the full chain parse→route→`process_inputs_mm`→`FromEngineCoreRequest`
+  asserts the engine request carries the mm handles + the expanded prompt with the
+  196 image_pad feature count). Text-path inertness suites byte-identical; clean
+  CPU `-Werror` library + server build.
+
+### What `MM-SERVE-E2E` must still run (the seam BODY + the forward)
+The `MultiModalChatFn` seam body is UNIMPLEMENTED on CPU (it needs the model): the
+model TOKENIZER that turns the inserted placeholder markers into the single
+`<|image_pad|>` token ids the processor expands, plus the qwen3vl/whisper
+processors, plus the mm FORWARD (encoder tower + DeepStack/MRoPE) consuming
+`Request.mm_features` on the GPU worker. E2E = wire that seam on Qwen3-VL-4B (DGX +
+checkpoint) and gate a real image+prompt `/v1/chat/completions` request
+token-correct vs the mm oracle (reuse M2c `gen_tokens_i32.bin`).
+
 ## Correctness / gates
-- CPU (this brick): `test_chat_mm` 5/5, 65 asserts; inertness suites
+- CPU (brick 1): `test_chat_mm` 5/5, 65 asserts; inertness suites
   `test_openai_protocol`/`test_openai_serving`/`test_openai_serving_chat_stream`
   byte-identical for bare-string; clean `-Werror` full-library + `server` build.
 - **GPU closing gate (`MM-SERVE-E2E`):** a real image+prompt OpenAI request →

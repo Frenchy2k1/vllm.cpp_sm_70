@@ -34,6 +34,7 @@
 
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"
+#include "vllm/multimodal/inputs.h"  // multimodal::MultiModalInputs (mm seam)
 #include "vllm/entrypoints/openai/serving_completion.h"  // SseStream
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
 #include "vllm/parser/parser_manager.h"  // engine-backed ParserEngine dispatch
@@ -67,6 +68,20 @@ struct ChatCompletionResult {
 using ChatPromptFn = std::function<std::string(
     const std::vector<ChatMessage>&, bool,
     const std::vector<ChatCompletionToolsParam>&)>;
+
+// The MULTIMODAL chat SEAM (MM-SERVE-ENGINE): given the request messages, decode
+// + route any mm content parts (image_url / input_audio) through the mm
+// processor and return the placeholder-EXPANDED MultiModalInputs (prompt ids +
+// mm_features) to hand to the engine mm add_request/generate overload; nullopt
+// when no message carries a mm part. This is the injection point where the model
+// tokenizer + the qwen3vl / whisper processors live (the production/E2E wiring
+// constructs it); the DEFAULT is unset, so a server without it renders the
+// text-only path byte-identically (the mm parts fall back to the joined-text
+// content, exactly the MM-SERVE-PARSE behavior). Mirrors upstream's serving
+// layer building the MultiModalDataDict and passing it to the engine alongside
+// the rendered prompt.
+using MultiModalChatFn = std::function<std::optional<multimodal::MultiModalInputs>(
+    const std::vector<ChatMessage>&)>;
 
 // The T0 fallback template (marked seam). Concatenates "<role>: <content>\n"
 // for each message; when add_generation_prompt, appends "assistant:". Ignores
@@ -205,6 +220,14 @@ class OpenAIServingChat {
     beam_eos_token_id_ = eos_token_id;
   }
 
+  // Attach the multimodal chat seam (see MultiModalChatFn). Unset (default)
+  // keeps the text-only path byte-identical. When set AND a request carries a mm
+  // content part, create_chat_completion routes the request through the engine
+  // mm add_request/generate overload with the seam's MultiModalInputs.
+  void set_multimodal_chat_fn(MultiModalChatFn fn) {
+    mm_chat_fn_ = std::move(fn);
+  }
+
   // The chat-prompt renderer this handler applies to `messages` (the same seam
   // create_chat_completion tokenizes through). Exposed so the /tokenize chat
   // form (serve/tokenize/serving.py:70-92, TokenizeChatRequest) renders through
@@ -245,6 +268,9 @@ class OpenAIServingChat {
   // unavailable on this handler.
   const vllm::tok::Tokenizer* beam_tokenizer_ = nullptr;
   std::optional<int32_t> beam_eos_token_id_;
+  // Multimodal chat seam (see set_multimodal_chat_fn). Null => the text-only
+  // path runs unchanged (mm parts drop to the joined-text content).
+  MultiModalChatFn mm_chat_fn_;
   // request_id is "chatcmpl-<counter>" (upstream f"chatcmpl-{random_uuid()}").
   std::atomic<int64_t> request_counter_{0};
 };

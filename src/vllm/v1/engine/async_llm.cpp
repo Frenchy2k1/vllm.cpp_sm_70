@@ -119,6 +119,47 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
   return AsyncRequest{request.request_id, std::move(collector)};
 }
 
+AsyncRequest AsyncLLM::add_request(const std::string& request_id,
+                                   multimodal::MultiModalInputs mm_inputs,
+                                   SamplingParams params, int priority) {
+  // Multimodal path: identical to the tokens add_request except the request is
+  // built via process_inputs_mm (placeholder-EXPANDED ids + mm_features carried
+  // onto the EngineCoreRequest / Request). The OutputProcessor gets no prompt
+  // string. See llm_engine.cpp's mirror mm overload.
+  if (shutdown_started_.load() || errored_.load() ||
+      engine_core_.engine_dead()) {
+    throw EngineDeadError("request submitted to a stopped AsyncLLM");
+  }
+
+  EngineCoreRequest request = input_processor_.process_inputs_mm(
+      request_id, std::move(mm_inputs.prompt_token_ids),
+      std::move(mm_inputs.mm_features), std::move(params),
+      /*arrival_time=*/std::nullopt, priority);
+  auto collector = std::make_shared<RequestOutputCollector>(
+      request.sampling_params.output_kind, request.request_id);
+
+  auto core_request = std::make_unique<Request>(
+      Request::FromEngineCoreRequest(request, block_hasher_));
+
+  {
+    std::lock_guard<std::mutex> lock(output_processor_mutex_);
+    if (shutdown_started_.load() || errored_.load() ||
+        engine_core_.engine_dead()) {
+      throw EngineDeadError("request submitted to a stopped AsyncLLM");
+    }
+    output_processor_.add_request(request, /*prompt=*/std::nullopt,
+                                  /*request_index=*/0, collector);
+    try {
+      engine_core_.add_request_async(std::move(core_request));
+    } catch (...) {
+      (void)output_processor_.abort_requests({request.request_id});
+      throw;
+    }
+  }
+
+  return AsyncRequest{request.request_id, std::move(collector)};
+}
+
 RequestOutput AsyncLLM::get_output(const AsyncRequest& request) {
   if (request.collector == nullptr) {
     throw std::invalid_argument("AsyncLLM request has no collector");
@@ -159,6 +200,27 @@ RequestOutput AsyncLLM::generate(std::vector<int32_t> prompt_token_ids,
                                  SamplingParams params,
                                  const std::string& request_id, int priority) {
   AsyncRequest request = add_request(request_id, std::move(prompt_token_ids),
+                                     std::move(params), priority);
+  try {
+    for (;;) {
+      std::optional<RequestOutput> ready = get_output_nowait(request);
+      RequestOutput output = ready.has_value()
+                                 ? std::move(*ready)
+                                 : get_output(request);
+      if (output.finished) return output;
+    }
+  } catch (...) {
+    abort(request.request_id);
+    throw;
+  }
+}
+
+RequestOutput AsyncLLM::generate(multimodal::MultiModalInputs mm_inputs,
+                                 SamplingParams params,
+                                 const std::string& request_id, int priority) {
+  // Multimodal single-request driver (mirrors the tokens generate loop). The
+  // mm forward on the GPU worker consumes the carried mm_features (MM-SERVE-E2E).
+  AsyncRequest request = add_request(request_id, std::move(mm_inputs),
                                      std::move(params), priority);
   try {
     for (;;) {

@@ -118,6 +118,53 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**Multimodal SERVING — brick 2/3 `MM-SERVE-ENGINE` LANDED (2026-07-28,
+`CLAIM-MM-SERVING-W2`, DONE — committed, NOT pushed; FULL SHA reported to
+caller).** Carries brick 1's parsed `MultiModalInputs` into the engine request.
+Base local `main` HEAD `01105b11`; isolated worktree
+`.claude/worktrees/agent-ad563900ac5a35344`; CPU-only (`-DVLLM_CPP_CUDA=OFF`), no
+GPU. **What it did.** (1) Engine mm-request overload: `InputProcessor::process_inputs_mm`
+(input_processor.{h,cpp}) mirrors upstream `input_processor.py:333-379` — builds
+the `EngineCoreRequest` from the placeholder-EXPANDED prompt ids AND carries
+`mm_features` (the field already existed on `EngineCoreRequest`/`Request`;
+`FromEngineCoreRequest` already threads it). Strictly ADDITIVE `add_request` /
+`generate` overloads taking `multimodal::MultiModalInputs` on BOTH `LLMEngine`
+(llm_engine.{h,cpp}) and `AsyncLLM` (async_llm.{h,cpp}); empty `mm_features`
+== byte-identical to the tokens overload. (2) Chat-template placeholder-string
+insertion (chat_mm.{h,cpp}): `ImagePlaceholderString` / `VideoPlaceholderString`
+/ `AudioPlaceholderString(i)` + `ChatPlaceholderFor` / `CollectChatPlaceholders`,
+mirroring vLLM `get_placeholder_str` (qwen3_vl.py:1714 image `<|vision_start|><|image_pad|><|vision_end|>`,
+qwen2_audio.py:333 audio) + `_add_placeholder` (chat_utils.py:886). The TOKEN-level
+count-expansion (count == grid/feature count) is brick 1's `ExpandImagePlaceholders`.
+(3) serving_chat wiring: an OPTIONAL `MultiModalChatFn` seam (`set_multimodal_chat_fn`,
+default UNSET → text path byte-identical) that, when a request carries mm parts,
+builds the `MultiModalInputs` and routes the non-stream path through the engine mm
+`generate` overload (streaming mm rejected — named residual). **Gate.** New
+`test_input_processor` +2 (`process_inputs_mm` carries mm_features + expanded
+prompt; empty == tokens path) and `test_chat_mm` +2 (placeholder strings mirror
+vLLM; full chain parse→route→`process_inputs_mm`→`FromEngineCoreRequest` — the
+engine request carries the mm handles + the expanded prompt with the correct 196
+image_pad feature count). RED-first: before this brick there was NO engine mm
+add_request path. Text-path INERTNESS: `test_input_processor` 10/10,
+`test_chat_mm` 7/7, `test_llm_engine` + `test_async_llm` + `test_openai_serving`
++ `test_openai_serving_chat_stream` all byte-identical; clean CPU `-Werror`
+library + server build, 0 warnings. **Owns:** `include/vllm/v1/engine/{input_processor.h,llm_engine.h,async_llm.h}`,
+`src/vllm/v1/engine/{input_processor.cpp,llm_engine.cpp,async_llm.cpp}`,
+`include/vllm/entrypoints/openai/{chat_mm.h,serving_chat.h}`,
+`src/vllm/entrypoints/openai/{chat_mm.cpp,serving_chat.cpp}`, `tests/CMakeLists.txt`
++ `tests/vllm/v1/test_input_processor.cpp` + `tests/vllm/entrypoints/openai/test_chat_mm.cpp`,
+plus the records below. **Does NOT touch** README/Metal (concurrent session owns
+them). **Residual — `MM-SERVE-E2E` (MANDATORY closing gate):** a real image+prompt
+OpenAI `/v1/chat/completions` request → token-correct output on Qwen3-VL-4B vs the
+mm oracle — needs the DGX + a Qwen3-VL-4B checkpoint. Its remaining pieces: the
+`MultiModalChatFn` seam BODY (the model tokenizer that turns the placeholder
+markers → single placeholder token ids + the qwen3vl/whisper processors) and the
+mm FORWARD (encoder tower + DeepStack/MRoPE) consuming `Request.mm_features` on
+the GPU worker. Also named: streaming mm, multiple images, video, http(s) fetch,
+PNG/JPEG container decode. Records: `.agents/specs/mm-serving.md`, `engine-matrix.md`,
+`feature-matrix.md`, `model-matrix.md`, `roadmap_v1.md`, this claim, `docs/STATUS.md`,
+`docs/BENCHMARKS.md` (NOT-APPLICABLE — feature), `parity-ledger.md`, `state.md`.
+
 **Multimodal SERVING — first CPU brick LANDED (2026-07-28, `CLAIM-MM-SERVING-W1`,
 DONE — committed, NOT pushed; FULL SHA reported to caller).** Opens the
 `ROAD-V1-MM` serving track: wire OpenAI multimodal content parts into the chat

@@ -30074,3 +30074,64 @@ stays UNVERIFIED without weights. Corrected the 4 stale `model-matrix.md` Gemma-
 `coordination.md` (07-27 annotation) already self-corrected; `parity-ledger.md`
 gate-time entry left as dated history. Unblock = a Gemma-4 checkpoint (accept the HF
 license + a token, or cached weights); records-only, no code.
+
+## 2026-07-28 — MM SERVING brick 2/3 `MM-SERVE-ENGINE`: carry the parsed MultiModalInputs into the engine (`CLAIM-MM-SERVING-W2`)
+
+Base local `main` HEAD `01105b11` (confirmed `git rev-parse HEAD`); isolated
+worktree `.claude/worktrees/agent-ad563900ac5a35344`; CPU-only build
+(`-DVLLM_CPP_CUDA=OFF`); NOT pushed; FULL SHA reported to caller.
+
+**What it did.** Brick 1 (`MM-SERVE-PARSE`, `0a8dd58b`) parses OpenAI content
+parts and routes them through the processor to a `MultiModalInputs`; this brick
+carries that into the engine request. (1) **Engine mm-request overload.** NEW
+`InputProcessor::process_inputs_mm` (mirror upstream `input_processor.py:333-379`):
+builds the `EngineCoreRequest` from the placeholder-EXPANDED prompt ids AND sets
+`mm_features` — the mm-carrying fields ALREADY existed on `EngineCoreRequest`
+(types.h:91) / `Request` (request.h:153) and `Request::FromEngineCoreRequest`
+already threads them (request.cpp:94), so this REUSES the existing internal
+structure, it does not invent one. Strictly ADDITIVE `add_request(MultiModalInputs)`
++ `generate(MultiModalInputs)` overloads on BOTH `LLMEngine` and `AsyncLLM`,
+mirroring the existing tokens overloads step-for-step (output processor gets no
+prompt string; parallel-sampling fan-out shares the mm features via the child
+`EngineCoreRequest` copy); empty mm_features == the tokens path byte-for-byte.
+(2) **Chat-template placeholder-string insertion** (chat_mm): `ImagePlaceholderString`
+(`<|vision_start|><|image_pad|><|vision_end|>`, qwen3_vl.py:1716),
+`VideoPlaceholderString`, `AudioPlaceholderString(i)` (`Audio {i}: <|audio_bos|><|AUDIO|><|audio_eos|>`,
+qwen2_audio.py:335), `ChatPlaceholderFor`/`CollectChatPlaceholders` — mirror vLLM
+`get_placeholder_str` (chat_utils.py:627) + `_add_placeholder` (:886). The single
+marker is what brick-1's `ExpandImagePlaceholders` expands to N = grid/feature-count
+copies (the count-level "placeholder-inserted prompt"). (3) **serving_chat wiring:**
+an OPTIONAL `MultiModalChatFn` seam (`set_multimodal_chat_fn`); when set AND a
+request carries a mm part, `create_chat_completion` builds the `MultiModalInputs`
+and drives the non-stream engine mm `generate` overload; default UNSET ⇒ the text
+path is byte-identical (mm parts fall back to the joined-text content, brick-1
+behavior), streaming mm rejected (residual).
+
+**Gate (CPU, exact, RED-first).** `test_input_processor` 10/10 (+2): `process_inputs_mm`
+carries mm_features (hash/modality/offset/length/handle) + the expanded prompt +
+the same eos/max_tokens wiring, `FromEngineCoreRequest` threads it onto `Request`;
+empty mm_features == `process_inputs_tokens`. `test_chat_mm` 7/7 (+2): placeholder
+strings == vLLM `get_placeholder_str`; the FULL CHAIN parse→`RouteImageRgb`→
+`process_inputs_mm`→`FromEngineCoreRequest` asserts the engine request carries the
+mm handles + the placeholder-EXPANDED prompt with the 196-slot image feature count
+(== the processor grid `[1,28,28]`/merge²). RED-first: before this brick the engine
+had NO mm add_request path (`process_inputs_tokens` drops mm data). Text-path
+INERTNESS: `test_llm_engine`, `test_async_llm`, `test_openai_serving`,
+`test_openai_serving_chat_stream` all byte-identical (ctest 6/6, 387 s). Clean CPU
+`-Werror` full-library + `server` binary clean-first rebuild = 0 warnings.
+
+**Honest landed-vs-residual.** LANDED = the engine now provably CARRIES the parsed
+mm inputs (asserted up to the forward). The **`MM-SERVE-E2E` GPU gate stays the
+MANDATORY closing residual**: the `MultiModalChatFn` seam BODY is UNIMPLEMENTED on
+CPU because it needs the model — the tokenizer that turns the inserted placeholder
+markers into the single `<|image_pad|>` token ids the processor expands, plus the
+qwen3vl/whisper processors, plus the mm FORWARD (encoder tower + DeepStack/MRoPE)
+consuming `Request.mm_features` on the GPU worker. E2E = wire that seam on
+Qwen3-VL-4B (DGX + checkpoint) and gate a real image+prompt `/v1/chat/completions`
+request token-correct vs the mm oracle (reuse the M2c `gen_tokens_i32.bin`). Also
+named: streaming mm, multiple images, video, http(s) fetch, PNG/JPEG container
+decode. Records: spec `mm-serving.md` (`MM-SERVE-ENGINE`→done), `engine-matrix.md`
+(`ENG-MM-INPUT-PIPELINE` serving note), `feature-matrix.md` (`MODEL-MM`),
+`model-matrix.md` (Qwen3-VL row), `roadmap_v1.md` (`ROAD-V1-MM`), `coordination.md`
+(`CLAIM-MM-SERVING-W2`), `docs/STATUS.md` + `docs/BENCHMARKS.md` (NOT-APPLICABLE —
+feature), `parity-ledger.md`, this entry.

@@ -35,6 +35,11 @@
 #include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
+#include "vllm/tokenizer/tokenizer.h"
+#include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/engine/input_processor.h"
+#include "vllm/v1/engine/types.h"
+#include "vllm/v1/request.h"
 
 namespace {
 
@@ -321,4 +326,131 @@ TEST_CASE("chat-mm image: image_url part -> processor -> grid + expansion") {
   CHECK(mm.mm_features[0].data->image_grid_thw[2] == g[2].get<int64_t>());
   // Expanded prompt: 2 real tokens + 196 placeholder copies.
   CHECK(mm.prompt_token_ids.size() == static_cast<size_t>(2 + merged));
+}
+
+// ---------------------------------------------------------------------------
+// 5. PLACEHOLDER STRINGS (MM-SERVE-ENGINE): the chat-template markers mirror
+//    vLLM get_placeholder_str (qwen3_vl.py:1714 / qwen2_audio.py:333).
+// ---------------------------------------------------------------------------
+TEST_CASE("chat-mm placeholder strings mirror vLLM get_placeholder_str") {
+  using vllm::entrypoints::openai::AudioPlaceholderString;
+  using vllm::entrypoints::openai::CollectChatPlaceholders;
+  using vllm::entrypoints::openai::ImagePlaceholderString;
+  using vllm::entrypoints::openai::VideoPlaceholderString;
+
+  CHECK(ImagePlaceholderString() ==
+        "<|vision_start|><|image_pad|><|vision_end|>");
+  CHECK(VideoPlaceholderString() ==
+        "<|vision_start|><|video_pad|><|vision_end|>");
+  CHECK(AudioPlaceholderString(1) ==
+        "Audio 1: <|audio_bos|><|AUDIO|><|audio_eos|>");
+
+  // CollectChatPlaceholders: one marker per mm part, audios numbered 1..k,
+  // text parts contribute none.
+  const nlohmann::json j = {
+      {"messages",
+       {{{"role", "user"},
+         {"content",
+          {{{"type", "text"}, {"text", "look:"}},
+           {{"type", "image_url"}, {"image_url", {{"url", "data:x"}}}},
+           {{"type", "input_audio"},
+            {"input_audio", {{"data", "AA=="}, {"format", "wav"}}}}}}}}}};
+  const ChatCompletionRequest req = j.get<ChatCompletionRequest>();
+  const std::vector<std::string> markers =
+      CollectChatPlaceholders(req.messages[0]);
+  REQUIRE(markers.size() == 2);
+  CHECK(markers[0] == "<|vision_start|><|image_pad|><|vision_end|>");
+  CHECK(markers[1] == "Audio 1: <|audio_bos|><|AUDIO|><|audio_eos|>");
+
+  // A bare-string message contributes no markers (byte-identical text path).
+  ChatMessage bare;
+  bare.role = "user";
+  bare.content = "hello";
+  CHECK(CollectChatPlaceholders(bare).empty());
+}
+
+// ---------------------------------------------------------------------------
+// 6. FULL CHAIN (MM-SERVE-ENGINE, the RED-first "New" gate): parse an image_url
+//    request -> route through the processor -> placeholder-EXPANDED prompt ->
+//    the engine mm path (InputProcessor::process_inputs_mm) receives the
+//    MultiModalInputs -> the built Request carries the mm handles + the expanded
+//    prompt with the CORRECT feature count. Everything UP TO the mm forward (the
+//    GPU consumer = MM-SERVE-E2E residual) is asserted on CPU.
+// ---------------------------------------------------------------------------
+TEST_CASE("chat-mm full chain: image request -> engine request carries mm") {
+  const std::string dir = ImgFixDir();
+  const nlohmann::json manifest = ReadJson(dir + "/manifest.json");
+  const auto cfg = ImageConfigFromManifest(manifest);
+  const int64_t H = manifest.at("image").at("shape")[0].get<int64_t>();
+  const int64_t W = manifest.at("image").at("shape")[1].get<int64_t>();
+  const std::vector<uint8_t> rgb =
+      ReadBytes(dir + "/image_rgb_uint8_448x448x3.bin");
+
+  // Parse an OpenAI chat request with an image_url part.
+  const std::string uri = "data:image/x-raw-rgb;base64," + EncodeBase64(rgb);
+  const nlohmann::json j = {
+      {"messages",
+       {{{"role", "user"},
+         {"content",
+          {{{"type", "text"}, {"text", "What is in this image?"}},
+           {{"type", "image_url"}, {"image_url", {{"url", uri}}}}}}}}}};
+  const ChatCompletionRequest req = j.get<ChatCompletionRequest>();
+  const ChatMessage& msg = req.messages[0];
+  REQUIRE(vllm::entrypoints::openai::HasMultiModalParts(msg));
+
+  // ROUTE (brick 1): decode + processor -> placeholder-EXPANDED MultiModalInputs.
+  vllm::multimodal::Qwen3VLImageProcessor proc(cfg);
+  const auto media =
+      vllm::entrypoints::openai::DecodeImageUrlPart((*msg.content_parts)[1]);
+  const std::vector<int32_t> base_prompt_ids = {5, cfg.image_token_id, 6};
+  const vllm::multimodal::MultiModalInputs mm =
+      vllm::entrypoints::openai::RouteImageRgb(proc, media.bytes.data(), H, W,
+                                               base_prompt_ids);
+
+  const auto g = manifest.at("image_grid_thw").at("values");
+  const int64_t merged =
+      (g[0].get<int64_t>() * g[1].get<int64_t>() * g[2].get<int64_t>()) /
+      (cfg.merge_size * cfg.merge_size);  // 196
+  // The placeholder-inserted prompt has EXACTLY the processor feature count of
+  // image_pad slots (the count == the grid/feature count, MM-SERVE item 2).
+  int64_t pad_slots = 0;
+  for (int32_t id : mm.prompt_token_ids) {
+    if (id == cfg.image_token_id) ++pad_slots;
+  }
+  CHECK(pad_slots == merged);
+  CHECK(mm.mm_features.size() == 1);
+  CHECK(mm.mm_features[0].length == merged);
+
+  // ENGINE (MM-SERVE-ENGINE): process_inputs_mm is the exact call the engine mm
+  // add_request overload makes. Feed the routed MultiModalInputs through it.
+  const vllm::HfConfig hf = [] {
+    vllm::HfConfig c;
+    c.max_position_embeddings = 4096;
+    c.raw = nlohmann::json::object();
+    return c;
+  }();
+  static const vllm::tok::Tokenizer tok = vllm::tok::Tokenizer::FromHfJson(
+      std::string(PARITY_GOLDENS_DIR) + "/tokenizer_qwen36/tokenizer.json");
+  vllm::v1::InputProcessor input_proc(tok, hf);
+
+  vllm::SamplingParams params;
+  vllm::v1::EngineCoreRequest core_req = input_proc.process_inputs_mm(
+      "chatcmpl-0", mm.prompt_token_ids, mm.mm_features, params);
+
+  // The engine request carries BOTH the expanded prompt AND the mm handles.
+  CHECK(core_req.prompt_token_ids == mm.prompt_token_ids);
+  REQUIRE(core_req.mm_features.size() == 1);
+  CHECK(core_req.mm_features[0].modality == "image");
+  CHECK(core_req.mm_features[0].length == merged);
+  CHECK(core_req.mm_features[0].mm_hash ==
+        manifest.at("mm_hash").get<std::string>());
+  REQUIRE(core_req.mm_features[0].data != nullptr);
+
+  // ...and the built Request (what the scheduler/encoder-cache consume).
+  vllm::v1::Request built = vllm::v1::Request::FromEngineCoreRequest(core_req);
+  REQUIRE(built.mm_features.size() == 1);
+  CHECK(built.mm_features[0].length == merged);
+  CHECK(built.prompt_token_ids == mm.prompt_token_ids);
+  // E2E residual (MM-SERVE-E2E): the mm forward on the GPU worker consuming
+  // built.mm_features to produce token-correct output on Qwen3-VL-4B.
 }

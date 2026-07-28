@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include "vllm/multimodal/inputs.h"  // multimodal::MultiModalInputs (mm request)
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -87,6 +88,17 @@ class AsyncLLM {
                            std::vector<int32_t> prompt_token_ids,
                            SamplingParams params, int priority = 0);
 
+  // add_request for a MULTIMODAL prompt (ROAD-V1-MM MM-SERVE-ENGINE). Strictly
+  // ADDITIVE overload mirroring LLMEngine::add_request(MultiModalInputs): builds
+  // the request from the placeholder-EXPANDED prompt ids + mm_features via
+  // InputProcessor::process_inputs_mm, registers the collector, and enqueues the
+  // Request (mm_features carried through FromEngineCoreRequest). The string /
+  // tokens overloads above are UNCHANGED; an mm_inputs with empty mm_features is
+  // byte-identical to the tokens overload.
+  AsyncRequest add_request(const std::string& request_id,
+                           multimodal::MultiModalInputs mm_inputs,
+                           SamplingParams params, int priority = 0);
+
   // Consumer side of generate (:524-635). get_output blocks for this request
   // only; get_output_nowait is the fast path used before blocking.
   RequestOutput get_output(const AsyncRequest& request);
@@ -105,6 +117,15 @@ class AsyncLLM {
   // drain its collector to the terminal RequestOutput. The async beam-search
   // driver issues one such single-token decode per beam per step.
   RequestOutput generate(std::vector<int32_t> prompt_token_ids,
+                         SamplingParams params,
+                         const std::string& request_id = "0",
+                         int priority = 0);
+
+  // generate for a MULTIMODAL prompt (ROAD-V1-MM MM-SERVE-ENGINE). Strictly
+  // ADDITIVE blocking single-request driver mirroring the tokens loop: add the
+  // mm request, then drain its collector to the terminal RequestOutput. The mm
+  // forward consumes the carried mm_features on the GPU worker (MM-SERVE-E2E).
+  RequestOutput generate(multimodal::MultiModalInputs mm_inputs,
                          SamplingParams params,
                          const std::string& request_id = "0",
                          int priority = 0);

@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/beam_search.h"
+#include "vllm/entrypoints/openai/chat_mm.h"  // HasMultiModalParts (mm seam gate)
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/entrypoints/openai/tool_parsers/structural_tags.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -577,6 +578,31 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const std::string prompt =
       prompt_fn_(request.messages, /*add_generation_prompt=*/true, tools);
 
+  // ── Multimodal (MM-SERVE-ENGINE) ─────────────────────────────────────────
+  // When the mm seam is set AND a message carries a mm content part, decode +
+  // route the media through the mm processor and carry the placeholder-EXPANDED
+  // MultiModalInputs to the engine mm overload. Unset seam OR a text-only
+  // request leaves mm_inputs empty and every path below is byte-identical to the
+  // text-only server (the RED-line inertness). Streaming mm is a NAMED residual.
+  std::optional<multimodal::MultiModalInputs> mm_inputs;
+  if (mm_chat_fn_) {
+    bool has_mm = false;
+    for (const ChatMessage& m : request.messages) {
+      if (HasMultiModalParts(m)) {
+        has_mm = true;
+        break;
+      }
+    }
+    if (has_mm) {
+      mm_inputs = mm_chat_fn_(request.messages);
+    }
+  }
+  if (mm_inputs.has_value() && request.stream) {
+    throw std::runtime_error(
+        "streaming is not currently supported with multimodal input "
+        "(MM-SERVE-E2E residual)");
+  }
+
   // ── use_beam_search (chat_completion/serving.py:319-343) ─────────────────
   // Route the rendered chat prompt through the merged BeamSearch driver;
   // beam_width == n, returns the n best beams as assistant choices. The
@@ -807,11 +833,23 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   }
 
   // ── Non-streaming (chat_completion_full_generator, :804) ────────────────
-  const RequestOutput final_res = async_engine_ != nullptr
-      ? async_engine_->generate(prompt, std::move(sampling_params),
-                                engine_request_id, request.priority)
-      : sync_engine_->generate(prompt, std::move(sampling_params),
-                               engine_request_id, request.priority);
+  // With mm inputs, drive the engine mm overload (placeholder-expanded prompt +
+  // mm_features); otherwise the text-only string overload byte-identically. The
+  // mm forward on the GPU worker consumes the mm_features (MM-SERVE-E2E).
+  const RequestOutput final_res =
+      mm_inputs.has_value()
+          ? (async_engine_ != nullptr
+                 ? async_engine_->generate(std::move(*mm_inputs),
+                                           std::move(sampling_params),
+                                           engine_request_id, request.priority)
+                 : sync_engine_->generate(std::move(*mm_inputs),
+                                          std::move(sampling_params),
+                                          engine_request_id, request.priority))
+      : (async_engine_ != nullptr
+             ? async_engine_->generate(prompt, std::move(sampling_params),
+                                       engine_request_id, request.priority)
+             : sync_engine_->generate(prompt, std::move(sampling_params),
+                                      engine_request_id, request.priority));
 
   ChatCompletionResponse response;
   response.id = request_id;
