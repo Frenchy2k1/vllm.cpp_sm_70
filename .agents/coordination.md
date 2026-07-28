@@ -118,6 +118,30 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**DeepSeek-V4 GGUF benchmark loadability — source-level spike (2026-07-28,
+`CLAIM-DSV4-GGUF-SPIKE`, records-only, NOT pushed; FULL SHA reported to caller).**
+Base `main` HEAD `e0b233df`; isolated worktree `.claude/worktrees/agent-a19a1d1e4dc82becb`;
+CPU/research only — NO build, NO GPU, NO download, NO benchmark; read-only source
+inspection of the DGX (`dgx.casa`). Question: can we bench our engine vs vLLM on the
+SAME `unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_XXS` (~91 GB)? **VERDICT: NO — blocked on
+BOTH engines.** (Q1) vLLM 0.26 moved GGUF OUT-OF-TREE to `vllm-gguf-plugin`
+(`vllm-src/docs/features/quantization/gguf.md:9`); pin has NO in-tree gguf.py / kernels;
+the plugin DOES dequant IQ2_XXS (`triton/dequantize/iq_quant/iq2_xxs.py` + CUDA
+`csrc/gguf/dequantize.cuh`). (Q2) `DeepseekV4ForCausalLM` (`deepseek_v4/nvidia/model.py:1333`)
+has NO `SupportsQuant`/`packed_modules_mapping`/gguf wiring, DeepSeek absent from plugin's
+tested models → V4 GGUF unproven/broken in vLLM. (Q3) oracle lacks BOTH the `gguf` lib
+AND the plugin; plugin pins `gguf>=0.17.0` (reads i-quants) — needs a scratch venv. (Q4)
+OUR `deepseek_v4_registry.cpp:61-64` (and v2:67-69) hard-reject GGUF; our dequant
+(`gguf_dequant.cpp:85-160`) lacks IQ2_XXS AND Q2_K (only F32/F16/BF16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/NVFP4).
+Q2_K_XL fallback ALSO blocked (same V4-reject + no Q2_K dequant). DGX `/` at 99%
+(~53 GiB free) — 91 GB won't fit. FALLBACK: DeepSeek-V4 apples-to-apples = the NVFP4
+2×-Spark vehicle; GGUF vehicle stays llama.cpp-on-card reference (ours-only); true
+same-GGUF cross-engine number only on a Qwen3/dense k-quant both already load. IQ2_XXS
+port source = llama.cpp `ggml-quants.c` `dequantize_row_iq2_xxs` + `iq2xxs_grid`. Owns
+ONLY: `specs/deepseek-v4-flash.md` (new §GGUF benchmark loadability), the
+BENCHMARKS/STATUS/ledger/state entries, this claim; no code/README/Metal. All 6 record
+checkers rc=0.
+
 **Kimi K3 W0 SCOPE — DERIVE-AND-SHIP (2026-07-28, `CLAIM-KIMI-K3-SCOPE`,
 records-only, NOT pushed; FULL SHA reported to caller).** Base `main` HEAD
 `df18ca91`; isolated worktree `.claude/worktrees/agent-affb2ae9cfb0ca879`; CPU-only,

@@ -30636,3 +30636,42 @@ verdict, which was NVFP4-only (156.7 GiB). TWO vehicles: single-Spark IQ2_XXS GG
 llama.cpp-on-box (derive-and-ship), and we need a V4-GGUF loader + IQ i-quant dequant
 (IQ1_S/IQ2_XXS/IQ2_M — NOT in our C4 K-quant set). Appended to specs/deepseek-v4-flash.md
 §HW-FIT CORRECTION. Records-only.
+
+## 2026-07-28 — DeepSeek-V4 GGUF benchmark loadability spike (`CLAIM-DSV4-GGUF-SPIKE`, records-only)
+
+Base `main` `e0b233df`, isolated worktree `.claude/worktrees/agent-a19a1d1e4dc82becb`.
+Question: can we bench our engine vs vLLM on the SAME `UD-IQ2_XXS` GGUF? Read-only
+source inspection on DGX `dgx.casa` (host `promaxgb10-4ad8`): pinned `/home/mudler/vllm-src`
+(0.26.0.dev0), installed oracle `~/venvs/vllm-oracle` (dist-info 0.25.0), and the
+`vllm-project/vllm-gguf-plugin@main` GitHub tree (via `gh api`). **VERDICT: NO —
+same-quant IQ2_XXS GGUF benchmark is blocked on BOTH engines.**
+
+- **Q1 (vLLM i-quant dequant): YES via the OOT plugin only.** vLLM 0.26 migrated GGUF
+  out-of-tree to `vllm-gguf-plugin` (`vllm-src/docs/features/quantization/gguf.md:9`).
+  Verified NO in-tree gguf: no `layers/quantization/gguf.py`, zero `GGMLQuantizationType`/
+  `import gguf` in the `vllm` pkg, no `csrc` gguf kernels, no `ggml_dequant` symbol in the
+  oracle `*.abi3.so`. The plugin DOES dequant IQ2_XXS: `triton/dequantize/iq_quant/iq2_xxs.py`
+  (+ iq1_s/iq1_m/iq2_s/iq2_xs/iq3_s/iq3_xxs/iq4_nl/iq4_xs) and CUDA `csrc/gguf/dequantize.cuh`+`vecdotq.cuh`.
+- **Q2 (DeepSeek-V4 gguf in vLLM): NO/unproven.** `DeepseekV4ForCausalLM`
+  (`vllm/models/deepseek_v4/nvidia/model.py:1333`) = `(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts)`
+  — no `SupportsQuant`, no class `packed_modules_mapping` (plugin `quantization/config.py:76,82`
+  needs it), zero gguf refs in the pkg; DeepSeek absent from the plugin's tested-model table.
+  (Contrast `deepseek_v2.py:1763` which DOES define packed_modules_mapping.)
+- **Q3 (gguf dep):** oracle has NEITHER `gguf` NOR the plugin installed. Plugin pyproject
+  pins `dependencies = ["gguf>=0.17.0", "vllm", "torch>=2.9"]`; `gguf>=0.17` reads i-quants.
+  Needs a scratch venv (never mutate the oracle).
+- **Q4 (ours):** `deepseek_v4_registry.cpp:61-64` (and `deepseek_v2_registry.cpp:67-69`)
+  hard-throw "does not support GGUF weights" unless `kSafetensors`. Our dequant
+  `gguf_dequant.cpp:85-160` + `vt/dtype.cpp:95-97` cover ONLY F32/F16/BF16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/NVFP4;
+  Q2_K(10) + IQ2_S(22)/IQ4_XS(23) have reader sizing traits only (`gguf_reader.cpp:210,230,236`),
+  IQ2_XXS/IQ1_S absent entirely. IQ2_XXS port source = llama.cpp `ggml-quants.c`
+  `dequantize_row_iq2_xxs` + `iq2xxs_grid` codebook.
+- **Ops:** DGX `/` at 99% (~53 GiB free); the 90.9 GB IQ2_XXS won't fit — HF cache holds
+  only config.json (28 KB). Freeing to ~100 GiB is a hard prereq.
+- **Q2_K_XL fallback does NOT rescue it** (same V4 GGUF-reject our side, no Q2_K dequant,
+  no V4 gguf wiring vLLM side). **FALLBACK:** DeepSeek-V4 apples-to-apples = the NVFP4
+  2×-Spark vehicle; the GGUF vehicle stays llama.cpp-on-card (ours-only); a true
+  same-GGUF cross-engine number is only available on a Qwen3/dense k-quant both load.
+
+Appended to specs/deepseek-v4-flash.md §GGUF benchmark loadability + BENCHMARKS + STATUS +
+ledger. Records-only; no build/GPU/download/benchmark.
