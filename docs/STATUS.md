@@ -637,10 +637,21 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   (`QUANT-GGUF-NVFP4`, `PARTIAL`); the earlier attempt threw there with ZERO GPU
   work. The loader gate DID pass 18/18 against the 35B A3B MoE GGUF, exercising
   the MoE head branch on real weights for the first time (the head block's own
-  tensors are not NVFP4) - a loader result, with no MoE inference run. Still
-  outstanding: an actual GPU end-to-end run on a head-carrying NVFP4 GGUF (which
-  needs more than the dequant), cross-format agreement, and a throughput
-  number.
+  tensors are not NVFP4) - a loader result, with no MoE inference run. **With
+  type 40 implemented the 35B A3B NVFP4 GGUF now LOADS AND GENERATES on the
+  GPU** (dgx.casa under `flock`, peak RSS 90.2 GiB, 7m33s): 2/2 cases, 10/10
+  assertions, spec-ON token-identical to spec-OFF, 13 drafts proposed / 11
+  accepted. Device attribution is proven by an A/B - hiding the GPU
+  (`CUDA_VISIBLE_DEVICES=`) changes the tokens and hits the known CPU
+  restriction `conv_state must be f32, or bf16 on CUDA`. That run is NOT
+  accepted as the closing gate, for two honest reasons: the dgx build is
+  configured `CMAKE_CUDA_ARCHITECTURES=75` on an sm_121 GB10, so it is PTX-JIT'd
+  Turing code and not the release target; and on the SAME loaded weights the GPU
+  arm's 24 tokens differ materially from the CPU arm's, which is a forward-path
+  question (the loader hands both arms identical bf16 buffers) rather than a
+  materialization one. Still outstanding: that run repeated on a
+  release-configured sm_121a build with the GPU/CPU token divergence explained,
+  cross-format agreement, and a throughput number.
 - **Speculative decoding on CPU corrupted the target's own state, and is FIXED**
   (`CPU-SPEC-DIVERGENCE`). `qwen3_5.cpp:3616` sized the GDN state gather/scatter
   row by `(Kw-1)` while the speculative persistent row is `(Kw-1)+num_spec`, so

@@ -30240,3 +30240,39 @@ Sec 5/6), `quantization-matrix.md` (`QUANT-GGUF-NVFP4` INVENTORIED -> PARTIAL, n
 row so `ENGINE_ROWS` unchanged), `docs/STATUS.md` (capability row + the MTP-GGUF
 blocker paragraph), `docs/BENCHMARKS.md` (NOT APPLICABLE, loader-only, with the
 correctness evidence), this log.
+
+---
+
+## 2026-07-28 — `QUANT-GGUF-NVFP4` follow-up: the downstream unblock MEASURED, with its caveats
+
+After `ef6ffdc4` landed type-40 dequant, ran the gate it had blocked, on dgx.casa
+under `flock $HOME/gpu.lock`, from a CLEAN pull of the pushed commit.
+
+**It runs.** `VLLM_MTP_GGUF_MODEL=~/bench/q36-35b-a3b-nvfp4.gguf
+./tests/test_qwen35_gguf_spec_decode` -> 2/2 cases, 10/10 assertions, spec-ON
+token-identical to spec-OFF, 13 drafts proposed / 11 accepted, peak RSS 90.2 GiB,
+wall 7m33s. Previously it threw at load with zero work.
+
+**The device is PROVEN, not assumed.** Peak RSS alone only proves the 35B was really
+materialized; it does not say where the forward ran. A/B: re-run with
+`CUDA_VISIBLE_DEVICES=` -> the tokens CHANGE and the run hits the known CPU
+restriction `causal_conv1d_spec_update: conv_state must be f32, or bf16 on CUDA`
+(1/2 cases, 69.1 GiB, 5m37s). So the passing arm executed on the GB10.
+
+**Two reasons this does NOT close `SPEC-MTP-GGUF`, recorded rather than glossed:**
+1. The dgx `build-cuda` is configured `CMAKE_CUDA_ARCHITECTURES=75` on an sm_121
+   GB10, so the GPU arm is PTX-JIT'd Turing code, not the release target. A
+   release-configured `-DVLLM_CPP_CUDA_ARCHITECTURES=121a` build must repeat it.
+2. On the SAME loaded weights the two arms produce materially different text
+   (GPU `" Paris.\nA. True\nB. False\nAnswer:\nA..."` vs CPU `" Paris, a city
+   renowned for its rich history, culture, and iconic landmarks..."`). The loader
+   hands both arms IDENTICAL bf16 buffers -- the NVFP4 expansion is host-side and
+   device-independent -- so this is a FORWARD-PATH question, not a materialization
+   one, and it is not attributable to `QUANT-GGUF-NVFP4`. It still has to be
+   explained before the GPU arm binds anything. Next step for whoever owns
+   `SPEC-MTP-GGUF`: repeat on a 121a build and, if the divergence survives, bisect
+   the GPU forward against `VT_CPU_REF=1` on the same file.
+
+Records: `docs/STATUS.md` (the `SPEC-MTP-GGUF` paragraph now states the measured
+run and both caveats instead of "outstanding"), `docs/BENCHMARKS.md` (the
+`QUANT-GGUF-NVFP4` entry's downstream-unblock paragraph), this log. No code change.
