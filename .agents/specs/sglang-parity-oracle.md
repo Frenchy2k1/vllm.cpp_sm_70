@@ -230,3 +230,40 @@ A/B (owned by the benchmark track), which itself needs `KV-MAMBA-ALIGN`.
   SGLang runs on GB10 today via the image; what is missing is our comparable
   async server + the exact-equivalence preflight. This program does not conflate
   the two.
+
+---
+
+## 9. Results — first measured floor (`CLAIM-SGLANG-PERF-BENCH`, 2026-07-28)
+
+**The oracle is STOOD UP and a first floor is MEASURED, reproduced on an idle
+GB10.** Rank-1 `SGLANG-ORACLE-PERF` is no longer INVENTORIED: the arm64 cu130
+image (`@sha256:d0a667e`) pulled and RAN the 27B-NVFP4 gate model on GB10
+sm_121a with no from-source build — confirming §2's headline asymmetry. The
+`run_serve_low.py` harness's `bench` subcommand drove `sglang.bench_serving`
+against both engines identically; note the harness's `SGLANG_IMAGE` pin
+(`serve_low_common.py:21`) is still v0.5.13 while this run used the oracle-spec
+v0.5.15 pin — a deliberate re-pin to record, not silently adopt.
+
+**Config + equivalence.** vllm.cpp `7e9ffbff` vs SGLang `v0.5.15-cu130` in
+production config (overlap + radix cache on, CUDA graphs captured); model
+`unsloth/Qwen3.6-27B-NVFP4` `890bdef7` byte-identical both arms; deterministic
+corpus (seed 0, 80 × 1024-in/128-out exact, common-prefix ≤32 = cache-neutral),
+greedy `ignore_eos`, KV 20480 tokens matched; strictly sequential under one
+`flock`; 3 reps + warmup, all within run-noise; both emitted exactly 80×128
+tokens, 0 errors, identical peak concurrency. Full per-axis table +
+repro recipe: [sglang-matrix.md](../sglang-matrix.md) § "Perf oracle results",
+[docs/BENCHMARKS.md](../../docs/BENCHMARKS.md).
+
+**Verdict against the §4 perf gate.** The gate is "ours ≥ SGLang on
+throughput/req-s AND ≤ SGLang on latency/memory, EVERY axis, BOTH cache gates."
+On the cache-neutral arm at c8/c16: ours PASSES throughput (2.21×/1.44×), req/s,
+TTFT (6–12× lower), and ~ties peak memory — but FAILS the per-token
+latency axis (TPOT/ITL 1.18–1.49× above SGLang). Per the gate's own rule
+("below SGLang on any axis where SGLang beats vLLM = an open gap, never near
+parity"), the perf gate is **NOT fully met**: it is a decisive throughput+TTFT
+win with a reproduced, honestly-recorded TPOT/ITL gap (candidate lever: our
+higher throughput comes from larger decode batches that raise per-request
+per-token latency). The second (shared-prefix cache-ON) gate,
+`BACKEND-GATE-CUDA-SGLANG-PREFIX`, remains unrun — as does 35B, the c1/c2/c4
+low-concurrency sweep (SGLang c1 ~13.3 s/it, impractical for 3-rep reproduction
+this pass), and the `SGLANG-ORACLE-CORRECT` token-exact cross-check.

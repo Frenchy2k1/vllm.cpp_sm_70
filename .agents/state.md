@@ -29246,6 +29246,96 @@ acceptance rate are unmeasured, and `G5` (cross-format agreement at F16) is
 untouched. The attach site in the GGUF branch is compile-verified only. A
 quantized head may accept rarely enough that spec-ON is SLOWER than spec-OFF -
 recorded in the spike as a finding to publish, not a bug to hide. Next: `G4`.
+## 2026-07-28 — SGLang perf oracle stood up + first competitor floor measured (`CLAIM-SGLANG-PERF-BENCH`)
+
+User side-quest "do the benchmarks": stand up live SGLang and benchmark our CUDA
+engine vs the SGLang floor. Base `main` HEAD `7e9ffbff` (≥ the `c26ec71e` floor).
+dgx GB10.
+
+**The headline held: SGLang runs our gate model on GB10 with no from-source
+build.** The oracle-spec `v0.5.15-cu130` arm64 image pulled cleanly (after one
+gotcha — pulling by the *manifest-list* digest + `--platform` gave "manifest
+schema unsupported" on docker 29.2.1; pulling the *arm64 sub-manifest* digest
+`ce9667f4` directly worked) and served `unsloth/Qwen3.6-27B-NVFP4` — "server is
+fired up and ready to roll", CUDA graphs captured. Confirms oracle spec §2's
+crucial asymmetry vs the from-source vLLM oracle.
+
+**Result (cache-neutral, 27B, c8/c16, 3 reps, idle box, one flock, engines
+sequential):** ours BEATS the SGLang floor on aggregate throughput (**2.21×@c16,
+1.44×@c8**) and TTFT (**6–12× lower**), but SGLang WINS the steady-state
+per-token decode latency (**TPOT/ITL 1.18–1.49× below ours**). The tradeoff is
+mechanistic and honest: at `--request-rate inf`, ours admits and drains the
+80-request burst with near-zero queue (TTFT ~3 s vs SGLang's ~33 s) by packing
+larger decode batches — which raises per-request per-token latency. Both arms
+were byte-equivalent on the workload (identical corpus, greedy `ignore_eos`,
+exactly 80×128 output tokens, 0 errors, identical peak concurrency), and both
+engines were internally rock-solid across reps (CV ~0.01% on the throughput
+axes). The TPOT/ITL deficit is recorded as a reproduced OPEN GAP / candidate
+lever, not explained away.
+
+**Lessons.** (1) A trimmed grid beats a stalled full grid: SGLang c1 ran at
+~13.3 s/it (~18 min/rep) — 3-rep c1/c2/c4 would have been ~2 h with little
+marginal signal, so I retargeted to the large-concurrency gate points c8/c16 and
+NAMED the low-conc sweep as a residual rather than let it block the whole
+benchmark. (2) On a 98%-full shared production box, the image (25.6 GB) is the
+benchmark *client* for BOTH arms, so it's non-optional; I pulled it, ran, then
+pruned image + build tree back to the starting 78 GB free. (3) The manifest's
+`--mem-fraction-static 0.85` is a documented box-rebooter on the unified pool —
+overrode to 0.30 (the KV pool only needs ~few GB here). Residuals: 35B, the
+shared-prefix cache-ON arm, the token-exact cross-check, and the full P2 grid
+(vLLM arm + c1–c16).
+
+## 2026-07-28 — Qwen vision-forward SPEED (campaign #2): §14 flash kernel extended to the tower, byte-exact; ATTRIBUTION REFUTED the assumed lever — the tower already BEATS vLLM (`CLAIM-MM-SPEED-QWEN-IMAGE`)
+
+GPU campaign #2 (user-directed 2/3): close the Qwen image/video mm-forward SPEED gap
+to vLLM. Base local `main` `0a07ac76`. dgx GB10 sm_121a, `~/vllmcpp-mmspeed` (cutlass
+4.5.0 + FA2 arch 121a banners CONFIRMED, `-Werror` 0-warn), all GPU under
+`flock $HOME/gpu.lock`, sole owner, rep0 dropped. NOT pushed.
+
+**ATTRIBUTION-FIRST (the deliverable).** nsys `cuda_gpu_kern_sum` of the 27B vision
+tower forward (448×448 image, 784 patches, 27 ViT blocks, head_dim 72): the post-§7
+148 ms forward is **~85% the dense attention kernel** — `AttentionWarpKernel`
+(`AttentionDenseFast`) 4.66 ms/block × 27 = ~126 ms; cutlass/nvjet GEMMs (QKV/proj/FC)
+~10%; LayerNorm/Rope/Gelu/Add glue <5%. So attention IS the dominant kernel — but the
+question the profile actually answers is whether the §14 flash tiling *helps here*, and
+it barely does.
+
+**The lever (byte-exact).** Routed the vision-tower per-frame self-attention (hd-72,
+non-causal) from the warp `vt::AttentionDenseFast` to the §14 flash-tiled
+`vt::AttentionDenseFlash` (`qwen3_vl_vision.cpp` default + `VT_QWEN3VL_ATTN_WARP`/
+`VT_QWEN3VL_ATTN_EAGER` A/B knobs; bench extended with the warp-vs-flash arm +
+bit-identity assert). The flash op is head_dim-generic (`npl=(d+31)/32` handles 72; shmem
+18.4 KiB at d=72) and its per-warp online-softmax recurrence is copied VERBATIM from the
+warp kernel — only K/V read from shared-memory tiles ⇒ BIT-IDENTICAL output. No new
+kernel; `kAttention`/`kAttentionDenseFast` untouched ⇒ text/audio/other-model
+byte-identical by construction.
+
+**A/B REFUTES the big lever.** Same-binary, `flock`, rep0 dropped, 27B tower: warp
+**148.3 → flash 142.3 ms = 1.04×** (per-kernel 4.66 → 4.37 ms/block). Unlike audio
+(§14: t=1500, warp→flash 1.82×), the vision attention at t=784 (single image window) is
+**serial-latency-bound** — one warp per query steps a dependent 784-key online-softmax
+chain, and the GB10 L2 already serves the "redundant" global K/V reads flash eliminates —
+so tiling recovers only ~6 ms. **HONEST HEADLINE: the Qwen image/video mm-forward tower
+ALREADY BEATS vLLM — 142 ms vs vLLM 0.25.0 ~250 ms eager encode = 0.57×** (carried-forward
+§7 denominator; not re-measured — OOM-reboot risk of a big oracle alongside the tree, and
+we are well under it).
+
+**Gate (RED line HELD, byte-exact).** 27B image e2e STRICT 32/32 (54/54), 4B image 32/32
+(46/46), 27B video 32/32 (gap 0 nats, 27/27), `test_ops_attention` 37239/37239; bench
+flash-vs-warp tower 0/1,003,520 mismatches; goldens md5 UNCHANGED before==after
+(`qwen3_5_27b 3bc5f231…`, `qwen3vl_text b7221f22…`, `qwen3_5_27b_video bf14a962…`,
+`qwen3vl_video 09b2fce3…`). Proof-of-run: nsys default 4B e2e `AttentionDenseFlashKernel`
+24 inst (= 24 vision blocks), ZERO `AttentionWarpKernel` on the mm path. RED: corrupt
+flash V-accum → 30/46 FAIL → restore → 46/46. compute-sanitizer memcheck 0 errors. Clean
+CUDA `-Werror` 0-warn.
+
+**Disposition.** Byte-exact 1.04× landed (free, widens the lead, unifies the codebase —
+tower + audio encoder now both on `AttentionDenseFlash`). The profile REFUTED the
+assumption that the flash kernel closes a big gap here, because there is no gap to close
+on the tower: we already run it at 0.57× vLLM. Image/video mm-forward = correctness-DONE +
+speed-BEATS-vLLM; the umbrella MM row stays `PARTIAL` for batched c2+/serving. Residual
+(NOT needed for parity): a tensor-core MMA hd-72 non-causal attention (§14.5 lever #1)
+would widen the tower lead further. `benchmark_binding=false`.
 
 ## 2026-07-28 — `SPEC-MTP-GGUF` G4: the token gate RUNS, finds one defect, exposes a second
 

@@ -205,6 +205,34 @@ per-request logit processor.
 
 ---
 
+## When to enable (guidance)
+
+These knobs are **correctness-neutral plumbing, not free speed switches** — whether
+they help is workload-dependent, and the shared-prefix performance arm that would
+put a number on the gain is **not yet measured** (tracked as
+`BACKEND-GATE-CUDA-SGLANG-PREFIX`; the first SGLang competitor-floor run was
+cache-neutral). Honest per-knob guidance:
+
+- **RadixAttention / prefix caching** — enable when the workload has **shared
+  prefixes** (a common system prompt, few-shot exemplars, multi-turn chat). It
+  reuses cached prefix KV instead of recomputing, a real win there; neutral to
+  slight overhead when there is no sharing. Already on by default for dense models.
+- **LPM scheduling** — enable **together with prefix caching** when concurrent
+  requests share prefixes: it admits cache-hitting requests first, raising the hit
+  rate under load. It has no effect without APC (falls back to `fcfs`), and it
+  changes admission order, so leave it off for latency-sensitive single-stream use.
+- **Jump-forward decoding** — a niche constrained-decoding speed lever, off by
+  default and conservative (token-unique subset only). Enable only for structured
+  output that matches that pattern; it is not a general throughput knob.
+- **Custom logits processors** — a programmatic per-request hook, not a performance
+  knob; use it when you need per-request logit control (a bias, a mask, a forced
+  token, a thinking budget).
+
+**Bottom line:** turn on RadixAttention (and LPM) for **prefix-heavy serving**,
+where the reuse is real; the rest are situational. Do not enable everything blindly
+for speed. Measured numbers for the prefix-cache-on gain are pending the
+shared-prefix benchmark.
+
 ## Default inertness
 
 Setting **none** of these knobs (all C-ABI fields `0`/`NULL`, no server flags, no
