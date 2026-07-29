@@ -131,6 +131,12 @@ struct MoeDeviceKernels {
                           const std::vector<int32_t>& hash_indices_table, int64_t vocab_size);
   std::vector<float> (*clamped_swiglu)(vt::Queue&, const std::vector<float>& gate_up,
                                        int64_t d, float limit, float alpha, float beta);
+  // Brick B — IN-PLACE clamped-SwiGLU: reads gate_up[2*d], writes out[d] on the
+  // queue device (unified memory), NO Upload/Download/Sync (caller drains at Brick
+  // B / captures at Brick D). Same ClampedSwiGLUKernel math as clamped_swiglu above
+  // ⇒ bit-identical (elementwise, no reduction).
+  void (*clamped_swiglu_ip)(vt::Queue&, float* out, const float* gate_up, int64_t d,
+                            float limit, float alpha, float beta);
 };
 
 // Resolve a family's device kernels through the vt OpProvider seam. THROWS on a
