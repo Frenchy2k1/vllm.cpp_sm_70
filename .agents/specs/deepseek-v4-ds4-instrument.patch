@@ -1,0 +1,120 @@
+diff --git a/ds4.c b/ds4.c
+index 2496319..2e30bf8 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -10758,6 +10758,8 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n);
+ 
+ /* Single-token routed MoE.  It selects six experts, runs IQ2_XXS gate/up,
+  * applies SwiGLU and router weights, then accumulates Q2_K down projections. */
++static void ds4_dump_act(const char *name, const float *v, uint64_t n);  /* #188 fwd */
++
+ static void layer_routed_moe_one(
+         float             * out,
+         const ds4_model   * model,
+@@ -10812,6 +10814,25 @@ static void layer_routed_moe_one(
+     } else {
+         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+     }
++    if (getenv("DS4_DUMP_ACT") && il >= 28 && il <= 34) {  /* coherence-debug #188 */
++        double xr = 0; for (uint64_t i = 0; i < expert_in_dim; i++) xr += (double)x[i]*x[i];
++        fprintf(stderr, "  [ds4 moe L%u] moe_in_rms=%.4f\n", il, sqrt(xr/expert_in_dim));
++        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++)
++            fprintf(stderr, "    [ds4 moe L%u] routed e=%d w=%.4f\n", il, selected[i], expert_weight[i]);
++        /* recompute + dump the raw gate logits [256] + bias [256] at L34 */
++        float dlog[DS4_MAX_EXPERT];
++        matvec_any(dlog, model, layer->ffn_gate_inp, x);
++        const float *dbias = layer->ffn_exp_probs_b ? tensor_data(model, layer->ffn_exp_probs_b) : NULL;
++        fprintf(stderr, "  [ds4 router L34] logit[33]=%.4f logit[233]=%.4f bias[33]=%.4f bias[233]=%.4f\n",
++                dlog[33], dlog[233], dbias?dbias[33]:0.f, dbias?dbias[233]:0.f);
++        char pp[512];
++        snprintf(pp, sizeof(pp), "%s/ds4_gating_L34.bin", getenv("DS4_DUMP_ACT"));
++        FILE *ff = fopen(pp, "wb"); if (ff) { fwrite(dlog, sizeof(float), DS4_N_EXPERT, ff); fclose(ff); }
++        snprintf(pp, sizeof(pp), "%s/ds4_routerin_L34.bin", getenv("DS4_DUMP_ACT"));  /* router INPUT x [H] */
++        ff = fopen(pp, "wb"); if (ff) { fwrite(x, sizeof(float), expert_in_dim, ff); fclose(ff); }
++        if (dbias) { snprintf(pp, sizeof(pp), "%s/ds4_gatebias_L34.bin", getenv("DS4_DUMP_ACT"));
++            ff = fopen(pp, "wb"); if (ff) { fwrite(dbias, sizeof(float), DS4_N_EXPERT, ff); fclose(ff); } }
++    }
+ 
+     if (routed_q8_0) {
+         const uint64_t x_blocks = expert_in_dim / 32u;
+@@ -11549,6 +11570,15 @@ static void layer_ffn_one(
+ 
+     t0 = profile ? now_sec() : 0.0;
+     layer_routed_moe_one(moe, model, layer, norm, il, token, DS4_SWIGLU_CLAMP_EXP, trace);
++    if (getenv("DS4_DUMP_ACT") && il >= 31 && il <= 34) {  /* coherence-debug #188 per-sub-op */
++        double r = 0; for (uint32_t i = 0; i < DS4_N_EMBD; i++) r += (double)moe[i]*moe[i];
++        double sr = 0; for (uint32_t i = 0; i < DS4_N_EMBD; i++) sr += (double)norm[i]*norm[i];
++        fprintf(stderr, "  [ds4 moe L%u] routed_out_rms=%.4f (moe_norm_in_rms=%.4f)\n",
++                il, sqrt(r/DS4_N_EMBD), sqrt(sr/DS4_N_EMBD));
++        char nm[64];
++        snprintf(nm, sizeof(nm), "ds4_moein_L%02u", il);  ds4_dump_act(nm, norm, DS4_N_EMBD);
++        snprintf(nm, sizeof(nm), "ds4_moeout_L%02u", il); ds4_dump_act(nm, moe, DS4_N_EMBD);
++    }
+     if (profile) t_routed = now_sec() - t0;
+     if (trace) {
+         char name[64];
+@@ -13852,6 +13882,17 @@ static void prefill_layer_major_cpu(
+     free(attn);
+ }
+ 
++/* DS4_DUMP_ACT: env-gated per-layer activation dump (coherence-debug #188).
++ * Writes a raw little-endian float32 vector to $DS4_DUMP_ACT/<name>.bin. */
++static void ds4_dump_act(const char *name, const float *v, uint64_t n) {
++    const char *dir = getenv("DS4_DUMP_ACT");
++    if (!dir || !name) return;
++    char path[1200];
++    snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
++    FILE *f = fopen(path, "wb");
++    if (f) { fwrite(v, sizeof(float), (size_t)n, f); fclose(f); }
++}
++
+ /* Diagnostic first-token layer without cache history: the token attends only
+  * to itself, useful for checking a minimal end-to-end slice. */
+ static void layer_forward_self_one(
+@@ -13894,6 +13935,17 @@ static void layer_forward_self_one(
+     layer_attention_one(heads, model, layer, q, kv);
+     rope_tail_layer_inplace(heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
+     layer_grouped_out_one(attn_out, model, layer, heads);
++    if (getenv("DS4_DUMP_ACT") && (il <= 5 || (il >= 28 && il <= 34))) {  /* #188 per-sub-op */
++        char nm[64]; snprintf(nm, sizeof(nm), "ds4_attnout_L%02u", il);
++        ds4_dump_act(nm, attn_out, DS4_N_EMBD);
++        snprintf(nm, sizeof(nm), "ds4_attncur_L%02u", il);   /* attention INPUT (post hc-pre, PRE-norm) */
++        ds4_dump_act(nm, attn_cur, DS4_N_EMBD);
++        snprintf(nm, sizeof(nm), "ds4_attnnorm_L%02u", il);  /* POST-input-norm: the tensor fed to q/kv */
++        ds4_dump_act(nm, attn_norm, DS4_N_EMBD);
++        /* also dump q [nh*hd] and the kv latent [hd] (the actual MLA operands) */
++        snprintf(nm, sizeof(nm), "ds4_q_L%02u", il);  ds4_dump_act(nm, q, (uint64_t)DS4_N_HEAD*DS4_N_HEAD_DIM);
++        snprintf(nm, sizeof(nm), "ds4_kv_L%02u", il); ds4_dump_act(nm, kv, DS4_N_HEAD_DIM);
++    }
+     hc_post_one(after_attn_hc, attn_out, attn_residual, post, comb, DS4_N_EMBD, n_hc);
+ 
+     layer_ffn_one(out_hc, model, layer, after_attn_hc, il, token,
+@@ -13920,12 +13972,16 @@ static void forward_first_token_cpu(
+ 
+     embed_token_f16(model, weights, token, plain);
+     hc_from_plain_embedding(cur, plain, DS4_N_EMBD, DS4_N_HC);
++    ds4_dump_act("ds4_embed", plain, DS4_N_EMBD);
++    ds4_dump_act("ds4_hc_00_embed", cur, (uint64_t)DS4_N_HC * DS4_N_EMBD);
+ 
+     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+         layer_forward_self_one(next, model, &weights->layer[il], cur, il, 0, token);
+         float *tmp = cur;
+         cur = next;
+         next = tmp;
++        char nm[64]; snprintf(nm, sizeof(nm), "ds4_hc_%02u_afterL%02u", il + 1, il);
++        ds4_dump_act(nm, cur, (uint64_t)DS4_N_HC * DS4_N_EMBD);
+     }
+ 
+     memcpy(out_hc, cur, (size_t)DS4_N_HC * DS4_N_EMBD * sizeof(out_hc[0]));
+@@ -53418,7 +53474,10 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
+ 
+     float *hc = xmalloc((size_t)DS4_N_HC * DS4_N_EMBD * sizeof(hc[0]));
+     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+-    forward_first_token_cpu(hc, model, weights, prompt->v[0]);
++    int tok0 = prompt->v[0];
++    { const char *ft = getenv("DS4_FIRST_TOKEN"); if (ft) tok0 = atoi(ft); }
++    fprintf(stderr, "first-token: using token id %d (prompt->v[0]=%d)\n", tok0, prompt->v[0]);
++    forward_first_token_cpu(hc, model, weights, tok0);
+     print_vec_stats("first-token final_hc", hc, (uint64_t)DS4_N_HC * DS4_N_EMBD);
+     output_logits_one(logits, model, weights, hc);
+     print_vec_stats("first-token logits", logits, DS4_N_VOCAB);

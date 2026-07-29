@@ -636,6 +636,39 @@ TEST_CASE("DeepseekV4ForwardGguf: real-ish geometry (comp_width=2*head_dim) runs
   for (size_t i = 0; i < lk.size(); ++i) CHECK(lk2[i] == lk[i]);
 }
 
+// ── MLA per-head query RMS-norm (coherence-debug #188) ────────────────────────
+// DeepSeek-V4 applies a per-head RMS-norm to q AFTER wq_b and BEFORE RoPE (ds4
+// `head_rms_norm_inplace`): each head's `head_dim` sub-vector is scaled by
+// 1/sqrt(mean(x^2)+eps), NO learnable weight. Our forward previously OMITTED it,
+// which made q rel-L2 ~0.96 vs the ds4 oracle at L00 (with a bit-exact input) and
+// drove the whole incoherent-generation cascade. Spec-anchored oracle: compute the
+// reference by hand from the formula (upstream is the executable spec).
+TEST_CASE("DeepseekV4QHeadRmsNormInplace: per-head unit-RMS matches the spec formula") {
+  const int64_t n_head = 3, head_dim = 4;
+  const float eps = 1e-6f;
+  // distinct per-head magnitudes so a MISSING norm leaves distinctly non-unit RMS.
+  std::vector<float> q = {1.f, 2.f, 3.f, 4.f,        // head0 (rms=sqrt(7.5)≈2.739)
+                          -10.f, 0.f, 10.f, -20.f,   // head1 (large)
+                          0.1f, -0.1f, 0.2f, -0.2f}; // head2 (small)
+  const std::vector<float> in = q;
+  vllm::DeepseekV4QHeadRmsNormInplace(q, n_head, head_dim, eps);
+  for (int64_t h = 0; h < n_head; ++h) {
+    // (a) matches the hand-computed spec reference (per-head 1/sqrt(mean(x^2)+eps)).
+    double ss = 0.0;
+    for (int64_t i = 0; i < head_dim; ++i) ss += (double)in[h * head_dim + i] * in[h * head_dim + i];
+    const float r = 1.0f / std::sqrt((float)(ss / head_dim) + eps);
+    double out_ss = 0.0;
+    for (int64_t i = 0; i < head_dim; ++i) {
+      CHECK(q[h * head_dim + i] == doctest::Approx(in[h * head_dim + i] * r));
+      out_ss += (double)q[h * head_dim + i] * q[h * head_dim + i];
+    }
+    // (b) SEMANTIC: each head is now unit-RMS (the property the forward relies on) —
+    // RED-first: the pre-norm heads (rms 2.74 / 15.8 / 0.16) are NOT unit-RMS, so a
+    // forward that skips this op feeds mis-scaled queries into attention.
+    CHECK(std::sqrt(out_ss / head_dim) == doctest::Approx(1.0f).epsilon(1e-4));
+  }
+}
+
 TEST_CASE("LoadDeepseekV4FromGguf: RED-first — unmapped/leftover tensors throw") {
   Dims d;
   const vllm::GgufLoadPolicy pol = KeepPolicy();

@@ -1333,3 +1333,188 @@ compressor bug); (c) keep-quant IQ2_XXS/Q2_K vec_dot numerics at real block scal
 quantization at H=4096. RULED OUT this pass: geometry, attention scale (ds4 `1/sqrt(512)` matches) +
 structure (score·scale + sink softmax, value=key=latent, grouped 8-way o-LoRA all match ds4), fp8
 roundtrip, memory path (mmap==copy byte-identical), per-layer RoPE (changed only 1 token). Row `SPIKE`.
+
+### W8-run.6 Coherence-debug ROOT CAUSE LOCALIZED — the routed keep-quant experts (IQ2_XXS/Q2_K) are grossly over-scaled (2026-07-29, `CLAIM-DEEPSEEK-V4-COHERENCE`, base `eeef1695`, worktree `/home/mudler/_git/vllm.cpp-w8dbg`, NOT pushed — PHASE-1 localization, NO fix)
+Applied the systematic-debugging Iron Law (root-cause before any fix) via instrumented per-layer
+activation diff against the ds4 oracle. Method: fixed single token 671 ("The", pos 0) so our forward
+is on the DENSE-MLA exact path (seq ≤ index_topk, indexer ruled out); env-gated float32 dumps of the
+`[hc=4, H=4096]` manifold residual after each of the 43 layers in BOTH engines (`VT_DUMP_ACT` in
+`ForwardComposeImpl`; `DS4_DUMP_ACT` in ds4 `forward_first_token_cpu`, saved as `ds4_instrument.patch`).
+ds4's first-token CPU pass prepends BOS — the token was forced equal via `DS4_FIRST_TOKEN=671` (a harness
+bug caught+fixed: the initial diff compared token 0 vs 671; the embed then cross-checked BIT-EXACT against
+the raw file row 671, `cos(raw,ours)=1.0000`, so ours reads the embedding correctly).
+
+**Per-layer relative-L2 curve `||ours-ds4||/||ds4||` (token 671):** embed **0.0000**; L00-L04 ~0.38-0.68;
+L05-L32 at the KEEP-QUANT FLOOR, *decreasing* 0.41→~0.06 (the model is contractive; ours tracks ds4, rms
+matches, e.g. L27 ours 56.0 vs ds4 58.0); **L33 JUMPS to 0.53; L34 EXPLODES to 6.02 (ours rms 367 vs ds4
+59, ~6× in one layer)**, staying 5-10× thereafter. **First-divergence layer = L33→L34.**
+
+**Sub-localization (intra-layer rms, ours):** the ATTENTION output is well-behaved every layer (attn_out
+rms ~0.1-1.0, at the quant floor); the **MoE block output is the divergence source** — `moe_out` rms is
+28-500 vs `moe_in` ~0.5 (50-1000× amplification), erratic across layers. Within the MoE: the router
+weights are fine (`wmax` ~0.4-1.5), the **Q8_0 shared expert is fine (`shared_rms` ~0.1-0.5)**, but the
+**raw routed-expert outputs EXPLODE (`expert_out_rmax` L26→66, L30→155, L34→346, L40→378 vs the expected
+~1 at L25)**. Shared (Q8_0) and routed (IQ2_XXS gate/up + Q2_K down) run the IDENTICAL clamped-SwiGLU, so
+the clamp/activation is not it.
+
+**SINGLE HYPOTHESIS (formed, NOT yet tested — the Iron Law defers the fix):** the keep-quant ROUTED-
+expert GEMM produces grossly over-scaled outputs — i.e. the **IQ2_XXS / Q2_K vec_dot (or block decode)
+numerics at real block scale, OR the `GemmRowSlice` row-offset addressing into the stacked `[E*out, K]`
+expert tensors at real E=256 / mi=2048** — because the Q8_0 shared expert with the identical
+clamped-SwiGLU is well-behaved (rms ~0.3) while the IQ2_XXS/Q2_K routed experts hit rms 66-378, and the
+over-scaling is expert-specific (erratic per layer), pointing at the per-expert quantized-weight decode
+or the stacked-slice offset rather than a uniform scalar error. Next round (Phase 2/3): compare one
+routed expert's keep-quant output vs its dequant-bf16 oracle to split vec_dot-numerics from
+slice-addressing, form the minimal failing test, then fix. Row stays `SPIKE`. Instrumentation is
+env-gated (inert without `VT_DUMP_ACT`); no model behavior change this round.
+
+### W8-run.7 Phase-2/3 discriminator — the MoE/quant is EXONERATED; the bug is an upstream router-input divergence that FLIPS the discrete expert selection (2026-07-29, base `eeef1695`, NOT pushed — PHASE-2 localization, NO fix)
+Ran the coordinator's binary discriminator (keep-quant `kMatmulBTQuant` A vs dequant-`BlockToFloat`+GEMM B,
+same blocks) on the real weights (`--probe 34`, `DeepseekV4ExpertProbe`), then followed the evidence with
+targeted cross-checks against the ds4 oracle (both on the fixed token 671). Findings, each an equality
+against ds4 or an A==B identity:
+1. **Expert GEMM is BIT-CORRECT.** For the exploding L34 expert e=33 (and controls): `A == B` at the
+   quant floor — gate rel 0.0013, up 0.0014, **EXPERT_OUT rel 0.0008** (A=346.53, B=346.48). So NEITHER
+   the IQ2_XXS/Q2_K vec_dot/decode numerics NOR the `GemmRowSlice` stacked-`[E*out,K]` offset is wrong.
+2. **Clamped-SwiGLU matches ds4 EXACTLY** (`silu(clamp(gate,max=lim))·clamp(up,±lim)·w`, lim=10;
+   ds4 `matvec_iq2_xxs_mid_worker`). e=33 is a GENUINELY loud expert (gate/up rms 5.69 vs ~0.9 → act
+   47.5 → 346); the controls (e=0,1,25) are ~0.6. The slice pulls the RIGHT (loud) rows.
+3. **Router LOGIC + bias match.** Our `SqrtSoftplusRouteTopk` = ds4's (`sqrt(softplus)` + `exp_probs_b`
+   bias for selection, top-k, unbiased weights, ×1.5); the bias is IDENTICAL (12.4703/12.4691 both).
+4. **The router SELECTS a DIFFERENT dominant expert:** ours e=33 (w=1.44, out 499), ds4 e=233 (w=1.40,
+   out 13.8) — SAME input rms 0.5804.
+5. **GATE GEMM is CORRECT** — the decisive cross-check: fed ds4's EXACT router input, OUR gate GEMM
+   returns `logit[33]=-11.7219, logit[233]=-0.8001`, **rel-L2 vs ds4's logits = 0.0000**. On OUR input it
+   returns `logit[33]=+4.25, logit[233]=-8.50` (favoring e=33). So the gate GEMM is bit-correct; only the
+   INPUT differs.
+6. **The L34 router INPUT is 0.91 rel-L2 diverged from ds4's** (cos 0.59, matching rms) — an UPSTREAM
+   divergence, not a MoE effect.
+
+**Conclusion (root cause redirected, evidence-backed):** the entire MoE + keep-quant suspect family is
+EXONERATED. The failure is an UPSTREAM residual-stream divergence (first visible at **L33**, where the
+per-layer curve jumps 0.06→0.53) that, by L34, makes the router input ~orthogonal to ds4's; because the
+top-k router is a DISCRETE argmax, this flips the dominant-expert selection to e=33 — a genuinely loud
+expert ds4 does not pick — which explodes and cascades. The ~6% keep-quant "floor" is CONTRACTIVE
+through L32 (the model self-corrects, rel 0.41→0.06); the discrete router flip at L33 is the amplifier.
+**No fix applied (Iron Law): no single BROKEN op was found — the ops are correct.** Next round is a fresh
+Phase-1 localization at L33's ATTENTION/MHC/norm (the non-GEMM ops feeding the L33 residual; note ds4
+fp8-quantizes the KV latent per-token which our forward currently skips — a candidate floor source).
+Tooling added (env-gated, inert): `DeepseekV4ExpertProbe` + `--probe LAYER` (A-vs-B + gate cross-check)
+and the ds4-side dumps (`ds4_instrument.patch`). Row stays `SPIKE`.
+
+### W8-run.8 Phase-1 per-sub-op at L28-34 — the L33 jump is a discrete ROUTER FLIP driven by an attention-output floor (2026-07-29, base `eeef1695`, NOT pushed — localization, NO fix)
+Followed the coordinator's method: (#4 first, cheap) checked the config for an L33 boundary — NONE
+(`compress_ratios` L31-35 = [128,4,128,4,128], the same alternating pattern as all layers ≥5;
+`swiglu_clamp_exp` all 10.0; no dense/sparse/first_k key). Then diffed per-sub-op vs ds4 at L28-34 on
+token 671.
+
+**The residual jump at L33 is a discrete ROUTER FLIP.** Top routed expert, ours vs ds4:
+L28 e32=e32, L29 e180=e180, L30 e121=e121 (MATCH); **L31 e234≠e224** (first flip, but a "flat" layer —
+all six weights ~0.2-0.45, no dominant expert, so the ~floor perturbation flips the argmax; low weight →
+harmless, L32 recovers e216=e216); **L33 e65≠e137** (ours picks a DOMINANT loud expert e65 w=1.16
+eo_rms=48.5; ds4 picks e137 w=0.82) → L33 folded state jumps 0.06→0.53; **L34 e33≠e233** (ours e33
+eo_rms=346 → explosion 6.02). So the cascade is: a discrete top-k flip lands on a loud dominant expert at
+L33 and blows up.
+
+**The floor that enables the flips is the ATTENTION OUTPUT.** `attn_out` rel-L2 vs ds4 is **~0.5-0.7 at
+EVERY layer** (L28-34, cos 0.72-0.92) — a persistent, roughly-uniform attention-output difference (NOT a
+discrete L33 event, NOT the ~6% quant floor). The MHC ABSORBS it (the folded residual stays at the
+0.06-0.12 floor through L32), but it perturbs the discrete router enough to flip borderline selections.
+
+**The exact attention sub-op is NOT yet cleanly isolated (honest).** Candidates + status: (a) the
+inverse-RoPE ds4 applies to the output heads — our forward omits it (line 557: `o += w·deck`, no
+un-rotation) — but at pos 0 RoPE is IDENTITY, so it cannot be the pos-0 error (it WILL matter for pos>0,
+a real residual). (b) the per-token fp8 KV-latent quantization — ds4 does it in per-64-element E4M3
+blocks (`dsv4_fp8_kv_quantize_row_inplace_cpu`, 7 scales over the 448-nope span), our forward SKIPS it;
+but per-64-block E4M3 is ~6% and cannot alone make 0.5-0.7. (c) the attention INPUT / MHC-pre — the
+`attn_cur` diff came back rel-L2 ~1.0 with an oscillating cos (0.56-0.997), but that comparison is
+CONFOUNDED: ds4 dumps `attn_cur` PRE-attn-norm while ours dumps the POST-MHC-pre plain hidden, so the
+rel-L2 ~1.0 is the RMSNorm magnitude gap, not a clean divergence — cross-codebase per-op diffing hit its
+reliable limit here. **Named sub-op: the MLA attention output (attn_out), ~0.5-0.7 diverged every layer;
+the specific mechanism (fp8-KV vs MHC-pre vs attention-core vs inverse-rope for pos>0) needs an ISOLATED
+test — feed one engine's exact attention input to the other's attention and diff the output — rather than
+raw per-op dumps.** No fix (Iron Law: not a single confirmed broken op yet). Tooling: per-layer
+`attn_out`/`attn_cur`/`moe_in`/`moe_out` + routed-expert dumps (both engines, env-gated, inert). Row
+stays `SPIKE`.
+
+### W8-run.9 FIXED — the missing per-head query RMS-norm; COHERENT single-Spark generation (2026-07-29, base `eeef1695`, worktree `/home/mudler/_git/vllm.cpp-w8dbg`, NOT pushed)
+**Root cause (named, isolated, spec-cited).** The decisive L00 experiment (dump-point-aligned: ours'
+`x_pre_attn` vs ds4's POST-input-norm `attn_norm`, the tensor literally fed to q/kv) forked H1/H2:
+attention INPUT rel-L2 **0.0000** (bit-exact) and KV latent rel-L2 **0.0179** (just the fp8 diff) — but
+the **q operand rel-L2 0.9646** (magnitude ~2× off, cos 0.965). H1 confirmed: the MLA math is wrong given
+a correct input, and it is the **q projection**. Reading ds4 `layer_q_projection_normed_one`: after
+`wq_b` it calls **`head_rms_norm_inplace(q, n_head, head_dim, eps)`** — a PER-HEAD RMS-normalization of
+the query (each head's `head_dim` scaled by `1/sqrt(mean(q²)+eps)`, NO weight); the KV latent gets only
+its `attn_kv_a_norm` (which we already apply — hence kv matched). **Our forward OMITTED the per-head
+q-norm entirely.**
+
+**Minimal failing test → fix → pass.** Added the self-contained doctest
+`DeepseekV4QHeadRmsNormInplace: per-head unit-RMS matches the spec formula` (spec-anchored: hand-computed
+`1/sqrt(mean+eps)` reference + the unit-RMS semantic; RED-first — the pre-norm heads have rms 2.74/15.8/
+0.16, so a forward skipping this op feeds mis-scaled queries). Fix: new public
+`DeepseekV4QHeadRmsNormInplace`, called in `AttentionBlock` after `wq_b`, before RoPE. Gate
+`test_deepseek_v4_gguf_load` **10/10·403** (CPU Release `-Werror`).
+
+**Verified on the REAL 80.7 GB model (token 671):** q rel-L2 **0.9646 → 0.0013**, attn_out **0.5956 →
+0.0175**, and the FULL 43-layer folded-state curve COLLAPSED to the keep-quant floor — **MAX rel-L2
+0.0334 (L37); L33 0.5286 → 0.0029; L34 6.0239 → 0.0031**. The L33/L34 explosion is gone.
+
+**COHERENT GENERATION.** Greedy on the chat-templated prompt: **"France's capital is Paris."** (q-norm
+fix alone). Adding the SECOND confirmed fix — the **inverse-RoPE on the attention output** (ds4
+`rope_tail_layer_inplace(heads, inverse=true)`, identity at pos 0, load-bearing for pos>0; our forward
+omitted it) — the multi-token generation cleans up to **"The capital of France is Paris.<｜end▁of▁sentence｜>"**
+(correct answer + proper EOS). CPU-tier: decode ~3.3 s/tok (~0.3 tok/s), peak resident 85.8 GiB (the ds4
+oracle: prefill 358, decode 16.5 tok/s on GPU). Self-consistent (deterministic greedy).
+
+**Two fixes landed:** (1) per-head query RMS-norm (the pos-0 breakthrough); (2) inverse-RoPE on the
+attention output (pos>0 multi-token). **Named residuals:** GPU-expert wiring (the driver runs the CPU
+queue; #195's CUDA keep-quant GEMM is on main but not dispatched here) → CPU-tier speed; the DSA-SPARSE
+path (compressor cache + indexer selection for contexts > index_topk=512) is still the dense-fallback (a
+named residual — exact for short single-Spark generations); ds4-oracle (not vLLM-token-exact — vLLM has
+no V4 GGUF plugin). Row ADVANCES `SPIKE → PARTIAL` (coherent + self-consistent + ds4-oracle-matching, but
+CPU-tier + dense-only + not vLLM-strict).
+
+## Gates
+- **Coherence + self-consistency (ratified for the ds4-oracle vehicle, no vLLM V4 GGUF plugin exists):** greedy generation on the chat-templated "The capital of France is" produces **"The capital of France is Paris.<｜end▁of▁sentence｜>"** (correct answer + EOS), deterministic across ≥2 runs (self-consistent).
+- **Per-layer oracle-diff gate (W8-run.9):** the 43-layer residual-stream rel-L2 vs the antirez/ds4 reference COLLAPSED to the keep-quant floor (MAX 0.0334; L33 0.53→0.003, L34 6.02→0.003) after the q-head-norm + inverse-RoPE fixes.
+- **Unit gates:** `test_deepseek_v4_gguf_load` 10/10·403 (CPU Release `-Werror`, incl. the spec-anchored RED-first `DeepseekV4QHeadRmsNormInplace` doctest + the ds4-file loadability + real-ish-geometry cases); the W3-W6 primitive gates (dsa 13/38, compressor 12/164, mhc 14/125, moe 12/716, forward 6/26, scaffold 4/40); `test_ops_quant_dot` 19/130444 (IQ2_XXS/IQ3_XXS/Q2_K keep-quant); `test_cuda_deepseek_v4` 11/11·153 (GB10 device kernels).
+- **NOT gated (honest residual):** no vLLM-token-exact SACRED gate (vLLM ships no DeepSeek-V4 GGUF plugin) — the cross-engine oracle is ds4, not vLLM.
+
+## Dependencies
+- Keep-quant CPU GEMM (`kMatmulBTQuant` for IQ2_XXS/IQ3_XXS/Q2_K/Q8_0) + the `blk.N.*`→V4 name-map (1328/1328) + the GGUF keep-quant tower loader (`LoadDeepseekV4FromGguf`, mmap-view residency).
+- The W3-W6 host primitives (DSA indexer/compressor, MHC Sinkhorn, sqrtsoftplus/hash MoE, clamped-SwiGLU) + the shared MLA/MoE/grouped-GEMM machinery (reused, not re-ported).
+- The antirez/ds4 (DwarfStar) cross-engine oracle (`make cuda-spark` on GB10) and its `q2-imatrix` GGUF (`antirez/deepseek-v4-gguf`, 80.7 GB) — the shared apples-to-apples vehicle.
+- DGX GB10 (sm_121a, 119 GiB unified) for the single-Spark run; `#195` CUDA keep-quant GEMM on main (not yet dispatched by the CPU-queue driver).
+
+## Work breakdown
+- **DONE:** W0 scope → W1/W2 scaffolding → W3 DSA → W4 compressor/fp8_ds_mla → W5 MHC → W6 sqrtsoftplus/hash MoE → W7 host forward → W7-device CUDA → W8 keep-quant enabler + name-map → W2b tower → W2c keep-quant forward → W8-run download+build+greedy driver → **W8-run.9 the two MLA fixes (per-head q RMS-norm + inverse-RoPE) → COHERENT single-Spark generation.**
+- **Residual (keeps it out of DONE):** (a) GPU-expert dispatch — the driver runs the CPU queue, so decode is CPU-tier (~0.3 tok/s vs ds4 16.5); wire the expert/MLA GEMMs to the CUDA `kMatmulBTQuant` provider; (b) the DSA-SPARSE path (compressor cache + indexer top-k selection for contexts > `index_topk`=512) — currently the dense-fallback, EXACT for short single-Spark generations but a named residual for long context; (c) the paged-engine integration (the stateless full-recompute driver is the run vehicle); (d) a vLLM-token-exact SACRED gate (blocked — no vLLM V4 GGUF plugin); (e) the fp8-KV per-64-block E4M3 the attention omits (~6% floor contributor, ds4 `dsv4_fp8_kv_quantize_row_inplace_cpu`).
+
+## Risks/decisions
+- **Decision (ratified):** with no vLLM DeepSeek-V4 GGUF plugin, the gate is cross-engine coherence + self-consistency + the per-layer ds4-oracle diff, NOT vLLM-token-exact. Row is `ACTIVE`, not `DONE`.
+- **Decision:** the real keep-quant run uses DENSE MLA (the DSA-sparse compressor/indexer is a dense-fallback) — EXACT for `seq ≤ index_topk`=512, which every short single-Spark step satisfies; the full real-geometry sparse path is a named residual.
+- **Risk (retired):** the incoherence was NOT the MoE/quant (bit-exact A==B discriminator) nor the router/gate-GEMM (rel-L2 0.0000 on ds4's input) — it was two missing MLA ops (per-head q-norm + inverse-RoPE), now fixed and gated.
+- **Risk (open):** GB10 unified-memory OOM — an 86 GiB keep-quant load on top of the 80 GB file page-cache OOM-reboots the box; run ONE engine resident at a time.
+
+## Upstream chain
+- vLLM `nvidia/DeepSeek-V4-Flash` model (`nvidia/model.py` forward + decoder, `attention.py`, `compressor.py`, `mhc/torch.py` Sinkhorn, `fused_topk_bias_router.py`, `activation.py`, `o_proj.py`, `common/rope.py`), pin `555967922` (0.26.0.dev0).
+- SGLang v0.5.15 `dsv4/` (second reference: DSA/MHC/o_lora, `moe/{topk,hash_topk}.py`, `dequant_k_cache.py`).
+- llama.cpp @ `237ad9b96` (the GGUF `deepseek4` conversion convention + IQ2_XXS/IQ3_XXS/Q2_K `vec_dot`/dequant ports).
+- **antirez/ds4 (DwarfStar)** — the executable cross-engine oracle for this GGUF vehicle: `ds4.c` `head_rms_norm_inplace` / `layer_q_projection_normed_one` (the per-head q-norm this fix restores), `rope_tail_layer_inplace(..., inverse=true)` (the output inverse-RoPE), `matvec_iq2_xxs_mid_worker` (clamped-SwiGLU), `layer_router_probs_one` (sqrtsoftplus + `exp_probs_b` bias).
+
+## Our baseline
+- The pre-existing dense/MoE model infra (loader, paged KV, grouped-GEMM, NVFP4/FP8 kernels, the GGUF keep-quant path from Qwen3.6) is reused; DeepSeek-V4 is additive files (`deepseek_v4*.{h,cpp,cu}`) mirroring upstream 1:1.
+- Before this campaign the V4 forward was a `VT_CHECK(false)` stub; the W3-W9 bricks built it to a coherent single-Spark run.
+
+## Port map
+- Host references: `deepseek_v4_dsa.{h,cpp}` (indexer+MLA seams), `deepseek_v4_compressor.{h,cpp}` (compressor+fp8_ds_mla), `deepseek_v4_mhc.{h,cpp}` (Sinkhorn+pre/post/head), `deepseek_v4_moe.{h,cpp}` (sqrtsoftplus/hash/clamped-SwiGLU).
+- Forward composition + the two MLA fixes: `deepseek_v4.cpp` (`ForwardComposeImpl`/`AttentionBlock`, `DeepseekV4QHeadRmsNormInplace`, the inverse-RoPE call, `RopeInplaceLayer(...,inverse)`).
+- Loader/quant: `deepseek_v4_weights.cpp` (name-map + keep-quant tower + mmap-view), `gguf_dequant.cpp` (I32), `cpu_quant_*` (IQ2_XXS/IQ3_XXS/Q2_K), `deepseek_v4_registry.cpp` (entrypoint).
+- CUDA: `src/vt/cuda/cuda_deepseek_v4.cu` + `deepseek_v4_device.{h,cpp}` (W7-device). Driver: `examples/deepseek_v4_gen`.
+
+## Tests to port
+- `test_deepseek_v4_gguf_load` (loadability + keep-quant forward + real-ish geometry + the per-head q-norm doctest), `test_deepseek_v4_{dsa,compressor,mhc,moe,forward,scaffold}`, `test_cuda_deepseek_v4` (GB10), `test_ops_quant_dot` (keep-quant vec_dot), `scripts/check-dsv4-gguf-namemap.py` (1328/1328).
+- The operational single-Spark gate is the on-DGX greedy run + the per-layer ds4-oracle diff (`ds4_instrument.patch` + `VT_DUMP_ACT`); a vLLM-token-exact port is blocked (no vLLM V4 GGUF plugin).
+
+## Scope
+Bring up DeepSeek-V4-Flash (`DeepseekV4ForCausalLM`, `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm`) — a NEW multi-brick architecture (DSA sparse-MLA + Manifold Hyper-Connections + sqrtsoftplus/hash MoE + clamped-SwiGLU + dual-theta YaRN RoPE) — on a single GB10 via the keep-quant GGUF vehicle, to a COHERENT single-Spark generation gated against the antirez/ds4 cross-engine oracle (vLLM ships no V4 GGUF plugin). In scope: the additive host + CUDA forward, the keep-quant loader, the greedy driver, and the per-layer oracle-diff bring-up. Out of scope (named residuals): GPU-expert dispatch (CPU-tier speed), the DSA-sparse path for ctx>512 (dense-fallback), paged-engine integration, and a vLLM-token-exact SACRED gate.

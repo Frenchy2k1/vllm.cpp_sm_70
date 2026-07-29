@@ -36,6 +36,8 @@ the [README Quantization table](../README.md#quantization).
 | Variable | Default | What it does |
 |---|---|---|
 | `VT_GGUF_KEEP_QUANT` | on when compute-in-quant is available | Keep GGUF weights compressed from file to matmul on CPU (no BF16 expansion), byte-identical to the reference path. `0` disables it and expands to BF16 |
+| `VT_GGUF_NVFP4_FP4` | on where the device can run the NVFP4 GEMM (CUDA; a CPU build expands) | The NVFP4 analog of `VT_GGUF_KEEP_QUANT`: keep an NVFP4 GGUF's weights in native fp4 residency and run `kMatmulNvfp4`, instead of expanding to BF16. `0` is the same-binary opt-out (expand to BF16); forced off under `VT_CPU_REF` so the oracle load stays byte-identical. See [.agents/specs/gguf-nvfp4-native-compute.md](../.agents/specs/gguf-nvfp4-native-compute.md) |
+| `VT_GGUF_NVFP4_W4A4` | on (only meaningful when `VT_GGUF_NVFP4_FP4` is on) | Selects which of vLLM's two NVFP4 modes the fp4-resident weights compute in: on = true W4A4 (fp4 activations, using the GGUF's `<stem>.input_scale` sidecars, mirroring the sibling compressed-tensors container); `0` = W4A16 (BF16 activations over the fp4 weights). No effect when the fp4 residency is off |
 | `VT_GGUF_KEEP_F16` | on (when weights expand) | Keep F16 GGUF weights in F16 rather than promoting them, an RSS/perf tradeoff |
 | `VT_GGUF_MMAP` | on when weights stay quantized | Keep the GGUF file mmap-resident instead of copying weight bytes into owned buffers, trading RSS for page-cache residency |
 | `VT_GGUF_PREFAULT` | off | Pre-fault the mmap-resident weight pages at load, trading a slower load for steadier first-token latency |

@@ -33119,3 +33119,49 @@ full-file sweep compares 192 NVFP4 tensors across both containers),
 **Still owed and NOT claimed:** a serving-throughput arm (tokens/s, TTFT, TPOT at
 concurrency) against the vLLM oracle on the equivalent workload. `P` stays `-`.
 Work remains LOCAL; nothing pushed.
+
+## DeepSeek-V4 coherence-debug — L33 jump is a discrete ROUTER FLIP driven by an attention-output floor (2026-07-29, `CLAIM-DEEPSEEK-V4-COHERENCE`, base `eeef1695`, NO fix, NOT pushed)
+
+Per-sub-op diff at L28-34 vs the ds4 oracle (token 671). Config check first: NO L33
+architectural boundary (compress_ratios/swiglu uniform). Findings: **the L33 residual
+jump (0.06→0.53) is a discrete ROUTER FLIP** — top routed expert ours-vs-ds4 matches
+L28/29/30, first flips at L31 (a flat borderline layer, weights ~0.2-0.45, harmless,
+L32 recovers), then at L33 ours picks a DOMINANT loud expert e65 (w1.16 eo_rms48.5) vs
+ds4's e137 → jump; L34 e33 (eo346) explodes. **The floor enabling the flips is the
+ATTENTION OUTPUT:** `attn_out` rel-L2 vs ds4 is ~0.5-0.7 at EVERY layer (cos 0.72-0.92)
+— persistent, roughly uniform, absorbed by the MHC (folded stays at the floor through
+L32) but enough to flip borderline routers. **Exact attention sub-op NOT yet isolated**
+(honest): inverse-RoPE on the output (ours omits; ds4 does) is identity at pos 0 so
+not the pos-0 error (matters for pos>0); fp8-KV per-64-block E4M3 (ds4 does, ours skips)
+is ~6%, too small alone; the attn_cur (input) diff is confounded by a pre-norm-vs-post-
+norm dump mismatch. Next: an ISOLATED test — feed one engine's exact attention input to
+the other's attention, diff the output. No fix (Iron Law). Router/gate-GEMM/experts/
+quant already exonerated (bit-exact). Instrumentation env-gated (inert). Worker restored,
+flock free, file retained. Row stays SPIKE. NOT pushed.
+
+## DeepSeek-V4 coherence-debug — FIXED: COHERENT single-Spark generation; row ADVANCES SPIKE→ACTIVE (2026-07-29, `CLAIM-DEEPSEEK-V4-COHERENCE`, worktree `/home/mudler/_git/vllm.cpp-w8dbg`, base `eeef1695`, NOT pushed)
+
+The decisive experiment (coordinator Round 7): fixed the dump-point alignment (ours'
+post-input-norm attn INPUT vs ds4's `attn_norm`) and diffed at L00 to fork H1 (attention
+math wrong) vs H2 (upstream MHC). **Verdict H1:** attention input rel-L2 **0.0000**
+(bit-exact — H2 refuted), KV latent 0.0179 (fp8), but the **q operand rel-L2 0.9646**
+(cos 0.965, magnitude ~2× off) → the MLA q projection. **Root cause + upstream cite:**
+our forward OMITTED the **per-head query RMS-norm** ds4 applies after `wq_b`
+(ds4 `head_rms_norm_inplace`: each head's [head_dim=512] scaled by 1/sqrt(mean(q²)+eps),
+NO weight; the KV correctly gets only its `attn_kv_a_norm` — which is why kv matched and
+q did not). **Fix:** `DeepseekV4QHeadRmsNormInplace` (called after wq_b, before RoPE) +
+a spec-anchored RED-first doctest (hand-computed 1/sqrt(mean+eps) reference + unit-RMS
+check), `test_deepseek_v4_gguf_load` **10/10·403**. Second confirmed fix — the
+**inverse-RoPE on the attention output** (ds4 `rope(heads, inverse=true)`; identity at
+pos 0, load-bearing for pos>0) via a new `inverse` param on `RopeInplaceLayer`.
+**Proof on the real 80.7 GB model:** L00 q **0.9646→0.0013**, attn_out **0.5956→0.0175**;
+the FULL 43-layer folded-state curve COLLAPSED to the keep-quant floor — MAX 0.0334,
+L33 **0.5286→0.0029**, L34 **6.0239→0.0031**. **Generation** (greedy, chat-templated):
+**"The capital of France is Paris.<｜end▁of▁sentence｜>"** (ids `671 6102 294 8760 344
+11111 16 1` — correct answer + EOS), deterministic/self-consistent. Benchmark: ours
+CPU-tier decode ~3.3 s/tok, peak resident 85.8 GiB (ds4 GPU oracle: prefill 358 tok/s,
+decode 16.5 tok/s). Named residuals (row ACTIVE, not DONE): GPU-expert dispatch (the #195
+CUDA keep-quant GEMM is on main but this driver runs the CPU queue), DSA-sparse ctx>512
+(dense-fallback, exact for short gen), paged-engine integration. Model-matrix row
+ADVANCED SPIKE→ACTIVE (rollup ACTIVE 21→22 / SPIKE 9→8); spec §W8-run.9 + 9 structured
+sections appended. All 7 record checkers rc=0. Worker restored, flock free. NOT pushed.

@@ -444,6 +444,20 @@ forward to the real DeepSeek-V4 geometry (compressor 1024-dim; audit indexer + g
 `o_groups=8`/`nh=64`/`q_lora_rank=1024`) against a reference; plus the mmap-view load fix. The
 download + keep-quant load + tokenizer + greedy driver + ds4 oracle are DONE; the forward geometry is
 the one blocker before a real single-Spark generation.
+**W8-run.9 FIXED — COHERENT single-Spark generation; DeepSeek-V4 ADVANCES `SPIKE → ACTIVE` (2026-07-29,
+base `eeef1695`, NOT pushed).** The isolated L00 experiment (aligned dump: ours' post-input-norm attn
+input vs ds4's `attn_norm`) forked H1/H2: attention INPUT bit-exact (rel-L2 **0.0000**), KV correct
+(0.018), but the **q operand rel-L2 0.9646** → the MLA q projection. Root cause: our forward OMITTED the
+**per-head query RMS-norm** (ds4 `head_rms_norm_inplace` after wq_b; the KV correctly gets only its
+`attn_kv_a_norm`). Fix `DeepseekV4QHeadRmsNormInplace` (+ spec-anchored RED-first doctest) → L00 q
+**0.9646→0.0013**, attn_out **0.5956→0.0175**, and the FULL 43-layer curve COLLAPSED to the keep-quant
+floor (L33 **0.53→0.003**, L34 **6.02→0.003**, MAX 0.0334). Plus the second confirmed fix, the
+**inverse-RoPE on the attention output** (ds4 `rope(heads,inverse=true)`, identity at pos 0, load-bearing
+for pos>0). Greedy generation is now **"The capital of France is Paris.<｜end▁of▁sentence｜>"** (correct +
+EOS), self-consistent; `test_deepseek_v4_gguf_load` 10/10·403. CPU-tier decode ~3.3 s/tok / peak 85.8 GiB
+(ds4 GPU: 16.5 tok/s). Gated by coherence + self-consistency + the ds4-oracle per-layer diff (no vLLM V4
+GGUF plugin ⇒ not vLLM-token-exact). Named residuals: GPU-expert dispatch (CPU-tier), DSA-sparse ctx>512
+(dense-fallback, exact for short gen), paged-engine integration. Row `ACTIVE`.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
