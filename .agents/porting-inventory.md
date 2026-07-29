@@ -341,6 +341,22 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    CPU reference; vendor specific CUTLASS/FlashInfer kernels only when a
    benchmark proves we can't match them. GDN + NVFP4-MoE prior art exists in
    the killgate/phase llama.cpp patch series on dgx.casa.
+   **From-necessity CUDA port (2026-07-29, `KERNEL-QUANT-CIQ-GEMM-CUDA`,
+   `CLAIM-CUDA-KEEPQUANT-GEMM`):** the CUDA keep-quant GGUF k-quant GEMM
+   (`src/vt/cuda/cuda_quant_dot.cu`, the kCUDA provider for `kMatmulBTQuant`) is a
+   from-necessity port — the pinned vLLM (0.26, GGUF moved to the OOT plugin) has
+   NO CUDA keep-quant GEMM for any k-quant, so DeepSeek-V4's ~2-3-bit routed
+   experts (IQ2_XXS/IQ3_XXS/Q2_K) had no on-GPU compressed-weight GEMM and fell to
+   the unified-memory CPU reference tier (the 20 ARM cores). It ports the
+   MMVQ-style dequant-in-kernel STRUCTURE of llama.cpp @ `237ad9b96`
+   `ggml/src/ggml-cuda/mmvq.cu` + `vecdotq.cuh` (warp-per-row, quantize the
+   activation then integer-dot the compressed blocks) but reproduces OUR CPU
+   keep-quant NUMERICS (Q8_K activation, `ggml-cpu/quants.c` vec_dots), NOT
+   llama.cpp's Q8_1 CUDA numerics — so it stays bit-identical to the landed CPU
+   oracle it was gated against (GB10, NMSE ≤1e-6, memcheck 0). The `__constant__`
+   IQ codebook tables (`cuda_quant_iq_tables.cuh`) are auto-derived from the CPU
+   `cpu_quant_iq_tables.h` (single source). Additive kCUDA provider; the CPU
+   oracle is untouched.
 2. **Process model**: ZMQ multi-process split becomes an in-process
    thread + queue boundary with the same interface shape (multi-process remains
    possible later).

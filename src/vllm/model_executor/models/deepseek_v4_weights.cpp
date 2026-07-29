@@ -491,7 +491,23 @@ DeepseekV4Params DeepseekV4ParamsFromGguf(const GgufFile& g) {
   d.moe_intermediate_size = ReqInt(g, p + "expert_feed_forward_length");
   d.num_hash_layers = OptInt(g, p + "hash_layer_count", 0);
   d.routed_scaling_factor = OptFloat(g, p + "expert_weights_scale", 1.0);
-  d.swiglu_limit = OptFloat(g, p + "swiglu_clamp", 0.0);
+  // Clamped-SwiGLU limit. llama.cpp converters emit EITHER a scalar
+  // `deepseek4.swiglu_clamp` (our tiny-synthetic gate) OR a per-layer f32 array
+  // `deepseek4.swiglu_clamp_exp` (the real DeepSeek-V4 GGUFs — antirez's
+  // q2-imatrix + unsloth). The real arrays are uniform (all 10.0), so the first
+  // element is the faithful scalar. A missing/zero limit would zero every expert
+  // (ClampedSwiGLU: min(gate,0)*...*clamp(up,0,0)=0), so read the array form too.
+  d.swiglu_limit = OptFloat(g, p + "swiglu_clamp", -1.0);
+  if (d.swiglu_limit < 0.0) {
+    if (const GgufValue* sc = g.FindKv(p + "swiglu_clamp_exp");
+        sc != nullptr && sc->TypeId() == kGgufArray &&
+        !std::get<GgufArray>(sc->v).elems.empty()) {
+      d.swiglu_limit =
+          GgKvFloat(std::get<GgufArray>(sc->v).elems[0], p + "swiglu_clamp_exp");
+    } else {
+      d.swiglu_limit = 0.0;
+    }
+  }
   d.norm_topk_prob = OptInt(g, p + "norm_topk_prob", 1) != 0;
   // The `deepseek4` arch is fixed sqrtsoftplus/noaux_tc (expert_gating_func==4);
   // the forward selects those unconditionally, so we do not re-validate the enum.
@@ -526,8 +542,15 @@ DeepseekV4Params DeepseekV4ParamsFromGguf(const GgufFile& g) {
            "deepseek-v4 gguf: degenerate geometry");
   VT_CHECK(d.n_routed_experts > 0, "deepseek-v4 gguf: n_routed_experts must be > 0");
   VT_CHECK(d.hc_mult > 0, "deepseek-v4 gguf: hc_mult must be > 0 (MHC is structural)");
-  VT_CHECK(static_cast<int64_t>(d.compress_ratios.size()) == d.num_hidden_layers,
-           "deepseek-v4 gguf: compress_ratios length must equal block_count");
+  // The real DeepSeek-V4 GGUFs carry compress_ratios of length block_count + the
+  // MTP/nextn layers (antirez's q2-imatrix: 44 = 43 main + 1 nextn), so accept
+  // >= block_count and keep only the main-layer prefix (the topology helpers
+  // is_hash_layer/has_indexer/has_compressor index [0, block_count)). A tiny
+  // synthetic file has exactly block_count entries (no truncation).
+  VT_CHECK(static_cast<int64_t>(d.compress_ratios.size()) >= d.num_hidden_layers,
+           "deepseek-v4 gguf: compress_ratios length must be >= block_count");
+  if (static_cast<int64_t>(d.compress_ratios.size()) > d.num_hidden_layers)
+    d.compress_ratios.resize(static_cast<size_t>(d.num_hidden_layers));
   return d;
 }
 

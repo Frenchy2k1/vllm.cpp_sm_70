@@ -65,6 +65,17 @@ inline std::string I32ArrayKv(const std::string& key,
   return s;
 }
 
+inline std::string F32ArrayKv(const std::string& key,
+                              const std::vector<float>& vals) {
+  std::string s = GStr(key) + U32Le(9) + U32Le(6) + U64Le(vals.size());
+  for (const float v : vals) {
+    uint32_t bits;
+    std::memcpy(&bits, &v, 4);
+    s += U32Le(bits);
+  }
+  return s;
+}
+
 inline std::string F32Kv(const std::string& key, float val) {
   std::string s = GStr(key) + U32Le(6);  // type 6 = f32
   uint32_t bits;

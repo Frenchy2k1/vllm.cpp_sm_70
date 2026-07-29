@@ -16,6 +16,78 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## CUDA keep-quant GGUF k-quant GEMM - DeepSeek-V4 experts on the GPU (2026-07-29, `CLAIM-CUDA-KEEPQUANT-GEMM`) - CORRECTNESS GATE PASS on GB10 / experts-on-GPU tok/s PENDING
+
+Disposition: **correctness RUNTIME-VERIFIED on the DGX GB10 (sm_121); the DeepSeek-V4
+experts-on-GPU throughput number is PENDING** (the follow-on run, picked up by the
+running benchmark lane `a35f6be0`).
+
+The FIRST CUDA keep-quant GGUF k-quant GEMM (`KERNEL-QUANT-CIQ-GEMM-CUDA`,
+`src/vt/cuda/cuda_quant_dot.cu`) is the kCUDA provider for `kMatmulBTQuant`:
+MMVQ-style, it quantizes the activation tile to Q8_K on-GPU and integer-dots it
+against the compressed Q8_K-family weight blocks (IQ2_XXS/IQ3_XXS/Q2_K +
+Q3_K/Q4_K/Q5_K/Q6_K) kept COMPRESSED in the unified pool (no bf16 expansion, which
+would OOM the 119 GiB pool at ~316 GiB). Registering it flips
+`GgufQuantComputeAvailable` TRUE on `kCUDA`, so on a CUDA runner DeepSeek-V4's
+routed-expert / MLA GEMMs dispatch to the GPU instead of the unified-memory CPU
+reference tier - the experts move off the 20 ARM cores (the biggest DeepSeek-V4
+speed lever).
+
+**Correctness gate (DGX GB10, `flock $HOME/gpu.lock`, serialized behind the live
+`a35f6be0`/dflash lane):** `test_cuda_quant_dot` **2/2 cases, 92401/92401 assertions
+GREEN** - the CUDA output vs the landed CPU keep-quant oracle at **NMSE <= 1e-6**
+(proving the Q8_K activation quant and the whole INTEGER dot are bit-identical; only
+the per-super-block float scale sum reassociates) AND vs an independent f64
+dequantize-then-dot at **NMSE <= 5e-4** (the test-backend-ops band), over the 7 Q8_K
+types x M{1,4,32,512} x N{1,7,16}. **compute-sanitizer memcheck: 0 errors.**
+**RED-first proven:** perturbing the IQ2_XXS 0.125 fold (-> 0.135) fails 24
+assertions (nmse 0.0064); revert restores 92401/92401 (source md5 `9890f7e1...`).
+
+**Experts-on-GPU throughput: PENDING.** The DeepSeek-V4 91 GB `UD-IQ2_XXS` e2e run
+(keep-quant load + greedy generate + TPOT/throughput vs the CPU-experts baseline and
+vs ds4) is the follow-on; it is the benchmark lane's to capture. Build: minimal CUDA
+build (`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a`) - this op is
+independent of cutlass/triton. Repro: `cmake --build build-cuda --target
+test_cuda_quant_dot && flock $HOME/gpu.lock ./build-cuda/tests/test_cuda_quant_dot`.
+
+## Pooling task class W2 heads composite + W3 pooling runner path (2026-07-29, `CLAIM-POOLING`) - STRUCTURAL cosine gate PASS / real-model oracle cosine gate PENDING
+
+Disposition: **correctness bricks landed + CPU-gated; the real-model oracle cosine
+number is PENDING** (needs a registered concrete embedding model forward). No
+throughput number is owed by a CPU pooler brick (host arithmetic).
+
+W2 landed the pooler HEADS composite (`EmbeddingPoolerHead` projector→matryoshka→
+normalize; `ClassifierPoolerHead` classifier→`(logit-mean)/sigma`→activation), the
+`SequencePooler` + `PoolerForEmbed`/`PoolerForClassify` factories, the
+`DispatchPooler` groupby-task routing, and the `PoolerConfig`/`PoolingParams`
+structs. W3 landed the pooling RUNNER path: `PoolingRunner` applies the model's
+`Pooler` to the packed last-hidden-state buffer and returns pooled embeddings
+where the generation runner would sample a token.
+
+Gates (CPU, `-Wall -Wextra -Werror` 0-warn):
+
+- `test_pooler_heads` 27/27 (240 assertions) vs independent double-precision
+  references (projector / classifier are deterministic matmuls evaluated twice),
+  covering EmbeddingPoolerHead, ClassifierPoolerHead, SequencePooler, and
+  DispatchPooler (including a mixed embed+classify batch + ctor task validation).
+  RED-first: disabling the matryoshka slice + the logit_mean calibration fails
+  8 cases / 50 assertions.
+- `test_pooling_runner` 5/5 (14 assertions): the runner path plus a **STRUCTURAL
+  cosine-parity gate** — the produced embedding vs a double-precision LAST-token
+  pool + L2-normalize reference is cosine 1.0 (epsilon 1e-6). RED-first: selecting
+  CLS instead of LAST drops the cosine below 0.5; disabling the normalize leaves
+  the embedding non-unit (2 unit-L2 assertions fail).
+
+Honest residual: this is a SYNTHETIC-weights structural gate (self-consistency +
+RED-first over the runner→pooler→normalize pipeline), NOT the real-model oracle
+gate. A cosine-vs-vLLM number needs a registered concrete `*EmbeddingModel` /
+`BertEmbeddingModel` forward producing real hidden states run against
+`vllm.LLM(task="embed").encode(...)` on the dev-box CPU; no such model is
+registered yet (the W3-model residual), so no cosine-vs-oracle number is
+fabricated. Repro (CPU): `cmake --build build-cpu --target test_pooler_heads
+test_pooling_runner && ./build-cpu/tests/test_pooler_heads &&
+./build-cpu/tests/test_pooling_runner`.
+
 ## Generic draft-model + Medusa spec-decode W0 spike + W1 CPU brick (2026-07-29, `CLAIM-SPEC-DRAFT-MEDUSA`) - PENDING (correctness brick landed; DGX e2e + speed gate deferred, box offline)
 
 Disposition: **PENDING** a performance number. `SPEC-DRAFT-MODEL` W1 is a host-side
@@ -1228,7 +1300,9 @@ registry-metadata fix — `KimiK3ForConditionalGeneration` outer wrapper
 `has_inner_state=false` + `test_model_registry` drift repaired, plus the
 2026-07-29 `test_model_loader_gguf` supported-arch golden sync, plus the
 2026-07-29 env-doc hygiene fix (`VLLM_PLUGINS` documented, `VLLM_GEMMA4_MM_DEBUG`
-allowlisted, `check-env-doc` rc=0) — is likewise
+allowlisted, `check-env-doc` rc=0), plus the `check-device-leakage` DSR-ratchet
+fix (the 8 kCUDA op-lookups in `deepseek_v4_device.cpp` allowlisted with a reason +
+deferred device-parameterization follow-up) — is likewise
 NOT APPLICABLE: metadata + test hygiene only, no build/run/measurement owed.) Scopes
 `KimiK3ForConditionalGeneration` (released 2026-07-27, beyond the pin) — a 2.8T MoE
 whose text backbone is the Kimi-Linear KDA+MLA+MoE hybrid scaled to H=7168 / 93
@@ -9702,3 +9776,11 @@ W4A16) is a named later brick and is where a benchmark binding will attach once 
 scheme wiring + a fitting MXFP4 checkpoint land. `benchmark_binding=false`.
 
 **DeepSeek-V4-Flash W7-device — CUDA kernels for the 4 new op families (2026-07-29, `CLAIM-DEEPSEEK-V4-W7-DEVICE`, NOT pushed).** Disposition: **NOT APPLICABLE (correctness-grade structural CUDA kernels + `ForwardDevice` wiring; unit-gated on the DGX GB10 vs the landed host references at small shape; per-op host round-trip, NOT a fused/perf path; `benchmark_binding=false`).** The four NEW V4 op families (MHC Sinkhorn/pre/post/head; DSA indexer weight-fold + weighted-MQA ReLU logits + causal top-k + attention-sink softmax + grouped output-LoRA; compressor pool+norm + save-APE + fp8_ds_mla KV encode/decode; sqrtsoftplus/hash router + clamped SwiGLU) are ported to CUDA (`src/vt/cuda/cuda_deepseek_v4.cu`), registered through the OpProvider seam (`kDeepseekV4{Mhc,Dsa,Compressor,Moe}`), and dispatched by a real `DeepseekV4Model::ForwardDevice`. **DGX GB10 (sm_121a) `test_cuda_deepseek_v4` 11/11 cases · 153 assertions GREEN** — BIT-EXACT top-k/router ids, near-tie rel-L2 < 1e-4 for the fp reductions, fp8_ds_mla within e4m3 granularity + bf16 rope bit-exact, and the ForwardDevice composition gate (device == host, rel-L2 < 2e-3). **compute-sanitizer memcheck 0 errors.** RED-first proven (drop sqrt → 3/6 fail). CUDA + CPU `-Werror` clean. The 512-wide MLA attn + expert grouped-GEMM REUSE the existing NVFP4/FP8 kernels (not re-ported). A throughput number is only owed once the real checkpoint runs end-to-end (W8, multi-Spark: 156.7 GiB NVFP4 does not fit ONE GB10) — a NAMED residual, along with W2b tower materialization and the single-Spark IQ2_XXS-GGUF `blk.N.*` name-map.
+
+**DeepSeek-V4-Flash W8-run — apples-to-apples ds4 benchmark (2026-07-29, `CLAIM-DEEPSEEK-V4-W8-RUN`, base `858b0b15`, NOT pushed).** Disposition: **EXECUTED on the DGX GB10 — our engine LOADS the real 158 B model but the forward HARD-FAILS at the real geometry (exact error below); ds4 reference numbers captured. Nothing faked; row stays SPIKE.** BOTH engines were built and run on the SAME 80.7 GB file (`antirez/deepseek-v4-gguf` `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`, downloaded + integrity-verified: 86,720,111,488 B == the HTTP Content-Length; IQ2_XXS gate/up + Q2_K down + Q8_0 attn/shared/out + F16 embed).
+
+**ds4 reference (DwarfStar, GB10 sm_121, GPU — experts on-device):** loads 80.76 GiB in ~20–29 s; greedy `--temp 0` on "The capital of France is" (chat-templated, 14 input tokens) generates **"We need to answer: "The capital of France is". This is a straightforward"** (ids `[2581,1309,304,3287,28,582,671,6102,294,8760,344,3305,1162,344,260,28179]`) — coherent, on-topic. `ds4-bench` at ctx=1024, gen=32: **prefill 358.4 tok/s, decode 16.5 tok/s (steady), first-token 76.3 ms** (KV 0.12 GiB, resident 80.76 GiB).
+
+**Our engine (CPU-tier keep-quant, aarch64):** the keep-quant LOAD SUCCEEDS on the real model — 43 layers, 256 experts, vocab 129280, `has_gguf_weights=1`, all 1328 tensors accounted, load ~78 s. **PEAK RESIDENT 116.2 GiB** — it fits under the 119 GiB pool but is **~32 GiB ABOVE the projected ~84 GiB**: `deepseek_v4_weights.cpp` calls `OwnGgufQuantBlocks` WITHOUT the `mmap_src` arg, so it COPIES ~81 GiB of blocks into owned vectors while the mmap'd file pages stay resident (a real memory finding — the fix is to mmap-VIEW the keep-quant blocks like `qwen3_5_gguf_weights.cpp` does, which would reach the ~84 GiB target and restore safe headroom). **The forward then HARD-FAILS (exact error):** `deepseek-v4 keep-quant GEMM: weight shape mismatch: want [N=512,K=4096] got [1024,4096]` at `deepseek_v4.cpp:234`, at **layer 2 (the first DSA compressor layer)**. Root cause: the W3–W7 forward composition — gated only at a tiny synthetic shape where the dims collapse — conflates `head_dim` (512) with the DSA compressor's distinct output dim (the real `attn_compressor_gate`/`attn_compressor_kv` are `[1024,4096]`, but the forward's `Gemm` expects `[head_dim=512, H]`). Layers 0–1 (non-compressor hash layers) pass; layer 2 crashes. **NO coherent tokens generated** — so no ours-vs-ds4 token cross-check and no our-tok/s number this pass (honest).
+
+**Residual (the remaining correctness brick):** rework the MLA/DSA forward to the REAL DeepSeek-V4-Flash geometry against a reference — the compressor projects to 1024 (not `head_dim`), and the indexer / grouped output-LoRA (`o_groups=8`, `nh=64`, `q_lora_rank=1024`) must be audited at real dims too. Separately, mmap-view the keep-quant blocks so peak resident drops to ~84 GiB. The DOWNLOAD + keep-quant LOAD + tokenizer + greedy DRIVER + ds4 oracle are all DONE and working; the forward geometry is the one blocker before a real single-Spark generation. Resume: same file already on the DGX at `$HOME/w8run/ds4/gguf/…` (no re-download needed).

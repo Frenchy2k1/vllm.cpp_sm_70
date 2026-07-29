@@ -973,10 +973,22 @@ routed experts are **IQ2_XXS** (`ffn_gate_exps`/`ffn_up_exps`) + **IQ3_XXS** (`f
 is the sibling `UD-Q2_K_XL` vehicle, NOT in the IQ2_XXS build. IQ3_XXS is therefore an EQUAL gating
 prerequisite (without it `ffn_down_exps` alone OOMs). All three landed so both vehicles keep-quant.
 
-**HONEST finding on "the CUDA path":** there is NO CUDA keep-quant `vec_dot` for ANY k-quant —
-`kMatmulBTQuant` is registered on `kCPU` alone (verified: no CUDA vec_dot/mmvq/mmq in `src/vt/cuda`).
-Keep-quant is a CPU-tier feature; on GB10 it runs on the 20 ARM cores against the unified pool, so
-IQ2_XXS/IQ3_XXS/Q2_K match the six existing k-quants exactly. Extending "the CUDA path" is N/A.
+**CUDA path — SUPERSEDED 2026-07-29 by `KERNEL-QUANT-CIQ-GEMM-CUDA` (`CLAIM-CUDA-KEEPQUANT-GEMM`).**
+The W8 finding above ("keep-quant is CPU-tier only; on GB10 it runs on the 20 ARM cores") is now
+CLOSED: the row `KERNEL-QUANT-CIQ-GEMM-CUDA` adds the FIRST CUDA keep-quant GGUF k-quant GEMM, a
+kCUDA provider for `kMatmulBTQuant` (`src/vt/cuda/cuda_quant_dot.cu`). It is MMVQ-style: quantize the
+activation tile to Q8_K on-GPU, then integer-dot it against the compressed weight blocks
+(dequant-in-kernel via the block scales/codebook), warp-per-output, weights kept COMPRESSED in the
+unified pool (no bf16 expansion). It covers the whole Q8_K family (IQ2_XXS/IQ3_XXS/Q2_K + the four
+other k-quants); it is a 1:1 numeric port of the landed CPU oracle (`cpu_quant_dot.cpp` /
+`cpu_quant_act.cpp`), NOT a copy of llama.cpp's Q8_1-based CUDA mmvq (which would not reproduce our
+Q8_K CPU reference). **Registering it flips `GgufQuantComputeAvailable` TRUE on `kCUDA`**, so on a
+CUDA runner the loader keeps blocks compressed and `vt::MatmulBT`→`kMatmulBTQuant` dispatches to the
+GPU — DeepSeek-V4's experts move OFF the ARM cores. **RUNTIME-VERIFIED on the DGX GB10 (sm_121):
+`test_cuda_quant_dot` 2/2 · 92401/92401 vs the CPU oracle (NMSE ≤1e-6, int core bit-exact) + f64
+dequant (NMSE ≤5e-4), compute-sanitizer memcheck 0, RED-first proven.** DeepSeek-V4 experts-on-GPU
+tok/s is the follow-on (benchmark lane). The original CPU-only finding is preserved below as the
+pre-supersession record.
 
 **Gate (`tests/vt/test_ops_quant_dot.cpp`, the same machinery as the six k-quants):** the three types
 added to `kWeightCases`. **19 cases / 130444 assertions GREEN** (CPU Debug, new TUs `-Werror` clean):
@@ -1185,3 +1197,98 @@ shards) → keep-quant load → greedy gen → self-consistency + coherence gate
 floor). SACRED-inert: only `deepseek_v4.{h,cpp}` / `deepseek_v4_weights.cpp` + the test changed; the
 W3-W6 primitive host references (the correctness oracle) are UNTOUCHED and still pass; the shared
 MLA/MoE, README, Metal, SACRED, apex, darwin untouched.
+
+---
+
+## W8-run — apples-to-apples ds4 oracle + ds4-file loadability (2026-07-29, `CLAIM-DEEPSEEK-V4-W8-RUN`, base `edf68c91`, NOT pushed)
+
+**The run was re-scoped to an apples-to-apples benchmark against a real cross-engine oracle.** The
+oracle is **antirez/ds4** (DwarfStar) — a purpose-built DeepSeek-V4-Flash GGUF engine that runs on the
+GB10 (`make cuda-spark`). Both engines must run the EXACT SAME file, so the shared vehicle is **ds4's
+`q2-imatrix` GGUF** (`antirez/deepseek-v4-gguf`, single 80.7 GB file — NOT the unsloth `UD-IQ2_XXS`,
+because ds4 is narrow and loads only its own conversion). Its per-role quant: routed experts **IQ2_XXS**
+gate/up + **Q2_K** down; A-proj / shared experts / output **Q8_0**; token_embd **F16** — all keep-quant
+types our engine already supports (W8 landed IQ2_XXS + Q2_K).
+
+### W8-run.1 Loadability into OUR engine — PROVEN from the file header (no 80 GB download)
+The ds4 file HEADER was read via HF HTTP-range (25 MB): GGUF v3, **1328 tensors**, 62 KV,
+`general.architecture=deepseek4`, full `deepseek4.*` config (block_count=43, hash_layer_count=3,
+expert_count=256, key_length=512, q_lora_rank=1024, output_group_count=8, indexer head=64/key=128/
+top_k=512). Our committed name-map (`scripts/dsv4_gguf_manifest_names.txt`) covers ds4's tensor set
+**EXACTLY — 1328/1328, 0 unmapped, 0 leftover** (the tensor-name set is byte-identical to unsloth's;
+ds4's `compress_ratios` encoding — 0,0 then alternating 4/128 — maps to the identical per-layer topology
+our `has_indexer=(cr==4)`/`has_compressor=(cr!=0)` derivation produces: indexer on the 21 `cr==4`
+layers, compressor on the 41 `cr!=0` layers).
+
+### W8-run.2 Three real-file loader gaps FOUND + FIXED + GATED
+A tiny synthetic file misses three representational quirks the real ds4 file carries that would throw or
+silently zero the model before a token:
+1. **`compress_ratios` length 44** (43 layers + a trailing MTP/nextn entry) vs our strict
+   `==block_count` assert → relaxed to `>= block_count` + prefix-truncate to the main layers.
+2. **`swiglu_clamp_exp` per-layer f32 array** (all 10.0), NO scalar `swiglu_clamp`. Our loader read only
+   the scalar → `swiglu_limit=0`, and `ClampedSwiGLU` with limit 0 is `min(gate,0)·σ·clamp(up,0,0)=0` —
+   it ZEROES every expert. Fixed: fall back to `swiglu_clamp_exp[0]`.
+3. **`ffn_gate_tid2eid` stored as ggml I32** (type 26), unhandled in `DequantGgufRowToF32` → threw. Added
+   an I32 case (ids round-trip exactly through f32).
+
+Gate: `tests/vllm/models/test_deepseek_v4_gguf_load.cpp` **8 cases / 288 assertions GREEN** (CPU Release
+full-library `-Werror`-clean; +1 case over W2c 7/185) — a new ds4-flavor synthetic reproduces all three
+quirks and asserts params resolve (`swiglu_limit==10.0` from the array, compress_ratios truncated), the
+keep-quant load accounts for every tensor, and `DeepseekV4ForwardGguf` runs finite + deterministic.
+**RED-first PROVEN:** disabling the I32 case throws "unsupported ggml type 26 (I32)" (1/8 fails); restore
+→ 8/288. `check-dsv4-gguf-namemap.py` still rc=0 (1328/1328). Files: `deepseek_v4_weights.cpp`,
+`gguf_dequant.cpp`, `tests/vllm/gguf_builder.h` (`F32ArrayKv`), the test.
+
+### W8-run.3 The GB10 RUN — HONEST RESIDUAL (did NOT execute; NOT faked)
+The run did not execute and was not simulated. It is blocked on: (a) the **GPU flock held by a
+concurrent agent** (checked repeatedly over ~30 min — stacking would risk an OOM-reboot,
+[[gb10-unified-memory-oom-reboots-box]] + [[sharing-a-gpu-with-flock]]); (b) two long builds (ds4
+`make cuda-spark` + our aarch64 CUDA); (c) the 80 GB download; (d) a **greedy driver** — V4's keep-quant
+`DeepseekV4ForwardGguf` is a STATELESS full-sequence recompute (it ignores KV cache), so the engine's
+incremental paged decode does not apply; the run needs a manual greedy loop (feed the growing token list
+each step, argmax the last row, append). Also `Tokenizer::FromGguf` rejects ds4's `pre='joyai-llm'`, so
+the apples-to-apples token cross-check should inject ds4's own input token ids into our loop rather than
+re-tokenize. **Resume:** `flock $HOME/gpu.lock` → `docker stop local-ai-worker` (restore after) →
+`./download_model.sh q2-imatrix` → ds4 `make cuda-spark` + `./ds4 -p "..."` / `./ds4-bench` → our greedy
+loop over the SAME file (assert peak resident ≈ 81-84 GiB keep-quant, NOT f32-expanded) → ours-vs-ds4
+token cross-check (prefix agreement / first divergence) + self-consistency + prefill/gen tok/s (expect
+ds4 faster: its experts run on the GPU, ours are CPU-tier on the 20 ARM cores — no CUDA keep-quant
+vec_dot exists; report the ratio with that attribution). Row stays `SPIKE` (no tokens generated).
+
+### W8-run.4 The RUN EXECUTED on the DGX GB10 — LOAD proven, forward HARD-FAILS at real geometry (2026-07-29, base `858b0b15`, NOT pushed)
+Everything up to the forward now runs on the REAL model. Delivered this pass (fresh worktree
+`/home/mudler/_git/vllm.cpp-w8run`, branch `deepseek-v4-w8-run-real`):
+- **Download + integrity:** the 80.7 GB ds4 `q2-imatrix` file downloaded to the DGX; size
+  **86,720,111,488 B == the HTTP Content-Length** (verified).
+- **Greedy driver (new code):** `examples/deepseek_v4_gen/main.cpp` — loads the keep-quant tower,
+  greedily generates by a STATELESS full-recompute loop over `DeepseekV4ForwardGguf` (argmax the
+  last-row logits, append), reports prefill/decode tok/s + peak resident (VmHWM), supports
+  `--token-ids` injection. `Tokenizer::FromGguf` relaxed to map `pre="joyai-llm"`→Llama-3 byte-level
+  (Decode is vocab-exact). Both built CPU-only (keep-quant is CPU-tier, so byte-identical to a CUDA
+  build) + ds4 built `make cuda-spark`.
+- **ds4 reference (GB10 GPU):** loads 80.76 GiB in ~20-29 s; greedy `--temp 0` on the prompt (its chat
+  template → 14 input tokens) → **"We need to answer: 'The capital of France is'. This is a
+  straightforward"** (coherent); `ds4-bench` ctx=1024/gen=32 → **prefill 358.4 tok/s, decode
+  16.5 tok/s, first-token 76.3 ms**. ds4's raw prompt tokenization: `[671,6102,294,8760,344]`.
+- **Our LOAD — SUCCEEDS:** 43 layers, 256 experts, vocab 129280, `has_gguf_weights=1`, all 1328
+  tensors accounted, ~78 s. **PEAK RESIDENT 116.2 GiB** — fits under 119 GiB but ~32 GiB ABOVE the
+  projected ~84 GiB: `deepseek_v4_weights.cpp` calls `OwnGgufQuantBlocks` WITHOUT `mmap_src`, so it
+  COPIES ~81 GiB of blocks into owned vectors while the mmap pages stay resident. **FIX:** thread an
+  mmap-view source through (as `qwen3_5_gguf_weights.cpp:214` `MmapSrc(g,pol)` does) so the blocks are
+  referenced in place → peak ≈ 84 GiB + safe headroom.
+- **Our FORWARD — HARD-FAILS (exact error, real bug):** `deepseek-v4 keep-quant GEMM: weight shape
+  mismatch: want [N=512,K=4096] got [1024,4096]` (`deepseek_v4.cpp:234`), at **layer 2 (the first DSA
+  compressor layer)**. The W3-W7 forward composition — gated ONLY at a tiny synthetic shape where the
+  dims collapse — conflates `head_dim` (512) with the DSA compressor's distinct output dim. Real MLA
+  dims (from the file header): `attn_q_a [1024,4096]`, `attn_q_b [32768,1024]` (=nh·hd×qlr, hd=512),
+  `attn_kv [512,4096]`, but `attn_compressor_gate`/`attn_compressor_kv` are **`[1024,4096]`** and
+  `comp_wgate`'s `Gemm(..., N=hd=512, H)` therefore mismatches. Layers 0-1 (non-compressor hash
+  layers) pass. **NO coherent tokens generated.**
+
+**Named residual (the one remaining brick):** rework the MLA/DSA forward to the REAL DeepSeek-V4-Flash
+geometry against a reference (vLLM `deepseek_v4` / ds4 source) — the compressor projects to 1024
+(not `head_dim`); the grouped output-LoRA (`o_groups=8`) and DSA indexer (`inh=64`,`ihd=128`) must be
+audited at real dims too — plus the mmap-view load fix above. The download, keep-quant load, tokenizer,
+greedy driver, and ds4 oracle are all DONE; the real-geometry forward is what stands between here and a
+coherent single-Spark generation. The 80.7 GB file is retained on the DGX at
+`$HOME/w8run/ds4/gguf/…` (no re-download needed). Row stays `SPIKE`.

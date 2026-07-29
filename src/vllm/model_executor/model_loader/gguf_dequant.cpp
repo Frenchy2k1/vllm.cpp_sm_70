@@ -125,6 +125,17 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
       vt::cpu::BlockToFloat(dtype)(data, y, numel);
       break;
     }
+    case 26: {  // I32 (raw int32 table tensor — DeepSeek-V4 hash `ffn_gate_tid2eid`
+                // stores per-token expert ids as I32 in the real GGUF; the small
+                // ids (< n_routed_experts) round-trip exactly through f32).
+      check_bytes(4);
+      for (int64_t i = 0; i < numel; ++i) {
+        int32_t v;
+        std::memcpy(&v, data + i * 4, sizeof(v));
+        y[i] = static_cast<float>(v);
+      }
+      break;
+    }
     case 40: {  // NVFP4
       // block_nvfp4 = uint8 d[4] then uint8 qs[32], 64 elements in 36 bytes.
       // d[s] is an IEEE fp8-e4m3fn scale for 16-element sub-block s. Sub-block

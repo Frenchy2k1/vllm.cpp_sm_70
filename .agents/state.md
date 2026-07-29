@@ -32738,6 +32738,116 @@ a real tiny-draft/target pair, and the throughput speed gate (match-or-beat vLLM
 on every axis) are W3, DGX-offline. NO production runner wiring in W1 (additive +
 default-inert; no path constructs a `DraftModelProposer`).
 
+## 2026-07-29 — Pooling task class W2 pooler HEADS composite + W3 pooling RUNNER path (`CLAIM-POOLING`, `ENG-POOLER-SEQ` W1→W2 + NEW `ENG-POOLING-RUNNER` ACTIVE, NOT pushed)
+
+**What landed.** Advanced the pooling task class from the W1 pooler-op brick to W2
+(the pooler composite) + W3 (the pooling runner path), CPU-only, off local `main`
+`edf68c91` in isolated worktree `.claude/worktrees/claim-pooling-w2w3` (branch
+`claim-pooling-w2w3`).
+
+- **W2 — pooler HEADS composite.** `EmbeddingPoolerHead` (ST-projector → matryoshka
+  dim slice → optional L2-normalize) and `ClassifierPoolerHead` (classifier →
+  affine `(logit-mean)/sigma` calibration → optional activation) mirroring
+  `seqwise/heads.py:19-196`; the `SequencePooler` (`poolers.py:41`, POOLING_TASKS ∩
+  method ∩ head) + `PoolerForEmbed`/`PoolerForClassify` factories; the
+  `DispatchPooler` (`special.py:23`) groupby-task routing with `ForEmbedding`/
+  `ForSeqCls` + ctor task-support validation; the `PoolerConfig`
+  (`config/pooler.py:16`), `PoolingParams` (`pooling_params.py:35`), and
+  `PoolingParamsUpdate` (`common.py:18`) structs. `PoolingMetadata` extended
+  ADDITIVELY with `pooling_params` + `tasks` (+ a `Slice` helper); the W1
+  `SequencePoolingMethod` base got defaulted `GetSupportedTasks`/`GetPoolingUpdates`
+  (non-breaking).
+- **W3 — pooling RUNNER path.** `PoolingRunner`
+  (`include/vllm/v1/worker/gpu/pool/pooling_runner.h`, mirror of
+  `pooling_runner.py:18-46`) applies the model's `Pooler` to the packed
+  `[num_tokens, hidden]` last-hidden-state buffer and returns POOLED DATA (an
+  embedding vector) where the generation runner would sample a token, plus
+  `GetSupportedTasks` + `ComputeValid` (`seq_lens==prompt_len`).
+
+**Gates (CPU, `-Wall -Wextra -Werror` 0-warn full-library build).**
+`test_pooler_heads` 27/27 (240 asserts) vs independent double-precision references
+(Embedding/Classifier heads + SequencePooler + DispatchPooler incl. a mixed
+embed+classify batch); `test_pooling_runner` 5/5 (14 asserts) — the runner path +
+a STRUCTURAL cosine-parity gate (embedding vs a double-precision LAST+normalize
+reference, cosine 1.0 ε1e-6); W1 `test_pooler` 17/17 unchanged. **RED-first
+proven:** disabling the matryoshka slice + logit_mean calibration fails 8 cases /
+50 asserts (heads); selecting CLS instead of LAST drops the cosine <0.5 and
+disabling normalize fails 2 unit-L2 asserts (runner). `check-agent-record.py`
+rc=0 (ENGINE 130→131 with dated rationale) and all record checkers green.
+
+**Deviations (recorded §9).** (a) upstream `PoolingRunner` hardcodes LAST+normalize;
+we route through the model `Pooler` (the general bert.py path), strictly more
+capable and the same design pooling MODELS use; (b) `DispatchPooler` passes the
+full hidden buffer with absolute cursor indices instead of physically slicing per
+task group (value-identical, no index shift); (c) `PoolingParams`/`PoolerConfig`
+co-located under `pooler/` (upstream top-level `pooling_params.py`/`config/`);
+(d) heads always return the per-sequence list form (upstream's stacked-Tensor-vs-
+list branching has no numeric effect on our PoolerOutput).
+
+**Residuals (honest).** The **real-model oracle cosine gate** — the W3 gate here is
+STRUCTURAL (synthetic weights, self-consistency + RED-first); a cosine-vs-vLLM
+number needs a REGISTERED concrete embedding model (`*EmbeddingModel` /
+`BertEmbeddingModel`) forward run against `vllm.LLM(task="embed").encode(...)` on
+the dev-box CPU, and NO such model is registered yet (W3-model). No cosine-vs-
+oracle number was fabricated, and no pooling MODEL row was created (model-matrix /
+checklist / rollup untouched). The `/v1/embeddings` + score/rerank/classify
+endpoints (W4) and the tokwise `AllPool`/`StepPool` + chunked-prefill ALL pooling
+(W5) remain named residuals. Additive + default-inert: no production forward or
+runner path constructs a `PoolingRunner` yet (that rides the endpoint brick). NOT
+pushed; full SHA reported to the caller.
+
+---
+
+## DeepSeek-V4 W8-run — ds4 apples-to-apples oracle + loadability (2026-07-29, `CLAIM-DEEPSEEK-V4-W8-RUN`, base `edf68c91`, NOT pushed)
+
+The single-Spark run was re-scoped to an apples-to-apples benchmark vs the new
+cross-engine oracle **antirez/ds4** (DwarfStar), sharing ds4's `q2-imatrix` GGUF
+(`antirez/deepseek-v4-gguf`, single 80.7 GB — IQ2_XXS gate/up + Q2_K down + Q8_0
+attn/shared/out + F16 embed). **Loadability into our engine PROVEN** from the file
+HEADER (HF HTTP-range, NO 80 GB download): our `blk.N.*` name-map covers ds4's file
+1328/1328 EXACTLY (0 unmapped/leftover; tensor-name set byte-identical to unsloth).
+**Three real-file loader gaps FIXED + gated** (`test_deepseek_v4_gguf_load` 8/8·288,
+CPU Release `-Werror`, RED-first proven): (1) `DeepseekV4ParamsFromGguf` accepts
+`compress_ratios` length > block_count (ds4 = 44 = 43 + trailing MTP) and truncates
+to the main-layer prefix; (2) the clamped-SwiGLU limit falls back to the per-layer
+`swiglu_clamp_exp` array (ds4 ships no scalar `swiglu_clamp`; a 0 limit ZEROES every
+expert); (3) `DequantGgufRowToF32` handles ggml I32 (type 26) for the hash
+`ffn_gate_tid2eid`. Files: `deepseek_v4_weights.cpp`, `gguf_dequant.cpp`, the test
++ `gguf_builder.h` `F32ArrayKv`. **The GB10 RUN did NOT execute (nothing faked)** —
+blocked on the GPU flock held by a concurrent agent + two long builds (ds4
+`cuda-spark` + our aarch64 CUDA) + the 80 GB download + a greedy driver (V4's
+stateless keep-quant recompute needs a manual loop over `DeepseekV4ForwardGguf`; the
+paged incremental decode does not apply; `Tokenizer::FromGguf` rejects ds4's
+`pre='joyai-llm'`, so the cross-check must inject ds4's token ids). Row stays SPIKE.
+SACRED-inert: only the V4 loader/dequant + the test changed (the ds4-flavor case is
+additive); prior V4 primitive tests untouched. All 6 record checkers + the
+`check-dsv4-gguf-namemap` (1328/1328) rc=0. NOT pushed; full SHA to the caller.
+- **2026-07-29** — **CUDA keep-quant GGUF k-quant GEMM landed + GB10-gated** (`CLAIM-CUDA-KEEPQUANT-GEMM`, isolated worktree `feat-cuda-keepquant-gemm` off `main` `2191f771`, NOT pushed; full SHA reported to caller). The FIRST CUDA keep-quant GEMM for any GGUF k-quant: a native kCUDA provider for `kMatmulBTQuant` (`src/vt/cuda/cuda_quant_dot.cu` + `cuda_quant_iq_tables.cuh`), MMVQ-style — quantize the activation to Q8_K on-GPU, integer-dot against the compressed Q8_K-family blocks (IQ2_XXS/IQ3_XXS/Q2_K + Q3_K/Q4_K/Q5_K/Q6_K) dequant-in-kernel, weights kept COMPRESSED in the unified pool. A 1:1 numeric port of the landed CPU keep-quant oracle (`cpu_quant_dot.cpp`/`cpu_quant_act.cpp`); legacy Q8_0-activation types (Q4_0/Q8_0) fall back to the CPU kernel. Registering it flips `GgufQuantComputeAvailable` TRUE on `kCUDA` so DeepSeek-V4's expert/MLA GEMMs dispatch to the GPU instead of the 20 ARM cores (the biggest DeepSeek-V4 speed lever). **DGX GB10 gate (flock, serialized behind the live `a35f6be0`/dflash lane, its worktree/containers untouched):** `test_cuda_quant_dot` 2/2 · 92401/92401 vs the CPU oracle (NMSE ≤1e-6, int core bit-exact) + f64 dequant (≤5e-4), compute-sanitizer memcheck 0 errors, RED-first proven (IQ2 0.125→0.135 fails 24, revert restores 92401, source md5 `9890f7e1…`). Additive: CPU oracle UNTOUCHED, `.cu` CUDA-only so CPU build byte-identical. Records: `KERNEL-QUANT-CIQ-GEMM-CUDA` row + `KERNEL` 44→45, quantization-matrix CUDA-compute notes on the 3 DSV4 rows + loader default, spec `specs/cuda-keepquant-gemm.md`, deepseek-v4-flash.md §W8 CUDA supersession, STATUS/BENCHMARKS/coordination/porting-inventory §9/roadmap. Six record checkers rc=0. **RESIDUAL:** the DeepSeek-V4 91 GB `UD-IQ2_XXS` experts-on-GPU e2e tok/s is the follow-on (benchmark lane picks it up). DGX left as found (work dir removed).
+
+### UPDATE — the GB10 RUN EXECUTED (fresh worktree `/home/mudler/_git/vllm.cpp-w8run`, branch `deepseek-v4-w8-run-real`, base `858b0b15`, NOT pushed)
+
+Downloaded the 80.7 GB ds4 `q2-imatrix` file (integrity 86,720,111,488 B ==
+Content-Length), built ds4 `make cuda-spark` + our CPU engine + a NEW greedy driver
+(`examples/deepseek_v4_gen`, stateless full-recompute loop over
+`DeepseekV4ForwardGguf`; `Tokenizer::FromGguf` relaxed to map `pre="joyai-llm"`→
+Llama-3 byte-level), and ran BOTH on the SAME file under `flock`. **ds4 (GB10 GPU):**
+loads 80.76 GiB in ~20-29 s; coherent greedy "We need to answer: 'The capital of
+France is'. This is a straightforward"; `ds4-bench` prefill 358 tok/s, decode
+16.5 tok/s (ctx=1024). **OURS:** the keep-quant LOAD SUCCEEDS on the real 158 B model
+(43 layers, 256 experts, vocab 129280, all 1328 tensors, `has_gguf_weights=1`, ~78 s)
+at **PEAK RESIDENT 116.2 GiB** — fits < 119 GiB but ~32 GiB above the ~84 GiB
+projection because `OwnGgufQuantBlocks` COPIES blocks instead of mmap-viewing (fix =
+thread `MmapSrc` like `qwen3_5_gguf_weights.cpp:214`). **The FORWARD HARD-FAILS:**
+`deepseek-v4 keep-quant GEMM: weight shape mismatch: want [N=512,K=4096] got
+[1024,4096]` (`deepseek_v4.cpp:234`) at **layer 2 (first DSA compressor layer)** — the
+W3-W7 forward, gated only at tiny synthetic shape, conflates `head_dim`=512 with the
+DSA compressor's real 1024-dim output (`attn_compressor_{gate,kv}` are `[1024,4096]`).
+Layers 0-1 pass. **NO coherent tokens generated → no ours-vs-ds4 token cross-check +
+no our-tok/s.** Named residual: rework the MLA/DSA forward to the REAL geometry
+(compressor 1024-dim; audit indexer + grouped output-LoRA at o_groups=8/nh=64/
+q_lora_rank=1024) against a reference + the mmap-view load fix. Box restored (worker
+up `--restart=always`, flock free, 80.7 GB file retained at `$HOME/w8run`). Row stays
+SPIKE. NOT pushed; full SHA to the caller.
 ## 2026-07-29 — `SPEC-DFLASH-GGUF` `GD10`: the end-to-end discriminator RUN, gates 3 and 5 CLOSED, row to `DONE` (correctness)
 
 **Claim** `CLAIM-DFLASH-GGUF-ACCEPT-RCA`. Worktree
