@@ -518,6 +518,18 @@ mirroring `Qwen3_5DenseDecodeGraph` — a multi-brick port, NOT the #183 `<<<1,1
 **FINAL campaign result: decode 0.68 → 5.83 tok/s (~8.6×), token-identical, ~35% of ds4's 16.5** (Stage 1
 KV cache 7.9× + Stage 2 grouped MoE GEMM +22%; both merged). Named residual = host-orchestration launch
 overhead (util ~36%), removable only by the device-resident forward. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Device-resident decode campaign — Brick 0 (scope) + Brick A (device MLA attention kernel) (2026-07-29,
+base `59260579`, NOT pushed).** User commissioned the device-resident decode forward (unblocks the Stage-3
+graph). Brick 0 = `.agents/specs/deepseek-v4-device-decode.md` (bricks A→B→C→D, DBuf layout, gates, honest
+ceiling: a graph likely reaches ~10-13 tok/s but SHORT of ds4's 16.5 — fp8 KV + tuned MMQ are a named
+follow-on). Brick A = first real device V4 forward kernel: `DecodeAttnKernel` (`cuda_deepseek_v4.cu`)
+replaces the host QK/softmax-sink/AV Dot loop, reading the unified KV latent in place (num KV heads = 1),
+preserving host `SoftmaxWithSink` order (only expf vs std::exp differs). Flag `VT_V4_DEVICE_ATTN` (default
+OFF). Gate = correctness: CUDA unit `test_cuda_deepseek_v4` **12/12·412** (+device-vs-host RelL2<1e-5,
+RED-first no_sink); `test_deepseek_v4_gguf_load` 12/12·531; real-model TOKEN-IDENTICAL (ON==OFF=="…Paris.").
+Speed (not Brick A's gate): decode 6.23 tok/s (24-tok) vs 5.83 baseline (~7%, grows with ctx); util still
+~35% (payoff at Brick D's graph); peak unchanged. Rollback-able (flag OFF default). Bricks B→C→D await
+review. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

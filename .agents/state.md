@@ -33426,3 +33426,37 @@ GB10 util ~36% — idle waiting on ~774 host launches/step), removable ONLY by t
 decode forward. NO code change this stage (a graph is architecturally impossible on this forward, not
 faked); the finding + FINAL table land as the reviewable artifact. Spec §Stage 3 + docs updated. Row
 `ACTIVE` (correct + a real ~8.6× single-Spark decode speedup; every-axis ds4 parity is the residual).
+
+## DeepSeek-V4 device-resident decode campaign — Brick 0 (scope) + Brick A (device MLA attention kernel) (2026-07-29, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-dd`, branch `deepseek-v4-device-decode`, base `59260579`, commits `d9724e7e`+`57f5483b`, NOT pushed)
+
+The user COMMISSIONED the device-resident decode forward (the campaign's largest brick — it unblocks
+the Stage-3 decode graph). Staged with per-brick correctness gates.
+
+**Brick 0 (scope, `d9724e7e`):** `.agents/specs/deepseek-v4-device-decode.md` — bricks A (device MLA
+attention) → B (device glue: MHC/Sinkhorn/rope/norms/router/SwiGLU/combine) → C (assemble device-resident
+decode, drop per-op sync) → D (capture the decode CUDA graph = the speed gate); persistent-DBuf layout
+(fixed-capacity KV, capture-hazard-safe per-step inputs); per-brick gates; and an HONEST projected
+ceiling — a graph likely reaches ~10-13 tok/s (2-2.5×) but SHORT of ds4's 16.5 (ds4 also has fp8 KV +
+a tuned fp4/MMQ expert GEMM; the last gap is a NAMED kernel-efficiency follow-on, not this campaign).
+
+**Brick A (device MLA attention kernel, `57f5483b`):** the FIRST real device V4 forward kernel.
+`DecodeAttnKernel` (`cuda_deepseek_v4.cu`) replaces the host QK/softmax-sink/AV Dot loop, reading the
+unified KV-cache latent IN PLACE (no Upload/Download — unlike the #183 `<<<1,1>>>` glue kernels). One
+block per (query t, head h); num KV heads = 1 (all heads share the cached latent); causal; sink softmax.
+BIT-order-preserving vs host `SoftmaxWithSink` (`deepseek_v4_dsa.cpp:116`) — per-key dot sequential over
+d, thread-0 sequential max/denom over s incl. the sink, per-d output sequential over s — so device vs
+host is a near-tie whose ONLY divergence is expf vs std::exp. `decode_attn` added to `DsaDeviceKernels`
+(raw unified-pointer sig); `AttentionBlock` uses it under `VT_V4_DEVICE_ATTN=1` + CUDA queue +
+`V4DeviceKernelsAvailable()` + dense-causal, else the host loop (default OFF — host stays default until
+Brick D). Launches async, caller drains (Brick A) / captures (Brick D).
+
+**GATE = correctness + build (met):** CUDA unit `test_cuda_deepseek_v4` **12/12·412** (+1 case: device
+decode_attn == host SoftmaxWithSink ref RelL2<1e-5, RED-first no_sink diverges + matches no-sink ref);
+`test_deepseek_v4_gguf_load` **12/12·531** (device path off by default); CPU + CUDA `-Werror` clean.
+**Real 80.7 GB model (DGX GB10): TOKEN-IDENTICAL** — `VT_V4_DEVICE_ATTN=1` and OFF both emit
+`11111 16 455 6102 294 8760 344 11111 …` = "…Paris.". **Speed (NOT Brick A's gate — measured anyway,
+expected flat per the coordinator):** decode 6.23 tok/s (24-tok) vs 5.83 baseline (~7%; the device kernel
+removes the host KV Dot loop, a win that grows with context), 6.85 vs 6.60 (11-tok); GB10 util still ~35%
+(surrounding glue still host-syncs — the payoff is at Brick D's graph); peak 86.33 GiB unchanged.
+Rollback-able (`VT_V4_DEVICE_ATTN` default OFF). `VT_V4_DEVICE_ATTN` allowlisted. Bricks B→C→D await
+coordinator review. Box restored (worker up restart=always, flock free, no stray). Row `ACTIVE`.

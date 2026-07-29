@@ -87,6 +87,18 @@ struct DsaDeviceKernels {
                                       const std::vector<float>& wo_b, int64_t num_tokens,
                                       int64_t n_heads, int64_t head_dim, int64_t n_groups,
                                       int64_t o_lora_rank, int64_t hidden_size);
+  // Brick A — device MLA decode/prefill attention over the unified KV-cache latent.
+  // Unlike the launchers above (host-vector, Upload/Download/Sync), this reads/writes
+  // UNIFIED-MEMORY raw pointers IN PLACE on the queue stream (no round-trip) — the
+  // first real device V4 forward kernel, toward a capturable decode graph. q
+  // [T*nh*hd], kv [n_keys*hd] (cached deck; num KV heads = 1, shared across heads),
+  // sink [nh], o [T*nh*hd], all on the queue device. Causal: query t attends keys
+  // [0, kv_base+t]. no_sink = the kNoAttnSink miswire (sink -> -inf). Matches
+  // SoftmaxWithSink (deepseek_v4_dsa.cpp:116) with host accumulation order preserved.
+  // Launches async on q's stream; the CALLER drains (Brick A) or captures (Brick D).
+  void (*decode_attn)(vt::Queue&, float* o, const float* q, const float* kv,
+                      const float* sink, int64_t nh, int64_t hd, int64_t kv_base,
+                      int64_t num_tokens, float scale, bool no_sink);
 };
 
 // ── (3) Compressor family device kernels ──────────────────────────────────────
