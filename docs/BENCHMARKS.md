@@ -175,6 +175,146 @@ throughput / peak resident memory / llama.cpp-on-card floor) is blocked on a nam
 residual (W2c: rewire the forward onto the CIQ `kMatmulBTQuant` blocks + gate off the host dequant), then
 the download + GB10 run. No cross-engine oracle exists (vLLM 0.26 GGUF plugin has no V4 wiring); the gate
 would be our-engine self-consistency + coherence. DGX left as found (no download).
+## `SPEC-DFLASH-GGUF` axis A CLOSED end to end on GB10 (2026-07-29, `GD10`, `CLAIM-DFLASH-GGUF-ACCEPT-RCA`) - correctness accepted, speed `PENDING` by design
+
+**Benchmark disposition: `NOT APPLICABLE` for throughput (no engine numerics
+change; the only code edit is a test bar), and the row's speed item stays
+`PENDING` with its reproduction command at the foot of this entry.** This is the
+GPU run the `GD9` entry below owed and could not perform. It settles the axis-A
+accept-count RED that has been open since the production-build re-verification.
+
+**Build provenance, proven three ways before any result was trusted** (dgx.casa
+GB10, CUDA 13.0.88, clean `git archive` tree of the local branch at
+`~/work/dflash-final/src`, rebuilt from scratch after the box's 12:53 UTC
+reboot):
+
+1. `grep -ci "cutlass not found" configure.log` is **0**, and the log prints
+   `CUTLASS found at /home/mudler/cutlass-4.5.0; enabling sm120a NVFP4 cutlass
+   GEMM`, `FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a]`, 29
+   `Triton AOT:` lines and `MANIFEST hashes OK`;
+2. `cuobjdump -lelf` on BOTH gate binaries reports **40 cubins, all `sm_121a`,
+   zero `sm_75`** (`CMakeCache.txt` still reads
+   `CMAKE_CUDA_ARCHITECTURES:STRING=75` and is still the decoy; `build.ninja`
+   carries `arch=compute_121a,code=[compute_121a,sm_121a]`);
+3. the SACRED `test_qwen27_paged_engine` is **235/235, exit 0**, wall 31.34s,
+   peak RSS 23.67 GiB.
+
+Asset: `Qwen3.6-27B-DFlash-BF16.gguf`, 3,471,497,440 B, md5
+`013ad3beddcfe6fcd35d45619b7eccba`, copied to `$HOME/bench/` and md5-verified
+against the local HF cache copy. Box idle throughout (3 GiB used at series
+start, no CUDA compute apps, the LocalAI worker parked at 105 MB RSS); one
+`flock $HOME/gpu.lock` series, one binary, `/` at 89% before and after.
+
+**THE DISCRIMINATOR: an unquantized GGUF draft reads EXACTLY what the
+safetensors draft reads.** 27B NVFP4 safetensors target, k=16, greedy, c1,
+accepted / proposed:
+
+| Prompt | tok | `BF16` GGUF draft | `Q4_K_M` GGUF draft | safetensors draft | cross-format tokens | gate |
+|---|---|---|---|---|---|---|
+| "Write a Python function that reverses a string:" | 48 | **47 / 96** | - | 47 / 96 | IDENTICAL | 17/17, exit 0 |
+| same, repeat run | 48 | **47 / 96** | - | 47 / 96 | IDENTICAL | 17/17, exit 0 |
+| same | 48 | - | 46 / 112 | 47 / 96 | IDENTICAL | 15/17, exit 1 (old exact bar) |
+| same | 24 | **27 / 64** | - | 27 / 64 | IDENTICAL | 17/17, exit 0 |
+| "The capital of France is" | 24 | **15 / 144** | - | 15 / 144 | IDENTICAL | 17/17, exit 0 |
+| "The capital of France is" | 24 | - | 15 / 144 | 15 / 144 | IDENTICAL | 17/17, exit 0 |
+
+Every arm above ran on the SAME binary in the SAME lock series. The 48-token
+Python prompt is the only discriminating configuration, and swapping ONLY the
+draft's numeric precision - same file format, same loader, same resolver, same
+config path, same target, same kernels - moves 46/112 back to exactly 47/96.
+**Quantization is therefore the whole cause, and nothing structural survives in
+our GGUF draft path**: any defect there would be carried by the `BF16` GGUF too.
+
+**The bar was SPLIT, not relaxed.**
+`tests/parity/test_qwen27_dflash_spec_decode.cpp` bar (a) now keeps the token
+half exact unconditionally and gates the accept counts by what the two arms
+actually vary:
+
+| Arm | Selected by | Accept-count bar | Measured |
+|---|---|---|---|
+| cross-FORMAT (neither draft quantized) | `IsQuantizedGgufDraft` reading the file's ggml types | EXACT | `d = 0` on every prompt and length |
+| cross-QUANTIZATION (one draft quantized) | same | `abs(d_accepted) <= 2`, `abs(d_proposed) <= k*2` | `d_accepted` 0 at 24 tok, -1 at 48; `d_proposed` 0 and +16 |
+
+Where the band comes from, since a band chosen to turn a red test green is the
+failure mode this row has already had once. `accepted` moves in units of 1 and
+the measured cross-quantization delta is 0, 0 and 1; a band equal to the observed
+maximum has zero margin, so the bound is that maximum plus one quantum, 2.
+`proposed` is not independent: with the token streams identical both arms emit
+the same number of tokens and each `k`-wide block emits its accepted prefix plus
+one bonus token, so `accepted + nblocks` is the same constant in both arms and
+`d_proposed = -k * d_accepted` exactly, which the data confirms (`-1` and `+16`
+at `k=16`). The bound is `k` times the accepted bound by derivation, not by a
+second choice. It is also tighter than the precedent it follows, the landed
+`SPEC-DFLASH` golden arm's `abs(acc - want) <= 4`.
+
+**The band and the arm selection are both load-bearing, proven by mutation.**
+Rebuilt with `kCrossQuantAcceptBand = 0`, the `Q4_K_M` 48-token arm goes
+**15/17, exit 1** on both banded assertions, while the `BF16` arm is untouched at
+**17/17, exit 0** because it takes the exact branch. With the real band both are
+17/17, exit 0, and the log names the arm it took
+(`is a QUANTIZED GGUF (fc.weight is Q4_K)` / `is an UNQUANTIZED GGUF (every
+tensor a scalar ggml type)`).
+
+**Axis B broadened from ONE prompt to THREE.** 27B NVFP4 **GGUF** target,
+`Q4_K_M` GGUF draft, 24 tokens, k=16, c1, the strict form (DFlash-ON
+token-for-token identical to that same target's own spec-OFF) on all of them:
+
+| Prompt | ON vs its own spec-OFF | GGUF-target accepted / proposed | safetensors-target arm | assertions | wall / peak RSS |
+|---|---|---|---|---|---|
+| "The capital of France is" | IDENTICAL | 14 / 160 (0.0875) | 15 / 144 (0.1042) | 15/15, exit 0 | 6m51.59s / 81.13 GiB |
+| "Write a Python function that reverses a string:" | IDENTICAL | 24 / 64 (0.375) | **24 / 64 (0.375), streams IDENTICAL** | 15/15, exit 0 | 6m29.31s / 81.14 GiB |
+| "Photosynthesis is the process by which" | IDENTICAL | 15 / 128 (0.1172) | not run | 9/9, exit 0 | 6m43.26s / 81.08 GiB |
+
+The second prompt REFINES a previously recorded claim: acceptance on the GGUF
+target is not uniformly lower than on the safetensors target, it tracks how far
+apart the two containers' own arithmetic drifts. Their spec-OFF streams diverge
+at index 4 on the first prompt and only at index 16 on the second, with no
+speculation anywhere, and on the second the DFlash-ON pair and the acceptance
+rate agree exactly. The cause remains `QUANT-GGUF-NVFP4` being dequant-only (the
+GGUF target expands to bf16 while the safetensors target runs the true W4A4
+kernels), not the shared head, which a byte comparison already excluded.
+
+Reproduce (the CUTLASS and Triton flags are MANDATORY; without them the numbers
+above are not reproducible and the 27B gate refuses to run at all):
+
+```
+cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON
+cmake --build build-cuda -j12
+grep -ci "cutlass not found" configure.log            # must be 0
+cuobjdump -lelf build-cuda/tests/test_qwen27_paged_engine | grep -c sm_121a
+flock $HOME/gpu.lock ./build-cuda/tests/test_qwen27_paged_engine
+
+# axis A, the cross-FORMAT (exact) arm
+VLLM_DFLASH_TARGET=$HOME/bench/q36-27b-nvfp4-vllm \
+VLLM_DFLASH_DRAFT=$HOME/bench/Qwen3.6-27B-DFlash-BF16.gguf \
+VLLM_DFLASH_DRAFT_B=z-lab/Qwen3.6-27B-DFlash \
+VLLM_DFLASH_MAX_TOKENS=48 \
+VLLM_DFLASH_PROMPT="Write a Python function that reverses a string:" \
+  flock $HOME/gpu.lock ./build-cuda/tests/test_qwen27_dflash_spec_decode \
+  -tc="dflash axis-A*"
+
+# axis A, the cross-QUANTIZATION (banded) arm: same command, Q4_K_M draft
+# axis B, per prompt
+VLLM_DFLASH_TARGET_B=$HOME/bench/q36-27b-nvfp4.gguf \
+VLLM_DFLASH_TARGET=$HOME/bench/q36-27b-nvfp4-vllm \
+VLLM_DFLASH_DRAFT=$HOME/bench/Qwen3.6-27B-DFlash-Q4_K_M.gguf \
+VLLM_DFLASH_MAX_TOKENS=24 VLLM_DFLASH_PROMPT="..." \
+  flock $HOME/gpu.lock ./build-cuda/tests/test_qwen27_dflash_spec_decode \
+  -tc="dflash axis-B*"
+```
+
+`VT_SPEC_TRACE=1` turns on the per-block propose/accept trace added by `GD9`; it
+was not needed here, because the aggregate counts were already decisive.
+
+**Still `PENDING`, and deliberately not owed by this row:** the DFlash-ON
+throughput A/B between the two target containers. It cannot be a fair comparison
+until a native NVFP4 GGUF GEMM exists, since the GGUF target currently runs bf16
+GEMMs against the safetensors target's W4A4 ones. No throughput number is
+claimed or moved by this checkpoint.
+
 ## `SPEC-DFLASH-GGUF` axis-A acceptance delta ROOT-CAUSED in weight space (2026-07-29, `GD9`, `CLAIM-DFLASH-GGUF-ACCEPT-RCA`) - NOT APPLICABLE for speed; the e2e half is PENDING on hardware
 
 **Benchmark disposition: `NOT APPLICABLE` for throughput (this checkpoint adds a
@@ -199,25 +339,12 @@ accept-count bar's own stated premise is "Same weights, two containers", which i
 true of the `BF16` GGUF and false of the `Q4_K_M` one, so the exact bar belongs
 on a cross-FORMAT arm and the cross-QUANTIZATION arm needs a band.
 
-**PENDING, and honestly so: no GPU number was produced this round.** dgx.casa
-dropped off the network mid-session (unreachable at the ARP level, ~09:47 UTC
-onward) and did not return, so the discriminating end-to-end run - the `BF16`
-GGUF draft as arm A against the safetensors draft, which must read exactly
-`47/96` if quantization is the whole story - was NOT run and nothing about it is
-claimed. Axis A stays RED. Reproduction, after copying `Qwen3.6-27B-DFlash-BF16.gguf`
-to `$HOME/bench/` (build flags exactly as in the entry below; `VT_SPEC_TRACE=1`
-turns on the new per-block propose/accept trace, which is what distinguishes a
-diffuse difference from a displaced block):
-
-```
-VLLM_DFLASH_TARGET=$HOME/bench/q36-27b-nvfp4-vllm \
-VLLM_DFLASH_DRAFT=$HOME/bench/Qwen3.6-27B-DFlash-BF16.gguf \
-VLLM_DFLASH_DRAFT_B=z-lab/Qwen3.6-27B-DFlash \
-VLLM_DFLASH_MAX_TOKENS=48 VT_SPEC_TRACE=1 \
-VLLM_DFLASH_PROMPT="Write a Python function that reverses a string:" \
-  flock $HOME/gpu.lock ./build-cuda/tests/test_qwen27_dflash_spec_decode \
-  -tc="dflash axis-A*"
-```
+**The GPU half was NOT run in this round** (dgx.casa dropped off the network
+mid-session, ~09:47 UTC onward) and axis A stayed RED on it. It was run later the
+same day once the box returned: see the `GD10` entry above, where the `BF16` GGUF
+draft reads exactly `47/96` and closes this. Nothing in the table above depends
+on it; the weight-space conclusion was reached without a GPU and the run
+confirmed it.
 
 The CPU half reproduces anywhere, with no GPU and no engine build flags:
 
@@ -229,7 +356,7 @@ VLLM_DFLASH_ST_DIR=<...>/models--z-lab--Qwen3.6-27B-DFlash/snapshots/<rev> \
   ./build-cpu/tests/test_qwen3_dflash_gguf -tc="*byte-identical*"
 ```
 
-## GGUF spec-decode rows RE-VERIFIED on a production-configured build (2026-07-29) - correctness re-measured, speed still PENDING; `SPEC-DFLASH-GGUF` axis A now has a REPRODUCIBLE RED
+## GGUF spec-decode rows RE-VERIFIED on a production-configured build (2026-07-29) - correctness re-measured, speed still PENDING; `SPEC-DFLASH-GGUF` axis A had a REPRODUCIBLE RED here, CLOSED by the `GD10` entry above
 
 **Benchmark disposition: PENDING for speed on both rows, `benchmark_binding=false`.
 No engine code changed, so no throughput number is claimed or moved.** Every GPU
@@ -318,6 +445,11 @@ less often than its bf16 sibling once the target runs the true W4A4 fp4 kernels
 instead of the emulation GEMM. Not root-caused here; it is now a measured, open
 item rather than a claimed non-issue. Reproduced identically in 3 of 3 runs
 (46/112 versus 47/96 every time), same binary, same `flock` series, idle box.
+**Since CLOSED** by `GD9` (weight space) and `GD10` (end to end): the delta is
+ordinary `Q4_K_M` cost, an unquantized GGUF draft of the SAME weights reads
+exactly `47/96`, and the bar is now exact across formats and banded across
+quantization levels. The `GD10` entry at the top of this page carries the binding
+numbers.
 
 The already-`DONE` `SPEC-DFLASH` reference arm was run on the same build as a
 control and is unchanged: `test_qwen27_dflash_spec_decode -tc="qwen27 DFlash

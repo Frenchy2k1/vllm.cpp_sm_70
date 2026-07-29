@@ -943,42 +943,40 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
   backend) could not expose LMCache or the prefill budget in a model config.
 - **DFlash speculative decoding from a GGUF DRAFT WORKS end to end on the GB10
-  release target** (`SPEC-DFLASH-GGUF`, `PARTIAL`,
+  release target** (`SPEC-DFLASH-GGUF`, `DONE` for correctness on both axes,
+  speed `PENDING` by design,
   [spike](../.agents/specs/gguf-dflash-draft.md)). A DFlash draft packaged as a
   single `dflash`-arch GGUF now loads AND generates against a safetensors target
   (axis A): config from the `dflash.*` KVs, weights through a resolver that
   reuses the existing safetensors `LoadQwen3DFlash` body, a `.gguf` branch in the
   draft-path resolution, and the target-shared embedding and lm_head still taken
   from the target, as the GGUF contract intends.
-  **Binding result, RE-MEASURED 2026-07-29 on a production-configured build**
-  (CUTLASS + FlashAttention-2 + vendored Triton-AOT, sm_121a; the earlier numbers
-  came from a build carrying none of those and are void): on the Qwen3.6-27B NVFP4
-  safetensors target the published `Q4_K_M` GGUF draft and the bf16 z-lab
-  safetensors draft still produce **token-for-token identical** greedy
-  continuations on both prompts, k=16, concurrency 1. Their accept counts no
-  longer match. At 24 tokens both are 15/144 and the gate is green 17/17; at 48
-  tokens the GGUF draft is 46/112 against the safetensors draft's 47/96 and the
-  gate is **RED, 15/17 assertions, exit 1, reproduced 3 of 3 runs**. So the 4-bit
-  draft DOES cost acceptance here, which is the risk the spike flagged and the
-  defective build had masked: it needs one extra 16-wide propose block and lands
-  one fewer acceptance, without changing a single emitted token.
-  **ROOT-CAUSED IN WEIGHT SPACE 2026-07-29 (`GD9`): ordinary `Q4_K_M` cost, not a
-  defect in our GGUF draft path, and the accept-count bar's own premise was wrong
-  for the asset it was aimed at.** The repository that publishes this draft also
-  publishes an UNQUANTIZED `BF16` GGUF, which the spec had recorded as
-  nonexistent. Loaded through the SAME code path it is BYTE-IDENTICAL to the
-  z-lab safetensors draft on all 58 tensors (a new CPU gate,
-  `tests/vllm/models/test_qwen3_dflash_gguf.cpp`, 302/302, functionally RED
-  against the `Q4_K_M` file), which eliminates every structural way the GGUF arm
-  could differ. Our Q4_K/Q6_K dequant is bit-equal to `gguf-py`'s reference on the
-  real tensors; the published ladder's weight error is monotone and uniform
-  (BF16 0, Q8_0 5.6e-3, Q6_K 1.85e-2, Q5_K 3.85e-2, Q4_K_M 7.6e-2 mean relative,
-  no outlier tensor); the only numeric config difference between the two arms is
-  `rms_norm_eps` at 2.5e-9 relative. So the exact accept-count bar is right for a
-  cross-FORMAT arm (same weights, which the BF16 asset now supplies) and was
-  never right for the cross-QUANTIZATION arm it was pointed at. The end-to-end
-  confirmation on GB10 is NOT YET RUN: dgx.casa left the network mid-session on
-  2026-07-29 and did not return. Axis A stays RED and open until it is.
+  **Binding result, MEASURED 2026-07-29 on a production-configured build**
+  (CUTLASS + FlashAttention-2 + vendored Triton-AOT, sm_121a, proven three ways;
+  earlier numbers came from a build carrying none of those and are void): on the
+  Qwen3.6-27B NVFP4 safetensors target, a DFlash draft read from an UNQUANTIZED
+  `BF16` GGUF is **the same draft as the z-lab safetensors one down to the
+  count** - token-for-token identical greedy continuations AND exactly equal
+  accept counts, 47/96 at 48 tokens (reproduced) and 27/64 and 15/144 at 24
+  tokens on two prompts, k=16, concurrency 1. The published `Q4_K_M` draft emits
+  the same tokens and costs at most ONE acceptance (46/112 against 47/96 at 48
+  tokens, zero delta at 24).
+  **That one acceptance is ordinary 4-bit cost, established rather than
+  assumed.** It stood RED against an exact bar until 2026-07-29, and what closed
+  it was finding out what the bar was measuring, not relaxing it. Loaded through
+  the SAME code path the `BF16` GGUF is BYTE-IDENTICAL to the safetensors draft
+  on all 58 tensors (a CPU gate, `tests/vllm/models/test_qwen3_dflash_gguf.cpp`,
+  302/302, functionally RED against the `Q4_K_M` file); our Q4_K/Q6_K dequant is
+  bit-equal to `gguf-py`'s reference on the real tensors; the published ladder's
+  weight error is monotone and uniform (BF16 0, Q8_0 5.6e-3, Q6_K 1.85e-2, Q5_K
+  3.85e-2, Q4_K_M 7.6e-2 mean relative, no outlier tensor); the only numeric
+  config difference is `rms_norm_eps` at 2.5e-9 relative. The end-to-end run then
+  closed it: restoring the draft's precision and nothing else moves the count
+  back to exactly 47/96. So the accept-count bar is now EXACT across formats and
+  BANDED across quantization levels (`|d_accepted| <= 2`, `|d_proposed| <= k*2`,
+  both derived from the measurement and mutation-proved non-vacuous at band 0),
+  with the arm selected by reading the draft file's ggml types rather than by a
+  flag.
   Three conventions this had to undo, all invisible to shape and name checks:
   `dflash.target_layers` is stored `+1`-offset; the draft's RMSNorm weights are
   RAW (its converter class does not inherit the Qwen3Next `+1` shift, so unlike
@@ -994,24 +992,29 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   the Qwen3.6-27B NVFP4 **GGUF** target with the same `Q4_K_M` GGUF draft, the
   DFlash-ON continuation is token-for-token identical to that same target's
   spec-OFF and the drafter is alive at 14/160 accepted.
+  Re-measured 2026-07-29 on the production build and BROADENED from one prompt to
+  three, strict-form green on all of them: "The capital of France is" IDENTICAL
+  with acceptance 14/160, "Write a Python function that reverses a string:"
+  IDENTICAL with 24/64, "Photosynthesis is the process by which" IDENTICAL with
+  15/128, all exit 0.
   Two things are worth stating plainly rather than rounding off. The spike's
   highest-ranked risk - the draft scoring with a head dequantized out of a
   quantized target - does not exist on this asset: the GGUF stores
   `token_embd`/`output` as BF16 beside its NVFP4 body, byte-identical to the
   safetensors sibling of the same quantization run, so the read is verbatim. And
-  acceptance IS lower than on the safetensors target (14/160 against that
-  target's 15/144 on the same draft and prompt); that belongs to the GGUF
+  acceptance against the safetensors target is PROMPT-DEPENDENT rather than
+  uniformly lower: 14/160 against 15/144 on the first prompt, but EQUAL at 24/64
+  with IDENTICAL DFlash-ON streams on the second. That belongs to the GGUF
   target's compute path, not to the shared head, because there is no NVFP4 GGUF
   GEMM yet, so the GGUF target expands to bf16 while the safetensors target runs
-  the true W4A4 kernels - the two diverge at token 4 with no speculation
-  anywhere. Axis B re-measured 2026-07-29 on the production build with every
-  number unchanged (24/24 identical, 14/160, divergence still at index 4, 15/15
-  assertions, exit 0, 81.01 GiB peak RSS), so it is the half of this row that a
-  correct build confirms.
-  Still `PARTIAL`, and now for one more reason: axis B is measured on one prompt
-  at concurrency 1, the acceptance characteristic above is understood but not
-  addressed, axis A's cross-format accept-count bar is RED on the 48-token prompt
-  as recorded above, and no speed number is owed or measured yet.
+  the true W4A4 kernels; the two containers' own spec-OFF streams diverge at
+  index 4 on the first prompt and index 16 on the second, with no speculation
+  anywhere, and the DFlash-ON pair tracks that.
+  **Both axes are now gated and closed** (gates 1-5 and 7 of the spike). What
+  remains open is deliberately NOT this row's: no speed A/B is owed until a
+  native NVFP4 GGUF GEMM exists to make the two target containers comparable, and
+  `docs/BENCHMARKS.md` carries that as an explicit `PENDING` with its
+  reproduction command.
 - **MTP speculative decoding from a GGUF target WORKS, on CPU and on the GB10
   release target** (`SPEC-MTP-GGUF`, `DONE`,
   [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads from a

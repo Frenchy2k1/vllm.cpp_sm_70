@@ -118,25 +118,30 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
-**`SPEC-DFLASH-GGUF` `GD9` - axis-A accept-count RCA (2026-07-29,
-`CLAIM-DFLASH-GGUF-ACCEPT-RCA`, weight-space half LANDED + CPU-GATED, GPU half
-NOT RUN, NOT pushed).** Base `main` `4e20b6f8`; worktree
-`/home/mudler/_git/vllm.cpp-abi-v9`; CPU-only Release build. Row
-`SPEC-DFLASH-GGUF` (engine-matrix), which stays `PARTIAL`. **Owns ONLY**
-`tests/vllm/models/test_qwen3_dflash_gguf.cpp` (one appended case), the
+**`SPEC-DFLASH-GGUF` `GD9`+`GD10` - axis-A accept-count RCA, CLOSED (2026-07-29,
+`CLAIM-DFLASH-GGUF-ACCEPT-RCA`, LANDED + CPU-GATED + GPU-GATED, RELEASED, NOT
+pushed).** Base `main` `d319b23f` (merged into `feat/capi-abi-v9-engine-config`);
+worktree `/home/mudler/_git/vllm.cpp-abi-v9`; CPU Release build plus a
+production-configured dgx.casa GB10 CUDA build at `~/work/dflash-final/src`. Row
+`SPEC-DFLASH-GGUF` (engine-matrix), which moves `PARTIAL` -> `DONE` for
+correctness in the closing commit. **Owned**
+`tests/vllm/models/test_qwen3_dflash_gguf.cpp` (one appended case), bar (a) of
+the axis-A case in `tests/parity/test_qwen27_dflash_spec_decode.cpp`, the
 acceptance-telemetry block of
 `src/vllm/v1/worker/gpu/runner.cpp::sample_tokens_with_rejection` (an
 off-by-default `VT_SPEC_TRACE` trace, no behaviour change), and this row's
-record surfaces. Establishes in weight space that the axis-A accept-count RED is
-ordinary `Q4_K_M` cost and not a defect: gate 2 is enabled with the previously
-overlooked `BF16` GGUF and passes 58/58 byte-identical, and the same case is
-functionally RED against `Q4_K_M`. **Hardware residual, explicitly open:** the
-discriminating end-to-end arm (BF16 GGUF draft vs safetensors draft at 48 tokens
-on the GB10 production build) was NOT run - dgx.casa went unreachable at the ARP
-level mid-session on 2026-07-29 and did not return, so no GPU exclusion window
-was ever held and no GPU number is published. Resume by copying
-`Qwen3.6-27B-DFlash-BF16.gguf` to `$HOME/bench/` on dgx and running the
-`docs/BENCHMARKS.md` repro under `flock $HOME/gpu.lock`.
+record surfaces. `GD9` established in weight space that the axis-A accept-count
+RED is ordinary `Q4_K_M` cost and not a defect. **`GD10` CONFIRMED IT END TO END
+and the hardware residual is DISCHARGED:** on the GB10 production build (proven
+three ways, SACRED 235/235) the `BF16` GGUF draft reads **exactly 47/96**, the
+safetensors draft's own number, at 48 tokens - reproduced 2 of 2 - against
+`Q4_K_M`'s 46/112 on the same binary in the same `flock $HOME/gpu.lock` series
+on an idle box. Bar (a) is consequently split EXACT (cross-format) / BANDED
+(cross-quantization) with the band derived from the measurement and
+mutation-proved non-vacuous, and axis B is broadened from one prompt to three.
+Gate 6 (speed) stays `PENDING` BY DESIGN and is not owed. GPU exclusion held for
+the whole series; no contended number published. Claim RELEASED.
+
 **xgrammar structured-output backend — W0 spike + W1 CPU brick (2026-07-29,
 `CLAIM-TOOLS-XGRAMMAR`, LANDED + CPU-GATED, NOT pushed; FULL SHA reported to
 caller).** Base `main` HEAD `6d54f242`; isolated worktree
