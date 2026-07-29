@@ -480,6 +480,17 @@ ds4's 16.5; GPU used (nvidia-smi 29–46%, compute-app `deepseek-v4-gen`); peak 
 `test_deepseek_v4_gguf_load` **11/11·430** (prefill bit-identical, incremental token-identical, RED-first).
 Stage 0 spec: `.agents/specs/deepseek-v4-forward-device.md`. Residual to ds4 = host-orchestration + per-GEMM
 sync (Stages 2–3: device-resident activations + graphs). Row stays `ACTIVE`; see docs/BENCHMARKS.md.
+**ForwardDevice campaign Stage 2 — decode profiler + deferred-sync drain batching: HONEST NEGATIVE RESULT
+(2026-07-29, base `17ec33ea`, NOT pushed).** The scoped lever ("drop the per-GEMM host sync") is MEASURED
+to NOT move decode. Added `VT_V4_PROF`, which split the 0.18s decode step into sync 0.073s / gemm-dispatch
+0.074s / host-glue 0.034s. Batched the stream drains (21 routed+shared expert GEMMs/layer → 2; grouped
+o-LoRA → 2; `defer_sync` + `DrainDevice`), byte-identical (`test_deepseek_v4_gguf_load` 11/11·430). Real
+DGX: decode 0.20 s/tok (5.11 tok/s), token-identical ("…Paris."), util ~49%, **NO speedup** (sync
+0.073→0.071s). CORRECTION: the "sync" bucket is the host *waiting for GPU compute* of ~1100 tiny T=1 GEMMs,
+NOT sync-call overhead; both buckets scale with GEMM count, not sync-call count. Real lever (named,
+corroborated by the Qwen3-Coder W7 decode-graph row): a **grouped MoE GEMM** (18 tiny expert matvecs → ~3
+kernels) + a **decode CUDA graph** to kill launch tax. Recommend re-scoping Stage 2 to the grouped GEMM.
+Rollback-able; NO speedup claimed. Row stays `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

@@ -33325,3 +33325,35 @@ MoE stacked-expert arm are both hardware-gated. The exclusions that keep it off
 `ssm_out` still expand (the V-head reorder rewrites their layout), the lm_head
 expands by design, and a CPU build expands everything since `kMatmulNvfp4` is
 CUDA-only. `E` and `P` stay `-`. Work remains LOCAL; nothing pushed.
+
+## DeepSeek-V4 ForwardDevice campaign — Stage 2 (profiler + deferred-sync batching): HONEST NEGATIVE RESULT (2026-07-29, `CLAIM-DEEPSEEK-V4-FORWARD-DEVICE`, worktree `/home/mudler/_git/vllm.cpp-s2`, branch `deepseek-v4-stage2`, base `17ec33ea`, committed `816aa446`, NOT pushed)
+
+Stage 1 merged (`17ec33ea`). Stage 2 scoped as "drop the per-GEMM host sync." I first GROUNDED
+the bottleneck (Iron Law) instead of assuming: added `VT_V4_PROF` and measured the steady-state
+decode step (0.18s, `--gpu --kv-cache`) = **sync 0.073s (40%) + gemm-dispatch 0.074s (40%) +
+host-glue 0.034s (18%)**. Also found the #183 device kernels are tiny `<<<1,1>>>` upload/download
+CORRECTNESS kernels (`cuda_deepseek_v4.cu:56/530/533`) — using them for the real model would
+REGRESS — so the "run glue on-device via #183" part of the scope is not viable without a kernel
+rewrite; Stage 2 targeted the sync instead.
+
+Implemented deferred-sync drain BATCHING (byte-identical: same GEMMs on the same stream, only the
+host drain amortized): `defer_sync` on `Gemm`/`GemmRowSlice`/`TimedMatmul` + a one-shot `DrainDevice`;
+`MoeBlock` batches the shared + topk routed experts (21 drains/layer → 2), `GroupedOutputLoraGguf`
+batches the `ng` group GEMMs (ng+1 → 2). Rollback-able (`defer_sync` default false; CPU-queue drains
+no-op → default/non-gpu byte-identical). Gate `test_deepseek_v4_gguf_load` **11/11·430** unchanged.
+
+**DGX GB10 (`--gpu --kv-cache`, 80.7 GB ds4 file): decode 0.20 s/tok (5.11 tok/s over 19 steps),
+TOKEN-IDENTICAL ("…Paris."), util ~49%, sync bucket 0.073 → 0.071s — NO speedup.** THE CORRECTION:
+the "sync" bucket is the host BLOCKING ON GPU COMPUTE of ~1100 tiny T=1 GEMMs/step, NOT sync-CALL
+overhead; the "gemm" bucket is per-GEMM host LAUNCH overhead (~67 µs × ~1100: validation + Q8_K
+activate + 2 kernel launches each). Batching drains cuts the NUMBER of `cudaStreamSynchronize` calls
+but each drain still waits for the same total GPU work → wall time unchanged. Both buckets scale with
+GEMM COUNT/size, not sync-call count.
+
+**Real lever (named, corroborated):** reduce GEMM count + raise occupancy — a **grouped keep-quant
+MoE GEMM** (the 6 routed experts × gate/up/down = 18 tiny matvecs → ~3 grouped kernels indexed over
+the selected experts) + a **decode CUDA graph** to kill the ~0.074s launch tax. This is exactly what
+closed the sibling `Qwen3-Coder-30B` decode row (docs/BENCHMARKS.md W7: missing decode CUDA graph =
+~86% GPU-busy host tax; `MoeGroupedGemmBf16`). RECOMMEND re-scoping Stage 2 to the grouped MoE GEMM
+before Stage 3 graphs. NO speedup claimed; the profiler + byte-identical batching land as the
+reviewable artifact. Box restored (worker up restart=always, flock free, no stray). Awaiting review.
