@@ -32973,6 +32973,30 @@ axis-A cross-FORMAT arm was re-confirmed on the same committed binary in the sam
 sitting: 47/96 both drafts, tokens IDENTICAL, CROSS-FORMAT arm selected, 17/17,
 exit 0.
 
+### UPDATE (2) — GEOMETRY FIXED, the forward now RUNS the real 158 B model end-to-end (worktree `/home/mudler/_git/vllm.cpp-w8geom`, branch `deepseek-v4-w8-geom`, base `fba56f9b`, NOT pushed)
+
+The layer-2 hard-fail is FIXED and the forward composes all 43 layers on the real
+model. Three fixes (gated, `test_deepseek_v4_gguf_load` **9/9·388**, RED-first):
+(1) **real-geometry forward** — the DSA compressor projects to `2*head_dim` (ds4
+`coff=2`), so the real keep-quant run uses DENSE MLA (EXACT for `seq ≤ index_topk=512`;
+the sparse compressor/indexer at real geometry is a named residual); a NEW real-ish
+gate (`comp_width=2*head_dim`) guards it. (2) **mmap-view keep-quant load** — PEAK
+RESIDENT **116.2 → 86.1 GiB**, load 78→6 s (warm), BYTE-IDENTICAL. (3) **per-layer
+YaRN RoPE** — compressed layers (41/43) base 160000 + freq_scale 1/16 (ds4
+`rope_tail_ext_inplace`); + skip the lossy single-block fp8 KV roundtrip. **RESULT
+(real):** the forward runs ALL 43 layers on the real 158 B model at ~1.4-1.7 s/tok
+(CPU-tier, ~0.6 tok/s decode) / **peak 86 GiB**, but greedy output is a degenerate
+2-cycle loop (`201 7249 465 7249…`) — **INCOHERENT**. A DIFFERENT prompt yields
+DIFFERENT ids (`818 7249 16 42498 20850`) → the transformer body IS input-responsive;
+the failure is a numerical/scaling fidelity error, not structural. ds4 reference (same
+file, GB10 GPU): coherent, prefill 358 tok/s, decode 16.5 tok/s (ours CPU-tier — the
+#195 CUDA keep-quant GEMM is on main but this stateless-recompute forward runs the CPU
+queue; GPU-expert wiring is a named residual). **Remaining brick (to coherence):**
+instrumented per-layer diff vs ds4 — suspects: MoE (`routed_scaling_factor=1.5`/
+shared-expert/sqrtsoftplus at `expert_used=6`), MHC Sinkhorn stream-mix at `hc=4`,
+keep-quant IQ2_XXS/Q2_K numerics at real scale. Ruled out: geometry, attention
+scale+structure (match ds4), fp8, memory path, per-layer rope. Box restored (worker up
+`--restart=always`, flock free, 80.7 GB file retained). Row stays SPIKE. NOT pushed.
 ## 2026-07-29 — `QUANT-GGUF-NVFP4` column `C`: NVFP4 GGUF weights now COMPUTE in fp4
 
 `CLAIM-GGUF-NVFP4-COMPUTE`, worktree `vllm.cpp-abi-v9`, branch

@@ -444,6 +444,20 @@ forward to the real DeepSeek-V4 geometry (compressor 1024-dim; audit indexer + g
 `o_groups=8`/`nh=64`/`q_lora_rank=1024`) against a reference; plus the mmap-view load fix. The
 download + keep-quant load + tokenizer + greedy driver + ds4 oracle are DONE; the forward geometry is
 the one blocker before a real single-Spark generation.
+**W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
+INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
+compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
+DENSE MLA (EXACT for `seq ≤ index_topk=512`; the sparse compressor/indexer at real geometry is a named
+residual), guarded by a new real-ish gate (`test_deepseek_v4_gguf_load` 9/9·388, RED-first). Also
+landed: mmap-VIEW keep-quant load (PEAK RESIDENT **116.2 → 86.1 GiB**, byte-identical, load 78 s → 6 s
+warm) and per-layer YaRN RoPE (compressed layers use base 160000 + freq_scale 1/16, ds4
+`rope_tail_ext_inplace`). The forward now runs all 43 layers on the real model at ~1.4–1.7 s/tok / peak
+86 GiB, but greedy output is a degenerate 2-cycle loop (`201 7249 465 7249…`) — INCOHERENT. A different
+prompt gives different ids, so the body is input-responsive; the failure is a numerical/scaling fidelity
+error (suspects: MoE routing/expert-scale/shared-expert, MHC Sinkhorn mixing, keep-quant IQ2_XXS/Q2_K
+numerics), needing instrumented per-layer comparison vs the ds4 oracle. Ruled out: geometry, attention
+scale/structure (match ds4), fp8 KV roundtrip, memory path, rope. ds4 reference (same file, GB10 GPU):
+coherent, prefill 358 tok/s, decode 16.5 tok/s. Row stays SPIKE (no coherent generation).
 **W3 attention primitives landed
 (2026-07-28):** the genuinely-new-vs-V2/V3 math is ported as portable host references
 and unit-gated — the DSA "Lightning Indexer" sparse top-k SELECTION (a weighted
@@ -1264,3 +1278,8 @@ architectures, the GGUF loader rejection case uses a genuinely-unregistered arch
 the DFlash proposer test supplies the now-required `"model"` key, and the two
 HTTP-server tests run under CTest `RUN_SERIAL` so a CPU-hog concurrent test can no
 longer starve their accept thread.
+
+**env-doc hygiene (2026-07-29):** allowlisted `VT_SPEC_TRACE` (a per-block
+spec-decode acceptance *trace*, off by default, output-neutral — `runner.cpp`
+`spec_trace`) on `scripts/env-doc-allowlist.txt`; introduced by the concurrent
+DFlash-GGUF session and left `check-env-doc` RED on main. No behavior change.
