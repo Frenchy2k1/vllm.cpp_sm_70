@@ -878,3 +878,64 @@ device kernels will call.
   only needs the checkpoint downloaded to the DGX to read its full 1328-tensor manifest — see the
   GGUF-loadability section) on top of W7-device + W8; the IQ2_XXS/Q2_K dequant already landed
   (`CLAIM-DSV4-GGUF-LOADER`).
+
+---
+
+## W7-device — the CUDA kernels for the 4 new op families (2026-07-29, `CLAIM-DEEPSEEK-V4-W7-DEVICE`)
+
+**Base:** `main` HEAD `33016f34`. Isolated worktree `/home/mudler/_git/vllm.cpp-w7-device` (branch
+`deepseek-v4-w7-device`), CPU `-Werror` build-verify + **DGX GB10 CUDA gate under `flock /tmp/gpu`**
+(worker stopped for the run then restored), foreground, NOT pushed. W7-device is the last
+engineering brick before an actual DeepSeek-V4 run: it lands the CUDA kernels for the four
+genuinely-new V4 op families, each unit-gated on the GB10 against the LANDED host reference (the
+oracle), and wires `DeepseekV4Model::ForwardDevice` to compose them.
+
+### W7-device.1 What landed (kernel-matrix row `KERNEL-DSV4-W7-DEVICE`, `SPIKE`)
+New TU `src/vt/cuda/cuda_deepseek_v4.cu` — CUDA kernels + host-vector launchers + OpProvider
+registration for the four families, each a 1:1 device port of the host reference:
+- **MHC** (`deepseek_v4_mhc.{h,cpp}`): Sinkhorn (row-softmax+eps seed → col-norm → (iters-1)×
+  [row,col]), MhcPre (folded RMSNorm projection → pre/post/comb gates → stream collapse → optional
+  attn/ffn RMSNorm fold), MhcPost (comb mix + post gate), HcHeadCollapse.
+- **DSA** (`deepseek_v4_dsa.{h,cpp}`): indexer weight-fold, weighted-MQA ReLU logits over the causal
+  window (`-inf` out-of-window), causal top-k selection (bit-exact ids), per-head attention-sink
+  softmax, grouped output-LoRA (`wo_a` bmm → `wo_b`).
+- **Compressor** (`deepseek_v4_compressor.{h,cpp}`): softmax-window pool + RMSNorm, save-time APE add,
+  **fp8_ds_mla** KV encode (per-64 UE8M0 power-of-two block scale + e4m3 nope, bf16 rope) / decode.
+- **MoE** (`deepseek_v4_moe.{h,cpp}`): sqrtsoftplus score, noaux_tc bias-for-selection top-k OR
+  `tid2eid` hash bypass (bit-exact ids, weights from UNBIASED scores), clamped SwiGLU.
+
+**Seam:** each family registers ONE OpProvider under a dedicated OpId (`vt/ops.h`:
+`kDeepseekV4{Mhc,Dsa,Compressor,Moe}`) whose `fn` points at a family kernels-struct
+(`include/vllm/model_executor/models/deepseek_v4_device.h`); `deepseek_v4_device.cpp` resolves them
+via `GetOp`. **NOT re-ported:** the 512-wide MLA attention + expert grouped-GEMM REUSE the existing
+NVFP4/FP8 kernels (`cuda_mla_attn.cu`, `cuda_moe*.cu`) — only the four NEW glue families need device
+kernels.
+
+**ForwardDevice wiring:** `deepseek_v4.cpp` refactors the W7 composition into ONE
+`ForwardComposeImpl` driven by a `V4Backend` policy; `DeepseekV4ForwardHost` binds the host refs (the
+oracle, unchanged — `test_deepseek_v4_forward` still 6/6·26), `DeepseekV4Model::ForwardDevice` binds
+the CUDA kernels through the seam. The small linear projections stay host in both modes (the real
+device path REUSES the existing GEMM/MLA/MoE-grouped kernels — a documented seam).
+
+### W7-device.2 Gate — DGX GB10 (sm_121a) RUNTIME-VERIFIED
+`tests/vllm/models/test_cuda_deepseek_v4.cpp` **11/11 cases · 153 assertions GREEN** on the GB10:
+each device kernel vs its host-ref oracle at small shape — BIT-EXACT ids (DSA causal top-k,
+sqrtsoftplus/hash router selection), `-inf` mask exact, near-tie rel-L2 < 1e-4 for the fp reductions
+(Sinkhorn, pool/softmax, sqrtsoftplus — device `expf`/`sqrtf`/`rsqrt` vs host), fp8_ds_mla
+encode→decode within the e4m3 granularity bound + bf16 rope bit-exact; PLUS the **ForwardDevice
+composition gate** (device forward == host forward, rel-L2 < 2e-3 over the 4-family tiny-config
+interleave). **compute-sanitizer memcheck 0 errors.** **RED-first PROVEN:** dropping the sqrt in the
+device sqrtsoftplus fails 3 cases / 6 assertions (sqrtsoftplus + router weights + ForwardDevice);
+revert restores 11/11·153. Build: CUDA `-Werror` clean; CPU `-Werror` clean. The pre-existing GCC-13
+`-O2` `-Werror=array-bounds`/`-Wstringop-overflow` FALSE POSITIVE in `voxtral.cpp` (project #155) was
+neutralized MINIMALLY + LOCALLY with a scoped `#pragma GCC diagnostic` around the in-bounds
+`BuildPaddedDecodeAttn` copies (advances #155).
+
+### W7-device.3 Honest 3-state + residuals
+The CUDA kernels are **RUNTIME-VERIFIED on GB10 at small shape** (real GPU, real host-ref oracle).
+This does NOT claim V4 "runs" a real model. Named residuals: **W2b** — materialize the real-checkpoint
+FP8-block MLA linears + NVFP4 grouped experts into the device towers (`Forward` VT_CHECKs the host
+tower present); **W8** — the full paged-engine strict/near-tie gate vs a real golden (multi-Spark:
+156.7 GiB NVFP4 / 167 GiB fp8 do not fit ONE GB10); the **single-Spark IQ2_XXS-GGUF vehicle**
+additionally needs the GGUF `blk.N.*` name-map (W2, checkpoint-download-blocked on the 1328-tensor
+manifest).

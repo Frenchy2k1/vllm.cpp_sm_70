@@ -252,6 +252,21 @@ enum class OpId : uint8_t {
   kAllGather,
   kSend,
   kRecv,
+  // --- DeepSeek-V4-Flash device kernels (W7-device) --------------------------
+  // The four NEW V4 op families' CUDA kernels (MHC Sinkhorn+pre/post+head, DSA
+  // Lightning-Indexer+seams, Compressor pool+fp8_ds_mla KV, sqrtsoftplus/hash
+  // router+clamped SwiGLU), registered through the OpProvider seam so
+  // DeepseekV4Model::ForwardDevice can dispatch them. Each OpId's `fn` points at
+  // a family kernels-struct (deepseek_v4_device.h) of typed device launchers,
+  // each a 1:1 CUDA port of the landed portable HOST reference
+  // (deepseek_v4_{mhc,dsa,compressor,moe}.{h,cpp}) it is unit-gated against. The
+  // 512-wide MLA attention + expert grouped-GEMM REUSE the existing kernels
+  // (kMlaDecodeAttention / kMoeGroupedGemmNvfp4) and are NOT re-ported. Additive:
+  // nothing outside the V4 device forward dispatches them.
+  kDeepseekV4Mhc,
+  kDeepseekV4Dsa,
+  kDeepseekV4Compressor,
+  kDeepseekV4Moe,
   kCount
 };
 

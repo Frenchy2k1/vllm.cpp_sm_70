@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
+#include "vllm/model_executor/models/deepseek_v4_device.h"
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
 #include "vllm/model_executor/models/deepseek_v4_mhc.h"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
@@ -71,6 +72,120 @@ using deepseek_v4::MhcPreResult;
 using deepseek_v4::MoeRouteResult;
 using deepseek_v4::SoftmaxWithSink;
 using deepseek_v4::SqrtSoftplusRouteTopk;
+
+// ── backend policy: HOST refs (the oracle) OR the W7-device CUDA kernels ───────
+// The composition below is written ONCE and run either on the portable host
+// references (DeepseekV4ForwardHost, the oracle the device kernels are gated
+// against) or on the CUDA kernels through the OpProvider seam
+// (DeepseekV4Model::ForwardDevice). Only the four NEW V4 op families
+// (MHC / DSA indexer+seams / compressor+fp8_ds_mla / sqrtsoftplus-hash MoE +
+// clamped SwiGLU) branch; the small linear projections stay host in both modes
+// (in the real device path they REUSE the existing GEMM/MLA/MoE-grouped kernels —
+// a documented W7 seam, not re-ported here). device==host at the tiny structural
+// shape is the ForwardDevice composition gate (test_cuda_deepseek_v4.cpp).
+struct V4Backend {
+  bool device = false;
+  vt::Queue* q = nullptr;
+};
+
+deepseek_v4::MhcPreResult DispMhcPre(const V4Backend& be, const std::vector<float>& residual,
+                                     const std::vector<float>& fn,
+                                     const std::vector<float>& scale,
+                                     const std::vector<float>& base, int64_t hc, int64_t hidden,
+                                     float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
+                                     float hc_post_mult, int64_t iters,
+                                     const std::vector<float>& norm_weight, float norm_eps) {
+  if (be.device)
+    return deepseek_v4::MhcDevice()->pre(*be.q, residual, fn, scale, base, hc, hidden, rms_eps,
+                                         hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, iters,
+                                         norm_weight, norm_eps);
+  return MhcPre(residual, fn, scale, base, hc, hidden, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+                hc_post_mult, iters, norm_weight, norm_eps);
+}
+std::vector<float> DispMhcPost(const V4Backend& be, const std::vector<float>& x,
+                               const std::vector<float>& residual,
+                               const std::vector<float>& post_mix,
+                               const std::vector<float>& comb, int64_t hc, int64_t hidden) {
+  if (be.device) return deepseek_v4::MhcDevice()->post(*be.q, x, residual, post_mix, comb, hc, hidden);
+  return MhcPost(x, residual, post_mix, comb, hc, hidden);
+}
+std::vector<float> DispHcHead(const V4Backend& be, const std::vector<float>& x,
+                              const std::vector<float>& fn, float scale,
+                              const std::vector<float>& base, int64_t hc, int64_t hidden,
+                              float rms_eps, float hc_eps) {
+  if (be.device) return deepseek_v4::MhcDevice()->head(*be.q, x, fn, scale, base, hc, hidden, rms_eps, hc_eps);
+  return HcHeadCollapse(x, fn, scale, base, hc, hidden, rms_eps, hc_eps);
+}
+std::vector<float> DispSaveScoreApe(const V4Backend& be, const std::vector<float>& score,
+                                    const std::vector<float>& ape,
+                                    const std::vector<int64_t>& positions, int64_t T,
+                                    int64_t width, int64_t cr) {
+  if (be.device) return deepseek_v4::CompressorDevice()->save_score_ape(*be.q, score, ape, positions, T, width, cr);
+  return CompressorSaveScoreApe(score, ape, positions, T, width, cr);
+}
+std::vector<float> DispPoolNorm(const V4Backend& be, const std::vector<float>& kv,
+                                const std::vector<float>& score,
+                                const std::vector<uint8_t>& valid,
+                                const std::vector<float>& rms_w, float eps, int64_t window,
+                                int64_t hd) {
+  if (be.device) return deepseek_v4::CompressorDevice()->pool_norm(*be.q, kv, score, valid, rms_w, eps, window, hd);
+  return CompressorPoolNorm(kv, score, valid, rms_w, eps, window, hd);
+}
+deepseek_v4::Fp8DsMlaToken DispEncode(const V4Backend& be, const std::vector<float>& head,
+                                      const Fp8DsMlaLayout& ly) {
+  if (be.device) return deepseek_v4::CompressorDevice()->encode(*be.q, head, ly);
+  return Fp8DsMlaEncodeToken(head, ly);
+}
+std::vector<float> DispDecode(const V4Backend& be, const deepseek_v4::Fp8DsMlaToken& tok,
+                              const Fp8DsMlaLayout& ly) {
+  if (be.device) return deepseek_v4::CompressorDevice()->decode(*be.q, tok, ly);
+  return Fp8DsMlaDecodeToken(tok, ly);
+}
+std::vector<float> DispWeightFold(const V4Backend& be, const std::vector<float>& wp, int64_t T,
+                                  int64_t inh, int64_t ihd) {
+  if (be.device) return deepseek_v4::DsaDevice()->weight_fold(*be.q, wp, T, inh, ihd);
+  return DsaIndexerWeightFold(wp, T, inh, ihd);
+}
+std::vector<float> DispLogits(const V4Backend& be, const std::vector<float>& q,
+                              const std::vector<float>& k, const std::vector<float>& folded,
+                              const std::vector<int64_t>& ws, const std::vector<int64_t>& we,
+                              int64_t T, int64_t nk, int64_t inh, int64_t ihd) {
+  if (be.device) return deepseek_v4::DsaDevice()->logits(*be.q, q, k, folded, ws, we, T, nk, inh, ihd);
+  return DsaIndexerLogits(q, k, folded, ws, we, T, nk, inh, ihd);
+}
+std::vector<int64_t> DispTopk(const V4Backend& be, const std::vector<float>& logits,
+                              const std::vector<int64_t>& ws, const std::vector<int64_t>& we,
+                              int64_t T, int64_t nk, int64_t topk) {
+  if (be.device) return deepseek_v4::DsaDevice()->topk(*be.q, logits, ws, we, T, nk, topk);
+  return DsaTopkSelect(logits, ws, we, T, nk, topk);
+}
+std::vector<float> DispSoftmaxSink(const V4Backend& be, const std::vector<float>& scores,
+                                   float sink) {
+  if (be.device) return deepseek_v4::DsaDevice()->softmax_sink(*be.q, scores, sink);
+  return SoftmaxWithSink(scores, sink);
+}
+std::vector<float> DispGroupedOLora(const V4Backend& be, const std::vector<float>& o,
+                                    const std::vector<float>& wo_a,
+                                    const std::vector<float>& wo_b, int64_t T, int64_t nh,
+                                    int64_t hd, int64_t ng, int64_t olr, int64_t H) {
+  if (be.device) return deepseek_v4::DsaDevice()->grouped_olora(*be.q, o, wo_a, wo_b, T, nh, hd, ng, olr, H);
+  return deepseek_v4::GroupedOutputLora(o, wo_a, wo_b, T, nh, hd, ng, olr, H);
+}
+deepseek_v4::MoeRouteResult DispRoute(const V4Backend& be, const std::vector<float>& gating,
+                                      int64_t T, int64_t E, int64_t topk,
+                                      const std::vector<float>& bias, bool renorm, float scale,
+                                      const std::vector<int64_t>& in_tokens,
+                                      const std::vector<int32_t>& hashtab, int64_t vocab) {
+  if (be.device)
+    return deepseek_v4::MoeDevice()->route(*be.q, gating, T, E, topk, bias, renorm, scale,
+                                           in_tokens, hashtab, vocab);
+  return SqrtSoftplusRouteTopk(gating, T, E, topk, bias, renorm, scale, in_tokens, hashtab, vocab);
+}
+std::vector<float> DispClampedSwiGLU(const V4Backend& be, const std::vector<float>& gate_up,
+                                     int64_t d, float limit, float alpha, float beta) {
+  if (be.device) return deepseek_v4::MoeDevice()->clamped_swiglu(*be.q, gate_up, d, limit, alpha, beta);
+  return ClampedSwiGLU(gate_up, d, limit, alpha, beta);
+}
 
 // ── small portable linear-algebra helpers ────────────────────────────────────
 float Dot(const float* a, const float* b, int64_t n) {
@@ -126,7 +241,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
                                   const DeepseekV4Params& p,
                                   const std::vector<float>& x,
                                   const std::vector<int32_t>& positions, int64_t layer,
-                                  V4Miswire miswire, V4ForwardTrace* trace) {
+                                  V4Miswire miswire, V4ForwardTrace* trace,
+                                  const V4Backend& be) {
   const int64_t T = static_cast<int64_t>(positions.size());
   const int64_t H = p.hidden_size;
   const int64_t nh = p.num_attention_heads;
@@ -167,7 +283,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       for (int64_t d = 0; d < hd; ++d) score[t * hd + d] = s[static_cast<size_t>(d)];
     }
     std::vector<int64_t> pos64(positions.begin(), positions.end());
-    score = CompressorSaveScoreApe(score, L.comp_ape, pos64, T, hd, cr);
+    score = DispSaveScoreApe(be, score, L.comp_ape, pos64, T, hd, cr);
     for (int64_t t = 0; t < T; ++t) {
       std::vector<float> kvwin(static_cast<size_t>(win) * hd, 0.0f);
       std::vector<float> scwin(static_cast<size_t>(win) * hd, 0.0f);
@@ -182,7 +298,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
         }
       }
       std::vector<float> comp =
-          CompressorPoolNorm(kvwin, scwin, valid, L.comp_norm_weight, eps, win, hd);
+          DispPoolNorm(be, kvwin, scwin, valid, L.comp_norm_weight, eps, win, hd);
       for (int64_t d = 0; d < hd; ++d) latent[t * hd + d] = comp[static_cast<size_t>(d)];
     }
     if (trace != nullptr) trace->layer_compressor_ran[static_cast<size_t>(layer)] = 1;
@@ -192,8 +308,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   const Fp8DsMlaLayout ly = MakeFp8DsMlaLayout(nope, rope, /*quant_block=*/nope);
   std::vector<float> deck(static_cast<size_t>(T) * hd);
   for (int64_t t = 0; t < T; ++t) {
-    const auto tok = Fp8DsMlaEncodeToken(Slice(latent, t * hd, hd), ly);
-    const std::vector<float> dec = Fp8DsMlaDecodeToken(tok, ly);
+    const auto tok = DispEncode(be, Slice(latent, t * hd, hd), ly);
+    const std::vector<float> dec = DispDecode(be, tok, ly);
     for (int64_t d = 0; d < hd; ++d) deck[t * hd + d] = dec[static_cast<size_t>(d)];
   }
 
@@ -212,15 +328,15 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       std::vector<float> c = MatVec(L.idx_wproj, &x[t * H], inh, H);
       for (int64_t h = 0; h < inh; ++h) wproj[t * inh + h] = c[static_cast<size_t>(h)];
     }
-    const std::vector<float> folded = DsaIndexerWeightFold(wproj, T, inh, ihd);
+    const std::vector<float> folded = DispWeightFold(be, wproj, T, inh, ihd);
     std::vector<int64_t> ws(static_cast<size_t>(T)), we(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) {
       ws[static_cast<size_t>(t)] = 0;
       we[static_cast<size_t>(t)] = t + 1;  // causal candidate window
     }
     const std::vector<float> logits =
-        DsaIndexerLogits(iq, ik, folded, ws, we, T, T, inh, ihd);
-    const std::vector<int64_t> topk = DsaTopkSelect(logits, ws, we, T, T, itopk);
+        DispLogits(be, iq, ik, folded, ws, we, T, T, inh, ihd);
+    const std::vector<int64_t> topk = DispTopk(be, logits, ws, we, T, T, itopk);
     for (int64_t t = 0; t < T; ++t)
       for (int64_t j = 0; j < itopk; ++j) {
         const int64_t s = topk[t * itopk + j];
@@ -249,7 +365,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       const float sink = (miswire == V4Miswire::kNoAttnSink)
                              ? kNegInf
                              : L.attn_sink[static_cast<size_t>(h)];
-      const std::vector<float> probs = SoftmaxWithSink(sc, sink);
+      const std::vector<float> probs = DispSoftmaxSink(be, sc, sink);
       float* oh = &o[(t * nh + h) * hd];
       for (size_t si = 0; si < S.size(); ++si) {
         const float w = probs[si];
@@ -260,15 +376,14 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   }
 
   // 6. grouped OUTPUT-LoRA (W3) : [T,nh,hd] -> [T,H].
-  return deepseek_v4::GroupedOutputLora(o, L.wo_a, L.wo_b, T, nh, hd, p.o_groups,
-                                        p.o_lora_rank, H);
+  return DispGroupedOLora(be, o, L.wo_a, L.wo_b, T, nh, hd, p.o_groups, p.o_lora_rank, H);
 }
 
 // ── DeepSeek-V4 MoE block (W6 primitives) : [T,H] -> [T,H] ────────────────────
 std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
                             const DeepseekV4Params& p, const std::vector<float>& x,
                             const std::vector<int32_t>& token_ids, int64_t layer,
-                            V4Miswire miswire, V4ForwardTrace* trace) {
+                            V4Miswire miswire, V4ForwardTrace* trace, const V4Backend& be) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = p.hidden_size;
   const int64_t ne = p.n_routed_experts;
@@ -294,9 +409,8 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
     bias = L.gate_bias;  // may be empty (then plain top-k on the unbiased scores)
   }
   const MoeRouteResult route =
-      SqrtSoftplusRouteTopk(gating, T, ne, topk, bias, p.norm_topk_prob,
-                            static_cast<float>(p.routed_scaling_factor), in_tokens,
-                            hashtab, p.vocab_size);
+      DispRoute(be, gating, T, ne, topk, bias, p.norm_topk_prob,
+                static_cast<float>(p.routed_scaling_factor), in_tokens, hashtab, p.vocab_size);
   if (trace != nullptr) {
     trace->layer_is_hash[static_cast<size_t>(layer)] = cfg_hash ? 1 : 0;
     trace->layer_hash_routed[static_cast<size_t>(layer)] = hash_route ? 1 : 0;
@@ -310,7 +424,7 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       gate_up[static_cast<size_t>(r)] = Dot(&w1[r * H], xin, H);
       gate_up[static_cast<size_t>(mi + r)] = Dot(&w3[r * H], xin, H);
     }
-    const std::vector<float> act = ClampedSwiGLU(gate_up, mi, lim, 1.0f, 0.0f);
+    const std::vector<float> act = DispClampedSwiGLU(be, gate_up, mi, lim, 1.0f, 0.0f);
     std::vector<float> out(static_cast<size_t>(H));
     for (int64_t hh = 0; hh < H; ++hh)
       out[static_cast<size_t>(hh)] = Dot(&w2[hh * mi], act.data(), mi);
@@ -351,13 +465,16 @@ constexpr const char* kDevicePending =
 
 }  // namespace
 
-// ── the W7 composition (host, tiny-config; also the device kernels' oracle) ───
-std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
-                                         const DeepseekV4Params& p,
-                                         const std::vector<int32_t>& token_ids,
-                                         const std::vector<int32_t>& positions,
-                                         const std::vector<int32_t>& logits_indices,
-                                         V4Miswire miswire, V4ForwardTrace* trace) {
+// ── the W7 composition, written ONCE and run on HOST refs OR the device kernels
+//    (backend policy `be`). DeepseekV4ForwardHost binds host; ForwardDevice binds
+//    the CUDA kernels through the seam. ───────────────────────────────────────
+static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
+                                             const DeepseekV4Params& p,
+                                             const std::vector<int32_t>& token_ids,
+                                             const std::vector<int32_t>& positions,
+                                             const std::vector<int32_t>& logits_indices,
+                                             V4Miswire miswire, V4ForwardTrace* trace,
+                                             const V4Backend& be) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = p.hidden_size;
   const int64_t hc = p.hc_mult;
@@ -409,13 +526,13 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
         for (int64_t i = 0; i < hc; ++i)
           for (int64_t h = 0; h < H; ++h) res_t[i * H + h] = x[t * H + h];
       } else {
-        res_t = MhcPost(Slice(x, t * H, H), Slice(residual, t * hc * H, hc * H),
-                        Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc),
-                        hc, H);
+        res_t = DispMhcPost(be, Slice(x, t * H, H), Slice(residual, t * hc * H, hc * H),
+                            Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc),
+                            hc, H);
       }
       const MhcPreResult pre =
-          MhcPre(res_t, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, hc, H, eps, hc_eps,
-                 hc_eps, 2.0f, iters, L.attn_norm_weight, eps);
+          DispMhcPre(be, res_t, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, hc, H, eps,
+                     hc_eps, hc_eps, 2.0f, iters, L.attn_norm_weight, eps);
       for (int64_t i = 0; i < hc * H; ++i)
         residual[t * hc * H + i] = res_t[static_cast<size_t>(i)];
       for (int64_t i = 0; i < hc; ++i) post_mix[t * hc + i] = pre.post_mix[static_cast<size_t>(i)];
@@ -426,16 +543,16 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
     have_residual = true;
 
     // ── 512-wide MLA attention (W3+W4).
-    x = AttentionBlock(L, p, x, positions, layer, miswire, trace);
+    x = AttentionBlock(L, p, x, positions, layer, miswire, trace, be);
 
     // ── ffn sub-block MHC fused-post-pre = MhcPost(attn-out) + MhcPre(ffn).
     for (int64_t t = 0; t < T; ++t) {
       std::vector<float> res_t =
-          MhcPost(Slice(x, t * H, H), Slice(residual, t * hc * H, hc * H),
-                  Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc), hc, H);
+          DispMhcPost(be, Slice(x, t * H, H), Slice(residual, t * hc * H, hc * H),
+                      Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc), hc, H);
       const MhcPreResult pre =
-          MhcPre(res_t, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, hc, H, eps, hc_eps,
-                 hc_eps, 2.0f, iters, L.ffn_norm_weight, eps);
+          DispMhcPre(be, res_t, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, hc, H, eps, hc_eps,
+                     hc_eps, 2.0f, iters, L.ffn_norm_weight, eps);
       for (int64_t i = 0; i < hc * H; ++i)
         residual[t * hc * H + i] = res_t[static_cast<size_t>(i)];
       for (int64_t i = 0; i < hc; ++i) post_mix[t * hc + i] = pre.post_mix[static_cast<size_t>(i)];
@@ -445,7 +562,7 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
     }
 
     // ── DeepSeek-V4 MoE (W6).
-    x = MoeBlock(L, p, x, token_ids, layer, miswire, trace);
+    x = MoeBlock(L, p, x, token_ids, layer, miswire, trace, be);
   }
 
   // final MhcPost(last-ffn-out) -> hc_head collapse -> norm -> lm_head (model.py:1128-1146).
@@ -459,8 +576,8 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
                       Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc), hc,
                       H);
     }
-    std::vector<float> h = HcHeadCollapse(res_t, hw.hc_head_fn, hw.hc_head_scale,
-                                          hw.hc_head_base, hc, H, eps, hc_eps);
+    std::vector<float> h = DispHcHead(be, res_t, hw.hc_head_fn, hw.hc_head_scale,
+                                      hw.hc_head_base, hc, H, eps, hc_eps);
     h = RmsNorm(h, hw.final_norm_weight, eps);
     for (int64_t d = 0; d < H; ++d) hidden[t * H + d] = h[static_cast<size_t>(d)];
   }
@@ -481,6 +598,17 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
   return logits;
 }
 
+// Public host oracle: the composition on the portable host references.
+std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
+                                         const DeepseekV4Params& p,
+                                         const std::vector<int32_t>& token_ids,
+                                         const std::vector<int32_t>& positions,
+                                         const std::vector<int32_t>& logits_indices,
+                                         V4Miswire miswire, V4ForwardTrace* trace) {
+  return ForwardComposeImpl(hw, p, token_ids, positions, logits_indices, miswire, trace,
+                            V4Backend{/*device=*/false, /*q=*/nullptr});
+}
+
 std::vector<float> DeepseekV4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
@@ -494,20 +622,31 @@ std::vector<float> DeepseekV4Model::Forward(
                                logits_indices);
 }
 
+// ── W7-DEVICE: the DEVICE forward. Runs the SAME composition as
+//    DeepseekV4ForwardHost but routes the four NEW V4 op families through the
+//    CUDA kernels (kDeepseekV4{Mhc,Dsa,Compressor,Moe}) via the OpProvider seam,
+//    at the tiny structural config. device==host within near-tie is the
+//    ForwardDevice composition gate (test_cuda_deepseek_v4.cpp). The small linear
+//    projections stay host in both modes (the real path REUSES the existing
+//    MLA/MoE-grouped/NVFP4 GEMM kernels — a documented W7 seam). The full paged
+//    engine over a materialized 167B checkpoint is the W8 residual. ────────────
 ForwardLogits DeepseekV4Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
     vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
-  (void)token_ids;
-  (void)positions;
   (void)attn_meta;
   (void)attn_kv;
-  (void)weights;
-  (void)queue;
-  (void)logits_indices;
-  VT_CHECK(false, kDevicePending);
-  return {};
+  VT_CHECK(weights.has_host_weights, kHostPending);
+  VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending);
+  std::vector<float> flat =
+      ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
+                         V4Miswire::kNone, /*trace=*/nullptr, V4Backend{/*device=*/true, &queue});
+  ForwardLogits out;
+  out.vocab = weights.params.vocab_size;
+  out.rows = out.vocab > 0 ? static_cast<int64_t>(flat.size()) / out.vocab : 0;
+  out.host = std::move(flat);
+  return out;
 }
 
 }  // namespace vllm

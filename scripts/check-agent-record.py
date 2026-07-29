@@ -92,9 +92,21 @@ MATRICES = {
     # expert machinery is REUSED, not re-ported. W6 landed a portable host reference
     # + unit gate; the device kernels + DeepseekV4Model::Forward assembly are W7
     # residuals. `SPIKE`, `CLAIM-DEEPSEEK-V4-W6`, spec specs/deepseek-v4-flash.md).
+    # 43 since 2026-07-29: +`KERNEL-DSV4-W7-DEVICE` (the DeepSeek-V4-Flash W7-DEVICE
+    # CUDA kernels — the four NEW V4 op families' device kernels: MHC Sinkhorn+pre/
+    # post+head, DSA indexer weight-fold/MQA-logits/causal-topk + sink softmax +
+    # grouped output-LoRA, compressor pool+norm + fp8_ds_mla KV encode/decode, and
+    # the sqrtsoftplus/hash router + clamped SwiGLU. Each a 1:1 device port of the
+    # landed host reference (KERNEL-{MHC-SINKHORN,ATTN-DSA-SPARSE-INDEX,ATTN-DSA-
+    # COMPRESSOR,MOE-SQRTSOFTPLUS-HASH}) registered through the OpProvider seam and
+    # RUNTIME-VERIFIED on the DGX GB10 at small shape vs its host-ref oracle (11/11
+    # cases · 153 assertions, compute-sanitizer memcheck 0 errors, RED-first proven).
+    # The 512-wide MLA attn + expert grouped-GEMM REUSE the existing NVFP4/FP8
+    # kernels — NOT re-ported. `IMPL`, `CLAIM-DEEPSEEK-V4-W7-DEVICE`, spec
+    # specs/deepseek-v4-flash.md; real-checkpoint e2e stays W8, multi-Spark).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 42),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 43),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
