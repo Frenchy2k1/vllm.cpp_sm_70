@@ -63,6 +63,18 @@ struct MhcDeviceKernels {
                              const std::vector<float>& fn, float scale,
                              const std::vector<float>& base, int64_t hc, int64_t hidden,
                              float rms_eps, float hc_eps);
+  // Brick B — IN-PLACE MHC glue (unified memory, no Upload/Download/Sync; caller
+  // drains). Same MhcPost/HcHead/MhcPreKernel as above. `mix_scratch` is a
+  // caller-provided [(2+hc)*hc] unified buffer for pre's intermediate mixes.
+  void (*post_ip)(vt::Queue&, float* out, const float* x, const float* residual,
+                  const float* post_mix, const float* comb, int64_t hc, int64_t hidden);
+  void (*head_ip)(vt::Queue&, float* out, const float* x, const float* fn, float scale,
+                  const float* base, int64_t hc, int64_t hidden, float rms_eps, float hc_eps);
+  void (*pre_ip)(vt::Queue&, float* pre_mix, float* post_mix, float* comb_mix,
+                 float* layer_input, float* mix_scratch, const float* residual, const float* fn,
+                 const float* scale, const float* base, int64_t hc, int64_t hidden, float rms_eps,
+                 float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult, int64_t iters,
+                 const float* norm_weight, bool has_norm, float norm_eps);
 };
 
 // ── (2) DSA family device kernels ─────────────────────────────────────────────
@@ -137,6 +149,12 @@ struct MoeDeviceKernels {
   // ⇒ bit-identical (elementwise, no reduction).
   void (*clamped_swiglu_ip)(vt::Queue&, float* out, const float* gate_up, int64_t d,
                             float limit, float alpha, float beta);
+  // Brick B — IN-PLACE router: same RouteKernel; writes topk_ids[T*topk] (i32) +
+  // topk_weights[T*topk] on the queue device (unified), no Upload/Download/Sync.
+  void (*route_ip)(vt::Queue&, int32_t* topk_ids, float* topk_weights, const float* gating,
+                   int64_t T, int64_t E, int64_t topk, const float* bias, bool has_bias,
+                   const int64_t* in_tokens, bool is_hash, const int32_t* hashtab,
+                   int64_t vocab, bool renorm, float scale);
 };
 
 // Resolve a family's device kernels through the vt OpProvider seam. THROWS on a

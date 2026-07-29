@@ -541,6 +541,17 @@ CUDA unit `test_cuda_deepseek_v4` **13/13·671** (+in-place==host RelL2<1e-5, RE
 and combined with `VT_V4_DEVICE_ATTN=1`, both = "…Paris."). Speed flat (6.12 tok/s attn+glue 24-tok vs 5.83;
 util ~38% — payoff at Brick D). Remaining Brick-B glue (router, MHC pre/post/head/Sinkhorn, RMSNorm, RoPE,
 combine) = next increments. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Device-resident decode campaign — Brick B increment 2: MHC-post/head + router device glue; MhcPre FINDING
+(2026-07-29, base `21191ce2`, commit `3046f087`, NOT pushed).** In-place launchers reusing the tested #183
+kernels for MHC pre/post/head + router; `DispMhcPost`/`DispHcHead`/`DispRoute` route to them under
+`VT_V4_DEVICE_GLUE`. **KEY FINDING (measured):** the #183 `MhcPreKernel`/`HcHeadKernel` are `<<<1,1>>>`
+single-thread stubs — routing MhcPre (86 calls/step over 16K, one GPU thread) REGRESSED decode ~10× (0.59
+vs 6.5 tok/s), so MhcPre stays HOST until a real PARALLEL MhcPre kernel exists (folded RMSNorm + 20-iter
+Sinkhorn + gates + collapse — the hardest remaining piece). The Grid-launched glue (SwiGLU, router,
+MHC-post, hc_head) IS on device + FLAT. Gates: CUDA `test_cuda_deepseek_v4` **14/14·749** (in-place ==
+round-trip #183 bit-identical, RED-first); `test_deepseek_v4_gguf_load` 12/12·531; real model TOKEN-IDENTICAL
+all-device-on "…Paris.", decode 6.38 tok/s (flat). **BRICK B NOT COMPLETE:** parallel glue done + gated;
+remaining = parallel MhcPre kernel + RMSNorm + RoPE + MoE combine. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

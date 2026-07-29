@@ -840,6 +840,64 @@ void ClampedSwiGLUInPlaceLaunch(Queue& q, float* out, const float* gate_up, int6
   Check(cudaGetLastError(), "clamped_swiglu_ip launch");
 }
 
+// Brick B — IN-PLACE MHC glue (unified memory, no Upload/Download/Sync). Same
+// MhcPostKernel/HcHeadKernel/MhcPreKernel as the #183 launchers, run directly on the
+// caller's unified pointers. Caller drains. MHC pre/head are <<<1,1>>> (hc=4 tiny);
+// post is parallel. Near-tie vs host (device expf/rsqrt vs host in the RMSNorm/gates).
+void MhcPostInPlaceLaunch(Queue& q, float* out, const float* x, const float* residual,
+                          const float* post_mix, const float* comb, int64_t hc,
+                          int64_t hidden) {
+  if (hc == 0 || hidden == 0) return;
+  cudaStream_t s = AsStream(q);
+  const int block = 128;
+  MhcPostKernel<<<Grid(hc * hidden, block), block, 0, s>>>(
+      x, residual, post_mix, comb, static_cast<int>(hc), static_cast<int>(hidden), out);
+  Check(cudaGetLastError(), "mhc_post_ip launch");
+}
+
+void HcHeadInPlaceLaunch(Queue& q, float* out, const float* x, const float* fn, float scale,
+                         const float* base, int64_t hc, int64_t hidden, float rms_eps,
+                         float hc_eps) {
+  if (hidden == 0) return;
+  cudaStream_t s = AsStream(q);
+  HcHeadKernel<<<1, 1, 0, s>>>(x, fn, scale, base, static_cast<int>(hc),
+                               static_cast<int>(hidden), rms_eps, hc_eps, out);
+  Check(cudaGetLastError(), "hc_head_ip launch");
+}
+
+// MhcPre writes pre/post/comb mixes + layer_input; it needs an hc3=[(2+hc)*hc] mix
+// scratch. `mix_scratch` is a caller-provided unified buffer (>= hc3 floats).
+void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_mix,
+                         float* layer_input, float* mix_scratch, const float* residual,
+                         const float* fn, const float* scale, const float* base, int64_t hc,
+                         int64_t hidden, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
+                         float hc_post_mult, int64_t iters, const float* norm_weight,
+                         bool has_norm, float norm_eps) {
+  if (hidden == 0) return;
+  cudaStream_t s = AsStream(q);
+  MhcPreKernel<<<1, 1, 0, s>>>(residual, fn, scale, base, static_cast<int>(hc),
+                               static_cast<int>(hidden), rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+                               hc_post_mult, static_cast<int>(iters), norm_weight,
+                               has_norm ? 1 : 0, norm_eps, mix_scratch, pre_mix, post_mix,
+                               comb_mix, layer_input);
+  Check(cudaGetLastError(), "mhc_pre_ip launch");
+}
+
+// IN-PLACE router: same RouteKernel; writes topk_ids[T*topk] (i32) + weights[T*topk].
+void RouteInPlaceLaunch(Queue& q, int32_t* topk_ids, float* topk_weights, const float* gating,
+                        int64_t T, int64_t E, int64_t topk, const float* bias, bool has_bias,
+                        const int64_t* in_tokens, bool is_hash, const int32_t* hashtab,
+                        int64_t vocab, bool renorm, float scale) {
+  if (T == 0) return;
+  cudaStream_t s = AsStream(q);
+  const int block = 64;
+  RouteKernel<<<Grid(T, block), block, 0, s>>>(
+      gating, static_cast<int>(T), static_cast<int>(E), static_cast<int>(topk), bias,
+      has_bias ? 1 : 0, is_hash ? 1 : 0, in_tokens, hashtab, vocab, renorm ? 1 : 0, scale,
+      topk_ids, topk_weights);
+  Check(cudaGetLastError(), "route_ip launch");
+}
+
 // ── Brick A: device MLA decode/prefill attention (unified memory, in place) ───
 // One block per (query t, head h). num KV heads = 1 (all heads share the cached
 // latent kv[s]). BIT-IDENTICAL to the host SoftmaxWithSink path by preserving its
@@ -924,13 +982,14 @@ void DecodeAttnLaunch(Queue& q, float* o, const float* query, const float* kv,
 }
 
 // ── the per-family kernels-structs (registered through the seam) ──────────────
-const MhcDeviceKernels kMhc = {&MhcSinkhornLaunch, &MhcPreLaunch, &MhcPostLaunch, &HcHeadLaunch};
+const MhcDeviceKernels kMhc = {&MhcSinkhornLaunch, &MhcPreLaunch, &MhcPostLaunch, &HcHeadLaunch,
+                               &MhcPostInPlaceLaunch, &HcHeadInPlaceLaunch, &MhcPreInPlaceLaunch};
 const DsaDeviceKernels kDsa = {&DsaWeightFoldLaunch, &DsaLogitsLaunch, &DsaTopkLaunch,
                                &SoftmaxSinkLaunch, &GroupedOLoraLaunch, &DecodeAttnLaunch};
 const CompressorDeviceKernels kComp = {&SaveScoreApeLaunch, &PoolNormLaunch, &Fp8EncodeLaunch,
                                        &Fp8DecodeLaunch};
 const MoeDeviceKernels kMoe = {&SqrtSoftplusLaunch, &RouteLaunch, &ClampedSwiGLULaunch,
-                               &ClampedSwiGLUInPlaceLaunch};
+                               &ClampedSwiGLUInPlaceLaunch, &RouteInPlaceLaunch};
 
 struct Registrar {
   Registrar() {
