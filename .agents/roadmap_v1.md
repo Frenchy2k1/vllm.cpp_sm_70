@@ -237,6 +237,25 @@ SM100-only so GB10 mirrors the FusedMoE-fallback router. SACRED-inert (no existi
 prior V4 tests 14/14·125 + 12/12·164 + 13/13·38 + 4/4·40 unchanged); new kernel row
 `KERNEL-MOE-SQRTSOFTPLUS-HASH` (`SPIKE`). Residuals: device kernels (reuse the existing grouped-GEMM)
 + `DeepseekV4Model::Forward` assembly (W7), strict/near-tie gate (W8) = multi-Spark.
+**W7 FORWARD ASSEMBLY LANDED (2026-07-29, `CLAIM-DEEPSEEK-V4-W7`, base `a856383c`):** the brick that
+finally makes V4 structurally runnable — the `VT_CHECK(false, "W3-W8 pending")` stub is REPLACED by a
+REAL `DeepseekV4Model::Forward` (`DeepseekV4ForwardHost`, in `deepseek_v4.{h,cpp}`) that COMPOSES the
+four landed host primitives (W3 DSA/MLA seams, W4 compressor + fp8_ds_mla KV, W5 MHC + Sinkhorn, W6
+sqrtsoftplus/hash MoE) into an end-to-end logits producer on the portable CPU path at a SMALL synthetic
+config. Interleave grounded 1:1 (`nvidia/model.py:1080-1148` + `:866-957`): embed → per layer
+[first-layer MHC-pre stream EXPAND `[T,H]→[T,hc,H]`, else fused MhcPost(prev-ffn)+MhcPre(attn)] →
+512-wide MLA (q/kv+norms, RoPE, DSA indexer→topk→compressor→fp8_ds_mla KV, sink softmax, grouped
+o-LoRA) → fused MhcPost(attn)+MhcPre(ffn) → MoE (sqrtsoftplus/hash + shared+routed clamped-SwiGLU) →
+final MhcPost → hc_head collapse → norm → lm_head. Gate `test_deepseek_v4_forward` **6/6·26** —
+STRUCTURAL/composition (finite logits end-to-end + deterministic + `[T,vocab]`; MHC stream `[T,hc,H]`;
+hash layers route by `tid2eid` vs gated top-k; DSA SELECTS + compressor POOLS; `logits_indices` gather)
++ RED-first PROVEN 3 levers (all-gated hash, skip-final-MhcPost, no-sink each change the output). Honest
+3-state: DERIVED + BUILD-VERIFIED (structural) — does NOT claim V4 "runs" a real model (documented
+tiny-vs-167B divergences). SACRED-inert (only `deepseek_v4.{h,cpp}` + new test + CMake; shared MLA/MoE +
+W3-W6 TUs empty-diff; prior V4 tests unchanged); NO new kernel row / no checker bump; new TU
+`-Wall -Werror -Wextra`-clean. Residuals: W7-device CUDA kernels + `ForwardDevice`; W2b real-tower
+materialization; W8 strict/near-tie engine gate (multi-Spark, 156.7 GiB); the single-Spark IQ2_XXS-GGUF
+vehicle additionally needs the GGUF `blk.N.*` name-map (W2, download-blocked).
 **MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
 [`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
 DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)

@@ -31789,3 +31789,58 @@ grouped-GEMM — the router + clamp are the only new device kernels) + `Deepseek
 composing W3-W6 with the first-layer stream expand + per-layer attn/ffn interleave — the brick that
 finally makes V4 runnable; W8 the strict/near-tie engine gate. **Resume:** the next V4 brick is W7
 (fold W3-W6 into `DeepseekV4Model::Forward`, `nvidia/model.py:1080-1148`; prefill argmax vs a golden).
+
+## 2026-07-29 — DeepSeek-V4-Flash W7: the `DeepseekV4Model::Forward` ASSEMBLY (`CLAIM-DEEPSEEK-V4-W7`)
+
+**Base:** local `main` `a856383c` (`git rev-parse HEAD`). Isolated worktree
+`/home/mudler/_git/vllm.cpp-w7-forward` (branch `deepseek-v4-w7-forward`), CPU-only, foreground, NOT
+pushed. The brick that finally makes DeepSeek-V4 STRUCTURALLY RUNNABLE.
+
+**What landed.** Replaced the `VT_CHECK(false, "W3-W8 pending")` stub in `DeepseekV4Model::Forward`
+with a REAL forward (`DeepseekV4ForwardHost`) that COMPOSES the four landed W3-W6 host-reference
+primitive stacks into an end-to-end logits producer on the portable CPU path at a SMALL synthetic V4
+config. Edits (owned via this claim): `include/vllm/model_executor/models/deepseek_v4.h` (the host-float
+weight tower `DeepseekV4HostWeights`/`DeepseekV4LayerHostWeights` on `DeepseekV4Weights::host` +
+`has_host_weights`; the `V4Miswire` RED-first enum; the `V4ForwardTrace` structural-facts struct; the
+`DeepseekV4ForwardHost` decl) + `src/vllm/model_executor/models/deepseek_v4.cpp` (the composition +
+`Forward` running off the host tower, else a loud VT_CHECK naming the W2b materialization residual;
+`ForwardDevice` still a loud VT_CHECK naming the W7-device residual). New:
+`tests/vllm/models/test_deepseek_v4_forward.cpp` + the `tests/CMakeLists.txt` wiring.
+
+**Interleave** grounded 1:1 (`nvidia/model.py:1080-1148` model.forward + `:866-957` decoder.forward):
+embed → per layer [first-layer MHC-pre stream EXPAND `[T,H]→[T,hc,H]` (the broadcast residual), else
+fused MhcPost(prev-ffn)+MhcPre(attn)] → 512-wide MLA (q wq_a→q_norm→wq_b + kv wkv→kv_norm, RoPE, DSA
+indexer→topk→compressor→fp8_ds_mla KV round-trip, per-head sink softmax, grouped o-LoRA) → fused
+MhcPost(attn)+MhcPre(ffn) → MoE (sqrtsoftplus/hash router + shared+routed clamped-SwiGLU) → final
+MhcPost → hc_head collapse → norm → lm_head.
+
+**Gate** `test_deepseek_v4_forward` **6/6 cases · 26 assertions GREEN** — STRUCTURAL/composition at a
+tiny shape (H=8, 4 layers, `num_hash_layers=2`, hc_mult=4, 2 heads × head_dim 6 = 4 NoPE + 2 RoPE, 4
+routed + 1 shared expert, `index_topk=3`, `compress_ratios={0,4,2,4}`): finite logits end-to-end +
+deterministic + shape `[T,vocab]`; MHC stream `[T,hc,H]` (`residual_stream_elems==T*4*H`, hc_mult==4);
+hash layers route by `tid2eid` (`layer_hash_routed=={1,1,0,0}`) vs gated learned top-k; DSA indexer
+SELECTS (layers 1,3, index_topk=3) + compressor POOLS (layers 1,2,3); `logits_indices` gather.
+**RED-first PROVEN 3 levers**, each changes the output: route hash layers as gated (ignore tid2eid),
+skip the final MhcPost fold, drop the per-head attention sink.
+
+**Honest 3-state.** The CPU forward assembly at tiny shape = DERIVED + BUILD-VERIFIED (structural). It
+does NOT claim V4 "runs" a real model — it claims the forward ASSEMBLES + is structurally gated at tiny
+shape. Documented tiny-vs-167B divergences (in `deepseek_v4.cpp`, not silent): W=2 compressor window
+(device gather addressing = a W7 seam); full-latent MLA value (W_UK/W_UV absorption = shared-mla-
+extraction follow-on); single rope_theta (dual compress_rope_theta = device seam); quant_block==nope
+(1 block). SACRED-inert: only `deepseek_v4.{h,cpp}` + the new test + the CMake line changed; the shared
+MLA/MoE + the W3-W6 primitive TUs empty-diff; prior V4 tests unchanged (scaffold 4/40, dsa 13/38,
+compressor 12/164, mhc 14/125, moe 12/716). CPU Debug full-library build (the voxtral `-O2`
+`-Werror=array-bounds` false positive forces Debug; the library builds under `-Wall -Wextra -Werror`, so
+the new TU is strict-clean). No new kernel row / no checker bump (a forward assembly, not a new kernel
+family). Checkers rc=0.
+
+**Residuals.** W7-device: the CUDA kernels (MHC Sinkhorn, DSA indexer/compressor, sqrtsoftplus router,
+clamped SwiGLU; the expert GEMM REUSES the existing NVFP4/FP8 grouped-GEMM) + `ForwardDevice`. W2b: the
+real-checkpoint FP8-block + NVFP4 tower materialization into the host tower (`Forward` VT_CHECKs it
+present). W8: the full paged-engine strict/near-tie gate vs a real golden — multi-Spark-blocked (156.7
+GiB NVFP4 / 167 GiB fp8 do not fit ONE GB10). **What still blocks a real single-Spark IQ2_XXS-GGUF run:**
+the GGUF `blk.N.*` name-map (W2, now only needs the checkpoint downloaded to the DGX to read its full
+1328-tensor manifest), on top of W7-device + W8; the IQ2_XXS/Q2_K dequant already landed
+(`CLAIM-DSV4-GGUF-LOADER`). **Resume:** the next V4 brick is W7-device (port the composition into CUDA
+kernels) or the GGUF W2 name-map once the checkpoint is on the DGX.

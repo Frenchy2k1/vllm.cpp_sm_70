@@ -659,6 +659,31 @@ remains multi-Spark-blocked (156.7 GiB); the device kernels (reuse the existing 
 forward-assembly (W7), strict gate (W8) are named residuals. New kernel row
 `KERNEL-MOE-SQRTSOFTPLUS-HASH` (`SPIKE`). No source/engine path touched.
 
+**DeepSeek-V4-Flash W7 forward assembly (2026-07-29, `CLAIM-DEEPSEEK-V4-W7`, NOT
+pushed).** Disposition: **NOT APPLICABLE (structural/composition brick, host CPU forward
+assembly + structural unit gate; no run, no download, no throughput number taken,
+claimed, or owed; `benchmark_binding=false`).** The `VT_CHECK(false, "W3-W8 pending")`
+stub is replaced by a REAL `DeepseekV4Model::Forward` (`DeepseekV4ForwardHost`) that
+composes the four landed host primitives (W3 DSA/MLA seams, W4 compressor + fp8_ds_mla
+KV, W5 MHC + Sinkhorn, W6 sqrtsoftplus/hash MoE) into an end-to-end logits producer on
+the portable CPU path at a small synthetic config, grounded 1:1 in
+`nvidia/model.py:1080-1148` + `:866-957`. `deepseek_v4.{h,cpp}`, `test_deepseek_v4_forward`
+**6/6·26** — STRUCTURAL/composition: finite logits end-to-end + deterministic + shape
+`[T,vocab]`; MHC stream `[T,hc,H]`; hash layers route by `tid2eid` (`layer_hash_routed
+{1,1,0,0}`) vs gated top-k; DSA indexer SELECTS + compressor POOLS; `logits_indices`
+gather; RED-first PROVEN 3 levers (all-gated hash, skip-final-MhcPost, no-sink each
+change the output). Honest 3-state: DERIVED + BUILD-VERIFIED (structural) — does NOT
+claim V4 "runs" a real model (documented tiny-vs-167B divergences: W=2 compressor window,
+full-latent MLA value, single rope_theta, 1-block quant). SACRED-inert (only
+`deepseek_v4.{h,cpp}` + new test + CMake; shared MLA/MoE + W3-W6 primitive TUs empty-diff;
+prior V4 tests 4/40 + 13/38 + 12/164 + 14/125 + 12/716 unchanged). CPU Debug build (the
+same voxtral `-O2` false positive; new TU `-Wall -Werror -Wextra`-clean). No new kernel
+row / no checker bump. The full-model speed + strict token gate remain multi-Spark-blocked
+(156.7 GiB); the device kernels (reuse the existing grouped-GEMM) + `ForwardDevice`
+(W7-device), the real-tower materialization (W2b), the strict gate (W8), and the
+single-Spark IQ2_XXS-GGUF `blk.N.*` name map (W2, download-blocked) are named residuals.
+No source/engine run path executed.
+
 **KDA (Kimi Delta Attention) kernel delta W1 (2026-07-28, `CLAIM-KDA-KERNEL`, NOT
 pushed).** Disposition: **NOT APPLICABLE (correctness/kernel-primitive brick, host CPU
 reference + unit gate; no run, no download, no throughput number taken, claimed, or

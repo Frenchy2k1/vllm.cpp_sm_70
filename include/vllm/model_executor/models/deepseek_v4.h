@@ -123,20 +123,115 @@ struct DeepseekV4Params {
 // missing required field or a value this bring-up cannot represent.
 DeepseekV4Params ParseDeepseekV4Params(const HfConfig& config);
 
+// ─── W7 host-float weight tower (the tiny-config CPU forward assembly) ────────
+// The W7 forward composes the landed host-reference primitives on the portable
+// CPU path at a SMALL synthetic config (the fixed-config 167B does not fit ONE
+// GB10, so the real e2e run is the multi-Spark W8 gate — see this header top).
+// These structs hold the plain-float weights the CPU forward consumes; they are
+// populated by the STRUCTURAL unit gate (test_deepseek_v4_forward.cpp) at a tiny
+// shape, NOT by the real checkpoint loader — the FP8-block + NVFP4 tower
+// MATERIALIZATION into this layout is the named W2b residual. All tensors row-major
+// fp32 unless noted.
+struct DeepseekV4LayerHostWeights {
+  // MHC mixing (nvidia/model.py:820-865): hc_attn/hc_ffn fn [(2+hc)*hc, hc*H],
+  // base [(2+hc)*hc], scale [3]; the attn/ffn RMSNorms folded into the pre-mix.
+  std::vector<float> attn_norm_weight;  // [H]
+  std::vector<float> ffn_norm_weight;   // [H]
+  std::vector<float> hc_attn_fn, hc_attn_base, hc_attn_scale;
+  std::vector<float> hc_ffn_fn, hc_ffn_base, hc_ffn_scale;
+  // 512-wide MLA (attention.py): q down/up, kv down, per-branch RMSNorms,
+  // per-head attention sink, grouped OUTPUT-LoRA wo_a (bmm) + wo_b.
+  std::vector<float> wq_a;            // [q_lora_rank, H]
+  std::vector<float> q_norm_weight;   // [q_lora_rank]
+  std::vector<float> wq_b;            // [n_heads*head_dim, q_lora_rank]
+  std::vector<float> wkv;             // [head_dim, H]
+  std::vector<float> kv_norm_weight;  // [head_dim]
+  std::vector<float> attn_sink;       // [n_heads]
+  std::vector<float> wo_a;            // [n_groups, o_lora_rank, in_per_group]
+  std::vector<float> wo_b;            // [H, n_groups*o_lora_rank]
+  // DSA Lightning-Indexer (indexer layers only; empty otherwise).
+  std::vector<float> idx_wq;     // [index_n_heads*index_head_dim, H]
+  std::vector<float> idx_wk;     // [index_head_dim, H]
+  std::vector<float> idx_wproj;  // [index_n_heads, H]
+  // DSA compressor (compressor layers only; empty otherwise).
+  std::vector<float> comp_wgate;        // [head_dim, H]  (produces the pool score)
+  std::vector<float> comp_ape;          // [compress_ratio, head_dim]
+  std::vector<float> comp_norm_weight;  // [head_dim]
+  // MoE router: learned gate + (non-hash) noaux_tc bias OR (hash) tid2eid table.
+  std::vector<float> gate_weight;  // [n_routed_experts, H]
+  std::vector<float> gate_bias;    // [n_routed_experts]  (non-hash layers)
+  std::vector<int32_t> tid2eid;    // [vocab, num_experts_per_tok] (hash layers)
+  // Shared + routed experts (clamped SwiGLU). Routed stored flat over experts.
+  std::vector<float> shared_w1, shared_w3;  // [moe_inter, H]
+  std::vector<float> shared_w2;             // [H, moe_inter]
+  std::vector<float> exp_w1, exp_w3;        // [n_experts, moe_inter, H]
+  std::vector<float> exp_w2;                // [n_experts, H, moe_inter]
+};
+struct DeepseekV4HostWeights {
+  std::vector<float> embed;              // [vocab, H]
+  std::vector<float> lm_head;            // [vocab, H]  (untied)
+  std::vector<float> final_norm_weight;  // [H]
+  std::vector<float> hc_head_fn;         // [hc, hc*H]
+  std::vector<float> hc_head_base;       // [hc]
+  float hc_head_scale = 0.0f;            // scalar (hc_head_scale[0] upstream)
+  std::vector<DeepseekV4LayerHostWeights> layers;
+};
+
 // Whole DeepSeek-V4 weights. W1/W2 SCAFFOLDING: carries the resolved params + the
 // loader's accounting result. Heavy tensor MATERIALIZATION (FP8-block MLA linears,
 // NVFP4 grouped experts, MHC mixing matrices, DSA indexer/compressor) is the named
-// W2b/W3-W6 residual — the loader ACCOUNTS for every checkpoint tensor here but
-// does not yet upload the quantized towers (TODO markers in deepseek_v4_weights.cpp).
+// W2b residual — the loader ACCOUNTS for every checkpoint tensor but does not yet
+// upload the quantized towers (TODO markers in deepseek_v4_weights.cpp). The W7
+// tiny-config CPU forward runs off `host` when `has_host_weights` is set.
 struct DeepseekV4Weights {
   DeepseekV4Params params{};
   // Accounting from the verified name-map pass (W2 gate): how many checkpoint
   // tensors the loader recognized / would consume. Diagnostic only.
   int64_t accounted_tensors = 0;
-  // TODO(W2b): the materialized towers land here as OwnedTensor fields once the
-  // FP8-block + NVFP4 weight-loading reuse (cuda_matmul_nvfp4_sm100 / the fp8
-  // block loaders) is wired for the 512-wide MLA + 256-expert FusedMoE fallback.
+  // W7 host-float tower for the tiny-config CPU forward composition. NOT filled by
+  // LoadDeepseekV4ForCausalLMWeights (that is the W2b residual); the structural
+  // gate populates it directly. `Forward` VT_CHECKs this present.
+  DeepseekV4HostWeights host{};
+  bool has_host_weights = false;
+  // TODO(W2b): the materialized quantized towers (FP8-block MLA linears + NVFP4
+  // grouped experts) land as device OwnedTensors; the device forward (W7-device)
+  // reads those, this host tower is the portable-CPU composition oracle.
 };
+
+// W7 structural-gate knobs. A deliberately-miswired interleave MUST change the
+// output (RED-first) — the structural gate proves each lever is load-bearing.
+enum class V4Miswire {
+  kNone,              // the faithful interleave
+  kAllLayersGated,    // route hash layers by learned top-k (ignore tid2eid)
+  kSkipFinalMhcPost,  // skip the final residual fold before the head collapse
+  kNoAttnSink,        // drop the per-head attention sink (plain softmax)
+};
+
+// Structural facts the W7 forward records for the composition gate (proves the
+// interleave RAN as designed at tiny shape — not a numerical parity claim).
+struct V4ForwardTrace {
+  int64_t hc_mult = 0, hidden = 0, num_tokens = 0;
+  int64_t residual_stream_elems = 0;  // == num_tokens*hc*hidden (proves [T,hc,H])
+  std::vector<int> layer_is_hash;          // per layer: config says hash-routed
+  std::vector<int> layer_hash_routed;      // per layer: the router took the hash branch
+  std::vector<int> layer_is_indexer;       // per layer: DSA Lightning-Indexer present
+  std::vector<int> layer_indexer_selected; // per layer: #keys the last query selected
+  std::vector<int> layer_compressor_ran;   // per layer: the DSA compressor pooled KV
+};
+
+// The W7 tiny-config CPU forward: compose the landed host primitives (MHC pre/post
+// + Sinkhorn, DSA indexer select + compressor + fp8_ds_mla KV, 512-wide MLA with
+// sinks + grouped output-LoRA, sqrtsoftplus/hash MoE with clamped SwiGLU) into an
+// end-to-end logits producer. Returns flat row-major logits for the `logits_indices`
+// rows (all rows if empty). `miswire` deliberately breaks the interleave for the
+// RED-first structural gate; `trace` (optional) records structural facts.
+// Grounding: vllm/models/deepseek_v4/nvidia/model.py:1080-1148 (DeepseekV4Model.forward)
+// + :866-957 (DeepseekV4DecoderLayer.forward).
+std::vector<float> DeepseekV4ForwardHost(
+    const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices = {},
+    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr);
 
 // Load `DeepseekV4ForCausalLM` safetensors into DeepseekV4Weights. Encodes the
 // checkpoint name-map VERIFIED against the real header (deepseek_v4_weights.cpp)
