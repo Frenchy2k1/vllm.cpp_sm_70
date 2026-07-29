@@ -1279,3 +1279,8 @@ architectures, the GGUF loader rejection case uses a genuinely-unregistered arch
 the DFlash proposer test supplies the now-required `"model"` key, and the two
 HTTP-server tests run under CTest `RUN_SERIAL` so a CPU-hog concurrent test can no
 longer starve their accept thread.
+
+**env-doc hygiene (2026-07-29):** allowlisted `VT_SPEC_TRACE` (a per-block
+spec-decode acceptance *trace*, off by default, output-neutral — `runner.cpp`
+`spec_trace`) on `scripts/env-doc-allowlist.txt`; introduced by the concurrent
+DFlash-GGUF session and left `check-env-doc` RED on main. No behavior change.
