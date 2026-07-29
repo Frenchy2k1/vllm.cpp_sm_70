@@ -996,6 +996,12 @@ target_include_directories(test_qwen36_gguf_engine PRIVATE ${CMAKE_SOURCE_DIR}/t
 vllm_cpp_add_test(test_qwen27_gguf_nvfp4_compute
   parity/test_qwen27_gguf_nvfp4_compute.cpp)
 
+# `QUANT-GGUF-NVFP4` column C, MoE arm: the 35B A3B stacked-expert residency.
+# Asset-gated (VLLM_NVFP4_MOE_GGUF, optionally VLLM_NVFP4_MOE_ST_DIR); compiles
+# and links on CPU/CI but only RUNS where the real 35B NVFP4 files exist.
+vllm_cpp_add_test(test_qwen36_gguf_nvfp4_compute
+  parity/test_qwen36_gguf_nvfp4_compute.cpp)
+
 # Dense 27B W4A4 greedy acceptance gate (checkpoint-gated, dgx-only; skips on
 # CPU/CI when the real snapshot is absent). Counterpart to the 35B gate; asserts
 # the paged dense engine reproduces the pip-vLLM oracle greedy continuation

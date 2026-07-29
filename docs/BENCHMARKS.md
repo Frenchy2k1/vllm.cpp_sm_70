@@ -3946,10 +3946,9 @@ without re-deriving numerics: the ggml type-40 blocks repack into exactly the
       test_nvfp4_dequant 4/47, test_gguf 30/103, test_gguf_dequant 15/480,
       test_gguf_keep_quant 37/5985, test_gguf_qwen36_loader 6/286
 
-**Not covered by this run:** the MoE (35B) NVFP4-GGUF expert arm is wired and
-unit-covered but was never loaded on hardware, so it carries no number and no
-support claim; and no serving-throughput arm exists, which is why `P` stays
-`-`.
+**Not covered by this run:** the MoE (35B) NVFP4-GGUF expert arm, which is
+measured separately below; and no serving-throughput arm exists, which is why
+`P` stays `-`.
 
 Reproduction entry point:
 
@@ -3957,6 +3956,96 @@ Reproduction entry point:
     VLLM_NVFP4_GGUF=~/bench/q36-27b-nvfp4.gguf \
     VLLM_NVFP4_ST_DIR=~/bench/q36-27b-nvfp4-vllm \
       ./tests/test_qwen27_gguf_nvfp4_compute
+
+### The MoE stacked-expert arm of `QUANT-GGUF-NVFP4` column `C` (2026-07-29) - load + residency ACCEPTED, serving throughput PENDING
+
+**Benchmark disposition: load-time and weight-residency numbers ACCEPTED for the
+35B A3B MoE arm; serving throughput `PENDING`; cross-container token comparison
+REPORTED, never gated.** This closes the "wired but never loaded" gap the 27B
+section above leaves open.
+
+Same build discipline and proofs as that section (0 `cutlass not found`;
+`cuobjdump -lelf` **41 cubins, all `sm_121a`** on all three gate binaries; SACRED
+`test_qwen27_paged_engine` **235/235 exit 0** before any number was trusted),
+clean `git archive` tree at `~/work/nvfp4-moe/src`, one `flock $HOME/gpu.lock`
+per series, idle box, `/` at 92% before and after, no doctest `-s`.
+
+**Same-binary A/B**, `test_qwen36_gguf_nvfp4_compute -tc="*generates through the
+fp4 path*"`, `~/bench/q36-35b-a3b-nvfp4.gguf`, greedy, 24 tokens, prompt "The
+capital of France is":
+
+| `VT_GGUF_NVFP4_FP4` | peak RSS | wall (load + generate) | tokens |
+|---|---|---|---|
+| `0` - bf16 expansion | 68.50 GiB | 1:51.91 | `11751 11 264 3177 34756 364 1141 8807 …` |
+| `1` - native fp4, 2 reps | **22.72 / 22.72 GiB** | **0:28.76 / 0:29.55** | same, reproduced 2/2 |
+
+**3.01x lower peak RSS and 3.9x faster load-and-generate**, rc=0 throughout. The
+routing audit shows **240 of 733** routed tensors taking the fp4 residency (120
+of them stacked-expert), **120 fp4 expert stacks over 40 layers with 0 left
+bf16**, and 17 280 MiB of fp4-resident expert weight.
+
+**Token identity across the switch is the CORRECT result here, and is not a
+no-op.** Unlike the 27B - where the switch flips bf16 expansion against TRUE W4A4
+and therefore moves tokens - the 35B routed experts run the fused Marlin
+**W4A16** grouped GEMM in BOTH arms (it consumes `scale2` and ignores `alpha`),
+so the two arms are the same arithmetic over the same quantized weights and
+identity is the LOSSLESSNESS signal. That the fp4 path really ran is carried by
+the 3.01x residency, the 3.9x load-and-generate delta, and by the defect below,
+which only the fp4 arm could ever hit.
+
+**The weight-level gate is per-expert BYTE-IDENTITY**, against the modelopt
+safetensors sibling, which stores experts UNSTACKED and so is the exact
+per-expert counterpart of a stacked GGUF slab:
+
+    Asset-gated, dgx GB10, under the same flock
+      test_gguf_nvfp4  14/14 cases, 12 650/12 650 assertions
+        27B sweep : 192 NVFP4 tensors compared across both containers
+        35B sweep : 840 (tensor, expert) slabs, ZERO differing bytes on
+                    weight_packed AND weight_scale, and 840 per-expert
+                    <stem>.scale[e] bit-identical to expert e's weight_scale_2
+      test_qwen36_gguf_nvfp4_compute (loader)  154 008/154 008 assertions
+    Mutation (the per-expert gate is not vacuous): the scales[0]-for-every-expert
+      mutant AND the expert-0-slab-for-every-expert mutant are constructed and
+      both REJECTED; the real file's own per-expert scales vary (117/117/138
+      distinct of 256 on layer 0's three stacks).
+    Regression, same build, same lock, all rc=0
+      test_qwen27_paged_engine 235/235 (SACRED)
+      test_qwen36_paged_engine 2 cases / 315/315 (SACRED)
+      test_nvfp4_dequant 4/47, test_gguf_keep_quant 37/5985
+
+**A latent defect this run found and fixed.** The first 35B fp4 forward THREW
+`vt: matmul: inner dims mismatch` from `MoeBlockFusedMarlinCuda`: the two fp4
+fused MoE blocks issued the router GEMM as a bare `vt::Matmul`, assuming the
+safetensors `[K=H, N=E]` gate layout, while the GGUF loader keeps it `[N=E, K=H]`
+`nk=true` under `expand_nk`. Pre-existing, and made reachable by this arm (a GGUF
+load never produced fp4-resident experts before). Deterministic once attributed:
+3/3 reps threw, 3/3 reps with `VT_GGUF_KEEP_QUANT=0` passed. Fixed by branching
+on `router_gate.nk`, provably inert for the safetensors path.
+
+**OPEN, and it bounds every token statement here: this case's greedy stream is
+not run-to-run stable.** The `VT_GGUF_NVFP4_W4A4=0` arm produced the canonical
+stream in 2 of 3 runs and a different coherent one in the third; the safetensors
+reference produced one stream in 3 of 4 runs and another in the fourth. So the
+binding results of this arm are the weight-level byte identity and the
+residency/routing audit, and the token agreement above is reported with that
+instability attached rather than as a token-exactness claim. The fp4 arm did
+reproduce its own stream 3 of 3. `test_qwen36_paged_engine` is token-exact
+(315/315) at ITS engine params, so this is a property of this case's
+`block_size 32 / num_blocks 256 / max_num_seqs 1` configuration, not of the
+checkpoint or of column `C`; attributing it is OWED WORK and is not claimed.
+Cross-container divergence against the modelopt safetensors came out index 7 in
+three runs and 16 in one - unstable for the same reason, and not guaranteed by
+construction anyway (the GGUF stores the GDN and full-attention families BF16
+where the safetensors runs native FP8 W8A8).
+
+Reproduction entry point:
+
+    ~/work/nvfp4-moe/run_post.sh       # the A/B series above, one flock
+    VLLM_NVFP4_MOE_GGUF=~/bench/q36-35b-a3b-nvfp4.gguf \
+    VLLM_NVFP4_MOE_ST_DIR=~/bench/q36-35b-a3b-nvfp4-vllm \
+      ./tests/test_gguf_nvfp4                       # the per-expert sweep
+    VLLM_NVFP4_MOE_GGUF=~/bench/q36-35b-a3b-nvfp4.gguf \
+      ./tests/test_qwen36_gguf_nvfp4_compute
 
 ### NVFP4 in the GGUF loader, `QUANT-GGUF-NVFP4` (2026-07-28) - correctness only, NOT APPLICABLE
 
