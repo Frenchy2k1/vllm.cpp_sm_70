@@ -93,6 +93,13 @@ vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffol
 # gated vs hand-derived cases + double-precision references. Full-model gate is
 # multi-Spark-blocked (156.7 GiB); MHC/MoE are W5/W6 (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_dsa vllm/models/test_deepseek_v4_dsa.cpp)
+
+# DeepSeek-V4-Flash W4: the DSA COMPRESSOR forward (softmax-weighted window pool
+# + save-time APE add + RMSNorm) + the fp8_ds_mla KV-cache state layout (448 fp8
+# UE8M0 + 64 bf16 rope, 576B stride) unit-gated vs hand-derived cases +
+# double-precision references. Full-model gate is multi-Spark-blocked (156.7 GiB);
+# MHC/MoE/device-kernel are W5/W6/W7 (.agents/specs/deepseek-v4-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_compressor vllm/models/test_deepseek_v4_compressor.cpp)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;

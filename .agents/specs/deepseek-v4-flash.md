@@ -537,3 +537,82 @@ math against. HOW it would be gated:
   cache + paged backend + the fp8_ds_mla KV insert (W4 device side), the device kernels for the W3
   primitives + folding them into `DeepseekV4Model::Forward` and the shared-mla extraction (W7), and
   the full strict/near-tie engine gate (W8) — all multi-Spark-blocked on one GB10.
+
+---
+
+## W4 — DSA COMPRESSOR forward + fp8_ds_mla KV-cache state (2026-07-29, `CLAIM-DEEPSEEK-V4-W4`)
+
+**Base:** current `main` HEAD `4d1be010` (`git rev-parse HEAD`). Isolated worktree, CPU-only,
+foreground, NOT pushed. Continues the W3 host-reference lane: the full-model gate is multi-Spark-
+blocked (156.7 GiB, does not fit one GB10; the forward also needs MHC + the sqrtsoftplus/hash MoE),
+so W4 lands the FORWARD CODE for the second half of the DSA sparse-attention stack + UNIT-gates it.
+
+### W4.1 What landed (additive, SACRED-inert)
+New TUs `include/vllm/model_executor/models/deepseek_v4_compressor.h` +
+`src/vllm/model_executor/models/deepseek_v4_compressor.cpp` — portable HOST (CPU) references for the
+two things W4 owns, each ported 1:1 with `file:line` on both sides (vLLM primary, SGLang v0.5.15
+cross-reference):
+
+- **(A) the DSA COMPRESSOR forward** — where W3's Lightning-Indexer SELECTS keys, the compressor
+  POOLS + normalizes them into the compressed latent the MLA reads:
+  - `CompressorSaveScoreApe` <- `common/ops/save_partial_states.py:92-101` — the fused save-time APE
+    add `score_state[t,d] = score[t,d] + ape[positions[t] % compress_ratio, d]` (the kv half is
+    stored verbatim; only the score half gets the position-embedding add, which is why it is fused
+    into the state write).
+  - `CompressorPoolNorm` <- `common/ops/fused_compress_quant_cache.py:198-218` (cross-checked vs
+    SGLang `dsv4/fused_compress_triton.py` `_fused_ape_pool_norm_rope_kernel:57-95`) — the softmax-
+    weighted window POOL: `softmax(score, dim=0)` INDEPENDENTLY PER head-dim column, weighted sum of
+    the window's kv → compressed latent, then RMSNorm (fp32). **The per-column softmax is the load-
+    bearing nuance** — each head-dim channel pools the `(1+overlap)·compress_ratio` window with its
+    OWN weights, not one shared attention weight per row; a unit case pins it (a column whose score
+    strongly favors one window row diverges from a uniform column in a way only per-column softmax
+    produces, and the ratio survives RMSNorm).
+
+- **(B) the fp8_ds_mla KV-CACHE STATE layout** — how the compressed latent is written to / read from
+  the paged cache across steps:
+  - `MakeFp8DsMlaLayout` <- `compressor.py:307-309` (`_quant_block=64`, `_token_stride=nope+rope*2=
+    576`, `_scale_dim = nope//64 + 1 = 8`); geometry cross-checked vs SGLang `dsv4/dequant_k_cache.py
+    :12-18` (`DIM_NOPE=448`, `TILE_SIZE=64`): per token 448 fp8 NoPE + 64 bf16 RoPE = 576 contiguous
+    bytes, then a padded 7+1 UE8M0 scale region.
+  - `Fp8DsMlaEncodeToken` <- `fused_compress_quant_cache.py:238-297` store side — per 64-wide NoPE
+    block: bf16-round (the kernel casts fp32→bf16→fp32), per-block `absmax` (clamped ≥1e-4), UE8M0
+    power-of-two scale `exponent = ceil(log2(absmax/448))`, `inv_scale = 2^-exponent`, `clamp(q·
+    inv_scale, ±448)` → e4m3; the stored scale byte `= clamp(exponent + 127, 0, 255)`. RoPE part →
+    bf16 verbatim (the forward RoPE that precedes it on GPU reuses our decoupled-RoPE machinery — a
+    W3/W7 seam — so this reference round-trips the bytes and leaves the rotation to W7).
+  - `Fp8DsMlaDecodeToken` <- the paged-KV READ, `SGLang dsv4/dequant_k_cache.py:122-136`:
+    `nope[d] = e4m3→f32(byte[d]) · 2^(scale_byte[block]-127)`, `rope[j] = bf16→f32`. Reuses the
+    landed host helpers `F32ToF8E4M3`/`F8E4M3ToF32` (nvfp4 path) + `vt::F32ToBF16`/`BF16ToF32`.
+
+### W4.2 Gate (unit, honest) — hand-case + structural review, NOT a dumped-oracle rel-L2
+Same honest bar as W3 (the fixed-config 167B arch cannot be constructed at a tiny shape, nor run —
+it does not fit one GB10). `tests/vllm/models/test_deepseek_v4_compressor.cpp`: **12/12 cases · 164
+assertions GREEN** on a CPU Debug full-library build, 0-warn on the new TUs. Hand-derived literal
+cases: APE modulo-wrap (`pos 3, cr 2 → ape row 1`); pool = `softmax(score,dim=0)·kv` then RMSNorm;
+window masking excludes out-of-range rows; per-column softmax load-bearing (column ratio survives
+RMSNorm); V4 layout `448/64/576/7+1`; all-ones NoPE block → UE8M0 byte `119` + exact round-trip;
+value-3 block → byte `120`; bf16 rope verbatim. Randomized double-precision references: pool+norm
+rel-L2 < 1e-6; an INDEPENDENT recompute of every UE8M0 scale byte; encode→decode round-trip < 0.05
+(honest fp8-granularity bound, not 1e-6 — e4m3 carries 3 mantissa bits). **RED-first PROVEN:**
+perturbing the scale bias `+127→+126` fails 4 cases / 135 assertions; revert restores 12/12·164.
+CAVEAT: the CPU gate uses `-DCMAKE_BUILD_TYPE=Debug` because a pre-existing GCC-13 `-O2`
+`-Werror=array-bounds` false positive in `voxtral.cpp` (unrelated to these TUs) breaks the `-O2`
+full-library build; the new TUs themselves are `-Wall -Werror -Wextra`-clean.
+
+### W4.3 SACRED inertness
+Additive ONLY. Zero edits to any existing forward — in particular the shared DeepSeek-V2 MLA
+(`mla_attention.{h,cpp}`, `cuda_mla_attn.cu`) has an EMPTY diff. Proof: `test_deepseek_v4_dsa` still
+13/13·38, `test_deepseek_v4_scaffold` 4/4·40. The only non-additive edits are the two CMake source/
+test wiring lines, the new `KERNEL-ATTN-DSA-COMPRESSOR` kernel-matrix row (+ its checker count bump
+39→40), and the record surfaces.
+
+### W4.4 Landed-vs-residual
+- **Landed (W4):** the DSA compressor pool+norm + save-time APE + the fp8_ds_mla KV-state read/write
+  layout — host references + unit gate; `KERNEL-ATTN-DSA-COMPRESSOR` (`SPIKE`).
+- **Residual:** the compressor STATE-CACHE gather addressing (the `head_offset` overlap window
+  indexing into the paged state, the two-stage cr≥128 split, `CompressorMetadata`/`CompressorBackend`
+  paging) is a W7 device-integration concern — W4's host reference feeds the ASSEMBLED window so the
+  gate isolates the pool/quant compute (`fused_compress_quant_cache.py:169-196` address arithmetic is
+  named, not ported). Still residual: MHC (W5), sqrtsoftplus/hash MoE (W6), the fused device kernel
+  (`_fused_kv_compress_norm_rope_insert_sparse_attn`) + `DeepseekV4Model::Forward` integration +
+  shared-mla extraction (W7), the strict/near-tie engine gate (W8) — all multi-Spark-blocked.

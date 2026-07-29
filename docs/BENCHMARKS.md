@@ -572,6 +572,26 @@ rel-L2 (the fixed-config 167B arch is not constructible at a tiny shape). SACRED
 v0.5.15 registers `DeepseekV4ForCausalLM` (full DSA/MHC stack) — a viable second
 reference for a future primitive-dump or 2-Spark benchmark. No source/engine path touched.
 
+**DeepSeek-V4-Flash W4 compressor + fp8_ds_mla KV-state (2026-07-29, `CLAIM-DEEPSEEK-V4-W4`,
+NOT pushed).** Disposition: **NOT APPLICABLE (correctness/primitive brick, host CPU
+reference + unit gate; no run, no download, no throughput number taken, claimed, or owed;
+`benchmark_binding=false`).** Ported + unit-gated the second half of the DSA sparse-attention
+stack: the DSA COMPRESSOR forward (the softmax-weighted window POOL `softmax(score,dim=0)·kv`
+per head-dim column + RMSNorm + the fused save-time APE add) and the fp8_ds_mla KV-cache state
+read/write layout (448 fp8 NoPE with per-64 UE8M0 power-of-two block scales + 64 bf16 RoPE, 576B
+token stride, 7+1 scale region, + the dequant read). `deepseek_v4_compressor.{h,cpp}`,
+`test_deepseek_v4_compressor` **12/12·164** — hand-derived literals + double-precision references
+(pool+norm rel-L2 < 1e-6; independent UE8M0 scale-byte recompute; round-trip < 0.05 fp8
+granularity) + RED-first (scale-bias perturb fails 4/135, revert restores). Ported 1:1 from vLLM
+`fused_compress_quant_cache.py`/`save_partial_states.py`/`compressor.py`, cross-checked vs SGLang
+`v0.5.15` `dsv4/dequant_k_cache.py`. Honest gate form: hand-case + structural review, NOT a
+dumped-oracle rel-L2. SACRED-inert (shared `mla_attention` empty-diff; `test_deepseek_v4_dsa`
+still 13/13·38). CPU gate uses the Debug build (a pre-existing GCC-13 `-O2` `-Werror=array-bounds`
+false positive in `voxtral.cpp`, unrelated, breaks the `-O2` full-library build; the new TUs are
+`-Wall -Werror -Wextra`-clean). The full-model speed gate remains multi-Spark-blocked (156.7 GiB);
+MHC/MoE/device-kernel/forward-integration are named W5-W8 residuals. New kernel row
+`KERNEL-ATTN-DSA-COMPRESSOR` (`SPIKE`). No source/engine path touched.
+
 **KDA (Kimi Delta Attention) kernel delta W1 (2026-07-28, `CLAIM-KDA-KERNEL`, NOT
 pushed).** Disposition: **NOT APPLICABLE (correctness/kernel-primitive brick, host CPU
 reference + unit gate; no run, no download, no throughput number taken, claimed, or

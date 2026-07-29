@@ -310,7 +310,17 @@ the gate is honest hand-case + structural review, not a dumped-oracle comparison
 (the fixed-config 167B model cannot be built at a tiny shape). It is additive and
 byte-neutral for DeepSeek-V2. SGLang v0.5.15 registers and implements
 `DeepseekV4ForCausalLM` (the full DSA/MHC stack), so it is a viable second reference,
-subject to the same single-GB10 memory limit. The remaining bricks — Manifold
+subject to the same single-GB10 memory limit. **W4 attention primitives landed
+(2026-07-29):** the second half of the DSA stack is ported as portable host references
+and unit-gated — the DSA COMPRESSOR forward (the softmax-weighted window pool that
+compresses the KV-state window into one latent, computed per head-dim column, plus the
+fused save-time position-embedding add and the RMSNorm) and the fp8_ds_mla KV-cache
+state read/write layout (the compressed latent split into a 448-wide part quantized to
+FP8 with per-64 UE8M0 power-of-two block scales and a 64-wide RoPE part stored bf16, at
+a 576-byte token stride, plus the dequant read). `test_deepseek_v4_compressor` passes
+12/12 (hand-derived literal cases plus double-precision references plus an independent
+scale-byte recompute, RED-first proven); ported 1:1 from vLLM and cross-checked against
+SGLang, additive and byte-neutral for DeepSeek-V2. The remaining bricks — Manifold
 Hyper-Connections, the sqrtsoftplus/hash MoE, the device kernels, and the full model
 gate — stay multi-Spark-blocked.
 The
