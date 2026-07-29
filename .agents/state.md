@@ -32362,3 +32362,54 @@ GPU memory-halving path, DGX-blocked); the runner/spec integration (half-sized K
 `k_scale`/`v_scale` threading + `--kv-cache-dtype`/`--calculate-kv-scales`); fp8_e5m2 CPU compute +
 per-attention-head scales. W1 is a CPU correctness brick — the real memory/throughput WIN is the GPU
 path + halved-block runner integration. Not pushed; FULL SHA reported to the caller.
+
+---
+
+## 2026-07-29 — Plugin system W0 spike + W1 CPU brick (`CLAIM-PLUGIN-SYSTEM`, `ENG-PLUGIN-SYSTEM`)
+
+Isolated worktree `.claude/worktrees/plugin-system`, branch `feat/plugin-system`, base `main`
+`f3ecbe70` (confirmed via `git rev-parse HEAD`). CPU-only Release `-Werror` (`build-cpu`,
+`-DVLLM_CPP_CUDA=OFF`); no GPU/download (DGX offline). Additive-only; NOT pushed.
+
+**What.** Picked up the plugin-system RECORDS-GAP the feature-gap analysis named
+([vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md)) and CREATED the stable row
+`ENG-PLUGIN-SYSTEM`. W1 lands the plugin DISCOVERY + orchestration layer the existing registration
+seams lacked: `vllm::plugins::LoadGeneralPlugins()` (a 1:1 mirror of `load_general_plugins` —
+`plugins_loaded` load-once latch, the `VLLM_PLUGINS` allowlist parse incl. `""`→`{""}`→no plugin,
+per-plugin `try/catch` failure isolation) + the out-of-core general-plugin registration seam
+`RegisterGeneralPlugin` / the `REGISTER_VLLM_GENERAL_PLUGIN` macro (mirror of the
+`vllm.general_plugins` entry-point group) + the documented C-ABI entry-symbol contract
+`vllm_plugin_register` for a future dlopen loader. NEW `include/vllm/plugins/plugins.h` +
+`src/vllm/plugins/plugins.cpp` (+1 `CMakeLists.txt` source line).
+
+**C++ mechanism (recorded porting-inventory §9.11).** Pure C++20 has no Python entry points, so
+discovery is the project's static-init/`dlopen` registration idiom (the same `REGISTER_VLLM_MODEL` /
+`RegisterPlatform` / `RegisterOp` seams). The plugin system adds ONLY the discovery+orchestration
+layer; a general plugin's callback installs its out-of-tree contribution through the EXISTING public
+registries (`vllm::RegisterModel`, `RegisterPlatform`, the quant registry) with ZERO core edit. The
+BEHAVIOR is mirrored 1:1; only the transport differs — a legitimate mechanical divergence.
+
+**Extensibility proof + gate.** NEW out-of-core `tests/vllm/plugins/toy_model_plugin.cpp` registers a
+toy architecture through the public `vllm::RegisterModel` seam and publishes its `register()` callback
+via `REGISTER_VLLM_GENERAL_PLUGIN` — compiled ONLY into the test exe (never the library), so the
+counted 28-arch model registry the other suites assert is untouched. `tests/vllm/plugins/test_plugin_system.cpp`
+**1 case / 29 assertions GREEN**: RED-first — the toy arch throws "are not supported for now" before
+load AND under `VLLM_PLUGINS=""`, and resolves to the plugin factory ONLY after `LoadGeneralPlugins()`
+runs it (`VLLM_PLUGINS="register_toy_model"`); plus the allowlist gate, load-once idempotence (callback
+once per load; no duplicate arch across a reload), and failure isolation (a deliberately-throwing
+sibling plugin logged+skipped, good arch survives, load never throws). Ported from
+`tests/plugins_tests/test_oot_registration_offline.py:14-45`. Clean CPU full-library
+`-Wall -Wextra -Werror`. Record checkers rc=0.
+
+**Records:** NEW `ENG-PLUGIN-SYSTEM` engine row INVENTORIED→ACTIVE (rollup Engine-area 26→27 /
+Total 126→127, ACTIVE 11→12 / 44→45) + `check-agent-record.py` `ENGINE_ROWS` 126→127 with dated
+rationale (real new row); `CLAIM-PLUGIN-SYSTEM` claim row; feature-matrix plugin gap row
+RECORDS-GAP→ACTIVE; roadmap breadth; porting-inventory §9.11; docs/STATUS; docs/BENCHMARKS
+(NOT-APPLICABLE — startup discovery layer, no throughput owed); parity-ledger; this entry.
+
+**RESIDUALS (honest, named W2-W5 in the spec):** real `.so` `dlopen` + the C-ABI
+`vllm_plugin_register` entry (W2); the engine/CLI `--load-plugins` wiring that calls
+`LoadGeneralPlugins` from the construction paths (W3); the platform/quant plugin kinds (W4); the
+io_processor/stat_logger/endpoint plugin groups (W5). W1 is the general-plugin brick + the
+extensibility proof; LoadGeneralPlugins is not yet called from any production path (so every existing
+engine construction is byte-identical). Not pushed; FULL SHA reported to the caller.

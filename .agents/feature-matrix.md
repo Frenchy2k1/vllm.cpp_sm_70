@@ -32,8 +32,9 @@ our-status, effort, priority) in
 [specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md). Top
 HIGH misses: LoRA runtime, the pooling/embedding/rerank task class, AWQ+GPTQ
 compute, xgrammar, fp8-KV, reasoning parsers. Three MED gaps have no stable row
-yet (flagged below): generic draft-model/Medusa spec decode, offline Batch API,
-the plugin system. Confirmed NON-gap: vLLM has removed prompt adapters.
+yet (flagged below): generic draft-model/Medusa spec decode, offline Batch API
+(the plugin system RECORDS-GAP was picked up 2026-07-29 as `ENG-PLUGIN-SYSTEM`).
+Confirmed NON-gap: vLLM has removed prompt adapters.
 
 ---
 
@@ -236,7 +237,7 @@ is configured, exactly as upstream loads its draft model on demand.
 | `/v1/embeddings`, `/pooling`, `/score`, `/rerank` | pooling routers | ☐ T2 | with pooling models (§4) | `planned: specs/pooling-endpoints.md` |
 | `/v1/responses`, `/v1/messages` (Anthropic-style), audio | responses/messages routers | ☐ T2 | includes `/v1/responses`(+retrieve/cancel) `responses/api_router.py:48`, `/v1/messages`(+count_tokens) `anthropic/api_router.py:49`, and the audio `/v1/audio/{transcriptions,translations}` `speech_to_text/transcription/api_router.py:31` — we have Whisper/Voxtral encode+decode but the transcription ENDPOINT is unwired (`SERVE-RESPONSES-MESSAGES`) | `planned: specs/responses-messages-endpoints.md` |
 | Offline Batch API (`/v1/batches`, file runner) | `entrypoints/openai/run_batch.py:793` (`run_batch`); batched chat/embed/score/transcription/translation | ☐ **RECORDS-GAP** T2 | async bulk-job format with no stable row; recommend `SERVE-BATCH-API` on pickup (feature-gap sweep) | [specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md) |
-| Plugin system (general / io_processor / platform / endpoint plugins) | `plugins/__init__.py:18,77`; `plugins/io_processors/interface.py:19`; `plugins/endpoint_plugins/interface.py:43` | ☐ **RECORDS-GAP** T2 | entry-point-discovered extensibility seam; directly serves the extensibility-first priority (additive HW/models/endpoints). Recommend `ENG-PLUGIN-SYSTEM` on pickup | [specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md) |
+| Plugin system (general / io_processor / platform / endpoint plugins) | `plugins/__init__.py:18,77`; `plugins/io_processors/interface.py:19`; `plugins/endpoint_plugins/interface.py:43` | ◑ **ACTIVE** T2 (`ENG-PLUGIN-SYSTEM`) | ROW CREATED 2026-07-29 (`CLAIM-PLUGIN-SYSTEM`): `LoadGeneralPlugins()` + the out-of-core general-plugin registration seam over the existing `REGISTER_VLLM_MODEL`-style registries (1:1 `load_general_plugins`: load-once, `VLLM_PLUGINS` allowlist, failure isolation), unit-gated RED-first via a toy-model out-of-core plugin. Python entry points → C++ static-init/`dlopen` registration (porting-inventory §9). Residuals: real `.so` dlopen + the C-ABI `vllm_plugin_register` entry, engine/CLI `--load-plugins` wiring, platform/quant plugin kinds, io_processor/stat_logger/endpoint groups | [plugin-system.md](specs/plugin-system.md) (`ENG-PLUGIN-SYSTEM`) |
 | Sleep/pause/resume, profiling, RL weight-update endpoints | various | ☐ T2–T3 | | `planned: specs/admin-endpoints.md` |
 | OTLP tracing | `config/observability.py` | ☐ T2 | | `planned: specs/otlp-tracing.md` |
 

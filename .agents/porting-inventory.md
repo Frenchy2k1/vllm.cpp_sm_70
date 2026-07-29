@@ -815,6 +815,38 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     mirrored from source by reasoning and documented in `remote_protocol.h`; the
     hashes and framing themselves use the REAL Python codecs.
 
+11. **Plugin system: Python entry points → C++ static-init/`dlopen` registration
+    (2026-07-29, `ENG-PLUGIN-SYSTEM` / `CLAIM-PLUGIN-SYSTEM`) — legitimate
+    mechanical divergence, no behavioral change.** vLLM discovers plugins through
+    `importlib.metadata` entry points (`vllm/plugins/__init__.py:36-42`
+    `load_plugins_by_group` reads the `vllm.general_plugins` group; each entry
+    point resolves to a `register()` function `load_general_plugins` calls,
+    `:77-90`). Pure C++20 has no Python entry points, so the faithful analog is a
+    process-global REGISTRATION list an out-of-core translation unit or shared
+    object populates at load time — the SAME static-init idiom the project already
+    uses for models (`REGISTER_VLLM_MODEL`), platforms (`RegisterPlatform`), and
+    vt ops/backends (`RegisterOp`/`RegisterBackend`). The new
+    `include/vllm/plugins/plugins.h` / `src/vllm/plugins/plugins.cpp` add ONLY the
+    discovery+orchestration layer those seams lacked: `RegisterGeneralPlugin` /
+    `REGISTER_VLLM_GENERAL_PLUGIN` (the registration seam, mirror of an entry
+    point) and `LoadGeneralPlugins()` (mirror of `load_general_plugins` — the
+    `plugins_loaded` load-once latch `:33,82-85`, the `VLLM_PLUGINS` allowlist
+    `envs.py:1104-1108` parsed identically incl. `""`→`{""}`→no plugin, and the
+    per-plugin `try/catch` failure isolation `:68-72`). The BEHAVIOR is mirrored
+    1:1; only the transport (Python entry points vs C++ static-init/`dlopen`)
+    differs. A general plugin's callback installs its out-of-tree contribution
+    through the EXISTING public registries (`vllm::RegisterModel` for a model
+    factory — the C++ analog of `ModelRegistry.register_model`,
+    `registry.py:1039-1083` — `RegisterPlatform`, the quant registry), so the core
+    engine is untouched and byte-identical (W1 never calls `LoadGeneralPlugins`
+    from any production path; the engine/CLI `--load-plugins` wiring is a named W3
+    residual). The documented C-ABI entry symbol `vllm_plugin_register` is the
+    contract a future `dlopen`-based loader (W2) resolves so the static and dynamic
+    paths converge on one registration mechanism. Proven with a toy-model
+    out-of-core plugin compiled ONLY into the test executable (not the library, so
+    the counted 28-arch registry is untouched): `test_plugin_system` 1 case / 29
+    assertions, RED-first. Spec [specs/plugin-system.md](specs/plugin-system.md).
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

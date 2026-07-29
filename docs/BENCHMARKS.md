@@ -16,6 +16,25 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Plugin system W0 spike + W1 CPU brick (2026-07-29, `CLAIM-PLUGIN-SYSTEM`) - NOT-APPLICABLE (out-of-core registration/discovery layer; no throughput owed)
+
+Disposition: **NOT APPLICABLE** for a performance number. `ENG-PLUGIN-SYSTEM` is
+the plugin DISCOVERY + orchestration layer (`vllm::plugins::LoadGeneralPlugins()`
++ the out-of-core general-plugin registration seam over the existing
+`REGISTER_VLLM_MODEL`-style registries): it runs once at startup to install
+out-of-tree contributions, on no hot path and with no oracle-throughput axis to
+compare. Correctness is the whole gate, and RED-first: `test_plugin_system`
+(1 case / 29 assertions) proves a toy architecture registered by an OUT-OF-CORE
+plugin TU resolves ONLY after `LoadGeneralPlugins()` runs it (and not under
+`VLLM_PLUGINS=""`), plus the allowlist / load-once idempotence / failure-isolation
+mirrors of `load_general_plugins`. Repro (CPU): `cmake --build build-cpu --target
+test_plugin_system && ./build-cpu/tests/test_plugin_system`. The behavioral oracle
+is the ported offline OOT test (`tests/plugins_tests/test_oot_registration_offline.py`),
+matched posture not a golden. Residuals (no number owed until wired): real `.so`
+`dlopen` + the C-ABI `vllm_plugin_register` entry, the engine/CLI `--load-plugins`
+wiring, the platform/quant plugin kinds, the io_processor/stat_logger/endpoint
+groups.
+
 ## xgrammar structured-output backend W1 (2026-07-29, `CLAIM-TOOLS-XGRAMMAR`) - NOT-APPLICABLE (host-side masking correctness brick; no throughput owed)
 
 Disposition: **NOT APPLICABLE** for a performance number. Structured output is a
