@@ -331,16 +331,45 @@ std::vector<float> RmsNorm(const std::vector<float>& x, const std::vector<float>
 // Decoupled NeoX-free pairwise RoPE over an `r`-wide (r even) rope subvector
 // (common/rope.py deepseek_yarn, mscale disabled — the tiny forward uses a single
 // theta; the compressed-layer dual compress_rope_theta is a device-RoPE seam).
-void RopeInplace(float* v, int64_t r, int64_t pos, double theta) {
-  for (int64_t i = 0; i < r / 2; ++i) {
-    const double freq =
-        std::pow(theta, -2.0 * static_cast<double>(i) / static_cast<double>(r));
-    const double ang = static_cast<double>(pos) * freq;
-    const float c = static_cast<float>(std::cos(ang));
-    const float s = static_cast<float>(std::sin(ang));
-    const float a = v[2 * i], b = v[2 * i + 1];
-    v[2 * i] = a * c - b * s;
-    v[2 * i + 1] = a * s + b * c;
+// Per-layer YaRN RoPE over the last `r` dims of a head (GPT-J adjacent pairs). The
+// REAL DeepSeek-V4 uses a DUAL rope: dense layers (compress_ratio==0) rotate with
+// base=rope_theta, freq_scale=1, ext_factor=0 (== RopeInplace); COMPRESSED layers
+// (41 of 43) rotate with base=compress_rope_theta (160000), freq_scale=1/factor
+// (1/16) YaRN interpolation + the beta_fast/beta_slow correction-dim ramp. The net
+// magnitude scale is 1 (ds4 cancels the yarn mscale explicitly). 1:1 port of ds4
+// `ds4.c:rope_tail_ext_inplace` (+ `rope_yarn_corr_dim`/`rope_yarn_ramp`). Getting
+// this wrong scrambles the rope half of q·k on every compressed layer → the model
+// loses positional/context structure (degenerate repetition).
+double YarnCorrDim(int64_t n_dims, int64_t n_ctx_orig, double beta, double base) {
+  return static_cast<double>(n_dims) *
+         std::log(static_cast<double>(n_ctx_orig) / (beta * 2.0 * M_PI)) /
+         (2.0 * std::log(base));
+}
+void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq_scale,
+                      double ext_factor, int64_t n_ctx_orig, double beta_fast,
+                      double beta_slow) {
+  const double theta_scale = std::pow(base, -2.0 / static_cast<double>(r));
+  double corr_lo = 0.0, corr_hi = 0.0;
+  if (ext_factor != 0.0) {
+    corr_lo = std::max(0.0, std::floor(YarnCorrDim(r, n_ctx_orig, beta_fast, base)));
+    corr_hi = std::min(static_cast<double>(r - 1),
+                       std::ceil(YarnCorrDim(r, n_ctx_orig, beta_slow, base)));
+  }
+  double theta_extrap = static_cast<double>(pos);
+  for (int64_t i = 0; i < r; i += 2) {
+    const double theta_interp = freq_scale * theta_extrap;
+    double theta = theta_interp;
+    if (ext_factor != 0.0) {
+      const double y = (static_cast<double>(i / 2) - corr_lo) / std::max(0.001, corr_hi - corr_lo);
+      const double ramp = (1.0 - std::min(1.0, std::max(0.0, y))) * ext_factor;
+      theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
+    }
+    const float c = static_cast<float>(std::cos(theta));
+    const float s = static_cast<float>(std::sin(theta));
+    const float x0 = v[i], x1 = v[i + 1];
+    v[i] = x0 * c - x1 * s;
+    v[i + 1] = x0 * s + x1 * c;
+    theta_extrap *= theta_scale;
   }
 }
 
@@ -365,8 +394,22 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   const int64_t qlr = p.q_lora_rank;
   const float eps = p.rms_norm_eps;
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-  const bool is_indexer = p.has_indexer(layer);
-  const bool is_comp = p.has_compressor(layer);
+  // DSA sparse path (the compressor's separate compressed-KV cache + the indexer's
+  // learned top-k token selection) is implemented only at the COLLAPSED synthetic
+  // geometry, where the compressor projects to `head_dim`. At the REAL DeepSeek-V4
+  // geometry the compressor projects to `comp_width = 2*head_dim` (ds4
+  // `ds4.c:5016-5021`: `coff=2` for `compress_ratio==4`), so the tiny compressor/
+  // indexer code does not apply. The real keep-quant run therefore uses DENSE MLA —
+  // which is EXACT, not an approximation, whenever `seq_len <= index_topk` (=512):
+  // the indexer cannot select more tokens than exist, so top-k over ≤512 tokens IS
+  // the full causal set, and no raw row has yet been evicted into the compressed
+  // cache. Every short single-Spark step satisfies this. The full real-geometry DSA
+  // sparse path (compressor cache + indexer selection, for contexts > 512) is a
+  // NAMED residual. The host/device synthetic path (be.gguf==nullptr) keeps
+  // exercising the compressor/indexer primitives at their gated tiny shape.
+  const bool dsa_dense = (be.gguf != nullptr);
+  const bool is_indexer = p.has_indexer(layer) && !dsa_dense;
+  const bool is_comp = p.has_compressor(layer) && !dsa_dense;
 
   // 1. q [T,nh,hd] and raw kv latent [T,hd] (num_key_value_heads=1 MLA). The MLA
   //    linears (wq_a, wq_b, wkv) run the keep-quant GEMM (Gemm) — the whole batch
@@ -376,16 +419,27 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     const std::vector<float> n = RmsNorm(Slice(qa, t * qlr, qlr), L.q_norm_weight, eps);
     for (int64_t i = 0; i < qlr; ++i) qa[t * qlr + i] = n[static_cast<size_t>(i)];
   }
+  // Per-layer DUAL RoPE (ds4 layer_rope_freq_base/scale): compressed layers use
+  // base=compress_rope_theta + 1/factor YaRN interpolation; dense layers plain.
+  const bool rope_compressed = p.has_compressor(layer);
+  const double rope_base = rope_compressed ? p.compress_rope_theta : p.rope_theta;
+  const double rope_fscale =
+      (rope_compressed && p.rope_scale_factor > 1.0) ? 1.0 / p.rope_scale_factor : 1.0;
+  const double rope_ext =
+      (rope_compressed && p.rope_scale_factor > 1.0) ? 1.0 : 0.0;
+  auto rope_layer = [&](float* v, int64_t pos) {
+    RopeInplaceLayer(v, rope, pos, rope_base, rope_fscale, rope_ext, p.rope_orig_ctx,
+                     p.rope_beta_fast, p.rope_beta_slow);
+  };
   std::vector<float> q =
       Gemm(be, Lq != nullptr ? &Lq->wq_b : nullptr, L.wq_b, qa, T, nh * hd, qlr);
   for (int64_t t = 0; t < T; ++t)
     for (int64_t h = 0; h < nh; ++h)
-      RopeInplace(&q[t * nh * hd + h * hd + nope], rope,
-                  positions[static_cast<size_t>(t)], p.rope_theta);
+      rope_layer(&q[t * nh * hd + h * hd + nope], positions[static_cast<size_t>(t)]);
   std::vector<float> kraw = Gemm(be, Lq != nullptr ? &Lq->wkv : nullptr, L.wkv, x, T, hd, H);
   for (int64_t t = 0; t < T; ++t) {
     std::vector<float> kv = RmsNorm(Slice(kraw, t * hd, hd), L.kv_norm_weight, eps);
-    RopeInplace(&kv[nope], rope, positions[static_cast<size_t>(t)], p.rope_theta);
+    rope_layer(&kv[nope], positions[static_cast<size_t>(t)]);
     for (int64_t d = 0; d < hd; ++d) kraw[t * hd + d] = kv[static_cast<size_t>(d)];
   }
 
@@ -421,13 +475,25 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     if (trace != nullptr) trace->layer_compressor_ran[static_cast<size_t>(layer)] = 1;
   }
 
-  // 3. fp8_ds_mla KV-state round-trip — EXERCISE the paged cache layout (W4).
-  const Fp8DsMlaLayout ly = MakeFp8DsMlaLayout(nope, rope, /*quant_block=*/nope);
-  std::vector<float> deck(static_cast<size_t>(T) * hd);
-  for (int64_t t = 0; t < T; ++t) {
-    const auto tok = DispEncode(be, Slice(latent, t * hd, hd), ly);
-    const std::vector<float> dec = DispDecode(be, tok, ly);
-    for (int64_t d = 0; d < hd; ++d) deck[t * hd + d] = dec[static_cast<size_t>(d)];
+  // 3. KV state. The synthetic path round-trips through the fp8_ds_mla layout to
+  //    EXERCISE the paged-cache encoding (W4). The REAL keep-quant run uses the
+  //    latent DIRECTLY: MakeFp8DsMlaLayout quantizes the whole `nope` span (448 at
+  //    the real geometry) as ONE fp8 block — a single scale over 448 values, whose
+  //    dynamic-range loss corrupts the latent and degrades generation. Skipping it
+  //    is strictly MORE faithful (ds4 keeps per-sub-block KV-cache scales; matching
+  //    that block layout is a named residual). Position-precision for attention is
+  //    unaffected (dense recompute; no paged cache in the stateless run).
+  std::vector<float> deck;
+  if (dsa_dense) {
+    deck = latent;
+  } else {
+    const Fp8DsMlaLayout ly = MakeFp8DsMlaLayout(nope, rope, /*quant_block=*/nope);
+    deck.resize(static_cast<size_t>(T) * hd);
+    for (int64_t t = 0; t < T; ++t) {
+      const auto tok = DispEncode(be, Slice(latent, t * hd, hd), ly);
+      const std::vector<float> dec = DispDecode(be, tok, ly);
+      for (int64_t d = 0; d < hd; ++d) deck[t * hd + d] = dec[static_cast<size_t>(d)];
+    }
   }
 
   // 4. selection: DSA Lightning-Indexer top-k on indexer layers, else dense causal.
