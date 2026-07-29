@@ -136,6 +136,42 @@ TEST_CASE("qwen27 paged-engine greedy acceptance gate (dgx-only, 27B W4A4)") {
     return;
   }
 
+  // BUILD-CONFIGURATION PRECONDITION. The production continuation (tok6 == 198)
+  // is reachable ONLY from the full production kernel set: the CUTLASS sm120a
+  // NVFP4 fp4xfp4 GEMM plus the vendored Triton-AOT GDN kernels. Drop either and
+  // the engine silently falls back to the emulation-grade fp4 GEMM / hand GDN
+  // recurrence, which takes the OTHER side of the documented tok6 whitespace
+  // near-tie and emits the greedy_ids_emulation.npy stream. Measured on GB10
+  // sm_121a from ONE source tree (main d4492c03), three build arms:
+  //   CUTLASS off + Triton off -> 234/235 (tok6 271; tail differs at tok15)
+  //   CUTLASS on  + Triton off -> 233/235 (tok6 271; == greedy_ids_emulation)
+  //   CUTLASS on  + Triton on  -> 235/235 (tok6 198; the production stream)
+  // A mis-configured build must fail on its CONFIGURATION, not masquerade as a
+  // forward-pass regression on main (it already did, twice). This relaxes no
+  // assertion: the token comparison below is unchanged and still binding.
+#ifdef VLLM_CPP_CUDA
+  constexpr bool kCutlassNvfp4Compiled =
+#ifdef VT_CUTLASS_NVFP4
+      true;
+#else
+      false;
+#endif
+  constexpr bool kTritonAotCompiled =
+#ifdef VLLM_CPP_TRITON
+      true;
+#else
+      false;
+#endif
+  if (!kCutlassNvfp4Compiled || !kTritonAotCompiled) {
+    throw std::runtime_error(
+        "qwen27 paged-engine gate requires the production kernel build: "
+        "configure with -DVLLM_CPP_CUTLASS_DIR=<cutlass 4.5.0+> (defines "
+        "VT_CUTLASS_NVFP4) AND -DVLLM_CPP_TRITON=ON (vendored Triton-AOT GDN). "
+        "Without both, the 27B takes the emulation side of the tok6 near-tie "
+        "and this gate measures the build, not the code.");
+  }
+#endif
+
   // Run the DEFAULT production config with no tactic/kernel/dtype force.
   const std::string kPrompt = "The capital of France is Paris, and the";
   const fs::path golden = fs::path(PARITY_GOLDENS_DIR) / "qwen36_logits_27b";

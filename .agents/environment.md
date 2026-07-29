@@ -29,6 +29,22 @@ use only the current local host and mark unavailable hardware gates `PENDING`.
   never share a build tree between agents.
   - Non-interactive SSH does not put nvcc on PATH — prepend
     `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
+  - **MANDATORY gate-build flags on this box (re-proven 2026-07-29).** A model
+    gate configured WITHOUT `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` and
+    `-DVLLM_CPP_TRITON=ON` is NOT the production stack: cutlass-off silently
+    disables the sm120a NVFP4 fp4×fp4 GEMM *and* FlashAttention-2, triton-off
+    swaps the vendored Triton-AOT GDN kernels for the hand kernels. On the 27B
+    that flips the documented tok6 near-tie and turns the SACRED
+    `test_qwen27_paged_engine` red (234/235 or 233/235 vs 235/235) with the
+    source untouched — measured three-arm from ONE tree at main `d4492c03`. Hard-
+    verify the configure log prints `CUTLASS found … enabling sm120a NVFP4
+    cutlass GEMM`, `FlashAttention-2 prefill/decode: ENABLED`, and the
+    `Triton AOT: … <- vendored … sm_121a` lines before trusting any gate or A/B.
+    Never read the arch from `CMakeCache.txt` (`CMAKE_CUDA_ARCHITECTURES` there
+    legitimately reads `75`, the `enable_language(CUDA)` probe default shadowed
+    in `CMakeLists.txt`); read `VLLM_CPP_CUDA_ARCHITECTURES`, `flags.make`, or
+    `cuobjdump -lelf`. This defect has voided work three times (2026-07-16 ×2,
+    2026-07-28); the 27B gate now refuses to run without both flags.
   - Oracle venv: **PIN ADVANCED 2026-07-26** (see
     [specs/pin-advance.md](specs/pin-advance.md)). `~/venvs/vllm-oracle` is now a
     canonical symlink to the from-source **`~/venvs/vllm-oracle-next`** — the new

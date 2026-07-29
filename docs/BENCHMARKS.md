@@ -16,6 +16,41 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## 27B SACRED gate red-alarm RCA: build configuration, not a code regression (2026-07-29, `CLAIM-27B-GATE-RCA`) - NOT APPLICABLE (no kernel, dtype, or token changed)
+
+No benchmark is owed and none is claimed. `benchmark_binding=false`. A reported
+`test_qwen27_paged_engine` 234/235 on main, "diverging at index 6 (198 vs 271)",
+was reproduced and attributed to the BUILD, not to any commit. Measured on
+dgx.casa GB10 sm_121a from ONE source tree detached at main `d4492c03`, one flock,
+same 27B NVFP4 snapshot, three build arms:
+
+| Build arm | Result | tok6 | Stream |
+| --- | --- | --- | --- |
+| CUTLASS off, Triton off (as-found `build-cuda`) | 234/235 | 271 | emulation, tail differs at tok15 |
+| CUTLASS on, Triton off | 233/235 | 271 | exactly `greedy_ids_emulation.npy` |
+| CUTLASS on, Triton on (production) | **235/235, exit 0** | 198 | production `greedy_ids.npy` |
+
+The production arm passed four consecutive runs, including two with the NVFP4
+autotune plan cache deleted beforehand, so the result is not autotune-dependent.
+Reproduction (the mandatory flags, all of them):
+
+```
+cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DVLLM_CPP_CUDA=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_BUILD_TESTS=ON \
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON
+# configure MUST log "CUTLASS found ... enabling sm120a NVFP4 cutlass GEMM",
+# "FlashAttention-2 prefill/decode: ENABLED", and the Triton AOT vendored lines
+cmake --build build-cuda --target test_qwen27_paged_engine -j 16
+flock $HOME/gpu.lock build-cuda/tests/test_qwen27_paged_engine
+```
+
+The gate now enforces this itself: a CUDA build lacking `VT_CUTLASS_NVFP4` or
+`VLLM_CPP_TRITON` fails on the configuration with a message naming the missing
+flags, rather than emitting a token diff that reads as a forward-pass regression.
+No assertion was relaxed. This is the third time the same missing-`CUTLASS_DIR`
+configure has voided work (see the two 2026-07-16 parity-ledger rows).
+
 ## AWQ + GPTQ native quant W0 spike + W1 CPU dequant (2026-07-28, `CLAIM-QUANT-AWQ-GPTQ`) - NOT-APPLICABLE (CPU dequant primitive, no throughput owed)
 
 No benchmark. W1 lands the INT4 unpack+dequant-to-bf16 CPU primitive for AWQ and

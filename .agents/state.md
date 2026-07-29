@@ -31253,3 +31253,75 @@ resident loader → bf16 expand + CPU dense `E`; W4 Marlin repack+GEMM GPU `C`/`
 (kernel-matrix row, bump the KERNEL constant, coordinate before touching shared
 `marlin_template.h`); W5 GPTQ 8/2/3-bit; W6 AWQ/GPTQ MoE. Upstream e2e tests
 (`test_auto_awq.py`/`test_auto_gptq.py`) named, to be checked in SKIPPED at W3.
+
+## 2026-07-29 — 27B SACRED gate red alarm: REPRODUCED, ATTRIBUTED TO THE BUILD, gate GREEN at main `d4492c03` (`CLAIM-27B-GATE-RCA`)
+
+Tree: dgx.casa `~/wk-mtp-gguf` detached at main `d4492c03` (`git rev-parse HEAD`
+= `d4492c03839d4f71fe0d96a4af5095b8fa91f2cd`); the axis-B WIP that tree carried
+was parked as `git stash@{0}` "axis-B WIP parked by regression-hunt agent" and
+restored afterwards. All GPU runs under `flock $HOME/gpu.lock`. Records + one
+test-file precondition; NOT pushed.
+
+**The alarm.** The 2026-07-28 `SPEC-DFLASH-GGUF` GD5-GD8 entry above flagged
+`test_qwen27_paged_engine` at **234/235**, "diverges at index 6 (`198` vs `271`)",
+red on committed main at `384d5b83`, and asked for an owner. It is reproduced
+exactly, and it is **NOT a code regression on main**. No commit is at fault, so
+no bisect was needed and none is claimed.
+
+**What it actually is.** The 27B production continuation (`greedy_ids.npy`,
+tok6 = 198) is reachable only from the FULL production kernel set. The as-found
+`~/wk-mtp-gguf/build-cuda` was configured with neither
+`-DVLLM_CPP_CUTLASS_DIR` nor `-DVLLM_CPP_TRITON=ON`, so its configure log says
+`CUTLASS not found / no CUTLASS-dependent feature for this arch; NVFP4 GEMM +
+FA2 disabled` and it links the hand GDN kernels instead of the vendored
+Triton-AOT FLA kernels. That build takes the OTHER side of the tok6 whitespace
+near-tie that `.agents/specs/qwen27b-w4a4-notes.md` §7.7 documented on hardware
+(vLLM's own emulation yields 271, only its native fp4 kernel yields 198) and that
+`tests/parity/test_qwen27_paged_engine.cpp` already names in the
+`kW4A4ForwardReady` comment (f32/emulation branch vs the shipping production
+chain). The sub-agent's `git stash` control was sound about the SOURCE and blind
+to the BUILD: both arms of its control shared the same defective configure.
+
+**Three-arm measurement, ONE source tree, same snapshot, same flock, main
+`d4492c03`:**
+
+| Build arm | ctest result | tok6 | got |
+| --- | --- | --- | --- |
+| CUTLASS off, Triton off (as-found) | 234/235, exit 1 | 271 | emulation stream, tail differs at tok15 (`11751` vs `271`) |
+| CUTLASS on, Triton off | 233/235, exit 1 | 271 | EXACTLY `greedy_ids_emulation.npy`, so `got != want_emu` fails too |
+| CUTLASS on, Triton on | **235/235, exit 0** | 198 | production `greedy_ids.npy`, 16/16 token-exact |
+
+Cutlass alone is NOT enough; it moved the run one assertion further from green.
+Adding `-DVLLM_CPP_TRITON=ON` (57 vendored `sm_121a` artifacts already in-tree,
+no Python) closed it. Triton-on-cutlass-off was not measured and is not claimed.
+
+**Not autotune flake.** The NVFP4 tactic plans are autotuned by timing and cached
+under `~/.cache/vllm.cpp/nvfp4_autotune/...` keyed by build id, and the Jul-18
+cache and today's disagree on many tactic ids, so autotune drift was a live
+hypothesis. It is refuted: the production arm passed **four consecutive runs**,
+two of them with the whole cache directory removed first (forcing a fresh cold
+tune each time). Evidence `dgx:~/rg_tactic_probe.log`, `~/rg_final_green.log`,
+`~/rg_guard_green.log`; the red arms are `~/rg_run_nocutlass.log` and
+`~/rg_rerun.log`.
+
+**The fix is a precondition, not a repair.** There is nothing to repair in the
+engine. `tests/parity/test_qwen27_paged_engine.cpp` now refuses to run a CUDA
+build missing `VT_CUTLASS_NVFP4` or `VLLM_CPP_TRITON` and names the two configure
+flags. Both `constexpr` arms compile in the production build (verified: clean
+`-Werror` rebuild, gate still **235/235**, exit 0). No assertion was relaxed, no
+checker weakened; a mis-configured build now fails on its configuration instead of
+producing a token diff that reads as a forward-pass regression. The same
+missing-`CUTLASS_DIR` configure has now voided work three times (two 2026-07-16
+ledger rows, plus this one), so `.agents/environment.md` carries the mandatory
+flags and the hard configure-log verification in the dgx profile.
+
+**Consequences for other rows.** `SPEC-DFLASH-GGUF`'s gate 1 (spec-OFF
+byte-identical, 27B 235/235) is satisfiable again and is not blocked by this; the
+rows that assert inertness against this gate may cite it, provided they cite a run
+from a build carrying BOTH flags. This entry does NOT re-run those rows' gates and
+does not advance any of their states.
+
+**Explicitly NOT chased, still open, still pre-existing:** `test_capi` SIGSEGV at
+`tests/capi/test_capi.cpp:410` (ABI v8 logits processor) and
+`test_model_loader_gguf` 2/3 (hard-coded registered-architecture list, since
+grown). Neither was touched.

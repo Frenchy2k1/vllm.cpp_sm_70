@@ -954,6 +954,19 @@ The protocol is in [`.agents/gates.md`](../.agents/gates.md) and
 their fusable add+RMSNorm glue through the portable fusion catalog rather than
 hand-fusing it.
 
+**The 27B SACRED gate needs the production kernel build, and now says so.** The
+27B W4A4 acceptance gate (`tests/parity/test_qwen27_paged_engine.cpp`) reproduces
+the oracle's production continuation only when the binary carries BOTH the CUTLASS
+sm120a NVFP4 fp4xfp4 GEMM (`-DVLLM_CPP_CUTLASS_DIR=<cutlass 4.5.0+>`) and the
+vendored Triton-AOT GDN kernels (`-DVLLM_CPP_TRITON=ON`). Drop either and the
+engine falls back to the emulation-grade fp4 GEMM / hand GDN recurrence, which
+deterministically takes the other side of the documented tok6 whitespace near-tie
+and emits the `greedy_ids_emulation.npy` stream. Measured 2026-07-29 on GB10
+sm_121a from ONE source tree at main `d4492c03`: CUTLASS off + Triton off 234/235,
+CUTLASS on + Triton off 233/235, both on **235/235**. The gate now refuses to run
+in a build missing either flag and names the configuration, instead of reporting a
+token regression that is not there. The gate's own status is UNCHANGED and GREEN.
+
 ### Feature-gap map vs pinned vLLM 0.26 (2026-07-28)
 
 A whole-surface sweep of pinned vLLM `555967922` (0.26.0.dev0) against our
