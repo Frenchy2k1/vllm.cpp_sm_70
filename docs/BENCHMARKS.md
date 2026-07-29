@@ -18,6 +18,8 @@ periods, parentheses, or hyphens), matching the README.
 
 ## DeepSeek-V4-Flash W2c - forward rewired onto the keep-quant tower (2026-07-29, `CLAIM-DEEPSEEK-V4-W2C`) - NOT-APPLICABLE (memory-enabler code brick; no throughput owed) / real run PENDING (W8-run, now memory-FEASIBLE)
 
+**W8-run status (2026-07-29): ATTEMPTED, HARDWARE-BLOCKED (not run, nothing faked).** The code is complete and memory-feasible @ `2936ff70` (keep-quant forward, ~93.9 GiB < the 119 GiB pool). The operational run (download ~91 GB `UD-IQ2_XXS`, keep-quant load, greedy generate, self-consistency + coherence gate, TPOT/throughput/peak-mem benchmark) could NOT start: the **DGX GB10 (`dgx.casa`/192.168.68.128) is OFFLINE** - `ping` 5/5 loss, ARP FAILED, SSH `No route to host`, while the gateway/Thor/mac-mini respond (DGX-specific, powered off or crashed per the OOM-reboot history). No out-of-band wake path from the dev box. **Resume: bring the DGX back online, then re-run the W8-run recipe below - no code change needed.** DeepSeek-V4 row stays SPIKE (no run, no benchmark).
+
 W2c fixes the OOM that blocked the single-Spark run: `LoadDeepseekV4FromGguf` no longer
 f32-expands the big MLA/MoE/lm_head weights, and `DeepseekV4ForwardGguf` consumes the
 COMPRESSED `weights.gguf` blocks in place via `vt::MatmulBT`->the CPU `kMatmulBTQuant` CIQ

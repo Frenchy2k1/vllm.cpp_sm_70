@@ -32262,3 +32262,18 @@ no download/GPU this lane.
 **Records same-change:** model-matrix (DeepSeek-V4 cell extended, stays `SPIKE`), coordination
 (`CLAIM-DEEPSEEK-V4-W2C` row), spec §W2c, feature-matrix, STATUS, BENCHMARKS, roadmap_v1, parity-ledger,
 this state entry.
+
+## 2026-07-29 — DeepSeek-V4-Flash W8-run: ATTEMPTED, hardware-blocked (DGX GB10 offline)
+
+DeepSeek-V4-Flash bring-up is **code-complete + memory-feasible** @ `2936ff70`: the full
+forward (W3-W7 host + W7-device CUDA GB10-gated), keep-quant vec_dot (IQ2_XXS/IQ3_XXS/Q2_K),
+GGUF name-map (1328/1328), W2b tower materialization, W8-final `deepseek4` entrypoint arm, and
+W2c (the forward reads the keep-quant tower — projected residency ~93.9 GiB < the 119 GiB pool,
+the ~1 TiB f32 OOM fixed). All unit/structural-gated, RED-first, no shared-path regression.
+The ONLY remaining is the operational run. It was attempted 2026-07-29 and is **hardware-blocked**:
+the DGX GB10 (`dgx.casa`) is OFFLINE (ping 5/5 loss, ARP FAILED, SSH no-route; gateway/Thor/mac-mini
+up ⇒ DGX-specific, down/crashed). No wake path from the dev box. **Nothing false was landed** — the
+model did NOT generate, no benchmark, the DeepSeek-V4 model-matrix row stays SPIKE. **Resume when the
+DGX is back:** re-dispatch the W8-run (free box → download ~91 GB UD-IQ2_XXS → keep-quant load [assert
+resident ≈ 91-94 GiB, the W2c VT_CHECK must not fire] → greedy generate → self-consistency + coherence
+gate → TPOT/throughput/peak-resident benchmark vs llama.cpp-on-card). No code change needed.
