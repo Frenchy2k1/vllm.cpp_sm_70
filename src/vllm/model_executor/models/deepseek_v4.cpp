@@ -232,7 +232,10 @@ std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
   if (be.gguf != nullptr && wq != nullptr && !wq->Empty()) {
     VT_CHECK(be.q != nullptr, "deepseek-v4 keep-quant GEMM needs a queue");
     VT_CHECK(wq->rank == 2 && wq->shape[0] == N && wq->shape[1] == K,
-             "deepseek-v4 keep-quant GEMM: weight shape mismatch");
+             "deepseek-v4 keep-quant GEMM: weight shape mismatch: want [N=" +
+                 std::to_string(N) + ",K=" + std::to_string(K) + "] got [" +
+                 std::to_string(wq->shape[0]) + "," + std::to_string(wq->shape[1]) +
+                 "] rank=" + std::to_string(wq->rank));
     std::vector<float> out(static_cast<size_t>(T) * N);
     vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()),
                                           vt::DType::kF32, be.q->device, {T, K});

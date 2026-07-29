@@ -10,6 +10,12 @@ add_executable(dequant_nvfp4 dequant_nvfp4/main.cpp)
 target_link_libraries(dequant_nvfp4 PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(dequant_nvfp4)
 
+# deepseek-v4-gen: the single-Spark DeepSeek-V4-Flash keep-quant GGUF greedy
+# generation driver (the W8-run vehicle — stateless full-recompute greedy loop).
+add_executable(deepseek-v4-gen deepseek_v4_gen/main.cpp)
+target_link_libraries(deepseek-v4-gen PRIVATE vllm::vllm)
+vllm_cpp_set_warnings(deepseek-v4-gen)
+
 # vllm-bench (M2.1): the throughput/latency benchmark harness — the gate-#1
 # measurement tool. Links the full C++ engine (vllm::vllm) so it can build both a
 # synthetic CPU engine (no --model) and a real loaded engine (--model on dgx).

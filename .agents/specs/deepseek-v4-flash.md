@@ -1254,3 +1254,41 @@ loop over the SAME file (assert peak resident ≈ 81-84 GiB keep-quant, NOT f32-
 token cross-check (prefix agreement / first divergence) + self-consistency + prefill/gen tok/s (expect
 ds4 faster: its experts run on the GPU, ours are CPU-tier on the 20 ARM cores — no CUDA keep-quant
 vec_dot exists; report the ratio with that attribution). Row stays `SPIKE` (no tokens generated).
+
+### W8-run.4 The RUN EXECUTED on the DGX GB10 — LOAD proven, forward HARD-FAILS at real geometry (2026-07-29, base `858b0b15`, NOT pushed)
+Everything up to the forward now runs on the REAL model. Delivered this pass (fresh worktree
+`/home/mudler/_git/vllm.cpp-w8run`, branch `deepseek-v4-w8-run-real`):
+- **Download + integrity:** the 80.7 GB ds4 `q2-imatrix` file downloaded to the DGX; size
+  **86,720,111,488 B == the HTTP Content-Length** (verified).
+- **Greedy driver (new code):** `examples/deepseek_v4_gen/main.cpp` — loads the keep-quant tower,
+  greedily generates by a STATELESS full-recompute loop over `DeepseekV4ForwardGguf` (argmax the
+  last-row logits, append), reports prefill/decode tok/s + peak resident (VmHWM), supports
+  `--token-ids` injection. `Tokenizer::FromGguf` relaxed to map `pre="joyai-llm"`→Llama-3 byte-level
+  (Decode is vocab-exact). Both built CPU-only (keep-quant is CPU-tier, so byte-identical to a CUDA
+  build) + ds4 built `make cuda-spark`.
+- **ds4 reference (GB10 GPU):** loads 80.76 GiB in ~20-29 s; greedy `--temp 0` on the prompt (its chat
+  template → 14 input tokens) → **"We need to answer: 'The capital of France is'. This is a
+  straightforward"** (coherent); `ds4-bench` ctx=1024/gen=32 → **prefill 358.4 tok/s, decode
+  16.5 tok/s, first-token 76.3 ms**. ds4's raw prompt tokenization: `[671,6102,294,8760,344]`.
+- **Our LOAD — SUCCEEDS:** 43 layers, 256 experts, vocab 129280, `has_gguf_weights=1`, all 1328
+  tensors accounted, ~78 s. **PEAK RESIDENT 116.2 GiB** — fits under 119 GiB but ~32 GiB ABOVE the
+  projected ~84 GiB: `deepseek_v4_weights.cpp` calls `OwnGgufQuantBlocks` WITHOUT `mmap_src`, so it
+  COPIES ~81 GiB of blocks into owned vectors while the mmap pages stay resident. **FIX:** thread an
+  mmap-view source through (as `qwen3_5_gguf_weights.cpp:214` `MmapSrc(g,pol)` does) so the blocks are
+  referenced in place → peak ≈ 84 GiB + safe headroom.
+- **Our FORWARD — HARD-FAILS (exact error, real bug):** `deepseek-v4 keep-quant GEMM: weight shape
+  mismatch: want [N=512,K=4096] got [1024,4096]` (`deepseek_v4.cpp:234`), at **layer 2 (the first DSA
+  compressor layer)**. The W3-W7 forward composition — gated ONLY at a tiny synthetic shape where the
+  dims collapse — conflates `head_dim` (512) with the DSA compressor's distinct output dim. Real MLA
+  dims (from the file header): `attn_q_a [1024,4096]`, `attn_q_b [32768,1024]` (=nh·hd×qlr, hd=512),
+  `attn_kv [512,4096]`, but `attn_compressor_gate`/`attn_compressor_kv` are **`[1024,4096]`** and
+  `comp_wgate`'s `Gemm(..., N=hd=512, H)` therefore mismatches. Layers 0-1 (non-compressor hash
+  layers) pass. **NO coherent tokens generated.**
+
+**Named residual (the one remaining brick):** rework the MLA/DSA forward to the REAL DeepSeek-V4-Flash
+geometry against a reference (vLLM `deepseek_v4` / ds4 source) — the compressor projects to 1024
+(not `head_dim`); the grouped output-LoRA (`o_groups=8`) and DSA indexer (`inh=64`,`ihd=128`) must be
+audited at real dims too — plus the mmap-view load fix above. The download, keep-quant load, tokenizer,
+greedy driver, and ds4 oracle are all DONE; the real-geometry forward is what stands between here and a
+coherent single-Spark generation. The 80.7 GB file is retained on the DGX at
+`$HOME/w8run/ds4/gguf/…` (no re-download needed). Row stays `SPIKE`.
