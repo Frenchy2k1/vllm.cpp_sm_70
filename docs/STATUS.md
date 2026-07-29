@@ -365,6 +365,14 @@ keep-quant `UD-IQ2_XXS` ~91 GiB + small host < 3 GiB = memory-FEASIBLE on ONE GB
 real 91 GB run (download + GB10 generate + benchmark) stays the operational W8-run, now
 memory-feasible. SACRED-inert: only the V4 forward/loader + its test changed; the W3-W6
 primitive tests (the correctness oracle) are untouched and still pass.
+**W8-run ATTEMPTED 2026-07-29 — HARDWARE-BLOCKED (not run, nothing faked):** with the code
+complete + memory-feasible @ `2936ff70`, the operational run could not start because the
+**DGX GB10 (`dgx.casa`) is OFFLINE** (ping 5/5 loss, ARP FAILED, SSH no-route; gateway/Thor/
+mac-mini up ⇒ DGX-specific, down or crashed). No out-of-band wake path from the dev box.
+The DeepSeek-V4 row stays SPIKE (no run, no benchmark). Resume: bring the DGX back online and
+re-run the W8-run recipe (free box → download ~91 GB `UD-IQ2_XXS` → keep-quant load [assert
+resident ≈ 91-94 GiB, the W2c `VT_CHECK` must not fire] → greedy generate → self-consistency +
+coherence gate → TPOT/throughput/peak-resident benchmark). No code change needed.
 **W3 attention primitives landed
 (2026-07-28):** the genuinely-new-vs-V2/V3 math is ported as portable host references
 and unit-gated — the DSA "Lightning Indexer" sparse top-k SELECTION (a weighted
