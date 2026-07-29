@@ -1010,6 +1010,10 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   the true W4A4 kernels; the two containers' own spec-OFF streams diverge at
   index 4 on the first prompt and index 16 on the second, with no speculation
   anywhere, and the DFlash-ON pair tracks that.
+  Operational note for anyone re-running the axis-B arm: it peaks at ~81 GiB RSS
+  against GB10's 119 GiB unified pool, so a run launched on top of a large page
+  cache can fail with `vt cuda: embedding: out of memory`. That is contention,
+  not a result; on a settled box the arm reproduces its numbers exactly.
   **Both axes are now gated and closed** (gates 1-5 and 7 of the spike), so the
   row moved `PARTIAL` -> `DONE` for correctness in closing commit `c62f2fa3`.
   What remains open is deliberately NOT this row's: no speed A/B is owed until a

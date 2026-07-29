@@ -309,6 +309,17 @@ VLLM_DFLASH_MAX_TOKENS=24 VLLM_DFLASH_PROMPT="..." \
 `VT_SPEC_TRACE=1` turns on the per-block propose/accept trace added by `GD9`; it
 was not needed here, because the aggregate counts were already decisive.
 
+**Reproduction caveat, observed and recorded rather than smoothed over.** The
+axis-B case peaks at ~81 GiB RSS against GB10's 119 GiB unified pool, so it is
+sensitive to whatever else holds that pool. A confirmation re-run launched
+immediately after an axis-A run, with ~49 GiB sitting in page cache, threw
+`vt cuda: embedding: out of memory` during the DFlash-ON arm (4/4 assertions
+passed, then the case threw). Re-run on the settled box it is **9/9 assertions,
+exit 0, DFlash-ON IDENTICAL to spec-OFF, acceptance 14/160**, reproducing the
+table above exactly, 5m35.09s, 81.14 GiB peak. The OOM is a contention event,
+not a result: no number from it is published, and none of the numbers above come
+from a contended run.
+
 **Row closure.** With gates 1-5 and 7 met, `SPEC-DFLASH-GGUF` moved `PARTIAL` ->
 `DONE` for correctness, closing commit `c62f2fa3`, ledger
 [`parity-ledger.md`](../.agents/parity-ledger.md#L845).

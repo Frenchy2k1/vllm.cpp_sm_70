@@ -32844,3 +32844,21 @@ carries that disposition with its reproduction command.
 
 Work is LOCAL ONLY. Nothing pushed; `feat/capi-abi-v9-engine-config` remains
 ahead of its remote.
+
+## 2026-07-29 — `SPEC-DFLASH-GGUF` post-closure: an axis-B reproduction caveat, recorded
+
+Confirming the committed source on dgx, an axis-B re-run launched immediately
+after an axis-A run threw `vt cuda: embedding: out of memory` in the DFlash-ON
+arm (4/4 assertions passed, then the case threw). Cause is memory pressure, not
+a regression: the case peaks at ~81 GiB RSS against GB10's 119 GiB unified pool,
+and ~49 GiB was sitting in page cache from the model files the preceding run had
+touched. Re-run on the settled box it is 9/9 assertions, exit 0, DFlash-ON
+IDENTICAL to that target's spec-OFF, acceptance 14/160 - reproducing the recorded
+number exactly - 5m35.09s, 81.14 GiB peak.
+
+Recorded because it is a real reproduction constraint for anyone re-running the
+axis-B arm, and because the OOM is a contention event whose numbers are void by
+protocol. No published number in this row comes from a contended run. The
+axis-A cross-FORMAT arm was re-confirmed on the same committed binary in the same
+sitting: 47/96 both drafts, tokens IDENTICAL, CROSS-FORMAT arm selected, 17/17,
+exit 0.
