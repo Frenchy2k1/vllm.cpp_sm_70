@@ -168,3 +168,17 @@ NVFP4 tensors across both containers), `test_gguf_keep_quant` 37/5985, `test_ggu
 30/103, `test_gguf_dequant` 15/480, `test_gguf_qwen36_loader` 6/286 — every one
 rc=0. Box idle throughout (3-4 GiB used at series start and end, no CUDA compute
 apps); `/` at 92% before and after; no doctest `-s`.
+
+### C.4 What this run does NOT cover
+
+**The MoE (35B) arm is code-complete and UNVERIFIED.** `OwnGgufNvfp4Experts` and
+the per-expert `<stem>.scale` slab handling are wired and covered by the routing
+unit tests, but no 35B NVFP4 GGUF was loaded or run on hardware. It exists
+because without it a 35B NVFP4 GGUF load would throw inside `OwnGgufKeptSlice`
+rather than expand. `test_qwen36_paged_engine` (315/315 above) is the 35B
+SAFETENSORS gate and does not exercise this path. Treat the MoE arm as a gap,
+not as support; the asset is `~/bench/q36-35b-a3b-nvfp4.gguf` and the next brick
+is a load + generate run against it.
+
+Also uncovered: a serving-throughput arm (tokens/s, TTFT, TPOT at concurrency)
+against the vLLM oracle, which is why `P` stays `-`.

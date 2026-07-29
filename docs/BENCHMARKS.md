@@ -3946,6 +3946,11 @@ without re-deriving numerics: the ggml type-40 blocks repack into exactly the
       test_nvfp4_dequant 4/47, test_gguf 30/103, test_gguf_dequant 15/480,
       test_gguf_keep_quant 37/5985, test_gguf_qwen36_loader 6/286
 
+**Not covered by this run:** the MoE (35B) NVFP4-GGUF expert arm is wired and
+unit-covered but was never loaded on hardware, so it carries no number and no
+support claim; and no serving-throughput arm exists, which is why `P` stays
+`-`.
+
 Reproduction entry point:
 
     ~/work/nvfp4-c/run_ab3.sh          # the A/B series above, one flock
