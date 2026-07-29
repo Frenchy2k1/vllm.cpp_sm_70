@@ -903,8 +903,8 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   the true W4A4 kernels - the two diverge at token 4 with no speculation
   anywhere. Axis B re-measured 2026-07-29 on the production build with every
   number unchanged (24/24 identical, 14/160, divergence still at index 4, 15/15
-  assertions, exit 0), so it is the half of this row that a correct build
-  confirms.
+  assertions, exit 0, 81.01 GiB peak RSS), so it is the half of this row that a
+  correct build confirms.
   Still `PARTIAL`, and now for one more reason: axis B is measured on one prompt
   at concurrency 1, the acceptance characteristic above is understood but not
   addressed, axis A's cross-format accept-count bar is RED on the 48-token prompt

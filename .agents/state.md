@@ -32012,7 +32012,7 @@ re-anchored.
 
 **What DID move is the 24-token text, and it kills the recorded CPU-vs-GPU
 narrative.** The probe (`VLLM_MTP_GGUF_PROBE=1`, GPU then `CUDA_VISIBLE_DEVICES=`,
-484/484 assertions each, GPU 85928 MiB-class 1:52.93, CPU 1:43.79) gives:
+484/484 assertions each, GPU 90109980 KiB = 85.94 GiB in 1:52.93, CPU 68484280 KiB = 65.31 GiB in 1:43.79) gives:
 
     position 1, production build   GPU rank1 11 -0.763897  rank2 13 -0.824083
     position 1, production build   CPU rank1 11 -0.765499  rank2 13 -0.830374
@@ -32044,7 +32044,7 @@ Target(s) `~/bench/q36-27b-nvfp4-vllm` (safetensors) and
 **Axis B (`-tc="dflash axis-B*"`): 15/15 assertions, exit 0.** GGUF-target
 DFlash-ON token-identical to that same target's spec-OFF 24/24; acceptance
 **14/160**, unchanged; cross-target spec-OFF divergence still at index 4;
-84945448 KiB (81.0 GiB), 6:53.08. Every axis-B number reproduced.
+84945448 KiB (81.01 GiB), 6:53.08. Every axis-B number reproduced.
 
 **Axis A (`-tc="dflash axis-A*"`):**
 
