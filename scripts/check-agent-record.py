@@ -116,9 +116,20 @@ MATRICES = {
     # ports of ggml `vec_dot_q2_K/iq2_xxs/iq3_xxs_q8_K_generic`; gated 19 cases /
     # 130444 assertions, RED-first proven. `SPIKE`, `CLAIM-DEEPSEEK-V4-W8`, spec
     # specs/deepseek-v4-flash.md §W8).
+    # 45 since 2026-07-29: +`KERNEL-QUANT-CIQ-GEMM-CUDA` (the FIRST CUDA keep-quant
+    # GGUF k-quant GEMM — the kCUDA provider for `kMatmulBTQuant`. MMVQ-style
+    # dequant-in-kernel dot: quantize the activation to Q8_K on-GPU, integer-dot
+    # against the compressed Q8_K-family weight blocks (IQ2_XXS/IQ3_XXS/Q2_K +
+    # Q3_K/Q4_K/Q5_K/Q6_K) kept COMPRESSED in the unified pool. Registering it flips
+    # GgufQuantComputeAvailable TRUE on kCUDA so DeepSeek-V4's routed experts run on
+    # the GPU instead of the 20 ARM cores. A NEW kernel family — the CPU
+    # KERNEL-QUANT-CIQ-IQUANT vec_dot is a separate row/impl. RUNTIME-VERIFIED on
+    # the DGX GB10: 2/2 cases · 92401 assertions vs the CPU oracle + f64 dequant,
+    # memcheck 0, RED-first proven. `ACTIVE`, `CLAIM-CUDA-KEEPQUANT-GEMM`, spec
+    # specs/deepseek-v4-flash.md §W8.)
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 44),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 45),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

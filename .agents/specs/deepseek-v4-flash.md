@@ -973,10 +973,22 @@ routed experts are **IQ2_XXS** (`ffn_gate_exps`/`ffn_up_exps`) + **IQ3_XXS** (`f
 is the sibling `UD-Q2_K_XL` vehicle, NOT in the IQ2_XXS build. IQ3_XXS is therefore an EQUAL gating
 prerequisite (without it `ffn_down_exps` alone OOMs). All three landed so both vehicles keep-quant.
 
-**HONEST finding on "the CUDA path":** there is NO CUDA keep-quant `vec_dot` for ANY k-quant —
-`kMatmulBTQuant` is registered on `kCPU` alone (verified: no CUDA vec_dot/mmvq/mmq in `src/vt/cuda`).
-Keep-quant is a CPU-tier feature; on GB10 it runs on the 20 ARM cores against the unified pool, so
-IQ2_XXS/IQ3_XXS/Q2_K match the six existing k-quants exactly. Extending "the CUDA path" is N/A.
+**CUDA path — SUPERSEDED 2026-07-29 by `KERNEL-QUANT-CIQ-GEMM-CUDA` (`CLAIM-CUDA-KEEPQUANT-GEMM`).**
+The W8 finding above ("keep-quant is CPU-tier only; on GB10 it runs on the 20 ARM cores") is now
+CLOSED: the row `KERNEL-QUANT-CIQ-GEMM-CUDA` adds the FIRST CUDA keep-quant GGUF k-quant GEMM, a
+kCUDA provider for `kMatmulBTQuant` (`src/vt/cuda/cuda_quant_dot.cu`). It is MMVQ-style: quantize the
+activation tile to Q8_K on-GPU, then integer-dot it against the compressed weight blocks
+(dequant-in-kernel via the block scales/codebook), warp-per-output, weights kept COMPRESSED in the
+unified pool (no bf16 expansion). It covers the whole Q8_K family (IQ2_XXS/IQ3_XXS/Q2_K + the four
+other k-quants); it is a 1:1 numeric port of the landed CPU oracle (`cpu_quant_dot.cpp` /
+`cpu_quant_act.cpp`), NOT a copy of llama.cpp's Q8_1-based CUDA mmvq (which would not reproduce our
+Q8_K CPU reference). **Registering it flips `GgufQuantComputeAvailable` TRUE on `kCUDA`**, so on a
+CUDA runner the loader keeps blocks compressed and `vt::MatmulBT`→`kMatmulBTQuant` dispatches to the
+GPU — DeepSeek-V4's experts move OFF the ARM cores. **RUNTIME-VERIFIED on the DGX GB10 (sm_121):
+`test_cuda_quant_dot` 2/2 · 92401/92401 vs the CPU oracle (NMSE ≤1e-6, int core bit-exact) + f64
+dequant (NMSE ≤5e-4), compute-sanitizer memcheck 0, RED-first proven.** DeepSeek-V4 experts-on-GPU
+tok/s is the follow-on (benchmark lane). The original CPU-only finding is preserved below as the
+pre-supersession record.
 
 **Gate (`tests/vt/test_ops_quant_dot.cpp`, the same machinery as the six k-quants):** the three types
 added to `kWeightCases`. **19 cases / 130444 assertions GREEN** (CPU Debug, new TUs `-Werror` clean):
