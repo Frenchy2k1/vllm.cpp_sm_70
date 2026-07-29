@@ -91,7 +91,7 @@ greedy, concurrency 1:
 | axis B, DFlash-ON vs its OWN spec-OFF | IDENTICAL 24/24 | IDENTICAL 24/24 | holds |
 | axis B, GGUF-target accepted / proposed | 14 / 160 | 14 / 160 | no change |
 | axis B, cross-target spec-OFF divergence | index 4 | index 4 | no change |
-| axis B, gate | 15/15, exit 0 | 15/15, exit 0 | GREEN |
+| axis B, gate | 15/15, exit 0 | 15/15, exit 0, 81.01 GiB peak RSS, 6m53.08s | GREEN |
 
 The two failing assertions are `arm_a.proposed == arm_b.proposed` and
 `arm_a.accepted == arm_b.accepted` at `test_qwen27_dflash_spec_decode.cpp:473-474`.
