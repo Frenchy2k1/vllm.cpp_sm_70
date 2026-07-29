@@ -64,6 +64,60 @@ throughput / peak resident memory / llama.cpp-on-card floor) is blocked on a nam
 residual (W2c: rewire the forward onto the CIQ `kMatmulBTQuant` blocks + gate off the host dequant), then
 the download + GB10 run. No cross-engine oracle exists (vLLM 0.26 GGUF plugin has no V4 wiring); the gate
 would be our-engine self-consistency + coherence. DGX left as found (no download).
+## `SPEC-DFLASH-GGUF` axis-A acceptance delta ROOT-CAUSED in weight space (2026-07-29, `GD9`, `CLAIM-DFLASH-GGUF-ACCEPT-RCA`) - NOT APPLICABLE for speed; the e2e half is PENDING on hardware
+
+**Benchmark disposition: `NOT APPLICABLE` for throughput (this checkpoint adds a
+CPU correctness gate and an off-by-default trace; no engine numerics change), and
+`PENDING` for the one GPU measurement it is owed.** The open item from the entry
+below - why the `Q4_K_M` GGUF draft reads 46/112 against the bf16 safetensors
+draft's 47/96 at 48 tokens while emitting identical tokens - was attacked in
+weight space, where it can be settled without a GPU, and the structural
+explanations are eliminated:
+
+| Check | Method | Result |
+|---|---|---|
+| Is there an unquantized GGUF of this draft? | `Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` repo tree | YES - `BF16` 3,471,497,440 B beside `Q8_0`, `Q6_K`, `Q5_K`, `Q4_K_M`. The spec had recorded it as nonexistent |
+| Does the GGUF loader reproduce the safetensors draft? | `test_qwen3_dflash_gguf` new third case, BF16 GGUF vs z-lab shards | **BYTE-IDENTICAL, 58/58 tensors, 302/302 assertions, exit 0** |
+| Is that gate vacuous? | same case pointed at the `Q4_K_M` file | **21/302 assertions RED, exit 1** (exactly the 21 quantized matmul tensors) |
+| Is our Q4_K/Q6_K dequant faithful? | `DequantGgufRowToBf16` vs `gguf.quants.dequantize` on `fc.weight`, `blk.0.attn_q.weight`, `blk.2.ffn_down.weight` | **0 differing bf16 values, max abs diff 0** on all three |
+| Is the quantization error structural or ordinary? | mean abs diff over mean abs weight, all 58 tensors, whole ladder | BF16 0, Q8_0 5.6e-3, Q6_K 1.85e-2, Q5_K 3.85e-2, Q4_K_M 7.6e-2; monotone, uniform, no outlier tensor, F32 norms bit-equal at every level |
+| Does the draft config differ between arms? | field-by-field vs the `z-lab` `config.json` | only `rms_norm_eps` (`1e-06` vs the f32 `9.999999974752427e-07`, 2.5e-9 relative) and a benign `vocab_size` provenance; `draft_vocab_size` comes from the target's `lm_head` in BOTH arms |
+
+Category: ordinary `Q4_K_M` cost, not a defect in our GGUF draft path. The
+accept-count bar's own stated premise is "Same weights, two containers", which is
+true of the `BF16` GGUF and false of the `Q4_K_M` one, so the exact bar belongs
+on a cross-FORMAT arm and the cross-QUANTIZATION arm needs a band.
+
+**PENDING, and honestly so: no GPU number was produced this round.** dgx.casa
+dropped off the network mid-session (unreachable at the ARP level, ~09:47 UTC
+onward) and did not return, so the discriminating end-to-end run - the `BF16`
+GGUF draft as arm A against the safetensors draft, which must read exactly
+`47/96` if quantization is the whole story - was NOT run and nothing about it is
+claimed. Axis A stays RED. Reproduction, after copying `Qwen3.6-27B-DFlash-BF16.gguf`
+to `$HOME/bench/` (build flags exactly as in the entry below; `VT_SPEC_TRACE=1`
+turns on the new per-block propose/accept trace, which is what distinguishes a
+diffuse difference from a displaced block):
+
+```
+VLLM_DFLASH_TARGET=$HOME/bench/q36-27b-nvfp4-vllm \
+VLLM_DFLASH_DRAFT=$HOME/bench/Qwen3.6-27B-DFlash-BF16.gguf \
+VLLM_DFLASH_DRAFT_B=z-lab/Qwen3.6-27B-DFlash \
+VLLM_DFLASH_MAX_TOKENS=48 VT_SPEC_TRACE=1 \
+VLLM_DFLASH_PROMPT="Write a Python function that reverses a string:" \
+  flock $HOME/gpu.lock ./build-cuda/tests/test_qwen27_dflash_spec_decode \
+  -tc="dflash axis-A*"
+```
+
+The CPU half reproduces anywhere, with no GPU and no engine build flags:
+
+```
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release && \
+  cmake --build build-cpu -j20 --target test_qwen3_dflash_gguf
+VLLM_DFLASH_GGUF_BF16_MODEL=<...>/Qwen3.6-27B-DFlash-BF16.gguf \
+VLLM_DFLASH_ST_DIR=<...>/models--z-lab--Qwen3.6-27B-DFlash/snapshots/<rev> \
+  ./build-cpu/tests/test_qwen3_dflash_gguf -tc="*byte-identical*"
+```
+
 ## GGUF spec-decode rows RE-VERIFIED on a production-configured build (2026-07-29) - correctness re-measured, speed still PENDING; `SPEC-DFLASH-GGUF` axis A now has a REPRODUCIBLE RED
 
 **Benchmark disposition: PENDING for speed on both rows, `benchmark_binding=false`.

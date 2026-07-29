@@ -911,8 +911,24 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   gate is **RED, 15/17 assertions, exit 1, reproduced 3 of 3 runs**. So the 4-bit
   draft DOES cost acceptance here, which is the risk the spike flagged and the
   defective build had masked: it needs one extra 16-wide propose block and lands
-  one fewer acceptance, without changing a single emitted token. Not root-caused,
-  open, and it is why axis A is not closed.
+  one fewer acceptance, without changing a single emitted token.
+  **ROOT-CAUSED IN WEIGHT SPACE 2026-07-29 (`GD9`): ordinary `Q4_K_M` cost, not a
+  defect in our GGUF draft path, and the accept-count bar's own premise was wrong
+  for the asset it was aimed at.** The repository that publishes this draft also
+  publishes an UNQUANTIZED `BF16` GGUF, which the spec had recorded as
+  nonexistent. Loaded through the SAME code path it is BYTE-IDENTICAL to the
+  z-lab safetensors draft on all 58 tensors (a new CPU gate,
+  `tests/vllm/models/test_qwen3_dflash_gguf.cpp`, 302/302, functionally RED
+  against the `Q4_K_M` file), which eliminates every structural way the GGUF arm
+  could differ. Our Q4_K/Q6_K dequant is bit-equal to `gguf-py`'s reference on the
+  real tensors; the published ladder's weight error is monotone and uniform
+  (BF16 0, Q8_0 5.6e-3, Q6_K 1.85e-2, Q5_K 3.85e-2, Q4_K_M 7.6e-2 mean relative,
+  no outlier tensor); the only numeric config difference between the two arms is
+  `rms_norm_eps` at 2.5e-9 relative. So the exact accept-count bar is right for a
+  cross-FORMAT arm (same weights, which the BF16 asset now supplies) and was
+  never right for the cross-QUANTIZATION arm it was pointed at. The end-to-end
+  confirmation on GB10 is NOT YET RUN: dgx.casa left the network mid-session on
+  2026-07-29 and did not return. Axis A stays RED and open until it is.
   Three conventions this had to undo, all invisible to shape and name checks:
   `dflash.target_layers` is stored `+1`-offset; the draft's RMSNorm weights are
   RAW (its converter class does not inherit the Qwen3Next `+1` shift, so unlike

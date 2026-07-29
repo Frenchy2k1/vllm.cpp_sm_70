@@ -1249,6 +1249,38 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logit
     if (kr > 0 && !chunked_prefilling[static_cast<size_t>(i)]) {
       spec_drafts_proposed_ += kr;
       spec_drafts_accepted_ += (ns > 1 ? ns - 1 : 0);
+      // PER-BLOCK acceptance trace (VT_SPEC_TRACE=1), off by default. The
+      // aggregate proposed/accepted totals cannot distinguish a diffuse
+      // per-block difference from one displaced block, which is exactly the
+      // question a cross-draft acceptance delta raises. This prints the whole
+      // proposal and what the target did with it, so the answer is read off the
+      // log rather than argued. `pos` is the request's token count BEFORE this
+      // step's write-back, so blocks from two runs line up by position.
+      static const bool spec_trace = [] {
+        const char* v = std::getenv("VT_SPEC_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+      }();
+      if (spec_trace) {
+        const int32_t base = step.cu_num_logits[static_cast<size_t>(i)];
+        std::string drafts;
+        for (int32_t j = 0; j < kr; ++j) {
+          drafts += std::to_string(
+              draft_sampled[static_cast<size_t>(base) + static_cast<size_t>(j) + 1]);
+          drafts += ' ';
+        }
+        std::string emitted;
+        for (const int32_t t : rs.sampled_token_ids[static_cast<size_t>(i)]) {
+          emitted += std::to_string(t);
+          emitted += ' ';
+        }
+        std::fprintf(
+            stderr,
+            "[SPECTRACE] req=%s pos=%d k=%d ns=%d acc=%d draft=[ %s] emit=[ %s]\n",
+            req_id.c_str(),
+            static_cast<int>(input_batch_.num_tokens_no_spec[static_cast<size_t>(i)]),
+            static_cast<int>(kr), static_cast<int>(ns),
+            static_cast<int>(ns > 1 ? ns - 1 : 0), drafts.c_str(), emitted.c_str());
+      }
     }
 
     if (chunked_prefilling[static_cast<size_t>(i)]) {
