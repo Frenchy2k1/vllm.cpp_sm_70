@@ -417,7 +417,13 @@ struct V4GgufCtx {
     VT_CHECK(t.shape.size() == 2, "deepseek-v4 gguf: expected 2-D MW " + name);
     const GgufResidency r = pol.Route(t, GgufTensorRole::kMatmulWeight);
     if (r != GgufResidency::kExpandBf16) {
-      return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1]);
+      // mmap-VIEW the blocks when the policy allows (borrow in place out of the
+      // file's read-only mapping, refcounted) instead of COPYING them into an owned
+      // buffer — the ~91 GiB keep-quant tower then shares the file's page cache
+      // rather than doubling it (measured on the real model: ~116 GiB copy -> the
+      // mmap-resident image). Mirrors qwen3_5_gguf_weights.cpp:214 (MmapSrc).
+      return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1], /*row_offset=*/0,
+                                pol.mmap_residency ? &g : nullptr, pol.quant_repack);
     }
     return MakeBf16Owned(DequantGgufRowToBf16(t.ggml_type, t.data, t.shape[0] * t.shape[1]),
                          {t.shape[0], t.shape[1]}, /*nk=*/true);
@@ -433,7 +439,10 @@ struct V4GgufCtx {
     const int64_t k = t.shape[2];                  // in
     const GgufResidency r = pol.Route(t, GgufTensorRole::kStackedExpertWeight);
     if (r != GgufResidency::kExpandBf16) {
-      return OwnGgufQuantBlocks(t, rows, k, /*row_offset=*/0);
+      // mmap-VIEW when allowed (see Mw) — the 256 routed-expert slabs are the bulk
+      // of the ~91 GiB, so borrowing them in place is the dominant memory win.
+      return OwnGgufQuantBlocks(t, rows, k, /*row_offset=*/0,
+                                pol.mmap_residency ? &g : nullptr, pol.quant_repack);
     }
     return MakeBf16Owned(DequantGgufRowToBf16(t.ggml_type, t.data, rows * k),
                          {rows, k}, /*nk=*/true);
@@ -479,6 +488,10 @@ DeepseekV4Params DeepseekV4ParamsFromGguf(const GgufFile& g) {
   d.sliding_window = OptInt(g, p + "attention.sliding_window", 0);
   d.rope_theta = OptFloat(g, p + "rope.freq_base", 10000.0);
   d.compress_rope_theta = OptFloat(g, p + "attention.compress_rope_freq_base", 160000.0);
+  d.rope_scale_factor = OptFloat(g, p + "rope.scaling.factor", 16.0);
+  d.rope_orig_ctx = OptInt(g, p + "rope.scaling.original_context_length", 65536);
+  d.rope_beta_fast = OptFloat(g, p + "rope.scaling.yarn_beta_fast", 32.0);
+  d.rope_beta_slow = OptFloat(g, p + "rope.scaling.yarn_beta_slow", 1.0);
   d.rms_norm_eps =
       static_cast<float>(OptFloat(g, p + "attention.layer_norm_rms_epsilon", 1e-6));
   d.max_position_embeddings = OptInt(g, p + "context_length", 0);

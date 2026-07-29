@@ -57,6 +57,11 @@ struct Dims {
   int64_t inh = 2, ihd = 32, index_topk = 3;
   int64_t n_layer = 4, n_hash = 2;
   std::vector<int32_t> compress_ratios = {0, 4, 2, 4};  // idx {1,3}, comp {1,2,3}
+  // The DSA compressor's REAL output width is `coff * head_dim` (ds4: coff==2 for
+  // compress_ratio==4). Default 1 collapses it onto head_dim (the historical tiny
+  // shape that HID the real-geometry forward bug); a real-ish gate sets it to 2 so
+  // the compressor projections are [2*head_dim, H] (comp_width != head_dim).
+  int64_t comp_coff = 1;
 };
 
 int64_t Prod(const std::vector<int64_t>& s) {
@@ -259,11 +264,14 @@ std::string BuildGguf(const Dims& d, const std::string& drop = "",
     } else {
       add(Blk(l, "exp_probs_b.bias"), false, {d.E});
     }
-    // DSA compressor (compress_ratio != 0) + indexer (== 4).
+    // DSA compressor (compress_ratio != 0) + indexer (== 4). The compressor
+    // projects to comp_width = comp_coff * head_dim (real: coff==2); the norm is
+    // over head_dim (ds4 `ds4.c:5021`), NOT comp_width.
     if (has_comp) {
-      add(Blk(l, "attn_compressor_ape.weight"), false, {cr, d.head_dim});
-      add(Blk(l, "attn_compressor_gate.weight"), true, {d.head_dim, d.H});
-      add(Blk(l, "attn_compressor_kv.weight"), true, {d.head_dim, d.H});
+      const int64_t cw = d.comp_coff * d.head_dim;
+      add(Blk(l, "attn_compressor_ape.weight"), false, {cr, cw});
+      add(Blk(l, "attn_compressor_gate.weight"), true, {cw, d.H});
+      add(Blk(l, "attn_compressor_kv.weight"), true, {cw, d.H});
       add(Blk(l, "attn_compressor_norm.weight"), false, {d.head_dim});
     }
     if (has_idx) {
@@ -588,6 +596,43 @@ TEST_CASE("LoadDeepseekV4FromGguf: antirez ds4 q2-imatrix real-file quirks (W8-r
   // Deterministic re-run (self-consistency, the W8-run correctness gate in miniature).
   const std::vector<float> lk2 = vllm::DeepseekV4ForwardGguf(w, q, tokens, positions);
   REQUIRE(lk2.size() == lk.size());
+  for (size_t i = 0; i < lk.size(); ++i) CHECK(lk2[i] == lk[i]);
+}
+
+// ── REAL-ISH (non-collapsing) geometry gate — regression guard for the W8-run bug ─
+// The historical tiny synthetic collapsed the DSA compressor's output width onto
+// `head_dim`, which HID a real-geometry forward bug: the keep-quant GGUF forward
+// assumed the compressor projects to `head_dim`, but the REAL DeepSeek-V4 compressor
+// projects to `comp_width = 2*head_dim` (ds4 `ds4.c:5016-5021`, `coff==2`). On the
+// real 80.7 GB run this threw `keep-quant GEMM: weight shape mismatch: want
+// [N=512,K=4096] got [1024,4096]` at layer 2. This case builds the compressor at
+// `comp_width = 2*head_dim` (comp_coff=2, i.e. comp_width != head_dim) and asserts
+// the keep-quant forward RUNS finite + deterministic — i.e. the real keep-quant run
+// takes the DENSE-MLA path (the DSA sparse compressor/indexer at real geometry is a
+// named residual, EXACT for seq <= index_topk) instead of the tiny-shape compressor
+// that mismatches. RED-first: reverting the dense-fallback gate (running the tiny
+// compressor at comp_width != head_dim) makes this THROW the shape mismatch again.
+TEST_CASE("DeepseekV4ForwardGguf: real-ish geometry (comp_width=2*head_dim) runs dense (W8-run guard)") {
+  Dims d;
+  d.comp_coff = 2;  // comp_width = 64 != head_dim = 32 (non-collapsing)
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  CHECK(w.accounted_tensors == static_cast<int64_t>(g.Tensors().size()));
+  // The loader accepted the [2*head_dim, H] compressor projections.
+  REQUIRE(w.gguf.layers[2].has_compressor);
+  REQUIRE(w.gguf.layers[2].comp_wgate.shape[0] == 2 * d.head_dim);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<int32_t> tokens = {1, 5, 9};
+  const std::vector<int32_t> positions = {0, 1, 2};
+  // Runs (no [N=head_dim] vs [2*head_dim] shape-mismatch crash) + finite.
+  const std::vector<float> lk = vllm::DeepseekV4ForwardGguf(w, q, tokens, positions);
+  REQUIRE(lk.size() == tokens.size() * static_cast<size_t>(d.vocab));
+  for (float v : lk) CHECK(std::isfinite(v));
+  const std::vector<float> lk2 = vllm::DeepseekV4ForwardGguf(w, q, tokens, positions);
   for (size_t i = 0; i < lk.size(); ++i) CHECK(lk2[i] == lk[i]);
 }
 

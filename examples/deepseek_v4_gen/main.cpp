@@ -113,6 +113,7 @@ int main(int argc, char** argv) {
   // KEEP-QUANT load (the memory enabler): the routed experts stay ~2-3-bit blocks.
   vllm::GgufLoadPolicy pol;
   pol.keep_quant = true;
+  pol.mmap_residency = true;  // borrow keep-quant blocks in place (no ~91 GiB copy)
   std::fprintf(stderr, "[gen] loading keep-quant tower (RSS before %.1f GiB)...\n", CurResidentGiB());
   const auto t_load0 = std::chrono::steady_clock::now();
   const vllm::DeepseekV4Weights w = vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &pol);
