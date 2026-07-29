@@ -393,6 +393,28 @@ The DeepSeek-V4 row stays SPIKE (no run, no benchmark). Resume: bring the DGX ba
 re-run the W8-run recipe (free box → download ~91 GB `UD-IQ2_XXS` → keep-quant load [assert
 resident ≈ 91-94 GiB, the W2c `VT_CHECK` must not fire] → greedy generate → self-consistency +
 coherence gate → TPOT/throughput/peak-resident benchmark). No code change needed.
+**W8-run apples-to-apples oracle SELECTED + ds4-file LOADABILITY PROVEN (2026-07-29, base
+`edf68c91`, NOT pushed):** the cross-engine oracle is now **antirez/ds4** (DwarfStar,
+`make cuda-spark` on GB10), and the shared apples-to-apples vehicle is ds4's `q2-imatrix`
+GGUF (`antirez/deepseek-v4-gguf`, a single 80.7 GB file — routed experts IQ2_XXS gate/up +
+Q2_K down, Q8_0 attn/shared/out, F16 embed — all keep-quant types we already support).
+Verified via HF HTTP-range (NO 80 GB download) that our `blk.N.*` name-map covers ds4's file
+EXACTLY (1328/1328, 0 unmapped, 0 leftover — byte-identical tensor-name set to unsloth's).
+Found + FIXED three real-file loader gaps that would throw or zero the model before a token:
+(1) `compress_ratios` length 44 (43 layers + a trailing MTP entry) vs our strict
+`==block_count` — relaxed to `>=` + prefix-truncate; (2) the clamp limit was read only from
+the scalar `swiglu_clamp`, but ds4 ships the per-layer array `swiglu_clamp_exp` (all 10.0) and
+a 0 limit ZEROES every expert (ClampedSwiGLU min(gate,0)·clamp(up,0,0)) — array fallback added;
+(3) the hash `ffn_gate_tid2eid` is ggml I32 (type 26), unhandled in `DequantGgufRowToF32` — I32
+case added. Gate `test_deepseek_v4_gguf_load` **8/8·288** (CPU Release `-Werror`-clean) with a
+new ds4-flavor case reproducing all three quirks (load + keep-quant forward finite +
+deterministic); RED-first proven (disabling the I32 case throws "unsupported ggml type 26").
+The GB10 run itself did NOT execute (nothing faked): it is blocked on the GPU flock held by a
+concurrent agent, two long builds (ds4 `cuda-spark` + our aarch64 CUDA), the 80 GB download,
+and a greedy driver (the engine's incremental paged decode is incompatible with V4's stateless
+keep-quant recompute — a manual greedy loop over `DeepseekV4ForwardGguf` is required; note
+`Tokenizer::FromGguf` also rejects ds4's `pre='joyai-llm'`, so the token cross-check must inject
+ds4's token ids). Row stays SPIKE.
 **W3 attention primitives landed
 (2026-07-28):** the genuinely-new-vs-V2/V3 math is ported as portable host references
 and unit-gated — the DSA "Lightning Indexer" sparse top-k SELECTION (a weighted

@@ -1185,3 +1185,60 @@ shards) → keep-quant load → greedy gen → self-consistency + coherence gate
 floor). SACRED-inert: only `deepseek_v4.{h,cpp}` / `deepseek_v4_weights.cpp` + the test changed; the
 W3-W6 primitive host references (the correctness oracle) are UNTOUCHED and still pass; the shared
 MLA/MoE, README, Metal, SACRED, apex, darwin untouched.
+
+---
+
+## W8-run — apples-to-apples ds4 oracle + ds4-file loadability (2026-07-29, `CLAIM-DEEPSEEK-V4-W8-RUN`, base `edf68c91`, NOT pushed)
+
+**The run was re-scoped to an apples-to-apples benchmark against a real cross-engine oracle.** The
+oracle is **antirez/ds4** (DwarfStar) — a purpose-built DeepSeek-V4-Flash GGUF engine that runs on the
+GB10 (`make cuda-spark`). Both engines must run the EXACT SAME file, so the shared vehicle is **ds4's
+`q2-imatrix` GGUF** (`antirez/deepseek-v4-gguf`, single 80.7 GB file — NOT the unsloth `UD-IQ2_XXS`,
+because ds4 is narrow and loads only its own conversion). Its per-role quant: routed experts **IQ2_XXS**
+gate/up + **Q2_K** down; A-proj / shared experts / output **Q8_0**; token_embd **F16** — all keep-quant
+types our engine already supports (W8 landed IQ2_XXS + Q2_K).
+
+### W8-run.1 Loadability into OUR engine — PROVEN from the file header (no 80 GB download)
+The ds4 file HEADER was read via HF HTTP-range (25 MB): GGUF v3, **1328 tensors**, 62 KV,
+`general.architecture=deepseek4`, full `deepseek4.*` config (block_count=43, hash_layer_count=3,
+expert_count=256, key_length=512, q_lora_rank=1024, output_group_count=8, indexer head=64/key=128/
+top_k=512). Our committed name-map (`scripts/dsv4_gguf_manifest_names.txt`) covers ds4's tensor set
+**EXACTLY — 1328/1328, 0 unmapped, 0 leftover** (the tensor-name set is byte-identical to unsloth's;
+ds4's `compress_ratios` encoding — 0,0 then alternating 4/128 — maps to the identical per-layer topology
+our `has_indexer=(cr==4)`/`has_compressor=(cr!=0)` derivation produces: indexer on the 21 `cr==4`
+layers, compressor on the 41 `cr!=0` layers).
+
+### W8-run.2 Three real-file loader gaps FOUND + FIXED + GATED
+A tiny synthetic file misses three representational quirks the real ds4 file carries that would throw or
+silently zero the model before a token:
+1. **`compress_ratios` length 44** (43 layers + a trailing MTP/nextn entry) vs our strict
+   `==block_count` assert → relaxed to `>= block_count` + prefix-truncate to the main layers.
+2. **`swiglu_clamp_exp` per-layer f32 array** (all 10.0), NO scalar `swiglu_clamp`. Our loader read only
+   the scalar → `swiglu_limit=0`, and `ClampedSwiGLU` with limit 0 is `min(gate,0)·σ·clamp(up,0,0)=0` —
+   it ZEROES every expert. Fixed: fall back to `swiglu_clamp_exp[0]`.
+3. **`ffn_gate_tid2eid` stored as ggml I32** (type 26), unhandled in `DequantGgufRowToF32` → threw. Added
+   an I32 case (ids round-trip exactly through f32).
+
+Gate: `tests/vllm/models/test_deepseek_v4_gguf_load.cpp` **8 cases / 288 assertions GREEN** (CPU Release
+full-library `-Werror`-clean; +1 case over W2c 7/185) — a new ds4-flavor synthetic reproduces all three
+quirks and asserts params resolve (`swiglu_limit==10.0` from the array, compress_ratios truncated), the
+keep-quant load accounts for every tensor, and `DeepseekV4ForwardGguf` runs finite + deterministic.
+**RED-first PROVEN:** disabling the I32 case throws "unsupported ggml type 26 (I32)" (1/8 fails); restore
+→ 8/288. `check-dsv4-gguf-namemap.py` still rc=0 (1328/1328). Files: `deepseek_v4_weights.cpp`,
+`gguf_dequant.cpp`, `tests/vllm/gguf_builder.h` (`F32ArrayKv`), the test.
+
+### W8-run.3 The GB10 RUN — HONEST RESIDUAL (did NOT execute; NOT faked)
+The run did not execute and was not simulated. It is blocked on: (a) the **GPU flock held by a
+concurrent agent** (checked repeatedly over ~30 min — stacking would risk an OOM-reboot,
+[[gb10-unified-memory-oom-reboots-box]] + [[sharing-a-gpu-with-flock]]); (b) two long builds (ds4
+`make cuda-spark` + our aarch64 CUDA); (c) the 80 GB download; (d) a **greedy driver** — V4's keep-quant
+`DeepseekV4ForwardGguf` is a STATELESS full-sequence recompute (it ignores KV cache), so the engine's
+incremental paged decode does not apply; the run needs a manual greedy loop (feed the growing token list
+each step, argmax the last row, append). Also `Tokenizer::FromGguf` rejects ds4's `pre='joyai-llm'`, so
+the apples-to-apples token cross-check should inject ds4's own input token ids into our loop rather than
+re-tokenize. **Resume:** `flock $HOME/gpu.lock` → `docker stop local-ai-worker` (restore after) →
+`./download_model.sh q2-imatrix` → ds4 `make cuda-spark` + `./ds4 -p "..."` / `./ds4-bench` → our greedy
+loop over the SAME file (assert peak resident ≈ 81-84 GiB keep-quant, NOT f32-expanded) → ours-vs-ds4
+token cross-check (prefix agreement / first divergence) + self-consistency + prefill/gen tok/s (expect
+ds4 faster: its experts run on the GPU, ours are CPU-tier on the 20 ARM cores — no CUDA keep-quant
+vec_dot exists; report the ratio with that attribution). Row stays `SPIKE` (no tokens generated).

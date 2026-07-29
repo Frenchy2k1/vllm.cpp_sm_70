@@ -32597,3 +32597,30 @@ endpoints (W4) and the tokwise `AllPool`/`StepPool` + chunked-prefill ALL poolin
 (W5) remain named residuals. Additive + default-inert: no production forward or
 runner path constructs a `PoolingRunner` yet (that rides the endpoint brick). NOT
 pushed; full SHA reported to the caller.
+
+---
+
+## DeepSeek-V4 W8-run — ds4 apples-to-apples oracle + loadability (2026-07-29, `CLAIM-DEEPSEEK-V4-W8-RUN`, base `edf68c91`, NOT pushed)
+
+The single-Spark run was re-scoped to an apples-to-apples benchmark vs the new
+cross-engine oracle **antirez/ds4** (DwarfStar), sharing ds4's `q2-imatrix` GGUF
+(`antirez/deepseek-v4-gguf`, single 80.7 GB — IQ2_XXS gate/up + Q2_K down + Q8_0
+attn/shared/out + F16 embed). **Loadability into our engine PROVEN** from the file
+HEADER (HF HTTP-range, NO 80 GB download): our `blk.N.*` name-map covers ds4's file
+1328/1328 EXACTLY (0 unmapped/leftover; tensor-name set byte-identical to unsloth).
+**Three real-file loader gaps FIXED + gated** (`test_deepseek_v4_gguf_load` 8/8·288,
+CPU Release `-Werror`, RED-first proven): (1) `DeepseekV4ParamsFromGguf` accepts
+`compress_ratios` length > block_count (ds4 = 44 = 43 + trailing MTP) and truncates
+to the main-layer prefix; (2) the clamped-SwiGLU limit falls back to the per-layer
+`swiglu_clamp_exp` array (ds4 ships no scalar `swiglu_clamp`; a 0 limit ZEROES every
+expert); (3) `DequantGgufRowToF32` handles ggml I32 (type 26) for the hash
+`ffn_gate_tid2eid`. Files: `deepseek_v4_weights.cpp`, `gguf_dequant.cpp`, the test
++ `gguf_builder.h` `F32ArrayKv`. **The GB10 RUN did NOT execute (nothing faked)** —
+blocked on the GPU flock held by a concurrent agent + two long builds (ds4
+`cuda-spark` + our aarch64 CUDA) + the 80 GB download + a greedy driver (V4's
+stateless keep-quant recompute needs a manual loop over `DeepseekV4ForwardGguf`; the
+paged incremental decode does not apply; `Tokenizer::FromGguf` rejects ds4's
+`pre='joyai-llm'`, so the cross-check must inject ds4's token ids). Row stays SPIKE.
+SACRED-inert: only the V4 loader/dequant + the test changed (the ds4-flavor case is
+additive); prior V4 primitive tests untouched. All 6 record checkers + the
+`check-dsv4-gguf-namemap` (1328/1328) rc=0. NOT pushed; full SHA to the caller.
