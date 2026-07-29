@@ -458,6 +458,17 @@ EOS), self-consistent; `test_deepseek_v4_gguf_load` 10/10·403. CPU-tier decode 
 (ds4 GPU: 16.5 tok/s). Gated by coherence + self-consistency + the ds4-oracle per-layer diff (no vLLM V4
 GGUF plugin ⇒ not vLLM-token-exact). Named residuals: GPU-expert dispatch (CPU-tier), DSA-sparse ctx>512
 (dense-fallback, exact for short gen), paged-engine integration. Row `ACTIVE`.
+
+**W8-run.10 — GPU-expert wiring (`--gpu`) + apples-to-apples vs ds4 (2026-07-29, base `20d8ccfa`).** Experts
+now run on the GB10: a CUDA queue routes every keep-quant expert/MLA/lm_head GEMM to the `kMatmulBTQuant`
+kCUDA provider (#195), reading unified-memory weight blocks in place (memory-safe; no device copy). GPU
+genuinely used (nvidia-smi 38–50% util, compute-app `deepseek-v4-gen` during the run); GPU path
+byte-identical to CPU; CPU default unchanged (`test_deepseek_v4_gguf_load` 10/10·403). Real table (same 80.7
+GB ds4 file): ds4 GPU prefill 325.9 / decode 16.3–16.6; ours `--gpu` prefill 6.26 / decode 0.68 (1.3–1.4×
+over our CPU path). The residual gap is NOT expert placement (fixed) but our **stateless full-recompute
+driver (no KV cache)** + route-(a) host-orchestration/per-GEMM sync. Real speed path = `ForwardDevice`
+(#183): resident on-device activations + KV cache + no per-GEMM sync — the only route to approach ds4's 16.5
+tok/s. Route (a) not dressed as a win. Row stays `ACTIVE`; see docs/BENCHMARKS.md W8-run.10.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

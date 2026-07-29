@@ -33165,3 +33165,29 @@ CUDA keep-quant GEMM is on main but this driver runs the CPU queue), DSA-sparse 
 (dense-fallback, exact for short gen), paged-engine integration. Model-matrix row
 ADVANCED SPIKE→ACTIVE (rollup ACTIVE 21→22 / SPIKE 9→8); spec §W8-run.9 + 9 structured
 sections appended. All 7 record checkers rc=0. Worker restored, flock free. NOT pushed.
+
+## DeepSeek-V4 W8-run.10 — GPU-expert wiring (`--gpu`) + apples-to-apples vs ds4 (2026-07-29, `CLAIM-DEEPSEEK-V4-GPU-EXPERTS`, branch `deepseek-v4-gpu-experts`→main, base `20d8ccfa`)
+
+Answers the user's "why run experts on CPU?" — they no longer do. Route (a), memory-safe:
+`Gemm`/`GemmRowSlice` already dispatch `vt::MatmulBT` by queue device (`ops.cpp:200`); a CUDA
+queue (`--gpu`) therefore sends every keep-quant expert/MLA/lm_head GEMM to the `kMatmulBTQuant`
+kCUDA provider (`cuda_quant_dot.cu:657`, #195), reading the unified-memory mmap'd weight blocks
+IN PLACE — no ~91 GiB device copy (`Alloc`=`cudaMalloc`, `cuda_backend.cu:79`, would OOM the 119
+GiB pool). Three fixes, each surfaced by running the real model (Iron Law): (1) `--gpu` builds a
+CUDA queue, CPU default preserved; (2) retag the weight view to the queue device so
+`MatmulBTQuant`'s device check (`ops.cpp:198`) dispatches to kCUDA; (3) only BLOCK-QUANT weights
+go to device (the bf16 router gate stays CPU — no CUDA f32-act/bf16-weight elementwise combo);
+`SyncDeviceGemm` drains the stream after each device GEMM (no-op on CPU).
+
+Verified (DGX GB10 sm_121a): GPU genuinely used (nvidia-smi 38–50% util, compute-app
+`deepseek-v4-gen` DURING run; GPU "memory" 206 MiB = CUDA context only, weights read from coherent
+system memory — confirms the memory-safe design). GPU path byte-identical to CPU ("…Paris."). CPU
+path unchanged (`test_deepseek_v4_gguf_load` 10/10·403). Real apples-to-apples (same 80.7 GB file):
+ds4 GPU prefill 325.9 / decode 16.3–16.6 / peak 80.8 GiB; ours `--gpu` prefill 6.26 / decode 0.68
+/ peak 86.33 GiB (1.3–1.4× over CPU 4.48 / 0.51). Gap attributed HONESTLY: (1) stateless
+full-recompute driver has NO KV cache → decode = repeated prefill; (2) route (a) is
+host-orchestrated + per-GEMM sync at T=5 → GB10 ~45% util. Real speed path (b) = `ForwardDevice`
+(#183): resident on-device activations + KV cache + drop per-GEMM sync. Route (a) NOT dressed as a
+win. Context (mirror-vLLM, source-grounded): vLLM has no experts-on-CPU-compute mode —
+`cpu_offload_gb` (`vllm/config/offload.py`) offloads WEIGHTS to host RAM and streams them to the
+GPU each forward; MoE compute always runs on GPU. Row stays ACTIVE (parity residual = path b).
