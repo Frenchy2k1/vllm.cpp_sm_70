@@ -5089,6 +5089,17 @@ that makes the oracle delta attributable to the oracle. Spread is 0.11% (pin) an
 build, and token identity:
 [pinned-oracle comparison](bench-evidence/qwen35-4b-pinned-oracle-20260728.md).
 
+**RE-VALIDATED (2026-07-29) after rebasing onto 139 upstream commits** (`main`
+`7f620e74` -> `f3ecbe70d`): 0.9972x total throughput, TTFT 0.7701x PASS, TPOT
+1.1247x FAIL — every axis inside noise of the row above, and our output
+token-identical 128/128 per repetition to the previous series. The control is
+that the vLLM arm, whose pinned binary did NOT change, drifted by the same ~0.13%
+as ours (0.9986x vs 0.9988x), so the drift is ambient rather than a code effect.
+No movement was the expected result: the only upstream commit in that window
+naming this gap (`2b00866a4`) concluded the decode gap is batch composition and
+changed records, not code.
+[post-rebase re-validation](bench-evidence/qwen35-4b-postrebase-20260729.md).
+
 ### OPEN LEAD - cuBLASLt resolves Ampere-class GEMM kernels on sm_120 (2026-07-27) - NOT MEASURED
 
 From the same profile: `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128`
