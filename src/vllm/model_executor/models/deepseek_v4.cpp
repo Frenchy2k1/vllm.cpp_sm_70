@@ -56,6 +56,7 @@
 #include "vt/quant.h"  // BlockToFloat (Phase-2 expert discriminator, #188)
 #include "vt/ops.h"      // vt::MatmulBT (auto-dispatches kMatmulBTQuant on block weights)
 #include "vt/tensor.h"   // vt::Tensor::Contiguous
+#include "vt/backend.h"  // vt::GetBackend / Backend::Synchronize (device GEMM drain)
 
 namespace vllm {
 namespace {
@@ -106,6 +107,21 @@ struct V4Backend {
   vt::Queue* q = nullptr;
   const DeepseekV4GgufWeights* gguf = nullptr;
 };
+
+// Drain the queue's stream after a keep-quant GEMM. This host-orchestrated GGUF
+// forward reads each GEMM's f32 output vector on the host IMMEDIATELY (the next
+// Disp*/glue op runs host-side), but the CUDA kMatmulBTQuant kernel is
+// stream-async — so on a device queue the stream must be drained before the host
+// touches `out`. On GB10 the GEMM operands are unified-memory views (mmap'd
+// keep-quant weight blocks + std::vector activations that the coherent GPU reads
+// in place — no H2D/D2H, which keeps the ~91 GiB weights single-copy), so this is
+// pure ORDERING, not a transfer. On the CPU queue (the default, coherent path)
+// MatmulBT is synchronous and this is a no-op. Mirrors qwen3_5.cpp:746
+// (Backend::Synchronize after a device matmul the host then consumes).
+inline void SyncDeviceGemm(const V4Backend& be) {
+  if (be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU)
+    vt::GetBackend(be.q->device).Synchronize(*be.q);
+}
 
 deepseek_v4::MhcPreResult DispMhcPre(const V4Backend& be, const std::vector<float>& residual,
                                      const std::vector<float>& fn,
@@ -242,12 +258,29 @@ std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
                  std::to_string(wq->shape[0]) + "," + std::to_string(wq->shape[1]) +
                  "] rank=" + std::to_string(wq->rank));
     std::vector<float> out(static_cast<size_t>(T) * N);
+    // Only BLOCK-QUANT weights (the dominant-FLOP experts / MLA linears / lm_head,
+    // IQ2_XXS/IQ3_XXS/Q2_K/Q8_0) go to the device kMatmulBTQuant provider. Small
+    // ELEMENTWISE weights the loader dequantized to bf16 (e.g. the [256,H] router
+    // gate) stay on the CPU: the CUDA elementwise kMatmulBT has no (f32-act,
+    // bf16-weight) combo, and these are negligible FLOPs. Both read the SAME
+    // unified-memory tensors, so mixing CPU/GPU GEMMs across the host-orchestrated
+    // forward is free (SyncDeviceGemm orders the device ones before host reads).
+    vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    const bool on_dev =
+        be.q->device.type != vt::DeviceType::kCPU && vt::IsBlockQuant(wq->dtype);
+    vt::Queue& gq = on_dev ? *be.q : cpuq;
     vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()),
-                                          vt::DType::kF32, be.q->device, {T, K});
+                                          vt::DType::kF32, gq.device, {T, K});
     vt::Tensor o =
-        vt::Tensor::Contiguous(out.data(), vt::DType::kF32, be.q->device, {T, N});
+        vt::Tensor::Contiguous(out.data(), vt::DType::kF32, gq.device, {T, N});
     vt::Tensor w = wq->View();
-    vt::MatmulBT(*be.q, o, a, w);
+    // The keep-quant blocks are loaded with the CPU device tag; on a device queue
+    // they are unified-memory views the GPU reads in place — retag to the chosen
+    // queue's device so MatmulBTQuant's device-consistency check (ops.cpp:198)
+    // dispatches to the right provider (mirrors GemmRowSlice's wt.device below).
+    w.device = gq.device;
+    vt::MatmulBT(gq, o, a, w);
+    if (on_dev) SyncDeviceGemm(be);  // drain before the host reads `out`
     return out;
   }
   std::vector<float> out(static_cast<size_t>(T) * N);
@@ -275,21 +308,29 @@ std::vector<float> GemmRowSlice(const V4Backend& be, const OwnedTensor& w,
            "deepseek-v4 keep-quant expert GEMM: slice out of range");
   const size_t row_bytes = vt::RowSizeBytes(w.dtype, K);
   std::vector<float> out(static_cast<size_t>(T) * N);
+  // Stacked expert/group slices are always block-quant → the device provider; the
+  // block-quant guard mirrors Gemm so a stray elementwise weight would fall to CPU
+  // rather than hit the CUDA kMatmulBT's missing (f32-act, bf16-weight) combo.
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const bool on_dev =
+      be.q->device.type != vt::DeviceType::kCPU && vt::IsBlockQuant(w.dtype);
+  vt::Queue& gq = on_dev ? *be.q : cpuq;
   vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()), vt::DType::kF32,
-                                        be.q->device, {T, K});
+                                        gq.device, {T, K});
   vt::Tensor o =
-      vt::Tensor::Contiguous(out.data(), vt::DType::kF32, be.q->device, {T, N});
+      vt::Tensor::Contiguous(out.data(), vt::DType::kF32, gq.device, {T, N});
   vt::Tensor wt;
   wt.data = const_cast<uint8_t*>(w.bytes.data()) +
             static_cast<size_t>(row_off) * row_bytes;
   wt.dtype = w.dtype;
-  wt.device = be.q->device;
+  wt.device = gq.device;
   wt.rank = 2;
   wt.shape[0] = N;
   wt.shape[1] = K;
   wt.stride[0] = K;  // inert for a block-quant weight; correct for the bf16 oracle
   wt.stride[1] = 1;
-  vt::MatmulBT(*be.q, o, a, wt);
+  vt::MatmulBT(gq, o, a, wt);
+  if (on_dev) SyncDeviceGemm(be);  // drain before the host reads `out`
   return out;
 }
 
