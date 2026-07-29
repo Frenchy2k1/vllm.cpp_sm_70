@@ -41,6 +41,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
@@ -51,11 +53,14 @@
 #include "vllm/model_executor/models/deepseek_v4_mhc.h"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
 #include "vt/dtype.h"
+#include "vt/quant.h"  // BlockToFloat (Phase-2 expert discriminator, #188)
 #include "vt/ops.h"      // vt::MatmulBT (auto-dispatches kMatmulBTQuant on block weights)
 #include "vt/tensor.h"   // vt::Tensor::Contiguous
 
 namespace vllm {
 namespace {
+
+void DumpAct(const char* name, const std::vector<float>& v);  // fwd (coherence-debug #188)
 
 using deepseek_v4::ClampedSwiGLU;
 using deepseek_v4::CompressorPoolNorm;
@@ -347,8 +352,9 @@ double YarnCorrDim(int64_t n_dims, int64_t n_ctx_orig, double beta, double base)
 }
 void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq_scale,
                       double ext_factor, int64_t n_ctx_orig, double beta_fast,
-                      double beta_slow) {
+                      double beta_slow, bool inverse = false) {
   const double theta_scale = std::pow(base, -2.0 / static_cast<double>(r));
+  const double sin_sign = inverse ? -1.0 : 1.0;  // inverse rope un-rotates (ds4 sin_sign)
   double corr_lo = 0.0, corr_hi = 0.0;
   if (ext_factor != 0.0) {
     corr_lo = std::max(0.0, std::floor(YarnCorrDim(r, n_ctx_orig, beta_fast, base)));
@@ -365,7 +371,7 @@ void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq
       theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
     }
     const float c = static_cast<float>(std::cos(theta));
-    const float s = static_cast<float>(std::sin(theta));
+    const float s = static_cast<float>(sin_sign * std::sin(theta));
     const float x0 = v[i], x1 = v[i + 1];
     v[i] = x0 * c - x1 * s;
     v[i + 1] = x0 * s + x1 * c;
@@ -433,9 +439,17 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   };
   std::vector<float> q =
       Gemm(be, Lq != nullptr ? &Lq->wq_b : nullptr, L.wq_b, qa, T, nh * hd, qlr);
+  // Per-head query RMS-norm (ds4 head_rms_norm_inplace, AFTER wq_b, BEFORE RoPE) — the
+  // MLA query normalization our forward previously omitted (#188: q was rel-L2 ~0.96
+  // vs ds4 at L00 with a bit-exact input; the KV latent already has its attn_kv_a_norm).
+  DeepseekV4QHeadRmsNormInplace(q, T * nh, hd, eps);
   for (int64_t t = 0; t < T; ++t)
     for (int64_t h = 0; h < nh; ++h)
       rope_layer(&q[t * nh * hd + h * hd + nope], positions[static_cast<size_t>(t)]);
+  if (std::getenv("VT_DUMP_ACT") != nullptr && (layer <= 5 || (layer >= 28 && layer <= 34))) {
+    char nm[64]; std::snprintf(nm, sizeof(nm), "ours_q_L%02lld", static_cast<long long>(layer));
+    DumpAct(nm, Slice(q, 0, nh * hd));  // #188 q operand (post-proj+rope), t=0
+  }
   std::vector<float> kraw = Gemm(be, Lq != nullptr ? &Lq->wkv : nullptr, L.wkv, x, T, hd, H);
   for (int64_t t = 0; t < T; ++t) {
     std::vector<float> kv = RmsNorm(Slice(kraw, t * hd, hd), L.kv_norm_weight, eps);
@@ -494,6 +508,10 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       const std::vector<float> dec = DispDecode(be, tok, ly);
       for (int64_t d = 0; d < hd; ++d) deck[t * hd + d] = dec[static_cast<size_t>(d)];
     }
+  }
+  if (std::getenv("VT_DUMP_ACT") != nullptr && (layer <= 5 || (layer >= 28 && layer <= 34))) {
+    char nm[64]; std::snprintf(nm, sizeof(nm), "ours_kv_L%02lld", static_cast<long long>(layer));
+    DumpAct(nm, Slice(deck, 0, hd));  // #188 kv latent operand (deck), t=0
   }
 
   // 4. selection: DSA Lightning-Indexer top-k on indexer layers, else dense causal.
@@ -554,6 +572,17 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     }
   }
 
+  // 5b. INVERSE RoPE on the attention output heads (ds4 `rope_tail_layer_inplace(
+  //     heads, ..., inverse=true)`, AFTER attention, BEFORE the o-proj). The value =
+  //     the rope-rotated latent, so the position rotation must be undone on the output
+  //     before the o-LoRA. IDENTITY at pos 0 (so it is invisible on the pos-0 single-
+  //     token gate) but load-bearing for multi-token generation (pos>0). #188.
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t h = 0; h < nh; ++h)
+      RopeInplaceLayer(&o[(t * nh + h) * hd + nope], rope, positions[static_cast<size_t>(t)],
+                       rope_base, rope_fscale, rope_ext, p.rope_orig_ctx, p.rope_beta_fast,
+                       p.rope_beta_slow, /*inverse=*/true);
+
   // 6. grouped OUTPUT-LoRA (W3) : [T,nh,hd] -> [T,H]. Keep-quant wo_a/wo_b on the
   //    GGUF source; the host/device-synthetic path keeps the f32 primitive.
   if (be.gguf != nullptr && Lq != nullptr) {
@@ -590,6 +619,12 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
     hashtab = L.tid2eid;
   } else {
     bias = L.gate_bias;  // may be empty (then plain top-k on the unbiased scores)
+  }
+  if (std::getenv("VT_DUMP_ACT") != nullptr && layer == 34) {  // #188 router logits/bias
+    DumpAct("ours_gating_L34", std::vector<float>(gating.begin(), gating.begin() + ne));
+    DumpAct("ours_gatebias_L34", bias.empty() ? std::vector<float>(ne, 0.0f) : bias);
+    std::fprintf(stderr, "  [router L34] logit[33]=%.4f logit[233]=%.4f bias[33]=%.4f bias[233]=%.4f\n",
+                 gating[33], gating[233], bias.empty() ? 0.f : bias[33], bias.empty() ? 0.f : bias[233]);
   }
   const MoeRouteResult route =
       DispRoute(be, gating, T, ne, topk, bias, p.norm_topk_prob,
@@ -650,7 +685,10 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
            : expert_f32(L.shared_w1.data(), L.shared_w3.data(), L.shared_w2.data(),
                         &x[t * H]);
     for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += sh[static_cast<size_t>(hh)];
+    const bool dbg = std::getenv("VT_DUMP_ACT") != nullptr && t == 0;
+    double sh_r = 0; if (dbg) { for (float v : sh) sh_r += (double)v * v; sh_r = std::sqrt(sh_r / H); }
     // routed experts.
+    double rt_r = 0, wmax = 0, eo_rmax = 0;
     for (int64_t j = 0; j < topk; ++j) {
       const int64_t e = route.topk_ids[t * topk + j];
       const float w = route.topk_weights[t * topk + j];
@@ -658,8 +696,18 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
           kq ? expert_kq(Lq->moe_gate_exps, Lq->moe_up_exps, Lq->moe_down_exps, e, x1)
              : expert_f32(&L.exp_w1[e * mi * H], &L.exp_w3[e * mi * H],
                           &L.exp_w2[e * H * mi], &x[t * H]);
+      if (dbg) {
+        double er = 0; for (float v : eo) er += (double)v * v; er = std::sqrt(er / H);
+        wmax = std::max(wmax, (double)std::fabs(w)); eo_rmax = std::max(eo_rmax, er);
+        double c = 0; for (float v : eo) c += (double)(w * v) * (w * v); rt_r += c;
+        std::fprintf(stderr, "    [moe L%02lld] routed e=%lld w=%.4f eo_rms=%.3f\n",
+                     static_cast<long long>(layer), static_cast<long long>(e), w, er);
+      }
       for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += w * eo[static_cast<size_t>(hh)];
     }
+    if (dbg)
+      std::fprintf(stderr, "  [moe L%02lld] shared_rms=%.3f routed_rms=%.3f wmax=%.3f expert_out_rmax=%.3f\n",
+                   static_cast<long long>(layer), sh_r, std::sqrt(rt_r / H), wmax, eo_rmax);
   }
   return out;
 }
@@ -677,6 +725,19 @@ constexpr const char* kDevicePending =
     "kernels (MHC Sinkhorn, DSA indexer/compressor, sqrtsoftplus router, clamped "
     "SwiGLU; the expert GEMM REUSES the existing NVFP4/FP8 grouped-GEMM) + the real "
     "multi-Spark e2e (W8) are named residuals. See .agents/specs/deepseek-v4-flash.md §W7.";
+
+// VT_DUMP_ACT: env-gated per-layer activation dump (coherence-debug #188). Writes a
+// raw little-endian float32 vector to $VT_DUMP_ACT/<name>.bin (inert when unset).
+void DumpAct(const char* name, const std::vector<float>& v) {
+  const char* dir = std::getenv("VT_DUMP_ACT");
+  if (dir == nullptr) return;
+  const std::string path = std::string(dir) + "/" + name + ".bin";
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (f != nullptr) {
+    std::fwrite(v.data(), sizeof(float), v.size(), f);
+    std::fclose(f);
+  }
+}
 
 }  // namespace
 
@@ -723,6 +784,7 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
     VT_CHECK(tok >= 0 && tok < V, "token id out of range");
     for (int64_t h = 0; h < H; ++h) x[t * H + h] = hw.embed[tok * H + h];
   }
+  DumpAct("ours_embed", Slice(x, 0, H));  // t=0 embed plain [H] (coherence-debug #188)
 
   // MHC residual manifold [T,hc,H] + the per-token post/comb mixes.
   std::vector<float> residual(static_cast<size_t>(T) * hc * H, 0.0f);
@@ -768,7 +830,18 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
     have_residual = true;
 
     // ── 512-wide MLA attention (W3+W4).
+    const std::vector<float> x_pre_attn = std::getenv("VT_DUMP_ACT") ? x : std::vector<float>{};
     x = AttentionBlock(L, Lq, p, x, positions, layer, miswire, trace, be);
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+      double ra = 0, rp = 0;
+      for (int64_t h = 0; h < H; ++h) { ra += x[h] * x[h]; rp += x_pre_attn[h] * x_pre_attn[h]; }
+      std::fprintf(stderr, "[L%02lld] rms pre_attn=%.3f attn_out=%.3f",
+                   static_cast<long long>(layer), std::sqrt(rp / H), std::sqrt(ra / H));
+      char nm[64]; std::snprintf(nm, sizeof(nm), "ours_attnout_L%02lld", static_cast<long long>(layer));
+      DumpAct(nm, Slice(x, 0, H));  // #188 per-sub-op diff: attention output [H]
+      std::snprintf(nm, sizeof(nm), "ours_attncur_L%02lld", static_cast<long long>(layer));
+      DumpAct(nm, Slice(x_pre_attn, 0, H));  // #188 attention INPUT (post attn MHC-pre)
+    }
 
     // ── ffn sub-block MHC fused-post-pre = MhcPost(attn-out) + MhcPre(ffn).
     for (int64_t t = 0; t < T; ++t) {
@@ -787,7 +860,32 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
     }
 
     // ── DeepSeek-V4 MoE (W6).
+    const std::vector<float> x_pre_moe = std::getenv("VT_DUMP_ACT") ? x : std::vector<float>{};
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {  // #188: real moe_in (t=0) for the expert probe
+      char nm[64]; std::snprintf(nm, sizeof(nm), "ours_moein_L%02lld", static_cast<long long>(layer));
+      DumpAct(nm, Slice(x, 0, H));
+    }
     x = MoeBlock(L, Lq, p, x, token_ids, layer, miswire, trace, be);
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+      double rm = 0, rp = 0;
+      for (int64_t h = 0; h < H; ++h) { rm += x[h] * x[h]; rp += x_pre_moe[h] * x_pre_moe[h]; }
+      std::fprintf(stderr, " moe_in=%.3f moe_out=%.3f\n", std::sqrt(rp / H), std::sqrt(rm / H));
+      char nm[64]; std::snprintf(nm, sizeof(nm), "ours_moeout_L%02lld", static_cast<long long>(layer));
+      DumpAct(nm, Slice(x, 0, H));  // #188 per-sub-op diff: routed+shared MoE output [H]
+    }
+
+    // coherence-debug #188: dump the [hc,H] manifold state AFTER this layer (the
+    // MoE output folded back through MhcPost, matching ds4's `cur` after
+    // layer_forward_self_one). t=0 only (single-token localization run).
+    if (std::getenv("VT_DUMP_ACT") != nullptr) {
+      const std::vector<float> folded =
+          MhcPost(Slice(x, 0, H), Slice(residual, 0, hc * H), Slice(post_mix, 0, hc),
+                  Slice(res_mix, 0, hc * hc), hc, H);
+      char nm[64];
+      std::snprintf(nm, sizeof(nm), "ours_hc_%02lld_afterL%02lld",
+                    static_cast<long long>(layer + 1), static_cast<long long>(layer));
+      DumpAct(nm, folded);
+    }
   }
 
   // final MhcPost(last-ffn-out) -> hc_head collapse -> norm -> lm_head (model.py:1128-1146).
@@ -856,6 +954,132 @@ std::vector<float> DeepseekV4ForwardGguf(const DeepseekV4Weights& weights,
   return ForwardComposeImpl(
       weights.host, weights.params, token_ids, positions, logits_indices, miswire, trace,
       V4Backend{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf});
+}
+
+void DeepseekV4QHeadRmsNormInplace(std::vector<float>& q, int64_t n_head,
+                                   int64_t head_dim, float eps) {
+  for (int64_t h = 0; h < n_head; ++h) {
+    float* head = q.data() + h * head_dim;
+    double ss = 0.0;
+    for (int64_t i = 0; i < head_dim; ++i) ss += static_cast<double>(head[i]) * head[i];
+    const float r =
+        1.0f / std::sqrt(static_cast<float>(ss / static_cast<double>(head_dim)) + eps);
+    for (int64_t i = 0; i < head_dim; ++i) head[i] *= r;
+  }
+}
+
+// Coherence-debug #188 Phase-2 DISCRIMINATOR. For each listed routed expert of `layer`,
+// compute each projection TWO ways from the SAME keep-quant blocks:
+//   (A) the kMatmulBTQuant path (GemmRowSlice, what the forward uses), and
+//   (B) dequant those exact block bytes to f32 (vt::BlockToFloat, the loader's own
+//       decoder) then a plain f64-accumulated GEMM.
+// A != B  => the vec_dot / block-decode NUMERICS are wrong (per quant type: gate/up
+//            are IQ2_XXS, down is Q2_K — so it names WHICH type).
+// A == B but the rms is grossly larger than a clean expert => the GemmRowSlice ROW
+//            OFFSET pulls the wrong rows out of the stacked [E*out,K] tensor.
+// Prints to stderr; pure diagnostic (no state change).
+void DeepseekV4ExpertProbe(const DeepseekV4Weights& weights, vt::Queue& queue,
+                           int64_t layer, const std::vector<int64_t>& experts) {
+  const DeepseekV4Params& p = weights.params;
+  VT_CHECK(weights.has_gguf_weights && layer >= 0 &&
+               layer < static_cast<int64_t>(weights.gguf.layers.size()),
+           "DeepseekV4ExpertProbe: bad layer / no keep-quant tower");
+  const DeepseekV4GgufLayerWeights& Lq = weights.gguf.layers[static_cast<size_t>(layer)];
+  const int64_t H = p.hidden_size, mi = p.moe_intermediate_size;
+  const V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
+  std::vector<float> xh(static_cast<size_t>(H)), xm(static_cast<size_t>(mi));
+  for (int64_t i = 0; i < H; ++i) xh[static_cast<size_t>(i)] = 0.5f * std::sin(0.017 * (i + 1));
+  for (int64_t i = 0; i < mi; ++i) xm[static_cast<size_t>(i)] = 0.5f * std::sin(0.013 * (i + 1));
+  // If a real moe_in dump exists for this layer (VT_DUMP_ACT), use it — the smooth
+  // synthetic input does NOT reproduce the forward's explosion; the real hidden does.
+  if (const char* dir = std::getenv("VT_DUMP_ACT")) {
+    const std::string path =
+        std::string(dir) + "/ours_moein_L" + (layer < 10 ? "0" : "") + std::to_string(layer) + ".bin";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f != nullptr) {
+      const size_t got = std::fread(xh.data(), sizeof(float), static_cast<size_t>(H), f);
+      std::fclose(f);
+      double r = 0; for (float v : xh) r += (double)v * v;
+      std::fprintf(stderr, "[probe] using REAL moe_in L%lld (%zu floats, rms=%.4f, max|x|=%.3f)\n",
+                   static_cast<long long>(layer), got, std::sqrt(r / H),
+                   [&]{ double m = 0; for (float v : xh) m = std::max(m, (double)std::fabs(v)); return m; }());
+    }
+  }
+  auto ref = [&](const OwnedTensor& w, int64_t N, int64_t K, int64_t roff,
+                 const std::vector<float>& x) {
+    const size_t rb = vt::RowSizeBytes(w.dtype, K);
+    std::vector<float> wf(static_cast<size_t>(N) * K);
+    vt::cpu::BlockToFloat(w.dtype)(w.bytes.data() + static_cast<size_t>(roff) * rb, wf.data(), N * K);
+    std::vector<float> out(static_cast<size_t>(N));
+    for (int64_t n = 0; n < N; ++n) {
+      double a = 0;
+      for (int64_t k = 0; k < K; ++k) a += static_cast<double>(wf[n * K + k]) * x[static_cast<size_t>(k)];
+      out[static_cast<size_t>(n)] = static_cast<float>(a);
+    }
+    return out;
+  };
+  auto rms = [](const std::vector<float>& v) {
+    double s = 0; for (float x : v) s += static_cast<double>(x) * x; return std::sqrt(s / v.size());
+  };
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double n = 0, d = 0;
+    for (size_t i = 0; i < a.size(); ++i) { double e = a[i] - b[i]; n += e * e; d += static_cast<double>(b[i]) * b[i]; }
+    return std::sqrt(n / (d + 1e-30));
+  };
+  // GATE-GEMM cross-check: feed ds4's EXACT router input to OUR gate GEMM. If our
+  // logits then match ds4's, our gate GEMM is correct and the divergence is an
+  // upstream (diverged-input) effect; if not, the gate GEMM itself is the bug.
+  if (const char* dir = std::getenv("VT_DUMP_ACT")) {
+    const std::string ip = std::string(dir) + "/ds4_routerin_L34.bin";
+    const std::string gp = std::string(dir) + "/ds4_gating_L34.bin";
+    std::FILE* fi = std::fopen(ip.c_str(), "rb");
+    if (fi != nullptr && layer == 34) {
+      std::vector<float> din(static_cast<size_t>(H));
+      if (std::fread(din.data(), sizeof(float), static_cast<size_t>(H), fi) != static_cast<size_t>(H)) { std::fclose(fi); return; }
+      std::fclose(fi);
+      const int64_t ne = p.n_routed_experts;
+      const std::vector<float> myg = Gemm(be, &Lq.moe_gate, {}, din, 1, ne, H);
+      double dr = 0; for (float v : din) dr += (double)v * v;
+      std::fprintf(stderr, "[gate-xcheck] on ds4's router input (rms=%.4f): OUR logit[33]=%.4f logit[233]=%.4f\n",
+                   std::sqrt(dr / H), myg[33], myg[233]);
+      std::FILE* fg = std::fopen(gp.c_str(), "rb");
+      if (fg != nullptr) {
+        std::vector<float> dg(static_cast<size_t>(ne));
+        const size_t ngot = std::fread(dg.data(), sizeof(float), static_cast<size_t>(ne), fg);
+        std::fclose(fg);
+        if (static_cast<int64_t>(ngot) == ne) {
+        std::fprintf(stderr, "[gate-xcheck] ds4 logit[33]=%.4f logit[233]=%.4f ; rel-L2(our_gate(ds4_in), ds4_gate)=%.4f\n",
+                     dg[33], dg[233], rel(myg, dg));
+        }
+      }
+    }
+  }
+  std::fprintf(stderr, "== expert probe layer %lld : A=kMatmulBTQuant B=dequant(BlockToFloat)+GEMM ; gate/up=IQ2_XXS down=Q2_K ==\n",
+               static_cast<long long>(layer));
+  const float lim = static_cast<float>(p.swiglu_limit);
+  // full expert (gate->clamped-SwiGLU->down) on input `xin`, projections via `proj`.
+  auto full_expert = [&](const std::vector<float>& g, const std::vector<float>& u,
+                         auto&& down_proj) {
+    std::vector<float> gate_up(static_cast<size_t>(2) * mi);
+    for (int64_t r = 0; r < mi; ++r) { gate_up[r] = g[r]; gate_up[mi + r] = u[r]; }
+    const std::vector<float> act = DispClampedSwiGLU(be, gate_up, mi, lim, 1.0f, 0.0f);
+    return std::make_pair(down_proj(act), rms(act));
+  };
+  for (int64_t e : experts) {
+    const std::vector<float> gA = GemmRowSlice(be, Lq.moe_gate_exps, xh, 1, mi, H, e * mi);
+    const std::vector<float> gB = ref(Lq.moe_gate_exps, mi, H, e * mi, xh);
+    const std::vector<float> uA = GemmRowSlice(be, Lq.moe_up_exps, xh, 1, mi, H, e * mi);
+    const std::vector<float> uB = ref(Lq.moe_up_exps, mi, H, e * mi, xh);
+    // full expert output, both ways (the actual thing that exploded in the forward).
+    auto [oA, actA] = full_expert(gA, uA, [&](const std::vector<float>& act) {
+      return GemmRowSlice(be, Lq.moe_down_exps, act, 1, H, mi, e * H); });
+    auto [oB, actB] = full_expert(gB, uB, [&](const std::vector<float>& act) {
+      return ref(Lq.moe_down_exps, H, mi, e * H, act); });
+    std::fprintf(stderr,
+                 "e%03lld gate[A=%8.3f rel=%.4f] up[A=%8.3f rel=%.4f] act[A=%9.3f B=%9.3f] EXPERT_OUT[A=%9.3f B=%9.3f rel=%.4f]\n",
+                 static_cast<long long>(e), rms(gA), rel(gA, gB), rms(uA), rel(uA, uB),
+                 actA, actB, rms(oA), rms(oB), rel(oA, oB));
+  }
 }
 
 std::vector<float> DeepseekV4Model::Forward(

@@ -340,6 +340,22 @@ std::vector<float> DeepseekV4ForwardGguf(
     const std::vector<int32_t>& logits_indices = {},
     V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr);
 
+// Coherence-debug #188 Phase-2 discriminator: per routed expert, compare each
+// projection's keep-quant kMatmulBTQuant output (A) vs a dequant-then-GEMM oracle
+// (B) from the SAME blocks. Splits vec_dot/decode numerics (A!=B) from slice
+// offset (A==B but over-scaled). Diagnostic (prints to stderr).
+void DeepseekV4ExpertProbe(const DeepseekV4Weights& weights, vt::Queue& queue,
+                           int64_t layer, const std::vector<int64_t>& experts);
+
+// Per-head RMS-normalization of the MLA query: each of `n_head` contiguous
+// `head_dim`-wide sub-vectors of `q` is scaled by 1/sqrt(mean(x^2) + eps) — NO
+// learnable weight. DeepSeek-V4 applies this to q AFTER wq_b and BEFORE RoPE
+// (ds4 `head_rms_norm_inplace` / `layer_q_projection_normed_one`; the KV latent
+// does NOT get it — only its `attn_kv_a_norm`). q is laid out [n_head*head_dim]
+// (for a batch, pass n_head = tokens*heads). #188 coherence fix.
+void DeepseekV4QHeadRmsNormInplace(std::vector<float>& q, int64_t n_head,
+                                   int64_t head_dim, float eps);
+
 // Load `DeepseekV4ForCausalLM` safetensors into DeepseekV4Weights. Encodes the
 // checkpoint name-map VERIFIED against the real header (deepseek_v4_weights.cpp)
 // and performs the W2 accounting pass (throws on a missing expected tensor). The
