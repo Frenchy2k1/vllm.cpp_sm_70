@@ -246,8 +246,8 @@ TEST_CASE("keep-quant residency refuses ragged K and out-of-span slices") {
   CHECK_THROWS(OwnGgufQuantBlocks(t, n, k, /*row_offset=*/1));
   // A ragged-K weight is not merely refused at residency: the POLICY routes it
   // to expansion, so the loader never reaches the throw.
-  CHECK(RouteGgufTensor(true, false, false, GgufTensorRole::kMatmulWeight, kQ8_0,
-                        {n, 33}) == GgufResidency::kExpandBf16);
+  CHECK(RouteGgufTensor(true, false, false, false, GgufTensorRole::kMatmulWeight,
+                        kQ8_0, {n, 33}) == GgufResidency::kExpandBf16);
 }
 
 // ===========================================================================
@@ -312,17 +312,18 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
                                            : GgufResidency::kExpandBf16;
 
         CHECK(RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
-                              /*cpu_ref=*/false, role, type, shape) == expected);
+                              /*nvfp4_fp4=*/false, /*cpu_ref=*/false, role,
+                              type, shape) == expected);
         (expect_keep ? kept : expanded)++;
 
         // The master switch OFF expands everything, always.
         CHECK(RouteGgufTensor(/*keep_quant=*/false, /*keep_f16=*/false,
-                              /*cpu_ref=*/false, role, type,
-                              shape) == GgufResidency::kExpandBf16);
+                              /*nvfp4_fp4=*/false, /*cpu_ref=*/false, role,
+                              type, shape) == GgufResidency::kExpandBf16);
         // The VT_CPU_REF oracle wins over keep-quant, always.
         CHECK(RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
-                              /*cpu_ref=*/true, role, type,
-                              shape) == GgufResidency::kExpandBf16);
+                              /*nvfp4_fp4=*/false, /*cpu_ref=*/true, role,
+                              type, shape) == GgufResidency::kExpandBf16);
       }
     }
   }
@@ -342,9 +343,9 @@ TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
          {GgufTensorRole::kTransformedWeight, GgufTensorRole::kEmbeddingTable,
           GgufTensorRole::kConvWeight, GgufTensorRole::kVector}) {
       CAPTURE(vllm::Name(role));
-      CHECK(RouteGgufTensor(true, false, false, role, e.ggml_type, {8, e.k}) ==
+      CHECK(RouteGgufTensor(true, false, false, false, role, e.ggml_type, {8, e.k}) ==
             GgufResidency::kExpandBf16);
-      CHECK(RouteGgufTensor(true, false, false, role, e.ggml_type,
+      CHECK(RouteGgufTensor(true, false, false, false, role, e.ggml_type,
                             {2, 8, e.k}) == GgufResidency::kExpandBf16);
     }
   }
@@ -1457,36 +1458,103 @@ GgufLoadPolicy KeepF16On() {
 TEST_CASE("keep-f16 routing: F16 matmul/expert/embed keep, others expand") {
   const uint32_t f16 = kF16;
   // The keep-eligible roles + right rank keep f16 ONLY when keep_f16 is on.
-  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kMatmulWeight, f16,
-                        {8, 64}) == GgufResidency::kKeepF16);
-  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kStackedExpertWeight,
-                        f16, {2, 8, 64}) == GgufResidency::kKeepF16);
+  CHECK(RouteGgufTensor(false, true, false, false, GgufTensorRole::kMatmulWeight,
+                        f16, {8, 64}) == GgufResidency::kKeepF16);
+  CHECK(RouteGgufTensor(false, true, false, false,
+                        GgufTensorRole::kStackedExpertWeight, f16, {2, 8, 64}) == GgufResidency::kKeepF16);
   // The embedding table keeps f16 too (a gather widens f16 like bf16); this is
   // what lets a tied token_embd/lm_head be ONE resident f16 vocab matrix.
-  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kEmbeddingTable, f16,
-                        {32, 64}) == GgufResidency::kKeepF16);
+  CHECK(RouteGgufTensor(false, true, false, false, GgufTensorRole::kEmbeddingTable,
+                        f16, {32, 64}) == GgufResidency::kKeepF16);
   // Value/layout-rewritten, conv and vector roles NEVER keep, even f16.
   for (GgufTensorRole role :
        {GgufTensorRole::kTransformedWeight, GgufTensorRole::kConvWeight,
         GgufTensorRole::kVector}) {
     CAPTURE(vllm::Name(role));
-    CHECK(RouteGgufTensor(false, true, false, role, f16, {8, 64}) ==
+    CHECK(RouteGgufTensor(false, true, false, false, role, f16, {8, 64}) ==
           GgufResidency::kExpandBf16);
   }
   // Wrong rank never keeps.
-  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kMatmulWeight, f16,
-                        {64}) == GgufResidency::kExpandBf16);
+  CHECK(RouteGgufTensor(false, true, false, false, GgufTensorRole::kMatmulWeight,
+                        f16, {64}) == GgufResidency::kExpandBf16);
   // keep_f16 OFF -> expand; VT_CPU_REF -> expand; a non-f16 type -> no keep-f16.
-  CHECK(RouteGgufTensor(false, false, false, GgufTensorRole::kMatmulWeight, f16,
+  CHECK(RouteGgufTensor(false, false, false, false, GgufTensorRole::kMatmulWeight,
+                        f16, {8, 64}) == GgufResidency::kExpandBf16);
+  CHECK(RouteGgufTensor(true, true, false, true, GgufTensorRole::kMatmulWeight, f16,
                         {8, 64}) == GgufResidency::kExpandBf16);
-  CHECK(RouteGgufTensor(true, true, true, GgufTensorRole::kMatmulWeight, f16,
-                        {8, 64}) == GgufResidency::kExpandBf16);
-  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kMatmulWeight, kQ8_0,
-                        {8, 64}) == GgufResidency::kExpandBf16);
+  CHECK(RouteGgufTensor(false, true, false, false, GgufTensorRole::kMatmulWeight,
+                        kQ8_0, {8, 64}) == GgufResidency::kExpandBf16);
   // keep-quant WINS over keep-f16 when both are on and the encoding is a block
   // type (they are mutually exclusive by encoding, so this only asserts order).
-  CHECK(RouteGgufTensor(true, true, false, GgufTensorRole::kMatmulWeight, kQ8_0,
-                        {8, 64}) == GgufResidency::kKeepQuant);
+  CHECK(RouteGgufTensor(true, true, false, false, GgufTensorRole::kMatmulWeight,
+                        kQ8_0, {8, 64}) == GgufResidency::kKeepQuant);
+}
+
+// `QUANT-GGUF-NVFP4` column C — the fp4 residency's routing contract.
+TEST_CASE("nvfp4 routing: type 40 in a verbatim role gets the fp4 residency") {
+  const uint32_t nvfp4 = 40;
+  // The two verbatim-bytes roles, at their expected ranks, with K a whole
+  // number of 64-element NVFP4 blocks.
+  CHECK(RouteGgufTensor(false, false, /*nvfp4_fp4=*/true, false,
+                        GgufTensorRole::kMatmulWeight, nvfp4,
+                        {8, 128}) == GgufResidency::kNvfp4Fp4);
+  CHECK(RouteGgufTensor(false, false, /*nvfp4_fp4=*/true, false,
+                        GgufTensorRole::kStackedExpertWeight, nvfp4,
+                        {2, 8, 128}) == GgufResidency::kNvfp4Fp4);
+  // Independent of keep_quant / keep_f16: NVFP4 is neither a vt block dtype nor
+  // F16, so those switches cannot produce (or suppress) this residency.
+  CHECK(RouteGgufTensor(true, true, /*nvfp4_fp4=*/true, false,
+                        GgufTensorRole::kMatmulWeight, nvfp4,
+                        {8, 128}) == GgufResidency::kNvfp4Fp4);
+  CHECK(RouteGgufTensor(true, true, /*nvfp4_fp4=*/false, false,
+                        GgufTensorRole::kMatmulWeight, nvfp4,
+                        {8, 128}) == GgufResidency::kExpandBf16);
+
+  // Roles whose value or layout is rewritten at load NEVER go fp4-resident —
+  // this is what keeps the GDN V-head reorders and the (w-1) norm rewrite
+  // correct on a file that stores them as NVFP4 (the 27B GGUF does).
+  for (GgufTensorRole role :
+       {GgufTensorRole::kTransformedWeight, GgufTensorRole::kEmbeddingTable,
+        GgufTensorRole::kConvWeight, GgufTensorRole::kVector}) {
+    CAPTURE(vllm::Name(role));
+    CHECK(RouteGgufTensor(false, false, true, false, role, nvfp4, {8, 128}) ==
+          GgufResidency::kExpandBf16);
+    CHECK(RouteGgufTensor(false, false, true, false, role, nvfp4,
+                          {2, 8, 128}) == GgufResidency::kExpandBf16);
+  }
+  // Wrong rank for the role never keeps.
+  CHECK(RouteGgufTensor(false, false, true, false,
+                        GgufTensorRole::kMatmulWeight, nvfp4,
+                        {128}) == GgufResidency::kExpandBf16);
+  CHECK(RouteGgufTensor(false, false, true, false,
+                        GgufTensorRole::kStackedExpertWeight, nvfp4,
+                        {8, 128}) == GgufResidency::kExpandBf16);
+  // A ragged K cannot be repacked block-wise, so it expands. 128 keeps, 96 (a
+  // multiple of 16 and 32 but NOT of the 64-element ggml block) does not.
+  CHECK(RouteGgufTensor(false, false, true, false,
+                        GgufTensorRole::kMatmulWeight, nvfp4,
+                        {8, 96}) == GgufResidency::kExpandBf16);
+  CHECK(RouteGgufTensor(false, false, true, false,
+                        GgufTensorRole::kMatmulWeight, nvfp4,
+                        {8, 0}) == GgufResidency::kExpandBf16);
+  // The VT_CPU_REF oracle wins over the fp4 residency, like every other one.
+  CHECK(RouteGgufTensor(false, false, true, /*cpu_ref=*/true,
+                        GgufTensorRole::kMatmulWeight, nvfp4,
+                        {8, 128}) == GgufResidency::kExpandBf16);
+  // And the switch is NVFP4-specific: it does not divert any other encoding.
+  for (const Encoding& e : kEncodings) {
+    CAPTURE(e.name);
+    CHECK(RouteGgufTensor(false, false, true, false,
+                          GgufTensorRole::kMatmulWeight, e.ggml_type,
+                          {8, e.k}) == GgufResidency::kExpandBf16);
+  }
+  CHECK(RouteGgufTensor(false, false, true, false,
+                        GgufTensorRole::kMatmulWeight, kF16,
+                        {8, 128}) == GgufResidency::kExpandBf16);
+  CHECK(vllm::KeepNvfp4DType(40));
+  CHECK_FALSE(vllm::KeepNvfp4DType(kQ8_0));
+  CHECK_FALSE(vllm::KeepNvfp4DType(kF16));
+  CHECK(std::string(vllm::Name(GgufResidency::kNvfp4Fp4)) == "nvfp4_fp4");
 }
 
 TEST_CASE("OwnGgufF16 keeps the file's f16 bytes verbatim, [N,K] nk=true") {

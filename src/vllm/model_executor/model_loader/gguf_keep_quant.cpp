@@ -76,6 +76,11 @@ bool GgufQuantComputeAvailable() {
                    vllm::platforms::CurrentPlatform().device_type());
 }
 
+bool GgufNvfp4ComputeAvailable() {
+  return vt::OpRegistered(vt::OpId::kMatmulNvfp4,
+                   vllm::platforms::CurrentPlatform().device_type());
+}
+
 const char* Name(GgufTensorRole role) {
   switch (role) {
     case GgufTensorRole::kMatmulWeight: return "matmul_weight";
@@ -93,12 +98,16 @@ const char* Name(GgufResidency residency) {
     case GgufResidency::kExpandBf16: return "expand_bf16";
     case GgufResidency::kKeepQuant: return "keep_quant";
     case GgufResidency::kKeepF16: return "keep_f16";
+    case GgufResidency::kNvfp4Fp4: return "nvfp4_fp4";
   }
   return "?";
 }
 
 // ggml type id 1 is F16 (IEEE half); see gguf_dequant.cpp case 1.
 bool KeepF16DType(uint32_t ggml_type) { return ggml_type == 1; }
+
+// ggml type id 40 is the NVFP4 fork extension; see gguf_dequant.cpp case 40.
+bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
 
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   vt::DType dt = vt::DType::kF32;
@@ -110,11 +119,22 @@ bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   return true;
 }
 
-GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool cpu_ref,
-                              GgufTensorRole role, uint32_t ggml_type,
+GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
+                              bool cpu_ref, GgufTensorRole role,
+                              uint32_t ggml_type,
                               const std::vector<int64_t>& shape) {
   // The oracle switch wins over everything (spec gate 2).
   if (cpu_ref) return GgufResidency::kExpandBf16;
+
+  // 0. Native fp4 residency for NVFP4. Checked first because it is the ONLY
+  // keep outcome type 40 has: it is not a vt block dtype (so it can never be
+  // kKeepQuant) and it is not F16 (so never kKeepF16). The eligible roles are
+  // exactly the verbatim-bytes ones keep-quant uses, and the alignment rule is
+  // the ggml block, 64 elements — a ragged K cannot be repacked block-wise.
+  if (nvfp4_fp4 && KeepNvfp4DType(ggml_type)) {
+    const int64_t k = KeepQuantKDim(role, shape);
+    if (k > 0 && k % 64 == 0) return GgufResidency::kNvfp4Fp4;
+  }
 
   // 1. Keep-quant blocks (a block encoding in a verbatim GEMM/expert role).
   if (keep_quant) {
@@ -171,6 +191,17 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
   // under VT_CPU_REF regardless (the oracle load stays byte-identical).
   p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk;
+  // `QUANT-GGUF-NVFP4` column C. Same shape as the keep-quant default: ON
+  // wherever the running device can execute the NVFP4 GEMM (CUDA today; a CPU
+  // build keeps expanding, which is correct but unquantized), with
+  // VT_GGUF_NVFP4_FP4=0 the same-binary opt-out and the oracle switch forcing it
+  // off so VT_CPU_REF=1 still reproduces the historical bf16 load byte for byte.
+  p.nvfp4_fp4 = EnvOnOr("VT_GGUF_NVFP4_FP4", GgufNvfp4ComputeAvailable()) &&
+                !p.cpu_ref;
+  // Both of vLLM's NVFP4 modes are mirrored; W4A4 is the default because it is
+  // what the sibling compressed-tensors container of the same model runs, and
+  // the GGUFs carry the `<stem>.input_scale` activation sidecars it needs.
+  p.nvfp4_w4a4 = EnvOnOr("VT_GGUF_NVFP4_W4A4", true) && p.nvfp4_fp4;
   // L5. Both ride the same availability condition as the residency they refine,
   // and both are forced off by the oracle switch, so VT_CPU_REF=1 keeps
   // reproducing the historical load byte for byte and allocation for allocation.
@@ -192,8 +223,8 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
 GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                                     GgufTensorRole role) const {
   const GgufResidency r =
-      RouteGgufTensor(keep_quant, keep_f16, cpu_ref, role, tensor.ggml_type,
-                      tensor.shape);
+      RouteGgufTensor(keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role,
+                      tensor.ggml_type, tensor.shape);
   if (audit) audit(tensor.name, role, r);
   return r;
 }

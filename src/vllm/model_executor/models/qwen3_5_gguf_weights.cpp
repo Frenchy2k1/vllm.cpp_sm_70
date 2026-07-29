@@ -339,18 +339,20 @@ void ReorderVCols(std::vector<T>& buf, int64_t rows, int64_t cols,
 // A 2-D weight has ONE scalar; a stacked expert weight (GGUF [E, out, in]) has
 // ONE PER EXPERT in expert order, exactly like vLLM's `w13_weight_scale_2`. The
 // result is therefore size 1 or size E, and {1.0f} for a self-contained
-// encoding. `<stem>.input_scale` is the W4A4 ACTIVATION scale and is
-// deliberately unused on this weight-only path.
-std::vector<float> GgufGlobalScales(const GgufFile& g, const std::string& name,
-                                    const GgufTensorInfo& t) {
-  if (!GgmlTypeNeedsGlobalScale(t.ggml_type)) return {1.0F};
+// encoding. `<stem>.input_scale` is the W4A4 ACTIVATION scale; it is read by the
+// SAME helper (GgufNvfp4SidecarScalars below) for the fp4-resident path and
+// stays unread on this weight-only dequant path.
+std::vector<float> GgufNvfp4SidecarScalars(const GgufFile& g,
+                                           const std::string& name,
+                                           const GgufTensorInfo& t,
+                                           const std::string& suffix) {
   const std::string kSuffix = ".weight";
   VT_CHECK(name.size() > kSuffix.size() &&
                name.compare(name.size() - kSuffix.size(), kSuffix.size(),
                             kSuffix) == 0,
            "qwen3_5 gguf: NVFP4 tensor without a .weight name: " + name);
   const std::string sidecar =
-      name.substr(0, name.size() - kSuffix.size()) + ".scale";
+      name.substr(0, name.size() - kSuffix.size()) + suffix;
   VT_CHECK(HasTensor(g, sidecar),
            "qwen3_5 gguf: " + name + " is NVFP4 but the file has no " +
                sidecar + " sidecar; its blocks alone do not determine the "
@@ -368,6 +370,12 @@ std::vector<float> GgufGlobalScales(const GgufFile& g, const std::string& name,
              "qwen3_5 gguf: non-positive or non-finite scale in " + sidecar);
   }
   return out;
+}
+
+std::vector<float> GgufGlobalScales(const GgufFile& g, const std::string& name,
+                                    const GgufTensorInfo& t) {
+  if (!GgmlTypeNeedsGlobalScale(t.ggml_type)) return {1.0F};
+  return GgufNvfp4SidecarScalars(g, name, t, ".scale");
 }
 
 // Dequant a named GGUF tensor (natural [out, in] row-major order, ne0 = in
@@ -495,6 +503,13 @@ OwnedTensor OwnMatmulWeight(const GgufFile& g, const std::string& name,
                             const GgufLoadPolicy& pol) {
   const GgufTensorInfo& t = g.Get(name);
   const GgufResidency r = pol.Route(t, GgufTensorRole::kMatmulWeight);
+  // The fp4 residency does not produce an OwnedTensor at all (its product is an
+  // Nvfp4Weight), so reaching here with it means a call site that CAN take fp4
+  // did not, or one that CANNOT was not given NoNvfp4(). Loud, never silent.
+  VT_CHECK(r != GgufResidency::kNvfp4Fp4,
+           "qwen3_5 gguf: " + name +
+               " routed to the fp4 residency but this call site builds a bf16 "
+               "OwnedTensor; use OwnGgufNvfp4 or NoNvfp4()");
   if (r != GgufResidency::kExpandBf16) {
     // keep-quant blocks OR keep-f16, both in the file's own [N, K] order.
     VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
@@ -507,6 +522,148 @@ OwnedTensor OwnMatmulWeight(const GgufFile& g, const std::string& name,
     return o;
   }
   return OwnBf16T(g, name);
+}
+
+// --- native fp4 residency (`QUANT-GGUF-NVFP4` column C) --------------------
+//
+// Build the fp4-resident `Nvfp4Weight` for ONE row-slice of an NVFP4 GGUF
+// tensor: the repacked operand pair plus the per-tensor scalars. The result is
+// EXACTLY what LoadCtNvfp4Raw produces from the compressed-tensors container of
+// the same quantization run (its `weight_packed` / `weight_scale` bytes are
+// byte-identical to the repack — measured, see the leaf spec Sec B), so the
+// forward's fp4 dispatch is reached with operands it has already been gated on.
+//
+// `scale2` is the `<stem>.scale` sidecar: the multiply-not-divide
+// `weight_scale_2` form, i.e. the RECIPROCAL of the compressed-tensors
+// `weight_global_scale` DIVISOR, bit-identical to it on the real files. The
+// divisor itself is NOT in the GGUF, so `weight_global_scale_inv` (which holds
+// the divisor, for the merged-linear max-then-reciprocate rule vLLM uses) is
+// RECONSTRUCTED as 1/scale2 and may differ from the safetensors divisor by one
+// ULP; recorded in the leaf spec's Risks/decisions rather than hidden.
+//
+// `input_scale2` is the `<stem>.input_scale` sidecar in the same reciprocal
+// form. With W4A4 on, the ACTIVATION divisor `input_global_scale_inv` (used
+// DIRECTLY by vt::ScaledFp4Quant) is likewise 1/input_scale2, and `alpha` is
+// formed by the SAME expression LoadCtNvfp4Raw uses so the two containers'
+// loaders cannot drift. With W4A4 off, both stay 0 and `IsTrueW4A4()` is false,
+// which is precisely how the forward selects vLLM's `use_a16` (W4A16) arm.
+Nvfp4Weight OwnGgufNvfp4Slice(const GgufTensorInfo& t, int64_t n, int64_t k,
+                              int64_t row_offset, float scale2,
+                              float input_scale2, bool w4a4) {
+  VT_CHECK(t.ggml_type == 40,
+           "qwen3_5 gguf: fp4 residency asked for a non-NVFP4 tensor " + t.name);
+  VT_CHECK(k % 64 == 0,
+           "qwen3_5 gguf: NVFP4 K must be whole 64-element blocks for " +
+               t.name);
+  VT_CHECK(std::isfinite(scale2) && scale2 > 0.0F,
+           "qwen3_5 gguf: bad <stem>.scale for " + t.name);
+  Nvfp4Weight w;
+  w.n = n;
+  w.k = k;
+  w.scale2 = scale2;
+  w.weight_global_scale_inv = 1.0F / scale2;  // reconstructed disk divisor
+  if (w4a4) {
+    VT_CHECK(std::isfinite(input_scale2) && input_scale2 > 0.0F,
+             "qwen3_5 gguf: bad <stem>.input_scale for " + t.name);
+    w.input_global_scale_inv = 1.0F / input_scale2;
+    // Same expression as LoadCtNvfp4Raw: scale2 * (1/input_divisor).
+    w.alpha = w.scale2 * (1.0F / w.input_global_scale_inv);
+  }
+  w.packed = MakeOwned(vt::DType::kI8, {n, k / 2});
+  w.scale = MakeOwned(vt::DType::kI8, {n, k / 16});
+  const int64_t blocks_per_row = k / 64;
+  const uint8_t* src = t.data + row_offset * blocks_per_row * 36;
+  RepackGgufNvfp4Rows(src, n, k,
+                      reinterpret_cast<uint8_t*>(w.packed.bytes.data()),
+                      reinterpret_cast<uint8_t*>(w.scale.bytes.data()));
+  return w;
+}
+
+// A 2-D NVFP4 matmul weight, taken verbatim in the file's own [N=out, K=in]
+// orientation — which is already the orientation vt::MatmulNvfp4 reads, so
+// unlike the bf16 path there is no transpose question here.
+Nvfp4Weight OwnGgufNvfp4(const GgufFile& g, const std::string& name,
+                         const GgufLoadPolicy& pol) {
+  const GgufTensorInfo& t = g.Get(name);
+  VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D NVFP4 weight " + name);
+  const std::vector<float> ws = GgufNvfp4SidecarScalars(g, name, t, ".scale");
+  VT_CHECK(ws.size() == 1,
+           "qwen3_5 gguf: a 2-D NVFP4 weight needs exactly one .scale: " + name);
+  float is2 = 0.0F;
+  if (pol.nvfp4_w4a4) {
+    const std::vector<float> in =
+        GgufNvfp4SidecarScalars(g, name, t, ".input_scale");
+    VT_CHECK(in.size() == 1,
+             "qwen3_5 gguf: a 2-D NVFP4 weight needs exactly one .input_scale: " +
+                 name);
+    is2 = in[0];
+  }
+  Nvfp4Weight w = OwnGgufNvfp4Slice(t, t.shape[0], t.shape[1], 0, ws[0], is2,
+                                    pol.nvfp4_w4a4);
+  // The blocks are read once and the repack is now the authority for this
+  // tensor; drop their file pages exactly as the bf16 expansion path does.
+  g.DropSpanResidency(t.data, t.nbytes);
+  return w;
+}
+
+// A stacked expert tensor (GGUF [E, out, in]) -> one Nvfp4Weight per expert.
+// The expert axis is the SLOWEST, so an expert slab is a whole number of ROWS
+// and therefore of 64-element blocks; the split is a byte range and no block is
+// ever cut. The sidecars hold ONE scalar PER EXPERT in expert order, matching
+// vLLM's `w13_weight_scale_2`.
+std::vector<Nvfp4Weight> OwnGgufNvfp4Experts(const GgufFile& g,
+                                             const std::string& name,
+                                             int64_t num_experts,
+                                             const GgufLoadPolicy& pol) {
+  const GgufTensorInfo& t = g.Get(name);
+  VT_CHECK(t.shape.size() == 3 && t.shape[0] == num_experts,
+           "qwen3_5 gguf: expected [E,out,in] NVFP4 expert tensor " + name);
+  const int64_t out_dim = t.shape[1];
+  const int64_t in_dim = t.shape[2];
+  const std::vector<float> ws = GgufNvfp4SidecarScalars(g, name, t, ".scale");
+  VT_CHECK(ws.size() == 1 || static_cast<int64_t>(ws.size()) == num_experts,
+           "qwen3_5 gguf: .scale must hold one scalar or one per expert: " + name);
+  std::vector<float> in(1, 0.0F);
+  if (pol.nvfp4_w4a4) {
+    in = GgufNvfp4SidecarScalars(g, name, t, ".input_scale");
+    VT_CHECK(in.size() == 1 || static_cast<int64_t>(in.size()) == num_experts,
+             "qwen3_5 gguf: .input_scale must hold one scalar or one per "
+             "expert: " + name);
+  }
+  std::vector<Nvfp4Weight> out;
+  out.reserve(static_cast<size_t>(num_experts));
+  for (int64_t e = 0; e < num_experts; ++e) {
+    const float s2 = ws.size() == 1 ? ws[0] : ws[static_cast<size_t>(e)];
+    const float i2 = in.size() == 1 ? in[0] : in[static_cast<size_t>(e)];
+    out.push_back(OwnGgufNvfp4Slice(t, out_dim, in_dim, e * out_dim, s2, i2,
+                                    pol.nvfp4_w4a4));
+  }
+  g.DropSpanResidency(t.data, t.nbytes);
+  return out;
+}
+
+// The PURE routing decision, WITHOUT firing the audit hook. Call sites that must
+// look at a tensor's fate before choosing which loader to run use this, so the
+// tensor is still audited EXACTLY ONCE by whichever loader they then call. Same
+// pattern (and same reason) as the tied-head probe in LoadEmbedAndHead.
+GgufResidency PeekRoute(const GgufLoadPolicy& pol, const GgufTensorInfo& t,
+                        GgufTensorRole role) {
+  return RouteGgufTensor(pol.keep_quant, pol.keep_f16, pol.nvfp4_fp4,
+                         pol.cpu_ref, role, t.ggml_type, t.shape);
+}
+
+// A policy copy with the fp4 residency DISABLED, for the call sites whose
+// consumer is an OwnedTensor and has no `Nvfp4Weight` field to fill: the
+// lm_head/embedding pair, the MoE router gate, and the GDN in_proj family
+// (whose 27B V-head reorder makes them kTransformedWeight anyway, but which
+// would otherwise become fp4-eligible on a model without that reorder). Stating
+// it as a policy rather than a silent fallthrough keeps the audit hook truthful
+// about what each tensor actually got.
+GgufLoadPolicy NoNvfp4(const GgufLoadPolicy& pol) {
+  GgufLoadPolicy p = pol;
+  p.nvfp4_fp4 = false;
+  p.nvfp4_w4a4 = false;
+  return p;
 }
 
 // Route a tensor that can NEVER keep its blocks (a value/layout rewrite, a
@@ -552,6 +709,9 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
                       OwnedTensor* embed, OwnedTensor* head) {
   const std::string kEmbed = "token_embd.weight";
   const GgufTensorInfo& et = g.Get(kEmbed);
+  // The embedding table is a gather and the head a bf16/keep-quant GEMM weight;
+  // neither has an Nvfp4Weight field, so the fp4 residency is off for both (the
+  // table is ineligible by ROLE already; the head is disabled explicitly below).
   const GgufResidency embed_r =
       pol.Route(et, GgufTensorRole::kEmbeddingTable);  // the embed's audit event
 
@@ -574,8 +734,9 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
   // does not fire the audit hook a second time: the head is routed EXACTLY ONCE
   // on both branches below.
   const GgufResidency head_r =
-      RouteGgufTensor(pol.keep_quant, pol.keep_f16, pol.cpu_ref,
-                      GgufTensorRole::kMatmulWeight, ht.ggml_type, ht.shape);
+      RouteGgufTensor(pol.keep_quant, pol.keep_f16, /*nvfp4_fp4=*/false,
+                      pol.cpu_ref, GgufTensorRole::kMatmulWeight, ht.ggml_type,
+                      ht.shape);
 
   // The two coincide (share one buffer) iff both kept f16, OR both expanded in
   // the file's own [N, K] order (expand_nk). share_tied_head already implies
@@ -585,7 +746,8 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
   const bool bf16_share = embed_r == GgufResidency::kExpandBf16 &&
                           head_r == GgufResidency::kExpandBf16 && pol.expand_nk;
   if (tied && pol.share_tied_head && (f16_share || bf16_share)) {
-    (void)pol.Route(ht, GgufTensorRole::kMatmulWeight);  // the head's one audit event
+    (void)NoNvfp4(pol).Route(ht,
+                             GgufTensorRole::kMatmulWeight);  // head's 1 audit
     std::shared_ptr<const void> owner = embed->bytes.KeepAlive();
     OwnedTensor h;
     h.dtype = embed->dtype;
@@ -596,7 +758,7 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
     *head = std::move(h);
     return;
   }
-  *head = OwnMatmulWeight(g, head_name, pol);
+  *head = OwnMatmulWeight(g, head_name, NoNvfp4(pol));
 }
 
 // --- config --------------------------------------------------------------
@@ -794,7 +956,7 @@ std::string Blk(int64_t il, const std::string& suffix) {
 }
 
 GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
-                            const GgufLoadPolicy& pol) {
+                            const GgufLoadPolicy& pol_in) {
   const int64_t num_k = c.linear_num_key_heads;
   const int64_t num_v = c.linear_num_value_heads;
   const int64_t dv = c.linear_value_head_dim;
@@ -809,6 +971,14 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   const GgufTensorRole proj_role = reorder
                                        ? GgufTensorRole::kTransformedWeight
                                        : GgufTensorRole::kMatmulWeight;
+  // GdnLayerWeights carries an Nvfp4Weight ONLY for out_proj, and even that is
+  // unreachable on the 27B because the V-column reorder makes ssm_out
+  // kTransformedWeight. The in_proj family has no fp4 field at all. So the GDN
+  // block loads against a policy with the fp4 residency off: an NVFP4 GDN
+  // projection (which the 27B GGUF does carry, unlike its safetensors sibling —
+  // see the leaf spec Sec A) expands to bf16, correctly but unquantized. This is
+  // the ONE documented gap left in the C column.
+  const GgufLoadPolicy pol = NoNvfp4(pol_in);
 
   GdnLayerWeights gdn;
 
@@ -922,13 +1092,33 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   return gdn;
 }
 
+// One 2-D matmul weight into EITHER the fp4-resident field or the bf16 one,
+// with the other left EMPTY — the invariant the forward's `!*.Empty()` dispatch
+// relies on. This is the whole wiring of the C column at a call site.
+void LoadMatmulWeightOrNvfp4(const GgufFile& g, const std::string& name,
+                             const GgufLoadPolicy& pol, OwnedTensor* bf16,
+                             Nvfp4Weight* fp4) {
+  const GgufTensorInfo& t = g.Get(name);
+  if (PeekRoute(pol, t, GgufTensorRole::kMatmulWeight) ==
+      GgufResidency::kNvfp4Fp4) {
+    (void)pol.Route(t, GgufTensorRole::kMatmulWeight);  // its ONE audit event
+    *fp4 = OwnGgufNvfp4(g, name, pol);
+    return;
+  }
+  *bf16 = OwnMatmulWeight(g, name, pol);  // routes (and audits) once itself
+}
+
 FullAttnLayerWeights LoadAttnGguf(const GgufFile& g, int64_t il,
                                   const GgufLoadPolicy& pol) {
   FullAttnLayerWeights a;
-  a.q_proj = OwnMatmulWeight(g, Blk(il, "attn_q.weight"), pol);
-  a.k_proj = OwnMatmulWeight(g, Blk(il, "attn_k.weight"), pol);
-  a.v_proj = OwnMatmulWeight(g, Blk(il, "attn_v.weight"), pol);
-  a.o_proj = OwnMatmulWeight(g, Blk(il, "attn_output.weight"), pol);
+  LoadMatmulWeightOrNvfp4(g, Blk(il, "attn_q.weight"), pol, &a.q_proj,
+                          &a.q_proj_fp4);
+  LoadMatmulWeightOrNvfp4(g, Blk(il, "attn_k.weight"), pol, &a.k_proj,
+                          &a.k_proj_fp4);
+  LoadMatmulWeightOrNvfp4(g, Blk(il, "attn_v.weight"), pol, &a.v_proj,
+                          &a.v_proj_fp4);
+  LoadMatmulWeightOrNvfp4(g, Blk(il, "attn_output.weight"), pol, &a.o_proj,
+                          &a.o_proj_fp4);
   // (w - 1) rewrite: a VALUE transform, so never keep-quant.
   RequireExpand(pol, g, Blk(il, "attn_q_norm.weight"),
                 GgufTensorRole::kTransformedWeight);
@@ -979,23 +1169,51 @@ std::vector<OwnedTensor> LoadExpertsT(const GgufFile& g, int64_t il,
   return experts;
 }
 
+// Stacked routed experts into EITHER the fp4-resident vector or the bf16 one.
+// The fp4 arm keeps the GGUF's own [N=out, K=in] per-expert orientation (which
+// is already what vt::MatmulNvfp4 reads), so unlike LoadExpertsT it does not
+// transpose; the per-expert `<stem>.scale` / `.input_scale` sidecars ride along.
+void LoadExpertsOrNvfp4(const GgufFile& g, int64_t il, const std::string& stem,
+                        int64_t num_experts, const GgufLoadPolicy& pol,
+                        std::vector<OwnedTensor>* bf16,
+                        std::vector<Nvfp4Weight>* fp4) {
+  const std::string name = Blk(il, stem);
+  const GgufTensorInfo& t = g.Get(name);
+  if (PeekRoute(pol, t, GgufTensorRole::kStackedExpertWeight) ==
+      GgufResidency::kNvfp4Fp4) {
+    (void)pol.Route(t, GgufTensorRole::kStackedExpertWeight);  // ONE audit event
+    *fp4 = OwnGgufNvfp4Experts(g, name, num_experts, pol);
+    return;
+  }
+  *bf16 = LoadExpertsT(g, il, stem, num_experts, pol);  // routes/audits itself
+}
+
 MoeBlockWeights LoadMoeGguf(const GgufFile& g, int64_t il, const HfConfig& c,
                             const GgufLoadPolicy& pol) {
   MoeBlockWeights m;
-  m.router_gate = OwnMatmulWeight(g, Blk(il, "ffn_gate_inp.weight"), pol);
+  // The router gate is F32 in every published file and has no fp4 field.
+  m.router_gate =
+      OwnMatmulWeight(g, Blk(il, "ffn_gate_inp.weight"), NoNvfp4(pol));
   // shared gate: 1-D [H] in GGUF -> [H, 1] (matches the safetensors [H,1]).
   RequireExpand(pol, g, Blk(il, "ffn_gate_inp_shexp.weight"),
                 GgufTensorRole::kVector);
   m.shared_gate =
       OwnBf16(g, Blk(il, "ffn_gate_inp_shexp.weight"), {c.hidden_size, 1});
-  m.expert_gate =
-      LoadExpertsT(g, il, "ffn_gate_exps.weight", c.num_experts, pol);
-  m.expert_up = LoadExpertsT(g, il, "ffn_up_exps.weight", c.num_experts, pol);
-  m.expert_down =
-      LoadExpertsT(g, il, "ffn_down_exps.weight", c.num_experts, pol);
-  m.shared_gate_proj = OwnMatmulWeight(g, Blk(il, "ffn_gate_shexp.weight"), pol);
-  m.shared_up_proj = OwnMatmulWeight(g, Blk(il, "ffn_up_shexp.weight"), pol);
-  m.shared_down_proj = OwnMatmulWeight(g, Blk(il, "ffn_down_shexp.weight"), pol);
+  // Stacked routed experts: fp4-resident per expert when routed there, else the
+  // historical transposed bf16 slabs. Exactly one set is filled, which is the
+  // invariant the MoE forward's `!expert_*_fp4.empty()` dispatch relies on.
+  LoadExpertsOrNvfp4(g, il, "ffn_gate_exps.weight", c.num_experts, pol,
+                     &m.expert_gate, &m.expert_gate_fp4);
+  LoadExpertsOrNvfp4(g, il, "ffn_up_exps.weight", c.num_experts, pol,
+                     &m.expert_up, &m.expert_up_fp4);
+  LoadExpertsOrNvfp4(g, il, "ffn_down_exps.weight", c.num_experts, pol,
+                     &m.expert_down, &m.expert_down_fp4);
+  LoadMatmulWeightOrNvfp4(g, Blk(il, "ffn_gate_shexp.weight"), pol,
+                          &m.shared_gate_proj, &m.shared_gate_proj_fp4);
+  LoadMatmulWeightOrNvfp4(g, Blk(il, "ffn_up_shexp.weight"), pol,
+                          &m.shared_up_proj, &m.shared_up_proj_fp4);
+  LoadMatmulWeightOrNvfp4(g, Blk(il, "ffn_down_shexp.weight"), pol,
+                          &m.shared_down_proj, &m.shared_down_proj_fp4);
   return m;
 }
 
@@ -1215,9 +1433,12 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
       VT_CHECK(false, "qwen3_5 gguf: unknown layer_type " + lt);
     }
     // Dense SwiGLU MLP (bf16 fields; the fp4 variants stay empty).
-    layer.mlp.gate_proj = OwnMatmulWeight(gguf, Blk(il, "ffn_gate.weight"), pol);
-    layer.mlp.up_proj = OwnMatmulWeight(gguf, Blk(il, "ffn_up.weight"), pol);
-    layer.mlp.down_proj = OwnMatmulWeight(gguf, Blk(il, "ffn_down.weight"), pol);
+    LoadMatmulWeightOrNvfp4(gguf, Blk(il, "ffn_gate.weight"), pol,
+                            &layer.mlp.gate_proj, &layer.mlp.gate_proj_fp4);
+    LoadMatmulWeightOrNvfp4(gguf, Blk(il, "ffn_up.weight"), pol,
+                            &layer.mlp.up_proj, &layer.mlp.up_proj_fp4);
+    LoadMatmulWeightOrNvfp4(gguf, Blk(il, "ffn_down.weight"), pol,
+                            &layer.mlp.down_proj, &layer.mlp.down_proj_fp4);
     w.layers.push_back(std::move(layer));
   }
   return w;

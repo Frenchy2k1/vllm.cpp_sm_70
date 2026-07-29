@@ -73,6 +73,18 @@ enum class GgufResidency {
   // tokens may move — and toward the file's f16 truth, see the leaf spec's
   // correctness section.
   kKeepF16,
+  // `QUANT-GGUF-NVFP4` column C: an NVFP4 (ggml type 40) weight stays in fp4 and
+  // is REPACKED at load into the (weight_packed [N,K/2], weight_scale [N,K/16])
+  // operand pair every NVFP4 GEMM in this tree already consumes, carrying the
+  // `<stem>.scale` sidecar on as `Nvfp4Weight::scale2`. Deliberately NOT
+  // kKeepQuant: NVFP4 has no `vt::DType` block encoding and cannot have one (its
+  // value is not determined by its blocks — see the leaf spec's Risks/decisions),
+  // so the product is an `Nvfp4Weight` (three buffers) rather than a block-typed
+  // vt::Tensor, and the consumer is `vt::MatmulNvfp4*` rather than a vec_dot. The
+  // repack is a pure byte permutation, bit-identical to the compressed-tensors
+  // container's own operands, so this residency changes WHERE the arithmetic
+  // happens (fp4 kernel, not a load-time bf16 expansion) and not what it is.
+  kNvfp4Fp4,
 };
 
 const char* Name(GgufTensorRole role);
@@ -96,7 +108,16 @@ bool KeepQuantDType(uint32_t ggml_type, vt::DType* out);
 // a bf16 matmul weight.
 bool KeepF16DType(uint32_t ggml_type);
 
+// True when `ggml_type` is NVFP4 (ggml type id 40) — the one encoding that can
+// stay in its own 4-bit form and be computed on natively. It has no vt block
+// dtype by design (see kNvfp4Fp4 above), so this is a plain id test rather than
+// a `BlockDTypeFromGgmlTypeId` lookup.
+bool KeepNvfp4DType(uint32_t ggml_type);
+
 // The pure decision. `shape` is the GGUF reader's torch-order shape.
+// kNvfp4Fp4 requires ALL of: nvfp4_fp4 enabled, cpu_ref off, an NVFP4 encoding,
+// a role whose bytes are taken verbatim, the expected rank, and K a whole number
+// of 64-element NVFP4 blocks.
 // kKeepQuant requires ALL of: keep_quant enabled, cpu_ref off, a role whose
 // bytes are taken verbatim, the expected rank, a supported encoding with an
 // executable vec_dot kernel, and K a whole number of blocks.
@@ -104,8 +125,9 @@ bool KeepF16DType(uint32_t ggml_type);
 // keep-quant eligible, a role whose bytes are taken verbatim (incl. the F16
 // embedding table, which is a plain gather), and an F16 encoding. Anything else
 // is kExpandBf16 — the decision is total and never throws.
-GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool cpu_ref,
-                              GgufTensorRole role, uint32_t ggml_type,
+GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
+                              bool cpu_ref, GgufTensorRole role,
+                              uint32_t ggml_type,
                               const std::vector<int64_t>& shape);
 
 // True when the device this process will actually run the forward on can
@@ -116,6 +138,15 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool cpu_ref,
 // row), and the day that kernel is registered for another device this default
 // follows it with no edit here.
 bool GgufQuantComputeAvailable();
+
+// True when the device this process will run the forward on can execute a
+// native NVFP4 GEMM (`OpId::kMatmulNvfp4`), i.e. when an fp4-resident weight has
+// a consumer. Registered for CUDA only (src/vt/cuda/cuda_matmul_nvfp4.cu), so a
+// CPU build keeps expanding NVFP4 to bf16 at load — which stays CORRECT, just
+// unquantized, and is the documented state of the `C` column off CUDA. Same
+// shape as GgufQuantComputeAvailable: the day a second backend registers the op,
+// the default follows it with no edit here.
+bool GgufNvfp4ComputeAvailable();
 
 // Loader-wide residency policy.
 struct GgufLoadPolicy {
@@ -157,6 +188,23 @@ struct GgufLoadPolicy {
   // activation/KV workspace, not weights. It rides expand_nk (CPU-only, off under
   // cpu_ref). See docs/BENCHMARKS.md and the leaf spec §L6.
   bool keep_f16 = false;
+  // `QUANT-GGUF-NVFP4` column C — native fp4 residency. An NVFP4 matmul/expert
+  // weight is repacked at load into the NVFP4 GEMM's operand pair instead of
+  // being expanded to bf16, and the forward runs the already-gated fp4 kernels
+  // on it. FromEnv() turns it ON wherever GgufNvfp4ComputeAvailable() holds (so
+  // CUDA yes, CPU no), and VT_GGUF_NVFP4_FP4=0 is the same-binary opt-out that
+  // restores the bf16 expansion exactly. Forced off by cpu_ref, like every other
+  // residency, so the oracle load stays byte-identical.
+  bool nvfp4_fp4 = false;
+  // Within the fp4 residency, whether to run TRUE W4A4 (fp4 activations, using
+  // the file's `<stem>.input_scale` sidecars) or W4A16 (bf16 activations, the
+  // `use_a16` mode vLLM also supports — kernels/linear/__init__.py:879-881). We
+  // mirror BOTH, as the standing directive requires; W4A4 is the default because
+  // it is what the sibling compressed-tensors container of the same model runs.
+  // VT_GGUF_NVFP4_W4A4=0 drops the activation globals (alpha stays 0, so
+  // `Nvfp4Weight::IsTrueW4A4()` is false) and the forward takes its W4A16 arm.
+  // Rides nvfp4_fp4.
+  bool nvfp4_w4a4 = false;
   // VT_CPU_REF=1 — the parity ORACLE switch (spec gate 2). Forces the full
   // dequant-to-bf16 load path regardless of `keep_quant`, so the bit-stable
   // reference numerics stay reachable once keep-quant becomes the default.

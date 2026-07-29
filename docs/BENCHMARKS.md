@@ -3877,6 +3877,48 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
+### Native NVFP4 compute from a GGUF, `QUANT-GGUF-NVFP4` column `C` (2026-07-29) - correctness binding, speed PENDING
+
+**Benchmark disposition: `PENDING`.** This change moves NVFP4 GGUF weights off
+the load-time bf16 expansion and onto the existing `vt::MatmulNvfp4*` kernels,
+so unlike the materialization row below it DOES owe a number: an fp4-vs-bf16
+same-binary A/B on the 27B NVFP4 GGUF (throughput, TTFT, TPOT, peak memory),
+plus the vLLM oracle arm on the equivalent workload. Not measured yet, and no
+number is claimed. Reproduction entry point, on an idle GB10 under one
+`flock $HOME/gpu.lock` for the whole series:
+
+    VLLM_NVFP4_GGUF=~/bench/q36-27b-nvfp4.gguf \
+    VLLM_NVFP4_ST_DIR=~/bench/q36-27b-nvfp4-vllm \
+      ./tests/test_qwen27_gguf_nvfp4_compute            # correctness + residency
+    VT_GGUF_NVFP4_FP4=1 ./examples/cli --model ~/bench/q36-27b-nvfp4.gguf ...
+    VT_GGUF_NVFP4_FP4=0 ./examples/cli --model ~/bench/q36-27b-nvfp4.gguf ...
+
+The two arms differ ONLY in the residency flag, so they are a same-binary A/B by
+construction.
+
+**A cross-container throughput or token comparison against
+`~/bench/q36-27b-nvfp4-vllm/` is NOT a valid arm and must not be published as
+one.** The two containers are not the same model: the GGUF NVFP4-quantizes the
+192-tensor GDN `in_proj_{qkv,z,a,b}` family that the safetensors keeps in BF16
+(mean relative weight error ~0.18 on `attn_qkv`, measured layers 0/1/40), and
+their activation global scales disagree on most projections (`ffn_gate` 808 vs
+812, `ffn_up` 344 vs 276, `ffn_down` 5.219 vs 3.547, `attn_output` 724 vs 292;
+`attn_q` matches). This retires the reading recorded elsewhere in this file that
+their token divergence at index 4 was a bf16-vs-fp4 COMPUTE artifact closable by
+this row. Full table: `.agents/specs/gguf-nvfp4-native-compute.md` Sec A.
+
+**The binding correctness result is BYTE-IDENTITY of the fp4 operands**, which
+is stronger than a value comparison and is what makes the fp4 kernels reusable
+without re-deriving numerics: the ggml type-40 blocks repack into exactly the
+`weight_packed` / `weight_scale` bytes the compressed-tensors container of the
+same quantization run stores.
+
+    CI (asset-free, real bytes from BOTH containers embedded)
+      tests/vllm/test_gguf_nvfp4.cpp        11/11 cases, 2207/2207 assertions
+      tests/vllm/test_gguf_keep_quant.cpp   37/37 cases, 5986/5986 assertions
+    Mutation (the gate is not vacuous): flipping the nibble halves in
+      RepackGgufNvfp4Rows makes test_gguf_nvfp4 9/11, 6 assertions RED.
+
 ### NVFP4 in the GGUF loader, `QUANT-GGUF-NVFP4` (2026-07-28) - correctness only, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE. `benchmark_binding=false`.** This row

@@ -211,4 +211,44 @@ std::vector<uint16_t> DequantGgufRowToBf16(uint32_t ggml_type,
   return DequantGgufRowToBf16(ggml_type, data, numel, 1.0F);
 }
 
+void RepackGgufNvfp4Rows(const uint8_t* src, int64_t rows, int64_t k,
+                         uint8_t* out_packed, uint8_t* out_scale) {
+  VT_CHECK(src != nullptr && out_packed != nullptr && out_scale != nullptr,
+           "gguf nvfp4 repack: null buffer");
+  VT_CHECK(rows >= 0 && k >= 0, "gguf nvfp4 repack: negative extent");
+  VT_CHECK(k % 64 == 0,
+           "gguf nvfp4 repack: K must be a whole number of 64-element NVFP4 "
+           "blocks");
+  const int64_t nblocks = k / 64;
+  for (int64_t r = 0; r < rows; ++r) {
+    const uint8_t* srow = src + r * nblocks * 36;
+    uint8_t* prow = out_packed + r * (k / 2);
+    uint8_t* scrow = out_scale + r * (k / 16);
+    for (int64_t b = 0; b < nblocks; ++b) {
+      const uint8_t* blk = srow + b * 36;
+      // Scales: 4 fp8-e4m3 bytes per 64-element block, one per 16-element
+      // sub-block, already in ascending sub-block order — so the linear
+      // [rows, k/16] stream is a straight copy, not a permutation.
+      std::memcpy(scrow + b * 4, blk, 4);
+      const uint8_t* qs = blk + 4;
+      for (int s = 0; s < 4; ++s) {
+        const uint8_t* sub = qs + s * 8;
+        // ggml: sub[j] holds element j in the LOW nibble and element j+8 in the
+        // HIGH nibble. torch: byte i holds element 2i low, 2i+1 high. Nothing
+        // crosses a 16-element sub-block, so this is a local 8-byte shuffle.
+        uint8_t* dst = prow + (b * 64 + s * 16) / 2;
+        for (int i = 0; i < 8; ++i) {
+          const int e0 = 2 * i;
+          const int e1 = 2 * i + 1;
+          const uint8_t n0 = e0 < 8 ? static_cast<uint8_t>(sub[e0] & 0x0FU)
+                                    : static_cast<uint8_t>(sub[e0 - 8] >> 4);
+          const uint8_t n1 = e1 < 8 ? static_cast<uint8_t>(sub[e1] & 0x0FU)
+                                    : static_cast<uint8_t>(sub[e1 - 8] >> 4);
+          dst[i] = static_cast<uint8_t>(n0 | static_cast<uint8_t>(n1 << 4));
+        }
+      }
+    }
+  }
+}
+
 }  // namespace vllm

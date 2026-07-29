@@ -79,4 +79,35 @@ std::vector<uint16_t> DequantGgufRowToBf16(uint32_t ggml_type,
                                            const uint8_t* data, int64_t numel,
                                            float global_scale);
 
+// --- NVFP4 (type 40) REPACK — the `C` column's whole mechanism ---------------
+//
+// Rearrange `rows` x `k` NVFP4 elements from the ggml type-40 container into the
+// two operand streams every NVFP4 GEMM in this tree already consumes:
+//
+//   out_packed [rows, k/2]   two e2m1 nibbles per byte, TORCH-PAIRWISE
+//                            (element 2i low, 2i+1 high)
+//   out_scale  [rows, k/16]  one IEEE fp8-e4m3fn byte per 16-element group,
+//                            LINEAR (row-major, not swizzled)
+//
+// This is a PURE BYTE PERMUTATION: no value is decoded, rounded or rescaled, and
+// the per-tensor `<stem>.scale` sidecar is NOT applied here (it travels on as
+// `Nvfp4Weight::scale2`, exactly as `weight_scale_2` does on the safetensors
+// side). The output is therefore BIT-IDENTICAL to the `weight_packed` /
+// `weight_scale` tensors of the compressed-tensors export of the same
+// quantization run — measured, zero differing bytes, on five real Qwen3.6-27B
+// projections; see .agents/specs/gguf-nvfp4-native-compute.md Sec B. That
+// identity is what lets a GGUF weight enter the already-gated fp4 kernels
+// without re-litigating any numerics.
+//
+// The two containers differ EXACTLY in the nibble order (ggml packs a 16-element
+// sub-block as byte j = element j low / element j+8 high; torch packs it
+// pairwise) and in whether the scales are interleaved with the nibbles. Getting
+// that permutation wrong preserves the value histogram, so it produces finite,
+// plausible logits — hence the byte-identity gate rather than a tolerance.
+//
+// `k` must be a multiple of 64 (the ggml block). `src` holds
+// rows * k/64 * 36 bytes; the caller (gguf_reader) has validated the span.
+void RepackGgufNvfp4Rows(const uint8_t* src, int64_t rows, int64_t k,
+                         uint8_t* out_packed, uint8_t* out_scale);
+
 }  // namespace vllm
