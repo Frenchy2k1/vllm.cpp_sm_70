@@ -237,12 +237,25 @@ deepseek_v4::MhcPreResult DispMhcPre(const V4Backend& be, const std::vector<floa
     return deepseek_v4::MhcDevice()->pre(*be.q, residual, fn, scale, base, hc, hidden, rms_eps,
                                          hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, iters,
                                          norm_weight, norm_eps);
-  // NOTE (Brick B finding): the #183 MhcPreKernel is a <<<1,1>>> SINGLE-THREAD
-  // correctness stub. Routing MhcPre to it (86 calls/step over hc*H=16K, single
-  // GPU thread) REGRESSED decode ~10x (0.59 vs 6.5 tok/s), so MhcPre stays on the
-  // host until a REAL PARALLEL MhcPre kernel is written (the hardest remaining
-  // Brick-B piece: folded RMSNorm + 20-iter Sinkhorn + gates + stream collapse).
-  // The parallel glue (SwiGLU/Router/MhcPost, Grid-launched) IS routed to device.
+  // Brick B: in-place device MHC-pre via the PARALLEL MhcPreParallelKernel (one
+  // block over the H width; the #183 <<<1,1>>> stub regressed decode 10×, so this
+  // is the real parallel kernel). Near-tie vs host (width-reduction reorder).
+  if (GlueDev(be)) {
+    deepseek_v4::MhcPreResult out;
+    out.pre_mix.resize(static_cast<size_t>(hc));
+    out.post_mix.resize(static_cast<size_t>(hc));
+    out.comb_mix.resize(static_cast<size_t>(hc * hc));
+    out.layer_input.resize(static_cast<size_t>(hidden));
+    std::vector<float> mix(static_cast<size_t>((2 + hc) * hc));  // pre's intermediate mixes
+    const bool has_norm = !norm_weight.empty();
+    deepseek_v4::MhcDevice()->pre_ip(
+        *be.q, out.pre_mix.data(), out.post_mix.data(), out.comb_mix.data(),
+        out.layer_input.data(), mix.data(), residual.data(), fn.data(), scale.data(), base.data(),
+        hc, hidden, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, iters,
+        has_norm ? norm_weight.data() : nullptr, has_norm, norm_eps);
+    SyncDeviceGemm(be);
+    return out;
+  }
   return MhcPre(residual, fn, scale, base, hc, hidden, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
                 hc_post_mult, iters, norm_weight, norm_eps);
 }

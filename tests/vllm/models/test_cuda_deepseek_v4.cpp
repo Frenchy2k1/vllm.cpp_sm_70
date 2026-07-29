@@ -617,8 +617,26 @@ TEST_CASE("DeepseekV4 device MHC + router in place == round-trip (Brick B)") {
                             scale.data(), base.data(), hc, hidden, eps, eps, eps, 2.0f, iters,
                             nw.data(), true, eps);
     gpu.Synchronize(g.q);
-    for (size_t i = 0; i < ip.layer_input.size(); ++i) CHECK(ip.layer_input[i] == rt.layer_input[i]);
-    for (size_t i = 0; i < ip.comb_mix.size(); ++i) CHECK(ip.comb_mix[i] == rt.comb_mix[i]);
+    // pre_ip is the PARALLEL MhcPreParallelKernel (block-reduce over H in double) vs
+    // the round-trip's single-thread float accumulation → CHARACTERIZED NEAR-TIE (the
+    // width reduction reorders); Sinkhorn + gates stay in host order.
+    for (float v : ip.layer_input) CHECK(std::isfinite(v));
+    CHECK(RelL2(ip.layer_input, rt.layer_input) < 1e-3);
+    CHECK(RelL2(ip.comb_mix, rt.comb_mix) < 1e-3);
+    // RED-first: a different residual changes the parallel output.
+    dv4::MhcPreResult ip2;
+    ip2.pre_mix.resize(static_cast<size_t>(hc));
+    ip2.post_mix.resize(static_cast<size_t>(hc));
+    ip2.comb_mix.resize(static_cast<size_t>(hc * hc));
+    ip2.layer_input.resize(static_cast<size_t>(hidden));
+    auto res2 = residual;
+    res2[0] += 5.0f;
+    dv4::MhcDevice()->pre_ip(g.q, ip2.pre_mix.data(), ip2.post_mix.data(), ip2.comb_mix.data(),
+                            ip2.layer_input.data(), mix.data(), res2.data(), fn.data(),
+                            scale.data(), base.data(), hc, hidden, eps, eps, eps, 2.0f, iters,
+                            nw.data(), true, eps);
+    gpu.Synchronize(g.q);
+    CHECK(RelL2(ip2.layer_input, ip.layer_input) > 1e-4);
   }
   // router (non-hash, biased top-k)
   {

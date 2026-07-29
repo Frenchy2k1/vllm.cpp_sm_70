@@ -33522,3 +33522,33 @@ gated + token-identical + flat; the remaining glue — a **real parallel MhcPre 
 regresses 10×, so reuse is not viable for it), **RMSNorm**, **RoPE**, **MoE combine** — are the next
 gated increments (stacking on this branch). I did NOT ship the 10×-regressing single-thread MhcPre as
 "flat." Box restored (worker up restart=always, flock free, no stray). Row `ACTIVE`.
+
+## DeepSeek-V4 device-resident decode campaign — Brick B increment 3 (PARALLEL MhcPre kernel + the per-op-sync-tax finding) (2026-07-29, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-dgl`, branch `deepseek-v4-device-glue`, base `21191ce2`, commit `9bd51523`, NOT pushed)
+
+Coordinator greenlit writing the parallel MhcPre (no reuse shortcut — the #183 stub is single-thread).
+**The crux:** `MhcPreParallelKernel` — one block, 256 threads over the `hc·H`=16 384 width; the sqrsum
+reduction, the `hc3`=24 mix dot-products, and the folded final RMSNorm are block-tree reductions (double
+accumulate); the tiny `hc`-sized gates + the 20-iter Sinkhorn stay on thread 0 in HOST ORDER; the per-`h`
+`layer_out` dot (over `hc`=4) is sequential (order kept). `MhcPreInPlaceLaunch` launches it (256 threads,
+NO `<<<1,1>>>`); `DispMhcPre` re-enabled to the device path. **CHARACTERIZED NEAR-TIE (stated):** the width
+reductions reorder vs the single-thread float accumulation → RelL2 < 1e-3, not bit-identical.
+
+**GATES:** CUDA unit `test_cuda_deepseek_v4` **14/14·736** (MhcPre parallel == round-trip #183 RelL2<1e-3
+near-tie, RED-first residual perturbation; the other in-place glue still bit-identical); `test_deepseek_v4_gguf_load`
+**12/12·531**; CPU + CUDA `-Werror` clean. **Real 80.7 GB model, ALL device kernels on (attn + swiglu +
+router + mhcpost + hchead + MhcPre-PARALLEL): TOKEN-IDENTICAL** — `11111 16 455 6102 294 8760 344 11111 …`
+= "…Paris."; decode **5.43 tok/s (24-tok)**.
+
+**KEY FINDING — the per-op SYNC tax, NOT single-thread poison:** the parallel MhcPre is fine (the 10× poison
+= 0.59 tok/s is GONE — verified). The ~21% dip vs the host-glue path (5.43 vs **6.84** glue-off, same session
+24-tok) is the ~560 per-op device-glue drains/step — each `Disp*` device call syncs so the host can read its
+output, inherent to Brick B's host-orchestrated + per-op-synced structure. This is EXACTLY what **Brick C
+(drop per-op sync, keep activations device-resident) + Brick D (the decode graph = one `cudaGraphLaunch`)**
+remove. No single-thread on the hot path; every device glue kernel is genuinely parallel.
+
+**STATUS:** the crux (parallel MhcPre) + all `Disp*`-routed glue (SwiGLU, router, MHC pre/post/head) are on
+device + token-identical + gated. Remaining for FULL device-residency: **device RMSNorm, RoPE, MoE combine**
+— these can land in Brick B or fold into Brick C's device-resident assembly; on their own they'd add MORE
+per-op-sync dip with NO Brick-B speed benefit (the dip only resolves at the graph), so folding them into
+Brick C (where the syncs are dropped) is the cleaner path. Reported for coordinator direction. Box restored
+(worker up restart=always, flock free, no stray). Row `ACTIVE`.

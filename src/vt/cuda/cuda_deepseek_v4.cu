@@ -183,6 +183,89 @@ __global__ void MhcPreKernel(const float* residual, const float* fn, const float
   }
 }
 
+// Brick B — PARALLEL MhcPre (one block, blockDim threads over the H/flat width; the
+// tiny hc-sized gates + 20-iter Sinkhorn stay on thread 0 in HOST ORDER). Same math
+// as MhcPreKernel but real-parallel (no <<<1,1>>> on the decode hot path). The width
+// reductions (sqrsum, the hc3 mix dots, the final RMSNorm ss) accumulate in DOUBLE
+// and reduce in a block tree → a CHARACTERIZED near-tie vs the single-thread version
+// (reduction reorder); the per-h layer_out dot (over hc) is sequential → order kept.
+__global__ void MhcPreParallelKernel(const float* __restrict__ residual,
+                                     const float* __restrict__ fn, const float* __restrict__ scale,
+                                     const float* __restrict__ base, int hc, int hidden,
+                                     float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
+                                     float hc_post_mult, int iters,
+                                     const float* __restrict__ norm_weight, int has_norm,
+                                     float norm_eps, float* mixes, float* pre_out, float* post_out,
+                                     float* comb_out, float* layer_out) {
+  const int hc3 = (2 + hc) * hc;
+  const int flat = hc * hidden;
+  const int tid = threadIdx.x;
+  const int nt = blockDim.x;
+  extern __shared__ double red[];  // [nt]
+
+  auto block_reduce = [&](double v) -> double {
+    red[tid] = v;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+      if (tid < s) red[tid] += red[tid + s];
+      __syncthreads();
+    }
+    const double r = red[0];
+    __syncthreads();
+    return r;
+  };
+
+  // sqrsum = Σ residual[i]^2 ; rms = 1/sqrt(mean + eps)
+  double ls = 0.0;
+  for (int i = tid; i < flat; i += nt) { const double r = residual[i]; ls += r * r; }
+  const double sqrsum = block_reduce(ls);
+  const float rms = 1.0f / sqrtf(static_cast<float>(sqrsum / static_cast<double>(flat)) + rms_eps);
+
+  // mixes[o] = (Σ_i residual[i]*fn[o*flat+i]) * rms
+  for (int o = 0; o < hc3; ++o) {
+    double la = 0.0;
+    const int frow = o * flat;
+    for (int i = tid; i < flat; i += nt) la += static_cast<double>(residual[i]) * fn[frow + i];
+    const double acc = block_reduce(la);
+    if (tid == 0) mixes[o] = static_cast<float>(acc) * rms;
+  }
+  __syncthreads();
+
+  // gates + Sinkhorn (tiny hc; thread 0 sequential = host order)
+  if (tid == 0) {
+    for (int j = 0; j < hc; ++j) pre_out[j] = Sig(mixes[j] * scale[0] + base[j]) + hc_pre_eps;
+    for (int j = 0; j < hc; ++j)
+      post_out[j] = Sig(mixes[hc + j] * scale[1] + base[hc + j]) * hc_post_mult;
+    float cl[256], m[256];
+    for (int j = 0; j < hc; ++j)
+      for (int k = 0; k < hc; ++k) {
+        const int idx = j * hc + k;
+        cl[idx] = mixes[2 * hc + idx] * scale[2] + base[2 * hc + idx];
+      }
+    SinkhornInplace(cl, m, hc, iters, hc_sinkhorn_eps);
+    for (int i = 0; i < hc * hc; ++i) comb_out[i] = m[i];
+  }
+  __syncthreads();
+
+  // layer_out[h] = Σ_j pre[j]*residual[j*hidden+h] (parallel over h; per-h order kept)
+  for (int h = tid; h < hidden; h += nt) {
+    float acc = 0.0f;
+    for (int j = 0; j < hc; ++j) acc += pre_out[j] * residual[j * hidden + h];
+    layer_out[h] = acc;
+  }
+  __syncthreads();
+
+  // optional folded final RMSNorm over hidden
+  if (has_norm) {
+    double ss = 0.0;
+    for (int h = tid; h < hidden; h += nt) { const double v = layer_out[h]; ss += v * v; }
+    const double ssr = block_reduce(ss);
+    const float r =
+        1.0f / sqrtf(static_cast<float>(ssr / static_cast<double>(hidden)) + norm_eps);
+    for (int h = tid; h < hidden; h += nt) layer_out[h] = layer_out[h] * r * norm_weight[h];
+  }
+}
+
 // MhcPost (torch.py:94-106). One thread per (j,h).
 __global__ void MhcPostKernel(const float* x, const float* residual, const float* post_mix,
                               const float* comb, int hc, int hidden, float* out) {
@@ -875,11 +958,12 @@ void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_
                          bool has_norm, float norm_eps) {
   if (hidden == 0) return;
   cudaStream_t s = AsStream(q);
-  MhcPreKernel<<<1, 1, 0, s>>>(residual, fn, scale, base, static_cast<int>(hc),
-                               static_cast<int>(hidden), rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-                               hc_post_mult, static_cast<int>(iters), norm_weight,
-                               has_norm ? 1 : 0, norm_eps, mix_scratch, pre_mix, post_mix,
-                               comb_mix, layer_input);
+  const unsigned block = 256;  // one block, parallel over the H/flat width
+  const unsigned shmem = block * sizeof(double);
+  MhcPreParallelKernel<<<1, block, shmem, s>>>(
+      residual, fn, scale, base, static_cast<int>(hc), static_cast<int>(hidden), rms_eps,
+      hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, static_cast<int>(iters), norm_weight,
+      has_norm ? 1 : 0, norm_eps, mix_scratch, pre_mix, post_mix, comb_mix, layer_input);
   Check(cudaGetLastError(), "mhc_pre_ip launch");
 }
 
