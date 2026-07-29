@@ -29,12 +29,15 @@ namespace vllm {
 namespace {
 
 // registry.py _ModelInfo for Kimi K3: text generation, HYBRID (69 KDA linear-attn
-// layers carry recurrent/conv inner state), MULTIMODAL (MoonViT-V2 vision).
+// layers), MULTIMODAL (MoonViT-V2 vision). Like the Qwen3.5 sibling wrappers, the
+// OUTER KimiK3ForConditionalGeneration registration inherits IsHybrid but NOT
+// HasInnerState: the recurrent/conv inner state belongs to the inner
+// KimiLinearForCausalLM language-model class, not this multimodal wrapper.
 inline constexpr ModelInfo kKimiK3Info{
     .is_text_generation_model = true,
     .is_pooling_model = false,
     .is_hybrid = true,
-    .has_inner_state = true,
+    .has_inner_state = false,
     .supports_multimodal = true,
     .score_type = "bi-encoder",
 };
