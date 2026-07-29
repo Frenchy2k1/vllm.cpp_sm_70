@@ -182,8 +182,19 @@ grouped output-LoRA `wo_a` bmm→`wo_b`); new TUs `deepseek_v4_dsa.{h,cpp}` + `t
 `-Wall -Werror -Wextra`, SACRED-inert (shared `mla_attention` untouched — extraction is a W7
 follow-on); new kernel row `KERNEL-ATTN-DSA-SPARSE-INDEX` (`SPIKE`). **SGLang `v0.5.15` registers +
 implements `DeepseekV4ForCausalLM`** (full DSA/MHC/o_lora stack, 2856 LoC) ⇒ a viable SECOND
-benchmark/primitive-dump reference (same single-GB10 memory constraint). Residuals: MHC (W5),
-sqrtsoftplus/hash MoE (W6), device kernel + forward integration + strict gate (W7-W8 = multi-Spark).
+benchmark/primitive-dump reference (same single-GB10 memory constraint). **W4 PRIMITIVES LANDED
+(2026-07-29, `CLAIM-DEEPSEEK-V4-W4`, base `4d1be010`):** the second half of the DSA stack ported +
+unit-gated as portable host references — the DSA COMPRESSOR forward (`CompressorPoolNorm` = the
+softmax-weighted window POOL, `softmax(score,dim=0)` per head-dim column then RMSNorm; the fused
+save-time APE add) and the **fp8_ds_mla** KV-cache state read/write layout (448-wide NoPE FP8 e4m3
+with per-64 UE8M0 power-of-two block scales + 64-wide RoPE bf16, 576B token stride, 7+1 scale
+region, + the dequant read); new TUs `deepseek_v4_compressor.{h,cpp}` + `test_deepseek_v4_compressor`
+**12/12·164** (hand-derived literals + double-precision references + independent UE8M0 recompute;
+RED-first proven), ported 1:1 from `fused_compress_quant_cache.py`/`save_partial_states.py`/
+`compressor.py` and cross-checked vs SGLang `v0.5.15` `dsv4/dequant_k_cache.py`; SACRED-inert (shared
+`mla_attention` empty-diff); new kernel row `KERNEL-ATTN-DSA-COMPRESSOR` (`SPIKE`). Residuals: MHC
+(W5), sqrtsoftplus/hash MoE (W6), the fused device kernel + forward integration + the compressor
+state-cache gather addressing (W7), strict gate (W8) = multi-Spark.
 **MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
 [`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
 DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)

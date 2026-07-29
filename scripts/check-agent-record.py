@@ -60,9 +60,21 @@ MATRICES = {
     # Kimi-Linear-48B proxy e2e gate are named residuals. Shared unblocker for
     # Kimi-Linear-48B and Kimi-K3 (W4). `SPIKE`, `CLAIM-KDA-KERNEL`, spec
     # specs/kda-kernel-delta.md).
+    # 40 since 2026-07-29: +`KERNEL-ATTN-DSA-COMPRESSOR` (the DeepSeek-V4 DSA
+    # COMPRESSOR — the softmax-weighted window POOL that compresses
+    # `(1+overlap)*compress_ratio` KV-state rows into one compressed latent (per
+    # head-dim-column softmax, then RMSNorm) + the fused save-time APE add + the
+    # fp8_ds_mla KV-cache STATE layout (448 fp8 UE8M0 per-64 block scales + 64
+    # bf16 rope, 576B token stride, 7+1 scale bytes). A genuinely separate op from
+    # `KERNEL-ATTN-DSA-SPARSE-INDEX` (which SELECTS keys): this one POOLS +
+    # QUANTIZES the selected/windowed KV into the latent the MLA reads and how it
+    # is cached across steps. W4 landed a portable host reference + unit gate; the
+    # device kernel (the fused `_fused_kv_compress_norm_rope_insert_sparse_attn`)
+    # is a W7 residual. `SPIKE`, `CLAIM-DEEPSEEK-V4-W4`, spec
+    # specs/deepseek-v4-flash.md).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 39),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 40),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

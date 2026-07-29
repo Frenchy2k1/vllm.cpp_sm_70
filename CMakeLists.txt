@@ -402,6 +402,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp
   src/vllm/model_executor/models/deepseek_v4_dsa.cpp
+  src/vllm/model_executor/models/deepseek_v4_compressor.cpp
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp

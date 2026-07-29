@@ -31588,3 +31588,44 @@ DeepSeek-V4 + Kimi-K3 loaders drop their MXFP4 refusal.
   rows — DFlash-class), Gemma-4 AUDIO→text e2e (the A1 mel feature extractor + engine
   `<audio>` merge through this same fold; the G3 audio tower is per-stage f32-exact), the
   full in-runner batched mm path, a C++ NaFlex image processor, per-axis speed.
+
+## 2026-07-29 — DeepSeek-V4-Flash W4: DSA COMPRESSOR + fp8_ds_mla KV-state host-reference brick (`CLAIM-DEEPSEEK-V4-W4`)
+
+**Base:** `main` HEAD `4d1be010` (isolated worktree `/home/mudler/_git/vllm.cpp-w4`, branch
+`claim-deepseek-v4-w4`). CPU-only, foreground, NOT pushed.
+
+**What landed.** The second half of the DSA sparse-attention stack for `DeepseekV4ForCausalLM`, as
+portable host (CPU) references + unit gate (continues the W3 host-reference lane; the full-model gate
+is multi-Spark-blocked — 156.7 GiB does not fit one GB10, and the forward also needs MHC + the
+sqrtsoftplus/hash MoE). New additive TUs `include/vllm/model_executor/models/deepseek_v4_compressor.h`
++ `src/vllm/model_executor/models/deepseek_v4_compressor.cpp`:
+- **(A) DSA COMPRESSOR forward** — `CompressorSaveScoreApe` (save-time `score += ape[pos %
+  compress_ratio]`, `save_partial_states.py:92-101`) + `CompressorPoolNorm` (the softmax-weighted
+  window POOL `softmax(score,dim=0)` PER head-dim column → weighted sum → RMSNorm,
+  `fused_compress_quant_cache.py:198-218`; the per-column softmax is the load-bearing nuance).
+- **(B) fp8_ds_mla KV-cache STATE layout** — `MakeFp8DsMlaLayout`/`Fp8DsMlaEncodeToken`/
+  `Fp8DsMlaDecodeToken`: 448-wide NoPE FP8 e4m3 with per-64 UE8M0 power-of-two block scales
+  (`exp=ceil(log2(absmax/448))`, byte `exp+127`), 64-wide RoPE bf16, 576B token stride, 7+1 scale
+  region, + the dequant read (`nope=e4m3·2^(byte-127)`). `fused_compress_quant_cache.py:220-297` +
+  `compressor.py:307-309`, cross-checked vs SGLang `v0.5.15` `dsv4/dequant_k_cache.py`.
+
+**Gate.** `test_deepseek_v4_compressor` **12/12 · 164 GREEN** — hand-derived literals (APE
+modulo-wrap; per-column softmax pool proven load-bearing; window masking; layout 448/64/576/7+1;
+all-ones→UE8M0 byte 119; value-3→byte 120; bf16 rope verbatim) + double-precision references
+(pool+norm rel-L2 < 1e-6; independent UE8M0 scale-byte recompute; round-trip < 0.05 fp8 granularity).
+**RED-first PROVEN:** scale-bias `+127→+126` fails 4/135, revert restores 12/12·164. Honest gate:
+hand-case + structural review, NOT a dumped-oracle rel-L2 (fixed-config 167B not constructible tiny).
+CPU **Debug** full-library build (a PRE-EXISTING GCC-13 `-O2` `-Werror=array-bounds` false positive
+in `voxtral.cpp`, unrelated, breaks the `-O2` full-library build; the new TUs are
+`-Wall -Werror -Wextra`-clean).
+
+**SACRED inertness.** Additive only; empty `git diff` over `mla_attention.{h,cpp}`/`cuda_mla_attn.cu`;
+`test_deepseek_v4_dsa` still 13/13·38, `test_deepseek_v4_scaffold` 4/4·40. New kernel row
+`KERNEL-ATTN-DSA-COMPRESSOR` (KERNEL count 39→40).
+
+**Residuals / next.** MHC hyper-connections (W5, no eager ref — hardest); sqrtsoftplus + hash-routed
+MoE over the FusedMoE fallback (W6); the fused device kernel
+(`_fused_kv_compress_norm_rope_insert_sparse_attn`) + `DeepseekV4Model::Forward` integration + the
+compressor state-cache gather addressing (the `head_offset` overlap window into the paged state +
+`CompressorBackend` paging) + shared-mla extraction (W7); the strict/near-tie engine gate (W8) — all
+multi-Spark-blocked on one GB10.
