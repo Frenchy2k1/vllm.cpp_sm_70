@@ -500,7 +500,12 @@ Env-doc hygiene (2026-07-29): two production env vars recent lanes added were
 undocumented (left `check-env-doc` RED) — `VLLM_PLUGINS` (user-facing plugin
 allowlist) documented in `docs/ENVIRONMENT.md`, `VLLM_GEMMA4_MM_DEBUG` (a
 diagnostic print switch) classified on `scripts/env-doc-allowlist.txt`;
-`check-env-doc` rc=0.
+`check-env-doc` rc=0. And the `check-device-leakage` DSR ratchet (RED from the
+W7-device lane): the 8 `kCUDA` op-lookups in `deepseek_v4_device.cpp` (the
+DeepSeek-V4 CUDA device-forward resolver TU) are allowlisted with a reason +
+a recorded FOLLOW-UP to thread the runner `DeviceType` through them (deferred,
+needs a GB10 re-gate — DGX offline); `check-device-leakage` rc=0. All six record
+checkers now green on main.
 The matrix opens with an
 architecture-support checklist (a per-architecture status roll-up covering every
 engaged model) that a CI checker keeps in lockstep with the detailed rows.
