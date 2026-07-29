@@ -274,6 +274,22 @@ array-bounds/stringop false positive neutralized locally). SACRED-inert (shared 
 TUs empty-diff; host oracle 6/6·26 unchanged). Honest 3-state: kernels RUNTIME-VERIFIED at small shape on
 real GB10; the real-checkpoint e2e stays W8 (156.7 GiB does not fit ONE GB10) + W2b tower materialization
 + the GGUF `blk.N.*` name-map.
+**W8-FINAL — ENTRYPOINT WIRING LANDED + GATED; THE RUN RE-SCOPED TO A CODE BLOCKER (2026-07-29,
+`CLAIM-DEEPSEEK-V4-W8`, base `376e186b`):** with W8 keep-quant + W2b tower materialization landed, this
+lane wired the top-level GGUF dispatch arm (the "one small code piece W2b named") and attempted the real
+single-Spark run. **Wiring (LANDED):** `DeepseekV4HfConfigFromGguf` (`deepseek_v4_weights.cpp`) maps
+`general.architecture=deepseek4`→the registered `DeepseekV4ForCausalLM` (republishing geometry into
+`config.raw` for `ParseDeepseekV4Config`); `LoadedEngine::FromModelDir` routes via
+`HfConfigFromGgufDispatch` (was qwen-only). Gate `test_deepseek_v4_gguf_load` **6/6·168** (CPU
+full-library `-Werror`-clean; +1 case: config maps + `ModelRegistry::Resolve`→V4 factory), qwen path
+byte-neutral (`test_model_registry` 24/24). **The RUN did NOT execute — BLOCKED on a CODE residual, not
+download/box, provable from source; NOT attempted (would OOM-reboot the box):** the forward
+(`ForwardComposeImpl`) reads the FULLY-DEQUANTIZED f32 `weights.host` tower, and `LoadDeepseekV4FromGguf`
+builds it unconditionally (every routed expert `HostVec`→f32) ≈ ~24 GiB/layer × 43 ≈ **~1.0 TiB** f32,
+past the 119 GiB unified pool by ~layer 5; the keep-quant `weights.gguf` tower (~91 GiB) is built but
+never read by the forward. **Named residual W2c:** rewire the forward onto the CIQ `kMatmulBTQuant`
+keep-quant blocks + gate off the host-f32 dequant, THEN the download + GB10 greedy gen +
+self-consistency/coherence gate + benchmark. No tokens generated (not faked); DGX left as found.
 **MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
 [`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
 DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)

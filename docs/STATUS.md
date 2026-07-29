@@ -335,6 +335,19 @@ rc=0). The V4 registry GGUF reject is now a PRECISE message (keep-quant + name-m
 W2b tower materialization pending). **The RUN did NOT execute** and was NOT faked: it is
 blocked on the unimplemented **W2b** (materialize the keep-quant blocks into the DeepseekV4
 towers via the name map) — a genuine code brick, then the 91 GB download + GB10 greedy gen.
+**W8-final entrypoint wiring landed + gated (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`, base
+`376e186b`):** with W2b landed, the top-level GGUF dispatch now recognizes a `deepseek4` file —
+`DeepseekV4HfConfigFromGguf` maps `general.architecture=deepseek4`→the registered
+`DeepseekV4ForCausalLM` (republishing geometry into `config.raw` for the parse hook) and
+`LoadedEngine::FromModelDir` routes it via `HfConfigFromGgufDispatch` (was qwen-only). Gate
+`test_deepseek_v4_gguf_load` 6/6·168 (CPU `-Werror`-clean), qwen path byte-neutral. **But the real
+single-Spark RUN is still BLOCKED — now on a CODE residual, not download/box, and was NOT attempted
+(it would OOM-reboot the box):** the DeepSeek-V4 forward composes off the FULLY-DEQUANTIZED f32
+`weights.host` tower, and `LoadDeepseekV4FromGguf` builds that host tower unconditionally (every
+routed expert `HostVec`→f32) ≈ ~24 GiB/layer × 43 ≈ **~1.0 TiB** f32, past the 119 GiB pool by
+~layer 5; the keep-quant `weights.gguf` tower (~91 GiB) is built but never read by the forward. A
+real run needs the forward rewired onto the CIQ `kMatmulBTQuant` keep-quant blocks + the host dequant
+gated off (named residual W2c). No tokens generated (not faked); DGX left as found.
 **W3 attention primitives landed
 (2026-07-28):** the genuinely-new-vs-V2/V3 math is ported as portable host references
 and unit-gated — the DSA "Lightning Indexer" sparse top-k SELECTION (a weighted

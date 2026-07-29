@@ -50,6 +50,21 @@ name map), then the 91 GB download + GB10 greedy generation + self-consistency /
 coherence gate. Benchmark disposition PENDING until W2b + the run land. Repro entry:
 `scripts/check-dsv4-gguf-namemap.py`; `build-cpu/tests/test_ops_quant_dot`.
 
+**W8-final update (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`, base `376e186b`): entrypoint wiring landed +
+gated; the RUN re-scoped to a CODE blocker, benchmark STILL PENDING (no numbers, not faked).** W2b
+(GGUF→tower materialization) landed, so the entrypoint arm was wired: a `deepseek4` GGUF now routes
+through `HfConfigFromGgufDispatch`/`DeepseekV4HfConfigFromGguf` onto the registered
+`DeepseekV4ForCausalLM` (gate `test_deepseek_v4_gguf_load` 6/6·168, CPU `-Werror`-clean). The real
+single-Spark `UD-IQ2_XXS` run was NOT attempted because it would OOM-reboot the box: the DeepSeek-V4
+forward (`ForwardComposeImpl`) reads the FULLY-DEQUANTIZED f32 `weights.host` tower, and
+`LoadDeepseekV4FromGguf` builds that host tower unconditionally (every routed expert `HostVec`→f32) —
+~24 GiB/layer × 43 layers ≈ **~1.0 TiB** f32, past the 119 GiB unified pool by ~layer 5. The keep-quant
+`weights.gguf` tower (~91 GiB) is built but never read by the forward. Real benchmark (TPOT / output
+throughput / peak resident memory / llama.cpp-on-card floor) is blocked on a named forward-over-keep-quant
+residual (W2c: rewire the forward onto the CIQ `kMatmulBTQuant` blocks + gate off the host dequant), then
+the download + GB10 run. No cross-engine oracle exists (vLLM 0.26 GGUF plugin has no V4 wiring); the gate
+would be our-engine self-consistency + coherence. DGX left as found (no download).
+
 ## GGUF IQ2_XXS + Q2_K dequant, the DeepSeek-V4-Flash single-Spark GGUF quant-path brick (2026-07-29, `CLAIM-DSV4-GGUF-LOADER`) - NOT-APPLICABLE (CPU dequant primitive, no throughput owed)
 
 No benchmark. W1 ports the two ~2-bit GGUF encodings the single-Spark

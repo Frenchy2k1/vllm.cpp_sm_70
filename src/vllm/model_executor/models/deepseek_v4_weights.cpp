@@ -531,6 +531,71 @@ DeepseekV4Params DeepseekV4ParamsFromGguf(const GgufFile& g) {
   return d;
 }
 
+HfConfig DeepseekV4HfConfigFromGguf(const GgufFile& g) {
+  // The GGUF is the source of geometry truth; resolve it ONCE (throws on a
+  // non-deepseek4 arch or a missing required key) and republish it.
+  const DeepseekV4Params p = DeepseekV4ParamsFromGguf(g);
+
+  HfConfig c;
+  // Keep llama.cpp's GGUF family key in model_type, but map `architectures` onto
+  // the registered vLLM model class so ModelRegistry::Resolve routes a deepseek4
+  // file into the DeepSeek-V4 factory — the same trick HfConfigFromGguf uses to
+  // map the qwen35* keys onto the Qwen3.5 wrappers.
+  c.model_type = "deepseek4";
+  c.architectures = {"DeepseekV4ForCausalLM"};
+  c.hidden_size = p.hidden_size;
+  c.num_hidden_layers = p.num_hidden_layers;
+  c.vocab_size = p.vocab_size;
+  c.num_attention_heads = p.num_attention_heads;
+  c.num_key_value_heads = p.num_key_value_heads;
+  c.head_dim = p.head_dim;
+  c.rms_norm_eps = p.rms_norm_eps;
+  c.rope_theta = p.rope_theta;
+  c.max_position_embeddings = p.max_position_embeddings;
+  c.torch_dtype = "bfloat16";
+
+  // Republish the DeepSeek-V4 scalars the registry parse hook
+  // (ParseDeepseekV4Config -> ParseDeepseekV4Params) reads from config.raw, so
+  // that hook validates the SAME geometry this GGUF describes. The weight loader
+  // itself re-derives from the GGUF KV (LoadDeepseekV4FromGguf ignores config).
+  nlohmann::json& raw = c.raw = nlohmann::json::object();
+  raw["hidden_size"] = p.hidden_size;
+  raw["num_hidden_layers"] = p.num_hidden_layers;
+  raw["vocab_size"] = p.vocab_size;
+  raw["num_attention_heads"] = p.num_attention_heads;
+  raw["num_key_value_heads"] = p.num_key_value_heads;
+  raw["head_dim"] = p.head_dim;
+  raw["qk_rope_head_dim"] = p.qk_rope_head_dim;
+  raw["q_lora_rank"] = p.q_lora_rank;
+  raw["o_lora_rank"] = p.o_lora_rank;
+  raw["o_groups"] = p.o_groups;
+  raw["sliding_window"] = p.sliding_window;
+  raw["rope_theta"] = p.rope_theta;
+  raw["compress_rope_theta"] = p.compress_rope_theta;
+  raw["rms_norm_eps"] = p.rms_norm_eps;
+  raw["max_position_embeddings"] = p.max_position_embeddings;
+  raw["num_nextn_predict_layers"] = p.num_nextn_predict_layers;
+  raw["n_routed_experts"] = p.n_routed_experts;
+  raw["num_experts_per_tok"] = p.num_experts_per_tok;
+  raw["moe_intermediate_size"] = p.moe_intermediate_size;
+  raw["n_shared_experts"] = p.n_shared_experts;
+  raw["norm_topk_prob"] = p.norm_topk_prob;
+  raw["routed_scaling_factor"] = p.routed_scaling_factor;
+  raw["swiglu_limit"] = p.swiglu_limit;
+  raw["scoring_func"] = p.scoring_func;
+  raw["topk_method"] = p.topk_method;
+  raw["num_hash_layers"] = p.num_hash_layers;
+  raw["expert_dtype"] = p.expert_dtype;
+  raw["hc_mult"] = p.hc_mult;
+  raw["hc_sinkhorn_iters"] = p.hc_sinkhorn_iters;
+  raw["hc_eps"] = p.hc_eps;
+  raw["index_head_dim"] = p.index_head_dim;
+  raw["index_n_heads"] = p.index_n_heads;
+  raw["index_topk"] = p.index_topk;
+  raw["compress_ratios"] = p.compress_ratios;
+  return c;
+}
+
 DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& config,
                                         const GgufLoadPolicy* policy) {
   (void)config;  // params resolved from the GGUF KV (self-describing vehicle)
