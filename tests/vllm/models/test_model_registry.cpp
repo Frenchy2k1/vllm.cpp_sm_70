@@ -194,10 +194,12 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       // registrations.
       CHECK(registration.info.is_hybrid);
       CHECK(registration.info.supports_multimodal);
-    } else if (registration.architecture == "Qwen3VLForConditionalGeneration") {
-      // Qwen3-VL (MM-ENGINE-FORWARD): MULTIMODAL (vision tower) but the 4B text
-      // backbone is PLAIN dense full-attention → NOT hybrid (no GDN state). This
-      // is the sole non-hybrid multimodal registration.
+    } else if (registration.architecture == "Qwen3VLForConditionalGeneration" ||
+               registration.architecture == "Gemma4ForConditionalGeneration") {
+      // Qwen3-VL (MM-ENGINE-FORWARD) + Gemma-4 (CLAIM-GEMMA4-MM-E2E): MULTIMODAL
+      // (SigLIP2 vision tower folded into the registered mm-forward) but the text
+      // backbone is dense full-attention → NOT hybrid (no GDN state). The two
+      // non-hybrid multimodal registrations.
       CHECK_FALSE(registration.info.is_hybrid);
       CHECK(registration.info.supports_multimodal);
     } else {

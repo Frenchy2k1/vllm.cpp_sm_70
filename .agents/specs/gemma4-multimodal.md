@@ -631,6 +631,78 @@ resident bf16 forward** (speed) and the **audio e2e GPU golden** are named resid
 
 ---
 
+## MM-E2E — IMAGE→text FOLDED into the ENGINE registered forward, dgx-GREEN near-tie (2026-07-29, `CLAIM-GEMMA4-MM-E2E`)
+
+The G2-impl residual ("register Gemma-4 as SupportsMultiModal + the tower→merge→decode
+fork through the engine") is CLOSED for IMAGE. Gemma-4 image→text now runs through the
+engine's REGISTERED forward (`ModelRegistry::Forward`), mirroring the Qwen3-VL fold
+(`CLAIM-ENGINE-MM-FORWARD`), NOT a bespoke standalone driver.
+
+### The fold (port map)
+- **`MultiModalForwardInput` gains `ple_token_ids`** (`model_registry.h`, additive
+  default-null): the Gemma-4 PLE masked ids (mm rows→0 + `vocab_size_per_layer_input`
+  range mask), mirror of `gemma4_mm.py` `embed_input_ids:1962-1973` + `gemma4.py`
+  `get_per_layer_inputs:857-863`. Gemma-4 uses the 1-D `ModelForwardInput::positions`
+  (NO 3-D MRoPE), NO DeepStack — so `positions3`/`deepstack` stay nullptr.
+- **`Gemma4Model::ForwardMm` + the `ForwardBody` mm seam** (`gemma4.cpp`, additive
+  default-null overrides): when set, the hidden stream STARTS from the already-merged
+  inputs_embeds (text rows √H-scaled, image rows the `embed_vision` projector output),
+  the PLE `embed_tokens_per_layer` lookup uses the masked ids, and `ple_proj` still
+  projects the merged embeds (`gemma4.py` forward inputs_embeds branch `:908-912`). The
+  two TEXT call sites pass null ⇒ the SACRED text 32/32 path is byte-identical.
+- **`gemma4_registry.cpp`:** `supports_multimodal=true` (no engine consumer ⇒ byte-
+  neutral flip) + the mm branch routing `ModelForwardInput.mm` + a borrow-capable
+  LoadedModel + `Make/BorrowGemma4LoadedModel` (mirror Qwen3-VL).
+- **`gemma4_mm.cpp` (NEW): `Gemma4GenerateGreedyViaRegistry`** — the single-sequence
+  greedy driver: prefill = `embed(prompt)*√H` + masked-scatter of the SigLIP2 projector
+  output into the `<image>` rows (`Qwen3VLMergeMultimodal`, modality-agnostic) + per-
+  layer paged KV (256 sliding / 512 full, YOCO-aware) → every step through
+  `ModelRegistry::Forward` with `input.mm` set (mirror `Qwen3VLGenerateGreedyViaRegistry`).
+
+### The gate (RATIFIED NEAR-TIE FORM) — MEASURED dgx GB10 sm_121a, `flock`
+`tests/vllm/multimodal/test_gemma4_registry_e2e.cpp` (dgx-only): image→text through
+`ModelRegistry::Forward` vs the STRICT `gemma4_e4b_image` golden. Runs the LIVE C++
+SigLIP2 tower when `VLLM_GEMMA4_VISION_WEIGHTS` is dumped
+(`scripts/mm/g2_vision_weight_dump.py`), else the committed `ref_projected.npy`.
+
+- **16/18 content tokens BIT-EXACT** = the WHOLE sentence "This is a vibrant, abstract
+  background featuring a smooth gradient of bright, blended colors" — token-identical to
+  the vLLM 0.25.0 golden.
+- The **single divergence is the TERMINAL punctuation** (idx16 ours=`,`236764 vs golden
+  =`.`236761, idx17 cascades) at a **bf16 NEAR-TIE**: greedy top1-top2 margin **~0.10-0.12
+  logit** (run-to-run bf16 noise ~0.02), vs the ~2.0 confident-pick margins elsewhere.
+- **INVARIANT to the vision-input precision:** the live C++ **bf16** tower (rel-L2 ~1.8%
+  vs f32 ref) AND the committed **f32** `ref_projected.npy` diverge IDENTICALLY (same
+  idx16 `,`) ⇒ the residual is **backbone bf16-accumulation on the 256 image-soft-token
+  rows, NOT the fold/merge/PLE**. Ruled out: PLE image-row mask (verified vs
+  `embed_input_ids`), `vocab_size_per_layer_input=262144` (range mask a no-op),
+  `use_bidirectional_attention=None` (causal is correct), the text path (STRICT 32/32).
+- **Gate form:** the golden is STRICT (K=5 vLLM-deterministic), so the committed gate is
+  the ratified near-tie form — content-exact prefix + the FIRST divergence must be a bf16
+  near-tie (margin < 0.5 band, past the sentence midpoint); a structural bug (confidently-
+  wrong token or early divergence) FAILs. GREEN: 239/239 assertions.
+
+### Inertness (same dgx session)
+Text SACRED `test_gemma4_paged_engine` STRICT **32/32 UNCHANGED** on the mm binary. CPU
+`-Werror` 0-warn (libvllm + new test). `test_model_registry` gemma4 mm-capability
+assertion green (the KimiK3 count/list drift is PRE-EXISTING on base HEAD — the KimiK3
+claim's fixture, out of scope).
+
+### Residuals (named, honest)
+1. **STRICT 18/18** — requires bit-matching vLLM's prefill bf16 accumulation on the image
+   rows (the DFlash-class bf16 acceptance floor); the near-tie is not a fold bug.
+2. **AUDIO→text e2e** — the A1 mel feature extractor (`gemma4_mm.py:348-395`) + the engine
+   `<audio>` merge through this SAME registered fold. The G3 USM-Conformer tower + audio
+   projector are already per-stage f32-exact; the mel frontend + merge wiring is the named
+   next brick (the audio e2e was too large to also land this lane — image e2e landed fully
+   per the honest-scope directive).
+3. The FULL in-runner BATCHED mm path (this drives the registered forward single-sequence,
+   like Qwen3-VL), a C++ NaFlex image processor (the gate consumes the committed processor
+   output + tower output, as the Qwen3-VL registry e2e consumes pre-decoded inputs), and
+   per-axis SPEED (device-resident bf16 weights).
+
+---
+
 ## 1. Per-model / per-modality DISPOSITION
 
 | Target | Image | Video | Audio | Disposition |

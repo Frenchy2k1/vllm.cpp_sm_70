@@ -176,6 +176,43 @@ reference + weights with `scripts/mm/g3_audio_tower_ref.py` (dgx CPU, E4B cached
 then run `test_gemma4_audio_tower` with `VLLM_GEMMA4_AUDIO_WEIGHTS` set to the dumped
 weight dir (refs come from the committed golden `tests/parity/goldens/gemma4_e4b_audio/`).
 
+## Gemma-4 image mm e2e - SigLIP2 tower FOLDED into the registered forward, near-tie GREEN (2026-07-29, `CLAIM-GEMMA4-MM-E2E`) - correctness gate landed, speed pending
+
+Gemma-4 image->text now runs through the ENGINE registered forward
+(`ModelRegistry::Forward` -> the `Gemma4ForConditionalGeneration` mm branch ->
+`Gemma4Model::ForwardMm`), mirroring the Qwen3-VL fold. The driver
+`Gemma4GenerateGreedyViaRegistry` (`gemma4_mm.cpp`) builds `ModelForwardInput.mm`
+from the SigLIP2 projector output (masked-scattered into the `<image>` rows) with the
+Gemma-4 PLE mm-mask, per-layer paged KV (256 sliding / 512 full, YOCO-aware), and
+1-D positions (no MRoPE/DeepStack).
+
+**Correctness (dgx GB10 sm_121a, `flock`, gate `test_gemma4_registry_e2e`): 16/18
+content tokens BIT-EXACT** vs the STRICT vLLM 0.25.0 `gemma4_e4b_image` golden - the
+whole sentence "This is a vibrant, abstract background featuring a smooth gradient of
+bright, blended colors" is token-identical. The single divergence is the terminal
+punctuation ("."<->",") at a **bf16 near-tie** (greedy top1-top2 margin ~0.10-0.12
+logit, run-to-run bf16 noise ~0.02, vs ~2.0 for the confident picks), and it is
+**INVARIANT to the vision-input precision**: the live C++ bf16 SigLIP2 tower (rel-L2
+~1.8% vs the f32 ref) AND the committed f32 `ref_projected.npy` produce the identical
+divergence, localizing the residual to backbone bf16-accumulation on the 256
+image-soft-token rows, NOT the fold/merge/PLE (PLE mask + `vocab_size_per_layer_input`
+=262144 verified vs the E4B config; `use_bidirectional_attention=None` so causal is
+correct; the text path is STRICT 32/32). The committed gate is the ratified near-tie
+form (content-exact prefix + first divergence must be a bf16 near-tie under a 0.5-logit
+band; a structural bug fails). Inertness: the SACRED text gate `test_gemma4_paged_engine`
+STRICT 32/32 UNCHANGED on the mm binary.
+
+**Speed: PENDING** - the driver is a single-sequence correctness path (device-resident
+bf16 weights + batched serving not yet built). **Residuals:** STRICT 18/18 (bit-match
+vLLM's prefill bf16 accumulation on the image rows - the DFlash-class bf16 acceptance
+floor); the Gemma-4 audio->text e2e (the A1 mel feature extractor + engine `<audio>`
+merge through this same fold - the G3 audio tower is already per-stage f32-exact). Reproduce:
+git-archive the commit to dgx, build `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, dump the vision weights with
+`scripts/mm/g2_vision_weight_dump.py`, then `flock $HOME/gpu.lock env
+VLLM_GEMMA4_VISION_WEIGHTS=<dir> ./build-cuda/tests/test_gemma4_registry_e2e` (or unset
+the env to use the committed `ref_projected.npy`).
+
 ## Gemma-4 G1 text backbone (2026-07-28, `CLAIM-GEMMA4-G1`) - correctness bring-up, no speed number owed
 
 `benchmark_binding=false`. G1 implemented the `Gemma4ForConditionalGeneration` text

@@ -31553,3 +31553,38 @@ DeepSeek-V4 + Kimi-K3 loaders drop their MXFP4 refusal.
   tower run (batched-loop mm + cross-step per-request MRoPE-delta state), the real
   server `/v1/chat/completions` GPU e2e, and video/multi-image/audio/Gemma-4-image
   through the registered path.
+
+## 2026-07-29 — Gemma-4 IMAGE mm e2e: SigLIP2 tower FOLDED into the ENGINE registered forward (`CLAIM-GEMMA4-MM-E2E`)
+
+- **What landed.** Gemma-4 image→text now runs through the engine's REGISTERED forward
+  (`ModelRegistry::Forward` → the `Gemma4ForConditionalGeneration` mm branch →
+  `Gemma4Model::ForwardMm`), mirroring the Qwen3-VL fold. `MultiModalForwardInput` gains
+  an additive default-null `ple_token_ids` (Gemma-4 PLE masked ids); `ForwardBody` gains
+  default-null mm overrides (merged inputs_embeds + masked PLE ids); the two text call
+  sites pass null ⇒ text path byte-identical. `gemma4_registry.cpp`: `supports_multimodal
+  =true` + the mm branch + Make/Borrow adapters. NEW `gemma4_mm.cpp`
+  `Gemma4GenerateGreedyViaRegistry` (the greedy driver, mirror of
+  `Qwen3VLGenerateGreedyViaRegistry`): merge via `Qwen3VLMergeMultimodal`, per-layer paged
+  KV (256/512, YOCO-aware), 1-D positions, every step through `ModelRegistry::Forward`.
+- **Gate (dgx GB10 sm_121a, `flock $HOME/gpu.lock`).** `test_gemma4_registry_e2e`:
+  **16/18 content tokens BIT-EXACT** vs the STRICT `gemma4_e4b_image` golden (the full
+  sentence), the single divergence a terminal-punctuation bf16 NEAR-TIE (top1-top2 margin
+  ~0.10-0.12 logit), INVARIANT to the vision-input precision (live C++ bf16 SigLIP2 tower
+  AND committed f32 `ref_projected.npy` diverge identically ⇒ backbone bf16-accumulation
+  on the 256 image rows, not the fold). Ruled out as fold bugs: PLE image-row mask +
+  `vocab_size_per_layer_input=262144` (range mask no-op) + `use_bidirectional_attention
+  =None` (causal correct); the text path is STRICT 32/32. Committed gate is the ratified
+  near-tie form (content-exact prefix + first-divergence-is-a-near-tie band). 239/239 green.
+- **Inertness (same session).** SACRED text `test_gemma4_paged_engine` STRICT 32/32
+  UNCHANGED on the mm binary; `supports_multimodal` has no engine consumer (byte-neutral
+  flip). CPU `-Werror` 0-warn. Golden md5 identical before/after git-archive transfer.
+  `test_model_registry` gemma4 mm-capability assertion green — the KimiK3 count/list drift
+  is PRE-EXISTING RED on base HEAD (`a642211f`, the KimiK3 claim's fixture), out of scope.
+- **Records.** `specs/gemma4-multimodal.md` §MM-E2E, `model-matrix.md` (mm row + checklist,
+  stays `ACTIVE`), `feature-matrix.md` `MODEL-MM`, `roadmap_v1.md` (ROAD-V1-MM),
+  `coordination.md` (`CLAIM-GEMMA4-MM-E2E`), `docs/STATUS.md` + `docs/BENCHMARKS.md`,
+  `parity-ledger.md` + this entry. Commits `17746bf9` (code) + `03083557` (near-tie gate);
+  NOT pushed. **NEXT / residuals:** STRICT 18/18 (bit-match vLLM prefill bf16 on the image
+  rows — DFlash-class), Gemma-4 AUDIO→text e2e (the A1 mel feature extractor + engine
+  `<audio>` merge through this same fold; the G3 audio tower is per-stage f32-exact), the
+  full in-runner batched mm path, a C++ NaFlex image processor, per-axis speed.

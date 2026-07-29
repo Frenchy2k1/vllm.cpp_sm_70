@@ -47,6 +47,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
@@ -152,7 +153,59 @@ class Gemma4Model {
       const std::vector<PagedKvCache>& attn_kv, const Gemma4Weights& weights,
       const HfConfig& config, vt::Queue& queue,
       const std::vector<int32_t>& logits_indices = {});
+
+  // CLAIM-GEMMA4-MM-E2E: one MULTIMODAL forward. The hidden stream starts from the
+  // already-merged host bf16 inputs_embeds [T*H] (text rows sqrt(H)-scaled, image/
+  // audio soft-token rows the embed_vision/embed_audio projector output), and the
+  // PLE embed_tokens_per_layer lookup uses `ple_token_ids` [T] (mm rows masked to
+  // 0 + the vocab_size_per_layer_input range mask) — gemma4_mm.py:1962-1973 +
+  // gemma4.py get_per_layer_inputs/project_per_layer_inputs (:848-928). Positions
+  // are Gemma-4's standard 1-D positions (NO MRoPE, NO DeepStack). Returns
+  // [n_out, vocab] host f32 (n_out = |logits_indices|, 1 for the last row).
+  static std::vector<float> ForwardMm(
+      const std::vector<uint16_t>& inputs_embeds_bf16,
+      const std::vector<int32_t>& ple_token_ids,
+      const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const Gemma4Weights& weights,
+      const HfConfig& config, vt::Queue& queue,
+      const std::vector<int32_t>& logits_indices = {});
 };
+
+// ── CLAIM-GEMMA4-MM-E2E: the registered engine mm-forward driver + adapters ──
+
+// Registered-path greedy IMAGE->text generation for Gemma-4: EVERY decoder step is
+// driven through ModelRegistry::Forward(model, input) with input.mm carrying the
+// merged inputs_embeds + Gemma-4 PLE-masked ids (positions are the 1-D
+// ModelForwardInput::positions) — i.e. it exercises the ENGINE registered
+// mm-forward (ForwardGemma4ForConditionalGeneration's mm branch). Mirrors
+// Qwen3VLGenerateGreedyViaRegistry (the Qwen3-VL fold): the prefill builds the
+// merged embeds (embed(prompt_ids)*sqrt(H) with `mm_projected` scattered into the
+// image-placeholder rows), then greedy-decodes through the registered forward.
+//
+// prompt_ids  : placeholder-expanded model input ids (image_token_id repeated N
+//               times at the image span).
+// mm_projected: the vision embed_vision projector output [N, text_hidden] (== the
+//               masked-scatter merge input), host f32, bf16-rounded before merge.
+// image_token_id / eos_token_id : the Gemma-4 <image> soft-token id + eos.
+// `model` MUST be the registered Gemma-4 LoadedModel loaded from `weights`.
+// `out_margins` (optional): per generated token, the greedy top1-top2 logit margin
+// — used by the e2e gate to classify a divergence as a bf16 near-tie (small margin)
+// vs a structural error (large margin), per the ratified near-tie methodology.
+std::vector<int32_t> Gemma4GenerateGreedyViaRegistry(
+    LoadedModel& model, const std::vector<int32_t>& prompt_ids,
+    const std::vector<float>& mm_projected, int32_t image_token_id,
+    int32_t eos_token_id, const Gemma4Weights& weights, const HfConfig& config,
+    vt::Queue& queue, int max_new_tokens,
+    std::vector<float>* out_margins = nullptr);
+
+// Wrap already-loaded Gemma-4 weights in the registered LoadedModel so a caller
+// that owns the weights (the mm e2e gate) can drive ModelRegistry::Forward without
+// re-reading the checkpoint. `Make` OWNS the moved weights; `Borrow` does NOT own
+// `weights` (it must outlive the model — used so the driver and the model share ONE
+// Gemma4Weights on the unified-memory box). Mirrors Make/BorrowQwen3VLLoadedModel.
+std::unique_ptr<LoadedModel> MakeGemma4LoadedModel(Gemma4Weights weights);
+std::unique_ptr<LoadedModel> BorrowGemma4LoadedModel(const Gemma4Weights& weights);
 
 // Per-family config hook (mirrors ParseGemma3ForCausalLMConfig). The engine's
 // HfConfig loader already descends into `text_config` (hf_config.cpp:103-113), so
