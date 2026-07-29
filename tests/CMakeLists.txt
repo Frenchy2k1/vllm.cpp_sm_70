@@ -379,6 +379,11 @@ target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).
 vllm_cpp_add_test(test_ngram_proposer vllm/v1/spec_decode/test_ngram_proposer.cpp)
 target_include_directories(test_ngram_proposer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DRAFT-MODEL (CLAIM-SPEC-DRAFT-MEDUSA) — the generic separate-draft-model
+# greedy propose brick; host-side, reuses the landed RejectionSampler verify.
+vllm_cpp_add_test(test_draft_model_proposer
+  vllm/v1/spec_decode/test_draft_model_proposer.cpp)
+target_include_directories(test_draft_model_proposer PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_structured_output vllm/v1/structured_output/test_structured_output.cpp)
 vllm_cpp_add_test(test_apply_grammar_bitmask vllm/v1/structured_output/test_apply_grammar_bitmask.cpp)
 vllm_cpp_add_test(test_backend_native vllm/v1/structured_output/test_backend_native.cpp)

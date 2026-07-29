@@ -16,6 +16,29 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Generic draft-model + Medusa spec-decode W0 spike + W1 CPU brick (2026-07-29, `CLAIM-SPEC-DRAFT-MEDUSA`) - PENDING (correctness brick landed; DGX e2e + speed gate deferred, box offline)
+
+Disposition: **PENDING** a performance number. `SPEC-DRAFT-MODEL` W1 is a host-side
+GREEDY propose brick (`DraftModelProposeGreedy`: run a standalone draft LM K
+autoregressive steps, argmax each, feed back, return K drafts) that reuses the
+LANDED `SPEC-REJECTION` verify UNCHANGED — only the proposer is net-new. There is
+NO GPU forward yet (the draft model is abstracted as a next-token-logits oracle),
+so no throughput axis exists to compare at W1. Correctness is unit-gated RED-first:
+`test_draft_model_proposer` (6 cases / 41 assertions, CPU) proves the
+propose->verify->accept equivalence — the accepted token stream equals the
+target's own greedy run for every draft/target (dis)agreement pattern (the
+spec-decode correctness invariant), a target-matching draft is fully accepted
+(num_sampled == k+1), and — RED-first — full acceptance DEPENDS on the
+autoregressive feed-back (dropping it fails 5/6 cases). Repro (CPU):
+`cmake --build build-cpu --target test_draft_model_proposer && ./build-cpu/tests/test_draft_model_proposer`.
+The behavioral oracle is `tests/v1/e2e/spec_decode/test_spec_decode.py:500-561`
+(ref==spec equivalence, re-expressed deterministically at the brick level).
+Residuals (the future gate, DGX-offline): the real draft-model forward behind the
+oracle (paged KV + CUDA-graph), the e2e greedy our-draft-ON == vLLM-draft-ON
+token-exact gate on a real tiny-draft/target pair, and the throughput speed gate
+(match-or-beat vLLM on every axis). Medusa (`SPEC-MEDUSA`) is W0 spike only, no
+number owed until its W2 proposer lands.
+
 ## Offline Batch API W0 spike + W1 CPU brick (2026-07-29, `CLAIM-BATCH-API`) - NOT-APPLICABLE (offline orchestration layer; no throughput owed)
 
 Disposition: **NOT APPLICABLE** for a performance number. `SERVE-BATCH-API` is an

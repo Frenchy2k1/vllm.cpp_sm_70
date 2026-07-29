@@ -215,7 +215,18 @@ ENGINE_PREFIXES = (
 # the existing OpenAIServingChat, NO reimplemented generation) landed +
 # unit-gated RED-first; `ACTIVE`, `CLAIM-BATCH-API`, spec `specs/batch-api.md`.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 128
+# 130 since 2026-07-29: +`SPEC-DRAFT-MODEL` (the classic model-agnostic SEPARATE
+# draft-model speculator — a full smaller standalone LM runs K autoregressive
+# greedy steps to propose K drafts, target verifies in one forward, longest
+# accepted prefix emitted; distinct from MTP/EAGLE/DFlash: no target-hidden tap,
+# no shared embed/lm_head) and +`SPEC-MEDUSA` (Medusa N-head single-pass
+# speculator). The two RECORDS-GAP items the feature-gap analysis named for row
+# creation (lines 82-83). `SPEC-DRAFT-MODEL` ACTIVE (W0 spike + W1 CPU greedy
+# propose brick landed + unit-gated RED-first, reusing the landed SPEC-REJECTION
+# verify); `SPEC-MEDUSA` SPIKE (W0 spike only, proposer deferred to W2).
+# `CLAIM-SPEC-DRAFT-MEDUSA`, spec `specs/draft-model-medusa-spec.md`. Bumped for
+# two real new rows, never to make a failing state transition pass.
+ENGINE_ROWS = 130
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

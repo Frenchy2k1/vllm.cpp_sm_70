@@ -34,7 +34,8 @@ HIGH misses: LoRA runtime, the pooling/embedding/rerank task class, AWQ+GPTQ
 compute, xgrammar, fp8-KV, reasoning parsers. Three MED gaps have no stable row
 yet (flagged below): generic draft-model/Medusa spec decode. (The offline Batch
 API RECORDS-GAP was picked up 2026-07-29 as `SERVE-BATCH-API`; the plugin system
-RECORDS-GAP as `ENG-PLUGIN-SYSTEM`.)
+RECORDS-GAP as `ENG-PLUGIN-SYSTEM`; the generic draft-model/Medusa spec-decode
+RECORDS-GAP as `SPEC-DRAFT-MODEL` (ACTIVE) + `SPEC-MEDUSA` (SPIKE).)
 Confirmed NON-gap: vLLM has removed prompt adapters.
 
 ---
@@ -217,7 +218,7 @@ is configured, exactly as upstream loads its draft model on demand.
 | TLI heterogeneous-vocabulary spec decode | `v1/spec_decode/vocab_mapping.py`, `config/speculative.py` | ☐ T1 | target↔draft ID mapping and shared-token constrained logits; current upstream validation is greedy draft only; inventory row `SPEC-TLI` | `planned: specs/tli-spec-decode.md` |
 | ngram (draft-free proposer) | `v1/spec_decode/ngram_proposer.py` | ✅ **DONE (`SPEC-NGRAM`, 2026-07-27)** | Draft-FREE suffix-ngram matcher (KMP-LPS, 1:1 port) wired as a third method reusing the MTP/DFlash verify/reject/`take_draft_token_ids` loop. 27B gate: 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted; unit 19/19; spec-OFF byte-identical (SACRED 235/235 + MTP 9/9 + DFlash 27/27); no new kernel | [specs/spec-decode-breadth-d3.md](specs/spec-decode-breadth-d3.md) |
 | EAGLE3 | `v1/spec_decode/eagle.py` | 🚫 **SCOPED — reachable-blocked (`SPEC-EAGLE3`)** | Port designed (reuses DFlash D5 separate-draft loader + D1 aux multi-tap). BLOCKED: no ungated oracle-runnable EAGLE3 draft arch/checkpoint for a Qwen3.6 gate model at pin `555967922` (registry has no `Eagle3Qwen3_5*`; z-lab published DFlash not EAGLE3). No fabricated gate | [specs/spec-decode-breadth-d3.md](specs/spec-decode-breadth-d3.md) |
-| Generic separate draft-model + Medusa + EAGLE-base + suffix (spec breadth) | `v1/spec_decode/draft_model.py:19` (`"draft_model"`), `medusa.py:18` (`"medusa"`), `eagle.py:10` (`"eagle"`), `suffix_decoding.py:9` (`"suffix"`) | ☐ **RECORDS-GAP** T1 | We have MTP/DFlash/ngram/DSpark/TLI/EAGLE3-scope, but NOT the classic model-agnostic separate-draft path, Medusa multi-head, base EAGLE, or suffix decoding. `mlp_speculator` is config-valid upstream but has NO v1 runtime branch (nothing owed). Recommend new rows `SPEC-DRAFT-MODEL` / `SPEC-MEDUSA` on pickup (feature-gap sweep) | [specs/vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md) |
+| Generic separate draft-model + Medusa + EAGLE-base + suffix (spec breadth) | `v1/spec_decode/draft_model.py:19` (`"draft_model"`), `medusa.py:18` (`"medusa"`), `eagle.py:10` (`"eagle"`), `suffix_decoding.py:9` (`"suffix"`) | ◪ **PICKED UP 2026-07-29** (`SPEC-DRAFT-MODEL` ACTIVE, `SPEC-MEDUSA` SPIKE) | Generic separate-draft path + Medusa rowed from the RECORDS-GAP. **`SPEC-DRAFT-MODEL` (ACTIVE):** W0 spike + W1 CPU greedy autoregressive propose brick (`DraftModelProposeGreedy`) reusing the LANDED `SPEC-REJECTION` verify UNCHANGED; unit 6/6 (41 asserts) RED-first (accepted==target greedy, full-acceptance depends on feed-back). **`SPEC-MEDUSA` (SPIKE):** W0 spike, proposer deferred to W2 (needs the target's Medusa heads). Base EAGLE + suffix remain unrowed. `mlp_speculator` is config-valid upstream but has NO v1 runtime branch (nothing owed). | [specs/draft-model-medusa-spec.md](specs/draft-model-medusa-spec.md) |
 
 ## 9. Serving surface (OpenAI API, endpoints, CLI, library)
 

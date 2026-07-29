@@ -32472,3 +32472,70 @@ Prometheus metrics + overlapped `AsyncLLM` submission. W1 is the chat-dispatch
 orchestrator; `RunBatch` is not yet called from any production path (so every
 existing engine/server construction is byte-identical). Not pushed; FULL SHA
 reported to the caller.
+
+## 2026-07-29 — Generic draft-model + Medusa spec-decode W0 spike + W1 CPU brick (`CLAIM-SPEC-DRAFT-MEDUSA`, `SPEC-DRAFT-MODEL` ACTIVE + `SPEC-MEDUSA` SPIKE, NOT pushed)
+
+The last spec-decode RECORDS-GAP the feature-gap analysis named (lines 82-83):
+the classic model-agnostic SEPARATE draft-model path (`draft_model.py:19`) and
+Medusa (`medusa.py:18`). We already had MTP/DFlash/ngram/EAGLE3/DSpark/TLI + the
+shared verify/accept machinery; only the two PROPOSERS were net-new.
+
+**Worktree.** `.claude/worktrees/draft-model-medusa`, branch
+`feat/draft-model-medusa-spec`, base `main` `2d1369fb`. CPU-only `build-cpu`
+(`-DVLLM_CPP_CUDA=OFF` Release `-Werror`). DGX offline — CPU-only lane. NOT
+pushed, NOT merged.
+
+**W0 spike** — `.agents/specs/draft-model-medusa-spec.md`: the `DraftModelProposer`
+(standalone draft LM runs K greedy autoregressive steps -> K drafts -> target
+verify -> longest-accepted-prefix), the `MedusaProposer` (N heads each emit one
+position from the same target hidden, single pass), the `SpeculativeConfig`
+method selection (`draft_model` when a separate `model` is given / auto-default
+`speculative.py:684`; `medusa` when `method=medusa`), how both reuse the landed
+`SPEC-REJECTION` acceptance sampler + the scheduler seam, exact files, upstream
+tests, gates, W-breakdown.
+
+**W1 brick (the more tractable of the two — a full model forward AS the
+proposer).** Files (all NEW except the config accept):
+- `include/vllm/v1/spec_decode/draft_model_proposer.h` — `DraftLogitsFn` (the
+  draft model as a next-token-logits oracle: `context -> vocab logits`, mirroring
+  `compute_logits(model(input_ids))[last]` reduced to the standalone-LM greedy
+  path without pulling the GPU runner into the CPU brick, exactly as SPEC-NGRAM's
+  matcher is a host algorithm), `GreedyArgmax` (torch.argmax lowest-index
+  tie-break), `DraftModelProposeGreedy` (k-step autoregressive propose),
+  `DraftModelProposeBatch`.
+- `src/vllm/v1/spec_decode/draft_model_proposer.cpp` — step 0
+  argmax(draft(context)); each later step appends the previous draft and
+  re-queries the oracle (the `:682-761` feed-back); k==0 empty, k==1 single
+  forward.
+- `tests/vllm/v1/spec_decode/test_draft_model_proposer.cpp` — realizes the
+  upstream e2e equivalence (`test_spec_decode.py:544-555`, ref==spec)
+  deterministically: tiny synthetic target LM + draft LM oracles; propose K ->
+  verify with the LANDED `RejectionSampler` -> assert accepted == the target's
+  own greedy run (every draft/target (dis)agreement pattern) + full-acceptance on
+  a matching draft + the RED-first feed-back witness.
+- `src/vllm/config/speculative.cpp` — `ParseSpeculativeConfigJson` accepts
+  `"draft_model"` (requires `model` + `num_speculative_tokens`).
+- CMake: source list + `test_draft_model_proposer` registration.
+
+**Gate.** `test_draft_model_proposer` 6/6, 41 assertions GREEN on CPU. RED-first
+PROVEN: commenting out the autoregressive feed-back (`running.push_back(draft)`)
+makes 5/6 cases fail (the perfect draft repeats its first token and the target's
+distinct greedy chain rejects at position 1, so num_sampled drops from k+1 to 2).
+Restored -> GREEN. Clean CPU `-Werror` full-library build. Six record checkers
+rc=0 (`check-agent-record.py` -> `ENGINE=130`).
+
+**Records same-change.** NEW rows `SPEC-DRAFT-MODEL` (ACTIVE) + `SPEC-MEDUSA`
+(SPIKE) in engine-matrix + the Speculative-area/Total rollup (Spec 10->12,
+ACTIVE 3->4, SPIKE 0->1; Total 128->130, ACTIVE 46->47, SPIKE 3->4) +
+`check-agent-record.py` `ENGINE_ROWS` 128->130 (dated rationale). coordination
+`CLAIM-SPEC-DRAFT-MEDUSA` ACTIVE. feature-matrix spec-breadth row (RECORDS-GAP ->
+PICKED UP) + intro. feature-gap-analysis lines 82-83 (RECORDS-GAP -> ROW CREATED).
+roadmap breadth note. docs/STATUS spec-decode section. docs/BENCHMARKS PENDING
+entry. parity-ledger + this state entry.
+
+**Residuals (honest).** Medusa proposer (W2 — needs the target's Medusa heads, a
+model change). The real GPU draft-model forward behind the oracle (paged KV +
+CUDA-graph), the DGX e2e greedy our-draft-ON == vLLM-draft-ON token-exact gate on
+a real tiny-draft/target pair, and the throughput speed gate (match-or-beat vLLM
+on every axis) are W3, DGX-offline. NO production runner wiring in W1 (additive +
+default-inert; no path constructs a `DraftModelProposer`).
