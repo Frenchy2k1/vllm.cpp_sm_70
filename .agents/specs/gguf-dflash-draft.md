@@ -251,25 +251,42 @@ gates.
    never be met with the available asset. Its purpose - making the token gates
    interpretable - is served instead by gate 3, which compares the two formats at
    the TOKEN level end to end.
-3. **Axis-A cross-format equivalence, c1. MET 2026-07-28.** The DFlash-ON greedy
-   continuation from the Q4_K_M GGUF draft is token-for-token identical to the
-   one from the bf16 safetensors draft, with identical proposed/accepted counts,
-   on two prompts. **Note the restatement:** the original wording of this gate
-   was "GGUF draft == safetensors draft", which is what is measured; an earlier
-   attempt to gate on `spec-ON == spec-OFF` instead was wrong for DFlash and is
-   recorded under `GD4` below.
-4. **Axis-B token identity, c1. MET 2026-07-28**, in its strict form: on the
-   GGUF target the DFlash-ON continuation is token-for-token identical to that
-   same target's spec-OFF, 24/24. Note this is a WITHIN-target bar. A
+3. **Axis-A cross-format equivalence, c1. TOKEN half MET; ACCEPT-COUNT half RED
+   as of the 2026-07-29 production-build re-measurement.** The DFlash-ON greedy
+   continuation from the Q4_K_M GGUF draft is still token-for-token identical to
+   the one from the bf16 safetensors draft on BOTH prompts, so the TOKEN half
+   stands. The proposed/accepted counts no longer agree: at 24 tokens both drafts
+   are 15/144 and the gate passes 17/17, at 48 tokens the GGUF draft is 46/112
+   against the safetensors draft's 47/96 and the gate FAILS 15/17, exit 1,
+   reproduced 3 of 3 runs. The 2026-07-28 "MET" reading came from a build
+   configured without `-DVLLM_CPP_CUTLASS_DIR` and without `-DVLLM_CPP_TRITON=ON`,
+   i.e. running the emulation fp4 GEMM, which masked the difference. **Note the
+   restatement:** the original wording of this gate was "GGUF draft ==
+   safetensors draft", which is what is measured; an earlier attempt to gate on
+   `spec-ON == spec-OFF` instead was wrong for DFlash and is recorded under `GD4`
+   below. **Open question this now raises:** whether the bar should stay
+   accept-count-EXACT or become accept-count-BANDED the way the landed
+   `SPEC-DFLASH` golden arm's is (`abs(acc - want) <= 4`, which 46 vs 47 would
+   satisfy). Not decided here; the RED is recorded as-is.
+4. **Axis-B token identity, c1. MET 2026-07-28, RE-CONFIRMED 2026-07-29 on a
+   production build**, in its strict form: on the GGUF target the DFlash-ON
+   continuation is token-for-token identical to that same target's spec-OFF,
+   24/24, with acceptance 14/160 and the cross-target spec-OFF divergence still
+   at index 4, every number unchanged. Note this is a WITHIN-target bar. A
    CROSS-target one was considered and rejected on evidence: the two containers
    diverge at index 4 without any speculation, so it would gate their arithmetic
    rather than this row (see the axis-B section above).
-5. **Acceptance parity. MET for axis A 2026-07-28**, and stronger than "within
-   noise": EXACTLY equal on both prompts (20/80 and 42/96). Q4_K_M costs this
-   draft nothing in acceptance on the safetensors target, which the spike had
-   flagged as a real risk. Two prompts is the evidence, not a general claim.
-   **For axis B: MEASURED, nonzero, and lower** - 14/160 vs 20/80 same-draft
-   same-prompt - with the cause established as the GGUF target's bf16 compute
+5. **Acceptance parity. NOT MET for axis A as of 2026-07-29.** The 2026-07-28
+   reading ("EXACTLY equal on both prompts, 20/80 and 42/96, so Q4_K_M costs this
+   draft nothing") was measured on the defective build and is void. On a
+   production build the 24-token prompt is 15/144 for both drafts but the
+   48-token prompt is 46/112 for the GGUF draft against 47/96 for the bf16 one,
+   so the spike's flagged risk is REAL: the 4-bit draft needs one extra 16-wide
+   propose block and lands one fewer acceptance, while emitting identical tokens.
+   Not root-caused; an explicit open item, and the reason axis A is not closed.
+   **For axis B: MEASURED, nonzero, and lower** - 14/160 vs the safetensors
+   target's 15/144 same-draft same-prompt on the production build (the older
+   20/80 comparison figure is void) - with the cause established as the GGUF target's bf16 compute
    path and the shared head EXCLUDED by a byte comparison. Recorded as a
    finding, per the risk decision below.
 6. **Speed: PENDING, not owed by this row.** Owes a `docs/BENCHMARKS.md`

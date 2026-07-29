@@ -31949,3 +31949,173 @@ does not advance any of their states.
 `tests/capi/test_capi.cpp:410` (ABI v8 logits processor) and
 `test_model_loader_gguf` 2/3 (hard-coded registered-architecture list, since
 grown). Neither was touched.
+
+## 2026-07-29 — GGUF spec-decode rows RE-VERIFIED on a production build: MTP re-anchored `DONE`, DFlash axis A now reproducibly RED (`CLAIM-GGUF-SPEC-REVERIFY`)
+
+**Base** `main` `3f34534d` (worktree `/home/mudler/_git/vllm.cpp-abi-v9`). dgx.casa
+GB10 sm_121a, CUDA 13.0.88, clean `git archive` tree at `~/work/gate-reverify/src`
+(sources md5-identical to the committed ones), every GPU run under
+`flock $HOME/gpu.lock`. RECORDS-ONLY: zero bytes changed under `src/`, `include/`
+or `tests/`. NOT pushed.
+
+**Why this was needed.** `CLAIM-27B-GATE-RCA` (`33870e43`) proved the build tree
+that produced EVERY GPU number for `SPEC-MTP-GGUF` and `SPEC-DFLASH-GGUF`
+(`~/wk-mtp-gguf/build-cuda`) was configured with neither `-DVLLM_CPP_CUTLASS_DIR`
+nor `-DVLLM_CPP_TRITON=ON`, so it ran the emulation-grade fp4 GEMM and the hand
+GDN kernels. Those results were not trustworthy evidence, including the run used
+to move `SPEC-MTP-GGUF` to `DONE`.
+
+### 1. The build, proven correct three ways before anything was trusted
+
+    cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+      -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+      -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON
+
+1. `grep -ci "cutlass not found" configure.log` = **0**, and the log prints
+   `CUTLASS found at /home/mudler/cutlass-4.5.0; enabling sm120a NVFP4 cutlass
+   GEMM`, `FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a]`, and 15
+   `Triton AOT: ... <- vendored .../sm_121a (no Python)` lines plus
+   `vendored tree ... matches triton_kernels/ (MANIFEST hashes OK)`.
+2. `cuobjdump -lelf` on each gate binary: **40 cubins, ALL `sm_121a`, zero
+   `sm_75`**. `CMakeCache.txt` still reads `CMAKE_CUDA_ARCHITECTURES:STRING=75`
+   and is still the decoy; `build.ninja` carries
+   `generate-code=arch=compute_121a,code=[compute_121a,sm_121a]` and
+   `VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a`.
+3. SACRED `test_qwen27_paged_engine`: **1/1 case, 235/235 assertions, exit 0**,
+   wall 32.77s, peak RSS 24824464 KiB (23.68 GiB).
+
+**The new precondition was proven to FIRE, not assumed.** Recompiling ONLY
+`tests/parity/test_qwen27_paged_engine.cpp` with `-DVT_CUTLASS_NVFP4` and
+`-DVLLM_CPP_TRITON` removed from its define list, and linking it against the SAME
+`libvllm.a`, gives: `test case THREW exception: qwen27 paged-engine gate requires
+the production kernel build: configure with -DVLLM_CPP_CUTLASS_DIR=<cutlass
+4.5.0+> ... AND -DVLLM_CPP_TRITON=ON ...`, `assertions: 0`, `Status: FAILURE!`,
+exit 1, before any weight is read. So a misconfigured build now fails on its
+configuration, exactly as intended.
+
+### 2. `SPEC-MTP-GGUF` still passes, and one recorded finding is RETRACTED
+
+`flock $HOME/gpu.lock env VLLM_MTP_GGUF_MODEL=$HOME/bench/q36-35b-a3b-nvfp4.gguf
+./tests/test_qwen35_gguf_spec_decode`:
+
+    3/3 cases, 10/10 assertions, Status: SUCCESS!, exit 0
+    spec-OFF and spec-ON both " Paris, a city renowned for its rich history,
+      culture, and iconic landmarks. Situated in the north-central part of"
+    drafts proposed/accepted: 13/11          <- IDENTICAL to the recorded number
+    ngram guard arm: same 24 tokens
+    peak RSS 94648408 KiB (90.26 GiB), wall 7:13.59
+
+So the row's bar (spec-ON == spec-OFF within a device, plus nonzero acceptance)
+holds and the acceptance numbers did not move. Row stays `DONE`, evidence
+re-anchored.
+
+**What DID move is the 24-token text, and it kills the recorded CPU-vs-GPU
+narrative.** The probe (`VLLM_MTP_GGUF_PROBE=1`, GPU then `CUDA_VISIBLE_DEVICES=`,
+484/484 assertions each, GPU 85928 MiB-class 1:52.93, CPU 1:43.79) gives:
+
+    position 1, production build   GPU rank1 11 -0.763897  rank2 13 -0.824083
+    position 1, production build   CPU rank1 11 -0.765499  rank2 13 -0.830374
+    position 1, DEFECTIVE build    GPU rank1 13 -0.773180  rank2 11 -0.847055
+    position 1, DEFECTIVE build    CPU rank1 11 -0.765499  rank2 13 -0.830374
+
+The CPU arm is BIT-IDENTICAL across the two builds, which is exactly right:
+CUTLASS and the Triton-AOT GDN kernels are CUDA-only. The GPU arm moved, and it
+moved onto the CPU's side of the near-tie. The two devices' full 24-token
+sequences are now IDENTICAL:
+
+    11751 11 264 3177 34756 364 1141 8807 3712 11 7431 11 321 25438 57902 13
+    27480 12484 303 279 9897 81183 919 314
+
+Margin sweep over all 24 positions, production build: **zero exact ties in either
+arm**, minimum margin 0.060186 nats (GPU) and 0.064875 nats (CPU); the defective
+build had 0.0482 and 0.0649. So the earlier "each device's pick is the other's
+rank 2, one 0.07-nat coin flip cascading" story described a build defect, not a
+device property. The near-tie is real and roughly the same size; only which side
+the GPU landed on was wrong. Retracted in `docs/STATUS.md`, `docs/BENCHMARKS.md`
+and the engine-matrix row.
+
+### 3. `SPEC-DFLASH-GGUF`: axis B holds exactly, axis A goes RED
+
+Target(s) `~/bench/q36-27b-nvfp4-vllm` (safetensors) and
+`~/bench/q36-27b-nvfp4.gguf`, drafts `~/bench/Qwen3.6-27B-DFlash-Q4_K_M.gguf` and
+`z-lab/Qwen3.6-27B-DFlash`, k=16, greedy, concurrency 1, one `flock` series.
+
+**Axis B (`-tc="dflash axis-B*"`): 15/15 assertions, exit 0.** GGUF-target
+DFlash-ON token-identical to that same target's spec-OFF 24/24; acceptance
+**14/160**, unchanged; cross-target spec-OFF divergence still at index 4;
+84945448 KiB (81.0 GiB), 6:53.08. Every axis-B number reproduced.
+
+**Axis A (`-tc="dflash axis-A*"`):**
+
+    24 tok, "The capital of France is"
+      GGUF Q4_K_M   15/144   safetensors  15/144   tokens IDENTICAL
+      17/17 assertions, exit 0            wall 1:38.45, 38585884 KiB
+      target margin sweep: 0 exact ties, min 0.0445251 nats
+      spec-ON vs spec-OFF: first divergence at index 4
+
+    48 tok, "Write a Python function that reverses a string:"
+      GGUF Q4_K_M   46/112   safetensors  47/96    tokens IDENTICAL
+      ERROR: CHECK( arm_a.proposed == arm_b.proposed ) is NOT correct!
+      ERROR: CHECK( arm_a.accepted == arm_b.accepted ) is NOT correct!
+      15/17 assertions, 2 failed, Status: FAILURE!, exit 1
+      target margin sweep: 0 exact ties, min 0.0905647 nats
+      spec-ON vs spec-OFF: first divergence at index 16 (the same index and the
+        same dropped token 279 as before, i.e. the ratified D5 near-tie envelope)
+
+Previously, on the defective build, BOTH prompts read 20/80 and 42/96 for BOTH
+drafts and both passed 17/17. **Re-run twice more: 46/112 vs 47/96 every time,
+exit 1 every time.** So this is the reproducible behavior of the production
+build, not a flake.
+
+**What it means.** Cross-format TOKEN identity, the headline claim of axis A, is
+UNBROKEN on both prompts. What breaks is the accept-count half of binding bar (a):
+the Q4_K_M draft needs one extra 16-wide propose block and lands one fewer
+acceptance, while emitting exactly the same tokens. That is the spike's own
+flagged risk (a 4-bit draft accepted less often than its bf16 sibling) showing up
+once the target runs the true W4A4 fp4 kernels instead of the emulation GEMM. It
+was not "cost nothing"; the emulation build had masked it. NOT root-caused here;
+recorded as an explicit open item.
+
+The target's own spec-OFF control is still clean (self-reproducible, zero exact
+top-1/top-2 ties), but its margins tightened from 0.197/0.400 nats to
+0.0445/0.0906, which is consistent with a different (real fp4) numeric path.
+
+### 4. Controls on the same build
+
+- already-`DONE` `SPEC-DFLASH` golden arm (`-tc="qwen27 DFlash e2e*"`): **27/27,
+  exit 0**, 2 of 4 prompts STRICT token-exact vs the vLLM DFlash-ON golden,
+  acceptance 19/192, 39/80, 29/144, 25/112, wall 0:56.47. Unchanged.
+- `test_qwen3_5_gguf_mtp`: 2 cases / **19** assertions on
+  `~/bench/Qwen3.5-2B-UD-Q8_K_XL.gguf`, 2 cases / **18** on the 35B A3B NVFP4.
+  Both exit 0, both matching the recorded counts.
+- `test_qwen3_dflash_gguf`: 2 cases / **47** assertions, exit 0.
+- Pre-existing and NOT chased, as flagged in the task: `test_capi` SIGSEGV at
+  `tests/capi/test_capi.cpp:410`, `test_model_loader_gguf` 2/3.
+
+### 5. Row states after this
+
+- `SPEC-MTP-GGUF` stays **`DONE`**, evidence re-anchored to this run. Its bar was
+  met on a build that is now provably the production one, and the acceptance
+  numbers are identical. No demotion is warranted.
+- `SPEC-DFLASH-GGUF` stays **`PARTIAL`**, which already was its state, but for one
+  more explicit reason: axis A's cross-format accept-count bar is RED on the
+  48-token prompt on the production build. Axis B is the half a correct build
+  confirms outright.
+
+### 6. Notes on the environment, recorded
+
+The dgx rebooted at 08:47 CEST mid-session (an unrelated LocalAI `longcat-video`
+job had been holding 72 GB of the unified pool at 96% GPU util for ~3 h; the
+reboot freed it and killed the first build at 354/1009, which was simply
+restarted). No vllm.cpp work was in flight at the time. Disk 391 G free before,
+353 G after the build; the `~/work/gate-reverify` tree is prunable and the exact
+configure line above rebuilds it. `~/wk-mtp-gguf` was NOT used or modified: its
+source is still `main 384d5b83` with 5 uncommitted files and its `build-cuda` no
+longer corresponds to them, so a clean tree was used instead.
+
+**NEXT / residuals.** Root-cause the axis-A cross-format acceptance delta (why
+the Q4_K_M draft's proposals get rejected one block earlier against a true-fp4
+target when the emitted tokens are identical), and decide whether the axis-A bar
+should stay accept-count-exact or become accept-count-banded like the golden
+arm's `<= 4` band. Both rows' speed items are unchanged and still PENDING.
