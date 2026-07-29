@@ -31844,3 +31844,37 @@ the GGUF `blk.N.*` name-map (W2, now only needs the checkpoint downloaded to the
 1328-tensor manifest), on top of W7-device + W8; the IQ2_XXS/Q2_K dequant already landed
 (`CLAIM-DSV4-GGUF-LOADER`). **Resume:** the next V4 brick is W7-device (port the composition into CUDA
 kernels) or the GGUF W2 name-map once the checkpoint is on the DGX.
+
+---
+
+## 2026-07-29 — DeepSeek-V4-Flash W7-device (CUDA kernels for the 4 new op families + ForwardDevice), DGX-gated (`CLAIM-DEEPSEEK-V4-W7-DEVICE`)
+
+**Base:** `main` `33016f34`. Isolated worktree `/home/mudler/_git/vllm.cpp-w7-device` (branch
+`deepseek-v4-w7-device`), CPU `-Werror` build-verify + DGX GB10 CUDA gate under `flock /tmp/gpu`
+(`docker stop local-ai-worker` for the run then restored `--restart=always`+start), foreground, NOT
+pushed. This is the last engineering brick before an actual DeepSeek-V4 run.
+
+**What landed.** The CUDA kernels for the four NEW V4 op families (new TU `src/vt/cuda/cuda_deepseek_v4.cu`),
+each a 1:1 device port of the landed host reference, registered through the OpProvider seam under NEW
+OpIds `kDeepseekV4{Mhc,Dsa,Compressor,Moe}` and dispatched by a real `DeepseekV4Model::ForwardDevice`:
+MHC Sinkhorn/pre/post/head; DSA indexer weight-fold + weighted-MQA ReLU logits + causal top-k + sink
+softmax + grouped output-LoRA; compressor pool+norm + save-APE + fp8_ds_mla KV encode/decode;
+sqrtsoftplus/hash router + clamped SwiGLU. `deepseek_v4.cpp` refactors the W7 composition into ONE
+`ForwardComposeImpl` driven by a `V4Backend` policy so the same interleave runs on host refs (the
+oracle) OR the device kernels. The 512-wide MLA attention + expert grouped-GEMM REUSE the existing
+NVFP4/FP8 kernels (NOT re-ported). New: `deepseek_v4_device.{h,cpp}` (seam resolvers),
+`test_cuda_deepseek_v4.cpp`. Also neutralized the pre-existing GCC-13 `-O2` array-bounds/stringop-
+overflow voxtral.cpp false positive (#155) with a minimal local scoped `#pragma GCC diagnostic`.
+
+**Gate.** DGX GB10 (sm_121a) `test_cuda_deepseek_v4` **11/11 cases · 153 assertions GREEN** — each
+device kernel vs its host-ref oracle (BIT-EXACT top-k/router ids, `-inf` exact, near-tie rel-L2 < 1e-4
+for the fp reductions, fp8_ds_mla within e4m3 granularity + bf16 rope bit-exact) + the ForwardDevice
+composition gate (device == host, rel-L2 < 2e-3). **compute-sanitizer memcheck 0 errors.** RED-first
+PROVEN (drop sqrt → 3/6 fail, revert restores). CUDA + CPU `-Werror` clean. SACRED-inert: shared
+MLA/MoE CUDA + W3-W6 host TUs empty-diff; host oracle 6/6·26 unchanged. `check-agent-record.py` KERNEL
+42→43.
+
+**Residuals.** W2b (materialize the real-checkpoint FP8-block + NVFP4 towers), W8 (full paged-engine
+strict/near-tie gate — multi-Spark, 156.7 GiB NVFP4 does not fit ONE GB10), and the single-Spark
+IQ2_XXS-GGUF vehicle's GGUF `blk.N.*` name-map (W2, checkpoint-download-blocked). The DGX was left as
+found (worker restarted, restart=always).

@@ -405,6 +405,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_compressor.cpp
   src/vllm/model_executor/models/deepseek_v4_mhc.cpp
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
+  src/vllm/model_executor/models/deepseek_v4_device.cpp
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp
@@ -820,7 +821,8 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_mla_prefill.cu
     src/vt/cuda/cuda_paged_attn.cu
     src/vt/cuda/cuda_combine_tokens.cu
-    src/vt/cuda/cuda_sample.cu)
+    src/vt/cuda/cuda_sample.cu
+    src/vt/cuda/cuda_deepseek_v4.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

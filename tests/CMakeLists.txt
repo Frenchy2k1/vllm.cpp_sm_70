@@ -122,6 +122,13 @@ vllm_cpp_add_test(test_deepseek_v4_moe vllm/models/test_deepseek_v4_moe.cpp)
 # stream, hash-by-tid routing, DSA select+compress, finiteness) + RED-first
 # miswires — NOT a real-checkpoint token gate (that is W8, multi-Spark, 156.7 GiB).
 vllm_cpp_add_test(test_deepseek_v4_forward vllm/models/test_deepseek_v4_forward.cpp)
+# DeepSeek-V4-Flash W7-DEVICE — the four NEW V4 op families' CUDA kernels
+# (src/vt/cuda/cuda_deepseek_v4.cu, dispatched through the OpProvider seam) each
+# unit-gated vs its landed HOST reference at small shape + the ForwardDevice
+# composition gate (device forward == host forward, near-tie). The device cases
+# SKIP on a CPU-only build; on the DGX GB10 they are the RUNTIME evidence the
+# kernels match the references. NOT a real-checkpoint token gate (W8, multi-Spark).
+vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;

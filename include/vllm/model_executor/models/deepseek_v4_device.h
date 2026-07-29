@@ -1,0 +1,135 @@
+// DeepSeek-V4-Flash W7-device — the CUDA kernel seam for the four NEW V4 op
+// families. This header declares the DEVICE launchers (1:1 CUDA ports of the
+// landed portable HOST references) and the OpProvider-seam resolvers the device
+// forward (DeepseekV4Model::ForwardDevice) and the unit gate dispatch through.
+//
+// ─── WHAT THIS IS A PORT OF (the four families; file:line on BOTH sides) ─────
+//   MHC        <- deepseek_v4_mhc.{h,cpp}        (Sinkhorn / MhcPre / MhcPost /
+//                                                 HcHeadCollapse) @ kernels/mhc/*.py
+//   DSA        <- deepseek_v4_dsa.{h,cpp}        (indexer weight-fold / MQA logits /
+//                                                 causal top-k / sink softmax /
+//                                                 grouped output-LoRA)
+//   Compressor <- deepseek_v4_compressor.{h,cpp} (save-time APE / pool+norm /
+//                                                 fp8_ds_mla KV encode+decode)
+//   MoE        <- deepseek_v4_moe.{h,cpp}         (sqrtsoftplus / hash+bias router /
+//                                                 clamped SwiGLU)
+// The 512-wide MLA attention + expert grouped-GEMM REUSE the existing NVFP4/FP8
+// CUDA paths (cuda_mla_attn.cu, cuda_moe*.cu) and are NOT re-ported here — only
+// these four NEW glue families need dedicated V4 kernels.
+//
+// ─── HONEST SCOPE (mirrors W3-W7) ────────────────────────────────────────────
+// The launchers take/return host std::vectors and upload/run/download internally
+// (via the CUDA backend). That is a STRUCTURAL, correctness-grade path — each
+// kernel is unit-gated on the DGX GB10 against its landed host reference at a
+// SMALL synthetic shape (test_cuda_deepseek_v4.cpp) — NOT a fused/perf path. The
+// per-op host round-trip lets a CPU-compiled TU (deepseek_v4.cpp ForwardDevice)
+// drive the kernels through the seam without linking CUDA symbols; the real
+// paged-engine e2e over a materialized checkpoint stays the W8 residual (the
+// fixed-config 167B does not fit ONE GB10 — see deepseek_v4.h).
+//
+// SEAM: each family registers ONE OpProvider under a dedicated OpId
+// (vt/ops.h: kDeepseekV4{Mhc,Dsa,Compressor,Moe}); the provider `fn` points at a
+// static kernels-struct of typed device launchers. The resolvers below cast the
+// GetOp() result; they THROW on a CPU-only build (nothing registered for kCUDA),
+// which is correct — ForwardDevice is a device-only path.
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+#include "vllm/model_executor/models/deepseek_v4_compressor.h"  // Fp8DsMlaLayout / Fp8DsMlaToken
+#include "vllm/model_executor/models/deepseek_v4_mhc.h"          // MhcPreResult
+#include "vllm/model_executor/models/deepseek_v4_moe.h"          // MoeRouteResult
+#include "vt/device.h"                                           // vt::Queue
+
+namespace vllm::deepseek_v4 {
+
+// ── (1) MHC family device kernels ─────────────────────────────────────────────
+struct MhcDeviceKernels {
+  std::vector<float> (*sinkhorn)(vt::Queue&, const std::vector<float>& comb_logits,
+                                 int64_t hc, int64_t iters, float eps);
+  MhcPreResult (*pre)(vt::Queue&, const std::vector<float>& residual,
+                      const std::vector<float>& fn, const std::vector<float>& scale,
+                      const std::vector<float>& base, int64_t hc, int64_t hidden,
+                      float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
+                      float hc_post_mult, int64_t iters,
+                      const std::vector<float>& norm_weight, float norm_eps);
+  std::vector<float> (*post)(vt::Queue&, const std::vector<float>& x,
+                             const std::vector<float>& residual,
+                             const std::vector<float>& post_layer_mix,
+                             const std::vector<float>& comb_res_mix, int64_t hc,
+                             int64_t hidden);
+  std::vector<float> (*head)(vt::Queue&, const std::vector<float>& x,
+                             const std::vector<float>& fn, float scale,
+                             const std::vector<float>& base, int64_t hc, int64_t hidden,
+                             float rms_eps, float hc_eps);
+};
+
+// ── (2) DSA family device kernels ─────────────────────────────────────────────
+struct DsaDeviceKernels {
+  std::vector<float> (*weight_fold)(vt::Queue&, const std::vector<float>& weights_proj,
+                                    int64_t num_tokens, int64_t index_n_heads,
+                                    int64_t index_head_dim);
+  std::vector<float> (*logits)(vt::Queue&, const std::vector<float>& q,
+                               const std::vector<float>& k,
+                               const std::vector<float>& folded_weights,
+                               const std::vector<int64_t>& win_start,
+                               const std::vector<int64_t>& win_end, int64_t num_tokens,
+                               int64_t num_keys, int64_t index_n_heads,
+                               int64_t index_head_dim);
+  std::vector<int64_t> (*topk)(vt::Queue&, const std::vector<float>& logits,
+                               const std::vector<int64_t>& win_start,
+                               const std::vector<int64_t>& win_end, int64_t num_tokens,
+                               int64_t num_keys, int64_t topk);
+  std::vector<float> (*softmax_sink)(vt::Queue&, const std::vector<float>& scores, float sink);
+  std::vector<float> (*grouped_olora)(vt::Queue&, const std::vector<float>& o,
+                                      const std::vector<float>& wo_a,
+                                      const std::vector<float>& wo_b, int64_t num_tokens,
+                                      int64_t n_heads, int64_t head_dim, int64_t n_groups,
+                                      int64_t o_lora_rank, int64_t hidden_size);
+};
+
+// ── (3) Compressor family device kernels ──────────────────────────────────────
+struct CompressorDeviceKernels {
+  std::vector<float> (*save_score_ape)(vt::Queue&, const std::vector<float>& score,
+                                       const std::vector<float>& ape,
+                                       const std::vector<int64_t>& positions,
+                                       int64_t num_tokens, int64_t width,
+                                       int64_t compress_ratio);
+  std::vector<float> (*pool_norm)(vt::Queue&, const std::vector<float>& kv,
+                                  const std::vector<float>& score,
+                                  const std::vector<uint8_t>& valid,
+                                  const std::vector<float>& rms_weight, float eps,
+                                  int64_t window, int64_t head_dim);
+  Fp8DsMlaToken (*encode)(vt::Queue&, const std::vector<float>& head,
+                          const Fp8DsMlaLayout& layout);
+  std::vector<float> (*decode)(vt::Queue&, const Fp8DsMlaToken& token,
+                               const Fp8DsMlaLayout& layout);
+};
+
+// ── (4) MoE family device kernels ─────────────────────────────────────────────
+struct MoeDeviceKernels {
+  // Elementwise sqrt(softplus(x)) over an arbitrary buffer (the router score).
+  std::vector<float> (*sqrtsoftplus)(vt::Queue&, const std::vector<float>& x);
+  MoeRouteResult (*route)(vt::Queue&, const std::vector<float>& gating, int64_t num_tokens,
+                          int64_t num_experts, int64_t topk,
+                          const std::vector<float>& e_score_correction_bias, bool renormalize,
+                          float routed_scaling_factor,
+                          const std::vector<int64_t>& input_tokens,
+                          const std::vector<int32_t>& hash_indices_table, int64_t vocab_size);
+  std::vector<float> (*clamped_swiglu)(vt::Queue&, const std::vector<float>& gate_up,
+                                       int64_t d, float limit, float alpha, float beta);
+};
+
+// Resolve a family's device kernels through the vt OpProvider seam. THROWS on a
+// CPU-only build (no kCUDA provider registered) — ForwardDevice is device-only.
+const MhcDeviceKernels* MhcDevice();
+const DsaDeviceKernels* DsaDevice();
+const CompressorDeviceKernels* CompressorDevice();
+const MoeDeviceKernels* MoeDevice();
+
+// True iff the CUDA backend registered the four V4 families (a device build with
+// a live CUDA backend). ForwardDevice checks this before dispatch.
+bool V4DeviceKernelsAvailable();
+
+}  // namespace vllm::deepseek_v4

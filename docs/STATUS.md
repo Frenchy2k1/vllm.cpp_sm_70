@@ -281,7 +281,16 @@ runnable) in [deepseek-v4-flash.md](../.agents/specs/deepseek-v4-flash.md): a
 Hyper-Connections + NVFP4/MegaMoE + sqrtsoftplus/hash MoE). As of 2026-07-28 the
 additive registry stub + config parse + checkpoint loader name-map are landed and
 VERIFIED against the real `nvidia/DeepSeek-V4-Flash-NVFP4` safetensors header
-(HTTP-range, no download); the forward is an honest not-yet-implemented stub.
+(HTTP-range, no download). The forward host-composition (W7) + the W7-device CUDA
+kernels are now landed: the four NEW V4 op families (MHC / DSA indexer+seams /
+compressor+fp8_ds_mla / sqrtsoftplus-hash MoE) are ported to CUDA, registered
+through the OpProvider seam, dispatched by a real `DeepseekV4Model::ForwardDevice`,
+and RUNTIME-VERIFIED on the DGX GB10 at small shape vs the host-ref oracle
+(`test_cuda_deepseek_v4` 11/11·153, compute-sanitizer memcheck 0 errors, RED-first
+proven; 2026-07-29, `CLAIM-DEEPSEEK-V4-W7-DEVICE`). The 512-wide MLA attn + expert
+grouped-GEMM REUSE the existing NVFP4/FP8 kernels. Still NOT runnable end-to-end:
+the real-checkpoint tower materialization (W2b) + the full paged-engine strict gate
+(W8) are multi-Spark-blocked (156.7 GiB does not fit ONE GB10).
 **HW-fit correction:** that NVFP4 checkpoint is **156.7 GiB**, NOT the ~83 GiB the
 scoping spike estimated (only the 256 routed experts are W4; the MLA and shared
 linears are FP8 plus NVFP4 double-scale overhead), so it does **not** fit ONE

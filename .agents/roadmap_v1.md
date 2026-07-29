@@ -256,6 +256,24 @@ W3-W6 TUs empty-diff; prior V4 tests unchanged); NO new kernel row / no checker 
 `-Wall -Werror -Wextra`-clean. Residuals: W7-device CUDA kernels + `ForwardDevice`; W2b real-tower
 materialization; W8 strict/near-tie engine gate (multi-Spark, 156.7 GiB); the single-Spark IQ2_XXS-GGUF
 vehicle additionally needs the GGUF `blk.N.*` name-map (W2, download-blocked).
+**W7-DEVICE LANDED + DGX-GATED (2026-07-29, `CLAIM-DEEPSEEK-V4-W7-DEVICE`, base `33016f34`):** the last
+engineering brick before an actual V4 run — the CUDA kernels for the four NEW V4 op families (MHC
+Sinkhorn/pre/post/head; DSA indexer weight-fold + weighted-MQA ReLU logits + causal top-k +
+attention-sink softmax + grouped output-LoRA; compressor pool+norm + save-APE + fp8_ds_mla KV
+encode/decode; sqrtsoftplus/hash router + clamped SwiGLU), each a 1:1 device port of the landed host
+reference, registered through the vt OpProvider seam (`kDeepseekV4{Mhc,Dsa,Compressor,Moe}`) and
+dispatched by a real `DeepseekV4Model::ForwardDevice` (the ONE composition now runs on host refs OR the
+device kernels via a `V4Backend` policy). The 512-wide MLA attn + expert grouped-GEMM REUSE the existing
+NVFP4/FP8 kernels (NOT re-ported). New TUs `src/vt/cuda/cuda_deepseek_v4.cu` + `deepseek_v4_device.{h,cpp}`
++ `test_cuda_deepseek_v4.cpp`; new kernel row `KERNEL-DSV4-W7-DEVICE` (`SPIKE`, count 42→43). **DGX GB10
+(sm_121a) `test_cuda_deepseek_v4` 11/11 cases · 153 assertions GREEN** vs the host-ref oracle at small
+shape (BIT-EXACT top-k/router ids, near-tie rel-L2 < 1e-4 for the fp reductions, fp8_ds_mla within e4m3
+granularity) + the ForwardDevice composition gate (device == host rel-L2 < 2e-3), **compute-sanitizer
+memcheck 0 errors**, RED-first proven. CUDA + CPU `-Werror` clean (the pre-existing GCC-13 voxtral #155
+array-bounds/stringop false positive neutralized locally). SACRED-inert (shared MLA/MoE CUDA + W3-W6 host
+TUs empty-diff; host oracle 6/6·26 unchanged). Honest 3-state: kernels RUNTIME-VERIFIED at small shape on
+real GB10; the real-checkpoint e2e stays W8 (156.7 GiB does not fit ONE GB10) + W2b tower materialization
++ the GGUF `blk.N.*` name-map.
 **MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
 [`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
 DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)
