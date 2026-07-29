@@ -159,11 +159,21 @@ class LoadedModel {
 //     multiscale tensor added after decoder layers 0..levels-1 (EMPTY on decode
 //     steps and on models without DeepStack, e.g. the 27B GDN-hybrid VL path).
 //   * deepstack_levels — `levels` (0 ⇒ no DeepStack inject).
+//   * ple_token_ids — CLAIM-GEMMA4-MM-E2E: the Gemma-4 Per-Layer-Embedding (PLE)
+//     token ids [num_tokens], with the multimodal (image/audio) rows masked to 0
+//     and the vocab_size_per_layer_input range mask applied — mirror of
+//     gemma4_mm.py embed_input_ids (`is_multimodal → 0`, :1962-1969) +
+//     gemma4.py get_per_layer_inputs (`id < vocab_size_per_layer_input ? id : 0`,
+//     :857-863). The Gemma-4 registered mm forward looks up embed_tokens_per_layer
+//     from THESE ids (NOT the merged embeds). nullptr for non-Gemma mm models
+//     (Qwen3-VL never sets it) — additive + default-null. Gemma-4 also uses the
+//     1-D ModelForwardInput::positions (NOT positions3) and no DeepStack.
 struct MultiModalForwardInput {
   const std::vector<uint16_t>* inputs_embeds_bf16 = nullptr;
   const std::vector<int32_t>* positions3 = nullptr;
   const std::vector<uint16_t>* deepstack_bf16 = nullptr;
   int64_t deepstack_levels = 0;
+  const std::vector<int32_t>* ple_token_ids = nullptr;
 };
 
 // One MRV2 forward invocation. References stay valid for the duration of the

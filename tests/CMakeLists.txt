@@ -181,6 +181,12 @@ vllm_cpp_add_test(test_gemma4_vision_tower vllm/multimodal/test_gemma4_vision_to
 target_include_directories(test_gemma4_vision_tower PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_definitions(test_gemma4_vision_tower PRIVATE
   GEMMA4_VISION_REF_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/gemma4_e4b_image/vision_refs")
+# CLAIM-GEMMA4-MM-E2E: the STRICT image->text token-exact gate THROUGH the ENGINE
+# registered mm-forward (ModelRegistry::Forward). dgx-only (CUDA + cached E4B).
+vllm_cpp_add_test(test_gemma4_registry_e2e vllm/multimodal/test_gemma4_registry_e2e.cpp)
+target_include_directories(test_gemma4_registry_e2e PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(test_gemma4_registry_e2e PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 # Gemma-4 G3: USM-Conformer audio-tower per-stage faithfulness gate (subsample ->
 # rel-pos-enc -> N conformer layers -> output_proj -> projected vs the dumped
 # transformers-eager refs). Host f32, no GPU. Weights via VLLM_GEMMA4_AUDIO_WEIGHTS
