@@ -16,6 +16,40 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## CUDA keep-quant GGUF k-quant GEMM - DeepSeek-V4 experts on the GPU (2026-07-29, `CLAIM-CUDA-KEEPQUANT-GEMM`) - CORRECTNESS GATE PASS on GB10 / experts-on-GPU tok/s PENDING
+
+Disposition: **correctness RUNTIME-VERIFIED on the DGX GB10 (sm_121); the DeepSeek-V4
+experts-on-GPU throughput number is PENDING** (the follow-on run, picked up by the
+running benchmark lane `a35f6be0`).
+
+The FIRST CUDA keep-quant GGUF k-quant GEMM (`KERNEL-QUANT-CIQ-GEMM-CUDA`,
+`src/vt/cuda/cuda_quant_dot.cu`) is the kCUDA provider for `kMatmulBTQuant`:
+MMVQ-style, it quantizes the activation tile to Q8_K on-GPU and integer-dots it
+against the compressed Q8_K-family weight blocks (IQ2_XXS/IQ3_XXS/Q2_K +
+Q3_K/Q4_K/Q5_K/Q6_K) kept COMPRESSED in the unified pool (no bf16 expansion, which
+would OOM the 119 GiB pool at ~316 GiB). Registering it flips
+`GgufQuantComputeAvailable` TRUE on `kCUDA`, so on a CUDA runner DeepSeek-V4's
+routed-expert / MLA GEMMs dispatch to the GPU instead of the unified-memory CPU
+reference tier - the experts move off the 20 ARM cores (the biggest DeepSeek-V4
+speed lever).
+
+**Correctness gate (DGX GB10, `flock $HOME/gpu.lock`, serialized behind the live
+`a35f6be0`/dflash lane):** `test_cuda_quant_dot` **2/2 cases, 92401/92401 assertions
+GREEN** - the CUDA output vs the landed CPU keep-quant oracle at **NMSE <= 1e-6**
+(proving the Q8_K activation quant and the whole INTEGER dot are bit-identical; only
+the per-super-block float scale sum reassociates) AND vs an independent f64
+dequantize-then-dot at **NMSE <= 5e-4** (the test-backend-ops band), over the 7 Q8_K
+types x M{1,4,32,512} x N{1,7,16}. **compute-sanitizer memcheck: 0 errors.**
+**RED-first proven:** perturbing the IQ2_XXS 0.125 fold (-> 0.135) fails 24
+assertions (nmse 0.0064); revert restores 92401/92401 (source md5 `9890f7e1...`).
+
+**Experts-on-GPU throughput: PENDING.** The DeepSeek-V4 91 GB `UD-IQ2_XXS` e2e run
+(keep-quant load + greedy generate + TPOT/throughput vs the CPU-experts baseline and
+vs ds4) is the follow-on; it is the benchmark lane's to capture. Build: minimal CUDA
+build (`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a`) - this op is
+independent of cutlass/triton. Repro: `cmake --build build-cuda --target
+test_cuda_quant_dot && flock $HOME/gpu.lock ./build-cuda/tests/test_cuda_quant_dot`.
+
 ## Pooling task class W2 heads composite + W3 pooling runner path (2026-07-29, `CLAIM-POOLING`) - STRUCTURAL cosine gate PASS / real-model oracle cosine gate PENDING
 
 Disposition: **correctness bricks landed + CPU-gated; the real-model oracle cosine

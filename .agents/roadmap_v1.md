@@ -306,6 +306,18 @@ keep-quant `UD-IQ2_XXS` **~91 GiB** + small host **< 3 GiB** = **memory-FEASIBLE
 landed `kMatmulBTQuant` (no new kernel row / no checker bump). SACRED-inert (W3-W6 primitive tests
 unchanged; shared MLA/MoE + CUDA W7-device untouched). The real 91 GB run stays the operational W8-run
 (download + GB10 generate + benchmark), now memory-feasible.
+**CUDA KEEP-QUANT GEMM LANDED — the experts move OFF the ARM cores (2026-07-29,
+`CLAIM-CUDA-KEEPQUANT-GEMM`, `KERNEL-QUANT-CIQ-GEMM-CUDA`, base `2191f771`):** W2c reused the CPU
+`kMatmulBTQuant`, so on a CUDA runner the keep-quant experts fell to the unified-memory CPU reference
+tier (the 20 ARM cores). This lane adds the FIRST CUDA keep-quant GGUF k-quant GEMM — a native kCUDA
+`kMatmulBTQuant` provider (`src/vt/cuda/cuda_quant_dot.cu`, MMVQ-style: Q8_K activation quant + integer
+dot against the compressed Q8_K-family blocks, dequant-in-kernel, weights kept COMPRESSED in the unified
+pool). Registering it flips `GgufQuantComputeAvailable` TRUE on `kCUDA`, so `vt::MatmulBT` dispatches
+these GEMMs to the GPU (the biggest DeepSeek-V4 speed lever). RUNTIME-VERIFIED on the DGX GB10:
+`test_cuda_quant_dot` 2/2·92401 vs the CPU oracle (NMSE ≤1e-6, int core bit-exact) + f64 dequant
+(≤5e-4), compute-sanitizer memcheck 0, RED-first proven. A 1:1 numeric port of the landed CPU oracle;
+additive (CPU reference untouched; `.cu` CUDA-only so the CPU build is byte-identical). KERNEL 44→45.
+The experts-on-GPU tok/s (part of the W8-run) is the follow-on benchmark.
 **MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
 [`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
 DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)

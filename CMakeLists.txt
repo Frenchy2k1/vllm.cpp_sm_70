@@ -819,6 +819,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/nccl_communicator.cu
     src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu
+    src/vt/cuda/cuda_quant_dot.cu
     src/vt/cuda/cuda_matmul_nvfp4.cu
     src/vt/cuda/cuda_ops.cu
     src/vt/cuda/cuda_gdn.cu
