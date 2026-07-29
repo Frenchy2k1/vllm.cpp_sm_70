@@ -158,14 +158,22 @@ ours, built to the same shape as the safetensors MTP gates.
    entry, but it may legitimately be `PENDING` with the reproduction command
    until a GGUF A/B is run.
 
-### Gate dispositions as of 2026-07-28
+### Gate dispositions as of 2026-07-29 (re-anchored to a production-configured build)
+
+Every GPU row below was originally measured on a build configured WITHOUT
+`-DVLLM_CPP_CUTLASS_DIR` and WITHOUT `-DVLLM_CPP_TRITON=ON`, the defect
+`CLAIM-27B-GATE-RCA` proved. All of them were re-run on a build carrying both,
+proven correct three ways (clean configure log, `cuobjdump -lelf` 40 cubins all
+`sm_121a`, SACRED 27B gate 235/235 exit 0). **Every disposition survived
+unchanged.** The one thing that did NOT survive is the `G6` CPU-vs-GPU narrative,
+retracted below.
 
 | Gate | Disposition | Evidence |
 |---|---|---|
-| 1 spec-OFF SACRED | **MET** | The trunk regression sweep recorded under `G4` is unchanged; the only later change is an env-gated test case, which touches no engine code |
-| 2 token identity c1 | **MET on BOTH devices** | CPU dense 2B token-exact; GPU sm_121a 35B A3B MoE token-exact, `G5` |
+| 1 spec-OFF SACRED | **MET** | The trunk regression sweep recorded under `G4` is unchanged; the only later change is an env-gated test case, which touches no engine code. Re-confirmed 2026-07-29: SACRED `test_qwen27_paged_engine` 235/235 exit 0 on the production build |
+| 2 token identity c1 | **MET on BOTH devices** | CPU dense 2B token-exact; GPU sm_121a 35B A3B MoE token-exact, `G5`. Re-run 2026-07-29 on the production build: 3/3 cases, 10/10 assertions, exit 0, spec-ON token-identical to spec-OFF, 90.26 GiB, 7m13.59s |
 | 3 cross-format agreement | **NOT APPLICABLE**, for two reasons | the gate's own precondition is an F16/F32 GGUF sibling and every head-carrying export on hand is quantized (2B Q8_0, 35B NVFP4); and per `G7` the same-weights NVFP4 safetensors sibling is not token-stable even against itself, so it could not serve as a reference either |
-| 4 acceptance parity | **MET** | GGUF 13 proposed / 11 accepted (0.846) vs safetensors 12 proposed / 11 accepted (0.917) on the SAME prompt, params and box, `G7` |
+| 4 acceptance parity | **MET** | GGUF 13 proposed / 11 accepted (0.846) vs safetensors 12 proposed / 11 accepted (0.917) on the SAME prompt, params and box, `G7`. The GGUF side re-measured 2026-07-29 on the production build at exactly 13 / 11; the safetensors side was not re-run |
 | 5 speed | **PENDING by design** | not owed by this row; `docs/BENCHMARKS.md` carries the disposition and the repro command |
 
 ## Dependencies
@@ -290,7 +298,23 @@ simply repeated rather than argued about.
 sm_121a arm emits the same 24 tokens the earlier arm did, so the two builds agree
 token-for-token as well.
 
-### `G6`: the CPU-vs-GPU token difference is a MEASURED near-tie, not a defect
+### `G6`: RETRACTED 2026-07-29 - the CPU-vs-GPU token difference was the BUILD, not a device near-tie
+
+**Read this before the section below.** `G6` measured a CPU-vs-GPU token
+divergence on a build configured without CUTLASS and without the vendored
+Triton-AOT GDN kernels. Re-measured on a production build, **there is no
+divergence at all**: both devices emit the same 24 tokens
+(`11751 11 264 3177 34756 364 1141 8807 3712 11 7431 11 321 25438 57902 13 27480
+12484 303 279 9897 81183 919 314`). The probe shows the GPU now picking `11`
+(-0.763897) over `13` (-0.824083) at position 1, where the defective build picked
+`13` (-0.773180) over `11` (-0.847055); the CPU arm's logprobs are BIT-IDENTICAL
+across the two builds, exactly as expected since CUTLASS and Triton are CUDA-only.
+Zero exact ties in either arm, minimum margins 0.060186 nats (GPU) and 0.064875
+(CPU). So the near-tie at position 1 is real and about the same size, but the
+"each device's pick is the other's rank 2, one coin flip cascading" conclusion
+described a build defect, not a property of this row or of the devices. The
+framing paragraph immediately below is still correct as a general statement of
+the bar; the measurement it introduces is superseded.
 
 State the bar first, because the previous framing invited the wrong chase:
 **CPU-vs-GPU token equality is NOT this row's gate and is not generally

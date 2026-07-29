@@ -863,12 +863,19 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   reuses the existing safetensors `LoadQwen3DFlash` body, a `.gguf` branch in the
   draft-path resolution, and the target-shared embedding and lm_head still taken
   from the target, as the GGUF contract intends.
-  **Binding result:** on the Qwen3.6-27B NVFP4 safetensors target, the published
-  `Q4_K_M` GGUF draft and the bf16 z-lab safetensors draft produce
-  token-for-token identical greedy continuations with identical accepted and
-  proposed draft counts (20/80 and 42/96 on two prompts, k=16, concurrency 1).
-  The 4-bit draft costs nothing in acceptance on this target, which the spike had
-  flagged as a real risk.
+  **Binding result, RE-MEASURED 2026-07-29 on a production-configured build**
+  (CUTLASS + FlashAttention-2 + vendored Triton-AOT, sm_121a; the earlier numbers
+  came from a build carrying none of those and are void): on the Qwen3.6-27B NVFP4
+  safetensors target the published `Q4_K_M` GGUF draft and the bf16 z-lab
+  safetensors draft still produce **token-for-token identical** greedy
+  continuations on both prompts, k=16, concurrency 1. Their accept counts no
+  longer match. At 24 tokens both are 15/144 and the gate is green 17/17; at 48
+  tokens the GGUF draft is 46/112 against the safetensors draft's 47/96 and the
+  gate is **RED, 15/17 assertions, exit 1, reproduced 3 of 3 runs**. So the 4-bit
+  draft DOES cost acceptance here, which is the risk the spike flagged and the
+  defective build had masked: it needs one extra 16-wide propose block and lands
+  one fewer acceptance, without changing a single emitted token. Not root-caused,
+  open, and it is why axis A is not closed.
   Three conventions this had to undo, all invisible to shape and name checks:
   `dflash.target_layers` is stored `+1`-offset; the draft's RMSNorm weights are
   RAW (its converter class does not inherit the Qwen3Next `+1` shift, so unlike
@@ -889,14 +896,19 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   quantized target - does not exist on this asset: the GGUF stores
   `token_embd`/`output` as BF16 beside its NVFP4 body, byte-identical to the
   safetensors sibling of the same quantization run, so the read is verbatim. And
-  acceptance IS lower than on the safetensors target (14/160 against 20/80, same
-  draft and prompt); that belongs to the GGUF target's compute path, not to the
-  shared head, because there is no NVFP4 GGUF GEMM yet, so the GGUF target
-  expands to bf16 while the safetensors target runs the true W4A4 kernels - the
-  two diverge at token 4 with no speculation anywhere.
-  Still `PARTIAL`: axis B is measured on one prompt at concurrency 1, the
-  acceptance characteristic above is understood but not addressed, and no speed
-  number is owed or measured yet.
+  acceptance IS lower than on the safetensors target (14/160 against that
+  target's 15/144 on the same draft and prompt); that belongs to the GGUF
+  target's compute path, not to the shared head, because there is no NVFP4 GGUF
+  GEMM yet, so the GGUF target expands to bf16 while the safetensors target runs
+  the true W4A4 kernels - the two diverge at token 4 with no speculation
+  anywhere. Axis B re-measured 2026-07-29 on the production build with every
+  number unchanged (24/24 identical, 14/160, divergence still at index 4, 15/15
+  assertions, exit 0), so it is the half of this row that a correct build
+  confirms.
+  Still `PARTIAL`, and now for one more reason: axis B is measured on one prompt
+  at concurrency 1, the acceptance characteristic above is understood but not
+  addressed, axis A's cross-format accept-count bar is RED on the 48-token prompt
+  as recorded above, and no speed number is owed or measured yet.
 - **MTP speculative decoding from a GGUF target WORKS, on CPU and on the GB10
   release target** (`SPEC-MTP-GGUF`, `DONE`,
   [spike](../.agents/specs/gguf-mtp-spec-decode.md)). The head loads from a
@@ -907,9 +919,12 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   A GGUF exported without the head is refused, naming that as the reason.
   **Both correctness gates pass: spec-ON output is token-identical to spec-OFF**
   on CPU against a real llama.cpp-converted Qwen3.5-2B, and on the GPU against
-  the 35B A3B NVFP4 GGUF with 13 drafts proposed / 11 accepted (dgx GB10 under
-  `flock`, sm_121a, 2/2 cases 10/10 assertions, 90.2 GiB peak RSS, 8m01s;
-  re-confirmed 3/3 on the committed source). Acceptance parity is measured
+  the 35B A3B NVFP4 GGUF with 13 drafts proposed / 11 accepted. **RE-ANCHORED
+  2026-07-29** to a production-configured build (CUTLASS + FlashAttention-2 +
+  vendored Triton-AOT, sm_121a; the original close-out ran without any of them,
+  so its evidence was not trustworthy): dgx GB10 under `flock`, 3/3 cases, 10/10
+  assertions, exit 0, spec-ON token-identical to spec-OFF, **13 proposed / 11
+  accepted, unchanged**, 90.26 GiB peak RSS, 7m13.59s. Acceptance parity is measured
   against the safetensors sibling of the same quantization run: 12 proposed / 11
   accepted there vs 13 / 11 here. Cross-format token agreement is NOT
   APPLICABLE - it needs an F16/F32 GGUF sibling and every head-carrying export
@@ -920,15 +935,16 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   that came from `CMakeCache.txt`, which records the CUDA compiler's own probe
   default and is shadowed by the normal variable the project sets, so it never
   described the compiled code. The real flags and every emitted cubin are
-  `sm_121a`. And the GPU arm's 24 tokens differed from the CPU arm's: that is a
-  **near-tie, not a defect**, and CPU-vs-GPU token equality was never the bar
-  (spec-ON == spec-OFF within one device is). At the one position where the two
-  arms fork they still share a bit-identical prefix, and each device's pick is
-  the other's rank-2 candidate at a margin of 0.074 nats (GPU) and 0.065 nats
-  (CPU) - roughly 7x inside the ratified 0.5-nat near-tie band, and smaller than
-  the 0.057-0.082 nats by which the two devices disagree about those same
-  tokens' logprobs. Rounding decides it; everything after is one coin flip
-  cascading, which is why 24 tokens look unrelated for a 0.07-nat cause.
+  `sm_121a`. And the GPU arm's 24 tokens differed from the CPU arm's: that was
+  read as a near-tie, and the 2026-07-29 re-measurement shows it was an artifact
+  of the defective build. **There is no CPU-versus-GPU token delta on a
+  production build**: both devices emit the same 24 tokens, because with CUTLASS
+  and the Triton-AOT GDN kernels in, the GPU takes the CPU's side of the 0.06-nat
+  near-tie at position 1 (GPU rank1 `11` -0.763897 over rank2 `13` -0.824083; CPU
+  rank1 `11` -0.765499 over rank2 `13` -0.830374, bit-identical to before, as
+  expected for CUDA-only kernels). Zero exact ties in either arm, minimum margins
+  0.060 and 0.065 nats. The near-tie is real and unchanged in size; only which
+  side the GPU landed on moved, and the earlier cascade narrative is retracted.
 - **The 35B A3B NVFP4 SAFETENSORS target has EXACT logit ties, and its
   speculative token identity does not hold there** (open, surfaced by
   `SPEC-MTP-GGUF`'s gate, owned by `SPEC-MTP`). Pointed at the safetensors
