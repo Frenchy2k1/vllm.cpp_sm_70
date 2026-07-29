@@ -199,7 +199,15 @@ ENGINE_PREFIXES = (
 # prefix-cache matching unit (`resolve_kv_cache_block_sizes` -> `hash_block_size`),
 # not covered by the `KV-PREFIX-CACHE` block-hash row (which hashes at
 # `block_size`). W0 spike + W1 resolver landed; `PARTIAL`.
-ENGINE_ROWS = 126
+# 127 since 2026-07-29: +`ENG-PLUGIN-SYSTEM` (the out-of-core PLUGIN system —
+# `LoadGeneralPlugins()` + the general-plugin registration seam that lets an
+# external TU / shared object register a model factory / platform / quant method
+# through the existing `REGISTER_VLLM_MODEL`-style seams WITHOUT editing engine
+# core; the RECORDS-GAP the feature-gap analysis named for row creation). A real
+# new engine capability, W0 spike + W1 CPU brick landed + unit-gated RED-first;
+# `ACTIVE`, `CLAIM-PLUGIN-SYSTEM`, spec `specs/plugin-system.md`. Bumped for a
+# real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 127
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
