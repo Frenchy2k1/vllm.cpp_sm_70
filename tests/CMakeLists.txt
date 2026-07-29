@@ -367,6 +367,10 @@ vllm_cpp_add_test(test_rotary_embedding
   vllm/model_executor/layers/rotary_embedding/test_rotary_embedding.cpp)
 vllm_cpp_add_test(test_pooler
   vllm/model_executor/layers/pooler/test_pooler.cpp)
+vllm_cpp_add_test(test_pooler_heads
+  vllm/model_executor/layers/pooler/test_pooler_heads.cpp)
+vllm_cpp_add_test(test_pooling_runner
+  vllm/v1/worker/gpu/pool/test_pooling_runner.cpp)
 vllm_cpp_add_test(test_gdn_metadata_builder vllm/v1/attention/test_gdn_metadata_builder.cpp)
 vllm_cpp_add_test(test_mtp_speculator vllm/v1/spec_decode/test_mtp_speculator.cpp)
 vllm_cpp_add_test(test_rejection_sampler vllm/v1/spec_decode/test_rejection_sampler.cpp)
@@ -658,6 +662,13 @@ target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # coherently elsewhere). Reaches src/ for the block/repack/threadpool headers.
 vllm_cpp_add_test(test_ops_quant_repack vt/test_ops_quant_repack.cpp)
 target_include_directories(test_ops_quant_repack PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# QUANT-GGUF-CIQ-GEMM-CUDA: the CUDA keep-quant GEMM (kCUDA provider for
+# kMatmulBTQuant). Gates the GPU dequant-in-kernel dot against the landed CPU
+# keep-quant oracle + an f64 dequant reference on the Q8_K family (DeepSeek-V4's
+# IQ2_XXS/IQ3_XXS/Q2_K plus the other four k-quants). Skips coherently with no
+# CUDA device. Reaches src/ for vt/cpu block/quant headers used by the reference.
+vllm_cpp_add_test(test_cuda_quant_dot vt/test_cuda_quant_dot.cpp)
+target_include_directories(test_cuda_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
 # gate is BYTE-IDENTITY against an independent scalar reference across every
 # dtype combination, both weight orientations, ragged K/N, row-strided

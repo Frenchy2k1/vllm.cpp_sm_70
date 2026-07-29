@@ -706,6 +706,15 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
     tok.pattern_ = SplitPattern::kQwen2Classic;
   } else if (pre == "llama-bpe") {
     tok.pattern_ = SplitPattern::kLlama3;
+  } else if (pre == "joyai-llm" || pre == "deepseek-llm" || pre == "deepseek-v3") {
+    // DeepSeek-V4-Flash GGUFs (antirez/ds4 q2-imatrix) tag pre="joyai-llm". The
+    // vocab is gpt2 byte-level BPE; the pretokenizer regex is the GPT-2/Llama-3
+    // byte-level family. We map it to kLlama3 for our-side Encode() as a close
+    // APPROXIMATION (it may differ from DeepSeek's exact regex on rare boundary
+    // pretokens) — for a token-EXACT cross-check, feed the reference engine's own
+    // input ids. Decode() is vocab-based and pattern-INDEPENDENT, so detokenizing
+    // generated ids is exact regardless.
+    tok.pattern_ = SplitPattern::kLlama3;
   } else {
     Fail("unsupported tokenizer.ggml.pre \"" + pre + "\"");
   }

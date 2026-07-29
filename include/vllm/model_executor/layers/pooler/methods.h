@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,20 @@ class SequencePoolingMethod {
   virtual ~SequencePoolingMethod() = default;
   virtual PooledData Forward(const vt::Tensor& hidden_states,
                              const PoolingMetadata& metadata) const = 0;
+
+  // methods.py:22 get_supported_tasks — every sequence method serves the four
+  // seqwise/tokwise-compatible tasks; the head narrows this (SequencePooler
+  // intersects method ∩ head). W2 addition (defaulted, non-breaking for W1).
+  virtual std::set<PoolingTask> GetSupportedTasks() const {
+    return {PoolingTask::kTokenEmbed, PoolingTask::kTokenClassify,
+            PoolingTask::kEmbed, PoolingTask::kClassify};
+  }
+
+  // methods.py:24 get_pooling_updates — the sequence methods advertise no
+  // token-id requirement (StepPool, which does, is the W5 tokwise brick).
+  virtual PoolingParamsUpdate GetPoolingUpdates(PoolingTask /*task*/) const {
+    return PoolingParamsUpdate{};
+  }
 };
 
 // methods.py:36 CLSPool — the first token of each sequence. Rejects partial
