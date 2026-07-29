@@ -83,9 +83,18 @@ MATRICES = {
     # first-principles double-precision Sinkhorn derivation); the device kernel +
     # DeepseekV4Model::Forward assembly are W7 residuals. `SPIKE`,
     # `CLAIM-DEEPSEEK-V4-W5`, spec specs/deepseek-v4-flash.md).
+    # 42 since 2026-07-29: +`KERNEL-MOE-SQRTSOFTPLUS-HASH` (the DeepSeek-V4 MoE
+    # router + clamped-SwiGLU deltas — the `sqrt(softplus(·))` score function, the
+    # noaux_tc bias-for-selection top-k with weights gathered from the UNBIASED
+    # scores, the hash `tid2eid` token-id→expert route that BYPASSES top-k, and the
+    # asymmetric clamped SwiGLU expert activation `SiluAndMulWithClamp`). The three
+    # genuinely-new-vs-V2/V3 MoE pieces; the shared grouped-GEMM / expert / shared-
+    # expert machinery is REUSED, not re-ported. W6 landed a portable host reference
+    # + unit gate; the device kernels + DeepseekV4Model::Forward assembly are W7
+    # residuals. `SPIKE`, `CLAIM-DEEPSEEK-V4-W6`, spec specs/deepseek-v4-flash.md).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 41),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 42),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

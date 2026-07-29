@@ -337,9 +337,22 @@ from-first-principles double-precision references, RED-first proven on both the
 iteration count and a normalization axis). The W0 scope's "no eager reference upstream"
 premise is corrected: vLLM ships an eager PyTorch reference (`mhc/torch.py`) and four
 upstream implementations agree on the Sinkhorn, so the port is grounded 1:1 and
-cross-checked against an independent derivation. Additive and byte-neutral. The
-remaining bricks — the sqrtsoftplus/hash MoE, the device kernels + forward assembly,
-and the full model gate — stay multi-Spark-blocked.
+cross-checked against an independent derivation. Additive and byte-neutral. **W6
+sqrtsoftplus + hash-routed MoE landed (2026-07-29):** the three genuinely-new-vs-V2/V3
+MoE pieces are ported as portable host references and unit-gated — the router score
+function `sqrt(softplus(x))` (distinct from V2/V3's sigmoid/softmax), the router that
+adds the correction bias for SELECTION only then either picks top-k or looks the
+experts up directly in the `tid2eid` token-id→expert hash table (bypassing top-k),
+gathering the weights from the UNBIASED scores, and the asymmetric clamped SwiGLU
+expert activation (gate clamped max-only, up clamped both-sided). `test_deepseek_v4_moe`
+passes 12/12 (hand-derived literals plus from-first-principles double-precision
+references, RED-first proven on all three load-bearing levers: dropping the sqrt,
+gathering weights from the biased scores, and symmetric-clamping the gate). The shared
+grouped-GEMM / expert / shared-expert / NVFP4 machinery is REUSED, not re-ported (only
+scoring + hash + clamp are net-new); MegaMoE is SM100-only so GB10 mirrors the
+FusedMoE-fallback router. Additive and byte-neutral. The
+remaining bricks — the device kernels (which reuse the existing grouped-GEMM) + the
+forward assembly, and the full model gate — stay multi-Spark-blocked.
 The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):

@@ -633,6 +633,32 @@ new TUs `-Wall -Werror -Wextra`-clean). The full-model speed gate remains multi-
 GiB); MoE (W6), device-kernel + forward-assembly (W7), strict gate (W8) are named residuals. New
 kernel row `KERNEL-MHC-SINKHORN` (`SPIKE`). No source/engine path touched.
 
+**DeepSeek-V4-Flash W6 sqrtsoftplus + hash-routed MoE (2026-07-29, `CLAIM-DEEPSEEK-V4-W6`,
+NOT pushed).** Disposition: **NOT APPLICABLE (correctness/primitive brick, host CPU reference + unit
+gate; no run, no download, no throughput number taken, claimed, or owed; `benchmark_binding=false`).**
+Ported + unit-gated the three genuinely-new-vs-V2/V3 MoE pieces: `SqrtSoftplus` (the V4 router score
+`sqrt(softplus(x))`, distinct from V2/V3's sigmoid/softmax), `SqrtSoftplusRouteTopk` (score all experts
+→ add `e_score_correction_bias` for SELECTION only → top-k OR the `tid2eid` token-id→expert HASH lookup
+that BYPASSES top-k → GATHER weights from the UNBIASED scores → renormalize → ×routed_scaling_factor),
+`ClampedSwiGLU` (`SiluAndMulWithClamp`: gate clamped max-only, up clamped both-sided,
+`gate·σ(α·gate)·(up+β)`). `deepseek_v4_moe.{h,cpp}`, `test_deepseek_v4_moe` **12/12·716** — hand-derived
+literals (sqrt∘softplus composition, bias-flips-selection-but-weight-stays-unbiased, the hash bypass,
+the asymmetric clamp) + from-first-principles double-precision references (router f32==f64 rel-L2 < 1e-5
++ exact ids; ClampedSwiGLU rel-L2 < 1e-6) + RED-first proven ALL THREE load-bearing levers: drop the
+sqrt fails 8/493, gather weights from the biased scores fails 2/181, symmetric-clamp the gate fails 2/6.
+Ported 1:1 from vLLM `fused_topk_bias_router.py:75-118` (`_topk_softplus_sqrt_torch`) +
+`activation.py:197-201`, cross-checked SGLang `v0.5.15` `moe/{topk.py, hash_topk.py}`. REUSE not
+re-port: the shared grouped-GEMM / 256-expert / shared-expert / NVFP4 machinery is untouched (only
+scoring+hash+clamp are net-new); MegaMoE is SM100-only so GB10 mirrors the FusedMoE-fallback router.
+Honest gate form: host-reference + hand-case + structural review, NOT a dumped-oracle rel-L2
+(fixed-config 167B not constructible tiny). No OPEN QUESTIONS (every constant grounded). SACRED-inert
+(no existing forward touched; `test_deepseek_v4_mhc` 14/14·125, `test_deepseek_v4_compressor` 12/12·164,
+`test_deepseek_v4_dsa` 13/13·38, `test_deepseek_v4_scaffold` 4/4·40 unchanged). CPU Debug build (the
+same voxtral `-O2` false positive; new TUs `-Wall -Werror -Wextra`-clean). The full-model speed gate
+remains multi-Spark-blocked (156.7 GiB); the device kernels (reuse the existing grouped-GEMM) +
+forward-assembly (W7), strict gate (W8) are named residuals. New kernel row
+`KERNEL-MOE-SQRTSOFTPLUS-HASH` (`SPIKE`). No source/engine path touched.
+
 **KDA (Kimi Delta Attention) kernel delta W1 (2026-07-28, `CLAIM-KDA-KERNEL`, NOT
 pushed).** Disposition: **NOT APPLICABLE (correctness/kernel-primitive brick, host CPU
 reference + unit gate; no run, no download, no throughput number taken, claimed, or
