@@ -140,8 +140,9 @@ the tests, and lays out the W-breakdown. Pinned oracle
 |---|---|---|
 | `tests/model_executor/layers/test_pooler_methods.py` (`TestCLSPool`, `TestLastPool`, `TestMeanPool`, `TestGetSeqPoolingMethod`) | `tests/vllm/model_executor/layers/pooler/test_pooler.cpp` | **W1 ported + passing** (double-precision references; the `AllPool`/`StepPool` classes deferred with the tokwise brick) |
 | `tests/model_executor/layers/test_pooler_activations.py` (Identity/Normalize/MultiLabelClassify/Classify) | same file | **W1 ported + passing**; the `get_act_fn` config-factory cases deferred with the head brick |
-| `tests/model_executor/layers/test_pooler_heads.py` | — | SKIPPED-DEFERRED (W2 heads brick): needs `PoolingParams`/matryoshka |
-| `tests/entrypoints/pooling/embed/*`, `tests/models/language/pooling/test_embedding.py` | — | SKIPPED-DEFERRED (W4 endpoint/model bricks): needs the runner + a real model |
+| `tests/model_executor/layers/test_pooler_heads.py` (`TestEmbeddingPoolerHead`, `TestClassifierPoolerHead`) | `tests/vllm/model_executor/layers/pooler/test_pooler_heads.cpp` | **W2 ported + passing** (240 asserts, double-precision refs; + SequencePooler/DispatchPooler composite). The tokwise `TestTokenEmbedding/TokenClassifierPoolerHead` classes deferred with the tokwise (W5) brick; the torch `list_input_gets_stacked` / `head_dtype` cases are return-type/dtype nuances not ported (recorded deviation) |
+| `tests/models/language/pooling/test_embedding.py` (real-oracle cosine gate) | `tests/vllm/v1/worker/gpu/pool/test_pooling_runner.cpp` | **W3 runner path ported + passing** as a STRUCTURAL cosine gate (14 asserts vs a double-precision LAST+normalize reference, RED-first). The REAL-model `vllm.LLM(task="embed").encode` oracle cosine gate remains SKIPPED-DEFERRED (W3-model): needs a registered concrete embedding model forward — no cosine-vs-oracle number is fabricated |
+| `tests/entrypoints/pooling/embed/*` | — | SKIPPED-DEFERRED (W4 endpoint brick): needs the OpenAI serving layer |
 
 ## Gates
 
@@ -172,9 +173,17 @@ the tests, and lays out the W-breakdown. Pinned oracle
 2. **W2 — pooler HEADS + `SequencePooler` + `DispatchPooler`** (matryoshka /
    projector / classifier calibration / task routing) + `PoolerConfig`/
    `PoolingParams`; port `test_pooler_heads.py`.
-3. **W3 — pooling RUNNER + first concrete pooling model** (a `*EmbeddingModel`
-   reusing a landed decoder backbone, or `BertEmbeddingModel`); `model-matrix.md`
-   row + checklist + rollup; oracle cosine-parity gate.
+3. **W3 — pooling RUNNER (`ENG-POOLING-RUNNER`) + first concrete pooling model**
+   (a `*EmbeddingModel` reusing a landed decoder backbone, or
+   `BertEmbeddingModel`); `model-matrix.md` row + checklist + rollup; oracle
+   cosine-parity gate. **RUNNER PATH LANDED 2026-07-29 (`CLAIM-POOLING`):**
+   `PoolingRunner` (`include/vllm/v1/worker/gpu/pool/pooling_runner.h`) applies the
+   model's `Pooler` (`DispatchPooler`) to the last hidden state and returns pooled
+   data instead of sampled tokens, structurally cosine-gated RED-first
+   (`test_pooling_runner.cpp`). RESIDUAL: the concrete embedding MODEL forward +
+   the REAL-model `vllm.LLM(task="embed").encode` oracle cosine gate (no such
+   model registered yet — structural gate only, no cosine-vs-oracle number
+   fabricated).
 4. **W4 — endpoints** `/v1/embeddings`, `/score` + `/rerank`, `/classify` +
    `/pooling` + protocol; `SERVE-POOLING-ENDPOINTS` → implementation; port
    `tests/entrypoints/pooling/*`.

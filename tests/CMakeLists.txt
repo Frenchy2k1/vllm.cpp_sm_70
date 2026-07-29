@@ -367,6 +367,10 @@ vllm_cpp_add_test(test_rotary_embedding
   vllm/model_executor/layers/rotary_embedding/test_rotary_embedding.cpp)
 vllm_cpp_add_test(test_pooler
   vllm/model_executor/layers/pooler/test_pooler.cpp)
+vllm_cpp_add_test(test_pooler_heads
+  vllm/model_executor/layers/pooler/test_pooler_heads.cpp)
+vllm_cpp_add_test(test_pooling_runner
+  vllm/v1/worker/gpu/pool/test_pooling_runner.cpp)
 vllm_cpp_add_test(test_gdn_metadata_builder vllm/v1/attention/test_gdn_metadata_builder.cpp)
 vllm_cpp_add_test(test_mtp_speculator vllm/v1/spec_decode/test_mtp_speculator.cpp)
 vllm_cpp_add_test(test_rejection_sampler vllm/v1/spec_decode/test_rejection_sampler.cpp)
