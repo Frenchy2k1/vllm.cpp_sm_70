@@ -470,3 +470,55 @@ TEST_CASE("W7-device ForwardDevice ASSEMBLES: device forward == host forward (ne
   // accumulated near-tie envelope (device expf/sqrtf/rsqrt vs host, over 4 layers).
   CHECK(RelL2(dev.host, host) < 2e-3);
 }
+
+// Brick A: the device MLA decode attention kernel == the host SoftmaxWithSink
+// reference (per-head sink softmax over the shared cached latent). Near-tie
+// (device expf vs host std::exp is the only divergence — accumulation order is
+// preserved). RED-first: dropping the sink (no_sink) changes the output.
+TEST_CASE("DeepseekV4 device MLA decode attention == host SoftmaxWithSink (Brick A)") {
+  if (!HasCuda()) return;  // DGX-only
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t nh = 4, hd = 64, kv_base = 5, T = 1;  // decode: 1 query, 6 keys
+  const int64_t n = kv_base + T;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const std::vector<float> q = Rand(r, T * nh * hd);
+  const std::vector<float> kv = Rand(r, n * hd);
+  const std::vector<float> sink = Rand(r, nh, 0.5f, 2.0f);  // positive → load-bearing
+
+  auto host_ref = [&](bool no_sink) {
+    std::vector<float> o(static_cast<size_t>(T) * nh * hd, 0.0f);
+    for (int64_t h = 0; h < nh; ++h) {
+      std::vector<float> sc(static_cast<size_t>(n));
+      for (int64_t s = 0; s < n; ++s) {
+        float acc = 0.0f;
+        for (int64_t d = 0; d < hd; ++d) acc += q[h * hd + d] * kv[s * hd + d];
+        sc[static_cast<size_t>(s)] = acc * scale;
+      }
+      const float sk = no_sink ? -std::numeric_limits<float>::infinity() : sink[h];
+      const std::vector<float> probs = vllm::deepseek_v4::SoftmaxWithSink(sc, sk);
+      for (int64_t s = 0; s < n; ++s)
+        for (int64_t d = 0; d < hd; ++d)
+          o[h * hd + d] += probs[static_cast<size_t>(s)] * kv[s * hd + d];
+    }
+    return o;
+  };
+
+  // device (unified-memory pointers; GB10 coherent access)
+  std::vector<float> o(static_cast<size_t>(T) * nh * hd, 0.0f);
+  vllm::deepseek_v4::DsaDevice()->decode_attn(g.q, o.data(), q.data(), kv.data(), sink.data(),
+                                              nh, hd, kv_base, T, scale, /*no_sink=*/false);
+  gpu.Synchronize(g.q);
+  const std::vector<float> ref = host_ref(false);
+  for (float v : o) CHECK(std::isfinite(v));
+  CHECK(RelL2(o, ref) < 1e-5);  // near-tie (expf vs std::exp)
+
+  // RED-first: no_sink must CHANGE the output (the sink is load-bearing).
+  std::vector<float> o_ns(static_cast<size_t>(T) * nh * hd, 0.0f);
+  vllm::deepseek_v4::DsaDevice()->decode_attn(g.q, o_ns.data(), q.data(), kv.data(), sink.data(),
+                                              nh, hd, kv_base, T, scale, /*no_sink=*/true);
+  gpu.Synchronize(g.q);
+  CHECK(RelL2(o_ns, o) > 1e-4);
+  CHECK(RelL2(o_ns, host_ref(true)) < 1e-5);  // and it matches the no-sink host ref
+}

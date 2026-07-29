@@ -159,6 +159,17 @@ inline bool GroupedMoeEnabled() {
   return on;
 }
 
+// Brick A (device-resident decode campaign): run the MLA attention QK/softmax-sink/AV
+// on the device kernel instead of the host Dot loop. Default OFF — the host path
+// stays default until the decode graph (Brick D) proves out. `VT_V4_DEVICE_ATTN=1`.
+inline bool DeviceAttnEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_DEVICE_ATTN");
+    return e != nullptr && std::string(e) == "1";
+  }();
+  return on;
+}
+
 // One MatmulBT + (optional device) drain, timed when profiling is on. When
 // `defer_sync` is true the stream is NOT drained here — the caller issues a batch
 // of independent GEMMs and drains ONCE via DrainDevice before the host reads them
@@ -732,25 +743,41 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   }
 
   // 5. attention with per-head sink softmax; key = value = the cached latent
-  //    (kv_keys, GLOBAL-indexed) — the decoded MLA latent (W3 seams).
+  //    (kv_keys, GLOBAL-indexed) — the decoded MLA latent (W3 seams). Brick A:
+  //    when VT_V4_DEVICE_ATTN + a CUDA queue + the V4 device kernels are live, this
+  //    runs on the device kernel over the unified KV cache (dense-causal only, no
+  //    indexer); else the host Dot loop. The device kernel preserves the host
+  //    accumulation order (bit-identical target); the caller drains after it.
   std::vector<float> o(static_cast<size_t>(T) * nh * hd, 0.0f);
   const float kNegInf = -std::numeric_limits<float>::infinity();
-  for (int64_t t = 0; t < T; ++t) {
-    const std::vector<int64_t>& S = sel[static_cast<size_t>(t)];
-    for (int64_t h = 0; h < nh; ++h) {
-      std::vector<float> sc(S.size());
-      const float* qh = &q[(t * nh + h) * hd];
-      for (size_t si = 0; si < S.size(); ++si)
-        sc[si] = Dot(qh, &(*kv_keys)[S[si] * hd], hd) * scale;
-      const float sink = (miswire == V4Miswire::kNoAttnSink)
-                             ? kNegInf
-                             : L.attn_sink[static_cast<size_t>(h)];
-      const std::vector<float> probs = DispSoftmaxSink(be, sc, sink);
-      float* oh = &o[(t * nh + h) * hd];
-      for (size_t si = 0; si < S.size(); ++si) {
-        const float w = probs[si];
-        const float* v = &(*kv_keys)[S[si] * hd];
-        for (int64_t d = 0; d < hd; ++d) oh[d] += w * v[d];
+  const bool dev_attn = be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU &&
+                        !is_indexer && DeviceAttnEnabled() &&
+                        deepseek_v4::V4DeviceKernelsAvailable();
+  if (dev_attn) {
+    // kv_keys holds the cached deck [n_keys_total, hd]; sel is dense-causal, so the
+    // device kernel derives it from kv_base+t (no per-key index list needed).
+    deepseek_v4::DsaDevice()->decode_attn(
+        *be.q, o.data(), q.data(), kv_keys->data(), L.attn_sink.data(), nh, hd, kv_base, T,
+        scale, /*no_sink=*/miswire == V4Miswire::kNoAttnSink);
+    SyncDeviceGemm(be);  // Brick A drains; Brick D will capture instead
+  } else {
+    for (int64_t t = 0; t < T; ++t) {
+      const std::vector<int64_t>& S = sel[static_cast<size_t>(t)];
+      for (int64_t h = 0; h < nh; ++h) {
+        std::vector<float> sc(S.size());
+        const float* qh = &q[(t * nh + h) * hd];
+        for (size_t si = 0; si < S.size(); ++si)
+          sc[si] = Dot(qh, &(*kv_keys)[S[si] * hd], hd) * scale;
+        const float sink = (miswire == V4Miswire::kNoAttnSink)
+                               ? kNegInf
+                               : L.attn_sink[static_cast<size_t>(h)];
+        const std::vector<float> probs = DispSoftmaxSink(be, sc, sink);
+        float* oh = &o[(t * nh + h) * hd];
+        for (size_t si = 0; si < S.size(); ++si) {
+          const float w = probs[si];
+          const float* v = &(*kv_keys)[S[si] * hd];
+          for (int64_t d = 0; d < hd; ++d) oh[d] += w * v[d];
+        }
       }
     }
   }
