@@ -424,6 +424,27 @@ and a greedy driver (the engine's incremental paged decode is incompatible with 
 keep-quant recompute — a manual greedy loop over `DeepseekV4ForwardGguf` is required; note
 `Tokenizer::FromGguf` also rejects ds4's `pre='joyai-llm'`, so the token cross-check must inject
 ds4's token ids). Row stays SPIKE.
+**W8-run EXECUTED on the DGX GB10 (2026-07-29, base `858b0b15`, NOT pushed) — our engine LOADS
+the real 158 B model but the forward HARD-FAILS at the real geometry; ds4 reference captured:**
+the 80.7 GB file was downloaded + integrity-verified (86,720,111,488 B == HTTP Content-Length),
+ds4 was built (`make cuda-spark`), our CPU engine + a new greedy driver (`examples/deepseek_v4_gen`)
+were built, and both were run on the SAME file. **ds4 (GB10 GPU)** loads 80.76 GiB in ~20–29 s and
+greedily generates coherent on-topic text ("We need to answer: "The capital of France is". This is
+a straightforward") at **prefill 358 tok/s, decode 16.5 tok/s** (ctx=1024, `ds4-bench`). **Our engine**
+LOADS the keep-quant tower on the real model (43 layers, 256 experts, vocab 129280, all 1328 tensors
+accounted, `has_gguf_weights=1`, ~78 s) at **PEAK RESIDENT 116.2 GiB** — it FITS under the 119 GiB
+pool but is ~32 GiB ABOVE the projected ~84 GiB, because `OwnGgufQuantBlocks` is called WITHOUT the
+`mmap_src` arg so it COPIES ~81 GiB of blocks into owned vectors while the mmap pages stay resident
+(fix: mmap-VIEW the blocks like `qwen3_5_gguf_weights.cpp`). **The forward then HARD-FAILS** with
+`deepseek-v4 keep-quant GEMM: weight shape mismatch: want [N=512,K=4096] got [1024,4096]`
+(`deepseek_v4.cpp:234`) at **layer 2 (the first DSA compressor layer)**: the W3–W7 forward, gated only
+at tiny synthetic shape, conflates `head_dim`=512 with the DSA compressor's distinct 1024-dim output
+(the real `attn_compressor_gate`/`attn_compressor_kv` are `[1024,4096]`). Layers 0–1 pass; layer 2
+crashes. NO coherent tokens generated → row STAYS SPIKE. **Remaining brick:** rework the MLA/DSA
+forward to the real DeepSeek-V4 geometry (compressor 1024-dim; audit indexer + grouped output-LoRA at
+`o_groups=8`/`nh=64`/`q_lora_rank=1024`) against a reference; plus the mmap-view load fix. The
+download + keep-quant load + tokenizer + greedy driver + ds4 oracle are DONE; the forward geometry is
+the one blocker before a real single-Spark generation.
 **W3 attention primitives landed
 (2026-07-28):** the genuinely-new-vs-V2/V3 math is ported as portable host references
 and unit-gated — the DSA "Lightning Indexer" sparse top-k SELECTION (a weighted
