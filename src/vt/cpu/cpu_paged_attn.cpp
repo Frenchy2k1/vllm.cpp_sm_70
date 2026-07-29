@@ -76,6 +76,22 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   const int64_t kc_blk = k_cache.stride[0], kc_pg = k_cache.stride[1], kc_hd = k_cache.stride[2];
   const int64_t vc_blk = v_cache.stride[0], vc_pg = v_cache.stride[1], vc_hd = v_cache.stride[2];
 
+  // fp8 KV read (KV-FP8 W1): when the cache is fp8 (kv_cache_dtype != kAuto) the
+  // pages are 1-byte fp8 (kI8) and each read is DEQUANTIZED as Dequant(fp8) *
+  // k_scale|v_scale before the f32 softmax (scaled_vec_conversion<float,uint8_t>,
+  // quant_utils.cuh:302-308). kAuto keeps the float path byte-identical.
+  const bool kv_fp8 = args.kv_cache_dtype != vt::Fp8KVCacheDataType::kAuto;
+  const uint8_t* k_fp8 = kv_fp8 ? k_cache.Ptr<uint8_t>() : nullptr;
+  const uint8_t* v_fp8 = kv_fp8 ? v_cache.Ptr<uint8_t>() : nullptr;
+  const float k_scale = args.k_scale;
+  const float v_scale = args.v_scale;
+  auto LoadK = [&](int64_t off) -> float {
+    return kv_fp8 ? vt::LoadKvFp8E4M3(k_fp8[off], k_scale) : LoadF32(k_cache, off);
+  };
+  auto LoadV = [&](int64_t off) -> float {
+    return kv_fp8 ? vt::LoadKvFp8E4M3(v_fp8[off], v_scale) : LoadF32(v_cache, off);
+  };
+
   // Flatten the (request, local-token) nest into the global query-token index so
   // the work is one embarrassingly-parallel axis: at c1 prefill num_reqs==1, so
   // the request loop alone is serial (kPagedAttention profiled at 10% of prefill,
@@ -124,7 +140,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
           const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
           float dot = 0.0f;
           for (int64_t e = 0; e < d; ++e)
-            dot += LoadF32(query, qoff + e) * LoadF32(k_cache, kbase + e);
+            dot += LoadF32(query, qoff + e) * LoadK(kbase + e);
           dot *= scale;
           if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
           probs[static_cast<size_t>(j - jmin)] = dot;
@@ -146,7 +162,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
           const int64_t off = j % block_size;
           const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
           for (int64_t e = 0; e < d; ++e)
-            acc[static_cast<size_t>(e)] += pw * LoadF32(v_cache, vbase + e);
+            acc[static_cast<size_t>(e)] += pw * LoadV(vbase + e);
         }
         for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
       }

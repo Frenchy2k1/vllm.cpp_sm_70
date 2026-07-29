@@ -32313,3 +32313,52 @@ gate → TPOT/throughput/peak-resident benchmark vs llama.cpp-on-card). No code 
   DGX-blocked). **Resume:** pick up W2 (production-wire the configured backend
   name through `MakeStructuredOutputBackendFactory` in `model_loader.cpp` + the
   feature-guard/fallback), then the GPU oracle parity gate when the DGX is back.
+---
+
+## 2026-07-29 — fp8 KV cache W0 spike + W1 CPU brick (`CLAIM-KV-FP8`, ACTIVE, NOT pushed)
+
+HIGH-priority feature-gap #5 ([fp8-kv-cache.md](specs/fp8-kv-cache.md)): the standard
+memory/throughput lever that halves the KV footprint by storing K/V as fp8 with a per-tensor
+dequant scale. Isolated worktree `.claude/worktrees/kv-fp8-w1`, branch `kv-fp8-w1`, base `main`
+`6d54f242`. CPU-only Release `-Werror`; NO GPU/download.
+
+**W0.** Spiked the whole vLLM fp8-KV path: the `CacheDType` config (`config/cache.py:19-36,76`,
+`fp8`==`fp8_e4m3`, `calculate_kv_scales`), `BaseKVCacheMethod` per-tensor k/v scale handling
+(`kv_cache.py:42,108-191`, default 1.0, checkpoint-loaded, per-tensor-only), the fp8 store in
+`reshape_and_cache_flash_kernel` (`cache_kernels.cu:241-252,314-401` via `CopyWithScaleOp` +
+`fp8::scaled_convert`), the read dequant (`quant_utils.cuh:296-308`, `Dequant(fp8)*scale`), and the
+halved-block memory accounting. Scale convention pinned from source: **`FP8=Quantize(HP/scale)`;
+`Dequant(FP8)*scale=HP`**.
+
+**W1 (CPU brick, all additive).** `include/vt/fp8_kv.h` (NEW): `Fp8KVCacheDataType` interpretation
+enum (mirror `dtype_fp8.cuh:9-13`) + the fp8-e4m3 codec + `StoreKvFp8E4M3`/`LoadKvFp8E4M3`,
+bit-identical to the landed `vllm::F32ToF8E4M3`/`F8E4M3ToF32` (vt does not depend on vllm — the same
+rationale as the `cpu_ops.cpp:418-460` in-file copies, which a later cleanup should consolidate onto
+this header). `vt::ReshapeAndCacheFp8` = NEW op `kReshapeAndCacheFp8` + wrapper (`src/vt/ops.cpp`) +
+CPU kernel (`src/vt/cpu/cpu_cache.cpp`), the fp8 store. Additive default-inert
+`PagedAttentionArgs.{kv_cache_dtype,k_scale,v_scale}` + the CPU paged-attention read dequant
+(`src/vt/cpu/cpu_paged_attn.cpp`). `vllm::v1::ParseCacheDType`/`IsQuantizedKvCache`
+(`include/vllm/v1/kv_cache_dtype.h`), the `cache_dtype` config parse. **Design decisions:** fp8
+storage rides `DType::kI8` (1 byte + the interpretation enum, mirroring vLLM's `cache_t=uint8_t` +
+`KV_DTYPE` template param), NOT a new `DType` enumerator — avoids the `-Wswitch` blast radius across
+every backend. New op (not a widened `ReshapeAndCacheFn`) so the CUDA/Metal registrations'
+`static_cast` is untouched (no Metal edit). CUDA/non-CPU + e5m2 refused at the wrapper (named later
+bricks), not silently mis-stored.
+
+**Gate.** `tests/vt/test_ops_fp8_kv_cache.cpp` **8 cases / 511 assertions GREEN** (round-trip within
+the e4m3 band, fp8-vs-bf16 NMSE < 1%, paged-attention e2e within 5%, `ParseCacheDType` mirror, e5m2 +
+auto-read refusals). Ported from `test_cache.py::test_reshape_and_cache` (fp8 branch). **RED-first
+PROVEN:** a wrong store direction (`hp*scale`) fails 3/480; a wrong read `v_scale` diverges > 0.05
+(both mutations run, observed, reverted). No sibling regression: `test_ops_reshape_cache` 12/12,
+`test_ops_paged_attn` 14/14. Clean CPU full-library `-Wall -Wextra -Werror`. Record checkers rc=0.
+
+**Records:** `KV-FP8` engine row INVENTORIED→ACTIVE (rollup ACTIVE 42→43, INVENTORIED 35→34; KV-area
+6→7/5→4), `QUANT-KV-FP8` INVENTORIED→PARTIAL, `CLAIM-KV-FP8` claim row, feature-matrix, roadmap #5,
+docs/STATUS, docs/BENCHMARKS (NOT-APPLICABLE speed / memory-halving e2e PENDING), parity-ledger.
+No counted-matrix ROW added ⇒ no checker constant change.
+
+**RESIDUALS (honest, named W2-W5 in the spec):** the CUDA fp8 store + fp8 paged-attention read (the
+GPU memory-halving path, DGX-blocked); the runner/spec integration (half-sized KV blocks + checkpoint
+`k_scale`/`v_scale` threading + `--kv-cache-dtype`/`--calculate-kv-scales`); fp8_e5m2 CPU compute +
+per-attention-head scales. W1 is a CPU correctness brick — the real memory/throughput WIN is the GPU
+path + halved-block runner integration. Not pushed; FULL SHA reported to the caller.

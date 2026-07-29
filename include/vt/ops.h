@@ -7,6 +7,7 @@
 #include <optional>
 #include <type_traits>
 
+#include "vt/fp8_kv.h"
 #include "vt/fused_recipe.h"
 #include "vt/op_provider.h"
 #include "vt/tensor.h"
@@ -267,6 +268,13 @@ enum class OpId : uint8_t {
   kDeepseekV4Dsa,
   kDeepseekV4Compressor,
   kDeepseekV4Moe,
+  // fp8 KV-cache STORE (KV-FP8 W1). The fp8 sibling of kReshapeAndCache: the
+  // paged K/V cache pages are 1-byte fp8-e4m3fn (DType::kI8 storage) and the
+  // write quantizes each K/V element as Quantize(hp / k_scale|v_scale). Mirrors
+  // reshape_and_cache_flash's fp8 branch (cache_kernels.cu:314-401,
+  // CopyWithScaleOp :241-252). Kept a SEPARATE op so every float-cache caller
+  // stays byte-identical. Appended before kCount so no existing op's id shifts.
+  kReshapeAndCacheFp8,
   kCount
 };
 
@@ -496,6 +504,17 @@ struct PagedAttentionArgs {
   // device read (companion to query_start_loc_host). 0 => that launcher falls
   // back to the D2H+sync.
   int32_t max_seq_len = 0;
+  // OPTIONAL fp8 KV-cache read (KV-FP8 W1). kAuto (default) => the cache holds
+  // the model float dtype and is read directly — every existing caller is
+  // byte-identical. When != kAuto the K/V cache pages are 1-byte fp8 (DType::kI8
+  // storage) and each read is DEQUANTIZED as Dequant(fp8) * k_scale|v_scale
+  // before entering the f32 softmax, mirroring the fp8 attention read path
+  // (scaled_vec_conversion<float,uint8_t>, quant_utils.cuh:302-308). k_scale /
+  // v_scale are the per-tensor scales from BaseKVCacheMethod (kv_cache.py:108-191)
+  // — 1.0 is the uncalibrated default. Per-head scales are a later brick.
+  Fp8KVCacheDataType kv_cache_dtype = Fp8KVCacheDataType::kAuto;
+  float k_scale = 1.0f;
+  float v_scale = 1.0f;
 };
 
 // Arguments for vt::MlaDecodeAttention (MLA campaign W4). Mirrors the scalar
@@ -734,6 +753,13 @@ using DFlashPagedBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, con
                                              const DFlashPagedBlockAttentionArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
+// fp8 KV-cache store (KV-FP8 W1). k_cache/v_cache are 1-byte fp8 (DType::kI8);
+// each element is stored as Quantize(hp / k_scale|v_scale). `kind` selects the
+// fp8 interpretation (kFp8E4M3 landed; kFp8E5M2 is a later brick).
+using ReshapeAndCacheFp8Fn = void (*)(Queue&, const Tensor& /*k*/, const Tensor& /*v*/,
+                                      Tensor& /*k_cache*/, Tensor& /*v_cache*/,
+                                      const Tensor& /*slot_mapping*/, Fp8KVCacheDataType /*kind*/,
+                                      float /*k_scale*/, float /*v_scale*/);
 using ConcatAndCacheMlaFn =
     void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, const Tensor&);
 using MlaDecodeAttentionFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
@@ -1832,6 +1858,21 @@ void DFlashPagedBlockAttention(Queue& q, Tensor& out, const Tensor& query,
 // fp8 scaling — fp8 KV cache is out of T0 scope).
 void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                      Tensor& v_cache, const Tensor& slot_mapping);
+
+// --- fp8 KV-cache write (KV-FP8 W1). The fp8 sibling of ReshapeAndCache: the
+// K/V cache pages are 1-byte fp8 (DType::kI8 storage, `kind` = the fp8
+// interpretation) and each element is quantized as Quantize(hp / k_scale) /
+// Quantize(hp / v_scale). Mirrors the fp8 branch of vLLM reshape_and_cache_flash
+// (csrc/libtorch_stable/cache_kernels.cu:314-401 + CopyWithScaleOp :241-252 +
+// the fp8::scaled_convert scale convention, quant_utils.cuh:296-308) @ pin
+// 555967922. k_scale/v_scale are the per-tensor scales BaseKVCacheMethod loads
+// from the checkpoint (kv_cache.py:108-191); both must be > 0. Same shape/stride
+// contract as ReshapeAndCache; the ONLY difference is the fp8 store. CPU-only in
+// W1 (the CUDA fp8-KV store kernel is a named later brick); kFp8E5M2 CPU compute
+// is likewise a later brick.
+void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                        Tensor& v_cache, const Tensor& slot_mapping, Fp8KVCacheDataType kind,
+                        float k_scale, float v_scale);
 
 // --- MLA paged KV-cache write (W3). The MLA counterpart of ReshapeAndCache.
 // Ported 1:1 from vllm/csrc/libtorch_stable/cache_kernels.cu:401-442
