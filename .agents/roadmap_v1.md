@@ -290,6 +290,22 @@ past the 119 GiB unified pool by ~layer 5; the keep-quant `weights.gguf` tower (
 never read by the forward. **Named residual W2c:** rewire the forward onto the CIQ `kMatmulBTQuant`
 keep-quant blocks + gate off the host-f32 dequant, THEN the download + GB10 greedy gen +
 self-consistency/coherence gate + benchmark. No tokens generated (not faked); DGX left as found.
+**W2c LANDED — the OOM-infeasibility is FIXED (2026-07-29, `CLAIM-DEEPSEEK-V4-W2C`, base `328e6a50`):**
+`LoadDeepseekV4FromGguf` no longer f32-expands the big MLA/MoE/lm_head weights (only the small
+norms/embed/MHC/DSA/hash tensors dequant to `host`); a new `DeepseekV4ForwardGguf` runs the SAME
+composition with the 512-wide MLA linears + 256 routed/shared expert GEMMs + lm_head CONSUMING the
+COMPRESSED `weights.gguf` blocks in place via `vt::MatmulBT`→the CPU `kMatmulBTQuant` CIQ GEMM (a `Gemm`
+/ `GemmRowSlice` / `GroupedOutputLoraGguf` helper trio), and `DeepseekV4Model::Forward` gates on
+`has_gguf_weights` (the safetensors/NVFP4 + tiny-synthetic host path stays byte-identical). Gate
+`test_deepseek_v4_gguf_load` **7/7·185** (CPU Release `-Werror`-clean): keep-quant forward RUNS
+finite+deterministic; keep-quant(Q8_0)==dequant(bf16) RelL2 **0.0116** (< 0.05 near-tie); RED-first
+(no-sink miswire diverges 0.122; a load that rebuilds the f32 tower fails a load-time `VT_CHECK` + the
+host<gguf-bytes assertion). MEMORY-BOUND asserted: host 23,980 B < keep-quant 141,676 B at tiny shape;
+projected full-scale the 256 routed experts alone are **~1032 GiB** f32 (OOMs the 119 GiB pool) vs the
+keep-quant `UD-IQ2_XXS` **~91 GiB** + small host **< 3 GiB** = **memory-FEASIBLE** on ONE GB10. REUSES the
+landed `kMatmulBTQuant` (no new kernel row / no checker bump). SACRED-inert (W3-W6 primitive tests
+unchanged; shared MLA/MoE + CUDA W7-device untouched). The real 91 GB run stays the operational W8-run
+(download + GB10 generate + benchmark), now memory-feasible.
 **MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
 [`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
 DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)
@@ -636,15 +652,48 @@ single-box, common, user-facing):
 | 3 | AWQ + GPTQ native quantized compute | [`QUANT-AWQ`](quantization-matrix.md), [`QUANT-GPTQ`](quantization-matrix.md) | M | The two most common community weight formats. **W0 spike + W1 CPU INT4 dequant LANDED (2026-07-28, `CLAIM-QUANT-AWQ-GPTQ`, both rows INVENTORIED→ACTIVE, [spike](specs/awq-gptq-quant.md)):** AWQ (reverse-order `awq_triton.py`) + GPTQ (`qdq_4.cuh` zero_offset v1/v2, act-order g_idx) unpack+dequant-to-bf16, unit-gated RED-first. Remaining: loader `R` (W2), Marlin GPU `C` (W4, rides the vendored NVFP4 Marlin), e2e `E` (W3), GPTQ 8/2/3-bit (W5), MoE (W6). |
 | 2 | Pooling task class — embeddings / classify / score / rerank (runner + endpoints) | [`ENG-POOLER-SEQ`](engine-matrix.md) (W1 pooler op, `ACTIVE`), [`SERVE-POOLING-ENDPOINTS`](engine-matrix.md) (`SPIKE`) (+ no pooling model rows yet) | L | An entire task class we cannot serve; embeddings/rerank are ubiquitous. **PICKUP STARTED 2026-07-28 (`CLAIM-POOLING`):** W0 spike ([pooling-task-class.md](specs/pooling-task-class.md)) + W1 CPU pooler OP landed (CLS/LAST/MEAN + normalize/classify activation heads, unit-gated vs double-precision refs). Residuals: heads composite + DispatchPooler (W2), pooling runner + first concrete model (W3), endpoints (W4), tokwise (W5). |
 | 3 | AWQ + GPTQ native quantized compute | [`QUANT-AWQ`](quantization-matrix.md), [`QUANT-GPTQ`](quantization-matrix.md) | M | The two most common community weight formats; no compute path. |
-| 4 | xgrammar structured-output backend | [`TOOLS-XGRAMMAR`](engine-matrix.md) | M | Closes JSON-schema parity beyond our bounded native subset (default auto backend upstream). |
-| 5 | fp8 KV cache (`cache_dtype=fp8`) | [`KV-FP8`](engine-matrix.md) | M | Standard memory/throughput lever, halves KV footprint. |
+| 4 | xgrammar structured-output backend — **W0 spike + W1 CPU brick LANDED 2026-07-29 (`CLAIM-TOOLS-XGRAMMAR`, `INVENTORIED`→`ACTIVE`)**: `XgrammarStructuredOutputBackend` behind the shared seam reuses the native pushdown-FSM/trie matcher (§9: mirror xgrammar's algorithm portably, do NOT vendor the C++ lib) + an xgrammar-faithful JSON-schema→EBNF converter (declaration key order + `any_whitespace` + `basic_*` verbatim), closing the key-order/whitespace/exotic-schema parity gap; `auto`→xgrammar selection mirrored; gate `test_backend_xgrammar` 6/6 RED-first. Residuals (W2+): optional props, compact separators, the feature-guard/`auto`-fallback + production wiring, xgrammar regex/structural-tag parity, GPU oracle parity | [`TOOLS-XGRAMMAR`](engine-matrix.md), [spec](specs/xgrammar-backend.md) | M | Closes JSON-schema parity beyond our bounded native subset (default auto backend upstream). |
+| 5 | fp8 KV cache (`cache_dtype=fp8`) | [`KV-FP8`](engine-matrix.md) | M | Standard memory/throughput lever, halves KV footprint. **W0 spike + W1 CPU brick landed (`ACTIVE`, `CLAIM-KV-FP8`, 2026-07-29):** fp8-e4m3 store+read+config-parse, CPU-gated RED-first. Residuals: CUDA store/read + memory-halving e2e (DGX) + runner integration + e5m2/per-head. |
 | 6 | Reasoning parsers (+ reasoning-gated grammar) — **ACTIVE** (partial coverage; spiked + seam landed 2026-07-28 `CLAIM-SAMPLE-REASONING`: 9 registered names of upstream's ~28; W2 remaining text families / W3 engine-backed adapters / W4 reasoning-gated grammar remain) | [`SAMPLE-REASONING`](engine-matrix.md), [spec](specs/reasoning-parsers.md) | M | `<think>` split for mainstream reasoning models; gates reasoning-conditioned structured output. |
 
-Three MED gaps have NO stable row yet (records gaps, recommend creating on
-pickup, IDs named in the spec): generic separate draft-model + Medusa spec
-decode (`vllm/v1/spec_decode/draft_model.py:19`, `medusa.py:18`); offline Batch
-API (`vllm/entrypoints/openai/run_batch.py:793`); plugin system
-(`vllm/plugins/__init__.py:18`, directly serves the extensibility-first priority).
+The plugin-system MED records-gap was PICKED UP 2026-07-29 as
+[`ENG-PLUGIN-SYSTEM`](engine-matrix.md) (`CLAIM-PLUGIN-SYSTEM`, `INVENTORIED`→
+`ACTIVE`, [spec](specs/plugin-system.md)): W0 spike + W1 CPU brick —
+`LoadGeneralPlugins()` + the out-of-core general-plugin registration seam over
+the existing `REGISTER_VLLM_MODEL`-style registries (1:1 `load_general_plugins`:
+load-once, `VLLM_PLUGINS` allowlist, failure isolation), unit-gated RED-first via
+a toy-model out-of-core plugin (`test_plugin_system` 1 case / 29 assertions).
+Directly serves the extensibility-first priority. Python entry points → the C++
+static-init/`dlopen` registration idiom (porting-inventory §9). Residuals: real
+`.so` dlopen + the C-ABI `vllm_plugin_register` entry (W2), engine/CLI
+`--load-plugins` wiring (W3), platform/quant plugin kinds (W4),
+io_processor/stat_logger/endpoint groups (W5).
+
+The offline Batch API MED records-gap was PICKED UP 2026-07-29 as
+[`SERVE-BATCH-API`](engine-matrix.md) (`CLAIM-BATCH-API`, `INVENTORIED`→`ACTIVE`,
+[spec](specs/batch-api.md)): W0 spike + W1 CPU brick — `RunBatch`/`RunBatchFile`,
+a pure orchestrator over the existing `OpenAIServingChat::create_chat_completion`
+(NO reimplemented generation), 1:1 with vLLM's `run_batch.py` endpoint_registry
+url→handler map. `/v1/chat/completions` dispatch + the `BatchRequestOutput`
+schema + custom_id echo + per-line error isolation, unit-gated RED-first
+(`test_openai_run_batch` 7 cases / 80 assertions). Recorded deviation: a
+malformed line is isolated into an error row (batch continues) where upstream
+aborts. Residuals: the `vllm run-batch` CLI (W2), embeddings/score/rerank + audio
+dispatch (W3-W4, rides pooling), http(s)/data-URL I/O + overlapped `AsyncLLM`
+submission (W5).
+
+The generic separate draft-model + Medusa spec-decode records-gap
+(`vllm/v1/spec_decode/draft_model.py:19`, `medusa.py:18`) was **picked up
+2026-07-29** as [`SPEC-DRAFT-MODEL`](engine-matrix.md) (`CLAIM-SPEC-DRAFT-MEDUSA`,
+`INVENTORIED`→`ACTIVE`, spec [draft-model-medusa-spec.md](specs/draft-model-medusa-spec.md)):
+W0 spike + W1 CPU brick — the k-step greedy autoregressive propose reusing the
+LANDED `SPEC-REJECTION` verify UNCHANGED, unit-gated RED-first
+(`test_draft_model_proposer` 6 cases / 41 assertions: accepted==target greedy,
+full-acceptance depends on the autoregressive feed-back) + the `draft_model`
+config accept. Medusa is rowed as [`SPEC-MEDUSA`](engine-matrix.md) (`SPIKE`,
+proposer deferred to W2). Residuals: the Medusa proposer (W2); the real GPU
+draft-model forward + DGX e2e greedy our-ON==vLLM-ON token-exact gate + the
+throughput speed gate (W3, DGX-offline).
 Confirmed NON-gap: vLLM has REMOVED prompt adapters. Other MED/LOW gaps
 (DP/EP+EPLB [`PAR-DP`](engine-matrix.md)/[`PAR-EP-EPLB`](engine-matrix.md), KV
 offload [`KV-OFFLOAD`](engine-matrix.md), external KV connectors / PD

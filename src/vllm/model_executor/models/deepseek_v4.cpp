@@ -51,6 +51,8 @@
 #include "vllm/model_executor/models/deepseek_v4_mhc.h"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"      // vt::MatmulBT (auto-dispatches kMatmulBTQuant on block weights)
+#include "vt/tensor.h"   // vt::Tensor::Contiguous
 
 namespace vllm {
 namespace {
@@ -83,9 +85,21 @@ using deepseek_v4::SqrtSoftplusRouteTopk;
 // (in the real device path they REUSE the existing GEMM/MLA/MoE-grouped kernels —
 // a documented W7 seam, not re-ported here). device==host at the tiny structural
 // shape is the ForwardDevice composition gate (test_cuda_deepseek_v4.cpp).
+// ── W2C: keep-quant weight SOURCE ─────────────────────────────────────────────
+// When `gguf != nullptr` the big MLA/MoE/lm_head GEMMs consume the keep-quant
+// `weights.gguf` OwnedTensor blocks DIRECTLY via vt::MatmulBT (which dispatches to
+// the landed CPU kMatmulBTQuant CIQ GEMM for a block-quant weight) — NO per-layer
+// f32 tower. The small non-GEMM tensors (norms, sinks, MHC/DSA mixing, ape, the
+// hash table, embed) still come from the SMALL `hw` host tower, dequant-f32 exactly
+// as our other GGUF models keep them (qwen3_5_gguf_weights.cpp). When `gguf ==
+// nullptr` every GEMM reads the f32 `hw` tower (the safetensors/NVFP4 + the tiny
+// synthetic structural gate), byte-for-byte the pre-W2C behavior. `device` selects
+// the CUDA V4-primitive kernels for the four NEW op families (orthogonal to the
+// weight source; the GGUF keep-quant path runs device=false, CPU).
 struct V4Backend {
   bool device = false;
   vt::Queue* q = nullptr;
+  const DeepseekV4GgufWeights* gguf = nullptr;
 };
 
 deepseek_v4::MhcPreResult DispMhcPre(const V4Backend& be, const std::vector<float>& residual,
@@ -203,6 +217,101 @@ std::vector<float> MatVec(const std::vector<float>& w, const float* x, int64_t o
   return y;
 }
 
+// ── W2C keep-quant GEMM: Y[T,N] = X[T,K] @ W[N,K]^T ───────────────────────────
+// `wq` (the keep-quant / bf16 OwnedTensor block, [N,K] nk=true as on GGUF disk) is
+// consumed IN PLACE via vt::MatmulBT — a block-quant dtype routes to the CPU
+// kMatmulBTQuant CIQ GEMM (cpu_quant_gemm.cpp, quantizes the activation once then
+// integer vec_dot per output, weights never expanded); a bf16 dtype (the expand
+// oracle) routes to the elementwise MatmulBT. When `wq` is null/absent (host
+// source) it falls back to the per-row f32 MatVec — BIT-IDENTICAL to the pre-W2C
+// host composition. Grounded in qwen3_5.cpp:786-838 (host MatmulBT off an
+// OwnedTensor.View()) + vt/ops.cpp:134-171 (block-quant dispatch).
+std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
+                        const std::vector<float>& wf32, const std::vector<float>& x,
+                        int64_t T, int64_t N, int64_t K) {
+  if (be.gguf != nullptr && wq != nullptr && !wq->Empty()) {
+    VT_CHECK(be.q != nullptr, "deepseek-v4 keep-quant GEMM needs a queue");
+    VT_CHECK(wq->rank == 2 && wq->shape[0] == N && wq->shape[1] == K,
+             "deepseek-v4 keep-quant GEMM: weight shape mismatch");
+    std::vector<float> out(static_cast<size_t>(T) * N);
+    vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()),
+                                          vt::DType::kF32, be.q->device, {T, K});
+    vt::Tensor o =
+        vt::Tensor::Contiguous(out.data(), vt::DType::kF32, be.q->device, {T, N});
+    vt::Tensor w = wq->View();
+    vt::MatmulBT(*be.q, o, a, w);
+    return out;
+  }
+  std::vector<float> out(static_cast<size_t>(T) * N);
+  for (int64_t t = 0; t < T; ++t) {
+    const std::vector<float> y = MatVec(wf32, &x[t * K], N, K);
+    for (int64_t n = 0; n < N; ++n) out[t * N + n] = y[static_cast<size_t>(n)];
+  }
+  return out;
+}
+
+// Keep-quant GEMM against a ROW-SLICE [row_off, row_off+N) of a stacked block
+// weight `w` ([E*out, K] nk=true) — the per-expert (moe_*_exps) / per-group (wo_a)
+// slice. Rows are whole blocks (RowSizeBytes), so the offset is a byte offset and
+// no block is ever cut (mirrors the loader's OwnGgufQuantBlocks row_offset slice,
+// qwen3_5_gguf_weights.cpp:57-101, and the kStackedExpertWeight contract). Returns
+// [T,N] f32.
+std::vector<float> GemmRowSlice(const V4Backend& be, const OwnedTensor& w,
+                                const std::vector<float>& x, int64_t T, int64_t N,
+                                int64_t K, int64_t row_off) {
+  VT_CHECK(be.q != nullptr, "deepseek-v4 keep-quant expert GEMM needs a queue");
+  VT_CHECK(!w.repacked,
+           "deepseek-v4 keep-quant expert/group slice requires non-repacked blocks "
+           "(disable VT_CPU_QUANT_REPACK for the stacked-expert weights)");
+  VT_CHECK(w.rank == 2 && row_off >= 0 && row_off + N <= w.shape[0] && w.shape[1] == K,
+           "deepseek-v4 keep-quant expert GEMM: slice out of range");
+  const size_t row_bytes = vt::RowSizeBytes(w.dtype, K);
+  std::vector<float> out(static_cast<size_t>(T) * N);
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()), vt::DType::kF32,
+                                        be.q->device, {T, K});
+  vt::Tensor o =
+      vt::Tensor::Contiguous(out.data(), vt::DType::kF32, be.q->device, {T, N});
+  vt::Tensor wt;
+  wt.data = const_cast<uint8_t*>(w.bytes.data()) +
+            static_cast<size_t>(row_off) * row_bytes;
+  wt.dtype = w.dtype;
+  wt.device = be.q->device;
+  wt.rank = 2;
+  wt.shape[0] = N;
+  wt.shape[1] = K;
+  wt.stride[0] = K;  // inert for a block-quant weight; correct for the bf16 oracle
+  wt.stride[1] = 1;
+  vt::MatmulBT(*be.q, o, a, wt);
+  return out;
+}
+
+// Grouped OUTPUT-LoRA on the keep-quant tower (the GGUF mirror of
+// deepseek_v4::GroupedOutputLora): z[t, g*olr+d] = Σ_r wo_a[g,d,r]·o[t,g,r]
+// (per-group block-diagonal, so one row-slice quant GEMM per group), then
+// out[t] = wo_b @ z. wo_a keep-quant [ng*olr, in_per_group], wo_b keep-quant
+// [H, ng*olr]. o_proj.py:58-73.
+std::vector<float> GroupedOutputLoraGguf(const V4Backend& be, const OwnedTensor& wo_a,
+                                         const OwnedTensor& wo_b,
+                                         const std::vector<float>& o, int64_t T,
+                                         int64_t nh, int64_t hd, int64_t ng,
+                                         int64_t olr, int64_t H) {
+  VT_CHECK(ng > 0 && nh % ng == 0, "grouped o-LoRA: n_heads % n_groups != 0");
+  const int64_t ipg = nh * hd / ng;  // in_per_group
+  const int64_t z_dim = ng * olr;
+  std::vector<float> z(static_cast<size_t>(T) * z_dim);
+  std::vector<float> og(static_cast<size_t>(T) * ipg);
+  for (int64_t g = 0; g < ng; ++g) {
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t r = 0; r < ipg; ++r)
+        og[t * ipg + r] = o[t * nh * hd + g * ipg + r];
+    const std::vector<float> zg =
+        GemmRowSlice(be, wo_a, og, T, olr, ipg, /*row_off=*/g * olr);  // [T,olr]
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t d = 0; d < olr; ++d) z[t * z_dim + g * olr + d] = zg[t * olr + d];
+  }
+  return Gemm(be, &wo_b, /*wf32=*/{}, z, T, H, z_dim);  // [T,H]
+}
+
 // Weighted RMSNorm (the standard DeepSeek/vLLM RMSNorm).
 std::vector<float> RmsNorm(const std::vector<float>& x, const std::vector<float>& w,
                            float eps) {
@@ -238,6 +347,7 @@ std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) 
 
 // ── 512-wide MLA attention block (W3 + W4 primitives) : [T,H] -> [T,H] ────────
 std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
+                                  const DeepseekV4GgufLayerWeights* Lq,
                                   const DeepseekV4Params& p,
                                   const std::vector<float>& x,
                                   const std::vector<int32_t>& positions, int64_t layer,
@@ -255,17 +365,23 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   const bool is_indexer = p.has_indexer(layer);
   const bool is_comp = p.has_compressor(layer);
 
-  // 1. per-token q [T,nh,hd] and raw kv latent [T,hd] (num_key_value_heads=1 MLA).
-  std::vector<float> q(static_cast<size_t>(T) * nh * hd);
-  std::vector<float> kraw(static_cast<size_t>(T) * hd);
+  // 1. q [T,nh,hd] and raw kv latent [T,hd] (num_key_value_heads=1 MLA). The MLA
+  //    linears (wq_a, wq_b, wkv) run the keep-quant GEMM (Gemm) — the whole batch
+  //    at once — then the per-token RMSNorm(q_norm/kv_norm) + per-head RoPE.
+  std::vector<float> qa = Gemm(be, Lq != nullptr ? &Lq->wq_a : nullptr, L.wq_a, x, T, qlr, H);
   for (int64_t t = 0; t < T; ++t) {
-    std::vector<float> qa =
-        RmsNorm(MatVec(L.wq_a, &x[t * H], qlr, H), L.q_norm_weight, eps);
-    std::vector<float> qf = MatVec(L.wq_b, qa.data(), nh * hd, qlr);
+    const std::vector<float> n = RmsNorm(Slice(qa, t * qlr, qlr), L.q_norm_weight, eps);
+    for (int64_t i = 0; i < qlr; ++i) qa[t * qlr + i] = n[static_cast<size_t>(i)];
+  }
+  std::vector<float> q =
+      Gemm(be, Lq != nullptr ? &Lq->wq_b : nullptr, L.wq_b, qa, T, nh * hd, qlr);
+  for (int64_t t = 0; t < T; ++t)
     for (int64_t h = 0; h < nh; ++h)
-      RopeInplace(&qf[h * hd + nope], rope, positions[static_cast<size_t>(t)], p.rope_theta);
-    for (int64_t i = 0; i < nh * hd; ++i) q[t * nh * hd + i] = qf[static_cast<size_t>(i)];
-    std::vector<float> kv = RmsNorm(MatVec(L.wkv, &x[t * H], hd, H), L.kv_norm_weight, eps);
+      RopeInplace(&q[t * nh * hd + h * hd + nope], rope,
+                  positions[static_cast<size_t>(t)], p.rope_theta);
+  std::vector<float> kraw = Gemm(be, Lq != nullptr ? &Lq->wkv : nullptr, L.wkv, x, T, hd, H);
+  for (int64_t t = 0; t < T; ++t) {
+    std::vector<float> kv = RmsNorm(Slice(kraw, t * hd, hd), L.kv_norm_weight, eps);
     RopeInplace(&kv[nope], rope, positions[static_cast<size_t>(t)], p.rope_theta);
     for (int64_t d = 0; d < hd; ++d) kraw[t * hd + d] = kv[static_cast<size_t>(d)];
   }
@@ -277,11 +393,9 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   if (is_comp) {
     const int64_t cr = p.compress_ratio(layer);
     const int64_t win = 2;  // tiny pooling window (device gather addressing = W7 seam)
-    std::vector<float> score(static_cast<size_t>(T) * hd);
-    for (int64_t t = 0; t < T; ++t) {
-      std::vector<float> s = MatVec(L.comp_wgate, &x[t * H], hd, H);
-      for (int64_t d = 0; d < hd; ++d) score[t * hd + d] = s[static_cast<size_t>(d)];
-    }
+    // compressor pool-score projection (keep-quant comp_wgate) : [T,H] -> [T,hd].
+    std::vector<float> score =
+        Gemm(be, Lq != nullptr ? &Lq->comp_wgate : nullptr, L.comp_wgate, x, T, hd, H);
     std::vector<int64_t> pos64(positions.begin(), positions.end());
     score = DispSaveScoreApe(be, score, L.comp_ape, pos64, T, hd, cr);
     for (int64_t t = 0; t < T; ++t) {
@@ -317,17 +431,13 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   std::vector<std::vector<int64_t>> sel(static_cast<size_t>(T));
   if (is_indexer) {
     const int64_t inh = p.index_n_heads, ihd = p.index_head_dim, itopk = p.index_topk;
-    std::vector<float> iq(static_cast<size_t>(T) * inh * ihd);
-    std::vector<float> ik(static_cast<size_t>(T) * ihd);
-    std::vector<float> wproj(static_cast<size_t>(T) * inh);
-    for (int64_t t = 0; t < T; ++t) {
-      std::vector<float> a = MatVec(L.idx_wq, &x[t * H], inh * ihd, H);
-      for (int64_t i = 0; i < inh * ihd; ++i) iq[t * inh * ihd + i] = a[static_cast<size_t>(i)];
-      std::vector<float> b = MatVec(L.idx_wk, &x[t * H], ihd, H);
-      for (int64_t d = 0; d < ihd; ++d) ik[t * ihd + d] = b[static_cast<size_t>(d)];
-      std::vector<float> c = MatVec(L.idx_wproj, &x[t * H], inh, H);
-      for (int64_t h = 0; h < inh; ++h) wproj[t * inh + h] = c[static_cast<size_t>(h)];
-    }
+    // indexer q/k projections keep-quant (idx_wq_b / indexer_compressor_kv); the
+    // weights_proj (idx_wproj) is a small V role and stays f32 (host).
+    const std::vector<float> iq =
+        Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T, inh * ihd, H);
+    const std::vector<float> ik =
+        Gemm(be, Lq != nullptr ? &Lq->idx_comp_wkv : nullptr, L.idx_wk, x, T, ihd, H);
+    const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);
     const std::vector<float> folded = DispWeightFold(be, wproj, T, inh, ihd);
     std::vector<int64_t> ws(static_cast<size_t>(T)), we(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) {
@@ -375,12 +485,18 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     }
   }
 
-  // 6. grouped OUTPUT-LoRA (W3) : [T,nh,hd] -> [T,H].
+  // 6. grouped OUTPUT-LoRA (W3) : [T,nh,hd] -> [T,H]. Keep-quant wo_a/wo_b on the
+  //    GGUF source; the host/device-synthetic path keeps the f32 primitive.
+  if (be.gguf != nullptr && Lq != nullptr) {
+    return GroupedOutputLoraGguf(be, Lq->wo_a, Lq->wo_b, o, T, nh, hd, p.o_groups,
+                                 p.o_lora_rank, H);
+  }
   return DispGroupedOLora(be, o, L.wo_a, L.wo_b, T, nh, hd, p.o_groups, p.o_lora_rank, H);
 }
 
 // ── DeepSeek-V4 MoE block (W6 primitives) : [T,H] -> [T,H] ────────────────────
 std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
+                            const DeepseekV4GgufLayerWeights* Lq,
                             const DeepseekV4Params& p, const std::vector<float>& x,
                             const std::vector<int32_t>& token_ids, int64_t layer,
                             V4Miswire miswire, V4ForwardTrace* trace, const V4Backend& be) {
@@ -392,13 +508,11 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   const float lim = static_cast<float>(p.swiglu_limit);
   const bool cfg_hash = p.is_hash_layer(layer);
   const bool hash_route = cfg_hash && miswire != V4Miswire::kAllLayersGated;
+  const bool kq = be.gguf != nullptr && Lq != nullptr;
 
-  // router gating logits [T, ne].
-  std::vector<float> gating(static_cast<size_t>(T) * ne);
-  for (int64_t t = 0; t < T; ++t) {
-    std::vector<float> g = MatVec(L.gate_weight, &x[t * H], ne, H);
-    for (int64_t e = 0; e < ne; ++e) gating[t * ne + e] = g[static_cast<size_t>(e)];
-  }
+  // router gating logits [T, ne] (keep-quant moe_gate).
+  const std::vector<float> gating =
+      Gemm(be, kq ? &Lq->moe_gate : nullptr, L.gate_weight, x, T, ne, H);
   std::vector<int64_t> in_tokens;
   std::vector<int32_t> hashtab;
   std::vector<float> bias;
@@ -416,9 +530,9 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
     trace->layer_hash_routed[static_cast<size_t>(layer)] = hash_route ? 1 : 0;
   }
 
-  // one clamped-SwiGLU expert: w1/w3 [mi,H], w2 [H,mi].
-  const auto expert = [&](const float* w1, const float* w3, const float* w2,
-                          const float* xin) -> std::vector<float> {
+  // one clamped-SwiGLU expert on the f32 host tower: w1/w3 [mi,H], w2 [H,mi].
+  const auto expert_f32 = [&](const float* w1, const float* w3, const float* w2,
+                              const float* xin) -> std::vector<float> {
     std::vector<float> gate_up(static_cast<size_t>(2) * mi);
     for (int64_t r = 0; r < mi; ++r) {
       gate_up[static_cast<size_t>(r)] = Dot(&w1[r * H], xin, H);
@@ -430,19 +544,51 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       out[static_cast<size_t>(hh)] = Dot(&w2[hh * mi], act.data(), mi);
     return out;
   };
+  // clamped-SwiGLU over a keep-quant expert e: w13 = stacked [E*mi,H] row-slice at
+  // e*mi, w2 = stacked [E*H,mi] row-slice at e*H. `x1` is the single token [1,H].
+  const auto expert_kq = [&](const OwnedTensor& w1s, const OwnedTensor& w3s,
+                             const OwnedTensor& w2s, int64_t e,
+                             const std::vector<float>& x1) -> std::vector<float> {
+    const std::vector<float> g = GemmRowSlice(be, w1s, x1, 1, mi, H, e * mi);
+    const std::vector<float> u = GemmRowSlice(be, w3s, x1, 1, mi, H, e * mi);
+    std::vector<float> gate_up(static_cast<size_t>(2) * mi);
+    for (int64_t r = 0; r < mi; ++r) {
+      gate_up[static_cast<size_t>(r)] = g[static_cast<size_t>(r)];
+      gate_up[static_cast<size_t>(mi + r)] = u[static_cast<size_t>(r)];
+    }
+    const std::vector<float> act = DispClampedSwiGLU(be, gate_up, mi, lim, 1.0f, 0.0f);
+    return GemmRowSlice(be, w2s, act, 1, H, mi, e * H);  // [H]
+  };
+  // the shared expert is a plain (non-stacked) keep-quant triple.
+  const auto shared_kq = [&](const std::vector<float>& x1) -> std::vector<float> {
+    const std::vector<float> g = Gemm(be, &Lq->shared_gate, {}, x1, 1, mi, H);
+    const std::vector<float> u = Gemm(be, &Lq->shared_up, {}, x1, 1, mi, H);
+    std::vector<float> gate_up(static_cast<size_t>(2) * mi);
+    for (int64_t r = 0; r < mi; ++r) {
+      gate_up[static_cast<size_t>(r)] = g[static_cast<size_t>(r)];
+      gate_up[static_cast<size_t>(mi + r)] = u[static_cast<size_t>(r)];
+    }
+    const std::vector<float> act = DispClampedSwiGLU(be, gate_up, mi, lim, 1.0f, 0.0f);
+    return Gemm(be, &Lq->shared_down, {}, act, 1, H, mi);  // [H]
+  };
 
   std::vector<float> out(static_cast<size_t>(T) * H, 0.0f);
   for (int64_t t = 0; t < T; ++t) {
+    const std::vector<float> x1(x.begin() + t * H, x.begin() + (t + 1) * H);
     // shared expert (always active).
     const std::vector<float> sh =
-        expert(L.shared_w1.data(), L.shared_w3.data(), L.shared_w2.data(), &x[t * H]);
+        kq ? shared_kq(x1)
+           : expert_f32(L.shared_w1.data(), L.shared_w3.data(), L.shared_w2.data(),
+                        &x[t * H]);
     for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += sh[static_cast<size_t>(hh)];
     // routed experts.
     for (int64_t j = 0; j < topk; ++j) {
       const int64_t e = route.topk_ids[t * topk + j];
       const float w = route.topk_weights[t * topk + j];
-      const std::vector<float> eo = expert(&L.exp_w1[e * mi * H], &L.exp_w3[e * mi * H],
-                                            &L.exp_w2[e * H * mi], &x[t * H]);
+      const std::vector<float> eo =
+          kq ? expert_kq(Lq->moe_gate_exps, Lq->moe_up_exps, Lq->moe_down_exps, e, x1)
+             : expert_f32(&L.exp_w1[e * mi * H], &L.exp_w3[e * mi * H],
+                          &L.exp_w2[e * H * mi], &x[t * H]);
       for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += w * eo[static_cast<size_t>(hh)];
     }
   }
@@ -515,8 +661,18 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
   std::vector<float> res_mix(static_cast<size_t>(T) * hc * hc, 0.0f);
   bool have_residual = false;
 
+  // Keep-quant weight source (GGUF): the big MLA/MoE/lm_head GEMMs read the
+  // compressed `be.gguf` blocks; small tensors stay in the f32 `hw` tower. Null
+  // on the safetensors/NVFP4 + tiny-synthetic host path (every GEMM reads `hw`).
+  const bool kq_src = be.gguf != nullptr;
+  if (kq_src)
+    VT_CHECK(static_cast<int64_t>(be.gguf->layers.size()) == nlayers,
+             "deepseek-v4 keep-quant: gguf layer count mismatch");
+
   for (int64_t layer = 0; layer < nlayers; ++layer) {
     const DeepseekV4LayerHostWeights& L = hw.layers[static_cast<size_t>(layer)];
+    const DeepseekV4GgufLayerWeights* Lq =
+        kq_src ? &be.gguf->layers[static_cast<size_t>(layer)] : nullptr;
 
     // ── attn sub-block MHC-pre: first layer BROADCAST-expands [T,H] -> [T,hc,H];
     //    subsequent layers fuse MhcPost(prev-ffn-out) + MhcPre(attn) (model.py:878-933).
@@ -543,7 +699,7 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
     have_residual = true;
 
     // ── 512-wide MLA attention (W3+W4).
-    x = AttentionBlock(L, p, x, positions, layer, miswire, trace, be);
+    x = AttentionBlock(L, Lq, p, x, positions, layer, miswire, trace, be);
 
     // ── ffn sub-block MHC fused-post-pre = MhcPost(attn-out) + MhcPre(ffn).
     for (int64_t t = 0; t < T; ++t) {
@@ -562,7 +718,7 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
     }
 
     // ── DeepSeek-V4 MoE (W6).
-    x = MoeBlock(L, p, x, token_ids, layer, miswire, trace, be);
+    x = MoeBlock(L, Lq, p, x, token_ids, layer, miswire, trace, be);
   }
 
   // final MhcPost(last-ffn-out) -> hc_head collapse -> norm -> lm_head (model.py:1128-1146).
@@ -582,20 +738,22 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
     for (int64_t d = 0; d < H; ++d) hidden[t * H + d] = h[static_cast<size_t>(d)];
   }
 
-  // gather the requested rows (all rows if logits_indices empty) and project.
+  // gather the requested rows (all rows if logits_indices empty) then project
+  // through the lm_head — keep-quant (GGUF) or f32 (host) via the same Gemm.
   std::vector<int32_t> rows = logits_indices;
   if (rows.empty()) {
     rows.resize(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) rows[static_cast<size_t>(t)] = static_cast<int32_t>(t);
   }
-  std::vector<float> logits(rows.size() * static_cast<size_t>(V));
-  for (size_t ri = 0; ri < rows.size(); ++ri) {
-    const int64_t r = rows[ri];
+  const int64_t R = static_cast<int64_t>(rows.size());
+  std::vector<float> hsel(static_cast<size_t>(R) * H);
+  for (int64_t ri = 0; ri < R; ++ri) {
+    const int64_t r = rows[static_cast<size_t>(ri)];
     VT_CHECK(r >= 0 && r < T, "logits index out of range");
-    for (int64_t v = 0; v < V; ++v)
-      logits[ri * V + v] = Dot(&hw.lm_head[v * H], &hidden[r * H], H);
+    for (int64_t d = 0; d < H; ++d) hsel[ri * H + d] = hidden[r * H + d];
   }
-  return logits;
+  const OwnedTensor* lmq = be.gguf != nullptr ? &be.gguf->lm_head : nullptr;
+  return Gemm(be, lmq, hw.lm_head, hsel, R, V, H);
 }
 
 // Public host oracle: the composition on the portable host references.
@@ -606,7 +764,29 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
                                          const std::vector<int32_t>& logits_indices,
                                          V4Miswire miswire, V4ForwardTrace* trace) {
   return ForwardComposeImpl(hw, p, token_ids, positions, logits_indices, miswire, trace,
-                            V4Backend{/*device=*/false, /*q=*/nullptr});
+                            V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr});
+}
+
+// W2C — the GGUF keep-quant forward. The SAME composition as the host oracle, but
+// the big MLA/MoE/lm_head GEMMs consume the COMPRESSED `weights.gguf` blocks in
+// place via vt::MatmulBT -> kMatmulBTQuant (no per-layer f32 tower). The small
+// tensors (norms/sinks/MHC/DSA mixing/ape/hash/embed) come from the SMALL
+// `weights.host` tower the GGUF loader still dequants. Requires a queue (the CPU
+// quant GEMM consumer).
+std::vector<float> DeepseekV4ForwardGguf(const DeepseekV4Weights& weights,
+                                         vt::Queue& queue,
+                                         const std::vector<int32_t>& token_ids,
+                                         const std::vector<int32_t>& positions,
+                                         const std::vector<int32_t>& logits_indices,
+                                         V4Miswire miswire, V4ForwardTrace* trace) {
+  VT_CHECK(weights.has_gguf_weights,
+           "DeepseekV4ForwardGguf: no keep-quant tower (call LoadDeepseekV4FromGguf)");
+  VT_CHECK(weights.has_host_weights,
+           "DeepseekV4ForwardGguf: the small f32 host tower (norms/embed/mixing) is "
+           "absent");
+  return ForwardComposeImpl(
+      weights.host, weights.params, token_ids, positions, logits_indices, miswire, trace,
+      V4Backend{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf});
 }
 
 std::vector<float> DeepseekV4Model::Forward(
@@ -616,6 +796,11 @@ std::vector<float> DeepseekV4Model::Forward(
     vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
   (void)attn_meta;
   (void)attn_kv;
+  // GGUF source: consume the keep-quant tower (memory-bounded — no ~1 TiB f32
+  // tower). Safetensors/NVFP4 + the tiny-synthetic gate: the f32 host oracle.
+  if (weights.has_gguf_weights) {
+    return DeepseekV4ForwardGguf(weights, queue, token_ids, positions, logits_indices);
+  }
   (void)queue;
   VT_CHECK(weights.has_host_weights, kHostPending);
   return DeepseekV4ForwardHost(weights.host, weights.params, token_ids, positions,
@@ -639,9 +824,10 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
   (void)attn_kv;
   VT_CHECK(weights.has_host_weights, kHostPending);
   VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending);
-  std::vector<float> flat =
-      ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
-                         V4Miswire::kNone, /*trace=*/nullptr, V4Backend{/*device=*/true, &queue});
+  std::vector<float> flat = ForwardComposeImpl(
+      weights.host, weights.params, token_ids, positions, logits_indices,
+      V4Miswire::kNone, /*trace=*/nullptr,
+      V4Backend{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr});
   ForwardLogits out;
   out.vocab = weights.params.vocab_size;
   out.rows = out.vocab > 0 ? static_cast<int64_t>(flat.size()) / out.vocab : 0;

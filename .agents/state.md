@@ -32418,3 +32418,322 @@ gate 5 root-cause, the `GD9` row, the corrected asset list, the new root-cause
 section), `engine-matrix.md` (`SPEC-DFLASH-GGUF`, stays `PARTIAL`),
 `coordination.md` (`CLAIM-DFLASH-GGUF-ACCEPT-RCA`), `docs/STATUS.md`,
 `docs/BENCHMARKS.md`, `parity-ledger.md`, this state entry.
+---
+
+## 2026-07-29 — DeepSeek-V4-Flash W2c: forward rewired onto the keep-quant tower (`CLAIM-DEEPSEEK-V4-W2C`, NOT pushed)
+
+**Base:** `main` `328e6a50` (isolated worktree `scratchpad/wt-w2c`, branch `claim-deepseek-v4-w2c`; CPU-only `build-w2c` Release `-DVLLM_CPP_CUDA=OFF`; foreground; NOT pushed).
+
+**The fix.** W8-final proved the DeepSeek-V4 GGUF forward read the FULLY-DEQUANTIZED f32 `weights.host`
+tower (which `LoadDeepseekV4FromGguf` built unconditionally, ~1 TiB for the real 43-layer/256-expert
+model) and would OOM-reboot the 119 GiB pool; the keep-quant `weights.gguf` tower (~91 GiB) was built
+but never read. W2c fixes both:
+- `LoadDeepseekV4FromGguf` (`deepseek_v4_weights.cpp`) NO LONGER f32-expands the big MLA/MoE/lm_head
+  weights into `host` — only the small NON-GEMM tensors (norms, sinks, MHC/DSA mixing, ape,
+  `tid2eid`/`exp_probs_b`, weights_proj, embed-gather) dequant. A load-time `VT_CHECK` asserts every
+  big host slot is EMPTY (rebuilding the f32 tower fails LOUDLY). Added `DeepseekV4{Host,Gguf}ResidentBytes`.
+- `deepseek_v4.cpp` gained a `V4Backend::gguf` weight source + `Gemm`/`GemmRowSlice`/`GroupedOutputLoraGguf`
+  keep-quant GEMM helpers (consume `OwnedTensor` blocks in place via `vt::MatmulBT`→the CPU
+  `kMatmulBTQuant` CIQ GEMM; f32-MatVec fallback bit-identical for the host path). `ForwardComposeImpl`
+  routes the 512-wide MLA linears, compressor/indexer projections, router gate, shared + 256 routed
+  experts, and lm_head to the compressed blocks. New public `DeepseekV4ForwardGguf`; `Forward` gates on
+  `has_gguf_weights` (safetensors/NVFP4 + tiny-synthetic host path byte-identical).
+
+**Gate.** `test_deepseek_v4_gguf_load` **7/7·185** (CPU Release `-Werror`-clean): keep-quant forward
+RUNS finite+deterministic; keep-quant(Q8_0)==dequant(bf16) RelL2 **0.0116** (< 0.05 near-tie); RED-first
+(no-sink miswire diverges 0.122; a rebuilt f32 tower fails the loader `VT_CHECK` + the host<gguf-bytes
+assertion). MEMORY-BOUND: host **23,980 B** < keep-quant **141,676 B** at tiny shape; projected the 256
+routed experts alone are **~1032 GiB** f32 (OOMs 119 GiB) vs keep-quant `UD-IQ2_XXS` **~91 GiB** + small
+host **< 3 GiB** = **memory-FEASIBLE**.
+
+**SACRED-inert PROVEN.** Only `deepseek_v4.{h,cpp}` + `deepseek_v4_weights.cpp` + the test changed; the
+W3-W6 primitive host references (the correctness oracle) untouched + still pass (dsa 38, mhc 125, moe
+716, compressor 164, forward 26, scaffold 40); shared MLA/MoE + CUDA W7-device empty-diff;
+`test_cuda_deepseek_v4` compiles + skips on the CPU box. REUSES `kMatmulBTQuant` — no new kernel row / no
+checker bump.
+
+**Residual.** The operational W8-run (download `unsloth/DeepSeek-V4-Flash-GGUF/UD-IQ2_XXS` ~91 GB + GB10
+greedy generate + self-consistency/coherence gate + benchmark vs llama.cpp-on-card), now MEMORY-FEASIBLE.
+Honest 3-state: the tiny keep-quant forward = DERIVED + BUILD-VERIFIED. NO tokens generated (not faked);
+no download/GPU this lane.
+
+**Records same-change:** model-matrix (DeepSeek-V4 cell extended, stays `SPIKE`), coordination
+(`CLAIM-DEEPSEEK-V4-W2C` row), spec §W2c, feature-matrix, STATUS, BENCHMARKS, roadmap_v1, parity-ledger,
+this state entry.
+
+## 2026-07-29 — DeepSeek-V4-Flash W8-run: ATTEMPTED, hardware-blocked (DGX GB10 offline)
+
+DeepSeek-V4-Flash bring-up is **code-complete + memory-feasible** @ `2936ff70`: the full
+forward (W3-W7 host + W7-device CUDA GB10-gated), keep-quant vec_dot (IQ2_XXS/IQ3_XXS/Q2_K),
+GGUF name-map (1328/1328), W2b tower materialization, W8-final `deepseek4` entrypoint arm, and
+W2c (the forward reads the keep-quant tower — projected residency ~93.9 GiB < the 119 GiB pool,
+the ~1 TiB f32 OOM fixed). All unit/structural-gated, RED-first, no shared-path regression.
+The ONLY remaining is the operational run. It was attempted 2026-07-29 and is **hardware-blocked**:
+the DGX GB10 (`dgx.casa`) is OFFLINE (ping 5/5 loss, ARP FAILED, SSH no-route; gateway/Thor/mac-mini
+up ⇒ DGX-specific, down/crashed). No wake path from the dev box. **Nothing false was landed** — the
+model did NOT generate, no benchmark, the DeepSeek-V4 model-matrix row stays SPIKE. **Resume when the
+DGX is back:** re-dispatch the W8-run (free box → download ~91 GB UD-IQ2_XXS → keep-quant load [assert
+resident ≈ 91-94 GiB, the W2c VT_CHECK must not fire] → greedy generate → self-consistency + coherence
+gate → TPOT/throughput/peak-resident benchmark vs llama.cpp-on-card). No code change needed.
+
+- **2026-07-29** — **xgrammar structured-output backend W0 spike + W1 CPU brick
+  (`CLAIM-TOOLS-XGRAMMAR`, `TOOLS-XGRAMMAR` `INVENTORIED`→`ACTIVE`; isolated
+  worktree `/home/mudler/_git/vllm.cpp-xgrammar`, branch `tools-xgrammar`, off
+  `main` `6d54f242`; CPU-only Release `-Werror`; DGX offline, not needed; NOT
+  pushed).** Opens HIGH-priority feature-gap #4. **W0:** committed
+  `.agents/specs/xgrammar-backend.md` — full spike over vLLM's xgrammar backend
+  (the `StructuredOutputBackend` interface, the six grammar input modes, `auto`→
+  xgrammar selection + fallbacks, the token-bitmask application, exact files to
+  port, upstream tests, gates, W-breakdown), incl. the **§9 decision to mirror
+  xgrammar's algorithm PORTABLY (reuse the native pushdown-FSM/trie matcher) and
+  NOT vendor the mlc-ai/xgrammar C++ library**. **W1:**
+  `XgrammarStructuredOutputBackend` (`backend_xgrammar.{h,cpp}`) behind the shared
+  seam, composing the native matcher, plus the xgrammar-faithful JSON-schema→EBNF
+  converter (`xgrammar_json_schema.{h,cpp}`, SEMANTICS ported from
+  `json_schema_converter.cc` @ `a32ac89`) that preserves property DECLARATION
+  order (`nlohmann::ordered_json`) + emits the `any_whitespace` `ws` rule + the
+  `basic_*` set verbatim — closing the key-order/whitespace/exotic-schema parity
+  gap. JSON + json_object compile→bitmask; GRAMMAR/REGEX/CHOICE/STRUCTURAL_TAG
+  delegate to native; `ResolveStructuredOutputBackend`(`auto`→xgrammar) +
+  `MakeStructuredOutputBackendFactory` mirror `sampling_params.py:1031` +
+  `__init__.py:133-165`. **Gate:** `test_backend_xgrammar` 6/6 (39 asserts) —
+  exact-valid-next-tokens; declaration key order vs native sort (RED-first: the
+  native key-sorting backend admits `a` after `{"`, which the xgrammar grammar
+  forbids); `disable_any_whitespace`; json_object; converter EBNF; `auto`→
+  xgrammar selection. **RED-first proven operationally:** `ordered_json`→`json`
+  (sorted) break makes 3/6 cases fail; revert → green. No regression
+  (`test_backend_native` 4878, `test_structured_output` 90,
+  `test_json_schema_to_gbnf` 656). Clean CPU `-Wall -Wextra -Werror` 0-warn.
+  **Residuals:** optional object properties + strict-compact separators (W2); the
+  `has_xgrammar_unsupported_json_features` guard + `validate_xgrammar_grammar`
+  feeding the `auto` fallback + `model_loader.cpp` production wiring (W2);
+  xgrammar-specific regex/structural-tag parity (W3); GPU oracle parity (W4,
+  DGX-blocked). **Resume:** pick up W2 (production-wire the configured backend
+  name through `MakeStructuredOutputBackendFactory` in `model_loader.cpp` + the
+  feature-guard/fallback), then the GPU oracle parity gate when the DGX is back.
+---
+
+## 2026-07-29 — fp8 KV cache W0 spike + W1 CPU brick (`CLAIM-KV-FP8`, ACTIVE, NOT pushed)
+
+HIGH-priority feature-gap #5 ([fp8-kv-cache.md](specs/fp8-kv-cache.md)): the standard
+memory/throughput lever that halves the KV footprint by storing K/V as fp8 with a per-tensor
+dequant scale. Isolated worktree `.claude/worktrees/kv-fp8-w1`, branch `kv-fp8-w1`, base `main`
+`6d54f242`. CPU-only Release `-Werror`; NO GPU/download.
+
+**W0.** Spiked the whole vLLM fp8-KV path: the `CacheDType` config (`config/cache.py:19-36,76`,
+`fp8`==`fp8_e4m3`, `calculate_kv_scales`), `BaseKVCacheMethod` per-tensor k/v scale handling
+(`kv_cache.py:42,108-191`, default 1.0, checkpoint-loaded, per-tensor-only), the fp8 store in
+`reshape_and_cache_flash_kernel` (`cache_kernels.cu:241-252,314-401` via `CopyWithScaleOp` +
+`fp8::scaled_convert`), the read dequant (`quant_utils.cuh:296-308`, `Dequant(fp8)*scale`), and the
+halved-block memory accounting. Scale convention pinned from source: **`FP8=Quantize(HP/scale)`;
+`Dequant(FP8)*scale=HP`**.
+
+**W1 (CPU brick, all additive).** `include/vt/fp8_kv.h` (NEW): `Fp8KVCacheDataType` interpretation
+enum (mirror `dtype_fp8.cuh:9-13`) + the fp8-e4m3 codec + `StoreKvFp8E4M3`/`LoadKvFp8E4M3`,
+bit-identical to the landed `vllm::F32ToF8E4M3`/`F8E4M3ToF32` (vt does not depend on vllm — the same
+rationale as the `cpu_ops.cpp:418-460` in-file copies, which a later cleanup should consolidate onto
+this header). `vt::ReshapeAndCacheFp8` = NEW op `kReshapeAndCacheFp8` + wrapper (`src/vt/ops.cpp`) +
+CPU kernel (`src/vt/cpu/cpu_cache.cpp`), the fp8 store. Additive default-inert
+`PagedAttentionArgs.{kv_cache_dtype,k_scale,v_scale}` + the CPU paged-attention read dequant
+(`src/vt/cpu/cpu_paged_attn.cpp`). `vllm::v1::ParseCacheDType`/`IsQuantizedKvCache`
+(`include/vllm/v1/kv_cache_dtype.h`), the `cache_dtype` config parse. **Design decisions:** fp8
+storage rides `DType::kI8` (1 byte + the interpretation enum, mirroring vLLM's `cache_t=uint8_t` +
+`KV_DTYPE` template param), NOT a new `DType` enumerator — avoids the `-Wswitch` blast radius across
+every backend. New op (not a widened `ReshapeAndCacheFn`) so the CUDA/Metal registrations'
+`static_cast` is untouched (no Metal edit). CUDA/non-CPU + e5m2 refused at the wrapper (named later
+bricks), not silently mis-stored.
+
+**Gate.** `tests/vt/test_ops_fp8_kv_cache.cpp` **8 cases / 511 assertions GREEN** (round-trip within
+the e4m3 band, fp8-vs-bf16 NMSE < 1%, paged-attention e2e within 5%, `ParseCacheDType` mirror, e5m2 +
+auto-read refusals). Ported from `test_cache.py::test_reshape_and_cache` (fp8 branch). **RED-first
+PROVEN:** a wrong store direction (`hp*scale`) fails 3/480; a wrong read `v_scale` diverges > 0.05
+(both mutations run, observed, reverted). No sibling regression: `test_ops_reshape_cache` 12/12,
+`test_ops_paged_attn` 14/14. Clean CPU full-library `-Wall -Wextra -Werror`. Record checkers rc=0.
+
+**Records:** `KV-FP8` engine row INVENTORIED→ACTIVE (rollup ACTIVE 42→43, INVENTORIED 35→34; KV-area
+6→7/5→4), `QUANT-KV-FP8` INVENTORIED→PARTIAL, `CLAIM-KV-FP8` claim row, feature-matrix, roadmap #5,
+docs/STATUS, docs/BENCHMARKS (NOT-APPLICABLE speed / memory-halving e2e PENDING), parity-ledger.
+No counted-matrix ROW added ⇒ no checker constant change.
+
+**RESIDUALS (honest, named W2-W5 in the spec):** the CUDA fp8 store + fp8 paged-attention read (the
+GPU memory-halving path, DGX-blocked); the runner/spec integration (half-sized KV blocks + checkpoint
+`k_scale`/`v_scale` threading + `--kv-cache-dtype`/`--calculate-kv-scales`); fp8_e5m2 CPU compute +
+per-attention-head scales. W1 is a CPU correctness brick — the real memory/throughput WIN is the GPU
+path + halved-block runner integration. Not pushed; FULL SHA reported to the caller.
+
+---
+
+## 2026-07-29 — Plugin system W0 spike + W1 CPU brick (`CLAIM-PLUGIN-SYSTEM`, `ENG-PLUGIN-SYSTEM`)
+
+Isolated worktree `.claude/worktrees/plugin-system`, branch `feat/plugin-system`, base `main`
+`f3ecbe70` (confirmed via `git rev-parse HEAD`). CPU-only Release `-Werror` (`build-cpu`,
+`-DVLLM_CPP_CUDA=OFF`); no GPU/download (DGX offline). Additive-only; NOT pushed.
+
+**What.** Picked up the plugin-system RECORDS-GAP the feature-gap analysis named
+([vllm-feature-gap-analysis.md](specs/vllm-feature-gap-analysis.md)) and CREATED the stable row
+`ENG-PLUGIN-SYSTEM`. W1 lands the plugin DISCOVERY + orchestration layer the existing registration
+seams lacked: `vllm::plugins::LoadGeneralPlugins()` (a 1:1 mirror of `load_general_plugins` —
+`plugins_loaded` load-once latch, the `VLLM_PLUGINS` allowlist parse incl. `""`→`{""}`→no plugin,
+per-plugin `try/catch` failure isolation) + the out-of-core general-plugin registration seam
+`RegisterGeneralPlugin` / the `REGISTER_VLLM_GENERAL_PLUGIN` macro (mirror of the
+`vllm.general_plugins` entry-point group) + the documented C-ABI entry-symbol contract
+`vllm_plugin_register` for a future dlopen loader. NEW `include/vllm/plugins/plugins.h` +
+`src/vllm/plugins/plugins.cpp` (+1 `CMakeLists.txt` source line).
+
+**C++ mechanism (recorded porting-inventory §9.11).** Pure C++20 has no Python entry points, so
+discovery is the project's static-init/`dlopen` registration idiom (the same `REGISTER_VLLM_MODEL` /
+`RegisterPlatform` / `RegisterOp` seams). The plugin system adds ONLY the discovery+orchestration
+layer; a general plugin's callback installs its out-of-tree contribution through the EXISTING public
+registries (`vllm::RegisterModel`, `RegisterPlatform`, the quant registry) with ZERO core edit. The
+BEHAVIOR is mirrored 1:1; only the transport differs — a legitimate mechanical divergence.
+
+**Extensibility proof + gate.** NEW out-of-core `tests/vllm/plugins/toy_model_plugin.cpp` registers a
+toy architecture through the public `vllm::RegisterModel` seam and publishes its `register()` callback
+via `REGISTER_VLLM_GENERAL_PLUGIN` — compiled ONLY into the test exe (never the library), so the
+counted 28-arch model registry the other suites assert is untouched. `tests/vllm/plugins/test_plugin_system.cpp`
+**1 case / 29 assertions GREEN**: RED-first — the toy arch throws "are not supported for now" before
+load AND under `VLLM_PLUGINS=""`, and resolves to the plugin factory ONLY after `LoadGeneralPlugins()`
+runs it (`VLLM_PLUGINS="register_toy_model"`); plus the allowlist gate, load-once idempotence (callback
+once per load; no duplicate arch across a reload), and failure isolation (a deliberately-throwing
+sibling plugin logged+skipped, good arch survives, load never throws). Ported from
+`tests/plugins_tests/test_oot_registration_offline.py:14-45`. Clean CPU full-library
+`-Wall -Wextra -Werror`. Record checkers rc=0.
+
+**Records:** NEW `ENG-PLUGIN-SYSTEM` engine row INVENTORIED→ACTIVE (rollup Engine-area 26→27 /
+Total 126→127, ACTIVE 11→12 / 44→45) + `check-agent-record.py` `ENGINE_ROWS` 126→127 with dated
+rationale (real new row); `CLAIM-PLUGIN-SYSTEM` claim row; feature-matrix plugin gap row
+RECORDS-GAP→ACTIVE; roadmap breadth; porting-inventory §9.11; docs/STATUS; docs/BENCHMARKS
+(NOT-APPLICABLE — startup discovery layer, no throughput owed); parity-ledger; this entry.
+
+**RESIDUALS (honest, named W2-W5 in the spec):** real `.so` `dlopen` + the C-ABI
+`vllm_plugin_register` entry (W2); the engine/CLI `--load-plugins` wiring that calls
+`LoadGeneralPlugins` from the construction paths (W3); the platform/quant plugin kinds (W4); the
+io_processor/stat_logger/endpoint plugin groups (W5). W1 is the general-plugin brick + the
+extensibility proof; LoadGeneralPlugins is not yet called from any production path (so every existing
+engine construction is byte-identical). Not pushed; FULL SHA reported to the caller.
+
+## 2026-07-29 — Offline OpenAI Batch API W0 spike + W1 CPU brick (`CLAIM-BATCH-API`, `SERVE-BATCH-API`, ACTIVE, NOT pushed)
+
+Picked up the offline Batch API RECORDS-GAP the feature-gap analysis named
+(`.agents/specs/vllm-feature-gap-analysis.md` line 85, recommending
+`SERVE-BATCH-API`). Isolated worktree `.claude/worktrees/batch-api`, branch
+`feat/batch-api`, base local `main` `d637a676` (confirmed `git rev-parse HEAD`).
+CPU-only Release `-Werror` (`build-cpu`, `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON`);
+no GPU/download (host orchestration; DGX offline).
+
+**W0 spike** committed `.agents/specs/batch-api.md`: the JSONL input/output schema
+(`BatchRequestInput`/`BatchResponseData`/`BatchRequestOutput`, custom_id echo,
+`vllm-<uuid>`/`vllm-batch-<uuid>` ids), the endpoint dispatch table
+(chat wired; embeddings/score/rerank/audio named residuals), the run loop
+(read → dispatch → collect → write JSONL), concurrency (W1 sequential; overlapped
+`AsyncLLM` a later brick), file I/O (local only; http(s)/data-URL a residual —
+noted `s3://` is NOT an upstream scheme), files/tests to port, gates, W0-W5
+breakdown, and the per-line-isolation deviation. All grounded 1:1 in
+`vllm/entrypoints/openai/run_batch.py` @ pin `555967922` file:line.
+
+**W1 brick** (`include/vllm/entrypoints/openai/run_batch.h` +
+`src/vllm/entrypoints/openai/run_batch.cpp`): `RunBatch` (`RunLine`/`RunLines`/
+`Run`) + `RunBatchFile` — a pure orchestrator over the existing
+`OpenAIServingChat::create_chat_completion` (the SAME handler
+`ApiServer::handle_chat_completions` drives; NO reimplemented generation), 1:1
+with vLLM's endpoint_registry url→handler map. `/v1/chat/completions` wired; the
+`run_request` AllResponse/ErrorResponse(status=code)/stream-rejected branches; the
+unsupported-endpoint (handler None) + unsupported-url error rows.
+
+**Gate** `test_openai_run_batch` **7 cases / 80 assertions GREEN** over the
+synthetic serving-engine harness (same `Harness` as `test_serving.cpp`): empty→
+empty; 3-line chat batch → ordered rows + custom_id echo + `body.choices` +
+per-line `BatchRequestOutput` schema round-trip; a malformed line ISOLATED into a
+400 error row while neighbours succeed (batch continues); a missing-custom_id
+error row; an unknown-url supported-endpoints row; an `/v1/embeddings`
+unsupported-endpoint row; an unknown-model 404 ErrorResponse-object row.
+**RED-first proven:** dropping the custom_id echo (`out.custom_id = ""`) fails 9
+assertions; reverting → 7/7. (Debug note: the initial crash was a TEST bug — the
+weights temporary was passed to `Harness` which holds it by reference; bound it to
+a named local like `test_serving.cpp` does.) Clean CPU full-library
+`-Wall -Wextra -Werror` build.
+
+**Records (same change):** NEW `SERVE-BATCH-API` engine-matrix row +
+Serving-area/Total rollup (Serving 20→21/ACTIVE 5→6, Total 127→128/ACTIVE 45→46) +
+`check-agent-record.py` `ENGINE_ROWS` 127→128 with dated rationale;
+`CLAIM-BATCH-API` coordination row; feature-matrix batch row RECORDS-GAP→ACTIVE +
+intro; feature-gap-analysis line 85 closure; roadmap breadth pickup note;
+docs/STATUS capability row + gap-line update; docs/BENCHMARKS NOT-APPLICABLE
+disposition; parity-ledger; this entry. `check-agent-record.py` rc=0
+(`agent record OK: ENGINE=128`).
+
+**RESIDUALS (honest, named W2-W5 in the spec):** the `vllm run-batch` CLI +
+`BatchFrontendArgs` (+ the abort-on-bad-line exit code if the upstream contract is
+mirrored there); embeddings/score/rerank dispatch (rides `SERVE-POOLING-ENDPOINTS`);
+audio transcription/translation + media fetch; http(s)/data-URL file I/O +
+Prometheus metrics + overlapped `AsyncLLM` submission. W1 is the chat-dispatch
+orchestrator; `RunBatch` is not yet called from any production path (so every
+existing engine/server construction is byte-identical). Not pushed; FULL SHA
+reported to the caller.
+
+## 2026-07-29 — Generic draft-model + Medusa spec-decode W0 spike + W1 CPU brick (`CLAIM-SPEC-DRAFT-MEDUSA`, `SPEC-DRAFT-MODEL` ACTIVE + `SPEC-MEDUSA` SPIKE, NOT pushed)
+
+The last spec-decode RECORDS-GAP the feature-gap analysis named (lines 82-83):
+the classic model-agnostic SEPARATE draft-model path (`draft_model.py:19`) and
+Medusa (`medusa.py:18`). We already had MTP/DFlash/ngram/EAGLE3/DSpark/TLI + the
+shared verify/accept machinery; only the two PROPOSERS were net-new.
+
+**Worktree.** `.claude/worktrees/draft-model-medusa`, branch
+`feat/draft-model-medusa-spec`, base `main` `2d1369fb`. CPU-only `build-cpu`
+(`-DVLLM_CPP_CUDA=OFF` Release `-Werror`). DGX offline — CPU-only lane. NOT
+pushed, NOT merged.
+
+**W0 spike** — `.agents/specs/draft-model-medusa-spec.md`: the `DraftModelProposer`
+(standalone draft LM runs K greedy autoregressive steps -> K drafts -> target
+verify -> longest-accepted-prefix), the `MedusaProposer` (N heads each emit one
+position from the same target hidden, single pass), the `SpeculativeConfig`
+method selection (`draft_model` when a separate `model` is given / auto-default
+`speculative.py:684`; `medusa` when `method=medusa`), how both reuse the landed
+`SPEC-REJECTION` acceptance sampler + the scheduler seam, exact files, upstream
+tests, gates, W-breakdown.
+
+**W1 brick (the more tractable of the two — a full model forward AS the
+proposer).** Files (all NEW except the config accept):
+- `include/vllm/v1/spec_decode/draft_model_proposer.h` — `DraftLogitsFn` (the
+  draft model as a next-token-logits oracle: `context -> vocab logits`, mirroring
+  `compute_logits(model(input_ids))[last]` reduced to the standalone-LM greedy
+  path without pulling the GPU runner into the CPU brick, exactly as SPEC-NGRAM's
+  matcher is a host algorithm), `GreedyArgmax` (torch.argmax lowest-index
+  tie-break), `DraftModelProposeGreedy` (k-step autoregressive propose),
+  `DraftModelProposeBatch`.
+- `src/vllm/v1/spec_decode/draft_model_proposer.cpp` — step 0
+  argmax(draft(context)); each later step appends the previous draft and
+  re-queries the oracle (the `:682-761` feed-back); k==0 empty, k==1 single
+  forward.
+- `tests/vllm/v1/spec_decode/test_draft_model_proposer.cpp` — realizes the
+  upstream e2e equivalence (`test_spec_decode.py:544-555`, ref==spec)
+  deterministically: tiny synthetic target LM + draft LM oracles; propose K ->
+  verify with the LANDED `RejectionSampler` -> assert accepted == the target's
+  own greedy run (every draft/target (dis)agreement pattern) + full-acceptance on
+  a matching draft + the RED-first feed-back witness.
+- `src/vllm/config/speculative.cpp` — `ParseSpeculativeConfigJson` accepts
+  `"draft_model"` (requires `model` + `num_speculative_tokens`).
+- CMake: source list + `test_draft_model_proposer` registration.
+
+**Gate.** `test_draft_model_proposer` 6/6, 41 assertions GREEN on CPU. RED-first
+PROVEN: commenting out the autoregressive feed-back (`running.push_back(draft)`)
+makes 5/6 cases fail (the perfect draft repeats its first token and the target's
+distinct greedy chain rejects at position 1, so num_sampled drops from k+1 to 2).
+Restored -> GREEN. Clean CPU `-Werror` full-library build. Six record checkers
+rc=0 (`check-agent-record.py` -> `ENGINE=130`).
+
+**Records same-change.** NEW rows `SPEC-DRAFT-MODEL` (ACTIVE) + `SPEC-MEDUSA`
+(SPIKE) in engine-matrix + the Speculative-area/Total rollup (Spec 10->12,
+ACTIVE 3->4, SPIKE 0->1; Total 128->130, ACTIVE 46->47, SPIKE 3->4) +
+`check-agent-record.py` `ENGINE_ROWS` 128->130 (dated rationale). coordination
+`CLAIM-SPEC-DRAFT-MEDUSA` ACTIVE. feature-matrix spec-breadth row (RECORDS-GAP ->
+PICKED UP) + intro. feature-gap-analysis lines 82-83 (RECORDS-GAP -> ROW CREATED).
+roadmap breadth note. docs/STATUS spec-decode section. docs/BENCHMARKS PENDING
+entry. parity-ledger + this state entry.
+
+**Residuals (honest).** Medusa proposer (W2 — needs the target's Medusa heads, a
+model change). The real GPU draft-model forward behind the oracle (paged KV +
+CUDA-graph), the DGX e2e greedy our-draft-ON == vLLM-draft-ON token-exact gate on
+a real tiny-draft/target pair, and the throughput speed gate (match-or-beat vLLM
+on every axis) are W3, DGX-offline. NO production runner wiring in W1 (additive +
+default-inert; no path constructs a `DraftModelProposer`).

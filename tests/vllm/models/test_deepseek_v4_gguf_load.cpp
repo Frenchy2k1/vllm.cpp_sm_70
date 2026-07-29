@@ -34,6 +34,7 @@
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vt/device.h"
 #include "vt/dtype.h"
 
 using gguf_test::F32Kv;
@@ -254,6 +255,17 @@ vllm::GgufLoadPolicy KeepPolicy() {
 }
 const vllm::GgufLoadPolicy kExpandAll;  // all defaults -> dequant everything
 
+// Relative L2 between two equal-length logit vectors.
+double RelL2(const std::vector<float>& a, const std::vector<float>& b) {
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    const double dd = static_cast<double>(a[i]) - b[i];
+    num += dd * dd;
+    den += static_cast<double>(a[i]) * a[i];
+  }
+  return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+}
+
 }  // namespace
 
 TEST_CASE("DeepseekV4ParamsFromGguf resolves the deepseek4 hparams") {
@@ -350,26 +362,120 @@ TEST_CASE("LoadDeepseekV4FromGguf: keep-quant blocks stay COMPRESSED") {
   CHECK(static_cast<int64_t>(we.gguf.layers[3].moe_down_exps.bytes.size()) == elems * 2);
 }
 
-TEST_CASE("LoadDeepseekV4FromGguf: load -> Forward runs end-to-end at tiny shape") {
+// ── W2C: the forward CONSUMES the keep-quant blocks (no f32 tower) ────────────
+// DeepseekV4ForwardGguf runs the whole composition with the big MLA/MoE/lm_head
+// GEMMs reading the COMPRESSED `w.gguf` blocks via vt::MatmulBT -> kMatmulBTQuant.
+// Gate: (a) it runs (finite, deterministic); (b) keep-quant (Q8_0 vec_dot) agrees
+// with the dequant oracle (bf16 MatmulBT, the expand-all load) within a near-tie;
+// (c) RED-first — a wrong route (a deliberate miswire) DIVERGES.
+TEST_CASE("DeepseekV4ForwardGguf: keep-quant forward runs + near-tie vs dequant (W2C)") {
   Dims d;
   TempFile f(BuildGguf(d));
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
-  const vllm::GgufLoadPolicy pol = KeepPolicy();
-  const vllm::DeepseekV4Weights w =
-      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &pol);
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights wk =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  const vllm::DeepseekV4Weights we =  // dequant oracle: bf16 OwnedTensors
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &kExpandAll);
+
+  // Prove the keep-quant tower REALLY kept its blocks and the oracle expanded.
+  REQUIRE(wk.gguf.layers[0].wq_a.dtype == vt::DType::kQ8_0);
+  REQUIRE(we.gguf.layers[0].wq_a.dtype == vt::DType::kBF16);
 
   const std::vector<int32_t> tokens = {1, 5, 9};
   const std::vector<int32_t> positions = {0, 1, 2};
-  const std::vector<float> logits =
-      vllm::DeepseekV4ForwardHost(w.host, w.params, tokens, positions);
+  const std::vector<float> lk =
+      vllm::DeepseekV4ForwardGguf(wk, q, tokens, positions);  // Q8_0 blocks
+  const std::vector<float> le =
+      vllm::DeepseekV4ForwardGguf(we, q, tokens, positions);  // bf16 dequant
 
-  REQUIRE(logits.size() == tokens.size() * static_cast<size_t>(d.vocab));
-  for (float v : logits) CHECK(std::isfinite(v));
-  // Deterministic: the same loaded tower re-runs bit-identically.
-  const std::vector<float> again =
-      vllm::DeepseekV4ForwardHost(w.host, w.params, tokens, positions);
-  REQUIRE(again.size() == logits.size());
-  for (size_t i = 0; i < logits.size(); ++i) CHECK(again[i] == logits[i]);
+  REQUIRE(lk.size() == tokens.size() * static_cast<size_t>(d.vocab));
+  for (float v : lk) CHECK(std::isfinite(v));
+
+  // (b) NEAR-TIE: the only difference between the two is that the keep path also
+  // quantizes the ACTIVATION to the weight's q8_0 vec_dot_type (8-bit, per-32
+  // block) before the integer dot; the oracle keeps f32 activations. Over the 4
+  // deep layers that compounds, but stays a near-tie. MEASURED RelL2 = 0.0116;
+  // the 0.05 band is ~4x margin (routing-flip-robust). See docs/BENCHMARKS.md.
+  CHECK(RelL2(lk, le) < 0.05);
+
+  // (a) DETERMINISTIC: the same loaded tower re-runs bit-identically.
+  const std::vector<float> lk2 =
+      vllm::DeepseekV4ForwardGguf(wk, q, tokens, positions);
+  REQUIRE(lk2.size() == lk.size());
+  for (size_t i = 0; i < lk.size(); ++i) CHECK(lk2[i] == lk[i]);
+
+  // (c) RED-first: a deliberately-miswired interleave (drop the per-head attention
+  // sink) CHANGES the keep-quant output — proving the route is load-bearing, not a
+  // constant the quant path happens to reproduce.
+  const std::vector<float> lk_miswire = vllm::DeepseekV4ForwardGguf(
+      wk, q, tokens, positions, /*logits_indices=*/{}, vllm::V4Miswire::kNoAttnSink);
+  CHECK(RelL2(lk, lk_miswire) > 1e-4);
+}
+
+// ── W2C: the load is MEMORY-BOUNDED — the ~1 TiB f32 tower is NOT built ────────
+// The crux of the brick. The big MLA/MoE/lm_head weights live ONLY in the
+// compressed `gguf` tower; the `host` tower holds only the small non-GEMM tensors
+// (norms/embed/mixing/hash/ape/sink). A regression that rebuilds the f32 tower
+// makes the host bytes EXCEED the f32-expanded weight image — asserted RED-first.
+TEST_CASE("LoadDeepseekV4FromGguf: memory-bounded — no f32 expert/linear tower (W2C)") {
+  Dims d;
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+
+  // (1) The big host slots are EMPTY (the loader also VT_CHECKs this at load).
+  CHECK(w.host.lm_head.empty());
+  CHECK(w.host.layers[0].wq_a.empty());
+  CHECK(w.host.layers[0].wq_b.empty());
+  CHECK(w.host.layers[3].wkv.empty());
+  CHECK(w.host.layers[3].exp_w1.empty());
+  CHECK(w.host.layers[3].exp_w2.empty());
+  CHECK(w.host.layers[2].comp_wgate.empty());
+  // ...but the keep-quant tower DOES hold them, compressed.
+  CHECK_FALSE(w.gguf.layers[0].wq_a.Empty());
+  CHECK_FALSE(w.gguf.layers[3].moe_down_exps.Empty());
+
+  const int64_t host_b = vllm::DeepseekV4HostResidentBytes(w);
+  const int64_t gguf_b = vllm::DeepseekV4GgufResidentBytes(w);
+
+  // (2) The host tower (small tensors only) is SMALLER than the keep-quant tower
+  // that actually holds the weights — i.e. the weights are NOT in host.
+  CHECK(host_b < gguf_b);
+
+  // (3) RED-first bound: what the host WOULD be if the big weights were
+  // f32-expanded (the bug). Compute that image; assert the real host stays far
+  // below it (the bug would make host_b ~ this or larger).
+  const int64_t big_f32 =
+      // per layer: wq_a + wq_b + wkv + wo_a + wo_b + gate + 3 shared + 3*E experts
+      static_cast<int64_t>(d.n_layer) *
+          (d.qlr * d.H + d.nh * d.head_dim * d.qlr + d.head_dim * d.H +
+           d.o_groups * d.olr * (d.nh * d.head_dim / d.o_groups) +
+           d.H * d.o_groups * d.olr + d.E * d.H + 3 * d.mi * d.H +
+           3 * d.E * d.mi * d.H) *
+          4 +
+      d.vocab * d.H * 4;  // lm_head
+  CHECK(host_b < big_f32);  // host does NOT hold the f32-expanded big tower
+
+  // (4) PROJECTION to the REAL DeepSeek-V4-Flash config (spec §W0/§W2b): the f32
+  // expansion of the 256 routed experts alone OOM-reboots the 119 GiB unified
+  // pool, while the keep-quant `UD-IQ2_XXS` checkpoint (~91 GiB) fits with the
+  // small f32 host tower + headroom. This is the memory-FEASIBILITY the brick
+  // unblocks (the real 91 GiB run stays the operational W8-run).
+  const double kGiB = 1024.0 * 1024.0 * 1024.0;
+  const int64_t kL = 43, kE = 256, kH = 4096, kMI = 2048;
+  const double routed_expert_params =
+      3.0 * static_cast<double>(kE) * kMI * kH * kL;          // gate+up+down, ~2.77e11
+  const double routed_f32_gib = routed_expert_params * 4.0 / kGiB;  // ~1030 GiB
+  CHECK(routed_f32_gib > 119.0);  // the f32 tower OOM-reboots the box (the bug)
+  const double kIq2xxsCheckpointGiB = 90.9;  // measured file size (spec §W2b HW table)
+  const double kSmallHostGiBUpperBound =
+      3.0;  // embed (~2 GiB f32) + norms/MHC/hash/ape (< 1 GiB) at real config
+  CHECK(kIq2xxsCheckpointGiB + kSmallHostGiBUpperBound < 119.0);  // memory-FEASIBLE
 }
 
 // ── entrypoint wiring (W8-final deliverable #1): a `deepseek4` GGUF must route
