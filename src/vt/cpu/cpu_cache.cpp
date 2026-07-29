@@ -122,10 +122,68 @@ void ConcatAndCacheMlaKernel(Queue&, const Tensor& kv_c, const Tensor& k_pe, Ten
   }
 }
 
+// Load one source K/V element as f32 (the model dtype: f32/f16/bf16).
+float LoadSrcF32(const Tensor& t, int64_t elem_off) {
+  switch (t.dtype) {
+    case DType::kF32: return t.Ptr<float>()[elem_off];
+    case DType::kF16: return F16ToF32(t.Ptr<uint16_t>()[elem_off]);
+    case DType::kBF16: return BF16ToF32(t.Ptr<uint16_t>()[elem_off]);
+    default: VT_CHECK(false, "reshape_and_cache_fp8 LoadSrcF32: unsupported source dtype");
+      return 0.0f;
+  }
+}
+
+// fp8 KV STORE — the fp8 sibling of ReshapeAndCacheKernel. Ported from the fp8
+// branch of vllm reshape_and_cache_flash_kernel (cache_kernels.cu:314-401) +
+// CopyWithScaleOp (:241-252): each element is stored as Quantize(hp / scale)
+// (the fp8::scaled_convert scale convention, quant_utils.cuh:296-308). The cache
+// pages are 1-byte fp8 (kI8), so the destination element size is 1; the strides
+// are the same NHD unbind-slice arithmetic as the auto path. Per-tensor k/v
+// scales (BaseKVCacheMethod, kv_cache.py:108-191); per-head is a later brick.
+void ReshapeAndCacheFp8Kernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                              Tensor& v_cache, const Tensor& slot_mapping,
+                              Fp8KVCacheDataType kind, float k_scale, float v_scale) {
+  VT_CHECK(kind == Fp8KVCacheDataType::kFp8E4M3,
+           "reshape_and_cache_fp8: CPU kernel implements fp8_e4m3 only");
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t num_kv_heads = k_cache.shape[2];
+  const int64_t head_size = k_cache.shape[3];
+  const int64_t n_elems = num_kv_heads * head_size;  // one token's page (NHD)
+  const int64_t k_block_stride = k_cache.stride[0];
+  const int64_t k_page_stride = k_cache.stride[1];
+  const int64_t v_block_stride = v_cache.stride[0];
+  const int64_t v_page_stride = v_cache.stride[1];
+  const int64_t k_tok_stride = k.stride[0];
+  const int64_t v_tok_stride = v.stride[0];
+
+  const int64_t* slots = slot_mapping.Ptr<int64_t>();
+  auto* kdst = k_cache.Ptr<uint8_t>();  // fp8 bytes (kI8)
+  auto* vdst = v_cache.Ptr<uint8_t>();
+
+  for (int64_t t = 0; t < num_slots; ++t) {
+    const int64_t slot = slots[t];
+    if (slot < 0) continue;  // padded token → skip (upstream: slot can be -1)
+    const int64_t block = slot / block_size;
+    const int64_t offset = slot % block_size;
+    const int64_t kdst_base = block * k_block_stride + offset * k_page_stride;  // bytes/elems
+    const int64_t vdst_base = block * v_block_stride + offset * v_page_stride;
+    const int64_t ksrc_base = t * k_tok_stride;
+    const int64_t vsrc_base = t * v_tok_stride;
+    for (int64_t e = 0; e < n_elems; ++e) {
+      kdst[kdst_base + e] = StoreKvFp8E4M3(LoadSrcF32(k, ksrc_base + e), k_scale);
+      vdst[vdst_base + e] = StoreKvFp8E4M3(LoadSrcF32(v, vsrc_base + e), v_scale);
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
+    RegisterOp(
+        OpId::kReshapeAndCacheFp8, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<ReshapeAndCacheFp8Fn>(&ReshapeAndCacheFp8Kernel)));
     RegisterOp(
         OpId::kConcatAndCacheMla, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<ConcatAndCacheMlaFn>(&ConcatAndCacheMlaKernel)));

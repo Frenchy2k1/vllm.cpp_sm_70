@@ -2252,6 +2252,67 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
       q, k, v, k_cache, v_cache, slot_mapping);
 }
 
+void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                        Tensor& v_cache, const Tensor& slot_mapping, Fp8KVCacheDataType kind,
+                        float k_scale, float v_scale) {
+  // fp8 KV store. Same geometry contract as ReshapeAndCache; the K/V cache is
+  // 1-byte fp8 (DType::kI8 — the dtype.h "the byte never guesses its semantic
+  // type" rule) and the source K/V are the model float dtype.
+  VT_CHECK(kind != Fp8KVCacheDataType::kAuto,
+           "reshape_and_cache_fp8: kind must be an fp8 dtype (use ReshapeAndCache for auto)");
+  VT_CHECK(kind == Fp8KVCacheDataType::kFp8E4M3,
+           "reshape_and_cache_fp8: only fp8_e4m3 is implemented on CPU in W1 "
+           "(fp8_e5m2 CPU compute is a named later brick)");
+  VT_CHECK(k.rank == 3 && v.rank == 3,
+           "reshape_and_cache_fp8: k/v must be rank-3 [num_tokens,num_kv_heads,head_size]");
+  VT_CHECK(k_cache.rank == 4 && v_cache.rank == 4,
+           "reshape_and_cache_fp8: k_cache/v_cache must be rank-4 "
+           "[num_blocks,block_size,num_kv_heads,head_size]");
+  VT_CHECK(slot_mapping.rank == 1,
+           "reshape_and_cache_fp8: slot_mapping must be rank-1 [num_slots]");
+  const int64_t num_kv_heads = k.shape[1], head_size = k.shape[2];
+  VT_CHECK(v.shape[0] == k.shape[0] && v.shape[1] == num_kv_heads && v.shape[2] == head_size,
+           "reshape_and_cache_fp8: k and v must share [num_tokens,num_kv_heads,head_size]");
+  VT_CHECK(k_cache.shape[2] == num_kv_heads && k_cache.shape[3] == head_size,
+           "reshape_and_cache_fp8: k_cache num_kv_heads/head_size must match k");
+  VT_CHECK(v_cache.shape[0] == k_cache.shape[0] && v_cache.shape[1] == k_cache.shape[1] &&
+               v_cache.shape[2] == k_cache.shape[2] && v_cache.shape[3] == k_cache.shape[3],
+           "reshape_and_cache_fp8: k_cache and v_cache must share shape");
+  VT_CHECK(k.shape[0] >= slot_mapping.shape[0],
+           "reshape_and_cache_fp8: num_tokens (k.shape[0]) must be >= slot_mapping length");
+  // Source K/V are model floats; cache pages are fp8 bytes (kI8).
+  VT_CHECK(IsFloat(k.dtype) && k.dtype == v.dtype,
+           "reshape_and_cache_fp8: k/v must share one float dtype");
+  VT_CHECK(k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8,
+           "reshape_and_cache_fp8: k_cache/v_cache must be 1-byte fp8 storage (DType::kI8)");
+  VT_CHECK(slot_mapping.dtype == DType::kI64, "reshape_and_cache_fp8: slot_mapping must be i64");
+  VT_CHECK(k_scale > 0.0f && v_scale > 0.0f,
+           "reshape_and_cache_fp8: k_scale/v_scale must be > 0 (per-tensor fp8 KV scales)");
+  // Same stride contract as ReshapeAndCache (inner-contiguous token pages, NHD
+  // unbind-slice cache). Element size 1 for the cache; the source uses its float
+  // element size.
+  VT_CHECK(k.stride[2] == 1 && v.stride[2] == 1 &&
+               k.stride[1] == head_size && v.stride[1] == head_size &&
+               k.stride[0] >= num_kv_heads * head_size &&
+               v.stride[0] >= num_kv_heads * head_size &&
+               slot_mapping.IsContiguous(),
+           "reshape_and_cache_fp8: k/v token pages must be inner-contiguous and "
+           "slot_mapping contiguous");
+  VT_CHECK(k_cache.stride[3] == 1 && v_cache.stride[3] == 1,
+           "reshape_and_cache_fp8: k_cache/v_cache innermost (head_size) stride must be 1");
+  VT_CHECK(k_cache.stride[2] == head_size && v_cache.stride[2] == head_size,
+           "reshape_and_cache_fp8: k_cache/v_cache page must be head-contiguous "
+           "(stride[2] == head_size) — the NHD unbind-slice layout");
+  VT_CHECK(q.device.type == DeviceType::kCPU,
+           "reshape_and_cache_fp8: only the CPU fp8-KV store is implemented in W1 "
+           "(the CUDA fp8-KV store kernel is a named later brick)");
+  VT_CHECK(k.device == q.device && v.device == q.device && k_cache.device == q.device &&
+               v_cache.device == q.device && slot_mapping.device == q.device,
+           "reshape_and_cache_fp8: device mismatch (k/v/k_cache/v_cache/slot_mapping/queue)");
+  reinterpret_cast<ReshapeAndCacheFp8Fn>(GetOp(OpId::kReshapeAndCacheFp8, q.device.type))(
+      q, k, v, k_cache, v_cache, slot_mapping, kind, k_scale, v_scale);
+}
+
 void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor& kv_cache,
                        const Tensor& slot_mapping) {
   VT_CHECK(kv_c.rank == 2 && k_pe.rank == 2,
@@ -2562,8 +2623,23 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
   // The KV cache may be a DIFFERENT float dtype than the query (Phase-1 bf16 KV
   // cache: f32 query · bf16 cache — the kernel converts bf16 cache reads to f32
   // and accumulates in f32). Require only that K and V share one float dtype.
-  VT_CHECK(IsFloat(k_cache.dtype) && k_cache.dtype == v_cache.dtype,
-           "paged_attention: k_cache/v_cache must share one float dtype");
+  // fp8 KV (args.kv_cache_dtype != kAuto): the cache is 1-byte fp8 (kI8) and the
+  // kernel dequantizes each read as Dequant(fp8) * k_scale|v_scale (KV-FP8 W1).
+  if (args.kv_cache_dtype == Fp8KVCacheDataType::kAuto) {
+    VT_CHECK(IsFloat(k_cache.dtype) && k_cache.dtype == v_cache.dtype,
+             "paged_attention: k_cache/v_cache must share one float dtype");
+  } else {
+    VT_CHECK(args.kv_cache_dtype == Fp8KVCacheDataType::kFp8E4M3,
+             "paged_attention: only fp8_e4m3 KV read is implemented on CPU in W1 "
+             "(fp8_e5m2 CPU read is a named later brick)");
+    VT_CHECK(k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8,
+             "paged_attention: fp8 KV read requires 1-byte fp8 cache (DType::kI8)");
+    VT_CHECK(args.k_scale > 0.0f && args.v_scale > 0.0f,
+             "paged_attention: fp8 KV read requires k_scale/v_scale > 0");
+    VT_CHECK(q.device.type == DeviceType::kCPU,
+             "paged_attention: only the CPU fp8-KV read is implemented in W1 "
+             "(the CUDA fp8-KV paged-attention kernel is a named later brick)");
+  }
   // metadata: block_table [num_reqs, max_blocks] i32, seq_lens [num_reqs] i32,
   // query_start_loc [num_reqs+1] i32.
   VT_CHECK(seq_lens.rank == 1 && seq_lens.dtype == DType::kI32,

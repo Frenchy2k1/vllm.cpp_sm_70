@@ -29,6 +29,20 @@ gate; the GPU **oracle parity** run (token-identical constrained decode vs the
 pinned vLLM oracle with `structured_outputs.backend="xgrammar"` on a real model)
 is **PENDING**, DGX-blocked (GB10 offline). Repro (CPU): `cmake --build build-cpu
 --target test_backend_xgrammar && ./build-cpu/tests/test_backend_xgrammar`.
+## fp8 KV cache W1 - CPU fp8-e4m3 store + read (2026-07-29, `CLAIM-KV-FP8`) - NOT-APPLICABLE (CPU correctness brick; no throughput owed) / memory-halving e2e PENDING
+
+`benchmark_binding=false`. W1 is a CPU correctness brick: the fp8-e4m3 K/V store
+(`Quantize(hp/scale)`) + the paged-attention read dequant (`Dequant(fp8)*scale`)
++ the `cache_dtype` config parse, unit-gated by `test_ops_fp8_kv_cache` (8 cases
+/ 511 assertions; round-trip within the e4m3 band, fp8-vs-bf16 NMSE < 1%,
+paged-attention e2e within 5%; RED-first: a wrong store direction fails 3/480).
+No throughput or memory number is owed by a CPU codec brick. **The real
+memory/throughput win (the point of the feature) is PENDING and DGX-blocked:**
+the CUDA fp8 store + fp8 paged-attention read plus the runner/spec integration
+(half-sized KV blocks roughly doubling `num_gpu_blocks`) are named W2-W4 in
+[.agents/specs/fp8-kv-cache.md](../.agents/specs/fp8-kv-cache.md). Repro (CPU
+correctness): `cmake --build build-cpu --target test_ops_fp8_kv_cache &&
+./build-cpu/tests/test_ops_fp8_kv_cache`.
 
 ## DeepSeek-V4-Flash W2c - forward rewired onto the keep-quant tower (2026-07-29, `CLAIM-DEEPSEEK-V4-W2C`) - NOT-APPLICABLE (memory-enabler code brick; no throughput owed) / real run PENDING (W8-run, now memory-FEASIBLE)
 
