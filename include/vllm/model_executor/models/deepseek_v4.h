@@ -48,6 +48,8 @@
 namespace vllm {
 
 class SafetensorsFile;
+class GgufFile;
+struct GgufLoadPolicy;
 
 // Every DeepSeek-V4-Flash config field the loader/forward consume, resolved ONCE
 // from the HfConfig. DeepSeek keys (`n_routed_experts`, `hc_mult`, `o_groups`,
@@ -177,26 +179,84 @@ struct DeepseekV4HostWeights {
   std::vector<DeepseekV4LayerHostWeights> layers;
 };
 
+// ─── W2b GGUF keep-quant weight tower (the `deepseek4` GGUF materialization) ───
+// The single-Spark `unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_XXS` (~91 GiB, the only
+// build that fits ONE GB10's 119 GiB unified pool) materializes here. Every GGUF
+// `blk.N.*` tensor routes via the LANDED name-map (scripts/check-dsv4-gguf-namemap.py,
+// EXACT 1328/1328 coverage) into the slot below. The MW/SEW roles (the MLA linears,
+// the router gate, the shared + the 256 routed experts, lm_head) KEEP their ~2-3-bit
+// blocks COMPRESSED via `OwnGgufQuantBlocks` (the keep-quant memory enabler:
+// dequant-to-bf16 would need ~316 GiB and OOM-reboot the box); the small V/ET/HASH
+// tensors (norms, MHC/DSA mixing, sinks, the `tid2eid` hash table, embed) dequant to
+// f32/bf16 exactly as our other GGUF loaders do. Keeping the block dtype is the point:
+// `OwnedTensor::dtype` stays a `vt::IsBlockQuant` type and the CPU `kMatmulBTQuant`
+// GEMM (CIQ) consumes it in place. An empty OwnedTensor means "this layer has no such
+// slot" (a non-indexer/non-compressor/gated-vs-hash layer).
+struct DeepseekV4GgufLayerWeights {
+  // 512-wide MLA (MW keep-quant capable) + its norms/sink (V, dequant f32).
+  OwnedTensor wq_a, wq_b, wkv, wo_a, wo_b;
+  OwnedTensor attn_norm, q_a_norm, kv_a_norm, attn_sink, ffn_norm;
+  // MHC per-layer mixing (V, dequant f32).
+  OwnedTensor hc_attn_base, hc_attn_fn, hc_attn_scale;
+  OwnedTensor hc_ffn_base, hc_ffn_fn, hc_ffn_scale;
+  // MoE: router gate (MW) + the 256 routed experts + shared expert (SEW/MW
+  // keep-quant), plus the per-layer router side-table (HASH `tid2eid` on the
+  // first num_hash_layers layers, else the noaux_tc `e_score_bias`, both V).
+  OwnedTensor moe_gate, moe_gate_exps, moe_up_exps, moe_down_exps;
+  OwnedTensor shared_gate, shared_up, shared_down;
+  OwnedTensor tid2eid, e_score_bias;
+  // DSA compressor (compressor layers only) + Lightning-Indexer (indexer layers).
+  OwnedTensor comp_ape, comp_wgate, comp_wkv, comp_norm;
+  OwnedTensor idx_wq_b, idx_proj;
+  OwnedTensor idx_comp_ape, idx_comp_wgate, idx_comp_wkv, idx_comp_norm;
+  bool is_hash = false, has_compressor = false, has_indexer = false;
+};
+struct DeepseekV4GgufWeights {
+  OwnedTensor embed, lm_head, final_norm;               // ET / MW / V
+  OwnedTensor hc_head_base, hc_head_fn, hc_head_scale;  // V (final head collapse)
+  std::vector<DeepseekV4GgufLayerWeights> layers;
+};
+
 // Whole DeepSeek-V4 weights. W1/W2 SCAFFOLDING: carries the resolved params + the
-// loader's accounting result. Heavy tensor MATERIALIZATION (FP8-block MLA linears,
-// NVFP4 grouped experts, MHC mixing matrices, DSA indexer/compressor) is the named
-// W2b residual — the loader ACCOUNTS for every checkpoint tensor but does not yet
-// upload the quantized towers (TODO markers in deepseek_v4_weights.cpp). The W7
-// tiny-config CPU forward runs off `host` when `has_host_weights` is set.
+// loader's accounting result. The safetensors loader still ACCOUNTS for every
+// checkpoint tensor without uploading the FP8/NVFP4 towers (a named residual). The
+// GGUF loader (W2b) MATERIALIZES the keep-quant `deepseek4` tower into `gguf` and
+// dequants the tiny-config CPU composition tower into `host`. The W7 CPU forward
+// runs off `host` when `has_host_weights` is set.
 struct DeepseekV4Weights {
   DeepseekV4Params params{};
   // Accounting from the verified name-map pass (W2 gate): how many checkpoint
-  // tensors the loader recognized / would consume. Diagnostic only.
+  // tensors the loader recognized / consumed. Diagnostic (and the gate assertion).
   int64_t accounted_tensors = 0;
-  // W7 host-float tower for the tiny-config CPU forward composition. NOT filled by
-  // LoadDeepseekV4ForCausalLMWeights (that is the W2b residual); the structural
-  // gate populates it directly. `Forward` VT_CHECKs this present.
+  // W7 host-float tower for the tiny-config CPU forward composition. Populated by
+  // the GGUF loader (dequant bridge) or the structural gate. `Forward` VT_CHECKs it.
   DeepseekV4HostWeights host{};
   bool has_host_weights = false;
-  // TODO(W2b): the materialized quantized towers (FP8-block MLA linears + NVFP4
-  // grouped experts) land as device OwnedTensors; the device forward (W7-device)
-  // reads those, this host tower is the portable-CPU composition oracle.
+  // W2b materialized keep-quant `deepseek4` GGUF tower (blocks stay COMPRESSED for
+  // the MW/SEW roles). Non-empty only on the GGUF load path.
+  DeepseekV4GgufWeights gguf{};
+  bool has_gguf_weights = false;
 };
+
+// Resolve DeepseekV4Params directly from a `deepseek4`-arch GGUF's KV metadata
+// (block_count, hash_layer_count, expert_count, key/value_length, q_lora_rank,
+// output_group_count, sinkhorn_iterations, indexer head/key/top_k, compress_ratios,
+// ...). The GGUF vehicle carries no config.json, so this is the config half of the
+// GGUF loader (the safetensors path uses ParseDeepseekV4Params off HfConfig.raw).
+// Throws with a precise message on a missing/unrepresentable field.
+DeepseekV4Params DeepseekV4ParamsFromGguf(const GgufFile& gguf);
+
+// Materialize a `deepseek4` GGUF (`unsloth/DeepSeek-V4-Flash-GGUF`) into a
+// DeepseekV4Weights. Routes EVERY GGUF tensor through GgufLoadPolicy with the
+// name-map role (scripts/check-dsv4-gguf-namemap.py): MW/SEW stay keep-quant blocks,
+// V/ET/HASH dequant. Accounts for every tensor (throws on a missing expected tensor
+// or a leftover file tensor the map does not cover) and also builds the `host`
+// tiny-config CPU composition tower (dequant bridge) so a loaded model can Forward.
+// `policy` null → GgufLoadPolicy::FromEnv (keep-quant ON wherever the CPU quant GEMM
+// is registered); tests pass an explicit keep-quant policy. `config` is accepted for
+// the registry signature; the params are resolved from the GGUF KV directly.
+DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& gguf, const HfConfig& config,
+                                        const GgufLoadPolicy* policy = nullptr);
 
 // W7 structural-gate knobs. A deliberately-miswired interleave MUST change the
 // output (RED-first) — the structural gate proves each lever is load-bearing.
