@@ -181,6 +181,13 @@ inline bool DeviceGlueEnabled() {
   return on;
 }
 
+// True when the GGUF keep-quant glue should run on the in-place device kernels:
+// VT_V4_DEVICE_GLUE set + a CUDA queue + the V4 device kernels linked/live.
+inline bool GlueDev(const V4Backend& be) {
+  return be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU && DeviceGlueEnabled() &&
+         deepseek_v4::V4DeviceKernelsAvailable();
+}
+
 // One MatmulBT + (optional device) drain, timed when profiling is on. When
 // `defer_sync` is true the stream is NOT drained here — the caller issues a batch
 // of independent GEMMs and drains ONCE via DrainDevice before the host reads them
@@ -230,6 +237,12 @@ deepseek_v4::MhcPreResult DispMhcPre(const V4Backend& be, const std::vector<floa
     return deepseek_v4::MhcDevice()->pre(*be.q, residual, fn, scale, base, hc, hidden, rms_eps,
                                          hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, iters,
                                          norm_weight, norm_eps);
+  // NOTE (Brick B finding): the #183 MhcPreKernel is a <<<1,1>>> SINGLE-THREAD
+  // correctness stub. Routing MhcPre to it (86 calls/step over hc*H=16K, single
+  // GPU thread) REGRESSED decode ~10x (0.59 vs 6.5 tok/s), so MhcPre stays on the
+  // host until a REAL PARALLEL MhcPre kernel is written (the hardest remaining
+  // Brick-B piece: folded RMSNorm + 20-iter Sinkhorn + gates + stream collapse).
+  // The parallel glue (SwiGLU/Router/MhcPost, Grid-launched) IS routed to device.
   return MhcPre(residual, fn, scale, base, hc, hidden, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
                 hc_post_mult, iters, norm_weight, norm_eps);
 }
@@ -238,6 +251,13 @@ std::vector<float> DispMhcPost(const V4Backend& be, const std::vector<float>& x,
                                const std::vector<float>& post_mix,
                                const std::vector<float>& comb, int64_t hc, int64_t hidden) {
   if (be.device) return deepseek_v4::MhcDevice()->post(*be.q, x, residual, post_mix, comb, hc, hidden);
+  if (GlueDev(be)) {  // Brick B: in-place device MHC-post
+    std::vector<float> out(static_cast<size_t>(hc * hidden));
+    deepseek_v4::MhcDevice()->post_ip(*be.q, out.data(), x.data(), residual.data(),
+                                      post_mix.data(), comb.data(), hc, hidden);
+    SyncDeviceGemm(be);
+    return out;
+  }
   return MhcPost(x, residual, post_mix, comb, hc, hidden);
 }
 std::vector<float> DispHcHead(const V4Backend& be, const std::vector<float>& x,
@@ -245,6 +265,13 @@ std::vector<float> DispHcHead(const V4Backend& be, const std::vector<float>& x,
                               const std::vector<float>& base, int64_t hc, int64_t hidden,
                               float rms_eps, float hc_eps) {
   if (be.device) return deepseek_v4::MhcDevice()->head(*be.q, x, fn, scale, base, hc, hidden, rms_eps, hc_eps);
+  if (GlueDev(be)) {  // Brick B: in-place device hc_head collapse
+    std::vector<float> out(static_cast<size_t>(hidden));
+    deepseek_v4::MhcDevice()->head_ip(*be.q, out.data(), x.data(), fn.data(), scale, base.data(),
+                                      hc, hidden, rms_eps, hc_eps);
+    SyncDeviceGemm(be);
+    return out;
+  }
   return HcHeadCollapse(x, fn, scale, base, hc, hidden, rms_eps, hc_eps);
 }
 std::vector<float> DispSaveScoreApe(const V4Backend& be, const std::vector<float>& score,
@@ -310,6 +337,19 @@ deepseek_v4::MoeRouteResult DispRoute(const V4Backend& be, const std::vector<flo
   if (be.device)
     return deepseek_v4::MoeDevice()->route(*be.q, gating, T, E, topk, bias, renorm, scale,
                                            in_tokens, hashtab, vocab);
+  if (GlueDev(be)) {  // Brick B: in-place device router (softmax + top-k → expert_ids)
+    const bool has_bias = !bias.empty();
+    const bool is_hash = !hashtab.empty() && !in_tokens.empty();
+    deepseek_v4::MoeRouteResult out;
+    out.topk_ids.assign(static_cast<size_t>(T * topk), 0);
+    out.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
+    deepseek_v4::MoeDevice()->route_ip(
+        *be.q, out.topk_ids.data(), out.topk_weights.data(), gating.data(), T, E, topk,
+        has_bias ? bias.data() : nullptr, has_bias, is_hash ? in_tokens.data() : nullptr, is_hash,
+        is_hash ? hashtab.data() : nullptr, vocab, renorm, scale);
+    SyncDeviceGemm(be);
+    return out;
+  }
   return SqrtSoftplusRouteTopk(gating, T, E, topk, bias, renorm, scale, in_tokens, hashtab, vocab);
 }
 std::vector<float> DispClampedSwiGLU(const V4Backend& be, const std::vector<float>& gate_up,

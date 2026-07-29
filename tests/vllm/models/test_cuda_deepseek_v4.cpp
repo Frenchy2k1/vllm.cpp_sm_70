@@ -553,3 +553,86 @@ TEST_CASE("DeepseekV4 device clamped-SwiGLU in place == host (Brick B)") {
   gpu.Synchronize(g.q);
   CHECK(RelL2(o2, o) > 1e-4);
 }
+
+// Brick B: the IN-PLACE MHC glue (post/head/pre) + router == the ROUND-TRIP #183
+// launchers. Same kernels, so the results are BIT-IDENTICAL (the round-trip variant
+// is already gated vs the host reference near-tie). RED-first: a perturbed input
+// changes the in-place output.
+TEST_CASE("DeepseekV4 device MHC + router in place == round-trip (Brick B)") {
+  if (!HasCuda()) return;  // DGX-only
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t hc = 4, hidden = 8, iters = 5;
+  const int64_t hc3 = (2 + hc) * hc;
+  const float eps = 1e-6f;
+
+  // MHC-post
+  {
+    const auto x = Rand(r, hidden), residual = Rand(r, hc * hidden);
+    const auto post_mix = Rand(r, hc, 0.0f, 2.0f), comb = Rand(r, hc * hc, 0.0f, 1.0f);
+    const auto rt = dv4::MhcDevice()->post(g.q, x, residual, post_mix, comb, hc, hidden);
+    std::vector<float> ip(static_cast<size_t>(hc * hidden), 0.0f);
+    dv4::MhcDevice()->post_ip(g.q, ip.data(), x.data(), residual.data(), post_mix.data(),
+                             comb.data(), hc, hidden);
+    gpu.Synchronize(g.q);
+    REQUIRE(ip.size() == rt.size());
+    for (size_t i = 0; i < ip.size(); ++i) CHECK(ip[i] == rt[i]);  // same kernel → bit-identical
+  }
+  // hc_head
+  {
+    const auto xh = Rand(r, hc * hidden), fn = Rand(r, hc * hc * hidden, -0.3f, 0.3f);
+    const auto base = Rand(r, hc, -0.3f, 0.3f);
+    const auto rt = dv4::MhcDevice()->head(g.q, xh, fn, 0.5f, base, hc, hidden, eps, eps);
+    std::vector<float> ip(static_cast<size_t>(hidden), 0.0f);
+    dv4::MhcDevice()->head_ip(g.q, ip.data(), xh.data(), fn.data(), 0.5f, base.data(), hc, hidden,
+                             eps, eps);
+    gpu.Synchronize(g.q);
+    for (size_t i = 0; i < ip.size(); ++i) CHECK(ip[i] == rt[i]);
+    // RED-first: a different scale changes the head output.
+    std::vector<float> ip2(static_cast<size_t>(hidden), 0.0f);
+    dv4::MhcDevice()->head_ip(g.q, ip2.data(), xh.data(), fn.data(), 1.7f, base.data(), hc, hidden,
+                             eps, eps);
+    gpu.Synchronize(g.q);
+    CHECK(RelL2(ip2, ip) > 1e-4);
+  }
+  // MHC-pre (all four outputs)
+  {
+    const int64_t hcH = hc * hidden;
+    const auto residual = Rand(r, hc * hidden, -1.0f, 1.0f);
+    const auto fn = Rand(r, hc3 * hcH, -0.3f, 0.3f);
+    const auto scale = Rand(r, 3, -0.5f, 0.5f);
+    const auto base = Rand(r, hc3, -0.3f, 0.3f);
+    const auto nw = Rand(r, hidden, 0.9f, 1.1f);
+    const auto rt = dv4::MhcDevice()->pre(g.q, residual, fn, scale, base, hc, hidden, eps, eps,
+                                          eps, 2.0f, iters, nw, eps);
+    dv4::MhcPreResult ip;
+    ip.pre_mix.resize(static_cast<size_t>(hc));
+    ip.post_mix.resize(static_cast<size_t>(hc));
+    ip.comb_mix.resize(static_cast<size_t>(hc * hc));
+    ip.layer_input.resize(static_cast<size_t>(hidden));
+    std::vector<float> mix(static_cast<size_t>(hc3));
+    dv4::MhcDevice()->pre_ip(g.q, ip.pre_mix.data(), ip.post_mix.data(), ip.comb_mix.data(),
+                            ip.layer_input.data(), mix.data(), residual.data(), fn.data(),
+                            scale.data(), base.data(), hc, hidden, eps, eps, eps, 2.0f, iters,
+                            nw.data(), true, eps);
+    gpu.Synchronize(g.q);
+    for (size_t i = 0; i < ip.layer_input.size(); ++i) CHECK(ip.layer_input[i] == rt.layer_input[i]);
+    for (size_t i = 0; i < ip.comb_mix.size(); ++i) CHECK(ip.comb_mix[i] == rt.comb_mix[i]);
+  }
+  // router (non-hash, biased top-k)
+  {
+    const int64_t T = 2, E = 8, topk = 3;
+    const auto gating = Rand(r, T * E, -2.0f, 2.0f);
+    const auto bias = Rand(r, E, -0.5f, 0.5f);
+    const auto rt = dv4::MoeDevice()->route(g.q, gating, T, E, topk, bias, true, 1.5f, {}, {}, 0);
+    dv4::MoeRouteResult ip;
+    ip.topk_ids.assign(static_cast<size_t>(T * topk), 0);
+    ip.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
+    dv4::MoeDevice()->route_ip(g.q, ip.topk_ids.data(), ip.topk_weights.data(), gating.data(), T,
+                              E, topk, bias.data(), true, nullptr, false, nullptr, 0, true, 1.5f);
+    gpu.Synchronize(g.q);
+    for (size_t i = 0; i < ip.topk_ids.size(); ++i) CHECK(ip.topk_ids[i] == rt.topk_ids[i]);
+    for (size_t i = 0; i < ip.topk_weights.size(); ++i) CHECK(ip.topk_weights[i] == rt.topk_weights[i]);
+  }
+}

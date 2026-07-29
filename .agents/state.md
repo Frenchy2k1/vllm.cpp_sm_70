@@ -33492,3 +33492,33 @@ host-launch-bound — the payoff is Brick D's graph); peak 86.33 GiB unchanged. 
 (`VT_V4_DEVICE_GLUE` default OFF; allowlisted). Remaining Brick-B glue (router, MHC pre/post/head/Sinkhorn,
 RMSNorm, RoPE, MoE combine) = the next gated increments. Box restored (worker up restart=always, flock
 free, no stray). Row `ACTIVE`.
+
+## DeepSeek-V4 device-resident decode campaign — Brick B increment 2 (MHC-post/head + router device glue; the MhcPre single-thread FINDING) (2026-07-29, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-dgl`, branch `deepseek-v4-device-glue`, base `21191ce2`, commit `3046f087`, NOT pushed)
+
+Continued Brick B on the branch (coordinator: keep stacking increments, review Brick B whole). Added
+in-place launchers reusing the tested #183 kernels for MHC pre/post/head + router (unified pointers, no
+Upload/Download/Sync): `post_ip`/`head_ip`/`pre_ip` in `MhcDeviceKernels`, `route_ip` in
+`MoeDeviceKernels`; `GlueDev(be)`; `DispMhcPost`/`DispHcHead`/`DispRoute` route to them under
+`VT_V4_DEVICE_GLUE`.
+
+**KEY FINDING (Iron Law — measured, not assumed):** the #183 `MhcPreKernel`/`HcHeadKernel` are `<<<1,1>>>`
+SINGLE-THREAD correctness stubs. Routing MhcPre to it (86 calls/step over `hc*H`=16 384, ONE GPU thread)
+**REGRESSED decode ~10× (0.59 vs 6.5 tok/s)** — a single GPU thread over 16K-wide data, launched hundreds
+of times/step, is far slower than the 20-core host. So MhcPre STAYS ON HOST (reverted, documented at the
+call site) until a REAL PARALLEL MhcPre kernel is written (folded RMSNorm + 20-iter Sinkhorn + gates +
+stream collapse — the hardest remaining Brick-B piece). The Grid-launched glue (clamped-SwiGLU, router,
+MHC-post, hc_head[1 call/step, single-thread but negligible]) IS routed to device and is FLAT. `pre_ip`
+is kept (linked + unit-tested) but NOT wired into the forward.
+
+**GATES:** CUDA unit `test_cuda_deepseek_v4` **14/14·749** (+1 case: MHC post/head/pre + router in-place ==
+round-trip #183 launcher BIT-IDENTICAL [same kernel; the round-trip is already gated vs the host near-tie],
+RED-first hc_head scale diverges); `test_deepseek_v4_gguf_load` **12/12·531** (glue off by default); CPU +
+CUDA `-Werror` clean. **Real 80.7 GB model (DGX GB10): TOKEN-IDENTICAL** with all device kernels on
+(attn+swiglu+router+mhcpost+hchead, mhcpre host) — `VT_V4_DEVICE_ATTN=1 VT_V4_DEVICE_GLUE=1` emits
+`11111 16 455 6102 294 8760 344 11111 …` = "…Paris."; decode **6.38 tok/s (flat vs 6.5 baseline)**.
+
+**BRICK B IS NOT COMPLETE (honest):** the parallel glue (SwiGLU, Router, MHC-post, hc_head) is done +
+gated + token-identical + flat; the remaining glue — a **real parallel MhcPre kernel** (the #183 stub
+regresses 10×, so reuse is not viable for it), **RMSNorm**, **RoPE**, **MoE combine** — are the next
+gated increments (stacking on this branch). I did NOT ship the 10×-regressing single-thread MhcPre as
+"flat." Box restored (worker up restart=always, flock free, no stray). Row `ACTIVE`.
