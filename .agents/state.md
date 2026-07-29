@@ -32219,3 +32219,202 @@ the Q4_K_M draft's proposals get rejected one block earlier against a true-fp4
 target when the emitted tokens are identical), and decide whether the axis-A bar
 should stay accept-count-exact or become accept-count-banded like the golden
 arm's `<= 4` band. Both rows' speed items are unchanged and still PENDING.
+
+## 2026-07-29 - `SPEC-DFLASH-GGUF` `GD9`: the axis-A accept-count RED is ROOT-CAUSED in WEIGHT SPACE (`CLAIM-DFLASH-GGUF-ACCEPT-RCA`)
+
+**Base** `main` `4e20b6f8` (worktree `/home/mudler/_git/vllm.cpp-abi-v9`, merged
+clean with `origin/main` at session start). CPU-only Release build on the dev box
+(`cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release`, gcc 13.3.0). **NO GPU RUN
+HAPPENED THIS SESSION** - see the hardware section below. NOT pushed.
+
+**The question.** The 2026-07-29 production-build re-verification left one open
+item: on the 48-token prompt the `Q4_K_M` GGUF DFlash draft reads **46/112**
+against the bf16 z-lab safetensors draft's **47/96**, tokens IDENTICAL, gate RED
+15/17 at `tests/parity/test_qwen27_dflash_spec_decode.cpp:473,474`, 3 of 3 runs.
+Two candidates: (a) ordinary `Q4_K_M` cost, or (b) a structural defect in our
+GGUF draft path. This row has already produced three defects that all looked
+statistical first (`fc.nk`, the `(w+1)` norm convention, `vocab_size`), so (a)
+was not assumed.
+
+### 0. Read the accept rule first - it re-weights the two halves of the bar
+
+`include/vllm/v1/spec_decode/rejection_sampler.h` pins ACCEPT-IFF-EQUAL,
+STOP-AT-FIRST-MISMATCH, and the mismatch position emitting the TARGET's argmax.
+Consequence: under greedy verification the emitted token stream IS the target's
+own greedy continuation whatever the draft proposes. So cross-draft token
+identity is a statement about the VERIFIER, not about either draft, and the
+accept counts are the ONLY channel carrying information about draft quality.
+That is exactly why the tokens agreed while the counts did not.
+
+It also disposes of the "extra propose block" framing. `spec_drafts_proposed_ +=
+kr` with `kr == 16` every step, so 144, 96 and 112 are `16 x nblocks`. Needing a
+7th block is the arithmetic consequence of accepting less per block, not a
+block-accounting off-by-one.
+
+### 1. The bar's own premise was false for the asset it was pointed at
+
+The assertion block reads "Same weights, two containers, one target ... both arms
+run the identical code path". Against a `Q4_K_M` file the first clause is simply
+untrue: it is a 4-bit re-encoding, not the same weights. Exact accept-count
+equality was never the right bar for that pairing.
+
+### 2. The asset survey in the spec was WRONG, and fixing it retires gate 2
+
+The spec recorded gate 2 (cross-format weight equivalence) as `NOT APPLICABLE`
+because "the only published one is `Q4_K_M`".
+`Alittlehammmer/Qwen3.6-27B-DFlash-GGUF-llama.cpp` actually publishes a full
+ladder:
+
+    Qwen3.6-27B-DFlash-BF16.gguf     3,471,497,440 B   (ggml type 30)
+    Qwen3.6-27B-DFlash-Q8_0.gguf     1,849,481,440 B
+    Qwen3.6-27B-DFlash-Q6_K.gguf     1,430,460,640 B
+    Qwen3.6-27B-DFlash-Q5_K.gguf     1,225,742,560 B
+    Qwen3.6-27B-DFlash-Q4_K_M.gguf   1,033,066,720 B   md5 255fb6188e8eaaa0b0938dcd806dd3a1
+
+All five plus `z-lab/Qwen3.6-27B-DFlash` (`model.safetensors`, 3,460,432,504 B,
+rev `0919688658996800f86b895034249700e9481106`) were fetched to the dev box's HF
+cache. The `BF16` member's KVs match the `GD0` dump exactly (`dflash.block_count`
+5, `.embedding_length` 5120, `.feed_forward_length` 17408, head counts 32/8,
+`.key_length` 128, `.rope.freq_base` 1e7, `.block_size` 16, `.target_layers`
+`[2,17,32,47,62]`, `.sliding_window` 2048, pattern `[T,T,T,T,F]`,
+`tokenizer.ggml.mask_token_id` 248070, 58 tensors, no `token_embd`, no `output`).
+
+### 3. New gate: the unquantized GGUF is BYTE-IDENTICAL through our loader
+
+`tests/vllm/models/test_qwen3_dflash_gguf.cpp` third case, asset-gated on
+`VLLM_DFLASH_GGUF_BF16_MODEL` + `VLLM_DFLASH_ST_DIR`, compares
+`LoadQwen3DFlashFromGguf(BF16.gguf)` against `LoadQwen3DFlash(z-lab shards)`
+tensor byte for tensor byte, including `nk` flags and per-layer attention modes.
+
+    VLLM_DFLASH_GGUF_BF16_MODEL=<...>/Qwen3.6-27B-DFlash-BF16.gguf \
+    VLLM_DFLASH_ST_DIR=<...>/models--z-lab--Qwen3.6-27B-DFlash/snapshots/<rev> \
+      ./build-cpu/tests/test_qwen3_dflash_gguf -tc="*byte-identical*"
+    -> test cases: 1 passed, assertions: 302 | 302 passed | 0 failed, SUCCESS!
+
+FUNCTIONAL RED control, same binary, `Q4_K_M` in place of `BF16`:
+
+    -> assertions: 302 | 281 passed | 21 failed, Status: FAILURE!, exit 1
+       e.g. "147103651 of 262144000 bytes differ, first at 0"
+
+The 21 reds are exactly the 21 quantized matmul tensors (`fc` + 4 per layer x 5
+layers); the 22 F32 norm tensors stay bit-equal because llama.cpp keeps norms
+F32. So the green is not vacuous, and gate 2 is MET.
+
+The existing two cases still pass 47/47 on BOTH files, i.e. the BF16 GGUF goes
+through the identical `MapName` / `DequantGgufRowToBf16` / `LoadQwen3DFlash`
+path a `Q4_K_M` one does. That is what makes the byte equality load-bearing:
+every STRUCTURAL way the GGUF arm could differ is exercised and comes out equal.
+
+### 4. Our dequantizer is bit-equal to the producer's reference
+
+A scratch tool over `libvllm.a` dumped `DequantGgufRowToBf16` output for three
+real tensors of the `Q4_K_M` file and diffed it against `gguf-py`'s
+`gguf.quants.dequantize` (rounded to bf16 the same way):
+
+    fc.weight            Q4_K  131,072,000 elems   ndiff 0   max|d| 0
+    blk.0.attn_q.weight  Q4_K   20,971,520 elems   ndiff 0   max|d| 0
+    blk.2.ffn_down.weight Q6_K  89,128,960 elems   ndiff 0   max|d| 0
+
+### 5. The error is ordinary quantization error, and it is uniform
+
+Mean `|w_gguf - w_st| / mean|w_st|` over all 58 tensors, per ladder level:
+
+    BF16     0          (58/58 bit-identical)
+    Q8_0     5.6e-3     (22/58 bit-identical: the F32 norms)
+    Q6_K     1.85e-2    (22/58)
+    Q5_K     3.85e-2    (22/58)
+    Q4_K_M   7.6e-2     (22/58)
+
+Monotone in bit-width; the spread WITHIN a level is negligible (Q8_0 spans
+5.53e-3 to 5.63e-3 across every matmul tensor). No outlier tensor, nothing out of
+family, no sign of a transposed or mis-scaled weight.
+
+### 6. Config delta between the arms, enumerated and excluded
+
+After load both sources converge on the same struct and the same code, so the
+only arm-dependent input left is the draft `HfConfig`. Every field matches the
+z-lab `config.json` except two, neither of which can move a proposal:
+
+- `rms_norm_eps`: `1e-06` from JSON vs `9.999999974752427e-07` from the GGUF's
+  f32 KV. 2.5e-9 relative, ~50x below f32 epsilon.
+- `vocab_size`: safetensors takes the declared 248320, GGUF is back-filled from
+  the target's `embed_tokens` rows (`GD4`). It only sizes the shared embedding
+  VIEW; the range the draft's argmax actually spans is `draft_vocab_size`, which
+  BOTH arms overwrite from the target's `lm_head` at `model_loader.cpp:312`.
+
+### 7. Verdict, and what it means for the bar
+
+**Category (a): ordinary `Q4_K_M` cost.** A structural defect is eliminated in
+the loader (byte-identical over the same path), in the dequantizer (bit-equal to
+the reference) and in the config. The effect size is also the right shape for
+quantization and the wrong shape for a defect: zero cost on the 24-token prompt
+(both drafts 15/144) and ONE acceptance out of 47 on the 48-token one. A
+mis-loaded draft collapses acceptance; it does not shave one.
+
+The bar should therefore be split by what the arms vary: cross-FORMAT
+(safetensors vs an UNQUANTIZED GGUF) keeps EXACT tokens and EXACT
+proposed/accepted, which the BF16 asset now makes a real invariant; and
+cross-QUANTIZATION (safetensors vs `Q4_K_M`) keeps EXACT tokens (guaranteed by
+the verifier) with a BANDED accept count, the way the landed `SPEC-DFLASH`
+golden arm already does (`abs(acc - want) <= 4`).
+
+**The band value is NOT being set in this change, on purpose.** Setting it needs
+the measurement below, and the last time this row published a conclusion without
+the right measurement (the "Q4_K_M costs this draft nothing" claim from the
+emulation build) it had to be voided.
+
+### 8. Instrumentation landed for the run that has not happened yet
+
+`VT_SPEC_TRACE=1` in `GPUModelRunner::sample_tokens_with_rejection`
+(`src/vllm/v1/worker/gpu/runner.cpp`) prints, per verify step, `req`, `pos` (the
+request's token count BEFORE write-back, so two runs line up by position), `k`,
+`ns`, `acc`, the whole 16-wide proposal, and the emitted tokens. Off by default
+behind a single cached env read; no behaviour change. The aggregate totals cannot
+tell a diffuse per-block difference from one displaced block, which is the first
+thing the hardware run should answer.
+
+### 9. Hardware: dgx.casa went away and did NOT come back
+
+Sequence, all UTC. 08:41 `nvidia-smi` on dgx: GB10 at 96% util, 86 C, with an
+unrelated LocalAI `longcat-video` process holding 69,939 MiB of the unified pool;
+disk 392 G free. The production `cmake` configure was run and PROVEN correct on
+its first two legs - `grep -ci "cutlass not found"` = **0**, log printing
+`CUTLASS found at /home/mudler/cutlass-4.5.0; enabling sm120a NVFP4 cutlass
+GEMM`, `Triton AOT: vendored tree .../sm_121a matches triton_kernels/ (MANIFEST
+hashes OK)` and `FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a]`.
+The `ninja` build was started; ~08:47 the host dropped off the network entirely
+(`ip neigh` shows `192.168.68.128 INCOMPLETE`, ping `Destination Host
+Unreachable`, i.e. ARP-level absent, not an sshd problem) and was still absent
+after continuous polling for the rest of the session. No BMC/IPMI path is
+recorded for this box, so there was nothing to do but wait.
+
+**Consequence, stated plainly: the GPU exclusion window was never held, the
+discriminator was never run, and NO GPU number appears anywhere in this
+checkpoint.** The dev box's `~/work/dflash-rca/` tree on dgx (source + configured
+`build-cuda`) is left in place for the resume; it is `git archive` of `4e20b6f8`
+plus the `VT_SPEC_TRACE` hunk, `md5 eac5599ed4f923411722277c409d0995` on
+`runner.cpp`, verified equal to the local file.
+
+**NEXT / residuals.**
+1. On dgx, `scp` `Qwen3.6-27B-DFlash-BF16.gguf` into `$HOME/bench/`, finish the
+   `~/work/dflash-rca/src/build-cuda` build, re-prove the third leg (SACRED
+   `test_qwen27_paged_engine` 235/235 and `cuobjdump -lelf` all `sm_121a`), then
+   run the axis-A case with `VLLM_DFLASH_DRAFT=$HOME/bench/Qwen3.6-27B-DFlash-BF16.gguf`
+   against `VLLM_DFLASH_DRAFT_B=z-lab/Qwen3.6-27B-DFlash` at 48 tokens under
+   `flock $HOME/gpu.lock`. If it reads exactly **47/96** on both arms,
+   quantization is proven to be the whole story by measurement.
+2. With `VT_SPEC_TRACE=1`, diff the per-block traces of the `Q4_K_M` and
+   safetensors arms to locate where the accept pattern first parts and whether
+   it is one block or several.
+3. Only then set the cross-QUANTIZATION band, with the measured delta as its
+   justification, and re-gate.
+4. Not chased, as flagged and still pre-existing: `test_capi` SIGSEGV at
+   `tests/capi/test_capi.cpp:410`, `test_model_loader_gguf` 2/3,
+   `check-device-leakage` (`kcuda=8` vs baseline 0) and `check-env-doc`, both
+   confirmed RED with this change STASHED, i.e. identical before and after.
+
+**Records same-change:** `specs/gguf-dflash-draft.md` (gate 2 MET, gate 3 and
+gate 5 root-cause, the `GD9` row, the corrected asset list, the new root-cause
+section), `engine-matrix.md` (`SPEC-DFLASH-GGUF`, stays `PARTIAL`),
+`coordination.md` (`CLAIM-DFLASH-GGUF-ACCEPT-RCA`), `docs/STATUS.md`,
+`docs/BENCHMARKS.md`, `parity-ledger.md`, this state entry.
