@@ -32814,3 +32814,33 @@ not this one's. Pre-existing and NOT introduced here: `test_capi` SIGSEGV at
 `tests/capi/test_capi.cpp:410`, `test_model_loader_gguf` 2/3, and the
 `check-device-leakage` / `check-env-doc` reds on `origin/main`. Work is LOCAL
 ONLY; nothing pushed.
+
+## 2026-07-29 — `SPEC-DFLASH-GGUF` closing commit: row `PARTIAL` -> `DONE` (correctness)
+
+Records-only, ZERO code: `git diff --stat` against `c62f2fa3` touches only
+`.agents/engine-matrix.md` (state, owner, ledger anchor, rollup),
+`.agents/specs/gguf-dflash-draft.md` (one table cell whose literal `|` absolute-
+value bars broke the 5-pipe table contract), `docs/STATUS.md`,
+`docs/BENCHMARKS.md` and this entry. The GPU gates therefore stand on exactly the
+code `c62f2fa3` carries.
+
+Row `SPEC-DFLASH-GGUF` state `PARTIAL` -> `DONE`, owner = closing commit
+`c62f2fa3`, tests field gains the exact ledger anchor
+`parity-ledger.md#L845`. Engine-matrix rollup: Speculative decoding
+`PARTIAL` 1 -> 0 and `DONE` 3 -> 4; Total `PARTIAL` 17 -> 16 and `DONE` 8 -> 9.
+
+Justification, gate by gate. 1 (spec-OFF byte-identical, SACRED) MET, 27B
+235/235 exit 0 on this build. 2 (cross-format draft equivalence at load) MET,
+58/58 tensors byte-identical, 302/302, functionally RED against `Q4_K_M`.
+3 (axis-A cross-format equivalence) MET in the split form: exact on the
+cross-FORMAT arm (47/96 = 47/96 at 48 tokens, reproduced; 27/64 and 15/144 at 24
+tokens), banded on the cross-QUANTIZATION arm with the band derived and
+mutation-proved. 4 (axis-B token identity) MET on THREE prompts, strict form.
+5 (acceptance parity) MET for axis A, measured and dispositioned for axis B.
+7 (shared-head equivalence) MET. 6 (speed) `PENDING` BY DESIGN and NOT owed: a
+DFlash-ON throughput A/B between the two target containers is not a fair
+comparison until a native NVFP4 GGUF GEMM exists, and `docs/BENCHMARKS.md`
+carries that disposition with its reproduction command.
+
+Work is LOCAL ONLY. Nothing pushed; `feat/capi-abi-v9-engine-config` remains
+ahead of its remote.
