@@ -21,6 +21,10 @@ MATRICES = {
     # discovery and kernel selection). This count is the inventory size, so it is
     # bumped when a genuinely new scheme is inventoried — never to make a failing
     # state transition pass.
+    # 2026-07-29: the pre-existing INVENTORIED `QUANT-GGUF-IQ3_XXS` (id 18) row was
+    # ADVANCED to `ACTIVE` (keep-quant compute landed) by `CLAIM-DEEPSEEK-V4-W8` —
+    # the `UD-IQ2_XXS` down-projection routed experts (`ffn_down_exps`) are IQ3_XXS;
+    # no row count change (an in-place advance, not a new row).
     "QUANT": (AGENTS / "quantization-matrix.md", 82),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
@@ -104,9 +108,17 @@ MATRICES = {
     # The 512-wide MLA attn + expert grouped-GEMM REUSE the existing NVFP4/FP8
     # kernels — NOT re-ported. `IMPL`, `CLAIM-DEEPSEEK-V4-W7-DEVICE`, spec
     # specs/deepseek-v4-flash.md; real-checkpoint e2e stays W8, multi-Spark).
+    # 44 since 2026-07-29: +`KERNEL-QUANT-CIQ-IQUANT` (the DeepSeek-V4 W8 keep-quant
+    # `vec_dot` for the ~2-3-bit codebook encodings IQ2_XXS/IQ3_XXS/Q2_K — the
+    # single-Spark GGUF memory enabler; extends `QUANT-GGUF-COMPUTE`'s six-type
+    # `kMatmulBTQuant` so the 158 B routed experts stay COMPRESSED instead of
+    # OOM-expanding to bf16. CPU tier only, like the six existing k-quants. 1:1
+    # ports of ggml `vec_dot_q2_K/iq2_xxs/iq3_xxs_q8_K_generic`; gated 19 cases /
+    # 130444 assertions, RED-first proven. `SPIKE`, `CLAIM-DEEPSEEK-V4-W8`, spec
+    # specs/deepseek-v4-flash.md §W8).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 43),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 44),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

@@ -1,13 +1,20 @@
 // Tier-0 generic `vec_dot` kernels — QUANT-GGUF-CIQ-GEMM work row G3.
 //
-// The six portable-C++ block dot products, ported byte-for-byte from
+// The portable-C++ block dot products, ported byte-for-byte from
 // llama.cpp @ 237ad9b96 `ggml/src/ggml-cpu/quants.c`:
 //   :174 ggml_vec_dot_q4_0_q8_0_generic
 //   :400 ggml_vec_dot_q8_0_q8_0_generic
+//   :514 ggml_vec_dot_q2_K_q8_K_generic     (DeepSeek-V4 W8)
 //   :566 ggml_vec_dot_q3_K_q8_K_generic
 //   :645 ggml_vec_dot_q4_K_q8_K_generic
 //   :720 ggml_vec_dot_q5_K_q8_K_generic
 //   :800 ggml_vec_dot_q6_K_q8_K_generic
+//   :855 ggml_vec_dot_iq2_xxs_q8_K_generic  (DeepSeek-V4 W8 — keep-quant enabler)
+//   :999 ggml_vec_dot_iq3_xxs_q8_K_generic  (DeepSeek-V4 W8 — keep-quant enabler)
+// Q2_K/IQ2_XXS/IQ3_XXS landed for the single-Spark DeepSeek-V4 GGUF vehicle
+// (CLAIM-DEEPSEEK-V4-W8): keeping the ~2-3-bit routed-expert weights COMPRESSED
+// and dotting them directly is what keeps the 158 B model at ~91 GiB instead of
+// OOM-expanding to bf16 (~316 GiB) — see .agents/specs/deepseek-v4-flash.md.
 // `GGML_CPU_FP16_TO_FP32` maps to `vt::F16ToF32` (the same IEEE binary16
 // decode) and the `*_generic` names are retained in each comment so an
 // upstream diff lands mechanically.
@@ -33,6 +40,7 @@
 #include <cstring>
 
 #include "cpu_quant_blocks.h"
+#include "cpu_quant_iq_tables.h"  // kIq2xxsGrid/kIq3xxsGrid/kKsignsIq2xs/kKmaskIq2xs
 #include "vt/quant.h"
 
 namespace vt::cpu {
@@ -426,16 +434,168 @@ void VecDotQ6_KQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
   *s = sumf;
 }
 
+// quants.c:514 — ggml_vec_dot_q2_K_q8_K_generic. 2-bit weight (qs, shift
+// 0/2/4/6) × a 4-bit per-16 sub-scale (low nibble of scales[]); the per-16
+// sub-min (high nibble) is applied via the activation's bsums in one pass
+// (`summs`), so the block minimum never touches the quant loop.
+void VecDotQ2_KQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
+                    const void* vy, size_t by, int nrc) {
+  VT_CHECK(n % kQK_K == 0, "vec_dot_q2_K_q8_K: n must be a multiple of 256");
+  VT_CHECK(nrc == 1, "vec_dot_q2_K_q8_K: generic tier supports nrc == 1 only");
+  (void)nrc;
+  (void)bx;
+  (void)by;
+  (void)bs;
+
+  const BlockQ2_K* x = static_cast<const BlockQ2_K*>(vx);
+  const BlockQ8_K* y = static_cast<const BlockQ8_K*>(vy);
+  const int nb = n / kQK_K;
+
+  float sumf = 0;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* q2 = x[i].qs;
+    const int8_t* q8 = y[i].qs;
+    const uint8_t* sc = x[i].scales;
+
+    int summs = 0;
+    for (int j = 0; j < 16; ++j) summs += y[i].bsums[j] * (sc[j] >> 4);
+
+    const float dall = y[i].d * F16ToF32(x[i].d);
+    const float dmin = y[i].d * F16ToF32(x[i].dmin);
+
+    int isum = 0;
+    int is = 0;
+    int d;
+    for (int k = 0; k < kQK_K / 128; ++k) {
+      int shift = 0;
+      for (int j = 0; j < 4; ++j) {
+        d = sc[is++] & 0xF;
+        int isuml = 0;
+        for (int l = 0; l < 16; ++l) isuml += q8[l] * ((q2[l] >> shift) & 3);
+        isum += d * isuml;
+        d = sc[is++] & 0xF;
+        isuml = 0;
+        for (int l = 16; l < 32; ++l) isuml += q8[l] * ((q2[l] >> shift) & 3);
+        isum += d * isuml;
+        shift += 2;
+        q8 += 32;
+      }
+      q2 += 32;
+    }
+    sumf += dall * isum - dmin * summs;
+  }
+  *s = sumf;
+}
+
+// quants.c:855 — ggml_vec_dot_iq2_xxs_q8_K_generic. Codebook dot: each 32-lane
+// sub-block reads two u32 (four 8-bit grid indices + four 7-bit sign selectors
+// with a 4-bit scale `ls` in the top nibble); the grid byte × activation ×
+// (±1 sign) is accumulated and scaled by `ls`. The final 0.125 folds the grid's
+// fixed 8x magnitude. The grid/sign tables live in cpu_quant_iq_tables.h.
+void VecDotIQ2_XXSQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
+                       const void* vy, size_t by, int nrc) {
+  VT_CHECK(n % kQK_K == 0, "vec_dot_iq2_xxs_q8_K: n must be a multiple of 256");
+  VT_CHECK(nrc == 1, "vec_dot_iq2_xxs_q8_K: generic tier supports nrc == 1 only");
+  (void)nrc;
+  (void)bx;
+  (void)by;
+  (void)bs;
+
+  const BlockIQ2_XXS* x = static_cast<const BlockIQ2_XXS*>(vx);
+  const BlockQ8_K* y = static_cast<const BlockQ8_K*>(vy);
+  const int nb = n / kQK_K;
+
+  uint32_t aux32[2];
+  const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(aux32);
+
+  float sumf = 0.f;
+  for (int i = 0; i < nb; ++i) {
+    const float d = F16ToF32(x[i].d) * y[i].d;
+    const uint16_t* q2 = x[i].qs;
+    const int8_t* q8 = y[i].qs;
+    int32_t bsum = 0;
+    for (int ib32 = 0; ib32 < kQK_K / 32; ++ib32) {
+      std::memcpy(aux32, q2, 2 * sizeof(uint32_t));
+      q2 += 4;
+      const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
+      int32_t sumi = 0;
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t* grid =
+            reinterpret_cast<const uint8_t*>(kIq2xxsGrid + aux8[l]);
+        const uint8_t signs = kKsignsIq2xs[(aux32[1] >> (7 * l)) & 127];
+        for (int j = 0; j < 8; ++j)
+          sumi += grid[j] * q8[j] * ((signs & kKmaskIq2xs[j]) ? -1 : 1);
+        q8 += 8;
+      }
+      bsum += sumi * static_cast<int32_t>(ls);
+    }
+    sumf += d * bsum;
+  }
+  *s = 0.125f * sumf;
+}
+
+// quants.c:999 — ggml_vec_dot_iq3_xxs_q8_K_generic. Codebook dot: `q3` holds
+// QK_K/4 grid-index bytes (two 4-byte grid entries per lane), `gas` the per-32
+// scale+sign u32s. The final 0.25 folds the grid's fixed 4x magnitude.
+void VecDotIQ3_XXSQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
+                       const void* vy, size_t by, int nrc) {
+  VT_CHECK(n % kQK_K == 0, "vec_dot_iq3_xxs_q8_K: n must be a multiple of 256");
+  VT_CHECK(nrc == 1, "vec_dot_iq3_xxs_q8_K: generic tier supports nrc == 1 only");
+  (void)nrc;
+  (void)bx;
+  (void)by;
+  (void)bs;
+
+  const BlockIQ3_XXS* x = static_cast<const BlockIQ3_XXS*>(vx);
+  const BlockQ8_K* y = static_cast<const BlockQ8_K*>(vy);
+  const int nb = n / kQK_K;
+
+  uint32_t aux32;
+  float sumf = 0.f;
+  for (int i = 0; i < nb; ++i) {
+    const float d = F16ToF32(x[i].d) * y[i].d;
+    const uint8_t* q3 = x[i].qs;
+    const uint8_t* gas = x[i].qs + kQK_K / 4;
+    const int8_t* q8 = y[i].qs;
+    int32_t bsum = 0;
+    for (int ib32 = 0; ib32 < kQK_K / 32; ++ib32) {
+      std::memcpy(&aux32, gas, sizeof(uint32_t));
+      gas += sizeof(uint32_t);
+      const uint32_t ls = 2 * (aux32 >> 28) + 1;
+      int32_t sumi = 0;
+      for (int l = 0; l < 4; ++l) {
+        const uint8_t* grid1 =
+            reinterpret_cast<const uint8_t*>(kIq3xxsGrid + q3[2 * l + 0]);
+        const uint8_t* grid2 =
+            reinterpret_cast<const uint8_t*>(kIq3xxsGrid + q3[2 * l + 1]);
+        const uint8_t signs = kKsignsIq2xs[(aux32 >> (7 * l)) & 127];
+        for (int j = 0; j < 4; ++j) {
+          sumi += grid1[j] * q8[j + 0] * ((signs & kKmaskIq2xs[j + 0]) ? -1 : 1);
+          sumi += grid2[j] * q8[j + 4] * ((signs & kKmaskIq2xs[j + 4]) ? -1 : 1);
+        }
+        q8 += 8;
+      }
+      q3 += 8;
+      bsum += sumi * static_cast<int32_t>(ls);
+    }
+    sumf += d * bsum;
+  }
+  *s = 0.25f * sumf;
+}
+
 }  // namespace
 
 VecDotFn BlockVecDot(DType dtype) {
   switch (dtype) {
-    case DType::kQ4_0: return &VecDotQ4_0Q8_0;  // quants.c:174
-    case DType::kQ8_0: return &VecDotQ8_0Q8_0;  // quants.c:400
-    case DType::kQ3_K: return &VecDotQ3_KQ8_K;  // quants.c:566
-    case DType::kQ4_K: return &VecDotQ4_KQ8_K;  // quants.c:645
-    case DType::kQ5_K: return &VecDotQ5_KQ8_K;  // quants.c:720
-    case DType::kQ6_K: return &VecDotQ6_KQ8_K;  // quants.c:800
+    case DType::kQ4_0: return &VecDotQ4_0Q8_0;        // quants.c:174
+    case DType::kQ8_0: return &VecDotQ8_0Q8_0;        // quants.c:400
+    case DType::kQ2_K: return &VecDotQ2_KQ8_K;        // quants.c:514
+    case DType::kQ3_K: return &VecDotQ3_KQ8_K;        // quants.c:566
+    case DType::kQ4_K: return &VecDotQ4_KQ8_K;        // quants.c:645
+    case DType::kQ5_K: return &VecDotQ5_KQ8_K;        // quants.c:720
+    case DType::kQ6_K: return &VecDotQ6_KQ8_K;        // quants.c:800
+    case DType::kIQ2_XXS: return &VecDotIQ2_XXSQ8_K;  // quants.c:855
+    case DType::kIQ3_XXS: return &VecDotIQ3_XXSQ8_K;  // quants.c:999
     default:
       // kQ8_K is the ACTIVATION encoding — upstream gives it no vec_dot row
       // (it is only ever the `y` side of the K-quant kernels above), so a

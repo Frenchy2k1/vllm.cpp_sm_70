@@ -122,6 +122,11 @@ vllm_cpp_add_test(test_deepseek_v4_moe vllm/models/test_deepseek_v4_moe.cpp)
 # stream, hash-by-tid routing, DSA select+compress, finiteness) + RED-first
 # miswires — NOT a real-checkpoint token gate (that is W8, multi-Spark, 156.7 GiB).
 vllm_cpp_add_test(test_deepseek_v4_forward vllm/models/test_deepseek_v4_forward.cpp)
+# DeepSeek-V4-Flash W2b — the `deepseek4` GGUF keep-quant TOWER materialization:
+# tiny synthetic GGUF (real blk.N.* names + Q8_0 keep-quant) -> accounting +
+# keep-quant residency + load->Forward end-to-end, RED-first (missing/leftover).
+vllm_cpp_add_test(test_deepseek_v4_gguf_load vllm/models/test_deepseek_v4_gguf_load.cpp)
+target_include_directories(test_deepseek_v4_gguf_load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 # DeepSeek-V4-Flash W7-DEVICE — the four NEW V4 op families' CUDA kernels
 # (src/vt/cuda/cuda_deepseek_v4.cu, dispatched through the OpProvider seam) each
 # unit-gated vs its landed HOST reference at small shape + the ForwardDevice

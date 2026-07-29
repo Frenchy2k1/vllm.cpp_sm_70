@@ -56,13 +56,20 @@
 // W1 (single-GB10 oracle run) is MEMORY-INFEASIBLE — needs multi-node TP / offload.
 #include "vllm/model_executor/models/deepseek_v4.h"
 
+#include <cmath>
+#include <cstring>
 #include <string>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -279,6 +286,484 @@ DeepseekV4Weights LoadDeepseekV4ForCausalLMWeights(
   DeepseekV4Weights w;
   w.params = p;
   w.accounted_tensors = accounted;
+  return w;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// W2b — the `deepseek4` GGUF keep-quant TOWER materialization.
+//
+// Wires the LANDED `blk.N.*` -> V4 name map (scripts/check-dsv4-gguf-namemap.py,
+// EXACT 1328/1328 coverage) + the LANDED keep-quant vec_dot (IQ2_XXS/IQ3_XXS/Q2_K,
+// CIQ) into the DeepseekV4 weight towers, so `unsloth/DeepSeek-V4-Flash-GGUF
+// UD-IQ2_XXS` (~91 GiB, the only single-GB10-fitting build) LOADS. MW/SEW roles
+// KEEP their ~2-3-bit blocks COMPRESSED (OwnGgufQuantBlocks, the memory enabler —
+// dequant-to-bf16 would need ~316 GiB and OOM-reboot the unified pool); the small
+// V/ET/HASH tensors dequant to f32/bf16 exactly as our other GGUF loaders do
+// (qwen3_5_gguf_weights.cpp is the structural mirror). The load ALSO dequants the
+// tiny-config CPU composition tower (`host`) so a loaded model can Forward.
+//
+// HONEST 3-state: the tiny-synthetic load->forward here is DERIVED + BUILD-VERIFIED
+// (structural, tiny shape, test_deepseek_v4_gguf_load.cpp). The REAL 91 GiB
+// checkpoint load + generate stays W8-final (operational: download + DGX) — the
+// name-map coverage vs the real 1328-tensor manifest is gated separately
+// (check-dsv4-gguf-namemap.py rc=0).
+namespace {
+
+// --- GGUF KV metadata readers (mirror qwen3_5_gguf_weights.cpp KvInt/KvFloat) ---
+int64_t GgKvInt(const GgufValue& v, const std::string& key) {
+  switch (v.TypeId()) {
+    case kGgufU8: return std::get<uint8_t>(v.v);
+    case kGgufI8: return std::get<int8_t>(v.v);
+    case kGgufU16: return std::get<uint16_t>(v.v);
+    case kGgufI16: return std::get<int16_t>(v.v);
+    case kGgufU32: return std::get<uint32_t>(v.v);
+    case kGgufI32: return std::get<int32_t>(v.v);
+    case kGgufU64: return static_cast<int64_t>(std::get<uint64_t>(v.v));
+    case kGgufI64: return std::get<int64_t>(v.v);
+    case kGgufBool: return std::get<bool>(v.v) ? 1 : 0;
+    default:
+      throw std::runtime_error("deepseek-v4 gguf: key " + key + " is not an integer");
+  }
+}
+double GgKvFloat(const GgufValue& v, const std::string& key) {
+  if (v.TypeId() == kGgufF32) return std::get<float>(v.v);
+  if (v.TypeId() == kGgufF64) return std::get<double>(v.v);
+  return static_cast<double>(GgKvInt(v, key));
+}
+int64_t ReqInt(const GgufFile& g, const std::string& key) {
+  const GgufValue* v = g.FindKv(key);
+  VT_CHECK(v != nullptr, "deepseek-v4 gguf: missing metadata key " + key);
+  return GgKvInt(*v, key);
+}
+int64_t OptInt(const GgufFile& g, const std::string& key, int64_t dflt) {
+  const GgufValue* v = g.FindKv(key);
+  return v != nullptr ? GgKvInt(*v, key) : dflt;
+}
+double OptFloat(const GgufFile& g, const std::string& key, double dflt) {
+  const GgufValue* v = g.FindKv(key);
+  return v != nullptr ? GgKvFloat(*v, key) : dflt;
+}
+
+std::string Blk(int64_t l, const std::string& suffix) {
+  return "blk." + std::to_string(l) + "." + suffix;
+}
+
+bool HasGgufTensor(const GgufFile& g, const std::string& name) {
+  for (const GgufTensorInfo& t : g.Tensors())
+    if (t.name == name) return true;
+  return false;
+}
+
+// --- host-tower dequant bridge (torch [out,in] row-major f32) ----------------
+// Reads the RAW ggml bytes (Q8_0/IQ2_XXS/IQ3_XXS/F32 are self-contained — no
+// sidecar scale), independent of the keep-quant OwnedTensor residency.
+std::vector<float> DqRowF32(const GgufFile& g, const std::string& name) {
+  const GgufTensorInfo& t = g.Get(name);
+  int64_t numel = 1;
+  for (int64_t d : t.shape) numel *= d;
+  return DequantGgufRowToF32(t.ggml_type, t.data, numel);
+}
+
+// --- tower materializers (route once, account, keep-quant or expand) ---------
+OwnedTensor MakeBf16Owned(const std::vector<uint16_t>& dq,
+                          const std::vector<int64_t>& shape, bool nk) {
+  OwnedTensor o;
+  o.dtype = vt::DType::kBF16;
+  o.rank = static_cast<int>(shape.size());
+  int64_t n = 1;
+  for (int i = 0; i < o.rank; ++i) {
+    o.shape[i] = shape[i];
+    n *= shape[i];
+  }
+  VT_CHECK(static_cast<int64_t>(dq.size()) == n, "deepseek-v4 gguf: bf16 size mismatch");
+  o.bytes.resize(static_cast<size_t>(n) * sizeof(uint16_t));
+  std::memcpy(o.bytes.data(), dq.data(), o.bytes.size());
+  o.nk = nk;
+  return o;
+}
+OwnedTensor MakeF32Owned(const std::vector<float>& dq,
+                         const std::vector<int64_t>& shape) {
+  OwnedTensor o;
+  o.dtype = vt::DType::kF32;
+  o.rank = static_cast<int>(shape.size());
+  int64_t n = 1;
+  for (int i = 0; i < o.rank; ++i) {
+    o.shape[i] = shape[i];
+    n *= shape[i];
+  }
+  VT_CHECK(static_cast<int64_t>(dq.size()) == n, "deepseek-v4 gguf: f32 size mismatch");
+  o.bytes.resize(static_cast<size_t>(n) * sizeof(float));
+  std::memcpy(o.bytes.data(), dq.data(), o.bytes.size());
+  return o;
+}
+
+// A per-load routing context: the file, the residency policy, and the set of
+// consumed tensor names (the totality/accounting contract — every routed tensor
+// is recorded, and a leftover unroutes-to-fail at the end).
+struct V4GgufCtx {
+  const GgufFile& g;
+  const GgufLoadPolicy& pol;
+  std::unordered_set<std::string> consumed;
+
+  const GgufTensorInfo& Take(const std::string& name) {
+    const GgufTensorInfo& t = g.Get(name);  // throws (unmapped/missing -> FAIL)
+    consumed.insert(name);
+    return t;
+  }
+  // 2-D [out,in] matmul weight: keep its blocks (MW keep-quant) else expand bf16,
+  // both in the file's own [N,K] order (nk=true) — GGUF disk order IS MatmulBT.
+  OwnedTensor Mw(const std::string& name) {
+    const GgufTensorInfo& t = Take(name);
+    VT_CHECK(t.shape.size() == 2, "deepseek-v4 gguf: expected 2-D MW " + name);
+    const GgufResidency r = pol.Route(t, GgufTensorRole::kMatmulWeight);
+    if (r != GgufResidency::kExpandBf16) {
+      return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1]);
+    }
+    return MakeBf16Owned(DequantGgufRowToBf16(t.ggml_type, t.data, t.shape[0] * t.shape[1]),
+                         {t.shape[0], t.shape[1]}, /*nk=*/true);
+  }
+  // Stacked [E,out,in] expert weight: KEEP the whole block slab COMPRESSED (each
+  // expert = out whole rows = whole blocks, so E*out rows is one contiguous keep),
+  // else expand to bf16 [E*out,in].
+  OwnedTensor Sew(const std::string& name, int64_t experts) {
+    const GgufTensorInfo& t = Take(name);
+    VT_CHECK(t.shape.size() == 3 && t.shape[0] == experts,
+             "deepseek-v4 gguf: expected [E,out,in] expert tensor " + name);
+    const int64_t rows = t.shape[0] * t.shape[1];  // E*out
+    const int64_t k = t.shape[2];                  // in
+    const GgufResidency r = pol.Route(t, GgufTensorRole::kStackedExpertWeight);
+    if (r != GgufResidency::kExpandBf16) {
+      return OwnGgufQuantBlocks(t, rows, k, /*row_offset=*/0);
+    }
+    return MakeBf16Owned(DequantGgufRowToBf16(t.ggml_type, t.data, rows * k),
+                         {rows, k}, /*nk=*/true);
+  }
+  // A value/table tensor whose bytes are rewritten (norm/bias/scale/sink/table/
+  // embed) — NEVER keep-quant. Asserts the policy agrees (totality) then dequants
+  // to f32 in the file's torch shape.
+  OwnedTensor Vec(const std::string& name, GgufTensorRole role) {
+    const GgufTensorInfo& t = Take(name);
+    VT_CHECK(pol.Route(t, role) == GgufResidency::kExpandBf16,
+             std::string("deepseek-v4 gguf: a ") + Name(role) +
+                 " tensor must not keep quant blocks: " + name);
+    return MakeF32Owned(DqRowF32(g, name), t.shape);
+  }
+};
+
+// Fill the tiny-config CPU composition host field for one flat weight.
+std::vector<float> HostVec(const GgufFile& g, const std::string& name) {
+  return DqRowF32(g, name);
+}
+
+}  // namespace
+
+DeepseekV4Params DeepseekV4ParamsFromGguf(const GgufFile& g) {
+  const GgufValue* arch = g.FindKv("general.architecture");
+  VT_CHECK(arch != nullptr && arch->TypeId() == kGgufString,
+           "deepseek-v4 gguf: general.architecture must be a string");
+  VT_CHECK(std::get<std::string>(arch->v) == "deepseek4",
+           "deepseek-v4 gguf: expected general.architecture 'deepseek4', got '" +
+               std::get<std::string>(arch->v) + "'");
+  const std::string p = "deepseek4.";
+
+  DeepseekV4Params d;
+  d.hidden_size = ReqInt(g, p + "embedding_length");
+  d.num_hidden_layers = ReqInt(g, p + "block_count");
+  d.num_attention_heads = ReqInt(g, p + "attention.head_count");
+  d.num_key_value_heads = OptInt(g, p + "attention.head_count_kv", 1);
+  d.head_dim = ReqInt(g, p + "attention.key_length");
+  d.qk_rope_head_dim = OptInt(g, p + "rope.dimension_count", 64);
+  d.q_lora_rank = ReqInt(g, p + "attention.q_lora_rank");
+  d.o_lora_rank = ReqInt(g, p + "attention.output_lora_rank");
+  d.o_groups = ReqInt(g, p + "attention.output_group_count");
+  d.sliding_window = OptInt(g, p + "attention.sliding_window", 0);
+  d.rope_theta = OptFloat(g, p + "rope.freq_base", 10000.0);
+  d.compress_rope_theta = OptFloat(g, p + "attention.compress_rope_freq_base", 160000.0);
+  d.rms_norm_eps =
+      static_cast<float>(OptFloat(g, p + "attention.layer_norm_rms_epsilon", 1e-6));
+  d.max_position_embeddings = OptInt(g, p + "context_length", 0);
+  d.num_nextn_predict_layers = OptInt(g, p + "nextn_predict_layers", 0);
+
+  // MoE.
+  d.n_routed_experts = ReqInt(g, p + "expert_count");
+  d.num_experts_per_tok = ReqInt(g, p + "expert_used_count");
+  d.n_shared_experts = OptInt(g, p + "expert_shared_count", 0);
+  d.moe_intermediate_size = ReqInt(g, p + "expert_feed_forward_length");
+  d.num_hash_layers = OptInt(g, p + "hash_layer_count", 0);
+  d.routed_scaling_factor = OptFloat(g, p + "expert_weights_scale", 1.0);
+  d.swiglu_limit = OptFloat(g, p + "swiglu_clamp", 0.0);
+  d.norm_topk_prob = OptInt(g, p + "norm_topk_prob", 1) != 0;
+  // The `deepseek4` arch is fixed sqrtsoftplus/noaux_tc (expert_gating_func==4);
+  // the forward selects those unconditionally, so we do not re-validate the enum.
+  d.scoring_func = "sqrtsoftplus";
+  d.topk_method = "noaux_tc";
+  d.expert_dtype = "fp4";
+
+  // MHC.
+  d.hc_mult = ReqInt(g, p + "hyper_connection.count");
+  d.hc_sinkhorn_iters = OptInt(g, p + "hyper_connection.sinkhorn_iterations", 20);
+  d.hc_eps = OptFloat(g, p + "hyper_connection.epsilon", 1e-6);
+
+  // DSA.
+  d.index_head_dim = OptInt(g, p + "attention.indexer.key_length", 0);
+  d.index_n_heads = OptInt(g, p + "attention.indexer.head_count", 0);
+  d.index_topk = OptInt(g, p + "attention.indexer.top_k", 0);
+  if (const GgufValue* cr = g.FindKv(p + "attention.compress_ratios");
+      cr != nullptr && cr->TypeId() == kGgufArray) {
+    for (const GgufValue& e : std::get<GgufArray>(cr->v).elems)
+      d.compress_ratios.push_back(GgKvInt(e, "compress_ratios"));
+  }
+
+  // vocab: prefer the token_embd leading (out) dim, else the kv.
+  const GgufValue* vk = g.FindKv(p + "vocab_size");
+  d.vocab_size = vk != nullptr ? GgKvInt(*vk, p + "vocab_size")
+                               : g.Get("token_embd.weight").shape[0];
+
+  // Minimal self-consistency (the GGUF is the source of geometry truth — the
+  // strict head_dim==512/sqrtsoftplus assertions live in ParseDeepseekV4Params
+  // for the safetensors path; a tiny synthetic GGUF uses a small head_dim).
+  VT_CHECK(d.hidden_size > 0 && d.num_hidden_layers > 0 && d.head_dim > 0,
+           "deepseek-v4 gguf: degenerate geometry");
+  VT_CHECK(d.n_routed_experts > 0, "deepseek-v4 gguf: n_routed_experts must be > 0");
+  VT_CHECK(d.hc_mult > 0, "deepseek-v4 gguf: hc_mult must be > 0 (MHC is structural)");
+  VT_CHECK(static_cast<int64_t>(d.compress_ratios.size()) == d.num_hidden_layers,
+           "deepseek-v4 gguf: compress_ratios length must equal block_count");
+  return d;
+}
+
+HfConfig DeepseekV4HfConfigFromGguf(const GgufFile& g) {
+  // The GGUF is the source of geometry truth; resolve it ONCE (throws on a
+  // non-deepseek4 arch or a missing required key) and republish it.
+  const DeepseekV4Params p = DeepseekV4ParamsFromGguf(g);
+
+  HfConfig c;
+  // Keep llama.cpp's GGUF family key in model_type, but map `architectures` onto
+  // the registered vLLM model class so ModelRegistry::Resolve routes a deepseek4
+  // file into the DeepSeek-V4 factory — the same trick HfConfigFromGguf uses to
+  // map the qwen35* keys onto the Qwen3.5 wrappers.
+  c.model_type = "deepseek4";
+  c.architectures = {"DeepseekV4ForCausalLM"};
+  c.hidden_size = p.hidden_size;
+  c.num_hidden_layers = p.num_hidden_layers;
+  c.vocab_size = p.vocab_size;
+  c.num_attention_heads = p.num_attention_heads;
+  c.num_key_value_heads = p.num_key_value_heads;
+  c.head_dim = p.head_dim;
+  c.rms_norm_eps = p.rms_norm_eps;
+  c.rope_theta = p.rope_theta;
+  c.max_position_embeddings = p.max_position_embeddings;
+  c.torch_dtype = "bfloat16";
+
+  // Republish the DeepSeek-V4 scalars the registry parse hook
+  // (ParseDeepseekV4Config -> ParseDeepseekV4Params) reads from config.raw, so
+  // that hook validates the SAME geometry this GGUF describes. The weight loader
+  // itself re-derives from the GGUF KV (LoadDeepseekV4FromGguf ignores config).
+  nlohmann::json& raw = c.raw = nlohmann::json::object();
+  raw["hidden_size"] = p.hidden_size;
+  raw["num_hidden_layers"] = p.num_hidden_layers;
+  raw["vocab_size"] = p.vocab_size;
+  raw["num_attention_heads"] = p.num_attention_heads;
+  raw["num_key_value_heads"] = p.num_key_value_heads;
+  raw["head_dim"] = p.head_dim;
+  raw["qk_rope_head_dim"] = p.qk_rope_head_dim;
+  raw["q_lora_rank"] = p.q_lora_rank;
+  raw["o_lora_rank"] = p.o_lora_rank;
+  raw["o_groups"] = p.o_groups;
+  raw["sliding_window"] = p.sliding_window;
+  raw["rope_theta"] = p.rope_theta;
+  raw["compress_rope_theta"] = p.compress_rope_theta;
+  raw["rms_norm_eps"] = p.rms_norm_eps;
+  raw["max_position_embeddings"] = p.max_position_embeddings;
+  raw["num_nextn_predict_layers"] = p.num_nextn_predict_layers;
+  raw["n_routed_experts"] = p.n_routed_experts;
+  raw["num_experts_per_tok"] = p.num_experts_per_tok;
+  raw["moe_intermediate_size"] = p.moe_intermediate_size;
+  raw["n_shared_experts"] = p.n_shared_experts;
+  raw["norm_topk_prob"] = p.norm_topk_prob;
+  raw["routed_scaling_factor"] = p.routed_scaling_factor;
+  raw["swiglu_limit"] = p.swiglu_limit;
+  raw["scoring_func"] = p.scoring_func;
+  raw["topk_method"] = p.topk_method;
+  raw["num_hash_layers"] = p.num_hash_layers;
+  raw["expert_dtype"] = p.expert_dtype;
+  raw["hc_mult"] = p.hc_mult;
+  raw["hc_sinkhorn_iters"] = p.hc_sinkhorn_iters;
+  raw["hc_eps"] = p.hc_eps;
+  raw["index_head_dim"] = p.index_head_dim;
+  raw["index_n_heads"] = p.index_n_heads;
+  raw["index_topk"] = p.index_topk;
+  raw["compress_ratios"] = p.compress_ratios;
+  return c;
+}
+
+DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& config,
+                                        const GgufLoadPolicy* policy) {
+  (void)config;  // params resolved from the GGUF KV (self-describing vehicle)
+  const GgufLoadPolicy env = GgufLoadPolicy::FromEnv();
+  const GgufLoadPolicy& pol = policy != nullptr ? *policy : env;
+  const DeepseekV4Params p = DeepseekV4ParamsFromGguf(g);
+
+  DeepseekV4Weights w;
+  w.params = p;
+  V4GgufCtx ctx{g, pol, {}};
+
+  const int64_t H = p.hidden_size;
+  const int64_t nh = p.num_attention_heads;
+  const int64_t hd = p.head_dim;
+  const int64_t qlr = p.q_lora_rank;
+  const int64_t ne = p.n_routed_experts;
+  const int64_t topk = p.num_experts_per_tok;
+  const int64_t mi = p.moe_intermediate_size;
+  const int64_t hc = p.hc_mult;
+  const int64_t inh = p.index_n_heads;
+  const int64_t ihd = p.index_head_dim;
+  const bool tied = !HasGgufTensor(g, "output.weight");
+
+  // ── model-level tower slots ─────────────────────────────────────────────
+  DeepseekV4GgufWeights& tw = w.gguf;
+  tw.embed = ctx.Vec("token_embd.weight", GgufTensorRole::kEmbeddingTable);
+  tw.lm_head = tied ? ctx.Vec("token_embd.weight", GgufTensorRole::kEmbeddingTable)
+                    : ctx.Mw("output.weight");
+  tw.final_norm = ctx.Vec("output_norm.weight", GgufTensorRole::kVector);
+  tw.hc_head_base = ctx.Vec("output_hc_base.weight", GgufTensorRole::kVector);
+  tw.hc_head_fn = ctx.Vec("output_hc_fn.weight", GgufTensorRole::kVector);
+  tw.hc_head_scale = ctx.Vec("output_hc_scale.weight", GgufTensorRole::kVector);
+
+  // ── host composition tower (dequant bridge) ─────────────────────────────
+  DeepseekV4HostWeights& hw = w.host;
+  hw.embed = HostVec(g, "token_embd.weight");
+  hw.lm_head = tied ? hw.embed : HostVec(g, "output.weight");
+  hw.final_norm_weight = HostVec(g, "output_norm.weight");
+  hw.hc_head_fn = HostVec(g, "output_hc_fn.weight");
+  hw.hc_head_base = HostVec(g, "output_hc_base.weight");
+  const std::vector<float> hhs = HostVec(g, "output_hc_scale.weight");
+  hw.hc_head_scale = hhs.empty() ? 0.0f : hhs[0];
+  hw.layers.resize(static_cast<size_t>(p.num_hidden_layers));
+
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    DeepseekV4GgufLayerWeights lw;
+    DeepseekV4LayerHostWeights& hl = hw.layers[static_cast<size_t>(l)];
+    lw.is_hash = p.is_hash_layer(l);
+    lw.has_compressor = p.has_compressor(l);
+    lw.has_indexer = p.has_indexer(l);
+
+    // 512-wide MLA (MW keep-quant) + norms/sink (V).
+    lw.wq_a = ctx.Mw(Blk(l, "attn_q_a.weight"));
+    lw.wq_b = ctx.Mw(Blk(l, "attn_q_b.weight"));
+    lw.wkv = ctx.Mw(Blk(l, "attn_kv.weight"));
+    lw.wo_a = ctx.Mw(Blk(l, "attn_output_a.weight"));
+    lw.wo_b = ctx.Mw(Blk(l, "attn_output_b.weight"));
+    lw.attn_norm = ctx.Vec(Blk(l, "attn_norm.weight"), GgufTensorRole::kVector);
+    lw.q_a_norm = ctx.Vec(Blk(l, "attn_q_a_norm.weight"), GgufTensorRole::kVector);
+    lw.kv_a_norm = ctx.Vec(Blk(l, "attn_kv_a_norm.weight"), GgufTensorRole::kVector);
+    lw.attn_sink = ctx.Vec(Blk(l, "attn_sinks.weight"), GgufTensorRole::kVector);
+    lw.ffn_norm = ctx.Vec(Blk(l, "ffn_norm.weight"), GgufTensorRole::kVector);
+
+    // MHC per-layer mixing (V).
+    lw.hc_attn_base = ctx.Vec(Blk(l, "hc_attn_base.weight"), GgufTensorRole::kVector);
+    lw.hc_attn_fn = ctx.Vec(Blk(l, "hc_attn_fn.weight"), GgufTensorRole::kVector);
+    lw.hc_attn_scale = ctx.Vec(Blk(l, "hc_attn_scale.weight"), GgufTensorRole::kVector);
+    lw.hc_ffn_base = ctx.Vec(Blk(l, "hc_ffn_base.weight"), GgufTensorRole::kVector);
+    lw.hc_ffn_fn = ctx.Vec(Blk(l, "hc_ffn_fn.weight"), GgufTensorRole::kVector);
+    lw.hc_ffn_scale = ctx.Vec(Blk(l, "hc_ffn_scale.weight"), GgufTensorRole::kVector);
+
+    // MoE: router gate (MW), 256 routed experts + shared (SEW/MW keep-quant),
+    // the hash `tid2eid` (hash layers) or the noaux_tc `exp_probs_b` bias.
+    lw.moe_gate = ctx.Mw(Blk(l, "ffn_gate_inp.weight"));
+    lw.moe_gate_exps = ctx.Sew(Blk(l, "ffn_gate_exps.weight"), ne);
+    lw.moe_up_exps = ctx.Sew(Blk(l, "ffn_up_exps.weight"), ne);
+    lw.moe_down_exps = ctx.Sew(Blk(l, "ffn_down_exps.weight"), ne);
+    lw.shared_gate = ctx.Mw(Blk(l, "ffn_gate_shexp.weight"));
+    lw.shared_up = ctx.Mw(Blk(l, "ffn_up_shexp.weight"));
+    lw.shared_down = ctx.Mw(Blk(l, "ffn_down_shexp.weight"));
+    if (lw.is_hash) {
+      lw.tid2eid = ctx.Vec(Blk(l, "ffn_gate_tid2eid.weight"), GgufTensorRole::kVector);
+    } else {
+      lw.e_score_bias = ctx.Vec(Blk(l, "exp_probs_b.bias"), GgufTensorRole::kVector);
+    }
+
+    // DSA compressor (compress_ratio != 0) + Lightning-Indexer (== 4).
+    if (lw.has_compressor) {
+      lw.comp_ape = ctx.Vec(Blk(l, "attn_compressor_ape.weight"), GgufTensorRole::kVector);
+      lw.comp_wgate = ctx.Mw(Blk(l, "attn_compressor_gate.weight"));
+      lw.comp_wkv = ctx.Mw(Blk(l, "attn_compressor_kv.weight"));
+      lw.comp_norm = ctx.Vec(Blk(l, "attn_compressor_norm.weight"), GgufTensorRole::kVector);
+    }
+    if (lw.has_indexer) {
+      lw.idx_wq_b = ctx.Mw(Blk(l, "indexer.attn_q_b.weight"));
+      lw.idx_proj = ctx.Vec(Blk(l, "indexer.proj.weight"), GgufTensorRole::kVector);
+      lw.idx_comp_ape =
+          ctx.Vec(Blk(l, "indexer_compressor_ape.weight"), GgufTensorRole::kVector);
+      lw.idx_comp_wgate = ctx.Mw(Blk(l, "indexer_compressor_gate.weight"));
+      lw.idx_comp_wkv = ctx.Mw(Blk(l, "indexer_compressor_kv.weight"));
+      lw.idx_comp_norm =
+          ctx.Vec(Blk(l, "indexer_compressor_norm.weight"), GgufTensorRole::kVector);
+    }
+
+    // ── host bridge for THIS layer (dequant the slots the CPU forward reads) ──
+    hl.attn_norm_weight = HostVec(g, Blk(l, "attn_norm.weight"));
+    hl.ffn_norm_weight = HostVec(g, Blk(l, "ffn_norm.weight"));
+    hl.hc_attn_fn = HostVec(g, Blk(l, "hc_attn_fn.weight"));
+    hl.hc_attn_base = HostVec(g, Blk(l, "hc_attn_base.weight"));
+    hl.hc_attn_scale = HostVec(g, Blk(l, "hc_attn_scale.weight"));
+    hl.hc_ffn_fn = HostVec(g, Blk(l, "hc_ffn_fn.weight"));
+    hl.hc_ffn_base = HostVec(g, Blk(l, "hc_ffn_base.weight"));
+    hl.hc_ffn_scale = HostVec(g, Blk(l, "hc_ffn_scale.weight"));
+    hl.wq_a = HostVec(g, Blk(l, "attn_q_a.weight"));
+    hl.q_norm_weight = HostVec(g, Blk(l, "attn_q_a_norm.weight"));
+    hl.wq_b = HostVec(g, Blk(l, "attn_q_b.weight"));
+    hl.wkv = HostVec(g, Blk(l, "attn_kv.weight"));
+    hl.kv_norm_weight = HostVec(g, Blk(l, "attn_kv_a_norm.weight"));
+    hl.attn_sink = HostVec(g, Blk(l, "attn_sinks.weight"));
+    hl.wo_a = HostVec(g, Blk(l, "attn_output_a.weight"));
+    hl.wo_b = HostVec(g, Blk(l, "attn_output_b.weight"));
+    hl.gate_weight = HostVec(g, Blk(l, "ffn_gate_inp.weight"));
+    if (lw.is_hash) {
+      const std::vector<float> t2e = HostVec(g, Blk(l, "ffn_gate_tid2eid.weight"));
+      hl.tid2eid.resize(t2e.size());
+      for (size_t i = 0; i < t2e.size(); ++i)
+        hl.tid2eid[i] = static_cast<int32_t>(std::lround(t2e[i]));
+    } else {
+      hl.gate_bias = HostVec(g, Blk(l, "exp_probs_b.bias"));
+    }
+    hl.shared_w1 = HostVec(g, Blk(l, "ffn_gate_shexp.weight"));
+    hl.shared_w3 = HostVec(g, Blk(l, "ffn_up_shexp.weight"));
+    hl.shared_w2 = HostVec(g, Blk(l, "ffn_down_shexp.weight"));
+    hl.exp_w1 = HostVec(g, Blk(l, "ffn_gate_exps.weight"));
+    hl.exp_w3 = HostVec(g, Blk(l, "ffn_up_exps.weight"));
+    hl.exp_w2 = HostVec(g, Blk(l, "ffn_down_exps.weight"));
+    if (lw.has_compressor) {
+      hl.comp_wgate = HostVec(g, Blk(l, "attn_compressor_gate.weight"));
+      hl.comp_ape = HostVec(g, Blk(l, "attn_compressor_ape.weight"));
+      hl.comp_norm_weight = HostVec(g, Blk(l, "attn_compressor_norm.weight"));
+    }
+    if (lw.has_indexer) {
+      // Tiny-config STRUCTURAL bridge (documented divergence, deepseek_v4.cpp):
+      // the host indexer uses a simplified q/k/proj triple — idx_wq <- the
+      // indexer query proj, idx_wproj <- the weights_proj, idx_wk <- the
+      // indexer compressor kv (the real model derives the key from the
+      // compressed latent). The full geometry is the W7-device / W8 seam.
+      hl.idx_wq = HostVec(g, Blk(l, "indexer.attn_q_b.weight"));
+      hl.idx_wproj = HostVec(g, Blk(l, "indexer.proj.weight"));
+      hl.idx_wk = HostVec(g, Blk(l, "indexer_compressor_kv.weight"));
+    }
+
+    tw.layers.push_back(std::move(lw));
+  }
+
+  // ── the ACCOUNTING gate: every file tensor must have been routed exactly once
+  //    (none unmapped, none leftover) — the C++ half of the name-map contract
+  //    (scripts/check-dsv4-gguf-namemap.py gates the real 1328-tensor manifest). ─
+  for (const GgufTensorInfo& t : g.Tensors()) {
+    VT_CHECK(ctx.consumed.count(t.name) != 0,
+             "deepseek-v4 gguf loader: LEFTOVER tensor not covered by the blk.N.* "
+             "name map: " + t.name);
+  }
+  w.accounted_tensors = static_cast<int64_t>(ctx.consumed.size());
+  w.has_gguf_weights = true;
+  w.has_host_weights = true;
+  // Silence unused in a non-indexer/degenerate tiny config.
+  (void)nh; (void)hd; (void)qlr; (void)topk; (void)mi; (void)hc; (void)inh; (void)ihd; (void)H;
   return w;
 }
 

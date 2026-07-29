@@ -939,3 +939,193 @@ tower present); **W8** — the full paged-engine strict/near-tie gate vs a real 
 156.7 GiB NVFP4 / 167 GiB fp8 do not fit ONE GB10); the **single-Spark IQ2_XXS-GGUF vehicle**
 additionally needs the GGUF `blk.N.*` name-map (W2, checkpoint-download-blocked on the 1328-tensor
 manifest).
+
+---
+
+## W8 — single-Spark keep-quant memory enabler + GGUF name-map (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`)
+
+**Base:** `main` HEAD `4d618f59`. Isolated worktree `/home/mudler/_git/vllm.cpp-w8-run` (branch
+`deepseek-v4-w8-run`), CPU-only Debug gate; DGX SSH used ONLY read-only (host/disk/mem check) + HF
+HTTP-range header fetch. Foreground, NOT pushed. W8 was scoped as "the actual single-Spark run +
+benchmark"; this lane lands the two GATING prerequisites of that run and reports the run itself as
+the honest residual (it is blocked on unimplemented W2b code, not just memory/download).
+
+### W8.1 The keep-quant memory enabler (the crux) — LANDED + GATED
+The stated crux: DeepSeek-V4-Flash is 158 B params; the `UD-IQ2_XXS` GGUF is ~91 GiB **because the
+weights stay ~2-3-bit**. Dequant-to-bf16 would need ~316 GiB and OOM-reboot the DGX (unified pool).
+So the routed experts MUST keep-quant. Our engine did keep-quant for the six k-quant block types via
+`kMatmulBTQuant` but IQ2_XXS/Q2_K were DEQUANT-ONLY (`HasQuantDotKernel` false → expand-to-bf16).
+
+W8 adds the keep-quant `vec_dot` for the codebook encodings, each a 1:1 port of the ggml reference
+(`llama.cpp @ 237ad9b96 ggml/src/ggml-cpu/quants.c`):
+- `VecDotIQ2_XXSQ8_K` <- `quants.c:855` `ggml_vec_dot_iq2_xxs_q8_K_generic`;
+- `VecDotIQ3_XXSQ8_K` <- `quants.c:999` `ggml_vec_dot_iq3_xxs_q8_K_generic`;
+- `VecDotQ2_KQ8_K`    <- `quants.c:514` `ggml_vec_dot_q2_K_q8_K_generic`.
+Plus: the shared codebook tables (`cpu_quant_iq_tables.h`: `iq2xxs_grid`/`iq3xxs_grid`/`ksigns`/`kmask`,
+moved out of the dequant anon-namespace so the vec_dots share ONE definition), `DequantIQ3_XXS`
+(`ggml-quants.c:2503`, the reference for the gate + the expand fallback), the `kIQ3_XXS` dtype +
+geometry (id 18, 98 B block) + three block structs (`BlockQ2_K`/`BlockIQ2_XXS`/`BlockIQ3_XXS`), three
+Q8_K traits rows (making `HasQuantDotKernel` TRUE for all three), the two exhaustive `DType` switches
+in `ops.cpp`, and the ggml id-18 sizing trait in `gguf_reader.cpp`.
+
+**HONEST CORRECTION of the brief ("IQ2_XXS + Q2_K"):** reading the REAL `UD-IQ2_XXS` manifest, the
+routed experts are **IQ2_XXS** (`ffn_gate_exps`/`ffn_up_exps`) + **IQ3_XXS** (`ffn_down_exps`) — Q2_K
+is the sibling `UD-Q2_K_XL` vehicle, NOT in the IQ2_XXS build. IQ3_XXS is therefore an EQUAL gating
+prerequisite (without it `ffn_down_exps` alone OOMs). All three landed so both vehicles keep-quant.
+
+**HONEST finding on "the CUDA path":** there is NO CUDA keep-quant `vec_dot` for ANY k-quant —
+`kMatmulBTQuant` is registered on `kCPU` alone (verified: no CUDA vec_dot/mmvq/mmq in `src/vt/cuda`).
+Keep-quant is a CPU-tier feature; on GB10 it runs on the 20 ARM cores against the unified pool, so
+IQ2_XXS/IQ3_XXS/Q2_K match the six existing k-quants exactly. Extending "the CUDA path" is N/A.
+
+**Gate (`tests/vt/test_ops_quant_dot.cpp`, the same machinery as the six k-quants):** the three types
+added to `kWeightCases`. **19 cases / 130444 assertions GREEN** (CPU Debug, new TUs `-Werror` clean):
+`vec_dot` vs an INDEPENDENT f64 dequant-then-dot (≤1e-5·L1 — a tight, cancellation-robust bound),
+`MatmulBTQuant` NMSE ≤5e-4 vs dequant-f32, bit-exact across thread counts 1/2/4, ragged-K rejection.
+**RED-first PROVEN:** perturbing the IQ2_XXS `0.125` fold (→`0.130`) fails 2 cases / 18 assertions,
+revert restores 19/130444. This is REUSABLE beyond V4 (any IQ2_XXS/IQ3_XXS/Q2_K GGUF now keep-quant).
+
+### W8.2 The GGUF `blk.N.*` name-map + FULL coverage — LANDED + GATED
+The real 1328-tensor manifest was read from the shard GGUF HEADERS via HF HTTP-range (shard-1 full 5.25 MB
++ 4 MB of shards 2/3) — **no 91 GB download**. Confirmed `general.architecture=deepseek4`,
+`split.tensors.count=1328`, and the full `deepseek4.*` config-KV (block_count=43, hash_layer_count=3,
+expert_count=256, key/value_length=512, q_lora_rank=1024, output_group_count=8, sinkhorn_iterations=20,
+indexer head=64/key=128/top_k=512, compress_rope_freq_base=160000). Topology (verified in the manifest):
+43 layers, hash layers {0,1,2}, DSA indexer on the 21 `compress_ratio==4` layers ({2}∪even{4..42}),
+compressor on the 41 `compress_ratio!=0` layers; 4 per-layer archetypes (2×24 + 1×34 + 20×28 + 20×34
+tensors) + 6 top-level = 1328.
+
+`scripts/check-dsv4-gguf-namemap.py` encodes the 41-slot `blk.N.*`→V4 name map (each slot tagged with
+its `GgufTensorRole` so keep-quant residency is derivable) + the topology, GENERATES the full expected
+tensor set, and asserts **EXACT set-equality** against the committed real manifest
+(`scripts/dsv4_gguf_manifest_names.txt`): **1328/1328 mapped, 0 unmapped, 0 leftover, rc=0**. The V4
+registry GGUF reject is replaced with a PRECISE message (keep-quant + name-map landed; W2b pending) —
+an honest state advance, not a fake-accept path (W2b is unimplemented, so a full lift would misbehave).
+
+### W8.3 The RUN — HONEST RESIDUAL (did NOT execute; NOT faked)
+The run did not execute and was not simulated. It is blocked on the unimplemented **W2b**: materialize
+the GGUF keep-quant blocks (+ the F32 MHC/DSA/norm tensors) into the `DeepseekV4` weight towers via the
+name map — a genuine engineering brick, not just memory/download. (The DGX was also contended: 87 GiB
+of the 119 GiB unified pool already in use by the LocalAI containers.) 3-state: the keep-quant kernels
++ name-map are **DERIVED + BUILD-VERIFIED + UNIT-GATED**; the run is **NOT DONE**. The model-matrix
+DeepSeek-V4 row therefore stays `SPIKE`.
+
+**Resume command (exact):** land W2b (GGUF→tower materialization through `check-dsv4-gguf-namemap.py`'s
+map + the landed keep-quant `vt::DType`s) → on DGX: free disk ≥100 GiB, `flock $HOME/gpu.lock`,
+`docker stop local-ai-worker` (restore `--restart=always`+start after), gpu_mem LOW → download
+`unsloth/DeepSeek-V4-Flash-GGUF/UD-IQ2_XXS` (3 shards, ~91 GB) → keep-quant load into `DeepseekV4Model`
+→ `ForwardDevice` greedy gen → gate = our-engine self-consistency (run-to-run deterministic greedy) +
+coherent output; benchmark TPOT/throughput/peak-mem, llama.cpp-on-card as the competitor floor if it
+loads the same GGUF, else ours-only honestly.
+
+### W8.4 Landed-vs-residual
+- **Landed (W8):** keep-quant `vec_dot` for IQ2_XXS/IQ3_XXS/Q2_K (`KERNEL-QUANT-CIQ-IQUANT`, the memory
+  enabler, gated + RED-first) + the `blk.N.*`→V4 name-map with EXACT 1328-tensor coverage + the precise
+  registry message.
+- **Residual:** W2b (GGUF→tower materialization) → then the RUN (download + GB10 greedy gen +
+  self-consistency/coherence gate + benchmark). W2b is the single remaining engineering brick before a
+  real single-Spark DeepSeek-V4 generation.
+
+### W8.5 W8-final — entrypoint wiring LANDED + GATED; the RUN re-scoped to a CODE blocker (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`, base `376e186b`)
+W2b (GGUF→tower materialization) landed at `376e186b`, so this lane took the two remaining W8-final
+pieces: the **entrypoint wiring** (the "one small code piece W2b named") and the **real run**.
+
+**Entrypoint wiring — LANDED + GATED.** A `deepseek4` arm now exists in the top-level GGUF dispatch:
+- `DeepseekV4HfConfigFromGguf(gguf)` (`deepseek_v4_weights.cpp`, decl in `deepseek_v4.h`) resolves the
+  params via the existing `DeepseekV4ParamsFromGguf`, sets `architectures = {"DeepseekV4ForCausalLM"}`
+  (mapping llama.cpp's `general.architecture=deepseek4` onto the registered vLLM model class, exactly as
+  `HfConfigFromGguf` maps the `qwen35*` keys), and republishes the geometry into the typed fields +
+  `config.raw` so the registry parse hook `ParseDeepseekV4Config` validates the same geometry.
+- `LoadedEngine::FromModelDir` now calls `HfConfigFromGgufDispatch(gguf)` (anon-ns helper) which peeks
+  `general.architecture` and routes `deepseek4`→the V4 builder, everything else→`HfConfigFromGguf`.
+  Downstream (`ModelRegistry::Resolve` → tokenizer → `Load`→`LoadDeepseekV4FromGguf`) is unchanged.
+- **Gate:** `test_deepseek_v4_gguf_load` **6/6 · 168** (CPU Release, full-library `-Werror`-clean build):
+  new case asserts `architectures[0]=="DeepseekV4ForCausalLM"`, `model_type=="deepseek4"`, the `raw`
+  scalars the parse hook reads (`hc_mult`, `n_routed_experts`, `scoring_func=sqrtsoftplus`,
+  `expert_dtype=fp4`, `compress_ratios`), and `ModelRegistry::Resolve(c)`→the V4 factory
+  (`is_dense_model=false`). The qwen GGUF path is byte-neutral (`test_model_registry` 24/24 green).
+
+**The RUN — did NOT execute; re-scoped to a CODE blocker (NOT download/box), provable from source.**
+The real single-Spark load was NOT attempted because it would OOM-reboot the box: the forward
+(`ForwardComposeImpl`, both `Forward` and `ForwardDevice`) composes off the FULLY-DEQUANTIZED f32
+`weights.host` tower, and `LoadDeepseekV4FromGguf` builds that host tower **unconditionally** — every
+routed-expert tensor via `HostVec`→`DqRowF32`→f32, retained per layer in `hw.layers[l].exp_w1/w3/w2`.
+For the real 43-layer/256-expert/mi=2048/H=4096 model that is 3×256×2048×4096×4 B ≈ **~24 GiB per
+layer**, ≈ **~1.0 TiB** across 43 layers — it exceeds the 119 GiB unified pool at ~layer 5. The
+keep-quant `weights.gguf` tower (~91 GiB, the W2b memory enabler) IS built but is **never read** by the
+forward, so the enabler does not help the run. **Named residual (W2c):** rewire the forward to consume
+the keep-quant blocks directly (via the CPU CIQ `kMatmulBTQuant` GEMM already landed) and gate off the
+host-f32 dequant, so resident stays ~91 GiB. Only then is a single-Spark greedy gen + self-consistency
+/coherence gate + benchmark feasible. NO tokens generated (not faked); benchmark disposition stays
+PENDING; DGX left exactly as found (LocalAI worker untouched, no 91 GB download). Row stays `SPIKE`.
+
+---
+
+## W2b — GGUF keep-quant TOWER materialization (2026-07-29, `CLAIM-DEEPSEEK-V4-W2B`)
+
+**Base:** `main` HEAD `341dfbb9` (the W8 keep-quant + name-map commit). Isolated worktree
+`/home/mudler/_git/vllm.cpp-w2b-tower` (branch `deepseek-v4-w2b-gguf-tower`), CPU-only Debug,
+foreground, NOT pushed. W2b is the LAST CODE brick before the real single-Spark run (W8-final): it
+wires the landed GGUF `blk.N.*` name-map (`scripts/check-dsv4-gguf-namemap.py`, EXACT 1328/1328) +
+the landed keep-quant `vec_dot` (IQ2_XXS/IQ3_XXS/Q2_K, CIQ) into the `DeepseekV4` weight towers, so
+the model can actually LOAD from the `UD-IQ2_XXS` GGUF.
+
+### W2b.1 What landed (loader-only, SACRED-inert)
+- `include/vllm/model_executor/models/deepseek_v4.h` — the `DeepseekV4GgufWeights` /
+  `DeepseekV4GgufLayerWeights` OwnedTensor tower (named slots mirroring the name-map), added to
+  `DeepseekV4Weights` as `gguf` + `has_gguf_weights`; declarations for `DeepseekV4ParamsFromGguf`
+  and `LoadDeepseekV4FromGguf`.
+- `src/vllm/model_executor/models/deepseek_v4_weights.cpp` — the materialization (structurally
+  mirroring the Qwen3.6 GGUF path `qwen3_5_gguf_weights.cpp`): `DeepseekV4ParamsFromGguf` resolves
+  the `deepseek4.*` KV (block_count, hash_layer_count, expert_count, key_length=head_dim, q_lora_rank,
+  output_group_count, sinkhorn_iterations, indexer head/key/top_k, compress_ratios, hyper_connection
+  count, …); `LoadDeepseekV4FromGguf` routes EVERY GGUF tensor through `GgufLoadPolicy::Route` with
+  its name-map role — **MW/SEW** (512-wide MLA linears wq_a/wq_b/wkv/wo_a/wo_b, router gate,
+  shared + the 256 routed experts, lm_head) KEEP their ~2-3-bit blocks COMPRESSED via
+  `OwnGgufQuantBlocks` (the ~91 GiB-vs-~316 GiB OOM memory enabler); **V/ET/HASH** (norms, MHC
+  hc_*, DSA compressor/indexer, attention sinks, embed, the `tid2eid` hash table, `exp_probs_b` bias)
+  dequant to f32 — plus the dequant BRIDGE that fills the tiny-config CPU composition `host` tower
+  so a loaded model FORWARDs.
+- `src/vllm/model_executor/models/deepseek_v4_registry.cpp` — the GGUF reject is LIFTED:
+  `source.kind == kGguf` → `LoadDeepseekV4FromGguf(*source.gguf, config)`.
+- `tests/vllm/models/test_deepseek_v4_gguf_load.cpp` — the structural gate (+ CMake wiring).
+
+### W2b.2 The ACCOUNTING contract (the name-map coverage, encoded in C++)
+The loader mirrors the Python name-map (`check-dsv4-gguf-namemap.py` PER_LAYER / HASH / GATED /
+COMPRESSOR / INDEXER / TOP_LEVEL tables + topology) and TRACKS every consumed tensor name: a missing
+required tensor throws (unmapped), and after materialization every file tensor MUST be in the consumed
+set (a leftover the map does not cover throws). `accounted_tensors` == the file tensor count.
+The real 1328-tensor manifest coverage stays gated separately by `check-dsv4-gguf-namemap.py` (rc=0);
+this C++ gate proves the ROUTING + keep-quant residency + accounting + load→forward LOGIC at tiny shape.
+
+### W2b.3 Gate — STRUCTURAL (tiny synthetic GGUF), NOT a real-checkpoint token gate
+`tests/vllm/models/test_deepseek_v4_gguf_load.cpp`: **5/5 cases · 149 assertions GREEN** on a CPU
+Debug full-library build (loader TUs `-Werror`-clean). A tiny synthetic `deepseek4` GGUF (built with
+`gguf_builder.h`, the REAL `blk.N.*` naming convention + a REAL keep-quant ggml type **Q8_0** at tiny
+dims: H=32, 4 layers, hash{0,1}, `compress_ratios={0,4,2,4}` so indexer{1,3}/compressor{1,2,3},
+hc_mult=2, 4 routed + 1 shared expert) is materialized and asserted:
+- (a) **accounting** — `accounted_tensors == 126 == g.Tensors().size()` (none unmapped, none
+  leftover); per-layer hash/compressor/indexer topology mapped; the tower slots are non-empty;
+- (b) **keep-quant residency** — the 256-expert down proj stays `vt::DType::kQ8_0` (block dtype,
+  `nk=true`, shape `[E*out, in]`), byte size = the compressed 34 B/32-elem image `<` the dequant-f32
+  image; an MLA linear + lm_head stay Q8_0; a norm stays F32;
+- (c) **load → forward** — `DeepseekV4ForwardHost(w.host, …)` produces finite, deterministic logits
+  end-to-end over the assembled W7 composition (proves load→forward works).
+**RED-first PROVEN:** (i) a MISSING required tensor throws (unaccounted route); (ii) a LEFTOVER
+tensor the map does not cover throws; (iii) an expand-instead-of-keep policy leaves the SAME weight
+UNCOMPRESSED (bf16) — proving keep-quant is what compresses it. Q8_0 is used because it is a real
+keep-quant type with an easy meaningful synthesis (the IQ2_XXS/IQ3_XXS/Q2_K keep-quant vec_dot is
+gated by `test_ops_quant_dot`; the tower WIRING here is quant-type-agnostic — it routes by role via
+`HasQuantDotKernel`, the identical path the i-quants take).
+
+### W2b.4 Honest 3-state + the W8-final residual
+The tiny-synthetic load→forward = **DERIVED + BUILD-VERIFIED (structural)**. It does NOT claim V4
+"runs" a real model. The real **91 GB `UD-IQ2_XXS` load + generate stays W8-FINAL** (operational,
+NOT this lane): download `unsloth/DeepSeek-V4-Flash-GGUF/UD-IQ2_XXS` (3 shards, ~91 GB) to the DGX
+(free disk ≥100 GiB) → `flock $HOME/gpu.lock` + `docker stop local-ai-worker` (restore after) →
+keep-quant load into `DeepseekV4Model` via `LoadDeepseekV4FromGguf` → `ForwardDevice` greedy gen →
+gate = our-engine self-consistency (run-to-run deterministic greedy) + coherent output → benchmark
+TPOT/throughput/peak-mem (llama.cpp-on-card as the competitor floor if it loads the same GGUF, else
+ours-only honestly). **Resume command:** `LoadedEngine::FromModelDir` also needs a `deepseek4` arm in
+the top-level `HfConfigFromGguf` dispatch (today qwen-only) to route the GGUF to this loader from the
+CLI/server — a small entrypoint wiring folded into the W8-final run.
