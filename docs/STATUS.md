@@ -503,6 +503,21 @@ DGX `--gpu --kv-cache`: **decode 5.83 tok/s (23-tok) / 6.60 (11-tok) — ~22% ov
 length); prefill 7.6–8.1; peak 86.33 GiB; ~35% of ds4's 16.5. nvidia-smi util did NOT rise (36%) — fewer/
 larger kernels leave the GB10 idle on host launches, so decode is now clearly **host-launch-bound** →
 motivates Stage 3 (decode CUDA graph, mirroring Qwen3-Coder W7). Row stays `ACTIVE`; see docs/BENCHMARKS.md.
+**ForwardDevice campaign Stage 3 — DECODE CUDA GRAPH: BLOCKED (architectural finding; honest last residual)
+(2026-07-29, base `3eb018df`, NOT pushed).** A decode CUDA graph CANNOT be built on the host-orchestrated
+forward — no code change. The vt capture contract (`cuda_backend.cu:173-182`) demands pure async stream
+work (no Synchronize / host<->device copies / malloc; fixed pointers). The dense/DFlash graphs capture a
+device-resident `ForwardLayers` over persistent `DBuf`s (`qwen3_5.cpp:5820/5747`). DeepSeek-V4's GGUF
+forward (`ForwardComposeImpl`, `device=false`) instead runs MHC/Sinkhorn, the attention QK/softmax/AV Dot
+loop, rope, RMSNorms, the MoE router (which decides `expert_ids`), SwiGLU and combine ON THE HOST over
+`std::vector`, between GPU GEMMs, reading each output on the host — no contiguous async device sequence to
+capture; the host syncs abort capture; the #183 glue kernels Upload/Download+sync per call and there is no
+device attention kernel. No host-node fallback exists. **Prerequisite:** a device-resident decode forward
+(all glue as real parallel device kernels on persistent `DBuf`s, incl. a device MLA attention kernel),
+mirroring `Qwen3_5DenseDecodeGraph` — a multi-brick port, NOT the #183 `<<<1,1>>>` correctness kernels.
+**FINAL campaign result: decode 0.68 → 5.83 tok/s (~8.6×), token-identical, ~35% of ds4's 16.5** (Stage 1
+KV cache 7.9× + Stage 2 grouped MoE GEMM +22%; both merged). Named residual = host-orchestration launch
+overhead (util ~36%), removable only by the device-resident forward. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

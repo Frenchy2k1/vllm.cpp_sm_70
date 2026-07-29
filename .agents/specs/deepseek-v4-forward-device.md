@@ -138,9 +138,45 @@ via the #183 kernels with resident buffers (drop the per-op host round-trip and
 the per-GEMM `SyncDeviceGemm`). Gate: token-identical or ratified near-tie
 (state + gate distributionally if bf16 associativity diverges). Benchmark.
 
-### Stage 3 — OVERLAP / CUDA GRAPHS (after review).
-Close the residual: capture the per-token decode step as a CUDA graph / overlap
-host glue with device GEMMs. Gate: unchanged tokens. Benchmark to ds4 parity.
+### Stage 3 — DECODE CUDA GRAPH — BLOCKED (architectural finding, 2026-07-29).
+**A decode CUDA graph CANNOT be built on the current host-orchestrated forward.**
+The vt capture contract (`cuda_backend.cu:173-182`) requires the captured region to
+be pure async stream work: "no Synchronize, no host<->device blocking copies", "no
+cudaMalloc/cudaFree", "captured pointers fixed across replays, only CONTENTS
+change". The dense/DFlash decode graphs satisfy this because their `ForwardLayers`
+(`qwen3_5.cpp:5820`, "captures/replays ForwardLayers over that fixed hidden
+address" `:5747`) is a **device-resident** sequence over persistent `DBuf`s — every
+op is a CUDA kernel on the stream, NO host reads/transforms between kernels.
+
+The DeepSeek-V4 GGUF forward (`ForwardComposeImpl`, `device=false`) is the OPPOSITE:
+it operates on HOST `std::vector<float>` activations and runs MHC/Sinkhorn, the
+attention QK/softmax-sink/AV Dot loop, rope, RMSNorms, the MoE router
+(sqrtsoftplus + topk/hash — which DECIDES the grouped GEMM's `expert_ids`), the
+clamped-SwiGLU, and the combine ALL ON THE HOST, between the GPU GEMMs, reading
+every GEMM output on the host (via `SyncDeviceGemm`). So (a) there is no contiguous
+async device sequence to capture, (b) the host `Synchronize`s abort capture, and
+(c) even the #183 device glue kernels can't be captured — they Upload/Download +
+`cudaStreamSynchronize` per call (`cuda_deepseek_v4.cu:533`), and there is no device
+attention kernel at all (the QK/AV is a host loop). No host-node fallback exists
+(`cudaGraphAddHostNode`/`cudaLaunchHostFunc` are unused repo-wide).
+
+**PREREQUISITE (the real, large next brick):** a **device-resident DeepSeek-V4
+decode forward** — every glue op (MHC pre/post/Sinkhorn/head, per-head q-norm,
+rope, a real MLA attention kernel over the cached KV with sink softmax, kv-norm,
+sqrtsoftplus/hash router, clamped-SwiGLU, combine, final norm) reimplemented as a
+REAL parallel device kernel operating on persistent `DBuf` activations with NO
+per-op sync/copy — mirroring `Qwen3_5DenseDecodeGraph`'s `ForwardLayers`. The #183
+kernels are tiny `<<<1,1>>>` upload/download correctness kernels, NOT this. Only
+after that port is a decode graph capturable. This is a multi-brick effort, not a
+single stage; it is the honest last residual of the parity push.
+
+**FINAL honest ours-vs-ds4 (after Stages 1-2, current main):** decode 5.83 tok/s
+(23-tok) / 6.60 (11-tok) vs ds4 16.5 — **~35% of ds4**; prefill 7.6-8.1 vs 325.9;
+peak 86.33 GiB vs 80.8. **Named residual cause:** host-orchestration launch/dispatch
+overhead (profiler: GEMM-dispatch + host-glue dominate, GB10 util ~36% — idle
+waiting on host launches), removable ONLY by the device-resident decode forward
+above. Stages 1 (KV cache, 7.9x) + 2 (grouped MoE GEMM, +22%) took decode
+0.68 -> 5.83 tok/s (~8.6x) while staying token-identical to the eager path.
 
 ## 5. Risks / decisions
 

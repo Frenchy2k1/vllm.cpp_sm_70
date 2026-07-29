@@ -33388,3 +33388,41 @@ GB10 idle waiting on host launches, so decode is now clearly **host-launch-bound
 GEMM-dispatch + host-glue; sync ≈ 0). This directly motivates **Stage 3: a decode CUDA graph** to
 capture the per-step kernel sequence and kill the launch tax (mirrors Qwen3-Coder W7). Box restored
 (worker up restart=always, flock free, no stray). Awaiting coordinator review before Stage 3.
+
+## DeepSeek-V4 ForwardDevice campaign — Stage 3 (decode CUDA graph): BLOCKED — architectural finding; parity push COMPLETE through Stage 2 (2026-07-29, `CLAIM-DEEPSEEK-V4-FORWARD-DEVICE`, worktree `/home/mudler/_git/vllm.cpp-dg`, branch `deepseek-v4-decode-graph`, base `3eb018df`, NO code change, NOT pushed)
+
+Stage 2 (grouped) merged (`3eb018df`) + greenlit Stage 3 (decode CUDA graph, the final planned
+lever). I grounded the premise before implementing (Iron Law) and found a decode graph CANNOT be
+built on the current host-orchestrated forward — this is the honest last residual the coordinator
+allowed for.
+
+**Evidence (source, file:line):** the vt capture contract (`cuda_backend.cu:173-182`) requires the
+captured region to be pure ASYNC stream work — "no Synchronize, no host<->device blocking copies",
+"no cudaMalloc/cudaFree", captured pointers fixed with only CONTENTS changing across replays. The
+dense/DFlash decode graphs satisfy it because their `ForwardLayers` (`qwen3_5.cpp:5820`; ":5747
+captures/replays ForwardLayers over that fixed hidden address") is a DEVICE-RESIDENT sequence over
+persistent `DBuf`s — all CUDA kernels on the stream, no host reads between them. DeepSeek-V4's GGUF
+forward (`ForwardComposeImpl`, `device=false`) is the OPPOSITE: MHC/Sinkhorn, the attention
+QK/softmax-sink/AV Dot loop, rope, RMSNorms, the MoE router (which DECIDES the grouped GEMM's
+`expert_ids`), clamped-SwiGLU and combine all run ON THE HOST over `std::vector` activations, BETWEEN
+the GPU GEMMs, reading every GEMM output on the host (`SyncDeviceGemm`). So: no contiguous async device
+sequence to capture; the host `Synchronize`s abort capture; even the #183 device glue kernels can't be
+captured (Upload/Download + `cudaStreamSynchronize` per call, `cuda_deepseek_v4.cu:533`) and there is
+NO device attention kernel (QK/AV is a host Dot loop); no host-node fallback
+(`cudaGraphAddHostNode`/`cudaLaunchHostFunc` unused repo-wide).
+
+**Prerequisite (named, the real large next brick):** a device-resident DeepSeek-V4 decode forward —
+every glue op reimplemented as a REAL parallel device kernel on persistent `DBuf`s with no per-op
+sync/copy (a device MLA attention kernel over the cached KV is the biggest missing piece), mirroring
+`Qwen3_5DenseDecodeGraph`. The #183 `<<<1,1>>>` correctness kernels are NOT this. Only after that port
+is a decode graph capturable — a multi-brick effort, not a single stage.
+
+**FINAL ours-vs-ds4 (parity push complete through Stage 2):** decode **0.68 → 5.83 tok/s (~8.6×)**,
+TOKEN-IDENTICAL throughout ("…Paris.", ids `11111 16 455 6102 294 8760 344 11111`), reaching **~35% of
+ds4's 16.5**; prefill 6.26 → 7.6-8.1 (ds4 325.9); peak 86.33 GiB (ds4 80.8). Stage 1 (MLA latent KV
+cache, 7.9×) + Stage 2 (grouped keep-quant MoE GEMM, +22%) landed + merged. **Named final residual
+cause:** host-orchestration launch/dispatch overhead (profiler: GEMM-dispatch + host-glue dominate;
+GB10 util ~36% — idle waiting on ~774 host launches/step), removable ONLY by the device-resident
+decode forward. NO code change this stage (a graph is architecturally impossible on this forward, not
+faked); the finding + FINAL table land as the reviewable artifact. Spec §Stage 3 + docs updated. Row
+`ACTIVE` (correct + a real ~8.6× single-Spark decode speedup; every-axis ds4 parity is the residual).
