@@ -590,7 +590,10 @@ the proxy e2e gate are named residuals. Shared unblocker for Kimi-Linear-48B and
 
 **Kimi K3 W0 SCOPE spike (2026-07-28, `CLAIM-KIMI-K3-SCOPE`, NOT pushed).**
 Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
-measurement taken, claimed, or owed; `benchmark_binding=false`).** Scopes
+measurement taken, claimed, or owed; `benchmark_binding=false`).** (2026-07-29
+registry-metadata fix — `KimiK3ForConditionalGeneration` outer wrapper
+`has_inner_state=false` + `test_model_registry` drift repaired — is likewise
+NOT APPLICABLE: metadata + test hygiene only, no build/run/measurement owed.) Scopes
 `KimiK3ForConditionalGeneration` (released 2026-07-27, beyond the pin) — a 2.8T MoE
 whose text backbone is the Kimi-Linear KDA+MLA+MoE hybrid scaled to H=7168 / 93
 layers (69 KDA + 24 MLA) / 896 experts, MXFP4 + MoonViT-V2 vision. It **does not fit**

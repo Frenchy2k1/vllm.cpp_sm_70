@@ -44,7 +44,7 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  REQUIRE(registrations.size() == 27);
+  REQUIRE(registrations.size() == 28);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -132,7 +132,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 27);
+  REQUIRE(supported.size() == 28);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -151,6 +151,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "GraniteForCausalLM",
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
+      "KimiK3ForConditionalGeneration",
       "LlamaForCausalLM",
       "MiniCPM3ForCausalLM",
       "MiniCPMForCausalLM",
@@ -187,11 +188,12 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
     CHECK_FALSE(registration.info.has_inner_state);
     CHECK(registration.info.score_type == "bi-encoder");
     if (registration.architecture == "Qwen3_5ForConditionalGeneration" ||
-        registration.architecture == "Qwen3_5MoeForConditionalGeneration") {
-      // The outer Qwen3.5 multimodal wrappers inherit IsHybrid but not
+        registration.architecture == "Qwen3_5MoeForConditionalGeneration" ||
+        registration.architecture == "KimiK3ForConditionalGeneration") {
+      // The outer Qwen3.5 + Kimi-K3 multimodal wrappers inherit IsHybrid but not
       // HasInnerState; their inner language-model classes carry HasInnerState.
-      // These two ConditionalGeneration wrappers are the ONLY hybrid+multimodal
-      // registrations.
+      // These ConditionalGeneration wrappers are the hybrid+multimodal
+      // registrations (Kimi-K3 = KDA+MLA hybrid backbone + MoonViT-V2 vision).
       CHECK(registration.info.is_hybrid);
       CHECK(registration.info.supports_multimodal);
     } else if (registration.architecture == "Qwen3VLForConditionalGeneration" ||
@@ -515,7 +517,7 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 27> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 28> kExampleConfigArchitectures{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "DeepseekV4ForCausalLM",
@@ -528,6 +530,7 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "GraniteForCausalLM",
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
+      "KimiK3ForConditionalGeneration",
       "LlamaForCausalLM",
       "MiniCPM3ForCausalLM",
       "MiniCPMForCausalLM",
@@ -617,7 +620,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'DeepseekV4ForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
-      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', 'LlamaForCausalLM', "
+      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
+      "'KimiK3ForConditionalGeneration', 'LlamaForCausalLM', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
@@ -635,7 +639,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'DeepseekV4ForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
-      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', 'LlamaForCausalLM', "
+      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
+      "'KimiK3ForConditionalGeneration', 'LlamaForCausalLM', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
