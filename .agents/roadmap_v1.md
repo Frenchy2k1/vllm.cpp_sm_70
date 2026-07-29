@@ -218,6 +218,25 @@ byte-for-byte on the Sinkhorn — ported 1:1 AND cross-checked against an indepe
 derivation. SACRED-inert (no existing forward touched; prior V4 tests unchanged); new kernel row
 `KERNEL-MHC-SINKHORN` (`SPIKE`). Residuals: sqrtsoftplus/hash MoE (W6), device kernel +
 `DeepseekV4Model::Forward` assembly (W7), strict gate (W8) = multi-Spark.
+**W6 sqrtsoftplus + HASH-ROUTED MoE LANDED (2026-07-29, `CLAIM-DEEPSEEK-V4-W6`, base `5b843be5`):**
+the three genuinely-new-vs-V2/V3 MoE pieces ported + unit-gated as portable host references —
+`SqrtSoftplus` (the V4 router score `sqrt(softplus(x))`, distinct from V2/V3's sigmoid/softmax
+`noaux_tc`), `SqrtSoftplusRouteTopk` (score all experts → add `e_score_correction_bias` for
+SELECTION ONLY → top-k, OR the `tid2eid` token-id→expert HASH lookup that BYPASSES top-k → GATHER
+weights from the UNBIASED scores → renormalize → ×routed_scaling_factor), `ClampedSwiGLU`
+(`SiluAndMulWithClamp`: gate clamped max-only, up clamped both-sided, `gate·σ(α·gate)·(up+β)`); new
+TUs `deepseek_v4_moe.{h,cpp}` + `test_deepseek_v4_moe` **12/12·716** (hand-derived literals — the
+sqrt∘softplus composition, bias-flips-selection-but-weight-stays-unbiased, the hash bypass, the
+asymmetric clamp — + from-first-principles double-precision references; RED-first proven ALL THREE
+load-bearing levers: drop the sqrt fails 8/493, gather weights from the biased scores fails 2/181,
+symmetric-clamp the gate fails 2/6). Ported 1:1 from vLLM `fused_topk_bias_router.py:75-118`
+(`_topk_softplus_sqrt_torch`) + `activation.py:197-201`, cross-checked SGLang `v0.5.15`
+`moe/{topk.py, hash_topk.py}`. REUSE not re-port: the shared DeepSeek grouped-GEMM / 256-expert /
+shared-expert / NVFP4 machinery is untouched — only scoring+hash+clamp are net-new; MegaMoE is
+SM100-only so GB10 mirrors the FusedMoE-fallback router. SACRED-inert (no existing forward touched;
+prior V4 tests 14/14·125 + 12/12·164 + 13/13·38 + 4/4·40 unchanged); new kernel row
+`KERNEL-MOE-SQRTSOFTPLUS-HASH` (`SPIKE`). Residuals: device kernels (reuse the existing grouped-GEMM)
++ `DeepseekV4Model::Forward` assembly (W7), strict/near-tie gate (W8) = multi-Spark.
 **MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
 [`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
 DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)

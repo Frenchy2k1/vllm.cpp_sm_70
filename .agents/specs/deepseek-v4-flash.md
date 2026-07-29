@@ -720,3 +720,90 @@ record surfaces.
   the bf16 residual storage) + folding MHC into `DeepseekV4Model::Forward` with the first-layer
   stream expand + the per-layer attn/ffn interleave (W7); the sqrtsoftplus/hash MoE (W6); the
   strict/near-tie engine gate (W8) — all multi-Spark-blocked on one GB10.
+
+---
+
+## W6 — the sqrtsoftplus + hash-routed MoE (2026-07-29, `CLAIM-DEEPSEEK-V4-W6`)
+
+**Base:** current `main` HEAD `5b843be5` (`git rev-parse HEAD`). Isolated worktree
+`/home/mudler/_git/vllm.cpp-w6-moe` (branch `deepseek-v4-w6-moe`), CPU-only, foreground, NOT pushed.
+Continues the W3/W4/W5 host-reference lane: the full-model gate is multi-Spark-blocked (156.7 GiB, does
+not fit one GB10; the forward still needs device assembly (W7)), so W6 lands the FORWARD CODE for the
+three genuinely-new MoE primitives + UNIT-gates them. Per the brief, the shared DeepSeek grouped-GEMM /
+256-expert / shared-expert / NVFP4 machinery is REUSED, not re-ported — only the NEW scoring + hash-route
++ clamp are net-new, so only those three land here.
+
+### W6.1 What landed (additive, SACRED-inert)
+New TUs `include/vllm/model_executor/models/deepseek_v4_moe.h` +
+`src/vllm/model_executor/models/deepseek_v4_moe.cpp` — portable HOST (CPU) references for the three
+things W6 owns, each ported 1:1 with `file:line` on BOTH sides (vLLM primary, SGLang v0.5.15 cross-ref):
+
+- **`SqrtSoftplus`** <- `fused_topk_bias_router.py:88` (`torch.sqrt(F.softplus(gating_output.float()))`).
+  The V4 router score `sqrt(softplus(x))`, `softplus(x)=log(1+exp(x))` (numerically stable
+  `max(x,0)+log1p(exp(-|x|))`), distinct from V2/V3's sigmoid/softmax `noaux_tc`. The sqrt∘softplus
+  COMPOSITION is the load-bearing nuance.
+- **`SqrtSoftplusRouteTopk`** <- `fused_topk_bias_router.py:75-118` (`_topk_softplus_sqrt_torch`, the
+  pure-PyTorch fallback = the eager reference the CUDA `topk_hash_softplus_sqrt` kernel matches) + the
+  hash branch `:100-106`; hash-table wiring `nvidia/model.py:562-578,:686,:696-717`; FusedMoE-fallback
+  router `nvidia/model.py:647-691`. Score every expert; add `e_score_correction_bias` for **SELECTION
+  ONLY**; either top-k by the biased score OR — for the first `num_hash_layers` HASH layers — the
+  `tid2eid` [vocab, topk] token-id→expert lookup that **BYPASSES top-k**; **GATHER the weights from the
+  UNBIASED scores** (using biased scores as weights flattens the distribution, `:90-96`); renormalize
+  `/max(Σ,1e-20)`; ×`routed_scaling_factor`. The bias-affects-selection-but-NOT-weights split + the hash
+  bypass are the two load-bearing nuances. Cross-checked SGLang `hash_topk.py:137-180` (`_forward_torch`,
+  identical tid2eid gather from unbiased scores) + `topk.py:1013-1014` (the score).
+- **`ClampedSwiGLU`** <- `activation.py:197-201` (`SiluAndMulWithClamp.forward_native`), used by
+  DeepseekV4MLP `nvidia/model.py:126-133`. `gate=clamp(·,max=limit)` (MAX only), `up=clamp(·,-limit,
+  +limit)` (BOTH sides), `out=gate·sigmoid(α·gate)·(up+β)`; DeepseekV4MLP passes α=1/β=0. The ASYMMETRIC
+  clamp (gate max-only vs up both-sided) is the load-bearing nuance.
+
+**NOT re-ported (REUSED):** the DeepSeek grouped-GEMM expert forward, the 256-expert w13/w2 layout, the
+shared-expert block, and the NVFP4/FP8 expert GEMMs are the existing DeepSeek-V2 MoE + NVFP4 machinery.
+**NOT ported (SM100-only, not the GB10 target):** MegaMoE (`DeepseekV4MegaMoEExperts`, requires
+major==10, `nvidia/model.py:307-315`) — W6 mirrors the FusedMoE-fallback router GB10 runs.
+
+### W6.2 Gate (unit, honest) — hand-case + structural review, NOT a dumped-oracle rel-L2
+Same honest bar as W3/W4/W5 (the fixed-config 167B arch cannot be constructed at a tiny shape, nor run —
+it does not fit one GB10). `tests/vllm/models/test_deepseek_v4_moe.cpp`: **12/12 cases · 716 assertions
+GREEN** on a CPU Debug full-library build; the new TUs are `-Wall -Werror -Wextra`-clean (verified by an
+explicit strict compile). Hand-derived literal cases: sqrt∘softplus composition (`softplus(x)=4 ⇒
+score=2`, distinct from softplus-alone=4 and raw-logit-sqrt); the bias flips the selection but the
+returned weight stays the UNBIASED 1.0 not the biased 3.0 (and without the bias the unbiased argmax is
+chosen — proving the bias changed the selection); renormalize divides by the unbiased weight sum;
+routed_scaling_factor multiplies; the hash `tid2eid` route picks {3,1} where top-k would pick {2,0};
+the asymmetric clamp keeps gate=-5 while clamping up to -2; gate max-clamp / up upper-clamp boundaries;
+alpha/beta. From-first-principles double-precision references: router f32==f64 rel-L2 < 1e-5 + EXACT ids
+across randomized shapes; SqrtSoftplus f64 + monotonicity; ClampedSwiGLU rel-L2 < 1e-6. **RED-first
+PROVEN all three levers:** dropping the sqrt fails 8 cases / 493 assertions; gathering the weights from
+the BIASED scores fails 2 cases / 181 assertions; symmetric-clamping the gate fails 2 cases / 6
+assertions; revert restores 12/12·716. Each lever is genuinely load-bearing (learning from W5: the
+composition case distinguishes sqrt∘softplus from softplus-alone AND from raw-logit-sqrt; the
+bias-selection case forces the weight to differ from the biased score; the asymmetry case forces gate
+and up to be clamped differently). CAVEAT: the CPU gate uses `-DCMAKE_BUILD_TYPE=Debug` because the
+pre-existing GCC-13 `-O2` `-Werror=array-bounds` false positive in `voxtral.cpp` (unrelated) breaks the
+`-O2` full-library build; the new TUs themselves are `-Wall -Werror -Wextra`-clean.
+
+### W6.3 OPEN QUESTIONS / derivation assumptions
+- **None unresolved — every constant grounded, none guessed.** The score, the bias-for-selection split,
+  the hash bypass, the renormalize `1e-20` floor, `routed_scaling_factor`, and the clamp α=1/β=0 defaults
+  are all read directly from the cited `file:line`.
+- **The device kernel's `is_padding` guard** (zeroes padded rows, `topk_hash_softplus_sqrt`) is a
+  device-batching concern — this host reference computes every real row and leaves padding to W7, exactly
+  as W3/W4/W5 left their device seams.
+
+### W6.4 SACRED inertness
+Additive ONLY. Zero edits to any existing forward — in particular the shared DeepSeek-V2 MoE router /
+grouped GEMM / shared experts have an EMPTY diff, and the W3/W4/W5 DSA/compressor/MHC TUs are untouched.
+Proof: `test_deepseek_v4_mhc` still 14/14·125, `test_deepseek_v4_compressor` 12/12·164,
+`test_deepseek_v4_dsa` 13/13·38, `test_deepseek_v4_scaffold` 4/4·40. The only non-additive edits are the
+two CMake source/test wiring lines, the new `KERNEL-MOE-SQRTSOFTPLUS-HASH` kernel-matrix row (+ its
+checker count bump 41→42), and the record surfaces.
+
+### W6.5 Landed-vs-residual
+- **Landed (W6):** the sqrtsoftplus router score + the noaux_tc bias-for-selection top-k + the `tid2eid`
+  hash route + the clamped SwiGLU expert activation — host references + unit gate;
+  `KERNEL-MOE-SQRTSOFTPLUS-HASH` (`SPIKE`).
+- **Residual:** the device kernels (the router + clamp are the only NEW device kernels; the expert
+  grouped-GEMM REUSES the existing NVFP4/FP8 path) + folding the MoE into `DeepseekV4Model::Forward`
+  composing W3-W6 (W7 — the brick that finally makes V4 runnable); the strict/near-tie engine gate (W8)
+  — all multi-Spark-blocked on one GB10.

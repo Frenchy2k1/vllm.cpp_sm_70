@@ -107,6 +107,14 @@ vllm_cpp_add_test(test_deepseek_v4_compressor vllm/models/test_deepseek_v4_compr
 # from-first-principles double-precision derivation. Full-model gate multi-Spark-
 # blocked; MoE/device-kernel are W6/W7 (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_mhc vllm/models/test_deepseek_v4_mhc.cpp)
+# DeepSeek-V4-Flash W6 — the sqrtsoftplus + hash-routed MoE: the V4 router score
+# function (sqrt∘softplus), the noaux_tc bias-for-selection top-k, the hash
+# `tid2eid` route that bypasses top-k, and the clamped SwiGLU expert activation.
+# Ported from the vLLM eager reference (fused_topk_bias_router.py + activation.py,
+# cross-checked SGLang) + gated against hand-derived literals and double-precision
+# references. Full-model gate multi-Spark-blocked (156.7 GiB); device-kernel +
+# forward assembly are W7 (.agents/specs/deepseek-v4-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_moe vllm/models/test_deepseek_v4_moe.cpp)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
