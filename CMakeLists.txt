@@ -538,6 +538,8 @@ add_library(vllm STATIC
   src/vllm/v1/attention/backends/gdn_attn.cpp
   src/vllm/v1/structured_output/backend_types.cpp
   src/vllm/v1/structured_output/backend_native.cpp
+  src/vllm/v1/structured_output/backend_xgrammar.cpp
+  src/vllm/v1/structured_output/xgrammar_json_schema.cpp
   src/vllm/v1/structured_output/json_schema_to_gbnf.cpp
   src/vllm/v1/structured_output/jump_forward.cpp
   src/vllm/v1/structured_output/request.cpp

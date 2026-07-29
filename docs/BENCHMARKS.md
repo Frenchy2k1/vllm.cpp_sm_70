@@ -16,6 +16,20 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## xgrammar structured-output backend W1 (2026-07-29, `CLAIM-TOOLS-XGRAMMAR`) - NOT-APPLICABLE (host-side masking correctness brick; no throughput owed)
+
+Disposition: **NOT APPLICABLE** for a performance number. Structured output is a
+host-side per-step logits-masking path; the only GPU work is the already-gated
+`apply_grammar_bitmask` scatter (`test_apply_grammar_bitmask`), unchanged by this
+row. W1 delivers the xgrammar-faithful JSON-schema→EBNF converter + the
+`XgrammarStructuredOutputBackend` behind the shared seam (reusing the native
+pushdown-FSM/trie matcher — xgrammar's own algorithm), CPU-gated by
+`test_backend_xgrammar` (6/6, 39 asserts, RED-first). Correctness is the whole
+gate; the GPU **oracle parity** run (token-identical constrained decode vs the
+pinned vLLM oracle with `structured_outputs.backend="xgrammar"` on a real model)
+is **PENDING**, DGX-blocked (GB10 offline). Repro (CPU): `cmake --build build-cpu
+--target test_backend_xgrammar && ./build-cpu/tests/test_backend_xgrammar`.
+
 ## DeepSeek-V4-Flash W2c - forward rewired onto the keep-quant tower (2026-07-29, `CLAIM-DEEPSEEK-V4-W2C`) - NOT-APPLICABLE (memory-enabler code brick; no throughput owed) / real run PENDING (W8-run, now memory-FEASIBLE)
 
 **W8-run status (2026-07-29): ATTEMPTED, HARDWARE-BLOCKED (not run, nothing faked).** The code is complete and memory-feasible @ `2936ff70` (keep-quant forward, ~93.9 GiB < the 119 GiB pool). The operational run (download ~91 GB `UD-IQ2_XXS`, keep-quant load, greedy generate, self-consistency + coherence gate, TPOT/throughput/peak-mem benchmark) could NOT start: the **DGX GB10 (`dgx.casa`/192.168.68.128) is OFFLINE** - `ping` 5/5 loss, ARP FAILED, SSH `No route to host`, while the gateway/Thor/mac-mini respond (DGX-specific, powered off or crashed per the OOM-reboot history). No out-of-band wake path from the dev box. **Resume: bring the DGX back online, then re-run the W8-run recipe below - no code change needed.** DeepSeek-V4 row stays SPIKE (no run, no benchmark).

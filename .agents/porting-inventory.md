@@ -224,11 +224,25 @@ seam) — the parity surface. The grammar ENGINE is a from-scratch **NATIVE back
 (§9, ORIGINAL)** behind that seam: GBNF/EBNF parser + push-down FSM + token-byte
 trie (sub-O(vocab) fill; fill==accept invariant guarded by an exhaustive
 differential test), covering `json` (schema→GBNF), `json_object`, `regex`,
-`choice`, `grammar`(EBNF/GBNF) + OpenAI `response_format`. **The xgrammar C++ core
-is DEFERRED to a later parity-completion milestone** (a 2nd backend behind the SAME
-proven seam — mirrors upstream's own 4 pluggable backends; not a parity deviation).
-Deferred: STRUCTURAL_TAG, reasoning-gating, spec-decode multi-row, key-order
-flexibility, whitespace-flexibility/exotic-schema parity (xgrammar-only until vendored).
+`choice`, `grammar`(EBNF/GBNF) + OpenAI `response_format`. **The xgrammar backend
+W1 landed 2026-07-29 (`CLAIM-TOOLS-XGRAMMAR`, `TOOLS-XGRAMMAR`→ACTIVE)** as a 2nd
+registerable backend behind the SAME seam. **§9 DECISION (recorded): mirror
+xgrammar's algorithm PORTABLY, do NOT vendor the mlc-ai/xgrammar C++ library** —
+xgrammar IS "grammar → pushdown automaton → per-step token bitmask", already
+implemented portably by the native engine; vendoring would duplicate that
+machinery + add a heavy dependency against the no-extra-deps posture. So
+`XgrammarStructuredOutputBackend` (`backend_xgrammar.cpp`) REUSES the native
+matcher and ports only the xgrammar-FAITHFUL front-end where the two diverge — the
+JSON-schema→EBNF converter (`xgrammar_json_schema.cpp`, SEMANTICS ported from
+xgrammar `cpp/json_schema_converter.cc` @ `a32ac89`): property DECLARATION order
+(`nlohmann::ordered_json`, vs the native path's lexicographic sort), the
+`any_whitespace` `ws` rule, and the `basic_*` set VERBATIM — closing the key-order
++ whitespace + exotic-schema parity that was xgrammar-only. `auto`→xgrammar
+selection mirrored (`sampling_params.py:1031`). Deferred (W2+): STRUCTURAL_TAG-full,
+reasoning-gating, spec-decode multi-row, optional object properties, strict-compact
+separators, the `has_xgrammar_unsupported_json_features` guard +
+`validate_xgrammar_grammar` feeding the `auto` fallback, production wiring, GPU
+oracle parity.
 T1: `prompt_logprobs`, `logprob_token_ids`, additional backends
 (guidance/outlines), reasoning parsers, beam search wrapper, thinking budget,
 repetition detection, torch-Philox bit-exact random parity. T2: rejection
