@@ -32972,3 +32972,77 @@ protocol. No published number in this row comes from a contended run. The
 axis-A cross-FORMAT arm was re-confirmed on the same committed binary in the same
 sitting: 47/96 both drafts, tokens IDENTICAL, CROSS-FORMAT arm selected, 17/17,
 exit 0.
+
+## 2026-07-29 — `QUANT-GGUF-NVFP4` column `C`: NVFP4 GGUF weights now COMPUTE in fp4
+
+`CLAIM-GGUF-NVFP4-COMPUTE`, worktree `vllm.cpp-abi-v9`, branch
+`feat/capi-abi-v9-engine-config` (merged with `origin/main` `d81cf1d1`). LOCAL
+ONLY, not pushed. Spec:
+[specs/gguf-nvfp4-native-compute.md](specs/gguf-nvfp4-native-compute.md).
+
+**Two things were MEASURED before a line was written, and one of them retires a
+claim this repo had been repeating.**
+
+(1) The framing "the fp4 kernels exist, so this is routing not numerics" is
+RIGHT, and stronger than expected. A ggml type-40 block repacks into exactly the
+compressed-tensors `weight_packed` (torch pairwise) + `weight_scale` (linear
+fp8) pair with **ZERO differing bytes**, verified on the real files over 128
+rows of five projections spanning both shapes and both tensor families, with the
+`<stem>.scale` sidecar bit-identical to `float32(1)/float32(weight_global_scale)`
+throughout. So column `C` is a load-time byte permutation into the operand
+layout the ALREADY-GATED `vt::MatmulNvfp4*` kernels read. No kernel was written;
+nothing under `src/vt/` was touched.
+
+(2) **The two 27B NVFP4 containers are NOT the same model.** The GGUF holds 496
+NVFP4 tensors, the safetensors 304, and the 192-tensor difference is exactly the
+GDN `in_proj_{qkv,z,a,b}` family the safetensors `recipe.yaml` ignores and the
+GGUF converter quantized anyway (measured mean relative weight error 0.180 /
+0.181 / 0.186 on `attn_qkv` layers 0 / 1 / 40, leading unreordered rows). Their
+ACTIVATION global scales also disagree on 4 of 5 sampled projections. So the
+divergence at token index 4 that `SPEC-DFLASH-GGUF` recorded and attributed to
+"the GGUF computes in bf16 while the safetensors runs true W4A4" is a WEIGHT
+difference, not a compute artifact, and was never closable by this row. That is
+now corrected in `docs/STATUS.md`, `docs/BENCHMARKS.md`, the matrix row and
+`specs/gguf-nvfp4-notes.md` Sec 5.6/6. The gate was moved to where it is exact:
+byte-identity of the fp4 OPERANDS, not token identity across containers.
+
+**What landed.** `GgufResidency::kNvfp4Fp4` + `KeepNvfp4DType` +
+`GgufNvfp4ComputeAvailable()` + `GgufLoadPolicy::{nvfp4_fp4,nvfp4_w4a4}`
+(`VT_GGUF_NVFP4_FP4`, `VT_GGUF_NVFP4_W4A4`), defaulting ON wherever
+`OpId::kMatmulNvfp4` is registered (CUDA) exactly as keep-quant defaults on
+`kMatmulBTQuant`; `RepackGgufNvfp4Rows` in `gguf_dequant.{h,cpp}` beside the
+case-40 decoder that owns the same layout facts; `OwnGgufNvfp4` /
+`OwnGgufNvfp4Experts` / `LoadMatmulWeightOrNvfp4` / `LoadExpertsOrNvfp4` in
+`qwen3_5_gguf_weights.cpp` filling the SAME `Nvfp4Weight` fields the safetensors
+loader fills, so the dense/MoE forwards are UNCHANGED. `RouteGgufTensor` grew an
+`nvfp4_fp4` parameter (all call sites updated, no default argument, so nothing
+inherits the new residency silently).
+
+**Deliberate decision: NVFP4 gets NO `vt::DType` member.** Every vt block dtype
+is self-contained and consumed through a `vec_dot`; NVFP4's value needs a scalar
+from a different TENSOR and its GEMM takes three operands. A `kNVFP4` enumerator
+would give `BlockDTypeFromGgmlTypeId(40)` a dtype with no `BlockToFloat`, no
+`vec_dot`, and a `RowSizeBytes` that lies about what determines the weight. The
+residency's product is an `Nvfp4Weight`, as on the safetensors side.
+
+**Honest subset (`part`, not `Y`).** Dense MLP + full-attention q/k/v/o + MoE
+shared/routed experts go native. The GDN `in_proj_{qkv,z,a,b}` family and
+`ssm_out` still expand: the 27B V-head reorder rewrites their layout, so they are
+`kTransformedWeight`, and only `ssm_out` even has an fp4 field. A CPU build
+expands everything (`kMatmulNvfp4` is CUDA-only), which stays correct.
+
+**Gates green on CPU at this checkpoint** (exit codes, not last lines):
+`test_gguf_nvfp4` 11/11 cases 2207/2207 (was 6/2141 — the four new cases are the
+repack byte-identity gate, its wrong-packing rejection, the repack/dequant tie
+and the geometry guards), `test_gguf_keep_quant` 37/37 5986/5986,
+`test_gguf` 30/103, `test_gguf_dequant` 15/480, `test_gguf_qwen36_loader` 6/286,
+`test_qwen3_5_gguf_mtp` 2/2, `test_model_loader_gguf` 3/3,
+`test_ops_quant_traits` 9/5663, all rc=0. MUTATION: flipping the nibble halves in
+`RepackGgufNvfp4Rows` takes `test_gguf_nvfp4` to 9/11 with 6 assertions RED, so
+the gate discriminates the layout and not merely the symbol.
+
+**NEXT (owed, not done at this checkpoint):** the GB10 run — production-configured
+build proven three ways, the SACRED set (`test_qwen27_paged_engine` 235/235,
+`test_qwen36_paged_engine`, `test_nvfp4_dequant`), the asset-gated
+`test_qwen27_gguf_nvfp4_compute` residency + generation gate, and the fp4-vs-bf16
+same-binary A/B that `docs/BENCHMARKS.md` carries as `PENDING`.

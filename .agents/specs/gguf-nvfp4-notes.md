@@ -249,11 +249,30 @@ anyway. Those tensors have no safetensors counterpart, so the oracle covers
 `ffn_{gate,up,down}` and `ssm_out` only; the container itself is proven by
 those, since the encoding does not vary per tensor.
 
+**QUANTIFIED 2026-07-29, and it is larger than "those tensors have no
+counterpart" suggests:** the GGUF holds **496** NVFP4 tensors against the
+safetensors' **304**, and the 192-tensor difference is exactly the GDN
+`in_proj_{qkv,z,a,b}` family. Dequantizing the GGUF's `blk.N.attn_qkv` against
+the safetensors' BF16 `in_proj_qkv` over the leading (unreordered) 64 rows gives
+mean relative errors 0.180 / 0.181 / 0.186 at layers 0 / 1 / 40. The activation
+global scales differ too. So the two containers are DIFFERENT MODELS, and the
+often-repeated reading that their greedy divergence at token index 4 is a
+bf16-vs-fp4 compute artifact is retired: it is a weight difference.
+[gguf-nvfp4-native-compute.md](gguf-nvfp4-native-compute.md) Sec A carries the
+table.
+
 ## 6. What is NOT done
 
-- `C` (native quantized compute): NVFP4 has no `vt::DType` block encoding and no
-  `vec_dot`, so `RouteGgufTensor` correctly sends it to `kExpandBf16`. A
-  keep-quant residency and an NVFP4 GGUF GEMM are separate, unstarted work.
+- `C` (native quantized compute): **LANDED 2026-07-29 as `part`, in the
+  companion spike [gguf-nvfp4-native-compute.md](gguf-nvfp4-native-compute.md).**
+  The statement that stood here — that NVFP4 has no `vt::DType` block encoding
+  and no `vec_dot` so `RouteGgufTensor` must expand it — was true and remains
+  true, but the CONCLUSION drawn from it was wrong: NVFP4 does not need a vt
+  block dtype, because its consumer is not a `vec_dot` but the existing
+  `vt::MatmulNvfp4*` family, whose operands the ggml blocks REPACK into byte for
+  byte. The dense MLP, full attention and the MoE experts now compute in fp4 on
+  CUDA; the GDN `in_proj_*` family and `ssm_out` still expand (V-head reorder),
+  as does any CPU build.
 - `E` (end-to-end): dequant alone does not load the 27B/35B models. The
   remaining gaps are model-level, not container-level, and are tracked on
   `SPEC-MTP-GGUF`.

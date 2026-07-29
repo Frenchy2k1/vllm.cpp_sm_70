@@ -208,6 +208,122 @@ TEST_CASE("gguf nvfp4: geometry and scale guards") {
   CHECK(vllm::GgmlTraits(kNvfp4).block_bytes == 36);
 }
 
+// ===========================================================================
+// THE `C` COLUMN GATE: the ggml blocks REPACK, byte for byte, into the operand
+// pair the NVFP4 GEMMs consume.
+//
+// Column `C` (native quantized compute) is entirely this permutation: if the
+// repacked (weight_packed, weight_scale) streams are BIT-IDENTICAL to the ones
+// the compressed-tensors container of the same quantization run stores, then a
+// GGUF weight entering vt::MatmulNvfp4* is entering it with operands the fp4
+// kernels are already gated on, and no numerics are re-litigated. The same
+// goldens the value-level gate above uses carry both containers' bytes, so this
+// runs in CI with no asset. See .agents/specs/gguf-nvfp4-native-compute.md.
+// ===========================================================================
+TEST_CASE("gguf nvfp4 repack: ggml blocks -> the fp4 GEMM operand pair, "
+          "byte-identical to the compressed-tensors container") {
+  for (const auto& c : gguf_nvfp4_goldens::kCases) {
+    INFO("case " << std::string(c.name));
+    std::vector<uint8_t> packed(static_cast<size_t>(c.out_dim * c.in_dim / 2));
+    std::vector<uint8_t> scale(static_cast<size_t>(c.out_dim * c.in_dim / 16));
+    vllm::RepackGgufNvfp4Rows(c.gguf, c.out_dim, c.in_dim, packed.data(),
+                              scale.data());
+
+    // Count rather than compare containers directly: doctest stringifies both
+    // operands of a reported comparison.
+    size_t pdiff = 0;
+    for (size_t i = 0; i < packed.size(); ++i) {
+      if (packed[i] != c.st_packed[i]) ++pdiff;
+    }
+    size_t sdiff = 0;
+    for (size_t i = 0; i < scale.size(); ++i) {
+      if (scale[i] != c.st_scales[i]) ++sdiff;
+    }
+    CHECK(pdiff == 0);
+    CHECK(sdiff == 0);
+
+    // Not vacuous: the slice must actually carry nibbles and scales.
+    size_t nonzero_packed = 0;
+    for (uint8_t v : packed) {
+      if (v != 0) ++nonzero_packed;
+    }
+    CHECK(nonzero_packed > packed.size() / 2);
+  }
+}
+
+// The gate must DISCRIMINATE THE LAYOUT, not merely the symbol. The dangerous
+// bug here is the same one the value-level gate was built against: assuming the
+// GGUF already packs nibbles pairwise (i.e. copying qs[] straight through)
+// preserves every value and every scale, so it produces finite, plausible
+// logits. Run that wrong repack deliberately and require the comparison above
+// to reject it.
+TEST_CASE("gguf nvfp4 repack: the straight-through (wrong) packing is "
+          "REJECTED") {
+  const auto& c = gguf_nvfp4_goldens::kCases[0];
+  const int64_t nblocks = c.in_dim / 64;
+  std::vector<uint8_t> wrong(static_cast<size_t>(c.out_dim * c.in_dim / 2));
+  for (int64_t r = 0; r < c.out_dim; ++r) {
+    for (int64_t b = 0; b < nblocks; ++b) {
+      // qs[32] copied verbatim: right values, ggml's split-half order retained.
+      std::memcpy(wrong.data() + (r * c.in_dim + b * 64) / 2,
+                  c.gguf + (r * nblocks + b) * 36 + 4, 32);
+    }
+  }
+  size_t diff = 0;
+  for (size_t i = 0; i < wrong.size(); ++i) {
+    if (wrong[i] != c.st_packed[i]) ++diff;
+  }
+  CHECK(diff > wrong.size() / 4);
+}
+
+// The repack and the dequant must agree about the SAME bytes: decoding the
+// repacked operands through the already-gated compressed-tensors decoder must
+// reproduce the GGUF decoder's values exactly. This ties the new primitive to
+// the value-level gate instead of letting the two drift.
+TEST_CASE("gguf nvfp4 repack: repacked operands dequant to the GGUF values") {
+  for (const auto& c : gguf_nvfp4_goldens::kCases) {
+    INFO("case " << std::string(c.name));
+    const int64_t numel = c.out_dim * c.in_dim;
+    const float global = BitsToF32(c.global_scale_bits);
+    std::vector<uint8_t> packed(static_cast<size_t>(numel / 2));
+    std::vector<uint8_t> scale(static_cast<size_t>(numel / 16));
+    vllm::RepackGgufNvfp4Rows(c.gguf, c.out_dim, c.in_dim, packed.data(),
+                              scale.data());
+    std::vector<uint16_t> via_repack(static_cast<size_t>(numel), 0);
+    DequantNvfp4ToBf16(packed.data(), scale.data(), global, c.out_dim, c.in_dim,
+                       via_repack.data());
+    const std::vector<uint16_t> direct =
+        DequantGgufRowToBf16(kNvfp4, c.gguf, numel, global);
+    size_t diff = 0;
+    for (size_t i = 0; i < direct.size(); ++i) {
+      if (direct[i] != via_repack[i]) ++diff;
+    }
+    CHECK(diff == 0);
+  }
+}
+
+TEST_CASE("gguf nvfp4 repack: geometry guards") {
+  std::vector<uint8_t> src(36 * 2, 0);
+  std::vector<uint8_t> packed(64, 0);
+  std::vector<uint8_t> scale(8, 0);
+  // K must be a whole number of 64-element NVFP4 blocks.
+  CHECK_THROWS_AS(vllm::RepackGgufNvfp4Rows(src.data(), 1, 63, packed.data(),
+                                            scale.data()),
+                  std::runtime_error);
+  CHECK_THROWS_AS(vllm::RepackGgufNvfp4Rows(src.data(), 1, 32, packed.data(),
+                                            scale.data()),
+                  std::runtime_error);
+  CHECK_THROWS_AS(vllm::RepackGgufNvfp4Rows(nullptr, 1, 64, packed.data(),
+                                            scale.data()),
+                  std::runtime_error);
+  // 128 elements = 2 blocks is fine and fills both outputs.
+  std::vector<uint8_t> src2(72, 0xABU);
+  std::vector<uint8_t> p2(64, 0), s2(8, 0);
+  vllm::RepackGgufNvfp4Rows(src2.data(), 1, 128, p2.data(), s2.data());
+  CHECK(p2[0] != 0);
+  CHECK(s2[0] == 0xABU);
+}
+
 // --- Asset-gated: the whole real files, every NVFP4 tensor they share. ------
 //
 // VLLM_NVFP4_GGUF=~/bench/q36-27b-nvfp4.gguf
