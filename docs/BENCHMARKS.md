@@ -608,6 +608,31 @@ false positive in `voxtral.cpp`, unrelated, breaks the `-O2` full-library build;
 MHC/MoE/device-kernel/forward-integration are named W5-W8 residuals. New kernel row
 `KERNEL-ATTN-DSA-COMPRESSOR` (`SPIKE`). No source/engine path touched.
 
+**DeepSeek-V4-Flash W5 Manifold/Markov Hyper-Connections (MHC) (2026-07-29, `CLAIM-DEEPSEEK-V4-W5`,
+NOT pushed).** Disposition: **NOT APPLICABLE (correctness/primitive brick, host CPU reference + unit
+gate; no run, no download, no throughput number taken, claimed, or owed; `benchmark_binding=false`).**
+Ported + unit-gated the hardest V4 brick — the MHC residual topology: `MhcSinkhorn` (the 20-iteration
+Sinkhorn — row-softmax seed `+eps` then alternating col/row normalization toward a doubly-stochastic
+matrix), `MhcPre` (folded weight-free RMSNorm projection → pre/post/comb gates → stream collapse →
+optional folded attn/ffn RMSNorm), `MhcPost` (comb mix + post-gate residual fold), `HcHeadCollapse`
+(weight-free RMSNorm → hc_head_fn → sigmoid → weighted stream sum). `deepseek_v4_mhc.{h,cpp}`,
+`test_deepseek_v4_mhc` **14/14·125** — hand-derived literals + from-first-principles double-precision
+references (rel-L2 < 1e-5..1e-4; doubly-stochastic convergence) + RED-first proven BOTH the iteration
+count (`iters-1→iters-2` fails 1/9) and a normalization axis (swap fails 2/12), via a dedicated
+small-iteration-count gate (at 20 iters the Sinkhorn has converged, so ±1 iter is within tolerance —
+an honesty fix over a naive iters=20-only gate). **EAGER-REF FINDING:** the W0 "no eager reference
+upstream" premise is corrected — vLLM ships `model_executor/kernels/mhc/torch.py`
+(`mhc_pre_torch`/`mhc_post_torch`) + `triton.py` (head collapse); four upstream impls agree
+byte-for-byte on the Sinkhorn. Ported 1:1 AND cross-checked against an independent double-precision
+derivation. Honest gate form: derived-eager-reference + hand-case + structural review, NOT a
+dumped-oracle rel-L2 (fixed-config 167B not constructible tiny). OPEN QUESTION: end-to-end bf16
+residual rounding between steps is a W7 device concern, left out of the f32/f64 refs. SACRED-inert (no
+existing forward touched; `test_deepseek_v4_compressor` 12/12·164, `test_deepseek_v4_dsa` 13/13·38,
+`test_deepseek_v4_scaffold` 4/4·40 unchanged). CPU Debug build (the same voxtral `-O2` false positive;
+new TUs `-Wall -Werror -Wextra`-clean). The full-model speed gate remains multi-Spark-blocked (156.7
+GiB); MoE (W6), device-kernel + forward-assembly (W7), strict gate (W8) are named residuals. New
+kernel row `KERNEL-MHC-SINKHORN` (`SPIKE`). No source/engine path touched.
+
 **KDA (Kimi Delta Attention) kernel delta W1 (2026-07-28, `CLAIM-KDA-KERNEL`, NOT
 pushed).** Disposition: **NOT APPLICABLE (correctness/kernel-primitive brick, host CPU
 reference + unit gate; no run, no download, no throughput number taken, claimed, or

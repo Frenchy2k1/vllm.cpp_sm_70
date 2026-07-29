@@ -100,6 +100,13 @@ vllm_cpp_add_test(test_deepseek_v4_dsa vllm/models/test_deepseek_v4_dsa.cpp)
 # double-precision references. Full-model gate is multi-Spark-blocked (156.7 GiB);
 # MHC/MoE/device-kernel are W5/W6/W7 (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_compressor vllm/models/test_deepseek_v4_compressor.cpp)
+# DeepSeek-V4-Flash W5 — Manifold/Markov Hyper-Connections (MHC): the Sinkhorn-
+# normalized hc_mult-stream residual manifold + mHC pre/post mixes + hc_head
+# collapse + folded RMSNorms. Ported from the vLLM eager reference
+# (mhc/torch.py + triton.py, 4 upstream impls agree) + gated against a
+# from-first-principles double-precision derivation. Full-model gate multi-Spark-
+# blocked; MoE/device-kernel are W6/W7 (.agents/specs/deepseek-v4-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_mhc vllm/models/test_deepseek_v4_mhc.cpp)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;

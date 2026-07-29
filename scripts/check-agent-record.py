@@ -72,9 +72,20 @@ MATRICES = {
     # device kernel (the fused `_fused_kv_compress_norm_rope_insert_sparse_attn`)
     # is a W7 residual. `SPIKE`, `CLAIM-DEEPSEEK-V4-W4`, spec
     # specs/deepseek-v4-flash.md).
+    # 41 since 2026-07-29: +`KERNEL-MHC-SINKHORN` (the DeepSeek-V4 Manifold/Markov
+    # Hyper-Connections topology — the `[tokens, hc_mult, hidden]` residual
+    # manifold mixed by a 20-iteration Sinkhorn-normalized doubly-stochastic
+    # matrix, the mHC pre/post mixes with the FOLDED attn/ffn RMSNorms, and the
+    # hc_head collapse). A genuinely new residual-stream topology distinct from the
+    # plain residual+RMSNorm every other family uses. W5 landed a portable host
+    # reference + unit gate (ported from the vLLM eager reference mhc/torch.py —
+    # correcting the W0 "no eager reference" premise — and gated against a from-
+    # first-principles double-precision Sinkhorn derivation); the device kernel +
+    # DeepseekV4Model::Forward assembly are W7 residuals. `SPIKE`,
+    # `CLAIM-DEEPSEEK-V4-W5`, spec specs/deepseek-v4-flash.md).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 40),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 41),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
