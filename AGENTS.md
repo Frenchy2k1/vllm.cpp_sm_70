@@ -280,6 +280,23 @@ source for flashinfer. A fusion "absent from vLLM's csrc" may live in flashinfer
 WRONGLY declared nonexistent). Verify the whole chain as necessary. This applies to
 every subagent and every design/parity check.
 
+**We can VENDOR generated kernels — account for this in every architecture
+decision.** A vLLM edge that lives in a codegen'd or fused kernel (Inductor Triton,
+a DeepGEMM/CuTe-DSL JIT kernel, a flashinfer fusion) is NEVER out of reach on the
+ground that "it's compiled/fused and we're C++": our engine reproduces any such
+kernel two ways — (1) a hand-written fused kernel declared through `vt::FusedChain`
+(`include/vt/fused_recipe.h`, `include/vt/recipes.h`), or (2) AOT-compiling the
+kernel and shipping the cubin through
+the Triton-AOT vendoring pipeline (`src/vt/cuda/triton_aot_vendored/sm_XX/`,
+`cmake/TritonAOT.cmake` — the GDN decode path already does this per arch), and we can
+equally vendor generated C++/CUDA. So the gap to an Inductor/DeepGEMM fusion is
+COVERAGE/EFFORT (Inductor auto-generates graph-wide at JIT time and shape-specializes
+per call; we port the hot-path fusions deliberately, and AOT covers the known shapes
+of a fixed model/decode step), NEVER a capability ceiling. The only genuinely-hard
+residual is a specific hand-tuned kernel outrunning our best CUTLASS/cuBLASLt/AOT port
+on one shape — still "port a better kernel", not "impossible". Design every forward
+and kernel plan on the assumption that the fused/graphed/codegen'd form is reachable.
+
 **TRACE THE EXECUTION, not just the code — nsys BOTH vLLM and ours before any perf
 comparison.** Reading source finds the DISPATCH LOGIC + the AVAILABLE kernels; it does
 NOT tell you what ACTUALLY RAN, because vLLM's real kernels are resolved at RUNTIME and
@@ -377,9 +394,15 @@ unchanged. Each participating agent reads BOTH the pinned vLLM
 faster. Then verify each diff adversarially (real? on the gate hot path?), rank
 by gain÷effort, drive the top lever, re-measure vs vLLM, repeat. Full protocol:
 [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md). Caveat: a
-real per-op comparison needs a CLEAN slice of OURS (not inferred proportions),
-and distinguish the few vLLM edges that are build-specific (Inductor/DeepGEMM
-fusions) — which eager-C++ can't 1:1 replicate — from the many we CAN.
+real per-op comparison needs a CLEAN slice of OURS (not inferred proportions).
+A vLLM edge that is an Inductor/DeepGEMM/flashinfer FUSION is NOT a ceiling: only
+*eager* op-by-op dispatch can't fuse, and our engine is not limited to eager — we
+reproduce any such kernel via `vt::FusedChain` (hand-fused CUDA) or by
+AOT-compiling and VENDORING the generated cubin / C++ (the Triton-AOT pipeline,
+`src/vt/cuda/triton_aot_vendored/`, already ships the GDN decode kernels per arch).
+The difference is coverage/effort (Inductor auto-generates graph-wide at JIT time;
+we port hot-path fusions deliberately, and AOT covers a fixed model's known shapes),
+never capability — see the vendoring principle in the MIRROR directive above.
 
 ## Policy for AI-Assisted Contributions
 
