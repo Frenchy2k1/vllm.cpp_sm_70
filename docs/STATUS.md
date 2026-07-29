@@ -1010,8 +1010,9 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   the true W4A4 kernels; the two containers' own spec-OFF streams diverge at
   index 4 on the first prompt and index 16 on the second, with no speculation
   anywhere, and the DFlash-ON pair tracks that.
-  **Both axes are now gated and closed** (gates 1-5 and 7 of the spike). What
-  remains open is deliberately NOT this row's: no speed A/B is owed until a
+  **Both axes are now gated and closed** (gates 1-5 and 7 of the spike), so the
+  row moved `PARTIAL` -> `DONE` for correctness in closing commit `c62f2fa3`.
+  What remains open is deliberately NOT this row's: no speed A/B is owed until a
   native NVFP4 GGUF GEMM exists to make the two target containers comparable, and
   `docs/BENCHMARKS.md` carries that as an explicit `PENDING` with its
   reproduction command.

@@ -309,6 +309,10 @@ VLLM_DFLASH_MAX_TOKENS=24 VLLM_DFLASH_PROMPT="..." \
 `VT_SPEC_TRACE=1` turns on the per-block propose/accept trace added by `GD9`; it
 was not needed here, because the aggregate counts were already decisive.
 
+**Row closure.** With gates 1-5 and 7 met, `SPEC-DFLASH-GGUF` moved `PARTIAL` ->
+`DONE` for correctness, closing commit `c62f2fa3`, ledger
+[`parity-ledger.md`](../.agents/parity-ledger.md#L845).
+
 **Still `PENDING`, and deliberately not owed by this row:** the DFlash-ON
 throughput A/B between the two target containers. It cannot be a fair comparison
 until a native NVFP4 GGUF GEMM exists, since the GGUF target currently runs bf16
