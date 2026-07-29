@@ -469,6 +469,17 @@ over our CPU path). The residual gap is NOT expert placement (fixed) but our **s
 driver (no KV cache)** + route-(a) host-orchestration/per-GEMM sync. Real speed path = `ForwardDevice`
 (#183): resident on-device activations + KV cache + no per-GEMM sync — the only route to approach ds4's 16.5
 tok/s. Route (a) not dressed as a win. Row stays `ACTIVE`; see docs/BENCHMARKS.md W8-run.10.
+**ForwardDevice campaign Stage 1 — MLA latent KV cache + incremental decode (2026-07-29, base `fd9e191c`,
+NOT pushed).** The single biggest decode lever, equivalence-gated + benchmarked. For the real dense-MLA run
+the only cross-token state is the per-layer `deck` latent `[head_dim]` (num_key_value_heads=1; MHC manifold
+per-token), so `DeepseekV4KvCache` (mirror of ds4 `raw_kv`) makes each decode step process ONE new token
+against cached KV instead of re-running the whole forward over the growing context. `DeepseekV4ForwardGgufCached`
++ driver `--kv-cache` (rollback-able; default + `--gpu` unchanged). **Token-IDENTICAL** to full-recompute
+("…Paris.", ids `11111 16 455 6102 294 8760 344 11111`); decode **0.68 → 4.79–5.35 tok/s (7.9×)**, ~1/3 of
+ds4's 16.5; GPU used (nvidia-smi 29–46%, compute-app `deepseek-v4-gen`); peak 86.33 GiB. Gate
+`test_deepseek_v4_gguf_load` **11/11·430** (prefill bit-identical, incremental token-identical, RED-first).
+Stage 0 spec: `.agents/specs/deepseek-v4-forward-device.md`. Residual to ds4 = host-orchestration + per-GEMM
+sync (Stages 2–3: device-resident activations + graphs). Row stays `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

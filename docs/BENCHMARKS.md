@@ -9880,6 +9880,16 @@ scheme wiring + a fitting MXFP4 checkpoint land. `benchmark_binding=false`.
 
 Honest attribution — the residual gap is NOT "experts on CPU" (fixed) but: (1) our driver is **stateless full-recompute (no KV cache)** — every decode token re-runs the whole 43-layer forward over the growing context, so "decode" is repeated prefill, capping tok/s regardless of compute placement; (2) route (a) is **host-orchestrated + per-GEMM stream-sync at tiny batch (T=5)** — MHC/DSA/compressor/MoE-glue run on CPU between every GPU GEMM, each drains the stream (no overlap/graphs), GB10 latency-bound reading weights from system memory → only ~45% util. **The real speed path (b), named:** `ForwardDevice` (#183, kernels landed) — activations RESIDENT on-device across the stack, MHC/DSA/glue as the W7-device kernels, a **KV cache** for incremental decode, no per-GEMM host sync. That removes both handicaps; it is the only route to approach ds4's 16.5 tok/s. Route (a) NOT dressed as a win. Row stays `ACTIVE`.
 
+**DeepSeek-V4-Flash ForwardDevice campaign — Stage 1: MLA latent KV cache + incremental decode (2026-07-29, `CLAIM-DEEPSEEK-V4-FORWARD-DEVICE`, base `fd9e191c`, NOT pushed).** Disposition: **the single biggest decode lever LANDED + equivalence-gated + benchmarked — incremental decode is TOKEN-IDENTICAL to full-recompute and 7.9× faster; decode 0.68 → ~5 tok/s (≈1/3 of ds4).** For the real dense-MLA run the only cross-token state is the per-layer `deck` latent `[head_dim]` (num_key_value_heads=1; MHC manifold is per-token), so caching it (`DeepseekV4KvCache`, mirror of ds4 `raw_kv` `ds4.c:12351`) makes each decode step process ONE new token against cached KV instead of re-running the whole 43-layer forward over the growing context. Same 80.7 GB ds4 file, prompt "The capital of France is", `--gpu`:
+
+| Engine | prefill tok/s | decode tok/s | peak resident |
+|---|---|---|---|
+| **ds4** (GPU, KV-cache incremental decode) | 325.9 (512 ctx) | 16.3–16.6 | 80.8 GiB |
+| ours `--gpu` full-recompute (fd9e191c) | 6.26 | 0.68 | 86.33 GiB |
+| **ours `--gpu --kv-cache`** (Stage 1) | 6.19 | **4.79–5.35** | 86.33 GiB |
+
+**Token-IDENTICAL** to full-recompute: both generate `11111 16 455 6102 294 8760 344 11111` = " Paris. The capital of France is Paris" (24-token run stays consistent). Decode dropped from ~1.48 s/tok to **0.19–0.21 s/tok**. GPU genuinely used: nvidia-smi **29–46% util**, compute-app **`deepseek-v4-gen`** (PID 53933) DURING the run. Peak 86.33 GiB (cache negligible). Correctness gate `test_deepseek_v4_gguf_load` **11/11·430** (+1 case): prefill BIT-identical (cached==full batch), incremental TOKEN-identical over 6 greedy steps, RED-first (a cache that forgets its history diverges). Residual gap to ds4 (5 vs 16.5) = the host-orchestration + per-GEMM sync at T=1 (Stages 2–3: device-resident activations + overlap/graphs). Row stays `ACTIVE`.
+
 **env-doc hygiene (2026-07-29):** no benchmark impact — allowlisted the
 diagnostic `VT_SPEC_TRACE` spec-decode acceptance trace to restore `check-env-doc`
 rc=0 on main (it prints per-block draft/accept detail to stderr; off by default).
