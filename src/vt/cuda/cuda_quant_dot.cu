@@ -527,6 +527,48 @@ __global__ void QuantDotGemmKernel(OutT* __restrict__ out,
   }
 }
 
+// GROUPED variant (kMatmulBTQuantGrouped): warp per (p, n); the weight row is
+// selected by the per-group expert index — row (expert_ids[p]*N + n) of the
+// stacked [E*N,K] block weight. Same integer-dot core as QuantDotGemmKernel; the
+// ONLY difference is the weight-row index, so it is numerically identical to the
+// per-expert kMatmulBTQuant. Collapses the DeepSeek-V4 MoE's per-expert matvecs
+// into one launch with P*N warps of parallelism (higher GB10 occupancy at T=1).
+template <WType W, typename OutT>
+__global__ void QuantDotGemmGroupedKernel(OutT* __restrict__ out,
+                                          const uint8_t* __restrict__ weight,
+                                          const BlockQ8_K* __restrict__ act,
+                                          const int32_t* __restrict__ expert_ids,
+                                          int64_t P, int64_t n, int64_t nsb,
+                                          size_t w_row_bytes, size_t w_block_bytes) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= P * n) return;
+  const int64_t p = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+
+  const int64_t e = expert_ids[p];
+  const uint8_t* w_row = weight + static_cast<size_t>(e * n + j) * w_row_bytes;
+  const BlockQ8_K* a_row = act + p * nsb;
+
+  float partial = 0.0f;
+  for (int64_t sb = lane; sb < nsb; sb += 32) {
+    const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
+    partial += DotSuperblock<W>(w_sb, a_row + sb);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    partial += __shfl_down_sync(0xffffffffu, partial, off);
+
+  if (lane == 0) {
+    const float v = FinalFactor<W>() * partial;
+    if constexpr (sizeof(OutT) == 4) {
+      out[p * n + j] = v;
+    } else {
+      out[p * n + j] = DF32ToBF16(v);
+    }
+  }
+}
+
 // --- per-stream grow-only Q8_K activation scratch (cudagraph-safe) -----------
 struct StreamScratch {
   void* buf = nullptr;
@@ -646,6 +688,82 @@ void MatmulBTQuantKernelCuda(Queue& q, Tensor& out, const Tensor& a,
   CheckCuda(cudaGetLastError(), "matmul_bt_quant launch");
 }
 
+template <WType W>
+void LaunchGroupedGemm(Tensor& out, const uint8_t* weight, const BlockQ8_K* act,
+                       const int32_t* expert_ids, int64_t P, int64_t n, int64_t nsb,
+                       size_t w_row_bytes, size_t w_block_bytes, cudaStream_t s) {
+  constexpr int kWarpsPerBlock = 4;
+  dim3 block(32, kWarpsPerBlock);
+  const int64_t warps = P * n;
+  const int64_t grid = (warps + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  if (out.dtype == DType::kF32) {
+    QuantDotGemmGroupedKernel<W, float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<float*>(out.data), weight, act, expert_ids, P, n, nsb, w_row_bytes,
+        w_block_bytes);
+  } else {
+    QuantDotGemmGroupedKernel<W, uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<uint16_t*>(out.data), weight, act, expert_ids, P, n, nsb, w_row_bytes,
+        w_block_bytes);
+  }
+}
+
+// The kCUDA provider for OpId::kMatmulBTQuantGrouped. out[P,N], act[P,K],
+// weight[E*N,K] block-quant, expert_ids[P] i32 (unified memory). Validation done
+// by vt::MatmulBTQuantGrouped. Quantizes the P activation rows to Q8_K once, then
+// one grouped-kernel launch computes every (p,n) output — the expert-batched
+// analog of MatmulBTQuantKernelCuda.
+void MatmulBTQuantGroupedKernelCuda(Queue& q, Tensor& out, const Tensor& act,
+                                    const Tensor& weight, const Tensor& expert_ids) {
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+  const int64_t P = out.shape[0];
+  const int64_t n = out.shape[1];
+  const int64_t k = act.shape[1];
+  if (P == 0 || n == 0) return;
+
+  WType w{};
+  if (!IsCudaKeepQuantSupported(weight.dtype, &w)) {
+    CheckCuda(cudaStreamSynchronize(s), "keepquant-grouped CPU-fallback drain");
+    reinterpret_cast<MatmulBTQuantGroupedFn>(
+        GetOp(OpId::kMatmulBTQuantGrouped, DeviceType::kCPU))(q, out, act, weight, expert_ids);
+    return;
+  }
+  if (k % kQK_K != 0) {
+    throw std::runtime_error(
+        "vt cuda: matmul_bt_quant_grouped: K must be a whole number of 256-element "
+        "Q8_K super-blocks");
+  }
+  const int64_t nsb = k / kQK_K;
+  const size_t w_block_bytes = static_cast<size_t>(BlockBytes(weight.dtype));
+  const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
+
+  // Quantize the P activation rows to Q8_K (per-stream grow-only scratch).
+  const size_t act_bytes = static_cast<size_t>(P) * static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
+  BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureScratch(act_bytes, s));
+  ActDT adt = act.dtype == DType::kF32 ? ActDT::kF32
+              : act.dtype == DType::kF16 ? ActDT::kF16
+                                         : ActDT::kBF16;
+  {
+    constexpr int kQBlock = 128;
+    const int64_t total_sb = P * nsb;
+    const int64_t grid = (total_sb + kQBlock - 1) / kQBlock;
+    QuantizeQ8KKernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
+        qact, act.data, adt, act.stride[0], P, nsb);
+  }
+
+  const uint8_t* wt = static_cast<const uint8_t*>(weight.data);
+  const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
+  switch (w) {
+    case WType::kIQ2_XXS: LaunchGroupedGemm<WType::kIQ2_XXS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kIQ3_XXS: LaunchGroupedGemm<WType::kIQ3_XXS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kQ2_K: LaunchGroupedGemm<WType::kQ2_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kQ3_K: LaunchGroupedGemm<WType::kQ3_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kQ4_K: LaunchGroupedGemm<WType::kQ4_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kQ5_K: LaunchGroupedGemm<WType::kQ5_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kQ6_K: LaunchGroupedGemm<WType::kQ6_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
+  }
+  CheckCuda(cudaGetLastError(), "matmul_bt_quant_grouped launch");
+}
+
 // Registers the CUDA keep-quant GEMM during static init (table fill only, no
 // CUDA calls — same rationale as cuda_matmul.cu Registrar). This makes
 // vt::OpRegistered(kMatmulBTQuant, kCUDA) TRUE, which flips the GGUF loader's
@@ -657,6 +775,9 @@ struct Registrar {
     RegisterOp(OpId::kMatmulBTQuant, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<MatmulFn>(&MatmulBTQuantKernelCuda)));
+    RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<MatmulBTQuantGroupedFn>(&MatmulBTQuantGroupedKernelCuda)));
   }
 } registrar;
 

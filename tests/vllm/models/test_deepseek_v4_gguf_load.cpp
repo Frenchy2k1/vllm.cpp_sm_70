@@ -36,6 +36,8 @@
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
+#include "vt/tensor.h"
 
 using gguf_test::F32ArrayKv;
 using gguf_test::F32Kv;
@@ -556,6 +558,84 @@ TEST_CASE("DeepseekV4ForwardGgufCached: incremental decode == full-recompute (St
   bool any_diff = false;
   for (size_t i = 0; i < gen_broken.size(); ++i)
     if (gen_broken[i] != gen_full[i]) any_diff = true;
+  CHECK(any_diff);
+}
+
+// ── Re-scoped Stage 2: grouped keep-quant MoE GEMM == per-expert loop ──────────
+// vt::MatmulBTQuantGrouped collapses the routed experts' per-expert kMatmulBTQuant
+// matvecs into one call. It is the SAME arithmetic, so grouped output MUST be
+// BYTE-IDENTICAL to the per-expert loop over the same stacked block weight.
+// RED-first: permuting the expert-index map changes the grouped output.
+TEST_CASE("MatmulBTQuantGrouped: grouped == per-expert loop (re-scoped Stage 2)") {
+  Dims d;
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  REQUIRE(w.has_gguf_weights);
+
+  // Stacked routed gate weight [E*mi, H], block-quant (Q8_0 keep-quant).
+  const vllm::OwnedTensor& wexp = w.gguf.layers[0].moe_gate_exps;
+  REQUIRE(vt::IsBlockQuant(wexp.dtype));
+  const int64_t N = d.mi, K = d.H, E = wexp.shape[0] / d.mi;
+  REQUIRE(E >= 3);
+
+  const int P = 3;
+  const std::vector<int32_t> eids = {2, 0, 1};  // selected experts (arbitrary)
+  std::vector<float> act(static_cast<size_t>(P) * K);
+  for (size_t i = 0; i < act.size(); ++i)
+    act[i] = 0.01f * static_cast<float>((i * 7 + 3) % 19) - 0.09f;
+
+  auto row_bytes = vt::RowSizeBytes(wexp.dtype, K);
+  // (A) grouped: one vt::MatmulBTQuantGrouped call.
+  std::vector<float> og(static_cast<size_t>(P) * N);
+  {
+    std::vector<int32_t> ids = eids;
+    vt::Tensor a = vt::Tensor::Contiguous(act.data(), vt::DType::kF32, q.device, {P, K});
+    vt::Tensor o = vt::Tensor::Contiguous(og.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor eid = vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+    vt::Tensor wt = wexp.View();
+    vt::MatmulBTQuantGrouped(q, o, a, wt, eid);
+  }
+  // (B) per-expert: vt::MatmulBTQuant on each expert's row-slice.
+  std::vector<float> op(static_cast<size_t>(P) * N);
+  for (int p = 0; p < P; ++p) {
+    vt::Tensor a = vt::Tensor::Contiguous(act.data() + static_cast<size_t>(p) * K,
+                                          vt::DType::kF32, q.device, {1, K});
+    vt::Tensor o = vt::Tensor::Contiguous(op.data() + static_cast<size_t>(p) * N,
+                                          vt::DType::kF32, q.device, {1, N});
+    vt::Tensor wt{};
+    wt.data = const_cast<uint8_t*>(wexp.bytes.data()) +
+              static_cast<size_t>(eids[p]) * N * row_bytes;
+    wt.dtype = wexp.dtype;
+    wt.device = q.device;
+    wt.rank = 2;
+    wt.shape[0] = N;
+    wt.shape[1] = K;
+    wt.stride[0] = K;
+    wt.stride[1] = 1;
+    vt::MatmulBTQuant(q, o, a, wt);
+  }
+  // BYTE-IDENTICAL.
+  REQUIRE(og.size() == op.size());
+  for (size_t i = 0; i < og.size(); ++i) CHECK(og[i] == op[i]);
+
+  // RED-first: a permuted expert map produces a DIFFERENT grouped result (so the
+  // expert-index selection is load-bearing, not incidentally equal).
+  std::vector<float> og2(static_cast<size_t>(P) * N);
+  {
+    std::vector<int32_t> ids = {1, 2, 0};  // permuted
+    vt::Tensor a = vt::Tensor::Contiguous(act.data(), vt::DType::kF32, q.device, {P, K});
+    vt::Tensor o = vt::Tensor::Contiguous(og2.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor eid = vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+    vt::Tensor wt = wexp.View();
+    vt::MatmulBTQuantGrouped(q, o, a, wt, eid);
+  }
+  bool any_diff = false;
+  for (size_t i = 0; i < og.size(); ++i)
+    if (og2[i] != og[i]) any_diff = true;
   CHECK(any_diff);
 }
 

@@ -165,6 +165,14 @@ enum class OpId : uint8_t {
   // encoding — llama.cpp's `ggml_compute_forward_mul_mat`
   // (ggml/src/ggml-cpu/ggml-cpu.c:1245-1443 @ 237ad9b96).
   kMatmulBTQuant,
+  // GROUPED keep-quant GEMM over an expert-index list: out[p,:] = act[p,:] .
+  // weight[expert_ids[p]*N .. +N]. Collapses the DeepSeek-V4 MoE's 6 routed
+  // experts x {gate,up,down} = 18 tiny T=1 kMatmulBTQuant matvecs/layer into 3
+  // grouped kernels (fewer host launches + higher GPU occupancy). Same arithmetic
+  // as the per-expert loop, so BYTE-IDENTICAL on the CPU provider (which loops the
+  // kMatmulBTQuant kernel per group). Mirrors kMoeGroupedGemmBf16's expert-index
+  // structure for the keep-quant (IQ2_XXS/Q2_K/Q8_0) tower.
+  kMatmulBTQuantGrouped,
   // W0-only raw-signature probe for the shared drop-in adapter boundary. It is
   // not a production kernel-family migration.
   kDropinProbe,
@@ -646,6 +654,10 @@ using MoeGroupedGemmNvfp4Fn =
              const Tensor&, const Tensor&);
 using MoeGroupedGemmBf16Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&);
+// kMatmulBTQuantGrouped: out[P,N], act[P,K] (f32/bf16), weight[E*N,K] block-quant,
+// expert_ids[P] i32 — weight row for (p,n) is expert_ids[p]*N + n.
+using MatmulBTQuantGroupedFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&);
 // Marlin NVFP4 W4A16 grouped-MoE GEMM (lift of vLLM moe_wna16_marlin_gemm; see
 // MoeGroupedGemmNvfp4Marlin below). Scalar params travel in MoeMarlinArgs.
 struct MoeMarlinArgs {
@@ -873,6 +885,16 @@ void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 // f32 dot — which is numerically the dequant-to-f32 reference the ported
 // MUL_MAT tests measure the quantized path against.
 void MatmulBTQuant(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+
+// vt::MatmulBTQuantGrouped — grouped keep-quant GEMM over an expert-index list.
+// out[P,N] where out[p,:] = act[p,:] . weight[expert_ids[p]*N .. +N] (the block
+// row-slice of the stacked expert weight [E*N,K]). Collapses the DeepSeek-V4 MoE's
+// per-expert kMatmulBTQuant matvecs into ONE launch. The CPU provider loops
+// kMatmulBTQuant per group ⇒ BYTE-IDENTICAL to the per-expert path; the CUDA
+// provider runs one warp-per-(p,n) grouped kernel (fewer launches, higher
+// occupancy). act f32/bf16, weight Q8_K-family block-quant, expert_ids i32.
+void MatmulBTQuantGrouped(Queue& q, Tensor& out, const Tensor& act,
+                          const Tensor& weight, const Tensor& expert_ids);
 
 // --- Batched dense GEMM (MLA campaign W6) -----------------------------------
 // out[G,M,N] = a[G,M,K] @ b[G,K,N] — one independent row-major GEMM per batch

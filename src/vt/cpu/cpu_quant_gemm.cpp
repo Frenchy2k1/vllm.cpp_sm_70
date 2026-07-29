@@ -210,10 +210,47 @@ void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a,
                   });
 }
 
+// GROUPED keep-quant GEMM (kMatmulBTQuantGrouped). out[P,N], act[P,K],
+// weight[E*N,K] block-quant, expert_ids[P] i32. Runs the SAME kMatmulBTQuant
+// kernel once per group over the [expert_ids[p]*N, +N) weight row-slice — so it is
+// BYTE-IDENTICAL to the per-expert kMatmulBTQuant path the DeepSeek-V4 forward
+// used before. The CUDA provider fuses this into one launch; this CPU provider is
+// the correctness reference (and the tiny-model doctest's grouped path).
+void MatmulBTQuantGroupedKernel(Queue& q, Tensor& out, const Tensor& act,
+                                const Tensor& weight, const Tensor& expert_ids) {
+  const int64_t P = out.shape[0];
+  const int64_t N = out.shape[1];
+  const int64_t K = act.shape[1];
+  const size_t row_bytes = RowSizeBytes(weight.dtype, K);
+  const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
+  for (int64_t p = 0; p < P; ++p) {
+    const int64_t e = eids[p];
+    Tensor a_row = Tensor::Contiguous(
+        static_cast<float*>(act.data) + static_cast<size_t>(p) * act.stride[0],
+        DType::kF32, act.device, {1, K});
+    Tensor o_row = Tensor::Contiguous(
+        static_cast<float*>(out.data) + static_cast<size_t>(p) * N, out.dtype, out.device,
+        {1, N});
+    Tensor w{};
+    w.data = static_cast<uint8_t*>(weight.data) + static_cast<size_t>(e) * N * row_bytes;
+    w.dtype = weight.dtype;
+    w.device = weight.device;
+    w.rank = 2;
+    w.shape[0] = N;
+    w.shape[1] = K;
+    w.stride[0] = K;
+    w.stride[1] = 1;
+    MatmulBTQuantKernel(q, o_row, a_row, w);
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmulBTQuant, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTQuantKernel)));
+    RegisterOp(
+        OpId::kMatmulBTQuantGrouped, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<MatmulBTQuantGroupedFn>(&MatmulBTQuantGroupedKernel)));
   }
 };
 const Registrar registrar;
