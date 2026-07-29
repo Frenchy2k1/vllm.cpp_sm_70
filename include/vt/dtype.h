@@ -35,16 +35,20 @@ namespace vt {
 //   ggml/include/ggml.h:390-432 (enum ggml_type)
 //   ggml/src/ggml-common.h:288-299 (block_q2_K), :242-245 (block_q8_0),
 //     :305-310 (block_q3_K), :317-327 (block_q4_K), :334-345 (block_q5_K),
-//     :352-357 (block_q6_K), :361-365 (block_q8_K), :371-374 (block_iq2_xxs)
+//     :352-357 (block_q6_K), :361-365 (block_q8_K), :371-374 (block_iq2_xxs),
+//     :385-400 (block_iq3_xxs)
 // kQ8_K is ACTIVATION-ONLY: it is the `vec_dot_type` of the K-quants and never
 // appears as a weight/storage type in a GGUF file.
 //
-// kQ2_K and kIQ2_XXS are the ~2-bit storage encodings the `unsloth/
-// DeepSeek-V4-Flash-GGUF UD-IQ2_XXS/UD-Q2_K_XL` checkpoints use. They register
-// their geometry + `to_float` decode here (dtype.cpp / cpu_quant_dequant.cpp)
-// but carry NO vec_dot kernel, so `HasQuantDotKernel` is false and the GGUF
-// loader routes them to the expand-to-bf16 residency (dequant-only path), never
-// keep-quant GEMM. See `.agents/specs/gguf-iquant-dsv4.md`.
+// kQ2_K, kIQ2_XXS and kIQ3_XXS are the ~2-3-bit storage encodings the `unsloth/
+// DeepSeek-V4-Flash-GGUF UD-IQ2_XXS/UD-Q2_K_XL` checkpoints use (the real
+// UD-IQ2_XXS routed experts are IQ2_XXS gate/up + IQ3_XXS down; Q2_K is the
+// UD-Q2_K_XL sibling vehicle). As of DeepSeek-V4 W8 (CLAIM-DEEPSEEK-V4-W8) all
+// three carry a keep-quant `vec_dot` against the Q8_K activation encoding
+// (cpu_quant_dot.cpp), so `HasQuantDotKernel` is TRUE and the GGUF loader keeps
+// their blocks COMPRESSED and dots them directly — the memory enabler that lets
+// a 158 B DeepSeek-V4 stay ~91 GiB instead of OOM-expanding to bf16. See
+// `.agents/specs/gguf-iquant-dsv4.md` and `.agents/specs/deepseek-v4-flash.md`.
 enum class DType : uint8_t {
   kF32,
   kF16,
@@ -62,6 +66,7 @@ enum class DType : uint8_t {
   kQ6_K,
   kQ8_K,
   kIQ2_XXS,
+  kIQ3_XXS,
 };
 
 // Bytes per ELEMENT. Throws for block-quantized dtypes (they have no

@@ -75,6 +75,13 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{256, 66, 16, "iq2_xxs"};
       return &g;
     }
+    case DType::kIQ3_XXS: {
+      // block_iq3_xxs (ggml-common.h:385-400): f16 d + u8 qs[3*QK_K/8]
+      // = 2 + 96 = 98. ggml type id 18. Codebook (iq3xxs_grid) decode;
+      // qs[0..63] grid indices, qs[64..95] the per-32 scale+sign u32s.
+      static constexpr BlockGeometry g{256, 98, 18, "iq3_xxs"};
+      return &g;
+    }
     case DType::kF32:
     case DType::kF16:
     case DType::kBF16:
@@ -105,8 +112,9 @@ uint32_t GgmlTypeId(DType dtype) { return RequireBlockGeometry(dtype).ggml_type;
 
 bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out) {
   static constexpr DType kBlockDTypes[] = {
-      DType::kQ4_0, DType::kQ8_0, DType::kQ2_K, DType::kQ3_K,   DType::kQ4_K,
-      DType::kQ5_K, DType::kQ6_K, DType::kQ8_K, DType::kIQ2_XXS};
+      DType::kQ4_0, DType::kQ8_0,    DType::kQ2_K,     DType::kQ3_K, DType::kQ4_K,
+      DType::kQ5_K, DType::kQ6_K,    DType::kQ8_K,     DType::kIQ2_XXS,
+      DType::kIQ3_XXS};
   for (DType d : kBlockDTypes) {
     if (FindBlockGeometry(d)->ggml_type == ggml_type) {
       if (out != nullptr) *out = d;
@@ -148,6 +156,7 @@ size_t SizeOf(DType dtype) {
     case DType::kQ6_K:
     case DType::kQ8_K:
     case DType::kIQ2_XXS:
+    case DType::kIQ3_XXS:
       VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") +
                           Name(dtype) + " has no per-element size");
       return 0;
@@ -173,6 +182,7 @@ const char* Name(DType dtype) {
     case DType::kQ6_K: return "q6_K";
     case DType::kQ8_K: return "q8_K";
     case DType::kIQ2_XXS: return "iq2_xxs";
+    case DType::kIQ3_XXS: return "iq3_xxs";
   }
   return "?";
 }

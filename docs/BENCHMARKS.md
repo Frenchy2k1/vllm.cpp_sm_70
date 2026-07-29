@@ -16,6 +16,26 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## DeepSeek-V4-Flash W8 - keep-quant IQ2_XXS/IQ3_XXS/Q2_K + GGUF name map (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`) - PENDING (the RUN did not execute; memory enabler + name-map landed, gated)
+
+No throughput number: the single-Spark GGUF RUN did NOT execute this lane and was
+NOT faked. What landed and is gated: (1) the keep-quant `vec_dot` for IQ2_XXS,
+IQ3_XXS and Q2_K (`test_ops_quant_dot` 19 cases / 130444 assertions, CPU Debug;
+vec_dot vs f64 dequant-dot within 1e-5·L1, `MatmulBTQuant` NMSE <= 5e-4 vs
+dequant-f32, bit-exact across thread counts; RED-first proven - perturbing the
+IQ2_XXS 0.125 fold fails 2 cases/18 assertions, revert restores 19/130444) - the
+MEMORY ENABLER that keeps the 158 B routed experts compressed (~91 GiB) instead of
+OOM-expanding to bf16 (~316 GiB, which hard-reboots the box); (2) the `blk.N.*`->V4
+name map with EXACT 1328/1328 coverage, 0 unmapped, 0 leftover
+(`scripts/check-dsv4-gguf-namemap.py` rc=0) verified against the real manifest read
+from the shard GGUF headers via HTTP-range (no 91 GB download). HONEST finding: there
+is NO CUDA keep-quant vec_dot for ANY k-quant (`kMatmulBTQuant` is CPU-only), so on
+GB10 this runs on the 20 ARM cores against the unified pool. The RUN is blocked on the
+unimplemented W2b (materialize the keep-quant blocks into the DeepseekV4 towers via the
+name map), then the 91 GB download + GB10 greedy generation + self-consistency /
+coherence gate. Benchmark disposition PENDING until W2b + the run land. Repro entry:
+`scripts/check-dsv4-gguf-namemap.py`; `build-cpu/tests/test_ops_quant_dot`.
+
 ## GGUF IQ2_XXS + Q2_K dequant, the DeepSeek-V4-Flash single-Spark GGUF quant-path brick (2026-07-29, `CLAIM-DSV4-GGUF-LOADER`) - NOT-APPLICABLE (CPU dequant primitive, no throughput owed)
 
 No benchmark. W1 ports the two ~2-bit GGUF encodings the single-Spark

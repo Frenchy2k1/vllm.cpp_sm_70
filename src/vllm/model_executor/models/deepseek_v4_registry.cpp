@@ -59,8 +59,17 @@ std::unique_ptr<LoadedModel> LoadDeepseekV4ForCausalLM(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
   if (source.kind != ModelSource::Kind::kSafetensors) {
+    // DeepSeek-V4 W8 advanced the single-Spark GGUF (`deepseek4` arch) vehicle:
+    // the keep-quant compute for its ~2-3-bit routed experts (IQ2_XXS/IQ3_XXS +
+    // Q2_K) is LANDED (vt::MatmulBTQuant, gated) and the blk.N.* -> V4 name map
+    // has EXACT 1328-tensor coverage (scripts/check-dsv4-gguf-namemap.py). The
+    // REMAINING brick before a load is W2b: materialize the keep-quant blocks +
+    // F32 MHC/DSA/norm tensors into the DeepseekV4 weight towers via that map.
+    // Until W2b lands this stays a loud reject rather than a half-populated load.
     throw std::runtime_error(
-        "Model architecture DeepseekV4ForCausalLM does not support GGUF weights");
+        "DeepseekV4ForCausalLM GGUF (deepseek4): keep-quant compute + blk.N.* "
+        "name map landed (W8); tower materialization (W2b) pending — see "
+        ".agents/specs/deepseek-v4-flash.md §W8");
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");

@@ -99,13 +99,22 @@ struct WeightCase {
 //   q4_K :317-327  d@0 dmin@2 sc@4 qs@16                        (144B)
 //   q5_K :334-345  d@0 dmin@2 sc@4 qh@16 qs@48                  (176B)
 //   q6_K :352-357  ql@0 qh@128 sc@192 d@208                     (210B)
+// q2_K :288-299   scales@0 qs@16 d@80 dmin@82                    (84B)
+// iq2_xxs :371-374 d@0 qs@2 (u16[32])                            (66B)
+// iq3_xxs :385-400 d@0 qs@2 (u8[96]: 64 grid idx + 32 sc/sig)    (98B)
 const WeightCase kWeightCases[] = {
     {vt::DType::kQ4_0, 32, 18, 0, -1, "q4_0"},
     {vt::DType::kQ8_0, 32, 34, 0, -1, "q8_0"},
+    {vt::DType::kQ2_K, 256, 84, 80, 82, "q2_K"},
     {vt::DType::kQ3_K, 256, 110, 108, -1, "q3_K"},
     {vt::DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
     {vt::DType::kQ5_K, 256, 176, 0, 2, "q5_K"},
     {vt::DType::kQ6_K, 256, 210, 208, -1, "q6_K"},
+    // DeepSeek-V4 W8 keep-quant enablers — the ~2-3-bit codebook encodings the
+    // single-Spark UD-IQ2_XXS routed experts use (IQ2_XXS gate/up, IQ3_XXS down;
+    // Q2_K is the UD-Q2_K_XL sibling vehicle).
+    {vt::DType::kIQ2_XXS, 256, 66, 0, -1, "iq2_xxs"},
+    {vt::DType::kIQ3_XXS, 256, 98, 0, -1, "iq3_xxs"},
 };
 
 // Random raw blocks: every quant/scale payload byte is arbitrary (all legal),
@@ -202,8 +211,9 @@ TEST_CASE("G2/G3 populate from_float and vec_dot (ggml-cpu.c:211-406)") {
   // from_float exists for exactly the two activation encodings.
   CHECK(vt::cpu::BlockFromFloat(vt::DType::kQ8_0) != nullptr);
   CHECK(vt::cpu::BlockFromFloat(vt::DType::kQ8_K) != nullptr);
-  for (vt::DType d : {vt::DType::kQ4_0, vt::DType::kQ3_K, vt::DType::kQ4_K,
-                      vt::DType::kQ5_K, vt::DType::kQ6_K}) {
+  for (vt::DType d : {vt::DType::kQ4_0, vt::DType::kQ2_K, vt::DType::kQ3_K,
+                      vt::DType::kQ4_K, vt::DType::kQ5_K, vt::DType::kQ6_K,
+                      vt::DType::kIQ2_XXS, vt::DType::kIQ3_XXS}) {
     CHECK(vt::cpu::BlockFromFloat(d) == nullptr);
   }
 

@@ -1,7 +1,9 @@
 # GGUF i-quant (IQ2_XXS) + Q2_K dequant + DeepSeek-V4 GGUF loadability
 
-**Claim:** `CLAIM-DSV4-GGUF-LOADER`. **Rows:** `QUANT-GGUF-IQ2_XXS` (id 16),
-`QUANT-GGUF-Q2_K` (id 10) in [quantization-matrix.md](../quantization-matrix.md);
+**Claim:** `CLAIM-DSV4-GGUF-LOADER` (dequant); keep-quant compute + `QUANT-GGUF-IQ3_XXS`
+advanced by `CLAIM-DEEPSEEK-V4-W8`. **Rows:** `QUANT-GGUF-IQ2_XXS` (id 16),
+`QUANT-GGUF-IQ3_XXS` (id 18), `QUANT-GGUF-Q2_K` (id 10) in
+[quantization-matrix.md](../quantization-matrix.md);
 cross-references `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` (stays `SPIKE`,
 owned by the DeepSeek-V4 impl/forward lane — this claim owns only the GGUF/quant
 path, NOT the forward). **Base:** `main` HEAD `4d1be010`.

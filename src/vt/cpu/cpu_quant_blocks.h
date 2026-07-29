@@ -107,4 +107,37 @@ struct BlockQ8_K {
 };
 static_assert(sizeof(BlockQ8_K) == 292, "wrong q8_K block size/padding");
 
+// ggml-common.h:288-299 block_q2_K. Upstream stores d/dmin in a
+// `GGML_EXTENSION union { struct { ggml_half d, dmin; }; ggml_half2 dm; }` after
+// scales+qs; the union is layout-inert (recorded deviation, layout-identical),
+// so the two halves are stated directly. Field ORDER matters: scales and qs LEAD
+// the block, the deltas TRAIL it (unlike q4_K/q5_K which lead with the deltas).
+struct BlockQ2_K {
+  uint8_t scales[kQK_K / 16];   // 16 — 4-bit sub-scale (low) + 4-bit sub-min (high)
+  uint8_t qs[kQK_K / 4];        // 64 — 2-bit quants
+  uint16_t d;                   // super-block scale (ggml_half)
+  uint16_t dmin;                // super-block min scale (ggml_half)
+};
+static_assert(sizeof(BlockQ2_K) == 84, "wrong q2_K block size/padding");
+
+// ggml-common.h:371-374 block_iq2_xxs. 2.0625 bpw codebook quant: `qs` is 32
+// u16 = 8 u32 per block (four 8-bit grid indices in aux[0], four 7-bit sign
+// selectors + a 4-bit scale in aux[1]) per 32-element sub-block. Decodes via
+// kIq2xxsGrid + kKsignsIq2xs (cpu_quant_iq_tables.h).
+struct BlockIQ2_XXS {
+  uint16_t d;                   // super-block scale (ggml_half)
+  uint16_t qs[kQK_K / 8];       // 32
+};
+static_assert(sizeof(BlockIQ2_XXS) == 66, "wrong iq2_xxs block size/padding");
+
+// ggml-common.h:385-400 block_iq3_xxs. 3.0625 bpw codebook quant: `qs` holds
+// QK_K/4 grid-index bytes (2 per lane) followed by QK_K/8 scale+sign bytes
+// (one u32 per 32-element sub-block: 4-bit scale in the top nibble + four 7-bit
+// sign selectors). Decodes via kIq3xxsGrid + kKsignsIq2xs.
+struct BlockIQ3_XXS {
+  uint16_t d;                   // super-block scale (ggml_half)
+  uint8_t qs[3 * kQK_K / 8];    // 96 — QK_K/4 grid indices + QK_K/8 scale+signs
+};
+static_assert(sizeof(BlockIQ3_XXS) == 98, "wrong iq3_xxs block size/padding");
+
 }  // namespace vt::cpu

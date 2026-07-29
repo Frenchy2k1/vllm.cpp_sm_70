@@ -234,6 +234,14 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 66, "IQ2_XXS"};
       return &t;
     }
+    case 18: {
+      // block_iq3_xxs (ggml-common.h:385-400): f16 d + 3*QK_K/8 u8 qs
+      // = 2 + 96 = 98. The Unsloth-Dynamic `UD-IQ2_XXS` down-projection
+      // routed experts (`ffn_down_exps`) are IQ3_XXS (codebook dequant in
+      // cpu_quant_dequant.cpp / vt DType kIQ3_XXS). DeepSeek-V4 W8.
+      static constexpr GgmlTypeTraits t{256, 98, "IQ3_XXS"};
+      return &t;
+    }
     case 22: {
       // block_iq2_s: f16 d + QK_K/4 qs + QK_K/16 qh = 2 + 64 + 16.
       // Used by the APEX "Mini" GGUFs for expert weights.

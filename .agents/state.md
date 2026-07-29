@@ -31949,3 +31949,38 @@ does not advance any of their states.
 `tests/capi/test_capi.cpp:410` (ABI v8 logits processor) and
 `test_model_loader_gguf` 2/3 (hard-coded registered-architecture list, since
 grown). Neither was touched.
+
+## 2026-07-29 — DeepSeek-V4-Flash W8: keep-quant memory enabler + GGUF name-map (run = honest residual)
+
+`CLAIM-DEEPSEEK-V4-W8`, isolated worktree `/home/mudler/_git/vllm.cpp-w8-run` (branch
+`deepseek-v4-w8-run`) off local `main` `4d618f59` (`git rev-parse HEAD`). CPU-only Debug gate; DGX
+`ssh dgx.casa` used read-only (confirmed host `promaxgb10-4ad8`, 392 GiB disk free, 119 GiB unified
+pool with 87 GiB already in use by the LocalAI containers) + HF HTTP-range shard-header fetch. NO 91 GB
+download, NO GPU run. Foreground; NOT pushed. DGX left as found (no containers touched).
+
+**Landed + gated (the two GATING prerequisites of the run):**
+1. **Keep-quant `vec_dot` for IQ2_XXS / IQ3_XXS / Q2_K** — the crux memory enabler. 1:1 ports of ggml
+   `vec_dot_{iq2_xxs,iq3_xxs,q2_K}_q8_K_generic` (`quants.c:855/999/514`) + `DequantIQ3_XXS`
+   (`ggml-quants.c:2503`) + shared codebook tables (`cpu_quant_iq_tables.h`) + `kIQ3_XXS` dtype/blocks
+   + three Q8_K traits rows ⇒ `HasQuantDotKernel` TRUE ⇒ the loader keeps these blocks COMPRESSED
+   (~91 GiB vs the ~316 GiB bf16 OOM). Gate `test_ops_quant_dot` **19 cases / 130444 assertions**
+   (vec_dot vs f64 dequant-dot ≤1e-5·L1, NMSE ≤5e-4 vs dequant-f32, bit-exact across threads, ragged-K
+   reject); **RED-first** perturb the IQ2_XXS `0.125` fold → 2 cases/18 fail, revert → 19/130444.
+   **HONEST CORRECTION** of the brief's "IQ2_XXS + Q2_K": the real `UD-IQ2_XXS` experts are IQ2_XXS
+   (gate/up) + **IQ3_XXS** (down); Q2_K is the `UD-Q2_K_XL` sibling — all three landed.
+   **HONEST finding:** NO CUDA keep-quant vec_dot for ANY k-quant (`kMatmulBTQuant` CPU-only) — on GB10
+   it runs on the 20 ARM cores against the unified pool.
+2. **GGUF `blk.N.*`→V4 name-map, EXACT 1328/1328 coverage** (`scripts/check-dsv4-gguf-namemap.py`
+   rc=0, 0 unmapped / 0 leftover) verified against the real manifest read from the shard GGUF headers
+   via HF HTTP-range (no download). Topology confirmed: 43 layers, hash{0,1,2}, indexer 21 =
+   compress_ratio==4, compressor 41. Registry reject replaced with a precise "keep-quant + name-map
+   landed; W2b pending" message (not a fake-accept path).
+
+**The RUN — HONEST RESIDUAL (did NOT execute, NOT faked).** Blocked on the unimplemented **W2b**:
+materialize the GGUF keep-quant blocks (+ F32 MHC/DSA tensors) into the `DeepseekV4` weight towers via
+the name-map — a genuine code brick, not just memory/download. Then: free DGX disk ≥100 GiB,
+`flock $HOME/gpu.lock` + `docker stop local-ai-worker`, download `UD-IQ2_XXS` (3 shards ~91 GB),
+keep-quant load, `ForwardDevice` greedy gen, self-consistency + coherence gate, benchmark. Model-matrix
+DeepSeek-V4 row STAYS `SPIKE`. Records: `kernel-matrix` (`KERNEL-QUANT-CIQ-IQUANT`, count 43→44),
+`quantization-matrix` (IQ2_XXS/IQ3_XXS/Q2_K `C`→`Y`), spec §W8, STATUS, BENCHMARKS (PENDING),
+coordination, parity-ledger. Checkers rc=0 (agent-record, model-checklist, doc-checkpoint).
