@@ -496,6 +496,11 @@ inner-state-free; `test_model_registry` 24/24. Test-golden sync (2026-07-29):
 `test_model_loader_gguf`'s hardcoded supported-architectures string was likewise
 stale (predated the breadth-sweep + frontier registrations); synced to include
 DeepseekV4/Gemma4/KimiK3/Qwen3VL, `test_model_loader_gguf` 3/3 (was RED on main).
+Env-doc hygiene (2026-07-29): two production env vars recent lanes added were
+undocumented (left `check-env-doc` RED) — `VLLM_PLUGINS` (user-facing plugin
+allowlist) documented in `docs/ENVIRONMENT.md`, `VLLM_GEMMA4_MM_DEBUG` (a
+diagnostic print switch) classified on `scripts/env-doc-allowlist.txt`;
+`check-env-doc` rc=0.
 The matrix opens with an
 architecture-support checklist (a per-architecture status roll-up covering every
 engaged model) that a CI checker keeps in lockstep with the detailed rows.

@@ -1025,7 +1025,9 @@ Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** (2026-07-29
 registry-metadata fix — `KimiK3ForConditionalGeneration` outer wrapper
 `has_inner_state=false` + `test_model_registry` drift repaired, plus the
-2026-07-29 `test_model_loader_gguf` supported-arch golden sync — is likewise
+2026-07-29 `test_model_loader_gguf` supported-arch golden sync, plus the
+2026-07-29 env-doc hygiene fix (`VLLM_PLUGINS` documented, `VLLM_GEMMA4_MM_DEBUG`
+allowlisted, `check-env-doc` rc=0) — is likewise
 NOT APPLICABLE: metadata + test hygiene only, no build/run/measurement owed.) Scopes
 `KimiK3ForConditionalGeneration` (released 2026-07-27, beyond the pin) — a 2.8T MoE
 whose text backbone is the Kimi-Linear KDA+MLA+MoE hybrid scaled to H=7168 / 93
