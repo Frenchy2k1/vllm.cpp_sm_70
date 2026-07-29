@@ -33046,3 +33046,52 @@ build proven three ways, the SACRED set (`test_qwen27_paged_engine` 235/235,
 `test_qwen36_paged_engine`, `test_nvfp4_dequant`), the asset-gated
 `test_qwen27_gguf_nvfp4_compute` residency + generation gate, and the fp4-vs-bf16
 same-binary A/B that `docs/BENCHMARKS.md` carries as `PENDING`.
+
+## 2026-07-29 — `QUANT-GGUF-NVFP4` column `C` VERIFIED on GB10, and my own prediction corrected
+
+Same claim `CLAIM-GGUF-NVFP4-COMPUTE`, closing the "NEXT (owed)" list of the
+entry above. dgx.casa GB10 sm_121a, CUDA 13, clean `git archive` of `d967733d`
+into `~/work/nvfp4-c/src`, one `flock $HOME/gpu.lock` across the series on an
+idle box. Build proven production-configured THREE ways before any number was
+trusted: `grep -ci "cutlass not found" configure.log` = 0 (log prints `CUTLASS
+found at /home/mudler/cutlass-4.5.0`, `Marlin NVFP4 W4A16 MoE GEMM enabled`,
+`FlashAttention-2 ... ENABLED for arch(es) [121a]`, 29 `Triton AOT:` lines,
+`MANIFEST hashes OK`); `cuobjdump -lelf` on both gate binaries = 41 cubins ALL
+`sm_121a`, zero `sm_75`; SACRED `test_qwen27_paged_engine` **235/235, exit 0**.
+
+**THE PREDICTION IN THE PREVIOUS ENTRY WAS WRONG, and the correction is the
+result.** That entry reasoned from the measured 192-tensor weight delta that the
+two containers' greedy divergence "was never closable by this row". Measured, it
+closes COMPLETELY on the discriminating prompt: with `VT_GGUF_NVFP4_FP4=1` the
+27B NVFP4 GGUF's 24-token greedy stream is IDENTICAL to the safetensors
+container's (divergence index 24 of 24), while `VT_GGUF_NVFP4_FP4=0` on the SAME
+BINARY diverges at index 4 (`271` against `198`). Both arms reproduced 2 of 2 in
+one interleaved 0/1/1/0 series. So the weight delta is real but does not move the
+greedy argmax here, and the bf16-vs-fp4 compute difference — the thing this row
+removes — was the operative cause of the divergence this repo had recorded. Both
+halves are kept in the record: the delta still governs what may be GATED (identity
+is not guaranteed by construction, so it is reported, never asserted), and the
+measurement is what was actually observed.
+
+**Residency and load, same-binary A/B, 2 reps per arm, rc=0 throughout:** peak
+RSS 50.78 / 50.83 GiB (bf16) against 25.67 / 25.67 GiB (fp4) = **1.98x**;
+load-and-generate 1:58.50 / 1:36.30 against 0:41.41 / 0:40.14 = **2.4-2.9x**. The
+routing audit shows **256 of 851** routed tensors taking the fp4 residency with 0
+left bf16, and those 256 projections cost **35 840 MiB** expanded against **10
+080 MiB** fp4-resident (3.56x, exactly 2 bytes/element against 0.5625). A side
+effect worth recording as a constraint: on the bf16 arm the process is OOM-killed
+if a second 27B engine is loaded beside it on the 119 GiB unified pool, which is
+why the safetensors reference is captured in its own process.
+
+**Regression, same build, same lock, every one rc=0:**
+`test_qwen27_paged_engine` 235/235 (SACRED), `test_qwen36_paged_engine` 2 cases /
+315/315 (SACRED), `test_gguf_nvfp4` 11/11 **2784/2784** with the real assets (its
+full-file sweep compares 192 NVFP4 tensors across both containers),
+`test_nvfp4_dequant` 4/47, `test_gguf_keep_quant` 37/5985, `test_gguf` 30/103,
+`test_gguf_dequant` 15/480, `test_gguf_qwen36_loader` 6/286. Box idle throughout;
+`/` at 92% before and after; no doctest `-s`; evidence under
+`~/work/nvfp4-c/ev2/`.
+
+**Still owed and NOT claimed:** a serving-throughput arm (tokens/s, TTFT, TPOT at
+concurrency) against the vLLM oracle on the equivalent workload. `P` stays `-`.
+Work remains LOCAL; nothing pushed.

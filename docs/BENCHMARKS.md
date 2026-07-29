@@ -3877,47 +3877,81 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
-### Native NVFP4 compute from a GGUF, `QUANT-GGUF-NVFP4` column `C` (2026-07-29) - correctness binding, speed PENDING
+### Native NVFP4 compute from a GGUF, `QUANT-GGUF-NVFP4` column `C` (2026-07-29) - load + residency ACCEPTED, serving throughput PENDING
 
-**Benchmark disposition: `PENDING`.** This change moves NVFP4 GGUF weights off
-the load-time bf16 expansion and onto the existing `vt::MatmulNvfp4*` kernels,
-so unlike the materialization row below it DOES owe a number: an fp4-vs-bf16
-same-binary A/B on the 27B NVFP4 GGUF (throughput, TTFT, TPOT, peak memory),
-plus the vLLM oracle arm on the equivalent workload. Not measured yet, and no
-number is claimed. Reproduction entry point, on an idle GB10 under one
-`flock $HOME/gpu.lock` for the whole series:
+**Benchmark disposition: load-time and weight-residency numbers ACCEPTED;
+serving throughput `PENDING`.** Moving NVFP4 GGUF weights off the load-time bf16
+expansion and onto the existing `vt::MatmulNvfp4*` kernels is measured below as a
+same-binary A/B. A serving-throughput arm (tokens/s, TTFT, TPOT at concurrency,
+against the vLLM oracle on the equivalent workload) is NOT measured and no such
+number is claimed.
 
-    VLLM_NVFP4_GGUF=~/bench/q36-27b-nvfp4.gguf \
-    VLLM_NVFP4_ST_DIR=~/bench/q36-27b-nvfp4-vllm \
-      ./tests/test_qwen27_gguf_nvfp4_compute            # correctness + residency
-    VT_GGUF_NVFP4_FP4=1 ./examples/cli --model ~/bench/q36-27b-nvfp4.gguf ...
-    VT_GGUF_NVFP4_FP4=0 ./examples/cli --model ~/bench/q36-27b-nvfp4.gguf ...
+Build proven production-configured three ways before any number was trusted:
+`grep -ci "cutlass not found" configure.log` = **0**; `cuobjdump -lelf` on both
+gate binaries = **41 cubins, all `sm_121a`, zero `sm_75`**; SACRED
+`test_qwen27_paged_engine` **235/235, exit 0**, 30.91 s, 23.67 GiB. dgx.casa GB10
+sm_121a, CUDA 13, clean `git archive` tree at `~/work/nvfp4-c/src`, one
+`flock $HOME/gpu.lock` across the whole series, idle box (3-4 GiB used at series
+start and end, no CUDA compute apps), `/` at 92% before and after.
 
-The two arms differ ONLY in the residency flag, so they are a same-binary A/B by
-construction.
+**Same-binary A/B**, `test_qwen27_gguf_nvfp4_compute -tc="*generates through the
+fp4 path*"`, 27B NVFP4 GGUF, greedy, 24 tokens, prompt "The capital of France
+is", 2 reps per arm, interleaved 0/1/1/0:
 
-**A cross-container throughput or token comparison against
-`~/bench/q36-27b-nvfp4-vllm/` is NOT a valid arm and must not be published as
-one.** The two containers are not the same model: the GGUF NVFP4-quantizes the
-192-tensor GDN `in_proj_{qkv,z,a,b}` family that the safetensors keeps in BF16
-(mean relative weight error ~0.18 on `attn_qkv`, measured layers 0/1/40), and
-their activation global scales disagree on most projections (`ffn_gate` 808 vs
-812, `ffn_up` 344 vs 276, `ffn_down` 5.219 vs 3.547, `attn_output` 724 vs 292;
-`attn_q` matches). This retires the reading recorded elsewhere in this file that
-their token divergence at index 4 was a bf16-vs-fp4 COMPUTE artifact closable by
-this row. Full table: `.agents/specs/gguf-nvfp4-native-compute.md` Sec A.
+| `VT_GGUF_NVFP4_FP4` | peak RSS | wall (load + generate) | tokens |
+|---|---|---|---|
+| `0` - bf16 expansion (the old behavior) | 50.78 / 50.83 GiB | 1:58.50 / 1:36.30 | reproduced 2/2 |
+| `1` - native fp4 | **25.67 / 25.67 GiB** | **0:41.41 / 0:40.14** | reproduced 2/2 |
 
-**The binding correctness result is BYTE-IDENTITY of the fp4 operands**, which
-is stronger than a value comparison and is what makes the fp4 kernels reusable
+**1.98x lower peak RSS and 2.4-2.9x faster load-and-generate**, both arms
+reproducing exactly, rc=0 throughout. The win is weight residency: the routing
+audit shows **256 of 851** routed tensors take the fp4 residency (64 layers x
+dense MLP gate/up/down, plus 16 full-attention layers x q/k/v/o, **0** left
+bf16), and those same projections cost **35 840 MiB** expanded against **10 080
+MiB** fp4-resident - a **3.56x** reduction, exactly 2 bytes/element against
+0.5625. On the bf16 arm the process is OOM-killed if a second 27B engine is
+loaded beside it on the 119 GiB unified pool; on the fp4 arm both fit.
+
+**Token result (REPORTED, not a gate).** Against the safetensors container of the
+same quantization run, generated in its own process on the same binary and
+prompt: the **fp4 arm is token-IDENTICAL, divergence index 24 of 24**, where the
+**bf16 arm diverges at index 4** (`271` against `198`). This RETIRES the reading
+recorded elsewhere in this file that the two containers' index-4 divergence was
+permanent - it was the compute delta, and it closes. It is reported rather than
+gated because the containers are not the same model and identity is not
+guaranteed: the GGUF NVFP4-quantizes the 192-tensor GDN `in_proj_{qkv,z,a,b}`
+family the safetensors keeps in BF16 (mean relative weight error ~0.18 on
+`attn_qkv`, layers 0/1/40), and their activation global scales disagree on most
+projections (`ffn_gate` 808 vs 812, `ffn_up` 344 vs 276, `ffn_down` 5.219 vs
+3.547, `attn_output` 724 vs 292; `attn_q` matches). A cross-container THROUGHPUT
+arm is likewise not valid. Full table:
+`.agents/specs/gguf-nvfp4-native-compute.md` Sec A and Sec C.
+
+**The binding correctness result is BYTE-IDENTITY of the fp4 operands**, which is
+stronger than a value comparison and is what makes the fp4 kernels reusable
 without re-deriving numerics: the ggml type-40 blocks repack into exactly the
-`weight_packed` / `weight_scale` bytes the compressed-tensors container of the
-same quantization run stores.
+`weight_packed` / `weight_scale` bytes the compressed-tensors container stores.
 
     CI (asset-free, real bytes from BOTH containers embedded)
       tests/vllm/test_gguf_nvfp4.cpp        11/11 cases, 2207/2207 assertions
       tests/vllm/test_gguf_keep_quant.cpp   37/37 cases, 5986/5986 assertions
+    Asset-gated, dgx GB10, under the same flock
+      test_gguf_nvfp4  11/11, 2784/2784  (full-file sweep: 192 NVFP4 tensors
+                                          compared across both containers)
     Mutation (the gate is not vacuous): flipping the nibble halves in
       RepackGgufNvfp4Rows makes test_gguf_nvfp4 9/11, 6 assertions RED.
+    Regression, same build, same lock, all rc=0
+      test_qwen27_paged_engine 235/235 (SACRED)
+      test_qwen36_paged_engine 2 cases / 315/315 (SACRED)
+      test_nvfp4_dequant 4/47, test_gguf 30/103, test_gguf_dequant 15/480,
+      test_gguf_keep_quant 37/5985, test_gguf_qwen36_loader 6/286
+
+Reproduction entry point:
+
+    ~/work/nvfp4-c/run_ab3.sh          # the A/B series above, one flock
+    VLLM_NVFP4_GGUF=~/bench/q36-27b-nvfp4.gguf \
+    VLLM_NVFP4_ST_DIR=~/bench/q36-27b-nvfp4-vllm \
+      ./tests/test_qwen27_gguf_nvfp4_compute
 
 ### NVFP4 in the GGUF loader, `QUANT-GGUF-NVFP4` (2026-07-28) - correctness only, NOT APPLICABLE
 
