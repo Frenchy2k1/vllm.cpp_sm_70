@@ -682,9 +682,18 @@ aborts. Residuals: the `vllm run-batch` CLI (W2), embeddings/score/rerank + audi
 dispatch (W3-W4, rides pooling), http(s)/data-URL I/O + overlapped `AsyncLLM`
 submission (W5).
 
-One MED gap still has NO stable row yet (records gap, recommend creating on
-pickup, IDs named in the spec): generic separate draft-model + Medusa spec
-decode (`vllm/v1/spec_decode/draft_model.py:19`, `medusa.py:18`).
+The generic separate draft-model + Medusa spec-decode records-gap
+(`vllm/v1/spec_decode/draft_model.py:19`, `medusa.py:18`) was **picked up
+2026-07-29** as [`SPEC-DRAFT-MODEL`](engine-matrix.md) (`CLAIM-SPEC-DRAFT-MEDUSA`,
+`INVENTORIED`→`ACTIVE`, spec [draft-model-medusa-spec.md](specs/draft-model-medusa-spec.md)):
+W0 spike + W1 CPU brick — the k-step greedy autoregressive propose reusing the
+LANDED `SPEC-REJECTION` verify UNCHANGED, unit-gated RED-first
+(`test_draft_model_proposer` 6 cases / 41 assertions: accepted==target greedy,
+full-acceptance depends on the autoregressive feed-back) + the `draft_model`
+config accept. Medusa is rowed as [`SPEC-MEDUSA`](engine-matrix.md) (`SPIKE`,
+proposer deferred to W2). Residuals: the Medusa proposer (W2); the real GPU
+draft-model forward + DGX e2e greedy our-ON==vLLM-ON token-exact gate + the
+throughput speed gate (W3, DGX-offline).
 Confirmed NON-gap: vLLM has REMOVED prompt adapters. Other MED/LOW gaps
 (DP/EP+EPLB [`PAR-DP`](engine-matrix.md)/[`PAR-EP-EPLB`](engine-matrix.md), KV
 offload [`KV-OFFLOAD`](engine-matrix.md), external KV connectors / PD

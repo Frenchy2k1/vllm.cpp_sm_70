@@ -41,12 +41,12 @@ forensics: roadmap_v1.md and the parity ledger.
 | Parallelism | 6 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 5 |
 | Sampling and generation | 15 | 0 | 2 | 0 | 0 | 7 | 0 | 1 | 5 |
 | Structured output and tools | 7 | 0 | 3 | 0 | 0 | 2 | 0 | 0 | 2 |
-| Speculative decoding | 10 | 0 | 1 | 0 | 0 | 3 | 0 | 3 | 2 |
+| Speculative decoding | 12 | 0 | 1 | 1 | 0 | 4 | 0 | 3 | 2 |
 | Serving, API, CLI, library | 21 | 3 | 2 | 1 | 0 | 6 | 2 | 1 | 6 |
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 1 |
 | Long context and attention | 10 | 0 | 0 | 0 | 1 | 5 | 1 | 0 | 3 |
 | Loading, tokenizer, config | 9 | 1 | 3 | 0 | 0 | 2 | 1 | 1 | 1 |
-| **Total** | **128** | **8** | **17** | **3** | **4** | **46** | **8** | **8** | **33** |
+| **Total** | **130** | **8** | **17** | **4** | **4** | **47** | **8** | **8** | **33** |
 
 ## Engine core and scheduling
 
@@ -169,6 +169,11 @@ bitmask, one row per draft token) is deferred — see
 [porting-inventory.md §6](porting-inventory.md) — and is in scope for neither
 the `TOOLS-STRUCTURED-CORE` row nor the `SPEC-*` rows above until a spike
 claims it.
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `SPEC-DRAFT-MODEL` | Generic model-agnostic SEPARATE draft-model proposer (`method="draft_model"`): a full smaller standalone LM runs K autoregressive greedy steps to propose K draft tokens; the target verifies in one forward and the longest-accepted-prefix is emitted. Distinct from MTP/EAGLE/DFlash — `pass_hidden_states_to_model=False`, shares NEITHER embeddings NOR lm_head with the target. **W0 spike + W1 CPU brick LANDED 2026-07-29 (`CLAIM-SPEC-DRAFT-MEDUSA`, NOT pushed):** the greedy k-step autoregressive propose (`DraftModelProposeGreedy`/`Batch`) over a `DraftLogitsFn` next-token oracle, reusing the LANDED `SPEC-REJECTION` verify/accept UNCHANGED (only the proposer is net-new, mirror of the SPEC-NGRAM shape). Unit-gated RED-first: propose->verify->accept equivalence (accepted tokens == the target's own greedy run, every draft/target (dis)agreement pattern) + full-acceptance on a matching draft (num_sampled==k+1) + the RED witness that full acceptance DEPENDS on the autoregressive feed-back (5/6 fail with feed-back dropped). `ParseSpeculativeConfigJson` accepts `"draft_model"` (requires `model` + `num_speculative_tokens`). Additive + default-inert (no runner construction; engine byte-identical with no `SpeculativeConfig`). Clean CPU `-Werror`. **RESIDUAL (W3, DGX-offline):** the real draft-model forward behind the oracle (paged KV + CUDA-graph) + e2e greedy our-ON==vLLM-ON token-exact gate + throughput speed gate. | T2 | `vllm/v1/spec_decode/draft_model.py:19` (pass_hidden_states :29, no shared embed/lm_head :108-115); propose `vllm/v1/spec_decode/llm_base_proposer.py:502-767` (`_greedy_sample` :428-438, `set_inputs_first_pass` :838-851, K-1 feed-back :682-761); config `vllm/config/speculative.py:684,692-701,1195`; runner `vllm/v1/worker/gpu_model_runner.py:604-609`; e2e `tests/v1/e2e/spec_decode/test_spec_decode.py:500-561` @ `555967922` | `include/vllm/v1/spec_decode/draft_model_proposer.h`; `src/vllm/v1/spec_decode/draft_model_proposer.cpp`; `src/vllm/config/speculative.cpp` (`draft_model` accept); reuses `src/vllm/v1/spec_decode/rejection_sampler.{h,cpp}` | `tests/vllm/v1/spec_decode/test_draft_model_proposer.cpp` (6/6, 41 assertions, CPU; RED-first 5/6 fail with feed-back dropped); ledger [parity-ledger.md](parity-ledger.md) 2026-07-29 | [specs/draft-model-medusa-spec.md](specs/draft-model-medusa-spec.md) | `ACTIVE` | `CLAIM-SPEC-DRAFT-MEDUSA` |
+| `SPEC-MEDUSA` | Medusa multi-head speculator (`method="medusa"`): the target carries N extra Medusa LM heads, each predicting ONE future position from the SAME target hidden state in a single (non-autoregressive) pass; `draft_tokens = stack([argmax(head_logits)])` -> `[batch, num_heads]`, `num_speculative_tokens == num_heads`. Verify/accept is the SAME `SPEC-REJECTION` loop (linear, not tree, at this pin). **W0 spike ONLY (`CLAIM-SPEC-DRAFT-MEDUSA`, 2026-07-29):** proposer scoped in [specs/draft-model-medusa-spec.md](specs/draft-model-medusa-spec.md); deferred to W2 because its multi-head target-tap propose needs the target model's Medusa heads (a model change) a pure host brick cannot meaningfully stand up. No code yet. | T2 | `vllm/v1/spec_decode/medusa.py:18` (propose :40-58: `model(hidden)`->per-head `compute_logits`->stacked argmax); config `vllm/config/speculative.py:822,888-889`; runner `vllm/v1/worker/gpu_model_runner.py:642-645` @ `555967922` | - (spike only, not implemented) | - (W2) | [specs/draft-model-medusa-spec.md](specs/draft-model-medusa-spec.md) | `SPIKE` | `CLAIM-SPEC-DRAFT-MEDUSA` |
 
 ## Serving surface, CLI, and library
 

@@ -112,6 +112,23 @@ sequence's own suffix n-gram, so it needs no draft model and works on any model;
 on the 27B it is token-exact vs vLLM's own `--speculative-config ngram` on
 repetitive workloads (5/5 prompts, every draft accepted).
 
+**Generic separate draft-model** (method `draft_model`, `SPEC-DRAFT-MODEL`
+ACTIVE) is spiked with its first CPU brick landed, not yet wired into any
+production path. The classic model-agnostic path runs a full smaller standalone
+draft LM K autoregressive greedy steps to propose K tokens, which the target
+verifies in one forward (longest-accepted-prefix), reusing the landed rejection
+sampler unchanged (only the proposer is net-new). W1 landed the greedy propose
+(`DraftModelProposeGreedy` over a next-token-logits oracle) + the `draft_model`
+`--speculative-config` accept, unit-gated RED-first (`test_draft_model_proposer`
+6 cases / 41 assertions: the accepted tokens equal the target's own greedy run
+for every draft/target agreement pattern, a target-matching draft is fully
+accepted, and full acceptance depends on the autoregressive feed-back). NOT yet
+wired: the real GPU draft-model forward behind the oracle (paged KV, CUDA-graph)
++ the e2e greedy our-ON==vLLM-ON token-exact gate + the throughput speed gate are
+DGX-offline residuals (W3). **Medusa** (method `medusa`, `SPEC-MEDUSA` SPIKE) is
+spiked only; its N-head single-pass proposer is deferred to W2 (needs the
+target's Medusa heads). See docs/BENCHMARKS.md.
+
 The correctness form and the full D0-D14 measured chronology live in
 [docs/BENCHMARKS.md](BENCHMARKS.md),
 [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) and

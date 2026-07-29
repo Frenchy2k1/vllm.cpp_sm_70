@@ -33,14 +33,19 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
   }
   cfg.method = doc.at("method").get<std::string>();
   // SPEC-DFLASH D4: accept "dflash" alongside "mtp". SPEC-NGRAM (ROAD-V1-D3):
-  // accept "ngram" — the draft-free proposer. "mtp"/"dflash" are draft-hidden-state
-  // methods; the loader resolves the concrete draft (MTP head vs the z-lab DFlash
+  // accept "ngram" — the draft-free proposer. SPEC-DRAFT-MODEL: accept
+  // "draft_model" — the classic model-agnostic SEPARATE draft model
+  // (speculative.py:684 default; uses_draft_model :1195; runner
+  // gpu_model_runner.py:604-609). "mtp"/"dflash" are draft-hidden-state methods;
+  // the loader resolves the concrete draft (MTP head vs the z-lab DFlash
   // checkpoint) and the block-derived k from the model config. "ngram" needs no
-  // draft model. Any other method is still rejected at this pin.
-  if (cfg.method != "mtp" && cfg.method != "dflash" && cfg.method != "ngram") {
+  // draft model; "draft_model" needs a separate `model` checkpoint (below).
+  // Any other method is still rejected at this pin.
+  if (cfg.method != "mtp" && cfg.method != "dflash" && cfg.method != "ngram" &&
+      cfg.method != "draft_model") {
     throw std::invalid_argument(
-        "speculative-config: only methods \"mtp\", \"dflash\" and \"ngram\" are "
-        "supported at this pin (got \"" +
+        "speculative-config: only methods \"mtp\", \"dflash\", \"ngram\" and "
+        "\"draft_model\" are supported at this pin (got \"" +
         cfg.method + "\")");
   }
 
@@ -87,6 +92,23 @@ SpeculativeConfig ParseSpeculativeConfigJson(const std::string& json_text) {
     throw std::invalid_argument(
         "speculative-config: method \"dflash\" requires a \"model\" key naming "
         "the DFlash draft checkpoint (path or HF repo id)");
+  }
+  // SPEC-DRAFT-MODEL: the generic draft model is a SEPARATE standalone
+  // checkpoint, so it likewise requires the `model` key (speculative.py:692-701;
+  // a separate `draft_model_config` is built from it). num_speculative_tokens (k)
+  // is also required for a draft model — there is no head depth to default from
+  // (speculative.py has no n_predict for "draft_model").
+  if (cfg.method == "draft_model") {
+    if (!cfg.draft_model_path.has_value()) {
+      throw std::invalid_argument(
+          "speculative-config: method \"draft_model\" requires a \"model\" key "
+          "naming the separate draft checkpoint (path or HF repo id)");
+    }
+    if (!cfg.num_speculative_tokens.has_value()) {
+      throw std::invalid_argument(
+          "speculative-config: method \"draft_model\" requires "
+          "\"num_speculative_tokens\"");
+    }
   }
   // n_predict stays 0 here: the model loader resolves it from the checkpoint's
   // mtp_num_hidden_layers and re-runs ResolveMtp with this user k.
