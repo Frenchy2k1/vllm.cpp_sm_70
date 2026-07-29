@@ -288,9 +288,20 @@ through the OpProvider seam, dispatched by a real `DeepseekV4Model::ForwardDevic
 and RUNTIME-VERIFIED on the DGX GB10 at small shape vs the host-ref oracle
 (`test_cuda_deepseek_v4` 11/11·153, compute-sanitizer memcheck 0 errors, RED-first
 proven; 2026-07-29, `CLAIM-DEEPSEEK-V4-W7-DEVICE`). The 512-wide MLA attn + expert
-grouped-GEMM REUSE the existing NVFP4/FP8 kernels. Still NOT runnable end-to-end:
-the real-checkpoint tower materialization (W2b) + the full paged-engine strict gate
-(W8) are multi-Spark-blocked (156.7 GiB does not fit ONE GB10).
+grouped-GEMM REUSE the existing NVFP4/FP8 kernels. The **W2b GGUF keep-quant tower
+materialization is now landed** (2026-07-29, `CLAIM-DEEPSEEK-V4-W2B`):
+`LoadDeepseekV4FromGguf` (+ `DeepseekV4ParamsFromGguf`) wires the landed `blk.N.*`
+name-map + keep-quant blocks into the `DeepseekV4` weight towers (the MLA linears,
+router gate, 256 routed + shared experts, and lm_head KEEP their ~2-3-bit blocks
+COMPRESSED via `OwnGgufQuantBlocks`, the ~91 GiB-vs-~316 GiB OOM enabler; norms /
+MHC / DSA / embed / `tid2eid` dequant), accounts for every tensor, lifts the registry
+GGUF reject, and dequants the tiny CPU composition tower so a loaded model forwards
+(`test_deepseek_v4_gguf_load` 5/5·149 — accounting 126/126, keep-quant residency,
+load→forward, RED-first) — DERIVED + BUILD-VERIFIED at tiny synthetic shape. Still
+NOT runnable end-to-end on the REAL checkpoint: the 91 GB `UD-IQ2_XXS` single-Spark
+run (keep-quant load + `ForwardDevice` greedy gen + self-consistency/coherence gate +
+benchmark) is the W8-final operational residual (download + DGX), and the NVFP4/fp8
+paged-engine strict gate (W8) is multi-Spark-blocked (156.7 GiB does not fit ONE GB10).
 **HW-fit correction:** that NVFP4 checkpoint is **156.7 GiB**, NOT the ~83 GiB the
 scoping spike estimated (only the 256 routed experts are W4; the MLA and shared
 linears are FP8 plus NVFP4 double-scale overhead), so it does **not** fit ONE

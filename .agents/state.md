@@ -31984,3 +31984,39 @@ keep-quant load, `ForwardDevice` greedy gen, self-consistency + coherence gate, 
 DeepSeek-V4 row STAYS `SPIKE`. Records: `kernel-matrix` (`KERNEL-QUANT-CIQ-IQUANT`, count 43→44),
 `quantization-matrix` (IQ2_XXS/IQ3_XXS/Q2_K `C`→`Y`), spec §W8, STATUS, BENCHMARKS (PENDING),
 coordination, parity-ledger. Checkers rc=0 (agent-record, model-checklist, doc-checkpoint).
+
+---
+
+## 2026-07-29 — DeepSeek-V4-Flash W2b: GGUF keep-quant TOWER materialization (`CLAIM-DEEPSEEK-V4-W2B`)
+
+Isolated worktree `/home/mudler/_git/vllm.cpp-w2b-tower` (branch `deepseek-v4-w2b-gguf-tower`)
+off local `main` `341dfbb9` (the W8 keep-quant + name-map commit). CPU-only Debug, foreground,
+NOT pushed. **W2b is the last CODE brick before the real single-Spark run (W8-final).**
+
+**What landed (loader-only, SACRED-inert).** `LoadDeepseekV4FromGguf` + `DeepseekV4ParamsFromGguf`
++ the `DeepseekV4GgufWeights` OwnedTensor tower in `deepseek_v4_weights.cpp` / `deepseek_v4.h`
+(structurally mirroring the Qwen3.6 GGUF path `qwen3_5_gguf_weights.cpp`). Every `deepseek4` GGUF
+tensor routes through `GgufLoadPolicy::Route` with its `blk.N.*` name-map role: MW/SEW (512-wide
+MLA linears wq_a/wq_b/wkv/wo_a/wo_b, router gate, shared + 256 routed experts, lm_head) KEEP their
+~2-3-bit blocks COMPRESSED via `OwnGgufQuantBlocks` (the ~91 GiB-vs-~316 GiB OOM enabler); V/ET/HASH
+(norms, MHC hc_*, DSA compressor/indexer, attention sinks, embed, `tid2eid`, `exp_probs_b` bias)
+dequant to f32. The loader ACCOUNTS for every tensor (throws on an unmapped required tensor OR a
+leftover the map does not cover), lifts the registry GGUF reject (`kGguf` → `LoadDeepseekV4FromGguf`
+in `deepseek_v4_registry.cpp`), and dequants the tiny-config CPU composition `host` tower so a loaded
+model FORWARDs.
+
+**Gate.** `tests/vllm/models/test_deepseek_v4_gguf_load.cpp` **5/5 cases · 149 assertions GREEN**
+(CPU Debug, loader TUs `-Werror`-clean). Tiny synthetic `deepseek4` GGUF (real `blk.N.*` names +
+Q8_0 keep-quant): accounting 126/126 == file set (none unmapped/leftover, per-layer topology mapped),
+keep-quant residency (down-experts stay Q8_0, bytes < dequant-f32; expand-policy RED → bf16),
+load→`DeepseekV4ForwardHost` finite+deterministic, RED-first (missing/leftover throw). SACRED-inert
+PROVEN: forward + W3-W6 primitives + shared MLA/MoE empty-diff; prior V4 tests 6/26 + 4/40 unchanged.
+
+**Honest 3-state.** Tiny-synthetic load→forward = DERIVED + BUILD-VERIFIED. The real 91 GB
+`UD-IQ2_XXS` load + generate stays **W8-FINAL** (operational: download + DGX keep-quant load +
+`ForwardDevice` greedy gen + self-consistency/coherence gate + benchmark). Also folded into that
+run: a `deepseek4` arm in the top-level `HfConfigFromGguf` dispatch (`LoadedEngine::FromModelDir`,
+today qwen-only) so the CLI/server routes a `deepseek4` GGUF to this loader.
+
+**Records same-change:** model-matrix (both DeepSeek-V4 cells advanced, stays `SPIKE`), coordination
+(`CLAIM-DEEPSEEK-V4-W2B`), spec §W2b, STATUS, BENCHMARKS, parity-ledger, this state entry.

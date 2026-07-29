@@ -16,6 +16,20 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## DeepSeek-V4-Flash W2b - GGUF keep-quant tower materialization (2026-07-29, `CLAIM-DEEPSEEK-V4-W2B`) - NOT-APPLICABLE (loader wiring brick; no throughput owed) / real run PENDING (W8-final)
+
+W2b wires the landed `deepseek4` GGUF `blk.N.*` name-map + keep-quant blocks into the
+`DeepseekV4` weight towers (`LoadDeepseekV4FromGguf`): the MLA linears, router gate, 256
+routed + shared experts, and lm_head KEEP their ~2-3-bit blocks COMPRESSED (the ~91 GiB
+vs ~316 GiB OOM enabler); norms/MHC/DSA/embed/`tid2eid` dequant. Gated STRUCTURALLY at
+tiny synthetic shape (`test_deepseek_v4_gguf_load` 5/5·149: accounting 126/126, keep-quant
+residency, load→forward finite+deterministic, RED-first) - a loader brick owes no
+throughput number, so NOT-APPLICABLE this lane. The real single-Spark `UD-IQ2_XXS`
+benchmark (TPOT/throughput/peak-mem, llama.cpp-on-card floor) stays PENDING until the
+W8-final run: download ~91 GB to the DGX, keep-quant load into `DeepseekV4Model`,
+`ForwardDevice` greedy gen, self-consistency + coherence gate, then time it. Repro entry:
+`LoadDeepseekV4FromGguf` + the resume recipe in `.agents/specs/deepseek-v4-flash.md` §W2b.4.
+
 ## DeepSeek-V4-Flash W8 - keep-quant IQ2_XXS/IQ3_XXS/Q2_K + GGUF name map (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`) - PENDING (the RUN did not execute; memory enabler + name-map landed, gated)
 
 No throughput number: the single-Spark GGUF RUN did NOT execute this lane and was
