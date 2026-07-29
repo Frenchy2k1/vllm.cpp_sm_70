@@ -447,7 +447,10 @@ is a named residual. Registry-metadata correction (2026-07-29): the outer
 `has_inner_state=false` (mirroring the Qwen3.5 hybrid-mm sibling wrappers, whose
 inner language-model class carries the recurrent state), fixing the
 `test_model_registry` invariant that every registered outer wrapper is
-inner-state-free; `test_model_registry` 24/24.
+inner-state-free; `test_model_registry` 24/24. Test-golden sync (2026-07-29):
+`test_model_loader_gguf`'s hardcoded supported-architectures string was likewise
+stale (predated the breadth-sweep + frontier registrations); synced to include
+DeepseekV4/Gemma4/KimiK3/Qwen3VL, `test_model_loader_gguf` 3/3 (was RED on main).
 The matrix opens with an
 architecture-support checklist (a per-architecture status roll-up covering every
 engaged model) that a CI checker keeps in lockstep with the detailed rows.
