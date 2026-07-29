@@ -29,6 +29,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"  // StTensor, MaybeReleaseSourcePages
 #include "vllm/model_executor/models/qwen3_5_weights.h"           // OwnedTensor, TensorResolver
+#include "vllm/model_executor/models/tensor_parallel.h"           // TensorParallel/TpShard (W2)
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -95,7 +96,8 @@ inline OwnedTensor LoadBf16Transposed(const TensorResolver& get,
 // vt::MatmulBT (the cuBLASLt TN fast path). This is vLLM's physical ownership
 // rule for MergedColumnParallelLinear/QKVParallelLinear (one merged param).
 inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
-                                       const std::vector<std::string>& names) {
+                                       const std::vector<std::string>& names,
+                                       const TensorParallel* tp = nullptr) {
   VT_CHECK(!names.empty(),
            "dense loader: merged BF16 projection requires at least one shard");
   int64_t in_dim = -1;
@@ -120,23 +122,44 @@ inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
     shards.push_back(&tensor);
   }
 
-  VT_CHECK(out_dim <= std::numeric_limits<int64_t>::max() / in_dim,
+  // MergedColumnParallelLinear column shard (linear.py:832-833): each named
+  // constituent (gate|up, or q|k|v) is sharded INDEPENDENTLY along its output
+  // rows (dim 0), then concatenated. `TpShard` returns the whole row range at
+  // tp_size==1, so `sharded_out_dim == out_dim` and the copy below is
+  // byte-identical to the single-GPU merge. RESIDUAL (HW-gated): QKVParallel
+  // head-aware KV replication when tp_size > num_kv_heads (linear.py:1076-1079)
+  // is NOT modeled here — this even split matches MergedColumnParallel and
+  // QKVParallel where tp divides every head group.
+  int64_t sharded_out_dim = 0;
+  std::vector<ShardRange> ranges;
+  ranges.reserve(shards.size());
+  for (const StTensor* shard : shards) {
+    const ShardRange r = TpShard(tp, shard->shape[0]);
+    ranges.push_back(r);
+    sharded_out_dim += r.size();
+  }
+
+  VT_CHECK(sharded_out_dim <= std::numeric_limits<int64_t>::max() / in_dim,
            "dense loader: merged BF16 element count overflow");
   const auto elements =
-      static_cast<uint64_t>(out_dim) * static_cast<uint64_t>(in_dim);
+      static_cast<uint64_t>(sharded_out_dim) * static_cast<uint64_t>(in_dim);
   VT_CHECK(elements <= std::numeric_limits<size_t>::max() / sizeof(uint16_t),
            "dense loader: merged BF16 byte count overflow");
-  OwnedTensor merged = MakeOwned(vt::DType::kBF16, {out_dim, in_dim});
+  OwnedTensor merged = MakeOwned(vt::DType::kBF16, {sharded_out_dim, in_dim});
+  const size_t row_bytes = static_cast<size_t>(in_dim) * sizeof(uint16_t);
   size_t offset = 0;
   for (size_t i = 0; i < shards.size(); ++i) {
     const StTensor& shard = *shards[i];
-    const size_t expected = static_cast<size_t>(shard.shape[0]) *
-                            static_cast<size_t>(in_dim) * sizeof(uint16_t);
-    VT_CHECK(shard.nbytes == expected,
+    const size_t full = static_cast<size_t>(shard.shape[0]) * row_bytes;
+    VT_CHECK(shard.nbytes == full,
              "dense loader: byte-size mismatch for " + names[i]);
-    std::memcpy(merged.bytes.data() + offset, shard.data, expected);
-    MaybeReleaseSourcePages(shard.data, expected);
-    offset += expected;
+    const ShardRange& r = ranges[i];
+    const size_t src_off = static_cast<size_t>(r.begin) * row_bytes;
+    const size_t copied = static_cast<size_t>(r.size()) * row_bytes;
+    std::memcpy(merged.bytes.data() + offset,
+                static_cast<const uint8_t*>(shard.data) + src_off, copied);
+    MaybeReleaseSourcePages(shard.data, full);
+    offset += copied;
   }
   VT_CHECK(offset == merged.bytes.size(),
            "dense loader: merged BF16 byte accounting mismatch");

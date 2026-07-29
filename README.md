@@ -65,7 +65,7 @@ server, use `build/examples/vllm-cli --model <dir> --prompt "..."`.
   sample logprobs.
 - **Structured output.** JSON schema, JSON object, regex, choice, and GBNF grammar, enforced in the
   engine with a per-step logits bitmask.
-- **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 7 reasoning
+- **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 9 reasoning
   parsers, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`.
 - **Speculative decoding.** MTP, block-diffusion DFlash, and draft-free ngram via
   `--speculative-config`, the same JSON vLLM takes.
@@ -104,6 +104,7 @@ self-inconsistent at bf16 near-ties, the bar is a near-tie-robust check. "Speed"
 | GLM-4 dense | GLM-4-9B-0414 | - | Token-exact | Speed-pending |
 | GLM-4.7-Flash (MLA MoE) | GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
 | Gemma-3 / Gemma-2 / Gemma-1 dense | gemma-3-1b-it, gemma-2-2b-it, gemma-2b | - | Token-exact (48/48 each) | Speed-pending |
+| Gemma-4 text (Gemma4ForConditionalGeneration) | unsloth/gemma-4-E4B-it | - | Strict token-exact 32/32 (text path) | Speed-pending |
 | OLMo-2 dense | OLMo-2-0425-1B | - | Token-exact (near-tie-robust) | Speed-pending |
 | OLMo-3 dense | OLMo-3-1025-7B | - | Implemented, oracle-blocked | Speed-pending |
 | Granite-3 dense | granite-3.3-2b-instruct | - | Token-exact (16/16) | Speed-pending |
@@ -181,7 +182,7 @@ Read from [`CMakeLists.txt`](CMakeLists.txt). Defaults shown are the shipped def
 | Option | Default | Purpose |
 |---|---|---|
 | `VLLM_CPP_CUDA` | `AUTO` | Build the CUDA backend: `ON`, `OFF`, or `AUTO` (on when a CUDA toolchain is found) |
-| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family portable-only targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110`. The `a` suffix is required for the native fp4 MMA |
+| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110`. The `a` suffix is required for the native fp4 MMA |
 | `VLLM_CPP_METAL` | `AUTO` | Build the Metal backend: `ON`, `OFF`, or `AUTO` (on for an Apple host with an ObjC++ compiler) |
 | `VLLM_CPP_VULKAN` | `AUTO` (= `OFF`) | Build the Vulkan backend. Opt-in with `-DVLLM_CPP_VULKAN=ON`; headers are vendored and SPIR-V is committed, so no graphics toolchain is needed |
 | `VLLM_CPP_MLX` | `OFF` | Build the optional MLX GEMM provider for Metal (needs `-DMLX_ROOT=<mlx install>`) |
@@ -197,8 +198,9 @@ Read from [`CMakeLists.txt`](CMakeLists.txt). Defaults shown are the shipped def
 | `VLLM_CPP_BENCH_PROFILE_CONTROL` | `OFF` | Trace-only profiler replay control (never for production timing builds) |
 
 Only GB10 / sm_121a is a runtime-gated CUDA target today. Consumer Blackwell (`120a`) plus the
-cross-family portable-only targets are build-supported (they compile and emit real machine code) but
-unproven here (no such board), and non-Apple / non-NVIDIA backends run a subset of operations. See
+cross-family targets are build-supported (they compile and emit real machine code, with the fast GDN
+path build-verified on several) but unproven at runtime here (no such board), and non-Apple /
+non-NVIDIA backends run a subset of operations. See
 [Acceleration](#acceleration) and the [backend matrix](.agents/backend-matrix.md).
 
 ## Running inference (CLI)
@@ -283,7 +285,7 @@ Server flags:
 | `--scheduling-policy fcfs\|priority` | `fcfs` | Scheduler policy |
 | `--enable-force-include-usage` | off | Force the usage block in responses |
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (40 names over 36 families). `auto` detects from the chat template, `none` disables |
-| `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `mistral`, `minimax_m2`, `step3`, `olmo3`). `auto` detects, `none` disables |
+| `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`). `auto` detects, `none` disables |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. See [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) |
 | `-h`, `--help` | | Print usage and exit |
@@ -353,8 +355,8 @@ carries no ggml or PyTorch dependency.
 | CPU | x86-64 and arm64 | Correctness / CI reference; at or ahead of llama.cpp on every GGUF axis, with an Arm i8mm quant-GEMM tier |
 | CUDA | GB10 / DGX Spark, sm_121a | Gate-model correctness passes; 27B at/above vLLM throughput, 35B prefill-pending. The only runtime-gated CUDA target |
 | CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
-| CUDA | Hopper, sm_90a | Build-supported, portable-kernels-only (accelerated paths disabled); not runtime-proven here |
-| CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a), sm_110 | Build-supported, portable-kernels-only; not runtime-proven here. sm_70/sm_75 are not build-supported (no bf16 tensor cores) |
+| CUDA | Hopper, sm_90a | Build-supported; the fast GDN (Triton-AOT) path is build-verified, not runtime-proven here (no such card) |
+| CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a), sm_110 | Build-supported; the fast GDN (Triton-AOT) path is build-verified per-arch on sm_80/86/89/100a (plus FA2 on Ampere, sm_100a NVFP4 GEMM), not runtime-gated here. sm_70/sm_75 unsupported (no bf16 tensor cores) |
 | Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill. Indicative ([BENCHMARKS](docs/BENCHMARKS.md)) |
 | Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet; off unless `-DVLLM_CPP_VULKAN=ON` |
 | Intel XPU | Intel GPUs | Spiked, hardware-blocked |

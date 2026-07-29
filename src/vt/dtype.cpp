@@ -43,6 +43,12 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{32, 34, 8, "q8_0"};
       return &g;
     }
+    case DType::kQ2_K: {
+      // block_q2_K (ggml-common.h:288-299): u8 scales[16] + u8 qs[64]
+      // + f16 d + f16 dmin = 16 + 64 + 2 + 2 = 84. ggml type id 10.
+      static constexpr BlockGeometry g{256, 84, 10, "q2_K"};
+      return &g;
+    }
     case DType::kQ3_K: {
       static constexpr BlockGeometry g{256, 110, 11, "q3_K"};
       return &g;
@@ -61,6 +67,12 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
     }
     case DType::kQ8_K: {
       static constexpr BlockGeometry g{256, 292, 15, "q8_K"};
+      return &g;
+    }
+    case DType::kIQ2_XXS: {
+      // block_iq2_xxs (ggml-common.h:371-374): f16 d + u16 qs[32]
+      // = 2 + 64 = 66. ggml type id 16. Codebook (iq2xxs_grid) decode.
+      static constexpr BlockGeometry g{256, 66, 16, "iq2_xxs"};
       return &g;
     }
     case DType::kF32:
@@ -93,8 +105,8 @@ uint32_t GgmlTypeId(DType dtype) { return RequireBlockGeometry(dtype).ggml_type;
 
 bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out) {
   static constexpr DType kBlockDTypes[] = {
-      DType::kQ4_0, DType::kQ8_0, DType::kQ3_K, DType::kQ4_K,
-      DType::kQ5_K, DType::kQ6_K, DType::kQ8_K};
+      DType::kQ4_0, DType::kQ8_0, DType::kQ2_K, DType::kQ3_K,   DType::kQ4_K,
+      DType::kQ5_K, DType::kQ6_K, DType::kQ8_K, DType::kIQ2_XXS};
   for (DType d : kBlockDTypes) {
     if (FindBlockGeometry(d)->ggml_type == ggml_type) {
       if (out != nullptr) *out = d;
@@ -129,11 +141,13 @@ size_t SizeOf(DType dtype) {
     // silently mis-striding a packed block buffer.
     case DType::kQ4_0:
     case DType::kQ8_0:
+    case DType::kQ2_K:
     case DType::kQ3_K:
     case DType::kQ4_K:
     case DType::kQ5_K:
     case DType::kQ6_K:
     case DType::kQ8_K:
+    case DType::kIQ2_XXS:
       VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") +
                           Name(dtype) + " has no per-element size");
       return 0;
@@ -152,11 +166,13 @@ const char* Name(DType dtype) {
     case DType::kI64: return "i64";
     case DType::kQ4_0: return "q4_0";
     case DType::kQ8_0: return "q8_0";
+    case DType::kQ2_K: return "q2_K";
     case DType::kQ3_K: return "q3_K";
     case DType::kQ4_K: return "q4_K";
     case DType::kQ5_K: return "q5_K";
     case DType::kQ6_K: return "q6_K";
     case DType::kQ8_K: return "q8_K";
+    case DType::kIQ2_XXS: return "iq2_xxs";
   }
   return "?";
 }

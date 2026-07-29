@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "vllm/entrypoints/openai/reasoning_parsers/deepseek_r1.h"
+#include "vllm/entrypoints/openai/reasoning_parsers/deepseek_v3.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/think_auto.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/minimax_m2.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/mistral.h"
@@ -22,6 +23,17 @@ std::unique_ptr<ReasoningParser> get_reasoning_parser(const std::string& name) {
   }
   if (name == "deepseek_r1") {
     return std::make_unique<DeepSeekR1ReasoningParser>();
+  }
+  // deepseek_v3_reasoning_parser.py:20 (name "deepseek_v3"). Hybrid-thinking
+  // delegate; the name-only factory mirrors upstream's DEFAULT construction
+  // (thinking=False -> Identity passthrough). See deepseek_v3.h for the deviation.
+  if (name == "deepseek_v3") {
+    return std::make_unique<DeepSeekV3ReasoningParser>(false);
+  }
+  // __init__.py:71 registers "holo2" -> DeepSeekV3ReasoningWithThinkingParser
+  // (deepseek_v3_reasoning_parser.py:83), the thinking-default variant -> R1 split.
+  if (name == "holo2") {
+    return std::make_unique<DeepSeekV3ReasoningWithThinkingParser>();
   }
   if (name == "mistral") {
     return std::make_unique<MistralReasoningParser>();
@@ -45,8 +57,8 @@ std::unique_ptr<ReasoningParser> get_reasoning_parser(const std::string& name) {
 // SAME CHANGE THAT ADDS ITS FACTORY BRANCH.
 const std::vector<std::string>& reasoning_parser_names() {
   static const std::vector<std::string> names = {
-      "think_auto", "deepseek_r1", "mistral", "minimax_m2",
-      "minimax_m2_append_think", "step3", "olmo3",
+      "think_auto", "deepseek_r1", "deepseek_v3", "holo2",
+      "mistral", "minimax_m2", "minimax_m2_append_think", "step3", "olmo3",
   };
   return names;
 }

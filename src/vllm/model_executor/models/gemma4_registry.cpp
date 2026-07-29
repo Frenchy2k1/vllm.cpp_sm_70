@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -34,25 +35,37 @@ namespace vllm {
 namespace {
 
 // registry.py _ModelInfo: text generation via the Gemma-4 language_model stack.
-// supports_multimodal stays false for G1 (the towers are not built yet); the
-// arch is the mm-wrapper name because the checkpoint carries no bare text row.
+// CLAIM-GEMMA4-MM-E2E: supports_multimodal is now TRUE — the registered forward
+// consumes ModelForwardInput.mm (the SigLIP2 vision tower's projected soft tokens,
+// masked-scattered into the <image> rows) via the mm branch below, exactly like the
+// Qwen3-VL fold. mm is nullopt on every TEXT step ⇒ the text path is byte-identical
+// by construction (the SACRED text 32/32 gate is re-proven post-flip).
 inline constexpr ModelInfo kGemma4Info{
     .is_text_generation_model = true,
     .is_pooling_model = false,
     .is_hybrid = false,
     .has_inner_state = false,
-    .supports_multimodal = false,
+    .supports_multimodal = true,
     .score_type = "bi-encoder",
 };
 
+// Owned-or-borrowed weights (mirrors Qwen3VLLoadedModel): the mm e2e gate BORROWS
+// the loaded weights so the driver and the model share ONE Gemma4Weights (no
+// multi-GB copy on the unified-memory box).
 class Gemma4LoadedModel final : public LoadedModel {
  public:
   Gemma4LoadedModel(const ModelRegistration& registration, Gemma4Weights weights)
-      : LoadedModel(registration), weights_(std::move(weights)) {}
-  const Gemma4Weights& weights() const { return weights_; }
+      : LoadedModel(registration),
+        owned_weights_(std::move(weights)),
+        weights_(&*owned_weights_) {}
+  Gemma4LoadedModel(const ModelRegistration& registration,
+                    const Gemma4Weights& weights, BorrowedWeightsTag)
+      : LoadedModel(registration), weights_(&weights) {}
+  const Gemma4Weights& weights() const { return *weights_; }
 
  private:
-  Gemma4Weights weights_;
+  std::optional<Gemma4Weights> owned_weights_;
+  const Gemma4Weights* weights_ = nullptr;
 };
 
 std::unique_ptr<LoadedModel> LoadGemma4ForConditionalGeneration(
@@ -83,6 +96,23 @@ ForwardLogits ForwardGemma4ForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
   const auto& gemma = static_cast<Gemma4LoadedModel&>(model);
   const Gemma4Weights& weights = gemma.weights();
+  // CLAIM-GEMMA4-MM-E2E: the multimodal branch. When ModelForwardInput.mm is set
+  // (the Gemma4GenerateGreedyViaRegistry driver / the runner mm-path) the hidden
+  // stream starts from the ALREADY-MERGED inputs_embeds and the PLE lookup uses the
+  // mm-masked ids; positions are the 1-D ModelForwardInput::positions (NO MRoPE / NO
+  // DeepStack). nullopt on every text step ⇒ the text path below is byte-identical.
+  if (input.mm.has_value()) {
+    const MultiModalForwardInput& mm = *input.mm;
+    VT_CHECK(mm.inputs_embeds_bf16 != nullptr && mm.ple_token_ids != nullptr,
+             "Gemma-4 mm forward: null merged-embeds / ple_token_ids handle on "
+             "ModelForwardInput.mm");
+    return HostLogits(
+        Gemma4Model::ForwardMm(*mm.inputs_embeds_bf16, *mm.ple_token_ids,
+                               input.positions, input.attn_meta, input.attn_kv,
+                               weights, input.config, input.queue,
+                               input.logits_indices),
+        input.config.vocab_size);
+  }
   if (input.gather_logits) {
     return Gemma4Model::ForwardDevice(input.token_ids, input.positions,
                                       input.attn_meta, input.attn_kv, weights,
@@ -168,6 +198,18 @@ v1::KVCacheConfig MakeGemma4ForConditionalGenerationKVCache(const HfConfig& conf
         block_size, num_kv_heads, hd, kv_dtype));
   }
   return kv;
+}
+
+// CLAIM-GEMMA4-MM-E2E: own/borrow adapters (mirror Make/BorrowQwen3VLLoadedModel).
+std::unique_ptr<LoadedModel> MakeGemma4LoadedModel(Gemma4Weights weights) {
+  return std::make_unique<Gemma4LoadedModel>(
+      RegistrationFor("Gemma4ForConditionalGeneration"), std::move(weights));
+}
+
+std::unique_ptr<LoadedModel> BorrowGemma4LoadedModel(const Gemma4Weights& weights) {
+  return std::make_unique<Gemma4LoadedModel>(
+      RegistrationFor("Gemma4ForConditionalGeneration"), weights,
+      BorrowedWeightsTag{});
 }
 
 REGISTER_VLLM_MODEL(gemma4, "Gemma4ForConditionalGeneration", kGemma4Factory,

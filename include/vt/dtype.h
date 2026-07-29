@@ -33,11 +33,18 @@ namespace vt {
 //
 // Ids/geometry mirror llama.cpp @ 237ad9b96:
 //   ggml/include/ggml.h:390-432 (enum ggml_type)
-//   ggml/src/ggml-common.h:242-245 (block_q8_0), :305-310 (block_q3_K),
-//     :317-327 (block_q4_K), :334-345 (block_q5_K), :352-357 (block_q6_K),
-//     :361-365 (block_q8_K)
+//   ggml/src/ggml-common.h:288-299 (block_q2_K), :242-245 (block_q8_0),
+//     :305-310 (block_q3_K), :317-327 (block_q4_K), :334-345 (block_q5_K),
+//     :352-357 (block_q6_K), :361-365 (block_q8_K), :371-374 (block_iq2_xxs)
 // kQ8_K is ACTIVATION-ONLY: it is the `vec_dot_type` of the K-quants and never
 // appears as a weight/storage type in a GGUF file.
+//
+// kQ2_K and kIQ2_XXS are the ~2-bit storage encodings the `unsloth/
+// DeepSeek-V4-Flash-GGUF UD-IQ2_XXS/UD-Q2_K_XL` checkpoints use. They register
+// their geometry + `to_float` decode here (dtype.cpp / cpu_quant_dequant.cpp)
+// but carry NO vec_dot kernel, so `HasQuantDotKernel` is false and the GGUF
+// loader routes them to the expand-to-bf16 residency (dequant-only path), never
+// keep-quant GEMM. See `.agents/specs/gguf-iquant-dsv4.md`.
 enum class DType : uint8_t {
   kF32,
   kF16,
@@ -48,11 +55,13 @@ enum class DType : uint8_t {
   // --- block-quantized (storage-only) ---
   kQ4_0,
   kQ8_0,
+  kQ2_K,
   kQ3_K,
   kQ4_K,
   kQ5_K,
   kQ6_K,
   kQ8_K,
+  kIQ2_XXS,
 };
 
 // Bytes per ELEMENT. Throws for block-quantized dtypes (they have no

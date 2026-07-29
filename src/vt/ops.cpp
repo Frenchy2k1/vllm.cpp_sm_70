@@ -31,11 +31,13 @@ ScalarTypeId ToScalarType(DType dtype) {
     // table, never through a KernelTensorDesc scalar type.
     case DType::kQ4_0:
     case DType::kQ8_0:
+    case DType::kQ2_K:
     case DType::kQ3_K:
     case DType::kQ4_K:
     case DType::kQ5_K:
     case DType::kQ6_K:
     case DType::kQ8_K:
+    case DType::kIQ2_XXS:
       break;
   }
   VT_CHECK(false, "unsupported storage dtype for scalar-type conversion");

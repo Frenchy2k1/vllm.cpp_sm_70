@@ -227,6 +227,13 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 210, "Q6_K"};
       return &t;
     }
+    case 16: {
+      // block_iq2_xxs (ggml-common.h:371-374): f16 d + QK_K/8 u16 qs
+      // = 2 + 32*2 = 66. The Unsloth-Dynamic `UD-IQ2_XXS` ~2-bit encoding
+      // (codebook dequant in cpu_quant_dequant.cpp / vt DType kIQ2_XXS).
+      static constexpr GgmlTypeTraits t{256, 66, "IQ2_XXS"};
+      return &t;
+    }
     case 22: {
       // block_iq2_s: f16 d + QK_K/4 qs + QK_K/16 qh = 2 + 64 + 16.
       // Used by the APEX "Mini" GGUFs for expert weights.

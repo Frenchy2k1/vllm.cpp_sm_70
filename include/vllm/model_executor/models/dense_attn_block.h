@@ -36,6 +36,7 @@
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"   // NVFP4 W4A16 dispatch
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/qwen3.h"         // Qwen3DenseAttnWeights, PagedKvCache
+#include "vllm/model_executor/models/tensor_parallel.h"  // TensorParallel/TpAllReduceSum (W2)
 #include "vllm/platforms/interface.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
@@ -310,7 +311,8 @@ inline StepInputs BuildStepInputs(Dev d, const std::vector<int32_t>& positions,
 // is the input-normed hidden [T,H] bf16; returns the o_proj output [T,H] bf16.
 inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg,
                       const Tensor& dhn, const StepInputs& si,
-                      const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T) {
+                      const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
+                      const TensorParallel* tp = nullptr) {
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -523,12 +525,20 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
     // NVFP4 W4A16 o_proj — the bf16 attention output IS the a16 activation.
     DBuf o = dense_nvfp4::MatmulNvfp4W4A16D(d, o_in, w.o_proj_fp4, DType::kBF16);
     (void)rot;
+    // RowParallelLinear all-reduce (linear.py:1766). No-op at tp_size==1.
+    Tensor ot = o.t();
+    TpAllReduceSum(tp, d.q, ot);
     return o;
   }
   Tensor wo = ResidentWeight(d, w.o_proj);
   DBuf o(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, o.t(), o_in, wo);
   (void)rot;
+  // o_proj is a RowParallelLinear: sum the per-rank partial products so every
+  // rank holds the full [T,H] output (linear.py:1766). No-op — nothing enqueued —
+  // at tp_size==1, so the single-GPU forward is byte-identical.
+  Tensor ot = o.t();
+  TpAllReduceSum(tp, d.q, ot);
   return o;
 }
 

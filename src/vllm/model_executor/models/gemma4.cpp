@@ -322,13 +322,27 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
     d.b.Copy(d.q, dp + s * rb, sp + static_cast<size_t>(idx[s]) * rb, rb);
 }
 
+// CLAIM-GEMMA4-MM-E2E: `inputs_embeds_override` (host bf16 [T*H]) and
+// `ple_token_ids` (host i32 [T]) are the multimodal seam. When BOTH are null the
+// function is byte-identical to the text path (embed from token_ids, PLE from
+// token_ids) — the two text call sites pass null so the SACRED text 32/32 gate is
+// unchanged by construction. When set (the registered mm forward), the hidden
+// stream STARTS from the already-merged + already-sqrt(H)-scaled inputs_embeds
+// (text rows scaled, vision soft-token rows the embed_vision projector output,
+// gemma4_mm.py:1319/embed_input_ids masked-scatter), and the PLE embed_tokens_
+// per_layer lookup uses the mm-masked ids (gemma4_mm.py:1962-1973). ple_proj still
+// projects the merged inputs_embeds (project_per_layer_inputs, gemma4.py:908-912).
 DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<int32_t>& positions,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const Gemma4Weights& weights, const HfConfig& config,
-                 const std::vector<int32_t>& logits_indices) {
-  const int64_t T = static_cast<int64_t>(token_ids.size());
+                 const std::vector<int32_t>& logits_indices,
+                 const std::vector<uint16_t>* inputs_embeds_override = nullptr,
+                 const std::vector<int32_t>* ple_token_ids = nullptr) {
+  const int64_t T = inputs_embeds_override != nullptr
+                        ? static_cast<int64_t>(positions.size())
+                        : static_cast<int64_t>(token_ids.size());
   const Gemma4Layout g = MakeLayout(config);
   const int64_t H = g.hidden;
   const int64_t L = g.num_layers;
@@ -341,6 +355,14 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
            "gemma4: positions length must match token_ids");
   VT_CHECK(attn_kv.size() == static_cast<size_t>(L),
            "gemma4: one PagedKvCache per layer required");
+  // mm seam: the merged-embeds override and the PLE ids must both match T.
+  if (inputs_embeds_override != nullptr)
+    VT_CHECK(static_cast<int64_t>(inputs_embeds_override->size()) == T * H,
+             "gemma4 mm: inputs_embeds_override size != T*H");
+  const std::vector<int32_t>& ple_ids =
+      ple_token_ids != nullptr ? *ple_token_ids : token_ids;
+  VT_CHECK(static_cast<int64_t>(ple_ids.size()) == T,
+           "gemma4 mm: ple_token_ids length != T");
 
   // Ones weights for the weight-less V-norm (identity scale), per head_dim.
   auto make_ones = [&](int64_t Dh) {
@@ -356,15 +378,22 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DBuf prop_cache = BuildProportionalRopeCache(d, g, g.head_dim_full, max_pos);
 
   // --- Token embedding * sqrt(hidden) (bf16). Also the PLE-projection input. ---
+  // mm seam: when inputs_embeds_override is set the hidden stream STARTS from the
+  // already-merged, already-sqrt(H)-scaled embeddings (text rows scaled at merge
+  // time, vision soft-token rows the raw embed_vision output). No embed lookup /
+  // no MulScalar — mirrors gemma4.py forward inputs_embeds branch (:908-909).
   DBuf tok(d, DType::kBF16, {T, H});
-  {
+  if (inputs_embeds_override != nullptr) {
+    tok = DBuf(d, DType::kBF16, {T, H}, inputs_embeds_override->data());
+  } else {
     Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
     DBuf dids(d, DType::kI32, {T}, token_ids.data());
     vt::Embedding(d.q, tok.t(), dtab, dids.t());
+    const float nsqrt = std::sqrt(static_cast<float>(H));
+    const double normalizer =
+        static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(nsqrt)));
+    vt::MulScalar(d.q, tok.t(), tok.t(), normalizer);
   }
-  const float nsqrt = std::sqrt(static_cast<float>(H));
-  const double normalizer = static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(nsqrt)));
-  vt::MulScalar(d.q, tok.t(), tok.t(), normalizer);
 
   // --- Per-Layer Embeddings precompute (gemma4.py:845-898). ---
   // ple_emb = embed_tokens_per_layer(ids) * sqrt(ple)         -> [T, L*ple]
@@ -377,7 +406,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     DBuf ple_emb(d, DType::kBF16, {T, LP});
     {
       Tensor dtab = ResidentWeight(d, weights.embed_tokens_per_layer, {vocab, LP});
-      DBuf dids(d, DType::kI32, {T}, token_ids.data());
+      DBuf dids(d, DType::kI32, {T}, ple_ids.data());
       vt::Embedding(d.q, ple_emb.t(), dtab, dids.t());
     }
     vt::MulScalar(d.q, ple_emb.t(), ple_emb.t(),
@@ -560,6 +589,25 @@ ForwardLogits Gemma4Model::ForwardDevice(
                              config, logits_indices);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
+}
+
+std::vector<float> Gemma4Model::ForwardMm(
+    const std::vector<uint16_t>& inputs_embeds_bf16,
+    const std::vector<int32_t>& ple_token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
+    const Gemma4Weights& weights, const HfConfig& config, vt::Queue& queue,
+    const std::vector<int32_t>& logits_indices) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  // token_ids is unused when inputs_embeds_override is set (T comes from
+  // positions); pass an empty vector so the mm seam never dereferences it.
+  const std::vector<int32_t> no_tokens;
+  DBuf dlogits = ForwardBody(d, no_tokens, positions, attn_meta, attn_kv, weights,
+                             config, logits_indices, &inputs_embeds_bf16,
+                             &ple_token_ids);
+  const int64_t n_out = dlogits.t().shape[0];
+  std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
+  dlogits.Download(d, logits.data());
+  return logits;
 }
 
 }  // namespace vllm

@@ -6,8 +6,10 @@
 
 #include <csignal>
 #include <cstdio>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "vt/backend.h"
 #include "vt/cuda/cuda_device_caps.h"
@@ -285,20 +287,37 @@ struct Registrar {
   Registrar() noexcept {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return;
-    // ONE device probe for the whole kernel layer (seam-gap #4): the residency
-    // attributes this registrar always needed AND the compute capability it
-    // never carried, cached together in vt/cuda/cuda_device_caps.h. The
-    // residency semantics are unchanged: PageableMemoryAccess alone means the
-    // driver can service ordinary host pointers through HMM/UVM, and discrete
-    // Blackwell reports it too — that does not make pageable system RAM
-    // equivalent to device-local memory, so an integrated GPU is still required
-    // before exposing the zero-copy contract used by DeviceScratch and the
-    // persistent KV/GDN caches.
-    const DeviceCaps& caps = GetDeviceCaps(0);  // device 0 only for now
-    if (!caps.valid) return;
-    static CudaBackend backend(0, caps.pageable_memory_access && caps.integrated, caps.sm_major,
-                               caps.sm_minor);
-    RegisterBackend(DeviceType::kCUDA, &backend);
+    // ONE device probe per GPU (seam-gap #4): the residency attributes this
+    // registrar always needed AND the compute capability it never carried,
+    // cached together in vt/cuda/cuda_device_caps.h. The residency semantics are
+    // unchanged: PageableMemoryAccess alone means the driver can service ordinary
+    // host pointers through HMM/UVM, and discrete Blackwell reports it too — that
+    // does not make pageable system RAM equivalent to device-local memory, so an
+    // integrated GPU is still required before exposing the zero-copy contract
+    // used by DeviceScratch and the persistent KV/GDN caches.
+    //
+    // MULTI-DEVICE (BACKEND-DISTRIBUTED-TP W2): register EVERY discrete GPU
+    // (device 0..N-1) at its own Device{kCUDA,index} slot so tensor/pipeline
+    // parallel can address each — the device-0 hardcode is gone. `RegisterBackend
+    // (Device{kCUDA,0}, ...)` writes the SAME slot `GetBackend(kCUDA)` reads, so
+    // the single-GPU path is byte-identical (device 0 gets the identical backend
+    // it always did). The `static` storage persists for the process; each backend
+    // caches its own device index and caps. RESIDUAL (HW-gated, no 2-GPU box
+    // here): the per-op cudaSetDevice affinity so a device-i backend allocates /
+    // launches on GPU i — CudaBackend's methods still run on the ambient current
+    // device, which is correct for the single-GPU (index-0) engine.
+    static std::vector<std::unique_ptr<CudaBackend>> backends;
+    const int count =
+        n < static_cast<int>(vt::kMaxDevicesPerType) ? n
+                                                     : static_cast<int>(vt::kMaxDevicesPerType);
+    for (int i = 0; i < count; ++i) {
+      const DeviceCaps& caps = GetDeviceCaps(i);
+      if (!caps.valid) continue;
+      backends.push_back(std::make_unique<CudaBackend>(
+          i, caps.pageable_memory_access && caps.integrated, caps.sm_major,
+          caps.sm_minor));
+      RegisterBackend(Device{DeviceType::kCUDA, i}, backends.back().get());
+    }
   }
 } registrar;
 

@@ -28,6 +28,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3.h"             // Qwen3DenseWeights, PagedKvCache
@@ -38,6 +39,11 @@
 namespace vllm {
 
 class SafetensorsFile;
+class LoadedModel;  // MM-ENGINE-FORWARD: the registered mm-forward driver target.
+
+namespace v1 {
+struct CommonAttentionMetadata;
+}  // namespace v1
 
 // The full Qwen3-VL model weights: the plain-dense text backbone (bf16, tied
 // lm_head) under the `model.language_model.*` prefix + the M2a vision tower under
@@ -108,5 +114,66 @@ std::vector<int32_t> Qwen3VLGenerateGreedyVideo(
     int32_t vision_start_token_id, int32_t vision_end_token_id,
     int32_t eos_token_id, const Qwen3VLWeights& weights, const HfConfig& config,
     vt::Queue& queue, int max_new_tokens);
+
+// ── MM-ENGINE-FORWARD: the registered engine mm-forward seam ────────────────
+//
+// A model-owned persistent bf16 cos|sin MRoPE cache (absolute positions 0..8191),
+// built ONCE and reused across every forward step. Both the standalone
+// Qwen3VLGenerateGreedy driver and the registered forward build it with IDENTICAL
+// RopeArgs + Pmax ⇒ bit-identical caches (the ops are deterministic). `storage`
+// owns the device buffer (freed on last reference); `tensor` is the view.
+struct Qwen3VLCosSinCache {
+  std::shared_ptr<void> storage;
+  vt::Tensor tensor;  // [8192, rotary_dim] bf16
+};
+
+// Build the persistent cos|sin cache (see Qwen3VLCosSinCache). Shared by
+// VLGenerateCore and the registered Qwen3-VL LoadedModel (Prepare).
+Qwen3VLCosSinCache Qwen3VLMakeCosSinCache(vt::Queue& queue, const HfConfig& config);
+
+// One registered forward STEP: given the already-merged host bf16 embeddings
+// [num_tokens*hidden], the 3-D MRoPE positions [3*num_tokens], the (possibly empty)
+// DeepStack [levels*num_tokens*hidden], the persistent cos|sin cache, the step
+// attention metadata, and the persistent paged KV, run one forked VL forward and
+// return the LAST row's logits [vocab] (host f32). This is the EXACT step the M2c
+// Qwen3VLGenerateGreedy driver runs (VLForwardLastLogits), exposed so the ENGINE
+// registered forward (ForwardQwen3VL) and the standalone driver are numerically
+// identical by construction.
+std::vector<float> Qwen3VLForwardStepLastLogits(
+    vt::Queue& queue, const Qwen3DenseWeights& weights_text, const HfConfig& config,
+    const std::vector<uint16_t>& inputs_embeds_bf16,
+    const std::vector<int32_t>& positions3, int64_t num_tokens,
+    const std::vector<uint16_t>& deepstack_bf16, int64_t deepstack_levels,
+    const vt::Tensor& cos_sin_cache_bf16, const v1::CommonAttentionMetadata& meta,
+    const std::vector<PagedKvCache>& attn_kv);
+
+// Registered-path greedy image->text generation: identical forked forward to
+// Qwen3VLGenerateGreedy, but EVERY decoder step is driven through
+// ModelRegistry::Forward(model, input) with input.mm carrying the merged
+// embeddings / 3-D MRoPE positions / DeepStack — i.e. it exercises the ENGINE
+// registered mm-forward (ForwardQwen3VL). Given the same (prompt_ids, tower
+// outputs, weights) it returns token-identical output to Qwen3VLGenerateGreedy
+// (shared VLGenerateCore step core). `model` must be the registered Qwen3-VL
+// LoadedModel loaded from `weights`. This is the entry the MM-SERVE engine seam
+// uses and the engine-mm-forward token-exact gate drives.
+std::vector<int32_t> Qwen3VLGenerateGreedyViaRegistry(
+    LoadedModel& model, const std::vector<int32_t>& prompt_ids,
+    const std::vector<float>& mm_main, const std::vector<float>& mm_deepstack,
+    int64_t num_deepstack_levels, const std::array<int64_t, 3>& grid_thw,
+    int32_t image_token_id, int32_t eos_token_id, const Qwen3VLWeights& weights,
+    const HfConfig& config, vt::Queue& queue, int max_new_tokens);
+
+// Compatibility adapter (mirrors MakeQwen3_5DenseLoadedModel): wrap already-loaded
+// Qwen3-VL weights in the registered LoadedModel so a caller that owns the weights
+// (the M2c/registry e2e gate, the MM-SERVE seam) can drive ModelRegistry::Forward
+// without re-reading the checkpoint. The returned model OWNS the moved weights.
+std::unique_ptr<LoadedModel> MakeQwen3VLLoadedModel(Qwen3VLWeights weights);
+
+// Borrowing adapter: the returned model does NOT own `weights` (it must outlive
+// the model). Used by the registry e2e gate + the MM-SERVE seam, which keep the
+// loaded weights alive to ALSO drive the host embed/merge in
+// Qwen3VLGenerateGreedyViaRegistry — so the model and the driver share ONE
+// Qwen3VLWeights (no multi-GB copy on the unified-memory box).
+std::unique_ptr<LoadedModel> BorrowQwen3VLLoadedModel(const Qwen3VLWeights& weights);
 
 }  // namespace vllm

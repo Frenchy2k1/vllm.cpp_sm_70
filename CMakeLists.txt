@@ -364,6 +364,7 @@ configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
+  src/vllm/lora/punica_cpu.cpp
   src/vllm/config/scheduler.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/speculative.cpp
@@ -375,6 +376,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/model_loader/gguf_keep_quant.cpp
   src/vllm/model_executor/model_loader/nvfp4_dequant.cpp
   src/vllm/model_executor/model_loader/awq_gptq_dequant.cpp
+  src/vllm/model_executor/model_loader/mxfp4_dequant.cpp
   src/vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.cpp
   src/vllm/model_executor/models/qwen3_5_weights.cpp
   src/vllm/model_executor/models/qwen3_5_dense_weights.cpp
@@ -400,9 +402,14 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp
   src/vllm/model_executor/models/deepseek_v4_dsa.cpp
+  src/vllm/model_executor/models/deepseek_v4_compressor.cpp
+  src/vllm/model_executor/models/deepseek_v4_mhc.cpp
+  src/vllm/model_executor/models/deepseek_v4_moe.cpp
+  src/vllm/model_executor/models/deepseek_v4_device.cpp
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp
+  src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
   src/vllm/model_executor/models/glm4_weights.cpp
   src/vllm/model_executor/models/glm4.cpp
@@ -417,6 +424,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/gemma4_registry.cpp
   src/vllm/model_executor/models/gemma4_weights.cpp
   src/vllm/model_executor/models/gemma4.cpp
+  src/vllm/model_executor/models/gemma4_mm.cpp
   src/vllm/model_executor/models/gemma3_registry.cpp
   src/vllm/model_executor/models/gemma3_weights.cpp
   src/vllm/model_executor/models/gemma3.cpp
@@ -459,6 +467,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/whisper_audio.cpp
   src/vllm/model_executor/models/qwen3_vl_text.cpp
   src/vllm/model_executor/models/qwen3_vl.cpp
+  src/vllm/model_executor/models/qwen3_vl_registry.cpp
   src/vllm/model_executor/models/voxtral.cpp
   src/vllm/multimodal/hasher.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
@@ -548,6 +557,8 @@ add_library(vllm STATIC
   src/vllm/v1/executor/executor.cpp
   src/vllm/model_executor/layers/attention/attention.cpp
   src/vllm/model_executor/layers/attention/chunked_local_attention.cpp
+  src/vllm/model_executor/layers/pooler/methods.cpp
+  src/vllm/model_executor/layers/pooler/activations.cpp
   src/vllm/model_executor/layers/attention/mla_attention.cpp
   src/vllm/model_executor/layers/rotary_embedding/base.cpp
   src/vllm/model_executor/layers/rotary_embedding/common.cpp
@@ -591,6 +602,8 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/reasoning_parsers/think_auto.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/basic.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/deepseek_r1.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/identity.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/deepseek_v3.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/mistral.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/minimax_m2.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/step3.cpp
@@ -794,6 +807,7 @@ if(VLLM_CPP_CUDA)
     src/vllm/platforms/cuda.cpp
     src/vt/cuda/cuda_arch_tactics.cu
     src/vt/cuda/cuda_backend.cu
+    src/vt/cuda/nccl_communicator.cu
     src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu
     src/vt/cuda/cuda_matmul_nvfp4.cu
@@ -807,10 +821,26 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_mla_prefill.cu
     src/vt/cuda/cuda_paged_attn.cu
     src/vt/cuda/cuda_combine_tokens.cu
-    src/vt/cuda/cuda_sample.cu)
+    src/vt/cuda/cuda_sample.cu
+    src/vt/cuda/cuda_deepseek_v4.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)
+  # NCCL tensor-parallel transport (BACKEND-DISTRIBUTED-COMM W2, DERIVE-AND-SHIP).
+  # OFF by default so the standing single-GPU CUDA gate is untouched: without it
+  # src/vt/cuda/nccl_communicator.cu compiles to a stub (no kCUDA collective
+  # provider). Turn ON on a >=2-GPU host to build-verify + run the real
+  # ncclAllReduce/Send/Recv path (pynccl.py mirror). AUTO-detect could be added,
+  # but an explicit opt-in keeps the default CUDA build reproducible.
+  option(VLLM_CPP_NCCL "Build the NCCL tensor-parallel transport (needs nccl.h + libnccl)" OFF)
+  if(VLLM_CPP_NCCL)
+    find_library(NCCL_LIBRARY NAMES nccl REQUIRED)
+    find_path(NCCL_INCLUDE_DIR NAMES nccl.h REQUIRED)
+    target_compile_definitions(vllm PRIVATE VT_NCCL=1)
+    target_include_directories(vllm PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(vllm PUBLIC ${NCCL_LIBRARY})
+    message(STATUS "NCCL TP transport: ON (${NCCL_LIBRARY})")
+  endif()
   # The cutlass sm120a NVFP4 GEMM TU is isolated: its own heavy cutlass include
   # tree + relaxed-constexpr/extended-lambda, so it never touches the general
   # build. Gated by VT_CUTLASS_NVFP4 so the host op path no-ops if not compiled.
