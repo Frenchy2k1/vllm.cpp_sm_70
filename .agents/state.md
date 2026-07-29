@@ -32413,3 +32413,62 @@ RECORDS-GAP→ACTIVE; roadmap breadth; porting-inventory §9.11; docs/STATUS; do
 io_processor/stat_logger/endpoint plugin groups (W5). W1 is the general-plugin brick + the
 extensibility proof; LoadGeneralPlugins is not yet called from any production path (so every existing
 engine construction is byte-identical). Not pushed; FULL SHA reported to the caller.
+
+## 2026-07-29 — Offline OpenAI Batch API W0 spike + W1 CPU brick (`CLAIM-BATCH-API`, `SERVE-BATCH-API`, ACTIVE, NOT pushed)
+
+Picked up the offline Batch API RECORDS-GAP the feature-gap analysis named
+(`.agents/specs/vllm-feature-gap-analysis.md` line 85, recommending
+`SERVE-BATCH-API`). Isolated worktree `.claude/worktrees/batch-api`, branch
+`feat/batch-api`, base local `main` `d637a676` (confirmed `git rev-parse HEAD`).
+CPU-only Release `-Werror` (`build-cpu`, `-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON`);
+no GPU/download (host orchestration; DGX offline).
+
+**W0 spike** committed `.agents/specs/batch-api.md`: the JSONL input/output schema
+(`BatchRequestInput`/`BatchResponseData`/`BatchRequestOutput`, custom_id echo,
+`vllm-<uuid>`/`vllm-batch-<uuid>` ids), the endpoint dispatch table
+(chat wired; embeddings/score/rerank/audio named residuals), the run loop
+(read → dispatch → collect → write JSONL), concurrency (W1 sequential; overlapped
+`AsyncLLM` a later brick), file I/O (local only; http(s)/data-URL a residual —
+noted `s3://` is NOT an upstream scheme), files/tests to port, gates, W0-W5
+breakdown, and the per-line-isolation deviation. All grounded 1:1 in
+`vllm/entrypoints/openai/run_batch.py` @ pin `555967922` file:line.
+
+**W1 brick** (`include/vllm/entrypoints/openai/run_batch.h` +
+`src/vllm/entrypoints/openai/run_batch.cpp`): `RunBatch` (`RunLine`/`RunLines`/
+`Run`) + `RunBatchFile` — a pure orchestrator over the existing
+`OpenAIServingChat::create_chat_completion` (the SAME handler
+`ApiServer::handle_chat_completions` drives; NO reimplemented generation), 1:1
+with vLLM's endpoint_registry url→handler map. `/v1/chat/completions` wired; the
+`run_request` AllResponse/ErrorResponse(status=code)/stream-rejected branches; the
+unsupported-endpoint (handler None) + unsupported-url error rows.
+
+**Gate** `test_openai_run_batch` **7 cases / 80 assertions GREEN** over the
+synthetic serving-engine harness (same `Harness` as `test_serving.cpp`): empty→
+empty; 3-line chat batch → ordered rows + custom_id echo + `body.choices` +
+per-line `BatchRequestOutput` schema round-trip; a malformed line ISOLATED into a
+400 error row while neighbours succeed (batch continues); a missing-custom_id
+error row; an unknown-url supported-endpoints row; an `/v1/embeddings`
+unsupported-endpoint row; an unknown-model 404 ErrorResponse-object row.
+**RED-first proven:** dropping the custom_id echo (`out.custom_id = ""`) fails 9
+assertions; reverting → 7/7. (Debug note: the initial crash was a TEST bug — the
+weights temporary was passed to `Harness` which holds it by reference; bound it to
+a named local like `test_serving.cpp` does.) Clean CPU full-library
+`-Wall -Wextra -Werror` build.
+
+**Records (same change):** NEW `SERVE-BATCH-API` engine-matrix row +
+Serving-area/Total rollup (Serving 20→21/ACTIVE 5→6, Total 127→128/ACTIVE 45→46) +
+`check-agent-record.py` `ENGINE_ROWS` 127→128 with dated rationale;
+`CLAIM-BATCH-API` coordination row; feature-matrix batch row RECORDS-GAP→ACTIVE +
+intro; feature-gap-analysis line 85 closure; roadmap breadth pickup note;
+docs/STATUS capability row + gap-line update; docs/BENCHMARKS NOT-APPLICABLE
+disposition; parity-ledger; this entry. `check-agent-record.py` rc=0
+(`agent record OK: ENGINE=128`).
+
+**RESIDUALS (honest, named W2-W5 in the spec):** the `vllm run-batch` CLI +
+`BatchFrontendArgs` (+ the abort-on-bad-line exit code if the upstream contract is
+mirrored there); embeddings/score/rerank dispatch (rides `SERVE-POOLING-ENDPOINTS`);
+audio transcription/translation + media fetch; http(s)/data-URL file I/O +
+Prometheus metrics + overlapped `AsyncLLM` submission. W1 is the chat-dispatch
+orchestrator; `RunBatch` is not yet called from any production path (so every
+existing engine/server construction is byte-identical). Not pushed; FULL SHA
+reported to the caller.

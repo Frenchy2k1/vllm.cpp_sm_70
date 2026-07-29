@@ -669,10 +669,22 @@ static-init/`dlopen` registration idiom (porting-inventory §9). Residuals: real
 `--load-plugins` wiring (W3), platform/quant plugin kinds (W4),
 io_processor/stat_logger/endpoint groups (W5).
 
-Two MED gaps still have NO stable row yet (records gaps, recommend creating on
+The offline Batch API MED records-gap was PICKED UP 2026-07-29 as
+[`SERVE-BATCH-API`](engine-matrix.md) (`CLAIM-BATCH-API`, `INVENTORIED`→`ACTIVE`,
+[spec](specs/batch-api.md)): W0 spike + W1 CPU brick — `RunBatch`/`RunBatchFile`,
+a pure orchestrator over the existing `OpenAIServingChat::create_chat_completion`
+(NO reimplemented generation), 1:1 with vLLM's `run_batch.py` endpoint_registry
+url→handler map. `/v1/chat/completions` dispatch + the `BatchRequestOutput`
+schema + custom_id echo + per-line error isolation, unit-gated RED-first
+(`test_openai_run_batch` 7 cases / 80 assertions). Recorded deviation: a
+malformed line is isolated into an error row (batch continues) where upstream
+aborts. Residuals: the `vllm run-batch` CLI (W2), embeddings/score/rerank + audio
+dispatch (W3-W4, rides pooling), http(s)/data-URL I/O + overlapped `AsyncLLM`
+submission (W5).
+
+One MED gap still has NO stable row yet (records gap, recommend creating on
 pickup, IDs named in the spec): generic separate draft-model + Medusa spec
-decode (`vllm/v1/spec_decode/draft_model.py:19`, `medusa.py:18`); offline Batch
-API (`vllm/entrypoints/openai/run_batch.py:793`).
+decode (`vllm/v1/spec_decode/draft_model.py:19`, `medusa.py:18`).
 Confirmed NON-gap: vLLM has REMOVED prompt adapters. Other MED/LOW gaps
 (DP/EP+EPLB [`PAR-DP`](engine-matrix.md)/[`PAR-EP-EPLB`](engine-matrix.md), KV
 offload [`KV-OFFLOAD`](engine-matrix.md), external KV connectors / PD
