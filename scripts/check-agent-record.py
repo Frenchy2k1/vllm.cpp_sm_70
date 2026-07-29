@@ -226,7 +226,16 @@ ENGINE_PREFIXES = (
 # verify); `SPEC-MEDUSA` SPIKE (W0 spike only, proposer deferred to W2).
 # `CLAIM-SPEC-DRAFT-MEDUSA`, spec `specs/draft-model-medusa-spec.md`. Bumped for
 # two real new rows, never to make a failing state transition pass.
-ENGINE_ROWS = 130
+# 131 since 2026-07-29: +`ENG-POOLING-RUNNER` (the pooling RUNNER path — where the
+# generation runner samples a token, `PoolingRunner` applies the model's `Pooler`
+# to the last hidden state and returns the POOLED DATA / embedding vector; the W3
+# brick of the pooling task class). A real new engine capability, CPU brick landed
+# + structurally cosine-gated RED-first; `ACTIVE`, `CLAIM-POOLING`, spec
+# `specs/pooling-task-class.md`. (Its sibling `ENG-POOLER-SEQ` advanced W1→W2 in
+# the same change — the heads/`SequencePooler`/`DispatchPooler` composite — not a
+# new row.) Bumped for a real new row, never to make a failing state transition
+# pass.
+ENGINE_ROWS = 131
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

@@ -563,6 +563,10 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/attention/chunked_local_attention.cpp
   src/vllm/model_executor/layers/pooler/methods.cpp
   src/vllm/model_executor/layers/pooler/activations.cpp
+  src/vllm/model_executor/layers/pooler/heads.cpp
+  src/vllm/model_executor/layers/pooler/poolers.cpp
+  src/vllm/model_executor/layers/pooler/dispatch_pooler.cpp
+  src/vllm/v1/worker/gpu/pool/pooling_runner.cpp
   src/vllm/model_executor/layers/attention/mla_attention.cpp
   src/vllm/model_executor/layers/rotary_embedding/base.cpp
   src/vllm/model_executor/layers/rotary_embedding/common.cpp

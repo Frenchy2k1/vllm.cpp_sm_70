@@ -32539,3 +32539,61 @@ CUDA-graph), the DGX e2e greedy our-draft-ON == vLLM-draft-ON token-exact gate o
 a real tiny-draft/target pair, and the throughput speed gate (match-or-beat vLLM
 on every axis) are W3, DGX-offline. NO production runner wiring in W1 (additive +
 default-inert; no path constructs a `DraftModelProposer`).
+
+## 2026-07-29 — Pooling task class W2 pooler HEADS composite + W3 pooling RUNNER path (`CLAIM-POOLING`, `ENG-POOLER-SEQ` W1→W2 + NEW `ENG-POOLING-RUNNER` ACTIVE, NOT pushed)
+
+**What landed.** Advanced the pooling task class from the W1 pooler-op brick to W2
+(the pooler composite) + W3 (the pooling runner path), CPU-only, off local `main`
+`edf68c91` in isolated worktree `.claude/worktrees/claim-pooling-w2w3` (branch
+`claim-pooling-w2w3`).
+
+- **W2 — pooler HEADS composite.** `EmbeddingPoolerHead` (ST-projector → matryoshka
+  dim slice → optional L2-normalize) and `ClassifierPoolerHead` (classifier →
+  affine `(logit-mean)/sigma` calibration → optional activation) mirroring
+  `seqwise/heads.py:19-196`; the `SequencePooler` (`poolers.py:41`, POOLING_TASKS ∩
+  method ∩ head) + `PoolerForEmbed`/`PoolerForClassify` factories; the
+  `DispatchPooler` (`special.py:23`) groupby-task routing with `ForEmbedding`/
+  `ForSeqCls` + ctor task-support validation; the `PoolerConfig`
+  (`config/pooler.py:16`), `PoolingParams` (`pooling_params.py:35`), and
+  `PoolingParamsUpdate` (`common.py:18`) structs. `PoolingMetadata` extended
+  ADDITIVELY with `pooling_params` + `tasks` (+ a `Slice` helper); the W1
+  `SequencePoolingMethod` base got defaulted `GetSupportedTasks`/`GetPoolingUpdates`
+  (non-breaking).
+- **W3 — pooling RUNNER path.** `PoolingRunner`
+  (`include/vllm/v1/worker/gpu/pool/pooling_runner.h`, mirror of
+  `pooling_runner.py:18-46`) applies the model's `Pooler` to the packed
+  `[num_tokens, hidden]` last-hidden-state buffer and returns POOLED DATA (an
+  embedding vector) where the generation runner would sample a token, plus
+  `GetSupportedTasks` + `ComputeValid` (`seq_lens==prompt_len`).
+
+**Gates (CPU, `-Wall -Wextra -Werror` 0-warn full-library build).**
+`test_pooler_heads` 27/27 (240 asserts) vs independent double-precision references
+(Embedding/Classifier heads + SequencePooler + DispatchPooler incl. a mixed
+embed+classify batch); `test_pooling_runner` 5/5 (14 asserts) — the runner path +
+a STRUCTURAL cosine-parity gate (embedding vs a double-precision LAST+normalize
+reference, cosine 1.0 ε1e-6); W1 `test_pooler` 17/17 unchanged. **RED-first
+proven:** disabling the matryoshka slice + logit_mean calibration fails 8 cases /
+50 asserts (heads); selecting CLS instead of LAST drops the cosine <0.5 and
+disabling normalize fails 2 unit-L2 asserts (runner). `check-agent-record.py`
+rc=0 (ENGINE 130→131 with dated rationale) and all record checkers green.
+
+**Deviations (recorded §9).** (a) upstream `PoolingRunner` hardcodes LAST+normalize;
+we route through the model `Pooler` (the general bert.py path), strictly more
+capable and the same design pooling MODELS use; (b) `DispatchPooler` passes the
+full hidden buffer with absolute cursor indices instead of physically slicing per
+task group (value-identical, no index shift); (c) `PoolingParams`/`PoolerConfig`
+co-located under `pooler/` (upstream top-level `pooling_params.py`/`config/`);
+(d) heads always return the per-sequence list form (upstream's stacked-Tensor-vs-
+list branching has no numeric effect on our PoolerOutput).
+
+**Residuals (honest).** The **real-model oracle cosine gate** — the W3 gate here is
+STRUCTURAL (synthetic weights, self-consistency + RED-first); a cosine-vs-vLLM
+number needs a REGISTERED concrete embedding model (`*EmbeddingModel` /
+`BertEmbeddingModel`) forward run against `vllm.LLM(task="embed").encode(...)` on
+the dev-box CPU, and NO such model is registered yet (W3-model). No cosine-vs-
+oracle number was fabricated, and no pooling MODEL row was created (model-matrix /
+checklist / rollup untouched). The `/v1/embeddings` + score/rerank/classify
+endpoints (W4) and the tokwise `AllPool`/`StepPool` + chunked-prefill ALL pooling
+(W5) remain named residuals. Additive + default-inert: no production forward or
+runner path constructs a `PoolingRunner` yet (that rides the endpoint brick). NOT
+pushed; full SHA reported to the caller.

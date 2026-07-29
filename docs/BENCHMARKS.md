@@ -16,6 +16,44 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Pooling task class W2 heads composite + W3 pooling runner path (2026-07-29, `CLAIM-POOLING`) - STRUCTURAL cosine gate PASS / real-model oracle cosine gate PENDING
+
+Disposition: **correctness bricks landed + CPU-gated; the real-model oracle cosine
+number is PENDING** (needs a registered concrete embedding model forward). No
+throughput number is owed by a CPU pooler brick (host arithmetic).
+
+W2 landed the pooler HEADS composite (`EmbeddingPoolerHead` projector→matryoshka→
+normalize; `ClassifierPoolerHead` classifier→`(logit-mean)/sigma`→activation), the
+`SequencePooler` + `PoolerForEmbed`/`PoolerForClassify` factories, the
+`DispatchPooler` groupby-task routing, and the `PoolerConfig`/`PoolingParams`
+structs. W3 landed the pooling RUNNER path: `PoolingRunner` applies the model's
+`Pooler` to the packed last-hidden-state buffer and returns pooled embeddings
+where the generation runner would sample a token.
+
+Gates (CPU, `-Wall -Wextra -Werror` 0-warn):
+
+- `test_pooler_heads` 27/27 (240 assertions) vs independent double-precision
+  references (projector / classifier are deterministic matmuls evaluated twice),
+  covering EmbeddingPoolerHead, ClassifierPoolerHead, SequencePooler, and
+  DispatchPooler (including a mixed embed+classify batch + ctor task validation).
+  RED-first: disabling the matryoshka slice + the logit_mean calibration fails
+  8 cases / 50 assertions.
+- `test_pooling_runner` 5/5 (14 assertions): the runner path plus a **STRUCTURAL
+  cosine-parity gate** — the produced embedding vs a double-precision LAST-token
+  pool + L2-normalize reference is cosine 1.0 (epsilon 1e-6). RED-first: selecting
+  CLS instead of LAST drops the cosine below 0.5; disabling the normalize leaves
+  the embedding non-unit (2 unit-L2 assertions fail).
+
+Honest residual: this is a SYNTHETIC-weights structural gate (self-consistency +
+RED-first over the runner→pooler→normalize pipeline), NOT the real-model oracle
+gate. A cosine-vs-vLLM number needs a registered concrete `*EmbeddingModel` /
+`BertEmbeddingModel` forward producing real hidden states run against
+`vllm.LLM(task="embed").encode(...)` on the dev-box CPU; no such model is
+registered yet (the W3-model residual), so no cosine-vs-oracle number is
+fabricated. Repro (CPU): `cmake --build build-cpu --target test_pooler_heads
+test_pooling_runner && ./build-cpu/tests/test_pooler_heads &&
+./build-cpu/tests/test_pooling_runner`.
+
 ## Generic draft-model + Medusa spec-decode W0 spike + W1 CPU brick (2026-07-29, `CLAIM-SPEC-DRAFT-MEDUSA`) - PENDING (correctness brick landed; DGX e2e + speed gate deferred, box offline)
 
 Disposition: **PENDING** a performance number. `SPEC-DRAFT-MODEL` W1 is a host-side
