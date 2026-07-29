@@ -350,9 +350,23 @@ references, RED-first proven on all three load-bearing levers: dropping the sqrt
 gathering weights from the biased scores, and symmetric-clamping the gate). The shared
 grouped-GEMM / expert / shared-expert / NVFP4 machinery is REUSED, not re-ported (only
 scoring + hash + clamp are net-new); MegaMoE is SM100-only so GB10 mirrors the
-FusedMoE-fallback router. Additive and byte-neutral. The
-remaining bricks — the device kernels (which reuse the existing grouped-GEMM) + the
-forward assembly, and the full model gate — stay multi-Spark-blocked.
+FusedMoE-fallback router. Additive and byte-neutral. **W7 forward assembly landed
+(2026-07-29):** the `VT_CHECK(false, "W3-W8 pending")` stub is replaced by a real
+`DeepseekV4Model::Forward` that composes the four landed host primitives (W3 DSA/MLA
+seams, W4 compressor + fp8_ds_mla KV, W5 MHC + Sinkhorn, W6 sqrtsoftplus/hash MoE) into
+an end-to-end logits producer on the CPU path at a small synthetic config — the brick
+that finally makes V4 structurally runnable. It is a STRUCTURAL/composition gate
+(`test_deepseek_v4_forward` 6/6·26: the layer interleave runs, the residual is a
+`[T, hc_mult, H]` stream, the hash layers route by token id, the DSA sparse path selects
+and the compressor pools, logits are finite/deterministic, and a deliberately-miswired
+interleave changes the output — all-gated hash, skip-final-fold, no-sink), NOT a
+real-checkpoint token gate. Honest 3-state: the CPU forward assembly at tiny shape is
+DERIVED + BUILD-VERIFIED (structural); it does not claim V4 "runs" a real model. Additive
+and byte-neutral (shared MLA/MoE + the W3-W6 primitive TUs untouched). The
+remaining bricks — the device kernels (which reuse the existing grouped-GEMM) +
+`ForwardDevice`, the real-checkpoint tower materialization, and the full strict model
+gate (W8) — stay multi-Spark-blocked; the single-Spark IQ2_XXS-GGUF vehicle also needs
+the V4-GGUF `blk.N.*` name map (download-blocked).
 The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):

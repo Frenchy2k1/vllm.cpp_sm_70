@@ -115,6 +115,13 @@ vllm_cpp_add_test(test_deepseek_v4_mhc vllm/models/test_deepseek_v4_mhc.cpp)
 # references. Full-model gate multi-Spark-blocked (156.7 GiB); device-kernel +
 # forward assembly are W7 (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_moe vllm/models/test_deepseek_v4_moe.cpp)
+# DeepSeek-V4-Flash W7 — the DeepseekV4Model::Forward ASSEMBLY: composes the four
+# landed host primitives (W3 DSA/MLA seams, W4 compressor + fp8_ds_mla KV, W5 MHC
+# + Sinkhorn, W6 sqrtsoftplus/hash MoE) into an end-to-end logits producer at a
+# tiny synthetic config. STRUCTURAL/composition gate (interleave runs, [T,hc,H]
+# stream, hash-by-tid routing, DSA select+compress, finiteness) + RED-first
+# miswires — NOT a real-checkpoint token gate (that is W8, multi-Spark, 156.7 GiB).
+vllm_cpp_add_test(test_deepseek_v4_forward vllm/models/test_deepseek_v4_forward.cpp)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
