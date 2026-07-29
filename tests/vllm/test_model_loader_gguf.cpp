@@ -75,13 +75,17 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
-      "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', 'GemmaForCausalLM', "
+      "'DeepseekV4ForCausalLM', "
+      "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
+      "'Gemma4ForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
-      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', 'LlamaForCausalLM', "
+      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
+      "'KimiK3ForConditionalGeneration', 'LlamaForCausalLM', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
-      "'Qwen3MoeForCausalLM', 'Qwen3_5ForConditionalGeneration', "
+      "'Qwen3MoeForCausalLM', 'Qwen3VLForConditionalGeneration', "
+      "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration', 'StableLmForCausalLM'])",
       std::runtime_error);
 }
