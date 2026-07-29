@@ -133,6 +133,18 @@ ALLOWLIST: dict[str, dict[str, tuple[object, str]]] = {
         "kcuda": (1, "the `(kCUDA, \"GDN_ATTN\")` registrar key — same reason as "
                      "backend.cpp above."),
     },
+    "src/vllm/model_executor/models/deepseek_v4_device.cpp": {
+        "kcuda": (8, "the DeepSeek-V4 CUDA device-forward RESOLVER TU (W7-device): "
+                     "4 `GetOp` + 4 `OpRegistered` lookups that fetch the "
+                     "CUDA-registered `kDeepseekV4{Mhc,Dsa,Compressor,Moe}` kernels "
+                     "for `DeepseekV4Model::ForwardDevice`. This TU exists only to "
+                     "resolve the device leg — a CPU build registers nothing on "
+                     "`(op, kCUDA)` so `GetOp` throws a clean device-only error. "
+                     "FOLLOW-UP (deferred, needs a GB10 re-gate — DGX offline "
+                     "2026-07-29): thread the runner `DeviceType` through these "
+                     "resolvers so they become device-parameterized lookups "
+                     "(`GetOp(op, runner.device.type)`) instead of hardcoding kCUDA."),
+    },
 }
 
 
