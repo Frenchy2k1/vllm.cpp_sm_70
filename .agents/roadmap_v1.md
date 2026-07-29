@@ -202,6 +202,22 @@ RED-first proven), ported 1:1 from `fused_compress_quant_cache.py`/`save_partial
 `mla_attention` empty-diff); new kernel row `KERNEL-ATTN-DSA-COMPRESSOR` (`SPIKE`). Residuals: MHC
 (W5), sqrtsoftplus/hash MoE (W6), the fused device kernel + forward integration + the compressor
 state-cache gather addressing (W7), strict gate (W8) = multi-Spark.
+**W5 MHC HYPER-CONNECTIONS LANDED (2026-07-29, `CLAIM-DEEPSEEK-V4-W5`, base `d0bc0f41`):** the hardest
+V4 brick — the Manifold/Markov Hyper-Connections residual topology ported + unit-gated as portable
+host references: `MhcSinkhorn` (the 20-iteration Sinkhorn: row-softmax seed `+eps` then alternating
+col/row normalization toward a doubly-stochastic matrix), `MhcPre` (folded weight-free RMSNorm
+projection → pre/post/comb sigmoid+Sinkhorn gates → stream collapse → optional folded attn/ffn
+RMSNorm), `MhcPost` (comb-matrix mix + post-gate residual fold), `HcHeadCollapse` (weight-free RMSNorm
+→ hc_head_fn → sigmoid → weighted stream sum); new TUs `deepseek_v4_mhc.{h,cpp}` +
+`test_deepseek_v4_mhc` **14/14·125** (hand-derived literals + from-first-principles double-precision
+references rel-L2 < 1e-5..1e-4; RED-first proven BOTH the iteration count and a normalization axis, via
+a dedicated small-iteration-count gate since the Sinkhorn converges by 20 iters). **The W0 "ZERO eager
+reference upstream" premise is CORRECTED:** vLLM ships `model_executor/kernels/mhc/torch.py`
+(`mhc_pre_torch`/`mhc_post_torch`) + `triton.py` (head collapse), and four upstream impls agree
+byte-for-byte on the Sinkhorn — ported 1:1 AND cross-checked against an independent double-precision
+derivation. SACRED-inert (no existing forward touched; prior V4 tests unchanged); new kernel row
+`KERNEL-MHC-SINKHORN` (`SPIKE`). Residuals: sqrtsoftplus/hash MoE (W6), device kernel +
+`DeepseekV4Model::Forward` assembly (W7), strict gate (W8) = multi-Spark.
 **MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
 [`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
 DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)

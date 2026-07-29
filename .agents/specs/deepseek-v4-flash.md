@@ -616,3 +616,107 @@ test wiring lines, the new `KERNEL-ATTN-DSA-COMPRESSOR` kernel-matrix row (+ its
   named, not ported). Still residual: MHC (W5), sqrtsoftplus/hash MoE (W6), the fused device kernel
   (`_fused_kv_compress_norm_rope_insert_sparse_attn`) + `DeepseekV4Model::Forward` integration +
   shared-mla extraction (W7), the strict/near-tie engine gate (W8) — all multi-Spark-blocked.
+
+---
+
+## W5 — Manifold/Markov Hyper-Connections (MHC) forward + Sinkhorn (2026-07-29, `CLAIM-DEEPSEEK-V4-W5`)
+
+**Base:** current `main` HEAD `d0bc0f41` (`git rev-parse HEAD`). Isolated worktree `/home/mudler/_git/vllm.cpp-w5-mhc`,
+CPU-only, foreground, NOT pushed. Continues the W3/W4 host-reference lane: the full-model gate is
+multi-Spark-blocked (156.7 GiB, does not fit one GB10; the forward still needs the sqrtsoftplus/hash
+MoE (W6) + device assembly (W7)), so W5 lands the FORWARD CODE for the MHC residual topology — the
+single hardest V4 brick per the W0 scope — + UNIT-gates it.
+
+### W5.0 EAGER-REFERENCE FINDING — corrects the W0/model-matrix "no eager reference" premise
+The W0 scope and the model-matrix row assert MHC has "ZERO numerical tests and no eager reference
+upstream" (the reason it was flagged the hardest correctness item). **That premise is CORRECTED
+here.** The pinned vLLM SHIPS an eager PyTorch reference for the mHC kernels:
+- `vllm/model_executor/kernels/mhc/torch.py` — `mhc_pre_torch` (`:6-91`) + `mhc_post_torch` (`:94-106`);
+- `vllm/model_executor/kernels/mhc/triton.py` — `hc_head_reduce_triton_kernel` (`:108-140`), the
+  head collapse eager math (`rmsnorm_nw` + linear + sigmoid + weighted reduce).
+
+These are the canonical numerics the TileLang / Triton / CUDA / AITER kernels all match. Moreover
+**four independent upstream implementations agree byte-for-byte on the Sinkhorn**: `torch.py:75-82`,
+`tilelang_kernels.py:126-153` (`_sinkhorn_fwd`), `tilelang.py` (`mhc_pre_big_fuse_with_norm`), and
+SGLang `v0.5.15` `python/sglang/srt/layers/mhc.py:110-126` (`hc_split_sinkhorn_kernel`). So the
+numerics are UNAMBIGUOUS. Per the brief we still ALSO derive an INDEPENDENT double-precision Sinkhorn
+from first principles (alternating row/column normalization toward a doubly-stochastic matrix) and
+prove the port agrees — the eager ref pins the exact eps/axis conventions, the derived ref proves the
+port is not a transcription of a bug.
+
+### W5.1 What landed (additive, SACRED-inert)
+New TUs `include/vllm/model_executor/models/deepseek_v4_mhc.h` +
+`src/vllm/model_executor/models/deepseek_v4_mhc.cpp` — portable HOST (CPU) references for the four
+MHC pieces, each ported 1:1 with `file:line` on BOTH sides (vLLM primary, SGLang v0.5.15 cross-ref):
+
+- **`MhcSinkhorn`** <- `torch.py:75-82`. The `hc_sinkhorn_iters`(=20) Sinkhorn of the hc_mult×hc_mult
+  mixing matrix: seed `M = softmax(logits, dim=-1) + eps` (row softmax over k, +eps), col-norm
+  `M /= (Σ_j M + eps)`, then `(iters-1)× [row-norm M/=(Σ_k M+eps), col-norm M/=(Σ_j M+eps)]`. The `+eps`
+  is on the softmax-seed NUMERATOR and every normalization DENOMINATOR (exactly as all four upstream
+  impls). With eps=0 it converges to a doubly-stochastic matrix; the AXIS ALTERNATION + ITERATION
+  COUNT are load-bearing at non-converged counts.
+- **`MhcPre`** <- `torch.py:56-91` (`mhc_pre_torch`) + the fold from `tilelang.py`
+  `mhc_pre_big_fuse_with_norm`. Flatten the streams, `mixes = residual_flat @ fn.T`, folded weight-free
+  RMSNorm `mixes *= rsqrt(sqrsum/(hc·H)+rms_eps)`, then `pre=σ(mixes[:hc]·s0+b)+hc_pre_eps`,
+  `post=σ(mixes[hc:2hc]·s1+b)·hc_post_mult(2.0)`, `comb=Sinkhorn(mixes[2hc:]·s2+b)`,
+  `layer_input=Σ_j pre[j]·residual[j]`, and (optional) the FOLDED attn/ffn RMSNorm
+  `layer_input *= rsqrt(mean(layer_input²)+norm_eps)·norm_weight`. Constants
+  `hc_post_alpha=2.0`, `hc_pre_eps=hc_sinkhorn_eps=hc_eps` @ `nvidia/model.py:818-821,:886-894`.
+- **`MhcPost`** <- `torch.py:94-106` (`mhc_post_torch`). `new[j,h] = Σ_i comb[i,j]·residual[i,h] +
+  post[j]·x[h]` — the einsum `"ij,ih->jh"` (comb mix, SUMS over the first index i) + the post gate add.
+- **`HcHeadCollapse`** <- `triton.py:108-140` + `tilelang.py:720-748` (`hc_head_fused_kernel_tilelang`).
+  The final collapse of the hc_mult streams to one hidden: weight-free RMSNorm(rms_eps) → `hc_head_fn`
+  [hc,hc·H] projection → `pre=σ(mixes·hc_head_scale+hc_head_base)+hc_eps` → `out[h]=Σ_m pre[m]·x[m,h]`.
+  `hc_head_scale` is the SCALAR [1] `nvidia/model.py:1038`; the model's final RMSNorm(weight) that
+  follows is a separate standard norm, not folded here.
+
+### W5.2 Gate (unit, honest) — DERIVED-eager-reference + hand-case + structural review
+Same honest bar as W3/W4 (the fixed-config 167B arch cannot be constructed at a tiny shape, nor run —
+it does not fit one GB10; and — the brief's premise — upstream ships no GOLDEN numerical test even
+though it ships an eager reference). `tests/vllm/models/test_deepseek_v4_mhc.cpp`: **14/14 cases · 125
+assertions GREEN** on a CPU Debug full-library build, `-Wall -Werror -Wextra` 0-warn on the new TUs.
+Hand-derived literal cases: all-zero Sinkhorn → uniform doubly-stochastic 1/hc; symmetric-2×2 fixed
+point `[[.75,.25],[.25,.75]]`; iteration-count load-bearing (iters=1 col-sums=1 but row-sums≠1 vs
+iters=20 both=1); MhcPre fn=0 → gate midpoints (pre=0.5, post=1.0, comb=0.5, layer_input=Σ0.5·res);
+the RMSNorm fold `[1,3]→[1,3]/√5`; MhcPost identity-comb + post-add (`25/37`); the mix sums over the
+first comb index (uniform comb → stream mean); hc_head fn=0 → stream mean. From-first-principles
+DOUBLE-PRECISION references: Sinkhorn / MhcPre / MhcPost / HcHead f32==f64 rel-L2 < 1e-5..1e-4;
+Sinkhorn doubly-stochastic convergence (row+col sums=1 within 1e-4 at eps=0). **RED-first PROVEN BOTH
+levers:** perturbing the Sinkhorn iteration count (`iters-1→iters-2`) fails 1 case / 9 assertions AND
+swapping a normalization axis (col-norm sum over the wrong index) fails 2 cases / 12 assertions —
+caught by a DEDICATED SMALL-iteration-count (2/3/5) f32==f64 gate, because at 20 iters the Sinkhorn
+has CONVERGED and ±1 iteration is within any tolerance (an honesty fix over a naive iters=20-only
+gate, which the first perturbation attempt silently PASSED — recorded so the lesson survives). Revert
+restores 14/14·125. CAVEAT: the CPU gate uses `-DCMAKE_BUILD_TYPE=Debug` because the pre-existing
+GCC-13 `-O2` `-Werror=array-bounds` false positive in `voxtral.cpp` (unrelated to these TUs) breaks
+the `-O2` full-library build; the new TUs themselves are `-Wall -Werror -Wextra`-clean.
+
+### W5.3 OPEN QUESTIONS / derivation assumptions (stated explicitly)
+- **bf16 storage rounding between steps is NOT modeled.** The model rounds `residual` and
+  `layer_input` to bf16 across attn/ffn boundaries (the mix/Sinkhorn compute stays fp32); these host
+  references stay in f32/f64 and leave bf16 storage rounding to the W7 device brick, exactly as W3/W4
+  left their RoPE/fp8 seams. The Sinkhorn/pre/post/head MATH is what W5 pins.
+- **Every resolved constant is grounded, none guessed.** `hc_post_alpha=2.0` (`model.py:821`),
+  `hc_pre_eps=hc_sinkhorn_eps=hc_eps` (both passed as `self.hc_eps`, `:886-894`), `hc_sinkhorn_iters`
+  from config (=20 in the W0 scope), `rms_norm_eps` (the mix + head RMSNorm eps), the attn/ffn
+  `norm_weight`/`norm_eps` fold (`mhc_pre_big_fuse_with_norm`), `hc_head_scale` scalar (`:1038`).
+- **First-layer stream EXPAND** ([T,H] embedding → [T,hc,H] manifold via `mhc_pre_broadcast_tilelang`
+  `fn_broadcast`) is a shape/broadcast op folded into the first decoder layer; it is a W7
+  forward-assembly seam, not a distinct numeric primitive, so it is NAMED here, not ported in W5.
+
+### W5.4 SACRED inertness
+Additive ONLY. Zero edits to any existing forward — MHC is a V4-only topology; the shared DeepSeek-V2
+MLA (`mla_attention.{h,cpp}`, `cuda_mla_attn.cu`) and the W3/W4 DSA/compressor TUs are UNTOUCHED
+(empty diff). Proof: `test_deepseek_v4_compressor` still 12/12·164, `test_deepseek_v4_dsa` 13/13·38,
+`test_deepseek_v4_scaffold` 4/4·40. The only non-additive edits are the two CMake source/test wiring
+lines, the new `KERNEL-MHC-SINKHORN` kernel-matrix row (+ its checker count bump 40→41), and the
+record surfaces.
+
+### W5.5 Landed-vs-residual
+- **Landed (W5):** the MHC hyper-connection expand/mix (`[T, hc_mult, H]` manifold) + the 20-iteration
+  Sinkhorn + the folded attn/ffn/head RMSNorms — host references + unit gate; `KERNEL-MHC-SINKHORN`
+  (`SPIKE`).
+- **Residual:** the device kernels (`mhc_pre`/`mhc_post`/`mhc_fused_post_pre`/`hc_head_fused` +
+  the bf16 residual storage) + folding MHC into `DeepseekV4Model::Forward` with the first-layer
+  stream expand + the per-layer attn/ffn interleave (W7); the sqrtsoftplus/hash MoE (W6); the
+  strict/near-tie engine gate (W8) — all multi-Spark-blocked on one GB10.

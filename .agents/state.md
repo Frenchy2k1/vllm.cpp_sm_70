@@ -31673,3 +31673,65 @@ the V4 forward (W3-W8, multi-Spark) + the V4-GGUF `blk.N.*` name map (W2, needs 
 1328-tensor manifest — a multi-range header fetch past the CDN cap, or a cached
 shard on a disk-freed box); a `vec_dot` for IQ2_XXS/Q2_K (perf leaf); a
 real-checkpoint byte-level IQ2_XXS gate once a manifest + byte slice exist.
+
+## 2026-07-29 — DeepSeek-V4-Flash W5: Manifold/Markov Hyper-Connections (MHC) host-reference brick (`CLAIM-DEEPSEEK-V4-W5`)
+
+**Base:** current `main` HEAD `d0bc0f41` (`git rev-parse HEAD`). Isolated worktree
+`/home/mudler/_git/vllm.cpp-w5-mhc` (branch `w5-mhc`), CPU-only, foreground, NOT pushed. Continues the
+W3/W4 host-reference lane on the largest single-model campaign in the matrix; the full-model gate stays
+multi-Spark-blocked (156.7 GiB, does not fit one GB10; the forward also needs the sqrtsoftplus/hash MoE
+(W6) + device assembly (W7)), so W5 lands the FORWARD CODE for the MHC residual topology — the single
+hardest V4 brick per the W0 scope — and UNIT-gates it.
+
+**What landed (additive, SACRED-inert).** New TUs `include/vllm/model_executor/models/deepseek_v4_mhc.h`
++ `src/vllm/model_executor/models/deepseek_v4_mhc.cpp` — portable host references for the four MHC
+pieces: `MhcSinkhorn` (the 20-iteration Sinkhorn of the hc_mult×hc_mult mixing matrix — row-softmax
+seed `+eps`, col-norm, then `(iters-1)×[row-norm, col-norm]` toward a doubly-stochastic matrix),
+`MhcPre` (folded weight-free RMSNorm projection → pre/post/comb sigmoid+Sinkhorn gates → stream collapse
+→ optional folded attn/ffn RMSNorm), `MhcPost` (comb-matrix mix + post-gate residual fold),
+`HcHeadCollapse` (weight-free RMSNorm → hc_head_fn → sigmoid → weighted stream sum). Ported 1:1 from the
+vLLM eager reference `model_executor/kernels/mhc/torch.py:56-106` + `triton.py:108-140` (head) +
+`tilelang.py` (the RMSNorm fold), constants `nvidia/model.py:818-821`, cross-checked vs SGLang v0.5.15
+`layers/mhc.py:110-126`.
+
+**EAGER-REFERENCE FINDING (decision-grade, corrects the W0 premise).** The W0 scope + model-matrix row
+assert MHC has "ZERO numerical tests and no eager reference upstream" — the stated reason it was the
+hardest correctness item. **That premise is CORRECTED:** the pinned vLLM SHIPS an eager PyTorch
+reference (`mhc/torch.py` `mhc_pre_torch`/`mhc_post_torch`, `triton.py` head collapse), and FOUR
+independent upstream implementations (torch.py, `tilelang_kernels.py` `_sinkhorn_fwd`, `tilelang.py`,
+SGLang `mhc.py`) agree byte-for-byte on the Sinkhorn. So the numerics are unambiguous. Per the brief we
+still derived the Sinkhorn INDEPENDENTLY in double precision (alternating row/column normalization) and
+proved the port agrees — the eager ref pins the eps/axis conventions, the derived ref proves the port is
+not a transcription of a bug.
+
+**Gate.** `tests/vllm/models/test_deepseek_v4_mhc.cpp` **14/14 cases · 125 assertions GREEN** (CPU Debug
+full-library build, `-Wall -Werror -Wextra` 0-warn on the new TUs). Hand-derived literals (all-zero
+Sinkhorn → uniform doubly-stochastic 1/hc; symmetric-2×2 fixed point `[[.75,.25],[.25,.75]]`;
+iteration-count load-bearing; MhcPre fn=0 → gate midpoints; RMSNorm fold `[1,3]→[1,3]/√5`; MhcPost
+identity-comb `25/37`; mix sums over the first comb index; hc_head fn=0 → stream mean) + from-first-
+principles double-precision references (Sinkhorn/MhcPre/MhcPost/HcHead f32==f64 rel-L2 < 1e-5..1e-4;
+doubly-stochastic convergence). **RED-first PROVEN BOTH levers:** perturbing the Sinkhorn iteration
+count (`iters-1→iters-2`) fails 1 case/9 assertions AND swapping a normalization axis fails 2 cases/12
+assertions — caught by a DEDICATED SMALL-iteration-count (2/3/5) gate. IMPORTANT LESSON (recorded): the
+FIRST perturbation attempt at the naive iters=20-only gate silently PASSED, because at 20 iters the
+Sinkhorn has CONVERGED and ±1 iter is within tolerance; the small-count gate was added specifically to
+make the iteration count load-bearing before claiming RED-first. Revert restores 14/14·125.
+
+**OPEN QUESTIONS / assumptions.** (1) bf16 storage rounding of `residual`/`layer_input` between steps is
+NOT modeled — the mix/Sinkhorn compute is fp32 in the kernels, and these host refs stay f32/f64, leaving
+bf16 storage rounding to the W7 device brick (exactly as W3/W4 left their RoPE/fp8 seams). (2) Every
+resolved constant is grounded, none guessed. (3) The first-layer stream EXPAND ([T,H]→[T,hc,H] via
+`mhc_pre_broadcast_tilelang`) is a shape/broadcast op folded into the first decoder layer — a W7
+forward-assembly seam, NAMED not ported.
+
+**SACRED inertness.** Additive only; no existing forward touched (MHC is a V4-only topology; shared
+DeepSeek-V2 MLA + the W3/W4 DSA/compressor TUs empty-diff). `test_deepseek_v4_compressor` still 12/12·164,
+`test_deepseek_v4_dsa` 13/13·38, `test_deepseek_v4_scaffold` 4/4·40. Non-additive edits: two CMake wiring
+lines, the new `KERNEL-MHC-SINKHORN` kernel-matrix row (+ checker count 40→41), and the record surfaces.
+
+**Residuals (multi-Spark-blocked on one GB10).** W6 sqrtsoftplus/hash MoE; W7 the MHC device kernels
+(`mhc_pre`/`mhc_post`/`mhc_fused_post_pre`/`hc_head_fused` + bf16 residual storage) + `DeepseekV4Model::
+Forward` assembly with the first-layer stream expand + per-layer attn/ffn interleave; W8 strict/near-tie
+engine gate. **Resume:** the next V4 brick is W6 (the MoE router: `sqrtsoftplus` scoring +
+`e_score_correction_bias` + hash-routed `tid2eid` layers + clamped SwiGLU over the FusedMoE fallback,
+`nvidia/model.py:512-757`).

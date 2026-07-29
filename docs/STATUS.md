@@ -326,9 +326,20 @@ FP8 with per-64 UE8M0 power-of-two block scales and a 64-wide RoPE part stored b
 a 576-byte token stride, plus the dequant read). `test_deepseek_v4_compressor` passes
 12/12 (hand-derived literal cases plus double-precision references plus an independent
 scale-byte recompute, RED-first proven); ported 1:1 from vLLM and cross-checked against
-SGLang, additive and byte-neutral for DeepSeek-V2. The remaining bricks — Manifold
-Hyper-Connections, the sqrtsoftplus/hash MoE, the device kernels, and the full model
-gate — stay multi-Spark-blocked.
+SGLang, additive and byte-neutral for DeepSeek-V2. **W5 Manifold Hyper-Connections
+landed (2026-07-29):** the hardest V4 brick — the residual stream becomes a
+`[tokens, hc_mult, hidden]` manifold mixed at every attn/ffn boundary by a
+20-iteration Sinkhorn-normalized doubly-stochastic matrix, with the layer RMSNorms
+folded in and a learned head that collapses the streams back to one hidden. Ported as
+portable host references (the Sinkhorn, the mHC pre/post mixes, the hc_head collapse)
+and unit-gated `test_deepseek_v4_mhc` 14/14 (hand-derived literals plus
+from-first-principles double-precision references, RED-first proven on both the
+iteration count and a normalization axis). The W0 scope's "no eager reference upstream"
+premise is corrected: vLLM ships an eager PyTorch reference (`mhc/torch.py`) and four
+upstream implementations agree on the Sinkhorn, so the port is grounded 1:1 and
+cross-checked against an independent derivation. Additive and byte-neutral. The
+remaining bricks — the sqrtsoftplus/hash MoE, the device kernels + forward assembly,
+and the full model gate — stay multi-Spark-blocked.
 The
 frontier families Kimi / MiniMax / GLM-latest are scoped for mechanical porting
 in [a dedicated spike](../.agents/specs/sweep-kimi-minimax-glm-latest.md):
