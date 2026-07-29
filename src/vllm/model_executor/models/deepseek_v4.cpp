@@ -113,6 +113,12 @@ struct V4Backend {
   // query's global position is kv_base + local_t (kv_base = cache.len at the call).
   DeepseekV4KvCache* kv = nullptr;
   int64_t kv_base = 0;
+  // Re-scoped Stage 2: collapse the routed-expert per-expert keep-quant matvecs
+  // into ONE grouped kMatmulBTQuantGrouped launch per {gate,up,down} (fewer host
+  // launches + higher GB10 occupancy). Default ON for the GGUF keep-quant path;
+  // `VT_V4_GROUPED_MOE=0` rolls back to the per-expert GemmRowSlice loop. The CPU
+  // grouped provider loops the same kMatmulBTQuant kernel ⇒ byte-identical.
+  bool grouped_moe = true;
 };
 
 // Drain the queue's stream after a keep-quant GEMM. This host-orchestrated GGUF
@@ -142,6 +148,16 @@ inline bool On() {
   return e;
 }
 }  // namespace prof
+
+// Re-scoped Stage 2: grouped routed-expert MoE GEMM default ON; `VT_V4_GROUPED_MOE=0`
+// rolls back to the per-expert GemmRowSlice batch. Read once.
+inline bool GroupedMoeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_GROUPED_MOE");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
 
 // One MatmulBT + (optional device) drain, timed when profiling is on. When
 // `defer_sync` is true the stream is NOT drained here — the caller issues a batch
@@ -422,6 +438,42 @@ std::vector<float> GroupedOutputLoraGguf(const V4Backend& be, const OwnedTensor&
       for (int64_t d = 0; d < olr; ++d)
         z[t * z_dim + g * olr + d] = zg[static_cast<size_t>(g)][t * olr + d];
   return Gemm(be, &wo_b, /*wf32=*/{}, z, T, H, z_dim);  // [T,H] (final; drains normally)
+}
+
+// Grouped keep-quant expert GEMM (re-scoped Stage 2): out[P,N] where
+// out[p,:] = act[p,:] · weight[expert_ids[p]] (the [e*N,+N) block row-slice of the
+// stacked expert weight). ONE vt::MatmulBTQuantGrouped launch replaces P per-expert
+// GemmRowSlice matvecs. `act` is [P*K] row-major. Weight retagged to the queue
+// device (unified view). Drains before returning (eids is a local buffer the async
+// kernel reads, so it must not be deferred past this call). Numerically identical
+// to the per-expert path (the grouped kernel is the same integer-dot core, and the
+// CPU provider literally loops kMatmulBTQuant per group).
+std::vector<float> GemmGroupedExpertsKq(const V4Backend& be, const OwnedTensor& weight,
+                                        const std::vector<float>& act,
+                                        const std::vector<int32_t>& expert_ids,
+                                        int64_t P, int64_t N, int64_t K) {
+  VT_CHECK(be.q != nullptr, "deepseek-v4 grouped expert GEMM needs a queue");
+  VT_CHECK(!weight.repacked,
+           "deepseek-v4 grouped expert GEMM requires non-repacked stacked blocks");
+  VT_CHECK(vt::IsBlockQuant(weight.dtype),
+           "deepseek-v4 grouped expert GEMM requires a block-quant stacked weight");
+  VT_CHECK(static_cast<int64_t>(act.size()) == P * K, "grouped expert GEMM: act size mismatch");
+  VT_CHECK(static_cast<int64_t>(expert_ids.size()) == P, "grouped expert GEMM: expert_ids size");
+  const bool on_dev = be.q->device.type != vt::DeviceType::kCPU;
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Queue& gq = on_dev ? *be.q : cpuq;
+  std::vector<float> out(static_cast<size_t>(P) * N);
+  std::vector<int32_t> eids = expert_ids;  // stable buffer for the (unified) tensor
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(act.data()), vt::DType::kF32,
+                                        gq.device, {P, K});
+  vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, gq.device, {P, N});
+  vt::Tensor eid =
+      vt::Tensor::Contiguous(eids.data(), vt::DType::kI32, gq.device, {P});
+  vt::Tensor w = weight.View();
+  w.device = gq.device;
+  vt::MatmulBTQuantGrouped(gq, o, a, w, eid);
+  if (on_dev) SyncDeviceGemm(be);  // drain before eids/out leave scope
+  return out;
 }
 
 // Weighted RMSNorm (the standard DeepSeek/vLLM RMSNorm).
@@ -806,23 +858,61 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       const int64_t A = 1 + topk;
       std::vector<std::vector<float>> g(static_cast<size_t>(A)), u(static_cast<size_t>(A)),
           act(static_cast<size_t>(A)), eo(static_cast<size_t>(A));
-      // phase 1: gate + up (deferred drain)
+      // The grouped kernel requires a BLOCK-QUANT stacked weight (the keep-quant
+      // load); the near-tie dequant oracle (kExpandAll) has bf16 expert weights, so
+      // fall back to the per-expert path there.
+      const bool grouped = be.grouped_moe && vt::IsBlockQuant(Lq->moe_gate_exps.dtype) &&
+                           vt::IsBlockQuant(Lq->moe_up_exps.dtype) &&
+                           vt::IsBlockQuant(Lq->moe_down_exps.dtype);
+      // The topk routed expert ids (i32), shared by phases 1 and 3.
+      std::vector<int32_t> eids(static_cast<size_t>(topk));
+      for (int64_t j = 0; j < topk; ++j)
+        eids[static_cast<size_t>(j)] = static_cast<int32_t>(route.topk_ids[t * topk + j]);
+
+      // phase 1: gate + up. Shared expert stays a per-expert Gemm; the topk routed
+      // experts collapse into ONE grouped kMatmulBTQuantGrouped launch each when
+      // grouped_moe (else the Stage-2 per-expert GemmRowSlice batch).
       g[0] = Gemm(be, &Lq->shared_gate, {}, x1, 1, mi, H, /*defer_sync=*/true);
       u[0] = Gemm(be, &Lq->shared_up, {}, x1, 1, mi, H, /*defer_sync=*/true);
-      for (int64_t j = 0; j < topk; ++j) {
-        const int64_t e = route.topk_ids[t * topk + j];
-        g[1 + j] = GemmRowSlice(be, Lq->moe_gate_exps, x1, 1, mi, H, e * mi, /*defer_sync=*/true);
-        u[1 + j] = GemmRowSlice(be, Lq->moe_up_exps, x1, 1, mi, H, e * mi, /*defer_sync=*/true);
+      if (grouped) {
+        std::vector<float> xrep(static_cast<size_t>(topk) * H);  // topk copies of x1
+        for (int64_t j = 0; j < topk; ++j)
+          std::copy(x1.begin(), x1.end(), xrep.begin() + j * H);
+        const std::vector<float> gr =
+            GemmGroupedExpertsKq(be, Lq->moe_gate_exps, xrep, eids, topk, mi, H);
+        const std::vector<float> ur =
+            GemmGroupedExpertsKq(be, Lq->moe_up_exps, xrep, eids, topk, mi, H);
+        for (int64_t j = 0; j < topk; ++j) {
+          g[1 + j].assign(gr.begin() + j * mi, gr.begin() + (j + 1) * mi);
+          u[1 + j].assign(ur.begin() + j * mi, ur.begin() + (j + 1) * mi);
+        }
+      } else {
+        for (int64_t j = 0; j < topk; ++j) {
+          const int64_t e = route.topk_ids[t * topk + j];
+          g[1 + j] = GemmRowSlice(be, Lq->moe_gate_exps, x1, 1, mi, H, e * mi, /*defer_sync=*/true);
+          u[1 + j] = GemmRowSlice(be, Lq->moe_up_exps, x1, 1, mi, H, e * mi, /*defer_sync=*/true);
+        }
       }
       DrainDevice(be);
       // phase 2: host clamped-SwiGLU
       for (int64_t a = 0; a < A; ++a) act[static_cast<size_t>(a)] = swiglu(g[a], u[a]);
-      // phase 3: down (deferred drain)
+      // phase 3: down. Shared per-expert; routed grouped when grouped_moe.
       eo[0] = Gemm(be, &Lq->shared_down, {}, act[0], 1, H, mi, /*defer_sync=*/true);
-      for (int64_t j = 0; j < topk; ++j) {
-        const int64_t e = route.topk_ids[t * topk + j];
-        eo[1 + j] = GemmRowSlice(be, Lq->moe_down_exps, act[static_cast<size_t>(1 + j)], 1, H, mi,
-                                 e * H, /*defer_sync=*/true);
+      if (grouped) {
+        std::vector<float> adown(static_cast<size_t>(topk) * mi);
+        for (int64_t j = 0; j < topk; ++j)
+          std::copy(act[static_cast<size_t>(1 + j)].begin(), act[static_cast<size_t>(1 + j)].end(),
+                    adown.begin() + j * mi);
+        const std::vector<float> er =
+            GemmGroupedExpertsKq(be, Lq->moe_down_exps, adown, eids, topk, H, mi);
+        for (int64_t j = 0; j < topk; ++j)
+          eo[1 + j].assign(er.begin() + j * H, er.begin() + (j + 1) * H);
+      } else {
+        for (int64_t j = 0; j < topk; ++j) {
+          const int64_t e = route.topk_ids[t * topk + j];
+          eo[1 + j] = GemmRowSlice(be, Lq->moe_down_exps, act[static_cast<size_t>(1 + j)], 1, H, mi,
+                                   e * H, /*defer_sync=*/true);
+        }
       }
       DrainDevice(be);
       // phase 4: combine  out = shared + Σ_j w_j · eo_j
@@ -1115,9 +1205,10 @@ std::vector<float> DeepseekV4ForwardGguf(const DeepseekV4Weights& weights,
   VT_CHECK(weights.has_host_weights,
            "DeepseekV4ForwardGguf: the small f32 host tower (norms/embed/mixing) is "
            "absent");
-  return ForwardComposeImpl(
-      weights.host, weights.params, token_ids, positions, logits_indices, miswire, trace,
-      V4Backend{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf});
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
+  be.grouped_moe = GroupedMoeEnabled();
+  return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
+                            miswire, trace, be);
 }
 
 // Stage 1 — incremental-decode variant. Same keep-quant composition, but binds a
@@ -1145,6 +1236,7 @@ std::vector<float> DeepseekV4ForwardGgufCached(const DeepseekV4Weights& weights,
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
   be.kv = &cache;
   be.kv_base = cache.len;  // same base for every layer this call
+  be.grouped_moe = GroupedMoeEnabled();
   std::vector<float> logits = ForwardComposeImpl(
       weights.host, weights.params, token_ids, positions, logits_indices,
       V4Miswire::kNone, /*trace=*/nullptr, be);

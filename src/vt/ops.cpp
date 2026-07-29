@@ -200,6 +200,37 @@ void MatmulBTQuant(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmulBTQuant, q.device.type))(q, out, a, b);
 }
 
+// vt::MatmulBTQuantGrouped — see ops.h. out[P,N], act[P,K], weight[E*N,K]
+// block-quant, expert_ids[P] i32. The per-group weight row-block is selected by
+// expert_ids[p]; validation mirrors MatmulBTQuant plus the expert-index contract.
+void MatmulBTQuantGrouped(Queue& q, Tensor& out, const Tensor& act,
+                          const Tensor& weight, const Tensor& expert_ids) {
+  VT_CHECK(out.rank == 2 && act.rank == 2 && weight.rank == 2,
+           "matmul_bt_quant_grouped: rank-2 out/act/weight required");
+  const int64_t P = out.shape[0], N = out.shape[1], K = act.shape[1];
+  VT_CHECK(act.shape[0] == P, "matmul_bt_quant_grouped: act/out row count mismatch");
+  VT_CHECK(weight.shape[1] == K, "matmul_bt_quant_grouped: weight K mismatch (b is [E*N,K])");
+  VT_CHECK(weight.shape[0] % N == 0,
+           "matmul_bt_quant_grouped: weight rows must be a whole multiple of N");
+  VT_CHECK(IsBlockQuant(weight.dtype),
+           "matmul_bt_quant_grouped: weight must be a block-quantized dtype");
+  VT_CHECK(IsFloat(act.dtype) && IsOutFloat(out.dtype),
+           "matmul_bt_quant_grouped: float activation and f32/bf16 output required");
+  VT_CHECK(weight.shape[1] % BlockElems(weight.dtype) == 0,
+           "matmul_bt_quant_grouped: K must be a whole number of weight blocks");
+  VT_CHECK(expert_ids.Numel() == P && expert_ids.dtype == DType::kI32,
+           "matmul_bt_quant_grouped: expert_ids must be i32 [P]");
+  VT_CHECK(act.stride[1] == 1 && act.stride[0] >= K,
+           "matmul_bt_quant_grouped: activation rows must be packed (innermost stride 1)");
+  VT_CHECK(out.IsContiguous() && expert_ids.IsContiguous(),
+           "matmul_bt_quant_grouped: contiguous out + expert_ids required");
+  VT_CHECK(act.device == q.device && weight.device == q.device &&
+               out.device == q.device && expert_ids.device == q.device,
+           "matmul_bt_quant_grouped: device mismatch");
+  reinterpret_cast<MatmulBTQuantGroupedFn>(GetOp(OpId::kMatmulBTQuantGrouped, q.device.type))(
+      q, out, act, weight, expert_ids);
+}
+
 // vt::BatchedMatmul — `torch.bmm` (mla_attention.py:789 q-side W_UK absorption,
 // :1034 W_UV v-up-projection). Stride-driven on every operand because BOTH
 // upstream call sites pass transposed views; only the innermost dim must be

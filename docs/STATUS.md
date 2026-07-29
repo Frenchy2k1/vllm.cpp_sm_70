@@ -491,6 +491,18 @@ NOT sync-call overhead; both buckets scale with GEMM count, not sync-call count.
 corroborated by the Qwen3-Coder W7 decode-graph row): a **grouped MoE GEMM** (18 tiny expert matvecs → ~3
 kernels) + a **decode CUDA graph** to kill launch tax. Recommend re-scoping Stage 2 to the grouped GEMM.
 Rollback-able; NO speedup claimed. Row stays `ACTIVE`; see docs/BENCHMARKS.md.
+**ForwardDevice campaign Stage 2 (re-scoped) — GROUPED keep-quant MoE GEMM: REAL SPEEDUP (2026-07-29, base
+`05f6318c`, NOT pushed).** The lever the profiler proved. New vt op `kMatmulBTQuantGrouped` (mirrors
+`kMoeGroupedGemmBf16`, extends the #195 `kMatmulBTQuant` kernel): collapses the 6 routed experts ×
+{gate,up,down} = 18 tiny T=1 matvecs/layer into 3 grouped kernels (CUDA `QuantDotGemmGroupedKernel` =
+same dot core, per-group weight-row index; CPU provider loops `MatmulBTQuant` per group = byte-identical
+reference). `MoeBlock` routes the routed experts through it (shared stays per-expert); `VT_V4_GROUPED_MOE=0`
+rolls back. **TOKEN-IDENTICAL** (grouped ON == OFF == "…Paris.", `11111 16 455 6102 294 8760 344 11111`);
+gate `test_deepseek_v4_gguf_load` **12/12·531** (+grouped==per-expert byte-identical, RED-first permuted map).
+DGX `--gpu --kv-cache`: **decode 5.83 tok/s (23-tok) / 6.60 (11-tok) — ~22% over Stage 1's 4.79** (equal
+length); prefill 7.6–8.1; peak 86.33 GiB; ~35% of ds4's 16.5. nvidia-smi util did NOT rise (36%) — fewer/
+larger kernels leave the GB10 idle on host launches, so decode is now clearly **host-launch-bound** →
+motivates Stage 3 (decode CUDA graph, mirroring Qwen3-Coder W7). Row stays `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

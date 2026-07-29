@@ -33357,3 +33357,34 @@ closed the sibling `Qwen3-Coder-30B` decode row (docs/BENCHMARKS.md W7: missing 
 ~86% GPU-busy host tax; `MoeGroupedGemmBf16`). RECOMMEND re-scoping Stage 2 to the grouped MoE GEMM
 before Stage 3 graphs. NO speedup claimed; the profiler + byte-identical batching land as the
 reviewable artifact. Box restored (worker up restart=always, flock free, no stray). Awaiting review.
+
+## DeepSeek-V4 ForwardDevice campaign — Stage 2 RE-SCOPED (grouped keep-quant MoE GEMM): REAL SPEEDUP (2026-07-29, `CLAIM-DEEPSEEK-V4-FORWARD-DEVICE`, worktree `/home/mudler/_git/vllm.cpp-gm`, branch `deepseek-v4-grouped-moe`, base `05f6318c`, committed `cb787fa8`, NOT pushed)
+
+Coordinator merged Stage 2 (negative result, `05f6318c`) + greenlit the re-scope. The lever
+the profiler proved: cut GEMM count + raise occupancy by collapsing the MoE's per-expert matvecs
+into grouped kernels.
+
+**NEW vt op `kMatmulBTQuantGrouped`** (`out[P,N]` where `out[p,:]=act[p,:]·weight[expert_ids[p]*N+n]`):
+mirrors `kMoeGroupedGemmBf16`'s expert-index structure (`ops.cpp:696`) and EXTENDS the #195
+`kMatmulBTQuant` kernel (`cuda_quant_dot.cu`). CUDA provider `QuantDotGemmGroupedKernel` = the same
+integer-dot core as `QuantDotGemmKernel` with a per-group weight-row index (one `QuantizeQ8K` + one
+grouped launch over P·N warps). CPU provider loops `MatmulBTQuantKernel` per group → BYTE-IDENTICAL
+reference (`cpu_quant_gemm.cpp`). `MoeBlock` routes the 6 routed experts × {gate,up,down} = 18 tiny
+matvecs/layer through `GemmGroupedExpertsKq` → **3 grouped launches**; shared expert stays per-expert;
+block-quant-guarded (the bf16 near-tie oracle → per-expert). `VT_V4_GROUPED_MOE=0` rolls back to the
+Stage-2 per-expert batch (default ON; CPU path byte-identical either way). Additive extension of the
+CIQ keep-quant GEMM family (no new kernel-matrix row).
+
+**CORRECTNESS: `test_deepseek_v4_gguf_load` 12/12·531** (+1 case: grouped op == per-expert loop
+BYTE-IDENTICAL on the stacked block weight, RED-first a permuted expert map diverges; existing 11
+unchanged — grouped default ON runs on the CPU queue in the tiny gate = same tokens). **DGX GB10
+(`--gpu --kv-cache`, 80.7 GB ds4 file): TOKEN-IDENTICAL** — grouped ON and OFF (`VT_V4_GROUPED_MOE=0`)
+both emit `11111 16 455 6102 294 8760 344 11111 …` = " Paris. The capital of France is Paris …".
+**Decode 5.83 tok/s (23-tok) / 6.60 (11-tok) — ~22% over Stage 1's 4.79 at equal length**; prefill
+7.6–8.1; peak 86.33 GiB; ~35% of ds4's 16.5 (grouped 6.60 vs per-expert 5.56 at 12 tok).
+
+nvidia-smi util did NOT rise (36% vs Stage-1 ~46%): fewer/larger kernels finish faster and leave the
+GB10 idle waiting on host launches, so decode is now clearly **host-launch-bound** (profiler residual =
+GEMM-dispatch + host-glue; sync ≈ 0). This directly motivates **Stage 3: a decode CUDA graph** to
+capture the per-step kernel sequence and kill the launch tax (mirrors Qwen3-Coder W7). Box restored
+(worker up restart=always, flock free, no stray). Awaiting coordinator review before Stage 3.
