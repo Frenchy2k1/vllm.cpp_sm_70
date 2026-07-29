@@ -461,6 +461,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/phi_weights.cpp
   src/vllm/model_executor/models/phi.cpp
   src/vllm/model_executor/models/model_registry.cpp
+  src/vllm/plugins/plugins.cpp
   src/vllm/model_executor/models/qwen3_vl_vision.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp
   src/vllm/model_executor/models/gemma4_audio.cpp
@@ -486,6 +487,7 @@ add_library(vllm STATIC
   src/vllm/v1/sample/sampler.cpp
   src/vllm/v1/spec_decode/rejection_sampler.cpp
   src/vllm/v1/spec_decode/ngram_proposer.cpp
+  src/vllm/v1/spec_decode/draft_model_proposer.cpp
   src/vllm/v1/worker/gpu/spec_decode/autoregressive/prepare_prefill_inputs.cpp
   src/vllm/v1/worker/gpu/spec_decode/mtp/speculator.cpp
   src/vllm/v1/worker/gpu/spec_decode/dflash/speculator.cpp
@@ -538,6 +540,8 @@ add_library(vllm STATIC
   src/vllm/v1/attention/backends/gdn_attn.cpp
   src/vllm/v1/structured_output/backend_types.cpp
   src/vllm/v1/structured_output/backend_native.cpp
+  src/vllm/v1/structured_output/backend_xgrammar.cpp
+  src/vllm/v1/structured_output/xgrammar_json_schema.cpp
   src/vllm/v1/structured_output/json_schema_to_gbnf.cpp
   src/vllm/v1/structured_output/jump_forward.cpp
   src/vllm/v1/structured_output/request.cpp
@@ -578,6 +582,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/serving_completion.cpp
   src/vllm/entrypoints/openai/serving_chat.cpp
   src/vllm/entrypoints/openai/serving_models.cpp
+  src/vllm/entrypoints/openai/run_batch.cpp
   src/vllm/entrypoints/openai/tool_parsers/abstract.cpp
   src/vllm/entrypoints/openai/tool_parsers/structural_tags.cpp
   src/vllm/entrypoints/openai/tool_parsers/detect.cpp

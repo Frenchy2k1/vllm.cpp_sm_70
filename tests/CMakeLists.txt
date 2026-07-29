@@ -25,6 +25,9 @@ endfunction()
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
 vllm_cpp_add_test(test_punica_cpu vllm/lora/test_punica_cpu.cpp)
+vllm_cpp_add_test(test_plugin_system
+  vllm/plugins/test_plugin_system.cpp
+  vllm/plugins/toy_model_plugin.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
 vllm_cpp_add_test(test_safetensors vllm/test_safetensors.cpp)
 vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)
@@ -376,9 +379,15 @@ target_include_directories(test_dflash_propose PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # vllm/tests/v1/spec_decode/test_ngram.py, host-side, runs everywhere).
 vllm_cpp_add_test(test_ngram_proposer vllm/v1/spec_decode/test_ngram_proposer.cpp)
 target_include_directories(test_ngram_proposer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# SPEC-DRAFT-MODEL (CLAIM-SPEC-DRAFT-MEDUSA) — the generic separate-draft-model
+# greedy propose brick; host-side, reuses the landed RejectionSampler verify.
+vllm_cpp_add_test(test_draft_model_proposer
+  vllm/v1/spec_decode/test_draft_model_proposer.cpp)
+target_include_directories(test_draft_model_proposer PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_structured_output vllm/v1/structured_output/test_structured_output.cpp)
 vllm_cpp_add_test(test_apply_grammar_bitmask vllm/v1/structured_output/test_apply_grammar_bitmask.cpp)
 vllm_cpp_add_test(test_backend_native vllm/v1/structured_output/test_backend_native.cpp)
+vllm_cpp_add_test(test_backend_xgrammar vllm/v1/structured_output/test_backend_xgrammar.cpp)
 vllm_cpp_add_test(test_jump_forward vllm/v1/structured_output/test_jump_forward.cpp)
 vllm_cpp_add_test(test_json_schema_to_gbnf vllm/v1/structured_output/test_json_schema_to_gbnf.cpp)
 vllm_cpp_add_test(test_response_format_e2e vllm/v1/structured_output/test_response_format_e2e.cpp)
@@ -404,6 +413,8 @@ target_compile_definitions(test_chat_mm PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 vllm_cpp_add_test(test_openai_protocol vllm/entrypoints/openai/test_protocol.cpp)
 vllm_cpp_add_test(test_openai_serving vllm/entrypoints/openai/test_serving.cpp)
+vllm_cpp_add_test(test_openai_run_batch
+  vllm/entrypoints/openai/test_run_batch.cpp)
 vllm_cpp_add_test(test_openai_serving_chat_stream
   vllm/entrypoints/openai/test_serving_chat_stream.cpp)
 vllm_cpp_add_test(test_openai_logprobs vllm/entrypoints/openai/test_logprobs.cpp)
@@ -787,6 +798,9 @@ vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
+# KV-FP8 W1: fp8 KV-cache store (ReshapeAndCacheFp8) + paged-attention read
+# dequant + the ParseCacheDType config wiring.
+vllm_cpp_add_test(test_ops_fp8_kv_cache vt/test_ops_fp8_kv_cache.cpp)
 # MLA campaign W3: the compressed-latent cache write + the grouped-topk router.
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.

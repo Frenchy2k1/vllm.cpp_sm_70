@@ -224,11 +224,25 @@ seam) — the parity surface. The grammar ENGINE is a from-scratch **NATIVE back
 (§9, ORIGINAL)** behind that seam: GBNF/EBNF parser + push-down FSM + token-byte
 trie (sub-O(vocab) fill; fill==accept invariant guarded by an exhaustive
 differential test), covering `json` (schema→GBNF), `json_object`, `regex`,
-`choice`, `grammar`(EBNF/GBNF) + OpenAI `response_format`. **The xgrammar C++ core
-is DEFERRED to a later parity-completion milestone** (a 2nd backend behind the SAME
-proven seam — mirrors upstream's own 4 pluggable backends; not a parity deviation).
-Deferred: STRUCTURAL_TAG, reasoning-gating, spec-decode multi-row, key-order
-flexibility, whitespace-flexibility/exotic-schema parity (xgrammar-only until vendored).
+`choice`, `grammar`(EBNF/GBNF) + OpenAI `response_format`. **The xgrammar backend
+W1 landed 2026-07-29 (`CLAIM-TOOLS-XGRAMMAR`, `TOOLS-XGRAMMAR`→ACTIVE)** as a 2nd
+registerable backend behind the SAME seam. **§9 DECISION (recorded): mirror
+xgrammar's algorithm PORTABLY, do NOT vendor the mlc-ai/xgrammar C++ library** —
+xgrammar IS "grammar → pushdown automaton → per-step token bitmask", already
+implemented portably by the native engine; vendoring would duplicate that
+machinery + add a heavy dependency against the no-extra-deps posture. So
+`XgrammarStructuredOutputBackend` (`backend_xgrammar.cpp`) REUSES the native
+matcher and ports only the xgrammar-FAITHFUL front-end where the two diverge — the
+JSON-schema→EBNF converter (`xgrammar_json_schema.cpp`, SEMANTICS ported from
+xgrammar `cpp/json_schema_converter.cc` @ `a32ac89`): property DECLARATION order
+(`nlohmann::ordered_json`, vs the native path's lexicographic sort), the
+`any_whitespace` `ws` rule, and the `basic_*` set VERBATIM — closing the key-order
++ whitespace + exotic-schema parity that was xgrammar-only. `auto`→xgrammar
+selection mirrored (`sampling_params.py:1031`). Deferred (W2+): STRUCTURAL_TAG-full,
+reasoning-gating, spec-decode multi-row, optional object properties, strict-compact
+separators, the `has_xgrammar_unsupported_json_features` guard +
+`validate_xgrammar_grammar` feeding the `auto` fallback, production wiring, GPU
+oracle parity.
 T1: `prompt_logprobs`, `logprob_token_ids`, additional backends
 (guidance/outlines), reasoning parsers, beam search wrapper, thinking budget,
 repetition detection, torch-Philox bit-exact random parity. T2: rejection
@@ -800,6 +814,38 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     the `torch.half is torch.float16` singleton collision resolving float16→2) is
     mirrored from source by reasoning and documented in `remote_protocol.h`; the
     hashes and framing themselves use the REAL Python codecs.
+
+11. **Plugin system: Python entry points → C++ static-init/`dlopen` registration
+    (2026-07-29, `ENG-PLUGIN-SYSTEM` / `CLAIM-PLUGIN-SYSTEM`) — legitimate
+    mechanical divergence, no behavioral change.** vLLM discovers plugins through
+    `importlib.metadata` entry points (`vllm/plugins/__init__.py:36-42`
+    `load_plugins_by_group` reads the `vllm.general_plugins` group; each entry
+    point resolves to a `register()` function `load_general_plugins` calls,
+    `:77-90`). Pure C++20 has no Python entry points, so the faithful analog is a
+    process-global REGISTRATION list an out-of-core translation unit or shared
+    object populates at load time — the SAME static-init idiom the project already
+    uses for models (`REGISTER_VLLM_MODEL`), platforms (`RegisterPlatform`), and
+    vt ops/backends (`RegisterOp`/`RegisterBackend`). The new
+    `include/vllm/plugins/plugins.h` / `src/vllm/plugins/plugins.cpp` add ONLY the
+    discovery+orchestration layer those seams lacked: `RegisterGeneralPlugin` /
+    `REGISTER_VLLM_GENERAL_PLUGIN` (the registration seam, mirror of an entry
+    point) and `LoadGeneralPlugins()` (mirror of `load_general_plugins` — the
+    `plugins_loaded` load-once latch `:33,82-85`, the `VLLM_PLUGINS` allowlist
+    `envs.py:1104-1108` parsed identically incl. `""`→`{""}`→no plugin, and the
+    per-plugin `try/catch` failure isolation `:68-72`). The BEHAVIOR is mirrored
+    1:1; only the transport (Python entry points vs C++ static-init/`dlopen`)
+    differs. A general plugin's callback installs its out-of-tree contribution
+    through the EXISTING public registries (`vllm::RegisterModel` for a model
+    factory — the C++ analog of `ModelRegistry.register_model`,
+    `registry.py:1039-1083` — `RegisterPlatform`, the quant registry), so the core
+    engine is untouched and byte-identical (W1 never calls `LoadGeneralPlugins`
+    from any production path; the engine/CLI `--load-plugins` wiring is a named W3
+    residual). The documented C-ABI entry symbol `vllm_plugin_register` is the
+    contract a future `dlopen`-based loader (W2) resolves so the static and dynamic
+    paths converge on one registration mechanism. Proven with a toy-model
+    out-of-core plugin compiled ONLY into the test executable (not the library, so
+    the counted 28-arch registry is untouched): `test_plugin_system` 1 case / 29
+    assertions, RED-first. Spec [specs/plugin-system.md](specs/plugin-system.md).
 
 ## 10. E2E test suites (T0 deliverable)
 

@@ -16,6 +16,117 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Generic draft-model + Medusa spec-decode W0 spike + W1 CPU brick (2026-07-29, `CLAIM-SPEC-DRAFT-MEDUSA`) - PENDING (correctness brick landed; DGX e2e + speed gate deferred, box offline)
+
+Disposition: **PENDING** a performance number. `SPEC-DRAFT-MODEL` W1 is a host-side
+GREEDY propose brick (`DraftModelProposeGreedy`: run a standalone draft LM K
+autoregressive steps, argmax each, feed back, return K drafts) that reuses the
+LANDED `SPEC-REJECTION` verify UNCHANGED — only the proposer is net-new. There is
+NO GPU forward yet (the draft model is abstracted as a next-token-logits oracle),
+so no throughput axis exists to compare at W1. Correctness is unit-gated RED-first:
+`test_draft_model_proposer` (6 cases / 41 assertions, CPU) proves the
+propose->verify->accept equivalence — the accepted token stream equals the
+target's own greedy run for every draft/target (dis)agreement pattern (the
+spec-decode correctness invariant), a target-matching draft is fully accepted
+(num_sampled == k+1), and — RED-first — full acceptance DEPENDS on the
+autoregressive feed-back (dropping it fails 5/6 cases). Repro (CPU):
+`cmake --build build-cpu --target test_draft_model_proposer && ./build-cpu/tests/test_draft_model_proposer`.
+The behavioral oracle is `tests/v1/e2e/spec_decode/test_spec_decode.py:500-561`
+(ref==spec equivalence, re-expressed deterministically at the brick level).
+Residuals (the future gate, DGX-offline): the real draft-model forward behind the
+oracle (paged KV + CUDA-graph), the e2e greedy our-draft-ON == vLLM-draft-ON
+token-exact gate on a real tiny-draft/target pair, and the throughput speed gate
+(match-or-beat vLLM on every axis). Medusa (`SPEC-MEDUSA`) is W0 spike only, no
+number owed until its W2 proposer lands.
+
+## Offline Batch API W0 spike + W1 CPU brick (2026-07-29, `CLAIM-BATCH-API`) - NOT-APPLICABLE (offline orchestration layer; no throughput owed)
+
+Disposition: **NOT APPLICABLE** for a performance number. `SERVE-BATCH-API` is an
+ORCHESTRATOR over the existing chat serving handler (`RunBatch` reads a JSONL of
+`BatchRequestInput`, dispatches each line to `OpenAIServingChat::create_chat_completion`,
+writes a `BatchRequestOutput` JSONL) — it reimplements NO generation, so its
+throughput is exactly the underlying handler's (`SERVE-OAI-BASIC`, already gated),
+and there is no separate oracle-throughput axis to compare. Correctness is the
+whole gate, and RED-first: `test_openai_run_batch` (7 cases / 80 assertions over
+the synthetic serving engine) proves the JSONL round-trip shape — ordered rows,
+custom_id echo, per-line error isolation (a malformed line becomes an error row
+and the batch continues), the endpoint dispatch table, and the 404/unsupported
+error rows; dropping the custom_id echo fails 9 assertions. Repro (CPU):
+`cmake --build build-cpu --target test_openai_run_batch && ./build-cpu/tests/test_openai_run_batch`.
+The behavioral oracle is the upstream `tests/entrypoints/openai/test_run_batch.py`
+(re-expressed at the library level; the subprocess-CLI cases need the unbuilt
+`vllm run-batch` binary). Residuals (no number owed until they land): the CLI,
+embeddings/score/rerank + audio dispatch, http(s)/data-URL I/O, and overlapped
+`AsyncLLM` submission — a CLI e2e vs the pinned oracle on a real model is the
+future gate.
+
+## Plugin system W0 spike + W1 CPU brick (2026-07-29, `CLAIM-PLUGIN-SYSTEM`) - NOT-APPLICABLE (out-of-core registration/discovery layer; no throughput owed)
+
+Disposition: **NOT APPLICABLE** for a performance number. `ENG-PLUGIN-SYSTEM` is
+the plugin DISCOVERY + orchestration layer (`vllm::plugins::LoadGeneralPlugins()`
++ the out-of-core general-plugin registration seam over the existing
+`REGISTER_VLLM_MODEL`-style registries): it runs once at startup to install
+out-of-tree contributions, on no hot path and with no oracle-throughput axis to
+compare. Correctness is the whole gate, and RED-first: `test_plugin_system`
+(1 case / 29 assertions) proves a toy architecture registered by an OUT-OF-CORE
+plugin TU resolves ONLY after `LoadGeneralPlugins()` runs it (and not under
+`VLLM_PLUGINS=""`), plus the allowlist / load-once idempotence / failure-isolation
+mirrors of `load_general_plugins`. Repro (CPU): `cmake --build build-cpu --target
+test_plugin_system && ./build-cpu/tests/test_plugin_system`. The behavioral oracle
+is the ported offline OOT test (`tests/plugins_tests/test_oot_registration_offline.py`),
+matched posture not a golden. Residuals (no number owed until wired): real `.so`
+`dlopen` + the C-ABI `vllm_plugin_register` entry, the engine/CLI `--load-plugins`
+wiring, the platform/quant plugin kinds, the io_processor/stat_logger/endpoint
+groups.
+
+## xgrammar structured-output backend W1 (2026-07-29, `CLAIM-TOOLS-XGRAMMAR`) - NOT-APPLICABLE (host-side masking correctness brick; no throughput owed)
+
+Disposition: **NOT APPLICABLE** for a performance number. Structured output is a
+host-side per-step logits-masking path; the only GPU work is the already-gated
+`apply_grammar_bitmask` scatter (`test_apply_grammar_bitmask`), unchanged by this
+row. W1 delivers the xgrammar-faithful JSON-schema→EBNF converter + the
+`XgrammarStructuredOutputBackend` behind the shared seam (reusing the native
+pushdown-FSM/trie matcher — xgrammar's own algorithm), CPU-gated by
+`test_backend_xgrammar` (6/6, 39 asserts, RED-first). Correctness is the whole
+gate; the GPU **oracle parity** run (token-identical constrained decode vs the
+pinned vLLM oracle with `structured_outputs.backend="xgrammar"` on a real model)
+is **PENDING**, DGX-blocked (GB10 offline). Repro (CPU): `cmake --build build-cpu
+--target test_backend_xgrammar && ./build-cpu/tests/test_backend_xgrammar`.
+## fp8 KV cache W1 - CPU fp8-e4m3 store + read (2026-07-29, `CLAIM-KV-FP8`) - NOT-APPLICABLE (CPU correctness brick; no throughput owed) / memory-halving e2e PENDING
+
+`benchmark_binding=false`. W1 is a CPU correctness brick: the fp8-e4m3 K/V store
+(`Quantize(hp/scale)`) + the paged-attention read dequant (`Dequant(fp8)*scale`)
++ the `cache_dtype` config parse, unit-gated by `test_ops_fp8_kv_cache` (8 cases
+/ 511 assertions; round-trip within the e4m3 band, fp8-vs-bf16 NMSE < 1%,
+paged-attention e2e within 5%; RED-first: a wrong store direction fails 3/480).
+No throughput or memory number is owed by a CPU codec brick. **The real
+memory/throughput win (the point of the feature) is PENDING and DGX-blocked:**
+the CUDA fp8 store + fp8 paged-attention read plus the runner/spec integration
+(half-sized KV blocks roughly doubling `num_gpu_blocks`) are named W2-W4 in
+[.agents/specs/fp8-kv-cache.md](../.agents/specs/fp8-kv-cache.md). Repro (CPU
+correctness): `cmake --build build-cpu --target test_ops_fp8_kv_cache &&
+./build-cpu/tests/test_ops_fp8_kv_cache`.
+
+## DeepSeek-V4-Flash W2c - forward rewired onto the keep-quant tower (2026-07-29, `CLAIM-DEEPSEEK-V4-W2C`) - NOT-APPLICABLE (memory-enabler code brick; no throughput owed) / real run PENDING (W8-run, now memory-FEASIBLE)
+
+**W8-run status (2026-07-29): ATTEMPTED, HARDWARE-BLOCKED (not run, nothing faked).** The code is complete and memory-feasible @ `2936ff70` (keep-quant forward, ~93.9 GiB < the 119 GiB pool). The operational run (download ~91 GB `UD-IQ2_XXS`, keep-quant load, greedy generate, self-consistency + coherence gate, TPOT/throughput/peak-mem benchmark) could NOT start: the **DGX GB10 (`dgx.casa`/192.168.68.128) is OFFLINE** - `ping` 5/5 loss, ARP FAILED, SSH `No route to host`, while the gateway/Thor/mac-mini respond (DGX-specific, powered off or crashed per the OOM-reboot history). No out-of-band wake path from the dev box. **Resume: bring the DGX back online, then re-run the W8-run recipe below - no code change needed.** DeepSeek-V4 row stays SPIKE (no run, no benchmark).
+
+W2c fixes the OOM that blocked the single-Spark run: `LoadDeepseekV4FromGguf` no longer
+f32-expands the big MLA/MoE/lm_head weights, and `DeepseekV4ForwardGguf` consumes the
+COMPRESSED `weights.gguf` blocks in place via `vt::MatmulBT`->the CPU `kMatmulBTQuant` CIQ
+GEMM. No throughput is owed by this brick (a memory/correctness enabler on CPU at tiny
+synthetic shape). Correctness + memory gate `test_deepseek_v4_gguf_load` 7/7 - 185
+assertions (CPU Release, `-Werror`-clean): keep-quant(Q8_0) vs dequant(bf16) forward RelL2
+0.0116 (near-tie, < 0.05 band); a no-sink miswire diverges (RelL2 0.122, RED-first); a load
+that rebuilds the f32 tower fails a load-time assertion. Memory-bound: at tiny shape host
+23,980 B vs keep-quant 141,676 B; projected full scale, the 256 routed experts alone are
+~1032 GiB f32 (OOM-reboots the 119 GiB pool) versus the keep-quant `UD-IQ2_XXS` ~91 GiB plus
+a small (< 3 GiB) f32 host tower = ~93.9 GiB, memory-FEASIBLE on ONE GB10. The real 91 GB
+`UD-IQ2_XXS` run (download + GB10 greedy generate + self-consistency/coherence + benchmark
+vs llama.cpp-on-card) is the operational W8-run, now unblocked on memory. Repro: build CPU
+`-DVLLM_CPP_CUDA=OFF` Release, `./tests/test_deepseek_v4_gguf_load`; resume recipe in
+`.agents/specs/deepseek-v4-flash.md` §W2c.3.
+
 ## DeepSeek-V4-Flash W2b - GGUF keep-quant tower materialization (2026-07-29, `CLAIM-DEEPSEEK-V4-W2B`) - NOT-APPLICABLE (loader wiring brick; no throughput owed) / real run PENDING (W8-final)
 
 W2b wires the landed `deepseek4` GGUF `blk.N.*` name-map + keep-quant blocks into the
@@ -968,7 +1079,9 @@ Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** (2026-07-29
 registry-metadata fix — `KimiK3ForConditionalGeneration` outer wrapper
 `has_inner_state=false` + `test_model_registry` drift repaired, plus the
-2026-07-29 `test_model_loader_gguf` supported-arch golden sync — is likewise
+2026-07-29 `test_model_loader_gguf` supported-arch golden sync, plus the
+2026-07-29 env-doc hygiene fix (`VLLM_PLUGINS` documented, `VLLM_GEMMA4_MM_DEBUG`
+allowlisted, `check-env-doc` rc=0) — is likewise
 NOT APPLICABLE: metadata + test hygiene only, no build/run/measurement owed.) Scopes
 `KimiK3ForConditionalGeneration` (released 2026-07-27, beyond the pin) — a 2.8T MoE
 whose text backbone is the Kimi-Linear KDA+MLA+MoE hybrid scaled to H=7168 / 93

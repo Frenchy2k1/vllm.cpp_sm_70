@@ -199,7 +199,34 @@ ENGINE_PREFIXES = (
 # prefix-cache matching unit (`resolve_kv_cache_block_sizes` -> `hash_block_size`),
 # not covered by the `KV-PREFIX-CACHE` block-hash row (which hashes at
 # `block_size`). W0 spike + W1 resolver landed; `PARTIAL`.
-ENGINE_ROWS = 126
+# 127 since 2026-07-29: +`ENG-PLUGIN-SYSTEM` (the out-of-core PLUGIN system —
+# `LoadGeneralPlugins()` + the general-plugin registration seam that lets an
+# external TU / shared object register a model factory / platform / quant method
+# through the existing `REGISTER_VLLM_MODEL`-style seams WITHOUT editing engine
+# core; the RECORDS-GAP the feature-gap analysis named for row creation). A real
+# new engine capability, W0 spike + W1 CPU brick landed + unit-gated RED-first;
+# `ACTIVE`, `CLAIM-PLUGIN-SYSTEM`, spec `specs/plugin-system.md`. Bumped for a
+# real new row, never to make a failing state transition pass.
+# 128 since 2026-07-29: +`SERVE-BATCH-API` (the offline OpenAI Batch API runner —
+# read a JSONL of BatchRequestInput, dispatch each line to the matching serving
+# handler, write a BatchRequestOutput JSONL; the RECORDS-GAP the feature-gap
+# analysis named for row creation, recommending SERVE-BATCH-API). A real new
+# serving capability, W0 spike + W1 CPU brick (chat dispatch orchestrator over
+# the existing OpenAIServingChat, NO reimplemented generation) landed +
+# unit-gated RED-first; `ACTIVE`, `CLAIM-BATCH-API`, spec `specs/batch-api.md`.
+# Bumped for a real new row, never to make a failing state transition pass.
+# 130 since 2026-07-29: +`SPEC-DRAFT-MODEL` (the classic model-agnostic SEPARATE
+# draft-model speculator — a full smaller standalone LM runs K autoregressive
+# greedy steps to propose K drafts, target verifies in one forward, longest
+# accepted prefix emitted; distinct from MTP/EAGLE/DFlash: no target-hidden tap,
+# no shared embed/lm_head) and +`SPEC-MEDUSA` (Medusa N-head single-pass
+# speculator). The two RECORDS-GAP items the feature-gap analysis named for row
+# creation (lines 82-83). `SPEC-DRAFT-MODEL` ACTIVE (W0 spike + W1 CPU greedy
+# propose brick landed + unit-gated RED-first, reusing the landed SPEC-REJECTION
+# verify); `SPEC-MEDUSA` SPIKE (W0 spike only, proposer deferred to W2).
+# `CLAIM-SPEC-DRAFT-MEDUSA`, spec `specs/draft-model-medusa-spec.md`. Bumped for
+# two real new rows, never to make a failing state transition pass.
+ENGINE_ROWS = 130
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
