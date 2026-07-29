@@ -271,6 +271,17 @@ HfConfig DeepseekV4HfConfigFromGguf(const GgufFile& gguf);
 DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& gguf, const HfConfig& config,
                                         const GgufLoadPolicy* policy = nullptr);
 
+// ─── W2C memory accounting (the memory-bound gate) ───────────────────────────
+// Resident bytes of the SMALL f32 `host` tower (norms/embed/mixing/hash/ape/sink
+// + the int32 hash table). After W2C this does NOT include the big MLA/MoE/lm_head
+// weights — those are keep-quant in `gguf`. A test asserts this stays far below
+// the keep-quant tower + the f32-expanded projection (a rebuild of the ~1 TiB f32
+// tower would blow it up).
+int64_t DeepseekV4HostResidentBytes(const DeepseekV4Weights& w);
+// Resident bytes of the keep-quant `gguf` tower (compressed blocks + the small
+// V/ET dequant OwnedTensors it also carries).
+int64_t DeepseekV4GgufResidentBytes(const DeepseekV4Weights& w);
+
 // W7 structural-gate knobs. A deliberately-miswired interleave MUST change the
 // output (RED-first) — the structural gate proves each lever is load-bearing.
 enum class V4Miswire {
@@ -302,6 +313,22 @@ struct V4ForwardTrace {
 // + :866-957 (DeepseekV4DecoderLayer.forward).
 std::vector<float> DeepseekV4ForwardHost(
     const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices = {},
+    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr);
+
+// W2C — the GGUF keep-quant forward. Runs the SAME composition as
+// DeepseekV4ForwardHost but the big 512-wide MLA linears + the 256 routed/shared
+// expert GEMMs + lm_head CONSUME the COMPRESSED `weights.gguf` keep-quant blocks
+// in place via vt::MatmulBT -> the CPU kMatmulBTQuant CIQ GEMM (NO per-layer f32
+// expansion — the ~1 TiB f32 tower is never built). The small non-GEMM tensors
+// (norms, sinks, MHC/DSA mixing, ape, the hash table, embed) still come from the
+// SMALL f32 `weights.host` tower the loader dequants, exactly as our other GGUF
+// models keep them (qwen3_5_gguf_weights.cpp). Requires a queue (the CPU quant
+// GEMM consumer). This is the memory ENABLER for the single-Spark `UD-IQ2_XXS`
+// (~91 GiB) vehicle. Grounding: model.py:1080-1148 + vt/ops.cpp:134-201.
+std::vector<float> DeepseekV4ForwardGguf(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {},
     V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr);

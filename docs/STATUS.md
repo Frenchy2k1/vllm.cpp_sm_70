@@ -347,7 +347,24 @@ single-Spark RUN is still BLOCKED — now on a CODE residual, not download/box, 
 routed expert `HostVec`→f32) ≈ ~24 GiB/layer × 43 ≈ **~1.0 TiB** f32, past the 119 GiB pool by
 ~layer 5; the keep-quant `weights.gguf` tower (~91 GiB) is built but never read by the forward. A
 real run needs the forward rewired onto the CIQ `kMatmulBTQuant` keep-quant blocks + the host dequant
-gated off (named residual W2c). No tokens generated (not faked); DGX left as found.
+gated off (was named residual W2c). No tokens generated (not faked); DGX left as found.
+**W2c landed (2026-07-29, `CLAIM-DEEPSEEK-V4-W2C`): the OOM-infeasibility is FIXED.**
+`LoadDeepseekV4FromGguf` no longer f32-expands the big MLA/MoE/lm_head weights (only the
+small norms/embed/MHC/DSA/hash tensors dequant); a new `DeepseekV4ForwardGguf` runs the
+SAME composition with the 512-wide MLA linears + the 256 routed/shared expert GEMMs +
+lm_head consuming the COMPRESSED `weights.gguf` blocks in place via `vt::MatmulBT`→the CPU
+`kMatmulBTQuant` CIQ GEMM (no per-layer f32 expansion), and `DeepseekV4Model::Forward`
+gates on `has_gguf_weights` (the safetensors/NVFP4 + tiny-synthetic host path stays
+byte-identical). Gate `test_deepseek_v4_gguf_load` 7/7·185 (CPU Release `-Werror`-clean):
+the keep-quant forward RUNS finite+deterministic, keep-quant(Q8_0)==dequant(bf16) RelL2
+0.0116 (< 0.05 near-tie), RED-first (a no-sink miswire diverges, and a load that rebuilds
+the f32 tower fails a load-time `VT_CHECK` + the host<gguf-bytes assertion). Memory-bound
+asserted: at tiny shape host 23,980 B vs keep-quant 141,676 B; projected to the real config
+the 256 routed experts alone are ~1032 GiB f32 (OOM-reboots the 119 GiB pool) vs the
+keep-quant `UD-IQ2_XXS` ~91 GiB + small host < 3 GiB = memory-FEASIBLE on ONE GB10. The
+real 91 GB run (download + GB10 generate + benchmark) stays the operational W8-run, now
+memory-feasible. SACRED-inert: only the V4 forward/loader + its test changed; the W3-W6
+primitive tests (the correctness oracle) are untouched and still pass.
 **W3 attention primitives landed
 (2026-07-28):** the genuinely-new-vs-V2/V3 math is ported as portable host references
 and unit-gated — the DSA "Lightning Indexer" sparse top-k SELECTION (a weighted

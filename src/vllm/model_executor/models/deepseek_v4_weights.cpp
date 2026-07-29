@@ -629,10 +629,17 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
   tw.hc_head_fn = ctx.Vec("output_hc_fn.weight", GgufTensorRole::kVector);
   tw.hc_head_scale = ctx.Vec("output_hc_scale.weight", GgufTensorRole::kVector);
 
-  // ── host composition tower (dequant bridge) ─────────────────────────────
+  // ── SMALL host composition tower (W2C: dequant bridge for the NON-GEMM tensors
+  //    ONLY). The big MLA/MoE/lm_head weights are NOT f32-expanded here — the
+  //    forward (DeepseekV4ForwardGguf) consumes them keep-quant from `w.gguf`. So
+  //    `host` holds only: embed (a gather), the RMSNorms, the attention sink, the
+  //    MHC/DSA mixing/ape/scale, the hash table / noaux_tc bias, and the small
+  //    indexer weights_proj. This is the ~1 TiB -> ~small memory fix (the routed
+  //    experts alone are ~277B params; f32 would OOM the 119 GiB unified pool). ─
   DeepseekV4HostWeights& hw = w.host;
-  hw.embed = HostVec(g, "token_embd.weight");
-  hw.lm_head = tied ? hw.embed : HostVec(g, "output.weight");
+  hw.embed = HostVec(g, "token_embd.weight");  // gather table (V/f32), NOT a GEMM
+  // hw.lm_head deliberately LEFT EMPTY — the final projection reads the keep-quant
+  // `tw.lm_head` block via the forward's Gemm (tied => an f32 OwnedTensor).
   hw.final_norm_weight = HostVec(g, "output_norm.weight");
   hw.hc_head_fn = HostVec(g, "output_hc_fn.weight");
   hw.hc_head_base = HostVec(g, "output_hc_base.weight");
@@ -700,7 +707,9 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
           ctx.Vec(Blk(l, "indexer_compressor_norm.weight"), GgufTensorRole::kVector);
     }
 
-    // ── host bridge for THIS layer (dequant the slots the CPU forward reads) ──
+    // ── SMALL host bridge for THIS layer (W2C: only the NON-GEMM slots the
+    //    forward reads as f32; the big MLA/MoE GEMM weights below are consumed
+    //    keep-quant from `lw` and are LEFT EMPTY in `hl`). ────────────────────
     hl.attn_norm_weight = HostVec(g, Blk(l, "attn_norm.weight"));
     hl.ffn_norm_weight = HostVec(g, Blk(l, "ffn_norm.weight"));
     hl.hc_attn_fn = HostVec(g, Blk(l, "hc_attn_fn.weight"));
@@ -709,15 +718,11 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
     hl.hc_ffn_fn = HostVec(g, Blk(l, "hc_ffn_fn.weight"));
     hl.hc_ffn_base = HostVec(g, Blk(l, "hc_ffn_base.weight"));
     hl.hc_ffn_scale = HostVec(g, Blk(l, "hc_ffn_scale.weight"));
-    hl.wq_a = HostVec(g, Blk(l, "attn_q_a.weight"));
     hl.q_norm_weight = HostVec(g, Blk(l, "attn_q_a_norm.weight"));
-    hl.wq_b = HostVec(g, Blk(l, "attn_q_b.weight"));
-    hl.wkv = HostVec(g, Blk(l, "attn_kv.weight"));
     hl.kv_norm_weight = HostVec(g, Blk(l, "attn_kv_a_norm.weight"));
     hl.attn_sink = HostVec(g, Blk(l, "attn_sinks.weight"));
-    hl.wo_a = HostVec(g, Blk(l, "attn_output_a.weight"));
-    hl.wo_b = HostVec(g, Blk(l, "attn_output_b.weight"));
-    hl.gate_weight = HostVec(g, Blk(l, "ffn_gate_inp.weight"));
+    // wq_a/wq_b/wkv/wo_a/wo_b, gate, shared+routed experts: KEEP-QUANT (in `lw`),
+    // NOT f32-expanded here — the memory fix.
     if (lw.is_hash) {
       const std::vector<float> t2e = HostVec(g, Blk(l, "ffn_gate_tid2eid.weight"));
       hl.tid2eid.resize(t2e.size());
@@ -726,26 +731,16 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
     } else {
       hl.gate_bias = HostVec(g, Blk(l, "exp_probs_b.bias"));
     }
-    hl.shared_w1 = HostVec(g, Blk(l, "ffn_gate_shexp.weight"));
-    hl.shared_w3 = HostVec(g, Blk(l, "ffn_up_shexp.weight"));
-    hl.shared_w2 = HostVec(g, Blk(l, "ffn_down_shexp.weight"));
-    hl.exp_w1 = HostVec(g, Blk(l, "ffn_gate_exps.weight"));
-    hl.exp_w3 = HostVec(g, Blk(l, "ffn_up_exps.weight"));
-    hl.exp_w2 = HostVec(g, Blk(l, "ffn_down_exps.weight"));
     if (lw.has_compressor) {
-      hl.comp_wgate = HostVec(g, Blk(l, "attn_compressor_gate.weight"));
+      // comp_wgate is keep-quant (in `lw`); only ape/norm are f32 (small V).
       hl.comp_ape = HostVec(g, Blk(l, "attn_compressor_ape.weight"));
       hl.comp_norm_weight = HostVec(g, Blk(l, "attn_compressor_norm.weight"));
     }
     if (lw.has_indexer) {
-      // Tiny-config STRUCTURAL bridge (documented divergence, deepseek_v4.cpp):
-      // the host indexer uses a simplified q/k/proj triple — idx_wq <- the
-      // indexer query proj, idx_wproj <- the weights_proj, idx_wk <- the
-      // indexer compressor kv (the real model derives the key from the
-      // compressed latent). The full geometry is the W7-device / W8 seam.
-      hl.idx_wq = HostVec(g, Blk(l, "indexer.attn_q_b.weight"));
+      // idx_wq (indexer.attn_q_b) + idx_wk (indexer_compressor_kv) are keep-quant
+      // (in `lw`); only the small weights_proj stays f32 (documented tiny-config
+      // structural bridge, deepseek_v4.cpp).
       hl.idx_wproj = HostVec(g, Blk(l, "indexer.proj.weight"));
-      hl.idx_wk = HostVec(g, Blk(l, "indexer_compressor_kv.weight"));
     }
 
     tw.layers.push_back(std::move(lw));
@@ -759,12 +754,81 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
              "deepseek-v4 gguf loader: LEFTOVER tensor not covered by the blk.N.* "
              "name map: " + t.name);
   }
+  // ── W2C MEMORY-BOUND ASSERTION: the big MLA/MoE/lm_head weights must NOT be
+  //    f32-expanded into the host tower. This is the crux of the fix — a
+  //    regression that re-adds a HostVec for any big weight (rebuilding the ~1 TiB
+  //    f32 tower that OOM-reboots the 119 GiB pool) fails LOUDLY here at load. ──
+  VT_CHECK(w.host.lm_head.empty(),
+           "deepseek-v4 gguf: lm_head must stay keep-quant, not f32-expanded");
+  for (const DeepseekV4LayerHostWeights& hl : w.host.layers) {
+    VT_CHECK(hl.wq_a.empty() && hl.wq_b.empty() && hl.wkv.empty() &&
+                 hl.wo_a.empty() && hl.wo_b.empty() && hl.gate_weight.empty() &&
+                 hl.shared_w1.empty() && hl.shared_w3.empty() && hl.shared_w2.empty() &&
+                 hl.exp_w1.empty() && hl.exp_w3.empty() && hl.exp_w2.empty() &&
+                 hl.comp_wgate.empty() && hl.idx_wq.empty() && hl.idx_wk.empty(),
+             "deepseek-v4 gguf: a big MLA/MoE weight was f32-expanded into the host "
+             "tower — the keep-quant forward must consume it from `gguf` (W2C)");
+  }
   w.accounted_tensors = static_cast<int64_t>(ctx.consumed.size());
   w.has_gguf_weights = true;
   w.has_host_weights = true;
   // Silence unused in a non-indexer/degenerate tiny config.
   (void)nh; (void)hd; (void)qlr; (void)topk; (void)mi; (void)hc; (void)inh; (void)ihd; (void)H;
   return w;
+}
+
+// ─── W2C memory accounting ───────────────────────────────────────────────────
+namespace {
+int64_t HostBytes(const DeepseekV4HostWeights& hw) {
+  auto vf = [](const std::vector<float>& v) {
+    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(float));
+  };
+  auto vi = [](const std::vector<int32_t>& v) {
+    return static_cast<int64_t>(v.size()) * static_cast<int64_t>(sizeof(int32_t));
+  };
+  int64_t b = vf(hw.embed) + vf(hw.lm_head) + vf(hw.final_norm_weight) +
+              vf(hw.hc_head_fn) + vf(hw.hc_head_base) + static_cast<int64_t>(sizeof(float));
+  for (const DeepseekV4LayerHostWeights& hl : hw.layers) {
+    b += vf(hl.attn_norm_weight) + vf(hl.ffn_norm_weight) + vf(hl.hc_attn_fn) +
+         vf(hl.hc_attn_base) + vf(hl.hc_attn_scale) + vf(hl.hc_ffn_fn) +
+         vf(hl.hc_ffn_base) + vf(hl.hc_ffn_scale) + vf(hl.wq_a) + vf(hl.q_norm_weight) +
+         vf(hl.wq_b) + vf(hl.wkv) + vf(hl.kv_norm_weight) + vf(hl.attn_sink) +
+         vf(hl.wo_a) + vf(hl.wo_b) + vf(hl.idx_wq) + vf(hl.idx_wk) + vf(hl.idx_wproj) +
+         vf(hl.comp_wgate) + vf(hl.comp_ape) + vf(hl.comp_norm_weight) +
+         vf(hl.gate_weight) + vf(hl.gate_bias) + vi(hl.tid2eid) + vf(hl.shared_w1) +
+         vf(hl.shared_w3) + vf(hl.shared_w2) + vf(hl.exp_w1) + vf(hl.exp_w3) +
+         vf(hl.exp_w2);
+  }
+  return b;
+}
+int64_t OwnedBytesOf(const OwnedTensor& t) {
+  return static_cast<int64_t>(t.bytes.size());
+}
+int64_t GgufBytes(const DeepseekV4GgufWeights& gw) {
+  int64_t b = OwnedBytesOf(gw.embed) + OwnedBytesOf(gw.lm_head) +
+              OwnedBytesOf(gw.final_norm) + OwnedBytesOf(gw.hc_head_base) +
+              OwnedBytesOf(gw.hc_head_fn) + OwnedBytesOf(gw.hc_head_scale);
+  for (const DeepseekV4GgufLayerWeights& l : gw.layers) {
+    for (const OwnedTensor* t :
+         {&l.wq_a, &l.wq_b, &l.wkv, &l.wo_a, &l.wo_b, &l.attn_norm, &l.q_a_norm,
+          &l.kv_a_norm, &l.attn_sink, &l.ffn_norm, &l.hc_attn_base, &l.hc_attn_fn,
+          &l.hc_attn_scale, &l.hc_ffn_base, &l.hc_ffn_fn, &l.hc_ffn_scale, &l.moe_gate,
+          &l.moe_gate_exps, &l.moe_up_exps, &l.moe_down_exps, &l.shared_gate,
+          &l.shared_up, &l.shared_down, &l.tid2eid, &l.e_score_bias, &l.comp_ape,
+          &l.comp_wgate, &l.comp_wkv, &l.comp_norm, &l.idx_wq_b, &l.idx_proj,
+          &l.idx_comp_ape, &l.idx_comp_wgate, &l.idx_comp_wkv, &l.idx_comp_norm}) {
+      b += OwnedBytesOf(*t);
+    }
+  }
+  return b;
+}
+}  // namespace
+
+int64_t DeepseekV4HostResidentBytes(const DeepseekV4Weights& w) {
+  return HostBytes(w.host);
+}
+int64_t DeepseekV4GgufResidentBytes(const DeepseekV4Weights& w) {
+  return GgufBytes(w.gguf);
 }
 
 }  // namespace vllm

@@ -32219,3 +32219,46 @@ the Q4_K_M draft's proposals get rejected one block earlier against a true-fp4
 target when the emitted tokens are identical), and decide whether the axis-A bar
 should stay accept-count-exact or become accept-count-banded like the golden
 arm's `<= 4` band. Both rows' speed items are unchanged and still PENDING.
+
+---
+
+## 2026-07-29 — DeepSeek-V4-Flash W2c: forward rewired onto the keep-quant tower (`CLAIM-DEEPSEEK-V4-W2C`, NOT pushed)
+
+**Base:** `main` `328e6a50` (isolated worktree `scratchpad/wt-w2c`, branch `claim-deepseek-v4-w2c`; CPU-only `build-w2c` Release `-DVLLM_CPP_CUDA=OFF`; foreground; NOT pushed).
+
+**The fix.** W8-final proved the DeepSeek-V4 GGUF forward read the FULLY-DEQUANTIZED f32 `weights.host`
+tower (which `LoadDeepseekV4FromGguf` built unconditionally, ~1 TiB for the real 43-layer/256-expert
+model) and would OOM-reboot the 119 GiB pool; the keep-quant `weights.gguf` tower (~91 GiB) was built
+but never read. W2c fixes both:
+- `LoadDeepseekV4FromGguf` (`deepseek_v4_weights.cpp`) NO LONGER f32-expands the big MLA/MoE/lm_head
+  weights into `host` — only the small NON-GEMM tensors (norms, sinks, MHC/DSA mixing, ape,
+  `tid2eid`/`exp_probs_b`, weights_proj, embed-gather) dequant. A load-time `VT_CHECK` asserts every
+  big host slot is EMPTY (rebuilding the f32 tower fails LOUDLY). Added `DeepseekV4{Host,Gguf}ResidentBytes`.
+- `deepseek_v4.cpp` gained a `V4Backend::gguf` weight source + `Gemm`/`GemmRowSlice`/`GroupedOutputLoraGguf`
+  keep-quant GEMM helpers (consume `OwnedTensor` blocks in place via `vt::MatmulBT`→the CPU
+  `kMatmulBTQuant` CIQ GEMM; f32-MatVec fallback bit-identical for the host path). `ForwardComposeImpl`
+  routes the 512-wide MLA linears, compressor/indexer projections, router gate, shared + 256 routed
+  experts, and lm_head to the compressed blocks. New public `DeepseekV4ForwardGguf`; `Forward` gates on
+  `has_gguf_weights` (safetensors/NVFP4 + tiny-synthetic host path byte-identical).
+
+**Gate.** `test_deepseek_v4_gguf_load` **7/7·185** (CPU Release `-Werror`-clean): keep-quant forward
+RUNS finite+deterministic; keep-quant(Q8_0)==dequant(bf16) RelL2 **0.0116** (< 0.05 near-tie); RED-first
+(no-sink miswire diverges 0.122; a rebuilt f32 tower fails the loader `VT_CHECK` + the host<gguf-bytes
+assertion). MEMORY-BOUND: host **23,980 B** < keep-quant **141,676 B** at tiny shape; projected the 256
+routed experts alone are **~1032 GiB** f32 (OOMs 119 GiB) vs keep-quant `UD-IQ2_XXS` **~91 GiB** + small
+host **< 3 GiB** = **memory-FEASIBLE**.
+
+**SACRED-inert PROVEN.** Only `deepseek_v4.{h,cpp}` + `deepseek_v4_weights.cpp` + the test changed; the
+W3-W6 primitive host references (the correctness oracle) untouched + still pass (dsa 38, mhc 125, moe
+716, compressor 164, forward 26, scaffold 40); shared MLA/MoE + CUDA W7-device empty-diff;
+`test_cuda_deepseek_v4` compiles + skips on the CPU box. REUSES `kMatmulBTQuant` — no new kernel row / no
+checker bump.
+
+**Residual.** The operational W8-run (download `unsloth/DeepSeek-V4-Flash-GGUF/UD-IQ2_XXS` ~91 GB + GB10
+greedy generate + self-consistency/coherence gate + benchmark vs llama.cpp-on-card), now MEMORY-FEASIBLE.
+Honest 3-state: the tiny keep-quant forward = DERIVED + BUILD-VERIFIED. NO tokens generated (not faked);
+no download/GPU this lane.
+
+**Records same-change:** model-matrix (DeepSeek-V4 cell extended, stays `SPIKE`), coordination
+(`CLAIM-DEEPSEEK-V4-W2C` row), spec §W2c, feature-matrix, STATUS, BENCHMARKS, roadmap_v1, parity-ledger,
+this state entry.
