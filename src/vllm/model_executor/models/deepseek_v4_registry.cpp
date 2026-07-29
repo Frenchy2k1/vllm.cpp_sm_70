@@ -58,9 +58,22 @@ class DeepseekV4LoadedModel final : public LoadedModel {
 std::unique_ptr<LoadedModel> LoadDeepseekV4ForCausalLM(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
-  if (source.kind != ModelSource::Kind::kSafetensors) {
-    throw std::runtime_error(
-        "Model architecture DeepseekV4ForCausalLM does not support GGUF weights");
+  if (source.kind == ModelSource::Kind::kGguf) {
+    // W2b (LANDED): the single-Spark `deepseek4` GGUF vehicle
+    // (`unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_XXS`, ~91 GiB — the only build that
+    // fits ONE GB10's 119 GiB unified pool). The keep-quant compute for the
+    // ~2-3-bit routed experts (IQ2_XXS/IQ3_XXS/Q2_K, vt::MatmulBTQuant) + the
+    // blk.N.* -> V4 name map (EXACT 1328/1328 coverage) landed in W8; W2b wires
+    // them into the DeepseekV4 weight towers (keep-quant blocks stay COMPRESSED;
+    // the small MHC/DSA/norm/embed tensors dequant). See
+    // .agents/specs/deepseek-v4-flash.md §W2b. HONEST 3-state: the materialization
+    // is gated at tiny synthetic shape (test_deepseek_v4_gguf_load.cpp); the real
+    // 91 GiB load + generate is the W8-final operational residual (download + DGX).
+    if (source.gguf == nullptr) {
+      throw std::runtime_error("deepseek-v4 GGUF model source is empty");
+    }
+    return std::make_unique<DeepseekV4LoadedModel>(
+        registration, LoadDeepseekV4FromGguf(*source.gguf, config));
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");

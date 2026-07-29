@@ -16,6 +16,54 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## DeepSeek-V4-Flash W2b - GGUF keep-quant tower materialization (2026-07-29, `CLAIM-DEEPSEEK-V4-W2B`) - NOT-APPLICABLE (loader wiring brick; no throughput owed) / real run PENDING (W8-final)
+
+W2b wires the landed `deepseek4` GGUF `blk.N.*` name-map + keep-quant blocks into the
+`DeepseekV4` weight towers (`LoadDeepseekV4FromGguf`): the MLA linears, router gate, 256
+routed + shared experts, and lm_head KEEP their ~2-3-bit blocks COMPRESSED (the ~91 GiB
+vs ~316 GiB OOM enabler); norms/MHC/DSA/embed/`tid2eid` dequant. Gated STRUCTURALLY at
+tiny synthetic shape (`test_deepseek_v4_gguf_load` 5/5·149: accounting 126/126, keep-quant
+residency, load→forward finite+deterministic, RED-first) - a loader brick owes no
+throughput number, so NOT-APPLICABLE this lane. The real single-Spark `UD-IQ2_XXS`
+benchmark (TPOT/throughput/peak-mem, llama.cpp-on-card floor) stays PENDING until the
+W8-final run: download ~91 GB to the DGX, keep-quant load into `DeepseekV4Model`,
+`ForwardDevice` greedy gen, self-consistency + coherence gate, then time it. Repro entry:
+`LoadDeepseekV4FromGguf` + the resume recipe in `.agents/specs/deepseek-v4-flash.md` §W2b.4.
+
+## DeepSeek-V4-Flash W8 - keep-quant IQ2_XXS/IQ3_XXS/Q2_K + GGUF name map (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`) - PENDING (the RUN did not execute; memory enabler + name-map landed, gated)
+
+No throughput number: the single-Spark GGUF RUN did NOT execute this lane and was
+NOT faked. What landed and is gated: (1) the keep-quant `vec_dot` for IQ2_XXS,
+IQ3_XXS and Q2_K (`test_ops_quant_dot` 19 cases / 130444 assertions, CPU Debug;
+vec_dot vs f64 dequant-dot within 1e-5·L1, `MatmulBTQuant` NMSE <= 5e-4 vs
+dequant-f32, bit-exact across thread counts; RED-first proven - perturbing the
+IQ2_XXS 0.125 fold fails 2 cases/18 assertions, revert restores 19/130444) - the
+MEMORY ENABLER that keeps the 158 B routed experts compressed (~91 GiB) instead of
+OOM-expanding to bf16 (~316 GiB, which hard-reboots the box); (2) the `blk.N.*`->V4
+name map with EXACT 1328/1328 coverage, 0 unmapped, 0 leftover
+(`scripts/check-dsv4-gguf-namemap.py` rc=0) verified against the real manifest read
+from the shard GGUF headers via HTTP-range (no 91 GB download). HONEST finding: there
+is NO CUDA keep-quant vec_dot for ANY k-quant (`kMatmulBTQuant` is CPU-only), so on
+GB10 this runs on the 20 ARM cores against the unified pool. The RUN is blocked on the
+unimplemented W2b (materialize the keep-quant blocks into the DeepseekV4 towers via the
+name map), then the 91 GB download + GB10 greedy generation + self-consistency /
+coherence gate. Benchmark disposition PENDING until W2b + the run land. Repro entry:
+`scripts/check-dsv4-gguf-namemap.py`; `build-cpu/tests/test_ops_quant_dot`.
+
+**W8-final update (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`, base `376e186b`): entrypoint wiring landed +
+gated; the RUN re-scoped to a CODE blocker, benchmark STILL PENDING (no numbers, not faked).** W2b
+(GGUF→tower materialization) landed, so the entrypoint arm was wired: a `deepseek4` GGUF now routes
+through `HfConfigFromGgufDispatch`/`DeepseekV4HfConfigFromGguf` onto the registered
+`DeepseekV4ForCausalLM` (gate `test_deepseek_v4_gguf_load` 6/6·168, CPU `-Werror`-clean). The real
+single-Spark `UD-IQ2_XXS` run was NOT attempted because it would OOM-reboot the box: the DeepSeek-V4
+forward (`ForwardComposeImpl`) reads the FULLY-DEQUANTIZED f32 `weights.host` tower, and
+`LoadDeepseekV4FromGguf` builds that host tower unconditionally (every routed expert `HostVec`→f32) —
+~24 GiB/layer × 43 layers ≈ **~1.0 TiB** f32, past the 119 GiB unified pool by ~layer 5. The keep-quant
+`weights.gguf` tower (~91 GiB) is built but never read by the forward. Real benchmark (TPOT / output
+throughput / peak resident memory / llama.cpp-on-card floor) is blocked on a named forward-over-keep-quant
+residual (W2c: rewire the forward onto the CIQ `kMatmulBTQuant` blocks + gate off the host dequant), then
+the download + GB10 run. No cross-engine oracle exists (vLLM 0.26 GGUF plugin has no V4 wiring); the gate
+would be our-engine self-consistency + coherence. DGX left as found (no download).
 ## GGUF spec-decode rows RE-VERIFIED on a production-configured build (2026-07-29) - correctness re-measured, speed still PENDING; `SPEC-DFLASH-GGUF` axis A now has a REPRODUCIBLE RED
 
 **Benchmark disposition: PENDING for speed on both rows, `benchmark_binding=false`.
@@ -865,7 +913,8 @@ the proxy e2e gate are named residuals. Shared unblocker for Kimi-Linear-48B and
 Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
 measurement taken, claimed, or owed; `benchmark_binding=false`).** (2026-07-29
 registry-metadata fix — `KimiK3ForConditionalGeneration` outer wrapper
-`has_inner_state=false` + `test_model_registry` drift repaired — is likewise
+`has_inner_state=false` + `test_model_registry` drift repaired, plus the
+2026-07-29 `test_model_loader_gguf` supported-arch golden sync — is likewise
 NOT APPLICABLE: metadata + test hygiene only, no build/run/measurement owed.) Scopes
 `KimiK3ForConditionalGeneration` (released 2026-07-27, beyond the pin) — a 2.8T MoE
 whose text backbone is the Kimi-Linear KDA+MLA+MoE hybrid scaled to H=7168 / 93
