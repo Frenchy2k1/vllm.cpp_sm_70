@@ -1292,3 +1292,44 @@ audited at real dims too — plus the mmap-view load fix above. The download, ke
 greedy driver, and ds4 oracle are all DONE; the real-geometry forward is what stands between here and a
 coherent single-Spark generation. The 80.7 GB file is retained on the DGX at
 `$HOME/w8run/ds4/gguf/…` (no re-download needed). Row stays `SPIKE`.
+
+### W8-run.5 Geometry FIXED — forward RUNS the real 158 B model end-to-end; generation still INCOHERENT (2026-07-29, base `fba56f9b`, worktree `/home/mudler/_git/vllm.cpp-w8geom`, NOT pushed)
+The layer-2 hard-fail is resolved and the forward now composes all 43 layers on the real model. Landed
+(all gated, `test_deepseek_v4_gguf_load` **9/9·388** CPU Release `-Werror`, RED-first):
+1. **Real-geometry forward (Fix 1).** The DSA compressor projects to `comp_width = 2*head_dim` (ds4
+   `ds4.c:5016-5021`, `coff=2` for `compress_ratio==4`), NOT `head_dim`. The real keep-quant run uses
+   **DENSE MLA** — skip the compressor's separate compressed-KV cache and the indexer's top-k selection.
+   EXACT (not an approximation) whenever `seq_len ≤ index_topk=512`: the indexer can't select more tokens
+   than exist, and no raw row has been evicted to the compressed cache — true for every short single-Spark
+   step. The full real-geometry DSA sparse path (contexts > 512) is a NAMED residual. Core MLA
+   (q_a/q_b/kv at head_dim=512, sink softmax), grouped output-LoRA (o_groups=8), MoE, MHC are
+   geometrically correct at real dims. NEW real-ish gate: a synthetic with `comp_width=2*head_dim` asserts
+   the keep-quant forward runs finite+deterministic; reverting the dense-fallback re-throws the shape
+   mismatch the tiny synthetic hid.
+2. **mmap-view keep-quant load (Fix 2).** Threading `MmapSrc` (qwen3_5_gguf_weights.cpp:214) through the
+   deepseek loader + `pol.mmap_residency` drops PEAK RESIDENT **116.2 → 86.1 GiB** (within the ~84
+   projection), load **78 s → 6 s** (warm), BYTE-IDENTICAL output.
+3. **Per-layer YaRN RoPE.** Dual rope: dense layers (2/43) base=`rope_theta`, scale 1; compressed layers
+   (41/43) base=`compress_rope_theta` (160000) + `freq_scale=1/factor` (1/16) YaRN interpolation with the
+   beta ramp (net mscale==1). 1:1 port of ds4 `rope_tail_ext_inplace`. The old single `rope_theta` was
+   wrong on 41/43 layers.
+4. **Skip the lossy fp8 KV roundtrip** for the real path (single-block 448-wide fp8 scale corrupts the
+   latent; ds4 keeps per-sub-block KV scales — matching that layout is a named residual).
+
+**RESULT (real, not faked).** The forward runs all 43 layers on the real 158 B model at ~1.4-1.7 s/tok
+(CPU-tier, ~0.6 tok/s decode) / **peak 86 GiB**, but greedy generation is a degenerate 2-cycle loop
+(`201 7249 465 7249…`) — **INCOHERENT**. A DIFFERENT prompt yields DIFFERENT ids (`818 7249 16 42498
+20850`), so the transformer body IS input-responsive — the remaining failure is a numerical/scaling
+fidelity error, not a structural break. ds4 reference (same file, GB10 GPU): coherent, prefill 358 tok/s,
+decode 16.5 tok/s. Ours is CPU-tier — the #195 CUDA keep-quant GEMM is on main, but this stateless-
+recompute forward runs the CPU queue; wiring the expert GEMMs to the GPU queue is a named residual.
+
+**Named residual (the remaining brick to coherence).** Localize the fidelity bug by INSTRUMENTED
+per-layer comparison against the ds4 oracle (dump layer-N hidden/attention/MoE on both and diff).
+Suspects, in order: (a) MoE — the `routed_scaling_factor=1.5` application, the shared-expert add, the
+sqrtsoftplus/noaux_tc routing at real `expert_used=6`; (b) MHC — the Sinkhorn stream mixing / `hc_head`
+collapse at real `hc=4` (least-validated primitive, same tiny-shape-collapse hazard that hid the
+compressor bug); (c) keep-quant IQ2_XXS/Q2_K vec_dot numerics at real block scale + the activation
+quantization at H=4096. RULED OUT this pass: geometry, attention scale (ds4 `1/sqrt(512)` matches) +
+structure (score·scale + sink softmax, value=key=latent, grouped 8-way o-LoRA all match ds4), fp8
+roundtrip, memory path (mmap==copy byte-identical), per-layer RoPE (changed only 1 token). Row `SPIKE`.

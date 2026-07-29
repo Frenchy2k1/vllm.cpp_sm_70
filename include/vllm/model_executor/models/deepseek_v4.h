@@ -77,6 +77,13 @@ struct DeepseekV4Params {
   int64_t sliding_window = 0;    // 128  (per-head attention sinks + SWA — NEW)
   double rope_theta = 10000.0;
   double compress_rope_theta = 160000.0;  // dual theta for compressed layers
+  // YaRN (compressed layers only): freq_scale = 1/rope_scale_factor interpolation
+  // with the beta_fast/beta_slow correction-dim ramp (ds4 rope_tail_ext_inplace;
+  // net mscale == 1). Dense layers (compress_ratio==0) use plain theta, scale 1.
+  double rope_scale_factor = 16.0;
+  int64_t rope_orig_ctx = 65536;
+  double rope_beta_fast = 32.0;
+  double rope_beta_slow = 1.0;
 
   // --- MoE (nvidia/model.py:512-757) ---
   int64_t n_routed_experts = 0;      // 256
