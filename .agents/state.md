@@ -32601,3 +32601,59 @@ that is not in vLLM's own `requirements/cuda.txt`, so a stock install lacks it
 too; the oracle is faithful.
 
 Evidence: [../docs/bench-evidence/qwen35-4b-pinned-oracle-20260728.md](../docs/bench-evidence/qwen35-4b-pinned-oracle-20260728.md).
+
+## 2026-07-29 — rebased onto 139 upstream commits and re-benchmarked: nothing moved
+
+Rebased `bench-lever-sampled-token-20260727` from `main` `7f620e74` onto
+`f3ecbe70d`. Three conflicts. `.agents/parity-ledger.md` and `.agents/state.md`
+were pure append collisions (upstream appended 76 ledger rows and ~4,580 log
+lines at the tail, this branch appended its own) — resolved by keeping both with
+upstream first, which is what the ledger's own header prescribes ("append-only …
+Newest last") and what a rebase means, then verified additively: `diff` against
+`main` shows ZERO lines lost from upstream. The third was real:
+`ModelForwardInput` gained a field on both sides (upstream's `mm`, ours
+`device_token_ids`). Both kept, ours LAST — it has to be the final member, which
+is the same constraint that broke positional aggregate initializers when it was
+first written mid-struct.
+
+**Verification of the merge, in the order that makes it binding.** Clean CUDA
+rebuild 925/925, exit 0, no warnings. `test_input_batch` 25/25·183/183,
+`test_combine_tokens` 7/7·14/14, `test_qwen35_plain_weights --no-skip`
+3/3·1672/1672 — all identical to pre-rebase. Then the strongest statement
+available: the 18-leg comparison reproduced our output **token-identical
+128/128 in every repetition** against the pre-rebase series, for both the direct-ON
+and direct-OFF arms. A 139-commit rebase that leaves generated tokens bit-stable
+is a semantic check the model gate alone cannot give.
+
+**Benchmark: a null result, and the useful kind.** Pin re-checked first and
+unchanged (`555967922`), so `.venv-vllm-pin` is still the right denominator.
+0.9972x total throughput (was 0.9970x), TTFT 0.7701x PASS (was 0.7731x), TPOT
+1.1247x FAIL (was 1.1241x). Ours 6610.270 vs pin 6628.651 tok/s. Per-rep spread
+0.05% (ours) and 0.07% (pin).
+
+The control that makes "nothing moved" a measurement rather than an assumption:
+all three arms drifted down ~0.13% (ours 0.9988x, direct-OFF 0.9983x, pin
+0.9986x). The pin arm is the SAME binary on the SAME corpus and cannot have
+changed, yet it drifted the same amount — so the drift is ambient thermal/clock
+state, not code, and it is the size of the arms' own repetition spread.
+
+No movement was expected. The only upstream commit in the window naming this gap
+(`2b00866a4`) concluded the decode gap is batch composition, not a decode-kernel
+deficiency, and changed records rather than code; the rest of the window is
+breadth on paths this dense 4B decode workload does not touch. TPOT stays owned
+by ENG-ASYNC-SCHED and the W4 finding stands.
+
+**Harness note worth keeping.** The first attempt at this series was killed
+partway by a 10-minute background-command ceiling, after the memory legs but
+before any performance leg, leaving an output tree with no aggregate. Re-run
+detached under `setsid` with an explicit wait for three consecutive idle GPU
+reads first, because the killed run left the card draining at 3% and the harness
+(correctly) refuses any leg above 2%. All nine performance legs then recorded 0%.
+
+Pre-existing and NOT introduced here: `check-agent-record` (6 errors),
+`check-env-doc` (`VLLM_GEMMA4_MM_DEBUG`) and `check-device-leakage` (DSR
+`kcuda=8` vs baseline 0) all fail identically on pristine `main`, verified in a
+throwaway worktree. The DSR bucket counts are byte-identical with and without
+this branch, so this branch adds zero device leakage.
+
+Evidence: [../docs/bench-evidence/qwen35-4b-postrebase-20260729.md](../docs/bench-evidence/qwen35-4b-postrebase-20260729.md).
