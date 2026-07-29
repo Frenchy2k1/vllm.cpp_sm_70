@@ -135,6 +135,53 @@ TEST_CASE("vt block geometry agrees with the GGUF reader's GgmlTraits") {
   }
 }
 
+// Q2_K (id 10) and IQ2_XXS (id 16) are the DeepSeek-V4-Flash ~2-bit GGUF
+// vehicles. They register geometry + a `to_float` decode but NO vec_dot kernel,
+// so `HasQuantDotKernel` is false and the loader routes them to expand-to-bf16
+// (dequant-only), never keep-quant GEMM. This is a DISTINCT contract from the
+// executable weight types in kBlockCases, so it gets its own case.
+TEST_CASE("Q2_K/IQ2_XXS are dequant-only block dtypes (geometry + no vec_dot)") {
+  struct DequantOnlyCase {
+    vt::DType dtype;
+    uint32_t ggml_type;
+    int64_t block_elems;
+    int64_t block_bytes;
+    const char* name;
+  };
+  // Sizes written out from ggml-common.h @ 237ad9b96:
+  //   q2_K    :288-299  16 sc + 64 qs + f16 d + f16 dmin = 16+64+2+2 = 84
+  //   iq2_xxs :371-374  f16 d + 32 u16 qs                = 2 + 64    = 66
+  const DequantOnlyCase cases[] = {
+      {vt::DType::kQ2_K, 10, 256, 84, "q2_K"},
+      {vt::DType::kIQ2_XXS, 16, 256, 66, "iq2_xxs"},
+  };
+  for (const DequantOnlyCase& c : cases) {
+    CAPTURE(c.name);
+    // vt geometry.
+    CHECK(vt::IsBlockQuant(c.dtype));
+    CHECK(vt::BlockElems(c.dtype) == c.block_elems);
+    CHECK(vt::BlockBytes(c.dtype) == c.block_bytes);
+    CHECK(vt::GgmlTypeId(c.dtype) == c.ggml_type);
+    CHECK(std::string(vt::Name(c.dtype)) == c.name);
+    CHECK_THROWS(vt::SizeOf(c.dtype));
+    CHECK(vt::RowSizeBytes(c.dtype, c.block_elems) ==
+          static_cast<size_t>(c.block_bytes));
+
+    // Reader GgmlTraits agreement (both are real FILE types, unlike Q8_K).
+    const vllm::GgmlTypeTraits& g = vllm::GgmlTraits(c.ggml_type);
+    CHECK(g.block_elems == c.block_elems);
+    CHECK(g.block_bytes == c.block_bytes);
+    vt::DType back = vt::DType::kF32;
+    REQUIRE(vt::BlockDTypeFromGgmlTypeId(c.ggml_type, &back));
+    CHECK(back == c.dtype);
+
+    // Decodes (to_float present) but is NOT keep-quant capable: no vec_dot row.
+    CHECK(vt::cpu::BlockToFloat(c.dtype) != nullptr);
+    CHECK_FALSE(vt::cpu::HasQuantDotKernel(c.dtype));
+    CHECK_THROWS(vt::cpu::QuantTraits(c.dtype));
+  }
+}
+
 TEST_CASE("elementwise dtypes are not block-quantized and reject block queries") {
   for (vt::DType d : {vt::DType::kF32, vt::DType::kF16, vt::DType::kBF16,
                       vt::DType::kI8, vt::DType::kI32, vt::DType::kI64}) {

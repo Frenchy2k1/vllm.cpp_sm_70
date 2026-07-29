@@ -172,7 +172,14 @@ So the C4/GGUF roadmap item to make the single-Spark GGUF vehicle real is: lift 
 reject + wire a V4-GGUF loader + port IQ2_XXS (llama.cpp `dequantize_row_iq2_xxs` + `iq2xxs_grid`)
 and/or Q2_K dequant — gated vs llama.cpp-on-card (vLLM cannot oracle V4-from-GGUF). Apples-to-apples
 DeepSeek-V4 is the NVFP4 2×-Spark vehicle; a true same-GGUF cross-engine number is only available on
-a Qwen3/dense k-quant both engines already load. **W3 PRIMITIVES LANDED (2026-07-28,
+a Qwen3/dense k-quant both engines already load. **QUANT-TYPE HALF LANDED (2026-07-29,
+`CLAIM-DSV4-GGUF-LOADER`, [gguf-iquant-dsv4.md](specs/gguf-iquant-dsv4.md)):** IQ2_XXS (id 16) +
+Q2_K (id 10) now dequant (1:1 from llama.cpp `ggml-quants.c`; `QUANT-GGUF-IQ2_XXS`/`QUANT-GGUF-Q2_K`
+→ ACTIVE; `test_gguf_dequant` 15/15). HTTP-range-verified the real GGUF header
+(`general.architecture=deepseek4`, `general.file_type=19`=IQ2_XXS, `split.tensors.count=1328`, full
+`deepseek4.*` config-KV schema). The V4 registry GGUF reject STAYS — the V4-GGUF `blk.N.*` name map
+needs the tensor manifest (beyond the CDN range cap + uncached; 90 GB download prohibited) and the
+forward is W3-W8. So the MODEL-ARCH half + the forward remain the residual to a runnable V4-GGUF vehicle. **W3 PRIMITIVES LANDED (2026-07-28,
 `CLAIM-DEEPSEEK-V4-W3`, base `308c312a`):** the genuinely-NEW attention math is ported + unit-gated
 as portable host references — the DSA "Lightning Indexer" sparse SELECTION (weighted-MQA logit
 `Σ_h w·ReLU(q·k)` with the load-bearing per-head ReLU + causal top-k `index_topk=512` + short-context

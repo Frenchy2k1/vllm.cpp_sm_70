@@ -16,6 +16,22 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## GGUF IQ2_XXS + Q2_K dequant, the DeepSeek-V4-Flash single-Spark GGUF quant-path brick (2026-07-29, `CLAIM-DSV4-GGUF-LOADER`) - NOT-APPLICABLE (CPU dequant primitive, no throughput owed)
+
+No benchmark. W1 ports the two ~2-bit GGUF encodings the single-Spark
+`unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_XXS` (~91 GB, the only DeepSeek-V4 build
+that fits ONE GB10's 119 GiB pool) vehicle uses — IQ2_XXS (id 16, `iq2xxs_grid`
+codebook + signs + 4-bit scale) and Q2_K (id 10, nibble sub-scale/min) — 1:1 from
+llama.cpp `ggml-quants.c` @ `237ad9b96`, to f32/bf16. Correctness-only unit gate
+(`tests/vllm/test_gguf_dequant.cpp` 15/15·480 hand-derived literals;
+`tests/vt/test_ops_quant_traits.cpp` 9/9·5643 dequant-only contract). Both are
+dequant-only (no vec_dot → expand-bf16); a keep-quant GEMM for them is a future
+perf leaf. A dequant primitive owes no throughput number, and a V4-GGUF model
+cannot RUN yet (the V4-GGUF name map is tensor-manifest-blocked and the V4 forward
+is W3-W8), so there is no end-to-end workload to time. The eventual GGUF-vehicle
+reference is llama.cpp-on-card (the pinned vLLM cannot load V4 from GGUF). Spike:
+[`.agents/specs/gguf-iquant-dsv4.md`](../.agents/specs/gguf-iquant-dsv4.md).
+
 ## AWQ + GPTQ native quant W0 spike + W1 CPU dequant (2026-07-28, `CLAIM-QUANT-AWQ-GPTQ`) - NOT-APPLICABLE (CPU dequant primitive, no throughput owed)
 
 No benchmark. W1 lands the INT4 unpack+dequant-to-bf16 CPU primitive for AWQ and

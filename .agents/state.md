@@ -31629,3 +31629,47 @@ MoE over the FusedMoE fallback (W6); the fused device kernel
 compressor state-cache gather addressing (the `head_offset` overlap window into the paged state +
 `CompressorBackend` paging) + shared-mla extraction (W7); the strict/near-tie engine gate (W8) — all
 multi-Spark-blocked on one GB10.
+## 2026-07-29 — GGUF IQ2_XXS + Q2_K dequant (DeepSeek-V4 single-Spark GGUF quant-path, W1) — `CLAIM-DSV4-GGUF-LOADER`
+
+**Base** `main` `4d1be010`. Isolated worktree `.claude/worktrees/gguf-iquant-dsv4`,
+branch `feat/gguf-iquant-dsv4`. CPU-only, NO GPU, NO 90 GB download. Foreground.
+NOT pushed.
+
+**Landed (W1).** Ported the two ~2-bit GGUF encodings the DeepSeek-V4-Flash GGUF
+vehicles use, 1:1 from llama.cpp `ggml-quants.c` @ `237ad9b96`:
+- **IQ2_XXS (id 16)** `DequantIQ2_XXS` (`cpu_quant_dequant.cpp:366`) — the
+  256-entry `iq2xxs_grid` codebook + `ksigns_iq2xs`/`kmask_iq2xs` sign tables +
+  4-bit block scale (`ggml-quants.c:2416`, `ggml-common.h:371,499,503,550`).
+- **Q2_K (id 10)** `DequantQ2_K` (`cpu_quant_dequant.cpp:330`) — per-16 4-bit
+  nibble sub-scale/min (`ggml-quants.c:903`, `ggml-common.h:288`).
+Registered as vt block dtypes `kQ2_K`/`kIQ2_XXS` (enum + geometry +
+`BlockDTypeFromGgmlTypeId` + `SizeOf`/`Name` + `ops.cpp` `ToScalarType`), reader
+trait id 16 (66 B), loader dispatch (`gguf_dequant.cpp` ids 10+16). Both are
+DEQUANT-ONLY (no `vec_dot`) ⇒ `HasQuantDotKernel` false ⇒ route to expand-bf16
+(same contract as Q8_K), verified by the new contract test. `QUANT-GGUF-IQ2_XXS`
++ `QUANT-GGUF-Q2_K` `INVENTORIED`→`ACTIVE`.
+
+**Gate.** `test_gguf_dequant` 15/15·480 (Q2_K + IQ2_XXS hand-derived literals +
+regressions), `test_ops_quant_traits` 9/9·5643 (dequant-only contract). RED-first
+by construction (literals computed from the spec independent of the code). All 7
+changed TUs compile clean under full `-Werror`. The `voxtral.cpp` GCC-13
+`-Werror=array-bounds` false positive was PROVEN pre-existing (fails identically
+at base with this diff's `dtype.h` reverted); neutralized only to link the test
+binaries.
+
+**W2 (V4-GGUF loader) — DERIVED, blocked on the tensor manifest.** HTTP-range-read
+the real `UD-IQ2_XXS` shard-1 header (NO download): `general.architecture=deepseek4`,
+`general.file_type=19` (=IQ2_XXS — confirms the target type), `split.tensors.count=1328`,
+and the full `deepseek4.*` config-KV schema (matches the verified safetensors arch
+scalars). The tensor NAME manifest is beyond the CDN range cap + not cached, and the
+90 GB download is prohibited, so the V4 registry GGUF reject STAYS (lifting onto a
+guessed map would be a speculative half-loader into a W4-owned stub forward).
+
+**Records.** `specs/gguf-iquant-dsv4.md` (NEW), `quantization-matrix.md` (2 rows
+→ ACTIVE), `model-matrix.md` (V4 GGUF-loadable note, row stays SPIKE),
+`roadmap_v1.md`, `docs/STATUS.md`, `docs/BENCHMARKS.md`, `coordination.md`
+(`CLAIM-DSV4-GGUF-LOADER`), `parity-ledger.md`, this entry. **NEXT / residuals:**
+the V4 forward (W3-W8, multi-Spark) + the V4-GGUF `blk.N.*` name map (W2, needs the
+1328-tensor manifest — a multi-range header fetch past the CDN cap, or a cached
+shard on a disk-freed box); a `vec_dot` for IQ2_XXS/Q2_K (perf leaf); a
+real-checkpoint byte-level IQ2_XXS gate once a manifest + byte slice exist.
