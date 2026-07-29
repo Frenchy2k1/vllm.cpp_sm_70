@@ -32020,3 +32020,33 @@ today qwen-only) so the CLI/server routes a `deepseek4` GGUF to this loader.
 
 **Records same-change:** model-matrix (both DeepSeek-V4 cells advanced, stays `SPIKE`), coordination
 (`CLAIM-DEEPSEEK-V4-W2B`), spec §W2b, STATUS, BENCHMARKS, parity-ledger, this state entry.
+
+---
+
+## DeepSeek-V4-Flash W8-final — `deepseek4` GGUF entrypoint arm LANDED + GATED; the real run BLOCKED on a CODE residual (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`, base `376e186b`)
+
+**What landed.** The top-level GGUF dispatch now recognizes a `deepseek4` file (was qwen-only):
+`DeepseekV4HfConfigFromGguf` (`deepseek_v4_weights.cpp`) maps `general.architecture=deepseek4` → the
+registered `DeepseekV4ForCausalLM` and republishes the GGUF geometry into the typed fields +
+`config.raw` so `ParseDeepseekV4Config` validates it; `LoadedEngine::FromModelDir` routes via a new
+anon-ns `HfConfigFromGgufDispatch`. **Gate** `test_deepseek_v4_gguf_load` **6/6·168** (CPU Release
+full-library `-Werror`-clean; +1 case: config maps + `ModelRegistry::Resolve`→V4 factory); qwen path
+byte-neutral (`test_model_registry` 24/24·669).
+
+**The real single-Spark RUN did NOT execute — re-scoped HONESTLY to a CODE blocker (not download/box).**
+The forward (`ForwardComposeImpl`, both `Forward`+`ForwardDevice`) composes off the FULLY-DEQUANTIZED
+f32 `weights.host` tower, and `LoadDeepseekV4FromGguf` builds that host tower UNCONDITIONALLY (every
+routed-expert tensor `HostVec`→`DqRowF32`→f32). For the real 43-layer/256-expert model that is
+~24 GiB/layer (3×256×2048×4096×4 B) ≈ **~1.0 TiB** f32, which OOM-reboots the 119 GiB unified pool at
+~layer 5 — so it was NOT attempted. The keep-quant `weights.gguf` tower (~91 GiB, W2b enabler) is built
+but NEVER read by the forward. **Named residual W2c:** rewire the forward onto the CPU CIQ
+`kMatmulBTQuant` keep-quant blocks + gate off the host dequant, THEN download + GB10 greedy gen +
+self-consistency/coherence gate + benchmark. NO tokens generated (not faked); benchmark PENDING; DGX
+left exactly as found (LocalAI worker untouched, no 91 GB download). Row stays `SPIKE`.
+
+**Pre-existing residual NOTED (not mine):** `test_model_loader_gguf` has a stale hardcoded "Supported
+architectures" golden (24 archs; missing DeepseekV4/Gemma4/Kimi/Qwen3VL from the breadth sweep) —
+already RED on base HEAD `376e186b`, independent of this change.
+
+**Records same-change:** model-matrix (DeepSeek-V4 cell extended, stays `SPIKE`), coordination
+(`CLAIM-DEEPSEEK-V4-W8`), spec §W8.5, STATUS, BENCHMARKS, roadmap_v1, parity-ledger, this state entry.

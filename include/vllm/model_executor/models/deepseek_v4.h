@@ -246,6 +246,19 @@ struct DeepseekV4Weights {
 // Throws with a precise message on a missing/unrepresentable field.
 DeepseekV4Params DeepseekV4ParamsFromGguf(const GgufFile& gguf);
 
+// Build a full HfConfig from a `deepseek4`-arch GGUF's KV metadata. This is the
+// TOP-LEVEL GGUF dispatch arm for DeepSeek-V4: it maps llama.cpp's
+// `general.architecture == "deepseek4"` onto the registered vLLM model class
+// `DeepseekV4ForCausalLM` (so `ModelRegistry::Resolve` routes the file into the
+// DeepSeek-V4 factory) and republishes the resolved geometry into the typed
+// HfConfig fields + `config.raw` (the scalars the registry parse hook
+// `ParseDeepseekV4Config` validates). `LoadedEngine::FromModelDir` calls this for
+// a deepseek4 GGUF exactly as it calls `HfConfigFromGguf` for the qwen families;
+// the weight loader (`LoadDeepseekV4FromGguf`) still re-derives its params from
+// the GGUF KV directly (it ignores `config`). Throws (via DeepseekV4ParamsFromGguf)
+// on a non-deepseek4 file or a missing/unrepresentable field.
+HfConfig DeepseekV4HfConfigFromGguf(const GgufFile& gguf);
+
 // Materialize a `deepseek4` GGUF (`unsloth/DeepSeek-V4-Flash-GGUF`) into a
 // DeepseekV4Weights. Routes EVERY GGUF tensor through GgufLoadPolicy with the
 // name-map role (scripts/check-dsv4-gguf-namemap.py): MW/SEW stay keep-quant blocks,

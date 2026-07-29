@@ -21,6 +21,7 @@
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft load
 #include "vllm/model_executor/models/qwen3_5_common.h"  // SPEC-MTP I5d KV widening
@@ -380,6 +381,21 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
   ctx.role = KVConnectorRole::kScheduler;
   ctx.block_size = fa_block;
   return KVConnectorFactory::Create(ctx);
+}
+
+// Top-level GGUF architecture dispatch: `general.architecture` selects the
+// family's HfConfig builder. The qwen35/qwen35moe/qwen3next keys go to
+// HfConfigFromGguf; a `deepseek4` file goes to DeepseekV4HfConfigFromGguf (which
+// maps it onto the registered DeepseekV4ForCausalLM). Additive by construction —
+// a new GGUF-loadable arch adds ONE arm here and owns its config builder in its
+// own TU. Everything downstream (Resolve -> tokenizer -> Load) is arch-agnostic.
+HfConfig HfConfigFromGgufDispatch(const vllm::GgufFile& gguf) {
+  const vllm::GgufValue* arch = gguf.FindKv("general.architecture");
+  if (arch != nullptr && arch->TypeId() == vllm::kGgufString &&
+      std::get<std::string>(arch->v) == "deepseek4") {
+    return vllm::DeepseekV4HfConfigFromGguf(gguf);
+  }
+  return vllm::HfConfigFromGguf(gguf);
 }
 
 }  // namespace
@@ -803,7 +819,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // GGUF (M0.10). The engine stack below is unchanged.
   if (fs::is_regular_file(dir) && dir.extension() == ".gguf") {
     vllm::GgufFile gguf = vllm::GgufFile::Open(model_dir);
-    HfConfig config = vllm::HfConfigFromGguf(gguf);
+    HfConfig config = HfConfigFromGgufDispatch(gguf);
     // Resolve before tokenizer/weight work so unsupported architecture errors
     // are deterministic and match registry.py rather than being masked by a
     // later source-specific missing-tensor/tokenizer error.

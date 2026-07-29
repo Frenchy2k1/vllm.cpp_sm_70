@@ -372,6 +372,45 @@ TEST_CASE("LoadDeepseekV4FromGguf: load -> Forward runs end-to-end at tiny shape
   for (size_t i = 0; i < logits.size(); ++i) CHECK(again[i] == logits[i]);
 }
 
+// ── entrypoint wiring (W8-final deliverable #1): a `deepseek4` GGUF must route
+//    through the top-level GGUF dispatch onto the registered DeepseekV4ForCausalLM
+//    model class, so the CLI/server recognizes the arch (it was qwen-only). ─────
+TEST_CASE("DeepseekV4HfConfigFromGguf: deepseek4 GGUF routes to DeepseekV4ForCausalLM") {
+  Dims d;
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::DeepseekV4HfConfigFromGguf(g);
+
+  // model_type keeps llama.cpp's GGUF family key; architectures maps onto the
+  // registered vLLM model class the top-level dispatch resolves.
+  CHECK(c.model_type == "deepseek4");
+  REQUIRE(c.architectures.size() == 1);
+  CHECK(c.architectures[0] == "DeepseekV4ForCausalLM");
+  // Typed geometry republished from the GGUF KV.
+  CHECK(c.hidden_size == 32);
+  CHECK(c.num_hidden_layers == 4);
+  CHECK(c.head_dim == 32);
+  CHECK(c.num_attention_heads == 2);
+  CHECK(c.vocab_size == 16);
+  // The scalars the registry parse hook (ParseDeepseekV4Config) reads from raw.
+  CHECK(c.raw.at("hc_mult").get<int64_t>() == 2);
+  CHECK(c.raw.at("n_routed_experts").get<int64_t>() == 4);
+  CHECK(c.raw.at("num_experts_per_tok").get<int64_t>() == 2);
+  CHECK(c.raw.at("scoring_func").get<std::string>() == "sqrtsoftplus");
+  CHECK(c.raw.at("expert_dtype").get<std::string>() == "fp4");
+  REQUIRE(c.raw.at("compress_ratios").is_array());
+  CHECK(c.raw.at("compress_ratios").size() == 4);
+
+  // The registry resolves the mapped architecture to the DeepSeek-V4 factory —
+  // i.e. the top-level GGUF dispatch now recognizes a deepseek4 file (the qwen-
+  // only HfConfigFromGguf would throw "unexpected architecture 'deepseek4'").
+  const vllm::ModelRegistration& reg = vllm::ModelRegistry::Resolve(c);
+  CHECK(reg.architecture == "DeepseekV4ForCausalLM");
+  REQUIRE(reg.factory != nullptr);
+  CHECK_FALSE(reg.factory->is_dense_model);
+  CHECK(reg.factory->load_weights != nullptr);
+}
+
 TEST_CASE("LoadDeepseekV4FromGguf: RED-first — unmapped/leftover tensors throw") {
   Dims d;
   const vllm::GgufLoadPolicy pol = KeepPolicy();

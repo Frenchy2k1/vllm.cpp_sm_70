@@ -1026,6 +1026,39 @@ loads the same GGUF, else ours-only honestly.
   self-consistency/coherence gate + benchmark). W2b is the single remaining engineering brick before a
   real single-Spark DeepSeek-V4 generation.
 
+### W8.5 W8-final — entrypoint wiring LANDED + GATED; the RUN re-scoped to a CODE blocker (2026-07-29, `CLAIM-DEEPSEEK-V4-W8`, base `376e186b`)
+W2b (GGUF→tower materialization) landed at `376e186b`, so this lane took the two remaining W8-final
+pieces: the **entrypoint wiring** (the "one small code piece W2b named") and the **real run**.
+
+**Entrypoint wiring — LANDED + GATED.** A `deepseek4` arm now exists in the top-level GGUF dispatch:
+- `DeepseekV4HfConfigFromGguf(gguf)` (`deepseek_v4_weights.cpp`, decl in `deepseek_v4.h`) resolves the
+  params via the existing `DeepseekV4ParamsFromGguf`, sets `architectures = {"DeepseekV4ForCausalLM"}`
+  (mapping llama.cpp's `general.architecture=deepseek4` onto the registered vLLM model class, exactly as
+  `HfConfigFromGguf` maps the `qwen35*` keys), and republishes the geometry into the typed fields +
+  `config.raw` so the registry parse hook `ParseDeepseekV4Config` validates the same geometry.
+- `LoadedEngine::FromModelDir` now calls `HfConfigFromGgufDispatch(gguf)` (anon-ns helper) which peeks
+  `general.architecture` and routes `deepseek4`→the V4 builder, everything else→`HfConfigFromGguf`.
+  Downstream (`ModelRegistry::Resolve` → tokenizer → `Load`→`LoadDeepseekV4FromGguf`) is unchanged.
+- **Gate:** `test_deepseek_v4_gguf_load` **6/6 · 168** (CPU Release, full-library `-Werror`-clean build):
+  new case asserts `architectures[0]=="DeepseekV4ForCausalLM"`, `model_type=="deepseek4"`, the `raw`
+  scalars the parse hook reads (`hc_mult`, `n_routed_experts`, `scoring_func=sqrtsoftplus`,
+  `expert_dtype=fp4`, `compress_ratios`), and `ModelRegistry::Resolve(c)`→the V4 factory
+  (`is_dense_model=false`). The qwen GGUF path is byte-neutral (`test_model_registry` 24/24 green).
+
+**The RUN — did NOT execute; re-scoped to a CODE blocker (NOT download/box), provable from source.**
+The real single-Spark load was NOT attempted because it would OOM-reboot the box: the forward
+(`ForwardComposeImpl`, both `Forward` and `ForwardDevice`) composes off the FULLY-DEQUANTIZED f32
+`weights.host` tower, and `LoadDeepseekV4FromGguf` builds that host tower **unconditionally** — every
+routed-expert tensor via `HostVec`→`DqRowF32`→f32, retained per layer in `hw.layers[l].exp_w1/w3/w2`.
+For the real 43-layer/256-expert/mi=2048/H=4096 model that is 3×256×2048×4096×4 B ≈ **~24 GiB per
+layer**, ≈ **~1.0 TiB** across 43 layers — it exceeds the 119 GiB unified pool at ~layer 5. The
+keep-quant `weights.gguf` tower (~91 GiB, the W2b memory enabler) IS built but is **never read** by the
+forward, so the enabler does not help the run. **Named residual (W2c):** rewire the forward to consume
+the keep-quant blocks directly (via the CPU CIQ `kMatmulBTQuant` GEMM already landed) and gate off the
+host-f32 dequant, so resident stays ~91 GiB. Only then is a single-Spark greedy gen + self-consistency
+/coherence gate + benchmark feasible. NO tokens generated (not faked); benchmark disposition stays
+PENDING; DGX left exactly as found (LocalAI worker untouched, no 91 GB download). Row stays `SPIKE`.
+
 ---
 
 ## W2b — GGUF keep-quant TOWER materialization (2026-07-29, `CLAIM-DEEPSEEK-V4-W2B`)
