@@ -37,6 +37,7 @@
 #include "vt/device.h"
 #include "vt/dtype.h"
 
+using gguf_test::F32ArrayKv;
 using gguf_test::F32Kv;
 using gguf_test::GgufModelBuilder;
 using gguf_test::I32ArrayKv;
@@ -135,8 +136,14 @@ std::string Blk(int64_t l, const std::string& s) {
 
 // Build the tiny synthetic deepseek4 GGUF. `drop` omits one tensor name (RED:
 // unaccounted -> throw); `extra` adds a bogus tensor (RED: leftover -> throw).
+// `ds4_flavor` reproduces the three real-GGUF quirks the antirez q2-imatrix file
+// carries that a tiny synthetic otherwise misses (all verified from the shipped
+// header): the clamped-SwiGLU limit is a per-layer f32 ARRAY `swiglu_clamp_exp`
+// (not the scalar `swiglu_clamp`); `compress_ratios` is block_count+1 long (the
+// trailing MTP/nextn entry); and the hash `ffn_gate_tid2eid` is stored as ggml
+// I32 (type 26), not F32.
 std::string BuildGguf(const Dims& d, const std::string& drop = "",
-                      const std::string& extra = "") {
+                      const std::string& extra = "", bool ds4_flavor = false) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "deepseek4"));
   const std::string p = "deepseek4.";
@@ -158,14 +165,23 @@ std::string BuildGguf(const Dims& d, const std::string& drop = "",
   b.AddKv(U32Kv(p + "expert_shared_count", 1));
   b.AddKv(U32Kv(p + "expert_feed_forward_length", d.mi));
   b.AddKv(U32Kv(p + "hash_layer_count", d.n_hash));
-  b.AddKv(F32Kv(p + "swiglu_clamp", 10.0f));
+  if (ds4_flavor) {
+    std::vector<float> clamp_exp(static_cast<size_t>(d.n_layer), 10.0f);
+    b.AddKv(F32ArrayKv(p + "swiglu_clamp_exp", clamp_exp));
+  } else {
+    b.AddKv(F32Kv(p + "swiglu_clamp", 10.0f));
+  }
   b.AddKv(U32Kv(p + "hyper_connection.count", d.hc));
   b.AddKv(U32Kv(p + "hyper_connection.sinkhorn_iterations", d.sinkhorn));
   b.AddKv(F32Kv(p + "hyper_connection.epsilon", 1e-6f));
   b.AddKv(U32Kv(p + "attention.indexer.head_count", d.inh));
   b.AddKv(U32Kv(p + "attention.indexer.key_length", d.ihd));
   b.AddKv(U32Kv(p + "attention.indexer.top_k", d.index_topk));
-  b.AddKv(I32ArrayKv(p + "attention.compress_ratios", d.compress_ratios));
+  {
+    std::vector<int32_t> cr = d.compress_ratios;
+    if (ds4_flavor) cr.push_back(0);  // trailing MTP/nextn entry -> length n_layer+1
+    b.AddKv(I32ArrayKv(p + "attention.compress_ratios", cr));
+  }
 
   const int64_t hcf = (2 + d.hc) * d.hc;  // MHC fn out rows
 
@@ -219,11 +235,27 @@ std::string BuildGguf(const Dims& d, const std::string& drop = "",
     add(Blk(l, "ffn_up_shexp.weight"), true, {d.mi, d.H});
     add(Blk(l, "ffn_down_shexp.weight"), true, {d.H, d.mi});
     if (is_hash) {
-      // tid2eid holds expert ids in [0, E); F32 (rounded to int at load).
+      // tid2eid holds expert ids in [0, E). The real GGUF stores it as ggml I32
+      // (type 26); the tiny synthetic default uses F32 (rounded to int at load).
       const std::string nm = Blk(l, "ffn_gate_tid2eid.weight");
-      if (nm != drop)
-        AddF32(b, nm, {d.vocab, d.used},
-               [&](int64_t i) { return static_cast<float>(i % d.E); });
+      if (nm != drop) {
+        if (ds4_flavor) {
+          const int64_t n = d.vocab * d.used;
+          std::string data;
+          data.reserve(static_cast<size_t>(n) * 4);
+          for (int64_t i = 0; i < n; ++i) {
+            const auto v = static_cast<int32_t>(i % d.E);
+            uint32_t bits;
+            std::memcpy(&bits, &v, 4);
+            for (int k = 0; k < 4; ++k)
+              data.push_back(static_cast<char>((bits >> (8 * k)) & 0xff));
+          }
+          b.AddTensor(nm, GgmlDims({d.vocab, d.used}), /*I32=*/26, data);
+        } else {
+          AddF32(b, nm, {d.vocab, d.used},
+                 [&](int64_t i) { return static_cast<float>(i % d.E); });
+        }
+      }
     } else {
       add(Blk(l, "exp_probs_b.bias"), false, {d.E});
     }
@@ -515,6 +547,48 @@ TEST_CASE("DeepseekV4HfConfigFromGguf: deepseek4 GGUF routes to DeepseekV4ForCau
   REQUIRE(reg.factory != nullptr);
   CHECK_FALSE(reg.factory->is_dense_model);
   CHECK(reg.factory->load_weights != nullptr);
+}
+
+// ── The antirez ds4 `q2-imatrix` real-file quirks LOAD + FORWARD (W8-run) ──────
+// The cross-engine oracle (antirez/ds4) shares its q2-imatrix GGUF as the
+// apples-to-apples vehicle. Its header (verified via HF HTTP-range) carries three
+// representational differences from a naive synthetic that the loader must handle
+// or it throws before a single token: (1) `swiglu_clamp_exp` per-layer f32 array
+// instead of the scalar `swiglu_clamp` (a missing limit ZEROES every expert —
+// ClampedSwiGLU min(gate,0)*clamp(up,0,0)); (2) `compress_ratios` of length
+// block_count+1 (trailing MTP entry); (3) `ffn_gate_tid2eid` stored as ggml I32.
+// The tensor NAME set is otherwise byte-identical to unsloth's (1328/1328, gated
+// by scripts/check-dsv4-gguf-namemap.py). This case proves the loader accepts all
+// three and still runs the keep-quant forward finite + deterministic.
+TEST_CASE("LoadDeepseekV4FromGguf: antirez ds4 q2-imatrix real-file quirks (W8-run)") {
+  Dims d;
+  TempFile f(BuildGguf(d, /*drop=*/"", /*extra=*/"", /*ds4_flavor=*/true));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+
+  // Params resolve: swiglu limit read from the ARRAY (not the absent scalar), and
+  // compress_ratios truncated to block_count despite the +1 trailing entry.
+  const vllm::DeepseekV4Params p = vllm::DeepseekV4ParamsFromGguf(g);
+  CHECK(p.swiglu_limit == 10.0);  // read from swiglu_clamp_exp[0]
+  CHECK(static_cast<int64_t>(p.compress_ratios.size()) == p.num_hidden_layers);
+
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  CHECK(w.accounted_tensors == static_cast<int64_t>(g.Tensors().size()));
+  CHECK(w.has_gguf_weights);
+  // The I32 tid2eid dequantized into the hash table (expert ids in [0, E)).
+  REQUIRE(w.gguf.layers[0].is_hash);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<int32_t> tokens = {1, 5, 9};
+  const std::vector<int32_t> positions = {0, 1, 2};
+  const std::vector<float> lk = vllm::DeepseekV4ForwardGguf(w, q, tokens, positions);
+  REQUIRE(lk.size() == tokens.size() * static_cast<size_t>(d.vocab));
+  for (float v : lk) CHECK(std::isfinite(v));
+  // Deterministic re-run (self-consistency, the W8-run correctness gate in miniature).
+  const std::vector<float> lk2 = vllm::DeepseekV4ForwardGguf(w, q, tokens, positions);
+  REQUIRE(lk2.size() == lk.size());
+  for (size_t i = 0; i < lk.size(); ++i) CHECK(lk2[i] == lk[i]);
 }
 
 TEST_CASE("LoadDeepseekV4FromGguf: RED-first — unmapped/leftover tensors throw") {
