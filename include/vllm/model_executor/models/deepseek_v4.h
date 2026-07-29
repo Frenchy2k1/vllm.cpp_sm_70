@@ -369,6 +369,13 @@ std::vector<float> DeepseekV4ForwardGgufCached(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {});
 
+// Stage-2 decode-step profiling (inert unless env `VT_V4_PROF` is set). Split the
+// forward's device wall time into GEMM-dispatch vs stream-drain; host glue is the
+// remainder (step_time - gemm - sync). Reset before a step, read after.
+void DeepseekV4ProfReset();
+double DeepseekV4ProfGemmSeconds();
+double DeepseekV4ProfSyncSeconds();
+
 // Coherence-debug #188 Phase-2 discriminator: per routed expert, compare each
 // projection's keep-quant kMatmulBTQuant output (A) vs a dequant-then-GEMM oracle
 // (B) from the SAME blocks. Splits vec_dot/decode numerics (A!=B) from slice

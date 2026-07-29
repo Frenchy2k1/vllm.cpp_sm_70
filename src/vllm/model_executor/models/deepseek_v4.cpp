@@ -39,6 +39,7 @@
 // landed primitive math the device kernels will call.
 #include "vllm/model_executor/models/deepseek_v4.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -127,6 +128,57 @@ struct V4Backend {
 inline void SyncDeviceGemm(const V4Backend& be) {
   if (be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU)
     vt::GetBackend(be.q->device).Synchronize(*be.q);
+}
+
+// Stage-2 decode-step profiling (env `VT_V4_PROF`): split GEMM-dispatch vs
+// stream-drain so the decode bottleneck is MEASURED, not guessed. Host glue =
+// step_time - gemm - sync. Accumulators are process-global; the driver resets
+// them per step. Inert unless VT_V4_PROF is set.
+namespace prof {
+double g_gemm_s = 0.0;
+double g_sync_s = 0.0;
+inline bool On() {
+  static const bool e = std::getenv("VT_V4_PROF") != nullptr;
+  return e;
+}
+}  // namespace prof
+
+// One MatmulBT + (optional device) drain, timed when profiling is on. When
+// `defer_sync` is true the stream is NOT drained here — the caller issues a batch
+// of independent GEMMs and drains ONCE via DrainDevice before the host reads them
+// (Stage 2: amortize the ~66 us cudaStreamSynchronize over many GEMMs). Same
+// stream ⇒ the GEMMs are serialized regardless, so the result is byte-identical.
+inline void TimedMatmul(const V4Backend& be, bool on_dev, bool defer_sync, vt::Queue& gq,
+                        vt::Tensor& o, const vt::Tensor& a, const vt::Tensor& w) {
+  const bool do_sync = on_dev && !defer_sync;
+  if (!prof::On()) {
+    vt::MatmulBT(gq, o, a, w);
+    if (do_sync) SyncDeviceGemm(be);
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  vt::MatmulBT(gq, o, a, w);
+  const auto t1 = std::chrono::steady_clock::now();
+  prof::g_gemm_s += std::chrono::duration<double>(t1 - t0).count();
+  if (do_sync) {
+    SyncDeviceGemm(be);
+    const auto t2 = std::chrono::steady_clock::now();
+    prof::g_sync_s += std::chrono::duration<double>(t2 - t1).count();
+  }
+}
+
+// Explicit one-shot stream drain for a batch of deferred GEMMs (Stage 2). No-op on
+// the CPU queue. Timed into the sync bucket when profiling.
+inline void DrainDevice(const V4Backend& be) {
+  if (be.q == nullptr || be.q->device.type == vt::DeviceType::kCPU) return;
+  if (!prof::On()) {
+    vt::GetBackend(be.q->device).Synchronize(*be.q);
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  vt::GetBackend(be.q->device).Synchronize(*be.q);
+  prof::g_sync_s +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
 deepseek_v4::MhcPreResult DispMhcPre(const V4Backend& be, const std::vector<float>& residual,
@@ -255,7 +307,7 @@ std::vector<float> MatVec(const std::vector<float>& w, const float* x, int64_t o
 // OwnedTensor.View()) + vt/ops.cpp:134-171 (block-quant dispatch).
 std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
                         const std::vector<float>& wf32, const std::vector<float>& x,
-                        int64_t T, int64_t N, int64_t K) {
+                        int64_t T, int64_t N, int64_t K, bool defer_sync = false) {
   if (be.gguf != nullptr && wq != nullptr && !wq->Empty()) {
     VT_CHECK(be.q != nullptr, "deepseek-v4 keep-quant GEMM needs a queue");
     VT_CHECK(wq->rank == 2 && wq->shape[0] == N && wq->shape[1] == K,
@@ -285,8 +337,7 @@ std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
     // queue's device so MatmulBTQuant's device-consistency check (ops.cpp:198)
     // dispatches to the right provider (mirrors GemmRowSlice's wt.device below).
     w.device = gq.device;
-    vt::MatmulBT(gq, o, a, w);
-    if (on_dev) SyncDeviceGemm(be);  // drain before the host reads `out`
+    TimedMatmul(be, on_dev, defer_sync, gq, o, a, w);  // MatmulBT + (device) drain
     return out;
   }
   std::vector<float> out(static_cast<size_t>(T) * N);
@@ -305,7 +356,7 @@ std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
 // [T,N] f32.
 std::vector<float> GemmRowSlice(const V4Backend& be, const OwnedTensor& w,
                                 const std::vector<float>& x, int64_t T, int64_t N,
-                                int64_t K, int64_t row_off) {
+                                int64_t K, int64_t row_off, bool defer_sync = false) {
   VT_CHECK(be.q != nullptr, "deepseek-v4 keep-quant expert GEMM needs a queue");
   VT_CHECK(!w.repacked,
            "deepseek-v4 keep-quant expert/group slice requires non-repacked blocks "
@@ -335,8 +386,7 @@ std::vector<float> GemmRowSlice(const V4Backend& be, const OwnedTensor& w,
   wt.shape[1] = K;
   wt.stride[0] = K;  // inert for a block-quant weight; correct for the bf16 oracle
   wt.stride[1] = 1;
-  vt::MatmulBT(gq, o, a, wt);
-  if (on_dev) SyncDeviceGemm(be);  // drain before the host reads `out`
+  TimedMatmul(be, on_dev, defer_sync, gq, o, a, wt);  // MatmulBT + (device) drain
   return out;
 }
 
@@ -354,17 +404,24 @@ std::vector<float> GroupedOutputLoraGguf(const V4Backend& be, const OwnedTensor&
   const int64_t ipg = nh * hd / ng;  // in_per_group
   const int64_t z_dim = ng * olr;
   std::vector<float> z(static_cast<size_t>(T) * z_dim);
-  std::vector<float> og(static_cast<size_t>(T) * ipg);
+  // Stage 2: the `ng` per-group wo_a GEMMs are independent → separate input/output
+  // buffers per group, issue them all with a deferred drain, DRAIN ONCE, then
+  // assemble z. Was ng+1 stream drains → 2. Byte-identical (same GEMMs, same stream).
+  std::vector<std::vector<float>> og(static_cast<size_t>(ng)), zg(static_cast<size_t>(ng));
   for (int64_t g = 0; g < ng; ++g) {
+    og[static_cast<size_t>(g)].resize(static_cast<size_t>(T) * ipg);
     for (int64_t t = 0; t < T; ++t)
       for (int64_t r = 0; r < ipg; ++r)
-        og[t * ipg + r] = o[t * nh * hd + g * ipg + r];
-    const std::vector<float> zg =
-        GemmRowSlice(be, wo_a, og, T, olr, ipg, /*row_off=*/g * olr);  // [T,olr]
-    for (int64_t t = 0; t < T; ++t)
-      for (int64_t d = 0; d < olr; ++d) z[t * z_dim + g * olr + d] = zg[t * olr + d];
+        og[static_cast<size_t>(g)][t * ipg + r] = o[t * nh * hd + g * ipg + r];
+    zg[static_cast<size_t>(g)] = GemmRowSlice(be, wo_a, og[static_cast<size_t>(g)], T, olr, ipg,
+                                              /*row_off=*/g * olr, /*defer_sync=*/true);  // [T,olr]
   }
-  return Gemm(be, &wo_b, /*wf32=*/{}, z, T, H, z_dim);  // [T,H]
+  DrainDevice(be);
+  for (int64_t g = 0; g < ng; ++g)
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t d = 0; d < olr; ++d)
+        z[t * z_dim + g * olr + d] = zg[static_cast<size_t>(g)][t * olr + d];
+  return Gemm(be, &wo_b, /*wf32=*/{}, z, T, H, z_dim);  // [T,H] (final; drains normally)
 }
 
 // Weighted RMSNorm (the standard DeepSeek/vLLM RMSNorm).
@@ -722,66 +779,99 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       out[static_cast<size_t>(hh)] = Dot(&w2[hh * mi], act.data(), mi);
     return out;
   };
-  // clamped-SwiGLU over a keep-quant expert e: w13 = stacked [E*mi,H] row-slice at
-  // e*mi, w2 = stacked [E*H,mi] row-slice at e*H. `x1` is the single token [1,H].
-  const auto expert_kq = [&](const OwnedTensor& w1s, const OwnedTensor& w3s,
-                             const OwnedTensor& w2s, int64_t e,
-                             const std::vector<float>& x1) -> std::vector<float> {
-    const std::vector<float> g = GemmRowSlice(be, w1s, x1, 1, mi, H, e * mi);
-    const std::vector<float> u = GemmRowSlice(be, w3s, x1, 1, mi, H, e * mi);
+  // clamped-SwiGLU host activation from separate gate `g` and up `u` [mi] vectors.
+  const auto swiglu = [&](const std::vector<float>& g,
+                          const std::vector<float>& u) -> std::vector<float> {
     std::vector<float> gate_up(static_cast<size_t>(2) * mi);
     for (int64_t r = 0; r < mi; ++r) {
       gate_up[static_cast<size_t>(r)] = g[static_cast<size_t>(r)];
       gate_up[static_cast<size_t>(mi + r)] = u[static_cast<size_t>(r)];
     }
-    const std::vector<float> act = DispClampedSwiGLU(be, gate_up, mi, lim, 1.0f, 0.0f);
-    return GemmRowSlice(be, w2s, act, 1, H, mi, e * H);  // [H]
-  };
-  // the shared expert is a plain (non-stacked) keep-quant triple.
-  const auto shared_kq = [&](const std::vector<float>& x1) -> std::vector<float> {
-    const std::vector<float> g = Gemm(be, &Lq->shared_gate, {}, x1, 1, mi, H);
-    const std::vector<float> u = Gemm(be, &Lq->shared_up, {}, x1, 1, mi, H);
-    std::vector<float> gate_up(static_cast<size_t>(2) * mi);
-    for (int64_t r = 0; r < mi; ++r) {
-      gate_up[static_cast<size_t>(r)] = g[static_cast<size_t>(r)];
-      gate_up[static_cast<size_t>(mi + r)] = u[static_cast<size_t>(r)];
-    }
-    const std::vector<float> act = DispClampedSwiGLU(be, gate_up, mi, lim, 1.0f, 0.0f);
-    return Gemm(be, &Lq->shared_down, {}, act, 1, H, mi);  // [H]
+    return DispClampedSwiGLU(be, gate_up, mi, lim, 1.0f, 0.0f);
   };
 
   std::vector<float> out(static_cast<size_t>(T) * H, 0.0f);
   for (int64_t t = 0; t < T; ++t) {
     const std::vector<float> x1(x.begin() + t * H, x.begin() + (t + 1) * H);
-    // shared expert (always active).
-    const std::vector<float> sh =
-        kq ? shared_kq(x1)
-           : expert_f32(L.shared_w1.data(), L.shared_w3.data(), L.shared_w2.data(),
-                        &x[t * H]);
-    for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += sh[static_cast<size_t>(hh)];
     const bool dbg = std::getenv("VT_DUMP_ACT") != nullptr && t == 0;
-    double sh_r = 0; if (dbg) { for (float v : sh) sh_r += (double)v * v; sh_r = std::sqrt(sh_r / H); }
-    // routed experts.
-    double rt_r = 0, wmax = 0, eo_rmax = 0;
-    for (int64_t j = 0; j < topk; ++j) {
-      const int64_t e = route.topk_ids[t * topk + j];
-      const float w = route.topk_weights[t * topk + j];
-      const std::vector<float> eo =
-          kq ? expert_kq(Lq->moe_gate_exps, Lq->moe_up_exps, Lq->moe_down_exps, e, x1)
-             : expert_f32(&L.exp_w1[e * mi * H], &L.exp_w3[e * mi * H],
-                          &L.exp_w2[e * H * mi], &x[t * H]);
-      if (dbg) {
-        double er = 0; for (float v : eo) er += (double)v * v; er = std::sqrt(er / H);
-        wmax = std::max(wmax, (double)std::fabs(w)); eo_rmax = std::max(eo_rmax, er);
-        double c = 0; for (float v : eo) c += (double)(w * v) * (w * v); rt_r += c;
-        std::fprintf(stderr, "    [moe L%02lld] routed e=%lld w=%.4f eo_rms=%.3f\n",
-                     static_cast<long long>(layer), static_cast<long long>(e), w, er);
+
+    if (kq) {
+      // ── Stage 2: BATCHED expert GEMMs. The shared + `topk` routed experts are
+      //    mutually independent and gate/up feed only their own down, so issue all
+      //    gate+up (deferred, no per-GEMM sync), DRAIN ONCE, host clamped-SwiGLU,
+      //    issue all down (deferred), DRAIN ONCE, then combine. Was ~21 stream
+      //    drains/layer (one per GEMM) → 2. BYTE-IDENTICAL to the per-expert path:
+      //    same GEMMs on the same stream (serialized), only the host drain is
+      //    amortized. Index 0 = shared expert (weight 1); 1..topk = routed.
+      const int64_t A = 1 + topk;
+      std::vector<std::vector<float>> g(static_cast<size_t>(A)), u(static_cast<size_t>(A)),
+          act(static_cast<size_t>(A)), eo(static_cast<size_t>(A));
+      // phase 1: gate + up (deferred drain)
+      g[0] = Gemm(be, &Lq->shared_gate, {}, x1, 1, mi, H, /*defer_sync=*/true);
+      u[0] = Gemm(be, &Lq->shared_up, {}, x1, 1, mi, H, /*defer_sync=*/true);
+      for (int64_t j = 0; j < topk; ++j) {
+        const int64_t e = route.topk_ids[t * topk + j];
+        g[1 + j] = GemmRowSlice(be, Lq->moe_gate_exps, x1, 1, mi, H, e * mi, /*defer_sync=*/true);
+        u[1 + j] = GemmRowSlice(be, Lq->moe_up_exps, x1, 1, mi, H, e * mi, /*defer_sync=*/true);
       }
-      for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += w * eo[static_cast<size_t>(hh)];
+      DrainDevice(be);
+      // phase 2: host clamped-SwiGLU
+      for (int64_t a = 0; a < A; ++a) act[static_cast<size_t>(a)] = swiglu(g[a], u[a]);
+      // phase 3: down (deferred drain)
+      eo[0] = Gemm(be, &Lq->shared_down, {}, act[0], 1, H, mi, /*defer_sync=*/true);
+      for (int64_t j = 0; j < topk; ++j) {
+        const int64_t e = route.topk_ids[t * topk + j];
+        eo[1 + j] = GemmRowSlice(be, Lq->moe_down_exps, act[static_cast<size_t>(1 + j)], 1, H, mi,
+                                 e * H, /*defer_sync=*/true);
+      }
+      DrainDevice(be);
+      // phase 4: combine  out = shared + Σ_j w_j · eo_j
+      for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += eo[0][static_cast<size_t>(hh)];
+      for (int64_t j = 0; j < topk; ++j) {
+        const float w = route.topk_weights[t * topk + j];
+        for (int64_t hh = 0; hh < H; ++hh)
+          out[t * H + hh] += w * eo[static_cast<size_t>(1 + j)][static_cast<size_t>(hh)];
+      }
+      if (dbg) {
+        double sh_r = 0; for (float v : eo[0]) sh_r += (double)v * v; sh_r = std::sqrt(sh_r / H);
+        double rt_r = 0, wmax = 0, eo_rmax = 0;
+        for (int64_t j = 0; j < topk; ++j) {
+          const int64_t e = route.topk_ids[t * topk + j];
+          const float w = route.topk_weights[t * topk + j];
+          double er = 0; for (float v : eo[1 + j]) er += (double)v * v; er = std::sqrt(er / H);
+          wmax = std::max(wmax, (double)std::fabs(w)); eo_rmax = std::max(eo_rmax, er);
+          double c = 0; for (float v : eo[1 + j]) c += (double)(w * v) * (w * v); rt_r += c;
+          std::fprintf(stderr, "    [moe L%02lld] routed e=%lld w=%.4f eo_rms=%.3f\n",
+                       static_cast<long long>(layer), static_cast<long long>(e), w, er);
+        }
+        std::fprintf(stderr, "  [moe L%02lld] shared_rms=%.3f routed_rms=%.3f wmax=%.3f expert_out_rmax=%.3f\n",
+                     static_cast<long long>(layer), sh_r, std::sqrt(rt_r / H), wmax, eo_rmax);
+      }
+    } else {
+      // f32 host path (unchanged): pure host Dot, no device queue / sync.
+      const std::vector<float> sh = expert_f32(L.shared_w1.data(), L.shared_w3.data(),
+                                               L.shared_w2.data(), &x[t * H]);
+      for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += sh[static_cast<size_t>(hh)];
+      double sh_r = 0; if (dbg) { for (float v : sh) sh_r += (double)v * v; sh_r = std::sqrt(sh_r / H); }
+      double rt_r = 0, wmax = 0, eo_rmax = 0;
+      for (int64_t j = 0; j < topk; ++j) {
+        const int64_t e = route.topk_ids[t * topk + j];
+        const float w = route.topk_weights[t * topk + j];
+        const std::vector<float> eo = expert_f32(&L.exp_w1[e * mi * H], &L.exp_w3[e * mi * H],
+                                                 &L.exp_w2[e * H * mi], &x[t * H]);
+        if (dbg) {
+          double er = 0; for (float v : eo) er += (double)v * v; er = std::sqrt(er / H);
+          wmax = std::max(wmax, (double)std::fabs(w)); eo_rmax = std::max(eo_rmax, er);
+          double c = 0; for (float v : eo) c += (double)(w * v) * (w * v); rt_r += c;
+          std::fprintf(stderr, "    [moe L%02lld] routed e=%lld w=%.4f eo_rms=%.3f\n",
+                       static_cast<long long>(layer), static_cast<long long>(e), w, er);
+        }
+        for (int64_t hh = 0; hh < H; ++hh) out[t * H + hh] += w * eo[static_cast<size_t>(hh)];
+      }
+      if (dbg)
+        std::fprintf(stderr, "  [moe L%02lld] shared_rms=%.3f routed_rms=%.3f wmax=%.3f expert_out_rmax=%.3f\n",
+                     static_cast<long long>(layer), sh_r, std::sqrt(rt_r / H), wmax, eo_rmax);
     }
-    if (dbg)
-      std::fprintf(stderr, "  [moe L%02lld] shared_rms=%.3f routed_rms=%.3f wmax=%.3f expert_out_rmax=%.3f\n",
-                   static_cast<long long>(layer), sh_r, std::sqrt(rt_r / H), wmax, eo_rmax);
   }
   return out;
 }
@@ -1061,6 +1151,15 @@ std::vector<float> DeepseekV4ForwardGgufCached(const DeepseekV4Weights& weights,
   cache.len += T;  // all layers appended their T decks
   return logits;
 }
+
+// Stage-2 profiling accessors (env `VT_V4_PROF`; see prof:: above). The driver
+// resets before a step and reads after: host-glue = step_time - gemm - sync.
+void DeepseekV4ProfReset() {
+  prof::g_gemm_s = 0.0;
+  prof::g_sync_s = 0.0;
+}
+double DeepseekV4ProfGemmSeconds() { return prof::g_gemm_s; }
+double DeepseekV4ProfSyncSeconds() { return prof::g_sync_s; }
 
 void DeepseekV4QHeadRmsNormInplace(std::vector<float>& q, int64_t n_head,
                                    int64_t head_dim, float eps) {

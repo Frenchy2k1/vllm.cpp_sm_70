@@ -192,12 +192,19 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < tokens.size(); ++i) positions[i] = static_cast<int32_t>(i);
       logits_idx = {static_cast<int32_t>(tokens.size() - 1)};
     }
+    vllm::DeepseekV4ProfReset();
     const auto s0 = std::chrono::steady_clock::now();
     const std::vector<float> logits =
         use_cache ? vllm::DeepseekV4ForwardGgufCached(w, q, cache, step_tokens, positions, logits_idx)
                   : vllm::DeepseekV4ForwardGguf(w, q, step_tokens, positions, logits_idx);
     const auto s1 = std::chrono::steady_clock::now();
     const double step_s = std::chrono::duration<double>(s1 - s0).count();
+    if (std::getenv("VT_V4_PROF") != nullptr) {
+      const double gemm = vllm::DeepseekV4ProfGemmSeconds();
+      const double sync = vllm::DeepseekV4ProfSyncSeconds();
+      std::fprintf(stderr, "[prof] step %d: total=%.3fs gemm=%.3fs sync=%.3fs glue=%.3fs\n",
+                   step, step_s, gemm, sync, step_s - gemm - sync);
+    }
     const int next = ArgmaxLastRow(logits, vocab);
     if (step == 0) prefill_s = step_s; else decode_s += step_s;
     std::fprintf(stderr, "[gen] step %d (ctx=%zu): next=%d  %.2fs  (RSS %.1f GiB)\n",
