@@ -340,6 +340,51 @@ std::vector<float> DeepseekV4ForwardGguf(
     const std::vector<int32_t>& logits_indices = {},
     V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr);
 
+// The MLA compressed-latent KV cache for INCREMENTAL decode (ForwardDevice
+// campaign, Stage 1). For the real dense-MLA run (num_key_value_heads=1, no
+// compressor/indexer) the only cross-token state is the per-layer `deck` latent
+// [head_dim] fed to attention as key=value. This caches it per layer so decode
+// processes ONE new token against cached KV instead of re-running the whole
+// forward over the growing context. Mirror of ds4 `ds4_layer_cache.raw_kv`
+// (ds4.c:12089/12351), cached at f32 to stay bit-exact to our full-recompute path.
+struct DeepseekV4KvCache {
+  std::vector<std::vector<float>> deck;  // [layer] -> flat [len * head_dim]
+  int64_t len = 0;                       // cached token count (same for all layers)
+  int64_t head_dim = 0;
+  void Reset(int64_t num_layers, int64_t head_dim_) {
+    deck.assign(static_cast<size_t>(num_layers), {});
+    len = 0;
+    head_dim = head_dim_;
+  }
+};
+
+// Incremental-decode variant of DeepseekV4ForwardGguf. On the FIRST call (prefill)
+// pass all prompt tokens with cache.len==0; each later call passes ONE new token
+// with positions={cache.len}. The forward appends each token's per-layer `deck` to
+// the cache and attends the new query over the full cached KV — token-IDENTICAL to
+// the full-recompute path (a pure equivalence: same tokens, ~ctx x fewer FLOPs).
+// `logits_indices` are LOCAL indices into the tokens passed THIS call.
+std::vector<float> DeepseekV4ForwardGgufCached(
+    const DeepseekV4Weights& weights, vt::Queue& queue, DeepseekV4KvCache& cache,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices = {});
+
+// Coherence-debug #188 Phase-2 discriminator: per routed expert, compare each
+// projection's keep-quant kMatmulBTQuant output (A) vs a dequant-then-GEMM oracle
+// (B) from the SAME blocks. Splits vec_dot/decode numerics (A!=B) from slice
+// offset (A==B but over-scaled). Diagnostic (prints to stderr).
+void DeepseekV4ExpertProbe(const DeepseekV4Weights& weights, vt::Queue& queue,
+                           int64_t layer, const std::vector<int64_t>& experts);
+
+// Per-head RMS-normalization of the MLA query: each of `n_head` contiguous
+// `head_dim`-wide sub-vectors of `q` is scaled by 1/sqrt(mean(x^2) + eps) — NO
+// learnable weight. DeepSeek-V4 applies this to q AFTER wq_b and BEFORE RoPE
+// (ds4 `head_rms_norm_inplace` / `layer_q_projection_normed_one`; the KV latent
+// does NOT get it — only its `attn_kv_a_norm`). q is laid out [n_head*head_dim]
+// (for a batch, pass n_head = tokens*heads). #188 coherence fix.
+void DeepseekV4QHeadRmsNormInplace(std::vector<float>& q, int64_t n_head,
+                                   int64_t head_dim, float eps);
+
 // Load `DeepseekV4ForCausalLM` safetensors into DeepseekV4Weights. Encodes the
 // checkpoint name-map VERIFIED against the real header (deepseek_v4_weights.cpp)
 // and performs the W2 accounting pass (throws on a missing expected tensor). The

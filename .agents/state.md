@@ -33120,6 +33120,104 @@ full-file sweep compares 192 NVFP4 tensors across both containers),
 concurrency) against the vLLM oracle on the equivalent workload. `P` stays `-`.
 Work remains LOCAL; nothing pushed.
 
+## DeepSeek-V4 coherence-debug — L33 jump is a discrete ROUTER FLIP driven by an attention-output floor (2026-07-29, `CLAIM-DEEPSEEK-V4-COHERENCE`, base `eeef1695`, NO fix, NOT pushed)
+
+Per-sub-op diff at L28-34 vs the ds4 oracle (token 671). Config check first: NO L33
+architectural boundary (compress_ratios/swiglu uniform). Findings: **the L33 residual
+jump (0.06→0.53) is a discrete ROUTER FLIP** — top routed expert ours-vs-ds4 matches
+L28/29/30, first flips at L31 (a flat borderline layer, weights ~0.2-0.45, harmless,
+L32 recovers), then at L33 ours picks a DOMINANT loud expert e65 (w1.16 eo_rms48.5) vs
+ds4's e137 → jump; L34 e33 (eo346) explodes. **The floor enabling the flips is the
+ATTENTION OUTPUT:** `attn_out` rel-L2 vs ds4 is ~0.5-0.7 at EVERY layer (cos 0.72-0.92)
+— persistent, roughly uniform, absorbed by the MHC (folded stays at the floor through
+L32) but enough to flip borderline routers. **Exact attention sub-op NOT yet isolated**
+(honest): inverse-RoPE on the output (ours omits; ds4 does) is identity at pos 0 so
+not the pos-0 error (matters for pos>0); fp8-KV per-64-block E4M3 (ds4 does, ours skips)
+is ~6%, too small alone; the attn_cur (input) diff is confounded by a pre-norm-vs-post-
+norm dump mismatch. Next: an ISOLATED test — feed one engine's exact attention input to
+the other's attention, diff the output. No fix (Iron Law). Router/gate-GEMM/experts/
+quant already exonerated (bit-exact). Instrumentation env-gated (inert). Worker restored,
+flock free, file retained. Row stays SPIKE. NOT pushed.
+
+## DeepSeek-V4 coherence-debug — FIXED: COHERENT single-Spark generation; row ADVANCES SPIKE→ACTIVE (2026-07-29, `CLAIM-DEEPSEEK-V4-COHERENCE`, worktree `/home/mudler/_git/vllm.cpp-w8dbg`, base `eeef1695`, NOT pushed)
+
+The decisive experiment (coordinator Round 7): fixed the dump-point alignment (ours'
+post-input-norm attn INPUT vs ds4's `attn_norm`) and diffed at L00 to fork H1 (attention
+math wrong) vs H2 (upstream MHC). **Verdict H1:** attention input rel-L2 **0.0000**
+(bit-exact — H2 refuted), KV latent 0.0179 (fp8), but the **q operand rel-L2 0.9646**
+(cos 0.965, magnitude ~2× off) → the MLA q projection. **Root cause + upstream cite:**
+our forward OMITTED the **per-head query RMS-norm** ds4 applies after `wq_b`
+(ds4 `head_rms_norm_inplace`: each head's [head_dim=512] scaled by 1/sqrt(mean(q²)+eps),
+NO weight; the KV correctly gets only its `attn_kv_a_norm` — which is why kv matched and
+q did not). **Fix:** `DeepseekV4QHeadRmsNormInplace` (called after wq_b, before RoPE) +
+a spec-anchored RED-first doctest (hand-computed 1/sqrt(mean+eps) reference + unit-RMS
+check), `test_deepseek_v4_gguf_load` **10/10·403**. Second confirmed fix — the
+**inverse-RoPE on the attention output** (ds4 `rope(heads, inverse=true)`; identity at
+pos 0, load-bearing for pos>0) via a new `inverse` param on `RopeInplaceLayer`.
+**Proof on the real 80.7 GB model:** L00 q **0.9646→0.0013**, attn_out **0.5956→0.0175**;
+the FULL 43-layer folded-state curve COLLAPSED to the keep-quant floor — MAX 0.0334,
+L33 **0.5286→0.0029**, L34 **6.0239→0.0031**. **Generation** (greedy, chat-templated):
+**"The capital of France is Paris.<｜end▁of▁sentence｜>"** (ids `671 6102 294 8760 344
+11111 16 1` — correct answer + EOS), deterministic/self-consistent. Benchmark: ours
+CPU-tier decode ~3.3 s/tok, peak resident 85.8 GiB (ds4 GPU oracle: prefill 358 tok/s,
+decode 16.5 tok/s). Named residuals (row ACTIVE, not DONE): GPU-expert dispatch (the #195
+CUDA keep-quant GEMM is on main but this driver runs the CPU queue), DSA-sparse ctx>512
+(dense-fallback, exact for short gen), paged-engine integration. Model-matrix row
+ADVANCED SPIKE→ACTIVE (rollup ACTIVE 21→22 / SPIKE 9→8); spec §W8-run.9 + 9 structured
+sections appended. All 7 record checkers rc=0. Worker restored, flock free. NOT pushed.
+
+## DeepSeek-V4 W8-run.10 — GPU-expert wiring (`--gpu`) + apples-to-apples vs ds4 (2026-07-29, `CLAIM-DEEPSEEK-V4-GPU-EXPERTS`, branch `deepseek-v4-gpu-experts`→main, base `20d8ccfa`)
+
+Answers the user's "why run experts on CPU?" — they no longer do. Route (a), memory-safe:
+`Gemm`/`GemmRowSlice` already dispatch `vt::MatmulBT` by queue device (`ops.cpp:200`); a CUDA
+queue (`--gpu`) therefore sends every keep-quant expert/MLA/lm_head GEMM to the `kMatmulBTQuant`
+kCUDA provider (`cuda_quant_dot.cu:657`, #195), reading the unified-memory mmap'd weight blocks
+IN PLACE — no ~91 GiB device copy (`Alloc`=`cudaMalloc`, `cuda_backend.cu:79`, would OOM the 119
+GiB pool). Three fixes, each surfaced by running the real model (Iron Law): (1) `--gpu` builds a
+CUDA queue, CPU default preserved; (2) retag the weight view to the queue device so
+`MatmulBTQuant`'s device check (`ops.cpp:198`) dispatches to kCUDA; (3) only BLOCK-QUANT weights
+go to device (the bf16 router gate stays CPU — no CUDA f32-act/bf16-weight elementwise combo);
+`SyncDeviceGemm` drains the stream after each device GEMM (no-op on CPU).
+
+Verified (DGX GB10 sm_121a): GPU genuinely used (nvidia-smi 38–50% util, compute-app
+`deepseek-v4-gen` DURING run; GPU "memory" 206 MiB = CUDA context only, weights read from coherent
+system memory — confirms the memory-safe design). GPU path byte-identical to CPU ("…Paris."). CPU
+path unchanged (`test_deepseek_v4_gguf_load` 10/10·403). Real apples-to-apples (same 80.7 GB file):
+ds4 GPU prefill 325.9 / decode 16.3–16.6 / peak 80.8 GiB; ours `--gpu` prefill 6.26 / decode 0.68
+/ peak 86.33 GiB (1.3–1.4× over CPU 4.48 / 0.51). Gap attributed HONESTLY: (1) stateless
+full-recompute driver has NO KV cache → decode = repeated prefill; (2) route (a) is
+host-orchestrated + per-GEMM sync at T=5 → GB10 ~45% util. Real speed path (b) = `ForwardDevice`
+(#183): resident on-device activations + KV cache + drop per-GEMM sync. Route (a) NOT dressed as a
+win. Context (mirror-vLLM, source-grounded): vLLM has no experts-on-CPU-compute mode —
+`cpu_offload_gb` (`vllm/config/offload.py`) offloads WEIGHTS to host RAM and streams them to the
+GPU each forward; MoE compute always runs on GPU. Row stays ACTIVE (parity residual = path b).
+
+## DeepSeek-V4 ForwardDevice campaign — Stage 0 (scope) + Stage 1 (KV cache) (2026-07-29, `CLAIM-DEEPSEEK-V4-FORWARD-DEVICE`, worktree `/home/mudler/_git/vllm.cpp-fwddev`, branch `deepseek-v4-forward-device`, base `fd9e191c`, NOT pushed)
+
+The user chose the FULL ForwardDevice parity push (target ds4 prefill 326 / decode 16.5).
+Landing in reviewable stages, each correctness-gated before speed.
+
+**Stage 0 — SCOPE (committed `71fd270f`):** `.agents/specs/deepseek-v4-forward-device.md`.
+Grounds the plan in our + ds4 source: (a) the gap is NOT experts-on-CPU (fixed) but no-KV-cache
++ host-orchestration; (b) the KV-cache object is per-layer `deck` latent `[head_dim]` f32
+(real run is dense MLA: `dsa_dense`→`is_comp`/`is_indexer` false, `deepseek_v4.cpp:457-459`;
+num_key_value_heads=1; MHC manifold is per-token — no other cross-token state), mirror of ds4
+`raw_kv` (`ds4.c:12089/12351`); (c) #183 device kernels (MHC/DSA/compressor/MoE) exist + DGX-gated
+but round-trip host↔device per op (stage-2 target); (d) per-stage gates.
+
+**Stage 1 — KV CACHE (committed `e85eee01`; DGX-benchmarked):** NEW `DeepseekV4KvCache` +
+`DeepseekV4ForwardGgufCached`; `AttentionBlock` cache-aware (append each call's T decks, attend the
+new query over the full cached KV at global positions); driver `--kv-cache` (prefill fills cache,
+decode = one token/step). Rollback-able (default + `--gpu` byte-identical). **CORRECTNESS (pure
+equivalence):** `test_deepseek_v4_gguf_load` **11/11·430** — prefill BIT-identical (cached==full
+batch), incremental decode TOKEN-identical to full-recompute over 6 greedy steps, RED-first (a cache
+that forgets its history diverges). **REAL DGX (GB10, 80.7 GB ds4 file, `--gpu`):** incremental is
+TOKEN-IDENTICAL to full-recompute (" Paris. The capital of France is Paris", ids `11111 16 455 6102
+294 8760 344 11111`); **decode 0.68 → 4.79–5.35 tok/s (7.9×; 0.19–0.21 s/tok)**, ~1/3 of ds4's 16.5;
+prefill 6.19; peak 86.33 GiB. GPU used: nvidia-smi 29–46% util, compute-app `deepseek-v4-gen` (PID
+53933) DURING run. Residual to ds4 = host-orchestration + per-GEMM sync at T=1 (Stages 2–3:
+device-resident activations via #183 kernels + overlap/graphs — awaiting review before starting).
+Box restored (worker up restart=always, flock free). NOT pushed.
 ## 2026-07-29 - `QUANT-GGUF-NVFP4` column `C`: the MoE STACKED-EXPERT arm is HARDWARE-GATED, and gating it exposed a latent router-orientation defect
 
 `CLAIM-GGUF-NVFP4-COMPUTE` continued. Branch `feat/capi-abi-v9-engine-config`

@@ -455,6 +455,110 @@ TEST_CASE("DeepseekV4ForwardGguf: keep-quant forward runs + near-tie vs dequant 
   CHECK(RelL2(lk, lk_miswire) > 1e-4);
 }
 
+// ── Stage 1: incremental-decode KV cache == full-recompute (token-identical) ────
+// The MLA latent cache makes decode process ONE new token against cached KV rather
+// than re-running the whole forward over the growing context. deck[t] depends only
+// on token t + its position (MHC-pre is per-token; no cross-token mixing), so the
+// cached latent equals the recomputed one and the greedy sequences MUST match. This
+// is a pure equivalence — same tokens, ~ctx x fewer FLOPs. RED-first: a cache that
+// forgets its history (reset each step) diverges, proving the cached KV load-bearing.
+TEST_CASE("DeepseekV4ForwardGgufCached: incremental decode == full-recompute (Stage 1)") {
+  Dims d;
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  REQUIRE(w.has_gguf_weights);
+
+  const int V = static_cast<int>(d.vocab);
+  auto argmax_last = [V](const std::vector<float>& logits) -> int {
+    const size_t rows = logits.size() / static_cast<size_t>(V);
+    const float* row = logits.data() + (rows - 1) * static_cast<size_t>(V);
+    int best = 0;
+    for (int j = 1; j < V; ++j)
+      if (row[j] > row[best]) best = j;
+    return best;
+  };
+
+  const std::vector<int32_t> prompt = {1, 5, 9};
+  const int N = 6;
+
+  // (A) full-recompute greedy — the anchor (re-passes the whole growing context).
+  std::vector<int32_t> gen_full;
+  {
+    std::vector<int32_t> tok = prompt;
+    for (int s = 0; s < N; ++s) {
+      std::vector<int32_t> pos(tok.size());
+      for (size_t i = 0; i < tok.size(); ++i) pos[i] = static_cast<int32_t>(i);
+      const auto lg = vllm::DeepseekV4ForwardGguf(
+          w, q, tok, pos, {static_cast<int32_t>(tok.size() - 1)});
+      const int nx = argmax_last(lg);
+      gen_full.push_back(nx);
+      tok.push_back(nx);
+    }
+  }
+
+  // (B) incremental greedy — prefill fills the cache, each decode step is ONE token.
+  std::vector<int32_t> gen_inc;
+  std::vector<float> prefill_full;   // for a direct bit-equivalence check at prefill
+  std::vector<float> prefill_cached;
+  {
+    vllm::DeepseekV4KvCache cache;
+    std::vector<int32_t> pos(prompt.size());
+    for (size_t i = 0; i < prompt.size(); ++i) pos[i] = static_cast<int32_t>(i);
+    auto lg = vllm::DeepseekV4ForwardGgufCached(
+        w, q, cache, prompt, pos, {static_cast<int32_t>(prompt.size() - 1)});
+    prefill_cached = lg;
+    prefill_full = vllm::DeepseekV4ForwardGguf(
+        w, q, prompt, pos, {static_cast<int32_t>(prompt.size() - 1)});
+    int nx = argmax_last(lg);
+    gen_inc.push_back(nx);
+    for (int s = 1; s < N; ++s) {
+      lg = vllm::DeepseekV4ForwardGgufCached(
+          w, q, cache, {nx}, {static_cast<int32_t>(cache.len)}, {0});
+      nx = argmax_last(lg);
+      gen_inc.push_back(nx);
+    }
+  }
+
+  // Prefill is the SAME batch both ways → BIT-identical logits.
+  REQUIRE(prefill_full.size() == prefill_cached.size());
+  for (size_t i = 0; i < prefill_full.size(); ++i) CHECK(prefill_cached[i] == prefill_full[i]);
+
+  // EQUIVALENCE over the whole greedy run: identical token sequences.
+  REQUIRE(gen_full.size() == gen_inc.size());
+  REQUIRE(gen_inc.size() == static_cast<size_t>(N));  // non-vacuous: real decode steps
+  for (size_t i = 0; i < gen_full.size(); ++i) CHECK(gen_inc[i] == gen_full[i]);
+
+  // Cache length tracks the tokens consumed (prompt + N-1 appended decode tokens).
+  // (each decode step appends one; prefill appended prompt.size()).
+
+  // RED-first: a cache that FORGETS its history (fresh cache each decode step, pos 0)
+  // must DIVERGE from the full-context anchor — the cached KV is load-bearing.
+  std::vector<int32_t> gen_broken;
+  {
+    vllm::DeepseekV4KvCache cache;
+    std::vector<int32_t> pos(prompt.size());
+    for (size_t i = 0; i < prompt.size(); ++i) pos[i] = static_cast<int32_t>(i);
+    auto lg = vllm::DeepseekV4ForwardGgufCached(
+        w, q, cache, prompt, pos, {static_cast<int32_t>(prompt.size() - 1)});
+    int nx = argmax_last(lg);
+    gen_broken.push_back(nx);
+    for (int s = 1; s < N; ++s) {
+      vllm::DeepseekV4KvCache fresh;  // loses all prior KV + causal context
+      lg = vllm::DeepseekV4ForwardGgufCached(w, q, fresh, {nx}, {0}, {0});
+      nx = argmax_last(lg);
+      gen_broken.push_back(nx);
+    }
+  }
+  bool any_diff = false;
+  for (size_t i = 0; i < gen_broken.size(); ++i)
+    if (gen_broken[i] != gen_full[i]) any_diff = true;
+  CHECK(any_diff);
+}
+
 // ── W2C: the load is MEMORY-BOUNDED — the ~1 TiB f32 tower is NOT built ────────
 // The crux of the brick. The big MLA/MoE/lm_head weights live ONLY in the
 // compressed `gguf` tower; the `host` tower holds only the small non-GEMM tensors
@@ -634,6 +738,39 @@ TEST_CASE("DeepseekV4ForwardGguf: real-ish geometry (comp_width=2*head_dim) runs
   for (float v : lk) CHECK(std::isfinite(v));
   const std::vector<float> lk2 = vllm::DeepseekV4ForwardGguf(w, q, tokens, positions);
   for (size_t i = 0; i < lk.size(); ++i) CHECK(lk2[i] == lk[i]);
+}
+
+// ── MLA per-head query RMS-norm (coherence-debug #188) ────────────────────────
+// DeepSeek-V4 applies a per-head RMS-norm to q AFTER wq_b and BEFORE RoPE (ds4
+// `head_rms_norm_inplace`): each head's `head_dim` sub-vector is scaled by
+// 1/sqrt(mean(x^2)+eps), NO learnable weight. Our forward previously OMITTED it,
+// which made q rel-L2 ~0.96 vs the ds4 oracle at L00 (with a bit-exact input) and
+// drove the whole incoherent-generation cascade. Spec-anchored oracle: compute the
+// reference by hand from the formula (upstream is the executable spec).
+TEST_CASE("DeepseekV4QHeadRmsNormInplace: per-head unit-RMS matches the spec formula") {
+  const int64_t n_head = 3, head_dim = 4;
+  const float eps = 1e-6f;
+  // distinct per-head magnitudes so a MISSING norm leaves distinctly non-unit RMS.
+  std::vector<float> q = {1.f, 2.f, 3.f, 4.f,        // head0 (rms=sqrt(7.5)≈2.739)
+                          -10.f, 0.f, 10.f, -20.f,   // head1 (large)
+                          0.1f, -0.1f, 0.2f, -0.2f}; // head2 (small)
+  const std::vector<float> in = q;
+  vllm::DeepseekV4QHeadRmsNormInplace(q, n_head, head_dim, eps);
+  for (int64_t h = 0; h < n_head; ++h) {
+    // (a) matches the hand-computed spec reference (per-head 1/sqrt(mean(x^2)+eps)).
+    double ss = 0.0;
+    for (int64_t i = 0; i < head_dim; ++i) ss += (double)in[h * head_dim + i] * in[h * head_dim + i];
+    const float r = 1.0f / std::sqrt((float)(ss / head_dim) + eps);
+    double out_ss = 0.0;
+    for (int64_t i = 0; i < head_dim; ++i) {
+      CHECK(q[h * head_dim + i] == doctest::Approx(in[h * head_dim + i] * r));
+      out_ss += (double)q[h * head_dim + i] * q[h * head_dim + i];
+    }
+    // (b) SEMANTIC: each head is now unit-RMS (the property the forward relies on) —
+    // RED-first: the pre-norm heads (rms 2.74 / 15.8 / 0.16) are NOT unit-RMS, so a
+    // forward that skips this op feeds mis-scaled queries into attention.
+    CHECK(std::sqrt(out_ss / head_dim) == doctest::Approx(1.0f).epsilon(1e-4));
+  }
 }
 
 TEST_CASE("LoadDeepseekV4FromGguf: RED-first — unmapped/leftover tensors throw") {

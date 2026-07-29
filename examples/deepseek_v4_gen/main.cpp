@@ -27,6 +27,7 @@
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/device.h"
+#include "vt/backend.h"  // vt::GetBackend / CreateQueue (--gpu: experts on the GB10)
 
 namespace {
 
@@ -93,6 +94,8 @@ int main(int argc, char** argv) {
   std::string model, prompt = "The capital of France is", token_ids_arg;
   int max_tokens = 16;
   bool load_only = false;
+  bool use_gpu = false;  // --gpu: run the keep-quant GEMMs (experts+MLA) on the GB10
+  bool use_cache = false;  // --kv-cache: incremental decode (Stage 1) vs full-recompute
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -101,6 +104,8 @@ int main(int argc, char** argv) {
     else if (a == "--token-ids") token_ids_arg = next();
     else if (a == "--max-tokens") max_tokens = std::atoi(next());
     else if (a == "--load-only") load_only = true;
+    else if (a == "--gpu") use_gpu = true;
+    else if (a == "--kv-cache") use_cache = true;
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if (model.empty()) { std::fprintf(stderr, "usage: --model <file.gguf> [--prompt ...] [--token-ids ...] [--max-tokens N] [--load-only]\n"); return 2; }
@@ -143,15 +148,54 @@ int main(int argc, char** argv) {
   const size_t n_prompt = tokens.size();
 
   // Greedy loop: full recompute each step (stateless keep-quant forward).
+  // Default = CPU keep-quant queue (the coherent, memory-safe reference path).
+  // --gpu = CUDA queue: MatmulBT dispatches the keep-quant expert/MLA GEMMs to
+  // the kCUDA kMatmulBTQuant provider (#195), reading the unified-memory mmap'd
+  // weight blocks in place (GB10 coherent access — no ~91 GiB device copy). The
+  // MHC/DSA/compressor/MoE-glue stay host-side (device=false in the forward);
+  // only the dominant-FLOP GEMMs move to the GB10.
+  vt::Backend* gpu_backend = nullptr;
   vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  if (use_gpu) {
+    gpu_backend = &vt::GetBackend(vt::DeviceType::kCUDA);
+    q = gpu_backend->CreateQueue();
+    std::fprintf(stderr, "[gen] GPU experts: CUDA queue on device %d (keep-quant GEMMs → GB10)\n",
+                 q.device.index);
+  } else {
+    std::fprintf(stderr, "[gen] CPU keep-quant queue (experts on the ARM cores)\n");
+  }
+  std::fprintf(stderr, "[gen] decode mode: %s\n",
+               use_cache ? "--kv-cache INCREMENTAL (Stage 1)" : "full-recompute (stateless)");
+
+  // --kv-cache (Stage 1): prefill fills the MLA latent cache with the prompt's
+  // per-layer `deck`; each decode step processes ONE new token against the cached
+  // KV (positions={cache.len}). Token-identical to the full-recompute path.
+  vllm::DeepseekV4KvCache cache;
   std::vector<int32_t> generated;
   double prefill_s = 0.0, decode_s = 0.0;
   for (int step = 0; step < max_tokens; ++step) {
-    std::vector<int32_t> positions(tokens.size());
-    for (size_t i = 0; i < tokens.size(); ++i) positions[i] = static_cast<int32_t>(i);
-    const std::vector<int32_t> logits_idx = {static_cast<int32_t>(tokens.size() - 1)};
+    std::vector<int32_t> step_tokens, positions, logits_idx;
+    if (use_cache) {
+      if (step == 0) {  // prefill: all prompt tokens
+        step_tokens = tokens;
+        positions.resize(step_tokens.size());
+        for (size_t i = 0; i < step_tokens.size(); ++i) positions[i] = static_cast<int32_t>(i);
+        logits_idx = {static_cast<int32_t>(step_tokens.size() - 1)};
+      } else {  // decode: one new token at position cache.len
+        step_tokens = {generated.back()};
+        positions = {static_cast<int32_t>(cache.len)};
+        logits_idx = {0};
+      }
+    } else {  // full-recompute: pass the whole growing context each step
+      step_tokens = tokens;
+      positions.resize(tokens.size());
+      for (size_t i = 0; i < tokens.size(); ++i) positions[i] = static_cast<int32_t>(i);
+      logits_idx = {static_cast<int32_t>(tokens.size() - 1)};
+    }
     const auto s0 = std::chrono::steady_clock::now();
-    const std::vector<float> logits = vllm::DeepseekV4ForwardGguf(w, q, tokens, positions, logits_idx);
+    const std::vector<float> logits =
+        use_cache ? vllm::DeepseekV4ForwardGgufCached(w, q, cache, step_tokens, positions, logits_idx)
+                  : vllm::DeepseekV4ForwardGguf(w, q, step_tokens, positions, logits_idx);
     const auto s1 = std::chrono::steady_clock::now();
     const double step_s = std::chrono::duration<double>(s1 - s0).count();
     const int next = ArgmaxLastRow(logits, vocab);
@@ -184,5 +228,6 @@ int main(int argc, char** argv) {
               (n_dec > 0 && decode_s > 0) ? n_dec / decode_s : 0.0, n_dec);
   std::printf("PEAK RESIDENT: %.2f GiB\n", PeakResidentGiB());
   std::fflush(stdout);
+  if (gpu_backend != nullptr) gpu_backend->DestroyQueue(q);
   return 0;
 }
