@@ -16,6 +16,21 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## GGUF IQ2_XXS + Q2_K dequant, the DeepSeek-V4-Flash single-Spark GGUF quant-path brick (2026-07-29, `CLAIM-DSV4-GGUF-LOADER`) - NOT-APPLICABLE (CPU dequant primitive, no throughput owed)
+
+No benchmark. W1 ports the two ~2-bit GGUF encodings the single-Spark
+`unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_XXS` (~91 GB, the only DeepSeek-V4 build
+that fits ONE GB10's 119 GiB pool) vehicle uses — IQ2_XXS (id 16, `iq2xxs_grid`
+codebook + signs + 4-bit scale) and Q2_K (id 10, nibble sub-scale/min) — 1:1 from
+llama.cpp `ggml-quants.c` @ `237ad9b96`, to f32/bf16. Correctness-only unit gate
+(`tests/vllm/test_gguf_dequant.cpp` 15/15·480 hand-derived literals;
+`tests/vt/test_ops_quant_traits.cpp` 9/9·5643 dequant-only contract). Both are
+dequant-only (no vec_dot → expand-bf16); a keep-quant GEMM for them is a future
+perf leaf. A dequant primitive owes no throughput number, and a V4-GGUF model
+cannot RUN yet (the V4-GGUF name map is tensor-manifest-blocked and the V4 forward
+is W3-W8), so there is no end-to-end workload to time. The eventual GGUF-vehicle
+reference is llama.cpp-on-card (the pinned vLLM cannot load V4 from GGUF). Spike:
+[`.agents/specs/gguf-iquant-dsv4.md`](../.agents/specs/gguf-iquant-dsv4.md).
 ## 27B SACRED gate red-alarm RCA: build configuration, not a code regression (2026-07-29, `CLAIM-27B-GATE-RCA`) - NOT APPLICABLE (no kernel, dtype, or token changed)
 
 No benchmark is owed and none is claimed. `benchmark_binding=false`. A reported
@@ -60,6 +75,17 @@ packed int32 + randomized double-precision roundtrip). A dequant primitive not
 yet wired to a loader or GPU GEMM owes no throughput number; the performance gate
 is W4 (Marlin GPU compute vs vLLM on the same workload). Spike:
 [`.agents/specs/awq-gptq-quant.md`](../.agents/specs/awq-gptq-quant.md).
+## `--prefix-match-unit` fine-grained matching unit (2026-07-28, `CLAIM-PREFIX-MATCH-UNIT`) - PENDING (W1 resolver + CPU unit gate only)
+
+No throughput number yet. W1 landed `resolve_kv_cache_block_sizes` (the
+`prefix_match_unit` -> `hash_block_size` semantics) + a CPU unit gate
+(`tests/vllm/v1/test_prefix_match_unit.cpp`, 8/8, 29 assertions, RED-first:
+default gcd `!=` `=16`). The real matching-unit effect (hit-rate + TTFT/throughput
+A/B on a hybrid model, finer unit enabling intra-block prefix-cache hits) is a
+NAMED later brick (W4) that requires the scheduler threading of a resolved
+`hash_block_size != block_size` (W3, blocked on the `KV-BLOCK-POOL` align path
+that still throws). Reproduce W1: `cmake -DVLLM_CPP_CUDA=OFF ...` then
+`ctest -R test_prefix_match_unit`. PENDING until W3/W4.
 
 ## vLLM feature-gap analysis (2026-07-28, `CLAIM-FEATURE-GAP-SPIKE`) - NOT-APPLICABLE (records-only spike)
 
@@ -68,6 +94,20 @@ our matrices produced a ranked map of what we are MISSING (8 HIGH, ~19 MED, ~16
 LOW), grounded in vLLM `file:line`. No build, no GPU, no measurement; no speed
 number is owed. Full list in
 [`.agents/specs/vllm-feature-gap-analysis.md`](../.agents/specs/vllm-feature-gap-analysis.md).
+
+## LoRA adapter subsystem W0 spike + W1 CPU brick (2026-07-28, `CLAIM-LORA-RUNTIME`, NOT pushed) - correctness brick, no speed number owed
+
+Disposition: **NOT APPLICABLE (correctness unit brick, host CPU; no throughput
+number owed at W1).** The W1 CPU punica brick (`LoRALayerWeights` + shrink/expand
+ops + `AddLoraLinear` + single-linear `LoRALinear`) is gated for CORRECTNESS only:
+`test_punica_cpu` 6/6 (101 assertions) vs an independent double-precision
+per-LoRA matmul reference, RED-first proven, clean CPU `-Werror` build. The
+subsystem PERFORMANCE gate — vLLM throughput parity with adapters active on a
+real multi-LoRA model — is **PENDING** the GPU-kernel + model-gate W (W7 in
+[`.agents/specs/lora-adapter.md`](../.agents/specs/lora-adapter.md)); no LoRA
+model can be served yet. Repro: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF
+-DVLLM_CPP_METAL=OFF && cmake --build build-cpu --target test_punica_cpu &&
+./build-cpu/tests/test_punica_cpu`.
 
 ## Gemma-4 multimodal W0, oracle-gateability run-verified + greedy golden captured (2026-07-28, `CLAIM-GEMMA4-W0`) - correctness anchor, no speed number owed
 
@@ -185,6 +225,43 @@ extractor + engine merge-plumbing) are the named residuals. Reproduce: dump the
 reference + weights with `scripts/mm/g3_audio_tower_ref.py` (dgx CPU, E4B cached),
 then run `test_gemma4_audio_tower` with `VLLM_GEMMA4_AUDIO_WEIGHTS` set to the dumped
 weight dir (refs come from the committed golden `tests/parity/goldens/gemma4_e4b_audio/`).
+
+## Gemma-4 image mm e2e - SigLIP2 tower FOLDED into the registered forward, near-tie GREEN (2026-07-29, `CLAIM-GEMMA4-MM-E2E`) - correctness gate landed, speed pending
+
+Gemma-4 image->text now runs through the ENGINE registered forward
+(`ModelRegistry::Forward` -> the `Gemma4ForConditionalGeneration` mm branch ->
+`Gemma4Model::ForwardMm`), mirroring the Qwen3-VL fold. The driver
+`Gemma4GenerateGreedyViaRegistry` (`gemma4_mm.cpp`) builds `ModelForwardInput.mm`
+from the SigLIP2 projector output (masked-scattered into the `<image>` rows) with the
+Gemma-4 PLE mm-mask, per-layer paged KV (256 sliding / 512 full, YOCO-aware), and
+1-D positions (no MRoPE/DeepStack).
+
+**Correctness (dgx GB10 sm_121a, `flock`, gate `test_gemma4_registry_e2e`): 16/18
+content tokens BIT-EXACT** vs the STRICT vLLM 0.25.0 `gemma4_e4b_image` golden - the
+whole sentence "This is a vibrant, abstract background featuring a smooth gradient of
+bright, blended colors" is token-identical. The single divergence is the terminal
+punctuation ("."<->",") at a **bf16 near-tie** (greedy top1-top2 margin ~0.10-0.12
+logit, run-to-run bf16 noise ~0.02, vs ~2.0 for the confident picks), and it is
+**INVARIANT to the vision-input precision**: the live C++ bf16 SigLIP2 tower (rel-L2
+~1.8% vs the f32 ref) AND the committed f32 `ref_projected.npy` produce the identical
+divergence, localizing the residual to backbone bf16-accumulation on the 256
+image-soft-token rows, NOT the fold/merge/PLE (PLE mask + `vocab_size_per_layer_input`
+=262144 verified vs the E4B config; `use_bidirectional_attention=None` so causal is
+correct; the text path is STRICT 32/32). The committed gate is the ratified near-tie
+form (content-exact prefix + first divergence must be a bf16 near-tie under a 0.5-logit
+band; a structural bug fails). Inertness: the SACRED text gate `test_gemma4_paged_engine`
+STRICT 32/32 UNCHANGED on the mm binary.
+
+**Speed: PENDING** - the driver is a single-sequence correctness path (device-resident
+bf16 weights + batched serving not yet built). **Residuals:** STRICT 18/18 (bit-match
+vLLM's prefill bf16 accumulation on the image rows - the DFlash-class bf16 acceptance
+floor); the Gemma-4 audio->text e2e (the A1 mel feature extractor + engine `<audio>`
+merge through this same fold - the G3 audio tower is already per-stage f32-exact). Reproduce:
+git-archive the commit to dgx, build `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, dump the vision weights with
+`scripts/mm/g2_vision_weight_dump.py`, then `flock $HOME/gpu.lock env
+VLLM_GEMMA4_VISION_WEIGHTS=<dir> ./build-cuda/tests/test_gemma4_registry_e2e` (or unset
+the env to use the committed `ref_projected.npy`).
 
 ## Gemma-4 G1 text backbone (2026-07-28, `CLAIM-GEMMA4-G1`) - correctness bring-up, no speed number owed
 
@@ -545,9 +622,124 @@ rel-L2 (the fixed-config 167B arch is not constructible at a tiny shape). SACRED
 v0.5.15 registers `DeepseekV4ForCausalLM` (full DSA/MHC stack) — a viable second
 reference for a future primitive-dump or 2-Spark benchmark. No source/engine path touched.
 
+**DeepSeek-V4-Flash W4 compressor + fp8_ds_mla KV-state (2026-07-29, `CLAIM-DEEPSEEK-V4-W4`,
+NOT pushed).** Disposition: **NOT APPLICABLE (correctness/primitive brick, host CPU
+reference + unit gate; no run, no download, no throughput number taken, claimed, or owed;
+`benchmark_binding=false`).** Ported + unit-gated the second half of the DSA sparse-attention
+stack: the DSA COMPRESSOR forward (the softmax-weighted window POOL `softmax(score,dim=0)·kv`
+per head-dim column + RMSNorm + the fused save-time APE add) and the fp8_ds_mla KV-cache state
+read/write layout (448 fp8 NoPE with per-64 UE8M0 power-of-two block scales + 64 bf16 RoPE, 576B
+token stride, 7+1 scale region, + the dequant read). `deepseek_v4_compressor.{h,cpp}`,
+`test_deepseek_v4_compressor` **12/12·164** — hand-derived literals + double-precision references
+(pool+norm rel-L2 < 1e-6; independent UE8M0 scale-byte recompute; round-trip < 0.05 fp8
+granularity) + RED-first (scale-bias perturb fails 4/135, revert restores). Ported 1:1 from vLLM
+`fused_compress_quant_cache.py`/`save_partial_states.py`/`compressor.py`, cross-checked vs SGLang
+`v0.5.15` `dsv4/dequant_k_cache.py`. Honest gate form: hand-case + structural review, NOT a
+dumped-oracle rel-L2. SACRED-inert (shared `mla_attention` empty-diff; `test_deepseek_v4_dsa`
+still 13/13·38). CPU gate uses the Debug build (a pre-existing GCC-13 `-O2` `-Werror=array-bounds`
+false positive in `voxtral.cpp`, unrelated, breaks the `-O2` full-library build; the new TUs are
+`-Wall -Werror -Wextra`-clean). The full-model speed gate remains multi-Spark-blocked (156.7 GiB);
+MHC/MoE/device-kernel/forward-integration are named W5-W8 residuals. New kernel row
+`KERNEL-ATTN-DSA-COMPRESSOR` (`SPIKE`). No source/engine path touched.
+
+**DeepSeek-V4-Flash W5 Manifold/Markov Hyper-Connections (MHC) (2026-07-29, `CLAIM-DEEPSEEK-V4-W5`,
+NOT pushed).** Disposition: **NOT APPLICABLE (correctness/primitive brick, host CPU reference + unit
+gate; no run, no download, no throughput number taken, claimed, or owed; `benchmark_binding=false`).**
+Ported + unit-gated the hardest V4 brick — the MHC residual topology: `MhcSinkhorn` (the 20-iteration
+Sinkhorn — row-softmax seed `+eps` then alternating col/row normalization toward a doubly-stochastic
+matrix), `MhcPre` (folded weight-free RMSNorm projection → pre/post/comb gates → stream collapse →
+optional folded attn/ffn RMSNorm), `MhcPost` (comb mix + post-gate residual fold), `HcHeadCollapse`
+(weight-free RMSNorm → hc_head_fn → sigmoid → weighted stream sum). `deepseek_v4_mhc.{h,cpp}`,
+`test_deepseek_v4_mhc` **14/14·125** — hand-derived literals + from-first-principles double-precision
+references (rel-L2 < 1e-5..1e-4; doubly-stochastic convergence) + RED-first proven BOTH the iteration
+count (`iters-1→iters-2` fails 1/9) and a normalization axis (swap fails 2/12), via a dedicated
+small-iteration-count gate (at 20 iters the Sinkhorn has converged, so ±1 iter is within tolerance —
+an honesty fix over a naive iters=20-only gate). **EAGER-REF FINDING:** the W0 "no eager reference
+upstream" premise is corrected — vLLM ships `model_executor/kernels/mhc/torch.py`
+(`mhc_pre_torch`/`mhc_post_torch`) + `triton.py` (head collapse); four upstream impls agree
+byte-for-byte on the Sinkhorn. Ported 1:1 AND cross-checked against an independent double-precision
+derivation. Honest gate form: derived-eager-reference + hand-case + structural review, NOT a
+dumped-oracle rel-L2 (fixed-config 167B not constructible tiny). OPEN QUESTION: end-to-end bf16
+residual rounding between steps is a W7 device concern, left out of the f32/f64 refs. SACRED-inert (no
+existing forward touched; `test_deepseek_v4_compressor` 12/12·164, `test_deepseek_v4_dsa` 13/13·38,
+`test_deepseek_v4_scaffold` 4/4·40 unchanged). CPU Debug build (the same voxtral `-O2` false positive;
+new TUs `-Wall -Werror -Wextra`-clean). The full-model speed gate remains multi-Spark-blocked (156.7
+GiB); MoE (W6), device-kernel + forward-assembly (W7), strict gate (W8) are named residuals. New
+kernel row `KERNEL-MHC-SINKHORN` (`SPIKE`). No source/engine path touched.
+
+**DeepSeek-V4-Flash W6 sqrtsoftplus + hash-routed MoE (2026-07-29, `CLAIM-DEEPSEEK-V4-W6`,
+NOT pushed).** Disposition: **NOT APPLICABLE (correctness/primitive brick, host CPU reference + unit
+gate; no run, no download, no throughput number taken, claimed, or owed; `benchmark_binding=false`).**
+Ported + unit-gated the three genuinely-new-vs-V2/V3 MoE pieces: `SqrtSoftplus` (the V4 router score
+`sqrt(softplus(x))`, distinct from V2/V3's sigmoid/softmax), `SqrtSoftplusRouteTopk` (score all experts
+→ add `e_score_correction_bias` for SELECTION only → top-k OR the `tid2eid` token-id→expert HASH lookup
+that BYPASSES top-k → GATHER weights from the UNBIASED scores → renormalize → ×routed_scaling_factor),
+`ClampedSwiGLU` (`SiluAndMulWithClamp`: gate clamped max-only, up clamped both-sided,
+`gate·σ(α·gate)·(up+β)`). `deepseek_v4_moe.{h,cpp}`, `test_deepseek_v4_moe` **12/12·716** — hand-derived
+literals (sqrt∘softplus composition, bias-flips-selection-but-weight-stays-unbiased, the hash bypass,
+the asymmetric clamp) + from-first-principles double-precision references (router f32==f64 rel-L2 < 1e-5
++ exact ids; ClampedSwiGLU rel-L2 < 1e-6) + RED-first proven ALL THREE load-bearing levers: drop the
+sqrt fails 8/493, gather weights from the biased scores fails 2/181, symmetric-clamp the gate fails 2/6.
+Ported 1:1 from vLLM `fused_topk_bias_router.py:75-118` (`_topk_softplus_sqrt_torch`) +
+`activation.py:197-201`, cross-checked SGLang `v0.5.15` `moe/{topk.py, hash_topk.py}`. REUSE not
+re-port: the shared grouped-GEMM / 256-expert / shared-expert / NVFP4 machinery is untouched (only
+scoring+hash+clamp are net-new); MegaMoE is SM100-only so GB10 mirrors the FusedMoE-fallback router.
+Honest gate form: host-reference + hand-case + structural review, NOT a dumped-oracle rel-L2
+(fixed-config 167B not constructible tiny). No OPEN QUESTIONS (every constant grounded). SACRED-inert
+(no existing forward touched; `test_deepseek_v4_mhc` 14/14·125, `test_deepseek_v4_compressor` 12/12·164,
+`test_deepseek_v4_dsa` 13/13·38, `test_deepseek_v4_scaffold` 4/4·40 unchanged). CPU Debug build (the
+same voxtral `-O2` false positive; new TUs `-Wall -Werror -Wextra`-clean). The full-model speed gate
+remains multi-Spark-blocked (156.7 GiB); the device kernels (reuse the existing grouped-GEMM) +
+forward-assembly (W7), strict gate (W8) are named residuals. New kernel row
+`KERNEL-MOE-SQRTSOFTPLUS-HASH` (`SPIKE`). No source/engine path touched.
+
+**DeepSeek-V4-Flash W7 forward assembly (2026-07-29, `CLAIM-DEEPSEEK-V4-W7`, NOT
+pushed).** Disposition: **NOT APPLICABLE (structural/composition brick, host CPU forward
+assembly + structural unit gate; no run, no download, no throughput number taken,
+claimed, or owed; `benchmark_binding=false`).** The `VT_CHECK(false, "W3-W8 pending")`
+stub is replaced by a REAL `DeepseekV4Model::Forward` (`DeepseekV4ForwardHost`) that
+composes the four landed host primitives (W3 DSA/MLA seams, W4 compressor + fp8_ds_mla
+KV, W5 MHC + Sinkhorn, W6 sqrtsoftplus/hash MoE) into an end-to-end logits producer on
+the portable CPU path at a small synthetic config, grounded 1:1 in
+`nvidia/model.py:1080-1148` + `:866-957`. `deepseek_v4.{h,cpp}`, `test_deepseek_v4_forward`
+**6/6·26** — STRUCTURAL/composition: finite logits end-to-end + deterministic + shape
+`[T,vocab]`; MHC stream `[T,hc,H]`; hash layers route by `tid2eid` (`layer_hash_routed
+{1,1,0,0}`) vs gated top-k; DSA indexer SELECTS + compressor POOLS; `logits_indices`
+gather; RED-first PROVEN 3 levers (all-gated hash, skip-final-MhcPost, no-sink each
+change the output). Honest 3-state: DERIVED + BUILD-VERIFIED (structural) — does NOT
+claim V4 "runs" a real model (documented tiny-vs-167B divergences: W=2 compressor window,
+full-latent MLA value, single rope_theta, 1-block quant). SACRED-inert (only
+`deepseek_v4.{h,cpp}` + new test + CMake; shared MLA/MoE + W3-W6 primitive TUs empty-diff;
+prior V4 tests 4/40 + 13/38 + 12/164 + 14/125 + 12/716 unchanged). CPU Debug build (the
+same voxtral `-O2` false positive; new TU `-Wall -Werror -Wextra`-clean). No new kernel
+row / no checker bump. The full-model speed + strict token gate remain multi-Spark-blocked
+(156.7 GiB); the device kernels (reuse the existing grouped-GEMM) + `ForwardDevice`
+(W7-device), the real-tower materialization (W2b), the strict gate (W8), and the
+single-Spark IQ2_XXS-GGUF `blk.N.*` name map (W2, download-blocked) are named residuals.
+No source/engine run path executed.
+
+**KDA (Kimi Delta Attention) kernel delta W1 (2026-07-28, `CLAIM-KDA-KERNEL`, NOT
+pushed).** Disposition: **NOT APPLICABLE (correctness/kernel-primitive brick, host CPU
+reference + unit gate; no run, no download, no throughput number taken, claimed, or
+owed; `benchmark_binding=false`).** Ported + unit-gated the four gated-linear-attention
+pieces KDA adds on top of plain GDN: the per-channel `[H,D]` low-rank decay (`f_a`/`f_b`
+bottleneck), the decay gate `-exp(A_log)·softplus` (+ its chunk-cumsum `RCP_LN2` variant),
+the sigmoid-gated output norm `FusedRMSNormGated`, the three q/k/v short convs and the q/k
+L2-norm (`kimi_kda.{h,cpp}`, `test_kimi_kda` 14/14·36, clean CPU `-Wall -Werror -Wextra`).
+Honest gate form: hand-derived literals + double-precision references (rel-L2 < 1e-6), NOT
+a dumped-oracle rel-L2 — KDA subclasses GDN so its recurrence is reused, and the REAL e2e
+gate is the DGX-blocked Kimi-Linear-48B-A3B proxy vs the pinned oracle (the 2.8T Kimi-K3
+does not fit one GB10). Additive/GDN-inert (`cuda_gdn.cu`/`gdn_attn.cpp` untouched ⇒ the
+Qwen3.6-27B/35B GDN gate is byte-identical by construction). The KDA CUDA device kernel +
+the proxy e2e gate are named residuals. Shared unblocker for Kimi-Linear-48B and Kimi-K3
+(W4). No source/engine compute path touched.
+
 **Kimi K3 W0 SCOPE spike (2026-07-28, `CLAIM-KIMI-K3-SCOPE`, NOT pushed).**
 Disposition: **NOT APPLICABLE (scoping spike; no build, no run, no download, no
-measurement taken, claimed, or owed; `benchmark_binding=false`).** Scopes
+measurement taken, claimed, or owed; `benchmark_binding=false`).** (2026-07-29
+registry-metadata fix — `KimiK3ForConditionalGeneration` outer wrapper
+`has_inner_state=false` + `test_model_registry` drift repaired — is likewise
+NOT APPLICABLE: metadata + test hygiene only, no build/run/measurement owed.) Scopes
 `KimiK3ForConditionalGeneration` (released 2026-07-27, beyond the pin) — a 2.8T MoE
 whose text backbone is the Kimi-Linear KDA+MLA+MoE hybrid scaled to H=7168 / 93
 layers (69 KDA + 24 MLA) / 896 experts, MXFP4 + MoonViT-V2 vision. It **does not fit**
@@ -598,6 +790,19 @@ priority-ranked (TP → EP → PP → DP → SP → context). Adds the mode rows
 HW-blocked exactly as scale-out (no ≥2-GPU box here); no engine speed number
 exists or is owed. Spec: [parallelism-modes.md](../.agents/specs/parallelism-modes.md).
 No source/engine path touched.
+
+**Scale-out W2 — same-host multi-GPU TP (CPU-gated) + NCCL derive-and-ship
+(2026-07-28, `CLAIM-SCALE-OUT-W2`, NOT pushed).** Disposition: **NOT APPLICABLE
+(infra / correctness brick; `benchmark_binding=false`; no speed number owed per
+the spec §Gates).** W2 landed the multi-device backend registry, collective
+`OpId` routing, the NCCL transport (mirrors `pynccl.py`, built only under
+`-DVLLM_CPP_NCCL=ON` — NOT built/run here, no ≥2-GPU box), and `TensorParallel`
+wired into the Qwen3-dense forward. Gated by `tests/vt/test_tp_forward.cpp` (60/60,
+RED-verified): a TP-2 sharded-matmul + all-reduce == the unsharded tp=1 forward
+over the CPU communicator, NO GPU. `tp_size==1` is byte-identical (zero extra vt::
+ops), so the single-GPU decode/prefill hot path is untouched — no throughput
+delta possible. A real TP-2 speed comparison is owed only once the transport runs
+on a ≥2-GPU host (W3+).
 
 **SGLang PERF oracle STOOD UP + first floor MEASURED (2026-07-28,
 `CLAIM-SGLANG-PERF-BENCH`, NOT pushed).** Disposition: **MEASURED + REPRODUCED —
@@ -931,6 +1136,28 @@ a standalone driver). The dgx TTFT/TPOT vs the mm oracle is owed only once that
 forward is folded into `ModelRegistry::Forward` (recipe in
 `.agents/specs/mm-serving.md`). Reproduce: `cmake --build build-cpu --target
 test_chat_mm server && ./build-cpu/tests/test_chat_mm`.
+
+**ROAD-V1-MM engine mm-forward integration — the fold into `ModelRegistry::Forward`
+(2026-07-28, `CLAIM-ENGINE-MM-FORWARD`, NOT pushed).** Disposition: **NOT APPLICABLE
+for a throughput A/B this pass (architectural correctness landing, `benchmark_binding=
+false`; single-sequence gate driver, no batched/serving compute path).** Multimodal
+now runs THROUGH the engine's registered forward: `ModelForwardInput` gains an
+additive default-nullopt `mm` field, `Qwen3VLForConditionalGeneration` is
+`REGISTER_VLLM_MODEL`-registered, and the registered forward folds the M2c decode via
+the shared `Qwen3VLForwardStepLastLogits`. Gate is TOKEN-EXACTNESS + text inertness,
+not speed: GPU `test_qwen3vl_registry_e2e` (dgx.casa GB10, cached Qwen3-VL-4B,
+`flock $HOME/gpu.lock`) runs image→text THROUGH `ModelRegistry::Forward` and matches
+the M2c golden **32/32 STRICT** (RED-first — unregistered ⇒ resolve throws); the M2c
+standalone `test_qwen3vl_e2e` holds 32/32 (the StepFn refactor is byte-neutral); text
+inertness `test_runner` 16/16 + `test_scheduler` 36/36 + `test_model_registry` 24/24 +
+`test_chat_mm` 8/8 + `test_openai_serving` 41/41 all green (nullopt-for-text ⇒
+byte-identical). The mm-forward SPEED (image TTFT/TPOT vs the mm oracle through the
+batched serving loop) is owed only once the FULL in-runner scheduler-fed tower run +
+the server `/v1/chat/completions` GPU e2e land (named residual). Reproduce (dgx):
+git-archive the commit → `dgx.casa`, `export PATH=/usr/local/cuda/bin:$PATH`,
+`cmake -B build-cuda -DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_CUDA_ARCHITECTURES=121a`,
+`flock $HOME/gpu.lock ./build-cuda/tests/test_qwen3vl_registry_e2e`.
 
 **ROAD-V1-C8 production endpoint wiring (2026-07-28, `CLAIM-C8-SERVE-PROD-WIRING`,
 NOT pushed).** Disposition: **NOT APPLICABLE (no throughput number,
@@ -8908,3 +9135,53 @@ number is only available on a Qwen3/dense k-quant that BOTH engines already load
 `qwen3_5_gguf_weights.cpp` ∩ the plugin's tested Qwen3 support), not DeepSeek-V4. IQ2_XXS
 port source = llama.cpp `ggml-quants.c` `dequantize_row_iq2_xxs` + `iq2xxs_grid` codebook.
 `benchmark_binding=false`.
+
+**Reasoning parsers `SAMPLE-REASONING` W0 spike + W1 brick (2026-07-28,
+`CLAIM-SAMPLE-REASONING`, NOT pushed).** Disposition: **NOT APPLICABLE (serving
+text-parse, off the GPU hot path; no throughput number owed;
+`benchmark_binding=false`).** W0 committed the spike `specs/reasoning-parsers.md`
+(the `ReasoningParser` contract, upstream's ~28-name registry, the coverage gap
+vs our landed seam, tests, gates, W-breakdown) and backfilled the row (the
+`<think>` reasoning/content split seam was already shipped but `SAMPLE-REASONING`
+still read INVENTORIED). W1 added `identity` + `deepseek_v3`/`holo2` thinking-gated
+delegates (7→9 registered names), gated by `test_deepseek_v3` (ports
+`tests/reasoning/test_deepseekv3_reasoning_parser.py`: thinking-gated selection +
+identity passthrough + no-think edge, RED-first) on a CPU `-Werror` build. A
+reasoning parser is a device-neutral pure function of the detokenized stream — the
+correctness oracle is the upstream test case, not a benchmark; an e2e
+`reasoning_content` check on a live `<think>` model is a follow-on.
+## Pooling task class W0 spike + W1 pooler op (2026-07-28, `CLAIM-POOLING`) - NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE (`benchmark_binding=false`) - a scoping
+spike plus a CPU pooler-OP unit brick; no engine forward, no token, no
+throughput.** HIGH-priority feature-gap #2 (the non-generative pooling task
+class: embeddings / classify / score / rerank). W0 committed the full spike
+(`.agents/specs/pooling-task-class.md`) over vLLM's pooling surface - the
+`Pooler` abstraction, the pooling runner, the `tasks.py` taxonomy, the
+`/v1/embeddings` + score/rerank/classify endpoints, and a concrete pooling
+model - with the exact port map, tests, gates, and W-breakdown. W1 landed the
+pooler OP on the CPU backend: the sequence pooling methods `CLSPool`/`LastPool`/
+`MeanPool` (+ `GetSeqPoolingMethod`) and the activation heads
+`PoolerIdentity`/`PoolerNormalize`/`PoolerMultiLabelClassify`/`PoolerClassify`,
+mirrored 1:1 from `vllm/model_executor/layers/pooler/{seqwise/methods,activations}.py`
+and `vllm/v1/pool/metadata.py` @ `555967922`. Gate is the `test_pooler` doctest
+unit suite vs DOUBLE-PRECISION references (CLS/LAST exact gathers; MeanPool and
+the activations recomputed in double, float-tolerance compared), RED-first
+(disabling the MeanPool division / the PoolerNormalize denominator fails the
+arithmetic subcases). No correctness-vs-oracle or throughput number is owed or
+claimed by a pooler-op unit brick - the pooling RUNNER + a concrete pooling
+model (W3) carry the future oracle cosine-parity gate, named in the spec.
+Reproduction: `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release;
+cmake --build build-cpu --target test_pooler -j"$(nproc)"; ./build-cpu/tests/test_pooler`.
+## MXFP4 compressed-tensors quant path W0/W1 (2026-07-28) - NOT APPLICABLE (`benchmark_binding=false`)
+
+The MXFP4 (`mxfp4-pack-quantized`) W1 brick is a CPU weight-dequant REFERENCE
+(`mxfp4_dequant.{h,cpp}`: E2M1 unpack + E8M0 `2^(byte-127)` group-32 scale, no
+global scale), not a compute or throughput path. Gate is correctness-only:
+`test_mxfp4_dequant` 5 cases / 1142 assertions vs a double-precision `dq_mxfp4_torch`
+port (RED-first: bias-128 mutation fails 446 assertions). No throughput number is
+owed. The GPU W4A4 fp4xfp4 GEMM (FlashInfer W4A4 on GB10 with cute-dsl, else Marlin
+W4A16) is a named later brick and is where a benchmark binding will attach once the
+scheme wiring + a fitting MXFP4 checkpoint land. `benchmark_binding=false`.
+
+**DeepSeek-V4-Flash W7-device — CUDA kernels for the 4 new op families (2026-07-29, `CLAIM-DEEPSEEK-V4-W7-DEVICE`, NOT pushed).** Disposition: **NOT APPLICABLE (correctness-grade structural CUDA kernels + `ForwardDevice` wiring; unit-gated on the DGX GB10 vs the landed host references at small shape; per-op host round-trip, NOT a fused/perf path; `benchmark_binding=false`).** The four NEW V4 op families (MHC Sinkhorn/pre/post/head; DSA indexer weight-fold + weighted-MQA ReLU logits + causal top-k + attention-sink softmax + grouped output-LoRA; compressor pool+norm + save-APE + fp8_ds_mla KV encode/decode; sqrtsoftplus/hash router + clamped SwiGLU) are ported to CUDA (`src/vt/cuda/cuda_deepseek_v4.cu`), registered through the OpProvider seam (`kDeepseekV4{Mhc,Dsa,Compressor,Moe}`), and dispatched by a real `DeepseekV4Model::ForwardDevice`. **DGX GB10 (sm_121a) `test_cuda_deepseek_v4` 11/11 cases · 153 assertions GREEN** — BIT-EXACT top-k/router ids, near-tie rel-L2 < 1e-4 for the fp reductions, fp8_ds_mla within e4m3 granularity + bf16 rope bit-exact, and the ForwardDevice composition gate (device == host, rel-L2 < 2e-3). **compute-sanitizer memcheck 0 errors.** RED-first proven (drop sqrt → 3/6 fail). CUDA + CPU `-Werror` clean. The 512-wide MLA attn + expert grouped-GEMM REUSE the existing NVFP4/FP8 kernels (not re-ported). A throughput number is only owed once the real checkpoint runs end-to-end (W8, multi-Spark: 156.7 GiB NVFP4 does not fit ONE GB10) — a NAMED residual, along with W2b tower materialization and the single-Spark IQ2_XXS-GGUF `blk.N.*` name-map.

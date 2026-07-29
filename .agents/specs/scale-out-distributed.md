@@ -319,14 +319,15 @@ ONE abstraction, three transports — mirroring vLLM's `device_communicators`:
   multi-Spark RoCE, and MLX-ring (kMETAL) transports; the one-`Backend*`-per-
   DeviceType registry (`backend.cpp:42`) + device-0 hardcoding
   (`cuda_backend.cu:297-299`); and real TP/PP in the model forwards.
-- **W2 — TP forward + loader (`BACKEND-DISTRIBUTED-TP`):** shard the merged-weight
-  memcpy (`dense_weight_loaders.h:131-138`) + divide heads (`dense_attn_block.h`)
-  + insert all-reduce after o_proj (`:530`) and MLP down (`qwen3.cpp:90`); MoE EP
-  in the expert loop. Gate: sharded ≡ unsharded token-exact (needs W1 + a CPU
-  multi-proc harness, or the 2-GPU box).
+- **W2 — TP forward + loader (`BACKEND-DISTRIBUTED-TP`): DONE (2026-07-28,
+  CPU-gated + NCCL derive-and-ship, `CLAIM-SCALE-OUT-W2`).** See **§W2 result**
+  below.
 - **W3 — NCCL transport (`BACKEND-DISTRIBUTED-COMM`/CUDA):** provider TU on
   `kCUDA`, comm per-`CudaBackend`, multi-device registry (unblock
   `cuda_backend.cu:297-299` + the index-0 shims). Gate: 2-GPU all-reduce.
+  **W2 already landed the multi-device registry + the NCCL provider TU
+  (derive-and-ship, build-verify pending on a NCCL host)** — W3 residual is the
+  per-op `cudaSetDevice` device-affinity + the real 2-GPU run.
 - **W4 — PP (`BACKEND-DISTRIBUTED-PP`):** stage split + point-to-point send/recv +
   multi-worker executor fan-out (`executor.cpp`). Gate: 2-stage ≡ 1-stage.
 - **W5 — multi-Spark (`BACKEND-DISTRIBUTED-MULTINODE-SPARK`):** cross-host
@@ -335,6 +336,83 @@ ONE abstraction, three transports — mirroring vLLM's `device_communicators`:
 - **W6 — MLX ring (`BACKEND-DISTRIBUTED-MLX-RING`):** provider TU on `kMETAL`
   beside `metal_mlx_provider.mm`, `mlx.core.distributed` ring/JACCL over
   Thunderbolt. Gate: 2-Mac all-reduce + MLX-LM `--num-shards` competitor arm.
+
+## W2 result (2026-07-28, `CLAIM-SCALE-OUT-W2`, CPU-gated + NCCL derive-and-ship)
+
+Base `main` `308c312a`. Additive; `world_size==1`/`tp_size==1` byte-identical
+(proven). NOT pushed. What landed:
+
+1. **Multi-device backend registry** (`src/vt/backend.cpp:42`, `include/vt/backend.h`).
+   The one-`Backend*`-per-`DeviceType` table became a per-`Device{type,index}`
+   grid (`kMaxDevicesPerType=16`); new `RegisterBackend(Device,…)` /
+   `GetBackend(Device)` / `RegisterDeviceResourceOps(Device,…)` overloads make
+   device 0..N-1 addressable. **Byte-neutral for device 0**: `Device{type,0}` is
+   the SAME slot the type-level API reads/writes, so `GetBackend(type) ==
+   GetBackend(Device{type,0})` (identical `Backend*`) — proven by
+   `tests/vt/test_backend_multidevice.cpp` (14 assertions). The CUDA registrar
+   (`cuda_backend.cu:284`) now registers every GPU at its own slot (device-0
+   hardcode gone). RESIDUAL: per-op `cudaSetDevice` affinity so a device-i backend
+   allocates/launches on GPU i (single-GPU index-0 is correct as-is; HW-gated).
+2. **Collective `OpId` routing** (deferred from W1). Added `OpId::kAllReduce/
+   kAllGather/kSend/kRecv` (`include/vt/ops.h`); the `vt::Communicator` methods now
+   dispatch through `GetOp(OpId, queue.device.type)` so a backend SUPPLIES the
+   transport (`CommAllReduceFn` etc., `include/vt/communicator.h`). The CPU
+   in-process reduce is registered on kCPU; `test_communicator` still passes 50/50
+   THROUGH the OpId path.
+3. **NCCL transport (kCUDA), derive-and-ship** (`src/vt/cuda/nccl_communicator.cu`,
+   CMake `VLLM_CPP_NCCL` OFF by default). `NcclCommunicator` mirrors
+   `PyNcclCommunicator` (`pynccl.py`): `ncclCommInitRank` (`:129-139`),
+   `ncclAllReduce` (`:166-188`), `ncclAllGather` (`:196-215`), `ncclSend`
+   (`:305-323`), `ncclRecv` (`:332-350`), stream-ordered on `q.handle`; registered
+   as the kCUDA collective providers. **Honest signal: NOT built here** (no CUDA
+   toolchain / no ≥2-GPU box) — it is a CUDA TU compiled only under
+   `-DVLLM_CPP_NCCL=ON` on a NCCL host; without the flag the TU is a named stub and
+   `GetOp(kAllReduce,kCUDA)` stays unresolved (a CUDA TP run fails LOUDLY, not
+   silently). Build-verify + run = W3 residual.
+4. **TP in the Qwen3-dense forward** (`include/vllm/model_executor/models/
+   tensor_parallel.h`). `TpAllReduceSum` after o_proj (`dense_attn_block.h`, both
+   the bf16 and NVFP4 paths) and after MLP-down (`qwen3.cpp` `MlpBlock`);
+   `TpShard` column-shards the merged BF16 weight at the loader chokepoint
+   (`dense_weight_loaders.h:131`). All via an optional `const TensorParallel* tp =
+   nullptr`, so every existing caller (and every SACRED text model) is unchanged —
+   `tp==nullptr`/`tp_size==1` enqueues ZERO extra vt:: ops and takes the whole-
+   tensor shard, i.e. byte-identical (structurally guaranteed + full CPU suite
+   green + `test_tp_forward` tp=1 inertness case).
+
+**The real gate (no GPU): `tests/vt/test_tp_forward.cpp` — 60/60 PASS.** A TP-2
+MLP (`y = relu(x @ W1ᵀ) @ W2ᵀ`) split ColumnParallel(W1)→no-comm,
+RowParallel(W2)→all-reduce over the W1 CPU communicator, asserted **equal to the
+unsharded tp=1 forward** on every rank (+ the ColumnParallel shard-concat sanity).
+**RED-verified**: removing the all-reduce fails 24/60 assertions (the partial
+product ≠ the full result). This certifies the TP wiring algebra WITHOUT a GPU.
+
+### Same-host multi-GPU recipe (2× RTX 6000 Ada / A6000 in one box)
+
+The reachable Leg-1 target (discrete GPUs over PCIe/NVLink). To run the real TP-2
+once the transport is built and per-device affinity lands (W3):
+
+1. **Build:** `cmake -DVLLM_CPP_CUDA=ON -DVLLM_CPP_NCCL=ON …` on a host with
+   `nccl.h` + `libnccl` (the same NCCL vLLM links). This compiles
+   `nccl_communicator.cu` and registers the kCUDA collective providers.
+2. **Launch:** one worker PROCESS (or thread) per GPU — ranks 0 and 1 bound to
+   `Device{kCUDA,0}` / `Device{kCUDA,1}` (both now in the registry). Mirrors vLLM's
+   `MultiprocExecutor` one-proc-per-local-GPU (`multiproc_executor.py:176`).
+3. **NCCL init:** rank 0 calls `ncclGetUniqueId`, broadcast it to rank 1 out-of-band
+   (a tiny TCP/pipe handshake, exactly `pynccl.py` broadcasting the id on the CPU
+   group), then each rank `ncclCommInitRank(comm, /*world=*/2, id, rank)` →
+   construct an `NcclCommunicator(comm, rank, 2)`.
+4. **tp-size:** hand each rank a `TensorParallel{&nccl_comm}` (`tp_size()==2`); the
+   Qwen3-dense forward then column-shards gate_up/qkv, row-shards o_proj/down, and
+   all-reduces after o_proj + MLP-down — the SAME code the CPU gate exercises, only
+   the transport swapped (CPU in-process → NCCL). Correctness bar: sharded forward
+   **token-exact** vs the single-GPU golden (strict where vLLM is deterministic,
+   near-tie distributional otherwise).
+
+**HW-run residual (honest):** no ≥2-GPU box exists here, so the NCCL build-verify
+and the TP-2 token-exact run are UNEXECUTED; the CPU 2-rank `tp==tp1` equality is
+the correctness evidence that stands today. Also residual: QKV head-aware KV
+replication (`linear.py:1076-1079`), vocab/LM-head + MoE-EP sharding, and the
+per-op `cudaSetDevice` affinity.
 
 ## Risks / decisions
 

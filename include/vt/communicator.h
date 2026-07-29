@@ -75,6 +75,24 @@ class Communicator {
                     int peer) = 0;
 };
 
+// --- OpProvider-routed collective data planes (BACKEND-DISTRIBUTED-COMM W2) ----
+// The collectives are dispatched through OpProvider/OpId (kAllReduce/kAllGather/
+// kSend/kRecv, vt/ops.h) keyed on the queue's DeviceType, so a backend SUPPLIES
+// the transport: the CPU in-process group registers these on kCPU, an NCCL
+// provider registers them on kCUDA (nccl_communicator.cu), MLX-ring on kMETAL.
+// The bound Communicator (which owns rank/world + the rendezvous machinery) is
+// passed as the first argument; the fn performs the device-specific data
+// movement. Mirrors vLLM keying its DeviceCommunicatorBase per device
+// (cuda_communicator.py / cpu_communicator.py). Type-erased through the same
+// `void*` OpProvider::fn every op uses (RegisterOp / GetOp, include/vt/ops.h).
+using CommAllReduceFn = void (*)(Communicator&, Queue&, void*, size_t, DType,
+                                 ReduceOp);
+using CommAllGatherFn = void (*)(Communicator&, Queue&, const void*, void*,
+                                 size_t, DType);
+using CommSendFn = void (*)(Communicator&, Queue&, const void*, size_t, DType,
+                            int);
+using CommRecvFn = void (*)(Communicator&, Queue&, void*, size_t, DType, int);
+
 // In-process multi-rank CPU transport: N ranks live as N Communicator objects in
 // ONE process, sharing a barrier + staging buffers + a point-to-point mailbox —
 // no IPC. This is the cleanest correctness gate for the collectives (the spec's

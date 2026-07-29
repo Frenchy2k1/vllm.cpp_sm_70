@@ -1,8 +1,11 @@
 // vllm.cpp original GGUF-format dequant loader (porting-inventory.md §9
 // deviation). Ported byte-for-byte from llama.cpp @
 // 237ad9b961f009ae19ac29dbce4cd0c1251f94b3:
-//   ggml/src/ggml-common.h  (block_q4_0/q8_0/q3_K/q4_K/q5_K/q6_K layouts)
-//   ggml/src/ggml-quants.c  (dequantize_row_* + get_scale_min_k4).
+//   ggml/src/ggml-common.h  (block_q2_K/q4_0/q8_0/q3_K/q4_K/q5_K/q6_K +
+//                            block_iq2_xxs layouts)
+//   ggml/src/ggml-quants.c  (dequantize_row_* + get_scale_min_k4). Q2_K (10)
+//                            and IQ2_XXS (16) are the ~2-bit DeepSeek-V4-Flash
+//                            GGUF vehicles (UD-Q2_K_XL / UD-IQ2_XXS).
 // The BLOCK decoders themselves now live one layer down in vt
 // (src/vt/cpu/cpu_quant_dequant.cpp) and are shared with the compute-in-quant
 // GEMM; this file keeps the GGUF-facing validation, the unquantized types, and
@@ -103,10 +106,12 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
     }
     case 2:    // Q4_0
     case 8:    // Q8_0
+    case 10:   // Q2_K
     case 11:   // Q3_K
     case 12:   // Q4_K
     case 13:   // Q5_K
-    case 14: {  // Q6_K
+    case 14:   // Q6_K
+    case 16: {  // IQ2_XXS (~2-bit codebook; UD-IQ2_XXS DeepSeek-V4 vehicle)
       // The block decoders moved to vt (src/vt/cpu/cpu_quant_dequant.cpp) so
       // the loader oracle and the compute-in-quant GEMM's generic fallback
       // share ONE implementation. The code is byte-identical to what lived

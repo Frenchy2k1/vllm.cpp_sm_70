@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <string>
 #include <stdexcept>
@@ -632,6 +633,76 @@ BlockHasher get_request_block_hasher(int hash_block_size,
 
     return new_block_hashes;
   };
+}
+
+std::pair<int, int> resolve_kv_cache_block_sizes(
+    const KVCacheConfig& kv_cache_config, int cache_block_size,
+    std::optional<int> prefix_match_unit, bool enable_prefix_caching,
+    bool connector_enabled, int dcp_world_size) {
+  const std::vector<KVCacheGroupSpec>& groups = kv_cache_config.kv_cache_groups;
+
+  if (groups.size() <= 1) {
+    const int bs = cache_block_size * dcp_world_size;
+    return {bs, bs};
+  }
+
+  // Attention groups are scaled by DCP; mamba groups keep their full per-rank
+  // state and are not scaled. Mirrors kv_cache_utils.py:653-658.
+  std::vector<int> group_block_sizes;
+  group_block_sizes.reserve(groups.size());
+  for (const KVCacheGroupSpec& g : groups) {
+    const KVCacheSpec* spec = g.kv_cache_spec.get();
+    if (dynamic_cast<const AttentionSpec*>(spec) != nullptr) {
+      group_block_sizes.push_back(spec->block_size * dcp_world_size);
+    } else {
+      group_block_sizes.push_back(spec->block_size);
+    }
+  }
+  int scheduler_block_size = group_block_sizes[0];
+  for (size_t i = 1; i < group_block_sizes.size(); ++i) {
+    scheduler_block_size = std::lcm(scheduler_block_size, group_block_sizes[i]);
+  }
+
+  // Block hashes are only consumed by prefix caching and KV connectors; when
+  // neither is active, keep hash_block_size equal to the scheduler block size.
+  // (kv_cache_utils.py:661-666)
+  if (!(enable_prefix_caching || connector_enabled)) {
+    return {scheduler_block_size, scheduler_block_size};
+  }
+
+  // Mamba groups with block_size != cache_block_size (mamba_cache_mode !=
+  // "align") break divisibility; back off to the scheduler block size.
+  // (kv_cache_utils.py:668-676)
+  for (const KVCacheGroupSpec& g : groups) {
+    const MambaSpec* m = dynamic_cast<const MambaSpec*>(g.kv_cache_spec.get());
+    if (m != nullptr && m->block_size != cache_block_size) {
+      return {scheduler_block_size, scheduler_block_size};
+    }
+  }
+
+  int hash_block_size;
+  if (prefix_match_unit.has_value()) {
+    hash_block_size = *prefix_match_unit;
+  } else {
+    hash_block_size = group_block_sizes[0];
+    for (size_t i = 1; i < group_block_sizes.size(); ++i) {
+      hash_block_size = std::gcd(hash_block_size, group_block_sizes[i]);
+    }
+  }
+  for (int bs : group_block_sizes) {
+    if (bs % hash_block_size != 0) {
+      std::string sizes;
+      for (size_t i = 0; i < group_block_sizes.size(); ++i) {
+        if (i > 0) sizes += ", ";
+        sizes += std::to_string(group_block_sizes[i]);
+      }
+      throw std::invalid_argument(
+          "Invalid prefix_match_unit=" + std::to_string(hash_block_size) +
+          "; all KV cache group block sizes must be divisible by "
+          "prefix_match_unit. Got group block sizes=[" + sizes + "].");
+    }
+  }
+  return {scheduler_block_size, hash_block_size};
 }
 
 void KVCacheBlock::set_block_hash(BlockHashWithGroupId block_hash,

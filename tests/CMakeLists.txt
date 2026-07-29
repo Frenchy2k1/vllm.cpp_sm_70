@@ -24,11 +24,13 @@ endfunction()
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
+vllm_cpp_add_test(test_punica_cpu vllm/lora/test_punica_cpu.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
 vllm_cpp_add_test(test_safetensors vllm/test_safetensors.cpp)
 vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)
 vllm_cpp_add_test(test_nvfp4_dequant vllm/test_nvfp4_dequant.cpp)
 vllm_cpp_add_test(test_awq_gptq_dequant vllm/test_awq_gptq_dequant.cpp)
+vllm_cpp_add_test(test_mxfp4_dequant vllm/test_mxfp4_dequant.cpp)
 vllm_cpp_add_test(test_ct_nvfp4_emulation vllm/test_ct_nvfp4_emulation.cpp)
 vllm_cpp_add_test(test_gguf_dequant vllm/test_gguf_dequant.cpp)
 vllm_cpp_add_test(test_gguf_nvfp4 vllm/test_gguf_nvfp4.cpp)
@@ -91,11 +93,55 @@ vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffol
 # gated vs hand-derived cases + double-precision references. Full-model gate is
 # multi-Spark-blocked (156.7 GiB); MHC/MoE are W5/W6 (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_dsa vllm/models/test_deepseek_v4_dsa.cpp)
+
+# DeepSeek-V4-Flash W4: the DSA COMPRESSOR forward (softmax-weighted window pool
+# + save-time APE add + RMSNorm) + the fp8_ds_mla KV-cache state layout (448 fp8
+# UE8M0 + 64 bf16 rope, 576B stride) unit-gated vs hand-derived cases +
+# double-precision references. Full-model gate is multi-Spark-blocked (156.7 GiB);
+# MHC/MoE/device-kernel are W5/W6/W7 (.agents/specs/deepseek-v4-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_compressor vllm/models/test_deepseek_v4_compressor.cpp)
+# DeepSeek-V4-Flash W5 — Manifold/Markov Hyper-Connections (MHC): the Sinkhorn-
+# normalized hc_mult-stream residual manifold + mHC pre/post mixes + hc_head
+# collapse + folded RMSNorms. Ported from the vLLM eager reference
+# (mhc/torch.py + triton.py, 4 upstream impls agree) + gated against a
+# from-first-principles double-precision derivation. Full-model gate multi-Spark-
+# blocked; MoE/device-kernel are W6/W7 (.agents/specs/deepseek-v4-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_mhc vllm/models/test_deepseek_v4_mhc.cpp)
+# DeepSeek-V4-Flash W6 — the sqrtsoftplus + hash-routed MoE: the V4 router score
+# function (sqrt∘softplus), the noaux_tc bias-for-selection top-k, the hash
+# `tid2eid` route that bypasses top-k, and the clamped SwiGLU expert activation.
+# Ported from the vLLM eager reference (fused_topk_bias_router.py + activation.py,
+# cross-checked SGLang) + gated against hand-derived literals and double-precision
+# references. Full-model gate multi-Spark-blocked (156.7 GiB); device-kernel +
+# forward assembly are W7 (.agents/specs/deepseek-v4-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_moe vllm/models/test_deepseek_v4_moe.cpp)
+# DeepSeek-V4-Flash W7 — the DeepseekV4Model::Forward ASSEMBLY: composes the four
+# landed host primitives (W3 DSA/MLA seams, W4 compressor + fp8_ds_mla KV, W5 MHC
+# + Sinkhorn, W6 sqrtsoftplus/hash MoE) into an end-to-end logits producer at a
+# tiny synthetic config. STRUCTURAL/composition gate (interleave runs, [T,hc,H]
+# stream, hash-by-tid routing, DSA select+compress, finiteness) + RED-first
+# miswires — NOT a real-checkpoint token gate (that is W8, multi-Spark, 156.7 GiB).
+vllm_cpp_add_test(test_deepseek_v4_forward vllm/models/test_deepseek_v4_forward.cpp)
+# DeepSeek-V4-Flash W7-DEVICE — the four NEW V4 op families' CUDA kernels
+# (src/vt/cuda/cuda_deepseek_v4.cu, dispatched through the OpProvider seam) each
+# unit-gated vs its landed HOST reference at small shape + the ForwardDevice
+# composition gate (device forward == host forward, near-tie). The device cases
+# SKIP on a CPU-only build; on the DGX GB10 they are the RUNTIME evidence the
+# kernels match the references. NOT a real-checkpoint token gate (W8, multi-Spark).
+vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
 # K3 is beyond the pinned oracle (.agents/specs/kimi-k3.md).
 vllm_cpp_add_test(test_kimi_k3_scaffold vllm/models/test_kimi_k3_scaffold.cpp)
+
+# KDA (Kimi Delta Attention) net-new gated-linear-attention primitives — host
+# reference + unit gate (KERNEL-KDA-DELTA). Shared unblocker for Kimi-Linear-48B
+# and Kimi-K3 (W4). Hand-derived literal cases + double-precision references over
+# the per-channel [H,D] low-rank decay, the sigmoid-gated output norm, the 3 q/k/v
+# short convs and q/k L2-norm. Full-model gate is the Kimi-Linear-48B proxy
+# (DGX-blocked); mirrors the DSA lane (.agents/specs/kda-kernel-delta.md).
+vllm_cpp_add_test(test_kimi_kda vllm/models/test_kimi_kda.cpp)
 
 # MLA CAMPAIGN W8 (DeepSeek-V2-Lite, DeepseekV2ForCausalLM) — the SACRED MLA
 # greedy correctness gate: drives a compact prompt battery through the paged
@@ -129,6 +175,7 @@ vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
 vllm_cpp_add_test(test_detokenizer vllm/test_detokenizer.cpp)
 vllm_cpp_add_test(test_request vllm/test_request.cpp)
 vllm_cpp_add_test(test_kv_cache_utils vllm/v1/test_kv_cache_utils.cpp)
+vllm_cpp_add_test(test_prefix_match_unit vllm/v1/test_prefix_match_unit.cpp)
 vllm_cpp_add_test(test_kv_cache_interface vllm/v1/test_kv_cache_interface.cpp)
 vllm_cpp_add_test(test_block_pool vllm/v1/test_block_pool.cpp)
 vllm_cpp_add_test(test_kv_events vllm/v1/test_kv_events.cpp)
@@ -170,6 +217,12 @@ vllm_cpp_add_test(test_gemma4_vision_tower vllm/multimodal/test_gemma4_vision_to
 target_include_directories(test_gemma4_vision_tower PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_definitions(test_gemma4_vision_tower PRIVATE
   GEMMA4_VISION_REF_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/gemma4_e4b_image/vision_refs")
+# CLAIM-GEMMA4-MM-E2E: the STRICT image->text token-exact gate THROUGH the ENGINE
+# registered mm-forward (ModelRegistry::Forward). dgx-only (CUDA + cached E4B).
+vllm_cpp_add_test(test_gemma4_registry_e2e vllm/multimodal/test_gemma4_registry_e2e.cpp)
+target_include_directories(test_gemma4_registry_e2e PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(test_gemma4_registry_e2e PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 # Gemma-4 G3: USM-Conformer audio-tower per-stage faithfulness gate (subsample ->
 # rel-pos-enc -> N conformer layers -> output_proj -> projected vs the dumped
 # transformers-eager refs). Host f32, no GPU. Weights via VLLM_GEMMA4_AUDIO_WEIGHTS
@@ -190,6 +243,13 @@ target_compile_definitions(test_qwen3vl_text PRIVATE
 # skipped (VLLM_QWEN3VL_CKPT or the default HF cache path).
 vllm_cpp_add_test(test_qwen3vl_e2e vllm/multimodal/test_qwen3vl_e2e.cpp)
 target_compile_definitions(test_qwen3vl_e2e PRIVATE
+  MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
+  TEXT_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_text")
+# MM-ENGINE-FORWARD — the SAME STRICT image->text token-exact gate driven THROUGH
+# the ENGINE registered forward (ModelRegistry::Forward → ForwardQwen3VL...), the
+# engine-mm-forward closing gate. GPU + Qwen3-VL-4B checkpoint required, else skipped.
+vllm_cpp_add_test(test_qwen3vl_registry_e2e vllm/multimodal/test_qwen3vl_registry_e2e.cpp)
+target_compile_definitions(test_qwen3vl_registry_e2e PRIVATE
   MM_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl"
   TEXT_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/qwen3vl_text")
 # M3-b — STRICT image->text token-exact on the Qwen3.6-27B GDN-hybrid gate model
@@ -297,6 +357,8 @@ vllm_cpp_add_test(test_chunked_local_attention
   vllm/v1/attention/test_chunked_local_attention.cpp)
 vllm_cpp_add_test(test_rotary_embedding
   vllm/model_executor/layers/rotary_embedding/test_rotary_embedding.cpp)
+vllm_cpp_add_test(test_pooler
+  vllm/model_executor/layers/pooler/test_pooler.cpp)
 vllm_cpp_add_test(test_gdn_metadata_builder vllm/v1/attention/test_gdn_metadata_builder.cpp)
 vllm_cpp_add_test(test_mtp_speculator vllm/v1/spec_decode/test_mtp_speculator.cpp)
 vllm_cpp_add_test(test_rejection_sampler vllm/v1/spec_decode/test_rejection_sampler.cpp)
@@ -395,6 +457,8 @@ vllm_cpp_add_test(test_reasoning_step3
   vllm/entrypoints/openai/reasoning_parsers/test_step3.cpp)
 vllm_cpp_add_test(test_reasoning_olmo3
   vllm/entrypoints/openai/reasoning_parsers/test_olmo3.cpp)
+vllm_cpp_add_test(test_reasoning_deepseek_v3
+  vllm/entrypoints/openai/reasoning_parsers/test_deepseek_v3.cpp)
 vllm_cpp_add_test(test_tool_parser_xlam
   vllm/entrypoints/openai/tool_parsers/test_xlam_tool_parser.cpp)
 vllm_cpp_add_test(test_tool_parser_phi4mini
@@ -547,6 +611,16 @@ vllm_cpp_add_test(test_reference_tier vt/test_reference_tier.cpp)
 vllm_cpp_add_test(test_communicator vt/test_communicator.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(test_communicator PRIVATE Threads::Threads)
+# Scale-out W2 (scale-out-distributed.md §W2): the tensor-parallel CORRECTNESS
+# gate with NO GPU — sharded-matmul + RowParallel all-reduce == the unsharded
+# tp=1 forward, through the ACTUAL W2 helpers (TpShard/TpAllReduceSum) over the
+# W1 CPU communicator; RED-first (a dropped all-reduce is the wrong partial).
+vllm_cpp_add_test(test_tp_forward vt/test_tp_forward.cpp)
+target_link_libraries(test_tp_forward PRIVATE Threads::Threads)
+# Scale-out W2 multi-device backend registry: Device{type,index} addressability
+# and the byte-neutral device-0 proof (a second backend at index 1 leaves index 0
+# and the type-level API identical). Hardware-free (a fake backend on kXPU).
+vllm_cpp_add_test(test_backend_multidevice vt/test_backend_multidevice.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 # QUANT-GGUF-CIQ-GEMM G1: block dtypes, the quant traits table and its

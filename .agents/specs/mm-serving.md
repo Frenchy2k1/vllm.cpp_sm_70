@@ -223,3 +223,50 @@ Closing the GPU gate (the exact residual, DGX GB10 + Qwen3-VL-4B checkpoint):
 - **GPU closing gate (`MM-SERVE-E2E`):** DEFERRED — architecturally blocked on the
   engine mm-forward (above), not on the DGX being unavailable. The CPU seam body is
   wired + gated; the forward integration is the named residual.
+
+## MM-ENGINE-FORWARD — the block is RESOLVED (2026-07-28, `CLAIM-ENGINE-MM-FORWARD`)
+
+The three-point architectural block above is CLOSED. Multimodal now runs through the
+engine's REGISTERED forward (`ModelRegistry::Forward`), not only the standalone
+`Qwen3VLGenerateGreedy` driver.
+
+1. **`ModelForwardInput` gains a vision field.** `MultiModalForwardInput`
+   (`model_registry.h`) carries the ALREADY-MERGED host bf16 inputs_embeds, the 3-D
+   MRoPE positions `[3,T]`, and the DeepStack `[L,T,H]` (borrowed handles); it hangs
+   off `ModelForwardInput` as `std::optional<MultiModalForwardInput> mm =
+   std::nullopt`. ADDITIVE + default-nullopt ⇒ every TEXT step leaves it nullopt, the
+   registered text forwards never read it, and the shared runner path is
+   byte-identical **by construction** (proven: `test_runner` 16/16 + `test_scheduler`
+   36/36 + `test_model_registry` 24/24 + `test_chat_mm` 8/8 + `test_openai_serving`
+   41/41, all green).
+2. **The M2c forward is FOLDED into the registered per-step contract.**
+   `VLForwardLastLogits` is exposed as the shared `Qwen3VLForwardStepLastLogits`;
+   `VLGenerateCore` is refactored to a shared `VLStepFn` driven by BOTH the standalone
+   driver AND `Qwen3VLGenerateGreedyViaRegistry`. The registered `ForwardQwen3VL...`
+   consumes `input.mm` and calls the SAME step ⇒ registered == standalone numerically,
+   no duplicated decode. `Qwen3VLGenerateGreedyViaRegistry` (the engine mm-forward
+   entry the MM-SERVE seam uses) drives every step through `ModelRegistry::Forward`.
+3. **Qwen3-VL is REGISTERED.** `REGISTER_VLLM_MODEL(qwen3_vl,
+   "Qwen3VLForConditionalGeneration", …)` in the new `qwen3_vl_registry.cpp`
+   (`supports_multimodal=true`, non-hybrid dense backbone, full-attention KV spec).
+   The registered LoadedModel owns the persistent cos|sin MRoPE cache (built with the
+   SAME RopeArgs/Pmax as the driver ⇒ bit-identical).
+
+**GPU closing gate (this pass):** `test_qwen3vl_registry_e2e` (dgx.casa GB10 +
+cached `Qwen3-VL-4B-Instruct`) runs image→text THROUGH `ModelRegistry::Forward` and
+asserts token-exact vs the M2c golden `gen_tokens_i32.bin` (STRICT, K-deterministic),
+RED-first (unregistered ⇒ `Resolve` throws). Recipe: git-archive the commit →
+`dgx.casa`, `export PATH=/usr/local/cuda/bin:$PATH`,
+`cmake -B build-cuda -DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_CUDA_ARCHITECTURES=121a`,
+`flock $HOME/gpu.lock ./build-cuda/tests/test_qwen3vl_registry_e2e`.
+
+**Named residual (still open):** (a) the FULL in-runner path — `runner.cpp` reading
+`Request.mm_features`, running the tower via the `EncoderCacheManager`, and building
+the `mm` field from staged encoder outputs for the BATCHED scheduler loop (this pass
+drives the registered forward via `Qwen3VLGenerateGreedyViaRegistry`, single-sequence,
+so batched-runner mm + cross-step per-request MRoPE-delta state is the residual);
+(b) the real server `/v1/chat/completions` GPU e2e (the W3 seam → the registered
+forward end-to-end); (c) video / multi-image / audio / Gemma-4-image through the
+registered path. README's "not yet wired into the OpenAI server end-to-end" line is
+now RESOLVABLE for the registered-forward half.

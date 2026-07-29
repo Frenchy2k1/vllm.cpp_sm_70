@@ -50,9 +50,63 @@ MATRICES = {
     # attention family above which score ALL keys. W3 landed a portable host
     # reference + unit gate; the device kernel is a W7 residual. `SPIKE`,
     # `CLAIM-DEEPSEEK-V4-W3`, spec specs/deepseek-v4-flash.md).
+    # 39 since 2026-07-28: +`KERNEL-KDA-DELTA` (the Kimi Delta Attention gated-
+    # linear-attention delta vs plain GDN — the per-channel [H,D] low-rank decay
+    # (f_a/f_b bottleneck), the sigmoid-gated output norm (FusedRMSNormGated), the
+    # 3 q/k/v short convs + q/k L2-norm. A genuinely new gated-linear-attention
+    # family distinct from GDN, which has only a per-head scalar decay and no gated
+    # output norm; SUBCLASSES GDN so its recurrence is REUSED, not re-ported. W1
+    # landed a portable host reference + unit gate; the device kernel + the
+    # Kimi-Linear-48B proxy e2e gate are named residuals. Shared unblocker for
+    # Kimi-Linear-48B and Kimi-K3 (W4). `SPIKE`, `CLAIM-KDA-KERNEL`, spec
+    # specs/kda-kernel-delta.md).
+    # 40 since 2026-07-29: +`KERNEL-ATTN-DSA-COMPRESSOR` (the DeepSeek-V4 DSA
+    # COMPRESSOR — the softmax-weighted window POOL that compresses
+    # `(1+overlap)*compress_ratio` KV-state rows into one compressed latent (per
+    # head-dim-column softmax, then RMSNorm) + the fused save-time APE add + the
+    # fp8_ds_mla KV-cache STATE layout (448 fp8 UE8M0 per-64 block scales + 64
+    # bf16 rope, 576B token stride, 7+1 scale bytes). A genuinely separate op from
+    # `KERNEL-ATTN-DSA-SPARSE-INDEX` (which SELECTS keys): this one POOLS +
+    # QUANTIZES the selected/windowed KV into the latent the MLA reads and how it
+    # is cached across steps. W4 landed a portable host reference + unit gate; the
+    # device kernel (the fused `_fused_kv_compress_norm_rope_insert_sparse_attn`)
+    # is a W7 residual. `SPIKE`, `CLAIM-DEEPSEEK-V4-W4`, spec
+    # specs/deepseek-v4-flash.md).
+    # 41 since 2026-07-29: +`KERNEL-MHC-SINKHORN` (the DeepSeek-V4 Manifold/Markov
+    # Hyper-Connections topology — the `[tokens, hc_mult, hidden]` residual
+    # manifold mixed by a 20-iteration Sinkhorn-normalized doubly-stochastic
+    # matrix, the mHC pre/post mixes with the FOLDED attn/ffn RMSNorms, and the
+    # hc_head collapse). A genuinely new residual-stream topology distinct from the
+    # plain residual+RMSNorm every other family uses. W5 landed a portable host
+    # reference + unit gate (ported from the vLLM eager reference mhc/torch.py —
+    # correcting the W0 "no eager reference" premise — and gated against a from-
+    # first-principles double-precision Sinkhorn derivation); the device kernel +
+    # DeepseekV4Model::Forward assembly are W7 residuals. `SPIKE`,
+    # `CLAIM-DEEPSEEK-V4-W5`, spec specs/deepseek-v4-flash.md).
+    # 42 since 2026-07-29: +`KERNEL-MOE-SQRTSOFTPLUS-HASH` (the DeepSeek-V4 MoE
+    # router + clamped-SwiGLU deltas — the `sqrt(softplus(·))` score function, the
+    # noaux_tc bias-for-selection top-k with weights gathered from the UNBIASED
+    # scores, the hash `tid2eid` token-id→expert route that BYPASSES top-k, and the
+    # asymmetric clamped SwiGLU expert activation `SiluAndMulWithClamp`). The three
+    # genuinely-new-vs-V2/V3 MoE pieces; the shared grouped-GEMM / expert / shared-
+    # expert machinery is REUSED, not re-ported. W6 landed a portable host reference
+    # + unit gate; the device kernels + DeepseekV4Model::Forward assembly are W7
+    # residuals. `SPIKE`, `CLAIM-DEEPSEEK-V4-W6`, spec specs/deepseek-v4-flash.md).
+    # 43 since 2026-07-29: +`KERNEL-DSV4-W7-DEVICE` (the DeepSeek-V4-Flash W7-DEVICE
+    # CUDA kernels — the four NEW V4 op families' device kernels: MHC Sinkhorn+pre/
+    # post+head, DSA indexer weight-fold/MQA-logits/causal-topk + sink softmax +
+    # grouped output-LoRA, compressor pool+norm + fp8_ds_mla KV encode/decode, and
+    # the sqrtsoftplus/hash router + clamped SwiGLU. Each a 1:1 device port of the
+    # landed host reference (KERNEL-{MHC-SINKHORN,ATTN-DSA-SPARSE-INDEX,ATTN-DSA-
+    # COMPRESSOR,MOE-SQRTSOFTPLUS-HASH}) registered through the OpProvider seam and
+    # RUNTIME-VERIFIED on the DGX GB10 at small shape vs its host-ref oracle (11/11
+    # cases · 153 assertions, compute-sanitizer memcheck 0 errors, RED-first proven).
+    # The 512-wide MLA attn + expert grouped-GEMM REUSE the existing NVFP4/FP8
+    # kernels — NOT re-ported. `IMPL`, `CLAIM-DEEPSEEK-V4-W7-DEVICE`, spec
+    # specs/deepseek-v4-flash.md; real-checkpoint e2e stays W8, multi-Spark).
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 38),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 43),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -120,7 +174,20 @@ ENGINE_PREFIXES = (
 # Distinct again: a separate draft checkpoint with its own llama.cpp `dflash` arch
 # contract, plus a shared-head coupling to the target that `SPEC-MTP-GGUF` does not
 # have. `READY`, spiked.
-ENGINE_ROWS = 124
+# 125 since 2026-07-28: +`ENG-POOLER-SEQ` (the non-generative POOLER OP — the
+# sequence pooling methods CLS/LAST/MEAN + the normalize/classify activation heads
+# that turn hidden states into a pooled embedding/logit row instead of a sampled
+# token). HIGH-priority feature-gap #2 (pooling task class); a genuinely-new
+# engine capability, W1 CPU brick landed + unit-gated. `ACTIVE`, `CLAIM-POOLING`,
+# spec `specs/pooling-task-class.md`. Bumped for a real new row, never to make a
+# failing state transition pass. (`SERVE-POOLING-ENDPOINTS` INVENTORIED→SPIKE in
+# the same change is a state move on the existing row, not a new row.)
+# 126 since 2026-07-28: +`KV-PREFIX-MATCH-UNIT` (`--prefix-match-unit` / config
+# `prefix_match_unit`, NEW in vLLM 0.26). A distinct capability: the fine-grained
+# prefix-cache matching unit (`resolve_kv_cache_block_sizes` -> `hash_block_size`),
+# not covered by the `KV-PREFIX-CACHE` block-hash row (which hashes at
+# `block_size`). W0 spike + W1 resolver landed; `PARTIAL`.
+ENGINE_ROWS = 126
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

@@ -238,6 +238,35 @@ enum class OpId : uint8_t {
   // `_insert_resampled_kernel` (:828-841). See vt::GreedyRejectionSample.
   // Additive: nothing on the non-speculative path calls it.
   kGreedyRejectionSample,
+  // --- Collective transport ops (BACKEND-DISTRIBUTED-COMM W2) -----------------
+  // The vt::Communicator collectives, deferred from W1 (a direct method was the
+  // cleaner W1 gate; W2 routes them through OpProvider so a backend SUPPLIES the
+  // transport — CPU in-process reduce, NCCL on kCUDA, MLX-ring on kMETAL). Each
+  // is dispatched on the queue's DeviceType and hands the bound Communicator its
+  // device-specific data plane. Mirrors DeviceCommunicatorBase.all_reduce:215 /
+  // all_gather:219 / send:321 / recv:328 (base_device_communicator.py). See
+  // vt::CommAllReduceFn (include/vt/communicator.h). Additive: nothing on the
+  // world_size==1 single-GPU path dispatches them (the collective returns before
+  // the lookup — parallel_state.py:638 bypass).
+  kAllReduce,
+  kAllGather,
+  kSend,
+  kRecv,
+  // --- DeepSeek-V4-Flash device kernels (W7-device) --------------------------
+  // The four NEW V4 op families' CUDA kernels (MHC Sinkhorn+pre/post+head, DSA
+  // Lightning-Indexer+seams, Compressor pool+fp8_ds_mla KV, sqrtsoftplus/hash
+  // router+clamped SwiGLU), registered through the OpProvider seam so
+  // DeepseekV4Model::ForwardDevice can dispatch them. Each OpId's `fn` points at
+  // a family kernels-struct (deepseek_v4_device.h) of typed device launchers,
+  // each a 1:1 CUDA port of the landed portable HOST reference
+  // (deepseek_v4_{mhc,dsa,compressor,moe}.{h,cpp}) it is unit-gated against. The
+  // 512-wide MLA attention + expert grouped-GEMM REUSE the existing kernels
+  // (kMlaDecodeAttention / kMoeGroupedGemmNvfp4) and are NOT re-ported. Additive:
+  // nothing outside the V4 device forward dispatches them.
+  kDeepseekV4Mhc,
+  kDeepseekV4Dsa,
+  kDeepseekV4Compressor,
+  kDeepseekV4Moe,
   kCount
 };
 

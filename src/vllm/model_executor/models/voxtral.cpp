@@ -229,6 +229,15 @@ void BuildPaddedDecodeAttn(int64_t S, const std::vector<int32_t>& tok,
                            CommonAttentionMetadata& am_out) {
   const int64_t cols = am.block_table_num_cols;
 
+  // GCC-13 `-O2 -Werror=array-bounds` FALSE POSITIVE (project issue #155): with
+  // S>=B guaranteed by the caller (padded decode, B<=S), these std::copy calls
+  // into the freshly-sized-to-S `*_out` buffers can never overrun, but GCC-13's
+  // -O2 inliner mis-derives a `[0,4]`-byte bound for the memmove and errors. The
+  // suppression is scoped to exactly this builder's in-bounds copies; a comment,
+  // not a broad -Wno. (Advances #155; unrelated to the W7-device change.)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
   tok_out.assign(static_cast<size_t>(S), 0);
   pos_out.assign(static_cast<size_t>(S), 0);
   std::copy(tok.begin(), tok.end(), tok_out.begin());
@@ -246,6 +255,7 @@ void BuildPaddedDecodeAttn(int64_t S, const std::vector<int32_t>& tok,
   am_out.block_table_tensor.assign(static_cast<size_t>(S * cols), 0);
   std::copy(am.block_table_tensor.begin(), am.block_table_tensor.end(),
             am_out.block_table_tensor.begin());
+#pragma GCC diagnostic pop
   am_out.query_start_loc.resize(static_cast<size_t>(S + 1));
   for (int64_t i = 0; i <= S; ++i)
     am_out.query_start_loc[static_cast<size_t>(i)] = static_cast<int32_t>(i);

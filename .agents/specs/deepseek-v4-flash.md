@@ -537,3 +537,405 @@ math against. HOW it would be gated:
   cache + paged backend + the fp8_ds_mla KV insert (W4 device side), the device kernels for the W3
   primitives + folding them into `DeepseekV4Model::Forward` and the shared-mla extraction (W7), and
   the full strict/near-tie engine gate (W8) — all multi-Spark-blocked on one GB10.
+
+---
+
+## W4 — DSA COMPRESSOR forward + fp8_ds_mla KV-cache state (2026-07-29, `CLAIM-DEEPSEEK-V4-W4`)
+
+**Base:** current `main` HEAD `4d1be010` (`git rev-parse HEAD`). Isolated worktree, CPU-only,
+foreground, NOT pushed. Continues the W3 host-reference lane: the full-model gate is multi-Spark-
+blocked (156.7 GiB, does not fit one GB10; the forward also needs MHC + the sqrtsoftplus/hash MoE),
+so W4 lands the FORWARD CODE for the second half of the DSA sparse-attention stack + UNIT-gates it.
+
+### W4.1 What landed (additive, SACRED-inert)
+New TUs `include/vllm/model_executor/models/deepseek_v4_compressor.h` +
+`src/vllm/model_executor/models/deepseek_v4_compressor.cpp` — portable HOST (CPU) references for the
+two things W4 owns, each ported 1:1 with `file:line` on both sides (vLLM primary, SGLang v0.5.15
+cross-reference):
+
+- **(A) the DSA COMPRESSOR forward** — where W3's Lightning-Indexer SELECTS keys, the compressor
+  POOLS + normalizes them into the compressed latent the MLA reads:
+  - `CompressorSaveScoreApe` <- `common/ops/save_partial_states.py:92-101` — the fused save-time APE
+    add `score_state[t,d] = score[t,d] + ape[positions[t] % compress_ratio, d]` (the kv half is
+    stored verbatim; only the score half gets the position-embedding add, which is why it is fused
+    into the state write).
+  - `CompressorPoolNorm` <- `common/ops/fused_compress_quant_cache.py:198-218` (cross-checked vs
+    SGLang `dsv4/fused_compress_triton.py` `_fused_ape_pool_norm_rope_kernel:57-95`) — the softmax-
+    weighted window POOL: `softmax(score, dim=0)` INDEPENDENTLY PER head-dim column, weighted sum of
+    the window's kv → compressed latent, then RMSNorm (fp32). **The per-column softmax is the load-
+    bearing nuance** — each head-dim channel pools the `(1+overlap)·compress_ratio` window with its
+    OWN weights, not one shared attention weight per row; a unit case pins it (a column whose score
+    strongly favors one window row diverges from a uniform column in a way only per-column softmax
+    produces, and the ratio survives RMSNorm).
+
+- **(B) the fp8_ds_mla KV-CACHE STATE layout** — how the compressed latent is written to / read from
+  the paged cache across steps:
+  - `MakeFp8DsMlaLayout` <- `compressor.py:307-309` (`_quant_block=64`, `_token_stride=nope+rope*2=
+    576`, `_scale_dim = nope//64 + 1 = 8`); geometry cross-checked vs SGLang `dsv4/dequant_k_cache.py
+    :12-18` (`DIM_NOPE=448`, `TILE_SIZE=64`): per token 448 fp8 NoPE + 64 bf16 RoPE = 576 contiguous
+    bytes, then a padded 7+1 UE8M0 scale region.
+  - `Fp8DsMlaEncodeToken` <- `fused_compress_quant_cache.py:238-297` store side — per 64-wide NoPE
+    block: bf16-round (the kernel casts fp32→bf16→fp32), per-block `absmax` (clamped ≥1e-4), UE8M0
+    power-of-two scale `exponent = ceil(log2(absmax/448))`, `inv_scale = 2^-exponent`, `clamp(q·
+    inv_scale, ±448)` → e4m3; the stored scale byte `= clamp(exponent + 127, 0, 255)`. RoPE part →
+    bf16 verbatim (the forward RoPE that precedes it on GPU reuses our decoupled-RoPE machinery — a
+    W3/W7 seam — so this reference round-trips the bytes and leaves the rotation to W7).
+  - `Fp8DsMlaDecodeToken` <- the paged-KV READ, `SGLang dsv4/dequant_k_cache.py:122-136`:
+    `nope[d] = e4m3→f32(byte[d]) · 2^(scale_byte[block]-127)`, `rope[j] = bf16→f32`. Reuses the
+    landed host helpers `F32ToF8E4M3`/`F8E4M3ToF32` (nvfp4 path) + `vt::F32ToBF16`/`BF16ToF32`.
+
+### W4.2 Gate (unit, honest) — hand-case + structural review, NOT a dumped-oracle rel-L2
+Same honest bar as W3 (the fixed-config 167B arch cannot be constructed at a tiny shape, nor run —
+it does not fit one GB10). `tests/vllm/models/test_deepseek_v4_compressor.cpp`: **12/12 cases · 164
+assertions GREEN** on a CPU Debug full-library build, 0-warn on the new TUs. Hand-derived literal
+cases: APE modulo-wrap (`pos 3, cr 2 → ape row 1`); pool = `softmax(score,dim=0)·kv` then RMSNorm;
+window masking excludes out-of-range rows; per-column softmax load-bearing (column ratio survives
+RMSNorm); V4 layout `448/64/576/7+1`; all-ones NoPE block → UE8M0 byte `119` + exact round-trip;
+value-3 block → byte `120`; bf16 rope verbatim. Randomized double-precision references: pool+norm
+rel-L2 < 1e-6; an INDEPENDENT recompute of every UE8M0 scale byte; encode→decode round-trip < 0.05
+(honest fp8-granularity bound, not 1e-6 — e4m3 carries 3 mantissa bits). **RED-first PROVEN:**
+perturbing the scale bias `+127→+126` fails 4 cases / 135 assertions; revert restores 12/12·164.
+CAVEAT: the CPU gate uses `-DCMAKE_BUILD_TYPE=Debug` because a pre-existing GCC-13 `-O2`
+`-Werror=array-bounds` false positive in `voxtral.cpp` (unrelated to these TUs) breaks the `-O2`
+full-library build; the new TUs themselves are `-Wall -Werror -Wextra`-clean.
+
+### W4.3 SACRED inertness
+Additive ONLY. Zero edits to any existing forward — in particular the shared DeepSeek-V2 MLA
+(`mla_attention.{h,cpp}`, `cuda_mla_attn.cu`) has an EMPTY diff. Proof: `test_deepseek_v4_dsa` still
+13/13·38, `test_deepseek_v4_scaffold` 4/4·40. The only non-additive edits are the two CMake source/
+test wiring lines, the new `KERNEL-ATTN-DSA-COMPRESSOR` kernel-matrix row (+ its checker count bump
+39→40), and the record surfaces.
+
+### W4.4 Landed-vs-residual
+- **Landed (W4):** the DSA compressor pool+norm + save-time APE + the fp8_ds_mla KV-state read/write
+  layout — host references + unit gate; `KERNEL-ATTN-DSA-COMPRESSOR` (`SPIKE`).
+- **Residual:** the compressor STATE-CACHE gather addressing (the `head_offset` overlap window
+  indexing into the paged state, the two-stage cr≥128 split, `CompressorMetadata`/`CompressorBackend`
+  paging) is a W7 device-integration concern — W4's host reference feeds the ASSEMBLED window so the
+  gate isolates the pool/quant compute (`fused_compress_quant_cache.py:169-196` address arithmetic is
+  named, not ported). Still residual: MHC (W5), sqrtsoftplus/hash MoE (W6), the fused device kernel
+  (`_fused_kv_compress_norm_rope_insert_sparse_attn`) + `DeepseekV4Model::Forward` integration +
+  shared-mla extraction (W7), the strict/near-tie engine gate (W8) — all multi-Spark-blocked.
+
+---
+
+## W5 — Manifold/Markov Hyper-Connections (MHC) forward + Sinkhorn (2026-07-29, `CLAIM-DEEPSEEK-V4-W5`)
+
+**Base:** current `main` HEAD `d0bc0f41` (`git rev-parse HEAD`). Isolated worktree `/home/mudler/_git/vllm.cpp-w5-mhc`,
+CPU-only, foreground, NOT pushed. Continues the W3/W4 host-reference lane: the full-model gate is
+multi-Spark-blocked (156.7 GiB, does not fit one GB10; the forward still needs the sqrtsoftplus/hash
+MoE (W6) + device assembly (W7)), so W5 lands the FORWARD CODE for the MHC residual topology — the
+single hardest V4 brick per the W0 scope — + UNIT-gates it.
+
+### W5.0 EAGER-REFERENCE FINDING — corrects the W0/model-matrix "no eager reference" premise
+The W0 scope and the model-matrix row assert MHC has "ZERO numerical tests and no eager reference
+upstream" (the reason it was flagged the hardest correctness item). **That premise is CORRECTED
+here.** The pinned vLLM SHIPS an eager PyTorch reference for the mHC kernels:
+- `vllm/model_executor/kernels/mhc/torch.py` — `mhc_pre_torch` (`:6-91`) + `mhc_post_torch` (`:94-106`);
+- `vllm/model_executor/kernels/mhc/triton.py` — `hc_head_reduce_triton_kernel` (`:108-140`), the
+  head collapse eager math (`rmsnorm_nw` + linear + sigmoid + weighted reduce).
+
+These are the canonical numerics the TileLang / Triton / CUDA / AITER kernels all match. Moreover
+**four independent upstream implementations agree byte-for-byte on the Sinkhorn**: `torch.py:75-82`,
+`tilelang_kernels.py:126-153` (`_sinkhorn_fwd`), `tilelang.py` (`mhc_pre_big_fuse_with_norm`), and
+SGLang `v0.5.15` `python/sglang/srt/layers/mhc.py:110-126` (`hc_split_sinkhorn_kernel`). So the
+numerics are UNAMBIGUOUS. Per the brief we still ALSO derive an INDEPENDENT double-precision Sinkhorn
+from first principles (alternating row/column normalization toward a doubly-stochastic matrix) and
+prove the port agrees — the eager ref pins the exact eps/axis conventions, the derived ref proves the
+port is not a transcription of a bug.
+
+### W5.1 What landed (additive, SACRED-inert)
+New TUs `include/vllm/model_executor/models/deepseek_v4_mhc.h` +
+`src/vllm/model_executor/models/deepseek_v4_mhc.cpp` — portable HOST (CPU) references for the four
+MHC pieces, each ported 1:1 with `file:line` on BOTH sides (vLLM primary, SGLang v0.5.15 cross-ref):
+
+- **`MhcSinkhorn`** <- `torch.py:75-82`. The `hc_sinkhorn_iters`(=20) Sinkhorn of the hc_mult×hc_mult
+  mixing matrix: seed `M = softmax(logits, dim=-1) + eps` (row softmax over k, +eps), col-norm
+  `M /= (Σ_j M + eps)`, then `(iters-1)× [row-norm M/=(Σ_k M+eps), col-norm M/=(Σ_j M+eps)]`. The `+eps`
+  is on the softmax-seed NUMERATOR and every normalization DENOMINATOR (exactly as all four upstream
+  impls). With eps=0 it converges to a doubly-stochastic matrix; the AXIS ALTERNATION + ITERATION
+  COUNT are load-bearing at non-converged counts.
+- **`MhcPre`** <- `torch.py:56-91` (`mhc_pre_torch`) + the fold from `tilelang.py`
+  `mhc_pre_big_fuse_with_norm`. Flatten the streams, `mixes = residual_flat @ fn.T`, folded weight-free
+  RMSNorm `mixes *= rsqrt(sqrsum/(hc·H)+rms_eps)`, then `pre=σ(mixes[:hc]·s0+b)+hc_pre_eps`,
+  `post=σ(mixes[hc:2hc]·s1+b)·hc_post_mult(2.0)`, `comb=Sinkhorn(mixes[2hc:]·s2+b)`,
+  `layer_input=Σ_j pre[j]·residual[j]`, and (optional) the FOLDED attn/ffn RMSNorm
+  `layer_input *= rsqrt(mean(layer_input²)+norm_eps)·norm_weight`. Constants
+  `hc_post_alpha=2.0`, `hc_pre_eps=hc_sinkhorn_eps=hc_eps` @ `nvidia/model.py:818-821,:886-894`.
+- **`MhcPost`** <- `torch.py:94-106` (`mhc_post_torch`). `new[j,h] = Σ_i comb[i,j]·residual[i,h] +
+  post[j]·x[h]` — the einsum `"ij,ih->jh"` (comb mix, SUMS over the first index i) + the post gate add.
+- **`HcHeadCollapse`** <- `triton.py:108-140` + `tilelang.py:720-748` (`hc_head_fused_kernel_tilelang`).
+  The final collapse of the hc_mult streams to one hidden: weight-free RMSNorm(rms_eps) → `hc_head_fn`
+  [hc,hc·H] projection → `pre=σ(mixes·hc_head_scale+hc_head_base)+hc_eps` → `out[h]=Σ_m pre[m]·x[m,h]`.
+  `hc_head_scale` is the SCALAR [1] `nvidia/model.py:1038`; the model's final RMSNorm(weight) that
+  follows is a separate standard norm, not folded here.
+
+### W5.2 Gate (unit, honest) — DERIVED-eager-reference + hand-case + structural review
+Same honest bar as W3/W4 (the fixed-config 167B arch cannot be constructed at a tiny shape, nor run —
+it does not fit one GB10; and — the brief's premise — upstream ships no GOLDEN numerical test even
+though it ships an eager reference). `tests/vllm/models/test_deepseek_v4_mhc.cpp`: **14/14 cases · 125
+assertions GREEN** on a CPU Debug full-library build, `-Wall -Werror -Wextra` 0-warn on the new TUs.
+Hand-derived literal cases: all-zero Sinkhorn → uniform doubly-stochastic 1/hc; symmetric-2×2 fixed
+point `[[.75,.25],[.25,.75]]`; iteration-count load-bearing (iters=1 col-sums=1 but row-sums≠1 vs
+iters=20 both=1); MhcPre fn=0 → gate midpoints (pre=0.5, post=1.0, comb=0.5, layer_input=Σ0.5·res);
+the RMSNorm fold `[1,3]→[1,3]/√5`; MhcPost identity-comb + post-add (`25/37`); the mix sums over the
+first comb index (uniform comb → stream mean); hc_head fn=0 → stream mean. From-first-principles
+DOUBLE-PRECISION references: Sinkhorn / MhcPre / MhcPost / HcHead f32==f64 rel-L2 < 1e-5..1e-4;
+Sinkhorn doubly-stochastic convergence (row+col sums=1 within 1e-4 at eps=0). **RED-first PROVEN BOTH
+levers:** perturbing the Sinkhorn iteration count (`iters-1→iters-2`) fails 1 case / 9 assertions AND
+swapping a normalization axis (col-norm sum over the wrong index) fails 2 cases / 12 assertions —
+caught by a DEDICATED SMALL-iteration-count (2/3/5) f32==f64 gate, because at 20 iters the Sinkhorn
+has CONVERGED and ±1 iteration is within any tolerance (an honesty fix over a naive iters=20-only
+gate, which the first perturbation attempt silently PASSED — recorded so the lesson survives). Revert
+restores 14/14·125. CAVEAT: the CPU gate uses `-DCMAKE_BUILD_TYPE=Debug` because the pre-existing
+GCC-13 `-O2` `-Werror=array-bounds` false positive in `voxtral.cpp` (unrelated to these TUs) breaks
+the `-O2` full-library build; the new TUs themselves are `-Wall -Werror -Wextra`-clean.
+
+### W5.3 OPEN QUESTIONS / derivation assumptions (stated explicitly)
+- **bf16 storage rounding between steps is NOT modeled.** The model rounds `residual` and
+  `layer_input` to bf16 across attn/ffn boundaries (the mix/Sinkhorn compute stays fp32); these host
+  references stay in f32/f64 and leave bf16 storage rounding to the W7 device brick, exactly as W3/W4
+  left their RoPE/fp8 seams. The Sinkhorn/pre/post/head MATH is what W5 pins.
+- **Every resolved constant is grounded, none guessed.** `hc_post_alpha=2.0` (`model.py:821`),
+  `hc_pre_eps=hc_sinkhorn_eps=hc_eps` (both passed as `self.hc_eps`, `:886-894`), `hc_sinkhorn_iters`
+  from config (=20 in the W0 scope), `rms_norm_eps` (the mix + head RMSNorm eps), the attn/ffn
+  `norm_weight`/`norm_eps` fold (`mhc_pre_big_fuse_with_norm`), `hc_head_scale` scalar (`:1038`).
+- **First-layer stream EXPAND** ([T,H] embedding → [T,hc,H] manifold via `mhc_pre_broadcast_tilelang`
+  `fn_broadcast`) is a shape/broadcast op folded into the first decoder layer; it is a W7
+  forward-assembly seam, not a distinct numeric primitive, so it is NAMED here, not ported in W5.
+
+### W5.4 SACRED inertness
+Additive ONLY. Zero edits to any existing forward — MHC is a V4-only topology; the shared DeepSeek-V2
+MLA (`mla_attention.{h,cpp}`, `cuda_mla_attn.cu`) and the W3/W4 DSA/compressor TUs are UNTOUCHED
+(empty diff). Proof: `test_deepseek_v4_compressor` still 12/12·164, `test_deepseek_v4_dsa` 13/13·38,
+`test_deepseek_v4_scaffold` 4/4·40. The only non-additive edits are the two CMake source/test wiring
+lines, the new `KERNEL-MHC-SINKHORN` kernel-matrix row (+ its checker count bump 40→41), and the
+record surfaces.
+
+### W5.5 Landed-vs-residual
+- **Landed (W5):** the MHC hyper-connection expand/mix (`[T, hc_mult, H]` manifold) + the 20-iteration
+  Sinkhorn + the folded attn/ffn/head RMSNorms — host references + unit gate; `KERNEL-MHC-SINKHORN`
+  (`SPIKE`).
+- **Residual:** the device kernels (`mhc_pre`/`mhc_post`/`mhc_fused_post_pre`/`hc_head_fused` +
+  the bf16 residual storage) + folding MHC into `DeepseekV4Model::Forward` with the first-layer
+  stream expand + the per-layer attn/ffn interleave (W7); the sqrtsoftplus/hash MoE (W6); the
+  strict/near-tie engine gate (W8) — all multi-Spark-blocked on one GB10.
+
+---
+
+## W6 — the sqrtsoftplus + hash-routed MoE (2026-07-29, `CLAIM-DEEPSEEK-V4-W6`)
+
+**Base:** current `main` HEAD `5b843be5` (`git rev-parse HEAD`). Isolated worktree
+`/home/mudler/_git/vllm.cpp-w6-moe` (branch `deepseek-v4-w6-moe`), CPU-only, foreground, NOT pushed.
+Continues the W3/W4/W5 host-reference lane: the full-model gate is multi-Spark-blocked (156.7 GiB, does
+not fit one GB10; the forward still needs device assembly (W7)), so W6 lands the FORWARD CODE for the
+three genuinely-new MoE primitives + UNIT-gates them. Per the brief, the shared DeepSeek grouped-GEMM /
+256-expert / shared-expert / NVFP4 machinery is REUSED, not re-ported — only the NEW scoring + hash-route
++ clamp are net-new, so only those three land here.
+
+### W6.1 What landed (additive, SACRED-inert)
+New TUs `include/vllm/model_executor/models/deepseek_v4_moe.h` +
+`src/vllm/model_executor/models/deepseek_v4_moe.cpp` — portable HOST (CPU) references for the three
+things W6 owns, each ported 1:1 with `file:line` on BOTH sides (vLLM primary, SGLang v0.5.15 cross-ref):
+
+- **`SqrtSoftplus`** <- `fused_topk_bias_router.py:88` (`torch.sqrt(F.softplus(gating_output.float()))`).
+  The V4 router score `sqrt(softplus(x))`, `softplus(x)=log(1+exp(x))` (numerically stable
+  `max(x,0)+log1p(exp(-|x|))`), distinct from V2/V3's sigmoid/softmax `noaux_tc`. The sqrt∘softplus
+  COMPOSITION is the load-bearing nuance.
+- **`SqrtSoftplusRouteTopk`** <- `fused_topk_bias_router.py:75-118` (`_topk_softplus_sqrt_torch`, the
+  pure-PyTorch fallback = the eager reference the CUDA `topk_hash_softplus_sqrt` kernel matches) + the
+  hash branch `:100-106`; hash-table wiring `nvidia/model.py:562-578,:686,:696-717`; FusedMoE-fallback
+  router `nvidia/model.py:647-691`. Score every expert; add `e_score_correction_bias` for **SELECTION
+  ONLY**; either top-k by the biased score OR — for the first `num_hash_layers` HASH layers — the
+  `tid2eid` [vocab, topk] token-id→expert lookup that **BYPASSES top-k**; **GATHER the weights from the
+  UNBIASED scores** (using biased scores as weights flattens the distribution, `:90-96`); renormalize
+  `/max(Σ,1e-20)`; ×`routed_scaling_factor`. The bias-affects-selection-but-NOT-weights split + the hash
+  bypass are the two load-bearing nuances. Cross-checked SGLang `hash_topk.py:137-180` (`_forward_torch`,
+  identical tid2eid gather from unbiased scores) + `topk.py:1013-1014` (the score).
+- **`ClampedSwiGLU`** <- `activation.py:197-201` (`SiluAndMulWithClamp.forward_native`), used by
+  DeepseekV4MLP `nvidia/model.py:126-133`. `gate=clamp(·,max=limit)` (MAX only), `up=clamp(·,-limit,
+  +limit)` (BOTH sides), `out=gate·sigmoid(α·gate)·(up+β)`; DeepseekV4MLP passes α=1/β=0. The ASYMMETRIC
+  clamp (gate max-only vs up both-sided) is the load-bearing nuance.
+
+**NOT re-ported (REUSED):** the DeepSeek grouped-GEMM expert forward, the 256-expert w13/w2 layout, the
+shared-expert block, and the NVFP4/FP8 expert GEMMs are the existing DeepSeek-V2 MoE + NVFP4 machinery.
+**NOT ported (SM100-only, not the GB10 target):** MegaMoE (`DeepseekV4MegaMoEExperts`, requires
+major==10, `nvidia/model.py:307-315`) — W6 mirrors the FusedMoE-fallback router GB10 runs.
+
+### W6.2 Gate (unit, honest) — hand-case + structural review, NOT a dumped-oracle rel-L2
+Same honest bar as W3/W4/W5 (the fixed-config 167B arch cannot be constructed at a tiny shape, nor run —
+it does not fit one GB10). `tests/vllm/models/test_deepseek_v4_moe.cpp`: **12/12 cases · 716 assertions
+GREEN** on a CPU Debug full-library build; the new TUs are `-Wall -Werror -Wextra`-clean (verified by an
+explicit strict compile). Hand-derived literal cases: sqrt∘softplus composition (`softplus(x)=4 ⇒
+score=2`, distinct from softplus-alone=4 and raw-logit-sqrt); the bias flips the selection but the
+returned weight stays the UNBIASED 1.0 not the biased 3.0 (and without the bias the unbiased argmax is
+chosen — proving the bias changed the selection); renormalize divides by the unbiased weight sum;
+routed_scaling_factor multiplies; the hash `tid2eid` route picks {3,1} where top-k would pick {2,0};
+the asymmetric clamp keeps gate=-5 while clamping up to -2; gate max-clamp / up upper-clamp boundaries;
+alpha/beta. From-first-principles double-precision references: router f32==f64 rel-L2 < 1e-5 + EXACT ids
+across randomized shapes; SqrtSoftplus f64 + monotonicity; ClampedSwiGLU rel-L2 < 1e-6. **RED-first
+PROVEN all three levers:** dropping the sqrt fails 8 cases / 493 assertions; gathering the weights from
+the BIASED scores fails 2 cases / 181 assertions; symmetric-clamping the gate fails 2 cases / 6
+assertions; revert restores 12/12·716. Each lever is genuinely load-bearing (learning from W5: the
+composition case distinguishes sqrt∘softplus from softplus-alone AND from raw-logit-sqrt; the
+bias-selection case forces the weight to differ from the biased score; the asymmetry case forces gate
+and up to be clamped differently). CAVEAT: the CPU gate uses `-DCMAKE_BUILD_TYPE=Debug` because the
+pre-existing GCC-13 `-O2` `-Werror=array-bounds` false positive in `voxtral.cpp` (unrelated) breaks the
+`-O2` full-library build; the new TUs themselves are `-Wall -Werror -Wextra`-clean.
+
+### W6.3 OPEN QUESTIONS / derivation assumptions
+- **None unresolved — every constant grounded, none guessed.** The score, the bias-for-selection split,
+  the hash bypass, the renormalize `1e-20` floor, `routed_scaling_factor`, and the clamp α=1/β=0 defaults
+  are all read directly from the cited `file:line`.
+- **The device kernel's `is_padding` guard** (zeroes padded rows, `topk_hash_softplus_sqrt`) is a
+  device-batching concern — this host reference computes every real row and leaves padding to W7, exactly
+  as W3/W4/W5 left their device seams.
+
+### W6.4 SACRED inertness
+Additive ONLY. Zero edits to any existing forward — in particular the shared DeepSeek-V2 MoE router /
+grouped GEMM / shared experts have an EMPTY diff, and the W3/W4/W5 DSA/compressor/MHC TUs are untouched.
+Proof: `test_deepseek_v4_mhc` still 14/14·125, `test_deepseek_v4_compressor` 12/12·164,
+`test_deepseek_v4_dsa` 13/13·38, `test_deepseek_v4_scaffold` 4/4·40. The only non-additive edits are the
+two CMake source/test wiring lines, the new `KERNEL-MOE-SQRTSOFTPLUS-HASH` kernel-matrix row (+ its
+checker count bump 41→42), and the record surfaces.
+
+### W6.5 Landed-vs-residual
+- **Landed (W6):** the sqrtsoftplus router score + the noaux_tc bias-for-selection top-k + the `tid2eid`
+  hash route + the clamped SwiGLU expert activation — host references + unit gate;
+  `KERNEL-MOE-SQRTSOFTPLUS-HASH` (`SPIKE`).
+- **Residual:** the device kernels (the router + clamp are the only NEW device kernels; the expert
+  grouped-GEMM REUSES the existing NVFP4/FP8 path) + folding the MoE into `DeepseekV4Model::Forward`
+  composing W3-W6 (W7 — the brick that finally makes V4 runnable); the strict/near-tie engine gate (W8)
+  — all multi-Spark-blocked on one GB10.
+
+---
+
+## W7 — the `DeepseekV4Model::Forward` ASSEMBLY (2026-07-29, `CLAIM-DEEPSEEK-V4-W7`)
+
+**Base:** current `main` HEAD `a856383c` (`git rev-parse HEAD`). Isolated worktree
+`/home/mudler/_git/vllm.cpp-w7-forward` (branch `deepseek-v4-w7-forward`), CPU-only, foreground, NOT
+pushed. W7 replaces the `VT_CHECK(false, "W3-W8 pending")` stub with a REAL forward that COMPOSES the
+four landed host-reference primitive stacks (W3 DSA indexer + 512-wide MLA output seams, W4
+compressor + fp8_ds_mla KV, W5 MHC + Sinkhorn, W6 sqrtsoftplus/hash MoE) into an end-to-end logits
+producer on the portable CPU path at a SMALL synthetic config. This is the brick that finally makes
+DeepSeek-V4 **structurally runnable**.
+
+### W7.1 What landed (owns `deepseek_v4.{h,cpp}` via `CLAIM-DEEPSEEK-V4-W7`)
+- `include/vllm/model_executor/models/deepseek_v4.h` — the W7 host-float weight tower
+  (`DeepseekV4LayerHostWeights` / `DeepseekV4HostWeights`, added to `DeepseekV4Weights` as
+  `host` + `has_host_weights`), the `V4Miswire` RED-first enum, the `V4ForwardTrace` structural-facts
+  struct, and the `DeepseekV4ForwardHost` declaration.
+- `src/vllm/model_executor/models/deepseek_v4.cpp` — the REAL `DeepseekV4Model::Forward` (runs the
+  host composition when `has_host_weights`, else a loud `VT_CHECK` naming the W2b materialization
+  residual) + `DeepseekV4ForwardHost` (the composition) + `ForwardDevice` still a loud
+  `VT_CHECK(false)` naming the W7-device residual.
+- The interleave, grounded 1:1 (`nvidia/model.py:1080-1148` `DeepseekV4Model.forward` + `:866-957`
+  `DeepseekV4DecoderLayer.forward`): embed → per layer [first-layer MHC-pre stream EXPAND
+  `[T,H]→[T,hc,H]` via the broadcast residual, else fused MhcPost(prev-ffn) + MhcPre(attn)] → 512-wide
+  MLA (q wq_a→q_norm→wq_b + kv wkv→kv_norm, RoPE, DSA indexer→topk→compressor→fp8_ds_mla KV, sink
+  softmax, grouped o-LoRA) → fused MhcPost(attn) + MhcPre(ffn) → MoE (sqrtsoftplus/hash router +
+  shared+routed clamped-SwiGLU) → final MhcPost(last-ffn) → hc_head collapse → norm → lm_head. The
+  hash-vs-gated split (`num_hash_layers`), the per-layer `compress_ratio∈{0,4,128}` indexer/compressor
+  topology, and the fp8_ds_mla KV round-trip are all exercised.
+
+### W7.2 Gate — STRUCTURAL / composition (tiny shape), NOT a real-checkpoint token gate
+`tests/vllm/models/test_deepseek_v4_forward.cpp`: **6/6 cases · 26 assertions GREEN** on a CPU Debug
+full-library build (`-Wall -Werror -Wextra`-clean). A tiny V4 (H=8, 4 layers, `num_hash_layers=2`,
+hc_mult=4, 2 heads × head_dim 6 = 4 NoPE + 2 RoPE, 4 routed + 1 shared expert, `index_topk=3`,
+`compress_ratios={0,4,2,4}`) is built directly (bypassing the head_dim==512 parse validation) and the
+assembled forward runs. Asserts: (a) the forward PRODUCES finite logits end-to-end, shape `[T,vocab]`,
+DETERMINISTIC across runs; (b) the MHC stream is `[T,hc,H]` (`residual_stream_elems == T*4*H`,
+hc_mult==4); (c) the hash layers route by `tid2eid` and the gated layers by learned top-k
+(`layer_hash_routed == {1,1,0,0}`); (d) the DSA sparse path SELECTS (indexer on layers 1,3, `index_topk`
+= 3 keys for the last query) and the compressor POOLS (layers 1,2,3); (e) `logits_indices` gathers the
+requested rows. **RED-first PROVEN three levers**, each changes the output vs the faithful interleave:
+route hash layers as gated (ignore `tid2eid`, `layer_hash_routed → {0,0,0,0}`), skip the final MhcPost
+fold before the head collapse, and drop the per-head attention sink (plain softmax). SACRED-inert: only
+`deepseek_v4.{h,cpp}` + the new test + the CMake test wiring changed; the shared MLA/MoE, the W3-W6
+primitive TUs, README/Metal untouched — the four prior V4 tests still 4/40 + 13/38 + 12/164 + 14/125 +
+12/716. CAVEAT: CPU Debug (the pre-existing GCC-13 `-O2` `-Werror=array-bounds` voxtral.cpp false
+positive forces Debug; the new TU is strict-clean).
+
+### W7.3 Honest 3-state + documented tiny-vs-167B divergences
+The CPU forward assembly at tiny shape = **DERIVED + BUILD-VERIFIED (structural)**. This does NOT claim
+V4 "runs" a real model — it claims the forward ASSEMBLES + is structurally gated at tiny shape. Where
+the tiny forward must diverge from the fixed-config 167B (documented in `deepseek_v4.cpp`, not silent):
+(i) the compressor pools a fixed W=2 window, not the real `(1+overlap)*compress_ratio` window (the
+state-cache gather addressing is a W7-device concern); (ii) the MLA value is the full decoded latent
+(the W_UK/W_UV absorption geometry is the shared-mla-extraction W7 follow-on); (iii) a single
+`rope_theta` is used (the compressed layers' dual `compress_rope_theta` is a device-RoPE seam); (iv)
+`quant_block == nope_head_dim` (one block) at tiny width. Each reuses the SAME landed primitive math the
+device kernels will call.
+
+### W7.4 Named residuals (what still blocks a real single-Spark IQ2_XXS-GGUF run)
+- **W7-device:** the CUDA kernels (MHC Sinkhorn, DSA indexer/compressor, sqrtsoftplus router, clamped
+  SwiGLU; the expert GEMM REUSES the existing NVFP4/FP8 grouped-GEMM) + `ForwardDevice`.
+- **W2b:** materialize the real-checkpoint FP8-block MLA linears + NVFP4 grouped experts into the host
+  tower (or the device towers); `Forward` currently `VT_CHECK`s the host tower present.
+- **W8:** the full paged-engine strict/near-tie gate vs a real golden — multi-Spark-blocked (156.7 GiB
+  NVFP4 / 167 GiB fp8 do not fit ONE GB10).
+- **The single-Spark IQ2_XXS-GGUF vehicle** additionally needs the GGUF `blk.N.*` name-map (W2, now
+  only needs the checkpoint downloaded to the DGX to read its full 1328-tensor manifest — see the
+  GGUF-loadability section) on top of W7-device + W8; the IQ2_XXS/Q2_K dequant already landed
+  (`CLAIM-DSV4-GGUF-LOADER`).
+
+---
+
+## W7-device — the CUDA kernels for the 4 new op families (2026-07-29, `CLAIM-DEEPSEEK-V4-W7-DEVICE`)
+
+**Base:** `main` HEAD `33016f34`. Isolated worktree `/home/mudler/_git/vllm.cpp-w7-device` (branch
+`deepseek-v4-w7-device`), CPU `-Werror` build-verify + **DGX GB10 CUDA gate under `flock /tmp/gpu`**
+(worker stopped for the run then restored), foreground, NOT pushed. W7-device is the last
+engineering brick before an actual DeepSeek-V4 run: it lands the CUDA kernels for the four
+genuinely-new V4 op families, each unit-gated on the GB10 against the LANDED host reference (the
+oracle), and wires `DeepseekV4Model::ForwardDevice` to compose them.
+
+### W7-device.1 What landed (kernel-matrix row `KERNEL-DSV4-W7-DEVICE`, `SPIKE`)
+New TU `src/vt/cuda/cuda_deepseek_v4.cu` — CUDA kernels + host-vector launchers + OpProvider
+registration for the four families, each a 1:1 device port of the host reference:
+- **MHC** (`deepseek_v4_mhc.{h,cpp}`): Sinkhorn (row-softmax+eps seed → col-norm → (iters-1)×
+  [row,col]), MhcPre (folded RMSNorm projection → pre/post/comb gates → stream collapse → optional
+  attn/ffn RMSNorm fold), MhcPost (comb mix + post gate), HcHeadCollapse.
+- **DSA** (`deepseek_v4_dsa.{h,cpp}`): indexer weight-fold, weighted-MQA ReLU logits over the causal
+  window (`-inf` out-of-window), causal top-k selection (bit-exact ids), per-head attention-sink
+  softmax, grouped output-LoRA (`wo_a` bmm → `wo_b`).
+- **Compressor** (`deepseek_v4_compressor.{h,cpp}`): softmax-window pool + RMSNorm, save-time APE add,
+  **fp8_ds_mla** KV encode (per-64 UE8M0 power-of-two block scale + e4m3 nope, bf16 rope) / decode.
+- **MoE** (`deepseek_v4_moe.{h,cpp}`): sqrtsoftplus score, noaux_tc bias-for-selection top-k OR
+  `tid2eid` hash bypass (bit-exact ids, weights from UNBIASED scores), clamped SwiGLU.
+
+**Seam:** each family registers ONE OpProvider under a dedicated OpId (`vt/ops.h`:
+`kDeepseekV4{Mhc,Dsa,Compressor,Moe}`) whose `fn` points at a family kernels-struct
+(`include/vllm/model_executor/models/deepseek_v4_device.h`); `deepseek_v4_device.cpp` resolves them
+via `GetOp`. **NOT re-ported:** the 512-wide MLA attention + expert grouped-GEMM REUSE the existing
+NVFP4/FP8 kernels (`cuda_mla_attn.cu`, `cuda_moe*.cu`) — only the four NEW glue families need device
+kernels.
+
+**ForwardDevice wiring:** `deepseek_v4.cpp` refactors the W7 composition into ONE
+`ForwardComposeImpl` driven by a `V4Backend` policy; `DeepseekV4ForwardHost` binds the host refs (the
+oracle, unchanged — `test_deepseek_v4_forward` still 6/6·26), `DeepseekV4Model::ForwardDevice` binds
+the CUDA kernels through the seam. The small linear projections stay host in both modes (the real
+device path REUSES the existing GEMM/MLA/MoE-grouped kernels — a documented seam).
+
+### W7-device.2 Gate — DGX GB10 (sm_121a) RUNTIME-VERIFIED
+`tests/vllm/models/test_cuda_deepseek_v4.cpp` **11/11 cases · 153 assertions GREEN** on the GB10:
+each device kernel vs its host-ref oracle at small shape — BIT-EXACT ids (DSA causal top-k,
+sqrtsoftplus/hash router selection), `-inf` mask exact, near-tie rel-L2 < 1e-4 for the fp reductions
+(Sinkhorn, pool/softmax, sqrtsoftplus — device `expf`/`sqrtf`/`rsqrt` vs host), fp8_ds_mla
+encode→decode within the e4m3 granularity bound + bf16 rope bit-exact; PLUS the **ForwardDevice
+composition gate** (device forward == host forward, rel-L2 < 2e-3 over the 4-family tiny-config
+interleave). **compute-sanitizer memcheck 0 errors.** **RED-first PROVEN:** dropping the sqrt in the
+device sqrtsoftplus fails 3 cases / 6 assertions (sqrtsoftplus + router weights + ForwardDevice);
+revert restores 11/11·153. Build: CUDA `-Werror` clean; CPU `-Werror` clean. The pre-existing GCC-13
+`-O2` `-Werror=array-bounds`/`-Wstringop-overflow` FALSE POSITIVE in `voxtral.cpp` (project #155) was
+neutralized MINIMALLY + LOCALLY with a scoped `#pragma GCC diagnostic` around the in-bounds
+`BuildPaddedDecodeAttn` copies (advances #155).
+
+### W7-device.3 Honest 3-state + residuals
+The CUDA kernels are **RUNTIME-VERIFIED on GB10 at small shape** (real GPU, real host-ref oracle).
+This does NOT claim V4 "runs" a real model. Named residuals: **W2b** — materialize the real-checkpoint
+FP8-block MLA linears + NVFP4 grouped experts into the device towers (`Forward` VT_CHECKs the host
+tower present); **W8** — the full paged-engine strict/near-tie gate vs a real golden (multi-Spark:
+156.7 GiB NVFP4 / 167 GiB fp8 do not fit ONE GB10); the **single-Spark IQ2_XXS-GGUF vehicle**
+additionally needs the GGUF `blk.N.*` name-map (W2, checkpoint-download-blocked on the 1328-tensor
+manifest).

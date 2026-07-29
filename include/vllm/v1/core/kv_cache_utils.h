@@ -73,6 +73,7 @@
 namespace vllm::v1 {
 
 struct KVCacheSpec;
+struct KVCacheConfig;
 
 // Hybrid-manager-disabled fallback: when full and sliding-window/chunked-local
 // specs are mixed, convert local storage to full allocation while preserving
@@ -410,6 +411,34 @@ std::vector<BlockHash> hash_request_tokens(
 // construction and after each append.
 BlockHasher get_request_block_hasher(int hash_block_size,
                                      const HashFn& caching_hash_fn);
+
+// Resolve (scheduler_block_size, hash_block_size) for a KV cache config.
+// Ported 1:1 from vllm/v1/core/kv_cache_utils.py:626-688
+// (resolve_kv_cache_block_sizes) @ 555967922.
+//
+// - scheduler_block_size is the token-alignment invariant used by the
+//   scheduler. Single group: cache_block_size * dcp. Multiple groups: LCM of
+//   every group's effective block size (attention groups scaled by DCP; mamba
+//   groups keep their per-rank state, unscaled).
+// - hash_block_size is the granularity (the "prefix match unit") at which a
+//   request's block hashes are computed. Single group: equals scheduler block
+//   size. Multiple groups: `prefix_match_unit` if set, else the GCD of group
+//   block sizes; every group block size must be divisible by it. Returns the
+//   scheduler block size (disabling finer hashing) when block hashing is
+//   inactive (no prefix caching AND no connector) or a mamba group's block size
+//   diverges from cache_block_size (mamba_cache_mode != "align").
+//
+// Deviation from upstream: takes the threaded config values explicitly
+// (cache_block_size = cache_config.block_size, prefix_match_unit =
+// cache_config.prefix_match_unit, enable_prefix_caching, connector_enabled =
+// (kv_transfer_config != None), dcp = decode_context_parallel_size) rather than
+// a single VllmConfig, because our config surface is threaded, not one
+// dataclass. Throws std::invalid_argument on a non-divisible prefix_match_unit,
+// mirroring upstream's ValueError.
+std::pair<int, int> resolve_kv_cache_block_sizes(
+    const KVCacheConfig& kv_cache_config, int cache_block_size,
+    std::optional<int> prefix_match_unit, bool enable_prefix_caching,
+    bool connector_enabled, int dcp_world_size = 1);
 
 }  // namespace vllm::v1
 

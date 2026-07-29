@@ -215,6 +215,91 @@ TEST_CASE("DequantGgufRowToF32 Q3_K synthetic block (scale shuffle + hi bit)") {
   CHECK(out[32] == doctest::Approx(2.0F));
 }
 
+// --- Q2_K (10): block = { u8 scales[16]; u8 qs[64]; f16 d; f16 dmin; }
+// (84 bytes). 2-bit quant (qs, shift 0/2/4/6) times a per-16 4-bit sub-scale
+// (low nibble of scales[]) minus a 4-bit sub-min (high nibble), both scaled by
+// f16 d / dmin. Output order: is 0..15, each covering 16 elements; is=0,1 at
+// shift0 (grpA q[0..15], grpB q[16..31]), is=2,3 at shift2, ... then q += 32
+// for the second half (n=128, is 8..15). d=0.5, dmin=0.25.
+//   scales[0]=0x14 -> sc=4,min=1 (dl=2.0, ml=0.25)
+//   scales[1]=0x23 -> sc=3,min=2 (dl=1.5, ml=0.5)
+//   scales[2]=0x31 -> sc=1,min=3 (dl=0.5, ml=0.75)
+//   qs[0]=0x1B -> shift0 field=3, shift2 field=2 ; qs[16]=0x02 -> shift0 field=2
+TEST_CASE("DequantGgufRowToF32 Q2_K synthetic block (nibble sub-scale/min)") {
+  std::vector<uint8_t> b(84, 0);
+  b[0] = 0x14;   // scales[0]: sc=4, min=1
+  b[1] = 0x23;   // scales[1]: sc=3, min=2
+  b[2] = 0x31;   // scales[2]: sc=1, min=3
+  b[16] = 0x1B;  // qs[0]
+  b[32] = 0x02;  // qs[16]
+  const uint16_t d = vt::F32ToF16(0.5F);
+  const uint16_t dmin = vt::F32ToF16(0.25F);
+  b[80] = static_cast<uint8_t>(d & 0xFF);
+  b[81] = static_cast<uint8_t>(d >> 8);
+  b[82] = static_cast<uint8_t>(dmin & 0xFF);
+  b[83] = static_cast<uint8_t>(dmin >> 8);
+
+  const std::vector<float> out = DequantGgufRowToF32(10, b.data(), 256);
+  REQUIRE(out.size() == 256);
+  // y[0]  : is=0, q[0]=0x1B shift0&3=3 ; 2.0*3 - 0.25 = 5.75
+  CHECK(out[0] == doctest::Approx(5.75F));
+  // y[1]  : is=0, q[1]=0 ; 2.0*0 - 0.25 = -0.25
+  CHECK(out[1] == doctest::Approx(-0.25F));
+  // y[16] : is=1, q[16]=0x02 shift0&3=2 ; 1.5*2 - 0.5 = 2.5
+  CHECK(out[16] == doctest::Approx(2.5F));
+  // y[32] : is=2, q[0]=0x1B shift2 -> (0x1B>>2)&3=2 ; 0.5*2 - 0.75 = 0.25
+  CHECK(out[32] == doctest::Approx(0.25F));
+}
+
+// --- IQ2_XXS (16): block = { f16 d; u16 qs[32]; } (66 bytes). Codebook decode:
+// each 32-elem sub-block reads two u32 from qs -- aux32[0] = four 8-bit grid
+// indices, aux32[1] = four 7-bit sign selectors + a 4-bit scale in the top
+// nibble (db = d*(0.5 + (aux32[1]>>28))*0.25). Each grid index picks 8 bytes of
+// iq2xxs_grid; ksigns_iq2xs[selector] & kmask_iq2xs[j] flips the sign.
+//
+// Hand-verified against ggml-common.h iq2xxs_grid @ 237ad9b96:
+//   grid[0] = 0x0808080808080808 -> all 8 grid bytes.
+//   grid[1] = 0x080808080808082b -> byte0 = 0x2b (43), bytes1..7 = 8.
+//   ksigns_iq2xs[0] = 0 (no flips) ; ksigns_iq2xs[1] = 129 = 0b10000001
+//     (flips lane j=0 via kmask 1 and j=7 via kmask 128).
+TEST_CASE("DequantGgufRowToF32 IQ2_XXS codebook block (grid + signs + scale)") {
+  std::vector<uint8_t> b(66, 0);
+  const uint16_t d = vt::F32ToF16(1.0F);
+  b[0] = static_cast<uint8_t>(d & 0xFF);
+  b[1] = static_cast<uint8_t>(d >> 8);
+  // qs bytes start at offset 2. ib32=0: aux32[0]=0x00000001 (grid idx 1 for
+  // lane l=0, idx 0 for l=1..3), aux32[1]=0 (scale sel 0 -> db=0.125, no signs).
+  b[2] = 0x01;  // aux32[0] low byte = 1
+  // ib32=1: aux32[0]=0 (all grid idx 0), aux32[1]=0x10000001
+  //   (>>28 = 1 -> db=0.375 ; bits0-6 = 1 -> l=0 sign selector = 1).
+  // aux32[1] for ib32=1 sits at qs offset 8+4 = 12 -> block offset 2+12 = 14.
+  b[14] = 0x01;  // aux32[1] byte0
+  b[17] = 0x10;  // aux32[1] byte3 (top nibble = 1)
+
+  const std::vector<float> out = DequantGgufRowToF32(16, b.data(), 256);
+  REQUIRE(out.size() == 256);
+  // ib32=0, l=0 (grid idx 1): db=0.125. y[0]=0.125*43=5.375, y[1..7]=0.125*8=1.0
+  CHECK(out[0] == doctest::Approx(5.375F));
+  for (int j = 1; j < 8; ++j) CHECK(out[j] == doctest::Approx(1.0F));
+  // ib32=0, l=1..3 (grid idx 0, no signs): all 1.0
+  for (int j = 8; j < 32; ++j) CHECK(out[j] == doctest::Approx(1.0F));
+  // ib32=1, l=0 (grid idx 0, db=0.375, signs=129 flips j=0 and j=7):
+  //   y[32]=-3.0, y[33..38]=+3.0, y[39]=-3.0
+  CHECK(out[32] == doctest::Approx(-3.0F));
+  for (int j = 33; j < 39; ++j) CHECK(out[j] == doctest::Approx(3.0F));
+  CHECK(out[39] == doctest::Approx(-3.0F));
+  // ib32=1, l=1..3 (no signs): all +3.0
+  for (int j = 40; j < 64; ++j) CHECK(out[j] == doctest::Approx(3.0F));
+  // ib32=2..7 (all-zero -> grid idx 0, db=0.125, no signs): all 1.0
+  for (int j = 64; j < 256; ++j) CHECK(out[j] == doctest::Approx(1.0F));
+
+  // bf16 variant round-trips through the same f32 decode.
+  const std::vector<uint16_t> bf = DequantGgufRowToBf16(16, b.data(), 256);
+  REQUIRE(bf.size() == 256);
+  CHECK(bf[0] == vt::F32ToBF16(5.375F));
+  CHECK(bf[32] == vt::F32ToBF16(-3.0F));
+}
+
 // --- Multi-block row: two Q8_0 blocks (64 elems) with distinct scales. ---
 TEST_CASE("DequantGgufRowToF32 Q8_0 multi-block row") {
   std::vector<uint8_t> b;
