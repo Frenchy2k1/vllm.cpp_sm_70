@@ -140,8 +140,12 @@ TEST_CASE("vt block geometry agrees with the GGUF reader's GgmlTraits") {
 // so `HasQuantDotKernel` is false and the loader routes them to expand-to-bf16
 // (dequant-only), never keep-quant GEMM. This is a DISTINCT contract from the
 // executable weight types in kBlockCases, so it gets its own case.
-TEST_CASE("Q2_K/IQ2_XXS are dequant-only block dtypes (geometry + no vec_dot)") {
-  struct DequantOnlyCase {
+TEST_CASE("Q2_K/IQ2_XXS/IQ3_XXS keep-quant block dtypes (geometry + vec_dot)") {
+  // DeepSeek-V4 W8 (CLAIM-DEEPSEEK-V4-W8): these ~2-3-bit codebook encodings —
+  // the single-Spark UD-IQ2_XXS (IQ2_XXS gate/up + IQ3_XXS down) / UD-Q2_K_XL
+  // routed experts — gained a keep-quant `vec_dot` against Q8_K, so they are now
+  // HasQuantDotKernel-TRUE (the memory enabler) rather than dequant-only.
+  struct KeepQuantCase {
     vt::DType dtype;
     uint32_t ggml_type;
     int64_t block_elems;
@@ -151,11 +155,13 @@ TEST_CASE("Q2_K/IQ2_XXS are dequant-only block dtypes (geometry + no vec_dot)") 
   // Sizes written out from ggml-common.h @ 237ad9b96:
   //   q2_K    :288-299  16 sc + 64 qs + f16 d + f16 dmin = 16+64+2+2 = 84
   //   iq2_xxs :371-374  f16 d + 32 u16 qs                = 2 + 64    = 66
-  const DequantOnlyCase cases[] = {
+  //   iq3_xxs :385-400  f16 d + 96 u8 qs                 = 2 + 96    = 98
+  const KeepQuantCase cases[] = {
       {vt::DType::kQ2_K, 10, 256, 84, "q2_K"},
       {vt::DType::kIQ2_XXS, 16, 256, 66, "iq2_xxs"},
+      {vt::DType::kIQ3_XXS, 18, 256, 98, "iq3_xxs"},
   };
-  for (const DequantOnlyCase& c : cases) {
+  for (const KeepQuantCase& c : cases) {
     CAPTURE(c.name);
     // vt geometry.
     CHECK(vt::IsBlockQuant(c.dtype));
@@ -167,7 +173,7 @@ TEST_CASE("Q2_K/IQ2_XXS are dequant-only block dtypes (geometry + no vec_dot)") 
     CHECK(vt::RowSizeBytes(c.dtype, c.block_elems) ==
           static_cast<size_t>(c.block_bytes));
 
-    // Reader GgmlTraits agreement (both are real FILE types, unlike Q8_K).
+    // Reader GgmlTraits agreement (all are real FILE types, unlike Q8_K).
     const vllm::GgmlTypeTraits& g = vllm::GgmlTraits(c.ggml_type);
     CHECK(g.block_elems == c.block_elems);
     CHECK(g.block_bytes == c.block_bytes);
@@ -175,10 +181,15 @@ TEST_CASE("Q2_K/IQ2_XXS are dequant-only block dtypes (geometry + no vec_dot)") 
     REQUIRE(vt::BlockDTypeFromGgmlTypeId(c.ggml_type, &back));
     CHECK(back == c.dtype);
 
-    // Decodes (to_float present) but is NOT keep-quant capable: no vec_dot row.
+    // Decodes (to_float present) AND keep-quant capable: a vec_dot row against
+    // Q8_K exists, so the loader keeps the blocks compressed (W8).
     CHECK(vt::cpu::BlockToFloat(c.dtype) != nullptr);
-    CHECK_FALSE(vt::cpu::HasQuantDotKernel(c.dtype));
-    CHECK_THROWS(vt::cpu::QuantTraits(c.dtype));
+    CHECK(vt::cpu::HasQuantDotKernel(c.dtype));
+    const vt::cpu::QuantTypeTraits& t = vt::cpu::QuantTraits(c.dtype);
+    CHECK(t.vec_dot != nullptr);
+    CHECK(t.vec_dot_type == vt::DType::kQ8_K);
+    // No `from_float`: nothing quantizes an activation INTO these weight types.
+    CHECK(vt::cpu::BlockFromFloat(c.dtype) == nullptr);
   }
 }
 

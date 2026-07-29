@@ -38,6 +38,11 @@ const QuantTypeTraits* FindQuantTraits(DType dtype) {
       static const QuantTypeTraits t = MakeTraits(DType::kQ8_0, DType::kQ8_0);
       return &t;
     }
+    // ggml-cpu.c:283-288 — Q2_K -> Q8_K activations (DeepSeek-V4 W8).
+    case DType::kQ2_K: {
+      static const QuantTypeTraits t = MakeTraits(DType::kQ2_K, DType::kQ8_K);
+      return &t;
+    }
     // ggml-cpu.c:295-300 — Q3_K -> Q8_K activations.
     case DType::kQ3_K: {
       static const QuantTypeTraits t = MakeTraits(DType::kQ3_K, DType::kQ8_K);
@@ -64,6 +69,18 @@ const QuantTypeTraits* FindQuantTraits(DType dtype) {
     // on); we carry a row solely so its `to_float` is reachable for tests.
     case DType::kQ8_K: {
       static const QuantTypeTraits t = MakeTraits(DType::kQ8_K, DType::kQ8_K);
+      return &t;
+    }
+    // ggml-cpu.c IQ rows — IQ2_XXS/IQ3_XXS -> Q8_K activations (DeepSeek-V4 W8).
+    // These are the ~2-3-bit codebook encodings the single-Spark DeepSeek-V4
+    // GGUF vehicle's routed experts use; keeping them keep-quant is the memory
+    // enabler (they carry no `from_float` — nothing quantizes INTO them).
+    case DType::kIQ2_XXS: {
+      static const QuantTypeTraits t = MakeTraits(DType::kIQ2_XXS, DType::kQ8_K);
+      return &t;
+    }
+    case DType::kIQ3_XXS: {
+      static const QuantTypeTraits t = MakeTraits(DType::kIQ3_XXS, DType::kQ8_K);
       return &t;
     }
     default:
