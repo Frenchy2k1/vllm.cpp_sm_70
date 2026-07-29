@@ -106,6 +106,12 @@ struct V4Backend {
   bool device = false;
   vt::Queue* q = nullptr;
   const DeepseekV4GgufWeights* gguf = nullptr;
+  // Incremental-decode KV cache (Stage 1). Null = stateless full-recompute (the
+  // default / --gpu path). When set, AttentionBlock appends each token's per-layer
+  // `deck` latent to cache.deck[layer] and attends over the full cached KV; the
+  // query's global position is kv_base + local_t (kv_base = cache.len at the call).
+  DeepseekV4KvCache* kv = nullptr;
+  int64_t kv_base = 0;
 };
 
 // Drain the queue's stream after a keep-quant GEMM. This host-orchestrated GGUF
@@ -555,7 +561,31 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     DumpAct(nm, Slice(deck, 0, hd));  // #188 kv latent operand (deck), t=0
   }
 
-  // 4. selection: DSA Lightning-Indexer top-k on indexer layers, else dense causal.
+  // 3b. KV CACHE (Stage 1, incremental decode). When a cache is bound, APPEND this
+  //     call's T new `deck` latents to the layer's cache and attend over the FULL
+  //     cached KV (global positions 0..kv_base+T-1). `deck[t]` depends only on
+  //     token t and its position, so the cached value equals the recomputed one →
+  //     incremental decode is token-identical to full-recompute. Null cache = the
+  //     stateless path (kv_keys == the local `deck`, base 0).
+  const std::vector<float>* kv_keys = &deck;
+  int64_t kv_base = 0;
+  int64_t n_keys = T;
+  if (be.kv != nullptr) {
+    VT_CHECK(!is_indexer && !is_comp,
+             "kv-cache incremental decode requires dense MLA (no indexer/compressor)");
+    VT_CHECK(be.kv->head_dim == hd, "kv cache head_dim mismatch");
+    std::vector<float>& lc = be.kv->deck[static_cast<size_t>(layer)];
+    kv_base = be.kv_base;
+    VT_CHECK(static_cast<int64_t>(lc.size()) == kv_base * hd,
+             "kv cache length mismatch (layer cache out of sync with kv_base)");
+    lc.insert(lc.end(), deck.begin(), deck.end());  // append the T new latents
+    kv_keys = &lc;
+    n_keys = kv_base + T;
+  }
+  (void)n_keys;
+
+  // 4. selection: DSA Lightning-Indexer top-k on indexer layers, else dense causal
+  //    over GLOBAL positions [0..kv_base+t] (kv_base==0 in the stateless path).
   std::vector<std::vector<int64_t>> sel(static_cast<size_t>(T));
   if (is_indexer) {
     const int64_t inh = p.index_n_heads, ihd = p.index_head_dim, itopk = p.index_topk;
@@ -586,11 +616,14 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
           T > 0 ? static_cast<int>(sel[static_cast<size_t>(T - 1)].size()) : 0;
     }
   } else {
-    for (int64_t t = 0; t < T; ++t)
-      for (int64_t s = 0; s <= t; ++s) sel[static_cast<size_t>(t)].push_back(s);
+    for (int64_t t = 0; t < T; ++t) {
+      const int64_t g = kv_base + t;  // this query's GLOBAL position
+      for (int64_t s = 0; s <= g; ++s) sel[static_cast<size_t>(t)].push_back(s);
+    }
   }
 
-  // 5. attention with per-head sink softmax; value = the decoded latent (W3 seams).
+  // 5. attention with per-head sink softmax; key = value = the cached latent
+  //    (kv_keys, GLOBAL-indexed) — the decoded MLA latent (W3 seams).
   std::vector<float> o(static_cast<size_t>(T) * nh * hd, 0.0f);
   const float kNegInf = -std::numeric_limits<float>::infinity();
   for (int64_t t = 0; t < T; ++t) {
@@ -599,7 +632,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       std::vector<float> sc(S.size());
       const float* qh = &q[(t * nh + h) * hd];
       for (size_t si = 0; si < S.size(); ++si)
-        sc[si] = Dot(qh, &deck[S[si] * hd], hd) * scale;
+        sc[si] = Dot(qh, &(*kv_keys)[S[si] * hd], hd) * scale;
       const float sink = (miswire == V4Miswire::kNoAttnSink)
                              ? kNegInf
                              : L.attn_sink[static_cast<size_t>(h)];
@@ -607,7 +640,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       float* oh = &o[(t * nh + h) * hd];
       for (size_t si = 0; si < S.size(); ++si) {
         const float w = probs[si];
-        const float* v = &deck[S[si] * hd];
+        const float* v = &(*kv_keys)[S[si] * hd];
         for (int64_t d = 0; d < hd; ++d) oh[d] += w * v[d];
       }
     }
@@ -995,6 +1028,38 @@ std::vector<float> DeepseekV4ForwardGguf(const DeepseekV4Weights& weights,
   return ForwardComposeImpl(
       weights.host, weights.params, token_ids, positions, logits_indices, miswire, trace,
       V4Backend{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf});
+}
+
+// Stage 1 — incremental-decode variant. Same keep-quant composition, but binds a
+// KV cache: this call's T tokens append their per-layer `deck` latent to the cache
+// and the new queries attend over the full cached KV (global positions
+// 0..cache.len+T-1). Prefill = first call (cache.len==0, all prompt tokens);
+// decode = later calls (one new token, positions={cache.len}). Token-identical to
+// DeepseekV4ForwardGguf run over the growing context (pure equivalence).
+std::vector<float> DeepseekV4ForwardGgufCached(const DeepseekV4Weights& weights,
+                                               vt::Queue& queue,
+                                               DeepseekV4KvCache& cache,
+                                               const std::vector<int32_t>& token_ids,
+                                               const std::vector<int32_t>& positions,
+                                               const std::vector<int32_t>& logits_indices) {
+  VT_CHECK(weights.has_gguf_weights,
+           "DeepseekV4ForwardGgufCached: no keep-quant tower (call LoadDeepseekV4FromGguf)");
+  VT_CHECK(weights.has_host_weights,
+           "DeepseekV4ForwardGgufCached: the small f32 host tower is absent");
+  const int64_t nlayers = weights.params.num_hidden_layers;
+  const int64_t hd = weights.params.head_dim;
+  if (cache.deck.empty()) cache.Reset(nlayers, hd);  // lazy init on first call
+  VT_CHECK(static_cast<int64_t>(cache.deck.size()) == nlayers && cache.head_dim == hd,
+           "DeepseekV4ForwardGgufCached: cache not sized for this model");
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
+  be.kv = &cache;
+  be.kv_base = cache.len;  // same base for every layer this call
+  std::vector<float> logits = ForwardComposeImpl(
+      weights.host, weights.params, token_ids, positions, logits_indices,
+      V4Miswire::kNone, /*trace=*/nullptr, be);
+  cache.len += T;  // all layers appended their T decks
+  return logits;
 }
 
 void DeepseekV4QHeadRmsNormInplace(std::vector<float>& q, int64_t n_head,

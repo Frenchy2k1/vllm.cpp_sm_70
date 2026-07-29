@@ -33191,3 +33191,30 @@ host-orchestrated + per-GEMM sync at T=5 → GB10 ~45% util. Real speed path (b)
 win. Context (mirror-vLLM, source-grounded): vLLM has no experts-on-CPU-compute mode —
 `cpu_offload_gb` (`vllm/config/offload.py`) offloads WEIGHTS to host RAM and streams them to the
 GPU each forward; MoE compute always runs on GPU. Row stays ACTIVE (parity residual = path b).
+
+## DeepSeek-V4 ForwardDevice campaign — Stage 0 (scope) + Stage 1 (KV cache) (2026-07-29, `CLAIM-DEEPSEEK-V4-FORWARD-DEVICE`, worktree `/home/mudler/_git/vllm.cpp-fwddev`, branch `deepseek-v4-forward-device`, base `fd9e191c`, NOT pushed)
+
+The user chose the FULL ForwardDevice parity push (target ds4 prefill 326 / decode 16.5).
+Landing in reviewable stages, each correctness-gated before speed.
+
+**Stage 0 — SCOPE (committed `71fd270f`):** `.agents/specs/deepseek-v4-forward-device.md`.
+Grounds the plan in our + ds4 source: (a) the gap is NOT experts-on-CPU (fixed) but no-KV-cache
++ host-orchestration; (b) the KV-cache object is per-layer `deck` latent `[head_dim]` f32
+(real run is dense MLA: `dsa_dense`→`is_comp`/`is_indexer` false, `deepseek_v4.cpp:457-459`;
+num_key_value_heads=1; MHC manifold is per-token — no other cross-token state), mirror of ds4
+`raw_kv` (`ds4.c:12089/12351`); (c) #183 device kernels (MHC/DSA/compressor/MoE) exist + DGX-gated
+but round-trip host↔device per op (stage-2 target); (d) per-stage gates.
+
+**Stage 1 — KV CACHE (committed `e85eee01`; DGX-benchmarked):** NEW `DeepseekV4KvCache` +
+`DeepseekV4ForwardGgufCached`; `AttentionBlock` cache-aware (append each call's T decks, attend the
+new query over the full cached KV at global positions); driver `--kv-cache` (prefill fills cache,
+decode = one token/step). Rollback-able (default + `--gpu` byte-identical). **CORRECTNESS (pure
+equivalence):** `test_deepseek_v4_gguf_load` **11/11·430** — prefill BIT-identical (cached==full
+batch), incremental decode TOKEN-identical to full-recompute over 6 greedy steps, RED-first (a cache
+that forgets its history diverges). **REAL DGX (GB10, 80.7 GB ds4 file, `--gpu`):** incremental is
+TOKEN-IDENTICAL to full-recompute (" Paris. The capital of France is Paris", ids `11111 16 455 6102
+294 8760 344 11111`); **decode 0.68 → 4.79–5.35 tok/s (7.9×; 0.19–0.21 s/tok)**, ~1/3 of ds4's 16.5;
+prefill 6.19; peak 86.33 GiB. GPU used: nvidia-smi 29–46% util, compute-app `deepseek-v4-gen` (PID
+53933) DURING run. Residual to ds4 = host-orchestration + per-GEMM sync at T=1 (Stages 2–3:
+device-resident activations via #183 kernels + overlap/graphs — awaiting review before starting).
+Box restored (worker up restart=always, flock free). NOT pushed.
