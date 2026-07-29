@@ -16,6 +16,24 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## DeepSeek-V4-Flash W2c - forward rewired onto the keep-quant tower (2026-07-29, `CLAIM-DEEPSEEK-V4-W2C`) - NOT-APPLICABLE (memory-enabler code brick; no throughput owed) / real run PENDING (W8-run, now memory-FEASIBLE)
+
+W2c fixes the OOM that blocked the single-Spark run: `LoadDeepseekV4FromGguf` no longer
+f32-expands the big MLA/MoE/lm_head weights, and `DeepseekV4ForwardGguf` consumes the
+COMPRESSED `weights.gguf` blocks in place via `vt::MatmulBT`->the CPU `kMatmulBTQuant` CIQ
+GEMM. No throughput is owed by this brick (a memory/correctness enabler on CPU at tiny
+synthetic shape). Correctness + memory gate `test_deepseek_v4_gguf_load` 7/7 - 185
+assertions (CPU Release, `-Werror`-clean): keep-quant(Q8_0) vs dequant(bf16) forward RelL2
+0.0116 (near-tie, < 0.05 band); a no-sink miswire diverges (RelL2 0.122, RED-first); a load
+that rebuilds the f32 tower fails a load-time assertion. Memory-bound: at tiny shape host
+23,980 B vs keep-quant 141,676 B; projected full scale, the 256 routed experts alone are
+~1032 GiB f32 (OOM-reboots the 119 GiB pool) versus the keep-quant `UD-IQ2_XXS` ~91 GiB plus
+a small (< 3 GiB) f32 host tower = ~93.9 GiB, memory-FEASIBLE on ONE GB10. The real 91 GB
+`UD-IQ2_XXS` run (download + GB10 greedy generate + self-consistency/coherence + benchmark
+vs llama.cpp-on-card) is the operational W8-run, now unblocked on memory. Repro: build CPU
+`-DVLLM_CPP_CUDA=OFF` Release, `./tests/test_deepseek_v4_gguf_load`; resume recipe in
+`.agents/specs/deepseek-v4-flash.md` §W2c.3.
+
 ## DeepSeek-V4-Flash W2b - GGUF keep-quant tower materialization (2026-07-29, `CLAIM-DEEPSEEK-V4-W2B`) - NOT-APPLICABLE (loader wiring brick; no throughput owed) / real run PENDING (W8-final)
 
 W2b wires the landed `deepseek4` GGUF `blk.N.*` name-map + keep-quant blocks into the

@@ -290,6 +290,22 @@ past the 119 GiB unified pool by ~layer 5; the keep-quant `weights.gguf` tower (
 never read by the forward. **Named residual W2c:** rewire the forward onto the CIQ `kMatmulBTQuant`
 keep-quant blocks + gate off the host-f32 dequant, THEN the download + GB10 greedy gen +
 self-consistency/coherence gate + benchmark. No tokens generated (not faked); DGX left as found.
+**W2c LANDED — the OOM-infeasibility is FIXED (2026-07-29, `CLAIM-DEEPSEEK-V4-W2C`, base `328e6a50`):**
+`LoadDeepseekV4FromGguf` no longer f32-expands the big MLA/MoE/lm_head weights (only the small
+norms/embed/MHC/DSA/hash tensors dequant to `host`); a new `DeepseekV4ForwardGguf` runs the SAME
+composition with the 512-wide MLA linears + 256 routed/shared expert GEMMs + lm_head CONSUMING the
+COMPRESSED `weights.gguf` blocks in place via `vt::MatmulBT`→the CPU `kMatmulBTQuant` CIQ GEMM (a `Gemm`
+/ `GemmRowSlice` / `GroupedOutputLoraGguf` helper trio), and `DeepseekV4Model::Forward` gates on
+`has_gguf_weights` (the safetensors/NVFP4 + tiny-synthetic host path stays byte-identical). Gate
+`test_deepseek_v4_gguf_load` **7/7·185** (CPU Release `-Werror`-clean): keep-quant forward RUNS
+finite+deterministic; keep-quant(Q8_0)==dequant(bf16) RelL2 **0.0116** (< 0.05 near-tie); RED-first
+(no-sink miswire diverges 0.122; a load that rebuilds the f32 tower fails a load-time `VT_CHECK` + the
+host<gguf-bytes assertion). MEMORY-BOUND asserted: host 23,980 B < keep-quant 141,676 B at tiny shape;
+projected full-scale the 256 routed experts alone are **~1032 GiB** f32 (OOMs the 119 GiB pool) vs the
+keep-quant `UD-IQ2_XXS` **~91 GiB** + small host **< 3 GiB** = **memory-FEASIBLE** on ONE GB10. REUSES the
+landed `kMatmulBTQuant` (no new kernel row / no checker bump). SACRED-inert (W3-W6 primitive tests
+unchanged; shared MLA/MoE + CUDA W7-device untouched). The real 91 GB run stays the operational W8-run
+(download + GB10 generate + benchmark), now memory-feasible.
 **MXFP4 QUANT PATH W0/W1 LANDED (2026-07-28, `CLAIM-QUANT-MXFP4`, base `42c56b51`,
 [`QUANT-CT-MXFP4`](quantization-matrix.md) `INVENTORIED`→`ACTIVE`):** the shared unblocker BOTH
 DeepSeek-V4 (W6 MegaMoE MXFP4 experts) and Kimi-K3 (real checkpoint is `mxfp4-pack-quantized`)

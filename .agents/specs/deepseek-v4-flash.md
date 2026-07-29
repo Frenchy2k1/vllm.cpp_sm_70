@@ -1129,3 +1129,59 @@ TPOT/throughput/peak-mem (llama.cpp-on-card as the competitor floor if it loads 
 ours-only honestly). **Resume command:** `LoadedEngine::FromModelDir` also needs a `deepseek4` arm in
 the top-level `HfConfigFromGguf` dispatch (today qwen-only) to route the GGUF to this loader from the
 CLI/server — a small entrypoint wiring folded into the W8-final run.
+
+---
+
+## W2c — rewire the forward onto the keep-quant tower (2026-07-29, `CLAIM-DEEPSEEK-V4-W2C`)
+
+The last CODE brick before the single-Spark run. W8-final PROVED the forward read the wrong tower and
+would OOM the box (§W8.5): `LoadDeepseekV4FromGguf` built the ~1 TiB f32 `weights.host` tower
+UNCONDITIONALLY and the forward composed off it, while the ~91 GiB keep-quant `weights.gguf` tower was
+built but never read. W2c fixes both.
+
+### W2c.1 What landed (owns `deepseek_v4.{h,cpp}` + `deepseek_v4_weights.cpp` via `CLAIM-DEEPSEEK-V4-W2C`)
+- **Forward rewire (`deepseek_v4.cpp`).** A `V4Backend::gguf` weight source + three keep-quant GEMM
+  helpers: `Gemm` (`Y[T,N]=X[T,K]@W[N,K]^T` off an `OwnedTensor.View()` via `vt::MatmulBT`, which
+  dispatches to the CPU `kMatmulBTQuant` CIQ GEMM for a block-quant weight — vt/ops.cpp:134-201 —
+  quantizing the activation once then integer vec_dot, weights never expanded), `GemmRowSlice` (a
+  per-expert / per-group row-slice of a stacked block weight — rows are whole blocks, so a byte
+  offset, mirroring the loader's `OwnGgufQuantBlocks` row_offset), and `GroupedOutputLoraGguf`
+  (per-group block-diagonal wo_a slice + wo_b). `ForwardComposeImpl` now routes the 512-wide MLA
+  linears (wq_a, wq_b, wkv, wo_a, wo_b), the compressor/indexer projections (comp_wgate, idx_wq_b,
+  idx_comp_wkv), the router gate, the shared + 256 routed expert GEMMs, and lm_head to the compressed
+  `weights.gguf` blocks; the small non-GEMM tensors (norms, sinks, MHC/DSA mixing, ape, the `tid2eid`
+  hash table, weights_proj, embed) stay dequant-f32 from the SMALL `host` tower, exactly as our other
+  GGUF models keep them (qwen3_5_gguf_weights.cpp is the structural mirror). New public entry
+  `DeepseekV4ForwardGguf`; `DeepseekV4Model::Forward` gates on `has_gguf_weights` — the
+  safetensors/NVFP4 + tiny-synthetic host path is byte-identical (Gemm falls back to the exact per-row
+  f32 MatVec when there is no keep-quant source).
+- **Loader memory fix (`deepseek_v4_weights.cpp`).** `LoadDeepseekV4FromGguf` NO LONGER f32-expands the
+  big MLA/MoE/lm_head weights into `host` — only the small dequant tensors + embed (a gather). A
+  load-time `VT_CHECK` asserts every big `host` slot is EMPTY (a regression that re-adds a `HostVec`
+  for any big weight, rebuilding the ~1 TiB tower, fails LOUDLY at load). Two accounting helpers
+  `DeepseekV4{Host,Gguf}ResidentBytes` for the memory gate.
+
+### W2c.2 Gate (`test_deepseek_v4_gguf_load` 7/7·185, CPU Release `-Werror`-clean)
+- **(a) keep-quant forward RUNS** consuming the blocks: `DeepseekV4ForwardGguf` over the Q8_0
+  keep-quant tower → finite, deterministic logits.
+- **(b) keep-quant == dequant within near-tie (RED-first):** keep-quant (Q8_0 vec_dot) vs the dequant
+  oracle (bf16 `MatmulBT`, the expand-all load) RelL2 = **0.0116** (< the 0.05 band, ~4x margin,
+  routing-flip-robust; the only difference is the keep path also quantizes the activation to q8_0). A
+  wrong route DIVERGES: the `kNoAttnSink` miswire moves the output RelL2 **0.122**.
+- **(c) MEMORY-BOUNDED (the crux):** at tiny shape host = **23,980 B** < keep-quant = **141,676 B**
+  (the weights are NOT in host); a test asserts the big host slots empty and `host_bytes < the
+  f32-expanded big-weight image`. PROJECTION to the real config: the 256 routed experts alone are
+  3·256·2048·4096·43·4 B ≈ **~1032 GiB** f32 (> 119 GiB → OOM-reboot, the bug) vs the keep-quant
+  `UD-IQ2_XXS` **~90.9 GiB** + small f32 host **< 3 GiB** = **93.9 GiB < 119 GiB → memory-FEASIBLE**
+  on ONE GB10.
+
+### W2c.3 Honest 3-state + the residual
+The tiny-shape keep-quant load→forward = **DERIVED + BUILD-VERIFIED**. It does NOT claim V4 "runs" a
+real model. The real **91 GB `UD-IQ2_XXS` load + generate + benchmark stays the operational W8-run**
+(download to the DGX + GB10) — but now **memory-FEASIBLE** (the ~1 TiB OOM is fixed). Resume: land the
+top-level `deepseek4` GGUF entrypoint arm (W8-final wiring — already landed in `LoadedEngine`), free
+DGX disk ≥100 GiB → `flock $HOME/gpu.lock` + `docker stop local-ai-worker` → download `UD-IQ2_XXS` (3
+shards) → keep-quant load → greedy gen → self-consistency + coherence gate → benchmark (llama.cpp-on-card
+floor). SACRED-inert: only `deepseek_v4.{h,cpp}` / `deepseek_v4_weights.cpp` + the test changed; the
+W3-W6 primitive host references (the correctness oracle) are UNTOUCHED and still pass; the shared
+MLA/MoE, README, Metal, SACRED, apex, darwin untouched.
