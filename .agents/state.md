@@ -32737,3 +32737,80 @@ CUDA-graph), the DGX e2e greedy our-draft-ON == vLLM-draft-ON token-exact gate o
 a real tiny-draft/target pair, and the throughput speed gate (match-or-beat vLLM
 on every axis) are W3, DGX-offline. NO production runner wiring in W1 (additive +
 default-inert; no path constructs a `DraftModelProposer`).
+
+## 2026-07-29 — `SPEC-DFLASH-GGUF` `GD10`: the end-to-end discriminator RUN, gates 3 and 5 CLOSED, row to `DONE` (correctness)
+
+**Claim** `CLAIM-DFLASH-GGUF-ACCEPT-RCA`. Worktree
+`/home/mudler/_git/vllm.cpp-abi-v9`, branch `feat/capi-abi-v9-engine-config`
+merged with `origin/main` `d319b23f` (three append-only conflicts in
+`coordination.md` / `parity-ledger.md` / `state.md`, resolved keep-both per
+protocol). NOT pushed. dgx.casa GB10 sm_121a, rebuilt from scratch after the
+box's 12:53 UTC reboot.
+
+**The one blocking measurement, and what it read.** `GD9` had root-caused the
+axis-A accept-count RED in weight space (ordinary `Q4_K_M` cost) but could not
+confirm it end to end, because dgx left the network mid-session. It is now run.
+On the 27B NVFP4 safetensors target, 48 tokens, k=16, greedy, c1, the **`BF16`
+GGUF draft reads 47 accepted / 96 proposed — EXACTLY the z-lab safetensors
+draft's own number** — reproduced 2 of 2, with `Q4_K_M` at 46/112 on the same
+binary in the same `flock` series. Also 27/64 = 27/64 at 24 tokens on that
+prompt and 15/144 = 15/144 at 24 tokens on "The capital of France is". Tokens
+IDENTICAL in every arm. **Swapping only the draft's numeric precision restores
+the count, so quantization is the whole cause and the weight-space conclusion
+holds.** Had anything structural survived in our GGUF draft path, the `BF16`
+GGUF would carry it too.
+
+**Build proven BEFORE any number was trusted, three ways.**
+`grep -ci "cutlass not found" configure.log` = 0 (log prints the CUTLASS,
+FlashAttention-2 `[121a]`, 29 `Triton AOT:` and `MANIFEST hashes OK` lines);
+`cuobjdump -lelf` on both gate binaries = 40 cubins, all `sm_121a`, zero
+`sm_75` (`CMakeCache.txt` still reads 75 and is still the decoy); SACRED
+`test_qwen27_paged_engine` 235/235, exit 0, 31.34s, 23.67 GiB. Asset
+`Qwen3.6-27B-DFlash-BF16.gguf` 3,471,497,440 B, md5
+`013ad3beddcfe6fcd35d45619b7eccba`, md5-verified after the copy to `~/bench/`.
+
+**The bar was SPLIT, not relaxed.** Bar (a) of the axis-A gate keeps the token
+half exact unconditionally and now gates the accept counts EXACT on a
+cross-FORMAT arm and BANDED on a cross-QUANTIZATION one. The arm is selected by
+`IsQuantizedGgufDraft`, which opens the draft and asks whether any tensor's ggml
+type packs more than one element per block — read from the ASSET, never from a
+flag, because a flag would let a future run band an arm that has no business
+being banded. The band is derived: `d_accepted` measured 0, 0, -1, so the bound
+is that maximum plus one quantum (2); and with tokens identical both arms emit
+the same token count and each `k`-wide block emits its accepted prefix plus one
+bonus token, so `accepted + nblocks` is constant across arms and
+`d_proposed = -k * d_accepted` EXACTLY (confirmed at -1 / +16, k=16). Tighter
+than the `SPEC-DFLASH` golden arm's `<= 4`. **Mutation-proved non-vacuous:** at
+band 0 the `Q4_K_M` arm is 15/17 exit 1 on both banded assertions while the
+`BF16` arm stays 17/17 exit 0 on the exact branch.
+
+**Axis B broadened from ONE prompt to THREE**, strict form green on all:
+"The capital of France is" IDENTICAL 14/160 (15/15), "Write a Python function
+that reverses a string:" IDENTICAL 24/64 (15/15), "Photosynthesis is the process
+by which" IDENTICAL 15/128 (9/9), all exit 0. The second prompt refines a
+recorded claim: the safetensors-target arm is ALSO 24/64 there with the two
+containers' DFlash-ON streams IDENTICAL, so the GGUF target's lower acceptance
+is prompt-dependent (spec-OFF divergence at index 4 on the first prompt, index
+16 on the second) and not a standing penalty.
+
+**Row state.** Gates 1-5 and 7 MET; gate 6 (speed) `PENDING` BY DESIGN and not
+owed — a DFlash-ON throughput A/B between the two target containers is not a
+fair comparison until a native NVFP4 GGUF GEMM exists. `SPEC-DFLASH-GGUF` moves
+`PARTIAL` -> `DONE` for correctness in the closing commit, with the ledger
+anchor and closing-commit owner AGENTS.md requires.
+
+**Records same-change.** Spec `gguf-dflash-draft.md` (new `GD10` section, gates
+3/4/5 rewritten, work-breakdown row, axis-B section, the void 20/80 figures
+corrected). `docs/STATUS.md` axis-A and axis-B dispositions compacted to the
+binding result. `docs/BENCHMARKS.md` new `GD10` top entry plus the superseded
+`GD9` "PENDING on hardware" and the older "REPRODUCIBLE RED" section marked
+closed. `.agents/engine-matrix.md` evidence field. `parity-ledger.md` and this
+entry.
+
+**Residuals (honest).** Gate 6 speed, as above, `PENDING` with its reproduction
+command in `docs/BENCHMARKS.md`. Axis B's acceptance characteristic is understood
+and attributed to `QUANT-GGUF-NVFP4` being dequant-only, which is that row's gap,
+not this one's. Pre-existing and NOT introduced here: `test_capi` SIGSEGV at
+`tests/capi/test_capi.cpp:410`, `test_model_loader_gguf` 2/3, and the
+`check-device-leakage` / `check-env-doc` reds on `origin/main`. Work is LOCAL
+ONLY; nothing pushed.

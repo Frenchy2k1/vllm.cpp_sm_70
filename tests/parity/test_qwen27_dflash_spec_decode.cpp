@@ -40,6 +40,7 @@
 
 #include "vllm/config/speculative.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/logprobs.h"
 #include "vllm/sampling_params.h"
 
@@ -338,6 +339,62 @@ SpecArm RunDflashOn(const std::string& target, const std::string& draft, int k,
   return arm;
 }
 
+// Does this draft SOURCE re-encode the weights at reduced precision? Decided
+// from the FILE, never from a flag, because that is exactly the fact bar (a)
+// turns on and a flag would let a future run band an arm that has no business
+// being banded. A ggml type is a re-encoding iff it packs MORE THAN ONE element
+// per block: `GgmlTraits().block_elems` is 1 for F32 / F16 / BF16 and 32-256 for
+// every Q*/IQ*/MXFP4/NVFP4 type (`gguf_reader.cpp` trait table). A checkpoint
+// directory or an HF repo id is not a GGUF at all and loads at its stored bf16,
+// so it answers false.
+bool IsQuantizedGgufDraft(const std::string& src) {
+  std::error_code ec;
+  if (!fs::is_regular_file(src, ec)) return false;
+  if (fs::path(src).extension() != ".gguf") return false;
+  const vllm::GgufFile f = vllm::GgufFile::Open(src);
+  for (const vllm::GgufTensorInfo& t : f.Tensors()) {
+    if (vllm::GgmlTraits(t.ggml_type).block_elems > 1) {
+      // `std::string(...)`, not the bare `const char*`: streaming a raw pointer
+      // into MESSAGE(...) prints its bool conversion, which is the same trap
+      // the spec-OFF verdict below already documents.
+      MESSAGE("GD9: " << src << " is a QUANTIZED GGUF (" << t.name << " is "
+                      << std::string(vllm::GgmlTraits(t.ggml_type).name) << ")");
+      return true;
+    }
+  }
+  MESSAGE("GD9: " << src << " is an UNQUANTIZED GGUF (every tensor a scalar "
+                     "ggml type)");
+  return false;
+}
+
+// The cross-QUANTIZATION accept band, and where the number comes from.
+//
+// It is NOT a tolerance chosen to make a red test green; that failure mode is
+// what this row already produced once, when the 2026-07-28 "Q4_K_M costs this
+// draft nothing" reading turned out to be an emulation-build artifact. It is
+// the measured spread plus exactly one quantum of headroom:
+//
+//   * `accepted` moves in units of 1, and the MEASURED cross-quantization delta
+//     on the production build is 0 on the 24-token prompt (both drafts equal)
+//     and 1 on the 48-token prompt (Q4_K_M 46 against bf16 47). A band equal to
+//     the observed maximum has zero margin and flips red on any single
+//     additional near-tie, so the bound is that maximum plus one unit: 2.
+//   * `proposed` is NOT an independent quantity. With the token streams
+//     identical (which bar (a) asserts unconditionally, and which the verifier
+//     guarantees), both arms emit the same number of tokens, and each 16-wide
+//     propose block emits its accepted prefix plus one bonus token. So
+//     `accepted + nblocks` is the same constant in both arms, hence
+//     `proposed = k * nblocks` gives `d_proposed = -k * d_accepted` EXACTLY.
+//     The measurement confirms it: 46/112 against 47/96 is d_accepted -1 and
+//     d_proposed +16 = -16 * -1. The proposed bound is therefore `k` times the
+//     accepted bound by derivation, not by a second choice.
+//
+// It is also TIGHTER than the precedent it follows: the landed `SPEC-DFLASH`
+// golden arm bands its acceptance at `<= 4`.
+constexpr int64_t kCrossQuantAcceptBand = 2;
+
+int64_t AbsDelta(int64_t a, int64_t b) { return a > b ? a - b : b - a; }
+
 }  // namespace
 
 TEST_CASE("dflash axis-A: a GGUF draft and a safetensors draft are the same draft") {
@@ -466,12 +523,43 @@ TEST_CASE("dflash axis-A: a GGUF draft and a safetensors draft are the same draf
                   ? std::string("IDENTICAL")
                   : "first divergence at index " + std::to_string(xf_diff)));
 
-  // (a) THE BAR. Same weights, two containers, one target: identical tokens and
-  // identical draft accounting. Nothing about the DFlash near-tie envelope can
-  // excuse a difference here, because both arms run the identical code path.
+  // (a) THE BAR, split by what the two arms ACTUALLY vary (`GD9`).
+  //
+  // TOKENS are exact in BOTH forms and are never banded. That half is not even
+  // a hope: `rejection_sampler.h` pins ACCEPT-IFF-EQUAL with
+  // STOP-AT-FIRST-MISMATCH, so under greedy verification the emitted stream is
+  // the TARGET's own greedy continuation whatever the draft proposes.
   CHECK(arm_a.ids == arm_b.ids);
-  CHECK(arm_a.proposed == arm_b.proposed);
-  CHECK(arm_a.accepted == arm_b.accepted);
+
+  // The ACCEPT COUNTS are the only channel carrying information about the
+  // draft, and what they are worth depends on whether the two arms hold the
+  // same weights. The original single bar read "Same weights, two containers",
+  // which is TRUE of an unquantized GGUF against the safetensors shards and
+  // FALSE of a `Q4_K_M` file, which is a 4-bit re-encoding of them. So:
+  const bool cross_quant =
+      IsQuantizedGgufDraft(draft_a) || IsQuantizedGgufDraft(draft_b);
+  if (!cross_quant) {
+    // CROSS-FORMAT. Same weights to the byte (gate 2 proves that at load:
+    // 58/58 tensors byte-identical through this same loader path), so exact
+    // accounting is a real invariant and the right bar. Nothing about the
+    // DFlash near-tie envelope can excuse a difference, because both arms run
+    // the identical code path and differ only in where the bytes came from.
+    MESSAGE("GD9: CROSS-FORMAT arm (neither draft is quantized), accept "
+            "counts gated EXACT");
+    CHECK(arm_a.proposed == arm_b.proposed);
+    CHECK(arm_a.accepted == arm_b.accepted);
+  } else {
+    // CROSS-QUANTIZATION. Different weights by construction, so an exact
+    // accept-count bar asserts something the arms do not satisfy. Banded; see
+    // kCrossQuantAcceptBand for where the two bounds come from.
+    MESSAGE("GD9: CROSS-QUANTIZATION arm, accept counts gated to band "
+            << kCrossQuantAcceptBand << " (proposed " << k << "x that): "
+            << "d_accepted=" << (arm_a.accepted - arm_b.accepted)
+            << " d_proposed=" << (arm_a.proposed - arm_b.proposed));
+    CHECK(AbsDelta(arm_a.accepted, arm_b.accepted) <= kCrossQuantAcceptBand);
+    CHECK(AbsDelta(arm_a.proposed, arm_b.proposed) <=
+          static_cast<int64_t>(k) * kCrossQuantAcceptBand);
+  }
 }
 
 // ── SPEC-DFLASH-GGUF `GD7`: the axis-B end-to-end token + acceptance gate ───

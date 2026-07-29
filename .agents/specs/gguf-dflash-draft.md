@@ -273,6 +273,64 @@ draft collapses acceptance; it does not shave one.
   hoped for - and the accept counts get a band, the way the landed `SPEC-DFLASH`
   golden arm's already are (`abs(acc - want) <= 4`).
 
+## The END-TO-END confirmation, RUN 2026-07-29 (`GD10`). The weight-space conclusion HOLDS
+
+The discriminator the section above owed was run on GB10 as soon as the box came
+back, on a build proven production-configured three ways (configure log has ZERO
+`CUTLASS not found`; `cuobjdump -lelf` reports 40 cubins, ALL `sm_121a`, zero
+`sm_75`, on both gate binaries; SACRED `test_qwen27_paged_engine` **235/235,
+exit 0**, 31.34s, 23.67 GiB). One flock series on an idle box, same binary in
+every arm.
+
+**The `BF16` GGUF draft reads exactly what the safetensors draft reads, on every
+prompt and length measured, with the counts EXACT and not merely close:**
+
+| Prompt | tok | BF16 GGUF draft | `Q4_K_M` GGUF draft | safetensors draft | verdict |
+|---|---|---|---|---|---|
+| "Write a Python function that reverses a string:" | 48 | **47 / 96** | 46 / 112 | 47 / 96 | BF16 EXACT; `Q4_K_M` off by 1 accept |
+| "Write a Python function that reverses a string:" | 48 (repeat) | **47 / 96** | - | 47 / 96 | reproduced |
+| "Write a Python function that reverses a string:" | 24 | **27 / 64** | - | 27 / 64 | EXACT |
+| "The capital of France is" | 24 | **15 / 144** | 15 / 144 | 15 / 144 | both EXACT |
+
+Tokens are IDENTICAL in every arm. Each `BF16` arm passes the unchanged exact
+bar 17/17, exit 0; the `Q4_K_M` 48-token arm is the only red, 15/17, exit 1, on
+the same binary in the same series.
+
+**So quantization is the WHOLE cause.** The 48-token prompt is the one that
+discriminates, and swapping ONLY the draft's numeric precision - same file
+format, same loader, same resolver, same config path, same target, same kernels -
+moves the count from 46/112 back to exactly 47/96. Nothing structural survives:
+had any part of the GGUF draft path been defective, the `BF16` GGUF would carry
+that defect too, and it does not.
+
+**The band, and where its number comes from.** The cross-QUANTIZATION arm is
+banded at `|d_accepted| <= 2` with `|d_proposed| <= k * 2`
+(`kCrossQuantAcceptBand`, `tests/parity/test_qwen27_dflash_spec_decode.cpp`).
+Neither bound is a round number chosen to turn the test green:
+
+- `accepted` moves in units of 1, and the MEASURED cross-quantization delta is 0
+  on both 24-token prompts and 1 on the 48-token prompt. A band equal to the
+  observed maximum has zero margin and flips red on any single additional
+  near-tie, so the bound is that maximum plus one quantum: **2**.
+- `proposed` is NOT free. With the token streams identical (which the bar
+  asserts unconditionally), both arms emit the same number of tokens and each
+  `k`-wide propose block emits its accepted prefix plus one bonus token, so
+  `accepted + nblocks` is the same constant in both arms and
+  `d_proposed = -k * d_accepted` EXACTLY. The data confirms it: 46/112 against
+  47/96 is `d_accepted = -1`, `d_proposed = +16 = -16 * -1`. The proposed bound
+  is therefore `k` times the accepted bound by derivation, not by a second
+  choice.
+
+It is also TIGHTER than the precedent it follows, the landed `SPEC-DFLASH`
+golden arm's `abs(acc - want) <= 4`.
+
+**Which arm a run takes is read from the ASSET, never from a flag.**
+`IsQuantizedGgufDraft` opens the draft and asks whether any tensor's ggml type
+packs more than one element per block (`GgmlTraits().block_elems > 1`, which is
+1 for F32/F16/BF16 and 32-256 for every Q*/IQ*/MXFP4/NVFP4 type). A flag would
+let a future run band an arm that has no business being banded, which is exactly
+the failure mode this row has already had once.
+
 ## Our baseline
 
 - **The DFlash weight loader is already resolver-shaped**, exactly like the MTP
@@ -335,8 +393,8 @@ gates.
 | Resolver name mapping | same | Every name `LoadQwen3DFlash` requests resolves; `fc`/`enc.output_norm`/`output_norm` land on the right fields. RED-first via a deliberately swapped norm. |
 | Draft-path discrimination | same or the model-loader test | `ResolveDflashDraftDir` accepts a `.gguf` file, a dir with `config.json`, and an HF-cache snapshot; rejects a dir with neither, with both the reference and the searched locations in the message. |
 | Cross-format draft equivalence | LANDED 2026-07-29 in `tests/vllm/models/test_qwen3_dflash_gguf.cpp` third case (a unit, not a parity, test: it needs no engine) | The SAME draft, loaded from safetensors and from an UNQUANTIZED GGUF, produces bit-identical `Qwen3DFlashWeights` (compare tensor bytes). The strongest cheap gate and needs no GPU, as the spike said - it was simply believed unavailable. Asset-gated on `VLLM_DFLASH_GGUF_BF16_MODEL` + `VLLM_DFLASH_ST_DIR`. |
-| Axis-A token gate | `tests/parity/test_qwen27_dflash_spec_decode.cpp` second case (NOT a new file: the existing one is the same engine path and only lacked a draft-source override) | MODE-MATCHED and CROSS-FORMAT, both drafts in ONE process: `VLLM_DFLASH_DRAFT` vs `VLLM_DFLASH_DRAFT_B` must produce identical DFlash-ON tokens AND identical accepted/proposed, each with nonzero acceptance. Companions: near-tie-robust vs spec-OFF (`D5` form), a spec-OFF self-reproducibility control, and a target margin sweep. **Not `spec-ON == spec-OFF`**: that is the MTP bar, and `SPEC-DFLASH` `D5` measured vLLM's own DFlash-ON as token-different from vLLM's own spec-OFF on 3 of 4 prompts. |
-| Axis-B token gate | same file, second case | GGUF-target spec-ON == GGUF-target spec-OFF at c1; plus acceptance > 0. |
+| Axis-A token gate | `tests/parity/test_qwen27_dflash_spec_decode.cpp` second case (NOT a new file: the existing one is the same engine path and only lacked a draft-source override) | MODE-MATCHED and CROSS-FORMAT, both drafts in ONE process: `VLLM_DFLASH_DRAFT` vs `VLLM_DFLASH_DRAFT_B` must produce identical DFlash-ON tokens, each with nonzero acceptance, plus accept counts EXACT when neither draft is quantized and BANDED when one is (`GD10`; the arm is chosen by `IsQuantizedGgufDraft`, which reads the file's ggml types). Companions: near-tie-robust vs spec-OFF (`D5` form), a spec-OFF self-reproducibility control, and a target margin sweep. **Not `spec-ON == spec-OFF`**: that is the MTP bar, and `SPEC-DFLASH` `D5` measured vLLM's own DFlash-ON as token-different from vLLM's own spec-OFF on 3 of 4 prompts. |
+| Axis-B token gate | same file, third case | GGUF-target spec-ON == GGUF-target spec-OFF at c1; plus acceptance > 0. Prompt-parameterized (`VLLM_DFLASH_PROMPT`); run on THREE prompts as of `GD10`. |
 | Shared-head equivalence (B) | unit | `SharedHeadSource` over an F16 GGUF yields bf16 bit-identical to the safetensors path. |
 
 ## Gates
@@ -357,57 +415,80 @@ gates.
    NOT a vacuous pass: pointed at the `Q4_K_M` file the same case FAILS with 21
    of 302 assertions red (exactly the 21 quantized matmul tensors; the 22 F32
    norms stay bit-equal), exit 1.
-3. **Axis-A cross-format equivalence, c1. TOKEN half MET; ACCEPT-COUNT half RED
-   as of the 2026-07-29 production-build re-measurement.** The DFlash-ON greedy
-   continuation from the Q4_K_M GGUF draft is still token-for-token identical to
-   the one from the bf16 safetensors draft on BOTH prompts, so the TOKEN half
-   stands. The proposed/accepted counts no longer agree: at 24 tokens both drafts
-   are 15/144 and the gate passes 17/17, at 48 tokens the GGUF draft is 46/112
-   against the safetensors draft's 47/96 and the gate FAILS 15/17, exit 1,
-   reproduced 3 of 3 runs. The 2026-07-28 "MET" reading came from a build
-   configured without `-DVLLM_CPP_CUTLASS_DIR` and without `-DVLLM_CPP_TRITON=ON`,
-   i.e. running the emulation fp4 GEMM, which masked the difference. **Note the
-   restatement:** the original wording of this gate was "GGUF draft ==
-   safetensors draft", which is what is measured; an earlier attempt to gate on
-   `spec-ON == spec-OFF` instead was wrong for DFlash and is recorded under `GD4`
-   below. **Open question this now raises:** whether the bar should stay
-   accept-count-EXACT or become accept-count-BANDED the way the landed
-   `SPEC-DFLASH` golden arm's is (`abs(acc - want) <= 4`, which 46 vs 47 would
-   satisfy). **ANSWERED 2026-07-29 by the `GD9` root cause above, in weight
-   space:** the exact bar is right for a cross-FORMAT arm and wrong for the
-   cross-QUANTIZATION arm it was pointed at, because its own premise ("same
-   weights, two containers") is false against a `Q4_K_M` file and true against
-   the `BF16` one. The end-to-end confirmation (`bf16_vs_st` at 48 tokens must
-   read exactly `47/96`, `Q4_K_M` a band around it) is NOT YET RUN - dgx.casa
-   dropped off the network mid-session on 2026-07-29 and did not return, so no
-   GPU number was produced this round and none is claimed. The RED stands.
+3. **Axis-A cross-format equivalence, c1. MET 2026-07-29 (`GD10`), in the SPLIT
+   form the `GD9` root cause established.** The bar is now two bars, selected
+   from the ASSET rather than from a flag:
+   - **cross-FORMAT** (`BF16` GGUF draft against the z-lab safetensors draft):
+     tokens IDENTICAL and accept counts EXACT, on every prompt and length
+     measured - `47/96` both arms at 48 tokens (reproduced, 2 of 2 runs),
+     `27/64` both at 24 tokens on that prompt, `15/144` both at 24 tokens on
+     "The capital of France is". 17/17 assertions, exit 0, each time.
+   - **cross-QUANTIZATION** (`Q4_K_M` GGUF draft against the same safetensors
+     draft): tokens IDENTICAL, accept counts banded at `|d_accepted| <= 2` and
+     `|d_proposed| <= k*2`. Measured `d_accepted` is 0 at 24 tokens and -1 at 48
+     (46/112 against 47/96). 17/17 assertions, exit 0.
+
+   The earlier RED was real and is not being papered over: it is the SAME 46/112
+   measurement, now attributed. Swapping ONLY the draft's numeric precision, with
+   the file format, loader, resolver, config path, target and kernels all held
+   fixed, restores 47/96 exactly - which is what proves the exact bar was aimed at
+   the wrong premise rather than catching a defect. **The 2026-07-28 "MET"
+   reading is still void** (it came from a build configured without
+   `-DVLLM_CPP_CUTLASS_DIR` and without `-DVLLM_CPP_TRITON=ON`, i.e. the
+   emulation fp4 GEMM, which masked the difference); this MET is on a build
+   proven production-configured three ways. **Note the restatement:** the
+   original wording of this gate was "GGUF draft == safetensors draft", which is
+   what is measured; an earlier attempt to gate on `spec-ON == spec-OFF` instead
+   was wrong for DFlash and is recorded under `GD4` below. **The band is not
+   vacuous, proven by mutation:** rebuilt with `kCrossQuantAcceptBand = 0` the
+   `Q4_K_M` arm goes 15/17, exit 1, on both banded assertions, while the `BF16`
+   arm is untouched at 17/17 (it takes the exact branch), so both the band and
+   the branch selection are load-bearing.
 4. **Axis-B token identity, c1. MET 2026-07-28, RE-CONFIRMED 2026-07-29 on a
-   production build**, in its strict form: on the GGUF target the DFlash-ON
+   production build, and BROADENED 2026-07-29 (`GD10`) from ONE prompt to
+   THREE.** In its strict form on every one: on the GGUF target the DFlash-ON
    continuation is token-for-token identical to that same target's spec-OFF,
-   24/24, with acceptance 14/160 and the cross-target spec-OFF divergence still
-   at index 4, every number unchanged. Note this is a WITHIN-target bar. A
-   CROSS-target one was considered and rejected on evidence: the two containers
-   diverge at index 4 without any speculation, so it would gate their arithmetic
-   rather than this row (see the axis-B section above).
-5. **Acceptance parity. NOT MET for axis A as of 2026-07-29.** The 2026-07-28
-   reading ("EXACTLY equal on both prompts, 20/80 and 42/96, so Q4_K_M costs this
-   draft nothing") was measured on the defective build and is void. On a
-   production build the 24-token prompt is 15/144 for both drafts but the
-   48-token prompt is 46/112 for the GGUF draft against 47/96 for the bf16 one,
-   so the spike's flagged risk is REAL: the 4-bit draft needs one extra 16-wide
-   propose block and lands one fewer acceptance, while emitting identical tokens.
-   **ROOT-CAUSED IN WEIGHT SPACE 2026-07-29** (the `GD9` section above):
-   category (a), ordinary `Q4_K_M` cost. A structural defect is eliminated in the
-   loader (gate 2, 58/58 byte-identical over the same code path), in the
-   dequantizer (bit-equal to `gguf-py` on the real tensors) and in the config
-   (only `rms_norm_eps` at 2.5e-9 relative and a benign `vocab_size` provenance
-   differ). What remains is the end-to-end confirmation on GB10; it is the
-   reason axis A is still not closed.
-   **For axis B: MEASURED, nonzero, and lower** - 14/160 vs the safetensors
-   target's 15/144 same-draft same-prompt on the production build (the older
-   20/80 comparison figure is void) - with the cause established as the GGUF target's bf16 compute
-   path and the shared head EXCLUDED by a byte comparison. Recorded as a
-   finding, per the risk decision below.
+   with acceptance alive in each case.
+
+       "The capital of France is"                      IDENTICAL   14/160  15/15 assertions
+       "Write a Python function that reverses a ..."   IDENTICAL   24/64   15/15
+       "Photosynthesis is the process by which"        IDENTICAL   15/128   9/9
+
+   All exit 0, 24 tokens, k=16, c1, `Q4_K_M` draft, one `flock` series on an
+   idle box. Note this is a WITHIN-target bar. A CROSS-target one was considered
+   and rejected on evidence: the containers diverge without any speculation, so
+   it would gate their arithmetic rather than this row (see the axis-B section
+   above), and the third prompt confirms that reading independently.
+5. **Acceptance parity. MET for axis A 2026-07-29 (`GD10`); MEASURED and
+   dispositioned for axis B.** The 2026-07-28 reading ("EXACTLY equal on both
+   prompts, 20/80 and 42/96, so Q4_K_M costs this draft nothing") was measured on
+   the defective build and stays void. On a production build the answer splits
+   cleanly by what the draft file actually contains:
+   - **An unquantized GGUF draft accepts EXACTLY what the safetensors draft
+     accepts.** 47/96 = 47/96 at 48 tokens (2 of 2 runs), 27/64 = 27/64 and
+     15/144 = 15/144 at 24 tokens. Zero delta, not "close".
+   - **`Q4_K_M` costs at most ONE acceptance** on the prompts measured: 0 at 24
+     tokens, 1 out of 47 at 48 tokens, with the emitted tokens identical. The
+     extra 16-wide propose block is the arithmetic consequence of that single
+     acceptance (`d_proposed = -k * d_accepted`), not a second effect.
+
+   **ROOT CAUSE CONFIRMED END TO END** (the `GD9` weight-space work plus the
+   `GD10` run above): category (a), ordinary `Q4_K_M` cost. A structural defect
+   was already eliminated in the loader (gate 2, 58/58 byte-identical over the
+   same code path), in the dequantizer (bit-equal to `gguf-py` on the real
+   tensors) and in the config (only `rms_norm_eps` at 2.5e-9 relative and a
+   benign `vocab_size` provenance differ); the `BF16`-draft arm closes it by
+   showing the whole difference disappears when precision is the only thing
+   restored.
+   **For axis B: MEASURED, nonzero on all three prompts, and prompt-dependent
+   rather than uniformly lower** - 14/160 against the safetensors target's
+   15/144 on "The capital of France is", but **24/64 against 24/64, i.e. EQUAL,
+   with the two containers' DFlash-ON streams IDENTICAL**, on the Python prompt
+   (their spec-OFF streams diverge only at index 16 there, against index 4 on the
+   first prompt). So the earlier "acceptance is lower on the GGUF target" is a
+   property of how far apart the two containers' arithmetic drifts on a given
+   prompt, not a standing penalty. The shared head remains EXCLUDED by a byte
+   comparison. Recorded as a finding, per the risk decision below.
 6. **Speed: PENDING, not owed by this row.** Owes a `docs/BENCHMARKS.md`
    disposition, which may be `PENDING` with the reproduction command.
 7. **Shared-head equivalence (B). MET 2026-07-28**, twice over: three synthetic
@@ -455,10 +536,11 @@ gates.
 | `GD6` | **DONE 2026-07-28.** The `dflash` half of the GGUF-branch rejection is deleted (`model_loader.cpp`); the `mtp` half is untouched | Gate 1 | `GD5` |
 | `GD7` | **DONE 2026-07-28 - axis B GENERATES on GB10.** `maybe_load_dflash`'s equivalent wired into the GGUF branch; e2e gate `tests/parity/test_qwen27_dflash_spec_decode.cpp` third case. See the axis-B result below | Gate 4 | `GD6` |
 | `GD8` | Record: STATUS, BENCHMARKS, matrix, ledger | Checkers green | `GD7` |
-| `GD9` | **Root-cause the axis-A accept-count RED. WEIGHT-SPACE HALF DONE 2026-07-29, category (a) established; the end-to-end half is what remains.** Enabled gate 2 with the previously-overlooked `BF16` GGUF (58/58 byte-identical, RED-first against `Q4_K_M`), bit-checked our Q4_K/Q6_K dequant against `gguf-py`, measured the whole quantization ladder, enumerated and excluded the config delta, and added the `VT_SPEC_TRACE=1` per-block propose/accept trace the totals cannot substitute for. See the root-cause section above | Gates 2, 3, 5 | `GD4` |
+| `GD9` | **DONE 2026-07-29 - root-caused the axis-A accept-count RED in WEIGHT SPACE, category (a).** Enabled gate 2 with the previously-overlooked `BF16` GGUF (58/58 byte-identical, RED-first against `Q4_K_M`), bit-checked our Q4_K/Q6_K dequant against `gguf-py`, measured the whole quantization ladder, enumerated and excluded the config delta, and added the `VT_SPEC_TRACE=1` per-block propose/accept trace the totals cannot substitute for. See the root-cause section above | Gates 2, 3, 5 | `GD4` |
+| `GD10` | **DONE 2026-07-29 - the END-TO-END confirmation, and the bar split it licenses.** Ran the discriminator on GB10 (build proven production-configured three ways): the `BF16` GGUF draft reads **exactly 47/96**, the safetensors draft's own number, at 48 tokens; `Q4_K_M` reads 46/112 on the same binary in the same series. So quantization is the whole cause. Split bar (a) in `tests/parity/test_qwen27_dflash_spec_decode.cpp` into an EXACT cross-FORMAT arm and a BANDED cross-QUANTIZATION arm, with the arm chosen by `IsQuantizedGgufDraft` reading the draft's ggml types rather than by a flag, and the band derived from the measurement (`|d_accepted| <= 2`, `|d_proposed| <= k*2`) and mutation-proved non-vacuous at band 0. Broadened axis B from one prompt to three, all strict-form green | Gates 3, 4, 5 | `GD9` |
 
-`GD0`-`GD4` are axis A and independently shippable; the row can legitimately rest
-at `PARTIAL` after `GD4`.
+`GD0`-`GD4` are axis A and independently shippable; the row could legitimately
+rest at `PARTIAL` after `GD4`, and did until `GD10` closed gates 3 and 5.
 
 ## The axis-B result, and the risk that did NOT materialize (`GD5`-`GD7`)
 
@@ -467,8 +549,13 @@ Axis B WORKS. On dgx GB10 sm_121a, the Qwen3.6-27B NVFP4 **GGUF** target plus th
 (`shared head from the GGUF target file`) and generates a coherent continuation,
 with the DFlash-ON sequence **token-for-token IDENTICAL to that same target's
 spec-OFF** on the c1 24-token prompt - the strict form of gate 4, not merely the
-near-tie-robust one. Acceptance is alive at **14/160**. One prompt at c1; the
-case asserts the near-tie-robust form so it does not become brittle.
+near-tie-robust one. Acceptance is alive at **14/160**. The case asserts the
+near-tie-robust form so it does not become brittle.
+
+**BROADENED to THREE prompts 2026-07-29 (`GD10`)**, because one sample is not a
+row: "Write a Python function that reverses a string:" gives IDENTICAL with
+acceptance 24/64 (15/15 assertions), and "Photosynthesis is the process by which"
+gives IDENTICAL with 15/128 (9/9). The strict form holds on all three.
 
 **The spike ranked the shared-head dequant as its highest risk** (the draft would
 score with a bf16 head dequantized from quantized target blocks while the target
@@ -482,11 +569,16 @@ and the draft scores with exactly the head it scores with on axis A. A GGUF that
 DID quantize its head would re-open the risk, which is why the gate stays a
 measurement rather than an assumption.
 
-**Acceptance IS lower on the GGUF target - 14/160 (0.0875) vs 20/80 (0.25) on the
-safetensors target, same draft, same prompt - and it is NOT chargeable to the
-shared head.** The two containers are not the same target: their spec-OFF
-continuations already diverge at index 4 with NO speculation anywhere, and the
-DFlash-ON pair diverges at exactly that same index 4. The cause is `QUANT-GGUF-NVFP4`
+**Acceptance on the GGUF target is PROMPT-DEPENDENT, and where it is lower it is
+NOT chargeable to the shared head.** On "The capital of France is" it is 14/160
+(0.0875) against the safetensors target's 15/144 (0.1042), same draft, same
+prompt; on "Write a Python function that reverses a string:" the two targets are
+**EQUAL at 24/64 with IDENTICAL DFlash-ON streams** (`GD10`). The discriminator
+is how far apart the containers' own arithmetic drifts: their spec-OFF
+continuations diverge at index 4 on the first prompt and only at index 16 on the
+second, with NO speculation anywhere, and the DFlash-ON pair tracks that. (The
+older 20/80 comparison figure is void, from the defective build.) The cause is
+`QUANT-GGUF-NVFP4`
 being dequant-only - there is no NVFP4 GGUF GEMM, so on CUDA the GGUF target
 EXPANDS to bf16 and computes in bf16 while the safetensors target runs the true
 W4A4 fp4 kernels. A drafter proposing for a numerically different target agrees
@@ -513,7 +605,9 @@ never this row.
   GGUF" is what the spike assumed; the 27B NVFP4 GGUF actually stores
   `token_embd`/`output` as ggml BF16 beside its NVFP4 body, byte-identical to the
   safetensors sibling, so nothing is dequantized and both arms score with the
-  SAME head. Acceptance did drop (14/160 vs 20/80), and it is precisely the byte
+  SAME head. Acceptance did drop on one prompt (14/160 against the safetensors
+  target's 15/144, while a second prompt has them EQUAL at 24/64), and it is
+  precisely the byte
   comparison that let that be attributed to the GGUF target's bf16 compute path
   instead. The "documented minimum target quantization" contingency is therefore
   NOT owed; what a future quantized-head GGUF owes is a re-measurement, not a
