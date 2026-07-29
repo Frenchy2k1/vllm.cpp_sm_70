@@ -827,6 +827,19 @@ std::vector<float> ClampedSwiGLULaunch(Queue& q, const std::vector<float>& gate_
   return out;
 }
 
+// Brick B — IN-PLACE clamped-SwiGLU (unified memory, no Upload/Download/Sync). Same
+// ClampedSwiGLUKernel as ClampedSwiGLULaunch, run directly on the caller's unified
+// gate_up[2*d]/out[d] pointers. Bit-identical (elementwise). Caller drains.
+void ClampedSwiGLUInPlaceLaunch(Queue& q, float* out, const float* gate_up, int64_t d,
+                                float limit, float alpha, float beta) {
+  if (d == 0) return;
+  cudaStream_t s = AsStream(q);
+  const int block = 128;
+  ClampedSwiGLUKernel<<<Grid(d, block), block, 0, s>>>(gate_up, static_cast<int>(d), limit,
+                                                       alpha, beta, out);
+  Check(cudaGetLastError(), "clamped_swiglu_ip launch");
+}
+
 // ── Brick A: device MLA decode/prefill attention (unified memory, in place) ───
 // One block per (query t, head h). num KV heads = 1 (all heads share the cached
 // latent kv[s]). BIT-IDENTICAL to the host SoftmaxWithSink path by preserving its
@@ -916,7 +929,8 @@ const DsaDeviceKernels kDsa = {&DsaWeightFoldLaunch, &DsaLogitsLaunch, &DsaTopkL
                                &SoftmaxSinkLaunch, &GroupedOLoraLaunch, &DecodeAttnLaunch};
 const CompressorDeviceKernels kComp = {&SaveScoreApeLaunch, &PoolNormLaunch, &Fp8EncodeLaunch,
                                        &Fp8DecodeLaunch};
-const MoeDeviceKernels kMoe = {&SqrtSoftplusLaunch, &RouteLaunch, &ClampedSwiGLULaunch};
+const MoeDeviceKernels kMoe = {&SqrtSoftplusLaunch, &RouteLaunch, &ClampedSwiGLULaunch,
+                               &ClampedSwiGLUInPlaceLaunch};
 
 struct Registrar {
   Registrar() {

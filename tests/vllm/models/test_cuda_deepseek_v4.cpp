@@ -522,3 +522,34 @@ TEST_CASE("DeepseekV4 device MLA decode attention == host SoftmaxWithSink (Brick
   CHECK(RelL2(o_ns, o) > 1e-4);
   CHECK(RelL2(o_ns, host_ref(true)) < 1e-5);  // and it matches the no-sink host ref
 }
+
+// Brick B: the IN-PLACE device clamped-SwiGLU (unified memory, no Upload/Download)
+// == the host ClampedSwiGLU. Same ClampedSwiGLUKernel as the #183 clamped_swiglu.
+// CHARACTERIZED NEAR-TIE (not bit-identical): the device SiLU sigmoid uses `expf`
+// while the host uses `std::exp`, so results agree to ~last-ULP (RelL2 < 1e-5),
+// NOT bitwise — stated, not hidden. RED-first: changing the clamp limit changes out.
+TEST_CASE("DeepseekV4 device clamped-SwiGLU in place == host (Brick B)") {
+  if (!HasCuda()) return;  // DGX-only
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t d = 256;
+  const float limit = 7.0f, alpha = 1.0f, beta = 0.0f;
+  const std::vector<float> gate_up = Rand(r, 2 * d, -10.0f, 10.0f);  // spans the clamp
+
+  std::vector<float> o(static_cast<size_t>(d), 0.0f);
+  vllm::deepseek_v4::MoeDevice()->clamped_swiglu_ip(g.q, o.data(), gate_up.data(), d, limit,
+                                                    alpha, beta);
+  gpu.Synchronize(g.q);
+  const std::vector<float> ref = vllm::deepseek_v4::ClampedSwiGLU(gate_up, d, limit, alpha, beta);
+  REQUIRE(o.size() == ref.size());
+  for (float v : o) CHECK(std::isfinite(v));
+  CHECK(RelL2(o, ref) < 1e-5);  // near-tie (device expf vs host std::exp in the SiLU)
+
+  // RED-first: a different clamp limit must change the output.
+  std::vector<float> o2(static_cast<size_t>(d), 0.0f);
+  vllm::deepseek_v4::MoeDevice()->clamped_swiglu_ip(g.q, o2.data(), gate_up.data(), d, 1.0f,
+                                                    alpha, beta);
+  gpu.Synchronize(g.q);
+  CHECK(RelL2(o2, o) > 1e-4);
+}

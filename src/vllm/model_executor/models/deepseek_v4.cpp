@@ -170,6 +170,17 @@ inline bool DeviceAttnEnabled() {
   return on;
 }
 
+// Brick B (device-resident decode campaign): run the MoE/MHC glue on device kernels
+// (in place on the unified activations) instead of the host reference. Default OFF
+// until the decode graph (Brick D) proves out. `VT_V4_DEVICE_GLUE=1`.
+inline bool DeviceGlueEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_DEVICE_GLUE");
+    return e != nullptr && std::string(e) == "1";
+  }();
+  return on;
+}
+
 // One MatmulBT + (optional device) drain, timed when profiling is on. When
 // `defer_sync` is true the stream is NOT drained here — the caller issues a batch
 // of independent GEMMs and drains ONCE via DrainDevice before the host reads them
@@ -304,6 +315,17 @@ deepseek_v4::MoeRouteResult DispRoute(const V4Backend& be, const std::vector<flo
 std::vector<float> DispClampedSwiGLU(const V4Backend& be, const std::vector<float>& gate_up,
                                      int64_t d, float limit, float alpha, float beta) {
   if (be.device) return deepseek_v4::MoeDevice()->clamped_swiglu(*be.q, gate_up, d, limit, alpha, beta);
+  // Brick B: the GGUF keep-quant path (be.device=false) runs the clamped-SwiGLU on
+  // the device kernel IN PLACE over the unified activation when VT_V4_DEVICE_GLUE +
+  // a CUDA queue + the V4 device kernels are live; bit-identical (elementwise).
+  if (be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU && DeviceGlueEnabled() &&
+      deepseek_v4::V4DeviceKernelsAvailable()) {
+    std::vector<float> out(static_cast<size_t>(d));
+    deepseek_v4::MoeDevice()->clamped_swiglu_ip(*be.q, out.data(), gate_up.data(), d, limit,
+                                                alpha, beta);
+    SyncDeviceGemm(be);  // Brick B drains; Brick D will capture instead
+    return out;
+  }
   return ClampedSwiGLU(gate_up, d, limit, alpha, beta);
 }
 

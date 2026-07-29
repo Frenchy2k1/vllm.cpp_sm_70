@@ -33460,3 +33460,35 @@ removes the host KV Dot loop, a win that grows with context), 6.85 vs 6.60 (11-t
 (surrounding glue still host-syncs — the payoff is at Brick D's graph); peak 86.33 GiB unchanged.
 Rollback-able (`VT_V4_DEVICE_ATTN` default OFF). `VT_V4_DEVICE_ATTN` allowlisted. Bricks B→C→D await
 coordinator review. Box restored (worker up restart=always, flock free, no stray). Row `ACTIVE`.
+
+## DeepSeek-V4 device-resident decode campaign — Brick B increment 1 (device clamped-SwiGLU in place) (2026-07-29, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-dgl`, branch `deepseek-v4-device-glue`, base `21191ce2`, commit `f09437ef`, NOT pushed)
+
+Brick A merged (`21191ce2`); greenlit Brick B (device glue kernels). Brick B reimplements the decode
+step's host glue (MHC pre/post/Sinkhorn, RMSNorms, rope, router, clamped-SwiGLU, MoE combine) as real
+in-place device kernels (no Upload/Download/Sync — the Brick-A pattern, NOT the #183 `<<<1,1>>>` stubs),
+toward the device-resident decode (Brick C) + graph (Brick D). It is a large brick (7-9 kernels each
+needing host-order-preserving equivalence gates), so I land it in GATED INCREMENTS to hold the
+correctness bar — reporting per increment.
+
+**Increment 1 = device clamped-SwiGLU (in place).** The cleanest first piece: elementwise, single-point
+`DispClampedSwiGLU` wiring, reuses the already-tested #183 `ClampedSwiGLUKernel`. `ClampedSwiGLUInPlaceLaunch`
+(`cuda_deepseek_v4.cu`) runs that kernel directly on the caller's unified `gate_up[2*d]`/`out[d]` pointers,
+no Upload/Download, no sync (caller drains at Brick B / captures at Brick D); `clamped_swiglu_ip` added to
+`MoeDeviceKernels`; `DispClampedSwiGLU` routes to it under `VT_V4_DEVICE_GLUE=1` + a CUDA queue +
+`V4DeviceKernelsAvailable()`, else the host `ClampedSwiGLU` (default OFF — host path default until Brick D).
+
+**CHARACTERIZED NEAR-TIE (stated, not hidden):** device vs host is RelL2 < 1e-5, NOT bit-identical — the
+device SiLU sigmoid uses `expf` while the host uses `std::exp` (~last-ULP). My initial test asserted
+bit-identity and correctly FAILED (31/256 elems differed in the last ULP, values equal to 6 sig figs);
+fixed the gate to a near-tie and characterized it (this is exactly the reorder/precision case the
+coordinator flagged). **GATE = correctness:** CUDA `test_cuda_deepseek_v4` **13/13·671** (+1 case:
+in-place device == host ClampedSwiGLU RelL2<1e-5, RED-first a different clamp limit diverges);
+`test_deepseek_v4_gguf_load` **12/12·531** (glue off by default); CPU + CUDA `-Werror` clean. **Real 80.7 GB
+model (DGX GB10): TOKEN-IDENTICAL despite the near-tie** — `VT_V4_DEVICE_GLUE=1` (and combined with
+`VT_V4_DEVICE_ATTN=1`, all device kernels on) both emit `11111 16 455 6102 294 8760 344 11111 …` = "…Paris."
+(the greedy argmax is robust to the expf-vs-exp ULP). **Speed (NOT the gate — flat expected):** decode 6.53
+tok/s (glue-on, 11-tok), 6.12 (attn+glue-on, 24-tok) vs 5.83 baseline; GB10 util ~38% (still
+host-launch-bound — the payoff is Brick D's graph); peak 86.33 GiB unchanged. Rollback-able
+(`VT_V4_DEVICE_GLUE` default OFF; allowlisted). Remaining Brick-B glue (router, MHC pre/post/head/Sinkhorn,
+RMSNorm, RoPE, MoE combine) = the next gated increments. Box restored (worker up restart=always, flock
+free, no stray). Row `ACTIVE`.

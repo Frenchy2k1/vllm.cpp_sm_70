@@ -530,6 +530,17 @@ RED-first no_sink); `test_deepseek_v4_gguf_load` 12/12·531; real-model TOKEN-ID
 Speed (not Brick A's gate): decode 6.23 tok/s (24-tok) vs 5.83 baseline (~7%, grows with ctx); util still
 ~35% (payoff at Brick D's graph); peak unchanged. Rollback-able (flag OFF default). Bricks B→C→D await
 review. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Device-resident decode campaign — Brick B increment 1: device clamped-SwiGLU (in place) (2026-07-29, base
+`21191ce2`, NOT pushed).** Brick B reimplements the decode glue as real in-place device kernels (no
+Upload/Download/Sync — the Brick-A pattern), landed in gated increments. Increment 1 = MoE clamped-SwiGLU:
+`ClampedSwiGLUInPlaceLaunch` (reuses the tested #183 `ClampedSwiGLUKernel` on unified `gate_up`/`out`);
+`DispClampedSwiGLU` routes to it under `VT_V4_DEVICE_GLUE=1` + CUDA (default OFF). CHARACTERIZED NEAR-TIE
+(RelL2<1e-5, device `expf` vs host `std::exp` in the SiLU — stated, not bit-identical). Gate = correctness:
+CUDA unit `test_cuda_deepseek_v4` **13/13·671** (+in-place==host RelL2<1e-5, RED-first clamp-limit);
+`test_deepseek_v4_gguf_load` 12/12·531; real-model **TOKEN-IDENTICAL despite the near-tie** (`VT_V4_DEVICE_GLUE=1`,
+and combined with `VT_V4_DEVICE_ATTN=1`, both = "…Paris."). Speed flat (6.12 tok/s attn+glue 24-tok vs 5.83;
+util ~38% — payoff at Brick D). Remaining Brick-B glue (router, MHC pre/post/head/Sinkhorn, RMSNorm, RoPE,
+combine) = next increments. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
