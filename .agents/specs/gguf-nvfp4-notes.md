@@ -272,7 +272,10 @@ table.
   `vt::MatmulNvfp4*` family, whose operands the ggml blocks REPACK into byte for
   byte. The dense MLP, full attention and the MoE experts now compute in fp4 on
   CUDA; the GDN `in_proj_*` family and `ssm_out` still expand (V-head reorder),
-  as does any CPU build.
+  as does any CPU build. The MoE STACKED-EXPERT arm - the per-expert `[256]`
+  `.scale` handling Sec 5.3 above describes - is HARDWARE-GATED as of 2026-07-29
+  on the real 35B A3B file (840 per-expert slabs byte-identical to the modelopt
+  safetensors, mutation-proved); see that spike's Sec D.
 - `E` (end-to-end): dequant alone does not load the 27B/35B models. The
   remaining gaps are model-level, not container-level, and are tracked on
   `SPEC-MTP-GGUF`.

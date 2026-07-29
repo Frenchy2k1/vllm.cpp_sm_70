@@ -4411,6 +4411,35 @@ DBuf SharedExpert(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   return shared;
 }
 
+// The fused MoE blocks' router GEMM, in EITHER weight orientation.
+//
+// The router gate reaches the two fp4 fused blocks below in one of two layouts,
+// and which one is not a property of the model but of the LOADER:
+//   * the safetensors loader transposes it to Matmul-B [K=H, N=E] (`nk == false`,
+//     LoadBf16Transposed, qwen3_5_weights.cpp:362);
+//   * the GGUF loader keeps the file's own [N=E, K=H] under `expand_nk`
+//     (`nk == true`, OwnMatmulWeight -> qwen3_5_gguf_weights.cpp:1195), which is
+//     the DEFAULT wherever the running device can execute the quantized GEMM.
+// The reference MoE loop has always branched on that flag (MatmulBf16, :5082) and
+// the bf16 fast path REFUSES the nk=true layout outright (MoeBf16FastLayoutOk,
+// :576) - but the fp4 fused blocks hardcoded `vt::Matmul` and so assumed the
+// safetensors layout. That assumption held only because a GGUF load never
+// produced fp4-resident experts; `QUANT-GGUF-NVFP4` column C's MoE arm made it
+// reachable, and the first 35B NVFP4 GGUF forward threw
+// "vt: matmul: inner dims mismatch" here (a [T,2048] activation against a
+// [256,2048] gate). Falling through to the reference loop is not an option for
+// this block - its bf16 expert fields are EMPTY by construction - so the fused
+// path HANDLES the orientation instead, exactly as MatmulBf16D does. Inert for
+// the safetensors path: `nk == false` still issues the identical vt::Matmul.
+void MoeRouterLogits(Dev d, Tensor& out, const Tensor& dh,
+                     const OwnedTensor& router_gate) {
+  Tensor drg = ResidentWeight(d, router_gate);
+  if (router_gate.nk)
+    vt::MatmulBT(d.q, out, dh, drg);  // gate [N=E, K=H]
+  else
+    vt::Matmul(d.q, out, dh, drg);    // gate [K=H, N=E]
+}
+
 // --- Fused MoE block (M2.4). CUDA + fp4-resident only. Replaces the per-expert
 // loop of tiny MatmulNvfp4 launches (each with a host round-trip Download) with
 // ~3 GROUPED NVFP4 GEMM launches over ALL (token, activated-expert) pairs, kept
@@ -4432,9 +4461,8 @@ DBuf MoeBlockFusedCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   // Hidden states already device-resident (dh [T,H] bf16); router logits +
   // top-k stay on device (the ids [T,top_k] are the pair expert ids, the
   // weights [T,top_k] feed the combine).
-  Tensor drg = ResidentWeight(d, w.router_gate);          // [H,E] bf16
   DBuf dlog(d, DType::kBF16, {T, E});
-  vt::Matmul(d.q, dlog.t(), dh, drg);                     // logits [T,E]
+  MoeRouterLogits(d, dlog.t(), dh, w.router_gate);        // logits [T,E]
   DBuf dtw(d, DType::kF32, {T, top_k});
   DBuf dtid(d, DType::kI32, {T, top_k});
   vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
@@ -4793,10 +4821,9 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
     d.b.RecordEvent(ax->done, ax->q);     // event1.record() on the aux stream
   }
 
-  // Router (identical to MoeBlockFusedCuda).
-  Tensor drg = ResidentWeight(d, w.router_gate);  // [H,E] bf16
+  // Router (identical to MoeBlockFusedCuda), in either weight orientation.
   DBuf dlog(d, DType::kBF16, {T, E});
-  vt::Matmul(d.q, dlog.t(), dh, drg);
+  MoeRouterLogits(d, dlog.t(), dh, w.router_gate);
   DBuf dtw(d, DType::kF32, {T, top_k});
   DBuf dtid(d, DType::kI32, {T, top_k});
   vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),

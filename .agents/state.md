@@ -33119,3 +33119,111 @@ full-file sweep compares 192 NVFP4 tensors across both containers),
 **Still owed and NOT claimed:** a serving-throughput arm (tokens/s, TTFT, TPOT at
 concurrency) against the vLLM oracle on the equivalent workload. `P` stays `-`.
 Work remains LOCAL; nothing pushed.
+
+## 2026-07-29 - `QUANT-GGUF-NVFP4` column `C`: the MoE STACKED-EXPERT arm is HARDWARE-GATED, and gating it exposed a latent router-orientation defect
+
+`CLAIM-GGUF-NVFP4-COMPUTE` continued. Branch `feat/capi-abi-v9-engine-config`
+(worktree `vllm.cpp-abi-v9`), merged with `origin/main` `6d4fb5e7`. Clean
+`git archive` tree at `~/work/nvfp4-moe/src` on dgx.casa; evidence
+`~/work/nvfp4-moe/ev{,2}/`. NOT pushed.
+
+**What was owed.** `c80ef924` recorded the MoE arm as an UNVERIFIED gap rather
+than as support: `OwnGgufNvfp4Experts` and the per-expert `<stem>.scale` slab
+handling were wired but no 35B NVFP4 GGUF had ever been loaded through them. This
+checkpoint runs that asset.
+
+**Build proven production-configured three ways first:** `grep -ci "cutlass not
+found" configure.log` = **0** (log prints `CUTLASS found at
+/home/mudler/cutlass-4.5.0`, `Marlin NVFP4 W4A16 MoE GEMM enabled`,
+`FlashAttention-2 ... ENABLED for arch(es) [121a]`, 29 `Triton AOT:` lines,
+`MANIFEST hashes OK`); `cuobjdump -lelf` on all three gate binaries = **41
+cubins, all `sm_121a`**; SACRED `test_qwen27_paged_engine` **235/235, exit 0**.
+One `flock $HOME/gpu.lock` per series, idle box (3-4 GiB used at series start and
+end, no CUDA compute apps), `/` at 92% before and after, no doctest `-s`.
+
+**The 35B's NVFP4 subset is DISJOINT from the 27B's**, which is why this arm
+needed its own gate: 120 3-D `[256,out,in]` routed-expert stacks + 120 2-D
+shared-expert projections are NVFP4, while the GDN, full-attention and the whole
+MTP layer (`blk.40`, `nextn.*`) are BF16 in this file. The two assets together
+cover column `C`.
+
+**Weight level - the per-expert gate holds, exactly.** The 35B safetensors
+sibling stores experts UNSTACKED (`mlp.experts.<e>.<proj>`), so it is the precise
+per-expert counterpart of a stacked GGUF slab. New asset-gated sweep over every
+NVFP4 expert tensor of every layer x experts {0,1,2,7,128,254,255}: **840
+(tensor, expert) slabs, ZERO differing bytes** on `weight_packed` AND on
+`weight_scale`, and all **840** per-expert `<stem>.scale[e]` bit-identical to
+expert `e`'s `weight_scale_2`. The 120 shared-expert 2-D projections check the
+same way. `test_gguf_nvfp4` **14/14 cases, 12 650/12 650 assertions**, rc=0.
+Container caveat recorded: this checkpoint is MODELOPT, whose `weight_scale_2` is
+already the multiply form, so the equality is DIRECT where the 27B's
+compressed-tensors sibling needs the reciprocal.
+
+**Mutation, so the per-expert gate is not vacuous.** Both plausible silent bugs
+are constructed in a synthetic fixture with per-expert distinct blocks and scales
+and required to be rejected: `scales[0]` for every expert, and expert 0's SLAB
+for every expert. The real file makes the first discriminable too (layer 0's
+three stacks carry 117/117/138 distinct scales of 256). Honest limit: the
+`.input_scale` sidecar is `[256]` but CONSTANT across experts on this file, so
+ITS indexing is only discriminable in the fixture.
+
+**Load.** 240 of 733 routed tensors take the fp4 residency (120 stacked-expert),
+120 fp4 expert stacks over 40 layers with **0** left bf16, 17 280 MiB of
+fp4-resident expert weight, 154 008/154 008 assertions rc=0, 21.6 GiB peak.
+
+**THE DEFECT THIS RUN FOUND - and it is the substantive result.** The first 35B
+fp4 forward THREW `vt: matmul: inner dims mismatch at src/vt/ops.cpp:103`, from
+`MoeBlockFusedMarlinCuda` (gdb `catch throw` backtrace). The two fp4 fused MoE
+blocks issued the ROUTER GEMM as a bare `vt::Matmul`, assuming the SAFETENSORS
+gate layout `[K=H, N=E]`; the GGUF loader keeps it `[N=E, K=H]` with `nk = true`
+under `expand_nk`, which is DEFAULT ON wherever the quantized GEMM is registered
+- and CUDA registers it since `KERNEL-QUANT-CIQ-GEMM-CUDA` landed the same day.
+The reference MoE loop had always branched on the flag and the bf16 fast path
+REFUSES `nk=true` outright; only the fp4 fused blocks assumed. PRE-EXISTING, and
+made REACHABLE by this row: a GGUF load never produced fp4-resident experts
+before, so a GGUF router gate never entered those blocks, and
+`test_qwen36_paged_engine` cannot see it (safetensors, `nk=false`). Deterministic
+once attributed - 3/3 reps threw, and 3/3 reps with `VT_GGUF_KEEP_QUANT=0`
+(restoring the transposed gate) passed with the correct stream; in the first
+series 1 of 4 runs happened to pass, which made it look intermittent before the
+mechanism was known. **Fix:** `MoeRouterLogits` branches on `router_gate.nk` and
+issues `vt::MatmulBT` for the `[N,K]` layout, exactly as `MatmulBf16D` does.
+Falling through to the reference loop - the `MoeBf16FastLayoutOk` precedent - is
+NOT available here because the block's bf16 expert fields are EMPTY by
+construction. Provably inert for `nk=false`.
+
+**End to end, post-fix, same-binary A/B.** Peak RSS **68.50 -> 22.72 GiB
+(3.01x)**, load-and-generate **1:51.91 -> 0:28.76 / 0:29.55 (3.9x)**, rc=0
+throughout, fp4 arm reproducing its 24-token stream **3 of 3**. The tokens do NOT
+change across the switch, and that is CORRECT here rather than a no-op: the 35B
+routed experts run the fused Marlin **W4A16** grouped GEMM in both arms (it
+consumes `scale2`, ignores `alpha`), so the arms are the same arithmetic over the
+same quantized weights and identity is the losslessness signal. "The fp4 path
+ran" is carried by the 3.01x residency, the 240/733 audit with 0 left bf16, the
+3.9x delta, and by the defect above, which only the fp4 arm could reach.
+
+**An honest negative, and it bounds the token statements.** At this case's engine
+params (`block_size 32 / num_blocks 256 / max_num_seqs 1`) the greedy stream is
+NOT run-to-run stable: the `VT_GGUF_NVFP4_W4A4=0` arm gave the canonical stream 2
+of 3 runs and a different coherent one once, and the safetensors reference gave
+one stream 3 of 4 runs and another once (cross-container divergence index 7 three
+times, 16 once). The earlier reading that `W4A4=0` was a deterministic mode
+difference is RETRACTED - it was this instability. `test_qwen36_paged_engine` is
+token-exact 315/315 at ITS params, so this belongs to this case's configuration,
+not to column `C`. Attributing it (a plausible candidate is the Marlin grouped
+GEMM's cross-SM atomic reduction) is OWED WORK and is not claimed. The binding
+results of this arm are therefore weight-level, not token-level.
+
+**Regression, same build, same lock, every one rc=0:** `test_qwen27_paged_engine`
+**235/235** (SACRED), `test_qwen36_paged_engine` 2 cases / **315/315** (SACRED),
+`test_nvfp4_dequant` 4/47, `test_gguf_keep_quant` 37/5985, `test_gguf_nvfp4`
+14/12 650 with the real assets, `test_qwen27_gguf_nvfp4_compute` (the dense arm)
+2/2 · 778/778 with its fp4 stream unchanged.
+
+**Column state.** `C` stays **`part`**, and the subset is now VERIFIED on both
+sides rather than half-verified: the 27B dense/full-attention arm and the 35B
+MoE stacked-expert arm are both hardware-gated. The exclusions that keep it off
+`Y` are unchanged and still recorded: the GDN `in_proj_{qkv,z,a,b}` family and
+`ssm_out` still expand (the V-head reorder rewrites their layout), the lm_head
+expands by design, and a CPU build expands everything since `kMatmulNvfp4` is
+CUDA-only. `E` and `P` stay `-`. Work remains LOCAL; nothing pushed.

@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -481,8 +482,18 @@ struct MoeFixture {
   int64_t H = 64, vocab = 32, n_head = 2, n_head_kv = 1, head_dim = 32;
   int64_t E = 3, used = 2, I = 64, Is = 64, n_layer = 1;
   std::vector<float> expert_scales{1.0F, 2.0F, 4.0F};
-  // One expert's blocks, repeated E times, so only the scale distinguishes them.
-  std::string one_expert_gate, one_expert_up, one_expert_down;
+  // Per-expert `<stem>.input_scale` (the W4A4 ACTIVATION sidecar). Distinct on
+  // purpose: the real 35B file happens to repeat one value across all 256
+  // experts, so only a fixture can gate that this sidecar is indexed per expert
+  // too rather than read once.
+  std::vector<float> expert_input_scales{0.5F, 0.25F, 0.125F};
+  // When false (the default, and what the value-level M-column case below
+  // wants) every expert gets BYTE-IDENTICAL blocks, so the scale is the only
+  // thing that distinguishes them. When true each expert gets its own blocks,
+  // which is what makes a wrong SLAB OFFSET observable.
+  bool distinct_experts = false;
+  // Per-expert block bytes, [E] entries per stack.
+  std::vector<std::string> gate_blocks, up_blocks, down_blocks;
 };
 
 std::string BuildMoeNvfp4Gguf(MoeFixture& d) {
@@ -514,9 +525,16 @@ std::string BuildMoeNvfp4Gguf(MoeFixture& d) {
   AddF32Torch(b, "output_norm.weight", {d.H}, 1.5F);
   AddF32Torch(b, "output.weight", {d.vocab, d.H}, 0.25F);
 
-  d.one_expert_gate = Nvfp4Blocks(d.I, d.H, 4242);
-  d.one_expert_up = Nvfp4Blocks(d.I, d.H, 5353);
-  d.one_expert_down = Nvfp4Blocks(d.H, d.I, 6464);
+  d.gate_blocks.clear();
+  d.up_blocks.clear();
+  d.down_blocks.clear();
+  for (int64_t e = 0; e < d.E; ++e) {
+    const uint32_t bump =
+        d.distinct_experts ? static_cast<uint32_t>(e) * 7919U : 0U;
+    d.gate_blocks.push_back(Nvfp4Blocks(d.I, d.H, 4242 + bump));
+    d.up_blocks.push_back(Nvfp4Blocks(d.I, d.H, 5353 + bump));
+    d.down_blocks.push_back(Nvfp4Blocks(d.H, d.I, 6464 + bump));
+  }
 
   const std::string p = "blk.0.";
   AddF32Torch(b, p + "attn_norm.weight", {d.H}, 1.25F);
@@ -530,28 +548,36 @@ std::string BuildMoeNvfp4Gguf(MoeFixture& d) {
   AddF32Torch(b, p + "ffn_gate_inp.weight", {d.E, d.H}, 0.05F);
   AddF32Torch(b, p + "ffn_gate_inp_shexp.weight", {d.H}, 0.75F);
 
-  struct Stack { const char* name; const std::string* blocks;
+  struct Stack { const char* name; const std::vector<std::string>* blocks;
                  int64_t out_dim, in_dim; };
   const Stack stacks[] = {
-      {"ffn_gate_exps.weight", &d.one_expert_gate, d.I, d.H},
-      {"ffn_up_exps.weight", &d.one_expert_up, d.I, d.H},
-      {"ffn_down_exps.weight", &d.one_expert_down, d.H, d.I},
+      {"ffn_gate_exps.weight", &d.gate_blocks, d.I, d.H},
+      {"ffn_up_exps.weight", &d.up_blocks, d.I, d.H},
+      {"ffn_down_exps.weight", &d.down_blocks, d.H, d.I},
   };
   for (const Stack& s : stacks) {
     std::string stacked;
-    for (int64_t e = 0; e < d.E; ++e) stacked += *s.blocks;
+    for (int64_t e = 0; e < d.E; ++e) {
+      stacked += (*s.blocks)[static_cast<size_t>(e)];
+    }
     b.AddTensor(p + s.name,
                 {static_cast<uint64_t>(s.in_dim),
                  static_cast<uint64_t>(s.out_dim),
                  static_cast<uint64_t>(d.E)},
                 kNvfp4, stacked);
+    const std::string stem =
+        std::string(s.name).substr(0, std::string(s.name).size() - 7);
     std::string sc;
+    std::string isc;
     for (int64_t e = 0; e < d.E; ++e) {
       sc += LeF32(d.expert_scales[static_cast<size_t>(e)]);
+      isc += LeF32(d.expert_input_scales[static_cast<size_t>(e)]);
     }
-    b.AddTensor(p + std::string(s.name).substr(
-                    0, std::string(s.name).size() - 7) + ".scale",
-                {static_cast<uint64_t>(d.E)}, kF32Type, sc);
+    b.AddTensor(p + stem + ".scale", {static_cast<uint64_t>(d.E)}, kF32Type, sc);
+    // The W4A4 activation sidecar the real files carry alongside `.scale`. The
+    // fp4 residency reads it; the bf16 expansion ignores it.
+    b.AddTensor(p + stem + ".input_scale", {static_cast<uint64_t>(d.E)},
+                kF32Type, isc);
   }
 
   AddF32Torch(b, p + "ffn_gate_shexp.weight", {d.Is, d.H}, 0.15F);
@@ -574,14 +600,14 @@ TEST_CASE("gguf nvfp4: a stacked expert tensor uses ITS OWN per-expert scale") {
 
   struct Stack {
     const std::vector<vllm::OwnedTensor>* got;
-    const std::string* blocks;
+    const std::vector<std::string>* blocks;
     int64_t out_dim, in_dim;
     const char* name;
   };
   const Stack stacks[] = {
-      {&moe.expert_gate, &d.one_expert_gate, d.I, d.H, "ffn_gate_exps"},
-      {&moe.expert_up, &d.one_expert_up, d.I, d.H, "ffn_up_exps"},
-      {&moe.expert_down, &d.one_expert_down, d.H, d.I, "ffn_down_exps"},
+      {&moe.expert_gate, &d.gate_blocks, d.I, d.H, "ffn_gate_exps"},
+      {&moe.expert_up, &d.up_blocks, d.I, d.H, "ffn_up_exps"},
+      {&moe.expert_down, &d.down_blocks, d.H, d.I, "ffn_down_exps"},
   };
 
   for (const Stack& s : stacks) {
@@ -595,8 +621,10 @@ TEST_CASE("gguf nvfp4: a stacked expert tensor uses ITS OWN per-expert scale") {
       // Reference: this expert's OWN slab bytes with this expert's OWN scale,
       // transposed to the loader's [in, out] Matmul-B layout.
       const std::vector<uint16_t> ref = DequantGgufRowToBf16(
-          kNvfp4, reinterpret_cast<const uint8_t*>(s.blocks->data()), numel,
-          scale);
+          kNvfp4,
+          reinterpret_cast<const uint8_t*>(
+              (*s.blocks)[static_cast<size_t>(e)].data()),
+          numel, scale);
       const vllm::OwnedTensor& got = (*s.got)[static_cast<size_t>(e)];
       REQUIRE(got.dtype == vt::DType::kBF16);
       REQUIRE(got.shape[0] == s.in_dim);
@@ -636,4 +664,275 @@ TEST_CASE("gguf nvfp4: a stacked expert tensor uses ITS OWN per-expert scale") {
     CHECK(scaled_ok == static_cast<size_t>(numel));
     CHECK(distinct > static_cast<size_t>(numel) / 2);
   }
+}
+
+// ===========================================================================
+// The `C` COLUMN, MoE ARM: a stacked expert tensor becomes ONE fp4-resident
+// Nvfp4Weight PER EXPERT.
+//
+// The dense arm's gate is byte-identity of the repacked operand pair. The
+// stacked arm adds exactly two things that can be wrong, and BOTH are silent:
+//
+//   (1) the SLAB OFFSET - expert e must repack from its own `e * out_dim` row
+//       range. Reading expert 0's slab for everyone gives every expert the same
+//       (valid, finite) weights;
+//   (2) the SCALE INDEX - expert e must carry `<stem>.scale[e]`. Reading
+//       `scale[0]` for everyone rescales 255 of 256 experts by a plausible
+//       factor and still produces sane logits.
+//
+// The fixture makes both observable at once: `distinct_experts` gives each
+// expert its own blocks, and the three scales / input_scales are distinct.
+// ===========================================================================
+namespace {
+
+// The reference operand pair for ONE expert: the fp4 repack of THAT expert's
+// own block slab, computed straight from the fixture bytes rather than from the
+// file, so the loader's slab arithmetic has an independent expectation.
+struct Operands {
+  std::vector<uint8_t> packed;
+  std::vector<uint8_t> scale;
+};
+
+Operands RepackExpert(const std::string& blocks, int64_t out_dim,
+                      int64_t in_dim) {
+  Operands o;
+  o.packed.resize(static_cast<size_t>(out_dim * in_dim / 2));
+  o.scale.resize(static_cast<size_t>(out_dim * in_dim / 16));
+  vllm::RepackGgufNvfp4Rows(reinterpret_cast<const uint8_t*>(blocks.data()),
+                            out_dim, in_dim, o.packed.data(), o.scale.data());
+  return o;
+}
+
+size_t CountDiff(const uint8_t* a, const uint8_t* b, size_t n) {
+  size_t diff = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (a[i] != b[i]) ++diff;
+  }
+  return diff;
+}
+
+vllm::GgufLoadPolicy Fp4On() {
+  vllm::GgufLoadPolicy p;
+  p.nvfp4_fp4 = true;
+  p.nvfp4_w4a4 = true;
+  return p;
+}
+
+}  // namespace
+
+TEST_CASE("gguf nvfp4 fp4 residency: stacked experts take their OWN slab and "
+          "their OWN per-expert scale") {
+  MoeFixture d;
+  d.distinct_experts = true;
+  const gguf_test::TempFile f(BuildMoeNvfp4Gguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+
+  const vllm::GgufLoadPolicy pol = Fp4On();
+  const vllm::Qwen3_5MoeWeights w = vllm::LoadQwen3_5MoeFromGguf(g, c, &pol);
+  const auto& moe = w.layers[0].moe;
+
+  struct Stack {
+    const std::vector<vllm::Nvfp4Weight>* got;
+    const std::vector<vllm::OwnedTensor>* bf16;
+    const std::vector<std::string>* blocks;
+    int64_t out_dim, in_dim;
+    const char* name;
+  };
+  const Stack stacks[] = {
+      {&moe.expert_gate_fp4, &moe.expert_gate, &d.gate_blocks, d.I, d.H,
+       "ffn_gate_exps"},
+      {&moe.expert_up_fp4, &moe.expert_up, &d.up_blocks, d.I, d.H,
+       "ffn_up_exps"},
+      {&moe.expert_down_fp4, &moe.expert_down, &d.down_blocks, d.H, d.I,
+       "ffn_down_exps"},
+  };
+
+  for (const Stack& s : stacks) {
+    INFO("stack " << std::string(s.name));
+    REQUIRE(s.got->size() == static_cast<size_t>(d.E));
+    // Exactly ONE representation: the forward dispatches on `!empty()`, so a
+    // stack with both filled would silently pick one.
+    CHECK(s.bf16->empty());
+
+    for (int64_t e = 0; e < d.E; ++e) {
+      INFO("expert " << e);
+      const vllm::Nvfp4Weight& got = (*s.got)[static_cast<size_t>(e)];
+      REQUIRE(!got.Empty());
+      CHECK(got.n == s.out_dim);
+      CHECK(got.k == s.in_dim);
+
+      // (2) the SCALE INDEX, exactly - not approximately.
+      CHECK(got.scale2 == d.expert_scales[static_cast<size_t>(e)]);
+      CHECK(got.weight_global_scale_inv ==
+            1.0F / d.expert_scales[static_cast<size_t>(e)]);
+      CHECK(got.IsTrueW4A4());
+      CHECK(got.input_global_scale_inv ==
+            1.0F / d.expert_input_scales[static_cast<size_t>(e)]);
+      // alpha is formed by the SAME expression the safetensors loader uses.
+      CHECK(got.alpha ==
+            got.scale2 * (1.0F / got.input_global_scale_inv));
+
+      // (1) the SLAB OFFSET: byte-identical to a repack of THIS expert's blocks.
+      const Operands ref = RepackExpert(
+          (*s.blocks)[static_cast<size_t>(e)], s.out_dim, s.in_dim);
+      REQUIRE(got.packed.bytes.size() == ref.packed.size());
+      REQUIRE(got.scale.bytes.size() == ref.scale.size());
+      CHECK(CountDiff(reinterpret_cast<const uint8_t*>(got.packed.bytes.data()),
+                      ref.packed.data(), ref.packed.size()) == 0);
+      CHECK(CountDiff(reinterpret_cast<const uint8_t*>(got.scale.bytes.data()),
+                      ref.scale.data(), ref.scale.size()) == 0);
+    }
+  }
+}
+
+// NON-VACUITY. Both plausible bugs are CONSTRUCTED here and the gate above is
+// required to reject them, so "the checks pass" is a statement about the loader
+// rather than about the fixture.
+TEST_CASE("gguf nvfp4 fp4 residency: the scale[0]-for-every-expert and "
+          "slab[0]-for-every-expert mutants are REJECTED") {
+  MoeFixture d;
+  d.distinct_experts = true;
+  const gguf_test::TempFile f(BuildMoeNvfp4Gguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+  const vllm::GgufLoadPolicy pol = Fp4On();
+  const vllm::Qwen3_5MoeWeights w = vllm::LoadQwen3_5MoeFromGguf(g, c, &pol);
+  const auto& got = w.layers[0].moe.expert_gate_fp4;
+  REQUIRE(got.size() == static_cast<size_t>(d.E));
+
+  // Mutant A - `scales[0]` for every expert (the exact bug this arm could
+  // plausibly have carried, since `<stem>.scale` is a [E] vector read once).
+  const Operands slab0 = RepackExpert(d.gate_blocks[0], d.I, d.H);
+  for (int64_t e = 1; e < d.E; ++e) {
+    INFO("expert " << e);
+    const float mutant_scale2 = d.expert_scales[0];
+    const float mutant_inv = 1.0F / d.expert_input_scales[0];
+    CHECK(got[static_cast<size_t>(e)].scale2 != mutant_scale2);
+    CHECK(got[static_cast<size_t>(e)].input_global_scale_inv != mutant_inv);
+
+    // Mutant B - expert 0's SLAB for every expert. A wrong offset keeps every
+    // byte a legal fp4 operand, so only a byte comparison catches it.
+    CHECK(CountDiff(reinterpret_cast<const uint8_t*>(
+                        got[static_cast<size_t>(e)].packed.bytes.data()),
+                    slab0.packed.data(), slab0.packed.size()) >
+          slab0.packed.size() / 4);
+  }
+}
+
+// --- Asset-gated: the real 35B A3B MoE file, PER EXPERT, against the modelopt
+// safetensors container of the same quantization run.
+//
+// VLLM_NVFP4_MOE_GGUF=~/bench/q36-35b-a3b-nvfp4.gguf
+// VLLM_NVFP4_MOE_ST_DIR=~/bench/q36-35b-a3b-nvfp4-vllm
+// Without both, this case is a no-op so CI stays asset-free.
+//
+// The 35B safetensors stores experts UNSTACKED (`mlp.experts.<e>.<proj>`), which
+// is exactly the per-expert counterpart the stacked GGUF slab must reproduce.
+// NOTE the container difference from the 27B: this checkpoint is modelopt, whose
+// `weight_scale_2` is ALREADY the multiply form, so the GGUF `<stem>.scale[e]`
+// equals it DIRECTLY rather than through a reciprocal.
+TEST_CASE("gguf nvfp4 moe: per-expert cross-container sweep on the real 35B") {
+  const char* gguf_path = std::getenv("VLLM_NVFP4_MOE_GGUF");
+  const char* st_dir = std::getenv("VLLM_NVFP4_MOE_ST_DIR");
+  if (gguf_path == nullptr || st_dir == nullptr) return;  // asset-gated
+
+  vllm::GgufFile g = vllm::GgufFile::Open(gguf_path);
+  const std::map<std::string, std::string> index = vllm::LoadSafetensorsIndex(
+      std::string(st_dir) + "/model.safetensors.index.json");
+  std::map<std::string, vllm::SafetensorsFile> shards;
+  auto st_get = [&](const std::string& name) -> const vllm::StTensor& {
+    const auto it = index.find(name);
+    REQUIRE(it != index.end());
+    auto sh = shards.find(it->second);
+    if (sh == shards.end()) {
+      sh = shards
+               .emplace(it->second, vllm::SafetensorsFile::Open(
+                                        std::string(st_dir) + "/" + it->second))
+               .first;
+    }
+    return sh->second.Get(name);
+  };
+
+  struct Pair { const char* gguf; const char* st; };
+  const Pair kPairs[] = {
+      {"blk.%d.ffn_gate_exps.weight", "gate_proj"},
+      {"blk.%d.ffn_up_exps.weight", "up_proj"},
+      {"blk.%d.ffn_down_exps.weight", "down_proj"},
+  };
+  // Every layer, a spread of experts: the first few (where an off-by-one shows),
+  // one in the middle, and the last two (where a truncated scale vector shows).
+  const int kExperts[] = {0, 1, 2, 7, 128, 254, 255};
+
+  int compared = 0;
+  int scale_checked = 0;
+  for (int layer = 0; layer < 64; ++layer) {
+    for (const Pair& p : kPairs) {
+      char gname[128];
+      std::snprintf(gname, sizeof(gname), p.gguf, layer);
+      if (!HasGguf(g, gname)) continue;
+      const vllm::GgufTensorInfo& t = g.Get(gname);
+      if (t.ggml_type != kNvfp4) continue;  // the MTP layer's are BF16
+      REQUIRE(t.shape.size() == 3);
+      const int64_t n_experts = t.shape[0];
+      const int64_t out_dim = t.shape[1];
+      const int64_t in_dim = t.shape[2];
+
+      // The `<stem>.scale` sidecar: ONE f32 per expert, in expert order.
+      const std::string stem =
+          std::string(gname).substr(0, std::string(gname).size() - 7);
+      const vllm::GgufTensorInfo& sc = g.Get(stem + ".scale");
+      REQUIRE(sc.shape.size() == 1);
+      REQUIRE(sc.shape[0] == n_experts);
+      std::vector<float> gscales(static_cast<size_t>(n_experts));
+      std::memcpy(gscales.data(), sc.data,
+                  static_cast<size_t>(n_experts) * sizeof(float));
+
+      const int64_t slab_blocks = out_dim * (in_dim / 64);
+      for (int e : kExperts) {
+        if (e >= n_experts) continue;
+        char sname[224];
+        std::snprintf(sname, sizeof(sname),
+                      "model.language_model.layers.%d.mlp.experts.%d.%s", layer,
+                      e, p.st);
+        if (index.find(std::string(sname) + ".weight") == index.end()) continue;
+        const vllm::StTensor& sp = st_get(std::string(sname) + ".weight");
+        const vllm::StTensor& ss = st_get(std::string(sname) + ".weight_scale");
+        const vllm::StTensor& s2 =
+            st_get(std::string(sname) + ".weight_scale_2");
+        REQUIRE(sp.shape.size() == 2);
+        REQUIRE(sp.shape[0] == out_dim);
+        REQUIRE(sp.shape[1] * 2 == in_dim);
+
+        std::vector<uint8_t> packed(static_cast<size_t>(out_dim * in_dim / 2));
+        std::vector<uint8_t> scale(static_cast<size_t>(out_dim * in_dim / 16));
+        vllm::RepackGgufNvfp4Rows(t.data + e * slab_blocks * 36, out_dim, in_dim,
+                                  packed.data(), scale.data());
+        INFO("tensor " << std::string(gname) << " expert " << e);
+        REQUIRE(sp.nbytes == packed.size());
+        REQUIRE(ss.nbytes == scale.size());
+        REQUIRE(CountDiff(packed.data(), sp.data, packed.size()) == 0);
+        REQUIRE(CountDiff(scale.data(), ss.data, scale.size()) == 0);
+
+        // The per-expert scale INDEX, bit for bit.
+        float ws2 = 0.0F;
+        std::memcpy(&ws2, s2.data, sizeof(ws2));
+        REQUIRE(std::memcmp(&gscales[static_cast<size_t>(e)], &ws2,
+                            sizeof(float)) == 0);
+        ++scale_checked;
+        ++compared;
+      }
+      // Non-vacuity of the scale index on the real file: the per-expert scales
+      // must actually VARY, or reading scale[0] everywhere would be harmless.
+      size_t distinct = 0;
+      for (int64_t e = 1; e < n_experts; ++e) {
+        if (gscales[static_cast<size_t>(e)] != gscales[0]) ++distinct;
+      }
+      CHECK(distinct > static_cast<size_t>(n_experts) / 2);
+    }
+  }
+  MESSAGE("compared " << compared << " (tensor, expert) slabs across both "
+                      << "containers; " << scale_checked
+                      << " per-expert scales bit-checked");
+  CHECK(compared > 0);
 }
