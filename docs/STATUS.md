@@ -444,6 +444,42 @@ forward to the real DeepSeek-V4 geometry (compressor 1024-dim; audit indexer + g
 `o_groups=8`/`nh=64`/`q_lora_rank=1024`) against a reference; plus the mmap-view load fix. The
 download + keep-quant load + tokenizer + greedy driver + ds4 oracle are DONE; the forward geometry is
 the one blocker before a real single-Spark generation.
+**W8-run.9 FIXED — COHERENT single-Spark generation; DeepSeek-V4 ADVANCES `SPIKE → ACTIVE` (2026-07-29,
+base `eeef1695`, NOT pushed).** The isolated L00 experiment (aligned dump: ours' post-input-norm attn
+input vs ds4's `attn_norm`) forked H1/H2: attention INPUT bit-exact (rel-L2 **0.0000**), KV correct
+(0.018), but the **q operand rel-L2 0.9646** → the MLA q projection. Root cause: our forward OMITTED the
+**per-head query RMS-norm** (ds4 `head_rms_norm_inplace` after wq_b; the KV correctly gets only its
+`attn_kv_a_norm`). Fix `DeepseekV4QHeadRmsNormInplace` (+ spec-anchored RED-first doctest) → L00 q
+**0.9646→0.0013**, attn_out **0.5956→0.0175**, and the FULL 43-layer curve COLLAPSED to the keep-quant
+floor (L33 **0.53→0.003**, L34 **6.02→0.003**, MAX 0.0334). Plus the second confirmed fix, the
+**inverse-RoPE on the attention output** (ds4 `rope(heads,inverse=true)`, identity at pos 0, load-bearing
+for pos>0). Greedy generation is now **"The capital of France is Paris.<｜end▁of▁sentence｜>"** (correct +
+EOS), self-consistent; `test_deepseek_v4_gguf_load` 10/10·403. CPU-tier decode ~3.3 s/tok / peak 85.8 GiB
+(ds4 GPU: 16.5 tok/s). Gated by coherence + self-consistency + the ds4-oracle per-layer diff (no vLLM V4
+GGUF plugin ⇒ not vLLM-token-exact). Named residuals: GPU-expert dispatch (CPU-tier), DSA-sparse ctx>512
+(dense-fallback, exact for short gen), paged-engine integration. Row `ACTIVE`.
+
+**W8-run.10 — GPU-expert wiring (`--gpu`) + apples-to-apples vs ds4 (2026-07-29, base `20d8ccfa`).** Experts
+now run on the GB10: a CUDA queue routes every keep-quant expert/MLA/lm_head GEMM to the `kMatmulBTQuant`
+kCUDA provider (#195), reading unified-memory weight blocks in place (memory-safe; no device copy). GPU
+genuinely used (nvidia-smi 38–50% util, compute-app `deepseek-v4-gen` during the run); GPU path
+byte-identical to CPU; CPU default unchanged (`test_deepseek_v4_gguf_load` 10/10·403). Real table (same 80.7
+GB ds4 file): ds4 GPU prefill 325.9 / decode 16.3–16.6; ours `--gpu` prefill 6.26 / decode 0.68 (1.3–1.4×
+over our CPU path). The residual gap is NOT expert placement (fixed) but our **stateless full-recompute
+driver (no KV cache)** + route-(a) host-orchestration/per-GEMM sync. Real speed path = `ForwardDevice`
+(#183): resident on-device activations + KV cache + no per-GEMM sync — the only route to approach ds4's 16.5
+tok/s. Route (a) not dressed as a win. Row stays `ACTIVE`; see docs/BENCHMARKS.md W8-run.10.
+**ForwardDevice campaign Stage 1 — MLA latent KV cache + incremental decode (2026-07-29, base `fd9e191c`,
+NOT pushed).** The single biggest decode lever, equivalence-gated + benchmarked. For the real dense-MLA run
+the only cross-token state is the per-layer `deck` latent `[head_dim]` (num_key_value_heads=1; MHC manifold
+per-token), so `DeepseekV4KvCache` (mirror of ds4 `raw_kv`) makes each decode step process ONE new token
+against cached KV instead of re-running the whole forward over the growing context. `DeepseekV4ForwardGgufCached`
++ driver `--kv-cache` (rollback-able; default + `--gpu` unchanged). **Token-IDENTICAL** to full-recompute
+("…Paris.", ids `11111 16 455 6102 294 8760 344 11111`); decode **0.68 → 4.79–5.35 tok/s (7.9×)**, ~1/3 of
+ds4's 16.5; GPU used (nvidia-smi 29–46%, compute-app `deepseek-v4-gen`); peak 86.33 GiB. Gate
+`test_deepseek_v4_gguf_load` **11/11·430** (prefill bit-identical, incremental token-identical, RED-first).
+Stage 0 spec: `.agents/specs/deepseek-v4-forward-device.md`. Residual to ds4 = host-orchestration + per-GEMM
+sync (Stages 2–3: device-resident activations + graphs). Row stays `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
