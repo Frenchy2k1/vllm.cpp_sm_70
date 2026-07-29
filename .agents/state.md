@@ -32277,3 +32277,39 @@ model did NOT generate, no benchmark, the DeepSeek-V4 model-matrix row stays SPI
 DGX is back:** re-dispatch the W8-run (free box → download ~91 GB UD-IQ2_XXS → keep-quant load [assert
 resident ≈ 91-94 GiB, the W2c VT_CHECK must not fire] → greedy generate → self-consistency + coherence
 gate → TPOT/throughput/peak-resident benchmark vs llama.cpp-on-card). No code change needed.
+
+- **2026-07-29** — **xgrammar structured-output backend W0 spike + W1 CPU brick
+  (`CLAIM-TOOLS-XGRAMMAR`, `TOOLS-XGRAMMAR` `INVENTORIED`→`ACTIVE`; isolated
+  worktree `/home/mudler/_git/vllm.cpp-xgrammar`, branch `tools-xgrammar`, off
+  `main` `6d54f242`; CPU-only Release `-Werror`; DGX offline, not needed; NOT
+  pushed).** Opens HIGH-priority feature-gap #4. **W0:** committed
+  `.agents/specs/xgrammar-backend.md` — full spike over vLLM's xgrammar backend
+  (the `StructuredOutputBackend` interface, the six grammar input modes, `auto`→
+  xgrammar selection + fallbacks, the token-bitmask application, exact files to
+  port, upstream tests, gates, W-breakdown), incl. the **§9 decision to mirror
+  xgrammar's algorithm PORTABLY (reuse the native pushdown-FSM/trie matcher) and
+  NOT vendor the mlc-ai/xgrammar C++ library**. **W1:**
+  `XgrammarStructuredOutputBackend` (`backend_xgrammar.{h,cpp}`) behind the shared
+  seam, composing the native matcher, plus the xgrammar-faithful JSON-schema→EBNF
+  converter (`xgrammar_json_schema.{h,cpp}`, SEMANTICS ported from
+  `json_schema_converter.cc` @ `a32ac89`) that preserves property DECLARATION
+  order (`nlohmann::ordered_json`) + emits the `any_whitespace` `ws` rule + the
+  `basic_*` set verbatim — closing the key-order/whitespace/exotic-schema parity
+  gap. JSON + json_object compile→bitmask; GRAMMAR/REGEX/CHOICE/STRUCTURAL_TAG
+  delegate to native; `ResolveStructuredOutputBackend`(`auto`→xgrammar) +
+  `MakeStructuredOutputBackendFactory` mirror `sampling_params.py:1031` +
+  `__init__.py:133-165`. **Gate:** `test_backend_xgrammar` 6/6 (39 asserts) —
+  exact-valid-next-tokens; declaration key order vs native sort (RED-first: the
+  native key-sorting backend admits `a` after `{"`, which the xgrammar grammar
+  forbids); `disable_any_whitespace`; json_object; converter EBNF; `auto`→
+  xgrammar selection. **RED-first proven operationally:** `ordered_json`→`json`
+  (sorted) break makes 3/6 cases fail; revert → green. No regression
+  (`test_backend_native` 4878, `test_structured_output` 90,
+  `test_json_schema_to_gbnf` 656). Clean CPU `-Wall -Wextra -Werror` 0-warn.
+  **Residuals:** optional object properties + strict-compact separators (W2); the
+  `has_xgrammar_unsupported_json_features` guard + `validate_xgrammar_grammar`
+  feeding the `auto` fallback + `model_loader.cpp` production wiring (W2);
+  xgrammar-specific regex/structural-tag parity (W3); GPU oracle parity (W4,
+  DGX-blocked). **Resume:** pick up W2 (production-wire the configured backend
+  name through `MakeStructuredOutputBackendFactory` in `model_loader.cpp` + the
+  feature-guard/fallback), then the GPU oracle parity gate when the DGX is back.
