@@ -207,7 +207,15 @@ ENGINE_PREFIXES = (
 # new engine capability, W0 spike + W1 CPU brick landed + unit-gated RED-first;
 # `ACTIVE`, `CLAIM-PLUGIN-SYSTEM`, spec `specs/plugin-system.md`. Bumped for a
 # real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 127
+# 128 since 2026-07-29: +`SERVE-BATCH-API` (the offline OpenAI Batch API runner —
+# read a JSONL of BatchRequestInput, dispatch each line to the matching serving
+# handler, write a BatchRequestOutput JSONL; the RECORDS-GAP the feature-gap
+# analysis named for row creation, recommending SERVE-BATCH-API). A real new
+# serving capability, W0 spike + W1 CPU brick (chat dispatch orchestrator over
+# the existing OpenAIServingChat, NO reimplemented generation) landed +
+# unit-gated RED-first; `ACTIVE`, `CLAIM-BATCH-API`, spec `specs/batch-api.md`.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 128
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

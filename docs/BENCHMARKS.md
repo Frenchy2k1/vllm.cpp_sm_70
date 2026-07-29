@@ -16,6 +16,27 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Offline Batch API W0 spike + W1 CPU brick (2026-07-29, `CLAIM-BATCH-API`) - NOT-APPLICABLE (offline orchestration layer; no throughput owed)
+
+Disposition: **NOT APPLICABLE** for a performance number. `SERVE-BATCH-API` is an
+ORCHESTRATOR over the existing chat serving handler (`RunBatch` reads a JSONL of
+`BatchRequestInput`, dispatches each line to `OpenAIServingChat::create_chat_completion`,
+writes a `BatchRequestOutput` JSONL) — it reimplements NO generation, so its
+throughput is exactly the underlying handler's (`SERVE-OAI-BASIC`, already gated),
+and there is no separate oracle-throughput axis to compare. Correctness is the
+whole gate, and RED-first: `test_openai_run_batch` (7 cases / 80 assertions over
+the synthetic serving engine) proves the JSONL round-trip shape — ordered rows,
+custom_id echo, per-line error isolation (a malformed line becomes an error row
+and the batch continues), the endpoint dispatch table, and the 404/unsupported
+error rows; dropping the custom_id echo fails 9 assertions. Repro (CPU):
+`cmake --build build-cpu --target test_openai_run_batch && ./build-cpu/tests/test_openai_run_batch`.
+The behavioral oracle is the upstream `tests/entrypoints/openai/test_run_batch.py`
+(re-expressed at the library level; the subprocess-CLI cases need the unbuilt
+`vllm run-batch` binary). Residuals (no number owed until they land): the CLI,
+embeddings/score/rerank + audio dispatch, http(s)/data-URL I/O, and overlapped
+`AsyncLLM` submission — a CLI e2e vs the pinned oracle on a real model is the
+future gate.
+
 ## Plugin system W0 spike + W1 CPU brick (2026-07-29, `CLAIM-PLUGIN-SYSTEM`) - NOT-APPLICABLE (out-of-core registration/discovery layer; no throughput owed)
 
 Disposition: **NOT APPLICABLE** for a performance number. `ENG-PLUGIN-SYSTEM` is
