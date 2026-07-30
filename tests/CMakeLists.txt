@@ -91,6 +91,14 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 # named W3-W8 residuals (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
 
+# Laguna-S-2.1 W1/W2 scaffolding gate: LagunaForCausalLM RESOLVES through the
+# registry + ParseLagunaParams descends the shipped config (nested dual-rope +
+# variable Q-head + ungrouped sigmoid-noaux MoE). No 73 GB checkpoint / GPU — the
+# forward + loader materialization + strict dual-oracle gate are named W3/W4
+# residuals (.agents/specs/laguna-s21-w1w2-2026-07-30.md).
+vllm_cpp_add_test(test_laguna_scaffold vllm/models/test_laguna_scaffold.cpp)
+target_include_directories(test_laguna_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # DeepSeek-V4-Flash W3: the NEW attention primitives (DSA Lightning-Indexer
 # top-k selection + 512-wide MLA attention sinks + grouped output-LoRA) unit-
 # gated vs hand-derived cases + double-precision references. Full-model gate is

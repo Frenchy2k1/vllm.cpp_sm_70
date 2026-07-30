@@ -716,8 +716,15 @@ sleep/wake+RLHF [`SERVE-ADMIN`](engine-matrix.md), guidance/outlines
 [`SPEC-EAGLE3`](engine-matrix.md)/[`SPEC-DSPARK`](engine-matrix.md)) stay in the
 spec table, not promoted.
 
-**`LAGUNA-S21` (`LagunaForCausalLM` / `laguna`) — `SPIKE` (W0 scoped 2026-07-30,
-`spike/laguna-s21-scope-2026-07-30.md`):** Poolside Laguna-S-2.1, 118B total /
+**`LAGUNA-S21` (`LagunaForCausalLM` / `laguna`) — `ACTIVE` (W0 scoped 2026-07-30
+`specs/laguna-s21-scope-2026-07-30.md`; **W1/W2 STRUCTURAL bring-up LANDED
+2026-07-30** `specs/laguna-s21-w1w2-2026-07-30.md`, `CLAIM-LAGUNA-W1W2`, row
+`MODEL-TEXT-laguna-laguna-for-causal-lm` INVENTORIED→ACTIVE): registry
+(`laguna`/`LagunaForCausalLM`) + `ParseLagunaParams` (nested dual-rope + variable
+Q-head + ungrouped sigmoid-noaux MoE) + GGUF `blk.N.*` name-map + UD-Q4_K_XL
+quant-mix + per-layer forward-composition scaffold (`VT_CHECK(false)` W3 stub);
+CPU `-Werror` clean; `test_laguna_scaffold` 3/3·40. Forward + strict dual-oracle
+gate DEFERRED to W4 (needs the 73 GB checkpoint). Poolside Laguna-S-2.1, 118B total /
 ~8B-active MoE (48 layers, 12 global + 36 sliding-window-512, 256 routed top-10 + 1
 shared expert, GQA 8 KV / 128 head-dim, 1M ctx, vocab 100352, native interleaved
 reasoning). **Oracle verdict REVERSES the "proprietary, vLLM-unsupported" premise:
