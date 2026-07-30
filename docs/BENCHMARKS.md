@@ -27,6 +27,19 @@ ranked carry-over (incl. the T0 RMSNorm 1.2-3.1x kernel perf 49750, which DOES
 owe a GB10 runtime gate when ported) in
 `.agents/specs/upstream-sync-2026-07-30.md`.
 
+**Increment 2 (T1-correctness triage).** Ported the portable core of rank 3,
+vllm#49343 (EAGLE draft `max_position_embeddings` clamp): the pure config helper
+`SpeculativeConfig::MaybeOverrideDraftMaxPositionEmbeddings` (raise a draft's
+mpe up to the target's `max_model_len`, eagle/eagle3-only, never lower) +
+`test_speculative_draft_max_position_embeddings` 4/4 (CPU, RED-first: the two
+raise/flag assertions fail with the clamp neutered). Config-only guard, no
+compute path, no throughput owed. Ranks 1-2 (vllm#48245 preemption-underflow,
+vllm#50297 P/D-race) SKIPPED as unported-code-path: both rebuild the async
+`num_in_flight_tokens` / `num_stale_output_tokens` / `drop_stale_output` +
+reset-running force-preempt + KV-connector-P/D machinery this tree does not
+carry; requeued behind that machinery. Parity pin still UNCHANGED at
+`555967922`.
+
 ## DeepSeek-V4 native MTP self-speculative draft head W1 (2026-07-30, `CLAIM-DEEPSEEK-V4-MTP`) - NOT-APPLICABLE (tiny-config correctness brick; no throughput owed) / real-model acceptance + speedup WEIGHT-BLOCKED
 
 Disposition: **the wiring is CPU-gated at tiny synthetic shape; the real-model

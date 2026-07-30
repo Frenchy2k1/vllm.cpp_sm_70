@@ -145,6 +145,47 @@ struct SpeculativeConfig {
     return cfg;
   }
 
+  // MaybeOverrideDraftMaxPositionEmbeddings: raise an EAGLE draft's
+  // max_position_embeddings up to the target's max_model_len.
+  //
+  // Ported from: vllm/config/speculative.py
+  //   SpeculativeConfig._maybe_override_draft_max_position_embeddings
+  //   @ 32e657e68 (vllm#49343 "[BugFix] eagle draft max position embeddings",
+  //   underlying issue #48894).
+  //
+  // EAGLE/eagle3 drafts SHARE the target's positional space: the proposer feeds
+  // the draft positions up to the target's max_model_len, while the draft's
+  // max_position_embeddings sizes its rotary cos_sin_cache. A draft checkpoint
+  // that ships a smaller value (e.g. 2048 for yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
+  // vs a 131072-context target) under-sizes that cache, so the gather at a
+  // target-scale position reads OUT OF BOUNDS — a device-side assert under
+  // graph capture, silent garbage in eager mode. This clamp raises the draft
+  // value to the target's max_model_len (never lowers it), for eagle/eagle3 ONLY:
+  // an independent AR draft_model may legitimately have a smaller context, so its
+  // value must NOT be resized (upstream test_independent_draft_model_keeps_its_
+  // own_limit).
+  //
+  // Signature note: upstream mutates draft_hf_config.max_position_embeddings in
+  // place and `getattr(..., None)` treats a missing attribute as "leave alone".
+  // Our SpeculativeConfig does not yet carry the draft ModelConfig/hf_config
+  // (draft-config resolution is DEFERRED to the eagle/eagle3 model-loader claim),
+  // so the value is passed by reference as std::optional<int> — nullopt mirrors
+  // "attribute missing" (no override). Returns true iff it raised the value,
+  // mirroring upstream's logger.info (the caller emits the log line). The live
+  // call site lands with eagle/eagle3 draft-config resolution; this is the tested
+  // clamp it will call, and the OOB it prevents is exactly our
+  // RotaryEmbeddingBase cos_sin_cache (built to max_position_embeddings_).
+  static bool MaybeOverrideDraftMaxPositionEmbeddings(
+      std::optional<int>& draft_max_position_embeddings,
+      int target_max_model_len) {
+    if (!draft_max_position_embeddings.has_value() ||
+        *draft_max_position_embeddings >= target_max_model_len) {
+      return false;
+    }
+    draft_max_position_embeddings = target_max_model_len;
+    return true;
+  }
+
   // num_speculative_tokens resolved to a concrete k (falls back to n_predict).
   int ResolvedNumSpeculativeTokens() const {
     return num_speculative_tokens.value_or(n_predict);

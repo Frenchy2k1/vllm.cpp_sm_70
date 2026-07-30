@@ -1570,3 +1570,28 @@ preemption-underflow, 50297 P/D-race, 49343 eagle-draft) and the T0 RMSNorm
 perf/determinism pair (49750, 48391 — GPU runtime gate) are the ranked
 carry-over. vllm#49030 (video temporal padding) was found ALREADY-CORRECT in
 `qwen3vl_processor.cpp` (our ceil formula equals the fix); no port.
+
+**Increment 2 (2026-07-30, T1-correctness triage).** Ported the portable core of
+rank 3, **vllm#49343** (EAGLE draft `max_position_embeddings` clamp): the pure
+config helper `SpeculativeConfig::MaybeOverrideDraftMaxPositionEmbeddings`
+(`include/vllm/config/speculative.h`) — raise an eagle/eagle3 draft's
+`max_position_embeddings` up to the target's `max_model_len` (never lower;
+prevents the draft rotary `cos_sin_cache` OOB gather our `RotaryEmbeddingBase`
+would take). Gate: `test_speculative_draft_max_position_embeddings` **4/4** (CPU,
+RED-first verified — the two raise/override-flag assertions fail with the clamp
+neutered). We do not yet LOAD eagle/eagle3 drafts (draft-config resolution is
+deferred, EAGLE3 is T2), so there is no live call site yet — this is the tested
+clamp the eagle loader wires in when it lands; the 2 upstream model-integration
+tests (real `ModelConfig(EAGLE3_DRAFT/AR_MODEL)`) are SKIPPED (need HF-download +
+draft ModelConfig machinery), recorded in porting-inventory.
+Ranks **1-2 SKIPPED** as unported-code-path, not force-fitted: **vllm#48245**
+(preemption `num_output_placeholders` underflow) and **vllm#50297** (P/D
+preemption race) both rebuild the async stale-output machinery around
+`num_in_flight_tokens` / `num_stale_output_tokens` / `drop_stale_output` + the
+`reset_prefix_cache(reset_running)` scheduler force-preempt + a `skipped_waiting`
+queue + (50297) the KV-connector producer/consumer `requires_kv_delivery` role —
+NONE of which this tree carries (our `async_tokens_to_discard` is never set, the
+force-preempt path is unported, the async engine has no PP concurrent-batch
+window, and KV P/D transport is N-A by sync policy). The underflow they fix
+cannot occur here; porting the prerequisite machinery is a scoped feature port,
+requeued in the sync doc. Parity pin still UNCHANGED at `555967922`.

@@ -346,6 +346,9 @@ vllm_cpp_add_test(test_lmcache_key_agreement vllm/v1/kv_offload/lmcache/test_lmc
 target_compile_definitions(test_lmcache_key_agreement PRIVATE
   TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 vllm_cpp_add_test(test_scheduler_config vllm/test_scheduler_config.cpp)
+# vllm#49343 eagle-draft max_position_embeddings clamp (config/speculative.h).
+vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
+  vllm/config/test_speculative_draft_max_position_embeddings.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)
 vllm_cpp_add_test(test_scheduler vllm/v1/test_scheduler.cpp)
