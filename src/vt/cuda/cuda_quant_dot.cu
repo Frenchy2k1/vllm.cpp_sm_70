@@ -627,6 +627,74 @@ __global__ void QuantDotGemmGroupedKernel(OutT* __restrict__ out,
   }
 }
 
+// FUSED gate+up+silu grouped kernel — the ds4 `moe_gate_up_mid` epilogue
+// (ds4_cuda.cu moe_gate_up_mid_decode_lut_qwarp32_kernel:17127). ONE warp per
+// (p,j) computes BOTH the gate dot (gate_w[e,j]·xq) AND the up dot (up_w[e,j]·xq)
+// against the SAME broadcast Q8_K activation, then writes the clamped-SwiGLU
+// product adown[p*n+j] = silu(min(gate,limit)) · clamp(up,±limit). This collapses
+// the resident-decode routed-MoE's {gate grouped-GEMM + up grouped-GEMM + topk×2
+// AsyncCopyF + topk ClampedSwiGLU} into ONE launch and NEVER writes the gate/up
+// intermediates to HBM (they stay in registers). BIT-IDENTICAL to that chain: the
+// SAME DotSuperblock integer core, the SAME 32-lane warp-tree reduce, the SAME
+// FinalFactor, and the SAME ClampedSwiGLUKernel formula with alpha=1,beta=0
+// (cuda_deepseek_v4.cu:612-619, Sig(x)=1/(1+e^-x)). The route weight is NOT folded
+// here — it stays in moe_combine (post-down), preserving the down-GEMM's exact
+// input bytes → the whole change is a pure launch-count + HBM-traffic fusion.
+template <WType W>
+__global__ void QuantDotGemmGroupedFusedSwiGLUKernel(float* __restrict__ out,
+                                                     const uint8_t* __restrict__ gate_w,
+                                                     const uint8_t* __restrict__ up_w,
+                                                     const BlockQ8_K* __restrict__ act,
+                                                     const int32_t* __restrict__ expert_ids,
+                                                     int64_t P, int64_t n, int64_t nsb,
+                                                     size_t w_row_bytes, size_t w_block_bytes,
+                                                     float limit, bool bcast) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= P * n) return;
+  const int64_t p = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+
+  const int64_t e = expert_ids[p];
+  const uint8_t* g_row = gate_w + static_cast<size_t>(e * n + j) * w_row_bytes;
+  const uint8_t* u_row = up_w + static_cast<size_t>(e * n + j) * w_row_bytes;
+  const BlockQ8_K* a_row = act + (bcast ? 0 : p) * nsb;
+
+  float pg = 0.0f, pu = 0.0f;
+  for (int64_t sb = lane; sb < nsb; sb += 32) {
+    const void* gw_sb = g_row + static_cast<size_t>(sb) * w_block_bytes;
+    const void* uw_sb = u_row + static_cast<size_t>(sb) * w_block_bytes;
+    pg += DotSuperblock<W>(gw_sb, a_row + sb);
+    pu += DotSuperblock<W>(uw_sb, a_row + sb);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    pg += __shfl_down_sync(0xffffffffu, pg, off);
+    pu += __shfl_down_sync(0xffffffffu, pu, off);
+  }
+  if (lane == 0) {
+    // == ClampedSwiGLUKernel(gate_up, mi, limit, alpha=1, beta=0): out[i] =
+    //    gate·Sig(gate)·up, gate=min(g,limit), up=clamp(u,±limit). Bit-identical.
+    const float gate = fminf(FinalFactor<W>() * pg, limit);
+    const float up = fminf(fmaxf(FinalFactor<W>() * pu, -limit), limit);
+    out[p * n + j] = gate * (1.0f / (1.0f + expf(-gate))) * up;
+  }
+}
+
+template <WType W>
+void LaunchGroupedFusedSwiGLU(Tensor& out, const uint8_t* gate_w, const uint8_t* up_w,
+                              const BlockQ8_K* act, const int32_t* expert_ids, int64_t P,
+                              int64_t n, int64_t nsb, size_t w_row_bytes, size_t w_block_bytes,
+                              float limit, bool bcast, cudaStream_t s) {
+  constexpr int kWarpsPerBlock = 4;
+  dim3 block(32, kWarpsPerBlock);
+  const int64_t warps = P * n;
+  const int64_t grid = (warps + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  QuantDotGemmGroupedFusedSwiGLUKernel<W><<<static_cast<unsigned>(grid), block, 0, s>>>(
+      static_cast<float*>(out.data), gate_w, up_w, act, expert_ids, P, n, nsb, w_row_bytes,
+      w_block_bytes, limit, bcast);
+}
+
 // ===========================================================================
 // Q8_0 keep-quant GEMM — the DeepSeek-V4 MLA projections / o-LoRA / shared
 // experts / lm_head (the "AProjQ8/SExpQ8/OutQ8" weights) run ON THE GPU instead
@@ -1103,4 +1171,63 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// DeepSeek-V4 resident-decode fused routed-MoE gate+up+SwiGLU (external linkage,
+// called from cuda_deepseek_v4.cu's MoeDeviceKernels wrapper — same CUDA library).
+// out[P,n] adown, act[Pa,K] (Pa==1 broadcast), gate_w/up_w[E*n,K] block-quant (same
+// dtype), expert_ids[P] i32. Quantizes act to Q8_K ONCE (grow-only per-stream
+// scratch, identical to MatmulBTQuantGroupedKernelCuda), then one fused launch.
+// Bit-identical to the two grouped GEMMs + ClampedSwiGLU it replaces.
+void MoeGateUpSwiGLUGroupedCuda(Queue& q, Tensor& out, const Tensor& act, const Tensor& gate_w,
+                                const Tensor& up_w, const Tensor& expert_ids, float limit) {
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+  const int64_t P = out.shape[0];
+  const int64_t n = out.shape[1];
+  const int64_t k = act.shape[1];
+  if (P == 0 || n == 0) return;
+
+  WType w{}, wu{};
+  if (!IsCudaKeepQuantSupported(gate_w.dtype, &w) || !IsCudaKeepQuantSupported(up_w.dtype, &wu) ||
+      w != wu) {
+    throw std::runtime_error(
+        "vt cuda: moe_gate_up_swiglu: gate/up must be the SAME CUDA keep-quant dtype");
+  }
+  if (k % kQK_K != 0) {
+    throw std::runtime_error(
+        "vt cuda: moe_gate_up_swiglu: K must be a whole number of 256-element Q8_K super-blocks");
+  }
+  const int64_t nsb = k / kQK_K;
+  const size_t w_block_bytes = static_cast<size_t>(BlockBytes(gate_w.dtype));
+  const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
+
+  const int64_t Pa = act.shape[0];
+  const bool bcast = (Pa == 1 && P > 1);
+  const size_t act_bytes = static_cast<size_t>(Pa) * static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
+  BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureScratch(act_bytes, s));
+  ActDT adt = act.dtype == DType::kF32 ? ActDT::kF32
+              : act.dtype == DType::kF16 ? ActDT::kF16
+                                         : ActDT::kBF16;
+  {
+    constexpr int kQBlock = 128;
+    const int64_t total_sb = Pa * nsb;
+    const int64_t grid = (total_sb + kQBlock - 1) / kQBlock;
+    QuantizeQ8KKernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(qact, act.data, adt,
+                                                                      act.stride[0], Pa, nsb);
+  }
+
+  const uint8_t* gw = static_cast<const uint8_t*>(gate_w.data);
+  const uint8_t* uw = static_cast<const uint8_t*>(up_w.data);
+  const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
+  switch (w) {
+    case WType::kIQ2_XXS: LaunchGroupedFusedSwiGLU<WType::kIQ2_XXS>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kIQ3_XXS: LaunchGroupedFusedSwiGLU<WType::kIQ3_XXS>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kQ2_K: LaunchGroupedFusedSwiGLU<WType::kQ2_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kQ3_K: LaunchGroupedFusedSwiGLU<WType::kQ3_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kQ4_K: LaunchGroupedFusedSwiGLU<WType::kQ4_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kQ5_K: LaunchGroupedFusedSwiGLU<WType::kQ5_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kQ6_K: LaunchGroupedFusedSwiGLU<WType::kQ6_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+  }
+  CheckCuda(cudaGetLastError(), "moe_gate_up_swiglu launch");
+}
+
 }  // namespace vt::cuda

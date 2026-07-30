@@ -1201,6 +1201,42 @@ void GemmGroupedInto(const V4Backend& be, const OwnedTensor& weight, const float
   vt::MatmulBTQuantGrouped(gq, o, a, w, eid);  // NO sync — resident
 }
 
+// FUSED routed-MoE gate+up+SwiGLU into `out` (adown[P,mi]), NO sync. Collapses the
+// {gate grouped-GEMM + up grouped-GEMM + P×2 AsyncCopyF + P ClampedSwiGLU} chain
+// into ONE launch (ds4 moe_gate_up_mid). Bit-identical: the gate/up dots reuse the
+// same integer core + warp reduce as GemmGroupedInto's two GEMMs, and the SwiGLU
+// epilogue matches ClampedSwiGLUKernel (α=1,β=0). The route weight is NOT folded —
+// it stays in moe_combine (post-down). `x` is the shared hidden (act_rows=1
+// broadcast: quantize once, feed every expert). Requires both towers block-quant.
+void MoeGateUpSwiGLUInto(const V4Backend& be, const OwnedTensor& gate_w, const OwnedTensor& up_w,
+                         const float* x, const int32_t* eids, int64_t P, int64_t mi, int64_t H,
+                         float limit, float* out) {
+  VT_CHECK(be.q != nullptr && !gate_w.repacked && !up_w.repacked &&
+               vt::IsBlockQuant(gate_w.dtype) && vt::IsBlockQuant(up_w.dtype),
+           "resident fused MoE gate+up: needs non-repacked block-quant gate/up towers");
+  vt::Queue& gq = *be.q;
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x), vt::DType::kF32, gq.device, {1, H});
+  vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, gq.device, {P, mi});
+  vt::Tensor eid =
+      vt::Tensor::Contiguous(const_cast<int32_t*>(eids), vt::DType::kI32, gq.device, {P});
+  vt::Tensor gw = gate_w.View();
+  gw.device = gq.device;
+  vt::Tensor uw = up_w.View();
+  uw.device = gq.device;
+  deepseek_v4::MoeDevice()->moe_gate_up_swiglu(gq, o, a, gw, uw, eid, limit);  // NO sync
+}
+
+// The fused routed-MoE gate+up+SwiGLU epilogue is the resident-decode default
+// (ds4-faithful). VT_V4_FUSED_MOE=0 falls back to the separate gate/up GEMMs +
+// per-expert ClampedSwiGLU (bit-identical) for A/B measurement + rollback.
+inline bool FusedMoeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_FUSED_MOE");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
 // True iff the resident T=1 decode path can run: flag on, CUDA queue, keep-quant
 // tower live (be.gguf != nullptr ⇒ `dsa_dense`, so every layer runs DENSE MLA and
 // the compressor/indexer are OFF regardless of the config compress_ratios — the
@@ -1353,12 +1389,18 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
     // routed experts (grouped, eids resident): gate/up read the SHARED hidden x
     // (act_rows=1 ⇒ quantize x ONCE, broadcast across the topk experts — no xrep copy,
     // no per-expert re-quant of an identical row), swiglu, down.
-    GemmGroupedInto(be, Lq.moe_gate_exps, x.data(), eids.data(), topk, mi, H, gr.data(), /*act_rows=*/1);
-    GemmGroupedInto(be, Lq.moe_up_exps, x.data(), eids.data(), topk, mi, H, ur.data(), /*act_rows=*/1);
-    for (int64_t j = 0; j < topk; ++j) {
-      AsyncCopyF(be, gate_up_r.data(), gr.data() + j * mi, mi);        // gate half
-      AsyncCopyF(be, gate_up_r.data() + mi, ur.data() + j * mi, mi);   // up half
-      MOE->clamped_swiglu_ip(*be.q, adown.data() + j * mi, gate_up_r.data(), mi, lim, 1.0f, 0.0f);
+    if (FusedMoeEnabled()) {
+      // ds4 moe_gate_up_mid: ONE launch does gate+up+silu → adown (bit-identical).
+      MoeGateUpSwiGLUInto(be, Lq.moe_gate_exps, Lq.moe_up_exps, x.data(), eids.data(), topk, mi, H,
+                          lim, adown.data());
+    } else {
+      GemmGroupedInto(be, Lq.moe_gate_exps, x.data(), eids.data(), topk, mi, H, gr.data(), /*act_rows=*/1);
+      GemmGroupedInto(be, Lq.moe_up_exps, x.data(), eids.data(), topk, mi, H, ur.data(), /*act_rows=*/1);
+      for (int64_t j = 0; j < topk; ++j) {
+        AsyncCopyF(be, gate_up_r.data(), gr.data() + j * mi, mi);        // gate half
+        AsyncCopyF(be, gate_up_r.data() + mi, ur.data() + j * mi, mi);   // up half
+        MOE->clamped_swiglu_ip(*be.q, adown.data() + j * mi, gate_up_r.data(), mi, lim, 1.0f, 0.0f);
+      }
     }
     GemmGroupedInto(be, Lq.moe_down_exps, adown.data(), eids.data(), topk, H, mi, eo.data() + H);
     // combine: x := shared + Σ_j w_j·routed_j  (device FMA near-tie).
@@ -1540,12 +1582,17 @@ struct V4Graph {
       MOE->clamped_swiglu_ip(*be.q, act_s.data(), gate_up_s.data(), mi, lim, 1.0f, 0.0f);
       GemmIntoKq(be, Lq.shared_down, act_s.data(), eo.data(), 1, H, mi);
       // gate/up: broadcast the shared hidden x (act_rows=1 ⇒ quantize once, no xrep copy).
-      GemmGroupedInto(be, Lq.moe_gate_exps, x.data(), eids.data(), topk, mi, H, gr.data(), /*act_rows=*/1);
-      GemmGroupedInto(be, Lq.moe_up_exps, x.data(), eids.data(), topk, mi, H, ur.data(), /*act_rows=*/1);
-      for (int64_t j = 0; j < topk; ++j) {
-        AsyncCopyF(be, gate_up_r.data(), gr.data() + j * mi, mi);
-        AsyncCopyF(be, gate_up_r.data() + mi, ur.data() + j * mi, mi);
-        MOE->clamped_swiglu_ip(*be.q, adown.data() + j * mi, gate_up_r.data(), mi, lim, 1.0f, 0.0f);
+      if (FusedMoeEnabled()) {
+        MoeGateUpSwiGLUInto(be, Lq.moe_gate_exps, Lq.moe_up_exps, x.data(), eids.data(), topk, mi, H,
+                            lim, adown.data());
+      } else {
+        GemmGroupedInto(be, Lq.moe_gate_exps, x.data(), eids.data(), topk, mi, H, gr.data(), /*act_rows=*/1);
+        GemmGroupedInto(be, Lq.moe_up_exps, x.data(), eids.data(), topk, mi, H, ur.data(), /*act_rows=*/1);
+        for (int64_t j = 0; j < topk; ++j) {
+          AsyncCopyF(be, gate_up_r.data(), gr.data() + j * mi, mi);
+          AsyncCopyF(be, gate_up_r.data() + mi, ur.data() + j * mi, mi);
+          MOE->clamped_swiglu_ip(*be.q, adown.data() + j * mi, gate_up_r.data(), mi, lim, 1.0f, 0.0f);
+        }
       }
       GemmGroupedInto(be, Lq.moe_down_exps, adown.data(), eids.data(), topk, H, mi, eo.data() + H);
       MOE->moe_combine(*be.q, x.data(), eo.data(), weights.data(), 1 + topk, H);

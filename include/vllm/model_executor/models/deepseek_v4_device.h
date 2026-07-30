@@ -41,6 +41,7 @@
 #include "vllm/model_executor/models/deepseek_v4_mhc.h"          // MhcPreResult
 #include "vllm/model_executor/models/deepseek_v4_moe.h"          // MoeRouteResult
 #include "vt/device.h"                                           // vt::Queue
+#include "vt/tensor.h"                                            // vt::Tensor
 
 namespace vllm::deepseek_v4 {
 
@@ -189,6 +190,19 @@ struct MoeDeviceKernels {
   // resident decode step is 100% device (capturable). w_bf16 = the bf16 weight bytes.
   void (*router_gate)(vt::Queue&, float* gating, const float* x, const void* w_bf16, int64_t ne,
                       int64_t H);
+  // FUSED routed-MoE gate+up+SwiGLU (ds4 moe_gate_up_mid). ONE launch computes,
+  // per (expert-slot p, mid-row j), gate=gate_w[e,j]·x, up=up_w[e,j]·x (shared
+  // Q8_K x, broadcast), then adown[p*mi+j] = silu(min(gate,limit))·clamp(up,±limit)
+  // — collapsing {gate grouped-GEMM + up grouped-GEMM + topk×2 copies + topk
+  // ClampedSwiGLU} → 1 kernel, gate/up never touching HBM. BIT-IDENTICAL to that
+  // chain (same integer dot, warp reduce, FinalFactor, SwiGLU formula α=1,β=0);
+  // the route weight stays in moe_combine (post-down). `gate_w`/`up_w` are the
+  // stacked [E*mi, H] block-quant expert towers (moe_gate_exps / moe_up_exps).
+  // out[P,mi] adown, act[1,H] broadcast, gate_w/up_w[E*mi,H] same block-quant
+  // dtype, expert_ids[P] i32 — all on the queue device (unified memory), no drain.
+  void (*moe_gate_up_swiglu)(vt::Queue&, vt::Tensor& out, const vt::Tensor& act,
+                             const vt::Tensor& gate_w, const vt::Tensor& up_w,
+                             const vt::Tensor& expert_ids, float limit);
 };
 
 // Resolve a family's device kernels through the vt OpProvider seam. THROWS on a

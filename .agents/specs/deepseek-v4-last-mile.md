@@ -190,6 +190,34 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   batched/persistent kernel — risky, uncertain) OR the numerics-delicate last mile (fp8-KV, dequant-cache) — a USER
   CALL. We stand at **10.07 tok/s ≈ 61% of ds4 16.5** vs the ~13–15 projected bit-exact ceiling.
 - **Brick 5 — fp8 KV (parity/long-ctx, measured at 256+).** Rollback-able (new path default-safe; the resident default stays correct).
+- **Brick 6 — FUSION lever: routed-MoE gate+up+silu into ONE kernel (ds4 `moe_gate_up_mid`) — DONE + DGX-gated, bit-exact, +5.2%.**
+  CORRECTS the Brick-4 "bit-exact IN-KERNEL GEMM levers EXHAUSTED" framing: that was about the GEMM *mainloop*;
+  the CROSS-kernel FUSION lever (fewer launches + less HBM glue, ds4's actual edge per `best-gemm-path`) was
+  untouched and is a NEW bit-exact win. The resident routed MoE ran {gate grouped-GEMM + up grouped-GEMM +
+  topk×2 `AsyncCopyF` + topk `ClampedSwiGLU`} as SEPARATE launches, writing the gate/up intermediates (`gr`/`ur`)
+  to HBM and reading them back. New `QuantDotGemmGroupedFusedSwiGLUKernel<W>` (`cuda_quant_dot.cu`, ground: ds4
+  `moe_gate_up_mid_decode_lut_qwarp32_kernel:17127`): ONE warp per (expert-slot p, mid-row j) computes BOTH the
+  gate dot and the up dot vs the SAME broadcast Q8_K x (quantized ONCE), keeps them in registers, writes
+  `adown[p*mi+j] = silu(min(gate,limit))·clamp(up,±limit)`. Wired through `MoeDeviceKernels::moe_gate_up_swiglu`
+  → eager + graph resident paths (`VT_V4_FUSED_MOE=0` A/B fallback). **BIT-IDENTICAL** — same `DotSuperblock`
+  integer core, same 32-lane warp-tree reduce, same `FinalFactor`, same `ClampedSwiGLUKernel` formula (α=1,β=0,
+  `Sig=1/(1+e^-x)`); the route weight is NOT folded (stays in `moe_combine`, post-down ⇒ the down-GEMM input bytes
+  are unchanged). Gates: `test_cuda_quant_dot` 3/3·105841, `test_cuda_deepseek_v4` 18/18·34176,
+  `test_deepseek_v4_gguf_load` 13/13·631 (all UNCHANGED); real 80.7 GB model resident+graph fused vs unfused =
+  **byte-IDENTICAL 49-token sequence** ("…11111 16 455 6102 294 8760 344 …" cycle). **RESULT (median of 3 warm
+  runs each, --gpu --kv-cache --graph, 50 tok):** decode **10.27 → 10.80 tok/s (+5.2%, non-overlapping bands
+  fused 10.79–10.82 / unfused 10.24–10.27)** vs ds4 16.5 (~65% of ds4; closes ~8.5% of the residual gap). **nsys
+  (`--cuda-graph-trace=node`, 13 decode steps × 43 layers):** total kernel instances **36,647 → 32,175 (−12.2%)**;
+  IQ2 `QuantDotGemmGroupedKernel<0>` (gate+up) 1548→0 folded into `…FusedSwiGLUKernel<0>` 559 (153.6→99.1 ms over
+  13 steps); `ClampedSwiGLUKernel` 3913→559 (routed 6/layer collapsed); `QuantizeQ8KKernel` 2322→1763 (−559: x
+  quantized once, not per gate+up — the activation-quant fusion, lever-2, came free). PEAK RSS unchanged (86.7 GiB;
+  `gr`/`ur`/`gate_up_r` buffers now unused, no new alloc). **HONEST residual:** the graph path already amortizes
+  host-launch overhead, so this win is the HBM gate/up round-trip + the redundant-quant, ~5%; the LARGE remaining
+  ds4 gap is the still-UN-fused per-step glue — nsys hot glue over 13 steps: `RopeKernel` 119.9 ms (1677 inst),
+  `QuantizeQ8KKernel` 106.7 ms, `MhcPreFinishKernel` 98.7 ms (1118), `RouteKernel` 77.4 ms (559) — plus the BW-
+  efficiency gap (ds4 at ~58% of the roofline). NEXT LEVER (STEP 1b): fuse Rope into the qk-write, and the
+  MhcPre/Route glue, into fewer kernels (bit-exact where elementwise; characterized near-tie where a reduction
+  reorders). Commit `<this>`.
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +
