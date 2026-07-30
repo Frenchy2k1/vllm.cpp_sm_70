@@ -10104,3 +10104,5 @@ Honest attribution — the residual gap is NOT "experts on CPU" (fixed) but: (1)
 **env-doc hygiene (2026-07-29):** no benchmark impact — allowlisted the
 diagnostic `VT_SPEC_TRACE` spec-decode acceptance trace to restore `check-env-doc`
 rc=0 on main (it prints per-block draft/accept detail to stderr; off by default).
+
+**Best-GEMM-path research (2026-07-30):** no benchmark impact (research/spec). Governs future perf levers per [[strive-for-best-in-class-not-just-parity]]: decode is memory-bound in every regime (matvec/dp4a at the roofline, tensor cores wasted at M=1) — the two ranked SPEED items on shipped models are the nvfp4 W4A4 decode mis-route (27B/35B) + the ~20% prefill glue; the big levers (fp16, GPTQ/AWQ Marlin, block-fp8/DeepGEMM, int8-MMA MMQ) are breadth/correctness unlocks. See `.agents/specs/best-gemm-path-2026-07-30.md`.
