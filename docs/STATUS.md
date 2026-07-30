@@ -677,6 +677,18 @@ decode matvec** (mmq.cu is prefill; the reference is llama.cpp `mmvq.cu`). Ranke
 dequant (the 5× gap, mmvq.cu vectorized dequant + dp4a), (2) fuse activation-quant, (3) Q8_0 coalescing,
 (4) fp8 KV (parity/long-ctx, NOT the short-ctx lever). Honest projection: **~14-16 tok/s target** (ds4 16.5 =
 58% of the BW roofline, fully fused); ~28 tok/s is the hard ceiling. Full table: `.agents/specs/deepseek-v4-last-mile.md`. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Last-mile campaign — Brick 1: __dp4a vectorized-dequant matvec for the grouped keep-quant GEMMs — SPLIT
+result (2026-07-30, base `aed4a498`, branch `deepseek-v4-last-mile`, commit `c1f92d24`, NOT pushed).** Ported
+llama.cpp `mmvq.cu`/`vecdotq.cuh` SIMD dequant into `DotIQ2XXS` (vecdotq.cuh:920-928) + `DotQ2K`
+(vecdotq.cuh:329-354), keeping warp-per-output + Q8_K activation. BIT-IDENTICAL (`__dp4a` = exact int32); the
+`test_cuda_quant_dot` nmse≤1e-6 gate CAUGHT a signed-overflow UB in the IQ2 sign broadcast (RED-first worked) →
+fixed to unsigned → **2/2·105601 zero drift**; `test_cuda_deepseek_v4` 18/18; `test_deepseek_v4_gguf_load`
+12/12; real model resident-default TOKEN-IDENTICAL "…Paris.". **SPLIT:** Q2_K grouped **2.35×** (24%→56% of
+peak, MAC was the bottleneck → now memory-bound; 10.0%→4.4% of step); IQ2_XXS grouped **FLAT** (~17-19% of
+peak) — GROUNDED: `d_iq2xxs_grid` is `__constant__`, our 32 lanes look up different indices → divergent
+constant-memory reads ~32-way serialized/warp = the bottleneck, not the MAC. **Decode 8.01 → 8.51 tok/s (+6%,
+4 stable warm runs) vs ds4 16.5.** NEXT (Brick 1b): the IQ2 grid-lookup (move to GLOBAL / mmvq.cu handling) —
+the bigger grouped kernel's win. STOPPED for review. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

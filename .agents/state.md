@@ -33853,3 +33853,52 @@ foreground-wait. Rollback via `VT_V4_RESIDENT_DECODE=0`. **THE DEEPSEEK-V4 DECOD
 DEFAULT ON GB10 — the vLLM-faithful path is shipped; the last mile to ds4's 16.5 is GEMM/quant microarch (fp8 KV,
 tuned MMQ), a named residual.** Box restored (worker running restart=always, flock free, no stray gen). Row `ACTIVE`.
 
+
+## DeepSeek-V4 last-mile campaign — Brick 1: __dp4a vectorized-dequant matvec for the grouped keep-quant GEMMs — a SPLIT result (2026-07-30, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-rd`, branch `deepseek-v4-last-mile`, base `aed4a498`, commit `c1f92d24`, NOT pushed)
+
+Brick 0 (prior, commit `42a99471`) MEASURED the T=1 keep-quant GEMM roofline (GB10 peak 240 GB/s via a float4
+copy microbench; every GEMM <1% of int8 compute peak → all MEMORY-bound → tensor cores don't help a decode
+matvec; reference = llama.cpp `mmvq.cu`, not `mmq.cu`). The coordinator reconciled it with the parallel source
+research (both agree) and GREENLIT Brick 1: the __dp4a vectorized-dequant matvec for the grouped kernels.
+
+**Brick 1 (cuda_quant_dot.cu):** ported mmvq's SIMD dequant into `DotIQ2XXS` (from `vecdotq.cuh:920-928`
+`vec_dot_iq2_xxs_q8_1` + ds4 `dev_iq2_dp4a_8` `ds4_cuda.cu:16147`) + `DotQ2K` (from `vecdotq.cuh:329-354`
+`vec_dot_q2_K_q8_1` + ds4 `dev_dot_q2_16` `ds4_cuda.cu:16158`) — these feed BOTH the single (`QuantDotGemmKernel<W>`)
+and grouped (`QuantDotGemmGroupedKernel<W>`) kernels via `DotSuperblock<W>`, keeping our warp-per-output +
+Q8_K activation. IQ2: per-element sign+MAC branch → `signs*0x01010101 & {0x08040201,0x80402010}` → `__vcmpne4`
+per-byte mask → `__vsub4(grid^s,s)` = ±grid → `__dp4a(±grid,q8,sumi)`. Q2_K: 2-bit MAC → `__dp4a` on
+`0x03030303`-masked packs. `__dp4a` is an EXACT int32 accumulation of int8 products → BIT-IDENTICAL integer core.
+
+**RED-FIRST CAUGHT A BUG (the gate worked):** the first build failed `test_cuda_quant_dot` — 24 iq2_xxs
+assertions, nmse ~0.3 (a real error, not a near-tie). Root cause: my sign broadcast `static_cast<int>(uint8) *
+0x01010101` overflows signed int for signs≥128 (255*0x01010101 > INT_MAX) = UB → wrong signs for half the
+patterns. Fixed to `unsigned` (well-defined wraparound) → `test_cuda_quant_dot` **2/2·105601, nmse≤1e-6 ZERO
+drift**. Q2_K passed on the first build (no signs, no UB).
+
+**GATES (DGX GB10):** `test_cuda_quant_dot` 2/2·105601; `test_cuda_deepseek_v4` 18/18·34176;
+`test_deepseek_v4_gguf_load` 12/12·531; real 80.7 GB model resident-default TOKEN-IDENTICAL "…Paris.".
+
+**THE SPLIT RESULT (honest, grounded — nsys re-profile):**
+- **Q2_K grouped: 2.35× faster** — nsys median/instance 265→104 µs; **24% → 56% of the 240 GB/s peak** (the
+  scalar MAC WAS the bottleneck; dp4a removed it → now memory-bound like Q8_0). Its share fell 10.0% → 4.4%.
+- **IQ2_XXS grouped: FLAT** — median 269→265 µs, still ~17-19% of peak. GROUNDED root cause: `d_iq2xxs_grid[256]`
+  is `__device__ __constant__ uint64_t`, and our warp-per-output has each of the 32 lanes look up a DIFFERENT
+  grid index (each lane owns a different super-block) → **divergent constant-memory reads are ~32-way serialized
+  per warp** = the bottleneck, NOT the MAC. dp4a vectorized only the already-cheap inner 8-element MAC, so it
+  gives IQ2 no win. (Q2_K has no codebook → no divergent lookup → the MAC WAS its bottleneck.)
+
+**BENCHMARK (real 80.7 GB, 24 decode, resident default):** decode **8.01 → 8.51 tok/s (+6%, 4 stable warm runs**;
+the first per-session run is a cold-clock leg ~6.8 — discarded per the benchmark-gate-statistics rule); host `=0`
+also 7.22→7.63 (it shares the CUDA grouped GEMM). vs ds4 16.5.
+
+**NEXT — Brick 1b (the finding, the bigger win):** the IQ2_XXS grid-lookup (20-23% of the step,
+grid-serialization-bound). Move `d_iq2xxs_grid` out of `__constant__` to GLOBAL (L2-cached, divergent access
+parallelized across lanes, not constant-serialized), or mirror mmvq.cu's grid handling; MEASURE. Q8_0 dp4a was
+DEFERRED (it's memory-bound at 63% of peak — its lever is Brick 3 coalescing, not dp4a).
+
+**Ops:** scp'd only cuda_quant_dot.cu onto the reused `vllmcpp-mmspeed/build-cuda` sm_121a tree (drift-checked vs
+main `aed4a498` = MATCH), fast incremental rebuild, worker stopped during build/gate/bench/nsys then RESTORED
+(running, restart=always), flock held for the GPU runs, ONE engine at a time, nsys `--cuda-graph-trace=node` for
+the per-kernel re-profile, 4 warm bench runs for stability. Rollback-able (bit-identical, the resident default
+stays correct). STOPPED for review before Brick 1b / Brick 2. Box restored (worker running restart=always, flock
+free, no stray gen). Row `ACTIVE`.
