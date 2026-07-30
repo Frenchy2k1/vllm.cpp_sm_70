@@ -42,6 +42,11 @@ namespace vt::cuda {
 void MoeGateUpSwiGLUGroupedCuda(vt::Queue& q, vt::Tensor& out, const vt::Tensor& act,
                                const vt::Tensor& gate_w, const vt::Tensor& up_w,
                                const vt::Tensor& expert_ids, float limit);
+// Brick 12 (ds4-gap launch consolidation): paired + block-diagonal Q8_0 decode GEMVs.
+void MatmulQ8_0PairCuda(vt::Tensor& out0, vt::Tensor& out1, const vt::Tensor& a,
+                        const vt::Tensor& b0, const vt::Tensor& b1, cudaStream_t s);
+void MatmulQ8_0GroupDiagCuda(vt::Tensor& out, const vt::Tensor& a, const vt::Tensor& b,
+                             int64_t ng, cudaStream_t s);
 }  // namespace vt::cuda
 
 namespace vllm::deepseek_v4 {
@@ -1570,13 +1575,26 @@ void DecodeAttnGLaunch(Queue& q, float* o, const float* query, const float* cach
   Check(cudaGetLastError(), "decode_attn_g launch");
 }
 
+// Brick 12 (ds4-gap launch consolidation): thin Tensor pass-throughs to the
+// cuda_quant_dot.cu paired / block-diagonal Q8_0 GEMV kernels (same CUDA library, no
+// drain — the resident chain drains/captures once). Bit-identical to the launches they
+// replace (see the cuda_quant_dot.cu kernel comments).
+void MatmulQ8_0PairLaunch(Queue& q, Tensor& out0, Tensor& out1, const Tensor& act,
+                          const Tensor& w0, const Tensor& w1) {
+  vt::cuda::MatmulQ8_0PairCuda(out0, out1, act, w0, w1, AsStream(q));
+}
+void MatmulQ8_0OloraALaunch(Queue& q, Tensor& out, const Tensor& act, const Tensor& w,
+                            int64_t n_groups) {
+  vt::cuda::MatmulQ8_0GroupDiagCuda(out, act, w, n_groups, AsStream(q));
+}
+
 // ── the per-family kernels-structs (registered through the seam) ──────────────
 const MhcDeviceKernels kMhc = {&MhcSinkhornLaunch, &MhcPreLaunch, &MhcPostLaunch, &HcHeadLaunch,
                                &MhcPostInPlaceLaunch, &HcHeadInPlaceLaunch, &MhcPreInPlaceLaunch};
 const DsaDeviceKernels kDsa = {&DsaWeightFoldLaunch, &DsaLogitsLaunch, &DsaTopkLaunch,
                                &SoftmaxSinkLaunch, &GroupedOLoraLaunch, &DecodeAttnLaunch,
                                &RmsNormLaunch, &RopeLaunch, &RmsNormRowsLaunch, &DecodeAttnGLaunch,
-                               &NormRopeRowsLaunch};
+                               &NormRopeRowsLaunch, &MatmulQ8_0PairLaunch, &MatmulQ8_0OloraALaunch};
 const CompressorDeviceKernels kComp = {&SaveScoreApeLaunch, &PoolNormLaunch, &Fp8EncodeLaunch,
                                        &Fp8DecodeLaunch};
 // FUSED routed-MoE gate+up+SwiGLU — forwards to the cuda_quant_dot.cu kernel that

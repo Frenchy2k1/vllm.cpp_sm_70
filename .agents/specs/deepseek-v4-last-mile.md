@@ -398,6 +398,35 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   biggest remaining Q8_0 win and re-opens the ladder. **Premise correction:** direct Q8_0 gap = **10.5 ms/step**, not
   the older whole-step-derived "19.8 ms"; ds4's Q8_0 is at 90% roofline (217 GB/s), not the whole-step ~139 GB/s
   average. Supersedes Brick 11's "irreducible residual / ~13 ceiling" framing. No code changed; L2-hit unmeasured (counter-blocked).
+- **Brick 12 (IMPL) — Q8_0 LAUNCH CONSOLIDATION built + measured: hits ds4's EXACT 259-launch structure BIT-EXACTLY,
+  but the projected bandwidth win does NOT materialize → the "launch count/size drives ds4's 90%" hypothesis is
+  REFUTED under the graphed decode.** (2026-07-30, branch `ds4-q8-launch-consolidation` off `1ddcc42c`, NOT pushed.
+  `VT_V4_Q8_PAIR` default-ON, rollback `=0`.) Three bit-exact consolidations wired into BOTH the resident-decode
+  `Step` and the captured `V4Graph` RunChain: (1) **projection-pairing** `QuantDotGemmQ8_0PairKernel` (port of
+  ds4 `matmul_q8_0_pair_preq_warp8_kernel` `ds4_cuda.cu:4485`) — the two A-projections that share the layer hidden
+  (`wq_a`+`wkv`; shared-expert `gate`+`up`) → ONE launch each, activation quantized once; (2) **block-diagonal
+  o-LoRA** `QuantDotGemmQ8_0GroupDiagKernel` (ds4 `grouped_q8_0_a_preq_warp8_kernel` `:5509`) — the ng=8 per-group
+  `wo_a` GEMVs → ONE launch (this was 344/step, 53% of the 646). MHC-expand epilogue fold (step 3) DEFERRED (not
+  needed to hit the count; would risk the near-tie budget). **MEASURED (nsys `cuda_gpu_kern_sum`, diff `(-n60−-n4)/56`,
+  same rig as Brick 12-profile):** dense-Q8_0 launches/step **646 → 259** (−387, **EXACTLY ds4's 259**: 130 plain +
+  86 pair + 43 group-diag); the pair kernel is **37.3 µs/matmul-equiv, at/under ds4's 38.8 µs**. Q8_0 GPU-active/step
+  **40.96 → 39.86 ms (−1.10 ms, −2.7%)**; achieved BW **161 → 166 GB/s (67.1% → 69.0%** of the 240 roofline — did
+  **NOT** reach the projected ~90%/30.4 ms). Wall decode **12.24 → 12.27 tok/s** (flat, within page-noise);
+  GPU-active-projected ~12.1 → ~12.3. **HONEST PARTIAL / hypothesis REFUTED:** the launch-count/structure target is
+  FULLY + bit-exactly met (ds4's exact 259, pair at ds4 efficiency) yet the DRAM-saturation time win is absent — under
+  `VT_V4_DECODE_GRAPH=1` the 646 launches were ALREADY a single `cudaGraphLaunch`, so collapsing graph nodes 646→259
+  removes host launch overhead that the graph had already eliminated and does not raise the on-device achieved BW.
+  **ds4's 67%→90% advantage is therefore NOT launch consolidation** (this build reproduces ds4's launch structure and
+  stays at 69%); it must come from a mechanism this session can't observe — ds4's fp16-dequant weight cache (spec noted
+  "budget-exhausted" this run but may be partially resident) or L2 residency (counter-blocked, `ERR_NVGPUCTRPERM`).
+  **DISPOSITION — bit-exact, ds4-faithful, DEFAULT-ON** (marginal-positive, not a regression: 12.27≥12.24): token
+  stream **byte-identical ON==OFF**, golden `11111 16 455 6102 294 8760 344 …` (16/16 both). **GATES (RED-first):**
+  new A/B unit cases in `test_cuda_quant_dot` (pair==two-separate byte-identical + group-diagonal==per-group-loop
+  byte-identical) → **7/7·106496**; `test_cuda_deepseek_v4` **20/20·67072**; `test_deepseek_v4_gguf_load` **15/15·931**.
+  The new kernels demonstrably RAN (nsys shows `QuantDotGemmQ8_0PairKernel` 86/step + `QuantDotGemmQ8_0GroupDiagKernel`
+  43/step). Supersedes the profile-Brick-12 "(A) portable lever → −10.5 ms" projection with the measured −1.1 ms;
+  the Q8_0 speed axis stays where Brick 11 left it (~12.3), now with a bit-exact ds4-faithful launch structure and the
+  causal question re-narrowed to the (unobservable) cache/L2 axis. Code merged default-ON, records kept, NOT pushed.
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +

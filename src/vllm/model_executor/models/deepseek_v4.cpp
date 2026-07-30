@@ -1179,6 +1179,71 @@ void GemmRowSliceInto(const V4Backend& be, const OwnedTensor& w, const float* x,
   vt::MatmulBT(gq, o, a, wt);  // NO sync — resident
 }
 
+// Brick 12 (ds4-gap "launch consolidation"): pair/consolidate the resident Q8_0 decode
+// projection launches (default ON — a parity/perf enabler ships as default). VT_V4_Q8_PAIR=0
+// rolls back to the per-projection / per-group launches (bit-identical) for A/B + rollback.
+inline bool Q8PairEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_Q8_PAIR");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
+// Brick 12: PAIRED keep-quant decode GEMV — out0=wq0·x, out1=wq1·x over the SAME x in
+// ONE launch (the two A-projections that share the layer hidden: MLA wq_a+wkv;
+// shared-expert gate+up). Quantizes x ONCE. Falls back to two GemmIntoKq when the flag
+// is off or the weights are not both device Q8_0. BIT-IDENTICAL either way (the pair
+// kernel preserves each output's integer __dp4a order + warp reduce + scale fold).
+void GemmPairIntoKq(const V4Backend& be, const OwnedTensor& wq0, const OwnedTensor& wq1,
+                    const float* x, float* out0, float* out1, int64_t N0, int64_t N1, int64_t K) {
+  const bool on_dev = be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU;
+  const bool pair = Q8PairEnabled() && on_dev && !wq0.Empty() && !wq1.Empty() &&
+                    wq0.dtype == vt::DType::kQ8_0 && wq1.dtype == vt::DType::kQ8_0 &&
+                    !wq0.repacked && !wq1.repacked;
+  if (!pair) {
+    GemmIntoKq(be, wq0, x, out0, 1, N0, K);
+    GemmIntoKq(be, wq1, x, out1, 1, N1, K);
+    return;
+  }
+  VT_CHECK(wq0.rank == 2 && wq0.shape[0] == N0 && wq0.shape[1] == K && wq1.rank == 2 &&
+               wq1.shape[0] == N1 && wq1.shape[1] == K,
+           "GemmPairIntoKq: weight shape mismatch");
+  vt::Queue& gq = *be.q;
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x), vt::DType::kF32, gq.device, {1, K});
+  vt::Tensor o0 = vt::Tensor::Contiguous(out0, vt::DType::kF32, gq.device, {1, N0});
+  vt::Tensor o1 = vt::Tensor::Contiguous(out1, vt::DType::kF32, gq.device, {1, N1});
+  vt::Tensor w0 = wq0.View();
+  w0.device = gq.device;
+  vt::Tensor w1 = wq1.View();
+  w1.device = gq.device;
+  deepseek_v4::DsaDevice()->matmul_q8_0_pair(gq, o0, o1, a, w0, w1);  // NO sync — resident
+}
+
+// Brick 12: BLOCK-DIAGONAL consolidation of the ng grouped output-LoRA `wo_a` GEMVs into
+// ONE launch. Falls back to the ng-slice loop when the flag is off / not device Q8_0.
+// BIT-IDENTICAL (each group's 32-block quant + per-row dot are unchanged; see kernel).
+void OloraAIntoKq(const V4Backend& be, const OwnedTensor& wo_a, const float* o, float* z,
+                  int64_t ng, int64_t olr, int64_t ipg) {
+  const bool on_dev = be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU;
+  const bool cons = Q8PairEnabled() && on_dev && !wo_a.Empty() &&
+                    wo_a.dtype == vt::DType::kQ8_0 && !wo_a.repacked;
+  if (!cons) {
+    for (int64_t gp = 0; gp < ng; ++gp)
+      GemmRowSliceInto(be, wo_a, o + gp * ipg, z + gp * olr, 1, olr, ipg, gp * olr);
+    return;
+  }
+  VT_CHECK(wo_a.rank == 2 && wo_a.shape[0] == ng * olr && wo_a.shape[1] == ipg,
+           "OloraAIntoKq: wo_a shape mismatch");
+  vt::Queue& gq = *be.q;
+  vt::Tensor a =
+      vt::Tensor::Contiguous(const_cast<float*>(o), vt::DType::kF32, gq.device, {1, ng * ipg});
+  vt::Tensor zt = vt::Tensor::Contiguous(z, vt::DType::kF32, gq.device, {1, ng * olr});
+  vt::Tensor w = wo_a.View();
+  w.device = gq.device;
+  deepseek_v4::DsaDevice()->matmul_q8_0_olora_a(gq, zt, a, w, ng);  // NO sync — resident
+}
+
 // Grouped keep-quant expert GEMM into `out`, NO sync. `eids` (i32) is a unified
 // buffer the device kernel consumes on-stream (the resident routing — no host
 // gather). Mirrors GemmGroupedExpertsKq without the drain.
@@ -1346,7 +1411,8 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
     have_residual = true;
 
     // ── 512-wide MLA attention (dense-causal, T=1).
-    GemmIntoKq(be, Lq.wq_a, x.data(), qa.data(), 1, qlr, H);
+    // Brick 12: the two A-projections share x → ONE paired launch (qa + kraw).
+    GemmPairIntoKq(be, Lq.wq_a, Lq.wkv, x.data(), qa.data(), kraw.data(), qlr, hd, H);
     DSA->rms_norm_rows(*be.q, qa.data(), qa.data(), L.q_norm_weight.data(), 1, qlr, eps, true);
     GemmIntoKq(be, Lq.wq_b, qa.data(), q.data(), 1, nh * hd, qlr);
     if (FusedRopeEnabled()) {  // Brick 7: fused per-head q RMS-norm + fwd RoPE (bit-identical).
@@ -1358,7 +1424,7 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
       DSA->rope(*be.q, q.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
                 p.rope_orig_ctx, p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/false);
     }
-    GemmIntoKq(be, Lq.wkv, x.data(), kraw.data(), 1, hd, H);
+    // (kraw computed above by the paired A-projection launch — Brick 12.)
     // kv-norm + RoPE written DIRECTLY into the new KV-cache row (the resident append).
     std::vector<float>& lc = be.kv->deck[static_cast<size_t>(layer)];
     const int64_t kv_base = be.kv_base;
@@ -1384,8 +1450,7 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
       DSA->rope(*be.q, o.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
                 p.rope_orig_ctx, p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/true);
     // grouped OUTPUT-LoRA: per-group wo_a slice into z, then wo_b → x (the attn out).
-    for (int64_t gp = 0; gp < ng; ++gp)
-      GemmRowSliceInto(be, Lq.wo_a, o.data() + gp * ipg, z.data() + gp * olr, 1, olr, ipg, gp * olr);
+    OloraAIntoKq(be, Lq.wo_a, o.data(), z.data(), ng, olr, ipg);  // Brick 12: ONE block-diag launch
     GemmIntoKq(be, Lq.wo_b, z.data(), x.data(), 1, H, zdim);
 
     // ── ffn sub-block MHC fused post+pre.
@@ -1410,8 +1475,9 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
                   static_cast<float>(p.routed_scaling_factor));
     weights[0] = 1.0f;  // shared-expert combine weight (host write; device reads later)
     // shared expert (index 0 of eo).
-    GemmIntoKq(be, Lq.shared_gate, x.data(), gate_up_s.data(), 1, mi, H);
-    GemmIntoKq(be, Lq.shared_up, x.data(), gate_up_s.data() + mi, 1, mi, H);
+    // Brick 12: shared-expert gate+up share x → ONE paired launch.
+    GemmPairIntoKq(be, Lq.shared_gate, Lq.shared_up, x.data(), gate_up_s.data(),
+                   gate_up_s.data() + mi, mi, mi, H);
     MOE->clamped_swiglu_ip(*be.q, act_s.data(), gate_up_s.data(), mi, lim, 1.0f, 0.0f);
     GemmIntoKq(be, Lq.shared_down, act_s.data(), eo.data(), 1, H, mi);
     // routed experts (grouped, eids resident): gate/up read the SHARED hidden x
@@ -1572,7 +1638,8 @@ struct V4Graph {
       mhc_pre(L, /*attn=*/true);
       have_residual = true;
       // MLA attention (T=1) — GRAPH variant: kv → deck_new scratch, attn over cache+deck_new+len.
-      GemmIntoKq(be, Lq.wq_a, x.data(), qa.data(), 1, qlr, H);
+      // Brick 12: the two A-projections share x → ONE paired launch (qa + kraw).
+      GemmPairIntoKq(be, Lq.wq_a, Lq.wkv, x.data(), qa.data(), kraw.data(), qlr, hd, H);
       DSA->rms_norm_rows(*be.q, qa.data(), qa.data(), L.q_norm_weight.data(), 1, qlr, eps, true);
       GemmIntoKq(be, Lq.wq_b, qa.data(), qact.data(), 1, nh * hd, qlr);
       if (FusedRopeEnabled()) {  // Brick 7: fused per-head q RMS-norm + fwd RoPE (bit-identical).
@@ -1585,7 +1652,7 @@ struct V4Graph {
         DSA->rope(*be.q, qact.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
                   p->rope_orig_ctx, p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/false);
       }
-      GemmIntoKq(be, Lq.wkv, x.data(), kraw.data(), 1, hd, H);
+      // (kraw computed above by the paired A-projection launch — Brick 12.)
       float* dn = deck_new[static_cast<size_t>(layer)].data();
       if (FusedRopeEnabled()) {  // Brick 7: fused kv RMS-norm + fwd RoPE into the deck_new slot.
         DSA->norm_rope_rows(*be.q, dn, kraw.data(), L.kv_norm_weight.data(), 1, hd, nope, rope,
@@ -1606,8 +1673,7 @@ struct V4Graph {
       else
         DSA->rope(*be.q, o.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
                   p->rope_orig_ctx, p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/true);
-      for (int64_t gp = 0; gp < ng; ++gp)
-        GemmRowSliceInto(be, Lq.wo_a, o.data() + gp * ipg, z.data() + gp * olr, 1, olr, ipg, gp * olr);
+      OloraAIntoKq(be, Lq.wo_a, o.data(), z.data(), ng, olr, ipg);  // Brick 12: ONE block-diag launch
       GemmIntoKq(be, Lq.wo_b, z.data(), x.data(), 1, H, zdim);
       // ffn MHC post+pre.
       MHC->post_ip(*be.q, res_nxt, x.data(), res_cur, post_mix.data(), res_mix.data(), hc, H);
@@ -1624,8 +1690,9 @@ struct V4Graph {
                     cfg_hash ? in_tokens.data() : nullptr, cfg_hash,
                     cfg_hash ? L.tid2eid.data() : nullptr, p->vocab_size, p->norm_topk_prob,
                     static_cast<float>(p->routed_scaling_factor));
-      GemmIntoKq(be, Lq.shared_gate, x.data(), gate_up_s.data(), 1, mi, H);
-      GemmIntoKq(be, Lq.shared_up, x.data(), gate_up_s.data() + mi, 1, mi, H);
+      // Brick 12: shared-expert gate+up share x → ONE paired launch.
+      GemmPairIntoKq(be, Lq.shared_gate, Lq.shared_up, x.data(), gate_up_s.data(),
+                     gate_up_s.data() + mi, mi, mi, H);
       MOE->clamped_swiglu_ip(*be.q, act_s.data(), gate_up_s.data(), mi, lim, 1.0f, 0.0f);
       GemmIntoKq(be, Lq.shared_down, act_s.data(), eo.data(), 1, H, mi);
       // gate/up: broadcast the shared hidden x (act_rows=1 ⇒ quantize once, no xrep copy).
