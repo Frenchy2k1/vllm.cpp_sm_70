@@ -1097,6 +1097,268 @@ void DumpAct(const char* name, const std::vector<float>& v) {
 
 }  // namespace
 
+// ─── Brick C part 2: the DEVICE-RESIDENT T=1 decode forward ───────────────────
+// The host-orchestrated ForwardComposeImpl drains the stream ~560×/step (each GEMM
+// + each Disp* device kernel syncs so the host can read/copy its output). Here the
+// whole 43-layer T=1 step runs as ONE async device chain over the (unified) buffers
+// with NO per-op sync: every GEMM defers, the small host primitives (q/kv/final
+// RMSNorm, per-head q-RMS, dual+inverse RoPE, MoE combine) run on the Brick-C device
+// kernels IN PLACE, and routing stays resident (device router → i32 topk_ids that
+// the grouped expert GEMM consumes on-device; topk_weights that the combine kernel
+// consumes) — no host gather. The ONLY drain is before the host reads the [V] logits
+// for argmax (the step boundary). Behind `VT_V4_RESIDENT_DECODE=1` (default OFF); the
+// host path stays default. CUDA + keep-quant GGUF + dense-causal (no compressor/
+// indexer) + T==1 only — the decode benchmark path (§7 of the device-decode spec).
+namespace {
+
+inline bool ResidentDecodeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_RESIDENT_DECODE");
+    return e != nullptr && std::string(e) == "1";
+  }();
+  return on;
+}
+
+// Async device copy on the queue stream (cudaMemcpyAsync — no sync). Used to
+// assemble the grouped-GEMM inputs (topk row-copies of x) + the [gate|up] pairs.
+inline void AsyncCopyF(const V4Backend& be, float* dst, const float* src, int64_t n) {
+  vt::GetBackend(be.q->device).Copy(*be.q, dst, src,
+                                    static_cast<size_t>(n) * sizeof(float));
+}
+
+// Keep-quant GEMM into a caller-provided unified `out` (T rows), NO sync — the
+// resident chain drains once at the end. Mirrors Gemm's device branch; a
+// block-quant weight → the device kMatmulBTQuant, a bf16 weight (e.g. the router
+// gate) → the synchronous CPU MatmulBT (still writes `out`; the caller drains the
+// stream FIRST when such a CPU GEMM reads a device-produced input).
+void GemmIntoKq(const V4Backend& be, const OwnedTensor& wq, const float* x, float* out,
+                int64_t T, int64_t N, int64_t K) {
+  VT_CHECK(be.q != nullptr && !wq.Empty(), "resident GemmInto needs a queue + kq weight");
+  VT_CHECK(wq.rank == 2 && wq.shape[0] == N && wq.shape[1] == K,
+           "resident GemmInto: weight shape mismatch");
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const bool on_dev = be.q->device.type != vt::DeviceType::kCPU && vt::IsBlockQuant(wq.dtype);
+  vt::Queue& gq = on_dev ? *be.q : cpuq;
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x), vt::DType::kF32, gq.device, {T, K});
+  vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, gq.device, {T, N});
+  vt::Tensor w = wq.View();
+  w.device = gq.device;
+  vt::MatmulBT(gq, o, a, w);  // NO SyncDeviceGemm — resident
+}
+
+// Keep-quant GEMM against a block ROW-SLICE [row_off, row_off+N) of a stacked weight,
+// into `out`, NO sync (the resident o-LoRA per-group wo_a). Mirrors GemmRowSlice.
+void GemmRowSliceInto(const V4Backend& be, const OwnedTensor& w, const float* x, float* out,
+                      int64_t T, int64_t N, int64_t K, int64_t row_off) {
+  VT_CHECK(!w.repacked && w.rank == 2 && row_off >= 0 && row_off + N <= w.shape[0] &&
+               w.shape[1] == K,
+           "resident GemmRowSliceInto: slice out of range / repacked");
+  const size_t row_bytes = vt::RowSizeBytes(w.dtype, K);
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const bool on_dev = be.q->device.type != vt::DeviceType::kCPU && vt::IsBlockQuant(w.dtype);
+  vt::Queue& gq = on_dev ? *be.q : cpuq;
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x), vt::DType::kF32, gq.device, {T, K});
+  vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, gq.device, {T, N});
+  vt::Tensor wt;
+  wt.data = const_cast<uint8_t*>(w.bytes.data()) + static_cast<size_t>(row_off) * row_bytes;
+  wt.dtype = w.dtype;
+  wt.device = gq.device;
+  wt.rank = 2;
+  wt.shape[0] = N;
+  wt.shape[1] = K;
+  wt.stride[0] = K;
+  wt.stride[1] = 1;
+  vt::MatmulBT(gq, o, a, wt);  // NO sync — resident
+}
+
+// Grouped keep-quant expert GEMM into `out`, NO sync. `eids` (i32) is a unified
+// buffer the device kernel consumes on-stream (the resident routing — no host
+// gather). Mirrors GemmGroupedExpertsKq without the drain.
+void GemmGroupedInto(const V4Backend& be, const OwnedTensor& weight, const float* act,
+                     const int32_t* eids, int64_t P, int64_t N, int64_t K, float* out) {
+  VT_CHECK(be.q != nullptr && !weight.repacked && vt::IsBlockQuant(weight.dtype),
+           "resident grouped expert GEMM: needs a non-repacked block-quant stacked weight");
+  vt::Queue& gq = *be.q;
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(act), vt::DType::kF32, gq.device, {P, K});
+  vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, gq.device, {P, N});
+  vt::Tensor eid =
+      vt::Tensor::Contiguous(const_cast<int32_t*>(eids), vt::DType::kI32, gq.device, {P});
+  vt::Tensor w = weight.View();
+  w.device = gq.device;
+  vt::MatmulBTQuantGrouped(gq, o, a, w, eid);  // NO sync — resident
+}
+
+// True iff the resident T=1 decode path can run: flag on, CUDA queue, keep-quant
+// tower live (be.gguf != nullptr ⇒ `dsa_dense`, so every layer runs DENSE MLA and
+// the compressor/indexer are OFF regardless of the config compress_ratios — the
+// keep-quant decode geometry, AttentionBlock :658-660), the V4 device kernels
+// linked, a KV cache bound, single token. (Contexts beyond the decode_attn
+// shared-memory KV window are a named residual — the host path shares that bound.)
+bool CanRunResidentDecode(const DeepseekV4Params& /*p*/, const V4Backend& be, int64_t T) {
+  if (!ResidentDecodeEnabled() || T != 1) return false;
+  if (be.q == nullptr || be.q->device.type == vt::DeviceType::kCPU) return false;
+  if (be.gguf == nullptr || be.kv == nullptr) return false;
+  if (!deepseek_v4::V4DeviceKernelsAvailable()) return false;
+  return true;
+}
+
+// The resident T=1 decode step. Returns the [V] logits (host-readable after the one
+// drain). Token-identical target to ForwardComposeImpl on the keep-quant dense path
+// (the wired-in device RMSNorm/RoPE/combine are the characterized part-1 near-ties;
+// argmax is robust, as it was for Bricks A/B).
+std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
+                                             const DeepseekV4Params& p,
+                                             const std::vector<int32_t>& token_ids,
+                                             const std::vector<int32_t>& positions,
+                                             const V4Backend& be) {
+  const int64_t H = p.hidden_size, hc = p.hc_mult, nlayers = p.num_hidden_layers;
+  const int64_t V = p.vocab_size, nh = p.num_attention_heads, hd = p.head_dim;
+  const int64_t rope = p.qk_rope_head_dim, nope = hd - rope, qlr = p.q_lora_rank;
+  const int64_t ne = p.n_routed_experts, topk = p.num_experts_per_tok, mi = p.moe_intermediate_size;
+  const int64_t ng = p.o_groups, olr = p.o_lora_rank, ipg = nh * hd / ng, zdim = ng * olr;
+  const float eps = p.rms_norm_eps, hc_eps = static_cast<float>(p.hc_eps);
+  const float lim = static_cast<float>(p.swiglu_limit);
+  const int64_t iters = p.hc_sinkhorn_iters;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const int32_t tok = token_ids[0];
+  const int pos = static_cast<int>(positions[0]);
+  VT_CHECK(tok >= 0 && tok < V, "resident decode: token id out of range");
+
+  auto* MHC = deepseek_v4::MhcDevice();
+  auto* DSA = deepseek_v4::DsaDevice();
+  auto* MOE = deepseek_v4::MoeDevice();
+
+  // ── persistent unified scratch (allocated ONCE; never resized → stable pointers
+  //    for the deferred async chain). T=1 shapes.
+  std::vector<float> x(static_cast<size_t>(H));
+  std::vector<float> resA(static_cast<size_t>(hc * H)), resB(static_cast<size_t>(hc * H));
+  std::vector<float> post_mix(static_cast<size_t>(hc)), res_mix(static_cast<size_t>(hc * hc));
+  std::vector<float> pre_mix(static_cast<size_t>(hc)), mix_scratch(static_cast<size_t>((2 + hc) * hc));
+  std::vector<float> qa(static_cast<size_t>(qlr)), q(static_cast<size_t>(nh * hd));
+  std::vector<float> kraw(static_cast<size_t>(hd)), o(static_cast<size_t>(nh * hd));
+  std::vector<float> z(static_cast<size_t>(zdim));
+  std::vector<float> gating(static_cast<size_t>(ne));
+  std::vector<int32_t> eids(static_cast<size_t>(topk));
+  std::vector<int64_t> in_tokens{static_cast<int64_t>(tok)};
+  std::vector<float> weights(static_cast<size_t>(1 + topk));  // [0]=shared(1), [1..]=routed
+  std::vector<float> xrep(static_cast<size_t>(topk * H));
+  std::vector<float> gate_up_s(static_cast<size_t>(2 * mi)), act_s(static_cast<size_t>(mi));
+  std::vector<float> gr(static_cast<size_t>(topk * mi)), ur(static_cast<size_t>(topk * mi));
+  std::vector<float> gate_up_r(static_cast<size_t>(2 * mi));
+  std::vector<float> adown(static_cast<size_t>(topk * mi));
+  std::vector<float> eo(static_cast<size_t>((1 + topk) * H));
+  std::vector<int> pos_buf(static_cast<size_t>(std::max<int64_t>(nh, 1)), pos);
+  std::vector<float> hbuf(static_cast<size_t>(H)), logits(static_cast<size_t>(V));
+
+  float* res_cur = resA.data();
+  float* res_nxt = resB.data();
+
+  // embed (host; the token hidden is the only host-written input, before any device op).
+  for (int64_t h = 0; h < H; ++h) x[static_cast<size_t>(h)] = hw.embed[tok * H + h];
+
+  // MHC-pre on a (hc*H) residual → writes layer_input(x), post_mix, res_mix; reads `residual`.
+  const auto mhc_pre = [&](const DeepseekV4LayerHostWeights& L, bool attn) {
+    const std::vector<float>& fn = attn ? L.hc_attn_fn : L.hc_ffn_fn;
+    const std::vector<float>& sc = attn ? L.hc_attn_scale : L.hc_ffn_scale;
+    const std::vector<float>& ba = attn ? L.hc_attn_base : L.hc_ffn_base;
+    const std::vector<float>& nw = attn ? L.attn_norm_weight : L.ffn_norm_weight;
+    MHC->pre_ip(*be.q, pre_mix.data(), post_mix.data(), res_mix.data(), x.data(),
+                mix_scratch.data(), res_nxt, fn.data(), sc.data(), ba.data(), hc, H, eps, hc_eps,
+                hc_eps, 2.0f, iters, nw.empty() ? nullptr : nw.data(), !nw.empty(), eps);
+    std::swap(res_cur, res_nxt);  // res_cur := res_t (the residual this pre consumed)
+  };
+
+  bool have_residual = false;
+  for (int64_t layer = 0; layer < nlayers; ++layer) {
+    const DeepseekV4LayerHostWeights& L = hw.layers[static_cast<size_t>(layer)];
+    const DeepseekV4GgufLayerWeights& Lq = be.gguf->layers[static_cast<size_t>(layer)];
+    const bool rope_comp = p.has_compressor(layer);
+    const double rbase = rope_comp ? p.compress_rope_theta : p.rope_theta;
+    const double rfs = (rope_comp && p.rope_scale_factor > 1.0) ? 1.0 / p.rope_scale_factor : 1.0;
+    const double rext = (rope_comp && p.rope_scale_factor > 1.0) ? 1.0 : 0.0;
+
+    // ── attn sub-block MHC pre (layer 0: broadcast x → [hc,H]; else fused post+pre).
+    if (!have_residual) {
+      for (int64_t i = 0; i < hc; ++i) AsyncCopyF(be, res_nxt + i * H, x.data(), H);
+    } else {
+      MHC->post_ip(*be.q, res_nxt, x.data(), res_cur, post_mix.data(), res_mix.data(), hc, H);
+    }
+    mhc_pre(L, /*attn=*/true);
+    have_residual = true;
+
+    // ── 512-wide MLA attention (dense-causal, T=1).
+    GemmIntoKq(be, Lq.wq_a, x.data(), qa.data(), 1, qlr, H);
+    DSA->rms_norm_rows(*be.q, qa.data(), qa.data(), L.q_norm_weight.data(), 1, qlr, eps, true);
+    GemmIntoKq(be, Lq.wq_b, qa.data(), q.data(), 1, nh * hd, qlr);
+    DSA->rms_norm_rows(*be.q, q.data(), q.data(), nullptr, nh, hd, eps, false);  // per-head q-RMS
+    DSA->rope(*be.q, q.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p.rope_orig_ctx,
+              p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/false);
+    GemmIntoKq(be, Lq.wkv, x.data(), kraw.data(), 1, hd, H);
+    // kv-norm + RoPE written DIRECTLY into the new KV-cache row (the resident append).
+    std::vector<float>& lc = be.kv->deck[static_cast<size_t>(layer)];
+    const int64_t kv_base = be.kv_base;
+    VT_CHECK(static_cast<int64_t>(lc.size()) == kv_base * hd, "resident decode: kv cache out of sync");
+    lc.resize(static_cast<size_t>((kv_base + 1) * hd));  // grow by one latent (host; stable this step)
+    float* slot = lc.data() + kv_base * hd;
+    DSA->rms_norm_rows(*be.q, slot, kraw.data(), L.kv_norm_weight.data(), 1, hd, eps, true);
+    DSA->rope(*be.q, slot, 1, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p.rope_orig_ctx,
+              p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/false);
+    DSA->decode_attn(*be.q, o.data(), q.data(), lc.data(), L.attn_sink.data(), nh, hd, kv_base, 1,
+                     scale, /*no_sink=*/false);
+    DSA->rope(*be.q, o.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p.rope_orig_ctx,
+              p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/true);
+    // grouped OUTPUT-LoRA: per-group wo_a slice into z, then wo_b → x (the attn out).
+    for (int64_t gp = 0; gp < ng; ++gp)
+      GemmRowSliceInto(be, Lq.wo_a, o.data() + gp * ipg, z.data() + gp * olr, 1, olr, ipg, gp * olr);
+    GemmIntoKq(be, Lq.wo_b, z.data(), x.data(), 1, H, zdim);
+
+    // ── ffn sub-block MHC fused post+pre.
+    MHC->post_ip(*be.q, res_nxt, x.data(), res_cur, post_mix.data(), res_mix.data(), hc, H);
+    mhc_pre(L, /*attn=*/false);
+
+    // ── DeepSeek-V4 MoE (shared + topk routed; resident routing).
+    const bool cfg_hash = p.is_hash_layer(layer);
+    // router gate: if bf16 (CPU GEMM reading device x), drain first; block-quant stays resident.
+    if (!vt::IsBlockQuant(Lq.moe_gate.dtype)) DrainDevice(be);
+    GemmIntoKq(be, Lq.moe_gate, x.data(), gating.data(), 1, ne, H);
+    const bool has_bias = !cfg_hash && !L.gate_bias.empty();
+    MOE->route_ip(*be.q, eids.data(), weights.data() + 1, gating.data(), 1, ne, topk,
+                  has_bias ? L.gate_bias.data() : nullptr, has_bias,
+                  cfg_hash ? in_tokens.data() : nullptr, cfg_hash,
+                  cfg_hash ? L.tid2eid.data() : nullptr, p.vocab_size, p.norm_topk_prob,
+                  static_cast<float>(p.routed_scaling_factor));
+    weights[0] = 1.0f;  // shared-expert combine weight (host write; device reads later)
+    // shared expert (index 0 of eo).
+    GemmIntoKq(be, Lq.shared_gate, x.data(), gate_up_s.data(), 1, mi, H);
+    GemmIntoKq(be, Lq.shared_up, x.data(), gate_up_s.data() + mi, 1, mi, H);
+    MOE->clamped_swiglu_ip(*be.q, act_s.data(), gate_up_s.data(), mi, lim, 1.0f, 0.0f);
+    GemmIntoKq(be, Lq.shared_down, act_s.data(), eo.data(), 1, H, mi);
+    // routed experts (grouped, eids resident): gate/up over topk copies of x, swiglu, down.
+    for (int64_t j = 0; j < topk; ++j) AsyncCopyF(be, xrep.data() + j * H, x.data(), H);
+    GemmGroupedInto(be, Lq.moe_gate_exps, xrep.data(), eids.data(), topk, mi, H, gr.data());
+    GemmGroupedInto(be, Lq.moe_up_exps, xrep.data(), eids.data(), topk, mi, H, ur.data());
+    for (int64_t j = 0; j < topk; ++j) {
+      AsyncCopyF(be, gate_up_r.data(), gr.data() + j * mi, mi);        // gate half
+      AsyncCopyF(be, gate_up_r.data() + mi, ur.data() + j * mi, mi);   // up half
+      MOE->clamped_swiglu_ip(*be.q, adown.data() + j * mi, gate_up_r.data(), mi, lim, 1.0f, 0.0f);
+    }
+    GemmGroupedInto(be, Lq.moe_down_exps, adown.data(), eids.data(), topk, H, mi, eo.data() + H);
+    // combine: x := shared + Σ_j w_j·routed_j  (device FMA near-tie).
+    MOE->moe_combine(*be.q, x.data(), eo.data(), weights.data(), 1 + topk, H);
+  }
+
+  // ── final MhcPost → hc_head collapse → final RMSNorm → lm_head.
+  MHC->post_ip(*be.q, res_nxt, x.data(), res_cur, post_mix.data(), res_mix.data(), hc, H);
+  MHC->head_ip(*be.q, hbuf.data(), res_nxt, hw.hc_head_fn.data(), hw.hc_head_scale,
+               hw.hc_head_base.data(), hc, H, eps, hc_eps);
+  DSA->rms_norm_rows(*be.q, hbuf.data(), hbuf.data(), hw.final_norm_weight.data(), 1, H, eps, true);
+  GemmIntoKq(be, be.gguf->lm_head, hbuf.data(), logits.data(), 1, V, H);
+  DrainDevice(be);  // the ONE step-boundary drain — the host now reads logits for argmax
+  return logits;
+}
+
+}  // namespace
+
 // ── the W7 composition, written ONCE and run on HOST refs OR the device kernels
 //    (backend policy `be`). DeepseekV4ForwardHost binds host; ForwardDevice binds
 //    the CUDA kernels through the seam. ───────────────────────────────────────
@@ -1339,9 +1601,16 @@ std::vector<float> DeepseekV4ForwardGgufCached(const DeepseekV4Weights& weights,
   be.kv = &cache;
   be.kv_base = cache.len;  // same base for every layer this call
   be.grouped_moe = GroupedMoeEnabled();
-  std::vector<float> logits = ForwardComposeImpl(
-      weights.host, weights.params, token_ids, positions, logits_indices,
-      V4Miswire::kNone, /*trace=*/nullptr, be);
+  // Brick C part 2: the device-resident T=1 decode chain (no per-op sync). Requires
+  // logits over the single new row (the decode contract) — VT_V4_RESIDENT_DECODE=1.
+  const bool resident_ok =
+      CanRunResidentDecode(weights.params, be, T) &&
+      (logits_indices.empty() || (logits_indices.size() == 1 && logits_indices[0] == 0));
+  std::vector<float> logits =
+      resident_ok
+          ? ForwardResidentDecodeGguf(weights.host, weights.params, token_ids, positions, be)
+          : ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
+                               V4Miswire::kNone, /*trace=*/nullptr, be);
   cache.len += T;  // all layers appended their T decks
   return logits;
 }

@@ -1009,6 +1009,39 @@ void RmsNormLaunch(Queue& q, float* out, const float* x, const float* w, int64_t
   Check(cudaGetLastError(), "rms_norm launch");
 }
 
+// Brick C part 2 — BATCHED RMSNorm over `rows` independent [n] segments in ONE
+// launch (blockIdx.x = row). Used for the 64-head per-head q-RMS (has_w=false) so
+// the resident decode does not issue nh=64 separate rms_norm launches per layer.
+// Same block-tree reduction as RmsNormKernel ⇒ per-row IDENTICAL to it (the same
+// characterized near-tie vs host double-sequential; a shared weight w[n] applies to
+// every row when has_w).
+__global__ void RmsNormRowsKernel(float* __restrict__ out, const float* __restrict__ x,
+                                  const float* __restrict__ w, int rows, int n, float eps,
+                                  int has_w) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const float* xr = x + static_cast<int64_t>(row) * n;
+  float* outr = out + static_cast<int64_t>(row) * n;
+  extern __shared__ double red[];
+  const int tid = threadIdx.x, nt = blockDim.x;
+  double ls = 0.0;
+  for (int i = tid; i < n; i += nt) { const double v = xr[i]; ls += v * v; }
+  red[tid] = ls;
+  __syncthreads();
+  for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; __syncthreads(); }
+  const float r = 1.0f / sqrtf(static_cast<float>(red[0] / static_cast<double>(n)) + eps);
+  for (int i = tid; i < n; i += nt) outr[i] = has_w ? xr[i] * r * w[i] : xr[i] * r;
+}
+void RmsNormRowsLaunch(Queue& q, float* out, const float* x, const float* w, int64_t rows,
+                       int64_t n, float eps, bool has_w) {
+  if (n == 0 || rows == 0) return;
+  cudaStream_t s = AsStream(q);
+  const unsigned block = 256;
+  RmsNormRowsKernel<<<static_cast<unsigned>(rows), block, block * sizeof(double), s>>>(
+      out, x, w, static_cast<int>(rows), static_cast<int>(n), eps, has_w ? 1 : 0);
+  Check(cudaGetLastError(), "rms_norm_rows launch");
+}
+
 __device__ double YarnCorrDimDev(int n_dims, int n_ctx_orig, double beta, double base) {
   const double kPi = 3.14159265358979323846;
   return static_cast<double>(n_dims) *
@@ -1170,7 +1203,7 @@ const MhcDeviceKernels kMhc = {&MhcSinkhornLaunch, &MhcPreLaunch, &MhcPostLaunch
                                &MhcPostInPlaceLaunch, &HcHeadInPlaceLaunch, &MhcPreInPlaceLaunch};
 const DsaDeviceKernels kDsa = {&DsaWeightFoldLaunch, &DsaLogitsLaunch, &DsaTopkLaunch,
                                &SoftmaxSinkLaunch, &GroupedOLoraLaunch, &DecodeAttnLaunch,
-                               &RmsNormLaunch, &RopeLaunch};
+                               &RmsNormLaunch, &RopeLaunch, &RmsNormRowsLaunch};
 const CompressorDeviceKernels kComp = {&SaveScoreApeLaunch, &PoolNormLaunch, &Fp8EncodeLaunch,
                                        &Fp8DecodeLaunch};
 const MoeDeviceKernels kMoe = {&SqrtSoftplusLaunch, &RouteLaunch, &ClampedSwiGLULaunch,

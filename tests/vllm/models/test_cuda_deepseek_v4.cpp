@@ -765,3 +765,42 @@ TEST_CASE("DeepseekV4 device RMSNorm / RoPE / MoE combine == host (Brick C)") {
     CHECK(RelL2(out2, out) > 1e-4);
   }
 }
+
+// Brick C part 2 — the BATCHED per-head q-RMS: rms_norm_rows over `rows` [n]
+// segments in ONE launch == rows independent rms_norm calls (per-row identical) ==
+// host double-sequential ref (the same characterized near-tie). RED-first each.
+TEST_CASE("DeepseekV4 device rms_norm_rows (batched per-head q-RMS) == host (Brick C part 2)") {
+  if (!HasCuda()) return;  // DGX-only
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t rows = 64, n = 512;  // the real MLA per-head q-RMS (nh=64, hd=512)
+  const float eps = 1e-6f;
+  const auto x = Rand(r, rows * n, -2.0f, 2.0f);
+  std::vector<float> out(static_cast<size_t>(rows * n), 0.0f);
+  dv4::DsaDevice()->rms_norm_rows(g.q, out.data(), x.data(), nullptr, rows, n, eps, /*has_w=*/false);
+  gpu.Synchronize(g.q);
+  // (a) == host double-sequential per-row RMSNorm (unweighted).
+  std::vector<float> ref(static_cast<size_t>(rows * n));
+  for (int64_t row = 0; row < rows; ++row) {
+    double ss = 0.0;
+    for (int64_t i = 0; i < n; ++i) ss += static_cast<double>(x[row * n + i]) * x[row * n + i];
+    const float rr = 1.0f / std::sqrt(static_cast<float>(ss / static_cast<double>(n)) + eps);
+    for (int64_t i = 0; i < n; ++i) ref[row * n + i] = x[row * n + i] * rr;
+  }
+  for (float v : out) CHECK(std::isfinite(v));
+  CHECK(RelL2(out, ref) < 1e-5);
+  // (b) == the per-row single-launch rms_norm (subsumes it exactly).
+  std::vector<float> perrow(static_cast<size_t>(rows * n), 0.0f);
+  for (int64_t row = 0; row < rows; ++row)
+    dv4::DsaDevice()->rms_norm(g.q, perrow.data() + row * n, x.data() + row * n, nullptr, n, eps,
+                               /*has_w=*/false);
+  gpu.Synchronize(g.q);
+  CHECK(RelL2(out, perrow) < 1e-6);
+  // RED-first: a shared weight (has_w=true) changes the result.
+  const auto w = Rand(r, n, 0.5f, 1.5f);
+  std::vector<float> outw(static_cast<size_t>(rows * n), 0.0f);
+  dv4::DsaDevice()->rms_norm_rows(g.q, outw.data(), x.data(), w.data(), rows, n, eps, /*has_w=*/true);
+  gpu.Synchronize(g.q);
+  CHECK(RelL2(outw, out) > 1e-4);
+}
