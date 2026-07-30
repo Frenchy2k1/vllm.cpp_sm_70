@@ -210,6 +210,60 @@ it, ~13 tok/s is the honest ceiling.
   via this lever.** The 41 ms Q8_0 GEMV is the irreducible residual. Branch
   `ds4-lever2-subwarp-gemv`, NOT pushed.
 
+## DeepSeek-V4-Flash decode ds4-gap — ds4's Q8_0 kernel DIRECTLY PROFILED (2026-07-30, `CLAIM-DSV4-Q8-KERNEL-PROFILE`) — VERDICT (A): "irreducible roofline" REFUTED, portable lever found
+
+Measurement-only (no code changed). Answers the one open ds4-gap question — nobody had
+ever profiled ds4's own Q8_0 GEMV. GB10 sm_121a, same DeepSeek-V4-Flash IQ2XXS GGUF,
+`flock`, worker down, `--gpu-vram 90 DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=28000`, greedy.
+**`ncu` IS on the box (`/usr/local/cuda-13.0/bin/ncu`) but every HW-counter path is
+`ERR_NVGPUCTRPERM`** (ncu AND `nsys --gpu-metrics`; no `sudo` to flip the driver flag) →
+used the counter-immune fallback: `nsys cuda_gpu_kern_sum` + exact GGUF byte-accounting.
+Per-step numbers are the prefill-stripped diff `(Total@-n60 − Total@-n4)/56`.
+
+- **Byte anchor (exact, `ds4 --inspect`):** `q8_0 = 345 tensors = 6.15 GiB`. Both engines
+  keep-quant-resident → the whole tower is read **once/step (6.604 GB)**; ds4's fp16-dequant
+  cache was **budget-exhausted this run** (log: *"q8 fp16 cache budget exhausted; using q8
+  kernels"*) so ds4 reads the **same raw 34-B q8_0 blocks we do**. *Bytes are equal, not
+  fewer:* reading >6.6 GB in our 40.9 ms would exceed the 240 GB/s peak — impossible — so our
+  646 launches are row-splits summing to the same tower, not re-reads.
+
+  | dense-Q8_0 decode | ours | ds4 |
+  |---|---|---|
+  | time / step | **40.93 ms** | **30.38 ms** |
+  | launches / step | 646 | 259 |
+  | bytes / step | 6.604 GB | 6.604 GB (same 345 tensors ×1) |
+  | achieved DRAM BW | **161 GB/s** | **217 GB/s** |
+  | % of 240.2 roofline | **67 %** | **90 %** |
+  | per-matmul (paired class) | 63.4 µs | **38.8 µs (1.63×)** |
+
+- **ds4 splits the tower into 4 kernels** (per-step diff): `matmul_q8_0_pair_preq_warp8`
+  5.20 ms/86 launches (**2 weights + 1 shared activation per launch**), `hc_expand_preq`
+  9.04/86 (**MHC-expand fused into the matmul epilogue**), `grouped_q8_0_a` 6.88/43,
+  plain `preq_warp8` 9.26/44. Ours = one `QuantDotGemmQ8_0Kernel`, 646 single-tensor launches.
+  Whole-step reconciles: ds4 56.80 ms GPU-active/step (→17.6, wall 16.51), ours 82.62 (→12.1,
+  wall 11.68); the Q8_0 bucket is 10.54 ms = 40.8 % of the 25.82 ms whole-step gap.
+- **ROOT CAUSE = launch consolidation, not the inner dot / bytes / alignment / lane-occupancy**
+  (Bricks 3/4/8/11 all correctly flat — ds4's plain kernel is structurally near-identical to
+  ours: warp-per-row, 8 warps/block, 34-B blocks, dp4a, unaligned i8×4). ds4's 259 big
+  paired/fused launches keep DRAM saturated (90 %); our 646 tiny warp-per-row launches spend a
+  large fraction of each short life in grid ramp/drain where DRAM is under-subscribed (67 %).
+  Brick 11 built sub-warp *lane-splitting* (within-launch) → correctly flat; Brick 9-Step0's
+  `kWarpsPerBlock 4→8` (within-launch) → also flat; **neither changed the launch COUNT/SIZE**,
+  the one axis that moves 67 %→90 %.
+- **VERDICT (A) PORTABLE LEVER — the "41 ms irreducible roofline" of Lever 2 is REFUTED**
+  (proven reachable: ds4 sits at 90 % on the same bytes). Build (follow-on lane): (1) Q8_0
+  **projection-pairing** (port `matmul_q8_0_pair_preq_warp8_kernel` `ds4_cuda.cu:4485`, two
+  weights + one shared quantized activation → bit-exact, measured class 1.63×); (2) fold the
+  **MHC/residual expand into the matmul epilogue** (`:4762`, near-tie); (3) consolidate the 646
+  row-split launches into fewer bigger per-tensor launches. **Honest gain:** full capture 40.93
+  → ~30.4 ms (−10.5) → ~13.9 t/s (from 12.1 GPU-active); half capture ~13 t/s. **Does NOT reach
+  16.5 alone** (the MoE-expert + glue residual is ~15 ms/step, a separate front) but banks the
+  single biggest remaining Q8_0 win and re-opens the 12.7→16.5 ladder. **Premise correction:**
+  the direct Q8_0 gap is **10.5 ms/step**, not the older whole-step-derived "19.8 ms"; ds4's
+  Q8_0 is at 90 % roofline (217 GB/s), not the whole-step ~139 GB/s average that mixed in the
+  MoE. L2-hit rate remains unmeasured (counter-blocked). Branch `ds4-q8-kernel-profile`, NOT
+  pushed; full spec `.agents/specs/ds4-q8-kernel-profile-2026-07-30.md`.
+
 Disposition: **the wiring is CPU-gated at tiny synthetic shape; the real-model
 MTP-on==MTP-off + acceptance-rate + tokens/step + wall-clock speedup measurement
 is WEIGHT-BLOCKED and did NOT run (nothing faked).**

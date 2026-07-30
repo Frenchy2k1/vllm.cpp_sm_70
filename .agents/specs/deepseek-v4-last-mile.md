@@ -379,6 +379,25 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   eligible one is not starved). **Honest reachable ceiling: L1 (+0.49) + L3 (route −5.59 ms GPU) bank ~12.7 tok/s;
   ~13 is the honest ceiling and 16.5 is NOT reachable via this lever.** The 41 ms Q8_0 GEMV is the irreducible
   residual. Code merged default-OFF, records kept; production default unchanged (~12.7). NOT pushed.
+- **Brick 12 — ds4's Q8_0 kernel DIRECTLY PROFILED (measurement-only) → Brick 11's "41 ms irreducible roofline"
+  is REFUTED; the lever is RE-OPENED.** (2026-07-30, `CLAIM-DSV4-Q8-KERNEL-PROFILE`, branch `ds4-q8-kernel-profile`
+  off `d6419601`, NOT pushed. Full spec: `.agents/specs/ds4-q8-kernel-profile-2026-07-30.md`.) Nobody had profiled
+  ds4's own Q8_0 GEMV. `ncu` IS on the DGX but every HW-counter path is `ERR_NVGPUCTRPERM` (no admin) → used
+  `nsys cuda_gpu_kern_sum` + exact GGUF byte-accounting (prefill-stripped diff `(-n60 − -n4)/56`). GGUF = 345 q8_0
+  tensors = **6.15 GiB read once/step in BOTH** (ds4's fp16 cache was budget-exhausted → same raw 34-B blocks; and
+  reading >6.6 GB in 40.9 ms would exceed the 240 GB/s peak, so our 646 launches are row-splits, not re-reads).
+  **Ours `QuantDotGemmQ8_0Kernel` = 40.93 ms/step over 646 launches = 161 GB/s = 67% of roofline; ds4 = 30.38 ms
+  over 259 launches = 217 GB/s = 90%.** Root cause = **launch consolidation** (NOT dot/bytes/alignment/lane-occupancy
+  — Bricks 3/4/8/11 all correctly flat): ds4 packs the tower into fewer, bigger launches — `matmul_q8_0_pair_preq_warp8`
+  (2 weights + 1 shared activation, 38.8 vs our 63.4 µs/matmul = **1.63×**), `hc_expand_preq` (MHC-expand fused into
+  the epilogue), `grouped_q8_0_a` — keeping DRAM saturated where our 646 tiny warp-per-row launches under-subscribe it.
+  Brick 11 built sub-warp *within-launch* lane-splitting (correctly flat) but **never changed the launch COUNT/SIZE**,
+  the axis that moves 67→90%. **VERDICT (A) PORTABLE LEVER:** build Q8_0 projection-pairing (`ds4_cuda.cu:4485`,
+  bit-exact) + fold the MHC/residual epilogue in (`:4762`, near-tie); target 40.93→~30.4 ms (−10.5) → ~13.9 t/s
+  (from 12.1 GPU-active). Does NOT reach 16.5 alone (MoE+glue residual ~15 ms is a separate front) but banks the
+  biggest remaining Q8_0 win and re-opens the ladder. **Premise correction:** direct Q8_0 gap = **10.5 ms/step**, not
+  the older whole-step-derived "19.8 ms"; ds4's Q8_0 is at 90% roofline (217 GB/s), not the whole-step ~139 GB/s
+  average. Supersedes Brick 11's "irreducible residual / ~13 ceiling" framing. No code changed; L2-hit unmeasured (counter-blocked).
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +
