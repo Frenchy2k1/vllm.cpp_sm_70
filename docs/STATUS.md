@@ -665,6 +665,18 @@ run; gguf_load 12/12). The CUDA graph stays OPT-IN default OFF (graph 7.92 ≈ e
 `=0` (host) **7.24**, both "…Paris." token-identical. Shipped DeepSeek-V4 decode = device-resident ~7.96 tok/s
 (~48% of ds4, GEMM-bound); last mile = fp8 KV + tuned MMQ (named residual). Rollback via
 `VT_V4_RESIDENT_DECODE=0`. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Last-mile campaign — Brick 0 (PROFILE-ONLY): the keep-quant GEMM roofline (2026-07-30, base `aed4a498`,
+branch `deepseek-v4-last-mile`, commit `42a99471`, NOT pushed).** Profile-only (holding for the coordinator's
+synthesis with parallel source research — no MMQ implementation). MEASURED the T=1 decode keep-quant GEMM
+efficiency vs roofline (real 80.7 GB, nsys per-kernel time ÷ exact weight bytes; **GB10 peak = 240 GB/s** via a
+float4 copy microbench): `QuantDotGemmQ8_0` (35.6%, 6.60 GB/step) = **~150 GB/s = 63% of peak → MEMORY-bound**
+(~1.6× headroom); `QuantDotGemmGrouped<IQ2_XXS>` (20.2%) = **~45 GB/s = 19% → DEQUANT/LATENCY-bound** (~5×);
+`<Q2_K>` (10.0%) = **~57 GB/s = 24%** (~2.5×); `QuantizeQ8K`/`QuantizeQ8_0` (12%) = **LAUNCH-bound** (~795 tiny
+launches/step). KEY: every T=1 GEMM is <1% of int8 compute peak → memory-bound; **tensor cores do NOT help a
+decode matvec** (mmq.cu is prefill; the reference is llama.cpp `mmvq.cu`). Ranked levers: (1) grouped-MoE
+dequant (the 5× gap, mmvq.cu vectorized dequant + dp4a), (2) fuse activation-quant, (3) Q8_0 coalescing,
+(4) fp8 KV (parity/long-ctx, NOT the short-ctx lever). Honest projection: **~14-16 tok/s target** (ds4 16.5 =
+58% of the BW roofline, fully fused); ~28 tok/s is the hard ceiling. Full table: `.agents/specs/deepseek-v4-last-mile.md`. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
