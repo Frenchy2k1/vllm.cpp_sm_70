@@ -33633,3 +33633,61 @@ transfer of the fixed TU), worker stopped during build+runs then RESTORED (Up, r
 the GPU runs, ONE engine at a time (OFF then ON sequential), nvidia-smi sampled during ON. Rollback-able (flag
 OFF default). STOPPED for review before Brick D. Box restored (worker Up restart=always, flock free, no stray gen).
 Row `ACTIVE`.
+
+## DeepSeek-V4 device-resident decode campaign — Brick D (decode CUDA graph): step 1 gated; step 2 infra unit-gated, capture BLOCKED on the model's Q8_0 weights — a grounded finding that REVISES the Brick C attribution (2026-07-30, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-rd`, branch `deepseek-v4-brick-d`, base `24bddf15`, commits `3c262cea`(step1)+`f62de523`(step2), NOT pushed)
+
+Coordinator greenlit Brick D (two steps: device-ify the router gate; then capture+replay). Both flags default OFF.
+
+**STEP 1 — device router gate (the last non-capturable host op named in Brick C).** `RouterGateKernel`
+(cuda_deepseek_v4.cu): gating[e] = Σ_h x[h]·bf16→f32(W[e·H+h]) over the [ne,H] BF16 `ffn.gate.weight`, one
+thread per expert, SEQUENTIAL f32 dot with the exact `bits<<16` bf16 upcast — matches the host CPU MatmulBT
+(`MatmulChunked<true>`, f32 accumulate, `LoadF32=BF16ToF32`). Added `router_gate` to `MoeDeviceKernels`+`kMoe`;
+`ForwardResidentDecodeGguf`'s MoE now calls it (no CPU GEMM, no drain for the router). **GATE:** CUDA unit
+**17/17·33919** (router_gate == host RelL2<1e-5, RED-first weight change); `test_deepseek_v4_gguf_load`
+12/12·531; real 80.7 GB model VT_V4_RESIDENT_DECODE=1 stays **TOKEN-IDENTICAL** to host ("…Paris.", exact 25
+ids — the top-k routing is preserved despite the FMA-contraction near-tie). Eager ~4.99 tok/s (the naive
+one-thread-per-expert kernel is slower eager; irrelevant — the graph is the payoff).
+
+**STEP 2 — the decode CUDA graph.** `decode_attn_g` (cuda_deepseek_v4.cu): reads the KV length from a DEVICE
+buffer + attends `cache[0..len)` PLUS the current token's key `deck_new` (index len), FIXED shmem — so ONE
+captured graph serves a GROWING context (`DecodeAttnKernel`'s baked `kv_base` would freeze it). `V4Graph`
+(deepseek_v4.cpp): the per-layer resident chain over PERSISTENT member buffers (never resized → stable
+addresses the capture bakes); fixed-capacity per-layer KV; cold→warm→captured state machine (the cold step
+runs eager to grow the per-stream Q8_K GEMM scratch — cudagraph-safe grow-only via `cudaMallocAsync`/
+`RetireGraphScratch` — so capture does zero fresh alloc); the kv-norm+RoPE writes the new latent to a FIXED
+`deck_new[layer]`, and BETWEEN replays the driver async-copies `deck_new`→`cache[len]` on the stream + advances
+len; per-step inputs (embed x, position, token, KV length) refreshed in the persistent buffers before each
+replay. Opaque graph holder on `DeepseekV4KvCache`; flag `VT_V4_DECODE_GRAPH=1` (default OFF); the graph seeds
+its fixed-cap KV from the prefill KV (`cache.deck`, filled by the host ForwardComposeImpl prefill step).
+[[cudagraph-capture-bakes-stack-addresses]]: every captured input is a member buffer, verified by TOKENS.
+**GATE:** CUDA unit **18/18·34176** (decode_attn_g == eager decode_attn BIT-IDENTICAL + RED-first wrong
+length); `test_deepseek_v4_gguf_load` 12/12·531.
+
+**THE BLOCKER (Iron Law, grounded).** With VT_V4_DECODE_GRAPH=1 the real-model capture ABORTS:
+`vt cuda: matmul_bt_quant: keepquant CPU-fallback drain: operation not permitted when stream is capturing`.
+gguf dump of the model: **345 Q8_0 tensors** — the MLA projections (`attn_q_a`/`attn_kv`/wq_b), the o-LoRA
+(wo_a/wo_b), the shared experts, and `output.weight` (the "AProjQ8-SExpQ8-OutQ8" in the filename; the routed
+experts are IQ2_XXS + Q2_K, which ARE CUDA-supported). `IsCudaKeepQuantSupported` (cuda_quant_dot.cu:596-605)
+returns FALSE for Q8_0 (only IQ2/IQ3/Q2_K…Q6_K have a CUDA keep-quant GEMM), so each of the ~15 Q8_0 GEMMs/
+layer runs the CPU keep-quant kernel behind a `cudaStreamSynchronize` (cuda_quant_dot.cu:643) — legal eager
+(one of the ~560 drains), ILLEGAL during capture.
+
+**THIS REVISES THE BRICK C PART-2 ATTRIBUTION (honest correction).** I attributed the eager-resident ~45%
+GPU-idle to device-kernel launch overhead. The graph attempt proves the dominant cost is actually the **~646
+Q8_0 CPU-fallback GEMM drains/step** (8 Q8_0 weights/layer → ~15 GEMM calls/layer × 43 + lm_head): the MLA
+projections, o-LoRA, shared experts, and lm_head matmuls execute on the ARM CPU (not the GPU) behind a stream
+sync each. That is why eager-resident is slower than host AND why the graph cannot capture.
+
+**UNBLOCK = a CUDA Q8_0 keep-quant GEMM** (a Q8_0-weight × Q8_K-activation device kernel matching the CPU
+integer-dot numerics), which IS the "tuned expert GEMM" follow-on the campaign named as the last mile — a USER
+decision; the coordinator said don't start it. So Brick D's graph infrastructure is COMPLETE + unit-gated +
+capture-hazard-safe behind a default-OFF flag, and will replay token-identical once a Q8_0 CUDA GEMM lands.
+
+**FINAL honest ours-vs-ds4 (real 80.7 GB, 5-tok prompt, 24 decode steps, GB10):** host 6.44 tok/s ·
+eager-resident ~5.0-5.2 (Q8_0-CPU-drain-bound) · decode graph BLOCKED (Q8_0 CPU fallback) · ds4 16.5. Peak
+86.33 GiB. **Ops:** scp'd only the changed files onto the reused `vllmcpp-mmspeed/build-cuda` sm_121a tree
+(preserving mtimes → fast incremental rebuild), worker stopped during build+runs then RESTORED (Up,
+restart=always), flock held for the GPU runs, ONE engine at a time, nvidia-smi sampled. Rollback-able (both
+flags OFF default). CAMPAIGN device-resident track: bricks A→B→C DONE + gated; Brick D infra DONE + gated,
+replay blocked on the Q8_0 CUDA GEMM follow-on. Box restored (worker Up restart=always, flock free, no stray
+gen). Row `ACTIVE`.
