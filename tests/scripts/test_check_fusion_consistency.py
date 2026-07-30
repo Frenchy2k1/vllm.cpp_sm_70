@@ -88,9 +88,29 @@ class DriftModelTests(unittest.TestCase):
     def test_removing_allowlist_entry_would_fail(self) -> None:
         # Mutation: if a known-drift model were dropped from the allowlist WITHOUT
         # being migrated, the checker must flag it (the enforcement teeth).
+        #
+        # The known-drift example is DERIVED from the allowlist, never hardcoded:
+        # migrating a model retires its entry (the Tier-B2 fold did exactly that
+        # for gemma/gemma2/gemma3), and that must close the gate, not break this
+        # test.
         scanned = mod.scan_models(ROOT / "src/vllm/model_executor/models")
-        # gemma2 is a known-drift file in-tree; with an EMPTY allowlist it drifts.
-        self.assertIn("gemma2", drift_models(scanned, set()))
+        allowlisted = mod.allowlisted_names(
+            (ROOT / "scripts/fusion-consistency-allowlist.txt").read_text(
+                encoding="utf-8"
+            )
+        )
+        exposed = set(drift_models(scanned, set()))
+        still_hand_fusing = {s for s, (n, c) in scanned.items() if n and not c}
+        # Emptying the allowlist must expose every in-tree hand-fusing model,
+        self.assertEqual(still_hand_fusing - exposed, set())
+        # and the allowlist must be load-bearing: it suppresses at least one model
+        # the checker really does see. That is what makes the green gate mean
+        # something rather than being vacuous.
+        self.assertTrue(
+            exposed & allowlisted,
+            "the allowlist suppresses nothing the checker detects; either the "
+            "detector regressed or every allowlist entry is now stale",
+        )
 
 
 if __name__ == "__main__":

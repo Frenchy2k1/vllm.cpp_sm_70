@@ -16,6 +16,14 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## fusion-consistency gate-test repair (2026-07-30) - VOID (test-only, no throughput owed)
+
+A hardcoded `gemma2` expectation in the fusion-consistency mutation test, made
+stale by the Tier-B2 Gemma fold that retired its allowlist entry. Test-only: the
+checker is untouched and no model forward, kernel, or config path changed, so no
+benchmark is owed. `tests/scripts` 87/87. Details in
+[docs/STATUS.md](STATUS.md#verification-and-parity).
+
 ## Landing-page restructure + project logo (2026-07-30) - NOT-APPLICABLE (documentation only, no throughput owed)
 
 No engine code, no kernel, no config path: README.md became a landing page, its

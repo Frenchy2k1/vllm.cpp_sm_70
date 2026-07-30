@@ -1617,6 +1617,17 @@ spec-decode acceptance *trace*, off by default, output-neutral — `runner.cpp`
 `spec_trace`) on `scripts/env-doc-allowlist.txt`; introduced by the concurrent
 DFlash-GGUF session and left `check-env-doc` RED on main. No behavior change.
 
+**fusion-consistency gate-test repair (2026-07-30):** VOID, no behavior change and
+no teeth weakened. `tests/scripts/test_check_fusion_consistency.py`'s mutation test
+hardcoded `gemma2` as its in-tree known-drift example, so the Tier-B2 fold broke it
+by doing what the gate wants (Gemma adopted `vt::FusedChain`, its allowlist entries
+were retired, and the assertion went looking for a model that no longer drifts). It
+was RED on clean main before this change. The example is now DERIVED from the
+allowlist: emptying the allowlist must expose every in-tree hand-fusing model, and
+the allowlist must suppress at least one model the detector really sees, so the next
+migration closes the gate instead of breaking the test.
+`scripts/check-fusion-consistency.py` itself is unchanged; `tests/scripts` 87/87.
+
 **Landing-page restructure + project logo (2026-07-30):** DOCUMENTATION-ONLY, no
 capability state moved and no number changed. README.md becomes a landing page
 (logo lockup, scoped badges, the six-axis concurrency grid, the footprint figure,
