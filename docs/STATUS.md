@@ -596,6 +596,27 @@ fast host-ARM glue → ~45% GPU idle). The §4 "may improve" precondition, NOT t
 the ~1700 launches into ONE cudaGraphLaunch)** is the payoff (55%→~100% busy ≈ 1.8× → ~9 tok/s, would exceed
 6.44), PROVIDED the bf16 router gate is first device-ified (the one remaining non-capturable host op). Rollback-
 able (flag OFF). STOPPED for review before Brick D. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Device-resident decode campaign — Brick D: decode CUDA graph — step 1 gated; step 2 infra gated, capture
+BLOCKED on the model's Q8_0 weights (grounded finding; REVISES the Brick C attribution) (2026-07-30, base
+`24bddf15`, branch `deepseek-v4-brick-d`, commits `3c262cea`+`f62de523`, NOT pushed).** STEP 1 = device router
+gate (`RouterGateKernel`: [ne,H] BF16 gate × f32 x, sequential f32 + exact bf16 upcast, bit-identical to the
+host CPU MatmulBT) → resident routing is device. Gate: CUDA unit **17/17·33919**; real model
+resident==host **TOKEN-IDENTICAL**. STEP 2 = the graph: `decode_attn_g` (KV length from a DEVICE buffer,
+attends cache[0..len)+deck_new, fixed shmem → one graph serves a growing context) + `V4Graph` (persistent
+buffers, fixed-cap KV, cold→warm→capture→replay, deck_new→cache appended between replays on-stream; every
+captured input a persistent buffer) + opaque holder on `DeepseekV4KvCache`; flag `VT_V4_DECODE_GRAPH=1`
+(default OFF). Unit **18/18·34176** (decode_attn_g == eager decode_attn BIT-IDENTICAL + RED-first);
+`test_deepseek_v4_gguf_load` 12/12·531. **BUT capture ABORTS: `matmul_bt_quant: keepquant CPU-fallback drain:
+operation not permitted when stream is capturing`.** ROOT CAUSE (gguf dump): **345 Q8_0 tensors** — the MLA
+projections (attn_q_a/attn_kv/wq_b), o-LoRA (wo_a/wo_b), shared experts, `output.weight` (the AProjQ8/SExpQ8/
+OutQ8 in the filename). `IsCudaKeepQuantSupported` is FALSE for Q8_0 (only IQ2/IQ3/Q2_K…Q6_K have a CUDA
+keep-quant GEMM), so each of ~15 Q8_0 GEMMs/layer CPU-fallbacks with a `cudaStreamSynchronize` — legal eager,
+ILLEGAL during capture. **REVISES Brick C:** the eager-resident ~45% GPU-idle is dominated by these **~646
+Q8_0 CPU-fallback GEMM drains/step** (MLA/shared/lm_head run on the ARM CPU), NOT device-launch overhead.
+**UNBLOCK = a CUDA Q8_0 keep-quant GEMM** = the named "tuned expert GEMM" follow-on (a USER decision — not
+started). Graph infra is COMPLETE + unit-gated + capture-hazard-safe behind a default-OFF flag; replays once
+Q8_0 lands. FINAL honest table (real 80.7 GB, 24 decode): host 6.44 · eager-resident ~5.0-5.2 · graph BLOCKED
+(Q8_0) · ds4 16.5. Rollback-able (both flags OFF). Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
