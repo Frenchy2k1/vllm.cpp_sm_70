@@ -1678,3 +1678,10 @@ determinism subsystem we do not carry — neither is a clean 1:1 mirror. No code
 landed; the queue + records were refreshed. Parity pin UNCHANGED at `555967922`.
 
 **Best-GEMM-path research (2026-07-30):** `.agents/specs/best-gemm-path-2026-07-30.md` — best-in-class GEMM path per regime (fp8/full-tensor/low-bit × decode/prefill) across vLLM+SGLang+ds4+llama.cpp + FusedChain-mapping verdict. Two actionable findings: (1) **fp16 dense inputs THROW** (`cuda_matmul.cu:220-227`) — a breadth gap, one-branch cuBLASLt fix; (2) **nvfp4 W4A4 M=1 decode is mis-routed to the prefill tensor-core tactic on our production 27B/35B gate models** — a real decode perf hole, dp4a-matvec fix. `Fp4GemmSm120` confirmed LIVE (not dormant). No behavior change (research/spec only).
+
+**nvfp4 W4A4 M=1 decode "mis-route" — MEASURED NON-ISSUE (2026-07-30, best-GEMM-path rank-2 CLOSED).**
+DGX-measured (Iron Law): at M=1 the cutlass autotuner ALREADY selects swap-AB small-M tactics, and
+the weight-dominant 27B W4A4 projections run FLAT across M at the HBM copy roofline (gate_up 258
+GB/s, down 283 GB/s) — decode is memory-bound, so a dp4a matvec reads the same bytes at the same
+bandwidth and cannot raise tok/s. NO production code changed; SACRED `test_ops_nvfp4_fp4` 30/30·27006.
+The gate models' W4A4 decode is at the achievable roofline. See `.agents/specs/nvfp4-w4a4-m1-decode-measured-2026-07-30.md`.
