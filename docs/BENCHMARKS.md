@@ -77,7 +77,20 @@ clean 1:1 mirror (our `RmsNormRowKernel` indexes contiguously with no
 `input_stride`; 48391 needs the `vllm_is_batch_invariant` subsystem). No code
 landed, no throughput owed. Parity pin UNCHANGED at `555967922`.
 
-## DeepSeek-V4 native MTP self-speculative draft head W1 (2026-07-30, `CLAIM-DEEPSEEK-V4-MTP`) - NOT-APPLICABLE (tiny-config correctness brick; no throughput owed) / real-model acceptance + speedup WEIGHT-BLOCKED
+## DeepSeek-V4-Flash decode ds4-gap — Step 0 + Lever 1 (2026-07-30, `CLAIM-DSV4-DECODE-LEVER1`) — Lever 1 lands a real bit-exact +4.3% decode; Step 0 measured NEUTRAL
+
+Measured on GB10 sm_121a, DeepSeek-V4-Flash-IQ2XXS-...-AProjQ8-SExpQ8-OutQ8 GGUF,
+`--gpu --kv-cache VT_V4_RESIDENT_DECODE=1 VT_V4_DECODE_GRAPH=1`, one `flock`, worker
+down, clean pristine-main (`81074c94`) build as the baseline (its 30-step kwin
+reproduces the ds4-gap Lane-A denominator: `QuantizeQ8_0` 4.5094 ms / `QuantizeQ8K`
+4.6031 ms / GEMM 40.82 ms / 84.87 ms/step). 4 warm reps/arm, non-overlapping bands.
+
+- **Step 0 (`kWarpsPerBlock` 4→8 on the dense Q8_0 GEMV, matching ds4's 8 rows/block)
+  — MEASURED NEUTRAL.** `QuantDotGemmQ8_0Kernel` stays 63.2 µs/launch (vs 63.19 baseline)
+  and decode stays 11.43 tok/s (flag=0 arm 11.40–11.47 vs baseline 11.41–11.45,
+  overlapping). Bit-identical (each warp still computes one independent output dot).
+  KEPT for ds4-layout parity, but this kernel is not occupancy-bound at 8 warps/block
+  — the 41 ms is memory/latency-bound, not block-count-bound.
 
 Disposition: **the wiring is CPU-gated at tiny synthetic shape; the real-model
 MTP-on==MTP-off + acceptance-rate + tokens/step + wall-clock speedup measurement

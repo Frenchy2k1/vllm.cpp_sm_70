@@ -120,6 +120,12 @@ llama.cpp converter dropped every nextn tensor (`DeepseekV4GgufHasMtp` returns
 false → clean fall-back to MTP-off). The DS4-native propose/verify decode loop +
 engine spec-config registration are named residuals.
 
+**DeepSeek-V4-Flash decode ds4-gap — Step 0** (`kWarpsPerBlock` 4→8 on the dense
+Q8_0 GEMV, ds4's 8-rows/block layout, 2026-07-30): bit-identical, but MEASURED
+NEUTRAL on GB10 (`QuantDotGemmQ8_0Kernel` 63.2 µs/launch unchanged, decode 11.43
+tok/s = baseline). Kept for ds4-layout parity; the 41 ms dense-Q8_0 GEMV is
+memory/latency-bound, not block-count-bound. See docs/BENCHMARKS.md.
+
 **ngram** (method `ngram`, draft-FREE) proposes the next tokens by matching the
 sequence's own suffix n-gram, so it needs no draft model and works on any model;
 on the 27B it is token-exact vs vLLM's own `--speculative-config ngram` on
