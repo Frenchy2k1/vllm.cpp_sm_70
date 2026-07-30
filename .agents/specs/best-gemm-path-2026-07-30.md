@@ -24,12 +24,12 @@ only compute-bound place tensor-core work raises the ceiling.**
 | bf16 | decode-M1 | cuBLASLt gemv (memory-bound) | cuBLASLt TN/NN at parity + FusedChain glue | **already-optimal** (no GEMM lever) |
 | bf16 | prefill | cuBLASLt + Inductor EVT epilogue fusion | cuBLASLt at parity; ~20% glue as separate kernels | FusedChain byte-exact folds (modest ~3.5%@c1) |
 | fp16 | both | cuBLASLt fp16 (same roofline as bf16) | **NOT SUPPORTED — f16 inputs THROW** (`cuda_matmul.cu:220-227`) | one-branch `CUDA_R_16F` enablement (cuBLASLt) — **rank 1** |
-| low-bit | decode-M1 | dp4a matvec (llama.cpp MMVQ / ds4 Q8 dp4a); Marlin small-M | GGUF at parity; **nvfp4 W4A4 M=1 MIS-ROUTED to the prefill cutlass tactic on our 27B/35B** | fp4 dp4a decode matvec + per-M router — **rank 2, real hole on gate models** |
+| low-bit | decode-M1 | dp4a matvec (llama.cpp MMVQ / ds4 Q8 dp4a); Marlin small-M | GGUF at parity; nvfp4 W4A4 M=1 **MEASURED at HBM roofline** (cutlass autotuner already picks swap-AB small-M tactics; NOT mis-routed) | ~~fp4 dp4a decode matvec~~ — **rank 2 CLOSED 2026-07-30: no real hole, see nvfp4-w4a4-m1-decode-measured-2026-07-30.md** |
 | low-bit | prefill | nvfp4→cutlass Fp4GemmSm120 (LIVE); GPTQ/AWQ→Marlin; k-quant→int8-MMA MMQ | nvfp4 W4A4 at FlashInfer parity (Fp4GemmSm120 LIVE); k-quant = dp4a at all M (tensor cores idle); GPTQ/AWQ stubs | int8-MMA MMQ for k-quant prefill (port llama.cpp mmq.cu); AOT-vendor Marlin w4a16 |
 
 ## Ranked levers
 1. **fp16 dtype enablement** (cuBLASLt one-branch) — TRIVIAL; unblocks the entire fp16 Llama/Mistral family at bf16 roofline. Breadth.
-2. **nvfp4 W4A4 decode dp4a matvec + per-M router** — MEDIUM; fixes the ONE measured perf hole on our PRODUCTION 27B/35B gate models (M=1 uses the tensor-core prefill tactic). SPEED on what we ship.
+2. ~~**nvfp4 W4A4 decode dp4a matvec + per-M router**~~ — **CLOSED 2026-07-30, NO-OP.** DGX-measured (Iron Law): at M=1 (bucket=1) the cutlass autotuner ALREADY selects swap-AB small-M tactics; the weight-dominant projections (gate_up 100MB, down 50MB) run flat-across-M at the HBM copy roofline (258/283 GB/s). M=1 is memory-bound — tensor-core tile under-use is hidden behind HBM latency — so a dp4a matvec reads the same bytes at the same bandwidth and cannot raise decode tok/s. The proposed per-M router already exists inside the autotuner. See `nvfp4-w4a4-m1-decode-measured-2026-07-30.md`.
 3. **fast_op kSiluMul{Fp8,Fp4}Quant** (1-launch MoE gate+up+silu epilogue) — LOW; recipes already declared (`recipes.h:131,182`); collapses ds4's 3-4 MoE launches. FusedChain + one kernel.
 4. **Block-scaled/per-token ScaledEpilogue EVT on SM120 C3x fp8 + dynamic-per-token quant** — MEDIUM; reaches vLLM's default fp8 accuracy + per-channel/block. cutlass-port + FusedChain.
 5. **AOT-vendor DeepGEMM block-fp8 + masked/contiguous grouped fp8 MoE** — HIGH; unblocks DeepSeek-V3/V4-class 128×128 block-fp8 checkpoints. Breadth.
@@ -63,7 +63,9 @@ dynamic-per-token variant (vLLM default).
 
 ## Honest ceiling
 On what we SHIP today (27B/35B nvfp4-W4A4 + per-tensor fp8) we are near the achievable
-ceiling EXCEPT (1) the W4A4 decode mis-route (#2) and (2) ~20% prefill glue (#8) — both
-modest. The BIG levers (fp16, GPTQ/AWQ Marlin, block-fp8/DeepGEMM, int8-MMA MMQ) are
+ceiling. Lever #2 (the suspected "W4A4 decode mis-route") was DGX-measured on
+2026-07-30 to be a NON-issue — M=1 is already at the HBM memory roofline (cutlass
+autotuner picks swap-AB small-M tactics), so the only residual is (2) ~20% prefill
+glue (#8) — modest. The BIG levers (fp16, GPTQ/AWQ Marlin, block-fp8/DeepGEMM, int8-MMA MMQ) are
 **breadth/correctness unlocks for model FAMILIES we cannot run fast at all** — they widen
 coverage, they do not speed up what already runs.

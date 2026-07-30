@@ -34042,3 +34042,16 @@ Brick 3 found the Q8_0 matvec (45% of decode step) stuck at ~63% of BW peak and 
 **OPS:** rebased onto main `d1c63dc7` (Brick 3 merged; clean). Overlaid the 10 changed files (header changes → wide recompile) onto the isolated `vllmcpp-lastmile` tree, full rebuild (1m27s, rc=0). Worker stopped for GPU runs then RESTORED (running, restart=always); flock held per-run; ONE engine; ALL runs FOREGROUND/blocking; nvidia-smi + `/usr/bin/time -v` peak-RSS captured DURING. Box restored (worker up, flock free, 0 stray gen, disk 302 G). **NEXT: STOP for review** — coordinator to decide revert-vs-default-off-merge, and whether to pursue the numerics-delicate residual. Rollback: `VT_V4_Q8_0_ALIGN` is default-OFF (the default path is unchanged). Row `ACTIVE`.
 
 - 2026-07-30 UPSTREAM-SYNC cycle `555967922..e04a30a77` (198 commits, ~4 days since the 0.26.0.dev0 pin). Enumerated via the local vLLM checkout `~/_git/vllm` (real history) + tier-classified; report `.agents/sync/2026-07-30-e04a30a.md`, ranked queue `.agents/specs/upstream-sync-2026-07-30.md`. Ported the top CPU-buildable T1 change: **vllm#49754** per-request `stream_interval` (SamplingParams field + Verify `>=1` + output-processor clamp-up + both OpenAI request paths). CPU-gated: test_output_processor 11/11, test_sampling_params 9/9, test_openai_protocol 28/28. Found vllm#49030 (video temporal padding) ALREADY-CORRECT in qwen3vl_processor.cpp (no port). **Parity pin UNCHANGED** at `555967922` (only a subset landed) — carry-over queue: T1 correctness (48245 preemption-underflow, 50297 P/D-race, 49343 eagle-draft) + T0 RMSNorm perf/determinism (49750, 48391; GPU runtime gate). Branch `sync/2026-07-30-upstream`, NOT pushed.
+- **2026-07-30 (later)** — Best-GEMM-path **rank-2 CLOSED as a measured NO-OP**
+  (branch `fix/nvfp4-w4a4-m1-decode-matvec`, NOT pushed). The suspected nvfp4
+  W4A4 M=1 DECODE mis-route to the cutlass prefill tactic `Fp4GemmSm120` was
+  DGX-measured (Iron Law, gated microbench `VT_FP4_M1_BENCH=1`) on the four real
+  27B W4A4 projection shapes: at M=1 the autotuner ALREADY picks swap-AB small-M
+  tactics and the weight-dominant projections (gate_up 100 MB, down 50 MB) run
+  flat-across-M at the HBM roofline (258/283 GB/s vs a 240 GB/s DtoD ceiling).
+  M=1 is memory-bound — a dp4a matvec reads the same bytes at the same bandwidth
+  and cannot raise decode tok/s, so it was **not built**. Recorded in
+  `.agents/specs/nvfp4-w4a4-m1-decode-measured-2026-07-30.md`; spec rank-2 +
+  BENCHMARKS updated; gated bench committed as durable measurement infra. NEXT:
+  remaining GEMM levers are breadth/correctness unlocks (fp16 dtype rank-1;
+  Marlin/DeepGEMM/MMQ), not decode speedups on what we already ship fast.
