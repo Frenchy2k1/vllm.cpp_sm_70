@@ -41,6 +41,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpGeluMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/glue
 #include "vllm/model_executor/models/device_pool.h"       // Pool
 #include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
@@ -302,11 +303,11 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
 // GeGLU MLP (gemma4.py::Gemma4MLP).
 DBuf Gemma4MlpBlock(Dev d, const Gemma4MlpWeights& w, int64_t H, int64_t I,
                     const Tensor& dh2, int64_t T) {
-  Tensor wgu = ResidentWeight(d, w.gate_up_proj);
-  DBuf gate_up(d, DType::kBF16, {T, 2 * I});
-  vt::MatmulBT(d.q, gate_up.t(), dh2, wgu);
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::GeluAndMul(d.q, act.t(), gate_up.t());
+  // gate_up MatmulBT -> GeluAndMul(tanh) via the SHARED bf16 GeGLU gate-up MLP seam
+  // (layers::UnquantizedMlpGateUpGeluMethod). Byte-for-byte the inline sequence —
+  // folds Gemma-4 onto the shared MlpGateUpMethodBase descriptor. (Tier-C1,
+  // arch-fusion-fold-plan-2026-07-30.)
+  DBuf act = layers::UnquantizedMlpGateUpGeluMethod(&w.gate_up_proj, I).Apply(d, dh2);
   Tensor wd = ResidentWeight(d, w.down_proj);
   DBuf down(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, down.t(), act.t(), wd);

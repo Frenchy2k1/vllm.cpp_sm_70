@@ -109,5 +109,37 @@ class UnquantizedMlpGateUpMethod : public MlpGateUpMethodBase {
   int64_t I_;
 };
 
+// Unquantized (bf16) GeGLU gate_up: one MatmulBT over the merged [2I,H] weight then
+// vt::GeluAndMul(tanh) — byte-for-byte the inline bf16 GeGLU MLP path the Gemma
+// family (Gemma-1/2/3/4) hand-rolled. The GeGLU sibling of
+// UnquantizedMlpGateUpMethod: same merged [2I,H] operand and same single MatmulBT;
+// the ONLY difference is the activation epilogue (GeluAndMul(approximate="tanh")
+// instead of SiluAndMul), mirroring vLLM's GemmaMLP (gemma.py::GemmaMLP.act_fn =
+// GeluAndMul("tanh")) vs LlamaMLP's SiluAndMul. Shares MlpGateUpMethodBase so the
+// merged-GEMM descriptor / fused-kernel scheme choice has one home across both
+// activation families; a future nvfp4 checkpoint gets a GeGLU quant arm the same
+// way the SwiGLU one gets GateUpFusedMarlinD.
+class UnquantizedMlpGateUpGeluMethod : public MlpGateUpMethodBase {
+ public:
+  UnquantizedMlpGateUpGeluMethod(const OwnedTensor* gate_up, int64_t intermediate)
+      : gate_up_(gate_up), I_(intermediate) {}
+
+  DBuf Apply(Dev d, const vt::Tensor& x) const override {
+    const int64_t M = x.shape[0];
+    vt::Tensor wgu = ResidentWeight(d, *gate_up_);  // [2I, H] raw-NK
+    DBuf gate_up(d, vt::DType::kBF16, {M, 2 * I_});
+    vt::MatmulBT(d.q, gate_up.t(), x, wgu);
+    DBuf act(d, vt::DType::kBF16, {M, I_});
+    vt::GeluAndMul(d.q, act.t(), gate_up.t());  // gelu_tanh(gate)*up
+    return act;
+  }
+
+  const char* Name() const override { return "bf16-gate-up-gelu"; }
+
+ private:
+  const OwnedTensor* gate_up_;
+  int64_t I_;
+};
+
 }  // namespace layers
 }  // namespace vllm

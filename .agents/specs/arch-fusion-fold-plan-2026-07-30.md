@@ -60,21 +60,27 @@ Bit-exact (ds4 records bit-identical); preserve decoupled-rope asymmetry (latent
 
 ### TIER B — bit-exact glue folds onto existing FusedChain catalog (Gemma sweep)
 
-**B1. Gemma attn-preamble → `kAttnQkNormRope` / `kAttnQkNormRopeGate`** *(shared-op: FusedChain, already in catalog)*
-Composite == the 3 standalone ops → bit-exact **provided the cos/sin cache path is used** (no `RopeNeox`→`RopeFromCache` swap in the same step, which would trip the Qwen3 1-ULP FMA near-tie). Inherits the 27B/35B-tuned kernel for free.
-- Gemma-4 (plain RMSNorm → STD recipe) — `gemma4.cpp:229,235,246-252` (already `RopeFromCache`, so clean)
-- Gemma-3 — `gemma3.cpp:147-148,152` (`kAttnQkNormRopeGate`, `recipes.h:247`)
+**B1. Gemma attn-preamble → `kAttnQkNormRope` / `kAttnQkNormRopeGate`** *(shared-op: FusedChain, already in catalog)* — ⚠️ **CHARACTERIZED NOT-BIT-EXACT-FOLDABLE onto the EXISTING catalog (2026-07-30); DEFERRED, not silently swapped.**
+Composite == the 3 standalone ops → bit-exact **provided the cos/sin cache path is used** (no `RopeNeox`→`RopeFromCache` swap in the same step, which would trip the Qwen3 1-ULP FMA near-tie). The B1 hazard FIRED on inspection:
+- Gemma-1/Gemma-2 — **N/A** (no q/k-norm; the preamble recipe needs the norm weights, and both use `RopeNeox` on a raw q/k).
+- Gemma-3 (`gemma3.cpp:145-152`) — qk-norm is **GemmaRMSNorm (1+w, `gemma=true`)** AND uses **`RopeNeox`** (not the cos/sin cache). `kAttnQkNormRope` is `gemma=false` + `RopeFromCache` (TWO mismatches: norm variant + a forbidden RoPE-impl swap); `kAttnQkNormRopeGate` carries an attention **output gate** Gemma-3 does not have. Neither existing recipe is bit-exact → would need a NEW `gemma=true` non-gated `RopeNeox` recipe. Left STANDALONE.
+- Gemma-4 (`gemma4.cpp:224-258`) — the preamble is **heterogeneous/conditional**: q-norm always, k-norm + v-norm only when `!is_kv_shared`, RoPE is `RopeFromCache` on full layers but **`RopeNeox` on sliding layers**, and shared-KV layers rope only q (k discarded). The fixed q+k-norm+rope macro does not fit (the weight-less v-norm sits outside it, sliding layers use `RopeNeox`, shared-KV layers skip k). Only the full+non-shared subset structurally matches; a partial conditional fold is possible but needs the fused op proven byte-identical to Gemma-4's exact `RopeFromCache(prop_cache, positions)` first. Left STANDALONE this pass.
+→ **B1 delivers no bit-exact fold on the current catalog; recorded honestly (fold-plan Iron Law: characterize the near-tie, do not silently swap). Follow-up: a `gemma=true` non-gated `RopeNeox` recipe (Gemma-3) + the Gemma-4 conditional handling.**
 
-**B2. Gemma residual add+norm → `kFusedAddRmsNorm` (GEMMA 1+w, `recipes.h:38`)** *(shared-op: FusedChain)*
-Bit-exact (Tier-0 composite dispatches to the same standalone RmsNorm). **Fold only the residual-carrying norms; leave sandwich post-norms standalone.**
-- Gemma — `gemma.cpp:142,148`
-- Gemma-2 — `gemma2.cpp:235,249` **only** (post-norms `:245,:255` are NOT fusable — flag them)
+**B2. Gemma residual add+norm → `kFusedAddRmsNorm` (GEMMA 1+w, `recipes.h:38`)** *(shared-op: FusedChain)* — ✅ **DONE 2026-07-30** (branch off `18ed6f03`, NOT pushed).
+Bit-exact (Tier-0 composite dispatches to the same standalone RmsNorm). **Folded only the residual-carrying norms; sandwich post-norms left standalone.** Adopted behind `FusedChainAdoptEnabled()` (existing default-ON flag, byte-exact `else` fallback), mirroring qwen3.
+- Gemma-1 — `gemma.cpp` input + post_attention + final (all 3 residual-carrying gemma norms). ✅
+- Gemma-2 — `gemma2.cpp` input + pre_feedforward + final; post_attention/post_feedforward (`:245,:255`) are sandwich post-norms with NO residual add → **marked NOT-fusable, left standalone** (folding them would be incorrect). ✅
+- Gemma-3 — `gemma3.cpp` input + pre_feedforward + final (extension beyond the plan's enumeration; same clean pattern); post_attention/post_feedforward NOT-fusable, standalone. ✅
+- Gemma-4 — **N/A**: its decoder norms are standalone plain (`gemma=false`) with the residual added SEPARATELY (PLE/YOCO structure `norm(hidden)` before `hidden = attn + r`), not the add-then-norm pattern; no fused-add-norm site to fold.
 
 ### TIER C — bit-exact but requires a NEW shared-op sibling (build once, many consumers)
 
-**C1. GeGLU MLP method — build the GeluAndMul sibling of `UnquantizedMlpGateUpMethod`** *(shared-op: MlpGateUpMethodBase, GeGLU arm — NEW)*
-Same [2I,H] merged operand + `GeluAndMul(tanh)` instead of `SiluAndMul`. Bit-exact. Once built, 5 sites fold and all inherit nvfp4 fused gate-up for free:
-- Gemma `gemma.cpp:116-120` · Gemma-2 `:206-210` · Gemma-3 `:201-205` · Gemma-4 `:305-309` · gemma4_vision `gemma4_vision.cpp:264-268,392-394` (already a bespoke [2I,H] DevW — add a clamp epilogue hook)
+**C1. GeGLU MLP method — build the GeluAndMul sibling of `UnquantizedMlpGateUpMethod`** *(shared-op: MlpGateUpMethodBase, GeGLU arm — NEW)* — ✅ **DONE 2026-07-30** (4 text Gemma sites; branch off `18ed6f03`, NOT pushed).
+Same [2I,H] merged operand + `GeluAndMul(tanh)` instead of `SiluAndMul`. Bit-exact. `vt::GeluAndMul` ALREADY existed (registered CUDA+CPU op) → **NO new vt op needed**; added only `layers::UnquantizedMlpGateUpGeluMethod` (sibling of `UnquantizedMlpGateUpMethod` under `MlpGateUpMethodBase`, `linear.h`). All 4 text Gemma MLPs folded onto it (each already packs a merged `[2I,H] gate_up_proj` → no loader concat). CPU composite-golden RED-first unit case added (`test_linear_method`: the GeGLU seam == standalone `{MatmulBT; GeluAndMul}` BYTE-IDENTICAL; RED-first proven — a `SiluAndMul` reference fails the byte-check).
+- Gemma-1 `gemma.cpp` · Gemma-2 `gemma2.cpp` · Gemma-3 `gemma3.cpp` · Gemma-4 `gemma4.cpp` — all folded. ✅
+- gemma4_vision `gemma4_vision.cpp` (bespoke [2I,H] DevW + clamp epilogue) — **NOT in this pass** (vision tower; needs the clamp-epilogue hook), deferred to the MM-tower tier.
+- **nvfp4 GeGLU arm**: the seam/method-base now hosts GeGLU, but the fused nvfp4 arm (`GateUpFusedMarlinD`) still hardcodes `SiluAndMul` — a GeGLU nvfp4 arm is a clean follow-up (Gemma is bf16-only today). Honest: "inherits nvfp4 for free" is the SEAM, realized when a GeGLU nvfp4 arm + a quantized Gemma checkpoint land.
 
 **C2. Vision-tower QKV merge where the weight is ALREADY resident-fused** *(shared-op: merged-QKV + bias epilogue)*
 Zero weight marshaling — descriptor already resident; only the compute is split. Bit-exact (contiguous output split), needs the **merged-bias epilogue**.
