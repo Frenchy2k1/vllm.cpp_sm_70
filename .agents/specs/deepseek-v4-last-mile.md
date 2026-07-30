@@ -147,8 +147,29 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   **LAUNCH-bound** (fixed per-launch overhead dominates — reducing per-launch rows 6→1 barely cuts it), so the
   bucket-% fell modestly; the +4.6% comes mostly from eliminating the 6×/layer xrep host-copies. The remaining
   quant lever is LAUNCH-COUNT reduction: fuse the quant INTO the GEMM, or dedup gate+up into ONE quantize.
-- **Brick 3 — Q8_0 coalescing** (now **45%** of step at 63% of peak — the dominant lever). **Brick 4 — fp8 KV
-  (parity/long-ctx, measured at 256+).** Each rollback-able (new path default-safe; the resident default stays correct).
+- **Brick 3 — Q8_0 GEMM vectorized dp4a dot (DONE + DGX-gated, commit `91e51aea`→amended). BIT-EXACT but a NEAR-FLAT
+  result — the Q8_0 matvec is at the 34-byte-block MEMORY WALL, not instruction-bound.** `QuantDotGemmQ8_0Kernel`
+  (+grouped) read the 32 int8/block as 32 scattered int8 loads + a scalar-MAC loop; Brick 3 reads them as 8 int32
+  + 8 `__dp4a` (mirrors llama.cpp `ggml-cuda/vecdotq.cuh:vec_dot_q8_0_q8_1_impl` + `VDR_Q8_0_Q8_1_MMVQ=2`). The
+  Q8_0 `qs` sits at offset 2 in the 34-byte block (uint16 d + 32 int8), so — unlike the 4-byte-aligned Q8_K qs the
+  Brick-1 IQ2/Q2_K path int-loads directly — a naked int32 load is mis-aligned; `GetIntB2` (bit-exact port of
+  `ggml-cuda/common.cuh:get_int_b2`, two uint16 little-endian loads) reconstructs the identical byte pattern → `__dp4a`
+  extracts the same signed int8 lanes as `(int)qs[p]`. BIT-IDENTICAL (`test_cuda_quant_dot` q8_0 nmse≤1e-6 **2/2·105601
+  ZERO drift**; `test_cuda_deepseek_v4` 18/18·34176; `test_deepseek_v4_gguf_load` 13/13·631; real 80.7 GB model
+  resident-default TOKEN-IDENTICAL "…Paris.", ids byte-equal to host `=0`; SASS: exactly 8 IDP inside the Q8_0 float
+  kernel). **RESULT (nsys, 50 tok): the Q8_0 kernel moved only 2.182 s → 2.149 s (−1.5%; median 30,112 → 29,472 ns,
+  −2.1%) = 45.0% → 44.6% of step ≈ 63% → ~64% of the 240 GB/s peak. Decode 10.02 → 10.07 tok/s (+0.5%, 6 warm runs
+  10.05–10.09, non-overlapping vs Brick 2's 9.99–10.04)** (host `=0` 8.50 → 8.56). **THE FINDING:** dp4a + int-reads
+  cut instructions but NOT the bottleneck — the kernel is DRAM-bandwidth-bound, and the 34-byte-misaligned block
+  precludes true 128-bit coalesced loads (the lane-stride-34 access pattern is unchanged). Reaching 63% → ~85% needs
+  an ALIGNED WEIGHT REPACK at load (separate f16 scales + 16-byte-aligned contiguous int8, ggml `mmq` load_tiles /
+  ds4 warp8-preq style) enabling float4/int4 loads — numerically NEUTRAL but it trades the in-place unified-memory
+  mmap design (a ~Q8_0-tower copy + load-time cost). **BOUNDARY: the bit-exact IN-KERNEL GEMM levers are now
+  largely exhausted** (both grouped dequant kernels memory-bound after B1/B1b; the Q8_0 matvec at its block-layout
+  wall after B3). Further speed = either the aligned repack (numerics-neutral, design-changing) OR the
+  numerics-delicate last mile (dequant-cache, fp8-KV). We stand at **10.07 tok/s ≈ 61% of ds4 16.5** vs the
+  ~13–15 projected bit-exact ceiling.
+- **Brick 4 — fp8 KV (parity/long-ctx, measured at 256+).** Rollback-able (new path default-safe; the resident default stays correct).
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +

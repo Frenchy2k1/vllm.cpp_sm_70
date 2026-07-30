@@ -732,6 +732,25 @@ overhead dominates → cutting per-launch rows 6→1 barely moves the %); the +4
 the 6×/layer xrep host-copies. Remaining quant lever = LAUNCH-COUNT reduction (fuse quant into GEMM / dedup
 gate+up). NEXT: Brick 3 (Q8_0 coalescing — now **45%** of step at 63% of peak, the dominant lever). STOPPED for
 review. Rollback `VT_V4_RESIDENT_DECODE=0`. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Last-mile campaign — Brick 3: Q8_0 GEMM vectorized dp4a dot — BIT-EXACT but NEAR-FLAT +0.5% (the Q8_0 matvec is
+at the 34-byte-block MEMORY WALL) (2026-07-30, base `dd6cc93c`, branch `deepseek-v4-last-mile`, commit
+`91e51aea`→amended, NOT pushed).** `QuantDotGemmQ8_0Kernel` (+grouped, ~45% of step at 63% of BW peak) read the 32
+int8/block as 32 scattered int8 loads + a scalar-MAC loop. FIX (mirrors llama.cpp `vecdotq.cuh:vec_dot_q8_0_q8_1_impl`):
+read 8 int32 + 8 `__dp4a`. The Q8_0 `qs` is at offset 2 in the 34-byte block → mis-aligned for a naked int32 load,
+so `GetIntB2` (bit-exact port of `ggml-cuda/common.cuh:get_int_b2`, two uint16 loads) reconstructs the bytes →
+`__dp4a` gets the same signed int8 lanes as `(int)qs[p]`. BIT-IDENTICAL: `test_cuda_quant_dot` q8_0 **2/2·105601
+nmse≤1e-6 ZERO drift**; `test_cuda_deepseek_v4` 18/18·34176; `test_deepseek_v4_gguf_load` 13/13·631; real 80.7 GB
+model resident-default TOKEN-IDENTICAL "…Paris." (ids byte-equal to host); SASS shows exactly 8 IDP in the Q8_0
+float kernel (Iron-Law compile-proof). **RESULT (nsys, 50 tok) — HONEST NEAR-FLAT: the Q8_0 kernel moved only
+2.182→2.149 s (−1.5%; med 30,112→29,472 ns) = 45.0%→44.6% ≈ 63%→~64% of peak. Decode 10.02 → 10.07 tok/s (+0.5%,
+6 warm runs 10.05–10.09, non-overlapping vs Brick 2's 9.99–10.04; host `=0` 8.50→8.56) vs ds4 16.5 (~61% of ds4;
+campaign host 6.44 → 10.07 = +56%).** FINDING: dp4a cut instructions but not the bottleneck — the kernel is
+DRAM-BW-bound and the 34-byte-misaligned block precludes true 128-bit coalesced loads; reaching ~85% needs an
+ALIGNED WEIGHT REPACK at load (numerics-neutral, but trades the in-place unified-memory mmap design). **THE
+BIT-EXACT IN-KERNEL GEMM LEVERS ARE NOW LARGELY EXHAUSTED** (both grouped dequant kernels memory-bound after
+B1/B1b; Q8_0 at its block wall after B3). Remaining: (a) aligned Q8_0 repack (numerics-neutral, design-changing);
+(b) glue (Rope+MhcPreFinish+Route ≈ 23%); (c) numerics-delicate (dequant-cache, fp8-KV). At 10.07 ≈ 61% of ds4 vs
+the ~13–15 bit-exact ceiling. STOPPED for review. Rollback `VT_V4_RESIDENT_DECODE=0`. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
