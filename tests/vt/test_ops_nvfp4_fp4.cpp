@@ -37,6 +37,8 @@
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vt/backend.h"
 #ifdef VLLM_CPP_CUDA
+#include <cuda_runtime.h>
+
 #include "vt/cuda/cuda_arch_tactics.h"
 #include "vt/cuda/cuda_device_caps.h"
 #endif
@@ -2621,5 +2623,145 @@ TEST_CASE("CUDA arch tactic registry is cross-family additive (Hopper sm_90 decl
 #else
   CHECK(registered == 0);
 #endif
+}
+
+// --- STEP-0 measurement microbench (best-gemm-path rank-2) --------------------
+// Quantifies the W4A4 fp4xfp4 GEMM at DECODE M=1 vs the memory roofline on the
+// real 27B (Qwen3.6-27B-NVFP4) projection shapes, answering: is the production
+// cutlass Fp4GemmSm120 tactic already near the weight-read roofline at M=1, or is
+// there a real mis-route cost (tensor-core tile under-utilization) a dp4a matvec
+// could recover? Gated on VT_FP4_M1_BENCH=1 so it never perturbs the SACRED
+// gates. Reports per-call us + achieved weight-read GB/s + % of an empirical
+// device-to-device copy bandwidth ceiling measured on the same box.
+namespace {
+double DtoDBandwidthGBs(vt::Backend& b, Queue& q) {
+  const size_t bytes = size_t{512} << 20;  // 512 MiB
+  void* src = b.Alloc(bytes);
+  void* dst = b.Alloc(bytes);
+  b.Memset(q, src, 0x3C, bytes);
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+  for (int i = 0; i < 3; ++i) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
+  cudaStreamSynchronize(s);
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0);
+  cudaEventCreate(&e1);
+  const int iters = 30;
+  cudaEventRecord(e0, s);
+  for (int i = 0; i < iters; ++i) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
+  cudaEventRecord(e1, s);
+  cudaEventSynchronize(e1);
+  float ms = 0;
+  cudaEventElapsedTime(&ms, e0, e1);
+  cudaEventDestroy(e0);
+  cudaEventDestroy(e1);
+  b.Free(src);
+  b.Free(dst);
+  // DtoD moves 2x bytes (read src + write dst) per copy.
+  return (2.0 * static_cast<double>(bytes) * iters) / (static_cast<double>(ms) * 1e-3) / 1e9;
+}
+}  // namespace
+
+TEST_CASE("W4A4 M=1 decode GEMM roofline microbench (VT_FP4_M1_BENCH=1)") {
+  if (std::getenv("VT_FP4_M1_BENCH") == nullptr) return;
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+
+  int dev = 0;
+  cudaGetDevice(&dev);
+  int clk_khz = 0, bus_bits = 0, sm_major = 0, sm_minor = 0;
+  cudaDeviceGetAttribute(&clk_khz, cudaDevAttrMemoryClockRate, dev);
+  cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev);
+  cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, dev);
+  const double attr_peak_gbs = 2.0 * (clk_khz * 1e3) * (bus_bits / 8.0) / 1e9;
+  const double dtod_gbs = DtoDBandwidthGBs(b, q);
+  std::fprintf(stderr,
+               "\n[FP4_M1_BENCH] sm_%d%d clk=%d kHz bus=%d bit  attr_peak=%.0f GB/s"
+               "  measured_DtoD=%.0f GB/s\n",
+               sm_major, sm_minor, clk_khz, bus_bits, attr_peak_gbs, dtod_gbs);
+  std::fprintf(stderr,
+               "[FP4_M1_BENCH] shape                    M   us/call    GB/s  %%DtoD\n");
+
+  // The four real Qwen3.6-27B-NVFP4 dense W4A4 projections (config: hidden=5120,
+  // intermediate=17408, 24 q-heads x hd256 -> q=6144, 4 kv-heads -> k=v=1024).
+  struct Shape { const char* name; int64_t N; int64_t K; };
+  const std::array<Shape, 4> shapes{{
+      {"qkv    [8192x5120]", 8192, 5120},
+      {"o      [5120x6144]", 5120, 6144},
+      {"gate_up[34816x5120]", 34816, 5120},
+      {"down   [5120x17408]", 5120, 17408},
+  }};
+  const std::array<int64_t, 5> Ms{{1, 8, 32, 64, 128}};
+
+  std::mt19937 rng(1234);
+  std::normal_distribution<float> nd(0.0F, 1.0F);
+
+  for (const auto& sh : shapes) {
+    const int64_t N = sh.N, K = sh.K;
+    const int64_t padN = RoundUpTo(N, 128), padK16 = RoundUpTo(K / 16, 4);
+    // Weight operands (quantized once, CUTLASS-swizzled scale) — resident.
+    std::vector<float> w(static_cast<size_t>(N * K));
+    for (auto& v : w) v = nd(rng);
+    void* dw = b.Alloc(w.size() * sizeof(float));
+    b.Copy(q, dw, w.data(), w.size() * sizeof(float));
+    void* db_packed = b.Alloc(static_cast<size_t>(N * K / 2));
+    void* db_sf = b.Alloc(static_cast<size_t>(padN * padK16));
+    b.Memset(q, db_sf, 0, static_cast<size_t>(padN * padK16));
+    Tensor tw = GpuTensor({N, K}); tw.data = dw; tw.dtype = DType::kF32; tw.device = Gpu();
+    Tensor tb_packed = GpuTensor({N, K / 2}); tb_packed.data = db_packed; tb_packed.dtype = DType::kI8; tb_packed.device = Gpu();
+    Tensor tb_sf = GpuTensor({padN, padK16}); tb_sf.data = db_sf; tb_sf.dtype = DType::kI8; tb_sf.device = Gpu();
+    vt::ScaledFp4Quant(q, tb_packed, tb_sf, tw, 7.0F, vt::Fp4ScaleLayout::kCutlassSwizzled);
+
+    void* d_alpha = b.Alloc(sizeof(float));
+    const float alpha_host = (1.0F / 7.0F) * (1.0F / 7.0F);
+    b.Copy(q, d_alpha, &alpha_host, sizeof(float));
+    Tensor t_alpha = GpuTensor({1}); t_alpha.data = d_alpha; t_alpha.dtype = DType::kF32; t_alpha.device = Gpu();
+
+    for (int64_t M : Ms) {
+      const int64_t padM = RoundUpTo(M, 128);
+      std::vector<float> x(static_cast<size_t>(M * K));
+      for (auto& v : x) v = nd(rng);
+      void* dx = b.Alloc(x.size() * sizeof(float));
+      b.Copy(q, dx, x.data(), x.size() * sizeof(float));
+      void* da_packed = b.Alloc(static_cast<size_t>(M * K / 2));
+      void* da_sf = b.Alloc(static_cast<size_t>(padM * padK16));
+      b.Memset(q, da_sf, 0, static_cast<size_t>(padM * padK16));
+      void* dout = b.Alloc(static_cast<size_t>(M * N) * sizeof(uint16_t));
+      Tensor tx = GpuTensor({M, K}); tx.data = dx; tx.dtype = DType::kF32; tx.device = Gpu();
+      Tensor ta_packed = GpuTensor({M, K / 2}); ta_packed.data = da_packed; ta_packed.dtype = DType::kI8; ta_packed.device = Gpu();
+      Tensor ta_sf = GpuTensor({padM, padK16}); ta_sf.data = da_sf; ta_sf.dtype = DType::kI8; ta_sf.device = Gpu();
+      Tensor tout = GpuTensor({M, N}); tout.data = dout; tout.dtype = DType::kBF16; tout.device = Gpu();
+      vt::ScaledFp4Quant(q, ta_packed, ta_sf, tx, 7.0F, vt::Fp4ScaleLayout::kCutlassSwizzled);
+
+      // Warmup + autotune plan selection (first call tunes the tactic).
+      for (int i = 0; i < 5; ++i)
+        vt::MatmulNvfp4Cutlass(q, tout, ta_packed, ta_sf, tb_packed, tb_sf, t_alpha);
+      cudaStreamSynchronize(s);
+      cudaEvent_t e0, e1;
+      cudaEventCreate(&e0);
+      cudaEventCreate(&e1);
+      const int iters = 200;
+      cudaEventRecord(e0, s);
+      for (int i = 0; i < iters; ++i)
+        vt::MatmulNvfp4Cutlass(q, tout, ta_packed, ta_sf, tb_packed, tb_sf, t_alpha);
+      cudaEventRecord(e1, s);
+      cudaEventSynchronize(e1);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, e0, e1);
+      cudaEventDestroy(e0);
+      cudaEventDestroy(e1);
+      const double us = (ms * 1e3) / iters;
+      // Ideal weight bytes read once: fp4 packed (N*K/2) + fp8 block scales (N*K/16).
+      const double wbytes = static_cast<double>(N) * K * 0.5 + static_cast<double>(N) * K / 16.0;
+      const double gbs = wbytes / (us * 1e-6) / 1e9;
+      std::fprintf(stderr, "[FP4_M1_BENCH] %-20s %4lld  %8.2f  %6.0f  %5.1f\n",
+                   sh.name, static_cast<long long>(M), us, gbs, 100.0 * gbs / dtod_gbs);
+      for (void* p : {dx, da_packed, da_sf, dout}) b.Free(p);
+    }
+    for (void* p : {dw, db_packed, db_sf, d_alpha}) b.Free(p);
+  }
+  b.DestroyQueue(q);
 }
 #endif  // VLLM_CPP_CUDA
