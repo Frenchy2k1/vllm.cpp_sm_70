@@ -1127,6 +1127,96 @@ void RopeLaunch(Queue& q, float* v, int64_t num_rows, int64_t row_stride, int64_
   Check(cudaGetLastError(), "rope launch");
 }
 
+// ── Brick 7: FUSED per-head RMSNorm + RoPE (ds4 head_rms_norm_rope_tail_kernel :5873
+// + dsv4_qkv_rms_norm_rows_kv_rope_kernel :5779). Collapses the resident-decode
+// {rms_norm_rows + rope} launch PAIR (q per-head norm+rope, kv norm+rope) into ONE
+// kernel — the normalized values never round-trip through HBM — AND parallelizes the
+// RoPE tail (block-per-row, threads split the r/2 pairs) instead of the old
+// one-thread-per-row serial recurrence.
+//
+// BIT-IDENTICAL to the split {RmsNormRowsKernel ; RopeKernel} path:
+//  - the RMS reduction is the SAME double block-tree reduce as RmsNormRowsKernel;
+//  - the RoPE recurrence `theta_extrap *= theta_scale` is a LEFT-FOLD, so pair p's
+//    theta_extrap = pos·theta_scale^p, and a thread reaching pair p by p sequential
+//    mults from pos reproduces the recurrence's exact product order (double);
+//  - cos/sin stay double (like RopeKernel), NO ds4 attn_factor/mscale (we have none).
+// do_norm=false + inverse=true covers the standalone post-attention inverse o-RoPE
+// (line-1356 site) with the SAME parallelized bit-exact tail, no norm.
+__global__ void NormRopeRowsKernel(float* __restrict__ out, const float* __restrict__ in,
+                                   const float* __restrict__ w, int rows, int n, int off, int r,
+                                   const int* __restrict__ row_pos, double base, double freq_scale,
+                                   double ext_factor, int n_ctx_orig, double beta_fast,
+                                   double beta_slow, int inverse, int has_w, int do_norm,
+                                   float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  const float* inr = in + static_cast<int64_t>(row) * n;
+  float* outr = out + static_cast<int64_t>(row) * n;
+  extern __shared__ double red[];
+  float rscale = 1.0f;
+  if (do_norm) {
+    double ls = 0.0;
+    for (int i = tid; i < n; i += nt) { const double v = inr[i]; ls += v * v; }
+    red[tid] = ls;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; __syncthreads(); }
+    rscale = 1.0f / sqrtf(static_cast<float>(red[0] / static_cast<double>(n)) + eps);
+    // normalized passthrough for the NON-roped dims [0, off) and [off+r, n); the
+    // roped tail [off, off+r) is written by the RoPE loop below (from the same nv).
+    for (int i = tid; i < off; i += nt) outr[i] = has_w ? inr[i] * rscale * w[i] : inr[i] * rscale;
+    for (int i = off + r + tid; i < n; i += nt)
+      outr[i] = has_w ? inr[i] * rscale * w[i] : inr[i] * rscale;
+  }
+  // RoPE tail — one thread per pair p (dims off+2p, off+2p+1); bit-exact left-fold.
+  const double theta_scale = pow(base, -2.0 / static_cast<double>(r));
+  const double sin_sign = inverse ? -1.0 : 1.0;
+  double corr_lo = 0.0, corr_hi = 0.0;
+  if (ext_factor != 0.0) {
+    corr_lo = fmax(0.0, floor(YarnCorrDimDev(r, n_ctx_orig, beta_fast, base)));
+    corr_hi = fmin(static_cast<double>(r - 1), ceil(YarnCorrDimDev(r, n_ctx_orig, beta_slow, base)));
+  }
+  const double pos = static_cast<double>(row_pos[row]);
+  const int pairs = r / 2;
+  for (int p = tid; p < pairs; p += nt) {
+    const int i = 2 * p;
+    double theta_extrap = pos;
+    for (int j = 0; j < p; ++j) theta_extrap *= theta_scale;  // == recurrence te at pair p
+    const double theta_interp = freq_scale * theta_extrap;
+    double theta = theta_interp;
+    if (ext_factor != 0.0) {
+      const double y = (static_cast<double>(i / 2) - corr_lo) / fmax(0.001, corr_hi - corr_lo);
+      const double ramp = (1.0 - fmin(1.0, fmax(0.0, y))) * ext_factor;
+      theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
+    }
+    const float c = static_cast<float>(cos(theta));
+    const float sn = static_cast<float>(sin_sign * sin(theta));
+    float x0, x1;
+    if (do_norm) {
+      x0 = has_w ? inr[off + i] * rscale * w[off + i] : inr[off + i] * rscale;
+      x1 = has_w ? inr[off + i + 1] * rscale * w[off + i + 1] : inr[off + i + 1] * rscale;
+    } else {
+      x0 = outr[off + i];
+      x1 = outr[off + i + 1];
+    }
+    outr[off + i] = x0 * c - x1 * sn;
+    outr[off + i + 1] = x0 * sn + x1 * c;
+  }
+}
+void NormRopeRowsLaunch(Queue& q, float* out, const float* in, const float* w, int64_t rows,
+                        int64_t n, int64_t off, int64_t r, const int* row_pos, double base,
+                        double freq_scale, double ext_factor, int64_t n_ctx_orig, double beta_fast,
+                        double beta_slow, bool inverse, bool has_w, bool do_norm, float eps) {
+  if (rows == 0 || n == 0) return;
+  cudaStream_t s = AsStream(q);
+  const unsigned block = 256;
+  NormRopeRowsKernel<<<static_cast<unsigned>(rows), block, block * sizeof(double), s>>>(
+      out, in, w, static_cast<int>(rows), static_cast<int>(n), static_cast<int>(off),
+      static_cast<int>(r), row_pos, base, freq_scale, ext_factor, static_cast<int>(n_ctx_orig),
+      beta_fast, beta_slow, inverse ? 1 : 0, has_w ? 1 : 0, do_norm ? 1 : 0, eps);
+  Check(cudaGetLastError(), "norm_rope_rows launch");
+}
+
 // MoE combine: out[h] = Σ_a weights[a]*eo[a*H+h] (one thread per h; sequential over
 // a → host order). Near-tie vs host (the device contracts weights[a]*eo+acc to an
 // FMA; the host does separate multiply+add) — ~last-ULP, characterized.
@@ -1345,7 +1435,8 @@ const MhcDeviceKernels kMhc = {&MhcSinkhornLaunch, &MhcPreLaunch, &MhcPostLaunch
                                &MhcPostInPlaceLaunch, &HcHeadInPlaceLaunch, &MhcPreInPlaceLaunch};
 const DsaDeviceKernels kDsa = {&DsaWeightFoldLaunch, &DsaLogitsLaunch, &DsaTopkLaunch,
                                &SoftmaxSinkLaunch, &GroupedOLoraLaunch, &DecodeAttnLaunch,
-                               &RmsNormLaunch, &RopeLaunch, &RmsNormRowsLaunch, &DecodeAttnGLaunch};
+                               &RmsNormLaunch, &RopeLaunch, &RmsNormRowsLaunch, &DecodeAttnGLaunch,
+                               &NormRopeRowsLaunch};
 const CompressorDeviceKernels kComp = {&SaveScoreApeLaunch, &PoolNormLaunch, &Fp8EncodeLaunch,
                                        &Fp8DecodeLaunch};
 // FUSED routed-MoE gate+up+SwiGLU — forwards to the cuda_quant_dot.cu kernel that

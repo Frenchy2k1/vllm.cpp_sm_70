@@ -217,7 +217,37 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   `QuantizeQ8KKernel` 106.7 ms, `MhcPreFinishKernel` 98.7 ms (1118), `RouteKernel` 77.4 ms (559) — plus the BW-
   efficiency gap (ds4 at ~58% of the roofline). NEXT LEVER (STEP 1b): fuse Rope into the qk-write, and the
   MhcPre/Route glue, into fewer kernels (bit-exact where elementwise; characterized near-tie where a reduction
-  reorders). Commit `<this>`.
+  reorders). Commit `4ffcb96b`.
+- **Brick 7 — FUSION lever: per-head RMSNorm+RoPE fused + RoPE tail parallelized (ds4 head_rms_norm_rope_tail_kernel
+  / dsv4_qkv_rms_norm_rows_kv_rope_kernel) — DONE + DGX-gated, BIT-EXACT, +5.5%.** Attacks the Brick-6 nsys top glue
+  (`RopeKernel`). The resident decode ran, per layer, {`rms_norm_rows` ; `rope`} as SEPARATE launches at 3 sites
+  (q per-head norm+fwd-rope, kv norm+fwd-rope, and the standalone inverse o-rope), round-tripping the normalized
+  q/kv through HBM, and the RoPE itself was ONE-THREAD-PER-ROW (64 threads doing the double cos/sin serially).
+  New `NormRopeRowsKernel` (`cuda_deepseek_v4.cu`; ground: ds4 `head_rms_norm_rope_tail_kernel:5873` +
+  `dsv4_qkv_rms_norm_rows_kv_rope_kernel:5779`): ONE kernel, block-per-row, does the RMS reduction (identical double
+  block-tree reduce to `RmsNormRowsKernel`) then applies RoPE to the tail with the pairs SPLIT ACROSS THREADS.
+  **BIT-IDENTICAL** because the RoPE recurrence `theta_extrap *= theta_scale` is a LEFT-FOLD — pair p's angle is
+  `pos·theta_scale^p`, so a thread reaching pair p by p sequential mults from `pos` reproduces the recurrence's exact
+  double product order; cos/sin stay double; no ds4 `attn_factor`/mscale (we have none). `do_norm=false`+`inverse=true`
+  covers the standalone inverse o-rope with the same parallelized bit-exact tail (no norm). Wired through
+  `DsaDeviceKernels::norm_rope_rows` into BOTH the eager `ForwardResidentDecodeGguf` AND the captured `V4Graph::Step`
+  (`VT_V4_FUSED_ROPE=0` A/B fallback). **NOTE (RED-first caught it):** the FIRST build wired only the eager path and
+  measured FLAT (10.85 vs 10.87) because the benchmark config is `VT_V4_DECODE_GRAPH=1` — the nsys showed `RopeKernel`
+  UNCHANGED (no `NormRopeRowsKernel`), proving the graph body was a separate un-edited code path; wiring `V4Graph::Step`
+  fixed it. **BIT-EXACT gates:** new unit case `norm_rope_rows == split {rms_norm_rows;rope}` BYTE-IDENTICAL over the
+  q/kv/o modes + RED-first (`test_cuda_deepseek_v4` **19/19·66949**, was 18); `test_cuda_quant_dot` **3/3·105841**,
+  `test_deepseek_v4_gguf_load` **13/13·631** (both UNCHANGED); real 80.7 GB model resident+graph, VT_V4_FUSED_ROPE=1
+  vs =0 = **byte-IDENTICAL 49-token sequence** ("…11111 16 455 6102 294 8760 344…"). **RESULT (median of 4 warm runs
+  each, --gpu --kv-cache VT_V4_DECODE_GRAPH=1, 50 tok):** decode **10.82 → 11.41 tok/s (+5.5%, non-overlapping bands
+  split 10.80–10.85 / fused 11.41–11.44)** vs ds4 16.5 (~69% of ds4, from ~65.5%; closes ~10.4% of the residual gap).
+  **nsys (`--cuda-graph-trace=node`, 14 decode steps × 43 layers):** `RopeKernel` 129.1 ms / 1806 inst (8.4% of the
+  step) → `NormRopeRowsKernel` 63.9 ms / 1806 inst (4.4%) = **-50.5% RoPE-glue GPU time (2.02×)** from the parallelized
+  tail, PLUS the two per-layer `rms_norm_rows` launches (q per-head + kv, ~1204 launches) folded away (`RmsNormRowsKernel`
+  1820 → ~616 inst). PEAK RSS **86.68 GiB unchanged** (no new alloc; reuses qact/dn/o). **HONEST residual:** the new
+  top glue is `QuantizeQ8KKernel` 110 ms (7.6%), `MhcPreFinishKernel` 106 ms (7.3%), `RouteKernel` 83.6 ms (5.7%) —
+  plus the BW-efficiency gap (ds4 at ~58% of the roofline vs our GEMMs). NEXT LEVER: fuse the activation-quant into the
+  consuming GEMM prologue (lever-2, LAUNCH-bound `QuantizeQ8K`), and the MhcPre reduction glue (characterized near-tie
+  where the Sinkhorn/mix reduction reorders). Commit `<this>`.
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +
