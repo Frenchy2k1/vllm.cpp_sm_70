@@ -1230,4 +1230,18 @@ void MoeGateUpSwiGLUGroupedCuda(Queue& q, Tensor& out, const Tensor& act, const 
   CheckCuda(cudaGetLastError(), "moe_gate_up_swiglu launch");
 }
 
+// SHARED-OP registration (kMoeGateUpSwiGLUGrouped). Promotes the DeepSeek-private
+// fused MoE gate+up+SwiGLU kernel above into a first-class vt:: op so any keep-quant
+// MoE arch inherits it via vt::MoeGateUpSwiGLUGrouped. BIT-IDENTICAL: the registered
+// entry IS MoeGateUpSwiGLUGroupedCuda (same kernel DeepSeek's MoeDeviceKernels wrapper
+// calls) — a shared-op wrapper, not a rewrite. Kept a SEPARATE registrar (append-only)
+// so the primary keep-quant Registrar above is untouched.
+struct FusedMoeSharedRegistrar {
+  FusedMoeSharedRegistrar() {
+    RegisterOp(OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<MoeGateUpSwiGLUGroupedFn>(&MoeGateUpSwiGLUGroupedCuda)));
+  }
+} fused_moe_shared_registrar;
+
 }  // namespace vt::cuda

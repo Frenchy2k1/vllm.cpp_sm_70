@@ -28,6 +28,7 @@
 // row before any dot reads it. Results are therefore bit-identical run to run
 // and independent of thread count — asserted directly in
 // tests/vt/test_ops_quant_dot.cpp.
+#include <cmath>
 #include <vector>
 
 #include "vt/quant.h"
@@ -245,6 +246,33 @@ void MatmulBTQuantGroupedKernel(Queue& q, Tensor& out, const Tensor& act,
   }
 }
 
+// SHARED fused MoE gate+up+SwiGLU keep-quant (kMoeGateUpSwiGLUGrouped) — the CPU
+// GOLDEN. This is the Tier-0 BYTE-EXACT COMPOSITE the CUDA fused kernel is defined
+// against: two grouped keep-quant GEMMs (gate, up) into f32 temporaries via the
+// SAME MatmulBTQuantGroupedKernel above, then the elementwise clamped-SwiGLU
+//   gate = min(g, limit); up = clamp(u, -limit, limit); out = gate·sigmoid(gate)·up
+// exactly matching QuantDotGemmGroupedFusedSwiGLUKernel (α=1, β=0). Because the
+// grouped GEMM already folds the weight FinalFactor into g/u, no extra scale is
+// applied here. limit=+inf → plain silu(g)·u (standard SwiGLU MLP).
+void MoeGateUpSwiGLUGroupedKernel(Queue& q, Tensor& out, const Tensor& act,
+                                  const Tensor& gate_w, const Tensor& up_w,
+                                  const Tensor& expert_ids, float limit) {
+  const int64_t P = out.shape[0];
+  const int64_t N = out.shape[1];
+  std::vector<float> g(static_cast<size_t>(P) * N);
+  std::vector<float> u(static_cast<size_t>(P) * N);
+  Tensor gt = Tensor::Contiguous(g.data(), DType::kF32, out.device, {P, N});
+  Tensor ut = Tensor::Contiguous(u.data(), DType::kF32, out.device, {P, N});
+  MatmulBTQuantGroupedKernel(q, gt, act, gate_w, expert_ids);
+  MatmulBTQuantGroupedKernel(q, ut, act, up_w, expert_ids);
+  float* o = static_cast<float*>(out.data);
+  for (size_t i = 0; i < g.size(); ++i) {
+    const float gate = std::fmin(g[i], limit);
+    const float up = std::fmin(std::fmax(u[i], -limit), limit);
+    o[i] = gate * (1.0F / (1.0F + std::exp(-gate))) * up;
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmulBTQuant, DeviceType::kCPU,
@@ -252,6 +280,9 @@ struct Registrar {
     RegisterOp(
         OpId::kMatmulBTQuantGrouped, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<MatmulBTQuantGroupedFn>(&MatmulBTQuantGroupedKernel)));
+    RegisterOp(OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<MoeGateUpSwiGLUGroupedFn>(&MoeGateUpSwiGLUGroupedKernel)));
   }
 };
 const Registrar registrar;

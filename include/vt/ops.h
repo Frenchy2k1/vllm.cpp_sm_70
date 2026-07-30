@@ -283,6 +283,17 @@ enum class OpId : uint8_t {
   // CopyWithScaleOp :241-252). Kept a SEPARATE op so every float-cache caller
   // stays byte-identical. Appended before kCount so no existing op's id shifts.
   kReshapeAndCacheFp8,
+  // SHARED fused routed-MoE gate+up+SwiGLU keep-quant epilogue. Promoted from the
+  // DeepSeek-V4-private MoeDeviceKernels::moe_gate_up_swiglu seam
+  // (deepseek_v4_device.h) into a first-class vt:: op so EVERY keep-quant MoE arch
+  // inherits the tuned single-launch kernel — the contraction-tier sibling of the
+  // grouped keep-quant GEMM kMatmulBTQuantGrouped. ONE launch computes, per
+  // (expert-slot p, mid-row j): gate=gate_w[e,j]·xq, up=up_w[e,j]·xq (shared Q8_K
+  // act, broadcast), then adown[p*N+j] = silu(min(gate,limit))·clamp(up,±limit) —
+  // gate/up never touch HBM. BIT-IDENTICAL to {2× kMatmulBTQuantGrouped +
+  // clamped-SwiGLU}; the CPU provider runs exactly that composite as the golden.
+  // Appended before kCount so no existing op's id shifts.
+  kMoeGateUpSwiGLUGrouped,
   kCount
 };
 
@@ -658,6 +669,12 @@ using MoeGroupedGemmBf16Fn =
 // expert_ids[P] i32 — weight row for (p,n) is expert_ids[p]*N + n.
 using MatmulBTQuantGroupedFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&);
+// kMoeGateUpSwiGLUGrouped: out[P,N] f32 adown, act[Pa,K] (Pa==1 broadcast),
+// gate_w/up_w[E*N,K] SAME block-quant dtype, expert_ids[P] i32, float limit. See
+// vt::MoeGateUpSwiGLUGrouped / OpId::kMoeGateUpSwiGLUGrouped.
+using MoeGateUpSwiGLUGroupedFn =
+    void (*)(Queue&, Tensor& /*out*/, const Tensor& /*act*/, const Tensor& /*gate_w*/,
+             const Tensor& /*up_w*/, const Tensor& /*expert_ids*/, float /*limit*/);
 // Marlin NVFP4 W4A16 grouped-MoE GEMM (lift of vLLM moe_wna16_marlin_gemm; see
 // MoeGroupedGemmNvfp4Marlin below). Scalar params travel in MoeMarlinArgs.
 struct MoeMarlinArgs {
@@ -895,6 +912,22 @@ void MatmulBTQuant(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 // occupancy). act f32/bf16, weight Q8_K-family block-quant, expert_ids i32.
 void MatmulBTQuantGrouped(Queue& q, Tensor& out, const Tensor& act,
                           const Tensor& weight, const Tensor& expert_ids);
+
+// vt::MoeGateUpSwiGLUGrouped — SHARED fused routed-MoE gate+up+SwiGLU keep-quant
+// epilogue (OpId::kMoeGateUpSwiGLUGrouped). out[P,N] f32 = per (p,j):
+//   gate = min(FinalFactor·(gate_w[e,j]·xq),  limit)
+//   up   = clamp(FinalFactor·(up_w[e,j]·xq), -limit, limit)
+//   out[p,j] = gate·sigmoid(gate)·up          (clamped SwiGLU, α=1, β=0)
+// where e = expert_ids[p] and xq is act[p] (or act[0] broadcast when Pa==1) quantized
+// to Q8_K ONCE. gate_w/up_w are the stacked [E*N,K] expert towers in the SAME CUDA
+// keep-quant dtype. The CUDA provider is one warp-per-(p,j) fused launch (gate/up stay
+// in registers). The CPU provider runs the BYTE-EXACT composite: two
+// vt::MatmulBTQuantGrouped (gate,up) + the clamped-SwiGLU elementwise — so it is the
+// golden the fused kernel is gated against. limit=+inf reduces to plain silu(gate)·up
+// (a standard SwiGLU MLP with no clamp). Promoted from DeepSeek-V4's private
+// MoeDeviceKernels::moe_gate_up_swiglu so any keep-quant MoE arch inherits it.
+void MoeGateUpSwiGLUGrouped(Queue& q, Tensor& out, const Tensor& act, const Tensor& gate_w,
+                            const Tensor& up_w, const Tensor& expert_ids, float limit);
 
 // --- Batched dense GEMM (MLA campaign W6) -----------------------------------
 // out[G,M,N] = a[G,M,K] @ b[G,K,N] — one independent row-major GEMM per batch

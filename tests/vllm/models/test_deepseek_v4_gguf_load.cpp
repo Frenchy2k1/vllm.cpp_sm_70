@@ -37,6 +37,7 @@
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
+#include "vt/merged_gemm.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
 
@@ -706,6 +707,157 @@ TEST_CASE("MatmulBTQuantGrouped: 1-row broadcast == replicated activation") {
   for (size_t i = 0; i < ob.size(); ++i)
     if (od[i] != ob[i]) any_diff = true;
   CHECK(any_diff);
+}
+
+// ── SHARED-OP promotion: kMoeGateUpSwiGLUGrouped == composite golden ──────────
+// The fused routed-MoE gate+up+SwiGLU op (promoted from DeepSeek's private
+// MoeDeviceKernels::moe_gate_up_swiglu to a first-class vt:: op) MUST be
+// BYTE-IDENTICAL to its Tier-0 composite: two vt::MatmulBTQuantGrouped (gate,up)
+// + the elementwise clamped-SwiGLU. RED-first: a different `limit` changes output.
+namespace {
+// The clamped-SwiGLU the fused kernel / CPU golden apply (α=1, β=0).
+float ClampedSwiGLU(float g, float u, float limit) {
+  const float gate = std::fmin(g, limit);
+  const float up = std::fmin(std::fmax(u, -limit), limit);
+  return gate * (1.0f / (1.0f + std::exp(-gate))) * up;
+}
+}  // namespace
+
+TEST_CASE("MoeGateUpSwiGLUGrouped: fused shared op == 2x grouped GEMM + clamped-SwiGLU") {
+  Dims d;
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  REQUIRE(w.has_gguf_weights);
+  const vllm::OwnedTensor& gate_exps = w.gguf.layers[0].moe_gate_exps;
+  const vllm::OwnedTensor& up_exps = w.gguf.layers[0].moe_up_exps;
+  REQUIRE(vt::IsBlockQuant(gate_exps.dtype));
+  REQUIRE(gate_exps.dtype == up_exps.dtype);
+  const int64_t N = d.mi, K = d.H, E = gate_exps.shape[0] / d.mi;
+  REQUIRE(E >= 3);
+
+  const int P = 3;
+  const std::vector<int32_t> eids = {2, 0, 1};
+  std::vector<float> x1(static_cast<size_t>(K));  // ONE shared hidden (broadcast)
+  for (size_t i = 0; i < x1.size(); ++i)
+    x1[i] = 0.017f * static_cast<float>((i * 5 + 1) % 17) - 0.11f;
+  const float limit = 10.0f;
+
+  auto make_a = [&]() {
+    return vt::Tensor::Contiguous(x1.data(), vt::DType::kF32, q.device, {1, K});
+  };
+  auto make_eid = [&](std::vector<int32_t>& ids) {
+    return vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+  };
+
+  // (A) fused shared op.
+  std::vector<float> ofused(static_cast<size_t>(P) * N);
+  {
+    std::vector<int32_t> ids = eids;
+    vt::Tensor a = make_a();
+    vt::Tensor o = vt::Tensor::Contiguous(ofused.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor eid = make_eid(ids);
+    vt::Tensor gw = gate_exps.View(), uw = up_exps.View();
+    vt::MoeGateUpSwiGLUGrouped(q, o, a, gw, uw, eid, limit);
+  }
+  // (B) explicit composite: gate GEMM + up GEMM + ClampedSwiGLU (the golden).
+  std::vector<float> gg(static_cast<size_t>(P) * N), uu(static_cast<size_t>(P) * N);
+  {
+    std::vector<int32_t> ids = eids;
+    vt::Tensor a = make_a();
+    vt::Tensor eid = make_eid(ids);
+    vt::Tensor gw = gate_exps.View(), uw = up_exps.View();
+    vt::Tensor og = vt::Tensor::Contiguous(gg.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor ou = vt::Tensor::Contiguous(uu.data(), vt::DType::kF32, q.device, {P, N});
+    vt::MatmulBTQuantGrouped(q, og, a, gw, eid);
+    vt::MatmulBTQuantGrouped(q, ou, a, uw, eid);
+  }
+  std::vector<float> ocomp(static_cast<size_t>(P) * N);
+  for (size_t i = 0; i < ocomp.size(); ++i) ocomp[i] = ClampedSwiGLU(gg[i], uu[i], limit);
+
+  REQUIRE(ofused.size() == ocomp.size());
+  for (size_t i = 0; i < ofused.size(); ++i) CHECK(ofused[i] == ocomp[i]);  // BYTE-IDENTICAL
+
+  // RED-first: a different clamp `limit` produces a DIFFERENT fused output (so the
+  // epilogue scalar is load-bearing, not incidentally equal).
+  std::vector<float> ofused2(static_cast<size_t>(P) * N);
+  {
+    std::vector<int32_t> ids = eids;
+    vt::Tensor a = make_a();
+    vt::Tensor o = vt::Tensor::Contiguous(ofused2.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor eid = make_eid(ids);
+    vt::Tensor gw = gate_exps.View(), uw = up_exps.View();
+    vt::MoeGateUpSwiGLUGrouped(q, o, a, gw, uw, eid, /*limit=*/0.05f);
+  }
+  bool any_diff = false;
+  for (size_t i = 0; i < ofused.size(); ++i)
+    if (ofused2[i] != ofused[i]) any_diff = true;
+  CHECK(any_diff);
+}
+
+// ── DECLARATIVE DESCRIPTOR: vt::MergedGemm(kKeepQuantGateUpSwiGLU) tiering ────
+// The merged-GEMM descriptor must realize BYTE-IDENTICALLY across its two tiers:
+// the fast op (force_composite=false) and the Tier-0 standalone-op composite
+// (force_composite=true). Both equal the manual gate+up GEMM + ClampedSwiGLU. This
+// is the "composite == fused, byte-identical" gate the promotion is judged on.
+TEST_CASE("MergedGemm descriptor: fast op == Tier-0 composite (byte-identical)") {
+  Dims d;
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  REQUIRE(w.has_gguf_weights);
+  const vllm::OwnedTensor& gate_exps = w.gguf.layers[0].moe_gate_exps;
+  const vllm::OwnedTensor& up_exps = w.gguf.layers[0].moe_up_exps;
+  const int64_t N = d.mi, K = d.H, E = gate_exps.shape[0] / d.mi;
+  REQUIRE(E >= 3);
+
+  // The realized descriptor names the promoted shared op as its fast_op.
+  REQUIRE(vt::kKeepQuantGateUpSwiGLU.arity == 2);
+  REQUIRE(vt::kKeepQuantGateUpSwiGLU.epilogue == vt::MergedEpilogue::kSiluMulClamp);
+  REQUIRE(vt::kKeepQuantGateUpSwiGLU.fast_op ==
+          static_cast<int>(vt::OpId::kMoeGateUpSwiGLUGrouped));
+
+  const int P = 3;
+  const std::vector<int32_t> eids = {1, 2, 0};
+  std::vector<float> x1(static_cast<size_t>(K));
+  for (size_t i = 0; i < x1.size(); ++i)
+    x1[i] = 0.021f * static_cast<float>((i * 3 + 2) % 13) - 0.09f;
+  const float limit = 10.0f;
+
+  auto run = [&](bool force_composite, std::vector<float>& out) {
+    std::vector<int32_t> ids = eids;
+    vt::Tensor a = vt::Tensor::Contiguous(x1.data(), vt::DType::kF32, q.device, {1, K});
+    vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor eid = vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+    vt::Tensor gw = gate_exps.View(), uw = up_exps.View();
+    vt::MergedGemm(q, vt::kKeepQuantGateUpSwiGLU, o, a, gw, uw, eid, limit, force_composite);
+  };
+  std::vector<float> ofast(static_cast<size_t>(P) * N), ocomp(static_cast<size_t>(P) * N);
+  run(/*force_composite=*/false, ofast);
+  run(/*force_composite=*/true, ocomp);
+  REQUIRE(ofast.size() == ocomp.size());
+  for (size_t i = 0; i < ofast.size(); ++i) CHECK(ofast[i] == ocomp[i]);  // BYTE-IDENTICAL
+
+  // And both equal the fully-manual standalone composite.
+  std::vector<float> gg(static_cast<size_t>(P) * N), uu(static_cast<size_t>(P) * N);
+  {
+    std::vector<int32_t> ids = eids;
+    vt::Tensor a = vt::Tensor::Contiguous(x1.data(), vt::DType::kF32, q.device, {1, K});
+    vt::Tensor eid = vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+    vt::Tensor gw = gate_exps.View(), uw = up_exps.View();
+    vt::Tensor og = vt::Tensor::Contiguous(gg.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor ou = vt::Tensor::Contiguous(uu.data(), vt::DType::kF32, q.device, {P, N});
+    vt::MatmulBTQuantGrouped(q, og, a, gw, eid);
+    vt::MatmulBTQuantGrouped(q, ou, a, uw, eid);
+  }
+  for (size_t i = 0; i < ofast.size(); ++i)
+    CHECK(ofast[i] == ClampedSwiGLU(gg[i], uu[i], limit));
 }
 
 // ── W2C: the load is MEMORY-BOUNDED — the ~1 TiB f32 tower is NOT built ────────
