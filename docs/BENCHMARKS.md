@@ -16,6 +16,18 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Laguna-S-2.1 (`LagunaForCausalLM`) W1/W2 structural bring-up (2026-07-30, `CLAIM-LAGUNA-W1W2`) - no throughput owed yet (gate PENDING W4)
+
+Structural-only increment: registry + config parse + GGUF name-map + forward
+composition scaffolding, CPU `-DVLLM_CPP_CUDA=OFF` Release `-Werror` clean;
+`test_laguna_scaffold` 3/3 (40 assertions) + `test_model_registry` 24/24. No
+model ran (the forward is a `VT_CHECK(false)` W3 stub; the 73 GB UD-Q4_K GGUF was
+NOT downloaded), so there are NO tok/s numbers yet. Speed benchmarks are owed at
+W5, after the W4 real-model dual-oracle correctness gate (llama.cpp-Q4_K
+token-exact + vLLM-NVFP4/-FP8 near-tie) lands on a fetched checkpoint. Q4_K keep-
+quant decode is already landed (ds4 path) so no new decode kernel is needed. See
+`.agents/specs/laguna-s21-w1w2-2026-07-30.md`.
+
 ## fusion-consistency gate-test repair (2026-07-30) - VOID (test-only, no throughput owed)
 
 A hardcoded `gemma2` expectation in the fusion-consistency mutation test, made

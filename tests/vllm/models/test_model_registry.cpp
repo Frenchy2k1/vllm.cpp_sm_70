@@ -44,7 +44,7 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  REQUIRE(registrations.size() == 28);
+  REQUIRE(registrations.size() == 29);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -132,7 +132,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 28);
+  REQUIRE(supported.size() == 29);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -152,6 +152,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
       "KimiK3ForConditionalGeneration",
+      "LagunaForCausalLM",
       "LlamaForCausalLM",
       "MiniCPM3ForCausalLM",
       "MiniCPMForCausalLM",
@@ -517,7 +518,7 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 28> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 29> kExampleConfigArchitectures{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "DeepseekV4ForCausalLM",
@@ -531,6 +532,7 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
       "KimiK3ForConditionalGeneration",
+      "LagunaForCausalLM",
       "LlamaForCausalLM",
       "MiniCPM3ForCausalLM",
       "MiniCPMForCausalLM",
@@ -621,7 +623,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'Gemma4ForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
-      "'KimiK3ForConditionalGeneration', 'LlamaForCausalLM', "
+      "'KimiK3ForConditionalGeneration', 'LagunaForCausalLM', "
+      "'LlamaForCausalLM', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
@@ -640,7 +643,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'Gemma4ForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
-      "'KimiK3ForConditionalGeneration', 'LlamaForCausalLM', "
+      "'KimiK3ForConditionalGeneration', 'LagunaForCausalLM', "
+      "'LlamaForCausalLM', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
