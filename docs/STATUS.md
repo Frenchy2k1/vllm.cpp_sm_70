@@ -135,6 +135,28 @@ grouped MoE) is Brick-8-refuted for fusion and Brick-2-deduped, so the plan
 mis-scoped it into Lever 1; realized +0.49 tok/s vs projected +2.3, so the ladder
 to 16.5 must be re-based. See docs/BENCHMARKS.md.
 
+**DeepSeek-V4-Flash decode ds4-gap — Lever 3 (route → warp-topk)** (2026-07-30,
+`CLAIM-DSV4-DECODE-LEVER3`, GB10 sm_121a, base `baff8a28`). `RouteWarpKernel`
+(`VT_V4_ROUTE_WARP_TOPK` default-ON) structure-ports ds4's `router_select_warp_topk`
+(`ds4_cuda.cu:10113`): the E=256/topk=6 expert top-k, previously ONE thread per token
+at T=1, now runs one WARP per token (8 experts/lane, per-lane argmax → `__shfl_xor`
+reduce → mask/repeat). **BIT-IDENTICAL** — argmax under a strict total order
+(value, tie-break lower index) is reduction-order-invariant, and the unbiased weight +
+our exact renorm run the same float ops in j-order; kept OUR arithmetic, not ds4's.
+Wired via a shared `RouteDispatch` into BOTH the eager forward AND the captured
+`V4Graph::Step` (nsys shows `RouteWarpKernel` in the graph body, 43 launches/step).
+**GATE B (bit-exact, RED-first):** `test_cuda_deepseek_v4` 20/20·67072 (new A/B case:
+warp == single-thread BYTE-IDENTICAL ids AND weights; deliberate perturbation goes RED),
+`test_cuda_quant_dot` 4/4·106081, `test_deepseek_v4_gguf_load` 15/15·931; real model
+warp-ON == legacy-OFF golden `11111 16 455 6102 294 8760 344 …` (TOKEN-EXACT).
+**Re-profile (nsys 30-step kwin):** route `RouteKernel` 5.9723 → `RouteWarpKernel`
+0.3779 ms/step (138.89 → 8.79 µs/launch, **−5.59 ms, 15.8×**, 4.7% → 0.5% GPU-active).
+**Honest realized-vs-projected:** the study's route magnitude (6.5 ms → <0.5 ms) was
+ACCURATE this time; −5.59 ms of ~81.6 ms/step = −6.9% GPU-active → GPU-active-bound
+~+0.7–0.8 tok/s (11.92 → ~12.7). Wall-clock tok/s NOT cleanly resolvable this session
+(no `sudo drop_caches`; churned-box page-cache variance swamps the ~0.7 tok/s delta).
+SHIPS default-on (bit-exact, real GPU-work win). See docs/BENCHMARKS.md.
+
 **ngram** (method `ngram`, draft-FREE) proposes the next tokens by matching the
 sequence's own suffix n-gram, so it needs no draft model and works on any model;
 on the 27B it is token-exact vs vLLM's own `--speculative-config ngram` on

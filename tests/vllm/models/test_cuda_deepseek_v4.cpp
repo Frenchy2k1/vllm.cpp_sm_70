@@ -22,6 +22,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "vt/backend.h"
@@ -327,6 +329,64 @@ TEST_CASE("W7-device sqrtsoftplus/hash router: CUDA ids BIT-EXACT, weights near-
     for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(got.topk_ids[i] == ref.topk_ids[i]);
     CHECK(RelL2(got.topk_weights, ref.topk_weights) < kTol);
   }
+}
+
+// ds4-gap Lever 3 / Brick 10 — the warp-parallel router top-k (RouteWarpKernel,
+// default-ON) must reproduce the single-thread RouteKernel BYTE-IDENTICALLY: same
+// expert ids (argmax under a strict total order, tie-break = lower expert index) AND
+// bit-exact weights (unbiased gather + renorm run the same float ops in j-order). The
+// A/B flips VT_V4_ROUTE_WARP_TOPK in-process. RED-first: any divergence in selection
+// order, tie-break, or weight arithmetic breaks the memcmp. Covers the DS4-realistic
+// E=256/topk=6 (full 8-per-lane path) + the small structural config + a non-32-multiple
+// E (invalid-lane guard).
+TEST_CASE("Lever 3 warp-topk router == single-thread RouteKernel BYTE-IDENTICAL (A/B)") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  struct Cfg { int64_t T, E, topk, vocab; };
+  const Cfg cfgs[] = {{5, 256, 6, 100}, {4, 8, 3, 12}, {3, 33, 5, 20}};
+  auto bytes_equal = [](const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() &&
+           std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+  };
+  for (const Cfg& c : cfgs) {
+    CAPTURE(c.E);
+    CAPTURE(c.topk);
+    const auto gating = Rand(r, c.T * c.E, -3.0f, 3.0f);
+    const auto bias = Rand(r, c.E, -0.3f, 0.3f);
+    // (a) learned biased top-k (selection biased, weights unbiased), renorm on.
+    {
+      setenv("VT_V4_ROUTE_WARP_TOPK", "0", 1);
+      const auto st = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
+                                              {}, c.vocab);
+      setenv("VT_V4_ROUTE_WARP_TOPK", "1", 1);
+      const auto wp = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
+                                              {}, c.vocab);
+      REQUIRE(wp.topk_ids.size() == st.topk_ids.size());
+      for (size_t i = 0; i < st.topk_ids.size(); ++i) CHECK(wp.topk_ids[i] == st.topk_ids[i]);
+      CHECK(bytes_equal(wp.topk_weights, st.topk_weights));  // BIT-EXACT, not near-tie
+    }
+    // (b) hash route (top-k bypass; weights gathered from UNBIASED scores).
+    {
+      std::vector<int64_t> in_tokens(static_cast<size_t>(c.T));
+      for (int64_t t = 0; t < c.T; ++t) in_tokens[static_cast<size_t>(t)] = t * 7 + 3;
+      std::vector<int32_t> tid2eid(static_cast<size_t>(c.vocab * c.topk));
+      for (int64_t tok = 0; tok < c.vocab; ++tok)
+        for (int64_t j = 0; j < c.topk; ++j)
+          tid2eid[static_cast<size_t>(tok * c.topk + j)] =
+              static_cast<int32_t>((tok * 5 + j) % c.E);
+      setenv("VT_V4_ROUTE_WARP_TOPK", "0", 1);
+      const auto st = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
+                                              in_tokens, tid2eid, c.vocab);
+      setenv("VT_V4_ROUTE_WARP_TOPK", "1", 1);
+      const auto wp = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
+                                              in_tokens, tid2eid, c.vocab);
+      for (size_t i = 0; i < st.topk_ids.size(); ++i) CHECK(wp.topk_ids[i] == st.topk_ids[i]);
+      CHECK(bytes_equal(wp.topk_weights, st.topk_weights));
+    }
+  }
+  unsetenv("VT_V4_ROUTE_WARP_TOPK");
 }
 
 // ===========================================================================

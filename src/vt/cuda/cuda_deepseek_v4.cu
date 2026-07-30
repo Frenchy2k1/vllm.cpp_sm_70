@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -617,6 +618,148 @@ __global__ void RouteKernel(const float* gating, int T, int E, int topk, const f
   for (int j = 0; j < topk; ++j) w[j] *= scale;
 }
 
+// A/B flag for the warp-parallel router top-k (ds4-gap Lever 3 / Brick 10). Default ON
+// (parity enabler ships as default); VT_V4_ROUTE_WARP_TOPK=0 forces the legacy
+// single-thread RouteKernel for baseline measurement + the bit-exact A/B gate. Read per
+// call so in-process CUDA tests can flip it. BIT-IDENTICAL either way (selection is an
+// argmax under a strict total order, weights + renorm run the same float ops in j-order).
+inline bool RouteWarpTopkOn(const char* v) { return !(v && v[0] == '0' && v[1] == '\0'); }
+
+// strict-> value compare; equal gating resolved by LOWER expert index (the exact tie-break
+// the single-thread RouteKernel encodes via `sfc[e] > bestv` with ascending e).
+__device__ __forceinline__ bool RouteScoreBetter(float av, unsigned ai, float bv, unsigned bi) {
+  return av > bv || (av == bv && ai < bi);
+}
+
+// Warp-parallel sqrtsoftplus + noaux_tc bias router — structure-port of ds4's
+// router_select_warp_topk_kernel (ds4_cuda.cu:10113). ONE WARP (32 lanes) per token; each
+// lane owns experts e = lane + j*32 (j<8 ⇒ E<=256). BIT-IDENTICAL to RouteKernel: the
+// selection is an argmax under RouteScoreBetter's strict total order so the tree-reduction
+// order is irrelevant to the winner; the unbiased weight is SqrtSoftplusDev(g[e]) (same
+// input, same fn ⇒ same bits) and the renorm (fmaxf(sum,1e-20); /denom; *scale) runs in the
+// same j-order on lane 0. Dynamic shared sprob[rows*E] mirrors ds4's sprob[4][256] for the
+// hash gather. Requires E<=256 && topk<=32 (else the launcher falls back to RouteKernel).
+__global__ void RouteWarpKernel(const float* gating, int T, int E, int topk, const float* bias,
+                                int has_bias, int is_hash, const int64_t* in_tokens,
+                                const int32_t* hashtab, int64_t vocab, int renorm, float scale,
+                                int32_t* ids_out, float* w_out) {
+  extern __shared__ float sprob[];  // [blockDim.y * E]
+  const unsigned lane = threadIdx.x;  // 0..31
+  const unsigned row = threadIdx.y;   // token within block (one warp per row)
+  const int t = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.y) +
+                static_cast<int>(row);
+  if (t >= T) return;
+  const float* g = &gating[static_cast<int64_t>(t) * E];
+  int32_t* ids = &ids_out[static_cast<int64_t>(t) * topk];
+  float* w = &w_out[static_cast<int64_t>(t) * topk];
+  float* srow = &sprob[static_cast<int64_t>(row) * E];
+
+  // Per-lane experts (<=8 for E<=256): local_score is the BIASED selection key; local_prob
+  // is the UNBIASED gathered weight. Invalid lanes (e>=E) hold -INF so they never win.
+  const int per = (E + 31) / 32;  // <= 8
+  float local_prob[8];
+  float local_score[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    local_prob[j] = 0.0f;
+    local_score[j] = -INFINITY;
+    if (j < per) {
+      const unsigned e = lane + static_cast<unsigned>(j) * 32u;
+      if (e < static_cast<unsigned>(E)) {
+        const float p = SqrtSoftplusDev(g[e]);
+        local_prob[j] = p;
+        local_score[j] = has_bias ? p + bias[e] : p;
+        srow[e] = p;
+      }
+    }
+  }
+  __syncwarp();
+
+  if (is_hash) {
+    if (lane == 0) {
+      int64_t tok = in_tokens[t] % vocab;
+      if (tok < 0) tok += vocab;
+      const int32_t* hrow = &hashtab[tok * topk];
+      for (int j = 0; j < topk; ++j) {
+        const int32_t e = hrow[j];
+        ids[j] = e;
+        w[j] = (e >= 0 && e < E) ? srow[e] : 0.0f;  // GATHER from UNBIASED scores
+      }
+    }
+  } else {
+    for (int k = 0; k < topk; ++k) {
+      float best_score = -INFINITY, best_prob = 0.0f;
+      unsigned best_idx = 0xFFFFFFFFu;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const unsigned e = lane + static_cast<unsigned>(j) * 32u;
+        if (RouteScoreBetter(local_score[j], e, best_score, best_idx)) {
+          best_score = local_score[j];
+          best_prob = local_prob[j];
+          best_idx = e;
+        }
+      }
+#pragma unroll
+      for (unsigned mask = 16u; mask > 0u; mask >>= 1u) {
+        const float os = __shfl_xor_sync(0xffffffffu, best_score, mask);
+        const float op = __shfl_xor_sync(0xffffffffu, best_prob, mask);
+        const unsigned oi = __shfl_xor_sync(0xffffffffu, best_idx, mask);
+        if (RouteScoreBetter(os, oi, best_score, best_idx)) {
+          best_score = os;
+          best_prob = op;
+          best_idx = oi;
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const unsigned e = lane + static_cast<unsigned>(j) * 32u;
+        if (e == best_idx) local_score[j] = -INFINITY;  // remove the winner for next k
+      }
+      if (lane == 0) {
+        ids[k] = static_cast<int32_t>(best_idx);
+        w[k] = best_prob;  // UNBIASED score of the selected expert
+      }
+    }
+  }
+  if (lane == 0) {
+    if (renorm) {
+      float sum = 0.0f;
+      for (int j = 0; j < topk; ++j) sum += w[j];
+      const float denom = fmaxf(sum, 1e-20f);
+      for (int j = 0; j < topk; ++j) w[j] /= denom;
+    }
+    for (int j = 0; j < topk; ++j) w[j] *= scale;
+  }
+}
+
+unsigned Grid(int64_t n, int block);  // fwd-decl (defined below); used by RouteDispatch
+
+// Shared launch helper: warp-topk (default) or legacy single-thread, both writing
+// ids_out[T*topk] (i32) + w_out[T*topk] (f32). Read the A/B env once per launch so eager
+// AND captured V4Graph::Step select the same kernel (no Brick-7 split-path trap). Falls
+// back to the single-thread kernel outside the structural gate (E>256 or topk>32).
+inline void RouteDispatch(cudaStream_t s, const float* gating, int T, int E, int topk,
+                          const float* bias, int has_bias, int is_hash,
+                          const int64_t* in_tokens, const int32_t* hashtab, int64_t vocab,
+                          int renorm, float scale, int32_t* ids_out, float* w_out) {
+  if (T <= 0) return;
+  const bool warp = RouteWarpTopkOn(std::getenv("VT_V4_ROUTE_WARP_TOPK")) && E <= 256 && topk <= 32;
+  if (warp) {
+    const unsigned rows = 4;  // 4 warps/block (ds4's sprob[4][256] layout)
+    const dim3 block(32, rows);
+    const unsigned grid = static_cast<unsigned>((static_cast<int64_t>(T) + rows - 1) / rows);
+    const unsigned shmem = rows * static_cast<unsigned>(E) * sizeof(float);
+    RouteWarpKernel<<<grid, block, shmem, s>>>(gating, T, E, topk, bias, has_bias, is_hash,
+                                               in_tokens, hashtab, vocab, renorm, scale, ids_out,
+                                               w_out);
+  } else {
+    const int block = 64;
+    RouteKernel<<<Grid(T, block), block, 0, s>>>(gating, T, E, topk, bias, has_bias, is_hash,
+                                                 in_tokens, hashtab, vocab, renorm, scale, ids_out,
+                                                 w_out);
+  }
+}
+
 // Clamped SwiGLU (activation.py:197-201). One thread per output channel.
 __global__ void ClampedSwiGLUKernel(const float* gate_up, int d, float limit, float alpha,
                                     float beta, float* out) {
@@ -911,12 +1054,11 @@ MoeRouteResult RouteLaunch(Queue& q, const std::vector<float>& gating, int64_t T
   out.topk_ids.assign(static_cast<size_t>(T * topk), 0);
   out.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
   Dev did(out.topk_ids.size() * sizeof(int32_t)), dw(out.topk_weights.size() * sizeof(float));
-  const int block = 64;
-  RouteKernel<<<Grid(T, block), block, 0, s>>>(
-      static_cast<const float*>(dg.p), static_cast<int>(T), static_cast<int>(E),
-      static_cast<int>(topk), static_cast<const float*>(dbias.p), has_bias ? 1 : 0,
-      is_hash ? 1 : 0, static_cast<const int64_t*>(dtok.p), static_cast<const int32_t*>(dhash.p),
-      vocab, renorm ? 1 : 0, scale, static_cast<int32_t*>(did.p), static_cast<float*>(dw.p));
+  RouteDispatch(s, static_cast<const float*>(dg.p), static_cast<int>(T), static_cast<int>(E),
+                static_cast<int>(topk), static_cast<const float*>(dbias.p), has_bias ? 1 : 0,
+                is_hash ? 1 : 0, static_cast<const int64_t*>(dtok.p),
+                static_cast<const int32_t*>(dhash.p), vocab, renorm ? 1 : 0, scale,
+                static_cast<int32_t*>(did.p), static_cast<float*>(dw.p));
   Download(out.topk_ids, did.p, s);
   Download(out.topk_weights, dw.p, s);
   Check(cudaStreamSynchronize(s), "sync route");
@@ -1007,11 +1149,9 @@ void RouteInPlaceLaunch(Queue& q, int32_t* topk_ids, float* topk_weights, const 
                         int64_t vocab, bool renorm, float scale) {
   if (T == 0) return;
   cudaStream_t s = AsStream(q);
-  const int block = 64;
-  RouteKernel<<<Grid(T, block), block, 0, s>>>(
-      gating, static_cast<int>(T), static_cast<int>(E), static_cast<int>(topk), bias,
-      has_bias ? 1 : 0, is_hash ? 1 : 0, in_tokens, hashtab, vocab, renorm ? 1 : 0, scale,
-      topk_ids, topk_weights);
+  RouteDispatch(s, gating, static_cast<int>(T), static_cast<int>(E), static_cast<int>(topk), bias,
+                has_bias ? 1 : 0, is_hash ? 1 : 0, in_tokens, hashtab, vocab, renorm ? 1 : 0,
+                scale, topk_ids, topk_weights);
   Check(cudaGetLastError(), "route_ip launch");
 }
 
