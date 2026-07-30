@@ -42,22 +42,22 @@ speed is only ever quoted against a reference measured in its own production con
 > The same model, the same prompts, side by side: **token-for-token identical output, and vllm.cpp
 > finishes first** ([full clip](benchmarks/media/concurrency_race.mp4)).
 
-Those are the goals. Here is where they actually stand, measured:
+Where that stands today:
 
 - **Small.** **66 MiB** of binary against a **9.1 GiB** vLLM install, both measured on the same GB10:
   about **140x less to deploy**, serving the same model in **24.88 GiB of peak host memory against
   vLLM's 28.18**. No interpreter in the process, and 0 bytes of bundled CUDA userspace.
-- **Fast.** On Qwen3.6-27B we are **faster than vLLM at all six concurrencies we measured**, against
-  its graphed production config: a **4.5% win at c1** and 0.7% to 1.7% across the rest (read the
-  noise band below before quoting the middle of that curve). Also **1.18x llama.cpp's prefill** on the
-  same GGUF file, and **ahead of MLX-LM on prefill** on Apple Silicon. Most other architectures are
-  correct but speed-pending, and every one of them says so.
+- **Fast.** On Qwen3.6-27B we beat vLLM at **all six concurrencies we measured**, against its graphed
+  production config: **4.5% at c1**, and 0.7% to 1.7% across the rest, which is close enough to our
+  noise band to call a tie. Also **1.18x llama.cpp's prefill** on the same GGUF file, and **ahead of
+  MLX-LM on prefill** on Apple Silicon. Most other architectures are correct but speed-pending, and
+  each one says so.
 - **Everything.** 25+ architectures, tool calling (36 parser families), structured output including
   GBNF, three speculative decoders, image and video and audio input, external KV offload, Prometheus
   metrics, and the SGLang knobs, all in a library you can `dlopen`.
-- **Grounded.** Correctness is not asserted, it is **gated token-for-token against a pinned vLLM
-  oracle**, and where vLLM's own greedy decode is non-deterministic at bf16 near-ties the gate says
-  so instead of quietly loosening.
+- **Grounded.** Every architecture is **gated token-for-token against a pinned vLLM oracle**, and
+  where vLLM's own greedy decode is non-deterministic at bf16 near-ties, the gate says so instead of
+  quietly loosening.
 
 ## Performance: faster than vLLM
 
@@ -71,20 +71,13 @@ point on this curve:
 | vLLM (tok/s) | 82.32 | 158.03 | 290.31 | 505.46 | 789.16 | 1076.25 |
 | **Ratio** | **1.045x** | **1.011x** | **1.007x** | **1.007x** | **1.016x** | **1.017x** |
 
-**So yes: we are faster than vLLM here, at all six concurrencies, on identical output.** That is the
-headline result of this project and we are not going to be coy about it. We keep it out of the
-one-line pitch at the top of this page for one reason: it is one model on one GPU, and a claim that
-broad deserves to be read with its scope and its error bars attached, which is the next paragraph.
+We are ahead at all six, but the margins in the middle are thin. Our run-to-run noise band is 0.5%,
+and c2 through c32 land between 0.7% and 1.7%, so treat those as ties. Only c1, at 4.5%, is clearly
+outside the noise. A tie is still a good result for a 66 MiB binary against a mature CUDA stack, and
+the tokens come out identical either way.
 
-**Read those ratios honestly.** This project gates on a measured run-to-run noise band of **0.5% for
-non-tail timing**, and the c2 through c32 margins (0.7% to 1.7%) sit close to it. So the fair reading
-of the middle of that curve is **a tie**, not a rout: the c1 win (4.5%) is the one comfortably outside
-noise. That is still the interesting result, because a tie is what a 66 MiB C++ binary is not supposed
-to manage against a mature CUDA stack, and because the output is identical while it happens. We would
-rather say "never behind" and show the band than round a coin flip up into a headline.
-
-Peak host memory is a clean win at **24.88 GiB against vLLM's 28.18 GiB**, and there is no Python
-stack behind it. That last part is not a footnote:
+Peak host memory is a clean win at **24.88 GiB against vLLM's 28.18 GiB**, with no Python stack behind
+it:
 
 ![What you install: a 9.1 GiB venv, or one 66 MiB binary](benchmarks/media/footprint.png)
 
@@ -98,10 +91,10 @@ And we hold every other engine to the same treatment: same model, same workload,
 | decode | 24.7 tok/s | 25.4 | 0.97x (tie) |
 | peak memory | 2.83 GiB | 2.80 GiB | 1.01x |
 
-The decode difference lands **inside llama.cpp's own run-to-run spread**, so the record calls it
-parity rather than a loss, and the memory difference is 30 MiB on a 2.8 GiB working set. The prefill
-win is the one real gap. The generated tokens are **byte-identical to llama.cpp's greedy decode**.
-Single-stream only: no concurrent-serving comparison against llama.cpp's server has been measured yet.
+Decode lands inside llama.cpp's own run-to-run spread, so that row is a tie, and the memory difference
+is 30 MiB on a 2.8 GiB working set. Prefill is the only axis with a real gap, and it goes our way. The
+tokens are **byte-identical to llama.cpp's greedy decode**. Single-stream only: we have not measured
+concurrent serving against llama.cpp's server.
 
 ### vs MLX-LM, on Apple M4, warm b=1
 
@@ -111,9 +104,9 @@ Single-stream only: no concurrent-serving comparison against llama.cpp's server 
 | decode | 27.23 tok/s | 27.85 | 97.8% |
 | warm total | 24.37 tok/s | 24.96 | **97.6%** |
 
-Here the remaining 2.4% is **real, not noise**, and we will not dress it up: over 6 interleaved runs
-our spread was 0.12% and MLX-LM's 0.34%, so a 2.4% deficit is well outside both. It sits entirely in
-decode (0.81 ms/token), it is understood, and prefill is genuinely ahead.
+That 2.4% is a real gap, not run-to-run noise: across 6 interleaved runs our spread was 0.12% and
+MLX-LM's 0.34%. All of it sits in decode, 0.81 ms per token, and we know where it goes. Prefill is
+ahead.
 
 Under the hood on Metal: our GEMM runs at **97% of MLX's own** (3.91 TFLOP/s mma issue rate), the
 decode GEMV streams weights at **83% of the part's memory-bandwidth peak**, and moving prefill
@@ -124,8 +117,8 @@ shape-gated to prefill (95.9% on the default build).
 ### Speculative decoding
 
 MTP is **token-identical to vLLM's MTP and about 4% faster** at c1 on Qwen3.6-27B-NVFP4, on both gate
-models end to end. Block-diffusion DFlash runs about 2x over spec-off but sits below vLLM's
-throughput, which is recorded as an open bf16-acceptance floor rather than smoothed over.
+models end to end. Block-diffusion DFlash runs about 2x over spec-off but stays below vLLM's
+throughput. That gap is an open bf16 acceptance floor, tracked in the benchmark record.
 
 Full per-axis grids, memory tables, the nine residual axes, and exact reproduction recipes:
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The two figures above are rendered from these measured
@@ -373,10 +366,10 @@ the features the community keeps asking for, and none of the Python.** Where ano
 solved something better, we port from it and cite the file we ported from rather than inventing our
 own version.
 
-The reason to trust any of that is the gate, not the pitch. A new architecture is not "done" here
-when it produces plausible text; it is done when it emits **the same tokens as vLLM**, and it is not
-"fast" until it is measured against the reference in that reference's own production configuration.
-When we fall short, the number stays in the README and the label says *speed-pending*.
+What makes that checkable is the gate. A new architecture is not "done" here when it produces
+plausible text; it is done when it emits **the same tokens as vLLM**, and it is not "fast" until it is
+measured against the reference in that reference's own production configuration. When we fall short,
+the number stays in the README and the label says *speed-pending*.
 
 ## Documentation
 
@@ -399,9 +392,9 @@ portfolio-completion plan is
 
 ## Credits, and what we borrow
 
-vllm.cpp exists because other people built excellent engines first. Our house rule is that every
-implementation is grounded in upstream source and cites the file it was ported from, so this is not a
-courtesy list, it is where the work comes from:
+vllm.cpp exists because other people built excellent engines first. Every implementation here is
+grounded in upstream source and cites the file it was ported from, so this is where the work comes
+from:
 
 - **[vLLM](https://github.com/vllm-project/vllm)** is the reference this project is measured against
   and the origin of the serving core: continuous batching, block-paged KV, the V1 scheduler, sampling
@@ -421,9 +414,8 @@ courtesy list, it is where the work comes from:
 
 **A note on ggml:** vllm.cpp does not use ggml. It reads GGUF and follows llama.cpp's C ABI style, but
 tensors, kernels, and dispatch are its own portable `vt::` runtime
-([`include/vt/`](include/vt/)) with no ggml or PyTorch dependency at any point. That is an
-implementation fact and not a criticism: ggml is a superb piece of engineering, and llama.cpp built the
-ecosystem this project plugs into.
+([`include/vt/`](include/vt/)) with no ggml or PyTorch dependency at any point. ggml is a superb piece of engineering and llama.cpp
+built the ecosystem this project plugs into; we needed a different tensor layer, that is all.
 
 ## Citation
 
