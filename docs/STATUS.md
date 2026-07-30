@@ -1660,3 +1660,5 @@ so 49750's residual-stride relaxation is a multi-backend structural change with 
 current strided-residual caller, and 48391 depends on the `vllm_is_batch_invariant`
 determinism subsystem we do not carry — neither is a clean 1:1 mirror. No code
 landed; the queue + records were refreshed. Parity pin UNCHANGED at `555967922`.
+
+**Best-GEMM-path research (2026-07-30):** `.agents/specs/best-gemm-path-2026-07-30.md` — best-in-class GEMM path per regime (fp8/full-tensor/low-bit × decode/prefill) across vLLM+SGLang+ds4+llama.cpp + FusedChain-mapping verdict. Two actionable findings: (1) **fp16 dense inputs THROW** (`cuda_matmul.cu:220-227`) — a breadth gap, one-branch cuBLASLt fix; (2) **nvfp4 W4A4 M=1 decode is mis-routed to the prefill tensor-core tactic on our production 27B/35B gate models** — a real decode perf hole, dp4a-matvec fix. `Fp4GemmSm120` confirmed LIVE (not dormant). No behavior change (research/spec only).
