@@ -99,6 +99,45 @@ TEST_CASE("linear_method: gate_up factory selects scheme by weight presence") {
   CHECK(std::string(g_fp4->Name()) == "compressed-tensors-nvfp4-w4a16-gate-up");
 }
 
+// Tier-A1 fold REUSE PROOF (arch-fusion-fold-plan-2026-07-30 §A1): the SHARED bf16
+// gate-up MLP seam (UnquantizedMlpGateUpMethod::Apply) must produce a BYTE-IDENTICAL
+// result to the standalone {ResidentWeight; MatmulBT[2I,H]; SiluAndMul} sequence the
+// five folded arch MLP blocks (OLMo-2 / Granite / StableLM / qwen3_dflash /
+// deepseek_v2) hand-rolled before the fold. Same ops, same order, same device ⇒ the
+// comparison is EXACT (raw bf16 bytes), not Approx. This is the CPU composite-golden
+// backing the two archs (dflash, deepseek_v2) whose checkpoints are not always on the
+// gate box; the three with SACRED goldens (OLMo-2/Granite/StableLM) are additionally
+// gated token-exact on dgx.
+TEST_CASE("linear_method: fused gate-up seam == standalone MatmulBT+SiluAndMul (byte-exact)") {
+  const int64_t M = 3, H = 8, I = 5;
+  OwnedTensor gate_up = MakeBf16({2 * I, H}, 11);  // merged [2I, H] raw-NK
+  OwnedTensor xw = MakeBf16({M, H}, 13);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCPU);
+  vllm::dense_attn::Dev d{b, q};
+  vllm::dense_attn::DBuf x(d, DType::kBF16, {M, H}, xw.bytes.data());
+
+  // (A) SHARED seam: pick the bf16 arm via the factory (no fp4 present), Apply.
+  auto method = layers::MakeMlpGateUpMethod(gate_up, Nvfp4Weight{}, Nvfp4Weight{}, I);
+  REQUIRE(std::string(method->Name()) == "bf16-gate-up");
+  vllm::dense_attn::DBuf act_fused = method->Apply(d, x.t());
+
+  // (B) STANDALONE reference: the exact op sequence the arch MLP blocks ran.
+  vt::Tensor wgu = vllm::dense_attn::ResidentWeight(d, gate_up);  // [2I, H]
+  vllm::dense_attn::DBuf gu(d, DType::kBF16, {M, 2 * I});
+  vt::MatmulBT(d.q, gu.t(), x.t(), wgu);
+  vllm::dense_attn::DBuf act_ref(d, DType::kBF16, {M, I});
+  vt::SiluAndMul(d.q, act_ref.t(), gu.t());
+
+  std::vector<uint16_t> got(static_cast<size_t>(M) * I);
+  std::vector<uint16_t> ref(static_cast<size_t>(M) * I);
+  act_fused.Download(d, got.data());
+  act_ref.Download(d, ref.data());
+  for (size_t i = 0; i < got.size(); ++i)
+    CHECK(got[i] == ref[i]);  // BYTE-IDENTICAL — the fold changes nothing numerically
+}
+
 TEST_CASE("linear_method: bf16 UnquantizedLinearMethod apply == reference MatmulBT") {
   const int64_t M = 2, K = 16, N = 4;
   OwnedTensor w = MakeBf16({N, K}, 7);  // raw-NK [N=out, K=in]

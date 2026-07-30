@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // shared device glue (Dev/DBuf/...)
 #include "vllm/model_executor/models/device_pool.h"       // DevicePool/Pool
 #include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
@@ -57,11 +58,12 @@ DBuf Olmo2MlpBlock(Dev d, const Olmo2MlpWeights& w, const HfConfig& cfg,
                    const Tensor& h, int64_t T) {
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
-  Tensor wgu = ResidentWeight(d, w.gate_up_proj);  // [2I, H]
-  DBuf gate_up(d, DType::kBF16, {T, 2 * I});
-  vt::MatmulBT(d.q, gate_up.t(), h, wgu);
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::SiluAndMul(d.q, act.t(), gate_up.t());  // [T,2I] -> [T,I]
+  // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
+  // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
+  // inline path ran — folds OLMo-2 onto the qwen3.cpp MlpBlock exemplar so it
+  // inherits the nvfp4 GateUpFusedMarlinD arm for free once a quantized
+  // checkpoint ships. (Tier-A1 fold, arch-fusion-fold-plan-2026-07-30.)
+  DBuf act = layers::UnquantizedMlpGateUpMethod(&w.gate_up_proj, I).Apply(d, h);
   Tensor wd = ResidentWeight(d, w.down_proj);  // [H, I]
   DBuf out(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, out.t(), act.t(), wd);
