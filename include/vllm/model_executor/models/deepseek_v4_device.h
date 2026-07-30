@@ -127,6 +127,13 @@ struct DsaDeviceKernels {
   // above (same block reduction; a shared weight w[n] applies to every row when has_w).
   void (*rms_norm_rows)(vt::Queue&, float* out, const float* x, const float* w, int64_t rows,
                         int64_t n, float eps, bool has_w);
+  // Brick D step 2 — GRAPH decode attention (T=1, capturable): reads the KV length
+  // from the DEVICE buffer `len_dev` (so ONE captured graph serves every step) and
+  // attends `cache[0..len)` + the current token's key `deck_new` (index len), FIXED
+  // shmem (max_cap keys). Bit-identical to decode_attn (same key set + order).
+  void (*decode_attn_g)(vt::Queue&, float* o, const float* q, const float* cache,
+                        const float* deck_new, const float* sink, int64_t nh, int64_t hd,
+                        const int* len_dev, int64_t max_cap, float scale, bool no_sink);
 };
 
 // ── (3) Compressor family device kernels ──────────────────────────────────────

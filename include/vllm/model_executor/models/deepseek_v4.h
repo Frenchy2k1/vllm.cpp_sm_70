@@ -34,6 +34,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -351,10 +352,16 @@ struct DeepseekV4KvCache {
   std::vector<std::vector<float>> deck;  // [layer] -> flat [len * head_dim]
   int64_t len = 0;                       // cached token count (same for all layers)
   int64_t head_dim = 0;
+  // Brick D: opaque persistent decode-CUDA-graph state (the fixed-capacity KV +
+  // persistent scratch + captured graph), lazily built on the first graphed decode
+  // step and reused across steps. void so this public header stays decoupled from
+  // the CUDA-only graph type; the deleter (set in deepseek_v4.cpp) frees it.
+  std::shared_ptr<void> decode_graph;
   void Reset(int64_t num_layers, int64_t head_dim_) {
     deck.assign(static_cast<size_t>(num_layers), {});
     len = 0;
     head_dim = head_dim_;
+    decode_graph.reset();
   }
 };
 
