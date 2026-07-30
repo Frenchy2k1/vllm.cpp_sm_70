@@ -16,6 +16,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits, Qwen3_5Model
 #include "vllm/model_executor/models/qwen3_5_common.h"  // kQwen3_5Info, helpers
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "qwen3_5_internal.h"  // W4 DeviceTokenIdsScope
 #include "vllm/model_executor/models/qwen3_5_mtp.h"  // SPEC-MTP I5d-pre draft
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) memory-model seam
@@ -90,6 +91,11 @@ ForwardLogits ForwardQwen3_5Moe(LoadedModel& model,
                                 const ModelForwardInput& input) {
   auto& qwen = static_cast<Qwen3_5MoeLoadedModel&>(model);
   const Qwen3_5MoeWeights& weights = qwen.weights();
+
+  // ENG-ASYNC-SCHED W4 (see qwen3_5_dense.cpp): scope the async runner's
+  // device-resident input ids to this forward so the embed reads them.
+  const detail::DeviceTokenIdsScope device_ids_scope(
+      input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
 
   // SPEC-MTP I5d-pre hidden-state tap (see qwen3_5_dense.cpp). Non-null routes to
   // the EXISTING ForwardDeviceTap (byte-identical logits + the [T,H] post-norm

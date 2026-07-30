@@ -37,7 +37,7 @@ token-for-token correctness against the pinned oracle.
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete, at/above vLLM speed | Token-exact greedy on GB10; beats vLLM 0.25.0 total throughput at every concurrency (1.007-1.045x), effective parity 115/124 axes |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete, decode at-parity, prefill speed-pending | Token-exact greedy; decode at or beyond vLLM, remaining gap is prefill TTFT |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual |
-| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical; direct loading cuts peak/stable host PSS by 72.0%/91.2%. The pre-transplant H32 AOT, decode-graph and ratio-4 FA2 result reached 0.9864x vLLM 0.25.0; the current-main development branch is pending revalidation |
+| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical, and token-identical to the previous series; direct loading cuts peak/stable host PSS by 73.4%/91.1% and mean TTFT by 12.7%. Against an oracle built at the actual parity pin: 0.9970x total throughput, TTFT passes (0.773x), TPOT 12.4% high; re-validated unchanged (0.9972x / 1.1247x) after rebasing onto 139 upstream commits. The failing axis is the discrete-GPU async-overlap gap, scoped as ENG-ASYNC-SCHED W4 |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM |
 | Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
@@ -1082,20 +1082,79 @@ The remaining recent-dense families are the trivial tail only: **Yi**
 (`YiForCausalLM`, a Llama alias) and **InternLM3** (`InternLM3ForCausalLM`,
 InternLM2 plus a sliding window).
 
+## Build and test lanes
+
+Measured against an oracle built from source at the ACTUAL parity pin, the gap
+is 0.9970x total throughput, not the 0.9819x published against the older
+pip-installed 0.24.0 release: that release is 1.25% faster than the pin, so
+the old denominator was understating us. TPOT (+12.4%) is the one real gap.
+Re-validated 2026-07-29 after rebasing onto 139 upstream commits: 0.9972x /
+TPOT 1.1247x, every axis inside noise and token-identical to the prior series.
+
+One open lead is on record from the same profiling pass: cuBLASLt resolves
+Ampere-class GEMM kernels on this Blackwell device. It is unmeasured and may be
+a non-issue, since it lands on the axis we already pass.
+
+Device-specific references in the device-agnostic layer stay at their ratchet
+floor: capability questions ("is memory unified?") rather than device-type
+tests.
+
+Benchmark provenance is gated as well as measured: both the comparison and the
+same-binary A/B harness refuse to start a leg on a GPU that is not idle, after
+a cooldown rather than before it.
+
+Alongside the default build, `-DVLLM_CPP_SANITIZE=address,undefined` and
+`-DVLLM_CPP_SANITIZE=thread` build the CPU tier under the dynamic detectors, and
+CI runs both as separate jobs. Verified end to end: the ASan+UBSan lane builds
+and passes `test_input_batch`, `test_combine_tokens` and `test_arena` with leak
+detection on. The lanes keep the warnings but drop `-Werror`, because sanitizer
+instrumentation makes GCC's range and initialization analyses fire inside
+libstdc++ on correct code; the plain build is the one that enforces `-Werror`. The lane refuses to configure with the CUDA
+backend on, because a host sanitizer runtime does not instrument nvcc device
+translation units and reports false positives against the CUDA driver; the CUDA
+tier's equivalent is `compute-sanitizer`, and `VT_POOL_BYPASS=1` makes the device
+scratch pool hand out exact-size, really-freed allocations so that tool can see
+tensor boundaries and use-after-free the caching pool otherwise hides.
+
+Known failing on discrete sm_120 (RTX 5070 Ti), pre-existing and not introduced
+by the lanes: `test_cuda_ops` "CUDA matmul (cuBLASLt) matches CPU on odd sizes"
+fails 11 of 442 elements on the bf16-in/bf16-out 17x31x13 case. Verified present
+on a pristine build of the same commit. The project's development GPU is GB10 /
+sm_121a, so this is an unattributed per-architecture numerics difference, not a
+regression.
+
 ## Performance detail
 
-**Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** the measured
-pre-transplant repair on an RTX 5070 Ti reached 5769.99 total tok/s versus vLLM
-0.25.0 at 5849.80 tok/s (0.9864x) on the identical 128-request workload. Direct
-loading reduced peak PSS from 8.59 to 2.41 GiB and stable PSS from 8.59 to 0.76
-GiB. Mean TPOT/ITL was 43.72 ms versus vLLM's 38.55 ms. Profiling attributes the
-residual to the discrete-CUDA sampled-token D2H path synchronizing the main
-stream instead of retaining vLLM's event-overlapped device mapping. The repair
-has since been transplanted onto current `main`; that development branch is
-pending the same-series revalidation, so these numbers do not yet bind to it.
+**Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** revalidated on
+current `main` (`7f620e74`) on an RTX 5070 Ti at 6600.66 total tok/s versus vLLM
+0.24.0 at 6722.24 tok/s (0.9819x) on the identical 128-request workload. Direct
+loading reduces peak PSS from 8.59 to 2.28 GiB, stable PSS from 8.59 to 0.76
+GiB, and mean TTFT from 835.0 to 729.2 ms. Mean TPOT/ITL is 38.22 ms versus
+vLLM's 33.53 ms. Every token matches the previous series exactly (128/128 per
+repetition, both arms), so the 109-commit upstream advance moved no output here.
+
+The failing TPOT axis has a corrected diagnosis as of the W4 work below: the
+per-step synchronization it was blamed on is the synchronous engine loop
+waiting for its own sampling, about one per step, not a removable defect in
+the async sampler. Closing it means running the async engine loop, which is
+what the (opt-in) device-resident sampled-token mirror now makes legal on a
+discrete GPU; the measurement that would bind it is a serving A/B and is
+pending a harness this host can run.
+
+Two things to know about the numbers. First, the earlier 5769.99 tok/s figure is
+VOID, not superseded by an improvement: that whole series ran against a GPU held
+at 11-13% utilization by a graphics consumer the harness's idle check could not
+see, and both arms gained ~14% once measured on a genuinely idle box. The check
+now fails on non-idle utilization. Second, the residual is a specific missing
+mechanism rather than a diffuse gap: this GPU is discrete, so the async-scheduling
+device combine/scatter falls back to a host path that must synchronize the main
+stream for the sampled ids, and the depth-2 scheduler therefore has nothing to
+overlap. Upstream keeps that state GPU-resident unconditionally. Scoped as
+ENG-ASYNC-SCHED W4.
+
 This local 4B diagnostic does not establish 27B/35B support. Exact evidence and
 reproduction:
-[Qwen3.5-4B main repair](bench-evidence/qwen35-4b-main-repair-20260725.md).
+[Qwen3.5-4B post-pull revalidation](bench-evidence/qwen35-4b-postpull-20260727.md).
 
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).

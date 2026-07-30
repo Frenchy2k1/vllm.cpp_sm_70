@@ -336,6 +336,16 @@ int64_t detail::ValidateGdnStateCacheLayout(
   return state_slots;
 }
 
+// ENG-ASYNC-SCHED W4 (see qwen3_5_internal.h for why this is a scoped override
+// rather than a parameter on five entry points). Thread-local: one host thread
+// drives a forward, and a serving process may drive independent engines from
+// different threads, so a process-global would let one engine's device ids leak
+// into another's embed.
+detail::DeviceTokenIds& detail::DeviceTokenIdsOverride() {
+  thread_local DeviceTokenIds ids;
+  return ids;
+}
+
 vt::DType detail::ResolveMambaSsmCacheDType(const HfConfig& config,
                                             vt::DType conv_dtype) {
   const std::string& dtype = config.mamba_ssm_dtype;
@@ -5739,6 +5749,35 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   return r;
 }
 
+// ENG-ASYNC-SCHED W4: overwrite the REAL prefix of a freshly uploaded input-id
+// buffer with the device-resident ids the async runner's combine produced.
+//
+// Why patch a prefix instead of embedding straight from the runner's buffer: the
+// decode-graph path does not embed `token_ids` as given — it embeds a version
+// PADDED up to the captured batch size, whose first B rows are the real requests
+// and whose tail is inert. So the correct operation is "replace the first
+// ov.count rows", which is exactly right for the padded case AND degenerates to
+// "replace everything" on the eager path where ov.count == T. The stale host
+// upload that precedes it is a handful of int32s and its real rows are
+// immediately overwritten.
+//
+// The override is CONSUMED here. A forward can reach a second, unrelated embed
+// (the multimodal helper embeds a prompt and then single tokens); consuming on
+// first use means those cannot be handed ids that were never meant for them.
+// The first embed in a registry forward is always the step's own.
+static void ApplyDeviceTokenIdsOverride(Dev d, DBuf& dids, int64_t T) {
+  const detail::DeviceTokenIds ov = detail::DeviceTokenIdsOverride();
+  if (ov.ids == nullptr) return;
+  detail::DeviceTokenIdsOverride() = detail::DeviceTokenIds{};
+  // A device buffer LONGER than the embed's input would run past the end. That
+  // can only mean the runner and the model disagree about this step's shape, so
+  // fail loudly rather than corrupt the embedding.
+  VT_CHECK(ov.count <= T,
+           "qwen3_5 embed: device input ids longer than the embed input");
+  d.b.Copy(d.q, dids.ptr(), ov.ids,
+           static_cast<size_t>(ov.count) * sizeof(int32_t));
+}
+
 // Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table).
 // KEPT OUTSIDE THE CUDA-GRAPH (M2.5 Phase 2): the CUDA Embedding op allocates a
 // device bounds-check flag (cudaMalloc/cudaFree) and syncs the stream, all of
@@ -5751,7 +5790,14 @@ static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
   Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  // ENG-ASYNC-SCHED W4: when the async runner has already placed this step's
+  // input ids on the device (and spliced each decode row's sampled token into
+  // them there), embed straight from that buffer. `token_ids` is stale for
+  // decode rows in that case BY DESIGN — materializing it on the host is the
+  // synchronize W4 removes — so it must not be uploaded here. Its SIZE is still
+  // authoritative: the runner sized the device buffer from the same step.
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
+  ApplyDeviceTokenIdsOverride(d, dids, T);
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 }
 
@@ -6544,6 +6590,7 @@ static void DenseEmbedInto(Dev d, DBuf& hidden,
   const int64_t vocab = config.vocab_size;
   Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
+  ApplyDeviceTokenIdsOverride(d, dids, T);
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 }
 

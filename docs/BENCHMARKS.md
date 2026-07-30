@@ -5766,42 +5766,190 @@ The local Qwen3.5-4B checkpoint corpus is exactly
 `/tmp/qwen35-4b-sharegpt-1024.json`, SHA-256
 `9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`.
 
-### Local Qwen3.5-4B direct-load checkpoint, 2026-07-25
+### Local Qwen3.5-4B direct-load checkpoint, 2026-07-27 (revalidated on `main` @ `7f620e74`)
 
-**GATING / speed-pending; current-main transplant revalidation PENDING.** The
-measurements below bind the original repair commit `8964bde7` based on
-`72f9fb13`, not its current-main transplant `c317237a` based on `c39d78a6`.
-That path includes the exact H32 Triton-AOT recurrence, plain-BF16 decode graph
-capture/replay and ratio-4 FA2 split-KV decode. On the corpus above at
-concurrency 32, 128 output tokens/request and three repetitions, direct
-ON/OFF/vLLM-0.25 means were:
+**GATING / speed-pending.** This SUPERSEDES the 2026-07-25 entry and discharges
+the revalidation it recorded as pending; the transplant's commits are now
+upstream, so the measured tree is plain current `main`. Corpus above,
+concurrency 32, 128 output tokens/request, three repetitions per arm, one
+`flock /tmp/gpu` across all 18 legs, oracle **vLLM 0.24.0** (the local venv's
+own recorded version; the previous entry's "0.25.0" label was wrong).
 
-| Axis | Direct ON | Direct OFF | vLLM 0.25 stable confirmation | Disposition |
+| Axis | Direct ON | Direct OFF | vLLM 0.24.0 | Disposition |
 |---|---:|---:|---:|---|
-| Total throughput (tok/s) | 5769.99 | 5660.70 | 5849.80 | FAIL, 0.9864x |
-| Output throughput (tok/s) | 638.03 | 625.94 | 646.85 | FAIL, 0.9864x |
-| Requests/s | 4.9867 | 4.8900 | 5.0536 | FAIL, 0.9868x |
-| Mean TTFT (ms) | 834.91 | 943.43 | 1047.13 | PASS |
-| Mean TPOT/ITL (ms) | 43.72 | 43.84 | 38.55 | FAIL |
-| Peak PSS (GiB) | 2.406 | 8.592 | 7.662 | PASS |
-| Stable PSS (GiB) | 0.759 | 8.589 | 4.029 | PASS |
-| Peak VRAM (MiB) | 12850.7 | 12843.3 | 12942.7 | PASS vs vLLM and within +8 MiB vs OFF |
+| Total throughput (tok/s) | 6600.66 | 6481.34 | 6722.24 | FAIL, 0.9819x |
+| Output throughput (tok/s) | 729.88 | 716.69 | 743.33 | FAIL, 0.9819x |
+| Requests/s | 5.700 | 5.600 | 5.807 | FAIL, 0.9815x |
+| Mean TTFT (ms) | 729.24 | 835.01 | 913.55 | PASS, 20.2% lower |
+| Mean TPOT/ITL (ms) | 38.22 | 38.21 | 33.53 | FAIL, 14.0% higher |
+| Peak PSS (GiB) | 2.282 | 8.594 | 7.666 | PASS |
+| Stable PSS (GiB) | 0.761 | 8.591 | 4.039 | PASS |
+| Peak VRAM (MiB) | 12850.0 | 12846.0 | 12933.3 | PASS vs vLLM and within +4 MiB vs OFF |
 
-Direct ON and OFF are output-identical for 128/128 requests in every pair.
-Same-binary component gains are H32 AOT **+4.5906%**, decode graph
-**+0.3873%**, and ratio-4 FA2 **+1.6004%**. The final attribution-complete
-node trace contains 453 graph launches and 200,972 graph-child kernels; local
-FA2 averages 180.28 us/call versus vLLM's 178.40 us/call. CUDA API attribution
-finds the residual: 497 sampled-ID D2H synchronizations consume 20.975 s
-(42.20 ms/call) because the discrete path updates host request rows
-immediately; vLLM defers the equivalent wait through events. Root, hashes,
-exact commands and the stable-denominator rationale:
+Every generated token is IDENTICAL to the 2026-07-25 run, 128/128 requests per
+repetition in both arms, so 109 upstream commits moved no token here. Our arm is
+deterministic rep-to-rep and ON==OFF 128/128; the oracle is not self-deterministic
+(102/128 on one pair). Spread is 0.13% (ours) and 0.17% (vLLM) across
+repetitions, so the ratios are not noise.
+
+**The 2026-07-25 absolute numbers are VOID: that series was contended.** All
+nine of its performance legs ran with the GPU at 11-13% utilization and 611 MiB
+of extra resident VRAM; today's nine ran at 0%. Both arms gained ~14% on the
+idle box, which is exactly why the ratio barely moved (0.9864x -> 0.9819x). The
+cause was a harness hole - `prepare_leg` gated idleness on
+`--query-compute-apps`, which cannot see a GRAPHICS consumer - now closed by an
+explicit `utilization.gpu` check (`GPU_IDLE_UTIL_MAX`, default 2%), carried by
+the new same-binary A/B harness `tools/bench/run_qwen35_4b_ab.sh` too - where
+running it promptly proved the gate works, refusing an arm at 14% because that
+harness sampled idleness BEFORE its inter-leg cooldown and so read the previous
+leg still draining; the cooldown now precedes the snapshot. The prior
+entry's RATIOS, its same-binary component attributions (H32 AOT **+4.5906%**,
+decode graph **+0.3873%**, ratio-4 FA2 **+1.6004%**) and its profiling
+attribution survive, because each was internal to one uniformly-contended series.
+
+The residual is unchanged and now specified. TPOT fails because this GPU is
+DISCRETE: `is_integrated_gpu()` is false, so both ENG-ASYNC-SCHED W3 device call
+sites take their host fallback and `sample_tokens_async` must synchronize the
+main stream (497 syncs, 20.975 s, 42.20 ms/call in the node-mode trace). The
+async scheduler IS engaged (`max_concurrent_batches=2`), so depth-2 currently
+buys nothing here. Upstream keeps `last_sampled_tokens` GPU-resident
+unconditionally and never condenses request slots. Scoped as `ENG-ASYNC-SCHED`
+W4 in [.agents/specs/async-discrete-device-combine.md](../.agents/specs/async-discrete-device-combine.md).
+Root, hashes, per-leg contention table, exact commands:
+[Qwen3.5-4B post-pull revalidation](bench-evidence/qwen35-4b-postpull-20260727.md).
+Prior series (ratios and attributions only):
 [Qwen3.5-4B main repair evidence](bench-evidence/qwen35-4b-main-repair-20260725.md).
-Revalidate `c317237a` with the exact `flock /tmp/gpu
-tools/bench/run_qwen35_4b_compare.sh /tmp/qwen35-main-final-fa2-<commit>` recipe
-in that evidence document before publishing these values as binding for the
-development branch.
 This 4B diagnostic does not establish 27B/35B support.
+
+### ENG-ASYNC-SCHED W4 discrete-CUDA device-resident sampled tokens (2026-07-27) - correctness GATED, speed NEUTRAL here, serving A/B PENDING
+
+**Implemented, opt-in (`VT_ASYNC_DEVICE_MIRROR=1`), DEFAULT OFF.** On a discrete
+GPU the W3 device combine/scatter fell back to a host path that must synchronize
+the main stream for the sampled ids; W4 gives that path a device-resident
+`last_sampled_tokens` (what upstream does unconditionally, `states.py:64`), with
+the condense/swap row edits recorded on the host and replayed on the device in
+stream order.
+
+Correctness gate on the RTX 5070 Ti, one `flock /tmp/gpu`, same binary:
+**token-identical, 128/128 requests, in both directions** on the 128-request
+corpus; `test_qwen35_plain_weights --no-skip` 3/3 (1672), `test_input_batch`
+25/25 (183, +3 new W4 cases), `test_combine_tokens` 7/7, `test_ops_gdn` 66/66
+(4242), `test_ops_paged_attn` 25/25 (454,474).
+
+Speed on this workload is NEUTRAL and cannot be otherwise, which is why the
+default is OFF. `vllm-bench` drives the SYNCHRONOUS `LLMEngine::step()` loop, so
+`sample_tokens_async` is never called and there is no depth-2 overlap for W4 to
+unlock; it adds four small uploads and two kernels per step and removes nothing.
+Two paired runs measured 6612.31 vs 6600.68 and 6602.22 vs 6612.15 tok/s - equal
+and opposite, i.e. run noise. The win it was built for needs the ASYNC serving
+loop (`AsyncLLM` -> `step_with_batch_queue`), so the binding measurement is a
+SERVING A/B and is **PENDING**.
+
+**This also corrects a wrong attribution in the record.** The 2026-07-25 evidence
+assigned the 497 `cudaStreamSynchronize` calls (20.975 s, 42.20 ms/call) to
+`GPUModelRunner::sample_tokens_async`'s discrete host path. That function is not
+called on the benchmarked path at all - verified directly, by instrumenting the
+branch and observing it never executes under `vllm-bench`. Whatever those
+synchronizations are, they are not the async sampler's. A fresh
+attribution-complete profile re-attributes them: 112 `cudaStreamSynchronize`
+calls over ~64 decode steps plus prefill and warm-up at 10.12 ms each - **about
+one per engine step**, which scaled to the binding workload (~512 steps at ~38 ms)
+is ~500 calls at ~40 ms, i.e. the 2026-07-25 numbers almost exactly. The count
+and the time in that trace were right; the attribution was not. It is the depth-1
+engine loop waiting for its own sampling, not an async-sampler defect. The
+per-call embedding barrier is absent from the new trace, which is W4e working.
+The mirror's enable predicate asks the BACKEND whether memory is unified rather
+than testing for CUDA, which is both more precise and what keeps the shared
+layer's device-leakage ratchet at its floor.
+Numbers, profile and reproduction:
+[W4 evidence](bench-evidence/w4-async-mirror-20260727.md). Spec and deviations:
+[.agents/specs/async-discrete-device-combine.md](../.agents/specs/async-discrete-device-combine.md).
+
+### Pinned-oracle provisioning (2026-07-28) - infrastructure, measurement PENDING
+
+The local oracle was **vLLM 0.24.0**, two versions behind the parity pin
+(`555967922` / 0.26.0.dev0), because it was pip-installed from a PyPI RELEASE on
+2026-07-09 while the pin tracks a vLLM **main commit** that has no release tag
+and no prebuilt wheel on any platform. A pip install could never have matched it.
+
+An oracle at the actual pin now exists in a SEPARATE venv (`.venv-vllm-pin`,
+built from source at `5559679229bc...`, `vllm-0.23.1rc1.dev1511+g555967922.cu132`)
+with the pinned stack: torch 2.13.0, torchvision 0.28.0, triton 3.7.1,
+transformers 5.14.1, flashinfer 0.6.15.post1, nvidia-cutlass-dsl 4.6.0. The
+working 0.24.0 venv is untouched.
+
+`run_qwen35_4b_compare.sh` gains `VLLM_CUDA_HOME`. The harness previously derived
+the vLLM arm's CUDA toolkit from the Nix CMake cache (12.9), which is correct for
+a venv that borrows Nix's CUDA and WRONG for one carrying its own: it would put a
+12.9 toolkit ahead of the 13.x the venv's extensions were compiled against.
+
+**Toolkit ceiling, recorded because it is not obvious:** the usable CUDA version
+here is set by what the DRIVER can JIT, not by what is newest. vLLM ships
+FlashAttention-2 as `8.0+PTX`, so the driver JIT-compiles its PTX for Blackwell at
+load; driver 595.71.05 tops out at CUDA 13.2 and rejects nvcc-13.3 PTX with
+`cudaErrorUnsupportedPtxVersion` — a failure that appears only at RUNTIME, after a
+completely clean build. CUDA 13.0 is also unusable: its headers predate glibc
+2.42's `rsqrt` declaration and collide with it. 13.2 is the only version in range
+that clears both, and the whole toolkit must match (cccl refuses a mixed
+compiler/header pair). Install vLLM with `--no-deps`, or pip re-resolves the CUDA
+runtime downward after the build and reintroduces the mismatch.
+
+**RE-MEASURED (2026-07-28): the 0.9819x was PESSIMISTIC.** vLLM at the pin is
+0.9875x the 0.24.0 release on this workload, so the old denominator was the
+FASTER vLLM and was understating us. Against the true pin:
+
+| Axis | Direct ON | vLLM @ pin | ratio | Disposition |
+|---|---:|---:|---:|---|
+| Total throughput (tok/s) | 6618.160 | 6638.129 | 0.9970x | FAIL |
+| Output throughput (tok/s) | 731.817 | 734.026 | 0.9970x | FAIL |
+| Requests/s | 5.717 | 5.735 | 0.9969x | FAIL |
+| Mean TTFT (ms) | 729.217 | 943.198 | 0.7731x | PASS |
+| Mean TPOT (ms) | 38.107 | 33.900 | 1.1241x | FAIL |
+
+So the throughput gap is **0.3%, not 1.8%**, with no change to our code, and TPOT
+(+12.4%) is confirmed as the one real gap. Our own arm reproduces the previous
+series exactly (1.0027x, token-identical 128/128 per rep), which is the control
+that makes the oracle delta attributable to the oracle. Spread is 0.11% (pin) and
+0.08% (ours). Full provenance, the CUDA toolkit ceiling that constrained the
+build, and token identity:
+[pinned-oracle comparison](bench-evidence/qwen35-4b-pinned-oracle-20260728.md).
+
+**RE-VALIDATED (2026-07-29) after rebasing onto 139 upstream commits** (`main`
+`7f620e74` -> `f3ecbe70d`): 0.9972x total throughput, TTFT 0.7701x PASS, TPOT
+1.1247x FAIL — every axis inside noise of the row above, and our output
+token-identical 128/128 per repetition to the previous series. The control is
+that the vLLM arm, whose pinned binary did NOT change, drifted by the same ~0.13%
+as ours (0.9986x vs 0.9988x), so the drift is ambient rather than a code effect.
+No movement was the expected result: the only upstream commit in that window
+naming this gap (`2b00866a4`) concluded the decode gap is batch composition and
+changed records, not code.
+[post-rebase re-validation](bench-evidence/qwen35-4b-postrebase-20260729.md).
+
+### OPEN LEAD - cuBLASLt resolves Ampere-class GEMM kernels on sm_120 (2026-07-27) - NOT MEASURED
+
+From the same profile: `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128`
+is 47.1% of GPU kernel time (1,664 instances, 2.099 s) and its 128x256 sibling a
+further 12.8%. Both are SM80 / Ampere-class kernels chosen by cuBLASLt's
+heuristic on a Blackwell device. Recorded as a LEAD, not a claim: the instance
+counts and `_relu_` epilogue indicate the PREFILL projections, and prefill is the
+axis we already pass (TTFT 0.798x), while the failing axis is TPOT. No matched
+vLLM trace exists on this device yet, and if the oracle resolves the same kernels
+there is no gap. The next step is a matched pair of traces on the identical
+corpus, diffed by kernel name.
+
+### Hardening detector lanes (2026-07-27, `HARDEN-DETECTOR-LANES`) - infrastructure, NOT APPLICABLE
+
+No performance claim: `VLLM_CPP_SANITIZE` (ASan/UBSan/TSan host lanes, CPU-tier
+only) and `VT_POOL_BYPASS=1` (exact-size, really-freed `DevicePool` allocations
+so `compute-sanitizer` can see tensor boundaries and use-after-free) are both
+default-OFF and production-inert. `VT_POOL_BYPASS` is explicitly NOT a timing
+configuration - it reinstates the per-op `cudaMalloc`/`cudaFree` device-sync
+storm the pool exists to remove. Rationale and the item-by-item transfer
+decision: [.agents/specs/hardening-adoption-2026-07-27.md](../.agents/specs/hardening-adoption-2026-07-27.md).
+The lanes are verified end to end (both configure, both guards fire, ASan+UBSan
+builds and passes three CPU suites with leak detection on), and their first real
+build already caught a `-Werror=unused-function` break in the W4 commit that
+would also have failed the existing `build-test-cpu` job.
 
 ## `M3c-1` CUDA-path neutrality on GB10 (2026-07-27) - NO MEASURABLE REGRESSION
 

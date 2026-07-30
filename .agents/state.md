@@ -34055,3 +34055,297 @@ Brick 3 found the Q8_0 matvec (45% of decode step) stuck at ~63% of BW peak and 
   BENCHMARKS updated; gated bench committed as durable measurement infra. NEXT:
   remaining GEMM levers are breadth/correctness unlocks (fp16 dtype rank-1;
   Marlin/DeepGEMM/MMQ), not decode speedups on what we already ship fast.
+## 2026-07-27 — Qwen3.5-4B post-pull revalidation on discrete Blackwell, and a VOIDED prior series
+
+Workspace fast-forwarded 109 commits onto `upstream/main` `7f620e74`; the local
+`c317237a` transplant's two commits are now upstream (`a131de03`, `b6f1efc8`), so
+the measured tree is plain current `main`. Rebuilt
+`build-nix-cuda-transplant-triton` clean, ran the correctness tier and the full
+18-leg matched comparison under one `flock /tmp/gpu`.
+
+**Correctness: unchanged, bit for bit.** `test_qwen35_plain_weights --no-skip`
+3/3 (1672 asserts), `test_ops_gdn` 66/66 (4242), `test_ops_paged_attn` 25/25
+(454,474), `test_gdn_packed_decode_triton` 1/1, `test_combine_tokens` 7/7,
+`test_input_batch` 22/22 — every count identical to the 2026-07-25 record. And
+the benchmark output is token-identical to that series: 128/128 requests per
+repetition for BOTH direct-ON and direct-OFF. 109 upstream commits moved no token
+on this workload.
+
+**Performance: no meaningful regression, and no real gain either.** Against the
+oracle in the SAME series, total throughput 0.9864x -> 0.9819x and the TPOT
+excess +13.41% -> +14.00%. Absolute numbers rose ~14% on BOTH arms, which is the
+whole story below.
+
+**THE FINDING — the 2026-07-25 series was contended, so its absolute numbers are
+VOID.** All nine of its performance legs recorded 11-13% GPU utilization and
+611 MiB of extra resident VRAM BEFORE the leg started; all nine of today's
+recorded 0%. `prepare_leg` gated idleness on `nvidia-smi --query-compute-apps`,
+which enumerates CUDA contexts only, so a GRAPHICS consumer was invisible to it
+and an entire binding series passed the gate while sharing the GPU. Both arms
+gained ~14% on a genuinely idle box, which is exactly why the RATIO moved almost
+not at all. Closed by adding an explicit `utilization.gpu` check
+(`GPU_IDLE_UTIL_MAX`, default 2%); re-parsed, it reads 0 for today and 12 for
+2026-07-25. The prior series' ratios, same-binary component attributions and
+profiling attribution survive — each was internal to one uniformly-contended
+series — but no absolute number from it may be published.
+
+Also corrected: the local oracle is **vLLM 0.24.0**, not the 0.25.0 the previous
+evidence and BENCHMARKS entry claimed. That series' own recorded
+`vllm-version.txt` already said 0.24.0. The project parity pin is now
+`555967922` / 0.26.0.dev0, so this denominator is behind the pin and is labelled
+as such.
+
+Two summarizer defects fixed on the way: it read historical token legs under a
+`perf-` prefix the harness has never written, and it demanded a
+`vllm_production` key its own current output does not contain. Either one made
+summarizing a series against the previous one impossible.
+
+**Residual and next step.** TPOT is the only failing latency axis and its
+mechanism is specific, not diffuse: this GPU is DISCRETE, `is_integrated_gpu()`
+is false, so both ENG-ASYNC-SCHED W3 device call sites (`runner.cpp:821`
+combine, `runner.cpp:1763` scatter) take their host fallback and
+`sample_tokens_async` must synchronize the main stream before the host can read
+the sampled ids. The async scheduler IS engaged (`max_concurrent_batches=2`), so
+depth-2 currently overlaps nothing here. Upstream has no such branch:
+`states.py:64` keeps `last_sampled_tokens` GPU-resident unconditionally and
+`states.py:132` never condenses slots (free-index pool), which is why it needs no
+host round-trip; our `InputBatch::condense` is the one real complication and the
+spec resolves it by replaying the recorded row moves on device in stream order.
+Scoped, not implemented: [specs/async-discrete-device-combine.md](specs/async-discrete-device-combine.md).
+The spec also names the SECOND per-step barrier that must go with it — the CUDA
+embedding out-of-range flag does `cudaMalloc` + `cudaStreamSynchronize` +
+`cudaFree` on EVERY call, which is 23.7 us while the engine is serialized and a
+hard barrier the moment it is not.
+
+Evidence root `/tmp/qwen35-postpull-7f620e74`; index
+[docs/bench-evidence/qwen35-4b-postpull-20260727.md](../docs/bench-evidence/qwen35-4b-postpull-20260727.md).
+
+Pre-existing and NOT introduced here: `scripts/check-agent-record.py` reports 6
+errors on pristine `main` (DONE rows citing closing commits `164453a2` /
+`7a3f04b2`, which do not exist in this clone). Verified identical with and
+without this change.
+
+## 2026-07-27 (later) — ENG-ASYNC-SCHED W4 implemented and gated; the lever's own attribution was WRONG
+
+Built the discrete-CUDA device-resident sampled-token path the earlier entry
+scoped, gated it, and in the process disproved the premise it was scoped from.
+
+**What landed.** `last_sampled_tokens` gains a device mirror on discrete CUDA
+(what upstream keeps unconditionally, `states.py:64`); the combine and scatter
+run on it; `InputBatch` records its structural row edits (seed/move/swap) and the
+runner replays them on the device in stream order, which is how a device-resident
+buffer survives our `condense()` (upstream never condenses — `states.py:132` uses
+a free-index pool). The forward reads the patched device ids through
+`ModelForwardInput::device_token_ids`. W4e removed the other per-step barrier:
+the CUDA embedding's out-of-range flag no longer does cudaMalloc + stream-sync +
+cudaFree per call, but uses a persistent ring of flag slots with a deferred,
+event-queried check (reporting contract changed deliberately; its test changed
+with it).
+
+**Three design corrections forced during implementation**, each recorded in the
+spec: the embed PATCHES a prefix rather than embedding the runner's buffer
+(the decode graph embeds a PADDED id vector, so "replace the whole buffer" would
+have mis-shaped it); the uploads copy from PAGEABLE host memory on purpose (a
+shared pinned staging buffer is a race — pinned copies are truly async, so the
+next upload can overwrite bytes an in-flight DMA has not read, and with depth-2
+that window spans steps); and the forward reads the ids through an RAII scoped
+override consumed on first use, rather than a parameter threaded through five
+entry points plus the decode-graph class.
+
+**THE FINDING — the lever was aimed at code the benchmark never runs.** First
+gate run: token identity mirror-ON vs OFF was **0/128**, output garbage from the
+first decode. Instrumenting showed the device mirror stayed all-zero: the scatter
+branch in `sample_tokens_async` NEVER EXECUTED. Cause: `vllm-bench` drives the
+SYNCHRONOUS `LLMEngine::step()` loop, which calls `sample_tokens()`, not
+`AsyncLLM`'s depth-2 `step_with_batch_queue` -> `sample_tokens_async`. So on the
+benchmarked path there is no async sampler, no depth-2 overlap, and **no
+`sample_tokens_async` synchronize to remove**. The 2026-07-25 attribution of 497
+`cudaStreamSynchronize` calls (20.975 s, 42.20 ms/call) to that function is
+therefore WRONG for this workload; those synchronizations come from somewhere
+else and must be re-attributed before another lever is chosen from that trace.
+Fixed by feeding the mirror from whichever sampler ran (the sync path uploads the
+ids it already downloaded); identity is now **128/128 in both directions**.
+
+**Disposition: opt-in, DEFAULT OFF** (`VT_ASYNC_DEVICE_MIRROR=1`), exactly as the
+W3 device kernels landed before their DGX A/B. On the sync loop W4 is correct but
+can only cost (four small uploads + two kernels per step, nothing removed);
+paired runs measured 6612.31 vs 6600.68 and 6602.22 vs 6612.15 tok/s — equal and
+opposite, run noise. The binding measurement is a SERVING A/B over `AsyncLLM`,
+PENDING; `tools/bench/run_serve_low.py` is the harness for it.
+
+**Pre-existing failure found and verified, NOT introduced here:** `test_cuda_ops`
+"CUDA matmul (cuBLASLt) matches CPU on odd sizes" fails 11 elements on the
+bf16/bf16 17x31x13 case on this discrete sm_120. Reproduced on a pristine
+stash-clean build of the same commit (436 assertions, same single failure). The
+project develops on GB10/sm_121a, so this is an unattributed per-architecture
+numerics difference on consumer Blackwell that nobody has recorded.
+
+Also adopted from the external hardening study: `VLLM_CPP_SANITIZE` host lanes
+(ASan+UBSan, TSan) plus the `sanitize-cpu` CI matrix, and `VT_POOL_BYPASS=1` so
+compute-sanitizer can see through the caching device-scratch pool. Item-by-item
+transfer decisions: [specs/hardening-adoption-2026-07-27.md](specs/hardening-adoption-2026-07-27.md).
+
+## 2026-07-27 (close) — W4 A/B and the re-attribution that replaces the lever's premise
+
+**A/B (`/tmp/w4-ab-final`, 3 interleaved reps/arm, order flipped on even reps,
+one lock, idle box):** W4 ON vs OFF is **0.9996x** total and output throughput,
+**1.0004x** TPOT, **1.0002x** TTFT. Per-rep spread within each arm is larger than
+the gap between them. **NEUTRAL.** Token identity across all three pairs:
+**384/384 requests identical.**
+
+**Re-attribution (`/tmp/w4-attrib.nsys-rep`, `--cuda-graph-trace=node`).** The
+2026-07-25 record blamed 497 `cudaStreamSynchronize` calls (20.975 s, 42.20
+ms/call) on `sample_tokens_async`. A fresh profile of the benchmarked path shows
+112 `cudaStreamSynchronize` over ~64 decode steps plus prefill and warm-up at
+10.12 ms each — about ONE PER ENGINE STEP. Scaled to the binding workload (~512
+steps at ~38 ms TPOT) that is ~500 calls at ~40 ms, which is the old trace's
+numbers almost exactly. So the COUNT and the TIME were right and the ATTRIBUTION
+was wrong: it is the depth-1 `LLMEngine::step()` loop waiting for its own
+sampling (the sampler's greedy download, `sampler.cpp:191`), not an async-sampler
+defect. Also visible: the per-call embedding `cudaMalloc`+sync+`cudaFree` is gone
+from the trace, which is W4e working; `cudaMalloc` is down to 818 calls and
+`cudaFree` to 512 for the whole run, at 29 ms and 28 ms total.
+
+**So the lever list changes.** There is no per-step synchronize to delete on the
+synchronous path — the wait IS the step. Overlap requires running the ASYNC
+engine loop, and W4 is what makes that loop legal on a discrete GPU. The next
+step is therefore a SERVING A/B over `AsyncLLM` (`examples/server`), not another
+runner-level kernel change. It is blocked by the harness, not by the engine:
+`tools/bench/run_serve_low.py` needs a pinned SGLang container image and accepts
+only the 27B/35B model keys, neither available here. A minimal serving driver for
+the 4B on this host is the unblocking task.
+
+Evidence: [../docs/bench-evidence/w4-async-mirror-20260727.md](../docs/bench-evidence/w4-async-mirror-20260727.md).
+
+## 2026-07-27 (close) — OPEN LEAD from the same trace: cuBLASLt picks Ampere-class GEMM kernels on sm_120
+
+Recorded as a lead, NOT a claim, from `/tmp/w4-attrib.nsys-rep`. The two largest
+GPU kernels on the 4B workload are
+
+- `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_256x128_32x3_tn_align8`,
+  1,664 instances, 2.099 s, **47.1%** of GPU kernel time;
+- `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_128x256_32x3_tn_align8`,
+  544 instances, 0.570 s, 12.8%.
+
+Both are `cutlass_80` — SM80 / Ampere-class tensorop kernels — selected by
+cuBLASLt's heuristic and executing on a Blackwell sm_120 device. The house
+parity-lever protocol already names this exact phenomenon (`nvjet_sm121` vs
+`cutlass_80`) as something only an execution trace reveals.
+
+Two reasons this is a LEAD and not a lever yet. First, these instance counts and
+the `_relu_` epilogue point at the PREFILL projections, and prefill is the axis
+we already PASS (TTFT 0.798x vs the oracle); the failing axis is TPOT. Second,
+nobody has checked what the vLLM oracle resolves to on the SAME workload on THIS
+device — if vLLM also lands on `cutlass_80` there is no gap to close, and the
+protocol is explicit that the oracle's trace, not ours alone, decides. The
+honest next step is a matched pair of traces (ours and vLLM's) on the identical
+corpus, diffed by kernel name, before anyone tries to force a tactic.
+
+## 2026-07-28 — oracle rebuilt AT the parity pin; the published ratio was PESSIMISTIC, not flattering
+
+The local oracle was two versions behind the pin and, on investigation, could
+never have matched it by installation: the pin `555967922` is a vLLM **main**
+commit with no release tag and **no prebuilt wheel on any platform** (x86_64
+verified here; the pin spec verified aarch64). `pip install vllm` reaches only
+PyPI releases, so the 2026-07-09 provisioning got 0.24.0 and drifted from there.
+The records compounded it by labelling that venv "0.25.0".
+
+**Built from source at the pin** into a SEPARATE venv (`.venv-vllm-pin`,
+`vllm 0.23.1rc1.dev1511+g555967922.cu132`, sm_120 only) with the pinned stack
+(torch 2.13.0, torchvision 0.28.0, triton 3.7.1, transformers 5.14.1, flashinfer
+0.6.15.post1, cutlass-dsl 4.6.0, tilelang 0.1.9). The 0.24.0 venv is untouched
+and retained as a rollback denominator. `${VLLM_SOURCE}` is now a real checkout
+at the pin (`/home/rich/c/vllm-upstream`), so pin-era mirror claims no longer
+have to be hedged.
+
+**THE RESULT — the direction is the surprise.** vLLM at the pin is **0.9875x**
+the 0.24.0 release on this workload, i.e. the old denominator was the FASTER
+vLLM. So the published 0.9819x was understating us. Against the true pin:
+total/output throughput **0.9970x** (6618.160 vs 6638.129), req/s 0.9969x, TTFT
+**0.7731x PASS**, TPOT **1.1241x FAIL**. The throughput gap is 0.3%, not 1.8%,
+with no change to our code; TPOT (+12.4%) is confirmed as the one real gap.
+Control: our own arm reproduces the previous series exactly (1.0027x,
+token-identical 128/128 per repetition), which is what makes the delta
+attributable to the oracle rather than to us. Spread 0.11% (pin) / 0.08% (ours).
+
+**The CUDA toolkit ceiling, recorded because it cost two full builds.** The
+usable CUDA version is set by what the DRIVER can JIT, not by what is newest.
+vLLM ships FA2 as `8.0+PTX`, so the driver JIT-compiles its PTX for Blackwell at
+load; driver 595.71.05 tops out at 13.2 and rejects nvcc-13.3 PTX with
+`cudaErrorUnsupportedPtxVersion` — visible only at RUNTIME, after a clean build.
+CUDA 13.0 is separately unusable (headers predate glibc 2.42's `rsqrt`; fixed
+from 13.1 via `_NV_RSQRT_SPECIFIER`). 13.2 is the only version clearing both, the
+whole toolkit must match (cccl hard-errors on a mixed compiler/header pair), and
+vLLM must be installed `--no-deps` or pip re-resolves the runtime down to 13.0
+after the build and reintroduces the mismatch. pip's CUDA wheels also ship no
+unversioned `.so`, so `find_library` needs dev symlinks.
+
+`run_qwen35_4b_compare.sh` gains `VLLM_CUDA_HOME` for a venv carrying its own
+toolkit; unset, behaviour is unchanged.
+
+**Correction to an earlier claim in this session:** I reported that the repo's
+`triton_kernels/` directory shadows Triton's package in benchmark runs. It does
+NOT. The harness invokes the metrics script BY PATH, so `sys.path[0]` is
+`tools/bench` and the repo root is never on `sys.path` — verified directly. The
+shadowing only occurred in an ad-hoc test that piped a script via stdin. The
+`Failed to import Triton kernels` warning is a genuinely absent optional package
+that is not in vLLM's own `requirements/cuda.txt`, so a stock install lacks it
+too; the oracle is faithful.
+
+Evidence: [../docs/bench-evidence/qwen35-4b-pinned-oracle-20260728.md](../docs/bench-evidence/qwen35-4b-pinned-oracle-20260728.md).
+
+## 2026-07-29 — rebased onto 139 upstream commits and re-benchmarked: nothing moved
+
+Rebased `bench-lever-sampled-token-20260727` from `main` `7f620e74` onto
+`f3ecbe70d`. Three conflicts. `.agents/parity-ledger.md` and `.agents/state.md`
+were pure append collisions (upstream appended 76 ledger rows and ~4,580 log
+lines at the tail, this branch appended its own) — resolved by keeping both with
+upstream first, which is what the ledger's own header prescribes ("append-only …
+Newest last") and what a rebase means, then verified additively: `diff` against
+`main` shows ZERO lines lost from upstream. The third was real:
+`ModelForwardInput` gained a field on both sides (upstream's `mm`, ours
+`device_token_ids`). Both kept, ours LAST — it has to be the final member, which
+is the same constraint that broke positional aggregate initializers when it was
+first written mid-struct.
+
+**Verification of the merge, in the order that makes it binding.** Clean CUDA
+rebuild 925/925, exit 0, no warnings. `test_input_batch` 25/25·183/183,
+`test_combine_tokens` 7/7·14/14, `test_qwen35_plain_weights --no-skip`
+3/3·1672/1672 — all identical to pre-rebase. Then the strongest statement
+available: the 18-leg comparison reproduced our output **token-identical
+128/128 in every repetition** against the pre-rebase series, for both the direct-ON
+and direct-OFF arms. A 139-commit rebase that leaves generated tokens bit-stable
+is a semantic check the model gate alone cannot give.
+
+**Benchmark: a null result, and the useful kind.** Pin re-checked first and
+unchanged (`555967922`), so `.venv-vllm-pin` is still the right denominator.
+0.9972x total throughput (was 0.9970x), TTFT 0.7701x PASS (was 0.7731x), TPOT
+1.1247x FAIL (was 1.1241x). Ours 6610.270 vs pin 6628.651 tok/s. Per-rep spread
+0.05% (ours) and 0.07% (pin).
+
+The control that makes "nothing moved" a measurement rather than an assumption:
+all three arms drifted down ~0.13% (ours 0.9988x, direct-OFF 0.9983x, pin
+0.9986x). The pin arm is the SAME binary on the SAME corpus and cannot have
+changed, yet it drifted the same amount — so the drift is ambient thermal/clock
+state, not code, and it is the size of the arms' own repetition spread.
+
+No movement was expected. The only upstream commit in the window naming this gap
+(`2b00866a4`) concluded the decode gap is batch composition, not a decode-kernel
+deficiency, and changed records rather than code; the rest of the window is
+breadth on paths this dense 4B decode workload does not touch. TPOT stays owned
+by ENG-ASYNC-SCHED and the W4 finding stands.
+
+**Harness note worth keeping.** The first attempt at this series was killed
+partway by a 10-minute background-command ceiling, after the memory legs but
+before any performance leg, leaving an output tree with no aggregate. Re-run
+detached under `setsid` with an explicit wait for three consecutive idle GPU
+reads first, because the killed run left the card draining at 3% and the harness
+(correctly) refuses any leg above 2%. All nine performance legs then recorded 0%.
+
+Pre-existing and NOT introduced here: `check-agent-record` (6 errors),
+`check-env-doc` (`VLLM_GEMMA4_MM_DEBUG`) and `check-device-leakage` (DSR
+`kcuda=8` vs baseline 0) all fail identically on pristine `main`, verified in a
+throwaway worktree. The DSR bucket counts are byte-identical with and without
+this branch, so this branch adds zero device leakage.
+
+Evidence: [../docs/bench-evidence/qwen35-4b-postrebase-20260729.md](../docs/bench-evidence/qwen35-4b-postrebase-20260729.md).

@@ -151,9 +151,13 @@ def token_comparisons(
         ]
         for arm in ("cpp-on", "cpp-off", "vllm")
     }
+    # Both roots are produced by run_qwen35_4b_compare.sh and use the SAME leg
+    # names. This side used to read a `perf-` prefix the harness has never
+    # written, so every historical comparison raised FileNotFoundError and the
+    # tool could not summarize any series against a previous one.
     historical = {
         arm: [
-            load_tokens(historical_root / f"perf-{arm}-r{rep}.tokens.json")
+            load_tokens(historical_root / f"performance-{arm}-r{rep}.tokens.json")
             for rep in range(1, 4)
         ]
         for arm in ("cpp-on", "cpp-off", "vllm")
@@ -206,14 +210,20 @@ def main() -> int:
             "vllm": memory(args.root, "vllm"),
         },
         "tokens": token_comparisons(args.root, args.historical_root),
+        # The historical block accepts EITHER schema. An aggregate produced by an
+        # older revision of this tool carried the vLLM arm under
+        # `vllm_production` plus a separate `vllm_client`; the aggregate this
+        # tool writes today carries one `vllm` key and no client split. Insisting
+        # on the old names made the tool unable to read its OWN output, so a
+        # series could never be summarized against the previous one.
         "historical": {
             "commit": old_aggregate["commit"],
             "cpp_on": old_aggregate["cpp_on"],
             "cpp_off": old_aggregate["cpp_off"],
-            "vllm": old_aggregate["vllm_production"],
+            "vllm": old_aggregate.get("vllm_production", old_aggregate.get("vllm")),
             "vllm_client": {
                 key: value
-                for key, value in old_aggregate["vllm_client"].items()
+                for key, value in old_aggregate.get("vllm_client", {}).items()
                 if key != "per_request"
             },
             "memory": old_aggregate["memory"],

@@ -7,10 +7,13 @@ compile_commands.json
 *.so
 .venv/
 .venv-vllm/
+.venv-vllm-pin/
 .hf-cache/
 .torchinductor-cache/
 .triton-cache/
+.triton-cache-pin/
 .vllm-cache/
+.vllm-cache-pin/
 .flashinfer-cache/
 __pycache__/
 

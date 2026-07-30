@@ -52,6 +52,7 @@ portable/reference path. In normal operation leave them unset.
 |---|---|---|
 | `VT_ASYNC_RUNNER` | on | Synchronous model runner (no async/overlap execution) |
 | `VT_ASYNC_SCHED` | on | Synchronous scheduling (no scheduler/execution overlap). The documented first-line workaround for a suspected scheduling bug |
+| `VT_ASYNC_DEVICE_MIRROR` | off | `=1` engages the discrete-CUDA device-resident sampled-token mirror (ENG-ASYNC-SCHED W4), so the async serving loop's sampled ids stay on the device instead of round-tripping the host. DEFAULT OFF pending a serving A/B, exactly as the W3 device kernels landed: the synchronous `LLMEngine::step()` loop has no overlap for it to unlock, so it can only cost there. Token-identical to the default path either way. No effect on an integrated GPU (which keeps its in-place path) or on CPU |
 | `VLLM_CPP_CUDAGRAPH` | on (CUDA) | Eager launches instead of a captured CUDA graph |
 | `VLLM_CPP_DENSE_DECODE_GRAPH` | on (CUDA dense) | Non-graphed dense decode |
 | `VT_MM_DECODE_EAGER` | off (graph on) | Set to `1` to force the eager per-step multimodal (Qwen3.6-27B image/video) decode instead of routing it through the captured dense decode graph. Rollback / A-B knob; the graphed path is token-exact with the eager path |
@@ -83,6 +84,7 @@ Read-only observability; none change output.
 | `VT_OP_PROVIDER_DISABLE` | (none) | Comma-separated provider names to disable, forcing fallback (diagnostic) |
 | `VT_GDN_VALIDATE` | off | Run the GDN validation/cross-check path (slower; for kernel debugging) |
 | `VT_FP4_AUTOTUNE_VERBOSE` | off | Log the NVFP4 GEMM autotuner's tactic selection |
+| `VT_POOL_BYPASS` | off | `=1` makes every device-scratch pool allocation an exact-size driver `Alloc` and every release a real `Free`, so `compute-sanitizer` can see tensor boundaries and use-after-free that the caching, size-class-rounding pool hides. DEBUGGING ONLY: it reinstates the per-op `cudaMalloc`/`cudaFree` device-sync storm the pool exists to remove, so it is never a timing configuration |
 
 ## Kernel-internal knobs (deferred)
 
