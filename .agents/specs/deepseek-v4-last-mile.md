@@ -427,9 +427,39 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   43/step). Supersedes the profile-Brick-12 "(A) portable lever → −10.5 ms" projection with the measured −1.1 ms;
   the Q8_0 speed axis stays where Brick 11 left it (~12.3), now with a bit-exact ds4-faithful launch structure and the
   causal question re-narrowed to the (unobservable) cache/L2 axis. Code merged default-ON, records kept, NOT pushed.
+- **Brick 13 (IMPL) — Q8_0 ILP lever (N output-rows per warp) built + sudo-ncu-measured → MEASURED-NEGATIVE; the
+  measurement-pointed ILP axis does NOT help; the ~13 tok/s Q8_0 ceiling is CONFIRMED and the Q8_0 front is CLOSED.**
+  (2026-07-31, branch `brick13-q8-ilp` off `137c739f`, NOT pushed. `VT_V4_Q8_ILP` default-OFF `=1`; opt-in `=2`/`=4`,
+  allow-listed.) The `ds4-q8-ncu-2026-07-30` root cause said our `QuantDotGemmQ8_0Kernel` is memory-LATENCY-bound
+  (long-scoreboard 54.4 @ 71.9% occupancy, L1-hit 96.7% → over-fetch absorbed, not DRAM-bound) and pointed at ONE
+  untried axis: raise memory-level parallelism per thread via N INDEPENDENT weight-load streams. Built
+  `QuantDotGemmQ8_0MultiRowKernel<OutT,NROWS>` (each warp computes NROWS consecutive output columns of the same
+  activation row: activation block read once, `__dp4a`-dotted against NROWS independent weight rows; grid
+  `m·ceil(n/NROWS)/8`). BIT-IDENTICAL to NROWS separate plain outputs (full 32-lane reduce + identical dp4a order +
+  identical f16-scale fold per row) — asserted byte-exact in `test_cuda_quant_dot` (`Brick 13` A/B, incl. tail n∤N).
+  **MEASURED (sudo `ncu --metrics long_scoreboard,warps_active,l1_hit,gpu__time_duration` regex `QuantDotGemmQ8_0`,
+  skip 400 count 48, decode steady, n-keyed OFF/ILP2/ILP4), the target n=2048 kernel (grid-256, the spec's 54.4):**
+  long-scoreboard **57.8 → 87.0 (ILP2) → 51.7 (ILP4)** — did NOT drop materially (ILP2 WORSE; ILP4 −6.1 only);
+  achieved occupancy **71.4% → 42.5% → 21.3%** (COLLAPSED — the grid shrinks by N and the extra accumulators raise
+  registers); per-launch GPU-active **46.7 → 44.9 → 51.0 µs** (flat-to-WORSE). n=4096 (grid-512) identical shape:
+  LS **56.4 → 122.2 → 91.3**, occ 82.3 → 79.6 → 41.5. **Clean wall-clock decode (sudo `drop_caches`, 3 reps,
+  `--max-tokens 64`):** OFF **13.19** tok/s median; ILP2 **13.12 (−0.5%)**; ILP4 **13.05 (−1.0%)** — flat-to-negative.
+  Token stream **byte-identical OFF==ILP2==ILP4**, golden `11111 16 455 6102 294 8760 344 …` (16/16). **HARD
+  STOP-CONDITION met on BOTH N-values → RECORDED-NEGATIVE.** ROOT of the negative (measured, not inferred): the plain
+  kernel's load latency was already hidden by INTER-warp parallelism (71% occupancy = many resident warps), NOT starved
+  for intra-thread ILP; folding N rows into one warp DIVIDES the warp count by N and adds registers, so occupancy
+  collapses and removes more latency-hiding than the extra per-thread load streams add — long-scoreboard rises because
+  each warp now waits on a longer serial load bundle with fewer sibling warps to cover it. **DISPOSITION — kernel kept
+  DEFAULT-OFF (bit-exact-safe, `VT_V4_Q8_ILP=2|4` opt-in for the record), like the Brick 4/8/11/12 negatives.** This was
+  the last measurement-pointed Q8_0 lever; **~13 tok/s is the honest Q8_0-kernel ceiling on GB10** and the campaign's
+  Q8_0 front is CLOSED. (ds4's 67%→90% edge — see Brick 12 — remains attributable only to the unobservable fp16-dequant
+  weight cache / L2 residency, `ERR_NVGPUCTRPERM` counter-blocked; not a Q8_0-GEMV-kernel-structure lever.)
+  **GATES (RED-first):** `test_cuda_quant_dot` **8/8·108464** (incl. new Brick-13 byte-identical A/B `1/1·1968`);
+  real-model token-identity OFF==ILP2==ILP4 16/16. Code kept default-OFF, records kept, NOT pushed.
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
-- Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +
+- Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmQ8_0MultiRowKernel<OutT,NROWS>`
+  (Brick 13 ILP, default-OFF measured-negative), `QuantDotGemmKernel<W>` +
   `DotIQ2XXS`/`DotQ2K`/`DotQ8_0`... , `QuantDotGemmGroupedKernel`, `QuantizeQ8KKernel`, `QuantizeQ8_0Kernel`).
 - The dequant/vec-dot ORACLE (bit-exact target): `src/vt/cpu/cpu_quant_dot.cpp`
   (`VecDotQ8_0Q8_0`, `VecDotIQ2_XXSQ8_K`, `VecDotQ2_KQ8_K`) + `cpu_quant_act.cpp` (`QuantizeRowQ8_0/Q8_K`).

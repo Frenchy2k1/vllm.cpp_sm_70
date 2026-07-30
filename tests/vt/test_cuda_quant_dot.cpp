@@ -412,6 +412,69 @@ TEST_CASE("Lever 2: CUDA Q8_0 sub-warp GEMV == plain (bit-exact big-K, NMSE≤5e
   gpu.DestroyQueue(gq);
 }
 
+// Brick 13 (ds4-gap ILP lever): the N-output-rows-per-warp Q8_0 GEMV
+// (QuantDotGemmQ8_0MultiRowKernel, VT_V4_Q8_ILP=2|4) computes NROWS consecutive output
+// columns per warp, sharing the activation load and issuing NROWS independent weight-load
+// streams. UNLIKE the sub-warp lever (Brick 11), each output row still uses the FULL 32-lane
+// warp reduce + the identical __dp4a order + the identical f16-scale fold → the result is
+// BYTE-IDENTICAL to the plain one-row-per-warp kernel (not merely a near-tie). That
+// byte-identity is the RED-first anchor: a wrong j0/tail/grid map or a re-associated reduce
+// would diverge from plain and fail hard. Covers short-K (nb=16), mid-K (nb=48), big-K
+// (nb=224); n both divisible and NOT divisible by NROWS (tail-row path); m=1 (decode) and m=3.
+TEST_CASE("Brick 13: CUDA Q8_0 ILP multi-row GEMV == plain (byte-identical)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; Q8_0 ILP gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase c = {DType::kQ8_0, 32, 34, 0, -1, "q8_0"};
+  for (int64_t nb : {int64_t{16}, int64_t{48}, int64_t{224}}) {
+    const int64_t k = nb * c.block_elems;
+    for (int64_t m : {int64_t{1}, int64_t{3}}) {
+      for (int64_t n : {int64_t{1}, int64_t{7}, int64_t{16}, int64_t{17}}) {  // 7,17 exercise tail
+        CAPTURE(nb);
+        CAPTURE(m);
+        CAPTURE(n);
+        std::vector<uint8_t> wq = RandomBlocks(c, n * nb, 0x13B1CU);
+        std::vector<float> a(static_cast<size_t>(m * k));
+        GenerateData(1.0F, a.size(), a.data());
+        void* d_a = gpu.Alloc(a.size() * sizeof(float));
+        gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+        Tensor at = DevTensor(d_a, DType::kF32, {m, k});
+        void* d_w = gpu.Alloc(wq.size());
+        gpu.Copy(gq, d_w, wq.data(), wq.size());
+        Tensor bt = DevTensor(d_w, DType::kQ8_0, {n, k});
+
+        auto run = [&](const char* flag) {
+          setenv("VT_V4_Q8_ILP", flag, 1);
+          void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+          Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
+          vt::MatmulBTQuant(gq, ot, at, bt);
+          std::vector<float> out(static_cast<size_t>(m * n), 0.0F);
+          gpu.Copy(gq, out.data(), d_o, out.size() * sizeof(float));
+          gpu.Synchronize(gq);
+          gpu.Free(d_o);
+          return out;
+        };
+        std::vector<float> plain = run("1");   // one row per warp (baseline)
+        std::vector<float> ilp2 = run("2");     // 2 rows per warp
+        std::vector<float> ilp4 = run("4");     // 4 rows per warp
+        unsetenv("VT_V4_Q8_ILP");
+        for (size_t i = 0; i < plain.size(); ++i) {
+          REQUIRE(std::isfinite(ilp2[i]));
+          REQUIRE(std::isfinite(ilp4[i]));
+          CHECK(ilp2[i] == plain[i]);  // byte-identical (RED-first)
+          CHECK(ilp4[i] == plain[i]);
+        }
+        gpu.Free(d_a);
+        gpu.Free(d_w);
+      }
+    }
+  }
+  gpu.DestroyQueue(gq);
+}
+
 TEST_CASE("CUDA keep-quant GEMM registers the native kCUDA provider") {
   // The registration is what flips the GGUF loader's keep-quant default ON on a
   // CUDA device (GgufQuantComputeAvailable -> OpRegistered(kMatmulBTQuant,kCUDA))

@@ -77,6 +77,53 @@ clean 1:1 mirror (our `RmsNormRowKernel` indexes contiguously with no
 `input_stride`; 48391 needs the `vllm_is_batch_invariant` subsystem). No code
 landed, no throughput owed. Parity pin UNCHANGED at `555967922`.
 
+## DeepSeek-V4-Flash decode ds4-gap — Brick 13 (Q8_0 ILP: N output-rows per warp) (2026-07-31, `CLAIM-DSV4-DECODE-BRICK13`) — MEASURED NEGATIVE via sudo-ncu: the ILP axis collapses occupancy, does NOT drop long-scoreboard; ~13 tok/s is the honest Q8_0 ceiling → Q8_0 front CLOSED
+
+Measured on GB10 sm_121a, same DeepSeek-V4-Flash IQ2XXS GGUF, `--gpu --kv-cache
+VT_V4_RESIDENT_DECODE=1 VT_V4_DECODE_GRAPH=1 DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=28000`,
+`flock`, `local-ai-worker` down. Base `137c739f` (branch `brick13-q8-ilp`, NOT pushed).
+The one untried, measurement-pointed lever from `ds4-q8-ncu-2026-07-30`: our
+`QuantDotGemmQ8_0Kernel` is memory-**LATENCY**-bound (sudo-ncu: long-scoreboard 54.4 @
+71.9% occupancy, L1-hit 96.7% ⇒ over-fetch absorbed, not DRAM-bound), so raise
+memory-level parallelism per thread via N INDEPENDENT weight-load streams.
+
+- **Kernel built + wired (bit-exact-safe).** `QuantDotGemmQ8_0MultiRowKernel<OutT,NROWS>`:
+  each warp computes NROWS consecutive output columns of the SAME activation row — the
+  activation block is read once and `__dp4a`-dotted against NROWS independent weight rows
+  (grid `m·ceil(n/NROWS)/8`, tail `j≥n` skipped). **BYTE-IDENTICAL** to NROWS separate plain
+  outputs (full 32-lane reduce + identical dp4a order + identical f16-scale fold per row).
+  `VT_V4_Q8_ILP` (default-OFF `=1`; opt-in `=2`/`=4`), dispatched in `MatmulQ8_0Cuda` so
+  BOTH the eager forward AND the captured `V4Graph::Step` inherit it.
+- **CAUSAL METRIC — sudo `ncu --metrics long_scoreboard,warps_active,l1_hit,gpu__time_duration`
+  regex `QuantDotGemmQ8_0`, skip 400 count 48, decode steady, n-keyed OFF/ILP2/ILP4.**
+  The target **n=2048** kernel (grid-256 = the spec's 54.4 baseline): long-scoreboard
+  **57.8 → 87.0 (ILP2) → 51.7 (ILP4)** (did NOT drop materially; ILP2 WORSE, ILP4 −6.1 only);
+  achieved occupancy **71.4% → 42.5% → 21.3%** (COLLAPSED); per-launch GPU-active
+  **46.7 → 44.9 → 51.0 µs** (flat-to-WORSE). **n=4096** (grid-512): LS **56.4 → 122.2 → 91.3**,
+  occ **82.3 → 79.6 → 41.5**. (The n=2560/5120 projections already have LS≈12 at ≥81% occ —
+  not latency-bound, no headroom.)
+- **CLEAN WALL-CLOCK (sudo `sync;drop_caches` before EACH rep, 3 reps, `--max-tokens 64`):**
+  OFF **13.199/13.154/13.188** (median **13.19**); ILP2 **13.089/13.116/13.149** (13.12, **−0.5%**);
+  ILP4 **13.050/13.133/13.025** (13.05, **−1.0%**). Flat-to-negative — matches the ncu-negative.
+- **ROOT of the negative (measured, not inferred):** the plain kernel's load latency was
+  already hidden by INTER-warp parallelism (71% occupancy = many resident warps), NOT starved
+  for intra-thread ILP. Folding N rows into one warp DIVIDES the warp count by N and adds
+  accumulator registers ⇒ occupancy collapses, removing more latency-hiding than the extra
+  per-thread load streams add; long-scoreboard rises because each warp now waits on a longer
+  serial load bundle with fewer sibling warps to cover it.
+- **GATE (RED-first, byte-identical):** `test_cuda_quant_dot` **8/8·108464** (new Brick-13 A/B
+  `1/1·1968`: ILP2==ILP4==plain byte-identical over nb∈{16,48,224}, n∈{1,7,16,17} incl. tail
+  n∤N, m∈{1,3}). Real-model token stream **byte-identical OFF==ILP2==ILP4**, golden
+  `11111 16 455 6102 294 8760 344 …` (16/16). `test_cuda_deepseek_v4` / `test_deepseek_v4_gguf_load`
+  covered by the same clean build.
+- **DISPOSITION — RECORDED-NEGATIVE, kept DEFAULT-OFF** (bit-exact-safe, unit-gated, wired both
+  paths; `VT_V4_Q8_ILP=2|4` opt-in for the record), exactly like Bricks 4/8/11/12. **HARD
+  STOP-CONDITION met on BOTH N-values → no further N tried.** This was the LAST measurement-pointed
+  Q8_0-GEMV lever: **~13 tok/s (this build: 13.19) is the honest Q8_0-kernel ceiling on GB10, and
+  the campaign's Q8_0 front is CLOSED.** ds4's 67%→90% edge (Brick 12) remains attributable only
+  to the unobservable fp16-dequant weight cache / L2 residency (`ERR_NVGPUCTRPERM`-blocked), not a
+  Q8_0-GEMV-kernel-structure lever.
+
 ## DeepSeek-V4-Flash decode ds4-gap — Step 0 + Lever 1 (2026-07-30, `CLAIM-DSV4-DECODE-LEVER1`) — Lever 1 lands a real bit-exact +4.3% decode; Step 0 measured NEUTRAL
 
 Measured on GB10 sm_121a, DeepSeek-V4-Flash-IQ2XXS-...-AProjQ8-SExpQ8-OutQ8 GGUF,
