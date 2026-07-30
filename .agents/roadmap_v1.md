@@ -716,6 +716,37 @@ sleep/wake+RLHF [`SERVE-ADMIN`](engine-matrix.md), guidance/outlines
 [`SPEC-EAGLE3`](engine-matrix.md)/[`SPEC-DSPARK`](engine-matrix.md)) stay in the
 spec table, not promoted.
 
+**`LAGUNA-S21` (`LagunaForCausalLM` / `laguna`) — `SPIKE` (W0 scoped 2026-07-30,
+`spike/laguna-s21-scope-2026-07-30.md`):** Poolside Laguna-S-2.1, 118B total /
+~8B-active MoE (48 layers, 12 global + 36 sliding-window-512, 256 routed top-10 + 1
+shared expert, GQA 8 KV / 128 head-dim, 1M ctx, vocab 100352, native interleaved
+reasoning). **Oracle verdict REVERSES the "proprietary, vLLM-unsupported" premise:
+vLLM has NATIVE `laguna.py`** (registered; `recipes.vllm.ai/poolside/Laguna-S-2.1`),
+and the DFlash-drafter commit is dated 2026-07-03 — BEFORE our pin `555967922`
+(0.26.0.dev0, advanced 2026-07-26) — so the model file IS in the pinned tree →
+**GATEABLE** pending a LIGHT W1 config-constructs + NVFP4/FP8 run-check (the nested
+`rope_parameters` that KeyError-blocked OLMo-3 is explicitly handled by `laguna.py` +
+transformers 5.14.1). MIRROR-vLLM → we port `laguna.py`. **Dual-oracle (ds4/antirez
+pattern):** vLLM on `poolside/Laguna-S-2.1-NVFP4`/`-FP8` (fits GB10 119 GiB; BF16 235
+GiB does NOT) = behavior/coherence; **llama.cpp Poolside-fork branch `laguna`** on the
+identical unsloth `UD-Q4_K_XL` GGUF = token-exact same-quant gate. **~85–90 % REUSE**
+— the extensibility payoff: Q4_K keep-quant decode ALREADY LANDED (ds4 GGUF path,
+`DotQ4K`/`DotSuperblock<kQ4_K>` CPU+CUDA — the feared "biggest new kernel" is ZERO
+new; UD mix = Q4_K/Q5_K/Q6_K/Q8_0, all decoded); interleaved global/sliding-window
+attn from Gemma-2/3; dual per-layer RoPE (YaRN-full-attn partial-0.5 / plain-sliding)
+from OLMo-3; sigmoid `noaux_tc` + `e_score_correction_bias` + shared-expert +
+`routed_scaling 2.5` MoE from DeepSeek-V2/GLM-4. **NEW (small host ops, NOT kernels):**
+per-head **softplus attention output gate** (`g_proj:hidden→num_heads`, `Softplusf`
+exists), the **ungrouped** variant of the noaux router (drop the group step), the
+Laguna GGUF name-map, per-layer **variable Q-head count** runner wiring (global 48 /
+sliding 72 heads, extends the Gemma-4 heterogeneous-per-layer-KV support), and the
+`poolside_v1` reasoning/tool parser. W-plan: W1 oracle-decision (light) → W2 GGUF
+loader+name-map → W3 forward (compose reuse + 3 new ops) → W4 greedy gate (strict vs
+llama.cpp Q4_K, near-tie vs vLLM NVFP4) → W5 speed (+ optional DFlash lane, SPEC-DFLASH
+reuse). Risks: variable-Q-head + dual-RoPE×partial×YaRN composition (medium), the
+oracle-blocked residual if remote-code is refused (falls back to llama.cpp-only,
+de-risked by the W1 config check).
+
 ## Decision rules carried forward
 
 - Every perf claim: same-box A/B vs the reference, token-exact gated, fresh
