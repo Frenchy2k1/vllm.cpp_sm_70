@@ -18,6 +18,7 @@ sys.modules[SPEC.name] = mod
 SPEC.loader.exec_module(mod)
 
 drift_models = mod.drift_models
+gemm_merge_drift_models = mod.gemm_merge_drift_models
 
 
 class DriftModelTests(unittest.TestCase):
@@ -110,6 +111,84 @@ class DriftModelTests(unittest.TestCase):
             exposed & allowlisted,
             "the allowlist suppresses nothing the checker detects; either the "
             "detector regressed or every allowlist entry is now stale",
+        )
+
+
+class GemmMergeDriftTests(unittest.TestCase):
+    def test_folded_model_passes(self) -> None:
+        # gated-MLP sites present, but the file references a merged-GEMM seam.
+        self.assertEqual(gemm_merge_drift_models({"olmo2": (1, True)}, set()), [])
+
+    def test_unfolded_model_fails(self) -> None:
+        # gated-MLP sites present, no seam, not allowlisted => drift.
+        self.assertEqual(
+            gemm_merge_drift_models({"minicpm": (1, False)}, set()), ["minicpm"]
+        )
+
+    def test_allowlisted_unfolded_passes(self) -> None:
+        self.assertEqual(
+            gemm_merge_drift_models({"minicpm": (1, False)}, {"minicpm"}), []
+        )
+
+    def test_no_gated_act_never_trips(self) -> None:
+        self.assertEqual(gemm_merge_drift_models({"opt": (0, False)}, set()), [])
+
+    def test_regex_matches_gated_act_and_seams(self) -> None:
+        silu = "vt::SiluAndMul(d.q, out.t(), gate_up.t());"
+        gelu = "vt::GeluAndMul(d.q, out.t(), gate_up.t());"
+        standalone_mm = "vt::MatmulBT(d.q, out.t(), x.t(), w);"  # no gated act
+        self.assertEqual(mod.count_gated_mlp_act(silu), 1)
+        self.assertEqual(mod.count_gated_mlp_act(gelu), 1)
+        self.assertEqual(mod.count_gated_mlp_act(standalone_mm), 0)
+        # every legitimate fused-gate-up construct is an adoption signal
+        for seam in (
+            "layers::UnquantizedMlpGateUpMethod m;",
+            "layers::UnquantizedMlpGateUpGeluMethod m;",
+            "layers::MakeMlpGateUpMethod(w);",
+            "vt::MergedGemm(kKeepQuantGateUpSwiGLU, ...);",
+            "vt::MoeGateUpSwiGLUGrouped(q, o, a, gw, uw, eid, limit);",
+            "dense_nvfp4::GateUpFusedMarlinD(...);",
+            "ResidentNvfp4GateUp(d, w);",
+        ):
+            self.assertTrue(mod.uses_merged_gemm_seam(seam), seam)
+        self.assertFalse(mod.uses_merged_gemm_seam(silu))
+
+    def test_shipped_tree_is_green(self) -> None:
+        scanned = mod.scan_models_gemm(ROOT / "src/vllm/model_executor/models")
+        allowlisted = mod.allowlisted_names(
+            (ROOT / "scripts/merged-gemm-consistency-allowlist.txt").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(gemm_merge_drift_models(scanned, allowlisted), [])
+
+    def test_a_new_unfolded_model_would_fail(self) -> None:
+        scanned = dict(mod.scan_models_gemm(ROOT / "src/vllm/model_executor/models"))
+        scanned["brand_new_mlp_arch"] = (2, False)
+        allowlisted = mod.allowlisted_names(
+            (ROOT / "scripts/merged-gemm-consistency-allowlist.txt").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn(
+            "brand_new_mlp_arch", gemm_merge_drift_models(scanned, allowlisted)
+        )
+
+    def test_allowlist_is_load_bearing(self) -> None:
+        # Emptying the allowlist must expose every in-tree unfolded model, and the
+        # allowlist must suppress at least one the detector really sees.
+        scanned = mod.scan_models_gemm(ROOT / "src/vllm/model_executor/models")
+        allowlisted = mod.allowlisted_names(
+            (ROOT / "scripts/merged-gemm-consistency-allowlist.txt").read_text(
+                encoding="utf-8"
+            )
+        )
+        exposed = set(gemm_merge_drift_models(scanned, set()))
+        still_hand_rolling = {s for s, (n, seam) in scanned.items() if n and not seam}
+        self.assertEqual(still_hand_rolling - exposed, set())
+        self.assertTrue(
+            exposed & allowlisted,
+            "the merged-GEMM allowlist suppresses nothing the checker detects",
         )
 
 
