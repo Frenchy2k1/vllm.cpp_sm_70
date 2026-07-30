@@ -33746,3 +33746,58 @@ A→B→C→D + the Q8_0 GEMM all landed + gated; the decode graph captures + re
 speed ceiling on this Q8_0 model is the host path at 7.22 tok/s, and the device-resident/graph track needs tuned
 glue kernels to become a win. Box restored (worker running restart=always, flock free, no stray gen). Row `ACTIVE`.
 
+## DeepSeek-V4 device-resident decode campaign — GLUE-KERNEL TUNE (top-3 offenders → vLLM-faithful parallel): THE GRAPHED DECODE NOW BEATS HOST (2026-07-30, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-rd`, branch `deepseek-v4-glue-tune`, base `f83c8065`, commit `e232146f`, NOT pushed)
+
+The prior finding (device-resident is device-glue-kernel-efficiency bound, not launch-bound) motivated the
+coordinator's profile-first decision: nsys the graphed step, glue-vs-GEMM split. Verdict was TUNABLE-WIN (glue
+44% of GPU kernel time, the #1 kernel being MhcPre glue at 25.5%). Coordinator GREENLIT tuning the top glue
+offenders toward vLLM-faithful parallel kernels.
+
+**TUNED (top-3, cuda_deepseek_v4.cu):**
+1. `RouterGateKernel` — was one thread per expert looping H=4096 serially → ONE WARP per expert (32 lanes
+   stride H + `__shfl_down_sync` warp-tree reduce). Near-tie vs the prior sequential f32 sum (strided partials
+   reorder — same reassociation class as the K-quant CUDA GEMM). **18× on this kernel** (7.5% → 0.6% of step).
+2. `MhcPreParallelKernel` (the #1 kernel) — was `<<<1,256>>>` doing the hc3=24 mix dot-products as 24
+   SEQUENTIAL block reductions in ONE block = ONE SM. Split into `MhcPreDotsKernel` (grid = hc3 blocks, one mix
+   dot each → concurrent across SMs; writes RAW dots into `mixes`) + `MhcPreFinishKernel` (sqrsum/rms +
+   `mixes[o]*=rms` + gates + thread-0 20-iter Sinkhorn in HOST ORDER + layer_out + folded final norm).
+   **BIT-IDENTICAL** to the old kernel: each dot is the SAME 256-thread block reduction (same partial
+   assignment + tree), just in its own block; `acc*rms` is a scalar mult, order-independent. **4.8×** (25.5% →
+   7.5% combined).
+3. `HcHeadKernel` — was `<<<1,1>>>` single-thread (the profiled 3.75 ms/instance!) → one block, blockDim over
+   flat: block-tree ss reduction + the hc pre-dots + parallel per-h collapse. BOTH launchers (the in-place hot
+   path + the #183 round-trip the unit test compares against) use it ⇒ they stay bit-identical to each other;
+   characterized near-tie vs the old single-thread float accumulation. **42×** (3.75 ms → 88 µs/instance,
+   2.1% → 0.1%). RoPE (5.2%→7.3%) / Route (3.3%→4.7%) deferred — the goal was met after 1-3.
+
+**GATE (DGX GB10):** `test_cuda_deepseek_v4` **18/18·34176** (the router_gate / MhcPre / HcHead per-kernel
+equivalence cases stayed green — bit-identical where accumulation order is preserved, characterized near-tie
+where the warp/block reduction reorders, RED-first unchanged); `test_deepseek_v4_gguf_load` 12/12·531; real
+80.7 GB model, host + eager-resident + the GRAPH all **TOKEN-IDENTICAL** ("…Paris.", exact 25 ids), graph 0
+errors. Tuning changed SPEED, not tokens.
+
+**THE NEW ours-vs-ds4 (2 stable runs, real 80.7 GB, 5-tok prompt, 24 decode steps, GB10): host 7.20 tok/s ·
+eager-resident 7.96 · GRAPH 7.92 · ds4 16.5 — THE GRAPHED DECODE BEATS HOST (+10%).** The device-resident/graph
+path, at 5.57 tok/s before the tune, is now the FASTEST decode path. util: resident 95%, graph 95%.
+
+**THE NEW per-kernel nsys breakdown (graphed step): GEMM ~78% · GLUE ~21% · ATTN ~1.3%.** The tune collapsed
+the glue from 44% → 21%: MhcPre 25.5%→7.5% (Finish 6.0% + Dots 1.5%), RouterGate 7.5%→0.6%, HcHead 2.1%→0.1%.
+The GEMMs (`QuantDotGemmQ8_0Kernel` 35.6%, grouped IQ2_XXS 20.2%, grouped Q2_K 10.0%, + the Q8_K/Q8_0
+activation quant 11.9%) now dominate. Remaining glue: RopeKernel 7.3% (per-row sequential YaRN recurrence +
+double cos/sin — feeds attention, precision-sensitive → not tuned), MhcPreFinish 6.0% (incl. the IRREDUCIBLE
+20-iter 4×4 Sinkhorn on thread 0), RouteKernel 4.7% (single-thread-per-token sqrtsoftplus + top-k selection).
+Partly irreducible; with the step now GEMM-bound, full glue elimination caps ~10 tok/s.
+
+**THE H2H-MEMCPY LEVER (investigated per the coordinator):** NOT on the critical path. util is 95% GPU-bound and
+the path beats host, so the ~40K per-run `cudaMemcpyAsync` broadcasts (which nsys classifies as Host-to-Host
+because the `std::vector` buffers are host pointers) overlap the GPU kernels and do not gate wall time. No change.
+
+**Ops:** scp'd only cuda_deepseek_v4.cu onto the reused `vllmcpp-mmspeed/build-cuda` sm_121a tree (md5-verified;
+drift-checked vs merged main `f83c8065` = MATCH), fast incremental rebuild, worker stopped during build/bench/
+nsys then RESTORED (running, restart=always), flock held for the GPU runs, ONE engine at a time, nsys with
+`--cuda-graph-trace=node` inside `env -i`, 2 bench runs for stability. Rollback-able (the three `VT_V4_*` device
+flags remain default OFF). **RECOMMEND flipping the device-resident/graph default ON — it is now the fastest
+decode path (beats host +10%, token-identical, graph capture-hazard-safe); the true last mile to ds4's 16.5 is
+GEMM/quant microarch (fp8 KV, tuned MMQ), a named residual.** Box restored (worker running restart=always, flock
+free, no stray gen). Row `ACTIVE`.
+

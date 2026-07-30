@@ -636,6 +636,21 @@ is **glue-kernel-efficiency bound**, not launch-bound; the graph works + is toke
 is a speed dead-end on GB10 vs the fast ARM CPU. NAMED last mile to ds4's 16.5 (not started, user decision):
 tune the device glue kernels, fp8 KV, and/or an async host path overlapping CPU glue with GPU GEMMs. Rollback-
 able (device flags OFF; the Q8_0 GEMM is always-on + benefits every path). Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Device-resident decode campaign — GLUE-KERNEL TUNE (top-3 offenders): THE GRAPHED DECODE NOW BEATS HOST
+(2026-07-30, base `f83c8065`, branch `deepseek-v4-glue-tune`, commit `e232146f`, NOT pushed).** After the
+profile-first tunable-win verdict (glue 44% of GPU time), tuned the top-3: (1) `RouterGateKernel`
+one-thread/expert → ONE WARP/expert — **18×** (7.5%→0.6%); (2) `MhcPreParallelKernel` (the #1 kernel,
+`<<<1,256>>>` = 24 sequential block reductions in ONE SM) → split `MhcPreDotsKernel` (one block per mix dot →
+concurrent, BIT-IDENTICAL) + `MhcPreFinishKernel` — **4.8×** (25.5%→7.5%); (3) `HcHeadKernel` `<<<1,1>>>` →
+one-block parallel — **42×** (3.75 ms→88 µs/instance). GATE: `test_cuda_deepseek_v4` **18/18·34176** (tuned
+kernels' equivalence cases stayed green); `test_deepseek_v4_gguf_load` 12/12·531; real 80.7 GB host + resident
++ graph all **TOKEN-IDENTICAL** ("…Paris."), graph 0 errors. **NEW TABLE (2 runs, 24 decode): host 7.20 ·
+eager-resident 7.96 · GRAPH 7.92 · ds4 16.5 — THE GRAPHED DECODE BEATS HOST (+10%).** New nsys split: GEMM
+~78% · GLUE ~21% (RoPE 7.3%, MhcPreFinish 6.0% incl. Sinkhorn floor, Route 4.7% — partly irreducible) · ATTN
+~1.3% — the step is now GEMM-bound (full glue elimination caps ~10 tok/s; the true last mile to ds4 16.5 is
+GEMM/quant microarch — fp8 KV, tuned MMQ). The H2H-memcpy lever is NOT on the critical path (util 95%,
+beats host). RECOMMEND flipping the device-resident/graph default ON (fastest path; flags still default OFF
+pending that call). Rollback-able. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
