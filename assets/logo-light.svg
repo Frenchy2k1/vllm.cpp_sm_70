@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 210 64" width="210" height="64" role="img" aria-label="vllm.cpp">
+  <g>
+    <path d="M23.5 6 V58" stroke="#cbcdce" stroke-width="1.4"/>
+    <path d="M42.5 6 V58" stroke="#cbcdce" stroke-width="1.4"/>
+    <rect x="4" y="9" width="26" height="6.5" rx="2" fill="#20889e"/>
+    <rect x="34" y="9" width="26" height="6.5" rx="2" fill="#6eb2c0"/>
+    <rect x="4" y="20" width="42" height="6.5" rx="2" fill="#0f7f96"/>
+    <rect x="12" y="31" width="48" height="6.5" rx="2" fill="#469cae"/>
+    <rect x="4" y="42" width="16" height="6.5" rx="2" fill="#6eb2c0"/>
+    <rect x="24" y="42" width="36" height="6.5" rx="2" fill="#20889e"/>
+    <rect x="20" y="53" width="32" height="6.5" rx="2" fill="#54a4b4"/>
+  </g>
+  <text x="76" y="41" font-family="DejaVu Sans Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="27" letter-spacing="-1.6" font-weight="700" fill="#131a20">vllm<tspan fill="#0f7f96">.cpp</tspan></text>
+</svg>

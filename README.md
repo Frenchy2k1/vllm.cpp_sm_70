@@ -1,39 +1,71 @@
-# vllm.cpp
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.png">
+    <img alt="vllm.cpp" src="assets/logo-dark.png" width="420">
+  </picture>
+</p>
+
+<p align="center">
+  <b>vLLM's serving engine, in C++20. No Python, no PyTorch, no ggml at inference.</b>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue"></a>
+  <a href="docs/BENCHMARKS.md"><img alt="vs vLLM" src="https://img.shields.io/badge/Qwen3.6--27B_vs_vLLM-token--exact_%2B_faster_at_every_concurrency-3ec8e0"></a>
+  <a href="docs/STATUS.md"><img alt="Architectures" src="https://img.shields.io/badge/architectures-25%2B_gated-7ee787"></a>
+  <a href="https://github.com/mudler/LocalAI"><img alt="LocalAI" src="https://img.shields.io/badge/LocalAI-Run_Locally-orange"></a>
+</p>
 
 **Brought to you by the [LocalAI](https://github.com/mudler/LocalAI) team**, the folks behind LocalAI, the open-source AI engine that runs any model (LLMs, vision, voice, image, video) on any hardware, no GPU required.
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](LICENSE)
-[![LocalAI](https://img.shields.io/badge/LocalAI-Run_Locally-orange)](https://github.com/mudler/LocalAI)
-
 A lightweight, community-first vLLM. vllm.cpp is a from-scratch C++20 port of
-[vLLM](https://github.com/vllm-project/vllm)'s serving engine, continuous batching, paged KV cache,
-prefix caching and speculative decoding included, with no Python, PyTorch, or ggml at inference time.
-It ships llama.cpp-style as one library behind a flat C ABI, plus a CLI and an OpenAI-compatible
-server. It loads Hugging Face **safetensors** and **GGUF** checkpoints, and builds for CUDA, CPU,
-Metal, and Vulkan from one source tree.
+[vLLM](https://github.com/vllm-project/vllm)'s serving engine: continuous batching, block-paged KV
+cache, automatic prefix caching, and speculative decoding, with no Python, PyTorch, or ggml at
+inference time. It ships llama.cpp-style as one library behind a flat C ABI, plus a CLI and an
+OpenAI-compatible server. It loads Hugging Face **safetensors** and **GGUF**, and builds for CUDA,
+CPU, Metal, and Vulkan from one source tree.
 
 ![vllm.cpp vs vLLM on Qwen3.6-27B: ahead at every concurrency](benchmarks/media/concurrency_race.gif)
 
-**It holds up under load.** Against vLLM itself on Qwen3.6-27B (NVFP4, GB10), the output is
-token-for-token identical and the total throughput is higher at every concurrency:
+> The same model, the same prompts, side by side: **token-for-token identical output, and vllm.cpp
+> finishes first** ([full clip](benchmarks/media/concurrency_race.mp4)).
+
+## Performance: faster than vLLM
+
+Qwen3.6-27B (NVFP4) on NVIDIA GB10, greedy, closed loop, against the vLLM oracle in its
+**production graphed config** (not `--enforce-eager`). Output is token-for-token identical at every
+point on this curve:
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---|---|---|---|---|---|
-| Ours (tok/s) | 86.05 | 159.68 | 292.34 | 508.77 | 801.76 | 1095.01 |
+| **vllm.cpp** (tok/s) | **86.05** | **159.68** | **292.34** | **508.77** | **801.76** | **1095.01** |
 | vLLM (tok/s) | 82.32 | 158.03 | 290.31 | 505.46 | 789.16 | 1076.25 |
 | **Ratio** | **1.045x** | **1.011x** | **1.007x** | **1.007x** | **1.016x** | **1.017x** |
 
-It does that in 24.88 GiB of peak host memory against vLLM's 28.18 GiB, from a binary with no Python
-stack behind it. That last part is not a detail:
+Six axes, six wins, in **24.88 GiB of peak host memory against vLLM's 28.18 GiB**. And there is no
+Python stack behind it. That last part is not a footnote:
 
 ![What you install: 9.4 GiB venv vs one 10 MiB binary](benchmarks/media/footprint.png)
+
+Elsewhere, measured the same way:
+
+| Comparison | Result |
+|---|---|
+| **CPU vs llama.cpp** (same GGUF file, single binary) | Prefill **223.8 tok/s vs 177.3** (**1.18x ahead**), decode at parity (24.7 vs 25.4), peak memory 2.83 GiB vs 2.80, and the output tokens are **byte-identical to llama.cpp's greedy decode** |
+| **Metal vs MLX-LM** (Apple Silicon, warm b=1) | Prefill **1.5% ahead** (524.5 ms vs 532.6 TTFT); warm total 97.6% with the optional MLX provider shape-gated to prefill, 95.9% on the default build. Indicative: two models run end to end, 18 of 75 ops native |
+| **MTP speculative decoding** | Token-identical to vLLM's MTP and ~4% faster at c1 on Qwen3.6-27B-NVFP4 |
+
+Full per-axis grids, memory tables, the nine residual axes, and exact reproduction recipes:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). The two figures above are rendered from these measured
+numbers by [`benchmarks/demo/`](benchmarks/demo/), which reads its values from a committed spec, so
+every figure traces back to the run that produced it.
 
 > **Pre-release, under heavy development.** Correctness is gated token-for-token against a pinned
 > vLLM oracle across 25+ architectures. Speed is proven on one GPU (NVIDIA GB10 / DGX Spark,
 > sm_121a) plus a CPU path that matches or beats llama.cpp on GGUF. Every capability is labelled
 > honestly in [docs/STATUS.md](docs/STATUS.md): *correctness-complete*, *speed-pending*,
-> *build-only*, or *hardware-blocked*. The full evidence is in
-> [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+> *build-only*, or *hardware-blocked*.
 
 ## Quickstart
 
@@ -54,9 +86,39 @@ curl http://localhost:8000/v1/completions \
 ```
 
 Any OpenAI client works by pointing its `base_url` at it. For a one-shot completion without a
-server, use `build/examples/vllm-cli --model <dir> --prompt "..."`.
+server: `build/examples/vllm-cli --model <dir> --prompt "..."`. Full CLI, server, and library
+reference: [docs/USAGE.md](docs/USAGE.md). CUDA, Metal, Vulkan, and every CMake option:
+[docs/BUILD.md](docs/BUILD.md).
 
-## Features
+## Features beyond vLLM parity
+
+vllm.cpp **mirrors vLLM by default**: same scheduler, same sampling order, same flags, same JSON
+configs, token-for-token the same output. On top of that:
+
+- **One 10 MiB binary instead of a 9.4 GiB venv.** A flat, exception-free, llama.cpp-style C ABI
+  ([`include/vllm.h`](include/vllm.h), 19 symbols) you can `dlopen` from C, C++, Go, or Rust. No
+  Python interpreter in the process, ever.
+- **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
+  **compute directly on the compressed blocks** (Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) with no BF16
+  expansion. Byte-identical greedy output to llama.cpp.
+- **SGLang's good ideas, as documented toggles.** RadixAttention / prefix caching, LPM cache-aware
+  scheduling, jump-forward decoding, and custom logits processors, opt-in from the library, the C
+  ABI, or server flags. Each defaults to today's behavior, so an engine that sets none of them is
+  byte-identical to one built without them ([docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md)).
+- **Runs on hardware people actually have.** CUDA, CPU, Metal, and Vulkan from one source tree, with
+  an MLX GEMM provider on Apple Silicon and an Arm i8mm quant-GEMM tier. No datacenter assumption
+  baked in.
+- **Speculative decoding beyond ngram.** MTP, block-diffusion DFlash, and draft-free ngram, through
+  the same `--speculative-config` JSON vLLM takes
+  ([docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md)).
+- **Additive by design.** New architectures and new GPU targets land as additive files mirroring
+  vLLM's own structure, so upstream changes port mechanically and a contribution stays a small diff.
+- **Honest numbers.** Every capability is labelled correctness-complete, speed-pending, build-only,
+  or hardware-blocked, and the evidence is in the record. Nothing is called fast that was not
+  measured against a reference.
+
+<details>
+<summary><b>The full feature surface</b> (serving core, sampling, structured output, tool calling, multimodal, external KV)</summary>
 
 - **vLLM's serving core.** Continuous batching, block-paged KV cache, automatic prefix caching (on
   by default for dense models), and the V1 / Model Runner V2 scheduler and engine step loop.
@@ -66,31 +128,37 @@ server, use `build/examples/vllm-cli --model <dir> --prompt "..."`.
 - **Structured output.** JSON schema, JSON object, regex, choice, and GBNF grammar, enforced in the
   engine with a per-step logits bitmask.
 - **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 9 reasoning
-  parsers, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`.
-- **Speculative decoding.** MTP, block-diffusion DFlash, and draft-free ngram via
-  `--speculative-config`, the same JSON vLLM takes.
+  parsers, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
+  render through the vendored google/minja engine, the same renderer llama.cpp ships.
 - **Multimodal.** Image, video, and audio to text, correctness-complete on a single-sequence path
   (not yet wired into the OpenAI server).
-- **Quantization.** NVFP4 W4A4/W4A16, compressed-tensors NVFP4A16, GGUF F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/
-  Q5_K/Q6_K, and an FP8 W8A8 slice. On CPU the GGUF block encodings compute directly on the
-  compressed blocks, with no BF16 expansion.
+- **Quantization.** NVFP4 W4A4/W4A16, compressed-tensors NVFP4A16, GGUF
+  F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K, and an FP8 W8A8 slice.
 - **External KV.** KV offload to CPU/disk and an `lm://` LMCache client, plus KV-cache events for
-  external routers. Opt-in, off by default.
-- **SGLang-compatible knobs.** RadixAttention / prefix caching, LPM cache-aware scheduling,
-  jump-forward decoding, and custom logits processors, opt-in from the library, C ABI, or server
-  flags (`--enable-radix-attention`, `--scheduling-policy lpm`, `--enable-jump-forward`). Each
-  defaults to today's behavior; when and whether to turn them on is
-  [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md).
-- **Backends.** CUDA, CPU, Metal, and Vulkan from one source tree.
+  external routers. Opt-in, off by default ([docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md)).
+- **Observability.** Prometheus `/metrics` with vLLM's metric names, `/server_info`, `/tokenize`,
+  `/detokenize`, and `/reset_prefix_cache`.
 
-Per-capability lifecycle state, active gaps, and the next gate for each: [docs/STATUS.md](docs/STATUS.md).
+Per-capability lifecycle state, active gaps, and the next gate for each:
+[docs/STATUS.md](docs/STATUS.md).
+
+</details>
 
 ## Supported models
 
 Every architecture below passes a token-for-token correctness gate against the pinned vLLM oracle on
 GB10. Where vLLM's own greedy is deterministic the bar is strict token-exact; where vLLM is
 self-inconsistent at bf16 near-ties, the bar is a near-tie-robust check. "Speed" is a separate bar
-(match or beat vLLM on every axis), tracked in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+(match or beat vLLM on every axis).
+
+**Gate models:** Qwen3.6-27B and Qwen3.6-35B-A3B (hybrid GDN + MoE, NVFP4), both token-exact, the
+27B at or above vLLM throughput on every axis. **Also running:** Llama-3.x, Mistral, Qwen3/Qwen2
+dense and MoE, DeepSeek-V2 and V4-Flash (MLA), GLM-4 and GLM-4.7-Flash, Gemma-1 through Gemma-4,
+Phi-1 through Phi-4, OLMo-2, Granite-3, StableLM, InternLM2/3, MiniCPM and MiniCPM3, Yi, OPT, plus
+Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
+
+<details>
+<summary><b>The full architecture matrix</b> (26 rows, with per-model correctness and speed state)</summary>
 
 | Architecture | Example checkpoint | GGUF | Correctness | Speed |
 |---|---|:---:|---|---|
@@ -126,194 +194,86 @@ Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 sliding-window attention are gated feature-positive. Family-by-family detail, including what is
 hardware-blocked and why: [docs/STATUS.md](docs/STATUS.md).
 
-## Performance
+</details>
 
-Measured on NVIDIA GB10 (DGX Spark, sm_121a) against the vLLM 0.25.0 oracle, greedy, closed loop,
-input 1024 tokens to output 128, three interleaved repetitions, ratios direction-normalized so 1.0
-or higher passes. The full per-axis grids, memory tables, and exact reproduction recipes are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+## Hardware
 
-The headline concurrency table is at the top of this file. Alongside it, effective parity is 115/124
-per-axis metrics (two-grid totality), with the residuals being noise-band coin-flips or a favorable
-determinism tradeoff described in the benchmark record. Peak host memory also passes (24.88 GiB vs
-vLLM 28.18 GiB). The 35B decode path is at or beyond vLLM everywhere; its remaining gap is prefill
-time-to-first-token, tracked as active work.
+| Backend | Hardware | State |
+|---|---|---|
+| **CUDA** | GB10 / DGX Spark (sm_121a) | Runtime-gated. 27B at/above vLLM throughput, 35B prefill-pending |
+| **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 through sm_121a) | Build-supported, compiles to real machine code, fast GDN path build-verified per-arch. Not runtime-proven here (no such boards) |
+| **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis, Arm i8mm quant-GEMM tier |
+| **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
+| **Vulkan** | Portable GPU | Skeleton: 8 ops plus the fusion catalogue cross-check against CPU and CUDA. No model runs yet |
+| **Intel XPU / ROCm / ANE** | Intel, AMD, Apple Neural Engine | Spiked or roadmap |
 
-**CPU vs llama.cpp (GGUF, same file, single binary):** prefill 223.8 tokens/s vs llama.cpp 177.3
-(1.18x ahead), decode at parity (24.7 vs 25.4 tokens/s), peak memory 2.83 GiB vs 2.80 (1.01x), and
-the output tokens are byte-identical to llama.cpp's greedy decode. This comparison is single-stream
-only; no concurrent-serving comparison against llama.cpp has been measured yet.
-
-The two figures above are rendered from these measured numbers by
-[`benchmarks/demo/`](benchmarks/demo/), which reads its values from a committed spec so any figure
-can be traced back to the run that produced it. There is no side-by-side race clip against
-llama.cpp's server yet, because the concurrent-serving comparison behind it has not been measured;
-when it is, it will follow the LocalAI house style (identical output, honest measured ratios).
+Per-arch build flags, per-op coverage, and the quantization format table:
+[docs/BUILD.md](docs/BUILD.md).
 
 ## Build
 
-vllm.cpp uses CMake (>= 3.24) and a C++20 compiler (gcc 13/14 and clang are exercised; the tree
-builds -Werror-clean on gcc 14.2). The core has no ML dependencies; the OpenAI server uses a vendored
-header-only HTTP transport (cpp-httplib).
+CMake (>= 3.24) and a C++20 compiler. The core has no ML dependencies, and the tree builds
+-Werror-clean on gcc 14.2.
 
 ```sh
-# CPU build (the correctness / CI reference). The server is ON by default.
-cmake -S . -B build
-cmake --build build -j
+cmake -S . -B build && cmake --build build -j   # CPU: the correctness / CI reference
 ctest --test-dir build
 ```
 
 ```sh
-# NVIDIA GB10 build with the vendored fast GDN path.
-# Triton-AOT cubins are vendored: Python/Triton is only needed to regenerate
-# them (VLLM_CPP_TRITON_REGEN), never to build or run them.
-cmake -S . -B build-cuda \
-  -DVLLM_CPP_CUDA=ON \
-  -DVLLM_CPP_TRITON=ON
+cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON   # NVIDIA GB10
 cmake --build build-cuda -j
 ```
 
-The example binaries land under `build/examples/`: `vllm-cli`, `server`, `vllm-bench`, and
-`tokenize`.
-
-### CMake options
-
-Read from [`CMakeLists.txt`](CMakeLists.txt). Defaults shown are the shipped defaults.
-
-| Option | Default | Purpose |
-|---|---|---|
-| `VLLM_CPP_CUDA` | `AUTO` | Build the CUDA backend: `ON`, `OFF`, or `AUTO` (on when a CUDA toolchain is found) |
-| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110`. The `a` suffix is required for the native fp4 MMA |
-| `VLLM_CPP_METAL` | `AUTO` | Build the Metal backend: `ON`, `OFF`, or `AUTO` (on for an Apple host with an ObjC++ compiler) |
-| `VLLM_CPP_VULKAN` | `AUTO` (= `OFF`) | Build the Vulkan backend. Opt-in with `-DVLLM_CPP_VULKAN=ON`; headers are vendored and SPIR-V is committed, so no graphics toolchain is needed |
-| `VLLM_CPP_MLX` | `OFF` | Build the optional MLX GEMM provider for Metal (needs `-DMLX_ROOT=<mlx install>`) |
-| `MLX_ROOT` | (empty) | Root of an MLX install (`include/` + `lib/`) for `VLLM_CPP_MLX` |
-| `VLLM_CPP_SERVER` | `ON` | Build the OpenAI HTTP server (needs `third_party/httplib/httplib.h`; disables itself with a warning if absent) |
-| `VLLM_CPP_TRITON` | `OFF` | Consume the vendored per-arch Triton-AOT GDN cubins (CUDA only; no Python needed) |
-| `VLLM_CPP_TRITON_REGEN` | `OFF` | Maintainer knob: regenerate the AOT cubins with Python + Triton |
-| `VLLM_CPP_CUTLASS_DIR` | `third_party/cutlass` | CUTLASS source root (>= 4.5.0) for the sm120a NVFP4 GEMM |
-| `VLLM_CPP_CUTLASS_FETCH` | `OFF` | FetchContent CUTLASS 4.5.0 if not found locally |
-| `VLLM_CPP_MARLIN` | `ON` | Build the vendored Marlin NVFP4 W4A16 MoE GEMM (sm_12xa) |
-| `VLLM_CPP_BUILD_TESTS` | `ON` | Compile and register ctest targets |
-| `VLLM_CPP_BUILD_EXAMPLES` | `ON` | Build the example CLI, server, and bench binaries |
-| `VLLM_CPP_BENCH_PROFILE_CONTROL` | `OFF` | Trace-only profiler replay control (never for production timing builds) |
-
-Only GB10 / sm_121a is a runtime-gated CUDA target today. Consumer Blackwell (`120a`) plus the
-cross-family targets are build-supported (they compile and emit real machine code, with the fast GDN
-path build-verified on several) but unproven at runtime here (no such board), and non-Apple /
-non-NVIDIA backends run a subset of operations. See
-[Acceleration](#acceleration) and the [backend matrix](.agents/backend-matrix.md).
+Triton-AOT cubins for the fast GDN path are vendored, so Python and Triton are needed only to
+regenerate them, never to build or run them. Metal is auto-detected on Apple hosts; Vulkan is opt-in
+with `-DVLLM_CPP_VULKAN=ON`. Every CMake option, per-backend recipe, and the quantization format
+table: [docs/BUILD.md](docs/BUILD.md).
 
 ## Running inference (CLI)
 
-`vllm-cli` runs a one-shot completion through the C ABI. Source:
-[`examples/cli/main.cpp`](examples/cli/main.cpp).
-
 ```sh
-build/examples/vllm-cli \
-  --model /path/to/Qwen3.6-27B \
-  --prompt "The capital of France is" \
-  --max-tokens 64
+build/examples/vllm-cli --model /path/to/Qwen3.6-27B --prompt "The capital of France is" --max-tokens 64
 ```
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--model <dir>` | (required) | Model directory (config.json + tokenizer.json + safetensors) |
-| `--prompt "<text>"` | (required) | Prompt text |
-| `--tokenizer-config <path>` | (none) | Override `tokenizer_config.json` |
-| `--max-tokens N` | `16` | Max tokens to generate |
-| `--temperature T` | `0.0` | Sampling temperature (`<= 0` means greedy) |
-| `--top-p P` | `1.0` | Nucleus cutoff |
-| `--top-k K` | `0` | Top-k (`0` means all) |
-| `--seed S` | (unset) | RNG seed (enables seeded sampling) |
-| `--stream` | off | Stream token deltas to stdout |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding, same JSON as vLLM's flag. See [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) |
-| `-h`, `--help` | | Print usage and exit |
-
-A throughput/latency harness, `vllm-bench` ([`examples/bench/main.cpp`](examples/bench/main.cpp)),
-takes `--model`, `--dataset-path`, `--num-prompts`, `--input-len`, `--output-len`, `--concurrency`,
-`--max-num-batched-tokens`, and `--num-blocks`. A tokenizer smoke tool, `tokenize`
-([`examples/tokenize/main.cpp`](examples/tokenize/main.cpp)), takes
-`<tokenizer.json | model.gguf> <corpus.txt>`.
+`vllm-bench` (throughput/latency harness) and `tokenize` (tokenizer smoke tool) ship alongside it.
+All flags, including `--speculative-config`: [docs/USAGE.md](docs/USAGE.md).
 
 ## OpenAI-compatible server
 
-`server` is a small HTTP server speaking the OpenAI API. Source:
-[`examples/server/main.cpp`](examples/server/main.cpp) and
-[`src/vllm/entrypoints/openai/`](src/vllm/entrypoints/openai/). See [Quickstart](#quickstart) for a
-runnable example.
+```sh
+build/examples/server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
+```
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
-print(client.completions.create(model="Qwen3.6-35B-A3B",
+print(client.completions.create(model="Qwen3.6-27B",
                                 prompt="The capital of France is",
                                 max_tokens=64).choices[0].text)
 ```
 
-Endpoints (registered in
-[`src/vllm/entrypoints/openai/api_server.cpp`](src/vllm/entrypoints/openai/api_server.cpp)):
-
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/v1/completions` | Text completion (JSON or `text/event-stream`) |
-| POST | `/v1/chat/completions` | Chat completion (JSON or streaming SSE) |
-| GET | `/v1/models` | List the served model |
-| GET | `/health` | Process liveness (200) |
-| GET, POST | `/ping` | Liveness probe (200, mirrors `/health`) |
-| GET | `/version` | Engine version |
-| GET | `/metrics` | Prometheus metrics (`vllm:*` names, text format 0.0.4) |
-| POST | `/tokenize` | Tokenize a `prompt` to token ids (optional `token_strs`) |
-| POST | `/detokenize` | Detokenize token ids back to text |
-| GET | `/server_info` | Server info (`vllm_config`, `vllm_env`, `system_env`) |
-| POST | `/reset_prefix_cache` | Reset the prefix cache; returns `{"success": bool}` |
-
-Server flags:
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--model <dir>` | (required) | Model directory (safetensors or `.gguf`) |
-| `--host H` | `0.0.0.0` | Bind host |
-| `--port P` | `8000` | Bind port |
-| `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
-| `--tokenizer-config F` | `<dir>/tokenizer_config.json` | Chat template / tokenizer config |
-| `--block-size N` | `32` | KV block size |
-| `--num-blocks N` | `256` | KV blocks |
-| `--max-model-len N` | `0` (config default) | Max sequence length |
-| `--max-num-seqs N` | `8` | Max concurrent sequences (also sizes the HTTP worker pool) |
-| `--max-num-batched-tokens N` | `0` (per-arch default) | Per-step token budget |
-| `--enable-prefix-caching` / `--no-enable-prefix-caching` | model default | Override automatic prefix caching |
-| `--scheduling-policy fcfs\|priority` | `fcfs` | Scheduler policy |
-| `--enable-force-include-usage` | off | Force the usage block in responses |
-| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (40 names over 36 families). `auto` detects from the chat template, `none` disables |
-| `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`). `auto` detects, `none` disables |
-| `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) |
-| `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. See [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) |
-| `-h`, `--help` | | Print usage and exit |
+`/v1/completions`, `/v1/chat/completions`, `/v1/models`, `/health`, `/ping`, `/version`,
+Prometheus `/metrics` with vLLM's metric names, `/tokenize`, `/detokenize`, `/server_info`, and
+`/reset_prefix_cache`. The full endpoint and flag tables are in [docs/USAGE.md](docs/USAGE.md).
 
 For a production deployment, use [LocalAI](https://localai.io), which can embed engines like this
 behind a model gallery, multi-model serving, the full OpenAI API surface, auth, and metrics.
 
-## Consuming it as a library (C API and C++)
+## Use it as a library (C API)
 
-Link `libvllm` (static or shared) and include [`include/vllm.h`](include/vllm.h). It exposes a flat,
-exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 9`, 19 exported symbols) suitable for
-`dlopen` / FFI / LocalAI integration.
+Link `libvllm` and include [`include/vllm.h`](include/vllm.h): a flat, exception-free,
+llama.cpp-style C ABI (`VLLM_ABI_VERSION 9`, 19 exported symbols) suitable for `dlopen` / FFI.
 
 ```c
-#include "vllm.h"
-
 vllm_model_params mp = vllm_model_params_default();
 mp.model_path = "/path/to/model";
 
 vllm_engine *engine = NULL;
-if (vllm_engine_load(&mp, &engine) != VLLM_OK) {
-    fprintf(stderr, "%s\n", vllm_last_error());
-    return 1;
-}
+if (vllm_engine_load(&mp, &engine) != VLLM_OK) { fprintf(stderr, "%s\n", vllm_last_error()); return 1; }
 
 vllm_sampling_params sp = vllm_sampling_params_default();
-sp.max_tokens = 64;               // sp.temperature = 0.0 means greedy
+sp.max_tokens = 64;               /* sp.temperature = 0.0 means greedy */
 
 vllm_completion out;
 if (vllm_complete(engine, "The capital of France is", &sp, &out) == VLLM_OK) {
@@ -323,69 +283,36 @@ if (vllm_complete(engine, "The capital of France is", &sp, &out) == VLLM_OK) {
 vllm_engine_free(engine);
 ```
 
-The ABI covers lifecycle, blocking and streaming completion, non-blocking concurrent requests,
-memory helpers, and diagnostics. Later ABI versions add structured output (v2), chat with tools and
-templates (v3), tool-parser selection (v4), reasoning-parser selection (v5), speculative decoding
-(v6), prefix caching (v7), custom logits processors (v8), and the engine-sizing config the bundled
-server exposes: chunked-prefill token budget, scheduling policy, and the external KV connector /
-LMCache (v9). Chat templates render through the vendored google/minja engine, the same renderer
-llama.cpp ships. Full surface: [`include/vllm.h`](include/vllm.h) and
-[docs/STATUS.md](docs/STATUS.md).
-
-For C++ consumers, the higher-level surface lives under [`include/vllm/`](include/vllm/):
-`LoadedEngine::FromModelDir(...)` ([`entrypoints/model_loader.h`](include/vllm/entrypoints/model_loader.h))
-hands back the synchronous `LLMEngine` ([`v1/engine/llm_engine.h`](include/vllm/v1/engine/llm_engine.h))
-or the async `AsyncLLM` ([`v1/engine/async_llm.h`](include/vllm/v1/engine/async_llm.h)) the server
-itself uses. The underlying portable tensor runtime is `vt::` ([`include/vt/`](include/vt/)), which
-carries no ggml or PyTorch dependency.
-
-## Quantization
-
-| Format | State |
-|---|---|
-| NVFP4 W4A4 / W4A16 | Both gate-model paths run on GB10, token-exact. FP4 tactics match vLLM; Marlin NVFP4 W4A16 grouped-MoE is the 35B expert path |
-| compressed-tensors NVFP4A16 (W4A16), dense | Correctness-complete via the Marlin weight-only path; speed not yet measured |
-| GGUF F32 / F16 / Q4_0 / Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K | Supported. On CPU the six block encodings compute directly on the compressed blocks (`VT_GGUF_KEEP_QUANT=0` disables it). GPU builds still expand GGUF weights |
-| FP8 (W8A8) | The 35B ModelOpt static per-tensor projection slice is implemented; generic FP8 modes and FP8 KV remain open |
-| MXFP4 / MXFP8 | Planned |
-
-## Acceleration
-
-| Backend | Hardware | State |
-|---|---|---|
-| CPU | x86-64 and arm64 | Correctness / CI reference; at or ahead of llama.cpp on every GGUF axis, with an Arm i8mm quant-GEMM tier |
-| CUDA | GB10 / DGX Spark, sm_121a | Gate-model correctness passes; 27B at/above vLLM throughput, 35B prefill-pending. The only runtime-gated CUDA target |
-| CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
-| CUDA | Hopper, sm_90a | Build-supported; the fast GDN (Triton-AOT) path is build-verified, not runtime-proven here (no such card) |
-| CUDA | Ampere/Ada (sm_80/86/87/89), datacenter Blackwell (sm_100a/103a), sm_110 | Build-supported; the fast GDN (Triton-AOT) path is build-verified per-arch on sm_80/86/89/100a (plus FA2 on Ampere, sm_100a NVFP4 GEMM), not runtime-gated here. sm_70/sm_75 unsupported (no bf16 tensor cores) |
-| Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill. Indicative ([BENCHMARKS](docs/BENCHMARKS.md)) |
-| Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet; off unless `-DVLLM_CPP_VULKAN=ON` |
-| Intel XPU | Intel GPUs | Spiked, hardware-blocked |
-| ROCm / ANE | AMD GPUs / Apple Neural Engine | Post-parity roadmap |
+Structured output, chat with tools, tool and reasoning parser selection, speculative decoding,
+prefix caching, custom logits processors, and engine sizing all have ABI surface. C++ consumers get
+`LoadedEngine::FromModelDir(...)` handing back the same `LLMEngine` / `AsyncLLM` the server uses.
+Both surfaces: [docs/USAGE.md](docs/USAGE.md).
 
 ## Why vllm.cpp
 
 vLLM is an excellent serving framework, but running it drags in a heavy Python / PyTorch / CUDA
 stack. llama.cpp is wonderfully light, but it is built around one user at a time. vllm.cpp is aimed
-at the gap between them:
+squarely at the gap between them: **vLLM's concurrency, llama.cpp's deployment story**. Real
+continuous batching and paged KV in a single embeddable library, on the hardware you already own,
+and measured against both references rather than asserted.
 
-- **Real concurrency, no Python.** vLLM's continuous batching and paged KV in a single `libvllm`
-  behind a flat C ABI ([`include/vllm.h`](include/vllm.h)), easy to embed from C, C++, Go, or Rust,
-  or to `dlopen` from LocalAI.
-- **Runs on hardware people have.** One source tree for CUDA, CPU, Metal, and Vulkan, loading
-  safetensors and GGUF, with no datacenter assumption baked in.
-- **Additive by design.** New architectures and new GPU targets land as additive files that mirror
-  vLLM's own structure, so upstream changes port mechanically and a contribution stays a small diff.
-- **Honest numbers.** Every capability is labelled correctness-complete, speed-pending, build-only,
-  or hardware-blocked, and the evidence is in the record.
+## Documentation
 
-## Status and project record
+| Doc | What is in it |
+|---|---|
+| [docs/USAGE.md](docs/USAGE.md) | CLI, OpenAI server (endpoints + flags), C ABI, C++ API |
+| [docs/BUILD.md](docs/BUILD.md) | Build recipes per backend, every CMake option, hardware and quantization state |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | The measured evidence: per-axis grids, memory, reproduction recipes |
+| [docs/STATUS.md](docs/STATUS.md) | Per-capability lifecycle ledger, active gaps, next gate |
+| [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | The SGLang-inspired knobs, and when to turn them on |
+| [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) | MTP, DFlash, ngram |
+| [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) | KV offload to CPU/disk, LMCache client, KV events |
+| [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | Runtime environment variables |
 
-The per-capability status ledger is [docs/STATUS.md](docs/STATUS.md), and the measured evidence is
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md). The canonical project record lives under
-[`.agents/`](.agents/), indexed by [AGENTS.md](AGENTS.md): the append-only
-[`.agents/state.md`](.agents/state.md), the [parity ledger](.agents/parity-ledger.md), and the
-[model matrix](.agents/model-matrix.md). The portfolio-completion plan is tracked in
+The canonical project record lives under [`.agents/`](.agents/), indexed by [AGENTS.md](AGENTS.md):
+the append-only [`.agents/state.md`](.agents/state.md), the
+[parity ledger](.agents/parity-ledger.md), and the [model matrix](.agents/model-matrix.md). The
+portfolio-completion plan is
 [`.agents/specs/roadmap-v1-completion.md`](.agents/specs/roadmap-v1-completion.md).
 
 ## Citation

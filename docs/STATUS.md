@@ -1617,6 +1617,23 @@ spec-decode acceptance *trace*, off by default, output-neutral — `runner.cpp`
 `spec_trace`) on `scripts/env-doc-allowlist.txt`; introduced by the concurrent
 DFlash-GGUF session and left `check-env-doc` RED on main. No behavior change.
 
+**Landing-page restructure + project logo (2026-07-30):** DOCUMENTATION-ONLY, no
+capability state moved and no number changed. README.md becomes a landing page
+(logo lockup, scoped badges, the six-axis concurrency grid, the footprint figure,
+and a features block); its reference tables move to the new
+[docs/USAGE.md](USAGE.md) (CLI, endpoints, server flags, C ABI, C++) and
+[docs/BUILD.md](BUILD.md) (per-backend recipes, every CMake option, hardware and
+quantization state), and the 26-row architecture matrix plus the full feature list
+become `<details>`. The sections `scripts/check-readme-structure.py` requires are
+retained as compact linking sections, so the AGENTS.md landing-page contract holds
+with the tables elsewhere (README 23k -> 19.1k chars against the 30k budget). The
+logo ("Steps": the V1 scheduler timeline, bars crossing step boundaries) is
+rendered by `scripts/make-logo.py` from one source-of-truth geometry, reusing the
+`benchmarks/demo/concurrency_race.py` palette. Honest-numbers rule held: the Metal
+row states prefill 1.5% ahead of MLX-LM with warm total 97.6% MLX-gated / 95.9%
+default and the 18-of-75-ops caveat, and the performance badge is scoped to the
+Qwen3.6-27B gate model rather than implying every architecture beats vLLM.
+
 ## Upstream sync 2026-07-30 (`555967922..e04a30a77`, 198 commits)
 
 Bounded mechanical sync cycle. Enumerated + tier-classified the 198-commit delta
