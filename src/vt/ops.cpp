@@ -232,6 +232,41 @@ void MatmulBTQuantGrouped(Queue& q, Tensor& out, const Tensor& act,
       q, out, act, weight, expert_ids);
 }
 
+// vt::MoeGateUpSwiGLUGrouped — see ops.h. out[P,N] f32, act[Pa,K] (Pa==1 broadcast),
+// gate_w/up_w[E*N,K] SAME block-quant dtype, expert_ids[P] i32, float limit. Validation
+// mirrors MatmulBTQuantGrouped for BOTH weight towers plus the same-dtype/f32-out
+// contract the fused epilogue requires.
+void MoeGateUpSwiGLUGrouped(Queue& q, Tensor& out, const Tensor& act, const Tensor& gate_w,
+                            const Tensor& up_w, const Tensor& expert_ids, float limit) {
+  VT_CHECK(out.rank == 2 && act.rank == 2 && gate_w.rank == 2 && up_w.rank == 2,
+           "moe_gate_up_swiglu: rank-2 out/act/gate_w/up_w required");
+  const int64_t P = out.shape[0], N = out.shape[1], K = act.shape[1];
+  VT_CHECK(act.shape[0] == P || act.shape[0] == 1,
+           "moe_gate_up_swiglu: act rows must be P (per-expert) or 1 (broadcast)");
+  VT_CHECK(gate_w.shape[1] == K && up_w.shape[1] == K,
+           "moe_gate_up_swiglu: gate_w/up_w K mismatch (both are [E*N,K])");
+  VT_CHECK(gate_w.shape[0] % N == 0 && up_w.shape[0] == gate_w.shape[0],
+           "moe_gate_up_swiglu: gate_w/up_w rows must be a whole multiple of N and equal");
+  VT_CHECK(IsBlockQuant(gate_w.dtype) && gate_w.dtype == up_w.dtype,
+           "moe_gate_up_swiglu: gate_w/up_w must be the SAME block-quantized dtype");
+  VT_CHECK(IsFloat(act.dtype) && out.dtype == DType::kF32,
+           "moe_gate_up_swiglu: float activation and f32 output required");
+  VT_CHECK(gate_w.shape[1] % BlockElems(gate_w.dtype) == 0,
+           "moe_gate_up_swiglu: K must be a whole number of weight blocks");
+  VT_CHECK(expert_ids.Numel() == P && expert_ids.dtype == DType::kI32,
+           "moe_gate_up_swiglu: expert_ids must be i32 [P]");
+  VT_CHECK(act.stride[1] == 1 && act.stride[0] >= K,
+           "moe_gate_up_swiglu: activation rows must be packed (innermost stride 1)");
+  VT_CHECK(out.IsContiguous() && expert_ids.IsContiguous(),
+           "moe_gate_up_swiglu: contiguous out + expert_ids required");
+  VT_CHECK(act.device == q.device && gate_w.device == q.device && up_w.device == q.device &&
+               out.device == q.device && expert_ids.device == q.device,
+           "moe_gate_up_swiglu: device mismatch");
+  reinterpret_cast<MoeGateUpSwiGLUGroupedFn>(
+      GetOp(OpId::kMoeGateUpSwiGLUGrouped, q.device.type))(q, out, act, gate_w, up_w, expert_ids,
+                                                           limit);
+}
+
 // vt::BatchedMatmul — `torch.bmm` (mla_attention.py:789 q-side W_UK absorption,
 // :1034 W_UV v-up-projection). Stride-driven on every operand because BOTH
 // upstream call sites pass transposed views; only the innermost dim must be
