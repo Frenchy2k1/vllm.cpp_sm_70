@@ -247,7 +247,38 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   top glue is `QuantizeQ8KKernel` 110 ms (7.6%), `MhcPreFinishKernel` 106 ms (7.3%), `RouteKernel` 83.6 ms (5.7%) —
   plus the BW-efficiency gap (ds4 at ~58% of the roofline vs our GEMMs). NEXT LEVER: fuse the activation-quant into the
   consuming GEMM prologue (lever-2, LAUNCH-bound `QuantizeQ8K`), and the MhcPre reduction glue (characterized near-tie
-  where the Sinkhorn/mix reduction reorders). Commit `<this>`.
+  where the Sinkhorn/mix reduction reorders). Commit `4ffcb96b`+`e2ab0690`.
+- **Brick 8 — FUSE QuantizeQ8K into the grouped-GEMM prologue (lever-2, launch-bound act-quant) — IMPLEMENTED + DGX-GATED,
+  BIT-EXACT, but a MEASURED NEGATIVE: −22% decode. The "launch-bound, fuse it" hypothesis is REFUTED; REVERT-code-keep-record
+  (main unaffected, stays 11.41).** Brick 7's nsys named `QuantizeQ8KKernel` (110 ms / 7.6%) the top remaining glue and called
+  it LAUNCH-bound. Brick 8 folded that activation-quant INTO the two DeepSeek-V4 decode keep-quant grouped kernels' prologue
+  (the fused gate+up+SwiGLU, and the routed down-proj): a new `BlockQuantizeRowQ8K` quantizes ONE activation row per block
+  cooperatively into a tiny nsb·292 B shared tile (`QuantDotGemmGroupedFusedSwiGLUQuantKernel` + `QuantDotGemmGroupedQuantKernel`,
+  ds4 preq-in-kernel pattern), removing the separate `QuantizeQ8KKernel` launch + its Q8_K HBM round-trip. Guarded by
+  `VT_V4_FUSED_QUANT` (eligibility nsb≤128 & bcast|n%4==0), wired via the shared providers so BOTH the eager forward AND the
+  captured `V4Graph::Step` inherit it (no Brick-7-style split-path trap). **BIT-EXACT** (shared `QuantizeSuperblockQ8K` ⇒
+  byte-identical Q8_K, same integer dot): unit gate `test_cuda_quant_dot` **4/4·106909** (a new grouped fused-quant case,
+  per-expert + BROADCAST, at the tight nmse≤1e-6 vs the CPU oracle — all pass), `test_cuda_deepseek_v4` **19/19·66949**,
+  `test_deepseek_v4_gguf_load` **13/13·631**; real 80.7 GB model resident+graph `VT_V4_FUSED_QUANT=1` vs `=0` = **byte-IDENTICAL
+  50-token sequence** ("…Paris. The capital of France is Paris…"). **RESULT — MEASURED NEGATIVE (4 interleaved warm runs, `--gpu
+  --kv-cache VT_V4_DECODE_GRAPH=1`, 50 tok, non-overlapping bands): decode 11.46 → 8.91 tok/s (−22.3%; fused 8.87–8.93 / unfused
+  11.45–11.53).** The `=0` baseline 11.46 ≈ Brick 7's 11.41 (fresh A confirmed). **nsys (`--cuda-graph-trace=node`, 20 tok) —
+  the mechanism, GROUNDED:** the fused path REMOVES `QuantizeQ8KKernel` (125.0M ns, 2279 inst) but the grouped kernels BALLOON:
+  gate/up SwiGLU 177,387 → 437,688 ns/inst (**2.47×**), down Q2_K 105,687 → 521,658 (**4.94×**), down IQ2 104,809 → 366,642
+  (**3.50×**) — **+630M ns added vs 125M saved = net −504M ns**. Because there are THOUSANDS of GEMM blocks per grouped launch
+  (the down GEMM alone is ~P·n/4 ≈ 6144 blocks/layer, each now re-quantizing ITS activation row behind a `__syncthreads`
+  barrier), folding the quant into the prologue trades ONE cheap per-row quant (whose small Q8_K output is L2-cached for every
+  block) for thousands of redundant re-quants + a block barrier on the GEMM critical path. The "launch-bound" framing DOES NOT
+  hold under the cudagraph: standalone `QuantizeQ8K` is only 54.9 µs/inst (a cheap node), not launch-dominated. **DISPOSITION:
+  REFUTED with NO salvage** — per-block re-quant is fundamental to "fold quant into the GEMM prologue" (the only quantize-once
+  design IS the standalone kernel we already have). Code REVERTED, record kept; production default unchanged (11.41). **The same
+  mechanism refutes fusing `QuantizeQ8_0` (5.3%) too — do NOT retry it.** **CORRECTED NEXT LEVER (from the `=0` nsys):** the
+  DOMINANT kernel is now `QuantDotGemmQ8_0Kernel` at **49.3%** (927M ns — the Q8_0 MLA/o-LoRA/shared-expert/lm_head matvecs),
+  which Bricks 3+4 established is latency/occupancy-bound (bit-exact in-kernel levers exhausted) → the real remaining lever is a
+  kernel-STRUCTURE change (multiple-outputs-per-warp or a batched/persistent Q8_0 matvec so one warp reuses the loaded activation
+  across several output rows — cuts the ~33k tiny warp launches/step), NOT a fusion. After that, the reduction glue
+  `MhcPreFinishKernel` (7.7%, single-block Sinkhorn/mix) + `RouteKernel` (6.0%) is the characterized-near-tie lever. Branch
+  `brick8-fused-quant` (records-only after revert), NOT pushed.
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +
