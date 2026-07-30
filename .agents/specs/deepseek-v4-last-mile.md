@@ -345,6 +345,40 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   33–54% of step — Lever 2 sub-warp GEMV tiling, the speculative bet) + `QuantDotGemmGroupedFusedSwiGLU`/`Grouped`
   (the routed-expert GEMMs) + `MhcPreFinishKernel`/`QuantizeQ8K`/`NormRopeRows` glue (Lever 4). 16.5 stays
   top-of-band and rides on Lever 2 landing on the short-K projections.
+- **Brick 11 — ds4-gap Lever 2 (Q8_0 sub-warp GEMV tiling, the DECISIVE 54% bet) — IMPLEMENTED + DGX-GATED,
+  MEASURED NEGATIVE: the plan's premise (short-K nb∈{16,48} idle-lane regime) DOES NOT HOLD for DeepSeek-V4-Flash;
+  STOP-CONDITION met, merged default-OFF as a guarded recorded-negative. ~13 tok/s is the honest ceiling, 16.5
+  NOT reachable via this lever.** (commit `<this>`, branch `ds4-lever2-subwarp-gemv`, base `d1ff7414`.) This was
+  the whole remaining ds4 gap: `QuantDotGemmQ8_0Kernel` **41.11 ms/step = 52.7% GPU-active (646 launches × 63.6
+  µs** — the MLA q/kv/o-LoRA/shared-expert/lm_head Q8_0 matvecs), and Bricks 3/4/8 exhausted the core-dot/load/fusion
+  axes → the UNTRIED axis was OCCUPANCY / lane-utilization. Templated `QuantDotGemmQ8_0SubwarpKernel<OutT,LANES>`
+  (+grouped), LANES∈{32,16,8}, one output-row per subgroup, block 256, `nb`-dispatch (nb≤16→8, nb≤48→16, else 32),
+  ds4-style masked sub-warp reduce (ground: `ds4_cuda.cu:16609` `quarter/half_warp_sum_f32` + `:17073` moe sub-warp
+  decode). Integer `__dp4a` core order-independent ⇒ `sumi` BIT-EXACT for any LANES; only the final float scale-sum
+  re-associates ⇒ characterized near-tie (NMSE≤5e-4). Guarded `VT_V4_Q8_SUBWARP` (default-OFF) + `VT_V4_Q8_PROBE`
+  (per-call-site nb attribution); dispatch inside `MatmulQ8_0Cuda`+`MatmulQ8_0GroupedCuda` so BOTH the eager forward
+  AND the captured `V4Graph::Step` inherit it (nsys confirms `QuantDotGemmQ8_0SubwarpKernel` in the graph body, 646
+  launches/step). **MEASURE-FIRST — the Iron Law caught the premise before over-investing:** the probe shows the
+  DS4-Flash decode (m=1) Q8_0 projections run at **nb∈{32,64,128,256}** (K∈{1024,2048,4096,8192}), NOT the assumed
+  nb∈{16,48}: the smallest, nb=32, **fills all 32 lanes exactly (1 block/lane, ZERO idle lanes)** — there is no
+  lane-waste regime; the lone nb≤48-eligible projection (nb=32, n=32768) issues 4096 blocks, so it is NOT
+  device-starved either (both occupancy premises fail). **RESULT (nsys `--cuda-graph-trace=node`, 30-step kwin,
+  GPU-active = paging-immune metric, worker down, flock):** total Q8_0 **41.11 → 41.06 ms/step (FLAT, −0.1% =
+  noise)**; per-grid.x breakdown — every nb≥64 bucket unchanged (grid.x 512 11.78→11.76, 128 11.37→11.31, 256
+  4.79→4.79, lm_head 16160 3.35→3.35, 64 0.69→0.67), and the ONLY addressable projection (nb=32, LANES=16, grid.x
+  4096→2048) **9.13 → 9.19 ms/step — marginally WORSE (+0.6%)**, far below the study's ~2 ms "worth it" bar.
+  Interleaved warm wall-clock ~12.7 tok/s BOTH arms (off {12.67,12.80,12.77} / on {12.82,12.71,12.70}, overlapping;
+  a single cold-first nsys run's 11.03-vs-12.55 was pure run-order page-cache noise, not the lever). Token stream
+  **byte-identical off==on**: golden `11111 16 455 6102 294 8760 344 …` (near-tie flips ZERO tokens — token-exact
+  here). **GATE (near-tie, RED-first):** new A/B unit case `test_cuda_quant_dot` **5/5·106483** (sub-warp==plain:
+  LANES=32 byte-identical big-K nb=224 + NMSE≤5e-4 short-K nb∈{16,48}; the short-K near-tie exercises the LANES=8/16
+  masks — a wrong mask blows past 5e-4 → RED), `test_cuda_deepseek_v4` **20/20·67072**, `test_deepseek_v4_gguf_load`
+  **15/15·931**. **DISPOSITION — recorded-negative, DEFAULT-OFF** (bit-exact-safe, unit-gated, wired both paths): a
+  valuable measured-negative like Bricks 4/8 — it establishes the Q8_0 GEMV is at its **DRAM-bandwidth roofline for
+  THIS model's nb≥32 dims** (occupancy/lane-utilization tiling has nothing to fix: no projection wastes lanes, the
+  eligible one is not starved). **Honest reachable ceiling: L1 (+0.49) + L3 (route −5.59 ms GPU) bank ~12.7 tok/s;
+  ~13 is the honest ceiling and 16.5 is NOT reachable via this lever.** The 41 ms Q8_0 GEMV is the irreducible
+  residual. Code merged default-OFF, records kept; production default unchanged (~12.7). NOT pushed.
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +
