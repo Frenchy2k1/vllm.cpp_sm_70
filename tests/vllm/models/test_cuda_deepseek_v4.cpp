@@ -846,3 +846,43 @@ TEST_CASE("DeepseekV4 device router_gate (f32-act x bf16-weight) == host (Brick 
   gpu.Synchronize(g.q);
   CHECK(RelL2(g2, gating) > 1e-4);
 }
+
+// Brick D step 2 — the GRAPH decode attention decode_attn_g (attends cache[0..len)
+// + the current key deck_new, len from a DEVICE buffer) == the eager decode_attn over
+// the FULL cache (with deck appended at row len). Same key set + order ⇒ BIT-IDENTICAL
+// (this is what lets the captured graph replay a growing context). RED-first: a wrong
+// length changes the result.
+TEST_CASE("DeepseekV4 device decode_attn_g == eager decode_attn (Brick D graph)") {
+  if (!HasCuda()) return;  // DGX-only
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t nh = 8, hd = 32, len = 11;  // len prior keys + 1 current
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const auto q = Rand(r, nh * hd, -1.0f, 1.0f);
+  const auto sink = Rand(r, nh, -0.5f, 0.5f);
+  const auto prior = Rand(r, len * hd, -1.0f, 1.0f);  // cache[0..len)
+  const auto deck = Rand(r, hd, -1.0f, 1.0f);         // the current token's key
+  // eager reference: full cache = [prior; deck], kv_base=len, T=1.
+  std::vector<float> full(static_cast<size_t>((len + 1) * hd));
+  std::copy(prior.begin(), prior.end(), full.begin());
+  std::copy(deck.begin(), deck.end(), full.begin() + len * hd);
+  std::vector<float> ref(static_cast<size_t>(nh * hd), 0.0f);
+  dv4::DsaDevice()->decode_attn(g.q, ref.data(), q.data(), full.data(), sink.data(), nh, hd,
+                                /*kv_base=*/len, /*T=*/1, scale, /*no_sink=*/false);
+  gpu.Synchronize(g.q);
+  // graph variant: cache=prior (len), deck_new=deck, len from a device buffer.
+  std::vector<int> len_dev(1, static_cast<int>(len));
+  std::vector<float> got(static_cast<size_t>(nh * hd), 0.0f);
+  dv4::DsaDevice()->decode_attn_g(g.q, got.data(), q.data(), prior.data(), deck.data(), sink.data(),
+                                  nh, hd, len_dev.data(), /*max_cap=*/64, scale, /*no_sink=*/false);
+  gpu.Synchronize(g.q);
+  for (int64_t i = 0; i < nh * hd; ++i) CHECK(got[static_cast<size_t>(i)] == ref[static_cast<size_t>(i)]);
+  // RED-first: a wrong length (drop the current key) changes the output.
+  std::vector<int> len_bad(1, static_cast<int>(len) - 3);
+  std::vector<float> got2(static_cast<size_t>(nh * hd), 0.0f);
+  dv4::DsaDevice()->decode_attn_g(g.q, got2.data(), q.data(), prior.data(), deck.data(), sink.data(),
+                                  nh, hd, len_bad.data(), /*max_cap=*/64, scale, /*no_sink=*/false);
+  gpu.Synchronize(g.q);
+  CHECK(RelL2(got2, got) > 1e-4);
+}

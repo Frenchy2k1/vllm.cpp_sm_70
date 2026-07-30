@@ -1362,6 +1362,221 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
   return logits;
 }
 
+inline bool DecodeGraphEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_DECODE_GRAPH");
+    return e != nullptr && std::string(e) == "1";
+  }();
+  return on;
+}
+
+// ─── Brick D step 2: the DECODE CUDA GRAPH (the campaign payoff) ──────────────
+// Capture the now-100%-device resident T=1 step into ONE graph and replay it —
+// collapsing the ~1700 host launches/step into a single cudaGraphLaunch (the
+// host-gap idle the eager resident measured at ~45% GPU-idle). The whole per-layer
+// chain runs over PERSISTENT member buffers (never resized → stable addresses the
+// captured graph bakes); the ONLY per-step-varying inputs (embed x, position,
+// token, KV length) live in persistent buffers whose CONTENTS the driver refreshes
+// before each replay. The growing KV is handled cudagraph-safely: fixed-capacity
+// per-layer cache; the kv-norm+RoPE writes the new token's latent to a FIXED
+// `deck_new[layer]` scratch; `decode_attn_g` attends `cache[0..len)` + `deck_new`
+// with `len` read from a DEVICE buffer; and BETWEEN replays the driver async-copies
+// `deck_new`→`cache[len]` on the stream (NOT inside the captured region) + advances
+// `len`. cold→warm→captured: the cold step runs eager (grows the per-stream Q8_K
+// GEMM scratch — cudagraph-safe grow-only — so capture does zero fresh allocation).
+// [[cudagraph-capture-bakes-stack-addresses]]: EVERY captured input is a member
+// buffer, never a stack temporary; verified BY TOKENS (replay == eager == host).
+struct V4Graph {
+  const DeepseekV4HostWeights* hw;
+  const DeepseekV4Params* p;
+  int64_t H, hc, nlayers, V, nh, hd, rope, nope, qlr, ne, topk, mi, ng, olr, ipg, zdim, iters,
+      max_cap;
+  float eps, hc_eps, lim, scale;
+  // persistent unified scratch (allocated once; never resized → stable addresses).
+  std::vector<float> x, resA, resB, post_mix, res_mix, pre_mix, mix_scratch, qa, qact, kraw, o, z,
+      gating, weights, xrep, gate_up_s, act_s, gr, ur, gate_up_r, adown, eo, hbuf, logits;
+  std::vector<int32_t> eids;
+  std::vector<int64_t> in_tokens;
+  std::vector<int> pos_buf, len_buf;                 // per-step inputs (device-read)
+  std::vector<std::vector<float>> cache, deck_new;   // [layer]: fixed-cap KV + new-row scratch
+  float* res_cur = nullptr;
+  float* res_nxt = nullptr;
+  int64_t kv_base = 0;
+  void* graph = nullptr;
+  int gstate = 0;  // 0 cold (eager warm-run), 1 warm (capture+replay), 2 captured (replay)
+  vt::Queue* qu = nullptr;
+
+  V4Graph(const V4Backend& be, const DeepseekV4HostWeights& hw_, const DeepseekV4Params& pp)
+      : hw(&hw_), p(&pp) {
+    H = pp.hidden_size; hc = pp.hc_mult; nlayers = pp.num_hidden_layers; V = pp.vocab_size;
+    nh = pp.num_attention_heads; hd = pp.head_dim; rope = pp.qk_rope_head_dim; nope = hd - rope;
+    qlr = pp.q_lora_rank; ne = pp.n_routed_experts; topk = pp.num_experts_per_tok;
+    mi = pp.moe_intermediate_size; ng = pp.o_groups; olr = pp.o_lora_rank; ipg = nh * hd / ng;
+    zdim = ng * olr; iters = pp.hc_sinkhorn_iters; eps = pp.rms_norm_eps;
+    hc_eps = static_cast<float>(pp.hc_eps); lim = static_cast<float>(pp.swiglu_limit);
+    scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    qu = be.q;
+    kv_base = be.kv_base;  // = prefill length (the graph takes over after prefill)
+    // fixed capacity: the decode_attn_g shared-mem KV window (≤40 KiB ⇒ ≤10240 keys).
+    max_cap = 4096;
+    VT_CHECK(kv_base + 1 <= max_cap,
+             "deepseek-v4 decode graph: prefill length exceeds the fixed KV capacity "
+             "(long-context graph is a named residual)");
+    x.assign(static_cast<size_t>(H), 0.0f);
+    resA.assign(static_cast<size_t>(hc * H), 0.0f); resB.assign(static_cast<size_t>(hc * H), 0.0f);
+    post_mix.assign(static_cast<size_t>(hc), 0.0f); res_mix.assign(static_cast<size_t>(hc * hc), 0.0f);
+    pre_mix.assign(static_cast<size_t>(hc), 0.0f);
+    mix_scratch.assign(static_cast<size_t>((2 + hc) * hc), 0.0f);
+    qa.assign(static_cast<size_t>(qlr), 0.0f); qact.assign(static_cast<size_t>(nh * hd), 0.0f);
+    kraw.assign(static_cast<size_t>(hd), 0.0f); o.assign(static_cast<size_t>(nh * hd), 0.0f);
+    z.assign(static_cast<size_t>(zdim), 0.0f); gating.assign(static_cast<size_t>(ne), 0.0f);
+    weights.assign(static_cast<size_t>(1 + topk), 0.0f); weights[0] = 1.0f;  // shared weight (const)
+    xrep.assign(static_cast<size_t>(topk * H), 0.0f);
+    gate_up_s.assign(static_cast<size_t>(2 * mi), 0.0f); act_s.assign(static_cast<size_t>(mi), 0.0f);
+    gr.assign(static_cast<size_t>(topk * mi), 0.0f); ur.assign(static_cast<size_t>(topk * mi), 0.0f);
+    gate_up_r.assign(static_cast<size_t>(2 * mi), 0.0f);
+    adown.assign(static_cast<size_t>(topk * mi), 0.0f);
+    eo.assign(static_cast<size_t>((1 + topk) * H), 0.0f);
+    eids.assign(static_cast<size_t>(topk), 0);
+    in_tokens.assign(1, 0);
+    pos_buf.assign(static_cast<size_t>(std::max<int64_t>(nh, 1)), 0);
+    len_buf.assign(1, 0);
+    hbuf.assign(static_cast<size_t>(H), 0.0f); logits.assign(static_cast<size_t>(V), 0.0f);
+    cache.assign(static_cast<size_t>(nlayers), {});
+    deck_new.assign(static_cast<size_t>(nlayers), {});
+    for (int64_t l = 0; l < nlayers; ++l) {
+      cache[static_cast<size_t>(l)].assign(static_cast<size_t>(max_cap * hd), 0.0f);
+      deck_new[static_cast<size_t>(l)].assign(static_cast<size_t>(hd), 0.0f);
+      // seed the fixed-cap cache with the prefill KV (be.kv->deck filled by ForwardComposeImpl).
+      const std::vector<float>& pref = be.kv->deck[static_cast<size_t>(l)];
+      VT_CHECK(static_cast<int64_t>(pref.size()) == kv_base * hd,
+               "deepseek-v4 decode graph: prefill KV size mismatch");
+      std::copy(pref.begin(), pref.end(), cache[static_cast<size_t>(l)].begin());
+    }
+  }
+  ~V4Graph() {
+    if (graph != nullptr && qu != nullptr) vt::GetBackend(qu->device).DestroyGraph(graph);
+  }
+
+  // The per-layer resident chain over the PERSISTENT buffers (the capture region).
+  void RunChain(const V4Backend& be) {
+    auto* MHC = deepseek_v4::MhcDevice();
+    auto* DSA = deepseek_v4::DsaDevice();
+    auto* MOE = deepseek_v4::MoeDevice();
+    res_cur = resA.data();
+    res_nxt = resB.data();
+    const auto mhc_pre = [&](const DeepseekV4LayerHostWeights& L, bool attn) {
+      const std::vector<float>& fn = attn ? L.hc_attn_fn : L.hc_ffn_fn;
+      const std::vector<float>& sc = attn ? L.hc_attn_scale : L.hc_ffn_scale;
+      const std::vector<float>& ba = attn ? L.hc_attn_base : L.hc_ffn_base;
+      const std::vector<float>& nw = attn ? L.attn_norm_weight : L.ffn_norm_weight;
+      MHC->pre_ip(*be.q, pre_mix.data(), post_mix.data(), res_mix.data(), x.data(),
+                  mix_scratch.data(), res_nxt, fn.data(), sc.data(), ba.data(), hc, H, eps, hc_eps,
+                  hc_eps, 2.0f, iters, nw.empty() ? nullptr : nw.data(), !nw.empty(), eps);
+      std::swap(res_cur, res_nxt);
+    };
+    bool have_residual = false;
+    for (int64_t layer = 0; layer < nlayers; ++layer) {
+      const DeepseekV4LayerHostWeights& L = hw->layers[static_cast<size_t>(layer)];
+      const DeepseekV4GgufLayerWeights& Lq = be.gguf->layers[static_cast<size_t>(layer)];
+      const bool rope_comp = p->has_compressor(layer);
+      const double rbase = rope_comp ? p->compress_rope_theta : p->rope_theta;
+      const double rfs = (rope_comp && p->rope_scale_factor > 1.0) ? 1.0 / p->rope_scale_factor : 1.0;
+      const double rext = (rope_comp && p->rope_scale_factor > 1.0) ? 1.0 : 0.0;
+      if (!have_residual)
+        for (int64_t i = 0; i < hc; ++i) AsyncCopyF(be, res_nxt + i * H, x.data(), H);
+      else
+        MHC->post_ip(*be.q, res_nxt, x.data(), res_cur, post_mix.data(), res_mix.data(), hc, H);
+      mhc_pre(L, /*attn=*/true);
+      have_residual = true;
+      // MLA attention (T=1) — GRAPH variant: kv → deck_new scratch, attn over cache+deck_new+len.
+      GemmIntoKq(be, Lq.wq_a, x.data(), qa.data(), 1, qlr, H);
+      DSA->rms_norm_rows(*be.q, qa.data(), qa.data(), L.q_norm_weight.data(), 1, qlr, eps, true);
+      GemmIntoKq(be, Lq.wq_b, qa.data(), qact.data(), 1, nh * hd, qlr);
+      DSA->rms_norm_rows(*be.q, qact.data(), qact.data(), nullptr, nh, hd, eps, false);
+      DSA->rope(*be.q, qact.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
+                p->rope_orig_ctx, p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/false);
+      GemmIntoKq(be, Lq.wkv, x.data(), kraw.data(), 1, hd, H);
+      float* dn = deck_new[static_cast<size_t>(layer)].data();
+      DSA->rms_norm_rows(*be.q, dn, kraw.data(), L.kv_norm_weight.data(), 1, hd, eps, true);
+      DSA->rope(*be.q, dn, 1, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p->rope_orig_ctx,
+                p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/false);
+      DSA->decode_attn_g(*be.q, o.data(), qact.data(), cache[static_cast<size_t>(layer)].data(), dn,
+                         L.attn_sink.data(), nh, hd, len_buf.data(), max_cap, scale, /*no_sink=*/false);
+      DSA->rope(*be.q, o.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
+                p->rope_orig_ctx, p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/true);
+      for (int64_t gp = 0; gp < ng; ++gp)
+        GemmRowSliceInto(be, Lq.wo_a, o.data() + gp * ipg, z.data() + gp * olr, 1, olr, ipg, gp * olr);
+      GemmIntoKq(be, Lq.wo_b, z.data(), x.data(), 1, H, zdim);
+      // ffn MHC post+pre.
+      MHC->post_ip(*be.q, res_nxt, x.data(), res_cur, post_mix.data(), res_mix.data(), hc, H);
+      mhc_pre(L, /*attn=*/false);
+      // MoE (device router gate + resident routing).
+      const bool cfg_hash = p->is_hash_layer(layer);
+      if (vt::IsBlockQuant(Lq.moe_gate.dtype))
+        GemmIntoKq(be, Lq.moe_gate, x.data(), gating.data(), 1, ne, H);
+      else
+        MOE->router_gate(*be.q, gating.data(), x.data(), Lq.moe_gate.bytes.data(), ne, H);
+      const bool has_bias = !cfg_hash && !L.gate_bias.empty();
+      MOE->route_ip(*be.q, eids.data(), weights.data() + 1, gating.data(), 1, ne, topk,
+                    has_bias ? L.gate_bias.data() : nullptr, has_bias,
+                    cfg_hash ? in_tokens.data() : nullptr, cfg_hash,
+                    cfg_hash ? L.tid2eid.data() : nullptr, p->vocab_size, p->norm_topk_prob,
+                    static_cast<float>(p->routed_scaling_factor));
+      GemmIntoKq(be, Lq.shared_gate, x.data(), gate_up_s.data(), 1, mi, H);
+      GemmIntoKq(be, Lq.shared_up, x.data(), gate_up_s.data() + mi, 1, mi, H);
+      MOE->clamped_swiglu_ip(*be.q, act_s.data(), gate_up_s.data(), mi, lim, 1.0f, 0.0f);
+      GemmIntoKq(be, Lq.shared_down, act_s.data(), eo.data(), 1, H, mi);
+      for (int64_t j = 0; j < topk; ++j) AsyncCopyF(be, xrep.data() + j * H, x.data(), H);
+      GemmGroupedInto(be, Lq.moe_gate_exps, xrep.data(), eids.data(), topk, mi, H, gr.data());
+      GemmGroupedInto(be, Lq.moe_up_exps, xrep.data(), eids.data(), topk, mi, H, ur.data());
+      for (int64_t j = 0; j < topk; ++j) {
+        AsyncCopyF(be, gate_up_r.data(), gr.data() + j * mi, mi);
+        AsyncCopyF(be, gate_up_r.data() + mi, ur.data() + j * mi, mi);
+        MOE->clamped_swiglu_ip(*be.q, adown.data() + j * mi, gate_up_r.data(), mi, lim, 1.0f, 0.0f);
+      }
+      GemmGroupedInto(be, Lq.moe_down_exps, adown.data(), eids.data(), topk, H, mi, eo.data() + H);
+      MOE->moe_combine(*be.q, x.data(), eo.data(), weights.data(), 1 + topk, H);
+    }
+    MHC->post_ip(*be.q, res_nxt, x.data(), res_cur, post_mix.data(), res_mix.data(), hc, H);
+    MHC->head_ip(*be.q, hbuf.data(), res_nxt, hw->hc_head_fn.data(), hw->hc_head_scale,
+                 hw->hc_head_base.data(), hc, H, eps, hc_eps);
+    DSA->rms_norm_rows(*be.q, hbuf.data(), hbuf.data(), hw->final_norm_weight.data(), 1, H, eps, true);
+    GemmIntoKq(be, be.gguf->lm_head, hbuf.data(), logits.data(), 1, V, H);
+  }
+
+  // One decode token: refresh the per-step inputs, run/replay the step, append this
+  // token's deck to the fixed-cap cache (on-stream, between replays), read logits.
+  std::vector<float> Step(const V4Backend& be, int32_t token, int32_t pos) {
+    VT_CHECK(kv_base + 1 <= max_cap, "deepseek-v4 decode graph: KV capacity exceeded");
+    for (int64_t h = 0; h < H; ++h) x[static_cast<size_t>(h)] = hw->embed[token * H + h];  // embed
+    std::fill(pos_buf.begin(), pos_buf.end(), pos);
+    in_tokens[0] = token;
+    len_buf[0] = static_cast<int>(kv_base);
+    vt::Backend& b = vt::GetBackend(be.q->device);
+    if (gstate == 0) {          // cold: eager warm-run (grow the cudagraph-safe GEMM scratch)
+      RunChain(be);
+      gstate = 1;
+    } else if (gstate == 1) {   // warm: capture the region once, then replay it
+      b.BeginCapture(*be.q);
+      RunChain(be);
+      graph = b.EndCaptureGraph(*be.q);
+      b.ReplayGraph(*be.q, graph);
+      gstate = 2;
+    } else {                    // captured: one cudaGraphLaunch
+      b.ReplayGraph(*be.q, graph);
+    }
+    // append this token's deck_new → cache[kv_base] (on the stream, AFTER the step's
+    // graph produced deck_new, BEFORE the next replay reads it) — the growing KV.
+    for (int64_t l = 0; l < nlayers; ++l)
+      AsyncCopyF(be, cache[static_cast<size_t>(l)].data() + kv_base * hd,
+                 deck_new[static_cast<size_t>(l)].data(), hd);
+    kv_base++;
+    DrainDevice(be);  // the one step-boundary drain: logits ready, appends complete
+    return logits;
+  }
+};
+
 }  // namespace
 
 // ── the W7 composition, written ONCE and run on HOST refs OR the device kernels
@@ -1606,11 +1821,29 @@ std::vector<float> DeepseekV4ForwardGgufCached(const DeepseekV4Weights& weights,
   be.kv = &cache;
   be.kv_base = cache.len;  // same base for every layer this call
   be.grouped_moe = GroupedMoeEnabled();
-  // Brick C part 2: the device-resident T=1 decode chain (no per-op sync). Requires
-  // logits over the single new row (the decode contract) — VT_V4_RESIDENT_DECODE=1.
-  const bool resident_ok =
-      CanRunResidentDecode(weights.params, be, T) &&
-      (logits_indices.empty() || (logits_indices.size() == 1 && logits_indices[0] == 0));
+  // Brick C part 2 / Brick D: the device-resident T=1 decode chain (no per-op sync).
+  // Requires logits over the single new row (the decode contract).
+  const bool single_row =
+      logits_indices.empty() || (logits_indices.size() == 1 && logits_indices[0] == 0);
+  const bool resident_ok = CanRunResidentDecode(weights.params, be, T) && single_row;
+
+  // Brick D (VT_V4_DECODE_GRAPH=1): after prefill (kv_base>0), drive the resident
+  // step through the captured decode CUDA graph (one cudaGraphLaunch/step). The
+  // prefill step (kv_base==0, T>1) still runs the host ForwardComposeImpl, filling
+  // cache.deck the graph seeds from. Default OFF; falls back to the eager resident /
+  // host path otherwise.
+  if (resident_ok && DecodeGraphEnabled() && cache.len > 0) {
+    if (!cache.decode_graph) {
+      cache.decode_graph = std::shared_ptr<void>(
+          new V4Graph(be, weights.host, weights.params),
+          [](void* g) { delete static_cast<V4Graph*>(g); });
+    }
+    auto* g = static_cast<V4Graph*>(cache.decode_graph.get());
+    std::vector<float> logits = g->Step(be, token_ids[0], positions[0]);
+    cache.len += T;
+    return logits;
+  }
+
   std::vector<float> logits =
       resident_ok
           ? ForwardResidentDecodeGguf(weights.host, weights.params, token_ids, positions, be)

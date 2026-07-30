@@ -1226,12 +1226,84 @@ void DecodeAttnLaunch(Queue& q, float* o, const float* query, const float* kv,
   // NO sync here — the caller drains (Brick A) or captures (Brick D).
 }
 
+// ── Brick D step 2: GRAPH decode attention (T=1, capturable) ──────────────────
+// DecodeAttnKernel bakes `kv_base` into the launch (host arg + dynamic shmem), so a
+// captured graph would freeze the context. This variant reads the KV length from a
+// DEVICE buffer `len_dev` at runtime, uses FIXED shared memory (max_cap keys), and
+// attends the `len` prior keys in `cache[0..len)` PLUS the current token's key
+// `deck_new` (as key index `len` — it is not yet appended to `cache`). The key set
+// {cache[0..len), deck_new} == the eager kernel's cache[0..kv_base] (which already
+// had this token's deck appended) in the SAME order ⇒ BIT-IDENTICAL to eager.
+__global__ void DecodeAttnGKernel(float* __restrict__ o, const float* __restrict__ q,
+                                  const float* __restrict__ cache,
+                                  const float* __restrict__ deck_new,
+                                  const float* __restrict__ sink, int nh, int hd,
+                                  const int* __restrict__ len_dev, float scale, bool no_sink) {
+  const int h = blockIdx.x;   // T=1 → t=0, one block per head
+  const int len = *len_dev;   // # prior keys already in `cache` (== kv_base)
+  const int n = len + 1;      // + this token's key (deck_new)
+  const float* qh = q + static_cast<int64_t>(h) * hd;
+  extern __shared__ float e[];  // [max_cap] scores → exp weights
+  __shared__ float denom_sh;
+  for (int s = threadIdx.x; s < n; s += blockDim.x) {
+    const float* ks = (s < len) ? (cache + static_cast<int64_t>(s) * hd) : deck_new;
+    float acc = 0.0f;
+    for (int d = 0; d < hd; ++d) acc += qh[d] * ks[d];
+    e[s] = acc * scale;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const float ninf = -INFINITY;
+    const float sink_h = no_sink ? ninf : sink[h];
+    float m = sink_h;
+    for (int s = 0; s < n; ++s) m = fmaxf(m, e[s]);
+    if (m == ninf) {
+      denom_sh = 0.0f;
+    } else {
+      float denom = expf(sink_h - m);
+      for (int s = 0; s < n; ++s) { const float ee = expf(e[s] - m); e[s] = ee; denom += ee; }
+      denom_sh = denom;
+    }
+  }
+  __syncthreads();
+  const float denom = denom_sh;
+  float* oh = o + static_cast<int64_t>(h) * hd;
+  if (denom == 0.0f) {
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) oh[d] = 0.0f;
+    return;
+  }
+  for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int s = 0; s < n; ++s) {
+      const float* ks = (s < len) ? (cache + static_cast<int64_t>(s) * hd) : deck_new;
+      acc += (e[s] / denom) * ks[d];
+    }
+    oh[d] = acc;
+  }
+}
+void DecodeAttnGLaunch(Queue& q, float* o, const float* query, const float* cache,
+                       const float* deck_new, const float* sink, int64_t nh, int64_t hd,
+                       const int* len_dev, int64_t max_cap, float scale, bool no_sink) {
+  if (nh == 0) return;
+  if (max_cap * static_cast<int64_t>(sizeof(float)) > 40 * 1024)
+    throw std::runtime_error(
+        "vt cuda deepseek_v4: decode_attn_g max_cap exceeds the shared-memory KV window");
+  cudaStream_t s = AsStream(q);
+  const dim3 grid(static_cast<unsigned>(nh));
+  const unsigned block = 256;
+  const unsigned shmem = static_cast<unsigned>(max_cap) * sizeof(float);
+  DecodeAttnGKernel<<<grid, block, shmem, s>>>(o, query, cache, deck_new, sink,
+                                               static_cast<int>(nh), static_cast<int>(hd), len_dev,
+                                               scale, no_sink);
+  Check(cudaGetLastError(), "decode_attn_g launch");
+}
+
 // ── the per-family kernels-structs (registered through the seam) ──────────────
 const MhcDeviceKernels kMhc = {&MhcSinkhornLaunch, &MhcPreLaunch, &MhcPostLaunch, &HcHeadLaunch,
                                &MhcPostInPlaceLaunch, &HcHeadInPlaceLaunch, &MhcPreInPlaceLaunch};
 const DsaDeviceKernels kDsa = {&DsaWeightFoldLaunch, &DsaLogitsLaunch, &DsaTopkLaunch,
                                &SoftmaxSinkLaunch, &GroupedOLoraLaunch, &DecodeAttnLaunch,
-                               &RmsNormLaunch, &RopeLaunch, &RmsNormRowsLaunch};
+                               &RmsNormLaunch, &RopeLaunch, &RmsNormRowsLaunch, &DecodeAttnGLaunch};
 const CompressorDeviceKernels kComp = {&SaveScoreApeLaunch, &PoolNormLaunch, &Fp8EncodeLaunch,
                                        &Fp8DecodeLaunch};
 const MoeDeviceKernels kMoe = {&SqrtSoftplusLaunch,        &RouteLaunch,
