@@ -1596,7 +1596,8 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
                                              const std::vector<int32_t>& positions,
                                              const std::vector<int32_t>& logits_indices,
                                              V4Miswire miswire, V4ForwardTrace* trace,
-                                             const V4Backend& be) {
+                                             const V4Backend& be,
+                                             std::vector<float>* mtp_residual_out = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = p.hidden_size;
   const int64_t hc = p.hc_mult;
@@ -1735,7 +1736,14 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
   }
 
   // final MhcPost(last-ffn-out) -> hc_head collapse -> norm -> lm_head (model.py:1128-1146).
+  // `all_res` captures the PRE-hc_head MHC residual stream [T,hc,H] — the exact
+  // state DeepSeek-V4's MTP head consumes as `previous_hidden_states` (nvidia/mtp.py:
+  // 139-141: previous_hidden_states.view(-1, hc_mult, H)). Filled only when the
+  // caller asks (mtp_residual_out != nullptr — the self-spec residual stash).
   std::vector<float> hidden(static_cast<size_t>(T) * H);
+  std::vector<float> all_res;
+  if (mtp_residual_out != nullptr)
+    all_res.resize(static_cast<size_t>(T) * hc * H);
   for (int64_t t = 0; t < T; ++t) {
     std::vector<float> res_t;
     if (miswire == V4Miswire::kSkipFinalMhcPost) {
@@ -1745,6 +1753,9 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
                       Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc), hc,
                       H);
     }
+    if (mtp_residual_out != nullptr)
+      for (int64_t i = 0; i < hc * H; ++i)
+        all_res[t * hc * H + i] = res_t[static_cast<size_t>(i)];
     std::vector<float> h = DispHcHead(be, res_t, hw.hc_head_fn, hw.hc_head_scale,
                                       hw.hc_head_base, hc, H, eps, hc_eps);
     h = RmsNorm(h, hw.final_norm_weight, eps);
@@ -1760,10 +1771,15 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
   }
   const int64_t R = static_cast<int64_t>(rows.size());
   std::vector<float> hsel(static_cast<size_t>(R) * H);
+  if (mtp_residual_out != nullptr)
+    mtp_residual_out->resize(static_cast<size_t>(R) * hc * H);
   for (int64_t ri = 0; ri < R; ++ri) {
     const int64_t r = rows[static_cast<size_t>(ri)];
     VT_CHECK(r >= 0 && r < T, "logits index out of range");
     for (int64_t d = 0; d < H; ++d) hsel[ri * H + d] = hidden[r * H + d];
+    if (mtp_residual_out != nullptr)
+      for (int64_t i = 0; i < hc * H; ++i)
+        (*mtp_residual_out)[ri * hc * H + i] = all_res[r * hc * H + i];
   }
   const OwnedTensor* lmq = be.gguf != nullptr ? &be.gguf->lm_head : nullptr;
   return Gemm(be, lmq, hw.lm_head, hsel, R, V, H);
@@ -1778,6 +1794,155 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
                                          V4Miswire miswire, V4ForwardTrace* trace) {
   return ForwardComposeImpl(hw, p, token_ids, positions, logits_indices, miswire, trace,
                             V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr});
+}
+
+// ─── DeepSeek-V4 MTP self-speculative draft head (host oracle, W1) ────────────
+// The target's PRE-hc_head MHC residual stream [R, hc*H] for the requested rows —
+// the exact state the MTP head consumes as `previous_hidden_states`
+// (nvidia/mtp.py:139-141). Reuses the host oracle with the residual-capture arm.
+std::vector<float> DeepseekV4TargetMtpResidualHost(
+    const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices) {
+  std::vector<float> res;
+  (void)ForwardComposeImpl(hw, p, token_ids, positions, logits_indices, V4Miswire::kNone,
+                           /*trace=*/nullptr,
+                           V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr},
+                           /*mtp_residual_out=*/&res);
+  return res;
+}
+
+// The MTP DRAFT FORWARD + compute_logits — 1:1 with nvidia/mtp.py:128-258,
+// reusing the DS4 host composition helpers. The nextn `mtp_block` is a full V4
+// decoder layer at layer index `num_hidden_layers` (dense MLA + learned-gate MoE:
+// compress_ratio(43)==0, is_hash_layer(43)==false), so it takes the plain dense
+// AttentionBlock / learned-gate MoeBlock path.
+std::vector<float> DeepseekV4MtpDraftLogitsHost(
+    const DeepseekV4MtpHostWeights& mw, const DeepseekV4HostWeights& target,
+    const DeepseekV4Params& p, const std::vector<int32_t>& input_ids,
+    const std::vector<int32_t>& positions, const std::vector<float>& previous_hidden,
+    const std::vector<int32_t>& logits_indices, V4MtpMiswire miswire) {
+  const int64_t T = static_cast<int64_t>(input_ids.size());
+  const int64_t H = p.hidden_size;
+  const int64_t hc = p.hc_mult;
+  const int64_t V = p.vocab_size;
+  const int64_t mtp_layer = p.num_hidden_layers;  // the nextn block's layer index
+  const float eps = p.rms_norm_eps;
+  const float hc_eps = static_cast<float>(p.hc_eps);
+  const int64_t iters = p.hc_sinkhorn_iters;
+  VT_CHECK(T > 0 && hc > 0 && H > 0, "deepseek-v4 mtp: degenerate shape");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == T,
+           "deepseek-v4 mtp: positions/input_ids length mismatch");
+  VT_CHECK(static_cast<int64_t>(previous_hidden.size()) == T * hc * H,
+           "deepseek-v4 mtp: previous_hidden must be [T, hc*H]");
+
+  const V4Backend be{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr};
+
+  // 1. inputs_embeds = embed(input_ids); mask position 0 -> 0 (nvidia/mtp.py:135);
+  //    then enorm (:136).
+  std::vector<float> emb(static_cast<size_t>(T) * H);
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t tok = input_ids[static_cast<size_t>(t)];
+    VT_CHECK(tok >= 0 && tok < V, "deepseek-v4 mtp: token id out of range");
+    const bool mask0 = positions[static_cast<size_t>(t)] == 0;
+    for (int64_t h = 0; h < H; ++h)
+      emb[t * H + h] = mask0 ? 0.0f : target.embed[tok * H + h];
+    const std::vector<float> n = RmsNorm(Slice(emb, t * H, H), mw.enorm_weight, eps);
+    for (int64_t h = 0; h < H; ++h) emb[t * H + h] = n[static_cast<size_t>(h)];
+  }
+
+  // 2. prev = hnorm(previous_hidden.view(T,hc,H)) per hc-stream row (:137).
+  std::vector<float> prev = previous_hidden;  // [T,hc,H]
+  if (miswire != V4MtpMiswire::kNoHnorm) {
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t i = 0; i < hc; ++i) {
+        const std::vector<float> n =
+            RmsNorm(Slice(prev, t * hc * H + i * H, H), mw.hnorm_weight, eps);
+        for (int64_t h = 0; h < H; ++h) prev[t * hc * H + i * H + h] = n[static_cast<size_t>(h)];
+      }
+  }
+
+  // 3. hidden[T,hc,H] = h_proj(prev) + e_proj(emb).unsqueeze(-2) (:139-141).
+  const std::vector<float> e_out = Gemm(be, nullptr, mw.e_proj, emb, T, H, H);       // [T,H]
+  const std::vector<float> h_out = Gemm(be, nullptr, mw.h_proj, prev, T * hc, H, H);  // [T*hc,H]
+  std::vector<float> hidden(static_cast<size_t>(T) * hc * H);
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t i = 0; i < hc; ++i)
+      for (int64_t h = 0; h < H; ++h)
+        hidden[t * hc * H + i * H + h] =
+            (miswire == V4MtpMiswire::kSkipEhProj)
+                ? emb[t * H + h]  // RED-first: drop the eh-lift (raw embed only)
+                : h_out[(t * hc + i) * H + h] + e_out[t * H + h];
+
+  // 4. mtp_block = ONE V4 decoder layer over the [T,hc,H] residual stream (the
+  //    eh-lift is already hc-wide, so no first-layer broadcast). Mirrors
+  //    ForwardComposeImpl:1654-1735 for a single layer.
+  const DeepseekV4LayerHostWeights& L = mw.mtp_block;
+  std::vector<float> residual = hidden;
+  std::vector<float> post_mix(static_cast<size_t>(T) * hc, 0.0f);
+  std::vector<float> res_mix(static_cast<size_t>(T) * hc * hc, 0.0f);
+  std::vector<float> x(static_cast<size_t>(T) * H);
+  // attn sub-block MHC-pre.
+  for (int64_t t = 0; t < T; ++t) {
+    const std::vector<float> res_t = Slice(residual, t * hc * H, hc * H);
+    const MhcPreResult pre =
+        DispMhcPre(be, res_t, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, hc, H, eps, hc_eps,
+                   hc_eps, 2.0f, iters, L.attn_norm_weight, eps);
+    for (int64_t i = 0; i < hc; ++i) post_mix[t * hc + i] = pre.post_mix[static_cast<size_t>(i)];
+    for (int64_t i = 0; i < hc * hc; ++i)
+      res_mix[t * hc * hc + i] = pre.comb_mix[static_cast<size_t>(i)];
+    for (int64_t h = 0; h < H; ++h) x[t * H + h] = pre.layer_input[static_cast<size_t>(h)];
+  }
+  x = AttentionBlock(L, /*Lq=*/nullptr, p, x, positions, mtp_layer, V4Miswire::kNone,
+                     /*trace=*/nullptr, be);
+  // ffn sub-block MhcPost + MhcPre.
+  for (int64_t t = 0; t < T; ++t) {
+    std::vector<float> res_t =
+        DispMhcPost(be, Slice(x, t * H, H), Slice(residual, t * hc * H, hc * H),
+                    Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc), hc, H);
+    const MhcPreResult pre =
+        DispMhcPre(be, res_t, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, hc, H, eps, hc_eps,
+                   hc_eps, 2.0f, iters, L.ffn_norm_weight, eps);
+    for (int64_t i = 0; i < hc * H; ++i)
+      residual[t * hc * H + i] = res_t[static_cast<size_t>(i)];
+    for (int64_t i = 0; i < hc; ++i) post_mix[t * hc + i] = pre.post_mix[static_cast<size_t>(i)];
+    for (int64_t i = 0; i < hc * hc; ++i)
+      res_mix[t * hc * hc + i] = pre.comb_mix[static_cast<size_t>(i)];
+    for (int64_t h = 0; h < H; ++h) x[t * H + h] = pre.layer_input[static_cast<size_t>(h)];
+  }
+  x = MoeBlock(L, /*Lq=*/nullptr, p, x, input_ids, mtp_layer, V4Miswire::kNone,
+               /*trace=*/nullptr, be);
+
+  // 5. compute_logits: final MhcPost -> mw.hc_head collapse -> shared norm -> lm_head
+  //    (nvidia/mtp.py:158-170 + :231-258). Gather the requested rows.
+  std::vector<int32_t> rows = logits_indices;
+  if (rows.empty()) {
+    rows.resize(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) rows[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+  const int64_t R = static_cast<int64_t>(rows.size());
+  std::vector<float> hsel(static_cast<size_t>(R) * H);
+  for (int64_t ri = 0; ri < R; ++ri) {
+    const int64_t r = rows[static_cast<size_t>(ri)];
+    VT_CHECK(r >= 0 && r < T, "deepseek-v4 mtp: logits index out of range");
+    const std::vector<float> res_t =
+        MhcPost(Slice(x, r * H, H), Slice(residual, r * hc * H, hc * H),
+                Slice(post_mix, r * hc, hc), Slice(res_mix, r * hc * hc, hc * hc), hc, H);
+    std::vector<float> h;
+    if (miswire == V4MtpMiswire::kSkipHcHead) {
+      // RED-first: naive mean collapse instead of the learned hc_head.
+      h.assign(static_cast<size_t>(H), 0.0f);
+      for (int64_t i = 0; i < hc; ++i)
+        for (int64_t d = 0; d < H; ++d)
+          h[static_cast<size_t>(d)] += res_t[i * H + d] / static_cast<float>(hc);
+    } else {
+      h = DispHcHead(be, res_t, mw.hc_head_fn, mw.hc_head_scale, mw.hc_head_base, hc, H, eps,
+                     hc_eps);
+    }
+    h = RmsNorm(h, mw.shared_norm_weight, eps);
+    for (int64_t d = 0; d < H; ++d) hsel[ri * H + d] = h[static_cast<size_t>(d)];
+  }
+  return Gemm(be, nullptr, mw.lm_head, hsel, R, V, H);
 }
 
 // W2C — the GGUF keep-quant forward. The SAME composition as the host oracle, but

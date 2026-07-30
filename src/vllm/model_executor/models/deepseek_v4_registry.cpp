@@ -7,8 +7,15 @@
 //
 // Registry routing upstream (`registry.py:94`) sends `DeepseekV4ForCausalLM` into
 // `vllm.models.deepseek_v4`. We register exactly that ONE string. The `DSparkDraftModel`
-// (registry.py:592) and `DeepSeekV4MTPModel` (registry.py:630) speculators are NOT
-// registered here — they are separate rows (INVENTORIED / SPIKE).
+// (registry.py:596) speculator is a separate row (INVENTORIED). The native MTP head
+// `DeepSeekV4MTPModel` (registry.py:617 -> vllm.models.deepseek_v4.DeepSeekV4MTP) is
+// WIRED at W1: its tiny-config draft forward + the lossless self-spec verify land in
+// deepseek_v4.cpp (`DeepseekV4MtpDraftLogitsHost`) + deepseek_v4.h + the loader's
+// absence guard (`DeepseekV4GgufHasMtp`). It is NOT registered as an engine
+// speculator here yet — the DS4-native propose/verify DECODE-LOOP integration + the
+// engine spec-config seam are named residuals (R2/R3), and the real-model gate is
+// weight-BLOCKED (both shipped GGUFs dropped the nextn tail). See
+// `.agents/specs/deepseek-v4-mtp.md`.
 //
 // SCOPE HONESTY: registering this arch makes it RESOLVE + parse config + account
 // for the checkpoint tensors; it does NOT make it forward. `DeepseekV4Model` is a

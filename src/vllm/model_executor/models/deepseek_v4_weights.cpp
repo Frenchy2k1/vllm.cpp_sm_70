@@ -567,6 +567,27 @@ DeepseekV4Params DeepseekV4ParamsFromGguf(const GgufFile& g) {
   return d;
 }
 
+bool DeepseekV4GgufHasMtp(const GgufFile& g) {
+  // The MTP/nextn tail lives at block index == block_count (llama.cpp `blk.{N}.*`
+  // for the nextn layer) or under an explicit `nextn`/`mtp` name. vLLM raises when
+  // the checkpoint advertises nextn_predict_layers but was quantized WITHOUT these
+  // tensors (nvidia/mtp.py load_weights). Detect their PRESENCE so the engine can
+  // fall back to MTP-off cleanly. NOTE (verified 2026-07-30, .agents/specs/
+  // deepseek-v4-mtp.md §4): BOTH shipped DeepSeek-V4-Flash GGUFs return false —
+  // the converter dropped nextn though the KV sets nextn_predict_layers=1.
+  const int64_t nextn = OptInt(g, "deepseek4.nextn_predict_layers", 0);
+  if (nextn <= 0) return false;
+  const int64_t block_count = ReqInt(g, "deepseek4.block_count");
+  const std::string nextn_prefix = "blk." + std::to_string(block_count) + ".";
+  for (const GgufTensorInfo& t : g.Tensors()) {
+    if (t.name.rfind(nextn_prefix, 0) == 0) return true;
+    if (t.name.find("nextn") != std::string::npos) return true;
+    if (t.name.find(".mtp") != std::string::npos || t.name.rfind("mtp.", 0) == 0)
+      return true;
+  }
+  return false;
+}
+
 HfConfig DeepseekV4HfConfigFromGguf(const GgufFile& g) {
   // The GGUF is the source of geometry truth; resolve it ONCE (throws on a
   // non-deepseek4 arch or a missing required key) and republish it.

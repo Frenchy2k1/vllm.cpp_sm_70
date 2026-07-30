@@ -425,6 +425,77 @@ class DeepseekV4Model {
       vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
 };
 
+// ─── MTP (Multi-Token Prediction) self-speculative draft head ────────────────
+// DeepSeek-V4 ships a native MTP head (`num_nextn_predict_layers = 1`): ONE extra
+// decoder layer predicting the NEXT token from the current post-layer hidden, so
+// the engine can self-speculate (draft k=1/step, the full model verifies via the
+// shared greedy RejectionSampler — LOSSLESS by construction: MTP-on greedy output
+// is token-IDENTICAL to MTP-off). Ground truth = the V4-SPECIFIC upstream module
+// `vllm/models/deepseek_v4/nvidia/mtp.py` (DeepSeekV4MultiTokenPredictorLayer),
+// which differs from V3's fused `eh_proj` (deepseek_mtp.py): V4 keeps SEPARATE
+// e_proj/h_proj, an MHC-aware `mtp_block` decoder layer, and its own hc_head
+// collapse in compute_logits. See `.agents/specs/deepseek-v4-mtp.md`.
+
+// The checkpoint-owned tiny-config CPU MTP tower (the W1 host oracle; the real
+// FP8/keep-quant materialization is a named residual, exactly like the main
+// `host` tower). All tensors row-major f32 unless noted. The `mtp_block` reuses
+// the main model's DeepseekV4LayerHostWeights layout (attn + MoE + MHC per-layer
+// mixing). embed_tokens is SHARED with the target (not stored here).
+struct DeepseekV4MtpHostWeights {
+  std::vector<float> enorm_weight;   // [H]  RMSNorm on the embed  (nvidia/mtp.py:86)
+  std::vector<float> hnorm_weight;   // [H]  RMSNorm on prev hidden (:87)
+  std::vector<float> e_proj;         // [H,H] ReplicatedLinear, no bias (:90)
+  std::vector<float> h_proj;         // [H,H] ReplicatedLinear, no bias (:99)
+  // The MTP head's OWN hc_head collapse (mirrors the main model's hc_head_*).
+  std::vector<float> hc_head_fn;     // [hc, hc*H]
+  std::vector<float> hc_head_base;   // [hc]
+  float hc_head_scale = 0.0f;        // scalar
+  // shared_head: its OWN final norm + lm_head (checkpoint-owned).
+  std::vector<float> shared_norm_weight;  // [H]
+  std::vector<float> lm_head;             // [V,H]
+  // The one V4 decoder layer (attn + MoE + per-layer MHC mixing).
+  DeepseekV4LayerHostWeights mtp_block{};
+};
+
+// RED-first structural knobs for the MTP draft gate: a deliberately-broken lever
+// MUST change the draft logits (each is load-bearing).
+enum class V4MtpMiswire {
+  kNone,          // the faithful nextn forward
+  kSkipEhProj,    // feed the raw embed instead of eh-lift(embed, prev_hidden)
+  kSkipHcHead,    // skip the hc_head collapse before the shared norm+lm_head
+  kNoHnorm,       // drop the prev-hidden RMSNorm (hnorm)
+};
+
+// The W1 tiny-config MTP DRAFT FORWARD: nextn layer + compute_logits, 1:1 with
+// nvidia/mtp.py:128-258, reusing the DS4 host composition helpers (AttentionBlock,
+// MoeBlock, MhcPre/Post, HcHeadCollapse). `previous_hidden` is the target's
+// PRE-hc_head MHC residual stream flat [T, hc*H] (NOT the post-final-norm hidden).
+// `embed` is the SHARED target embed table [V,H]. Returns draft logits for the
+// `logits_indices` rows (all rows if empty), flat row-major [rows, V].
+std::vector<float> DeepseekV4MtpDraftLogitsHost(
+    const DeepseekV4MtpHostWeights& mw, const DeepseekV4HostWeights& target,
+    const DeepseekV4Params& p, const std::vector<int32_t>& input_ids,
+    const std::vector<int32_t>& positions, const std::vector<float>& previous_hidden,
+    const std::vector<int32_t>& logits_indices = {},
+    V4MtpMiswire miswire = V4MtpMiswire::kNone);
+
+// The TARGET's pre-hc_head MHC residual stream [T, hc*H] — the state MTP consumes
+// as `previous_hidden`. This is the host oracle's final MhcPost output before the
+// hc_head collapse (deepseek_v4.cpp::ForwardComposeImpl:1737-1747). Exposed so the
+// self-speculation driver (and the lossless gate) can stash it per step.
+std::vector<float> DeepseekV4TargetMtpResidualHost(
+    const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices = {});
+
+// Whether a `deepseek4` GGUF actually carries the MTP/nextn tail tensors (block
+// index == block_count). Mirrors vLLM's missing-MTP-layer guard (nvidia/mtp.py
+// load_weights raises if the checkpoint was quantized WITHOUT the mtp.* layers).
+// BOTH shipped DeepSeek-V4-Flash GGUFs return FALSE (the converter dropped nextn,
+// though the KV advertises nextn_predict_layers=1) — the engine then cleanly falls
+// back to MTP-off. See `.agents/specs/deepseek-v4-mtp.md` §4.
+bool DeepseekV4GgufHasMtp(const GgufFile& gguf);
+
 // Per-family config hook (registry `parse_config`): resolves + validates
 // DeepseekV4Params and throws on anything unsupported.
 void ParseDeepseekV4Config(const HfConfig& config);

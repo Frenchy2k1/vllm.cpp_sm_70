@@ -106,6 +106,20 @@ concurrency-1 A/B our-on 29.32 tok/s vs vLLM-on 29.24, non-overlapping bands,
 D0 through D14 on the vLLM 0.26.0.dev0 stack (which resolves vllm#40898), and it
 remains gated behind a spike while its user-facing serving surface is finalized.
 
+**DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
+2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
+Unlike V3's fused `eh_proj`, the V4 nextn layer keeps separate `e_proj`/`h_proj`,
+`enorm`/`hnorm`, an MHC-aware `mtp_block` decoder layer, and its own `hc_head`
+vocab collapse — ported 1:1 from `nvidia/mtp.py` as a tiny-config host draft
+forward (`DeepseekV4MtpDraftLogitsHost`) reusing the DS4 attention/MoE/MHC
+composition, verified by the SHARED greedy `RejectionSampler` so MTP-on greedy is
+token-IDENTICAL to MTP-off (`test_deepseek_v4_mtp` 5/5, RED-first). The
+real-model MTP-on==MTP-off + acceptance/speedup gate is WEIGHT-BLOCKED: both
+shipped DeepSeek-V4-Flash GGUFs advertise `nextn_predict_layers=1` but the
+llama.cpp converter dropped every nextn tensor (`DeepseekV4GgufHasMtp` returns
+false → clean fall-back to MTP-off). The DS4-native propose/verify decode loop +
+engine spec-config registration are named residuals.
+
 **ngram** (method `ngram`, draft-FREE) proposes the next tokens by matching the
 sequence's own suffix n-gram, so it needs no draft model and works on any model;
 on the 27B it is token-exact vs vLLM's own `--speculative-config ngram` on
