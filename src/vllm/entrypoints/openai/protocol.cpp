@@ -311,6 +311,7 @@ void from_json(const nlohmann::json& j, CompletionRequest& r) {
   GetOpt(j, "prompt_logprobs", r.prompt_logprobs);
   GetOr(j, "echo", r.echo);
   GetOr(j, "min_tokens", r.min_tokens);
+  GetOpt(j, "stream_interval", r.stream_interval);
   GetOr(j, "ignore_eos", r.ignore_eos);
   GetOr(j, "include_stop_str_in_output", r.include_stop_str_in_output);
   GetOr(j, "skip_special_tokens", r.skip_special_tokens);
@@ -477,6 +478,7 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   GetOr(j, "echo", r.echo);
   GetOpt(j, "prompt_logprobs", r.prompt_logprobs);
   GetOr(j, "min_tokens", r.min_tokens);
+  GetOpt(j, "stream_interval", r.stream_interval);
   GetOr(j, "ignore_eos", r.ignore_eos);
   GetOr(j, "include_stop_str_in_output", r.include_stop_str_in_output);
   GetOr(j, "skip_special_tokens", r.skip_special_tokens);
@@ -527,6 +529,8 @@ SamplingParams CompletionRequest::to_sampling_params(
   sp.include_stop_str_in_output = include_stop_str_in_output;
   sp.output_kind =
       stream ? RequestOutputKind::kDelta : RequestOutputKind::kFinalOnly;
+  // stream_interval (completion/protocol.py:378 @ vllm#49754).
+  sp.stream_interval = stream_interval;
   // logit_bias / allowed_token_ids / bad_words (completion/protocol.py:369-371).
   ApplyLogitFilters(sp, logit_bias, allowed_token_ids, bad_words);
   // response_format -> structured_outputs (completion/protocol.py:309-338).
@@ -570,6 +574,8 @@ SamplingParams ChatCompletionRequest::to_sampling_params(
   sp.include_stop_str_in_output = include_stop_str_in_output;
   sp.output_kind =
       stream ? RequestOutputKind::kDelta : RequestOutputKind::kFinalOnly;
+  // stream_interval (chat_completion/protocol.py @ vllm#49754).
+  sp.stream_interval = stream_interval;
   // logit_bias / allowed_token_ids / bad_words (chat_completion/protocol.py:694-697).
   ApplyLogitFilters(sp, logit_bias, allowed_token_ids, bad_words);
   // response_format -> structured_outputs (chat_completion/protocol.py:629-658).

@@ -163,6 +163,11 @@ RequestState RequestState::FromNewRequest(const tok::Tokenizer* tokenizer,
         LogprobsProcessor::FromNewRequest(detok_tokenizer, sp);
   }
   state.max_tokens_param = sp.max_tokens;
+  // output_processor.py:227-229 @ vllm#49754: a per-request stream_interval only
+  // RAISES the engine-level interval (values below it are clamped up to it).
+  if (sp.stream_interval.has_value()) {
+    stream_interval = std::max(*sp.stream_interval, stream_interval);
+  }
   state.stream_interval = stream_interval;
   // RequestStateStats.arrival_time (stats.py:222): the reference the e2e latency
   // and TTFT are measured from. Upstream uses request.arrival_time; at T0 we

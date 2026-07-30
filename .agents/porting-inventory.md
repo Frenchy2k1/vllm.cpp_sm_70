@@ -197,7 +197,11 @@ checked in at `:173` with a real doctest skip assigned to
 T0 fields: `n`, `temperature`, `top_p`, `top_k`, `min_p`, `presence/frequency/
 repetition_penalty`, `seed`, `stop`/`stop_token_ids`, `include_stop_str_in_output`,
 `ignore_eos`, `max_tokens`, `min_tokens`, `logprobs`, `detokenize`,
-`skip_special_tokens`, `output_kind` (CUMULATIVE/DELTA/FINAL_ONLY); pipeline order
+`skip_special_tokens`, `output_kind` (CUMULATIVE/DELTA/FINAL_ONLY),
+`stream_interval` (per-request streaming-cadence override, upstream-sync
+**vllm#49754** 2026-07-30 — only raises the engine `--stream-interval`, clamped
+up in `output_processor` `RequestState::FromNewRequest`; Verify() rejects `<1`);
+pipeline order
 exactly as `v1/sample/sampler.py` (fp32 logits → processors → greedy short-circuit
 → temperature → penalties → top-k/top-p → seeded sample → logprobs), GPU top-k/
 top-p kernels (`v1/sample/ops/`).

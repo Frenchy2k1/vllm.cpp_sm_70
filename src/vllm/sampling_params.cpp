@@ -102,6 +102,11 @@ void SamplingParams::Verify() const {
         std::to_string(*max_tokens) + ", got " + std::to_string(min_tokens) +
         ".");
   }
+  // stream_interval (sampling_params.py:595-600 @ vllm#49754): must be >= 1.
+  if (stream_interval.has_value() && *stream_interval < 1) {
+    throw std::runtime_error("stream_interval must be at least 1, got " +
+                             std::to_string(*stream_interval) + ".");
+  }
   if (logprobs.has_value() && *logprobs != -1 && *logprobs < 0) {
     throw std::runtime_error("logprobs must be non-negative or -1, got " +
                              std::to_string(*logprobs) + ".");

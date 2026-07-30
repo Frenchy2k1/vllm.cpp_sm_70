@@ -1554,3 +1554,19 @@ longer starve their accept thread.
 spec-decode acceptance *trace*, off by default, output-neutral — `runner.cpp`
 `spec_trace`) on `scripts/env-doc-allowlist.txt`; introduced by the concurrent
 DFlash-GGUF session and left `check-env-doc` RED on main. No behavior change.
+
+## Upstream sync 2026-07-30 (`555967922..e04a30a77`, 198 commits)
+
+Bounded mechanical sync cycle. Enumerated + tier-classified the 198-commit delta
+(ranked queue: [.agents/specs/upstream-sync-2026-07-30.md](../.agents/specs/upstream-sync-2026-07-30.md);
+report: [.agents/sync/2026-07-30-e04a30a.md](../.agents/sync/2026-07-30-e04a30a.md)).
+**Ported (T1, CPU-gated):** vllm#49754 per-request `stream_interval` sampling
+param, mirrored into `SamplingParams`, the output-processor clamp, and both
+OpenAI request paths (only raises the engine `--stream-interval`, clamped up;
+first/final chunks always emitted). Gates: `test_output_processor` 11/11,
+`test_sampling_params` 9/9, `test_openai_protocol` 28/28 (CPU). **Parity pin
+UNCHANGED** at `555967922` (subset landed); the T1 correctness queue (48245
+preemption-underflow, 50297 P/D-race, 49343 eagle-draft) and the T0 RMSNorm
+perf/determinism pair (49750, 48391 — GPU runtime gate) are the ranked
+carry-over. vllm#49030 (video temporal padding) was found ALREADY-CORRECT in
+`qwen3vl_processor.cpp` (our ceil formula equals the fix); no port.

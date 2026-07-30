@@ -371,3 +371,68 @@ TEST_CASE("OutputProcessor AsyncLLM queue handoff and abort final output") {
   CHECK(*final_output.outputs[0].finish_reason == "abort");
   CHECK_FALSE(op.has_unfinished_requests());
 }
+
+// ---------------------------------------------------------------------------
+// stream_interval per-request override — vllm#49754
+// (upstream test: tests/v1/engine/test_output_processor.py::test_stream_interval).
+// A per-request SamplingParams.stream_interval only RAISES the engine-level
+// interval (values below it are clamped up); the first and final outputs are
+// always emitted, intermediate steps below the interval are held back.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Verify() rejects stream_interval < 1") {
+  SamplingParams sp;
+  sp.stream_interval = 0;
+  CHECK_THROWS_AS(sp.Verify(), std::runtime_error);
+  sp.stream_interval = 1;    // the minimum
+  CHECK_NOTHROW(sp.Verify());
+  sp.stream_interval = std::nullopt;  // unset => engine interval unchanged
+  CHECK_NOTHROW(sp.Verify());
+}
+
+TEST_CASE("per-request stream_interval raises the engine interval (throttles)") {
+  const Tokenizer& tok = Fixture();
+  const Ids prompt = tok.Encode("hello");
+
+  // Engine interval 1 (inert), request asks for 3 => effective interval 3.
+  OutputProcessor op(&tok, /*engine stream_interval=*/1);
+  EngineCoreRequest req = MakeRequest("r0", prompt, RequestOutputKind::kDelta);
+  req.sampling_params.stream_interval = 3;
+  op.add_request(req, "hello");
+
+  // Step 1: first output is always emitted (sent_tokens_offset == 0).
+  auto s1 = op.process_outputs(MakeStep("r0", {17}));
+  REQUIRE(s1.request_outputs.size() == 1);
+  CHECK(s1.request_outputs[0].outputs[0].text == " world");
+
+  // Step 2: only 1 new token since the last send (< 3) => held back.
+  auto s2 = op.process_outputs(MakeStep("r0", {8}));
+  CHECK(s2.request_outputs.empty());
+
+  // Step 3 (final): always emitted, batching the held-back delta "12".
+  auto s3 = op.process_outputs(
+      MakeStep("r0", {9}, std::optional<FinishReason>(FinishReason::kLength)));
+  REQUIRE(s3.request_outputs.size() == 1);
+  CHECK(s3.request_outputs[0].outputs[0].text == "12");
+  CHECK_FALSE(op.has_unfinished_requests());
+}
+
+TEST_CASE("per-request stream_interval below the engine interval is clamped up") {
+  const Tokenizer& tok = Fixture();
+  const Ids prompt = tok.Encode("hello");
+
+  // Engine interval 3, request asks for 1 => cannot LOWER, effective stays 3.
+  OutputProcessor op(&tok, /*engine stream_interval=*/3);
+  EngineCoreRequest req = MakeRequest("r0", prompt, RequestOutputKind::kDelta);
+  req.sampling_params.stream_interval = 1;
+  op.add_request(req, "hello");
+
+  auto s1 = op.process_outputs(MakeStep("r0", {17}));
+  REQUIRE(s1.request_outputs.size() == 1);  // first output always sent
+  auto s2 = op.process_outputs(MakeStep("r0", {8}));
+  CHECK(s2.request_outputs.empty());         // still throttled by engine interval 3
+  auto s3 = op.process_outputs(
+      MakeStep("r0", {9}, std::optional<FinishReason>(FinishReason::kLength)));
+  REQUIRE(s3.request_outputs.size() == 1);
+  CHECK(s3.request_outputs[0].outputs[0].text == "12");
+}

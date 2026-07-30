@@ -239,6 +239,9 @@ struct CompletionRequest {
   bool include_stop_str_in_output = false;
   bool skip_special_tokens = true;
   bool spaces_between_special_tokens = true;
+  // stream_interval (completion/protocol.py:236 @ vllm#49754): per-request
+  // override of the server `--stream-interval`; only raises it (clamped up).
+  std::optional<int> stream_interval;
 
   // ROAD-V1-C7 SAMPLE-LOGIT-FILTERS (completion/protocol.py:58,93,108). OpenAI
   // `logit_bias` has STRING token-id keys; to_sampling_params converts them to
@@ -457,6 +460,9 @@ struct ChatCompletionRequest {
   bool include_stop_str_in_output = false;
   bool skip_special_tokens = true;
   bool spaces_between_special_tokens = true;
+  // stream_interval (chat_completion/protocol.py @ vllm#49754): per-request
+  // override of the server `--stream-interval`; only raises it (clamped up).
+  std::optional<int> stream_interval;
 
   // ROAD-V1-C7 SAMPLE-LOGIT-FILTERS (chat_completion/protocol.py:202,282,283).
   // See CompletionRequest for the logit_bias string-key -> int + clamp contract.
