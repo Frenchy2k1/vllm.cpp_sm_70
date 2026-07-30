@@ -58,6 +58,28 @@ void LaunchScatterLastSampled(Queue& queue, int32_t* last_sampled_tokens,
                               const int64_t* sampled_ids,
                               const int32_t* idx_mapping, int num_reqs);
 
+// W4 (discrete CUDA): replay InputBatch's STRUCTURAL edits to last_sampled_tokens
+// onto the device mirror, in stream order.
+//
+// Upstream never needs this. vllm/v1/worker/gpu/states.py:132 frees a request's
+// slot index into a pool and reuses it, so a request's req_state index is stable
+// for its lifetime and the GPU tensor is never permuted. Our InputBatch instead
+// CONDENSES (moves the last live row into the freed slot) and swaps rows in the
+// decode-first reorder. Once the values live on the device the host cannot
+// perform those moves without reading them back — which is the synchronize this
+// whole row exists to delete — so the host records what it did and the device
+// replays it here.
+//
+// `ops` is a flat [4 * num_ops] int32 device array of (kind, a, b, value):
+//   kind 0 SEED: last_sampled[a] = value      (add_request)
+//   kind 1 MOVE: last_sampled[a] = last_sampled[b]  (condense)
+//   kind 2 SWAP: swap(last_sampled[a], last_sampled[b])  (swap_states)
+// Applied STRICTLY IN ORDER by a single thread: the ops are not independent (a
+// move can read a slot a previous move wrote), and there are at most a handful
+// per step, so serial application is both correct and free.
+void LaunchApplyLastSampledOps(Queue& queue, int32_t* last_sampled_tokens,
+                               const int32_t* ops, int num_ops);
+
 }  // namespace vt::cuda
 
 #endif  // VT_CUDA_COMBINE_TOKENS_H_

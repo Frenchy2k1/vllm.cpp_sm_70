@@ -409,7 +409,7 @@ TEST_CASE("CUDA embedding matches CPU (i32 and i64 ids)") {
   }
 }
 
-TEST_CASE("CUDA embedding: out-of-range device id throws with the id") {
+TEST_CASE("CUDA embedding: out-of-range device id is reported with the id") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");
     return;
@@ -418,25 +418,55 @@ TEST_CASE("CUDA embedding: out-of-range device id throws with the id") {
   const int64_t v = 8, h = 4;
   const auto tf = RandomF32(static_cast<size_t>(v * h), 42);
 
+  // CONTRACT (changed deliberately, see cuda_ops.cu EmbeddingErrRing): the CUDA
+  // embedding no longer synchronizes the stream to read its out-of-range flag,
+  // because that made a once-per-step op a hard barrier between engine steps.
+  // The report is now DEFERRED: an out-of-range id is raised no later than the
+  // NEXT Embedding on the queue, carrying the same message and the same id. The
+  // gather itself is unchanged — bad ids are still clamped in-kernel, so the
+  // offending call never reads out of bounds.
+  //
+  // The Synchronize below is what makes this deterministic rather than a race
+  // with the flag's device-to-host copy: after it the copy has certainly landed,
+  // so the next Embedding MUST raise.
   for (int32_t bad : {int32_t{8}, int32_t{-3}}) {
     CAPTURE(bad);
-    std::vector<int32_t> ids = {1, bad, 2};
+    std::vector<int32_t> bad_ids = {1, bad, 2};
+    const std::vector<int32_t> good_ids = {1, 0, 2};
     QueueGuard gq(gpu);
     DeviceTensor dtab(gpu, gq.q, DType::kF32, {v, h}, tf.data());
-    DeviceTensor dids(gpu, gq.q, DType::kI32, {3}, ids.data());
+    DeviceTensor dbad(gpu, gq.q, DType::kI32, {3}, bad_ids.data());
+    DeviceTensor dgood(gpu, gq.q, DType::kI32, {3}, good_ids.data());
     DeviceTensor dout(gpu, gq.q, DType::kF32, {3, h});
+
+    // The offending call is allowed to raise here or to defer; either is the
+    // contract, so only the id is asserted when it does raise.
     bool threw = false;
+    std::string msg;
     try {
-      vt::Embedding(gq.q, dout.tensor(), dtab.tensor(), dids.tensor());
+      vt::Embedding(gq.q, dout.tensor(), dtab.tensor(), dbad.tensor());
     } catch (const std::runtime_error& e) {
       threw = true;
-      const std::string msg = e.what();
-      CAPTURE(msg);
-      CHECK(msg.find("embedding") != std::string::npos);
-      CHECK(msg.find(std::to_string(bad)) != std::string::npos);
+      msg = e.what();
     }
+    // The kernel clamps bad ids, so the stream stays healthy either way.
+    CHECK_NOTHROW(gpu.Synchronize(gq.q));
+
+    if (!threw) {
+      try {
+        vt::Embedding(gq.q, dout.tensor(), dtab.tensor(), dgood.tensor());
+      } catch (const std::runtime_error& e) {
+        threw = true;
+        msg = e.what();
+      }
+    }
+    CAPTURE(msg);
     CHECK(threw);
-    // The kernel clamps bad ids, so the stream stays healthy after the throw.
+    CHECK(msg.find("embedding") != std::string::npos);
+    CHECK(msg.find(std::to_string(bad)) != std::string::npos);
+    // Once reported, the error is CONSUMED: a subsequent clean call is clean,
+    // so a single bad id cannot poison every later step.
+    CHECK_NOTHROW(vt::Embedding(gq.q, dout.tensor(), dtab.tensor(), dgood.tensor()));
     CHECK_NOTHROW(gpu.Synchronize(gq.q));
   }
 }

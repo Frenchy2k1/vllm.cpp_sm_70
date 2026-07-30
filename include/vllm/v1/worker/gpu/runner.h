@@ -386,6 +386,8 @@ class GPUModelRunner final : public ModelRunnerBase {
   // cache is sized by this (one recurrent state per sequence), decoupled from
   // the attention num_blocks. See remap_gdn_state_slots.
   int max_num_reqs_ = 0;
+  // Flattened-token bound for one step; sizes the W4 device input_ids mirror.
+  int max_num_batched_tokens_ = 0;
   int64_t gdn_state_slots_ = 0;
   // Compact GDN state-slot allocator: request identity (req_id) -> slot in
   // [0, gdn_state_slots_); free list of unused slots. Keyed on the sequence, not
@@ -420,6 +422,49 @@ class GPUModelRunner final : public ModelRunnerBase {
   // sample; freed in the dtor. Mirrors torch's caching device/pinned allocators.
   std::unique_ptr<AsyncOutputPool> async_output_pool_;
   AsyncOutputPool& get_or_create_async_output_pool();
+
+  // ─── ENG-ASYNC-SCHED W4: discrete-CUDA device-resident async inputs ─────────
+  // On an INTEGRATED GPU the W3 combine/scatter kernels operate on the runner's
+  // host arrays in place, because pageable host memory is device-addressable
+  // there. A DISCRETE GPU cannot do that, and the host fallback has to
+  // synchronize the main stream to read the sampled ids — which is precisely
+  // what makes the depth-2 async scheduler overlap nothing on this hardware.
+  //
+  // These are the discrete equivalent: the small per-step inputs the combine
+  // reads, held in persistent device buffers, with last_sampled_tokens the
+  // AUTHORITATIVE copy (the scatter writes it on the main queue and the next
+  // step's combine reads it there, so no sampled id ever crosses to the host on
+  // the critical path). That is exactly what upstream does on every platform —
+  // vllm/v1/worker/gpu/states.py:64 makes last_sampled_tokens a GPU tensor
+  // unconditionally.
+  //
+  // Sized once from the batch bound; all zero-initialized. The per-step uploads
+  // copy from the caller's pageable host buffers on purpose (see stage_upload).
+  struct AsyncDeviceInputs {
+    int32_t* last_sampled = nullptr;     // [max_num_reqs], AUTHORITATIVE
+    int32_t* prefill_len = nullptr;      // [max_num_reqs]
+    int32_t* query_start_loc = nullptr;  // [max_num_reqs + 1]
+    int32_t* seq_lens = nullptr;         // [max_num_reqs]
+    int32_t* input_ids = nullptr;        // [max_num_batched_tokens]
+    int32_t* ops = nullptr;              // [4 * max_num_reqs] structural replay
+    int64_t input_ids_capacity = 0;      // elements in `input_ids`
+    int32_t max_reqs = 0;
+  };
+  std::unique_ptr<AsyncDeviceInputs> async_device_inputs_;
+  // Allocate on first use, or return nullptr when this device does not need the
+  // mirror (integrated GPU, non-CUDA backend, or async not engaged). Caller
+  // treats nullptr as "take the pre-W4 path".
+  AsyncDeviceInputs* get_or_create_async_device_inputs();
+  // True when this runner must mirror the async inputs onto the device: CUDA,
+  // async engaged, and the platform is NOT integrated. Memoized.
+  bool async_device_mirror() const;
+  mutable int async_device_mirror_cached_ = -1;  // -1 unknown, 0 no, 1 yes
+  // Push the recorded InputBatch structural edits (seed/move/swap) to the device
+  // mirror in stream order, then clear the log. No-op without a mirror.
+  void replay_last_sampled_ops(AsyncDeviceInputs& dev);
+  // Upload `src` into `dst` through the pinned staging buffer on the main queue.
+  void stage_upload(AsyncDeviceInputs& dev, int32_t* dst, const int32_t* src,
+                    int64_t count);
   // Assemble the [num_reqs, vocab] logits the sampler runs on (the three-case
   // device/host gather from the stashed forward result) and apply the grammar
   // bitmask, IN the exact order the sync path uses. Shared by sample_tokens and
