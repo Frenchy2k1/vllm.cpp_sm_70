@@ -212,6 +212,71 @@ TEST_CASE("CUDA keep-quant GEMM == CPU reference and f64 dequant (Q8_K family + 
   gpu.DestroyQueue(gq);
 }
 
+// Brick 4 (last-mile): the CUDA coalesced-Q8_0 layout (RepackQ8_0Cuda + the
+// q8_0_aligned kernel) must be BIT-IDENTICAL to the plain in-place Q8_0 path — it
+// is a byte permutation of the SAME int8 + f16 scale values feeding the SAME dp4a
+// dot. RED-first: a wrong deinterleave offset (qs/scale section) or a mis-aligned
+// int4 load would diverge the two outputs.
+TEST_CASE("Brick 4: CUDA Q8_0 aligned (coalesced) layout == plain Q8_0 (bit-identical)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; Q8_0-aligned gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase c = {DType::kQ8_0, 32, 34, 0, -1, "q8_0"};
+  const int64_t k = 8 * c.block_elems;  // 8 blocks
+  for (int64_t m : {int64_t{1}, int64_t{4}}) {
+    for (int64_t n : {int64_t{1}, int64_t{7}, int64_t{16}}) {
+      CAPTURE(m);
+      CAPTURE(n);
+      std::vector<uint8_t> wq = RandomBlocks(c, n * (k / c.block_elems), 0x5EEDU);
+      std::vector<float> a(static_cast<size_t>(m * k));
+      GenerateData(1.0F, a.size(), a.data());
+
+      void* d_a = gpu.Alloc(a.size() * sizeof(float));
+      gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+      Tensor at = DevTensor(d_a, DType::kF32, {m, k});
+
+      // plain in-place Q8_0
+      void* d_w = gpu.Alloc(wq.size());
+      void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+      gpu.Copy(gq, d_w, wq.data(), wq.size());
+      Tensor bt = DevTensor(d_w, DType::kQ8_0, {n, k});
+      Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
+      vt::MatmulBTQuant(gq, ot, at, bt);
+      std::vector<float> plain(static_cast<size_t>(m * n), 0.0F);
+      gpu.Copy(gq, plain.data(), d_o, plain.size() * sizeof(float));
+      gpu.Synchronize(gq);
+
+      // aligned (coalesced) layout: repack the SAME bytes + flag the tensor
+      std::vector<uint8_t> wq_al = wq;
+      vt::cpu::RepackQ8_0Cuda(wq_al.data(), n, k);
+      void* d_wa = gpu.Alloc(wq_al.size());
+      void* d_oa = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+      gpu.Copy(gq, d_wa, wq_al.data(), wq_al.size());
+      Tensor bta = DevTensor(d_wa, DType::kQ8_0, {n, k});
+      bta.q8_0_aligned = true;
+      Tensor ota = DevTensor(d_oa, DType::kF32, {m, n});
+      vt::MatmulBTQuant(gq, ota, at, bta);
+      std::vector<float> aligned(static_cast<size_t>(m * n), 0.0F);
+      gpu.Copy(gq, aligned.data(), d_oa, aligned.size() * sizeof(float));
+      gpu.Synchronize(gq);
+
+      for (size_t i = 0; i < plain.size(); ++i) {
+        REQUIRE(std::isfinite(aligned[i]));
+        CHECK(aligned[i] == plain[i]);  // BIT-IDENTICAL
+      }
+      gpu.Free(d_a);
+      gpu.Free(d_w);
+      gpu.Free(d_o);
+      gpu.Free(d_wa);
+      gpu.Free(d_oa);
+    }
+  }
+  gpu.DestroyQueue(gq);
+}
+
 TEST_CASE("CUDA keep-quant GEMM registers the native kCUDA provider") {
   // The registration is what flips the GGUF loader's keep-quant default ON on a
   // CUDA device (GgufQuantComputeAvailable -> OpRegistered(kMatmulBTQuant,kCUDA))

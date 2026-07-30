@@ -751,6 +751,22 @@ BIT-EXACT IN-KERNEL GEMM LEVERS ARE NOW LARGELY EXHAUSTED** (both grouped dequan
 B1/B1b; Q8_0 at its block wall after B3). Remaining: (a) aligned Q8_0 repack (numerics-neutral, design-changing);
 (b) glue (Rope+MhcPreFinish+Route ≈ 23%); (c) numerics-delicate (dequant-cache, fp8-KV). At 10.07 ≈ 61% of ds4 vs
 the ~13–15 bit-exact ceiling. STOPPED for review. Rollback `VT_V4_RESIDENT_DECODE=0`. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Last-mile campaign — Brick 4: aligned Q8_0 weight repack for coalesced CUDA loads — a MEASURED NEGATIVE
+(bit-exact, NO speedup, +4.7 GiB peak RSS); the coalesced-load hypothesis is REFUTED (2026-07-30, base `d1c63dc7`,
+branch `deepseek-v4-last-mile`, commit `b8a3f691`→amended, NOT pushed).** Repacked the Q8_0 tower (6.146 GiB) at
+load into `[all qs (16B-aligned) | all scales]` (`RepackQ8_0Cuda`) so a warp lane reads via aligned `int4` loads
+(`QuantDotGemmQ8_0AlignedKernel`); memory-disciplined (copy off mmap + `DropSpanResidency`); opt-in
+`VT_V4_Q8_0_ALIGN` (default OFF); `wo_a` excluded (row-sliced). BIT-EXACT: `test_cuda_quant_dot` **3/3·105841**
+(new aligned==plain BYTE-IDENTICAL + RED-first); `test_cuda_deepseek_v4` 18/18; `test_deepseek_v4_gguf_load`
+13/13; real 80.7 GB ALIGNED resident ids BYTE-EQUAL to plain, "…Paris.". **RESULT — NEGATIVE: decode 10.07 →
+10.03 tok/s (FLAT). nsys: aligned kernel 1.671 s + still-plain wo_a 0.506 s = 2.177 s vs Brick 3's 2.149 s
+(+1.3% WORSE). PEAK RSS: aligned 91.05 GiB vs plain 86.33 GiB = +4.7 GiB (safe, 28 GiB headroom; not net-flat).**
+WHY: the aligned int4 loads didn't help + separating the scales added a scattered per-block gather. With Brick 3
+(dp4a also no help), the Q8_0 matvec is NOT load/ALU/alignment-bound but LATENCY/OCCUPANCY-bound (1-warp/output,
+~33k tiny launches/step). **THE BIT-EXACT IN-KERNEL GEMM LEVERS ARE EXHAUSTED.** RECOMMEND: do not ship — revert
+(keep record) or merge default-OFF. Residual = a kernel-structure change (risky) OR fp8-KV/dequant-cache
+(numerics-delicate) — a USER CALL. At 10.07 ≈ 61% of ds4 vs the ~13–15 bit-exact ceiling. STOPPED for review.
+Rollback `VT_V4_Q8_0_ALIGN` default-OFF. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

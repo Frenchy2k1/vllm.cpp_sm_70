@@ -80,6 +80,7 @@ vt::Tensor OwnedTensor::View() const {
   t.data = const_cast<uint8_t*>(bytes.data());
   t.dtype = dtype;
   t.repacked = repacked;  // CIQ G7: carry the i8mm-repack marker to the kernel
+  t.q8_0_aligned = q8_0_aligned;  // Brick 4: carry the CUDA coalesced-Q8_0 marker
   t.device = vt::Device{};  // default = CPU host
   t.rank = rank;
   int64_t stride = 1;

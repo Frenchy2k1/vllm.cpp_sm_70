@@ -169,7 +169,27 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   wall after B3). Further speed = either the aligned repack (numerics-neutral, design-changing) OR the
   numerics-delicate last mile (dequant-cache, fp8-KV). We stand at **10.07 tok/s ≈ 61% of ds4 16.5** vs the
   ~13–15 projected bit-exact ceiling.
-- **Brick 4 — fp8 KV (parity/long-ctx, measured at 256+).** Rollback-able (new path default-safe; the resident default stays correct).
+- **Brick 4 — aligned Q8_0 weight repack for coalesced CUDA loads — IMPLEMENTED + DGX-GATED, but a MEASURED
+  NEGATIVE: the hypothesis (63%→~85% via aligned int4 loads) is REFUTED. Recommend NOT shipping (default-OFF).**
+  (commit `b8a3f691`→amended.) Repacked the Q8_0 tower at load into the coalesced layout — deinterleave each
+  tensor into `[all qs (32B/block, 16-byte-aligned) | all scales (uint16)]` so a warp lane reads its 32 int8 via
+  two aligned `int4` (128-bit) loads (`QuantDotGemmQ8_0AlignedKernel`); `RepackQ8_0Cuda` copies off the mmap +
+  `DropSpanResidency` drops the source pages (CIQ G7 pattern). Opt-in `VT_V4_Q8_0_ALIGN` (default OFF); `wo_a`
+  excluded (row-sliced). **BIT-EXACT** (`test_cuda_quant_dot` **3/3·105841** incl. a new aligned==plain
+  BYTE-IDENTICAL + RED-first case; `test_cuda_deepseek_v4` 18/18; `test_deepseek_v4_gguf_load` 13/13; real 80.7 GB
+  model ALIGNED resident ids BYTE-EQUAL to plain, "…Paris."). **RESULT — NO SPEEDUP: decode 10.07 → 10.03 tok/s
+  (FLAT, within noise; aligned 6 warm 10.02–10.06). nsys: the aligned kernel (7 full-tensor Q8_0 GEMMs) 1.671 s +
+  the still-plain `wo_a` 0.506 s = 2.177 s vs Brick 3's all-plain 2.149 s — MARGINALLY WORSE (+1.3%).** PEAK RSS:
+  aligned **91.05 GiB** vs plain 86.33 GiB = **+4.7 GiB** (safe — 28 GiB headroom under the 119 pool — but not the
+  hoped net-flat; the source-page drop is a high-water no-op and the owned 6.1 GiB tower is added). **WHY IT FAILED:**
+  the aligned int4 loads did not help (and separating the scales into their own section added a scattered per-block
+  uint16 gather). Combined with Brick 3 (dp4a also no help), the Q8_0 matvec is NOT load/ALU/alignment-bound — it is
+  LATENCY/OCCUPANCY-bound (1-warp-per-output, small nb/lane, ~33k tiny launches/step, the warp-reduce). **THE
+  BIT-EXACT IN-KERNEL GEMM LEVERS ARE EXHAUSTED.** Recommend REVERT-code-keep-record (or merge default-OFF as a
+  guarded recorded-negative). Further Q8_0 speed = a kernel-STRUCTURE change (multiple outputs/warp or a
+  batched/persistent kernel — risky, uncertain) OR the numerics-delicate last mile (fp8-KV, dequant-cache) — a USER
+  CALL. We stand at **10.07 tok/s ≈ 61% of ds4 16.5** vs the ~13–15 projected bit-exact ceiling.
+- **Brick 5 — fp8 KV (parity/long-ctx, measured at 256+).** Rollback-able (new path default-safe; the resident default stays correct).
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +

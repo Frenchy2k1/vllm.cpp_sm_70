@@ -60,6 +60,13 @@ struct OwnedTensor {
   // mutates the buffer, so it cannot ride the read-only mmap borrow).
   bool repacked = false;
 
+  // Brick 4 (DeepSeek-V4 last-mile): the Q8_0 blocks were repacked at load into
+  // the CUDA coalesced-load layout ([all qs | all scales], 16-byte-aligned qs).
+  // Carried to vt::Tensor::q8_0_aligned by View(); the CUDA Q8_0 GEMM keys on it.
+  // Same total bytes; set only on the owned (copy) residency (the transform
+  // rewrites the buffer, so it cannot ride the read-only mmap borrow).
+  bool q8_0_aligned = false;
+
   // A synchronized direct-device load may discard the host staging buffer while
   // retaining an authoritative d_dev/d_dev_f32 copy. Empty() is used as model
   // dispatch metadata, so host reclamation must not make a populated weight look

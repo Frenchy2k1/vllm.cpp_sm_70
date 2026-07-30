@@ -79,10 +79,13 @@ namespace vllm {
 // a whole number of blocks (ggml_row_size's precondition), when the requested
 // rows fall outside the tensor's validated byte span, or when a borrowed span is
 // not inside `mmap_src`'s mapping.
+// `cuda_align` (Brick 4): if set AND the encoding is Q8_0, repack the blocks into
+// the CUDA coalesced-load layout (copy off the mmap into an owned buffer, drop the
+// source file pages) instead of borrowing/plain-copying — see RepackQ8_0Cuda.
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset = 0,
                                const GgufFile* mmap_src = nullptr,
-                               bool repack = false);
+                               bool repack = false, bool cuda_align = false);
 
 // L6 (keep-f16 residency). Take `n` rows of `k` F16 elements of `tensor`'s raw
 // bytes — starting at row `row_offset` (how a stacked [E, out, in] expert tensor

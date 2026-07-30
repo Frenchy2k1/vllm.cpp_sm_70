@@ -146,6 +146,16 @@ bool QuantRepackEligible(DType weight_dtype, int64_t n, int64_t k);
 void QuantRepackWeight(DType weight_dtype, uint8_t* blocks, int64_t n,
                        int64_t k);
 
+// Brick 4 (DeepSeek-V4 last-mile): CUDA coalesced-load repack. Eligible = Q8_0 +
+// K a whole number of 32-blocks (any N). RepackQ8_0Cuda rewrites the [N,K] Q8_0
+// buffer IN PLACE from block-interleaved `[d,qs]×nblk` into two contiguous
+// sections `[all qs (32B/block) | all scales (2B/block)]` (same total bytes) so
+// the CUDA Q8_0 GEMM reads qs via aligned int4 loads. Byte permutation only ->
+// BIT-IDENTICAL integer dot. Host code (always compiled); the CONSUMER kernel is
+// CUDA-only. See cpu_quant_repack.cpp.
+bool RepackQ8_0CudaEligible(DType weight_dtype, int64_t n, int64_t k);
+void RepackQ8_0Cuda(uint8_t* blocks, int64_t n, int64_t k);
+
 }  // namespace vt::cpu
 
 namespace vt {

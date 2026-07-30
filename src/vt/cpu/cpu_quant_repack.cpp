@@ -71,4 +71,38 @@ void QuantRepackWeight(DType weight_dtype, uint8_t* blocks, int64_t n,
   }
 }
 
+// Brick 4 (DeepSeek-V4 last-mile): repack a Q8_0 weight into the CUDA
+// coalesced-load layout. The in-place 34-byte block (`uint16 d + 32×int8 qs`)
+// interleaves the scale into the qs stream and starts qs at offset 2 (2-byte
+// aligned), which precludes wide aligned loads on the decode Q8_0 matvec. This
+// DEINTERLEAVES the whole tensor into two contiguous sections — `[all qs | all
+// scales]` — so every block's 32 qs sit at a 32-byte-aligned offset (b*32) and a
+// warp lane reads them via aligned `int4` (128-bit) loads. Byte permutation only:
+// same total size (n*nb*32 qs + n*nb*2 scales = n*nb*34), same scale + int8
+// values, so the integer dot is BIT-IDENTICAL to the in-place BlockQ8_0 path.
+// dst layout for global block index i = r*nb+b (r in [0,n), b in [0,nb)):
+//   qs bytes  : blocks[ i*32 .. i*32+32 )
+//   scale d   : *(uint16*)(blocks + n*nb*32 + i*2)
+bool RepackQ8_0CudaEligible(DType weight_dtype, int64_t n, int64_t k) {
+  return weight_dtype == DType::kQ8_0 && n > 0 && k > 0 && k % kQK8_0 == 0;
+}
+
+void RepackQ8_0Cuda(uint8_t* blocks, int64_t n, int64_t k) {
+  VT_CHECK(RepackQ8_0CudaEligible(DType::kQ8_0, n, k),
+           "repack_q8_0_cuda: weight is not Q8_0 / K not a whole number of blocks");
+  const int64_t nb = k / kQK8_0;
+  const int64_t nblk = n * nb;
+  const size_t total = static_cast<size_t>(nblk) * sizeof(BlockQ8_0);  // n*nb*34
+  // Not in-place-safe (the qs section overlaps the source interleave), so
+  // snapshot the plain blocks first; the deinterleaved sections fit `blocks`.
+  std::vector<uint8_t> src(blocks, blocks + total);
+  const BlockQ8_0* sb = reinterpret_cast<const BlockQ8_0*>(src.data());
+  uint8_t* qs = blocks;                                                    // [nblk*32]
+  uint8_t* dd = blocks + static_cast<size_t>(nblk) * kQK8_0;               // [nblk*2]
+  for (int64_t i = 0; i < nblk; ++i) {
+    std::memcpy(qs + static_cast<size_t>(i) * kQK8_0, sb[i].qs, kQK8_0);
+    std::memcpy(dd + static_cast<size_t>(i) * sizeof(uint16_t), &sb[i].d, sizeof(uint16_t));
+  }
+}
+
 }  // namespace vt::cpu
