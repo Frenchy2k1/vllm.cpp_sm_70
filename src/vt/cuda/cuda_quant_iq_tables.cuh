@@ -13,7 +13,15 @@ namespace vt::cuda {
 
 __device__ __constant__ uint8_t d_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
-__device__ __constant__ uint8_t d_ksigns_iq2xs[128] = {
+// Brick 1b (last-mile): d_ksigns_iq2xs + d_iq2xxs_grid moved from __constant__ to
+// __device__ GLOBAL. In the warp-per-output grouped matvec the 32 lanes each own a
+// DIFFERENT super-block ⇒ they read DIFFERENT grid/sign indices — DIVERGENT access,
+// which __constant__ (optimized for uniform/broadcast) serializes ~32× per warp
+// (the profiled IQ2_XXS bottleneck). Global goes through L2 (cached, cross-lane
+// parallel). SAME literals ⇒ the integer dot is BIT-IDENTICAL; the memcmp/NMSE gates
+// pass unchanged (cudaMemcpyFromSymbol works for __device__ globals too). llama.cpp's
+// mmvq iq2 path likewise reads the grid from a regular (non-constant) array.
+__device__ uint8_t d_ksigns_iq2xs[128] = {
       0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
     144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
     160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
@@ -24,7 +32,7 @@ __device__ __constant__ uint8_t d_ksigns_iq2xs[128] = {
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255
 };
 
-__device__ __constant__ uint64_t d_iq2xxs_grid[256] = {
+__device__ uint64_t d_iq2xxs_grid[256] = {  // GLOBAL (not __constant__) — see note above
     0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,
     0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x08080808082b0808ULL,
     0x08080808082b082bULL, 0x08080808082b2b08ULL, 0x08080808082b2b2bULL, 0x0808080819080819ULL,

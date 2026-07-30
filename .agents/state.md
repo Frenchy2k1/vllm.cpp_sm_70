@@ -33927,3 +33927,47 @@ free, no stray gen). Row `ACTIVE`.
   `MtpProposePrefill` is not reused — only the rejection sampler is shared) +
   engine spec-config registration + device draft forward. All 7 record checkers
   rc=0. See `.agents/specs/deepseek-v4-mtp.md`.
+
+## DeepSeek-V4 last-mile campaign — Brick 1b: fix the IQ2_XXS grid-lookup serialization (__constant__ → GLOBAL) — the flat kernel unblocked, +12.5% (2026-07-30, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-rd`, branch `deepseek-v4-last-mile`, base `f6c34252`, commit `e4d8845b`, NOT pushed)
+
+Brick 1's split finding named the lever: the grouped IQ2_XXS matvec stayed at ~19% of BW peak (flat under
+dp4a) because `d_iq2xxs_grid[256]` is `__device__ __constant__ uint64_t`, and our warp-per-output kernel has
+each of the 32 lanes read a DIFFERENT grid index (each lane owns a different super-block) → divergent
+constant-memory reads serialize ~32× per warp (constant memory is optimized for uniform/broadcast, terrible
+for divergent). Coordinator GREENLIT Brick 1b: move the grid out of `__constant__`.
+
+**FIX (cuda_quant_iq_tables.cuh):** moved `d_iq2xxs_grid[256]` + `d_ksigns_iq2xs[128]` from
+`__device__ __constant__` to `__device__` GLOBAL, so the divergent per-lane reads go through L2 (cached,
+parallelized across lanes) instead of the serialized constant path. `d_kmask_iq2xs` + `d_iq3xxs_grid` left
+`__constant__` (IQ3 is not on this model's hot path). llama.cpp's mmvq iq2 path likewise reads the grid from a
+regular (non-constant) array. BIT-IDENTICAL: same literals, only the memory space/access changes → the integer
+dot is unchanged; `cudaMemcpyFromSymbol` still works for `__device__` globals.
+
+**GATES (DGX GB10):** `test_cuda_quant_dot` **2/2·105601, nmse≤1e-6 ZERO drift** (moving to global kept the
+values bit-identical — as expected); `test_cuda_deepseek_v4` 18/18·34176; `test_deepseek_v4_gguf_load`
+12/12·531; real 80.7 GB model resident-default TOKEN-IDENTICAL "…Paris." (default == host `=0`).
+
+**RESULT (nsys re-profile, resident-default eager):**
+- **IQ2_XXS grouped: 2.45× faster** — nsys median/instance 265→108 µs; **19% → 46% of the 240 GB/s peak** (now
+  memory-bound-ish, like Q2_K 56% and Q8_0 63%). Its share 22.8% → 10.0% of the step. The grid serialization
+  WAS the bottleneck (confirmed — the dp4a MAC vectorization from Brick 1 was correct but hidden behind it).
+- Q2_K grouped unchanged (already dp4a-fast, median 104 µs).
+- New per-kernel split: Q8_0 43.2% · IQ2 grouped 10.0% · QuantizeQ8K 9.8% · Q2_K grouped 4.8% · QuantizeQ8_0 4.5%.
+  The grouped-MoE dequant lever (Bricks 1+1b) is DONE — both grouped kernels are now memory-bound.
+
+**BENCHMARK (real 80.7 GB, 24 decode, resident default):** decode **8.51 → 9.58 tok/s (+12.5%, 5 stable warm
+runs — all warm this session, no cold leg)**; host `=0` 7.63 → 8.47. vs ds4 16.5 → now **~58% of ds4**.
+Campaign-cumulative: host 6.44 (pre-Q8_0) → resident-default **9.58 = +49%**.
+
+**NEXT (per the coordinator):** Brick 2 — activation-quant fusion / preq-reuse (S-effort, bit-exact): dedup the
+~795 tiny quant launches + the redundant per-GEMM re-quant (`QuantizeQ8K` 9.8% + `QuantizeQ8_0` 4.5% = ~14%,
+launch-bound — the biggest non-Q8_0 lever now). Then Brick 3 — Q8_0 coalescing (43% of step at 63% of peak).
+
+**MULTI-AGENT OPS (important):** a parallel Workflow agent is building DeepSeek-V4 MTP in `vllmcpp-mmspeed`
+(MY prior tree) — I found it actively compiling `deepseek_v4_mtp` there, so to avoid a concurrent-`make` relink
+race I built Brick 1b in a NEW ISOLATED tree `vllmcpp-lastmile` (git-archive of my commit, clean full CUDA
+build, sm_121a). The `flock $HOME/gpu.lock` serialized our GPU runs (I foreground-waited for it). 116 GB host
+mem available + worker at 69 MB (no model) → no OOM risk for the build; I stopped the worker only for my GPU
+runs then RESTORED it (running, restart=always). Disk 302 G free (my tree +~18 GB build; prune at campaign end).
+STOPPED for review before Brick 2. Box restored (worker running restart=always, flock free, no stray gen).
+Row `ACTIVE`.

@@ -703,6 +703,18 @@ peak) — GROUNDED: `d_iq2xxs_grid` is `__constant__`, our 32 lanes look up diff
 constant-memory reads ~32-way serialized/warp = the bottleneck, not the MAC. **Decode 8.01 → 8.51 tok/s (+6%,
 4 stable warm runs) vs ds4 16.5.** NEXT (Brick 1b): the IQ2 grid-lookup (move to GLOBAL / mmvq.cu handling) —
 the bigger grouped kernel's win. STOPPED for review. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Last-mile campaign — Brick 1b: IQ2_XXS grid-lookup fix (`__constant__` → GLOBAL) — the flat kernel unblocked,
++12.5% (2026-07-30, base `f6c34252`, branch `deepseek-v4-last-mile`, commit `e4d8845b`, NOT pushed).** Brick 1's
+finding: IQ2_XXS grouped stayed at ~19% of peak because `d_iq2xxs_grid[256]` is `__constant__` and the 32 warp
+lanes read DIFFERENT indices → divergent constant reads serialize ~32×/warp. FIX: moved `d_iq2xxs_grid` +
+`d_ksigns_iq2xs` to `__device__` GLOBAL (L2-cached, cross-lane parallel; llama.cpp's mmvq does the same).
+BIT-IDENTICAL (same literals): `test_cuda_quant_dot` **2/2·105601 nmse≤1e-6 ZERO drift**; `test_cuda_deepseek_v4`
+18/18; `test_deepseek_v4_gguf_load` 12/12; real model resident-default TOKEN-IDENTICAL "…Paris.". **RESULT:
+IQ2_XXS grouped 2.45× (median 265→108 µs; 19% → 46% of peak — now memory-bound-ish like Q2_K 56% / Q8_0 63%;
+22.8% → 10.0% of step). Decode 8.51 → 9.58 tok/s (+12.5%, 5 stable warm) vs ds4 16.5 (~58% of ds4;
+campaign-cumulative host 6.44 → 9.58 = +49%).** The grouped-MoE dequant lever (Bricks 1+1b) is DONE. NEXT:
+Brick 2 (activation-quant fusion, ~14% launch-bound) → Brick 3 (Q8_0 coalescing, 43% at 63% of peak). STOPPED
+for review. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

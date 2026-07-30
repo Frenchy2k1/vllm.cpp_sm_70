@@ -122,10 +122,18 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
     index → **divergent constant-memory reads are 32-way serialized per warp** = the bottleneck, NOT the MAC.
     So dp4a (which only vectorized the already-cheap inner MAC) does not help IQ2.
   - Decode **8.01 → 8.51 tok/s (+6%, 4 stable warm runs)** vs ds4 16.5.
-- **Brick 1b (NEW, from the Brick 1 finding) — IQ2_XXS grid-lookup fix (the bigger grouped kernel, 20-23% of
-  the step, grid-serialization-bound).** Move `d_iq2xxs_grid` out of `__constant__` to GLOBAL (L2-cached,
-  divergent access parallelized), or mirror mmvq.cu's grid handling. This is where the IQ2 win is.
-- **Brick 2 — activation-quant fusion.** **Brick 3 — Q8_0 coalescing.** **Brick 4 — fp8 KV (parity/long-ctx,
+- **Brick 1b — IQ2_XXS grid-lookup fix (DONE + DGX-gated, commit `e4d8845b`).** Moved `d_iq2xxs_grid[256]` +
+  `d_ksigns_iq2xs[128]` from `__device__ __constant__` to `__device__ GLOBAL` (`cuda_quant_iq_tables.cuh`), so
+  the divergent per-lane reads go through L2 (cached, cross-lane parallel) instead of the ~32×-serialized
+  constant path. BIT-IDENTICAL (same literals; `test_cuda_quant_dot` **2/2·105601 nmse≤1e-6 ZERO drift**;
+  `test_cuda_deepseek_v4` 18/18·34176; `test_deepseek_v4_gguf_load` 12/12·531; real model resident-default
+  TOKEN-IDENTICAL "…Paris."). **RESULT: IQ2_XXS grouped 2.45× (nsys median 265→108 µs; 19% → 46% of the
+  240 GB/s peak — now memory-bound-ish like Q2_K 56% / Q8_0 63%; its share fell 22.8% → 10.0% of the step).
+  Decode 8.51 → 9.58 tok/s (+12.5%, 5 stable warm runs) vs ds4 16.5** (host `=0` 7.63 → 8.47, shares the GEMM).
+  The grouped-MoE dequant lever (Bricks 1+1b) is DONE: both grouped kernels now memory-bound (IQ2 46%, Q2_K 56%).
+- **Brick 2 — activation-quant fusion** (now the biggest non-Q8_0 lever: `QuantizeQ8K` 9.8% + `QuantizeQ8_0`
+  4.5% = ~14% launch-bound, ~795 tiny launches/step). **Brick 3 — Q8_0 coalescing** (43% of step at 63% of
+  peak). **Brick 4 — fp8 KV (parity/long-ctx,
   measured at 256+).** Each rollback-able (new path default-safe; the current resident default stays correct).
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
