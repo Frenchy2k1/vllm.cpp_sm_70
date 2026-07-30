@@ -33801,3 +33801,55 @@ decode path (beats host +10%, token-identical, graph capture-hazard-safe); the t
 GEMM/quant microarch (fp8 KV, tuned MMQ), a named residual.** Box restored (worker running restart=always, flock
 free, no stray gen). Row `ACTIVE`.
 
+## DeepSeek-V4 device-resident decode campaign — DEFAULT FLIPPED: device-resident decode is the SHIPPED DEFAULT after broad validation (2026-07-30, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-rd`, branch `deepseek-v4-resident-default`, base `73d4799c`, commit `75c3697a`, NOT pushed)
+
+Coordinator greenlit making the device-resident decode the default, AFTER a broad correctness validation (a
+one-prompt/≤50-token check isn't enough to flip a shipped default that changes numerics).
+
+**STEP 1 — BROADENED VALIDATION (real 80.7 GB model, DGX, `deepseek-v4-gen --gpu --kv-cache`, resident
+`VT_V4_RESIDENT_DECODE=1` vs host, 4 DISTINCT prompts × 256 tokens each).** Results:
+- P0 "The capital of France is" (factual): **TOKEN-IDENTICAL** for all 258 tokens.
+- P1 "Here is a short story about a robot:" — diverge at decode token #15; HOST "…R-32 was a helpful robot who
+  loved to assist people. One day…", RES "…This robot was designed to assist humans in their daily tasks…" —
+  BOTH coherent robot stories.
+- P2 "List three benefits of regular exercise:" — diverge at #212 (211 tokens identical), both coherent.
+- P3 "Explain how photosynthesis works in simple terms:" — diverge at #44; both coherent photosynthesis
+  explanations (the chat model continues into a multi-turn conversation format, every sentence grammatical).
+0 errors, 0 crashes. Both host AND resident are DETERMINISTIC run-to-run (re-ran P1 at 64 tok: host and res each
+reproduced exactly, sharing a 15-token identical prefix then diverging at the same stable position host=433 /
+res=1162). CHARACTERIZATION: the resident kernels are within bounded numeric tolerance of host (unit-gated
+RelL2), so a greedy flip can ONLY occur where host's top-2 logits are within that noise — i.e. every divergence
+is BY CONSTRUCTION a near-tie, not a bug; and the pattern (token-identical on the confident/factual prompt,
+coherent-divergence on the open-ended ones) is the signature of a numerically-faithful path with characterized
+near-ties. The ratified COHERENT-NEAR-TIE gate is met (token-identical OR coherent near-tie; no incoherence, no
+non-near-tie flip). **SPEED at long context: resident ~1.8× the host path — 7.8 vs 4.3 tok/s over 256 tokens**
+(the host path's per-op sync + growing-context recompute compounds with context length; resident stays flat).
+
+**STEP 2 — THE FLIP.** `ResidentDecodeEnabled()` changed from default-OFF (`env=="1"`) to **default-ON**
+(`env!="0"`); **`VT_V4_RESIDENT_DECODE=0` is the rollback off-switch** (→ host `ForwardComposeImpl`). The guard
+`CanRunResidentDecode` is UNCHANGED (CUDA + keep-quant GGUF + KV cache + T==1 + V4 device kernels live), so
+CPU / non-dense / T>1 (prefill) / no-KV-cache configurations still fall back to the host path — verified: the
+prefill step (T>1) takes the host path on EVERY run (the resident path only handles the T=1 decode steps), and
+`test_deepseek_v4_gguf_load` is 12/12 with the new default (its CPU/whatever cached-forward path falls back
+cleanly). GATE (DGX GB10): `test_cuda_deepseek_v4` **18/18·34176**; `test_deepseek_v4_gguf_load` **12/12·531**;
+real 80.7 GB model — new DEFAULT (resident, no flag) **8.01 tok/s** vs `VT_V4_RESIDENT_DECODE=0` (host) **7.24**,
+both greedily generate "…Paris." TOKEN-IDENTICAL.
+
+**STEP 3 — THE CUDA GRAPH STAYS OPT-IN (`VT_V4_DECODE_GRAPH` default OFF, unchanged).** Recorded honestly: the
+graph (7.92) ≈ eager-resident (7.96) — once the step is GPU-bound at 95% util the graph collapses no host-gap
+idle on GB10, so it adds nothing HERE and carries the capture-hazard surface; eager-resident is the default win.
+The graph stays available (unit-gated, capture-hazard-safe) for launch-bound configs.
+
+**DOCS UPDATED:** docs/STATUS + docs/BENCHMARKS + this state + parity-ledger + model-matrix (DeepSeek-V4 decode =
+device-resident-default, ~7.96 tok/s, ~48% of ds4, GEMM-bound) + a NEW README models-table row (DeepSeek-V4-Flash
+MLA+MHC+DSA, keep-quant, coherent near-tie-robust, device-resident decode ~7.96 tok/s ~48% of ds4) — the shipped
+decode speedup is user-visible. The keep-README-current rule: the README listed DeepSeek-V2 but not V4; added V4.
+
+**Ops:** scp'd only deepseek_v4.cpp onto the reused `vllmcpp-mmspeed/build-cuda` sm_121a tree (md5-verified;
+drift-checked cuda_deepseek_v4.cu / deepseek_v4.cpp / cuda_quant_dot.cu vs merged main `73d4799c` = MATCH), fast
+incremental rebuild, worker stopped during build+runs then RESTORED (running, restart=always), flock held for the
+GPU runs, ONE engine at a time (8 validation runs + determinism re-runs + the flip gate, all sequential),
+foreground-wait. Rollback via `VT_V4_RESIDENT_DECODE=0`. **THE DEEPSEEK-V4 DECODE IS NOW DEVICE-RESIDENT BY
+DEFAULT ON GB10 — the vLLM-faithful path is shipped; the last mile to ds4's 16.5 is GEMM/quant microarch (fp8 KV,
+tuned MMQ), a named residual.** Box restored (worker running restart=always, flock free, no stray gen). Row `ACTIVE`.
+
