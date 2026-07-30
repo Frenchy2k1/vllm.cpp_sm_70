@@ -31,7 +31,7 @@ These change how the engine runs and have no CLI flag (or complement one).
 ## GGUF loading
 
 Behavior of the GGUF weight loader (CPU path). See also `VT_GGUF_KEEP_QUANT` in
-the [README Quantization table](../README.md#quantization).
+the [quantization format table](BUILD.md#quantization-formats).
 
 | Variable | Default | What it does |
 |---|---|---|

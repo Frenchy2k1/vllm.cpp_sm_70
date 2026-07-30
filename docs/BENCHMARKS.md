@@ -7,7 +7,7 @@ binding result, the active performance diagnosis, pending gates, and current
 reproduction entry points. For the user-facing overview (what the project is,
 how to build it, the CLI, the OpenAI server, and how to consume it), see the
 [README](../README.md); this page is the detailed numbers behind its
-[Performance](../README.md#performance) section, and the per-capability
+[Performance](../README.md#performance-faster-than-vllm) section, and the per-capability
 lifecycle ledger is [docs/STATUS.md](STATUS.md). Attempt chronology and failure
 forensics live in the [parity ledger](../.agents/parity-ledger.md),
 [state log](../.agents/state.md), linked specs, and Git. Those raw records are
@@ -15,6 +15,20 @@ append-only within the current era and are frozen under `.agents/completed/`
 when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
+
+## Landing-page restructure + project logo (2026-07-30) - NOT-APPLICABLE (documentation only, no throughput owed)
+
+No engine code, no kernel, no config path: README.md became a landing page, its
+reference tables moved to `docs/USAGE.md` + `docs/BUILD.md`, and the project logo
+landed as `scripts/make-logo.py` (renderer) plus the `assets/logo-*` outputs. This
+owes no benchmark. The numbers the page now leads with are the EXISTING binding
+ones re-presented, not new measurements: the Qwen3.6-27B six-axis concurrency grid
+(1.007x-1.045x, all six ahead), peak host memory 24.88 vs 28.18 GiB, CPU prefill
+223.8 vs llama.cpp 177.3 tok/s, and the Metal figures below (prefill 1.5% ahead of
+MLX-LM, warm total 97.6% MLX-gated / 95.9% default). The perf badge is scoped to
+the 27B gate model deliberately, since most architectures are speed-pending.
+Reproduction entry points are unchanged; `benchmarks/demo/` still renders both
+front-page figures from its committed spec.
 
 ## Upstream sync 2026-07-30 (`555967922..e04a30a77`) - NOT-APPLICABLE (frontend feature, no throughput owed)
 
