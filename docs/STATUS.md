@@ -1685,3 +1685,5 @@ the weight-dominant 27B W4A4 projections run FLAT across M at the HBM copy roofl
 GB/s, down 283 GB/s) — decode is memory-bound, so a dp4a matvec reads the same bytes at the same
 bandwidth and cannot raise tok/s. NO production code changed; SACRED `test_ops_nvfp4_fp4` 30/30·27006.
 The gate models' W4A4 decode is at the achievable roofline. See `.agents/specs/nvfp4-w4a4-m1-decode-measured-2026-07-30.md`.
+
+**DeepSeek-V4-Flash Brick 6 — MoE fusion, +5.2% decode (2026-07-30, `6795717f`, MERGED).** Corrects the Brick-4 "bit-exact GEMM levers exhausted" framing: that was the GEMM *mainloop*; the CROSS-kernel fusion lever (ds4's real edge) was still open. Fused routed-MoE gate+up+silu into ONE kernel (mirrors ds4 `moe_gate_up_mid`) — **BIT-EXACT** (byte-identical 49-token sequence, real 80.7 GB model), decode **10.27 → 10.80 tok/s (~65% of ds4 16.5)**, kernel instances −12.2%. `VT_V4_FUSED_MOE=0` rollback. NEXT (Brick 7): fuse the un-fused per-step glue (Rope 119.9ms + MhcPreFinish 98.7ms + Route 77.4ms) — the LARGE remaining ds4 gap. Row stays `ACTIVE`.
