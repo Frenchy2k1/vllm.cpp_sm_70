@@ -28,6 +28,16 @@ struct Tensor {
   // byte count and [N,K] shape are unchanged; only the block interleave differs.
   bool repacked = false;
 
+  // Brick 4 (DeepSeek-V4 last-mile): this is a Q8_0 weight whose bytes were
+  // REPACKED at load into the CUDA coalesced-load layout — the 32 int8 `qs` of
+  // every block deinterleaved into one 16-byte-aligned contiguous section
+  // (`[all qs | all scales]`) so a warp lane reads them via aligned `int4`
+  // (128-bit) loads instead of the 34-byte in-place block's 2-byte reads.
+  // Storage only — set by the GGUF keep-quant loader, consumed by the CUDA
+  // `kMatmulBTQuant` Q8_0 path. Same total byte count + [N,K] shape; only the
+  // block byte order differs. Mutually exclusive with `repacked` (CPU i8mm).
+  bool q8_0_aligned = false;
+
   static Tensor Contiguous(void* data, DType dtype, Device device,
                            std::initializer_list<int64_t> shape);
 

@@ -56,7 +56,8 @@ inline void PrefaultBorrowedSpan(const uint8_t* src, size_t bytes) {
 
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset,
-                               const GgufFile* mmap_src, bool repack) {
+                               const GgufFile* mmap_src, bool repack,
+                               bool cuda_align) {
   vt::DType dt = vt::DType::kF32;
   VT_CHECK(KeepQuantDType(tensor.ggml_type, &dt),
            "qwen3_5 gguf: keep-quant on a non-keep-quant encoding for " +
@@ -79,6 +80,21 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
   // GGUF disk order [out, in] IS the MatmulBT [N, K] orientation: no transpose.
   o.nk = true;
   const uint8_t* src = tensor.data + begin;
+
+  // Brick 4 (DeepSeek-V4 last-mile): repack the Q8_0 slice into the CUDA
+  // coalesced-load layout. Like the CIQ G7 branch below it always COPIES (the
+  // transform rewrites the buffer; an mmap borrow is read-only), marks
+  // o.q8_0_aligned, and drops the now-dead source file pages so the Q8_0 mass is
+  // not counted twice (owned repack + resident file page). Same total bytes; the
+  // integer dot is unchanged (byte permutation only). Precedes the CPU i8mm
+  // branch — the two are mutually exclusive and cuda_align wins where both apply.
+  if (cuda_align && vt::cpu::RepackQ8_0CudaEligible(dt, n, k)) {
+    o.bytes.assign(src, src + bytes);
+    vt::cpu::RepackQ8_0Cuda(o.bytes.data(), n, k);
+    o.q8_0_aligned = true;
+    if (mmap_src != nullptr) mmap_src->DropSpanResidency(src, bytes);
+    return o;
+  }
 
   // CIQ G7: repack the slice into the i8mm interleave. It rewrites the buffer,
   // so it always COPIES (an mmap borrow is read-only) and marks o.repacked; the

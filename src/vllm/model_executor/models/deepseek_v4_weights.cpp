@@ -397,6 +397,17 @@ OwnedTensor MakeF32Owned(const std::vector<float>& dq,
   return o;
 }
 
+// Brick 4 (DeepSeek-V4 last-mile): opt-in CUDA coalesced-Q8_0 repack at load
+// (the MLA q/kv/o-LoRA/shared-expert/lm_head Q8_0 tower — ~6.1 GiB, deinterleaved
+// off the mmap into owned aligned buffers with the source file pages dropped, so
+// net-resident is ~flat). Default OFF (`VT_V4_Q8_0_ALIGN=1` to enable). CUDA-only:
+// the aligned layout is consumed only by the CUDA Q8_0 GEMM.
+inline bool EnvQ8_0CudaAlign() {
+  const char* v = std::getenv("VT_V4_Q8_0_ALIGN");
+  return v != nullptr && !(std::strcmp(v, "") == 0 || std::strcmp(v, "0") == 0 ||
+                           std::strcmp(v, "false") == 0 || std::strcmp(v, "off") == 0);
+}
+
 // A per-load routing context: the file, the residency policy, and the set of
 // consumed tensor names (the totality/accounting contract — every routed tensor
 // is recorded, and a leftover unroutes-to-fail at the end).
@@ -412,7 +423,12 @@ struct V4GgufCtx {
   }
   // 2-D [out,in] matmul weight: keep its blocks (MW keep-quant) else expand bf16,
   // both in the file's own [N,K] order (nk=true) — GGUF disk order IS MatmulBT.
-  OwnedTensor Mw(const std::string& name) {
+  // `allow_align`: gate the Brick-4 CUDA coalesced-Q8_0 repack for THIS tensor.
+  // Must be false for a weight that is later read via a block ROW-SLICE (wo_a, the
+  // per-o-group GemmRowSliceInto) — the aligned layout is per-tensor deinterleaved,
+  // so a row-offset sub-pointer would address the wrong section. Full-tensor GEMM
+  // weights (wq_a/wq_b/wkv/wo_b/shared_*/lm_head) align safely.
+  OwnedTensor Mw(const std::string& name, bool allow_align = true) {
     const GgufTensorInfo& t = Take(name);
     VT_CHECK(t.shape.size() == 2, "deepseek-v4 gguf: expected 2-D MW " + name);
     const GgufResidency r = pol.Route(t, GgufTensorRole::kMatmulWeight);
@@ -423,7 +439,8 @@ struct V4GgufCtx {
       // rather than doubling it (measured on the real model: ~116 GiB copy -> the
       // mmap-resident image). Mirrors qwen3_5_gguf_weights.cpp:214 (MmapSrc).
       return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1], /*row_offset=*/0,
-                                pol.mmap_residency ? &g : nullptr, pol.quant_repack);
+                                pol.mmap_residency ? &g : nullptr, pol.quant_repack,
+                                /*cuda_align=*/allow_align && EnvQ8_0CudaAlign());
     }
     return MakeBf16Owned(DequantGgufRowToBf16(t.ggml_type, t.data, t.shape[0] * t.shape[1]),
                          {t.shape[0], t.shape[1]}, /*nk=*/true);
@@ -715,7 +732,7 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
     lw.wq_a = ctx.Mw(Blk(l, "attn_q_a.weight"));
     lw.wq_b = ctx.Mw(Blk(l, "attn_q_b.weight"));
     lw.wkv = ctx.Mw(Blk(l, "attn_kv.weight"));
-    lw.wo_a = ctx.Mw(Blk(l, "attn_output_a.weight"));
+    lw.wo_a = ctx.Mw(Blk(l, "attn_output_a.weight"), /*allow_align=*/false);  // row-sliced (o-groups)
     lw.wo_b = ctx.Mw(Blk(l, "attn_output_b.weight"));
     lw.attn_norm = ctx.Vec(Blk(l, "attn_norm.weight"), GgufTensorRole::kVector);
     lw.q_a_norm = ctx.Vec(Blk(l, "attn_q_a_norm.weight"), GgufTensorRole::kVector);

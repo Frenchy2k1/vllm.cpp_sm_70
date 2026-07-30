@@ -714,6 +714,54 @@ __global__ void QuantDotGemmQ8_0Kernel(OutT* __restrict__ out,
   }
 }
 
+// Brick 4 (last-mile): Q8_0 GEMM over the CUDA COALESCED-LOAD layout (RepackQ8_0Cuda).
+// The weight tensor is deinterleaved into two contiguous sections — qs `[nblk*32]`
+// (16-byte-aligned per block) then scales `[nblk]` uint16 (nblk = n*nb). Global block
+// index for output row j, block b = j*nb + b, so a warp lane reads its 32 int8 via TWO
+// aligned `int4` (128-bit) loads instead of the in-place block's 2-byte reads — the
+// coalesced-load lever. BIT-IDENTICAL: same int8 + f16 scale values (byte permutation),
+// same 8×__dp4a integer dot as QuantDotGemmQ8_0Kernel. The activation stays the plain
+// Q8_0 scratch (small, reused — no repack needed).
+template <typename OutT>
+__global__ void QuantDotGemmQ8_0AlignedKernel(OutT* __restrict__ out,
+                                              const uint8_t* __restrict__ weight,
+                                              const BlockQ8_0* __restrict__ act, int64_t m,
+                                              int64_t n, int64_t nb) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= m * n) return;
+  const int64_t i = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+  const int8_t* qs_base = reinterpret_cast<const int8_t*>(weight);
+  const uint16_t* d_base =
+      reinterpret_cast<const uint16_t*>(weight + static_cast<size_t>(n) * nb * kQK8_0);
+  const BlockQ8_0* a_row = act + i * nb;
+  float partial = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    const int64_t gi = j * nb + b;  // global block index in the deinterleaved weight
+    const int4* wq = reinterpret_cast<const int4*>(qs_base + static_cast<size_t>(gi) * kQK8_0);
+    const int4 w0 = wq[0];  // aligned 128-bit loads (qs at gi*32, 16-byte aligned)
+    const int4 w1 = wq[1];
+    const int8_t* aq = a_row[b].qs;
+    int sumi = 0;
+    sumi = __dp4a(w0.x, GetIntB2(aq, 0), sumi);
+    sumi = __dp4a(w0.y, GetIntB2(aq, 1), sumi);
+    sumi = __dp4a(w0.z, GetIntB2(aq, 2), sumi);
+    sumi = __dp4a(w0.w, GetIntB2(aq, 3), sumi);
+    sumi = __dp4a(w1.x, GetIntB2(aq, 4), sumi);
+    sumi = __dp4a(w1.y, GetIntB2(aq, 5), sumi);
+    sumi = __dp4a(w1.z, GetIntB2(aq, 6), sumi);
+    sumi = __dp4a(w1.w, GetIntB2(aq, 7), sumi);
+    partial += sumi * (DF16ToF32(d_base[gi]) * DF16ToF32(a_row[b].d));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffu, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
+    else out[i * n + j] = DF32ToBF16(partial);
+  }
+}
+
 // GROUPED Q8_0 variant (weight row = expert_ids[p]*n + j). Same dot core.
 template <typename OutT>
 __global__ void QuantDotGemmGroupedQ8_0Kernel(OutT* __restrict__ out,
@@ -829,7 +877,14 @@ void MatmulQ8_0Cuda(Tensor& out, const Tensor& a, const Tensor& b, cudaStream_t 
   dim3 block(32, kWarpsPerBlock);
   const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
   const uint8_t* w = static_cast<const uint8_t*>(b.data);
-  if (out.dtype == DType::kF32)
+  if (b.q8_0_aligned) {  // Brick 4: coalesced-load layout (RepackQ8_0Cuda) — aligned int4 loads
+    if (out.dtype == DType::kF32)
+      QuantDotGemmQ8_0AlignedKernel<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          static_cast<float*>(out.data), w, act, m, n, nb);
+    else
+      QuantDotGemmQ8_0AlignedKernel<uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          static_cast<uint16_t*>(out.data), w, act, m, n, nb);
+  } else if (out.dtype == DType::kF32)
     QuantDotGemmQ8_0Kernel<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
         static_cast<float*>(out.data), w, act, m, n, nb, w_row_bytes);
   else
