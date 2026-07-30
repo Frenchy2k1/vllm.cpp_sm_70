@@ -70,8 +70,10 @@ struct WeightCase {
   const char* name;
 };
 
-// Same table as test_ops_quant_dot.cpp, restricted to the Q8_K family the CUDA
-// kernel serves natively (offsets from ggml-common.h, restated independently).
+// Same table as test_ops_quant_dot.cpp: the Q8_K-family encodings the CUDA kernel
+// serves natively PLUS Q8_0 (its own 32-block Q8_0-activation path — the DeepSeek-V4
+// MLA/o-LoRA/shared-expert/lm_head weights) (offsets from ggml-common.h, restated
+// independently).
 const WeightCase kCases[] = {
     {DType::kIQ2_XXS, 256, 66, 0, -1, "iq2_xxs"},   // DeepSeek-V4 gate/up
     {DType::kIQ3_XXS, 256, 98, 0, -1, "iq3_xxs"},   // DeepSeek-V4 down
@@ -80,6 +82,7 @@ const WeightCase kCases[] = {
     {DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
     {DType::kQ5_K, 256, 176, 0, 2, "q5_K"},
     {DType::kQ6_K, 256, 210, 208, -1, "q6_K"},
+    {DType::kQ8_0, 32, 34, 0, -1, "q8_0"},          // DeepSeek-V4 AProj/SExp/Out (Q8_0-act path)
 };
 
 void GenerateData(float offset, size_t n, float* dst) {
@@ -122,7 +125,7 @@ Tensor DevTensor(void* p, DType dt, const std::vector<int64_t>& shape) {
 
 }  // namespace
 
-TEST_CASE("CUDA keep-quant GEMM == CPU reference and f64 dequant (Q8_K family)") {
+TEST_CASE("CUDA keep-quant GEMM == CPU reference and f64 dequant (Q8_K family + Q8_0)") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend on this host; CUDA keep-quant gate skipped");
     return;

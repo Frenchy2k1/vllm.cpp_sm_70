@@ -58,8 +58,10 @@ using vt::cpu::BlockQ3_K;
 using vt::cpu::BlockQ4_K;
 using vt::cpu::BlockQ5_K;
 using vt::cpu::BlockQ6_K;
+using vt::cpu::BlockQ8_0;
 using vt::cpu::BlockQ8_K;
-using vt::cpu::kQK_K;  // 256
+using vt::cpu::kQK8_0;  // 32
+using vt::cpu::kQK_K;   // 256
 
 void CheckCuda(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
@@ -98,6 +100,34 @@ __device__ inline uint16_t DF32ToBF16(float f) {
   }
   uint32_t rounding = 0x7FFF + ((u >> 16) & 1);
   return static_cast<uint16_t>((u + rounding) >> 16);
+}
+
+// dtype.cpp F32ToF16 — bit-exact port (round-to-nearest-even, subnormals, inf/nan).
+// Used only for the Q8_0-activation scale `y.d` (the round-trip F32ToF16→F16ToF32 the
+// CPU Q8_0 vec_dot applies); the integer core is scale-independent, so the whole Q8_0
+// INTEGER dot stays bit-identical to the CPU reference.
+__device__ inline uint16_t DF32ToF16(float f) {
+  uint32_t u = __float_as_uint(f);
+  uint16_t sign = static_cast<uint16_t>((u >> 16) & 0x8000);
+  int32_t exp = static_cast<int32_t>((u >> 23) & 0xFF) - 127 + 15;
+  uint32_t mant = u & 0x7FFFFF;
+  if (((u >> 23) & 0xFF) == 0xFF)
+    return static_cast<uint16_t>(sign | 0x7C00 | (mant ? 0x200 | (mant >> 13) : 0));
+  if (exp >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00);
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    mant |= 0x800000;
+    uint32_t shift = static_cast<uint32_t>(14 - exp);
+    uint32_t half = mant >> shift;
+    uint32_t rem = mant & ((1u << shift) - 1);
+    uint32_t mid = 1u << (shift - 1);
+    if (rem > mid || (rem == mid && (half & 1))) ++half;
+    return static_cast<uint16_t>(sign | half);
+  }
+  uint32_t half = static_cast<uint32_t>(exp << 10) | (mant >> 13);
+  uint32_t rem = mant & 0x1FFF;
+  if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) ++half;
+  return static_cast<uint16_t>(sign | half);
 }
 
 // cpu_quant_act.cpp NearestInt (ggml-quants.c:563) — magic-constant round-to-even.
@@ -569,6 +599,108 @@ __global__ void QuantDotGemmGroupedKernel(OutT* __restrict__ out,
   }
 }
 
+// ===========================================================================
+// Q8_0 keep-quant GEMM — the DeepSeek-V4 MLA projections / o-LoRA / shared
+// experts / lm_head (the "AProjQ8/SExpQ8/OutQ8" weights) run ON THE GPU instead
+// of the CPU keep-quant fallback (which drained the stream + made the decode
+// step uncapturable). Q8_0 is a LEGACY (32-element, single-fp16-scale) encoding
+// whose CPU vec_dot pairs it with a Q8_0 ACTIVATION (not the K-quants' Q8_K), so
+// this is a self-contained path: quantize the activation to Q8_0 on the GPU, then
+// the Q8_0×Q8_0 integer dot. ORACLE = our CPU reference:
+//   cpu_quant_act.cpp QuantizeRowQ8_0 (ggml-quants.c quantize_row_q8_0) — the quant
+//   cpu_quant_dot.cpp VecDotQ8_0Q8_0  (quants.c:400)                    — the dot
+// The INTEGER core (Σ x.qs·y.qs per 32-block) is bit-identical; only the per-block
+// float scale sum is reassociated (warp tree vs CPU sequential) — the same near-tie
+// band the K-quant path is gated at (NMSE 5e-4).
+// ---------------------------------------------------------------------------
+// GPU Q8_0 activation quantizer — one thread per 32-element block. Bit-exact port
+// of QuantizeRowQ8_0 (ternary amax, d=amax/127, y.d=F32ToF16(d), qs=roundf(x·id)).
+__global__ void QuantizeQ8_0Kernel(BlockQ8_0* __restrict__ scratch,
+                                   const void* __restrict__ a, ActDT adt, int64_t a_rs,
+                                   int64_t m, int64_t nb) {
+  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= m * nb) return;
+  const int64_t i = t / nb;   // activation row
+  const int64_t b = t % nb;   // 32-block within the row
+  const int64_t elem0 = i * a_rs + b * kQK8_0;
+  float amax = 0.0f;
+  for (int j = 0; j < kQK8_0; ++j) {
+    const float av = fabsf(DLoadAct(a, adt, elem0 + j));
+    amax = amax > av ? amax : av;  // ternary MAX (matches CPU, NaN-propagating)
+  }
+  BlockQ8_0& y = scratch[t];
+  const float d = amax / 127.0f;
+  const float id = d != 0.0f ? 1.0f / d : 0.0f;
+  y.d = DF32ToF16(d);
+  for (int j = 0; j < kQK8_0; ++j) {
+    const float x0 = DLoadAct(a, adt, elem0 + j) * id;
+    y.qs[j] = static_cast<int8_t>(roundf(x0));  // round half away from zero (== std::roundf)
+  }
+}
+
+// Q8_0×Q8_0 GEMM: one warp per output (i,j); lane `w` handles blocks b=w,w+32,…,
+// each a 32-element integer dot scaled by f16(wd)·f16(ad); warp-reduce the partials.
+template <typename OutT>
+__global__ void QuantDotGemmQ8_0Kernel(OutT* __restrict__ out,
+                                       const uint8_t* __restrict__ weight,
+                                       const BlockQ8_0* __restrict__ act, int64_t m, int64_t n,
+                                       int64_t nb, size_t w_row_bytes) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= m * n) return;
+  const int64_t i = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
+  const BlockQ8_0* a_row = act + i * nb;
+  float partial = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(b) *
+                                                                          sizeof(BlockQ8_0));
+    const BlockQ8_0* ab = a_row + b;
+    int sumi = 0;
+    for (int p = 0; p < kQK8_0; ++p) sumi += static_cast<int>(wb->qs[p]) * static_cast<int>(ab->qs[p]);
+    partial += sumi * (DF16ToF32(wb->d) * DF16ToF32(ab->d));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffu, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
+    else out[i * n + j] = DF32ToBF16(partial);
+  }
+}
+
+// GROUPED Q8_0 variant (weight row = expert_ids[p]*n + j). Same dot core.
+template <typename OutT>
+__global__ void QuantDotGemmGroupedQ8_0Kernel(OutT* __restrict__ out,
+                                              const uint8_t* __restrict__ weight,
+                                              const BlockQ8_0* __restrict__ act,
+                                              const int32_t* __restrict__ expert_ids, int64_t P,
+                                              int64_t n, int64_t nb, size_t w_row_bytes) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= P * n) return;
+  const int64_t p = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+  const int64_t e = expert_ids[p];
+  const uint8_t* w_row = weight + static_cast<size_t>(e * n + j) * w_row_bytes;
+  const BlockQ8_0* a_row = act + p * nb;
+  float partial = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(b) *
+                                                                          sizeof(BlockQ8_0));
+    const BlockQ8_0* ab = a_row + b;
+    int sumi = 0;
+    for (int q = 0; q < kQK8_0; ++q) sumi += static_cast<int>(wb->qs[q]) * static_cast<int>(ab->qs[q]);
+    partial += sumi * (DF16ToF32(wb->d) * DF16ToF32(ab->d));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffu, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[p * n + j] = partial;
+    else out[p * n + j] = DF32ToBF16(partial);
+  }
+}
+
 // --- per-stream grow-only Q8_K activation scratch (cudagraph-safe) -----------
 struct StreamScratch {
   void* buf = nullptr;
@@ -624,6 +756,72 @@ void LaunchGemm(Tensor& out, const uint8_t* weight, const BlockQ8_K* act,
   }
 }
 
+inline ActDT ActDtOf(DType dt) {
+  return dt == DType::kF32 ? ActDT::kF32 : dt == DType::kF16 ? ActDT::kF16 : ActDT::kBF16;
+}
+
+// Q8_0 keep-quant GEMM (single). Quantize the m activation rows to Q8_0 on the GPU
+// (per-stream grow-only scratch, shared with the Q8_K path — sequential GEMMs), then
+// one warp-per-output integer dot. NO CPU fallback, NO stream sync ⇒ capturable.
+void MatmulQ8_0Cuda(Tensor& out, const Tensor& a, const Tensor& b, cudaStream_t s) {
+  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
+  if (m == 0 || n == 0) return;
+  if (k % kQK8_0 != 0)
+    throw std::runtime_error("vt cuda: matmul_bt_quant Q8_0: K must be a multiple of 32");
+  const int64_t nb = k / kQK8_0;
+  const size_t w_row_bytes = static_cast<size_t>(nb) * sizeof(BlockQ8_0);
+  const size_t act_bytes = static_cast<size_t>(m) * static_cast<size_t>(nb) * sizeof(BlockQ8_0);
+  BlockQ8_0* act = static_cast<BlockQ8_0*>(EnsureScratch(act_bytes, s));
+  {
+    constexpr int kQBlock = 128;
+    const int64_t grid = (m * nb + kQBlock - 1) / kQBlock;
+    QuantizeQ8_0Kernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
+        act, a.data, ActDtOf(a.dtype), a.stride[0], m, nb);
+  }
+  constexpr int kWarpsPerBlock = 4;
+  dim3 block(32, kWarpsPerBlock);
+  const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const uint8_t* w = static_cast<const uint8_t*>(b.data);
+  if (out.dtype == DType::kF32)
+    QuantDotGemmQ8_0Kernel<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<float*>(out.data), w, act, m, n, nb, w_row_bytes);
+  else
+    QuantDotGemmQ8_0Kernel<uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<uint16_t*>(out.data), w, act, m, n, nb, w_row_bytes);
+  CheckCuda(cudaGetLastError(), "matmul_bt_quant Q8_0 launch");
+}
+
+// Q8_0 keep-quant GEMM (grouped: weight row = expert_ids[p]*n + j).
+void MatmulQ8_0GroupedCuda(Tensor& out, const Tensor& act_t, const Tensor& weight,
+                           const Tensor& expert_ids, cudaStream_t s) {
+  const int64_t P = out.shape[0], n = out.shape[1], k = act_t.shape[1];
+  if (P == 0 || n == 0) return;
+  if (k % kQK8_0 != 0)
+    throw std::runtime_error("vt cuda: matmul_bt_quant_grouped Q8_0: K must be a multiple of 32");
+  const int64_t nb = k / kQK8_0;
+  const size_t w_row_bytes = static_cast<size_t>(nb) * sizeof(BlockQ8_0);
+  const size_t act_bytes = static_cast<size_t>(P) * static_cast<size_t>(nb) * sizeof(BlockQ8_0);
+  BlockQ8_0* qact = static_cast<BlockQ8_0*>(EnsureScratch(act_bytes, s));
+  {
+    constexpr int kQBlock = 128;
+    const int64_t grid = (P * nb + kQBlock - 1) / kQBlock;
+    QuantizeQ8_0Kernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
+        qact, act_t.data, ActDtOf(act_t.dtype), act_t.stride[0], P, nb);
+  }
+  constexpr int kWarpsPerBlock = 4;
+  dim3 block(32, kWarpsPerBlock);
+  const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const uint8_t* w = static_cast<const uint8_t*>(weight.data);
+  const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
+  if (out.dtype == DType::kF32)
+    QuantDotGemmGroupedQ8_0Kernel<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<float*>(out.data), w, qact, eids, P, n, nb, w_row_bytes);
+  else
+    QuantDotGemmGroupedQ8_0Kernel<uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<uint16_t*>(out.data), w, qact, eids, P, n, nb, w_row_bytes);
+  CheckCuda(cudaGetLastError(), "matmul_bt_quant_grouped Q8_0 launch");
+}
+
 // The kCUDA provider for OpId::kMatmulBTQuant. Validation already done by
 // vt::MatmulBTQuant (ops.cpp) before dispatch; this mirrors the CPU kernel's
 // contract: b is [N,K] block-quant, a is [M,K] f32/bf16 (row-packed), out [M,N].
@@ -635,9 +833,16 @@ void MatmulBTQuantKernelCuda(Queue& q, Tensor& out, const Tensor& a,
   const int64_t n = b.shape[0];
   if (m == 0 || n == 0) return;
 
+  // Q8_0 (32-block, Q8_0-activation) runs its own on-GPU path — the DeepSeek-V4
+  // MLA/o-LoRA/shared-expert/lm_head weights. No CPU fallback, no stream sync.
+  if (b.dtype == DType::kQ8_0) {
+    MatmulQ8_0Cuda(out, a, b, s);
+    return;
+  }
+
   WType w{};
   if (!IsCudaKeepQuantSupported(b.dtype, &w)) {
-    // Legacy Q8_0-activation encodings (Q4_0/Q8_0) — not used by DeepSeek-V4.
+    // Q4_0 (the only remaining Q8_0-activation encoding) — not used by DeepSeek-V4.
     // Run the CPU keep-quant kernel over the SAME unified-memory tensors: drain
     // the stream first so any GPU-produced activation is visible to the host.
     CheckCuda(cudaStreamSynchronize(s), "keepquant CPU-fallback drain");
@@ -719,6 +924,11 @@ void MatmulBTQuantGroupedKernelCuda(Queue& q, Tensor& out, const Tensor& act,
   const int64_t n = out.shape[1];
   const int64_t k = act.shape[1];
   if (P == 0 || n == 0) return;
+
+  if (weight.dtype == DType::kQ8_0) {  // on-GPU Q8_0 grouped path (no CPU sync)
+    MatmulQ8_0GroupedCuda(out, act, weight, expert_ids, s);
+    return;
+  }
 
   WType w{};
   if (!IsCudaKeepQuantSupported(weight.dtype, &w)) {
