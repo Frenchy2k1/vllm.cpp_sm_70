@@ -77,6 +77,24 @@ clean 1:1 mirror (our `RmsNormRowKernel` indexes contiguously with no
 `input_stride`; 48391 needs the `vllm_is_batch_invariant` subsystem). No code
 landed, no throughput owed. Parity pin UNCHANGED at `555967922`.
 
+## DeepSeek-V4-Flash — BEAT-ds4 sweep (2026-07-30, `CLAIM-DSV4-BEAT-SWEEP`) — analysis-only: raw decode is at its GB10 ceiling (13.19 tok/s, Q8_0 front CLOSED); ds4's 16.5-17.2 is RAW decode too; the ONLY path PAST it is MTP self-spec
+
+Analysis-only sweep (no code). ds4's 16.5-17.2 (GB10 nsys 16.51 wall / 17.6 GPU-active)
+is verified RAW autoregressive decode — its MTP/DSpark spec is opt-in and NOT in that
+number (ds4 README: "Ordinary decode remains the default"; profile reproduce cmd has no
+`--mtp`/`--dspark`; single-token per-step kernel structure). Our raw 13.19 is behind on
+the Q8_0 GEMV (ds4 90% vs our 67% roofline on byte-identical weights) and that front is
+CLOSED (Bricks 3/4/8/11/12/13 all refuted; ds4's edge is an unobservable L2/access-pattern
+effect, HW-counter-blocked). **Beating 16.5-17.2 is reachable via EXACTLY ONE lever — MTP
+self-spec decode:** effective `13.19 × (1+p)/1.05` (verify at M=2 is weight-read-bound ⇒
+nearly free on the device-resident decode), break-even acceptance **p≈0.31**, plausible
+p 0.55-0.85 → **~18-23 tok/s**. Lossless (token-identical to greedy). Dependency chain:
+R1 a nextn-carrying GGUF (BLOCKED — llama.cpp converter dropped `blk.43`), R2 propose/verify
+loop, R4 device draft. fp16 dequant cache refuted net-slower on GB10 (1.88× the bytes on a
+BW-bound step). MHC measured tie; routed-MoE we win +2.6 ms; fp8 KV/prefill are long-ctx/
+footprint/unmeasured. Full ranked table + acceptance math + exact ds4-ncu command:
+`.agents/specs/deepseek-beat-ds4-sweep-2026-07-30.md`.
+
 ## DeepSeek-V4-Flash decode ds4-gap — Brick 13 (Q8_0 ILP: N output-rows per warp) (2026-07-31, `CLAIM-DSV4-DECODE-BRICK13`) — MEASURED NEGATIVE via sudo-ncu: the ILP axis collapses occupancy, does NOT drop long-scoreboard; ~13 tok/s is the honest Q8_0 ceiling → Q8_0 front CLOSED
 
 Measured on GB10 sm_121a, same DeepSeek-V4-Flash IQ2XXS GGUF, `--gpu --kv-cache
