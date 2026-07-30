@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -778,6 +779,26 @@ __global__ void QuantizeQ8_0PreqKernel(BlockQ8_0* __restrict__ scratch,
 // tests can flip it. BIT-IDENTICAL either way (asserted in test_cuda_quant_dot).
 inline bool Q8PreqQuantOn(const char* v) { return !(v && v[0] == '0' && v[1] == '\0'); }
 
+// Lever 2 / Brick 11 (ds4-gap): A/B flag for the sub-warp Q8_0 GEMV tiling.
+// Default OFF (=speculative near-tie lever, opt-in `VT_V4_Q8_SUBWARP=1`); the plain
+// 32-lane-per-output kernel is the baseline. Read per call so in-process CUDA tests
+// and the captured decode graph pick it up at launch/capture time.
+inline bool Q8SubwarpOn(const char* v) { return v && v[0] == '1' && v[1] == '\0'; }
+
+// Probe (measurement only): print each DISTINCT Q8_0 dense projection shape (nb,n)
+// once so the nsys per-grid.x breakdown can be attributed to K. Guarded (default off).
+inline void Q8ProbeShape(int64_t m, int64_t n, int64_t nb, bool grouped) {
+  if (!std::getenv("VT_V4_Q8_PROBE")) return;
+  static std::mutex pmu;
+  static std::set<int64_t> seen;
+  const int64_t key = (nb << 44) ^ (n << 12) ^ (m << 2) ^ (grouped ? 1 : 0);
+  std::lock_guard<std::mutex> lk(pmu);
+  if (seen.insert(key).second)
+    std::fprintf(stderr, "[Q8PROBE] %s nb=%lld n=%lld m=%lld K=%lld grid.x=%lld\n",
+                 grouped ? "grouped" : "dense", (long long)nb, (long long)n, (long long)m,
+                 (long long)(nb * kQK8_0), (long long)((m * n + 7) / 8));
+}
+
 // Brick 3 (last-mile): read a 4-byte int from a 2-BYTE-aligned int8 stream. The Q8_0
 // block `qs` starts at offset 2 in the 34-byte block (uint16 d + 32×int8), so — unlike
 // the 4-byte-aligned Q8_K qs the Brick-1 IQ2/Q2_K path int-loads directly — a naked
@@ -823,6 +844,84 @@ __global__ void QuantDotGemmQ8_0Kernel(OutT* __restrict__ out,
   if (lane == 0) {
     if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
     else out[i * n + j] = DF32ToBF16(partial);
+  }
+}
+
+// Lever 2 / Brick 11 (ds4-gap): sub-warp Q8_0 GEMV. The plain kernel above maps ONE
+// full 32-lane warp to each output. For SHORT-K projections (MLA/LoRA/kv, K∈{512,1536}
+// → nb∈{16,48}) a 32-lane warp leaves lanes b∈[nb,32) idle (nb=16 wastes 50% of the
+// warp) AND issues only nb concurrent block-loads → too little memory-level parallelism
+// to hide the M=1 GEMV's DRAM latency (Bricks 3/4 established this matvec is
+// latency/occupancy-bound, NOT ALU/alignment-bound). This kernel splits the 32-lane
+// warp into LANES-wide subgroups, ONE output per subgroup, so ALL 32 lanes of a warp
+// issue loads (LANES=16 → 2 outputs/warp; LANES=8 → 4 outputs/warp), raising in-flight
+// loads/warp. Ground: ds4's sub-warp reduction quarter/half_warp_sum_f32
+// (ds4_cuda.cu:16609-16625) + moe_gate_up_mid decode sub-warp kernels (:17073-17119).
+// CORRECTNESS: the integer __dp4a accumulation is order-independent → `sumi` is
+// bit-exact for any LANES; only the final float scale-sum re-associates across fewer
+// lanes → a characterized NEAR-TIE (NMSE≤5e-4, test_cuda_quant_dot). LANES=32 is
+// byte-identical to QuantDotGemmQ8_0Kernel (same lane→block map + same 32-wide reduce).
+template <int LANES>
+__device__ __forceinline__ unsigned SubwarpMask(unsigned tx) {
+  if constexpr (LANES == 32) {
+    (void)tx;
+    return 0xffffffffu;
+  } else {
+    return ((1u << LANES) - 1u) << (tx & (32u - LANES));  // the subgroup's 8/16 lanes
+  }
+}
+
+template <typename OutT, int LANES>
+__global__ void QuantDotGemmQ8_0SubwarpKernel(OutT* __restrict__ out,
+                                              const uint8_t* __restrict__ weight,
+                                              const BlockQ8_0* __restrict__ act, int64_t m,
+                                              int64_t n, int64_t nb, size_t w_row_bytes) {
+  constexpr int kSub = 256 / LANES;  // subgroups (=outputs) per 256-thread block
+  const int sg = threadIdx.x / LANES;
+  const int lane = threadIdx.x & (LANES - 1);
+  const int64_t o = static_cast<int64_t>(blockIdx.x) * kSub + sg;
+  if (o >= m * n) return;
+  const int64_t i = o / n;
+  const int64_t j = o % n;
+  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
+  const BlockQ8_0* a_row = act + i * nb;
+  float partial = 0.0f;
+  for (int64_t b = lane; b < nb; b += LANES) {
+    const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(b) *
+                                                                          sizeof(BlockQ8_0));
+    const BlockQ8_0* ab = a_row + b;
+    int sumi = 0;
+#pragma unroll
+    for (int k = 0; k < kQK8_0 / 4; ++k) sumi = __dp4a(GetIntB2(wb->qs, k), GetIntB2(ab->qs, k), sumi);
+    partial += sumi * (DF16ToF32(wb->d) * DF16ToF32(ab->d));
+  }
+  const unsigned mask = SubwarpMask<LANES>(threadIdx.x);
+#pragma unroll
+  for (int off = LANES / 2; off > 0; off >>= 1) partial += __shfl_down_sync(mask, partial, off, LANES);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
+    else out[i * n + j] = DF32ToBF16(partial);
+  }
+}
+
+// nb-dispatch: nb≤16 → 8 lanes/output (4 outs/warp), nb≤48 → 16 (2 outs/warp), else 32
+// (the big-K GEMMs — lm_head K=7168/nb=224 — are already lane-saturated: keep 32-lane).
+template <typename OutT>
+void LaunchQ8_0Subwarp(OutT* out, const uint8_t* w, const BlockQ8_0* act, int64_t m, int64_t n,
+                       int64_t nb, size_t w_row_bytes, cudaStream_t s) {
+  const int64_t outs = m * n;
+  if (nb <= 16) {
+    const int64_t grid = (outs + 32 - 1) / 32;  // 256/8 = 32 outputs/block
+    QuantDotGemmQ8_0SubwarpKernel<OutT, 8><<<static_cast<unsigned>(grid), 256, 0, s>>>(
+        out, w, act, m, n, nb, w_row_bytes);
+  } else if (nb <= 48) {
+    const int64_t grid = (outs + 16 - 1) / 16;  // 256/16 = 16 outputs/block
+    QuantDotGemmQ8_0SubwarpKernel<OutT, 16><<<static_cast<unsigned>(grid), 256, 0, s>>>(
+        out, w, act, m, n, nb, w_row_bytes);
+  } else {
+    const int64_t grid = (outs + 8 - 1) / 8;  // 256/32 = 8 outputs/block
+    QuantDotGemmQ8_0SubwarpKernel<OutT, 32><<<static_cast<unsigned>(grid), 256, 0, s>>>(
+        out, w, act, m, n, nb, w_row_bytes);
   }
 }
 
@@ -905,6 +1004,66 @@ __global__ void QuantDotGemmGroupedQ8_0Kernel(OutT* __restrict__ out,
   if (lane == 0) {
     if constexpr (sizeof(OutT) == 4) out[p * n + j] = partial;
     else out[p * n + j] = DF32ToBF16(partial);
+  }
+}
+
+// Lever 2 / Brick 11: GROUPED sub-warp Q8_0 GEMV (shared-expert path). Same sub-warp
+// mapping as QuantDotGemmQ8_0SubwarpKernel but the weight row is expert_ids[p]*n+j and
+// the activation row is broadcast(bcast?0:p). Near-tie identical to the grouped plain
+// kernel (int core bit-exact; float scale-sum re-associates across LANES).
+template <typename OutT, int LANES>
+__global__ void QuantDotGemmGroupedQ8_0SubwarpKernel(OutT* __restrict__ out,
+                                                     const uint8_t* __restrict__ weight,
+                                                     const BlockQ8_0* __restrict__ act,
+                                                     const int32_t* __restrict__ expert_ids,
+                                                     int64_t P, int64_t n, int64_t nb,
+                                                     size_t w_row_bytes, bool bcast) {
+  constexpr int kSub = 256 / LANES;
+  const int sg = threadIdx.x / LANES;
+  const int lane = threadIdx.x & (LANES - 1);
+  const int64_t o = static_cast<int64_t>(blockIdx.x) * kSub + sg;
+  if (o >= P * n) return;
+  const int64_t p = o / n;
+  const int64_t j = o % n;
+  const int64_t e = expert_ids[p];
+  const uint8_t* w_row = weight + static_cast<size_t>(e * n + j) * w_row_bytes;
+  const BlockQ8_0* a_row = act + (bcast ? 0 : p) * nb;
+  float partial = 0.0f;
+  for (int64_t b = lane; b < nb; b += LANES) {
+    const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(b) *
+                                                                          sizeof(BlockQ8_0));
+    const BlockQ8_0* ab = a_row + b;
+    int sumi = 0;
+#pragma unroll
+    for (int k = 0; k < kQK8_0 / 4; ++k) sumi = __dp4a(GetIntB2(wb->qs, k), GetIntB2(ab->qs, k), sumi);
+    partial += sumi * (DF16ToF32(wb->d) * DF16ToF32(ab->d));
+  }
+  const unsigned mask = SubwarpMask<LANES>(threadIdx.x);
+#pragma unroll
+  for (int off = LANES / 2; off > 0; off >>= 1) partial += __shfl_down_sync(mask, partial, off, LANES);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[p * n + j] = partial;
+    else out[p * n + j] = DF32ToBF16(partial);
+  }
+}
+
+template <typename OutT>
+void LaunchGroupedQ8_0Subwarp(OutT* out, const uint8_t* w, const BlockQ8_0* act,
+                              const int32_t* eids, int64_t P, int64_t n, int64_t nb,
+                              size_t w_row_bytes, bool bcast, cudaStream_t s) {
+  const int64_t outs = P * n;
+  if (nb <= 16) {
+    const int64_t grid = (outs + 32 - 1) / 32;
+    QuantDotGemmGroupedQ8_0SubwarpKernel<OutT, 8><<<static_cast<unsigned>(grid), 256, 0, s>>>(
+        out, w, act, eids, P, n, nb, w_row_bytes, bcast);
+  } else if (nb <= 48) {
+    const int64_t grid = (outs + 16 - 1) / 16;
+    QuantDotGemmGroupedQ8_0SubwarpKernel<OutT, 16><<<static_cast<unsigned>(grid), 256, 0, s>>>(
+        out, w, act, eids, P, n, nb, w_row_bytes, bcast);
+  } else {
+    const int64_t grid = (outs + 8 - 1) / 8;
+    QuantDotGemmGroupedQ8_0SubwarpKernel<OutT, 32><<<static_cast<unsigned>(grid), 256, 0, s>>>(
+        out, w, act, eids, P, n, nb, w_row_bytes, bcast);
   }
 }
 
@@ -999,6 +1158,18 @@ void MatmulQ8_0Cuda(Tensor& out, const Tensor& a, const Tensor& b, cudaStream_t 
   dim3 block(32, kWarpsPerBlock);
   const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
   const uint8_t* w = static_cast<const uint8_t*>(b.data);
+  Q8ProbeShape(m, n, nb, /*grouped=*/false);
+  // Lever 2 / Brick 11: sub-warp GEMV tiling (opt-in). Only on the plain in-place
+  // layout (the Brick-4 aligned layout is default-OFF + a measured-negative).
+  if (!b.q8_0_aligned && Q8SubwarpOn(std::getenv("VT_V4_Q8_SUBWARP"))) {
+    if (out.dtype == DType::kF32)
+      LaunchQ8_0Subwarp<float>(static_cast<float*>(out.data), w, act, m, n, nb, w_row_bytes, s);
+    else
+      LaunchQ8_0Subwarp<uint16_t>(static_cast<uint16_t*>(out.data), w, act, m, n, nb, w_row_bytes,
+                                  s);
+    CheckCuda(cudaGetLastError(), "matmul_bt_quant Q8_0 subwarp launch");
+    return;
+  }
   if (b.q8_0_aligned) {  // Brick 4: coalesced-load layout (RepackQ8_0Cuda) — aligned int4 loads
     if (out.dtype == DType::kF32)
       QuantDotGemmQ8_0AlignedKernel<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
@@ -1044,6 +1215,18 @@ void MatmulQ8_0GroupedCuda(Tensor& out, const Tensor& act_t, const Tensor& weigh
   const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
   const uint8_t* w = static_cast<const uint8_t*>(weight.data);
   const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
+  Q8ProbeShape(P, n, nb, /*grouped=*/true);
+  // Lever 2 / Brick 11: sub-warp GEMV tiling (opt-in) — grouped shared-expert path.
+  if (Q8SubwarpOn(std::getenv("VT_V4_Q8_SUBWARP"))) {
+    if (out.dtype == DType::kF32)
+      LaunchGroupedQ8_0Subwarp<float>(static_cast<float*>(out.data), w, qact, eids, P, n, nb,
+                                      w_row_bytes, bcast, s);
+    else
+      LaunchGroupedQ8_0Subwarp<uint16_t>(static_cast<uint16_t*>(out.data), w, qact, eids, P, n, nb,
+                                         w_row_bytes, bcast, s);
+    CheckCuda(cudaGetLastError(), "matmul_bt_quant_grouped Q8_0 subwarp launch");
+    return;
+  }
   if (out.dtype == DType::kF32)
     QuantDotGemmGroupedQ8_0Kernel<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
         static_cast<float*>(out.data), w, qact, eids, P, n, nb, w_row_bytes, bcast);

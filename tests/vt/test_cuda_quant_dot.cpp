@@ -332,6 +332,74 @@ TEST_CASE("Lever 1: CUDA Q8_0 preq-quant grid == legacy quant grid (bit-identica
   gpu.DestroyQueue(gq);
 }
 
+// Lever 2 / Brick 11 (ds4-gap): the sub-warp Q8_0 GEMV (QuantDotGemmQ8_0SubwarpKernel,
+// VT_V4_Q8_SUBWARP=1) splits the 32-lane warp into LANES-wide subgroups (nb≤16→8,
+// nb≤48→16, else 32), one output per subgroup. The integer __dp4a accumulation is
+// order-independent → `sumi` is bit-exact for ANY LANES; only the final float scale-sum
+// re-associates across fewer lanes → a characterized NEAR-TIE (NMSE≤5e-4). The big-K
+// (nb=224 → LANES=32) case must be BYTE-IDENTICAL to the plain kernel (same lane→block
+// map + same 32-wide reduce) — that byte-identity is the RED-first anchor: a wrong
+// SubwarpMask/reduction/lane-map would diverge LANES=32 from plain and fail hard.
+TEST_CASE("Lever 2: CUDA Q8_0 sub-warp GEMV == plain (bit-exact big-K, NMSE≤5e-4 short-K)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; Q8_0 sub-warp gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase c = {DType::kQ8_0, 32, 34, 0, -1, "q8_0"};
+  const double kMaxNmse = 5e-4;  // ratified DeepSeek-V4 near-tie band
+  // nb = 16 (LANES=8, short-K MLA/kv), 48 (LANES=16, q_b/LoRA), 224 (LANES=32, big-K).
+  for (int64_t nb : {int64_t{16}, int64_t{48}, int64_t{224}}) {
+    const int64_t k = nb * c.block_elems;
+    for (int64_t m : {int64_t{1}, int64_t{3}}) {
+      for (int64_t n : {int64_t{1}, int64_t{7}, int64_t{16}}) {
+        CAPTURE(nb);
+        CAPTURE(m);
+        CAPTURE(n);
+        std::vector<uint8_t> wq = RandomBlocks(c, n * nb, 0x1EAF2U);
+        std::vector<float> a(static_cast<size_t>(m * k));
+        GenerateData(1.0F, a.size(), a.data());
+        void* d_a = gpu.Alloc(a.size() * sizeof(float));
+        gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+        Tensor at = DevTensor(d_a, DType::kF32, {m, k});
+        void* d_w = gpu.Alloc(wq.size());
+        gpu.Copy(gq, d_w, wq.data(), wq.size());
+        Tensor bt = DevTensor(d_w, DType::kQ8_0, {n, k});
+
+        auto run = [&](const char* flag) {
+          setenv("VT_V4_Q8_SUBWARP", flag, 1);
+          void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+          Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
+          vt::MatmulBTQuant(gq, ot, at, bt);
+          std::vector<float> out(static_cast<size_t>(m * n), 0.0F);
+          gpu.Copy(gq, out.data(), d_o, out.size() * sizeof(float));
+          gpu.Synchronize(gq);
+          gpu.Free(d_o);
+          return out;
+        };
+        std::vector<float> plain = run("0");    // full 32-lane warp per output
+        std::vector<float> subw = run("1");     // sub-warp tiling
+        unsetenv("VT_V4_Q8_SUBWARP");
+        double num = 0.0, den = 0.0;
+        for (size_t i = 0; i < plain.size(); ++i) {
+          REQUIRE(std::isfinite(subw[i]));
+          const double d = static_cast<double>(subw[i]) - plain[i];
+          num += d * d;
+          den += static_cast<double>(plain[i]) * plain[i];
+          if (nb == 224) CHECK(subw[i] == plain[i]);  // LANES=32 byte-identical (RED-first)
+        }
+        const double nmse = den > 0 ? num / den : num;
+        CAPTURE(nmse);
+        CHECK(nmse <= kMaxNmse);  // near-tie (short-K re-associates the float scale-sum)
+        gpu.Free(d_a);
+        gpu.Free(d_w);
+      }
+    }
+  }
+  gpu.DestroyQueue(gq);
+}
+
 TEST_CASE("CUDA keep-quant GEMM registers the native kCUDA provider") {
   // The registration is what flips the GGUF loader's keep-quant default ON on a
   // CUDA device (GgufQuantComputeAvailable -> OpRegistered(kMatmulBTQuant,kCUDA))

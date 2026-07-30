@@ -159,6 +159,57 @@ cache evicted before each capture. Base `baff8a28` (Lever 1 shipped, 11.92 tok/s
   route-share (compute-only glue, immune to paging) is the reliable evidence and is a real,
   bit-exact, default-on win. Branch `ds4-lever3-warp-topk`, NOT pushed.
 
+## DeepSeek-V4-Flash decode ds4-gap — Lever 2 / Brick 11 (Q8_0 sub-warp GEMV tiling) (2026-07-30, `CLAIM-DSV4-DECODE-LEVER2`) — MEASURED NEGATIVE: the premise (nb∈{16,48} idle-lane regime) does NOT hold for DS4-Flash; STOP-CONDITION met, recorded default-OFF
+
+Measured on GB10 sm_121a, same DeepSeek-V4-Flash IQ2XXS GGUF, `--gpu --kv-cache
+VT_V4_RESIDENT_DECODE=1 VT_V4_DECODE_GRAPH=1 DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=28000`,
+`flock`, `local-ai-worker` down. Base `d1ff7414` (L1+L3 shipped). This was the plan's
+DECISIVE, high-variance bet: `QuantDotGemmQ8_0Kernel` = **41.11 ms/step = 52.7% GPU-active
+(646 launches × 63.6 µs)** is the whole remaining ds4 gap; if occupancy tiling doesn't move
+it, ~13 tok/s is the honest ceiling.
+
+- **MEASURE-FIRST — the per-call-site nb attribution (`VT_V4_Q8_PROBE`) REFUTED the plan's
+  premise.** The plan assumed short-K MLA/LoRA/kv projections at **nb∈{16,48}** (K∈{512,1536})
+  where a 32-lane warp wastes ~50% of lanes. The DS4-Flash decode (m=1) Q8_0 projections
+  actually run at **nb∈{32,64,128,256}** (K∈{1024,2048,4096,8192}): the smallest, nb=32,
+  **fills all 32 lanes exactly (1 block/lane, ZERO idle lanes)** — there is no lane-waste
+  regime. Only ONE projection (nb=32, n=32768, K=1024) is even nb≤48-eligible, and it issues
+  **4096 blocks — NOT device-starved** (the other occupancy premise fails too).
+- **Sub-warp kernel implemented + wired (bit-exact-safe).** Templated
+  `QuantDotGemmQ8_0SubwarpKernel<OutT,LANES>` (+grouped), LANES∈{32,16,8}, one output/subgroup,
+  `nb`-dispatch (nb≤16→8, nb≤48→16, else 32), block 256, ds4-style masked sub-warp reduce
+  (ground: `ds4_cuda.cu:16609/17073`). Integer `__dp4a` core is order-independent ⇒ `sumi`
+  bit-exact for any LANES; only the final float scale-sum re-associates ⇒ characterized
+  near-tie (NMSE≤5e-4). Guarded `VT_V4_Q8_SUBWARP` (default-OFF); dispatch inside
+  `MatmulQ8_0Cuda`+`MatmulQ8_0GroupedCuda` so BOTH the eager forward AND `V4Graph::Step`
+  inherit it (nsys confirms `QuantDotGemmQ8_0SubwarpKernel` runs in the graph body, 646
+  launches/step).
+- **RESULT — MEASURED NEGATIVE (nsys `--cuda-graph-trace=node`, 30-step kwin, GPU-active is
+  the paging-immune metric):** total Q8_0 **41.11 → 41.06 ms/step (flat, −0.1% = noise)**.
+  Per-grid.x breakdown: every nb≥64 bucket unchanged (grid.x 512 11.78→11.76, 128 11.37→11.31,
+  256 4.79→4.79, 16160 lm_head 3.35→3.35, 64 0.69→0.67); the ONLY addressable projection
+  (nb=32, LANES=16, grid.x 4096→2048) **9.13 → 9.19 ms/step — marginally WORSE (+0.6%)**,
+  far below the study's ~2 ms "worth it" bar. **HARD STOP-CONDITION MET → cut losses, no
+  further variants tried.**
+- **Wall-clock (interleaved warm A/B, noise-labeled):** ~12.7 tok/s BOTH arms (off
+  {12.67,12.80,12.77} / on {12.82,12.71,12.70}, overlapping bands). A single cold-first nsys
+  run read 11.03 (off) vs 12.55 (on) — that gap is pure run-order page-cache noise (no `sudo
+  drop_caches`), NOT the lever; the interleaved warm reps and the flat GPU-active Q8_0 are the
+  reliable evidence. Token stream **byte-identical off==on**: golden `11111 16 455 6102 294
+  8760 344 …` (the near-tie flips zero tokens — token-exact on this model).
+- **GATE (near-tie, RED-first):** new A/B unit case `test_cuda_quant_dot` **5/5·106483**
+  (sub-warp==plain: LANES=32 byte-identical big-K nb=224 + NMSE≤5e-4 short-K nb∈{16,48}; the
+  short-K near-tie check exercises the LANES=8/16 masks — a wrong mask blows past 5e-4 → RED).
+  `test_cuda_deepseek_v4` **20/20·67072**, `test_deepseek_v4_gguf_load` **15/15·931** GREEN.
+- **DISPOSITION — recorded-negative, merged DEFAULT-OFF** (bit-exact-safe, unit-gated, wired
+  both paths; `VT_V4_Q8_SUBWARP=1` opt-in). A valuable measured-negative like Bricks 4/8: it
+  establishes the Q8_0 GEMV is at its **DRAM-bandwidth roofline for THIS model's nb≥32 dims** —
+  occupancy/lane-utilization tiling has nothing to fix because none of the projections waste
+  lanes and the eligible one is not device-starved. **Honest reachable ceiling: L1 (+0.49) +
+  L3 (route −5.59 ms GPU) bank ~12.7 tok/s; ~13 is the honest ceiling and 16.5 is NOT reachable
+  via this lever.** The 41 ms Q8_0 GEMV is the irreducible residual. Branch
+  `ds4-lever2-subwarp-gemv`, NOT pushed.
+
 Disposition: **the wiring is CPU-gated at tiny synthetic shape; the real-model
 MTP-on==MTP-off + acceptance-rate + tokens/step + wall-clock speedup measurement
 is WEIGHT-BLOCKED and did NOT run (nothing faked).**

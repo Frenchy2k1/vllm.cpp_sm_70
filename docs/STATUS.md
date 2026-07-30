@@ -157,6 +157,33 @@ ACCURATE this time; −5.59 ms of ~81.6 ms/step = −6.9% GPU-active → GPU-act
 (no `sudo drop_caches`; churned-box page-cache variance swamps the ~0.7 tok/s delta).
 SHIPS default-on (bit-exact, real GPU-work win). See docs/BENCHMARKS.md.
 
+**DeepSeek-V4-Flash decode ds4-gap — Lever 2 / Brick 11 (Q8_0 sub-warp GEMV tiling) —
+MEASURED NEGATIVE, recorded** (2026-07-30, `CLAIM-DSV4-DECODE-LEVER2`, GB10 sm_121a,
+base `d1ff7414`). The plan's decisive speculative bet: the `QuantDotGemmQ8_0Kernel`
+(41.1 ms/step = 52.7% GPU-active, the whole remaining ds4 gap) is 1-warp-per-output; at
+short K a 32-lane warp was theorized to waste ~50% of lanes and starve the device, so a
+templated sub-warp kernel (LANES∈{32,16,8}, `nb`-dispatch, ground: ds4
+`quarter/half_warp_sum_f32` `ds4_cuda.cu:16609`, moe sub-warp `:17073`) should raise
+lane-utilization/occupancy. **MEASURE-FIRST REFUTED THE PREMISE:** the DS4-Flash decode
+Q8_0 projections have **nb∈{32,64,128,256}** (K∈{1024,2048,4096,8192}) — the smallest,
+nb=32, **fills all 32 lanes (1 block/lane, ZERO idle lanes)**; there is no nb∈{16,48}
+lane-waste regime, and that lone nb=32 projection (n=32768) issues 4096 blocks — NOT
+device-starved. **nsys 30-step kwin, VT_V4_Q8_SUBWARP A/B, worker down, flock:** total
+Q8_0 **41.11 → 41.06 ms/step (flat, −0.1% = noise)**; the ONLY sub-warp-eligible
+projection (nb=32, LANES=16, grid 4096→2048) **9.13 → 9.19 ms (marginally WORSE)** —
+well under the study's ~2 ms "worth it" bar. Interleaved warm wall-clock ~12.7 tok/s
+both arms (off {12.67,12.80,12.77} / on {12.82,12.71,12.70}, overlapping); token-exact
+golden `11111 16 455 6102 294 8760 344 …` byte-identical off==on (the near-tie flips zero
+tokens). **HARD STOP-CONDITION MET → cut losses, no more variants.** Gate: A/B unit case
+`test_cuda_quant_dot` 5/5·106483 (sub-warp==plain, LANES=32 byte-identical big-K + NMSE≤5e-4
+short-K, RED-first), `test_cuda_deepseek_v4` 20/20·67072, `test_deepseek_v4_gguf_load`
+15/15·931. Merged **default-OFF** as a guarded recorded-negative (`VT_V4_Q8_SUBWARP=1`,
+`VT_V4_Q8_PROBE` for the nb-attribution). **Honest reachable ceiling:** L1 (+0.49) +
+L3 (route −5.59 ms GPU) bank **~12.7 tok/s**; the Q8_0 GEMV is the **irreducible
+DRAM-bandwidth residual** for THIS model's nb≥32 dims (occupancy/tiling has nothing to
+fix), so **~13 tok/s is the honest ceiling and 16.5 is NOT reachable via this lever** —
+a valuable measured-negative like Bricks 4/8. See docs/BENCHMARKS.md.
+
 **ngram** (method `ngram`, draft-FREE) proposes the next tokens by matching the
 sequence's own suffix n-gram, so it needs no draft model and works on any model;
 on the 27B it is token-exact vs vLLM's own `--speculative-config ngram` on
