@@ -175,6 +175,13 @@ struct MoeDeviceKernels {
   // the A experts; near-tie vs host — device FMA contraction). In place on the queue.
   void (*moe_combine)(vt::Queue&, float* out, const float* eo, const float* weights, int64_t A,
                       int64_t H);
+  // Brick D — DEVICE router gate: gating[e] = Σ_h x[h]·bf16→f32(W[e*H+h]) over the
+  // [ne,H] BF16 `ffn.gate.weight`. Sequential f32 dot + exact bf16 upcast ⇒
+  // BIT-IDENTICAL to the host CPU MatmulBT — replaces the last non-capturable host
+  // op (the f32-act×bf16-weight GEMM the CUDA elementwise MatmulBT lacks) so the
+  // resident decode step is 100% device (capturable). w_bf16 = the bf16 weight bytes.
+  void (*router_gate)(vt::Queue&, float* gating, const float* x, const void* w_bf16, int64_t ne,
+                      int64_t H);
 };
 
 // Resolve a family's device kernels through the vt OpProvider seam. THROWS on a

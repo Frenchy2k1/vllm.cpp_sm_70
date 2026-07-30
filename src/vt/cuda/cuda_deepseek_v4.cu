@@ -1115,6 +1115,34 @@ void MoeCombineLaunch(Queue& q, float* out, const float* eo, const float* weight
   Check(cudaGetLastError(), "moe_combine launch");
 }
 
+// Brick D step 1 — DEVICE router gate (the last non-capturable host op of the
+// resident decode): gating[e] = Σ_h x[h]·bf16→f32(W[e·H+h]) for the [ne,H] BF16
+// `ffn.gate.weight`. One thread per expert; the dot is SEQUENTIAL in f32 with the
+// exact `bits<<16` bf16 upcast — BIT-IDENTICAL to the host CPU MatmulBT
+// (cpu_ops.cpp MatmulChunked<true>, f32 accumulate, LoadF32=BF16ToF32). Replaces
+// the CPU MatmulBT (f32-act×bf16-weight, which the CUDA elementwise MatmulBT lacks)
+// so the resident step is 100% device — no host op inside the capture region.
+__global__ void RouterGateKernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                 float* __restrict__ gating, int ne, int H) {
+  const int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= ne) return;
+  const uint16_t* we = w + static_cast<int64_t>(e) * H;
+  float acc = 0.0f;
+  for (int h = 0; h < H; ++h)
+    acc += x[h] * __uint_as_float(static_cast<uint32_t>(we[h]) << 16);  // bf16→f32 exact
+  gating[e] = acc;
+}
+void RouterGateLaunch(Queue& q, float* gating, const float* x, const void* w_bf16, int64_t ne,
+                      int64_t H) {
+  if (ne == 0) return;
+  cudaStream_t s = AsStream(q);
+  const unsigned block = 128;
+  const unsigned grid = static_cast<unsigned>((ne + block - 1) / block);
+  RouterGateKernel<<<grid, block, 0, s>>>(x, static_cast<const uint16_t*>(w_bf16), gating,
+                                          static_cast<int>(ne), static_cast<int>(H));
+  Check(cudaGetLastError(), "router_gate launch");
+}
+
 // ── Brick A: device MLA decode/prefill attention (unified memory, in place) ───
 // One block per (query t, head h). num KV heads = 1 (all heads share the cached
 // latent kv[s]). BIT-IDENTICAL to the host SoftmaxWithSink path by preserving its
@@ -1206,8 +1234,10 @@ const DsaDeviceKernels kDsa = {&DsaWeightFoldLaunch, &DsaLogitsLaunch, &DsaTopkL
                                &RmsNormLaunch, &RopeLaunch, &RmsNormRowsLaunch};
 const CompressorDeviceKernels kComp = {&SaveScoreApeLaunch, &PoolNormLaunch, &Fp8EncodeLaunch,
                                        &Fp8DecodeLaunch};
-const MoeDeviceKernels kMoe = {&SqrtSoftplusLaunch, &RouteLaunch, &ClampedSwiGLULaunch,
-                               &ClampedSwiGLUInPlaceLaunch, &RouteInPlaceLaunch, &MoeCombineLaunch};
+const MoeDeviceKernels kMoe = {&SqrtSoftplusLaunch,        &RouteLaunch,
+                               &ClampedSwiGLULaunch,       &ClampedSwiGLUInPlaceLaunch,
+                               &RouteInPlaceLaunch,        &MoeCombineLaunch,
+                               &RouterGateLaunch};
 
 struct Registrar {
   Registrar() {
