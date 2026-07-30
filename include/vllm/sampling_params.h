@@ -167,6 +167,14 @@ struct SamplingParams {
   // How much output each RequestOutput carries.
   RequestOutputKind output_kind = RequestOutputKind::kCumulative;
 
+  // stream_interval (sampling_params.py:302 @ vllm#49754): per-request override
+  // of the engine-level `--stream-interval` — the number of newly generated
+  // tokens to batch into each streamed RequestOutput. Only RAISES the interval
+  // above the engine setting (values below it are clamped up, see
+  // output_processor RequestState::FromNewRequest). The first and final outputs
+  // are always emitted immediately. Unset => use the engine interval unchanged.
+  std::optional<int> stream_interval;
+
   // structured_outputs (SamplingParams.structured_outputs @ e24d1b24): the
   // structured-output / guided-decoding constraint, or unset. PostInit()
   // validates it (mutual exclusion) when present.

@@ -16,6 +16,17 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Upstream sync 2026-07-30 (`555967922..e04a30a77`) - NOT-APPLICABLE (frontend feature, no throughput owed)
+
+Mechanical upstream-sync cycle over the 198-commit delta since the pin. Ported
+vllm#49754 (per-request `stream_interval` OpenAI sampling param, clamped up over
+the engine `--stream-interval`). This is a streaming-cadence control, not a
+compute path: it owes no benchmark. CPU-gated (`test_output_processor` 11/11,
+`test_sampling_params` 9/9, `test_openai_protocol` 28/28). Parity pin UNCHANGED;
+ranked carry-over (incl. the T0 RMSNorm 1.2-3.1x kernel perf 49750, which DOES
+owe a GB10 runtime gate when ported) in
+`.agents/specs/upstream-sync-2026-07-30.md`.
+
 ## DeepSeek-V4 native MTP self-speculative draft head W1 (2026-07-30, `CLAIM-DEEPSEEK-V4-MTP`) - NOT-APPLICABLE (tiny-config correctness brick; no throughput owed) / real-model acceptance + speedup WEIGHT-BLOCKED
 
 Disposition: **the wiring is CPU-gated at tiny synthetic shape; the real-model
