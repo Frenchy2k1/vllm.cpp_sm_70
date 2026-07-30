@@ -33691,3 +33691,58 @@ restart=always), flock held for the GPU runs, ONE engine at a time, nvidia-smi s
 flags OFF default). CAMPAIGN device-resident track: bricks A→B→C DONE + gated; Brick D infra DONE + gated,
 replay blocked on the Q8_0 CUDA GEMM follow-on. Box restored (worker Up restart=always, flock free, no stray
 gen). Row `ACTIVE`.
+
+## DeepSeek-V4 device-resident decode campaign — the Q8_0 CUDA keep-quant GEMM (the graph unblocker + the dominant lever): CAMPAIGN COMPLETE with an honest speed finding (2026-07-30, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-rd`, branch `deepseek-v4-q8-cuda-gemm`, base `93e72203`, commit `fcf3003c`, NOT pushed)
+
+Per the user's "for v1, always best performance" directive, the coordinator commissioned the Q8_0 CUDA GEMM —
+THE dominant lever (646 Q8_0 GEMMs/step were on the ARM CPU) + the graph capture unblocker.
+
+**The Q8_0 CUDA path (`cuda_quant_dot.cu`, both `kMatmulBTQuant` + `kMatmulBTQuantGrouped`).** Q8_0 is a LEGACY
+32-element single-fp16-scale encoding whose CPU vec_dot pairs it with a Q8_0 ACTIVATION (not the K-quants'
+Q8_K), so it is a self-contained path: `QuantizeQ8_0Kernel` (bit-exact port of `QuantizeRowQ8_0`: per 32-block,
+ternary amax, `d=amax/127`, `id=1/d`, `y.d=DF32ToF16(d)` via the new device `DF32ToF16` — a bit-exact port of
+`dtype.cpp F32ToF16` — and `qs=roundf(x·id)`) + `QuantDotGemmQ8_0Kernel`(+grouped) (one warp per output; lane w
+handles blocks b=w,w+32,…; per-block int32 dot Σ x.qs·y.qs scaled by `f16(wd)·f16(ad)`; warp-reduce). ORACLE =
+`cpu_quant_dot.cpp VecDotQ8_0Q8_0`: the INTEGER core is bit-identical; only the per-block float-scale sum is
+reassociated (warp tree vs CPU sequential) — the same NMSE 5e-4 near-tie band the K-quant CUDA path is gated at.
+Wired as a branch BEFORE the CPU-fallback check in both providers ⇒ Q8_0 runs on the GB10 with NO
+`cudaStreamSynchronize`. Activation scratch shares the existing per-stream grow-only (cudagraph-safe) buffer.
+
+**GATES (DGX GB10).** `test_cuda_quant_dot` **2/2·105601** (the Q8_K-family + Q8_0 harness: Q8_0 CUDA == CPU
+nmse≤1e-6 AND == f64 dequant nmse≤5e-4 across m∈{1,4,32,512}, n∈{1,7,16}); `test_cuda_deepseek_v4` 18/18·34176;
+`test_deepseek_v4_gguf_load` 12/12·531; real 80.7 GB model, `--gpu --kv-cache`, 25 tokens: host + eager-resident
+(`VT_V4_RESIDENT_DECODE=1`) + the GRAPH (`+VT_V4_DECODE_GRAPH=1`) ALL **TOKEN-IDENTICAL** ("…Paris.", exact 25
+ids). **THE DECODE GRAPH NOW CAPTURES + REPLAYS** — the Q8_0 CPU-fallback abort is GONE (0 errors, token-verified
+across all 24 decode steps; the campaign's capture goal is MET).
+
+**THE HONEST FINAL SPEED (2 stable runs, real 80.7 GB, 5-tok prompt, 24 decode steps):** host **7.22 tok/s** ·
+eager-resident **5.64** · GRAPH **5.57** · ds4 **16.5**. util: resident 94%, graph 95%.
+
+**THE FINDING (honest, and it REVISES the thesis a SECOND time).** The Q8_0-on-GPU GEMM lifted the HOST
+(shipped-default) path 6.44 → 7.22 tok/s (+12%) — the real, dominant win, because the ~646 MLA/o-LoRA/shared/
+lm_head GEMMs left the ARM CPU for the GB10. BUT the device-resident + graph track does NOT beat the host path
+(5.6 vs 7.22). Now that Q8_0 is on the GPU, the resident path is **GPU-COMPUTE-bound** (util 94-95%): the
+correctness-grade device glue kernels (RMSNorm/RoPE/MHC-pre/post/head/Sinkhorn/router/SwiGLU/combine, one-block
+or one-thread-per-expert, un-tuned for T=1) do MORE GPU work than the host's ARM-CPU glue does, and they
+serialize behind the GEMMs on the one stream. The graph captures + replays token-identical (the infra is PROVEN
+and capture-hazard-safe) but recovers NOTHING — there is no host-gap idle left to collapse (util already 94%).
+So the Brick-C "launch-bound" attribution → Brick-D "Q8_0-CPU-drain-bound" attribution → now the TRUE root cause:
+**device-glue kernel-efficiency bound.** On GB10 the fast ARM CPU out-runs the un-tuned T=1 device glue, so the
+device-resident/graph approach is a SPEED DEAD-END here even though it is correct and the graph works.
+
+**NAMED LAST MILE to ds4's 16.5 (user decision — NOT started).** (1) Perf-tune the device glue kernels — the
+resident/graph potential is real, the kernels are just correctness-grade (e.g. the router gate is one thread per
+expert looping H=4096); with tuned glue the sync-free graphed step could beat host. (2) fp8 KV (smaller cache
+reads). (3) Alternatively/additionally, an ASYNC host path that overlaps the CPU glue with the GPU GEMMs — that
+attacks the ~560-sync tax on the 7.22 winner directly, without moving the glue onto the GPU.
+
+**Ops:** scp'd only cuda_quant_dot.cu + test_cuda_quant_dot.cpp onto the reused `vllmcpp-mmspeed/build-cuda`
+sm_121a tree (md5-verified; drift-checked deepseek_v4.cpp/cuda_deepseek_v4.cu vs merged main 93e72203 = MATCH),
+fast incremental rebuild, worker stopped during build+runs then RESTORED (running, restart=always), flock held
+for the GPU runs, ONE engine at a time (host→resident→graph sequential), nvidia-smi sampled, 2 runs for
+stability. Rollback-able (the three VT_V4_* device flags default OFF; the Q8_0 CUDA GEMM is ALWAYS-ON — it is a
+generic keep-quant capability that benefits EVERY path, incl. the host default). **CAMPAIGN COMPLETE:** bricks
+A→B→C→D + the Q8_0 GEMM all landed + gated; the decode graph captures + replays token-identical; the honest
+speed ceiling on this Q8_0 model is the host path at 7.22 tok/s, and the device-resident/graph track needs tuned
+glue kernels to become a win. Box restored (worker running restart=always, flock free, no stray gen). Row `ACTIVE`.
+

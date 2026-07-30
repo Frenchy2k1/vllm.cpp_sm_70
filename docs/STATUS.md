@@ -617,6 +617,25 @@ Q8_0 CPU-fallback GEMM drains/step** (MLA/shared/lm_head run on the ARM CPU), NO
 started). Graph infra is COMPLETE + unit-gated + capture-hazard-safe behind a default-OFF flag; replays once
 Q8_0 lands. FINAL honest table (real 80.7 GB, 24 decode): host 6.44 · eager-resident ~5.0-5.2 · graph BLOCKED
 (Q8_0) · ds4 16.5. Rollback-able (both flags OFF). Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Device-resident decode campaign — the Q8_0 CUDA keep-quant GEMM (graph unblocker + dominant lever):
+CAMPAIGN COMPLETE with an honest speed finding (2026-07-30, base `93e72203`, branch
+`deepseek-v4-q8-cuda-gemm`, commit `fcf3003c`, NOT pushed).** Added an on-GPU Q8_0 path to
+`cuda_quant_dot.cu` (both providers), moving the ~646 Q8_0 GEMMs/step (MLA/o-LoRA/shared/lm_head —
+AProjQ8/SExpQ8/OutQ8) off the ARM CPU onto the GB10: `QuantizeQ8_0Kernel` (bit-exact port of the CPU
+`QuantizeRowQ8_0`, 32-block Q8_0 activation) + `QuantDotGemmQ8_0Kernel`(+grouped) (warp/output, int core
+bit-identical to `VecDotQ8_0Q8_0`, float scale reassociated — NMSE 5e-4 band); wired BEFORE the CPU-fallback
+⇒ NO stream sync (the capture unblocker). GATE: `test_cuda_quant_dot` **2/2·105601** (Q8_0 CUDA==CPU
+nmse≤1e-6 + f64≤5e-4); `test_cuda_deepseek_v4` 18/18; `test_deepseek_v4_gguf_load` 12/12; real 80.7 GB model
+host + resident + **GRAPH all TOKEN-IDENTICAL** ("…Paris."); **THE DECODE GRAPH NOW CAPTURES + REPLAYS**
+(0 errors, token-verified 24 steps). **FINAL honest table (2 stable runs, 24 decode): host 7.22 tok/s ·
+eager-resident 5.64 · GRAPH 5.57 · ds4 16.5.** Q8_0-on-GPU lifted the HOST (shipped-default) path
+6.44→7.22 (+12%) — the real win. **The resident+graph track does NOT beat host** (5.6 vs 7.22): Q8_0 on GPU
+makes the resident path GPU-compute-bound (util 94-95%), the correctness-grade device glue does more GPU work
+than the ARM-CPU glue, and the graph recovers nothing (already 94% busy). REVISES the thesis: eager-resident
+is **glue-kernel-efficiency bound**, not launch-bound; the graph works + is token-identical (infra proven) but
+is a speed dead-end on GB10 vs the fast ARM CPU. NAMED last mile to ds4's 16.5 (not started, user decision):
+tune the device glue kernels, fp8 KV, and/or an async host path overlapping CPU glue with GPU GEMMs. Rollback-
+able (device flags OFF; the Q8_0 GEMM is always-on + benefits every path). Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
