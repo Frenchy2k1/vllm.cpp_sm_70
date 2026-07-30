@@ -1595,3 +1595,32 @@ force-preempt path is unported, the async engine has no PP concurrent-batch
 window, and KV P/D transport is N-A by sync policy). The underflow they fix
 cannot occur here; porting the prerequisite machinery is a scoped feature port,
 requeued in the sync doc. Parity pin still UNCHANGED at `555967922`.
+
+**Increment 3 (2026-07-30, quant/config triage — verified SKIP-all).** Worked the
+quant-loader + config-validation slice of the ranked queue (ranks 6-8). All three
+are SKIPPED as unported-code-path after source verification against the real
+upstream diffs — not force-fitted, no invented code. **vllm#49483** (compressed-
+tensors: prioritize fused-name match over class match in `find_matched_target`)
+reorders two matching strategies inside `find_matched_target`
+(`vllm/model_executor/layers/quantization/compressed_tensors/utils.py:145-150`); our
+tree has NO such generalized matcher — compressed-tensors schemes are resolved
+per-projection by direct tensor-name probing (`IsCtNvfp4Projection` /
+`LoadCtNvfp4W4A16` in `include/vllm/model_executor/models/dense_weight_loaders.h`
+check `has(proj + ".weight_packed")` and honor the config `ignore` list inline),
+so there is no targets-list walk, no class-name substring match, and no
+fused-vs-class ordering to fix. The bug is structurally impossible here.
+**vllm#48589** (INC `extra_config` layer-name suffix match) adds an `endswith`
+fallback to the Intel-Neural-Compressor config parser
+(`vllm/model_executor/layers/quantization/inc/config_parser.py`); we carry no INC
+quant path (Intel/XPU, N-A bucket) — our only `extra_config` is the KV-connector's,
+an unrelated map. **vllm#49134** (reject contradictory custom-op directives)
+validates `CompilationConfig.custom_ops` (`+op`/`-op`/`all`/`none`), a
+torch.compile/Inductor plumbing config we do not carry (our fusion catalog is a
+portable `vt::FusedChain` applied by declaration, not a runtime custom-op
+enable/disable list). The T0 RMSNorm pair (49750 uncontiguous-residual perf, 48391
+batch-invariance) stays QUEUED, GPU-gated: our `RmsNormRowKernel`
+(`src/vt/cuda/cuda_ops.cu:62`) indexes contiguously (`row*h`, no `input_stride`),
+so 49750's residual-stride relaxation is a multi-backend structural change with no
+current strided-residual caller, and 48391 depends on the `vllm_is_batch_invariant`
+determinism subsystem we do not carry — neither is a clean 1:1 mirror. No code
+landed; the queue + records were refreshed. Parity pin UNCHANGED at `555967922`.

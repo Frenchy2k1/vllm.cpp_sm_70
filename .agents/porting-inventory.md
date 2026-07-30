@@ -272,7 +272,27 @@ Gate `tests/vllm/config/test_speculative_draft_max_position_embeddings.cpp` 4/4
 model-integration cases (`ModelConfig(EAGLE3_DRAFT/AR_MODEL)`) are SKIPPED — they
 need HF-download + a full draft ModelConfig this T0 subset does not carry; they
 land with the eagle loader. The PR's bundled `llm_base_proposer.py` block_size
-determinism half is N-A (no ported eagle/llm-base proposer). M-mtp-0 is
+determinism half is N-A (no ported eagle/llm-base proposer).
+**Upstream-sync incr 3 (2026-07-30) — quant/config triage, verified SKIP-all
+(records-only, no code):** three ranked items resolved as unported-code-path after
+reading the real upstream diffs. **vllm#49483** (`8a7b3c299`,
+`compressed_tensors/utils.py:145-150`) reorders `_find_first_match(class)` vs
+`_match_fused_layer(layer)` in `find_matched_target`; our tree has NO generalized
+matcher — compressed-tensors schemes are resolved per-projection by tensor-name
+probing (`IsCtNvfp4Projection`/`LoadCtNvfp4W4A16`, `dense_weight_loaders.h:256,266`;
+`ignore` list honored inline), so no fused-vs-class ordering exists to fix (bug
+structurally impossible). **vllm#48589** (`948107acf`,
+`inc/config_parser.py:142-152`) adds an `endswith` suffix fallback to the Intel-
+Neural-Compressor `INCConfigParser` — no INC quant path carried (Intel/XPU, N-A).
+**vllm#49134** (`0da6e7f3d`, `config/compilation.py`, `custom_op.py`) validates
+`CompilationConfig.custom_ops` — no such config surface (fusion catalog is a
+declarative `vt::FusedChain`). The T0 RMSNorm pair (**vllm#49750** uncontiguous-
+residual perf, **vllm#48391** batch-invariance) stays GPU-gated INVENTORY: our
+`RmsNormRowKernel` (`src/vt/cuda/cuda_ops.cu:62`) indexes contiguously (`row*h`,
+no `input_stride`) so 49750's residual-stride relaxation is a multi-backend
+structural change with no current strided-residual caller, and 48391 depends on the
+`vllm_is_batch_invariant` determinism subsystem not carried here — neither is a
+clean 1:1 mirror. M-mtp-0 is
 `GATING`: the optional BF16 `mtp.*`
 safetensors loader (`src/vllm/model_executor/models/qwen3_5_mtp.cpp:271`) and
 standalone dense/MoE head (`src/vllm/model_executor/models/qwen3_5.cpp:3359`)

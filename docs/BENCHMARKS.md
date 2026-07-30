@@ -40,6 +40,21 @@ reset-running force-preempt + KV-connector-P/D machinery this tree does not
 carry; requeued behind that machinery. Parity pin still UNCHANGED at
 `555967922`.
 
+**Increment 3 (quant/config triage — SKIP-all, nothing owes a benchmark).**
+Source-verified the ranks 6-8 quant-loader + config slice against the real
+upstream diffs; all three SKIPPED as unported-code-path (not force-fitted).
+vllm#49483 (compressed-tensors fused-vs-class match order in `find_matched_target`)
+has no analog here — schemes are resolved per-projection by tensor-name probing,
+not a targets-list walk. vllm#48589 (INC `extra_config` suffix match) targets the
+Intel-Neural-Compressor config parser we do not carry. vllm#49134 (reject
+contradictory custom-op directives) validates a `CompilationConfig.custom_ops`
+list we do not carry (our fusion catalog is a declarative `vt::FusedChain`). The
+only benchmark-owing carry-over remains the T0 RMSNorm pair (49750 1.2-3.1x
+uncontiguous-residual kernel, 48391 batch-invariance) — still GPU-gated and NOT a
+clean 1:1 mirror (our `RmsNormRowKernel` indexes contiguously with no
+`input_stride`; 48391 needs the `vllm_is_batch_invariant` subsystem). No code
+landed, no throughput owed. Parity pin UNCHANGED at `555967922`.
+
 ## DeepSeek-V4 native MTP self-speculative draft head W1 (2026-07-30, `CLAIM-DEEPSEEK-V4-MTP`) - NOT-APPLICABLE (tiny-config correctness brick; no throughput owed) / real-model acceptance + speedup WEIGHT-BLOCKED
 
 Disposition: **the wiring is CPU-gated at tiny synthetic shape; the real-model
