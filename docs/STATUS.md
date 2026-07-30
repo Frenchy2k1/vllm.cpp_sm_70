@@ -1629,7 +1629,22 @@ migration closes the gate instead of breaking the test.
 `scripts/check-fusion-consistency.py` itself is unchanged; `tests/scripts` 87/87.
 
 **Landing-page restructure + project logo (2026-07-30):** DOCUMENTATION-ONLY, no
-capability state moved and no number changed. README.md becomes a landing page
+capability state moved and no number changed. The thesis is now stated as the
+project's actual ambition (smallest, fastest, every feature people want, with vLLM
+as the PROOF rather than the identity) instead of "a C++ port of vLLM", the
+llama.cpp and MLX-LM comparisons carry their real per-axis numbers alongside the
+vLLM grid, and a Credits section attributes vLLM / SGLang / llama.cpp / MLX / the
+kernel upstreams and records that this tree does NOT use ggml (own portable `vt::`
+runtime, GGUF read natively) without disparaging it. **Two accuracy fixes landed with
+it.** (1) The footprint claim was STALE: the README said "9.4 GiB venv vs one 10 MiB
+binary" while the committed spec (`benchmarks/demo/footprint_gb10.json`, measured
+2026-07-28 on the same GB10) and the rendered figure both say **9318.6 MiB (9.1 GiB)
+vs a 65.78 MiB stripped CUDA server binary**, i.e. ~140x, not ~960x; every instance is
+now the measured number. (2) The concurrency ratios are now read against the gated
+**0.5% non-tail run-to-run noise band**: c2-c32 (0.7%-1.7%) are presented as a TIE
+with the c1 4.5% as the one win outside noise, llama.cpp decode 0.97x as parity inside
+its own spread, and the Metal 2.4% as REAL and outside both spreads (ours 0.12%,
+MLX-LM's 0.34% over 6 interleaved runs) rather than waved off as noise. README.md becomes a landing page
 (logo lockup, scoped badges, the six-axis concurrency grid, the footprint figure,
 and a features block); its reference tables move to the new
 [docs/USAGE.md](USAGE.md) (CLI, endpoints, server flags, C ABI, C++) and
