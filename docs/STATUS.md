@@ -651,6 +651,20 @@ eager-resident 7.96 · GRAPH 7.92 · ds4 16.5 — THE GRAPHED DECODE BEATS HOST 
 GEMM/quant microarch — fp8 KV, tuned MMQ). The H2H-memcpy lever is NOT on the critical path (util 95%,
 beats host). RECOMMEND flipping the device-resident/graph default ON (fastest path; flags still default OFF
 pending that call). Rollback-able. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Device-resident decode campaign — DEFAULT FLIPPED: device-resident decode is the SHIPPED DEFAULT
+(2026-07-30, base `73d4799c`, branch `deepseek-v4-resident-default`, commit `75c3697a`, NOT pushed).** Broadened
+validation (real 80.7 GB, resident vs host, 4 prompts × 256 tok): P0 (factual) TOKEN-IDENTICAL (258 toks);
+P1/P2/P3 (open-ended) diverge only at genuine near-tie positions into COHERENT, deterministic continuations
+(bounded kernel noise can only flip host's ~tied top-2 → by construction near-ties, not bugs), 0 errors — the
+ratified coherent-near-tie gate is met. Resident is ~1.8× the host path at a grown 256-tok context (7.8 vs 4.3).
+FLIP: `ResidentDecodeEnabled` OFF→ON (`VT_V4_RESIDENT_DECODE=0` = rollback off-switch → host forward); the guard
+is UNCHANGED so CPU / non-dense / T>1 (prefill) / no-KV still fall back to host (verified: prefill→host every
+run; gguf_load 12/12). The CUDA graph stays OPT-IN default OFF (graph 7.92 ≈ eager-resident 7.96 — GPU-bound at
+95%, the graph adds nothing on GB10 + carries the capture-hazard surface). GATE: `test_cuda_deepseek_v4`
+**18/18·34176**; `test_deepseek_v4_gguf_load` **12/12·531**; real model new DEFAULT (resident) **8.01 tok/s** vs
+`=0` (host) **7.24**, both "…Paris." token-identical. Shipped DeepSeek-V4 decode = device-resident ~7.96 tok/s
+(~48% of ds4, GEMM-bound); last mile = fp8 KV + tuned MMQ (named residual). Rollback via
+`VT_V4_RESIDENT_DECODE=0`. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
