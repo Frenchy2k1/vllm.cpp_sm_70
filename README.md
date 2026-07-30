@@ -7,29 +7,57 @@
 </p>
 
 <p align="center">
-  <b>vLLM's serving engine, in C++20. No Python, no PyTorch, no ggml at inference.</b>
+  <b>Same tokens as vLLM. Faster than vLLM. From a 66 MiB binary instead of a 9.1 GiB install.</b><br>
+  <sub>Continuous batching, paged KV, 25+ architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue"></a>
   <a href="docs/BENCHMARKS.md"><img alt="vs vLLM" src="https://img.shields.io/badge/Qwen3.6--27B_vs_vLLM-token--exact_%2B_faster_at_every_concurrency-3ec8e0"></a>
   <a href="docs/STATUS.md"><img alt="Architectures" src="https://img.shields.io/badge/architectures-25%2B_gated-7ee787"></a>
+  <a href="#performance-faster-than-vllm"><img alt="Binary size" src="https://img.shields.io/badge/one_binary-66_MiB,_no_Python-6e7681"></a>
   <a href="https://github.com/mudler/LocalAI"><img alt="LocalAI" src="https://img.shields.io/badge/LocalAI-Run_Locally-orange"></a>
 </p>
 
 **Brought to you by the [LocalAI](https://github.com/mudler/LocalAI) team**, the folks behind LocalAI, the open-source AI engine that runs any model (LLMs, vision, voice, image, video) on any hardware, no GPU required.
 
-A lightweight, community-first vLLM. vllm.cpp is a from-scratch C++20 port of
-[vLLM](https://github.com/vllm-project/vllm)'s serving engine: continuous batching, block-paged KV
-cache, automatic prefix caching, and speculative decoding, with no Python, PyTorch, or ggml at
-inference time. It ships llama.cpp-style as one library behind a flat C ABI, plus a CLI and an
-OpenAI-compatible server. It loads Hugging Face **safetensors** and **GGUF**, and builds for CUDA,
-CPU, Metal, and Vulkan from one source tree.
+vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
+**smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
+carry **every feature people actually want**. No Python and no PyTorch at inference time.
+
+It gets there by taking the best of each engine rather than reimplementing one of them.
+[vLLM](https://github.com/vllm-project/vllm)'s serving core (continuous batching, block-paged KV,
+automatic prefix caching, speculative decoding). [SGLang](https://github.com/sgl-project/sglang)'s
+scheduling ideas (RadixAttention, LPM cache-aware admission, jump-forward decoding).
+[llama.cpp](https://github.com/ggml-org/llama.cpp)'s deployment story (one library behind a flat C
+ABI, GGUF straight off the shelf, and compute directly on the quantized blocks). MLX's GEMM where it
+wins on Apple Silicon. Safetensors and GGUF, CUDA and CPU and Metal and Vulkan, from one source tree.
+
+What keeps that honest is the oracle. Every architecture is gated **token-for-token against vLLM
+itself** on the same workload, so "grounded in vLLM" is a test result rather than a design claim, and
+speed is only ever quoted against a reference measured in its own production config.
 
 ![vllm.cpp vs vLLM on Qwen3.6-27B: ahead at every concurrency](benchmarks/media/concurrency_race.gif)
 
 > The same model, the same prompts, side by side: **token-for-token identical output, and vllm.cpp
 > finishes first** ([full clip](benchmarks/media/concurrency_race.mp4)).
+
+Those are the goals. Here is where they actually stand, measured:
+
+- **Small.** **66 MiB** of binary against a **9.1 GiB** vLLM install, both measured on the same GB10:
+  about **140x less to deploy**, serving the same model in **24.88 GiB of peak host memory against
+  vLLM's 28.18**. No interpreter in the process, and 0 bytes of bundled CUDA userspace.
+- **Fast.** **Never behind vLLM at any concurrency** on the Qwen3.6-27B gate model, with a real
+  **4.5% win at c1** and a tie-or-better across the rest of the curve, against vLLM's graphed
+  production config. **1.18x llama.cpp's prefill** on the same GGUF file, and **ahead of MLX-LM on
+  prefill** on Apple Silicon. Most other architectures are correct but speed-pending, and every one
+  of them says so.
+- **Everything.** 25+ architectures, tool calling (36 parser families), structured output including
+  GBNF, three speculative decoders, image and video and audio input, external KV offload, Prometheus
+  metrics, and the SGLang knobs, all in a library you can `dlopen`.
+- **Grounded.** Correctness is not asserted, it is **gated token-for-token against a pinned vLLM
+  oracle**, and where vLLM's own greedy decode is non-deterministic at bf16 near-ties the gate says
+  so instead of quietly loosening.
 
 ## Performance: faster than vLLM
 
@@ -43,18 +71,56 @@ point on this curve:
 | vLLM (tok/s) | 82.32 | 158.03 | 290.31 | 505.46 | 789.16 | 1076.25 |
 | **Ratio** | **1.045x** | **1.011x** | **1.007x** | **1.007x** | **1.016x** | **1.017x** |
 
-Six axes, six wins, in **24.88 GiB of peak host memory against vLLM's 28.18 GiB**. And there is no
-Python stack behind it. That last part is not a footnote:
+**Read those ratios honestly.** This project gates on a measured run-to-run noise band of **0.5% for
+non-tail timing**, and the c2 through c32 margins (0.7% to 1.7%) sit close to it. So the fair reading
+of the middle of that curve is **a tie**, not a rout: the c1 win (4.5%) is the one comfortably outside
+noise. That is still the interesting result, because a tie is what a 66 MiB C++ binary is not supposed
+to manage against a mature CUDA stack, and because the output is identical while it happens. We would
+rather say "never behind" and show the band than round a coin flip up into a headline.
 
-![What you install: 9.4 GiB venv vs one 10 MiB binary](benchmarks/media/footprint.png)
+Peak host memory is a clean win at **24.88 GiB against vLLM's 28.18 GiB**, and there is no Python
+stack behind it. That last part is not a footnote:
 
-Elsewhere, measured the same way:
+![What you install: a 9.1 GiB venv, or one 66 MiB binary](benchmarks/media/footprint.png)
 
-| Comparison | Result |
-|---|---|
-| **CPU vs llama.cpp** (same GGUF file, single binary) | Prefill **223.8 tok/s vs 177.3** (**1.18x ahead**), decode at parity (24.7 vs 25.4), peak memory 2.83 GiB vs 2.80, and the output tokens are **byte-identical to llama.cpp's greedy decode** |
-| **Metal vs MLX-LM** (Apple Silicon, warm b=1) | Prefill **1.5% ahead** (524.5 ms vs 532.6 TTFT); warm total 97.6% with the optional MLX provider shape-gated to prefill, 95.9% on the default build. Indicative: two models run end to end, 18 of 75 ops native |
-| **MTP speculative decoding** | Token-identical to vLLM's MTP and ~4% faster at c1 on Qwen3.6-27B-NVFP4 |
+And we hold every other engine to the same treatment: same model, same workload, same box.
+
+### vs llama.cpp, on CPU, from the same GGUF file
+
+| | vllm.cpp | llama.cpp | ratio |
+|---|--:|--:|--:|
+| prefill | **223.8 tok/s** | 177.3 | **1.18x** |
+| decode | 24.7 tok/s | 25.4 | 0.97x (tie) |
+| peak memory | 2.83 GiB | 2.80 GiB | 1.01x |
+
+The decode difference lands **inside llama.cpp's own run-to-run spread**, so the record calls it
+parity rather than a loss, and the memory difference is 30 MiB on a 2.8 GiB working set. The prefill
+win is the one real gap. The generated tokens are **byte-identical to llama.cpp's greedy decode**.
+Single-stream only: no concurrent-serving comparison against llama.cpp's server has been measured yet.
+
+### vs MLX-LM, on Apple M4, warm b=1
+
+| | vllm.cpp | MLX-LM | ratio |
+|---|--:|--:|--:|
+| prefill TTFT | **524.5 ms** | 532.6 ms | **1.5% ahead** |
+| decode | 27.23 tok/s | 27.85 | 97.8% |
+| warm total | 24.37 tok/s | 24.96 | **97.6%** |
+
+Here the remaining 2.4% is **real, not noise**, and we will not dress it up: over 6 interleaved runs
+our spread was 0.12% and MLX-LM's 0.34%, so a 2.4% deficit is well outside both. It sits entirely in
+decode (0.81 ms/token), it is understood, and prefill is genuinely ahead.
+
+Under the hood on Metal: our GEMM runs at **97% of MLX's own** (3.91 TFLOP/s mma issue rate), the
+decode GEMV streams weights at **83% of the part's memory-bandwidth peak**, and moving prefill
+attention onto the matrix units was worth **4.3x**. Indicative rather than binding: two models
+(OPT-125m, Qwen3-0.6B), 18 of 75 ops native, and the 97.6% needs the optional MLX GEMM provider
+shape-gated to prefill (95.9% on the default build).
+
+### Speculative decoding
+
+MTP is **token-identical to vLLM's MTP and about 4% faster** at c1 on Qwen3.6-27B-NVFP4, on both gate
+models end to end. Block-diffusion DFlash runs about 2x over spec-off but sits below vLLM's
+throughput, which is recorded as an open bf16-acceptance floor rather than smoothed over.
 
 Full per-axis grids, memory tables, the nine residual axes, and exact reproduction recipes:
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The two figures above are rendered from these measured
@@ -90,12 +156,13 @@ server: `build/examples/vllm-cli --model <dir> --prompt "..."`. Full CLI, server
 reference: [docs/USAGE.md](docs/USAGE.md). CUDA, Metal, Vulkan, and every CMake option:
 [docs/BUILD.md](docs/BUILD.md).
 
-## Features beyond vLLM parity
+## Features: vLLM parity, then everything else
 
 vllm.cpp **mirrors vLLM by default**: same scheduler, same sampling order, same flags, same JSON
-configs, token-for-token the same output. On top of that:
+configs, token-for-token the same output. Switching to it should be boring. Everything below is what
+you get on top, most of it borrowed from whichever engine does it best:
 
-- **One 10 MiB binary instead of a 9.4 GiB venv.** A flat, exception-free, llama.cpp-style C ABI
+- **One 66 MiB binary instead of a 9.1 GiB install.** A flat, exception-free, llama.cpp-style C ABI
   ([`include/vllm.h`](include/vllm.h), 19 symbols) you can `dlopen` from C, C++, Go, or Rust. No
   Python interpreter in the process, ever.
 - **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
@@ -290,11 +357,21 @@ Both surfaces: [docs/USAGE.md](docs/USAGE.md).
 
 ## Why vllm.cpp
 
-vLLM is an excellent serving framework, but running it drags in a heavy Python / PyTorch / CUDA
-stack. llama.cpp is wonderfully light, but it is built around one user at a time. vllm.cpp is aimed
-squarely at the gap between them: **vLLM's concurrency, llama.cpp's deployment story**. Real
-continuous batching and paged KV in a single embeddable library, on the hardware you already own,
-and measured against both references rather than asserted.
+Every engine today makes you give something up. vLLM has the best serving core in the business, but
+running it drags in a heavy Python / PyTorch / CUDA stack and assumes a datacenter. llama.cpp is
+wonderfully light and runs anywhere, but it is built around one user at a time. SGLang has scheduling
+ideas nobody else ships. MLX is excellent, and only on a Mac.
+
+We do not think you should have to choose. vllm.cpp is the attempt to have all of it in one place:
+**real continuous batching and paged KV, in a 66 MiB library, on the hardware you already own, with
+the features the community keeps asking for, and none of the Python.** Where another engine has
+solved something better, we port from it and cite the file we ported from rather than inventing our
+own version.
+
+The reason to trust any of that is the gate, not the pitch. A new architecture is not "done" here
+when it produces plausible text; it is done when it emits **the same tokens as vLLM**, and it is not
+"fast" until it is measured against the reference in that reference's own production configuration.
+When we fall short, the number stays in the README and the label says *speed-pending*.
 
 ## Documentation
 
@@ -314,6 +391,34 @@ the append-only [`.agents/state.md`](.agents/state.md), the
 [parity ledger](.agents/parity-ledger.md), and the [model matrix](.agents/model-matrix.md). The
 portfolio-completion plan is
 [`.agents/specs/roadmap-v1-completion.md`](.agents/specs/roadmap-v1-completion.md).
+
+## Credits, and what we borrow
+
+vllm.cpp exists because other people built excellent engines first. Our house rule is that every
+implementation is grounded in upstream source and cites the file it was ported from, so this is not a
+courtesy list, it is where the work comes from:
+
+- **[vLLM](https://github.com/vllm-project/vllm)** is the reference this project is measured against
+  and the origin of the serving core: continuous batching, block-paged KV, the V1 scheduler, sampling
+  order, speculative decoding. It is also the oracle: every architecture here has to emit the same
+  tokens vLLM does before it counts as working.
+- **[SGLang](https://github.com/sgl-project/sglang)** contributed serving ideas nobody else ships,
+  which we carry as documented toggles: RadixAttention, LPM cache-aware scheduling, and jump-forward
+  decoding ([docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md)).
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** set the deployment standard we copied
+  outright: one library, a flat C ABI, quantized weights straight off the shelf, and the vendored
+  google/minja chat-template renderer it also ships. It is our CPU speed bar, and the reason GGUF is a
+  first-class input here.
+- **[MLX](https://github.com/ml-explore/mlx)** is the Apple Silicon bar, and optionally the GEMM
+  provider on that path.
+- Kernel work is ported from **CUTLASS**, **FlashInfer**, **Marlin**, and **TRT-LLM** rather than
+  reinvented, cited per kernel in the porting inventory.
+
+**A note on ggml:** vllm.cpp does not use ggml. It reads GGUF and follows llama.cpp's C ABI style, but
+tensors, kernels, and dispatch are its own portable `vt::` runtime
+([`include/vt/`](include/vt/)) with no ggml or PyTorch dependency at any point. That is an
+implementation fact and not a criticism: ggml is a superb piece of engineering, and llama.cpp built the
+ecosystem this project plugs into.
 
 ## Citation
 
