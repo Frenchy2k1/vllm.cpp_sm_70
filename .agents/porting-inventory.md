@@ -257,7 +257,22 @@ OpenAI request/payload wiring remain T1.)
 **Spec decode** (`v1/worker/gpu/spec_decode/`): after speed parity, T1 starts
 with Qwen3.5/3.6 MTP (the gate checkpoints ship their heads), then DFlash and
 the user-promoted DSpark path. Tokenizer-agnostic TLI heterogeneous-vocabulary
-mapping is a distinct T1 row; ngram, EAGLE3 and suffix remain T2. M-mtp-0 is
+mapping is a distinct T1 row; ngram, EAGLE3 and suffix remain T2.
+**Eagle-draft `max_position_embeddings` clamp (upstream-sync vllm#49343,
+2026-07-30, incr 2):** `SpeculativeConfig::MaybeOverrideDraftMaxPositionEmbeddings`
+(`include/vllm/config/speculative.h`) mirrors
+`config/speculative.py::_maybe_override_draft_max_position_embeddings` @ `32e657e68`
+— raise an eagle/eagle3 draft's mpe up to the target's `max_model_len` (never
+lower) so the draft rotary `cos_sin_cache` (our `RotaryEmbeddingBase`, sized to
+`max_position_embeddings_`) is not gathered out of bounds at target-scale
+positions. Ported AHEAD of eagle draft loading (which is deferred / EAGLE3 is T2),
+so there is NO live call site yet — the eagle loader wires it in when it lands.
+Gate `tests/vllm/config/test_speculative_draft_max_position_embeddings.cpp` 4/4
+(3 upstream pure-unit cases + a never-lower guard). Upstream's 2
+model-integration cases (`ModelConfig(EAGLE3_DRAFT/AR_MODEL)`) are SKIPPED — they
+need HF-download + a full draft ModelConfig this T0 subset does not carry; they
+land with the eagle loader. The PR's bundled `llm_base_proposer.py` block_size
+determinism half is N-A (no ported eagle/llm-base proposer). M-mtp-0 is
 `GATING`: the optional BF16 `mtp.*`
 safetensors loader (`src/vllm/model_executor/models/qwen3_5_mtp.cpp:271`) and
 standalone dense/MoE head (`src/vllm/model_executor/models/qwen3_5.cpp:3359`)
