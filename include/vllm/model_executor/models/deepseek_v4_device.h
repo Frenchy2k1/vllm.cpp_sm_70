@@ -135,6 +135,18 @@ struct DsaDeviceKernels {
   void (*decode_attn_g)(vt::Queue&, float* o, const float* q, const float* cache,
                         const float* deck_new, const float* sink, int64_t nh, int64_t hd,
                         const int* len_dev, int64_t max_cap, float scale, bool no_sink);
+  // Brick 7 — FUSED per-row RMSNorm + RoPE (ds4 head_rms_norm_rope_tail_kernel /
+  // dsv4_qkv_rms_norm_rows_kv_rope_kernel). Collapses the {rms_norm_rows ; rope}
+  // launch pair (q per-head norm+rope; kv norm+rope) into ONE kernel — normalized
+  // values never round-trip HBM — and parallelizes the RoPE tail (block-per-row,
+  // threads split the r/2 pairs) BIT-IDENTICALLY (double reduction + left-fold theta
+  // recurrence). do_norm=false + inverse=true is the standalone post-attention
+  // inverse o-RoPE (no norm). `in`/`out` may alias (in-place q/o); for kv in=kraw,
+  // out=slot. off/r are the RoPE tail window [off, off+r) within each n-wide row.
+  void (*norm_rope_rows)(vt::Queue&, float* out, const float* in, const float* w, int64_t rows,
+                         int64_t n, int64_t off, int64_t r, const int* row_pos, double base,
+                         double freq_scale, double ext_factor, int64_t n_ctx_orig, double beta_fast,
+                         double beta_slow, bool inverse, bool has_w, bool do_norm, float eps);
 };
 
 // ── (3) Compressor family device kernels ──────────────────────────────────────

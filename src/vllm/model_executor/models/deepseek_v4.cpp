@@ -1237,6 +1237,17 @@ inline bool FusedMoeEnabled() {
   return on;
 }
 
+// Brick 7: the fused per-head RMSNorm+RoPE kernel (NormRopeRowsKernel) is the
+// resident-decode default (ds4-faithful; bit-identical). VT_V4_FUSED_ROPE=0 falls
+// back to the separate {rms_norm_rows ; rope} launches for A/B measurement + rollback.
+inline bool FusedRopeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_FUSED_ROPE");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
 // True iff the resident T=1 decode path can run: flag on, CUDA queue, keep-quant
 // tower live (be.gguf != nullptr ⇒ `dsa_dense`, so every layer runs DENSE MLA and
 // the compressor/indexer are OFF regardless of the config compress_ratios — the
@@ -1338,9 +1349,15 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
     GemmIntoKq(be, Lq.wq_a, x.data(), qa.data(), 1, qlr, H);
     DSA->rms_norm_rows(*be.q, qa.data(), qa.data(), L.q_norm_weight.data(), 1, qlr, eps, true);
     GemmIntoKq(be, Lq.wq_b, qa.data(), q.data(), 1, nh * hd, qlr);
-    DSA->rms_norm_rows(*be.q, q.data(), q.data(), nullptr, nh, hd, eps, false);  // per-head q-RMS
-    DSA->rope(*be.q, q.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p.rope_orig_ctx,
-              p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/false);
+    if (FusedRopeEnabled()) {  // Brick 7: fused per-head q RMS-norm + fwd RoPE (bit-identical).
+      DSA->norm_rope_rows(*be.q, q.data(), q.data(), nullptr, nh, hd, nope, rope, pos_buf.data(),
+                          rbase, rfs, rext, p.rope_orig_ctx, p.rope_beta_fast, p.rope_beta_slow,
+                          /*inverse=*/false, /*has_w=*/false, /*do_norm=*/true, eps);
+    } else {
+      DSA->rms_norm_rows(*be.q, q.data(), q.data(), nullptr, nh, hd, eps, false);  // per-head q-RMS
+      DSA->rope(*be.q, q.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
+                p.rope_orig_ctx, p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/false);
+    }
     GemmIntoKq(be, Lq.wkv, x.data(), kraw.data(), 1, hd, H);
     // kv-norm + RoPE written DIRECTLY into the new KV-cache row (the resident append).
     std::vector<float>& lc = be.kv->deck[static_cast<size_t>(layer)];
@@ -1348,13 +1365,24 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
     VT_CHECK(static_cast<int64_t>(lc.size()) == kv_base * hd, "resident decode: kv cache out of sync");
     lc.resize(static_cast<size_t>((kv_base + 1) * hd));  // grow by one latent (host; stable this step)
     float* slot = lc.data() + kv_base * hd;
-    DSA->rms_norm_rows(*be.q, slot, kraw.data(), L.kv_norm_weight.data(), 1, hd, eps, true);
-    DSA->rope(*be.q, slot, 1, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p.rope_orig_ctx,
-              p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/false);
+    if (FusedRopeEnabled()) {  // Brick 7: fused kv RMS-norm + fwd RoPE into the KV slot.
+      DSA->norm_rope_rows(*be.q, slot, kraw.data(), L.kv_norm_weight.data(), 1, hd, nope, rope,
+                          pos_buf.data(), rbase, rfs, rext, p.rope_orig_ctx, p.rope_beta_fast,
+                          p.rope_beta_slow, /*inverse=*/false, /*has_w=*/true, /*do_norm=*/true, eps);
+    } else {
+      DSA->rms_norm_rows(*be.q, slot, kraw.data(), L.kv_norm_weight.data(), 1, hd, eps, true);
+      DSA->rope(*be.q, slot, 1, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p.rope_orig_ctx,
+                p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/false);
+    }
     DSA->decode_attn(*be.q, o.data(), q.data(), lc.data(), L.attn_sink.data(), nh, hd, kv_base, 1,
                      scale, /*no_sink=*/false);
-    DSA->rope(*be.q, o.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p.rope_orig_ctx,
-              p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/true);
+    if (FusedRopeEnabled())  // Brick 7: parallelized inverse o-RoPE (no norm), bit-identical.
+      DSA->norm_rope_rows(*be.q, o.data(), o.data(), nullptr, nh, hd, nope, rope, pos_buf.data(),
+                          rbase, rfs, rext, p.rope_orig_ctx, p.rope_beta_fast, p.rope_beta_slow,
+                          /*inverse=*/true, /*has_w=*/false, /*do_norm=*/false, eps);
+    else
+      DSA->rope(*be.q, o.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
+                p.rope_orig_ctx, p.rope_beta_fast, p.rope_beta_slow, /*inverse=*/true);
     // grouped OUTPUT-LoRA: per-group wo_a slice into z, then wo_b → x (the attn out).
     for (int64_t gp = 0; gp < ng; ++gp)
       GemmRowSliceInto(be, Lq.wo_a, o.data() + gp * ipg, z.data() + gp * olr, 1, olr, ipg, gp * olr);
@@ -1547,18 +1575,37 @@ struct V4Graph {
       GemmIntoKq(be, Lq.wq_a, x.data(), qa.data(), 1, qlr, H);
       DSA->rms_norm_rows(*be.q, qa.data(), qa.data(), L.q_norm_weight.data(), 1, qlr, eps, true);
       GemmIntoKq(be, Lq.wq_b, qa.data(), qact.data(), 1, nh * hd, qlr);
-      DSA->rms_norm_rows(*be.q, qact.data(), qact.data(), nullptr, nh, hd, eps, false);
-      DSA->rope(*be.q, qact.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
-                p->rope_orig_ctx, p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/false);
+      if (FusedRopeEnabled()) {  // Brick 7: fused per-head q RMS-norm + fwd RoPE (bit-identical).
+        DSA->norm_rope_rows(*be.q, qact.data(), qact.data(), nullptr, nh, hd, nope, rope,
+                            pos_buf.data(), rbase, rfs, rext, p->rope_orig_ctx, p->rope_beta_fast,
+                            p->rope_beta_slow, /*inverse=*/false, /*has_w=*/false, /*do_norm=*/true,
+                            eps);
+      } else {
+        DSA->rms_norm_rows(*be.q, qact.data(), qact.data(), nullptr, nh, hd, eps, false);
+        DSA->rope(*be.q, qact.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
+                  p->rope_orig_ctx, p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/false);
+      }
       GemmIntoKq(be, Lq.wkv, x.data(), kraw.data(), 1, hd, H);
       float* dn = deck_new[static_cast<size_t>(layer)].data();
-      DSA->rms_norm_rows(*be.q, dn, kraw.data(), L.kv_norm_weight.data(), 1, hd, eps, true);
-      DSA->rope(*be.q, dn, 1, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p->rope_orig_ctx,
-                p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/false);
+      if (FusedRopeEnabled()) {  // Brick 7: fused kv RMS-norm + fwd RoPE into the deck_new slot.
+        DSA->norm_rope_rows(*be.q, dn, kraw.data(), L.kv_norm_weight.data(), 1, hd, nope, rope,
+                            pos_buf.data(), rbase, rfs, rext, p->rope_orig_ctx, p->rope_beta_fast,
+                            p->rope_beta_slow, /*inverse=*/false, /*has_w=*/true, /*do_norm=*/true,
+                            eps);
+      } else {
+        DSA->rms_norm_rows(*be.q, dn, kraw.data(), L.kv_norm_weight.data(), 1, hd, eps, true);
+        DSA->rope(*be.q, dn, 1, hd, nope, rope, pos_buf.data(), rbase, rfs, rext, p->rope_orig_ctx,
+                  p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/false);
+      }
       DSA->decode_attn_g(*be.q, o.data(), qact.data(), cache[static_cast<size_t>(layer)].data(), dn,
                          L.attn_sink.data(), nh, hd, len_buf.data(), max_cap, scale, /*no_sink=*/false);
-      DSA->rope(*be.q, o.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
-                p->rope_orig_ctx, p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/true);
+      if (FusedRopeEnabled())  // Brick 7: parallelized inverse o-RoPE (no norm), bit-identical.
+        DSA->norm_rope_rows(*be.q, o.data(), o.data(), nullptr, nh, hd, nope, rope, pos_buf.data(),
+                            rbase, rfs, rext, p->rope_orig_ctx, p->rope_beta_fast, p->rope_beta_slow,
+                            /*inverse=*/true, /*has_w=*/false, /*do_norm=*/false, eps);
+      else
+        DSA->rope(*be.q, o.data(), nh, hd, nope, rope, pos_buf.data(), rbase, rfs, rext,
+                  p->rope_orig_ctx, p->rope_beta_fast, p->rope_beta_slow, /*inverse=*/true);
       for (int64_t gp = 0; gp < ng; ++gp)
         GemmRowSliceInto(be, Lq.wo_a, o.data() + gp * ipg, z.data() + gp * olr, 1, olr, ipg, gp * olr);
       GemmIntoKq(be, Lq.wo_b, z.data(), x.data(), 1, H, zdim);

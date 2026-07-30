@@ -806,6 +806,72 @@ TEST_CASE("DeepseekV4 device rms_norm_rows (batched per-head q-RMS) == host (Bri
   CHECK(RelL2(outw, out) > 1e-4);
 }
 
+// Brick 7 — the FUSED per-row RMSNorm+RoPE (NormRopeRowsKernel) is BYTE-IDENTICAL to
+// the split {rms_norm_rows ; rope} launch pair it replaces: the double block-reduce is
+// the SAME as RmsNormRowsKernel, and the parallelized RoPE tail reproduces RopeKernel's
+// `theta_extrap *= theta_scale` left-fold (pair p reached by p sequential mults). All
+// three resident-decode modes: q (has_w=false, do_norm, fwd) / kv (has_w=true, do_norm,
+// fwd) / o (do_norm=false, inverse). RED-first each.
+TEST_CASE("DeepseekV4 device norm_rope_rows == split {rms_norm_rows;rope} BYTE-IDENTICAL (Brick 7)") {
+  if (!HasCuda()) return;  // DGX-only
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t rows = 64, n = 512, rope = 64, off = n - rope;  // real MLA geometry
+  const float eps = 1e-6f;
+  const double base = 10000.0, fscale = 0.8, ext = 1.0, bfast = 32.0, bslow = 1.0;
+  const int64_t n_ctx = 4096;
+  std::vector<int> pos(static_cast<size_t>(rows));
+  for (int64_t i = 0; i < rows; ++i) pos[static_cast<size_t>(i)] = static_cast<int>(37 + i);
+  auto* dsa = dv4::DsaDevice();
+
+  auto split = [&](const std::vector<float>& x, const std::vector<float>* w, bool do_norm,
+                   bool inverse) {
+    std::vector<float> out(x.size());
+    if (do_norm) {
+      dsa->rms_norm_rows(g.q, out.data(), x.data(), w ? w->data() : nullptr, rows, n, eps,
+                         w != nullptr);
+    } else {
+      out = x;  // inverse-only site (o): no norm, rope in place
+    }
+    dsa->rope(g.q, out.data(), rows, n, off, rope, pos.data(), base, fscale, ext, n_ctx, bfast,
+              bslow, inverse);
+    gpu.Synchronize(g.q);
+    return out;
+  };
+  auto fused = [&](const std::vector<float>& x, const std::vector<float>* w, bool do_norm,
+                   bool inverse) {
+    // do_norm=false (inverse-o) ropes the tail IN PLACE (reads out), matching the real
+    // forward's norm_rope_rows(o, o, ...); do_norm reads a separate `in` (kv: kraw→slot).
+    std::vector<float> out = do_norm ? std::vector<float>(x.size(), 0.0f) : x;
+    const float* in = do_norm ? x.data() : out.data();
+    dsa->norm_rope_rows(g.q, out.data(), in, w ? w->data() : nullptr, rows, n, off, rope,
+                        pos.data(), base, fscale, ext, n_ctx, bfast, bslow, inverse, w != nullptr,
+                        do_norm, eps);
+    gpu.Synchronize(g.q);
+    return out;
+  };
+
+  const auto x = Rand(r, rows * n, -2.0f, 2.0f);
+  const auto w = Rand(r, n, 0.5f, 1.5f);
+  // (q) has_w=false, do_norm, forward — BYTE-identical.
+  const auto q_split = split(x, nullptr, /*do_norm=*/true, /*inverse=*/false);
+  const auto q_fused = fused(x, nullptr, /*do_norm=*/true, /*inverse=*/false);
+  for (float v : q_fused) CHECK(std::isfinite(v));
+  CHECK(RelL2(q_fused, q_split) == doctest::Approx(0.0));
+  // (kv) has_w=true, do_norm, forward — BYTE-identical.
+  const auto kv_split = split(x, &w, /*do_norm=*/true, /*inverse=*/false);
+  const auto kv_fused = fused(x, &w, /*do_norm=*/true, /*inverse=*/false);
+  CHECK(RelL2(kv_fused, kv_split) == doctest::Approx(0.0));
+  // (o) do_norm=false, inverse — BYTE-identical (rope tail only, no norm).
+  const auto o_split = split(x, nullptr, /*do_norm=*/false, /*inverse=*/true);
+  const auto o_fused = fused(x, nullptr, /*do_norm=*/false, /*inverse=*/true);
+  CHECK(RelL2(o_fused, o_split) == doctest::Approx(0.0));
+  // RED-first: fwd vs inverse differ; and the weighted (kv) path differs from unweighted.
+  CHECK(RelL2(q_fused, o_fused) > 1e-4);
+  CHECK(RelL2(kv_fused, q_fused) > 1e-4);
+}
+
 // Brick D step 1 — the DEVICE router gate (gating[e] = Σ_h x[h]·bf16→f32(W[e*H+h]))
 // == the host reference (sequential f32 dot, exact `bits<<16` bf16 upcast). A near-tie
 // vs the host CPU MatmulBT (FMA-contraction), so the TRUE bar is real-model token-
