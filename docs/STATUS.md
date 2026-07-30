@@ -563,6 +563,19 @@ parallel MhcPre is fine (10× poison gone); the ~21% dip vs host-glue (5.43 vs 6
 device-glue drains/step — inherent to Brick B's per-op-synced structure, removed by Brick C (drop syncs) +
 Brick D (graph). No single-thread on the hot path. Remaining for full device-residency: device RMSNorm,
 RoPE, MoE combine (can fold into Brick C). Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Device-resident decode campaign — Brick C part 1: folded-in device glue kernels (RMSNorm/RoPE/combine)
+(2026-07-30, base `f2fff1ee`, commit `d68768b4`, NOT pushed).** The device kernels the resident assembly
+needs: `RmsNormKernel` (parallel block reduction; has_w=false → per-head q-RMS), `RopeKernel` (per-row
+sequential YaRN recurrence, inverse flips sin), `MoeCombineKernel` (Σ_a w_a·eo_a). Added to the seam
+(`rms_norm`/`rope` in DsaDeviceKernels, `moe_combine` in MoeDeviceKernels); NOT wired into the forward yet
+(they land in the resident assembly). ALL THREE CHARACTERIZED NEAR-TIES (stated): RMSNorm (reduction
+reorder), RoPE (cos/sin lib), and combine (a new **FMA** finding — device fused multiply-add vs host
+separate mul+add; my bit-identical assertion correctly failed at last-ULP → fixed to a near-tie). GATE:
+CUDA `test_cuda_deepseek_v4` **15/15·1106** (RMSNorm/RoPE/combine == host RelL2<1e-5, RED-first each);
+`test_deepseek_v4_gguf_load` 12/12·531. **Brick C part 2 (the SPEED part) REMAINS:** thread the T=1 decode
+through persistent DBufs across the 43-layer stack, consume these + the Brick-A/B kernels resident, and drop
+the ~560 per-op drains (sync only at the step-boundary logits read) — that recovers + exceeds 5.83. Row
+`ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

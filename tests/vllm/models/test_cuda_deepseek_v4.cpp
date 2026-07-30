@@ -654,3 +654,114 @@ TEST_CASE("DeepseekV4 device MHC + router in place == round-trip (Brick B)") {
     for (size_t i = 0; i < ip.topk_weights.size(); ++i) CHECK(ip.topk_weights[i] == rt.topk_weights[i]);
   }
 }
+
+// Brick C: the folded-in device glue (RMSNorm / RoPE / MoE combine) == host refs.
+// All three are near-ties: RMSNorm (block-reduction reorder), RoPE (device cos/sin
+// vs libm), combine (device FMA contraction vs host separate mul+add). RED-first each.
+TEST_CASE("DeepseekV4 device RMSNorm / RoPE / MoE combine == host (Brick C)") {
+  if (!HasCuda()) return;  // DGX-only
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+
+  // device RMSNorm (weighted) == host double-sequential ref (near-tie).
+  {
+    const int64_t n = 300;
+    const float eps = 1e-6f;
+    const auto x = Rand(r, n, -2.0f, 2.0f);
+    const auto w = Rand(r, n, 0.5f, 1.5f);
+    std::vector<float> out(static_cast<size_t>(n), 0.0f);
+    dv4::DsaDevice()->rms_norm(g.q, out.data(), x.data(), w.data(), n, eps, /*has_w=*/true);
+    gpu.Synchronize(g.q);
+    double ss = 0.0;
+    for (int64_t i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
+    const float rr = 1.0f / std::sqrt(static_cast<float>(ss / static_cast<double>(n)) + eps);
+    std::vector<float> ref(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) ref[i] = x[i] * rr * w[i];
+    for (float v : out) CHECK(std::isfinite(v));
+    CHECK(RelL2(out, ref) < 1e-5);
+    // RED-first: has_w=false (no weight) differs from the weighted result.
+    std::vector<float> out2(static_cast<size_t>(n), 0.0f);
+    dv4::DsaDevice()->rms_norm(g.q, out2.data(), x.data(), w.data(), n, eps, /*has_w=*/false);
+    gpu.Synchronize(g.q);
+    CHECK(RelL2(out2, out) > 1e-4);
+  }
+
+  // device RoPE (YaRN) == host RopeInplaceLayer ref (near-tie, cos/sin lib).
+  {
+    const int64_t rows = 5, rd = 64, stride = 96, off = 0;
+    const double base = 160000.0, fscale = 1.0 / 16.0, ext = 1.0;
+    const int64_t n_ctx = 4096;
+    const double bfast = 32.0, bslow = 1.0;
+    std::vector<int> pos(static_cast<size_t>(rows));
+    for (int64_t i = 0; i < rows; ++i) pos[static_cast<size_t>(i)] = static_cast<int>(3 + i);
+    auto v = Rand(r, rows * stride, -1.0f, 1.0f);
+    auto vd = v;  // device copy
+    // host ref matching RopeKernel exactly (sequential recurrence).
+    const double kPi = 3.14159265358979323846;
+    auto corr = [&](double beta) {
+      return static_cast<double>(rd) * std::log(static_cast<double>(n_ctx) / (beta * 2.0 * kPi)) /
+             (2.0 * std::log(base));
+    };
+    const double clo = std::max(0.0, std::floor(corr(bfast)));
+    const double chi = std::min(static_cast<double>(rd - 1), std::ceil(corr(bslow)));
+    const double tscale = std::pow(base, -2.0 / static_cast<double>(rd));
+    for (int64_t row = 0; row < rows; ++row) {
+      float* vv = v.data() + row * stride + off;
+      double te = static_cast<double>(pos[static_cast<size_t>(row)]);
+      for (int64_t i = 0; i < rd; i += 2) {
+        const double ti = fscale * te;
+        double th = ti;
+        const double y = (static_cast<double>(i / 2) - clo) / std::max(0.001, chi - clo);
+        const double ramp = (1.0 - std::min(1.0, std::max(0.0, y))) * ext;
+        th = ti * (1.0 - ramp) + te * ramp;
+        const float c = static_cast<float>(std::cos(th)), s = static_cast<float>(std::sin(th));
+        const float x0 = vv[i], x1 = vv[i + 1];
+        vv[i] = x0 * c - x1 * s;
+        vv[i + 1] = x0 * s + x1 * c;
+        te *= tscale;
+      }
+    }
+    dv4::DsaDevice()->rope(g.q, vd.data(), rows, stride, off, rd, pos.data(), base, fscale, ext,
+                           n_ctx, bfast, bslow, /*inverse=*/false);
+    gpu.Synchronize(g.q);
+    CHECK(RelL2(vd, v) < 1e-5);
+    // RED-first: inverse RoPE differs from forward.
+    auto vi = Rand(r, rows * stride, -1.0f, 1.0f);
+    auto vif = vi;
+    dv4::DsaDevice()->rope(g.q, vi.data(), rows, stride, off, rd, pos.data(), base, fscale, ext,
+                           n_ctx, bfast, bslow, /*inverse=*/false);
+    dv4::DsaDevice()->rope(g.q, vif.data(), rows, stride, off, rd, pos.data(), base, fscale, ext,
+                           n_ctx, bfast, bslow, /*inverse=*/true);
+    gpu.Synchronize(g.q);
+    CHECK(RelL2(vif, vi) > 1e-4);
+  }
+
+  // device MoE combine == host (near-tie: device FMA contraction vs host mul+add).
+  {
+    const int64_t A = 7, H = 64;
+    const auto eo = Rand(r, A * H, -2.0f, 2.0f);
+    const auto wts = Rand(r, A, -1.0f, 1.0f);
+    std::vector<float> out(static_cast<size_t>(H), 0.0f);
+    dv4::MoeDevice()->moe_combine(g.q, out.data(), eo.data(), wts.data(), A, H);
+    gpu.Synchronize(g.q);
+    std::vector<float> ref(static_cast<size_t>(H), 0.0f);
+    for (int64_t h = 0; h < H; ++h) {
+      float acc = 0.0f;
+      for (int64_t a = 0; a < A; ++a) acc += wts[a] * eo[a * H + h];
+      ref[h] = acc;
+    }
+    for (float v : out) CHECK(std::isfinite(v));
+    // CHARACTERIZED NEAR-TIE (not bit-identical): the device compiles the combine's
+    // `weights[a]*eo + acc` to a fused multiply-add (FMA contraction) while the host
+    // does a separate multiply+add → ~last-ULP difference. Stated, not hidden.
+    CHECK(RelL2(out, ref) < 1e-5);
+    // RED-first: negated weights change the output.
+    auto wn = wts;
+    for (auto& x : wn) x = -x;
+    std::vector<float> out2(static_cast<size_t>(H), 0.0f);
+    dv4::MoeDevice()->moe_combine(g.q, out2.data(), eo.data(), wn.data(), A, H);
+    gpu.Synchronize(g.q);
+    CHECK(RelL2(out2, out) > 1e-4);
+  }
+}

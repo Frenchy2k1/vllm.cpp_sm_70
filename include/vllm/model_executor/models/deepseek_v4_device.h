@@ -111,6 +111,17 @@ struct DsaDeviceKernels {
   void (*decode_attn)(vt::Queue&, float* o, const float* q, const float* kv,
                       const float* sink, int64_t nh, int64_t hd, int64_t kv_base,
                       int64_t num_tokens, float scale, bool no_sink);
+  // Brick C — folded-in device glue (in place on unified/device buffers, no
+  // Upload/Download/Sync; caller drains at Brick C / captures at Brick D).
+  // rms_norm: weighted RMSNorm over [n] (has_w=false → the per-head q-RMS). Near-tie
+  // (block reduction reorders vs host double-sequential).
+  void (*rms_norm)(vt::Queue&, float* out, const float* x, const float* w, int64_t n, float eps,
+                   bool has_w);
+  // rope: sequential-recurrence RoPE over `num_rows` rows (each v[row*row_stride+off..+r]),
+  // per-row position `row_pos[row]`. inverse flips the sin sign. Near-tie (cos/sin lib).
+  void (*rope)(vt::Queue&, float* v, int64_t num_rows, int64_t row_stride, int64_t off, int64_t r,
+               const int* row_pos, double base, double freq_scale, double ext_factor,
+               int64_t n_ctx_orig, double beta_fast, double beta_slow, bool inverse);
 };
 
 // ── (3) Compressor family device kernels ──────────────────────────────────────
@@ -155,6 +166,10 @@ struct MoeDeviceKernels {
                    int64_t T, int64_t E, int64_t topk, const float* bias, bool has_bias,
                    const int64_t* in_tokens, bool is_hash, const int32_t* hashtab,
                    int64_t vocab, bool renorm, float scale);
+  // Brick C — MoE combine: out[h] = Σ_a weights[a]*eo[a*H+h] (per-h sequential over
+  // the A experts; near-tie vs host — device FMA contraction). In place on the queue.
+  void (*moe_combine)(vt::Queue&, float* out, const float* eo, const float* weights, int64_t A,
+                      int64_t H);
 };
 
 // Resolve a family's device kernels through the vt OpProvider seam. THROWS on a
