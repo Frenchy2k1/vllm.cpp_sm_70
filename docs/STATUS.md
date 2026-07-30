@@ -184,6 +184,32 @@ DRAM-bandwidth residual** for THIS model's nb≥32 dims (occupancy/tiling has no
 fix), so **~13 tok/s is the honest ceiling and 16.5 is NOT reachable via this lever** —
 a valuable measured-negative like Bricks 4/8. See docs/BENCHMARKS.md.
 
+**DeepSeek-V4-Flash decode ds4-gap — ds4's Q8_0 kernel DIRECTLY PROFILED → the
+"irreducible roofline" is REFUTED, lever RE-OPENED** (2026-07-30,
+`CLAIM-DSV4-Q8-KERNEL-PROFILE`, GB10 sm_121a, measurement-only). Nobody had ever
+profiled ds4's own Q8_0 GEMV; done now (nsys `cuda_gpu_kern_sum` + GGUF byte-accounting
+— `ncu`/`nsys --gpu-metrics` both `ERR_NVGPUCTRPERM`, no admin, so L2-hit is unmeasurable
+and achieved-BW is the counter-immune proxy). Both engines read the **identical 6.15 GiB
+Q8_0 tower once/step** (GGUF `--inspect`: 345 q8_0 tensors; ds4's fp16-dequant cache was
+budget-exhausted this run → it reads the same raw 34-B blocks). **Diff (pure decode/step,
+`(-n60 − -n4)/56`): ours `QuantDotGemmQ8_0Kernel` = 40.93 ms over 646 launches = 161 GB/s
+= 67% of the 240 roofline; ds4 = 30.38 ms over 259 launches = 217 GB/s = 90% of roofline.**
+Same bytes (reading >6.6 GB in 40.9 ms would exceed 240 GB/s — impossible — so our 646 are
+row-splits summing to the same tower, not re-reads). **Root cause = launch consolidation,
+NOT the inner dot / bytes / alignment / lane-occupancy (Bricks 3/4/8/11 all correctly flat):
+ds4 packs the tower into fewer, bigger launches** — `matmul_q8_0_pair_preq_warp8` (2 weights
++ 1 shared activation/launch, 38.8 vs our 63.4 µs/matmul = **1.63×**), `hc_expand_preq`
+(MHC-expand fused into the matmul epilogue), `grouped_q8_0_a` — keeping DRAM saturated,
+where our 646 tiny warp-per-row launches under-subscribe it. Brick 11 built sub-warp
+*lane-splitting* (within-launch) and correctly found it flat; it never changed the launch
+COUNT/SIZE — the one axis that moves 67%→90%. **VERDICT (A) PORTABLE LEVER: build Q8_0
+projection-pairing (mirror `matmul_q8_0_pair_preq_warp8_kernel`, bit-exact) + fold the
+MHC/residual epilogue in (near-tie); target 40.93→~30.4 ms (−10.5) → ~13.9 t/s (from 12.1
+GPU-active), does not reach 16.5 alone (MoE+glue residual ~15 ms is a separate front) but
+re-opens the ladder.** Premise correction: the direct Q8_0 gap is **10.5 ms/step**, not the
+older whole-step-derived "19.8 ms". No code changed. See
+`.agents/specs/ds4-q8-kernel-profile-2026-07-30.md` + docs/BENCHMARKS.md.
+
 **ngram** (method `ngram`, draft-FREE) proposes the next tokens by matching the
 sequence's own suffix n-gram, so it needs no draft model and works on any model;
 on the 27B it is token-exact vs vLLM's own `--speculative-config ngram` on
