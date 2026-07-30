@@ -279,6 +279,35 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   across several output rows — cuts the ~33k tiny warp launches/step), NOT a fusion. After that, the reduction glue
   `MhcPreFinishKernel` (7.7%, single-block Sinkhorn/mix) + `RouteKernel` (6.0%) is the characterized-near-tie lever. Branch
   `brick8-fused-quant` (records-only after revert), NOT pushed.
+- **Brick 9 — ds4-gap Step 0 + Lever 1 (dense Q8_0 activation-quant preq grid) — IMPLEMENTED + DGX-GATED,
+  BIT-EXACT, REAL +4.3% decode; PARTIAL GO for the 11.41→16.5 campaign (plan magnitude REFUTED).** Distinct
+  from Brick 8 (VERIFIED before building): Brick 8 fused `QuantizeQ8K` INTO the GROUPED-MoE GEMM prologue
+  (per-block cooperative re-quant behind `__syncthreads` × thousands of blocks/launch → −22%, refuted, and its
+  disposition said the same refutes fusing `QuantizeQ8_0`). Lever 1 does NOT fuse into any GEMM prologue: it
+  quantizes the DENSE Q8_0 activation exactly ONCE into scratch (as before) and the GEMM reads the pre-quantized
+  buffer — mirroring ds4's actual `preq` pattern (`matmul_q8_0_preq_warp8_kernel` READS `xq`/`xscale` produced
+  by a SEPARATE standalone `quantize_q8_0_f32_kernel`, `ds4_cuda.cu:4228`/`:4343`/dispatch `:12254`; ds4 does
+  NOT fuse the quant into the GEMM). **The measured 6× gap was the standalone quant's GRID:** our
+  `QuantizeQ8_0Kernel` mapped one THREAD to a whole 32-block → a `[1,K]` decode activation launched only 2 blocks
+  (device-starved, 6.98 µs/launch × 646 = 4.51 ms/step); the new `QuantizeQ8_0PreqKernel` uses ds4's one-warp-
+  per-32-block `{nb,m}` grid → 1.53 µs/launch × 646 = 0.99 ms/step (ds4's ~1.2 µs). Guarded `VT_V4_Q8_PREQ_QUANT`
+  (default-ON, `=0` = legacy for A/B), wired inside `MatmulQ8_0Cuda`+`MatmulQ8_0GroupedCuda` so BOTH the eager
+  forward AND the captured `V4Graph::Step` inherit it — nsys confirms `QuantizeQ8_0PreqKernel` appears in the
+  graph body (Brick-7 split-path closed). **BIT-IDENTICAL** (amax MAX-reduction associative+exact, same d=amax/127
+  + roundf; `test_cuda_quant_dot` 4/4·106081 asserts preq==legacy byte-for-byte, RED-first). **MEASURED on clean
+  pristine-main `81074c94` baseline (GB10, 30-step kwin, 4 warm reps, one `flock`, worker down):** baseline
+  reproduces the Lane-A denominator (`QuantizeQ8_0` 4.5094 / `QuantizeQ8K` 4.6031 ms / 84.87 ms/step / 11.44 tok/s);
+  Lever 1 → dense-Q8_0 quant 4.51→0.99 ms (−3.52, 4.56×), GPU-active 84.87→81.31 ms/step, decode **11.44→11.92
+  tok/s (+4.3%, non-overlapping 11.897–11.942 vs 11.414–11.453)**, token-exact golden reproduced;
+  `test_cuda_deepseek_v4` 19/19·66949, `test_deepseek_v4_gguf_load` 15/15·931. **Step 0** (`kWarpsPerBlock` 4→8,
+  `cuda_quant_dot.cu:944`): bit-identical, MEASURED NEUTRAL (`QuantDotGemmQ8_0Kernel` 63.2 µs/launch unchanged;
+  the 41 ms GEMV is memory/latency-bound, not block-count-bound). **GO/NO-GO VERDICT — PARTIAL GO, plan magnitude
+  REFUTED:** the addressable dense-Q8_0 round-trip DID fuse away (Gate A(i) bit-exact PASS, Gate A(iii) decode
+  improves non-overlapping), but Gate A(ii) (`QuantizeQ8_0`+`QuantizeQ8K` 9.1→<1 ms) is NOT met — the `QuantizeQ8K`
+  half (4.60 ms, grouped) is Brick-8-refuted for fusion and Brick-2-deduped, i.e. the plan mis-scoped it into
+  Lever 1. Realized **+0.49 tok/s vs projected +2.3** (→13.5), ~1/5 of projection; the 11.41→16.5 ladder must be
+  re-based (levers 2/3/4 re-measured before trusting 16.5). Lever 1 SHIPS default-on (bit-exact, real). Branch
+  `ds4-lever1-preq-quant` (Step 0 + Lever 1 commits), NOT pushed.
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +

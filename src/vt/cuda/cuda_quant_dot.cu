@@ -36,6 +36,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -734,6 +735,49 @@ __global__ void QuantizeQ8_0Kernel(BlockQ8_0* __restrict__ scratch,
   }
 }
 
+// Lever 1 (ds4-gap "preq"): quantize the activation with ONE warp per 32-block
+// (grid = {nb, m}, 32 threads/block), mirroring ds4 `quantize_q8_0_f32_kernel`
+// (ds4_cuda.cu:4228). The classic QuantizeQ8_0Kernel above maps one THREAD to a
+// whole 32-block, so a single-row [1,K] decode activation launches only
+// ceil(nb/128) blocks (2 for K=7168) — far too few to fill the SMs (measured
+// 6.97 us/launch × 646 = 4.5 ms/step). One warp per block gives `nb` resident
+// blocks (ds4 hits ~1.2 us for the same work). This is NOT the Brick-8 per-block
+// prologue re-quant (which re-quantized the SAME activation in every one of
+// thousands of GEMM blocks behind a __syncthreads and regressed -22%): here the
+// activation is still quantized exactly ONCE into scratch, then the GEMM reads
+// the pre-quantized buffer — only the quant kernel's thread->work mapping changes.
+// BIT-IDENTICAL to QuantizeQ8_0Kernel: amax is a warp MAX-reduction (associative
+// + exact for floats, NaN-propagating ternary preserved), d = amax/127, and the
+// round-half-away-from-zero (roundf) + DF32ToF16 are unchanged.
+__global__ void QuantizeQ8_0PreqKernel(BlockQ8_0* __restrict__ scratch,
+                                       const void* __restrict__ a, ActDT adt, int64_t a_rs,
+                                       int64_t m, int64_t nb) {
+  const int64_t b = static_cast<int64_t>(blockIdx.x);  // 32-block within the row
+  const int64_t i = static_cast<int64_t>(blockIdx.y);  // activation row
+  if (b >= nb || i >= m) return;
+  const int lane = static_cast<int>(threadIdx.x);      // 0..31, one per element
+  const int64_t elem0 = i * a_rs + b * kQK8_0;
+  const float xv = DLoadAct(a, adt, elem0 + lane);
+  float amax = fabsf(xv);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    const float o = __shfl_down_sync(0xffffffffu, amax, off);
+    amax = amax > o ? amax : o;  // ternary MAX (matches CPU, NaN-propagating)
+  }
+  amax = __shfl_sync(0xffffffffu, amax, 0);  // broadcast lane0's reduced amax
+  const float d = amax / 127.0f;
+  const float id = d != 0.0f ? 1.0f / d : 0.0f;
+  BlockQ8_0& y = scratch[i * nb + b];
+  if (lane == 0) y.d = DF32ToF16(d);
+  y.qs[lane] = static_cast<int8_t>(roundf(xv * id));  // round half away from zero
+}
+
+// A/B flag for the ds4-preq activation-quant grid. Default ON (parity enabler
+// ships as default); VT_V4_Q8_PREQ_QUANT=0 forces the legacy one-thread-per-block
+// QuantizeQ8_0Kernel for baseline measurement. Read per call so in-process CUDA
+// tests can flip it. BIT-IDENTICAL either way (asserted in test_cuda_quant_dot).
+inline bool Q8PreqQuantOn(const char* v) { return !(v && v[0] == '0' && v[1] == '\0'); }
+
 // Brick 3 (last-mile): read a 4-byte int from a 2-BYTE-aligned int8 stream. The Q8_0
 // block `qs` starts at offset 2 in the 34-byte block (uint16 d + 32×int8), so — unlike
 // the 4-byte-aligned Q8_K qs the Brick-1 IQ2/Q2_K path int-loads directly — a naked
@@ -935,7 +979,12 @@ void MatmulQ8_0Cuda(Tensor& out, const Tensor& a, const Tensor& b, cudaStream_t 
   const size_t w_row_bytes = static_cast<size_t>(nb) * sizeof(BlockQ8_0);
   const size_t act_bytes = static_cast<size_t>(m) * static_cast<size_t>(nb) * sizeof(BlockQ8_0);
   BlockQ8_0* act = static_cast<BlockQ8_0*>(EnsureScratch(act_bytes, s));
-  {
+  if (Q8PreqQuantOn(std::getenv("VT_V4_Q8_PREQ_QUANT"))) {
+    // Lever 1: ds4-preq grid — one warp per 32-block, {nb, m} blocks.
+    dim3 qgrid(static_cast<unsigned>(nb), static_cast<unsigned>(m), 1);
+    QuantizeQ8_0PreqKernel<<<qgrid, 32, 0, s>>>(act, a.data, ActDtOf(a.dtype), a.stride[0], m,
+                                                nb);
+  } else {
     constexpr int kQBlock = 128;
     const int64_t grid = (m * nb + kQBlock - 1) / kQBlock;
     QuantizeQ8_0Kernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
@@ -979,7 +1028,12 @@ void MatmulQ8_0GroupedCuda(Tensor& out, const Tensor& act_t, const Tensor& weigh
   const size_t w_row_bytes = static_cast<size_t>(nb) * sizeof(BlockQ8_0);
   const size_t act_bytes = static_cast<size_t>(Pa) * static_cast<size_t>(nb) * sizeof(BlockQ8_0);
   BlockQ8_0* qact = static_cast<BlockQ8_0*>(EnsureScratch(act_bytes, s));
-  {
+  if (Q8PreqQuantOn(std::getenv("VT_V4_Q8_PREQ_QUANT"))) {
+    // Lever 1: ds4-preq grid — one warp per 32-block, {nb, Pa} blocks.
+    dim3 qgrid(static_cast<unsigned>(nb), static_cast<unsigned>(Pa), 1);
+    QuantizeQ8_0PreqKernel<<<qgrid, 32, 0, s>>>(qact, act_t.data, ActDtOf(act_t.dtype),
+                                                act_t.stride[0], Pa, nb);
+  } else {
     constexpr int kQBlock = 128;
     const int64_t grid = (Pa * nb + kQBlock - 1) / kQBlock;
     QuantizeQ8_0Kernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
