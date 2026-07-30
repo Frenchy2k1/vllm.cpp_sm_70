@@ -25,6 +25,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/layers/quantization/compressed_tensors/schemes/nvfp4.h"  // MakeMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // shared device glue
 #include "vllm/model_executor/models/device_pool.h"       // DevicePool/Pool
 #include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
@@ -61,11 +62,15 @@ DBuf GraniteMlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
                      const Tensor& h, int64_t T) {
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
-  Tensor wgu = ResidentWeight(d, w.gate_up_proj);  // [2I, H]
-  DBuf gate_up(d, DType::kBF16, {T, 2 * I});
-  vt::MatmulBT(d.q, gate_up.t(), h, wgu);
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::SiluAndMul(d.q, act.t(), gate_up.t());
+  // gate_up MatmulBT -> SiluAndMul via the SHARED gate-up MLP seam. Granite's
+  // MLP weights are literally Qwen3DenseMlpWeights (the factory's operand type),
+  // so this is the exact exemplar (qwen3.cpp MlpBlock): byte-for-byte the same op
+  // sequence, and MakeMlpGateUpMethod selects the nvfp4 GateUpFusedMarlinD arm
+  // automatically the moment a quantized Granite checkpoint populates *_fp4.
+  // (Tier-A1 fold, arch-fusion-fold-plan-2026-07-30.)
+  auto gate_up = layers::MakeMlpGateUpMethod(w.gate_up_proj, w.gate_proj_fp4,
+                                             w.up_proj_fp4, I);
+  DBuf act = gate_up->Apply(d, h);
   Tensor wd = ResidentWeight(d, w.down_proj);  // [H, I]
   DBuf out(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, out.t(), act.t(), wd);

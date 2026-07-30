@@ -72,6 +72,7 @@
 
 #include "vllm/model_executor/layers/attention/mla_chunked_context.h"
 #include "vllm/model_executor/models/decode_graph_sizes.h"  // DecodeGraphSizes/PadToCaptureSize
+#include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight glue
 #include "vllm/model_executor/models/device_pool.h"
 #include "vllm/model_executor/models/mla_attention.h"
@@ -279,11 +280,13 @@ mla::MlaBlockWeights ResidentMla(Dev d, const DeepseekV2MlaWeights& w,
 // SiluAndMul -> down GEMM. Identical op shape to the Qwen3-dense MlpBlock.
 DBuf DenseMlp(Dev d, const DeepseekV2DenseMlp& w, const Tensor& dh, int64_t T,
               int64_t H, int64_t I) {
-  Tensor wgu = ResidentWeight(d, w.gate_up_proj);  // [2I, H] raw-NK
-  DBuf gate_up(d, DType::kBF16, {T, 2 * I});
-  vt::MatmulBT(d.q, gate_up.t(), dh, wgu);
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::SiluAndMul(d.q, act.t(), gate_up.t());
+  // gate_up MatmulBT -> SiluAndMul via the SHARED bf16 gate-up MLP seam
+  // (layers::UnquantizedMlpGateUpMethod). Byte-for-byte the same op sequence the
+  // inline path ran; this single fold covers BOTH the dense-layer MLP and the
+  // shared-expert epilogue (the two DenseMlp call sites), and inherits the nvfp4
+  // GateUpFusedMarlinD arm for free on a quantized checkpoint. (Tier-A1 fold,
+  // arch-fusion-fold-plan-2026-07-30.)
+  DBuf act = layers::UnquantizedMlpGateUpMethod(&w.gate_up_proj, I).Apply(d, dh);
   Tensor wdn = ResidentWeight(d, w.down_proj);  // [H, I] raw-NK
   DBuf out(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, out.t(), act.t(), wdn);

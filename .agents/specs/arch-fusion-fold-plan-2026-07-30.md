@@ -26,15 +26,15 @@ Ranking rule: **(a)** inherits an already-tuned kernel for free · **(b)** bit-e
 
 ### TIER A — bit-exact, drop-in, inherits tuned kernel, wide reuse (do first)
 
-**A1. bf16 SwiGLU MLP → `layers::UnquantizedMlpGateUpMethod` seam** *(shared-op: MlpGateUpMethodBase)*
-Drop-in, byte-for-byte identical op sequence, inherits the nvfp4 `GateUpFusedMarlinD` arm for free the moment a quantized checkpoint ships.
-- OLMo-2 — `olmo2.cpp:60-64` ("EXACT match: SiluAndMul path already exists")
-- Granite — `granite.cpp:64-68` (weights are literally `Qwen3DenseMlpWeights`, the method's operand type)
-- StableLM — `stablelm.cpp:59-63`
-- qwen3_dflash — `qwen3_dflash.cpp:335-342` (already merged, just not on the seam)
-- deepseek_v2 dense/shared-expert epilogue — `deepseek_v2.cpp:280-291`,`:463` (merged GEMM exists; fold `SiluAndMul` into the epilogue)
+**A1. bf16 SwiGLU MLP → `layers::UnquantizedMlpGateUpMethod` seam** *(shared-op: MlpGateUpMethodBase)* — ✅ **DONE 2026-07-30** (branch `worktree-wf_9054a036-47d-1`, NOT pushed)
+Drop-in, byte-for-byte identical op sequence, inherits the nvfp4 `GateUpFusedMarlinD` arm for free the moment a quantized checkpoint ships. **All 5 sites folded; no loader concat needed (every arch already packs a merged `[2I,H] gate_up_proj`).**
+- ✅ OLMo-2 — `olmo2.cpp` `Olmo2MlpBlock` → direct `UnquantizedMlpGateUpMethod` arm. **DGX SACRED token-exact gate RAN + PASSED** (`test_olmo2_paged_engine` 16/16 · 92 assertions; anchor no-op REQUIRE vs pre-fold `our_ids.npy` PASSED = byte-exact no-op on GPU).
+- ✅ Granite — `granite.cpp` `GraniteMlpBlock` → full `layers::MakeMlpGateUpMethod` factory (weights ARE `Qwen3DenseMlpWeights`, so nvfp4-ready today). **Build-verified on production CUDA stack + link/load-verify (golden NOT committed → no vs-vLLM gate this pass); covered by CPU composite golden.**
+- ✅ StableLM — `stablelm.cpp` `StablelmMlpBlock` → direct `UnquantizedMlpGateUpMethod` arm. **Build-verified on production CUDA stack + link/load-verify (golden NOT committed → no vs-vLLM gate this pass); covered by CPU composite golden.**
+- ✅ qwen3_dflash — `qwen3_dflash.cpp` (was hand-merged, off-seam) → direct arm. **Build-verified + CPU composite golden.**
+- ✅ deepseek_v2 dense/shared-expert epilogue — `deepseek_v2.cpp` `DenseMlp` (ONE fold covers BOTH the dense-layer MLP call site AND the shared-expert epilogue call site). **Build-verified + CPU composite golden.**
 
-Exemplar to copy: `qwen3.cpp:91-96` (already on the seam). **Widest, cleanest sweep in the whole plan — 5 archs, zero near-tie.**
+Exemplar copied: `qwen3.cpp:91-96` (already on the seam). **REUSE PROOF landed:** the CPU composite-golden RED-first unit case (`test_linear_method`, GREEN on the DGX production CUDA stack) shows the fused seam is BYTE-IDENTICAL to the standalone `{MatmulBT;SiluAndMul}` sequence; OLMo-2's SACRED gate proves that same shared method is token-exact end-to-end on the real GPU forward. Shared method TU (`linear.h`/`nvfp4.h`) UNTOUCHED → 27B/35B/qwen3_dense stay strict without re-gate. No new env flag. **HONEST:** 1 arch empirically token-exact-gated (OLMo-2); Granite/StableLM goldens were never committed (`granite_greedy_2b`/`stablelm_greedy_1_6b` do not exist) so those get build-verify + link/load this pass — capturing their oracle goldens is available follow-up.
 
 **A2. MLA A-proj merge (3→1) → single `vt::MatmulBT` over `fused_qkv_a_proj`** *(shared-op: merged-QKV, MLA instance)*
 Explicitly flagged in-source as deferred "W9 A/B". Bit-exact (identical GEMM math, merged N); only constraint is **contiguous-output slicing** for the downstream `vt::RmsNorm`.

@@ -14,6 +14,7 @@
 #include <memory>
 #include <vector>
 
+#include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/Reshape/MakeRopeArgs
 #include "vllm/platforms/interface.h"                     // platforms::GetPlatform (static-graph gate)
 #include "vt/backend.h"
@@ -330,13 +331,13 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     else
       vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
 
-    // SwiGLU MLP: gate_up GEMM -> SiluAndMul -> down GEMM.
+    // SwiGLU MLP: gate_up GEMM -> SiluAndMul -> down GEMM. gate_up+SiluAndMul run
+    // through the SHARED bf16 gate-up MLP seam (layers::UnquantizedMlpGateUpMethod)
+    // — byte-for-byte the same op sequence the inline path ran, now on the same
+    // exemplar as qwen3.cpp MlpBlock. (Tier-A1 fold, arch-fusion-fold-plan.)
     const int64_t I = config.intermediate_size;
-    Tensor wgu = ResidentWeight(d, layer.gate_up_proj);
-    DBuf gu(d, DType::kBF16, {T, 2 * I});
-    vt::MatmulBT(d.q, gu.t(), dh2.t(), wgu);
-    DBuf act(d, DType::kBF16, {T, I});
-    vt::SiluAndMul(d.q, act.t(), gu.t());
+    DBuf act =
+        layers::UnquantizedMlpGateUpMethod(&layer.gate_up_proj, I).Apply(d, dh2.t());
     Tensor wdn = ResidentWeight(d, layer.down_proj);
     DBuf down(d, DType::kBF16, {T, H});
     vt::MatmulBT(d.q, down.t(), act.t(), wdn);
