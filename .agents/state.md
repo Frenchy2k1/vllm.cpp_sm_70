@@ -33587,3 +33587,49 @@ logits read for argmax)** — that is what recovers + exceeds the 5.83 baseline 
 Then STOP for review before Brick D (capture the sync-free resident step into a decode CUDA graph; watch the
 cudagraph-bakes-stack-addresses hazard — keep captured inputs in stable owned DBufs, verify by TOKENS). Box
 restored (worker up restart=always, flock free, no stray). Row `ACTIVE`.
+
+## DeepSeek-V4 device-resident decode campaign — Brick C part 2 (the device-resident T=1 decode assembly): CORRECT + token-identical, eager-SLOWER (honest launch-bound finding) (2026-07-30, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-rd`, branch `deepseek-v4-resident-assembly`, base `24bddf15`, commit `3a635624`, NOT pushed)
+
+Coordinator greenlit Brick C part 2 as ONE increment (scope → implement + gate + benchmark, report once). SCOPE
+appended to `.agents/specs/deepseek-v4-device-decode.md` §7.
+
+**`ForwardResidentDecodeGguf` (deepseek_v4.cpp):** the whole 43-layer T=1 decode step as ONE async device chain
+over the (unified) buffers with NO per-op sync. Every keep-quant GEMM defers via new helpers `GemmIntoKq` /
+`GemmRowSliceInto` / `GemmGroupedInto` (MatmulBT[QuantGrouped] into caller unified buffers, no drain). The small
+host primitives run on the Brick-A/B/C device kernels IN PLACE: q/kv/final RMSNorm + the batched per-head q-RMS
+via the NEW `rms_norm_rows` (nh=64 in ONE launch), dual + inverse RoPE, MHC `pre_ip`/`post_ip`/`head_ip`,
+`route_ip`, `clamped_swiglu_ip`, `moe_combine`, `decode_attn` — NONE draining. Routing stays RESIDENT: the device
+router writes i32 `topk_ids` (the grouped expert GEMM consumes on-device) + `topk_weights` (the combine consumes)
+— the host performs NO gather. The KV append is resident (kv-norm+RoPE writes the new deck row directly into the
+cache slot; decode_attn reads the full cache on-stream). The grouped-GEMM input broadcast + the [gate|up] swiglu
+pairing use async `cudaMemcpyAsync` on the stream. The ONE drain is before the host reads the [V] logits for
+argmax. Flag `VT_V4_RESIDENT_DECODE=1` (default OFF); `CanRunResidentDecode` gates CUDA + keep-quant GGUF + KV
+cache + T==1. `rms_norm_rows` added to `DsaDeviceKernels` + `kDsa` (+ a unit case).
+
+**A guard BUG (found + fixed on DGX):** the first `CanRunResidentDecode` rejected any layer with a config
+compress_ratio (has_compressor/has_indexer). But the keep-quant run is `dsa_dense` (be.gguf != nullptr →
+AttentionBlock :658-660 forces compressor/indexer OFF for EVERY layer). So the resident path silently fell back
+to the host path — the first ON run measured IDENTICAL to OFF (both 6.4 tok/s). Removed the loop; the second run
+ENGAGED (util rose to 55%, speed changed).
+
+**GATES (DGX GB10, `deepseek-v4-gen --gpu --kv-cache`, real 80.7 GB model, --max-tokens 25 = 24 decode steps):**
+CUDA unit `test_cuda_deepseek_v4` **16/16·33877** (+`rms_norm_rows` == host + == per-row `rms_norm`, RED-first);
+`test_deepseek_v4_gguf_load` **12/12·531**. **CORRECTNESS — resident ON == host OFF TOKEN-IDENTICAL:** both
+`11111 16 455 6102 294 8760 344 …` = "…Paris." (exact 25 ids). **SPEED — the honest finding: resident-eager
+5.17 tok/s vs the host-glue path 6.44 (−20%); util rose 38%→55% (GPU BUSIER, ~45% idle).**
+
+**Attribution (grounded, per the coordinator's "missed sync? residual host op?"):** NOT a correctness bug (tokens
+identical). NOT the router-gate drains — the bf16 router gate is a CPU MatmulBT reading device x, so the path
+drains 1×/layer = 43/step ≈ 2.8 ms ≈ 1.4% of the 193 ms step (minor). It is **launch/host-gap bound:** the ~1700
+small device-kernel launches/step (replacing fast host-ARM portable-C++ glue) leave the GPU ~45% idle in
+host-side launch gaps, and the correctness-grade V4 glue kernels do the tiny T=1 ops less efficiently than the
+ARM cores. This is the spec-§4 "may improve (fewer syncs)" PRECONDITION, NOT the payoff. **Brick D is the payoff:**
+collapsing the ~1700 launches into ONE `cudaGraphLaunch` removes the host-gap idle — a first-order 55%→~100%
+GPU-busy is ~1.8× → ~9 tok/s (would exceed the 6.44 host baseline), PROVIDED the bf16 router gate is first
+device-ified (the one remaining non-capturable host op — a small f32/bf16 router-gate device GEMM, named).
+
+**Ops:** DGX build (git-archive overlay onto the reused `vllmcpp-mmspeed/build-cuda` sm_121a tree, md5-verified
+transfer of the fixed TU), worker stopped during build+runs then RESTORED (Up, restart=always), flock held for
+the GPU runs, ONE engine at a time (OFF then ON sequential), nvidia-smi sampled during ON. Rollback-able (flag
+OFF default). STOPPED for review before Brick D. Box restored (worker Up restart=always, flock free, no stray gen).
+Row `ACTIVE`.

@@ -122,6 +122,11 @@ struct DsaDeviceKernels {
   void (*rope)(vt::Queue&, float* v, int64_t num_rows, int64_t row_stride, int64_t off, int64_t r,
                const int* row_pos, double base, double freq_scale, double ext_factor,
                int64_t n_ctx_orig, double beta_fast, double beta_slow, bool inverse);
+  // Brick C part 2 — BATCHED RMSNorm over `rows` independent [n] segments in ONE
+  // launch (the per-head q-RMS: rows=nh, has_w=false). Per-row identical to rms_norm
+  // above (same block reduction; a shared weight w[n] applies to every row when has_w).
+  void (*rms_norm_rows)(vt::Queue&, float* out, const float* x, const float* w, int64_t rows,
+                        int64_t n, float eps, bool has_w);
 };
 
 // ── (3) Compressor family device kernels ──────────────────────────────────────

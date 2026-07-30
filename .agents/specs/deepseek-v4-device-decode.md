@@ -145,3 +145,67 @@ Stated up front so the final number isn't a surprise.
   Brick D proves the graph token-identical.
 - **R5 (ceiling):** §5 — this campaign targets the launch tax; kernel-efficiency
   (fp8 KV, tuned MMQ) is a separate named follow-on.
+
+## 7. Brick C part 2 — the resident-decode dataflow (implementation design)
+
+Grounded in the ACTUAL code (`ForwardComposeImpl` :1103, `AttentionBlock` :629,
+`MoeBlock` :881, `DeepseekV4ForwardGgufCached` :1322). Correction to the Brick-0
+sketch (§2): on GB10 the activations are **already unified-memory `std::vector<float>`
+the GPU reads in place** — so this brick does NOT rewrite them into `DBuf`s. The
+~560 syncs come from two things, and residency removes BOTH:
+
+1. **Host value-reads of device outputs.** After each device GEMM/kernel the host
+   reads the output (a copy loop `residual[i]=res_t[i]`, or a `RmsNorm`/`RoPE`/
+   combine that runs on the HOST). Every such read forces a `SyncDeviceGemm`.
+2. **Host primitives still on the CPU** even under `VT_V4_DEVICE_ATTN/GLUE`: q_norm
+   RMSNorm (:667), kv_norm RMSNorm (:697), q-head-RMS (`DeepseekV4QHeadRmsNormInplace`
+   :1358), dual-RoPE + inverse-RoPE (`RopeInplaceLayer` :690/:698/:867), MoE combine
+   (:1021-1025), final RMSNorm (:1260). The Brick-C-part-1 device kernels
+   (`RmsNormLaunch`/`RopeLaunch`/`MoeCombineLaunch`) exist + are unit-gated but are
+   NOT wired into the forward — wiring them IN-PLACE on the unified buffers is the
+   core of this brick.
+
+**Design: a resident T=1 decode path** `ForwardResidentDecodeGguf` (flag
+`VT_V4_RESIDENT_DECODE=1`, default OFF; CUDA + keep-quant GGUF + dense-causal only —
+the benchmark path, `dsa_dense` so no compressor/indexer). It transcribes
+`ForwardComposeImpl`'s math for T=1 but:
+- Keeps the unified `std::vector` buffers; issues **every GEMM with `defer_sync`**
+  and **never calls `SyncDeviceGemm` mid-step**.
+- Replaces every host primitive with its device kernel writing **in place** on the
+  unified buffer (no host copy): q_norm/kv_norm/q-head-RMS → `RmsNormLaunch`;
+  dual-RoPE + inverse-RoPE → `RopeLaunch(...,inverse)`; MHC pre/post/head + router +
+  clamped-SwiGLU → the Brick-B in-place kernels (`pre_ip`/`post_ip`/`head_ip`/
+  `route_ip`/`clamped_swiglu_ip`) **without** their trailing `SyncDeviceGemm`;
+  combine → `MoeCombineLaunch`; final RMSNorm → `RmsNormLaunch`. Attention →
+  `decode_attn` (Brick A) without its drain.
+- **Resident routing (the flagged design point):** the device router writes
+  `topk_ids`/`topk_weights` into unified buffers; the grouped expert GEMM
+  (`kMatmulBTQuantGrouped`) CONSUMES `topk_ids` on-device (no host gather); the
+  combine kernel CONSUMES `topk_weights` on-device. The host reads NEITHER. The one
+  exposed glue: building `xrep`/`adown` (topk row-copies of the expert input) — a
+  tiny device **replicate-row** kernel on-stream (the "tiny glue the threading
+  exposes", §3 Brick C). `topk_ids` is emitted i32 for the grouped-GEMM operand.
+- **KV append stays resident:** host resizes the layer cache `lc` by `hd` (a host
+  vector-grow, no device read), then the kv-norm+RoPE kernel writes the new `deck`
+  row **directly into** `lc.data()+len*hd`; `decode_attn` reads the full `lc`
+  on-stream. No host copy of `deck`.
+- **The ONE drain:** a single `DrainDevice` after the lm_head GEMM, before the host
+  reads the `[V]` logits for argmax (the step boundary). That is the only
+  host↔device ordering point in the step.
+
+**Per-op MHC/x threading (T=1):** the manifold `residual[hc*H]`, `post_mix[hc]`,
+`res_mix[hc*hc]`, and `x[H]` are persistent unified buffers; the in-place MHC
+kernels read+write them directly (the host copy-loops :1179-1184/:1210-1215 are
+DELETED — the kernels write the destinations). `have_residual` first-layer
+broadcast (:1168-1170) is a trivial device or host-side fill of `residual` from `x`
+before any device output exists (no sync).
+
+**Correctness gate:** `VT_V4_RESIDENT_DECODE=1` == the host path (OFF), real 80.7 GB
+model, token-identical "…Paris." (or a CHARACTERIZED near-tie, since the wired-in
+device RMSNorm/RoPE/combine are the same characterized near-ties from part 1 — argmax
+is expected robust as it was for Bricks A/B); `test_deepseek_v4_gguf_load` green.
+**Speed gate:** decode all-resident, nvidia-smi DURING (util must rise well above
+~38% once the drains are gone), report the real ours-vs-ds4 number; expected to
+recover + exceed 5.83. If it does not, attribute (a missed sync? a residual host op
+still reading a device buffer?). Then STOP for review before Brick D (capture this
+now-sync-free step).

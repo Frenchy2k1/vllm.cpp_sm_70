@@ -576,6 +576,26 @@ CUDA `test_cuda_deepseek_v4` **15/15·1106** (RMSNorm/RoPE/combine == host RelL2
 through persistent DBufs across the 43-layer stack, consume these + the Brick-A/B kernels resident, and drop
 the ~560 per-op drains (sync only at the step-boundary logits read) — that recovers + exceeds 5.83. Row
 `ACTIVE`; see docs/BENCHMARKS.md.
+**Device-resident decode campaign — Brick C part 2: the resident T=1 decode assembly — CORRECT + token-
+identical, but eager-SLOWER (honest launch-bound finding) (2026-07-30, base `24bddf15`, commit `3a635624`,
+branch `deepseek-v4-resident-assembly`, NOT pushed).** `ForwardResidentDecodeGguf` runs the whole 43-layer
+T=1 step as ONE async device chain over the unified buffers — every GEMM defers (GemmIntoKq/RowSliceInto/
+GroupedInto), the small host primitives run on the Brick-C device kernels IN PLACE (q/kv/final RMSNorm + the
+batched per-head q-RMS `rms_norm_rows`, dual+inverse RoPE, MHC pre/post/head, router, clamped-SwiGLU, combine,
+decode_attn — none draining), routing stays RESIDENT (device router → i32 topk_ids the grouped GEMM consumes
++ topk_weights the combine consumes — no host gather), the KV append writes the new deck row into the cache
+slot, async cudaMemcpyAsync for the grouped-GEMM broadcast + [gate|up] pairing. Flag `VT_V4_RESIDENT_DECODE=1`
+(default OFF). New tiny glue: `rms_norm_rows` (batched nh=64 q-RMS in ONE launch). Fixed a guard bug (rejected
+on config compress_ratios; the keep-quant run is dense `dsa_dense` regardless → resident never engaged on the
+first run). GATES (DGX GB10, deepseek-v4-gen --gpu --kv-cache, real 80.7 GB, 24 decode): CUDA unit
+**16/16·33877** (+rms_norm_rows case); `test_deepseek_v4_gguf_load` **12/12·531**; **resident ON == host OFF
+TOKEN-IDENTICAL** ("…Paris.", exact 25 ids). **SPEED (honest): resident-eager 5.17 tok/s vs host 6.44 (−20%);
+util 38%→55%.** Attribution: NOT a correctness bug (tokens identical), NOT the router-gate drains (bf16 gate →
+43 CPU-GEMM drains ≈ 1.4%/step) — **launch/host-gap bound** (~1700 small device-kernel launches/step replace
+fast host-ARM glue → ~45% GPU idle). The §4 "may improve" precondition, NOT the payoff — **Brick D (collapse
+the ~1700 launches into ONE cudaGraphLaunch)** is the payoff (55%→~100% busy ≈ 1.8× → ~9 tok/s, would exceed
+6.44), PROVIDED the bf16 router gate is first device-ified (the one remaining non-capturable host op). Rollback-
+able (flag OFF). STOPPED for review before Brick D. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses
