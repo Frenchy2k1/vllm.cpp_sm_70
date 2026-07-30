@@ -2,7 +2,9 @@
 
 Pin `555967922` (vLLM 0.26.0.dev0) → target `e04a30a77` (2026-07-30). Only the
 subset touching our mirrored surface (`src/vllm/**`, `include/vllm/**`,
-`src/vt/**`) is ranked. **1 landed this cycle (rank 0); the pin is NOT advanced.**
+`src/vt/**`) is ranked. **Landed: rank 0 (incr 1, PORTED) + rank 3 clamp helper
+(incr 2, PARTIAL). Incr 3 (2026-07-30) verified-SKIPPED ranks 6-8 (quant matcher /
+INC / custom-ops — none of those code paths exist here). The pin is NOT advanced.**
 Report: [sync/2026-07-30-e04a30a.md](../sync/2026-07-30-e04a30a.md).
 
 ## Ranked work-list (portable + high-value first)
@@ -15,9 +17,9 @@ Report: [sync/2026-07-30-e04a30a.md](../sync/2026-07-30-e04a30a.md).
 | 3 | 49343 | eagle draft max position embeddings | T1-corr | `config/speculative.h` (queue mapping to `v1/spec_decode/**` was imprecise — the fix is config-level) | yes | S | **PARTIAL-DONE (incr 2).** Ported the pure clamp helper `SpeculativeConfig::MaybeOverrideDraftMaxPositionEmbeddings` (1:1 with `_maybe_override_draft_max_position_embeddings`) + 3 unit tests, `test_speculative_draft_max_position_embeddings` 4/4 CPU (RED-first). No live call site yet (eagle/eagle3 draft loading deferred, EAGLE3 T2); helper is wired in when the eagle loader lands. The 2 model-integration tests SKIPPED (need HF ModelConfig). The bundled `llm_base_proposer.py` block_size determinism half is N-A (no ported eagle proposer). |
 | 4 | 49750 | RMSNorm uncontiguous support (1.2–3.1x) | T0-perf | `src/vt/**/rms_norm*` (CUDA + CPU ref) | structure-yes / verify GPU | M | QUEUED — DERIVED+BUILD-VERIFY on CPU ref, runtime perf gate on GB10 |
 | 5 | 48391 | RMSNorm batch-invariance (pin block size) | T0-det | `src/vt/**/rms_norm*` | structure-yes / verify GPU | S | QUEUED — determinism; pairs with rank 4 |
-| 6 | 49483 | compressed-tensors prioritize fused-name match | T1-corr | `model_executor/layers/quantization/compressed_tensors/**` | yes | S | QUEUED — target-matching order; confirm our matcher |
-| 7 | 48589 | extra_config layer-name suffix matching | T1 | quant config | yes | S | QUEUED |
-| 8 | 49134 | reject contradictory custom-op directives | T3/T1 | `config/**` | yes | S | QUEUED — config validation |
+| 6 | 49483 | compressed-tensors prioritize fused-name match | T1-corr | `model_executor/layers/quantization/compressed_tensors/**` | yes | S | **SKIPPED (incr 3) — no matcher to reorder.** The fix (`8a7b3c299`, `compressed_tensors/utils.py:145-150`) swaps `_find_first_match(module.__class__.__name__)` and `_match_fused_layer(layer_name)` inside `find_matched_target`. Our tree has NO `find_matched_target`: compressed-tensors schemes are resolved per-projection by direct tensor-name probing (`IsCtNvfp4Projection`/`LoadCtNvfp4W4A16`, `include/vllm/model_executor/models/dense_weight_loaders.h:256,266`; `ignore` list honored inline). No targets-list walk, no class-name substring match, no fused-vs-class ordering exists here → the bug is structurally impossible. Not force-fitted. |
+| 7 | 48589 | extra_config layer-name suffix matching | T1 | quant config | yes | S | **SKIPPED (incr 3) — INC not carried.** The fix (`948107acf`, `quantization/inc/config_parser.py:142-152`) adds an `endswith(f".{cfg_key}")` suffix fallback to the Intel-Neural-Compressor `INCConfigParser.resolve`. We carry no INC quant path (Intel/XPU, N-A bucket); our only `extra_config` is the KV-connector's (`kv_connector_extra_config`), an unrelated map. |
+| 8 | 49134 | reject contradictory custom-op directives | T3/T1 | `config/**` | yes | S | **SKIPPED (incr 3) — no custom_ops config.** The fix (`0da6e7f3d`, `config/compilation.py:996-1020` + `custom_op.py:284-310`) validates `CompilationConfig.custom_ops` (`+op`/`-op`/`all`/`none`), a torch.compile/Inductor plumbing config we do not carry — our fusion catalog is a declarative `vt::FusedChain` applied at call sites, not a runtime enable/disable list. No `CompilationConfig`/`custom_ops` surface here. |
 | 9 | 50210 | Qwen3.5 text-only dense + MoE | T1 | `model_executor/models/qwen3_5*` | yes | L | QUEUED — diff vs our existing qwen3_5 for behavior drift |
 | 10 | 48912 | enable EVS for Qwen3.5 | T1 | `qwen3_5*` + multimodal | yes | M | QUEUED — video EVS (efficient-video-sampling) |
 | 11 | 47750 | VidCom2 video token pruning | T2 | multimodal | yes | M | INVENTORY — new feature, not ported |
@@ -36,6 +38,13 @@ frontend + NVIDIA CuTe-DSL kernels. All target subsystems/platforms the project
 does not gate (upstream-sync.md Rules; discipline.md deviations §9).
 
 ## Pin-advance gate
-Advance `555967922 → e04a30a77` only after ranks 1–5 land AND the T0 RMSNorm
-runtime gate re-runs on GB10 (gate models Qwen3.6-27B/35B token-exact + speed).
-Until then the pin holds; this doc is the carry-over work-list.
+Advance `555967922 → e04a30a77` only after the remaining behavior-bearing ranks
+resolve AND the T0 RMSNorm runtime gate re-runs on GB10 (gate models
+Qwen3.6-27B/35B token-exact + speed). **Readiness after incr 3:** ranks 6-8 are
+now RESOLVED as SKIP (not-carried code paths — they impose no pin-advance debt).
+The only pin-blocking items left are: (a) the T0 RMSNorm pair (ranks 4-5, GPU
+runtime gate — the sole remaining hard blocker), and (b) the scoped async/KV-P/D
+machinery behind ranks 1-2 (SKIP-requeued, not on the near-term advance path). The
+large model adds (ranks 9-11) are INVENTORY, not pin blockers. So: **the pin holds
+solely on the GB10 RMSNorm runtime gate** — no CPU-portable correctness item
+remains unresolved in the queue.
