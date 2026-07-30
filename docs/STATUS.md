@@ -238,6 +238,34 @@ weight cache or L2 residency (counter-blocked). Token stream **byte-identical ON
 ds4-faithful, DEFAULT-ON (marginal-positive, not a regression). NOT pushed. See
 `.agents/specs/deepseek-v4-last-mile.md` (Brick 12 IMPL) + docs/BENCHMARKS.md.
 
+**DeepSeek-V4-Flash decode ds4-gap — Brick 13 (IMPL): Q8_0 ILP lever (N output-rows per
+warp) — MEASURED NEGATIVE via sudo-ncu; ~13 tok/s is the honest Q8_0 ceiling, Q8_0 front
+CLOSED** (2026-07-31, `CLAIM-DSV4-DECODE-BRICK13`, branch `brick13-q8-ilp` off `137c739f`,
+GB10 sm_121a, `VT_V4_Q8_ILP` default-OFF, opt-in `=2`/`=4`, NOT pushed). The one untried,
+measurement-pointed lever from `ds4-q8-ncu-2026-07-30` (our `QuantDotGemmQ8_0Kernel` is
+memory-LATENCY-bound: long-scoreboard 54.4 @ 71.9% occupancy, L1-hit 96.7%): raise
+memory-level parallelism per thread with N INDEPENDENT weight-load streams. Built
+`QuantDotGemmQ8_0MultiRowKernel<OutT,NROWS>` — each warp computes NROWS consecutive output
+columns of the same activation row (activation read once, `__dp4a`'d against NROWS independent
+weight rows), **BYTE-IDENTICAL** to NROWS plain outputs — wired in `MatmulQ8_0Cuda` (eager +
+captured `V4Graph::Step`). **CAUSAL METRIC (sudo `ncu`, regex `QuantDotGemmQ8_0`, decode
+steady, n-keyed):** the target n=2048 kernel long-scoreboard **57.8 → 87.0 (ILP2) → 51.7
+(ILP4)** (did NOT drop materially), achieved occupancy **71.4% → 42.5% → 21.3% (COLLAPSED)**,
+per-launch GPU-active **46.7 → 44.9 → 51.0 µs (flat-to-WORSE)**; n=4096 LS **56.4 → 122.2 →
+91.3**. **Clean wall-clock (sudo `drop_caches`, 3 reps, `--max-tokens 64`):** OFF **13.19**
+median, ILP2 **13.12 (−0.5%)**, ILP4 **13.05 (−1.0%)**. ROOT (measured): the load latency was
+already hidden by INTER-warp parallelism (71% occupancy), not starved for intra-thread ILP;
+folding N rows/warp divides the warp count by N and adds registers ⇒ occupancy collapses and
+removes more latency-hiding than the extra streams add. Token stream **byte-identical
+OFF==ILP2==ILP4** (golden `11111 16 455 6102 294 8760 344 …`, 16/16). GATE (RED-first,
+byte-identical): `test_cuda_quant_dot` **8/8·108464** (new Brick-13 A/B `1/1·1968`, ILP2==ILP4==plain
+over nb∈{16,48,224}, n∈{1,7,16,17} incl. tail n∤N). **HARD STOP-CONDITION met on BOTH N-values →
+RECORDED-NEGATIVE, kept DEFAULT-OFF** (bit-exact-safe, like Bricks 4/8/11/12). This was the LAST
+measurement-pointed Q8_0-GEMV lever: **~13 tok/s is the honest Q8_0-kernel ceiling on GB10 and
+the campaign's Q8_0 front is CLOSED**; ds4's 67%→90% edge stays attributable only to the
+unobservable fp16-dequant weight cache / L2 residency (`ERR_NVGPUCTRPERM`-blocked). NOT pushed.
+See `.agents/specs/deepseek-v4-last-mile.md` (Brick 13) + docs/BENCHMARKS.md.
+
 **ngram** (method `ngram`, draft-FREE) proposes the next tokens by matching the
 sequence's own suffix n-gram, so it needs no draft model and works on any model;
 on the 27B it is token-exact vs vLLM's own `--speculative-config ngram` on

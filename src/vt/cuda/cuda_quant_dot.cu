@@ -785,6 +785,19 @@ inline bool Q8PreqQuantOn(const char* v) { return !(v && v[0] == '0' && v[1] == 
 // and the captured decode graph pick it up at launch/capture time.
 inline bool Q8SubwarpOn(const char* v) { return v && v[0] == '1' && v[1] == '\0'; }
 
+// Brick 13 (ds4-gap ILP lever): A/B flag for the N-output-rows-per-warp Q8_0 GEMV.
+// Default OFF (=1 → the plain one-row-per-warp kernel is the baseline). VT_V4_Q8_ILP=2
+// or =4 selects the multi-row kernel (N independent weight-load streams per warp → more
+// in-flight loads → lower long-scoreboard). Read per call so in-process CUDA tests and
+// the captured decode graph pick it up at launch/capture time. BIT-IDENTICAL either way
+// (asserted in test_cuda_quant_dot: multi-row == N separate plain outputs, byte-exact).
+inline int Q8IlpRows(const char* v) {
+  if (!v) return 1;
+  if (v[0] == '2' && v[1] == '\0') return 2;
+  if (v[0] == '4' && v[1] == '\0') return 4;
+  return 1;
+}
+
 // Probe (measurement only): print each DISTINCT Q8_0 dense projection shape (nb,n)
 // once so the nsys per-grid.x breakdown can be attributed to K. Guarded (default off).
 inline void Q8ProbeShape(int64_t m, int64_t n, int64_t nb, bool grouped) {
@@ -844,6 +857,67 @@ __global__ void QuantDotGemmQ8_0Kernel(OutT* __restrict__ out,
   if (lane == 0) {
     if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
     else out[i * n + j] = DF32ToBF16(partial);
+  }
+}
+
+// Brick 13 (ds4-gap ILP lever): N-OUTPUT-ROWS-PER-WARP Q8_0 GEMV. The plain kernel above
+// maps ONE output row per warp → each lane runs a DEPENDENT load→unpack→__dp4a chain with
+// nothing to hide the load latency (measured ncu 2026-07-30: long-scoreboard 54.4 at 71.9%
+// occupancy, L1 hit 96.7% → memory-LATENCY-bound, not bandwidth/occupancy/alignment-bound).
+// This kernel gives each warp NROWS CONSECUTIVE output columns of the SAME activation row i
+// (j0..j0+NROWS-1): the activation block is read ONCE and __dp4a-dotted against NROWS
+// INDEPENDENT weight rows, so NROWS separate weight-load streams are issued per block —
+// while row r's load is in flight the compiler issues row r+1's load (higher memory-level
+// parallelism → lower long-scoreboard). This is the ILP axis none of Bricks 4/11/12 touched.
+// BIT-IDENTICAL to NROWS separate QuantDotGemmQ8_0Kernel outputs: each row's integer __dp4a
+// order (same GetIntB2 8×dp4a over the same blocks), the 32-wide warp reduce, and the
+// f16-scale fold `sumi*(DF16ToF32(wd)*DF16ToF32(ad))` are ALL UNCHANGED — only co-issued.
+// Grid maps warp → (i, jg) with jg over ceil(n/NROWS) column-groups; tail rows j>=n skipped.
+template <typename OutT, int NROWS>
+__global__ void QuantDotGemmQ8_0MultiRowKernel(OutT* __restrict__ out,
+                                               const uint8_t* __restrict__ weight,
+                                               const BlockQ8_0* __restrict__ act, int64_t m,
+                                               int64_t n, int64_t nb, size_t w_row_bytes) {
+  const int64_t njg = (n + NROWS - 1) / NROWS;  // column-groups per activation row
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= m * njg) return;
+  const int64_t i = warp / njg;
+  const int64_t jg = warp % njg;
+  const int64_t j0 = jg * NROWS;
+  const int lane = threadIdx.x;
+  const BlockQ8_0* a_row = act + i * nb;
+  float partial[NROWS];
+#pragma unroll
+  for (int r = 0; r < NROWS; ++r) partial[r] = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    const BlockQ8_0* ab = a_row + b;
+    const float ad = DF16ToF32(ab->d);
+#pragma unroll
+    for (int r = 0; r < NROWS; ++r) {
+      const int64_t j = j0 + r;
+      if (j >= n) continue;
+      const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
+      const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(b) *
+                                                                            sizeof(BlockQ8_0));
+      int sumi = 0;
+#pragma unroll
+      for (int k = 0; k < kQK8_0 / 4; ++k) sumi = __dp4a(GetIntB2(wb->qs, k), GetIntB2(ab->qs, k), sumi);
+      partial[r] += sumi * (DF16ToF32(wb->d) * ad);
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+    for (int r = 0; r < NROWS; ++r) partial[r] += __shfl_down_sync(0xffffffffu, partial[r], off);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < NROWS; ++r) {
+      const int64_t j = j0 + r;
+      if (j >= n) continue;
+      if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial[r];
+      else out[i * n + j] = DF32ToBF16(partial[r]);
+    }
   }
 }
 
@@ -1274,6 +1348,29 @@ void MatmulQ8_0Cuda(Tensor& out, const Tensor& a, const Tensor& b, cudaStream_t 
       LaunchQ8_0Subwarp<uint16_t>(static_cast<uint16_t*>(out.data), w, act, m, n, nb, w_row_bytes,
                                   s);
     CheckCuda(cudaGetLastError(), "matmul_bt_quant Q8_0 subwarp launch");
+    return;
+  }
+  // Brick 13 (ds4-gap ILP lever): N-output-rows-per-warp GEMV (opt-in, plain layout only).
+  // Bit-identical to the plain kernel; raises in-flight weight loads to hide L1 latency.
+  const int ilp = b.q8_0_aligned ? 1 : Q8IlpRows(std::getenv("VT_V4_Q8_ILP"));
+  if (ilp >= 2) {
+    const int64_t njg = (n + ilp - 1) / ilp;
+    const int64_t ilp_grid = (m * njg + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    if (out.dtype == DType::kF32) {
+      if (ilp == 2)
+        QuantDotGemmQ8_0MultiRowKernel<float, 2><<<static_cast<unsigned>(ilp_grid), block, 0, s>>>(
+            static_cast<float*>(out.data), w, act, m, n, nb, w_row_bytes);
+      else
+        QuantDotGemmQ8_0MultiRowKernel<float, 4><<<static_cast<unsigned>(ilp_grid), block, 0, s>>>(
+            static_cast<float*>(out.data), w, act, m, n, nb, w_row_bytes);
+    } else if (ilp == 2) {
+      QuantDotGemmQ8_0MultiRowKernel<uint16_t, 2><<<static_cast<unsigned>(ilp_grid), block, 0, s>>>(
+          static_cast<uint16_t*>(out.data), w, act, m, n, nb, w_row_bytes);
+    } else {
+      QuantDotGemmQ8_0MultiRowKernel<uint16_t, 4><<<static_cast<unsigned>(ilp_grid), block, 0, s>>>(
+          static_cast<uint16_t*>(out.data), w, act, m, n, nb, w_row_bytes);
+    }
+    CheckCuda(cudaGetLastError(), "matmul_bt_quant Q8_0 ILP launch");
     return;
   }
   if (b.q8_0_aligned) {  // Brick 4: coalesced-load layout (RepackQ8_0Cuda) — aligned int4 loads
