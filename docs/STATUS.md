@@ -1564,7 +1564,17 @@ The protocol is in [`.agents/gates.md`](../.agents/gates.md) and
 [`.agents/benchmark-protocol.md`](../.agents/benchmark-protocol.md). A CI check
 (`scripts/check-fusion-consistency.py`) additionally keeps model forwards routing
 their fusable add+RMSNorm glue through the portable fusion catalog rather than
-hand-fusing it.
+hand-fusing it. **The Gemma family (Gemma-1/2/3) was MIGRATED off the drift
+allowlist 2026-07-30 (Tier-B2 of the cross-arch fold plan):** their
+residual-carrying gemma-(1+w) input/pre-ffn/final norms now route through
+`vt::FusedChain(kFusedAddRmsNorm)` behind `FusedChainAdoptEnabled()` (byte-exact
+`else` fallback), and the sandwich post-norms (no residual add) correctly stay
+standalone — so the allowlist shrinks to `glm4`/`phi3`. In the SAME wave (Tier-C1)
+all four text Gemma MLPs fold onto a new shared GeGLU gate-up method
+(`layers::UnquantizedMlpGateUpGeluMethod`, the GeluAndMul sibling of the SwiGLU
+`UnquantizedMlpGateUpMethod` A1 landed) — one merged `[2I,H]` descriptor family now
+serves BOTH activation families. Gemma is the strongest reuse proof because it has
+REAL committed goldens: see docs/BENCHMARKS.md for the DGX SACRED-gate results.
 
 **The 27B SACRED gate needs the production kernel build, and now says so.** The
 27B W4A4 acceptance gate (`tests/parity/test_qwen27_paged_engine.cpp`) reproduces

@@ -32,11 +32,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpGeluMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/glue
 #include "vllm/model_executor/models/device_pool.h"       // Pool
 #include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vt/recipes.h"  // kFusedAddRmsNorm (Tier-B2)
 
 namespace vllm {
 namespace {
@@ -198,11 +200,11 @@ DBuf Gemma3MlpBlock(Dev d, const Gemma3MlpWeights& w, const HfConfig& cfg,
                     const Tensor& dh2, int64_t T) {
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
-  Tensor wgu = ResidentWeight(d, w.gate_up_proj);
-  DBuf gate_up(d, DType::kBF16, {T, 2 * I});
-  vt::MatmulBT(d.q, gate_up.t(), dh2, wgu);
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::GeluAndMul(d.q, act.t(), gate_up.t());
+  // gate_up MatmulBT -> GeluAndMul(tanh) via the SHARED bf16 GeGLU gate-up MLP seam
+  // (layers::UnquantizedMlpGateUpGeluMethod). Byte-for-byte the inline sequence —
+  // folds Gemma-3 onto the shared MlpGateUpMethodBase descriptor. (Tier-C1,
+  // arch-fusion-fold-plan-2026-07-30.)
+  DBuf act = layers::UnquantizedMlpGateUpGeluMethod(&w.gate_up_proj, I).Apply(d, dh2);
   Tensor wd = ResidentWeight(d, w.down_proj);
   DBuf down(d, DType::kBF16, {T, H});
   vt::MatmulBT(d.q, down.t(), act.t(), wd);
@@ -225,10 +227,16 @@ void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const vt::RmsNormArgs gemma{eps, true};
 
-  // input_layernorm (fused add+GemmaRMSNorm): res += hidden; dhn = norm(res)
+  // input_layernorm (fused add+GemmaRMSNorm): res += hidden; dhn = norm(res).
+  // Routed through the shared fusion catalog (vt::kFusedAddRmsNorm); the Tier-0
+  // composite is byte-identical to the standalone `vt::RmsNorm(..., &res)`. (Tier-B2,
+  // arch-fusion-fold-plan-2026-07-30.)
   Tensor w_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, gemma, &res.t());
+  if (FusedChainAdoptEnabled())
+    vt::FusedChain(d.q, dhn.t(), hidden.t(), w_in, &res.t(), vt::kFusedAddRmsNorm, eps);
+  else
+    vt::RmsNorm(d.q, dhn.t(), hidden.t(), w_in, gemma, &res.t());
 
   // attention (dual-theta rope + per-layer sliding window)
   const bool sliding = g.IsSliding(l);
@@ -238,20 +246,26 @@ void RunLayer(Dev d, const Gemma3LayerWeights& layer, const HfConfig& cfg,
   DBuf attn = Gemma3AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T,
                               rope_base, g.attn_scale, window);
 
-  // post_attention_layernorm (STANDALONE GemmaRMSNorm, sandwich): attn = norm(attn)
+  // post_attention_layernorm (STANDALONE GemmaRMSNorm, sandwich): attn = norm(attn).
+  // NOT-FUSABLE onto kFusedAddRmsNorm — a sublayer-output post-norm with NO residual
+  // add. Left standalone by design (fold-plan §B2 hazard). (Tier-B2)
   Tensor w_pa = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf attn_n(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, attn_n.t(), attn.t(), w_pa, gemma);
 
-  // pre_feedforward_layernorm (fused add+GemmaRMSNorm): res += attn_n; dh2=norm(res)
+  // pre_feedforward_layernorm (fused add+GemmaRMSNorm): res += attn_n; dh2=norm(res).
   Tensor w_pf = ResidentWeight(d, layer.pre_feedforward_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dh2.t(), attn_n.t(), w_pf, gemma, &res.t());
+  if (FusedChainAdoptEnabled())
+    vt::FusedChain(d.q, dh2.t(), attn_n.t(), w_pf, &res.t(), vt::kFusedAddRmsNorm, eps);
+  else
+    vt::RmsNorm(d.q, dh2.t(), attn_n.t(), w_pf, gemma, &res.t());
 
   // GeGLU MLP
   DBuf mlp = Gemma3MlpBlock(d, layer.mlp, cfg, dh2.t(), T);
 
-  // post_feedforward_layernorm (STANDALONE GemmaRMSNorm, sandwich): hidden=norm(mlp)
+  // post_feedforward_layernorm (STANDALONE GemmaRMSNorm, sandwich): hidden=norm(mlp).
+  // NOT-FUSABLE (no residual add). STANDALONE. (Tier-B2)
   Tensor w_pff = ResidentWeight(d, layer.post_feedforward_layernorm, {H});
   hidden = DBuf(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, hidden.t(), mlp.t(), w_pff, gemma);
@@ -306,10 +320,13 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, g, l, hidden, res, si,
              attn_meta, attn_kv[static_cast<size_t>(l)], T);
 
-  // Final GemmaRMSNorm over the fused stream (res += hidden; gemma norm).
+  // Final GemmaRMSNorm over the fused stream (res += hidden; gemma norm) via catalog.
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
   DBuf dnorm(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dnorm.t(), hidden.t(), w_fn, vt::RmsNormArgs{eps, true}, &res.t());
+  if (FusedChainAdoptEnabled())
+    vt::FusedChain(d.q, dnorm.t(), hidden.t(), w_fn, &res.t(), vt::kFusedAddRmsNorm, eps);
+  else
+    vt::RmsNorm(d.q, dnorm.t(), hidden.t(), w_fn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // lm_head. Tied (gemma-3-1b): logits = hidden @ embed_tokens^T (MatmulBT over
   // the [vocab,H] embed table). Note the embed table used here is the UNSCALED

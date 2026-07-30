@@ -15,8 +15,10 @@
 # refactor the forwards).
 
 # --- KNOWN-DRIFT: recipe exists, model has NOT adopted the catalog (fix = adopt) ---
-gemma      # gemma-(1+w) add+RMSNorm at input/pre-ffn/final sites → kFusedAddRmsNorm; pending FUSION-DENSE-MIGRATE
-gemma2     # gemma-(1+w) sandwich norms (residual-carrying) → kFusedAddRmsNorm; pending FUSION-DENSE-MIGRATE
-gemma3     # gemma-(1+w) sandwich norms (residual-carrying) → kFusedAddRmsNorm; pending FUSION-DENSE-MIGRATE
+# gemma/gemma2/gemma3 MIGRATED 2026-07-30 (Tier-B2, arch-fusion-fold-plan): their
+# residual-carrying gemma-(1+w) input/pre-ffn/final norms now route through
+# vt::FusedChain(kFusedAddRmsNorm) behind FusedChainAdoptEnabled(); the sandwich
+# post-norms (no residual add) correctly stay standalone. Removed from the allowlist
+# = the enforcement gate closing for the Gemma family.
 glm4       # plain-w add+RMSNorm at input/post/final sites → kFusedAddRmsNormStd; pending FUSION-DENSE-MIGRATE
 phi3       # plain-w add+RMSNorm at input/post/final sites → kFusedAddRmsNormStd; pending FUSION-DENSE-MIGRATE
