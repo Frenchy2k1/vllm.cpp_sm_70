@@ -92,6 +92,38 @@ reproduces the ds4-gap Lane-A denominator: `QuantizeQ8_0` 4.5094 ms / `QuantizeQ
   KEPT for ds4-layout parity, but this kernel is not occupancy-bound at 8 warps/block
   — the 41 ms is memory/latency-bound, not block-count-bound.
 
+- **Lever 1 (dense Q8_0 activation-quant preq grid, `QuantizeQ8_0PreqKernel`,
+  `VT_V4_Q8_PREQ_QUANT` default-ON) — REAL bit-exact +4.3% decode. GO (partial).**
+  The legacy `QuantizeQ8_0Kernel` mapped one THREAD to a whole 32-block, so a
+  single-row `[1,K]` decode activation launched only ceil(nb/128)=2 blocks →
+  device-starved (6.98 µs/launch × 646 = 4.51 ms/step). Porting ds4's
+  `quantize_q8_0_f32_kernel` grid (`ds4_cuda.cu:4228` — one warp per 32-block,
+  `{nb,m}` blocks) drops it to **1.53 µs/launch × 646 = 0.99 ms/step** (ds4 hits
+  ~1.2 µs), verified appearing in the captured `V4Graph::Step` body (nsys), so the
+  Brick-7 split-path is closed. **This is NOT Brick 8's per-block prologue re-quant**
+  (which re-quantized the SAME activation in every one of thousands of grouped-GEMM
+  blocks behind a `__syncthreads` and regressed −22%): the activation is still
+  quantized exactly ONCE into scratch, then the GEMM reads it — only the quant
+  kernel's thread→work mapping changes. **BIT-IDENTICAL** (amax MAX-reduction is
+  associative+exact; `test_cuda_quant_dot` 4/4·106081 asserts preq==legacy
+  byte-for-byte). **MEASURED (GB10, 30-step kwin, 4 warm reps, non-overlapping):**
+  dense-Q8_0 quant 4.51→0.99 ms (−3.52 ms, 4.56×), GPU-active 84.87→81.31 ms/step,
+  decode **11.44→11.92 tok/s (+4.3%)**; token-exact (golden `11111 16 455 6102 294
+  8760 344 …` reproduced). `test_cuda_deepseek_v4` 19/19·66949,
+  `test_deepseek_v4_gguf_load` 15/15·931 GREEN.
+- **HONEST go/no-go for the 11.41→16.5 campaign — PARTIAL GO, plan magnitude
+  REFUTED.** Gate A(ii) as written ("`QuantizeQ8_0`+`QuantizeQ8K` share 9.1 ms →
+  <1 ms") is NOT met: only the `QuantizeQ8_0` half (4.51→0.99 ms) is addressable.
+  The other half, `QuantizeQ8K` (4.60 ms, grouped MoE), is NOT touched by Lever 1
+  and is NOT further reducible by this class of change — Brick 8 already proved
+  fusing it into the grouped-GEMM prologue regresses −22%, and Brick 2 already
+  deduped its launches (broadcast preq-reuse). The plan mis-scoped `QuantizeQ8K`
+  into Lever 1. Realized Lever-1 gain is **+0.49 tok/s (+4.3%), not the projected
+  +2.3 (→13.5)** — ~1/5 of projection. The ds4-gap ladder to 16.5 therefore needs
+  re-basing: each downstream lever (2/3/4) must be re-measured before the 16.5
+  ceiling is trusted, since Lever 1's headline projection did not hold. Lever 1
+  itself is a real, keep-worthy, bit-exact, default-on win and SHIPS.
+
 Disposition: **the wiring is CPU-gated at tiny synthetic shape; the real-model
 MTP-on==MTP-off + acceptance-rate + tokens/step + wall-clock speedup measurement
 is WEIGHT-BLOCKED and did NOT run (nothing faked).**

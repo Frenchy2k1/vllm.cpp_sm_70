@@ -120,11 +120,20 @@ llama.cpp converter dropped every nextn tensor (`DeepseekV4GgufHasMtp` returns
 false → clean fall-back to MTP-off). The DS4-native propose/verify decode loop +
 engine spec-config registration are named residuals.
 
-**DeepSeek-V4-Flash decode ds4-gap — Step 0** (`kWarpsPerBlock` 4→8 on the dense
-Q8_0 GEMV, ds4's 8-rows/block layout, 2026-07-30): bit-identical, but MEASURED
-NEUTRAL on GB10 (`QuantDotGemmQ8_0Kernel` 63.2 µs/launch unchanged, decode 11.43
-tok/s = baseline). Kept for ds4-layout parity; the 41 ms dense-Q8_0 GEMV is
-memory/latency-bound, not block-count-bound. See docs/BENCHMARKS.md.
+**DeepSeek-V4-Flash decode ds4-gap — Step 0 + Lever 1** (2026-07-30,
+`CLAIM-DSV4-DECODE-LEVER1`, GB10 sm_121a). **Step 0** (`kWarpsPerBlock` 4→8 on the
+dense Q8_0 GEMV, ds4's 8-rows/block): bit-identical, MEASURED NEUTRAL
+(`QuantDotGemmQ8_0Kernel` 63.2 µs/launch unchanged; the 41 ms GEMV is
+memory/latency-bound). **Lever 1** (`QuantizeQ8_0PreqKernel`, `VT_V4_Q8_PREQ_QUANT`
+default-ON): ports ds4's warp-per-32-block quant grid, dropping the dense Q8_0
+activation-quant 4.51→0.99 ms/step (6.98→1.53 µs/launch, ds4-parity), in the
+captured decode graph body. BIT-IDENTICAL (`test_cuda_quant_dot` 4/4·106081,
+preq==legacy byte-for-byte), token-exact. **Decode 11.44→11.92 tok/s (+4.3%,
+non-overlapping); SHIPS default-on.** Go/no-go for the 11.41→16.5 campaign =
+**PARTIAL GO**: Gate A(ii) 9.1→<1 ms is NOT met — the `QuantizeQ8K` half (4.60 ms,
+grouped MoE) is Brick-8-refuted for fusion and Brick-2-deduped, so the plan
+mis-scoped it into Lever 1; realized +0.49 tok/s vs projected +2.3, so the ladder
+to 16.5 must be re-based. See docs/BENCHMARKS.md.
 
 **ngram** (method `ngram`, draft-FREE) proposes the next tokens by matching the
 sequence's own suffix n-gram, so it needs no draft model and works on any model;

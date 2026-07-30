@@ -21,6 +21,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -272,6 +273,60 @@ TEST_CASE("Brick 4: CUDA Q8_0 aligned (coalesced) layout == plain Q8_0 (bit-iden
       gpu.Free(d_o);
       gpu.Free(d_wa);
       gpu.Free(d_oa);
+    }
+  }
+  gpu.DestroyQueue(gq);
+}
+
+// Lever 1 (ds4-gap): the ds4-preq activation-quant grid (QuantizeQ8_0PreqKernel,
+// one warp per 32-block, VT_V4_Q8_PREQ_QUANT default-ON) must be BIT-IDENTICAL to
+// the legacy one-thread-per-block QuantizeQ8_0Kernel (=0). Both compute the same
+// amax (MAX-reduction is associative + exact), same d = amax/127, same roundf ->
+// byte-identical Q8_0 scratch feeding the same integer dot. RED-first: a wrong
+// warp-reduce or lane->element mapping would diverge the two outputs.
+TEST_CASE("Lever 1: CUDA Q8_0 preq-quant grid == legacy quant grid (bit-identical)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; Q8_0 preq-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase c = {DType::kQ8_0, 32, 34, 0, -1, "q8_0"};
+  const int64_t k = 8 * c.block_elems;  // 8 blocks
+  for (int64_t m : {int64_t{1}, int64_t{4}}) {
+    for (int64_t n : {int64_t{1}, int64_t{7}, int64_t{16}}) {
+      CAPTURE(m);
+      CAPTURE(n);
+      std::vector<uint8_t> wq = RandomBlocks(c, n * (k / c.block_elems), 0x5EEDU);
+      std::vector<float> a(static_cast<size_t>(m * k));
+      GenerateData(1.0F, a.size(), a.data());
+      void* d_a = gpu.Alloc(a.size() * sizeof(float));
+      gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+      Tensor at = DevTensor(d_a, DType::kF32, {m, k});
+      void* d_w = gpu.Alloc(wq.size());
+      gpu.Copy(gq, d_w, wq.data(), wq.size());
+      Tensor bt = DevTensor(d_w, DType::kQ8_0, {n, k});
+
+      auto run = [&](const char* flag) {
+        setenv("VT_V4_Q8_PREQ_QUANT", flag, 1);
+        void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+        Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
+        vt::MatmulBTQuant(gq, ot, at, bt);
+        std::vector<float> out(static_cast<size_t>(m * n), 0.0F);
+        gpu.Copy(gq, out.data(), d_o, out.size() * sizeof(float));
+        gpu.Synchronize(gq);
+        gpu.Free(d_o);
+        return out;
+      };
+      std::vector<float> legacy = run("0");  // one-thread-per-block
+      std::vector<float> preq = run("1");    // ds4-preq warp-per-block
+      unsetenv("VT_V4_Q8_PREQ_QUANT");
+      for (size_t i = 0; i < legacy.size(); ++i) {
+        REQUIRE(std::isfinite(preq[i]));
+        CHECK(preq[i] == legacy[i]);  // BIT-IDENTICAL
+      }
+      gpu.Free(d_a);
+      gpu.Free(d_w);
     }
   }
   gpu.DestroyQueue(gq);
