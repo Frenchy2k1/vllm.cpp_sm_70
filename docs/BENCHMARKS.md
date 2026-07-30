@@ -124,6 +124,41 @@ reproduces the ds4-gap Lane-A denominator: `QuantizeQ8_0` 4.5094 ms / `QuantizeQ
   ceiling is trusted, since Lever 1's headline projection did not hold. Lever 1
   itself is a real, keep-worthy, bit-exact, default-on win and SHIPS.
 
+## DeepSeek-V4-Flash decode ds4-gap — Lever 3 (route → warp-topk) (2026-07-30, `CLAIM-DSV4-DECODE-LEVER3`) — bit-exact route GPU work −5.59 ms/step (15.8×)
+
+Measured on GB10 sm_121a, same DeepSeek-V4-Flash IQ2XXS GGUF, `--gpu --kv-cache
+VT_V4_RESIDENT_DECODE=1 VT_V4_DECODE_GRAPH=1`, `flock`, `local-ai-worker` down, page
+cache evicted before each capture. Base `baff8a28` (Lever 1 shipped, 11.92 tok/s).
+
+- **Lever 3 (`RouteWarpKernel`, `VT_V4_ROUTE_WARP_TOPK` default-ON) — bit-exact, route
+  GPU work −5.59 ms/step.** The single-thread `RouteKernel` did the E=256/topk=6 expert
+  top-k with ONE thread per token at T=1 (scan 256 experts × 6 selections). The new
+  warp-parallel kernel (ds4 `router_select_warp_topk_kernel`, `ds4_cuda.cu:10113`): one
+  WARP per token, 8 experts/lane, per-lane argmax → butterfly `__shfl_xor` reduce → mask
+  winner, repeat topk. **BIT-IDENTICAL** (argmax under a strict total order — value then
+  unique index — is reduction-order-invariant; unbiased weight + our exact renorm run the
+  same float ops in j-order). Wired through a shared `RouteDispatch` into BOTH the eager
+  `RouteLaunch` AND the captured-graph `RouteInPlaceLaunch`; nsys confirms `RouteWarpKernel`
+  in the `V4Graph::Step` body (43 launches/step). **RE-PROFILE (nsys `--cuda-graph-trace=node`,
+  30-step kwin):** `RouteKernel` **5.9723 ms/step (138.89 µs/launch, 4.7% GPU-active)** →
+  `RouteWarpKernel` **0.3779 ms/step (8.79 µs/launch, 0.5%)** = **−5.59 ms/step, 15.8×**.
+- **GATE B (bit-exact, RED-first):** `test_cuda_deepseek_v4` **20/20·67072** (new A/B case:
+  warp == single-thread BYTE-IDENTICAL ids AND weights across E=256/topk=6, E=8/topk=3,
+  E=33/topk=5, learned + hash modes; a `best_prob→best_score` perturbation goes RED with 3
+  weight-memcmp fails). `test_cuda_quant_dot` 4/4·106081, `test_deepseek_v4_gguf_load`
+  15/15·931. Real model: warp-ON and legacy-OFF both emit the golden `11111 16 455 6102 294
+  8760 344 …` (TOKEN-EXACT).
+- **HONEST realized-vs-projected.** The study projected route 6.5 ms → <0.5 ms, +1.3 tok/s.
+  The GPU-work magnitude was ACCURATE this time (route really was ~6 ms, ~92% addressable —
+  unlike Lever 1's mis-scoped 9.1 ms). −5.59 ms of the ~81.6 ms/step (arm-1-state) = −6.9%
+  GPU-active → **GPU-active-bound projection ~+0.7–0.8 tok/s (11.92 → ~12.7)**; realized-partial
+  because the route LAUNCH count (43/step host tax) is unchanged. **Wall-clock decode tok/s
+  NOT cleanly resolvable this session** — no `sudo` to `drop_caches`, so the churned box's
+  page-cache/host-paging variance (reps drifted by run ORDER: 11.02→8.82→7.70 and
+  8.53→9.76→12.65, not by kernel) swamps the ~0.7 tok/s GPU-level delta. The nsys GPU-active
+  route-share (compute-only glue, immune to paging) is the reliable evidence and is a real,
+  bit-exact, default-on win. Branch `ds4-lever3-warp-topk`, NOT pushed.
+
 Disposition: **the wiring is CPU-gated at tiny synthetic shape; the real-model
 MTP-on==MTP-off + acceptance-rate + tokens/step + wall-clock speedup measurement
 is WEIGHT-BLOCKED and did NOT run (nothing faked).**

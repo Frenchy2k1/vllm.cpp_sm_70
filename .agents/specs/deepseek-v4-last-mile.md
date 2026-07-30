@@ -308,6 +308,43 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   Lever 1. Realized **+0.49 tok/s vs projected +2.3** (→13.5), ~1/5 of projection; the 11.41→16.5 ladder must be
   re-based (levers 2/3/4 re-measured before trusting 16.5). Lever 1 SHIPS default-on (bit-exact, real). Branch
   `ds4-lever1-preq-quant` (Step 0 + Lever 1 commits), NOT pushed.
+- **Brick 10 — ds4-gap Lever 3 (route → warp-parallel top-k) — IMPLEMENTED + DGX-GATED, BIT-EXACT, route GPU
+  work −5.59 ms/step (15.8×); GPU-active-attributed, wall-clock UNRESOLVABLE this session (churned box).** Base
+  `baff8a28` (Lever 1 shipped). The single-thread `RouteKernel` (`cuda_deepseek_v4.cu:570`) does the E=256/topk=6
+  expert top-k SINGLE-THREADED at T=1 decode (one thread per token scans 256 experts × 6 selections + `used[]`).
+  New `RouteWarpKernel` structure-ports ds4's `router_select_warp_topk_kernel` (`ds4_cuda.cu:10113`): ONE WARP
+  (32 lanes) per token, each lane owns experts `e=lane+j*32` (j<8 ⇒ E≤256); per-lane argmax under
+  `RouteScoreBetter` (strict `>`, tie-break LOWER expert index) → butterfly `__shfl_xor` warp-reduce → mask the
+  winner and repeat topk times. **BIT-IDENTICAL to the single-thread kernel** — the selection is an argmax under a
+  strict TOTAL order (value, then unique index) so the tree-reduction order is irrelevant to the winner, the
+  unbiased weight is `SqrtSoftplusDev(g[e])` (same input, same fn ⇒ same bits), and the renorm
+  (`fmaxf(sum,1e-20)`; `/denom`; `*scale`) runs the SAME float ops in the SAME j-order on lane 0. Kept OUR exact
+  arithmetic (did NOT copy ds4's `6.1e-5`/`1.5` renorm). Guarded `VT_V4_ROUTE_WARP_TOPK` (default-ON, `=0` legacy
+  for A/B; allowlisted), wired through the shared `RouteDispatch` in BOTH `RouteLaunch` (eager) AND
+  `RouteInPlaceLaunch` (captured `V4Graph::Step`) — nsys confirms `RouteWarpKernel` in the graph body (43
+  launches/step, Brick-7 split-path closed). Falls back to `RouteKernel` outside the structural gate (E>256 or
+  topk>32). **GATE B (bit-exact, RED-first):** new A/B unit case `test_cuda_deepseek_v4` **20/20·67072** (warp ==
+  single-thread BYTE-IDENTICAL ids AND weights over DS4-realistic E=256/topk=6 + E=8/topk=3 + non-32-multiple
+  E=33/topk=5, learned + hash modes; a deliberate `best_prob→best_score` perturbation goes RED with 3
+  weight-memcmp failures — proof the memcmp is load-bearing); `test_cuda_quant_dot` 4/4·106081,
+  `test_deepseek_v4_gguf_load` 15/15·931. Real 80.7 GB model `--gpu --kv-cache VT_V4_RESIDENT_DECODE=1
+  VT_V4_DECODE_GRAPH=1`: warp-ON and legacy-OFF both emit the golden `11111 16 455 6102 294 8760 344 …`
+  (TOKEN-EXACT, not near-tie). **RE-PROFILE (nsys `--cuda-graph-trace=node`, 30-step kwin, GB10, worker down,
+  flock, page cache evicted):** `RouteKernel` **5.9723 ms/step (138.89 µs/launch, 4.7% GPU-active)** →
+  `RouteWarpKernel` **0.3779 ms/step (8.79 µs/launch, 0.5%)** = **−5.59 ms/step, 15.8×**. **HONEST realized-vs-
+  projected:** the study projected route 6.5 ms → <0.5 ms — this time the study's magnitude was ACCURATE (route
+  really was ~6 ms and ~92% of it is addressable, unlike Lever 1's mis-scoped 9.1 ms). GPU-work delta −5.59 ms of
+  the ~81.6 ms/step (arm-1-state, legacy-route added back) = **−6.9% GPU-active → GPU-active-bound projection
+  ~+0.7–0.8 tok/s (11.92 → ~12.7)**; realized-partial because the route LAUNCH count (43/step host tax) is
+  unchanged. **Wall-clock decode tok/s NOT cleanly resolvable this session:** no `sudo` to `drop_caches`, so the
+  churned box's page-cache/host-paging variance (arm reps drifted 11.02→8.82→7.70 and 8.53→9.76→12.65 by run
+  ORDER, not kernel) swamps the ~0.7 tok/s GPU-level delta; the nsys GPU-active route-share (compute-only glue,
+  immune to paging) is the reliable evidence. Lever 3 SHIPS default-on (bit-exact, real GPU-work win). Branch
+  `ds4-lever3-warp-topk`, NOT pushed. **Re-based ladder view:** L1 (shipped, +0.49) + L3 (route −5.59 ms GPU work,
+  ~+0.7 GPU-bound) bank the two independent glue wins; the dominant residual is `QuantDotGemmQ8_0Kernel` (41 ms,
+  33–54% of step — Lever 2 sub-warp GEMV tiling, the speculative bet) + `QuantDotGemmGroupedFusedSwiGLU`/`Grouped`
+  (the routed-expert GEMMs) + `MhcPreFinishKernel`/`QuantizeQ8K`/`NormRopeRows` glue (Lever 4). 16.5 stays
+  top-of-band and rides on Lever 2 landing on the short-K projections.
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +
