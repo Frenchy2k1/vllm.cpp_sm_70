@@ -106,11 +106,25 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   target and 16.5 as the stretch**; the ~28 tok/s hard ceiling is out of reach on this quant mix. fp8 KV
   does NOT move the short-context number (it's a parity/long-context lever).
 
-## 4. Bricks (to be finalized after the source research)
+## 4. Bricks
 - **Brick 0 — this profile (DONE, profile-only).**
-- **Brick 1 — the top lever** (TBD by the coordinator's synthesis; the measurement points at the grouped-MoE
-  dequant as the biggest gap, mmvq.cu-grounded). Implement + gate (token-identical / characterized near-tie,
-  RED-first) + re-profile + re-benchmark vs host/ds4; STOP for review.
+- **Brick 1 — __dp4a vectorized-dequant matvec for the grouped kernels (DONE + DGX-gated, commit `c1f92d24`).**
+  Ported llama.cpp `mmvq.cu`/`vecdotq.cuh`'s SIMD dequant into `DotIQ2XXS` (`vecdotq.cuh:920-928` + ds4
+  `dev_iq2_dp4a_8`) + `DotQ2K` (`vecdotq.cuh:329-354` + ds4 `dev_dot_q2_16`), keeping our warp-per-output +
+  Q8_K activation. **BIT-IDENTICAL** integer core (`__dp4a` = exact int32); the `test_cuda_quant_dot` nmse≤1e-6
+  gate CAUGHT a signed-overflow UB in the sign broadcast (`(int)uint8 * 0x01010101` overflows for signs≥128) —
+  RED-first worked; fixed to `unsigned`, then **2/2·105601, nmse≤1e-6 zero drift**. Real model resident-default
+  TOKEN-IDENTICAL "…Paris.". **SPLIT RESULT (honest):**
+  - **Q2_K grouped: 2.35× (median 265→104 µs; 24% → 56% of BW peak — the MAC WAS the bottleneck; now
+    memory-bound). 10.0% → 4.4% of the step.**
+  - **IQ2_XXS grouped: FLAT (median 269→265 µs, ~17-19% of peak).** GROUNDED root cause: `d_iq2xxs_grid[256]`
+    is `__device__ __constant__`, and our warp-per-output has each of the 32 lanes look up a DIFFERENT grid
+    index → **divergent constant-memory reads are 32-way serialized per warp** = the bottleneck, NOT the MAC.
+    So dp4a (which only vectorized the already-cheap inner MAC) does not help IQ2.
+  - Decode **8.01 → 8.51 tok/s (+6%, 4 stable warm runs)** vs ds4 16.5.
+- **Brick 1b (NEW, from the Brick 1 finding) — IQ2_XXS grid-lookup fix (the bigger grouped kernel, 20-23% of
+  the step, grid-serialization-bound).** Move `d_iq2xxs_grid` out of `__constant__` to GLOBAL (L2-cached,
+  divergent access parallelized), or mirror mmvq.cu's grid handling. This is where the IQ2 win is.
 - **Brick 2 — activation-quant fusion.** **Brick 3 — Q8_0 coalescing.** **Brick 4 — fp8 KV (parity/long-ctx,
   measured at 256+).** Each rollback-able (new path default-safe; the current resident default stays correct).
 

@@ -201,6 +201,14 @@ __global__ void QuantizeQ8KKernel(BlockQ8_K* __restrict__ scratch,
 // ---------------------------------------------------------------------------
 
 // cpu_quant_dot.cpp VecDotIQ2_XXSQ8_K (quants.c:855) — one super-block.
+// Brick 1 (last-mile): __dp4a vectorized-dequant matvec, ported from llama.cpp
+// ggml-cuda/vecdotq.cuh:920-928 (`vec_dot_iq2_xxs_q8_1`) + ds4 `dev_iq2_dp4a_8`
+// (ds4_cuda.cu:16147). The per-element `g*q8[j]*sign` branch → SIMD sign-apply
+// (__vcmpne4/__vsub4) + `__dp4a` (4 int8 products/instr). BIT-IDENTICAL integer core:
+// __dp4a is an EXACT int32 accumulation of int8 products (order-independent), the
+// grid bytes are ≤~43 so ±g fits int8, and d_kmask_iq2xs[j]==1<<j so the packed
+// sign masks 0x08040201 / 0x80402010 select the same per-byte sign as the scalar.
+// The per-block ls fold + final *0.125 (after the warp reduction) are unchanged.
 __device__ inline float DotIQ2XXS(const BlockIQ2_XXS* xb, const BlockQ8_K* yb) {
   const float d = DF16ToF32(xb->d) * yb->d;
   const uint16_t* qs = xb->qs;
@@ -214,12 +222,18 @@ __device__ inline float DotIQ2XXS(const BlockIQ2_XXS* xb, const BlockQ8_K* yb) {
     const uint32_t ls = 2 * (a1 >> 28) + 1;
     int32_t sumi = 0;
     for (int l = 0; l < 4; ++l) {
-      const uint64_t grid = d_iq2xxs_grid[(a0 >> (8 * l)) & 0xff];
-      const uint8_t signs = d_ksigns_iq2xs[(a1 >> (7 * l)) & 127];
-      for (int j = 0; j < 8; ++j) {
-        const int g = static_cast<int>((grid >> (8 * j)) & 0xff);
-        sumi += g * q8[j] * ((signs & d_kmask_iq2xs[j]) ? -1 : 1);
-      }
+      const uint32_t* grid =
+          reinterpret_cast<const uint32_t*>(&d_iq2xxs_grid[(a0 >> (8 * l)) & 0xff]);
+      // Broadcast the 8-bit sign pattern to 4 bytes (UNSIGNED — signed *0x01010101
+      // overflows int for signs≥128 = UB), then per-byte 0xff mask where bit b/b+4 set.
+      const unsigned sbc =
+          static_cast<unsigned>(d_ksigns_iq2xs[(a1 >> (7 * l)) & 127]) * 0x01010101u;
+      const int slo = __vcmpne4(static_cast<int>(sbc & 0x08040201u), 0);  // bytes 0-3
+      const int shi = __vcmpne4(static_cast<int>(sbc & 0x80402010u), 0);  // bytes 4-7
+      const int glo = __vsub4(static_cast<int>(grid[0]) ^ slo, slo);  // ±grid bytes 0-3
+      const int ghi = __vsub4(static_cast<int>(grid[1]) ^ shi, shi);  // ±grid bytes 4-7
+      sumi = __dp4a(glo, *reinterpret_cast<const int*>(q8 + 0), sumi);
+      sumi = __dp4a(ghi, *reinterpret_cast<const int*>(q8 + 4), sumi);
       q8 += 8;
     }
     bsum += sumi * static_cast<int32_t>(ls);
@@ -259,6 +273,13 @@ __device__ inline float DotIQ3XXS(const BlockIQ3_XXS* xb, const BlockQ8_K* yb) {
 }
 
 // cpu_quant_dot.cpp VecDotQ2_KQ8_K (quants.c:514) — one super-block.
+// Brick 1 (last-mile): __dp4a vectorized-dequant, ported from llama.cpp
+// ggml-cuda/vecdotq.cuh:329-354 (`vec_dot_q2_K_q8_1`) + ds4 `dev_dot_q2_16`
+// (ds4_cuda.cu:16158). The scalar per-element `q8 * ((q2>>shift)&3)` → `__dp4a`
+// on the 0x03030303-masked 2-bit packs. BIT-IDENTICAL: `(word>>shift)&0x03030303`
+// per byte == `(byte>>shift)&3` (the cross-byte bits land in bits 6-7, masked off),
+// __dp4a is exact int32; the summs (min) term + dall/dmin fold are unchanged. All
+// int reads are 4-aligned (Q2_K block=84 B ÷4, qs@16 ÷4; the Q8_K activation ÷4).
 __device__ inline float DotQ2K(const BlockQ2_K* xb, const BlockQ8_K* yb) {
   const uint8_t* q2 = xb->qs;
   const int8_t* q8 = yb->qs;
@@ -270,18 +291,21 @@ __device__ inline float DotQ2K(const BlockQ2_K* xb, const BlockQ8_K* yb) {
   int isum = 0;
   int is = 0;
   for (int k = 0; k < kQK_K / 128; ++k) {
+    const uint8_t* q2k = q2 + k * 32;
+    const int8_t* q8k = q8 + k * 128;
     int shift = 0;
     for (int j = 0; j < 4; ++j) {
-      int d = sc[is++] & 0xF;
-      int isuml = 0;
-      for (int l = 0; l < 16; ++l)
-        isuml += q8[k * 128 + j * 32 + l] * ((q2[k * 32 + l] >> shift) & 3);
-      isum += d * isuml;
-      d = sc[is++] & 0xF;
-      isuml = 0;
-      for (int l = 16; l < 32; ++l)
-        isuml += q8[k * 128 + j * 32 + l] * ((q2[k * 32 + l] >> shift) & 3);
-      isum += d * isuml;
+      int sl = 0, sh = 0;
+      for (int l = 0; l < 16; l += 4) {
+        const int v = (*reinterpret_cast<const int*>(q2k + l) >> shift) & 0x03030303;
+        sl = __dp4a(v, *reinterpret_cast<const int*>(q8k + j * 32 + l), sl);
+      }
+      isum += (sc[is++] & 0xF) * sl;
+      for (int l = 16; l < 32; l += 4) {
+        const int v = (*reinterpret_cast<const int*>(q2k + l) >> shift) & 0x03030303;
+        sh = __dp4a(v, *reinterpret_cast<const int*>(q8k + j * 32 + l), sh);
+      }
+      isum += (sc[is++] & 0xF) * sh;
       shift += 2;
     }
   }
