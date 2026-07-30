@@ -208,7 +208,8 @@ void MatmulBTQuantGrouped(Queue& q, Tensor& out, const Tensor& act,
   VT_CHECK(out.rank == 2 && act.rank == 2 && weight.rank == 2,
            "matmul_bt_quant_grouped: rank-2 out/act/weight required");
   const int64_t P = out.shape[0], N = out.shape[1], K = act.shape[1];
-  VT_CHECK(act.shape[0] == P, "matmul_bt_quant_grouped: act/out row count mismatch");
+  VT_CHECK(act.shape[0] == P || act.shape[0] == 1,
+           "matmul_bt_quant_grouped: act rows must be P (per-expert) or 1 (broadcast)");
   VT_CHECK(weight.shape[1] == K, "matmul_bt_quant_grouped: weight K mismatch (b is [E*N,K])");
   VT_CHECK(weight.shape[0] % N == 0,
            "matmul_bt_quant_grouped: weight rows must be a whole multiple of N");

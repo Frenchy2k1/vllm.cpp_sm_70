@@ -593,7 +593,8 @@ __global__ void QuantDotGemmGroupedKernel(OutT* __restrict__ out,
                                           const BlockQ8_K* __restrict__ act,
                                           const int32_t* __restrict__ expert_ids,
                                           int64_t P, int64_t n, int64_t nsb,
-                                          size_t w_row_bytes, size_t w_block_bytes) {
+                                          size_t w_row_bytes, size_t w_block_bytes,
+                                          bool bcast) {
   const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
   if (warp >= P * n) return;
   const int64_t p = warp / n;
@@ -602,7 +603,10 @@ __global__ void QuantDotGemmGroupedKernel(OutT* __restrict__ out,
 
   const int64_t e = expert_ids[p];
   const uint8_t* w_row = weight + static_cast<size_t>(e * n + j) * w_row_bytes;
-  const BlockQ8_K* a_row = act + p * nsb;
+  // Broadcast activation: the routed gate/up share ONE quantized hidden (all P
+  // experts see the SAME x), so a 1-row Q8_K feeds every p — bit-identical to the
+  // per-row path (identical input ⇒ identical Q8_K ⇒ identical integer dot).
+  const BlockQ8_K* a_row = act + (bcast ? 0 : p) * nsb;
 
   float partial = 0.0f;
   for (int64_t sb = lane; sb < nsb; sb += 32) {
@@ -699,7 +703,8 @@ __global__ void QuantDotGemmGroupedQ8_0Kernel(OutT* __restrict__ out,
                                               const uint8_t* __restrict__ weight,
                                               const BlockQ8_0* __restrict__ act,
                                               const int32_t* __restrict__ expert_ids, int64_t P,
-                                              int64_t n, int64_t nb, size_t w_row_bytes) {
+                                              int64_t n, int64_t nb, size_t w_row_bytes,
+                                              bool bcast) {
   const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
   if (warp >= P * n) return;
   const int64_t p = warp / n;
@@ -707,7 +712,7 @@ __global__ void QuantDotGemmGroupedQ8_0Kernel(OutT* __restrict__ out,
   const int lane = threadIdx.x;
   const int64_t e = expert_ids[p];
   const uint8_t* w_row = weight + static_cast<size_t>(e * n + j) * w_row_bytes;
-  const BlockQ8_0* a_row = act + p * nb;
+  const BlockQ8_0* a_row = act + (bcast ? 0 : p) * nb;
   float partial = 0.0f;
   for (int64_t b = lane; b < nb; b += 32) {
     const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(b) *
@@ -823,14 +828,16 @@ void MatmulQ8_0GroupedCuda(Tensor& out, const Tensor& act_t, const Tensor& weigh
   if (k % kQK8_0 != 0)
     throw std::runtime_error("vt cuda: matmul_bt_quant_grouped Q8_0: K must be a multiple of 32");
   const int64_t nb = k / kQK8_0;
+  const int64_t Pa = act_t.shape[0];  // broadcast when 1 row feeds P>1 experts (preq-reuse)
+  const bool bcast = (Pa == 1 && P > 1);
   const size_t w_row_bytes = static_cast<size_t>(nb) * sizeof(BlockQ8_0);
-  const size_t act_bytes = static_cast<size_t>(P) * static_cast<size_t>(nb) * sizeof(BlockQ8_0);
+  const size_t act_bytes = static_cast<size_t>(Pa) * static_cast<size_t>(nb) * sizeof(BlockQ8_0);
   BlockQ8_0* qact = static_cast<BlockQ8_0*>(EnsureScratch(act_bytes, s));
   {
     constexpr int kQBlock = 128;
-    const int64_t grid = (P * nb + kQBlock - 1) / kQBlock;
+    const int64_t grid = (Pa * nb + kQBlock - 1) / kQBlock;
     QuantizeQ8_0Kernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
-        qact, act_t.data, ActDtOf(act_t.dtype), act_t.stride[0], P, nb);
+        qact, act_t.data, ActDtOf(act_t.dtype), act_t.stride[0], Pa, nb);
   }
   constexpr int kWarpsPerBlock = 4;
   dim3 block(32, kWarpsPerBlock);
@@ -839,10 +846,10 @@ void MatmulQ8_0GroupedCuda(Tensor& out, const Tensor& act_t, const Tensor& weigh
   const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
   if (out.dtype == DType::kF32)
     QuantDotGemmGroupedQ8_0Kernel<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
-        static_cast<float*>(out.data), w, qact, eids, P, n, nb, w_row_bytes);
+        static_cast<float*>(out.data), w, qact, eids, P, n, nb, w_row_bytes, bcast);
   else
     QuantDotGemmGroupedQ8_0Kernel<uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
-        static_cast<uint16_t*>(out.data), w, qact, eids, P, n, nb, w_row_bytes);
+        static_cast<uint16_t*>(out.data), w, qact, eids, P, n, nb, w_row_bytes, bcast);
   CheckCuda(cudaGetLastError(), "matmul_bt_quant_grouped Q8_0 launch");
 }
 
@@ -920,7 +927,7 @@ void MatmulBTQuantKernelCuda(Queue& q, Tensor& out, const Tensor& a,
 template <WType W>
 void LaunchGroupedGemm(Tensor& out, const uint8_t* weight, const BlockQ8_K* act,
                        const int32_t* expert_ids, int64_t P, int64_t n, int64_t nsb,
-                       size_t w_row_bytes, size_t w_block_bytes, cudaStream_t s) {
+                       size_t w_row_bytes, size_t w_block_bytes, bool bcast, cudaStream_t s) {
   constexpr int kWarpsPerBlock = 4;
   dim3 block(32, kWarpsPerBlock);
   const int64_t warps = P * n;
@@ -928,11 +935,11 @@ void LaunchGroupedGemm(Tensor& out, const uint8_t* weight, const BlockQ8_K* act,
   if (out.dtype == DType::kF32) {
     QuantDotGemmGroupedKernel<W, float><<<static_cast<unsigned>(grid), block, 0, s>>>(
         static_cast<float*>(out.data), weight, act, expert_ids, P, n, nsb, w_row_bytes,
-        w_block_bytes);
+        w_block_bytes, bcast);
   } else {
     QuantDotGemmGroupedKernel<W, uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
         static_cast<uint16_t*>(out.data), weight, act, expert_ids, P, n, nsb, w_row_bytes,
-        w_block_bytes);
+        w_block_bytes, bcast);
   }
 }
 
@@ -970,30 +977,37 @@ void MatmulBTQuantGroupedKernelCuda(Queue& q, Tensor& out, const Tensor& act,
   const size_t w_block_bytes = static_cast<size_t>(BlockBytes(weight.dtype));
   const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
 
-  // Quantize the P activation rows to Q8_K (per-stream grow-only scratch).
-  const size_t act_bytes = static_cast<size_t>(P) * static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
+  // Broadcast activation (preq-reuse): when act has ONE row but P>1 outputs, the
+  // routed experts all share the SAME hidden — quantize it ONCE and let every p read
+  // Q8_K row 0. Eliminates the topk-fold redundant re-quant (was the bulk of the
+  // QuantizeQ8K time) and the caller's xrep copy. Bit-identical (§Brick 2).
+  const int64_t Pa = act.shape[0];
+  const bool bcast = (Pa == 1 && P > 1);
+
+  // Quantize the Pa activation rows to Q8_K (per-stream grow-only scratch).
+  const size_t act_bytes = static_cast<size_t>(Pa) * static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
   BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureScratch(act_bytes, s));
   ActDT adt = act.dtype == DType::kF32 ? ActDT::kF32
               : act.dtype == DType::kF16 ? ActDT::kF16
                                          : ActDT::kBF16;
   {
     constexpr int kQBlock = 128;
-    const int64_t total_sb = P * nsb;
+    const int64_t total_sb = Pa * nsb;
     const int64_t grid = (total_sb + kQBlock - 1) / kQBlock;
     QuantizeQ8KKernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
-        qact, act.data, adt, act.stride[0], P, nsb);
+        qact, act.data, adt, act.stride[0], Pa, nsb);
   }
 
   const uint8_t* wt = static_cast<const uint8_t*>(weight.data);
   const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
   switch (w) {
-    case WType::kIQ2_XXS: LaunchGroupedGemm<WType::kIQ2_XXS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
-    case WType::kIQ3_XXS: LaunchGroupedGemm<WType::kIQ3_XXS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
-    case WType::kQ2_K: LaunchGroupedGemm<WType::kQ2_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
-    case WType::kQ3_K: LaunchGroupedGemm<WType::kQ3_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
-    case WType::kQ4_K: LaunchGroupedGemm<WType::kQ4_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
-    case WType::kQ5_K: LaunchGroupedGemm<WType::kQ5_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
-    case WType::kQ6_K: LaunchGroupedGemm<WType::kQ6_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kIQ2_XXS: LaunchGroupedGemm<WType::kIQ2_XXS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kIQ3_XXS: LaunchGroupedGemm<WType::kIQ3_XXS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kQ2_K: LaunchGroupedGemm<WType::kQ2_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kQ3_K: LaunchGroupedGemm<WType::kQ3_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kQ4_K: LaunchGroupedGemm<WType::kQ4_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kQ5_K: LaunchGroupedGemm<WType::kQ5_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kQ6_K: LaunchGroupedGemm<WType::kQ6_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
   }
   CheckCuda(cudaGetLastError(), "matmul_bt_quant_grouped launch");
 }

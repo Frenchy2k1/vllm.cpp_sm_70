@@ -131,10 +131,24 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   240 GB/s peak — now memory-bound-ish like Q2_K 56% / Q8_0 63%; its share fell 22.8% → 10.0% of the step).
   Decode 8.51 → 9.58 tok/s (+12.5%, 5 stable warm runs) vs ds4 16.5** (host `=0` 7.63 → 8.47, shares the GEMM).
   The grouped-MoE dequant lever (Bricks 1+1b) is DONE: both grouped kernels now memory-bound (IQ2 46%, Q2_K 56%).
-- **Brick 2 — activation-quant fusion** (now the biggest non-Q8_0 lever: `QuantizeQ8K` 9.8% + `QuantizeQ8_0`
-  4.5% = ~14% launch-bound, ~795 tiny launches/step). **Brick 3 — Q8_0 coalescing** (43% of step at 63% of
-  peak). **Brick 4 — fp8 KV (parity/long-ctx,
-  measured at 256+).** Each rollback-able (new path default-safe; the current resident default stays correct).
+- **Brick 2 — routed gate/up activation preq-reuse / broadcast (DONE + DGX-gated, commit `99d2b282`→amended).**
+  The resident-decode routed experts fed `xrep` (topk-identical copies of the shared hidden x) into the gate + up
+  grouped GEMMs, re-quantizing an IDENTICAL row per expert per GEMM. Mirrors ds4's preq pattern (quantize the
+  shared activation ONCE, broadcast across the P experts). The grouped providers (`cuda_quant_dot.cu`, Q8_K + Q8_0)
+  detect a 1-row activation (`act.shape[0]==1 && P>1`) → quantize ONE row, kernels read block-set 0 for all p
+  (`bcast`); `ops.cpp` accepts act rows == P or 1; CPU grouped ref broadcast-aware; the resident forward (eager +
+  graph) passes x with `act_rows=1`, dropping the xrep buffer + the per-layer topk `AsyncCopyF`. BIT-IDENTICAL
+  (identical input → identical block-quant → identical integer dot; `test_cuda_quant_dot` **2/2·105601 nmse≤1e-6**;
+  `test_cuda_deepseek_v4` 18/18·34176; `test_deepseek_v4_gguf_load` **13/13·631** incl. a new broadcast==replicated
+  BYTE-IDENTICAL + RED-first case; real 80.7 GB model resident-default TOKEN-IDENTICAL "…Paris.", ids byte-equal to
+  host `=0`). **RESULT (nsys re-profile, 50 tok): `QuantizeQ8K` 9.8% → 7.3%, `QuantizeQ8_0` 4.5% → 4.7% (bucket
+  ~14.3% → ~12.0%). Decode 9.58 → 10.02 tok/s (+4.6%, 6 stable warm runs 9.99–10.04)** (host `=0` 8.47 → 8.50) vs
+  ds4 16.5 (now ~61% of ds4; campaign-cumulative host 6.44 → 10.02 = +56%). HONEST: the quant bucket is
+  **LAUNCH-bound** (fixed per-launch overhead dominates — reducing per-launch rows 6→1 barely cuts it), so the
+  bucket-% fell modestly; the +4.6% comes mostly from eliminating the 6×/layer xrep host-copies. The remaining
+  quant lever is LAUNCH-COUNT reduction: fuse the quant INTO the GEMM, or dedup gate+up into ONE quantize.
+- **Brick 3 — Q8_0 coalescing** (now **45%** of step at 63% of peak — the dominant lever). **Brick 4 — fp8 KV
+  (parity/long-ctx, measured at 256+).** Each rollback-able (new path default-safe; the resident default stays correct).
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmKernel<W>` +

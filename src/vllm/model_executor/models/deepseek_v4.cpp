@@ -1182,12 +1182,17 @@ void GemmRowSliceInto(const V4Backend& be, const OwnedTensor& w, const float* x,
 // Grouped keep-quant expert GEMM into `out`, NO sync. `eids` (i32) is a unified
 // buffer the device kernel consumes on-stream (the resident routing — no host
 // gather). Mirrors GemmGroupedExpertsKq without the drain.
+// `act_rows` is the number of rows in `act`: P (one per expert) OR 1 (a shared hidden
+// BROADCAST across all P experts — the routed gate/up preq-reuse: quantize x ONCE, feed
+// every expert; the provider quantizes a single row and reads it for all p). Bit-exact.
 void GemmGroupedInto(const V4Backend& be, const OwnedTensor& weight, const float* act,
-                     const int32_t* eids, int64_t P, int64_t N, int64_t K, float* out) {
+                     const int32_t* eids, int64_t P, int64_t N, int64_t K, float* out,
+                     int64_t act_rows = -1) {
   VT_CHECK(be.q != nullptr && !weight.repacked && vt::IsBlockQuant(weight.dtype),
            "resident grouped expert GEMM: needs a non-repacked block-quant stacked weight");
+  const int64_t Pa = act_rows > 0 ? act_rows : P;
   vt::Queue& gq = *be.q;
-  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(act), vt::DType::kF32, gq.device, {P, K});
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(act), vt::DType::kF32, gq.device, {Pa, K});
   vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, gq.device, {P, N});
   vt::Tensor eid =
       vt::Tensor::Contiguous(const_cast<int32_t*>(eids), vt::DType::kI32, gq.device, {P});
@@ -1249,7 +1254,6 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
   std::vector<int32_t> eids(static_cast<size_t>(topk));
   std::vector<int64_t> in_tokens{static_cast<int64_t>(tok)};
   std::vector<float> weights(static_cast<size_t>(1 + topk));  // [0]=shared(1), [1..]=routed
-  std::vector<float> xrep(static_cast<size_t>(topk * H));
   std::vector<float> gate_up_s(static_cast<size_t>(2 * mi)), act_s(static_cast<size_t>(mi));
   std::vector<float> gr(static_cast<size_t>(topk * mi)), ur(static_cast<size_t>(topk * mi));
   std::vector<float> gate_up_r(static_cast<size_t>(2 * mi));
@@ -1346,10 +1350,11 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
     GemmIntoKq(be, Lq.shared_up, x.data(), gate_up_s.data() + mi, 1, mi, H);
     MOE->clamped_swiglu_ip(*be.q, act_s.data(), gate_up_s.data(), mi, lim, 1.0f, 0.0f);
     GemmIntoKq(be, Lq.shared_down, act_s.data(), eo.data(), 1, H, mi);
-    // routed experts (grouped, eids resident): gate/up over topk copies of x, swiglu, down.
-    for (int64_t j = 0; j < topk; ++j) AsyncCopyF(be, xrep.data() + j * H, x.data(), H);
-    GemmGroupedInto(be, Lq.moe_gate_exps, xrep.data(), eids.data(), topk, mi, H, gr.data());
-    GemmGroupedInto(be, Lq.moe_up_exps, xrep.data(), eids.data(), topk, mi, H, ur.data());
+    // routed experts (grouped, eids resident): gate/up read the SHARED hidden x
+    // (act_rows=1 ⇒ quantize x ONCE, broadcast across the topk experts — no xrep copy,
+    // no per-expert re-quant of an identical row), swiglu, down.
+    GemmGroupedInto(be, Lq.moe_gate_exps, x.data(), eids.data(), topk, mi, H, gr.data(), /*act_rows=*/1);
+    GemmGroupedInto(be, Lq.moe_up_exps, x.data(), eids.data(), topk, mi, H, ur.data(), /*act_rows=*/1);
     for (int64_t j = 0; j < topk; ++j) {
       AsyncCopyF(be, gate_up_r.data(), gr.data() + j * mi, mi);        // gate half
       AsyncCopyF(be, gate_up_r.data() + mi, ur.data() + j * mi, mi);   // up half
@@ -1402,7 +1407,7 @@ struct V4Graph {
   float eps, hc_eps, lim, scale;
   // persistent unified scratch (allocated once; never resized → stable addresses).
   std::vector<float> x, resA, resB, post_mix, res_mix, pre_mix, mix_scratch, qa, qact, kraw, o, z,
-      gating, weights, xrep, gate_up_s, act_s, gr, ur, gate_up_r, adown, eo, hbuf, logits;
+      gating, weights, gate_up_s, act_s, gr, ur, gate_up_r, adown, eo, hbuf, logits;
   std::vector<int32_t> eids;
   std::vector<int64_t> in_tokens;
   std::vector<int> pos_buf, len_buf;                 // per-step inputs (device-read)
@@ -1439,7 +1444,6 @@ struct V4Graph {
     kraw.assign(static_cast<size_t>(hd), 0.0f); o.assign(static_cast<size_t>(nh * hd), 0.0f);
     z.assign(static_cast<size_t>(zdim), 0.0f); gating.assign(static_cast<size_t>(ne), 0.0f);
     weights.assign(static_cast<size_t>(1 + topk), 0.0f); weights[0] = 1.0f;  // shared weight (const)
-    xrep.assign(static_cast<size_t>(topk * H), 0.0f);
     gate_up_s.assign(static_cast<size_t>(2 * mi), 0.0f); act_s.assign(static_cast<size_t>(mi), 0.0f);
     gr.assign(static_cast<size_t>(topk * mi), 0.0f); ur.assign(static_cast<size_t>(topk * mi), 0.0f);
     gate_up_r.assign(static_cast<size_t>(2 * mi), 0.0f);
@@ -1535,9 +1539,9 @@ struct V4Graph {
       GemmIntoKq(be, Lq.shared_up, x.data(), gate_up_s.data() + mi, 1, mi, H);
       MOE->clamped_swiglu_ip(*be.q, act_s.data(), gate_up_s.data(), mi, lim, 1.0f, 0.0f);
       GemmIntoKq(be, Lq.shared_down, act_s.data(), eo.data(), 1, H, mi);
-      for (int64_t j = 0; j < topk; ++j) AsyncCopyF(be, xrep.data() + j * H, x.data(), H);
-      GemmGroupedInto(be, Lq.moe_gate_exps, xrep.data(), eids.data(), topk, mi, H, gr.data());
-      GemmGroupedInto(be, Lq.moe_up_exps, xrep.data(), eids.data(), topk, mi, H, ur.data());
+      // gate/up: broadcast the shared hidden x (act_rows=1 ⇒ quantize once, no xrep copy).
+      GemmGroupedInto(be, Lq.moe_gate_exps, x.data(), eids.data(), topk, mi, H, gr.data(), /*act_rows=*/1);
+      GemmGroupedInto(be, Lq.moe_up_exps, x.data(), eids.data(), topk, mi, H, ur.data(), /*act_rows=*/1);
       for (int64_t j = 0; j < topk; ++j) {
         AsyncCopyF(be, gate_up_r.data(), gr.data() + j * mi, mi);
         AsyncCopyF(be, gate_up_r.data() + mi, ur.data() + j * mi, mi);

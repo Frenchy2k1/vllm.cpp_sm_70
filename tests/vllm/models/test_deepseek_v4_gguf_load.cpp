@@ -24,6 +24,7 @@
 // the identical routing/residency/accounting path the i-quants take.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -636,6 +637,74 @@ TEST_CASE("MatmulBTQuantGrouped: grouped == per-expert loop (re-scoped Stage 2)"
   bool any_diff = false;
   for (size_t i = 0; i < og.size(); ++i)
     if (og2[i] != og[i]) any_diff = true;
+  CHECK(any_diff);
+}
+
+// Brick 2 (preq-reuse): the routed gate/up feed the SAME hidden to every expert. A
+// 1-row BROADCAST activation (quantize x once, read it for all P) MUST be BYTE-IDENTICAL
+// to the per-expert path over P physical copies of that row. RED-first: a genuinely
+// per-expert activation (rows differ) is NOT equal to the broadcast of row 0.
+TEST_CASE("MatmulBTQuantGrouped: 1-row broadcast == replicated activation") {
+  Dims d;
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  REQUIRE(w.has_gguf_weights);
+  const vllm::OwnedTensor& wexp = w.gguf.layers[0].moe_gate_exps;
+  const int64_t N = d.mi, K = d.H, E = wexp.shape[0] / d.mi;
+  REQUIRE(E >= 3);
+
+  const int P = 3;
+  std::vector<int32_t> eids = {2, 0, 1};
+  std::vector<float> x1(static_cast<size_t>(K));  // ONE shared hidden
+  for (size_t i = 0; i < x1.size(); ++i)
+    x1[i] = 0.013f * static_cast<float>((i * 5 + 1) % 17) - 0.1f;
+
+  // (A) broadcast: act = {1, K}, out = {P, N}.
+  std::vector<float> ob(static_cast<size_t>(P) * N);
+  {
+    std::vector<int32_t> ids = eids;
+    vt::Tensor a = vt::Tensor::Contiguous(x1.data(), vt::DType::kF32, q.device, {1, K});
+    vt::Tensor o = vt::Tensor::Contiguous(ob.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor eid = vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+    vt::Tensor wt = wexp.View();
+    vt::MatmulBTQuantGrouped(q, o, a, wt, eid);
+  }
+  // (B) replicated: act = {P, K} with every row a copy of x1.
+  std::vector<float> rep(static_cast<size_t>(P) * K);
+  for (int p = 0; p < P; ++p) std::copy(x1.begin(), x1.end(), rep.begin() + static_cast<size_t>(p) * K);
+  std::vector<float> orr(static_cast<size_t>(P) * N);
+  {
+    std::vector<int32_t> ids = eids;
+    vt::Tensor a = vt::Tensor::Contiguous(rep.data(), vt::DType::kF32, q.device, {P, K});
+    vt::Tensor o = vt::Tensor::Contiguous(orr.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor eid = vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+    vt::Tensor wt = wexp.View();
+    vt::MatmulBTQuantGrouped(q, o, a, wt, eid);
+  }
+  REQUIRE(ob.size() == orr.size());
+  for (size_t i = 0; i < ob.size(); ++i) CHECK(ob[i] == orr[i]);  // BYTE-IDENTICAL
+
+  // RED-first: distinct per-expert rows are NOT the broadcast of row 0.
+  std::vector<float> distinct(static_cast<size_t>(P) * K);
+  for (int p = 0; p < P; ++p)
+    for (int64_t kk = 0; kk < K; ++kk)
+      distinct[static_cast<size_t>(p) * K + kk] = x1[static_cast<size_t>(kk)] + 0.001f * (p + 1);
+  std::vector<float> od(static_cast<size_t>(P) * N);
+  {
+    std::vector<int32_t> ids = eids;
+    vt::Tensor a = vt::Tensor::Contiguous(distinct.data(), vt::DType::kF32, q.device, {P, K});
+    vt::Tensor o = vt::Tensor::Contiguous(od.data(), vt::DType::kF32, q.device, {P, N});
+    vt::Tensor eid = vt::Tensor::Contiguous(ids.data(), vt::DType::kI32, q.device, {P});
+    vt::Tensor wt = wexp.View();
+    vt::MatmulBTQuantGrouped(q, o, a, wt, eid);
+  }
+  bool any_diff = false;
+  for (size_t i = 0; i < ob.size(); ++i)
+    if (od[i] != ob[i]) any_diff = true;
   CHECK(any_diff);
 }
 

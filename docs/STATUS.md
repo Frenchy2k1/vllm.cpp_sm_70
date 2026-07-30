@@ -715,6 +715,23 @@ IQ2_XXS grouped 2.45× (median 265→108 µs; 19% → 46% of peak — now memory
 campaign-cumulative host 6.44 → 9.58 = +49%).** The grouped-MoE dequant lever (Bricks 1+1b) is DONE. NEXT:
 Brick 2 (activation-quant fusion, ~14% launch-bound) → Brick 3 (Q8_0 coalescing, 43% at 63% of peak). STOPPED
 for review. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Last-mile campaign — Brick 2: routed gate/up activation preq-reuse (broadcast) — bit-exact +4.6% (2026-07-30,
+base `67bb8d1c` after rebase, branch `deepseek-v4-last-mile`, commit `99d2b282`→amended, NOT pushed).** The
+resident-decode routed experts fed `xrep` — topk-identical copies of the shared hidden x — into the gate + up
+grouped GEMMs, re-quantizing an IDENTICAL row per expert (6× redundant) + a per-layer topk `AsyncCopyF`. FIX
+(ds4's preq pattern): the grouped providers (Q8_K + Q8_0) detect a 1-row activation (`act.shape[0]==1 && P>1`) →
+quantize ONE row, kernels read block-set 0 for all p (`bcast`); the resident forward (eager + graph) passes x
+with `act_rows=1`, dropping xrep. BIT-IDENTICAL (identical input → identical block-quant → identical dot):
+`test_cuda_quant_dot` **2/2·105601 nmse≤1e-6**; `test_cuda_deepseek_v4` 18/18·34176; `test_deepseek_v4_gguf_load`
+**13/13·631** (+1 broadcast==replicated BYTE-IDENTICAL + RED-first case); real 80.7 GB model resident-default
+TOKEN-IDENTICAL "…Paris." (ids byte-equal to host `=0`). **RESULT (nsys re-profile, 50 tok): `QuantizeQ8K`
+9.8%→7.3%, `QuantizeQ8_0` 4.5%→4.7% (bucket ~14.3%→~12.0%). Decode 9.58 → 10.02 tok/s (+4.6%, 6 stable warm runs
+9.99–10.04; nvidia-smi 92% util)** (host `=0` 8.47→8.50, MoE host path unchanged) vs ds4 16.5 (~61% of ds4;
+campaign-cumulative host 6.44 → 10.02 = +56%). HONEST: the quant bucket is LAUNCH-bound (fixed per-launch
+overhead dominates → cutting per-launch rows 6→1 barely moves the %); the +4.6% comes mostly from eliminating
+the 6×/layer xrep host-copies. Remaining quant lever = LAUNCH-COUNT reduction (fuse quant into GEMM / dedup
+gate+up). NEXT: Brick 3 (Q8_0 coalescing — now **45%** of step at 63% of peak, the dominant lever). STOPPED for
+review. Rollback `VT_V4_RESIDENT_DECODE=0`. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **W8-run (2): geometry FIXED — the forward now RUNS the real 158 B model end-to-end; generation still
 INCOHERENT (2026-07-29, base `fba56f9b`, NOT pushed).** The layer-2 hard-fail is fixed: the DSA
 compressor projects to `2*head_dim` (ds4 `coff=2`), not `head_dim`, so the real keep-quant run uses

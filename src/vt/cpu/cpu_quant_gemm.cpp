@@ -221,12 +221,13 @@ void MatmulBTQuantGroupedKernel(Queue& q, Tensor& out, const Tensor& act,
   const int64_t P = out.shape[0];
   const int64_t N = out.shape[1];
   const int64_t K = act.shape[1];
+  const bool bcast = (act.shape[0] == 1 && P > 1);  // broadcast a shared hidden across experts
   const size_t row_bytes = RowSizeBytes(weight.dtype, K);
   const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
   for (int64_t p = 0; p < P; ++p) {
     const int64_t e = eids[p];
     Tensor a_row = Tensor::Contiguous(
-        static_cast<float*>(act.data) + static_cast<size_t>(p) * act.stride[0],
+        static_cast<float*>(act.data) + static_cast<size_t>(bcast ? 0 : p) * act.stride[0],
         DType::kF32, act.device, {1, K});
     Tensor o_row = Tensor::Contiguous(
         static_cast<float*>(out.data) + static_cast<size_t>(p) * N, out.dtype, out.device,
