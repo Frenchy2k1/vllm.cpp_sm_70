@@ -1106,15 +1106,23 @@ void DumpAct(const char* name, const std::vector<float>& v) {
 // kernels IN PLACE, and routing stays resident (device router → i32 topk_ids that
 // the grouped expert GEMM consumes on-device; topk_weights that the combine kernel
 // consumes) — no host gather. The ONLY drain is before the host reads the [V] logits
-// for argmax (the step boundary). Behind `VT_V4_RESIDENT_DECODE=1` (default OFF); the
-// host path stays default. CUDA + keep-quant GGUF + dense-causal (no compressor/
+// for argmax (the step boundary). CUDA + keep-quant GGUF + dense-causal (no compressor/
 // indexer) + T==1 only — the decode benchmark path (§7 of the device-decode spec).
+//
+// DEFAULT ON (validated 2026-07-30): the device-resident decode is the fastest path on
+// GB10 (7.96 tok/s vs the host path's ~4.3-7.2, ~1.8× at 256-token context) and is
+// token-identical/characterized-coherent-near-tie to host across a 4-prompt × 256-token
+// validation (P0 token-identical; open-ended prompts diverge only at genuine near-tie
+// positions — bounded kernel noise can only flip host's ~tied top-2 — into coherent,
+// deterministic continuations). `VT_V4_RESIDENT_DECODE=0` is the rollback off-switch
+// (→ the host ForwardComposeImpl). The guard (CanRunResidentDecode) still falls back to
+// host for CPU / non-dense / T>1 / no-KV-cache, so those paths are UNCHANGED.
 namespace {
 
 inline bool ResidentDecodeEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_V4_RESIDENT_DECODE");
-    return e != nullptr && std::string(e) == "1";
+    return e == nullptr || std::string(e) != "0";  // default ON; `=0` rolls back to host
   }();
   return on;
 }
