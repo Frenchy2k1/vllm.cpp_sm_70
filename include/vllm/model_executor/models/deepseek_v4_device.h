@@ -147,6 +147,24 @@ struct DsaDeviceKernels {
                          int64_t n, int64_t off, int64_t r, const int* row_pos, double base,
                          double freq_scale, double ext_factor, int64_t n_ctx_orig, double beta_fast,
                          double beta_slow, bool inverse, bool has_w, bool do_norm, float eps);
+  // Brick 12 (ds4-gap "launch consolidation") — PAIRED Q8_0 decode GEMV: ONE launch
+  // computes out0=w0·act and out1=w1·act over the SAME activation (m==1), quantizing
+  // `act` to Q8_0 once. Halves the launch count for the two A-projections that share the
+  // layer hidden (MLA q_a+kv_a; shared-expert gate+up). BIT-IDENTICAL to two matmul_q8_0
+  // launches (same preq quant + 8×__dp4a dot + warp reduce). out0[1,n0]/out1[1,n1],
+  // act[1,K], w0[n0,K]/w1[n1,K] plain Q8_0 blocks — all on the queue device, no drain.
+  // Ports ds4 `matmul_q8_0_pair_preq_warp8_kernel` (ds4_cuda.cu:4485).
+  void (*matmul_q8_0_pair)(vt::Queue&, vt::Tensor& out0, vt::Tensor& out1, const vt::Tensor& act,
+                           const vt::Tensor& w0, const vt::Tensor& w1);
+  // Brick 12 (ds4-gap "row-split consolidation") — BLOCK-DIAGONAL grouped Q8_0 decode
+  // GEMV: consolidates the ng per-group output-LoRA `wo_a` GEMVs into ONE launch. `w` is
+  // the stacked [ng*rows_per_group, ipg] weight (row rr → group rr/rows_per_group); `act`
+  // is the full [1, ng*ipg] attention output, quantized ONCE (each group reads its
+  // block-aligned ipg-wide slice). BIT-IDENTICAL to the ng separate slice GEMVs. out
+  // [1, ng*rows_per_group] contiguous. Ports ds4 `grouped_q8_0_a_preq_warp8_kernel`
+  // (ds4_cuda.cu:5509).
+  void (*matmul_q8_0_olora_a)(vt::Queue&, vt::Tensor& out, const vt::Tensor& act,
+                              const vt::Tensor& w, int64_t n_groups);
 };
 
 // ── (3) Compressor family device kernels ──────────────────────────────────────

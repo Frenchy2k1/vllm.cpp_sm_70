@@ -210,6 +210,33 @@ re-opens the ladder.** Premise correction: the direct Q8_0 gap is **10.5 ms/step
 older whole-step-derived "19.8 ms". No code changed. See
 `.agents/specs/ds4-q8-kernel-profile-2026-07-30.md` + docs/BENCHMARKS.md.
 
+**DeepSeek-V4-Flash decode ds4-gap — Brick 12 (IMPL): Q8_0 LAUNCH CONSOLIDATION built —
+hits ds4's EXACT 259-launch structure BIT-EXACTLY, but the projected bandwidth win does
+NOT materialize; the "launch count/size → ds4's 90%" hypothesis is REFUTED** (2026-07-30,
+branch `ds4-q8-launch-consolidation` off `1ddcc42c`, GB10 sm_121a, `VT_V4_Q8_PAIR` default-ON,
+rollback `=0`, NOT pushed). Three bit-exact consolidations wired into BOTH the resident-decode
+`Step` and the captured `V4Graph` RunChain: **projection-pairing** (`QuantDotGemmQ8_0PairKernel`,
+port of ds4 `matmul_q8_0_pair_preq_warp8_kernel` `:4485`) fuses the two A-projections sharing the
+layer hidden — MLA `wq_a`+`wkv` and shared-expert `gate`+`up` — into one launch each (activation
+quantized once); **block-diagonal o-LoRA** (`QuantDotGemmQ8_0GroupDiagKernel`, ds4
+`grouped_q8_0_a_preq_warp8_kernel` `:5509`) collapses the ng=8 per-group `wo_a` GEMVs (344/step,
+53% of the 646) into ONE launch; the MHC-expand epilogue fold was DEFERRED. **MEASURED (nsys
+`cuda_gpu_kern_sum`, diff `(-n60 − -n4)/56`): launches/step 646 → 259 (EXACTLY ds4's 259: 130
+plain + 86 pair + 43 group-diag); the pair kernel is 37.3 µs/matmul-equiv, at/under ds4's 38.8.
+Q8_0 GPU-active/step 40.96 → 39.86 ms (−1.10, −2.7%); achieved BW 161 → 166 GB/s (67.1% → 69.0%
+of 240 — NOT the projected ~90%/30.4 ms); wall decode 12.24 → 12.27 tok/s (flat, within
+page-noise).** HONEST PARTIAL — the launch-count target is fully + bit-exactly met yet the
+DRAM-saturation time win is absent: under `VT_V4_DECODE_GRAPH=1` the 646 launches were ALREADY one
+`cudaGraphLaunch`, so collapsing graph nodes 646→259 removes host overhead the graph had eliminated
+and does not raise on-device BW. **ds4's 67%→90% advantage is therefore NOT launch consolidation**
+(this build reproduces ds4's launch structure and stays at 69%) — it must lie in ds4's fp16-dequant
+weight cache or L2 residency (counter-blocked). Token stream **byte-identical ON==OFF** (golden
+`11111 16 455 6102 294 8760 344 …`, 16/16). GATES (RED-first): new `test_cuda_quant_dot` A/B cases
+(pair==two-separate + group-diag==per-group-loop byte-identical) **7/7·106496**,
+`test_cuda_deepseek_v4` **20/20·67072**, `test_deepseek_v4_gguf_load` **15/15·931**. Bit-exact,
+ds4-faithful, DEFAULT-ON (marginal-positive, not a regression). NOT pushed. See
+`.agents/specs/deepseek-v4-last-mile.md` (Brick 12 IMPL) + docs/BENCHMARKS.md.
+
 **ngram** (method `ngram`, draft-FREE) proposes the next tokens by matching the
 sequence's own suffix n-gram, so it needs no draft model and works on any model;
 on the 27B it is token-exact vs vLLM's own `--speculative-config ngram` on

@@ -847,6 +847,112 @@ __global__ void QuantDotGemmQ8_0Kernel(OutT* __restrict__ out,
   }
 }
 
+// Brick 12 (ds4-gap "launch consolidation"): PAIRED Q8_0 GEMV. Computes TWO weight
+// matrices w0,w1 against the SAME pre-quantized activation `act` (m==1 decode) in ONE
+// launch — the port of ds4 `matmul_q8_0_pair_preq_warp8_kernel` (ds4_cuda.cu:4485).
+// One warp per output row `j`; the warp reads its activation block once and dp4a-dots
+// it against BOTH w0[j] and w1[j] (when j < the respective out-dim), amortizing the
+// activation load and — the measured lever — HALVING the launch count for the two
+// A-projections that share the layer hidden (MLA q_a+kv_a; shared-expert gate+up).
+// BIT-IDENTICAL to two QuantDotGemmQ8_0Kernel launches: each output's integer __dp4a
+// order is UNCHANGED (same GetIntB2 8×dp4a over the same blocks), the 32-wide warp
+// reduce is UNCHANGED, and the f16-scale fold is UNCHANGED — only co-scheduled.
+template <typename OutT>
+__global__ void QuantDotGemmQ8_0PairKernel(OutT* __restrict__ out0, OutT* __restrict__ out1,
+                                           const uint8_t* __restrict__ w0,
+                                           const uint8_t* __restrict__ w1,
+                                           const BlockQ8_0* __restrict__ act, int64_t n0,
+                                           int64_t n1, int64_t nb, size_t w0_row_bytes,
+                                           size_t w1_row_bytes) {
+  const int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  const int64_t nmax = n0 > n1 ? n0 : n1;
+  if (j >= nmax) return;
+  const int lane = threadIdx.x;
+  const bool has0 = j < n0;
+  const bool has1 = j < n1;
+  const uint8_t* w0_row = has0 ? w0 + static_cast<size_t>(j) * w0_row_bytes : nullptr;
+  const uint8_t* w1_row = has1 ? w1 + static_cast<size_t>(j) * w1_row_bytes : nullptr;
+  const BlockQ8_0* a_row = act;  // m == 1: single shared activation row
+  float p0 = 0.0f;
+  float p1 = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    const BlockQ8_0* ab = a_row + b;
+    const float ad = DF16ToF32(ab->d);
+    if (has0) {
+      const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w0_row + static_cast<size_t>(b) *
+                                                                            sizeof(BlockQ8_0));
+      int sumi = 0;
+#pragma unroll
+      for (int k = 0; k < kQK8_0 / 4; ++k) sumi = __dp4a(GetIntB2(wb->qs, k), GetIntB2(ab->qs, k), sumi);
+      p0 += sumi * (DF16ToF32(wb->d) * ad);
+    }
+    if (has1) {
+      const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w1_row + static_cast<size_t>(b) *
+                                                                            sizeof(BlockQ8_0));
+      int sumi = 0;
+#pragma unroll
+      for (int k = 0; k < kQK8_0 / 4; ++k) sumi = __dp4a(GetIntB2(wb->qs, k), GetIntB2(ab->qs, k), sumi);
+      p1 += sumi * (DF16ToF32(wb->d) * ad);
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    p0 += __shfl_down_sync(0xffffffffu, p0, off);
+    p1 += __shfl_down_sync(0xffffffffu, p1, off);
+  }
+  if (lane == 0) {
+    if (has0) {
+      if constexpr (sizeof(OutT) == 4) out0[j] = p0;
+      else out0[j] = DF32ToBF16(p0);
+    }
+    if (has1) {
+      if constexpr (sizeof(OutT) == 4) out1[j] = p1;
+      else out1[j] = DF32ToBF16(p1);
+    }
+  }
+}
+
+// Brick 12 (ds4-gap "row-split consolidation"): BLOCK-DIAGONAL grouped Q8_0 GEMV — the
+// resident grouped OUTPUT-LoRA `wo_a` (o_proj.py:58-73). The host path launches ONE
+// GEMV per group (ng=8 → 344 launches/step, 53% of the 646), each over a DISJOINT
+// ipg-wide slice of the attention output against the group's olr weight rows. This
+// kernel does all ng groups in ONE launch: output row `rr` (0..ng*rpg) belongs to group
+// gp=rr/rpg and dots weight row `rr` (nb_g=ipg/32 blocks) against the activation blocks
+// [gp*nb_g, (gp+1)*nb_g) of the ONCE-quantized full [nh*hd] activation. BIT-IDENTICAL to
+// the ng separate GemmRowSliceInto launches: since ipg is a multiple of 32, each group's
+// slice is a whole set of 32-blocks whose per-block amax/quant is byte-identical whether
+// quantized as a slice or as part of the full row; the per-row __dp4a + warp reduce +
+// scale fold are the plain-kernel math with a group base offset. Mirrors ds4
+// `grouped_q8_0_a_preq_warp8_kernel` (ds4_cuda.cu:5509).
+template <typename OutT>
+__global__ void QuantDotGemmQ8_0GroupDiagKernel(OutT* __restrict__ out,
+                                                const uint8_t* __restrict__ weight,
+                                                const BlockQ8_0* __restrict__ act, int64_t rpg,
+                                                int64_t ng, int64_t nb_g, size_t w_row_bytes) {
+  const int64_t rr = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (rr >= ng * rpg) return;
+  const int64_t gp = rr / rpg;
+  const int lane = threadIdx.x;
+  const uint8_t* w_row = weight + static_cast<size_t>(rr) * w_row_bytes;
+  const BlockQ8_0* a_row = act + gp * nb_g;  // this group's activation slice (block-aligned)
+  float partial = 0.0f;
+  for (int64_t b = lane; b < nb_g; b += 32) {
+    const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(b) *
+                                                                          sizeof(BlockQ8_0));
+    const BlockQ8_0* ab = a_row + b;
+    int sumi = 0;
+#pragma unroll
+    for (int k = 0; k < kQK8_0 / 4; ++k) sumi = __dp4a(GetIntB2(wb->qs, k), GetIntB2(ab->qs, k), sumi);
+    partial += sumi * (DF16ToF32(wb->d) * DF16ToF32(ab->d));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffu, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[rr] = partial;
+    else out[rr] = DF32ToBF16(partial);
+  }
+}
+
 // Lever 2 / Brick 11 (ds4-gap): sub-warp Q8_0 GEMV. The plain kernel above maps ONE
 // full 32-lane warp to each output. For SHORT-K projections (MLA/LoRA/kv, K∈{512,1536}
 // → nb∈{16,48}) a 32-lane warp leaves lanes b∈[nb,32) idle (nb=16 wastes 50% of the
@@ -1413,6 +1519,103 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// Brick 12 (ds4-gap "launch consolidation"): PAIRED Q8_0 decode GEMV (external linkage,
+// called from cuda_deepseek_v4.cu's DsaDeviceKernels wrapper — same CUDA library). One
+// launch computes out0=b0·a and out1=b1·a over the SAME activation `a` (m==1 decode),
+// quantizing `a` to Q8_0 ONCE (grow-only per-stream scratch, identical grid to
+// MatmulQ8_0Cuda). BIT-IDENTICAL to two MatmulQ8_0Cuda calls (see kernel comment):
+// same preq quantization, same 8×__dp4a integer dot, same 32-wide warp reduce + scale
+// fold. b0/b1 are the plain in-place Q8_0 layout ([N,K] blocks); not q8_0_aligned.
+void MatmulQ8_0PairCuda(Tensor& out0, Tensor& out1, const Tensor& a, const Tensor& b0,
+                        const Tensor& b1, cudaStream_t s) {
+  const int64_t m = a.shape[0], k = a.shape[1], n0 = b0.shape[0], n1 = b1.shape[0];
+  if (n0 == 0 && n1 == 0) return;
+  if (m != 1)
+    throw std::runtime_error("vt cuda: matmul_bt_quant Q8_0 pair: decode-only (m must be 1)");
+  if (b0.shape[1] != k || b1.shape[1] != k)
+    throw std::runtime_error("vt cuda: matmul_bt_quant Q8_0 pair: K mismatch");
+  if (b0.q8_0_aligned || b1.q8_0_aligned)
+    throw std::runtime_error("vt cuda: matmul_bt_quant Q8_0 pair: aligned layout unsupported");
+  if (k % kQK8_0 != 0)
+    throw std::runtime_error("vt cuda: matmul_bt_quant Q8_0 pair: K must be a multiple of 32");
+  const int64_t nb = k / kQK8_0;
+  const size_t w0_row_bytes = static_cast<size_t>(nb) * sizeof(BlockQ8_0);
+  const size_t w1_row_bytes = w0_row_bytes;
+  const size_t act_bytes = static_cast<size_t>(nb) * sizeof(BlockQ8_0);
+  BlockQ8_0* act = static_cast<BlockQ8_0*>(EnsureScratch(act_bytes, s));
+  if (Q8PreqQuantOn(std::getenv("VT_V4_Q8_PREQ_QUANT"))) {
+    dim3 qgrid(static_cast<unsigned>(nb), 1, 1);
+    QuantizeQ8_0PreqKernel<<<qgrid, 32, 0, s>>>(act, a.data, ActDtOf(a.dtype), a.stride[0], 1, nb);
+  } else {
+    constexpr int kQBlock = 128;
+    const int64_t qgrid = (nb + kQBlock - 1) / kQBlock;
+    QuantizeQ8_0Kernel<<<static_cast<unsigned>(qgrid), kQBlock, 0, s>>>(
+        act, a.data, ActDtOf(a.dtype), a.stride[0], 1, nb);
+  }
+  constexpr int kWarpsPerBlock = 8;
+  dim3 block(32, kWarpsPerBlock);
+  const int64_t nmax = n0 > n1 ? n0 : n1;
+  const int64_t grid = (nmax + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const uint8_t* w0 = static_cast<const uint8_t*>(b0.data);
+  const uint8_t* w1 = static_cast<const uint8_t*>(b1.data);
+  const bool f32 = out0.dtype == DType::kF32;
+  if (f32)
+    QuantDotGemmQ8_0PairKernel<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<float*>(out0.data), static_cast<float*>(out1.data), w0, w1, act, n0, n1, nb,
+        w0_row_bytes, w1_row_bytes);
+  else
+    QuantDotGemmQ8_0PairKernel<uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<uint16_t*>(out0.data), static_cast<uint16_t*>(out1.data), w0, w1, act, n0, n1,
+        nb, w0_row_bytes, w1_row_bytes);
+  CheckCuda(cudaGetLastError(), "matmul_bt_quant Q8_0 pair launch");
+}
+
+// Brick 12 (ds4-gap "row-split consolidation"): BLOCK-DIAGONAL grouped Q8_0 decode GEMV
+// (external linkage). Consolidates the ng per-group `wo_a` output-LoRA GEMVs into ONE
+// launch. `b` is the stacked [ng*rpg, ipg] weight (row rr → group rr/rpg); `a` is the
+// full [1, ng*ipg] activation, quantized ONCE. BIT-IDENTICAL to the ng separate
+// GemmRowSliceInto launches (see kernel comment). out is [1, ng*rpg] (contiguous).
+void MatmulQ8_0GroupDiagCuda(Tensor& out, const Tensor& a, const Tensor& b, int64_t ng,
+                             cudaStream_t s) {
+  const int64_t total_rows = b.shape[0], ipg = b.shape[1];
+  if (total_rows == 0) return;
+  if (ng <= 0 || total_rows % ng != 0)
+    throw std::runtime_error("vt cuda: matmul_bt_quant Q8_0 groupdiag: rows not a multiple of ng");
+  if (b.q8_0_aligned)
+    throw std::runtime_error("vt cuda: matmul_bt_quant Q8_0 groupdiag: aligned layout unsupported");
+  if (ipg % kQK8_0 != 0)
+    throw std::runtime_error("vt cuda: matmul_bt_quant Q8_0 groupdiag: ipg must be a multiple of 32");
+  if (a.shape[0] != 1 || a.shape[1] != ng * ipg)
+    throw std::runtime_error("vt cuda: matmul_bt_quant Q8_0 groupdiag: activation must be [1, ng*ipg]");
+  const int64_t rpg = total_rows / ng;
+  const int64_t nb_g = ipg / kQK8_0;
+  const int64_t nb_total = ng * nb_g;
+  const size_t w_row_bytes = static_cast<size_t>(nb_g) * sizeof(BlockQ8_0);
+  const size_t act_bytes = static_cast<size_t>(nb_total) * sizeof(BlockQ8_0);
+  BlockQ8_0* act = static_cast<BlockQ8_0*>(EnsureScratch(act_bytes, s));
+  if (Q8PreqQuantOn(std::getenv("VT_V4_Q8_PREQ_QUANT"))) {
+    dim3 qgrid(static_cast<unsigned>(nb_total), 1, 1);
+    QuantizeQ8_0PreqKernel<<<qgrid, 32, 0, s>>>(act, a.data, ActDtOf(a.dtype), a.stride[0], 1,
+                                                nb_total);
+  } else {
+    constexpr int kQBlock = 128;
+    const int64_t qgrid = (nb_total + kQBlock - 1) / kQBlock;
+    QuantizeQ8_0Kernel<<<static_cast<unsigned>(qgrid), kQBlock, 0, s>>>(
+        act, a.data, ActDtOf(a.dtype), a.stride[0], 1, nb_total);
+  }
+  constexpr int kWarpsPerBlock = 8;
+  dim3 block(32, kWarpsPerBlock);
+  const int64_t grid = (total_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const uint8_t* w = static_cast<const uint8_t*>(b.data);
+  if (out.dtype == DType::kF32)
+    QuantDotGemmQ8_0GroupDiagKernel<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<float*>(out.data), w, act, rpg, ng, nb_g, w_row_bytes);
+  else
+    QuantDotGemmQ8_0GroupDiagKernel<uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+        static_cast<uint16_t*>(out.data), w, act, rpg, ng, nb_g, w_row_bytes);
+  CheckCuda(cudaGetLastError(), "matmul_bt_quant Q8_0 groupdiag launch");
+}
 
 // DeepSeek-V4 resident-decode fused routed-MoE gate+up+SwiGLU (external linkage,
 // called from cuda_deepseek_v4.cu's MoeDeviceKernels wrapper — same CUDA library).

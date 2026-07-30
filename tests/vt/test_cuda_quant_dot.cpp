@@ -19,6 +19,8 @@
 // green; it only asserts on a real GB10/CUDA device.
 #include <doctest/doctest.h>
 
+#include <cuda_runtime.h>  // cudaStream_t for the Brick 12 pair/group-diag externs
+
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -41,6 +43,16 @@ using vt::DeviceType;
 using vt::DType;
 using vt::Queue;
 using vt::Tensor;
+
+// Brick 12 (ds4-gap launch consolidation): the paired + block-diagonal Q8_0 decode GEMV
+// kernels under test (external linkage from cuda_quant_dot.cu). The A/B gates below prove
+// they are BYTE-IDENTICAL to the launches they consolidate.
+namespace vt::cuda {
+void MatmulQ8_0PairCuda(vt::Tensor& out0, vt::Tensor& out1, const vt::Tensor& a,
+                        const vt::Tensor& b0, const vt::Tensor& b1, cudaStream_t s);
+void MatmulQ8_0GroupDiagCuda(vt::Tensor& out, const vt::Tensor& a, const vt::Tensor& b,
+                             int64_t ng, cudaStream_t s);
+}  // namespace vt::cuda
 
 namespace {
 
@@ -406,4 +418,133 @@ TEST_CASE("CUDA keep-quant GEMM registers the native kCUDA provider") {
   // so DeepSeek-V4's experts dispatch to the GPU. Present only in a CUDA build.
   if (!HasCuda()) return;
   CHECK(vt::OpRegistered(vt::OpId::kMatmulBTQuant, DeviceType::kCUDA));
+}
+
+// Brick 12 (ds4-gap "launch consolidation") A/B gate — PAIRED Q8_0 decode GEMV. The
+// paired kernel (one launch, two weights, one shared activation) must be BYTE-IDENTICAL
+// to running the plain Q8_0 GEMV twice (via vt::MatmulBTQuant). RED-first: a wrong
+// activation-load factoring, a swapped weight row-stride, or a reduction re-order would
+// diverge the two outputs (this is the wq_a+wkv / shared-gate+up decode fusion).
+TEST_CASE("Brick 12: CUDA Q8_0 PAIR == two separate matmuls (bit-identical)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; Q8_0 pair gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  cudaStream_t s = static_cast<cudaStream_t>(gq.handle);
+  const WeightCase c = {DType::kQ8_0, 32, 34, 0, -1, "q8_0"};
+  const int64_t k = 8 * c.block_elems;  // 8 blocks (256), a model-ish decode K
+  const int64_t nbk = k / c.block_elems;
+  // (n0,n1): unequal out-dims (the real q_a=qlr vs kv_a=hd; gate=up=mi), and 1-row edge.
+  for (auto nn : {std::pair<int64_t, int64_t>{16, 16}, {16, 7}, {7, 16}, {1, 24}, {24, 1}}) {
+    const int64_t n0 = nn.first, n1 = nn.second;
+    CAPTURE(n0);
+    CAPTURE(n1);
+    std::vector<uint8_t> w0 = RandomBlocks(c, n0 * nbk, 0xA11CEU);
+    std::vector<uint8_t> w1 = RandomBlocks(c, n1 * nbk, 0xB0BAU);
+    std::vector<float> a(static_cast<size_t>(k));
+    GenerateData(1.0F, a.size(), a.data());
+
+    void* d_a = gpu.Alloc(a.size() * sizeof(float));
+    void* d_w0 = gpu.Alloc(w0.size());
+    void* d_w1 = gpu.Alloc(w1.size());
+    void* d_o0 = gpu.Alloc(static_cast<size_t>(n0) * sizeof(float));
+    void* d_o1 = gpu.Alloc(static_cast<size_t>(n1) * sizeof(float));
+    void* d_r0 = gpu.Alloc(static_cast<size_t>(n0) * sizeof(float));
+    void* d_r1 = gpu.Alloc(static_cast<size_t>(n1) * sizeof(float));
+    gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+    gpu.Copy(gq, d_w0, w0.data(), w0.size());
+    gpu.Copy(gq, d_w1, w1.data(), w1.size());
+
+    Tensor at = DevTensor(d_a, DType::kF32, {1, k});
+    Tensor w0t = DevTensor(d_w0, DType::kQ8_0, {n0, k});
+    Tensor w1t = DevTensor(d_w1, DType::kQ8_0, {n1, k});
+    Tensor o0 = DevTensor(d_o0, DType::kF32, {1, n0});
+    Tensor o1 = DevTensor(d_o1, DType::kF32, {1, n1});
+    Tensor r0 = DevTensor(d_r0, DType::kF32, {1, n0});
+    Tensor r1 = DevTensor(d_r1, DType::kF32, {1, n1});
+
+    vt::cuda::MatmulQ8_0PairCuda(o0, o1, at, w0t, w1t, s);  // ONE paired launch
+    vt::MatmulBTQuant(gq, r0, at, w0t);                     // reference: two separate launches
+    vt::MatmulBTQuant(gq, r1, at, w1t);
+
+    std::vector<float> got0(static_cast<size_t>(n0)), got1(static_cast<size_t>(n1));
+    std::vector<float> ref0(static_cast<size_t>(n0)), ref1(static_cast<size_t>(n1));
+    gpu.Copy(gq, got0.data(), d_o0, got0.size() * sizeof(float));
+    gpu.Copy(gq, got1.data(), d_o1, got1.size() * sizeof(float));
+    gpu.Copy(gq, ref0.data(), d_r0, ref0.size() * sizeof(float));
+    gpu.Copy(gq, ref1.data(), d_r1, ref1.size() * sizeof(float));
+    gpu.Synchronize(gq);
+    gpu.Free(d_a); gpu.Free(d_w0); gpu.Free(d_w1);
+    gpu.Free(d_o0); gpu.Free(d_o1); gpu.Free(d_r0); gpu.Free(d_r1);
+
+    CHECK(std::memcmp(got0.data(), ref0.data(), got0.size() * sizeof(float)) == 0);
+    CHECK(std::memcmp(got1.data(), ref1.data(), got1.size() * sizeof(float)) == 0);
+  }
+  gpu.DestroyQueue(gq);
+}
+
+// Brick 12 (ds4-gap "row-split consolidation") A/B gate — BLOCK-DIAGONAL grouped Q8_0
+// output-LoRA GEMV. The single consolidated launch (all ng groups) must be
+// BYTE-IDENTICAL to the ng separate per-group slice GEMVs (each over a disjoint ipg-wide
+// activation slice + its olr weight rows). RED-first: a wrong group activation offset or
+// a mis-computed rows-per-group would diverge. This is the resident wo_a fusion (the 344
+// launches/step, 53% of the 646).
+TEST_CASE("Brick 12: CUDA Q8_0 block-diagonal o-LoRA == per-group loop (bit-identical)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; Q8_0 group-diagonal gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  cudaStream_t s = static_cast<cudaStream_t>(gq.handle);
+  const WeightCase c = {DType::kQ8_0, 32, 34, 0, -1, "q8_0"};
+  const size_t row_bytes = static_cast<size_t>(1) * c.block_bytes;  // per 32-block
+  // (ng, olr, ipg): ipg must be a multiple of 32; models use ng=8.
+  struct Shape { int64_t ng, olr, ipg; };
+  for (Shape sh : {Shape{4, 8, 64}, Shape{8, 16, 96}, Shape{2, 7, 32}}) {
+    const int64_t ng = sh.ng, olr = sh.olr, ipg = sh.ipg;
+    const int64_t nb_g = ipg / c.block_elems;
+    const int64_t total_rows = ng * olr;
+    CAPTURE(ng);
+    CAPTURE(olr);
+    CAPTURE(ipg);
+    std::vector<uint8_t> w = RandomBlocks(c, total_rows * nb_g, 0xC0FFEEU);
+    std::vector<float> o(static_cast<size_t>(ng * ipg));
+    GenerateData(0.5F, o.size(), o.data());
+
+    void* d_o = gpu.Alloc(o.size() * sizeof(float));
+    void* d_w = gpu.Alloc(w.size());
+    void* d_z = gpu.Alloc(static_cast<size_t>(total_rows) * sizeof(float));   // consolidated
+    void* d_zr = gpu.Alloc(static_cast<size_t>(total_rows) * sizeof(float));  // per-group ref
+    gpu.Copy(gq, d_o, o.data(), o.size() * sizeof(float));
+    gpu.Copy(gq, d_w, w.data(), w.size());
+
+    Tensor ot = DevTensor(d_o, DType::kF32, {1, ng * ipg});
+    Tensor wt = DevTensor(d_w, DType::kQ8_0, {total_rows, ipg});
+    Tensor zt = DevTensor(d_z, DType::kF32, {1, total_rows});
+    vt::cuda::MatmulQ8_0GroupDiagCuda(zt, ot, wt, ng, s);  // ONE block-diagonal launch
+
+    // reference: ng separate slice GEMVs (mirrors GemmRowSliceInto in the model forward)
+    for (int64_t gp = 0; gp < ng; ++gp) {
+      Tensor a_slice =
+          DevTensor(static_cast<float*>(d_o) + gp * ipg, DType::kF32, {1, ipg});
+      Tensor w_slice = DevTensor(static_cast<uint8_t*>(d_w) +
+                                     static_cast<size_t>(gp * olr) * nb_g * row_bytes,
+                                 DType::kQ8_0, {olr, ipg});
+      Tensor z_slice =
+          DevTensor(static_cast<float*>(d_zr) + gp * olr, DType::kF32, {1, olr});
+      vt::MatmulBTQuant(gq, z_slice, a_slice, w_slice);
+    }
+
+    std::vector<float> got(static_cast<size_t>(total_rows)), ref(static_cast<size_t>(total_rows));
+    gpu.Copy(gq, got.data(), d_z, got.size() * sizeof(float));
+    gpu.Copy(gq, ref.data(), d_zr, ref.size() * sizeof(float));
+    gpu.Synchronize(gq);
+    gpu.Free(d_o); gpu.Free(d_w); gpu.Free(d_z); gpu.Free(d_zr);
+
+    CHECK(std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) == 0);
+  }
+  gpu.DestroyQueue(gq);
 }
