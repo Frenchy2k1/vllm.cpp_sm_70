@@ -1318,9 +1318,14 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
 
     // ── DeepSeek-V4 MoE (shared + topk routed; resident routing).
     const bool cfg_hash = p.is_hash_layer(layer);
-    // router gate: if bf16 (CPU GEMM reading device x), drain first; block-quant stays resident.
-    if (!vt::IsBlockQuant(Lq.moe_gate.dtype)) DrainDevice(be);
-    GemmIntoKq(be, Lq.moe_gate, x.data(), gating.data(), 1, ne, H);
+    // router gate — DEVICE (Brick D): the [ne,H] BF16 `ffn.gate.weight` × f32 x via
+    // RouterGateKernel (sequential f32, exact bf16 upcast → bit-identical to the host
+    // CPU MatmulBT). No drain, no host op — the resident step is now 100% device.
+    // (A block-quant router gate, if a build ever ships one, stays the device GEMM.)
+    if (vt::IsBlockQuant(Lq.moe_gate.dtype))
+      GemmIntoKq(be, Lq.moe_gate, x.data(), gating.data(), 1, ne, H);
+    else
+      MOE->router_gate(*be.q, gating.data(), x.data(), Lq.moe_gate.bytes.data(), ne, H);
     const bool has_bias = !cfg_hash && !L.gate_bias.empty();
     MOE->route_ip(*be.q, eids.data(), weights.data() + 1, gating.data(), 1, ne, topk,
                   has_bias ? L.gate_bias.data() : nullptr, has_bias,

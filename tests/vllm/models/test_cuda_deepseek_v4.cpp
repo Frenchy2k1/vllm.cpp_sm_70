@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "vt/backend.h"
+#include "vt/dtype.h"  // vt::F32ToBF16 / vt::BF16ToF32 (router_gate bf16 weights)
 
 namespace dv4 = vllm::deepseek_v4;
 using vllm::DeepseekV4HostWeights;
@@ -803,4 +804,45 @@ TEST_CASE("DeepseekV4 device rms_norm_rows (batched per-head q-RMS) == host (Bri
   dv4::DsaDevice()->rms_norm_rows(g.q, outw.data(), x.data(), w.data(), rows, n, eps, /*has_w=*/true);
   gpu.Synchronize(g.q);
   CHECK(RelL2(outw, out) > 1e-4);
+}
+
+// Brick D step 1 — the DEVICE router gate (gating[e] = Σ_h x[h]·bf16→f32(W[e*H+h]))
+// == the host reference (sequential f32 dot, exact `bits<<16` bf16 upcast). A near-tie
+// vs the host CPU MatmulBT (FMA-contraction), so the TRUE bar is real-model token-
+// identical routing; the unit case pins the numeric match + RED-first weight change.
+TEST_CASE("DeepseekV4 device router_gate (f32-act x bf16-weight) == host (Brick D)") {
+  if (!HasCuda()) return;  // DGX-only
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t ne = 40, H = 128;  // small stand-in for [256,4096]
+  const auto x = Rand(r, H, -1.5f, 1.5f);
+  // bf16 weights (the loader's `ffn.gate.weight` dtype): round f32->bf16, store bits.
+  std::vector<uint16_t> wbf16(static_cast<size_t>(ne * H));
+  std::vector<float> wval(static_cast<size_t>(ne * H));
+  {
+    const auto wf = Rand(r, ne * H, -1.0f, 1.0f);
+    for (int64_t i = 0; i < ne * H; ++i) {
+      wbf16[static_cast<size_t>(i)] = vt::F32ToBF16(wf[static_cast<size_t>(i)]);
+      wval[static_cast<size_t>(i)] = vt::BF16ToF32(wbf16[static_cast<size_t>(i)]);  // exact decoded
+    }
+  }
+  std::vector<float> gating(static_cast<size_t>(ne), 0.0f);
+  dv4::MoeDevice()->router_gate(g.q, gating.data(), x.data(), wbf16.data(), ne, H);
+  gpu.Synchronize(g.q);
+  std::vector<float> ref(static_cast<size_t>(ne));
+  for (int64_t e = 0; e < ne; ++e) {
+    float acc = 0.0f;
+    for (int64_t h = 0; h < H; ++h) acc += x[h] * wval[e * H + h];
+    ref[static_cast<size_t>(e)] = acc;
+  }
+  for (float v : gating) CHECK(std::isfinite(v));
+  CHECK(RelL2(gating, ref) < 1e-5);  // near-tie (device FMA vs host mul+add) — see comment
+  // RED-first: perturbing one expert's weights changes that gating logit.
+  auto wb2 = wbf16;
+  for (int64_t h = 0; h < H; ++h) wb2[static_cast<size_t>(3 * H + h)] = vt::F32ToBF16(0.7f);
+  std::vector<float> g2(static_cast<size_t>(ne), 0.0f);
+  dv4::MoeDevice()->router_gate(g.q, g2.data(), x.data(), wb2.data(), ne, H);
+  gpu.Synchronize(g.q);
+  CHECK(RelL2(g2, gating) > 1e-4);
 }
