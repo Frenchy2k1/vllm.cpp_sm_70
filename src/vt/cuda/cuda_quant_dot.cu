@@ -941,7 +941,12 @@ void MatmulQ8_0Cuda(Tensor& out, const Tensor& a, const Tensor& b, cudaStream_t 
     QuantizeQ8_0Kernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
         act, a.data, ActDtOf(a.dtype), a.stride[0], m, nb);
   }
-  constexpr int kWarpsPerBlock = 4;
+  // Step 0 (ds4-gap): 8 warps/block (8 output rows/block) matching ds4's
+  // matmul_q8_0_*_warp8 layout (ds4_cuda.cu:4343, 8 rows/block) — the current
+  // full-warp Q8_0 GEMV ran at ~16% occupancy ("grid too small to fill the
+  // device", ds4_cuda.cu:17073). More warps/block = more resident blocks per SM.
+  // BIT-IDENTICAL: each warp still computes one independent output (i,j) dot.
+  constexpr int kWarpsPerBlock = 8;
   dim3 block(32, kWarpsPerBlock);
   const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
   const uint8_t* w = static_cast<const uint8_t*>(b.data);
