@@ -982,6 +982,106 @@ void RouteInPlaceLaunch(Queue& q, int32_t* topk_ids, float* topk_weights, const 
   Check(cudaGetLastError(), "route_ip launch");
 }
 
+// ── Brick C folded-in glue kernels (device RMSNorm / RoPE / MoE combine) ──────
+// Weighted RMSNorm over [n]. One block, parallel block-tree reduction (double
+// accumulate) → CHARACTERIZED near-tie vs host double-sequential (the reduction
+// reorders); the scale+weight multiply is per-element (order-independent). has_w=0
+// → no weight (the per-head q-RMS; DeepseekV4QHeadRmsNormInplace).
+__global__ void RmsNormKernel(float* __restrict__ out, const float* __restrict__ x,
+                              const float* __restrict__ w, int n, float eps, int has_w) {
+  extern __shared__ double red[];
+  const int tid = threadIdx.x, nt = blockDim.x;
+  double ls = 0.0;
+  for (int i = tid; i < n; i += nt) { const double v = x[i]; ls += v * v; }
+  red[tid] = ls;
+  __syncthreads();
+  for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; __syncthreads(); }
+  const float r = 1.0f / sqrtf(static_cast<float>(red[0] / static_cast<double>(n)) + eps);
+  for (int i = tid; i < n; i += nt) out[i] = has_w ? x[i] * r * w[i] : x[i] * r;
+}
+void RmsNormLaunch(Queue& q, float* out, const float* x, const float* w, int64_t n, float eps,
+                   bool has_w) {
+  if (n == 0) return;
+  cudaStream_t s = AsStream(q);
+  const unsigned block = 256;
+  RmsNormKernel<<<1, block, block * sizeof(double), s>>>(out, x, w, static_cast<int>(n), eps,
+                                                         has_w ? 1 : 0);
+  Check(cudaGetLastError(), "rms_norm launch");
+}
+
+__device__ double YarnCorrDimDev(int n_dims, int n_ctx_orig, double beta, double base) {
+  const double kPi = 3.14159265358979323846;
+  return static_cast<double>(n_dims) *
+         log(static_cast<double>(n_ctx_orig) / (beta * 2.0 * kPi)) / (2.0 * log(base));
+}
+// One thread per row; the sequential-recurrence RoPE (host RopeInplaceLayer) on
+// v[row*stride + off .. +r]. Near-tie vs host (device cos/sin vs libm; the double
+// recurrence theta_extrap*=theta_scale preserves host order).
+__global__ void RopeKernel(float* v, int num_rows, int row_stride, int off, int r,
+                           const int* row_pos, double base, double freq_scale, double ext_factor,
+                           int n_ctx_orig, double beta_fast, double beta_slow, int inverse) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows) return;
+  float* vv = v + static_cast<int64_t>(row) * row_stride + off;
+  const double theta_scale = pow(base, -2.0 / static_cast<double>(r));
+  const double sin_sign = inverse ? -1.0 : 1.0;
+  double corr_lo = 0.0, corr_hi = 0.0;
+  if (ext_factor != 0.0) {
+    corr_lo = fmax(0.0, floor(YarnCorrDimDev(r, n_ctx_orig, beta_fast, base)));
+    corr_hi = fmin(static_cast<double>(r - 1), ceil(YarnCorrDimDev(r, n_ctx_orig, beta_slow, base)));
+  }
+  double theta_extrap = static_cast<double>(row_pos[row]);
+  for (int i = 0; i < r; i += 2) {
+    const double theta_interp = freq_scale * theta_extrap;
+    double theta = theta_interp;
+    if (ext_factor != 0.0) {
+      const double y = (static_cast<double>(i / 2) - corr_lo) / fmax(0.001, corr_hi - corr_lo);
+      const double ramp = (1.0 - fmin(1.0, fmax(0.0, y))) * ext_factor;
+      theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
+    }
+    const float c = static_cast<float>(cos(theta));
+    const float sn = static_cast<float>(sin_sign * sin(theta));
+    const float x0 = vv[i], x1 = vv[i + 1];
+    vv[i] = x0 * c - x1 * sn;
+    vv[i + 1] = x0 * sn + x1 * c;
+    theta_extrap *= theta_scale;
+  }
+}
+void RopeLaunch(Queue& q, float* v, int64_t num_rows, int64_t row_stride, int64_t off, int64_t r,
+                const int* row_pos, double base, double freq_scale, double ext_factor,
+                int64_t n_ctx_orig, double beta_fast, double beta_slow, bool inverse) {
+  if (num_rows == 0) return;
+  cudaStream_t s = AsStream(q);
+  const unsigned block = 128;
+  const unsigned grid = static_cast<unsigned>((num_rows + block - 1) / block);
+  RopeKernel<<<grid, block, 0, s>>>(v, static_cast<int>(num_rows), static_cast<int>(row_stride),
+                                    static_cast<int>(off), static_cast<int>(r), row_pos, base,
+                                    freq_scale, ext_factor, static_cast<int>(n_ctx_orig), beta_fast,
+                                    beta_slow, inverse ? 1 : 0);
+  Check(cudaGetLastError(), "rope launch");
+}
+
+// MoE combine: out[h] = Σ_a weights[a]*eo[a*H+h] (one thread per h; sequential over
+// a → host order). Near-tie vs host (the device contracts weights[a]*eo+acc to an
+// FMA; the host does separate multiply+add) — ~last-ULP, characterized.
+__global__ void MoeCombineKernel(float* out, const float* eo, const float* weights, int A, int H) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= H) return;
+  float acc = 0.0f;
+  for (int a = 0; a < A; ++a) acc += weights[a] * eo[static_cast<int64_t>(a) * H + h];
+  out[h] = acc;
+}
+void MoeCombineLaunch(Queue& q, float* out, const float* eo, const float* weights, int64_t A,
+                      int64_t H) {
+  if (H == 0) return;
+  cudaStream_t s = AsStream(q);
+  const unsigned block = 128;
+  const unsigned grid = static_cast<unsigned>((H + block - 1) / block);
+  MoeCombineKernel<<<grid, block, 0, s>>>(out, eo, weights, static_cast<int>(A),
+                                          static_cast<int>(H));
+  Check(cudaGetLastError(), "moe_combine launch");
+}
+
 // ── Brick A: device MLA decode/prefill attention (unified memory, in place) ───
 // One block per (query t, head h). num KV heads = 1 (all heads share the cached
 // latent kv[s]). BIT-IDENTICAL to the host SoftmaxWithSink path by preserving its
@@ -1069,11 +1169,12 @@ void DecodeAttnLaunch(Queue& q, float* o, const float* query, const float* kv,
 const MhcDeviceKernels kMhc = {&MhcSinkhornLaunch, &MhcPreLaunch, &MhcPostLaunch, &HcHeadLaunch,
                                &MhcPostInPlaceLaunch, &HcHeadInPlaceLaunch, &MhcPreInPlaceLaunch};
 const DsaDeviceKernels kDsa = {&DsaWeightFoldLaunch, &DsaLogitsLaunch, &DsaTopkLaunch,
-                               &SoftmaxSinkLaunch, &GroupedOLoraLaunch, &DecodeAttnLaunch};
+                               &SoftmaxSinkLaunch, &GroupedOLoraLaunch, &DecodeAttnLaunch,
+                               &RmsNormLaunch, &RopeLaunch};
 const CompressorDeviceKernels kComp = {&SaveScoreApeLaunch, &PoolNormLaunch, &Fp8EncodeLaunch,
                                        &Fp8DecodeLaunch};
 const MoeDeviceKernels kMoe = {&SqrtSoftplusLaunch, &RouteLaunch, &ClampedSwiGLULaunch,
-                               &ClampedSwiGLUInPlaceLaunch, &RouteInPlaceLaunch};
+                               &ClampedSwiGLUInPlaceLaunch, &RouteInPlaceLaunch, &MoeCombineLaunch};
 
 struct Registrar {
   Registrar() {

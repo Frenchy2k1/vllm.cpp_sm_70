@@ -33552,3 +33552,38 @@ device + token-identical + gated. Remaining for FULL device-residency: **device 
 per-op-sync dip with NO Brick-B speed benefit (the dip only resolves at the graph), so folding them into
 Brick C (where the syncs are dropped) is the cleaner path. Reported for coordinator direction. Box restored
 (worker up restart=always, flock free, no stray). Row `ACTIVE`.
+
+## DeepSeek-V4 device-resident decode campaign — Brick C part 1 (folded-in device glue kernels: RMSNorm / RoPE / MoE combine) (2026-07-30, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`, worktree `/home/mudler/_git/vllm.cpp-rd`, branch `deepseek-v4-resident-decode`, base `f2fff1ee`, commit `d68768b4`, NOT pushed)
+
+Coordinator approved rec-(b): the device-kernel crux is done; fold the remaining glue (RMSNorm/RoPE/combine)
+into Brick C, where the per-op-sync tax dies. Part 1 = write + gate those three device kernels (they are
+CONSUMED by the resident assembly in part 2; not wired into the forward yet — the current per-op-synced path
+would only add sync-dip with no benefit).
+
+**The kernels (`cuda_deepseek_v4.cu`):** `RmsNormKernel` — weighted RMSNorm over [n], one block, block-tree
+reduction in double; `RmsNormLaunch(q,out,x,w,n,eps,has_w)` (has_w=false → the per-head q-RMS, out=x·r).
+`RopeKernel` — one thread per row, the sequential-recurrence YaRN RoPE (theta_extrap*=theta_scale;
+sin_sign=inverse?-1:1); `RopeLaunch(...base,freq_scale,ext_factor,n_ctx_orig,beta_fast,beta_slow,inverse)`.
+`MoeCombineKernel` — out[h]=Σ_a weights[a]·eo[a·H+h], one thread per h; `MoeCombineLaunch(q,out,eo,weights,A,H)`.
+Seam: `rms_norm`/`rope` added to `DsaDeviceKernels`, `moe_combine` to `MoeDeviceKernels`; `kDsa` appends
+`&RmsNormLaunch,&RopeLaunch`, `kMoe` appends `&MoeCombineLaunch`.
+
+**ALL THREE CHARACTERIZED NEAR-TIES (stated, not hidden):** RMSNorm (block-reduction reorder vs host
+double-sequential → RelL2<1e-5), RoPE (device cos/sin vs libm → RelL2<1e-5), and — a NEW finding —
+**MoE combine is a near-tie, NOT bit-identical:** the device contracts `weights[a]*eo+acc` to an FMA vs the
+host's separate multiply+add → last-ULP. My initial test asserted `out[i]==ref[i]` and it CORRECTLY FAILED
+(38 assertions, values equal to 6 sig-figs); I fixed the gate to RelL2<1e-5 + corrected the kernel/header
+comments (and the commit message, which had claimed combine bit-identical).
+
+**GATES:** CUDA unit `test_cuda_deepseek_v4` **15/15·1106** (+1 case "device RMSNorm/RoPE/MoE combine == host
+(Brick C)": RMSNorm near-tie + RED-first no-weight, RoPE YaRN near-tie + RED-first inverse, combine FMA
+near-tie + RED-first negated weights); `test_deepseek_v4_gguf_load` **12/12·531** (the kernels are unused by
+the forward yet). CPU + CUDA `-Werror` clean.
+
+**Brick C part 2 (the SPEED part) REMAINS:** thread the T=1 decode activations through persistent DBufs across
+the 43-layer stack (mirror `Qwen3_5DenseDecodeGraph`, `qwen3_5.cpp:5747/5820`), consume these + the Brick-A/B
+device kernels in a resident chain, and **drop the ~560 per-op host drains (sync only at the step-boundary
+logits read for argmax)** — that is what recovers + exceeds the 5.83 baseline (util should rise above ~38%).
+Then STOP for review before Brick D (capture the sync-free resident step into a decode CUDA graph; watch the
+cudagraph-bakes-stack-addresses hazard — keep captured inputs in stable owned DBufs, verify by TOKENS). Box
+restored (worker up restart=always, flock free, no stray). Row `ACTIVE`.
