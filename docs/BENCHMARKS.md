@@ -16,6 +16,37 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## DeepSeek-V4 native MTP self-speculative draft head W1 (2026-07-30, `CLAIM-DEEPSEEK-V4-MTP`) - NOT-APPLICABLE (tiny-config correctness brick; no throughput owed) / real-model acceptance + speedup WEIGHT-BLOCKED
+
+Disposition: **the wiring is CPU-gated at tiny synthetic shape; the real-model
+MTP-on==MTP-off + acceptance-rate + tokens/step + wall-clock speedup measurement
+is WEIGHT-BLOCKED and did NOT run (nothing faked).**
+
+The V4 native MTP head (`num_nextn_predict_layers=1`) is wired to the same
+lossless spec-decode path as the Qwen3.6 gate models. The draft forward
+(`DeepseekV4MtpDraftLogitsHost`, 1:1 with `nvidia/mtp.py:128-258`: separate
+`e_proj`/`h_proj`, `enorm`/`hnorm`, an MHC-aware `mtp_block`, own `hc_head`
+collapse) reuses the DS4 attention/MoE/MHC composition; the target's pre-`hc_head`
+MHC residual stream is stashed via a `ForwardComposeImpl` out-param. Verification
+reuses the SHARED greedy `RejectionSampler` verbatim, so MTP-on greedy output is
+token-IDENTICAL to MTP-off by construction. Gate `test_deepseek_v4_mtp` 5/5·29
+(finite/deterministic draft logits, RED-first eh-lift/hc_head/hnorm miswires, the
+lossless accept+reject equivalence == pure target greedy); `test_deepseek_v4_forward`
+6/6 and `test_deepseek_v4_gguf_load` 12/12 non-regressed (the residual-capture
+out-param is inert when null).
+
+**Why the real gate is blocked (verified on `dgx.casa`, 2026-07-30, llama.cpp
+`gguf-py`, no GPU):** both shipped DeepSeek-V4-Flash GGUFs (`ds4flash.gguf` 80.7 GB
+and the v2-imatrix file) carry KV `deepseek4.nextn_predict_layers = 1` but contain
+**1328 tensors, blocks 0-42 only, ZERO nextn/mtp tensors** - the llama.cpp
+converter dropped the MTP layer during quantization (exactly vLLM's documented
+"quantized without MTP layers" case). `DeepseekV4GgufHasMtp` returns false and the
+engine falls back to MTP-off. The measurement (acceptance/tok-per-step/wall-clock
+on GB10) resumes once a `deepseek4` GGUF that retains `blk.43.*` exists, or the
+156.7 GiB NVFP4 safetensors runs on multi-Spark. ds4 (the oracle) runs plain
+autoregressive decode (16.5 tok/s) and does NOT use MTP, so this is a beat-ds4
+lever once weights exist. See `.agents/specs/deepseek-v4-mtp.md`.
+
 ## CUDA keep-quant GGUF k-quant GEMM - DeepSeek-V4 experts on the GPU (2026-07-29, `CLAIM-CUDA-KEEPQUANT-GEMM`) - CORRECTNESS GATE PASS on GB10 / experts-on-GPU tok/s PENDING
 
 Disposition: **correctness RUNTIME-VERIFIED on the DGX GB10 (sm_121); the DeepSeek-V4

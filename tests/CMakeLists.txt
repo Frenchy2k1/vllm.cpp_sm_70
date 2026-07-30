@@ -130,6 +130,12 @@ vllm_cpp_add_test(test_deepseek_v4_forward vllm/models/test_deepseek_v4_forward.
 # keep-quant residency + load->Forward end-to-end, RED-first (missing/leftover).
 vllm_cpp_add_test(test_deepseek_v4_gguf_load vllm/models/test_deepseek_v4_gguf_load.cpp)
 target_include_directories(test_deepseek_v4_gguf_load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
+# DeepSeek-V4-Flash MTP W1 — the native nextn self-speculative draft head: tiny
+# synthetic nextn forward (nvidia/mtp.py:128-258) + RED-first miswires + the
+# LOSSLESS gate (DS4 draft + DS4 target verified by the shared RejectionSampler ==
+# pure target greedy => MTP-on == MTP-off). See .agents/specs/deepseek-v4-mtp.md.
+vllm_cpp_add_test(test_deepseek_v4_mtp vllm/models/test_deepseek_v4_mtp.cpp)
+target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # DeepSeek-V4-Flash W7-DEVICE — the four NEW V4 op families' CUDA kernels
 # (src/vt/cuda/cuda_deepseek_v4.cu, dispatched through the OpProvider seam) each
 # unit-gated vs its landed HOST reference at small shape + the ForwardDevice

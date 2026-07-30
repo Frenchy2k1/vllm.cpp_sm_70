@@ -33902,3 +33902,28 @@ main `aed4a498` = MATCH), fast incremental rebuild, worker stopped during build/
 the per-kernel re-profile, 4 warm bench runs for stability. Rollback-able (bit-identical, the resident default
 stays correct). STOPPED for review before Brick 1b / Brick 2. Box restored (worker running restart=always, flock
 free, no stray gen). Row `ACTIVE`.
+- **2026-07-30** — **DeepSeek-V4 native MTP self-speculative draft head W1
+  wired (`CLAIM-DEEPSEEK-V4-MTP`, branch `deepseek-v4-mtp` off `main`
+  `aed4a498`, NOT pushed).** Scoped + implemented the V4 nextn head against the
+  V4-SPECIFIC upstream (`vllm/models/deepseek_v4/nvidia/mtp.py`, NOT the generic
+  V3 `deepseek_mtp.py`): separate `e_proj`/`h_proj`, `enorm`/`hnorm`, an
+  MHC-aware `mtp_block` decoder layer, its own `hc_head` collapse, previous_hidden
+  = the target's PRE-hc_head MHC residual stream [T,hc*H]. Landed: the
+  `DeepseekV4MtpHostWeights` struct + `DeepseekV4GgufHasMtp` absence guard
+  (deepseek_v4_weights.cpp) + the tiny-config draft forward
+  `DeepseekV4MtpDraftLogitsHost` + `DeepseekV4TargetMtpResidualHost` (a
+  `ForwardComposeImpl` residual-capture out-param, inert when null) reusing the
+  DS4 AttentionBlock/MoeBlock/MHC helpers, + `test_deepseek_v4_mtp` 5/5·29 (finite
+  + RED-first eh/hc_head/hnorm miswires + the LOSSLESS gate: DS4 draft + DS4
+  target verified by the SHARED `RejectionSampler` == pure target greedy, so
+  MTP-on == MTP-off). DS4 forward/gguf_load 6/6·26, 12/12·531 non-regressed.
+  **BLOCKER (verified on dgx.casa, no GPU): both shipped DS4 GGUFs advertise
+  nextn_predict_layers=1 but carry ZERO nextn tensors** (1328 tensors, blocks
+  0-42; converter dropped the tail) → the real-model MTP-on==MTP-off +
+  acceptance/tok-per-step/speedup gate is WEIGHT-BLOCKED (engine falls back to
+  MTP-off cleanly). Row `MODEL-SPEC-deepseek-v4-deep-seek-v4-mtp` SPIKE→ACTIVE
+  (handoff from `CLAIM-DEEPSEEK-V4-SCOPE`). Residuals: DS4-native decode-loop
+  propose/verify (the DS4 forward is NOT the Qwen paged-runner path, so
+  `MtpProposePrefill` is not reused — only the rejection sampler is shared) +
+  engine spec-config registration + device draft forward. All 7 record checkers
+  rc=0. See `.agents/specs/deepseek-v4-mtp.md`.
