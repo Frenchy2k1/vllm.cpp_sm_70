@@ -1,0 +1,32 @@
+# Merged-GEMM consistency allowlist — model TUs that hand-roll a gated MLP
+# epilogue (vt::SiluAndMul / vt::GeluAndMul) WITHOUT (yet) routing their gate-up
+# through a shared merged-GEMM seam (the layers::MlpGateUpMethodBase method seam +
+# its tuned quant arms, the vt::MergedGemmGroup descriptor, or the shared fused
+# MoE op vt::MoeGateUpSwiGLUGrouped), accepted as a KNOWN, TRACKED state so
+# scripts/check-fusion-consistency.py stays green while preventing a NEW
+# unadopted hand-rolled-MLP model from landing silently.
+#
+# Each entry is a model-file stem (src/vllm/model_executor/models/<stem>.cpp) with
+# a reason. Ranked fold order + the shared-op targets:
+# .agents/specs/arch-fusion-fold-plan-2026-07-30.md (Tiers A1/C1/C2).
+#
+# Removing a stem here (after folding its gate-up onto the shared seam,
+# byte-exact + token-exact/near-tie gated) is the enforcement gate closing — as
+# happened for the 5 SwiGLU archs (Tier A1: olmo2/granite/stablelm/qwen3_dflash/
+# deepseek_v2) and the Gemma family (Tier C1: gemma/gemma2/gemma3/gemma4), which
+# now route through layers::UnquantizedMlpGateUp{,Gelu}Method and are NOT listed.
+#
+# NOTE: the seam already carries both activation arms (UnquantizedMlpGateUpMethod
+# SwiGLU + UnquantizedMlpGateUpGeluMethod GeGLU) and the nvfp4 fused arm
+# (GateUpFusedMarlinD) for free on quantized checkpoints — these models need only
+# the fold (swap {gate;up;SiluAndMul/GeluAndMul} -> the method), no new kernel.
+# Every listed model already ships a merged [2I,H] gate_up weight (no loader
+# concat needed) — the gap is launch/epilogue granularity + seam routing only.
+
+# --- KNOWN-DRIFT: seam exists, model has NOT adopted it (fix = fold, Tier A1/C1) ---
+commandr        # SwiGLU {gate;up;SiluAndMul}, merged gate_up present -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
+glm4            # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod (also on the glue allowlist); pending FOLD-MIGRATE
+minicpm         # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
+minicpm3        # SwiGLU dense MLP (MLA arch) -> UnquantizedMlpGateUpMethod; pending FOLD-MIGRATE
+phi3            # SwiGLU dense MLP -> UnquantizedMlpGateUpMethod (also on the glue allowlist); pending FOLD-MIGRATE
+gemma4_vision   # GeGLU vision-tower MLP -> UnquantizedMlpGateUpGeluMethod + a clamp-epilogue hook (Tier C2); pending FOLD-MIGRATE

@@ -297,6 +297,33 @@ residual is a specific hand-tuned kernel outrunning our best CUTLASS/cuBLASLt/AO
 on one shape — still "port a better kernel", not "impossible". Design every forward
 and kernel plan on the assumption that the fused/graphed/codegen'd form is reachable.
 
+**FOLD onto the shared fusion / merged-GEMM frameworks — do NOT hand-roll (CI-gated).**
+The engine has TWO shared frameworks a new model MUST route through, not re-implement:
+(1) the **glue** catalog `vt::FusedChain` (add+residual+RMSNorm, norm+rope — declare a
+`constexpr FusedRecipe` once, every backend inherits it); (2) the **merged-GEMM** family
+— the gate-up MLP method seam `layers::MlpGateUpMethodBase`
+(`UnquantizedMlpGateUpMethod` SwiGLU / `UnquantizedMlpGateUpGeluMethod` GeGLU, with the
+nvfp4 `GateUpFusedMarlinD` arm inherited free on quantized checkpoints), the declarative
+`vt::MergedGemmGroup` descriptor (N GEMMs sharing operand A + a fused epilogue), and the
+shared fused ops (`vt::MoeGateUpSwiGLUGrouped`, `vt::MatmulBTQuantGrouped`). A model
+forward is meant to be **"born fused"**: it picks the quant arm and binds the recipes; the
+tuned kernel is a shared `vt::` op, NOT per-model code. The model FORWARD is legitimately
+arch-scoped (the op sequence — MLA, MHC, hash-routed MoE — is the architecture, hand-write
+it like vLLM's model files); the KERNELS it calls are op-scoped and SHARED. Hand-rolling a
+`{gate; up; SiluAndMul/GeluAndMul}` MLP, an add+RMSNorm chain, or a per-model merged-GEMM
+instead of routing through these seams is **drift**: a new backend can't inherit it by
+registration, a new vLLM fusion PR can't port as one declaration, and the tuned kernel
+stays siloed (the exact regression the frameworks exist to prevent — see
+`.agents/specs/arch-fusion-fold-plan-2026-07-30.md`,
+`.agents/specs/keepquant-shared-ops-2026-07-30.md`,
+`.agents/specs/portable-fusion-framework.md`). This is enforced by
+`scripts/check-fusion-consistency.py` (two floors — glue + merged-GEMM — each with an
+allowlist: `scripts/fusion-consistency-allowlist.txt`,
+`scripts/merged-gemm-consistency-allowlist.txt`). A model that legitimately cannot adopt
+yet is a CONSCIOUS, reviewable allowlist entry with a reason + its fold-plan tier — never a
+silent landing; removing the entry after the fold (byte-exact + token-exact/near-tie gated)
+is the enforcement gate closing.
+
 **TRACE THE EXECUTION, not just the code — nsys BOTH vLLM and ours before any perf
 comparison.** Reading source finds the DISPATCH LOGIC + the AVAILABLE kernels; it does
 NOT tell you what ACTUALLY RAN, because vLLM's real kernels are resolved at RUNTIME and
