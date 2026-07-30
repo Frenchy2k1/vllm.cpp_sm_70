@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <b>Same tokens as vLLM. Faster than vLLM. From a 66 MiB binary instead of a 9.1 GiB install.</b><br>
+  <b>Same tokens as vLLM. Same throughput. 140x less to install.</b><br>
   <sub>Continuous batching, paged KV, 25+ architectures, CUDA / CPU / Metal / Vulkan. No Python anywhere.</sub>
 </p>
 
@@ -47,11 +47,11 @@ Those are the goals. Here is where they actually stand, measured:
 - **Small.** **66 MiB** of binary against a **9.1 GiB** vLLM install, both measured on the same GB10:
   about **140x less to deploy**, serving the same model in **24.88 GiB of peak host memory against
   vLLM's 28.18**. No interpreter in the process, and 0 bytes of bundled CUDA userspace.
-- **Fast.** **Never behind vLLM at any concurrency** on the Qwen3.6-27B gate model, with a real
-  **4.5% win at c1** and a tie-or-better across the rest of the curve, against vLLM's graphed
-  production config. **1.18x llama.cpp's prefill** on the same GGUF file, and **ahead of MLX-LM on
-  prefill** on Apple Silicon. Most other architectures are correct but speed-pending, and every one
-  of them says so.
+- **Fast.** On Qwen3.6-27B we are **faster than vLLM at all six concurrencies we measured**, against
+  its graphed production config: a **4.5% win at c1** and 0.7% to 1.7% across the rest (read the
+  noise band below before quoting the middle of that curve). Also **1.18x llama.cpp's prefill** on the
+  same GGUF file, and **ahead of MLX-LM on prefill** on Apple Silicon. Most other architectures are
+  correct but speed-pending, and every one of them says so.
 - **Everything.** 25+ architectures, tool calling (36 parser families), structured output including
   GBNF, three speculative decoders, image and video and audio input, external KV offload, Prometheus
   metrics, and the SGLang knobs, all in a library you can `dlopen`.
@@ -70,6 +70,11 @@ point on this curve:
 | **vllm.cpp** (tok/s) | **86.05** | **159.68** | **292.34** | **508.77** | **801.76** | **1095.01** |
 | vLLM (tok/s) | 82.32 | 158.03 | 290.31 | 505.46 | 789.16 | 1076.25 |
 | **Ratio** | **1.045x** | **1.011x** | **1.007x** | **1.007x** | **1.016x** | **1.017x** |
+
+**So yes: we are faster than vLLM here, at all six concurrencies, on identical output.** That is the
+headline result of this project and we are not going to be coy about it. We keep it out of the
+one-line pitch at the top of this page for one reason: it is one model on one GPU, and a claim that
+broad deserves to be read with its scope and its error bars attached, which is the next paragraph.
 
 **Read those ratios honestly.** This project gates on a measured run-to-run noise band of **0.5% for
 non-tail timing**, and the c2 through c32 margins (0.7% to 1.7%) sit close to it. So the fair reading
