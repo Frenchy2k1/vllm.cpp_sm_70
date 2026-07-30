@@ -666,8 +666,24 @@ __global__ void QuantizeQ8_0Kernel(BlockQ8_0* __restrict__ scratch,
   }
 }
 
+// Brick 3 (last-mile): read a 4-byte int from a 2-BYTE-aligned int8 stream. The Q8_0
+// block `qs` starts at offset 2 in the 34-byte block (uint16 d + 32×int8), so — unlike
+// the 4-byte-aligned Q8_K qs the Brick-1 IQ2/Q2_K path int-loads directly — a naked
+// int32 load here would be MIS-ALIGNED (UB / fault on half the blocks). Bit-exact port
+// of llama.cpp `ggml-cuda/common.cuh:get_int_b2` (two uint16 loads, little-endian) — the
+// reconstructed byte pattern is identical to a valid int32 load, so __dp4a extracts the
+// same signed int8 lanes as the scalar `(int)qs[p]`.
+__device__ __forceinline__ int GetIntB2(const int8_t* qs, int i32) {
+  const uint16_t* x16 = reinterpret_cast<const uint16_t*>(qs);
+  return static_cast<int>(x16[2 * i32 + 0]) | (static_cast<int>(x16[2 * i32 + 1]) << 16);
+}
+
 // Q8_0×Q8_0 GEMM: one warp per output (i,j); lane `w` handles blocks b=w,w+32,…,
 // each a 32-element integer dot scaled by f16(wd)·f16(ad); warp-reduce the partials.
+// Brick 3: the per-block dot reads the 32 int8 as 8 int32 (`GetIntB2`, coalesced 2-byte
+// loads) + 8 `__dp4a` (mirrors llama.cpp `ggml-cuda/vecdotq.cuh:vec_dot_q8_0_q8_1_impl`
+// + `VDR_Q8_0_Q8_1_MMVQ`) instead of 32 scattered int8 loads + scalar MACs. BIT-IDENTICAL
+// (__dp4a = exact int32 accumulation; integer sumi unchanged; the f16-scale fold unchanged).
 template <typename OutT>
 __global__ void QuantDotGemmQ8_0Kernel(OutT* __restrict__ out,
                                        const uint8_t* __restrict__ weight,
@@ -686,7 +702,8 @@ __global__ void QuantDotGemmQ8_0Kernel(OutT* __restrict__ out,
                                                                           sizeof(BlockQ8_0));
     const BlockQ8_0* ab = a_row + b;
     int sumi = 0;
-    for (int p = 0; p < kQK8_0; ++p) sumi += static_cast<int>(wb->qs[p]) * static_cast<int>(ab->qs[p]);
+#pragma unroll
+    for (int k = 0; k < kQK8_0 / 4; ++k) sumi = __dp4a(GetIntB2(wb->qs, k), GetIntB2(ab->qs, k), sumi);
     partial += sumi * (DF16ToF32(wb->d) * DF16ToF32(ab->d));
   }
 #pragma unroll
@@ -718,8 +735,9 @@ __global__ void QuantDotGemmGroupedQ8_0Kernel(OutT* __restrict__ out,
     const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(b) *
                                                                           sizeof(BlockQ8_0));
     const BlockQ8_0* ab = a_row + b;
-    int sumi = 0;
-    for (int q = 0; q < kQK8_0; ++q) sumi += static_cast<int>(wb->qs[q]) * static_cast<int>(ab->qs[q]);
+    int sumi = 0;  // Brick 3: 8×__dp4a over GetIntB2 (see QuantDotGemmQ8_0Kernel) — bit-identical
+#pragma unroll
+    for (int k = 0; k < kQK8_0 / 4; ++k) sumi = __dp4a(GetIntB2(wb->qs, k), GetIntB2(ab->qs, k), sumi);
     partial += sumi * (DF16ToF32(wb->d) * DF16ToF32(ab->d));
   }
 #pragma unroll
