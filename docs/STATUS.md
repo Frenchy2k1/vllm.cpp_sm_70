@@ -119,7 +119,16 @@ real-model MTP-on==MTP-off + acceptance/speedup gate is WEIGHT-BLOCKED: both
 shipped DeepSeek-V4-Flash GGUFs advertise `nextn_predict_layers=1` but the
 llama.cpp converter dropped every nextn tensor (`DeepseekV4GgufHasMtp` returns
 false → clean fall-back to MTP-off). The DS4-native propose/verify decode loop +
-engine spec-config registration are named residuals.
+engine spec-config registration are named residuals. **BEAT-ds4 sweep (2026-07-30,
+`CLAIM-DSV4-BEAT-SWEEP`, analysis-only):** our raw autoregressive decode is at its
+GB10 ceiling (13.19 tok/s, Q8_0 front CLOSED after Bricks 3-13), and ds4's
+16.5-17.2 is itself RAW decode (its MTP/DSpark spec is opt-in, NOT in that
+number). The one path PAST 16.5 is MTP self-spec: `13.19 × (1+p)/1.05`, break-even
+acceptance p≈0.31, plausible p 0.55-0.85 → ~18-23 tok/s. Lossless (token-identical
+to greedy). Gated on unblocking a nextn-carrying GGUF (R1) + the propose/verify
+loop (R2) + device draft (R4). fp16 dequant cache refuted net-slower on GB10; MHC
+a measured tie; routed-MoE we already win. See
+`.agents/specs/deepseek-beat-ds4-sweep-2026-07-30.md`.
 
 **DeepSeek-V4-Flash decode ds4-gap — Step 0 + Lever 1** (2026-07-30,
 `CLAIM-DSV4-DECODE-LEVER1`, GB10 sm_121a). **Step 0** (`kWarpsPerBlock` 4→8 on the
