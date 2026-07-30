@@ -35,6 +35,14 @@
 #include "vllm/model_executor/models/deepseek_v4_device.h"
 #include "vt/ops.h"
 
+// Defined in cuda_quant_dot.cu (same CUDA library): the fused routed-MoE
+// gate+up+SwiGLU epilogue over the keep-quant expert towers.
+namespace vt::cuda {
+void MoeGateUpSwiGLUGroupedCuda(vt::Queue& q, vt::Tensor& out, const vt::Tensor& act,
+                               const vt::Tensor& gate_w, const vt::Tensor& up_w,
+                               const vt::Tensor& expert_ids, float limit);
+}  // namespace vt::cuda
+
 namespace vllm::deepseek_v4 {
 namespace {
 
@@ -42,6 +50,7 @@ using vt::DeviceType;
 using vt::OpId;
 using vt::Queue;
 using vt::RegisterOp;
+using vt::Tensor;
 
 void Check(cudaError_t e, const char* what) {
   if (e != cudaSuccess)
@@ -1339,10 +1348,17 @@ const DsaDeviceKernels kDsa = {&DsaWeightFoldLaunch, &DsaLogitsLaunch, &DsaTopkL
                                &RmsNormLaunch, &RopeLaunch, &RmsNormRowsLaunch, &DecodeAttnGLaunch};
 const CompressorDeviceKernels kComp = {&SaveScoreApeLaunch, &PoolNormLaunch, &Fp8EncodeLaunch,
                                        &Fp8DecodeLaunch};
+// FUSED routed-MoE gate+up+SwiGLU — forwards to the cuda_quant_dot.cu kernel that
+// holds the keep-quant dequant/dot machinery. Thin Tensor pass-through (no drain).
+void MoeGateUpSwiGLULaunch(Queue& q, Tensor& out, const Tensor& act, const Tensor& gate_w,
+                           const Tensor& up_w, const Tensor& expert_ids, float limit) {
+  vt::cuda::MoeGateUpSwiGLUGroupedCuda(q, out, act, gate_w, up_w, expert_ids, limit);
+}
+
 const MoeDeviceKernels kMoe = {&SqrtSoftplusLaunch,        &RouteLaunch,
                                &ClampedSwiGLULaunch,       &ClampedSwiGLUInPlaceLaunch,
                                &RouteInPlaceLaunch,        &MoeCombineLaunch,
-                               &RouterGateLaunch};
+                               &RouterGateLaunch,          &MoeGateUpSwiGLULaunch};
 
 struct Registrar {
   Registrar() {
