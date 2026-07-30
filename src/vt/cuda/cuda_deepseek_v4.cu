@@ -183,55 +183,57 @@ __global__ void MhcPreKernel(const float* residual, const float* fn, const float
   }
 }
 
-// Brick B — PARALLEL MhcPre (one block, blockDim threads over the H/flat width; the
-// tiny hc-sized gates + 20-iter Sinkhorn stay on thread 0 in HOST ORDER). Same math
-// as MhcPreKernel but real-parallel (no <<<1,1>>> on the decode hot path). The width
-// reductions (sqrsum, the hc3 mix dots, the final RMSNorm ss) accumulate in DOUBLE
-// and reduce in a block tree → a CHARACTERIZED near-tie vs the single-thread version
-// (reduction reorder); the per-h layer_out dot (over hc) is sequential → order kept.
-__global__ void MhcPreParallelKernel(const float* __restrict__ residual,
-                                     const float* __restrict__ fn, const float* __restrict__ scale,
-                                     const float* __restrict__ base, int hc, int hidden,
-                                     float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
-                                     float hc_post_mult, int iters,
-                                     const float* __restrict__ norm_weight, int has_norm,
-                                     float norm_eps, float* mixes, float* pre_out, float* post_out,
-                                     float* comb_out, float* layer_out) {
+// Brick B / glue-tune — PARALLEL MhcPre, split into TWO kernels so the hc3 mix
+// dot-products (the profiled 25.5%-of-step hot spot, previously 24 SEQUENTIAL block
+// reductions inside ONE block = ONE SM) run CONCURRENTLY across hc3 blocks (many
+// SMs). Numerics are BIT-IDENTICAL to the prior one-block kernel: each dot is the
+// SAME 256-thread block reduction (same partial assignment + tree), just in its own
+// block; `acc*rms` is a scalar mult, order-independent. The tiny hc-sized gates +
+// 20-iter Sinkhorn stay on thread 0 in HOST ORDER; the per-h layer_out dot (over hc)
+// is sequential → order kept. Characterized near-tie vs the single-thread #183 (the
+// double block reductions reorder vs single-thread float) — UNCHANGED tolerance.
+//
+// Kernel A: one block per mix dot `o` → mixes[o] = Σ_i residual[i]*fn[o*flat+i] (RAW).
+__global__ void MhcPreDotsKernel(const float* __restrict__ residual,
+                                 const float* __restrict__ fn, int flat, float* __restrict__ mixes) {
+  const int o = blockIdx.x;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  extern __shared__ double red[];
+  const int frow = o * flat;
+  double la = 0.0;
+  for (int i = tid; i < flat; i += nt) la += static_cast<double>(residual[i]) * fn[frow + i];
+  red[tid] = la;
+  __syncthreads();
+  for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; __syncthreads(); }
+  if (tid == 0) mixes[o] = static_cast<float>(red[0]);  // RAW dot; kernel B applies rms
+}
+// Kernel B (one block): sqrsum→rms, mixes[o]*=rms, gates+Sinkhorn (thread0),
+// layer_out (parallel over hidden), optional folded final RMSNorm.
+__global__ void MhcPreFinishKernel(const float* __restrict__ residual,
+                                   const float* __restrict__ scale, const float* __restrict__ base,
+                                   int hc, int hidden, float rms_eps, float hc_pre_eps,
+                                   float hc_sinkhorn_eps, float hc_post_mult, int iters,
+                                   const float* __restrict__ norm_weight, int has_norm,
+                                   float norm_eps, float* mixes, float* pre_out, float* post_out,
+                                   float* comb_out, float* layer_out) {
   const int hc3 = (2 + hc) * hc;
   const int flat = hc * hidden;
-  const int tid = threadIdx.x;
-  const int nt = blockDim.x;
-  extern __shared__ double red[];  // [nt]
-
+  const int tid = threadIdx.x, nt = blockDim.x;
+  extern __shared__ double red[];
   auto block_reduce = [&](double v) -> double {
     red[tid] = v;
     __syncthreads();
-    for (int s = nt / 2; s > 0; s >>= 1) {
-      if (tid < s) red[tid] += red[tid + s];
-      __syncthreads();
-    }
+    for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; __syncthreads(); }
     const double r = red[0];
     __syncthreads();
     return r;
   };
-
-  // sqrsum = Σ residual[i]^2 ; rms = 1/sqrt(mean + eps)
   double ls = 0.0;
   for (int i = tid; i < flat; i += nt) { const double r = residual[i]; ls += r * r; }
   const double sqrsum = block_reduce(ls);
   const float rms = 1.0f / sqrtf(static_cast<float>(sqrsum / static_cast<double>(flat)) + rms_eps);
-
-  // mixes[o] = (Σ_i residual[i]*fn[o*flat+i]) * rms
-  for (int o = 0; o < hc3; ++o) {
-    double la = 0.0;
-    const int frow = o * flat;
-    for (int i = tid; i < flat; i += nt) la += static_cast<double>(residual[i]) * fn[frow + i];
-    const double acc = block_reduce(la);
-    if (tid == 0) mixes[o] = static_cast<float>(acc) * rms;
-  }
+  for (int o = tid; o < hc3; o += nt) mixes[o] = mixes[o] * rms;  // raw dot → *rms (order-indep)
   __syncthreads();
-
-  // gates + Sinkhorn (tiny hc; thread 0 sequential = host order)
   if (tid == 0) {
     for (int j = 0; j < hc; ++j) pre_out[j] = Sig(mixes[j] * scale[0] + base[j]) + hc_pre_eps;
     for (int j = 0; j < hc; ++j)
@@ -246,16 +248,12 @@ __global__ void MhcPreParallelKernel(const float* __restrict__ residual,
     for (int i = 0; i < hc * hc; ++i) comb_out[i] = m[i];
   }
   __syncthreads();
-
-  // layer_out[h] = Σ_j pre[j]*residual[j*hidden+h] (parallel over h; per-h order kept)
   for (int h = tid; h < hidden; h += nt) {
     float acc = 0.0f;
     for (int j = 0; j < hc; ++j) acc += pre_out[j] * residual[j * hidden + h];
     layer_out[h] = acc;
   }
   __syncthreads();
-
-  // optional folded final RMSNorm over hidden
   if (has_norm) {
     double ss = 0.0;
     for (int h = tid; h < hidden; h += nt) { const double v = layer_out[h]; ss += v * v; }
@@ -278,25 +276,46 @@ __global__ void MhcPostKernel(const float* x, const float* residual, const float
 }
 
 // HcHeadCollapse (triton.py:108-140). Single thread; pre[hc] in local.
-__global__ void HcHeadKernel(const float* x, const float* fn, float scale, const float* base,
-                             int hc, int hidden, float rms_eps, float hc_eps, float* out) {
+// glue-tune — PARALLEL hc_head collapse (was <<<1,1>>> single-thread = the profiled
+// 3.75 ms/instance). One block, blockDim threads over the flat=hc*hidden width: the ss
+// reduction + the hc pre-dots are block-tree reductions (double), the per-h collapse is
+// parallel over hidden (per-h sequential over hc → order kept). CHARACTERIZED near-tie
+// vs the single-thread float accumulation (reduction reorder) — the same class as the
+// other MHC glue; BOTH launchers use this kernel, so head_ip == the #183 round-trip
+// remain BIT-IDENTICAL to each other. `x[p]*r` stays float (host order) before the dot.
+__global__ void HcHeadKernel(const float* __restrict__ x, const float* __restrict__ fn, float scale,
+                             const float* __restrict__ base, int hc, int hidden, float rms_eps,
+                             float hc_eps, float* __restrict__ out) {
   const int flat = hc * hidden;
-  double ss = 0.0;
-  for (int p = 0; p < flat; ++p) {
-    const double v = x[p];
-    ss += v * v;
-  }
-  const float r = 1.0f / sqrtf(static_cast<float>(ss / static_cast<double>(flat)) + rms_eps);
-  float pre[256];
+  const int tid = threadIdx.x, nt = blockDim.x;
+  extern __shared__ double red[];
+  __shared__ float pre_sh[256];
+  __shared__ float rms_sh;
+  auto block_reduce = [&](double v) -> double {
+    red[tid] = v;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) red[tid] += red[tid + s]; __syncthreads(); }
+    const double r = red[0];
+    __syncthreads();
+    return r;
+  };
+  double ls = 0.0;
+  for (int p = tid; p < flat; p += nt) { const double v = x[p]; ls += v * v; }
+  const double ss = block_reduce(ls);
+  if (tid == 0) rms_sh = 1.0f / sqrtf(static_cast<float>(ss / static_cast<double>(flat)) + rms_eps);
+  __syncthreads();
+  const float r = rms_sh;
   for (int m = 0; m < hc; ++m) {
-    float acc = 0.0f;
+    double la = 0.0;
     const int frow = m * flat;
-    for (int p = 0; p < flat; ++p) acc += (x[p] * r) * fn[frow + p];
-    pre[m] = Sig(acc * scale + base[m]) + hc_eps;
+    for (int p = tid; p < flat; p += nt) la += static_cast<double>(x[p] * r) * fn[frow + p];
+    const double acc = block_reduce(la);
+    if (tid == 0) pre_sh[m] = Sig(static_cast<float>(acc) * scale + base[m]) + hc_eps;
   }
-  for (int h = 0; h < hidden; ++h) {
+  __syncthreads();
+  for (int h = tid; h < hidden; h += nt) {
     float acc = 0.0f;
-    for (int m = 0; m < hc; ++m) acc += pre[m] * x[m * hidden + h];
+    for (int m = 0; m < hc; ++m) acc += pre_sh[m] * x[m * hidden + h];
     out[h] = acc;
   }
 }
@@ -678,10 +697,10 @@ std::vector<float> HcHeadLaunch(Queue& q, const std::vector<float>& x,
   Dev dx = Upload(x, s), df = Upload(fn, s), db = Upload(base, s);
   std::vector<float> out(static_cast<size_t>(hidden));
   Dev dout(out.size() * sizeof(float));
-  HcHeadKernel<<<1, 1, 0, s>>>(static_cast<const float*>(dx.p), static_cast<const float*>(df.p),
-                               scale, static_cast<const float*>(db.p), static_cast<int>(hc),
-                               static_cast<int>(hidden), rms_eps, hc_eps,
-                               static_cast<float*>(dout.p));
+  HcHeadKernel<<<1, 256, 256 * sizeof(double), s>>>(
+      static_cast<const float*>(dx.p), static_cast<const float*>(df.p), scale,
+      static_cast<const float*>(db.p), static_cast<int>(hc), static_cast<int>(hidden), rms_eps,
+      hc_eps, static_cast<float*>(dout.p));
   Download(out, dout.p, s);
   Check(cudaStreamSynchronize(s), "sync hc_head");
   return out;
@@ -943,8 +962,8 @@ void HcHeadInPlaceLaunch(Queue& q, float* out, const float* x, const float* fn, 
                          float hc_eps) {
   if (hidden == 0) return;
   cudaStream_t s = AsStream(q);
-  HcHeadKernel<<<1, 1, 0, s>>>(x, fn, scale, base, static_cast<int>(hc),
-                               static_cast<int>(hidden), rms_eps, hc_eps, out);
+  HcHeadKernel<<<1, 256, 256 * sizeof(double), s>>>(x, fn, scale, base, static_cast<int>(hc),
+                                                    static_cast<int>(hidden), rms_eps, hc_eps, out);
   Check(cudaGetLastError(), "hc_head_ip launch");
 }
 
@@ -958,12 +977,17 @@ void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_
                          bool has_norm, float norm_eps) {
   if (hidden == 0) return;
   cudaStream_t s = AsStream(q);
-  const unsigned block = 256;  // one block, parallel over the H/flat width
+  const unsigned block = 256;  // 256 threads/block ⇒ the mix dots stay BIT-IDENTICAL
   const unsigned shmem = block * sizeof(double);
-  MhcPreParallelKernel<<<1, block, shmem, s>>>(
-      residual, fn, scale, base, static_cast<int>(hc), static_cast<int>(hidden), rms_eps,
-      hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, static_cast<int>(iters), norm_weight,
-      has_norm ? 1 : 0, norm_eps, mix_scratch, pre_mix, post_mix, comb_mix, layer_input);
+  const int hc3 = static_cast<int>((2 + hc) * hc);
+  const int flat = static_cast<int>(hc * hidden);
+  // Kernel A: the hc3 mix dot-products, ONE BLOCK EACH → concurrent across SMs.
+  MhcPreDotsKernel<<<static_cast<unsigned>(hc3), block, shmem, s>>>(residual, fn, flat, mix_scratch);
+  // Kernel B: sqrsum/rms + gates + Sinkhorn + layer_out + final norm (one block).
+  MhcPreFinishKernel<<<1, block, shmem, s>>>(
+      residual, scale, base, static_cast<int>(hc), static_cast<int>(hidden), rms_eps, hc_pre_eps,
+      hc_sinkhorn_eps, hc_post_mult, static_cast<int>(iters), norm_weight, has_norm ? 1 : 0,
+      norm_eps, mix_scratch, pre_mix, post_mix, comb_mix, layer_input);
   Check(cudaGetLastError(), "mhc_pre_ip launch");
 }
 
@@ -1122,22 +1146,31 @@ void MoeCombineLaunch(Queue& q, float* out, const float* eo, const float* weight
 // (cpu_ops.cpp MatmulChunked<true>, f32 accumulate, LoadF32=BF16ToF32). Replaces
 // the CPU MatmulBT (f32-act×bf16-weight, which the CUDA elementwise MatmulBT lacks)
 // so the resident step is 100% device — no host op inside the capture region.
+// TUNED (glue-tune): ONE WARP per expert (was one thread per expert looping H=4096
+// serially — 7.5% of the graphed step). The 32 lanes stride over H, then a warp-tree
+// reduce. NEAR-TIE vs the prior sequential kernel (the strided partials reorder the
+// f32 sum vs h=0,1,2,… — the same reassociation class as the K-quant CUDA GEMM); the
+// integer/bf16 upcast is unchanged, and the real-model top-k routing stays robust.
 __global__ void RouterGateKernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
                                  float* __restrict__ gating, int ne, int H) {
-  const int e = blockIdx.x * blockDim.x + threadIdx.x;
+  const int e = blockIdx.x * blockDim.y + threadIdx.y;  // one warp per expert
   if (e >= ne) return;
+  const int lane = threadIdx.x;
   const uint16_t* we = w + static_cast<int64_t>(e) * H;
   float acc = 0.0f;
-  for (int h = 0; h < H; ++h)
+  for (int h = lane; h < H; h += 32)
     acc += x[h] * __uint_as_float(static_cast<uint32_t>(we[h]) << 16);  // bf16→f32 exact
-  gating[e] = acc;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0) gating[e] = acc;
 }
 void RouterGateLaunch(Queue& q, float* gating, const float* x, const void* w_bf16, int64_t ne,
                       int64_t H) {
   if (ne == 0) return;
   cudaStream_t s = AsStream(q);
-  const unsigned block = 128;
-  const unsigned grid = static_cast<unsigned>((ne + block - 1) / block);
+  constexpr int kWarpsPerBlock = 8;
+  dim3 block(32, kWarpsPerBlock);
+  const unsigned grid = static_cast<unsigned>((ne + kWarpsPerBlock - 1) / kWarpsPerBlock);
   RouterGateKernel<<<grid, block, 0, s>>>(x, static_cast<const uint16_t*>(w_bf16), gating,
                                           static_cast<int>(ne), static_cast<int>(H));
   Check(cudaGetLastError(), "router_gate launch");
