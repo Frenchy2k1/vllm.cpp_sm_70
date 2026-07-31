@@ -34413,3 +34413,20 @@ Record checks: doc-checkpoint, README structure, model checklist, device leakage
 and env documentation all pass. `check-agent-record` reports the base tree's
 same six absent closing-commit objects (`444ea9d7`, `7a3f04b2`, `164453a2`) on
 unrelated DONE rows; this diff changes none of those rows or owner hashes.
+
+## 2026-07-31 — GCC 12 production-library `-Werror` portability
+
+`CLAIM-CPU-GCC12-WERROR-PORTABILITY`, isolated worktree
+`.claude/worktrees/codex-cpu-fix`, base `upstream/main` `557988ed`, CPU-only.
+The RED build failed first on the L7 GGUF prefault's deprecated volatile
+compound assignment, then on GCC 12's libstdc++ `-Wrestrict` false positive in
+the KV filesystem temporary-suffix concatenation. The expression-local fixes
+preserve the one-byte-per-page XOR and the exact `.<pid>.<counter>.tmp` value.
+
+The production `vllm` library and both focused test targets now compile clean
+without warning suppression; focused CTest passes 2/2 (`test_gguf_keep_quant`,
+`test_kv_offload_fs`). The requested all-target build progressed to 42% and is
+PARTIAL on two further unrelated test-only GCC 12 `-Wrestrict` diagnostics in
+`test_deepseek_v2_paged_engine.cpp` (actively MLA-owned) and
+`test_glm4_moe_lite_paged_engine.cpp`; those files were not touched, so full
+CTest cannot run from this incomplete build. No GPU, model, or benchmark ran.

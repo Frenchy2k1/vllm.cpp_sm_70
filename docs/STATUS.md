@@ -29,6 +29,12 @@ citing "vLLM 0.25.0" are the last binding measurement against the prior oracle
 
 ## Capability status
 
+GCC 12 production-library maintenance (2026-07-31): the two known `-Werror`
+blockers in GGUF prefaulting and KV-offload temporary-file naming are fixed
+without behavior or lifecycle changes. The production library and focused
+tests build clean; the all-target build remains PARTIAL on two unrelated
+test-only `-Wrestrict` diagnostics, recorded in [BENCHMARKS](BENCHMARKS.md).
+
 vllm.cpp implements an intentionally focused subset of vLLM, held to
 token-for-token correctness against the pinned oracle.
 

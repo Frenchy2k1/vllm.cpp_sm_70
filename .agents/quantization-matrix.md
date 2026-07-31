@@ -7,6 +7,11 @@ advanced 2026-07-26 from the prior `e24d1b24`/0.25.0 pin, see
 [specs/pin-advance.md](specs/pin-advance.md)), llama.cpp `237ad9b` plus the
 documented local type-40/41 fork, MLX `4367c73b`, and MLX-LM `a790972f`.
 
+Maintenance checkpoint for `QUANT-GGUF-KEEPQ-LOADER` (2026-07-31): GCC 12
+`-Werror` portability is restored for the L7 volatile prefault accumulator
+with an expression-only assignment. Prefault reads, defaults, behavior, and
+the row's `ACTIVE` lifecycle are unchanged.
+
 ## Status contract
 
 | Column | Meaning |
