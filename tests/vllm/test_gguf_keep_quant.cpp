@@ -800,7 +800,7 @@ std::string BuildMoeQ8Gguf(const MoeDims& d) {
 
 }  // namespace
 
-TEST_CASE("loader keep-quant expert split is lossless per expert") {
+TEST_CASE("loader keep-quant experts load as a lossless stacked tower (A3)") {
   const MoeDims d;
   const TempFile f(BuildMoeQ8Gguf(d));
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
@@ -826,15 +826,20 @@ TEST_CASE("loader keep-quant expert split is lossless per expert") {
     const std::string p = "blk." + std::to_string(il) + ".";
     const auto& kl = kept.layers[static_cast<size_t>(il)].moe;
     const auto& bl = base.layers[static_cast<size_t>(il)].moe;
+    // A3: keep-quant no longer splits per-expert — the whole [E*out,in] tower loads
+    // as ONE stacked block tensor (expert_*_kq); the per-expert vector is EMPTY.
+    CHECK(kl.expert_gate.empty());
+    CHECK(kl.expert_up.empty());
+    CHECK(kl.expert_down.empty());
     struct Stack {
-      const std::vector<vllm::OwnedTensor>* q;
-      const std::vector<vllm::OwnedTensor>* b;
+      const vllm::OwnedTensor* kq;              // A3 stacked [E*out,in] (kept)
+      const std::vector<vllm::OwnedTensor>* b;  // base expand-bf16 per-expert
       std::string name;
     };
     const Stack stacks[] = {
-        {&kl.expert_gate, &bl.expert_gate, p + "ffn_gate_exps.weight"},
-        {&kl.expert_up, &bl.expert_up, p + "ffn_up_exps.weight"},
-        {&kl.expert_down, &bl.expert_down, p + "ffn_down_exps.weight"},
+        {&kl.expert_gate_kq, &bl.expert_gate, p + "ffn_gate_exps.weight"},
+        {&kl.expert_up_kq, &bl.expert_up, p + "ffn_up_exps.weight"},
+        {&kl.expert_down_kq, &bl.expert_down, p + "ffn_down_exps.weight"},
     };
     for (const Stack& s : stacks) {
       CAPTURE(s.name);
@@ -842,27 +847,26 @@ TEST_CASE("loader keep-quant expert split is lossless per expert") {
       const vllm::GgufTensorInfo& t = g.Get(s.name);
       const int64_t out_dim = t.shape[1];
       const int64_t in_dim = t.shape[2];
-      REQUIRE(s.q->size() == static_cast<size_t>(d.E));
       REQUIRE(s.b->size() == static_cast<size_t>(d.E));
       const size_t per_bytes =
           vt::RowSizeBytes(vt::DType::kQ8_0, out_dim * in_dim);
+      // A3: the whole tower is ONE stacked [E*out, in] Q8_0 block tensor, byte-for-byte
+      // the file's tensor (a wrong offset / short load is caught by the memcmp below).
+      CHECK(s.kq->dtype == vt::DType::kQ8_0);
+      CHECK(s.kq->nk == true);
+      CHECK(s.kq->shape[0] == d.E * out_dim);
+      CHECK(s.kq->shape[1] == in_dim);
+      REQUIRE(s.kq->bytes.size() == static_cast<size_t>(d.E) * per_bytes);
+      CHECK(std::memcmp(s.kq->bytes.data(), t.data,
+                        static_cast<size_t>(d.E) * per_bytes) == 0);
       for (int64_t e = 0; e < d.E; ++e) {
         CAPTURE(e);
-        const vllm::OwnedTensor& q = (*s.q)[static_cast<size_t>(e)];
         const vllm::OwnedTensor& bexp = (*s.b)[static_cast<size_t>(e)];
-        CHECK(q.dtype == vt::DType::kQ8_0);
-        CHECK(q.nk == true);
-        CHECK(q.shape[0] == out_dim);
-        CHECK(q.shape[1] == in_dim);
-        REQUIRE(q.bytes.size() == per_bytes);
-        // The slice is EXACTLY this expert's byte range of the stacked tensor —
-        // a wrong offset (e.g. always expert 0) is caught here.
-        CHECK(std::memcmp(q.bytes.data(),
-                          t.data + static_cast<size_t>(e) * per_bytes,
-                          per_bytes) == 0);
-        // ...and dequantizing it reproduces the expanded expert byte for byte.
-        const std::vector<uint16_t> rehydrated =
-            ExpandAndTranspose(kQ8_0, q.bytes.data(), out_dim, in_dim);
+        // Each expert slice of the stacked tower dequants to the base bf16 expert
+        // byte for byte (a wrong per-expert offset is caught here).
+        const std::vector<uint16_t> rehydrated = ExpandAndTranspose(
+            kQ8_0, s.kq->bytes.data() + static_cast<size_t>(e) * per_bytes, out_dim,
+            in_dim);
         REQUIRE(rehydrated.size() * sizeof(uint16_t) == bexp.bytes.size());
         CHECK(std::memcmp(rehydrated.data(), bexp.bytes.data(),
                           bexp.bytes.size()) == 0);

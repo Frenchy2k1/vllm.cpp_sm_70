@@ -4275,6 +4275,71 @@ std::vector<uint16_t> ExpertMlp(Dev d, const OwnedTensor& gate,
   return MatmulBf16(d, act, n, I, down);  // [n,H]
 }
 
+// A3 W3a: a MatmulBT over a ROW-SLICE [row_off, row_off+N) of a stacked keep-quant
+// expert tower `w` [E*out, in]. Byte-IDENTICAL to MatmulF32/MatmulBf16 on a standalone
+// per-expert OwnedTensor (same kMatmulBTQuant core, same slice bytes). CRITICAL: the
+// whole tower is made DEVICE-RESIDENT via ResidentWeight (CUDA `needs_weight_staging`
+// is TRUE — the kernel CANNOT read host bytes; a raw-host-ptr view produces garbage),
+// staged ONCE (cached on `w.d_dev`) and REUSED per expert; the slice offsets the
+// RESIDENT ptr. The tower is nk=true ([N,K]) so MatmulBT applies (row = whole blocks,
+// row_off*row_bytes never cuts a block).
+Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
+                       int64_t row_off) {
+  const Tensor whole = ResidentWeight(d, w);  // stage/view the WHOLE tower (cached)
+  const size_t row_bytes = vt::RowSizeBytes(w.dtype, K);
+  Tensor wt = whole;  // inherit resident data ptr + device + dtype + repacked
+  wt.data = static_cast<void*>(static_cast<uint8_t*>(whole.data) +
+                               static_cast<size_t>(row_off) * row_bytes);
+  wt.rank = 2;
+  wt.shape[0] = N;
+  wt.shape[1] = K;
+  wt.stride[0] = K;
+  wt.stride[1] = 1;
+  return wt;
+}
+
+std::vector<float> MatmulF32Slice(Dev d, const std::vector<uint16_t>& x, int64_t M,
+                                  int64_t N, int64_t K, const OwnedTensor& w,
+                                  int64_t row_off) {
+  DBuf dx(d, DType::kBF16, {M, K}, x.data());
+  DBuf dout(d, DType::kF32, {M, N});
+  Tensor dw = KqResidentSlice(d, w, N, K, row_off);
+  vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
+  std::vector<float> out(static_cast<size_t>(M) * N);
+  dout.Download(d, out.data());
+  return out;
+}
+
+std::vector<uint16_t> MatmulBf16Slice(Dev d, const std::vector<uint16_t>& x, int64_t M,
+                                      int64_t N, int64_t K, const OwnedTensor& w,
+                                      int64_t row_off) {
+  DBuf dx(d, DType::kBF16, {M, K}, x.data());
+  DBuf dout(d, DType::kBF16, {M, N});
+  Tensor dw = KqResidentSlice(d, w, N, K, row_off);
+  vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
+  std::vector<uint16_t> out(static_cast<size_t>(M) * N);
+  dout.Download(d, out.data());
+  return out;
+}
+
+// A3 W3a: ExpertMlp for expert `e` over the STACKED keep-quant towers (gate/up [E*I,H]
+// sliced at e*I; down [E*H,I] sliced at e*H). Byte-IDENTICAL to ExpertMlp on the
+// per-expert copies — the ONLY difference is the weight is a slice-view of the whole
+// tower, not a standalone OwnedTensor (same bytes, same compute). This makes the
+// stacked-tower loader (A3 W2) a byte-exact memory-layout refactor; grouping (W3b) is
+// an additive optimization on top.
+std::vector<uint16_t> ExpertMlpKq(Dev d, const OwnedTensor& gate_kq,
+                                  const OwnedTensor& up_kq, const OwnedTensor& down_kq,
+                                  const std::vector<uint16_t>& x, int64_t e, int64_t n,
+                                  int64_t H, int64_t I) {
+  std::vector<float> hg = MatmulF32Slice(d, x, n, I, H, gate_kq, e * I);  // [n,I]
+  std::vector<float> hu = MatmulF32Slice(d, x, n, I, H, up_kq, e * I);    // [n,I]
+  std::vector<uint16_t> act(static_cast<size_t>(n) * I);
+  for (size_t i = 0; i < act.size(); ++i)
+    act[i] = vt::F32ToBF16(Silu(hg[i]) * hu[i]);
+  return MatmulBf16Slice(d, act, n, H, I, down_kq, e * H);  // [n,H]
+}
+
 // fp4-resident per-expert silu-mul MLP (M2.2b): identical to ExpertMlp but the
 // gate/up/down NVFP4 weights are read on-device via vt::MatmulNvfp4.
 std::vector<uint16_t> ExpertMlpNvfp4(Dev d, const Nvfp4Weight& gate,
@@ -5148,6 +5213,11 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
         fp4 ? ExpertMlpNvfp4(d, w.expert_gate_fp4[static_cast<size_t>(e)],
                              w.expert_up_fp4[static_cast<size_t>(e)],
                              w.expert_down_fp4[static_cast<size_t>(e)], xg, n, H, I)
+        : !w.expert_gate_kq.Empty()
+            // A3 keep-quant: gate/up/down are slices of the stacked tower (byte-exact
+            // with the pre-A3 per-expert ExpertMlp; W3b grouping lands additively).
+            ? ExpertMlpKq(d, w.expert_gate_kq, w.expert_up_kq, w.expert_down_kq, xg, e,
+                          n, H, I)
             : ExpertMlp(d, w.expert_gate[static_cast<size_t>(e)],
                         w.expert_up[static_cast<size_t>(e)],
                         w.expert_down[static_cast<size_t>(e)], xg, n, H, I);

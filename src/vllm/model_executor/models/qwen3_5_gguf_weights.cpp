@@ -1185,23 +1185,50 @@ std::vector<OwnedTensor> LoadExpertsT(const GgufFile& g, int64_t il,
   return experts;
 }
 
-// Stacked routed experts into EITHER the fp4-resident vector or the bf16 one.
-// The fp4 arm keeps the GGUF's own [N=out, K=in] per-expert orientation (which
-// is already what vt::MatmulNvfp4 reads), so unlike LoadExpertsT it does not
-// transpose; the per-expert `<stem>.scale` / `.input_scale` sidecars ride along.
+// A3: load the WHOLE keep-quant expert tower as ONE stacked [E*out, in] block tensor
+// (row_offset=0, all E*out rows) — the [E*N,K] layout vt::MatmulBTQuantGrouped consumes.
+// The keep-quant arm of LoadExpertsT slices per-expert WITHOUT transpose, so the whole
+// tower IS this layout; loading it whole REPLACES the E per-expert copies (memory-neutral,
+// no duplicate ~30GB on the 35B). Called only when the tower routes keep-quant.
+OwnedTensor LoadExpertsStackedKq(const GgufFile& g, int64_t il, const std::string& stem,
+                                 int64_t num_experts, const GgufLoadPolicy& pol) {
+  const std::string name = Blk(il, stem);
+  const GgufTensorInfo& ti = g.Get(name);
+  VT_CHECK(ti.shape.size() == 3 && ti.shape[0] == num_experts,
+           "qwen3_5 gguf A3: expected [E,out,in] expert tensor " + stem);
+  const int64_t out_dim = ti.shape[1];
+  const int64_t in_dim = ti.shape[2];
+  const GgufResidency r =
+      pol.Route(ti, GgufTensorRole::kStackedExpertWeight);  // ONE audit event
+  VT_CHECK(r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16,
+           "qwen3_5 gguf A3: LoadExpertsStackedKq for a non-keep residency on " + name);
+  // Each expert = out_dim WHOLE rows, so E*out_dim rows never cuts a block/f16 row.
+  return OwnGgufKeptSlice(g, pol, ti, r, num_experts * out_dim, in_dim,
+                          /*row_offset=*/0);
+}
+
+// Route the stacked routed-expert tower to EXACTLY ONE of: fp4-resident (*fp4), the
+// bf16-EXPAND per-expert transposed vector (*bf16), or the A3 keep-quant WHOLE stacked
+// tensor (*kq). The fp4 arm keeps the GGUF's own [N=out,K=in] orientation (what
+// vt::MatmulNvfp4 reads). The MoE forward dispatch keys on which one is non-empty.
 void LoadExpertsOrNvfp4(const GgufFile& g, int64_t il, const std::string& stem,
                         int64_t num_experts, const GgufLoadPolicy& pol,
-                        std::vector<OwnedTensor>* bf16,
-                        std::vector<Nvfp4Weight>* fp4) {
+                        std::vector<OwnedTensor>* bf16, std::vector<Nvfp4Weight>* fp4,
+                        OwnedTensor* kq) {
   const std::string name = Blk(il, stem);
   const GgufTensorInfo& t = g.Get(name);
-  if (PeekRoute(pol, t, GgufTensorRole::kStackedExpertWeight) ==
-      GgufResidency::kNvfp4Fp4) {
+  const GgufResidency peek =
+      PeekRoute(pol, t, GgufTensorRole::kStackedExpertWeight);
+  if (peek == GgufResidency::kNvfp4Fp4) {
     (void)pol.Route(t, GgufTensorRole::kStackedExpertWeight);  // ONE audit event
     *fp4 = OwnGgufNvfp4Experts(g, name, num_experts, pol);
     return;
   }
-  *bf16 = LoadExpertsT(g, il, stem, num_experts, pol);  // routes/audits itself
+  if (peek == GgufResidency::kExpandBf16) {
+    *bf16 = LoadExpertsT(g, il, stem, num_experts, pol);  // per-expert transposed; audits
+    return;
+  }
+  *kq = LoadExpertsStackedKq(g, il, stem, num_experts, pol);  // keep-quant whole; audits
 }
 
 MoeBlockWeights LoadMoeGguf(const GgufFile& g, int64_t il, const HfConfig& c,
@@ -1219,11 +1246,11 @@ MoeBlockWeights LoadMoeGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   // historical transposed bf16 slabs. Exactly one set is filled, which is the
   // invariant the MoE forward's `!expert_*_fp4.empty()` dispatch relies on.
   LoadExpertsOrNvfp4(g, il, "ffn_gate_exps.weight", c.num_experts, pol,
-                     &m.expert_gate, &m.expert_gate_fp4);
+                     &m.expert_gate, &m.expert_gate_fp4, &m.expert_gate_kq);
   LoadExpertsOrNvfp4(g, il, "ffn_up_exps.weight", c.num_experts, pol,
-                     &m.expert_up, &m.expert_up_fp4);
+                     &m.expert_up, &m.expert_up_fp4, &m.expert_up_kq);
   LoadExpertsOrNvfp4(g, il, "ffn_down_exps.weight", c.num_experts, pol,
-                     &m.expert_down, &m.expert_down_fp4);
+                     &m.expert_down, &m.expert_down_fp4, &m.expert_down_kq);
   LoadMatmulWeightOrNvfp4(g, Blk(il, "ffn_gate_shexp.weight"), pol,
                           &m.shared_gate_proj, &m.shared_gate_proj_fp4);
   LoadMatmulWeightOrNvfp4(g, Blk(il, "ffn_up_shexp.weight"), pol,
