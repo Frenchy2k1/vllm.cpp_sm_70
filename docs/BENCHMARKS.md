@@ -34,6 +34,10 @@ cheaper option (one workflow-level group keyed on `github.ref` with
 `before..sha` range of every superseded push. Reproduction entry points are
 unchanged. See the "Build and test lanes" section of [STATUS.md](STATUS.md).
 
+## Cross-reference speed-lever scan (2026-07-31, `CLAIM-XREF-LEVER-SCAN`) — no throughput owed (analysis)
+
+5-source parallel scan (vLLM/SGLang/llama.cpp/ds4/ours) for batch-1 raw-decode levers toward Laguna-beat-vLLM and DeepSeek-beat-ds4, no-spec, adversarially verified vs our code. Key verified results: (1) ds4 register-prefetch is a MYTH (no cp.async/double-buffer in DwarfStar) — Brick-14 rightly abandoned; ds4's 90% = full-warp-per-row + 1088-B coalesced Q8_0 bursts. (2) Our Q8_0 ships sub-warp (8/16-lane/row) for medium-K → the one testable Path-B lever is porting ds4's 32-lane/8-row warp8 (DGX A/B, not guaranteed). (3) PDL (Programmatic Dependent Launch) is a verified gap — zero in our tree, both llama.cpp+SGLang use it on Blackwell for batch-1 launch-latency. (4) vLLM's 18.8 Laguna bar is MARLIN W4A16 (lower bound); real default FLASHINFER_CUTLASS W4A4 is faster. Ranked plan: `.agents/specs/cross-ref-lever-scan-2026-07-31.md`.
+
 ## DeepSeek-V4-Flash — vLLM on ONE Spark is INFEASIBLE; DwarfStar/GGUF was HW-forced (2026-07-31, `CLAIM-DSV4-VLLM-INFEASIBLE`)
 
 DeepSeek-V4-Flash has been benchmarked against `ds4` = **DwarfStar** (antirez's self-contained GGUF C engine), never vLLM. Unlike Laguna (which fit vLLM at NVFP4, 67 GiB — see below), DeepSeek **cannot run on vLLM on a single GB10 Spark at all**: every vLLM-loadable checkpoint exceeds the 119 GiB unified pool —
