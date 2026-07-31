@@ -10886,3 +10886,5 @@ _(Laguna W11 (2026-07-31, GB10): GPU-busy 2.56s ≈ sync 2.59s ⇒ decode GPU-co
 **qwen3_5 A3 W3 hazard (2026-07-31).** Recorded the strict-35B down-GEMM cast byte-exactness requirement so fresh W2-W4 execution accounts for it (no near-tie on test_qwen36_gguf_engine). No benchmark. See spec §W3.
 
 **qwen3_5 A3 W2/W3a (2026-07-31): incomplete, not landed.** test_gguf_keep_quant caught that keep-quant has 3 per-expert-vector consumers (forward+MTP+test) needing coordinated stacked-tower routing. Byte-exact ExpertMlpKq/slice code is correct+reusable; MTP + test co-changes owed. No benchmark. See spec.
+
+**qwen3_5 A3 W2/W3a #2 (2026-07-31): 1/2 35B strict, not landed.** Staging root cause fixed (ResidentWeight-resident slice) → APEX-Balanced coherent golden; APEX-Compact residual under investigation (whole-tower Alloc / repacked / pre-existing-attribution owed). No benchmark. See spec.
