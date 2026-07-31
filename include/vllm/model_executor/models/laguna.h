@@ -230,6 +230,23 @@ struct LagunaMoeWeights {
   OwnedTensor shared_gate;    // [moe_I, H]  (ffn_gate_shexp, Q8_0)
   OwnedTensor shared_up;      // [moe_I, H]  (ffn_up_shexp,   Q8_0)
   OwnedTensor shared_down;    // [H, moe_I]  (ffn_down_shexp, Q8_0)
+
+  // NVFP4 arm (task #230, spec laguna-nvfp4-arm-2026-07-31.md). The
+  // poolside/Laguna-S-2.1-NVFP4 checkpoint keeps attention + dense-MLP + shared
+  // norms/router/embed/lm_head in BF16 (loaded into the OwnedTensor fields
+  // above / in LagunaAttnWeights, LagunaMlpWeights, LagunaWeights) and quantizes
+  // ONLY the routed + shared EXPERTS to W4A4 NVFP4 (weight_packed U8 [N,K/2] +
+  // weight_scale F8 [N,K/16] + weight_global_scale f32 + input_global_scale f32).
+  // These per-expert Nvfp4Weight fields mirror qwen3_5 MoeBlockWeights.expert_*_fp4
+  // and are consumed by kMoeGroupedGemmNvfp4 / vt::MatmulNvfp4Fp4 in the N2
+  // forward-branch. ADDITIVE + dead until the N1 loader (LoadLagunaNvfp4)
+  // populates them; the GGUF keep-quant path never touches them (Empty()).
+  std::vector<Nvfp4Weight> experts_gate_fp4;  // E * [N=moe_I, K=H]
+  std::vector<Nvfp4Weight> experts_up_fp4;    // E * [N=moe_I, K=H]
+  std::vector<Nvfp4Weight> experts_down_fp4;  // E * [N=H, K=moe_I]
+  Nvfp4Weight shared_gate_fp4;   // [N=moe_I, K=H]
+  Nvfp4Weight shared_up_fp4;     // [N=moe_I, K=H]
+  Nvfp4Weight shared_down_fp4;   // [N=H, K=moe_I]
 };
 
 // One Laguna decoder layer.

@@ -66,6 +66,8 @@ Until now every Laguna number was measured against **llama.cpp** (the same UD-Q4
 
 vLLM is ~2.4× our GGUF path. llama.cpp still leads both at batch-1 (its GGUF GEMV is best-in-class for single-request latency; vLLM's edge is throughput under concurrency, not exercised here). Quant differs (ours GGUF-Q4_K vs vLLM NVFP4) — the fully clean apples-to-apple needs **our own NVFP4 Laguna forward arm** (task #230), which puts us on the same tensor-core regime we already reach vLLM parity on for 27B/35B. Repro: `~/laguna-nvfp4/run_vllm4.py` on dgx with `VLLM_TEST_FORCE_FP8_MARLIN=1`, GB10 recipe (drop_caches first, `gpu_memory_utilization=0.60-0.72`, `max_model_len` small — see the OOM-reboot note below).
 
+**Our-engine NVFP4 arm progress (task #230, no throughput owed yet — scaffold):** N1-scaffold LANDED 2026-07-31 — additive `Nvfp4Weight` expert fields on `LagunaMoeWeights` (dead until the N1 loader), CPU build clean + `test_laguna_scaffold` 8/8·167 unchanged. The N1 loader / N2 forward-branch / N4 correctness / N5 speed-vs-18.8 bricks are DGX-gated follow-ons (spec `laguna-nvfp4-arm-2026-07-31.md`).
+
 ## Laguna-S-2.1 (`LagunaForCausalLM`) W7 decode-speed ATTRIBUTION (profile-only): where the 18x to llama.cpp goes (2026-07-31, `CLAIM-LAGUNA-W7-SPEED`)
 
 Research-only `nsys` profile of the W6 decode (`laguna-gen --gpu`, real 3-shard UD-Q4_K_XL, GB10,
