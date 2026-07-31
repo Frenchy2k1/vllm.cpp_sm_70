@@ -1588,6 +1588,13 @@ card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
   `VLLM_ERR_INVALID_ARGUMENT` rather than `VLLM_ERR_MODEL_LOAD` (the contract
   `vllm.h` has documented since v6). Driver: an embedder (the LocalAI vllm-cpp
   backend) could not expose LMCache or the prefill budget in a model config.
+- **The stable C ABI contract is now spiked and current at ABI v10**
+  (`SERVE-C-ABI`, `CLAIM-SERVE-C-ABI-SPIKE`). The accepted
+  [contract](../.agents/specs/c-api-library.md) inventories ownership,
+  no-throw/error mapping, concurrency, versioning and packaging gates. The row
+  remains `ANCHOR-BACKFILL`: the next CPU-only bricks are all-19-symbol `dlsym`
+  coverage, historical-layout compatibility fixtures, allocation-failure
+  no-throw proof, and lifetime sanitizer stress.
 - **DFlash speculative decoding from a GGUF DRAFT WORKS end to end on the GB10
   release target** (`SPEC-DFLASH-GGUF`, `DONE` for correctness on both axes,
   speed `PENDING` by design,

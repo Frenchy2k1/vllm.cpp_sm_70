@@ -118,6 +118,19 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**Stable C ABI contract spike (`SERVE-C-ABI`, 2026-07-31,
+`CLAIM-SERVE-C-ABI-SPIKE`).** Codex (GPT-5), isolated worktree
+`.worktrees/serve-c-abi-spike`, branch `codex/serve-c-abi-spike`, base
+`upstream/main` `a10bd428`. CPU-only records/spec pass: inventory the original
+packaging layer, its ABI/versioning/ownership/error/concurrency contracts, exact
+implementation and test anchors, and a row-sized follow-on breakdown. Owns only
+NEW `.agents/specs/c-api-library.md` plus the `SERVE-C-ABI` row, this claim,
+roadmap/status checkpoint text, `README.md`, `docs/BENCHMARKS.md`,
+`.agents/parity-ledger.md`, and append-only `.agents/state.md`. No source,
+header, CMake, test, model, kernel, or generated fixture changes; verification
+is the existing CPU C/C++/dlopen/export suite plus all record checkers. The row
+is unclaimed at base; no GPU or model download is required.
+
 **CUDA keep-quant GGUF k-quant GEMM — the kCUDA provider for `kMatmulBTQuant`
 (2026-07-29, `CLAIM-CUDA-KEEPQUANT-GEMM`, LANDED + GB10-GATED, NOT pushed; FULL
 SHA reported to caller).** Base `main` HEAD `2191f771`; isolated worktree

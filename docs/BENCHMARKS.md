@@ -10926,3 +10926,20 @@ _(Laguna W11 (2026-07-31, GB10): GPU-busy 2.56s ≈ sync 2.59s ⇒ decode GPU-co
 **qwen3_5 A3 W3b LANDED (2026-07-31, GB10) — A3 COMPLETE.** Keep-quant MoE grouped: per-expert loop → 3 grouped MatmulBTQuantGrouped over stacked towers. Gate: DGX APEX-Compact grouped-vs-per-expert BYTE-IDENTICAL continuation + strict golden pass. Launch reduction on the GGUF keep-quant MoE path; byte-exact.
 
 **Fold-plan A3 CLOSED (2026-07-31).** Keep-quant grouped-MoE fold done on both Laguna + qwen3_5 GGUF (shared MatmulBTQuantGrouped). Byte-exact; launch reduction on both keep-quant MoE paths.
+## Stable C ABI W0 contract spike (2026-07-31) - NOT APPLICABLE
+
+`SERVE-C-ABI` / `CLAIM-SERVE-C-ABI-SPIKE` is a records and documentation
+checkpoint. It adds the accepted C-API contract spec and corrects stale public
+ABI v9 labels to the source-of-truth ABI v10; no source, header, build rule,
+test, model, kernel, or runtime behavior changed. Therefore no throughput,
+latency, or memory number is applicable or claimed.
+
+CPU verification is the existing C11 header compile, C++ behavioral suite,
+runtime `dlopen` smoke, exact-export check, and record checkers. The focused
+CPU Release gate passed 3/3 (`test_capi`, `test_dlopen`,
+`capi_shared_exports_only_abi`) after explicitly building `vllm_shared`; GCC 12
+needed `-Wno-volatile -Wno-restrict` for two unrelated existing `-Werror`
+diagnostics outside this diff. The row remains
+`ANCHOR-BACKFILL`; W1-W5 in
+[the spec](../.agents/specs/c-api-library.md) name the remaining compatibility,
+no-throw, lifetime, and standalone-consumer gates.

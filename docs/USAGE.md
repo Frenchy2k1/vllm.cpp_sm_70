@@ -112,7 +112,7 @@ API surface, auth, and metrics.
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 9`,
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 10`,
 19 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
@@ -151,6 +151,7 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v7 | Prefix caching (tri-state) |
 | v8 | Custom logits processors |
 | v9 | Engine sizing: chunked-prefill token budget, scheduling policy, external KV connector / LMCache |
+| v10 | Jump-forward decoding (tri-state, default off) |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
