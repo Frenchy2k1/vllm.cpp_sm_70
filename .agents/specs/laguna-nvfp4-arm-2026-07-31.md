@@ -47,6 +47,52 @@ Recipe = **bf16 attention + dense MLP, W4A4-NVFP4 routed experts**:
   qwen3_5's `expert_{gate,up,down}_fp4` + `shared_*_fp4`). `LoadLagunaNvfp4`
   over the HF name-map with the W4A4 global-scale delta. CPU build-verify +
   a loader unit test (shapes + a byte-identity check vs the raw file, RED-first).
+  - **N1a DONE (98a67a01):** additive `Nvfp4Weight` expert fields on
+    `LagunaMoeWeights` (CPU-built, `test_laguna_scaffold` 8/8·167).
+  - **N1b — the loader body (CONCRETE RECIPE, derived 2026-07-31).** Replace the
+    `VT_CHECK(false)` in `LoadLagunaForCausalLMWeights(const
+    std::vector<SafetensorsFile>& shards, const HfConfig&)`
+    (`laguna_weights.cpp:240`). Steps, all reusing qwen3_5_weights.cpp helpers
+    (same TU family — extract them to a shared header or duplicate the ~5-line
+    resolver):
+    1. **Resolver** (copy `qwen3_5_weights.cpp:423-434`): build
+       `where = unordered_map<string,const SafetensorsFile*>` from each
+       `shard.Names()`, then `TensorResolver get = [where](name) -> const
+       StTensor& { ...->Get(name); }`.
+    2. **Top-level** (HF names, all BF16): `LoadBf16Direct(get,
+       "model.embed_tokens.weight")`, `..."model.norm.weight"`, `lm_head` =
+       `LoadBf16Direct(get,"lm_head.weight")` (NOT fp4 — the checkpoint keeps it
+       bf16; verified in the index).
+    3. **Per layer l in 0..num_hidden_layers-1** (`model.layers.l.`):
+       - norms BF16: `input_layernorm.weight`, `post_attention_layernorm.weight`.
+       - attn BF16: `self_attn.{q,k,v,o,g}_proj.weight` +
+         `self_attn.{q,k}_norm.weight` (per-head [head_dim]). Q width is
+         per-layer variable (`LagunaParams::QHeadsForLayer`) — size from the
+         tensor shape, do NOT assume uniform.
+       - **layer 0 (dense, `mlp_only_layers=={0}`):** `mlp.{gate,up,down}_proj.weight` BF16.
+       - **layers 1..47 (MoE):** router `mlp.gate.weight` BF16->F32; the
+         `e_score_correction_bias` (verify HF name, likely
+         `mlp.gate.e_score_correction_bias` or absent — if absent, leave Empty,
+         the sigmoid-noaux router tolerates a zero bias); per-expert e in
+         0..num_experts-1: `experts_{gate,up,down}_fp4.push_back(LoadNvfp4RawW4A4(
+         get, "mlp.experts.e.{gate,up,down}_proj"))`; shared expert
+         `mlp.shared_expert{,s}.{gate,up,down}_proj` -> `shared_*_fp4` (verify the
+         exact shared-expert HF stem from the index).
+    4. **`LoadNvfp4RawW4A4`** = `LoadNvfp4Raw` (`:259`) with the name delta:
+       reads `.weight_packed`, `.weight_scale` (F8), and — instead of
+       `.weight_scale_2` — `.weight_global_scale` (f32) into `scale2` +
+       `weight_global_scale_inv`, plus `.input_global_scale` (f32) into
+       `input_global_scale_inv`, and `alpha = scale2 / input_global_scale_inv`
+       (the W4A4 recipe already documented on `Nvfp4Weight`, qwen3_5_weights.h:120-132).
+    5. **Dual RoPE caches** (Laguna-specific, already implemented): build the
+       full-attn YaRN-64 + sliding-128 cos/sin via the W3 `BuildLaguna{FullYarn,
+       Sliding}CosSin` (`laguna_ops.cpp`) into `LagunaWeights`, same as the GGUF
+       path does.
+    - **Gate:** truly validating N1b needs the real 67 GiB checkpoint (DGX) OR a
+      synthetic 2-layer safetensors fixture (a `test_laguna_nvfp4_loader` that
+      writes a tiny fp4 tensor + checks `experts_gate_fp4[0].{packed,scale,scale2,
+      n,k}` round-trip byte-identical, RED-first on a wrong-scale-name mutant).
+      The fixture is the CPU-gateable path; recommend it over deferring to DGX.
 - **N2 — forward quant-branch.** In `laguna.cpp`, select the NVFP4 arm when the
   weights are fp4-resident: attention/dense via bf16 `MatmulBT`; routed experts
   via `kMoeGroupedGemmNvfp4` (P = T·top_k, mirror the A3 grouped shape); shared
