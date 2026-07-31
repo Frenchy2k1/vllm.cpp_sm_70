@@ -32,8 +32,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/laguna_ops.h"
@@ -230,6 +232,53 @@ std::vector<float> LqGemmRowSlice(vt::Queue& q, const OwnedTensor& w,
   return out;
 }
 
+// W8 lever #2 (grouped-expert GEMM): default-ON, `VT_LAGUNA_GROUPED_MOE=0` restores
+// the byte-exact per-expert loop in the SAME binary. Mirrors ds4 GroupedMoeEnabled.
+inline bool LagunaGroupedMoeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_GROUPED_MOE");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
+// Grouped keep-quant expert GEMM over the stacked [E*N,K] tower: out[P,N] where
+// out[p,:] = act[p,:] · weight[expert_ids[p]*N .. +N] (the block row-slice for that
+// expert). ONE vt::MatmulBTQuantGrouped launch replaces P per-expert LqGemmRowSlice
+// matvecs. BYTE-IDENTICAL to the per-expert path — the grouped op's CPU provider loops
+// the EXACT kMatmulBTQuant per group; the CUDA provider is the same integer-dot core
+// (ds4-gated byte-exact). Routes through the SHARED vt keep-quant grouped op (fold
+// policy: no hand-rolled per-model kernel). Mirror of deepseek_v4.cpp
+// GemmGroupedExpertsKq (drains before the local eids/out buffers leave scope).
+std::vector<float> LqGemmGrouped(vt::Queue& q, const OwnedTensor& w,
+                                 const std::vector<float>& act,
+                                 const std::vector<int32_t>& expert_ids, int64_t P,
+                                 int64_t N, int64_t K) {
+  VT_CHECK(vt::IsBlockQuant(w.dtype) && !w.repacked,
+           "laguna grouped expert GEMM requires a non-repacked block-quant stacked weight");
+  VT_CHECK(w.rank == 2 && w.shape[1] == K,
+           "laguna grouped expert GEMM: weight K mismatch");
+  VT_CHECK(static_cast<int64_t>(act.size()) == P * K,
+           "laguna grouped expert GEMM: act size mismatch");
+  VT_CHECK(static_cast<int64_t>(expert_ids.size()) == P,
+           "laguna grouped expert GEMM: expert_ids size mismatch");
+  std::vector<float> out(static_cast<size_t>(P) * N);
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const bool on_dev = q.device.type != vt::DeviceType::kCPU;
+  vt::Queue& gq = on_dev ? q : cpuq;
+  std::vector<int32_t> eids = expert_ids;  // stable buffer for the (unified) tensor
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(act.data()),
+                                        vt::DType::kF32, gq.device, {P, K});
+  vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, gq.device, {P, N});
+  vt::Tensor eid =
+      vt::Tensor::Contiguous(eids.data(), vt::DType::kI32, gq.device, {P});
+  vt::Tensor wt = w.View();
+  wt.device = gq.device;  // unified-memory block view retag
+  vt::MatmulBTQuantGrouped(gq, o, a, wt, eid);
+  if (on_dev) DrainQueue(gq);
+  return out;
+}
+
 // ── W6 shared building blocks (used by BOTH the stateless full-recompute and the
 //    KV-cached incremental forward, so the two paths are bit-identical BY SHARING
 //    the exact same float ops — the moved code is verbatim from the W5 forward). ──
@@ -356,18 +405,45 @@ std::vector<float> LagunaFfnBlock(vt::Queue& q, const LagunaLayerWeights& lw,
         rlog, bias, p.num_experts_per_tok, p.norm_topk_prob,
         p.moe_routed_scaling_factor);
     std::vector<float> acc(static_cast<size_t>(H), 0.0F);
-    for (size_t s = 0; s < sel.ids.size(); ++s) {
-      const int64_t id = sel.ids[s];
+    const int64_t Pk = static_cast<int64_t>(sel.ids.size());
+    if (LagunaGroupedMoeEnabled() && Pk > 0) {
+      // W8 lever #2: collapse this token's Pk per-expert gate/up/down matvecs into 3
+      // grouped launches. Row s := (this token's hrow, expert sel.ids[s]) IN SLOT
+      // ORDER, so eo[s] == the per-expert down output for expert sel.ids[s] and the
+      // acc combine below runs in the exact same order as the per-expert fallback →
+      // byte-identical. gate/up/down each = ONE vt::MatmulBTQuantGrouped.
+      std::vector<int32_t> eids(sel.ids.begin(), sel.ids.end());
+      std::vector<float> arep(static_cast<size_t>(Pk) * H);
+      for (int64_t s = 0; s < Pk; ++s)
+        std::memcpy(arep.data() + static_cast<size_t>(s) * H, hrow.data(),
+                    static_cast<size_t>(H) * sizeof(float));
       const std::vector<float> eg =
-          LqGemmRowSlice(q, lw.moe.experts_gate, hrow, 1, moe_I, H, id * moe_I);
+          LqGemmGrouped(q, lw.moe.experts_gate, arep, eids, Pk, moe_I, H);
       const std::vector<float> eu =
-          LqGemmRowSlice(q, lw.moe.experts_up, hrow, 1, moe_I, H, id * moe_I);
-      const std::vector<float> eact = GateUpSilu(eg, eu, 1, moe_I);
+          LqGemmGrouped(q, lw.moe.experts_up, arep, eids, Pk, moe_I, H);
+      const std::vector<float> eact = GateUpSilu(eg, eu, Pk, moe_I);
       const std::vector<float> eo =
-          LqGemmRowSlice(q, lw.moe.experts_down, eact, 1, H, moe_I, id * H);
-      const float wgt = sel.weights[s];
-      for (int64_t d = 0; d < H; ++d)
-        acc[static_cast<size_t>(d)] += wgt * eo[static_cast<size_t>(d)];
+          LqGemmGrouped(q, lw.moe.experts_down, eact, eids, Pk, H, moe_I);
+      for (int64_t s = 0; s < Pk; ++s) {
+        const float wgt = sel.weights[static_cast<size_t>(s)];
+        const float* eor = eo.data() + static_cast<size_t>(s) * H;
+        for (int64_t d = 0; d < H; ++d)
+          acc[static_cast<size_t>(d)] += wgt * eor[d];
+      }
+    } else {
+      for (size_t s = 0; s < sel.ids.size(); ++s) {
+        const int64_t id = sel.ids[s];
+        const std::vector<float> eg =
+            LqGemmRowSlice(q, lw.moe.experts_gate, hrow, 1, moe_I, H, id * moe_I);
+        const std::vector<float> eu =
+            LqGemmRowSlice(q, lw.moe.experts_up, hrow, 1, moe_I, H, id * moe_I);
+        const std::vector<float> eact = GateUpSilu(eg, eu, 1, moe_I);
+        const std::vector<float> eo =
+            LqGemmRowSlice(q, lw.moe.experts_down, eact, 1, H, moe_I, id * H);
+        const float wgt = sel.weights[s];
+        for (int64_t d = 0; d < H; ++d)
+          acc[static_cast<size_t>(d)] += wgt * eo[static_cast<size_t>(d)];
+      }
     }
     if (has_shared) {
       const std::vector<float> sg = LqGemm(q, lw.moe.shared_gate, hrow, 1, moe_I, H);
