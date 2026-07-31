@@ -798,6 +798,25 @@ inline int Q8IlpRows(const char* v) {
   return 1;
 }
 
+// Brick 14 (ds4 raw-mechanism lever): A/B flag for the INTRA-ROW multi-BLOCK register
+// PREFETCH Q8_0 GEMV. Default OFF (=1 → the plain one-row-per-warp kernel). VT_V4_Q8_PREFETCH
+// =2 or =4 selects the software-pipelined kernel: for a SINGLE output row, PF Q8_0 super-block
+// loads (int8 qs + f16 scale) are hoisted into registers BEFORE the dependent __dp4a chains,
+// so PF independent weight+act load streams are outstanding per row. This is the ds4 mechanism
+// (register-resident memory-level parallelism — the ncu DIFF in ds4-q8-raw-mechanism-2026-07-30.md
+// showed ds4 longSB 17.2 @ 56 regs vs OURS 54.4 @ 39 regs, longSB INVERSELY tracking register
+// count). DISTINCT from the Brick-13 multi-ROW ILP (which changed the row→warp map, raised longSB
+// to 85-127 → measured-negative): here the warp→output map is UNCHANGED (one row per warp), only
+// the per-row block loop is software-pipelined. Read per call so in-process CUDA tests and the
+// captured decode graph pick it up at launch/capture time. BIT-IDENTICAL (same integer __dp4a
+// order, same f16-scale fold, same per-row accumulation order — asserted in test_cuda_quant_dot).
+inline int Q8Prefetch(const char* v) {
+  if (!v) return 1;
+  if (v[0] == '2' && v[1] == '\0') return 2;
+  if (v[0] == '4' && v[1] == '\0') return 4;
+  return 1;
+}
+
 // Probe (measurement only): print each DISTINCT Q8_0 dense projection shape (nb,n)
 // once so the nsys per-grid.x breakdown can be attributed to K. Guarded (default off).
 inline void Q8ProbeShape(int64_t m, int64_t n, int64_t nb, bool grouped) {
@@ -918,6 +937,80 @@ __global__ void QuantDotGemmQ8_0MultiRowKernel(OutT* __restrict__ out,
       if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial[r];
       else out[i * n + j] = DF32ToBF16(partial[r]);
     }
+  }
+}
+
+// Brick 14 (ds4 raw-mechanism lever): INTRA-ROW multi-BLOCK register-PREFETCH Q8_0 GEMV.
+// The plain kernel (QuantDotGemmQ8_0Kernel) maps ONE output row per warp and runs a
+// DEPENDENT load→unpack→__dp4a chain per lane with a SHALLOW in-flight-load pipeline (ncu
+// 2026-07-31: long-scoreboard 54.4 @ 39 regs, 71.9% occ). ds4's byte-identical `preq` kernel
+// hits long-scoreboard 17.2 @ 56 regs, 60% occ — the ncu DIFF (ds4-q8-raw-mechanism-2026-07-30.md)
+// showed long-scoreboard INVERSELY tracks register count (56→17, 48→36, 39→54): ds4 spends the
+// extra registers on a DEEPER in-flight weight-block load pipeline (register-resident memory-level
+// parallelism) that hides LPDDR5X latency so DRAM stays saturated at LOWER occupancy. L2 and
+// coalescing were REFUTED (ds4 WORSE on both). This kernel reproduces that mechanism on the SAME
+// single-row-per-warp structure (NOT the failed Brick-13 multi-ROW axis): the per-lane block loop
+// is UNROLL-AND-JAMmed by PF — each group of PF blocks issues ALL of its PF weight+act int32 loads
+// (+f16 scales) into registers FIRST, THEN consumes them with PF independent __dp4a chains, so PF
+// block loads are outstanding per row before the first dependent MAC. More live registers ⇒ nvcc
+// keeps a deeper load pipeline ⇒ lower long-scoreboard.
+// BIT-IDENTICAL to QuantDotGemmQ8_0Kernel: each lane visits blocks in the SAME ascending order
+// (lane, lane+32, lane+64, …: group g's PF blocks are base_g+{0,32,…,32(PF-1)} with base_g=lane+g*32*PF,
+// accumulated p-ascending then g-ascending), the 8×__dp4a per block, the 32-wide warp reduce, and
+// the f16-scale fold `sumi*(DF16ToF32(wd)*DF16ToF32(ad))` are ALL UNCHANGED — only the loads are
+// hoisted ahead of the MACs. So `partial +=` runs the identical float-add sequence ⇒ same bits.
+template <typename OutT, int PF>
+__global__ void QuantDotGemmQ8_0PrefetchKernel(OutT* __restrict__ out,
+                                               const uint8_t* __restrict__ weight,
+                                               const BlockQ8_0* __restrict__ act, int64_t m,
+                                               int64_t n, int64_t nb, size_t w_row_bytes) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= m * n) return;
+  const int64_t i = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
+  const BlockQ8_0* a_row = act + i * nb;
+  float partial = 0.0f;
+  constexpr int kI32 = kQK8_0 / 4;  // 8 int32 per 32-int8 block
+  for (int64_t base = lane; base < nb; base += static_cast<int64_t>(32) * PF) {
+    // Prefetch phase: hoist ALL PF blocks' weight+act int32 words + folded scales into
+    // registers so PF independent load streams are issued before any dependent __dp4a.
+    int wq[PF][kI32];
+    int aq[PF][kI32];
+    float sc[PF];
+    bool ok[PF];
+#pragma unroll
+    for (int p = 0; p < PF; ++p) {
+      const int64_t b = base + static_cast<int64_t>(p) * 32;
+      ok[p] = (b < nb);
+      if (ok[p]) {
+        const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(
+            w_row + static_cast<size_t>(b) * sizeof(BlockQ8_0));
+        const BlockQ8_0* ab = a_row + b;
+#pragma unroll
+        for (int k = 0; k < kI32; ++k) {
+          wq[p][k] = GetIntB2(wb->qs, k);
+          aq[p][k] = GetIntB2(ab->qs, k);
+        }
+        sc[p] = DF16ToF32(wb->d) * DF16ToF32(ab->d);
+      }
+    }
+    // Compute phase: p-ascending, identical per-block __dp4a order + scale fold as the plain kernel.
+#pragma unroll
+    for (int p = 0; p < PF; ++p) {
+      if (!ok[p]) continue;
+      int sumi = 0;
+#pragma unroll
+      for (int k = 0; k < kI32; ++k) sumi = __dp4a(wq[p][k], aq[p][k], sumi);
+      partial += sumi * sc[p];
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffu, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
+    else out[i * n + j] = DF32ToBF16(partial);
   }
 }
 
@@ -1371,6 +1464,28 @@ void MatmulQ8_0Cuda(Tensor& out, const Tensor& a, const Tensor& b, cudaStream_t 
           static_cast<uint16_t*>(out.data), w, act, m, n, nb, w_row_bytes);
     }
     CheckCuda(cudaGetLastError(), "matmul_bt_quant Q8_0 ILP launch");
+    return;
+  }
+  // Brick 14 (ds4 raw-mechanism lever): INTRA-ROW multi-block register PREFETCH GEMV (opt-in,
+  // plain layout only). Bit-identical to the plain kernel; hoists PF block loads into registers
+  // ahead of the __dp4a chains to deepen the in-flight-load pipeline (register-resident MLP).
+  const int pf = b.q8_0_aligned ? 1 : Q8Prefetch(std::getenv("VT_V4_Q8_PREFETCH"));
+  if (pf >= 2) {
+    if (out.dtype == DType::kF32) {
+      if (pf == 2)
+        QuantDotGemmQ8_0PrefetchKernel<float, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(
+            static_cast<float*>(out.data), w, act, m, n, nb, w_row_bytes);
+      else
+        QuantDotGemmQ8_0PrefetchKernel<float, 4><<<static_cast<unsigned>(grid), block, 0, s>>>(
+            static_cast<float*>(out.data), w, act, m, n, nb, w_row_bytes);
+    } else if (pf == 2) {
+      QuantDotGemmQ8_0PrefetchKernel<uint16_t, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          static_cast<uint16_t*>(out.data), w, act, m, n, nb, w_row_bytes);
+    } else {
+      QuantDotGemmQ8_0PrefetchKernel<uint16_t, 4><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          static_cast<uint16_t*>(out.data), w, act, m, n, nb, w_row_bytes);
+    }
+    CheckCuda(cudaGetLastError(), "matmul_bt_quant Q8_0 prefetch launch");
     return;
   }
   if (b.q8_0_aligned) {  // Brick 4: coalesced-load layout (RepackQ8_0Cuda) — aligned int4 loads

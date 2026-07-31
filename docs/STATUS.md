@@ -121,7 +121,7 @@ llama.cpp converter dropped every nextn tensor (`DeepseekV4GgufHasMtp` returns
 false → clean fall-back to MTP-off). The DS4-native propose/verify decode loop +
 engine spec-config registration are named residuals. **BEAT-ds4 sweep (2026-07-30,
 `CLAIM-DSV4-BEAT-SWEEP`, analysis-only):** our raw autoregressive decode is at its
-GB10 ceiling (13.19 tok/s, Q8_0 front CLOSED after Bricks 3-13), and ds4's
+GB10 ceiling (~13.1-13.2 tok/s, Q8_0 front CLOSED after Bricks 3-14), and ds4's
 16.5-17.2 is itself RAW decode (its MTP/DSpark spec is opt-in, NOT in that
 number). The one path PAST 16.5 is MTP self-spec: `13.19 × (1+p)/1.05`, break-even
 acceptance p≈0.31, plausible p 0.55-0.85 → ~18-23 tok/s. Lossless (token-identical
@@ -129,6 +129,30 @@ to greedy). Gated on unblocking a nextn-carrying GGUF (R1) + the propose/verify
 loop (R2) + device draft (R4). fp16 dequant cache refuted net-slower on GB10; MHC
 a measured tie; routed-MoE we already win. See
 `.agents/specs/deepseek-beat-ds4-sweep-2026-07-30.md`.
+
+**DeepSeek-V4-Flash decode ds4-gap — Brick 14 (Q8_0 intra-row register-prefetch —
+the ds4 raw mechanism)** (2026-07-31, `CLAIM-DSV4-DECODE-BRICK14`, GB10 sm_121a,
+branch `ds4-q8-register-prefetch`, NOT pushed). Built `QuantDotGemmQ8_0PrefetchKernel
+<OutT,PF>` (`src/vt/cuda/cuda_quant_dot.cu`, env `VT_V4_Q8_PREFETCH` default-OFF `=1`,
+opt-in `=2`/`=4`, wired in `MatmulQ8_0Cuda` so both eager forward and captured
+`V4Graph::Step` inherit it): same one-row-per-warp map, per-lane block loop
+unroll-and-JAMmed by PF so PF weight+act block loads are hoisted into registers
+before the dependent `__dp4a` chains (the ds4 register-resident-MLP mechanism from
+`ds4-q8-raw-mechanism-2026-07-30`). BIT-IDENTICAL to the plain kernel (same block/dp4a
+order + f16-scale fold; `test_cuda_quant_dot` Brick-14 A/B `1/1·1968`; real-model
+token-identity OFF==PF2==PF4 16/16). **sudo-ncu (`--replay-mode application` +
+memory watchdog) grid-256 (n=2048): registers 39→64→96, long-scoreboard 56.1→30.7→28.4
+(toward ds4's 17.2), occupancy 72→55→30% (toward ds4's 60%) — the mechanism REPRODUCES —
+but per-kernel GPU-active FLAT (46.06→46.27→46.19 µs) and clean decode tok/s FLAT
+(13.145→13.140→13.133).** MEASURED-NEGATIVE: lowering long-scoreboard ~2× at ds4's
+register/occupancy operating point yields ZERO throughput ⇒ long-scoreboard is NOT the
+causal gate on the 67%→90% BW gap (the raw-mechanism premise is refuted; the GEMV is
+bound by DRAM byte-delivery, not latency-exposure). CORRECTS Brick 13's "intra-row is
+the untried right axis" — that axis hits ds4's counter target and still yields nothing.
+Kept DEFAULT-OFF like Bricks 4/8/11/12/13; ~13 tok/s stays the honest Q8_0-kernel ceiling
+and the raw beat of ds4's 16.5 is not reachable via any Q8_0-GEMV-kernel-structure lever
+(the residual is the MoE + glue front). See `.agents/specs/deepseek-v4-last-mile.md`
+Brick 14 + `docs/BENCHMARKS.md`.
 
 **DeepSeek-V4-Flash decode ds4-gap — Step 0 + Lever 1** (2026-07-30,
 `CLAIM-DSV4-DECODE-LEVER1`, GB10 sm_121a). **Step 0** (`kWarpsPerBlock` 4→8 on the
