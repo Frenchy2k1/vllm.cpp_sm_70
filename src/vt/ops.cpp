@@ -786,6 +786,38 @@ void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& 
       q, out, act, expert_ids, row_map, weight_ptrs);
 }
 
+void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
+                                  const Tensor& expert_ids, const Tensor* row_map,
+                                  const Tensor& gate_ptrs, const Tensor& up_ptrs) {
+  VT_CHECK(out.rank == 2 && act.rank == 2,
+           "moe_grouped_gemm_bf16_gate_up_silu: out/act must be rank-2");
+  const int64_t p = out.shape[0], e = gate_ptrs.shape[0];
+  VT_CHECK(act.dtype == DType::kBF16, "moe_grouped_gemm_bf16_gate_up_silu: act must be bf16");
+  VT_CHECK(out.dtype == DType::kBF16,
+           "moe_grouped_gemm_bf16_gate_up_silu: out must be bf16 (fused silu store)");
+  VT_CHECK(expert_ids.Numel() == p,
+           "moe_grouped_gemm_bf16_gate_up_silu: expert_ids must have P entries (one per out row)");
+  VT_CHECK(expert_ids.dtype == DType::kI32,
+           "moe_grouped_gemm_bf16_gate_up_silu: expert_ids must be i32");
+  VT_CHECK(gate_ptrs.Numel() == e && gate_ptrs.dtype == DType::kI64 && up_ptrs.Numel() == e &&
+               up_ptrs.dtype == DType::kI64,
+           "moe_grouped_gemm_bf16_gate_up_silu: gate_ptrs/up_ptrs must be i64 [E] device pointers");
+  VT_CHECK(act.IsContiguous() && out.IsContiguous() && expert_ids.IsContiguous() &&
+               gate_ptrs.IsContiguous() && up_ptrs.IsContiguous(),
+           "moe_grouped_gemm_bf16_gate_up_silu: contiguous tensors required");
+  VT_CHECK(act.device == q.device && out.device == q.device && expert_ids.device == q.device &&
+               gate_ptrs.device == q.device && up_ptrs.device == q.device,
+           "moe_grouped_gemm_bf16_gate_up_silu: device mismatch");
+  if (row_map != nullptr) {
+    VT_CHECK(row_map->Numel() == p && row_map->dtype == DType::kI32 && row_map->IsContiguous() &&
+                 row_map->device == q.device,
+             "moe_grouped_gemm_bf16_gate_up_silu: row_map must be contiguous i32 [P] on the device");
+  }
+  reinterpret_cast<MoeGroupedGemmBf16GateUpSiluFn>(
+      GetOp(OpId::kMoeGroupedGemmBf16GateUpSilu, q.device.type))(q, out, act, expert_ids, row_map,
+                                                                gate_ptrs, up_ptrs);
+}
+
 void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,
                                const Tensor& b_scales, const Tensor& global_scale,
                                Tensor& workspace, const Tensor& sorted_token_ids,

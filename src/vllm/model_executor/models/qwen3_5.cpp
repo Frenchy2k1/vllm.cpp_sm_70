@@ -5053,16 +5053,15 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   Tensor ddown_ptrs = MakeTensor(mr.down, DType::kI64, d.q.device, {E});
   Tensor dtok = MakeTensor(tok_it->second, DType::kI32, d.q.device, {P});
 
-  // Grouped gate/up GEMM over all pairs (one launch each, f32 out to match the
-  // reference MatmulF32), silu-mul (f32 silu -> bf16, matches ExpertMlp), grouped
-  // down GEMM (act = per-pair silu output, identity row-map). expert_out lands as
-  // [T,top_k,H] contiguous — exactly what MoeCombine consumes.
-  DBuf dgate(d, DType::kF32, {P, I});
-  DBuf dup_out(d, DType::kF32, {P, I});
-  vt::MoeGroupedGemmBf16(d.q, dgate.t(), dh, eids, &dtok, dgate_ptrs);
-  vt::MoeGroupedGemmBf16(d.q, dup_out.t(), dh, eids, &dtok, dup_ptrs);
+  // Fused grouped gate+up GEMM + SwiGLU over all pairs (Tier-A4 fold): ONE vt op
+  // replaces the {gate GEMM (f32); up GEMM (f32); MoeSiluMul} triplet — decode
+  // fuses to a partials launch + reduce+SwiGLU (drops the two f32 [P,I] round-
+  // trips), prefill reuses the tuned grouped GEMM twice + the identical silu-mul.
+  // BIT-IDENTICAL to the old sequence. Then the grouped down GEMM (act = per-pair
+  // silu output, identity row-map). expert_out lands as [T,top_k,H] contiguous —
+  // exactly what MoeCombine consumes.
   DBuf dact(d, DType::kBF16, {P, I});
-  vt::MoeSiluMul(d.q, dact.t(), dgate.t(), dup_out.t());
+  vt::MoeGroupedGemmBf16GateUpSilu(d.q, dact.t(), dh, eids, &dtok, dgate_ptrs, dup_ptrs);
   DBuf ddown(d, DType::kBF16, {P, H});
   vt::MoeGroupedGemmBf16(d.q, ddown.t(), dact.t(), eids, nullptr, ddown_ptrs);
   Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});

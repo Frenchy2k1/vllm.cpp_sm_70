@@ -68,6 +68,15 @@ inline constexpr MergedGemmGroup kKeepQuantGateUpSwiGLU = {
     /*name=*/"keepquant_gate_up_swiglu",
 };
 
+// The BF16-native SIBLING arm of this gate+up+SwiGLU family (Tier-A4 fold) is NOT a
+// MergedGemmGroup instance: the bf16 grouped-MoE archs (Qwen3-Coder, DeepSeek-V2,
+// kimi) marshal their experts as per-expert weight-POINTER ARRAYS [E] i64 with a
+// pair->token row_map (not the contiguous [E*N,K] + broadcast-activation convention
+// MergedGemm's Tier-0 composite consumes), so it is realized directly as the shared
+// op vt::MoeGroupedGemmBf16GateUpSilu / OpId::kMoeGroupedGemmBf16GateUpSilu — the
+// bf16 twin of kMoeGateUpSwiGLUGrouped, BIT-IDENTICAL to {2x MoeGroupedGemmBf16 +
+// MoeSiluMul}. Same family, distinct weight-marshaling seam.
+
 // ── Dispatch ─────────────────────────────────────────────────────────────────
 // Run a merged-GEMM group. For an arity-2 kSiluMulClamp group over keep-quant
 // towers: out[P,N] f32, act[Pa,K] (Pa==1 broadcast), gate_w/up_w[E*N,K] SAME

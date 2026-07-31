@@ -403,12 +403,12 @@ DBuf MoeBlock(Dev d, const DeepseekV2MoeWeights& w, const DeepseekV2Params& p,
     Tensor up_ptrs = MakeTensor(mr.up, DType::kI64, d.q.device, {E});
     Tensor down_ptrs = MakeTensor(mr.down, DType::kI64, d.q.device, {E});
     Tensor dtok = MakeTensor(tok_it->second, DType::kI32, d.q.device, {P});
-    DBuf dgate(d, DType::kF32, {P, I});
-    DBuf dup(d, DType::kF32, {P, I});
-    vt::MoeGroupedGemmBf16(d.q, dgate.t(), dh, eids, &dtok, gate_ptrs);
-    vt::MoeGroupedGemmBf16(d.q, dup.t(), dh, eids, &dtok, up_ptrs);
+    // Tier-A4 fold: fused gate+up GEMM + SwiGLU in ONE vt op (the same shared op
+    // Qwen3-Coder routes through), BIT-IDENTICAL to the old {gate GEMM; up GEMM;
+    // MoeSiluMul} — decode fuses the two f32 [P,I] round-trips away, prefill reuses
+    // the tuned grouped GEMM twice + the identical silu-mul. Then the down GEMM.
     DBuf dact(d, DType::kBF16, {P, I});
-    vt::MoeSiluMul(d.q, dact.t(), dgate.t(), dup.t());
+    vt::MoeGroupedGemmBf16GateUpSilu(d.q, dact.t(), dh, eids, &dtok, gate_ptrs, up_ptrs);
     Tensor eo = Reshape(expert_out.t(), {P, H});
     vt::MoeGroupedGemmBf16(d.q, eo, dact.t(), eids, nullptr, down_ptrs);
   } else {
