@@ -368,6 +368,7 @@ LagunaWeights LoadLagunaForCausalLMWeights(
   }
   w.accounted_tensors = static_cast<int64_t>(where->size());
   w.has_gguf_weights = false;  // safetensors NVFP4 arm, not the GGUF keep-quant tower
+  w.has_nvfp4_weights = true;  // N2 forward selects the W4A4 arm off this flag / non-empty fp4 experts
   return w;
 }
 

@@ -196,6 +196,45 @@ std::vector<float> LqGemm(vt::Queue& q, const OwnedTensor& w,
   return out;
 }
 
+// N2 (task #230): TRUE-W4A4 NVFP4 GEMM for the safetensors arm's routed experts.
+// Y[M,N] f32 = fp4(X[M,K] / input_divisor) @ dequant(w).T, accumulator * alpha.
+// The activation is quantized to fp4 with w.input_global_scale_inv (NOT scale2),
+// then vt::MatmulNvfp4Fp4 scales the fp4xfp4 accumulator by w.alpha (which folds
+// BOTH the activation and weight reciprocated global scales). Mirrors LqGemm's
+// unified-memory pattern (host ptrs as device tensors on GB10; raw weight view
+// retagged). CPU-runnable (ScaledFp4QuantKernel + MatmulNvfp4Fp4Kernel exist), so
+// the fixture gate exercises the exact numerics. If the DGX gate shows all-zeros,
+// the whole-weight raw view needs ResidentWeight staging (keepquant-device-slice
+// note) — a one-line switch to explicit residency.
+std::vector<float> LqGemmNvfp4Fp4(vt::Queue& q, const Nvfp4Weight& w,
+                                  const std::vector<float>& x, int64_t M, int64_t N,
+                                  int64_t K) {
+  VT_CHECK(w.n == N && w.k == K && K % 16 == 0,
+           "laguna nvfp4 GEMM: weight shape / K%16 mismatch");
+  VT_CHECK(w.IsTrueW4A4(), "laguna nvfp4 GEMM: expected true-W4A4 (alpha>0) weight");
+  std::vector<float> out(static_cast<size_t>(M) * N);
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const bool on_dev = q.device.type != vt::DeviceType::kCPU;
+  vt::Queue& gq = on_dev ? q : cpuq;
+  // fp4 activation intermediates (unified-memory host buffers: i8 packed [M,K/2] +
+  // fp8-e4m3 block scale [M,K/16]).
+  std::vector<int8_t> ap_buf(static_cast<size_t>(M) * (K / 2));
+  std::vector<int8_t> as_buf(static_cast<size_t>(M) * (K / 16));
+  vt::Tensor xt = vt::Tensor::Contiguous(const_cast<float*>(x.data()),
+                                         vt::DType::kF32, gq.device, {M, K});
+  vt::Tensor ap = vt::Tensor::Contiguous(ap_buf.data(), vt::DType::kI8, gq.device, {M, K / 2});
+  vt::Tensor as = vt::Tensor::Contiguous(as_buf.data(), vt::DType::kI8, gq.device, {M, K / 16});
+  vt::ScaledFp4Quant(gq, ap, as, xt, w.input_global_scale_inv);  // kLinear layout
+  vt::Tensor ot = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, gq.device, {M, N});
+  vt::Tensor bp = w.packed.View();
+  bp.device = gq.device;  // unified-memory retag (mirror LqGemm)
+  vt::Tensor bs = w.scale.View();
+  bs.device = gq.device;
+  vt::MatmulNvfp4Fp4(gq, ot, ap, as, bp, bs, w.alpha);
+  if (on_dev) DrainQueue(gq);
+  return out;
+}
+
 // Keep-quant GEMM against a ROW-SLICE [row_off, row_off+N) of a stacked block
 // weight `w` [E*out, K] — the per-expert (moe_*_exps) slice. Rows are whole
 // blocks (RowSizeBytes), so the offset is a byte offset and no block is cut.
@@ -397,6 +436,19 @@ std::vector<float> LagunaFfnBlock(vt::Queue& q, const LagunaLayerWeights& lw,
   if (!lw.moe.e_score_correction_bias.Empty())
     bias = ReadF32(lw.moe.e_score_correction_bias);
   const bool has_shared = !lw.moe.shared_gate.Empty();
+  // N2 (task #230): safetensors NVFP4 arm — routed experts are per-expert TRUE-W4A4
+  // Nvfp4Weight (experts_*_fp4), not the stacked keep-quant OwnedTensor. Everything
+  // else on this path (router BF16, shared expert BF16, attention BF16) flows through
+  // ReadF32/LqGemm unchanged. The grouped fast-path is keep-quant-only (its op is
+  // W4A16 grouped, wrong numerics for W4A4), so it is gated off when fp4.
+  const bool fp4 = !lw.moe.experts_gate_fp4.empty();
+  if (fp4) {
+    VT_CHECK(lw.moe.experts_gate_fp4[0].IsTrueW4A4(),
+             "laguna nvfp4 MoE: routed experts must be true-W4A4 (alpha>0)");
+    VT_CHECK(lw.moe.experts_up_fp4.size() == lw.moe.experts_gate_fp4.size() &&
+                 lw.moe.experts_down_fp4.size() == lw.moe.experts_gate_fp4.size(),
+             "laguna nvfp4 MoE: gate/up/down expert counts must match");
+  }
   for (int64_t i = 0; i < T; ++i) {
     std::vector<float> hrow(hn2.begin() + static_cast<int64_t>(i * H),
                             hn2.begin() + static_cast<int64_t>((i + 1) * H));
@@ -406,7 +458,7 @@ std::vector<float> LagunaFfnBlock(vt::Queue& q, const LagunaLayerWeights& lw,
         p.moe_routed_scaling_factor);
     std::vector<float> acc(static_cast<size_t>(H), 0.0F);
     const int64_t Pk = static_cast<int64_t>(sel.ids.size());
-    if (LagunaGroupedMoeEnabled() && Pk > 0) {
+    if (!fp4 && LagunaGroupedMoeEnabled() && Pk > 0) {
       // W8 lever #2: collapse this token's Pk per-expert gate/up/down matvecs into 3
       // grouped launches. Row s := (this token's hrow, expert sel.ids[s]) IN SLOT
       // ORDER, so eo[s] == the per-expert down output for expert sel.ids[s] and the
@@ -433,13 +485,23 @@ std::vector<float> LagunaFfnBlock(vt::Queue& q, const LagunaLayerWeights& lw,
     } else {
       for (size_t s = 0; s < sel.ids.size(); ++s) {
         const int64_t id = sel.ids[s];
+        // NVFP4 arm: per-expert TRUE-W4A4 GEMMs (fp4 activation + alpha-scaled
+        // accumulate); keep-quant arm: stacked-block row-slice matvecs. Both
+        // produce [1,moe_I] gate/up then [1,H] down, so the SwiGLU + combine below
+        // are shared verbatim.
         const std::vector<float> eg =
-            LqGemmRowSlice(q, lw.moe.experts_gate, hrow, 1, moe_I, H, id * moe_I);
+            fp4 ? LqGemmNvfp4Fp4(q, lw.moe.experts_gate_fp4[static_cast<size_t>(id)],
+                                 hrow, 1, moe_I, H)
+                : LqGemmRowSlice(q, lw.moe.experts_gate, hrow, 1, moe_I, H, id * moe_I);
         const std::vector<float> eu =
-            LqGemmRowSlice(q, lw.moe.experts_up, hrow, 1, moe_I, H, id * moe_I);
+            fp4 ? LqGemmNvfp4Fp4(q, lw.moe.experts_up_fp4[static_cast<size_t>(id)],
+                                 hrow, 1, moe_I, H)
+                : LqGemmRowSlice(q, lw.moe.experts_up, hrow, 1, moe_I, H, id * moe_I);
         const std::vector<float> eact = GateUpSilu(eg, eu, 1, moe_I);
         const std::vector<float> eo =
-            LqGemmRowSlice(q, lw.moe.experts_down, eact, 1, H, moe_I, id * H);
+            fp4 ? LqGemmNvfp4Fp4(q, lw.moe.experts_down_fp4[static_cast<size_t>(id)],
+                                 eact, 1, H, moe_I)
+                : LqGemmRowSlice(q, lw.moe.experts_down, eact, 1, H, moe_I, id * H);
         const float wgt = sel.weights[s];
         for (int64_t d = 0; d < H; ++d)
           acc[static_cast<size_t>(d)] += wgt * eo[static_cast<size_t>(d)];
@@ -734,7 +796,8 @@ std::vector<float> LagunaForwardGguf(const LagunaWeights& weights, vt::Queue& q,
   const int64_t Hkv = p.num_key_value_heads;
   const int64_t kvdim = Hkv * Dh;
   const float eps = p.rms_norm_eps;
-  VT_CHECK(weights.has_gguf_weights, "laguna gguf forward: no keep-quant tower");
+  VT_CHECK(weights.has_gguf_weights || weights.has_nvfp4_weights,
+           "laguna forward: no keep-quant or nvfp4 tower");
   VT_CHECK(static_cast<int64_t>(positions.size()) == T,
            "laguna gguf: positions length must match token_ids");
   VT_CHECK(static_cast<int64_t>(weights.layers.size()) == p.num_hidden_layers,
@@ -828,7 +891,8 @@ std::vector<float> LagunaForwardGgufCached(const LagunaWeights& weights, vt::Que
   const int64_t kvdim = Hkv * Dh;
   const float eps = p.rms_norm_eps;
   const int64_t nlayers = p.num_hidden_layers;
-  VT_CHECK(weights.has_gguf_weights, "laguna gguf cached: no keep-quant tower");
+  VT_CHECK(weights.has_gguf_weights || weights.has_nvfp4_weights,
+           "laguna cached forward: no keep-quant or nvfp4 tower");
   VT_CHECK(static_cast<int64_t>(positions.size()) == T,
            "laguna gguf cached: positions length must match token_ids");
   VT_CHECK(static_cast<int64_t>(weights.layers.size()) == nlayers,

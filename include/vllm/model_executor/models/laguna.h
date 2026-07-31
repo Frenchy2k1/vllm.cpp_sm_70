@@ -276,6 +276,7 @@ struct LagunaWeights {
   std::vector<LagunaLayerWeights> layers;
   int64_t accounted_tensors = 0;  // W2 accounting-pass count
   bool has_gguf_weights = false;  // W5: the keep-quant tower is materialized
+  bool has_nvfp4_weights = false;  // N1b/N2: the safetensors NVFP4 W4A4 arm is materialized
 };
 
 // Safetensors loader (BF16 checkpoint; MEMORY-INFEASIBLE on one GB10 at 235 GiB,
