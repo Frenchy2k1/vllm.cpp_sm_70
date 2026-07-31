@@ -308,6 +308,22 @@ enum class OpId : uint8_t {
   // byte-exact here; ds4's own NormRopeRows stays its per-head analytic form.
   // Appended before kCount so no existing op's id shifts.
   kFusedNormRope,
+  // SHARED fused BF16 grouped-MoE gate+up+SwiGLU (Tier-A4 fold). The bf16-native
+  // arm of the routed-MoE gate+up+SwiGLU family (keep-quant arm is
+  // kMoeGateUpSwiGLUGrouped): ONE vt entry replaces the {gate grouped GEMM; up
+  // grouped GEMM; SiluAndMul} triplet the bf16 grouped-MoE archs (Qwen3-Coder,
+  // DeepSeek-V2, kimi) ran. gate_w/up_w travel as the SAME per-expert bf16
+  // device-pointer arrays [E] i64 kMoeGroupedGemmBf16 consumes (NOT a contiguous
+  // [E*N,K] tensor — the bf16 experts are separate resident allocations), plus
+  // the optional pair->token row_map. In the decode/non-WMMA regime the fused
+  // kernels compute gate+up in ONE grouped launch (reusing the exact split-K
+  // sequential-k accumulation) and reduce+SwiGLU in a second, dropping the two
+  // f32 [P,I] HBM round-trips; in the WMMA regime it reuses LaunchGroupedBf16
+  // twice + the byte-identical silu-mul. BIT-IDENTICAL to {2x kMoeGroupedGemmBf16
+  // (f32 out) + kMoeSiluMul (bf16 out)} in every regime — that composite is the
+  // golden the A/B unit test gates against. CUDA-only (like kMoeGroupedGemmBf16).
+  // Appended before kCount so no existing op's id shifts.
+  kMoeGroupedGemmBf16GateUpSilu,
   kCount
 };
 
@@ -679,6 +695,13 @@ using MoeGroupedGemmNvfp4Fn =
              const Tensor&, const Tensor&);
 using MoeGroupedGemmBf16Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&);
+// kMoeGroupedGemmBf16GateUpSilu: out[P,N] bf16 = silu(gate)*up, gate/up = grouped
+// bf16 GEMM of act[T|P,K] against per-expert weight-pointer arrays gate_ptrs/
+// up_ptrs [E] i64, expert_ids[P] i32, optional row_map[P] i32. Same convention as
+// MoeGroupedGemmBf16 with a SECOND weight-pointer array + the fused SwiGLU epilogue.
+using MoeGroupedGemmBf16GateUpSiluFn =
+    void (*)(Queue&, Tensor& /*out*/, const Tensor& /*act*/, const Tensor& /*expert_ids*/,
+             const Tensor* /*row_map*/, const Tensor& /*gate_ptrs*/, const Tensor& /*up_ptrs*/);
 // kMatmulBTQuantGrouped: out[P,N], act[P,K] (f32/bf16), weight[E*N,K] block-quant,
 // expert_ids[P] i32 — weight row for (p,n) is expert_ids[p]*N + n.
 using MatmulBTQuantGroupedFn =
@@ -1273,6 +1296,30 @@ void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor&
 // K = act.shape[1], N = out.shape[1], P = out.shape[0].
 void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                         const Tensor* row_map, const Tensor& weight_ptrs);
+
+// vt::MoeGroupedGemmBf16GateUpSilu — SHARED fused BF16 grouped-MoE gate+up+SwiGLU
+// (Tier-A4 fold, OpId::kMoeGroupedGemmBf16GateUpSilu). ONE vt entry replaces the
+// {MoeGroupedGemmBf16(gate); MoeGroupedGemmBf16(up); MoeSiluMul} triplet the bf16
+// grouped-MoE archs (Qwen3-Coder, DeepSeek-V2, kimi) ran:
+//   out[p, j] = silu(gate[p, j]) * up[p, j]           (bf16 store)
+// where gate[p, j] = sum_k act[row(p), k] * gate_W_e[k, j],
+//       up[p, j]   = sum_k act[row(p), k] * up_W_e[k, j],
+//       e = expert_ids[p], row(p) = row_map ? row_map[p] : p, and gate_W_e/up_W_e
+// are gate_ptrs[e]/up_ptrs[e] (bf16 [K, N] Matmul-B weights). Same argument
+// convention as MoeGroupedGemmBf16 with a SECOND weight-pointer array. BIT-IDENTICAL
+// to that composite in every launch regime — the decode/non-WMMA path fuses the two
+// GEMMs into one grouped launch + a reduce+SwiGLU launch (reusing the exact split-K
+// sequential-k accumulation and the MoeSiluMul math); the WMMA path reuses the
+// grouped-GEMM dispatch twice + the identical silu-mul. CUDA only.
+//   out          [P, N] bf16 (the per-(token,slot) silu(gate)*up)
+//   act          [*, K] bf16
+//   expert_ids   [P] i32 (device)
+//   row_map      [P] i32 (device) or nullptr
+//   gate_ptrs    [E] i64 (device) — gate expert weight pointers (bf16 [K, N])
+//   up_ptrs      [E] i64 (device) — up   expert weight pointers (bf16 [K, N])
+void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
+                                  const Tensor& expert_ids, const Tensor* row_map,
+                                  const Tensor& gate_ptrs, const Tensor& up_ptrs);
 
 // MoeGroupedGemmNvfp4Marlin (lift of vLLM moe_wna16_marlin_gemm, ops.cu:543 —
 // the Marlin W4A16 kernel vLLM selects for the 35B's NVFP4 MoE experts). One

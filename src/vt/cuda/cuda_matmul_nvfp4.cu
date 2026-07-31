@@ -1432,6 +1432,153 @@ void MoeGroupedGemmBf16KernelCuda(Queue& q, Tensor& out, const Tensor& act,
   }
 }
 
+// --- Tier-A4: SHARED fused BF16 grouped-MoE gate+up+SwiGLU (kMoeGroupedGemmBf16-
+// GateUpSilu) ------------------------------------------------------------------
+// ONE vt entry replaces the {MoeGroupedGemmBf16(gate); MoeGroupedGemmBf16(up);
+// MoeSiluMul} triplet the bf16 grouped-MoE archs ran (Qwen3-Coder, DeepSeek-V2,
+// kimi). BIT-IDENTICAL to that composite in EVERY launch regime by construction:
+//   * decode / non-WMMA (p < kTileMinRows || !WmmaEnabled): reuse the EXISTING
+//     split-K partial kernel (MoeGroupedGemmBf16NaiveSplitK) once per weight into
+//     two f32 partial buffers, then ONE fused reduce+SwiGLU launch that sums each
+//     tower's partials in the SAME fixed ascending split order as
+//     MoeGroupedGemmBf16SplitKReduce and applies the SAME silu(gate)*up math as
+//     MoeSiluMulKernel. 5 launches -> 3; the two f32 [P,N] reduce outputs never
+//     touch HBM (the reduce reads partials and writes only the bf16 act).
+//   * prefill / WMMA (else): reuse LaunchGroupedBf16<float> twice into persistent
+//     f32 gate/up scratch + the identical silu-mul — byte-for-byte the caller's
+//     old three ops (no fused WMMA epilogue; prefill is compute-bound, launch
+//     count is irrelevant there and a fused tensor-core epilogue would risk the
+//     tuned path). Consistency win: ONE call site for all regimes.
+// Both scratch buffers are persistent (retire-don't-free, the g_moe_partials
+// contract) so a pointer baked into the captured pure-decode graph never dangles.
+
+// Persistent f32 partials for the fused decode path (gate ++ up, so 2x the
+// single-tower g_moe_partials capacity). Separate from g_moe_partials so the
+// down-projection's own split-K (which reuses g_moe_partials) can never alias
+// the gate/up partials within one captured graph.
+float* g_moe_fused_partials = nullptr;
+size_t g_moe_fused_partials_cap = 0;
+float* EnsureMoeFusedPartials(int64_t elems) {
+  if (static_cast<size_t>(elems) > g_moe_fused_partials_cap) {
+    RetireGraphScratch(g_moe_fused_partials);
+    Check(cudaMalloc(&g_moe_fused_partials, static_cast<size_t>(elems) * sizeof(float)),
+          "moe fused gate/up persistent partials");
+    g_moe_fused_partials_cap = static_cast<size_t>(elems);
+  }
+  return g_moe_fused_partials;
+}
+
+// Persistent f32 gate/up scratch for the WMMA composite branch (2 x [P,N]).
+float* g_moe_fused_gateup = nullptr;
+size_t g_moe_fused_gateup_cap = 0;
+float* EnsureMoeFusedGateUp(int64_t elems) {
+  if (static_cast<size_t>(elems) > g_moe_fused_gateup_cap) {
+    RetireGraphScratch(g_moe_fused_gateup);
+    Check(cudaMalloc(&g_moe_fused_gateup, static_cast<size_t>(elems) * sizeof(float)),
+          "moe fused gate/up persistent f32 scratch");
+    g_moe_fused_gateup_cap = static_cast<size_t>(elems);
+  }
+  return g_moe_fused_gateup;
+}
+
+// Fused reduce+SwiGLU: out[idx] = silu(sum_s gate_partials[s,idx]) *
+// sum_s up_partials[s,idx], each sum in fixed ASCENDING split order. Combines the
+// two MoeGroupedGemmBf16SplitKReduce passes and MoeSiluMulKernel into one launch;
+// bit-identical to running all three (the f32 HBM round-trip the composite takes
+// between reduce and silu is lossless).
+template <typename Tout>
+__global__ void MoeGroupedGemmBf16FusedGateUpReduceSilu(Tout* out, const float* gate_partials,
+                                                        const float* up_partials, int64_t p_rows,
+                                                        int64_t n_cols, int splits) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = p_rows * n_cols;
+  if (idx >= total) return;
+  float g = 0.0f, u = 0.0f;
+  for (int s = 0; s < splits; ++s) {
+    g += gate_partials[static_cast<int64_t>(s) * total + idx];
+    u += up_partials[static_cast<int64_t>(s) * total + idx];
+  }
+  const float sv = g / (1.0f + expf(-g));  // == MoeSiluMulKernel (cuda_moe.cu)
+  Store(out, idx, sv * u);
+}
+
+// Plain silu-mul over f32 gate/up -> bf16 (WMMA composite branch epilogue).
+// Identical math to MoeSiluMulKernel; kept local so this TU need not reach into
+// the cuda_moe.cu anonymous namespace.
+template <typename Tout>
+__global__ void MoeFusedSiluMulF32(Tout* out, const float* gate, const float* up, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step) {
+    const float g = gate[i];
+    const float sv = g / (1.0f + expf(-g));
+    Store(out, i, sv * up[i]);
+  }
+}
+
+// VT_MOE_BF16_FUSED_GATEUP=0 forces the composite (2x grouped GEMM + silu-mul)
+// path in EVERY regime — the same-binary A/B rollback of the decode fusion. The
+// fused decode path is bit-identical to the composite, so this only trades launch
+// count, never numerics.
+bool MoeBf16FusedGateUpEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_BF16_FUSED_GATEUP");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+void MoeGroupedGemmBf16GateUpSiluCuda(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& expert_ids, const Tensor* row_map,
+                                      const Tensor& gate_ptrs, const Tensor& up_ptrs) {
+  const int64_t p = out.shape[0], n = out.shape[1], k = act.shape[1];
+  if (p == 0 || n == 0) return;
+  const int64_t e_count = gate_ptrs.shape[0];
+  cudaStream_t s = AsStream(q);
+  const int64_t total = p * n;
+  __nv_bfloat16* out_ptr = out.Ptr<__nv_bfloat16>();
+
+  if (MoeBf16FusedGateUpEnabled() && (p < kTileMinRows || !WmmaEnabled())) {
+    // Decode / small-P: fuse via the split-K partial kernel + reduce+SwiGLU.
+    const int64_t y = p < 65535 ? p : 65535;
+    constexpr int kBlock = 256;
+    const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), static_cast<unsigned>(y));
+    const int splits = Bf16SplitKEnabled() ? MoeSplitKCount(p, n, k, kBlock) : 1;
+    const int64_t part_elems = total * splits;
+    float* base = EnsureMoeFusedPartials(part_elems * 2);
+    float* gate_partials = base;
+    float* up_partials = base + part_elems;
+    const int64_t k_chunk = (k + splits - 1) / splits;
+    const dim3 sgrid(grid.x, grid.y, static_cast<unsigned>(splits));
+    const int32_t* rm = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
+    MoeGroupedGemmBf16NaiveSplitK<float><<<sgrid, kBlock, 0, s>>>(
+        gate_partials, act.Ptr<__nv_bfloat16>(), expert_ids.Ptr<int32_t>(), rm,
+        gate_ptrs.Ptr<int64_t>(), p, n, k, k_chunk);
+    MoeGroupedGemmBf16NaiveSplitK<float><<<sgrid, kBlock, 0, s>>>(
+        up_partials, act.Ptr<__nv_bfloat16>(), expert_ids.Ptr<int32_t>(), rm,
+        up_ptrs.Ptr<int64_t>(), p, n, k, k_chunk);
+    Check(cudaGetLastError(), "moe_grouped_gemm_bf16_gate_up_silu partials launch");
+    constexpr int kRB = 256;
+    MoeGroupedGemmBf16FusedGateUpReduceSilu<__nv_bfloat16>
+        <<<static_cast<unsigned>((total + kRB - 1) / kRB), kRB, 0, s>>>(out_ptr, gate_partials,
+                                                                        up_partials, p, n, splits);
+    Check(cudaGetLastError(), "moe_grouped_gemm_bf16_gate_up_silu reduce+silu launch");
+    return;
+  }
+
+  // Prefill / WMMA: reuse the tuned grouped GEMM twice into persistent f32 scratch
+  // + the identical silu-mul (byte-for-byte the caller's old three ops).
+  float* base = EnsureMoeFusedGateUp(total * 2);
+  Tensor gate_f32 = Tensor::Contiguous(base, DType::kF32, act.device, {p, n});
+  Tensor up_f32 = Tensor::Contiguous(base + total, DType::kF32, act.device, {p, n});
+  LaunchGroupedBf16<float>(s, gate_f32, act, expert_ids, row_map, gate_ptrs, p, n, k, e_count);
+  LaunchGroupedBf16<float>(s, up_f32, act, expert_ids, row_map, up_ptrs, p, n, k, e_count);
+  constexpr int kSB = 256;
+  MoeFusedSiluMulF32<__nv_bfloat16>
+      <<<static_cast<unsigned>((total + kSB - 1) / kSB), kSB, 0, s>>>(out_ptr, gate_f32.Ptr<float>(),
+                                                                      up_f32.Ptr<float>(), total);
+  Check(cudaGetLastError(), "moe_grouped_gemm_bf16_gate_up_silu wmma silu-mul launch");
+}
+
 void MoeGroupedGemmNvfp4KernelCuda(Queue& q, Tensor& out, const Tensor& act,
                                    const Tensor& expert_ids, const Tensor* row_map,
                                    const Tensor& packed_ptrs, const Tensor& scale_ptrs,
@@ -2799,6 +2946,9 @@ struct Registrar {
     RegisterOp(OpId::kMoeGroupedGemmBf16, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<MoeGroupedGemmBf16Fn>(&MoeGroupedGemmBf16KernelCuda)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16GateUpSilu, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16GateUpSiluFn>(
+                   &MoeGroupedGemmBf16GateUpSiluCuda)));
   }
 } registrar;
 
