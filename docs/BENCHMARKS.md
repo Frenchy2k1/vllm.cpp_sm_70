@@ -10888,3 +10888,5 @@ _(Laguna W11 (2026-07-31, GB10): GPU-busy 2.56s ≈ sync 2.59s ⇒ decode GPU-co
 **qwen3_5 A3 W2/W3a (2026-07-31): incomplete, not landed.** test_gguf_keep_quant caught that keep-quant has 3 per-expert-vector consumers (forward+MTP+test) needing coordinated stacked-tower routing. Byte-exact ExpertMlpKq/slice code is correct+reusable; MTP + test co-changes owed. No benchmark. See spec.
 
 **qwen3_5 A3 W2/W3a #2 (2026-07-31): 1/2 35B strict, not landed.** Staging root cause fixed (ResidentWeight-resident slice) → APEX-Balanced coherent golden; APEX-Compact residual under investigation (whole-tower Alloc / repacked / pre-existing-attribution owed). No benchmark. See spec.
+
+**qwen3_5 A3 W2+W3a LANDED (2026-07-31, GB10).** Structural half of the keep-quant grouped-MoE fold: stacked-tower loader + byte-exact slice forward. Gate: CPU test_gguf_keep_quant 37/37 + DGX test_qwen36_gguf_engine APEX-Compact keep-quant byte-identical golden to pre-A3 (verified same continuation). No perf change yet (W3b grouping is the perf step). The APEX-Balanced 2nd-case all-zeros is pre-existing (reproduced on pre-A3). See spec.

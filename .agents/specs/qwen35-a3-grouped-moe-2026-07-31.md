@@ -134,3 +134,18 @@ grouped f32-out; SwiGLU `F32ToBF16(Silu(hg)·hu)` identical). **Also:** the `=0`
 byte-exact fallback for keep-quant must slice `expert_*_kq` per-expert (add `MatmulF32Slice`
 /`MatmulBf16Slice`, mirror of laguna `LqGemmRowSlice`) — the per-expert `expert_gate` vector
 is EMPTY for keep-quant after W2.
+
+## ✅ RESOLVED — A3 W2+W3a LANDS (2026-07-31, attribution complete)
+Ran PRE-A3 main (`origin/main` sans A3 code) `test_qwen36_gguf_engine` in keep-quant on the
+DGX. Result is byte-for-byte the SAME as A3-fixed: **APEX-Compact (1st TEST_CASE) passes
+golden-correct ("Paris, France…" + "9,10,11,12"); APEX-Balanced (2nd TEST_CASE) all-zeros.**
+So the "case-2 all-zeros" is **PRE-EXISTING** — the SECOND engine load in the same test
+binary fails identically WITHOUT any A3 code (a second-engine/async-scheduler-state harness
+bug, tasks #50/#65), NOT the keep-quant forward. My earlier "case-2 is my A3 bug" read was
+wrong (I mis-mapped the config↔order). With the ResidentWeight staging fix, **A3 is
+behavior-IDENTICAL to pre-A3**: Compact keep-quant byte-identical golden + CPU
+`test_gguf_keep_quant` 37/37. The staging fix (§W2/W3a #2) WAS required (host-ptr broke both).
+**LANDED** `df3f5add`→(this commit). W3b grouping (`MatmulBTQuantGrouped`, additive perf) is
+now unblocked. The pre-existing Balanced-2nd harness failure is out of A3 scope (tasks
+#50/#65). laguna `LqGemmRowSlice` reconcile still worth a look but non-blocking (A3 now uses
+the correct ResidentWeight-resident slice).
