@@ -2028,3 +2028,5 @@ _(Laguna W8+W9 decode-speed campaign handoff recorded in `.agents/state.md`; cum
 _(Laguna W10 re-profile: current 0.13 s/tok decode is 89.7% host-sync (14,034 `cudaStreamSynchronize`/24tok ≈ 610/step); lever #1 device-resident decode confirmed top. See spec §W10.)_
 
 _(Laguna W11 go/no-go: decode is GPU-COMPUTE-bound (GPU-busy 2.56s ≈ sync 2.59s); device-residency DEMOTED, real levers = QuantizeQ8K-dedup + keep-quant GEMV BW-tuning. See spec §W11.)_
+
+**qwen3_5 A3 keep-quant grouped-MoE fold — W1 spike + scaffolding (2026-07-31).** Spike spec committed (`.agents/specs/qwen35-a3-grouped-moe-2026-07-31.md`) + additive `MoeBlockWeights.expert_*_kq` stacked fields (dead until W2 loader). Applies the landed Laguna W9 grouped pattern to qwen3_5 GGUF; memory-neutral (stacked replaces per-expert copies). W2 loader / W3 forward / W4 gate (test_qwen36_gguf_engine) to follow.

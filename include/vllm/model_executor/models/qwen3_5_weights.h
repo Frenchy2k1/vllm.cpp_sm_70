@@ -296,6 +296,15 @@ struct MoeBlockWeights {
   std::vector<OwnedTensor> expert_gate;  // E * bf16 [H, I]
   std::vector<OwnedTensor> expert_up;    // E * bf16 [H, I]
   std::vector<OwnedTensor> expert_down;  // E * bf16 [I, H]
+  // A3 keep-quant grouped-MoE fold: when the GGUF experts stay block-quant (the
+  // keep-quant arm of LoadExpertsT slices WITHOUT transpose), the whole stacked
+  // [E*N, K] block tensor is loaded ONCE here (memory-neutral: replaces the E
+  // per-expert `expert_*` copies, not additive) so the MoE forward can issue ONE
+  // vt::MatmulBTQuantGrouped per {gate,up,down} instead of E per-expert matvecs
+  // (mirror of laguna W9). EMPTY on fp4 / bf16-expand (those keep the vectors above).
+  OwnedTensor expert_gate_kq;  // keep-quant stacked [E*I, H]
+  OwnedTensor expert_up_kq;    // keep-quant stacked [E*I, H]
+  OwnedTensor expert_down_kq;  // keep-quant stacked [E*H, I]
   OwnedTensor shared_gate_proj;  // bf16 [H, Is]
   OwnedTensor shared_up_proj;    // bf16 [H, Is]
   OwnedTensor shared_down_proj;  // bf16 [Is, H]
