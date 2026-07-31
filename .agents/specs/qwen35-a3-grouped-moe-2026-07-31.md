@@ -61,6 +61,26 @@ duplicate ~30 GB expert copy on the 35B ⇒ no OOM-reboot (see
 - `test_ops_moe_*` grouped keep-quant A/B (extend the ds4 pattern to the qwen3_5 stacked layout).
 - `test_qwen36_gguf_engine` stays the e2e SACRED gate; add a `VT_QWEN35_GROUPED_MOE=0` A/B leg.
 
+## ★★ W2/W3a attempt 2026-07-31 — CPU gate CAUGHT an incomplete change (multi-consumer)
+Implemented W2 (3-arm loader → `expert_*_kq`) + W3a (byte-exact `ExpertMlpKq` slice forward),
+committed LOCAL-only, and ran `test_gguf_keep_quant` (CPU) BEFORE pushing. It FAILED:
+`:845 REQUIRE(expert_gate.size()==E)` → 0 vs 3. Root cause: emptying the per-expert
+`expert_gate` vector for keep-quant breaks consumers that STILL read it. **A3 has THREE
+keep-quant consumers of the per-expert vector, all must change together:**
+1. the main MoE forward (`qwen3_5.cpp` reference loop) — handled by W3a `ExpertMlpKq`;
+2. **`qwen3_5_mtp.cpp`** (`:122-129` populates `expert_gate`; `:230-237` `VT_CHECK`
+   `expert_gate.size()==experts` + reads `expert_gate[expert]`) — the MTP draft MoE, NOT
+   yet handled → its VT_CHECK fires;
+3. **`tests/vllm/test_gguf_keep_quant.cpp:803` "loader keep-quant expert split is lossless
+   per expert"** — asserts the loader fills the per-expert vector; must be re-expressed to
+   assert the stacked `expert_*_kq` (the whole tower == the concat of the per-expert slices).
+Keeping BOTH the per-expert vector AND the stacked tensor is NOT an option (2× ~30GB experts
+→ OOM-reboot on the 35B). So the correct A3 W2/W3 is: load stacked, and route BOTH the main
+forward AND the MTP MoE through slices of the stacked tower (add a shared keep-quant expert
+accessor), and update the split-lossless test. Verify-before-push worked — nothing broken
+was pushed. (Local commit `831e941b` reverted; the byte-exact `ExpertMlpKq`/slice-helper
+code is correct and reusable, it just needs the MTP + test co-changes.)
+
 ## Constraints / hazards
 - `MoeBlockWeights` is SHARED with the fp4/bf16 paths — keep the `_kq` fields additive.
 - Route-weight in `MoeCombine` (invariant). No RopeNeox/impl swaps. `check-fusion-consistency`
