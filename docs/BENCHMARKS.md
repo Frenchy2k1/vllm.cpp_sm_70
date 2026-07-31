@@ -34,6 +34,25 @@ cheaper option (one workflow-level group keyed on `github.ref` with
 `before..sha` range of every superseded push. Reproduction entry points are
 unchanged. See the "Build and test lanes" section of [STATUS.md](STATUS.md).
 
+## Laguna-S-2.1 (`LagunaForCausalLM`) FIRST real vLLM bar — vLLM NVFP4 vs our GGUF (2026-07-31, `CLAIM-LAGUNA-VLLM-NVFP4`)
+
+Until now every Laguna number was measured against **llama.cpp** (the same UD-Q4_K_XL GGUF), and even the correctness oracle was `llama-cli` (`run_oracle.sh`) — vLLM, the project's standing bar, had **never** been run on Laguna. This closes that gap.
+
+**vLLM Laguna-S-2.1 (single GB10, greedy, `enforce_eager`, prompt "The capital of France is"):**
+- Checkpoint: official `poolside/Laguna-S-2.1-NVFP4` (`compressed-tensors` NVFP4, ~67 GiB, fits the 119 GiB unified pool).
+- **18.77 tok/s** (64-token steady-state), 15.49 tok/s (24-token); coherent " Paris." ✓; GPU KV cache 184,765 tokens; load 522 s (disk-cold).
+- Backend = **MARLIN**, FORCED via `VLLM_TEST_FORCE_FP8_MARLIN=1`. This is a **lower bound**: vLLM's auto-default NvFp4 MoE backend is `FLASHINFER_CUTLASS`, which JIT-compiles CUTLASS at the first forward and needs `nvcc` — **absent on this box** — so the faster default kernel could not run here. True vLLM production ≥ 18.8 tok/s.
+
+**Honest comparison, single-request batch-1 latency, ~4-bit each:**
+
+| Engine | Quant | Backend | tok/s |
+| --- | --- | --- | --- |
+| our engine | GGUF Q4_K_XL | keep-quant GEMV (W9) | 7.7 |
+| **vLLM** | **NVFP4** | **MARLIN (eager, ≥ this on FLASHINFER_CUTLASS)** | **~18.8** |
+| llama.cpp | GGUF Q4_K_XL | — | 27.8 |
+
+vLLM is ~2.4× our GGUF path. llama.cpp still leads both at batch-1 (its GGUF GEMV is best-in-class for single-request latency; vLLM's edge is throughput under concurrency, not exercised here). Quant differs (ours GGUF-Q4_K vs vLLM NVFP4) — the fully clean apples-to-apple needs **our own NVFP4 Laguna forward arm** (task #230), which puts us on the same tensor-core regime we already reach vLLM parity on for 27B/35B. Repro: `~/laguna-nvfp4/run_vllm4.py` on dgx with `VLLM_TEST_FORCE_FP8_MARLIN=1`, GB10 recipe (drop_caches first, `gpu_memory_utilization=0.60-0.72`, `max_model_len` small — see the OOM-reboot note below).
+
 ## Laguna-S-2.1 (`LagunaForCausalLM`) W7 decode-speed ATTRIBUTION (profile-only): where the 18x to llama.cpp goes (2026-07-31, `CLAIM-LAGUNA-W7-SPEED`)
 
 Research-only `nsys` profile of the W6 decode (`laguna-gen --gpu`, real 3-shard UD-Q4_K_XL, GB10,
