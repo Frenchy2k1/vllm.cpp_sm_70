@@ -35,6 +35,7 @@
 #include <memory>
 #include <vector>
 
+#include "vllm/model_executor/models/merged_qkv_fold.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
@@ -150,28 +151,9 @@ DevW MakeDevBf16(Backend& b, Queue& q, const std::vector<float>& f, std::vector<
   return d;
 }
 
-// A contiguous row-block view [rows,cols] of a resident [*,cols] weight tensor
-// (used to slice the fused qkv_w [3H,H] into q/k/v [H,H] — BIT-identical to the
-// baseline's host qkv split, same bf16 bytes, same 3 GEMMs).
-Tensor SubRows(const Tensor& w, int64_t row_off, int64_t rows, int64_t cols) {
-  Tensor s = w;
-  s.rank = 2;
-  s.shape[0] = rows;
-  s.shape[1] = cols;
-  s.stride[0] = cols;
-  s.stride[1] = 1;
-  s.data = static_cast<char*>(w.data) +
-           static_cast<size_t>(row_off * cols) * vt::SizeOf(w.dtype);
-  return s;
-}
-Tensor SubVec(const Tensor& v, int64_t off, int64_t n) {
-  Tensor s = v;
-  s.rank = 1;
-  s.shape[0] = n;
-  s.stride[0] = 1;
-  s.data = static_cast<char*>(v.data) + static_cast<size_t>(off) * vt::SizeOf(v.dtype);
-  return s;
-}
+// (Former SubRows/SubVec qkv row-slicers removed: the qkv projection now folds
+// to ONE MatmulBT over the resident merged qkv_w [3H,H] + merged-bias epilogue
+// + contiguous QkvSplit — see models::FusedMergedQkvBiasSplit, Tier C2.)
 
 struct DevBlock {
   DevW norm1_w, norm1_b, norm2_w, norm2_b;
@@ -469,6 +451,8 @@ std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_value
   Buf n1(b, q, DType::kBF16, {L, H});
   Buf qb(b, q, DType::kBF16, {L, H}), kb(b, q, DType::kBF16, {L, H}),
       vb(b, q, DType::kBF16, {L, H});
+  // C2 fold scratch: merged qkv GEMM output [L, 3H] (view-split into qb/kb/vb).
+  Buf qkv(b, q, DType::kBF16, {L, 3 * H});
   Buf ao(b, q, DType::kBF16, {L, nh, hd});
   Buf attn(b, q, DType::kBF16, {L, H});
   Buf n2(b, q, DType::kBF16, {L, H});
@@ -500,18 +484,17 @@ std::vector<float> Qwen3VLVisionForward(const std::vector<uint16_t>& pixel_value
     // norm1
     vt::LayerNorm(q, n1.tensor(), hidden.tensor(), &db.norm1_w.tensor(), &db.norm1_b.tensor(),
                   vt::LayerNormArgs{eps});
-    // qkv: 3 GEMMs from the fused resident qkv_w [3H,H] row-slices (rows [0:H]=q,
-    // [H:2H]=k, [2H:3H]=v) — BIT-identical to the old host qkv split.
+    // qkv (C2 fold): ONE MatmulBT over the resident merged qkv_w [3H,H] + a fused
+    // merged [3H] BIAS epilogue, then a contiguous QkvSplit into qb/kb/vb [L,H].
+    // BIT-identical to the prior 3x {LinearBias(row-slice)} (merged GEMM math ==
+    // per-slice GEMM math; [3H] bias add broadcasts per column == 3x [H] adds;
+    // QkvSplit is a pure contiguous copy). The merged-bias epilogue is the NEW
+    // C2 piece vs the text bf16 merged-QKV (which carries no qkv bias).
     {
-      const Tensor qw = SubRows(db.qkv_w.tensor(), 0, H, H);
-      const Tensor kw = SubRows(db.qkv_w.tensor(), H, H, H);
-      const Tensor vw = SubRows(db.qkv_w.tensor(), 2 * H, H, H);
-      const Tensor qbi = SubVec(db.qkv_b.tensor(), 0, H);
-      const Tensor kbi = SubVec(db.qkv_b.tensor(), H, H);
-      const Tensor vbi = SubVec(db.qkv_b.tensor(), 2 * H, H);
-      LinearBias(q, qb, n1.tensor(), qw, &qbi);
-      LinearBias(q, kb, n1.tensor(), kw, &kbi);
-      LinearBias(q, vb, n1.tensor(), vw, &vbi);
+      Tensor qbias = db.qkv_b.tensor();
+      models::FusedMergedQkvBiasSplit(q, qkv.tensor(), qb.tensor(), kb.tensor(),
+                                      vb.tensor(), n1.tensor(), db.qkv_w.tensor(),
+                                      &qbias);
     }
     // rope on q,k viewed [L,nh,hd].
     Tensor q3 = qb.tensor(); q3.rank = 3; q3.shape[0] = L; q3.shape[1] = nh; q3.shape[2] = hd;
