@@ -298,6 +298,49 @@ std::vector<float> LagunaForwardGguf(const LagunaWeights& w, vt::Queue& q,
                                      const std::vector<int32_t>& positions,
                                      const std::vector<int32_t>& logits_indices);
 
+// ─── W6: per-layer K/V cache for INCREMENTAL decode ──────────────────────────
+// Laguna is MIXED attention: 12 GLOBAL layers (full causal — cache grows unbounded)
+// + 36 SLIDING-WINDOW-512 layers (cache CAPPED at the 512 window — the oldest rows
+// are evicted, mirror of gemma2/3 is_sliding). The cached K/V are POST-QK-RMSNorm,
+// POST-RoPE keys and RAW values; RoPE/QK-norm depend only on a token's OWN absolute
+// position, and Laguna attention is causal, so a token's cached K/V equal the values
+// the full-recompute forward would produce at any later step (the KV-cache identity).
+// Stored at f32 to stay BIT-EXACT to LagunaForwardGguf. Mirror of DeepseekV4KvCache
+// (deepseek_v4.h), extended from MLA's single `deck` latent to GQA multi-head K/V.
+struct LagunaKvCache {
+  std::vector<std::vector<float>> k;  // [layer] -> flat [rows_l * Hkv * Dh]
+  std::vector<std::vector<float>> v;  // [layer] -> flat [rows_l * Hkv * Dh]
+  // Global position of the FIRST cached row of each layer. Global layers keep 0
+  // (all history); sliding layers advance it as they evict (rows capped at window).
+  std::vector<int64_t> first_pos;     // [layer]
+  int64_t len = 0;                    // tokens processed = global position of next
+  int64_t head_dim = 0;
+  int64_t kv_heads = 0;
+  void Reset(int64_t num_layers, int64_t hd, int64_t hkv) {
+    k.assign(static_cast<size_t>(num_layers), {});
+    v.assign(static_cast<size_t>(num_layers), {});
+    first_pos.assign(static_cast<size_t>(num_layers), 0);
+    len = 0;
+    head_dim = hd;
+    kv_heads = hkv;
+  }
+};
+
+// W6 INCREMENTAL-decode variant of LagunaForwardGguf. On the FIRST call (prefill)
+// pass all prompt tokens with cache.len==0 (positions 0..P-1); each later call
+// passes ONE new token with positions={cache.len} and logits_indices={0}. The
+// forward appends each token's per-layer K/V to the cache (sliding layers evict
+// beyond the 512 window) and attends the new query over the cached K/V — TOKEN-
+// IDENTICAL to LagunaForwardGguf run over the growing context (a pure equivalence:
+// same tokens, ~ctx× fewer FLOPs), which kills the O(n²) full-recompute. Mirror of
+// DeepseekV4ForwardGgufCached. `logits_indices` are LOCAL indices into THIS call's
+// tokens.
+std::vector<float> LagunaForwardGgufCached(const LagunaWeights& w, vt::Queue& q,
+                                           LagunaKvCache& cache,
+                                           const std::vector<int32_t>& token_ids,
+                                           const std::vector<int32_t>& positions,
+                                           const std::vector<int32_t>& logits_indices);
+
 // The Laguna forward. STUB (W3/W4): composes the reuse (variable-Q-head GQA +
 // interleaved sliding-window mask + dual per-layer RoPE + per-head softplus
 // out-gate; dense MLP at layer 0; ungrouped sigmoid-noaux MoE at layers 1..47;

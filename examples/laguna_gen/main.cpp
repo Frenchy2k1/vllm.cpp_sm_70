@@ -114,7 +114,7 @@ std::vector<std::string> ShardPaths(const std::string& shard1, int64_t count) {
 int main(int argc, char** argv) {
   std::string model, prompt = "The capital of France is", token_ids_arg;
   int max_tokens = 24;
-  bool load_only = false, use_gpu = false;
+  bool load_only = false, use_gpu = false, stateless = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-tokens") max_tokens = std::atoi(next());
     else if (a == "--load-only") load_only = true;
     else if (a == "--gpu") use_gpu = true;
+    else if (a == "--stateless") stateless = true;  // W5 O(n^2) full-recompute (A/B gate)
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if (model.empty()) {
@@ -199,15 +200,37 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[gen] CPU keep-quant queue\n");
   }
 
+  std::fprintf(stderr, "[gen] decode path: %s\n",
+               stateless ? "STATELESS O(n^2) full-recompute (W5)"
+                         : "KV-CACHE incremental (W6)");
   std::vector<int32_t> generated;
   double prefill_s = 0.0, decode_s = 0.0;
+  vllm::LagunaKvCache kv;  // W6 path only
   for (int step = 0; step < max_tokens; ++step) {
-    std::vector<int32_t> positions(tokens.size());
-    for (size_t i = 0; i < tokens.size(); ++i) positions[i] = static_cast<int32_t>(i);
-    const std::vector<int32_t> logits_idx = {static_cast<int32_t>(tokens.size() - 1)};
+    // STATELESS: feed the growing context each step (positions 0..n-1), last-row
+    // logits. KV-CACHE: step 0 = prefill (all prompt tokens); steps 1.. feed ONE new
+    // token at position kv.len, local logits index 0.
+    std::vector<int32_t> step_tokens, positions;
+    std::vector<int32_t> logits_idx;
+    if (stateless) {
+      step_tokens = tokens;
+      positions.resize(tokens.size());
+      for (size_t i = 0; i < tokens.size(); ++i) positions[i] = static_cast<int32_t>(i);
+      logits_idx = {static_cast<int32_t>(tokens.size() - 1)};
+    } else if (step == 0) {
+      step_tokens = tokens;  // prefill the whole prompt
+      positions.resize(tokens.size());
+      for (size_t i = 0; i < tokens.size(); ++i) positions[i] = static_cast<int32_t>(i);
+      logits_idx = {static_cast<int32_t>(tokens.size() - 1)};
+    } else {
+      step_tokens = {tokens.back()};  // one new token
+      positions = {static_cast<int32_t>(kv.len)};
+      logits_idx = {0};
+    }
     const auto s0 = std::chrono::steady_clock::now();
     const std::vector<float> logits =
-        vllm::LagunaForwardGguf(w, q, tokens, positions, logits_idx);
+        stateless ? vllm::LagunaForwardGguf(w, q, step_tokens, positions, logits_idx)
+                  : vllm::LagunaForwardGgufCached(w, q, kv, step_tokens, positions, logits_idx);
     const auto s1 = std::chrono::steady_clock::now();
     const double step_s = std::chrono::duration<double>(s1 - s0).count();
     const int next = ArgmaxLastRow(logits, vocab);
