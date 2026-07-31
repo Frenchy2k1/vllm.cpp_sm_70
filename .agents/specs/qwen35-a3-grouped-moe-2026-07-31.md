@@ -81,6 +81,36 @@ accessor), and update the split-lossless test. Verify-before-push worked — not
 was pushed. (Local commit `831e941b` reverted; the byte-exact `ExpertMlpKq`/slice-helper
 code is correct and reusable, it just needs the MTP + test co-changes.)
 
+## ★★★ W2/W3a full attempt #2 (2026-07-31) — DGX-gated, device bug ROOT-CAUSED, 1/2 passing
+Completed the coordinated change (loader stacked + `ExpertMlpKq` slice forward + test
+re-expressed). **CPU gate `test_gguf_keep_quant` 37/37 PASS** + MTP unaffected. On the DGX
+strict `test_qwen36_gguf_engine` (keep-quant default-ON), the same-binary A/B was decisive:
+- **`VT_GGUF_KEEP_QUANT=0` (expand, bypasses my `_kq` path): 2/2 PASS** (coherent "Paris,
+  France…" + "9,10,11,12" == golden) ⇒ the failure is in MY keep-quant path.
+- default keep-quant (my `_kq`): **ALL-ZEROS** ("!!!!") both cases.
+**ROOT CAUSE #1 (fixed):** `KqSliceView` built a Tensor over `w.bytes.data()` (HOST) but
+**CUDA `needs_weight_staging()` == TRUE** (`platforms/cuda.cpp:67`) — the device keep-quant
+kernel does not read the host pointer (the CPU gate can't catch this: CPU host==device). Fix:
+`KqResidentSlice` routes through `ResidentWeight(d, w)` (stages the WHOLE tower to `d_dev`
+once, cached) and slices the RESIDENT ptr. **After the fix: case 1 (APEX-Balanced) PASSES
+golden-correct; case 2 (APEX-Compact) STILL all-zeros → 1/2.**
+**RESIDUAL (case 2 only, keep-quant only — expand passes both):** the two cases are DIFFERENT
+checkpoints (APEX-Compact vs -Balanced, different quant mixes/sizes). Hypotheses to test next:
+(a) whole-tower `ResidentWeight` `Alloc` is ONE large block per tower vs the pre-A3 per-expert
+lazy staging — the larger file may hit an Alloc/copy-size issue; (b) the `repacked` marker
+(my host slice carried `w.repacked`; the ResidentWeight staging branch leaves it false — a
+mismatch on one file's quant type); (c) a quant-type my slice mishandles. **Attribution owed:
+run pre-A3 main in keep-quant on case 2 — if it ALSO all-zeros, case 2 keep-quant is
+PRE-EXISTING (my A3 is then correct: case-1 golden + CPU 37/37), not an A3 regression.**
+The working code (loader + ExpertMlpKq + KqResidentSlice + test) is on the reverted local
+commit; NOT pushed (1/2 strict is not landable). Verify-before-push caught both the staging
+bug AND the residual — nothing broken shipped.
+**★ CHECK LAGUNA:** `laguna.cpp` `LqGemm`/`LqGemmRowSlice` use the SAME raw-host-byte view
+(no `ResidentWeight`) yet W9 gated byte-exact on GB10 — reconcile (GB10 is physically unified
+per `cuda.cpp:64`, so a host ptr may work despite the staging POLICY flag; or laguna's
+OwnedTensors are device-resident). If host-ptr works physically, root-cause #1 is really the
+`repacked`/whole-tower-load angle, not the pointer — worth pinning before W3b.
+
 ## Constraints / hazards
 - `MoeBlockWeights` is SHARED with the fp4/bf16 paths — keep the `_kq` fields additive.
 - Route-weight in `MoeCombine` (invariant). No RopeNeox/impl swaps. `check-fusion-consistency`
