@@ -4340,6 +4340,35 @@ std::vector<uint16_t> ExpertMlpKq(Dev d, const OwnedTensor& gate_kq,
   return MatmulBf16Slice(d, act, n, H, I, down_kq, e * H);  // [n,H]
 }
 
+// W3b: keep-quant grouped MoE — default-ON, VT_QWEN35_GROUPED_MOE=0 restores the
+// byte-exact per-expert ExpertMlpKq loop in the same binary.
+inline bool Qwen35GroupedMoeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_QWEN35_GROUPED_MOE");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
+// W3b: ONE grouped keep-quant GEMM over the stacked [E*N,K] tower (ResidentWeight-
+// staged, cached) for ALL P rows — out[p,:] = act[p,:] · tower[eids[p]*N .. +N].
+// Replaces P per-expert MatmulF32Slice matvecs with ONE vt::MatmulBTQuantGrouped launch.
+// BYTE-IDENTICAL to the per-expert slice (same kMatmulBTQuant integer-dot core + eids
+// slice; ds4-gated byte-exact). act bf16, out f32.
+std::vector<float> KqGrouped(Dev d, const std::vector<uint16_t>& act, int64_t P,
+                             int64_t N, int64_t K, const OwnedTensor& w_kq,
+                             const std::vector<int32_t>& eids) {
+  DBuf da(d, DType::kBF16, {P, K}, act.data());
+  std::vector<int32_t> ids = eids;  // stable buffer backing the device tensor
+  DBuf dids(d, DType::kI32, {P}, ids.data());
+  DBuf dout(d, DType::kF32, {P, N});
+  Tensor w = ResidentWeight(d, w_kq);  // stage the WHOLE [E*N,K] tower (device, cached)
+  vt::MatmulBTQuantGrouped(d.q, dout.t(), da.t(), w, dids.t());
+  std::vector<float> out(static_cast<size_t>(P) * N);
+  dout.Download(d, out.data());  // drains before ids/out leave scope
+  return out;
+}
+
 // fp4-resident per-expert silu-mul MLP (M2.2b): identical to ExpertMlp but the
 // gate/up/down NVFP4 weights are read on-device via vt::MatmulNvfp4.
 std::vector<uint16_t> ExpertMlpNvfp4(Dev d, const Nvfp4Weight& gate,
@@ -5200,6 +5229,32 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
           .push_back({t, j});
 
   std::vector<uint16_t> expert_out(static_cast<size_t>(T) * top_k * H, 0);
+  if (!w.expert_gate_kq.Empty() && Qwen35GroupedMoeEnabled()) {
+    // W3b: keep-quant grouped MoE — the per-expert {gate,up,down} matvecs collapse to
+    // 3 grouped vt::MatmulBTQuantGrouped launches over the stacked expert_*_kq towers.
+    // Pair p = t*top_k+j: expert = ids[p], act = h[t]; expert_out is built directly in
+    // [T,top_k,H] order, so it is BYTE-IDENTICAL to the per-expert ExpertMlpKq scatter
+    // below (same eids slice + kMatmulBTQuant core + F32ToBF16 SwiGLU + down cast).
+    const int64_t P = T * top_k;
+    std::vector<int32_t> eids(static_cast<size_t>(P));
+    std::vector<uint16_t> act(static_cast<size_t>(P) * H);
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t j = 0; j < top_k; ++j) {
+        const int64_t p = t * top_k + j;
+        eids[static_cast<size_t>(p)] = ids[static_cast<size_t>(t * top_k + j)];
+        std::memcpy(act.data() + static_cast<size_t>(p) * H,
+                    h.data() + static_cast<size_t>(t) * H,
+                    static_cast<size_t>(H) * sizeof(uint16_t));
+      }
+    const std::vector<float> g = KqGrouped(d, act, P, I, H, w.expert_gate_kq, eids);
+    const std::vector<float> u = KqGrouped(d, act, P, I, H, w.expert_up_kq, eids);
+    std::vector<uint16_t> eact(static_cast<size_t>(P) * I);
+    for (size_t i = 0; i < eact.size(); ++i)
+      eact[i] = vt::F32ToBF16(Silu(g[i]) * u[i]);
+    const std::vector<float> dn = KqGrouped(d, eact, P, H, I, w.expert_down_kq, eids);
+    for (size_t i = 0; i < expert_out.size(); ++i)
+      expert_out[i] = vt::F32ToBF16(dn[i]);
+  } else
   for (int64_t e = 0; e < E; ++e) {
     const auto& list = lists[static_cast<size_t>(e)];
     if (list.empty()) continue;
@@ -5215,7 +5270,7 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
                              w.expert_down_fp4[static_cast<size_t>(e)], xg, n, H, I)
         : !w.expert_gate_kq.Empty()
             // A3 keep-quant: gate/up/down are slices of the stacked tower (byte-exact
-            // with the pre-A3 per-expert ExpertMlp; W3b grouping lands additively).
+            // with the pre-A3 per-expert ExpertMlp; W3b grouped path above).
             ? ExpertMlpKq(d, w.expert_gate_kq, w.expert_up_kq, w.expert_down_kq, xg, e,
                           n, H, I)
             : ExpertMlp(d, w.expert_gate[static_cast<size_t>(e)],

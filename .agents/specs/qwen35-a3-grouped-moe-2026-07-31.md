@@ -149,3 +149,16 @@ behavior-IDENTICAL to pre-A3**: Compact keep-quant byte-identical golden + CPU
 now unblocked. The pre-existing Balanced-2nd harness failure is out of A3 scope (tasks
 #50/#65). laguna `LqGemmRowSlice` reconcile still worth a look but non-blocking (A3 now uses
 the correct ResidentWeight-resident slice).
+
+## ✅ W3b LANDED — keep-quant grouped MoE (2026-07-31)
+The per-expert `ExpertMlpKq` matvec loop folds to 3 grouped `vt::MatmulBTQuantGrouped`
+launches over the stacked `expert_*_kq` towers (ResidentWeight-staged): P=T*top_k pairs,
+gather `act[P,H]`, grouped gate+up → F32ToBF16 SwiGLU → grouped down → `expert_out[T,top_k,H]`
+→ `MoeCombine`. Guard `VT_QWEN35_GROUPED_MOE` default-ON. **GATED byte-exact on the strict
+35B (DGX, APEX-Compact keep-quant):** grouped (`=1`) vs per-expert (`=0`) `generated`
+continuations are BYTE-IDENTICAL (" Paris, France. It is one of the most famous landmarks in
+the world and") AND grouped-default strict-passes the golden — so the f32→F32ToBF16 down-cast
+is exactly bit-identical to the per-expert bf16-out path. The APEX-Balanced 2nd-case all-zeros
+is the pre-existing harness bug (tasks #50/#65), unchanged. A3 (qwen3_5 GGUF keep-quant
+grouped-MoE) is now COMPLETE — the same shared `vt::MatmulBTQuantGrouped` descriptor as
+Laguna W9, on a second model.
