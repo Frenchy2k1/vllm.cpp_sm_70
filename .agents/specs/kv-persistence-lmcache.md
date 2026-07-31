@@ -544,6 +544,16 @@ every row is `open`.
 
 ### Risks/decisions
 
+**GCC 12 `-Werror` maintenance (2026-07-31).** The filesystem tier's
+thread-local temporary suffix keeps the identical
+`.<pid>.<monotonic-counter>.tmp` value and one-time-per-thread initialization.
+Its initializer is now a thread-local lambda that builds the value with
+`append` and `push_back`, avoiding GCC 12's libstdc++ `-Wrestrict` false
+positive from the chained `operator+` expression. The binding gate is the
+clean GCC 12 production-library build plus `test_kv_offload_fs`; the all-target
+build's unrelated test-only diagnostics are recorded in the checkpoint
+evidence.
+
 **R1 — our block hashes are not byte-compatible with a stock vLLM, and this is
 the gating constraint on ALL cross-engine interop.** We ship `sha256_cbor` while
 upstream's DEFAULT is `sha256` over a pickle opcode stream, which is impractical

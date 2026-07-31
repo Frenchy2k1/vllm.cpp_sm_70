@@ -129,6 +129,16 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
 
 ## Risks/decisions
 
+### GCC 12 `-Werror` maintenance (2026-07-31)
+
+The L7 synchronous prefault remains a one-byte-per-page volatile read. Its
+accumulator now uses simple assignment instead of deprecated compound
+assignment on a volatile left operand. This is expression-only and preserves
+the prefault addresses, reads, XOR result, defaults, and loader behavior. The
+binding gate for this maintenance leaf is the clean GCC 12 production-library
+build plus `test_gguf_keep_quant`; the all-target build's unrelated test-only
+diagnostics are recorded in the checkpoint evidence.
+
 - **DECISION — bench-branch fate:** land `7c91a42`'s content on main (L1). It
   is loader-only, tested, and the B4 evidence row cites it; leaving
   measurement-enabling code unmerged makes the recorded floor

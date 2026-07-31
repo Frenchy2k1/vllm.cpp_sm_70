@@ -518,6 +518,12 @@ enter `DONE` without exact code and test/evidence anchors. Closed execution
 blocks move to [completed/](completed/) while permanent support rows remain in
 their area matrix.
 
+`ROAD-V1-C4` maintenance checkpoint (2026-07-31): the GCC 12 production
+`vllm` target and focused GGUF test target compile for the L7 prefault
+expression without changing the `QUANT-GGUF-KEEPQ-LOADER` lifecycle or
+behavior. The default all-target build remains blocked by unrelated test-only
+diagnostics recorded in `docs/BENCHMARKS.md`.
+
 ## A. MVP closing tracks (in flight)
 
 | # | Track | State |
@@ -570,6 +576,12 @@ live in [feature-matrix.md](feature-matrix.md).
 | D3 | Spec-decode breadth beyond MTP/DFlash | ☐ ngram and EAGLE3 after the T1 path |
 | D4 | **KV persistent state to disk, and external KV-cache provider API / LMCache interoperability**: mirror vLLM's `kv_offload` CPU and filesystem tiers plus the connector roles/lifecycle, then determine whether LMCache interop is reachable at all | 🚧 T2 — [spike ACCEPTED](specs/kv-persistence-lmcache.md) covering `KV-OFFLOAD`, `KV-EXTERNAL-CACHE`, `KV-CONNECTORS`. Disk persistence is a near-verbatim mirror and is scheduled W1-W4; LMCache is an EXTERNAL package whose storage engine and wire protocol sit outside the vLLM tree, so it is a W6 go/no-go STUDY rather than a port, gated on two blockers we own (hash byte-compatibility and cross-process hash determinism). The dynamic Python module-path seam is deliberately NOT mirrored — compile-time registration replaces it, recorded as a deviation. [LMCache quickstart](https://docs.lmcache.ai/getting_started/quickstart.html) |
 | D5 | LoRA, local KV/weight offload, expert streaming, and wider model zoo | 🚧 T2 — corrected [expert streaming from disk](specs/expert-streaming.md) contract READY; W0 trace/c1 baseline first; LoRA/KV-offload/zoo still ☐ |
+
+`ROAD-V1-D4` maintenance checkpoint (2026-07-31): the GCC 12 production
+`vllm` target and focused KV-offload test target compile for the filesystem-tier
+temporary-suffix expression without changing `KV-OFFLOAD` lifecycle or
+behavior. The default all-target build remains blocked by unrelated test-only
+diagnostics recorded in `docs/BENCHMARKS.md`.
 
 ## Protocol evolution (user-directed, 2026-07-10) — mirror as the FLOOR, surpass beyond it
 

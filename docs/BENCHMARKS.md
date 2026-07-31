@@ -1,5 +1,19 @@
 # Benchmarks
 
+## GCC 12 production-library portability (2026-07-31, `CLAIM-CPU-GCC12-WERROR-PORTABILITY`) - NOT APPLICABLE / all-target build PARTIAL
+
+This maintenance checkpoint changes no runtime algorithm or benchmark axis.
+The GCC 12 `-Werror` build previously failed on the GGUF prefault volatile
+compound assignment and then the KV-offload temporary-suffix concatenation.
+Both production expression forms are now portable without warning suppression.
+The `vllm` library and focused `test_gguf_keep_quant` and
+`test_kv_offload_fs` targets build clean, and both tests pass. The full
+all-target build remains PARTIAL: at 42% it reaches unrelated, test-only GCC 12
+libstdc++ `-Wrestrict` diagnostics in `test_deepseek_v2_paged_engine.cpp` and
+`test_glm4_moe_lite_paged_engine.cpp`; those files are outside this claim, and
+the first is actively owned by the MLA claim. Full CTest therefore cannot run
+from this incomplete all-target build. No throughput or memory number changes.
+
 **PARITY PIN ADVANCED 2026-07-26 → vLLM 0.26.0.dev0 (`55596792`) + transformers 5.14.1** (from 0.25.0). Correctness re-validated BIT-IDENTICAL on the new oracle (zero golden drift; 27B-W4A4 + 32B-NVFP4A16 bit-identical, 35B/Coder byte-stable - the W0-W2 '27B drift' was a capture-config near-tie, not the oracle). Full re-gate 296/299 GREEN on GB10. DFlash's mixed-attn draft now CONSTRUCTS + generates + accepts (2.2-4.8 tok/step) under `VLLM_USE_V2_MODEL_RUNNER=1` (vllm#40898 cleared) - D1-D6 unblocked. Speed figures citing '0.25.0' are the last binding run (engine unchanged by the advance); a 0.26 re-benchmark is pending. Rollback: `~/venvs/vllm-oracle-v0.25.0-stage`. See `.agents/specs/pin-advance.md`.
 
 This is the public current-state scoreboard for vllm.cpp. It contains the

@@ -62,9 +62,14 @@ uint64_t ReadU64(const char* p) {
 // the same destination must not collide on the temp name.
 const std::string& TmpSuffix() {
   static std::atomic<uint64_t> counter{0};
-  static thread_local std::string suffix =
-      "." + std::to_string(::getpid()) + "." +
-      std::to_string(counter.fetch_add(1)) + ".tmp";
+  static thread_local std::string suffix = [&] {
+    std::string value = ".";
+    value.append(std::to_string(::getpid()));
+    value.push_back('.');
+    value.append(std::to_string(counter.fetch_add(1)));
+    value.append(".tmp");
+    return value;
+  }();
   return suffix;
 }
 

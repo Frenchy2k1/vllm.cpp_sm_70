@@ -82,6 +82,11 @@ forensics: roadmap_v1.md and the parity ledger.
 
 ## KV cache and memory
 
+Maintenance checkpoint for `KV-OFFLOAD` (2026-07-31): GCC 12 `-Werror`
+portability is restored for the thread-local temporary suffix with append
+operations. Suffix values, atomic publication behavior, and the row's `ACTIVE`
+lifecycle are unchanged.
+
 | ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|---|
 | `KV-BLOCK-POOL` | Free list, refcounts, LRU eviction, core block lifecycle. **Record corrected 2026-07-22 (`ANCHOR-BACKFILL` -> `PARTIAL`): the spike gap is closed by [prefix-prompt-caching-parity.md](specs/prefix-prompt-caching-parity.md), and the row's stated scope UNDERSOLD the port** — it also covers group-aware hash mapping, the partial-alias map, the unhashed-front/hashed-tail free ordering that is what actually makes eviction LRU (the queue itself is plain FIFO), reset with the null-block invariant, usage and duplicate-hash eviction, under 13 tests. `PARTIAL` (not `DONE`) because four upstream behaviours are genuinely absent, all throw-if-called or inert and none reachable from a ported call site: ~~KV-cache EVENTS~~ (LANDED 2026-07-27 by `KV-EVENTS` — the emission is now wired at the store/remove/clear sites, guarded default-OFF so this row stays byte-identical), partial-block primitives (upstream's are dead code, so not owed live), connector-driven `evict_blocks`, and the align path where `block_size != hash_block_size` | T0 | `vllm/v1/core/block_pool.py:144,163-197,199-224,226-356,542,574-595,597-612,614-635,656-690,700-711`; dead partial primitive `:358-457`; queue `vllm/v1/core/kv_cache_utils.py:179-408`; `tests/v1/core/test_prefix_caching.py:1315,1991` | `src/vllm/v1/core/block_pool.cpp:42,77,206,231,254`; deferrals recorded `include/vllm/v1/core/block_pool.h:18-46` | `tests/vllm/v1/test_block_pool.cpp:70,115,202,251,280,308,337,384,398` | [prefix-prompt-caching-parity.md](specs/prefix-prompt-caching-parity.md) | `PARTIAL` | - |

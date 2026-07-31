@@ -46,7 +46,7 @@ inline void PrefaultBorrowedSpan(const uint8_t* src, size_t bytes) {
   const long ps_l = ::sysconf(_SC_PAGESIZE);
   const size_t ps = static_cast<size_t>(ps_l > 0 ? ps_l : 4096);
   volatile uint8_t sink = 0;
-  for (size_t off = 0; off < bytes; off += ps) sink ^= src[off];
+  for (size_t off = 0; off < bytes; off += ps) sink = sink ^ src[off];
   (void)sink;
 #else
   (void)src;
