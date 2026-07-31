@@ -10967,3 +10967,10 @@ diagnostics outside this diff. The row remains
 `ANCHOR-BACKFILL`; W1-W5 in
 [the spec](../.agents/specs/c-api-library.md) name the remaining compatibility,
 no-throw, lifetime, and standalone-consumer gates.
+
+## Canonical record-owner repair (2026-07-31) - NOT APPLICABLE
+
+Six existing `DONE` matrix rows now point to reachable commits that introduced
+their binding closure states. This records-only metadata repair changes no
+lifecycle state, implementation, workload, or accepted benchmark result, so no
+new performance number is applicable or claimed.

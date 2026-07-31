@@ -2059,3 +2059,5 @@ _(Laguna W11 go/no-go: decode is GPU-COMPUTE-bound (GPU-busy 2.56s ≈ sync 2.59
 **qwen3_5 A3 W3b LANDED (2026-07-31) — A3 COMPLETE.** Per-expert keep-quant MoE loop → 3 grouped vt::MatmulBTQuantGrouped launches (VT_QWEN35_GROUPED_MOE default-ON). BYTE-EXACT: DGX APEX-Compact grouped(=1) vs per-expert(=0) continuations byte-identical + strict-passes golden. Shared descriptor with Laguna W9. See spec §W3b.
 
 **Fold-plan A3 tier CLOSED (2026-07-31).** Both keep-quant models (Laguna W9 + qwen3_5 GGUF W2/W3a/W3b) route their routed-expert MoE through the shared vt::MatmulBTQuantGrouped descriptor, byte-exact gated. See .agents/specs/arch-fusion-fold-plan-2026-07-30.md A3.
+
+**Canonical record-owner repair (2026-07-31).** No lifecycle or support status changed. Six existing `DONE` rows now point to their reachable binding closure commits; this is records-only metadata maintenance.

@@ -34430,3 +34430,5 @@ PARTIAL on two further unrelated test-only GCC 12 `-Wrestrict` diagnostics in
 `test_deepseek_v2_paged_engine.cpp` (actively MLA-owned) and
 `test_glm4_moe_lite_paged_engine.cpp`; those files were not touched, so full
 CTest cannot run from this incomplete build. No GPU, model, or benchmark ran.
+
+**Canonical DONE-owner reachability repaired (2026-07-31, `CLAIM-RECORD-DONE-OWNER-REPAIR`).** Records-only correction: the six checker-reported `DONE` owner cells now name the reachable commits that introduced their binding closures (`KV-PREFIX-CACHE` `a41af480`, `SAMPLE-LOGPROBS` `ecda3ce1`, and the four DFlash rows `489a7544`). Lifecycle states, evidence, support claims, source, tests, and benchmark results are unchanged.
