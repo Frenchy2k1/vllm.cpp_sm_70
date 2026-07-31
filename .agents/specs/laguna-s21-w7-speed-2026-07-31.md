@@ -205,3 +205,41 @@ like W8/W9 — governed by the CUDA-graph-capture-safety hazards (see
 [[cudagraph-capture-bakes-stack-addresses]]). GPU-kernel breakdown (post-residency
 residual: `QuantizeQ8K` dedup, weight-GEMV BW) owed on the next profile. Reachable
 still ~13–20 tok/s; killing ~600 syncs/step is the path there.
+
+---
+
+## W11 — GO/NO-GO on device-residency: decode is now GPU-COMPUTE-BOUND, not host-bound (2026-07-31, `CLAIM-LAGUNA-W11-GONOGO`)
+
+Before committing the LARGE device-resident campaign (W10's inferred lever #1), measured
+GPU-busy time (`nsys cuda_gpu_kern_sum`) to check the recoverable headroom. Real
+UD-Q4_K_XL (GB10, `--gpu`, 24 tok, TPOT 0.13 s/tok):
+
+| GPU kernel | Time% | Total | reading |
+|---|---|---|---|
+| `QuantDotGemmGroupedKernel` Q4_K/Q5_K/Q6_K | **62.1%** | 1.59 s | MoE expert GEMVs (W9-grouped; must read all top_k experts) |
+| `QuantDotGemmQ8_0Kernel` | 24.7% | 0.63 s | attention q/k/v/o + shared + dense + lm_head GEMVs |
+| `QuantizeQ8KKernel` | 12.4% | 0.32 s | activation re-quant (per GEMM) |
+| **Σ GPU-busy** | | **2.56 s** | ≈ `cudaStreamSynchronize` 2.59 s ≈ decode wall |
+
+**VERDICT: device-residency (task #228) DEMOTED — decode is GPU-compute-bound.** GPU-busy
+(2.56 s) ≈ the host sync time (2.59 s): the 89.7% "host-sync" from W10 is the host
+SERIALLY WAITING on real GPU kernels, NOT idle host-gap. After W8 (embed) + W9 (expert
+launch collapse), what remains IS the keep-quant GEMV compute. Deferring syncs recovers
+only the host-glue serialization (~0.8 s across prefill+decode) → maybe 0.13 → ~0.11
+s/tok, modest — NOT worth a multi-brick CUDA-graph campaign. **This measurement reversed
+the W7/W10 "host-orchestration" framing** (which was true at 0.66 s/tok, before W8/W9).
+
+**RE-RANKED remaining levers (real data):**
+1. **`QuantizeQ8K` dedup (~12% GPU, tractable):** W9 uses 2× `MatmulBTQuantGrouped`
+   (gate,up) each re-quantizing the activation; switch to the FUSED
+   `vt::MoeGateUpSwiGLUGrouped` (quantizes act ONCE for gate+up, ds4's op) → removes a
+   chunk of the 12.4%. Bit-exactness vs Laguna's `GateUpSilu` must be A/B-verified
+   (limit=+inf ⇒ plain silu·up; the ds4-gated composite identity should hold).
+2. **keep-quant GEMV BW-tuning (~87% GPU, HARD — the ceiling lever):** the
+   `QuantDotGemmGroupedKernel` (Q4_K/Q5_K, 62%) + `QuantDotGemmQ8_0Kernel` (25%) run at
+   ~22% of the 240 GB/s peak (W7) vs llama.cpp ~76%. This is the ds4-Q8_0-saga class
+   (7 levers largely refuted, compiler/SASS-limited) — but the GROUPED Q4_K/Q5_K kernel
+   is DISTINCT from the ds4 Q8_0 kernel and may not have been BW-tuned; a dp4a /
+   vectorized-load / occupancy pass on it is the real ~13–20 tok/s headroom.
+3. device-resident decode (#1, task #228): DEMOTED to a modest ~0.02 s/tok recovery,
+   deprioritized below the two GPU-kernel levers.

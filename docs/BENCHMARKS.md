@@ -10878,3 +10878,5 @@ speed lever. Gated microbench `VT_FP4_M1_BENCH` (test-only).
 _(Laguna W8+W9 campaign detail + repro in `.agents/state.md` and `.agents/specs/laguna-s21-w7-speed-2026-07-31.md`.)_
 
 _(Laguna W10 re-profile (2026-07-31, GB10): decode 0.13 s/tok = 89.7% `cudaStreamSynchronize` (610/step), 2.6% launches → device-resident decode is the confirmed next lever toward ~13-20 tok/s. Measurement-only. See spec §W10.)_
+
+_(Laguna W11 (2026-07-31, GB10): GPU-busy 2.56s ≈ sync 2.59s ⇒ decode GPU-compute-bound after W8/W9; MoE grouped GEMVs 62%, Q8_0 GEMVs 25%, QuantizeQ8K 12%. Device-residency demoted; next = QuantizeQ8K-dedup (fused MoeGateUpSwiGLUGrouped) + GEMV BW-tune. See spec §W11.)_

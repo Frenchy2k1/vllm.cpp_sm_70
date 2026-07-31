@@ -2026,3 +2026,5 @@ The gate models' W4A4 decode is at the achievable roofline. See `.agents/specs/n
 _(Laguna W8+W9 decode-speed campaign handoff recorded in `.agents/state.md`; cumulative 0.66 → 0.13 s/tok, next lever #1 device-resident decode.)_
 
 _(Laguna W10 re-profile: current 0.13 s/tok decode is 89.7% host-sync (14,034 `cudaStreamSynchronize`/24tok ≈ 610/step); lever #1 device-resident decode confirmed top. See spec §W10.)_
+
+_(Laguna W11 go/no-go: decode is GPU-COMPUTE-bound (GPU-busy 2.56s ≈ sync 2.59s); device-residency DEMOTED, real levers = QuantizeQ8K-dedup + keep-quant GEMV BW-tuning. See spec §W11.)_
