@@ -42,7 +42,8 @@ Bit-exact (identical GEMM math, merged N). The `kv_c`(nope)+`k_pe`(rope) A-proje
 - deepseek_v2 no-q-lora (kv_c+k_pe) — `mla_attention.cpp` (was `:332-335`) ✅
 - **Free carry:** kimi_k3 inherits this once its forward lands (`kimi_k3.cpp:20-30`).
 
-**A3. keep-quant grouped MoE fold → `kMatmulBTQuantGrouped`** *(shared-op: grouped keep-quant, Front-A / task #200-201)*
+**A3. keep-quant grouped MoE fold → `kMatmulBTQuantGrouped`** *(shared-op: grouped keep-quant, Front-A / task #200-201)* — ✅ **DONE 2026-07-31** (Laguna `96b4652f` + qwen3_5 `ae201441`/`b4f5610a`).
+Both keep-quant models now route their routed-expert MoE through the shared `vt::MatmulBTQuantGrouped` descriptor: **Laguna W9** (experts pre-stacked → grouped, byte-exact same-binary A/B, 1.38× decode) and **qwen3_5 GGUF W2+W3a+W3b** (stacked-tower loader + `ResidentWeight`-staged slice forward + grouped MoE; DGX byte-exact — grouped(=1) vs per-expert(=0) APEX-Compact continuations BYTE-IDENTICAL + strict golden pass; device-staging bug root-caused en route, see [[keepquant-device-slice-needs-residentweight]]). "Fold structurally, use consistently" realized on both keep-quant models.
 "The biggest single fold in the cluster." Bit-exact (identical per-block vec_dot + f32 accum), inherits the ds4-tuned grouped keep-quant vec_dot for free; removes E host round-trips + E×2 tiny MMQ launches → ~3 grouped launches.
 - qwen3_5_gguf — the per-expert host-gather loop (was `qwen3_5.cpp:4256-4266`) → ds4 `cuda_quant_dot.cu`/`cpu_quant_gemm.cpp`
 - Free carry: qwen3_5_gguf dense MLP routes through the same descriptor.

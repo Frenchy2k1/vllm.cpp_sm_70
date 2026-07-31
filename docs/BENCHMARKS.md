@@ -10892,3 +10892,5 @@ _(Laguna W11 (2026-07-31, GB10): GPU-busy 2.56s ≈ sync 2.59s ⇒ decode GPU-co
 **qwen3_5 A3 W2+W3a LANDED (2026-07-31, GB10).** Structural half of the keep-quant grouped-MoE fold: stacked-tower loader + byte-exact slice forward. Gate: CPU test_gguf_keep_quant 37/37 + DGX test_qwen36_gguf_engine APEX-Compact keep-quant byte-identical golden to pre-A3 (verified same continuation). No perf change yet (W3b grouping is the perf step). The APEX-Balanced 2nd-case all-zeros is pre-existing (reproduced on pre-A3). See spec.
 
 **qwen3_5 A3 W3b LANDED (2026-07-31, GB10) — A3 COMPLETE.** Keep-quant MoE grouped: per-expert loop → 3 grouped MatmulBTQuantGrouped over stacked towers. Gate: DGX APEX-Compact grouped-vs-per-expert BYTE-IDENTICAL continuation + strict golden pass. Launch reduction on the GGUF keep-quant MoE path; byte-exact.
+
+**Fold-plan A3 CLOSED (2026-07-31).** Keep-quant grouped-MoE fold done on both Laguna + qwen3_5 GGUF (shared MatmulBTQuantGrouped). Byte-exact; launch reduction on both keep-quant MoE paths.
