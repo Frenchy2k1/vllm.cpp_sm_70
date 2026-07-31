@@ -118,6 +118,23 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**Canonical DONE-owner reachability repair (`KV-PREFIX-CACHE`,
+`SAMPLE-LOGPROBS`, `SPEC-DFLASH`,
+`MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm`,
+`KERNEL-ATTN-DFLASH-BLOCK`, `KERNEL-ATTN-DFLASH-PAGED-BLOCK`, 2026-07-31,
+`CLAIM-RECORD-DONE-OWNER-REPAIR`).** Codex (GPT-5), isolated worktree
+`/home/mudler/.cache/sdd/localai-org-maint-bot-vllm.cpp/codex-cpu-regression-fix`,
+branch `codex/cpu-regression-fix`, base `upstream/main` `0d014016`. CPU-only
+governance repair: `scripts/check-agent-record.py` currently rejects six `DONE`
+rows because their three owner SHAs are not Git objects; replace them with the
+reachable commits that actually introduced the binding `DONE` closures. Owns
+only those six Owner cells, this claim, the minimal append-only state entry,
+and the required no-lifecycle-change checkpoint notes in `docs/STATUS.md` and
+`docs/BENCHMARKS.md`. No source, test, build, lifecycle, benchmark, README,
+roadmap, ledger, or support-claim change; verification is the agent-record
+checker and its mutation suite plus the remaining record/document checkers.
+No GPU, model, or compiler is required.
+
 **Stable C ABI contract spike (`SERVE-C-ABI`, 2026-07-31,
 `CLAIM-SERVE-C-ABI-SPIKE`).** Codex (GPT-5), isolated worktree
 `.worktrees/serve-c-abi-spike`, branch `codex/serve-c-abi-spike`, base
