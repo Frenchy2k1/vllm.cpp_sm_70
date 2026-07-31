@@ -803,6 +803,64 @@ void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks,
   });
 }
 
+// Fused MLA norm-rope (kFusedNormRope) CPU reference — the byte-exact composite
+// of {RmsNormKernel(x[:, :off]) ; RopeFromCacheKernel(x[:, off:off+rot])}. The
+// two halves address DISJOINT dims, so running them fused (one row loop) is the
+// SAME arithmetic in the SAME order as the two standalone kernels; this is the
+// Tier-0 golden the CUDA kernel is gated against.
+//   x           [T, off+rot]  — merged kv_a output (off = norm_weight length, rot = rotary_dim)
+//   norm_weight [off]         — kv_a_layernorm weight
+//   latent_out  [T, off]      — RmsNorm of the leading latent slice (NOT roped)
+//   pe_out      [T, rot]      — RopeFromCache rotation of the trailing pe slice (single vector)
+void FusedNormRopeKernel(Queue&, Tensor& latent_out, Tensor& pe_out, const Tensor& x,
+                         const Tensor& norm_weight, const Tensor& positions,
+                         const Tensor& cache, const RmsNormArgs& norm_args,
+                         const RopeArgs& rope_args) {
+  const int64_t t = x.shape[0];
+  const int64_t off = norm_weight.shape[0];       // latent width (kv_lora_rank)
+  const int64_t rot = rope_args.rotary_dim;       // decoupled-rope width (qk_rope_head_dim)
+  const int64_t half = rot / 2;
+  const int64_t xrs = x.stride[0], lrs = latent_out.stride[0], prs = pe_out.stride[0];
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) {
+      // --- latent RMSNorm over [0, off) — mirrors RmsNormKernel exactly. ------
+      const int64_t xb = i * xrs;
+      float sumsq = 0.0f;
+      for (int64_t j = 0; j < off; ++j) {
+        const float v = LoadF32(x, xb + j);
+        sumsq += v * v;
+      }
+      const float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(off) + norm_args.eps);
+      const int64_t lb = i * lrs;
+      for (int64_t j = 0; j < off; ++j) {
+        float wj = LoadF32(norm_weight, j);
+        if (norm_args.gemma) wj += 1.0f;
+        StoreF32(latent_out, lb + j, LoadF32(x, xb + j) * inv * wj);
+      }
+      // --- decoupled-pe RopeFromCache over [off, off+rot) — mirrors
+      //     RopeFromCacheKernel (single head, base rope, positions rank-1). ----
+      const int64_t position =
+          positions.dtype == DType::kI32
+              ? static_cast<int64_t>(positions.Ptr<int32_t>()[i])
+              : positions.Ptr<int64_t>()[i];
+      VT_CHECK(position >= 0 && position < cache.shape[0],
+               "fused_norm_rope: position outside cache");
+      const int64_t cache_off = position * rot;
+      const int64_t pb = i * prs;
+      for (int64_t pair = 0; pair < half; ++pair) {
+        const float c = LoadF32(cache, cache_off + pair);
+        const float s = LoadF32(cache, cache_off + half + pair);
+        const int64_t first = rope_args.is_neox_style ? pair : pair * 2;
+        const int64_t second = rope_args.is_neox_style ? pair + half : pair * 2 + 1;
+        const float xr = LoadF32(x, xb + off + first);
+        const float yr = LoadF32(x, xb + off + second);
+        StoreF32(pe_out, pb + first, xr * c - yr * s);
+        StoreF32(pe_out, pb + second, xr * s + yr * c);
+      }
+    }
+  });
+}
+
 float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 
 // Per-step RoPE cos|sin cache fill (fused-attn-preamble prep). cos_sin[T,rot] f32:
@@ -2324,6 +2382,9 @@ struct Registrar {
         OpId::kRopeFromCache, DeviceType::kCPU,
         reinterpret_cast<void*>(
             static_cast<RopeFromCacheFn>(&RopeFromCacheKernel)));
+    RegisterOp(
+        OpId::kFusedNormRope, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<FusedNormRopeFn>(&FusedNormRopeKernel)));
     RegisterOp(OpId::kCausalConv1dFwd, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CausalConv1dFwdFn>(&CausalConv1dFwdKernel)));
     RegisterOp(

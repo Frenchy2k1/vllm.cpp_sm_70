@@ -1388,6 +1388,46 @@ void RopeFromCache(Queue& q, Tensor& q_states, Tensor* k_states,
       q, q_states, k_states, positions, cos_sin_cache, args);
 }
 
+void FusedNormRope(Queue& q, Tensor& latent_out, Tensor& pe_out, const Tensor& x,
+                   const Tensor& norm_weight, const Tensor& positions,
+                   const Tensor& cos_sin_cache, const RmsNormArgs& norm_args,
+                   const RopeArgs& rope_args) {
+  const int64_t off = norm_weight.shape[0];   // latent width (kv_lora_rank)
+  const int64_t rot = rope_args.rotary_dim;   // decoupled-rope width
+  VT_CHECK(x.rank == 2 && latent_out.rank == 2 && pe_out.rank == 2,
+           "fused_norm_rope: x/latent_out/pe_out must be rank-2 [T, ...]");
+  const int64_t t = x.shape[0];
+  VT_CHECK(norm_weight.rank == 1 && off > 0, "fused_norm_rope: norm_weight must be [off]");
+  VT_CHECK(rot > 0 && rot % 2 == 0, "fused_norm_rope: rotary_dim must be positive even");
+  VT_CHECK(x.shape[1] == off + rot,
+           "fused_norm_rope: x must be [T, off+rot] (merged latent|pe)");
+  VT_CHECK(latent_out.shape[0] == t && latent_out.shape[1] == off,
+           "fused_norm_rope: latent_out must be [T, off]");
+  VT_CHECK(pe_out.shape[0] == t && pe_out.shape[1] == rot,
+           "fused_norm_rope: pe_out must be [T, rot]");
+  VT_CHECK(x.stride[1] == 1 && latent_out.stride[1] == 1 && pe_out.stride[1] == 1,
+           "fused_norm_rope: x/latent_out/pe_out innermost dim must be unit-stride");
+  VT_CHECK(IsOutFloat(x.dtype) && norm_weight.dtype == x.dtype &&
+               latent_out.dtype == x.dtype && pe_out.dtype == x.dtype,
+           "fused_norm_rope: x/norm_weight/latent_out/pe_out must share f32 or bf16 dtype");
+  VT_CHECK(positions.rank == 1 && positions.shape[0] == t,
+           "fused_norm_rope: positions must be [T]");
+  VT_CHECK(positions.dtype == DType::kI32 || positions.dtype == DType::kI64,
+           "fused_norm_rope: positions must be i32/i64");
+  VT_CHECK(cos_sin_cache.rank == 2 && cos_sin_cache.shape[0] > 0 &&
+               cos_sin_cache.shape[1] == rot && cos_sin_cache.dtype == x.dtype,
+           "fused_norm_rope: cache must be [P,rot] with x's dtype");
+  VT_CHECK(positions.IsContiguous() && cos_sin_cache.IsContiguous(),
+           "fused_norm_rope: contiguous positions/cache required");
+  VT_CHECK(x.device == q.device && norm_weight.device == q.device &&
+               latent_out.device == q.device && pe_out.device == q.device &&
+               positions.device == q.device && cos_sin_cache.device == q.device,
+           "fused_norm_rope: all tensors must share the queue device");
+  if (t == 0) return;
+  reinterpret_cast<FusedNormRopeFn>(GetOp(OpId::kFusedNormRope, q.device.type))(
+      q, latent_out, pe_out, x, norm_weight, positions, cos_sin_cache, norm_args, rope_args);
+}
+
 void RopeCosSinCache(Queue& q, Tensor& cos_sin, const Tensor& positions, const RopeArgs& args) {
   VT_CHECK(cos_sin.rank == 2, "rope_cos_sin_cache: cos_sin rank-2 [T, rotary_dim]");
   VT_CHECK(cos_sin.dtype == DType::kF32, "rope_cos_sin_cache: cos_sin must be f32");
