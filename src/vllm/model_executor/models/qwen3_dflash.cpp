@@ -291,13 +291,23 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
       DBuf q(d, DType::kBF16, {T, qdim});
       DBuf k(d, DType::kBF16, {T, kdim});
       DBuf v(d, DType::kBF16, {T, kdim});
+      // Merged QKVParallelLinear: D1 folds the shared-input q/k/v GEMMs to ONE
+      // MatmulBT over the merged owner + a contiguous QkvSplit (MergedQkvEnabled(),
+      // VT_QWEN3_QKV_MERGE default ON; =0 = byte-identical 3-shard). RoPE handling
+      // is UNCHANGED (still RopeNeox below — no RopeFromCache swap).
       Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
-      Tensor wq = wqkv.Slice(0, 0, qdim);
-      Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
-      Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
-      vt::MatmulBT(d.q, q.t(), dhn.t(), wq);
-      vt::MatmulBT(d.q, k.t(), dhn.t(), wk);
-      vt::MatmulBT(d.q, v.t(), dhn.t(), wv);
+      if (MergedQkvEnabled()) {
+        DBuf qkv(d, DType::kBF16, {T, qdim + 2 * kdim});
+        vt::MatmulBT(d.q, qkv.t(), dhn.t(), wqkv);
+        vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
+      } else {
+        Tensor wq = wqkv.Slice(0, 0, qdim);
+        Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
+        Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
+        vt::MatmulBT(d.q, q.t(), dhn.t(), wq);
+        vt::MatmulBT(d.q, k.t(), dhn.t(), wk);
+        vt::MatmulBT(d.q, v.t(), dhn.t(), wv);
+      }
       Tensor q2 = Reshape(q.t(), {T * Hq, Dh});
       Tensor k2 = Reshape(k.t(), {T * Hkv, Dh});
       Tensor q3 = Reshape(q.t(), {T, Hq, Dh});

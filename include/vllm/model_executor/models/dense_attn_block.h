@@ -132,19 +132,33 @@ inline vt::RopeArgs MakeRopeArgs(const HfConfig& cfg) {
 // launch saving is negligible against ~82k decode launches, so there is no win.
 // It is also byte-AFFECTING (cuBLASLt picks a different K-reduction for the wider
 // merged N, flipping ONE Qwen3-0.6B near-tie token — Qwen3-4B stays 16/16 exact),
-// which would force regenerating the SACRED 0.6B near-tie golden for no benefit.
+// which required regenerating the SACRED 0.6B near-tie golden.
 //
-// So it ships DEFAULT OFF (opt-in): the default path is the byte-identical
-// 3-shard GEMM that matches the committed near-tie goldens. Set VT_QWEN3_QKV_MERGE=1
-// to exercise the vLLM-structural merged path (the QkvSplit primitive stays
-// available for a future decode-fusion that could make it pay). Read once.
+// D1 (fold plan Tier D1, 2026-07-31) FLIPPED THE DEFAULT ON and made this the
+// SHARED merged-QKV gate for the whole bf16 dense/coder/dflash/Gemma family — the
+// same OLMo-2/Granite/StableLM exemplar form (one MatmulBT over the merged
+// [Nq+Nk+Nv,H] owner + a contiguous QkvSplit). Every consumer already packs the
+// merged qkv_proj owner (no loader concat). The merge is bit-exact GEMM math
+// (wider N; identical per-output-row reduction — see tests/vt/test_ops_qkv_merge.cpp,
+// CPU byte-identity); the ONLY byte effect is the downstream FA2/attention 1-ULP on
+// the 0.6B genuine bf16 near-tie, so the whole family was batched behind ONE 0.6B
+// near-tie golden regen. Qwen3-4B stays STRICT (measured neutral). NOT interleaved
+// with any RopeNeox->RopeFromCache swap (that would compound a second 1-ULP flip);
+// rope handling is UNCHANGED. 27B/35B are UNAFFECTED (resident nvfp4/fp8 QKV, not
+// this bf16 path). Opt out with VT_QWEN3_QKV_MERGE=0 for the byte-identical 3-shard
+// A/B baseline (same binary, restores the pre-D1 sequence everywhere). Read once.
 inline bool Qwen3QkvMergeEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_QWEN3_QKV_MERGE");
-    return e != nullptr && e[0] == '1';
+    return !(e != nullptr && e[0] == '0');
   }();
   return on;
 }
+
+// Readable alias for the shared merged-QKV gate at the non-Qwen (Gemma/dflash) D1
+// call sites — the same env (VT_QWEN3_QKV_MERGE, default ON) and process-stable
+// value, so the whole D1 family flips together behind one switch.
+inline bool MergedQkvEnabled() { return Qwen3QkvMergeEnabled(); }
 
 // Dev / MakeTensor / Reshape / DevicePoolPolicy / DBuf were RELOCATED VERBATIM
 // to dense_device_glue.h (included above) so dense_nvfp4_gemm.h can layer

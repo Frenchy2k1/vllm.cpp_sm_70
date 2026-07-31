@@ -660,6 +660,10 @@ target_link_libraries(test_tp_forward PRIVATE Threads::Threads)
 vllm_cpp_add_test(test_backend_multidevice vt/test_backend_multidevice.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
+# D1 (fold plan Tier D1): the merged-QKV == separate-q/k/v A/B — one MatmulBT over
+# the merged [Nq+Nk+Nv,H] owner + a contiguous QkvSplit is BYTE-IDENTICAL to three
+# separate MatmulBT (bit-exact GEMM math, wider N; RED-first). CPU-only.
+vllm_cpp_add_test(test_ops_qkv_merge vt/test_ops_qkv_merge.cpp)
 # QUANT-GGUF-CIQ-GEMM G1: block dtypes, the quant traits table and its
 # cross-check against the GGUF reader's GgmlTraits, and the kMatmulBTQuant
 # skeleton's generic-composite fallback. CPU-only.

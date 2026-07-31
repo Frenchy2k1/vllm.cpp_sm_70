@@ -122,20 +122,28 @@ DBuf Gemma3AttnBlock(Dev d, const Gemma3AttnWeights& w, const HfConfig& cfg,
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "gemma3: KV cache head dims mismatch config");
 
-  // Merged QKVParallelLinear (no bias): one raw-NK owner [qdim+2kdim, H], sliced
-  // into q/k/v shards and projected (3-shard; the tiny GQA k/v GEMMs mirror
-  // vLLM's single qkv GEMM + split numerically).
+  // Merged QKVParallelLinear (no bias): one raw-NK owner [qdim+2kdim, H]. D1 folds
+  // the shared-input q/k/v GEMMs to ONE MatmulBT over the merged owner + a
+  // contiguous QkvSplit (MergedQkvEnabled(), VT_QWEN3_QKV_MERGE default ON; =0
+  // restores the byte-identical 3-shard, whose tiny GQA k/v GEMMs mirror vLLM's
+  // single qkv GEMM + split numerically).
   DBuf q(d, adt, {T, qdim});
   DBuf k(d, adt, {T, kdim});
   DBuf v(d, adt, {T, kdim});
   {
     Tensor wqkv = ResidentWeight(d, w.qkv_proj);
+    if (MergedQkvEnabled()) {
+      DBuf qkv(d, adt, {T, qdim + 2 * kdim});
+      vt::MatmulBT(d.q, qkv.t(), dhn, wqkv);
+      vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
+    } else {
     Tensor wq = wqkv.Slice(0, 0, qdim);
     Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
     Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
     vt::MatmulBT(d.q, q.t(), dhn, wq);
     vt::MatmulBT(d.q, k.t(), dhn, wk);
     vt::MatmulBT(d.q, v.t(), dhn, wv);
+    }
   }
 
   // Per-head Gemma q/k RMSNorm (GemmaRMSNorm(head_dim), 1+w) BEFORE RoPE, then

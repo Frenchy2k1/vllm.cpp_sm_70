@@ -209,17 +209,28 @@ DBuf Gemma4AttnBlock(Dev d, const Gemma4LayerWeights& w, const Gemma4Layout& g,
            "gemma4: KV cache head dims mismatch this layer (heterogeneous KV — "
            "runner must allocate per-layer head_dim; see gemma4.h G1 note)");
 
+  // Merged QKVParallelLinear: D1 folds the shared-input q/k/v GEMMs to ONE
+  // MatmulBT over the merged [qdim+2kdim,H] owner + a contiguous QkvSplit
+  // (MergedQkvEnabled(), VT_QWEN3_QKV_MERGE default ON; =0 = byte-identical
+  // 3-shard). The QKV GEMM is uniform across all Gemma-4 layers — the
+  // heterogeneous sliding/shared-KV/norm handling downstream is unaffected.
   DBuf q(d, adt, {T, qdim});
   DBuf k(d, adt, {T, kdim});
   DBuf v(d, adt, {T, kdim});
   {
     Tensor wqkv = ResidentWeight(d, w.attn.qkv_proj);
-    Tensor wq = wqkv.Slice(0, 0, qdim);
-    Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
-    Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
-    vt::MatmulBT(d.q, q.t(), dhn, wq);
-    vt::MatmulBT(d.q, k.t(), dhn, wk);
-    vt::MatmulBT(d.q, v.t(), dhn, wv);
+    if (MergedQkvEnabled()) {
+      DBuf qkv(d, adt, {T, qdim + 2 * kdim});
+      vt::MatmulBT(d.q, qkv.t(), dhn, wqkv);
+      vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
+    } else {
+      Tensor wq = wqkv.Slice(0, 0, qdim);
+      Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
+      Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
+      vt::MatmulBT(d.q, q.t(), dhn, wq);
+      vt::MatmulBT(d.q, k.t(), dhn, wk);
+      vt::MatmulBT(d.q, v.t(), dhn, wv);
+    }
   }
 
   // Q norm (PLAIN per-head RMSNorm over Dh). Always applied.
