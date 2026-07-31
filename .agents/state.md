@@ -34357,7 +34357,6 @@ Evidence: [../docs/bench-evidence/qwen35-4b-postrebase-20260729.md](../docs/benc
 **Tier-C2 vision-tower merged-QKV + bias epilogue (Qwen3-VL + Gemma-4 vision, 2026-07-31, `CLAIM-C2-VISION-QKV-BIAS`, branch `fold/c2-vision-qkv-bias` off `main` `d21c442d`, foreground, NOT pushed).** Executed Tier-C2 of the cross-arch merged-GEMM fold plan (`.agents/specs/arch-fusion-fold-plan-2026-07-30.md`). The vision-tower attention QKV — where the weight is (or is packed into) a single merged `[3H,H]` resident tensor but the compute was three MatmulBT — now folds to ONE `vt::MatmulBT` + an OPTIONAL fused merged-`[3H]` **BIAS epilogue** + a contiguous `vt::QkvSplit`, via the NEW shared helper `models::FusedMergedQkvBiasSplit` (`src/vllm/model_executor/models/merged_qkv_fold.h`). **The NEW piece vs the D1 text merged-QKV** (whose `AttnBlock` VT_CHECKs `qkv_bias.Empty`) is the fused per-`[3H]` bias add carried on the vision path. **A/B unit** `tests/vt/test_ops_qkv_merged_bias.cpp` (CPU, RED-first, run GREEN on this box's CPU build): merged `MatmulBT`+bias-`Add`+`QkvSplit` == three separate `{MatmulBT + bias}` BYTE-IDENTICAL across MHA/GQA/wide shapes (a wrong bias-slice fails the check) — **2/2·14 PASS**. Towers folded: **(1) qwen3_vl_vision** (`qwen3_vl_vision.cpp`) — weight ALREADY resident-fused (`qkv_w [3H,H]` + `[3H]` bias at `:337-338`); the 3× `LinearBias` over `SubRows`/`SubVec` row-slices collapse to ONE helper call carrying the `[3H]` bias (the removed `SubRows`/`SubVec` are now unused → deleted). This is the true zero-marshaling resident-fused C2 site. **(2) gemma4_vision** (`gemma4_vision.cpp`) — q/k/v were SEPARATE `[H,H]` resident weights with NO bias, so the loader now packs a merged `qkv_proj [3H,H]` (a load-time concat mirroring the existing `gate_up` concat — a marshal, NOT pre-fused like qwen3_vl) and the forward does ONE no-bias MatmulBT + `QkvSplit`; the per-slice OUTPUT clamp epilogue stays on the split qb/kb/vb (bit-exact by construction). Bit-exact reasons: the merged GEMM reduces each output row independently (wider N, no cross-row mixing), the merged-`[3H]` bias add broadcasts per column == 3× `[H]` adds on the contiguous thirds, `QkvSplit` is a pure contiguous copy. GATED on DGX GB10 sm_121a (RelWithDebInfo + cutlass-4.5.0 + triton, worker container already down, one `flock $HOME/gpu.lock`): `test_ops_qkv_merged_bias` 2/2·14 (same 14 assertions as the CPU build); **qwen3_vl_vision folded tower gated e2e by `test_qwen3vl_e2e`** — loads the HF Qwen3-VL-4B checkpoint + runs the folded C++ tower (tower_out 196×10240) → image→text **STRICT 32/32 match golden (46 assertions PASS)**; **gemma4_vision folded tower gated e2e by `test_gemma4_registry_e2e` with the LIVE C++ tower** (`VLLM_GEMMA4_VISION_WEIGHTS` dumped via `scripts/mm/g2_vision_weight_dump.py`, 211 weights + 448 clip scalars) → image→text **16/18 content tokens bit-exact (239 assertions PASS) — IDENTICAL to the pre-fold committed-ref gate** (the 2 divergences are the pre-existing terminal bf16 near-ties, margin ~0.10 ≪ 0.5 band; the existing gemma4 image gate held); `test_gemma4_vision_tower` additionally ran the folded tower per-stage 214/214 assertions PASS before throwing on a NON-committed per-stage ref (`ref_patch_embedder.npy`, unrelated to the fold). CUDA build (both folded TUs + the helper header + all 4 test targets) links clean. All four record checkers rc=0. Not pushed; FULL SHA reported. RESIDUAL (fold plan): C3 (35B nvfp4 fused-w13), D2 (GDN in_proj merge), D3 (OLMo-2 full-width qk-norm), E-tier (whisper/voxtral/gemma4_audio tower epilogues).
 
 **Laguna-S-2.1 decode-speed campaign W8+W9 (2026-07-31, `CLAIM-LAGUNA-W8-EMBED` `96b4652f`→ wait, embed=`6eb9fc5a`, grouped=`96b4652f`, base `main`, foreground, PUSHED).** Acting on the W7 speed attribution (`2fac28bb`: Laguna decode host-orchestration-bound, GPU 32.7% active, 22k syncs/step). **W8 (`6eb9fc5a`):** `LagunaEmbed` stopped `ReadF32`-converting the WHOLE `[Vsz,H]` embed table (~311M host element-converts, ~1.23 GB) every token to gather T rows — now gathers only the T rows directly (bit-identical; the profile UNDER-filed this dominant host cost as a minor "#5"). **W9 (`96b4652f`):** the 30 un-grouped per-expert keep-quant GEMV launches/step fold onto the SHARED `vt::MatmulBTQuantGrouped` (3×top_k → 3 launches/token; new `LqGemmGrouped` wrapper + `VT_LAGUNA_GROUPED_MOE` gate; experts were ALREADY stacked `[E*N,H]` → no loader change; routes through the shared op per fold policy). **GATED — same-binary A/B on the real 3-shard UD-Q4_K_XL GGUF (GB10 sm_121a, `--gpu`, W6 cached, drop_caches cold, 24 tok, one `flock`):** W8 TOKEN-IDENTICAL to the W5/W6 golden (`22345 83 350 785 …` " Paris."); W9 grouped (`=1`, default) == per-expert (`=0`) BYTE-IDENTICAL (md5 `754728c6`, == golden). **Speed: decode 0.66 → 0.17 (W8, 3.9×) → 0.13 s/tok (W9, +1.38×) = 5.1× cumulative; 1.5 → 7.7 tok/s; 18× → 3.6× vs llama.cpp 27.8.** Bit-exact both levers by construction; each verified before push; all record checkers rc=0 by exit code (W9 added `VT_LAGUNA_GROUPED_MOE` to `scripts/env-doc-allowlist.txt`). RESIDUAL: **lever #1 device-resident decode** (the 22k-syncs/step kill — mirror ds4 `ForwardResidentDecodeGguf` + decode-CUDA-graph) toward the ~13–20 tok/s ceiling; smaller #5s (per-token RoPE cos/sin rebuild, norm/router `ReadF32`). The shared grouped op also closes qwen3_5's A3 fold (task #226) but qwen3_5 needs a loader-stacking step first. Spec: [specs/laguna-s21-w7-speed-2026-07-31.md](specs/laguna-s21-w7-speed-2026-07-31.md) §W8/§W9.
-
 - **2026-07-31 (Laguna real vLLM bar)** — `CLAIM-LAGUNA-VLLM-NVFP4`. USER
   flagged that Laguna (and DeepSeek) were only ever benchmarked vs GGUF C
   engines (llama.cpp; ds4=antirez DwarfStar), never vLLM — off the standing
@@ -34378,3 +34377,39 @@ Evidence: [../docs/bench-evidence/qwen35-4b-postrebase-20260729.md](../docs/benc
   (`nvidia/DeepSeek-V4-Flash-NVFP4` fits one Spark). NOT started: our NVFP4
   arm, DeepSeek vLLM run (disk-gated: DS4 NVFP4 ~85 GiB vs ~89 free after
   Laguna).
+
+## 2026-07-31 — `SERVE-C-ABI` W0 contract spike (`CLAIM-SERVE-C-ABI-SPIKE`)
+
+CPU-only, isolated worktree `.worktrees/serve-c-abi-spike`, branch
+`codex/serve-c-abi-spike`, base `a10bd428`. Accepted the missing
+`.agents/specs/c-api-library.md` for the stable C API: pinned-vLLM semantic
+chain and original-packaging deviation, ABI v10/19-symbol baseline, ownership,
+no-throw/error mapping, callback/request concurrency, versioning/export rules,
+tests, gates, dependencies, risks, and non-overlapping W1-W5 follow-ons.
+
+The source-of-truth audit found a real documentation bug: `include/vllm.h:85`
+and `test_capi.cpp:1122-1227` are ABI v10, while README and `docs/USAGE.md`
+still advertised v9 and the usage history stopped at v9. Corrected those public
+surfaces and added v10's default-off jump-forward field. No source, header,
+CMake, test, model, kernel, fixture, or generated artifact changed.
+
+Honest residuals keep `SERVE-C-ABI` at `ANCHOR-BACKFILL`: `test_dlopen` resolves
+17/19 symbols and omits the chat pair; historical binary-layout compatibility
+is not mechanically gated; the no-throw guarantee needs allocation-failure
+fault injection; callback/request teardown needs focused sanitizer stress; a
+standalone C consumer over a real tiny model remains the final packaging gate.
+
+Verification: CPU Release build completed for `vllm_capi_c_check`, `test_capi`,
+`vllm_shared`, and `test_dlopen`; focused ctest passed 3/3 (`test_capi`,
+`test_dlopen`, `capi_shared_exports_only_abi`). This GCC 12 box required
+`-Wno-volatile -Wno-restrict` only for two unrelated pre-existing project-wide
+`-Werror` diagnostics (`qwen3_5_gguf_weights.cpp:49`, `fs_io.cpp:66`). The first
+run also proved `test_dlopen` does not itself build `vllm_shared`; building the
+shared target explicitly fixed the missing artifact. A one-off known timing
+flake in the early-stop case (1 vs expected 2 deltas) passed on the required
+serial rerun; no test/source change was made.
+
+Record checks: doc-checkpoint, README structure, model checklist, device leakage,
+and env documentation all pass. `check-agent-record` reports the base tree's
+same six absent closing-commit objects (`444ea9d7`, `7a3f04b2`, `164453a2`) on
+unrelated DONE rows; this diff changes none of those rows or owner hashes.
