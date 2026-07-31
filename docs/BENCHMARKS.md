@@ -107,6 +107,57 @@ BW-bound step). MHC measured tie; routed-MoE we win +2.6 ms; fp8 KV/prefill are 
 footprint/unmeasured. Full ranked table + acceptance math + exact ds4-ncu command:
 `.agents/specs/deepseek-beat-ds4-sweep-2026-07-30.md`.
 
+## DeepSeek-V4-Flash decode ds4-gap — Brick 14 (Q8_0 INTRA-ROW register-prefetch — the ds4 raw mechanism) (2026-07-31, `CLAIM-DSV4-DECODE-BRICK14`) — MECHANISM REPRODUCED (long-scoreboard 56→31→28, regs 39→64→96 toward ds4) but MEASURED-NEGATIVE on throughput (tok/s flat 13.14) → long-scoreboard is NOT the causal gate; corrects Brick 13's axis claim; Q8_0 front stays CLOSED
+
+Measured on GB10 sm_121a, same DeepSeek-V4-Flash IQ2XXS GGUF, `--gpu --kv-cache
+VT_V4_RESIDENT_DECODE=1 VT_V4_DECODE_GRAPH=1 DS4_CUDA_Q8_F16_CACHE_RESERVE_MB=28000`,
+`flock`, `local-ai-worker` absent. Base `353aebe3` (branch `ds4-q8-register-prefetch`, NOT
+pushed). The lever named by `ds4-q8-raw-mechanism-2026-07-30`: ds4's byte-identical `preq`
+Q8_0 GEMV runs at long-scoreboard **17.2 @ 56 regs, 60% occ** vs ours **54.4 @ 39 regs, 72%
+occ**, long-scoreboard INVERSELY tracking register count ⇒ raise INTRA-ROW memory-level
+parallelism (deepen the per-warp in-flight weight-block load pipeline). DISTINCT from the
+Brick-13 multi-ROW ILP that moved the wrong axis.
+
+- **Kernel built + wired (bit-exact-safe).** `QuantDotGemmQ8_0PrefetchKernel<OutT,PF>`: SAME
+  one-row-per-warp map; the per-lane block loop is unroll-and-JAMmed by PF — each group of PF
+  blocks issues ALL of its int8+scale loads into registers BEFORE the dependent `__dp4a` chains,
+  so PF block-loads are outstanding per row. **BYTE-IDENTICAL** to the plain kernel (same block
+  order lane,lane+32,…, same 8×`__dp4a`, same f16-scale fold). `VT_V4_Q8_PREFETCH` (default-OFF
+  `=1`; opt-in `=2`/`=4`), dispatched in `MatmulQ8_0Cuda` so BOTH the eager forward AND the
+  captured `V4Graph::Step` inherit it. Ground: ds4 `matmul_q8_0_preq_warp8_kernel` `ds4_cuda.cu:4343`.
+- **CAUSAL METRIC — sudo `ncu --replay-mode application` (+ memory watchdog, min-free 26 GB; NEVER
+  kernel-replay with the 80 GB model) `--metrics long_scoreboard,registers_per_thread,warps_active,
+  l1_hit,gpu__time_duration`, regex `QuantDotGemmQ8_0(Prefetch)Kernel`, skip 400 count 48, decode
+  steady, grid-keyed OFF/PF2/PF4.** Target grid-256 (n=2048 = the spec's 54.4): registers/thread
+  **39 → 64 → 96** (nvcc grew regs past ds4's 56 WITHOUT `__launch_bounds__`/`-maxrregcount`);
+  long-scoreboard **56.1 → 30.7 → 28.4** (DROPPED ~2×, toward ds4's 17.2); occupancy **72.2% →
+  55.3% → 30.5%** (toward ds4's 60%); L1-hit flat 96.6→96.8%. grid-512 (n=4096): LS **58.3 → 25.2
+  → 21.4**; lm_head grid-20480: LS **75.3 → 37.4 → 18.7**. **The ds4 register-resident-MLP signature
+  is REPRODUCED exactly.** BUT per-kernel GPU-active is **FLAT**: grid-256 **46.06 → 46.27 → 46.19
+  µs**; grid-512 45.87 → 45.97 → 46.61; lm_head 1111 → 1123 → 1137 µs (PF4 slightly WORSE at 31% occ).
+- **CLEAN WALL-CLOCK (sudo `sync;drop_caches` before EACH rep, 3 reps, `--max-tokens 64`):**
+  OFF **13.158/13.145/13.133** (median **13.145**); PF2 **13.155/13.140/13.134** (13.140, **−0.04%**);
+  PF4 **13.145/13.140/13.133** (13.133, **−0.09%**). DEAD FLAT — matches the flat per-kernel duration.
+- **VERDICT — the mechanism LANDED but the causal payoff is ABSENT.** Long-scoreboard fell exactly
+  as ds4's, at ds4's register/occupancy operating point, yet GPU-active and tok/s did NOT move ⇒ the
+  raw-mechanism spec's premise (long-scoreboard is the CAUSAL gate on the 67%→90% BW gap) is
+  MEASURED-REFUTED. On GB10 the Q8_0 GEMV time is bound by DRAM byte-delivery for the row's weight
+  bytes, NOT by the latency-exposure the long-scoreboard-per-issue-active counter reports; deepening
+  the load pipeline lowers the stall counter but not the wall time (bytes arrive at the same rate),
+  so DRAM-achieved BW stays ~67%. **This CORRECTS Brick 13's framing:** Brick 13 called multi-row
+  "the wrong axis" and implied intra-row MLP was the untried, promising one; Brick 14 runs exactly
+  that axis, hits ds4's counter target, and shows it ALSO yields nothing — the long-scoreboard axis
+  as a whole is a red herring for throughput here.
+- **GATE (RED-first, byte-identical):** `test_cuda_quant_dot` **9/9·110432** (new Brick-14 A/B
+  `1/1·1968`: PF2==PF4==plain byte-identical over nb∈{16,48,224}, n∈{1,7,16,17} incl. tail groups
+  ∤32·PF, m∈{1,3}); `test_deepseek_v4_gguf_load` **15/15·931**; `test_cuda_deepseek_v4` **20/20·67072**.
+  Real-model token stream **byte-identical OFF==PF2==PF4**, golden `11111 16 455 6102 294 8760 344 …` (16/16).
+- **DISPOSITION — RECORDED-NEGATIVE, kept DEFAULT-OFF** (bit-exact-safe, unit-gated, wired both paths;
+  `VT_V4_Q8_PREFETCH=2|4` opt-in for the record), like Bricks 4/8/11/12/13. **~13 tok/s remains the
+  honest Q8_0-kernel ceiling on GB10; a raw-vs-raw OVERALL beat of ds4's 16.5 is NOT reachable via
+  any Q8_0-GEMV-kernel-structure lever** — the remaining raw gap is the MoE-expert + per-step glue
+  front (~15 ms/step), a separate campaign. Full DIFF: `.agents/specs/ds4-q8-raw-mechanism-2026-07-30.md`.
+
 ## DeepSeek-V4-Flash decode ds4-gap — Brick 13 (Q8_0 ILP: N output-rows per warp) (2026-07-31, `CLAIM-DSV4-DECODE-BRICK13`) — MEASURED NEGATIVE via sudo-ncu: the ILP axis collapses occupancy, does NOT drop long-scoreboard; ~13 tok/s is the honest Q8_0 ceiling → Q8_0 front CLOSED
 
 Measured on GB10 sm_121a, same DeepSeek-V4-Flash IQ2XXS GGUF, `--gpu --kv-cache

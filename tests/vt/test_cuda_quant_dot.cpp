@@ -475,6 +475,69 @@ TEST_CASE("Brick 13: CUDA Q8_0 ILP multi-row GEMV == plain (byte-identical)") {
   gpu.DestroyQueue(gq);
 }
 
+// Brick 14 (ds4 raw-mechanism lever): the INTRA-ROW multi-block register-PREFETCH Q8_0 GEMV
+// (QuantDotGemmQ8_0PrefetchKernel, VT_V4_Q8_PREFETCH=2|4) hoists PF super-block loads into
+// registers before the dependent __dp4a chains, keeping the warp→output map (one row per warp)
+// UNCHANGED — unlike the Brick-13 multi-ROW ILP. Each lane still visits its blocks in the SAME
+// ascending order, runs the SAME 8×__dp4a per block, the SAME 32-wide warp reduce, and the SAME
+// f16-scale fold → the result is BYTE-IDENTICAL to the plain one-row-per-warp kernel. That
+// byte-identity is the RED-first anchor: a wrong group/tail stride or a re-associated accumulate
+// would diverge from plain and fail hard. nb chosen to exercise groups that are NOT a multiple of
+// 32*PF (tail-block path): nb=16 (< one PF=2 group), nb=48, nb=224; n both 1 and tail-y.
+TEST_CASE("Brick 14: CUDA Q8_0 register-prefetch GEMV == plain (byte-identical)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; Q8_0 prefetch gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase c = {DType::kQ8_0, 32, 34, 0, -1, "q8_0"};
+  for (int64_t nb : {int64_t{16}, int64_t{48}, int64_t{224}}) {
+    const int64_t k = nb * c.block_elems;
+    for (int64_t m : {int64_t{1}, int64_t{3}}) {
+      for (int64_t n : {int64_t{1}, int64_t{7}, int64_t{16}, int64_t{17}}) {
+        CAPTURE(nb);
+        CAPTURE(m);
+        CAPTURE(n);
+        std::vector<uint8_t> wq = RandomBlocks(c, n * nb, 0x14B14U);
+        std::vector<float> a(static_cast<size_t>(m * k));
+        GenerateData(1.0F, a.size(), a.data());
+        void* d_a = gpu.Alloc(a.size() * sizeof(float));
+        gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+        Tensor at = DevTensor(d_a, DType::kF32, {m, k});
+        void* d_w = gpu.Alloc(wq.size());
+        gpu.Copy(gq, d_w, wq.data(), wq.size());
+        Tensor bt = DevTensor(d_w, DType::kQ8_0, {n, k});
+
+        auto run = [&](const char* flag) {
+          setenv("VT_V4_Q8_PREFETCH", flag, 1);
+          void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
+          Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
+          vt::MatmulBTQuant(gq, ot, at, bt);
+          std::vector<float> out(static_cast<size_t>(m * n), 0.0F);
+          gpu.Copy(gq, out.data(), d_o, out.size() * sizeof(float));
+          gpu.Synchronize(gq);
+          gpu.Free(d_o);
+          return out;
+        };
+        std::vector<float> plain = run("1");   // one row per warp, no prefetch (baseline)
+        std::vector<float> pf2 = run("2");      // prefetch depth 2
+        std::vector<float> pf4 = run("4");      // prefetch depth 4
+        unsetenv("VT_V4_Q8_PREFETCH");
+        for (size_t i = 0; i < plain.size(); ++i) {
+          REQUIRE(std::isfinite(pf2[i]));
+          REQUIRE(std::isfinite(pf4[i]));
+          CHECK(pf2[i] == plain[i]);  // byte-identical (RED-first)
+          CHECK(pf4[i] == plain[i]);
+        }
+        gpu.Free(d_a);
+        gpu.Free(d_w);
+      }
+    }
+  }
+  gpu.DestroyQueue(gq);
+}
+
 TEST_CASE("CUDA keep-quant GEMM registers the native kCUDA provider") {
   // The registration is what flips the GGUF loader's keep-quant default ON on a
   // CUDA device (GgufQuantComputeAvailable -> OpRegistered(kMatmulBTQuant,kCUDA))

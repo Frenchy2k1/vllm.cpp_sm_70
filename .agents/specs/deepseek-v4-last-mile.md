@@ -456,10 +456,51 @@ the IQ2_XXS codebook (`d_iq2xxs_grid`/`d_ksigns`) + K-quant sub-block unpack + f
   weight cache / L2 residency, `ERR_NVGPUCTRPERM` counter-blocked; not a Q8_0-GEMV-kernel-structure lever.)
   **GATES (RED-first):** `test_cuda_quant_dot` **8/8·108464** (incl. new Brick-13 byte-identical A/B `1/1·1968`);
   real-model token-identity OFF==ILP2==ILP4 16/16. Code kept default-OFF, records kept, NOT pushed.
+- **Brick 14 (IMPL) — Q8_0 INTRA-ROW register-PREFETCH lever (the ds4 raw mechanism) built + sudo-ncu-measured →
+  MECHANISM REPRODUCED but MEASURED-NEGATIVE on throughput; this CORRECTS the Brick-13 axis claim AND refutes the
+  raw-mechanism spec's causal premise (long-scoreboard is NOT the throughput driver on GB10).** (2026-07-31, branch
+  `ds4-q8-register-prefetch` off `353aebe3`, NOT pushed. `VT_V4_Q8_PREFETCH` default-OFF `=1`; opt-in `=2`/`=4`,
+  allow-listed.) `ds4-q8-raw-mechanism-2026-07-30` DIFFed ds4's byte-identical `preq` Q8_0 GEMV (long-scoreboard
+  **17.2 @ 56 regs, 60% occ**) against ours (**54.4 @ 39 regs, 72% occ**), found long-scoreboard INVERSELY tracks
+  register count, and named the lever: raise INTRA-ROW memory-level parallelism (deepen the per-warp in-flight
+  weight-block load pipeline) — DISTINCT from the Brick-13 multi-ROW ILP that moved the wrong axis (longSB 85-127).
+  Built `QuantDotGemmQ8_0PrefetchKernel<OutT,PF>` (`cuda_quant_dot.cu`): SAME single-row-per-warp map; the per-lane
+  block loop is unroll-and-JAMmed by PF — each group of PF blocks issues ALL of its int8+scale loads into registers
+  BEFORE the dependent `__dp4a` chains, so PF block-loads are outstanding per row. BIT-IDENTICAL (same block order
+  lane,lane+32,…, same 8×`__dp4a`, same f16-scale fold) — `test_cuda_quant_dot` Brick-14 A/B `1/1·1968` byte-exact,
+  real-model token-identity OFF==PF2==PF4 16/16 (`11111 16 455 6102 294 8760 344 …`). **MEASURED (sudo `ncu
+  --replay-mode application` + memory watchdog, min-free 26 GB, launch-skip 400 count 48, decode steady), the target
+  grid-256 (n=2048, the spec's 54.4) kernel:** registers/thread **39 → 64 (PF2) → 96 (PF4)** (nvcc grew regs past
+  ds4's 56 WITHOUT `__launch_bounds__`/`-maxrregcount`); long-scoreboard **56.1 → 30.7 → 28.4** (DROPPED ~2×, toward
+  ds4's 17.2); occupancy **72.2% → 55.3% → 30.5%** (toward ds4's 60%); L1-hit flat 96.6→96.8%. grid-512 (n=4096):
+  longSB **58.3 → 25.2 → 21.4**; lm_head grid-20480: longSB **75.3 → 37.4 → 18.7**. **The ds4 register-resident-MLP
+  signature is REPRODUCED exactly.** BUT the causal payoff is ABSENT: per-kernel GPU-active is **FLAT** (grid-256
+  **46.06 → 46.27 → 46.19 µs**; grid-512 45.87 → 45.97 → 46.61; lm_head 1111 → 1123 → 1137 µs, PF4 slightly WORSE at
+  31% occ). **Clean wall-clock decode (sudo `drop_caches`, 3 reps, `--max-tokens 64`):** OFF **13.145** tok/s median;
+  PF2 **13.140 (−0.04%)**; PF4 **13.133 (−0.09%)** — DEAD FLAT. **HARD-STOP verdict: the mechanism landed (long-SB
+  fell exactly as ds4's, at ds4's register/occupancy operating point) yet produced ZERO time/throughput win → the
+  raw-mechanism spec's premise that long-scoreboard is the CAUSAL gate on the 67%→90% BW gap is MEASURED-REFUTED.**
+  On GB10 the Q8_0 GEMV time is bound by the actual DRAM byte-delivery for the row's weight bytes, NOT by the
+  latency-exposure the long-scoreboard-per-issue-active counter reports; hiding that latency (deeper load pipeline)
+  lowers the stall counter but not the wall time because the bytes still arrive at the same rate. DRAM-achieved BW
+  therefore stays ~67% (byte-delivery time unchanged). **This CORRECTS Brick 13's framing precisely:** Brick 13 said
+  multi-row was "the wrong axis" and implied the RIGHT axis (intra-row MLP) was untried and promising; Brick 14 tries
+  exactly that right axis, hits ds4's counter target, and shows it ALSO yields nothing — so the long-scoreboard axis
+  as a whole is a red herring for throughput here, not merely the multi-row variant. ds4's 90% remains attributable
+  only to a mechanism the observable counters do not capture (its fp16-dequant weight cache / different byte-delivery
+  path), NOT to register-resident MLP. **DISPOSITION — kernel kept DEFAULT-OFF** (bit-exact-safe, `VT_V4_Q8_PREFETCH
+  =2|4` opt-in for the record), like the Brick 4/8/11/12/13 negatives. **~13 tok/s remains the honest Q8_0-kernel
+  ceiling on GB10; the raw-vs-raw OVERALL beat of ds4's 16.5 is NOT on the table via any Q8_0-GEMV-kernel-structure
+  lever** — the remaining raw gap is the MoE-expert + per-step glue front (~15 ms/step), a separate campaign.
+  **GATES (RED-first):** `test_cuda_quant_dot` **9/9·110432** (incl. new Brick-14 byte-identical A/B `1/1·1968`),
+  `test_deepseek_v4_gguf_load` **15/15·931**, `test_cuda_deepseek_v4` **20/20·67072**; real-model token-identity
+  OFF==PF2==PF4 16/16. Code kept default-OFF, records kept, NOT pushed. Full DIFF: `ds4-q8-raw-mechanism-2026-07-30.md`.
 
 ## 5. Grounding (every impl cites upstream, per [[ground-every-impl-in-upstream]])
 - Our kernels: `src/vt/cuda/cuda_quant_dot.cu` (`QuantDotGemmQ8_0Kernel`, `QuantDotGemmQ8_0MultiRowKernel<OutT,NROWS>`
-  (Brick 13 ILP, default-OFF measured-negative), `QuantDotGemmKernel<W>` +
+  (Brick 13 ILP, default-OFF measured-negative), `QuantDotGemmQ8_0PrefetchKernel<OutT,PF>` (Brick 14 intra-row
+  register-prefetch, default-OFF measured-negative; ground: ds4 `matmul_q8_0_preq_warp8_kernel` `ds4_cuda.cu:4343`),
+  `QuantDotGemmKernel<W>` +
   `DotIQ2XXS`/`DotQ2K`/`DotQ8_0`... , `QuantDotGemmGroupedKernel`, `QuantizeQ8KKernel`, `QuantizeQ8_0Kernel`).
 - The dequant/vec-dot ORACLE (bit-exact target): `src/vt/cpu/cpu_quant_dot.cpp`
   (`VecDotQ8_0Q8_0`, `VecDotIQ2_XXSQ8_K`, `VecDotQ2_KQ8_K`) + `cpu_quant_act.cpp` (`QuantizeRowQ8_0/Q8_K`).
