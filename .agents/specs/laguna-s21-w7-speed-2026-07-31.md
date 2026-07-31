@@ -151,3 +151,30 @@ The measured 0.49 s/tok saved per token ≈ the host cost of the eliminated 311M
 embed conversion — consistent with the host-orchestration attribution. Remaining levers
 unchanged (grouped-expert GEMM = A3, then device-resident decode); the per-token
 RoPE-cos/sin rebuild + norm/router `ReadF32` are the smaller residual #5 items.
+
+---
+
+## W9 — lever #2 (grouped-expert GEMM) LANDED + GATED (2026-07-31, `CLAIM-LAGUNA-W9-GROUPED`)
+
+Laguna's 30 un-grouped per-expert GEMV launches/step (top_k experts × {gate,up,down},
+each a separate `LqGemmRowSlice` + `DrainQueue`) fold onto the SHARED keep-quant grouped
+op `vt::MatmulBTQuantGrouped`: per token, the Pk selected experts' gate/up/down each
+collapse to ONE grouped launch over the already-stacked `[E*N,H]` expert tower (NO loader
+change — Laguna's experts are stored stacked, sliced by `id*moe_I`). New `LqGemmGrouped`
+thin wrapper (mirror of ds4 `GemmGroupedExpertsKq`) + `LagunaGroupedMoeEnabled()` gate;
+rows built in SLOT ORDER so `GateUpSilu` (Laguna's own) + the `acc` combine run in the
+identical order as the per-expert fallback ⇒ bit-identical by construction.
+
+**GATED — same-binary A/B on the real UD-Q4_K_XL GGUF (GB10 sm_121a, `--gpu`, W6 cached,
+drop_caches cold, 24 tok):**
+- **BYTE-IDENTICAL** — grouped (`VT_LAGUNA_GROUPED_MOE=1`, default) and per-expert (`=0`)
+  `generated ids` are byte-equal (md5 `754728c6…`) and BOTH == the W6/W5 golden (a wrong
+  row-order/combine would diverge). Bit-exact confirmed on the real model, both ways.
+- **SPEED: decode 0.18 → 0.13 s/tok = 1.38×** (same-binary grouped-vs-per-expert). Prefill
+  0.99 → 0.70s. Cumulative with W8 embed: **0.66 → 0.13 s/tok = 5.1× (1.5 → 7.7 tok/s);
+  18× → 3.6× vs llama.cpp 27.8**.
+
+This routes through the SHARED `vt::MatmulBTQuantGrouped` (fold policy: no per-model kernel)
+and proves the grouped-consumption pattern qwen3_5's A3 reuses (after its loader-stacking —
+qwen3_5 stores experts per-`OwnedTensor`, not stacked). Remaining Laguna lever: #1
+device-resident decode (the 22k-syncs kill) toward the ~13–20 tok/s ceiling.
