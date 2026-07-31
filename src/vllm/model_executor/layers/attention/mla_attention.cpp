@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "vt/dtype.h"
+#include "vt/op_provider.h"
 
 namespace vllm {
 namespace mla {
@@ -60,6 +62,15 @@ void RequireWeight(const Tensor& t, const char* name) {
     throw std::invalid_argument(std::string("MLA block: required weight `") + name +
                                 "` is not set for the selected q_lora_rank branch");
   }
+}
+
+// Tier-A2+A5 fold: merge the kv_c+k_pe A-projections into ONE vt::MatmulBT over the
+// merged [L+R, H] weight and fuse the {kv_a_layernorm ; decoupled-k_pe RoPE} pair
+// into ONE vt::FusedNormRope launch. Default-ON; VT_MLA_FUSED_NORM_ROPE=0 rolls back
+// to the byte-exact split path (3/2 A-proj GEMMs + standalone RmsNorm + RopeFromCache).
+bool MlaFusedNormRopeEnabled() {
+  const char* v = std::getenv("VT_MLA_FUSED_NORM_ROPE");
+  return v == nullptr || v[0] != '0';
 }
 
 // `yarn_find_correction_dim` (rotary_embedding/common.py:34-42).
@@ -292,7 +303,20 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   // 1812-1820) — only the launch granularity differs, which is the same trade
   // the dense block already makes by DEFAULT (dense_attn_block.h's 3-shard qkv
   // path, VT_QWEN3_QKV_MERGE default OFF). A truly fused A-GEMM is a W9 A/B.
-  DBuf kv_c(d, dt, {T, L});
+  RequireWeight(w.kv_a_layernorm, "kv_a_layernorm");
+  // Tier-A2+A5 fold (default-ON). When the shared vt::FusedNormRope op is
+  // registered on this backend, the kv_c(nope) + k_pe(rope) A-projections collapse
+  // to ONE merged [L+R, H] vt::MatmulBT and the {kv_a_layernorm ; decoupled-k_pe
+  // RoPE} pair folds into ONE launch — BIT-IDENTICAL, since the merged GEMM is the
+  // same arithmetic with a wider N (per-row output slices unchanged) and the fused
+  // op runs the exact {RmsNorm(latent) ; RopeFromCache(k_pe)} the split path does
+  // (the two halves are disjoint dims). The latent slice of the merged output is
+  // strided, which is why the fused kernel — not vt::RmsNorm, which requires a
+  // contiguous input — reads it. VT_MLA_FUSED_NORM_ROPE=0 restores the split path.
+  const bool fused_nr = R > 0 && MlaFusedNormRopeEnabled() &&
+                        vt::OpRegistered(vt::OpId::kFusedNormRope, d.q.device.type);
+  DBuf kv_c(d, dt, {T, fused_nr ? int64_t{0} : L});
+  DBuf kv_merged(d, dt, {T, fused_nr ? (L + R) : int64_t{0}});
   DBuf k_pe(d, dt, {T, R});
   DBuf q_raw(d, dt, {T, N * Dqk});
   if (dims.has_q_lora()) {
@@ -308,15 +332,18 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     }
     DBuf q_c(d, dt, {T, ql});
     Tensor w_qa = fused.Slice(0, 0, ql);
-    Tensor w_kva_nope = fused.Slice(0, ql, ql + L);
-    Tensor w_kva_rope = fused.Slice(0, ql + L, ql + L + R);
-    Tensor q_c_t = q_c.t(), kv_c_t = kv_c.t(), k_pe_t = k_pe.t(), q_raw_t = q_raw.t();
-    vt::MatmulBT(d.q, q_c_t, hidden, w_qa);
-    vt::MatmulBT(d.q, kv_c_t, hidden, w_kva_nope);
-    vt::MatmulBT(d.q, k_pe_t, hidden, w_kva_rope);
+    Tensor q_c_t = q_c.t(), q_raw_t = q_raw.t();
+    vt::MatmulBT(d.q, q_c_t, hidden, w_qa);  // q_c A-proj (own GEMM → contiguous latent)
+    if (fused_nr) {
+      Tensor kv_merged_t = kv_merged.t();  // A2: ONE merged [T, L+R] kv A-proj GEMM
+      vt::MatmulBT(d.q, kv_merged_t, hidden, fused.Slice(0, ql, ql + L + R));
+    } else {
+      Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t();
+      vt::MatmulBT(d.q, kv_c_t, hidden, fused.Slice(0, ql, ql + L));
+      vt::MatmulBT(d.q, k_pe_t, hidden, fused.Slice(0, ql + L, ql + L + R));
+    }
     // `q_c = self.q_a_layernorm(q_c)` (mla.py:143) — in-place, like upstream.
-    Tensor w_qan = w.q_a_layernorm;
-    vt::RmsNorm(d.q, q_c_t, q_c_t, w_qan, vt::RmsNormArgs{dims.rms_norm_eps, false});
+    vt::RmsNorm(d.q, q_c_t, q_c_t, w.q_a_layernorm, vt::RmsNormArgs{dims.rms_norm_eps, false});
     // `q = self.q_b_proj(q_c)[0]` (mla.py:144)
     vt::MatmulBT(d.q, q_raw_t, q_c_t, w.q_b_proj);
   } else {
@@ -328,43 +355,55 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
           "MLA block: kv_a_proj_with_mqa must be [kv_lora_rank + qk_rope_head_dim, "
           "hidden_size] (deepseek_v2.py:511)");
     }
-    Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t(), q_raw_t = q_raw.t();
-    vt::MatmulBT(d.q, kv_c_t, hidden, kva.Slice(0, 0, L));
-    vt::MatmulBT(d.q, k_pe_t, hidden, kva.Slice(0, L, L + R));
+    Tensor q_raw_t = q_raw.t();
+    if (fused_nr) {
+      Tensor kv_merged_t = kv_merged.t();  // A2: ONE merged GEMM (kva is already [L+R, H])
+      vt::MatmulBT(d.q, kv_merged_t, hidden, kva);
+    } else {
+      Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t();
+      vt::MatmulBT(d.q, kv_c_t, hidden, kva.Slice(0, 0, L));
+      vt::MatmulBT(d.q, k_pe_t, hidden, kva.Slice(0, L, L + R));
+    }
     // `q = self.q_proj(hidden_states)[0]` (mla.py:152)
     vt::MatmulBT(d.q, q_raw_t, hidden, w.q_proj);
   }
 
-  // ─── 2. kv_a_layernorm over the LATENT ONLY (deepseek_v2.py:516) ──────────
-  // The decoupled rope part is deliberately NOT normed — that asymmetry is the
-  // whole reason `kv_a_layernorm` is built over `kv_lora_rank` and not over the
-  // full 576-wide projection output.
-  RequireWeight(w.kv_a_layernorm, "kv_a_layernorm");
+  // ─── 2+3. kv_a_layernorm(LATENT ONLY, deepseek_v2.py:516) + decoupled RoPE
+  //          (mla.py:155-167). The decoupled rope part is deliberately NOT normed
+  //          — that asymmetry is the whole reason `kv_a_layernorm` is built over
+  //          `kv_lora_rank` and not over the full 576-wide projection output.
+  //          RoPE rotates only the TRAILING qk_rope_head_dim slice of each query
+  //          head; the rotation style comes from `dims.is_neox_style` (DeepSeek-
+  //          V2/V3 use the adjacent-pair GPT-J form, is_neox_style=False,
+  //          deepseek_v2.py:1059-1064; MiniCPM3 the neox half-split form). All rope
+  //          operands are STRIDED views, which is why W6 relaxed vt::RopeFromCache
+  //          to stride-driven q/k.
   DBuf kv_c_normed(d, dt, {T, L});
   Tensor kv_c_normed_t = kv_c_normed.t();
-  Tensor kv_c_in = kv_c.t();
-  Tensor w_kvan = w.kv_a_layernorm;
-  vt::RmsNorm(d.q, kv_c_normed_t, kv_c_in, w_kvan,
-              vt::RmsNormArgs{dims.rms_norm_eps, false});
-
-  // ─── 3. decoupled RoPE (mla.py:155-167) ──────────────────────────────────
-  // `q.view(-1, num_heads, qk_head_dim)`, `k_pe.unsqueeze(1)`, then
-  // `q[..., qk_nope_head_dim:], k_pe = rotary_emb(positions,
-  //                                q[..., qk_nope_head_dim:], k_pe)`.
-  // Only the TRAILING qk_rope_head_dim slice of each query head rotates. The
-  // rotation style comes from `dims.is_neox_style`: DeepSeek-V2/V3 use the
-  // adjacent-pair GPT-J form (`is_neox_style=False`, deepseek_v2.py:1059-1064,
-  // the DEFAULT), MiniCPM3 the neox half-split form (get_rope default,
-  // minicpm3.py:121-125). Both operands are STRIDED views, which is why W6
-  // relaxed vt::RopeFromCache to stride-driven q/k.
-  if (R > 0) {
+  vt::RopeArgs rope;
+  rope.rotary_dim = static_cast<int>(R);
+  rope.is_neox_style = dims.is_neox_style;
+  if (fused_nr) {
     RequireWeight(w.rope_cos_sin_cache, "rope_cos_sin_cache");
+    // A5: latent RMSNorm + decoupled k_pe RoPE in ONE launch over the merged kv
+    // row; k_pe (roped) written to the same buffer the split path fed the cache.
+    Tensor kv_merged_t = kv_merged.t(), k_pe_out = k_pe.t();
+    vt::FusedNormRope(d.q, kv_c_normed_t, k_pe_out, kv_merged_t, w.kv_a_layernorm, positions,
+                      w.rope_cos_sin_cache, vt::RmsNormArgs{dims.rms_norm_eps, false}, rope);
+    // The QUERY rope (q_pe, N heads) stays a distinct binding — bit-identical,
+    // since rope is per-head independent (k_pe was roped in the fused op above).
     Tensor q_pe = View3(q_raw.t(), P, T, N, R, N * Dqk, Dqk, 1);
-    Tensor k_pe3 = View3(k_pe.t(), 0, T, 1, R, R, R, 1);
-    vt::RopeArgs rope;
-    rope.rotary_dim = static_cast<int>(R);
-    rope.is_neox_style = dims.is_neox_style;
-    vt::RopeFromCache(d.q, q_pe, &k_pe3, positions, w.rope_cos_sin_cache, rope);
+    vt::RopeFromCache(d.q, q_pe, nullptr, positions, w.rope_cos_sin_cache, rope);
+  } else {
+    Tensor kv_c_in = kv_c.t();
+    vt::RmsNorm(d.q, kv_c_normed_t, kv_c_in, w.kv_a_layernorm,
+                vt::RmsNormArgs{dims.rms_norm_eps, false});
+    if (R > 0) {
+      RequireWeight(w.rope_cos_sin_cache, "rope_cos_sin_cache");
+      Tensor q_pe = View3(q_raw.t(), P, T, N, R, N * Dqk, Dqk, 1);
+      Tensor k_pe3 = View3(k_pe.t(), 0, T, 1, R, R, R, 1);
+      vt::RopeFromCache(d.q, q_pe, &k_pe3, positions, w.rope_cos_sin_cache, rope);
+    }
   }
 
   // ─── 4. the MLA cache write (W3), BEFORE attention ───────────────────────

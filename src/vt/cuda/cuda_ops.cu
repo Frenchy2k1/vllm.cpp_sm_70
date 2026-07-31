@@ -993,6 +993,105 @@ void RopeFromCacheKernelCuda(Queue& q, Tensor& qs, Tensor* ks,
   }
 }
 
+// Fused MLA norm-rope (kFusedNormRope): one block per token. The RMS reduction
+// over the latent slice [0,off) reuses RmsNormRowKernel's EXACT tree reduce +
+// scale (cuda_ops.cu:62-93), and the decoupled-pe rotation over [off,off+rot)
+// reuses RopeFromCacheKernel's EXACT cache read + rotation (cuda_ops.cu:896-943).
+// The two halves address DISJOINT dims, so the fused output is BIT-IDENTICAL to
+// {RmsNorm(x[:,:off]) ; RopeFromCache(x[:,off:])} — the CPU FusedNormRopeKernel
+// runs exactly that composite as the golden.
+template <typename T, typename Tid>
+__global__ void FusedNormRopeKernel(T* latent_out, T* pe_out, const T* x, const T* w,
+                                    const Tid* positions, const T* cache, int64_t cache_rows,
+                                    int64_t off, int rot, int64_t half, int64_t x_row_stride,
+                                    int64_t lat_row_stride, int64_t pe_row_stride,
+                                    bool is_neox_style, bool gemma, float eps) {
+  const int64_t row = blockIdx.x;
+  const T* xrow = x + row * x_row_stride;
+  T* lrow = latent_out + row * lat_row_stride;
+  T* prow = pe_out + row * pe_row_stride;
+
+  // --- latent RMSNorm over [0, off) — identical to RmsNormRowKernel. ----------
+  __shared__ float partial[kBlock];
+  float acc = 0.0f;
+  for (int64_t j = threadIdx.x; j < off; j += kBlock) {
+    const float v = Load(xrow, j);
+    acc += v * v;
+  }
+  partial[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s /= 2) {
+    if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(off) + eps);
+  for (int64_t j = threadIdx.x; j < off; j += kBlock) {
+    float wj = Load(w, j);
+    if (gemma) wj += 1.0f;
+    Store(lrow, j, Load(xrow, j) * inv * wj);
+  }
+
+  // --- decoupled-pe RopeFromCache over [off, off+rot) — identical to
+  //     RopeFromCacheKernel (single vector, base rope, positions rank-1). ------
+  const int64_t position = static_cast<int64_t>(positions[row]);
+  if (position < 0 || position >= cache_rows) return;
+  const int64_t cache_offset = position * rot;
+  for (int64_t pair = threadIdx.x; pair < half; pair += kBlock) {
+    const float c = Load(cache, cache_offset + pair);
+    const float sn = Load(cache, cache_offset + half + pair);
+    const int64_t first = is_neox_style ? pair : pair * 2;
+    const int64_t second = is_neox_style ? pair + half : pair * 2 + 1;
+    const float xr = Load(xrow, off + first);
+    const float yr = Load(xrow, off + second);
+    Store(prow, first, xr * c - yr * sn);
+    Store(prow, second, xr * sn + yr * c);
+  }
+}
+
+template <typename T>
+void LaunchFusedNormRope(cudaStream_t stream, Tensor& latent_out, Tensor& pe_out,
+                         const Tensor& x, const Tensor& w, const Tensor& positions,
+                         const Tensor& cache, const RmsNormArgs& norm_args,
+                         const RopeArgs& rope_args) {
+  const int64_t t = x.shape[0];
+  const int64_t off = w.shape[0];
+  const int rot = rope_args.rotary_dim;
+  const int64_t half = rot / 2;
+  if (t == 0) return;
+  const unsigned rows = static_cast<unsigned>(t);
+  if (positions.dtype == DType::kI32) {
+    FusedNormRopeKernel<T, int32_t><<<rows, kBlock, 0, stream>>>(
+        latent_out.Ptr<T>(), pe_out.Ptr<T>(), x.Ptr<T>(), w.Ptr<T>(),
+        positions.Ptr<int32_t>(), cache.Ptr<T>(), cache.shape[0], off, rot, half,
+        x.stride[0], latent_out.stride[0], pe_out.stride[0], rope_args.is_neox_style,
+        norm_args.gemma, norm_args.eps);
+  } else {
+    FusedNormRopeKernel<T, int64_t><<<rows, kBlock, 0, stream>>>(
+        latent_out.Ptr<T>(), pe_out.Ptr<T>(), x.Ptr<T>(), w.Ptr<T>(),
+        positions.Ptr<int64_t>(), cache.Ptr<T>(), cache.shape[0], off, rot, half,
+        x.stride[0], latent_out.stride[0], pe_out.stride[0], rope_args.is_neox_style,
+        norm_args.gemma, norm_args.eps);
+  }
+  Check(cudaGetLastError(), "fused_norm_rope launch");
+}
+
+void FusedNormRopeKernelCuda(Queue& q, Tensor& latent_out, Tensor& pe_out, const Tensor& x,
+                             const Tensor& w, const Tensor& positions, const Tensor& cache,
+                             const RmsNormArgs& norm_args, const RopeArgs& rope_args) {
+  switch (x.dtype) {
+    case DType::kF32:
+      LaunchFusedNormRope<float>(AsStream(q), latent_out, pe_out, x, w, positions, cache,
+                                 norm_args, rope_args);
+      break;
+    case DType::kBF16:
+      LaunchFusedNormRope<__nv_bfloat16>(AsStream(q), latent_out, pe_out, x, w, positions, cache,
+                                         norm_args, rope_args);
+      break;
+    default:
+      VT_CHECK(false, "cuda fused_norm_rope: unsupported dtype (f32/bf16 only)");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // rope_cos_sin_cache: precompute the batch's cos|sin ONCE per step (grid-stride
 // over (token, pair)) so the fused preamble below does zero in-kernel
@@ -2160,6 +2259,9 @@ struct Registrar {
         OpId::kRopeFromCache, DeviceType::kCUDA,
         reinterpret_cast<void*>(
             static_cast<RopeFromCacheFn>(&RopeFromCacheKernelCuda)));
+    RegisterOp(
+        OpId::kFusedNormRope, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<FusedNormRopeFn>(&FusedNormRopeKernelCuda)));
     RegisterOp(
         OpId::kRopeCosSinCache, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernelCuda)));

@@ -294,6 +294,20 @@ enum class OpId : uint8_t {
   // clamped-SwiGLU}; the CPU provider runs exactly that composite as the golden.
   // Appended before kCount so no existing op's id shifts.
   kMoeGateUpSwiGLUGrouped,
+  // SHARED fused MLA norm-rope (Tier-A5 fold; ground: DeepSeek-V4-private
+  // NormRopeRowsKernel, deepseek_v4.cpp Brick-7). ONE launch over the merged
+  // kv_a projection row [T, off+rot] computes BOTH DeepSeek-MLA decoupled-rope
+  // halves: latent_out[t,:off] = RmsNorm(x[t,:off]) with norm_weight (the
+  // kv_a_layernorm over kv_lora_rank), and pe_out[t,:rot] = RopeFromCache-rotate
+  // x[t,off:off+rot] (the UNNORMED, UNWEIGHTED decoupled k_pe). The two halves
+  // are DISJOINT dims (latent normed, rope part not), so this is BIT-IDENTICAL
+  // to {vt::RmsNorm(x[:,:off]); vt::RopeFromCache(x[:,off:])} — the CPU provider
+  // runs exactly that composite as the golden. NOTE this reads the precomputed
+  // cos|sin CACHE (like the MLA rope it replaces), NOT ds4's in-kernel analytic
+  // recompute — DeepSeek-V2/kimi rope from a cache, so the cache path is what is
+  // byte-exact here; ds4's own NormRopeRows stays its per-head analytic form.
+  // Appended before kCount so no existing op's id shifts.
+  kFusedNormRope,
   kCount
 };
 
@@ -735,6 +749,11 @@ using EmbeddingFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RopeFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const RopeArgs&);
 using RopeFromCacheFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&,
                                  const Tensor&, const RopeArgs&);
+// Fused MLA norm-rope (kFusedNormRope): latent RmsNorm + decoupled-pe
+// RopeFromCache over one merged kv_a row, in ONE launch. See vt::FusedNormRope.
+using FusedNormRopeFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&,
+                                 const Tensor&, const Tensor&, const RmsNormArgs&,
+                                 const RopeArgs&);
 using CausalConv1dFwdFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*,
                                    Tensor&, const Tensor&, const Tensor&,
                                    const CausalConv1dArgs&);
@@ -1494,6 +1513,27 @@ void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positi
 void RopeFromCache(Queue& q, Tensor& q_states, Tensor* k_states,
                    const Tensor& positions, const Tensor& cos_sin_cache,
                    const RopeArgs& args);
+
+// FusedNormRope (kFusedNormRope): the fused DeepSeek-MLA norm-rope — one launch
+// replacing the {RmsNorm(kv_c latent) ; RopeFromCache(k_pe)} pair over the merged
+// kv_a projection output. Grid is one block per token; each block RMS-reduces the
+// leading latent slice x[t, 0:off) and writes latent_out, then rotates the trailing
+// decoupled-rope slice x[t, off:off+rot) from the precomputed cos|sin cache and
+// writes pe_out. The two halves address DISJOINT dims, so it is BIT-FOR-BIT equal
+// to composing the two standalone ops:
+//   x         [T, off+rot] f32/bf16 — merged kv_a output (contiguous; off = norm_weight length)
+//   norm_weight [off]      f32/bf16 — kv_a_layernorm weight (over kv_lora_rank)
+//   positions [T]          i32/i64  — rope positions
+//   cos_sin_cache [P, rot] f32      — the rope cache (cols [0,rot/2)=cos, [rot/2,rot)=sin)
+//   latent_out[T, off]     f32/bf16 — RmsNorm(x[:, :off]) (NOT roped)
+//   pe_out    [T, rot]     f32/bf16 — RopeFromCache-rotated x[:, off:] (NOT normed, single vector)
+// norm_args: eps + gemma (gemma=false for DeepSeek). rope_args: rotary_dim (=rot) +
+// is_neox_style (DeepSeek-V2/V3 use the GPT-J adjacent-pair form, is_neox_style=false).
+// CPU + CUDA. Additive: only the DeepSeek-V2/kimi MLA block dispatches it.
+void FusedNormRope(Queue& q, Tensor& latent_out, Tensor& pe_out, const Tensor& x,
+                   const Tensor& norm_weight, const Tensor& positions,
+                   const Tensor& cos_sin_cache, const RmsNormArgs& norm_args,
+                   const RopeArgs& rope_args);
 
 // --- Fused full-attention preamble (default-OFF prefill lever; mirror of vLLM's
 // fused_qk_rmsnorm_rope / fla fused_qk_norm_rope.py:95-102, which reads a
