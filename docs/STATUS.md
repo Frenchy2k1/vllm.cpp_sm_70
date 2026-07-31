@@ -2030,3 +2030,5 @@ _(Laguna W10 re-profile: current 0.13 s/tok decode is 89.7% host-sync (14,034 `c
 _(Laguna W11 go/no-go: decode is GPU-COMPUTE-bound (GPU-busy 2.56s ≈ sync 2.59s); device-residency DEMOTED, real levers = QuantizeQ8K-dedup + keep-quant GEMV BW-tuning. See spec §W11.)_
 
 **qwen3_5 A3 keep-quant grouped-MoE fold — W1 spike + scaffolding (2026-07-31).** Spike spec committed (`.agents/specs/qwen35-a3-grouped-moe-2026-07-31.md`) + additive `MoeBlockWeights.expert_*_kq` stacked fields (dead until W2 loader). Applies the landed Laguna W9 grouped pattern to qwen3_5 GGUF; memory-neutral (stacked replaces per-expert copies). W2 loader / W3 forward / W4 gate (test_qwen36_gguf_engine) to follow.
+
+**qwen3_5 A3 W3 byte-exactness hazard recorded (2026-07-31).** The grouped down GEMM needs bf16-output byte-exactness with ExpertMlp MatmulBf16 on the STRICT-gated 35B; shared MatmulBTQuantGrouped is f32-out only. Provable-by-construction but A/B-confirm-before-strict; may need a bf16-output grouped-down variant. See spec §W3 hazard.

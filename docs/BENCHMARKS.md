@@ -10882,3 +10882,5 @@ _(Laguna W10 re-profile (2026-07-31, GB10): decode 0.13 s/tok = 89.7% `cudaStrea
 _(Laguna W11 (2026-07-31, GB10): GPU-busy 2.56s ≈ sync 2.59s ⇒ decode GPU-compute-bound after W8/W9; MoE grouped GEMVs 62%, Q8_0 GEMVs 25%, QuantizeQ8K 12%. Device-residency demoted; next = QuantizeQ8K-dedup (fused MoeGateUpSwiGLUGrouped) + GEMV BW-tune. See spec §W11.)_
 
 **qwen3_5 A3 grouped-MoE — W1 spike/scaffolding, no benchmark yet (2026-07-31).** Impl pending (W2-W4). Target: the per-expert keep-quant MoE matvecs collapse to 3 grouped vt::MatmulBTQuantGrouped launches (mirror Laguna W9, bit-exact). Perf PENDING; DGX SACRED gate test_qwen36_gguf_engine on Qwen3.5-35B-A3B-TBQ4_0.gguf OWED.
+
+**qwen3_5 A3 W3 hazard (2026-07-31).** Recorded the strict-35B down-GEMM cast byte-exactness requirement so fresh W2-W4 execution accounts for it (no near-tie on test_qwen36_gguf_engine). No benchmark. See spec §W3.

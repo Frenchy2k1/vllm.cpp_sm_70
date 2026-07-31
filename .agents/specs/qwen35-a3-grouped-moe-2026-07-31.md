@@ -66,3 +66,21 @@ duplicate ~30 GB expert copy on the 35B ⇒ no OOM-reboot (see
 - Route-weight in `MoeCombine` (invariant). No RopeNeox/impl swaps. `check-fusion-consistency`
   must pass by ROUTING through `vt::MatmulBTQuantGrouped` (the shared op), never an allowlist.
 - Agent cap 200/200 this session ⇒ W2-W4 are hands-on.
+
+## ★ W3 byte-exactness hazard (found during the 2026-07-31 W2/W3 attempt — MUST resolve)
+qwen3.6-35B is a **STRICT-gated MVP gate model** (`test_qwen36_gguf_engine` token-exact),
+so the grouped fold MUST be byte-exact, NOT a near-tie. The subtlety is the DOWN GEMM:
+`ExpertMlp`'s `MatmulBf16` (`qwen3_5.cpp:858`) computes the keep-quant `vt::MatmulBT` with a
+**bf16 OUTPUT tensor** (`dout` is `kBF16`) — the f32→bf16 cast happens INSIDE the kernel.
+The shared `vt::MatmulBTQuantGrouped` outputs **f32 only** (`ops.h`), so the grouped path
+would do f32 → then `F32ToBF16`. Byte-exact ONLY IF the kernel's internal store-cast ==
+`F32ToBF16(same f32 accumulator)` — provable by construction (identical f32 vec_dot
+accumulator — the grouped op's "same integer-dot core", ds4-gated byte-exact — + the same
+round-to-nearest-even bf16 cast), but MUST be confirmed by the grouped=1-vs-=0 A/B BEFORE
+claiming strict. If the A/B shows a 1-ULP diff, W3 needs a **bf16-output grouped down**
+variant (mirror `MatmulBf16`'s in-kernel cast) rather than f32+`F32ToBF16`, since a near-tie
+is NOT acceptable on this strict gate. The gate/up side is safe (`MatmulF32` f32-out ==
+grouped f32-out; SwiGLU `F32ToBF16(Silu(hg)·hu)` identical). **Also:** the `=0`
+byte-exact fallback for keep-quant must slice `expert_*_kq` per-expert (add `MatmulF32Slice`
+/`MatmulBf16Slice`, mirror of laguna `LqGemmRowSlice`) — the per-expert `expert_gate` vector
+is EMPTY for keep-quant after W2.
