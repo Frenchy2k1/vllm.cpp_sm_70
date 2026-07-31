@@ -178,3 +178,30 @@ This routes through the SHARED `vt::MatmulBTQuantGrouped` (fold policy: no per-m
 and proves the grouped-consumption pattern qwen3_5's A3 reuses (after its loader-stacking —
 qwen3_5 stores experts per-`OwnedTensor`, not stacked). Remaining Laguna lever: #1
 device-resident decode (the 22k-syncs kill) toward the ~13–20 tok/s ceiling.
+
+---
+
+## W10 — RE-PROFILE after W8+W9 (2026-07-31, measurement-only, `CLAIM-LAGUNA-W10-REPROFILE`)
+
+The W7 attribution profiled the pre-W8/W9 0.66 s/tok path; re-profiled current main
+(`a402eb6b`, W8+W9) to re-rank levers with real data. nsys `--trace=cuda`, real
+UD-Q4_K_XL GGUF (GB10, `--gpu`, W6 cached, drop_caches cold, 24 tok, TPOT 0.13 s/tok):
+
+| CUDA API | Time% | calls | reading |
+|---|---|---|---|
+| **`cudaStreamSynchronize`** | **89.7%** (2.59 s) | **14,034 (~610/step)** | the per-GEMM `DrainQueue` — STILL the dominant cost |
+| `cudaStreamCreate` | 7.4% | 1 | one-time queue create (213 ms, amortized, not per-step) |
+| `cudaLaunchKernel` | 2.6% | 28,068 (~1,220/step) | launch overhead is NOT the bottleneck |
+
+**VERDICT: lever #1 (device-resident decode) CONFIRMED as the top remaining lever.**
+Syncs dropped 22,115 → 14,034 (W9's grouped-MoE effect) but decode is STILL 89.7%
+host-sync-bound: every `LqGemm`/`LqGemmGrouped` drains the stream so the host reads the
+output for the next f32 glue op (RmsNorm, RoPE, attention, SwiGLU, router, softplus
+out-gate — all host today). The fix (mirror ds4 `ForwardResidentDecodeGguf` + decode
+CUDA-graph): keep intermediates ON-DEVICE and run the glue on-device so the whole
+step defers to ONE `DrainDevice` (610 → ~1 sync/step). This is a MULTI-BRICK campaign
+(port each Laguna glue op to a device kernel + chain them), NOT a bit-exact host fix
+like W8/W9 — governed by the CUDA-graph-capture-safety hazards (see
+[[cudagraph-capture-bakes-stack-addresses]]). GPU-kernel breakdown (post-residency
+residual: `QuantizeQ8K` dedup, weight-GEMV BW) owed on the next profile. Reachable
+still ~13–20 tok/s; killing ~600 syncs/step is the path there.

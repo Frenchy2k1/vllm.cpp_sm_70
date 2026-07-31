@@ -10876,3 +10876,5 @@ speed lever. Gated microbench `VT_FP4_M1_BENCH` (test-only).
 **Laguna-S-2.1 decode: 0.18 → 0.13 s/tok (1.38×), W9 grouped-expert MoE (2026-07-31, GB10 sm_121a).** Real UD-Q4_K_XL keep-quant GGUF, `--gpu`, W6 cached, drop_caches cold, 24 tok. Same-binary A/B (`VT_LAGUNA_GROUPED_MOE=1` vs `=0`): BYTE-IDENTICAL ids (md5 `754728c6`, == W6 golden), so bit-exact both ways. The top_k per-expert gate/up/down GEMVs collapse to 3 grouped `vt::MatmulBTQuantGrouped` launches/token over the stacked tower. Cumulative Laguna decode 0.66 → 0.13 s/tok (5.1×; 1.5 → 7.7 tok/s; 18× → 3.6× vs llama.cpp 27.8). Prefill 0.99 → 0.70s. Next: device-resident decode (#1).
 
 _(Laguna W8+W9 campaign detail + repro in `.agents/state.md` and `.agents/specs/laguna-s21-w7-speed-2026-07-31.md`.)_
+
+_(Laguna W10 re-profile (2026-07-31, GB10): decode 0.13 s/tok = 89.7% `cudaStreamSynchronize` (610/step), 2.6% launches → device-resident decode is the confirmed next lever toward ~13-20 tok/s. Measurement-only. See spec §W10.)_
