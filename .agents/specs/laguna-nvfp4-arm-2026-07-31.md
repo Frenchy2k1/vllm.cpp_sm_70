@@ -57,8 +57,8 @@ Recipe = **bf16 attention + dense MLP, W4A4-NVFP4 routed experts**:
     resolver):
     1. **Resolver** (copy `qwen3_5_weights.cpp:423-434`): build
        `where = unordered_map<string,const SafetensorsFile*>` from each
-       `shard.Names()`, then `TensorResolver get = [where](name) -> const
-       StTensor& { ...->Get(name); }`.
+       `shard.Names()`, then a `TensorResolver get` lambda capturing `where`
+       that maps a tensor name to `it->second->Get(name)`.
     2. **Top-level** (HF names, all BF16): `LoadBf16Direct(get,
        "model.embed_tokens.weight")`, `..."model.norm.weight"`, `lm_head` =
        `LoadBf16Direct(get,"lm_head.weight")` (NOT fp4 — the checkpoint keeps it
