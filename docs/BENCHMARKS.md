@@ -16,6 +16,35 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Laguna-S-2.1 (`LagunaForCausalLM`) W7 decode-speed ATTRIBUTION (profile-only): where the 18x to llama.cpp goes (2026-07-31, `CLAIM-LAGUNA-W7-SPEED`)
+
+Research-only `nsys` profile of the W6 decode (`laguna-gen --gpu`, real 3-shard UD-Q4_K_XL, GB10,
+1 prefill + 7 steady decode). Our decode is 0.66 s/tok cold (1.5 tok/s), 0.53 s/tok warm here; the
+llama.cpp Poolside-fork runs the IDENTICAL GGUF at 27.8 tok/s (a ~15-18x gap). Token stream matched
+the W6 golden. NO code changed; the levers are the follow-on.
+
+MEASURED split (nsys, 5.14 s forward wall):
+
+- **GPU active only 32.7%** of the step (kernel total 1.682 s); host / idle **67.3%**.
+- `cudaStreamSynchronize`: 1.729 s over **22,115 calls** (~2,764 per step) = the host FULLY blocked,
+  ZERO GPU overlap. `cudaLaunchKernel` only 2.1% (launch overhead is NOT the bottleneck). No H2D/D2H
+  copies (unified memory; the GPU reads host vectors in place, so it is NOT copy-bound).
+- Root cause: `LagunaForwardGgufCached` issues ~1,795 keep-quant GEMMs/token, each followed by a
+  `DrainQueue` sync (`LqGemm`/`LqGemmRowSlice`, no `defer_sync`), with all glue (RMSNorm, dual-RoPE,
+  attention, softplus gate, router, SwiGLU) scalar on the HOST between them. The 30 routed experts/
+  layer run as UN-GROUPED per-expert GEMVs.
+- Of the 32.7% GPU time, **39.4% is `QuantizeQ8K` (activation quant), not the weight matmul** (the
+  hidden row is re-quantized once per GEMM); the weight GEMMs themselves run at ~22% of the 240 GB/s
+  peak. llama.cpp reads the same ~6.58 GB/token at ~76% of peak.
+
+Ranked levers (all in-tree from the DeepSeek-V4 device-decode campaign): 1. device-resident decode
+(kill the ~2,764 syncs, glue on-device) 1.5 -> ~5-7 tok/s; 2. grouped expert GEMM
+(`MatmulBTQuantGrouped` + fused gate/up/SwiGLU) +1.5-2x and dedupes the activation-quant; 3. capture
+the decode CUDA graph; 4. tuned MMVQ BW; plus free host cleanups (`LagunaEmbed` copies the whole
+1.23 GB embed table per token to gather one row; the RoPE cos/sin caches are rebuilt every token).
+Honest reachable ~13-20 tok/s (8-13x), 27.8 a stretch (same shape as ds4's host -> ~12.7 outcome).
+See `.agents/specs/laguna-s21-w7-speed-2026-07-31.md`.
+
 ## Laguna-S-2.1 (`LagunaForCausalLM`) W6 — KV cache + incremental decode: 5.05× faster, token-identical (2026-07-31, `CLAIM-LAGUNA-W6`)
 
 W6 kills W5's O(n²) stateless full-recompute. A per-layer K/V cache
