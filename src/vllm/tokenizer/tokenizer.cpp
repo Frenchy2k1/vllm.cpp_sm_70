@@ -706,7 +706,12 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
     tok.pattern_ = SplitPattern::kQwen2Classic;
   } else if (pre == "llama-bpe") {
     tok.pattern_ = SplitPattern::kLlama3;
-  } else if (pre == "joyai-llm" || pre == "deepseek-llm" || pre == "deepseek-v3") {
+  } else if (pre == "joyai-llm" || pre == "deepseek-llm" || pre == "deepseek-v3" ||
+             pre == "laguna") {
+    // Laguna-S-2.1 GGUFs tag pre="laguna"; the vocab is gpt2 byte-level BPE and
+    // the pretokenizer is the GPT-2/Llama-3 byte-level family. Mapped to kLlama3
+    // as a close APPROXIMATION for Encode() (feed the reference engine's own ids
+    // for a token-EXACT cross-check); Decode() is vocab-based and exact.
     // DeepSeek-V4-Flash GGUFs (antirez/ds4 q2-imatrix) tag pre="joyai-llm". The
     // vocab is gpt2 byte-level BPE; the pretokenizer regex is the GPT-2/Llama-3
     // byte-level family. We map it to kLlama3 for our-side Encode() as a close

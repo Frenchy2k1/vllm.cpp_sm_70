@@ -72,6 +72,7 @@ namespace vllm {
 
 class SafetensorsFile;
 class GgufFile;
+struct GgufLoadPolicy;
 
 // Every Laguna config field the loader/forward consume, resolved ONCE from the
 // HfConfig. Laguna keys (`num_experts`, `moe_routed_scaling_factor`,
@@ -241,19 +242,23 @@ struct LagunaLayerWeights {
   LagunaMoeWeights moe;         // valid iff !is_dense
 };
 
-// The full Laguna model weights (SCAFFOLD — accounting + name-map only this
-// increment; device materialization is a named W3 residual).
+// The full Laguna model weights. W5: the GGUF keep-quant tower is REAL — the big
+// GEMM weights (attn q/k/v/o/gate Q8_0, dense-L0 ffn Q8_0, shared-expert Q8_0,
+// routed experts Q4_K/Q5_K, lm_head Q8_0) stay COMPRESSED as block-typed
+// OwnedTensors (consumed keep-quant via vt::MatmulBT); the small norms / router /
+// bias / embed dequant to f32. Mirrors DeepseekV4Weights (gguf keep-quant tower).
 struct LagunaWeights {
   LagunaParams params;
-  OwnedTensor embed;    // [V, H]
-  OwnedTensor norm;     // [H]  final RMSNorm
-  OwnedTensor lm_head;  // [V, H]  untied
+  OwnedTensor embed;    // [V, H]  f32 gather table (dequant token_embd)
+  OwnedTensor norm;     // [H]  final RMSNorm (f32)
+  OwnedTensor lm_head;  // [V, H]  untied, keep-quant Q8_0 (or f32 tiny path)
   // Dual per-layer RoPE caches (OLMo-3 BuildOlmo3YarnCache pattern): one YaRN
   // (full-attn, 64-dim) + one plain (sliding, 128-dim). Built at load.
   OwnedTensor rope_cos_sin_yarn_full;  // bf16 [rows, 64]
   OwnedTensor rope_cos_sin_plain_slide;  // bf16 [rows, 128]
   std::vector<LagunaLayerWeights> layers;
   int64_t accounted_tensors = 0;  // W2 accounting-pass count
+  bool has_gguf_weights = false;  // W5: the keep-quant tower is materialized
 };
 
 // Safetensors loader (BF16 checkpoint; MEMORY-INFEASIBLE on one GB10 at 235 GiB,
@@ -263,10 +268,35 @@ LagunaWeights LoadLagunaForCausalLMWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config);
 
 // GGUF keep-quant loader (the single-GB10 vehicle: unsloth/Laguna-S-2.1-GGUF
-// UD-Q4_K_XL, ~73.4 GiB). Reuses the ds4 gguf_keep_quant path + a Laguna blk.N.*
-// name-map; the MoE expert blocks stay COMPRESSED (Q4_K/Q5_K/Q6_K/Q8_0 all
-// already decoded — ZERO new kernel). Materialization is a named W3 residual.
+// UD-Q4_K_XL, ~69 GiB, 3 shards). Reuses the ds4 gguf_keep_quant path + a Laguna
+// blk.N.* name-map; the MoE expert blocks stay COMPRESSED (Q4_K/Q5_K/Q6_K/Q8_0
+// all already decoded — ZERO new kernel). Single-shard wrapper of the multi-shard
+// entrypoint below (the real model ships 3 shards; a single-file GGUF works too).
 LagunaWeights LoadLagunaFromGguf(const GgufFile& gguf, const HfConfig& config);
+
+// W5 multi-shard GGUF keep-quant loader. `shards[0]` is the METADATA shard (the
+// laguna.* KV geometry + tokenizer live only in shard-1); the tensors are routed
+// to whichever shard holds them by scanning every shard's tensor table (the
+// UD-Q4_K_XL 3-shard split: shard-1 = header only, shards 2/3 = the 814 tensors).
+// Loader-local — NO reader rewrite, NO merge. Keep every `GgufFile` alive for the
+// weights' lifetime (mmap-borrowed keep-quant blocks refcount their shard's map).
+LagunaWeights LoadLagunaFromGgufShards(const std::vector<const GgufFile*>& shards,
+                                       const GgufLoadPolicy* policy = nullptr);
+
+// Resolve LagunaParams from the GGUF `laguna.*` KV of the metadata shard (mirrors
+// DeepseekV4ParamsFromGguf): per-layer head_count array, dual-rope keys, MoE keys.
+LagunaParams LagunaParamsFromGguf(const GgufFile& meta);
+
+// W5 REAL keep-quant forward. The `LagunaModel::Forward` composition with the ~9
+// GEMM sites routed through vt::MatmulBT (keep-quant on the block-typed weight,
+// dispatches to CPU/CUDA kMatmulBTQuant) instead of the f32 MatmulNK reference.
+// Stateless whole-sequence recompute (mirrors DeepseekV4ForwardGguf); the greedy
+// driver (examples/laguna_gen) loops it. `q` = CPU queue (default) or a CUDA queue
+// (--gpu: the block-quant GEMMs run on the GB10 off the unified-memory blocks).
+std::vector<float> LagunaForwardGguf(const LagunaWeights& w, vt::Queue& q,
+                                     const std::vector<int32_t>& token_ids,
+                                     const std::vector<int32_t>& positions,
+                                     const std::vector<int32_t>& logits_indices);
 
 // The Laguna forward. STUB (W3/W4): composes the reuse (variable-Q-head GQA +
 // interleaved sliding-window mask + dual per-layer RoPE + per-head softplus

@@ -20,10 +20,17 @@
 #include "vllm/model_executor/models/laguna.h"
 
 #include <cmath>
+#include <cstring>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <variant>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -247,21 +254,333 @@ LagunaWeights LoadLagunaForCausalLMWeights(
   return w;
 }
 
-LagunaWeights LoadLagunaFromGguf(const GgufFile& gguf, const HfConfig& config) {
-  (void)gguf;
+// ════════════════════════════════════════════════════════════════════════════
+// W5 — the REAL multi-shard GGUF keep-quant tower materialization.
+//
+// Mirrors the ds4 V4GgufCtx keep-quant loader (deepseek_v4_weights.cpp:410-852):
+// the big GEMM weights (attn q/k/v/o/gate Q8_0, dense-L0 ffn Q8_0, routed experts
+// Q4_K/Q5_K, shared experts Q8_0, lm_head Q8_0) stay block-COMPRESSED via
+// OwnGgufQuantBlocks (the memory enabler — a bf16 expansion of the 256 experts is
+// ~226 GiB and OOM-reboots the 119 GiB unified pool); the small norms / router /
+// bias / embed dequant to f32. The Laguna UD-Q4_K_XL ships as 3 shards (shard-1 =
+// header only), so a name→shard ROUTING map (below) routes each tensor to the
+// GgufFile that holds it — loader-local, no reader rewrite, no merge.
+namespace {
+
+// --- GGUF KV readers (mirror deepseek_v4_weights.cpp GgKvInt/GgKvFloat) --------
+int64_t GgInt(const GgufValue& v, const std::string& key) {
+  switch (v.TypeId()) {
+    case kGgufU8: return std::get<uint8_t>(v.v);
+    case kGgufI8: return std::get<int8_t>(v.v);
+    case kGgufU16: return std::get<uint16_t>(v.v);
+    case kGgufI16: return std::get<int16_t>(v.v);
+    case kGgufU32: return std::get<uint32_t>(v.v);
+    case kGgufI32: return std::get<int32_t>(v.v);
+    case kGgufU64: return static_cast<int64_t>(std::get<uint64_t>(v.v));
+    case kGgufI64: return std::get<int64_t>(v.v);
+    case kGgufBool: return std::get<bool>(v.v) ? 1 : 0;
+    default:
+      throw std::runtime_error("laguna gguf: key " + key + " is not an integer");
+  }
+}
+double GgFloat(const GgufValue& v, const std::string& key) {
+  if (v.TypeId() == kGgufF32) return std::get<float>(v.v);
+  if (v.TypeId() == kGgufF64) return std::get<double>(v.v);
+  return static_cast<double>(GgInt(v, key));
+}
+int64_t ReqInt(const GgufFile& g, const std::string& key) {
+  const GgufValue* v = g.FindKv(key);
+  VT_CHECK(v != nullptr, "laguna gguf: missing required key " + key);
+  return GgInt(*v, key);
+}
+int64_t OptInt(const GgufFile& g, const std::string& key, int64_t dflt) {
+  const GgufValue* v = g.FindKv(key);
+  return v != nullptr ? GgInt(*v, key) : dflt;
+}
+double OptFloat(const GgufFile& g, const std::string& key, double dflt) {
+  const GgufValue* v = g.FindKv(key);
+  return v != nullptr ? GgFloat(*v, key) : dflt;
+}
+bool OptBool(const GgufFile& g, const std::string& key, bool dflt) {
+  const GgufValue* v = g.FindKv(key);
+  return v != nullptr ? (GgInt(*v, key) != 0) : dflt;
+}
+
+}  // namespace
+
+LagunaParams LagunaParamsFromGguf(const GgufFile& g) {
+  const GgufValue* arch = g.FindKv("general.architecture");
+  VT_CHECK(arch != nullptr && arch->TypeId() == kGgufString &&
+               std::get<std::string>(arch->v) == "laguna",
+           "laguna gguf: expected general.architecture 'laguna'");
+  const std::string p = "laguna.";
+  LagunaParams d;
+
+  // --- shared geometry ---
+  d.hidden_size = ReqInt(g, p + "embedding_length");
+  d.num_hidden_layers = ReqInt(g, p + "block_count");
+  d.num_key_value_heads = ReqInt(g, p + "attention.head_count_kv");
+  d.head_dim = ReqInt(g, p + "attention.key_length");
+  d.intermediate_size = ReqInt(g, p + "feed_forward_length");
+  d.rms_norm_eps =
+      static_cast<float>(OptFloat(g, p + "attention.layer_norm_rms_epsilon", 1e-6));
+  d.max_position_embeddings = OptInt(g, p + "context_length", 0);
+  d.tie_word_embeddings = false;  // Laguna ships an untied `output.weight`.
+
+  // --- per-layer VARIABLE Q-head count (the `laguna.attention.head_count` ARRAY)
+  //     + the derived layer_types (global = the smaller head count, sliding = the
+  //     larger; the 1:3 pattern gives 12 global / 36 sliding). ---
+  const GgufValue* hc = g.FindKv(p + "attention.head_count");
+  VT_CHECK(hc != nullptr && hc->TypeId() == kGgufArray,
+           "laguna gguf: attention.head_count must be a per-layer array");
+  const GgufArray& hca = std::get<GgufArray>(hc->v);
+  VT_CHECK(static_cast<int64_t>(hca.elems.size()) == d.num_hidden_layers,
+           "laguna gguf: head_count array length must equal block_count");
+  int64_t min_heads = -1;
+  for (const GgufValue& e : hca.elems) {
+    const int64_t h = GgInt(e, "attention.head_count");
+    d.num_attention_heads_per_layer.push_back(h);
+    if (min_heads < 0 || h < min_heads) min_heads = h;
+  }
+  d.num_attention_heads = min_heads;  // base (global) head count
+  for (int64_t l = 0; l < d.num_hidden_layers; ++l)
+    d.layer_types.emplace_back(
+        d.num_attention_heads_per_layer[static_cast<size_t>(l)] == min_heads
+            ? "full_attention"
+            : "sliding_attention");
+  d.sliding_window = OptInt(g, p + "attention.sliding_window", 0);
+
+  // --- per-head softplus attn output gate + QK-RMSNorm (present in the tensor map)
+  d.per_head_output_gate = true;
+  d.has_qk_norm = true;
+
+  // --- MoE ---
+  d.num_experts = ReqInt(g, p + "expert_count");
+  d.num_experts_per_tok = ReqInt(g, p + "expert_used_count");
+  d.moe_intermediate_size = ReqInt(g, p + "expert_feed_forward_length");
+  d.shared_expert_intermediate_size =
+      OptInt(g, p + "expert_shared_feed_forward_length", 0);
+  d.norm_topk_prob = OptBool(g, p + "expert_weights_norm", true);
+  d.moe_routed_scaling_factor =
+      static_cast<float>(OptFloat(g, p + "expert_weights_scale", 1.0));
+  d.use_grouped_topk = false;  // laguna.py sets use_grouped_topk=False
+  // expert_gating_func: 1=softmax, 2=sigmoid (llama.cpp enum). Laguna uses 2.
+  const int64_t gating = OptInt(g, p + "expert_gating_func", 2);
+  VT_CHECK(gating == 2, "laguna gguf: only sigmoid gating (func=2) is scoped");
+  d.has_e_score_correction_bias = true;
+  const int64_t leading_dense = OptInt(g, p + "leading_dense_block_count", 1);
+  for (int64_t l = 0; l < leading_dense; ++l) d.mlp_only_layers.push_back(l);
+
+  // --- dual per-layer RoPE (global YaRN-partial / sliding plain) ---
+  d.rope_theta_full = OptFloat(g, p + "rope.freq_base", 500000.0);
+  d.rope_theta_sliding = OptFloat(g, p + "rope.freq_base_swa", 10000.0);
+  d.rotary_dim_full = OptInt(g, p + "rope.dimension_count", 64);
+  d.rotary_dim_sliding = OptInt(g, p + "rope.dimension_count_swa", d.head_dim);
+  d.partial_rotary_factor_full =
+      d.head_dim > 0 ? static_cast<double>(d.rotary_dim_full) / d.head_dim : 0.5;
+  d.yarn_factor = OptFloat(g, p + "rope.scaling.factor", 32.0);
+  d.yarn_orig_max_pos =
+      OptInt(g, p + "rope.scaling.original_context_length", 8192);
+  d.yarn_beta_fast = OptFloat(g, p + "rope.scaling.yarn_beta_fast", 32.0);
+  d.yarn_beta_slow = OptFloat(g, p + "rope.scaling.yarn_beta_slow", 1.0);
+  d.yarn_attn_factor = OptFloat(g, p + "rope.scaling.yarn_attn_factor", 1.0);
+
+  // vocab: prefer the KV, else the token_embd leading (out) dim.
+  const GgufValue* vk = g.FindKv(p + "vocab_size");
+  d.vocab_size = vk != nullptr ? GgInt(*vk, p + "vocab_size") : 0;
+
+  VT_CHECK(d.hidden_size > 0 && d.num_hidden_layers > 0 && d.head_dim > 0,
+           "laguna gguf: degenerate geometry");
+  VT_CHECK(d.num_experts > 0 && d.num_experts_per_tok > 0,
+           "laguna gguf: missing MoE geometry");
+  VT_CHECK(d.rotary_dim_full > 0 && d.rotary_dim_full <= d.head_dim,
+           "laguna gguf: partial rotary_dim (full-attn) out of range");
+  return d;
+}
+
+namespace {
+
+// --- tower materializers (mirror deepseek_v4_weights.cpp MakeBf16Owned/MakeF32Owned)
+OwnedTensor MakeF32Owned(const std::vector<float>& dq,
+                         const std::vector<int64_t>& shape) {
+  OwnedTensor o;
+  o.dtype = vt::DType::kF32;
+  o.rank = static_cast<int>(shape.size());
+  int64_t n = 1;
+  for (int i = 0; i < o.rank; ++i) {
+    o.shape[i] = shape[i];
+    n *= shape[i];
+  }
+  VT_CHECK(static_cast<int64_t>(dq.size()) == n, "laguna gguf: f32 size mismatch");
+  o.bytes.resize(static_cast<size_t>(n) * sizeof(float));
+  std::memcpy(o.bytes.data(), dq.data(), o.bytes.size());
+  return o;
+}
+OwnedTensor MakeBf16Owned(const std::vector<uint16_t>& dq,
+                          const std::vector<int64_t>& shape, bool nk) {
+  OwnedTensor o;
+  o.dtype = vt::DType::kBF16;
+  o.rank = static_cast<int>(shape.size());
+  int64_t n = 1;
+  for (int i = 0; i < o.rank; ++i) {
+    o.shape[i] = shape[i];
+    n *= shape[i];
+  }
+  VT_CHECK(static_cast<int64_t>(dq.size()) == n, "laguna gguf: bf16 size mismatch");
+  o.bytes.resize(static_cast<size_t>(n) * sizeof(uint16_t));
+  std::memcpy(o.bytes.data(), dq.data(), o.bytes.size());
+  o.nk = nk;
+  return o;
+}
+
+// A multi-shard routing context. Scans every shard's tensor table into a
+// name→{owning GgufFile, &info} map; Take() resolves the shard that holds a
+// tensor so a keep-quant borrow refcounts the RIGHT shard's mmap. Mw/Sew/Vec
+// mirror the ds4 V4GgufCtx roles.
+struct LagunaGgufCtx {
+  const GgufLoadPolicy& pol;
+  std::unordered_map<std::string, std::pair<const GgufFile*, const GgufTensorInfo*>>
+      index;
+  std::unordered_set<std::string> consumed;
+
+  explicit LagunaGgufCtx(const std::vector<const GgufFile*>& shards,
+                         const GgufLoadPolicy& p)
+      : pol(p) {
+    for (const GgufFile* s : shards) {
+      VT_CHECK(s != nullptr, "laguna gguf: null shard");
+      for (const GgufTensorInfo& t : s->Tensors())
+        index[t.name] = {s, &t};
+    }
+  }
+
+  std::pair<const GgufFile*, const GgufTensorInfo*> Take(const std::string& name) {
+    auto it = index.find(name);
+    VT_CHECK(it != index.end(),
+             "laguna gguf loader: expected tensor missing across shards: " + name);
+    consumed.insert(name);
+    return it->second;
+  }
+  // 2-D [out,in] matmul weight: keep its blocks (keep-quant) else expand bf16,
+  // both in the file's own [N,K] order (nk=true) — GGUF disk order IS MatmulBT.
+  OwnedTensor Mw(const std::string& name) {
+    auto [g, t] = Take(name);
+    VT_CHECK(t->shape.size() == 2, "laguna gguf: expected 2-D MW " + name);
+    const GgufResidency r = pol.Route(*t, GgufTensorRole::kMatmulWeight);
+    if (r != GgufResidency::kExpandBf16)
+      return OwnGgufQuantBlocks(*t, t->shape[0], t->shape[1], /*row_offset=*/0,
+                                pol.mmap_residency ? g : nullptr, pol.quant_repack);
+    return MakeBf16Owned(
+        DequantGgufRowToBf16(t->ggml_type, t->data, t->shape[0] * t->shape[1]),
+        {t->shape[0], t->shape[1]}, /*nk=*/true);
+  }
+  // Stacked [E,out,in] expert weight: KEEP the whole slab COMPRESSED [E*out,in]
+  // (each expert = out whole rows = whole blocks), else expand bf16.
+  OwnedTensor Sew(const std::string& name, int64_t experts) {
+    auto [g, t] = Take(name);
+    VT_CHECK(t->shape.size() == 3 && t->shape[0] == experts,
+             "laguna gguf: expected [E,out,in] expert tensor " + name);
+    const int64_t rows = t->shape[0] * t->shape[1];  // E*out
+    const int64_t k = t->shape[2];                   // in
+    const GgufResidency r = pol.Route(*t, GgufTensorRole::kStackedExpertWeight);
+    if (r != GgufResidency::kExpandBf16)
+      return OwnGgufQuantBlocks(*t, rows, k, /*row_offset=*/0,
+                                pol.mmap_residency ? g : nullptr, pol.quant_repack);
+    return MakeBf16Owned(DequantGgufRowToBf16(t->ggml_type, t->data, rows * k),
+                         {rows, k}, /*nk=*/true);
+  }
+  // A value/table tensor (norm/bias/router/embed): NEVER keep-quant, dequant f32.
+  OwnedTensor Vec(const std::string& name, GgufTensorRole role) {
+    auto [g, t] = Take(name);
+    (void)g;
+    VT_CHECK(pol.Route(*t, role) == GgufResidency::kExpandBf16,
+             std::string("laguna gguf: a ") + Name(role) +
+                 " tensor must not keep quant blocks: " + name);
+    int64_t numel = 1;
+    for (int64_t dim : t->shape) numel *= dim;
+    return MakeF32Owned(DequantGgufRowToF32(t->ggml_type, t->data, numel), t->shape);
+  }
+  bool Has(const std::string& name) const {
+    return index.find(name) != index.end();
+  }
+};
+
+std::string Blk(int64_t l, const std::string& suffix) {
+  return "blk." + std::to_string(l) + "." + suffix;
+}
+
+}  // namespace
+
+LagunaWeights LoadLagunaFromGgufShards(const std::vector<const GgufFile*>& shards,
+                                       const GgufLoadPolicy* policy) {
+  VT_CHECK(!shards.empty() && shards[0] != nullptr,
+           "laguna gguf: shards[0] (the metadata shard) is required");
+  const GgufLoadPolicy env = GgufLoadPolicy::FromEnv();
+  const GgufLoadPolicy& pol = policy != nullptr ? *policy : env;
+
   LagunaWeights w;
-  w.params = ParseLagunaParams(config);
-  // TODO(W3): wire the ds4 gguf_keep_quant tower materialization + the Laguna
-  //   blk.N.* name-map (LagunaGgufAttnName/LagunaGgufMoeName above). The 256
-  //   routed-expert Q4_K blocks stay COMPRESSED (OwnGgufQuantBlocks — the memory
-  //   enabler); the small norm/router/gate/embed tensors dequant. ZERO new decode
-  //   kernel (Q4_K/Q5_K/Q6_K/Q8_0 all landed). Then extend the name-map coverage
-  //   checker to laguna.
-  VT_CHECK(false,
-           "laguna: GGUF keep-quant tower materialization is a W3 residual "
-           "(name-map + quant-mix scaffolded this increment; no new decode "
-           "kernel needed). See .agents/specs/laguna-s21-w1w2-2026-07-30.md.");
+  w.params = LagunaParamsFromGguf(*shards[0]);  // KV lives only in shard-1
+  const LagunaParams& p = w.params;
+
+  LagunaGgufCtx ctx(shards, pol);
+  const int64_t E = p.num_experts;
+  const bool tied = !ctx.Has("output.weight");
+
+  // vocab fallback from token_embd's [V,H] leading dim.
+  if (w.params.vocab_size <= 0) {
+    auto [g, t] = ctx.Take("token_embd.weight");
+    (void)g;
+    w.params.vocab_size = t->shape[0];
+    ctx.consumed.erase("token_embd.weight");  // re-routed below with its role
+  }
+
+  // ── model level ──────────────────────────────────────────────────────────
+  w.embed = ctx.Vec("token_embd.weight", GgufTensorRole::kEmbeddingTable);  // f32 gather
+  w.norm = ctx.Vec("output_norm.weight", GgufTensorRole::kVector);
+  w.lm_head = tied ? OwnedTensor{} : ctx.Mw("output.weight");  // keep-quant Q8_0
+
+  w.layers.resize(static_cast<size_t>(p.num_hidden_layers));
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    LagunaLayerWeights& lw = w.layers[static_cast<size_t>(l)];
+    lw.is_dense = p.IsDenseLayer(l);
+
+    // norms (f32)
+    lw.input_norm = ctx.Vec(Blk(l, "attn_norm.weight"), GgufTensorRole::kVector);
+    lw.post_attn_norm = ctx.Vec(Blk(l, "ffn_norm.weight"), GgufTensorRole::kVector);
+
+    // attention linears (keep-quant Q8_0) + gate + per-head QK-norms (f32)
+    lw.attn.q_proj = ctx.Mw(Blk(l, "attn_q.weight"));
+    lw.attn.k_proj = ctx.Mw(Blk(l, "attn_k.weight"));
+    lw.attn.v_proj = ctx.Mw(Blk(l, "attn_v.weight"));
+    lw.attn.o_proj = ctx.Mw(Blk(l, "attn_output.weight"));
+    lw.attn.g_proj = ctx.Mw(Blk(l, "attn_gate.weight"));
+    lw.attn.q_norm = ctx.Vec(Blk(l, "attn_q_norm.weight"), GgufTensorRole::kVector);
+    lw.attn.k_norm = ctx.Vec(Blk(l, "attn_k_norm.weight"), GgufTensorRole::kVector);
+
+    if (lw.is_dense) {
+      lw.mlp.gate_proj = ctx.Mw(Blk(l, "ffn_gate.weight"));
+      lw.mlp.up_proj = ctx.Mw(Blk(l, "ffn_up.weight"));
+      lw.mlp.down_proj = ctx.Mw(Blk(l, "ffn_down.weight"));
+    } else {
+      lw.moe.router = ctx.Vec(Blk(l, "ffn_gate_inp.weight"), GgufTensorRole::kVector);  // f32 [E,H]
+      lw.moe.e_score_correction_bias =
+          ctx.Vec(Blk(l, "exp_probs_b.bias"), GgufTensorRole::kVector);  // f32 [E]
+      lw.moe.experts_gate = ctx.Sew(Blk(l, "ffn_gate_exps.weight"), E);  // Q4_K [E*moeI,H]
+      lw.moe.experts_up = ctx.Sew(Blk(l, "ffn_up_exps.weight"), E);      // Q4_K [E*moeI,H]
+      lw.moe.experts_down = ctx.Sew(Blk(l, "ffn_down_exps.weight"), E);  // Q5_K [E*H,moeI]
+      lw.moe.shared_gate = ctx.Mw(Blk(l, "ffn_gate_shexp.weight"));      // Q8_0
+      lw.moe.shared_up = ctx.Mw(Blk(l, "ffn_up_shexp.weight"));
+      lw.moe.shared_down = ctx.Mw(Blk(l, "ffn_down_shexp.weight"));
+    }
+  }
+
+  w.accounted_tensors = static_cast<int64_t>(ctx.consumed.size());
+  w.has_gguf_weights = true;
   return w;
+}
+
+LagunaWeights LoadLagunaFromGguf(const GgufFile& gguf, const HfConfig& config) {
+  (void)config;  // geometry resolved from the GGUF KV (self-describing vehicle)
+  return LoadLagunaFromGgufShards({&gguf});
 }
 
 }  // namespace vllm
