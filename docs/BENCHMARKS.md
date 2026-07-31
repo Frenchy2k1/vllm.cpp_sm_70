@@ -16,17 +16,26 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
-## Laguna-S-2.1 (`LagunaForCausalLM`) W1/W2 structural bring-up (2026-07-30, `CLAIM-LAGUNA-W1W2`) - no throughput owed yet (gate PENDING W4)
+## Laguna-S-2.1 (`LagunaForCausalLM`) W3 real forward + 3 new ops (2026-07-31, `CLAIM-LAGUNA-W3`) - no throughput owed yet (gate PENDING W4)
 
-Structural-only increment: registry + config parse + GGUF name-map + forward
-composition scaffolding, CPU `-DVLLM_CPP_CUDA=OFF` Release `-Werror` clean;
-`test_laguna_scaffold` 3/3 (40 assertions) + `test_model_registry` 24/24. No
-model ran (the forward is a `VT_CHECK(false)` W3 stub; the 73 GB UD-Q4_K GGUF was
-NOT downloaded), so there are NO tok/s numbers yet. Speed benchmarks are owed at
-W5, after the W4 real-model dual-oracle correctness gate (llama.cpp-Q4_K
-token-exact + vLLM-NVFP4/-FP8 near-tie) lands on a fetched checkpoint. Q4_K keep-
-quant decode is already landed (ds4 path) so no new decode kernel is needed. See
-`.agents/specs/laguna-s21-w1w2-2026-07-30.md`.
+W3 lands the REAL forward composition + the 3 genuinely-NEW small host ops
+(`laguna_ops.cpp`: per-head softplus attn out-gate, ungrouped sigmoid-noaux
+router, dual per-layer RoPE cos/sin builders) and turns `LagunaModel::Forward`
+into a runnable host-reference composition (variable-Q-head GQA + dual RoPE +
+sliding-window mask + softplus gate + dense L0 / ungrouped-MoE L1..47 + untied
+lm_head), replacing the W1/W2 `VT_CHECK(false)` stub. CPU `-DVLLM_CPP_CUDA=OFF`
+Release `-Werror` FULL-library build clean; `test_laguna_scaffold` **8/8 (166
+assertions)** — softplus gate math, ungrouped-router selection + tie-break
+(RED-first razor), dual-RoPE cos/sin bit-match vs a hand reference, variable-Q-head
+shape wiring, and the forward composition on synthetic weights (RUNS, deterministic,
+gather==full-row, softplus gate wired) — plus `test_model_registry` 24/24. NO
+real model ran (the 73 GB UD-Q4_K GGUF was NOT downloaded; the loaders still
+LOUDLY throw the W4 device-materialization residual), so there are STILL NO tok/s
+numbers. Speed benchmarks are owed at W5, after the W4 real-model dual-oracle
+correctness gate (llama.cpp-Q4_K token-exact + vLLM-NVFP4/-FP8 near-tie) lands on
+a fetched checkpoint. Q4_K keep-quant decode is already landed (ds4 path) so no new
+decode kernel is needed. See `.agents/specs/laguna-s21-w3-2026-07-31.md` (+ W1/W2
+`laguna-s21-w1w2-2026-07-30.md`).
 
 ## fusion-consistency gate-test repair (2026-07-30) - VOID (test-only, no throughput owed)
 

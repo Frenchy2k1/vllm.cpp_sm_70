@@ -105,6 +105,24 @@ struct LagunaParams {
     return l < static_cast<int64_t>(layer_types.size()) &&
            layer_types[static_cast<size_t>(l)] == "full_attention";
   }
+  // Per-layer VARIABLE Q-head wiring (the riskiest bit). KV heads + head_dim are
+  // uniform; only the Q-head COUNT (and thus the GQA group + q_proj width) vary.
+  int64_t QHeadsForLayer(int64_t l) const {
+    if (l >= 0 && l < static_cast<int64_t>(num_attention_heads_per_layer.size()))
+      return num_attention_heads_per_layer[static_cast<size_t>(l)];
+    return num_attention_heads;  // fallback = base (global) count
+  }
+  int64_t QDimForLayer(int64_t l) const { return QHeadsForLayer(l) * head_dim; }
+  int64_t GqaGroupForLayer(int64_t l) const {
+    return num_key_value_heads > 0 ? QHeadsForLayer(l) / num_key_value_heads : 0;
+  }
+  // The dual per-layer RoPE regime + finite window are keyed off layer type.
+  int64_t RotaryDimForLayer(int64_t l) const {
+    return IsGlobalLayer(l) ? rotary_dim_full : rotary_dim_sliding;
+  }
+  int64_t WindowForLayer(int64_t l) const {
+    return IsGlobalLayer(l) ? 0 : sliding_window;  // 0 => full causal
+  }
 
   // --- per-head softplus attention OUTPUT gate (all layers) ---
   // gate = softplus(g_proj(x).float()).type_as(attn); broadcast over head_dim.
