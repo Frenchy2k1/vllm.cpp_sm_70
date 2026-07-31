@@ -234,19 +234,37 @@ std::vector<float> LqGemmRowSlice(vt::Queue& q, const OwnedTensor& w,
 //    KV-cached incremental forward, so the two paths are bit-identical BY SHARING
 //    the exact same float ops — the moved code is verbatim from the W5 forward). ──
 
-// Embed gather: hidden[T,H] = embed_table[token_ids].
+// Embed gather: hidden[T,H] = embed_table[token_ids]. Gathers ONLY the T needed
+// rows directly from the (f32/bf16) table bytes — BIT-IDENTICAL to the prior
+// ReadF32(whole-table)-then-gather (same per-element f32/bf16→f32 conversion,
+// same rows), but avoids materializing the full [Vsz,H] table (~1.23 GB, ~311M
+// element-converts) on EVERY decode token — the dominant host-orchestration
+// waste measured in the W7 speed profile (laguna-s21-w7-speed-2026-07-31.md #5).
 std::vector<float> LagunaEmbed(const OwnedTensor& embed_t,
                                const std::vector<int32_t>& token_ids, int64_t H,
                                int64_t Vsz) {
-  const std::vector<float> embed = ReadF32(embed_t);
   const int64_t T = static_cast<int64_t>(token_ids.size());
   std::vector<float> hidden(static_cast<size_t>(T * H));
+  const uint8_t* raw = embed_t.bytes.data();
+  const bool is_bf16 = embed_t.dtype == vt::DType::kBF16;
+  VT_CHECK(embed_t.dtype == vt::DType::kF32 || is_bf16,
+           "laguna embed: table dtype must be f32/bf16 (matches ReadF32)");
   for (int64_t t = 0; t < T; ++t) {
     const int64_t tok = token_ids[static_cast<size_t>(t)];
     VT_CHECK(tok >= 0 && tok < Vsz, "laguna: token id out of range");
-    std::memcpy(hidden.data() + static_cast<size_t>(t * H),
-                embed.data() + static_cast<size_t>(tok * H),
-                static_cast<size_t>(H) * sizeof(float));
+    float* dst = hidden.data() + static_cast<size_t>(t * H);
+    if (is_bf16) {
+      const auto* b =
+          reinterpret_cast<const uint16_t*>(raw) + static_cast<size_t>(tok * H);
+      for (int64_t i = 0; i < H; ++i) {
+        const uint32_t bits = static_cast<uint32_t>(b[i]) << 16;
+        std::memcpy(&dst[i], &bits, sizeof(float));
+      }
+    } else {
+      std::memcpy(dst,
+                  reinterpret_cast<const float*>(raw) + static_cast<size_t>(tok * H),
+                  static_cast<size_t>(H) * sizeof(float));
+    }
   }
   return hidden;
 }

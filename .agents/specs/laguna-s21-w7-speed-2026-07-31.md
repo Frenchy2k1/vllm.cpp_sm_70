@@ -127,3 +127,27 @@ GEMVs at 22% of BW peak** — NOT kernel compute. The ranked levers (device-resi
 expert GEMM first, then decode-graph + tuned MMVQ) are the DeepSeek-V4 playbook, all in-tree. Honest
 reachable ~13–20 tok/s, 27.8 a stretch. Numbers are measured (nsys) or explicitly computed (roofline);
 hypotheses are labelled. No code changed.
+
+---
+
+## W8 — lever #5 (embed gather) LANDED + GATED (2026-07-31, `CLAIM-LAGUNA-W8-EMBED`)
+
+The W7 profile filed `LagunaEmbed`'s full-table copy under "#5 free host cleanups", but
+it was the **dominant** decode cost, not minor: `LagunaEmbed` called `ReadF32(embed_t)`
+which converted the ENTIRE `[Vsz,H]` f32/bf16 embed table (~311M element-converts,
+~1.23 GB) on the HOST **every token** just to gather T rows. Fixed: gather only the T
+needed rows directly from the table bytes (bit-identical — same per-element f32/bf16→f32
+conversion, same rows; the untouched rows never affected the output).
+
+**GATED on the real 3-shard UD-Q4_K_XL GGUF (GB10 sm_121a, `--gpu`, W6 cached path,
+drop_caches cold, prompt "The capital of France is", 24 tokens):**
+- **TOKEN-IDENTICAL PASS** — `generated ids` byte-equal to the W5/W6 golden
+  (`22345 83 350 785 989 395 13259 330 4159 9431 377 340 4328 377 444 136 22029 9626 71 493 6396 565 7760 10291`),
+  coherent " Paris." continuation. Bit-exact confirmed on the real model.
+- **SPEED: decode 0.66 → 0.17 s/tok = 3.9×** (Laguna **1.5 → 5.9 tok/s**; 18× → 4.7× vs
+  llama.cpp 27.8). Prefill 0.98s, peak 69.96 GiB. Single bit-exact host fix.
+
+The measured 0.49 s/tok saved per token ≈ the host cost of the eliminated 311M-element
+embed conversion — consistent with the host-orchestration attribution. Remaining levers
+unchanged (grouped-expert GEMM = A3, then device-resident decode); the per-token
+RoPE-cos/sin rebuild + norm/router `ReadF32` are the smaller residual #5 items.

@@ -2003,3 +2003,5 @@ The gate models' W4A4 decode is at the achievable roofline. See `.agents/specs/n
 **D3 GPU gate CLOSED (2026-07-31, GB10).** OLMo-2 full-width qk-norm fold empirically confirmed: olmo2 16/16 + fused_chain 10/10 + qwen3/27B canaries unchanged. See BENCHMARKS.
 
 **A3 fold SCOPING VERIFIED (2026-07-31, pending impl).** qwen3_5 GGUF keep-quant grouped MoE fold: premise confirmed bit-exact (ResidentWeight keeps weights quantized → per-expert loop already runs the ds4 vec_dot). Remaining: loader stacking + a keep-quant grouped MoE block (ds4 MoeFusedResident analog) + RED-first byte test. DGX SACRED gate OWED. See `.agents/specs/arch-fusion-fold-plan-2026-07-30.md` A3.
+
+**Laguna W8 embed-fix LANDED + GATED (2026-07-31).** `LagunaEmbed` gathers only the T needed rows instead of converting the whole 1.23 GB embed table to f32 every token. GATED on real UD-Q4_K_XL GGUF (GB10, `--gpu`): TOKEN-IDENTICAL to the W5/W6 golden + decode **0.66 → 0.17 s/tok (3.9×; 1.5 → 5.9 tok/s)**. Bit-exact by construction. See `.agents/specs/laguna-s21-w7-speed-2026-07-31.md` §W8.
