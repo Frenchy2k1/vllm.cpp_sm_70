@@ -716,7 +716,13 @@ sleep/wake+RLHF [`SERVE-ADMIN`](engine-matrix.md), guidance/outlines
 [`SPEC-EAGLE3`](engine-matrix.md)/[`SPEC-DSPARK`](engine-matrix.md)) stay in the
 spec table, not promoted.
 
-**`LAGUNA-S21` (`LagunaForCausalLM` / `laguna`) — `ACTIVE` (W0 scoped 2026-07-30
+**`LAGUNA-S21` (`LagunaForCausalLM` / `laguna`) — `RUNNABLE` (W5 2026-07-31: our
+engine greedy-generates COHERENT text on the REAL 3-shard UD-Q4_K_XL GGUF on GB10
+— "The capital of France is" → " Paris. …", first token "Paris." matching the
+llama.cpp-Poolside reference on the identical bytes. Multi-shard GGUF reader +
+keep-quant tower + `LagunaForwardGguf` + `examples/laguna_gen`;
+`specs/laguna-s21-w5-2026-07-31.md`. Speed (stateless recompute 3.27 s/tok →
+KV-cache + grouped-expert GEMM) = W6.) Prior `ACTIVE` (W0 scoped 2026-07-30
 `specs/laguna-s21-scope-2026-07-30.md`; **W1/W2 STRUCTURAL bring-up LANDED
 2026-07-30** `specs/laguna-s21-w1w2-2026-07-30.md`, `CLAIM-LAGUNA-W1W2`, row
 `MODEL-TEXT-laguna-laguna-for-causal-lm` INVENTORIED→ACTIVE): registry

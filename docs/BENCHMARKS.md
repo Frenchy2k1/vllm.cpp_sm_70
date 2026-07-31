@@ -16,6 +16,40 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Laguna-S-2.1 (`LagunaForCausalLM`) W5 RUNNABLE — real keep-quant GGUF forward, coherent on GB10 (2026-07-31, `CLAIM-LAGUNA-W5`)
+
+W5 makes Laguna **RUNNABLE**: `examples/laguna-gen` loads the REAL 3-shard unsloth
+`UD-Q4_K_XL` GGUF (keep-quant) and greedy-generates COHERENT text on the GB10.
+
+```
+$ laguna-gen --model Laguna-S-2.1-UD-Q4_K_XL-00001-of-00003.gguf \
+             --prompt "The capital of France is" --max-tokens 24 --gpu
+[gen] LOADED: layers=48 experts=256 vocab=100352 has_gguf=1 | load 20.6s | RSS 69.8 GiB PEAK 69.8 GiB
+prompt: The capital of France is
+generated ids: 22345 83 350 785 989 395 13259 330 4159 9431 377 340 4328 377 444 136 22029 9626 71 493 6396 565 7760 10291
+generated text:  Paris.\n\nThe user is seeking a detailed explanation of the concept of "cultural capital" as developed by French soci
+prefill: 1.36s  decode: 75.14s  TPOT 3.27s/tok over 23 steps  PEAK RESIDENT: 71.08 GiB
+```
+
+- **COHERENCE GATE PASSES.** The first generated token is **" Paris."** — matching
+  the llama.cpp-Poolside reference on the identical UD-Q4_K bytes ("…Paris.") — and
+  the continuation is fully coherent English. Coherence = the RUNNABLE bar (gate a).
+- **Memory:** peak 71 GiB in the 119 GiB GB10 unified pool (113 GiB free before the
+  run); the 256 routed experts + attention/dense/shared/lm_head GEMM weights stay
+  block-COMPRESSED (Q4_K/Q5_K/Q6_K/Q8_0), consumed keep-quant via `vt::MatmulBT`
+  (CUDA `kMatmulBTQuant`); only norms/router/bias/embed dequant to f32.
+- **What landed:** a loader-local **multi-shard GGUF reader** (`LagunaGgufCtx` routes
+  each of the 814 tensors to its shard — shard-1 is header/KV only), **params-from-KV**
+  (`LagunaParamsFromGguf`: per-layer head_count array, dual-rope keys, MoE keys),
+  the **keep-quant tower** (`LoadLagunaFromGgufShards`, ds4 `Mw`/`Sew`/`Vec` precedent),
+  **`LagunaForwardGguf`** (the f32 composition with the ~9 GEMM sites swapped to
+  keep-quant `LqGemm`/`LqGemmRowSlice`, ds4 `Gemm`/`GemmRowSlice` precedent), and the
+  **`examples/laguna_gen`** run entrypoint (mirrors `deepseek_v4_gen`).
+- **Speed (W6, owed):** 3.27 s/tok is a STATELESS full-recompute reference (per-token,
+  per-expert GEMV, no KV cache) — a KV-cached forward + grouped-expert GEMM
+  (`MatmulBTQuantGrouped`, the ds4 path) is the throughput lane, not a correctness gap.
+- See `.agents/specs/laguna-s21-w5-2026-07-31.md`.
+
 ## Laguna-S-2.1 (`LagunaForCausalLM`) W4 checkpoint-fetch + fidelity corrections (2026-07-31, `CLAIM-LAGUNA-W4`) - no throughput owed yet (real-model greedy gate is the W5 close)
 
 W4 FETCHED the unsloth `UD-Q4_K_XL` GGUF (73.4 GiB, 3 shards) to the DGX and read

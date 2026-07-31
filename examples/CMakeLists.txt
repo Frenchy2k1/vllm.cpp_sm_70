@@ -16,6 +16,12 @@ add_executable(deepseek-v4-gen deepseek_v4_gen/main.cpp)
 target_link_libraries(deepseek-v4-gen PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(deepseek-v4-gen)
 
+# laguna-gen: the single-GB10 Laguna-S-2.1 keep-quant GGUF greedy generation
+# driver (W5 RUNNABLE vehicle — 3-shard keep-quant load + stateless recompute).
+add_executable(laguna-gen laguna_gen/main.cpp)
+target_link_libraries(laguna-gen PRIVATE vllm::vllm)
+vllm_cpp_set_warnings(laguna-gen)
+
 # vllm-bench (M2.1): the throughput/latency benchmark harness — the gate-#1
 # measurement tool. Links the full C++ engine (vllm::vllm) so it can build both a
 # synthetic CPU engine (no --model) and a real loaded engine (--model on dgx).

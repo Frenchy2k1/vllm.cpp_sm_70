@@ -38,7 +38,10 @@
 
 #include "vllm/model_executor/models/laguna_ops.h"
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
-#include "vt/dtype.h"
+#include "vt/backend.h"  // vt::GetBackend (device drain for the keep-quant GEMMs)
+#include "vt/dtype.h"    // vt::IsBlockQuant / RowSizeBytes
+#include "vt/ops.h"      // vt::MatmulBT (dispatches kMatmulBTQuant on block weights)
+#include "vt/tensor.h"
 
 namespace vllm {
 namespace {
@@ -156,6 +159,75 @@ std::vector<float> ExpertMlp(const std::vector<float>& h_row,
   const std::vector<float> u = MatmulNK(h_row, up_w, 1, I, H);
   const std::vector<float> act = GateUpSilu(g, u, 1, I);
   return MatmulNK(act, down_w, 1, H, I);  // [H]
+}
+
+// ── W5 keep-quant GEMM (mirror deepseek_v4.cpp Gemm/GemmRowSlice) ─────────────
+// Drain a device queue's stream before the host reads the output (no-op on CPU).
+inline void DrainQueue(vt::Queue& q) {
+  if (q.device.type != vt::DeviceType::kCPU)
+    vt::GetBackend(q.device).Synchronize(q);
+}
+
+// Y[T,N] = X[T,K] @ W[N,K]^T. W is a keep-quant (block) OR f32/bf16 OwnedTensor in
+// the file's own [N,K] order (nk=true, as on GGUF disk). A block-quant weight
+// routes to vt::MatmulBT's kMatmulBTQuant provider (CPU always; CUDA when the
+// queue is a device queue — reads the unified-memory blocks in place). An f32/bf16
+// weight (the router, or a bf16 oracle expansion) falls to the host MatmulNK
+// reference — BIT-IDENTICAL to the pre-W5 path. Mirrors deepseek_v4.cpp:410.
+std::vector<float> LqGemm(vt::Queue& q, const OwnedTensor& w,
+                          const std::vector<float>& x, int64_t T, int64_t N,
+                          int64_t K) {
+  VT_CHECK(w.rank == 2 && w.shape[0] == N && w.shape[1] == K,
+           "laguna keep-quant GEMM: weight shape mismatch");
+  if (!vt::IsBlockQuant(w.dtype)) return MatmulNK(x, ReadF32(w), T, N, K);
+  std::vector<float> out(static_cast<size_t>(T) * N);
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const bool on_dev = q.device.type != vt::DeviceType::kCPU;
+  vt::Queue& gq = on_dev ? q : cpuq;
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()),
+                                        vt::DType::kF32, gq.device, {T, K});
+  vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, gq.device, {T, N});
+  vt::Tensor wt = w.View();
+  wt.device = gq.device;  // unified-memory block view retag (ds4 ops.cpp:198 check)
+  vt::MatmulBT(gq, o, a, wt);
+  if (on_dev) DrainQueue(gq);
+  return out;
+}
+
+// Keep-quant GEMM against a ROW-SLICE [row_off, row_off+N) of a stacked block
+// weight `w` [E*out, K] — the per-expert (moe_*_exps) slice. Rows are whole
+// blocks (RowSizeBytes), so the offset is a byte offset and no block is cut.
+// Mirrors deepseek_v4.cpp GemmRowSlice.
+std::vector<float> LqGemmRowSlice(vt::Queue& q, const OwnedTensor& w,
+                                  const std::vector<float>& x, int64_t T, int64_t N,
+                                  int64_t K, int64_t row_off) {
+  VT_CHECK(vt::IsBlockQuant(w.dtype),
+           "laguna keep-quant expert GEMM requires a block-quant stacked weight");
+  VT_CHECK(!w.repacked,
+           "laguna keep-quant expert slice requires non-repacked blocks");
+  VT_CHECK(w.rank == 2 && row_off >= 0 && row_off + N <= w.shape[0] && w.shape[1] == K,
+           "laguna keep-quant expert GEMM: slice out of range");
+  const size_t row_bytes = vt::RowSizeBytes(w.dtype, K);
+  std::vector<float> out(static_cast<size_t>(T) * N);
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const bool on_dev = q.device.type != vt::DeviceType::kCPU;
+  vt::Queue& gq = on_dev ? q : cpuq;
+  vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x.data()),
+                                        vt::DType::kF32, gq.device, {T, K});
+  vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, gq.device, {T, N});
+  vt::Tensor wt;
+  wt.data = const_cast<uint8_t*>(w.bytes.data()) +
+            static_cast<size_t>(row_off) * row_bytes;
+  wt.dtype = w.dtype;
+  wt.device = gq.device;
+  wt.rank = 2;
+  wt.shape[0] = N;
+  wt.shape[1] = K;
+  wt.stride[0] = K;
+  wt.stride[1] = 1;
+  vt::MatmulBT(gq, o, a, wt);
+  if (on_dev) DrainQueue(gq);
+  return out;
 }
 
 }  // namespace
@@ -381,6 +453,201 @@ ForwardLogits LagunaModel::ForwardDevice(
       LagunaModel::Forward(token_ids, positions, attn_meta, attn_kv, weights,
                            config, queue, logits_indices),
       weights.params.vocab_size);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// W5 — the REAL keep-quant GGUF forward. The `LagunaModel::Forward` composition
+// with the ~9 GEMM sites routed through the keep-quant LqGemm/LqGemmRowSlice
+// (vt::MatmulBT on the block-typed weights) instead of MatmulNK(ReadF32). All the
+// glue (dual-RoPE, per-head QK-RMSNorm, per-head softplus out-gate, ungrouped
+// sigmoid-noaux router + routed_scaling, shared expert) is IDENTICAL to the
+// unit-gated f32 reference — only the matmul operands change from f32 to
+// keep-quant blocks. Stateless whole-sequence recompute (mirrors
+// DeepseekV4ForwardGguf); the greedy driver loops it.
+std::vector<float> LagunaForwardGguf(const LagunaWeights& weights, vt::Queue& q,
+                                     const std::vector<int32_t>& token_ids,
+                                     const std::vector<int32_t>& positions,
+                                     const std::vector<int32_t>& logits_indices) {
+  const LagunaParams& p = weights.params;
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = p.hidden_size;
+  const int64_t Vsz = p.vocab_size;
+  const int64_t Dh = p.head_dim;
+  const int64_t Hkv = p.num_key_value_heads;
+  const int64_t kvdim = Hkv * Dh;
+  const float eps = p.rms_norm_eps;
+  VT_CHECK(weights.has_gguf_weights, "laguna gguf forward: no keep-quant tower");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == T,
+           "laguna gguf: positions length must match token_ids");
+  VT_CHECK(static_cast<int64_t>(weights.layers.size()) == p.num_hidden_layers,
+           "laguna gguf: one LagunaLayerWeights per layer required");
+
+  int64_t max_pos = 0;
+  for (int32_t ps : positions) max_pos = std::max<int64_t>(max_pos, ps);
+  const int64_t rope_rows = max_pos + 1;
+  const std::vector<float> yarn_cache = BuildLagunaFullYarnCosSin(p, rope_rows);
+  const std::vector<float> slide_cache = BuildLagunaSlidingCosSin(p, rope_rows);
+
+  // Embed: hidden[T,H] = embed[token_ids] (f32 gather table).
+  const std::vector<float> embed = ReadF32(weights.embed);
+  std::vector<float> hidden(static_cast<size_t>(T * H));
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t tok = token_ids[static_cast<size_t>(t)];
+    VT_CHECK(tok >= 0 && tok < Vsz, "laguna gguf: token id out of range");
+    std::memcpy(hidden.data() + static_cast<size_t>(t * H),
+                embed.data() + static_cast<size_t>(tok * H),
+                static_cast<size_t>(H) * sizeof(float));
+  }
+
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    const LagunaLayerWeights& lw = weights.layers[static_cast<size_t>(l)];
+    const int64_t Hq = p.QHeadsForLayer(l);
+    const int64_t qdim = Hq * Dh;
+    const int64_t group = p.GqaGroupForLayer(l);
+    VT_CHECK(group > 0 && Hq == group * Hkv,
+             "laguna gguf: per-layer Q-head count must be a multiple of KV heads");
+    const bool global = p.IsGlobalLayer(l);
+    const int64_t rd = p.RotaryDimForLayer(l);
+    const int64_t window = p.WindowForLayer(l);
+
+    // --- attention ---
+    const std::vector<float> hn = RmsNorm(hidden, ReadF32(lw.input_norm), T, H, eps);
+    std::vector<float> qv = LqGemm(q, lw.attn.q_proj, hn, T, qdim, H);
+    std::vector<float> kv = LqGemm(q, lw.attn.k_proj, hn, T, kvdim, H);
+    std::vector<float> vv = LqGemm(q, lw.attn.v_proj, hn, T, kvdim, H);
+    if (p.has_qk_norm && !lw.attn.q_norm.Empty()) {
+      RmsNormHeads(qv, ReadF32(lw.attn.q_norm), T, Hq, Dh, eps);
+      RmsNormHeads(kv, ReadF32(lw.attn.k_norm), T, Hkv, Dh, eps);
+    }
+    const std::vector<float>& cache = global ? yarn_cache : slide_cache;
+    ApplyRope(qv, T, Hq, Dh, rd, cache, positions);
+    ApplyRope(kv, T, Hkv, Dh, rd, cache, positions);
+
+    std::vector<float> attn(static_cast<size_t>(T * qdim), 0.0F);
+    const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
+    for (int64_t h = 0; h < Hq; ++h) {
+      const int64_t kvh = h / group;
+      for (int64_t i = 0; i < T; ++i) {
+        const int64_t pi = positions[static_cast<size_t>(i)];
+        float maxs = -std::numeric_limits<float>::infinity();
+        std::vector<float> logit(static_cast<size_t>(T),
+                                 -std::numeric_limits<float>::infinity());
+        for (int64_t j = 0; j < T; ++j) {
+          const int64_t pj = positions[static_cast<size_t>(j)];
+          if (pj > pi) continue;
+          if (window > 0 && pi - pj >= window) continue;
+          const float* qrow = qv.data() + static_cast<size_t>((i * Hq + h) * Dh);
+          const float* krow = kv.data() + static_cast<size_t>((j * Hkv + kvh) * Dh);
+          float dot = 0.0F;
+          for (int64_t d = 0; d < Dh; ++d) dot += qrow[d] * krow[d];
+          dot *= scale;
+          logit[static_cast<size_t>(j)] = dot;
+          maxs = std::max(maxs, dot);
+        }
+        float denom = 0.0F;
+        for (int64_t j = 0; j < T; ++j) {
+          if (logit[static_cast<size_t>(j)] == -std::numeric_limits<float>::infinity())
+            continue;
+          const float e = std::exp(logit[static_cast<size_t>(j)] - maxs);
+          logit[static_cast<size_t>(j)] = e;
+          denom += e;
+        }
+        float* ao = attn.data() + static_cast<size_t>((i * Hq + h) * Dh);
+        for (int64_t j = 0; j < T; ++j) {
+          const float ww = logit[static_cast<size_t>(j)];
+          if (ww == -std::numeric_limits<float>::infinity() || ww == 0.0F) continue;
+          const float pw = ww / denom;
+          const float* vrow = vv.data() + static_cast<size_t>((j * Hkv + kvh) * Dh);
+          for (int64_t d = 0; d < Dh; ++d) ao[d] += pw * vrow[d];
+        }
+      }
+    }
+
+    // per-head softplus attention OUTPUT gate.
+    const std::vector<float> glogits = LqGemm(q, lw.attn.g_proj, hn, T, Hq, H);
+    for (int64_t i = 0; i < T; ++i) {
+      std::vector<float> row(attn.begin() + static_cast<int64_t>(i * qdim),
+                             attn.begin() + static_cast<int64_t>((i + 1) * qdim));
+      std::vector<float> gl(glogits.begin() + static_cast<int64_t>(i * Hq),
+                            glogits.begin() + static_cast<int64_t>((i + 1) * Hq));
+      LagunaSoftplusHeadGate(row, gl, Hq, Dh);
+      std::copy(row.begin(), row.end(), attn.begin() + static_cast<int64_t>(i * qdim));
+    }
+
+    const std::vector<float> o = LqGemm(q, lw.attn.o_proj, attn, T, H, qdim);
+    for (int64_t i = 0; i < T * H; ++i) hidden[static_cast<size_t>(i)] += o[static_cast<size_t>(i)];
+
+    // --- FFN: dense SwiGLU (layer 0) or ungrouped sigmoid-noaux MoE ---
+    const std::vector<float> hn2 = RmsNorm(hidden, ReadF32(lw.post_attn_norm), T, H, eps);
+    std::vector<float> f(static_cast<size_t>(T * H), 0.0F);
+    if (lw.is_dense) {
+      const int64_t I = p.intermediate_size;
+      const std::vector<float> g = LqGemm(q, lw.mlp.gate_proj, hn2, T, I, H);
+      const std::vector<float> u = LqGemm(q, lw.mlp.up_proj, hn2, T, I, H);
+      const std::vector<float> act = GateUpSilu(g, u, T, I);
+      f = LqGemm(q, lw.mlp.down_proj, act, T, H, I);
+    } else {
+      const int64_t moe_I = p.moe_intermediate_size;
+      const std::vector<float> router_w = ReadF32(lw.moe.router);
+      std::vector<float> bias;
+      if (!lw.moe.e_score_correction_bias.Empty())
+        bias = ReadF32(lw.moe.e_score_correction_bias);
+      const bool has_shared = !lw.moe.shared_gate.Empty();
+      for (int64_t i = 0; i < T; ++i) {
+        std::vector<float> hrow(hn2.begin() + static_cast<int64_t>(i * H),
+                                hn2.begin() + static_cast<int64_t>((i + 1) * H));
+        const std::vector<float> rlog = MatmulNK(hrow, router_w, 1, p.num_experts, H);  // [E]
+        const LagunaRouterSelection sel = LagunaUngroupedRouterTopK(
+            rlog, bias, p.num_experts_per_tok, p.norm_topk_prob,
+            p.moe_routed_scaling_factor);
+        std::vector<float> acc(static_cast<size_t>(H), 0.0F);
+        for (size_t s = 0; s < sel.ids.size(); ++s) {
+          const int64_t id = sel.ids[s];
+          const std::vector<float> eg =
+              LqGemmRowSlice(q, lw.moe.experts_gate, hrow, 1, moe_I, H, id * moe_I);
+          const std::vector<float> eu =
+              LqGemmRowSlice(q, lw.moe.experts_up, hrow, 1, moe_I, H, id * moe_I);
+          const std::vector<float> eact = GateUpSilu(eg, eu, 1, moe_I);
+          const std::vector<float> eo =
+              LqGemmRowSlice(q, lw.moe.experts_down, eact, 1, H, moe_I, id * H);
+          const float wgt = sel.weights[s];
+          for (int64_t d = 0; d < H; ++d)
+            acc[static_cast<size_t>(d)] += wgt * eo[static_cast<size_t>(d)];
+        }
+        if (has_shared) {
+          const std::vector<float> sg = LqGemm(q, lw.moe.shared_gate, hrow, 1, moe_I, H);
+          const std::vector<float> su = LqGemm(q, lw.moe.shared_up, hrow, 1, moe_I, H);
+          const std::vector<float> sact = GateUpSilu(sg, su, 1, moe_I);
+          const std::vector<float> so = LqGemm(q, lw.moe.shared_down, sact, 1, H, moe_I);
+          for (int64_t d = 0; d < H; ++d)
+            acc[static_cast<size_t>(d)] += so[static_cast<size_t>(d)];
+        }
+        std::copy(acc.begin(), acc.end(), f.begin() + static_cast<int64_t>(i * H));
+      }
+    }
+    for (int64_t i = 0; i < T * H; ++i) hidden[static_cast<size_t>(i)] += f[static_cast<size_t>(i)];
+  }
+
+  // Final RMSNorm -> lm_head (untied keep-quant) -> logits.
+  const std::vector<float> hn = RmsNorm(hidden, ReadF32(weights.norm), T, H, eps);
+  const bool gather =
+      !logits_indices.empty() && static_cast<int64_t>(logits_indices.size()) < T;
+  std::vector<float> src;
+  int64_t n_out;
+  if (gather) {
+    n_out = static_cast<int64_t>(logits_indices.size());
+    src.resize(static_cast<size_t>(n_out * H));
+    for (int64_t r = 0; r < n_out; ++r)
+      std::memcpy(src.data() + static_cast<size_t>(r * H),
+                  hn.data() + static_cast<size_t>(logits_indices[static_cast<size_t>(r)] * H),
+                  static_cast<size_t>(H) * sizeof(float));
+  } else {
+    n_out = T;
+    src = hn;
+  }
+  const bool tied = p.tie_word_embeddings || weights.lm_head.Empty();
+  if (tied) return MatmulNK(src, ReadF32(weights.embed), n_out, Vsz, H);
+  return LqGemm(q, weights.lm_head, src, n_out, Vsz, H);
 }
 
 }  // namespace vllm
