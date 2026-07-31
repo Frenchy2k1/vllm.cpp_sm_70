@@ -151,17 +151,22 @@ Recipe = **bf16 attention + dense MLP, W4A4-NVFP4 routed experts**:
   but a different quant than vLLM's NVFP4; not mutually exclusive.
 
 ## Status
-**N1a + N1b + N2 LANDED + CPU-gated (2026-07-31).** The NVFP4 W4A4 arm is
-buildable end-to-end on CPU: weight struct → loader → forward branch, with
-`test_laguna_nvfp4_loader` (3 cases, 61 assertions) covering byte-identity load,
-missing-tensor RED, and a finite+deterministic forward run through the fp4 MoE
-branch. The GGUF keep-quant path stays byte-identical (`test_laguna_scaffold`
-8/8). REMAINING:
-- **N3 — run entrypoint.** Point `examples/laguna_gen` (the greedy driver the DGX
-  benchmark loops) at the NVFP4 safetensors dir → `LoadLagunaForCausalLMWeights`
-  → `LagunaForwardGguf`. (Loader dispatch already keys on dir vs GGUF.)
-- **N4 — CORRECTNESS gate (DGX).** Greedy on the real 67 GiB checkpoint, near-tie
-  vs the recorded vLLM-NVFP4 golden (`~/laguna-nvfp4/vllm_golden.txt`).
-- **N5 — SPEED gate (DGX).** ours-NVFP4 tok/s vs vLLM-NVFP4 18.8 (MARLIN);
-  grouped-W4A4 fold + device residency are the speed levers if the per-expert
-  loop trails. This is the apples-to-apple bar the user set (both at NVFP4).
+**N1a + N1b + N2 + N3 LANDED + CPU-gated (2026-07-31).** The NVFP4 W4A4 arm is
+runnable end-to-end on CPU: weight struct → loader → forward branch → greedy
+driver. `test_laguna_nvfp4_loader` (3 cases, 61 assertions) covers byte-identity
+load, missing-tensor RED, and a finite+deterministic forward through the fp4 MoE
+branch; the GGUF keep-quant path stays byte-identical (`test_laguna_scaffold`
+8/8). **N3 (driver):** `examples/laguna_gen` auto-detects a safetensors DIRECTORY
+(→ NVFP4: `LoadHfConfig(config.json)` + `LoadLagunaForCausalLMWeights` +
+`LagunaForwardGguf{,Cached}`) vs a `.gguf` FILE (→ keep-quant), sharing the greedy
+loop; injected `--token-ids` bypass the tokenizer for the id-vs-golden gate.
+CPU-smoke-verified on a synthetic NVFP4 dir with a REAL config.json (exercises the
+`LoadHfConfig`→`ParseLagunaParams` seam the loader test bypassed) → `has_nvfp4=1`,
+KV-cache decode runs finite. REMAINING (DGX):
+- **N4 — CORRECTNESS gate.** Greedy on the real 67 GiB checkpoint, near-tie vs the
+  recorded vLLM-NVFP4 golden (`~/laguna-nvfp4/vllm_golden.txt`). Ship via
+  `git archive` of this commit + a `-DVLLM_CPP_CUTLASS_DIR` CUDA build on GB10.
+- **N5 — SPEED gate.** ours-NVFP4 tok/s vs vLLM-NVFP4 18.8 (MARLIN); the
+  grouped-W4A4 fold + device residency (the same levers that took the GGUF path
+  1.5→7.7) are the speed knobs if the per-expert loop trails. This is the
+  apples-to-apple bar the user set (both at NVFP4).
