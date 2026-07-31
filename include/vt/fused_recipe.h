@@ -115,8 +115,9 @@ struct FOperandSlot {
 // One recipe step: an opcode + the operand INDICES it reads/writes + the small
 // structural constants the opcode needs. `out` is the primary output operand
 // index; `out2` a secondary output (fp4 scale stream) or kNoOperand; `in[nin]`
-// the input operand indices. `gemma`/`reduce`/`sigmoid_gate` are structural;
-// runtime scalars (eps, quant scale, rope args) travel in the op call.
+// the input operand indices. `gemma`/`reduce`/`sigmoid_gate`/`norm_full_width`
+// are structural; runtime scalars (eps, quant scale, rope args) travel in the op
+// call.
 struct FStep {
   FOp op = FOp::kAdd;
   uint8_t out = 0;                     // primary output operand index
@@ -126,6 +127,18 @@ struct FStep {
   FReduce reduce = FReduce::kNone;
   bool gemma = false;         // kRmsNorm/kAttn: weight as (1 + w), GemmaRMSNorm style
   bool sigmoid_gate = false;  // kRmsNormGated: sigmoid gate activation (else silu)
+  // kRmsNorm SHAPE param (the qk-norm domain, D3). false (default): the norm
+  // reduces over the PER-HEAD head_dim Dh — the bound row operand is [.,Dh]
+  // (Qwen3 dense / 27B). true: the norm reduces over the WHOLE q-dim / k-dim —
+  // the bound row operand is [T,qdim]/[T,kdim] with a full-width weight
+  // [qdim]/[kdim] (OLMo-2's `_apply_qk_norm`, all heads folded into one variance
+  // statistic). The Tier-0 composite is already shape-driven (RmsNorm reduces
+  // over the bound row's last dim), so this flag changes NO composite math; it
+  // DECLARES the intended norm domain so a bespoke fast realization can branch,
+  // and lets the two otherwise-identical qk-norm-rope recipes (per-head vs
+  // full-width) be told apart. Additive: default false keeps every existing
+  // recipe byte-identical.
+  bool norm_full_width = false;
 };
 
 // The declaration: a fixed-size step list + an indexed operand table + live

@@ -34,6 +34,7 @@
 #include "vllm/model_executor/models/qwen3_5_common.h"     // HostLogits
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vt/recipes.h"  // kAttnQkNormRopeFullWidth (D3 full-width qk-norm fold)
 
 namespace vllm {
 namespace {
@@ -113,32 +114,57 @@ DBuf Olmo2AttnBlock(Dev d, const Olmo2AttnWeights& w, const HfConfig& cfg,
   Tensor wkn = ResidentWeight(d, w.k_norm, {kdim});
   Tensor q2 = q.t();  // [T, qdim]
   Tensor k2 = k.t();  // [T, kdim]
-  vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
-  vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
-
-  // Standard NeoX RoPE (rotary_dim == head_dim, is_neox_style default true), on the
-  // per-head views. Two paths (RopeCacheEnabled / VT_QWEN3_ROPE_CACHE), mirroring
-  // the dense AttnBlock: default-ON RopeFromCache off the bf16 cos/sin cache
-  // (vLLM-faithful), else in-place RopeNeox (per-element fp64 cos/sin).
   Tensor q3 = Reshape(q.t(), {T, Hq, Dh});
   Tensor k3 = Reshape(k.t(), {T, Hkv, Dh});
-  if (use_yarn && rot > 0) {
-    // OLMo-3 FULL-attention layer: YaRN-scaled rope from the precomputed cache
-    // (olmo2.py:139-149 — scaling on full-attn layers only), indexed by the REAL
-    // positions. base is unused (the cache is precomputed with the YaRN inv_freq).
+
+  // D3 FOLD (arch-fusion-fold-plan-2026-07-30, Tier-D3): the FULL-WIDTH q/k
+  // RMSNorm + standard NeoX RoPE preamble folds onto the SHARED fusion catalog
+  // recipe vt::kAttnQkNormRopeFullWidth — the `norm_full_width` shape-param
+  // variant of Qwen3-dense's kAttnQkNormRope (recipes.h). Its Tier-0 composite
+  // dispatches EXACTLY the standalone RmsNorm(q,[qdim]) + RmsNorm(k,[kdim]) +
+  // RopeFromCache sequence OLMo-2 hand-called before this fold, so adoption is
+  // byte-identical (SACRED-gated). The fold requires RoPE FROM A CACHE (the
+  // recipe's third step is RopeFromCache): the YaRN full-attention path and the
+  // default-ON bf16 cos/sin cache both qualify; the in-place RopeNeox fallback
+  // (VT_QWEN3_ROPE_CACHE=0) does NOT — routing it through the recipe would
+  // silently swap one RoPE impl for another (mirrors the qwen3.cpp guard), so it
+  // keeps the standalone sequence. Both norms are full-width in EVERY branch.
+  const bool rope_from_cache = rot > 0 && (use_yarn || RopeCacheEnabled());
+  const bool fused_preamble = FusedChainAdoptEnabled() && rope_from_cache;
+  if (fused_preamble) {
+    // yarn (OLMo-3 full-attn layers) rope against the precomputed YaRN cache
+    // indexed by the REAL positions; the default path (OLMo-2, OLMo-3 sliding)
+    // ropes against the per-step bf16 cos/sin cache indexed by the identity row
+    // (the position map is baked into the cache rows).
+    Tensor rope_cache = use_yarn ? *yarn_cache : si.cos_sin_bf16.t();
+    Tensor rope_idx = use_yarn ? si.positions.t() : si.rope_row_idx.t();
     vt::RopeArgs ra;
-    ra.rotary_dim = rot;
-    ra.is_neox_style = true;
-    Tensor k3v = k3;
-    vt::RopeFromCache(d.q, q3, &k3v, si.positions.t(), *yarn_cache, ra);
-  } else if (RopeCacheEnabled() && rot > 0) {
-    // OLMo-2, and OLMo-3 SLIDING layers: plain NeoX rope (base rope_theta) off the
-    // per-step bf16 cos/sin cache (identity row index). Byte-identical to before.
-    Tensor k3v = k3;
-    vt::RopeFromCache(d.q, q3, &k3v, si.rope_row_idx.t(), si.cos_sin_bf16.t(),
-                      MakeRopeArgs(cfg));
-  } else if (rot > 0) {
-    vt::RopeNeox(d.q, q3, k3, si.positions.t(), MakeRopeArgs(cfg));
+    if (use_yarn) {
+      ra.rotary_dim = rot;
+      ra.is_neox_style = true;  // base unused (YaRN inv_freq baked into the cache)
+    } else {
+      ra = MakeRopeArgs(cfg);
+    }
+    vt::FusedBinding b;
+    b.op[0] = &q2;   // q [T,qdim]   (full-width norm in place)
+    b.op[1] = &wqn;  // q_norm [qdim]
+    b.op[2] = &k2;   // k [T,kdim]   (full-width norm in place)
+    b.op[3] = &wkn;  // k_norm [kdim]
+    b.op[4] = &q3;   // q3 [T,Hq,Dh] (per-head rope view, aliases q2)
+    b.op[5] = &k3;   // k3 [T,Hkv,Dh] (per-head rope view, aliases k2)
+    b.op[6] = &rope_cache;
+    b.op[7] = &rope_idx;
+    b.n = 8;
+    vt::FusedParams p;
+    p.eps = eps;
+    p.rope = ra;
+    vt::FusedChain(d.q, vt::kAttnQkNormRopeFullWidth, b, p);
+  } else {
+    // Standalone fallback: full-width q/k RMSNorm then in-place NeoX RoPE (base
+    // rope_theta, per-element fp64 cos/sin). Byte-identical to the pre-fold code.
+    vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
+    vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
+    if (rot > 0) vt::RopeNeox(d.q, q3, k3, si.positions.t(), MakeRopeArgs(cfg));
   }
 
   // Write rope'd K + V into the paged cache (bf16 == cache dtype on the production

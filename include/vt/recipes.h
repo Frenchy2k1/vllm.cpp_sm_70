@@ -354,4 +354,58 @@ constexpr FusedRecipe kAttnQkNormRope = {
     /*fast_op=*/static_cast<int>(OpId::kAttnQkNormRope),
 };
 
+// kAttnQkNormRopeFullWidth — the FULL-WIDTH qk-norm variant of kAttnQkNormRope
+// (D3, arch-fusion-fold-plan-2026-07-30 Tier-D3). Structurally identical to
+// kAttnQkNormRope EXCEPT the two RMSNorm steps carry the `norm_full_width` shape
+// param: the q/k norm reduces over the WHOLE q-dim / k-dim (all heads folded into
+// one variance statistic), not the per-head head_dim. This transcribes OLMo-2's
+// `_apply_qk_norm` (vllm/model_executor/models/olmo2.py:113-117,160-172 @
+// e24d1b24): `q = q_norm(q.view(*, q_size)); k = k_norm(k.view(*, kv_size))`
+// applied to the FLAT [T,q_size]/[T,kv_size] views BEFORE the head reshape, then
+// standard NeoX RoPE on the per-head views.
+//
+// The operand table + step wiring are the SAME as kAttnQkNormRope — only the
+// bound SHAPES differ at the call: operand 0 (q) is [T,qdim] with q_norm[qdim],
+// operand 2 (k) is [T,kdim] with k_norm[kdim], and operands 4/5 (q3/k3) are the
+// per-head [T,Hq,Dh]/[T,Hkv,Dh] rope views aliasing the same buffers. Because the
+// Tier-0 composite's RmsNorm reduces over the bound row's last dim, the composite
+// realizes the full-width norm BYTE-EXACTLY with NO new primitive (it dispatches
+// the exact standalone RmsNorm(q,[qdim])+RmsNorm(k,[kdim])+RopeFromCache sequence
+// OLMo-2 hand-calls today).
+//
+// Realization: composite-only (fast_op = kNoFastOp). The existing bespoke fast
+// kernel (kAttnQkNormRope, Metal) assumes a per-head Dh reduction, so this
+// full-width variant does NOT claim it — it keeps the byte-exact composite on
+// every backend. A full-width fast kernel is a clean follow-up perf step (like
+// kSiluMulQuantFp8's deferred fast tier); it is NOT needed for the D3 fold, which
+// is a launch-consolidation / shared-catalog consistency fold whose bit-exactness
+// is proven by OLMo-2's SACRED token-exact gate on the composite path.
+constexpr FusedRecipe kAttnQkNormRopeFullWidth = {
+    {
+        {FOp::kRmsNorm, /*out=*/0, /*in=*/{0, 1}, /*nin=*/2, kNoOperand, FReduce::kMeanSquare,
+         /*gemma=*/false, /*sigmoid_gate=*/false, /*norm_full_width=*/true},
+        {FOp::kRmsNorm, /*out=*/2, /*in=*/{2, 3}, /*nin=*/2, kNoOperand, FReduce::kMeanSquare,
+         /*gemma=*/false, /*sigmoid_gate=*/false, /*norm_full_width=*/true},
+        {FOp::kRope, /*out=*/4, /*in=*/{4, 6, 7}, /*nin=*/3, /*out2=*/5, FReduce::kNone, false,
+         false},
+    },
+    {
+        {FKind::kRow, "q"},
+        {FKind::kWeight, "q_norm"},
+        {FKind::kRow, "k"},
+        {FKind::kWeight, "k_norm"},
+        {FKind::kAux, "q3"},
+        {FKind::kAux, "k3"},
+        {FKind::kAux, "cos_sin"},
+        {FKind::kAux, "positions"},
+    },
+    /*n=*/3,
+    /*n_operands=*/8,
+    /*name=*/"attn_qk_norm_rope_full_width",
+    // Composite-only: no full-width bespoke fast kernel yet (the per-head
+    // kAttnQkNormRope fast kernel would norm over the wrong domain). The composite
+    // is byte-exact by construction, so this is safe on every backend.
+    /*fast_op=*/kNoFastOp,
+};
+
 }  // namespace vt
