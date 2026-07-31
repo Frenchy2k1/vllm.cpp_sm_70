@@ -19,6 +19,7 @@
 // Poolside-fork `laguna` branch (GGUF name-map authority, scope spec §3).
 #include "vllm/model_executor/models/laguna.h"
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -144,13 +145,24 @@ LagunaParams ParseLagunaParams(const HfConfig& config) {
   // --- dual per-layer RoPE (nested rope_parameters) ---
   if (const nlohmann::json* full = RopeBlock(raw, "full_attention")) {
     p.rope_theta_full = RawDouble(*full, "rope_theta", 500000.0);
-    p.yarn_factor = RawDouble(*full, "factor", 128.0);
+    // config.json (HF safetensors) uses factor 128 (1M ctx); the UD-Q4_K GGUF
+    // uses factor 32 (262144 ctx). The GGUF loader OVERRIDES these from the GGUF
+    // KV (laguna.rope.scaling.*) so the same-quant gate matches llama.cpp; this
+    // typed path is the safetensors/NVFP4-oracle fallback.
+    p.yarn_factor = RawDouble(*full, "factor", 32.0);
     p.yarn_orig_max_pos =
         RawInt(*full, "original_max_position_embeddings", 8192);
     p.yarn_beta_fast = RawDouble(*full, "beta_fast", 32.0);
     p.yarn_beta_slow = RawDouble(*full, "beta_slow", 1.0);
-    p.yarn_attention_factor =
-        RawDouble(*full, "attention_factor", 1.4852030263919618);
+    // HF ships a precomputed `attention_factor` (== the llama.cpp mscale formula
+    // output). Back out the raw yarn_attn_factor so LagunaYarnMscale reproduces it
+    // for BOTH paths; if absent, default 1.0 (the GGUF value).
+    if (const double af = RawDouble(*full, "attention_factor", -1.0); af > 0.0) {
+      const double base = p.yarn_factor > 1.0 ? 1.0 + 0.1 * std::log(p.yarn_factor) : 1.0;
+      p.yarn_attn_factor = base > 0.0 ? af / base : 1.0;
+    } else {
+      p.yarn_attn_factor = 1.0;
+    }
     p.partial_rotary_factor_full = RawDouble(*full, "partial_rotary_factor", 0.5);
   }
   p.rotary_dim_full = static_cast<int64_t>(p.head_dim * p.partial_rotary_factor_full);
@@ -192,27 +204,31 @@ void ParseLagunaConfig(const HfConfig& config) {
 // download. The per-tensor quant TYPE is read from the GGUF header at W4; the
 // EXPECTED unsloth UD-Q4_K_XL "XL" mix is recorded in the table below.
 std::string LagunaGgufAttnName(int64_t layer, const char* proj) {
-  // proj in {attn_q, attn_k, attn_v, attn_output, attn_gate}.
+  // proj in {attn_norm, attn_q, attn_k, attn_v, attn_output, attn_gate,
+  //          attn_q_norm, attn_k_norm}. VERIFIED W4 from the real GGUF headers.
   return "blk." + std::to_string(layer) + "." + proj + ".weight";
 }
 std::string LagunaGgufMoeName(int64_t layer, const char* which) {
-  // which in {ffn_gate_exps, ffn_up_exps, ffn_down_exps,
-  //           ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp, ffn_gate_inp}.
+  // which in {ffn_norm, ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps,
+  //   ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp} (+ exp_probs_b.bias, no
+  //   ".weight" suffix). Dense layer 0: ffn_gate/ffn_up/ffn_down. VERIFIED W4.
   return "blk." + std::to_string(layer) + "." + which + ".weight";
 }
 
-// The EXPECTED UD-Q4_K_XL per-role quant mix (unsloth dynamic "XL"). Each type is
-// ALREADY decoded in-tree (Q4_K/Q5_K/Q6_K/Q8_0 — cuda_quant_dot.cu +
+// The VERIFIED UD-Q4_K_XL per-role quant mix (unsloth dynamic "XL"), read W4
+// 2026-07-31 from the real GGUF tensor-info headers (814 tensors, split.count=3).
+// Every type is ALREADY decoded in-tree (Q4_K/Q5_K/Q6_K/Q8_0 — cuda_quant_dot.cu +
 // cpu_quant_dot.cpp) => ZERO new decode kernel for ANY tensor in the mix.
-//   token_embd / output(lm_head)      -> Q6_K or Q8_0 (accuracy-critical)
-//   attn_q/k/v/output                 -> Q4_K (Q6_K on some global layers)
-//   attn_gate (softplus out-gate)     -> Q6_K/Q8_0 (tiny, accuracy-critical)
-//   ffn_gate_inp (router) + bias      -> F32 / Q8_0
+//   token_embd / output(lm_head)      -> Q6_K/Q8_0 (accuracy-critical)
+//   attn_q/k/v/output/gate            -> Q8_0 (VERIFIED — all attn linears Q8_0)
+//   attn_q_norm/k_norm/attn_norm      -> F32 (per-head QK-RMSNorm + pre-attn norm)
+//   ffn_gate_inp (router)             -> F32 [H,256]; exp_probs_b.bias -> F32 [256]
 //   ffn_{gate,up}_exps (256 experts)  -> Q4_K (the bulk)
-//   ffn_down_exps                     -> Q5_K/Q6_K (UD "richer down-proj" rule)
-//   shared expert ffn_*_shexp         -> Q4_K/Q5_K
-//   *_norm                            -> F32
-// Confirmed per-tensor at W4 from the shard headers (light metadata read).
+//   ffn_down_exps                     -> Q5_K (UD "richer down-proj" rule)
+//   ffn_{gate,up,down}_shexp (shared) -> Q8_0
+//   ffn_norm                          -> F32
+// GGUF ne-order is [in, out] (reverse of torch [out, in]); OwnGgufQuantBlocks +
+// vt::MatmulBT consume the on-disk [N,K] block layout with no transpose.
 
 LagunaWeights LoadLagunaForCausalLMWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config) {

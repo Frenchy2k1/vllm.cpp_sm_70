@@ -61,10 +61,15 @@ LagunaRouterSelection LagunaUngroupedRouterTopK(
 //   row r, i in [0, rotary_dim/2): cache[r*rd + i]           = cos(r*inv_freq[i])*m
 //                                  cache[r*rd + rd/2 + i]     = sin(r*inv_freq[i])*m
 // FULL-attention (global) layers: YaRN inv_freq (theta_full, factor, beta_fast/
-// slow) over rotary_dim_full (=64), mscale = yarn_attention_factor (1.4852).
+// slow) over rotary_dim_full (=64), mscale = LagunaYarnMscale(factor, attn_factor).
 // SLIDING layers: plain inv_freq[i]=theta_sliding^(-(2i)/rotary_dim_sliding),
 // mscale = 1, over rotary_dim_sliding (=128). `rows` sizes the (position) axis.
 std::vector<float> BuildLagunaFullYarnCosSin(const LagunaParams& p, int64_t rows);
 std::vector<float> BuildLagunaSlidingCosSin(const LagunaParams& p, int64_t rows);
+
+// llama.cpp YaRN mscale: yarn_attn_factor * (1 + 0.1*ln(factor)) for factor>1,
+// else yarn_attn_factor. Reproduces HF's precomputed attention_factor and the
+// GGUF's yarn_attn_factor=1.0 + factor 32. Exposed for the RoPE bit-match gate.
+double LagunaYarnMscale(double factor, double yarn_attn_factor);
 
 }  // namespace vllm
