@@ -2007,3 +2007,5 @@ The gate models' W4A4 decode is at the achievable roofline. See `.agents/specs/n
 **Laguna W8 embed-fix LANDED + GATED (2026-07-31).** `LagunaEmbed` gathers only the T needed rows instead of converting the whole 1.23 GB embed table to f32 every token. GATED on real UD-Q4_K_XL GGUF (GB10, `--gpu`): TOKEN-IDENTICAL to the W5/W6 golden + decode **0.66 → 0.17 s/tok (3.9×; 1.5 → 5.9 tok/s)**. Bit-exact by construction. See `.agents/specs/laguna-s21-w7-speed-2026-07-31.md` §W8.
 
 **Laguna W9 grouped-expert MoE LANDED + GATED (2026-07-31).** The 30 un-grouped per-expert GEMV launches/step fold onto the shared `vt::MatmulBTQuantGrouped` (3×top_k → 3 launches/token, no loader change). Same-binary A/B on real UD-Q4_K_XL (GB10, `--gpu`): grouped==per-expert BYTE-IDENTICAL (md5 `754728c6`, == W6 golden) + decode **0.18 → 0.13 s/tok (1.38×)**. Cumulative with W8: **0.66 → 0.13 s/tok (5.1×, 1.5 → 7.7 tok/s)**. See spec §W9.
+
+_(Laguna W8+W9 decode-speed campaign handoff recorded in `.agents/state.md`; cumulative 0.66 → 0.13 s/tok, next lever #1 device-resident decode.)_
