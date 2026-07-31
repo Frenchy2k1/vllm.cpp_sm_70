@@ -49,7 +49,14 @@ Recipe = **bf16 attention + dense MLP, W4A4-NVFP4 routed experts**:
   a loader unit test (shapes + a byte-identity check vs the raw file, RED-first).
   - **N1a DONE (98a67a01):** additive `Nvfp4Weight` expert fields on
     `LagunaMoeWeights` (CPU-built, `test_laguna_scaffold` 8/8·167).
-  - **N1b — the loader body (CONCRETE RECIPE, derived 2026-07-31).** Replace the
+  - **N1b DONE (0d014016 loader, 218655f2 test).** `LoadLagunaForCausalLMWeights`
+    body landed: resolver + per-layer bf16 attn/dense/norms/embed/lm_head +
+    BF16 router + F32 `e_score_correction_bias` + `LnLoadCtNvfp4Raw` W4A4 experts
+    (`alpha = scale2 / input_global_scale_inv`) + BF16 shared expert; sets
+    `has_nvfp4_weights`. Gated by `test_laguna_nvfp4_loader` (synthetic 2-layer
+    NVFP4 checkpoint round-trips byte-identically + missing-tensor RED). The
+    concrete recipe below was the derivation:
+  - **N1b recipe (derived 2026-07-31).** Replace the
     `VT_CHECK(false)` in `LoadLagunaForCausalLMWeights(const
     std::vector<SafetensorsFile>& shards, const HfConfig&)`
     (`laguna_weights.cpp:240`). Steps, all reusing qwen3_5_weights.cpp helpers
@@ -93,11 +100,29 @@ Recipe = **bf16 attention + dense MLP, W4A4-NVFP4 routed experts**:
       writes a tiny fp4 tensor + checks `experts_gate_fp4[0].{packed,scale,scale2,
       n,k}` round-trip byte-identical, RED-first on a wrong-scale-name mutant).
       The fixture is the CPU-gateable path; recommend it over deferring to DGX.
-- **N2 — forward quant-branch.** In `laguna.cpp`, select the NVFP4 arm when the
-  weights are fp4-resident: attention/dense via bf16 `MatmulBT`; routed experts
-  via `kMoeGroupedGemmNvfp4` (P = T·top_k, mirror the A3 grouped shape); shared
-  expert + lm_head via the dense NVFP4/bf16 sink. Keep softplus gate / dual RoPE
-  / sigmoid router / sliding-window mask exactly as the GGUF path.
+- **N2 DONE (this commit).** Forward quant-branch landed in `laguna.cpp` +
+  CPU-gated. **CORRECTION vs the original recipe:** the routed experts are TRUE
+  **W4A4** (each expert carries `input_global_scale` ⇒ `alpha>0`), so they use
+  the **per-expert `MatmulNvfp4Fp4`** (fp4 activation quant via
+  `ScaledFp4Quant(w.input_global_scale_inv)` → `MatmulNvfp4Fp4(..., w.alpha)`),
+  NOT the grouped `MoeGroupedGemmNvfp4` op — that op is **W4A16** (bf16
+  activation), wrong numerics for this checkpoint. The grouped W4A4 fast-path is
+  deferred to N5 (a speed fold, not correctness). Concretely:
+  - New helper `LqGemmNvfp4Fp4` (after `LqGemm`): mirrors `LqGemm`'s
+    unified-memory pattern (host ptrs as device tensors on GB10, raw weight view
+    retagged), does fp4-activation-quant then the W4A4 GEMM.
+  - `LagunaFfnBlock` branches on `fp4 = !experts_gate_fp4.empty()`: routed-expert
+    gate/up/down call `LqGemmNvfp4Fp4` per expert; the keep-quant grouped
+    fast-path is gated off (`!fp4`); an `IsTrueW4A4()` assert guards the arm.
+  - **Everything else flows through the SAME bf16 path unchanged:** attention,
+    dense L0 MLP, router (BF16→F32), shared expert (BF16 in this checkpoint), and
+    lm_head are all bf16 and route through `LqGemm`/`ReadF32` — softplus gate,
+    dual RoPE, sigmoid router, sliding-window mask all identical to the GGUF path.
+  - The two `LagunaForwardGguf{,Cached}` guards relaxed to
+    `has_gguf_weights || has_nvfp4_weights`.
+  - **CPU run-gate** (`test_laguna_nvfp4_loader`, +1 case): the fp4 MoE branch
+    executes through the real `LagunaForwardGguf` on a controlled-finite synthetic
+    checkpoint → finite + deterministic logits + routed-experts-consumed proof.
 - **N3 — engine wiring + run entrypoint.** Register the NVFP4 Laguna in the
   loader dispatch (safetensors dir → NVFP4 arm; GGUF → keep-quant arm);
   `examples/laguna_gen` accepts the NVFP4 dir.
@@ -126,6 +151,17 @@ Recipe = **bf16 attention + dense MLP, W4A4-NVFP4 routed experts**:
   but a different quant than vLLM's NVFP4; not mutually exclusive.
 
 ## Status
-SPEC ONLY (2026-07-31). No code. Blocked on user direction between this arm (1a)
-and the GGUF-path optimization (1b); both need DGX gates. Reference studied:
-qwen3_5 NVFP4 loader + ops confirmed reusable; checkpoint structure verified.
+**N1a + N1b + N2 LANDED + CPU-gated (2026-07-31).** The NVFP4 W4A4 arm is
+buildable end-to-end on CPU: weight struct → loader → forward branch, with
+`test_laguna_nvfp4_loader` (3 cases, 61 assertions) covering byte-identity load,
+missing-tensor RED, and a finite+deterministic forward run through the fp4 MoE
+branch. The GGUF keep-quant path stays byte-identical (`test_laguna_scaffold`
+8/8). REMAINING:
+- **N3 — run entrypoint.** Point `examples/laguna_gen` (the greedy driver the DGX
+  benchmark loops) at the NVFP4 safetensors dir → `LoadLagunaForCausalLMWeights`
+  → `LagunaForwardGguf`. (Loader dispatch already keys on dir vs GGUF.)
+- **N4 — CORRECTNESS gate (DGX).** Greedy on the real 67 GiB checkpoint, near-tie
+  vs the recorded vLLM-NVFP4 golden (`~/laguna-nvfp4/vllm_golden.txt`).
+- **N5 — SPEED gate (DGX).** ours-NVFP4 tok/s vs vLLM-NVFP4 18.8 (MARLIN);
+  grouped-W4A4 fold + device residency are the speed levers if the per-expert
+  loop trails. This is the apples-to-apple bar the user set (both at NVFP4).

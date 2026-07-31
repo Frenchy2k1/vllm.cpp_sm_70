@@ -5,6 +5,7 @@
 // and asserts every field round-trips byte-identically. RED-first: a wrong
 // scale-global reciprocal and a missing tensor both fail.
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -187,6 +188,75 @@ std::vector<Fx> BuildTensors() {
   return v;
 }
 
+// ── controlled-FINITE builders (for the forward run-gate) ───────────────────
+// The byte-identity fixtures above use arbitrary Fill() bytes, which decode to
+// inf/NaN for BF16 (0x7F80…) and fp8-e4m3 (0x7F/0xFF). A forward through those
+// would produce NaN that is a fixture artifact, not a real bug. These builders
+// emit only finite, bounded values so `std::isfinite` is a meaningful assertion.
+uint16_t Bf16Bits(float v) {
+  uint32_t bits;
+  std::memcpy(&bits, &v, 4);
+  return static_cast<uint16_t>(bits >> 16);  // truncate f32 -> bf16 (finite in, finite out)
+}
+// BF16 tensor with small deterministic values in [-0.08, 0.07].
+Fx Bf16Finite(const std::string& n, std::vector<int64_t> shape, int seed) {
+  int64_t ne = 1;
+  for (int64_t d : shape) ne *= d;
+  std::string s(static_cast<size_t>(ne) * 2, '\0');
+  for (int64_t i = 0; i < ne; ++i) {
+    const float v = static_cast<float>(((i * 7 + seed) % 16) - 8) * 0.01F;
+    const uint16_t bf = Bf16Bits(v);
+    std::memcpy(&s[static_cast<size_t>(i) * 2], &bf, 2);
+  }
+  return {n, "BF16", std::move(shape), std::move(s)};
+}
+void AttnBf16Finite(std::vector<Fx>& v, const std::string& b, int& s) {
+  v.push_back(Bf16Finite(b + "input_layernorm.weight", {H}, s++));
+  v.push_back(Bf16Finite(b + "post_attention_layernorm.weight", {H}, s++));
+  v.push_back(Bf16Finite(b + "self_attn.q_proj.weight", {NH * Dh, H}, s++));
+  v.push_back(Bf16Finite(b + "self_attn.k_proj.weight", {KV * Dh, H}, s++));
+  v.push_back(Bf16Finite(b + "self_attn.v_proj.weight", {KV * Dh, H}, s++));
+  v.push_back(Bf16Finite(b + "self_attn.o_proj.weight", {H, NH * Dh}, s++));
+  v.push_back(Bf16Finite(b + "self_attn.g_proj.weight", {NH, H}, s++));
+  v.push_back(Bf16Finite(b + "self_attn.q_norm.weight", {Dh}, s++));
+  v.push_back(Bf16Finite(b + "self_attn.k_norm.weight", {Dh}, s++));
+}
+// FINITE W4A4 projection: fp8-e4m3 scale byte 0x38 (== 1.0), fp4-e2m1 packed byte
+// 0x11 (both nibbles code-1 == 0.5), unit globals -> bounded, NaN-free dequant.
+void ExpertProjFinite(std::vector<Fx>& v, const std::string& p, int64_t n, int64_t k) {
+  v.push_back({p + ".weight_packed", "U8", {n, k / 2},
+               std::string(static_cast<size_t>(n * k / 2), '\x11')});
+  v.push_back({p + ".weight_scale", "F8_E4M3", {n, k / 16},
+               std::string(static_cast<size_t>(n * k / 16), '\x38')});
+  v.push_back({p + ".weight_global_scale", "F32", {}, F32Bytes(1.0F)});
+  v.push_back({p + ".input_global_scale", "F32", {}, F32Bytes(1.0F)});
+}
+std::vector<Fx> BuildFiniteTensors() {
+  std::vector<Fx> v;
+  int s = 1;
+  v.push_back(Bf16Finite("model.embed_tokens.weight", {V, H}, s++));
+  v.push_back(Bf16Finite("model.norm.weight", {H}, s++));
+  v.push_back(Bf16Finite("lm_head.weight", {V, H}, s++));
+  AttnBf16Finite(v, "model.layers.0.", s);
+  v.push_back(Bf16Finite("model.layers.0.mlp.gate_proj.weight", {DENSE_I, H}, s++));
+  v.push_back(Bf16Finite("model.layers.0.mlp.up_proj.weight", {DENSE_I, H}, s++));
+  v.push_back(Bf16Finite("model.layers.0.mlp.down_proj.weight", {H, DENSE_I}, s++));
+  AttnBf16Finite(v, "model.layers.1.", s);
+  v.push_back(Bf16Finite("model.layers.1.mlp.gate.weight", {E, H}, s++));  // router BF16
+  v.push_back({"model.layers.1.mlp.experts.e_score_correction_bias", "F32", {E},
+               std::string(static_cast<size_t>(E) * 4, '\0')});  // zeros
+  for (int e = 0; e < E; ++e) {
+    const std::string ep = "model.layers.1.mlp.experts." + std::to_string(e) + ".";
+    ExpertProjFinite(v, ep + "gate_proj", MOE_I, H);
+    ExpertProjFinite(v, ep + "up_proj", MOE_I, H);
+    ExpertProjFinite(v, ep + "down_proj", H, MOE_I);
+  }
+  v.push_back(Bf16Finite("model.layers.1.mlp.shared_expert.gate_proj.weight", {MOE_I, H}, s++));
+  v.push_back(Bf16Finite("model.layers.1.mlp.shared_expert.up_proj.weight", {MOE_I, H}, s++));
+  v.push_back(Bf16Finite("model.layers.1.mlp.shared_expert.down_proj.weight", {H, MOE_I}, s++));
+  return v;
+}
+
 }  // namespace
 
 TEST_CASE("laguna nvfp4 loader: synthetic checkpoint round-trips byte-identically") {
@@ -271,4 +341,59 @@ TEST_CASE("laguna nvfp4 loader: missing tensor throws (RED-first)") {
   std::vector<SafetensorsFile> shards;
   shards.push_back(SafetensorsFile::Open(f.path()));
   CHECK_THROWS(LoadLagunaForCausalLMWeights(shards, TinyConfig()));
+}
+
+// N2 CPU RUN-GATE (task #230): the NVFP4 fp4 MoE branch in LagunaFfnBlock actually
+// EXECUTES through the real LagunaForwardGguf entry (the same path examples/laguna_gen
+// loops for the DGX benchmark) and produces finite, deterministic logits. This is the
+// pre-DGX safety proof that the fp4 activation-quant -> MatmulNvfp4Fp4 -> alpha combine
+// wires up correctly on CPU (ScaledFp4QuantKernel + MatmulNvfp4Fp4Kernel run here) before
+// the real GB10 near-tie gate vs the recorded vLLM golden.
+TEST_CASE("laguna nvfp4 forward: fp4 MoE branch runs finite + deterministic (CPU run-gate)") {
+  const std::vector<Fx> ts = BuildFiniteTensors();
+  TempFile f(BuildSt(ts));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  const LagunaWeights w = LoadLagunaForCausalLMWeights(shards, TinyConfig());
+  REQUIRE(w.has_nvfp4_weights);
+  // Layer 1 is MoE and its experts are the true-W4A4 fp4 tensors -> the fp4 branch fires.
+  REQUIRE(!w.layers[1].moe.experts_gate_fp4.empty());
+  REQUIRE(w.layers[1].moe.experts_gate_fp4[0].IsTrueW4A4());
+
+  vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<int32_t> tokens = {1, 3, 2};
+  const std::vector<int32_t> positions = {0, 1, 2};
+  const std::vector<int32_t> logits_indices = {0, 1, 2};
+
+  const std::vector<float> out1 =
+      vllm::LagunaForwardGguf(w, cpuq, tokens, positions, logits_indices);
+  REQUIRE(static_cast<int64_t>(out1.size()) == 3 * V);
+  for (float x : out1) CHECK(std::isfinite(x));
+
+  // Deterministic: identical inputs -> byte-identical logits across runs.
+  const std::vector<float> out2 =
+      vllm::LagunaForwardGguf(w, cpuq, tokens, positions, logits_indices);
+  REQUIRE(out2.size() == out1.size());
+  CHECK(std::memcmp(out1.data(), out2.data(), out1.size() * sizeof(float)) == 0);
+
+  // The routed experts are actually CONSUMED: zeroing EVERY routed expert's gate packed
+  // codes (silu(gate)=silu(0)=0 -> routed contribution collapses to 0, regardless of which
+  // expert top-1 picks per token) shifts the MoE-layer output, hence the logits. Proves the
+  // fp4 GEMM result flows into the residual stream.
+  std::vector<Fx> ts2 = BuildFiniteTensors();
+  for (Fx& t : ts2)
+    if (t.name.find("mlp.experts.") != std::string::npos &&
+        t.name.find("gate_proj.weight_packed") != std::string::npos)
+      std::fill(t.bytes.begin(), t.bytes.end(), '\x00');  // e2m1 code 0 == 0.0
+  TempFile f2(BuildSt(ts2));
+  std::vector<SafetensorsFile> shards2;
+  shards2.push_back(SafetensorsFile::Open(f2.path()));
+  const LagunaWeights w2 = LoadLagunaForCausalLMWeights(shards2, TinyConfig());
+  const std::vector<float> out3 =
+      vllm::LagunaForwardGguf(w2, cpuq, tokens, positions, logits_indices);
+  REQUIRE(out3.size() == out1.size());
+  bool differs = false;
+  for (size_t i = 0; i < out1.size(); ++i)
+    if (out1[i] != out3[i]) { differs = true; break; }
+  CHECK(differs);
 }
