@@ -278,7 +278,91 @@ TEST_CASE("fused_chain kAttnQkNormRope composite == RmsNorm(q)+RmsNorm(k)+RopeFr
 
 namespace {
 
+// D3 (arch-fusion-fold-plan-2026-07-30): kAttnQkNormRopeFullWidth composite ==
+// standalone FULL-WIDTH RmsNorm(q,[qdim]) + RmsNorm(k,[kdim]) + RopeFromCache,
+// byte-exact. This is OLMo-2's `_apply_qk_norm`: the q/k norm reduces over the
+// WHOLE q-dim / k-dim (all heads folded), NOT the per-head head_dim. The bound
+// operands are q2=[T,qdim] / q_norm=[qdim] (vs the per-head [.,Dh]/[Dh] variant),
+// and q3/k3 the per-head [T,H,Dh] rope views aliasing the same buffers.
+void RunCpuAttnQkNormRopeFullWidth(int64_t t, int64_t hq, int64_t hk, int64_t dh,
+                                   uint32_t seed) {
+  const int64_t qdim = hq * dh, kdim = hk * dh;
+  const int rot = static_cast<int>(dh);
+  const float eps = 1e-6f;
+  const auto qf = RandF32(static_cast<size_t>(t * qdim), seed);
+  const auto kf = RandF32(static_cast<size_t>(t * kdim), seed + 1);
+  const auto qnf = RandF32(static_cast<size_t>(qdim), seed + 2);  // FULL-WIDTH weight
+  const auto knf = RandF32(static_cast<size_t>(kdim), seed + 3);  // FULL-WIDTH weight
+  std::vector<int32_t> pos(static_cast<size_t>(t));
+  for (int64_t i = 0; i < t; ++i) pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  const vt::RopeArgs rope{1000000.0f, rot, /*is_neox_style=*/true};
+
+  Queue q{Cpu(), nullptr};
+  Tensor tpos = MakeTensor(pos.data(), DType::kI32, Cpu(), {t});
+  Tensor tqn = MakeTensor(const_cast<float*>(qnf.data()), DType::kF32, Cpu(), {qdim});
+  Tensor tkn = MakeTensor(const_cast<float*>(knf.data()), DType::kF32, Cpu(), {kdim});
+  std::vector<float> cs(static_cast<size_t>(t) * rot);
+  Tensor tcs = MakeTensor(cs.data(), DType::kF32, Cpu(), {t, rot});
+  vt::RopeCosSinCache(q, tcs, tpos, rope);
+
+  // Golden: standalone FULL-WIDTH in-place norms ([T,qdim]/[T,kdim]) + RopeFromCache.
+  std::vector<float> qg = qf, kg = kf;
+  Tensor qg2 = MakeTensor(qg.data(), DType::kF32, Cpu(), {t, qdim});
+  Tensor kg2 = MakeTensor(kg.data(), DType::kF32, Cpu(), {t, kdim});
+  vt::RmsNorm(q, qg2, qg2, tqn, RmsNormArgs{eps, false});
+  vt::RmsNorm(q, kg2, kg2, tkn, RmsNormArgs{eps, false});
+  Tensor qg3 = MakeTensor(qg.data(), DType::kF32, Cpu(), {t, hq, dh});
+  Tensor kg3 = MakeTensor(kg.data(), DType::kF32, Cpu(), {t, hk, dh});
+  vt::RopeFromCache(q, qg3, &kg3, tpos, tcs, rope);
+
+  // Composite via the declared FULL-WIDTH recipe.
+  std::vector<float> qc = qf, kc = kf;
+  Tensor qc2 = MakeTensor(qc.data(), DType::kF32, Cpu(), {t, qdim});
+  Tensor kc2 = MakeTensor(kc.data(), DType::kF32, Cpu(), {t, kdim});
+  Tensor qc3 = MakeTensor(qc.data(), DType::kF32, Cpu(), {t, hq, dh});
+  Tensor kc3 = MakeTensor(kc.data(), DType::kF32, Cpu(), {t, hk, dh});
+  vt::FusedBinding b;
+  b.op[0] = &qc2;
+  b.op[1] = &tqn;
+  b.op[2] = &kc2;
+  b.op[3] = &tkn;
+  b.op[4] = &qc3;
+  b.op[5] = &kc3;
+  b.op[6] = &tcs;
+  b.op[7] = &tpos;
+  b.n = 8;
+  vt::FusedParams p;
+  p.eps = eps;
+  p.rope = rope;
+  SetTier(0);
+  vt::FusedChain(q, vt::kAttnQkNormRopeFullWidth, b, p);
+
+  const size_t qb = qc.size() * sizeof(float), kb = kc.size() * sizeof(float);
+  CHECK(std::memcmp(qc.data(), qg.data(), qb) == 0);
+  CHECK(std::memcmp(kc.data(), kg.data(), kb) == 0);
+
+  // RED-first discrimination: the full-width fold must NOT equal a PER-HEAD norm
+  // (weight [Dh], reduce over Dh). A per-head realization here would be WRONG for
+  // OLMo-2, so prove the full-width result actually differs from it (else the
+  // byte-check above would be satisfied by the wrong domain and prove nothing).
+  const auto qph_w = RandF32(static_cast<size_t>(dh), seed + 4);
+  Tensor tqph = MakeTensor(const_cast<float*>(qph_w.data()), DType::kF32, Cpu(), {dh});
+  std::vector<float> qp = qf;
+  Tensor qp2 = MakeTensor(qp.data(), DType::kF32, Cpu(), {t * hq, dh});  // per-head rows
+  vt::RmsNorm(q, qp2, qp2, tqph, RmsNormArgs{eps, false});
+  bool differs = std::memcmp(qp.data(), qg.data(), qb) != 0;
+  CHECK(differs);  // full-width norm domain is genuinely distinct from per-head
+}
+
 }  // namespace
+
+TEST_CASE("fused_chain kAttnQkNormRopeFullWidth composite == full-width RmsNorm(q)+RmsNorm(k)+RopeFromCache (CPU, byte-exact, D3)") {
+  // MHA full-width shape (Hq == Hkv, OLMo-2 style), head_dim 64.
+  RunCpuAttnQkNormRopeFullWidth(/*t=*/5, /*hq=*/32, /*hk=*/32, /*dh=*/64, 400);
+  RunCpuAttnQkNormRopeFullWidth(/*t=*/1, /*hq=*/32, /*hk=*/32, /*dh=*/64, 411);
+  // GQA full-width shape (Hq != Hkv), head_dim 128.
+  RunCpuAttnQkNormRopeFullWidth(/*t=*/3, /*hq=*/16, /*hk=*/4, /*dh=*/128, 422);
+}
 
 TEST_CASE("fused_chain validates operands at the chokepoint") {
   Queue q{Cpu(), nullptr};
