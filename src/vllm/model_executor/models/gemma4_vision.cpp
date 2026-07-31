@@ -21,6 +21,7 @@
 #include <cstring>
 #include <vector>
 
+#include "vllm/model_executor/models/merged_qkv_fold.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
@@ -129,7 +130,8 @@ void Linear(Queue& q, Buf& out, Tensor x, Tensor w) { vt::MatmulBT(q, out.tensor
 
 struct DevBlock {
   DevW input_ln, post_attn_ln, pre_ff_ln, post_ff_ln;
-  DevW q_proj, k_proj, v_proj, o_proj;
+  DevW qkv_proj;  // [3H, H] fused (q rows, then k rows, then v rows) — C2 fold
+  DevW o_proj;
   DevW q_norm, k_norm;
   DevW gate_up;  // [2I, H] fused (gate rows then up rows)
   DevW down_proj;
@@ -255,9 +257,18 @@ std::vector<float> Gemma4VisionForward(const std::vector<float>& pixel_values,
     d.post_attn_ln = MakeDevBf16(b, q, bw.post_attn_ln, {H});
     d.pre_ff_ln = MakeDevBf16(b, q, bw.pre_ff_ln, {H});
     d.post_ff_ln = MakeDevBf16(b, q, bw.post_ff_ln, {H});
-    d.q_proj = MakeDevBf16(b, q, bw.q_proj, {H, H});
-    d.k_proj = MakeDevBf16(b, q, bw.k_proj, {H, H});
-    d.v_proj = MakeDevBf16(b, q, bw.v_proj, {H, H});
+    // C2 fold: pack q/k/v [H,H] into one resident merged qkv_proj [3H,H] (q rows,
+    // then k rows, then v rows) so the QKV projection is ONE MatmulBT + a
+    // contiguous QkvSplit. Mirrors the existing gate_up concat below. BIT-exact
+    // vs three separate [H,H] GEMMs (same bf16 bytes, per-slice output clamp
+    // stays on the split outputs in the forward).
+    std::vector<float> qkv(bw.q_proj.size() + bw.k_proj.size() + bw.v_proj.size());
+    std::memcpy(qkv.data(), bw.q_proj.data(), bw.q_proj.size() * sizeof(float));
+    std::memcpy(qkv.data() + bw.q_proj.size(), bw.k_proj.data(),
+                bw.k_proj.size() * sizeof(float));
+    std::memcpy(qkv.data() + bw.q_proj.size() + bw.k_proj.size(), bw.v_proj.data(),
+                bw.v_proj.size() * sizeof(float));
+    d.qkv_proj = MakeDevBf16(b, q, qkv, {3 * H, H});
     d.o_proj = MakeDevBf16(b, q, bw.o_proj, {H, H});
     d.q_norm = MakeDevBf16(b, q, bw.q_norm, {hd});
     d.k_norm = MakeDevBf16(b, q, bw.k_norm, {hd});
@@ -302,6 +313,7 @@ std::vector<float> Gemma4VisionForward(const std::vector<float>& pixel_values,
 
   Buf n1(b, q, DType::kBF16, {L, H});
   Buf qb(b, q, DType::kBF16, {L, H}), kb(b, q, DType::kBF16, {L, H}), vb(b, q, DType::kBF16, {L, H});
+  Buf qkv(b, q, DType::kBF16, {L, 3 * H});  // C2 merged-qkv GEMM scratch [L,3H]
   Buf ao(b, q, DType::kBF16, {L, nh, hd});
   Buf attn(b, q, DType::kBF16, {L, H});
   Buf n2(b, q, DType::kBF16, {L, H});
@@ -318,9 +330,14 @@ std::vector<float> Gemma4VisionForward(const std::vector<float>& pixel_values,
     // q/k/v projections. q/k/v share the input clamp (same source n1); each has
     // its own output clamp. clamp(input) -> linear -> clamp(output).
     ClampDevice(b, q, n1, L * H, cw.q_clip.in_min, cw.q_clip.in_max);
-    Linear(q, qb, n1.tensor(), d.q_proj.tensor());
-    Linear(q, kb, n1.tensor(), d.k_proj.tensor());
-    Linear(q, vb, n1.tensor(), d.v_proj.tensor());
+    // C2 fold: ONE MatmulBT over the merged qkv_proj [3H,H] (no bias in Gemma-4
+    // vision) + a contiguous QkvSplit into qb/kb/vb. BIT-identical to the three
+    // separate [H,H] Linears: the merged GEMM's per-output-row reduction is the
+    // same math and QkvSplit is a pure contiguous copy. The per-slice OUTPUT
+    // clamp epilogue stays below, applied to the split qb/kb/vb exactly as before.
+    models::FusedMergedQkvBiasSplit(q, qkv.tensor(), qb.tensor(), kb.tensor(),
+                                    vb.tensor(), n1.tensor(), d.qkv_proj.tensor(),
+                                    /*qkv_bias=*/nullptr);
     ClampDevice(b, q, qb, L * H, cw.q_clip.out_min, cw.q_clip.out_max);
     ClampDevice(b, q, kb, L * H, cw.k_clip.out_min, cw.k_clip.out_max);
     ClampDevice(b, q, vb, L * H, cw.v_clip.out_min, cw.v_clip.out_max);

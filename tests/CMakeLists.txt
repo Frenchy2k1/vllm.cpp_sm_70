@@ -664,6 +664,11 @@ vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 # the merged [Nq+Nk+Nv,H] owner + a contiguous QkvSplit is BYTE-IDENTICAL to three
 # separate MatmulBT (bit-exact GEMM math, wider N; RED-first). CPU-only.
 vllm_cpp_add_test(test_ops_qkv_merge vt/test_ops_qkv_merge.cpp)
+# Fold plan Tier C2: the vision-tower merged-QKV *with bias* A/B — ONE MatmulBT +
+# a fused merged-[3d] BIAS epilogue + a contiguous QkvSplit is BYTE-IDENTICAL to
+# three separate {MatmulBT + bias} (the NEW merged-bias piece vs D1; RED-first
+# wrong-bias-slice fails). Exercises models::FusedMergedQkvBiasSplit. CPU-only.
+vllm_cpp_add_test(test_ops_qkv_merged_bias vt/test_ops_qkv_merged_bias.cpp)
 # QUANT-GGUF-CIQ-GEMM G1: block dtypes, the quant traits table and its
 # cross-check against the GGUF reader's GgmlTraits, and the kMatmulBTQuant
 # skeleton's generic-composite fallback. CPU-only.
