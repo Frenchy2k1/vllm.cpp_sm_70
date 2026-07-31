@@ -16,6 +16,43 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Laguna-S-2.1 (`LagunaForCausalLM`) W6 — KV cache + incremental decode: 5.05× faster, token-identical (2026-07-31, `CLAIM-LAGUNA-W6`)
+
+W6 kills W5's O(n²) stateless full-recompute. A per-layer K/V cache
+(`LagunaKvCache`) + a single-token incremental-decode forward
+(`LagunaForwardGgufCached`) attends each new token over cached K/V instead of
+re-running the whole context every step. Same binary A/B on the real 3-shard
+`UD-Q4_K_XL` GGUF (GB10, `--gpu`, keep-quant), greedy, prompt "The capital of
+France is", 24 tokens (drop_caches, `flock`, one model resident, worker down):
+
+```
+$ laguna-gen --model Laguna-S-2.1-UD-Q4_K_XL-00001-of-00003.gguf --gpu --stateless --max-tokens 24   # W5
+    ids  22345 83 350 785 989 395 13259 330 4159 9431 377 340 4328 377 444 136 22029 9626 71 493 6396 565 7760 10291
+    prefill 1.37s | decode 76.60s | TPOT 3.33 s/tok over 23 steps   (per-step GREW 0.68s→5.08s: the O(n²) signature)
+
+$ laguna-gen --model Laguna-S-2.1-UD-Q4_K_XL-00001-of-00003.gguf --gpu --max-tokens 24                # W6 (default, KV-cache)
+    ids  22345 83 350 785 989 395 13259 330 4159 9431 377 340 4328 377 444 136 22029 9626 71 493 6396 565 7760 10291
+    prefill 1.47s | decode 15.10s | TPOT 0.66 s/tok over 23 steps   (FLAT ~0.66–0.69 s/tok, context-independent)
+```
+
+- **TOKEN-IDENTICAL GATE: PASS.** The two `generated ids` lines are BYTE-EQUAL
+  (identical md5 `754728c6…`) and both equal the recorded W5 golden — a KV cache
+  changes nothing numerically when correct. Bit-exact on the first run; no cache
+  bug. The recompute path itself is unchanged (shared `LagunaAttention`/
+  `LagunaFfnBlock` helpers; its ids still match the W5 golden after the refactor).
+- **SPEED: decode 3.33 → 0.66 s/tok = 5.05×.** Prefill unchanged (~1.4s), peak
+  resident 71.09 GiB (119 GiB pool).
+- **Mechanism:** post-QK-RMSNorm/post-RoPE K + raw V cached at f32 (RoPE/QK-norm
+  are position-only, attention is causal → the cached K/V equal what the recompute
+  recomputes). MIXED attention per-layer: 12 GLOBAL layers keep full history; 36
+  SLIDING-WINDOW-512 layers EVICT rows beyond the 512 window (gemma2/3
+  `is_sliding`) — the memory cap; the `pi-pj≥window` mask keeps correctness
+  independent of eviction (window not exceeded at 30 ctx tokens, so eviction is a
+  no-op here — the >512-ctx exercise is future).
+- **Next speed (owed, not this row):** grouped-expert GEMM + device-resident
+  decode chain (both in-tree from ds4); token-exact-vs-llama.cpp tightening.
+- See `.agents/specs/laguna-s21-w6-2026-07-31.md`.
+
 ## Laguna-S-2.1 (`LagunaForCausalLM`) W5 RUNNABLE — real keep-quant GGUF forward, coherent on GB10 (2026-07-31, `CLAIM-LAGUNA-W5`)
 
 W5 makes Laguna **RUNNABLE**: `examples/laguna-gen` loads the REAL 3-shard unsloth
