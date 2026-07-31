@@ -34,6 +34,19 @@ cheaper option (one workflow-level group keyed on `github.ref` with
 `before..sha` range of every superseded push. Reproduction entry points are
 unchanged. See the "Build and test lanes" section of [STATUS.md](STATUS.md).
 
+## DeepSeek-V4-Flash — vLLM on ONE Spark is INFEASIBLE; DwarfStar/GGUF was HW-forced (2026-07-31, `CLAIM-DSV4-VLLM-INFEASIBLE`)
+
+DeepSeek-V4-Flash has been benchmarked against `ds4` = **DwarfStar** (antirez's self-contained GGUF C engine), never vLLM. Unlike Laguna (which fit vLLM at NVFP4, 67 GiB — see below), DeepSeek **cannot run on vLLM on a single GB10 Spark at all**: every vLLM-loadable checkpoint exceeds the 119 GiB unified pool —
+
+| Checkpoint | Size | vLLM-loadable | Fits 1 Spark |
+| --- | --- | --- | --- |
+| `nvidia/DeepSeek-V4-Flash-NVFP4` | ~168 GB | yes (`modelopt_fp4`) | **no** |
+| `Intel/DeepSeek-V4-Flash-W4A16-AutoRound` | ~156 GB | yes (`auto-round`) | **no** |
+| `anemll/DeepSeek-V4-Flash-NVFP4-TP2-W4A4` | ~179 GB | yes (TP2, 2 GPUs) | **no** (built for 2) |
+| GGUF IQ2_XXS (~2-bit) | ~80 GB | **no** (GB10 build has no `gguf` quant method) | yes |
+
+The model is ~300B+ total params, so even 4-bit weights are 156-168 GB. The only quant that fits one Spark is extreme-low-bit GGUF, which vLLM can't load here. So on one Spark the ONLY feasible engines are GGUF (our engine, DwarfStar, llama.cpp) — **DwarfStar was forced by the hardware, not an off-policy shortcut** (contrast Laguna, where vLLM fit and llama.cpp-only was avoidable). The policy-correct vLLM DeepSeek comparison is OWED but requires **2× GB10 Sparks + TP2** (the anemll checkpoint, ~90 GB/GPU) over the landed NCCL intra-node TP seam — a multi-node effort, not a single-box run. DwarfStar stays a labeled secondary best-in-class-GGUF peer meanwhile.
+
 ## Laguna-S-2.1 (`LagunaForCausalLM`) FIRST real vLLM bar — vLLM NVFP4 vs our GGUF (2026-07-31, `CLAIM-LAGUNA-VLLM-NVFP4`)
 
 Until now every Laguna number was measured against **llama.cpp** (the same UD-Q4_K_XL GGUF), and even the correctness oracle was `llama-cli` (`run_oracle.sh`) — vLLM, the project's standing bar, had **never** been run on Laguna. This closes that gap.
