@@ -1,34 +1,43 @@
 // laguna-gen — a minimal greedy generation driver for the single-GB10
-// Laguna-S-2.1 keep-quant GGUF vehicle (unsloth UD-Q4_K_XL, 3 shards).
+// Laguna-S-2.1 vehicle. Two checkpoint formats, auto-detected from --model:
 //
-// Laguna's keep-quant forward (`LagunaForwardGguf`) is a STATELESS full-sequence
-// recompute (it ignores the KV cache), so greedy decode is a manual loop: feed the
-// growing token list each step, take the last-row logits, argmax, append. Mirrors
-// examples/deepseek_v4_gen. The UD-Q4_K_XL model ships as 3 shards (shard-1 =
-// header/KV only), so this opens ALL shards and passes them to the multi-shard
-// keep-quant loader (LoadLagunaFromGgufShards), which routes each tensor to the
-// shard that holds it. Expert/attention GEMMs run keep-quant on the CPU tier by
-// default (--gpu routes the block-quant GEMMs to the GB10 via kMatmulBTQuant off
-// the unified-memory mmap'd blocks — no device copy of the ~69 GiB tower).
+//   * a .gguf FILE  → keep-quant GGUF (unsloth UD-Q4_K_XL, 3 shards). Experts stay
+//     Q4_K/Q5_K blocks, borrowed in place by the mmap residency (no ~69 GiB copy).
+//   * a DIRECTORY   → NVFP4 safetensors (poolside/Laguna-S-2.1-NVFP4, W4A4). bf16
+//     attn/dense/router/shared-expert + per-expert fp4 routed experts. This is the
+//     apples-to-apple-vs-vLLM arm (N3): same tensor-core regime as vLLM's NVFP4.
 //
-//   laguna-gen --model <shard-1.gguf> [--prompt "..."] [--token-ids 1,2,3]
-//              [--max-tokens N] [--load-only] [--gpu]
+// Both formats resolve to `LagunaWeights` and run the SAME greedy loop:
+// `LagunaForwardGguf`/`...Cached` (the forward branches on the resident quant).
+// `LagunaForwardGguf` is a STATELESS full-sequence recompute; the KV-cache
+// variant (default) attends each new token over cached K/V. --gpu routes the
+// block-quant / fp4 GEMMs to the GB10 off the unified-memory blocks.
+//
+//   laguna-gen --model <shard-1.gguf | nvfp4-dir> [--prompt "..."]
+//              [--token-ids 1,2,3] [--max-tokens N] [--load-only] [--gpu]
+//              [--stateless]
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/laguna.h"
 #include "vllm/tokenizer/tokenizer.h"
+#include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"  // vt::GetBackend / CreateQueue (--gpu: GEMMs on the GB10)
 #include "vt/device.h"
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -72,6 +81,17 @@ int64_t KvInt(const vllm::GgufFile& g, const char* key, int64_t dflt) {
   }
 }
 
+// eos/eot from the HF config.json `raw` doc (scalar or first element of a list);
+// falls back to `dflt` when the key is absent or non-numeric.
+int64_t HfInt(const nlohmann::json& raw, const char* key, int64_t dflt) {
+  auto it = raw.find(key);
+  if (it == raw.end()) return dflt;
+  if (it->is_number_integer()) return it->get<int64_t>();
+  if (it->is_array() && !it->empty() && it->front().is_number_integer())
+    return it->front().get<int64_t>();
+  return dflt;
+}
+
 int ArgmaxLastRow(const std::vector<float>& logits, int64_t vocab) {
   const int64_t rows = static_cast<int64_t>(logits.size()) / vocab;
   const float* row = logits.data() + (rows - 1) * vocab;
@@ -109,6 +129,20 @@ std::vector<std::string> ShardPaths(const std::string& shard1, int64_t count) {
   return out;
 }
 
+// Enumerate a dir's *.safetensors shards, sorted (mirror model_loader.cpp LoadShards).
+std::vector<vllm::SafetensorsFile> OpenSafetensorsDir(const std::string& dir) {
+  std::vector<std::string> paths;
+  for (const auto& e : fs::directory_iterator(dir))
+    if (e.is_regular_file() && e.path().extension() == ".safetensors")
+      paths.push_back(e.path().string());
+  if (paths.empty()) throw std::runtime_error("no *.safetensors shards in " + dir);
+  std::sort(paths.begin(), paths.end());
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.reserve(paths.size());
+  for (const std::string& p : paths) shards.push_back(vllm::SafetensorsFile::Open(p));
+  return shards;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -128,66 +162,113 @@ int main(int argc, char** argv) {
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if (model.empty()) {
-    std::fprintf(stderr, "usage: --model <shard-1.gguf> [--prompt ...] "
+    std::fprintf(stderr, "usage: --model <shard-1.gguf | nvfp4-dir> [--prompt ...] "
                          "[--token-ids ...] [--max-tokens N] [--load-only] [--gpu]\n");
     return 2;
   }
 
-  // Open shard-1 (metadata) first to read the split count, then all shards.
-  std::fprintf(stderr, "[gen] opening %s\n", model.c_str());
-  vllm::GgufFile meta = vllm::GgufFile::Open(model);
-  const int64_t split_count = KvInt(meta, "split.count", 1);
-  const std::vector<std::string> paths = ShardPaths(model, split_count);
-  std::vector<vllm::GgufFile> shards;
-  shards.reserve(paths.size());
-  shards.push_back(std::move(meta));  // shard-1 stays index 0 (has the KV)
-  for (size_t s = 1; s < paths.size(); ++s) {
-    std::fprintf(stderr, "[gen] opening shard %zu: %s\n", s + 1, paths[s].c_str());
-    shards.push_back(vllm::GgufFile::Open(paths[s]));
+  // Auto-detect the checkpoint format: a directory = NVFP4 safetensors, a file = GGUF.
+  const bool is_nvfp4 = fs::is_directory(model);
+
+  vllm::LagunaWeights w;
+  int64_t eos = 2, eot = 2, bos_id = 2;
+  std::optional<vllm::tok::Tokenizer> tkz;   // built once; used for encode + decode
+  bool add_bos = false;
+
+  if (is_nvfp4) {
+    // ── NVFP4 safetensors arm (N3) ──────────────────────────────────────────
+    const std::string config_path = (fs::path(model) / "config.json").string();
+    const std::string tok_path = (fs::path(model) / "tokenizer.json").string();
+    std::fprintf(stderr, "[gen] NVFP4 safetensors dir %s\n", model.c_str());
+    const vllm::HfConfig config = vllm::LoadHfConfig(config_path);
+    std::vector<vllm::SafetensorsFile> shards = OpenSafetensorsDir(model);
+    std::fprintf(stderr, "[gen] %zu safetensors shard(s); loading NVFP4 W4A4 tower "
+                 "(RSS before %.1f GiB)...\n", shards.size(), CurResidentGiB());
+    const auto t0 = std::chrono::steady_clock::now();
+    w = vllm::LoadLagunaForCausalLMWeights(shards, config);
+    const auto t1 = std::chrono::steady_clock::now();
+    std::fprintf(stderr,
+        "[gen] LOADED: layers=%lld experts=%lld vocab=%lld has_nvfp4=%d | load %.1fs | "
+        "RSS %.1f GiB PEAK %.1f GiB\n",
+        (long long)w.params.num_hidden_layers, (long long)w.params.num_experts,
+        (long long)w.params.vocab_size, (int)w.has_nvfp4_weights,
+        std::chrono::duration<double>(t1 - t0).count(), CurResidentGiB(), PeakResidentGiB());
+    if (!w.has_nvfp4_weights) { std::fprintf(stderr, "[gen] ERROR: no NVFP4 tower\n"); return 1; }
+    eos = HfInt(config.raw, "eos_token_id", 2);
+    eot = eos;
+    if (fs::exists(tok_path)) {
+      try { tkz.emplace(vllm::tok::Tokenizer::FromHfJson(tok_path)); }
+      catch (const std::exception& e) {
+        std::fprintf(stderr, "[gen] WARN: tokenizer.json load failed (%s); "
+                     "text decode disabled, use --token-ids\n", e.what());
+      }
+    }
+  } else {
+    // ── keep-quant GGUF arm (W5/W6) ─────────────────────────────────────────
+    std::fprintf(stderr, "[gen] opening %s\n", model.c_str());
+    vllm::GgufFile meta = vllm::GgufFile::Open(model);
+    const int64_t split_count = KvInt(meta, "split.count", 1);
+    const std::vector<std::string> paths = ShardPaths(model, split_count);
+    std::vector<vllm::GgufFile> shards;
+    shards.reserve(paths.size());
+    shards.push_back(std::move(meta));  // shard-1 stays index 0 (has the KV)
+    for (size_t s = 1; s < paths.size(); ++s) {
+      std::fprintf(stderr, "[gen] opening shard %zu: %s\n", s + 1, paths[s].c_str());
+      shards.push_back(vllm::GgufFile::Open(paths[s]));
+    }
+    std::vector<const vllm::GgufFile*> shard_ptrs;
+    for (const vllm::GgufFile& s : shards) shard_ptrs.push_back(&s);
+
+    eos = KvInt(shards[0], "tokenizer.ggml.eos_token_id", 2);
+    eot = KvInt(shards[0], "tokenizer.ggml.eot_token_id", 24);
+    add_bos = KvInt(shards[0], "tokenizer.ggml.add_bos_token", 0) != 0;
+    bos_id = KvInt(shards[0], "tokenizer.ggml.bos_token_id", 2);
+
+    // KEEP-QUANT load: routed experts stay Q4_K/Q5_K blocks; mmap borrows in place.
+    vllm::GgufLoadPolicy pol;
+    pol.keep_quant = true;
+    pol.mmap_residency = true;
+    std::fprintf(stderr, "[gen] loading keep-quant tower (RSS before %.1f GiB)...\n",
+                 CurResidentGiB());
+    const auto t0 = std::chrono::steady_clock::now();
+    w = vllm::LoadLagunaFromGgufShards(shard_ptrs, &pol);
+    const auto t1 = std::chrono::steady_clock::now();
+    std::fprintf(stderr,
+        "[gen] LOADED: layers=%lld experts=%lld vocab=%lld has_gguf=%d | load %.1fs | "
+        "RSS %.1f GiB PEAK %.1f GiB\n",
+        (long long)w.params.num_hidden_layers, (long long)w.params.num_experts,
+        (long long)w.params.vocab_size, (int)w.has_gguf_weights,
+        std::chrono::duration<double>(t1 - t0).count(), CurResidentGiB(), PeakResidentGiB());
+    if (!w.has_gguf_weights) { std::fprintf(stderr, "[gen] ERROR: no keep-quant tower\n"); return 1; }
+    try { tkz.emplace(vllm::tok::Tokenizer::FromGguf(shards[0])); }
+    catch (const std::exception& e) {
+      std::fprintf(stderr, "[gen] WARN: gguf tokenizer load failed (%s)\n", e.what());
+    }
   }
-  std::vector<const vllm::GgufFile*> shard_ptrs;
-  for (const vllm::GgufFile& s : shards) shard_ptrs.push_back(&s);
 
-  const int64_t eos = KvInt(shards[0], "tokenizer.ggml.eos_token_id", 2);
-  const int64_t eot = KvInt(shards[0], "tokenizer.ggml.eot_token_id", 24);
-
-  // KEEP-QUANT load (the memory enabler): the routed experts stay Q4_K/Q5_K blocks;
-  // mmap residency borrows them in place (no ~69 GiB copy).
-  vllm::GgufLoadPolicy pol;
-  pol.keep_quant = true;
-  pol.mmap_residency = true;
-  std::fprintf(stderr, "[gen] loading keep-quant tower (RSS before %.1f GiB)...\n",
-               CurResidentGiB());
-  const auto t0 = std::chrono::steady_clock::now();
-  const vllm::LagunaWeights w = vllm::LoadLagunaFromGgufShards(shard_ptrs, &pol);
-  const auto t1 = std::chrono::steady_clock::now();
   const int64_t vocab = w.params.vocab_size;
-  std::fprintf(stderr,
-      "[gen] LOADED: layers=%lld experts=%lld vocab=%lld has_gguf=%d | load %.1fs | "
-      "RSS %.1f GiB PEAK %.1f GiB\n",
-      (long long)w.params.num_hidden_layers, (long long)w.params.num_experts,
-      (long long)vocab, (int)w.has_gguf_weights,
-      std::chrono::duration<double>(t1 - t0).count(), CurResidentGiB(),
-      PeakResidentGiB());
-  if (!w.has_gguf_weights) { std::fprintf(stderr, "[gen] ERROR: no keep-quant tower\n"); return 1; }
   if (load_only) { std::fprintf(stderr, "[gen] --load-only done.\n"); return 0; }
 
-  // Prompt -> token ids. Prefer injected ids (exact cross-check); else our encode.
+  // Prompt -> token ids. Prefer injected ids (exact cross-check vs the vLLM golden);
+  // else encode with the loaded tokenizer.
   std::vector<int32_t> tokens;
   if (!token_ids_arg.empty()) {
     tokens = ParseIds(token_ids_arg);
     std::fprintf(stderr, "[gen] using %zu injected token ids\n", tokens.size());
-  } else {
-    const vllm::tok::Tokenizer tkz = vllm::tok::Tokenizer::FromGguf(shards[0]);
-    tokens = tkz.Encode(prompt);
-    if (KvInt(shards[0], "tokenizer.ggml.add_bos_token", 0) != 0) {
-      const int64_t bos = KvInt(shards[0], "tokenizer.ggml.bos_token_id", 2);
-      tokens.insert(tokens.begin(), static_cast<int32_t>(bos));
-    }
+  } else if (tkz.has_value()) {
+    tokens = tkz->Encode(prompt);
+    // GGUF path prepends the GGUF bos when add_bos_token is set (the NVFP4
+    // tokenizer.json applies its own bos/eos via the post-processor).
+    if (add_bos && !is_nvfp4)
+      tokens.insert(tokens.begin(), static_cast<int32_t>(bos_id));
     std::fprintf(stderr, "[gen] encoded prompt (%zu ids):", tokens.size());
     for (int32_t t : tokens) std::fprintf(stderr, " %d", t);
     std::fprintf(stderr, "\n");
+  } else {
+    std::fprintf(stderr, "[gen] ERROR: no tokenizer and no --token-ids\n");
+    return 2;
   }
+  if (tokens.empty()) { std::fprintf(stderr, "[gen] ERROR: empty token list\n"); return 2; }
   const size_t n_prompt = tokens.size();
 
   vt::Backend* gpu_backend = nullptr;
@@ -195,9 +276,10 @@ int main(int argc, char** argv) {
   if (use_gpu) {
     gpu_backend = &vt::GetBackend(vt::DeviceType::kCUDA);
     q = gpu_backend->CreateQueue();
-    std::fprintf(stderr, "[gen] GPU keep-quant GEMMs on CUDA device %d\n", q.device.index);
+    std::fprintf(stderr, "[gen] GPU %s GEMMs on CUDA device %d\n",
+                 is_nvfp4 ? "NVFP4 W4A4" : "keep-quant", q.device.index);
   } else {
-    std::fprintf(stderr, "[gen] CPU keep-quant queue\n");
+    std::fprintf(stderr, "[gen] CPU %s queue\n", is_nvfp4 ? "NVFP4" : "keep-quant");
   }
 
   std::fprintf(stderr, "[gen] decode path: %s\n",
@@ -207,18 +289,10 @@ int main(int argc, char** argv) {
   double prefill_s = 0.0, decode_s = 0.0;
   vllm::LagunaKvCache kv;  // W6 path only
   for (int step = 0; step < max_tokens; ++step) {
-    // STATELESS: feed the growing context each step (positions 0..n-1), last-row
-    // logits. KV-CACHE: step 0 = prefill (all prompt tokens); steps 1.. feed ONE new
-    // token at position kv.len, local logits index 0.
     std::vector<int32_t> step_tokens, positions;
     std::vector<int32_t> logits_idx;
-    if (stateless) {
-      step_tokens = tokens;
-      positions.resize(tokens.size());
-      for (size_t i = 0; i < tokens.size(); ++i) positions[i] = static_cast<int32_t>(i);
-      logits_idx = {static_cast<int32_t>(tokens.size() - 1)};
-    } else if (step == 0) {
-      step_tokens = tokens;  // prefill the whole prompt
+    if (stateless || step == 0) {
+      step_tokens = tokens;  // stateless: whole context; step 0: prefill the prompt
       positions.resize(tokens.size());
       for (size_t i = 0; i < tokens.size(); ++i) positions[i] = static_cast<int32_t>(i);
       logits_idx = {static_cast<int32_t>(tokens.size() - 1)};
@@ -243,12 +317,14 @@ int main(int argc, char** argv) {
   }
 
   std::string text;
-  try {
-    const vllm::tok::Tokenizer tkz = vllm::tok::Tokenizer::FromGguf(shards[0]);
-    text = tkz.Decode(generated);
-  } catch (const std::exception& e) { text = std::string("<decode failed: ") + e.what() + ">"; }
+  if (tkz.has_value()) {
+    try { text = tkz->Decode(generated); }
+    catch (const std::exception& e) { text = std::string("<decode failed: ") + e.what() + ">"; }
+  } else {
+    text = "<no tokenizer; ids only>";
+  }
 
-  std::printf("\n===== LAGUNA-S-2.1 GENERATION =====\n");
+  std::printf("\n===== LAGUNA-S-2.1 GENERATION (%s) =====\n", is_nvfp4 ? "NVFP4" : "GGUF");
   std::printf("prompt: %s\n", prompt.c_str());
   std::printf("generated ids:");
   for (int32_t t : generated) std::printf(" %d", t);
