@@ -27,9 +27,13 @@
 #include <variant>
 #include <vector>
 
+#include <memory>
+
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/model_loader/safetensors_reader.h"  // SafetensorsFile, StTensor
+#include "vllm/model_executor/models/dense_weight_loaders.h"      // dense_loaders::LoadBf16Direct/MakeOwned
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
 #include "vt/dtype.h"
 
@@ -237,20 +241,133 @@ std::string LagunaGgufMoeName(int64_t layer, const char* which) {
 // GGUF ne-order is [in, out] (reverse of torch [out, in]); OwnGgufQuantBlocks +
 // vt::MatmulBT consume the on-disk [N,K] block layout with no transpose.
 
+namespace {
+
+// F32 scalar read (weight/input global scales are F32 scalars).
+float LnReadF32Scalar(const StTensor& t) {
+  VT_CHECK(t.dtype == "F32" && t.nbytes >= 4, "laguna nvfp4: F32 scalar expected");
+  float v;
+  std::memcpy(&v, t.data, 4);
+  return v;
+}
+
+// F32 tensor copied verbatim (the e_score_correction_bias is F32 [E] on disk).
+OwnedTensor LnLoadF32Direct(const TensorResolver& get, const std::string& name) {
+  const StTensor& t = get(name);
+  VT_CHECK(t.dtype == "F32", "laguna nvfp4: F32 expected for " + name);
+  OwnedTensor o = dense_loaders::MakeOwned(vt::DType::kF32, t.shape);
+  VT_CHECK(t.nbytes == o.bytes.size(), "laguna nvfp4: F32 size mismatch " + name);
+  std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  return o;
+}
+
+// W4A4 NVFP4 routed-expert loader. Byte-identical to qwen3_5_dense_weights.cpp
+// LoadCtNvfp4Raw (weight_packed U8 [N,K/2] + weight_scale F8_E4M3 [N,K/16] +
+// weight_global_scale/input_global_scale F32 scalars); duplicated here to avoid
+// touching the SACRED-gated qwen3_5 dense TU — TODO(S4): promote LoadCtNvfp4Raw
+// to dense_weight_loaders.h and share (see laguna-nvfp4-arm spec §N1b).
+Nvfp4Weight LnLoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
+  const StTensor& packed = get(proj + ".weight_packed");
+  VT_CHECK(packed.dtype == "U8" && packed.shape.size() == 2,
+           "laguna nvfp4: U8 2-D weight_packed for " + proj);
+  const int64_t out_dim = packed.shape[0];
+  const int64_t in_dim = packed.shape[1] * 2;
+  VT_CHECK(in_dim % 16 == 0, "laguna nvfp4: in_dim must be %16 for " + proj);
+  const StTensor& ws = get(proj + ".weight_scale");
+  VT_CHECK(ws.dtype == "F8_E4M3", "laguna nvfp4: F8_E4M3 weight_scale for " + proj);
+  const float wgs = LnReadF32Scalar(get(proj + ".weight_global_scale"));
+  VT_CHECK(wgs != 0.0F, "laguna nvfp4: zero weight_global_scale for " + proj);
+  Nvfp4Weight r;
+  r.n = out_dim;
+  r.k = in_dim;
+  r.weight_global_scale_inv = wgs;
+  r.scale2 = 1.0F / wgs;
+  const float igs = LnReadF32Scalar(get(proj + ".input_global_scale"));
+  VT_CHECK(igs != 0.0F, "laguna nvfp4: zero input_global_scale for " + proj);
+  r.input_global_scale_inv = igs;
+  r.alpha = r.scale2 * (1.0F / igs);
+  r.packed = dense_loaders::MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+  VT_CHECK(packed.nbytes == r.packed.bytes.size(), "laguna nvfp4: packed size " + proj);
+  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+  r.scale = dense_loaders::MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+  VT_CHECK(ws.nbytes == r.scale.bytes.size(), "laguna nvfp4: scale size " + proj);
+  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+  return r;
+}
+
+}  // namespace
+
+// N1b (task #230, spec laguna-nvfp4-arm-2026-07-31.md): the real safetensors
+// NVFP4 loader for poolside/Laguna-S-2.1-NVFP4. Recipe VERIFIED against the
+// checkpoint index: bf16 attn/dense/norms/embed/lm_head/router/shared-expert,
+// F32 e_score_correction_bias, W4A4-NVFP4 routed experts. ~67 GiB, fits one
+// GB10. The dual-RoPE caches are built lazily in the forward (as the GGUF path
+// does), so this fills params + weights only.
 LagunaWeights LoadLagunaForCausalLMWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
-  (void)shards;
+  using dense_loaders::LoadBf16Direct;
   LagunaWeights w;
   w.params = ParseLagunaParams(config);
-  // TODO(W3): materialize the BF16 towers + build the dual RoPE caches
-  //   (BuildOlmo3YarnCache for full-attn YaRN-64; plain get_rope for sliding-128).
-  //   Safetensors BF16 is 235 GiB — MEMORY-INFEASIBLE on one GB10; this path is
-  //   for the NVFP4 behavior oracle + structural completeness only.
-  VT_CHECK(false,
-           "laguna: safetensors weight materialization is a W3 residual "
-           "(structural bring-up + name-map only this increment). The GGUF "
-           "UD-Q4_K_XL keep-quant path (LoadLagunaFromGguf) is the single-GB10 "
-           "vehicle. See .agents/specs/laguna-s21-w1w2-2026-07-30.md.");
+  const LagunaParams& p = w.params;
+
+  // name -> shard resolver (mirrors qwen3_5_weights.cpp:423).
+  auto where =
+      std::make_shared<std::unordered_map<std::string, const SafetensorsFile*>>();
+  for (const SafetensorsFile& s : shards)
+    for (const std::string& n : s.Names()) (*where)[n] = &s;
+  const TensorResolver get =
+      [where](const std::string& name) -> const StTensor& {
+    auto it = where->find(name);
+    VT_CHECK(it != where->end(), "laguna nvfp4: tensor not found: " + name);
+    return it->second->Get(name);
+  };
+
+  // model level (all BF16; untied lm_head).
+  w.embed = LoadBf16Direct(get, "model.embed_tokens.weight");
+  w.norm = LoadBf16Direct(get, "model.norm.weight");
+  w.lm_head = LoadBf16Direct(get, "lm_head.weight");
+
+  w.layers.resize(static_cast<size_t>(p.num_hidden_layers));
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    LagunaLayerWeights& lw = w.layers[static_cast<size_t>(l)];
+    lw.is_dense = p.IsDenseLayer(l);
+    const std::string b = "model.layers." + std::to_string(l) + ".";
+
+    lw.input_norm = LoadBf16Direct(get, b + "input_layernorm.weight");
+    lw.post_attn_norm = LoadBf16Direct(get, b + "post_attention_layernorm.weight");
+    lw.attn.q_proj = LoadBf16Direct(get, b + "self_attn.q_proj.weight");
+    lw.attn.k_proj = LoadBf16Direct(get, b + "self_attn.k_proj.weight");
+    lw.attn.v_proj = LoadBf16Direct(get, b + "self_attn.v_proj.weight");
+    lw.attn.o_proj = LoadBf16Direct(get, b + "self_attn.o_proj.weight");
+    lw.attn.g_proj = LoadBf16Direct(get, b + "self_attn.g_proj.weight");
+    lw.attn.q_norm = LoadBf16Direct(get, b + "self_attn.q_norm.weight");
+    lw.attn.k_norm = LoadBf16Direct(get, b + "self_attn.k_norm.weight");
+
+    if (lw.is_dense) {  // layer 0 (mlp_only_layers = {0})
+      lw.mlp.gate_proj = LoadBf16Direct(get, b + "mlp.gate_proj.weight");
+      lw.mlp.up_proj = LoadBf16Direct(get, b + "mlp.up_proj.weight");
+      lw.mlp.down_proj = LoadBf16Direct(get, b + "mlp.down_proj.weight");
+    } else {  // MoE layers 1..47
+      lw.moe.router = LoadBf16Direct(get, b + "mlp.gate.weight");  // BF16 [E,H]
+      lw.moe.e_score_correction_bias =
+          LnLoadF32Direct(get, b + "mlp.experts.e_score_correction_bias");  // F32 [E]
+      const std::string ex = b + "mlp.experts.";
+      lw.moe.experts_gate_fp4.reserve(static_cast<size_t>(p.num_experts));
+      lw.moe.experts_up_fp4.reserve(static_cast<size_t>(p.num_experts));
+      lw.moe.experts_down_fp4.reserve(static_cast<size_t>(p.num_experts));
+      for (int64_t e = 0; e < p.num_experts; ++e) {
+        const std::string ep = ex + std::to_string(e) + ".";
+        lw.moe.experts_gate_fp4.push_back(LnLoadCtNvfp4Raw(get, ep + "gate_proj"));
+        lw.moe.experts_up_fp4.push_back(LnLoadCtNvfp4Raw(get, ep + "up_proj"));
+        lw.moe.experts_down_fp4.push_back(LnLoadCtNvfp4Raw(get, ep + "down_proj"));
+      }
+      lw.moe.shared_gate = LoadBf16Direct(get, b + "mlp.shared_expert.gate_proj.weight");
+      lw.moe.shared_up = LoadBf16Direct(get, b + "mlp.shared_expert.up_proj.weight");
+      lw.moe.shared_down = LoadBf16Direct(get, b + "mlp.shared_expert.down_proj.weight");
+    }
+  }
+  w.accounted_tensors = static_cast<int64_t>(where->size());
+  w.has_gguf_weights = false;  // safetensors NVFP4 arm, not the GGUF keep-quant tower
   return w;
 }
 
