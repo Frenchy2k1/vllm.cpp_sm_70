@@ -1177,6 +1177,21 @@ tier's equivalent is `compute-sanitizer`, and `VT_POOL_BYPASS=1` makes the devic
 scratch pool hand out exact-size, really-freed allocations so that tool can see
 tensor boundaries and use-after-free the caching pool otherwise hides.
 
+CI concurrency is split by GATE SCOPE, not applied workflow-wide. The two
+DIFF-scoped gates, `documentation-checkpoint` and `commit-protocol-tag`,
+evaluate `github.event.before..github.sha`, so each owns a commit range that no
+later run re-covers (the next run's `before` is this run's `sha`). They
+deliberately carry no concurrency group and are never cancelled. The six
+TREE-scoped jobs (`agent-record`, `cuda-arch-features`, `device-leakage`,
+`build-test-cpu`, and both `sanitize-cpu` lanes) validate HEAD, so only the
+newest push to a ref is meaningful; each carries a per-job group keyed on
+`github.ref` with `cancel-in-progress`. Net effect: a superseded push to `main`
+keeps its 2 per-commit gates and drops the other 6 jobs. The `sanitize-cpu`
+group includes `matrix.lane`, without which the two mutually exclusive
+sanitizer legs of the SAME run would share a group and cancel each other. At
+the workflow level the group is keyed on the SHA for a push, so two pushes to
+`main` never share a group; only pull-request pushes are deduplicated there.
+
 Known failing on discrete sm_120 (RTX 5070 Ti), pre-existing and not introduced
 by the lanes: `test_cuda_ops` "CUDA matmul (cuBLASLt) matches CPU on odd sizes"
 fails 11 of 442 elements on the bf16-in/bf16-out 17x31x13 case. Verified present

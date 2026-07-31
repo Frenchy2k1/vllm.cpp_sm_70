@@ -16,6 +16,24 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## CI concurrency split by gate scope (2026-07-31) - NOT-APPLICABLE (CI orchestration only, no throughput owed)
+
+No engine code, no kernel, no config path: `.github/workflows/ci.yml` gained a
+workflow-level concurrency group that deduplicates pull-request pushes only,
+plus per-job groups on the six tree-scoped jobs, so a superseded push to `main`
+drops those and keeps only its two diff-scoped per-commit gates
+(`documentation-checkpoint`, `commit-protocol-tag`). This owes no benchmark: no
+number in this document is produced by or affected by the CI lanes, and every
+lane still runs to completion on the newest commit of a ref. The motivation was
+queue saturation, ten pushes to `main` in one morning left 80 jobs queued
+against an account-level hosted-runner ceiling shared with the LocalAI repo, at
+a measured 1 to 3 concurrent jobs. The scope split recovers that throughput
+without exempting any commit from the two per-commit gates, which is why the
+cheaper option (one workflow-level group keyed on `github.ref` with
+`cancel-in-progress`) was rejected: it would have silently skipped the
+`before..sha` range of every superseded push. Reproduction entry points are
+unchanged. See the "Build and test lanes" section of [STATUS.md](STATUS.md).
+
 ## Laguna-S-2.1 (`LagunaForCausalLM`) W7 decode-speed ATTRIBUTION (profile-only): where the 18x to llama.cpp goes (2026-07-31, `CLAIM-LAGUNA-W7-SPEED`)
 
 Research-only `nsys` profile of the W6 decode (`laguna-gen --gpu`, real 3-shard UD-Q4_K_XL, GB10,

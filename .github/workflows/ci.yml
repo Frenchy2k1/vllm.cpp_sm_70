@@ -3,8 +3,28 @@ on:
   push:
     branches: [main]
   pull_request:
+
+# Workflow-level: dedupe PR pushes only. The group is keyed on the SHA for a
+# push, so two pushes to main never share a group and never cancel each other.
+# That is deliberate: `documentation-checkpoint` and `commit-protocol-tag` below
+# are DIFF-scoped over `github.event.before..github.sha`, so a cancelled main run
+# leaves its own commit range permanently unvalidated (no later run re-covers it,
+# because the next run's `before` is this run's `sha`).
+#
+# The expensive TREE-scoped jobs carry their own job-level group instead, which
+# does collapse superseded main pushes. Net effect: a superseded push to main
+# keeps only its 2 per-commit gates and drops the other 6 jobs.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}-${{ github.repository }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   agent-record:
+    # Tree-scoped: validates the record as it stands at HEAD, so only the newest
+    # push to a ref is meaningful. Cancellable.
+    concurrency:
+      group: ci-agent-record-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +54,10 @@ jobs:
   documentation-checkpoint:
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.
+    #
+    # DIFF-scoped: deliberately carries NO concurrency group. Its verdict covers
+    # this push's own `before..sha` range and nothing re-covers that range later,
+    # so cancelling it would silently exempt those commits from the gate.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +83,10 @@ jobs:
   commit-protocol-tag:
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.
+    #
+    # DIFF-scoped: deliberately carries NO concurrency group, same reasoning as
+    # documentation-checkpoint above. It walks `before..sha` per push, so a
+    # cancelled run means those commits are never checked for the trailer.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,6 +133,11 @@ jobs:
     # so the resolution that decides which architectures get fp4-mma /
     # cutlass-nvfp4 / cutlass-fp8 / marlin-nvfp4 / fa2 (whose historical failure
     # mode was a SILENT capability drop) is checked on every push.
+    #
+    # Tree-scoped (drives cmake at HEAD): cancellable.
+    concurrency:
+      group: ci-cuda-arch-features-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +158,12 @@ jobs:
     # Needs neither a CUDA toolkit nor a GPU — pure static analysis, like the
     # cuda-arch-features job above. The mutation suite proves the checker actually
     # catches a planted leak; an unpoliced checker is worse than none.
+    #
+    # Tree-scoped: the ratchet compares HEAD against the committed baseline, so
+    # only the newest push matters. Cancellable.
+    concurrency:
+      group: ci-device-leakage-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -133,6 +172,10 @@ jobs:
           python3 scripts/check-device-leakage.py --report
           python3 tests/scripts/test_device_leakage.py
   build-test-cpu:
+    # Tree-scoped and the most expensive lane in the workflow. Cancellable.
+    concurrency:
+      group: ci-build-test-cpu-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -164,6 +207,12 @@ jobs:
       matrix:
         lane: ["address,undefined", "thread"]
     continue-on-error: true
+    # Tree-scoped: cancellable. `matrix.lane` MUST be part of the group key, or
+    # the two mutually-exclusive sanitizer legs of the SAME run would land in one
+    # group and cancel each other, leaving only whichever started second.
+    concurrency:
+      group: ci-sanitize-cpu-${{ matrix.lane }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
