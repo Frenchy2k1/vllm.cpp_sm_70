@@ -2024,3 +2024,5 @@ The gate models' W4A4 decode is at the achievable roofline. See `.agents/specs/n
 **Laguna W9 grouped-expert MoE LANDED + GATED (2026-07-31).** The 30 un-grouped per-expert GEMV launches/step fold onto the shared `vt::MatmulBTQuantGrouped` (3×top_k → 3 launches/token, no loader change). Same-binary A/B on real UD-Q4_K_XL (GB10, `--gpu`): grouped==per-expert BYTE-IDENTICAL (md5 `754728c6`, == W6 golden) + decode **0.18 → 0.13 s/tok (1.38×)**. Cumulative with W8: **0.66 → 0.13 s/tok (5.1×, 1.5 → 7.7 tok/s)**. See spec §W9.
 
 _(Laguna W8+W9 decode-speed campaign handoff recorded in `.agents/state.md`; cumulative 0.66 → 0.13 s/tok, next lever #1 device-resident decode.)_
+
+_(Laguna W10 re-profile: current 0.13 s/tok decode is 89.7% host-sync (14,034 `cudaStreamSynchronize`/24tok ≈ 610/step); lever #1 device-resident decode confirmed top. See spec §W10.)_
