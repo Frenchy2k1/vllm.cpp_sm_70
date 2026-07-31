@@ -173,7 +173,11 @@ TEST_CASE("laguna scaffold: config DESCENDS (arch + nested dual-rope + variable 
   CHECK(p.rope_theta_full == doctest::Approx(500000.0));
   CHECK(p.yarn_factor == doctest::Approx(128.0));
   CHECK(p.yarn_orig_max_pos == 8192);
-  CHECK(p.yarn_attention_factor == doctest::Approx(1.4852030263919618));
+  // yarn_attn_factor backed out of HF's attention_factor: for factor 128 the raw
+  // is 1.0 and the effective llama.cpp mscale reproduces 1.4852.
+  CHECK(p.yarn_attn_factor == doctest::Approx(1.0));
+  CHECK(vllm::LagunaYarnMscale(p.yarn_factor, p.yarn_attn_factor) ==
+        doctest::Approx(1.4852030263919618));
   CHECK(p.rotary_dim_full == 64);
   CHECK(p.rope_theta_sliding == doctest::Approx(10000.0));
   CHECK(p.rotary_dim_sliding == 128);
@@ -304,7 +308,8 @@ TEST_CASE("laguna op (c): dual per-layer RoPE cos/sin caches bit-match a hand re
       static_cast<int64_t>(p.yarn_beta_slow), false);
   const int64_t rdf = p.rotary_dim_full;
   const int64_t halff = rdf / 2;
-  const float m = static_cast<float>(p.yarn_attention_factor);
+  const float m =
+      static_cast<float>(vllm::LagunaYarnMscale(p.yarn_factor, p.yarn_attn_factor));
   for (int64_t r : {1, 2})
     for (int64_t i : {0, 5, 31}) {
       const float freq = static_cast<float>(r) * inv[static_cast<size_t>(i)];
@@ -368,7 +373,7 @@ vllm::LagunaWeights TinyModel() {
   p.yarn_orig_max_pos = 8192;
   p.yarn_beta_fast = 32.0;
   p.yarn_beta_slow = 1.0;
-  p.yarn_attention_factor = 1.4852030263919618;
+  p.yarn_attn_factor = 1.0;  // llama.cpp mscale = 1*(1+0.1*ln(128)) = 1.4852
   p.partial_rotary_factor_full = 0.5;
   p.rotary_dim_full = 2;      // head_dim(4) * 0.5
   p.rope_theta_sliding = 10000.0;
@@ -394,17 +399,22 @@ vllm::LagunaWeights TinyModel() {
     lw.attn.v_proj = F32(Rand(Hkv * Dh * H, s), {Hkv * Dh, H});
     lw.attn.o_proj = F32(Rand(H * Hq * Dh, s), {H, Hq * Dh});
     lw.attn.g_proj = F32(Rand(Hq * H, s), {Hq, H});
+    lw.attn.q_norm = F32(Rand(Dh, s), {Dh});  // per-head QK-RMSNorm (VERIFIED W4)
+    lw.attn.k_norm = F32(Rand(Dh, s), {Dh});
     if (l == 0) {
       lw.is_dense = true;
-      lw.mlp.gate_up_proj = F32(Rand(2 * I * H, s), {2 * I, H});
+      lw.mlp.gate_proj = F32(Rand(I * H, s), {I, H});
+      lw.mlp.up_proj = F32(Rand(I * H, s), {I, H});
       lw.mlp.down_proj = F32(Rand(H * I, s), {H, I});
     } else {
       lw.is_dense = false;
       lw.moe.router = F32(Rand(E * H, s), {E, H});
       lw.moe.e_score_correction_bias = F32(Rand(E, s), {E});
-      lw.moe.experts_gate_up = F32(Rand(E * 2 * moeI * H, s), {E, 2 * moeI, H});
+      lw.moe.experts_gate = F32(Rand(E * moeI * H, s), {E, moeI, H});
+      lw.moe.experts_up = F32(Rand(E * moeI * H, s), {E, moeI, H});
       lw.moe.experts_down = F32(Rand(E * H * moeI, s), {E, H, moeI});
-      lw.moe.shared_gate_up = F32(Rand(2 * moeI * H, s), {2 * moeI, H});
+      lw.moe.shared_gate = F32(Rand(moeI * H, s), {moeI, H});
+      lw.moe.shared_up = F32(Rand(moeI * H, s), {moeI, H});
       lw.moe.shared_down = F32(Rand(H * moeI, s), {H, moeI});
     }
     w.layers.push_back(std::move(lw));

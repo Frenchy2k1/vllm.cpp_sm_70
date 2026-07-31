@@ -129,6 +129,15 @@ struct LagunaParams {
   // g_proj: [num_heads_of_layer, hidden]. NEW small op (Softplusf exists).
   bool per_head_output_gate = true;  // config `gating == "per-head"`
 
+  // --- per-head QK-RMSNorm (VERIFIED W4 from the real GGUF) ---------------------
+  // The GGUF ships `blk.N.attn_q_norm.weight` / `attn_k_norm.weight`, both F32
+  // [head_dim] — Laguna applies an RMSNorm to EACH head's q and k vector before
+  // RoPE (the Qwen3/OLMo-2 QK-norm pattern). The W1-W3 scope MISSED this (there is
+  // no `qk_layernorm` flag in config.json; it surfaced only in the GGUF tensor
+  // map), so the W3 forward omitted it. VERIFIED 2026-07-31 by dumping the GGUF
+  // tensor-info headers (blk.*.attn_q_norm/attn_k_norm F32 [128]).
+  bool has_qk_norm = true;
+
   // --- MoE (layers 1..47; layer 0 is dense, mlp_only_layers=[0]) ---
   int64_t num_experts = 0;             // 256
   int64_t num_experts_per_tok = 0;     // 10 (top-10)
@@ -154,11 +163,20 @@ struct LagunaParams {
   //   beta_fast 32 / beta_slow 1, attention_factor(mscale) 1.4852030263919618,
   //   partial_rotary_factor 0.5 -> rotary_dim 64 of 128.
   double rope_theta_full = 500000.0;
-  double yarn_factor = 128.0;
+  // YaRN `factor` = ctx_len / orig_ctx. The unsloth UD-Q4_K GGUF is built for a
+  // 262144 context (factor 32 = 262144/8192), NOT the HF config.json 1M context
+  // (factor 128). For the same-quant token-exact gate vs llama.cpp on THIS GGUF,
+  // the GGUF value (32) is authoritative — VERIFIED W4 from laguna.rope.scaling.*.
+  double yarn_factor = 32.0;
   int64_t yarn_orig_max_pos = 8192;
   double yarn_beta_fast = 32.0;
   double yarn_beta_slow = 1.0;
-  double yarn_attention_factor = 1.4852030263919618;
+  // llama.cpp `yarn_attn_factor` (default 1.0). The FULL mscale llama.cpp applies is
+  //   mscale = yarn_attn_factor * (1 + 0.1*ln(factor))     [rope_yarn, ext_factor!=0]
+  // which reproduces HF's precomputed `attention_factor` too (factor 128 -> 1.48520,
+  // factor 32 -> 1.34657). See LagunaYarnMscale. VERIFIED W4 (laguna.rope.scaling.
+  // yarn_attn_factor = 1.0).
+  double yarn_attn_factor = 1.0;
   double partial_rotary_factor_full = 0.5;  // rotary_dim_full = 64
   int64_t rotary_dim_full = 64;
   // sliding_attention: plain RoPE — theta 10000, full 128-dim rotary.
@@ -177,31 +195,40 @@ void ParseLagunaConfig(const HfConfig& config);
 // (num_heads_of_layer * head_dim); k/v are fixed (num_key_value_heads * head_dim).
 // g_proj is the per-head softplus output gate (num_heads_of_layer, hidden).
 struct LagunaAttnWeights {
-  OwnedTensor q_proj;   // raw-NK [num_heads_l*Dh, H]
-  OwnedTensor k_proj;   // raw-NK [Hkv*Dh, H]
-  OwnedTensor v_proj;   // raw-NK [Hkv*Dh, H]
-  OwnedTensor o_proj;   // raw-NK [H, num_heads_l*Dh]
-  OwnedTensor g_proj;   // raw-NK [num_heads_l, H]  (per-head softplus out-gate) — NEW
+  OwnedTensor q_proj;   // raw-NK [num_heads_l*Dh, H]   (GGUF blk.N.attn_q)
+  OwnedTensor k_proj;   // raw-NK [Hkv*Dh, H]           (GGUF blk.N.attn_k)
+  OwnedTensor v_proj;   // raw-NK [Hkv*Dh, H]           (GGUF blk.N.attn_v)
+  OwnedTensor o_proj;   // raw-NK [H, num_heads_l*Dh]   (GGUF blk.N.attn_output)
+  OwnedTensor g_proj;   // raw-NK [num_heads_l, H]  (per-head softplus out-gate; GGUF attn_gate)
+  OwnedTensor q_norm;   // f32 [head_dim]  per-head QK-RMSNorm (GGUF blk.N.attn_q_norm) — VERIFIED W4
+  OwnedTensor k_norm;   // f32 [head_dim]  per-head QK-RMSNorm (GGUF blk.N.attn_k_norm) — VERIFIED W4
 };
 
-// Laguna dense SwiGLU MLP (layer 0 only). Merged gate_up -> SiluAndMul -> down.
+// Laguna dense SwiGLU MLP (layer 0 only). silu(gate)*up -> down (separate tensors).
 struct LagunaMlpWeights {
-  OwnedTensor gate_up_proj;  // raw-NK [2*I, H]
-  OwnedTensor down_proj;     // raw-NK [H, I]
+  // GGUF ships SEPARATE dense FFN tensors (blk.0.ffn_gate/up/down.weight); the
+  // W1-W3 scaffold assumed a merged gate_up — corrected to the real name-map (W4).
+  OwnedTensor gate_proj;  // raw-NK [I, H]  (ffn_gate)
+  OwnedTensor up_proj;    // raw-NK [I, H]  (ffn_up)
+  OwnedTensor down_proj;  // raw-NK [H, I]  (ffn_down)
 };
 
 // Laguna MoE block (layers 1..47): sigmoid noaux_tc router (+ e_score_correction_
 // bias) UNGROUPED top-10 of 256 + 1 shared expert, routed_scaling 2.5 on output.
 struct LagunaMoeWeights {
-  OwnedTensor router;                 // raw-NK [num_experts, H]
-  OwnedTensor e_score_correction_bias;  // f32 [num_experts]
-  // 256 routed experts (grouped operands) + 1 shared expert. The keep-quant
-  // blocks stay COMPRESSED for the GGUF path (ds4 pattern); materialization is a
-  // named W2b/W3 residual.
-  OwnedTensor experts_gate_up;  // grouped [E, 2*moe_I, H]
-  OwnedTensor experts_down;     // grouped [E, H, moe_I]
-  OwnedTensor shared_gate_up;   // [2*moe_I, H]
-  OwnedTensor shared_down;      // [H, moe_I]
+  OwnedTensor router;                 // raw-NK [num_experts, H]  (GGUF ffn_gate_inp, F32)
+  OwnedTensor e_score_correction_bias;  // f32 [num_experts]      (GGUF exp_probs_b.bias)
+  // 256 routed experts + 1 shared expert. The GGUF ships SEPARATE gate/up tensors
+  // (VERIFIED W4: ffn_gate_exps Q4_K [E,moe_I,H] + ffn_up_exps Q4_K + ffn_down_exps
+  // Q5_K); the W1-W3 scaffold assumed a MERGED gate_up — corrected here. The
+  // keep-quant expert slabs stay COMPRESSED for the GGUF path (ds4 kStackedExpert),
+  // consumed per-selected-expert via a row-slice keep-quant GEMM.
+  OwnedTensor experts_gate;   // grouped [E, moe_I, H]  (ffn_gate_exps, Q4_K)
+  OwnedTensor experts_up;     // grouped [E, moe_I, H]  (ffn_up_exps,   Q4_K)
+  OwnedTensor experts_down;   // grouped [E, H, moe_I]  (ffn_down_exps, Q5_K)
+  OwnedTensor shared_gate;    // [moe_I, H]  (ffn_gate_shexp, Q8_0)
+  OwnedTensor shared_up;      // [moe_I, H]  (ffn_up_shexp,   Q8_0)
+  OwnedTensor shared_down;    // [H, moe_I]  (ffn_down_shexp, Q8_0)
 };
 
 // One Laguna decoder layer.

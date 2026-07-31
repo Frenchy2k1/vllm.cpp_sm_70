@@ -115,18 +115,32 @@ std::vector<float> FillCosSin(const std::vector<float>& inv_freq,
 }
 }  // namespace
 
+double LagunaYarnMscale(double factor, double yarn_attn_factor) {
+  // llama.cpp ggml `rope_yarn` (ext_factor != 0 arm): mscale = attn_factor *
+  // (1 + 0.1*ln(1/freq_scale)), freq_scale = 1/factor. This reproduces HF's
+  // precomputed `attention_factor` (factor 128 -> 1.48520) AND the GGUF's
+  // yarn_attn_factor=1.0 + factor 32 -> 1.34657. For the same-quant gate vs
+  // llama.cpp on the UD-Q4_K GGUF we compute it llama.cpp's way (from `factor`),
+  // NOT from the HF-precomputed 1M-context scalar.
+  if (factor <= 1.0) return yarn_attn_factor;
+  return yarn_attn_factor * (1.0 + 0.1 * std::log(factor));
+}
+
 std::vector<float> BuildLagunaFullYarnCosSin(const LagunaParams& p, int64_t rows) {
   VT_CHECK(p.rotary_dim_full > 0 && p.rotary_dim_full % 2 == 0,
            "laguna rope: rotary_dim_full must be positive/even");
   // REUSE the pinned YaRN inv_freq (linear-ramp interp/extrap blend) — the exact
-  // numerics gated by test_rotary_embedding. Laguna supplies attention_factor
-  // explicitly, so mscale = yarn_attention_factor (no yarn_get_mscale multiply).
+  // numerics gated by test_rotary_embedding. NOTE (numerics-delicate residual): the
+  // llama.cpp `rope_yarn_corr_dims` ramp uses the SAME beta_fast/slow correction
+  // range as our compute_yarn_inv_freq; a byte-for-byte cos/sin match on the real
+  // config rows is verified against llama.cpp on the GGUF (W4 gate). mscale follows
+  // llama.cpp's formula (LagunaYarnMscale), not the HF 1M-ctx precomputed scalar.
   const std::vector<float> inv_freq = rotary_embedding_detail::compute_yarn_inv_freq(
       p.rotary_dim_full, p.rope_theta_full, p.yarn_orig_max_pos, p.yarn_factor,
       /*extrapolation_factor=*/1.0, static_cast<int64_t>(p.yarn_beta_fast),
       static_cast<int64_t>(p.yarn_beta_slow), /*truncate=*/false);
   return FillCosSin(inv_freq, p.rotary_dim_full, rows,
-                    static_cast<float>(p.yarn_attention_factor));
+                    static_cast<float>(LagunaYarnMscale(p.yarn_factor, p.yarn_attn_factor)));
 }
 
 std::vector<float> BuildLagunaSlidingCosSin(const LagunaParams& p, int64_t rows) {

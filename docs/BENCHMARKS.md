@@ -16,6 +16,23 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 House style: honest measured numbers only, and no em-dashes (use commas,
 periods, parentheses, or hyphens), matching the README.
 
+## Laguna-S-2.1 (`LagunaForCausalLM`) W4 checkpoint-fetch + fidelity corrections (2026-07-31, `CLAIM-LAGUNA-W4`) - no throughput owed yet (real-model greedy gate is the W5 close)
+
+W4 FETCHED the unsloth `UD-Q4_K_XL` GGUF (73.4 GiB, 3 shards) to the DGX and read
+its metadata + full tensor map AUTHORITATIVELY (814 tensors, split.count=3, arch
+`laguna`). This surfaced three fidelity corrections to the W1-W3 scaffold, each
+grounded in the real GGUF + llama.cpp (NOT config.json): per-head QK-RMSNorm
+(`attn_q_norm`/`attn_k_norm`, missing from the scope), the GGUF-authoritative
+dual-RoPE mscale (`yarn_attn_factor·(1+0.1·ln(factor))`, factor 32/256K-ctx not HF
+128/1M), and SEPARATE `ffn_gate_exps`/`ffn_up_exps` (Q4_K) + `ffn_down_exps`
+(Q5_K) + Q8_0 attn/shared. Per-tensor quant mix VERIFIED: attn q/k/v/o/gate Q8_0,
+experts gate/up Q4_K + down Q5_K, shared Q8_0, router/bias/norms F32. No
+throughput is owed — the keep-quant tower materialization (`Mw`/`Sew` mirror of
+ds4) + host-orchestrated `ForwardGguf` (vt::MatmulBT / GemmRowSlice) + the
+real-model greedy run vs the llama.cpp-laguna same-quant oracle remain the W5
+close (73 GB single-GB10, host-orchestrated; no vLLM-GGUF path for this arch).
+See `.agents/specs/laguna-s21-w4-2026-07-31.md`.
+
 ## Laguna-S-2.1 (`LagunaForCausalLM`) W3 real forward + 3 new ops (2026-07-31, `CLAIM-LAGUNA-W3`) - no throughput owed yet (gate PENDING W4)
 
 ## bf16 grouped-MoE gate+up+SwiGLU fold — Tier-A4 (Qwen3-Coder + DeepSeek-V2, 2026-07-31, `CLAIM-A4-BF16-MOE-FOLD`) - CONSISTENCY/LAUNCH-COUNT fold, bit-exact, correctness-gated (no new throughput ratio owed)

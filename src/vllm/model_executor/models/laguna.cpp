@@ -97,18 +97,28 @@ std::vector<float> RmsNorm(const std::vector<float>& x, const std::vector<float>
   return out;
 }
 
+// Per-head RMSNorm over the head_dim axis (Laguna QK-norm, VERIFIED W4): x is
+// [T, heads, Dh] flattened; each length-Dh head vector is RMS-normed with the
+// shared weight w[Dh]. Variance in f32 (Qwen3/OLMo-2 qk_layernorm semantics).
+void RmsNormHeads(std::vector<float>& x, const std::vector<float>& w, int64_t T,
+                  int64_t heads, int64_t Dh, float eps) {
+  for (int64_t r = 0; r < T * heads; ++r) {
+    float* v = x.data() + static_cast<size_t>(r * Dh);
+    float ss = 0.0F;
+    for (int64_t d = 0; d < Dh; ++d) ss += v[d] * v[d];
+    const float inv = 1.0F / std::sqrt(ss / static_cast<float>(Dh) + eps);
+    for (int64_t d = 0; d < Dh; ++d) v[d] = v[d] * inv * w[static_cast<size_t>(d)];
+  }
+}
+
 inline float Silu(float x) { return x / (1.0F + std::exp(-x)); }
 
-// SwiGLU: merged gate_up[T,2I] -> silu(gate)*up -> [T,I].
-std::vector<float> SiluAndMul(const std::vector<float>& gate_up, int64_t T,
-                              int64_t I) {
+// Separate gate/up SwiGLU: silu(gate)*up per element -> [T,I].
+std::vector<float> GateUpSilu(const std::vector<float>& gate,
+                              const std::vector<float>& up, int64_t T, int64_t I) {
   std::vector<float> act(static_cast<size_t>(T * I));
-  for (int64_t t = 0; t < T; ++t) {
-    const float* g = gate_up.data() + static_cast<size_t>(t * 2 * I);
-    const float* u = g + I;
-    float* a = act.data() + static_cast<size_t>(t * I);
-    for (int64_t i = 0; i < I; ++i) a[i] = Silu(g[i]) * u[i];
-  }
+  for (int64_t i = 0; i < T * I; ++i)
+    act[static_cast<size_t>(i)] = Silu(gate[static_cast<size_t>(i)]) * up[static_cast<size_t>(i)];
   return act;
 }
 
@@ -135,12 +145,16 @@ void ApplyRope(std::vector<float>& x, int64_t T, int64_t heads, int64_t Dh,
   }
 }
 
+// One expert / shared-MLP forward from SEPARATE gate/up/down weights (the real
+// GGUF name-map): silu(gate@h)*(up@h) then down. [H] out.
 std::vector<float> ExpertMlp(const std::vector<float>& h_row,
-                             const std::vector<float>& gate_up_w,
+                             const std::vector<float>& gate_w,
+                             const std::vector<float>& up_w,
                              const std::vector<float>& down_w, int64_t H,
                              int64_t I) {
-  const std::vector<float> gu = MatmulNK(h_row, gate_up_w, 1, 2 * I, H);
-  const std::vector<float> act = SiluAndMul(gu, 1, I);
+  const std::vector<float> g = MatmulNK(h_row, gate_w, 1, I, H);
+  const std::vector<float> u = MatmulNK(h_row, up_w, 1, I, H);
+  const std::vector<float> act = GateUpSilu(g, u, 1, I);
   return MatmulNK(act, down_w, 1, H, I);  // [H]
 }
 
@@ -204,6 +218,11 @@ std::vector<float> LagunaModel::Forward(
     std::vector<float> q = MatmulNK(hn, ReadF32(lw.attn.q_proj), T, qdim, H);
     std::vector<float> k = MatmulNK(hn, ReadF32(lw.attn.k_proj), T, kvdim, H);
     std::vector<float> v = MatmulNK(hn, ReadF32(lw.attn.v_proj), T, kvdim, H);
+    // Per-head QK-RMSNorm BEFORE RoPE (VERIFIED W4 from the GGUF attn_q/k_norm).
+    if (p.has_qk_norm && !lw.attn.q_norm.Empty()) {
+      RmsNormHeads(q, ReadF32(lw.attn.q_norm), T, Hq, Dh, eps);
+      RmsNormHeads(k, ReadF32(lw.attn.k_norm), T, Hkv, Dh, eps);
+    }
     const std::vector<float>& cache = global ? yarn_cache : slide_cache;
     ApplyRope(q, T, Hq, Dh, rd, cache, positions);
     ApplyRope(k, T, Hkv, Dh, rd, cache, positions);
@@ -275,8 +294,9 @@ std::vector<float> LagunaModel::Forward(
     std::vector<float> f(static_cast<size_t>(T * H), 0.0F);
     if (lw.is_dense) {
       const int64_t I = p.intermediate_size;
-      const std::vector<float> gu = MatmulNK(hn2, ReadF32(lw.mlp.gate_up_proj), T, 2 * I, H);
-      const std::vector<float> act = SiluAndMul(gu, T, I);
+      const std::vector<float> g = MatmulNK(hn2, ReadF32(lw.mlp.gate_proj), T, I, H);
+      const std::vector<float> u = MatmulNK(hn2, ReadF32(lw.mlp.up_proj), T, I, H);
+      const std::vector<float> act = GateUpSilu(g, u, T, I);
       f = MatmulNK(act, ReadF32(lw.mlp.down_proj), T, H, I);
     } else {
       const int64_t E = p.num_experts;
@@ -285,14 +305,16 @@ std::vector<float> LagunaModel::Forward(
       std::vector<float> bias;
       if (!lw.moe.e_score_correction_bias.Empty())
         bias = ReadF32(lw.moe.e_score_correction_bias);
-      const std::vector<float> exp_gu = ReadF32(lw.moe.experts_gate_up);  // [E,2moeI,H]
-      const std::vector<float> exp_dn = ReadF32(lw.moe.experts_down);     // [E,H,moeI]
-      const int64_t gu_stride = 2 * moe_I * H;
+      const std::vector<float> exp_g = ReadF32(lw.moe.experts_gate);  // [E,moeI,H]
+      const std::vector<float> exp_u = ReadF32(lw.moe.experts_up);    // [E,moeI,H]
+      const std::vector<float> exp_dn = ReadF32(lw.moe.experts_down); // [E,H,moeI]
+      const int64_t gu_stride = moe_I * H;
       const int64_t dn_stride = H * moe_I;
-      const bool has_shared = !lw.moe.shared_gate_up.Empty();
-      std::vector<float> shared_gu, shared_dn;
+      const bool has_shared = !lw.moe.shared_gate.Empty();
+      std::vector<float> shared_g, shared_u, shared_dn;
       if (has_shared) {
-        shared_gu = ReadF32(lw.moe.shared_gate_up);
+        shared_g = ReadF32(lw.moe.shared_gate);
+        shared_u = ReadF32(lw.moe.shared_up);
         shared_dn = ReadF32(lw.moe.shared_down);
       }
       for (int64_t i = 0; i < T; ++i) {
@@ -305,16 +327,18 @@ std::vector<float> LagunaModel::Forward(
         std::vector<float> acc(static_cast<size_t>(H), 0.0F);
         for (size_t s = 0; s < sel.ids.size(); ++s) {
           const int64_t id = sel.ids[s];
-          std::vector<float> egu(exp_gu.begin() + static_cast<int64_t>(id * gu_stride),
-                                 exp_gu.begin() + static_cast<int64_t>((id + 1) * gu_stride));
+          std::vector<float> eg(exp_g.begin() + static_cast<int64_t>(id * gu_stride),
+                                exp_g.begin() + static_cast<int64_t>((id + 1) * gu_stride));
+          std::vector<float> eu(exp_u.begin() + static_cast<int64_t>(id * gu_stride),
+                                exp_u.begin() + static_cast<int64_t>((id + 1) * gu_stride));
           std::vector<float> edn(exp_dn.begin() + static_cast<int64_t>(id * dn_stride),
                                  exp_dn.begin() + static_cast<int64_t>((id + 1) * dn_stride));
-          const std::vector<float> eo = ExpertMlp(hrow, egu, edn, H, moe_I);
+          const std::vector<float> eo = ExpertMlp(hrow, eg, eu, edn, H, moe_I);
           const float w = sel.weights[s];
           for (int64_t d = 0; d < H; ++d) acc[static_cast<size_t>(d)] += w * eo[static_cast<size_t>(d)];
         }
         if (has_shared) {
-          const std::vector<float> so = ExpertMlp(hrow, shared_gu, shared_dn, H, moe_I);
+          const std::vector<float> so = ExpertMlp(hrow, shared_g, shared_u, shared_dn, H, moe_I);
           for (int64_t d = 0; d < H; ++d) acc[static_cast<size_t>(d)] += so[static_cast<size_t>(d)];
         }
         std::copy(acc.begin(), acc.end(),
