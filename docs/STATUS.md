@@ -130,6 +130,8 @@ loop (R2) + device draft (R4). fp16 dequant cache refuted net-slower on GB10; MH
 a measured tie; routed-MoE we already win. See
 `.agents/specs/deepseek-beat-ds4-sweep-2026-07-30.md`.
 
+**Cross-reference lever scan (2026-07-31, `CLAIM-XREF-LEVER-SCAN`, `.agents/specs/cross-ref-lever-scan-2026-07-31.md`).** A 5-source parallel scan (vLLM/SGLang/llama.cpp/ds4/ours) for batch-1 raw-decode levers, no-spec, adversarially verified against our code. **Corrects the record:** ds4/DwarfStar has NO register-prefetch (grep-verified) — the Brick-14 theory below was a misattribution; ds4's 90% comes from full-warp-per-row + lane-strided 34-B Q8_0 blocks (1088-B coalesced burst). Our production Q8_0 ships SUB-warp (8/16-lane/row) for medium-K (`LaunchQ8_0Subwarp`), so the one non-refuted Path-B lever left is **B1: port ds4's exact 32-lane/8-row `warp8` for medium-K + measure** (DGX A/B, not guaranteed). Verified cross-cutting gap: **PDL** (Programmatic Dependent Launch) — we have zero, both llama.cpp+SGLang use it on Blackwell. Path A (Laguna beat vLLM): the NVFP4 arm (#230) + the note that vLLM's 18.8 is MARLIN W4A16 (a lower bound; real default FLASHINFER_CUTLASS W4A4 is faster). Full ranked plan + citations in the spec.
+
 **DeepSeek-V4-Flash decode ds4-gap — Brick 14 (Q8_0 intra-row register-prefetch —
 the ds4 raw mechanism)** (2026-07-31, `CLAIM-DSV4-DECODE-BRICK14`, GB10 sm_121a,
 branch `ds4-q8-register-prefetch`, NOT pushed). Built `QuantDotGemmQ8_0PrefetchKernel
