@@ -34432,3 +34432,31 @@ PARTIAL on two further unrelated test-only GCC 12 `-Wrestrict` diagnostics in
 CTest cannot run from this incomplete build. No GPU, model, or benchmark ran.
 
 **Canonical DONE-owner reachability repaired (2026-07-31, `CLAIM-RECORD-DONE-OWNER-REPAIR`).** Records-only correction: the six checker-reported `DONE` owner cells now name the reachable commits that introduced their binding closures (`KV-PREFIX-CACHE` `a41af480`, `SAMPLE-LOGPROBS` `ecda3ce1`, and the four DFlash rows `489a7544`). Lifecycle states, evidence, support claims, source, tests, and benchmark results are unchanged.
+
+## 2026-08-01 - `SERVE-CLI-CHAT` contract spike
+
+`CLAIM-SERVE-CLI-CHAT-SPIKE`, isolated worktree
+`/home/mudler/.cache/sdd/localai-org-maint-bot-vllm.cpp/codex-serve-cli-chat-spike`,
+branch `codex/serve-cli-chat-spike`, base `upstream/main` `1448e981`, CPU-only.
+
+The pinned-source read found and corrected a material inventory error: vLLM
+`5559679229` does have direct `chat` and `complete` commands. They are registered
+through `entrypoints/cli/main.py` and implemented in `entrypoints/cli/openai.py`
+as clients of a running OpenAI-compatible server. The old row described them
+as a project extension based only on the import list in `main.py`, without
+following the imported `openai` command module.
+
+Accepted `.agents/specs/cli-chat-complete.md`. The selected design mirrors the
+remote URL/auth/model-discovery, quick/interactive, SSE, conversation-history,
+and TTFT/TPS contracts while retaining today's in-process `--model --prompt`
+form as an explicit compatibility alias. Alternatives rejected: remote-only
+would break the shipped library-first example; in-process-only would fail
+upstream parity. The implementation is split into W1 parse/dispatch, W2 OpenAI
+transport, W3 complete, W4 chat, and W5 packaging/gates. No source, tests,
+CMake, model, GPU, checkpoint, or benchmark changed. Resume with W1/W2 after
+the spike merges; both are fully CPU-gateable via a loopback fake server.
+
+The required Slack selection notification was attempted through the bundled
+secret-safe sender to the only conventional target available, `#general`, but
+Slack returned `channel_not_found`. No channel ID/name is configured and no
+credential was inspected or exposed.

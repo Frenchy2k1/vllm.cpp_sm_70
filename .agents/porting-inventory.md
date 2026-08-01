@@ -319,7 +319,7 @@ before this becomes supported.
 | `/v1/embeddings`, `/pooling`, `/score`, `/rerank` | pooling routers | T2 |
 | `/v1/responses`, `/v1/messages` (Anthropic-style), audio endpoints | responses/messages routers | T2 |
 | Sleep/pause/resume, LoRA load/unload, profiling, RL weight-update endpoints | various | T2–T3 |
-| CLI: `serve`, `bench {latency,throughput,serve}`, `chat`, `complete` | `entrypoints/cli/` | T0 **partial** (separate example server + one in-process bench), T1 matching command families/rest |
+| CLI: `serve`, `bench {latency,throughput,serve}`, `chat`, `complete` | `entrypoints/cli/` | T0 **partial** (separate example server + one in-process bench); T1 `chat`/`complete` spike accepted at [cli-chat-complete.md](specs/cli-chat-complete.md), correcting the prior false claim that the pin lacked those commands. Remote command implementation remains open under `SERVE-CLI-CHAT` |
 | Offline API: `generate`, `chat`, streaming enqueue; `get_metrics` | `entrypoints/llm.py` | T1 parity surface; bounded synchronous C/C++ entry points exist |
 | Prometheus metric names **1:1** (`vllm:num_requests_running`, `vllm:time_to_first_token_seconds`, `vllm:kv_cache_usage_perc`, …) | `v1/metrics/` | T0 (core set), T1 (full set) |
 | OTLP tracing | `config/observability.py` | T2 |
