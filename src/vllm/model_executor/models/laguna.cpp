@@ -550,6 +550,74 @@ std::vector<float> LagunaMoeResidentMarlin(vt::Queue& q, const LagunaMoeWeights&
   }
   return acc;
 }
+
+// Device-in/device-out variant for the resident decode: takes a DEVICE f32
+// activation [H] + DEVICE i32 ids[Pk] + DEVICE f32 weights[Pk] (from the on-device
+// router), runs the SAME Marlin W4A16 grouped chain, and writes the f32 [H] combine
+// into out_dev (no host download → no per-MoE-layer drain). Same kernels ⇒ same
+// device-regime near-tie as LagunaMoeResidentMarlin.
+void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, const float* hn_dev,
+                                 int64_t moe_I, int64_t H, int64_t E, const int32_t* ids_dev,
+                                 const float* w_dev, int64_t Pk, float* out_dev) {
+  using vt::DType;
+  if (Pk == 0) return;
+  vt::Backend& bk = vt::GetBackend(q.device.type);
+  vllm::dense_nvfp4::Dev d{bk, q};
+  LagunaMoeMarlinResident& mr = LagunaMoeMarlinResidentFor(&moe);
+  if (!mr.ready)
+    BuildLagunaMoeMarlinResident(d, moe, static_cast<int>(E), static_cast<int>(H),
+                                 static_cast<int>(moe_I), mr);
+  void* stream = q.handle;
+  const vt::Device dev = q.device;
+  const int block = vt::cuda::MarlinMoeAlignBlockSizeSelect(1, static_cast<int>(Pk),
+                                                            static_cast<int>(E));
+  int max_tok = 0, max_blk = 0;
+  vt::cuda::MarlinMoeAlignSizes(1, static_cast<int>(Pk), static_cast<int>(E), block, &max_tok,
+                                &max_blk);
+  vllm::dense_nvfp4::DBuf dh(d, DType::kBF16, {1, H});
+  {
+    vllm::dense_nvfp4::DBuf xf(d, DType::kF32, {1, H}, hn_dev);
+    vt::CastBf16(q, dh.t(), xf.t());
+  }
+  vllm::dense_nvfp4::DBuf dtid(d, DType::kI32, {1, Pk}, ids_dev);
+  vllm::dense_nvfp4::DBuf dtw(d, DType::kF32, {1, Pk}, w_dev);
+  vllm::dense_nvfp4::DBuf sorted(d, DType::kI32, {max_tok});
+  vllm::dense_nvfp4::DBuf eids(d, DType::kI32, {max_blk});
+  vllm::dense_nvfp4::DBuf npad(d, DType::kI32, {1});
+  vt::cuda::MarlinMoeAlignBlockSize(stream, static_cast<const int32_t*>(dtid.ptr()), 1,
+                                    static_cast<int>(Pk), static_cast<int>(E), block,
+                                    static_cast<int32_t*>(sorted.ptr()),
+                                    static_cast<int32_t*>(eids.ptr()),
+                                    static_cast<int32_t*>(npad.ptr()));
+  vt::Tensor wg = vllm::dense_nvfp4::MakeTensor(mr.w_gate, DType::kI32, dev, {E, H / 16, moe_I * 2});
+  vt::Tensor wu = vllm::dense_nvfp4::MakeTensor(mr.w_up, DType::kI32, dev, {E, H / 16, moe_I * 2});
+  vt::Tensor wd = vllm::dense_nvfp4::MakeTensor(mr.w_down, DType::kI32, dev, {E, moe_I / 16, H * 2});
+  vt::Tensor sg = vllm::dense_nvfp4::MakeTensor(mr.s_gate, DType::kI8, dev, {E, H / 16, moe_I});
+  vt::Tensor su = vllm::dense_nvfp4::MakeTensor(mr.s_up, DType::kI8, dev, {E, H / 16, moe_I});
+  vt::Tensor sd = vllm::dense_nvfp4::MakeTensor(mr.s_down, DType::kI8, dev, {E, moe_I / 16, H});
+  vt::Tensor gg = vllm::dense_nvfp4::MakeTensor(mr.g_gate, DType::kF32, dev, {E});
+  vt::Tensor gu = vllm::dense_nvfp4::MakeTensor(mr.g_up, DType::kF32, dev, {E});
+  vt::Tensor gd = vllm::dense_nvfp4::MakeTensor(mr.g_down, DType::kF32, dev, {E});
+  vt::Tensor ws = vllm::dense_nvfp4::MakeTensor(mr.workspace, DType::kI32, dev, {mr.sms * 4});
+  const int bi = block, Pki = static_cast<int>(Pk), Hi = static_cast<int>(H),
+            Ii = static_cast<int>(moe_I);
+  vllm::dense_nvfp4::DBuf dgate(d, DType::kBF16, {Pk, moe_I});
+  vllm::dense_nvfp4::DBuf dup(d, DType::kBF16, {Pk, moe_I});
+  vt::MoeGroupedGemmNvfp4Marlin(q, dgate.t(), dh.t(), wg, sg, gg, ws, sorted.t(), eids.t(),
+                                npad.t(), dtw.t(), vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+  vt::MoeGroupedGemmNvfp4Marlin(q, dup.t(), dh.t(), wu, su, gu, ws, sorted.t(), eids.t(), npad.t(),
+                                dtw.t(), vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+  vllm::dense_nvfp4::DBuf dact(d, DType::kBF16, {Pk, moe_I});
+  vt::MoeSiluMul(q, dact.t(), dgate.t(), dup.t());
+  vllm::dense_nvfp4::DBuf ddown(d, DType::kBF16, {Pk, H});
+  vt::MoeGroupedGemmNvfp4Marlin(q, ddown.t(), dact.t(), wd, sd, gd, ws, sorted.t(), eids.t(),
+                                npad.t(), dtw.t(), vt::MoeMarlinArgs{bi, 1, Pki, Hi, Ii, false});
+  vt::Tensor expert_out = vllm::dense_nvfp4::MakeTensor(ddown.ptr(), DType::kBF16, dev, {1, Pk, H});
+  vllm::dense_nvfp4::DBuf dout(d, DType::kBF16, {1, H});
+  vt::MoeCombine(q, dout.t(), expert_out, dtw.t());
+  vt::Tensor ot = vllm::dense_nvfp4::MakeTensor(out_dev, DType::kF32, dev, {1, H});
+  vt::CastF32(q, ot, dout.t());  // bf16 -> f32, device (no download)
+}
 #endif  // VT_MARLIN_NVFP4
 
 // N5 campaign-B gate: route the routed experts through the Marlin W4A16 grouped
@@ -1295,12 +1363,17 @@ inline bool LagunaResidentDecodeEnabled() {
 
 bool LagunaCanRunResidentDecode(const LagunaParams& p, vt::Queue& q, const LagunaWeights& w,
                                 int64_t T) {
+#ifndef VT_MARLIN_NVFP4
+  (void)p; (void)q; (void)w; (void)T;
+  return false;  // the resident FFN routes the MoE through the Marlin W4A16 path
+#else
   if (!LagunaResidentDecodeEnabled() || T != 1) return false;
   if (q.device.type == vt::DeviceType::kCPU) return false;
   if (!w.has_nvfp4_weights) return false;
   if (p.tie_word_embeddings || w.lm_head.Empty()) return false;
   if (!laguna::LagunaDeviceKernelsAvailable()) return false;
   return true;
+#endif
 }
 
 std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt::Queue& q,
@@ -1324,7 +1397,10 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
   int64_t Hq_max = p.num_attention_heads;
   for (int64_t l = 0; l < nlayers; ++l) Hq_max = std::max(Hq_max, p.QHeadsForLayer(l));
   const int64_t qdim_max = Hq_max * Dh;
-  const int64_t maxK = std::max<int64_t>(H, qdim_max);
+  const int64_t E = p.num_experts, topk = p.num_experts_per_tok;
+  const int64_t moe_I = p.moe_intermediate_size, dense_I = p.intermediate_size;
+  const int64_t maxI = std::max(moe_I, dense_I);
+  const int64_t maxK = std::max({H, qdim_max, moe_I, dense_I});
 
   const std::vector<float> yarn_cache = BuildLagunaFullYarnCosSin(p, pos + 1);
   const std::vector<float> slide_cache = BuildLagunaSlidingCosSin(p, pos + 1);
@@ -1334,6 +1410,28 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       gl(static_cast<size_t>(Hq_max)), attn(static_cast<size_t>(qdim_max)),
       o(static_cast<size_t>(H));
   std::vector<uint16_t> abf(static_cast<size_t>(maxK));
+  // device-FFN scratch (unified) + persistent f32 norm/bias keep-alive (no per-FFN drain)
+  std::vector<float> gating(static_cast<size_t>(E)), dg(static_cast<size_t>(maxI)),
+      du(static_cast<size_t>(maxI)), dact(static_cast<size_t>(maxI)), fdn(static_cast<size_t>(H)),
+      so(static_cast<size_t>(H)), doutb(static_cast<size_t>(H));
+  std::vector<int32_t> eids32(static_cast<size_t>(topk));
+  std::vector<float> topw(static_cast<size_t>(topk));
+  std::vector<std::vector<float>> keep;
+  auto Keep = [&](std::vector<float> v) -> const float* {
+    keep.push_back(std::move(v));
+    return keep.back().data();
+  };
+  auto DevT = [&](float* p2, int64_t I) {
+    return vt::Tensor::Contiguous(p2, DType::kF32, dev, {1, I});
+  };
+  auto SiluMul = [&](float* out, float* g, float* u, int64_t I) {
+    vt::Tensor ot = DevT(out, I);
+    vt::MoeSiluMul(q, ot, DevT(g, I), DevT(u, I));
+  };
+  auto AddInto = [&](float* a, float* b) {  // a += b  (both [1,H])
+    vt::Tensor at = DevT(a, H);
+    vt::Add(q, at, at, DevT(b, H));
+  };
 
   // no-sync bf16 GEMM: out[1,N] f32 = cast(x[1,K])·w[N,K]^T (mirror LqGemm device path)
   auto GemmBf16Into = [&](float* out, const OwnedTensor& w, const float* x, int64_t N, int64_t K) {
@@ -1399,13 +1497,37 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       vt::Tensor ot = vt::Tensor::Contiguous(o.data(), DType::kF32, dev, {1, H});
       vt::Add(q, ht, ht, ot);
     }
-    const std::vector<float> w_pa = ReadF32(lw.post_attn_norm);
-    LAG->rms_norm_seq(q, hn.data(), hidden.data(), w_pa.data(), 1, H, eps, true);
-    DrainQueue(q);  // hn (post-attn norm) host-readable for the FFN
-
-    const std::vector<float> f = LagunaFfnBlock(q, lw, p, hn, 1);
-    for (int64_t i = 0; i < H; ++i) hidden[static_cast<size_t>(i)] += f[static_cast<size_t>(i)];
+    // post-attn RMSNorm (device); FFN fully device-resident — NO per-layer FFN drain.
+    LAG->rms_norm_seq(q, hn.data(), hidden.data(), Keep(ReadF32(lw.post_attn_norm)), 1, H, eps,
+                      true);
+    if (lw.is_dense) {
+      GemmBf16Into(dg.data(), lw.mlp.gate_proj, hn.data(), dense_I, H);
+      GemmBf16Into(du.data(), lw.mlp.up_proj, hn.data(), dense_I, H);
+      SiluMul(dact.data(), dg.data(), du.data(), dense_I);
+      GemmBf16Into(fdn.data(), lw.mlp.down_proj, dact.data(), H, dense_I);
+      AddInto(hidden.data(), fdn.data());
+    } else {
+#ifdef VT_MARLIN_NVFP4
+      GemmBf16Into(gating.data(), lw.moe.router, hn.data(), E, H);  // router (bf16 weight)
+      const float* bias = lw.moe.e_score_correction_bias.Empty()
+                              ? nullptr
+                              : Keep(ReadF32(lw.moe.e_score_correction_bias));
+      LAG->sigmoid_topk(q, eids32.data(), topw.data(), gating.data(), bias, bias != nullptr, E,
+                        topk, p.norm_topk_prob, p.moe_routed_scaling_factor);
+      LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
+                                  topk, doutb.data());
+      GemmBf16Into(dg.data(), lw.moe.shared_gate, hn.data(), moe_I, H);  // shared expert
+      GemmBf16Into(du.data(), lw.moe.shared_up, hn.data(), moe_I, H);
+      SiluMul(dact.data(), dg.data(), du.data(), moe_I);
+      GemmBf16Into(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
+      AddInto(hidden.data(), doutb.data());  // hidden += routed
+      AddInto(hidden.data(), so.data());     // hidden += shared
+#else
+      VT_CHECK(false, "laguna resident decode: MoE requires the VT_MARLIN_NVFP4 build");
+#endif
+    }
   }
+  DrainQueue(q);  // the ONE step-boundary drain: hidden coherent for the final logits
   return LagunaFinalLogits(q, weights, hidden, 1, logits_indices);
 }
 
