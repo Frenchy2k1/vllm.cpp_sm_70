@@ -10974,3 +10974,18 @@ Six existing `DONE` matrix rows now point to reachable commits that introduced
 their binding closure states. This records-only metadata repair changes no
 lifecycle state, implementation, workload, or accepted benchmark result, so no
 new performance number is applicable or claimed.
+
+## CLI chat/complete contract spike (2026-08-01) - NOT APPLICABLE
+
+`SERVE-CLI-CHAT` W0 (`CLAIM-SERVE-CLI-CHAT-SPIKE`) is a records/spec-only
+checkpoint. No production, test, model, scheduler, memory, latency, or
+throughput path changed, so `benchmark_binding=false`. The pinned source proves
+that vLLM registers remote `chat` and `complete` commands in
+`entrypoints/cli/main.py:17-37,73-98` and defines their full client behavior in
+`entrypoints/cli/openai.py:30-100,155-312`; the local baseline remains the
+in-process-only `examples/cli/main.cpp:1-207`.
+
+Implementation is `PENDING`. The next reproduction is the W1/W2 CPU fake-server
+transcript suite in
+[the accepted spec](../.agents/specs/cli-chat-complete.md), followed by clean
+Release `-Werror` and sanitizer gates. No GPU or model is required.
