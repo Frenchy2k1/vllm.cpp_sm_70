@@ -71,171 +71,181 @@ __global__ void RopeFromCacheKernel(float* x, const float* cache, int64_t heads,
   xv[half + i] = x1 * c + x0 * s;
 }
 
-// ── GQA T=1 decode attention (bit-exact to LagunaAttention:701) ──
-// One thread per query head h (kvh=h/group). 3-pass host-order softmax: (A) global
-// max over masked keys, (B) denom = Σ exp(logit-max), (C) o += (exp/denom)·v. The dot
-// is recomputed each pass (deterministic → identical value) to avoid per-key storage.
-// K/V laid out [kv_rows, Hkv, Dh]; kv_pos[j]=j, q_pos=pos; causal + per-layer window.
-// ONE BLOCK per query head (blockDim threads cooperate over kv_rows). 3-pass
-// host-order softmax parallelized: block-reduce max, block-reduce denom, atomicAdd
-// weighted-V into a shared [Dh] accumulator. NEAR-TIE vs the host sequential softmax
-// (block reduction reorders) — accepted in the device regime. Dh<=128.
+// ── Brick B: one-pass GQA-broadcast flash decode attention ──────────────────
+// Dh is fixed at 128 for Laguna → 32 lanes × kLagEpl=4 head-dim elems/lane. Keys are
+// staged into shared memory kLagTile at a time (each DRAM K/V row read ONCE) and the
+// online-softmax O accumulator lives in registers (per lane), so this REPLACES the
+// old 3-pass, block-per-Q-head, atomicAdd kernel (which re-read K 3× AND re-read the
+// SAME KV once per Q-head in a group → 12-18× the minimum KV bytes).
+constexpr int kLagDh = 128;              // Laguna head_dim (fixed; see laguna.h:90)
+constexpr int kLagEpl = kLagDh / 32;     // 4 head-dim elems per lane (128 == 32*4)
+constexpr int kLagTile = 32;             // keys staged per shared tile
+
+// GQA T=1 decode attention (NEAR-TIE vs the host 3-pass softmax — the online rescale
+// reorders the float adds, accepted in the device regime). ONE BLOCK per KV head g;
+// block = QG*32 threads = QG warps, warp w owns query head h = g*QG + w (kvh=h/group=g,
+// QG=group). Each key's K/V row is staged into shared ONCE by the whole block, then
+// every warp attends it from shared (GQA broadcast). Register-resident online softmax
+// (running m,l,o), warp-shuffle Q·K reduce, no atomicAdd. K/V laid out [kv_rows,Hkv,Dh];
+// row j global pos = first_pos+j, q_pos=pos; causal + per-layer sliding window.
 __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, const float* v,
                                     int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group,
                                     int64_t kv_rows, int64_t q_pos, int64_t first_pos,
                                     int64_t window, float scale) {
-  const int64_t h = static_cast<int64_t>(blockIdx.x);
-  if (h >= Hq) return;
-  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t g = static_cast<int64_t>(blockIdx.x);  // KV head this block owns
+  if (g >= Hkv) return;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;   // == q-head within the group
+  const int lane = static_cast<int>(threadIdx.x) & 31;
   const int nth = static_cast<int>(blockDim.x);
-  const int64_t kvh = h / group;
-  const float* qrow = q + h * Dh;
-  float* orow = o + h * Dh;
-  __shared__ float red[256];
-  __shared__ float sao[128];
-  for (int d = tid; d < Dh; d += nth) sao[d] = 0.0f;
-  __syncthreads();
+  const int64_t QG = group;                              // q-heads per KV head (6 or 9)
+  const int64_t h = g * QG + warp;                       // global q-head index
+  const bool active = (warp < QG) && (h < Hq);           // (always true when block==QG*32)
 
-  auto masked = [&](int64_t j) -> bool {
-    const int64_t pj = first_pos + j;
-    if (pj > q_pos) return true;
-    if (window > 0 && q_pos - pj >= window) return true;
-    return false;
-  };
-  auto dotj = [&](int64_t j) -> float {
-    const float* krow = k + (j * Hkv + kvh) * Dh;
-    float dot = 0.0f;
-    for (int64_t d = 0; d < Dh; ++d) dot += qrow[d] * krow[d];
-    return dot * scale;
-  };
-  // (A) block-reduce max
-  float lmax = -CUDART_INF_F;
-  for (int64_t j = tid; j < kv_rows; j += nth)
-    if (!masked(j)) lmax = fmaxf(lmax, dotj(j));
-  red[tid] = lmax;
-  __syncthreads();
-  for (int s = nth / 2; s > 0; s >>= 1) {
-    if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+  // This warp's query slice (this lane owns kLagEpl contiguous head dims), loaded once.
+  float q_reg[kLagEpl];
+#pragma unroll
+  for (int i = 0; i < kLagEpl; ++i)
+    q_reg[i] = active ? q[h * Dh + lane * kLagEpl + i] : 0.0f;
+  float m = -CUDART_INF_F, l = 0.0f;
+  float o_reg[kLagEpl];
+#pragma unroll
+  for (int i = 0; i < kLagEpl; ++i) o_reg[i] = 0.0f;
+
+  __shared__ float ksh[kLagTile * kLagDh];  // 16 KiB
+  __shared__ float vsh[kLagTile * kLagDh];  // 16 KiB
+
+  for (int64_t base = 0; base < kv_rows; base += kLagTile) {
+    const int64_t cnt = (kv_rows - base < kLagTile) ? (kv_rows - base) : kLagTile;
+    const int64_t nload = cnt * Dh;  // elems per K (or V) block
+    // Cooperative stage: [0,nload) → K rows, [nload,2*nload) → V rows (each read ONCE).
+    for (int64_t idx = threadIdx.x; idx < 2 * nload; idx += nth) {
+      const bool isv = idx >= nload;
+      const int64_t e = isv ? (idx - nload) : idx;
+      const int64_t row = e / Dh, col = e % Dh;
+      const float* src = isv ? v : k;
+      (isv ? vsh : ksh)[row * Dh + col] = src[((base + row) * Hkv + g) * Dh + col];
+    }
     __syncthreads();
+    if (active) {
+      for (int64_t r = 0; r < cnt; ++r) {
+        const int64_t pj = first_pos + base + r;
+        if (pj > q_pos) continue;                          // causal (mask is lane-uniform)
+        if (window > 0 && q_pos - pj >= window) continue;  // sliding window (0 => full causal)
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kLagEpl; ++i) dot += q_reg[i] * ksh[r * Dh + lane * kLagEpl + i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+        dot = __shfl_sync(0xffffffffu, dot, 0) * scale;    // full-head score to all lanes
+        const float m_new = fmaxf(m, dot);
+        const float corr = expf(m - m_new);                // 0 on the first key (m == -inf)
+        const float pw = expf(dot - m_new);
+#pragma unroll
+        for (int i = 0; i < kLagEpl; ++i)
+          o_reg[i] = o_reg[i] * corr + pw * vsh[r * Dh + lane * kLagEpl + i];
+        l = l * corr + pw;
+        m = m_new;
+      }
+    }
+    __syncthreads();  // done reading shared before the next tile overwrites it
   }
-  const float maxs = red[0];
-  __syncthreads();
-  if (maxs == -CUDART_INF_F) {  // no visible key -> attn 0 (matches host)
-    for (int d = tid; d < Dh; d += nth) orow[d] = 0.0f;
-    return;
+
+  if (active) {
+    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;      // no visible key -> 0 (matches host)
+#pragma unroll
+    for (int i = 0; i < kLagEpl; ++i) o[h * Dh + lane * kLagEpl + i] = o_reg[i] * inv;
   }
-  // (B) block-reduce denom
-  float lsum = 0.0f;
-  for (int64_t j = tid; j < kv_rows; j += nth)
-    if (!masked(j)) lsum += expf(dotj(j) - maxs);
-  red[tid] = lsum;
-  __syncthreads();
-  for (int s = nth / 2; s > 0; s >>= 1) {
-    if (tid < s) red[tid] += red[tid + s];
-    __syncthreads();
-  }
-  const float denom = red[0];
-  __syncthreads();
-  // (C) weighted V -> shared accumulator
-  for (int64_t j = tid; j < kv_rows; j += nth) {
-    if (masked(j)) continue;
-    const float e = expf(dotj(j) - maxs);
-    if (e == 0.0f) continue;
-    const float pw = e / denom;
-    const float* vrow = v + (j * Hkv + kvh) * Dh;
-    for (int64_t d = 0; d < Dh; ++d) atomicAdd(&sao[d], pw * vrow[d]);
-  }
-  __syncthreads();
-  for (int d = tid; d < Dh; d += nth) orow[d] = sao[d];
 }
 
-// ── Brick A2: GRAPH GQA T=1 decode attention (capturable variant of DecodeAttnGqaKernel) ──
-// DecodeAttnGqaKernel bakes `kv_rows`/`q_pos` into the launch (host args), so a
-// captured graph would freeze the KV length + position. This variant reads BOTH from
-// DEVICE buffers (len_dev/pos_dev) at runtime and takes the current token's row
-// (knew/vnew, [Hkv,Dh]) SEPARATELY — it is NOT yet appended to the cache (the driver
-// appends it between replays). It attends physical cache rows j in [0,len) (K/V laid
-// out [rows,Hkv,Dh]; row j global pos = first_pos+j) PLUS the new row (index len,
-// global pos = q_pos). Same 3-pass block-reduced softmax as the eager kernel; the key
-// set {cache[0..len), knew} == the eager kernel's cache[0..len+1) once appended ⇒
-// bit-identical. first_pos/window/Hq/Hkv/Dh/group/scale are baked per-layer constants.
+// ── Brick A2+B: GRAPH one-pass GQA-broadcast flash decode (capturable) ──────
+// Same one-pass flash kernel as DecodeAttnGqaKernel, but the two per-step-varying
+// scalars come from DEVICE buffers so a captured CUDA graph reads them at REPLAY:
+// len=*len_dev (prior cache rows), q_pos=*pos_dev. The current token's row is passed
+// SEPARATELY (knew/vnew, [Hkv,Dh]) — NOT yet appended to the cache; the driver appends
+// it between replays. Attends cache rows j in [0,len) (row j global pos first_pos+j)
+// PLUS the new row (index len, global pos q_pos), so the key set == the eager kernel's
+// cache[0..len+1) once appended ⇒ same math (near-tie float order). The LAUNCH shape
+// (grid=Hkv, block=QG*32, static shared) is FIXED per layer; only the internal loop
+// trip count varies via *len_dev at replay. first_pos/window/Hq/Hkv/Dh/group/scale are
+// per-layer constants baked at capture.
 __global__ void DecodeAttnGqaGKernel(float* o, const float* q, const float* k, const float* v,
                                      const float* knew, const float* vnew, int64_t Hq, int64_t Hkv,
                                      int64_t Dh, int64_t group, int64_t first_pos, int64_t window,
                                      float scale, const int* len_dev, const int* pos_dev) {
-  const int64_t h = static_cast<int64_t>(blockIdx.x);
-  if (h >= Hq) return;
-  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t g = static_cast<int64_t>(blockIdx.x);  // KV head this block owns
+  if (g >= Hkv) return;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;   // == q-head within the group
+  const int lane = static_cast<int>(threadIdx.x) & 31;
   const int nth = static_cast<int>(blockDim.x);
-  const int64_t kvh = h / group;
-  const int64_t len = static_cast<int64_t>(*len_dev);   // prior cache rows (== dev_rows)
+  const int64_t QG = group;                              // q-heads per KV head (6 or 9)
+  const int64_t h = g * QG + warp;                       // global q-head index
+  const bool active = (warp < QG) && (h < Hq);
+  const int64_t len = static_cast<int64_t>(*len_dev);    // prior cache rows
   const int64_t q_pos = static_cast<int64_t>(*pos_dev);  // this token's global position
   const int64_t total = len + 1;                         // cache rows + the new row
-  const float* qrow = q + h * Dh;
-  float* orow = o + h * Dh;
-  __shared__ float red[256];
-  __shared__ float sao[128];
-  for (int d = tid; d < Dh; d += nth) sao[d] = 0.0f;
-  __syncthreads();
 
-  auto pos_of = [&](int64_t j) -> int64_t { return (j < len) ? (first_pos + j) : q_pos; };
-  auto masked = [&](int64_t j) -> bool {
-    const int64_t pj = pos_of(j);
-    if (pj > q_pos) return true;
-    if (window > 0 && q_pos - pj >= window) return true;
-    return false;
-  };
-  auto krow_of = [&](int64_t j) -> const float* {
-    return (j < len) ? (k + (j * Hkv + kvh) * Dh) : (knew + kvh * Dh);
-  };
-  auto vrow_of = [&](int64_t j) -> const float* {
-    return (j < len) ? (v + (j * Hkv + kvh) * Dh) : (vnew + kvh * Dh);
-  };
-  auto dotj = [&](int64_t j) -> float {
-    const float* krow = krow_of(j);
-    float dot = 0.0f;
-    for (int64_t d = 0; d < Dh; ++d) dot += qrow[d] * krow[d];
-    return dot * scale;
-  };
-  // (A) block-reduce max
-  float lmax = -CUDART_INF_F;
-  for (int64_t j = tid; j < total; j += nth)
-    if (!masked(j)) lmax = fmaxf(lmax, dotj(j));
-  red[tid] = lmax;
-  __syncthreads();
-  for (int s = nth / 2; s > 0; s >>= 1) {
-    if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+  float q_reg[kLagEpl];
+#pragma unroll
+  for (int i = 0; i < kLagEpl; ++i)
+    q_reg[i] = active ? q[h * Dh + lane * kLagEpl + i] : 0.0f;
+  float m = -CUDART_INF_F, l = 0.0f;
+  float o_reg[kLagEpl];
+#pragma unroll
+  for (int i = 0; i < kLagEpl; ++i) o_reg[i] = 0.0f;
+
+  __shared__ float ksh[kLagTile * kLagDh];  // 16 KiB
+  __shared__ float vsh[kLagTile * kLagDh];  // 16 KiB
+
+  for (int64_t base = 0; base < total; base += kLagTile) {
+    const int64_t cnt = (total - base < kLagTile) ? (total - base) : kLagTile;
+    const int64_t nload = cnt * Dh;
+    // Cooperative stage: rows [0,len) from the k/v cache, row == len from knew/vnew.
+    for (int64_t idx = threadIdx.x; idx < 2 * nload; idx += nth) {
+      const bool isv = idx >= nload;
+      const int64_t e = isv ? (idx - nload) : idx;
+      const int64_t row = e / Dh, col = e % Dh;
+      const int64_t gj = base + row;  // global key index in [0,total)
+      float val;
+      if (gj < len) {
+        const float* src = isv ? v : k;
+        val = src[(gj * Hkv + g) * Dh + col];
+      } else {  // gj == len: the new (not-yet-appended) row, layout [Hkv,Dh]
+        const float* src = isv ? vnew : knew;
+        val = src[g * Dh + col];
+      }
+      (isv ? vsh : ksh)[row * Dh + col] = val;
+    }
+    __syncthreads();
+    if (active) {
+      for (int64_t r = 0; r < cnt; ++r) {
+        const int64_t gj = base + r;
+        const int64_t pj = (gj < len) ? (first_pos + gj) : q_pos;  // new row pos == q_pos
+        if (pj > q_pos) continue;                          // causal
+        if (window > 0 && q_pos - pj >= window) continue;  // sliding window
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kLagEpl; ++i) dot += q_reg[i] * ksh[r * Dh + lane * kLagEpl + i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+        dot = __shfl_sync(0xffffffffu, dot, 0) * scale;
+        const float m_new = fmaxf(m, dot);
+        const float corr = expf(m - m_new);
+        const float pw = expf(dot - m_new);
+#pragma unroll
+        for (int i = 0; i < kLagEpl; ++i)
+          o_reg[i] = o_reg[i] * corr + pw * vsh[r * Dh + lane * kLagEpl + i];
+        l = l * corr + pw;
+        m = m_new;
+      }
+    }
     __syncthreads();
   }
-  const float maxs = red[0];
-  __syncthreads();
-  if (maxs == -CUDART_INF_F) {  // no visible key -> attn 0 (matches host)
-    for (int d = tid; d < Dh; d += nth) orow[d] = 0.0f;
-    return;
+
+  if (active) {
+    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+#pragma unroll
+    for (int i = 0; i < kLagEpl; ++i) o[h * Dh + lane * kLagEpl + i] = o_reg[i] * inv;
   }
-  // (B) block-reduce denom
-  float lsum = 0.0f;
-  for (int64_t j = tid; j < total; j += nth)
-    if (!masked(j)) lsum += expf(dotj(j) - maxs);
-  red[tid] = lsum;
-  __syncthreads();
-  for (int s = nth / 2; s > 0; s >>= 1) {
-    if (tid < s) red[tid] += red[tid + s];
-    __syncthreads();
-  }
-  const float denom = red[0];
-  __syncthreads();
-  // (C) weighted V -> shared accumulator
-  for (int64_t j = tid; j < total; j += nth) {
-    if (masked(j)) continue;
-    const float e = expf(dotj(j) - maxs);
-    if (e == 0.0f) continue;
-    const float pw = e / denom;
-    const float* vrow = vrow_of(j);
-    for (int64_t d = 0; d < Dh; ++d) atomicAdd(&sao[d], pw * vrow[d]);
-  }
-  __syncthreads();
-  for (int d = tid; d < Dh; d += nth) orow[d] = sao[d];
 }
 
 // ── per-head softplus OUT-gate (bit-exact to LagunaSoftplusHeadGate:25) ──
@@ -306,19 +316,24 @@ void RopeFromCacheLaunch(Queue& q, float* x, const float* cache, int64_t heads, 
 void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                          int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group, int64_t kv_rows,
                          int64_t q_pos, int64_t first_pos, int64_t window, float scale) {
-  // one block per query head; 128 threads cooperate over kv_rows.
-  DecodeAttnGqaKernel<<<static_cast<unsigned>(Hq), 128, 0, AsStream(q)>>>(
-      o, qd, k, v, Hq, Hkv, Dh, group, kv_rows, q_pos, first_pos, window, scale);
+  // ONE block per KV head (GQA broadcast); block = group*32 = QG warps, warp w owns
+  // query head g*QG+w. Each K/V row staged into shared ONCE, reused across all QG heads.
+  const unsigned grid = static_cast<unsigned>(Hkv);
+  const unsigned blk = static_cast<unsigned>(group * 32);
+  DecodeAttnGqaKernel<<<grid, blk, 0, AsStream(q)>>>(o, qd, k, v, Hq, Hkv, Dh, group, kv_rows,
+                                                     q_pos, first_pos, window, scale);
 }
 void DecodeAttnGqaGLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                           const float* knew, const float* vnew, int64_t Hq, int64_t Hkv, int64_t Dh,
                           int64_t group, int64_t first_pos, int64_t window, float scale,
                           const int* len_dev, const int* pos_dev) {
-  // one block per query head; 128 threads cooperate over (len+1) rows read from the
-  // DEVICE len_dev at replay. FIXED launch shape (no kv_rows-dependent shmem) — the
-  // __shared__ red[256]/sao[128] are static, so the grid/shmem never vary per step.
-  DecodeAttnGqaGKernel<<<static_cast<unsigned>(Hq), 128, 0, AsStream(q)>>>(
-      o, qd, k, v, knew, vnew, Hq, Hkv, Dh, group, first_pos, window, scale, len_dev, pos_dev);
+  // ONE block per KV head; block = group*32 (QG warps). FIXED launch shape: grid=Hkv,
+  // block=QG*32, STATIC shared (ksh/vsh) — never varies per step, so it is capturable.
+  // Only the kernel's internal tile-loop trip count varies via *len_dev at replay.
+  const unsigned grid = static_cast<unsigned>(Hkv);
+  const unsigned blk = static_cast<unsigned>(group * 32);
+  DecodeAttnGqaGKernel<<<grid, blk, 0, AsStream(q)>>>(o, qd, k, v, knew, vnew, Hq, Hkv, Dh, group,
+                                                      first_pos, window, scale, len_dev, pos_dev);
 }
 void SoftplusHeadGateLaunch(Queue& q, float* attn, const float* gl, int64_t Hq, int64_t Dh) {
   SoftplusHeadGateKernel<<<Blocks(Hq * Dh), kTPB, 0, AsStream(q)>>>(attn, gl, Hq, Dh);
