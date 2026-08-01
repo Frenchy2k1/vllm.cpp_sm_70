@@ -316,6 +316,13 @@ std::vector<float> LagunaForwardGguf(const LagunaWeights& w, vt::Queue& q,
                                      const std::vector<int32_t>& positions,
                                      const std::vector<int32_t>& logits_indices);
 
+// N5 campaign-B: pre-build all routed-expert MARLIN W4A16 residents at model-LOAD
+// time (mirrors vLLM's process_weights_after_loading), so the repack cost is not a
+// first-token TTFT spike. No-op unless the Marlin path is enabled (VT_LAGUNA_MARLIN_MOE)
+// and on GPU (and unless built with VT_MARLIN_NVFP4). Call once after loading the
+// NVFP4 tower; the forward's lazy build then finds every resident ready.
+void LagunaBuildMarlinResidents(vt::Queue& q, const LagunaWeights& w);
+
 // ─── W6: per-layer K/V cache for INCREMENTAL decode ──────────────────────────
 // Laguna is MIXED attention: 12 GLOBAL layers (full causal — cache grows unbounded)
 // + 36 SLIDING-WINDOW-512 layers (cache CAPPED at the 512 window — the oldest rows

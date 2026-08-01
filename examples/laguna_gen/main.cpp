@@ -229,6 +229,19 @@ int main(int argc, char** argv) {
     shards.shrink_to_fit();
     std::fprintf(stderr, "[gen] released %zu mmap'd shard(s); RSS %.1f GiB\n",
                  n_shards_freed, CurResidentGiB());
+    // N5 campaign-B: build the routed-expert MARLIN residents NOW (at load), not
+    // lazily on the first forward — so the 48L×256E repack is a one-time load cost,
+    // not a first-token TTFT spike (mirrors vLLM process_weights_after_loading).
+    // No-op unless VT_LAGUNA_MARLIN_MOE=1 + GPU (+ built with VT_MARLIN_NVFP4).
+    if (use_gpu) {
+      const auto tmb0 = std::chrono::steady_clock::now();
+      vllm::LagunaBuildMarlinResidents(q, w);
+      const auto tmb1 = std::chrono::steady_clock::now();
+      const double mb_s = std::chrono::duration<double>(tmb1 - tmb0).count();
+      if (mb_s > 0.5)
+        std::fprintf(stderr, "[gen] MARLIN residents built at load in %.1fs (RSS %.1f GiB)\n",
+                     mb_s, CurResidentGiB());
+    }
     eos = HfInt(config.raw, "eos_token_id", 2);
     eot = eos;
     if (fs::exists(tok_path)) {
