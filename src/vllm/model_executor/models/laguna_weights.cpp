@@ -251,13 +251,27 @@ float LnReadF32Scalar(const StTensor& t) {
   return v;
 }
 
-// F32 tensor copied verbatim (the e_score_correction_bias is F32 [E] on disk).
+// F32 tensor materialized (the e_score_correction_bias is F32 [E] on most shards, but
+// some poolside NVFP4 shards store it BF16 — upconvert those so the router/topk always
+// sees F32). Output dtype is always F32 (the "F32Direct" contract).
 OwnedTensor LnLoadF32Direct(const TensorResolver& get, const std::string& name) {
   const StTensor& t = get(name);
-  VT_CHECK(t.dtype == "F32", "laguna nvfp4: F32 expected for " + name);
   OwnedTensor o = dense_loaders::MakeOwned(vt::DType::kF32, t.shape);
-  VT_CHECK(t.nbytes == o.bytes.size(), "laguna nvfp4: F32 size mismatch " + name);
-  std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  if (t.dtype == "F32") {
+    VT_CHECK(t.nbytes == o.bytes.size(), "laguna nvfp4: F32 size mismatch " + name);
+    std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  } else if (t.dtype == "BF16") {
+    const size_t n = t.nbytes / 2;  // bf16 = 2 bytes/elem
+    VT_CHECK(o.bytes.size() == n * 4, "laguna nvfp4: BF16->F32 size mismatch " + name);
+    const auto* src = reinterpret_cast<const uint16_t*>(t.data);
+    auto* dst = reinterpret_cast<float*>(o.bytes.data());
+    for (size_t i = 0; i < n; ++i) {
+      const uint32_t bits = static_cast<uint32_t>(src[i]) << 16;  // bf16 -> high 16 bits of f32
+      std::memcpy(&dst[i], &bits, 4);
+    }
+  } else {
+    VT_CHECK(false, "laguna nvfp4: F32 or BF16 expected for " + name + " (got " + t.dtype + ")");
+  }
   return o;
 }
 
