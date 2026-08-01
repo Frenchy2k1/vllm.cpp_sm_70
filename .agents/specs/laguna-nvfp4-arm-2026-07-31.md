@@ -195,12 +195,19 @@ HOST `MatmulNK` reference (`laguna.cpp:184`) even on the CUDA queue, so ALL bf16
 — ~4.8 s/tok of the 6.34. Source-only scan would have missed this; the trace found it.
 
 N5 SPEED PLAN (the user's goal — reach ≥ vLLM 18.8 tok/s, both at NVFP4; trace-ranked):
-1. **Route the routed experts to the CUTLASS sm120a fp4 tensor-core path — NEXT (the
-   confirmed dominant cost).** Post-lever-2 nsys (2026-08-01): `MatmulNvfp4Fp4Naive` is now
-   **92%** of GPU time, the bf16 tower runs fast on-GPU (~6.5%), GPU ~87% busy (compute-bound,
-   host bottleneck gone). Use `MatmulNvfp4Fp4DirectD` / the cutlass entry (swizzled block
-   scales via `CutlassFp4ScaleShape`+`SwizzleBlockscale`, resident weights) instead of the
-   generic emulation op — the SAME kernel that puts 27B/35B at vLLM parity. Kills the 92%.
+1. **Native fp4 tensor-core MMA — DONE (2026-08-01), another ~2×.** The post-lever-2 nsys
+   showed `MatmulNvfp4Fp4Naive` at 92% of GPU time. TURNS OUT the engine ALREADY has a native
+   sm120a fp4 tensor-core kernel (`MatmulNvfp4Fp4Native`, `mma.sync kind::mxf4nvf4`,
+   `cuda_matmul_nvfp4.cu:2726`) that reads the SAME LINEAR scale layout `LqGemmNvfp4Fp4`
+   produces (`a_scale[row*groups+col]`, :2763) — so NO swizzle/DirectD machinery was needed;
+   it was just gated OFF behind `VT_NVFP4_FP4_NATIVE` (`NativeFp4MmaEnabled`, :1669). The
+   Laguna driver now defaults it ON (`setenv(...,0)`, scoped — 27B/35B use the separate
+   `MatmulNvfp4CutlassModel`/DirectD path via `NvfpCutlassEnabled`, untouched). GB10: decode
+   0.39 → ~0.20-0.24 s/tok (~2×; ~4.2-5.0 tok/s); byte-identical ids to the emulation path
+   (numerically equivalent), first token matches the golden. **Cumulative: 0.16 → ~4.5 tok/s
+   (~28×), ~4× from vLLM 18.8.** NOTE: the DirectD swizzled-scale cutlass path remains a
+   possible further lever if the native MMA trails cutlass on this shape — but the native
+   kernel is already tensor-core, so the bigger remaining wins are the host-orchestration tail:
 2. **Route the bf16 GEMMs to the GPU — DONE (2026-08-01), 16× decode.** `LqGemm`'s bf16
    branch now casts the small `[T,K]` f32 activation to bf16 on-device (`vt::CastBf16`) and
    runs `vt::MatmulBT` (bf16×bf16→f32, cuBLASLt nvjet), keeping the weight bf16 (no per-token
