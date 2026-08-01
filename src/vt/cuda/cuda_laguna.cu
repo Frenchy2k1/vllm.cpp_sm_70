@@ -76,21 +76,30 @@ __global__ void RopeFromCacheKernel(float* x, const float* cache, int64_t heads,
 // max over masked keys, (B) denom = Σ exp(logit-max), (C) o += (exp/denom)·v. The dot
 // is recomputed each pass (deterministic → identical value) to avoid per-key storage.
 // K/V laid out [kv_rows, Hkv, Dh]; kv_pos[j]=j, q_pos=pos; causal + per-layer window.
+// ONE BLOCK per query head (blockDim threads cooperate over kv_rows). 3-pass
+// host-order softmax parallelized: block-reduce max, block-reduce denom, atomicAdd
+// weighted-V into a shared [Dh] accumulator. NEAR-TIE vs the host sequential softmax
+// (block reduction reorders) — accepted in the device regime. Dh<=128.
 __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, const float* v,
                                     int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group,
                                     int64_t kv_rows, int64_t q_pos, int64_t first_pos,
                                     int64_t window, float scale) {
-  const int64_t h = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t h = static_cast<int64_t>(blockIdx.x);
   if (h >= Hq) return;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int nth = static_cast<int>(blockDim.x);
   const int64_t kvh = h / group;
   const float* qrow = q + h * Dh;
   float* orow = o + h * Dh;
-  for (int64_t d = 0; d < Dh; ++d) orow[d] = 0.0f;
+  __shared__ float red[256];
+  __shared__ float sao[128];
+  for (int d = tid; d < Dh; d += nth) sao[d] = 0.0f;
+  __syncthreads();
 
   auto masked = [&](int64_t j) -> bool {
-    const int64_t pj = first_pos + j;                     // global position of cache row j
-    if (pj > q_pos) return true;                          // causal
-    if (window > 0 && q_pos - pj >= window) return true;  // sliding-window eviction
+    const int64_t pj = first_pos + j;
+    if (pj > q_pos) return true;
+    if (window > 0 && q_pos - pj >= window) return true;
     return false;
   };
   auto dotj = [&](int64_t j) -> float {
@@ -99,29 +108,45 @@ __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, co
     for (int64_t d = 0; d < Dh; ++d) dot += qrow[d] * krow[d];
     return dot * scale;
   };
-  // (A) global max
-  float maxs = -CUDART_INF_F;
-  for (int64_t j = 0; j < kv_rows; ++j) {
-    if (masked(j)) continue;
-    const float dv = dotj(j);
-    if (dv > maxs) maxs = dv;
+  // (A) block-reduce max
+  float lmax = -CUDART_INF_F;
+  for (int64_t j = tid; j < kv_rows; j += nth)
+    if (!masked(j)) lmax = fmaxf(lmax, dotj(j));
+  red[tid] = lmax;
+  __syncthreads();
+  for (int s = nth / 2; s > 0; s >>= 1) {
+    if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+    __syncthreads();
   }
-  if (maxs == -CUDART_INF_F) return;  // no visible key (matches host: attn stays 0)
-  // (B) denom
-  float denom = 0.0f;
-  for (int64_t j = 0; j < kv_rows; ++j) {
-    if (masked(j)) continue;
-    denom += expf(dotj(j) - maxs);
+  const float maxs = red[0];
+  __syncthreads();
+  if (maxs == -CUDART_INF_F) {  // no visible key -> attn 0 (matches host)
+    for (int d = tid; d < Dh; d += nth) orow[d] = 0.0f;
+    return;
   }
-  // (C) weighted V
-  for (int64_t j = 0; j < kv_rows; ++j) {
+  // (B) block-reduce denom
+  float lsum = 0.0f;
+  for (int64_t j = tid; j < kv_rows; j += nth)
+    if (!masked(j)) lsum += expf(dotj(j) - maxs);
+  red[tid] = lsum;
+  __syncthreads();
+  for (int s = nth / 2; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  const float denom = red[0];
+  __syncthreads();
+  // (C) weighted V -> shared accumulator
+  for (int64_t j = tid; j < kv_rows; j += nth) {
     if (masked(j)) continue;
     const float e = expf(dotj(j) - maxs);
-    if (e == 0.0f) continue;  // host skips ww==0
+    if (e == 0.0f) continue;
     const float pw = e / denom;
     const float* vrow = v + (j * Hkv + kvh) * Dh;
-    for (int64_t d = 0; d < Dh; ++d) orow[d] += pw * vrow[d];
+    for (int64_t d = 0; d < Dh; ++d) atomicAdd(&sao[d], pw * vrow[d]);
   }
+  __syncthreads();
+  for (int d = tid; d < Dh; d += nth) orow[d] = sao[d];
 }
 
 // ── per-head softplus OUT-gate (bit-exact to LagunaSoftplusHeadGate:25) ──
@@ -192,9 +217,9 @@ void RopeFromCacheLaunch(Queue& q, float* x, const float* cache, int64_t heads, 
 void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                          int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group, int64_t kv_rows,
                          int64_t q_pos, int64_t first_pos, int64_t window, float scale) {
-  DecodeAttnGqaKernel<<<Blocks(Hq), kTPB, 0, AsStream(q)>>>(o, qd, k, v, Hq, Hkv, Dh, group,
-                                                            kv_rows, q_pos, first_pos, window,
-                                                            scale);
+  // one block per query head; 128 threads cooperate over kv_rows.
+  DecodeAttnGqaKernel<<<static_cast<unsigned>(Hq), 128, 0, AsStream(q)>>>(
+      o, qd, k, v, Hq, Hkv, Dh, group, kv_rows, q_pos, first_pos, window, scale);
 }
 void SoftplusHeadGateLaunch(Queue& q, float* attn, const float* gl, int64_t Hq, int64_t Dh) {
   SoftplusHeadGateKernel<<<Blocks(Hq * Dh), kTPB, 0, AsStream(q)>>>(attn, gl, Hq, Dh);
