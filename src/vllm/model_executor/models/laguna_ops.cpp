@@ -95,7 +95,8 @@ namespace {
 // (length rotary_dim/2) with a scalar mscale. Layout matches
 // rotary_embedding_detail::compute_yarn_cos_sin_cache.
 std::vector<float> FillCosSin(const std::vector<float>& inv_freq,
-                              int64_t rotary_dim, int64_t rows, float mscale) {
+                              int64_t rotary_dim, int64_t rows, float mscale,
+                              int64_t pos0) {
   const int64_t half = rotary_dim / 2;
   VT_CHECK(static_cast<int64_t>(inv_freq.size()) == half,
            "laguna rope: inv_freq length must equal rotary_dim/2");
@@ -103,7 +104,7 @@ std::vector<float> FillCosSin(const std::vector<float>& inv_freq,
   std::vector<float> cache(static_cast<size_t>(rows) *
                            static_cast<size_t>(rotary_dim));
   for (int64_t r = 0; r < rows; ++r) {
-    const float p = static_cast<float>(r);
+    const float p = static_cast<float>(pos0 + r);
     for (int64_t i = 0; i < half; ++i) {
       const float freq = p * inv_freq[static_cast<size_t>(i)];
       const size_t base = static_cast<size_t>(r) * static_cast<size_t>(rotary_dim);
@@ -126,7 +127,7 @@ double LagunaYarnMscale(double factor, double yarn_attn_factor) {
   return yarn_attn_factor * (1.0 + 0.1 * std::log(factor));
 }
 
-std::vector<float> BuildLagunaFullYarnCosSin(const LagunaParams& p, int64_t rows) {
+std::vector<float> BuildLagunaFullYarnCosSin(const LagunaParams& p, int64_t rows, int64_t pos0) {
   VT_CHECK(p.rotary_dim_full > 0 && p.rotary_dim_full % 2 == 0,
            "laguna rope: rotary_dim_full must be positive/even");
   // REUSE the pinned YaRN inv_freq (linear-ramp interp/extrap blend) — the exact
@@ -140,10 +141,10 @@ std::vector<float> BuildLagunaFullYarnCosSin(const LagunaParams& p, int64_t rows
       /*extrapolation_factor=*/1.0, static_cast<int64_t>(p.yarn_beta_fast),
       static_cast<int64_t>(p.yarn_beta_slow), /*truncate=*/false);
   return FillCosSin(inv_freq, p.rotary_dim_full, rows,
-                    static_cast<float>(LagunaYarnMscale(p.yarn_factor, p.yarn_attn_factor)));
+                    static_cast<float>(LagunaYarnMscale(p.yarn_factor, p.yarn_attn_factor)), pos0);
 }
 
-std::vector<float> BuildLagunaSlidingCosSin(const LagunaParams& p, int64_t rows) {
+std::vector<float> BuildLagunaSlidingCosSin(const LagunaParams& p, int64_t rows, int64_t pos0) {
   const int64_t rd = p.rotary_dim_sliding;
   VT_CHECK(rd > 0 && rd % 2 == 0,
            "laguna rope: rotary_dim_sliding must be positive/even");
@@ -155,7 +156,7 @@ std::vector<float> BuildLagunaSlidingCosSin(const LagunaParams& p, int64_t rows)
     inv_freq[static_cast<size_t>(i)] =
         static_cast<float>(1.0 / std::pow(base, exponent));
   }
-  return FillCosSin(inv_freq, rd, rows, /*mscale=*/1.0F);
+  return FillCosSin(inv_freq, rd, rows, /*mscale=*/1.0F, pos0);
 }
 
 }  // namespace vllm
