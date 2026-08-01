@@ -59,6 +59,21 @@ struct LagunaDeviceKernels {
   void (*sigmoid_topk)(vt::Queue&, int32_t* ids, float* weights, const float* logits,
                        const float* bias, bool has_bias, int64_t E, int64_t topk, bool renorm,
                        float scale);
+  // Brick A2 GRAPH variant of decode_attn_gqa (capturable). Identical math but the
+  // two per-step-varying scalars come from DEVICE buffers so a captured CUDA graph
+  // reads them at REPLAY: q_pos=*pos_dev, kv_rows=*len_dev (fixed pointers, contents
+  // refreshed by the host outside capture). The current token's row is passed
+  // SEPARATELY (knew/vnew, [Hkv,Dh]) rather than pre-appended to the cache — the
+  // graph appends it BETWEEN replays at a host-known slot (a varying offset must
+  // never be a captured arg). Attends cache rows j in [0,len) (global pos
+  // first_pos+j) PLUS the new row (index len, global pos q_pos). first_pos / window /
+  // Hq / Hkv / Dh / group / scale are per-layer constants baked at capture. The key
+  // set == decode_attn_gqa's cache[0..rows) AFTER the between-replay append, so the
+  // replayed output is bit-identical to the eager decode_attn_gqa. NO attn-sink.
+  void (*decode_attn_gqa_g)(vt::Queue&, float* o, const float* q, const float* k, const float* v,
+                            const float* knew, const float* vnew, int64_t Hq, int64_t Hkv,
+                            int64_t Dh, int64_t group, int64_t first_pos, int64_t window,
+                            float scale, const int* len_dev, const int* pos_dev);
 };
 
 // Resolver (throws on a CPU-only build where nothing registered for kLaguna,kCUDA).

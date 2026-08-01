@@ -1364,6 +1364,20 @@ inline bool LagunaResidentDecodeEnabled() {
   return on;
 }
 
+// ── Brick A2: capture the resident T=1 decode step into ONE CUDA graph and replay
+// it — collapsing the ~700 host kernel launches/token into a single cudaGraphLaunch
+// (the path to vLLM-NVFP4's 18.8 tok/s; the A1 eager resident measured ~14). Default
+// OFF (VT_LAGUNA_DECODE_GRAPH=1 to enable); the A1 eager resident path stays the
+// fallback. Mirror of deepseek_v4.cpp DecodeGraphEnabled()/VT_V4_DECODE_GRAPH. inline
+// so an unused CPU build (VT_MARLIN_NVFP4 off, graph excluded) does not -Wunused.
+inline bool LagunaDecodeGraphEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_DECODE_GRAPH");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 bool LagunaCanRunResidentDecode(const LagunaParams& p, vt::Queue& q, const LagunaWeights& w,
                                 int64_t T) {
 #ifndef VT_MARLIN_NVFP4
@@ -1556,6 +1570,329 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
   return LagunaFinalLogits(q, weights, hidden, 1, logits_indices);
 }
 
+#ifdef VT_MARLIN_NVFP4
+namespace {
+// ─── Brick A2: the DECODE CUDA GRAPH (mirror of deepseek_v4.cpp V4Graph) ──────────
+// Capture the now-100%-device resident T=1 step (the A1 chain) into ONE graph and
+// replay it — one cudaGraphLaunch/step instead of ~700 host launches (the A1 eager
+// resident measured ~45% GPU-idle from host-launch gaps). The whole per-layer chain
+// runs over PERSISTENT member buffers (never resized → stable addresses the captured
+// graph bakes); the ONLY per-step-varying inputs (embed→hidden, position, KV length,
+// the single-row RoPE cos/sin) live in persistent buffers whose CONTENTS the driver
+// refreshes OUTSIDE capture before each replay. The growing KV is handled cudagraph-
+// safely: fixed-capacity per-layer cache_k/cache_v seeded from the prefill KV; the
+// kv-norm+RoPE writes the new token's K/V to a FIXED per-layer knew[l]/vnew[l] scratch
+// (NOT the varying cache slot); decode_attn_gqa_g attends cache[0..len) + knew/vnew
+// with len/pos read from DEVICE buffers; and BETWEEN replays the driver async-copies
+// knew[l]/vnew[l]→cache_k[l]/cache_v[l] at the host-known slot (NOT inside capture) +
+// advances the row count. cold→warm→captured: the cold step runs eager (warms the
+// DevicePool + the per-stream GEMM scratch, grow-only → capture does zero fresh
+// cudaMalloc, which stream capture forbids). [[cudagraph-capture-bakes-stack-
+// addresses]]: EVERY captured input is a member buffer, never a stack temporary or a
+// per-token ReadF32 (norms are pre-converted ONCE in the ctor). Gate BY TOKENS.
+//
+// Single-len_buf scope: correct while every layer keeps the SAME cached-row count and
+// first_pos==0 — holds for a prompt P < the 512 sliding window (the P=6 benchmark).
+// The ctor VT_CHECKs it; the per-layer ring-buffer graph (diverging sliding evictions)
+// is a named follow-up (Brick A2b), NOT blocking here.
+//
+// NOVEL capture risk vs V4Graph (flagged for the GPU token-gate): V4Graph uses ZERO
+// pooled scratch in-graph; Laguna's MoE (LagunaMoeResidentMarlinInto) allocates ~10
+// DevicePool DBufs per call. Capture is safe iff (a) the cold warm-run already touched
+// every DBuf size-class (so capture pops warm blocks, no cudaMalloc), and (b) nothing
+// else Gets those size-classes between/after replays (single in-flight sequence). The
+// pool is deterministic LIFO, so the baked pooled pointers stay valid across replays.
+struct LagunaGraph {
+  const LagunaWeights* w;
+  const LagunaParams* p;
+  vt::Queue* qp;
+  vt::Device dev;
+  int64_t H, Vsz, Dh, Hkv, kvdim, nlayers, E, topk, moe_I, dense_I;
+  float eps, scale;
+  int64_t max_cap = 0;
+  int64_t kv_rows = 0;  // uniform cached-row count for ALL layers (grows 1/token)
+  struct LayerC {
+    int64_t Hq, qdim, group, rd, window;
+    bool global, is_dense;
+  };
+  std::vector<LayerC> lc;
+  // persistent per-layer device KV (seeded from prefill) + fixed new-row scratch.
+  std::vector<std::vector<float>> cache_k, cache_v, knew, vnew;
+  // persistent per-layer f32 norms/bias — pre-converted ONCE (kills per-token ReadF32
+  // + the stack-baked-pointer hazard).
+  std::vector<std::vector<float>> input_norm_f, q_norm_f, k_norm_f, post_norm_f, moe_bias_f;
+  std::vector<float> final_norm_f;
+  // persistent single-row RoPE cos/sin (contents refreshed each token OUTSIDE capture).
+  std::vector<float> yarn_row, slide_row;
+  // per-step device-read scalars (FIXED pointers, contents refreshed each token).
+  std::vector<int> pos_buf, len_buf;
+  // persistent working scratch (all members → stable captured addresses).
+  std::vector<float> hidden, hn, qv, gl, attn, o, gating, dg, du, dact, fdn, so, doutb, topw,
+      logits;
+  std::vector<uint16_t> abf;
+  std::vector<int32_t> eids32;
+  void* graph = nullptr;
+  int gstate = 0;  // 0 cold (eager warm-run), 1 warm (capture+replay), 2 captured (replay)
+
+  LagunaGraph(const LagunaWeights& w_, vt::Queue& q, LagunaKvCache& cache)
+      : w(&w_), p(&w_.params), qp(&q), dev(q.device) {
+    H = p->hidden_size; Vsz = p->vocab_size; Dh = p->head_dim;
+    Hkv = p->num_key_value_heads; kvdim = Hkv * Dh;
+    nlayers = p->num_hidden_layers;
+    E = p->num_experts; topk = p->num_experts_per_tok;
+    moe_I = p->moe_intermediate_size; dense_I = p->intermediate_size;
+    eps = p->rms_norm_eps;
+    scale = 1.0F / std::sqrt(static_cast<float>(Dh));
+    int64_t Hq_max = p->num_attention_heads;
+    for (int64_t l = 0; l < nlayers; ++l) Hq_max = std::max(Hq_max, p->QHeadsForLayer(l));
+    const int64_t qdim_max = Hq_max * Dh;
+    const int64_t maxI = std::max(moe_I, dense_I);
+    const int64_t maxK = std::max({H, qdim_max, moe_I, dense_I});
+    lc.resize(static_cast<size_t>(nlayers));
+    for (int64_t l = 0; l < nlayers; ++l) {
+      lc[static_cast<size_t>(l)] = {p->QHeadsForLayer(l), p->QHeadsForLayer(l) * Dh,
+                                    p->GqaGroupForLayer(l), p->RotaryDimForLayer(l),
+                                    p->WindowForLayer(l), p->IsGlobalLayer(l),
+                                    w->layers[static_cast<size_t>(l)].is_dense};
+    }
+    // single-len_buf validity + the seed row count (uniform across layers for P<512).
+    VT_CHECK(!cache.k.empty() && static_cast<int64_t>(cache.k.size()) == nlayers,
+             "laguna decode graph: prefill KV missing (build after prefill only)");
+    const int64_t rows0 = static_cast<int64_t>(cache.k[0].size()) / kvdim;
+    for (int64_t l = 0; l < nlayers; ++l) {
+      VT_CHECK(cache.first_pos[static_cast<size_t>(l)] == 0 &&
+                   static_cast<int64_t>(cache.k[static_cast<size_t>(l)].size()) / kvdim == rows0,
+               "laguna decode graph: single-len_buf requires uniform per-layer KV (prompt "
+               "< sliding window 512); the per-layer ring-buffer graph is Brick A2b");
+    }
+    kv_rows = rows0;
+    max_cap = rows0 + 1024;  // decode headroom
+    // persistent per-layer KV seeded from the host prefill KV; fixed new-row scratch.
+    cache_k.assign(static_cast<size_t>(nlayers), {});
+    cache_v.assign(static_cast<size_t>(nlayers), {});
+    knew.assign(static_cast<size_t>(nlayers), {});
+    vnew.assign(static_cast<size_t>(nlayers), {});
+    for (int64_t l = 0; l < nlayers; ++l) {
+      const size_t cap = static_cast<size_t>(max_cap * kvdim);
+      cache_k[static_cast<size_t>(l)].assign(cap, 0.0F);
+      cache_v[static_cast<size_t>(l)].assign(cap, 0.0F);
+      const std::vector<float>& kc = cache.k[static_cast<size_t>(l)];
+      const std::vector<float>& vc = cache.v[static_cast<size_t>(l)];
+      std::copy(kc.begin(), kc.end(), cache_k[static_cast<size_t>(l)].begin());
+      std::copy(vc.begin(), vc.end(), cache_v[static_cast<size_t>(l)].begin());
+      knew[static_cast<size_t>(l)].assign(static_cast<size_t>(kvdim), 0.0F);
+      vnew[static_cast<size_t>(l)].assign(static_cast<size_t>(kvdim), 0.0F);
+    }
+    // persistent f32 norms/bias (pre-converted ONCE — no per-token ReadF32 in-graph).
+    input_norm_f.resize(static_cast<size_t>(nlayers));
+    q_norm_f.resize(static_cast<size_t>(nlayers));
+    k_norm_f.resize(static_cast<size_t>(nlayers));
+    post_norm_f.resize(static_cast<size_t>(nlayers));
+    moe_bias_f.resize(static_cast<size_t>(nlayers));
+    for (int64_t l = 0; l < nlayers; ++l) {
+      const LagunaLayerWeights& L = w->layers[static_cast<size_t>(l)];
+      input_norm_f[static_cast<size_t>(l)] = ReadF32(L.input_norm);
+      post_norm_f[static_cast<size_t>(l)] = ReadF32(L.post_attn_norm);
+      if (p->has_qk_norm && !L.attn.q_norm.Empty()) {
+        q_norm_f[static_cast<size_t>(l)] = ReadF32(L.attn.q_norm);
+        k_norm_f[static_cast<size_t>(l)] = ReadF32(L.attn.k_norm);
+      }
+      if (!L.is_dense && !L.moe.e_score_correction_bias.Empty())
+        moe_bias_f[static_cast<size_t>(l)] = ReadF32(L.moe.e_score_correction_bias);
+    }
+    final_norm_f = ReadF32(w->norm);
+    yarn_row.assign(static_cast<size_t>(p->rotary_dim_full), 0.0F);
+    slide_row.assign(static_cast<size_t>(p->rotary_dim_sliding), 0.0F);
+    pos_buf.assign(1, 0);
+    len_buf.assign(1, 0);
+    // persistent working scratch.
+    hidden.assign(static_cast<size_t>(H), 0.0F);
+    hn.assign(static_cast<size_t>(H), 0.0F);
+    qv.assign(static_cast<size_t>(qdim_max), 0.0F);
+    gl.assign(static_cast<size_t>(Hq_max), 0.0F);
+    attn.assign(static_cast<size_t>(qdim_max), 0.0F);
+    o.assign(static_cast<size_t>(H), 0.0F);
+    gating.assign(static_cast<size_t>(E), 0.0F);
+    dg.assign(static_cast<size_t>(maxI), 0.0F);
+    du.assign(static_cast<size_t>(maxI), 0.0F);
+    dact.assign(static_cast<size_t>(maxI), 0.0F);
+    fdn.assign(static_cast<size_t>(H), 0.0F);
+    so.assign(static_cast<size_t>(H), 0.0F);
+    doutb.assign(static_cast<size_t>(H), 0.0F);
+    topw.assign(static_cast<size_t>(topk), 0.0F);
+    logits.assign(static_cast<size_t>(Vsz), 0.0F);
+    abf.assign(static_cast<size_t>(maxK), 0);
+    eids32.assign(static_cast<size_t>(topk), 0);
+  }
+  ~LagunaGraph() {
+    if (graph != nullptr && qp != nullptr) vt::GetBackend(qp->device).DestroyGraph(graph);
+  }
+  LagunaGraph(const LagunaGraph&) = delete;
+  LagunaGraph& operator=(const LagunaGraph&) = delete;
+
+  // no-sync bf16 GEMM over the persistent abf scratch (mirror of the eager
+  // GemmBf16Into lambda): out[1,N] f32 = cast(x[1,K])·w[N,K]^T. Same-stream ⇒ reusing
+  // one abf buffer across GEMMs is byte-identical (each cast→matmul completes before
+  // the next cast overwrites), and the FIXED abf pointer is capture-safe.
+  void GemmBf16(float* out, const OwnedTensor& wt, const float* x, int64_t N, int64_t K) {
+    vt::Queue& q = *qp;
+    vt::Tensor xf = vt::Tensor::Contiguous(const_cast<float*>(x), vt::DType::kF32, dev, {1, K});
+    vt::Tensor ab = vt::Tensor::Contiguous(abf.data(), vt::DType::kBF16, dev, {1, K});
+    vt::CastBf16(q, ab, xf);
+    vt::Tensor ot = vt::Tensor::Contiguous(out, vt::DType::kF32, dev, {1, N});
+    vt::Tensor wv = wt.View();
+    wv.device = dev;
+    vt::MatmulBT(q, ot, ab, wv);
+  }
+
+  // The per-layer resident chain over the PERSISTENT buffers (the CAPTURE region) —
+  // same math as LagunaForwardResidentDecode's loop body, but: norms read the pre-
+  // converted f32 members; RoPE reads the persistent single-row cos/sin (index 0);
+  // decode_attn uses decode_attn_gqa_g with len_buf/pos_buf (DEVICE); the new K/V go
+  // to the FIXED per-layer knew[l]/vnew[l] (NOT appended in-graph); final norm +
+  // lm_head are INSIDE the region, writing persistent logits.
+  void RunChain() {
+    vt::Queue& q = *qp;
+    const laguna::LagunaDeviceKernels* LAG = laguna::LagunaDevice();
+    auto DevT = [&](float* pp, int64_t I) {
+      return vt::Tensor::Contiguous(pp, vt::DType::kF32, dev, {1, I});
+    };
+    auto SiluMul = [&](float* out, float* g, float* u, int64_t I) {
+      vt::Tensor ot = DevT(out, I);
+      vt::MoeSiluMul(q, ot, DevT(g, I), DevT(u, I));
+    };
+    auto AddInto = [&](float* a, float* b) {
+      vt::Tensor at = DevT(a, H);
+      vt::Add(q, at, at, DevT(b, H));
+    };
+    for (int64_t l = 0; l < nlayers; ++l) {
+      const LagunaLayerWeights& lw = w->layers[static_cast<size_t>(l)];
+      const LayerC& c = lc[static_cast<size_t>(l)];
+      float* kn = knew[static_cast<size_t>(l)].data();
+      float* vn = vnew[static_cast<size_t>(l)].data();
+      const float* rcache = (c.global ? yarn_row : slide_row).data();
+      LAG->rms_norm_seq(q, hn.data(), hidden.data(), input_norm_f[static_cast<size_t>(l)].data(), 1,
+                        H, eps, true);
+      GemmBf16(qv.data(), lw.attn.q_proj, hn.data(), c.qdim, H);
+      GemmBf16(kn, lw.attn.k_proj, hn.data(), kvdim, H);
+      GemmBf16(vn, lw.attn.v_proj, hn.data(), kvdim, H);
+      if (p->has_qk_norm && !lw.attn.q_norm.Empty()) {
+        LAG->rms_norm_seq(q, qv.data(), qv.data(), q_norm_f[static_cast<size_t>(l)].data(), c.Hq,
+                          Dh, eps, true);
+        LAG->rms_norm_seq(q, kn, kn, k_norm_f[static_cast<size_t>(l)].data(), Hkv, Dh, eps, true);
+      }
+      LAG->rope_from_cache(q, qv.data(), rcache, c.Hq, Dh, c.rd, /*pos=*/0);
+      LAG->rope_from_cache(q, kn, rcache, Hkv, Dh, c.rd, /*pos=*/0);
+      // GRAPH decode attention: cache_k[l][0..len) + knew/vnew as the new row, with
+      // len/pos read from the DEVICE buffers. first_pos=0 (uniform, P<512). The new
+      // row is appended to cache_k/cache_v BETWEEN replays (Step), never in-graph.
+      LAG->decode_attn_gqa_g(q, attn.data(), qv.data(), cache_k[static_cast<size_t>(l)].data(),
+                             cache_v[static_cast<size_t>(l)].data(), kn, vn, c.Hq, Hkv, Dh, c.group,
+                             /*first_pos=*/0, c.window, scale, len_buf.data(), pos_buf.data());
+      GemmBf16(gl.data(), lw.attn.g_proj, hn.data(), c.Hq, H);
+      LAG->softplus_head_gate(q, attn.data(), gl.data(), c.Hq, Dh);
+      GemmBf16(o.data(), lw.attn.o_proj, attn.data(), H, c.qdim);
+      AddInto(hidden.data(), o.data());
+      LAG->rms_norm_seq(q, hn.data(), hidden.data(), post_norm_f[static_cast<size_t>(l)].data(), 1,
+                        H, eps, true);
+      if (c.is_dense) {
+        GemmBf16(dg.data(), lw.mlp.gate_proj, hn.data(), dense_I, H);
+        GemmBf16(du.data(), lw.mlp.up_proj, hn.data(), dense_I, H);
+        SiluMul(dact.data(), dg.data(), du.data(), dense_I);
+        GemmBf16(fdn.data(), lw.mlp.down_proj, dact.data(), H, dense_I);
+        AddInto(hidden.data(), fdn.data());
+      } else {
+        GemmBf16(gating.data(), lw.moe.router, hn.data(), E, H);
+        const float* bias = moe_bias_f[static_cast<size_t>(l)].empty()
+                                ? nullptr
+                                : moe_bias_f[static_cast<size_t>(l)].data();
+        LAG->sigmoid_topk(q, eids32.data(), topw.data(), gating.data(), bias, bias != nullptr, E,
+                          topk, p->norm_topk_prob, p->moe_routed_scaling_factor);
+        LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
+                                    topk, doutb.data());
+        GemmBf16(dg.data(), lw.moe.shared_gate, hn.data(), moe_I, H);
+        GemmBf16(du.data(), lw.moe.shared_up, hn.data(), moe_I, H);
+        SiluMul(dact.data(), dg.data(), du.data(), moe_I);
+        GemmBf16(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
+        AddInto(hidden.data(), doutb.data());  // hidden += routed
+        AddInto(hidden.data(), so.data());     // hidden += shared
+      }
+    }
+    // final RMSNorm + lm_head INSIDE the captured region (device), into persistent
+    // logits — the resident/non-graph path does this host-side (LagunaFinalLogits);
+    // moving it on-device adds one block-reduced-norm near-tie point (accepted device
+    // regime, gated vs vLLM). lm_head is the bf16 tower weight (nvfp4 arm), so GemmBf16
+    // matches LqGemm's bf16 device branch.
+    LAG->rms_norm_seq(q, hn.data(), hidden.data(), final_norm_f.data(), 1, H, eps, true);
+    GemmBf16(logits.data(), w->lm_head, hn.data(), Vsz, H);
+  }
+
+  // One decode token: refresh the persistent inputs OUTSIDE capture, run/replay the
+  // step, append this token's per-layer K/V to the fixed-cap cache (on-stream, between
+  // replays), read logits. Mirror of V4Graph::Step.
+  std::vector<float> Step(int32_t token, int32_t pos) {
+    vt::Queue& q = *qp;
+    VT_CHECK(kv_rows + 1 <= max_cap, "laguna decode graph: KV capacity exceeded");
+    // (1) embed → persistent hidden (host gather into the unified buffer).
+    {
+      const OwnedTensor& et = w->embed;
+      const uint8_t* raw = et.bytes.data();
+      const bool is_bf16 = et.dtype == vt::DType::kBF16;
+      float* dst = hidden.data();
+      if (is_bf16) {
+        const auto* bb =
+            reinterpret_cast<const uint16_t*>(raw) + static_cast<size_t>(token) * H;
+        for (int64_t i = 0; i < H; ++i) {
+          const uint32_t bits = static_cast<uint32_t>(bb[i]) << 16;
+          std::memcpy(&dst[i], &bits, sizeof(float));
+        }
+      } else {
+        std::memcpy(dst, reinterpret_cast<const float*>(raw) + static_cast<size_t>(token) * H,
+                    static_cast<size_t>(H) * sizeof(float));
+      }
+    }
+    // (2) device-read scalars.
+    pos_buf[0] = pos;
+    len_buf[0] = static_cast<int>(kv_rows);
+    // (3) single-row RoPE cos/sin for `pos` into the persistent buffers (pointer fixed,
+    // CONTENTS refreshed — the captured rope_from_cache reads row 0).
+    {
+      const std::vector<float> yr = BuildLagunaFullYarnCosSin(*p, /*rows=*/1, /*pos0=*/pos);
+      const std::vector<float> sr = BuildLagunaSlidingCosSin(*p, /*rows=*/1, /*pos0=*/pos);
+      std::copy(yr.begin(), yr.end(), yarn_row.begin());
+      std::copy(sr.begin(), sr.end(), slide_row.begin());
+    }
+    vt::Backend& b = vt::GetBackend(dev);
+    if (gstate == 0) {         // cold: eager warm-run (warms the pool + GEMM scratch)
+      RunChain();
+      gstate = 1;
+    } else if (gstate == 1) {  // warm: capture the region once, then replay it
+      b.BeginCapture(q);
+      RunChain();
+      graph = b.EndCaptureGraph(q);
+      b.ReplayGraph(q, graph);
+      gstate = 2;
+    } else {                   // captured: one cudaGraphLaunch
+      b.ReplayGraph(q, graph);
+    }
+    // append this token's per-layer knew/vnew → cache at slot kv_rows (on the stream,
+    // AFTER the step produced knew/vnew, BEFORE the next replay reads it) — the growing
+    // KV. Host-known offset here is legal (NOT a captured arg).
+    const size_t rowbytes = static_cast<size_t>(kvdim) * sizeof(float);
+    for (int64_t l = 0; l < nlayers; ++l) {
+      b.Copy(q, cache_k[static_cast<size_t>(l)].data() + kv_rows * kvdim,
+             knew[static_cast<size_t>(l)].data(), rowbytes);
+      b.Copy(q, cache_v[static_cast<size_t>(l)].data() + kv_rows * kvdim,
+             vnew[static_cast<size_t>(l)].data(), rowbytes);
+    }
+    kv_rows++;
+    b.Synchronize(q);  // the ONE step-boundary drain: logits ready, appends complete
+    return logits;
+  }
+};
+}  // namespace
+#endif  // VT_MARLIN_NVFP4
+
 std::vector<float> LagunaForwardGgufCached(const LagunaWeights& weights, vt::Queue& q,
                                            LagunaKvCache& cache,
                                            const std::vector<int32_t>& token_ids,
@@ -1589,6 +1926,25 @@ std::vector<float> LagunaForwardGgufCached(const LagunaWeights& weights, vt::Que
   // N5 device-resident T=1 decode fast path (VT_LAGUNA_RESIDENT_DECODE, default OFF).
   if (LagunaCanRunResidentDecode(p, q, weights, T) && logits_indices.size() == 1 &&
       logits_indices[0] == 0) {
+#ifdef VT_MARLIN_NVFP4
+    // Brick A2 (VT_LAGUNA_DECODE_GRAPH=1): after prefill (cache.len>0), drive the
+    // resident step through a captured CUDA graph — one cudaGraphLaunch/step. The
+    // prefill step (cache.len==0, T>1) never reaches here (T!=1 fails the guard) and
+    // fills cache.k/cache.v the graph seeds from. Default OFF; the A1 eager resident
+    // path below is the fallback. Mirror of DeepseekV4ForwardGgufCached (deepseek_v4.
+    // cpp:2173-2183).
+    if (LagunaDecodeGraphEnabled() && cache.len > 0) {
+      if (!cache.decode_graph) {
+        cache.decode_graph = std::shared_ptr<void>(
+            new LagunaGraph(weights, q, cache),
+            [](void* g) { delete static_cast<LagunaGraph*>(g); });
+      }
+      auto* g = static_cast<LagunaGraph*>(cache.decode_graph.get());
+      std::vector<float> lg = g->Step(token_ids[0], positions[0]);
+      cache.len += T;
+      return lg;
+    }
+#endif  // VT_MARLIN_NVFP4
     std::vector<float> lg =
         LagunaForwardResidentDecode(weights, q, cache, token_ids, positions, logits_indices);
     cache.len += T;
