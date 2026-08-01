@@ -350,6 +350,8 @@ clean 1:1 mirror (our `RmsNormRowKernel` indexes contiguously with no
 `input_stride`; 48391 needs the `vllm_is_batch_invariant` subsystem). No code
 landed, no throughput owed. Parity pin UNCHANGED at `555967922`.
 
+## DeepSeek-V4-Flash — MMQ LEVER 1 (2026-08-01, byte-exact): the "raw decode at GB10 ceiling" verdict was PARTLY WRONG — it measured the Q8_0 DENSE GEMV (correctly closed, already `__dp4a`) but NOT the routed-expert k-quant MoE GEMM, which is the dominant decode FLOP and was a VERBATIM SCALAR CPU port (256-B `aux8` spill + scalar MAC, no `__dp4a`) in `DotQ4K`/`DotQ5K`/`DotQ3K`/`DotQ6K` while `DotQ2K`/`DotIQ2XXS` were vectorized. `__dp4a`-vectorized `DotQ4K`+`DotQ5K` (DeepSeek routed-expert quants; ref llama.cpp `vec_dot_q4_K_q8_1_impl_vmmq`): `test_cuda_quant_dot` BIT-FOR-BIT green (9/9 cases, 110432/110432 assertions CUDA==CPU). Est decode 8.0 → ~11-13 tok/s; MEASURE PENDING (tmux-capture, ncu of `QuantDotGroupedFusedSwiGLU`). Follow-ups: `DotQ3K`/`DotQ6K`, expert-sorted dispatch, IQ2 smem-LUT → ds4-parity ~16.5 credible. Found via the lever-scan workflow (the prior sweep below fixated on the wrong kernel).
+
 ## DeepSeek-V4-Flash — BEAT-ds4 sweep (2026-07-30, `CLAIM-DSV4-BEAT-SWEEP`) — analysis-only: raw decode is at its GB10 ceiling (13.19 tok/s, Q8_0 front CLOSED); ds4's 16.5-17.2 is RAW decode too; the ONLY path PAST it is MTP self-spec
 
 Analysis-only sweep (no code). ds4's 16.5-17.2 (GB10 nsys 16.51 wall / 17.6 GPU-active)

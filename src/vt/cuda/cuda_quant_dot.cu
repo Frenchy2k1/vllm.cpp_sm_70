@@ -369,15 +369,6 @@ __device__ inline float DotQ4K(const BlockQ4_K* xb, const BlockQ8_K* yb) {
   const uint32_t kmask3 = 0x03030303;
   const uint8_t* q4 = xb->qs;
   const int8_t* q8 = yb->qs;
-  int8_t aux8[kQK_K];
-  int8_t* a = aux8;
-  for (int j = 0; j < kQK_K / 64; ++j) {
-    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(q4[l] & 0xF);
-    a += 32;
-    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(q4[l] >> 4);
-    a += 32;
-    q4 += 32;
-  }
   uint32_t utmp[4];
   memcpy(utmp, xb->scales, 12);
   utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
@@ -389,20 +380,26 @@ __device__ inline float DotQ4K(const BlockQ4_K* xb, const BlockQ8_K* yb) {
   const uint8_t* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
   int sumi = 0;
   for (int j = 0; j < kQK_K / 16; ++j) sumi += yb->bsums[j] * mins[j / 2];
-  a = aux8;
-  int is = 0;
-  const int8_t* q8p = q8;
-  int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  for (int j = 0; j < kQK_K / 32; ++j) {
-    const int32_t scale = scales[is++];
-    for (int pass = 0; pass < 4; ++pass) {
-      for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8p[l] * a[l]);
-      q8p += 8; a += 8;
+  // __dp4a-VECTORIZED (mirrors DotQ2K): the 8 sub-blocks of 32 each carry ONE scale;
+  // sub-block sb reads the low (sb even) / high (sb odd) nibble of q4 group (sb/2)*32
+  // against q8[sb*32..], and isum = Σ_sb scale_sb·Σ(q4·q8). BYTE-IDENTICAL to the
+  // scalar aux8 form (int32 dp4a == the scalar int accumulation), but kills the
+  // 256-B/lane aux8 local-mem spill + scalar MAC that throttled the dominant
+  // routed-expert (Q4_K) decode GEMM. Ref: llama.cpp vec_dot_q4_K_q8_1_impl_vmmq.
+  int isum = 0;
+  for (int sb = 0; sb < kQK_K / 32; ++sb) {
+    const int scale = scales[sb];
+    const uint8_t* q4b = q4 + (sb / 2) * 32;
+    const int8_t* q8b = q8 + sb * 32;
+    const int shift = (sb & 1) ? 4 : 0;
+    int sub = 0;
+    for (int l = 0; l < 32; l += 4) {
+      const int v = (*reinterpret_cast<const int*>(q4b + l) >> shift) & 0x0F0F0F0F;
+      sub = __dp4a(v, *reinterpret_cast<const int*>(q8b + l), sub);
     }
+    isum += scale * sub;
   }
   const float d = DF16ToF32(xb->d) * yb->d;
-  int isum = 0;
-  for (int l = 0; l < 8; ++l) isum += aux32[l];
   const float dmin = DF16ToF32(xb->dmin) * yb->d;
   return d * isum - dmin * sumi;
 }
@@ -415,18 +412,6 @@ __device__ inline float DotQ5K(const BlockQ5_K* xb, const BlockQ8_K* yb) {
   const uint8_t* q4 = xb->qs;
   const uint8_t* hm = xb->qh;
   const int8_t* q8 = yb->qs;
-  int8_t aux8[kQK_K];
-  int8_t* a = aux8;
-  uint8_t m = 1;
-  for (int j = 0; j < kQK_K / 64; ++j) {
-    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(q4[l] & 0xF);
-    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(a[l] + ((hm[l] & m) ? 16 : 0));
-    a += 32; m = static_cast<uint8_t>(m << 1);
-    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(q4[l] >> 4);
-    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(a[l] + ((hm[l] & m) ? 16 : 0));
-    a += 32; m = static_cast<uint8_t>(m << 1);
-    q4 += 32;
-  }
   uint32_t utmp[4];
   memcpy(utmp, xb->scales, 12);
   utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
@@ -438,20 +423,25 @@ __device__ inline float DotQ5K(const BlockQ5_K* xb, const BlockQ8_K* yb) {
   const uint8_t* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
   int sumi = 0;
   for (int j = 0; j < kQK_K / 16; ++j) sumi += yb->bsums[j] * mins[j / 2];
-  a = aux8;
-  int is = 0;
-  const int8_t* q8p = q8;
-  int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  for (int j = 0; j < kQK_K / 32; ++j) {
-    const int32_t scale = scales[is++];
-    for (int pass = 0; pass < 4; ++pass) {
-      for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8p[l] * a[l]);
-      q8p += 8; a += 8;
+  // __dp4a-VECTORIZED (see DotQ4K): 8 sub-blocks of 32, one scale each. The Q5_K
+  // 5-bit value = 4-bit nibble | (qh bit << 4); sub-block sb uses qh mask (1<<sb) over
+  // hm[0..31]. isum = Σ_sb scale_sb·Σ((nibble|hi)·q8) — BYTE-IDENTICAL to the scalar
+  // aux8 form, no 256-B local spill. Values 0..31 are non-negative so signed dp4a matches.
+  int isum = 0;
+  for (int sb = 0; sb < kQK_K / 32; ++sb) {
+    const int scale = scales[sb];
+    const uint8_t* q4b = q4 + (sb / 2) * 32;
+    const int8_t* q8b = q8 + sb * 32;
+    const int shift = (sb & 1) ? 4 : 0;
+    int sub = 0;
+    for (int l = 0; l < 32; l += 4) {
+      const int lo = (*reinterpret_cast<const int*>(q4b + l) >> shift) & 0x0F0F0F0F;
+      const int hi = ((*reinterpret_cast<const int*>(hm + l) >> sb) & 0x01010101) << 4;
+      sub = __dp4a(lo | hi, *reinterpret_cast<const int*>(q8b + l), sub);
     }
+    isum += scale * sub;
   }
   const float d = DF16ToF32(xb->d) * yb->d;
-  int isum = 0;
-  for (int l = 0; l < 8; ++l) isum += aux32[l];
   const float dmin = DF16ToF32(xb->dmin) * yb->d;
   return d * isum - dmin * sumi;
 }
