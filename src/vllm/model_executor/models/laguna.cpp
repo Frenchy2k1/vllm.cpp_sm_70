@@ -426,7 +426,31 @@ void BuildLagunaMoeMarlinResident(vllm::dense_nvfp4::Dev d, const LagunaMoeWeigh
   d.b.Copy(d.q, mr.g_up, gu.data(), gu.size() * sizeof(float));
   d.b.Copy(d.q, mr.g_down, gd.data(), gd.size() * sizeof(float));
   d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
-  d.b.Synchronize(d.q);  // repack done
+  d.b.Synchronize(d.q);  // repack done → safe to free the fp4 originals
+
+  // CRITICAL (matches qwen3_5.cpp BuildMoeMarlinResident tail): the Marlin resident
+  // is now the committed compute path, so FREE the per-expert fp4 originals — both
+  // the ResidentNvfp4 device transients (d_packed/d_scale, ~expert-tower-sized) and
+  // the HOST mirror (packed/scale .bytes). Without this, peak = host copies + device
+  // transients + Marlin resident ≈ 3× the expert tower, blowing past the 119 GiB
+  // unified pool (a failed Alloc mid-build → null → silent device fault). Safe here:
+  // BuildLagunaMoeMarlinResident runs ONLY under LagunaMarlinMoeEnabled(), so the
+  // GEMV/CPU paths that read these bytes can never run in this process.
+  for (int e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    moe.experts_gate_fp4[se].d_packed.reset();
+    moe.experts_gate_fp4[se].d_scale.reset();
+    moe.experts_up_fp4[se].d_packed.reset();
+    moe.experts_up_fp4[se].d_scale.reset();
+    moe.experts_down_fp4[se].d_packed.reset();
+    moe.experts_down_fp4[se].d_scale.reset();
+    moe.experts_gate_fp4[se].packed.ReleaseHost();
+    moe.experts_gate_fp4[se].scale.ReleaseHost();
+    moe.experts_up_fp4[se].packed.ReleaseHost();
+    moe.experts_up_fp4[se].scale.ReleaseHost();
+    moe.experts_down_fp4[se].packed.ReleaseHost();
+    moe.experts_down_fp4[se].scale.ReleaseHost();
+  }
   mr.ready = true;
 }
 }  // namespace
