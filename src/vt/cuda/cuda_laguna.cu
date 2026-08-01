@@ -30,18 +30,27 @@ using vt::RegisterOp;
 
 cudaStream_t AsStream(Queue& q) { return static_cast<cudaStream_t>(q.handle); }
 
-// ── RMSNorm (sequential SoS per row; bit-exact to RmsNorm:94 / RmsNormHeads:112) ──
-// One thread per row: ss = Σ x[i]²  (host order); inv = 1/sqrtf(ss/n + eps).
+// ── RMSNorm (block-per-row, block-reduced SoS; NEAR-TIE vs host RmsNorm:94/:112, in
+// the accepted device regime — user-ratified 2026-08-01: gate the device path vs vLLM).
+// One BLOCK per row: blockDim threads reduce Σ x[i]²; inv = 1/sqrtf(ss/n + eps).
 __global__ void RmsNormSeqKernel(float* out, const float* x, const float* w, int64_t rows,
                                  int64_t n, float eps, bool has_w) {
-  const int64_t r = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t r = static_cast<int64_t>(blockIdx.x);
   if (r >= rows) return;
   const float* xr = x + r * n;
   float* orow = out + r * n;
-  float ss = 0.0f;
-  for (int64_t i = 0; i < n; ++i) ss += xr[i] * xr[i];
-  const float inv = 1.0f / sqrtf(ss / static_cast<float>(n) + eps);
-  for (int64_t i = 0; i < n; ++i) orow[i] = xr[i] * inv * (has_w ? w[i] : 1.0f);
+  float local = 0.0f;
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) local += xr[i] * xr[i];
+  __shared__ float sh[256];
+  sh[threadIdx.x] = local;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(sh[0] / static_cast<float>(n) + eps);
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x)
+    orow[i] = xr[i] * inv * (has_w ? w[i] : 1.0f);
 }
 
 // ── partial-NeoX RoPE from a half-split [rope_rows,rd] cache (bit-exact to ApplyRope) ──
@@ -171,7 +180,9 @@ inline int Blocks(int64_t n) { return static_cast<int>((n + kTPB - 1) / kTPB); }
 
 void RmsNormSeqLaunch(Queue& q, float* out, const float* x, const float* w, int64_t rows,
                       int64_t n, float eps, bool has_w) {
-  RmsNormSeqKernel<<<Blocks(rows), kTPB, 0, AsStream(q)>>>(out, x, w, rows, n, eps, has_w);
+  // one block per row; 256 threads (matches the __shared__ sh[256] reduction).
+  RmsNormSeqKernel<<<static_cast<unsigned>(rows), 256, 0, AsStream(q)>>>(out, x, w, rows, n, eps,
+                                                                         has_w);
 }
 void RopeFromCacheLaunch(Queue& q, float* x, const float* cache, int64_t heads, int64_t Dh,
                          int64_t rd, int64_t pos) {
