@@ -557,9 +557,15 @@ std::vector<float> LagunaMoeResidentMarlin(vt::Queue& q, const LagunaMoeWeights&
 // policy. VT_LAGUNA_MARLIN_MOE=1 enables. Only meaningful when VT_MARLIN_NVFP4
 // compiled the path in.
 inline bool LagunaMarlinMoeEnabled() {
+  // DEFAULT ON: the Marlin W4A16 grouped MoE is vLLM's own 18.8-tok/s kernel and the
+  // validated fast Laguna-NVFP4 decode path (reproduced 3× on GB10, golden-matching,
+  // ~10 tok/s = ~1.5× the fp4-GEMV fallback). It just works with no env; only an
+  // explicit VT_LAGUNA_MARLIN_MOE=0 opts back out to the fp4 GEMV/resident path (the
+  // same-binary A/B escape hatch). CUDA + VT_MARLIN_NVFP4 only; a CPU/non-marlin build
+  // never compiles the branch, so it falls to the fp4 path automatically.
   static const bool on = [] {
     const char* e = std::getenv("VT_LAGUNA_MARLIN_MOE");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
   return on;
 }
