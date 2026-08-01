@@ -1335,9 +1335,6 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       o(static_cast<size_t>(H));
   std::vector<uint16_t> abf(static_cast<size_t>(maxK));
 
-  auto NormPtr = [](const OwnedTensor& w) {
-    return reinterpret_cast<const float*>(w.bytes.data());
-  };
   // no-sync bf16 GEMM: out[1,N] f32 = cast(x[1,K])·w[N,K]^T (mirror LqGemm device path)
   auto GemmBf16Into = [&](float* out, const OwnedTensor& w, const float* x, int64_t N, int64_t K) {
     vt::Tensor xf = vt::Tensor::Contiguous(const_cast<float*>(x), DType::kF32, dev, {1, K});
@@ -1358,14 +1355,20 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     const int64_t window = p.WindowForLayer(l);
     const float* rcache = (global ? yarn_cache : slide_cache).data();
 
-    LAG->rms_norm_seq(q, hn.data(), hidden.data(), NormPtr(lw.input_norm), 1, H, eps, true);
+    // Norm weights via ReadF32 (bf16->f32 exact, matching the host golden); layer-scoped
+    // so they outlive both DrainQueues.
+    const std::vector<float> w_in = ReadF32(lw.input_norm);
+    LAG->rms_norm_seq(q, hn.data(), hidden.data(), w_in.data(), 1, H, eps, true);
     std::vector<float> knew(static_cast<size_t>(kvdim)), vnew(static_cast<size_t>(kvdim));
     GemmBf16Into(qv.data(), lw.attn.q_proj, hn.data(), qdim, H);
     GemmBf16Into(knew.data(), lw.attn.k_proj, hn.data(), kvdim, H);
     GemmBf16Into(vnew.data(), lw.attn.v_proj, hn.data(), kvdim, H);
+    std::vector<float> w_qn, w_kn;
     if (p.has_qk_norm && !lw.attn.q_norm.Empty()) {
-      LAG->rms_norm_seq(q, qv.data(), qv.data(), NormPtr(lw.attn.q_norm), Hq, Dh, eps, true);
-      LAG->rms_norm_seq(q, knew.data(), knew.data(), NormPtr(lw.attn.k_norm), Hkv, Dh, eps, true);
+      w_qn = ReadF32(lw.attn.q_norm);
+      w_kn = ReadF32(lw.attn.k_norm);
+      LAG->rms_norm_seq(q, qv.data(), qv.data(), w_qn.data(), Hq, Dh, eps, true);
+      LAG->rms_norm_seq(q, knew.data(), knew.data(), w_kn.data(), Hkv, Dh, eps, true);
     }
     LAG->rope_from_cache(q, qv.data(), rcache, Hq, Dh, rd, pos);
     LAG->rope_from_cache(q, knew.data(), rcache, Hkv, Dh, rd, pos);
@@ -1396,7 +1399,8 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       vt::Tensor ot = vt::Tensor::Contiguous(o.data(), DType::kF32, dev, {1, H});
       vt::Add(q, ht, ht, ot);
     }
-    LAG->rms_norm_seq(q, hn.data(), hidden.data(), NormPtr(lw.post_attn_norm), 1, H, eps, true);
+    const std::vector<float> w_pa = ReadF32(lw.post_attn_norm);
+    LAG->rms_norm_seq(q, hn.data(), hidden.data(), w_pa.data(), 1, H, eps, true);
     DrainQueue(q);  // hn (post-attn norm) host-readable for the FFN
 
     const std::vector<float> f = LagunaFfnBlock(q, lw, p, hn, 1);
