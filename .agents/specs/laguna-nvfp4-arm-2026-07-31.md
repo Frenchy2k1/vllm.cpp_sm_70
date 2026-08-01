@@ -215,8 +215,17 @@ N5 SPEED PLAN (the user's goal — reach ≥ vLLM 18.8 tok/s, both at NVFP4; tra
    6.34 → 0.39 s/tok (16.3×; 0.16 → 2.56 tok/s), prefill 17.3 → 2.24s; coherence preserved
    (near-tie shifted slightly from bf16-activation rounding). CPU path keeps `MatmulNK` (run-gate
    byte-identical); GGUF tower is block-quant so nvfp4-arm-only. STILL 7.3× short of vLLM 18.8.
-3. **Grouped W4A4 MoE** — one grouped fp4 GEMM per gate/up/down instead of the per-expert
-   loop (mirror the A3/W9 `MatmulBTQuantGrouped` fold, but for nvfp4).
+3. **Grouped W4A4 MoE — NEXT lever (post-lever-1 nsys: 22,115 `cudaStreamSynchronize`/run =
+   78.6% of API time, ~2,760/token — the per-GEMM `DrainQueue` in the per-expert loop; GPU
+   kernels are fast, the arm is HOST-SYNC-bound).** Collapse the top_k×3 per-expert
+   GEMMs+drains/layer into 3 grouped GEMMs. DESIGN INPUT (checked 2026-08-01): `vt::MoeGroupedGemmNvfp4`
+   exists but is **W4A16** (bf16 activation, only `scale2` — the 35B uses it at `qwen3_5.cpp:4645`),
+   so it is NOT drop-in for our TRUE-W4A4 experts (wrong numerics — no fp4 activation quant / no
+   `input_global_scale`/`alpha`). Options: (a) a NEW grouped fp4×fp4 (W4A4) op — quantize the
+   shared token activation to fp4 ONCE, then a grouped fp4×fp4 GEMM over the top_k expert weights;
+   (b) switch the experts to the `use_a16` W4A16 grouped mode (valid per the MIRROR directive, but
+   a numerics change to verify) — both ALSO need the per-expert `Nvfp4Weight` vector STACKED at load
+   (like qwen3_5 A3 W2) so the grouped op sees one `[E*N,K]` block. Needs a spike.
 4. **Device residency** — stage `d_packed`/`d_scale` once (ResidentNvfp4), drop the
    per-GEMM host round-trip + `DrainQueue` sync.
 5. Decode CUDA-graph + on-GPU sampling (the ds4/35B host-orchestration levers).
