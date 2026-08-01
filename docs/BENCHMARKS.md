@@ -69,6 +69,19 @@ DeepSeek-V4-Flash has been benchmarked against `ds4` = **DwarfStar** (antirez's 
 
 The model is ~300B+ total params, so even 4-bit weights are 156-168 GB. The only quant that fits one Spark is extreme-low-bit GGUF, which vLLM can't load here. So on one Spark the ONLY feasible engines are GGUF (our engine, DwarfStar, llama.cpp) — **DwarfStar was forced by the hardware, not an off-policy shortcut** (contrast Laguna, where vLLM fit and llama.cpp-only was avoidable). The policy-correct vLLM DeepSeek comparison is OWED but requires **2× GB10 Sparks + TP2** (the anemll checkpoint, ~90 GB/GPU) over the landed NCCL intra-node TP seam — a multi-node effort, not a single-box run. DwarfStar stays a labeled secondary best-in-class-GGUF peer meanwhile.
 
+## Laguna-NVFP4 — decode-isolated host-sync attribution: the 1.9× to vLLM 18.8 is orchestration, not kernels (2026-08-01, `CLAIM-LAGUNA-DECODE-SYNC`)
+
+Marlin-default decode is ~10 tok/s (0.10 s/tok) vs vLLM-NVFP4 18.8 (~1.9×). To attribute the residual byte-exactly, ran two nsys profiles (`laguna-gen --gpu`, GB10, same 6 prompt ids) at max-tokens 20 and 60 and differenced the CUDA API counts — load + prefill + the one-time Marlin repack are fixed, so (60t − 20t)/40 = **per-decode-token** API calls:
+
+| API call | 20-tok | 60-tok | **per decode token** |
+|---|---|---|---|
+| `cudaStreamSynchronize` | 9,627 | 26,907 | **~432** |
+| `cudaMemcpyAsync` | 77,033 | 84,553 | **~188** |
+| `cudaMalloc` | 72,675 | 72,675 | **0** |
+| `cudaFree` | 72,192 | 72,192 | **0** |
+
+**The decode is HOST-SYNC-bound: ~432 `cudaStreamSynchronize` + ~188 `cudaMemcpyAsync` per token, and ZERO malloc/free** (the 72k allocs are identical in both runs → entirely the load-time Marlin repack; the `DBuf` pool already recycles). ~432 syncs = ~9 per-GEMM drains × 48 layers + per-layer activation host↔device round-trips. NOT kernels (the Marlin MoE is vLLM's OWN kernel, compute at parity), NOT malloc. Per AGENTS.md §396 the 1.9× is a specific closable diff, not a ceiling. **Byte-exact lever (confirmed + sized): device-resident decode** (keep the activation on-GPU across all 48 layers → kills the 188 memcpy/token) **+ decode CUDA-graph** (collapse the 432 syncs/token → 1, exactly vLLM's mechanism). No correctness relaxation — it changes only where buffers live, gated on the golden ids staying identical. Executable plan: `.agents/specs/laguna-device-resident-decode.md`. Same "Brick D" class as DeepSeek device-resident decode (task #228).
+
 ## DeepSeek-V4-Flash — decode nsys attribution: 13.0 tok/s, Q8_0 GEMV is 53.5% (2026-08-01, `CLAIM-DSV4-DECODE-NSYS`)
 
 Re-measured the GGUF decode from scratch (`deepseek-v4-gen --gpu --kv-cache`, `ds4flash.gguf` = `IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8`, GB10, tmux drop-proof capture). **Decode = 13.0 tok/s** (0.076 s/step, dead-consistent over 23 steps) vs **ds4 16.5 → 79% of ds4, ~1.27× behind.** The prior-recorded **8.0 baseline is STALE** (device-resident decode + tuned glue landed since; superseded). Prefill 0.47s, PEAK RESIDENT 86.3 GiB.
