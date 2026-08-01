@@ -457,6 +457,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
   src/vllm/model_executor/models/laguna_ops.cpp
+  src/vllm/model_executor/models/laguna_device.cpp
   src/vllm/model_executor/models/laguna.cpp
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
@@ -885,7 +886,8 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_paged_attn.cu
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu
-    src/vt/cuda/cuda_deepseek_v4.cu)
+    src/vt/cuda/cuda_deepseek_v4.cu
+    src/vt/cuda/cuda_laguna.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

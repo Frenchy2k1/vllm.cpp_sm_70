@@ -324,6 +324,13 @@ enum class OpId : uint8_t {
   // golden the A/B unit test gates against. CUDA-only (like kMoeGroupedGemmBf16).
   // Appended before kCount so no existing op's id shifts.
   kMoeGroupedGemmBf16GateUpSilu,
+  // Laguna-S-2.1 device-resident-decode glue table (the 5 small host ops the
+  // NVFP4/Marlin arm still ran on the host: sequential RMSNorm, partial-NeoX RoPE,
+  // GQA T=1 decode attention, per-head softplus out-gate, sigmoid-noaux top-k).
+  // Registered on kCUDA by cuda_laguna.cu; resolved via laguna::LagunaDevice().
+  // BYTE-EXACT (sequential reductions) to the host Laguna forward. Additive: only
+  // LagunaForwardResidentDecode dispatches it. Appended before kCount (no id shift).
+  kLaguna,
   kCount
 };
 
