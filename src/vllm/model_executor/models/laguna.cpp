@@ -259,6 +259,63 @@ std::vector<float> LqGemmNvfp4Fp4(vt::Queue& q, const Nvfp4Weight& w,
   return out;
 }
 
+// N5 lever (task #234): DEVICE-RESIDENT W4A4 MoE block for ONE decode token. The
+// per-expert `LqGemmNvfp4Fp4` loop drains the queue after EVERY GEMM (it returns a
+// host vector) → ~top_k×3 `cudaStreamSynchronize`/layer, the 78.6%-of-API-time wall
+// the nsys found. Here the WHOLE token's routed-expert MoE runs as one async device
+// chain — per expert: fp4-quant(hrow, w.igs) → MatmulNvfp4Fp4 for gate/up, MoeSiluMul,
+// fp4-quant(act, down.igs) → MatmulNvfp4Fp4 for down into a stacked [top_k,H] device
+// buffer — then ONE MoeCombine (weighted sum) and ONE DrainQueue. Unified-memory
+// buffers (host ptrs retagged device); every op stays on `q` so CUDA orders them (the
+// gate GEMM reads `a_p` before the up-quant overwrites it — same-stream serial). CUDA
+// only (M=1 decode); the CPU/per-expert path stays the byte-exact reference.
+std::vector<float> LagunaMoeResidentFp4(vt::Queue& q, const LagunaMoeWeights& moe,
+                                        const std::vector<float>& hrow, int64_t moe_I,
+                                        int64_t H, const LagunaRouterSelection& sel) {
+  const int64_t Pk = static_cast<int64_t>(sel.ids.size());
+  std::vector<float> acc(static_cast<size_t>(H), 0.0F);
+  if (Pk == 0) return acc;
+  const vt::Device dev = q.device;
+  // fp4 activation intermediates (K=H for gate/up, K=moe_I for down) + per-expert
+  // gate/up/silu buffers + the stacked expert-output [Pk,H] the combine reduces.
+  std::vector<int8_t> ap_h((H / 2)), as_h((H / 16));        // gate/up activation fp4
+  std::vector<int8_t> ap_d((moe_I / 2)), as_d((moe_I / 16));  // down activation fp4
+  std::vector<float> dg(moe_I), du(moe_I), dact(moe_I);
+  std::vector<float> deo(static_cast<size_t>(Pk) * H);       // [Pk,H] stacked outputs
+  std::vector<float> wgt(static_cast<size_t>(Pk));
+  for (int64_t s = 0; s < Pk; ++s) wgt[static_cast<size_t>(s)] = sel.weights[static_cast<size_t>(s)];
+  auto wview = [&](const OwnedTensor& w) { vt::Tensor t = w.View(); t.device = dev; return t; };
+  vt::Tensor xt = vt::Tensor::Contiguous(const_cast<float*>(hrow.data()), vt::DType::kF32, dev, {1, H});
+  vt::Tensor ap = vt::Tensor::Contiguous(ap_h.data(), vt::DType::kI8, dev, {1, H / 2});
+  vt::Tensor as = vt::Tensor::Contiguous(as_h.data(), vt::DType::kI8, dev, {1, H / 16});
+  vt::Tensor apd = vt::Tensor::Contiguous(ap_d.data(), vt::DType::kI8, dev, {1, moe_I / 2});
+  vt::Tensor asd = vt::Tensor::Contiguous(as_d.data(), vt::DType::kI8, dev, {1, moe_I / 16});
+  vt::Tensor dgt = vt::Tensor::Contiguous(dg.data(), vt::DType::kF32, dev, {1, moe_I});
+  vt::Tensor dut = vt::Tensor::Contiguous(du.data(), vt::DType::kF32, dev, {1, moe_I});
+  vt::Tensor dat = vt::Tensor::Contiguous(dact.data(), vt::DType::kF32, dev, {1, moe_I});
+  for (int64_t s = 0; s < Pk; ++s) {
+    const int64_t id = sel.ids[static_cast<size_t>(s)];
+    const Nvfp4Weight& gw = moe.experts_gate_fp4[static_cast<size_t>(id)];
+    const Nvfp4Weight& uw = moe.experts_up_fp4[static_cast<size_t>(id)];
+    const Nvfp4Weight& dw = moe.experts_down_fp4[static_cast<size_t>(id)];
+    vt::ScaledFp4Quant(q, ap, as, xt, gw.input_global_scale_inv);
+    vt::MatmulNvfp4Fp4(q, dgt, ap, as, wview(gw.packed), wview(gw.scale), gw.alpha);
+    vt::ScaledFp4Quant(q, ap, as, xt, uw.input_global_scale_inv);
+    vt::MatmulNvfp4Fp4(q, dut, ap, as, wview(uw.packed), wview(uw.scale), uw.alpha);
+    vt::MoeSiluMul(q, dat, dgt, dut);
+    vt::ScaledFp4Quant(q, apd, asd, dat, dw.input_global_scale_inv);
+    vt::Tensor eo = vt::Tensor::Contiguous(deo.data() + static_cast<size_t>(s) * H,
+                                           vt::DType::kF32, dev, {1, H});
+    vt::MatmulNvfp4Fp4(q, eo, apd, asd, wview(dw.packed), wview(dw.scale), dw.alpha);
+  }
+  vt::Tensor eostack = vt::Tensor::Contiguous(deo.data(), vt::DType::kF32, dev, {1, Pk, H});
+  vt::Tensor wt = vt::Tensor::Contiguous(wgt.data(), vt::DType::kF32, dev, {1, Pk});
+  vt::Tensor at = vt::Tensor::Contiguous(acc.data(), vt::DType::kF32, dev, {1, H});
+  vt::MoeCombine(q, at, eostack, wt);
+  DrainQueue(q);  // the ONLY sync for the whole token's routed-expert MoE
+  return acc;
+}
+
 // Keep-quant GEMM against a ROW-SLICE [row_off, row_off+N) of a stacked block
 // weight `w` [E*out, K] — the per-expert (moe_*_exps) slice. Rows are whole
 // blocks (RowSizeBytes), so the offset is a byte offset and no block is cut.
@@ -505,6 +562,31 @@ std::vector<float> LagunaFfnBlock(vt::Queue& q, const LagunaLayerWeights& lw,
         const float* eor = eo.data() + static_cast<size_t>(s) * H;
         for (int64_t d = 0; d < H; ++d)
           acc[static_cast<size_t>(d)] += wgt * eor[d];
+      }
+    } else if (fp4 && q.device.type != vt::DeviceType::kCPU && Pk > 0) {
+      // N5 device-resident MoE (task #234): the whole token's routed experts as ONE
+      // async device chain, draining ONCE (vs ~Pk×3 per-GEMM syncs). Byte-neutral to
+      // the per-expert path up to the fp4-op near-tie; the CPU path below stays the
+      // reference so the run-gate is unchanged. Measures whether killing the syncs
+      // wins EAGER on Laguna's fast-kernel profile (ds4's slow-glue precedent may not
+      // transfer). VT_LAGUNA_RESIDENT_MOE=0 forces the per-expert path for an A/B.
+      const char* dis = std::getenv("VT_LAGUNA_RESIDENT_MOE");
+      if (dis == nullptr || dis[0] != '0') {
+        const std::vector<float> racc = LagunaMoeResidentFp4(q, lw.moe, hrow, moe_I, H, sel);
+        for (int64_t d = 0; d < H; ++d) acc[static_cast<size_t>(d)] += racc[static_cast<size_t>(d)];
+      } else {
+        for (size_t s = 0; s < sel.ids.size(); ++s) {
+          const int64_t id = sel.ids[s];
+          const std::vector<float> eg = LqGemmNvfp4Fp4(
+              q, lw.moe.experts_gate_fp4[static_cast<size_t>(id)], hrow, 1, moe_I, H);
+          const std::vector<float> eu = LqGemmNvfp4Fp4(
+              q, lw.moe.experts_up_fp4[static_cast<size_t>(id)], hrow, 1, moe_I, H);
+          const std::vector<float> eact = GateUpSilu(eg, eu, 1, moe_I);
+          const std::vector<float> eo = LqGemmNvfp4Fp4(
+              q, lw.moe.experts_down_fp4[static_cast<size_t>(id)], eact, 1, H, moe_I);
+          const float wgt = sel.weights[s];
+          for (int64_t d = 0; d < H; ++d) acc[static_cast<size_t>(d)] += wgt * eo[static_cast<size_t>(d)];
+        }
       }
     } else {
       for (size_t s = 0; s < sel.ids.size(); ++s) {
