@@ -185,12 +185,25 @@ the load (else the 67 GiB reclaimable page cache starves `cudaStreamCreate`).
   GEMMs/token), a host `ScaledFp4Quant`+`DrainQueue` per GEMM, and the unified-memory
   raw-view retag (no device residency).
 
-N5 SPEED PLAN (the user's goal — reach ≥ vLLM 18.8 tok/s, both at NVFP4):
-1. **Route the experts to the CUTLASS sm120a fp4 tensor-core path** (`MatmulNvfp4Fp4DirectD`
-   / the cutlass entry, swizzled block scales) instead of the emulation op — the SAME
-   kernel that puts 27B/35B at vLLM parity. Biggest lever by far.
-2. **Grouped W4A4 MoE** — one grouped fp4 GEMM per gate/up/down instead of the per-expert
+**N5 nsys TRACE (2026-08-01, `cuda_gpu_kern_sum`, our `laguna-gen --gpu` decode, 5 tok):**
+only TWO kernels ran on the GPU — **`MatmulNvfp4Fp4Naive<float>` = 99.3%** of GPU time
+(14,100 instances, avg 526µs, med 254µs — the emulation fp4 GEMV, ~100× a tensor-core
+fp4 GEMM), `ScaledFp4QuantFastKernel` = 0.7%. GPU busy only ~18% of wall time. The
+absence of ANY bf16 GEMM kernel proves the second lever: `LqGemm`'s bf16 branch runs the
+HOST `MatmulNK` reference (`laguna.cpp:184`) even on the CUDA queue, so ALL bf16 work
+(attention q/k/v/o, dense L0, router, shared expert, embed, lm_head) executes on the CPU
+— ~4.8 s/tok of the 6.34. Source-only scan would have missed this; the trace found it.
+
+N5 SPEED PLAN (the user's goal — reach ≥ vLLM 18.8 tok/s, both at NVFP4; trace-ranked):
+1. **Route the routed experts to the CUTLASS sm120a fp4 tensor-core path**
+   (`MatmulNvfp4Fp4DirectD` / the cutlass entry, swizzled block scales) instead of the
+   emulation op — the SAME kernel that puts 27B/35B at vLLM parity. Kills the 99.3% GPU cost.
+2. **Route the bf16 GEMMs to the GPU** — `LqGemm`'s bf16 branch must use `vt::MatmulBT`
+   (cuBLASLt/cutlass on the CUDA queue) instead of the host `MatmulNK` reference; the whole
+   attention/dense/router/shared/lm_head tower is currently CPU-bound (~4.8 s/tok). This is a
+   correctness-neutral device-routing fix, likely the fastest single win to land first.
+3. **Grouped W4A4 MoE** — one grouped fp4 GEMM per gate/up/down instead of the per-expert
    loop (mirror the A3/W9 `MatmulBTQuantGrouped` fold, but for nvfp4).
-3. **Device residency** — stage `d_packed`/`d_scale` once (ResidentNvfp4), drop the
+4. **Device residency** — stage `d_packed`/`d_scale` once (ResidentNvfp4), drop the
    per-GEMM host round-trip + `DrainQueue` sync.
-4. Decode CUDA-graph + on-GPU sampling (the ds4/35B host-orchestration levers).
+5. Decode CUDA-graph + on-GPU sampling (the ds4/35B host-orchestration levers).
