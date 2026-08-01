@@ -42,6 +42,7 @@
 #include <unordered_map>
 
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // Dev/DBuf/ResidentNvfp4 + Marlin (B2)
+#include "vllm/model_executor/models/laguna_device.h"
 #include "vllm/model_executor/models/laguna_ops.h"
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vt/backend.h"  // vt::GetBackend (device drain for the keep-quant GEMMs)
@@ -1275,6 +1276,135 @@ std::vector<float> LagunaForwardGguf(const LagunaWeights& weights, vt::Queue& q,
 //    only on the token's own position and attention is causal). Mirror of
 //    DeepseekV4ForwardGgufCached, extended MLA-latent -> GQA multi-head K/V, plus the
 //    NEW sliding-window eviction (grounded in gemma2/3 is_sliding).
+// ── N5 device-resident T=1 decode (VT_LAGUNA_RESIDENT_DECODE, default OFF) ─────
+// The NVFP4/Marlin arm's per-GEMM host drains (~432 cudaStreamSynchronize/token,
+// MEASURED) are the 1.9x gap to vLLM 18.8. This v1 runs the ATTENTION block fully
+// device-resident (the 5 kLaguna glue kernels + no-sync bf16 GEMMs), collapsing the
+// ~5 per-layer attention-GEMM drains into 2; the FFN reuses the existing host path
+// (its own minimal drains) for now (v2 = device-resident FFN). BYTE-EXACT: the
+// kLaguna kernels use sequential reductions matching the host float order, and the
+// GEMMs are the same bf16 MatmulBT as the current golden. Gated on the golden ids
+// staying identical (VT_LAGUNA_RESIDENT_DECODE=0/1 A/B).
+inline bool LagunaResidentDecodeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_RESIDENT_DECODE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+bool LagunaCanRunResidentDecode(const LagunaParams& p, vt::Queue& q, const LagunaWeights& w,
+                                int64_t T) {
+  if (!LagunaResidentDecodeEnabled() || T != 1) return false;
+  if (q.device.type == vt::DeviceType::kCPU) return false;
+  if (!w.has_nvfp4_weights) return false;
+  if (p.tie_word_embeddings || w.lm_head.Empty()) return false;
+  if (!laguna::LagunaDeviceKernelsAvailable()) return false;
+  return true;
+}
+
+std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt::Queue& q,
+                                               LagunaKvCache& cache,
+                                               const std::vector<int32_t>& token_ids,
+                                               const std::vector<int32_t>& positions,
+                                               const std::vector<int32_t>& logits_indices) {
+  using vt::DType;
+  const LagunaParams& p = weights.params;
+  const int64_t H = p.hidden_size, Vsz = p.vocab_size, Dh = p.head_dim;
+  const int64_t Hkv = p.num_key_value_heads, kvdim = Hkv * Dh;
+  const int64_t nlayers = p.num_hidden_layers;
+  const float eps = p.rms_norm_eps;
+  const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
+  const vt::Device dev = q.device;
+  const int64_t pos = positions[0];
+  if (cache.k.empty()) cache.Reset(nlayers, Dh, Hkv);
+
+  const laguna::LagunaDeviceKernels* LAG = laguna::LagunaDevice();
+
+  int64_t Hq_max = p.num_attention_heads;
+  for (int64_t l = 0; l < nlayers; ++l) Hq_max = std::max(Hq_max, p.QHeadsForLayer(l));
+  const int64_t qdim_max = Hq_max * Dh;
+  const int64_t maxK = std::max<int64_t>(H, qdim_max);
+
+  const std::vector<float> yarn_cache = BuildLagunaFullYarnCosSin(p, pos + 1);
+  const std::vector<float> slide_cache = BuildLagunaSlidingCosSin(p, pos + 1);
+
+  std::vector<float> hidden = LagunaEmbed(weights.embed, token_ids, H, Vsz);
+  std::vector<float> hn(static_cast<size_t>(H)), qv(static_cast<size_t>(qdim_max)),
+      gl(static_cast<size_t>(Hq_max)), attn(static_cast<size_t>(qdim_max)),
+      o(static_cast<size_t>(H));
+  std::vector<uint16_t> abf(static_cast<size_t>(maxK));
+
+  auto NormPtr = [](const OwnedTensor& w) {
+    return reinterpret_cast<const float*>(w.bytes.data());
+  };
+  // no-sync bf16 GEMM: out[1,N] f32 = cast(x[1,K])·w[N,K]^T (mirror LqGemm device path)
+  auto GemmBf16Into = [&](float* out, const OwnedTensor& w, const float* x, int64_t N, int64_t K) {
+    vt::Tensor xf = vt::Tensor::Contiguous(const_cast<float*>(x), DType::kF32, dev, {1, K});
+    vt::Tensor ab = vt::Tensor::Contiguous(abf.data(), DType::kBF16, dev, {1, K});
+    vt::CastBf16(q, ab, xf);
+    vt::Tensor ot = vt::Tensor::Contiguous(out, DType::kF32, dev, {1, N});
+    vt::Tensor wt = w.View();
+    wt.device = dev;
+    vt::MatmulBT(q, ot, ab, wt);
+  };
+
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const LagunaLayerWeights& lw = weights.layers[static_cast<size_t>(l)];
+    const int64_t Hq = p.QHeadsForLayer(l), qdim = Hq * Dh;
+    const int64_t group = p.GqaGroupForLayer(l);
+    const bool global = p.IsGlobalLayer(l);
+    const int64_t rd = p.RotaryDimForLayer(l);
+    const int64_t window = p.WindowForLayer(l);
+    const float* rcache = (global ? yarn_cache : slide_cache).data();
+
+    LAG->rms_norm_seq(q, hn.data(), hidden.data(), NormPtr(lw.input_norm), 1, H, eps, true);
+    std::vector<float> knew(static_cast<size_t>(kvdim)), vnew(static_cast<size_t>(kvdim));
+    GemmBf16Into(qv.data(), lw.attn.q_proj, hn.data(), qdim, H);
+    GemmBf16Into(knew.data(), lw.attn.k_proj, hn.data(), kvdim, H);
+    GemmBf16Into(vnew.data(), lw.attn.v_proj, hn.data(), kvdim, H);
+    if (p.has_qk_norm && !lw.attn.q_norm.Empty()) {
+      LAG->rms_norm_seq(q, qv.data(), qv.data(), NormPtr(lw.attn.q_norm), Hq, Dh, eps, true);
+      LAG->rms_norm_seq(q, knew.data(), knew.data(), NormPtr(lw.attn.k_norm), Hkv, Dh, eps, true);
+    }
+    LAG->rope_from_cache(q, qv.data(), rcache, Hq, Dh, rd, pos);
+    LAG->rope_from_cache(q, knew.data(), rcache, Hkv, Dh, rd, pos);
+    DrainQueue(q);  // knew/vnew host-readable for the cache append + eviction
+
+    std::vector<float>& kc = cache.k[static_cast<size_t>(l)];
+    std::vector<float>& vc = cache.v[static_cast<size_t>(l)];
+    kc.insert(kc.end(), knew.begin(), knew.end());
+    vc.insert(vc.end(), vnew.begin(), vnew.end());
+    int64_t rows = static_cast<int64_t>(kc.size()) / kvdim;
+    if (window > 0 && rows > window) {
+      const int64_t drop = rows - window;
+      const size_t off = static_cast<size_t>(drop * kvdim);
+      kc.erase(kc.begin(), kc.begin() + static_cast<int64_t>(off));
+      vc.erase(vc.begin(), vc.begin() + static_cast<int64_t>(off));
+      cache.first_pos[static_cast<size_t>(l)] += drop;
+      rows = window;
+    }
+    const int64_t fp = cache.first_pos[static_cast<size_t>(l)];
+
+    LAG->decode_attn_gqa(q, attn.data(), qv.data(), kc.data(), vc.data(), Hq, Hkv, Dh, group, rows,
+                         pos, fp, window, scale);
+    GemmBf16Into(gl.data(), lw.attn.g_proj, hn.data(), Hq, H);
+    LAG->softplus_head_gate(q, attn.data(), gl.data(), Hq, Dh);
+    GemmBf16Into(o.data(), lw.attn.o_proj, attn.data(), H, qdim);
+    {
+      vt::Tensor ht = vt::Tensor::Contiguous(hidden.data(), DType::kF32, dev, {1, H});
+      vt::Tensor ot = vt::Tensor::Contiguous(o.data(), DType::kF32, dev, {1, H});
+      vt::Add(q, ht, ht, ot);
+    }
+    LAG->rms_norm_seq(q, hn.data(), hidden.data(), NormPtr(lw.post_attn_norm), 1, H, eps, true);
+    DrainQueue(q);  // hn (post-attn norm) host-readable for the FFN
+
+    const std::vector<float> f = LagunaFfnBlock(q, lw, p, hn, 1);
+    for (int64_t i = 0; i < H; ++i) hidden[static_cast<size_t>(i)] += f[static_cast<size_t>(i)];
+  }
+  return LagunaFinalLogits(q, weights, hidden, 1, logits_indices);
+}
+
 std::vector<float> LagunaForwardGgufCached(const LagunaWeights& weights, vt::Queue& q,
                                            LagunaKvCache& cache,
                                            const std::vector<int32_t>& token_ids,
@@ -1304,6 +1434,15 @@ std::vector<float> LagunaForwardGgufCached(const LagunaWeights& weights, vt::Que
   const int64_t base = cache.len;
   VT_CHECK(positions[0] == static_cast<int32_t>(base),
            "laguna gguf cached: positions[0] must equal cache.len (contiguous decode)");
+
+  // N5 device-resident T=1 decode fast path (VT_LAGUNA_RESIDENT_DECODE, default OFF).
+  if (LagunaCanRunResidentDecode(p, q, weights, T) && logits_indices.size() == 1 &&
+      logits_indices[0] == 0) {
+    std::vector<float> lg =
+        LagunaForwardResidentDecode(weights, q, cache, token_ids, positions, logits_indices);
+    cache.len += T;
+    return lg;
+  }
 
   int64_t max_pos = 0;
   for (int32_t ps : positions) max_pos = std::max<int64_t>(max_pos, ps);
