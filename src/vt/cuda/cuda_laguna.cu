@@ -278,24 +278,51 @@ __global__ void SigmoidTopKKernel(int32_t* ids, float* weights, const float* log
     sel[e] = 0.0f;
   }
   __syncthreads();
-  if (threadIdx.x != 0) return;
-  float wsum = 0.0f;
+  // Parallel top-K selection (was a thread-0 serial O(topk*E) scan = ~77us/call,
+  // 5.3% of decode GPU time). Each round is a BLOCK-WIDE argmax over the UNSELECTED
+  // experts with the lower-index-wins tie-break (mirrors "ascending e + strict >").
+  // BYTE-IDENTICAL to the serial version (same picks, same weights, same order).
+  const int t = static_cast<int>(threadIdx.x);
+  const int nt = static_cast<int>(blockDim.x);  // power-of-two (launcher pads to 256)
+  __shared__ float rval[256];
+  __shared__ int ridx[256];
   for (int64_t j = 0; j < topk; ++j) {
-    int64_t best = -1;
-    float bestc = -CUDART_INF_F;
-    for (int64_t e = 0; e < E; ++e) {          // ascending e + strict > ⇒ lower idx wins ties
+    float bc = -CUDART_INF_F;
+    int bi = static_cast<int>(E);  // sentinel "none": loses every tie (val & idx)
+    for (int64_t e = t; e < E; e += nt) {
       if (sel[e] != 0.0f) continue;
-      if (choice[e] > bestc) { bestc = choice[e]; best = e; }
+      const float c = choice[e];
+      if (c > bc || (c == bc && static_cast<int>(e) < bi)) { bc = c; bi = static_cast<int>(e); }
     }
-    sel[best] = 1.0f;
-    ids[j] = static_cast<int32_t>(best);
-    const float w = scores[best];              // UNBIASED weight
-    weights[j] = w;
-    wsum += w;
+    rval[t] = bc;
+    ridx[t] = bi;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+      if (t < s) {
+        const float ov = rval[t + s];
+        const int oi = ridx[t + s];
+        if (ov > rval[t] || (ov == rval[t] && oi < ridx[t])) {
+          rval[t] = ov;
+          ridx[t] = oi;
+        }
+      }
+      __syncthreads();
+    }
+    const int best = ridx[0];
+    if (t == 0) {
+      sel[best] = 1.0f;
+      ids[j] = best;
+      weights[j] = scores[best];  // UNBIASED weight
+    }
+    __syncthreads();  // sel[best] visible to all threads before the next round
   }
-  for (int64_t j = 0; j < topk; ++j) {
-    if (renorm && wsum > 0.0f) weights[j] /= wsum;
-    weights[j] *= scale;
+  if (t == 0) {  // renorm+scale over the topk selected (topk small; thread 0)
+    float wsum = 0.0f;
+    for (int64_t j = 0; j < topk; ++j) wsum += weights[j];
+    for (int64_t j = 0; j < topk; ++j) {
+      if (renorm && wsum > 0.0f) weights[j] /= wsum;
+      weights[j] *= scale;
+    }
   }
 }
 
@@ -383,7 +410,8 @@ void SoftplusHeadGateLaunch(Queue& q, float* attn, const float* gl, int64_t Hq, 
 void SigmoidTopKLaunch(Queue& q, int32_t* ids, float* weights, const float* logits,
                        const float* bias, bool has_bias, int64_t E, int64_t topk, bool renorm,
                        float scale) {
-  const int threads = E < 256 ? static_cast<int>(E) : 256;
+  const int threads = 256;  // power-of-two for the block tree-reduce (E<=256 experts
+                            // handled by the strided argmax + idx=E sentinel).
   const size_t shmem = static_cast<size_t>(3 * E) * sizeof(float);
   SigmoidTopKKernel<<<1, threads, shmem, AsStream(q)>>>(ids, weights, logits, bias, has_bias, E,
                                                         topk, renorm, scale);
