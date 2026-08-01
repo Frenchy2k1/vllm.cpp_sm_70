@@ -2601,6 +2601,51 @@ __global__ void MatmulNvfp4Fp4Naive(Tout* out, const uint8_t* a_packed, const ui
   Store(out, m * n_cols + n, alpha * acc);
 }
 
+// Coalesced M=1 (decode) fp4xfp4 GEMV. The Naive kernel puts ONE THREAD per output
+// column n, so adjacent threads read weight rows strided by k/2 bytes -> UNCOALESCED,
+// and the native MMA tile wastes 15 of 16 rows on M=1 (nsys: ~72us/expert GEMM, ~12%
+// of the 240 GB/s peak). Here ONE WARP owns column n: the 32 lanes cooperatively
+// stride the packed weight row `bprow` (lane L reads bytes L, L+32, ... -> COALESCED
+// within the warp), each dequants + accumulates the fp4·fp4 dot, then a warp reduce.
+// The shared activation `aprow` is re-read per warp but hits L2 (small). Near-tie vs
+// Naive/MMA (same per-element decode; only the K-reduction order differs). Mirrors the
+// ds4 Q8_0 sub-warp GEMV that reached ~76% BW.
+template <typename Tout>
+__global__ void MatmulNvfp4Fp4Gemv(Tout* out, const uint8_t* a_packed, const uint8_t* a_scale,
+                                   const uint8_t* b_packed, const uint8_t* b_scale, float alpha,
+                                   int64_t n_cols, int64_t k_dim) {
+  const int64_t n = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x & 31);
+  if (n >= n_cols) return;
+  const int64_t packed_cols = k_dim / 2;
+  const int64_t groups = k_dim / 16;
+  const uint8_t* aprow = a_packed;              // m == 0
+  const uint8_t* asrow = a_scale;
+  const uint8_t* bprow = b_packed + n * packed_cols;
+  const uint8_t* bsrow = b_scale + n * groups;
+  float acc = 0.0f;
+  for (int64_t bidx = lane; bidx < packed_cols; bidx += 32) {
+    const int64_t g = bidx >> 3;                 // group = byte / 8
+    const float asf = F8E4M3ToF32Dev(asrow[g]);
+    const float bsf = F8E4M3ToF32Dev(bsrow[g]);
+    const uint8_t ab = aprow[bidx];
+    const uint8_t bb = bprow[bidx];
+    const float a_lo = kE2M1[ab & 0x7u] * ((ab & 0x8u) ? -1.0f : 1.0f) * asf;
+    const float a_hi = kE2M1[(ab >> 4) & 0x7u] * ((ab & 0x80u) ? -1.0f : 1.0f) * asf;
+    const float b_lo = kE2M1[bb & 0x7u] * ((bb & 0x8u) ? -1.0f : 1.0f) * bsf;
+    const float b_hi = kE2M1[(bb >> 4) & 0x7u] * ((bb & 0x80u) ? -1.0f : 1.0f) * bsf;
+    acc += a_lo * b_lo + a_hi * b_hi;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0) Store(out, n, alpha * acc);
+}
+
+inline bool Fp4GemvEnabled() {
+  const char* e = std::getenv("VT_NVFP4_FP4_GEMV");
+  return e == nullptr || e[0] != '0';  // default ON; the coalesced M=1 decode path
+}
+
 // Decode a fp4 tile [ROWS][BK] (packed [ROWS][K/2], fp8 group scales [ROWS][K/16])
 // into shared bf16 `dst` [ROWS][BK]. `outer0` = the tile's first row in the full
 // [ROWS_total][K] operand; used by both the A (M) and B (N) operands (symmetric).
@@ -2864,6 +2909,16 @@ void LaunchFp4Fp4(cudaStream_t s, const DeviceCaps& caps, Tensor& out, const Ten
   auto* as = a_scale.Ptr<uint8_t>();
   auto* bp = b_packed.Ptr<uint8_t>();
   auto* bs = b_scale.Ptr<uint8_t>();
+  // M=1 DECODE: the coalesced warp-per-column GEMV (the native MMA/Naive are ~12% of
+  // peak BW for M=1). Bit-consistent per-element decode with the tile paths (near-tie
+  // K-order). VT_NVFP4_FP4_GEMV=0 falls through to the tile dispatch for an A/B.
+  if (m == 1 && Fp4GemvEnabled()) {
+    constexpr int kThreads = 128;  // 4 warps/block, one warp per output column
+    const dim3 grid(static_cast<unsigned>((n * 32 + kThreads - 1) / kThreads));
+    MatmulNvfp4Fp4Gemv<Tout><<<grid, kThreads, 0, s>>>(out.Ptr<Tout>(), ap, as, bp, bs, alpha, n, k);
+    Check(cudaGetLastError(), "matmul_nvfp4_fp4 kernel launch (gemv)");
+    return;
+  }
   // Runtime SM dispatch: ask the registry for a tactic that supports THIS device.
   // With one registered tactic and GB10's sm_121 this reduces exactly to the old
   // `#if VT_FP4_MMA_SM120A && NativeFp4MmaEnabled()` test — same kernel, same
