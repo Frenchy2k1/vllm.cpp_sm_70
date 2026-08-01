@@ -574,19 +574,22 @@ void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, cons
   int max_tok = 0, max_blk = 0;
   vt::cuda::MarlinMoeAlignSizes(1, static_cast<int>(Pk), static_cast<int>(E), block, &max_tok,
                                 &max_blk);
+  // Wrap the async-produced device inputs (hn_dev/ids_dev/w_dev, written on-stream by
+  // the router GEMM + sigmoid_topk with NO drain before) with MakeTensor — read them
+  // ON-STREAM (ordered), NOT via a DBuf host-Copy which would snapshot stale data.
   vllm::dense_nvfp4::DBuf dh(d, DType::kBF16, {1, H});
   {
-    vllm::dense_nvfp4::DBuf xf(d, DType::kF32, {1, H}, hn_dev);
-    vt::CastBf16(q, dh.t(), xf.t());
+    vt::Tensor xf = vllm::dense_nvfp4::MakeTensor(const_cast<float*>(hn_dev), DType::kF32, dev,
+                                                 {1, H});
+    vt::CastBf16(q, dh.t(), xf);
   }
-  vllm::dense_nvfp4::DBuf dtid(d, DType::kI32, {1, Pk}, ids_dev);
-  vllm::dense_nvfp4::DBuf dtw(d, DType::kF32, {1, Pk}, w_dev);
+  vt::Tensor dtw = vllm::dense_nvfp4::MakeTensor(const_cast<float*>(w_dev), DType::kF32, dev,
+                                               {1, Pk});
   vllm::dense_nvfp4::DBuf sorted(d, DType::kI32, {max_tok});
   vllm::dense_nvfp4::DBuf eids(d, DType::kI32, {max_blk});
   vllm::dense_nvfp4::DBuf npad(d, DType::kI32, {1});
-  vt::cuda::MarlinMoeAlignBlockSize(stream, static_cast<const int32_t*>(dtid.ptr()), 1,
-                                    static_cast<int>(Pk), static_cast<int>(E), block,
-                                    static_cast<int32_t*>(sorted.ptr()),
+  vt::cuda::MarlinMoeAlignBlockSize(stream, ids_dev, 1, static_cast<int>(Pk), static_cast<int>(E),
+                                    block, static_cast<int32_t*>(sorted.ptr()),
                                     static_cast<int32_t*>(eids.ptr()),
                                     static_cast<int32_t*>(npad.ptr()));
   vt::Tensor wg = vllm::dense_nvfp4::MakeTensor(mr.w_gate, DType::kI32, dev, {E, H / 16, moe_I * 2});
@@ -604,17 +607,17 @@ void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, cons
   vllm::dense_nvfp4::DBuf dgate(d, DType::kBF16, {Pk, moe_I});
   vllm::dense_nvfp4::DBuf dup(d, DType::kBF16, {Pk, moe_I});
   vt::MoeGroupedGemmNvfp4Marlin(q, dgate.t(), dh.t(), wg, sg, gg, ws, sorted.t(), eids.t(),
-                                npad.t(), dtw.t(), vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+                                npad.t(), dtw, vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
   vt::MoeGroupedGemmNvfp4Marlin(q, dup.t(), dh.t(), wu, su, gu, ws, sorted.t(), eids.t(), npad.t(),
-                                dtw.t(), vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+                                dtw, vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
   vllm::dense_nvfp4::DBuf dact(d, DType::kBF16, {Pk, moe_I});
   vt::MoeSiluMul(q, dact.t(), dgate.t(), dup.t());
   vllm::dense_nvfp4::DBuf ddown(d, DType::kBF16, {Pk, H});
   vt::MoeGroupedGemmNvfp4Marlin(q, ddown.t(), dact.t(), wd, sd, gd, ws, sorted.t(), eids.t(),
-                                npad.t(), dtw.t(), vt::MoeMarlinArgs{bi, 1, Pki, Hi, Ii, false});
+                                npad.t(), dtw, vt::MoeMarlinArgs{bi, 1, Pki, Hi, Ii, false});
   vt::Tensor expert_out = vllm::dense_nvfp4::MakeTensor(ddown.ptr(), DType::kBF16, dev, {1, Pk, H});
   vllm::dense_nvfp4::DBuf dout(d, DType::kBF16, {1, H});
-  vt::MoeCombine(q, dout.t(), expert_out, dtw.t());
+  vt::MoeCombine(q, dout.t(), expert_out, dtw);
   vt::Tensor ot = vllm::dense_nvfp4::MakeTensor(out_dev, DType::kF32, dev, {1, H});
   vt::CastF32(q, ot, dout.t());  // bf16 -> f32, device (no download)
 }
