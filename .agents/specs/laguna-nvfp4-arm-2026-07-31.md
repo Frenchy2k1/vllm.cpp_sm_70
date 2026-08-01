@@ -249,3 +249,17 @@ N5 SPEED PLAN (the user's goal — reach ≥ vLLM 18.8 tok/s, both at NVFP4; tra
    campaign is how we find out, and it also lifts the GGUF path (#228).
 5. Decode CUDA-graph + on-GPU sampling (the ds4/35B host-orchestration levers) — the PAYOFF
    step of lever 4 (see the ds4 precedent above), not a separate lever.
+
+**CORRECTED CEILING (2026-08-01, from the measured lever-1 state — CRITICAL for planning):**
+at 0.20 s/tok the GPU is ~87% busy ⇒ GPU compute ≈ 0.174 s/tok, host gaps only ≈ 0.026. So a
+PERFECT decode graph (levers 4+5, removing ALL host gaps) caps at **~5.9 tok/s** — it clears
+our ~4.5 but is still **3.3× short of vLLM's 18.8**. The graph is NECESSARY BUT NOT SUFFICIENT.
+The remaining 3.3× is **KERNEL EFFICIENCY**, a SEPARATE lever set: our enabled native fp4 MMA
+runs ~302µs per M=1 expert GEMM (tensor-core tiles waste the single row), vs vLLM's tuned
+cutlass sm120a fp4 GEMM (`MatmulNvfp4CutlassModel`/DirectD, swizzled scales, resident weights)
++ FUSED norm+quant / silu+quant kernels (fewer launches, no bf16 intermediate). So the true
+parity plan is TWO campaigns: (A) device-resident forward + graph → ~5.9 tok/s; (B) route the
+experts to cutlass DirectD + adopt the fused norm/quant/silu ops (mirror 27B/35B) + an
+M=1-tuned fp4 GEMV → the remaining 3.3×. Both are substantial; (B) is the bigger lift and the
+one that actually reaches 18.8. Honest: single-GB10 Laguna-NVFP4 parity is a multi-campaign
+effort, not one graph.
