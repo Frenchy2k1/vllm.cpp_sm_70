@@ -198,10 +198,13 @@ N5 SPEED PLAN (the user's goal — reach ≥ vLLM 18.8 tok/s, both at NVFP4; tra
 1. **Route the routed experts to the CUTLASS sm120a fp4 tensor-core path**
    (`MatmulNvfp4Fp4DirectD` / the cutlass entry, swizzled block scales) instead of the
    emulation op — the SAME kernel that puts 27B/35B at vLLM parity. Kills the 99.3% GPU cost.
-2. **Route the bf16 GEMMs to the GPU** — `LqGemm`'s bf16 branch must use `vt::MatmulBT`
-   (cuBLASLt/cutlass on the CUDA queue) instead of the host `MatmulNK` reference; the whole
-   attention/dense/router/shared/lm_head tower is currently CPU-bound (~4.8 s/tok). This is a
-   correctness-neutral device-routing fix, likely the fastest single win to land first.
+2. **Route the bf16 GEMMs to the GPU — DONE (2026-08-01), 16× decode.** `LqGemm`'s bf16
+   branch now casts the small `[T,K]` f32 activation to bf16 on-device (`vt::CastBf16`) and
+   runs `vt::MatmulBT` (bf16×bf16→f32, cuBLASLt nvjet), keeping the weight bf16 (no per-token
+   `ReadF32` of `[N,K]`; `lm_head [Vsz,H]` was the dominant host cost). GB10: decode
+   6.34 → 0.39 s/tok (16.3×; 0.16 → 2.56 tok/s), prefill 17.3 → 2.24s; coherence preserved
+   (near-tie shifted slightly from bf16-activation rounding). CPU path keeps `MatmulNK` (run-gate
+   byte-identical); GGUF tower is block-quant so nvfp4-arm-only. STILL 7.3× short of vLLM 18.8.
 3. **Grouped W4A4 MoE** — one grouped fp4 GEMM per gate/up/down instead of the per-expert
    loop (mirror the A3/W9 `MatmulBTQuantGrouped` fold, but for nvfp4).
 4. **Device residency** — stage `d_packed`/`d_scale` once (ResidentNvfp4), drop the

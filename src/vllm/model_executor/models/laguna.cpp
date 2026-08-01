@@ -181,7 +181,31 @@ std::vector<float> LqGemm(vt::Queue& q, const OwnedTensor& w,
                           int64_t K) {
   VT_CHECK(w.rank == 2 && w.shape[0] == N && w.shape[1] == K,
            "laguna keep-quant GEMM: weight shape mismatch");
-  if (!vt::IsBlockQuant(w.dtype)) return MatmulNK(x, ReadF32(w), T, N, K);
+  if (!vt::IsBlockQuant(w.dtype)) {
+    // N5 lever #2: the bf16/f32 tower (attention/dense/router/shared/lm_head on the
+    // NVFP4 arm) — the nsys trace found it runs the HOST MatmulNK reference even on
+    // the CUDA queue, CPU-bound at ~4.8 s/tok (the lm_head [Vsz,H] MatmulNK + its
+    // per-token ReadF32 dominate). On the DEVICE, keep the weight bf16 (no ReadF32),
+    // cast the SMALL [T,K] f32 activation to bf16 on-GPU, and run the bf16×bf16->f32
+    // MatmulBT (cuBLASLt nvjet on GB10; MatmulBT needs matched dtypes). f32 accum;
+    // near-tie vs MatmulNK (different algo + bf16 activation rounding). The CPU path
+    // keeps the exact MatmulNK reference (the run-gate stays byte-identical); the GGUF
+    // keep-quant tower is block-quant here so this branch is nvfp4-arm-only.
+    const bool bf16_dev = q.device.type != vt::DeviceType::kCPU && w.dtype == vt::DType::kBF16;
+    if (!bf16_dev) return MatmulNK(x, ReadF32(w), T, N, K);
+    std::vector<float> out(static_cast<size_t>(T) * N);
+    std::vector<uint16_t> a_bf16(static_cast<size_t>(T) * K);  // bf16 activation (unified mem)
+    vt::Tensor xf = vt::Tensor::Contiguous(const_cast<float*>(x.data()), vt::DType::kF32,
+                                           q.device, {T, K});
+    vt::Tensor ab = vt::Tensor::Contiguous(a_bf16.data(), vt::DType::kBF16, q.device, {T, K});
+    vt::CastBf16(q, ab, xf);
+    vt::Tensor o = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, q.device, {T, N});
+    vt::Tensor wt = w.View();
+    wt.device = q.device;  // unified-memory bf16 weight retag (like the block-quant path)
+    vt::MatmulBT(q, o, ab, wt);
+    DrainQueue(q);
+    return out;
+  }
   std::vector<float> out(static_cast<size_t>(T) * N);
   vt::Queue cpuq{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
   const bool on_dev = q.device.type != vt::DeviceType::kCPU;
