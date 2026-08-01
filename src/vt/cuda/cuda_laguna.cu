@@ -330,41 +330,44 @@ __global__ void SigmoidTopKKernel(int32_t* ids, float* weights, const float* log
 // out[N] f32 = W[N,K] (bf16, row-major) · x[K] (f32), M=1. cuBLASLt's heuristic
 // mis-routes this M=1×N=vocab×K=hidden GEMM to a BATCHED wmma tile algo (fills 1 of
 // 16 tile rows → ~20% of roofline, the measured #1 Laguna decode GPU cost). This
-// dedicated GEMV streams the ~616 MB weight ONCE at ~roofline. ONE BLOCK per output
-// row n (grid = N): the block's 256 threads stride over K, each reading W[n*K+k]
-// (bf16) — consecutive threads hit consecutive bf16 addresses ⇒ COALESCED. The K loop
-// reads bf16 in __nv_bfloat162 PAIRS (4-byte loads; each row start n*K is 2-aligned
-// for K even ⇒ a warp's 32 pairs = one 128 B transaction), multiply-accumulates in
-// f32 against x (also read as float2 pairs), then a power-of-two block tree-reduce
-// writes out[n]. NEAR-TIE vs the MatmulBT reference (block-reduced sum reorders the
-// float adds; accepted device regime, gated vs vLLM). K odd falls back to a scalar
-// tail (not exercised by Laguna: hidden=3072 is even).
+// dedicated GEMV streams the ~616 MB weight ONCE at ~roofline. ONE WARP (32 lanes) per
+// output row n: block = (blockDim/32) warps, so warp w owns row
+// n = blockIdx.x*(blockDim/32) + (threadIdx.x>>5). warp_id is warp-UNIFORM ⇒ the n<N
+// guard never splits a warp. Each lane strides over K reading W as __nv_bfloat162 PAIRS
+// (lane l reads pair l, l+32, … — 32 consecutive 4-byte pairs = one 128 B COALESCED
+// warp transaction; each row start n*K is 2-aligned for K even), multiply-accumulates
+// in f32 against x (read as float2 pairs). The 32 partial sums reduce via
+// __shfl_down_sync (full-mask warp shuffle — every lane of the owning warp stays active,
+// the K-loop trip count is lane-uniform for even K — NO __shared__, NO __syncthreads);
+// lane 0 writes out[n]. This replaces the old ONE-BLOCK-per-row sh[256] tree-reduce (8
+// __syncthreads/row): warp-per-row removes all block sync + raises occupancy toward the
+// GB10 BW roofline. NEAR-TIE vs the MatmulBT reference (warp-reduced sum reorders the
+// float adds; accepted device regime, gated vs vLLM). K odd falls back to a scalar tail
+// on lane 0 (not exercised by Laguna: hidden=3072 is even).
 __global__ void LmHeadGemvKernel(float* __restrict__ out, const __nv_bfloat16* __restrict__ w,
                                  const float* __restrict__ x, int64_t N, int64_t K) {
-  const int64_t n = static_cast<int64_t>(blockIdx.x);
-  if (n >= N) return;
-  const int tid = static_cast<int>(threadIdx.x);
-  const int nth = static_cast<int>(blockDim.x);  // 256 (power of two; matches sh[256])
-  const int64_t kpairs = K >> 1;                 // bf16 pairs (K even for Laguna)
+  const int warp_id = static_cast<int>(threadIdx.x) >> 5;  // warp within block
+  const int lane = static_cast<int>(threadIdx.x) & 31;     // lane within warp
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;  // 8 (256 threads/block)
+  const int64_t n = static_cast<int64_t>(blockIdx.x) * warps_per_block + warp_id;  // this row
+  if (n >= N) return;  // warp-UNIFORM (whole warp owns row n) ⇒ never splits a warp
+  const int64_t kpairs = K >> 1;  // bf16 pairs (K even for Laguna)
   const __nv_bfloat162* __restrict__ w2 =
       reinterpret_cast<const __nv_bfloat162*>(w) + n * kpairs;  // this row, as pairs
   const float2* __restrict__ x2 = reinterpret_cast<const float2*>(x);
   float acc = 0.0f;
-  for (int64_t pdx = tid; pdx < kpairs; pdx += nth) {  // coalesced 4-byte bf162 stream
+  for (int64_t pdx = lane; pdx < kpairs; pdx += 32) {  // coalesced 128 B/warp bf162 stream
     const float2 wf = __bfloat1622float2(w2[pdx]);
     const float2 xv = x2[pdx];
     acc += wf.x * xv.x + wf.y * xv.y;
   }
-  if ((K & 1) && tid == 0)  // odd-K scalar tail (not Laguna: hidden is even)
-    acc += __bfloat162float(w[n * K + (K - 1)]) * x[K - 1];
-  __shared__ float sh[256];
-  sh[tid] = acc;
-  __syncthreads();
-  for (int s = nth >> 1; s > 0; s >>= 1) {
-    if (tid < s) sh[tid] += sh[tid + s];
-    __syncthreads();
+  for (int off = 16; off > 0; off >>= 1)  // warp-shuffle tree-reduce (no __syncthreads)
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0) {
+    if (K & 1)  // odd-K scalar tail (not Laguna: hidden is even)
+      acc += __bfloat162float(w[n * K + (K - 1)]) * x[K - 1];
+    out[n] = acc;
   }
-  if (tid == 0) out[n] = sh[0];
 }
 
 // ── launchers (no sync — resident) ──
@@ -418,9 +421,13 @@ void SigmoidTopKLaunch(Queue& q, int32_t* ids, float* weights, const float* logi
 }
 void LmHeadGemvLaunch(Queue& q, float* out, const void* w_bf16, const float* x, int64_t N,
                       int64_t K) {
-  // ONE block per output row n (grid = N); 256 threads (power of two; matches the
-  // sh[256] tree-reduce). Fixed grid + fixed pointers ⇒ CUDA-graph capturable.
-  LmHeadGemvKernel<<<static_cast<unsigned>(N), 256, 0, AsStream(q)>>>(
+  // ONE WARP per output row n. Block = kLmHeadWarps warps (kLmHeadWarps*32 threads);
+  // grid = ceil(N / kLmHeadWarps) so each of the 8 warps/block owns an independent row.
+  // Fixed grid + fixed pointers ⇒ CUDA-graph capturable. Warp-shuffle reduce (no shared,
+  // no __syncthreads) replaces the old block-per-row sh[256] tree-reduce.
+  constexpr int kLmHeadWarps = 8;  // 8 warps = 256 threads/block
+  const unsigned grid = static_cast<unsigned>((N + kLmHeadWarps - 1) / kLmHeadWarps);
+  LmHeadGemvKernel<<<grid, kLmHeadWarps * 32, 0, AsStream(q)>>>(
       out, reinterpret_cast<const __nv_bfloat16*>(w_bf16), x, N, K);
 }
 
