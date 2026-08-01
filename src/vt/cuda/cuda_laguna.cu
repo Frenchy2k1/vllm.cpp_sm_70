@@ -11,6 +11,7 @@
 //   LagunaAttention (laguna.cpp:701)          -> DecodeAttnGqaKernel
 //   LagunaSoftplusHeadGate (laguna_ops.cpp:25)-> SoftplusHeadGateKernel
 //   LagunaUngroupedRouterTopK (laguna_ops.cpp:41) -> SigmoidTopKKernel
+#include <cuda_bf16.h>       // __nv_bfloat16 / __nv_bfloat162 / __bfloat1622float2
 #include <cuda_runtime.h>
 #include <math_constants.h>  // CUDART_INF_F
 
@@ -298,6 +299,47 @@ __global__ void SigmoidTopKKernel(int32_t* ids, float* weights, const float* log
   }
 }
 
+// ── Laguna lm_head M=1 decode GEMV (coalesced, roofline-bound) ───────────────
+// out[N] f32 = W[N,K] (bf16, row-major) · x[K] (f32), M=1. cuBLASLt's heuristic
+// mis-routes this M=1×N=vocab×K=hidden GEMM to a BATCHED wmma tile algo (fills 1 of
+// 16 tile rows → ~20% of roofline, the measured #1 Laguna decode GPU cost). This
+// dedicated GEMV streams the ~616 MB weight ONCE at ~roofline. ONE BLOCK per output
+// row n (grid = N): the block's 256 threads stride over K, each reading W[n*K+k]
+// (bf16) — consecutive threads hit consecutive bf16 addresses ⇒ COALESCED. The K loop
+// reads bf16 in __nv_bfloat162 PAIRS (4-byte loads; each row start n*K is 2-aligned
+// for K even ⇒ a warp's 32 pairs = one 128 B transaction), multiply-accumulates in
+// f32 against x (also read as float2 pairs), then a power-of-two block tree-reduce
+// writes out[n]. NEAR-TIE vs the MatmulBT reference (block-reduced sum reorders the
+// float adds; accepted device regime, gated vs vLLM). K odd falls back to a scalar
+// tail (not exercised by Laguna: hidden=3072 is even).
+__global__ void LmHeadGemvKernel(float* __restrict__ out, const __nv_bfloat16* __restrict__ w,
+                                 const float* __restrict__ x, int64_t N, int64_t K) {
+  const int64_t n = static_cast<int64_t>(blockIdx.x);
+  if (n >= N) return;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int nth = static_cast<int>(blockDim.x);  // 256 (power of two; matches sh[256])
+  const int64_t kpairs = K >> 1;                 // bf16 pairs (K even for Laguna)
+  const __nv_bfloat162* __restrict__ w2 =
+      reinterpret_cast<const __nv_bfloat162*>(w) + n * kpairs;  // this row, as pairs
+  const float2* __restrict__ x2 = reinterpret_cast<const float2*>(x);
+  float acc = 0.0f;
+  for (int64_t pdx = tid; pdx < kpairs; pdx += nth) {  // coalesced 4-byte bf162 stream
+    const float2 wf = __bfloat1622float2(w2[pdx]);
+    const float2 xv = x2[pdx];
+    acc += wf.x * xv.x + wf.y * xv.y;
+  }
+  if ((K & 1) && tid == 0)  // odd-K scalar tail (not Laguna: hidden is even)
+    acc += __bfloat162float(w[n * K + (K - 1)]) * x[K - 1];
+  __shared__ float sh[256];
+  sh[tid] = acc;
+  __syncthreads();
+  for (int s = nth >> 1; s > 0; s >>= 1) {
+    if (tid < s) sh[tid] += sh[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) out[n] = sh[0];
+}
+
 // ── launchers (no sync — resident) ──
 constexpr int kTPB = 128;
 inline int Blocks(int64_t n) { return static_cast<int>((n + kTPB - 1) / kTPB); }
@@ -346,10 +388,18 @@ void SigmoidTopKLaunch(Queue& q, int32_t* ids, float* weights, const float* logi
   SigmoidTopKKernel<<<1, threads, shmem, AsStream(q)>>>(ids, weights, logits, bias, has_bias, E,
                                                         topk, renorm, scale);
 }
+void LmHeadGemvLaunch(Queue& q, float* out, const void* w_bf16, const float* x, int64_t N,
+                      int64_t K) {
+  // ONE block per output row n (grid = N); 256 threads (power of two; matches the
+  // sh[256] tree-reduce). Fixed grid + fixed pointers ⇒ CUDA-graph capturable.
+  LmHeadGemvKernel<<<static_cast<unsigned>(N), 256, 0, AsStream(q)>>>(
+      out, reinterpret_cast<const __nv_bfloat16*>(w_bf16), x, N, K);
+}
 
-const LagunaDeviceKernels kLaguna = {&RmsNormSeqLaunch,       &RopeFromCacheLaunch,
-                                     &DecodeAttnGqaLaunch,    &SoftplusHeadGateLaunch,
-                                     &SigmoidTopKLaunch,      &DecodeAttnGqaGLaunch};
+const LagunaDeviceKernels kLaguna = {&RmsNormSeqLaunch,    &RopeFromCacheLaunch,
+                                     &DecodeAttnGqaLaunch, &SoftplusHeadGateLaunch,
+                                     &SigmoidTopKLaunch,   &DecodeAttnGqaGLaunch,
+                                     &LmHeadGemvLaunch};
 
 struct Registrar {
   Registrar() {

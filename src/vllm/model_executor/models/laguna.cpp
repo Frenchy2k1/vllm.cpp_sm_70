@@ -989,6 +989,22 @@ std::vector<float> LagunaFinalLogits(vt::Queue& q, const LagunaWeights& weights,
   }
   const bool tied = p.tie_word_embeddings || weights.lm_head.Empty();
   if (tied) return MatmulNK(src, ReadF32(weights.embed), n_out, Vsz, H);
+  // M=1 decode fast-path: a dedicated coalesced bf16 GEMV streams the ~616 MB lm_head
+  // ONCE at ~roofline — cuBLASLt mis-routes LqGemm's M=1×N=vocab MatmulBT to a batched
+  // wmma tile algo (~20% of roofline, the measured #1 Laguna decode GPU cost). Only the
+  // T=1 decode (n_out==1) + bf16 tower lm_head (nvfp4 arm) on a CUDA queue with the
+  // kLaguna table registered; the CPU / GGUF keep-quant / prefill (n_out>1) paths keep
+  // the exact LqGemm reference. NEAR-TIE vs LqGemm (block-reduced dot reorders float
+  // adds; accepted device regime, gated vs vLLM).
+  if (n_out == 1 && weights.lm_head.dtype == vt::DType::kBF16 &&
+      q.device.type != vt::DeviceType::kCPU && laguna::LagunaDeviceKernelsAvailable()) {
+    std::vector<float> logits(static_cast<size_t>(Vsz));
+    laguna::LagunaDevice()->lm_head_gemv(
+        q, logits.data(), reinterpret_cast<const void*>(weights.lm_head.bytes.data()), src.data(),
+        Vsz, H);
+    DrainQueue(q);  // logits are consumed on the host by the caller
+    return logits;
+  }
   return LqGemm(q, weights.lm_head, src, n_out, Vsz, H);
 }
 
@@ -1821,10 +1837,18 @@ struct LagunaGraph {
     // final RMSNorm + lm_head INSIDE the captured region (device), into persistent
     // logits — the resident/non-graph path does this host-side (LagunaFinalLogits);
     // moving it on-device adds one block-reduced-norm near-tie point (accepted device
-    // regime, gated vs vLLM). lm_head is the bf16 tower weight (nvfp4 arm), so GemmBf16
-    // matches LqGemm's bf16 device branch.
+    // regime, gated vs vLLM). lm_head is the bf16 tower weight (nvfp4 arm). The
+    // dedicated M=1 GEMV streams the ~616 MB weight ONCE at ~roofline — replacing the
+    // GemmBf16 MatmulBT that cuBLASLt mis-routed to a batched wmma tile algo (~20% of
+    // roofline, the measured #1 decode GPU cost). Fixed grid=Vsz + fixed pointers ⇒
+    // capture-safe. (f32/quant lm_head would fall back to GemmBf16, but the nvfp4 arm
+    // is always bf16 here.)
     LAG->rms_norm_seq(q, hn.data(), hidden.data(), final_norm_f.data(), 1, H, eps, true);
-    GemmBf16(logits.data(), w->lm_head, hn.data(), Vsz, H);
+    if (w->lm_head.dtype == vt::DType::kBF16)
+      LAG->lm_head_gemv(q, logits.data(),
+                        reinterpret_cast<const void*>(w->lm_head.bytes.data()), hn.data(), Vsz, H);
+    else
+      GemmBf16(logits.data(), w->lm_head, hn.data(), Vsz, H);
   }
 
   // One decode token: refresh the persistent inputs OUTSIDE capture, run/replay the

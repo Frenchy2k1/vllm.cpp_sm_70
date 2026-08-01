@@ -74,6 +74,14 @@ struct LagunaDeviceKernels {
                             const float* knew, const float* vnew, int64_t Hq, int64_t Hkv,
                             int64_t Dh, int64_t group, int64_t first_pos, int64_t window,
                             float scale, const int* len_dev, const int* pos_dev);
+  // Laguna lm_head M=1 decode GEMV: out[N] (f32) = W[N,K] (bf16, row-major) · x[K]
+  // (f32), M=1. A dedicated one-block-per-row coalesced kernel that streams the
+  // ~616 MB [vocab,hidden] weight ONCE at ~roofline — cuBLASLt mis-routes this
+  // M=1×N=vocab×K=hidden GEMM to a batched wmma tile algo (~20% of roofline, the
+  // measured #1 Laguna decode GPU cost). NEAR-TIE vs the MatmulBT reference (the
+  // block-reduced dot reorders float adds — accepted device regime, gated vs vLLM).
+  void (*lm_head_gemv)(vt::Queue&, float* out, const void* w_bf16, const float* x, int64_t N,
+                       int64_t K);
 };
 
 // Resolver (throws on a CPU-only build where nothing registered for kLaguna,kCUDA).
