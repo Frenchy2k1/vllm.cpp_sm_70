@@ -195,9 +195,12 @@ HOST `MatmulNK` reference (`laguna.cpp:184`) even on the CUDA queue, so ALL bf16
 — ~4.8 s/tok of the 6.34. Source-only scan would have missed this; the trace found it.
 
 N5 SPEED PLAN (the user's goal — reach ≥ vLLM 18.8 tok/s, both at NVFP4; trace-ranked):
-1. **Route the routed experts to the CUTLASS sm120a fp4 tensor-core path**
-   (`MatmulNvfp4Fp4DirectD` / the cutlass entry, swizzled block scales) instead of the
-   emulation op — the SAME kernel that puts 27B/35B at vLLM parity. Kills the 99.3% GPU cost.
+1. **Route the routed experts to the CUTLASS sm120a fp4 tensor-core path — NEXT (the
+   confirmed dominant cost).** Post-lever-2 nsys (2026-08-01): `MatmulNvfp4Fp4Naive` is now
+   **92%** of GPU time, the bf16 tower runs fast on-GPU (~6.5%), GPU ~87% busy (compute-bound,
+   host bottleneck gone). Use `MatmulNvfp4Fp4DirectD` / the cutlass entry (swizzled block
+   scales via `CutlassFp4ScaleShape`+`SwizzleBlockscale`, resident weights) instead of the
+   generic emulation op — the SAME kernel that puts 27B/35B at vLLM parity. Kills the 92%.
 2. **Route the bf16 GEMMs to the GPU — DONE (2026-08-01), 16× decode.** `LqGemm`'s bf16
    branch now casts the small `[T,K]` f32 activation to bf16 on-device (`vt::CastBf16`) and
    runs `vt::MatmulBT` (bf16×bf16→f32, cuBLASLt nvjet), keeping the weight bf16 (no per-token
