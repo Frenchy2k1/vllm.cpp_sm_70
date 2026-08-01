@@ -341,6 +341,17 @@ struct LagunaKvCache {
   int64_t len = 0;                    // tokens processed = global position of next
   int64_t head_dim = 0;
   int64_t kv_heads = 0;
+  // --- Resident-decode device KV (Brick A1): fixed-capacity per-layer buffers
+  // (unified → device-accessible). The prefill KV (host `k`/`v`) is migrated in
+  // ONCE on the first resident step; thereafter each token's K/V is appended
+  // ON-STREAM at index dev_rows (no host insert, no per-layer DrainQueue). No
+  // eviction — the decode_attn window mask handles sliding layers (full-deck),
+  // so dev_first_pos stays the prefill value (graph-ready: a per-layer constant).
+  std::vector<std::vector<float>> k_dev, v_dev;  // [layer] max_cap*kvdim
+  std::vector<int64_t> dev_first_pos;            // [layer] frozen at migration
+  std::vector<int64_t> dev_rows;                 // [layer] cached-row count (grows 1/token)
+  int64_t max_cap = 0;
+  bool resident_ready = false;
   void Reset(int64_t num_layers, int64_t hd, int64_t hkv) {
     k.assign(static_cast<size_t>(num_layers), {});
     v.assign(static_cast<size_t>(num_layers), {});
@@ -348,6 +359,12 @@ struct LagunaKvCache {
     len = 0;
     head_dim = hd;
     kv_heads = hkv;
+    k_dev.clear();
+    v_dev.clear();
+    dev_first_pos.clear();
+    dev_rows.clear();
+    max_cap = 0;
+    resident_ready = false;
   }
 };
 

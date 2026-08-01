@@ -1395,6 +1395,30 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
   const int64_t pos = positions[0];
   if (cache.k.empty()) cache.Reset(nlayers, Dh, Hkv);
 
+  // Brick A1: migrate the (host-built) prefill KV into fixed-capacity device buffers
+  // ONCE. Thereafter each token's K/V is appended ON-STREAM at dev_rows[l] (no host
+  // std::vector insert, so no per-layer DrainQueue). Full-deck (no eviction) — the
+  // decode_attn window mask handles sliding layers, and dev_first_pos stays frozen.
+  if (!cache.resident_ready) {
+    cache.max_cap = pos + 1024;  // decode headroom (VT_CHECK guards; one-time zero-init)
+    cache.k_dev.assign(static_cast<size_t>(nlayers), {});
+    cache.v_dev.assign(static_cast<size_t>(nlayers), {});
+    cache.dev_first_pos.assign(static_cast<size_t>(nlayers), 0);
+    cache.dev_rows.assign(static_cast<size_t>(nlayers), 0);
+    for (int64_t l = 0; l < nlayers; ++l) {
+      const size_t cap = static_cast<size_t>(cache.max_cap * kvdim);
+      cache.k_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
+      cache.v_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
+      const std::vector<float>& kc = cache.k[static_cast<size_t>(l)];
+      const std::vector<float>& vc = cache.v[static_cast<size_t>(l)];
+      std::copy(kc.begin(), kc.end(), cache.k_dev[static_cast<size_t>(l)].begin());
+      std::copy(vc.begin(), vc.end(), cache.v_dev[static_cast<size_t>(l)].begin());
+      cache.dev_first_pos[static_cast<size_t>(l)] = cache.first_pos[static_cast<size_t>(l)];
+      cache.dev_rows[static_cast<size_t>(l)] = static_cast<int64_t>(kc.size()) / kvdim;
+    }
+    cache.resident_ready = true;
+  }
+
   const laguna::LagunaDeviceKernels* LAG = laguna::LagunaDevice();
 
   int64_t Hq_max = p.num_attention_heads;
@@ -1460,41 +1484,36 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     const int64_t window = p.WindowForLayer(l);
     const float* rcache = (global ? yarn_cache : slide_cache).data();
 
-    // Norm weights via ReadF32 (bf16->f32 exact, matching the host golden); layer-scoped
-    // so they outlive both DrainQueues.
-    const std::vector<float> w_in = ReadF32(lw.input_norm);
-    LAG->rms_norm_seq(q, hn.data(), hidden.data(), w_in.data(), 1, H, eps, true);
+    // Norm weights via ReadF32 (bf16->f32 exact). Keep()'d so they outlive the now
+    // fully-async layer loop (no per-layer drain) — freed at the step-boundary drain.
+    const float* w_in = Keep(ReadF32(lw.input_norm));
+    LAG->rms_norm_seq(q, hn.data(), hidden.data(), w_in, 1, H, eps, true);
     GemmBf16Into(qv.data(), lw.attn.q_proj, hn.data(), qdim, H);
     GemmBf16Into(knew.data(), lw.attn.k_proj, hn.data(), kvdim, H);
     GemmBf16Into(vnew.data(), lw.attn.v_proj, hn.data(), kvdim, H);
-    std::vector<float> w_qn, w_kn;
     if (p.has_qk_norm && !lw.attn.q_norm.Empty()) {
-      w_qn = ReadF32(lw.attn.q_norm);
-      w_kn = ReadF32(lw.attn.k_norm);
-      LAG->rms_norm_seq(q, qv.data(), qv.data(), w_qn.data(), Hq, Dh, eps, true);
-      LAG->rms_norm_seq(q, knew.data(), knew.data(), w_kn.data(), Hkv, Dh, eps, true);
+      const float* w_qn = Keep(ReadF32(lw.attn.q_norm));
+      const float* w_kn = Keep(ReadF32(lw.attn.k_norm));
+      LAG->rms_norm_seq(q, qv.data(), qv.data(), w_qn, Hq, Dh, eps, true);
+      LAG->rms_norm_seq(q, knew.data(), knew.data(), w_kn, Hkv, Dh, eps, true);
     }
     LAG->rope_from_cache(q, qv.data(), rcache, Hq, Dh, rd, /*pos=*/0);    // single-row cache
     LAG->rope_from_cache(q, knew.data(), rcache, Hkv, Dh, rd, /*pos=*/0);  // (built for `pos`)
-    DrainQueue(q);  // knew/vnew host-readable for the cache append + eviction
-
-    std::vector<float>& kc = cache.k[static_cast<size_t>(l)];
-    std::vector<float>& vc = cache.v[static_cast<size_t>(l)];
-    kc.insert(kc.end(), knew.begin(), knew.end());
-    vc.insert(vc.end(), vnew.begin(), vnew.end());
-    int64_t rows = static_cast<int64_t>(kc.size()) / kvdim;
-    if (window > 0 && rows > window) {
-      const int64_t drop = rows - window;
-      const size_t off = static_cast<size_t>(drop * kvdim);
-      kc.erase(kc.begin(), kc.begin() + static_cast<int64_t>(off));
-      vc.erase(vc.begin(), vc.begin() + static_cast<int64_t>(off));
-      cache.first_pos[static_cast<size_t>(l)] += drop;
-      rows = window;
-    }
-    const int64_t fp = cache.first_pos[static_cast<size_t>(l)];
-
-    LAG->decode_attn_gqa(q, attn.data(), qv.data(), kc.data(), vc.data(), Hq, Hkv, Dh, group, rows,
-                         pos, fp, window, scale);
+    // Brick A1: append K/V to the device cache ON-STREAM (ordered after the RoPE that
+    // wrote knew/vnew, before decode_attn reads — same stream), NO DrainQueue, NO host
+    // insert/eviction. Full-deck: dev_first_pos frozen, decode_attn's window mask evicts.
+    const int64_t dr = cache.dev_rows[static_cast<size_t>(l)];
+    VT_CHECK(dr < cache.max_cap, "laguna resident decode: KV capacity exceeded (raise max_cap)");
+    float* kdev = cache.k_dev[static_cast<size_t>(l)].data();
+    float* vdev = cache.v_dev[static_cast<size_t>(l)].data();
+    const size_t rowbytes = static_cast<size_t>(kvdim) * sizeof(float);
+    vt::GetBackend(dev).Copy(q, kdev + dr * kvdim, knew.data(), rowbytes);
+    vt::GetBackend(dev).Copy(q, vdev + dr * kvdim, vnew.data(), rowbytes);
+    const int64_t rows = dr + 1;
+    const int64_t fp = cache.dev_first_pos[static_cast<size_t>(l)];
+    LAG->decode_attn_gqa(q, attn.data(), qv.data(), kdev, vdev, Hq, Hkv, Dh, group, rows, pos, fp,
+                         window, scale);
+    cache.dev_rows[static_cast<size_t>(l)] = rows;  // advance this layer's cached-row count
     GemmBf16Into(gl.data(), lw.attn.g_proj, hn.data(), Hq, H);
     LAG->softplus_head_gate(q, attn.data(), gl.data(), Hq, Dh);
     GemmBf16Into(o.data(), lw.attn.o_proj, attn.data(), H, qdim);
