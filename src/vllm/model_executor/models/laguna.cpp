@@ -38,6 +38,10 @@
 #include <string>
 #include <vector>
 
+#include <mutex>
+#include <unordered_map>
+
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // Dev/DBuf/ResidentNvfp4 + Marlin (B2)
 #include "vllm/model_executor/models/laguna_ops.h"
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vt/backend.h"  // vt::GetBackend (device drain for the keep-quant GEMMs)
@@ -316,6 +320,226 @@ std::vector<float> LagunaMoeResidentFp4(vt::Queue& q, const LagunaMoeWeights& mo
   return acc;
 }
 
+// ── N5 campaign-B (task #234): route the routed experts to the MARLIN W4A16
+//    grouped MoE GEMM — vLLM's ACTUAL 18.8-tok/s kernel (VLLM_TEST_FORCE_FP8_MARLIN=1),
+//    LOW-M-optimized for decode. Mirrors qwen3_5.cpp BuildMoeMarlinResident +
+//    MoeBlockFusedMarlinCuda (the validated 27B/35B path: default-ON there,
+//    16/16 token-for-token vs oracle, +22% gate / +80% decode), reusing the SHARED
+//    dense_nvfp4::Dev/DBuf/ResidentNvfp4 + the shared vt::cuda Marlin repack/align
+//    ops + vt::MoeGroupedGemmNvfp4Marlin. The SACRED qwen3_5 path is BYTE-UNTOUCHED
+//    (this is a Laguna-local reconstruction over the shared primitives, split-w13
+//    layout for a simple first landing). Gated OFF by default (VT_LAGUNA_MARLIN_MOE=1
+//    opt-in) until the DGX near-tie + ncu gate lands — so the current default GEMV
+//    path is unchanged. CUDA-only (VT_MARLIN_NVFP4). ──────────────────────────────
+#ifdef VT_MARLIN_NVFP4
+namespace {
+// Resident Marlin-repacked routed experts (split w13). Mirror MoeMarlinResident.
+struct LagunaMoeMarlinResident {
+  void* w_gate = nullptr;  // i32 [E, H/16, moe_I*2]
+  void* w_up = nullptr;    // i32 [E, H/16, moe_I*2]
+  void* w_down = nullptr;  // i32 [E, moe_I/16, H*2]
+  void* s_gate = nullptr;  // u8  [E, H/16, moe_I]
+  void* s_up = nullptr;
+  void* s_down = nullptr;  // u8  [E, moe_I/16, H]
+  void* g_gate = nullptr;  // f32 [E]
+  void* g_up = nullptr;
+  void* g_down = nullptr;
+  void* workspace = nullptr;  // i32 [sms*4]
+  int sms = 0;
+  bool ready = false;
+};
+
+LagunaMoeMarlinResident& LagunaMoeMarlinResidentFor(const LagunaMoeWeights* w) {
+  static std::mutex mu;
+  static std::unordered_map<const LagunaMoeWeights*, LagunaMoeMarlinResident> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  return cache[w];
+}
+
+// Repack every routed expert's fp4 gate/up/down into the resident Marlin layout —
+// the per-expert body of qwen3_5.cpp BuildMoeMarlinResident (split branch),
+// reusing the identical shared vt::cuda primitives. K=H (gate/up in), N=moe_I
+// (gate/up out); down is K=moe_I, N=H.
+void BuildLagunaMoeMarlinResident(vllm::dense_nvfp4::Dev d, const LagunaMoeWeights& moe, int E,
+                                  int H, int I, LagunaMoeMarlinResident& mr) {
+  void* stream = d.q.handle;
+  mr.sms = vt::cuda::MarlinDeviceSms(d.q.device.index);
+  const size_t wg_i32 = static_cast<size_t>(H / 16) * (I * 2);  // gate/up weight elems
+  const size_t wd_i32 = static_cast<size_t>(I / 16) * (H * 2);  // down weight elems
+  const size_t sg_b = static_cast<size_t>(H / 16) * I;          // gate/up scale bytes
+  const size_t sd_b = static_cast<size_t>(I / 16) * H;          // down scale bytes
+  mr.w_gate = d.b.Alloc(static_cast<size_t>(E) * wg_i32 * 4);
+  mr.w_up = d.b.Alloc(static_cast<size_t>(E) * wg_i32 * 4);
+  mr.w_down = d.b.Alloc(static_cast<size_t>(E) * wd_i32 * 4);
+  mr.s_gate = d.b.Alloc(static_cast<size_t>(E) * sg_b);
+  mr.s_up = d.b.Alloc(static_cast<size_t>(E) * sg_b);
+  mr.s_down = d.b.Alloc(static_cast<size_t>(E) * sd_b);
+  mr.g_gate = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  mr.g_up = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  mr.g_down = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  mr.workspace = d.b.Alloc(static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+
+  // combined_scale_factor: gate+up jointly (w13), down alone (w2).
+  std::vector<const uint8_t*> gu_bufs, dn_bufs;
+  std::vector<size_t> gu_lens, dn_lens;
+  for (int e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    gu_bufs.push_back(reinterpret_cast<const uint8_t*>(moe.experts_gate_fp4[se].scale.bytes.data()));
+    gu_lens.push_back(moe.experts_gate_fp4[se].scale.bytes.size());
+    gu_bufs.push_back(reinterpret_cast<const uint8_t*>(moe.experts_up_fp4[se].scale.bytes.data()));
+    gu_lens.push_back(moe.experts_up_fp4[se].scale.bytes.size());
+    dn_bufs.push_back(reinterpret_cast<const uint8_t*>(moe.experts_down_fp4[se].scale.bytes.data()));
+    dn_lens.push_back(moe.experts_down_fp4[se].scale.bytes.size());
+  }
+  const float sf_gu = vt::cuda::MarlinNvfp4CombinedScaleFactor(gu_bufs, gu_lens);
+  const float sf_dn = vt::cuda::MarlinNvfp4CombinedScaleFactor(dn_bufs, dn_lens);
+
+  std::vector<float> gg(E), gu(E), gd(E);
+  for (int e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    vllm::dense_nvfp4::Nvfp4Dev g = vllm::dense_nvfp4::ResidentNvfp4(d, moe.experts_gate_fp4[se]);
+    vllm::dense_nvfp4::Nvfp4Dev u = vllm::dense_nvfp4::ResidentNvfp4(d, moe.experts_up_fp4[se]);
+    vllm::dense_nvfp4::Nvfp4Dev dn = vllm::dense_nvfp4::ResidentNvfp4(d, moe.experts_down_fp4[se]);
+    auto* wg = static_cast<uint32_t*>(mr.w_gate) + se * wg_i32;
+    auto* wu = static_cast<uint32_t*>(mr.w_up) + se * wg_i32;
+    auto* wd = static_cast<uint32_t*>(mr.w_down) + se * wd_i32;
+    auto* sgp = static_cast<uint8_t*>(mr.s_gate) + se * sg_b;
+    auto* sup = static_cast<uint8_t*>(mr.s_up) + se * sg_b;
+    auto* sdp = static_cast<uint8_t*>(mr.s_down) + se * sd_b;
+    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wg,
+                                       static_cast<const uint8_t*>(g.packed.data), H, I);
+    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wu,
+                                       static_cast<const uint8_t*>(u.packed.data), H, I);
+    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wd,
+                                       static_cast<const uint8_t*>(dn.packed.data), I, H);
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(g.scale.data), sgp, H, I,
+                                        sf_gu);
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(u.scale.data), sup, H, I,
+                                        sf_gu);
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(dn.scale.data), sdp, I, H,
+                                        sf_dn);
+    gg[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(moe.experts_gate_fp4[se].scale2, sf_gu);
+    gu[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(moe.experts_up_fp4[se].scale2, sf_gu);
+    gd[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(moe.experts_down_fp4[se].scale2, sf_dn);
+  }
+  d.b.Copy(d.q, mr.g_gate, gg.data(), gg.size() * sizeof(float));
+  d.b.Copy(d.q, mr.g_up, gu.data(), gu.size() * sizeof(float));
+  d.b.Copy(d.q, mr.g_down, gd.data(), gd.size() * sizeof(float));
+  d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+  d.b.Synchronize(d.q);  // repack done
+  mr.ready = true;
+}
+}  // namespace
+
+// Single-token (T=1) routed-expert MoE via Marlin W4A16. Returns the combined
+// routed-expert contribution [H] (shared expert handled by the caller, as for
+// LagunaMoeResidentFp4). Mirrors MoeBlockFusedMarlinCuda's split-w13 body with
+// T=1, top_k=Pk. bf16 activation (W4A16), so it IGNORES the W4A4 activation-quant
+// fields and uses scale2 — exactly vLLM's Marlin config.
+std::vector<float> LagunaMoeResidentMarlin(vt::Queue& q, const LagunaMoeWeights& moe,
+                                           const std::vector<float>& hrow, int64_t moe_I, int64_t H,
+                                           int64_t E, const LagunaRouterSelection& sel) {
+  using vt::DType;
+  const int64_t Pk = static_cast<int64_t>(sel.ids.size());
+  std::vector<float> acc(static_cast<size_t>(H), 0.0F);
+  if (Pk == 0) return acc;
+  vt::Backend& bk = vt::GetBackend(q.device.type);
+  vllm::dense_nvfp4::Dev d{bk, q};
+  LagunaMoeMarlinResident& mr = LagunaMoeMarlinResidentFor(&moe);
+  if (!mr.ready)
+    BuildLagunaMoeMarlinResident(d, moe, static_cast<int>(E), static_cast<int>(H),
+                                 static_cast<int>(moe_I), mr);
+  void* stream = q.handle;
+  const vt::Device dev = q.device;
+
+  const int block = vt::cuda::MarlinMoeAlignBlockSizeSelect(1, static_cast<int>(Pk),
+                                                            static_cast<int>(E));
+  int max_tok = 0, max_blk = 0;
+  vt::cuda::MarlinMoeAlignSizes(1, static_cast<int>(Pk), static_cast<int>(E), block, &max_tok,
+                                &max_blk);
+
+  // bf16 activation [1,H] (upload f32 hrow, cast on device).
+  vllm::dense_nvfp4::DBuf dh(d, DType::kBF16, {1, H});
+  {
+    vllm::dense_nvfp4::DBuf xf(d, DType::kF32, {1, H}, hrow.data());
+    vt::CastBf16(q, dh.t(), xf.t());
+  }
+  // router top-k ids/weights for this one token = the Pk selected experts.
+  std::vector<int32_t> ids32(static_cast<size_t>(Pk));
+  std::vector<float> w1(static_cast<size_t>(Pk));
+  for (int64_t s = 0; s < Pk; ++s) {
+    ids32[static_cast<size_t>(s)] = static_cast<int32_t>(sel.ids[static_cast<size_t>(s)]);
+    w1[static_cast<size_t>(s)] = sel.weights[static_cast<size_t>(s)];
+  }
+  vllm::dense_nvfp4::DBuf dtid(d, DType::kI32, {1, Pk}, ids32.data());
+  vllm::dense_nvfp4::DBuf dtw(d, DType::kF32, {1, Pk}, w1.data());
+  vllm::dense_nvfp4::DBuf sorted(d, DType::kI32, {max_tok});
+  vllm::dense_nvfp4::DBuf eids(d, DType::kI32, {max_blk});
+  vllm::dense_nvfp4::DBuf npad(d, DType::kI32, {1});
+  vt::cuda::MarlinMoeAlignBlockSize(stream, static_cast<const int32_t*>(dtid.ptr()), 1,
+                                    static_cast<int>(Pk), static_cast<int>(E), block,
+                                    static_cast<int32_t*>(sorted.ptr()),
+                                    static_cast<int32_t*>(eids.ptr()),
+                                    static_cast<int32_t*>(npad.ptr()));
+
+  vt::Tensor wg = vllm::dense_nvfp4::MakeTensor(mr.w_gate, DType::kI32, dev, {E, H / 16, moe_I * 2});
+  vt::Tensor wu = vllm::dense_nvfp4::MakeTensor(mr.w_up, DType::kI32, dev, {E, H / 16, moe_I * 2});
+  vt::Tensor wd = vllm::dense_nvfp4::MakeTensor(mr.w_down, DType::kI32, dev, {E, moe_I / 16, H * 2});
+  vt::Tensor sg = vllm::dense_nvfp4::MakeTensor(mr.s_gate, DType::kI8, dev, {E, H / 16, moe_I});
+  vt::Tensor su = vllm::dense_nvfp4::MakeTensor(mr.s_up, DType::kI8, dev, {E, H / 16, moe_I});
+  vt::Tensor sd = vllm::dense_nvfp4::MakeTensor(mr.s_down, DType::kI8, dev, {E, moe_I / 16, H});
+  vt::Tensor gg = vllm::dense_nvfp4::MakeTensor(mr.g_gate, DType::kF32, dev, {E});
+  vt::Tensor gu = vllm::dense_nvfp4::MakeTensor(mr.g_up, DType::kF32, dev, {E});
+  vt::Tensor gd = vllm::dense_nvfp4::MakeTensor(mr.g_down, DType::kF32, dev, {E});
+  vt::Tensor ws = vllm::dense_nvfp4::MakeTensor(mr.workspace, DType::kI32, dev, {mr.sms * 4});
+
+  const int bi = block, Pki = static_cast<int>(Pk), Hi = static_cast<int>(H),
+            Ii = static_cast<int>(moe_I);
+  vllm::dense_nvfp4::DBuf dgate(d, DType::kBF16, {Pk, moe_I});
+  vllm::dense_nvfp4::DBuf dup(d, DType::kBF16, {Pk, moe_I});
+  vt::MoeGroupedGemmNvfp4Marlin(q, dgate.t(), dh.t(), wg, sg, gg, ws, sorted.t(),
+                                eids.t(), npad.t(), dtw.t(),
+                                vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+  vt::MoeGroupedGemmNvfp4Marlin(q, dup.t(), dh.t(), wu, su, gu, ws, sorted.t(),
+                                eids.t(), npad.t(), dtw.t(),
+                                vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+  vllm::dense_nvfp4::DBuf dact(d, DType::kBF16, {Pk, moe_I});
+  vt::MoeSiluMul(q, dact.t(), dgate.t(), dup.t());
+
+  vllm::dense_nvfp4::DBuf ddown(d, DType::kBF16, {Pk, H});
+  vt::MoeGroupedGemmNvfp4Marlin(q, ddown.t(), dact.t(), wd, sd, gd, ws, sorted.t(),
+                                eids.t(), npad.t(), dtw.t(),
+                                vt::MoeMarlinArgs{bi, 1, Pki, Hi, Ii, false});
+  vt::Tensor expert_out = vllm::dense_nvfp4::MakeTensor(ddown.ptr(), DType::kBF16, dev, {1, Pk, H});
+  vllm::dense_nvfp4::DBuf dout(d, DType::kBF16, {1, H});
+  vt::MoeCombine(q, dout.t(), expert_out, dtw.t());
+
+  // bf16 [H] -> f32 acc (bf16 is the top 16 bits of f32; exact).
+  std::vector<uint16_t> hb(static_cast<size_t>(H));
+  dout.Download(d, hb.data());
+  for (int64_t i = 0; i < H; ++i) {
+    const uint32_t u = static_cast<uint32_t>(hb[static_cast<size_t>(i)]) << 16;
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    acc[static_cast<size_t>(i)] = f;
+  }
+  return acc;
+}
+#endif  // VT_MARLIN_NVFP4
+
+// N5 campaign-B gate: route the routed experts through the Marlin W4A16 grouped
+// MoE GEMM (vLLM's 18.8 kernel). Default OFF (opt-in) until the DGX near-tie + ncu
+// gate lands; then flip to default-ON per the parity-enablers-ship-as-defaults
+// policy. VT_LAGUNA_MARLIN_MOE=1 enables. Only meaningful when VT_MARLIN_NVFP4
+// compiled the path in.
+inline bool LagunaMarlinMoeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_MARLIN_MOE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 // Keep-quant GEMM against a ROW-SLICE [row_off, row_off+N) of a stacked block
 // weight `w` [E*out, K] — the per-expert (moe_*_exps) slice. Rows are whole
 // blocks (RowSizeBytes), so the offset is a byte offset and no block is cut.
@@ -571,6 +795,16 @@ std::vector<float> LagunaFfnBlock(vt::Queue& q, const LagunaLayerWeights& lw,
       // wins EAGER on Laguna's fast-kernel profile (ds4's slow-glue precedent may not
       // transfer). VT_LAGUNA_RESIDENT_MOE=0 forces the per-expert path for an A/B.
       const char* dis = std::getenv("VT_LAGUNA_RESIDENT_MOE");
+#ifdef VT_MARLIN_NVFP4
+      if (LagunaMarlinMoeEnabled()) {
+        // N5 campaign-B: route the routed experts through vLLM's 18.8 Marlin W4A16
+        // grouped GEMM (opt-in VT_LAGUNA_MARLIN_MOE=1 until the DGX gate lands).
+        const int64_t E = static_cast<int64_t>(lw.moe.experts_gate_fp4.size());
+        const std::vector<float> racc =
+            LagunaMoeResidentMarlin(q, lw.moe, hrow, moe_I, H, E, sel);
+        for (int64_t d = 0; d < H; ++d) acc[static_cast<size_t>(d)] += racc[static_cast<size_t>(d)];
+      } else
+#endif
       if (dis == nullptr || dis[0] != '0') {
         const std::vector<float> racc = LagunaMoeResidentFp4(q, lw.moe, hrow, moe_I, H, sel);
         for (int64_t d = 0; d < H; ++d) acc[static_cast<size_t>(d)] += racc[static_cast<size_t>(d)];
