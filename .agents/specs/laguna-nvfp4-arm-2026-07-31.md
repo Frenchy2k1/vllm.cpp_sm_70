@@ -290,7 +290,30 @@ scales, resident weights) + fused norm/quant/silu. Next bounded bricks, ranked:
   B1. GEMV dequant arithmetic: replace the kE2M1 `__constant__` LUT (data-dependent index →
       constant-memory serialization across a warp) with branchless bit-arithmetic e2m1→f32;
       + vectorized (uint4) packed-weight loads. Cheapest, self-contained, ncu-gated.
-  B2. Route Laguna experts to MatmulNvfp4CutlassModel/DirectD (the 27B/35B path): swizzle the
-      linear NVFP4 scales → cutlass layout at LOAD, then dispatch. Bigger lift, the real 18.8
-      path. Grounded in the existing proven cutlass kernel ([[ground-every-impl-in-upstream]]).
-  (B0 — hw-fp8 cvt — DONE, negative.)
+  B2. **Route Laguna experts to the MARLIN W4A16 grouped MoE GEMM — the HIGHEST-VALUE lever
+      and the true 18.8 path (scoped 2026-08-01, zero-DGX source study).** KEY: vLLM's 18.8 bar
+      is **MARLIN W4A16** (`VLLM_TEST_FORCE_FP8_MARLIN=1`; bf16 activations + fp4 weights), NOT
+      cutlass W4A4 — and Marlin is LOW-M-optimized (decode/batch-1), exactly where a tensor-core
+      cutlass/native-MMA GEMM wastes tile rows on M=1. The engine already ships the EXACT kernel:
+      `vt::MoeGroupedGemmNvfp4Marlin` (`include/vt/ops.h:1340`, a 1:1 lift of vLLM
+      `moe_wna16_marlin_gemm`, `ops.cu:543`) + the shared repack primitive
+      `MarlinRepackExpertWeight` (`src/vt/cuda/cuda_marlin_repack.cu:131`, vendored
+      `gptq_marlin_repack_kernel`). **qwen3_5 (27B/35B) ALREADY uses this path** — DEFAULT ON
+      (`MarlinMoeEnabled()`/`VT_NVFP4_MARLIN`), validated **16/16 token-for-token vs oracle,
+      +22% gate / +80% decode-heavy** — via `BuildMoeMarlinResident` (`qwen3_5.cpp:4674`, repacks
+      each expert's fp4 weight → i32 marlin `[E,K/16,N*2]` + fp8 scales `[E,K/16,N]` + f32 global
+      scale at LOAD) + `MoeMarlinResident` (:617) + the fused-w13 forward (:2210). Laguna reuses
+      qwen3_5's whole infra, so B2 = **(i)** a `BuildLagunaMoeMarlinResident` mirroring
+      `BuildMoeMarlinResident` but over `LagunaMoeWeights.experts_{gate,up,down}_fp4`
+      (`Nvfp4Weight`, already stacked `[E,N,K/2]`) — call the SAME shared `MarlinRepackExpertWeight`
+      + scale/global-scale packing; **(ii)** route `LagunaFfnBlock`'s fp4 branch (currently
+      `LagunaMoeResidentFp4` → per-expert `MatmulNvfp4Fp4` GEMV) to `MoeGroupedGemmNvfp4Marlin`
+      when `MarlinMoeEnabled()` + resident ready, mirroring qwen3_5:2210; keep the GEMV path as
+      the `VT_NVFP4_MARLIN=0` escape hatch for A/B. Gate: near-tie vs the vLLM-**Marlin** golden
+      (W4A16 numerics → should match BETTER than our current W4A4) + kernel-duration ncu +
+      same-binary A/B. This is pure reuse of proven shared ops ([[ground-every-impl-in-upstream]],
+      MIRROR-vLLM + FOLD-onto-shared-MoE-Marlin directives) — no new kernel. NOTE the shared
+      expert also has a Marlin arm (`SharedGateUpFusedMarlinD`) for the same fold.
+  (B0 — hw-fp8 cvt — DONE, negative. B2 supersedes the earlier "cutlass DirectD" framing: Marlin
+   is vLLM's ACTUAL 18.8 kernel and is the low-M-correct choice; DirectD/cutlass W4A4 is a
+   prefill/large-M lever, not the decode bar.)
