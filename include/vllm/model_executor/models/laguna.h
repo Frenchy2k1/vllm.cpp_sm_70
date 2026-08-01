@@ -203,6 +203,20 @@ struct LagunaAttnWeights {
   OwnedTensor g_proj;   // raw-NK [num_heads_l, H]  (per-head softplus out-gate; GGUF attn_gate)
   OwnedTensor q_norm;   // f32 [head_dim]  per-head QK-RMSNorm (GGUF blk.N.attn_q_norm) — VERIFIED W4
   OwnedTensor k_norm;   // f32 [head_dim]  per-head QK-RMSNorm (GGUF blk.N.attn_k_norm) — VERIFIED W4
+
+  // ─── Fused decode projection (NVFP4 arm; steady-decode lever) ───────────────
+  // The NVFP4 checkpoint keeps q/k/v/g in BF16, and all four read the SAME
+  // input-norm activation, so they stack row-wise into ONE bf16 [qdim + 2*kvdim +
+  // Hq, H] tensor consumed by a SINGLE wider M=1 GEMV in the resident/graph decode
+  // (row order q, k, v, g). Fusing raises the GEMV's N (grid = N blocks) so the
+  // small-N projections stop under-filling the GPU — MEASURED #1 steady-decode
+  // cost (52.7% of decode GPU time was separate bf16 M=1 GEMVs). ADDITIVE: the
+  // split q/k/v/g above are KEPT (the host/prefill forwards read them); this is a
+  // load-time row-block concat, populated ONLY by the NVFP4 loader (Empty() on the
+  // GGUF keep-quant path, which never reaches the resident decode). Byte-exact in
+  // principle (each output row is an independent fp32-accumulated dot); the wider N
+  // may latch a different cuBLASLt algo -> near-tie (the accepted device regime).
+  OwnedTensor qkvg_proj;  // bf16 [qdim + 2*kvdim + Hq, H]  (q | k | v | g stacked)
 };
 
 // Laguna dense SwiGLU MLP (layer 0 only). silu(gate)*up -> down (separate tensors).
@@ -230,6 +244,16 @@ struct LagunaMoeWeights {
   OwnedTensor shared_gate;    // [moe_I, H]  (ffn_gate_shexp, Q8_0)
   OwnedTensor shared_up;      // [moe_I, H]  (ffn_up_shexp,   Q8_0)
   OwnedTensor shared_down;    // [H, moe_I]  (ffn_down_shexp, Q8_0)
+
+  // ─── Fused router+shared-gate+shared-up (NVFP4 arm; steady-decode lever) ─────
+  // The NVFP4 checkpoint keeps the router + shared-expert gate/up in BF16, all
+  // reading the SAME post-attn activation (K=H), so they stack row-wise into ONE
+  // bf16 [E + 2*moe_I, H] tensor consumed by a SINGLE M=1 GEMV in the resident/
+  // graph decode (row order router, shared_gate, shared_up). Slice: [0,E)=router
+  // logits -> sigmoid_topk; [E, E+moe_I)=shared_gate; [E+moe_I, E+2*moe_I)=
+  // shared_up (pre-SiLU). ADDITIVE (the split tensors above are KEPT for the host/
+  // prefill forwards); populated ONLY by the NVFP4 loader (Empty() otherwise).
+  OwnedTensor router_shared_gu;  // bf16 [E + 2*moe_I, H]  (router | s_gate | s_up)
 
   // NVFP4 arm (task #230, spec laguna-nvfp4-arm-2026-07-31.md). The
   // poolside/Laguna-S-2.1-NVFP4 checkpoint keeps attention + dense-MLP + shared
