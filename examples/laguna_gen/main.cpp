@@ -194,6 +194,16 @@ int main(int argc, char** argv) {
         (long long)w.params.vocab_size, (int)w.has_nvfp4_weights,
         std::chrono::duration<double>(t1 - t0).count(), CurResidentGiB(), PeakResidentGiB());
     if (!w.has_nvfp4_weights) { std::fprintf(stderr, "[gen] ERROR: no NVFP4 tower\n"); return 1; }
+    // The loader COPIES every tensor into owned buffers (LoadBf16Direct / the fp4
+    // LnLoadCtNvfp4Raw both memcpy), so the mmap'd shards are dead weight now.
+    // On the GB10's 119 GiB UNIFIED pool holding the mmap alongside the ~67 GiB of
+    // owned copies pushes RSS to ~114 GiB and starves the CUDA context
+    // (cudaStreamCreate OOM). Drop the shards -> RSS falls to the owned-copy size.
+    const size_t n_shards_freed = shards.size();
+    shards.clear();
+    shards.shrink_to_fit();
+    std::fprintf(stderr, "[gen] released %zu mmap'd shard(s); RSS %.1f GiB\n",
+                 n_shards_freed, CurResidentGiB());
     eos = HfInt(config.raw, "eos_token_id", 2);
     eot = eos;
     if (fs::exists(tok_path)) {
