@@ -69,7 +69,8 @@ __global__ void RopeFromCacheKernel(float* x, const float* cache, int64_t heads,
 // K/V laid out [kv_rows, Hkv, Dh]; kv_pos[j]=j, q_pos=pos; causal + per-layer window.
 __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, const float* v,
                                     int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group,
-                                    int64_t kv_rows, int64_t q_pos, int64_t window, float scale) {
+                                    int64_t kv_rows, int64_t q_pos, int64_t first_pos,
+                                    int64_t window, float scale) {
   const int64_t h = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (h >= Hq) return;
   const int64_t kvh = h / group;
@@ -78,8 +79,9 @@ __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, co
   for (int64_t d = 0; d < Dh; ++d) orow[d] = 0.0f;
 
   auto masked = [&](int64_t j) -> bool {
-    if (j > q_pos) return true;                          // causal (kv_pos[j]=j)
-    if (window > 0 && q_pos - j >= window) return true;  // sliding-window eviction
+    const int64_t pj = first_pos + j;                     // global position of cache row j
+    if (pj > q_pos) return true;                          // causal
+    if (window > 0 && q_pos - pj >= window) return true;  // sliding-window eviction
     return false;
   };
   auto dotj = [&](int64_t j) -> float {
@@ -178,9 +180,10 @@ void RopeFromCacheLaunch(Queue& q, float* x, const float* cache, int64_t heads, 
 }
 void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                          int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group, int64_t kv_rows,
-                         int64_t q_pos, int64_t window, float scale) {
+                         int64_t q_pos, int64_t first_pos, int64_t window, float scale) {
   DecodeAttnGqaKernel<<<Blocks(Hq), kTPB, 0, AsStream(q)>>>(o, qd, k, v, Hq, Hkv, Dh, group,
-                                                            kv_rows, q_pos, window, scale);
+                                                            kv_rows, q_pos, first_pos, window,
+                                                            scale);
 }
 void SoftplusHeadGateLaunch(Queue& q, float* attn, const float* gl, int64_t Hq, int64_t Dh) {
   SoftplusHeadGateKernel<<<Blocks(Hq * Dh), kTPB, 0, AsStream(q)>>>(attn, gl, Hq, Dh);

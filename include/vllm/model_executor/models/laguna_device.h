@@ -41,12 +41,13 @@ struct LagunaDeviceKernels {
   void (*rope_from_cache)(vt::Queue&, float* x, const float* cache, int64_t heads, int64_t Dh,
                           int64_t rd, int64_t pos);
   // GQA T=1 decode attention: o[Hq,Dh] over K/V[kv_rows,Hkv,Dh], head h reads KV head
-  // h/group; SEQUENTIAL host-order online softmax (bit-exact to LagunaAttention:701);
-  // causal (skip key j>q_pos) + per-layer sliding window (skip if window>0 and
-  // q_pos-j>=window); NO attn-sink. scale=1/sqrt(Dh).
+  // h/group; SEQUENTIAL host-order 3-pass softmax (bit-exact to LagunaAttention:701).
+  // Physical cache row r has GLOBAL position kv_pos=first_pos+r (matches the host's
+  // sliding-window eviction bookkeeping); causal (skip kv_pos>q_pos) + per-layer window
+  // (skip if window>0 and q_pos-kv_pos>=window); NO attn-sink. scale=1/sqrt(Dh).
   void (*decode_attn_gqa)(vt::Queue&, float* o, const float* q, const float* k, const float* v,
                           int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group, int64_t kv_rows,
-                          int64_t q_pos, int64_t window, float scale);
+                          int64_t q_pos, int64_t first_pos, int64_t window, float scale);
   // Per-head softplus OUT-gate in place: attn[h,d] *= softplus(gate_logits[h]),
   // softplus(x)=(x>20)?x:log1p(exp(x)) in f32. Bit-exact to LagunaSoftplusHeadGate:25.
   void (*softplus_head_gate)(vt::Queue&, float* attn, const float* gate_logits, int64_t Hq,
