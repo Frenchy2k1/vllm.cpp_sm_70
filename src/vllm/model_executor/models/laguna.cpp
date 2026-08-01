@@ -916,6 +916,34 @@ std::vector<float> LagunaFinalLogits(vt::Queue& q, const LagunaWeights& weights,
 
 }  // namespace
 
+// N5 campaign-B: build ALL routed-expert Marlin residents at model-LOAD time
+// (mirrors vLLM's process_weights_after_loading, marlin_utils_fp4.py), instead of
+// lazily on the first forward — so the 48L×256E repack cost is paid once at load,
+// not as a first-token TTFT spike. No-op unless the Marlin path is enabled + on GPU
+// (+ built with VT_MARLIN_NVFP4). The forward's lazy `if (!mr.ready) Build…` then
+// finds every resident ready. Safe: only runs under LagunaMarlinMoeEnabled(), so the
+// GEMV/CPU paths (which read the fp4 originals it frees) can never run this process.
+// External linkage (declared in laguna.h); the anon-namespace helpers it calls stay
+// visible here via the anonymous namespace's implicit using-directive.
+void LagunaBuildMarlinResidents(vt::Queue& q, const LagunaWeights& w) {
+#ifdef VT_MARLIN_NVFP4
+  if (q.device.type == vt::DeviceType::kCPU || !LagunaMarlinMoeEnabled()) return;
+  vt::Backend& bk = vt::GetBackend(q.device.type);
+  vllm::dense_nvfp4::Dev d{bk, q};
+  for (const LagunaLayerWeights& lw : w.layers) {
+    if (lw.is_dense || lw.moe.experts_gate_fp4.empty()) continue;
+    const int E = static_cast<int>(lw.moe.experts_gate_fp4.size());
+    const int N = static_cast<int>(lw.moe.experts_gate_fp4[0].n);  // moe_intermediate
+    const int K = static_cast<int>(lw.moe.experts_gate_fp4[0].k);  // hidden_size
+    LagunaMoeMarlinResident& mr = LagunaMoeMarlinResidentFor(&lw.moe);
+    if (!mr.ready) BuildLagunaMoeMarlinResident(d, lw.moe, E, K, N, mr);
+  }
+#else
+  (void)q;
+  (void)w;
+#endif
+}
+
 std::vector<float> LagunaModel::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
