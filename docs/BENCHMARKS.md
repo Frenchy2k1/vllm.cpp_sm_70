@@ -69,6 +69,22 @@ DeepSeek-V4-Flash has been benchmarked against `ds4` = **DwarfStar** (antirez's 
 
 The model is ~300B+ total params, so even 4-bit weights are 156-168 GB. The only quant that fits one Spark is extreme-low-bit GGUF, which vLLM can't load here. So on one Spark the ONLY feasible engines are GGUF (our engine, DwarfStar, llama.cpp) — **DwarfStar was forced by the hardware, not an off-policy shortcut** (contrast Laguna, where vLLM fit and llama.cpp-only was avoidable). The policy-correct vLLM DeepSeek comparison is OWED but requires **2× GB10 Sparks + TP2** (the anemll checkpoint, ~90 GB/GPU) over the landed NCCL intra-node TP seam — a multi-node effort, not a single-box run. DwarfStar stays a labeled secondary best-in-class-GGUF peer meanwhile.
 
+## DeepSeek-V4-Flash — decode nsys attribution: 13.0 tok/s, Q8_0 GEMV is 53.5% (2026-08-01, `CLAIM-DSV4-DECODE-NSYS`)
+
+Re-measured the GGUF decode from scratch (`deepseek-v4-gen --gpu --kv-cache`, `ds4flash.gguf` = `IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8`, GB10, tmux drop-proof capture). **Decode = 13.0 tok/s** (0.076 s/step, dead-consistent over 23 steps) vs **ds4 16.5 → 79% of ds4, ~1.27× behind.** The prior-recorded **8.0 baseline is STALE** (device-resident decode + tuned glue landed since; superseded). Prefill 0.47s, PEAK RESIDENT 86.3 GiB.
+
+**nsys `cuda_gpu_kern_sum`: 1.984 s GPU-kernel time / ~2.24 s compute-wall = ~88% GPU-ACTIVE** → decode is **GPU-BUSY, not launch/host-bound** (an initial mem-floor guess of "launch-bound → decode CUDA-graph" was OVERTURNED by this measurement — the graph is NOT the lever). GPU-time breakdown:
+
+| kernel family | GPU time | % |
+|---|---|---|
+| **Q8_0 GEMV** (`QuantDotGemmQ8_0Kernel` 35.8% + `GroupDiag` 10.7% + `Pair` 7.4%) | **1061 ms** | **53.5%** |
+| routed-expert MoE (IQ2XXS/Q2K fused grouped SwiGLU + grouped) | 345 ms | 17.4% |
+| MHC glue (`MhcPreFinish`/`MhcPreDots`/`MhcPost`) | 221 ms | 11% |
+| `QuantizeQ8K` (activation quant) | 152 ms | 7.7% |
+| norm/rope/attn/router | ~180 ms | 9% |
+
+**The #1 lever is the Q8_0 GEMV** (attention q/kv/o projections + shared-expert gate/up/down, every layer). The cross-ref lever scan (`CLAIM-XREF-LEVER-SCAN` above) already IDENTIFIED it — "ds4's 90% DRAM = full-warp-per-row + 1088-B coalesced Q8_0 bursts; our Q8_0 ships sub-warp 8/16-lane/row → port ds4's 32-lane/8-row warp8" — and the prior campaign (tasks #206-#220) worked it but **NEVER LANDED** it; it is still 53.5% of GPU time and ~2× ds4. That port (byte-exact-gated by `test_cuda_quant_dot`; ds4 ref kernel = `~/w8run/ds4/ds4_cuda.cu`) is the reachable path to ≥16.5. Secondary: `QuantizeQ8K` fusion (7.7%, fold into the prior GEMV epilogue), MHC-glue fusion (11%). **SCOPE NOTE:** this checkpoint uses NO Q4_K/Q5_K (experts are IQ2_XXS/Q2_K, already `__dp4a`-vectorized — no Q4K/Q5K kernel appears in the trace), so the `DotQ4K`/`DotQ5K` __dp4a vectorization (`f9d9369b`, byte-exact 110432/110432) is a correct GENERAL k-quant win but NOT a DeepSeek-benchmark closer.
+
 ## Laguna-S-2.1 (`LagunaForCausalLM`) FIRST real vLLM bar — vLLM NVFP4 vs our GGUF (2026-07-31, `CLAIM-LAGUNA-VLLM-NVFP4`)
 
 Until now every Laguna number was measured against **llama.cpp** (the same UD-Q4_K_XL GGUF), and even the correctness oracle was `llama-cli` (`run_oracle.sh`) — vLLM, the project's standing bar, had **never** been run on Laguna. This closes that gap.
