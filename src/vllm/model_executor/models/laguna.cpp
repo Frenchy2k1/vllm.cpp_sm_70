@@ -1405,14 +1405,18 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
   const int64_t maxI = std::max(moe_I, dense_I);
   const int64_t maxK = std::max({H, qdim_max, moe_I, dense_I});
 
-  const std::vector<float> yarn_cache = BuildLagunaFullYarnCosSin(p, pos + 1);
-  const std::vector<float> slide_cache = BuildLagunaSlidingCosSin(p, pos + 1);
+  // rope_from_cache reads only row `pos`; build that single row (pos0=pos, rows=1)
+  // instead of the full [pos+1, rd] table — the full rebuild was O(pos)/token = O(n^2)
+  // cumulative. Byte-identical to row `pos` of the full table; read below at index 0.
+  const std::vector<float> yarn_cache = BuildLagunaFullYarnCosSin(p, /*rows=*/1, /*pos0=*/pos);
+  const std::vector<float> slide_cache = BuildLagunaSlidingCosSin(p, /*rows=*/1, /*pos0=*/pos);
 
   std::vector<float> hidden = LagunaEmbed(weights.embed, token_ids, H, Vsz);
   std::vector<float> hn(static_cast<size_t>(H)), qv(static_cast<size_t>(qdim_max)),
       gl(static_cast<size_t>(Hq_max)), attn(static_cast<size_t>(qdim_max)),
       o(static_cast<size_t>(H));
   std::vector<uint16_t> abf(static_cast<size_t>(maxK));
+  std::vector<float> knew(static_cast<size_t>(kvdim)), vnew(static_cast<size_t>(kvdim));
   // device-FFN scratch (unified) + persistent f32 norm/bias keep-alive (no per-FFN drain)
   std::vector<float> gating(static_cast<size_t>(E)), dg(static_cast<size_t>(maxI)),
       du(static_cast<size_t>(maxI)), dact(static_cast<size_t>(maxI)), fdn(static_cast<size_t>(H)),
@@ -1460,7 +1464,6 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     // so they outlive both DrainQueues.
     const std::vector<float> w_in = ReadF32(lw.input_norm);
     LAG->rms_norm_seq(q, hn.data(), hidden.data(), w_in.data(), 1, H, eps, true);
-    std::vector<float> knew(static_cast<size_t>(kvdim)), vnew(static_cast<size_t>(kvdim));
     GemmBf16Into(qv.data(), lw.attn.q_proj, hn.data(), qdim, H);
     GemmBf16Into(knew.data(), lw.attn.k_proj, hn.data(), kvdim, H);
     GemmBf16Into(vnew.data(), lw.attn.v_proj, hn.data(), kvdim, H);
@@ -1471,8 +1474,8 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       LAG->rms_norm_seq(q, qv.data(), qv.data(), w_qn.data(), Hq, Dh, eps, true);
       LAG->rms_norm_seq(q, knew.data(), knew.data(), w_kn.data(), Hkv, Dh, eps, true);
     }
-    LAG->rope_from_cache(q, qv.data(), rcache, Hq, Dh, rd, pos);
-    LAG->rope_from_cache(q, knew.data(), rcache, Hkv, Dh, rd, pos);
+    LAG->rope_from_cache(q, qv.data(), rcache, Hq, Dh, rd, /*pos=*/0);    // single-row cache
+    LAG->rope_from_cache(q, knew.data(), rcache, Hkv, Dh, rd, /*pos=*/0);  // (built for `pos`)
     DrainQueue(q);  // knew/vnew host-readable for the cache append + eviction
 
     std::vector<float>& kc = cache.k[static_cast<size_t>(l)];

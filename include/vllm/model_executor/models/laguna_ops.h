@@ -63,9 +63,12 @@ LagunaRouterSelection LagunaUngroupedRouterTopK(
 // FULL-attention (global) layers: YaRN inv_freq (theta_full, factor, beta_fast/
 // slow) over rotary_dim_full (=64), mscale = LagunaYarnMscale(factor, attn_factor).
 // SLIDING layers: plain inv_freq[i]=theta_sliding^(-(2i)/rotary_dim_sliding),
-// mscale = 1, over rotary_dim_sliding (=128). `rows` sizes the (position) axis.
-std::vector<float> BuildLagunaFullYarnCosSin(const LagunaParams& p, int64_t rows);
-std::vector<float> BuildLagunaSlidingCosSin(const LagunaParams& p, int64_t rows);
+// mscale = 1, over rotary_dim_sliding (=128). `rows` sizes the (position) axis;
+// `pos0` is the global position of the FIRST row (default 0 → rows cover [0,rows)).
+// The resident decode reads only row `pos`, so it builds a single row with rows=1,
+// pos0=pos (avoids the O(pos)/token full-table rebuild = O(n^2) over a generation).
+std::vector<float> BuildLagunaFullYarnCosSin(const LagunaParams& p, int64_t rows, int64_t pos0 = 0);
+std::vector<float> BuildLagunaSlidingCosSin(const LagunaParams& p, int64_t rows, int64_t pos0 = 0);
 
 // llama.cpp YaRN mscale: yarn_attn_factor * (1 + 0.1*ln(factor)) for factor>1,
 // else yarn_attn_factor. Reproduces HF's precomputed attention_factor and the
