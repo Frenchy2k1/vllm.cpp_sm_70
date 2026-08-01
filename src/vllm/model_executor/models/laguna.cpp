@@ -1471,6 +1471,11 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       o(static_cast<size_t>(H));
   std::vector<uint16_t> abf(static_cast<size_t>(maxK));
   std::vector<float> knew(static_cast<size_t>(kvdim)), vnew(static_cast<size_t>(kvdim));
+  // Fused-projection decode scratch (steady-decode lever): ONE wider GEMV writes
+  // the stacked qkvg / router+shared outputs; downstream ops read pointer-offset
+  // slices into these (no copy). qkvg = [q | k | v | g], rsg = [router | sg | su].
+  std::vector<float> qkvg_buf(static_cast<size_t>(qdim_max + 2 * kvdim + Hq_max));
+  std::vector<float> rsg_buf(static_cast<size_t>(E + 2 * moe_I));
   // device-FFN scratch (unified) + persistent f32 norm/bias keep-alive (no per-FFN drain)
   std::vector<float> gating(static_cast<size_t>(E)), dg(static_cast<size_t>(maxI)),
       du(static_cast<size_t>(maxI)), dact(static_cast<size_t>(maxI)), fdn(static_cast<size_t>(H)),
@@ -1518,17 +1523,39 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     // fully-async layer loop (no per-layer drain) — freed at the step-boundary drain.
     const float* w_in = Keep(ReadF32(lw.input_norm));
     LAG->rms_norm_seq(q, hn.data(), hidden.data(), w_in, 1, H, eps, true);
-    GemmBf16Into(qv.data(), lw.attn.q_proj, hn.data(), qdim, H);
-    GemmBf16Into(knew.data(), lw.attn.k_proj, hn.data(), kvdim, H);
-    GemmBf16Into(vnew.data(), lw.attn.v_proj, hn.data(), kvdim, H);
+    // LEVER 1 — fused q|k|v|g projection (ONE wider GEMV instead of 3+1 narrow
+    // M=1 GEMVs). Slice the stacked output into qv/knew/vnew/gl pointer views (no
+    // copy); the offsets MUST match the load-time stack order (q,k,v,g). Fallback
+    // to the split GEMVs on the GGUF path (qkvg_proj Empty()).
+    float* qvp;
+    float* knp;
+    float* vnp;
+    float* glp;
+    const bool fused_qkvg = !lw.attn.qkvg_proj.Empty();
+    if (fused_qkvg) {
+      const int64_t n_qkvg = qdim + 2 * kvdim + Hq;
+      GemmBf16Into(qkvg_buf.data(), lw.attn.qkvg_proj, hn.data(), n_qkvg, H);
+      qvp = qkvg_buf.data();
+      knp = qkvg_buf.data() + qdim;
+      vnp = qkvg_buf.data() + qdim + kvdim;
+      glp = qkvg_buf.data() + qdim + 2 * kvdim;
+    } else {
+      GemmBf16Into(qv.data(), lw.attn.q_proj, hn.data(), qdim, H);
+      GemmBf16Into(knew.data(), lw.attn.k_proj, hn.data(), kvdim, H);
+      GemmBf16Into(vnew.data(), lw.attn.v_proj, hn.data(), kvdim, H);
+      qvp = qv.data();
+      knp = knew.data();
+      vnp = vnew.data();
+      glp = gl.data();
+    }
     if (p.has_qk_norm && !lw.attn.q_norm.Empty()) {
       const float* w_qn = Keep(ReadF32(lw.attn.q_norm));
       const float* w_kn = Keep(ReadF32(lw.attn.k_norm));
-      LAG->rms_norm_seq(q, qv.data(), qv.data(), w_qn, Hq, Dh, eps, true);
-      LAG->rms_norm_seq(q, knew.data(), knew.data(), w_kn, Hkv, Dh, eps, true);
+      LAG->rms_norm_seq(q, qvp, qvp, w_qn, Hq, Dh, eps, true);
+      LAG->rms_norm_seq(q, knp, knp, w_kn, Hkv, Dh, eps, true);
     }
-    LAG->rope_from_cache(q, qv.data(), rcache, Hq, Dh, rd, /*pos=*/0);    // single-row cache
-    LAG->rope_from_cache(q, knew.data(), rcache, Hkv, Dh, rd, /*pos=*/0);  // (built for `pos`)
+    LAG->rope_from_cache(q, qvp, rcache, Hq, Dh, rd, /*pos=*/0);    // single-row cache
+    LAG->rope_from_cache(q, knp, rcache, Hkv, Dh, rd, /*pos=*/0);  // (built for `pos`)
     // Brick A1: append K/V to the device cache ON-STREAM (ordered after the RoPE that
     // wrote knew/vnew, before decode_attn reads — same stream), NO DrainQueue, NO host
     // insert/eviction. Full-deck: dev_first_pos frozen, decode_attn's window mask evicts.
@@ -1537,15 +1564,17 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     float* kdev = cache.k_dev[static_cast<size_t>(l)].data();
     float* vdev = cache.v_dev[static_cast<size_t>(l)].data();
     const size_t rowbytes = static_cast<size_t>(kvdim) * sizeof(float);
-    vt::GetBackend(dev).Copy(q, kdev + dr * kvdim, knew.data(), rowbytes);
-    vt::GetBackend(dev).Copy(q, vdev + dr * kvdim, vnew.data(), rowbytes);
+    vt::GetBackend(dev).Copy(q, kdev + dr * kvdim, knp, rowbytes);
+    vt::GetBackend(dev).Copy(q, vdev + dr * kvdim, vnp, rowbytes);
     const int64_t rows = dr + 1;
     const int64_t fp = cache.dev_first_pos[static_cast<size_t>(l)];
-    LAG->decode_attn_gqa(q, attn.data(), qv.data(), kdev, vdev, Hq, Hkv, Dh, group, rows, pos, fp,
+    LAG->decode_attn_gqa(q, attn.data(), qvp, kdev, vdev, Hq, Hkv, Dh, group, rows, pos, fp,
                          window, scale);
     cache.dev_rows[static_cast<size_t>(l)] = rows;  // advance this layer's cached-row count
-    GemmBf16Into(gl.data(), lw.attn.g_proj, hn.data(), Hq, H);
-    LAG->softplus_head_gate(q, attn.data(), gl.data(), Hq, Dh);
+    // LEVER 1: the fused GEMV already produced g (glp -> qkvg_buf); only the
+    // split fallback still needs a dedicated g_proj GEMV here.
+    if (!fused_qkvg) GemmBf16Into(gl.data(), lw.attn.g_proj, hn.data(), Hq, H);
+    LAG->softplus_head_gate(q, attn.data(), glp, Hq, Dh);
     GemmBf16Into(o.data(), lw.attn.o_proj, attn.data(), H, qdim);
     {
       vt::Tensor ht = vt::Tensor::Contiguous(hidden.data(), DType::kF32, dev, {1, H});
@@ -1563,17 +1592,37 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       AddInto(hidden.data(), fdn.data());
     } else {
 #ifdef VT_MARLIN_NVFP4
-      GemmBf16Into(gating.data(), lw.moe.router, hn.data(), E, H);  // router (bf16 weight)
+      // LEVER 2 — fused router|shared_gate|shared_up projection (ONE GEMV): all
+      // three read the SAME post-attn `hn`. Slice: [0,E)=router logits ->
+      // sigmoid_topk; [E,E+moe_I)=shared_gate; [E+moe_I,E+2*moe_I)=shared_up
+      // (pre-SiLU). Fallback to split GEMVs on the GGUF path (router_shared_gu Empty()).
+      float* gatingp;
+      float* sgp;
+      float* sup;
+      const bool fused_rsg = !lw.moe.router_shared_gu.Empty();
+      if (fused_rsg) {
+        GemmBf16Into(rsg_buf.data(), lw.moe.router_shared_gu, hn.data(), E + 2 * moe_I, H);
+        gatingp = rsg_buf.data();
+        sgp = rsg_buf.data() + E;
+        sup = rsg_buf.data() + E + moe_I;
+      } else {
+        GemmBf16Into(gating.data(), lw.moe.router, hn.data(), E, H);  // router (bf16 weight)
+        gatingp = gating.data();
+        sgp = dg.data();
+        sup = du.data();
+      }
       const float* bias = lw.moe.e_score_correction_bias.Empty()
                               ? nullptr
                               : Keep(ReadF32(lw.moe.e_score_correction_bias));
-      LAG->sigmoid_topk(q, eids32.data(), topw.data(), gating.data(), bias, bias != nullptr, E,
+      LAG->sigmoid_topk(q, eids32.data(), topw.data(), gatingp, bias, bias != nullptr, E,
                         topk, p.norm_topk_prob, p.moe_routed_scaling_factor);
       LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
                                   topk, doutb.data());
-      GemmBf16Into(dg.data(), lw.moe.shared_gate, hn.data(), moe_I, H);  // shared expert
-      GemmBf16Into(du.data(), lw.moe.shared_up, hn.data(), moe_I, H);
-      SiluMul(dact.data(), dg.data(), du.data(), moe_I);
+      if (!fused_rsg) {  // split fallback still needs dedicated shared gate/up GEMVs
+        GemmBf16Into(dg.data(), lw.moe.shared_gate, hn.data(), moe_I, H);  // shared expert
+        GemmBf16Into(du.data(), lw.moe.shared_up, hn.data(), moe_I, H);
+      }
+      SiluMul(dact.data(), sgp, sup, moe_I);
       GemmBf16Into(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
       AddInto(hidden.data(), doutb.data());  // hidden += routed
       AddInto(hidden.data(), so.data());     // hidden += shared
@@ -1597,10 +1646,11 @@ namespace {
 // the single-row RoPE cos/sin) live in persistent buffers whose CONTENTS the driver
 // refreshes OUTSIDE capture before each replay. The growing KV is handled cudagraph-
 // safely: fixed-capacity per-layer cache_k/cache_v seeded from the prefill KV; the
-// kv-norm+RoPE writes the new token's K/V to a FIXED per-layer knew[l]/vnew[l] scratch
-// (NOT the varying cache slot); decode_attn_gqa_g attends cache[0..len) + knew/vnew
-// with len/pos read from DEVICE buffers; and BETWEEN replays the driver async-copies
-// knew[l]/vnew[l]→cache_k[l]/cache_v[l] at the host-known slot (NOT inside capture) +
+// kv-norm+RoPE writes the new token's K/V into the k/v sub-ranges of the FIXED
+// per-layer qkvg[l] fused scratch (NOT the varying cache slot); decode_attn_gqa_g
+// attends cache[0..len) + those k/v ranges with len/pos read from DEVICE buffers;
+// and BETWEEN replays the driver async-copies the k/v ranges→cache_k[l]/cache_v[l]
+// at the host-known slot (NOT inside capture) +
 // advances the row count. cold→warm→captured: the cold step runs eager (warms the
 // DevicePool + the per-stream GEMM scratch, grow-only → capture does zero fresh
 // cudaMalloc, which stream capture forbids). [[cudagraph-capture-bakes-stack-
@@ -1632,8 +1682,13 @@ struct LagunaGraph {
     bool global, is_dense;
   };
   std::vector<LayerC> lc;
-  // persistent per-layer device KV (seeded from prefill) + fixed new-row scratch.
-  std::vector<std::vector<float>> cache_k, cache_v, knew, vnew;
+  // persistent per-layer device KV (seeded from prefill) + the fused new-row
+  // scratch. LEVER 1: qkvg[l] is the per-layer [qdim_l + 2*kvdim + Hq_l] output of
+  // the fused q|k|v|g GEMV; its k/v sub-ranges REPLACE the old separate knew[l]/
+  // vnew[l] (Step() copies those slices into the growing cache between replays), so
+  // each layer needs its OWN persistent buffer (a shared one would be overwritten
+  // by the next layer before Step() drains it).
+  std::vector<std::vector<float>> cache_k, cache_v, qkvg;
   // persistent per-layer f32 norms/bias — pre-converted ONCE (kills per-token ReadF32
   // + the stack-baked-pointer hazard).
   std::vector<std::vector<float>> input_norm_f, q_norm_f, k_norm_f, post_norm_f, moe_bias_f;
@@ -1642,9 +1697,11 @@ struct LagunaGraph {
   std::vector<float> yarn_row, slide_row;
   // per-step device-read scalars (FIXED pointers, contents refreshed each token).
   std::vector<int> pos_buf, len_buf;
-  // persistent working scratch (all members → stable captured addresses).
-  std::vector<float> hidden, hn, qv, gl, attn, o, gating, dg, du, dact, fdn, so, doutb, topw,
-      logits;
+  // persistent working scratch (all members → stable captured addresses). LEVER 2:
+  // rsg is the shared [E + 2*moe_I] fused router|shared_gate|shared_up output (a
+  // single reused buffer suffices — unlike qkvg's K/V, none of its slices persist
+  // across layers/replays). The old separate qv/gl/gating are now qkvg/rsg slices.
+  std::vector<float> hidden, hn, attn, o, dg, du, dact, fdn, so, doutb, topw, logits, rsg;
   std::vector<uint16_t> abf;
   std::vector<int32_t> eids32;
   void* graph = nullptr;
@@ -1683,11 +1740,13 @@ struct LagunaGraph {
     }
     kv_rows = rows0;
     max_cap = rows0 + 1024;  // decode headroom
-    // persistent per-layer KV seeded from the host prefill KV; fixed new-row scratch.
+    // persistent per-layer KV seeded from the host prefill KV; per-layer fused
+    // q|k|v|g new-row scratch (LEVER 1). Each qkvg[l] is sized to the layer's own
+    // N_total = qdim_l + 2*kvdim + Hq_l; its k/v sub-ranges are the new-row scratch
+    // Step() drains between replays.
     cache_k.assign(static_cast<size_t>(nlayers), {});
     cache_v.assign(static_cast<size_t>(nlayers), {});
-    knew.assign(static_cast<size_t>(nlayers), {});
-    vnew.assign(static_cast<size_t>(nlayers), {});
+    qkvg.assign(static_cast<size_t>(nlayers), {});
     for (int64_t l = 0; l < nlayers; ++l) {
       const size_t cap = static_cast<size_t>(max_cap * kvdim);
       cache_k[static_cast<size_t>(l)].assign(cap, 0.0F);
@@ -1696,8 +1755,15 @@ struct LagunaGraph {
       const std::vector<float>& vc = cache.v[static_cast<size_t>(l)];
       std::copy(kc.begin(), kc.end(), cache_k[static_cast<size_t>(l)].begin());
       std::copy(vc.begin(), vc.end(), cache_v[static_cast<size_t>(l)].begin());
-      knew[static_cast<size_t>(l)].assign(static_cast<size_t>(kvdim), 0.0F);
-      vnew[static_cast<size_t>(l)].assign(static_cast<size_t>(kvdim), 0.0F);
+      const LayerC& c = lc[static_cast<size_t>(l)];
+      // The graph always fuses (NVFP4-arm-only path); the loader must have built
+      // the stacked projections. Fail LOUDLY here rather than mis-slice at replay.
+      const LagunaLayerWeights& L = w->layers[static_cast<size_t>(l)];
+      VT_CHECK(!L.attn.qkvg_proj.Empty(),
+               "laguna decode graph: fused qkvg_proj missing (NVFP4 loader must build it)");
+      VT_CHECK(c.is_dense || !L.moe.router_shared_gu.Empty(),
+               "laguna decode graph: fused router_shared_gu missing (NVFP4 loader must build it)");
+      qkvg[static_cast<size_t>(l)].assign(static_cast<size_t>(c.qdim + 2 * kvdim + c.Hq), 0.0F);
     }
     // persistent f32 norms/bias (pre-converted ONCE — no per-token ReadF32 in-graph).
     input_norm_f.resize(static_cast<size_t>(nlayers));
@@ -1721,14 +1787,12 @@ struct LagunaGraph {
     slide_row.assign(static_cast<size_t>(p->rotary_dim_sliding), 0.0F);
     pos_buf.assign(1, 0);
     len_buf.assign(1, 0);
-    // persistent working scratch.
+    // persistent working scratch. (qv/gl/gating are now qkvg/rsg slices.)
     hidden.assign(static_cast<size_t>(H), 0.0F);
     hn.assign(static_cast<size_t>(H), 0.0F);
-    qv.assign(static_cast<size_t>(qdim_max), 0.0F);
-    gl.assign(static_cast<size_t>(Hq_max), 0.0F);
     attn.assign(static_cast<size_t>(qdim_max), 0.0F);
     o.assign(static_cast<size_t>(H), 0.0F);
-    gating.assign(static_cast<size_t>(E), 0.0F);
+    rsg.assign(static_cast<size_t>(E + 2 * moe_I), 0.0F);
     dg.assign(static_cast<size_t>(maxI), 0.0F);
     du.assign(static_cast<size_t>(maxI), 0.0F);
     dact.assign(static_cast<size_t>(maxI), 0.0F);
@@ -1764,9 +1828,9 @@ struct LagunaGraph {
   // The per-layer resident chain over the PERSISTENT buffers (the CAPTURE region) —
   // same math as LagunaForwardResidentDecode's loop body, but: norms read the pre-
   // converted f32 members; RoPE reads the persistent single-row cos/sin (index 0);
-  // decode_attn uses decode_attn_gqa_g with len_buf/pos_buf (DEVICE); the new K/V go
-  // to the FIXED per-layer knew[l]/vnew[l] (NOT appended in-graph); final norm +
-  // lm_head are INSIDE the region, writing persistent logits.
+  // decode_attn uses decode_attn_gqa_g with len_buf/pos_buf (DEVICE); the new K/V
+  // are the k/v sub-ranges of the FIXED per-layer qkvg[l] fused buffer (NOT appended
+  // in-graph); final norm + lm_head are INSIDE the region, writing persistent logits.
   void RunChain() {
     vt::Queue& q = *qp;
     const laguna::LagunaDeviceKernels* LAG = laguna::LagunaDevice();
@@ -1784,29 +1848,33 @@ struct LagunaGraph {
     for (int64_t l = 0; l < nlayers; ++l) {
       const LagunaLayerWeights& lw = w->layers[static_cast<size_t>(l)];
       const LayerC& c = lc[static_cast<size_t>(l)];
-      float* kn = knew[static_cast<size_t>(l)].data();
-      float* vn = vnew[static_cast<size_t>(l)].data();
+      // LEVER 1: the fused q|k|v|g output lives in the per-layer qkvg[l] buffer;
+      // slice it (offsets MUST match the load-time stack order q,k,v,g). kn/vn are
+      // the k/v sub-ranges Step() drains into the growing cache between replays.
+      float* base = qkvg[static_cast<size_t>(l)].data();
+      float* qvp = base;
+      float* kn = base + c.qdim;
+      float* vn = base + c.qdim + kvdim;
+      float* glp = base + c.qdim + 2 * kvdim;
       const float* rcache = (c.global ? yarn_row : slide_row).data();
       LAG->rms_norm_seq(q, hn.data(), hidden.data(), input_norm_f[static_cast<size_t>(l)].data(), 1,
                         H, eps, true);
-      GemmBf16(qv.data(), lw.attn.q_proj, hn.data(), c.qdim, H);
-      GemmBf16(kn, lw.attn.k_proj, hn.data(), kvdim, H);
-      GemmBf16(vn, lw.attn.v_proj, hn.data(), kvdim, H);
+      GemmBf16(base, lw.attn.qkvg_proj, hn.data(), c.qdim + 2 * kvdim + c.Hq, H);
       if (p->has_qk_norm && !lw.attn.q_norm.Empty()) {
-        LAG->rms_norm_seq(q, qv.data(), qv.data(), q_norm_f[static_cast<size_t>(l)].data(), c.Hq,
+        LAG->rms_norm_seq(q, qvp, qvp, q_norm_f[static_cast<size_t>(l)].data(), c.Hq,
                           Dh, eps, true);
         LAG->rms_norm_seq(q, kn, kn, k_norm_f[static_cast<size_t>(l)].data(), Hkv, Dh, eps, true);
       }
-      LAG->rope_from_cache(q, qv.data(), rcache, c.Hq, Dh, c.rd, /*pos=*/0);
+      LAG->rope_from_cache(q, qvp, rcache, c.Hq, Dh, c.rd, /*pos=*/0);
       LAG->rope_from_cache(q, kn, rcache, Hkv, Dh, c.rd, /*pos=*/0);
-      // GRAPH decode attention: cache_k[l][0..len) + knew/vnew as the new row, with
+      // GRAPH decode attention: cache_k[l][0..len) + kn/vn as the new row, with
       // len/pos read from the DEVICE buffers. first_pos=0 (uniform, P<512). The new
       // row is appended to cache_k/cache_v BETWEEN replays (Step), never in-graph.
-      LAG->decode_attn_gqa_g(q, attn.data(), qv.data(), cache_k[static_cast<size_t>(l)].data(),
+      LAG->decode_attn_gqa_g(q, attn.data(), qvp, cache_k[static_cast<size_t>(l)].data(),
                              cache_v[static_cast<size_t>(l)].data(), kn, vn, c.Hq, Hkv, Dh, c.group,
                              /*first_pos=*/0, c.window, scale, len_buf.data(), pos_buf.data());
-      GemmBf16(gl.data(), lw.attn.g_proj, hn.data(), c.Hq, H);
-      LAG->softplus_head_gate(q, attn.data(), gl.data(), c.Hq, Dh);
+      // g was produced by the fused GEMV (glp -> qkvg[l]); untouched until here.
+      LAG->softplus_head_gate(q, attn.data(), glp, c.Hq, Dh);
       GemmBf16(o.data(), lw.attn.o_proj, attn.data(), H, c.qdim);
       AddInto(hidden.data(), o.data());
       LAG->rms_norm_seq(q, hn.data(), hidden.data(), post_norm_f[static_cast<size_t>(l)].data(), 1,
@@ -1818,17 +1886,19 @@ struct LagunaGraph {
         GemmBf16(fdn.data(), lw.mlp.down_proj, dact.data(), H, dense_I);
         AddInto(hidden.data(), fdn.data());
       } else {
-        GemmBf16(gating.data(), lw.moe.router, hn.data(), E, H);
+        // LEVER 2: fused router|shared_gate|shared_up GEMV -> rsg slices.
+        GemmBf16(rsg.data(), lw.moe.router_shared_gu, hn.data(), E + 2 * moe_I, H);
+        float* gatingp = rsg.data();
+        float* sgp = rsg.data() + E;
+        float* sup = rsg.data() + E + moe_I;
         const float* bias = moe_bias_f[static_cast<size_t>(l)].empty()
                                 ? nullptr
                                 : moe_bias_f[static_cast<size_t>(l)].data();
-        LAG->sigmoid_topk(q, eids32.data(), topw.data(), gating.data(), bias, bias != nullptr, E,
+        LAG->sigmoid_topk(q, eids32.data(), topw.data(), gatingp, bias, bias != nullptr, E,
                           topk, p->norm_topk_prob, p->moe_routed_scaling_factor);
         LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
                                     topk, doutb.data());
-        GemmBf16(dg.data(), lw.moe.shared_gate, hn.data(), moe_I, H);
-        GemmBf16(du.data(), lw.moe.shared_up, hn.data(), moe_I, H);
-        SiluMul(dact.data(), dg.data(), du.data(), moe_I);
+        SiluMul(dact.data(), sgp, sup, moe_I);
         GemmBf16(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
         AddInto(hidden.data(), doutb.data());  // hidden += routed
         AddInto(hidden.data(), so.data());     // hidden += shared
@@ -1899,15 +1969,18 @@ struct LagunaGraph {
     } else {                   // captured: one cudaGraphLaunch
       b.ReplayGraph(q, graph);
     }
-    // append this token's per-layer knew/vnew → cache at slot kv_rows (on the stream,
-    // AFTER the step produced knew/vnew, BEFORE the next replay reads it) — the growing
-    // KV. Host-known offset here is legal (NOT a captured arg).
+    // append this token's per-layer new K/V → cache at slot kv_rows (on the stream,
+    // AFTER the step produced them, BEFORE the next replay reads them) — the growing
+    // KV. LEVER 1: the new K/V are the k/v sub-ranges of the fused qkvg[l] buffer
+    // (offsets qdim_l and qdim_l+kvdim). Host-known offsets here are legal (NOT
+    // captured args).
     const size_t rowbytes = static_cast<size_t>(kvdim) * sizeof(float);
     for (int64_t l = 0; l < nlayers; ++l) {
-      b.Copy(q, cache_k[static_cast<size_t>(l)].data() + kv_rows * kvdim,
-             knew[static_cast<size_t>(l)].data(), rowbytes);
-      b.Copy(q, cache_v[static_cast<size_t>(l)].data() + kv_rows * kvdim,
-             vnew[static_cast<size_t>(l)].data(), rowbytes);
+      const float* base = qkvg[static_cast<size_t>(l)].data();
+      const int64_t qd = lc[static_cast<size_t>(l)].qdim;
+      b.Copy(q, cache_k[static_cast<size_t>(l)].data() + kv_rows * kvdim, base + qd, rowbytes);
+      b.Copy(q, cache_v[static_cast<size_t>(l)].data() + kv_rows * kvdim, base + qd + kvdim,
+             rowbytes);
     }
     kv_rows++;
     b.Synchronize(q);  // the ONE step-boundary drain: logits ready, appends complete

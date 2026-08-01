@@ -295,6 +295,42 @@ Nvfp4Weight LnLoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj)
   return r;
 }
 
+#ifdef VT_MARLIN_NVFP4
+// Stack several bf16 [N_i, K] row-major weight tensors into ONE bf16 [sum N_i, K]
+// tensor (plain row-block memcpy concat; the listed order is preserved). Used to
+// pre-fuse the resident/graph-decode projections that all read the SAME activation
+// (q/k/v/g off the input norm; router/shared_gate/shared_up off the post-attn
+// norm) so the decode issues ONE wider M=1 GEMV instead of 3-4 narrow ones — the
+// MEASURED #1 steady-decode lever (raising the GEMV's N = grid blocks fixes the
+// small-N under-fill). Byte-exact in principle: each output row is an independent
+// fp32-accumulated dot over the same activation, so stacking rows changes no row's
+// math (only the launch is fused). Guarded to the NVFP4 build (the only build whose
+// resident/graph decode consumes it); the split originals are KEPT for the host/
+// prefill forwards, so this concat is purely ADDITIVE.
+OwnedTensor LnStackBf16RowsNK(const std::vector<const OwnedTensor*>& parts) {
+  VT_CHECK(!parts.empty(), "laguna nvfp4 fuse: empty stack");
+  int64_t k = -1;
+  int64_t n_total = 0;
+  for (const OwnedTensor* t : parts) {
+    VT_CHECK(t != nullptr && !t->Empty(), "laguna nvfp4 fuse: missing stack part");
+    VT_CHECK(t->dtype == vt::DType::kBF16 && t->rank == 2,
+             "laguna nvfp4 fuse: expected 2-D bf16 stack part");
+    if (k < 0) k = t->shape[1];
+    VT_CHECK(t->shape[1] == k, "laguna nvfp4 fuse: stack parts must share K");
+    n_total += t->shape[0];
+  }
+  OwnedTensor o = dense_loaders::MakeOwned(vt::DType::kBF16, {n_total, k});
+  size_t off = 0;
+  for (const OwnedTensor* t : parts) {
+    std::memcpy(o.bytes.data() + off, t->bytes.data(), t->bytes.size());
+    off += t->bytes.size();
+  }
+  VT_CHECK(off == o.bytes.size(), "laguna nvfp4 fuse: byte accounting mismatch");
+  o.nk = true;  // raw [N,K] torch orientation (vt::MatmulBT), matches the parts
+  return o;
+}
+#endif  // VT_MARLIN_NVFP4
+
 }  // namespace
 
 // N1b (task #230, spec laguna-nvfp4-arm-2026-07-31.md): the real safetensors
@@ -365,6 +401,19 @@ LagunaWeights LoadLagunaForCausalLMWeights(
       lw.moe.shared_up = LoadBf16Direct(get, b + "mlp.shared_expert.up_proj.weight");
       lw.moe.shared_down = LoadBf16Direct(get, b + "mlp.shared_expert.down_proj.weight");
     }
+
+#ifdef VT_MARLIN_NVFP4
+    // Fused decode projections (the steady-decode lever): stack q|k|v|g (all read
+    // the input-norm activation) and router|shared_gate|shared_up (all read the
+    // post-attn activation) so the resident/graph decode fires ONE wider GEMV each.
+    // ADDITIVE — the split originals above are KEPT (the host/prefill forwards read
+    // them). Order MUST match the forward's slice offsets (q,k,v,g / router,sg,su).
+    lw.attn.qkvg_proj = LnStackBf16RowsNK(
+        {&lw.attn.q_proj, &lw.attn.k_proj, &lw.attn.v_proj, &lw.attn.g_proj});
+    if (!lw.is_dense)
+      lw.moe.router_shared_gu = LnStackBf16RowsNK(
+          {&lw.moe.router, &lw.moe.shared_gate, &lw.moe.shared_up});
+#endif  // VT_MARLIN_NVFP4
   }
   w.accounted_tensors = static_cast<int64_t>(where->size());
   w.has_gguf_weights = false;  // safetensors NVFP4 arm, not the GGUF keep-quant tower
