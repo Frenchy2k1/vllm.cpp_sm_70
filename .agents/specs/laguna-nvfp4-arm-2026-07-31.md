@@ -263,3 +263,34 @@ experts to cutlass DirectD + adopt the fused norm/quant/silu ops (mirror 27B/35B
 M=1-tuned fp4 GEMV → the remaining 3.3×. Both are substantial; (B) is the bigger lift and the
 one that actually reaches 18.8. Honest: single-GB10 Laguna-NVFP4 parity is a multi-campaign
 effort, not one graph.
+
+**N5 update (2026-08-01) — hw-fp8 GEMV dequant: MEASURED NEGATIVE, reverted.**
+Hypothesis: the M=1 fp4 GEMV (MatmulNvfp4Fp4Gemv) is compute-bound on the per-byte
+software fp8-e4m3 scale decode (F8E4M3ToF32Dev's `ldexpf`), so a hardware
+`cvt.rn.f16.e4m3` (via `__nv_fp8_e4m3`→float) would cut it. Implemented bit-exact
+(generated ids byte-identical on the real 67 GiB ckpt) + templated behind
+VT_NVFP4_FP4_GEMV_HWFP8 for a same-binary A/B. **Paging-immune ncu (sm_121a) verdict:
+hardware cvt is NEUTRAL-to-slightly-WORSE** — grid768 41.2us(hw) vs 41.9us(sw) = tie;
+grid256 59.8 vs 53.2 (within the 45-87us per-sample spread); mean 53.6(hw) vs 49.4(sw).
+On the GPU `ldexpf` compiles to a cheap exponent-bit add, so the software decode was
+already efficient. Reverted (commit ab7a1c1e). Recorded so the LUT-vs-cvt question
+is closed, not re-litigated. NOTE the end-to-end wall-clock A/B was USELESS: the 67 GiB
+unified reload + paging swings TPOT 0.16↔1.08 s/tok run-to-run — the kernel-duration
+ncu is the only honest anchor here (matches [[dgx-passwordless-sudo-clean-measurement]]).
+
+**N5 ATTRIBUTION CORRECTION (2026-08-01) — the "host-orchestration" framing is GGUF-only.**
+[[laguna-speed-host-orchestration-bound]] (⅔ host-sync, 22k syncs/step, GPU 32.7% active)
+was measured on the GGUF keep-quant path, NOT NVFP4. The NVFP4 lever-1 state is ~87%
+GPU-busy (line 254), and current best decode ≈ 0.16 s/tok = **6.25 tok/s already MEETS the
+~5.9 tok/s perfect-graph ceiling**. So for NVFP4 the device-resident-decode + graph campaign
+(#228) is LARGELY SPENT — it cannot clear the current number by more than noise. The ONLY
+lever left to 18.8 is **kernel efficiency of the M=1 fp4 GEMMs** (campaign B): the compute-
+bound GEMV (68% SM at grid768) + routing experts to vLLM's tuned cutlass DirectD (swizzled
+scales, resident weights) + fused norm/quant/silu. Next bounded bricks, ranked:
+  B1. GEMV dequant arithmetic: replace the kE2M1 `__constant__` LUT (data-dependent index →
+      constant-memory serialization across a warp) with branchless bit-arithmetic e2m1→f32;
+      + vectorized (uint4) packed-weight loads. Cheapest, self-contained, ncu-gated.
+  B2. Route Laguna experts to MatmulNvfp4CutlassModel/DirectD (the 27B/35B path): swizzle the
+      linear NVFP4 scales → cutlass layout at LOAD, then dispatch. Bigger lift, the real 18.8
+      path. Grounded in the existing proven cutlass kernel ([[ground-every-impl-in-upstream]]).
+  (B0 — hw-fp8 cvt — DONE, negative.)
