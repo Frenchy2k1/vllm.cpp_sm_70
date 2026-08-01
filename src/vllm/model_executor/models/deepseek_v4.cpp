@@ -1512,9 +1512,14 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
 }
 
 inline bool DecodeGraphEnabled() {
+  // DEFAULT-ON (parity-enablers-ship-as-defaults): the decode CUDA graph is a MEASURED
+  // 2.13x byte-exact decode win on GB10 (VT_V4_DECODE_GRAPH A/B: 6.0 -> 12.8 tok/s,
+  // ids byte-identical), and the recorded 13.0 DeepSeek baseline already ran with it —
+  // so the shipped default must match the benchmarked config. VT_V4_DECODE_GRAPH=0 opts
+  // back out (same-binary A/B escape hatch); anything else (unset or =1) keeps it ON.
   static const bool on = [] {
     const char* e = std::getenv("VT_V4_DECODE_GRAPH");
-    return e != nullptr && std::string(e) == "1";
+    return e == nullptr || std::string(e) != "0";
   }();
   return on;
 }
