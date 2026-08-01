@@ -195,6 +195,13 @@ int main(int argc, char** argv) {
 
   if (is_nvfp4) {
     // ── NVFP4 safetensors arm (N3) ──────────────────────────────────────────
+    // N5 lever #1: enable the native sm120a fp4 tensor-core MMA for the routed-expert
+    // GEMMs. It reads the SAME linear scale layout LqGemmNvfp4Fp4 produces, so no
+    // swizzle is needed; it just defaults OFF. Measured on GB10: decode 0.39 → 0.20
+    // s/tok (2×; 2.56 → 5.0 tok/s), coherent + near-tie. `setenv(...,0)` respects an
+    // explicit `VT_NVFP4_FP4_NATIVE=0` override. Scoped to this Laguna driver (the
+    // 27B/35B use the separate DirectD cutlass path, untouched).
+    setenv("VT_NVFP4_FP4_NATIVE", "1", 0);
     const std::string config_path = (fs::path(model) / "config.json").string();
     const std::string tok_path = (fs::path(model) / "tokenizer.json").string();
     std::fprintf(stderr, "[gen] NVFP4 safetensors dir %s\n", model.c_str());
