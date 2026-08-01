@@ -175,6 +175,24 @@ int main(int argc, char** argv) {
   std::optional<vllm::tok::Tokenizer> tkz;   // built once; used for encode + decode
   bool add_bos = false;
 
+  // Create the CUDA context BEFORE loading weights. On the GB10's 119 GiB UNIFIED
+  // pool, reading the ~67 GiB checkpoint leaves ~67 GiB of reclaimable page cache on
+  // top of the ~67 GiB of owned copies; a CUDA context reserved AFTER the load fails
+  // (cudaStreamCreate OOM) because the driver can't grab its reservation against that
+  // pressure. Reserving the context while the pool is empty avoids it — the forward's
+  // later device allocations then grow into the headroom (the kernel evicts the clean
+  // page cache under pressure).
+  vt::Backend* gpu_backend = nullptr;
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  if (use_gpu) {
+    gpu_backend = &vt::GetBackend(vt::DeviceType::kCUDA);
+    q = gpu_backend->CreateQueue();
+    std::fprintf(stderr, "[gen] GPU context reserved on CUDA device %d (before load)\n",
+                 q.device.index);
+  } else {
+    std::fprintf(stderr, "[gen] CPU queue\n");
+  }
+
   if (is_nvfp4) {
     // ── NVFP4 safetensors arm (N3) ──────────────────────────────────────────
     const std::string config_path = (fs::path(model) / "config.json").string();
@@ -281,16 +299,8 @@ int main(int argc, char** argv) {
   if (tokens.empty()) { std::fprintf(stderr, "[gen] ERROR: empty token list\n"); return 2; }
   const size_t n_prompt = tokens.size();
 
-  vt::Backend* gpu_backend = nullptr;
-  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-  if (use_gpu) {
-    gpu_backend = &vt::GetBackend(vt::DeviceType::kCUDA);
-    q = gpu_backend->CreateQueue();
-    std::fprintf(stderr, "[gen] GPU %s GEMMs on CUDA device %d\n",
-                 is_nvfp4 ? "NVFP4 W4A4" : "keep-quant", q.device.index);
-  } else {
-    std::fprintf(stderr, "[gen] CPU %s queue\n", is_nvfp4 ? "NVFP4" : "keep-quant");
-  }
+  std::fprintf(stderr, "[gen] %s GEMMs (%s)\n", use_gpu ? "GPU" : "CPU",
+               is_nvfp4 ? "NVFP4 W4A4" : "keep-quant");
 
   std::fprintf(stderr, "[gen] decode path: %s\n",
                stateless ? "STATELESS O(n^2) full-recompute (W5)"

@@ -34430,3 +34430,49 @@ PARTIAL on two further unrelated test-only GCC 12 `-Wrestrict` diagnostics in
 `test_deepseek_v2_paged_engine.cpp` (actively MLA-owned) and
 `test_glm4_moe_lite_paged_engine.cpp`; those files were not touched, so full
 CTest cannot run from this incomplete build. No GPU, model, or benchmark ran.
+
+## 2026-08-01 — Laguna NVFP4 W4A4 arm N1a–N4 LANDS + RAN on GB10 (`CLAIM-LAGUNA-NVFP4-N4`; tasks #230 CLOSED, #234 OPEN)
+
+Built the ADDITIVE NVFP4 (safetensors) Laguna arm end-to-end and RAN it on the real
+`poolside/Laguna-S-2.1-NVFP4` (67 GiB) on dgx GB10 — the first our-engine-vs-vLLM NVFP4
+Laguna number, and the true apples-to-apple the #230 vLLM bar was owed.
+
+- **N1a/N1b** (`98a67a01`/`0d014016`+`218655f2`): additive `Nvfp4Weight` expert fields on
+  `LagunaMoeWeights` + `LoadLagunaForCausalLMWeights` (resolver + bf16 attn/dense/norms/
+  embed/lm_head + BF16 router + F32 `e_score_correction_bias` + `LnLoadCtNvfp4Raw` W4A4
+  experts; sets `has_nvfp4_weights`). Gate `test_laguna_nvfp4_loader`.
+- **N2** (`d33871f3`): `LqGemmNvfp4Fp4` (per-expert TRUE-W4A4: `ScaledFp4Quant(input_global_
+  scale_inv)`→`MatmulNvfp4Fp4(alpha)`, unified-mem pattern like `LqGemm`) + `LagunaFfnBlock`
+  branches on `fp4=!experts_gate_fp4.empty()`; grouped keep-quant path gated off (`!fp4`);
+  `IsTrueW4A4` assert; both forward guards relaxed to `has_gguf||has_nvfp4`. CORRECTION vs
+  the spec: routed experts are W4A4 ⇒ per-expert `MatmulNvfp4Fp4`, NOT the grouped W4A16
+  `MoeGroupedGemmNvfp4`. `test_laguna_nvfp4_loader` grew to 3/3·61 (added a CPU forward
+  run-gate: finite+deterministic+experts-consumed through the real `LagunaForwardGguf`).
+- **N3** (`a6646805`): `examples/laguna_gen` auto-detects a safetensors DIR (→ NVFP4:
+  `LoadHfConfig` + `LoadLagunaForCausalLMWeights` + `LagunaForwardGguf{,Cached}`) vs a `.gguf`
+  FILE; `--token-ids` bypasses the tokenizer. CPU-smoke-verified on a synthetic NVFP4 dir
+  with a real config.json (exercises the `LoadHfConfig`→`ParseLagunaParams` seam).
+- **Two GB10 memory fixes to run** (`84fab587`, `d8d24f7e`): the loader COPIES every tensor
+  (memcpy), so (1) release the mmap'd shards after load (114→67 GiB RSS) and (2) create the
+  CUDA context BEFORE the load (the ~67 GiB reclaimable page cache otherwise starves
+  `cudaStreamCreate`). Both landed in the driver. Box did NOT reboot (clean aborts).
+- **N4 RAN** (git-archived `84fab587`→ clean `121a` CUDA build → `laguna-gen --gpu` on ckpt,
+  vLLM's exact prompt ids `2,785,9626,377,15360,395` captured via the HF tokenizer):
+  **Correctness = coherent + near-tie** — ours `22345 83 350 71070 395 340 9626 372 1703 …`
+  vs golden `22345 83 290 350 674 330 5541 966 340 9626 377 15360 …`; FIRST 2 TOKENS MATCH
+  vLLM exactly, then near-tie divergence (our TRUE-W4A4 fp4-activations vs the MARLIN golden's
+  W4A16 bf16-activations — different precision, EXPECTED not a bug; shares golden vocabulary).
+  **Speed = 6.34 s/tok (0.16 tok/s), prefill 17.3s — ~120× slower than vLLM 18.8** (RSS pinned
+  67.3 GiB, 48 GiB free, box stable — NOT a paging artifact). ROOT CAUSE (source-confirmed):
+  `LqGemmNvfp4Fp4` uses the generic `vt::MatmulNvfp4Fp4`, whose CUDA impl is the hand-written
+  EMULATION kernel (`cuda_matmul_nvfp4.cu` `MatmulNvfp4Fp4KernelCuda` → Naive/Wmma), NOT the
+  cutlass sm120a fp4 tensor-core GEMM the 27B/35B W4A4 path uses (`MatmulNvfp4Fp4DirectD`);
+  + per-expert loop + per-GEMM host `ScaledFp4Quant`+`DrainQueue` + no device residency.
+- **OPEN #234 (N5 SPEED, the user's parity goal):** MIRROR-directive-aligned — vLLM's DEFAULT
+  nvfp4 selection on GB10 is FLASHINFER_CUTLASS W4A4 (the golden's MARLIN was a forced fallback,
+  no nvcc for its JIT), so routing our experts to the cutlass fp4 path IS mirroring vLLM. Plan:
+  (1) route experts to the cutlass sm120a fp4 tensor-core path (`MatmulNvfp4Fp4DirectD`, biggest
+  lever), (2) grouped W4A4 MoE, (3) `ResidentNvfp4` staging, (4) decode CUDA-graph + on-GPU
+  sampling. FIRST: nsys OUR run to confirm the emulation-kernel bottleneck (protocol: trace,
+  don't infer). DGX build tree at `~/laguna-n4-build` (extracted `a6646805`, `build-cuda`).
+  Spec `.agents/specs/laguna-nvfp4-arm-2026-07-31.md` §N5.

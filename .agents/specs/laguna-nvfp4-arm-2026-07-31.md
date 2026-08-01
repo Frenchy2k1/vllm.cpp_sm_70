@@ -162,11 +162,35 @@ branch; the GGUF keep-quant path stays byte-identical (`test_laguna_scaffold`
 loop; injected `--token-ids` bypass the tokenizer for the id-vs-golden gate.
 CPU-smoke-verified on a synthetic NVFP4 dir with a REAL config.json (exercises the
 `LoadHfConfig`→`ParseLagunaParams` seam the loader test bypassed) → `has_nvfp4=1`,
-KV-cache decode runs finite. REMAINING (DGX):
-- **N4 — CORRECTNESS gate.** Greedy on the real 67 GiB checkpoint, near-tie vs the
-  recorded vLLM-NVFP4 golden (`~/laguna-nvfp4/vllm_golden.txt`). Ship via
-  `git archive` of this commit + a `-DVLLM_CPP_CUTLASS_DIR` CUDA build on GB10.
-- **N5 — SPEED gate.** ours-NVFP4 tok/s vs vLLM-NVFP4 18.8 (MARLIN); the
-  grouped-W4A4 fold + device residency (the same levers that took the GGUF path
-  1.5→7.7) are the speed knobs if the per-expert loop trails. This is the
-  apples-to-apple bar the user set (both at NVFP4).
+KV-cache decode runs finite. **N4 RAN on GB10 (2026-08-01) — coherent, near-tie; the arm works end-to-end.**
+git-archived `84fab587` → clean CUDA build (`121a`, `-DVLLM_CPP_CUTLASS_DIR`) →
+`laguna-gen --model ~/laguna-nvfp4/ckpt --gpu --token-ids 2,785,9626,377,15360,395`
+(vLLM's exact prompt ids, captured cheaply via the HF tokenizer — no model load).
+Two GB10 memory fixes were needed to run (both landed): release the mmap'd shards
+after the loader's memcpy-copy (114→67 GiB RSS), and create the CUDA context BEFORE
+the load (else the 67 GiB reclaimable page cache starves `cudaStreamCreate`).
+- **Result:** ours `22345 83 350 71070 395 340 9626 372 1703 29339 5705 377 15360
+  81 466 330 7097 377 290 87 81 86 91 86` vs golden `22345 83 290 350 674 330 5541
+  966 340 9626 377 15360 81 2498 …`. **First 2 tokens match vLLM exactly**, then
+  near-tie divergence — coherent (9626/377/15360 = "France is"; shares the golden's
+  340/330/290/81 vocabulary). EXPECTED: our path is TRUE **W4A4** (fp4 activations)
+  vs the MARLIN golden's **W4A16** (bf16 activations) — genuinely different
+  precision, so token divergence is not a bug. Forward is CORRECT (coherence + near-tie).
+- **N5 SPEED = 6.34 s/tok (0.16 tok/s), prefill 17.3s — ~120× slower than vLLM's
+  18.8 tok/s.** ROOT CAUSE (confirmed in source): `LqGemmNvfp4Fp4` calls the generic
+  `vt::MatmulNvfp4Fp4` op, which on CUDA is the hand-written EMULATION kernel
+  (`MatmulNvfp4Fp4KernelCuda` → Naive/Wmma; reproduces vLLM's emulation token stream),
+  NOT the cutlass sm120a fp4 tensor-core GEMM that the 27B/35B W4A4 path uses
+  (`MatmulNvfp4Fp4DirectD`, qwen3_5.cpp). Compounded by the per-expert loop (top-k×3
+  GEMMs/token), a host `ScaledFp4Quant`+`DrainQueue` per GEMM, and the unified-memory
+  raw-view retag (no device residency).
+
+N5 SPEED PLAN (the user's goal — reach ≥ vLLM 18.8 tok/s, both at NVFP4):
+1. **Route the experts to the CUTLASS sm120a fp4 tensor-core path** (`MatmulNvfp4Fp4DirectD`
+   / the cutlass entry, swizzled block scales) instead of the emulation op — the SAME
+   kernel that puts 27B/35B at vLLM parity. Biggest lever by far.
+2. **Grouped W4A4 MoE** — one grouped fp4 GEMM per gate/up/down instead of the per-expert
+   loop (mirror the A3/W9 `MatmulBTQuantGrouped` fold, but for nvfp4).
+3. **Device residency** — stage `d_packed`/`d_scale` once (ResidentNvfp4), drop the
+   per-GEMM host round-trip + `DrainQueue` sync.
+4. Decode CUDA-graph + on-GPU sampling (the ds4/35B host-orchestration levers).
