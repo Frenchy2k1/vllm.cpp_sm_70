@@ -226,6 +226,26 @@ N5 SPEED PLAN (the user's goal — reach ≥ vLLM 18.8 tok/s, both at NVFP4; tra
    (b) switch the experts to the `use_a16` W4A16 grouped mode (valid per the MIRROR directive, but
    a numerics change to verify) — both ALSO need the per-expert `Nvfp4Weight` vector STACKED at load
    (like qwen3_5 A3 W2) so the grouped op sees one `[E*N,K]` block. Needs a spike.
-4. **Device residency** — stage `d_packed`/`d_scale` once (ResidentNvfp4), drop the
-   per-GEMM host round-trip + `DrainQueue` sync.
-5. Decode CUDA-graph + on-GPU sampling (the ds4/35B host-orchestration levers).
+4. **Device-resident decode (RECOMMENDED next brick — kills the 22k syncs at the root).**
+   The current Laguna forward is HOST-style (every `LqGemm`/`LqGemmNvfp4Fp4` returns a
+   `std::vector<float>` + `DrainQueue`; host `GateUpSilu`/combine), which is why there are
+   ~2,760 `cudaStreamSynchronize`/token. Restructure the decode to keep activations ON-DEVICE
+   across a layer's GEMMs and drain ONCE per step. REUSE TARGET (checked 2026-08-01): qwen3_5
+   already has the full device-resident MoE machinery — `struct Dev`/`Nvfp4Dev`
+   (`qwen3_5.cpp:449/878`), `ResidentNvfp4` (:887, lazy `d_packed`/`d_scale` staging),
+   device `ScaledFp4Quant`/`MoeGroupedGemmNvfp4`/`MoeGateUpSwiGLUGrouped`, and `RunMoeBlock`
+   (`qwen3_5_moe_block.h`) — but these are qwen3_5-internal (static); the Laguna device forward
+   mirrors the pattern (expose/replicate the seam). This is the SAME lever the GGUF path owes
+   (task #228) and lifts BOTH Laguna quant paths. Substantial; spike-first per protocol.
+   **DECISIVE PRECEDENT (DeepSeek-V4 device-decode campaign, Bricks A–D, `state.md`/`CLAIM-
+   DEEPSEEK-V4-DEVICE-DECODE`):** ds4 built exactly this (`ForwardResidentDecodeGguf`, whole
+   decode as one async device chain, drop the per-op syncs) and it was TOKEN-IDENTICAL but
+   **EAGER-SLOWER (−20%)** — the ~1700 small device-kernel launches/step leave the GPU ~45%
+   idle in host-launch GAPS; the sync-drop is a PREREQUISITE, not the payoff. **The payoff is
+   the decode CUDA-graph (lever 5): collapse the launches into ONE `cudaGraphLaunch`.** So
+   levers 4+5 are ONE campaign (device-resident THEN graph); per the ds4 projection a graph
+   reaches maybe ~10-13 tok/s (2-2.5×) — clears our current ~4.5 but may still trail vLLM 18.8
+   (vLLM also graphs + has tuned cutlass kernels). Honest ceiling uncertain vs 18.8; the
+   campaign is how we find out, and it also lifts the GGUF path (#228).
+5. Decode CUDA-graph + on-GPU sampling (the ds4/35B host-orchestration levers) — the PAYOFF
+   step of lever 4 (see the ds4 precedent above), not a separate lever.
