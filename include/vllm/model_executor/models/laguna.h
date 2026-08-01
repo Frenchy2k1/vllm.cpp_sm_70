@@ -352,6 +352,12 @@ struct LagunaKvCache {
   std::vector<int64_t> dev_rows;                 // [layer] cached-row count (grows 1/token)
   int64_t max_cap = 0;
   bool resident_ready = false;
+  // Brick A2: opaque persistent decode-CUDA-graph state (the fixed-capacity KV +
+  // persistent scratch + captured graph), lazily built on the first graphed decode
+  // step and reused across steps. void so this public header stays decoupled from the
+  // CUDA-only LagunaGraph type; the deleter (set in laguna.cpp) frees it. Mirror of
+  // DeepseekV4KvCache::decode_graph (deepseek_v4.h:359).
+  std::shared_ptr<void> decode_graph;
   void Reset(int64_t num_layers, int64_t hd, int64_t hkv) {
     k.assign(static_cast<size_t>(num_layers), {});
     v.assign(static_cast<size_t>(num_layers), {});
@@ -365,6 +371,7 @@ struct LagunaKvCache {
     dev_rows.clear();
     max_cap = 0;
     resident_ready = false;
+    decode_graph.reset();
   }
 };
 
