@@ -154,6 +154,16 @@ __device__ inline float F8E4M3ToF32Dev(uint8_t byte) {
 
 // E2M1 (fp4) magnitude LUT, indexed by the low 3 bits of the nibble; bit 3 is
 // the sign. 1x-scaled — modelopt NVFP4, NOT the 2x GGUF kvalues_mxfp4 LUT.
+// HARDWARE fp8-e4m3 -> f32 (cvt.rn.f16.e4m3 on sm_89+, then f16->f32; BIT-EXACT for
+// e4m3 since f16's 10-bit mantissa losslessly holds e4m3's 3-bit mantissa + range).
+// Replaces the software F8E4M3ToF32Dev's per-byte `ldexpf` library call — the compute
+// the ncu flagged as the M=1 GEMV's bottleneck (sm-throughput bound, not BW-bound).
+__device__ __forceinline__ float F8E4M3FastDev(uint8_t b) {
+  __nv_fp8_e4m3 v;
+  v.__x = b;
+  return static_cast<float>(v);
+}
+
 __constant__ float kE2M1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
 
 // Decode one packed fp4 byte (two E2M1 codes) into its two dequanted bf16-rounded
@@ -2627,7 +2637,7 @@ __global__ void MatmulNvfp4Fp4Gemv(Tout* out, const uint8_t* a_packed, const uin
   for (int c = 0; c < CPW; ++c) acc[c] = 0.0f;
   for (int64_t bidx = lane; bidx < packed_cols; bidx += 32) {
     const int64_t g = bidx >> 3;                 // group = byte / 8
-    const float asf = F8E4M3ToF32Dev(asrow[g]);
+    const float asf = F8E4M3FastDev(asrow[g]);
     const uint8_t ab = aprow[bidx];              // activation loaded + decoded ONCE
     const float a_lo = kE2M1[ab & 0x7u] * ((ab & 0x8u) ? -1.0f : 1.0f) * asf;
     const float a_hi = kE2M1[(ab >> 4) & 0x7u] * ((ab & 0x80u) ? -1.0f : 1.0f) * asf;
@@ -2637,7 +2647,7 @@ __global__ void MatmulNvfp4Fp4Gemv(Tout* out, const uint8_t* a_packed, const uin
       if (n >= n_cols) continue;
       const uint8_t* bprow = b_packed + n * packed_cols;
       const uint8_t* bsrow = b_scale + n * groups;
-      const float bsf = F8E4M3ToF32Dev(bsrow[g]);
+      const float bsf = F8E4M3FastDev(bsrow[g]);
       const uint8_t bb = bprow[bidx];
       const float b_lo = kE2M1[bb & 0x7u] * ((bb & 0x8u) ? -1.0f : 1.0f) * bsf;
       const float b_hi = kE2M1[(bb >> 4) & 0x7u] * ((bb & 0x80u) ? -1.0f : 1.0f) * bsf;
