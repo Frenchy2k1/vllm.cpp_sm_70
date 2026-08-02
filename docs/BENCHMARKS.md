@@ -11051,3 +11051,6 @@ SPEED: rough e2e A/B on the gate binary (load + prefill + short decode; a LOWER
 bound on the decode win, and reload-noisy on the GB10 unified pool): graph ON
 18.73 s vs OFF 19.57 s average (~4.3% faster, ON < OFF on both runs). A clean
 steady-state per-step / nsys decode tok/s (eager vs graphed) is OWED.
+
+<!-- framework-routing (2026-08-02) -->
+- Laguna-XS-2.1-NVFP4 decode (GB10, vs vLLM 42.46 tok/s): split-K + w13-fusion → 35.3 tok/s (83.2%). Residual is GPU-kernel work inside the graph (measured). PENDING: full KV/attention framework port. Qwen3DenseDecodeGraph ~4.3% e2e (directional; rigorous per-step tok/s OWED). Qwen3VL/DS4 routing = framework-conformance (no speed claim); CUDA re-gate OWED.
