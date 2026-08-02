@@ -17,6 +17,8 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 #include "vllm/model_executor/models/laguna_device.h"
 #include "vt/ops.h"  // OpId, RegisterOp, DeviceType
@@ -30,6 +32,12 @@ using vt::Queue;
 using vt::RegisterOp;
 
 cudaStream_t AsStream(Queue& q) { return static_cast<cudaStream_t>(q.handle); }
+
+void Check(cudaError_t e, const char* what) {
+  if (e != cudaSuccess)
+    throw std::runtime_error(std::string("vt cuda laguna: ") + what + ": " +
+                             cudaGetErrorString(e));
+}
 
 // ── RMSNorm (block-per-row, block-reduced SoS; NEAR-TIE vs host RmsNorm:94/:112, in
 // the accepted device regime — user-ratified 2026-08-01: gate the device path vs vLLM).
@@ -249,6 +257,227 @@ __global__ void DecodeAttnGqaGKernel(float* o, const float* q, const float* k, c
   }
 }
 
+// ── Split-K decode attention (occupancy fill for GB10's many SMs) ───────────
+// grid=Hkv (block-per-KV-head) launches only Hkv(=8) blocks → severe under-occupancy on
+// GB10 for this memory-bound decode attention (which grows with context). SPLIT the
+// KV-row range across SPLIT blocks per KV head: grid=dim3(Hkv,SPLIT); block (g,s) owns KV
+// head g and KV rows [s*rps, min((s+1)*rps,rows)) (rps=ceil(rows/SPLIT)). Each block runs
+// the SAME masked online-softmax over its slice and writes a PARTIAL — running max m_s,
+// denom l_s, UN-normalized numerator o_s[Dh] (NOT divided by l_s) — to scratch[h,s]. A
+// combine kernel then merges the SPLIT partials per q-head with the flash split-KV
+// reduction (mirrors the cross-warp flash merge in cuda_paged_attn.cu:373/:386 — global
+// max, exp-rescale each partial by exp(m_s-gm)):
+//   gm=max_s m_s ; denom=Σ_s l_s·exp(m_s-gm) ; acc=Σ_s exp(m_s-gm)·o_s ; out=acc/denom.
+// NEAR-TIE vs the single-block kernel (the sub-range running-max + merge reorders the
+// float adds — accepted device regime, gated vs vLLM). SPLIT==1 collapses exactly:
+// gm=m_0, acc=o_0, denom=l_0, out=o_0/l_0 == the single-block kernel's o_reg/l — so the
+// launcher runs the original single-block kernel for SPLIT==1 (byte-exact tiny-kv fallback).
+
+// Partial online-softmax over KV rows [row_begin,row_end) of KV head g → scratch[h,s].
+__global__ void DecodeAttnGqaSplitKernel(float* mp, float* lp, float* op, const float* q,
+                                         const float* k, const float* v, int64_t Hq, int64_t Hkv,
+                                         int64_t Dh, int64_t group, int64_t kv_rows, int64_t q_pos,
+                                         int64_t first_pos, int64_t window, float scale, int SPLIT) {
+  const int64_t g = static_cast<int64_t>(blockIdx.x);  // KV head this block owns
+  if (g >= Hkv) return;
+  const int sp = static_cast<int>(blockIdx.y);         // split index within head g
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int nth = static_cast<int>(blockDim.x);
+  const int64_t QG = group;
+  const int64_t h = g * QG + warp;
+  const bool active = (warp < QG) && (h < Hq);
+  const int64_t rps = (kv_rows + SPLIT - 1) / SPLIT;   // rows per split (ceil)
+  const int64_t row_begin = static_cast<int64_t>(sp) * rps;
+  const int64_t row_end = (row_begin + rps < kv_rows) ? (row_begin + rps) : kv_rows;
+
+  float q_reg[kLagEpl];
+#pragma unroll
+  for (int i = 0; i < kLagEpl; ++i)
+    q_reg[i] = active ? q[h * Dh + lane * kLagEpl + i] : 0.0f;
+  float m = -CUDART_INF_F, l = 0.0f;
+  float o_reg[kLagEpl];
+#pragma unroll
+  for (int i = 0; i < kLagEpl; ++i) o_reg[i] = 0.0f;
+
+  __shared__ float ksh[kLagTile * kLagDh];
+  __shared__ float vsh[kLagTile * kLagDh];
+
+  for (int64_t base = row_begin; base < row_end; base += kLagTile) {
+    const int64_t cnt = (row_end - base < kLagTile) ? (row_end - base) : kLagTile;
+    const int64_t nload = cnt * Dh;
+    for (int64_t idx = threadIdx.x; idx < 2 * nload; idx += nth) {
+      const bool isv = idx >= nload;
+      const int64_t e = isv ? (idx - nload) : idx;
+      const int64_t row = e / Dh, col = e % Dh;
+      const float* src = isv ? v : k;
+      (isv ? vsh : ksh)[row * Dh + col] = src[((base + row) * Hkv + g) * Dh + col];
+    }
+    __syncthreads();
+    if (active) {
+      for (int64_t r = 0; r < cnt; ++r) {
+        const int64_t pj = first_pos + base + r;
+        if (pj > q_pos) continue;                          // causal
+        if (window > 0 && q_pos - pj >= window) continue;  // sliding window
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kLagEpl; ++i) dot += q_reg[i] * ksh[r * Dh + lane * kLagEpl + i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+        dot = __shfl_sync(0xffffffffu, dot, 0) * scale;
+        const float m_new = fmaxf(m, dot);
+        const float corr = expf(m - m_new);
+        const float pw = expf(dot - m_new);
+#pragma unroll
+        for (int i = 0; i < kLagEpl; ++i)
+          o_reg[i] = o_reg[i] * corr + pw * vsh[r * Dh + lane * kLagEpl + i];
+        l = l * corr + pw;
+        m = m_new;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (active) {  // UN-normalized partial (empty slice ⇒ m=-inf, l=0, o=0 — combine ignores)
+#pragma unroll
+    for (int i = 0; i < kLagEpl; ++i)
+      op[(h * SPLIT + sp) * Dh + lane * kLagEpl + i] = o_reg[i];
+    if (lane == 0) {
+      mp[h * SPLIT + sp] = m;
+      lp[h * SPLIT + sp] = l;
+    }
+  }
+}
+
+// GRAPH split-K partial (capturable): same as DecodeAttnGqaSplitKernel, but len/q_pos come
+// from DEVICE buffers at replay and the new (not-yet-appended) row is knew/vnew (index len).
+// total=len+1 rows; slice [sp*rps, min((sp+1)*rps,total)) with rps=ceil(total/SPLIT). SPLIT
+// is FIXED at capture (grid baked); rps is computed IN-KERNEL from *len_dev so the SAME
+// grid covers a growing context across replays. Empty splits write (-inf,0,0).
+__global__ void DecodeAttnGqaSplitGKernel(float* mp, float* lp, float* op, const float* q,
+                                          const float* k, const float* v, const float* knew,
+                                          const float* vnew, int64_t Hq, int64_t Hkv, int64_t Dh,
+                                          int64_t group, int64_t first_pos, int64_t window,
+                                          float scale, const int* len_dev, const int* pos_dev,
+                                          int SPLIT) {
+  const int64_t g = static_cast<int64_t>(blockIdx.x);
+  if (g >= Hkv) return;
+  const int sp = static_cast<int>(blockIdx.y);
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int nth = static_cast<int>(blockDim.x);
+  const int64_t QG = group;
+  const int64_t h = g * QG + warp;
+  const bool active = (warp < QG) && (h < Hq);
+  const int64_t len = static_cast<int64_t>(*len_dev);
+  const int64_t q_pos = static_cast<int64_t>(*pos_dev);
+  const int64_t total = len + 1;
+  const int64_t rps = (total + SPLIT - 1) / SPLIT;
+  const int64_t row_begin = static_cast<int64_t>(sp) * rps;
+  const int64_t row_end = (row_begin + rps < total) ? (row_begin + rps) : total;
+
+  float q_reg[kLagEpl];
+#pragma unroll
+  for (int i = 0; i < kLagEpl; ++i)
+    q_reg[i] = active ? q[h * Dh + lane * kLagEpl + i] : 0.0f;
+  float m = -CUDART_INF_F, l = 0.0f;
+  float o_reg[kLagEpl];
+#pragma unroll
+  for (int i = 0; i < kLagEpl; ++i) o_reg[i] = 0.0f;
+
+  __shared__ float ksh[kLagTile * kLagDh];
+  __shared__ float vsh[kLagTile * kLagDh];
+
+  for (int64_t base = row_begin; base < row_end; base += kLagTile) {
+    const int64_t cnt = (row_end - base < kLagTile) ? (row_end - base) : kLagTile;
+    const int64_t nload = cnt * Dh;
+    for (int64_t idx = threadIdx.x; idx < 2 * nload; idx += nth) {
+      const bool isv = idx >= nload;
+      const int64_t e = isv ? (idx - nload) : idx;
+      const int64_t row = e / Dh, col = e % Dh;
+      const int64_t gj = base + row;  // global key index in [0,total)
+      float val;
+      if (gj < len) {
+        const float* src = isv ? v : k;
+        val = src[(gj * Hkv + g) * Dh + col];
+      } else {  // gj == len: the new (not-yet-appended) row, layout [Hkv,Dh]
+        const float* src = isv ? vnew : knew;
+        val = src[g * Dh + col];
+      }
+      (isv ? vsh : ksh)[row * Dh + col] = val;
+    }
+    __syncthreads();
+    if (active) {
+      for (int64_t r = 0; r < cnt; ++r) {
+        const int64_t gj = base + r;
+        const int64_t pj = (gj < len) ? (first_pos + gj) : q_pos;  // new row pos == q_pos
+        if (pj > q_pos) continue;
+        if (window > 0 && q_pos - pj >= window) continue;
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kLagEpl; ++i) dot += q_reg[i] * ksh[r * Dh + lane * kLagEpl + i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+        dot = __shfl_sync(0xffffffffu, dot, 0) * scale;
+        const float m_new = fmaxf(m, dot);
+        const float corr = expf(m - m_new);
+        const float pw = expf(dot - m_new);
+#pragma unroll
+        for (int i = 0; i < kLagEpl; ++i)
+          o_reg[i] = o_reg[i] * corr + pw * vsh[r * Dh + lane * kLagEpl + i];
+        l = l * corr + pw;
+        m = m_new;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (active) {
+#pragma unroll
+    for (int i = 0; i < kLagEpl; ++i)
+      op[(h * SPLIT + sp) * Dh + lane * kLagEpl + i] = o_reg[i];
+    if (lane == 0) {
+      mp[h * SPLIT + sp] = m;
+      lp[h * SPLIT + sp] = l;
+    }
+  }
+}
+
+// Merge the SPLIT partials per q-head (flash split-KV reduction; mirrors the cross-warp
+// merge in cuda_paged_attn.cu:386). ONE block per q-head h, block = kLagDh threads (one
+// per head dim). gm=max_sp m_sp; sc_sp=exp(m_sp-gm) (0 for empty splits where m_sp==-inf);
+// denom=Σ l_sp·sc_sp; out[h,d]=(Σ_sp sc_sp·o_sp[d])/denom. gm==-inf (no visible key in ANY
+// split — impossible here since the diagonal is always visible) ⇒ write 0. Shared holds
+// the SPLIT scalars: [SPLIT] m | [SPLIT] l | [SPLIT] sc.
+__global__ void DecodeAttnCombineKernel(float* o, const float* mp, const float* lp,
+                                        const float* op, int64_t Hq, int64_t Dh, int SPLIT) {
+  const int64_t h = static_cast<int64_t>(blockIdx.x);
+  if (h >= Hq) return;
+  extern __shared__ float csh[];  // [SPLIT] m | [SPLIT] l | [SPLIT] sc
+  float* m_sp = csh;
+  float* l_sp = csh + SPLIT;
+  float* sc_sp = csh + 2 * SPLIT;
+  for (int t = static_cast<int>(threadIdx.x); t < SPLIT; t += static_cast<int>(blockDim.x)) {
+    m_sp[t] = mp[h * SPLIT + t];
+    l_sp[t] = lp[h * SPLIT + t];
+  }
+  __syncthreads();
+  float gm = -CUDART_INF_F;
+  for (int t = 0; t < SPLIT; ++t) gm = fmaxf(gm, m_sp[t]);
+  for (int t = static_cast<int>(threadIdx.x); t < SPLIT; t += static_cast<int>(blockDim.x))
+    sc_sp[t] = (m_sp[t] == -CUDART_INF_F || gm == -CUDART_INF_F) ? 0.0f : expf(m_sp[t] - gm);
+  __syncthreads();
+  float denom = 0.0f;
+  for (int t = 0; t < SPLIT; ++t) denom += l_sp[t] * sc_sp[t];
+  const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+  for (int64_t d = static_cast<int64_t>(threadIdx.x); d < Dh;
+       d += static_cast<int64_t>(blockDim.x)) {
+    float acc = 0.0f;
+    for (int t = 0; t < SPLIT; ++t) acc += sc_sp[t] * op[(h * SPLIT + t) * Dh + d];
+    o[h * Dh + d] = acc * inv;
+  }
+}
+
 // ── per-head softplus OUT-gate (bit-exact to LagunaSoftplusHeadGate:25) ──
 // softplus(x) = (x>20)? x : log1pf(expf(x)); attn[h,d] *= softplus(gate_logits[h]).
 __global__ void SoftplusHeadGateKernel(float* attn, const float* gate_logits, int64_t Hq,
@@ -374,6 +603,45 @@ __global__ void LmHeadGemvKernel(float* __restrict__ out, const __nv_bfloat16* _
 constexpr int kTPB = 128;
 inline int Blocks(int64_t n) { return static_cast<int>((n + kTPB - 1) / kTPB); }
 
+// Split-K occupancy tuning. grid=Hkv(=8) starves GB10's many SMs; split each KV head's
+// KV rows across SPLIT blocks to reach ~kLagSplitTargetBlocks total. The EAGER SPLIT adapts
+// to kv_rows (more splits as context grows); the GRAPH uses a FIXED SPLIT (grid baked at
+// capture, rps computed in-kernel from *len_dev so one capture covers a growing context).
+constexpr int kLagSplitTargetBlocks = 256;     // aim to fill the machine (a few hundred blocks)
+constexpr int kLagSplitMax = 32;               // cap: bounds partials scratch + combine cost
+constexpr int kLagMinRowsPerSplit = kLagTile;  // never split below one staged tile (32 rows)
+constexpr int kLagSplitGraph = 16;             // FIXED graph SPLIT (Hkv*16 blocks; capture-safe)
+
+// EAGER split factor: enough blocks to fill the GPU, but never below one tile of rows per
+// split and never above kLagSplitMax. Returns 1 (single-block byte-exact path) for tiny kv.
+inline int ChooseSplitEager(int64_t kv_rows, int64_t Hkv) {
+  if (kv_rows <= kLagMinRowsPerSplit || Hkv <= 0) return 1;
+  const int by_rows = static_cast<int>((kv_rows + kLagMinRowsPerSplit - 1) / kLagMinRowsPerSplit);
+  const int by_fill = static_cast<int>((kLagSplitTargetBlocks + Hkv - 1) / Hkv);
+  int sp = (by_rows < by_fill) ? by_rows : by_fill;
+  if (sp > kLagSplitMax) sp = kLagSplitMax;
+  return (sp < 1) ? 1 : sp;
+}
+
+// Persistent grow-only device scratch for the split partials (o | m | l per q-head per
+// split). Grown ONLY outside a CUDA-graph capture: the graph's gstate-0 eager warm-run
+// (laguna.cpp LagunaGraph::Step) runs the SAME launcher sequence and sizes this to the max
+// (Hq_max*SPLIT*(Dh+2)) BEFORE the gstate-1 capture, so the captured combine's baked
+// scratch pointer never reallocs → it stays valid across every replay. cudaMalloc is thus
+// never invoked inside capture. Single decode stream (no concurrency guard, matching the
+// rest of the resident path).
+float* EnsureSplitScratch(size_t floats) {
+  static float* buf = nullptr;
+  static size_t cap = 0;
+  if (floats > cap) {
+    if (buf != nullptr) cudaFree(buf);
+    Check(cudaMalloc(reinterpret_cast<void**>(&buf), floats * sizeof(float)),
+          "split-K partials scratch alloc");
+    cap = floats;
+  }
+  return buf;
+}
+
 void RmsNormSeqLaunch(Queue& q, float* out, const float* x, const float* w, int64_t rows,
                       int64_t n, float eps, bool has_w) {
   // one block per row; 256 threads (matches the __shared__ sh[256] reduction).
@@ -388,24 +656,60 @@ void RopeFromCacheLaunch(Queue& q, float* x, const float* cache, int64_t heads, 
 void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                          int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group, int64_t kv_rows,
                          int64_t q_pos, int64_t first_pos, int64_t window, float scale) {
-  // ONE block per KV head (GQA broadcast); block = group*32 = QG warps, warp w owns
-  // query head g*QG+w. Each K/V row staged into shared ONCE, reused across all QG heads.
-  const unsigned grid = static_cast<unsigned>(Hkv);
+  // block = group*32 = QG warps (warp w owns query head g*QG+w); each K/V row staged into
+  // shared ONCE, reused across all QG heads. Split the KV rows across SPLIT blocks per KV
+  // head to fill GB10 (grid=Hkv=8 alone starves the SMs on this memory-bound decode attn).
   const unsigned blk = static_cast<unsigned>(group * 32);
-  DecodeAttnGqaKernel<<<grid, blk, 0, AsStream(q)>>>(o, qd, k, v, Hq, Hkv, Dh, group, kv_rows,
-                                                     q_pos, first_pos, window, scale);
+  cudaStream_t st = AsStream(q);
+  const int SPLIT = ChooseSplitEager(kv_rows, Hkv);
+  if (SPLIT <= 1) {  // byte-exact single-block fallback (tiny kv_rows)
+    DecodeAttnGqaKernel<<<static_cast<unsigned>(Hkv), blk, 0, st>>>(
+        o, qd, k, v, Hq, Hkv, Dh, group, kv_rows, q_pos, first_pos, window, scale);
+    return;
+  }
+  const size_t need = static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT) *
+                      static_cast<size_t>(Dh + 2);
+  float* sc = EnsureSplitScratch(need);
+  float* op = sc;  // [Hq*SPLIT*Dh] partial numerators | [Hq*SPLIT] m | [Hq*SPLIT] l
+  float* mp = sc + static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT) * static_cast<size_t>(Dh);
+  float* lp = mp + static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT);
+  const dim3 grid(static_cast<unsigned>(Hkv), static_cast<unsigned>(SPLIT));
+  DecodeAttnGqaSplitKernel<<<grid, blk, 0, st>>>(mp, lp, op, qd, k, v, Hq, Hkv, Dh, group, kv_rows,
+                                                 q_pos, first_pos, window, scale, SPLIT);
+  const size_t csh = static_cast<size_t>(3 * SPLIT) * sizeof(float);
+  DecodeAttnCombineKernel<<<static_cast<unsigned>(Hq), static_cast<unsigned>(kLagDh), csh, st>>>(
+      o, mp, lp, op, Hq, Dh, SPLIT);
 }
 void DecodeAttnGqaGLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                           const float* knew, const float* vnew, int64_t Hq, int64_t Hkv, int64_t Dh,
                           int64_t group, int64_t first_pos, int64_t window, float scale,
                           const int* len_dev, const int* pos_dev) {
-  // ONE block per KV head; block = group*32 (QG warps). FIXED launch shape: grid=Hkv,
-  // block=QG*32, STATIC shared (ksh/vsh) — never varies per step, so it is capturable.
-  // Only the kernel's internal tile-loop trip count varies via *len_dev at replay.
-  const unsigned grid = static_cast<unsigned>(Hkv);
+  // block = group*32 (QG warps). CAPTURE-SAFE split-K: grid=dim3(Hkv,SPLIT) with a FIXED
+  // SPLIT (baked at capture); the per-split KV-row range (rps) is computed IN-KERNEL from
+  // *len_dev at replay so one capture covers a growing context. The scratch is pre-sized by
+  // the gstate-0 eager warm-run, so no cudaMalloc happens inside the gstate-1 capture and
+  // the combine's baked scratch pointer stays valid across replays. STATIC shared (ksh/vsh).
   const unsigned blk = static_cast<unsigned>(group * 32);
-  DecodeAttnGqaGKernel<<<grid, blk, 0, AsStream(q)>>>(o, qd, k, v, knew, vnew, Hq, Hkv, Dh, group,
-                                                      first_pos, window, scale, len_dev, pos_dev);
+  cudaStream_t st = AsStream(q);
+  constexpr int SPLIT = kLagSplitGraph;
+  if (SPLIT <= 1) {  // byte-exact single-block fallback (keeps the original kernel live)
+    DecodeAttnGqaGKernel<<<static_cast<unsigned>(Hkv), blk, 0, st>>>(
+        o, qd, k, v, knew, vnew, Hq, Hkv, Dh, group, first_pos, window, scale, len_dev, pos_dev);
+    return;
+  }
+  const size_t need = static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT) *
+                      static_cast<size_t>(Dh + 2);
+  float* sc = EnsureSplitScratch(need);
+  float* op = sc;
+  float* mp = sc + static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT) * static_cast<size_t>(Dh);
+  float* lp = mp + static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT);
+  const dim3 grid(static_cast<unsigned>(Hkv), static_cast<unsigned>(SPLIT));
+  DecodeAttnGqaSplitGKernel<<<grid, blk, 0, st>>>(mp, lp, op, qd, k, v, knew, vnew, Hq, Hkv, Dh,
+                                                  group, first_pos, window, scale, len_dev, pos_dev,
+                                                  SPLIT);
+  const size_t csh = static_cast<size_t>(3 * SPLIT) * sizeof(float);
+  DecodeAttnCombineKernel<<<static_cast<unsigned>(Hq), static_cast<unsigned>(kLagDh), csh, st>>>(
+      o, mp, lp, op, Hq, Dh, SPLIT);
 }
 void SoftplusHeadGateLaunch(Queue& q, float* attn, const float* gl, int64_t Hq, int64_t Dh) {
   SoftplusHeadGateKernel<<<Blocks(Hq * Dh), kTPB, 0, AsStream(q)>>>(attn, gl, Hq, Dh);
