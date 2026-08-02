@@ -523,13 +523,23 @@ TEST_CASE("W7-device ForwardDevice ASSEMBLES: device forward == host forward (ne
   const vllm::ForwardLogits dev =
       vllm::DeepseekV4Model::ForwardDevice(kTokens, kPositions, attn_meta, attn_kv, w, g.q, {});
 
-  REQUIRE(dev.host.size() == host.size());
+  // ForwardDevice now returns DEVICE-RESIDENT logits on a CUDA queue (on_device(),
+  // no full-[rows,vocab] D2H) — the shared-framework contract (qwen3_moe
+  // WrapDeviceLogits). Materialize to host for the near-tie compare exactly as the
+  // runner's VT_GPU_SAMPLE=0 A/B path does (backend Copy); ForwardComposeImpl has
+  // already drained the lm_head GEMM, so the device buffer is complete.
+  REQUIRE(dev.on_device());
   CHECK(dev.rows == static_cast<int64_t>(kTokens.size()));
   CHECK(dev.vocab == p.vocab_size);
-  for (float v : dev.host) CHECK(std::isfinite(v));
+  std::vector<float> devh(static_cast<size_t>(dev.rows) *
+                          static_cast<size_t>(dev.vocab));
+  gpu.Copy(g.q, devh.data(), dev.device_tensor.data, devh.size() * sizeof(float));
+  gpu.Synchronize(g.q);
+  REQUIRE(devh.size() == host.size());
+  for (float v : devh) CHECK(std::isfinite(v));
   // The whole 4-family device composition matches the host oracle within the
   // accumulated near-tie envelope (device expf/sqrtf/rsqrt vs host, over 4 layers).
-  CHECK(RelL2(dev.host, host) < 2e-3);
+  CHECK(RelL2(devh, host) < 2e-3);
 }
 
 // Brick A: the device MLA decode attention kernel == the host SoftmaxWithSink
