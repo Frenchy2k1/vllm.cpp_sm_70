@@ -19,7 +19,9 @@
 // green; it only asserts on a real GB10/CUDA device.
 #include <doctest/doctest.h>
 
+#ifdef VLLM_CPP_CUDA
 #include <cuda_runtime.h>  // cudaStream_t for the Brick 12 pair/group-diag externs
+#endif
 
 #include <cmath>
 #include <cstdint>
@@ -46,13 +48,18 @@ using vt::Tensor;
 
 // Brick 12 (ds4-gap launch consolidation): the paired + block-diagonal Q8_0 decode GEMV
 // kernels under test (external linkage from cuda_quant_dot.cu). The A/B gates below prove
-// they are BYTE-IDENTICAL to the launches they consolidate.
+// they are BYTE-IDENTICAL to the launches they consolidate. These two call the .cu
+// symbols DIRECTLY (not through the OpProvider seam), so both the <cuda_runtime.h>
+// declaration and the gates themselves exist only in a CUDA build — a CPU-only or
+// sanitizer build has neither the toolkit header nor the symbols to link against.
+#ifdef VLLM_CPP_CUDA
 namespace vt::cuda {
 void MatmulQ8_0PairCuda(vt::Tensor& out0, vt::Tensor& out1, const vt::Tensor& a,
                         const vt::Tensor& b0, const vt::Tensor& b1, cudaStream_t s);
 void MatmulQ8_0GroupDiagCuda(vt::Tensor& out, const vt::Tensor& a, const vt::Tensor& b,
                              int64_t ng, cudaStream_t s);
 }  // namespace vt::cuda
+#endif  // VLLM_CPP_CUDA
 
 namespace {
 
@@ -546,6 +553,7 @@ TEST_CASE("CUDA keep-quant GEMM registers the native kCUDA provider") {
   CHECK(vt::OpRegistered(vt::OpId::kMatmulBTQuant, DeviceType::kCUDA));
 }
 
+#ifdef VLLM_CPP_CUDA
 // Brick 12 (ds4-gap "launch consolidation") A/B gate — PAIRED Q8_0 decode GEMV. The
 // paired kernel (one launch, two weights, one shared activation) must be BYTE-IDENTICAL
 // to running the plain Q8_0 GEMV twice (via vt::MatmulBTQuant). RED-first: a wrong
@@ -674,3 +682,4 @@ TEST_CASE("Brick 12: CUDA Q8_0 block-diagonal o-LoRA == per-group loop (bit-iden
   }
   gpu.DestroyQueue(gq);
 }
+#endif  // VLLM_CPP_CUDA

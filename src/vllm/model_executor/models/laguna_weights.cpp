@@ -336,6 +336,13 @@ OwnedTensor LnLoadSharedExpertBf16(const TensorResolver& get,
   return o;
 }
 
+// This helper is HOST-ONLY bf16 row concat with no device dependency of its own; it is
+// build-gated purely because its only CONSUMER (the resident/graph decode) is CUDA-only,
+// and building the stacked copies unconditionally would cost a CPU-only build memory it
+// can never use. REPAIR OWED: ask at RUNTIME instead (LagunaDeviceKernelsAvailable() /
+// non-kCPU queue) so the shared layer stops branching at build time. Deferred — it moves
+// weight loading, so it needs the GB10 Laguna re-gate.
+// DSR-ALLOW(S1): host-only concat, build-gated on its CUDA-only consumer; repair owed.
 #ifdef VT_MARLIN_NVFP4
 // Stack several bf16 [N_i, K] row-major weight tensors into ONE bf16 [sum N_i, K]
 // tensor (plain row-block memcpy concat; the listed order is preserved). Used to
@@ -445,6 +452,7 @@ LagunaWeights LoadLagunaForCausalLMWeights(
       lw.moe.shared_down = LnLoadSharedExpertBf16(get, has, b + "mlp.shared_expert.down_proj");
     }
 
+    // DSR-ALLOW(S1): call site of the host-only concat above — same reason, same repair.
 #ifdef VT_MARLIN_NVFP4
     // Fused decode projections (the steady-decode lever): stack q|k|v|g (all read
     // the input-norm activation) and router|shared_gate|shared_up (all read the

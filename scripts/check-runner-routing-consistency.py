@@ -34,9 +34,15 @@ resolves through the codebase's real seams so the false-positive/negative rate s
 low:
   * the registered `.forward` hook usually DELEGATES on its `gather_logits` branch to
     `SomeModel::ForwardDevice(...)`; the classification follows that call into the
-    ForwardDevice IMPL body (so laguna/deepseek_v4, whose ForwardDevice is a HOST stub
+    ForwardDevice IMPL body (so laguna/qwen3_vl, whose ForwardDevice is a HOST stub
     returning `HostLogits`/`out.host`, are caught even though their registry hook looks
     identical to a clean model's);
+  * and ONE further hop into a file-local `ForwardLogits`-returning helper the impl
+    calls, so a model that builds its device carrier in its OWN wrapper rather than
+    the shared `WrapDeviceLogits` still reads as DEVICE (deepseek_v4's
+    `WrapV4DeviceLogits`). Without the hop such a model matched neither seam and
+    classified NONE — not an error state, so it dropped out of the drift check
+    entirely and the gate stayed green while silently exempting it;
   * `using LlamaModel = Qwen3DenseModel;` aliases are resolved (llama/mistral/internlm2
     reuse the qwen3 dense device forward);
   * a REFUSE-by-name stub (`KimiK3Model::ForwardDevice` is `VT_CHECK(false)`) decodes
@@ -170,6 +176,34 @@ def classify_body(body: str | None) -> str:
     return "NONE"
 
 
+def classify_with_helpers(body: str | None, defining_text: str) -> str:
+    """`classify_body`, but following ONE level of file-local `ForwardLogits`-returning
+    helper that the body CALLS.
+
+    A model may build its device-resident carrier in its own privately-named wrapper
+    instead of the shared `WrapDeviceLogits` — deepseek_v4.cpp's `WrapV4DeviceLogits`
+    is the case that motivated this. Without the hop, `ForwardDevice` matched NEITHER
+    seam and classified NONE, which is not an error state: the model dropped out of
+    the HOST-drift check entirely and the gate went green while claiming it had "1
+    no-logit-producer". A hole that silently EXEMPTS a model is worse than a red gate,
+    so the resolution follows the call the same way the delegate hop already follows
+    `Class::ForwardDevice`. Conservative by construction: `extract_fn_body` only
+    matches a definition whose return type is `ForwardLogits`, so a helper that
+    produces something else is skipped rather than guessed at."""
+    direct = classify_body(body)
+    if direct == "DEVICE" or body is None:
+        return direct
+    ranked = {direct}
+    for called in _FREE_CALL.findall(strip_comments(body)):
+        helper = extract_fn_body(defining_text, called)
+        if helper is not None:
+            ranked.add(classify_body(helper))
+    for level in ("DEVICE", "HOST", "REFUSE"):
+        if level in ranked:
+            return level
+    return "NONE"
+
+
 def resolve_alias(cls: str, alias: dict[str, str]) -> str:
     seen: set[str] = set()
     while cls in alias and cls not in seen:
@@ -274,19 +308,20 @@ def scan_registrations(
         }
         device_source = ""
         classification = "NONE"
-        if _DEVICE_SEAM.search(clean_body):
+        if classify_with_helpers(body, text) == "DEVICE":
             classification, device_source = "DEVICE", fn
         for cls in delegated_classes:
             impl = fd_bodies.get(cls)
             if impl:
                 impl_files.add(impl[0])
-                if classify_body(impl[1]) == "DEVICE" and classification != "DEVICE":
+                impl_class = classify_with_helpers(impl[1], file_text.get(impl[0], ""))
+                if impl_class == "DEVICE" and classification != "DEVICE":
                     classification, device_source = "DEVICE", cls
         if classification != "DEVICE":
             # Not device-reachable: rank the delegated ForwardDevice impls, else the
             # hook body itself, as HOST > REFUSE > NONE.
             impl_classes = [
-                classify_body(fd_bodies[c][1])
+                classify_with_helpers(fd_bodies[c][1], file_text.get(fd_bodies[c][0], ""))
                 for c in delegated_classes
                 if c in fd_bodies
             ]
