@@ -140,6 +140,30 @@ a measured tie; routed-MoE we already win. See
 
 **Cross-reference lever scan (2026-07-31, `CLAIM-XREF-LEVER-SCAN`, `.agents/specs/cross-ref-lever-scan-2026-07-31.md`).** A 5-source parallel scan (vLLM/SGLang/llama.cpp/ds4/ours) for batch-1 raw-decode levers, no-spec, adversarially verified against our code. **Corrects the record:** ds4/DwarfStar has NO register-prefetch (grep-verified) — the Brick-14 theory below was a misattribution; ds4's 90% comes from full-warp-per-row + lane-strided 34-B Q8_0 blocks (1088-B coalesced burst). Our production Q8_0 ships SUB-warp (8/16-lane/row) for medium-K (`LaunchQ8_0Subwarp`), so the one non-refuted Path-B lever left is **B1: port ds4's exact 32-lane/8-row `warp8` for medium-K + measure** (DGX A/B, not guaranteed). Verified cross-cutting gap: **PDL** (Programmatic Dependent Launch) — we have zero, both llama.cpp+SGLang use it on Blackwell. Path A (Laguna beat vLLM): the NVFP4 arm (#230) + the note that vLLM's 18.8 is MARLIN W4A16 (a lower bound; real default FLASHINFER_CUTLASS W4A4 is faster). Full ranked plan + citations in the spec.
 
+**DeepSeek-V4-Flash framework-conformance — device-resident logits on the registry
+forward** (2026-08-02, `CLAIM-DSV4-RUNNER-ROUTE`, branch `deepseek-v4-runner-route`,
+CPU-compile-verified, DGX runtime gate OWED). First slice of moving DS4 off its
+off-framework decode toward the shared runner. `DeepseekV4Model::ForwardDevice` (the
+function the registry hook `ForwardDeepseekV4ForCausalLM` runs on the runner's
+`ModelRegistry::Forward` gather-logits path) now returns **device-resident** logits on
+a CUDA queue (`ForwardLogits::on_device()`) via a new `WrapV4DeviceLogits` helper that
+mirrors `qwen3_moe.cpp WrapDeviceLogits` — dropping the `.host` logit download so the
+runner's on-device sampler consumes it like every framework-conforming model. DS4's
+keep-quant forward is GB10-unified by construction (every GEMM reads/writes coherent
+unified-memory views in place; `ForwardComposeImpl` already drains the lm_head GEMM),
+so the composed buffer is device-addressable + complete and ownership moves into the
+`shared_ptr` the runner holds across execute_model→sample. CPU queue keeps the
+byte-identical `.host` path (the portable host oracle + every CPU gate). CPU build
+`-Wall -Wextra -Werror` clean; the tiny-synthetic CUDA composition gate
+(`test_cuda_deepseek_v4.cpp`) updated to consume the device-resident return (backend
+`Copy` → host for the near-tie compare, mirroring the runner's `VT_GPU_SAMPLE=0` path).
+**OWED:** the CUDA unit gate + a real-model coherence/tok-s re-gate on GB10 (deferred —
+box at 99% disk, DS4 loads ~86 GiB, no-regression re-gate of the shipped resident/graph
+default was not run). **Scoped follow-up (not done):** DS4's private resident/graph
+DECODE (`ForwardResidentDecodeGguf`/`V4Graph`, CLI-driven) + its own `DeepseekV4KvCache`
+off the shared `AttnBlock`/`PagedKvCache` remain off-runner — the larger KV/attention
+port is the next brick. See `.agents/specs/deepseek-v4-forward-device.md`.
+
 **DeepSeek-V4-Flash decode ds4-gap — Brick 14 (Q8_0 intra-row register-prefetch —
 the ds4 raw mechanism)** (2026-07-31, `CLAIM-DSV4-DECODE-BRICK14`, GB10 sm_121a,
 branch `ds4-q8-register-prefetch`, NOT pushed). Built `QuantDotGemmQ8_0PrefetchKernel

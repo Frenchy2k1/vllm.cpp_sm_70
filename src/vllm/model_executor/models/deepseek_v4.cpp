@@ -45,7 +45,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
@@ -2349,6 +2351,39 @@ std::vector<float> DeepseekV4Model::Forward(
                                logits_indices);
 }
 
+// FRAMEWORK-CONFORMANCE (device-resident logits): wrap the composed
+// [rows, vocab] f32 logits as the runner's ForwardLogits, DEVICE-RESIDENT on a
+// CUDA queue — the shared-framework contract, mirroring qwen3_moe.cpp
+// WrapDeviceLogits (:216). When on_device() the runner samples argmax /
+// temperature / top-k/top-p STRAIGHT off `device_tensor` with NO full-[rows,vocab]
+// D2H (runner.cpp sample path (A)); only the sampled token ids cross to host.
+//
+// DeepSeek-V4's keep-quant forward is GB10-UNIFIED by construction: every GEMM
+// reads/writes coherent unified-memory views in place (the same property that lets
+// the keep-quant weight blocks be read mmap'd + the CLI read the logits on the host
+// after ONE drain), and ForwardComposeImpl already drained the lm_head GEMM before
+// returning `flat` (TimedMatmul syncs on the non-deferred device path). So the
+// composed buffer is already device-addressable + complete; ownership moves into a
+// shared_ptr the runner holds across execute_model -> sample_tokens, then returns
+// (no per-step alloc/free — the buffer is the vector's own storage). On a CPU queue
+// there is no device to sample from, so the logits stay on the byte-identical
+// `.host` path (the portable host oracle + every CPU gate).
+static ForwardLogits WrapV4DeviceLogits(std::vector<float>&& flat, int64_t rows,
+                                        int64_t vocab, vt::Queue& queue) {
+  ForwardLogits fl;
+  fl.rows = rows;
+  fl.vocab = vocab;
+  if (queue.device.type == vt::DeviceType::kCPU) {
+    fl.host = std::move(flat);
+    return fl;
+  }
+  auto buf = std::make_shared<std::vector<float>>(std::move(flat));
+  fl.device_tensor = vt::Tensor::Contiguous(buf->data(), vt::DType::kF32,
+                                            queue.device, {rows, vocab});
+  fl.device_storage = std::move(buf);  // shared_ptr<vector<float>> -> shared_ptr<void>
+  return fl;
+}
+
 // ── W7-DEVICE: the DEVICE forward. Runs the SAME composition as
 //    DeepseekV4ForwardHost but routes the four NEW V4 op families through the
 //    CUDA kernels (kDeepseekV4{Mhc,Dsa,Compressor,Moe}) via the OpProvider seam,
@@ -2357,6 +2392,13 @@ std::vector<float> DeepseekV4Model::Forward(
 //    projections stay host in both modes (the real path REUSES the existing
 //    MLA/MoE-grouped/NVFP4 GEMM kernels — a documented W7 seam). The full paged
 //    engine over a materialized 167B checkpoint is the W8 residual. ────────────
+//
+// FRAMEWORK-CONFORMANCE: the registry hook (deepseek_v4_registry.cpp) routes the
+// runner's ModelRegistry::Forward here on the gather-logits path, and the return is
+// now DEVICE-RESIDENT on a CUDA queue (WrapV4DeviceLogits) so the runner's on-device
+// sampler consumes it like every framework-conforming model — no host logit
+// download. (The device-resident DECODE forward + its KV/scratch off the shared
+// AttnBlock is the scoped follow-up; today this shares ForwardComposeImpl.)
 ForwardLogits DeepseekV4Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
@@ -2370,11 +2412,10 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
       weights.host, weights.params, token_ids, positions, logits_indices,
       V4Miswire::kNone, /*trace=*/nullptr,
       V4Backend{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr});
-  ForwardLogits out;
-  out.vocab = weights.params.vocab_size;
-  out.rows = out.vocab > 0 ? static_cast<int64_t>(flat.size()) / out.vocab : 0;
-  out.host = std::move(flat);
-  return out;
+  const int64_t vocab = weights.params.vocab_size;
+  const int64_t rows =
+      vocab > 0 ? static_cast<int64_t>(flat.size()) / vocab : 0;
+  return WrapV4DeviceLogits(std::move(flat), rows, vocab, queue);
 }
 
 }  // namespace vllm
