@@ -34,6 +34,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"  // SafetensorsFile, StTensor
 #include "vllm/model_executor/models/dense_weight_loaders.h"      // dense_loaders::LoadBf16Direct/MakeOwned
+#include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"  // DequantCtNvfp4WeightToF32
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
 #include "vt/dtype.h"
 
@@ -309,6 +310,32 @@ Nvfp4Weight LnLoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj)
   return r;
 }
 
+// Shared-expert weight loader. Laguna-S-2.1 keeps the shared expert BF16 (`.weight`);
+// Laguna-XS-2.1 quantizes it to NVFP4 (`.weight_packed` + scales). Dequant the NVFP4
+// case to BF16 at load so the (BF16) shared-expert forward GEMMs are unchanged (the
+// shared expert is small — the bf16-vs-fp4 dtype barely moves decode tok/s).
+OwnedTensor LnLoadSharedExpertBf16(const TensorResolver& get,
+                                   const std::function<bool(const std::string&)>& has,
+                                   const std::string& proj) {
+  if (!has(proj + ".weight_packed"))
+    return dense_loaders::LoadBf16Direct(get, proj + ".weight");  // S-2.1 bf16 path
+  const Nvfp4Weight r = LnLoadCtNvfp4Raw(get, proj);              // XS NVFP4 path
+  const float wgs = LnReadF32Scalar(get(proj + ".weight_global_scale"));
+  std::vector<float> f32(static_cast<size_t>(r.n) * static_cast<size_t>(r.k));
+  DequantCtNvfp4WeightToF32(reinterpret_cast<const uint8_t*>(r.packed.bytes.data()),
+                            reinterpret_cast<const uint8_t*>(r.scale.bytes.data()), wgs, r.n, r.k,
+                            f32.data());
+  OwnedTensor o = dense_loaders::MakeOwned(vt::DType::kBF16, {r.n, r.k});
+  auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
+  for (size_t i = 0; i < f32.size(); ++i) {  // f32 -> bf16 round-to-nearest-even
+    uint32_t x;
+    std::memcpy(&x, &f32[i], 4);
+    x += 0x7FFFu + ((x >> 16) & 1u);
+    dst[i] = static_cast<uint16_t>(x >> 16);
+  }
+  return o;
+}
+
 #ifdef VT_MARLIN_NVFP4
 // Stack several bf16 [N_i, K] row-major weight tensors into ONE bf16 [sum N_i, K]
 // tensor (plain row-block memcpy concat; the listed order is preserved). Used to
@@ -371,6 +398,8 @@ LagunaWeights LoadLagunaForCausalLMWeights(
     VT_CHECK(it != where->end(), "laguna nvfp4: tensor not found: " + name);
     return it->second->Get(name);
   };
+  const std::function<bool(const std::string&)> has =
+      [where](const std::string& name) { return where->find(name) != where->end(); };
 
   // model level (all BF16; untied lm_head).
   w.embed = LoadBf16Direct(get, "model.embed_tokens.weight");
@@ -411,9 +440,9 @@ LagunaWeights LoadLagunaForCausalLMWeights(
         lw.moe.experts_up_fp4.push_back(LnLoadCtNvfp4Raw(get, ep + "up_proj"));
         lw.moe.experts_down_fp4.push_back(LnLoadCtNvfp4Raw(get, ep + "down_proj"));
       }
-      lw.moe.shared_gate = LoadBf16Direct(get, b + "mlp.shared_expert.gate_proj.weight");
-      lw.moe.shared_up = LoadBf16Direct(get, b + "mlp.shared_expert.up_proj.weight");
-      lw.moe.shared_down = LoadBf16Direct(get, b + "mlp.shared_expert.down_proj.weight");
+      lw.moe.shared_gate = LnLoadSharedExpertBf16(get, has, b + "mlp.shared_expert.gate_proj");
+      lw.moe.shared_up = LnLoadSharedExpertBf16(get, has, b + "mlp.shared_expert.up_proj");
+      lw.moe.shared_down = LnLoadSharedExpertBf16(get, has, b + "mlp.shared_expert.down_proj");
     }
 
 #ifdef VT_MARLIN_NVFP4
