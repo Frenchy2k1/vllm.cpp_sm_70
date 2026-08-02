@@ -40,6 +40,7 @@ namespace vllm {
 
 class SafetensorsFile;
 class LoadedModel;  // MM-ENGINE-FORWARD: the registered mm-forward driver target.
+struct ForwardLogits;  // RUNNER-ROUTE: on-device logits carrier (qwen3_5.h).
 
 namespace v1 {
 struct CommonAttentionMetadata;
@@ -140,6 +141,20 @@ Qwen3VLCosSinCache Qwen3VLMakeCosSinCache(vt::Queue& queue, const HfConfig& conf
 // registered forward (ForwardQwen3VL) and the standalone driver are numerically
 // identical by construction.
 std::vector<float> Qwen3VLForwardStepLastLogits(
+    vt::Queue& queue, const Qwen3DenseWeights& weights_text, const HfConfig& config,
+    const std::vector<uint16_t>& inputs_embeds_bf16,
+    const std::vector<int32_t>& positions3, int64_t num_tokens,
+    const std::vector<uint16_t>& deepstack_bf16, int64_t deepstack_levels,
+    const vt::Tensor& cos_sin_cache_bf16, const v1::CommonAttentionMetadata& meta,
+    const std::vector<PagedKvCache>& attn_kv);
+
+// RUNNER-ROUTE: the ON-DEVICE variant of the step above. Identical forward, but the
+// last-token [1, vocab] f32 logits stay resident on device — returned as a
+// ForwardLogits::on_device() carrier (pool-backed, mirrors qwen3_dense.cpp
+// ForwardDevice / WrapDeviceLogits) so the runner / greedy loop samples straight
+// off device (vt::GreedyArgmax) with no full-vocab D2H. The registered forward
+// (ForwardQwen3VL) returns this on the gather_logits path.
+ForwardLogits Qwen3VLForwardStepLastLogitsDevice(
     vt::Queue& queue, const Qwen3DenseWeights& weights_text, const HfConfig& config,
     const std::vector<uint16_t>& inputs_embeds_bf16,
     const std::vector<int32_t>& positions3, int64_t num_tokens,
