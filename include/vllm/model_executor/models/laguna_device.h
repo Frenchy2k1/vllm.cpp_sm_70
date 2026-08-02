@@ -45,9 +45,13 @@ struct LagunaDeviceKernels {
   // Physical cache row r has GLOBAL position kv_pos=first_pos+r (matches the host's
   // sliding-window eviction bookkeeping); causal (skip kv_pos>q_pos) + per-layer window
   // (skip if window>0 and q_pos-kv_pos>=window); NO attn-sink. scale=1/sqrt(Dh).
+  // L1 (VT_LAGUNA_GLUE_FUSED): `gate` (or nullptr) folds the per-head softplus out-gate
+  // into the normalized attention store — byte-exact vs the separate softplus_head_gate
+  // pass, one fewer kernel/layer. nullptr keeps the un-gated store bit-for-bit.
   void (*decode_attn_gqa)(vt::Queue&, float* o, const float* q, const float* k, const float* v,
                           int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group, int64_t kv_rows,
-                          int64_t q_pos, int64_t first_pos, int64_t window, float scale);
+                          int64_t q_pos, int64_t first_pos, int64_t window, float scale,
+                          const float* gate);
   // Per-head softplus OUT-gate in place: attn[h,d] *= softplus(gate_logits[h]),
   // softplus(x)=(x>20)?x:log1p(exp(x)) in f32. Bit-exact to LagunaSoftplusHeadGate:25.
   void (*softplus_head_gate)(vt::Queue&, float* attn, const float* gate_logits, int64_t Hq,
@@ -70,10 +74,13 @@ struct LagunaDeviceKernels {
   // Hq / Hkv / Dh / group / scale are per-layer constants baked at capture. The key
   // set == decode_attn_gqa's cache[0..rows) AFTER the between-replay append, so the
   // replayed output is bit-identical to the eager decode_attn_gqa. NO attn-sink.
+  // L1 (VT_LAGUNA_GLUE_FUSED): `gate` (or nullptr) folds the softplus out-gate into the
+  // combine store (see decode_attn_gqa); capture-safe (glp is a persistent qkvg[l] slice).
   void (*decode_attn_gqa_g)(vt::Queue&, float* o, const float* q, const float* k, const float* v,
                             const float* knew, const float* vnew, int64_t Hq, int64_t Hkv,
                             int64_t Dh, int64_t group, int64_t first_pos, int64_t window,
-                            float scale, const int* len_dev, const int* pos_dev);
+                            float scale, const int* len_dev, const int* pos_dev,
+                            const float* gate);
   // Laguna lm_head M=1 decode GEMV: out[N] (f32) = W[N,K] (bf16, row-major) · x[K]
   // (f32), M=1. A dedicated one-block-per-row coalesced kernel that streams the
   // ~616 MB [vocab,hidden] weight ONCE at ~roofline — cuBLASLt mis-routes this

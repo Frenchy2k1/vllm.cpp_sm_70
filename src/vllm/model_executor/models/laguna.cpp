@@ -49,6 +49,7 @@
 #include "vt/backend.h"  // vt::GetBackend (device drain for the keep-quant GEMMs)
 #include "vt/dtype.h"    // vt::IsBlockQuant / RowSizeBytes
 #include "vt/ops.h"      // vt::MatmulBT (dispatches kMatmulBTQuant on block weights)
+#include "vt/recipes.h"  // vt::kFusedAddRmsNormStd (L4 residual-add + RMSNorm fusion)
 #include "vt/tensor.h"
 
 namespace vllm {
@@ -1501,6 +1502,24 @@ inline bool LagunaDecodeGraphEnabled() {
   return on;
 }
 
+// ── Attention-glue fusions on the resident decode (VT_LAGUNA_GLUE_FUSED, default ON).
+// Recovers the device-time the CUDA graph does NOT hide (ramp/drain of ~450 tiny
+// under-occupied sequential kernel-nodes/token) by BYTE-EXACT folds that shrink the
+// captured node count: L1 folds the per-head softplus out-gate into the attention
+// combine store (one fewer kernel/layer); L4 folds each residual-Add + RMSNorm pair
+// into ONE vt::FusedChain(kFusedAddRmsNormStd) call (two fewer kernels/layer with the
+// Tier-1 interpreter, VT_FUSED_TIER=1). Both are bit-for-bit identical to the toggle-
+// off path (same f32 arithmetic, same 256-thread RMSNorm reduction order) — a same-
+// binary A/B: VT_LAGUNA_GLUE_FUSED=0 restores the separate kernels. inline so a CPU
+// build (VT_MARLIN_NVFP4 off) does not -Wunused.
+inline bool LagunaGlueFusedEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_GLUE_FUSED");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
 bool LagunaCanRunResidentDecode(const LagunaParams& p, vt::Queue& q, const LagunaWeights& w,
                                 int64_t T) {
 #ifndef VT_MARLIN_NVFP4
@@ -1675,13 +1694,16 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     vt::GetBackend(dev).Copy(q, vdev + dr * kvdim, vnp, rowbytes);
     const int64_t rows = dr + 1;
     const int64_t fp = cache.dev_first_pos[static_cast<size_t>(l)];
-    LAG->decode_attn_gqa(q, attn.data(), qvp, kdev, vdev, Hq, Hkv, Dh, group, rows, pos, fp,
-                         window, scale);
-    cache.dev_rows[static_cast<size_t>(l)] = rows;  // advance this layer's cached-row count
-    // LEVER 1: the fused GEMV already produced g (glp -> qkvg_buf); only the
-    // split fallback still needs a dedicated g_proj GEMV here.
+    // LEVER 1: the fused GEMV already produced g (glp -> qkvg_buf); only the split
+    // fallback still needs a dedicated g_proj GEMV. L1 folds the softplus out-gate into
+    // decode_attn_gqa's store, which reads g — so produce it BEFORE attention (reorder of
+    // two independent same-stream ops => byte-exact).
     if (!fused_qkvg) GemmBf16Into(gl.data(), lw.attn.g_proj, hn.data(), Hq, H);
-    LAG->softplus_head_gate(q, attn.data(), glp, Hq, Dh);
+    const bool glue_fused = LagunaGlueFusedEnabled();
+    LAG->decode_attn_gqa(q, attn.data(), qvp, kdev, vdev, Hq, Hkv, Dh, group, rows, pos, fp,
+                         window, scale, glue_fused ? glp : nullptr);
+    cache.dev_rows[static_cast<size_t>(l)] = rows;  // advance this layer's cached-row count
+    if (!glue_fused) LAG->softplus_head_gate(q, attn.data(), glp, Hq, Dh);  // L1 off => separate pass
     GemmBf16Into(o.data(), lw.attn.o_proj, attn.data(), H, qdim);
     {
       vt::Tensor ht = vt::Tensor::Contiguous(hidden.data(), DType::kF32, dev, {1, H});
@@ -1958,6 +1980,28 @@ struct LagunaGraph {
       vt::Tensor at = DevT(a, H);
       vt::Add(q, at, at, DevT(b, H));
     };
+    const bool glue_fused = LagunaGlueFusedEnabled();
+    // L4: fold a residual-Add + STANDARD RMSNorm pair into ONE vt::FusedChain
+    // (kFusedAddRmsNormStd): res += x; out = rms_norm(res)*w. BYTE-EXACT to
+    // AddInto(res,x) + rms_norm_seq(out,res,w): the f32 residual add is the same
+    // (commutative + ResRound<f32> is identity), and the RMSNorm uses the SAME 256-thread
+    // strided sum + shared-tree reduction + 1/sqrtf as RmsNormSeqKernel. NODE-COUNT WIN in
+    // BOTH tiers: the default Tier-0 composite collapses the chain to ONE
+    // vt::RmsNorm(residual) launch (RmsNormRowKernel does the add inline), and Tier-1
+    // (VT_FUSED_TIER=1) to one interpreter kernel — either way 2 kernels -> 1. All
+    // operands are persistent member buffers => capture-safe (same temporary-Tensor
+    // pattern as the AddInto lambda already captured in this graph).
+    auto FusedAddNorm = [&](float* out, float* x, const float* wgt, float* res) {
+      vt::Tensor o2 = DevT(out, H), x2 = DevT(x, H), r2 = DevT(res, H);
+      vt::Tensor w1 = vt::Tensor::Contiguous(const_cast<float*>(wgt), vt::DType::kF32, dev, {H});
+      vt::FusedChain(q, o2, x2, w1, &r2, vt::kFusedAddRmsNormStd, eps);
+    };
+    // L4: when fused, `hn` always holds rms_norm(hidden, input_norm[l]) on entry to layer
+    // l — layer 0 is seeded here (no preceding residual add to fold), and every later
+    // layer inherits it from the previous layer's fused Pair-2 tail (last MLP add folded
+    // with the next input norm). When NOT fused, the input norm runs at each loop top.
+    if (glue_fused)
+      LAG->rms_norm_seq(q, hn.data(), hidden.data(), input_norm_f[0].data(), 1, H, eps, true);
     for (int64_t l = 0; l < nlayers; ++l) {
       const LagunaLayerWeights& lw = w->layers[static_cast<size_t>(l)];
       const LayerC& c = lc[static_cast<size_t>(l)];
@@ -1972,8 +2016,9 @@ struct LagunaGraph {
       // LEVER A: the position-indexed full RoPE table for this layer's regime; the graph
       // RoPE indexes row *pos_buf on-device (no per-step host cos/sin rebuild).
       const float* rcache = (c.global ? yarn_full : slide_full).data();
-      LAG->rms_norm_seq(q, hn.data(), hidden.data(), input_norm_f[static_cast<size_t>(l)].data(), 1,
-                        H, eps, true);
+      if (!glue_fused)  // L4: fused path carries hn in from the previous layer's Pair-2 tail
+        LAG->rms_norm_seq(q, hn.data(), hidden.data(),
+                          input_norm_f[static_cast<size_t>(l)].data(), 1, H, eps, true);
       GemmBf16(base, lw.attn.qkvg_proj, hn.data(), c.qdim + 2 * kvdim + c.Hq, H);
       if (p->has_qk_norm && !lw.attn.q_norm.Empty()) {
         LAG->rms_norm_seq(q, qvp, qvp, q_norm_f[static_cast<size_t>(l)].data(), c.Hq,
@@ -1986,7 +2031,8 @@ struct LagunaGraph {
       // len/pos read from the DEVICE buffers. first_pos=0 (uniform, P<512).
       LAG->decode_attn_gqa_g(q, attn.data(), qvp, cache_k[static_cast<size_t>(l)].data(),
                              cache_v[static_cast<size_t>(l)].data(), kn, vn, c.Hq, Hkv, Dh, c.group,
-                             /*first_pos=*/0, c.window, scale, len_buf.data(), pos_buf.data());
+                             /*first_pos=*/0, c.window, scale, len_buf.data(), pos_buf.data(),
+                             glue_fused ? glp : nullptr);  // L1: fold softplus out-gate
       // LEVER A: append this token's post-RoPE K (kn) and raw V (vn) into the growing
       // cache at the DEVICE-read slot *len_buf, IN-GRAPH — folds the 2×nlayers between-
       // replay host Copy launches into the captured graph. Runs after decode_attn_gqa_g
@@ -1995,17 +2041,29 @@ struct LagunaGraph {
       LAG->append_kv_row(q, cache_k[static_cast<size_t>(l)].data(),
                          cache_v[static_cast<size_t>(l)].data(), kn, vn, kvdim, len_buf.data());
       // g was produced by the fused GEMV (glp -> qkvg[l]); untouched until here.
-      LAG->softplus_head_gate(q, attn.data(), glp, c.Hq, Dh);
+      if (!glue_fused)  // L1 off => separate softplus out-gate pass
+        LAG->softplus_head_gate(q, attn.data(), glp, c.Hq, Dh);
       GemmBf16(o.data(), lw.attn.o_proj, attn.data(), H, c.qdim);
-      AddInto(hidden.data(), o.data());
-      LAG->rms_norm_seq(q, hn.data(), hidden.data(), post_norm_f[static_cast<size_t>(l)].data(), 1,
-                        H, eps, true);
+      // L4 Pair 1 (post-attn): hidden += o; hn = rms_norm(hidden, post_norm[l]).
+      if (glue_fused) {
+        FusedAddNorm(hn.data(), o.data(), post_norm_f[static_cast<size_t>(l)].data(), hidden.data());
+      } else {
+        AddInto(hidden.data(), o.data());
+        LAG->rms_norm_seq(q, hn.data(), hidden.data(), post_norm_f[static_cast<size_t>(l)].data(), 1,
+                          H, eps, true);
+      }
+      // L4 Pair 2: the LAST residual add of this layer folds with the NEXT layer's input
+      // RMSNorm (or the post-loop final RMSNorm on the last layer) — computed into hn.
+      const float* next_norm = (l + 1 < nlayers)
+                                   ? input_norm_f[static_cast<size_t>(l + 1)].data()
+                                   : final_norm_f.data();
       if (c.is_dense) {
         GemmBf16(dg.data(), lw.mlp.gate_proj, hn.data(), dense_I, H);
         GemmBf16(du.data(), lw.mlp.up_proj, hn.data(), dense_I, H);
         SiluMul(dact.data(), dg.data(), du.data(), dense_I);
         GemmBf16(fdn.data(), lw.mlp.down_proj, dact.data(), H, dense_I);
-        AddInto(hidden.data(), fdn.data());
+        if (glue_fused) FusedAddNorm(hn.data(), fdn.data(), next_norm, hidden.data());
+        else AddInto(hidden.data(), fdn.data());
       } else {
         // LEVER 2: fused router|shared_gate|shared_up GEMV -> rsg slices.
         GemmBf16(rsg.data(), lw.moe.router_shared_gu, hn.data(), E + 2 * moe_I, H);
@@ -2021,8 +2079,10 @@ struct LagunaGraph {
                                     topk, doutb.data());
         SiluMul(dact.data(), sgp, sup, moe_I);
         GemmBf16(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
-        AddInto(hidden.data(), doutb.data());  // hidden += routed
-        AddInto(hidden.data(), so.data());     // hidden += shared
+        AddInto(hidden.data(), doutb.data());  // hidden += routed (always a plain add)
+        // hidden += shared, folded with the next layer's input (or final) RMSNorm.
+        if (glue_fused) FusedAddNorm(hn.data(), so.data(), next_norm, hidden.data());
+        else AddInto(hidden.data(), so.data());
       }
     }
     // final RMSNorm + lm_head INSIDE the captured region (device), into persistent
@@ -2034,7 +2094,9 @@ struct LagunaGraph {
     // roofline, the measured #1 decode GPU cost). Fixed grid=Vsz + fixed pointers ⇒
     // capture-safe. (f32/quant lm_head would fall back to GemmBf16, but the nvfp4 arm
     // is always bf16 here.)
-    LAG->rms_norm_seq(q, hn.data(), hidden.data(), final_norm_f.data(), 1, H, eps, true);
+    if (!glue_fused)  // L4: fused path already produced hn=norm(hidden,final_norm) in the
+                      // last layer's Pair-2 tail (next_norm==final_norm_f when l+1==nlayers)
+      LAG->rms_norm_seq(q, hn.data(), hidden.data(), final_norm_f.data(), 1, H, eps, true);
     if (w->lm_head.dtype == vt::DType::kBF16)
       LAG->lm_head_gemv(q, logits.data(),
                         reinterpret_cast<const void*>(w->lm_head.bytes.data()), hn.data(), Vsz, H);

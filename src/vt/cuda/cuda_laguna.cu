@@ -134,7 +134,7 @@ constexpr int kLagTile = 32;             // keys staged per shared tile
 __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, const float* v,
                                     int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group,
                                     int64_t kv_rows, int64_t q_pos, int64_t first_pos,
-                                    int64_t window, float scale) {
+                                    int64_t window, float scale, const float* gate) {
   const int64_t g = static_cast<int64_t>(blockIdx.x);  // KV head this block owns
   if (g >= Hkv) return;
   const int warp = static_cast<int>(threadIdx.x) >> 5;   // == q-head within the group
@@ -195,8 +195,19 @@ __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, co
 
   if (active) {
     const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;      // no visible key -> 0 (matches host)
+    // L1 (VT_LAGUNA_GLUE_FUSED): fold the per-head softplus out-gate into the store.
+    // BYTE-EXACT vs the separate SoftplusHeadGateKernel: it stored o=o_reg*inv (f32,
+    // lossless) then reloaded+×g; folded computes the SAME (o_reg*inv)*g in registers.
+    // gate==nullptr keeps the un-gated store bit-for-bit (no ×1.0 rounding risk).
+    if (gate != nullptr) {
+      const float gx = gate[h];
+      const float gv = (gx > 20.0f) ? gx : log1pf(expf(gx));
 #pragma unroll
-    for (int i = 0; i < kLagEpl; ++i) o[h * Dh + lane * kLagEpl + i] = o_reg[i] * inv;
+      for (int i = 0; i < kLagEpl; ++i) o[h * Dh + lane * kLagEpl + i] = o_reg[i] * inv * gv;
+    } else {
+#pragma unroll
+      for (int i = 0; i < kLagEpl; ++i) o[h * Dh + lane * kLagEpl + i] = o_reg[i] * inv;
+    }
   }
 }
 
@@ -214,7 +225,8 @@ __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, co
 __global__ void DecodeAttnGqaGKernel(float* o, const float* q, const float* k, const float* v,
                                      const float* knew, const float* vnew, int64_t Hq, int64_t Hkv,
                                      int64_t Dh, int64_t group, int64_t first_pos, int64_t window,
-                                     float scale, const int* len_dev, const int* pos_dev) {
+                                     float scale, const int* len_dev, const int* pos_dev,
+                                     const float* gate) {
   const int64_t g = static_cast<int64_t>(blockIdx.x);  // KV head this block owns
   if (g >= Hkv) return;
   const int warp = static_cast<int>(threadIdx.x) >> 5;   // == q-head within the group
@@ -286,8 +298,15 @@ __global__ void DecodeAttnGqaGKernel(float* o, const float* q, const float* k, c
 
   if (active) {
     const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    if (gate != nullptr) {  // L1: fold softplus out-gate (byte-exact; see DecodeAttnGqaKernel)
+      const float gx = gate[h];
+      const float gv = (gx > 20.0f) ? gx : log1pf(expf(gx));
 #pragma unroll
-    for (int i = 0; i < kLagEpl; ++i) o[h * Dh + lane * kLagEpl + i] = o_reg[i] * inv;
+      for (int i = 0; i < kLagEpl; ++i) o[h * Dh + lane * kLagEpl + i] = o_reg[i] * inv * gv;
+    } else {
+#pragma unroll
+      for (int i = 0; i < kLagEpl; ++i) o[h * Dh + lane * kLagEpl + i] = o_reg[i] * inv;
+    }
   }
 }
 
@@ -484,9 +503,20 @@ __global__ void DecodeAttnGqaSplitGKernel(float* mp, float* lp, float* op, const
 // split — impossible here since the diagonal is always visible) ⇒ write 0. Shared holds
 // the SPLIT scalars: [SPLIT] m | [SPLIT] l | [SPLIT] sc.
 __global__ void DecodeAttnCombineKernel(float* o, const float* mp, const float* lp,
-                                        const float* op, int64_t Hq, int64_t Dh, int SPLIT) {
+                                        const float* op, int64_t Hq, int64_t Dh, int SPLIT,
+                                        const float* gate) {
   const int64_t h = static_cast<int64_t>(blockIdx.x);
   if (h >= Hq) return;
+  // L1 (VT_LAGUNA_GLUE_FUSED): fold the per-head softplus out-gate into the combine
+  // epilogue. gate[h] is head-uniform, so softplus is computed ONCE per block; the
+  // final store becomes (acc*inv)*gv — byte-exact vs the separate SoftplusHeadGate
+  // pass (which stored acc*inv f32 then reloaded ×gv). gate==nullptr => un-gated store.
+  float gv = 1.0f;
+  const bool has_gate = (gate != nullptr);
+  if (has_gate) {
+    const float gx = gate[h];
+    gv = (gx > 20.0f) ? gx : log1pf(expf(gx));
+  }
   extern __shared__ float csh[];  // [SPLIT] m | [SPLIT] l | [SPLIT] sc
   float* m_sp = csh;
   float* l_sp = csh + SPLIT;
@@ -508,7 +538,7 @@ __global__ void DecodeAttnCombineKernel(float* o, const float* mp, const float* 
        d += static_cast<int64_t>(blockDim.x)) {
     float acc = 0.0f;
     for (int t = 0; t < SPLIT; ++t) acc += sc_sp[t] * op[(h * SPLIT + t) * Dh + d];
-    o[h * Dh + d] = acc * inv;
+    o[h * Dh + d] = has_gate ? (acc * inv) * gv : (acc * inv);
   }
 }
 
@@ -699,16 +729,18 @@ void AppendKvRowLaunch(Queue& q, float* cache_k, float* cache_v, const float* kn
 }
 void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                          int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group, int64_t kv_rows,
-                         int64_t q_pos, int64_t first_pos, int64_t window, float scale) {
+                         int64_t q_pos, int64_t first_pos, int64_t window, float scale,
+                         const float* gate) {
   // block = group*32 = QG warps (warp w owns query head g*QG+w); each K/V row staged into
   // shared ONCE, reused across all QG heads. Split the KV rows across SPLIT blocks per KV
   // head to fill GB10 (grid=Hkv=8 alone starves the SMs on this memory-bound decode attn).
+  // L1: `gate` (or nullptr) folds the softplus out-gate into the normalized store below.
   const unsigned blk = static_cast<unsigned>(group * 32);
   cudaStream_t st = AsStream(q);
   const int SPLIT = ChooseSplitEager(kv_rows, Hkv);
   if (SPLIT <= 1) {  // byte-exact single-block fallback (tiny kv_rows)
     DecodeAttnGqaKernel<<<static_cast<unsigned>(Hkv), blk, 0, st>>>(
-        o, qd, k, v, Hq, Hkv, Dh, group, kv_rows, q_pos, first_pos, window, scale);
+        o, qd, k, v, Hq, Hkv, Dh, group, kv_rows, q_pos, first_pos, window, scale, gate);
     return;
   }
   const size_t need = static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT) *
@@ -722,12 +754,12 @@ void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, co
                                                  q_pos, first_pos, window, scale, SPLIT);
   const size_t csh = static_cast<size_t>(3 * SPLIT) * sizeof(float);
   DecodeAttnCombineKernel<<<static_cast<unsigned>(Hq), static_cast<unsigned>(kLagDh), csh, st>>>(
-      o, mp, lp, op, Hq, Dh, SPLIT);
+      o, mp, lp, op, Hq, Dh, SPLIT, gate);
 }
 void DecodeAttnGqaGLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                           const float* knew, const float* vnew, int64_t Hq, int64_t Hkv, int64_t Dh,
                           int64_t group, int64_t first_pos, int64_t window, float scale,
-                          const int* len_dev, const int* pos_dev) {
+                          const int* len_dev, const int* pos_dev, const float* gate) {
   // block = group*32 (QG warps). CAPTURE-SAFE split-K: grid=dim3(Hkv,SPLIT) with a FIXED
   // SPLIT (baked at capture); the per-split KV-row range (rps) is computed IN-KERNEL from
   // *len_dev at replay so one capture covers a growing context. The scratch is pre-sized by
@@ -738,7 +770,8 @@ void DecodeAttnGqaGLaunch(Queue& q, float* o, const float* qd, const float* k, c
   constexpr int SPLIT = kLagSplitGraph;
   if (SPLIT <= 1) {  // byte-exact single-block fallback (keeps the original kernel live)
     DecodeAttnGqaGKernel<<<static_cast<unsigned>(Hkv), blk, 0, st>>>(
-        o, qd, k, v, knew, vnew, Hq, Hkv, Dh, group, first_pos, window, scale, len_dev, pos_dev);
+        o, qd, k, v, knew, vnew, Hq, Hkv, Dh, group, first_pos, window, scale, len_dev, pos_dev,
+        gate);
     return;
   }
   const size_t need = static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT) *
@@ -753,7 +786,7 @@ void DecodeAttnGqaGLaunch(Queue& q, float* o, const float* qd, const float* k, c
                                                   SPLIT);
   const size_t csh = static_cast<size_t>(3 * SPLIT) * sizeof(float);
   DecodeAttnCombineKernel<<<static_cast<unsigned>(Hq), static_cast<unsigned>(kLagDh), csh, st>>>(
-      o, mp, lp, op, Hq, Dh, SPLIT);
+      o, mp, lp, op, Hq, Dh, SPLIT, gate);
 }
 void SoftplusHeadGateLaunch(Queue& q, float* attn, const float* gl, int64_t Hq, int64_t Dh) {
   SoftplusHeadGateKernel<<<Blocks(Hq * Dh), kTPB, 0, AsStream(q)>>>(attn, gl, Hq, Dh);
