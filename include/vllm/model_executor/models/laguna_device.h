@@ -82,6 +82,22 @@ struct LagunaDeviceKernels {
   // block-reduced dot reorders float adds — accepted device regime, gated vs vLLM).
   void (*lm_head_gemv)(vt::Queue&, float* out, const void* w_bf16, const float* x, int64_t N,
                        int64_t K);
+  // Brick A2b GRAPH KV-append (capturable): write the new token's post-RoPE K (knew) and
+  // raw V (vnew), each [Hkv,Dh]=kvdim, into cache_k/cache_v at the DEVICE-read slot
+  // *len_dev. Folds the between-replay host Copy loop (2×nlayers host launches/step) INTO
+  // the captured graph. Fixed pointers + baked grid ⇒ capture-safe; *len_dev is read at
+  // REPLAY (host refreshes it outside capture). Runs AFTER decode_attn_gqa_g (which reads
+  // cache[0..len) + knew/vnew), and slot len is NOT in that read range ⇒ no intra-replay
+  // RAW; the write is visible to the NEXT replay's attention (same-stream ordering).
+  void (*append_kv_row)(vt::Queue&, float* cache_k, float* cache_v, const float* knew,
+                        const float* vnew, int64_t kvdim, const int* len_dev);
+  // Brick A2b GRAPH RoPE (capturable): identical math to rope_from_cache, but the row
+  // index comes from a DEVICE buffer (pos=*pos_dev) so ONE position-indexed cos/sin table
+  // (built once, rows [0,max_cap)) serves every replay — kills the per-step host cos/sin
+  // rebuild+copy. Row *pos_dev of the full table == the old single-row build for that pos
+  // ⇒ byte-identical. Fixed pointers ⇒ capture-safe.
+  void (*rope_from_cache_g)(vt::Queue&, float* x, const float* cache, int64_t heads, int64_t Dh,
+                            int64_t rd, const int* pos_dev);
 };
 
 // Resolver (throws on a CPU-only build where nothing registered for kLaguna,kCUDA).

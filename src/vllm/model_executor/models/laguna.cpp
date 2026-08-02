@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -334,9 +335,11 @@ std::vector<float> LagunaMoeResidentFp4(vt::Queue& q, const LagunaMoeWeights& mo
 //    path is unchanged. CUDA-only (VT_MARLIN_NVFP4). ──────────────────────────────
 #ifdef VT_MARLIN_NVFP4
 namespace {
-// Resident Marlin-repacked routed experts (split w13). Mirror MoeMarlinResident.
+// Resident Marlin-repacked routed experts. Mirror MoeMarlinResident (qwen3_5.cpp), incl.
+// the LEVER B fused-w13 layout: gate+up concatenated along N into ONE size_n=2*moe_I
+// operand (w_gu/s_gu/g_gu), populated INSTEAD of w_gate/w_up when fused_w13.
 struct LagunaMoeMarlinResident {
-  void* w_gate = nullptr;  // i32 [E, H/16, moe_I*2]
+  void* w_gate = nullptr;  // i32 [E, H/16, moe_I*2]  (split layout)
   void* w_up = nullptr;    // i32 [E, H/16, moe_I*2]
   void* w_down = nullptr;  // i32 [E, moe_I/16, H*2]
   void* s_gate = nullptr;  // u8  [E, H/16, moe_I]
@@ -345,10 +348,28 @@ struct LagunaMoeMarlinResident {
   void* g_gate = nullptr;  // f32 [E]
   void* g_up = nullptr;
   void* g_down = nullptr;
+  // LEVER B fused-w13 (VT_MOE_FUSED_W13): gate+up CONCATENATED along N per expert →
+  // ONE grouped Marlin GEMM of size_n=2*moe_I + one SiluAndMul (3 grouped GEMMs → 2).
+  void* w_gu = nullptr;    // i32 [E, H/16, (2*moe_I)*2]
+  void* s_gu = nullptr;    // u8  [E, H/16, 2*moe_I]
+  void* g_gu = nullptr;    // f32 [E]  (gate scale2; == up scale2, checked at build)
+  bool fused_w13 = false;
   void* workspace = nullptr;  // i32 [sms*4]
   int sms = 0;
   bool ready = false;
 };
+
+// LEVER B gate: fuse the routed-expert gate+up into ONE size_n=2N grouped GEMM. Mirrors
+// qwen3_5.cpp MoeFusedW13Enabled (SAME env var VT_MOE_FUSED_W13, DEFAULT ON) — the
+// frameworkization move onto the shared fused-w13 layout. Any gate/up scale2 mismatch
+// falls back to split at build (token-exact; no degraded fusion).
+inline bool LagunaMoeFusedW13Enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_FUSED_W13");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
 
 LagunaMoeMarlinResident& LagunaMoeMarlinResidentFor(const LagunaMoeWeights* w) {
   static std::mutex mu;
@@ -358,9 +379,9 @@ LagunaMoeMarlinResident& LagunaMoeMarlinResidentFor(const LagunaMoeWeights* w) {
 }
 
 // Repack every routed expert's fp4 gate/up/down into the resident Marlin layout —
-// the per-expert body of qwen3_5.cpp BuildMoeMarlinResident (split branch),
-// reusing the identical shared vt::cuda primitives. K=H (gate/up in), N=moe_I
-// (gate/up out); down is K=moe_I, N=H.
+// the per-expert body of qwen3_5.cpp BuildMoeMarlinResident, reusing the identical
+// shared vt::cuda primitives. K=H (gate/up in), N=moe_I (gate/up out); down is K=moe_I,
+// N=H. LEVER B: when fused_w13, gate+up are repacked as ONE size_n=2*moe_I operand.
 void BuildLagunaMoeMarlinResident(vllm::dense_nvfp4::Dev d, const LagunaMoeWeights& moe, int E,
                                   int H, int I, LagunaMoeMarlinResident& mr) {
   void* stream = d.q.handle;
@@ -369,14 +390,40 @@ void BuildLagunaMoeMarlinResident(vllm::dense_nvfp4::Dev d, const LagunaMoeWeigh
   const size_t wd_i32 = static_cast<size_t>(I / 16) * (H * 2);  // down weight elems
   const size_t sg_b = static_cast<size_t>(H / 16) * I;          // gate/up scale bytes
   const size_t sd_b = static_cast<size_t>(I / 16) * H;          // down scale bytes
-  mr.w_gate = d.b.Alloc(static_cast<size_t>(E) * wg_i32 * 4);
-  mr.w_up = d.b.Alloc(static_cast<size_t>(E) * wg_i32 * 4);
+
+  // LEVER B fused-w13 (mirror qwen3_5.cpp): ONE Marlin B operand per expert with gate+up
+  // concatenated along N needs ONE per-expert global scale for both halves. vLLM checks
+  // allclose(w13_weight_scale_2[:,0], [:,1]) then uses [:,0] (modelopt "single gscale for
+  // w13"); our token-exact gate forbids degraded fusion, so ANY gate/up scale2 mismatch
+  // falls back to the split two-GEMM layout instead.
+  bool fuse = LagunaMoeFusedW13Enabled();
+  for (int e = 0; fuse && e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    if (moe.experts_gate_fp4[se].scale2 != moe.experts_up_fp4[se].scale2) {
+      std::fprintf(stderr,
+                   "vllm.cpp laguna: VT_MOE_FUSED_W13: expert %d gate/up scale2 differ "
+                   "(%g vs %g) — falling back to the split w13 layout\n",
+                   e, static_cast<double>(moe.experts_gate_fp4[se].scale2),
+                   static_cast<double>(moe.experts_up_fp4[se].scale2));
+      fuse = false;
+    }
+  }
+  mr.fused_w13 = fuse;
+
+  if (fuse) {  // same total bytes as the split w_gate+w_up / s_gate+s_up pair
+    mr.w_gu = d.b.Alloc(static_cast<size_t>(E) * 2 * wg_i32 * 4);
+    mr.s_gu = d.b.Alloc(static_cast<size_t>(E) * 2 * sg_b);
+    mr.g_gu = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  } else {
+    mr.w_gate = d.b.Alloc(static_cast<size_t>(E) * wg_i32 * 4);
+    mr.w_up = d.b.Alloc(static_cast<size_t>(E) * wg_i32 * 4);
+    mr.s_gate = d.b.Alloc(static_cast<size_t>(E) * sg_b);
+    mr.s_up = d.b.Alloc(static_cast<size_t>(E) * sg_b);
+    mr.g_gate = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+    mr.g_up = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  }
   mr.w_down = d.b.Alloc(static_cast<size_t>(E) * wd_i32 * 4);
-  mr.s_gate = d.b.Alloc(static_cast<size_t>(E) * sg_b);
-  mr.s_up = d.b.Alloc(static_cast<size_t>(E) * sg_b);
   mr.s_down = d.b.Alloc(static_cast<size_t>(E) * sd_b);
-  mr.g_gate = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
-  mr.g_up = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
   mr.g_down = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
   mr.workspace = d.b.Alloc(static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
 
@@ -395,39 +442,72 @@ void BuildLagunaMoeMarlinResident(vllm::dense_nvfp4::Dev d, const LagunaMoeWeigh
   const float sf_gu = vt::cuda::MarlinNvfp4CombinedScaleFactor(gu_bufs, gu_lens);
   const float sf_dn = vt::cuda::MarlinNvfp4CombinedScaleFactor(dn_bufs, dn_lens);
 
+  // Fused-w13 concat staging (device, reused across experts — issued on the SAME stream,
+  // so each expert's repack reads its staging bytes before the next expert overwrites).
+  // vLLM w13 stack = w1 (gate) rows first, then w3 (up); silu reads [:N] as gate.
+  const size_t pk_b = static_cast<size_t>(I) * (H / 2);  // one shard's packed fp4 bytes
+  uint8_t* tmp_w = nullptr;
+  uint8_t* tmp_s = nullptr;
+  if (fuse) {
+    tmp_w = static_cast<uint8_t*>(d.b.Alloc(2 * pk_b));
+    tmp_s = static_cast<uint8_t*>(d.b.Alloc(2 * sg_b));
+  }
+
   std::vector<float> gg(E), gu(E), gd(E);
   for (int e = 0; e < E; ++e) {
     const size_t se = static_cast<size_t>(e);
     vllm::dense_nvfp4::Nvfp4Dev g = vllm::dense_nvfp4::ResidentNvfp4(d, moe.experts_gate_fp4[se]);
     vllm::dense_nvfp4::Nvfp4Dev u = vllm::dense_nvfp4::ResidentNvfp4(d, moe.experts_up_fp4[se]);
     vllm::dense_nvfp4::Nvfp4Dev dn = vllm::dense_nvfp4::ResidentNvfp4(d, moe.experts_down_fp4[se]);
-    auto* wg = static_cast<uint32_t*>(mr.w_gate) + se * wg_i32;
-    auto* wu = static_cast<uint32_t*>(mr.w_up) + se * wg_i32;
     auto* wd = static_cast<uint32_t*>(mr.w_down) + se * wd_i32;
-    auto* sgp = static_cast<uint8_t*>(mr.s_gate) + se * sg_b;
-    auto* sup = static_cast<uint8_t*>(mr.s_up) + se * sg_b;
     auto* sdp = static_cast<uint8_t*>(mr.s_down) + se * sd_b;
-    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wg,
-                                       static_cast<const uint8_t*>(g.packed.data), H, I);
-    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wu,
-                                       static_cast<const uint8_t*>(u.packed.data), H, I);
-    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wd,
-                                       static_cast<const uint8_t*>(dn.packed.data), I, H);
-    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(g.scale.data), sgp, H, I,
-                                        sf_gu);
-    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(u.scale.data), sup, H, I,
-                                        sf_gu);
+    const auto* pg = static_cast<const uint8_t*>(g.packed.data);
+    const auto* pu = static_cast<const uint8_t*>(u.packed.data);
+    const auto* pd = static_cast<const uint8_t*>(dn.packed.data);
+    if (fuse) {
+      // ONE repack + ONE scale-process over the N-concatenated gate|up (size_n = 2*I) —
+      // the per-expert body of vLLM's repack over the stacked w13 (size_n = num_shards*N).
+      auto* wgu = static_cast<uint32_t*>(mr.w_gu) + se * 2 * wg_i32;
+      auto* sgup = static_cast<uint8_t*>(mr.s_gu) + se * 2 * sg_b;
+      d.b.Copy(d.q, tmp_w, pg, pk_b);
+      d.b.Copy(d.q, tmp_w + pk_b, pu, pk_b);
+      vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wgu, tmp_w, H, 2 * I);
+      d.b.Copy(d.q, tmp_s, g.scale.data, sg_b);
+      d.b.Copy(d.q, tmp_s + sg_b, u.scale.data, sg_b);
+      vt::cuda::MarlinProcessExpertScales(stream, tmp_s, sgup, H, 2 * I, sf_gu);
+      gg[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(moe.experts_gate_fp4[se].scale2, sf_gu);
+    } else {
+      auto* wg = static_cast<uint32_t*>(mr.w_gate) + se * wg_i32;
+      auto* wu = static_cast<uint32_t*>(mr.w_up) + se * wg_i32;
+      auto* sgp = static_cast<uint8_t*>(mr.s_gate) + se * sg_b;
+      auto* sup = static_cast<uint8_t*>(mr.s_up) + se * sg_b;
+      vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wg, pg, H, I);
+      vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wu, pu, H, I);
+      vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(g.scale.data), sgp, H,
+                                          I, sf_gu);
+      vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(u.scale.data), sup, H,
+                                          I, sf_gu);
+      gg[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(moe.experts_gate_fp4[se].scale2, sf_gu);
+      gu[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(moe.experts_up_fp4[se].scale2, sf_gu);
+    }
+    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wd, pd, I, H);
     vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(dn.scale.data), sdp, I, H,
                                         sf_dn);
-    gg[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(moe.experts_gate_fp4[se].scale2, sf_gu);
-    gu[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(moe.experts_up_fp4[se].scale2, sf_gu);
     gd[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(moe.experts_down_fp4[se].scale2, sf_dn);
   }
-  d.b.Copy(d.q, mr.g_gate, gg.data(), gg.size() * sizeof(float));
-  d.b.Copy(d.q, mr.g_up, gu.data(), gu.size() * sizeof(float));
+  if (fuse) {
+    d.b.Copy(d.q, mr.g_gu, gg.data(), gg.size() * sizeof(float));
+  } else {
+    d.b.Copy(d.q, mr.g_gate, gg.data(), gg.size() * sizeof(float));
+    d.b.Copy(d.q, mr.g_up, gu.data(), gu.size() * sizeof(float));
+  }
   d.b.Copy(d.q, mr.g_down, gd.data(), gd.size() * sizeof(float));
   d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
   d.b.Synchronize(d.q);  // repack done → safe to free the fp4 originals
+  if (fuse) {
+    d.b.Free(tmp_w);
+    d.b.Free(tmp_s);
+  }
 
   // CRITICAL (matches qwen3_5.cpp BuildMoeMarlinResident tail): the Marlin resident
   // is now the committed compute path, so FREE the per-expert fp4 originals — both
@@ -507,29 +587,40 @@ std::vector<float> LagunaMoeResidentMarlin(vt::Queue& q, const LagunaMoeWeights&
                                     static_cast<int32_t*>(eids.ptr()),
                                     static_cast<int32_t*>(npad.ptr()));
 
-  vt::Tensor wg = vllm::dense_nvfp4::MakeTensor(mr.w_gate, DType::kI32, dev, {E, H / 16, moe_I * 2});
-  vt::Tensor wu = vllm::dense_nvfp4::MakeTensor(mr.w_up, DType::kI32, dev, {E, H / 16, moe_I * 2});
   vt::Tensor wd = vllm::dense_nvfp4::MakeTensor(mr.w_down, DType::kI32, dev, {E, moe_I / 16, H * 2});
-  vt::Tensor sg = vllm::dense_nvfp4::MakeTensor(mr.s_gate, DType::kI8, dev, {E, H / 16, moe_I});
-  vt::Tensor su = vllm::dense_nvfp4::MakeTensor(mr.s_up, DType::kI8, dev, {E, H / 16, moe_I});
   vt::Tensor sd = vllm::dense_nvfp4::MakeTensor(mr.s_down, DType::kI8, dev, {E, moe_I / 16, H});
-  vt::Tensor gg = vllm::dense_nvfp4::MakeTensor(mr.g_gate, DType::kF32, dev, {E});
-  vt::Tensor gu = vllm::dense_nvfp4::MakeTensor(mr.g_up, DType::kF32, dev, {E});
   vt::Tensor gd = vllm::dense_nvfp4::MakeTensor(mr.g_down, DType::kF32, dev, {E});
   vt::Tensor ws = vllm::dense_nvfp4::MakeTensor(mr.workspace, DType::kI32, dev, {mr.sms * 4});
 
   const int bi = block, Pki = static_cast<int>(Pk), Hi = static_cast<int>(H),
             Ii = static_cast<int>(moe_I);
-  vllm::dense_nvfp4::DBuf dgate(d, DType::kBF16, {Pk, moe_I});
-  vllm::dense_nvfp4::DBuf dup(d, DType::kBF16, {Pk, moe_I});
-  vt::MoeGroupedGemmNvfp4Marlin(q, dgate.t(), dh.t(), wg, sg, gg, ws, sorted.t(),
-                                eids.t(), npad.t(), dtw.t(),
-                                vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
-  vt::MoeGroupedGemmNvfp4Marlin(q, dup.t(), dh.t(), wu, su, gu, ws, sorted.t(),
-                                eids.t(), npad.t(), dtw.t(),
-                                vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
   vllm::dense_nvfp4::DBuf dact(d, DType::kBF16, {Pk, moe_I});
-  vt::MoeSiluMul(q, dact.t(), dgate.t(), dup.t());
+  if (mr.fused_w13) {  // LEVER B: ONE size_n=2I grouped GEMM + SiluAndMul (see Into variant).
+    vt::Tensor wgu =
+        vllm::dense_nvfp4::MakeTensor(mr.w_gu, DType::kI32, dev, {E, H / 16, 2 * moe_I * 2});
+    vt::Tensor sgu = vllm::dense_nvfp4::MakeTensor(mr.s_gu, DType::kI8, dev, {E, H / 16, 2 * moe_I});
+    vt::Tensor ggu = vllm::dense_nvfp4::MakeTensor(mr.g_gu, DType::kF32, dev, {E});
+    vllm::dense_nvfp4::DBuf dgu(d, DType::kBF16, {Pk, 2 * moe_I});
+    vt::MoeGroupedGemmNvfp4Marlin(q, dgu.t(), dh.t(), wgu, sgu, ggu, ws, sorted.t(), eids.t(),
+                                  npad.t(), dtw.t(),
+                                  vt::MoeMarlinArgs{bi, Pki, 1, 2 * Ii, Hi, false});
+    vt::SiluAndMul(q, dact.t(), dgu.t());
+  } else {
+    vt::Tensor wg =
+        vllm::dense_nvfp4::MakeTensor(mr.w_gate, DType::kI32, dev, {E, H / 16, moe_I * 2});
+    vt::Tensor wu = vllm::dense_nvfp4::MakeTensor(mr.w_up, DType::kI32, dev, {E, H / 16, moe_I * 2});
+    vt::Tensor sg = vllm::dense_nvfp4::MakeTensor(mr.s_gate, DType::kI8, dev, {E, H / 16, moe_I});
+    vt::Tensor su = vllm::dense_nvfp4::MakeTensor(mr.s_up, DType::kI8, dev, {E, H / 16, moe_I});
+    vt::Tensor gg = vllm::dense_nvfp4::MakeTensor(mr.g_gate, DType::kF32, dev, {E});
+    vt::Tensor gu = vllm::dense_nvfp4::MakeTensor(mr.g_up, DType::kF32, dev, {E});
+    vllm::dense_nvfp4::DBuf dgate(d, DType::kBF16, {Pk, moe_I});
+    vllm::dense_nvfp4::DBuf dup(d, DType::kBF16, {Pk, moe_I});
+    vt::MoeGroupedGemmNvfp4Marlin(q, dgate.t(), dh.t(), wg, sg, gg, ws, sorted.t(), eids.t(),
+                                  npad.t(), dtw.t(), vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+    vt::MoeGroupedGemmNvfp4Marlin(q, dup.t(), dh.t(), wu, su, gu, ws, sorted.t(), eids.t(),
+                                  npad.t(), dtw.t(), vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+    vt::MoeSiluMul(q, dact.t(), dgate.t(), dup.t());
+  }
 
   vllm::dense_nvfp4::DBuf ddown(d, DType::kBF16, {Pk, H});
   vt::MoeGroupedGemmNvfp4Marlin(q, ddown.t(), dact.t(), wd, sd, gd, ws, sorted.t(),
@@ -592,26 +683,42 @@ void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, cons
                                     block, static_cast<int32_t*>(sorted.ptr()),
                                     static_cast<int32_t*>(eids.ptr()),
                                     static_cast<int32_t*>(npad.ptr()));
-  vt::Tensor wg = vllm::dense_nvfp4::MakeTensor(mr.w_gate, DType::kI32, dev, {E, H / 16, moe_I * 2});
-  vt::Tensor wu = vllm::dense_nvfp4::MakeTensor(mr.w_up, DType::kI32, dev, {E, H / 16, moe_I * 2});
   vt::Tensor wd = vllm::dense_nvfp4::MakeTensor(mr.w_down, DType::kI32, dev, {E, moe_I / 16, H * 2});
-  vt::Tensor sg = vllm::dense_nvfp4::MakeTensor(mr.s_gate, DType::kI8, dev, {E, H / 16, moe_I});
-  vt::Tensor su = vllm::dense_nvfp4::MakeTensor(mr.s_up, DType::kI8, dev, {E, H / 16, moe_I});
   vt::Tensor sd = vllm::dense_nvfp4::MakeTensor(mr.s_down, DType::kI8, dev, {E, moe_I / 16, H});
-  vt::Tensor gg = vllm::dense_nvfp4::MakeTensor(mr.g_gate, DType::kF32, dev, {E});
-  vt::Tensor gu = vllm::dense_nvfp4::MakeTensor(mr.g_up, DType::kF32, dev, {E});
   vt::Tensor gd = vllm::dense_nvfp4::MakeTensor(mr.g_down, DType::kF32, dev, {E});
   vt::Tensor ws = vllm::dense_nvfp4::MakeTensor(mr.workspace, DType::kI32, dev, {mr.sms * 4});
   const int bi = block, Pki = static_cast<int>(Pk), Hi = static_cast<int>(H),
             Ii = static_cast<int>(moe_I);
-  vllm::dense_nvfp4::DBuf dgate(d, DType::kBF16, {Pk, moe_I});
-  vllm::dense_nvfp4::DBuf dup(d, DType::kBF16, {Pk, moe_I});
-  vt::MoeGroupedGemmNvfp4Marlin(q, dgate.t(), dh.t(), wg, sg, gg, ws, sorted.t(), eids.t(),
-                                npad.t(), dtw, vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
-  vt::MoeGroupedGemmNvfp4Marlin(q, dup.t(), dh.t(), wu, su, gu, ws, sorted.t(), eids.t(), npad.t(),
-                                dtw, vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
   vllm::dense_nvfp4::DBuf dact(d, DType::kBF16, {Pk, moe_I});
-  vt::MoeSiluMul(q, dact.t(), dgate.t(), dup.t());
+  if (mr.fused_w13) {
+    // LEVER B: ONE grouped GEMM over the N-concatenated w13 (size_n=2*moe_I → [Pk,2I]) +
+    // one SiluAndMul over the halves — vLLM's marlin_moe shape (3 grouped GEMMs → 2).
+    // SiluAndMul(gate=dgu[:,:I], up=dgu[:,I:]) is the SAME f32 silu + bf16 store as
+    // MoeSiluMul, so per-element byte-identical to the split path given equal GEMM output.
+    vt::Tensor wgu =
+        vllm::dense_nvfp4::MakeTensor(mr.w_gu, DType::kI32, dev, {E, H / 16, 2 * moe_I * 2});
+    vt::Tensor sgu = vllm::dense_nvfp4::MakeTensor(mr.s_gu, DType::kI8, dev, {E, H / 16, 2 * moe_I});
+    vt::Tensor ggu = vllm::dense_nvfp4::MakeTensor(mr.g_gu, DType::kF32, dev, {E});
+    vllm::dense_nvfp4::DBuf dgu(d, DType::kBF16, {Pk, 2 * moe_I});
+    vt::MoeGroupedGemmNvfp4Marlin(q, dgu.t(), dh.t(), wgu, sgu, ggu, ws, sorted.t(), eids.t(),
+                                  npad.t(), dtw, vt::MoeMarlinArgs{bi, Pki, 1, 2 * Ii, Hi, false});
+    vt::SiluAndMul(q, dact.t(), dgu.t());
+  } else {
+    vt::Tensor wg =
+        vllm::dense_nvfp4::MakeTensor(mr.w_gate, DType::kI32, dev, {E, H / 16, moe_I * 2});
+    vt::Tensor wu = vllm::dense_nvfp4::MakeTensor(mr.w_up, DType::kI32, dev, {E, H / 16, moe_I * 2});
+    vt::Tensor sg = vllm::dense_nvfp4::MakeTensor(mr.s_gate, DType::kI8, dev, {E, H / 16, moe_I});
+    vt::Tensor su = vllm::dense_nvfp4::MakeTensor(mr.s_up, DType::kI8, dev, {E, H / 16, moe_I});
+    vt::Tensor gg = vllm::dense_nvfp4::MakeTensor(mr.g_gate, DType::kF32, dev, {E});
+    vt::Tensor gu = vllm::dense_nvfp4::MakeTensor(mr.g_up, DType::kF32, dev, {E});
+    vllm::dense_nvfp4::DBuf dgate(d, DType::kBF16, {Pk, moe_I});
+    vllm::dense_nvfp4::DBuf dup(d, DType::kBF16, {Pk, moe_I});
+    vt::MoeGroupedGemmNvfp4Marlin(q, dgate.t(), dh.t(), wg, sg, gg, ws, sorted.t(), eids.t(),
+                                  npad.t(), dtw, vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+    vt::MoeGroupedGemmNvfp4Marlin(q, dup.t(), dh.t(), wu, su, gu, ws, sorted.t(), eids.t(), npad.t(),
+                                  dtw, vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
+    vt::MoeSiluMul(q, dact.t(), dgate.t(), dup.t());
+  }
   vllm::dense_nvfp4::DBuf ddown(d, DType::kBF16, {Pk, H});
   vt::MoeGroupedGemmNvfp4Marlin(q, ddown.t(), dact.t(), wd, sd, gd, ws, sorted.t(), eids.t(),
                                 npad.t(), dtw, vt::MoeMarlinArgs{bi, 1, Pki, Hi, Ii, false});
@@ -1693,8 +1800,11 @@ struct LagunaGraph {
   // + the stack-baked-pointer hazard).
   std::vector<std::vector<float>> input_norm_f, q_norm_f, k_norm_f, post_norm_f, moe_bias_f;
   std::vector<float> final_norm_f;
-  // persistent single-row RoPE cos/sin (contents refreshed each token OUTSIDE capture).
-  std::vector<float> yarn_row, slide_row;
+  // LEVER A: device-resident position-indexed RoPE cos/sin tables — built ONCE (rows
+  // [0,max_cap)), indexed by *pos_buf on-device via rope_from_cache_g. Replaces the old
+  // single-row buffers that Step host-rebuilt every token (kills the per-step host cos/sin
+  // recompute + copy). Row `pos` is byte-identical to the old single-row build for `pos`.
+  std::vector<float> yarn_full, slide_full;
   // per-step device-read scalars (FIXED pointers, contents refreshed each token).
   std::vector<int> pos_buf, len_buf;
   // persistent working scratch (all members → stable captured addresses). LEVER 2:
@@ -1783,8 +1893,11 @@ struct LagunaGraph {
         moe_bias_f[static_cast<size_t>(l)] = ReadF32(L.moe.e_score_correction_bias);
     }
     final_norm_f = ReadF32(w->norm);
-    yarn_row.assign(static_cast<size_t>(p->rotary_dim_full), 0.0F);
-    slide_row.assign(static_cast<size_t>(p->rotary_dim_sliding), 0.0F);
+    // LEVER A: build the FULL position-indexed RoPE tables ONCE (rows [0,max_cap)). pos
+    // increments in lockstep with kv_rows (both == cache.len at decode), and Step VT_CHECKs
+    // kv_rows+1 <= max_cap, so every decoded pos < max_cap ⇒ the tables cover every index.
+    yarn_full = BuildLagunaFullYarnCosSin(*p, /*rows=*/max_cap, /*pos0=*/0);
+    slide_full = BuildLagunaSlidingCosSin(*p, /*rows=*/max_cap, /*pos0=*/0);
     pos_buf.assign(1, 0);
     len_buf.assign(1, 0);
     // persistent working scratch. (qv/gl/gating are now qkvg/rsg slices.)
@@ -1856,7 +1969,9 @@ struct LagunaGraph {
       float* kn = base + c.qdim;
       float* vn = base + c.qdim + kvdim;
       float* glp = base + c.qdim + 2 * kvdim;
-      const float* rcache = (c.global ? yarn_row : slide_row).data();
+      // LEVER A: the position-indexed full RoPE table for this layer's regime; the graph
+      // RoPE indexes row *pos_buf on-device (no per-step host cos/sin rebuild).
+      const float* rcache = (c.global ? yarn_full : slide_full).data();
       LAG->rms_norm_seq(q, hn.data(), hidden.data(), input_norm_f[static_cast<size_t>(l)].data(), 1,
                         H, eps, true);
       GemmBf16(base, lw.attn.qkvg_proj, hn.data(), c.qdim + 2 * kvdim + c.Hq, H);
@@ -1865,14 +1980,20 @@ struct LagunaGraph {
                           Dh, eps, true);
         LAG->rms_norm_seq(q, kn, kn, k_norm_f[static_cast<size_t>(l)].data(), Hkv, Dh, eps, true);
       }
-      LAG->rope_from_cache(q, qvp, rcache, c.Hq, Dh, c.rd, /*pos=*/0);
-      LAG->rope_from_cache(q, kn, rcache, Hkv, Dh, c.rd, /*pos=*/0);
+      LAG->rope_from_cache_g(q, qvp, rcache, c.Hq, Dh, c.rd, pos_buf.data());
+      LAG->rope_from_cache_g(q, kn, rcache, Hkv, Dh, c.rd, pos_buf.data());
       // GRAPH decode attention: cache_k[l][0..len) + kn/vn as the new row, with
-      // len/pos read from the DEVICE buffers. first_pos=0 (uniform, P<512). The new
-      // row is appended to cache_k/cache_v BETWEEN replays (Step), never in-graph.
+      // len/pos read from the DEVICE buffers. first_pos=0 (uniform, P<512).
       LAG->decode_attn_gqa_g(q, attn.data(), qvp, cache_k[static_cast<size_t>(l)].data(),
                              cache_v[static_cast<size_t>(l)].data(), kn, vn, c.Hq, Hkv, Dh, c.group,
                              /*first_pos=*/0, c.window, scale, len_buf.data(), pos_buf.data());
+      // LEVER A: append this token's post-RoPE K (kn) and raw V (vn) into the growing
+      // cache at the DEVICE-read slot *len_buf, IN-GRAPH — folds the 2×nlayers between-
+      // replay host Copy launches into the captured graph. Runs after decode_attn_gqa_g
+      // consumed kn/vn (slot len is outside its [0,len) cache read ⇒ no intra-replay RAW;
+      // the write is seen by the NEXT replay's attention via same-stream ordering).
+      LAG->append_kv_row(q, cache_k[static_cast<size_t>(l)].data(),
+                         cache_v[static_cast<size_t>(l)].data(), kn, vn, kvdim, len_buf.data());
       // g was produced by the fused GEMV (glp -> qkvg[l]); untouched until here.
       LAG->softplus_head_gate(q, attn.data(), glp, c.Hq, Dh);
       GemmBf16(o.data(), lw.attn.o_proj, attn.data(), H, c.qdim);
@@ -1921,9 +2042,9 @@ struct LagunaGraph {
       GemmBf16(logits.data(), w->lm_head, hn.data(), Vsz, H);
   }
 
-  // One decode token: refresh the persistent inputs OUTSIDE capture, run/replay the
-  // step, append this token's per-layer K/V to the fixed-cap cache (on-stream, between
-  // replays), read logits. Mirror of V4Graph::Step.
+  // One decode token: refresh the persistent inputs OUTSIDE capture (embed + the two
+  // device-read scalars pos/len — the RoPE table and KV append are now BOTH in-graph),
+  // run/replay the step, read logits. Mirror of V4Graph::Step.
   std::vector<float> Step(int32_t token, int32_t pos) {
     vt::Queue& q = *qp;
     VT_CHECK(kv_rows + 1 <= max_cap, "laguna decode graph: KV capacity exceeded");
@@ -1945,17 +2066,10 @@ struct LagunaGraph {
                     static_cast<size_t>(H) * sizeof(float));
       }
     }
-    // (2) device-read scalars.
+    // (2) device-read scalars (the ONLY per-step host refresh now: pos indexes the
+    // in-graph RoPE table on-device, len drives both the in-graph attention and KV append).
     pos_buf[0] = pos;
     len_buf[0] = static_cast<int>(kv_rows);
-    // (3) single-row RoPE cos/sin for `pos` into the persistent buffers (pointer fixed,
-    // CONTENTS refreshed — the captured rope_from_cache reads row 0).
-    {
-      const std::vector<float> yr = BuildLagunaFullYarnCosSin(*p, /*rows=*/1, /*pos0=*/pos);
-      const std::vector<float> sr = BuildLagunaSlidingCosSin(*p, /*rows=*/1, /*pos0=*/pos);
-      std::copy(yr.begin(), yr.end(), yarn_row.begin());
-      std::copy(sr.begin(), sr.end(), slide_row.begin());
-    }
     vt::Backend& b = vt::GetBackend(dev);
     if (gstate == 0) {         // cold: eager warm-run (warms the pool + GEMM scratch)
       RunChain();
@@ -1969,19 +2083,9 @@ struct LagunaGraph {
     } else {                   // captured: one cudaGraphLaunch
       b.ReplayGraph(q, graph);
     }
-    // append this token's per-layer new K/V → cache at slot kv_rows (on the stream,
-    // AFTER the step produced them, BEFORE the next replay reads them) — the growing
-    // KV. LEVER 1: the new K/V are the k/v sub-ranges of the fused qkvg[l] buffer
-    // (offsets qdim_l and qdim_l+kvdim). Host-known offsets here are legal (NOT
-    // captured args).
-    const size_t rowbytes = static_cast<size_t>(kvdim) * sizeof(float);
-    for (int64_t l = 0; l < nlayers; ++l) {
-      const float* base = qkvg[static_cast<size_t>(l)].data();
-      const int64_t qd = lc[static_cast<size_t>(l)].qdim;
-      b.Copy(q, cache_k[static_cast<size_t>(l)].data() + kv_rows * kvdim, base + qd, rowbytes);
-      b.Copy(q, cache_v[static_cast<size_t>(l)].data() + kv_rows * kvdim, base + qd + kvdim,
-             rowbytes);
-    }
+    // LEVER A: the per-layer K/V append is now IN-GRAPH (append_kv_row writes the new row
+    // at the device-read slot *len_buf inside RunChain), so the old between-replay host
+    // Copy loop (2×nlayers launches/step) is gone — only the row count advances here.
     kv_rows++;
     b.Synchronize(q);  // the ONE step-boundary drain: logits ready, appends complete
     return logits;

@@ -80,6 +80,40 @@ __global__ void RopeFromCacheKernel(float* x, const float* cache, int64_t heads,
   xv[half + i] = x1 * c + x0 * s;
 }
 
+// ── Brick A2b GRAPH RoPE (capturable): row index from a DEVICE buffer ────────
+// Identical to RopeFromCacheKernel except pos = *pos_dev, read at REPLAY, so ONE
+// position-indexed cos/sin table (built once, rows [0,max_cap)) serves every replay —
+// no per-step host cos/sin rebuild. Row *pos_dev == the old single-row build for pos.
+__global__ void RopeFromCacheGKernel(float* x, const float* cache, int64_t heads, int64_t Dh,
+                                     int64_t rd, const int* pos_dev) {
+  const int64_t half = rd / 2;
+  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= heads * half) return;
+  const int64_t h = t / half, i = t % half;
+  const float* crow = cache + static_cast<int64_t>(*pos_dev) * rd;
+  const float c = crow[i];
+  const float s = crow[half + i];
+  float* xv = x + h * Dh;
+  const float x0 = xv[i];
+  const float x1 = xv[half + i];
+  xv[i] = x0 * c - x1 * s;
+  xv[half + i] = x1 * c + x0 * s;
+}
+
+// ── Brick A2b GRAPH KV-append (capturable): write the new token's K/V into the cache ──
+// cache_k/cache_v[*len_dev * kvdim + i] = knew/vnew[i], for i in [0,kvdim). One thread per
+// element. *len_dev is read at REPLAY (host refreshes outside capture); the slot varies
+// across replays but the POINTERS are fixed ⇒ capture-safe. Called AFTER the graph decode
+// attention consumed knew/vnew, so appending row *len_dev creates no intra-replay hazard.
+__global__ void AppendKvRowKernel(float* cache_k, float* cache_v, const float* knew,
+                                  const float* vnew, int64_t kvdim, const int* len_dev) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= kvdim) return;
+  const int64_t off = static_cast<int64_t>(*len_dev) * kvdim;
+  cache_k[off + i] = knew[i];
+  cache_v[off + i] = vnew[i];
+}
+
 // ── Brick B: one-pass GQA-broadcast flash decode attention ──────────────────
 // Dh is fixed at 128 for Laguna → 32 lanes × kLagEpl=4 head-dim elems/lane. Keys are
 // staged into shared memory kLagTile at a time (each DRAM K/V row read ONCE) and the
@@ -653,6 +687,16 @@ void RopeFromCacheLaunch(Queue& q, float* x, const float* cache, int64_t heads, 
   RopeFromCacheKernel<<<Blocks(heads * (rd / 2)), kTPB, 0, AsStream(q)>>>(x, cache, heads, Dh, rd,
                                                                           pos);
 }
+void RopeFromCacheGLaunch(Queue& q, float* x, const float* cache, int64_t heads, int64_t Dh,
+                          int64_t rd, const int* pos_dev) {
+  RopeFromCacheGKernel<<<Blocks(heads * (rd / 2)), kTPB, 0, AsStream(q)>>>(x, cache, heads, Dh, rd,
+                                                                           pos_dev);
+}
+void AppendKvRowLaunch(Queue& q, float* cache_k, float* cache_v, const float* knew,
+                       const float* vnew, int64_t kvdim, const int* len_dev) {
+  AppendKvRowKernel<<<Blocks(kvdim), kTPB, 0, AsStream(q)>>>(cache_k, cache_v, knew, vnew, kvdim,
+                                                             len_dev);
+}
 void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                          int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group, int64_t kv_rows,
                          int64_t q_pos, int64_t first_pos, int64_t window, float scale) {
@@ -738,7 +782,8 @@ void LmHeadGemvLaunch(Queue& q, float* out, const void* w_bf16, const float* x, 
 const LagunaDeviceKernels kLaguna = {&RmsNormSeqLaunch,    &RopeFromCacheLaunch,
                                      &DecodeAttnGqaLaunch, &SoftplusHeadGateLaunch,
                                      &SigmoidTopKLaunch,   &DecodeAttnGqaGLaunch,
-                                     &LmHeadGemvLaunch};
+                                     &LmHeadGemvLaunch,    &AppendKvRowLaunch,
+                                     &RopeFromCacheGLaunch};
 
 struct Registrar {
   Registrar() {
