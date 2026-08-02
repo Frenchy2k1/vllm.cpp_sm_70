@@ -22,5 +22,4 @@
 
 # --- KNOWN OFF-FRAMEWORK: private resident/graph decode, pending framework-routing ---
 laguna        # LagunaModel::ForwardDevice is a HOST stub (returns HostLogits); resident/graph decode fully off-framework (private f32-host-vector KV, bespoke DecodeAttnGqaKernel, host RoPE, host logit download) -> pending framework-routing (see AGENTS.md decode/runtime seam)
-deepseek_v4   # DeepseekV4Model::ForwardDevice returns host logits (out.host) on the GGUF keep-quant resident decode; not yet on the paged-bf16-KV/on-GPU-sampling runner path -> pending framework-routing (see AGENTS.md decode/runtime seam)
 qwen3_vl      # ForwardQwen3VLForConditionalGeneration returns HostLogits + private VLGenerateCore host ArgMax loop (MM-ENGINE-FORWARD partial seam) bypasses the runner -> pending framework-routing (see AGENTS.md decode/runtime seam)

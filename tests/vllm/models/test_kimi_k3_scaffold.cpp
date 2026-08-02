@@ -128,7 +128,12 @@ TEST_CASE("kimi-k3 scaffold: KimiK3ForConditionalGeneration RESOLVES via registr
   CHECK(reg.architecture == "KimiK3ForConditionalGeneration");
   CHECK(reg.info.is_text_generation_model);
   CHECK(reg.info.is_hybrid);          // 69 KDA linear-attn layers
-  CHECK(reg.info.has_inner_state);
+  // The OUTER ConditionalGeneration wrapper mirrors the Qwen3.5 hybrid-mm sibling
+  // convention: IsHybrid YES, HasInnerState NO — the recurrent/conv state belongs to
+  // the inner KimiLinearForCausalLM. Corrected in the registry by 4d1be010, which
+  // updated test_model_registry but missed this assertion (the CPU Test step has been
+  // unreachable since the Brick 12 build break, so nothing caught the drift).
+  CHECK_FALSE(reg.info.has_inner_state);
   CHECK(reg.info.supports_multimodal);  // MoonViT-V2 vision
 }
 

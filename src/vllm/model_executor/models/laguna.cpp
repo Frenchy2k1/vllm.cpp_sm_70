@@ -334,6 +334,15 @@ std::vector<float> LagunaMoeResidentFp4(vt::Queue& q, const LagunaMoeWeights& mo
 //    layout for a simple first landing). Gated OFF by default (VT_LAGUNA_MARLIN_MOE=1
 //    opt-in) until the DGX near-tie + ncu gate lands — so the current default GEMV
 //    path is unchanged. CUDA-only (VT_MARLIN_NVFP4). ──────────────────────────────
+// The Marlin-repacked resident MoE state + its repack/build helpers are GENUINELY
+// device-coupled: the types and repack entry points they name exist only in the CUDA leg
+// (src/vt/cuda), so a CPU build cannot compile the block at all. REPAIR OWED: hoist this
+// behind the OpProvider seam (a `kLagunaMoeMarlin` op resolved at runtime) the way
+// laguna_device.cpp already resolves the kLaguna glue table, so the shared model TU stops
+// carrying a build-time device branch. Deferred: it restructures the resident MoE path and
+// needs the GB10 Laguna re-gate. Same class as the 26 pre-existing VT_MARLIN_NVFP4 sites
+// in qwen3_5.cpp that make up the DSR baseline.
+// DSR-ALLOW(S1): Marlin resident MoE state/helpers, CUDA-leg types; repair owed above.
 #ifdef VT_MARLIN_NVFP4
 namespace {
 // Resident Marlin-repacked routed experts. Mirror MoeMarlinResident (qwen3_5.cpp), incl.
@@ -1005,6 +1014,9 @@ std::vector<float> LagunaFfnBlock(vt::Queue& q, const LagunaLayerWeights& lw,
       // wins EAGER on Laguna's fast-kernel profile (ds4's slow-glue precedent may not
       // transfer). VT_LAGUNA_RESIDENT_MOE=0 forces the per-expert path for an A/B.
       const char* dis = std::getenv("VT_LAGUNA_RESIDENT_MOE");
+      // Dispatch branch onto the Marlin resident MoE above; carries an `else` fallback to
+      // the per-expert path, so only the BRANCH is build-gated. Same repair owed.
+      // DSR-ALLOW(S1): Marlin resident MoE dispatch branch (has an else fallback).
 #ifdef VT_MARLIN_NVFP4
       if (LagunaMarlinMoeEnabled()) {
         // N5 campaign-B: route the routed experts through vLLM's 18.8 Marlin W4A16
@@ -1128,6 +1140,11 @@ std::vector<float> LagunaFinalLogits(vt::Queue& q, const LagunaWeights& weights,
 // External linkage (declared in laguna.h); the anon-namespace helpers it calls stay
 // visible here via the anonymous namespace's implicit using-directive.
 void LagunaBuildMarlinResidents(vt::Queue& q, const LagunaWeights& w) {
+  // Body of the Marlin resident BUILD entry point — device-coupled for the same reason as
+  // the struct above (CUDA-leg repack types). Note it ALREADY asks the runtime device
+  // question on the next line (`q.device.type == kCPU`); the build-time gate exists only
+  // because the enclosed types will not compile without CUDA. Same repair owed.
+  // DSR-ALLOW(S1): Marlin resident build entry point, CUDA-leg repack types.
 #ifdef VT_MARLIN_NVFP4
   if (q.device.type == vt::DeviceType::kCPU || !LagunaMarlinMoeEnabled()) return;
   vt::Backend& bk = vt::GetBackend(q.device.type);
@@ -1720,6 +1737,10 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       GemmBf16Into(fdn.data(), lw.mlp.down_proj, dact.data(), H, dense_I);
       AddInto(hidden.data(), fdn.data());
     } else {
+      // Reads the fused router|shared_gate|shared_up weight that laguna_weights.cpp only
+      // STACKS under the same build gate, so this branch must match it. Retires together
+      // with that one when the concat moves to a runtime device question.
+      // DSR-ALLOW(S1): pairs with the laguna_weights.cpp fused-projection gate.
 #ifdef VT_MARLIN_NVFP4
       // LEVER 2 — fused router|shared_gate|shared_up projection (ONE GEMV): all
       // three read the SAME post-attn `hn`. Slice: [0,E)=router logits ->
@@ -1764,6 +1785,11 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
   return LagunaFinalLogits(q, weights, hidden, 1, logits_indices);
 }
 
+// The decode CUDA-GRAPH capture class is irreducibly device-coupled at build time —
+// graph capture/replay is a CUDA driver concept with no portable vt op today. REPAIR
+// OWED: a portable `vt` capture/replay seam (the same one deepseek_v4.cpp's V4Graph would
+// move behind), after which both graphs leave the shared layer together.
+// DSR-ALLOW(S1): decode CUDA-graph capture class; no portable vt capture seam yet.
 #ifdef VT_MARLIN_NVFP4
 namespace {
 // ─── Brick A2: the DECODE CUDA GRAPH (mirror of deepseek_v4.cpp V4Graph) ──────────
@@ -2189,6 +2215,7 @@ std::vector<float> LagunaForwardGgufCached(const LagunaWeights& weights, vt::Que
   // N5 device-resident T=1 decode fast path (VT_LAGUNA_RESIDENT_DECODE, default OFF).
   if (LagunaCanRunResidentDecode(p, q, weights, T) && logits_indices.size() == 1 &&
       logits_indices[0] == 0) {
+    // DSR-ALLOW(S1): decode CUDA-graph dispatch; retires with the capture class above.
 #ifdef VT_MARLIN_NVFP4
     // Brick A2 (VT_LAGUNA_DECODE_GRAPH=1): after prefill (cache.len>0), drive the
     // resident step through a captured CUDA graph — one cudaGraphLaunch/step. The

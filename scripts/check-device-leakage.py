@@ -145,6 +145,19 @@ ALLOWLIST: dict[str, dict[str, tuple[object, str]]] = {
                      "resolvers so they become device-parameterized lookups "
                      "(`GetOp(op, runner.device.type)`) instead of hardcoding kCUDA."),
     },
+    "src/vllm/model_executor/models/laguna_device.cpp": {
+        "kcuda": (2, "the Laguna CUDA device-forward RESOLVER TU — the SAME shape as "
+                     "deepseek_v4_device.cpp above: 1 `GetOp` + 1 `OpRegistered` "
+                     "lookup fetching the `kLaguna` glue table that cuda_laguna.cu "
+                     "registers on kCUDA, for the resident decode path. The TU is "
+                     "always compiled and holds NO CUDA code; on a CPU-only build "
+                     "nothing is registered for `(kLaguna, kCUDA)`, so "
+                     "`LagunaDeviceKernelsAvailable()` returns false and the host "
+                     "compose path runs. FOLLOW-UP (deferred, shares the DeepSeek-V4 "
+                     "row above and needs the same GB10 re-gate): thread the runner "
+                     "`DeviceType` through both resolvers so they become "
+                     "`GetOp(op, runner.device.type)` instead of hardcoding kCUDA."),
+    },
 }
 
 

@@ -113,10 +113,12 @@ class DriftModelTests(unittest.TestCase):
         )
 
     def test_known_off_framework_are_host(self) -> None:
-        # The 3 off-framework models the audit found must classify HOST (so the
-        # allowlist is load-bearing, not decorative).
+        # The off-framework models the audit found must classify HOST (so the
+        # allowlist is load-bearing, not decorative). deepseek_v4 was the third; it
+        # was ROUTED on-framework (device-resident logits on the registry forward)
+        # and its allowlist entry retired, so it is asserted DEVICE below instead.
         scanned = mod.scan_registrations(mod.MODELS_DIR, mod.INCLUDE_DIR)
-        for name in ("laguna", "deepseek_v4", "qwen3_vl"):
+        for name in ("laguna", "qwen3_vl"):
             self.assertIn(name, scanned)
             self.assertEqual(scanned[name].classification, "HOST", name)
         # Qwen3-VL additionally ships the private *GenerateCore host loop (inv. b).
@@ -124,6 +126,42 @@ class DriftModelTests(unittest.TestCase):
         # A clean model that keeps a *GenerateCore example helper (qwen3_5) is NOT
         # flagged — DEVICE classification means it never enters the (b) gate.
         self.assertEqual(scanned["qwen3_5_moe"].classification, "DEVICE")
+
+    def test_private_device_wrapper_classifies_device(self) -> None:
+        # REGRESSION (the hole this closed): a model whose ForwardDevice builds its
+        # device carrier in its OWN ForwardLogits helper rather than the shared
+        # WrapDeviceLogits matched NEITHER seam and classified NONE. NONE is not an
+        # error state, so the model dropped out of the drift check and the gate went
+        # green while silently exempting it. deepseek_v4 (WrapV4DeviceLogits) is the
+        # tree's live case.
+        scanned = mod.scan_registrations(mod.MODELS_DIR, mod.INCLUDE_DIR)
+        self.assertEqual(scanned["deepseek_v4"].classification, "DEVICE")
+        # No registered model may sit in the silently-exempt NONE bucket at all.
+        self.assertEqual(
+            sorted(n for n, r in scanned.items() if r.classification == "NONE"), []
+        )
+
+    def test_helper_hop_resolves_both_ways(self) -> None:
+        # Mutation on synthetic text: the one-level hop must LIFT a private DEVICE
+        # wrapper to DEVICE, and must NOT launder a HOST wrapper into DEVICE.
+        body = "{ return WrapMine(std::move(flat)); }"
+        self.assertEqual(mod.classify_body(body), "NONE")  # RED without the hop
+        device_text = (
+            "static ForwardLogits WrapMine(std::vector<float>&& f) {\n"
+            "  ForwardLogits fl;\n"
+            "  fl.device_tensor = vt::Tensor::Contiguous(f.data());\n"
+            "  return fl;\n"
+            "}\n"
+        )
+        self.assertEqual(mod.classify_with_helpers(body, device_text), "DEVICE")
+        host_text = (
+            "static ForwardLogits WrapMine(std::vector<float>&& f) {\n"
+            "  ForwardLogits fl;\n"
+            "  fl.host = std::move(f);\n"
+            "  return fl;\n"
+            "}\n"
+        )
+        self.assertEqual(mod.classify_with_helpers(body, host_text), "HOST")
 
     def test_refuse_stub_is_skipped_on_tree(self) -> None:
         # kimi_k3's ForwardDevice is VT_CHECK(false); it must be REFUSE, not HOST.

@@ -11091,5 +11091,18 @@ bound on the decode win, and reload-noisy on the GB10 unified pool): graph ON
 18.73 s vs OFF 19.57 s average (~4.3% faster, ON < OFF on both runs). A clean
 steady-state per-step / nsys decode tok/s (eager vs graphed) is OWED.
 
+<!-- ci-gate repair (2026-08-02) -->
+- CI-gate repair (CPU build leg + runner-routing/DSR checkers): **NO speed claim, no
+  benchmark run.** No kernel, model, weight-loading or forward path changed. The only
+  edits under `src/` are COMMENTS (the `DSR-ALLOW(S1)` markers); everything else is test
+  and CI-checker code. Byte-exactness is untouched by construction, so no SACRED re-gate
+  applies (the 2 corrected assertions — `test_model_loader_gguf`'s arch string and
+  `test_kimi_k3_scaffold`'s `has_inner_state` — were both stale WRT already-shipped
+  registrations, so no shipped behavior moved to make them pass).
+  Verified: CPU-only build links + `test_cuda_quant_dot` 7/7, full `ctest` green,
+  and all 15 static gates pass on a clean worktree at `ca5c7adc`. The CUDA branch of the
+  guarded test was syntax-checked against a stubbed `cuda_runtime.h` (no CUDA toolkit on
+  the dev box); a real GB10 compile of that leg is OWED before relying on it.
+
 <!-- framework-routing (2026-08-02) -->
 - Laguna-XS-2.1-NVFP4 decode (GB10, vs vLLM 42.46 tok/s): split-K + w13-fusion → 35.3 tok/s (83.2%). Residual is GPU-kernel work inside the graph (measured). PENDING: full KV/attention framework port. Qwen3DenseDecodeGraph ~4.3% e2e (directional; rigorous per-step tok/s OWED). Qwen3VL/DS4 routing = framework-conformance (no speed claim); CUDA re-gate OWED.
