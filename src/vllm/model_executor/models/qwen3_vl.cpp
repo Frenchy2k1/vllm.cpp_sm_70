@@ -39,12 +39,14 @@ using namespace dense_attn;  // Dev, DBuf, ResidentWeight, ResidentWeightF32, Kv
 // One forward STEP of the forked VL decode: given the already-merged host bf16
 // embeddings [T*H], the 3-D MRoPE positions [3*T], the (possibly empty) DeepStack
 // [L*T*H], the step attention metadata, the persistent paged KV, and the bf16
-// cos|sin cache, return the LAST row's logits [vocab] (host f32). This is the seam
-// that lets VLGenerateCore be driven identically by (a) the standalone in-TU
-// forward (VLForwardLastLogits) and (b) the ENGINE registered forward
-// (ModelRegistry::Forward), so the two paths are numerically identical by
-// construction — the fold demanded by MM-ENGINE-FORWARD (no duplicated decode).
-using VLStepFn = std::function<std::vector<float>(
+// cos|sin cache, return the LAST row's logits [1, vocab] as a ForwardLogits
+// carrier — ON DEVICE by default (device_tensor; the runner/greedy loop samples
+// straight off device via vt::GreedyArgmax, no full-vocab D2H), or host on the
+// opt-out. RUNNER-ROUTE: the ONLY production step is the ENGINE registered forward
+// (MakeRegistryStep -> ModelRegistry::Forward -> ForwardQwen3VL), so every driver
+// (image/video/registry) enters through ModelRegistry::Forward and gets the same
+// on-device logits carrier the text models return (qwen3_dense.cpp WrapDeviceLogits).
+using VLStepFn = std::function<ForwardLogits(
     const std::vector<uint16_t>& inputs_embeds_bf16,
     const std::vector<int32_t>& positions3, int64_t num_tokens,
     const std::vector<uint16_t>& deepstack_bf16, const CommonAttentionMetadata& meta,
@@ -244,11 +246,30 @@ void VLRunLayer(Dev d, const Qwen3DenseLayerWeights& layer, const HfConfig& cfg,
   hidden = down->Apply(d, act.t(), DType::kBF16);
 }
 
+// Move a [rows, vocab] f32 DEVICE DBuf into a pool-returning ForwardLogits carrier
+// so the runner / greedy loop samples straight off device (the sampler's argmax /
+// temperature / top-k/p kernels run on-device — no per-step full-vocab D2H). The
+// pool block's lifetime moves into a shared_ptr whose deleter returns it to the
+// DevicePool (no per-step cudaMalloc/cudaFree). Byte-for-byte the qwen3.cpp /
+// qwen3_moe.cpp WrapDeviceLogits idiom (RUNNER-ROUTE: mirror the text device path).
+ForwardLogits WrapDeviceLogits(DBuf&& dlogits, int64_t rows, int64_t vocab) {
+  ForwardLogits fl;
+  fl.rows = rows;
+  fl.vocab = vocab;
+  fl.device_tensor = dlogits.t();
+  const size_t alloc = dlogits.alloc_bytes();
+  void* p = dlogits.Release();
+  fl.device_storage =
+      std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+  return fl;
+}
+
 // Full forked forward for ONE step. `inputs_embeds_bf16` [T*H] host bf16 bits are
 // the already-merged embeddings. `deepstack_bf16` (may be empty) is the [L*T*H]
 // host bf16 DeepStack tensor injected after layers 0/1/2. Returns the LAST row's
-// logits [vocab] host f32.
-std::vector<float> VLForwardLastLogits(
+// logits as an ON-DEVICE [1, vocab] f32 DBuf (NO host Download) — the device-
+// resident forward core shared by the host + on-device logits wrappers.
+DBuf VLForwardLastLogitsDBuf(
     Dev d, const std::vector<uint16_t>& inputs_embeds_bf16,
     const std::vector<int32_t>& positions3_host, int64_t T,
     const std::vector<uint16_t>& deepstack_bf16, int64_t L,
@@ -308,8 +329,22 @@ std::vector<float> VLForwardLastLogits(
   Tensor lm = ResidentWeight(d, weights.embed_tokens, {vocab, H});
   DBuf logits(d, DType::kF32, {1, vocab});
   vt::MatmulBT(d.q, logits.t(), last.t(), lm);
+  return logits;
+}
 
-  std::vector<float> out(static_cast<size_t>(vocab));
+// Host wrapper over the device core (VT_LOGITS_GATHER=0-style opt-out + the
+// exposed host public API): run the forward, then Download the [vocab] f32 row.
+std::vector<float> VLForwardLastLogits(
+    Dev d, const std::vector<uint16_t>& inputs_embeds_bf16,
+    const std::vector<int32_t>& positions3_host, int64_t T,
+    const std::vector<uint16_t>& deepstack_bf16, int64_t L,
+    const Tensor& cos_sin_cache, const CommonAttentionMetadata& meta,
+    const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
+    const HfConfig& config, const vt::RopeArgs& rope) {
+  DBuf logits = VLForwardLastLogitsDBuf(d, inputs_embeds_bf16, positions3_host, T,
+                                        deepstack_bf16, L, cos_sin_cache, meta,
+                                        attn_kv, weights, config, rope);
+  std::vector<float> out(static_cast<size_t>(config.vocab_size));
   logits.Download(d, out.data());
   return out;
 }
@@ -338,6 +373,23 @@ int64_t ArgMax(const std::vector<float>& logits) {
   for (int64_t v = 1; v < static_cast<int64_t>(logits.size()); ++v)
     if (logits[static_cast<size_t>(v)] > logits[static_cast<size_t>(am)]) am = v;
   return am;
+}
+
+// Greedy token from a step's ForwardLogits. On the DEVICE path (default) reduce
+// the [1, vocab] f32 logits with vt::GreedyArgmax (LOWEST-index tie-break ==
+// torch.argmax, the exact winner the old host scan produced) and Download only the
+// winning int64 — instead of the full-vocab (~600 KiB) f32 D2H + a host scan.
+// This is the on-GPU greedy sampler the text runner uses (runner.cpp:1185-1186 ->
+// sampler.cpp GreedyArgmax). Host path (opt-out) falls back to the host scan.
+int32_t VLArgMaxFromForward(Dev d, const ForwardLogits& fl) {
+  if (fl.on_device()) {
+    DBuf ids(d, DType::kI64, {1});
+    vt::GreedyArgmax(d.q, ids.t(), fl.device_tensor);
+    int64_t id = 0;
+    ids.Download(d, &id);
+    return static_cast<int32_t>(id);
+  }
+  return static_cast<int32_t>(ArgMax(fl.host));
 }
 
 }  // namespace
@@ -473,14 +525,20 @@ std::vector<int32_t> VLGenerateCore(
   std::vector<uint16_t> ds_bits = F32ToBf16Bits(ds_f32.data(), L * T0 * H);
 
   const CommonAttentionMetadata pm = StepMeta(T0, T0, 0);
-  std::vector<float> logits =
+  ForwardLogits logits =
       step(merged_bits, pos_prefill, T0, ds_bits, pm, attn_kv, cos_sin.tensor);
 
   std::vector<int32_t> generated;
-  int32_t next = static_cast<int32_t>(ArgMax(logits));
+  int32_t next = VLArgMaxFromForward(d, logits);
   generated.push_back(next);
 
   // ---- DECODE: single token per step, MRoPE decode position, no deepstack ----
+  // The greedy token is picked on-device from the step's device logits carrier
+  // (VLArgMaxFromForward -> vt::GreedyArgmax), so the only per-step D2H is the
+  // winning int64 — the full-vocab logit round-trip is GONE. The one remaining
+  // host round-trip is the per-token embed Download below (the mm-forward contract
+  // still carries HOST merged embeds via MultiModalForwardInput; a device-embeds
+  // seam is the scoped RUNNER-ROUTE residual).
   const std::vector<uint16_t> no_ds;
   for (int dstep = 1; dstep < max_new_tokens; ++dstep) {
     if (next == eos_token_id) break;
@@ -500,23 +558,50 @@ std::vector<int32_t> VLGenerateCore(
     const int64_t seq_len = abs_idx + 1;
     const CommonAttentionMetadata dm = StepMeta(1, seq_len, abs_idx);
     logits = step(tok_emb, pos1, 1, no_ds, dm, attn_kv, cos_sin.tensor);
-    next = static_cast<int32_t>(ArgMax(logits));
+    next = VLArgMaxFromForward(d, logits);
     generated.push_back(next);
   }
   return generated;
 }
 
-// The STANDALONE step: call the in-TU forked forward directly (the M2c gate path).
-VLStepFn MakeStandaloneStep(Dev d, const Qwen3DenseWeights& weights_text,
-                            const HfConfig& config, const vt::RopeArgs& rope,
-                            int64_t L) {
-  return [d, &weights_text, &config, &rope, L](
+// The PRODUCTION step: pack the already-merged embeddings / 3-D MRoPE positions /
+// DeepStack into ModelForwardInput.mm and drive ModelRegistry::Forward, which
+// dispatches to the registered ForwardQwen3VL → the SHARED
+// Qwen3VLForwardStepLastLogitsDevice. `gather_logits=true` requests ON-DEVICE
+// logits (the sampler-on-device carrier), consumed by VLArgMaxFromForward. This is
+// the ONE step every driver (image / video / registry) runs — so the Qwen3-VL
+// decode enters through ModelRegistry::Forward exactly like the text models, no
+// off-framework standalone forward (RUNNER-ROUTE).
+VLStepFn MakeRegistryStep(LoadedModel& model, const HfConfig& config,
+                          vt::Queue& queue, int64_t deepstack_levels) {
+  return [&model, &config, &queue, deepstack_levels](
              const std::vector<uint16_t>& embeds, const std::vector<int32_t>& pos3,
              int64_t T, const std::vector<uint16_t>& ds,
              const CommonAttentionMetadata& meta, std::vector<PagedKvCache>& attn_kv,
-             const Tensor& cos_sin) -> std::vector<float> {
-    return VLForwardLastLogits(d, embeds, pos3, T, ds, L, cos_sin, meta, attn_kv,
-                               weights_text, config, rope);
+             const Tensor& /*cos_sin (the model owns an identical cache)*/)
+             -> ForwardLogits {
+    const std::vector<int32_t> no_tokens;
+    const std::vector<int32_t> no_pos;
+    std::vector<GdnStateCache> no_gdn_state;
+    v1::GDNAttentionMetadata gdn_meta{};
+    const std::vector<int32_t> gather_li = {static_cast<int32_t>(T - 1)};
+    const MultiModalForwardInput mm{&embeds, &pos3, &ds, deepstack_levels};
+    ModelForwardInput in{
+        .token_ids = no_tokens,
+        .positions = no_pos,
+        .attn_meta = meta,
+        .gdn_meta = gdn_meta,
+        .attn_kv = attn_kv,
+        .gdn_state = no_gdn_state,
+        .config = config,
+        .queue = queue,
+        .logits_indices = gather_li,
+        .num_reqs = meta.num_reqs,
+        .pure_decode = false,
+        .gather_logits = true,
+        .mm = mm,
+    };
+    return ModelRegistry::Forward(model, in);
   };
 }
 
@@ -559,6 +644,23 @@ std::vector<float> Qwen3VLForwardStepLastLogits(
                              meta, attn_kv, weights_text, config, rope);
 }
 
+ForwardLogits Qwen3VLForwardStepLastLogitsDevice(
+    vt::Queue& queue, const Qwen3DenseWeights& weights_text, const HfConfig& config,
+    const std::vector<uint16_t>& inputs_embeds_bf16,
+    const std::vector<int32_t>& positions3, int64_t num_tokens,
+    const std::vector<uint16_t>& deepstack_bf16, int64_t deepstack_levels,
+    const vt::Tensor& cos_sin_cache_bf16, const v1::CommonAttentionMetadata& meta,
+    const std::vector<PagedKvCache>& attn_kv) {
+  Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const vt::RopeArgs rope = MropeArgs(config);
+  DBuf logits = VLForwardLastLogitsDBuf(
+      d, inputs_embeds_bf16, positions3, num_tokens, deepstack_bf16,
+      deepstack_levels, cos_sin_cache_bf16, meta, attn_kv, weights_text, config,
+      rope);
+  return WrapDeviceLogits(std::move(logits), /*rows=*/1, config.vocab_size);
+}
+
 std::vector<int32_t> Qwen3VLGenerateGreedy(
     const std::vector<int32_t>& prompt_ids, const std::vector<float>& mm_main,
     const std::vector<float>& mm_deepstack, int64_t num_deepstack_levels,
@@ -569,7 +671,6 @@ std::vector<int32_t> Qwen3VLGenerateGreedy(
   Dev d{backend, queue};
   const int64_t H = config.hidden_size;
   const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
-  const vt::RopeArgs rope = MropeArgs(config);
 
   // Image span offset + visual mask.
   int64_t offset = -1;
@@ -592,8 +693,11 @@ std::vector<int32_t> Qwen3VLGenerateGreedy(
   std::vector<int32_t> pos_prefill =
       multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, /*spatial_merge_size=*/2, &delta);
 
+  // RUNNER-ROUTE: every decode step enters through ModelRegistry::Forward on a
+  // borrowed (non-owning) registered Qwen3-VL LoadedModel — no standalone forward.
+  std::unique_ptr<LoadedModel> model = BorrowQwen3VLLoadedModel(weights);
   const VLStepFn step =
-      MakeStandaloneStep(d, weights.text, config, rope, num_deepstack_levels);
+      MakeRegistryStep(*model, config, queue, num_deepstack_levels);
   return VLGenerateCore(d, prompt_ids, mm_main, mm_deepstack, num_deepstack_levels,
                         mask, pos_prefill, delta, eos_token_id, weights.text, config,
                         max_new_tokens, step);
@@ -610,7 +714,6 @@ std::vector<int32_t> Qwen3VLGenerateGreedyVideo(
   Dev d{backend, queue};
   const int64_t H = config.hidden_size;
   const int64_t T0 = static_cast<int64_t>(prompt_ids.size());
-  const vt::RopeArgs rope = MropeArgs(config);
 
   // Video merge mask (all video_token_id positions across all frames).
   int64_t n_vid = 0;
@@ -631,8 +734,12 @@ std::vector<int32_t> Qwen3VLGenerateGreedyVideo(
       prompt_ids, grid_thw, /*spatial_merge_size=*/2, vision_start_token_id,
       video_token_id, vision_end_token_id, &delta);
 
+  // RUNNER-ROUTE: drive every decode step through ModelRegistry::Forward (see
+  // Qwen3VLGenerateGreedy) — the image and video drivers share the same
+  // registered mm-forward path, differing only in mask / MRoPE construction.
+  std::unique_ptr<LoadedModel> model = BorrowQwen3VLLoadedModel(weights);
   const VLStepFn step =
-      MakeStandaloneStep(d, weights.text, config, rope, num_deepstack_levels);
+      MakeRegistryStep(*model, config, queue, num_deepstack_levels);
   return VLGenerateCore(d, prompt_ids, mm_main, mm_deepstack, num_deepstack_levels,
                         mask, pos_prefill, delta, eos_token_id, weights.text, config,
                         max_new_tokens, step);
@@ -669,45 +776,13 @@ std::vector<int32_t> Qwen3VLGenerateGreedyViaRegistry(
   std::vector<int32_t> pos_prefill =
       multimodal::Qwen3VLGetRopeIndex(prompt_ids, spans, /*spatial_merge_size=*/2, &delta);
 
-  // The REGISTERED step: pack the already-merged embeddings / 3-D MRoPE positions /
-  // DeepStack into ModelForwardInput.mm and drive ModelRegistry::Forward, which
-  // dispatches to the registered ForwardQwen3VL → the SAME
-  // Qwen3VLForwardStepLastLogits the standalone driver runs. Token-identical to
-  // Qwen3VLGenerateGreedy by construction (the ENGINE registered mm-forward path).
+  // The REGISTERED step (shared by all three drivers): drive ModelRegistry::Forward
+  // with ModelForwardInput.mm carrying the merged embeddings / 3-D MRoPE positions /
+  // DeepStack, which dispatches to the registered ForwardQwen3VL → the SHARED
+  // Qwen3VLForwardStepLastLogitsDevice. Returns ON-DEVICE logits (the sampler-on-
+  // device carrier), consumed by VLGenerateCore's on-GPU VLArgMaxFromForward.
   const VLStepFn step =
-      [&model, &config, &queue, num_deepstack_levels](
-          const std::vector<uint16_t>& embeds, const std::vector<int32_t>& pos3,
-          int64_t T, const std::vector<uint16_t>& ds,
-          const CommonAttentionMetadata& meta, std::vector<PagedKvCache>& attn_kv,
-          const Tensor& /*cos_sin (model owns an identical cache)*/)
-          -> std::vector<float> {
-    const std::vector<int32_t> no_tokens;
-    const std::vector<int32_t> no_pos;
-    std::vector<GdnStateCache> no_gdn_state;
-    v1::GDNAttentionMetadata gdn_meta{};
-    const std::vector<int32_t> gather_li = {static_cast<int32_t>(T - 1)};
-    const MultiModalForwardInput mm{&embeds, &pos3, &ds, num_deepstack_levels};
-    ModelForwardInput in{
-        .token_ids = no_tokens,
-        .positions = no_pos,
-        .attn_meta = meta,
-        .gdn_meta = gdn_meta,
-        .attn_kv = attn_kv,
-        .gdn_state = no_gdn_state,
-        .config = config,
-        .queue = queue,
-        .logits_indices = gather_li,
-        .num_reqs = meta.num_reqs,
-        .pure_decode = false,
-        .gather_logits = false,
-        .mm = mm,
-    };
-    ForwardLogits fl = ModelRegistry::Forward(model, in);
-    VT_CHECK(!fl.host.empty(),
-             "qwen3-vl registered forward returned no host logits");
-    return std::move(fl.host);
-  };
-
+      MakeRegistryStep(model, config, queue, num_deepstack_levels);
   return VLGenerateCore(d, prompt_ids, mm_main, mm_deepstack, num_deepstack_levels,
                         mask, pos_prefill, delta, eos_token_id, weights.text, config,
                         max_new_tokens, step);

@@ -119,12 +119,21 @@ ForwardLogits ForwardQwen3VLForConditionalGeneration(
            "handle on ModelForwardInput.mm");
   const int64_t num_tokens = static_cast<int64_t>(mm.positions3->size()) / 3;
   const Qwen3VLCosSinCache& cos_sin = vl.CosSinCache(input.queue, input.config);
+  // DEVICE-resident logits (sampler-on-device) on the gather path — the mm forward
+  // produces exactly the single last-token [1, vocab] row, kept ON DEVICE so the
+  // greedy driver / runner samples it straight off device (vt::GreedyArgmax) with
+  // no full-vocab D2H. Mirrors the text device path (qwen3_dense.cpp:86). The host
+  // path (gather_logits=false) reproduces the old download-then-sample A/B.
+  if (input.gather_logits) {
+    return Qwen3VLForwardStepLastLogitsDevice(
+        input.queue, vl.weights().text, input.config, *mm.inputs_embeds_bf16,
+        *mm.positions3, num_tokens, *mm.deepstack_bf16, mm.deepstack_levels,
+        cos_sin.tensor, input.attn_meta, input.attn_kv);
+  }
   std::vector<float> logits = Qwen3VLForwardStepLastLogits(
       input.queue, vl.weights().text, input.config, *mm.inputs_embeds_bf16,
       *mm.positions3, num_tokens, *mm.deepstack_bf16, mm.deepstack_levels,
       cos_sin.tensor, input.attn_meta, input.attn_kv);
-  // Last-row [vocab] host logits → rows=1 ForwardLogits (the greedy driver argmaxes
-  // the single row; the runner mm-path samples it exactly like a decode step).
   return HostLogits(std::move(logits), input.config.vocab_size);
 }
 
