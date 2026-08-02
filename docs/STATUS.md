@@ -1836,7 +1836,20 @@ The protocol is in [`.agents/gates.md`](../.agents/gates.md) and
 [`.agents/benchmark-protocol.md`](../.agents/benchmark-protocol.md). A CI check
 (`scripts/check-fusion-consistency.py`) additionally keeps model forwards routing
 their fusable add+RMSNorm glue through the portable fusion catalog rather than
-hand-fusing it. **The Gemma family (Gemma-1/2/3) was MIGRATED off the drift
+hand-fusing it. A sibling CI check
+(`scripts/check-runner-routing-consistency.py`, wired into the same `agent-record`
+job, 2026-08-02) enforces the THIRD "MUST route through" seam — the decode/runtime
+path: every `REGISTER_VLLM_MODEL` must return device-resident logits
+(`ForwardLogits.on_device()==true`, off the on-GPU sampler) on the default
+`gather_logits` path and not ship a private `*GenerateCore` host loop off the
+runner. It resolves the `.forward` hook through its `SomeModel::ForwardDevice`
+delegate and `using`-aliases (so a HOST-stub `ForwardDevice` is caught while a
+`VT_CHECK(false)` refuse stub is skipped), classifies all 27 registrations green
+(23 device-resident, 3 off-framework on `scripts/runner-routing-allowlist.txt` —
+`laguna`/`deepseek_v4`/`qwen3_vl`, 1 refuse stub skipped), and would fail a NEW model
+returning `HostLogits` without an allowlist entry. Removing an allowlist entry after
+the model routes through the runner (device-resident logits) is the gate closing.
+**The Gemma family (Gemma-1/2/3) was MIGRATED off the drift
 allowlist 2026-07-30 (Tier-B2 of the cross-arch fold plan):** their
 residual-carrying gemma-(1+w) input/pre-ffn/final norms now route through
 `vt::FusedChain(kFusedAddRmsNorm)` behind `FusedChainAdoptEnabled()` (byte-exact
