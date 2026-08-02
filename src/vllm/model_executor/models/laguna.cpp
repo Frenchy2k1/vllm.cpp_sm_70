@@ -1537,6 +1537,22 @@ inline bool LagunaGlueFusedEnabled() {
   return on;
 }
 
+// ── LEVER A: fold the MoE routed-add into the trailing add_rms_norm (VT_LAGUNA_MOE_ADDNORM_FUSED,
+// default ON). Under the glue-fused decode a MoE layer runs its residual update + next-layer
+// input norm as TWO graph nodes — vt::Add(hidden,doutb) [routed AddKernel] then
+// FusedChain(kFusedAddRmsNormStd)(hn,so,next_norm,hidden) [shared add + RMSNorm]. This lever
+// collapses them into ONE fused_add2_rmsnorm node/MoE-layer (hidden=(hidden+doutb)+so;
+// hn=rms_norm(hidden)*next_norm). BYTE-EXACT (IEEE add commutes + identical 256-thread norm
+// reduction) — a same-binary A/B: =0 restores the split Add+FusedChain. inline so a CPU build
+// does not -Wunused.
+inline bool LagunaMoeAddNormFusedEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_MOE_ADDNORM_FUSED");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
 // ── On-device greedy sample + embed on the resident decode graph (VT_LAGUNA_ONDEV_SAMPLE).
 // Removes the per-step host round-trip: the driver used to Synchronize the graph, download
 // the whole [vocab] logits, argmax them on the HOST, then gather the next token's embedding
@@ -2039,6 +2055,7 @@ struct LagunaGraph {
       vt::Add(q, at, at, DevT(b, H));
     };
     const bool glue_fused = LagunaGlueFusedEnabled();
+    const bool moe_addnorm_fused = LagunaMoeAddNormFusedEnabled();  // LEVER A
     // VT_LAGUNA_ONDEV_SAMPLE: gather THIS step's input embedding ON-DEVICE from argmax_id
     // (seeded by Step, or the previous replay's argmax) into the persistent hidden buffer —
     // the in-graph replacement for the host embed loop in Step. Byte-identical widen (the
@@ -2145,10 +2162,18 @@ struct LagunaGraph {
                                     topk, doutb.data());
         SiluMul(dact.data(), sgp, sup, moe_I);
         GemmBf16(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
-        AddInto(hidden.data(), doutb.data());  // hidden += routed (always a plain add)
-        // hidden += shared, folded with the next layer's input (or final) RMSNorm.
-        if (glue_fused) FusedAddNorm(hn.data(), so.data(), next_norm, hidden.data());
-        else AddInto(hidden.data(), so.data());
+        // LEVER A: hidden += routed + shared; hn = rms_norm(hidden)*next_norm in ONE node
+        // (byte-exact vs AddInto(doutb) + FusedAddNorm(so)). Only in the glue-fused regime
+        // (the split path is what it replaces); =0 restores the two-node split.
+        if (glue_fused && moe_addnorm_fused) {
+          LAG->fused_add2_rmsnorm(q, hn.data(), hidden.data(), doutb.data(), so.data(), next_norm,
+                                  H, eps);
+        } else {
+          AddInto(hidden.data(), doutb.data());  // hidden += routed (always a plain add)
+          // hidden += shared, folded with the next layer's input (or final) RMSNorm.
+          if (glue_fused) FusedAddNorm(hn.data(), so.data(), next_norm, hidden.data());
+          else AddInto(hidden.data(), so.data());
+        }
       }
     }
     // final RMSNorm + lm_head INSIDE the captured region (device), into persistent

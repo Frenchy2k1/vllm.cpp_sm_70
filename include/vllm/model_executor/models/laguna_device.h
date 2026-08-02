@@ -113,6 +113,14 @@ struct LagunaDeviceKernels {
   // no host work on step N's logits (removes the ~527 us between-step host round-trip).
   void (*embed_gather)(vt::Queue&, float* out, const void* table, bool is_bf16, const int64_t* tok,
                        int64_t H);
+  // LEVER A (VT_LAGUNA_MOE_ADDNORM_FUSED): fused MoE residual double-add + STANDARD
+  // RMSNorm. residual[H] = (residual + x1) + x2 (f32), out[H] = rms_norm(residual)*w.
+  // BYTE-EXACT one-node replacement for the split vt::Add(residual,x1) [routed add] +
+  // FusedChain(kFusedAddRmsNormStd)(out,x2,w,residual) [shared add + norm] in the MoE
+  // glue-fused tail: IEEE add is commutative so (residual+x1)+x2 == x2+(residual+x1),
+  // and the norm uses the identical 256-thread shared-tree reduction. Non-gemma.
+  void (*fused_add2_rmsnorm)(vt::Queue&, float* out, float* residual, const float* x1,
+                             const float* x2, const float* w, int64_t h, float eps);
 };
 
 // Resolver (throws on a CPU-only build where nothing registered for kLaguna,kCUDA).
