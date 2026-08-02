@@ -324,6 +324,39 @@ yet is a CONSCIOUS, reviewable allowlist entry with a reason + its fold-plan tie
 silent landing; removing the entry after the fold (byte-exact + token-exact/near-tie gated)
 is the enforcement gate closing.
 
+**ROUTE decode through the shared RUNTIME/decode framework — do NOT hand-roll a
+private decode driver (the THIRD "MUST route through" seam, alongside fusion +
+merged-GEMM).** A new model's decode MUST enter the production `ModelRunner`
+(`ModelRegistry::Forward`) and reuse the shared decode stack: the attention preamble
+`dense_attn::AttnBlock` (paged **bf16** KV sized from the spec dtype
+`v1::ResolveKvCacheDType()`, `vt::ReshapeAndCache`, the shared FA2 split-KV /
+`vt::PagedAttention` kernel — NOT a private `std::vector<float>` KV + a bespoke attention
+kernel); **bf16-resident activations** (`DBuf`s, not an f32 host residual stream with a
+`CastBf16` before every projection); **on-GPU sampling** (`ForwardLogits.on_device()` with
+a device logits carrier — NO host `logits.Download`/argmax on the default `gather_logits`
+path); the shared **MoE resident builders** (`BuildMoeMarlinResident` fused-w13, not a
+hand-rolled split-w13); a **device-resident RoPE cache** (not a host cos/sin rebuild per
+step); and a `*DenseDecodeGraph`-style capture (in-graph KV write via `slot_mapping`, not
+a host between-replay `Copy` loop). The forward's ARCH is arch-scoped (hand-write the op
+sequence like vLLM's model files); the decode DRIVER is SHARED — a model **expresses its
+layout** (attention config, KV spec dtype, MoE structure, quant arm) and **inherits the
+parity-enablers for free**: "born on the runner", the sibling of "born fused". A model
+that hand-rolls a private resident/graph decode driver off the runner is **drift**: it
+inherits none of the enablers and forces per-model rediscovery — the **Laguna
+anti-pattern** (its resident/graph decode went fully off-framework: private f32 host-vector
+KV, bespoke `DecodeAttnGqaKernel`, per-GEMM `CastBf16`, host RoPE rebuild, host
+logit download — costing a multi-cycle lever hunt to recover what `AttnBlock`/the runner
+provide by default; **Qwen3VL** `VLGenerateCore` + host `ArgMax` and the GGUF
+**DeepSeek-V4** resident decode are the same escape). Enforce with a **born-on-the-runner
+CI guard** (a `scripts/check-*-consistency.py`-shape invariant over every
+`REGISTER_VLLM_MODEL`: (a) decode enters ONLY via `ModelRegistry::Forward` — no private
+generate/argmax loop; (b) the default `gather_logits=true` forward returns
+`ForwardLogits.on_device()==true` — no `HostLogits`/`logits.Download` on the production
+path). Decode-CUDA-graph coverage is a **tracker/report**, NOT a red-build gate — small
+bf16 dense models are legitimately eager (they hit vLLM parity without a graph). The audit
+that established this (only Laguna/DeepSeek-V4/Qwen3VL off-framework of 24 models) is a
+named follow-up spec.
+
 **TRACE THE EXECUTION, not just the code — nsys BOTH vLLM and ours before any perf
 comparison.** Reading source finds the DISPATCH LOGIC + the AVAILABLE kernels; it does
 NOT tell you what ACTUALLY RAN, because vLLM's real kernels are resolved at RUNTIME and
