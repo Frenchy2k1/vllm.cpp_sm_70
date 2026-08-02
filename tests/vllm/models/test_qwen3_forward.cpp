@@ -169,6 +169,62 @@ TEST_CASE("qwen3 dense forward: CPU synthetic runs, finite, deterministic") {
   CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
 }
 
+// Qwen3DenseDecodeGraph::Step EAGER-FALLBACK == Qwen3DenseModel::Forward. The
+// shared pure-dense decode CUDA-graph driver (qwen3.cpp) that the five dense
+// registrations pick up. Its CUDA capture/replay is dgx-only, but on CPU
+// support_static_graph_mode() is false, so Step() takes the eager ForwardBody
+// fallback — which MUST be bit-identical to Qwen3DenseModel::Forward for the same
+// pure-decode step. This exercises the new class end-to-end on CI (its
+// construction, BuildPaddedDecodeAttn at S==B, and the eager-fallback wiring +
+// device-logits carrier), catching any wiring regression without a GPU.
+TEST_CASE("qwen3 dense decode-graph: CPU eager-fallback Step == Forward (pure decode)") {
+  setenv("VT_FUSED_CHAIN_ADOPT", "1", 1);
+  const HfConfig c = TinyConfig();
+  const Qwen3DenseWeights w = TinyWeights(c);
+  vt::Queue q = Q();
+
+  // A single-token PURE-DECODE step (num_actual_tokens == num_reqs == 1) against a
+  // one-block cache. Two independent, identically zero-initialised caches so the
+  // Forward and Step KV writes never alias.
+  const int64_t block_size = 8;
+  const std::vector<int32_t> tokens = {42};
+  const std::vector<int32_t> positions = {3};  // some decode position within block 0
+  CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = 1;
+  am.query_start_loc = {0, 1};
+  am.query_start_loc_cpu = am.query_start_loc;
+  am.seq_lens = {4};  // context length 4 (positions 0..3)
+  am.seq_lens_cpu = am.seq_lens;
+  am.max_query_len = 1;
+  am.max_seq_len = 4;
+  am.block_table_num_cols = 1;
+  am.block_table_tensor = {0};
+  am.slot_mapping = {3};
+  am.causal = true;
+
+  CachePool pool_fwd(c, /*num_blocks=*/2, block_size);
+  CachePool pool_step(c, /*num_blocks=*/2, block_size);
+
+  const std::vector<float> fwd = vllm::Qwen3DenseModel::Forward(
+      tokens, positions, am, pool_fwd.attn_kv, w, c, q);
+  REQUIRE(fwd.size() == static_cast<size_t>(c.vocab_size));
+
+  vllm::Qwen3DenseDecodeGraph graph(w, c, q, /*max_num_reqs=*/8);
+  const vllm::ForwardLogits step = graph.Step(tokens, positions, am, pool_step.attn_kv);
+  // CPU: the graph is disabled, so Step returns the eager fallback's device-resident
+  // [1, vocab] logits (device == host on the CPU backend, directly readable).
+  REQUIRE(step.rows == 1);
+  REQUIRE(step.vocab == c.vocab_size);
+  REQUIRE(step.on_device());
+  const auto* sp = static_cast<const float*>(step.device_tensor.data);
+  REQUIRE(sp != nullptr);
+
+  // Bit-identical: Step's eager fallback runs the exact same op sequence as Forward.
+  CHECK(std::memcmp(fwd.data(), sp, fwd.size() * sizeof(float)) == 0);
+  CHECK_FALSE(graph.captured());  // no capture on CPU
+}
+
 // --- NVFP4 W4A16 synthetic forward (the QUANT-SCHEME additivity doctest) -----
 // ADDITIVE-QUANT W3 for Qwen3-32B-NVFP4A16 (`Qwen3ForCausalLM` +
 // compressed-tensors NVFP4A16). Builds the SAME tiny model twice — once with

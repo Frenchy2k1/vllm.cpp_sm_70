@@ -46,9 +46,13 @@ class MistralLoadedModel final : public LoadedModel {
       : LoadedModel(registration), weights_(std::move(weights)) {}
 
   const MistralWeights& weights() const { return weights_; }
+  // W7: the shared pure-dense decode CUDA-graph driver state (MistralModel ==
+  // Qwen3DenseModel, so this is the SAME driver the Qwen3-dense path uses).
+  std::unique_ptr<Qwen3DenseDecodeGraph>& decode_graph() { return decode_graph_; }
 
  private:
   MistralWeights weights_;
+  std::unique_ptr<Qwen3DenseDecodeGraph> decode_graph_;
 };
 
 std::unique_ptr<LoadedModel> LoadMistralForCausalLM(
@@ -75,8 +79,12 @@ void PrepareMistralForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardMistralForCausalLM(LoadedModel& model,
                                         const ModelForwardInput& input) {
-  const auto& mistral = static_cast<MistralLoadedModel&>(model);
+  auto& mistral = static_cast<MistralLoadedModel&>(model);
   const MistralWeights& weights = mistral.weights();
+  // Shared pure-dense decode CUDA-graph (opt-in via VLLM_CPP_QWEN3_DENSE_DECODE_
+  // GRAPH); std::nullopt falls through to the byte-identical eager path below.
+  if (auto fl = DenseDecodeGraphForward(mistral.decode_graph(), weights, input))
+    return std::move(*fl);
   // DEVICE-resident logits (sampler-on-device) on the gather path; HOST logits on
   // the opt-out. Mistral is pure full-attention (input.gdn_* unused).
   if (input.gather_logits) {

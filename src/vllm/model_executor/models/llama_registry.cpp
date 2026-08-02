@@ -58,9 +58,13 @@ class LlamaLoadedModel final : public LoadedModel {
       : LoadedModel(registration), weights_(std::move(weights)) {}
 
   const LlamaWeights& weights() const { return weights_; }
+  // W7: the shared pure-dense decode CUDA-graph driver state (LlamaModel ==
+  // Qwen3DenseModel, so this is the SAME driver the Qwen3-dense path uses).
+  std::unique_ptr<Qwen3DenseDecodeGraph>& decode_graph() { return decode_graph_; }
 
  private:
   LlamaWeights weights_;
+  std::unique_ptr<Qwen3DenseDecodeGraph> decode_graph_;
 };
 
 std::unique_ptr<LoadedModel> LoadLlamaForCausalLM(
@@ -87,8 +91,12 @@ void PrepareLlamaForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardLlamaForCausalLM(LoadedModel& model,
                                       const ModelForwardInput& input) {
-  const auto& llama = static_cast<LlamaLoadedModel&>(model);
+  auto& llama = static_cast<LlamaLoadedModel&>(model);
   const LlamaWeights& weights = llama.weights();
+  // Shared pure-dense decode CUDA-graph (opt-in via VLLM_CPP_QWEN3_DENSE_DECODE_
+  // GRAPH); std::nullopt falls through to the byte-identical eager path below.
+  if (auto fl = DenseDecodeGraphForward(llama.decode_graph(), weights, input))
+    return std::move(*fl);
   // DEVICE-resident logits (sampler-on-device) on the gather path; HOST logits on
   // the opt-out. Llama is pure full-attention (input.gdn_* unused).
   if (input.gather_logits) {
