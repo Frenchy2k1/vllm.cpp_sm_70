@@ -62,6 +62,41 @@ __global__ void RmsNormSeqKernel(float* out, const float* x, const float* w, int
     orow[i] = xr[i] * inv * (has_w ? w[i] : 1.0f);
 }
 
+// ── LEVER A: fused MoE residual double-add + STANDARD RMSNorm (one node vs two). ──
+// The MoE glue-fused tail folds its TWO residual contributions (routed doutb + shared
+// so) plus the following input/final RMSNorm into ONE kernel — the byte-exact
+// replacement for the split
+//   vt::Add(residual, x1)              [AddKernel: residual += x1]
+//   FusedChain(kFusedAddRmsNormStd)    [RmsNormRowKernel: residual += x2; out=rms_norm(residual)*w]
+// residual = (residual + x1) + x2 in f32; IEEE add is COMMUTATIVE so this equals the
+// split path's x2 + (residual + x1) bit-for-bit (Store<f32>/ResRound<f32> are identity),
+// then the SAME 256-thread shared-tree Σx² + 1/sqrtf(ss/n+eps) reduction and
+// out=v*inv*w (non-gemma) as RmsNormRowKernel/RmsNormSeqKernel. One graph node/layer
+// fewer. rows=1 (T=1 decode).
+__global__ void AddAdd2RmsNormStdKernel(float* out, float* residual, const float* x1,
+                                        const float* x2, const float* w, int64_t n, float eps) {
+  const int64_t r = static_cast<int64_t>(blockIdx.x);  // T=1: r == 0
+  float* rr = residual + r * n;
+  float* orow = out + r * n;
+  const float* x1r = x1 + r * n;
+  const float* x2r = x2 + r * n;
+  float local = 0.0f;
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+    const float v = (rr[i] + x1r[i]) + x2r[i];  // == split path's (hidden+doutb)+so, f32
+    rr[i] = v;
+    local += v * v;
+  }
+  __shared__ float sh[256];
+  sh[threadIdx.x] = local;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(sh[0] / static_cast<float>(n) + eps);
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) orow[i] = rr[i] * inv * w[i];
+}
+
 // ── partial-NeoX RoPE from a half-split [rope_rows,rd] cache (bit-exact to ApplyRope) ──
 // One thread per (head, i<rd/2): c=cache[pos*rd+i], s=cache[pos*rd+half+i].
 __global__ void RopeFromCacheKernel(float* x, const float* cache, int64_t heads, int64_t Dh,
@@ -733,6 +768,12 @@ void RmsNormSeqLaunch(Queue& q, float* out, const float* x, const float* w, int6
   RmsNormSeqKernel<<<static_cast<unsigned>(rows), 256, 0, AsStream(q)>>>(out, x, w, rows, n, eps,
                                                                          has_w);
 }
+void AddAdd2RmsNormStdLaunch(Queue& q, float* out, float* residual, const float* x1,
+                             const float* x2, const float* w, int64_t n, float eps) {
+  // one block (T=1 row); 256 threads (matches the __shared__ sh[256] reduction and
+  // RmsNormRowKernel's kBlock=256 order — byte-exact norm).
+  AddAdd2RmsNormStdKernel<<<1, 256, 0, AsStream(q)>>>(out, residual, x1, x2, w, n, eps);
+}
 void RopeFromCacheLaunch(Queue& q, float* x, const float* cache, int64_t heads, int64_t Dh,
                          int64_t rd, int64_t pos) {
   RopeFromCacheKernel<<<Blocks(heads * (rd / 2)), kTPB, 0, AsStream(q)>>>(x, cache, heads, Dh, rd,
@@ -842,7 +883,8 @@ const LagunaDeviceKernels kLaguna = {&RmsNormSeqLaunch,    &RopeFromCacheLaunch,
                                      &DecodeAttnGqaLaunch, &SoftplusHeadGateLaunch,
                                      &SigmoidTopKLaunch,   &DecodeAttnGqaGLaunch,
                                      &LmHeadGemvLaunch,    &AppendKvRowLaunch,
-                                     &RopeFromCacheGLaunch, &EmbedGatherLaunch};
+                                     &RopeFromCacheGLaunch, &EmbedGatherLaunch,
+                                     &AddAdd2RmsNormStdLaunch};
 
 struct Registrar {
   Registrar() {
