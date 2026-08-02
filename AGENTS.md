@@ -347,15 +347,22 @@ anti-pattern** (its resident/graph decode went fully off-framework: private f32 
 KV, bespoke `DecodeAttnGqaKernel`, per-GEMM `CastBf16`, host RoPE rebuild, host
 logit download — costing a multi-cycle lever hunt to recover what `AttnBlock`/the runner
 provide by default; **Qwen3VL** `VLGenerateCore` + host `ArgMax` and the GGUF
-**DeepSeek-V4** resident decode are the same escape). Enforce with a **born-on-the-runner
-CI guard** (a `scripts/check-*-consistency.py`-shape invariant over every
-`REGISTER_VLLM_MODEL`: (a) decode enters ONLY via `ModelRegistry::Forward` — no private
-generate/argmax loop; (b) the default `gather_logits=true` forward returns
-`ForwardLogits.on_device()==true` — no `HostLogits`/`logits.Download` on the production
-path). Decode-CUDA-graph coverage is a **tracker/report**, NOT a red-build gate — small
-bf16 dense models are legitimately eager (they hit vLLM parity without a graph). The audit
-that established this (only Laguna/DeepSeek-V4/Qwen3VL off-framework of 24 models) is a
-named follow-up spec.
+**DeepSeek-V4** resident decode are the same escape). Enforced by the **born-on-the-runner
+CI guard** `scripts/check-runner-routing-consistency.py` (the sibling of
+check-fusion-consistency.py, wired into the same `agent-record` CI job): a
+`check-*-consistency.py`-shape invariant over every `REGISTER_VLLM_MODEL` that (a) the
+default `gather_logits=true` forward returns `ForwardLogits.on_device()==true` — no
+`HostLogits`/`logits.Download` off the on-GPU sampler on the production path (it follows the
+`.forward` hook through its `SomeModel::ForwardDevice` delegate + `using`-aliases, so a
+HOST-stub ForwardDevice is caught and a REFUSE-by-name stub is skipped); (b) the model does
+not ALSO ship a private `*GenerateCore` host generate/argmax loop as its real decode path.
+A model that legitimately cannot route yet is a CONSCIOUS allowlist entry with a reason on
+`scripts/runner-routing-allowlist.txt` (the 3 off-framework models keep the gate green;
+removing an entry after the model returns device-resident logits is the gate closing) —
+never a silent landing. Decode-CUDA-graph coverage is a **tracker/report**, NOT a
+red-build gate — small bf16 dense models are legitimately eager (they hit vLLM parity
+without a graph). The audit that established this (only Laguna/DeepSeek-V4/Qwen3VL
+off-framework of 24 models) is a named follow-up spec.
 
 **TRACE THE EXECUTION, not just the code — nsys BOTH vLLM and ours before any perf
 comparison.** Reading source finds the DISPATCH LOGIC + the AVAILABLE kernels; it does

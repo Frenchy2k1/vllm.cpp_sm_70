@@ -1,0 +1,26 @@
+# Runner-routing allowlist — registered models whose decode is OFF-FRAMEWORK: it
+# does NOT enter the production runner returning a device-resident ForwardLogits
+# (on_device()==true) on the default gather_logits path, but instead returns HOST
+# logits off the on-GPU sampler (and, for Qwen3-VL, drives generation through a
+# private *GenerateCore host greedy-argmax loop that bypasses the runner). Accepted
+# as a KNOWN, TRACKED state so scripts/check-runner-routing-consistency.py stays
+# green while preventing a NEW off-runner model from landing silently.
+#
+# This is the THIRD "MUST route through, not re-implement" seam (alongside the glue
+# vt::FusedChain catalog + the merged-GEMM MlpGateUpMethodBase family — see
+# scripts/fusion-consistency-allowlist.txt / merged-gemm-consistency-allowlist.txt).
+# The decode/runtime seam is documented in AGENTS.md ("ROUTE decode through the
+# shared RUNTIME/decode framework", the born-on-the-runner CI guard).
+#
+# Each entry is a model name (the registry stem minus _registry, i.e.
+# src/vllm/model_executor/models/<name>_registry.cpp or <name>.cpp). Removing a name
+# here (after its production forward routes through ModelRegistry::Forward returning
+# ForwardLogits.on_device()==true — WrapDeviceLogits / ViewDeviceLogits on the
+# gather_logits path, byte-exact / token-exact-or-near-tie gated) is the enforcement
+# gate closing. The audit that scoped this (only these 3 off-framework of 24 models)
+# is the born-on-the-runner follow-up spec.
+
+# --- KNOWN OFF-FRAMEWORK: private resident/graph decode, pending framework-routing ---
+laguna        # LagunaModel::ForwardDevice is a HOST stub (returns HostLogits); resident/graph decode fully off-framework (private f32-host-vector KV, bespoke DecodeAttnGqaKernel, host RoPE, host logit download) -> pending framework-routing (see AGENTS.md decode/runtime seam)
+deepseek_v4   # DeepseekV4Model::ForwardDevice returns host logits (out.host) on the GGUF keep-quant resident decode; not yet on the paged-bf16-KV/on-GPU-sampling runner path -> pending framework-routing (see AGENTS.md decode/runtime seam)
+qwen3_vl      # ForwardQwen3VLForConditionalGeneration returns HostLogits + private VLGenerateCore host ArgMax loop (MM-ENGINE-FORWARD partial seam) bypasses the runner -> pending framework-routing (see AGENTS.md decode/runtime seam)
