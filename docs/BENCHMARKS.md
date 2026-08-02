@@ -82,6 +82,19 @@ Marlin-default decode is ~10 tok/s (0.10 s/tok) vs vLLM-NVFP4 18.8 (~1.9×). To 
 
 **The decode is HOST-SYNC-bound: ~432 `cudaStreamSynchronize` + ~188 `cudaMemcpyAsync` per token, and ZERO malloc/free** (the 72k allocs are identical in both runs → entirely the load-time Marlin repack; the `DBuf` pool already recycles). ~432 syncs = ~9 per-GEMM drains × 48 layers + per-layer activation host↔device round-trips. NOT kernels (the Marlin MoE is vLLM's OWN kernel, compute at parity), NOT malloc. Per AGENTS.md §396 the 1.9× is a specific closable diff, not a ceiling. **Byte-exact lever (confirmed + sized): device-resident decode** (keep the activation on-GPU across all 48 layers → kills the 188 memcpy/token) **+ decode CUDA-graph** (collapse the 432 syncs/token → 1, exactly vLLM's mechanism). No correctness relaxation — it changes only where buffers live, gated on the golden ids staying identical. Executable plan: `.agents/specs/laguna-device-resident-decode.md`. Same "Brick D" class as DeepSeek device-resident decode (task #228).
 
+## Laguna decode KV+attention → shared-framework port, bf16-KV slice: WASH + near-tie break (2026-08-02, `CLAIM-LAGUNA-KV-ATTN-BF16`)
+
+Ported Laguna's private off-framework decode KV/attention toward vLLM parity via the **tractable slice**: convert the per-layer **f32** KV (`LagunaKvCache::k_dev/v_dev`, `LagunaGraph::cache_k/cache_v`) to **bf16** (vLLM's own paged-KV dtype), halving the DRAM bytes the memory-bound `DecodeAttnGqa*` decode kernels stream — inside Laguna's own kernels, SACRED 27B/35B path byte-untouched. (Full `AttnBlock` port OWED: the shared FA2 pure-decode `LaunchDecodeFA2Bf16` THROWS on `window_size.has_value()` and has no post-attn gate hook, so routing Laguna needs per-layer sliding-window + a softplus-head-gate epilogue grown additively — large + SACRED-risky.)
+
+Built clean on GB10 sm_121a (incremental, **7 TUs, 0 warnings**). DGX-gated on `~/laguna-xs-nvfp4`, token-ids `2,785,9626,377,15360,395`, `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_DECODE_GRAPH=1` (the ~35 tok/s decode-graph path), max-tokens 128, 2 runs each:
+
+| path | first-20 prefix vs vLLM golden | decode/step (best of 2) |
+|---|---|---|
+| **base f32 KV** | **MATCH** (`22345 83 268 33586 81 855 397 874 367 6376 815 340 9626 377 15360 83 1729 756 1205 565`) | 3.84s / 127 = **33.1 tok/s** |
+| **bf16 KV** | **BREAK** — diverges at token 2 (`…83 22345 395 6885…` vs golden `…83 268 33586…`) | 3.93s / 127 = **32.3 tok/s** |
+
+**WASH on speed** (bf16 3.93s vs base 3.84s; spreads base 3.84–4.03 / bf16 3.93–4.07 overlap → indistinguishable) — did NOT move the residual. At the XS gate's short context (~130 tok) the decode-attention KV read is a small share of decode time; `lm_head_gemv` (streams the ~600 MB tower) + Marlin MoE dominate — so this **confirms the ~17%-to-vLLM-42.46 residual is GEMV/MoE, not KV/attention traffic**, at this context. **Near-tie BREAK on correctness**: bf16 output is coherent (re-emits the golden prefix from ~token 14) but flips the step-2 argmax 268→22345 — our device regime is not bit-identical to vLLM, so a near-tie flips even when moving TOWARD vLLM's bf16 dtype (vLLM itself uses bf16 KV yet emits 268). Two strikes → **NOT landed**; default stays f32 KV (base prefix + ~33 tok/s re-verified after DGX restore). Tested diff + analysis: `.agents/specs/laguna-kv-attn-port-2026-08-02.md`.
+
 ## DeepSeek-V4-Flash — decode nsys attribution: 13.0 tok/s, Q8_0 GEMV is 53.5% (2026-08-01, `CLAIM-DSV4-DECODE-NSYS`)
 
 Re-measured the GGUF decode from scratch (`deepseek-v4-gen --gpu --kv-cache`, `ds4flash.gguf` = `IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8`, GB10, tmux drop-proof capture). **Decode = 13.0 tok/s** (0.076 s/step, dead-consistent over 23 steps) vs **ds4 16.5 → 79% of ds4, ~1.27× behind.** The prior-recorded **8.0 baseline is STALE** (device-resident decode + tuned glue landed since; superseded). Prefill 0.47s, PEAK RESIDENT 86.3 GiB.
