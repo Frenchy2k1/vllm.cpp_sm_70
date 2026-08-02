@@ -382,6 +382,11 @@ struct LagunaKvCache {
   // CUDA-only LagunaGraph type; the deleter (set in laguna.cpp) frees it. Mirror of
   // DeepseekV4KvCache::decode_graph (deepseek_v4.h:359).
   std::shared_ptr<void> decode_graph;
+  // On-device greedy sample result (VT_LAGUNA_ONDEV_SAMPLE): the decode graph argmaxes
+  // its logits ON-DEVICE and leaves the winning token id here (>=0) so the driver never
+  // downloads the full vocab for a host argmax. -1 when off / not a graphed decode step
+  // (prefill + host-argmax fallback), so the caller host-argmaxes the returned logits.
+  int32_t last_sampled = -1;
   void Reset(int64_t num_layers, int64_t hd, int64_t hkv) {
     k.assign(static_cast<size_t>(num_layers), {});
     v.assign(static_cast<size_t>(num_layers), {});
@@ -396,6 +401,7 @@ struct LagunaKvCache {
     max_cap = 0;
     resident_ready = false;
     decode_graph.reset();
+    last_sampled = -1;
   }
 };
 
