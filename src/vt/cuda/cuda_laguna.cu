@@ -663,6 +663,27 @@ __global__ void LmHeadGemvKernel(float* __restrict__ out, const __nv_bfloat16* _
   }
 }
 
+// ── Laguna decode embed-gather (VT_LAGUNA_ONDEV_SAMPLE) ──────────────────────
+// out[H] f32 = embed_table[*tok][0..H) — one output element per thread, the token id
+// read from a DEVICE buffer (tok[0]) so it is capture-safe INSIDE the decode graph
+// (fixed pointers, grid=ceil(H/TPB)). The bf16 table widens EXACTLY as the host
+// LagunaGraph::Step embed loop does (bits<<16 zero-pad ⇒ byte-identical f32); an f32
+// table is a plain copy. Replaces the between-replay HOST embed gather (+ the full-
+// vocab host argmax) so the graph replay for step N+1 launches with no host work on
+// step N's logits (the ~527 us GPU-idle step gap).
+__global__ void EmbedGatherKernel(float* __restrict__ out, const void* __restrict__ table,
+                                  int is_bf16, const int64_t* __restrict__ tok, int64_t H) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= H) return;
+  const int64_t id = tok[0];
+  if (is_bf16) {
+    const uint16_t* __restrict__ t = reinterpret_cast<const uint16_t*>(table) + id * H;
+    out[i] = __uint_as_float(static_cast<uint32_t>(t[i]) << 16);  // bf16→f32 (exact)
+  } else {
+    out[i] = reinterpret_cast<const float*>(table)[id * H + i];
+  }
+}
+
 // ── launchers (no sync — resident) ──
 constexpr int kTPB = 128;
 inline int Blocks(int64_t n) { return static_cast<int>((n + kTPB - 1) / kTPB); }
@@ -811,12 +832,17 @@ void LmHeadGemvLaunch(Queue& q, float* out, const void* w_bf16, const float* x, 
   LmHeadGemvKernel<<<grid, kLmHeadWarps * 32, 0, AsStream(q)>>>(
       out, reinterpret_cast<const __nv_bfloat16*>(w_bf16), x, N, K);
 }
+void EmbedGatherLaunch(Queue& q, float* out, const void* table, bool is_bf16, const int64_t* tok,
+                       int64_t H) {
+  // grid=ceil(H/kTPB), fixed pointers, reads tok[0] on-device ⇒ CUDA-graph capturable.
+  EmbedGatherKernel<<<Blocks(H), kTPB, 0, AsStream(q)>>>(out, table, is_bf16 ? 1 : 0, tok, H);
+}
 
 const LagunaDeviceKernels kLaguna = {&RmsNormSeqLaunch,    &RopeFromCacheLaunch,
                                      &DecodeAttnGqaLaunch, &SoftplusHeadGateLaunch,
                                      &SigmoidTopKLaunch,   &DecodeAttnGqaGLaunch,
                                      &LmHeadGemvLaunch,    &AppendKvRowLaunch,
-                                     &RopeFromCacheGLaunch};
+                                     &RopeFromCacheGLaunch, &EmbedGatherLaunch};
 
 struct Registrar {
   Registrar() {

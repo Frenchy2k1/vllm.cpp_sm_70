@@ -345,9 +345,16 @@ int main(int argc, char** argv) {
     const std::vector<float> logits =
         stateless ? vllm::LagunaForwardGguf(w, q, step_tokens, positions, logits_idx)
                   : vllm::LagunaForwardGgufCached(w, q, kv, step_tokens, positions, logits_idx);
+    // VT_LAGUNA_ONDEV_SAMPLE: the resident decode graph already argmaxed the logits ON-
+    // DEVICE and left the token in kv.last_sampled (>=0), so skip the host argmax over the
+    // (empty) logits. -1 on prefill / when the lever is off ⇒ host-argmax the returned row.
+    // NEXT-TOKEN SELECTION IS INSIDE THE TIMED STEP: the host argmax over the 100352-vocab
+    // is real per-step wall (it sits between two graph replays, GPU idle) — attributing it
+    // to the step is what makes the on-device-sample win visible in decode wall tok/s.
+    const int next = (!stateless && kv.last_sampled >= 0) ? kv.last_sampled
+                                                          : ArgmaxLastRow(logits, vocab);
     const auto s1 = std::chrono::steady_clock::now();
     const double step_s = std::chrono::duration<double>(s1 - s0).count();
-    const int next = ArgmaxLastRow(logits, vocab);
     if (step == 0) prefill_s = step_s; else decode_s += step_s;
     std::fprintf(stderr, "[gen] step %d (ctx=%zu): next=%d  %.2fs  (RSS %.1f GiB)\n",
                  step, tokens.size(), next, step_s, CurResidentGiB());
@@ -373,6 +380,8 @@ int main(int argc, char** argv) {
   std::printf("prompt_tokens=%zu gen_tokens=%zu\n", n_prompt, generated.size());
   std::printf("prefill: %.2fs  decode: %.2fs  TPOT %.2fs/tok over %d steps\n",
               prefill_s, decode_s, n_dec > 0 ? decode_s / n_dec : 0.0, n_dec);
+  std::printf("decode_hp: %.5fs steps=%d tok/s=%.4f\n", decode_s, n_dec,
+              (n_dec > 0 && decode_s > 0.0) ? n_dec / decode_s : 0.0);
   std::printf("PEAK RESIDENT: %.2f GiB\n", PeakResidentGiB());
   std::fflush(stdout);
   if (gpu_backend != nullptr) gpu_backend->DestroyQueue(q);

@@ -105,6 +105,14 @@ struct LagunaDeviceKernels {
   // ⇒ byte-identical. Fixed pointers ⇒ capture-safe.
   void (*rope_from_cache_g)(vt::Queue&, float* x, const float* cache, int64_t heads, int64_t Dh,
                             int64_t rd, const int* pos_dev);
+  // Decode embed-gather (VT_LAGUNA_ONDEV_SAMPLE): out[H] f32 = embed_table[*tok] with the
+  // token id read from a DEVICE buffer (tok[0]) so it is capture-safe INSIDE the decode
+  // graph. bf16 tables widen EXACTLY as LagunaGraph::Step's host embed loop (bits<<16),
+  // f32 tables copy — byte-identical to the host gather. Lets the graph produce the next
+  // step's input embedding on-device (paired with an on-device argmax) so replay N+1 needs
+  // no host work on step N's logits (removes the ~527 us between-step host round-trip).
+  void (*embed_gather)(vt::Queue&, float* out, const void* table, bool is_bf16, const int64_t* tok,
+                       int64_t H);
 };
 
 // Resolver (throws on a CPU-only build where nothing registered for kLaguna,kCUDA).
