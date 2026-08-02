@@ -15,6 +15,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
@@ -161,6 +163,79 @@ class Qwen3DenseModel {
       const HfConfig& config, vt::Queue& queue,
       const std::vector<int32_t>& logits_indices = {});
 };
+
+// SHARED pure-dense decode CUDA-graph driver — the sibling of Qwen3MoeDecodeGraph
+// (qwen3_moe.cpp) and Qwen3_5DenseDecodeGraph (qwen3_5.cpp), driving the SHARED
+// Qwen3DenseModel forward. Because `LlamaModel`/`MistralModel`/`InternLM2Model` are
+// type aliases of `Qwen3DenseModel` over `Qwen3DenseWeights`, ONE driver serves all
+// FIVE registrations (Qwen3ForCausalLM, LlamaForCausalLM, InternLM3ForCausalLM,
+// MistralForCausalLM, InternLM2ForCausalLM).
+//
+// Same cold -> warm -> capture -> replay state machine + same padded-batch capture
+// set (DecodeGraphSizes / PadToCaptureSize) as the siblings; the ATTENTION-ONLY
+// analogue (no GDN metadata — pure full-attention). Captures the pure-decode dense
+// forward once per PADDED batch size and replays it per token, removing the per-step
+// host launch tax (~hundreds of tiny kernel launches/step) the eager decode paid.
+// The embedding stays OUTSIDE the capture region (run per step into a persistent
+// hidden buffer); every per-call device scratch is pool-backed / resident (the
+// shared DevicePool + resident weights + the FA-2 varlen-decode per-shape scratch)
+// so a cold pre-warm makes the captured region do ZERO cudaMalloc. Bit-identical to
+// Qwen3DenseModel::Forward for the same inputs/caches (same op sequence: EmbedInto +
+// ForwardLayers). The d128 full-attention capture path is exactly the one the
+// already-shipped Qwen3MoeDecodeGraph (Qwen3-Coder) proves capture-safe.
+//
+// VLLM_CPP_CUDAGRAPH=0 (framework kill switch) disables capture; the per-family
+// opt-in env VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH gates whether the registry routes
+// here at all (see DenseDecodeGraphEnabled). The 27B/35B/Qwen3-Coder graphs are
+// separate drivers and are untouched.
+class Qwen3DenseDecodeGraph {
+ public:
+  // max_num_reqs == the runner's max_num_seqs (carried in ModelForwardInput::
+  // gdn_state_slots for every arch); the padded decode batch is capped at it so it
+  // never exceeds the captured size set (mirrors vLLM's decode cudagraph dispatch).
+  Qwen3DenseDecodeGraph(const Qwen3DenseWeights& weights, const HfConfig& config,
+                        vt::Queue queue, int64_t max_num_reqs);
+  ~Qwen3DenseDecodeGraph();
+  Qwen3DenseDecodeGraph(const Qwen3DenseDecodeGraph&) = delete;
+  Qwen3DenseDecodeGraph& operator=(const Qwen3DenseDecodeGraph&) = delete;
+
+  // One PURE-DECODE step. Returns the [B, vocab] f32 logits as a DEVICE-resident
+  // ForwardLogits (the captured graph's output stays on device — a view over the
+  // slot's persistent logits buffer; the eager fallback owns a pool block), fed
+  // straight to the sampler with NO full-logits D2H. Bit-identical to
+  // Qwen3DenseModel::Forward for the same inputs/caches. The caller must only route
+  // pure-decode batches here (all query_len==1, no prefill).
+  ForwardLogits Step(const std::vector<int32_t>& token_ids,
+                     const std::vector<int32_t>& positions,
+                     const v1::CommonAttentionMetadata& attn_meta,
+                     const std::vector<PagedKvCache>& attn_kv);
+
+  // Diagnostics (A/B + tests): is a graph currently captured, and how many replays
+  // have run since the last (re)capture.
+  bool captured() const;
+  int64_t replay_count() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+// Per-family opt-in for the shared dense decode CUDA-graph. Reads
+// VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH (DEFAULT OFF — the graph is a same-binary
+// opt-in until its per-model SACRED token-exact gate has been run on GB10; the
+// eager default path is then byte-identical to the pre-change forward), and honors
+// the framework kill switch VLLM_CPP_CUDAGRAPH=0. When false the dense factories'
+// forward is LITERALLY unchanged (never constructs or routes through a graph).
+bool DenseDecodeGraphEnabled();
+
+// SHARED routing helper used by all five dense factory forwards. When this step is
+// a graph-eligible pure decode (DenseDecodeGraphEnabled() && input.pure_decode &&
+// CUDA static-graph platform), lazily builds `graph` on the caller's LoadedModel
+// and returns the graphed [num_reqs, vocab] device logits; otherwise returns
+// std::nullopt so the caller runs its existing eager Forward/ForwardDevice path.
+std::optional<ForwardLogits> DenseDecodeGraphForward(
+    std::unique_ptr<Qwen3DenseDecodeGraph>& graph,
+    const Qwen3DenseWeights& weights, const ModelForwardInput& input);
 
 // Per-family config hook (mirrors ParseQwen3_5Config). LoadHfConfig already
 // materializes the consumed Qwen3 fields (num_key_value_heads, head_dim,

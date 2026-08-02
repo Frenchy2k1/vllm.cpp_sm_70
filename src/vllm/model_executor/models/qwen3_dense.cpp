@@ -49,9 +49,13 @@ class Qwen3DenseLoadedModel final : public LoadedModel {
       : LoadedModel(registration), weights_(std::move(weights)) {}
 
   const Qwen3DenseWeights& weights() const { return weights_; }
+  // W7: the model's shared pure-dense decode CUDA-graph driver state (held here so
+  // the graph outlives a single forward call).
+  std::unique_ptr<Qwen3DenseDecodeGraph>& decode_graph() { return decode_graph_; }
 
  private:
   Qwen3DenseWeights weights_;
+  std::unique_ptr<Qwen3DenseDecodeGraph> decode_graph_;
 };
 
 std::unique_ptr<LoadedModel> LoadQwen3ForCausalLM(
@@ -79,8 +83,14 @@ void PrepareQwen3ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardQwen3ForCausalLM(LoadedModel& model,
                                       const ModelForwardInput& input) {
-  const auto& qwen = static_cast<Qwen3DenseLoadedModel&>(model);
+  auto& qwen = static_cast<Qwen3DenseLoadedModel&>(model);
   const Qwen3DenseWeights& weights = qwen.weights();
+  // Shared pure-dense decode CUDA-graph (opt-in via VLLM_CPP_QWEN3_DENSE_DECODE_
+  // GRAPH): route a graph-eligible pure-decode CUDA step through the model's driver
+  // (pad-to-nearest capture set + replay), else fall through to the byte-identical
+  // eager path below. std::nullopt when the graph is disabled / not applicable.
+  if (auto fl = DenseDecodeGraphForward(qwen.decode_graph(), weights, input))
+    return std::move(*fl);
   // DEVICE-resident logits (sampler-on-device) on the gather path; HOST logits
   // on the opt-out. Qwen3 dense is pure full-attention (input.gdn_* unused).
   if (input.gather_logits) {

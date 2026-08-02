@@ -11006,3 +11006,47 @@ diagnostics outside this diff. The row remains
 `ANCHOR-BACKFILL`; W1-W5 in
 [the spec](../.agents/specs/c-api-library.md) name the remaining compatibility,
 no-throw, lifetime, and standalone-consumer gates.
+
+## Canonical record-owner repair (2026-07-31) - NOT APPLICABLE
+
+Six existing `DONE` matrix rows now point to reachable commits that introduced
+their binding closure states. This records-only metadata repair changes no
+lifecycle state, implementation, workload, or accepted benchmark result, so no
+new performance number is applicable or claimed.
+
+## CLI chat/complete contract spike (2026-08-01) - NOT APPLICABLE
+
+`SERVE-CLI-CHAT` W0 (`CLAIM-SERVE-CLI-CHAT-SPIKE`) is a records/spec-only
+checkpoint. No production, test, model, scheduler, memory, latency, or
+throughput path changed, so `benchmark_binding=false`. The pinned source proves
+that vLLM registers remote `chat` and `complete` commands in
+`entrypoints/cli/main.py:17-37,73-98` and defines their full client behavior in
+`entrypoints/cli/openai.py:30-100,155-312`; the local baseline remains the
+in-process-only `examples/cli/main.cpp:1-207`.
+
+Implementation is `PENDING`. The next reproduction is the W1/W2 CPU fake-server
+transcript suite in
+[the accepted spec](../.agents/specs/cli-chat-complete.md), followed by clean
+Release `-Werror` and sanitizer gates. No GPU or model is required.
+
+## Qwen3-dense shared decode CUDA-graph (2026-08-02) - TOKEN-EXACT PASS, tok/s OWED
+
+`Qwen3DenseDecodeGraph` (opt-in `VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH`) generalizes the
+decode CUDA-graph onto the SHARED `Qwen3DenseModel` forward — five registrations at
+once: `Qwen3ForCausalLM`, `LlamaForCausalLM`, `InternLM3ForCausalLM`,
+`MistralForCausalLM`, `InternLM2ForCausalLM`. It is the pure-dense sibling of the
+shipped `Qwen3MoeDecodeGraph` (same d128 full-attention capture path, minus the MoE
+scratch), so `benchmark_binding=true` on the correctness axis; the speed axis has a
+directional e2e number and a pending steady-state measurement.
+
+CORRECTNESS (dgx GB10, `test_qwen3_paged_engine` SACRED near-tie greedy gate vs the
+pinned vLLM 0.25.0 oracle), graph ON — BYTE-IDENTICAL to the eager (graph-OFF)
+baseline (identical strict/near-tie counts, max gap, and divergent position):
+  * Qwen3-0.6B: 16/16 PASS (10/16 strict + 6/16 near-tie, max gap 0.000 nats)
+  * Qwen3-4B:   16/16 PASS (11/16 strict + 5/16 near-tie, max gap 0.250 nats)
+  driver engaged: captured padded size S=1, 239 replays/checkpoint.
+
+SPEED: rough e2e A/B on the gate binary (load + prefill + short decode; a LOWER
+bound on the decode win, and reload-noisy on the GB10 unified pool): graph ON
+18.73 s vs OFF 19.57 s average (~4.3% faster, ON < OFF on both runs). A clean
+steady-state per-step / nsys decode tok/s (eager vs graphed) is OWED.
