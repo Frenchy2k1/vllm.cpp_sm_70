@@ -234,6 +234,80 @@ __global__ void RmsNormRowFastKernel(__nv_bfloat16* __restrict__ out,
   }
 }
 
+// f32-residual sibling of RmsNormRowFastKernel — BYTE-IDENTICAL to the shipped
+// RmsNormRowKernel<float,float,float> (residual!=null, f32 in/out/residual). The Laguna
+// NVFP4 decode's post-attn residual RMSNorm runs this shipped kernel as a <<<rows=1,256>>>
+// single block (ncu: launch__waves_per_multiprocessor≈0.00, sm__throughput≈0.06% — one SM
+// of ~100+, latency-bound). Same fix as the bf16 fast kernel: float4-vectorized memory
+// passes over kFastBlock(=1024) threads hide the per-block memory latency (decode launches
+// only `rows` blocks), while the variance REDUCTION reproduces the shipped kBlock(=256)
+// strided partials + tree over the SAME per-element squares in the SAME Σ_m ssq[i+256m]
+// order → bit-identical f32 variance. residual add is f32 x+res (ResRound<float> is
+// identity, shipped:75), inv = 1.0f/sqrtf (shipped:86), normalize out=res*inv*(w[+gemma])
+// element-independent — every bit matches shipped. Scope guard (h%4==0, 1024<=h<=kFastMaxH,
+// 16B-aligned) in TryLaunchRmsNormDecodeFastF32.
+__global__ void RmsNormRowFastF32Kernel(float* __restrict__ out, const float* __restrict__ x,
+                                        const float* __restrict__ w, float* __restrict__ residual,
+                                        int h, float eps, bool gemma) {
+  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * h;
+  const int vh = h >> 2;
+  const float4* xv = reinterpret_cast<const float4*>(x + base);
+  float4* rv = reinterpret_cast<float4*>(residual + base);
+  const float4* wv = reinterpret_cast<const float4*>(w);
+  float4* ov = reinterpret_cast<float4*>(out + base);
+  __shared__ float sv[kFastMaxH];     // residual VALUE v (not v²): the reduction squares with
+  __shared__ float partial[kBlock];   // shipped's `acc += v*v` expression so nvcc emits the
+                                      // SAME fma (f32 v² is NOT exact — pre-squaring the value
+                                      // rounds it and diverges by ≤1 ulp; the bf16 sibling can
+                                      // pre-square because a bf16² is exactly representable).
+
+  // Pass 1 — residual = x + res (f32, == shipped ResRound<float> identity), store residual + v.
+  for (int vi = tid; vi < vh; vi += kFastBlock) {
+    float4 t = xv[vi], r = rv[vi], nr;
+    nr.x = t.x + r.x;
+    nr.y = t.y + r.y;
+    nr.z = t.z + r.z;
+    nr.w = t.w + r.w;
+    rv[vi] = nr;
+    const int e = vi << 2;
+    sv[e] = nr.x;
+    sv[e + 1] = nr.y;
+    sv[e + 2] = nr.z;
+    sv[e + 3] = nr.w;
+  }
+  __syncthreads();
+  // Reduction — BYTE-FOR-BYTE shipped (cuda_ops.cu:80-86): thread t squares+accumulates
+  // v[t],v[t+256],… with the IDENTICAL `acc += v*v` expression (same nvcc fma). Threads >=256 idle.
+  if (tid < kBlock) {
+    float acc = 0.0f;
+    for (int j = tid; j < h; j += kBlock) acc += sv[j] * sv[j];
+    partial[tid] = acc;
+  }
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s >>= 1) {
+    if (tid < s) partial[tid] += partial[tid + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(h) + eps);
+  // Pass 2 — normalize (element-independent, bit-identical to shipped:87-92).
+  for (int vi = tid; vi < vh; vi += kFastBlock) {
+    float4 r = rv[vi], wr = wv[vi], o;
+    float w0 = wr.x, w1 = wr.y, w2 = wr.z, w3 = wr.w;
+    if (gemma) {
+      w0 += 1.0f;
+      w1 += 1.0f;
+      w2 += 1.0f;
+      w3 += 1.0f;
+    }
+    o.x = r.x * inv * w0;
+    o.y = r.y * inv * w1;
+    o.z = r.z * inv * w2;
+    o.w = r.w * inv * w3;
+    ov[vi] = o;
+  }
+}
+
 // Runtime predicate + launch for the decode-fast path. Returns true iff it ran.
 // Guard: bf16 in/out/weight/residual, 16-byte-aligned pointers (vectorized loads),
 // H%8==0, 1024<=H<=kFastMaxH (H>=1024 scopes to the big residual RMSNorm launches;
@@ -259,6 +333,30 @@ inline bool TryLaunchRmsNormDecodeFast(cudaStream_t s, Tensor& out, const Tensor
                                              w.Ptr<__nv_bfloat16>(),
                                              residual->Ptr<__nv_bfloat16>(),
                                              static_cast<int>(h), args.eps, args.gemma);
+  return true;
+}
+
+// f32-residual sibling of TryLaunchRmsNormDecodeFast. Same VT_RMSNORM_DECODE_FAST contract
+// (default ON, '0' = rollback), same bit-identity guarantee (RmsNormRowFastF32Kernel). Scope:
+// f32 in/out/weight AND a f32 residual (the add+RMSNorm decode launch — the Laguna NVFP4
+// post-attn residual norm), h%4==0, 1024<=h<=kFastMaxH, 16-byte-aligned. Every other case
+// keeps RmsNormRowKernel. float4 vectorization needs h%4==0 (vs the bf16 path's h%8==0).
+inline bool TryLaunchRmsNormDecodeFastF32(cudaStream_t s, Tensor& out, const Tensor& x,
+                                          const Tensor& w, const RmsNormArgs& args,
+                                          Tensor* residual, unsigned rows, int64_t h) {
+  if (!RmsNormDecodeFastFlagIsOn(std::getenv("VT_RMSNORM_DECODE_FAST"))) return false;
+  if (out.dtype != DType::kF32 || x.dtype != DType::kF32 || w.dtype != DType::kF32) return false;
+  if (residual == nullptr || residual->dtype != DType::kF32) return false;
+  if (h % 4 != 0 || h < 1024 || h > kFastMaxH) return false;
+  auto aligned16 = [](const void* p) {
+    return (reinterpret_cast<std::uintptr_t>(p) & 0xF) == 0;
+  };
+  if (!aligned16(out.data) || !aligned16(x.data) || !aligned16(w.data) ||
+      !aligned16(residual->data))
+    return false;
+  RmsNormRowFastF32Kernel<<<rows, kFastBlock, 0, s>>>(out.Ptr<float>(), x.Ptr<float>(),
+                                                      w.Ptr<float>(), residual->Ptr<float>(),
+                                                      static_cast<int>(h), args.eps, args.gemma);
   return true;
 }
 
@@ -292,6 +390,14 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
   if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
     if (TryLaunchRmsNormDecodeFast(s, out, x, w, args, residual, rows, h)) {
       Check(cudaGetLastError(), "rmsnorm fast launch");
+      return;
+    }
+  }
+  // f32-residual decode-fast path (Laguna NVFP4 post-attn residual norm). Bit-identical
+  // to RmsNormRowKernel<float,float,float>; same VT_RMSNORM_DECODE_FAST contract.
+  if constexpr (std::is_same_v<Tin, float>) {
+    if (TryLaunchRmsNormDecodeFastF32(s, out, x, w, args, residual, rows, h)) {
+      Check(cudaGetLastError(), "rmsnorm fast-f32 launch");
       return;
     }
   }

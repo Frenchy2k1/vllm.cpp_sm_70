@@ -1,5 +1,25 @@
 # Benchmarks
 
+## Laguna-S-2.1-NVFP4 decode — residual-norm KERNEL-EFFICIENCY (`VT_LAGUNA_FAST_NORM`), byte-exact, norms 1.85×, −0.81% decode-step GPU (2026-08-03, `CLAIM-LAGUNA-FAST-NORM`)
+
+The byte-exact node-count/fold tier is exhausted (`CLAIM-LAGUNA-TAIL-FUSED` below) — but the residual-stream RMSNorm KERNELS themselves were still under-occupied. Same box/model/ids/env as below (`~/laguna-xs-nvfp4`, ids `2,785,9626,377,15360,395`, `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1`), origin/main `8281ee89`.
+
+**Diagnosis (`ncu`, one launch each, graph off).** The decode `[1,H=2048]` residual norms `AddAdd2RmsNormStdBf16Kernel` and `RmsNormRowKernel<float,float,float>` ship as `<<<1,256>>>` — ONE 256-thread block. `ncu`: `launch__grid_size=1`, `launch__block_size=256`, `launch__waves_per_multiprocessor≈0.00`, `sm__throughput≈0.06%` (occupies 1 SM of ~100+, latency-bound on 8 `__syncthreads` + scalar loads). Well-occupied siblings for contrast: the `grid=64` q/k head-norm shape shows `waves=0.22`, `sm=2.25%`. So the `[1,H]` norm is launch/occupancy-bound, NOT compute-bound.
+
+**Optimization (byte-exact).** Ported the PROVEN bit-identical `RmsNormRowFastKernel` (cuda_ops.cu:165) structure to the f32 kernels — new `AddAdd2RmsNormStd{,Bf16}FastKernel` (Laguna, `VT_LAGUNA_FAST_NORM`) + `RmsNormRowFastF32Kernel` (shared, f32 extension of `VT_RMSNORM_DECODE_FAST`): 1024-thread float4-vectorized memory passes hide the per-block memory latency (thread-parallelism, not occupancy — M=1 launches only 1 block), while the variance REDUCTION reproduces the shipped 256-strided-partial + `sh[256]` tree byte-for-byte. **f32 byte-exactness pitfall (vs the bf16 sibling):** the bf16 fast kernel pre-squares into shared (`ssq=v²`) because a bf16² is exactly representable in f32; for f32 activations `v²` is NOT exact, and pre-squaring diverged — the shipped kernel's `local += v*v` is nvcc-`fmad` **fma** (v² kept full-precision), a pre-rounded `v²` differs by ≤1 ulp and flipped an XS near-tie at token 108. Fix: store `v` (not `v²`) in shared and let the reduction square with the IDENTICAL `acc += v*v` expression so nvcc emits the same fma → bit-identical.
+
+**Gate: BYTE-EXACT.** `=1` (fast) and `=0` (rollback) both reproduce the origin/main 160-token id stream identically (first-20 `22345 83 268 33586 81 855 397 874 367 6376 815 340 9626 377 15360 83 1729 756 1205 565`). Both fast kernels confirmed RUNNING in the after-profile.
+
+**Speed (nsys `cuda_gpu_kern_sum --cuda-graph-trace=node`, per-tok = total/69 over 70-tok run; paging-immune):**
+
+| norm kernel | `=0` shipped µs/tok | `=1` fast µs/tok | speedup |
+|---|---|---|---|
+| `RmsNormRow<f32>` (post-attn add+norm) | 286.5 | **155.7** | 1.84× |
+| `AddAdd2RmsNormStdBf16` (MoE-tail add+norm) | 286.0 | **152.9** | 1.87× |
+| combined | 572.5 | **308.6** | 1.86× (−264 µs/tok GPU) |
+
+Decode-step GPU time (70-vs-20 2-length diff, prefill-subtracted): **26192 → 25980 µs/step = −0.81%**. Wall-clock median-3 (drop_caches) ON 35.69 / OFF 35.50 tok/s — ranges OVERLAP (GB10 reload-swing noise floor; the GPU-time diff is the reliable anchor, per project convention). **Residual gap is byte-exactness-BLOCKED:** at 308 µs/tok the two norms are still ~2.4× vLLM's fused `triton_red_fused_add_rms_norm` (~130 µs/tok) — closing that needs vLLM's warp-shuffle reduction, a DIFFERENT summation order that is not byte-exact to our shipped tree and flips XS near-ties. So the norm is at its BYTE-EXACT launch-bound floor; the remainder to vLLM is a numerics (reduction-order) difference, not a further byte-exact kernel win.
+
 ## Laguna-S-2.1-NVFP4 decode — routed-MoE CastF32 fold (`VT_LAGUNA_TAIL_FUSED`), byte-exact, −39 nodes/step, wall-neutral (2026-08-03, `CLAIM-LAGUNA-TAIL-FUSED`)
 
 Continuation of the byte-exact node-count campaign (glue/preamble/addnorm/onecast) on the GB10 NVFP4 decode graph (`~/laguna-xs-nvfp4`, ids `2,785,9626,377,15360,395`, base env `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1`, origin/main `65f3cdc1`). A fresh `cuda_gpu_kern_sum --cuda-graph-trace=node` 20↔70 diff of the baseline ranked the remaining SMALL decode kernels; the biggest tail items are already folded (`RmsNormRow`+`AddAdd2RmsNorm` = the add_rms_norm forms, `FusedQkNormRope` = the preamble) or unfoldable (`SigmoidTopK`/router GEMV = cuBLAS-adjacent, `DecodeAttnGqaSplitG`/`DecodeAttnCombine` = attention compute, `MoeAlign`/`SiluAndMul`/`MoeCombine` = ported-Marlin pipeline). The one clean byte-exact node reduction left was the MoE-output `CastF32`.

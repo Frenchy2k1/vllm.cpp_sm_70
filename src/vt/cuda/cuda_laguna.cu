@@ -39,6 +39,37 @@ void Check(cudaError_t e, const char* what) {
                              cudaGetErrorString(e));
 }
 
+// ── VT_LAGUNA_FAST_NORM (default ON): kernel-EFFICIENCY (not math) speedup of the
+// single-block [1,H] residual-stream RMSNorm decode kernels. ncu on the shipped
+// <<<1,256>>> AddAdd2RmsNormStd*/RmsNormSeq kernels (grid=1, block=256):
+// launch__waves_per_multiprocessor≈0.00, sm__throughput≈0.06% — one 256-thread block
+// occupies ONE SM of ~100+, latency-bound (8 __syncthreads tree + scalar loads). This
+// ports the PROVEN bit-identical RmsNormRowFastKernel structure (cuda_ops.cu:165) to
+// the f32 Laguna kernels: 1024-thread float4-vectorized memory passes hide the memory
+// latency PER BLOCK (thread-level parallelism, not occupancy — the M=1 decode launches
+// only rows=1 block, so the GPU is block-starved), while the variance REDUCTION
+// reproduces the shipped 256-thread strided-partial + sh[256] tree BYTE-FOR-BYTE (reads
+// the same per-element squares in the same Σ_m ssq[i+256m] increasing-m order), so the
+// f32 variance — and every output bit — is IDENTICAL to the shipped kernel. '0' rolls
+// back to the shipped kernels (same-binary A/B proves byte-exactness: 160-tok ids
+// identical). Only engages for float4-vectorizable, 16-byte-aligned shapes; every other
+// case keeps the shipped kernel.
+inline bool LagunaFastNormOn() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_FAST_NORM");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+constexpr int kLagFastNormBlock = 1024;  // memory-pass threads (32 warps in the 1 block)
+constexpr int kLagFastNormMaxN = 8192;   // ssq[] bound (32 KB static shared; H=2048 uses 8 KB)
+inline bool LagFastNormAligned16(const void* p) {
+  return (reinterpret_cast<std::uintptr_t>(p) & 0xF) == 0;
+}
+inline bool LagFastNormAligned8(const void* p) {
+  return (reinterpret_cast<std::uintptr_t>(p) & 0x7) == 0;
+}
+
 // ── RMSNorm (block-per-row, block-reduced SoS; NEAR-TIE vs host RmsNorm:94/:112, in
 // the accepted device regime — user-ratified 2026-08-01: gate the device path vs vLLM).
 // One BLOCK per row: blockDim threads reduce Σ x[i]²; inv = 1/sqrtf(ss/n + eps).
@@ -128,6 +159,128 @@ __global__ void AddAdd2RmsNormStdBf16Kernel(float* out, float* residual,
   }
   const float inv = 1.0f / sqrtf(sh[0] / static_cast<float>(n) + eps);
   for (int64_t i = threadIdx.x; i < n; i += blockDim.x) orow[i] = rr[i] * inv * w[i];
+}
+
+// ── VT_LAGUNA_FAST_NORM fast sibling of AddAdd2RmsNormStdKernel — BYTE-EXACT. The
+// memory passes run float4-vectorized over kLagFastNormBlock(=1024) threads (32 warps in
+// the single M=1 block hide the memory latency the shipped 256-thread block cannot); the
+// variance reduction reproduces the shipped 256-thread strided partials + sh[256] tree
+// over the SAME per-element squares in the SAME Σ_m ssq[i+256m] order, so partial[0] — and
+// every output bit — equals AddAdd2RmsNormStdKernel's. n%4==0 and 16-byte-aligned pointers
+// guaranteed by the launcher; rows=1 (T=1 decode), grid=1.
+__global__ void AddAdd2RmsNormStdFastKernel(float* __restrict__ out, float* __restrict__ residual,
+                                            const float* __restrict__ x1,
+                                            const float* __restrict__ x2, const float* __restrict__ w,
+                                            int n, float eps) {
+  const int tid = static_cast<int>(threadIdx.x);
+  const int vn = n >> 2;  // float4 groups
+  float4* rv = reinterpret_cast<float4*>(residual);
+  const float4* x1v = reinterpret_cast<const float4*>(x1);
+  const float4* x2v = reinterpret_cast<const float4*>(x2);
+  const float4* wv = reinterpret_cast<const float4*>(w);
+  float4* ov = reinterpret_cast<float4*>(out);
+  __shared__ float sv[kLagFastNormMaxN];  // the residual VALUE v (not v²): the reduction
+  __shared__ float partial[256];          // squares+accumulates with shipped's `acc += v*v`
+                                          // expression so nvcc emits the SAME fma (f32 v² is
+                                          // NOT exact — pre-squaring would differ by ≤1 ulp).
+
+  // Pass 1 — v = (residual + x1) + x2 per element (f32, == shipped), store residual + v.
+  for (int vi = tid; vi < vn; vi += kLagFastNormBlock) {
+    float4 r = rv[vi], a = x1v[vi], b = x2v[vi], v;
+    v.x = (r.x + a.x) + b.x;
+    v.y = (r.y + a.y) + b.y;
+    v.z = (r.z + a.z) + b.z;
+    v.w = (r.w + a.w) + b.w;
+    rv[vi] = v;
+    const int e = vi << 2;
+    sv[e] = v.x;
+    sv[e + 1] = v.y;
+    sv[e + 2] = v.z;
+    sv[e + 3] = v.w;
+  }
+  __syncthreads();
+  // Reduction — BYTE-FOR-BYTE shipped: thread t squares+accumulates v[t],v[t+256],… with the
+  // IDENTICAL `acc += v*v` expression (→ same nvcc fma) in the same increasing order, then tree.
+  if (tid < 256) {
+    float acc = 0.0f;
+    for (int j = tid; j < n; j += 256) acc += sv[j] * sv[j];
+    partial[tid] = acc;
+  }
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) partial[tid] += partial[tid + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(n) + eps);
+  // Pass 2 — out = residual * inv * w (element-independent, same bits as shipped).
+  for (int vi = tid; vi < vn; vi += kLagFastNormBlock) {
+    float4 r = rv[vi], wr = wv[vi], o;
+    o.x = r.x * inv * wr.x;
+    o.y = r.y * inv * wr.y;
+    o.z = r.z * inv * wr.z;
+    o.w = r.w * inv * wr.w;
+    ov[vi] = o;
+  }
+}
+
+// bf16-x1 sibling (VT_LAGUNA_TAIL_FUSED path): the routed-expert x1 arrives bf16 and is
+// widened in-kernel — __bfloat1622float2 reproduces the EXACT bits __bfloat162float wrote
+// in AddAdd2RmsNormStdBf16Kernel, so this is BYTE-EXACT to it. x2/w/out/residual f32
+// (float4), x1 bf16 loaded 4-at-a-time (2×bf162, 8-byte aligned). Same reduction/order.
+struct alignas(8) LagBf16x4 {
+  __nv_bfloat162 a, b;
+};
+__global__ void AddAdd2RmsNormStdBf16FastKernel(float* __restrict__ out,
+                                                float* __restrict__ residual,
+                                                const __nv_bfloat16* __restrict__ x1,
+                                                const float* __restrict__ x2,
+                                                const float* __restrict__ w, int n, float eps) {
+  const int tid = static_cast<int>(threadIdx.x);
+  const int vn = n >> 2;
+  float4* rv = reinterpret_cast<float4*>(residual);
+  const LagBf16x4* x1v = reinterpret_cast<const LagBf16x4*>(x1);
+  const float4* x2v = reinterpret_cast<const float4*>(x2);
+  const float4* wv = reinterpret_cast<const float4*>(w);
+  float4* ov = reinterpret_cast<float4*>(out);
+  __shared__ float sv[kLagFastNormMaxN];  // v (not v²): reduction squares w/ shipped's fma
+  __shared__ float partial[256];
+
+  for (int vi = tid; vi < vn; vi += kLagFastNormBlock) {
+    float4 r = rv[vi], b = x2v[vi], v;
+    LagBf16x4 a = x1v[vi];
+    float2 a01 = __bfloat1622float2(a.a);  // x1 elems 0,1 widened == __bfloat162float
+    float2 a23 = __bfloat1622float2(a.b);  // x1 elems 2,3
+    v.x = (r.x + a01.x) + b.x;
+    v.y = (r.y + a01.y) + b.y;
+    v.z = (r.z + a23.x) + b.z;
+    v.w = (r.w + a23.y) + b.w;
+    rv[vi] = v;
+    const int e = vi << 2;
+    sv[e] = v.x;
+    sv[e + 1] = v.y;
+    sv[e + 2] = v.z;
+    sv[e + 3] = v.w;
+  }
+  __syncthreads();
+  if (tid < 256) {
+    float acc = 0.0f;
+    for (int j = tid; j < n; j += 256) acc += sv[j] * sv[j];
+    partial[tid] = acc;
+  }
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) partial[tid] += partial[tid + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(n) + eps);
+  for (int vi = tid; vi < vn; vi += kLagFastNormBlock) {
+    float4 r = rv[vi], wr = wv[vi], o;
+    o.x = r.x * inv * wr.x;
+    o.y = r.y * inv * wr.y;
+    o.z = r.z * inv * wr.z;
+    o.w = r.w * inv * wr.w;
+    ov[vi] = o;
+  }
 }
 
 // ── partial-NeoX RoPE from a half-split [rope_rows,rd] cache (bit-exact to ApplyRope) ──
@@ -861,16 +1014,37 @@ void RmsNormSeqLaunch(Queue& q, float* out, const float* x, const float* w, int6
 }
 void AddAdd2RmsNormStdLaunch(Queue& q, float* out, float* residual, const float* x1,
                              const float* x2, const float* w, int64_t n, float eps) {
+  cudaStream_t st = AsStream(q);
+  // VT_LAGUNA_FAST_NORM: float4-vectorized 1024-thread fast kernel, BYTE-EXACT to the
+  // shipped <<<1,256>>> path (see AddAdd2RmsNormStdFastKernel). Guarded to vectorizable,
+  // aligned shapes; every other case keeps the shipped kernel.
+  if (LagunaFastNormOn() && (n & 3) == 0 && n <= kLagFastNormMaxN && LagFastNormAligned16(out) &&
+      LagFastNormAligned16(residual) && LagFastNormAligned16(x1) && LagFastNormAligned16(x2) &&
+      LagFastNormAligned16(w)) {
+    AddAdd2RmsNormStdFastKernel<<<1, kLagFastNormBlock, 0, st>>>(out, residual, x1, x2, w,
+                                                                static_cast<int>(n), eps);
+    return;
+  }
   // one block (T=1 row); 256 threads (matches the __shared__ sh[256] reduction and
   // RmsNormRowKernel's kBlock=256 order — byte-exact norm).
-  AddAdd2RmsNormStdKernel<<<1, 256, 0, AsStream(q)>>>(out, residual, x1, x2, w, n, eps);
+  AddAdd2RmsNormStdKernel<<<1, 256, 0, st>>>(out, residual, x1, x2, w, n, eps);
 }
 void AddAdd2RmsNormStdBf16Launch(Queue& q, float* out, float* residual, const void* x1,
                                  const float* x2, const float* w, int64_t n, float eps) {
+  cudaStream_t st = AsStream(q);
+  const __nv_bfloat16* x1b = reinterpret_cast<const __nv_bfloat16*>(x1);
+  // VT_LAGUNA_FAST_NORM fast path (BYTE-EXACT). x1 (bf16) needs 8-byte alignment for the
+  // 2×bf162 vector load; f32 buffers 16-byte.
+  if (LagunaFastNormOn() && (n & 3) == 0 && n <= kLagFastNormMaxN && LagFastNormAligned16(out) &&
+      LagFastNormAligned16(residual) && LagFastNormAligned16(x2) && LagFastNormAligned16(w) &&
+      LagFastNormAligned8(x1b)) {
+    AddAdd2RmsNormStdBf16FastKernel<<<1, kLagFastNormBlock, 0, st>>>(out, residual, x1b, x2, w,
+                                                                    static_cast<int>(n), eps);
+    return;
+  }
   // VT_LAGUNA_TAIL_FUSED: x1 is the bf16 routed-expert output (MoeCombine wrote it
   // directly, no CastF32). one block (T=1), 256 threads (byte-exact norm reduction).
-  AddAdd2RmsNormStdBf16Kernel<<<1, 256, 0, AsStream(q)>>>(
-      out, residual, reinterpret_cast<const __nv_bfloat16*>(x1), x2, w, n, eps);
+  AddAdd2RmsNormStdBf16Kernel<<<1, 256, 0, st>>>(out, residual, x1b, x2, w, n, eps);
 }
 void RopeFromCacheLaunch(Queue& q, float* x, const float* cache, int64_t heads, int64_t Dh,
                          int64_t rd, int64_t pos) {
