@@ -13,9 +13,9 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue"></a>
-  <a href="docs/BENCHMARKS.md"><img alt="vs vLLM" src="https://img.shields.io/badge/Qwen3.6--27B_vs_vLLM-token--exact_%2B_faster_at_every_concurrency-3ec8e0"></a>
+  <a href="docs/BENCHMARKS.md"><img alt="vs vLLM" src="https://img.shields.io/badge/Qwen3.6--27B_vs_vLLM-token--exact_%2B_same_throughput-3ec8e0"></a>
   <a href="docs/STATUS.md"><img alt="Architectures" src="https://img.shields.io/badge/architectures-25%2B_gated-7ee787"></a>
-  <a href="#performance-faster-than-vllm"><img alt="Binary size" src="https://img.shields.io/badge/one_binary-66_MiB,_no_Python-6e7681"></a>
+  <a href="#performance"><img alt="Binary size" src="https://img.shields.io/badge/one_binary-66_MiB,_no_Python-6e7681"></a>
   <a href="https://github.com/mudler/LocalAI"><img alt="LocalAI" src="https://img.shields.io/badge/LocalAI-Run_Locally-orange"></a>
 </p>
 
@@ -49,21 +49,22 @@ What keeps that honest is the oracle. Every architecture is gated **token-for-to
 itself** on the same workload, so "grounded in vLLM" is a test result rather than a design claim, and
 speed is only ever quoted against a reference measured in its own production config.
 
-![vllm.cpp vs vLLM on Qwen3.6-27B: ahead at every concurrency](benchmarks/media/concurrency_race.gif)
+![vllm.cpp vs vLLM on Qwen3.6-27B: identical output at every concurrency](benchmarks/media/concurrency_race.gif)
 
-> The same model, the same prompts, side by side: **token-for-token identical output, and vllm.cpp
-> finishes first** ([full clip](benchmarks/media/concurrency_race.mp4)).
+> The same model, the same prompts, side by side: **token-for-token identical output**, finishing a
+> hair ahead. That margin is inside our noise band at five of the six concurrencies
+> ([full clip](benchmarks/media/concurrency_race.mp4)).
 
 Where that stands today:
 
 - **Small.** **66 MiB** of binary against a **9.1 GiB** vLLM install, both measured on the same GB10:
   about **140x less to deploy**, serving the same model in **24.88 GiB of peak host memory against
   vLLM's 28.18**. No interpreter in the process, and 0 bytes of bundled CUDA userspace.
-- **Fast.** On Qwen3.6-27B we beat vLLM at **all six concurrencies we measured**, against its graphed
-  production config: **4.5% at c1**, and 0.7% to 1.7% across the rest, which is close enough to our
-  noise band to call a tie. Also **1.18x llama.cpp's prefill** on the same GGUF file, and **ahead of
-  MLX-LM on prefill** on Apple Silicon. Most other architectures are correct but speed-pending, and
-  each one says so.
+- **Fast.** On Qwen3.6-27B we **match vLLM's throughput** against its graphed production config.
+  We are ahead at all six concurrencies we measured, but only **c1 (4.5%)** is outside our noise
+  band; the other five, 0.7% to 1.7%, are ties. Also **1.18x llama.cpp's prefill** on the same
+  GGUF file, and **ahead of MLX-LM on prefill** on Apple Silicon. Most other architectures are
+  correct but speed-pending, and each one says so.
 - **Everything.** 25+ architectures, tool calling (36 parser families), structured output including
   GBNF, three speculative decoders, image and video and audio input, external KV offload, Prometheus
   metrics, and the SGLang knobs, all in a library you can `dlopen`.
@@ -71,7 +72,7 @@ Where that stands today:
   where vLLM's own greedy decode is non-deterministic at bf16 near-ties, the gate says so instead of
   quietly loosening.
 
-## Performance: faster than vLLM
+## Performance
 
 Qwen3.6-27B (NVFP4) on NVIDIA GB10, greedy, closed loop, against the vLLM oracle in its
 **production graphed config** (not `--enforce-eager`). Output is token-for-token identical at every
@@ -85,8 +86,8 @@ point on this curve:
 
 We are ahead at all six, but the margins in the middle are thin. Our run-to-run noise band is 0.5%,
 and c2 through c32 land between 0.7% and 1.7%, so treat those as ties. Only c1, at 4.5%, is clearly
-outside the noise. A tie is still a good result for a 66 MiB binary against a mature CUDA stack, and
-the tokens come out identical either way.
+outside the noise. The tokens come out identical either way, and the install is 66 MiB against
+9.1 GiB.
 
 Peak host memory is a clean win at **24.88 GiB against vLLM's 28.18 GiB**, with no Python stack behind
 it:
