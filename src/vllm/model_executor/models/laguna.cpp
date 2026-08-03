@@ -659,7 +659,8 @@ std::vector<float> LagunaMoeResidentMarlin(vt::Queue& q, const LagunaMoeWeights&
 // device-regime near-tie as LagunaMoeResidentMarlin.
 void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, const float* hn_dev,
                                  int64_t moe_I, int64_t H, int64_t E, const int32_t* ids_dev,
-                                 const float* w_dev, int64_t Pk, float* out_dev) {
+                                 const float* w_dev, int64_t Pk, float* out_dev,
+                                 const void* hn_bf16 = nullptr) {
   using vt::DType;
   if (Pk == 0) return;
   vt::Backend& bk = vt::GetBackend(q.device.type);
@@ -678,8 +679,14 @@ void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, cons
   // Wrap the async-produced device inputs (hn_dev/ids_dev/w_dev, written on-stream by
   // the router GEMM + sigmoid_topk with NO drain before) with MakeTensor — read them
   // ON-STREAM (ordered), NOT via a DBuf host-Copy which would snapshot stale data.
+  // VT_LAGUNA_MOE_ONECAST: when the caller passes a persistent bf16 copy of hn (cast once
+  // per MoE layer), read it on-stream and SKIP the redundant internal CastBf16 — byte-
+  // identical (vt::CastBf16 is a deterministic truncation). Else cast hn→bf16 here as before.
   vllm::dense_nvfp4::DBuf dh(d, DType::kBF16, {1, H});
-  {
+  vt::Tensor act_bf16 = dh.t();
+  if (hn_bf16 != nullptr) {
+    act_bf16 = vllm::dense_nvfp4::MakeTensor(const_cast<void*>(hn_bf16), DType::kBF16, dev, {1, H});
+  } else {
     vt::Tensor xf = vllm::dense_nvfp4::MakeTensor(const_cast<float*>(hn_dev), DType::kF32, dev,
                                                  {1, H});
     vt::CastBf16(q, dh.t(), xf);
@@ -710,7 +717,7 @@ void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, cons
     vt::Tensor sgu = vllm::dense_nvfp4::MakeTensor(mr.s_gu, DType::kI8, dev, {E, H / 16, 2 * moe_I});
     vt::Tensor ggu = vllm::dense_nvfp4::MakeTensor(mr.g_gu, DType::kF32, dev, {E});
     vllm::dense_nvfp4::DBuf dgu(d, DType::kBF16, {Pk, 2 * moe_I});
-    vt::MoeGroupedGemmNvfp4Marlin(q, dgu.t(), dh.t(), wgu, sgu, ggu, ws, sorted.t(), eids.t(),
+    vt::MoeGroupedGemmNvfp4Marlin(q, dgu.t(), act_bf16, wgu, sgu, ggu, ws, sorted.t(), eids.t(),
                                   npad.t(), dtw, vt::MoeMarlinArgs{bi, Pki, 1, 2 * Ii, Hi, false});
     vt::SiluAndMul(q, dact.t(), dgu.t());
   } else {
@@ -723,9 +730,9 @@ void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, cons
     vt::Tensor gu = vllm::dense_nvfp4::MakeTensor(mr.g_up, DType::kF32, dev, {E});
     vllm::dense_nvfp4::DBuf dgate(d, DType::kBF16, {Pk, moe_I});
     vllm::dense_nvfp4::DBuf dup(d, DType::kBF16, {Pk, moe_I});
-    vt::MoeGroupedGemmNvfp4Marlin(q, dgate.t(), dh.t(), wg, sg, gg, ws, sorted.t(), eids.t(),
+    vt::MoeGroupedGemmNvfp4Marlin(q, dgate.t(), act_bf16, wg, sg, gg, ws, sorted.t(), eids.t(),
                                   npad.t(), dtw, vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
-    vt::MoeGroupedGemmNvfp4Marlin(q, dup.t(), dh.t(), wu, su, gu, ws, sorted.t(), eids.t(), npad.t(),
+    vt::MoeGroupedGemmNvfp4Marlin(q, dup.t(), act_bf16, wu, su, gu, ws, sorted.t(), eids.t(), npad.t(),
                                   dtw, vt::MoeMarlinArgs{bi, Pki, 1, Ii, Hi, false});
     vt::MoeSiluMul(q, dact.t(), dgate.t(), dup.t());
   }
@@ -751,7 +758,7 @@ void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, cons
 //    runs there, never inside capture), and the pooled DBuf transients are warmed the
 //    same way LagunaMoeResidentMarlinInto's are. ──────────────────────────────────
 void LagunaSharedExpertMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, const float* hn_dev,
-                                  int64_t H, float* so_dev) {
+                                  int64_t H, float* so_dev, const void* hn_bf16 = nullptr) {
   namespace dn = vllm::dense_nvfp4;
   using vt::DType;
   vt::Backend& bk = vt::GetBackend(q.device.type);
@@ -760,8 +767,13 @@ void LagunaSharedExpertMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, con
   const int64_t K = moe.shared_gate_fp4.k;  // == H (shared expert in-features)
   const int64_t N = moe.shared_gate_fp4.n;  // shared_expert_intermediate_size
   // cast the post-attn activation to bf16 [1,K] (the W4A16 GEMM's activation dtype).
+  // VT_LAGUNA_MOE_ONECAST: reuse the caller's single bf16 hn (K==H) and skip this cast —
+  // byte-identical to casting here (deterministic truncation of the same hn).
   dn::DBuf xb(d, DType::kBF16, {1, K});
-  {
+  vt::Tensor act_bf16 = xb.t();
+  if (hn_bf16 != nullptr) {
+    act_bf16 = dn::MakeTensor(const_cast<void*>(hn_bf16), DType::kBF16, dev, {1, K});
+  } else {
     vt::Tensor xf = dn::MakeTensor(const_cast<float*>(hn_dev), DType::kF32, dev, {1, K});
     vt::CastBf16(q, xb.t(), xf);
   }
@@ -770,9 +782,9 @@ void LagunaSharedExpertMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, con
   // bf16 MoeSiluMul (byte-equal given equal GEMM output — the routed-expert fallback).
   dn::DBuf act = [&]() -> dn::DBuf {
     if (dn::GateUpFusedEligible(moe.shared_gate_fp4, moe.shared_up_fp4))
-      return dn::GateUpFusedMarlinD(d, xb.t(), moe.shared_gate_fp4, moe.shared_up_fp4);
-    dn::DBuf g = dn::MatmulNvfp4MarlinD(d, xb.t(), moe.shared_gate_fp4, DType::kBF16);
-    dn::DBuf u = dn::MatmulNvfp4MarlinD(d, xb.t(), moe.shared_up_fp4, DType::kBF16);
+      return dn::GateUpFusedMarlinD(d, act_bf16, moe.shared_gate_fp4, moe.shared_up_fp4);
+    dn::DBuf g = dn::MatmulNvfp4MarlinD(d, act_bf16, moe.shared_gate_fp4, DType::kBF16);
+    dn::DBuf u = dn::MatmulNvfp4MarlinD(d, act_bf16, moe.shared_up_fp4, DType::kBF16);
     dn::DBuf a(d, DType::kBF16, {1, N});
     vt::MoeSiluMul(q, a.t(), g.t(), u.t());
     return a;
@@ -1640,6 +1652,26 @@ inline bool LagunaOndevSampleEnabled() {
   return on;
 }
 
+// ── VT_LAGUNA_MOE_ONECAST: cast the MoE input activation `hn` [1,H] to bf16 ONCE per MoE
+// layer and reuse it, instead of re-casting the SAME f32 `hn` inside every consumer
+// (default ON). Under the shared-fp4 decode a MoE layer casts hn→bf16 THREE times — the
+// router GEMV (GemmBf16), LagunaMoeResidentMarlinInto, and LagunaSharedExpertMarlinInto
+// each run their own vt::CastBf16 node over the identical hn. This lever casts hn into a
+// persistent bf16 buffer once and passes that pointer to all three (2 fewer CastBf16 graph
+// nodes/MoE-layer = ~78 fewer nodes/step at 39 MoE layers), recovering the ramp/drain
+// device time the CUDA graph does NOT hide on the tiny M=1 cast kernels — same mechanism
+// as the glue/preamble/addnorm folds. BYTE-EXACT: vt::CastBf16 is a deterministic
+// truncation, so the single cast's bf16 bytes are bit-identical to each consumer's own
+// cast of the same hn — a same-binary A/B: =0 restores the per-consumer casts. inline so a
+// CPU build (VT_MARLIN_NVFP4 off, graph excluded) does not -Wunused.
+inline bool LagunaMoeOnecastEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_MOE_ONECAST");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
 bool LagunaCanRunResidentDecode(const LagunaParams& p, vt::Queue& q, const LagunaWeights& w,
                                 int64_t T) {
 #ifndef VT_MARLIN_NVFP4
@@ -1974,6 +2006,10 @@ struct LagunaGraph {
   // across layers/replays). The old separate qv/gl/gating are now qkvg/rsg slices.
   std::vector<float> hidden, hn, attn, o, dg, du, dact, fdn, so, doutb, topw, logits, rsg;
   std::vector<uint16_t> abf;
+  // VT_LAGUNA_MOE_ONECAST: persistent bf16 copy of the MoE input `hn` [1,H], cast ONCE
+  // per MoE layer and reused by the router GEMM + routed-expert Marlin + shared-expert
+  // Marlin (fixed address ⇒ capture-safe; unlike `abf` which each GemmBf16 overwrites).
+  std::vector<uint16_t> hn_bf16;
   std::vector<int32_t> eids32;
   // VT_LAGUNA_ONDEV_SAMPLE: single-element device buffer holding the greedy token id.
   // Step seeds it (host) with THIS step's input token; RunChain's embed_gather reads it
@@ -2097,6 +2133,7 @@ struct LagunaGraph {
     topw.assign(static_cast<size_t>(topk), 0.0F);
     logits.assign(static_cast<size_t>(Vsz), 0.0F);
     abf.assign(static_cast<size_t>(maxK), 0);
+    hn_bf16.assign(static_cast<size_t>(H), 0);  // VT_LAGUNA_MOE_ONECAST reuse buffer
     eids32.assign(static_cast<size_t>(topk), 0);
     argmax_id.assign(1, 0);  // VT_LAGUNA_ONDEV_SAMPLE token buffer (device-accessible)
   }
@@ -2115,6 +2152,27 @@ struct LagunaGraph {
     vt::Tensor xf = vt::Tensor::Contiguous(const_cast<float*>(x), vt::DType::kF32, dev, {1, K});
     vt::Tensor ab = vt::Tensor::Contiguous(abf.data(), vt::DType::kBF16, dev, {1, K});
     vt::CastBf16(q, ab, xf);
+    vt::Tensor ot = vt::Tensor::Contiguous(out, vt::DType::kF32, dev, {1, N});
+    vt::Tensor wv = wt.View();
+    wv.device = dev;
+    vt::MatmulBT(q, ot, ab, wv);
+  }
+
+  // VT_LAGUNA_MOE_ONECAST: cast hn[1,H] f32 → the persistent hn_bf16 buffer ONCE (the
+  // single node that replaces the per-consumer casts). Same CastBf16 truncation ⇒ the
+  // bytes are identical to each consumer's own cast of the same hn.
+  void CastHnBf16(const float* x) {
+    vt::Queue& q = *qp;
+    vt::Tensor xf = vt::Tensor::Contiguous(const_cast<float*>(x), vt::DType::kF32, dev, {1, H});
+    vt::Tensor hb = vt::Tensor::Contiguous(hn_bf16.data(), vt::DType::kBF16, dev, {1, H});
+    vt::CastBf16(q, hb, xf);
+  }
+  // GEMM whose activation is the ALREADY-cast persistent hn_bf16 (no per-call CastBf16):
+  // out[1,N] f32 = hn_bf16[1,K]·w[N,K]^T. Byte-identical to GemmBf16(out,wt,hn,N,K) when
+  // hn_bf16 == cast(hn). K must be H (hn_bf16 holds the [1,H] MoE input).
+  void GemmBf16Pre(float* out, const OwnedTensor& wt, int64_t N, int64_t K) {
+    vt::Queue& q = *qp;
+    vt::Tensor ab = vt::Tensor::Contiguous(hn_bf16.data(), vt::DType::kBF16, dev, {1, K});
     vt::Tensor ot = vt::Tensor::Contiguous(out, vt::DType::kF32, dev, {1, N});
     vt::Tensor wv = wt.View();
     wv.device = dev;
@@ -2144,6 +2202,7 @@ struct LagunaGraph {
     const bool glue_fused = LagunaGlueFusedEnabled();
     const bool moe_addnorm_fused = LagunaMoeAddNormFusedEnabled();  // LEVER A
     const bool preamble_fused = LagunaPreambleFusedEnabled();       // fused q/k norm+rope
+    const bool moe_onecast = LagunaMoeOnecastEnabled();             // one hn→bf16 cast/MoE-layer
     // VT_LAGUNA_ONDEV_SAMPLE: gather THIS step's input embedding ON-DEVICE from argmax_id
     // (seeded by Step, or the previous replay's argmax) into the persistent hidden buffer —
     // the in-graph replacement for the host embed loop in Step. Byte-identical widen (the
@@ -2249,10 +2308,17 @@ struct LagunaGraph {
         // LEVER 2: fused router|shared_gate|shared_up GEMV -> rsg slices. VT_LAGUNA_SHARED_FP4:
         // the shared expert is fp4-resident, so drop to a router-ONLY GEMV (`moe.router`) and
         // run gate/up/down through the fp4 Marlin path (no bf16 shared weights read).
-        if (shared_fp4)
-          GemmBf16(rsg.data(), lw.moe.router, hn.data(), E, H);  // router only
-        else
-          GemmBf16(rsg.data(), lw.moe.router_shared_gu, hn.data(), E + 2 * moe_I, H);
+        // VT_LAGUNA_MOE_ONECAST: cast hn→bf16 ONCE here and feed the persistent buffer to the
+        // router GEMM + routed Marlin + shared Marlin (each else-cast the SAME hn otherwise).
+        const void* hnb = moe_onecast ? static_cast<const void*>(hn_bf16.data()) : nullptr;
+        if (moe_onecast) CastHnBf16(hn.data());
+        if (shared_fp4) {
+          if (moe_onecast) GemmBf16Pre(rsg.data(), lw.moe.router, E, H);  // router only
+          else GemmBf16(rsg.data(), lw.moe.router, hn.data(), E, H);
+        } else {
+          if (moe_onecast) GemmBf16Pre(rsg.data(), lw.moe.router_shared_gu, E + 2 * moe_I, H);
+          else GemmBf16(rsg.data(), lw.moe.router_shared_gu, hn.data(), E + 2 * moe_I, H);
+        }
         float* gatingp = rsg.data();
         float* sgp = rsg.data() + E;
         float* sup = rsg.data() + E + moe_I;
@@ -2262,9 +2328,9 @@ struct LagunaGraph {
         LAG->sigmoid_topk(q, eids32.data(), topw.data(), gatingp, bias, bias != nullptr, E,
                           topk, p->norm_topk_prob, p->moe_routed_scaling_factor);
         LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
-                                    topk, doutb.data());
+                                    topk, doutb.data(), hnb);
         if (shared_fp4) {
-          LagunaSharedExpertMarlinInto(q, lw.moe, hn.data(), H, so.data());  // fp4 shared expert
+          LagunaSharedExpertMarlinInto(q, lw.moe, hn.data(), H, so.data(), hnb);  // fp4 shared
         } else {
           SiluMul(dact.data(), sgp, sup, moe_I);
           GemmBf16(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);

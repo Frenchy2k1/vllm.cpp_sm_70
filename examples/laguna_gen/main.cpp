@@ -334,7 +334,18 @@ int main(int argc, char** argv) {
   std::vector<int32_t> generated;
   double prefill_s = 0.0, decode_s = 0.0;
   vllm::LagunaKvCache kv;  // W6 path only
+  // FRONT 1 (measurement honesty): the per-step trace line calls CurResidentGiB()
+  // (a /proc/self/status read) + an unbuffered stderr write EVERY decode step, in the
+  // GPU-idle gap between two graph replays — host overhead a production engine never
+  // pays. Default OFF (set VT_LAGUNA_STEP_LOG=1 to restore the per-step trace); the
+  // final summary below is always printed, so the gates (grep decode_hp / generated ids)
+  // are unaffected. `decode_hp` (sum of the s0→s1 step timers) EXCLUDES this gap already;
+  // `decode_wall` below is the TRUE end-to-end decode throughput INCLUDING every gap, so
+  // the FRONT-1 win is visible there (paired A/B: VT_LAGUNA_STEP_LOG=1 vs unset).
+  const bool step_log = std::getenv("VT_LAGUNA_STEP_LOG") != nullptr;
+  std::chrono::steady_clock::time_point dec_wall_start{};
   for (int step = 0; step < max_tokens; ++step) {
+    if (step == 1) dec_wall_start = std::chrono::steady_clock::now();  // decode phase begins
     std::vector<int32_t> step_tokens, positions;
     std::vector<int32_t> logits_idx;
     if (stateless || step == 0) {
@@ -362,12 +373,14 @@ int main(int argc, char** argv) {
     const auto s1 = std::chrono::steady_clock::now();
     const double step_s = std::chrono::duration<double>(s1 - s0).count();
     if (step == 0) prefill_s = step_s; else decode_s += step_s;
-    std::fprintf(stderr, "[gen] step %d (ctx=%zu): next=%d  %.2fs  (RSS %.1f GiB)\n",
-                 step, tokens.size(), next, step_s, CurResidentGiB());
+    if (step_log)
+      std::fprintf(stderr, "[gen] step %d (ctx=%zu): next=%d  %.2fs  (RSS %.1f GiB)\n",
+                   step, tokens.size(), next, step_s, CurResidentGiB());
     generated.push_back(next);
     tokens.push_back(next);
     if (next == eos || next == eot) { std::fprintf(stderr, "[gen] EOS/EOT\n"); break; }
   }
+  const auto dec_wall_end = std::chrono::steady_clock::now();
 
   std::string text;
   if (tkz.has_value()) {
@@ -388,6 +401,13 @@ int main(int argc, char** argv) {
               prefill_s, decode_s, n_dec > 0 ? decode_s / n_dec : 0.0, n_dec);
   std::printf("decode_hp: %.5fs steps=%d tok/s=%.4f\n", decode_s, n_dec,
               (n_dec > 0 && decode_s > 0.0) ? n_dec / decode_s : 0.0);
+  // TRUE end-to-end decode wall (step 1's start → last step's end), INCLUDING every
+  // per-step host gap — the honest throughput a caller sees. decode_hp above is the
+  // gap-free device-busy timer; the (decode_wall < decode_hp) delta is the host tax.
+  const double decode_wall_s =
+      (n_dec >= 1) ? std::chrono::duration<double>(dec_wall_end - dec_wall_start).count() : 0.0;
+  std::printf("decode_wall: %.5fs steps=%d tok/s=%.4f\n", decode_wall_s, n_dec,
+              (n_dec > 0 && decode_wall_s > 0.0) ? n_dec / decode_wall_s : 0.0);
   std::printf("PEAK RESIDENT: %.2f GiB\n", PeakResidentGiB());
   std::fflush(stdout);
   if (gpu_backend != nullptr) gpu_backend->DestroyQueue(q);

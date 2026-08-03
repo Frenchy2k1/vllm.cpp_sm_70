@@ -1,5 +1,28 @@
 # Benchmarks
 
+## Laguna-S-2.1-NVFP4 decode — W7 two-front pass: honest wall (FRONT 1) + one-cast MoE-input fold (FRONT 2), byte-exact (2026-08-03, `CLAIM-LAGUNA-W7-DECODE`)
+
+Two byte-exact fronts on the GB10 NVFP4 decode graph (`~/laguna-xs-nvfp4`, ids `2,785,9626,377,15360,395`, base env `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1`, origin/main `0678d85b`). Combined best (onecast on + per-step log off): **decode 36.97 tok/s = 86.0% of vLLM-NVFP4 43** (up from the pre-pass 36.64 / 85.2%). Both land default-ON. Repro: `~/laguna-n4-build/w7_measure.sh`.
+
+**FRONT 1 — the per-step harness log was a real (tiny) host tax; the reported wall was ALREADY honest.** `examples/laguna_gen/main.cpp` logged `[gen] step N … (RSS %.1f GiB)` EVERY decode step, and the `%.1f GiB` argument calls `CurResidentGiB()` — a `/proc/self/status` read — then does an unbuffered `stderr` write, all in the GPU-idle gap between two graph replays (host work a production engine never pays). Guarded behind `VT_LAGUNA_STEP_LOG` (default OFF; `=1` restores the per-step trace) and added a `decode_wall` line = TRUE end-to-end decode throughput (step-1 start → last-step end, INCLUDING every per-step gap), next to the existing gap-free `decode_hp` (Σ of the `s0→s1` step timers). Measured (300-tok, drop_caches, 3 paired reps, same binary):
+
+| STEP_LOG | decode_hp med | decode_wall med | wall − hp (per-run gap) |
+|---|---|---|---|
+| ON (old harness) | 36.9695 | 36.9105 | −0.03 … −0.17% (the fprintf+/proc gap) |
+| OFF (FRONT 1 default) | 36.9732 | 36.9730 | **±0.001 tok/s (wall == hp)** |
+
+**The `fprintf` sat OUTSIDE the `s0→s1` timer, so `decode_hp` never saw it** — the reported number was already gap-free. The value of FRONT 1: with the log off, the TRUE end-to-end wall now provably EQUALS `decode_hp` (`decode_wall == decode_hp` in every LOG_OFF run, within 0.001 tok/s), and the recovered host tax is only ~0.1% (at the drop_caches noise floor). **HONEST CONCLUSION: the ~86% gap to vLLM 43 is NOT a measurement artifact — `decode_hp` was already honest, and the true wall matches it. The residual is genuine device compute (the at-parity bf16 projection GEMV + lm_head, per the recorded "Laguna-NVFP4 at practical ceiling" finding).**
+
+**FRONT 2 — `VT_LAGUNA_MOE_ONECAST` (default ON): cast the MoE input `hn` to bf16 ONCE per MoE layer, not 3×.** Under the shared-fp4 decode a MoE layer cast the SAME `hn[1,H]` f32→bf16 three times — the router GEMV (`GemmBf16`), `LagunaMoeResidentMarlinInto`, and `LagunaSharedExpertMarlinInto` each ran their own `vt::CastBf16`. This lever casts `hn` into a persistent bf16 buffer once and feeds that pointer to all three (a new `CastHnBf16`/`GemmBf16Pre` + an optional pre-cast param on both `…Into` helpers). **BYTE-EXACT** (`vt::CastBf16` is a deterministic truncation ⇒ the single cast's bytes are bit-identical to each consumer's own cast): `VT_LAGUNA_MOE_ONECAST=1` vs `=0` produce **byte-identical 300-token id streams** (first-20 `22345 83 268 33586 81 855 397 874 367 6376 815 340 9626 377 15360 83 1729 756 1205 565`). nsys `cuda_gpu_kern_sum --cuda-graph-trace=node` 2-length diff (20↔70):
+
+| metric | `=0` (per-consumer cast) | `=1` (one cast) |
+|---|---|---|
+| `CastBf16Kernel` inst/step | 200.0 | **122.0 (−78 = 2×39 MoE layers)** |
+| GPU-busy ms/step | 26.25 | 26.31 (parity within nsys run-noise) |
+| decode_hp tok/s (drop_caches) | 36.857 | 36.965 (+0.29%) |
+
+The 78 removed casts are ~78 µs/step — BELOW the ~0.3 ms nsys run-to-run noise (the dominant `enable_if` projection GEMV drifts ±0.4–0.7% between runs), so GPU-busy reads at parity; the win is the deterministic node-count drop (fewer graph nodes → less ramp/drain the CUDA graph doesn't hide), reflected as a neutral-to-+0.29% `decode_hp`. Lands default-ON on the same "shrink the captured node count, byte-exact" basis as the glue/preamble/addnorm folds (`=0` is a same-binary A/B opt-out). The remaining decode tail (projection GEMV ~55%, lm_head 7.4%, we-win Marlin MoE ~12%) is at/beyond parity; the load-time Marlin repack (`TransposeToInt32`/`gptq_marlin_repack`/`ProcessScales`, 20046 inst) is a one-time cost, correctly zeroed by the 2-length diff (the nsys-aggregate trap).
+
 ## GCC 12 production-library portability (2026-07-31, `CLAIM-CPU-GCC12-WERROR-PORTABILITY`) - NOT APPLICABLE / all-target build PARTIAL
 
 This maintenance checkpoint changes no runtime algorithm or benchmark axis.
