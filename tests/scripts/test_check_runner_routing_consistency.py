@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/check-runner-routing-consistency.py"
 ALLOWLIST = ROOT / "scripts/runner-routing-allowlist.txt"
+BF16_ALLOWLIST = ROOT / "scripts/runner-bf16-activation-allowlist.txt"
 SPEC = importlib.util.spec_from_file_location("check_runner_routing_consistency", CHECKER)
 assert SPEC is not None and SPEC.loader is not None
 mod = importlib.util.module_from_spec(SPEC)
@@ -20,11 +21,13 @@ SPEC.loader.exec_module(mod)
 
 ModelRoute = mod.ModelRoute
 drift_models = mod.drift_models
+f32_stream_drift_models = mod.f32_stream_drift_models
 
 
-def route(name: str, classification: str, private_loop: bool = False) -> ModelRoute:
+def route(name: str, classification: str, private_loop: bool = False,
+          activation: str = "BF16_RESIDENT") -> ModelRoute:
     return ModelRoute(name, f"{name}_registry.cpp", f"Forward{name}", classification,
-                      private_loop)
+                      private_loop, activation=activation)
 
 
 class DriftModelTests(unittest.TestCase):
@@ -195,6 +198,136 @@ class DriftModelTests(unittest.TestCase):
             "the allowlist suppresses nothing the checker detects; either the "
             "detector regressed or every allowlist entry is now stale",
         )
+
+
+class Bf16ActivationTests(unittest.TestCase):
+    """Invariant (c): bf16-resident activations vs a hand-rolled f32 host stream."""
+
+    # --- pure classifier on synthetic text -----------------------------------
+    def test_classify_activation_f32_stream(self) -> None:
+        # A decode that declares several private f32 residual-stream buffers and casts
+        # to bf16 before every projection, with NO shared AttnBlock and NO bf16-DBuf
+        # residual, is F32_STREAM.
+        text = (
+            "std::vector<float> hidden(T * H);\n"
+            "std::vector<float> residual(T * H);\n"
+            "std::vector<float> x(T * H);\n"
+            "for (int64_t l = 0; l < nlayers; ++l) {\n"
+            "  CastBf16(q, dh.t(), hidden.data());\n"
+            "  GemmBf16Into(qkv.data(), lw.attn.qkv, hidden.data(), n, H);\n"
+            "}\n"
+        )
+        self.assertEqual(mod.classify_activation_stream(text), "F32_STREAM")
+        self.assertGreaterEqual(mod.count_f32_resid_decls(text), mod.MIN_F32_RESID)
+
+    def test_classify_activation_bf16_via_attnblock(self) -> None:
+        # A decode that routes the residual through the shared dense_attn::AttnBlock
+        # preamble is BF16_RESIDENT even if it keeps an f32 scratch buffer.
+        text = (
+            "std::vector<float> hidden(T * H);\n"  # a lone scratch, below threshold
+            "DBuf x = dense_attn::AttnBlock(d, w.attn, cfg, dh.t(), positions);\n"
+        )
+        self.assertEqual(mod.classify_activation_stream(text), "BF16_RESIDENT")
+        self.assertTrue(mod.is_bf16_resident(text))
+
+    def test_classify_activation_bf16_via_dbuf_residual(self) -> None:
+        # A bf16-DBuf residual stream (DBuf hidden ... kBF16) is BF16_RESIDENT even
+        # alongside many f32 host vectors (the f32 are mm-prefill helpers, not the
+        # decode residual) — the qwen3_vl shape.
+        text = (
+            "std::vector<float> embeds(T * H);\n"
+            "std::vector<float> residual(T * H);\n"
+            "std::vector<float> x(T * H);\n"
+            "DBuf hidden(d, DType::kBF16, {T, H}, embeds.data());\n"
+            "DBuf res(d, DType::kBF16, {T, H});\n"
+        )
+        self.assertEqual(mod.classify_activation_stream(text), "BF16_RESIDENT")
+
+    def test_classify_activation_bf16_below_threshold(self) -> None:
+        # A lone f32 scratch var (below MIN_F32_RESID) is not an f32 stream.
+        text = "std::vector<float> x(H);\n"
+        self.assertEqual(mod.classify_activation_stream(text), "BF16_RESIDENT")
+
+    def test_scratch_bf16_dbuf_does_not_exempt(self) -> None:
+        # NARROWNESS: a per-op bf16 SCRATCH DBuf (laguna's `DBuf dh(... kBF16)`) must
+        # NOT exempt an f32-stream decode — only a residual-NAMED bf16 DBuf does.
+        text = (
+            "std::vector<float> hidden(T * H);\n"
+            "std::vector<float> residual(T * H);\n"
+            "std::vector<float> hn(T * H);\n"
+            "DBuf dh(d, DType::kBF16, {1, H});\n"        # scratch, not residual-named
+            "DBuf dact(d, DType::kBF16, {Pk, moe_I});\n"  # scratch
+        )
+        self.assertFalse(mod.is_bf16_resident(text))
+        self.assertEqual(mod.classify_activation_stream(text), "F32_STREAM")
+
+    # --- pure drift function --------------------------------------------------
+    def test_f32_drift_fires_unallowlisted(self) -> None:
+        s = {"laguna": route("laguna", "HOST", activation="F32_STREAM")}
+        self.assertEqual(f32_stream_drift_models(s, set()), ["laguna"])
+
+    def test_f32_drift_allowlisted_passes(self) -> None:
+        s = {"laguna": route("laguna", "HOST", activation="F32_STREAM")}
+        self.assertEqual(f32_stream_drift_models(s, {"laguna"}), [])
+
+    def test_bf16_resident_never_drifts(self) -> None:
+        s = {"qwen3_vl": route("qwen3_vl", "HOST", activation="BF16_RESIDENT")}
+        self.assertEqual(f32_stream_drift_models(s, set()), [])
+
+    def test_refuse_stub_never_f32_drifts(self) -> None:
+        # Even if a REFUSE stub somehow carried the f32 signal, it decodes nothing.
+        s = {"kimi_k3": route("kimi_k3", "REFUSE", activation="F32_STREAM")}
+        self.assertEqual(f32_stream_drift_models(s, set()), [])
+
+    # --- on the shipped tree --------------------------------------------------
+    def test_tree_f32_stream_membership(self) -> None:
+        # Exactly laguna + deepseek_v4 hand-roll an f32 host stream on the tree; every
+        # other registered model (incl. qwen3_vl, whose decode residual is a bf16 DBuf)
+        # is BF16_RESIDENT. This axis is ORTHOGONAL to (a): deepseek_v4 is DEVICE on (a)
+        # yet F32_STREAM here; qwen3_vl is HOST on (a) yet BF16_RESIDENT here.
+        scanned = mod.scan_registrations(mod.MODELS_DIR, mod.INCLUDE_DIR)
+        f32 = sorted(n for n, r in scanned.items() if r.activation == "F32_STREAM")
+        self.assertEqual(f32, ["deepseek_v4", "laguna"])
+        self.assertEqual(scanned["deepseek_v4"].classification, "DEVICE")   # clean on (a)
+        self.assertEqual(scanned["deepseek_v4"].activation, "F32_STREAM")   # drift on (c)
+        self.assertEqual(scanned["qwen3_vl"].classification, "HOST")        # drift on (a)
+        self.assertEqual(scanned["qwen3_vl"].activation, "BF16_RESIDENT")   # clean on (c)
+        # And it really is load-bearing: laguna casts hn->bf16 per projection (>0 sites),
+        # deepseek_v4 keeps everything f32 (0 casts) — both are the same escape.
+        self.assertGreater(scanned["laguna"].f32_resid_decls, mod.MIN_F32_RESID)
+        self.assertGreater(scanned["deepseek_v4"].f32_resid_decls, mod.MIN_F32_RESID)
+
+    def test_tree_bf16_activation_is_green(self) -> None:
+        scanned = mod.scan_registrations(mod.MODELS_DIR, mod.INCLUDE_DIR)
+        allow = mod.allowlisted_names(BF16_ALLOWLIST.read_text(encoding="utf-8"))
+        self.assertEqual(f32_stream_drift_models(scanned, allow), [])
+        # the bf16 allowlist is load-bearing (not decorative / stale).
+        exposed = set(f32_stream_drift_models(scanned, set()))
+        self.assertTrue(exposed & allow)
+        self.assertEqual(exposed, {"laguna", "deepseek_v4"})
+
+    def test_new_f32_stream_model_would_fail(self) -> None:
+        # Mutation: a NEW model landing with an f32 host stream and no allowlist entry
+        # must trip invariant (c).
+        scanned = dict(mod.scan_registrations(mod.MODELS_DIR, mod.INCLUDE_DIR))
+        allow = mod.allowlisted_names(BF16_ALLOWLIST.read_text(encoding="utf-8"))
+        scanned["brand_new_arch"] = route("brand_new_arch", "DEVICE",
+                                           activation="F32_STREAM")
+        self.assertIn("brand_new_arch", f32_stream_drift_models(scanned, allow))
+
+    def test_mutating_on_framework_to_f32_would_fail(self) -> None:
+        # Mutation: flip a currently-clean on-framework model to F32_STREAM — the gate
+        # must fire (proves the invariant is real, not vacuous). Derived from the tree.
+        scanned = dict(mod.scan_registrations(mod.MODELS_DIR, mod.INCLUDE_DIR))
+        allow = mod.allowlisted_names(BF16_ALLOWLIST.read_text(encoding="utf-8"))
+        victim = next(n for n, r in scanned.items()
+                      if r.activation == "BF16_RESIDENT"
+                      and r.classification == "DEVICE" and n not in allow)
+        r = scanned[victim]
+        scanned[victim] = mod.ModelRoute(
+            r.name, r.reg_file, r.forward_fn, r.classification,
+            r.private_generate_loop, r.device_source, "F32_STREAM", 9, 9)
+        self.assertIn(victim, f32_stream_drift_models(scanned, allow))
 
 
 if __name__ == "__main__":

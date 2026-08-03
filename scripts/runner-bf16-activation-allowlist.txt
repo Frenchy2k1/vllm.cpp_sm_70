@@ -1,0 +1,33 @@
+# BF16-resident-activation allowlist — registered models whose decode HAND-ROLLS an f32
+# host residual/activation stream (private std::vector<float> {hidden,residual,x,...}
+# threaded through the per-token decode, cast to bf16 before every projection) INSTEAD of
+# the shared bf16 DBuf glue (dense_attn::AttnBlock preamble + bf16-resident DBuf, mirroring
+# vLLM's per-op bf16 stores). Accepted as a KNOWN, TRACKED state so invariant (c) of
+# scripts/check-runner-routing-consistency.py stays green while preventing a NEW f32-stream
+# model from landing silently — the exact escape AGENTS.md's born-on-the-runner seam names
+# ("DBufs, not an f32 host residual stream with a CastBf16 before every projection").
+#
+# This is the THIRD sub-invariant of the decode/runtime seam (the sibling of the (a)/(b)
+# on-device-logits / no-private-generate-loop list in scripts/runner-routing-allowlist.txt
+# and of the fusion / merged-GEMM guards). It is kept in a SEPARATE file from the
+# (a)/(b) allowlist ON PURPOSE: the two axes have DIFFERENT membership — deepseek_v4 is
+# CLEAN on (a) (it returns device-resident logits) yet drifts on (c) (f32 host stream);
+# qwen3_vl drifts on (a)/(b) yet is CLEAN on (c) (its per-token transformer decode residual
+# is a bf16 DBuf). A shared flat list would silently cross-suppress a real regression on the
+# other axis, so each axis carries its own load-bearing allowlist.
+#
+# Each entry is a model name (the registry stem minus _registry, i.e.
+# src/vllm/model_executor/models/<name>_registry.cpp or <name>.cpp). Removing a name here —
+# after its decode residual routes onto the shared bf16 dense_attn::AttnBlock / DBuf glue
+# (byte-exact / token-exact-or-near-tie gated) — is the enforcement gate closing.
+#
+# NB: qwen3_vl is DELIBERATELY NOT listed here. On the current tree its per-token transformer
+# decode residual is already a bf16 DBuf (Qwen3VLForwardStepLastLogitsDevice / VLForwardLast
+# LogitsDBuf: DBuf hidden/res ... kBF16), so it classifies BF16_RESIDENT on invariant (c).
+# Its remaining escape is the HOST-logits + VLGenerateCore generate loop, which is tracked on
+# the (a)/(b) list — NOT the f32-activation axis. Listing it here would suppress nothing the
+# checker detects (a stale, non-load-bearing entry).
+
+# --- KNOWN F32-STREAM: private f32 host residual/activation decode, pending framework-routing ---
+laguna        # decode residual is std::vector<float> hidden/hn cast to bf16 before every projection (GemmBf16Into/CastBf16, ~31 sites); no dense_attn::AttnBlock, no bf16-DBuf residual stream -> fold-plan: route decode onto the shared bf16 dense_attn::AttnBlock/DBuf glue; removing this entry == routed (see AGENTS.md decode/runtime seam)
+deepseek_v4   # GGUF resident decode computes the whole per-token forward in an f32 host vector stream (std::vector<float> x/residual/hidden per layer, host Gemm, quantize-per-GEMM) and only uploads the final logits to a device carrier (WrapV4DeviceLogits — hence DEVICE-clean on invariant (a), but F32_STREAM on (c)) -> fold-plan: route decode residual onto the shared bf16 AttnBlock/DBuf glue; removing this entry == routed (see AGENTS.md decode/runtime seam)
