@@ -293,19 +293,36 @@ __global__ void MhcPreFinishKernel(const float* __restrict__ residual,
 //    greedy (which is non-deterministic), and token-checked A/B vs the double path.
 //
 // Kernel A' (float mix dots): one block per output o, mirrors the ds4 mix matvec (float).
+// Lever 2 (fold_sqrsum): block o==0 ALSO reduces Σresidual² over flat — it already streams
+// the whole residual for its dot, so the sqrsum is nearly free here — and stashes it in
+// mixes[hc3]. That removes the DUPLICATE residual pass MhcPreFinishFloatKernel used to do
+// (it read the residual once for the sqrsum and again for the weighted sum). BYTE-EXACT: the
+// sqrsum is the SAME 256-thread block-tree reduction over the SAME residual/stride the finish
+// used, only relocated to the dots kernel (which runs first on the same stream).
 __global__ void MhcPreDotsFloatKernel(const float* __restrict__ residual,
                                       const float* __restrict__ fn, int flat,
-                                      float* __restrict__ mixes) {
+                                      float* __restrict__ mixes, int fold_sqrsum, int hc3) {
   const int o = blockIdx.x;
   const int tid = threadIdx.x, nt = blockDim.x;
   extern __shared__ float redf[];
   const int frow = o * flat;
-  float la = 0.0f;
-  for (int i = tid; i < flat; i += nt) la += residual[i] * fn[frow + i];
+  float la = 0.0f, sq = 0.0f;
+  for (int i = tid; i < flat; i += nt) {
+    const float r = residual[i];
+    la += r * fn[frow + i];
+    if (fold_sqrsum && o == 0) sq += r * r;
+  }
   redf[tid] = la;
   __syncthreads();
   for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) redf[tid] += redf[tid + s]; __syncthreads(); }
   if (tid == 0) mixes[o] = redf[0];  // RAW float dot; kernel B' applies rms
+  if (fold_sqrsum && o == 0) {
+    __syncthreads();  // reuse redf for the sqrsum reduction
+    redf[tid] = sq;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) redf[tid] += redf[tid + s]; __syncthreads(); }
+    if (tid == 0) mixes[hc3] = redf[0];  // Σresidual² → finish reads this instead of re-summing
+  }
 }
 // Kernel B' (float finish): sqrsum→rms, mixes*=rms, gates+Sinkhorn (thread0), weighted-sum
 // layer_out (parallel over hidden), optional folded final RMSNorm — all FLOAT, mirroring the
@@ -317,7 +334,8 @@ __global__ void MhcPreFinishFloatKernel(const float* __restrict__ residual,
                                         float hc_post_mult, int iters,
                                         const float* __restrict__ norm_weight, int has_norm,
                                         float norm_eps, float* mixes, float* pre_out,
-                                        float* post_out, float* comb_out, float* layer_out) {
+                                        float* post_out, float* comb_out, float* layer_out,
+                                        int fold_sqrsum) {
   const int hc3 = (2 + hc) * hc;
   const int flat = hc * hidden;
   const int tid = threadIdx.x, nt = blockDim.x;
@@ -330,9 +348,17 @@ __global__ void MhcPreFinishFloatKernel(const float* __restrict__ residual,
     __syncthreads();
     return r;
   };
-  float ls = 0.0f;
-  for (int i = tid; i < flat; i += nt) { const float r = residual[i]; ls += r * r; }
-  const float sqrsum = block_reduce(ls);
+  // Lever 2: reuse the sqrsum MhcPreDotsFloatKernel already computed (block 0 stashed it in
+  // mixes[hc3]) instead of streaming the residual a second time. fold_sqrsum=0 keeps the
+  // in-kernel reduction (baseline A/B, VT_V4_MHC_LEAN=0).
+  float sqrsum;
+  if (fold_sqrsum) {
+    sqrsum = mixes[hc3];
+  } else {
+    float ls = 0.0f;
+    for (int i = tid; i < flat; i += nt) { const float r = residual[i]; ls += r * r; }
+    sqrsum = block_reduce(ls);
+  }
   const float rms = rsqrtf(sqrsum / static_cast<float>(flat) + rms_eps);
   for (int o = tid; o < hc3; o += nt) mixes[o] = mixes[o] * rms;  // raw dot → *rms (order-indep)
   __syncthreads();
@@ -1222,6 +1248,35 @@ static bool MhcFusedEnabled() {
   return on;
 }
 
+// Lever 2 — MHC-pre FINISH occupancy. MhcPreFinishFloatKernel runs `<<<1, block>>>`:
+// ONE block (= ONE SM) executed ~86× SEQUENTIALLY per decode step (2 sub-blocks × 43
+// layers; the layer chain is data-dependent so they cannot overlap). It is
+// memory-latency-bound — it streams the residual (flat=hc·H) for the sqrsum reduction
+// and again (strided) for the pre-weighted sum — so on the >100-SM GB10 the single
+// block's few warps cannot hide HBM latency (it was 9.5% of decode GPU time at block=256
+// = 8 warps). Widening the block to 1024 threads (32 warps) keeps more loads in flight
+// → closer to bandwidth-bound. Same float algebra; a wider block only reorders the tree
+// reduction → CHARACTERIZED near-tie (distributional-gated, token-checked A/B). Read once
+// process-wide so the captured decode graph bakes a consistent block. VT_V4_MHC_LEAN
+// selects the finish block: unset/1 → 1024 (default ON per parity-enablers); 0 → 256
+// (baseline A/B); an explicit power-of-two ≤1024 (e.g. 512) → that size. The mix-dots
+// kernel keeps block=256 (already grid=hc3 = well-occupied).
+static unsigned MhcFinishBlock() {
+  static const unsigned b = [] {
+    const char* e = std::getenv("VT_V4_MHC_LEAN");
+    if (e == nullptr) return 1024u;  // default lean ON
+    const int v = std::atoi(e);
+    if (v == 0) return 256u;    // baseline (lean off) — same block as the mix dots
+    if (v == 1) return 1024u;   // lean on
+    if (v == 512 || v == 1024) return static_cast<unsigned>(v);
+    return 1024u;               // reject non-power-of-two; the reduction tree needs pow2
+  }();
+  return b;
+}
+// Lever 2 ON iff the finish block was widened past the 256 baseline; it also gates the
+// sqrsum fold (MhcPreDots block 0 pre-computes Σresidual² → finish skips its second pass).
+static inline bool MhcLeanOn() { return MhcFinishBlock() != 256u; }
+
 // MhcPre writes pre/post/comb mixes + layer_input; it needs an hc3=[(2+hc)*hc] mix
 // scratch. `mix_scratch` is a caller-provided unified buffer (>= hc3 floats).
 void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_mix,
@@ -1238,12 +1293,16 @@ void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_
   if (MhcFusedEnabled()) {
     // ds4-fold: the identical algebra in FLOAT (GB10 FP64 is ~1/32-1/64 of FP32).
     const unsigned shmemf = block * sizeof(float);
+    const int fold = MhcLeanOn() ? 1 : 0;  // Lever 2: fold Σresidual² into the dots kernel
     MhcPreDotsFloatKernel<<<static_cast<unsigned>(hc3), block, shmemf, s>>>(residual, fn, flat,
-                                                                            mix_scratch);
-    MhcPreFinishFloatKernel<<<1, block, shmemf, s>>>(
+                                                                            mix_scratch, fold, hc3);
+    // Lever 2: widen the single-block finish for HBM-latency hiding on its lone SM + skip its
+    // duplicate residual pass when the sqrsum was folded into the dots.
+    const unsigned fblock = MhcFinishBlock();
+    MhcPreFinishFloatKernel<<<1, fblock, fblock * sizeof(float), s>>>(
         residual, scale, base, static_cast<int>(hc), static_cast<int>(hidden), rms_eps, hc_pre_eps,
         hc_sinkhorn_eps, hc_post_mult, static_cast<int>(iters), norm_weight, has_norm ? 1 : 0,
-        norm_eps, mix_scratch, pre_mix, post_mix, comb_mix, layer_input);
+        norm_eps, mix_scratch, pre_mix, post_mix, comb_mix, layer_input, fold);
     Check(cudaGetLastError(), "mhc_pre_ip launch (fused)");
     return;
   }

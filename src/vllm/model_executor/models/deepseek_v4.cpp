@@ -248,7 +248,7 @@ deepseek_v4::MhcPreResult DispMhcPre(const V4Backend& be, const std::vector<floa
     out.post_mix.resize(static_cast<size_t>(hc));
     out.comb_mix.resize(static_cast<size_t>(hc * hc));
     out.layer_input.resize(static_cast<size_t>(hidden));
-    std::vector<float> mix(static_cast<size_t>((2 + hc) * hc));  // pre's intermediate mixes
+    std::vector<float> mix(static_cast<size_t>((2 + hc) * hc + 1));  // mixes[hc3] + folded sqrsum slot
     const bool has_norm = !norm_weight.empty();
     deepseek_v4::MhcDevice()->pre_ip(
         *be.q, out.pre_mix.data(), out.post_mix.data(), out.comb_mix.data(),
@@ -1360,7 +1360,7 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
   std::vector<float> x(static_cast<size_t>(H));
   std::vector<float> resA(static_cast<size_t>(hc * H)), resB(static_cast<size_t>(hc * H));
   std::vector<float> post_mix(static_cast<size_t>(hc)), res_mix(static_cast<size_t>(hc * hc));
-  std::vector<float> pre_mix(static_cast<size_t>(hc)), mix_scratch(static_cast<size_t>((2 + hc) * hc));
+  std::vector<float> pre_mix(static_cast<size_t>(hc)), mix_scratch(static_cast<size_t>((2 + hc) * hc + 1));
   std::vector<float> qa(static_cast<size_t>(qlr)), q(static_cast<size_t>(nh * hd));
   std::vector<float> kraw(static_cast<size_t>(hd)), o(static_cast<size_t>(nh * hd));
   std::vector<float> z(static_cast<size_t>(zdim));
@@ -1582,7 +1582,7 @@ struct V4Graph {
     resA.assign(static_cast<size_t>(hc * H), 0.0f); resB.assign(static_cast<size_t>(hc * H), 0.0f);
     post_mix.assign(static_cast<size_t>(hc), 0.0f); res_mix.assign(static_cast<size_t>(hc * hc), 0.0f);
     pre_mix.assign(static_cast<size_t>(hc), 0.0f);
-    mix_scratch.assign(static_cast<size_t>((2 + hc) * hc), 0.0f);
+    mix_scratch.assign(static_cast<size_t>((2 + hc) * hc + 1), 0.0f);
     qa.assign(static_cast<size_t>(qlr), 0.0f); qact.assign(static_cast<size_t>(nh * hd), 0.0f);
     kraw.assign(static_cast<size_t>(hd), 0.0f); o.assign(static_cast<size_t>(nh * hd), 0.0f);
     z.assign(static_cast<size_t>(zdim), 0.0f); gating.assign(static_cast<size_t>(ne), 0.0f);

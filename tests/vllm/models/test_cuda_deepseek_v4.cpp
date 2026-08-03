@@ -682,7 +682,7 @@ TEST_CASE("DeepseekV4 device MHC + router in place == round-trip (Brick B)") {
     ip.post_mix.resize(static_cast<size_t>(hc));
     ip.comb_mix.resize(static_cast<size_t>(hc * hc));
     ip.layer_input.resize(static_cast<size_t>(hidden));
-    std::vector<float> mix(static_cast<size_t>(hc3));
+    std::vector<float> mix(static_cast<size_t>(hc3 + 1));  // + folded-sqrsum slot (Lever 2)
     dv4::MhcDevice()->pre_ip(g.q, ip.pre_mix.data(), ip.post_mix.data(), ip.comb_mix.data(),
                             ip.layer_input.data(), mix.data(), residual.data(), fn.data(),
                             scale.data(), base.data(), hc, hidden, eps, eps, eps, 2.0f, iters,
