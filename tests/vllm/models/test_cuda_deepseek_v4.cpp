@@ -878,13 +878,16 @@ TEST_CASE("DeepseekV4 device rms_norm_rows (batched per-head q-RMS) == host (Bri
   CHECK(RelL2(outw, out) > 1e-4);
 }
 
-// Brick 7 — the FUSED per-row RMSNorm+RoPE (NormRopeRowsKernel) is BYTE-IDENTICAL to
-// the split {rms_norm_rows ; rope} launch pair it replaces: the double block-reduce is
-// the SAME as RmsNormRowsKernel, and the parallelized RoPE tail reproduces RopeKernel's
-// `theta_extrap *= theta_scale` left-fold (pair p reached by p sequential mults). All
-// three resident-decode modes: q (has_w=false, do_norm, fwd) / kv (has_w=true, do_norm,
-// fwd) / o (do_norm=false, inverse). RED-first each.
-TEST_CASE("DeepseekV4 device norm_rope_rows == split {rms_norm_rows;rope} BYTE-IDENTICAL (Brick 7)") {
+// Brick 7 — the FUSED per-row RMSNorm+RoPE (norm_rope_rows) vs the split {rms_norm_rows ;
+// rope} launch pair it replaces. norm_rope_rows DEFAULTS to the ds4-fold FLOAT kernel
+// (VT_V4_ROPE_FLOAT): the RMS reduction + the RoPE pow/cos/sin run in FLOAT (GB10 throttles
+// FP64) and the theta uses ds4's direct powf(base,-i/r) per pair vs the split path's DOUBLE
+// block-reduce + double `theta_extrap *= theta_scale` left-fold → CHARACTERIZED NEAR-TIE
+// (float reduction reorder + float transcendentals; RelL2 < 1e-3 at this tiny shape).
+// (VT_V4_ROPE_FLOAT=0 restores the double NormRopeRowsKernel, itself BYTE-IDENTICAL to the
+// split path.) All three resident-decode modes: q (has_w=false, do_norm, fwd) / kv (has_w=
+// true, do_norm, fwd) / o (do_norm=false, inverse). RED-first each.
+TEST_CASE("DeepseekV4 device norm_rope_rows == split {rms_norm_rows;rope} NEAR-TIE (Brick 7)") {
   if (!HasCuda()) return;  // DGX-only
   vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
   QueueGuard g(gpu);
@@ -930,15 +933,15 @@ TEST_CASE("DeepseekV4 device norm_rope_rows == split {rms_norm_rows;rope} BYTE-I
   const auto q_split = split(x, nullptr, /*do_norm=*/true, /*inverse=*/false);
   const auto q_fused = fused(x, nullptr, /*do_norm=*/true, /*inverse=*/false);
   for (float v : q_fused) CHECK(std::isfinite(v));
-  CHECK(RelL2(q_fused, q_split) == doctest::Approx(0.0));
-  // (kv) has_w=true, do_norm, forward — BYTE-identical.
+  CHECK(RelL2(q_fused, q_split) < 1e-3);
+  // (kv) has_w=true, do_norm, forward — float near-tie.
   const auto kv_split = split(x, &w, /*do_norm=*/true, /*inverse=*/false);
   const auto kv_fused = fused(x, &w, /*do_norm=*/true, /*inverse=*/false);
-  CHECK(RelL2(kv_fused, kv_split) == doctest::Approx(0.0));
-  // (o) do_norm=false, inverse — BYTE-identical (rope tail only, no norm).
+  CHECK(RelL2(kv_fused, kv_split) < 1e-3);
+  // (o) do_norm=false, inverse — float near-tie (rope tail only, no norm).
   const auto o_split = split(x, nullptr, /*do_norm=*/false, /*inverse=*/true);
   const auto o_fused = fused(x, nullptr, /*do_norm=*/false, /*inverse=*/true);
-  CHECK(RelL2(o_fused, o_split) == doctest::Approx(0.0));
+  CHECK(RelL2(o_fused, o_split) < 1e-3);
   // RED-first: fwd vs inverse differ; and the weighted (kv) path differs from unweighted.
   CHECK(RelL2(q_fused, o_fused) > 1e-4);
   CHECK(RelL2(kv_fused, q_fused) > 1e-4);
