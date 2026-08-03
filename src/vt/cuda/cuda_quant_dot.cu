@@ -412,7 +412,11 @@ __device__ inline float DotIQ2S(const BlockIQ2_S* xb, const BlockQ8_K* yb) {
 // walk); until that lands, MXFP4 correctly CPU-fallbacks like Q4_0/Q8_0
 // (IsCudaKeepQuantSupported returns false for it). The math here is ready for
 // that variant and is BIT-IDENTICAL to the CPU reference's integer core.
-__device__ inline float DotMXFP4(const BlockMXFP4* xb, const BlockQ8_0* yb) {
+// [[maybe_unused]]: intentionally not yet referenced (awaits the Q8_0-activation
+// GEMM variant above) — keeps the ready device math without tripping nvcc #177-D
+// under -Werror.
+[[maybe_unused]] __device__ inline float DotMXFP4(const BlockMXFP4* xb,
+                                                  const BlockQ8_0* yb) {
   const float d = DF16ToF32(yb->d) * DE8M0ToF32Half(xb->e);
   int sumi1 = 0;
   int sumi2 = 0;
