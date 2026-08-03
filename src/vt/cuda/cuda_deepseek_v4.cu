@@ -279,6 +279,92 @@ __global__ void MhcPreFinishKernel(const float* __restrict__ residual,
   }
 }
 
+// ── ds4-fold (VT_V4_MHC_FUSED): the FLOAT MHC-pre, a 1:1 structural mirror of ds4's
+//    hc4_split_one (~/w8run/ds4/ds4_cuda.cu:9618) + hc_split_weighted_sum_norm_fused_kernel
+//    (:9752). The double-accumulating MhcPreDots/Finish kernels above are BIT-FAITHFUL to
+//    the host reference, but GB10 (sm_121a) executes FP64 at ~1/32-1/64 of FP32, so the mix
+//    dots + the two block-RMS reductions pay a large FP64 penalty on the decode-graph hot
+//    path. ds4 runs the SAME algebra in FLOAT (its fused kernel is float throughout). These
+//    two kernels keep OUR pre/post/comb output layout (so MhcPost/HcHead are unchanged) and
+//    the SAME SinkhornInplace (already float → the Sinkhorn is IDENTICAL to the double path);
+//    the ONLY change is the mix dot + the sqrsum/norm reductions moving double→float. That is
+//    a CHARACTERIZED near-tie vs the double path (float reduction reorder + float accumulate),
+//    the same class as every other MHC glue kernel here — distributional-gated on the IQ2XXS
+//    greedy (which is non-deterministic), and token-checked A/B vs the double path.
+//
+// Kernel A' (float mix dots): one block per output o, mirrors the ds4 mix matvec (float).
+__global__ void MhcPreDotsFloatKernel(const float* __restrict__ residual,
+                                      const float* __restrict__ fn, int flat,
+                                      float* __restrict__ mixes) {
+  const int o = blockIdx.x;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  extern __shared__ float redf[];
+  const int frow = o * flat;
+  float la = 0.0f;
+  for (int i = tid; i < flat; i += nt) la += residual[i] * fn[frow + i];
+  redf[tid] = la;
+  __syncthreads();
+  for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) redf[tid] += redf[tid + s]; __syncthreads(); }
+  if (tid == 0) mixes[o] = redf[0];  // RAW float dot; kernel B' applies rms
+}
+// Kernel B' (float finish): sqrsum→rms, mixes*=rms, gates+Sinkhorn (thread0), weighted-sum
+// layer_out (parallel over hidden), optional folded final RMSNorm — all FLOAT, mirroring the
+// ds4 fused kernel's rsqrtf + float partial[] reduction.
+__global__ void MhcPreFinishFloatKernel(const float* __restrict__ residual,
+                                        const float* __restrict__ scale,
+                                        const float* __restrict__ base, int hc, int hidden,
+                                        float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
+                                        float hc_post_mult, int iters,
+                                        const float* __restrict__ norm_weight, int has_norm,
+                                        float norm_eps, float* mixes, float* pre_out,
+                                        float* post_out, float* comb_out, float* layer_out) {
+  const int hc3 = (2 + hc) * hc;
+  const int flat = hc * hidden;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  extern __shared__ float redf[];
+  auto block_reduce = [&](float v) -> float {
+    redf[tid] = v;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) redf[tid] += redf[tid + s]; __syncthreads(); }
+    const float r = redf[0];
+    __syncthreads();
+    return r;
+  };
+  float ls = 0.0f;
+  for (int i = tid; i < flat; i += nt) { const float r = residual[i]; ls += r * r; }
+  const float sqrsum = block_reduce(ls);
+  const float rms = rsqrtf(sqrsum / static_cast<float>(flat) + rms_eps);
+  for (int o = tid; o < hc3; o += nt) mixes[o] = mixes[o] * rms;  // raw dot → *rms (order-indep)
+  __syncthreads();
+  if (tid == 0) {
+    for (int j = 0; j < hc; ++j) pre_out[j] = Sig(mixes[j] * scale[0] + base[j]) + hc_pre_eps;
+    for (int j = 0; j < hc; ++j)
+      post_out[j] = Sig(mixes[hc + j] * scale[1] + base[hc + j]) * hc_post_mult;
+    float cl[256], m[256];
+    for (int j = 0; j < hc; ++j)
+      for (int k = 0; k < hc; ++k) {
+        const int idx = j * hc + k;
+        cl[idx] = mixes[2 * hc + idx] * scale[2] + base[2 * hc + idx];
+      }
+    SinkhornInplace(cl, m, hc, iters, hc_sinkhorn_eps);
+    for (int i = 0; i < hc * hc; ++i) comb_out[i] = m[i];
+  }
+  __syncthreads();
+  for (int h = tid; h < hidden; h += nt) {
+    float acc = 0.0f;
+    for (int j = 0; j < hc; ++j) acc += pre_out[j] * residual[j * hidden + h];
+    layer_out[h] = acc;
+  }
+  __syncthreads();
+  if (has_norm) {
+    float ss = 0.0f;
+    for (int h = tid; h < hidden; h += nt) { const float v = layer_out[h]; ss += v * v; }
+    const float ssr = block_reduce(ss);
+    const float r = rsqrtf(ssr / static_cast<float>(hidden) + norm_eps);
+    for (int h = tid; h < hidden; h += nt) layer_out[h] = layer_out[h] * r * norm_weight[h];
+  }
+}
+
 // MhcPost (torch.py:94-106). One thread per (j,h).
 __global__ void MhcPostKernel(const float* x, const float* residual, const float* post_mix,
                               const float* comb, int hc, int hidden, float* out) {
@@ -1123,6 +1209,19 @@ void HcHeadInPlaceLaunch(Queue& q, float* out, const float* x, const float* fn, 
   Check(cudaGetLastError(), "hc_head_ip launch");
 }
 
+// ds4-fold gate: route MHC-pre through the FLOAT (ds4-mirroring) kernels instead of the
+// bit-faithful FP64 path. DEFAULT ON (parity-enablers-ship-as-defaults) — a MEASURED
+// decode win on GB10 where FP64 is throttled; VT_V4_MHC_FUSED=0 opts back to the double
+// path for a same-binary A/B. Read once (process-wide), so the captured decode graph bakes
+// a consistent path.
+static bool MhcFusedEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_MHC_FUSED");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
 // MhcPre writes pre/post/comb mixes + layer_input; it needs an hc3=[(2+hc)*hc] mix
 // scratch. `mix_scratch` is a caller-provided unified buffer (>= hc3 floats).
 void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_mix,
@@ -1134,9 +1233,21 @@ void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_
   if (hidden == 0) return;
   cudaStream_t s = AsStream(q);
   const unsigned block = 256;  // 256 threads/block ⇒ the mix dots stay BIT-IDENTICAL
-  const unsigned shmem = block * sizeof(double);
   const int hc3 = static_cast<int>((2 + hc) * hc);
   const int flat = static_cast<int>(hc * hidden);
+  if (MhcFusedEnabled()) {
+    // ds4-fold: the identical algebra in FLOAT (GB10 FP64 is ~1/32-1/64 of FP32).
+    const unsigned shmemf = block * sizeof(float);
+    MhcPreDotsFloatKernel<<<static_cast<unsigned>(hc3), block, shmemf, s>>>(residual, fn, flat,
+                                                                            mix_scratch);
+    MhcPreFinishFloatKernel<<<1, block, shmemf, s>>>(
+        residual, scale, base, static_cast<int>(hc), static_cast<int>(hidden), rms_eps, hc_pre_eps,
+        hc_sinkhorn_eps, hc_post_mult, static_cast<int>(iters), norm_weight, has_norm ? 1 : 0,
+        norm_eps, mix_scratch, pre_mix, post_mix, comb_mix, layer_input);
+    Check(cudaGetLastError(), "mhc_pre_ip launch (fused)");
+    return;
+  }
+  const unsigned shmem = block * sizeof(double);
   // Kernel A: the hc3 mix dot-products, ONE BLOCK EACH → concurrent across SMs.
   MhcPreDotsKernel<<<static_cast<unsigned>(hc3), block, shmem, s>>>(residual, fn, flat, mix_scratch);
   // Kernel B: sqrsum/rms + gates + Sinkhorn + layer_out + final norm (one block).
