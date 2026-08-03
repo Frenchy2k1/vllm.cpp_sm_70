@@ -21,6 +21,13 @@
 
 **Brought to you by the [LocalAI](https://github.com/mudler/LocalAI) team**, the folks behind LocalAI, the open-source AI engine that runs any model (LLMs, vision, voice, image, video) on any hardware, no GPU required.
 
+> ⚠️ **Under heavy development.** This project moves fast right now: internals, CLI flags, and
+> server behavior can change between commits, so expect breakage if you track `main`.
+> The one thing we keep disciplined is the **C ABI** in [`include/vllm.h`](include/vllm.h):
+> it is versioned (`VLLM_ABI_VERSION`, checkable at runtime with `vllm_abi_version()`), grows by
+> appending fields whose zero value keeps existing behavior byte-identical, and only bumps on an
+> incompatible change. If you embed us, embed through that header.
+
 vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
 **smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
 carry **every feature people actually want**. No Python and no PyTorch at inference time.
