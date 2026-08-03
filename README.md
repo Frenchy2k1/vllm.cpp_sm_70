@@ -21,6 +21,11 @@
 
 **Brought to you by the [LocalAI](https://github.com/mudler/LocalAI) team**, the folks behind LocalAI, the open-source AI engine that runs any model (LLMs, vision, voice, image, video) on any hardware, no GPU required.
 
+> **Independent and unofficial.** vllm.cpp is a community port. It is not affiliated with, endorsed
+> by, or sponsored by the vLLM project, the PyTorch Foundation, or the Linux Foundation. "vLLM" is
+> used here only to name the upstream project this port mirrors and is measured against. See
+> [Trademarks](#trademarks).
+
 > ⚠️ **Under heavy development.** This project moves fast right now: internals, CLI flags, and
 > server behavior can change between commits, so expect breakage if you track `main`.
 > The one thing we keep disciplined is the **C ABI** in [`include/vllm.h`](include/vllm.h):
@@ -443,6 +448,21 @@ weights are governed by their own licenses, so check each model card.
 ## Author
 
 Ettore Di Giacinto ([@mudler](https://github.com/mudler)).
+
+## Trademarks
+
+vllm.cpp is an independent community project. It is **not affiliated with, endorsed by, or sponsored
+by** the vLLM project, the [PyTorch Foundation](https://pytorch.org/projects/vllm/), or the Linux
+Foundation.
+
+"vLLM" is a mark of its respective owners. It is used throughout this repository in its descriptive
+sense only: to identify the upstream project that vllm.cpp ports, mirrors, and is gated against.
+Nothing here should be read as a claim of ownership of that mark, or as a suggestion that the vLLM
+project has reviewed, approved, or endorsed this software. The Apache License, Version 2.0 under
+which vLLM is distributed grants no trademark rights (section 6), and none are claimed.
+
+Other names and marks (llama.cpp, SGLang, MLX, CUTLASS, and the rest) belong to their respective
+owners and are likewise used descriptively.
 
 ## License
 
