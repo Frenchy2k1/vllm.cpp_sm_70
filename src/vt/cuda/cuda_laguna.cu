@@ -135,6 +135,64 @@ __global__ void RopeFromCacheGKernel(float* x, const float* cache, int64_t heads
   xv[half + i] = x1 * c + x0 * s;
 }
 
+// ── VT_LAGUNA_PREAMBLE_FUSED: the fused GRAPH attention preamble (one launch vs four) ──
+// Collapses the per-layer rms_norm_seq(q) + rms_norm_seq(k) + rope_from_cache_g(q) +
+// rope_from_cache_g(k) into ONE kernel. One BLOCK per head — q heads blockIdx.x in
+// [0,Hq) operate on qbuf, k heads [Hq,Hq+Hkv) on kbuf — 256 threads/block (== the
+// rms_norm_seq launch width). Phase A reduces Σx² over all Dh with the IDENTICAL sh[256]
+// tree as RmsNormSeqKernel / AddAdd2RmsNormStdKernel → the SAME inv. Phase B applies the
+// IDENTICAL half-split partial-NeoX RoPE as RopeFromCacheGKernel to the normed values.
+//
+// BYTE-EXACT to the four composed kernels — it REPLICATES their exact data flow, including
+// the f32 MEMORY round-trip between the norm and the rope, so the compiler emits the same
+// arithmetic (an earlier register-only recompute of the normed pair diverged at a decode
+// near-tie because the fused rope's fma-contraction differed from the standalone rope's):
+//   Phase A  block-reduced Σx² over Dh — IDENTICAL sh[256] tree as RmsNormSeqKernel → inv.
+//   Phase B  orow[i] = (x[i]*inv)*w[i] WRITTEN BACK to the buffer for ALL Dh dims — the
+//            exact RmsNormSeqKernel store (in place; x[i] read once before the overwrite).
+//   __syncthreads (all normed writes visible before any rope read).
+//   Phase C  RoPE read from the buffer EXACTLY as RopeFromCacheGKernel: x0=row[i],
+//            x1=row[i+half] (memory loads), row[i]=x0*c-x1*s, row[i+half]=x1*c+x0*s over
+//            pairs i<rd/2; dims [rd,Dh) already hold the normed value (untouched).
+// The row (position) index is read from a DEVICE pointer at REPLAY (== RopeFromCacheGKernel)
+// ⇒ capture-safe. In place is safe: Phase B thread j owns x[j] (reads then writes it, no
+// other thread touches j); after the barrier Phase C pair-thread i owns x[i] and x[i+half].
+// Requires has_qk_norm (w always applied). ONE launch replaces the four.
+__global__ void FusedQkNormRopeGKernel(float* qbuf, float* kbuf, const float* q_norm,
+                                       const float* k_norm, const float* cache, int64_t Hq,
+                                       int64_t Hkv, int64_t Dh, int64_t rd, float eps,
+                                       const int* pos_dev) {
+  const int64_t head = static_cast<int64_t>(blockIdx.x);  // [0, Hq+Hkv)
+  const bool is_q = head < Hq;
+  float* row = is_q ? (qbuf + head * Dh) : (kbuf + (head - Hq) * Dh);
+  const float* w = is_q ? q_norm : k_norm;
+  // ── Phase A: block-reduced Σx² over Dh — IDENTICAL to RmsNormSeqKernel (sh[256] tree) ──
+  float local = 0.0f;
+  for (int64_t i = threadIdx.x; i < Dh; i += blockDim.x) local += row[i] * row[i];
+  __shared__ float sh[256];
+  sh[threadIdx.x] = local;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(sh[0] / static_cast<float>(Dh) + eps);
+  // ── Phase B: the RmsNormSeqKernel store, in place, for ALL Dh dims (rope reads it back) ──
+  for (int64_t i = threadIdx.x; i < Dh; i += blockDim.x) row[i] = row[i] * inv * w[i];
+  __syncthreads();
+  // ── Phase C: the RopeFromCacheGKernel rope, reading the normed values from the buffer ──
+  const int64_t half = rd / 2;
+  const float* crow = cache + static_cast<int64_t>(*pos_dev) * rd;
+  for (int64_t i = threadIdx.x; i < half; i += blockDim.x) {  // rotary pairs [0,rd)
+    const float c = crow[i];
+    const float s = crow[half + i];
+    const float x0 = row[i];
+    const float x1 = row[i + half];
+    row[i] = x0 * c - x1 * s;
+    row[i + half] = x1 * c + x0 * s;
+  }
+}
+
 // ── Brick A2b GRAPH KV-append (capturable): write the new token's K/V into the cache ──
 // cache_k/cache_v[*len_dev * kvdim + i] = knew/vnew[i], for i in [0,kvdim). One thread per
 // element. *len_dev is read at REPLAY (host refreshes outside capture); the slot varies
@@ -784,6 +842,14 @@ void RopeFromCacheGLaunch(Queue& q, float* x, const float* cache, int64_t heads,
   RopeFromCacheGKernel<<<Blocks(heads * (rd / 2)), kTPB, 0, AsStream(q)>>>(x, cache, heads, Dh, rd,
                                                                            pos_dev);
 }
+void FusedQkNormRopeGLaunch(Queue& q, float* qbuf, float* kbuf, const float* q_norm,
+                            const float* k_norm, const float* cache, int64_t Hq, int64_t Hkv,
+                            int64_t Dh, int64_t rd, float eps, const int* pos_dev) {
+  // ONE block per head (Hq q heads then Hkv k heads); 256 threads (== the rms_norm_seq
+  // reduction width) so the block-reduced Σx² is byte-identical to the split rms_norm_seq.
+  FusedQkNormRopeGKernel<<<static_cast<unsigned>(Hq + Hkv), 256, 0, AsStream(q)>>>(
+      qbuf, kbuf, q_norm, k_norm, cache, Hq, Hkv, Dh, rd, eps, pos_dev);
+}
 void AppendKvRowLaunch(Queue& q, float* cache_k, float* cache_v, const float* knew,
                        const float* vnew, int64_t kvdim, const int* len_dev) {
   AppendKvRowKernel<<<Blocks(kvdim), kTPB, 0, AsStream(q)>>>(cache_k, cache_v, knew, vnew, kvdim,
@@ -884,7 +950,7 @@ const LagunaDeviceKernels kLaguna = {&RmsNormSeqLaunch,    &RopeFromCacheLaunch,
                                      &SigmoidTopKLaunch,   &DecodeAttnGqaGLaunch,
                                      &LmHeadGemvLaunch,    &AppendKvRowLaunch,
                                      &RopeFromCacheGLaunch, &EmbedGatherLaunch,
-                                     &AddAdd2RmsNormStdLaunch};
+                                     &AddAdd2RmsNormStdLaunch, &FusedQkNormRopeGLaunch};
 
 struct Registrar {
   Registrar() {

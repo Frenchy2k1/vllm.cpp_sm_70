@@ -121,6 +121,22 @@ struct LagunaDeviceKernels {
   // and the norm uses the identical 256-thread shared-tree reduction. Non-gemma.
   void (*fused_add2_rmsnorm)(vt::Queue&, float* out, float* residual, const float* x1,
                              const float* x2, const float* w, int64_t h, float eps);
+  // VT_LAGUNA_PREAMBLE_FUSED: the fused GRAPH attention preamble — ONE launch replacing the
+  // per-layer 4 kernels rms_norm_seq(q) + rms_norm_seq(k) + rope_from_cache_g(q) +
+  // rope_from_cache_g(k). One BLOCK per head (q heads [0,Hq), k heads [Hq,Hq+Hkv)), 256
+  // threads: the IDENTICAL block-reduced SoS as rms_norm_seq (sh[256] tree) followed by the
+  // IDENTICAL half-split partial-NeoX RoPE as rope_from_cache_g. In place on the qkvg q/k
+  // sub-ranges; the row index (pos) is read from a DEVICE pointer at REPLAY ⇒ capture-safe
+  // (mirror rope_from_cache_g). BYTE-EXACT to the 4-kernel compose: same inv, same
+  // (x*inv)*w multiply order, same rope math — the normed pair stays in a register instead
+  // of round-tripping f32 memory (an exact no-op), and each src index is read AND written
+  // by exactly one thread (its pair-owner or non-rotary owner) so the in-place write races
+  // nothing. qbuf/kbuf are qkvg[l]'s q/k slices; cache = the layer's regime cos/sin table
+  // (yarn_full for global, slide_full for sliding); rd = the layer's rotary dim (both q and
+  // k share the same cache+rd). Requires has_qk_norm (norm always applied here).
+  void (*fused_qk_norm_rope_g)(vt::Queue&, float* qbuf, float* kbuf, const float* q_norm,
+                               const float* k_norm, const float* cache, int64_t Hq, int64_t Hkv,
+                               int64_t Dh, int64_t rd, float eps, const int* pos_dev);
 };
 
 // Resolver (throws on a CPU-only build where nothing registered for kLaguna,kCUDA).

@@ -1597,6 +1597,26 @@ inline bool LagunaMoeAddNormFusedEnabled() {
   return on;
 }
 
+// ── VT_LAGUNA_PREAMBLE_FUSED: fold the GRAPH attention preamble into ONE launch (default
+// ON). The decode graph runs the per-layer preamble as FOUR under-occupied M=1 kernel
+// nodes — rms_norm_seq(q) + rms_norm_seq(k) + rope_from_cache_g(q) + rope_from_cache_g(k)
+// (2×nlayers RMSNorm + 2×nlayers RoPE launches/token). This lever collapses them into ONE
+// fused_qk_norm_rope_g node/layer (3 fewer graph nodes/layer), recovering the ramp/drain
+// device time the CUDA graph does NOT hide on tiny M=1 kernels — the same residual
+// mechanism the glue fusion (L1/L4) already exploited. BYTE-EXACT: the fused kernel uses
+// the IDENTICAL 256-thread shared-tree Σx² + 1/sqrtf reduction as rms_norm_seq and the
+// IDENTICAL half-split RoPE as rope_from_cache_g (the normed pair stays in a register, an
+// exact no-op vs the f32 memory round-trip) — a same-binary A/B: =0 restores the four
+// separate kernels. Only taken when the layer has q/k norm (else the unfused 2-RoPE path
+// stays). inline so a CPU build (VT_MARLIN_NVFP4 off, graph excluded) does not -Wunused.
+inline bool LagunaPreambleFusedEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_PREAMBLE_FUSED");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
 // ── On-device greedy sample + embed on the resident decode graph (VT_LAGUNA_ONDEV_SAMPLE).
 // Removes the per-step host round-trip: the driver used to Synchronize the graph, download
 // the whole [vocab] logits, argmax them on the HOST, then gather the next token's embedding
@@ -2123,6 +2143,7 @@ struct LagunaGraph {
     };
     const bool glue_fused = LagunaGlueFusedEnabled();
     const bool moe_addnorm_fused = LagunaMoeAddNormFusedEnabled();  // LEVER A
+    const bool preamble_fused = LagunaPreambleFusedEnabled();       // fused q/k norm+rope
     // VT_LAGUNA_ONDEV_SAMPLE: gather THIS step's input embedding ON-DEVICE from argmax_id
     // (seeded by Step, or the previous replay's argmax) into the persistent hidden buffer —
     // the in-graph replacement for the host embed loop in Step. Byte-identical widen (the
@@ -2170,13 +2191,23 @@ struct LagunaGraph {
         LAG->rms_norm_seq(q, hn.data(), hidden.data(),
                           input_norm_f[static_cast<size_t>(l)].data(), 1, H, eps, true);
       GemmBf16(base, lw.attn.qkvg_proj, hn.data(), c.qdim + 2 * kvdim + c.Hq, H);
-      if (p->has_qk_norm && !lw.attn.q_norm.Empty()) {
-        LAG->rms_norm_seq(q, qvp, qvp, q_norm_f[static_cast<size_t>(l)].data(), c.Hq,
-                          Dh, eps, true);
-        LAG->rms_norm_seq(q, kn, kn, k_norm_f[static_cast<size_t>(l)].data(), Hkv, Dh, eps, true);
+      const bool do_qk_norm = p->has_qk_norm && !lw.attn.q_norm.Empty();
+      if (preamble_fused && do_qk_norm) {
+        // ONE node: fused q/k RMSNorm + dual-head RoPE over the qkvg q/k slices, byte-exact
+        // to the four kernels below (same 256-thread reduction, same half-split rope). Both
+        // regimes handled by c.rd (global 64 / sliding 128) reading the layer's rcache.
+        LAG->fused_qk_norm_rope_g(q, qvp, kn, q_norm_f[static_cast<size_t>(l)].data(),
+                                  k_norm_f[static_cast<size_t>(l)].data(), rcache, c.Hq, Hkv, Dh,
+                                  c.rd, eps, pos_buf.data());
+      } else {
+        if (do_qk_norm) {
+          LAG->rms_norm_seq(q, qvp, qvp, q_norm_f[static_cast<size_t>(l)].data(), c.Hq,
+                            Dh, eps, true);
+          LAG->rms_norm_seq(q, kn, kn, k_norm_f[static_cast<size_t>(l)].data(), Hkv, Dh, eps, true);
+        }
+        LAG->rope_from_cache_g(q, qvp, rcache, c.Hq, Dh, c.rd, pos_buf.data());
+        LAG->rope_from_cache_g(q, kn, rcache, Hkv, Dh, c.rd, pos_buf.data());
       }
-      LAG->rope_from_cache_g(q, qvp, rcache, c.Hq, Dh, c.rd, pos_buf.data());
-      LAG->rope_from_cache_g(q, kn, rcache, Hkv, Dh, c.rd, pos_buf.data());
       // GRAPH decode attention: cache_k[l][0..len) + kn/vn as the new row, with
       // len/pos read from the DEVICE buffers. first_pos=0 (uniform, P<512).
       LAG->decode_attn_gqa_g(q, attn.data(), qvp, cache_k[static_cast<size_t>(l)].data(),
