@@ -1,5 +1,20 @@
 # Benchmarks
 
+## DeepSeek-V4-Flash UD-IQ2_M — IQ2_S + MXFP4 CPU keep-quant bring-up (2026-08-03, `CLAIM-DSV4-UDIQ2M-QUANT`) — no throughput owed (off-GPU correctness bring-up)
+
+Off-GPU task (GB10 down, no nvcc on the dev box), so NO throughput is measured or owed. Adds the two per-tensor "dynamic" encodings the `unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_M` checkpoint's last 4 routed-expert slabs use — **IQ2_S** (ggml type 22; 2.5625 bpw codebook, Q8_K activation) and **MXFP4** (type 39; OCP micro-scaling fp4, 32-elem blocks, Q8_0 activation) — as first-class vt block dtypes (`kIQ2_S`/`kMXFP4`): block traits + dequant + a keep-quant `vec_dot`, ported 1:1 from llama.cpp `ggml-quants.c` @ 237ad9b96 (`iq2s_grid` 1024-entry codebook copied verbatim + direct sign bytes; `kvalues_mxfp4` + `e8m0_to_fp32_half`). The memory point: these load COMPRESSED (keep-quant) instead of the ~17 GiB bf16 expansion that OOM-reboots the 119 GiB pool.
+
+**CPU gate (g++, `-DVLLM_CPP_CUDA=OFF`, all GREEN):**
+
+| test | result | what it pins |
+|---|---|---|
+| `test_gguf_dequant` | 17/17 · 539 assertions | hand-derived golden IQ2_S (grid 0/1/2/256, qh high bit, direct signs, low/high scale nibbles) + MXFP4 (kvalues + E8M0 half-scale) bytes, computed independently from the ggml formula |
+| `test_ops_quant_dot` | 19/19 · 150136 assertions | keep-quant `vec_dot` == an INDEPENDENT f64 dequant-then-dot (separate decode path) over 1/2/3/5/7/16 blocks + `MatmulBTQuant` NMSE ≤ 5e-4 + run-to-run bit-exactness |
+| `test_ops_quant_traits` | 9/9 · 5700 assertions | geometry cross-check (vt table vs GGUF reader traits) + traits row (IQ2_S→Q8_K, MXFP4→Q8_0, no `from_float`) |
+| `test_gguf_keep_quant` | 37/37 · 6061 assertions | `KeepQuantDType` now keeps IQ2_S/MXFP4 compressed; routing totality table (kept 16, expanded 452) |
+
+**Box-deferred (UNBUILT — do not read as compiling):** the IQ2_S device `DotSuperblock<WType::kIQ2_S>` is written + wired into the CUDA Q8_K grouped-MoE GEMM, and an MXFP4 device dot (`DotMXFP4`) is written but NOT wired (Q8_0-activation needs a separate 32-block GEMM). Owed when GB10 returns: the CUDA build of both + a real UD-IQ2_M GPU load/coherence run.
+
 ## Laguna-S-2.1-NVFP4 decode — router top-k KERNEL-EFFICIENCY (`VT_LAGUNA_TOPK_SHFL`), BYTE-EXACT, SigmoidTopK 1.67×, −0.57% decode-step GPU (2026-08-03, `CLAIM-LAGUNA-TOPK-SHFL`)
 
 With the residual-norm byte-exact floor reached (`CLAIM-LAGUNA-FAST-NORM` below), a fresh `nsys cuda_gpu_kern_sum --cuda-graph-trace=node` 2-length diff (20-vs-70) ranked the remaining small kernels; excluding the at-parity projection GEMVs (`gemvx`, ~69% of decode step — the IDENTICAL cuBLAS kernels vLLM uses) and the Marlin MoE (we win) / attention-compute kernels, the router `SigmoidTopKKernel` was the single largest still-optimizable small kernel (415 µs/step, 1.6%). Same box/model/ids/env as below (`~/laguna-xs-nvfp4`, ids `2,785,9626,377,15360,395`, `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1`), origin/main `e61b4de3`.
