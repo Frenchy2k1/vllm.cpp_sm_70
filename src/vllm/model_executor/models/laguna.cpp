@@ -660,7 +660,7 @@ std::vector<float> LagunaMoeResidentMarlin(vt::Queue& q, const LagunaMoeWeights&
 void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, const float* hn_dev,
                                  int64_t moe_I, int64_t H, int64_t E, const int32_t* ids_dev,
                                  const float* w_dev, int64_t Pk, float* out_dev,
-                                 const void* hn_bf16 = nullptr) {
+                                 const void* hn_bf16 = nullptr, void* out_bf16 = nullptr) {
   using vt::DType;
   if (Pk == 0) return;
   vt::Backend& bk = vt::GetBackend(q.device.type);
@@ -740,10 +740,19 @@ void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, cons
   vt::MoeGroupedGemmNvfp4Marlin(q, ddown.t(), dact.t(), wd, sd, gd, ws, sorted.t(), eids.t(),
                                 npad.t(), dtw, vt::MoeMarlinArgs{bi, 1, Pki, Hi, Ii, false});
   vt::Tensor expert_out = vllm::dense_nvfp4::MakeTensor(ddown.ptr(), DType::kBF16, dev, {1, Pk, H});
-  vllm::dense_nvfp4::DBuf dout(d, DType::kBF16, {1, H});
-  vt::MoeCombine(q, dout.t(), expert_out, dtw);
-  vt::Tensor ot = vllm::dense_nvfp4::MakeTensor(out_dev, DType::kF32, dev, {1, H});
-  vt::CastF32(q, ot, dout.t());  // bf16 -> f32, device (no download)
+  // VT_LAGUNA_TAIL_FUSED: when the caller passes a persistent bf16 out buffer, MoeCombine
+  // writes its bf16 result straight there and the caller's bf16-x1 fused_add2_rmsnorm
+  // widens it in-kernel — SKIPS the standalone CastF32 node (byte-exact: same bf16 bytes,
+  // same widen). Else the default bf16-combine + CastF32-to-f32 path (unchanged).
+  if (out_bf16 != nullptr) {
+    vt::Tensor ob = vllm::dense_nvfp4::MakeTensor(out_bf16, DType::kBF16, dev, {1, H});
+    vt::MoeCombine(q, ob, expert_out, dtw);
+  } else {
+    vllm::dense_nvfp4::DBuf dout(d, DType::kBF16, {1, H});
+    vt::MoeCombine(q, dout.t(), expert_out, dtw);
+    vt::Tensor ot = vllm::dense_nvfp4::MakeTensor(out_dev, DType::kF32, dev, {1, H});
+    vt::CastF32(q, ot, dout.t());  // bf16 -> f32, device (no download)
+  }
 }
 
 // ── VT_LAGUNA_SHARED_FP4: the per-layer SHARED expert via the SAME Marlin W4A16
@@ -1672,6 +1681,27 @@ inline bool LagunaMoeOnecastEnabled() {
   return on;
 }
 
+// ── VT_LAGUNA_TAIL_FUSED: fold the routed-MoE output CastF32 into the trailing
+// fused_add2_rmsnorm (default ON). Under the glue+addnorm-fused decode the routed expert
+// path ends with vt::MoeCombine writing a bf16 [1,H] result, THEN a standalone vt::CastF32
+// widening it to the f32 `doutb` the fused_add2_rmsnorm reads as x1 — one M=1 CastF32 graph
+// node PER MoE layer (~39/step). This lever has MoeCombine write its bf16 result straight
+// into a persistent bf16 buffer and feeds that to a bf16-x1 fused_add2_rmsnorm sibling that
+// widens in-kernel, deleting the CastF32 node (recovers the ramp/drain the CUDA graph does
+// NOT hide on the tiny cast — same mechanism as the onecast/preamble/addnorm folds).
+// BYTE-EXACT: MoeCombine writes the IDENTICAL bf16 bytes either way, and the in-kernel
+// __bfloat162float reproduces exactly what vt::CastF32 wrote (bf16 bits << 16) — a same-
+// binary A/B: =0 restores MoeCombine(bf16)+CastF32+f32 fused_add2. Only taken in the
+// glue+addnorm-fused regime (the f32 split path is unchanged otherwise). inline so a CPU
+// build (VT_MARLIN_NVFP4 off, graph excluded) does not -Wunused.
+inline bool LagunaTailFusedEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_TAIL_FUSED");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
 bool LagunaCanRunResidentDecode(const LagunaParams& p, vt::Queue& q, const LagunaWeights& w,
                                 int64_t T) {
 #ifndef VT_MARLIN_NVFP4
@@ -2010,6 +2040,7 @@ struct LagunaGraph {
   // per MoE layer and reused by the router GEMM + routed-expert Marlin + shared-expert
   // Marlin (fixed address ⇒ capture-safe; unlike `abf` which each GemmBf16 overwrites).
   std::vector<uint16_t> hn_bf16;
+  std::vector<uint16_t> doutb_bf16;  // VT_LAGUNA_TAIL_FUSED: bf16 routed-MoE out (no CastF32)
   std::vector<int32_t> eids32;
   // VT_LAGUNA_ONDEV_SAMPLE: single-element device buffer holding the greedy token id.
   // Step seeds it (host) with THIS step's input token; RunChain's embed_gather reads it
@@ -2134,6 +2165,7 @@ struct LagunaGraph {
     logits.assign(static_cast<size_t>(Vsz), 0.0F);
     abf.assign(static_cast<size_t>(maxK), 0);
     hn_bf16.assign(static_cast<size_t>(H), 0);  // VT_LAGUNA_MOE_ONECAST reuse buffer
+    doutb_bf16.assign(static_cast<size_t>(H), 0);  // VT_LAGUNA_TAIL_FUSED reuse buffer
     eids32.assign(static_cast<size_t>(topk), 0);
     argmax_id.assign(1, 0);  // VT_LAGUNA_ONDEV_SAMPLE token buffer (device-accessible)
   }
@@ -2203,6 +2235,11 @@ struct LagunaGraph {
     const bool moe_addnorm_fused = LagunaMoeAddNormFusedEnabled();  // LEVER A
     const bool preamble_fused = LagunaPreambleFusedEnabled();       // fused q/k norm+rope
     const bool moe_onecast = LagunaMoeOnecastEnabled();             // one hn→bf16 cast/MoE-layer
+    // VT_LAGUNA_TAIL_FUSED: bf16 routed-MoE out widened in fused_add2 (drops routed CastF32).
+    // Only meaningful in the glue+addnorm-fused regime (its fused_add2 tail is what absorbs
+    // the widen); otherwise the f32 doutb + CastF32 path stays.
+    const bool tail_fused =
+        LagunaTailFusedEnabled() && glue_fused && moe_addnorm_fused;
     // VT_LAGUNA_ONDEV_SAMPLE: gather THIS step's input embedding ON-DEVICE from argmax_id
     // (seeded by Step, or the previous replay's argmax) into the persistent hidden buffer —
     // the in-graph replacement for the host embed loop in Step. Byte-identical widen (the
@@ -2327,8 +2364,11 @@ struct LagunaGraph {
                                 : moe_bias_f[static_cast<size_t>(l)].data();
         LAG->sigmoid_topk(q, eids32.data(), topw.data(), gatingp, bias, bias != nullptr, E,
                           topk, p->norm_topk_prob, p->moe_routed_scaling_factor);
+        // VT_LAGUNA_TAIL_FUSED: when on, MoeCombine writes the routed output as bf16 into
+        // doutb_bf16 (no CastF32) and the bf16-x1 fused_add2 below widens it in-kernel.
+        void* routed_bf16 = tail_fused ? static_cast<void*>(doutb_bf16.data()) : nullptr;
         LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
-                                    topk, doutb.data(), hnb);
+                                    topk, doutb.data(), hnb, routed_bf16);
         if (shared_fp4) {
           LagunaSharedExpertMarlinInto(q, lw.moe, hn.data(), H, so.data(), hnb);  // fp4 shared
         } else {
@@ -2338,7 +2378,12 @@ struct LagunaGraph {
         // LEVER A: hidden += routed + shared; hn = rms_norm(hidden)*next_norm in ONE node
         // (byte-exact vs AddInto(doutb) + FusedAddNorm(so)). Only in the glue-fused regime
         // (the split path is what it replaces); =0 restores the two-node split.
-        if (glue_fused && moe_addnorm_fused) {
+        if (tail_fused) {
+          // routed contribution (x1) is bf16 in doutb_bf16, widened in-kernel; shared (x2) f32.
+          LAG->fused_add2_rmsnorm_bf16x1(q, hn.data(), hidden.data(),
+                                         static_cast<const void*>(doutb_bf16.data()), so.data(),
+                                         next_norm, H, eps);
+        } else if (glue_fused && moe_addnorm_fused) {
           LAG->fused_add2_rmsnorm(q, hn.data(), hidden.data(), doutb.data(), so.data(), next_norm,
                                   H, eps);
         } else {

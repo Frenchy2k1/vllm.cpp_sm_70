@@ -137,6 +137,13 @@ struct LagunaDeviceKernels {
   void (*fused_qk_norm_rope_g)(vt::Queue&, float* qbuf, float* kbuf, const float* q_norm,
                                const float* k_norm, const float* cache, int64_t Hq, int64_t Hkv,
                                int64_t Dh, int64_t rd, float eps, const int* pos_dev);
+  // VT_LAGUNA_TAIL_FUSED: bf16-x1 sibling of fused_add2_rmsnorm. Same one-node MoE tail
+  // (residual=(residual+x1)+x2; out=rms_norm(residual)*w) but x1 (the routed-expert
+  // output) is bf16 and widened in-kernel — folds the routed MoE CastF32 (bf16->f32)
+  // into this reduce (one graph node/MoE-layer fewer). BYTE-EXACT: the in-kernel widen
+  // reproduces the bits vt::CastF32 wrote. x2 (shared expert) stays f32.
+  void (*fused_add2_rmsnorm_bf16x1)(vt::Queue&, float* out, float* residual, const void* x1,
+                                    const float* x2, const float* w, int64_t h, float eps);
 };
 
 // Resolver (throws on a CPU-only build where nothing registered for kLaguna,kCUDA).

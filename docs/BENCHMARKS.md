@@ -1,5 +1,24 @@
 # Benchmarks
 
+## Laguna-S-2.1-NVFP4 decode — routed-MoE CastF32 fold (`VT_LAGUNA_TAIL_FUSED`), byte-exact, −39 nodes/step, wall-neutral (2026-08-03, `CLAIM-LAGUNA-TAIL-FUSED`)
+
+Continuation of the byte-exact node-count campaign (glue/preamble/addnorm/onecast) on the GB10 NVFP4 decode graph (`~/laguna-xs-nvfp4`, ids `2,785,9626,377,15360,395`, base env `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1`, origin/main `65f3cdc1`). A fresh `cuda_gpu_kern_sum --cuda-graph-trace=node` 20↔70 diff of the baseline ranked the remaining SMALL decode kernels; the biggest tail items are already folded (`RmsNormRow`+`AddAdd2RmsNorm` = the add_rms_norm forms, `FusedQkNormRope` = the preamble) or unfoldable (`SigmoidTopK`/router GEMV = cuBLAS-adjacent, `DecodeAttnGqaSplitG`/`DecodeAttnCombine` = attention compute, `MoeAlign`/`SiluAndMul`/`MoeCombine` = ported-Marlin pipeline). The one clean byte-exact node reduction left was the MoE-output `CastF32`.
+
+**`VT_LAGUNA_TAIL_FUSED` (default ON): fold the routed-MoE `CastF32` into the trailing `fused_add2_rmsnorm`.** The routed expert path ended `vt::MoeCombine → bf16 [1,H]`, then a STANDALONE `vt::CastF32` widened it to the f32 `doutb` that `fused_add2_rmsnorm` reads as x1 — one M=1 `CastF32` graph node PER MoE layer (39/step). This lever has `MoeCombine` write its bf16 result straight into a persistent bf16 buffer and feeds it to a new bf16-x1 sibling `AddAdd2RmsNormStdBf16Kernel` that widens IN-KERNEL (`__bfloat162float`), deleting the `CastF32` node. **BYTE-EXACT**: `MoeCombine` writes the IDENTICAL bf16 bytes either way, and the in-kernel widen reproduces exactly what `vt::CastF32` wrote (bf16 bits << 16) — `=1` vs `=0` produce byte-identical 160-token id streams (first-20 `22345 83 268 33586 81 855 397 874 367 6376 815 340 9626 377 15360 83 1729 756 1205 565`). Only taken in the glue+addnorm-fused regime (the shared-expert x2 stays f32); `=0` is a same-binary A/B opt-out.
+
+nsys `cuda_gpu_kern_sum --cuda-graph-trace=node` 2-length diff (20↔70):
+
+| metric | `=0` | `=1` |
+|---|---|---|
+| `CastF32Kernel` inst/step | 78.0 | **39.0 (−39 = 39 MoE layers)** |
+| total graph nodes/step | 919.0 | **880.0 (−39)** |
+| projection GEMV µs/step (`gemvx` 6+7) | 18133 | 18059 (parity within run-noise) |
+| we-win Marlin MoE µs/step | 3783 | 3773 (parity) |
+
+decode_hp (drop_caches, 3 paired reps): `=0` {36.666, 36.677, 36.803} med **36.677**; `=1` {36.727, 36.795, 36.574} med **36.727**. **The wall is a WASH** — median +0.14%, mean −0.04%, at the ~0.3% drop_caches noise floor (the 39 removed casts are ~43 µs/step, below noise); paired reps split 2:1 for `=1` with a low `=1` rep-3 outlier. GPU-busy reads at parity. Lands default-ON on the IDENTICAL "shrink the captured node count, byte-exact, no regression" basis as `VT_LAGUNA_MOE_ONECAST`/`…PREAMBLE_FUSED`/`…MOE_ADDNORM_FUSED` — the deterministic win is the node-count drop, NOT a measurable wall gain. Combined headline unchanged: **36.97 tok/s = 86.0% of vLLM-NVFP4 43** (this fold is wall-neutral).
+
+**HONEST TIER STATUS: the byte-exact decode-tail fold campaign is now essentially EXHAUSTED.** The fresh ranking confirms the residual small-kernel tail is dominated by kernels that are already folded, attention COMPUTE (not glue), cuBLAS/router-adjacent (`SigmoidTopK` cannot fold into the cuBLAS router GEMV epilogue), or ported-Marlin pipeline kernels (`MoeAlign`/`SiluAndMul`/`MoeCombine`, not byte-exact foldable without modifying vLLM's own kernels; folding `MoeCombine`→f32 direct would DROP the bf16 truncation = a near-tie, not byte-exact). The remaining gap to vLLM 43 is genuine device compute (bf16 projection GEMV ~55% at cuBLAS parity + lm_head 7.4% at floor + we-win Marlin MoE), consistent with the recorded "Laguna-NVFP4 at practical ceiling" finding. Repro: `~/tail_gate.sh`.
+
 ## Laguna-S-2.1-NVFP4 decode — W7 two-front pass: honest wall (FRONT 1) + one-cast MoE-input fold (FRONT 2), byte-exact (2026-08-03, `CLAIM-LAGUNA-W7-DECODE`)
 
 Two byte-exact fronts on the GB10 NVFP4 decode graph (`~/laguna-xs-nvfp4`, ids `2,785,9626,377,15360,395`, base env `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1`, origin/main `0678d85b`). Combined best (onecast on + per-step log off): **decode 36.97 tok/s = 86.0% of vLLM-NVFP4 43** (up from the pre-pass 36.64 / 85.2%). Both land default-ON. Repro: `~/laguna-n4-build/w7_measure.sh`.
