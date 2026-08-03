@@ -1435,9 +1435,10 @@ loop, not parallelism or layout. An optional MLX GEMM provider is available via
 `-DVLLM_CPP_MLX=ON` and currently measures net slower than our own kernels. Full
 per-lever chronology: [docs/BENCHMARKS.md](BENCHMARKS.md) and
 [.agents/specs/metal-dispatch-attribution.md](../.agents/specs/metal-dispatch-attribution.md).
-The MLX-enabled Darwin build remains **build-verification pending**: its narrow
-AppleClang header-warning suppression now lives in the provider translation unit
-so the target-wide `-Werror` cannot re-promote it; Darwin CI is the binding gate.
+The MLX-enabled Darwin build remains **build-verification pending**: MLX is now
+an imported CMake dependency whose public include directory is explicitly
+`SYSTEM`; third-party header diagnostics stay outside project `-Werror`, while
+vllm.cpp warnings remain fatal. Darwin CI is the binding AppleClang gate.
 
 **CUDA architectures.** The production target is GB10/`sm_121a` (runtime-gated,
 both gate models token-exact + at/above vLLM speed). The arch-additivity
