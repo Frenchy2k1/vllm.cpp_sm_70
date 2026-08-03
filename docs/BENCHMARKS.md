@@ -521,6 +521,21 @@ a fetched checkpoint. Q4_K keep-quant decode is already landed (ds4 path) so no 
 decode kernel is needed. See `.agents/specs/laguna-s21-w3-2026-07-31.md` (+ W1/W2
 `laguna-s21-w1w2-2026-07-30.md`).
 
+## born-on-the-runner guard — bf16-resident-activation invariant (2026-08-03) - VOID (CI-guard, no throughput owed)
+
+Extended `scripts/check-runner-routing-consistency.py` with a THIRD sub-check (c):
+a registered model's decode must keep its residual/activation stream in bf16 device
+`DBuf`s, not hand-roll a private `std::vector<float>` host stream cast to bf16 before
+every projection (the Laguna/DeepSeek-V4-GGUF f32-stream escape). Pure Python + a
+sibling allowlist (`scripts/runner-bf16-activation-allowlist.txt`: `laguna`,
+`deepseek_v4`) + mutation tests — NO engine code, kernel, or config path changed, so
+no benchmark is owed. Guard green (27 registrations: 24 bf16-resident, 2 f32-stream
+allowlisted, 1 refuse stub); `tests/scripts` mutation suite 31/31. The two flagged
+models are the SAME off-framework decodes already tracked for perf (see the Laguna
+NVFP4 decode entries above and the DeepSeek-V4 Q8_K entry); the guard only prevents a
+NEW f32-stream model from landing silently. Details in
+[docs/STATUS.md](STATUS.md#verification-and-parity).
+
 ## fusion-consistency gate-test repair (2026-07-30) - VOID (test-only, no throughput owed)
 
 A hardcoded `gemma2` expectation in the fusion-consistency mutation test, made

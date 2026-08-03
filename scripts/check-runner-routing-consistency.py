@@ -13,7 +13,7 @@ logit download. A model born off the runner inherits none of the parity-enablers
 decode-graph capture) and forces per-model rediscovery — the "Laguna anti-pattern"
 (AGENTS.md, the decode/runtime seam added in `c5c872e6`).
 
-Two invariants, checked per `REGISTER_VLLM_MODEL` (`.forward = &Fn`):
+Three invariants, checked per `REGISTER_VLLM_MODEL` (`.forward = &Fn`):
 
 (a) **ON-DEVICE LOGITS** — the model's DEFAULT (`gather_logits`) production forward
     returns a device-resident `ForwardLogits` (reaches the device-logits seam
@@ -28,6 +28,29 @@ Two invariants, checked per `REGISTER_VLLM_MODEL` (`.forward = &Fn`):
     CLEAN device-resident model that merely keeps a `*GenerateCore` example helper
     around (e.g. qwen3_5's `VLGenerateCoreGdn`) is NOT flagged — the runner path,
     not the presence of a helper, is what makes a model "born on the runner".
+
+(c) **BF16-RESIDENT ACTIVATIONS** — the model's decode path must keep the residual/
+    activation stream in bf16 **device** buffers (the shared `dense_attn::AttnBlock`
+    preamble + `DBuf` glue, mirroring vLLM's per-op bf16 stores), NOT hand-roll a
+    private `std::vector<float>` host residual stream threaded through the per-token
+    decode with a `CastBf16`/`GemmBf16`-before-every-projection anti-pattern (AGENTS.md
+    born-on-the-runner: "`DBuf`s, not an f32 host residual stream with a `CastBf16`
+    before every projection"). A model whose decode files declare >= MIN_F32_RESID
+    private f32 residual-stream buffers (`std::vector<float> {hidden,residual,resid,
+    hn,hs,x,...}`) AND route the stream through NEITHER the shared bf16 attn preamble
+    (`dense_attn::AttnBlock(`) NOR a bf16-`DBuf` residual (`DBuf hidden/res ... kBF16`)
+    is classified **F32_STREAM** (drift); an on-framework `DBuf`-based decode is
+    **BF16_RESIDENT** (clean). This axis is ORTHOGONAL to (a): deepseek_v4 returns
+    device-resident logits (DEVICE, clean on (a)) yet computes its whole decode in an
+    f32 host vector stream and only uploads the final logits (F32_STREAM, drift on (c));
+    qwen3_vl is HOST on (a)/(b) yet its per-token transformer decode residual is a bf16
+    `DBuf` (BF16_RESIDENT, clean on (c)). Supporting per-projection host casts
+    (`CastBf16(`/`GemmBf16(`) are REPORTED but not required: laguna casts hn->bf16 before
+    each projection (18 sites) while deepseek_v4 keeps everything f32 and quantizes
+    per-GEMM (0 CastBf16) — both are the same f32-host-stream escape, so the load-bearing
+    signal is the f32 residual-stream declaration + the ABSENCE of a bf16-resident stream,
+    not the cast-kernel name. This invariant is REFUSE-skipped like (a): a
+    VT_CHECK(false) stub decodes nothing.
 
 Like check-fusion-consistency.py this is a coarse FLOOR, not a per-site proof, and it
 resolves through the codebase's real seams so the false-positive/negative rate stays
@@ -51,13 +74,20 @@ low:
     (gemma4) is CLEAN — its default decode still reaches ForwardDevice.
 
 A model that legitimately cannot route yet is a CONSCIOUS, reviewable allowlist entry
-(scripts/runner-routing-allowlist.txt) with a reason; the 3 known off-framework models
-(laguna, deepseek_v4, qwen3_vl) keep the gate GREEN while a NEW off-runner model must be
-a deliberate allowlist landing. Removing an entry after the model is routed through the
-runner (device-resident logits) is the enforcement gate closing.
+with a reason + fold-plan tier — never a silent landing. The (a)/(b) logits/generate
+seam has its own allowlist (scripts/runner-routing-allowlist.txt: laguna, qwen3_vl);
+the (c) bf16-activation seam has a SIBLING allowlist
+(scripts/runner-bf16-activation-allowlist.txt: laguna, deepseek_v4) — kept separate
+because the two axes have DIFFERENT membership (deepseek_v4 is clean on (a) but drifts
+on (c); qwen3_vl drifts on (a)/(b) but is clean on (c)), so a shared flat list would
+silently cross-suppress. Removing an (a)/(b) entry after the model returns
+device-resident logits, or a (c) entry after its decode routes onto the shared bf16
+`AttnBlock`/`DBuf` glue (byte-exact / token-exact-or-near-tie gated), is the enforcement
+gate closing.
 
-The validation logic is pure functions (`classify_body`, `drift_models`) so it is unit-
-and mutation-testable (tests/scripts/test_check_runner_routing_consistency.py), mirroring
+The validation logic is pure functions (`classify_body`, `classify_activation_stream`,
+`drift_models`, `f32_stream_drift_models`) so it is unit- and mutation-testable
+(tests/scripts/test_check_runner_routing_consistency.py), mirroring
 check-fusion-consistency.py.
 """
 
@@ -72,6 +102,14 @@ ROOT = Path(__file__).resolve().parents[1]
 MODELS_DIR = ROOT / "src/vllm/model_executor/models"
 INCLUDE_DIR = ROOT / "include/vllm/model_executor/models"
 ALLOWLIST = ROOT / "scripts/runner-routing-allowlist.txt"
+# Invariant (c) has its OWN allowlist — different membership than (a)/(b).
+BF16_ACT_ALLOWLIST = ROOT / "scripts/runner-bf16-activation-allowlist.txt"
+
+# Invariant (c) threshold: how many private f32 residual-stream declarations a decode
+# file set must carry before it counts as a hand-rolled f32 stream. laguna declares 12,
+# deepseek_v4 declares 8; every on-framework (DBuf) model declares 0 — so any floor in
+# [1, 8] separates them. 3 is a conservative margin that ignores a lone f32 scratch var.
+MIN_F32_RESID = 3
 
 # --- Seam / signal regexes ----------------------------------------------------
 
@@ -108,6 +146,31 @@ _GENERATE_CORE_DEF = re.compile(
 # A free function the hook calls whose definition file carries the real decode body
 # (Qwen3VLForwardStepLastLogits -> qwen3_vl.cpp, which also holds VLGenerateCore).
 _FREE_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+
+# --- Invariant (c): bf16-resident activations vs a hand-rolled f32 host stream -------
+
+# A PRIVATE f32 residual/activation-stream declaration: `std::vector<float> <name>` where
+# <name> is a residual/hidden/activation carrier threaded through the per-token decode.
+# This is the load-bearing tell of the anti-pattern AGENTS.md names ("an f32 host residual
+# stream ... with a CastBf16 before every projection"). Only the FIRST identifier of a
+# multi-declaration is required to match (e.g. `std::vector<float> x, resA, resB` counts
+# once) — the count is a coarse floor, not an exact buffer census.
+_F32_RESID_DECL = re.compile(
+    r"std::vector<\s*float\s*>\s+(?:hidden|residual|resid|res|hstate|hs|hn|x|cur|act)\b"
+)
+# The BF16-RESIDENT exemption: the decode keeps its stream in bf16 device buffers. Either
+# it routes through the shared bf16 attention preamble (`dense_attn::AttnBlock(` / an
+# `AttnBlock(` call under `using namespace dense_attn`) OR it binds a bf16-`DBuf` residual
+# stream (`DBuf hidden/res/residual(... kBF16 ...)`). NB: this is deliberately NARROW —
+# it matches a residual-NAMED bf16 DBuf, not a per-op bf16 scratch DBuf (laguna's `DBuf
+# dh(... kBF16)` cast-scratch must NOT exempt it, since its residual is still `std::vector
+# <float> hidden`).
+_BF16_ATTN_PREAMBLE = re.compile(r"(?:dense_attn::)?\bAttnBlock\s*\(")
+_BF16_DBUF_RESID = re.compile(
+    r"\bDBuf\s+(?:hidden|residual|resid|res|hstate|hs)\s*\([^;{}]*\bkBF16\b"
+)
+# Supporting (reported, not required) evidence: a per-projection host cast/GEMM helper.
+_PER_PROJ_HOST_CAST = re.compile(r"\b(?:CastBf16|GemmBf16(?:Into)?)\s*\(")
 
 
 def read(path: Path) -> str:
@@ -204,6 +267,34 @@ def classify_with_helpers(body: str | None, defining_text: str) -> str:
     return "NONE"
 
 
+def count_f32_resid_decls(text: str) -> int:
+    """Number of private f32 residual/activation-stream declarations in a decode TU."""
+    return len(_F32_RESID_DECL.findall(strip_comments(text)))
+
+
+def is_bf16_resident(text: str) -> bool:
+    """True if the decode TU keeps its residual stream bf16-resident on device — via the
+    shared `dense_attn::AttnBlock(` preamble or a bf16-`DBuf` residual (`DBuf hidden ...
+    kBF16`). A per-op bf16 scratch DBuf does NOT count (the regex is residual-named)."""
+    t = strip_comments(text)
+    return bool(_BF16_ATTN_PREAMBLE.search(t) or _BF16_DBUF_RESID.search(t))
+
+
+def classify_activation_stream(text: str) -> str:
+    """Classify a decode file set's activation stream (invariant c): F32_STREAM if it
+    hand-rolls >= MIN_F32_RESID private f32 residual-stream buffers AND is NOT
+    bf16-resident (no shared AttnBlock preamble, no bf16-DBuf residual); else
+    BF16_RESIDENT. Pure over the concatenated decode-body text so it is mutation-testable.
+
+    A bf16-resident decode wins even if it also declares some f32 scratch — the exemption
+    is checked FIRST so a `DBuf`-based model that keeps an f32 helper is never mislabeled."""
+    if is_bf16_resident(text):
+        return "BF16_RESIDENT"
+    if count_f32_resid_decls(text) >= MIN_F32_RESID:
+        return "F32_STREAM"
+    return "BF16_RESIDENT"
+
+
 def resolve_alias(cls: str, alias: dict[str, str]) -> str:
     seen: set[str] = set()
     while cls in alias and cls not in seen:
@@ -221,6 +312,9 @@ class ModelRoute:
     classification: str            # DEVICE | HOST | REFUSE | NONE
     private_generate_loop: bool    # invariant (b): ships a *GenerateCore host loop
     device_source: str = ""        # which delegated class supplied the device seam
+    activation: str = "BF16_RESIDENT"  # invariant (c): F32_STREAM | BF16_RESIDENT
+    f32_resid_decls: int = 0       # invariant (c): private f32 residual-stream decls
+    per_proj_host_casts: int = 0   # invariant (c): supporting CastBf16/GemmBf16 sites
 
 
 def build_alias_map(files: list[Path]) -> dict[str, str]:
@@ -334,6 +428,20 @@ def scan_registrations(
             elif _REFUSE.search(clean_body):
                 classification = "REFUSE"
 
+        # Invariant (c): bf16-resident activations. Scope to the decode-BODY files (the
+        # registry hook file + the delegated ForwardDevice impl files) — NOT the broader
+        # free-fn expansion below (which would drag in a model's mm-PREFILL / audio tower
+        # helpers, whose legitimate f32 vectors are not the decode residual stream). A
+        # REFUSE stub decodes nothing, so it is never an f32-stream escape.
+        decode_text = "\n".join(file_text.get(f, "") for f in sorted(impl_files))
+        f32_resid = count_f32_resid_decls(decode_text)
+        per_proj_casts = len(_PER_PROJ_HOST_CAST.findall(strip_comments(decode_text)))
+        activation = (
+            classify_activation_stream(decode_text)
+            if classification != "REFUSE"
+            else "BF16_RESIDENT"
+        )
+
         # Invariant (b): does this model's decode-body file set define a private
         # *GenerateCore host loop? (Only meaningful for a HOST model — a DEVICE model
         # that keeps a GenerateCore example helper is legitimately clean.)
@@ -353,6 +461,9 @@ def scan_registrations(
             classification=classification,
             private_generate_loop=private_loop,
             device_source=device_source,
+            activation=activation,
+            f32_resid_decls=f32_resid,
+            per_proj_host_casts=per_proj_casts,
         )
     return routes
 
@@ -381,6 +492,22 @@ def drift_models(
     )
 
 
+def f32_stream_drift_models(
+    scanned: dict[str, ModelRoute], allowlisted: set[str]
+) -> list[str]:
+    """Model names whose decode hand-rolls an f32 host residual/activation stream
+    instead of the shared bf16 DBuf glue (invariant c: activation == F32_STREAM) and
+    are not allowlisted. Empty == the check passes. REFUSE stubs and BF16_RESIDENT
+    (DBuf-based) decodes never drift."""
+    return sorted(
+        name
+        for name, route in scanned.items()
+        if route.activation == "F32_STREAM"
+        and route.classification != "REFUSE"
+        and name not in allowlisted
+    )
+
+
 def _load_allowlist(path: Path) -> set[str]:
     return allowlisted_names(read(path)) if path.exists() else set()
 
@@ -388,14 +515,25 @@ def _load_allowlist(path: Path) -> set[str]:
 def main() -> int:
     scanned = scan_registrations(MODELS_DIR, INCLUDE_DIR)
     allowlisted = _load_allowlist(ALLOWLIST)
+    bf16_allowlisted = _load_allowlist(BF16_ACT_ALLOWLIST)
     drift = drift_models(scanned, allowlisted)
+    f32_drift = f32_stream_drift_models(scanned, bf16_allowlisted)
 
     n_device = sum(1 for r in scanned.values() if r.classification == "DEVICE")
     n_host = sum(1 for r in scanned.values() if r.classification == "HOST")
     n_refuse = sum(1 for r in scanned.values() if r.classification == "REFUSE")
     n_none = sum(1 for r in scanned.values() if r.classification == "NONE")
+    n_f32 = sum(1 for r in scanned.values() if r.activation == "F32_STREAM")
+    n_bf16 = sum(
+        1 for r in scanned.values()
+        if r.activation == "BF16_RESIDENT" and r.classification != "REFUSE"
+    )
 
+    rc = 0
+
+    # Invariant (a)+(b): on-device logits / no private host generate loop.
     if drift:
+        rc = 1
         print(
             "ERROR: registered model decode(s) return HOST logits off the production "
             "runner / on-GPU sampler instead of a device-resident ForwardLogits "
@@ -423,15 +561,54 @@ def main() -> int:
             "(pending framework-routing, see AGENTS.md decode/runtime seam).",
             file=sys.stderr,
         )
-        return 1
+    else:
+        print(
+            f"OK (runner-routing): {len(scanned)} registered model(s); "
+            f"{n_device} return device-resident logits on the runner, "
+            f"{n_host} host-logits off-framework ({len(allowlisted)} allowlisted), "
+            f"{n_refuse} refuse-by-name stub(s) skipped, {n_none} no-logit-producer."
+        )
 
-    print(
-        f"OK (runner-routing): {len(scanned)} registered model(s); "
-        f"{n_device} return device-resident logits on the runner, "
-        f"{n_host} host-logits off-framework ({len(allowlisted)} allowlisted), "
-        f"{n_refuse} refuse-by-name stub(s) skipped, {n_none} no-logit-producer."
-    )
-    return 0
+    # Invariant (c): bf16-resident activations (no hand-rolled f32 host stream).
+    if f32_drift:
+        rc = 1
+        print(
+            "ERROR: registered model decode(s) hand-roll an f32 host residual/activation "
+            "stream (private std::vector<float> {hidden,residual,x,...} threaded through "
+            "the per-token decode with CastBf16/GemmBf16-before-every-projection) instead "
+            "of the shared bf16 DBuf glue (dense_attn::AttnBlock / bf16-resident DBuf) — "
+            "the bf16-resident-activations invariant (AGENTS.md 'born on the runner') — "
+            "and are not on scripts/runner-bf16-activation-allowlist.txt:",
+            file=sys.stderr,
+        )
+        for name in f32_drift:
+            r = scanned[name]
+            casts = (
+                f", {r.per_proj_host_casts} CastBf16/GemmBf16 per-projection cast(s)"
+                if r.per_proj_host_casts else ""
+            )
+            print(
+                f"  - {name} ({r.reg_file}: {r.f32_resid_decls} f32 residual-stream "
+                f"decl(s){casts}, no bf16-resident stream)",
+                file=sys.stderr,
+            )
+        print(
+            "Route the decode residual onto the shared bf16 dense_attn::AttnBlock preamble "
+            "+ DBuf glue (bf16-resident device activations; see qwen3.cpp / qwen3_5.cpp / "
+            "gemma4.cpp), or add the model to scripts/runner-bf16-activation-allowlist.txt "
+            "with a reason + fold-plan tier (pending framework-routing, see AGENTS.md "
+            "decode/runtime seam).",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"OK (bf16-activation): {len(scanned)} registered model(s); "
+            f"{n_bf16} keep bf16-resident DBuf activations, "
+            f"{n_f32} hand-roll an f32 host stream ({len(bf16_allowlisted)} allowlisted), "
+            f"{n_refuse} refuse-by-name stub(s) skipped."
+        )
+
+    return rc
 
 
 if __name__ == "__main__":

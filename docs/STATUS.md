@@ -1869,16 +1869,31 @@ their fusable add+RMSNorm glue through the portable fusion catalog rather than
 hand-fusing it. A sibling CI check
 (`scripts/check-runner-routing-consistency.py`, wired into the same `agent-record`
 job, 2026-08-02) enforces the THIRD "MUST route through" seam — the decode/runtime
-path: every `REGISTER_VLLM_MODEL` must return device-resident logits
-(`ForwardLogits.on_device()==true`, off the on-GPU sampler) on the default
-`gather_logits` path and not ship a private `*GenerateCore` host loop off the
-runner. It resolves the `.forward` hook through its `SomeModel::ForwardDevice`
-delegate and `using`-aliases (so a HOST-stub `ForwardDevice` is caught while a
-`VT_CHECK(false)` refuse stub is skipped), classifies all 27 registrations green
-(23 device-resident, 3 off-framework on `scripts/runner-routing-allowlist.txt` —
-`laguna`/`deepseek_v4`/`qwen3_vl`, 1 refuse stub skipped), and would fail a NEW model
-returning `HostLogits` without an allowlist entry. Removing an allowlist entry after
-the model routes through the runner (device-resident logits) is the gate closing.
+path — over every `REGISTER_VLLM_MODEL` with THREE sub-checks: **(a)** the default
+`gather_logits` forward returns device-resident logits
+(`ForwardLogits.on_device()==true`, off the on-GPU sampler), **(b)** no private
+`*GenerateCore` host generate loop off the runner, and **(c) bf16-resident
+activations** (added 2026-08-03) — the decode keeps its residual/activation stream in
+bf16 **device** `DBuf`s (the shared `dense_attn::AttnBlock` glue), NOT a hand-rolled
+private `std::vector<float>` host residual stream cast to bf16 before every projection
+(`CastBf16`/`GemmBf16`); a model that declares >=`MIN_F32_RESID`(=3) private f32
+residual-stream buffers AND routes through neither the shared bf16 attn preamble nor a
+bf16-`DBuf` residual is flagged **F32_STREAM** (drift). It resolves the `.forward` hook
+through its `SomeModel::ForwardDevice` delegate and `using`-aliases (so a HOST-stub
+`ForwardDevice` is caught while a `VT_CHECK(false)` refuse stub is skipped) and
+classifies all 27 registrations green: **on (a)/(b)** 24 device-resident, 2 off-runner
+on `scripts/runner-routing-allowlist.txt` (`laguna`, `qwen3_vl`), 1 refuse stub;
+**on (c)** 24 bf16-resident, 2 f32-stream on the SIBLING
+`scripts/runner-bf16-activation-allowlist.txt` (`laguna`, `deepseek_v4`), 1 refuse stub.
+The two axes are ORTHOGONAL and carry SEPARATE allowlists because their membership
+differs: `deepseek_v4` returns device-resident logits (clean on (a)) yet computes its
+whole decode in an f32 host vector stream (drift on (c)); `qwen3_vl` is HOST on (a)/(b)
+yet its per-token transformer decode residual is a bf16 `DBuf` (clean on (c) — its text
+decode is already routed onto DBufs). A shared flat list would silently cross-suppress a
+regression on the other axis. The gate would fail a NEW model returning `HostLogits`, or
+a NEW model hand-rolling an f32 host stream, without an allowlist entry; removing an
+(a)/(b) entry after the model returns device-resident logits, or a (c) entry after its
+decode residual routes onto the shared bf16 `AttnBlock`/`DBuf` glue, is the gate closing.
 **The Gemma family (Gemma-1/2/3) was MIGRATED off the drift
 allowlist 2026-07-30 (Tier-B2 of the cross-arch fold plan):** their
 residual-carrying gemma-(1+w) input/pre-ffn/final norms now route through
