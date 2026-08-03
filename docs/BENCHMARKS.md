@@ -11289,3 +11289,15 @@ steady-state per-step / nsys decode tok/s (eager vs graphed) is OWED.
 
 <!-- framework-routing (2026-08-02) -->
 - Laguna-XS-2.1-NVFP4 decode (GB10, vs vLLM 42.46 tok/s): split-K + w13-fusion → 35.3 tok/s (83.2%). Residual is GPU-kernel work inside the graph (measured). PENDING: full KV/attention framework port. Qwen3DenseDecodeGraph ~4.3% e2e (directional; rigorous per-step tok/s OWED). Qwen3VL/DS4 routing = framework-conformance (no speed claim); CUDA re-gate OWED.
+
+<!-- darwin-laguna-build-repair (2026-08-03) -->
+- **Darwin Laguna feature-guard repair: NOT APPLICABLE to benchmarks.** Guarding
+  the Marlin-only environment helper out of non-Marlin builds changes no CUDA
+  runtime path, model output, memory use, or performance. The binding evidence
+  is the AppleClang 21 `-Werror,-Wunused-function` consumer failure plus the
+  source-invariant regression gate; no speed measurement is owed.
+- **Darwin Voxtral pragma repair: NOT APPLICABLE to benchmarks.** Restricting a
+  GCC false-positive suppression to GCC changes no runtime path or generated
+  code. The binding evidence is the AppleClang `-Werror,-Wunknown-warning-option`
+  consumer failure and the compiler-boundary regression gate; no speed number
+  is owed.

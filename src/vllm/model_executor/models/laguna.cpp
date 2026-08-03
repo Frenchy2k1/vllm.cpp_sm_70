@@ -810,6 +810,8 @@ void LagunaSharedExpertMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, con
 // gate lands; then flip to default-ON per the parity-enablers-ship-as-defaults
 // policy. VT_LAGUNA_MARLIN_MOE=1 enables. Only meaningful when VT_MARLIN_NVFP4
 // compiled the path in.
+// DSR-ALLOW(S1): Marlin-only environment gate; all consumers share this build guard.
+#ifdef VT_MARLIN_NVFP4
 inline bool LagunaMarlinMoeEnabled() {
   // DEFAULT ON: the Marlin W4A16 grouped MoE is vLLM's own 18.8-tok/s kernel and the
   // validated fast Laguna-NVFP4 decode path (reproduced 3× on GB10, golden-matching,
@@ -823,6 +825,7 @@ inline bool LagunaMarlinMoeEnabled() {
   }();
   return on;
 }
+#endif  // VT_MARLIN_NVFP4
 
 // Keep-quant GEMM against a ROW-SLICE [row_off, row_off+N) of a stacked block
 // weight `w` [E*out, K] — the per-expert (moe_*_exps) slice. Rows are whole

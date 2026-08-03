@@ -360,6 +360,20 @@ class DsrRatchetMutationTests(unittest.TestCase):
 class RealTreeTests(unittest.TestCase):
     """Hard expectations about THIS repository, not a synthetic mutant."""
 
+    def test_laguna_marlin_gate_helper_is_feature_guarded(self) -> None:
+        path = ROOT / "src/vllm/model_executor/models/laguna.cpp"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        definitions = [
+            index
+            for index, line in enumerate(lines)
+            if "inline bool LagunaMarlinMoeEnabled()" in line
+        ]
+        self.assertEqual(len(definitions), 1)
+        self.assertTrue(
+            dl.cuda_guard_depth(lines)[definitions[0]],
+            "LagunaMarlinMoeEnabled must not compile outside VT_MARLIN_NVFP4",
+        )
+
     def test_baseline_matches_the_tree_exactly(self) -> None:
         # This is the CI gate itself, asserted here too so a local run catches it
         # before the push.

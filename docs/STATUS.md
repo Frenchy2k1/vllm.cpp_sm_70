@@ -2136,3 +2136,13 @@ _(Laguna decode KV+attention → shared-framework port, bf16-KV slice (2026-08-0
 
 <!-- decode/runtime framework-routing (2026-08-02) -->
 - **Decode/runtime framework-routing** — `GATING`. Third "MUST route through" seam codified (AGENTS.md) + CI-enforced (`check-runner-routing-consistency.py`, green: 27 models, 3 allowlisted). Landed: Laguna split-K attention + w13-fusion (82.7→83.2% of vLLM decode); shared `Qwen3DenseDecodeGraph` (5 registrations, GB10 token-exact 16/16); Qwen3VL + DeepSeek-V4 routed to on-device logits + runner entry. Pending: Laguna gate-up fold onto the shared MLP seam (allowlisted) + its full KV/attention port onto `AttnBlock` (the kernel-level residual to vLLM parity); CUDA re-gates for Qwen3VL/DS4 owed.
+
+**Darwin Laguna build repair (2026-08-03).** The Marlin-only
+`LagunaMarlinMoeEnabled` helper now shares the `VT_MARLIN_NVFP4` feature guard
+used by every call site, so non-CUDA AppleClang builds do not emit
+`-Wunused-function` under `-Werror`. A static regression gate enforces that
+boundary; runtime behavior and Laguna's lifecycle state are unchanged.
+The next consumer run exposed a separate Voxtral portability error: its
+GCC-only `-Wstringop-overflow` suppression is now guarded out of Clang builds,
+where the unknown warning name was itself fatal under `-Werror`. The Go
+`go-m1cpu` folding diagnostics in that run were nonfatal and outside this repo.
