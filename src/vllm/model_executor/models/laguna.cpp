@@ -55,6 +55,44 @@
 namespace vllm {
 namespace {
 
+// LEVER A: host f32→bf16 round-to-nearest-even (matches CUDA __float2bfloat16 used by the
+// on-device KV append, so the one-time prefill-KV migration rounds identically to the decode
+// appends). NaN is preserved as a quiet bf16 NaN; KV values never hit it in practice.
+inline uint16_t LagunaF32ToBf16Rne(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof(x));
+  if ((x & 0x7fffffffu) > 0x7f800000u) return static_cast<uint16_t>((x >> 16) | 0x0040u);
+  const uint32_t bias = ((x >> 16) & 1u) + 0x7fffu;  // round-to-nearest-even
+  return static_cast<uint16_t>((x + bias) >> 16);
+}
+
+// LEVER A (VT_LAGUNA_KV_BF16, default OFF — opt-in): store the resident/graph decode KV at
+// bf16 (see laguna.h k_dev16). Reads the SAME env var as the .cu-side LagunaKvBf16On() (a
+// process-global toggle; both read it independently, mirroring the other Laguna*Enabled gates).
+// Default OFF because a prior short-context attempt was a WASH + near-tie break; the win is
+// context-linear (see the .cu comment). MUST agree with the .cu reader — same var, same logic.
+inline bool LagunaKvBf16Enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_KV_BF16");
+    return (e != nullptr && e[0] == '1');  // default OFF; =1 opts in
+  }();
+  return on;
+}
+
+// Per-layer decode KV headroom (rows reserved above the prompt for generated tokens). Default
+// 1024 (unchanged behavior). VT_LAGUNA_KV_HEADROOM raises it so the two-length long-context
+// slope measurement (~2048 generated tokens) fits the fixed-capacity resident/graph KV without
+// tripping the capacity VT_CHECK — measurement infrastructure, not a lever.
+inline int64_t LagunaKvHeadroom() {
+  static const int64_t rows = [] {
+    const char* e = std::getenv("VT_LAGUNA_KV_HEADROOM");
+    if (e == nullptr) return static_cast<int64_t>(1024);
+    const long v = std::strtol(e, nullptr, 10);
+    return (v > 0) ? static_cast<int64_t>(v) : static_cast<int64_t>(1024);
+  }();
+  return rows;
+}
+
 // Decode an OwnedTensor (host bytes) to a flat f32 vector. Reference path handles
 // the two host dtypes a synthetic/dequantized tower carries: f32 and bf16.
 std::vector<float> ReadF32(const OwnedTensor& t) {
@@ -1740,20 +1778,36 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
   // ONCE. Thereafter each token's K/V is appended ON-STREAM at dev_rows[l] (no host
   // std::vector insert, so no per-layer DrainQueue). Full-deck (no eviction) — the
   // decode_attn window mask handles sliding layers, and dev_first_pos stays frozen.
+  // LEVER A: allocate the KV at bf16 (half the DRAM) or f32 (byte-exact fallback), never both.
+  const bool kv_bf16 = LagunaKvBf16Enabled();
   if (!cache.resident_ready) {
-    cache.max_cap = pos + 1024;  // decode headroom (VT_CHECK guards; one-time zero-init)
-    cache.k_dev.assign(static_cast<size_t>(nlayers), {});
-    cache.v_dev.assign(static_cast<size_t>(nlayers), {});
+    cache.max_cap = pos + LagunaKvHeadroom();  // decode headroom (VT_CHECK guards; one-time zero-init)
     cache.dev_first_pos.assign(static_cast<size_t>(nlayers), 0);
     cache.dev_rows.assign(static_cast<size_t>(nlayers), 0);
+    if (kv_bf16) {
+      cache.k_dev16.assign(static_cast<size_t>(nlayers), {});
+      cache.v_dev16.assign(static_cast<size_t>(nlayers), {});
+    } else {
+      cache.k_dev.assign(static_cast<size_t>(nlayers), {});
+      cache.v_dev.assign(static_cast<size_t>(nlayers), {});
+    }
     for (int64_t l = 0; l < nlayers; ++l) {
       const size_t cap = static_cast<size_t>(cache.max_cap * kvdim);
-      cache.k_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
-      cache.v_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
       const std::vector<float>& kc = cache.k[static_cast<size_t>(l)];
       const std::vector<float>& vc = cache.v[static_cast<size_t>(l)];
-      std::copy(kc.begin(), kc.end(), cache.k_dev[static_cast<size_t>(l)].begin());
-      std::copy(vc.begin(), vc.end(), cache.v_dev[static_cast<size_t>(l)].begin());
+      if (kv_bf16) {  // one-time prefill migration with RNE cast (matches the on-device append)
+        cache.k_dev16[static_cast<size_t>(l)].assign(cap, 0);
+        cache.v_dev16[static_cast<size_t>(l)].assign(cap, 0);
+        std::vector<uint16_t>& kd = cache.k_dev16[static_cast<size_t>(l)];
+        std::vector<uint16_t>& vd = cache.v_dev16[static_cast<size_t>(l)];
+        for (size_t i = 0; i < kc.size(); ++i) kd[i] = LagunaF32ToBf16Rne(kc[i]);
+        for (size_t i = 0; i < vc.size(); ++i) vd[i] = LagunaF32ToBf16Rne(vc[i]);
+      } else {
+        cache.k_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
+        cache.v_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
+        std::copy(kc.begin(), kc.end(), cache.k_dev[static_cast<size_t>(l)].begin());
+        std::copy(vc.begin(), vc.end(), cache.v_dev[static_cast<size_t>(l)].begin());
+      }
       cache.dev_first_pos[static_cast<size_t>(l)] = cache.first_pos[static_cast<size_t>(l)];
       cache.dev_rows[static_cast<size_t>(l)] = static_cast<int64_t>(kc.size()) / kvdim;
     }
@@ -1872,11 +1926,19 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     // insert/eviction. Full-deck: dev_first_pos frozen, decode_attn's window mask evicts.
     const int64_t dr = cache.dev_rows[static_cast<size_t>(l)];
     VT_CHECK(dr < cache.max_cap, "laguna resident decode: KV capacity exceeded (raise max_cap)");
-    float* kdev = cache.k_dev[static_cast<size_t>(l)].data();
-    float* vdev = cache.v_dev[static_cast<size_t>(l)].data();
-    const size_t rowbytes = static_cast<size_t>(kvdim) * sizeof(float);
-    vt::GetBackend(dev).Copy(q, kdev + dr * kvdim, knp, rowbytes);
-    vt::GetBackend(dev).Copy(q, vdev + dr * kvdim, vnp, rowbytes);
+    // LEVER A: the cache is bf16 (k_dev16) or f32 (k_dev); pass its base to the kernels via
+    // float* (address pun for bf16 — the launchers read the env and the kernels reinterpret).
+    float* kdev = kv_bf16 ? reinterpret_cast<float*>(cache.k_dev16[static_cast<size_t>(l)].data())
+                          : cache.k_dev[static_cast<size_t>(l)].data();
+    float* vdev = kv_bf16 ? reinterpret_cast<float*>(cache.v_dev16[static_cast<size_t>(l)].data())
+                          : cache.v_dev[static_cast<size_t>(l)].data();
+    if (kv_bf16) {  // append CASTS f32→bf16 on device at host row offset dr (no shared device int)
+      LAG->append_kv_row_cast(q, kdev, vdev, knp, vnp, kvdim, dr);
+    } else {  // f32: raw f32→f32 Copy at the byte offset (byte-exact, unchanged path)
+      const size_t rowbytes = static_cast<size_t>(kvdim) * sizeof(float);
+      vt::GetBackend(dev).Copy(q, kdev + dr * kvdim, knp, rowbytes);
+      vt::GetBackend(dev).Copy(q, vdev + dr * kvdim, vnp, rowbytes);
+    }
     const int64_t rows = dr + 1;
     const int64_t fp = cache.dev_first_pos[static_cast<size_t>(l)];
     // LEVER 1: the fused GEMV already produced g (glp -> qkvg_buf); only the split
@@ -2022,6 +2084,11 @@ struct LagunaGraph {
   // each layer needs its OWN persistent buffer (a shared one would be overwritten
   // by the next layer before Step() drains it).
   std::vector<std::vector<float>> cache_k, cache_v, qkvg;
+  // LEVER A (VT_LAGUNA_KV_BF16): bf16 alternative to cache_k/cache_v (half the KV DRAM,
+  // matching vLLM). Only one of the pair is allocated per run (env-gated); the f32 path is
+  // byte-identical when off. bf16 bits (uint16_t) passed to the kernels via the float* param.
+  std::vector<std::vector<uint16_t>> cache_k16, cache_v16;
+  bool kv_bf16 = false;  // resolved in the ctor from LagunaKvBf16Enabled()
   // persistent per-layer f32 norms/bias — pre-converted ONCE (kills per-token ReadF32
   // + the stack-baked-pointer hazard).
   std::vector<std::vector<float>> input_norm_f, q_norm_f, k_norm_f, post_norm_f, moe_bias_f;
@@ -2095,22 +2162,38 @@ struct LagunaGraph {
                "< sliding window 512); the per-layer ring-buffer graph is Brick A2b");
     }
     kv_rows = rows0;
-    max_cap = rows0 + 1024;  // decode headroom
+    max_cap = rows0 + LagunaKvHeadroom();  // decode headroom (VT_LAGUNA_KV_HEADROOM for ~2k slope)
     // persistent per-layer KV seeded from the host prefill KV; per-layer fused
     // q|k|v|g new-row scratch (LEVER 1). Each qkvg[l] is sized to the layer's own
     // N_total = qdim_l + 2*kvdim + Hq_l; its k/v sub-ranges are the new-row scratch
     // Step() drains between replays.
-    cache_k.assign(static_cast<size_t>(nlayers), {});
-    cache_v.assign(static_cast<size_t>(nlayers), {});
+    // LEVER A: bf16 or f32 KV, never both (env-gated; f32 byte-identical when off).
+    kv_bf16 = LagunaKvBf16Enabled();
     qkvg.assign(static_cast<size_t>(nlayers), {});
+    if (kv_bf16) {
+      cache_k16.assign(static_cast<size_t>(nlayers), {});
+      cache_v16.assign(static_cast<size_t>(nlayers), {});
+    } else {
+      cache_k.assign(static_cast<size_t>(nlayers), {});
+      cache_v.assign(static_cast<size_t>(nlayers), {});
+    }
     for (int64_t l = 0; l < nlayers; ++l) {
       const size_t cap = static_cast<size_t>(max_cap * kvdim);
-      cache_k[static_cast<size_t>(l)].assign(cap, 0.0F);
-      cache_v[static_cast<size_t>(l)].assign(cap, 0.0F);
       const std::vector<float>& kc = cache.k[static_cast<size_t>(l)];
       const std::vector<float>& vc = cache.v[static_cast<size_t>(l)];
-      std::copy(kc.begin(), kc.end(), cache_k[static_cast<size_t>(l)].begin());
-      std::copy(vc.begin(), vc.end(), cache_v[static_cast<size_t>(l)].begin());
+      if (kv_bf16) {  // one-time prefill migration with RNE cast (matches append_kv_row)
+        cache_k16[static_cast<size_t>(l)].assign(cap, 0);
+        cache_v16[static_cast<size_t>(l)].assign(cap, 0);
+        std::vector<uint16_t>& kd = cache_k16[static_cast<size_t>(l)];
+        std::vector<uint16_t>& vd = cache_v16[static_cast<size_t>(l)];
+        for (size_t i = 0; i < kc.size(); ++i) kd[i] = LagunaF32ToBf16Rne(kc[i]);
+        for (size_t i = 0; i < vc.size(); ++i) vd[i] = LagunaF32ToBf16Rne(vc[i]);
+      } else {
+        cache_k[static_cast<size_t>(l)].assign(cap, 0.0F);
+        cache_v[static_cast<size_t>(l)].assign(cap, 0.0F);
+        std::copy(kc.begin(), kc.end(), cache_k[static_cast<size_t>(l)].begin());
+        std::copy(vc.begin(), vc.end(), cache_v[static_cast<size_t>(l)].begin());
+      }
       const LayerC& c = lc[static_cast<size_t>(l)];
       // The graph always fuses (NVFP4-arm-only path); the loader must have built
       // the stacked projections. Fail LOUDLY here rather than mis-slice at replay.
@@ -2309,8 +2392,13 @@ struct LagunaGraph {
       }
       // GRAPH decode attention: cache_k[l][0..len) + kn/vn as the new row, with
       // len/pos read from the DEVICE buffers. first_pos=0 (uniform, P<512).
-      LAG->decode_attn_gqa_g(q, attn.data(), qvp, cache_k[static_cast<size_t>(l)].data(),
-                             cache_v[static_cast<size_t>(l)].data(), kn, vn, c.Hq, Hkv, Dh, c.group,
+      // LEVER A: the cache base is bf16 (cache_k16) or f32 (cache_k), passed via float* (bf16
+      // is an address pun — the launcher reads the env and the kernels reinterpret to bf16).
+      float* ckl = kv_bf16 ? reinterpret_cast<float*>(cache_k16[static_cast<size_t>(l)].data())
+                           : cache_k[static_cast<size_t>(l)].data();
+      float* cvl = kv_bf16 ? reinterpret_cast<float*>(cache_v16[static_cast<size_t>(l)].data())
+                           : cache_v[static_cast<size_t>(l)].data();
+      LAG->decode_attn_gqa_g(q, attn.data(), qvp, ckl, cvl, kn, vn, c.Hq, Hkv, Dh, c.group,
                              /*first_pos=*/0, c.window, scale, len_buf.data(), pos_buf.data(),
                              glue_fused ? glp : nullptr);  // L1: fold softplus out-gate
       // LEVER A: append this token's post-RoPE K (kn) and raw V (vn) into the growing
@@ -2318,8 +2406,7 @@ struct LagunaGraph {
       // replay host Copy launches into the captured graph. Runs after decode_attn_gqa_g
       // consumed kn/vn (slot len is outside its [0,len) cache read ⇒ no intra-replay RAW;
       // the write is seen by the NEXT replay's attention via same-stream ordering).
-      LAG->append_kv_row(q, cache_k[static_cast<size_t>(l)].data(),
-                         cache_v[static_cast<size_t>(l)].data(), kn, vn, kvdim, len_buf.data());
+      LAG->append_kv_row(q, ckl, cvl, kn, vn, kvdim, len_buf.data());
       // g was produced by the fused GEMV (glp -> qkvg[l]); untouched until here.
       if (!glue_fused)  // L1 off => separate softplus out-gate pass
         LAG->softplus_head_gate(q, attn.data(), glp, c.Hq, Dh);
