@@ -286,6 +286,16 @@ been through nvcc). (3) Laguna long-context levers (`CLAIM-LAGUNA-LONGCTX-LEVERS
 **−0.30 ms/step@2k**; bf16 paged KV (`VT_LAGUNA_KV_BF16` default-OFF opt-in) a near-tie left UNRATIFIED.
 **SACRED gates UNMOVED on the merged GB10 build: `test_qwen27_paged_engine` 235/235 + `test_qwen36_paged_engine`
 315/315.** See docs/BENCHMARKS.md + docs/STATUS.md.
+**DEEPSEEK-V4 DECODE GLUE-FUSION LEVERS 2+3 INTEGRATED TO main (2026-08-03, GB10 sm_121a clean build+gate, base `6576814b`):**
+two measured byte-exact decode-glue folds landed on top of the MHC-pre fold. (3) norm+RoPE FP64→FP32 fold
+(`CLAIM-DSV4-ROPE-FLOAT`, `VT_V4_ROPE_FLOAT` default-ON) — the fused `NormRopeRows` kernel dropped **4.58→0.46 ms/step
+(~10×)**, decode +6.1%. (2) MHC-pre finish occupancy widen (256→1024) + sqrsum-fold (`CLAIM-DSV4-MHC-LEAN`,
+`VT_V4_MHC_LEAN` default-ON=1024) — +0.7%; HONEST BOUND: the finish is floored by 86 sequential single-block
+launches/step (NOT warp-latency/memory), the owed residual = a layer-chain-spanning MHC restructure (high-risk).
+Net decode **14.02→14.96 tok/s (+6.7%) → 87.3% of ds4 17.13**. BYTE-EXACT: decode ids token-IDENTICAL `=1`/`=0`
+for BOTH levers on ds4flash IQ2XXS via the resident-decode path (`--gpu --kv-cache`, device kernels genuinely
+exercised) + `test_cuda_deepseek_v4` 20/20·67073 (Brick-7 + Brick-B). **SACRED UNMOVED on the merged GB10 build:
+`test_qwen36_paged_engine` 315/315** (27B checkpoint absent on box ⇒ that gate SKIPs). See docs/BENCHMARKS.md + docs/STATUS.md.
 **W8-FINAL — ENTRYPOINT WIRING LANDED + GATED; THE RUN RE-SCOPED TO A CODE BLOCKER (2026-07-29,
 `CLAIM-DEEPSEEK-V4-W8`, base `376e186b`):** with W8 keep-quant + W2b tower materialization landed, this
 lane wired the top-level GGUF dispatch arm (the "one small code piece W2b named") and attempted the real
