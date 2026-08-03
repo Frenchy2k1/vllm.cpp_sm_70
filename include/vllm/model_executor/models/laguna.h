@@ -340,6 +340,24 @@ std::vector<float> LagunaForwardGguf(const LagunaWeights& w, vt::Queue& q,
                                      const std::vector<int32_t>& positions,
                                      const std::vector<int32_t>& logits_indices);
 
+// VT_LAGUNA_SHARED_FP4 (default OFF): keep the per-layer SHARED expert fp4-resident
+// (XS-NVFP4 tower) and route it through the Marlin W4A16 grouped GEMM instead of
+// dequantizing to bf16 — 4x less shared-tower DRAM traffic on the M=1 decode GEMV,
+// matching vLLM's fp4 shared expert. Read once per process; `=1` opts in.
+bool LagunaSharedFp4Enabled();
+
+// True iff the loaded weights carry the fp4 shared expert (the flag is a no-op on a
+// bf16-shared tower like S-2.1-NVFP4).
+bool LagunaHasFp4SharedExpert(const LagunaWeights& w);
+
+// Populate the fp4 shared-expert fields (`moe.shared_{gate,up,down}_proj_fp4`) from
+// the checkpoint shards when VT_LAGUNA_SHARED_FP4=1 and the tower quantizes the
+// shared expert. Call AFTER LoadLagunaForCausalLMWeights and BEFORE the shards are
+// released (the fp4 bytes are copied out). When it loads, the now-dead bf16 shared
+// copies + the fused router|shared projection are freed. No-op otherwise (bf16
+// tower, GGUF path, or flag off). ADDITIVE — does NOT touch laguna_weights.cpp.
+void LagunaLoadSharedExpertFp4(const std::vector<SafetensorsFile>& shards, LagunaWeights& w);
+
 // N5 campaign-B: pre-build all routed-expert MARLIN W4A16 residents at model-LOAD
 // time (mirrors vLLM's process_weights_after_loading), so the repack cost is not a
 // first-token TTFT spike. No-op unless the Marlin path is enabled (VT_LAGUNA_MARLIN_MOE)

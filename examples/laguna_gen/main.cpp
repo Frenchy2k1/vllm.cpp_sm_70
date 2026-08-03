@@ -219,6 +219,12 @@ int main(int argc, char** argv) {
         (long long)w.params.vocab_size, (int)w.has_nvfp4_weights,
         std::chrono::duration<double>(t1 - t0).count(), CurResidentGiB(), PeakResidentGiB());
     if (!w.has_nvfp4_weights) { std::fprintf(stderr, "[gen] ERROR: no NVFP4 tower\n"); return 1; }
+    // VT_LAGUNA_SHARED_FP4 (default OFF): keep the per-layer shared expert fp4-resident
+    // (XS-NVFP4 tower) instead of the bf16 dequant, and free the now-dead bf16 shared +
+    // fused router-shared copies. MUST run BEFORE the shards are released (it copies the
+    // on-disk fp4 bytes out). No-op unless the flag is set and the tower quantizes the
+    // shared expert. ADDITIVE — does not touch the SACRED laguna_weights.cpp loader.
+    vllm::LagunaLoadSharedExpertFp4(shards, w);
     // The loader COPIES every tensor into owned buffers (LoadBf16Direct / the fp4
     // LnLoadCtNvfp4Raw both memcpy), so the mmap'd shards are dead weight now.
     // On the GB10's 119 GiB UNIFIED pool holding the mmap alongside the ~67 GiB of

@@ -738,6 +738,50 @@ void LagunaMoeResidentMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, cons
   vt::Tensor ot = vllm::dense_nvfp4::MakeTensor(out_dev, DType::kF32, dev, {1, H});
   vt::CastF32(q, ot, dout.t());  // bf16 -> f32, device (no download)
 }
+
+// ── VT_LAGUNA_SHARED_FP4: the per-layer SHARED expert via the SAME Marlin W4A16
+//    single-expert (num_experts=1) grouped GEMM the routed experts win on, instead
+//    of the bf16 GEMV over the dequantized shared weights. Device-in (hn_dev [1,H]
+//    f32, the post-attn norm) -> device-out (so_dev [1,H] f32, added to the residual
+//    by the caller). W4A16 regime: bf16 activation, fp4 weight, scale2 — the fp4
+//    weight is 4x fewer DRAM bytes than the bf16 copy on this DRAM-bound M=1 GEMV.
+//    Reuses the dense_nvfp4 single-expert primitives (GateUpFusedMarlinD +
+//    MatmulNvfp4MarlinD, the validated 35B W4A16 path). CAPTURE-SAFE: the per-weight
+//    Marlin residents build lazily on the gstate-0 eager warm-run (their Synchronize
+//    runs there, never inside capture), and the pooled DBuf transients are warmed the
+//    same way LagunaMoeResidentMarlinInto's are. ──────────────────────────────────
+void LagunaSharedExpertMarlinInto(vt::Queue& q, const LagunaMoeWeights& moe, const float* hn_dev,
+                                  int64_t H, float* so_dev) {
+  namespace dn = vllm::dense_nvfp4;
+  using vt::DType;
+  vt::Backend& bk = vt::GetBackend(q.device.type);
+  dn::Dev d{bk, q};
+  const vt::Device dev = q.device;
+  const int64_t K = moe.shared_gate_fp4.k;  // == H (shared expert in-features)
+  const int64_t N = moe.shared_gate_fp4.n;  // shared_expert_intermediate_size
+  // cast the post-attn activation to bf16 [1,K] (the W4A16 GEMM's activation dtype).
+  dn::DBuf xb(d, DType::kBF16, {1, K});
+  {
+    vt::Tensor xf = dn::MakeTensor(const_cast<float*>(hn_dev), DType::kF32, dev, {1, K});
+    vt::CastBf16(q, xb.t(), xf);
+  }
+  // gate_up: silu(x@gate.T) * (x@up.T) -> bf16 [1,N]. ONE fused Marlin GEMM when the
+  // gate/up global scales match (vLLM's merged gate_up layout); else two GEMMs + a
+  // bf16 MoeSiluMul (byte-equal given equal GEMM output — the routed-expert fallback).
+  dn::DBuf act = [&]() -> dn::DBuf {
+    if (dn::GateUpFusedEligible(moe.shared_gate_fp4, moe.shared_up_fp4))
+      return dn::GateUpFusedMarlinD(d, xb.t(), moe.shared_gate_fp4, moe.shared_up_fp4);
+    dn::DBuf g = dn::MatmulNvfp4MarlinD(d, xb.t(), moe.shared_gate_fp4, DType::kBF16);
+    dn::DBuf u = dn::MatmulNvfp4MarlinD(d, xb.t(), moe.shared_up_fp4, DType::kBF16);
+    dn::DBuf a(d, DType::kBF16, {1, N});
+    vt::MoeSiluMul(q, a.t(), g.t(), u.t());
+    return a;
+  }();
+  // down: act @ down.T -> bf16 [1,H]; upcast into the caller's persistent f32 so_dev.
+  dn::DBuf sb = dn::MatmulNvfp4MarlinD(d, act.t(), moe.shared_down_fp4, DType::kBF16);
+  vt::Tensor ot = dn::MakeTensor(so_dev, DType::kF32, dev, {1, H});
+  vt::CastF32(q, ot, sb.t());
+}
 #endif  // VT_MARLIN_NVFP4
 
 // N5 campaign-B gate: route the routed experts through the Marlin W4A16 grouped
@@ -1785,10 +1829,16 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       // three read the SAME post-attn `hn`. Slice: [0,E)=router logits ->
       // sigmoid_topk; [E,E+moe_I)=shared_gate; [E+moe_I,E+2*moe_I)=shared_up
       // (pre-SiLU). Fallback to split GEMVs on the GGUF path (router_shared_gu Empty()).
+      // VT_LAGUNA_SHARED_FP4: the shared expert stays fp4-resident (Marlin W4A16),
+      // so the wide fused GEMV drops to a router-ONLY GEMV (the split `moe.router`)
+      // and the shared gate/up/down run through the fp4 Marlin path — no bf16 shared
+      // weights are read (the 4x-DRAM win). `shared_gate_fp4` non-empty => the fp4
+      // tower was loaded (LagunaLoadSharedExpertFp4) for this MoE layer.
+      const bool shared_fp4 = LagunaSharedFp4Enabled() && !lw.moe.shared_gate_fp4.Empty();
       float* gatingp;
       float* sgp;
       float* sup;
-      const bool fused_rsg = !lw.moe.router_shared_gu.Empty();
+      const bool fused_rsg = !shared_fp4 && !lw.moe.router_shared_gu.Empty();
       if (fused_rsg) {
         GemmBf16Into(rsg_buf.data(), lw.moe.router_shared_gu, hn.data(), E + 2 * moe_I, H);
         gatingp = rsg_buf.data();
@@ -1807,12 +1857,16 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
                         topk, p.norm_topk_prob, p.moe_routed_scaling_factor);
       LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
                                   topk, doutb.data());
-      if (!fused_rsg) {  // split fallback still needs dedicated shared gate/up GEMVs
-        GemmBf16Into(dg.data(), lw.moe.shared_gate, hn.data(), moe_I, H);  // shared expert
-        GemmBf16Into(du.data(), lw.moe.shared_up, hn.data(), moe_I, H);
+      if (shared_fp4) {
+        LagunaSharedExpertMarlinInto(q, lw.moe, hn.data(), H, so.data());  // fp4 shared expert
+      } else {
+        if (!fused_rsg) {  // split fallback still needs dedicated shared gate/up GEMVs
+          GemmBf16Into(dg.data(), lw.moe.shared_gate, hn.data(), moe_I, H);  // shared expert
+          GemmBf16Into(du.data(), lw.moe.shared_up, hn.data(), moe_I, H);
+        }
+        SiluMul(dact.data(), sgp, sup, moe_I);
+        GemmBf16Into(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
       }
-      SiluMul(dact.data(), sgp, sup, moe_I);
-      GemmBf16Into(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
       AddInto(hidden.data(), doutb.data());  // hidden += routed
       AddInto(hidden.data(), so.data());     // hidden += shared
 #else
@@ -1907,13 +1961,20 @@ struct LagunaGraph {
   // back after the drain. i64 to match vt::GreedyArgmax's output dtype. `ondev` caches the
   // env flag; `last_sampled` is the token the caller consumes (-1 when off).
   const bool ondev = LagunaOndevSampleEnabled();
+  // VT_LAGUNA_SHARED_FP4: run the shared expert through the fp4 Marlin W4A16 path
+  // (set only when the fp4 shared tower was loaded — LagunaLoadSharedExpertFp4). When
+  // true the per-MoE-layer GEMV is router-ONLY (`moe.router`); the shared gate/up/down
+  // ride LagunaSharedExpertMarlinInto (no bf16 shared weights read). Set in the ctor
+  // init-list (depends on the ctor's weights arg).
+  const bool shared_fp4;
   std::vector<int64_t> argmax_id;
   int32_t last_sampled = -1;
   void* graph = nullptr;
   int gstate = 0;  // 0 cold (eager warm-run), 1 warm (capture+replay), 2 captured (replay)
 
   LagunaGraph(const LagunaWeights& w_, vt::Queue& q, LagunaKvCache& cache)
-      : w(&w_), p(&w_.params), qp(&q), dev(q.device) {
+      : w(&w_), p(&w_.params), qp(&q), dev(q.device),
+        shared_fp4(LagunaSharedFp4Enabled() && LagunaHasFp4SharedExpert(w_)) {
     H = p->hidden_size; Vsz = p->vocab_size; Dh = p->head_dim;
     Hkv = p->num_key_value_heads; kvdim = Hkv * Dh;
     nlayers = p->num_hidden_layers;
@@ -1966,8 +2027,14 @@ struct LagunaGraph {
       const LagunaLayerWeights& L = w->layers[static_cast<size_t>(l)];
       VT_CHECK(!L.attn.qkvg_proj.Empty(),
                "laguna decode graph: fused qkvg_proj missing (NVFP4 loader must build it)");
-      VT_CHECK(c.is_dense || !L.moe.router_shared_gu.Empty(),
-               "laguna decode graph: fused router_shared_gu missing (NVFP4 loader must build it)");
+      // VT_LAGUNA_SHARED_FP4 uses the split router GEMV + fp4 shared expert instead of
+      // the fused router|shared_gate|shared_up projection (which is freed at load).
+      if (shared_fp4)
+        VT_CHECK(c.is_dense || (!L.moe.router.Empty() && !L.moe.shared_gate_fp4.Empty()),
+                 "laguna decode graph: VT_LAGUNA_SHARED_FP4 needs split router + fp4 shared expert");
+      else
+        VT_CHECK(c.is_dense || !L.moe.router_shared_gu.Empty(),
+                 "laguna decode graph: fused router_shared_gu missing (NVFP4 loader must build it)");
       qkvg[static_cast<size_t>(l)].assign(static_cast<size_t>(c.qdim + 2 * kvdim + c.Hq), 0.0F);
     }
     // persistent f32 norms/bias (pre-converted ONCE — no per-token ReadF32 in-graph).
@@ -2148,8 +2215,13 @@ struct LagunaGraph {
         if (glue_fused) FusedAddNorm(hn.data(), fdn.data(), next_norm, hidden.data());
         else AddInto(hidden.data(), fdn.data());
       } else {
-        // LEVER 2: fused router|shared_gate|shared_up GEMV -> rsg slices.
-        GemmBf16(rsg.data(), lw.moe.router_shared_gu, hn.data(), E + 2 * moe_I, H);
+        // LEVER 2: fused router|shared_gate|shared_up GEMV -> rsg slices. VT_LAGUNA_SHARED_FP4:
+        // the shared expert is fp4-resident, so drop to a router-ONLY GEMV (`moe.router`) and
+        // run gate/up/down through the fp4 Marlin path (no bf16 shared weights read).
+        if (shared_fp4)
+          GemmBf16(rsg.data(), lw.moe.router, hn.data(), E, H);  // router only
+        else
+          GemmBf16(rsg.data(), lw.moe.router_shared_gu, hn.data(), E + 2 * moe_I, H);
         float* gatingp = rsg.data();
         float* sgp = rsg.data() + E;
         float* sup = rsg.data() + E + moe_I;
@@ -2160,8 +2232,12 @@ struct LagunaGraph {
                           topk, p->norm_topk_prob, p->moe_routed_scaling_factor);
         LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
                                     topk, doutb.data());
-        SiluMul(dact.data(), sgp, sup, moe_I);
-        GemmBf16(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
+        if (shared_fp4) {
+          LagunaSharedExpertMarlinInto(q, lw.moe, hn.data(), H, so.data());  // fp4 shared expert
+        } else {
+          SiluMul(dact.data(), sgp, sup, moe_I);
+          GemmBf16(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
+        }
         // LEVER A: hidden += routed + shared; hn = rms_norm(hidden)*next_norm in ONE node
         // (byte-exact vs AddInto(doutb) + FusedAddNorm(so)). Only in the glue-fused regime
         // (the split path is what it replaces); =0 restores the two-node split.
