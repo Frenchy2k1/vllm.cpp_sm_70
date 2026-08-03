@@ -688,9 +688,11 @@ TEST_CASE("DeepseekV4 device MHC + router in place == round-trip (Brick B)") {
                             scale.data(), base.data(), hc, hidden, eps, eps, eps, 2.0f, iters,
                             nw.data(), true, eps);
     gpu.Synchronize(g.q);
-    // pre_ip is the PARALLEL MhcPreParallelKernel (block-reduce over H in double) vs
-    // the round-trip's single-thread float accumulation → CHARACTERIZED NEAR-TIE (the
-    // width reduction reorders); Sinkhorn + gates stay in host order.
+    // pre_ip DEFAULTS to the ds4-fold FLOAT path (VT_V4_MHC_FUSED): the mix dots + the
+    // sqrsum/norm reductions run in float (GB10 throttles FP64) vs the round-trip's
+    // single-thread accumulation → CHARACTERIZED NEAR-TIE (float reduction reorder);
+    // Sinkhorn + gates stay in host order. (VT_V4_MHC_FUSED=0 restores the double path,
+    // itself a near-tie; both hold well within the 1e-3 tolerance at this tiny shape.)
     for (float v : ip.layer_input) CHECK(std::isfinite(v));
     CHECK(RelL2(ip.layer_input, rt.layer_input) < 1e-3);
     CHECK(RelL2(ip.comb_mix, rt.comb_mix) < 1e-3);
