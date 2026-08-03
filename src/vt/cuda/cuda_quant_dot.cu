@@ -196,6 +196,82 @@ __global__ void QuantizeQ8KKernel(BlockQ8_K* __restrict__ scratch,
 }
 
 // ---------------------------------------------------------------------------
+// ds4-parity Q8_K activation quantizer — ONE BLOCK per (super-block, row), 256
+// threads (one thread per element) with a shared-memory reduction. Port of the
+// GRID GEOMETRY of ds4 `q8_K_quantize_kernel` (ds4_cuda.cu:16627): grid=(nsb,m).
+// The legacy QuantizeQ8KKernel above maps one THREAD to a whole 256-element
+// super-block, so a decode grouped-MoE activation quant (Pa∈{1,P}, nsb≈8–28)
+// launches a SINGLE 128-thread block with ≤28 active threads on a >100-SM
+// device — occupancy/latency-bound (nsys: ~166 ms whole-run of the ds4flash
+// decode). This kernel launches `nsb·m` independent 256-thread blocks (one per
+// super-block), spreading the tiny per-step quant across the SMs exactly like
+// ds4 does. NOTE: this is NOT the Brick-8 GEMM-prologue fusion (fold the quant
+// into the grouped dot) — that re-quantized the SAME row in every one of the
+// thousands of GEMM blocks and regressed −22%; ds4 itself keeps the Q8_K quant
+// a SEPARATE stage (ds4_cuda.cu:25951 "Stage 1: quantize x rows to q8_K"). The
+// activation is still quantized exactly ONCE into scratch; only the quant
+// kernel's thread→work map changes.
+// BYTE-IDENTICAL to QuantizeQ8KKernel: the amax reduction carries the ORIGINAL
+// element index and breaks ties by LOWEST index — reproducing the legacy
+// sequential `if (ax > amax)` FIRST-occurrence rule, so the signed `mx` (hence
+// iscale's sign) is identical even when two elements share |x| with opposite
+// sign. iscale=-127/mx, qs=DNearestInt(iscale·x) upper-clamped to 127, bsums,
+// and d=1/iscale are unchanged. (Asserted byte-exact in test_cuda_quant_dot.)
+// ---------------------------------------------------------------------------
+__global__ void QuantizeQ8KPreqKernel(BlockQ8_K* __restrict__ scratch,
+                                      const void* __restrict__ a, ActDT adt,
+                                      int64_t a_rs, int64_t m, int64_t nsb) {
+  const int64_t b = static_cast<int64_t>(blockIdx.x);  // super-block within the row
+  const int64_t i = static_cast<int64_t>(blockIdx.y);  // activation row
+  if (b >= nsb || i >= m) return;
+  const int tid = static_cast<int>(threadIdx.x);  // 0..255, one element per thread
+  const int64_t elem0 = i * a_rs + b * kQK_K;
+  const float v = DLoadAct(a, adt, elem0 + tid);
+
+  __shared__ float sabs[kQK_K];
+  __shared__ float sval[kQK_K];
+  __shared__ int sidx[kQK_K];
+  sabs[tid] = fabsf(v);
+  sval[tid] = v;
+  sidx[tid] = tid;
+  __syncthreads();
+  // Reduce for the argmax-|x|: take the larger |x|, and on an EXACT tie keep the
+  // LOWEST original index (== legacy first-occurrence scan). sval[0] = signed mx.
+#pragma unroll
+  for (int stride = kQK_K >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      const float oa = sabs[tid + stride];
+      if (oa > sabs[tid] || (oa == sabs[tid] && sidx[tid + stride] < sidx[tid])) {
+        sabs[tid] = oa;
+        sval[tid] = sval[tid + stride];
+        sidx[tid] = sidx[tid + stride];
+      }
+    }
+    __syncthreads();
+  }
+
+  BlockQ8_K& y = scratch[i * nsb + b];
+  const float amax = sabs[0];
+  if (amax == 0.0f) {
+    if (tid == 0) y.d = 0.0f;
+    y.qs[tid] = 0;
+    if (tid < kQK_K / 16) y.bsums[tid] = 0;
+    return;
+  }
+  const float iscale = -127.0f / sval[0];
+  const int q = DNearestInt(iscale * v);
+  y.qs[tid] = static_cast<int8_t>(q < 127 ? q : 127);
+  __syncthreads();  // all 256 qs written (block-scoped global fence) before bsums read
+  if (tid < kQK_K / 16) {
+    int sum = 0;
+#pragma unroll
+    for (int ii = 0; ii < 16; ++ii) sum += y.qs[tid * 16 + ii];
+    y.bsums[tid] = static_cast<int16_t>(sum);
+  }
+  if (tid == 0) y.d = 1.0f / iscale;
+}
+
+// ---------------------------------------------------------------------------
 // Per-super-block dot kernels. Each returns the block's float contribution with
 // the INTEGER core computed bit-identically to the CPU vec_dot; the type's final
 // constant magnitude factor (0.125 iq2 / 0.25 iq3 / 1 otherwise) is folded once
@@ -1389,6 +1465,30 @@ inline ActDT ActDtOf(DType dt) {
   return dt == DType::kF32 ? ActDT::kF32 : dt == DType::kF16 ? ActDT::kF16 : ActDT::kBF16;
 }
 
+// ds4-parity Q8_K activation-quant dispatch (Brick 15): when VT_V4_PREQ_FUSED is
+// on, route the decode grouped-MoE / dense keep-quant activation quant through the
+// block-per-super-block QuantizeQ8KPreqKernel (ds4 q8_K_quantize grid geometry,
+// spreads the tiny per-step quant across the SMs); else the legacy 128-thread
+// one-thread-per-super-block QuantizeQ8KKernel. BYTE-IDENTICAL either way. Read per
+// call so in-process CUDA tests and the captured decode graph pick it up at
+// launch/capture time. Default ON (parity enabler ships as default);
+// VT_V4_PREQ_FUSED=0 forces the legacy quantizer for A/B measurement.
+inline bool Q8KPreqOn(const char* v) { return !(v && v[0] == '0' && v[1] == '\0'); }
+
+void LaunchQuantizeQ8K(BlockQ8_K* qact, const void* data, ActDT adt, int64_t a_rs,
+                       int64_t rows, int64_t nsb, cudaStream_t s) {
+  if (Q8KPreqOn(std::getenv("VT_V4_PREQ_FUSED"))) {
+    dim3 qgrid(static_cast<unsigned>(nsb), static_cast<unsigned>(rows), 1);
+    QuantizeQ8KPreqKernel<<<qgrid, kQK_K, 0, s>>>(qact, data, adt, a_rs, rows, nsb);
+  } else {
+    constexpr int kQBlock = 128;
+    const int64_t total_sb = rows * nsb;
+    const int64_t grid = (total_sb + kQBlock - 1) / kQBlock;
+    QuantizeQ8KKernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(qact, data, adt, a_rs, rows,
+                                                                      nsb);
+  }
+}
+
 // Q8_0 keep-quant GEMM (single). Quantize the m activation rows to Q8_0 on the GPU
 // (per-stream grow-only scratch, shared with the Q8_K path — sequential GEMMs), then
 // one warp-per-output integer dot. NO CPU fallback, NO stream sync ⇒ capturable.
@@ -1593,13 +1693,7 @@ void MatmulBTQuantKernelCuda(Queue& q, Tensor& out, const Tensor& a,
   ActDT adt = a.dtype == DType::kF32 ? ActDT::kF32
               : a.dtype == DType::kF16 ? ActDT::kF16
                                        : ActDT::kBF16;
-  const int64_t total_sb = m * nsb;
-  {
-    constexpr int kQBlock = 128;
-    const int64_t grid = (total_sb + kQBlock - 1) / kQBlock;
-    QuantizeQ8KKernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
-        act, a.data, adt, a.stride[0], m, nsb);
-  }
+  LaunchQuantizeQ8K(act, a.data, adt, a.stride[0], m, nsb, s);
 
   // 2. The integer dot GEMM (one warp per output), dequant-in-kernel.
   const uint8_t* weight = static_cast<const uint8_t*>(b.data);
@@ -1681,13 +1775,7 @@ void MatmulBTQuantGroupedKernelCuda(Queue& q, Tensor& out, const Tensor& act,
   ActDT adt = act.dtype == DType::kF32 ? ActDT::kF32
               : act.dtype == DType::kF16 ? ActDT::kF16
                                          : ActDT::kBF16;
-  {
-    constexpr int kQBlock = 128;
-    const int64_t total_sb = Pa * nsb;
-    const int64_t grid = (total_sb + kQBlock - 1) / kQBlock;
-    QuantizeQ8KKernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(
-        qact, act.data, adt, act.stride[0], Pa, nsb);
-  }
+  LaunchQuantizeQ8K(qact, act.data, adt, act.stride[0], Pa, nsb, s);
 
   const uint8_t* wt = static_cast<const uint8_t*>(weight.data);
   const int32_t* eids = static_cast<const int32_t*>(expert_ids.data);
@@ -1854,13 +1942,7 @@ void MoeGateUpSwiGLUGroupedCuda(Queue& q, Tensor& out, const Tensor& act, const 
   ActDT adt = act.dtype == DType::kF32 ? ActDT::kF32
               : act.dtype == DType::kF16 ? ActDT::kF16
                                          : ActDT::kBF16;
-  {
-    constexpr int kQBlock = 128;
-    const int64_t total_sb = Pa * nsb;
-    const int64_t grid = (total_sb + kQBlock - 1) / kQBlock;
-    QuantizeQ8KKernel<<<static_cast<unsigned>(grid), kQBlock, 0, s>>>(qact, act.data, adt,
-                                                                      act.stride[0], Pa, nsb);
-  }
+  LaunchQuantizeQ8K(qact, act.data, adt, act.stride[0], Pa, nsb, s);
 
   const uint8_t* gw = static_cast<const uint8_t*>(gate_w.data);
   const uint8_t* uw = static_cast<const uint8_t*>(up_w.data);
