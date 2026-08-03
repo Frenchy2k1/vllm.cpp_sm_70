@@ -141,7 +141,7 @@ binding result, the active performance diagnosis, pending gates, and current
 reproduction entry points. For the user-facing overview (what the project is,
 how to build it, the CLI, the OpenAI server, and how to consume it), see the
 [README](../README.md); this page is the detailed numbers behind its
-[Performance](../README.md#performance-faster-than-vllm) section, and the per-capability
+[Performance](../README.md#performance) section, and the per-capability
 lifecycle ledger is [docs/STATUS.md](STATUS.md). Attempt chronology and failure
 forensics live in the [parity ledger](../.agents/parity-ledger.md),
 [state log](../.agents/state.md), linked specs, and Git. Those raw records are
