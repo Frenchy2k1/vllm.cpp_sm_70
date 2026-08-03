@@ -1336,6 +1336,12 @@ __device__ double YarnCorrDimDev(int n_dims, int n_ctx_orig, double beta, double
   return static_cast<double>(n_dims) *
          log(static_cast<double>(n_ctx_orig) / (beta * 2.0 * kPi)) / (2.0 * log(base));
 }
+// FLOAT YaRN correction-dim (mirrors ds4's inline corr0/corr1: logf, 2*logf(base)).
+__device__ float YarnCorrDimDevF(int n_dims, int n_ctx_orig, float beta, float base) {
+  const float kPi = 3.14159265358979323846f;
+  return static_cast<float>(n_dims) *
+         logf(static_cast<float>(n_ctx_orig) / (beta * 2.0f * kPi)) / (2.0f * logf(base));
+}
 // One thread per row; the sequential-recurrence RoPE (host RopeInplaceLayer) on
 // v[row*stride + off .. +r]. Near-tie vs host (device cos/sin vs libm; the double
 // recurrence theta_extrap*=theta_scale preserves host order).
@@ -1459,6 +1465,88 @@ __global__ void NormRopeRowsKernel(float* __restrict__ out, const float* __restr
     outr[off + i + 1] = x0 * sn + x1 * c;
   }
 }
+// ── ds4-fold (VT_V4_ROPE_FLOAT): the FLOAT norm+RoPE, a 1:1 structural mirror of the
+// double NormRopeRowsKernel above and of ds4's head_rms_norm_rope_tail_kernel
+// (~/w8run/ds4/ds4_cuda.cu:5873) + dsv4_qkv_rms_norm_rows_kv_rope_kernel (:5779). Two
+// changes vs the double kernel, both ds4-faithful: (1) the RMS reduction + the RoPE
+// pow/cos/sin run in FLOAT (GB10 throttles FP64 transcendentals ~1/32-1/64 of FP32 —
+// the SAME failure mode the MHC FP64->FP32 fold fixed); (2) the RoPE theta uses ds4's
+// DIRECT powf(base, -i/r) per pair (i=2p) instead of the double O(pairs^2) left-fold
+// recurrence (theta_extrap*=theta_scale). powf(base,-2p/r) == theta_scale^p, so the
+// algebra is identical — only the accumulation precision + per-pair cost change. NO
+// ds4 attn_factor/mscale (we have none, matching the double kernel). Same grid=(rows),
+// block=256; do_norm/has_w/inverse branches unchanged.
+__global__ void NormRopeRowsFloatKernel(float* __restrict__ out, const float* __restrict__ in,
+                                        const float* __restrict__ w, int rows, int n, int off,
+                                        int r, const int* __restrict__ row_pos, float base,
+                                        float freq_scale, float ext_factor, int n_ctx_orig,
+                                        float beta_fast, float beta_slow, int inverse, int has_w,
+                                        int do_norm, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  const float* inr = in + static_cast<int64_t>(row) * n;
+  float* outr = out + static_cast<int64_t>(row) * n;
+  extern __shared__ float redf[];
+  float rscale = 1.0f;
+  if (do_norm) {
+    float ls = 0.0f;
+    for (int i = tid; i < n; i += nt) { const float v = inr[i]; ls += v * v; }
+    redf[tid] = ls;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) redf[tid] += redf[tid + s]; __syncthreads(); }
+    rscale = rsqrtf(redf[0] / static_cast<float>(n) + eps);
+    for (int i = tid; i < off; i += nt) outr[i] = has_w ? inr[i] * rscale * w[i] : inr[i] * rscale;
+    for (int i = off + r + tid; i < n; i += nt)
+      outr[i] = has_w ? inr[i] * rscale * w[i] : inr[i] * rscale;
+  }
+  // RoPE tail — one thread per pair p (dims off+2p, off+2p+1); float, direct powf.
+  const float sin_sign = inverse ? -1.0f : 1.0f;
+  float corr_lo = 0.0f, corr_hi = 0.0f;
+  if (ext_factor != 0.0f) {
+    corr_lo = fmaxf(0.0f, floorf(YarnCorrDimDevF(r, n_ctx_orig, beta_fast, base)));
+    corr_hi = fminf(static_cast<float>(r - 1), ceilf(YarnCorrDimDevF(r, n_ctx_orig, beta_slow, base)));
+  }
+  const float pos = static_cast<float>(row_pos[row]);
+  const int pairs = r / 2;
+  for (int p = tid; p < pairs; p += nt) {
+    const int i = 2 * p;
+    const float theta_extrap = pos * powf(base, -static_cast<float>(i) / static_cast<float>(r));
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+      const float y = (static_cast<float>(i / 2) - corr_lo) / fmaxf(0.001f, corr_hi - corr_lo);
+      const float ramp = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+      theta = theta_interp * (1.0f - ramp) + theta_extrap * ramp;
+    }
+    const float c = cosf(theta);
+    const float sn = sin_sign * sinf(theta);
+    float x0, x1;
+    if (do_norm) {
+      x0 = has_w ? inr[off + i] * rscale * w[off + i] : inr[off + i] * rscale;
+      x1 = has_w ? inr[off + i + 1] * rscale * w[off + i + 1] : inr[off + i + 1] * rscale;
+    } else {
+      x0 = outr[off + i];
+      x1 = outr[off + i + 1];
+    }
+    outr[off + i] = x0 * c - x1 * sn;
+    outr[off + i + 1] = x0 * sn + x1 * c;
+  }
+}
+
+// ds4-fold gate: route norm+RoPE through the FLOAT (ds4-mirroring) kernel instead of the
+// bit-faithful FP64 path. DEFAULT ON (parity-enablers-ship-as-defaults) — a MEASURED
+// decode win on GB10 where FP64 is throttled; VT_V4_ROPE_FLOAT=0 opts back to the double
+// path for a same-binary A/B. Read once (process-wide) so the captured decode graph bakes
+// a consistent path.
+static bool RopeFloatEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_ROPE_FLOAT");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
 void NormRopeRowsLaunch(Queue& q, float* out, const float* in, const float* w, int64_t rows,
                         int64_t n, int64_t off, int64_t r, const int* row_pos, double base,
                         double freq_scale, double ext_factor, int64_t n_ctx_orig, double beta_fast,
@@ -1466,6 +1554,17 @@ void NormRopeRowsLaunch(Queue& q, float* out, const float* in, const float* w, i
   if (rows == 0 || n == 0) return;
   cudaStream_t s = AsStream(q);
   const unsigned block = 256;
+  if (RopeFloatEnabled()) {
+    // ds4-fold: the identical algebra in FLOAT (GB10 FP64 is ~1/32-1/64 of FP32).
+    NormRopeRowsFloatKernel<<<static_cast<unsigned>(rows), block, block * sizeof(float), s>>>(
+        out, in, w, static_cast<int>(rows), static_cast<int>(n), static_cast<int>(off),
+        static_cast<int>(r), row_pos, static_cast<float>(base), static_cast<float>(freq_scale),
+        static_cast<float>(ext_factor), static_cast<int>(n_ctx_orig),
+        static_cast<float>(beta_fast), static_cast<float>(beta_slow), inverse ? 1 : 0,
+        has_w ? 1 : 0, do_norm ? 1 : 0, eps);
+    Check(cudaGetLastError(), "norm_rope_rows launch (float)");
+    return;
+  }
   NormRopeRowsKernel<<<static_cast<unsigned>(rows), block, block * sizeof(double), s>>>(
       out, in, w, static_cast<int>(rows), static_cast<int>(n), static_cast<int>(off),
       static_cast<int>(r), row_pos, base, freq_scale, ext_factor, static_cast<int>(n_ctx_orig),
