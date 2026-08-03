@@ -34505,3 +34505,34 @@ The required Slack selection notification was attempted through the bundled
 secret-safe sender to the only conventional target available, `#general`, but
 Slack returned `channel_not_found`. No channel ID/name is configured and no
 credential was inspected or exposed.
+
+## 2026-08-03 - Darwin Laguna feature-guard repair
+
+LocalAI Darwin consumer CI pinned at `ca5c7adc` exposed AppleClang 21's real
+fatal error: `laguna.cpp:739` defined `LagunaMarlinMoeEnabled` in a Metal build,
+while every call was compiled only under `VT_MARLIN_NVFP4`. The two preceding
+`-Wgnu-folding-constant` annotations came instead from Go module
+`github.com/shoenig/go-m1cpu@v0.1.6` before vllm.cpp was checked out; the MLX
+translation-unit suppressions in PRs #23/#24 were unrelated to this failure.
+
+The helper definition now shares its call sites' `VT_MARLIN_NVFP4` guard. A
+RED-first real-tree test in `test_device_leakage.py` asserts that the helper
+cannot drift outside the feature boundary again. This is build portability
+only: no runtime, model, lifecycle, correctness, or benchmark state changed.
+
+## 2026-08-03 - Darwin Voxtral compiler-pragma repair
+
+The next LocalAI Darwin consumer run (`30778738021`, job `91579246349`, pin
+`065373dc`) confirmed that the two annotated `-Wgnu-folding-constant` warnings
+were emitted by Go dependency `github.com/shoenig/go-m1cpu@v0.1.6` and did not
+stop the build. The actual fatal error occurred later at
+`voxtral.cpp:240`: AppleClang does not recognize GCC's
+`-Wstringop-overflow`, so the diagnostic-suppression pragma itself became
+`-Werror,-Wunknown-warning-option`.
+
+The GCC-13 false-positive suppression is now bounded by
+`defined(__GNUC__) && !defined(__clang__)`; the in-bounds copy code is
+unchanged. A RED-first source regression test pins that ownership boundary.
+This is build portability only and changes no runtime, model lifecycle,
+correctness result, or benchmark disposition. Darwin consumer CI remains the
+binding AppleClang verification.
