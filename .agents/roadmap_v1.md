@@ -274,6 +274,18 @@ array-bounds/stringop false positive neutralized locally). SACRED-inert (shared 
 TUs empty-diff; host oracle 6/6·26 unchanged). Honest 3-state: kernels RUNTIME-VERIFIED at small shape on
 real GB10; the real-checkpoint e2e stays W8 (156.7 GiB does not fit ONE GB10) + W2b tower materialization
 + the GGUF `blk.N.*` name-map.
+**MEASURED PARITY LEVERS INTEGRATED TO main (2026-08-03, GB10 build+gate):** four verified branches landed
+together. (1) DeepSeek MHC-pre FP64→FP32 fold (`CLAIM-DSV4-MHC-FOLD`, `VT_V4_MHC_FUSED` default-ON) — the
+float MHC-pre mirroring ds4 is BIT-EXACT (decode ids token-identical `=1`/`=0`; `test_cuda_deepseek_v4`
+Brick-B PASS on GB10) and MEASURED **82.3%→84.3% of ds4**. (2) GGUF UD-IQ2_M CPU bring-up — multi-shard
+`gguf-split` stitching (`CLAIM-GGUF-SPLIT-SHARDS`, `test_gguf` 33/33) + IQ2_S/MXFP4 keep-quant `vec_dot`
+(`CLAIM-DSV4-UDIQ2M-QUANT`, CPU-green); the IQ2_S device `DotSuperblock<kIQ2_S>` is now **CUDA-BUILT + LINKED
+on GB10** (sm_121a, `-Werror`; one integration fix: `DotMXFP4` marked `[[maybe_unused]]` — the file had never
+been through nvcc). (3) Laguna long-context levers (`CLAIM-LAGUNA-LONGCTX-LEVERS`) — window-bounded SWA reads
+(`VT_LAGUNA_SWA_WINDOW` default-ON, BYTE-EXACT: GB10 A/B token-IDENTICAL at 520-token context) MEASURED
+**−0.30 ms/step@2k**; bf16 paged KV (`VT_LAGUNA_KV_BF16` default-OFF opt-in) a near-tie left UNRATIFIED.
+**SACRED gates UNMOVED on the merged GB10 build: `test_qwen27_paged_engine` 235/235 + `test_qwen36_paged_engine`
+315/315.** See docs/BENCHMARKS.md + docs/STATUS.md.
 **W8-FINAL — ENTRYPOINT WIRING LANDED + GATED; THE RUN RE-SCOPED TO A CODE BLOCKER (2026-07-29,
 `CLAIM-DEEPSEEK-V4-W8`, base `376e186b`):** with W8 keep-quant + W2b tower materialization landed, this
 lane wired the top-level GGUF dispatch arm (the "one small code piece W2b named") and attempted the real
