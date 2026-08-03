@@ -97,6 +97,39 @@ __global__ void AddAdd2RmsNormStdKernel(float* out, float* residual, const float
   for (int64_t i = threadIdx.x; i < n; i += blockDim.x) orow[i] = rr[i] * inv * w[i];
 }
 
+// ── VT_LAGUNA_TAIL_FUSED: bf16-x1 sibling of AddAdd2RmsNormStdKernel. IDENTICAL math,
+// but the FIRST residual contribution x1 (the routed-expert output) arrives as bf16 and
+// is widened in-kernel with __bfloat162float instead of via a preceding standalone
+// vt::CastF32 node. BYTE-EXACT to the f32 path: __bfloat162float(x1b[i]) reproduces the
+// EXACT bits vt::CastF32 wrote (bf16 bits << 16), so (residual + widen(x1b)) + x2 equals
+// (residual + castf32(x1b)) + x2 for every element — the ONLY change is WHERE the widen
+// runs (folded into this reduce, one graph node fewer: the MoE routed CastF32 is gone).
+// x2 (shared expert) stays f32. rows=1 (T=1 decode). Same 256-thread sh[256] reduction.
+__global__ void AddAdd2RmsNormStdBf16Kernel(float* out, float* residual,
+                                            const __nv_bfloat16* x1, const float* x2,
+                                            const float* w, int64_t n, float eps) {
+  const int64_t r = static_cast<int64_t>(blockIdx.x);  // T=1: r == 0
+  float* rr = residual + r * n;
+  float* orow = out + r * n;
+  const __nv_bfloat16* x1r = x1 + r * n;
+  const float* x2r = x2 + r * n;
+  float local = 0.0f;
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+    const float v = (rr[i] + __bfloat162float(x1r[i])) + x2r[i];  // widen == CastF32(bf16)
+    rr[i] = v;
+    local += v * v;
+  }
+  __shared__ float sh[256];
+  sh[threadIdx.x] = local;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(sh[0] / static_cast<float>(n) + eps);
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) orow[i] = rr[i] * inv * w[i];
+}
+
 // ── partial-NeoX RoPE from a half-split [rope_rows,rd] cache (bit-exact to ApplyRope) ──
 // One thread per (head, i<rd/2): c=cache[pos*rd+i], s=cache[pos*rd+half+i].
 __global__ void RopeFromCacheKernel(float* x, const float* cache, int64_t heads, int64_t Dh,
@@ -832,6 +865,13 @@ void AddAdd2RmsNormStdLaunch(Queue& q, float* out, float* residual, const float*
   // RmsNormRowKernel's kBlock=256 order — byte-exact norm).
   AddAdd2RmsNormStdKernel<<<1, 256, 0, AsStream(q)>>>(out, residual, x1, x2, w, n, eps);
 }
+void AddAdd2RmsNormStdBf16Launch(Queue& q, float* out, float* residual, const void* x1,
+                                 const float* x2, const float* w, int64_t n, float eps) {
+  // VT_LAGUNA_TAIL_FUSED: x1 is the bf16 routed-expert output (MoeCombine wrote it
+  // directly, no CastF32). one block (T=1), 256 threads (byte-exact norm reduction).
+  AddAdd2RmsNormStdBf16Kernel<<<1, 256, 0, AsStream(q)>>>(
+      out, residual, reinterpret_cast<const __nv_bfloat16*>(x1), x2, w, n, eps);
+}
 void RopeFromCacheLaunch(Queue& q, float* x, const float* cache, int64_t heads, int64_t Dh,
                          int64_t rd, int64_t pos) {
   RopeFromCacheKernel<<<Blocks(heads * (rd / 2)), kTPB, 0, AsStream(q)>>>(x, cache, heads, Dh, rd,
@@ -950,7 +990,8 @@ const LagunaDeviceKernels kLaguna = {&RmsNormSeqLaunch,    &RopeFromCacheLaunch,
                                      &SigmoidTopKLaunch,   &DecodeAttnGqaGLaunch,
                                      &LmHeadGemvLaunch,    &AppendKvRowLaunch,
                                      &RopeFromCacheGLaunch, &EmbedGatherLaunch,
-                                     &AddAdd2RmsNormStdLaunch, &FusedQkNormRopeGLaunch};
+                                     &AddAdd2RmsNormStdLaunch, &FusedQkNormRopeGLaunch,
+                                     &AddAdd2RmsNormStdBf16Launch};
 
 struct Registrar {
   Registrar() {
