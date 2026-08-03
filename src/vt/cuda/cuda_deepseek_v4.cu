@@ -146,6 +146,64 @@ __global__ void SinkhornKernel(const float* logits, float* out, int hc, int iter
   for (int i = 0; i < hc * hc; ++i) out[i] = m[i];
 }
 
+// hc==4 specialization of SinkhornInplace (the DeepSeek-V4 hc_mult is structurally 4:
+// (2+hc)*hc=24, hc*H=16384 ⇒ hc=4). Hardcoding hc=4 with #pragma unroll lets ptxas keep
+// `m[16]` (and the caller's cl[16]) in REGISTERS instead of the 2048-byte LOCAL stack frame
+// the generic runtime-`hc` version forces (dynamic index ⇒ off-chip local memory). ncu on
+// GB10 pins the finish kernel as ~86% CTA-barrier + local-memory-scoreboard bound: 31 warps
+// idle at the __syncthreads while thread 0 grinds the Sinkhorn through 4-byte-of-32 local
+// DRAM transactions. Register residency collapses that (2048→0 B stack frame). BYTE-IDENTICAL
+// to SinkhornInplace for hc=4: same op sequence, same accumulation order (k asc, j asc; eps
+// added last) — verified 0/16 ULP on a locked-clock GB10 A/B. Mirrors ds4's hc4_split_one
+// (~/w8run/ds4/ds4_cuda.cu:9618, its `float c[16]` fully-unrolled register split).
+__device__ inline void SinkhornInplace4(const float* __restrict__ logits, float* m, int iters,
+                                        float eps) {
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    float rmax = logits[j * 4];
+#pragma unroll
+    for (int k = 1; k < 4; ++k) rmax = fmaxf(rmax, logits[j * 4 + k]);
+    float rsum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float e = expf(logits[j * 4 + k] - rmax);
+      m[j * 4 + k] = e;
+      rsum += e;
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) m[j * 4 + k] = m[j * 4 + k] / rsum + eps;
+  }
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    float c = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) c += m[j * 4 + k];
+    const float den = c + eps;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) m[j * 4 + k] /= den;
+  }
+  for (int it = 0; it < iters - 1; ++it) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      float r = 0.0f;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) r += m[j * 4 + k];
+      const float den = r + eps;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) m[j * 4 + k] /= den;
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      float c = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) c += m[j * 4 + k];
+      const float den = c + eps;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) m[j * 4 + k] /= den;
+    }
+  }
+}
+
 // MhcPre (torch.py:56-91 + folded RMSNorm). Single thread; mixes/scratch global.
 __global__ void MhcPreKernel(const float* residual, const float* fn, const float* scale,
                              const float* base, int hc, int hidden, float rms_eps,
@@ -385,6 +443,87 @@ __global__ void MhcPreFinishFloatKernel(const float* __restrict__ residual,
   if (has_norm) {
     float ss = 0.0f;
     for (int h = tid; h < hidden; h += nt) { const float v = layer_out[h]; ss += v * v; }
+    const float ssr = block_reduce(ss);
+    const float r = rsqrtf(ssr / static_cast<float>(hidden) + norm_eps);
+    for (int h = tid; h < hidden; h += nt) layer_out[h] = layer_out[h] * r * norm_weight[h];
+  }
+}
+
+// ── Kernel B'' (VT_V4_MHC_SINK4): the hc==4 register-resident finish. The MEASURED close
+//    (ncu, locked-clock GB10) of the last DeepSeek decode lever vs ds4. The generic
+//    MhcPreFinishFloatKernel above is barrier + local-memory bound: ptxas hands it a
+//    2048-byte LOCAL stack frame for the runtime-`hc` `cl[256]/m[256]` Sinkhorn arrays, and
+//    ncu pins ~86% of its warp-cycles STALLED at the __syncthreads while thread 0 grinds that
+//    Sinkhorn through scattered 4-byte local-DRAM transactions (Compute 0.1% / Mem 0.3% — it
+//    is neither compute- nor bandwidth-bound, it is single-block serial-latency bound). This
+//    kernel is byte-identical for hc=4 but (a) runs the split in REGISTERS (SinkhornInplace4,
+//    0-byte stack frame) and (b) folds the RMSNorm Σ into the weighted-sum loop (ds4's
+//    hc_split_weighted_sum_norm_fused_kernel:9752 does the same `sum += acc*acc` single-pass),
+//    removing the duplicate layer_out re-read + one barrier. ncu: ~75→~26 µs/call; event-loop
+//    95→57 µs/call — both BYTE-EXACT (comb+layer 0/16 ULP A/B). Same 1024-wide finish block +
+//    sqrsum fold as the default LEAN path, so the norm reduction tree is unchanged.
+__global__ void MhcPreFinishFloatKernel4(const float* __restrict__ residual,
+                                         const float* __restrict__ scale,
+                                         const float* __restrict__ base, int hc, int hidden,
+                                         float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
+                                         float hc_post_mult, int iters,
+                                         const float* __restrict__ norm_weight, int has_norm,
+                                         float norm_eps, float* mixes, float* pre_out,
+                                         float* post_out, float* comb_out, float* layer_out,
+                                         int fold_sqrsum) {
+  const int hc3 = (2 + hc) * hc;
+  const int flat = hc * hidden;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  extern __shared__ float redf[];
+  auto block_reduce = [&](float v) -> float {
+    redf[tid] = v;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) { if (tid < s) redf[tid] += redf[tid + s]; __syncthreads(); }
+    const float r = redf[0];
+    __syncthreads();
+    return r;
+  };
+  float sqrsum;
+  if (fold_sqrsum) {
+    sqrsum = mixes[hc3];
+  } else {
+    float ls = 0.0f;
+    for (int i = tid; i < flat; i += nt) { const float r = residual[i]; ls += r * r; }
+    sqrsum = block_reduce(ls);
+  }
+  const float rms = rsqrtf(sqrsum / static_cast<float>(flat) + rms_eps);
+  for (int o = tid; o < hc3; o += nt) mixes[o] = mixes[o] * rms;
+  __syncthreads();
+  if (tid == 0) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) pre_out[j] = Sig(mixes[j] * scale[0] + base[j]) + hc_pre_eps;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      post_out[j] = Sig(mixes[4 + j] * scale[1] + base[4 + j]) * hc_post_mult;
+    float cl[16], m[16];  // hc==4 ⇒ register-resident (0-byte stack frame)
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const int idx = j * 4 + k;
+        cl[idx] = mixes[8 + idx] * scale[2] + base[8 + idx];
+      }
+    SinkhornInplace4(cl, m, iters, hc_sinkhorn_eps);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) comb_out[i] = m[i];
+  }
+  __syncthreads();
+  // ds4-mirror norm fold: one global write of layer_out, no re-read. BYTE-EXACT — ss
+  // accumulates acc*acc over the SAME per-thread h-sequence/order the separate pass used.
+  float ss = 0.0f;
+  for (int h = tid; h < hidden; h += nt) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc += pre_out[j] * residual[j * hidden + h];
+    layer_out[h] = acc;
+    ss += acc * acc;
+  }
+  if (has_norm) {
     const float ssr = block_reduce(ss);
     const float r = rsqrtf(ssr / static_cast<float>(hidden) + norm_eps);
     for (int h = tid; h < hidden; h += nt) layer_out[h] = layer_out[h] * r * norm_weight[h];
@@ -1277,6 +1416,19 @@ static unsigned MhcFinishBlock() {
 // sqrsum fold (MhcPreDots block 0 pre-computes Σresidual² → finish skips its second pass).
 static inline bool MhcLeanOn() { return MhcFinishBlock() != 256u; }
 
+// VT_V4_MHC_SINK4 — the hc==4 register-resident finish (MhcPreFinishFloatKernel4). DEFAULT-ON
+// (parity-enablers): it is BYTE-EXACT for hc=4 and a MEASURED ~75→~26 µs/call (ncu) close of
+// the finish kernel's local-memory+barrier stall vs ds4. =0 opts back to the generic
+// runtime-`hc` finish (same-binary A/B). Only applies when hc==4 (the DeepSeek-V4 structural
+// hc_mult); any other hc always takes the generic path.
+static bool MhcSink4On() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_MHC_SINK4");
+    return e == nullptr || std::string(e) != "0";
+  }();
+  return on;
+}
+
 // MhcPre writes pre/post/comb mixes + layer_input; it needs an hc3=[(2+hc)*hc] mix
 // scratch. `mix_scratch` is a caller-provided unified buffer (>= hc3 floats).
 void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_mix,
@@ -1299,10 +1451,19 @@ void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_
     // Lever 2: widen the single-block finish for HBM-latency hiding on its lone SM + skip its
     // duplicate residual pass when the sqrsum was folded into the dots.
     const unsigned fblock = MhcFinishBlock();
-    MhcPreFinishFloatKernel<<<1, fblock, fblock * sizeof(float), s>>>(
-        residual, scale, base, static_cast<int>(hc), static_cast<int>(hidden), rms_eps, hc_pre_eps,
-        hc_sinkhorn_eps, hc_post_mult, static_cast<int>(iters), norm_weight, has_norm ? 1 : 0,
-        norm_eps, mix_scratch, pre_mix, post_mix, comb_mix, layer_input, fold);
+    if (MhcSink4On() && hc == 4) {
+      // Register-resident hc=4 finish + ds4 norm-fold (byte-exact); kills the 2048-byte local
+      // stack frame + the layer_out re-read that made the generic finish barrier-bound.
+      MhcPreFinishFloatKernel4<<<1, fblock, fblock * sizeof(float), s>>>(
+          residual, scale, base, static_cast<int>(hc), static_cast<int>(hidden), rms_eps,
+          hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, static_cast<int>(iters), norm_weight,
+          has_norm ? 1 : 0, norm_eps, mix_scratch, pre_mix, post_mix, comb_mix, layer_input, fold);
+    } else {
+      MhcPreFinishFloatKernel<<<1, fblock, fblock * sizeof(float), s>>>(
+          residual, scale, base, static_cast<int>(hc), static_cast<int>(hidden), rms_eps,
+          hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, static_cast<int>(iters), norm_weight,
+          has_norm ? 1 : 0, norm_eps, mix_scratch, pre_mix, post_mix, comb_mix, layer_input, fold);
+    }
     Check(cudaGetLastError(), "mhc_pre_ip launch (fused)");
     return;
   }
