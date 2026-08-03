@@ -34536,3 +34536,18 @@ unchanged. A RED-first source regression test pins that ownership boundary.
 This is build portability only and changes no runtime, model lifecycle,
 correctness result, or benchmark disposition. Darwin consumer CI remains the
 binding AppleClang verification.
+
+## 2026-08-03 - MLX system-header dependency boundary
+
+LocalAI Darwin consumer run `30783379823` showed that translation-unit warning
+flags and pragmas did not durably isolate AppleClang diagnostics emitted by MLX
+0.29.3 headers from vllm.cpp's target-wide `-Werror`. The MLX library and its
+public includes are now owned by a dedicated imported CMake target, with the
+include directory explicitly present in both the normal and SYSTEM interface.
+The provider links that dependency target and carries no diagnostic pragma.
+
+A RED-first focused regression configures a synthetic MLX dependency whose
+header emits Clang's GNU-folding warning: the dependency warning must compile,
+while the identical warning in project source must remain fatal. This is build
+portability only. Local structural checks pass; Darwin consumer CI remains the
+binding AppleClang verification.

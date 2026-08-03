@@ -831,11 +831,13 @@ if(VLLM_CPP_METAL)
       message(FATAL_ERROR "VLLM_CPP_MLX=ON but no libmlx + include/mlx/array.h under "
         "MLX_ROOT=${MLX_ROOT}")
     endif()
+    include(cmake/MLXDependency.cmake)
+    vllm_cpp_import_mlx("${MLX_ROOT}" "${MLX_LIBRARY}")
     target_compile_definitions(vllm PUBLIC VLLM_CPP_MLX)
     target_sources(vllm PRIVATE src/vt/metal/metal_mlx_provider.mm)
-    # SYSTEM so MLX's own headers cannot break our -Werror build.
-    target_include_directories(vllm SYSTEM PRIVATE "${MLX_ROOT}/include")
-    target_link_libraries(vllm PUBLIC ${MLX_LIBRARY})
+    # MLX is a third-party dependency target: its public headers are SYSTEM,
+    # while vllm's own sources remain subject to the target-wide -Werror policy.
+    target_link_libraries(vllm PUBLIC vllm_cpp::mlx)
     message(STATUS "MLX GEMM provider enabled: ${MLX_LIBRARY}")
   endif()
 endif()

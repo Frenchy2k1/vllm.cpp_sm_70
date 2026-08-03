@@ -6783,10 +6783,11 @@ us by about 1.5 points.
 The default (non-MLX) build is **95.9%** against this corrected baseline, not
 96.4%.
 
-The 2026-08-02 AppleClang warning-suppression correction is **NOT APPLICABLE**
-to benchmark results: it changes only whether the optional MLX provider compiles
-under target-wide `-Werror`. Darwin CI remains the build-verification gate; no
-runtime path, measurement, or binding number changed.
+The 2026-08-03 MLX system-header dependency correction is **NOT APPLICABLE** to
+benchmark results: it replaces translation-unit warning suppression with an
+imported CMake dependency whose public headers are `SYSTEM`. Darwin CI remains
+the build-verification gate; no runtime path, measurement, or binding number
+changed.
 
 **Everything qualitative in the entry below still holds** — MLX wins prefill, the
 shape gate is the right disposition, the fallback hoist was worth 27.2 vs 17.8 —
