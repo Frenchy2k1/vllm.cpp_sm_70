@@ -1743,6 +1743,32 @@ inline bool LagunaTailFusedEnabled() {
   return on;
 }
 
+// ── VT_LAGUNA_SHARED_AUX: run the per-MoE-layer SHARED expert on a SECOND CUDA
+// stream, forked from the post-attn-norm hidden `hn` BEFORE the router GEMV, so
+// the (fp4-Marlin) shared expert overlaps the router GEMV + sigmoid_topk + routed
+// grouped-GEMM issued on the main stream. This mirrors vLLM's
+// MULTI_STREAM_OVERLAPPED (fused_moe/runner/shared_experts.py:125-129 fork from
+// the post-attn hidden, moe_runner.py:560-596,809 join before MoeCombine) — the
+// SAME machinery the 35B ships ON by default (ENG-MOE-SHARED-AUX,
+// qwen3_5.cpp:4408-4467). The routed grouped GEMM is low-occupancy on the GB10
+// (ncu: ~14% mem-SoL, 23% occ, 1 wave), so its spare SMs run the shared MLP
+// concurrently. DEFAULT ON: the in-situ GB10 A/B won it (byte-exact + real 2.34 ms/step
+// concurrency, net GPU-active +2.9%, 38.15->39.27 tok/s, ~92% of vLLM — parity-enablers-
+// ship-as-defaults). BYTE-EXACT: the two streams read the same `hn` and write
+// disjoint buffers (routed->doutb on main, shared->so on aux) joined before the
+// combine, so the result is bit-identical to the serial order; `=0` is the
+// same-binary rollback. Only meaningful in the fp4-shared arm (VT_LAGUNA_SHARED_FP4,
+// default ON), where the router GEMV is already SPLIT from the shared expert — the
+// EARLY fork the prior fused-GEMV attempt could not achieve. inline so a CPU build
+// (VT_MARLIN_NVFP4 off, graph excluded) does not -Wunused.
+inline bool LagunaSharedAuxEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_SHARED_AUX");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
 bool LagunaCanRunResidentDecode(const LagunaParams& p, vt::Queue& q, const LagunaWeights& w,
                                 int64_t T) {
 #ifndef VT_MARLIN_NVFP4
@@ -2124,6 +2150,17 @@ struct LagunaGraph {
   // ride LagunaSharedExpertMarlinInto (no bf16 shared weights read). Set in the ctor
   // init-list (depends on the ctor's weights arg).
   const bool shared_fp4;
+  // VT_LAGUNA_SHARED_AUX: the aux stream + fork/join events for the shared-expert
+  // overlap (ENG-MOE-SHARED-AUX mirror). Created in the ctor — BEFORE any capture —
+  // so the stream/events exist when the gstate-1 region is captured; the gstate-0
+  // eager warm-run issues the aux shared expert once (building its fp4 Marlin
+  // residents + warming AuxPool) so the captured replay does zero cudaMalloc. Only
+  // armed when VT_LAGUNA_SHARED_AUX=1 AND the fp4-shared arm is active AND the
+  // backend has a second stream (SupportsAuxStream). Serial (no fork) otherwise.
+  bool shared_aux = false;
+  vt::Queue aux_q{};      // the shared-expert stream (plain default-priority, like vLLM)
+  vt::Event aux_fork{};   // recorded on main; aux waits it (hn ready — the fork point)
+  vt::Event aux_done{};   // recorded on aux after the shared MLP; main waits it (join)
   std::vector<int64_t> argmax_id;
   int32_t last_sampled = -1;
   void* graph = nullptr;
@@ -2254,9 +2291,30 @@ struct LagunaGraph {
     doutb_bf16.assign(static_cast<size_t>(H), 0);  // VT_LAGUNA_TAIL_FUSED reuse buffer
     eids32.assign(static_cast<size_t>(topk), 0);
     argmax_id.assign(1, 0);  // VT_LAGUNA_ONDEV_SAMPLE token buffer (device-accessible)
+    // VT_LAGUNA_SHARED_AUX: create the aux stream + fork/join events NOW (ctor runs
+    // before any BeginCapture). Only in the fp4-shared arm — the bf16 arm fuses the
+    // shared gate/up INTO the router GEMV (router_shared_gu), so there is no split
+    // shared expert to hand to a second stream. SupportsAuxStream is false on non-CUDA
+    // backends (the graph itself is CUDA-only, but keep the guard honest).
+    if (LagunaSharedAuxEnabled() && shared_fp4) {
+      vt::Backend& b = vt::GetBackend(dev);
+      if (b.SupportsAuxStream()) {
+        aux_q = b.CreateQueue();
+        aux_fork = b.CreateEvent();
+        aux_done = b.CreateEvent();
+        shared_aux = true;
+      }
+    }
   }
   ~LagunaGraph() {
-    if (graph != nullptr && qp != nullptr) vt::GetBackend(qp->device).DestroyGraph(graph);
+    if (qp == nullptr) return;
+    vt::Backend& b = vt::GetBackend(qp->device);
+    if (graph != nullptr) b.DestroyGraph(graph);
+    if (shared_aux) {
+      b.DestroyEvent(aux_fork);
+      b.DestroyEvent(aux_done);
+      b.DestroyQueue(aux_q);
+    }
   }
   LagunaGraph(const LagunaGraph&) = delete;
   LagunaGraph& operator=(const LagunaGraph&) = delete;
@@ -2438,6 +2496,26 @@ struct LagunaGraph {
         // VT_LAGUNA_MOE_ONECAST: cast hn→bf16 ONCE here and feed the persistent buffer to the
         // router GEMM + routed Marlin + shared Marlin (each else-cast the SAME hn otherwise).
         const void* hnb = moe_onecast ? static_cast<const void*>(hn_bf16.data()) : nullptr;
+        // ── VT_LAGUNA_SHARED_AUX FORK ─────────────────────────────────────────────
+        // Issue the FULL fp4 shared expert on the aux stream NOW — forked from `hn`
+        // (the post-attn-norm hidden) BEFORE the main-stream router GEMV — so it runs
+        // concurrently with router+sigmoid_topk+routed grouped GEMM. This is the EARLY
+        // fork vLLM does (shared_experts.py:125-129: record on main, aux waits, aux runs
+        // the shared MLP). The aux path reads `hn` (f32) and does its OWN hn->bf16 cast
+        // (hnb=nullptr) rather than the main-stream hn_bf16 — deterministic truncation of
+        // the same hn ⇒ byte-identical `so`, and it removes the only main->aux data
+        // dependency, so the aux path waits ONLY the fork point (hn ready). Its scratch is
+        // drawn from AuxPool (disjoint from the main routed Pool blocks) so the two
+        // concurrent streams never alias a live block.
+        const bool do_aux = shared_aux;  // shared_aux already implies shared_fp4
+        if (do_aux) {
+          vt::Backend& b = vt::GetBackend(dev);
+          b.RecordEvent(aux_fork, q);          // event0.record() on the main stream (hn ready)
+          b.QueueWaitEvent(aux_q, aux_fork);   // aux waits event0 before reading hn
+          ActivePoolScope guard(&AuxPool());   // shared scratch from AuxPool (see device_pool.h)
+          LagunaSharedExpertMarlinInto(aux_q, lw.moe, hn.data(), H, so.data());  // fp4 shared on aux
+          b.RecordEvent(aux_done, aux_q);      // event1.record() on the aux stream (join target)
+        }
         if (moe_onecast) CastHnBf16(hn.data());
         if (shared_fp4) {
           if (moe_onecast) GemmBf16Pre(rsg.data(), lw.moe.router, E, H);  // router only
@@ -2460,11 +2538,19 @@ struct LagunaGraph {
         LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
                                     topk, doutb.data(), hnb, routed_bf16);
         if (shared_fp4) {
-          LagunaSharedExpertMarlinInto(q, lw.moe, hn.data(), H, so.data(), hnb);  // fp4 shared
+          // When do_aux, the shared expert was already issued on the aux stream above;
+          // otherwise run it serially on the main stream here (fp4 shared).
+          if (!do_aux)
+            LagunaSharedExpertMarlinInto(q, lw.moe, hn.data(), H, so.data(), hnb);
         } else {
           SiluMul(dact.data(), sgp, sup, moe_I);
           GemmBf16(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
         }
+        // ── VT_LAGUNA_SHARED_AUX JOIN ─────────────────────────────────────────────
+        // Make the main stream wait for the aux shared MLP (event1.wait) so the combine
+        // below reads a fully-computed `so`. Both the routed path (main) and the shared
+        // path (aux) are now complete → the combine result is byte-identical to serial.
+        if (do_aux) vt::GetBackend(dev).QueueWaitEvent(q, aux_done);
         // LEVER A: hidden += routed + shared; hn = rms_norm(hidden)*next_norm in ONE node
         // (byte-exact vs AddInto(doutb) + FusedAddNorm(so)). Only in the glue-fused regime
         // (the split path is what it replaces); =0 restores the two-node split.
