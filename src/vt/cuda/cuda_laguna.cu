@@ -70,6 +70,36 @@ inline bool LagFastNormAligned8(const void* p) {
   return (reinterpret_cast<std::uintptr_t>(p) & 0x7) == 0;
 }
 
+// ── VT_LAGUNA_TOPK_SHFL (default ON): kernel-EFFICIENCY (BYTE-EXACT) speedup of the
+// single-block <<<1,256>>> SigmoidTopKKernel router. ncu on the shipped kernel showed it
+// grid=1 / occupancy≈0 AND serially dependent across topk rounds, each doing a 256-element
+// sh[256] argmax tree with 8 __syncthreads (~10 syncs/round × topk). The shfl variant keeps
+// the IDENTICAL algorithm (block-argmax by (choice desc, idx asc) each round, same sel[]
+// updates, same weights) but reduces each round with a warp-shuffle argmax (2 syncs/round).
+// Argmax over a total order (val desc, idx asc) is associative+commutative, so ANY reduction
+// tree picks the SAME winner → BYTE-EXACT (same ids/weights, same 160-tok stream). '0' rolls
+// back to the shipped tree kernel (same-binary A/B).
+inline bool LagunaTopkShflOn() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_TOPK_SHFL");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
+// Warp-shuffle argmax by (val desc, idx asc) — no __syncthreads. Full-warp mask; used by the
+// byte-exact SigmoidTopKShflKernel round reduce (lane-uniform trip count).
+__device__ __forceinline__ void LagArgmaxWarpShfl(float& val, int& idx) {
+  for (int off = 16; off > 0; off >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, val, off);
+    const int oi = __shfl_xor_sync(0xffffffffu, idx, off);
+    if (ov > val || (ov == val && oi < idx)) {
+      val = ov;
+      idx = oi;
+    }
+  }
+}
+
 // ── RMSNorm (block-per-row, block-reduced SoS; NEAR-TIE vs host RmsNorm:94/:112, in
 // the accepted device regime — user-ratified 2026-08-01: gate the device path vs vLLM).
 // One BLOCK per row: blockDim threads reduce Σ x[i]²; inv = 1/sqrtf(ss/n + eps).
@@ -898,6 +928,70 @@ __global__ void SigmoidTopKKernel(int32_t* ids, float* weights, const float* log
   }
 }
 
+// ── VT_LAGUNA_TOPK_SHFL BYTE-EXACT sibling of SigmoidTopKKernel — same algorithm, each
+// round's block-argmax reduced by warp shuffle (2 __syncthreads/round vs the sh[256] tree's
+// ~10). ncu on the shipped kernel: grid=1, waves≈0.000, sm__throughput≈0.2% — pure latency
+// (8 serially-dependent rounds × the sync-heavy tree). Argmax over the total order
+// (choice desc, idx asc) is associative+commutative ⇒ the warp+block shuffle reduce picks the
+// SAME winner as the tree every round → IDENTICAL sel[]/ids/weights (byte-exact 160-tok ids).
+// block padded to a multiple of 32 (launcher uses 256 = 8 warps); wv/wi hold <=32 warp winners.
+__global__ void SigmoidTopKShflKernel(int32_t* ids, float* weights, const float* logits,
+                                      const float* bias, bool has_bias, int64_t E, int64_t topk,
+                                      bool renorm, float scale) {
+  extern __shared__ float sh[];  // [E] scores | [E] choice | [E] selected(0/1)
+  float* scores = sh;
+  float* choice = sh + E;
+  float* sel = sh + 2 * E;
+  for (int64_t e = threadIdx.x; e < E; e += blockDim.x) {
+    const float s = 1.0f / (1.0f + expf(-logits[e]));
+    scores[e] = s;
+    choice[e] = s + (has_bias ? bias[e] : 0.0f);
+    sel[e] = 0.0f;
+  }
+  __syncthreads();
+  const int t = static_cast<int>(threadIdx.x);
+  const int nt = static_cast<int>(blockDim.x);
+  const int lane = t & 31;
+  const int warp = t >> 5;
+  const int nwarps = nt >> 5;
+  __shared__ float wv[32];
+  __shared__ int wi[32];
+  for (int64_t j = 0; j < topk; ++j) {
+    float bc = -CUDART_INF_F;
+    int bi = static_cast<int>(E);  // sentinel "none": loses every tie (val & idx)
+    for (int64_t e = t; e < E; e += nt) {
+      if (sel[e] != 0.0f) continue;
+      const float c = choice[e];
+      if (c > bc || (c == bc && static_cast<int>(e) < bi)) { bc = c; bi = static_cast<int>(e); }
+    }
+    LagArgmaxWarpShfl(bc, bi);  // warp winner (no sync)
+    if (lane == 0) {
+      wv[warp] = bc;
+      wi[warp] = bi;
+    }
+    __syncthreads();
+    if (warp == 0) {  // first warp reduces the <=32 warp winners
+      float v2 = (lane < nwarps) ? wv[lane] : -CUDART_INF_F;
+      int i2 = (lane < nwarps) ? wi[lane] : static_cast<int>(E);
+      LagArgmaxWarpShfl(v2, i2);
+      if (lane == 0) {
+        sel[i2] = 1.0f;
+        ids[j] = i2;
+        weights[j] = scores[i2];  // UNBIASED weight
+      }
+    }
+    __syncthreads();  // sel[best] visible to all threads before the next round
+  }
+  if (t == 0) {  // renorm+scale over the topk selected (topk small; thread 0)
+    float wsum = 0.0f;
+    for (int64_t j = 0; j < topk; ++j) wsum += weights[j];
+    for (int64_t j = 0; j < topk; ++j) {
+      if (renorm && wsum > 0.0f) weights[j] /= wsum;
+      weights[j] *= scale;
+    }
+  }
+}
+
 // ── Laguna lm_head M=1 decode GEMV (coalesced, roofline-bound) ───────────────
 // out[N] f32 = W[N,K] (bf16, row-major) · x[K] (f32), M=1. cuBLASLt's heuristic
 // mis-routes this M=1×N=vocab×K=hidden GEMM to a BATCHED wmma tile algo (fills 1 of
@@ -1136,9 +1230,16 @@ void SoftplusHeadGateLaunch(Queue& q, float* attn, const float* gl, int64_t Hq, 
 void SigmoidTopKLaunch(Queue& q, int32_t* ids, float* weights, const float* logits,
                        const float* bias, bool has_bias, int64_t E, int64_t topk, bool renorm,
                        float scale) {
-  const int threads = 256;  // power-of-two for the block tree-reduce (E<=256 experts
-                            // handled by the strided argmax + idx=E sentinel).
+  const int threads = 256;  // multiple of 32 (8 warps) for the block reduce; E<=256 experts
+                            // handled by the strided argmax + idx=E sentinel.
   const size_t shmem = static_cast<size_t>(3 * E) * sizeof(float);
+  // VT_LAGUNA_TOPK_SHFL: BYTE-EXACT warp-shuffle argmax reduce (2 syncs/round vs the sh[256]
+  // tree's ~10) on the grid=1 / waves≈0 latency-bound router. '0' keeps the shipped kernel.
+  if (LagunaTopkShflOn()) {
+    SigmoidTopKShflKernel<<<1, threads, shmem, AsStream(q)>>>(ids, weights, logits, bias, has_bias,
+                                                             E, topk, renorm, scale);
+    return;
+  }
   SigmoidTopKKernel<<<1, threads, shmem, AsStream(q)>>>(ids, weights, logits, bias, has_bias, E,
                                                         topk, renorm, scale);
 }
