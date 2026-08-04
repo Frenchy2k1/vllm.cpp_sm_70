@@ -94,7 +94,8 @@ inline int64_t LagunaKvHeadroom() {
   return rows;
 }
 
-// ── VT_LAGUNA_RESIDENT_BF16W (default OFF): stage the bf16/f32 decode projection
+// ── VT_LAGUNA_RESIDENT_BF16W (default ON; =0 opts back to the retag A/B arm):
+// stage the bf16/f32 decode projection
 // weights TRUE device-resident (a cudaMalloc'd copy, uploaded ONCE and reused every
 // step) instead of the unified-memory RETAG of the host bytes (w.View() +
 // .device=dev). On GB10 the GPU reads system-allocated (ATS/unified) memory slower
@@ -110,7 +111,7 @@ inline int64_t LagunaKvHeadroom() {
 inline bool LagunaResidentBf16WEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_LAGUNA_RESIDENT_BF16W");
-    return (e != nullptr && e[0] == '1');  // default OFF; =1 opts in
+    return (e == nullptr || e[0] != '0');  // default ON (parity enabler); =0 opts out
   }();
   return on;
 }

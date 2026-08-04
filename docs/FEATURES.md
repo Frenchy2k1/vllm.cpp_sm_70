@@ -82,7 +82,7 @@ are our reading of their documented behavior, not measurements.
 | DeepSeek-V2 (MLA), DeepSeek-V4-Flash | ✅ | token-exact, speed gaps recorded |
 | GLM-4, GLM-4.7-Flash | ✅ | token-exact |
 | OPT, Phi, MiniCPM, OLMo-2, StableLM, Granite, Yi | ✅ | token-exact |
-| Laguna-S / Laguna-XS 2.1 | ✅ | near-tie; parity+ with `VT_LAGUNA_RESIDENT_BF16W` (default-OFF), 87% without |
+| Laguna-S / Laguna-XS 2.1 | ✅ | near-tie; **vLLM parity+ (1.03x) by default** (`VT_LAGUNA_RESIDENT_BF16W` default-ON) |
 | Whisper, Voxtral (audio) | ✅ | token-exact |
 | Embedding and reranking models | ☐ | engine-side pooler landed, no model registered |
 

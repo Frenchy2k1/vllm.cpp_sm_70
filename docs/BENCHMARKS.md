@@ -20,7 +20,7 @@ see [docs/FEATURES.md](FEATURES.md).
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | ahead at c16/c32, behind at c1 to c8 | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
-| **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | 87% default; **parity+ with `VT_LAGUNA_RESIDENT_BF16W`** (44.6 vs 43.1 tok/s, byte-exact); bf16 weights were read from unified/ATS host memory, now staged device-resident; default-OFF pending flip | near-tie |
+| **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.6 vs 43.1 tok/s, byte-exact, default config) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | prefill **1.18x ahead**, decode tie, memory parity | byte-identical |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **parity**, 0.997x (16.28 vs 16.33 tok/s) | n/a, GGUF peer |
@@ -99,7 +99,7 @@ Both arms NVFP4, single request, batch 1, GB10.
 | Arm | Decode tok/s | Ratio |
 |---|---:|---:|
 | vLLM NVFP4, graphed | 43.10 | 1.00x |
-| **vllm.cpp NVFP4**, resident decode + CUDA graph | **37.55** | **0.87x** |
+| **vllm.cpp NVFP4**, resident decode + CUDA graph | **44.55** | **1.03x** |
 
 The gap is localized, same-tool (nsys graph-node tracing on BOTH engines,
 2026-08-04): the entire +3.1 ms/step is the bf16 M=1 projection GEMV bucket,
@@ -228,7 +228,7 @@ built on it rather than keeping the flattering one.
 | 35B prefill TTFT | 0.79x to 0.86x at every concurrency | Portable fusion of the norm/quant/act/combine glue |
 | 35B low-batch MoE decode | c1 TPOT 0.73x, wins by c16 | Attribute and close the batch-1 grouped GEMM |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
-| Laguna-XS NVFP4 | **RESOLVED 2026-08-04**: `VT_LAGUNA_RESIDENT_BF16W` (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, parity+, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | Flip the gate default-ON |
+| Laguna-XS NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
 | DFlash speculative decode | Below vLLM throughput | bf16 acceptance floor ~0.85x |

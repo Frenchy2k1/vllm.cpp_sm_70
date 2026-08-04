@@ -14,7 +14,7 @@ fully merged/superseded; work from main).
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Laguna NVFP4 decode speed | 87% of vLLM (37.55 vs 43.10); gap LOCALIZED same-tool to the bf16 GEMV invocation (f32-out `cublasLtMatmul` vs vLLM's bf16-out `cublasGemmEx` on the identical `gemvx` kernel; 2/3 o_proj, 204 vs 139 us/call) | Gated `VT_LAGUNA_BF16OUT_GEMV` A/B in flight (o_proj first); if it converts, extend qkv/router/lm_head → parity at bf16 |
+| Laguna NVFP4 decode speed | **PARITY+ (44.55 vs 43.10 tok/s, 1.03x), byte-exact, default config** — root cause was WEIGHT RESIDENCY: bf16 projections read unified/ATS host memory via a `w.View()` retag; `VT_LAGUNA_RESIDENT_BF16W` (default-ON) stages them cudaMalloc device-resident (o_proj 194→131 us, lm_head 2410→1620) | Closed; goal met. Residual: formal vLLM K-run distributional set when convenient |
 | DeepSeek-V4-Flash decode | **PARITY with ds4** (16.28 vs 16.33, 0.997x, same-session clean). HC-expand fusion byte-exact but perf-neutral, held default-OFF | Optional beat-path only: f16 tensor-core DSA/router (near-tie class — needs user gate-class ratification) |
 | f32-out GEMV systemic audit | Only laguna (high) + deepseek_v4 bf16 tower (medium) affected; gate models & on-framework dense unaffected (bf16-out by construction, e2e-bench-verified) | Same-tool re-verify deepseek_v4's bf16 tower after the Laguna fix proves out |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md invocation-parity checklist being landed (worktree agent) | Review + merge; CUDA build-verify the `kGemvHeuristicAlgos` constant refactor on dgx |
@@ -42,9 +42,7 @@ comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
 
 ## Next actions
 
-1. **Land the Laguna bf16-out GEMV fix** if the in-flight A/B converts o_proj
-   204→139 us in-graph; then stack qkv/router/lm_head and re-measure vs vLLM.
-2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
+1. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other
    f32-out caller) once the Laguna fix proves the mechanism.
