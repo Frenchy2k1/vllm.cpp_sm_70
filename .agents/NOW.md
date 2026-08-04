@@ -50,8 +50,18 @@ comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always local-ai-worker && docker start ...`).
-5. Protocol substrate: triage `coordination.md` claims, roll the record era
-   (state.md 2.5 MB / parity-ledger 2.0 MB), budget `docs/STATUS.md`.
+5. **Protocol substrate — partly done.** Claim triage DONE (54 rows out of
+   `ACTIVE`, 29 claims retired); `docs/STATUS.md` now under a shrink-only
+   ratchet; roadmap compacted; `AGENTS.md` tiered. REMAINING: (a) anchor
+   backfill, 98 rows still `SPIKE`/`ACTIVE` (backend 36, engine 26, kernel 16,
+   model 16, quant 4) because every honest destination needs code/test anchors
+   they lack — root cause is that the lifecycle has no zero-cost parking state
+   for a landed-but-unowned row; 6 model rows need a DECISION, not an anchor
+   (architecture unregistered). (b) The record-era rollover is BLOCKED:
+   `check-agent-record.py` binds `DONE` rows to exact LINE anchors in
+   `parity-ledger.md` (43 references), so freezing it invalidates the evidence
+   graph — re-anchor by ledger ROW ID first. `state.md` and
+   `benchmark-record.md` have no line anchors and can roll now.
 
 ## Protocol invariants that bite most often
 
