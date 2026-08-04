@@ -62,15 +62,14 @@ comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
    `benchmark-record.md` have no line anchors and can roll now.
 
 **Operator/helper protocol**
-([spec](specs/operator-helper-protocol.md)): roles are DECLARED then
-MATERIALIZED into a lock or worktree+PR, then re-derived; operator merges PRs
-first and does features only via sub-agents; helpers work in worktrees on
-`row/<ROW-ID>` and open a DRAFT PR at the START, which IS the claim. **W0-W5 LANDED**
-(`agent-role.py`, `check-role-discipline.py`, `claim-view.py`,
-`ready-for-helper.py`, PR template + size cap, docs folded), all CI-gated.
-Enforcement is still OPT-IN: set `ROLE_DISCIPLINE_SINCE` to the cutover commit
-and use `agent-preflight.sh --require-role` to make it binding. Queue today: 4
-pickable rows. Backfill: 79 non-live rows still `SPIKE`/`ACTIVE`, 30 fully anchored.
+([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
+into a lock or worktree+PR; operator merges PRs first, does features only via
+sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
+START, which IS the claim. **W0-W5 LANDED**, all CI-gated. Enforcement OPT-IN:
+set `ROLE_DISCIPLINE_SINCE` + `--require-role`. Queue: 4 pickable rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES, not anchors.
+**Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md)):
+SM060/061/070 below vLLM's 7.5 floor = OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are
+REAL unported work; **62 of vLLM's 362 archs have no row**.
 
 ## Protocol invariants that bite most often
 
