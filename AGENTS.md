@@ -501,18 +501,24 @@ lane of every perf/parity investigation — not only after a kernel hunt stalls 
 OWN performance RATIONALE, not just its kernels: its source CODE COMMENTS, ENV-VAR docs
 (`vllm/envs.py`), design docs (`docs/design/`), AND its GitHub ISSUES/PRs. vLLM's tree
 routinely documents the exact structural pitfall and its magnitude — you are usually
-READING the answer, not inferring it. Proven 2026-08-04: a wrongly-declared "bf16 DRAM
-wall" (~87% of vLLM, same `gemvx`, same clock) dissolved once a read-only sub-agent scanned
-vLLM's source — our decode ran 41 CUDA streams where vLLM runs ONE ("single global
-auxiliary stream **to avoid an explosion of streams for every layer**", `torch_utils.py`
-around the `current_stream()` helper), vLLM's own code documents that exact ~20%
-"bandwidth-bound decode" penalty from side-stream/allocator-pool structure
-(`v1/worker/gpu_model_runner.py`), and it gates ALL overlap OFF once the primary kernel
-saturates the bottleneck ("above it the GEMM saturates the device and cross-stream sync is
-pure overhead", `vllm/envs.py`, PR #41526). Run this rationale-scan (a read-only agent over
-`${VLLM_SOURCE}` + its issues/PRs) as a STANDING lane alongside the nsys execution trace;
-full method: [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § The
-STRUCTURAL lens.
+READING the answer, not inferring it. ★ AND this is NOT vLLM-only — scan the SAME rationale
+in ANY non-vLLM reference a model is gated against (ds4/DwarfStar, SGLang, llama.cpp): read
+its source CODE COMMENTS + kernel structure and (where they exist) its ISSUES/PRs. Two
+proofs, both 2026-08-04, from BOTH references: (1) a wrongly-declared "bf16 DRAM wall"
+(Laguna ~87% of vLLM, same `gemvx`, same clock) dissolved once a read-only sub-agent scanned
+vLLM's source — our decode ran 41 CUDA streams where vLLM runs ONE ("single global auxiliary
+stream **to avoid an explosion of streams for every layer**", `torch_utils.py` around
+`current_stream()`), vLLM's own code documents that exact ~20% "bandwidth-bound decode"
+penalty from side-stream/allocator-pool structure (`v1/worker/gpu_model_runner.py`), and it
+gates overlap OFF once the primary kernel saturates the bus ("above it the GEMM saturates
+the device and cross-stream sync is pure overhead", `vllm/envs.py`, PR #41526). (2) a
+wrongly-declared "Q8_0 weight-stream floor" (DeepSeek at ds4 parity) turned into a beat-path
+once a sub-agent READ ds4's OWN kernel source (`ds4_cuda.cu`): our int8 GEMV is at
+per-launch parity, but ds4 OFFLOADS a chunk of projections to f16 tensor-core GEMMs — a
+DECOMPOSITION every per-launch-parity kernel scan had missed. Run this reference-rationale
+scan (a read-only agent over the reference source + its issues/PRs — it costs NO GPU time,
+so run it ALONGSIDE the nsys trace, not after) as a STANDING lane. Full method:
+[.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § The STRUCTURAL lens.
 
 ## Policy for AI-Assisted Contributions
 
