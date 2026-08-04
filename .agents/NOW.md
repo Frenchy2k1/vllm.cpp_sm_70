@@ -53,13 +53,6 @@ order-0 row is still framed against v0.25.0 and predates the pin advance.
    freezing that file invalidates the evidence graph. **Prerequisite:** re-anchor
    `DONE` evidence by ledger ROW ID instead of line number, then roll.
    `state.md` and `benchmark-record.md` carry no line anchors and can roll now.
-3. **Compact `roadmap_v1.md`.** 484 lines of 2026-07-18 narrative sit above the
-   portfolio table. Cut to a <=30-line current position; table first.
-4. **Budget `docs/STATUS.md`.** 292 KB and unbudgeted, the same shape
-   `docs/BENCHMARKS.md` was in before its 2026-08-04 conversion. Extend
-   `check-public-doc-tables.py` to cover it.
-5. **Tier `AGENTS.md`** to <=200 lines (T0 non-negotiables / T1 directive
-   summaries + links / T2 index); move rationale bodies into `.agents/` docs.
 
 ## Protocol invariants that bite most often
 

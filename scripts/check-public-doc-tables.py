@@ -306,6 +306,72 @@ def features_errors(text: str) -> list[str]:
     return page_errors(text, FEATURES_RULES)
 
 
+# docs/STATUS.md is the per-capability ledger. It is legitimately larger than a
+# scoreboard, and it is ALSO the page BENCHMARKS.md's forensics were told to
+# move to, so a hard budget today would either fail on landing or push detail
+# somewhere worse. But it is currently in the exact shape BENCHMARKS.md was in
+# before its conversion (291k chars, 91 paragraphs over the prose budget, 47
+# oversized cells, one cell of 16,181 chars), and it is the only public surface
+# with no size gate at all - which is precisely how BENCHMARKS.md reached 11,127
+# lines unnoticed.
+#
+# So this is a RATCHET, not a budget: every limit is pinned to what the page
+# measured on 2026-08-04 and may only go DOWN. New rows and tighter prose pass;
+# growth fails. The same mechanism as the device-leakage DSR ratchet in CI.
+# Lowering these numbers as the page is compacted is the gate closing.
+STATUS = ROOT / "docs/STATUS.md"
+STATUS_RATCHET = {
+    "chars": 289_777,
+    "h2_sections": 11,
+    "long_paragraphs": 90,
+    "oversized_cells": 47,
+}
+STATUS_REQUIRED = (
+    ("Parity pin", ("parity pin",)),
+    ("Capability status", ("capability status",)),
+    ("Not supported yet", ("not supported yet", "not yet supported")),
+)
+
+
+def status_errors(text: str) -> list[str]:
+    """Return ratchet violations for docs/STATUS.md, the per-capability ledger."""
+    errors: list[str] = []
+
+    headers = _h2_headers(text)
+    lowered = [h.lower() for h in headers]
+    for label, matchers in STATUS_REQUIRED:
+        if not any(any(m in h for m in matchers) for h in lowered):
+            errors.append(
+                f"docs/STATUS.md is missing its '{label}' section; it is the "
+                "per-capability status surface every checkpoint updates"
+            )
+
+    measured = {
+        "chars": len(text),
+        "h2_sections": len(headers),
+        "long_paragraphs": sum(
+            1 for _, para in _prose_paragraphs(text) if len(para) > MAX_PARAGRAPH_CHARS
+        ),
+        "oversized_cells": sum(
+            1
+            for _, cells in _table_rows(text)
+            for cell in cells
+            if len(cell) > MAX_CELL_CHARS
+        ),
+    }
+    for key, cap in STATUS_RATCHET.items():
+        if measured[key] > cap:
+            errors.append(
+                f"docs/STATUS.md {key.replace('_', ' ')} is {measured[key]}, over "
+                f"the {cap} ratchet: this page may only shrink. Collapse the "
+                "superseded narrative into the binding result and move the "
+                f"detail to {RECORD_LINK} or .agents/state.md, then lower the "
+                "ratchet in the same change"
+            )
+
+    return errors
+
+
 def record_errors(path: Path) -> list[str]:
     """Return problems with the append-only benchmark record."""
     if not path.exists():
@@ -319,7 +385,11 @@ def record_errors(path: Path) -> list[str]:
 
 def main() -> int:
     errors: list[str] = []
-    for path, check in ((BENCHMARKS, benchmarks_errors), (FEATURES, features_errors)):
+    for path, check in (
+        (BENCHMARKS, benchmarks_errors),
+        (FEATURES, features_errors),
+        (STATUS, status_errors),
+    ):
         if not path.exists():
             errors.append(f"{path.relative_to(ROOT)} is missing")
             continue
@@ -335,7 +405,8 @@ def main() -> int:
         return 1
     print(
         "OK: docs/BENCHMARKS.md and docs/FEATURES.md are human-readable keyed "
-        f"tables, and {RECORD_LINK} carries the append-only record."
+        f"tables, docs/STATUS.md is inside its size ratchet, and {RECORD_LINK} "
+        "carries the append-only record."
     )
     return 0
 
