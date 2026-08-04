@@ -486,6 +486,34 @@ The difference is coverage/effort (Inductor auto-generates graph-wide at JIT tim
 we port hot-path fusions deliberately, and AOT covers a fixed model's known shapes),
 never capability — see the vendoring principle in the MIRROR directive above.
 
+**Same kernel, different throughput = STRUCTURAL — scan vLLM's OWN rationale, and do it
+AUTOMATICALLY.** When the execution trace shows BOTH engines running the IDENTICAL kernel
+yet ours achieves LESS throughput at the SAME clock (e.g. identical cuBLAS
+`internal::gemvx`, same clock, ours sustaining ~20% less DRAM bandwidth), the gap is NOT
+the kernel and NOT a hardware "wall": it is STRUCTURAL — how our engine DRIVES execution
+AROUND that kernel (stream count, CUDA-graph structure, overlap/scheduling policy,
+allocator-pool placement, per-step sync-vs-async). ★ Two same-kernel numbers can NEVER be
+a wall — a real bandwidth/compute ceiling caps BOTH engines equally, so a same-kernel
+throughput split is positive PROOF a structural difference exists; treat "it's just a
+DRAM/hardware wall" (or "diffuse in-engine inefficiency" / "irreducible") while your OWN
+trace shows vLLM hitting a higher number as a RED FLAG that you stopped early. As a DEFAULT
+lane of every perf/parity investigation — not only after a kernel hunt stalls — SCAN vLLM's
+OWN performance RATIONALE, not just its kernels: its source CODE COMMENTS, ENV-VAR docs
+(`vllm/envs.py`), design docs (`docs/design/`), AND its GitHub ISSUES/PRs. vLLM's tree
+routinely documents the exact structural pitfall and its magnitude — you are usually
+READING the answer, not inferring it. Proven 2026-08-04: a wrongly-declared "bf16 DRAM
+wall" (~87% of vLLM, same `gemvx`, same clock) dissolved once a read-only sub-agent scanned
+vLLM's source — our decode ran 41 CUDA streams where vLLM runs ONE ("single global
+auxiliary stream **to avoid an explosion of streams for every layer**", `torch_utils.py`
+around the `current_stream()` helper), vLLM's own code documents that exact ~20%
+"bandwidth-bound decode" penalty from side-stream/allocator-pool structure
+(`v1/worker/gpu_model_runner.py`), and it gates ALL overlap OFF once the primary kernel
+saturates the bottleneck ("above it the GEMM saturates the device and cross-stream sync is
+pure overhead", `vllm/envs.py`, PR #41526). Run this rationale-scan (a read-only agent over
+`${VLLM_SOURCE}` + its issues/PRs) as a STANDING lane alongside the nsys execution trace;
+full method: [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § The
+STRUCTURAL lens.
+
 ## Policy for AI-Assisted Contributions
 
 This project follows the Linux kernel project's [guidelines for AI coding
