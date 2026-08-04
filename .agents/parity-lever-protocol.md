@@ -217,6 +217,25 @@ floor", "diffuse in-engine inefficiency", or "irreducible" while your OWN trace 
 reference achieving a higher number (or doing LESS work) on the same op — that is a
 structural miss you have not found yet, never a ceiling.
 
+**MANDATORY lane #3 — INVOCATION parity (same kernel NAME ≠ same resolved kernel).** The
+trace can name the IDENTICAL kernel on both engines yet run a DIFFERENT resolved TEMPLATE —
+the cost that hid on Laguna for weeks: our bf16 M=1 decode GEMVs ran cuBLAS
+`gemvx<bf16,FLOAT>` (f32 output, 204 us o_proj) where vLLM runs `gemvx<bf16,bf16>` (bf16
+output, 139 us) — the OUTPUT dtype SELECTS the gemvx template, and `requestedAlgoCount=1`
+skips the algo search. Before claiming any GEMM/GEMV at-parity, verify vLLM's ACTUAL call on
+FOUR axes: (1) **output/C dtype** — it SELECTS the template, so an API-name match can still
+be a slower `<bf16,FLOAT>` template; (2) **compute + scale type**; (3) **entry point + algo
+policy** — `cublasGemmEx` default-algo vs `cublasLtMatmul` requestedAlgoCount/heuristic; (4)
+**the resolved template dtypes** read off the SAME tool's trace. HARD RULE: a CROSS-TOOL
+comparison (our nsys vs vLLM's torch-profiler) can NEVER establish invocation parity — it
+cannot compare in-graph stall% or template dtypes across two different profilers; a SAME-tool
+trace where entry point AND resolved template BOTH match is required. This is CI-gated on both
+sides so the regression cannot reland silently: the op-contract side (the C/D layout stays
+dtype-faithful to the caller via `out_type`, requestedAlgoCount is the named
+`kGemvHeuristicAlgos`) by `scripts/check-gemv-invocation-consistency.py` over
+`src/vt/cuda/cuda_matmul.cu`, and the CALLER side (an f32-resident decode stream that buys the
+slow template model-wide) by `check-runner-routing-consistency.py` invariant (c).
+
 ### MANDATORY during autonomous porting: profile vLLM's ACTUAL kernels, port 1:1 what it runs
 
 **"At-parity" inferred from SOURCE is NOT parity — you must MEASURE it.** (Proven

@@ -236,6 +236,7 @@ built on it rather than keeping the flattering one.
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
+| cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
 
 ## Reproduce
 

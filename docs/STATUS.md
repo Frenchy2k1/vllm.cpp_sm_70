@@ -37,6 +37,15 @@ without behavior or lifecycle changes. The production library and focused
 tests build clean; the all-target build remains PARTIAL on two unrelated
 test-only `-Wrestrict` diagnostics, recorded in [BENCHMARKS](BENCHMARKS.md).
 
+cuBLAS invocation-parity CI guard (2026-08-04): new
+`scripts/check-gemv-invocation-consistency.py` (+ mutation test, wired into CI)
+locks the dtype-faithful cuBLASLt op-contract the Laguna `gemvx<bf16,FLOAT>`-vs-
+`gemvx<bf16,bf16>` template bug exposed — the C/D layout stays `out_type` (never a
+hardcoded `CUDA_R_32F` literal) and requestedAlgoCount is the named
+`kGemvHeuristicAlgos`. The byte-exact `kGemvHeuristicAlgos` refactor of
+`src/vt/cuda/cuda_matmul.cu` is type-safe and zero-behavior; CUDA build-verified
+on dgx sm_121a (clean incremental -Werror build, rc=0, 2026-08-04).
+
 vllm.cpp implements an intentionally focused subset of vLLM, held to
 token-for-token correctness against the pinned oracle.
 
@@ -905,7 +914,7 @@ run; gguf_load 12/12). The CUDA graph stays OPT-IN default OFF (graph 7.92 ≈ e
 `=0` (host) **7.24**, both "…Paris." token-identical. Shipped DeepSeek-V4 decode = device-resident ~7.96 tok/s
 (~48% of ds4, GEMM-bound); last mile = fp8 KV + tuned MMQ (named residual). **★ MMQ LEVER 1 LANDED (2026-08-01, byte-exact): the ds4-gap decode kernel was MISATTRIBUTED — the prior campaign optimized the Q8_0 dense GEMV (already `__dp4a`-efficient), but the DOMINANT-FLOP routed-expert k-quant MoE GEMM (`DotQ4K`/`DotQ5K`/`DotQ3K`/`DotQ6K` in `cuda_quant_dot.cu`) was a VERBATIM SCALAR CPU port (256-B/lane `aux8` local-mem spill + scalar MAC, NO `__dp4a`) while `DotQ2K`/`DotIQ2XXS` were vectorized. Resolves the "94% util but slow" paradox (SMs busy on an inefficient kernel). `__dp4a`-vectorized `DotQ4K`+`DotQ5K` (the DeepSeek routed-expert quants; ref llama.cpp `vec_dot_q4_K_q8_1_impl_vmmq`): `test_cuda_quant_dot` BIT-FOR-BIT green (9 cases / 110432 assertions CUDA==CPU). ★ HONEST SCOPE CORRECTION: this is a GENERAL k-quant kernel win (helps Q4_K/Q5_K keep-quant models incl. the `DeepSeek-V4-Flash-MTP-Q4K` variant), but the ds4-BENCHMARK checkpoint is `IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8` — its routed experts are IQ2_XXS (gate/up) + Q2_K (down), both ALREADY `__dp4a`-vectorized (`DotIQ2XXS`/`DotQ2K`), with attn/shared/out Q8_0. So `DotQ4K`/`DotQ5K` are NOT on THIS checkpoint's decode hot path → NO ds4-gap speedup here (the lever-scan's Lever-1 premise was seeded by a wrong ground-context "routed experts Q4_K/Q5_K"; the actual checkpoint differs). The change is kept as a correct byte-exact general improvement, not a DeepSeek-benchmark closer.
 
-★ NSYS-GROUNDED DECODE STATE (2026-08-01, ds4flash.gguf IQ2XXS/Q2K, GB10): decode = **13.0 tok/s** (0.076 s/step, consistent 23 steps) vs ds4 16.5 → **79% of ds4, ~1.27× behind** (the recorded 8.0 baseline is STALE — device-resident decode + tuned glue landed since; superseded). `cuda_gpu_kern_sum` = 1.984 s GPU-kernel / ~2.24 s compute-wall = **~88% GPU-ACTIVE** (decode is GPU-BUSY, not launch/host-bound — a decode CUDA-graph is NOT the lever). GPU-time breakdown: **Q8_0 GEMV = 53.5%** (attn q/kv/o proj + shared-expert gate/up/down, every layer) · routed-MoE fused 17.4% · MHC glue 11% · QuantizeQ8K 7.7% · norm/rope/attn/router ~9%. (Q8_0-GEMV-lever framing later retired — per-launch parity vs ds4; see the 2026-08-04 binding parity line.) Rollback via
+(2026-08-01 nsys state — 13.0 tok/s / Q8_0-GEMV-53.5% breakdown — superseded by the 2026-08-04 binding parity line; detail in the benchmark record.) (Q8_0-GEMV-lever framing later retired — per-launch parity vs ds4; see the 2026-08-04 binding parity line.) Rollback via
 `VT_V4_RESIDENT_DECODE=0`. Row `ACTIVE`; see docs/BENCHMARKS.md.
 **Last-mile campaign — Brick 0 (PROFILE-ONLY): the keep-quant GEMM roofline (2026-07-30, base `aed4a498`,
 branch `deepseek-v4-last-mile`, commit `42a99471`, NOT pushed).** Profile-only (holding for the coordinator's
