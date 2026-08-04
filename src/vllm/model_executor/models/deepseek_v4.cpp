@@ -1157,7 +1157,7 @@ inline void AsyncCopyF(const V4Backend& be, float* dst, const float* src, int64_
 inline bool V4ResidentWEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_V4_RESIDENT_W");
-    return e != nullptr && e[0] != '\0' && std::string(e) != "0";  // default OFF; =1 to enable
+    return e == nullptr || e[0] == '\0' || std::string(e) != "0";  // default ON (parity enabler, beats ds4); =0 opts out
   }();
   return on;
 }
