@@ -247,7 +247,7 @@ Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
 | Mistral dense | Mistral-7B-v0.3 | - | Token-exact | Speed-pending |
 | OPT | OPT-125m | - | Strict token-exact | Speed-pending |
 | DeepSeek-V2 (MLA) | DeepSeek-V2-Lite | - | Token-exact | Speed-pending |
-| DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Device-resident decode ~7.96 tok/s (~48% of ds4) |
+| DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Device-resident decode ~15.87 tok/s (~96% of ds4) |
 | GLM-4 dense | GLM-4-9B-0414 | - | Token-exact | Speed-pending |
 | GLM-4.7-Flash (MLA MoE) | GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
 | Gemma-3 / Gemma-2 / Gemma-1 dense | gemma-3-1b-it, gemma-2-2b-it, gemma-2b | - | Token-exact (48/48 each) | Speed-pending |
