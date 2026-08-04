@@ -37,9 +37,9 @@ order-0 row is still framed against v0.25.0 and predates the pin advance.
 
 ## Next actions
 
-1. **Finish the anchor backfill.** The 2026-08-04 triage moved the 28 rows that
-   already had exact code+test anchors out of `ACTIVE` and retired 31 claims.
-   **124 rows remain `SPIKE`/`ACTIVE` and cannot move**: every honest
+1. **Finish the anchor backfill.** Batch 1 done: 12 engine rows made precise, 10
+   more rows left `ACTIVE`. **114 remain `SPIKE`/`ACTIVE`** (backend 36, model
+   31, kernel 16, engine 27, quant 4) and cannot move yet: every honest
    destination is in `EVIDENCED_STATES` and requires anchors they lack, and
    inventing anchors would be the dishonesty the record prevents. Root cause:
    the lifecycle has **no zero-cost parking state** for a landed-but-unowned

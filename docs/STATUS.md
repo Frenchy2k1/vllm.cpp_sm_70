@@ -1226,9 +1226,9 @@ state** was triaged against the code: only the DeepSeek and Laguna
 speed-parity tracks are in flight, 28 anchor-complete rows moved to
 `ANCHOR-BACKFILL`, and 31 claims retired to
 [.agents/completed/claims-era1-2026-08-04.md](../.agents/completed/claims-era1-2026-08-04.md).
-124 rows still cannot move because every honest destination requires anchors they
-lack; that backfill is queued work, not a blocker. Root cause: the lifecycle has
-no zero-cost parking state for a landed but unowned row. **CI gap closed:** the
+Backfill batch 1: 12 engine rows naming a test file but no line now cite a real
+`TEST_CASE` in it; 10 rows left `ACTIVE`, 19 claims retired, 114 remain. Root
+cause: no zero-cost parking state for a landed, unowned row. **CI gap closed:** the
 two DIFF-scoped gates carried a `cancel-in-progress` group contradicting their
 own comments, so two consecutive main pushes had them cancelled and those commit
 ranges went unvalidated; groups removed. Separately the
