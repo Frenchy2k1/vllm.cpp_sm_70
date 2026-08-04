@@ -1136,6 +1136,60 @@ inline void AsyncCopyF(const V4Backend& be, float* dst, const float* src, int64_
                                     static_cast<size_t>(n) * sizeof(float));
 }
 
+// ── VT_V4_RESIDENT_W (default OFF; =1 stages the dense Q8_0 decode projection tower
+// TRUE device-resident). MECHANISM transferred from Laguna's VT_LAGUNA_RESIDENT_BF16W
+// (laguna.cpp:125 LagunaResidentBf16W): on GB10 the GPU reads system-allocated
+// (ATS/unified) host memory slower per-GEMV than cudaMalloc'd device memory. The
+// keep-quant MLA / shared-expert / lm_head Q8_0 weights are consumed here via
+// `wq.View(); .device=dev` — a unified-memory RETAG of the GGUF mmap's read-only file
+// pages — so every decode projection GEMV reads host bytes over ATS. Staging the ~6 GiB
+// dense Q8_0 tower cudaMalloc-device ONCE (lazily, on first touch, cached in the
+// OwnedTensor's mutable d_dev) and reusing the device copy every step recovers the
+// per-call GEMV bandwidth. SAME bytes, SAME kMatmulBTQuant / matmul_q8_0_* kernel, SAME
+// invocation ⇒ byte-exact by construction. CAPTURE-SAFE: the first touch is the eager
+// prefill / gstate-0 decode-graph warm run, BEFORE any BeginCapture, so the captured
+// replay reads a stable device pointer and does ZERO fresh cudaMalloc (mirrors the
+// Laguna gstate-0 pattern). The source bytes are the GGUF mmap (borrowed, read-only),
+// so this is ADDITIVE (~6 GiB) rather than move-not-duplicate; the clean file pages are
+// evictable under pressure. Default OFF as the A/B artifact; recommend-flip only after
+// an on-box bit-exact decode win. The routed-expert slabs (the ~70 GiB bulk) are NOT
+// staged here — that is the Phase-2 move-semantics surface (GemmGroupedInto).
+inline bool V4ResidentWEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_RESIDENT_W");
+    return e != nullptr && e[0] != '\0' && std::string(e) != "0";  // default OFF; =1 to enable
+  }();
+  return on;
+}
+
+// Upload a keep-quant projection weight's host bytes → a cudaMalloc device copy ONCE
+// (cached in the OwnedTensor's mutable d_dev), returning the device base pointer. `gq`
+// must be the device queue. Mirrors LagunaResidentBf16W's lazy Alloc+Copy.
+inline const uint8_t* V4ResidentBase(vt::Queue& gq, const OwnedTensor& w) {
+  if (!w.d_dev) {
+    vt::Backend& b = vt::GetBackend(gq.device);
+    const size_t nb = w.bytes.size();
+    void* p = b.Alloc(nb);
+    b.Copy(gq, p, w.bytes.data(), nb);
+    vt::Backend* bk = &b;
+    w.d_dev = std::shared_ptr<void>(p, [bk](void* pp) { bk->Free(pp); });
+  }
+  return static_cast<const uint8_t*>(w.d_dev.get());
+}
+
+// Device operand for a keep-quant projection weight consumed by a decode GEMV. Lever ON:
+// a View over the true-device copy. Lever OFF: the legacy unified-memory retag (host
+// mmap bytes, device-tagged). Byte-identical either way — only the backing allocation
+// (true-device vs ATS host) differs; shape/stride/nk/dtype/q8_0_aligned metadata comes
+// straight from w.View(), so it is exactly the retag path's. `gq` must be the device queue.
+inline vt::Tensor V4ResidentW(vt::Queue& gq, const OwnedTensor& w) {
+  vt::Tensor t = w.View();
+  t.device = gq.device;
+  if (V4ResidentWEnabled() && !w.bytes.empty())
+    t.data = const_cast<uint8_t*>(V4ResidentBase(gq, w));
+  return t;
+}
+
 // Keep-quant GEMM into a caller-provided unified `out` (T rows), NO sync — the
 // resident chain drains once at the end. Mirrors Gemm's device branch; a
 // block-quant weight → the device kMatmulBTQuant, a bf16 weight (e.g. the router
@@ -1153,6 +1207,7 @@ void GemmIntoKq(const V4Backend& be, const OwnedTensor& wq, const float* x, floa
   vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, gq.device, {T, N});
   vt::Tensor w = wq.View();
   w.device = gq.device;
+  if (on_dev) w = V4ResidentW(gq, wq);  // VT_V4_RESIDENT_W: device copy vs ATS retag
   vt::MatmulBT(gq, o, a, w);  // NO SyncDeviceGemm — resident
 }
 
@@ -1169,8 +1224,13 @@ void GemmRowSliceInto(const V4Backend& be, const OwnedTensor& w, const float* x,
   vt::Queue& gq = on_dev ? *be.q : cpuq;
   vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x), vt::DType::kF32, gq.device, {T, K});
   vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, gq.device, {T, N});
+  // VT_V4_RESIDENT_W: slice into the true-device copy (base + row offset) vs the ATS host
+  // mmap bytes. Byte-identical layout — only the backing allocation differs.
+  const uint8_t* wbase = (on_dev && V4ResidentWEnabled() && !w.bytes.empty())
+                             ? V4ResidentBase(gq, w)
+                             : w.bytes.data();
   vt::Tensor wt;
-  wt.data = const_cast<uint8_t*>(w.bytes.data()) + static_cast<size_t>(row_off) * row_bytes;
+  wt.data = const_cast<uint8_t*>(wbase) + static_cast<size_t>(row_off) * row_bytes;
   wt.dtype = w.dtype;
   wt.device = gq.device;
   wt.rank = 2;
@@ -1215,10 +1275,8 @@ void GemmPairIntoKq(const V4Backend& be, const OwnedTensor& wq0, const OwnedTens
   vt::Tensor a = vt::Tensor::Contiguous(const_cast<float*>(x), vt::DType::kF32, gq.device, {1, K});
   vt::Tensor o0 = vt::Tensor::Contiguous(out0, vt::DType::kF32, gq.device, {1, N0});
   vt::Tensor o1 = vt::Tensor::Contiguous(out1, vt::DType::kF32, gq.device, {1, N1});
-  vt::Tensor w0 = wq0.View();
-  w0.device = gq.device;
-  vt::Tensor w1 = wq1.View();
-  w1.device = gq.device;
+  vt::Tensor w0 = V4ResidentW(gq, wq0);  // VT_V4_RESIDENT_W: device copy vs ATS retag
+  vt::Tensor w1 = V4ResidentW(gq, wq1);
   deepseek_v4::DsaDevice()->matmul_q8_0_pair(gq, o0, o1, a, w0, w1);  // NO sync — resident
 }
 
@@ -1241,8 +1299,7 @@ void OloraAIntoKq(const V4Backend& be, const OwnedTensor& wo_a, const float* o, 
   vt::Tensor a =
       vt::Tensor::Contiguous(const_cast<float*>(o), vt::DType::kF32, gq.device, {1, ng * ipg});
   vt::Tensor zt = vt::Tensor::Contiguous(z, vt::DType::kF32, gq.device, {1, ng * olr});
-  vt::Tensor w = wo_a.View();
-  w.device = gq.device;
+  vt::Tensor w = V4ResidentW(gq, wo_a);  // VT_V4_RESIDENT_W: device copy vs ATS retag
   deepseek_v4::DsaDevice()->matmul_q8_0_olora_a(gq, zt, a, w, ng);  // NO sync — resident
 }
 
