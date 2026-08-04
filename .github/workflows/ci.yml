@@ -88,6 +88,11 @@ jobs:
         run: |
           python3 scripts/check-role-discipline.py
           python3 tests/scripts/test_agent_role.py
+      - name: Claim view, helper queue and PR reviewability
+        run: |
+          python3 scripts/claim-view.py --check
+          python3 scripts/ready-for-helper.py --check
+          python3 tests/scripts/test_claim_view.py
   documentation-checkpoint:
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.
@@ -166,6 +171,21 @@ jobs:
             exit 1
           fi
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
+  pr-size:
+    # PR-only: helper PRs stay cheap to review, which is what stops the serial
+    # operator from becoming the bottleneck. Non-row branches are reported only.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Helper PRs stay reviewable
+        run: |
+          python3 scripts/check-pr-size.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --branch "${{ github.event.pull_request.head.ref }}"
   cuda-arch-features:
     # Configure-tier assertions on the CUDA per-arch FEATURE TABLE. Needs neither
     # a CUDA toolkit nor a GPU: it drives cmake/CudaArchFeatures.cmake directly,

@@ -67,9 +67,12 @@ comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
 ([spec](specs/operator-helper-protocol.md)): roles are DECLARED then
 MATERIALIZED into a lock or worktree+PR, then re-derived; operator merges PRs
 first and does features only via sub-agents; helpers work in worktrees on
-`row/<ROW-ID>` and open a DRAFT PR at the START, which IS the claim. **W0+W1
-LANDED** (`agent-role.py`, `check-role-discipline.py`), both CI-gated but
-REPORT-ONLY until `ROLE_DISCIPLINE_SINCE` names a cutover commit. W2-W5 remain.
+`row/<ROW-ID>` and open a DRAFT PR at the START, which IS the claim. **W0-W5 LANDED**
+(`agent-role.py`, `check-role-discipline.py`, `claim-view.py`,
+`ready-for-helper.py`, PR template + size cap, docs folded), all CI-gated.
+Enforcement is still OPT-IN: set `ROLE_DISCIPLINE_SINCE` to the cutover commit
+and use `agent-preflight.sh --require-role` to make it binding. Queue today: 4
+pickable rows (`ready-for-helper.py`).
 
 ## Protocol invariants that bite most often
 

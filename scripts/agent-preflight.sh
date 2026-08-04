@@ -34,6 +34,7 @@ done
 CHECKERS=(
   check-agent-record
   check-role-discipline
+  claim-view
   check-readme-structure
   check-public-doc-tables
   check-model-checklist
@@ -48,6 +49,7 @@ CHECKERS=(
 SUITES=(
   test_agent_record
   test_agent_role
+  test_claim_view
   test_doc_checkpoint
   test_check_readme_structure
   test_check_public_doc_tables
@@ -87,8 +89,13 @@ fi
 
 echo "Record gates:"
 for checker in "${CHECKERS[@]}"; do
-  run "$checker" python3 "scripts/$checker.py"
+  case "$checker" in
+    claim-view) run "$checker" python3 "scripts/$checker.py" --check ;;
+    *) run "$checker" python3 "scripts/$checker.py" ;;
+  esac
 done
+
+run "ready-for-helper" python3 scripts/ready-for-helper.py --check
 
 echo "Mutation suites:"
 for suite in "${SUITES[@]}"; do
