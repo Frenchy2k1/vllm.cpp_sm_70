@@ -68,9 +68,10 @@ sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
 START, which IS the claim. **W0-W5 LANDED**, CI-gated, enforcement OPT-IN
 (`ROLE_DISCIPLINE_SINCE` + `--require-role`). Queue: 4 rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
-drift-gated by `upstream-inventory.py`): SM060/061/070 are below vLLM's 7.5 floor
-= OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **43 of 362 archs
-and 11 llama.cpp device backends have no row**.
+drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
+OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **43 of 362 archs
+have no row**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated
+(`ROAD-V1-D6`).
 
 ## Protocol invariants that bite most often
 
@@ -78,7 +79,7 @@ and 11 llama.cpp device backends have no row**.
   `Co-Authored-By` or `Signed-off-by` from AI.
 - Three MUST-route seams: fusion catalog, merged-GEMM family, born-on-the-runner
   decode. Not routing is drift — allowlist consciously or fold.
-- Mirror vLLM; do not ask the user how a feature should behave.
+- Mirror vLLM; never ask how a feature should behave.
 - `nsys` BOTH sides, SAME tool, before any perf claim; cross-tool per-kernel
   comparisons can NEVER establish invocation parity; whole-run sums mix prefill.
 - GPU box discipline: park `local-ai-worker`, flock `$HOME/gpu.lock`,
