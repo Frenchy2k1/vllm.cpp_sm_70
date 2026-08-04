@@ -486,38 +486,39 @@ The difference is coverage/effort (Inductor auto-generates graph-wide at JIT tim
 we port hot-path fusions deliberately, and AOT covers a fixed model's known shapes),
 never capability — see the vendoring principle in the MIRROR directive above.
 
-**Same kernel, different throughput = STRUCTURAL — scan vLLM's OWN rationale, and do it
-AUTOMATICALLY.** When the execution trace shows BOTH engines running the IDENTICAL kernel
-yet ours achieves LESS throughput at the SAME clock (e.g. identical cuBLAS
-`internal::gemvx`, same clock, ours sustaining ~20% less DRAM bandwidth), the gap is NOT
-the kernel and NOT a hardware "wall": it is STRUCTURAL — how our engine DRIVES execution
-AROUND that kernel (stream count, CUDA-graph structure, overlap/scheduling policy,
-allocator-pool placement, per-step sync-vs-async). ★ Two same-kernel numbers can NEVER be
-a wall — a real bandwidth/compute ceiling caps BOTH engines equally, so a same-kernel
-throughput split is positive PROOF a structural difference exists; treat "it's just a
-DRAM/hardware wall" (or "diffuse in-engine inefficiency" / "irreducible") while your OWN
-trace shows vLLM hitting a higher number as a RED FLAG that you stopped early. As a DEFAULT
-lane of every perf/parity investigation — not only after a kernel hunt stalls — SCAN vLLM's
-OWN performance RATIONALE, not just its kernels: its source CODE COMMENTS, ENV-VAR docs
-(`vllm/envs.py`), design docs (`docs/design/`), AND its GitHub ISSUES/PRs. vLLM's tree
-routinely documents the exact structural pitfall and its magnitude — you are usually
-READING the answer, not inferring it. ★ AND this is NOT vLLM-only — scan the SAME rationale
-in ANY non-vLLM reference a model is gated against (ds4/DwarfStar, SGLang, llama.cpp): read
-its source CODE COMMENTS + kernel structure and (where they exist) its ISSUES/PRs. Two
-proofs, both 2026-08-04, from BOTH references: (1) a wrongly-declared "bf16 DRAM wall"
-(Laguna ~87% of vLLM, same `gemvx`, same clock) dissolved once a read-only sub-agent scanned
-vLLM's source — our decode ran 41 CUDA streams where vLLM runs ONE ("single global auxiliary
-stream **to avoid an explosion of streams for every layer**", `torch_utils.py` around
-`current_stream()`), vLLM's own code documents that exact ~20% "bandwidth-bound decode"
-penalty from side-stream/allocator-pool structure (`v1/worker/gpu_model_runner.py`), and it
-gates overlap OFF once the primary kernel saturates the bus ("above it the GEMM saturates
-the device and cross-stream sync is pure overhead", `vllm/envs.py`, PR #41526). (2) a
-wrongly-declared "Q8_0 weight-stream floor" (DeepSeek at ds4 parity) turned into a beat-path
-once a sub-agent READ ds4's OWN kernel source (`ds4_cuda.cu`): our int8 GEMV is at
-per-launch parity, but ds4 OFFLOADS a chunk of projections to f16 tensor-core GEMMs — a
-DECOMPOSITION every per-launch-parity kernel scan had missed. Run this reference-rationale
-scan (a read-only agent over the reference source + its issues/PRs — it costs NO GPU time,
-so run it ALONGSIDE the nsys trace, not after) as a STANDING lane. Full method:
+**Same kernel, different throughput ⇒ look STRUCTURAL and scan the reference's rationale —
+but the scan GENERATES hypotheses; per-shape MEASUREMENT is the arbiter.** When the
+execution trace shows BOTH engines running the IDENTICAL kernel yet ours appears slower at
+the SAME clock, the gap is LIKELY structural — how our engine DRIVES execution AROUND that
+kernel (stream count, CUDA-graph structure, overlap/scheduling policy, allocator-pool
+placement, per-step sync-vs-async) — not the kernel, and a "DRAM/hardware wall" while the
+reference does better on the same op is NOT a proven ceiling (a real ceiling caps BOTH
+engines equally). As a DEFAULT lane of every perf/parity investigation — box-independent, so
+run it ALONGSIDE the nsys trace, not after — SCAN THE REFERENCE'S OWN performance RATIONALE,
+not just its kernels: vLLM for most models, but EQUALLY any non-vLLM reference a model is
+gated against (ds4/DwarfStar, SGLang, llama.cpp) — its source CODE COMMENTS + kernel
+structure, ENV-VAR/design docs (`vllm/envs.py`, `docs/design/`), and (where they exist)
+GitHub ISSUES/PRs. A reference's tree often documents the exact structural pitfall and its
+magnitude. ★★ BUT — and this is the hard rule the two 2026-08-04 cases teach — the scan only
+gives you a HYPOTHESIS; you MUST confirm it with PER-SHAPE / PER-KERNEL measurement before
+implementing, and you MUST distrust any AGGREGATE/DERIVED throughput number (bytes÷time)
+until the byte count is verified and cross-checked per-kernel:
+- **POSITIVE (ds4 / DeepSeek):** reading ds4's OWN kernel source (`ds4_cuda.cu`) revealed it
+  OFFLOADS a chunk of projections to f16 tensor-core GEMMs (`matmul_f16_pair` /
+  `cutlass_80_wmma`) — a real DECOMPOSITION difference (ds4 does ~1.8× less GPU work),
+  MEASUREMENT-CONFIRMED → a beat-path our per-launch-parity int8-GEMV scans had all missed.
+- **CAUTIONARY (vLLM / Laguna):** a "20% in-engine bandwidth deficit" that triggered a whole
+  structural hunt was a MEASUREMENT ARTIFACT — an aggregate bytes÷time whose byte total was
+  UNDERCOUNTED; the clean PER-SHAPE table showed our projections at per-call PARITY with
+  vLLM. And vLLM's own "single global auxiliary stream **to avoid an explosion of streams for
+  every layer**" comment (`torch_utils.py`) generated a plausible fix (collapse our 41
+  streams), which per-shape measurement then REFUTED — the projections were 0.41% concurrent
+  (nothing to de-contend) and the more-serial variant measured ~2% SLOWER. The scan surfaced
+  the idea; measurement killed it. Do NOT implement a scan-hypothesis against your own trace.
+So: same-kernel-different-throughput is a real RED FLAG worth the structural scan and forbids
+declaring a "ceiling" prematurely — but confirm the anomaly PER-SHAPE (never on an aggregate
+derived metric), and verify the reference's rationale actually applies to YOUR measured
+situation before you build the fix. Full method:
 [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § The STRUCTURAL lens.
 
 ## Policy for AI-Assisted Contributions
