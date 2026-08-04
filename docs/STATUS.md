@@ -1232,9 +1232,28 @@ had moved to this file, so both normative documents now carry an identical
 machine-readable doc-obligation contract that
 `scripts/check-protocol-consistency.py` asserts equal to the checker constants.
 Each gate ships with its mutation test. No engine code, no kernel, no numbers
-changed. Queued, and recorded in NOW.md: coordination-claim triage (187 matrix
-rows read `ACTIVE`), the record-era rollover, roadmap preamble compaction, a
-budget for this page, and an `agent-preflight` entry point. The rollover is
+changed. Queued, and recorded in NOW.md: the record-era rollover, roadmap
+preamble compaction, and a budget for this page.
+
+Claim/lifecycle triage (2026-08-04). **Correction:** the earlier "187 `ACTIVE`
+rows" figure was a naive grep that counted prose mentions of the word. Parsed
+from the tables, the matrices carried 106 `ACTIVE` + 46 `SPIKE` rows out of 653.
+With the developer confirming that only the DeepSeek and Laguna speed-parity
+tracks are in flight, every other `SPIKE`/`ACTIVE` row was mis-stated, since
+`ACTIVE` means "implementation is in flight". 28 rows that already carried both
+an exact code anchor and an exact test/evidence anchor moved to
+`ANCHOR-BACKFILL` (code exists, evidence contract not closed, explicitly not
+`DONE`), retiring 31 claims into
+[.agents/completed/claims-era1-2026-08-04.md](../.agents/completed/claims-era1-2026-08-04.md);
+no claim was lost and no prose cell was edited. The engine lifecycle summary was
+recomputed from the real per-area states, which had drifted because only its
+`Total` row is gated. 124 rows remain `SPIKE`/`ACTIVE`: they cannot move without
+first being given real code/test anchors, and inventing anchors to clear them
+would be exactly the dishonesty the record exists to prevent. That anchor
+backfill is the queued work. Root cause of the rot, now recorded: the lifecycle
+has **no zero-cost parking state** — every honest destination for a landed but
+unowned row sits in `EVIDENCED_STATES` and demands anchors, so rows rot in
+`ACTIVE` instead. No engine code, no kernel, no numbers changed. The rollover is
 BLOCKED on a coupling this audit surfaced: `check-agent-record.py` binds `DONE`
 rows to exact LINE anchors in `.agents/parity-ledger.md` (43 references), so
 freezing that file under `completed/` invalidates them. Re-anchoring by row ID
