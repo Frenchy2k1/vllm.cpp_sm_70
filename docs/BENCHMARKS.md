@@ -20,7 +20,7 @@ see [docs/FEATURES.md](FEATURES.md).
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | ahead at c16/c32, behind at c1 to c8 | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
-| **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.6 vs 43.1 tok/s, byte-exact, default config) | near-tie |
+| **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | prefill **1.18x ahead**, decode tie, memory parity | byte-identical |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **parity**, 0.997x (16.28 vs 16.33 tok/s) | n/a, GGUF peer |
@@ -99,20 +99,26 @@ Both arms NVFP4, single request, batch 1, GB10.
 | Arm | Decode tok/s | Ratio |
 |---|---:|---:|
 | vLLM NVFP4, graphed | 43.10 | 1.00x |
-| **vllm.cpp NVFP4**, resident decode + CUDA graph | **44.55** | **1.03x** |
+| **vllm.cpp NVFP4**, resident decode + CUDA graph | **44.46** | **1.03x** |
 
-The gap is localized, same-tool (nsys graph-node tracing on BOTH engines,
-2026-08-04): the entire +3.1 ms/step is the bf16 M=1 projection GEMV bucket,
-two thirds of it o_proj (ours ~196-204 us vs vLLM 139 us per call, the
-identical cuBLAS `gemvx` kernel). Attention is tied (537 vs 527 us), MoE is
-within 0.3 ms, and we win the norm/cast glue by 0.46 ms.
+The gap is CLOSED (2026-08-04, same-tool nsys graph-node tracing on both
+engines). Root cause: the bf16 M=1 projection GEMVs (o_proj, qkv, router,
+dense, lm_head) read their weights from GB10 UNIFIED/ATS host memory (a
+`w.View()` device retag, no `cudaMalloc` staging), which the GPU reads slower
+than true device memory. `VT_LAGUNA_RESIDENT_BF16W` (default-ON parity enabler)
+stages every projection device-resident (one H2D copy at load); byte-exact
+(ids bit-identical to the `=0` retag arm). Binding new-default decode is 44.46
+tok/s (median-of-3), 1.03x vs vLLM's graphed 43.10.
 
-Ruled out by gated same-tool A/Bs: the invocation itself (matching vLLM's
-bf16-output `cublasGemmEx` exactly leaves o_proj at ~196 us, a GPU wash and a
-host regression), stream contention, clocks, allocator pools, and the host
-gap. The open question is why the identical instantiation runs faster per call
-for vLLM; a per-shape byte audit (do our GEMV shapes match vLLM's exactly?) is
-the next probe. The earlier "overlap window" explanation is superseded.
+Per-call the residency recovers o_proj 194 to 131 us (about 168 to 249 GB/s),
+qkv 245 to 225 us, and lm_head 2410 to 1620 us/call. This supersedes the earlier
+invocation / bf16-output-`cublasGemmEx` framing (measured a wash): the
+invocation was never the cause, the weight's memory RESIDENCY was. Full
+forensics in `.agents/benchmark-record.md`.
+
+Memory: the roughly 2.6 GB of bf16 device copies sit in the 119 GB GB10 unified
+pool; peak host RSS is unchanged at about 40.7 GiB (device/unified allocations
+are not counted in `ru_maxrss`), so there is no memory regression.
 
 ## Memory
 
