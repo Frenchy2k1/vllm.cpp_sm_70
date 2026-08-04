@@ -94,10 +94,40 @@ next reproduction command. Never publish a partial/contended/stale-denominator
 number as binding. `scripts/check-doc-checkpoint.py` and its CI job enforce that
 every code/test/benchmark/spike/lifecycle commit updates both public checkpoint
 surfaces; do not weaken the checker to bypass the obligation.
-`docs/BENCHMARKS.md` is likewise a **scoreboard snapshot**, not an attempt log:
-retain binding/current component results, explicit pending/failed/void
-dispositions and the current reproduction entry point, while compacting
-superseded run-by-run forensics into the append-only ledger/state record.
+
+**`docs/BENCHMARKS.md` is a KEYED TABLE, not an append log.** It is in the same
+class as `.agents/roadmap_v1.md` and the area matrices: **merge by key, never
+union-append.** A checkpoint **UPDATES ITS ROW IN PLACE**; a genuinely new
+subject adds ONE ROW. Adding an H2 section per attempt is a protocol violation,
+not a style preference: that is exactly how the page reached 11,405 lines and
+171 claim-titled sections and stopped being readable by users (converted
+2026-08-04). Per-attempt narrative, refuted hypotheses, profiler tables and
+superseded numbers go to the append-only
+[`.agents/benchmark-record.md`](.agents/benchmark-record.md) **in the same
+change** (move it, never delete evidence). If sections have accumulated anyway,
+`scripts/roll-benchmark-record.py --apply` moves every non-canonical section
+into the record verbatim. `scripts/check-public-doc-tables.py` (CI-gated, with
+its mutation test `tests/scripts/test_check_public_doc_tables.py`) enforces the
+required user-facing sections, the section/prose/character/table-cell budgets,
+the house no-em-dash rule, and that the page still points at the record; do not
+weaken the checker to bypass the obligation. When a DENOMINATOR turns out to be
+wrong, correct every ratio built on it, never keep the flattering one.
+
+**Keep [`docs/FEATURES.md`](docs/FEATURES.md) CURRENT — same-change
+obligation.** It is the PUBLIC feature surface: what we support, next to vLLM,
+SGLang and llama.cpp. It is a KEYED TABLE under the same rules as
+`docs/BENCHMARKS.md` above (one row per feature, updated in place, no appended
+sections). Any change that touches `.agents/feature-matrix.md`,
+`.agents/model-matrix.md`, `.agents/backend-matrix.md`,
+`.agents/quantization-matrix.md`, or `src/vllm/model_executor/models/` updates
+the row it moves in the SAME change, and `scripts/check-doc-checkpoint.py`
+enforces it. The marks are load-bearing and must not be inflated: ✅ means
+implemented AND gated (token-exact against the pinned oracle for model rows, a
+named test in the tree for engine rows), ◐ means the path exists with limits
+NAMED in `docs/STATUS.md`, ☐ means not yet. Never mark a row ✅ because the code
+compiles, never mark a competitor ☐ to flatter a column, and keep the
+"Not supported yet" table honest, it is the reason the rest of the page is
+believable.
 
 **Keep the ROADMAP (`.agents/roadmap_v1.md`) and its AREA MATRICES CURRENT —
 same-change obligation.** The roadmap is the single top-level portfolio table;
@@ -613,6 +643,13 @@ submitting AI-assisted code, read
   decisions, next steps. Update this every working session.
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — user-facing accepted benchmark
   scoreboard plus the current pending/failed/void checkpoint and repro status.
+  KEYED TABLE: update the row, never append a section.
+- [docs/FEATURES.md](docs/FEATURES.md) — user-facing feature matrix against
+  vLLM, SGLang and llama.cpp. KEYED TABLE, same rules.
+- [.agents/benchmark-record.md](.agents/benchmark-record.md) — **append-only
+  benchmark record**: every attempt, refuted hypothesis, profiler table and
+  superseded number. Read it before re-running a lever; most entries are dead
+  ends already measured and closed.
 
 ## Canonical documents (outside .agents/)
 
