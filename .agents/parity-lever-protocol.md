@@ -155,6 +155,48 @@ THE METHOD — do this BEFORE and DURING any parity/throughput work:
 Code-only comparison is necessary but NOT sufficient. If you have not PROFILED vLLM on the
 workload, you do not yet know where the gap is — you are guessing.
 
+## The STRUCTURAL lens — when the SAME kernel runs at different throughput
+
+The execution trace can show BOTH engines running the IDENTICAL kernel, yet ours slower.
+That is NOT a kernel problem and NOT a hardware "ceiling": a real bandwidth/compute wall
+caps BOTH engines EQUALLY, so a same-kernel throughput split — e.g. the same cuBLAS
+`internal::gemvx` sustaining ~167 GB/s in vLLM but ~131 GB/s in ours at the SAME clock — is
+positive PROOF of a STRUCTURAL difference: how the engine DRIVES execution AROUND the
+kernel. A memory-bound kernel's ACHIEVED bandwidth is set by its execution CONTEXT, so
+audit the context, not the kernel:
+
+- **Stream count + graph structure** — how many CUDA streams does decode run on, and is the
+  forward ONE full cudagraph on ONE stream, or a per-layer stream explosion? (Ours once ran
+  **41 streams** where vLLM runs 1 compute + ≤3 shared aux ≈ "5".)
+- **Overlap / scheduling policy** — is DRAM-heavy work co-scheduled with a bandwidth-bound
+  kernel on a saturated bus (a NET LOSS — the concurrent kernels steal each other's
+  bandwidth), or is overlap gated to only *compute-slack* work when the primary kernel
+  leaves idle SMs? vLLM gates overlap OFF above token thresholds a bs=1 decode never trips.
+- **Allocator-pool placement** — per-stream memory pools can strand scratch buffers and
+  shift the physical placement of KV/weights, slowing bandwidth-bound decode.
+- **Per-step sync vs async** — a per-step device sync that idles the GPU, vs async
+  scheduling that overlaps step-N host/sample work with step-(N+1) forward.
+
+**MANDATORY lane — read vLLM's OWN rationale, not just its kernels.** As a DEFAULT part of
+any perf/parity investigation (a read-only sub-agent is ideal, and it runs box-independent
+so it costs no GPU time), scan vLLM's own performance REASONING: source CODE COMMENTS,
+ENV-VAR docs (`vllm/envs.py`), design docs (`docs/design/`), and GitHub ISSUES/PRs. vLLM's
+tree routinely documents the exact structural pitfall AND its magnitude — you are usually
+READING the answer, not inferring it. Proven 2026-08-04: a wrongly-declared "bf16 DRAM wall"
+(~87% of vLLM, same `gemvx`, same clock, three GPU trace agents trending toward "floor")
+resolved the moment a scan found — vLLM keeps ONE compute stream + a "single global
+auxiliary stream **to avoid an explosion of streams for every layer**"
+(`vllm/utils/torch_utils.py`, `current_stream()`); vLLM's OWN source documents the exact
+~20% "bandwidth-bound decode" penalty from side-stream/allocator-pool structure
+(`vllm/v1/worker/gpu_model_runner.py`); and it disables overlap once the primary kernel
+saturates the bottleneck ("above it the GEMM saturates the device and cross-stream sync is
+PURE OVERHEAD", `vllm/envs.py`, PR #41526, and the ≤256/≤1024-token overlap gates in
+`fused_moe/runner/shared_experts.py` / the DeepSeek-V4 attention). Our 41-stream decode was
+the exact anti-pattern vLLM's comment forbids. RED FLAGS that you skipped this lane:
+concluding "DRAM/hardware wall", "diffuse in-engine inefficiency", or "irreducible" while
+your OWN trace shows vLLM achieving a higher number on the identical kernel — that is a
+structural miss you have not found yet, never a ceiling.
+
 ### MANDATORY during autonomous porting: profile vLLM's ACTUAL kernels, port 1:1 what it runs
 
 **"At-parity" inferred from SOURCE is NOT parity — you must MEASURE it.** (Proven
