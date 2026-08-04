@@ -1,0 +1,242 @@
+{
+ "available": true,
+ "pins": {
+  "vllm": "555967922",
+  "sglang": "f63458b5b",
+  "llamacpp": "237ad9b96"
+ },
+ "arch_floor": {
+  "supported": [
+   "7.5",
+   "8.0",
+   "8.6",
+   "8.7",
+   "8.9",
+   "9.0",
+   "10.0",
+   "10.1",
+   "10.3",
+   "12.0",
+   "12.1"
+  ],
+  "anchor": "CMakeLists.txt:129",
+  "our_rows_below_floor": [
+   "BACKEND-CUDA-SM060",
+   "BACKEND-CUDA-SM061",
+   "BACKEND-CUDA-SM070"
+  ]
+ },
+ "components": {
+  "machete": {
+   "files": 12,
+   "anchor": "csrc/libtorch_stable/quantization/machete:1"
+  },
+  "allspark": {
+   "files": 6,
+   "anchor": "csrc/libtorch_stable/quantization/gptq_allspark:1"
+  },
+  "scaled_mm_c2x": {
+   "files": 6,
+   "anchor": "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c2x_sm89_fp8_dispatch.cuh:1"
+  },
+  "cutlass_moe": {
+   "files": 3,
+   "anchor": "vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py:1"
+  },
+  "w4a8": {
+   "files": 13,
+   "anchor": "csrc/libtorch_stable/quantization/cutlass_w4a8:1"
+  },
+  "flashmla": {
+   "files": 5,
+   "anchor": "vllm/v1/attention/ops/flashmla.py:1"
+  },
+  "deepgemm": {
+   "files": 0,
+   "anchor": ""
+  },
+  "mla": {
+   "files": 39,
+   "anchor": "csrc/libtorch_stable/attention/mla:1"
+  }
+ },
+ "registry": {
+  "upstream_total": 362,
+  "named_by_us": 319,
+  "missing_count": 43,
+  "missing": [
+   {
+    "arch": "BertForMaskedLM",
+    "anchor": "vllm/model_executor/models/registry.py:217"
+   },
+   {
+    "arch": "Cheers",
+    "anchor": "vllm/model_executor/models/registry.py:354"
+   },
+   {
+    "arch": "ColQwen3",
+    "anchor": "vllm/model_executor/models/registry.py:278"
+   },
+   {
+    "arch": "ColQwen3_5",
+    "anchor": "vllm/model_executor/models/registry.py:280"
+   },
+   {
+    "arch": "Cosmos3EdgeForConditionalGeneration",
+    "anchor": "vllm/model_executor/models/registry.py:361"
+   },
+   {
+    "arch": "DiffusionGemmaForBlockDiffusion",
+    "anchor": "vllm/model_executor/models/registry.py:400"
+   },
+   {
+    "arch": "Exaone4_5_MTP",
+    "anchor": "vllm/model_executor/models/registry.py:637"
+   },
+   {
+    "arch": "ExaoneMoeMTP",
+    "anchor": "vllm/model_executor/models/registry.py:636"
+   },
+   {
+    "arch": "Gemma4DSparkModel",
+    "anchor": "vllm/model_executor/models/registry.py:611"
+   },
+   {
+    "arch": "GritLM",
+    "anchor": "vllm/model_executor/models/registry.py:126"
+   },
+   {
+    "arch": "HF_ColBERT",
+    "anchor": "vllm/model_executor/models/registry.py:270"
+   },
+   {
+    "arch": "HfMoondream",
+    "anchor": "vllm/model_executor/models/registry.py:510"
+   },
+   {
+    "arch": "InklingForCausalLM",
+    "anchor": "vllm/model_executor/models/registry.py:163"
+   },
+   {
+    "arch": "InklingForConditionalGeneration",
+    "anchor": "vllm/model_executor/models/registry.py:164"
+   },
+   {
+    "arch": "InklingMTPModel",
+    "anchor": "vllm/model_executor/models/registry.py:633"
+   },
+   {
+    "arch": "JinaForRanking",
+    "anchor": "vllm/model_executor/models/registry.py:274"
+   },
+   {
+    "arch": "JinaVLForRanking",
+    "anchor": "vllm/model_executor/models/registry.py:333"
+   },
+   {
+    "arch": "LlamaForCausalLMEagle3",
+    "anchor": "vllm/model_executor/models/registry.py:616"
+   },
+   {
+    "arch": "Llama_Nemotron_Nano_VL",
+    "anchor": "vllm/model_executor/models/registry.py:472"
+   },
+   {
+    "arch": "LongcatFlashNgramForCausalLM",
+    "anchor": "vllm/model_executor/models/registry.py:149"
+   },
+   {
+    "arch": "MiniCPMO",
+    "anchor": "vllm/model_executor/models/registry.py:496"
+   },
+   {
+    "arch": "MiniCPMV",
+    "anchor": "vllm/model_executor/models/registry.py:497"
+   },
+   {
+    "arch": "MiniMaxM3MTP",
+    "anchor": "vllm/model_executor/models/registry.py:631"
+   },
+   {
+    "arch": "NVLM_D",
+    "anchor": "vllm/model_executor/models/registry.py:514"
+   },
+   {
+    "arch": "NemotronH_Nano_Omni_Reasoning_V3",
+    "anchor": "vllm/model_executor/models/registry.py:512"
+   },
+   {
+    "arch": "NemotronH_Nano_VL_V2",
+    "anchor": "vllm/model_executor/models/registry.py:511"
+   },
+   {
+    "arch": "NemotronH_Super_Omni_Reasoning_V3",
+    "anchor": "vllm/model_executor/models/registry.py:513"
+   },
+   {
+    "arch": "OpenVLAForActionPrediction",
+    "anchor": "vllm/model_executor/models/registry.py:520"
+   },
+   {
+    "arch": "Ovis",
+    "anchor": "vllm/model_executor/models/registry.py:521"
+   },
+   {
+    "arch": "Ovis2_5",
+    "anchor": "vllm/model_executor/models/registry.py:522"
+   },
+   {
+    "arch": "Phi4ForCausalLMV",
+    "anchor": "vllm/model_executor/models/registry.py:534"
+   },
+   {
+    "arch": "PrithviGeoSpatialMAE",
+    "anchor": "vllm/model_executor/models/registry.py:264"
+   },
+   {
+    "arch": "Qwen3ASRRealtimeGeneration",
+    "anchor": "vllm/model_executor/models/registry.py:566"
+   },
+   {
+    "arch": "Qwen3NextMTP",
+    "anchor": "vllm/model_executor/models/registry.py:645"
+   },
+   {
+    "arch": "Qwen3_5MTP",
+    "anchor": "vllm/model_executor/models/registry.py:647"
+   },
+   {
+    "arch": "Qwen3_5MoeMTP",
+    "anchor": "vllm/model_executor/models/registry.py:648"
+   },
+   {
+    "arch": "RobertaForTokenClassification",
+    "anchor": "vllm/model_executor/models/registry.py:304"
+   },
+   {
+    "arch": "Step3p5MTP",
+    "anchor": "vllm/model_executor/models/registry.py:646"
+   },
+   {
+    "arch": "Terratorch",
+    "anchor": "vllm/model_executor/models/registry.py:265"
+   },
+   {
+    "arch": "VaultGemmaForCausalLM",
+    "anchor": "vllm/model_executor/models/registry.py:662"
+   },
+   {
+    "arch": "VibeVoiceAsrForConditionalGeneration",
+    "anchor": "vllm/model_executor/models/registry.py:668"
+   },
+   {
+    "arch": "VoxtralRealtimeGeneration",
+    "anchor": "vllm/model_executor/models/registry.py:585"
+   },
+   {
+    "arch": "XLMRobertaForTokenClassification",
+    "anchor": "vllm/model_executor/models/registry.py:305"
+   }
+  ]
+ }
+}

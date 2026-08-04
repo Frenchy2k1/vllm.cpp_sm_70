@@ -69,7 +69,7 @@ START, which IS the claim. **W0-W5 LANDED**, all CI-gated. Enforcement OPT-IN:
 set `ROLE_DISCIPLINE_SINCE` + `--require-role`. Queue: 4 pickable rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES, not anchors.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md)):
 SM060/061/070 below vLLM's 7.5 floor = OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are
-REAL unported work; **62 of vLLM's 362 archs have no row**.
+REAL unported work; **43 of vLLM's 362 archs have no row** (`upstream-inventory.py`, drift-gated).
 
 ## Protocol invariants that bite most often
 

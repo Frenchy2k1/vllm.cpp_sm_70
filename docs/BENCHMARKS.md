@@ -215,7 +215,7 @@ token budget, context, corpus bytes, KV and SSM dtypes, kernel family, and
 graphed decode all match, and the audit is
 [recorded](../.agents/specs/benchmark-equivalence-audit-2026-07-15.md). The
 2026-08-04 agent-record substrate, triage, compaction, CI-concurrency and
-anchor-backfill work, the operator/helper protocol W0-W5, anchor-backfill batches 3-4, and the upstream-derived inventory, touched no engine code and moved no number: NOT
+anchor-backfill work, the operator/helper protocol W0-W5, anchor-backfill batches 3-4, and the upstream-derived inventory tooling, touched no engine code and moved no number: NOT
 APPLICABLE, nothing to reproduce.
 
 **Vocabulary.** *Token-exact* means our output ids equal the reference's, byte

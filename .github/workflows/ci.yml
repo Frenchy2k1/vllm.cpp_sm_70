@@ -92,7 +92,9 @@ jobs:
         run: |
           python3 scripts/claim-view.py --check
           python3 scripts/ready-for-helper.py --check
+          python3 scripts/upstream-inventory.py --check
           python3 tests/scripts/test_claim_view.py
+          python3 tests/scripts/test_upstream_inventory.py
   documentation-checkpoint:
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.

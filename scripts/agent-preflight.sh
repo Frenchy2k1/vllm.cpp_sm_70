@@ -50,6 +50,7 @@ SUITES=(
   test_agent_record
   test_agent_role
   test_claim_view
+  test_upstream_inventory
   test_doc_checkpoint
   test_check_readme_structure
   test_check_public_doc_tables
@@ -96,6 +97,7 @@ for checker in "${CHECKERS[@]}"; do
 done
 
 run "ready-for-helper" python3 scripts/ready-for-helper.py --check
+run "upstream-inventory" python3 scripts/upstream-inventory.py --check
 
 echo "Mutation suites:"
 for suite in "${SUITES[@]}"; do

@@ -35074,3 +35074,38 @@ W1-W4 plan whose FIRST item is making this enumeration reproducible
 checkable condition instead of an occasional audit.
 
 No source, kernel, model, gate, benchmark or capability mark changed.
+
+## W1 LANDED: upstream inventory made reproducible — and it CORRECTS my own 62 figure
+<!-- state: 2026-08-05T06:00 -->
+
+`scripts/upstream-inventory.py` turns yesterday's hand audit into a repeatable
+derivation with `file:line` citations, snapshotted to
+`.agents/upstream-inventory.json` and drift-checked in CI.
+
+**It immediately corrected a number I had published.** The hand count said 62
+uninventoried upstream architectures; the real figure is **43** (362 upstream,
+319 named by us). The 62 came from an arch-name regex that missed
+`ForMaskedLM`/`ForRetrieval`/`ForSequenceClassification` suffixes, so
+legitimately-inventoried rows looked absent. This is exactly why W1 was
+sequenced FIRST instead of acting on the raw numbers: a one-off grep produces
+confident wrong counts, and the fix is tooling, not more care.
+
+Confirmed unchanged by the tooling: vLLM's arch floor is 7.5 (CMakeLists.txt:129)
+so `SM060`/`SM061`/`SM070` are out of scope; all COMP-* components are real
+unported work except `deepgemm` (0 files - external dep).
+
+Design points:
+- `--check` SKIPS cleanly when reference checkouts are absent rather than
+  pretending to have verified something. CI has no vLLM checkout, so a silent
+  pass there would be a lie;
+- drift is defined as the uninventoried COUNT changing or vLLM's supported-arch
+  list changing, either of which means upstream moved and the delta needs
+  inventorying;
+- 10 mutation tests cover the parsing, which is where the errors live: an
+  off-by-one in the arch floor would declare a SUPPORTED arch out of scope, and a
+  sloppy registry regex would invent or hide architectures. One test caught my
+  own wrong line-number expectation (the code was right).
+
+Remaining: W2 (close the 3 sub-floor rows, re-scope DEEPGEMM), W3 (inventory the
+43), W4 (repeat against SGLang and llama.cpp). No source, kernel, model, gate,
+benchmark or capability mark changed.
