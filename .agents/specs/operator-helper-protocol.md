@@ -42,20 +42,51 @@ record coherent, runs the GPU. The only role that lands anything on `main`.
 **Helper.** Any number, bounded by disk (see § Dependencies). Picks one ready
 row, works in an isolated worktree, opens a PR. Never touches `main`.
 
-### Determining the role
+### Determining the role — DECLARE, then MATERIALIZE, then derive
 
-In order, first match wins:
+Derivation alone does NOT work, and assuming it did was an error in the first
+draft of this spec (user-caught, 2026-08-04). The common case is several
+sessions started from the SAME environment: same machine, same primary checkout,
+same branch. Nothing distinguishes them. A helper only becomes environmentally
+recognisable AFTER it has taken a worktree and a branch, so derivation is
+circular if used to decide the role in the first place.
 
-1. explicit instruction from the user in this session;
-2. derived from the environment — a session whose working tree is the primary
-   checkout **and** which holds `.agents/operator.lock` is the operator; a
-   session in a git worktree on a `row/*` branch is a helper;
-3. **if it cannot be derived, ASK the user before doing anything else.**
+Acquisition and persistence are different problems and need different mechanisms:
 
-Asking is the fallback, not the mechanism. A role that lives only in an answered
-question does not survive context compaction, and every unenforced rule audited
-on 2026-08-04 had drifted — `ci.yml` carried a comment stating it "deliberately
-carries NO concurrency group" ten lines below its concurrency group.
+**1. Acquire — ASK.** Unless the user has said which role this session is, the
+session ASKS before doing anything else. This is unavoidable: the information
+does not exist in the environment yet. It is also cheap, once per session.
+
+**2. Materialize — make the answer a FACT.** Immediately on answering:
+
+- *operator*: atomically acquire `.agents/operator.lock` (create-exclusive, so a
+  second self-declared operator FAILS rather than racing), carrying session id,
+  host, PID and a heartbeat timestamp;
+- *helper*: create its worktree and `row/<ROW-ID>` branch and open the draft PR
+  straight away, before any other work.
+
+After this step the session IS distinguishable from the outside, which is what
+the first draft wrongly assumed at the start.
+
+**3. Persist and re-derive — never ask twice.** The role is recorded in a
+session-scoped marker (keyed by session id, outside the repo). Re-derivation, not
+memory, is what survives context compaction: a session that has forgotten its
+role reads the marker and the lock rather than guessing or asking again.
+
+**4. Resolution rides on the mandatory preflight.** `scripts/agent-preflight.sh`
+resolves and PRINTS the role every run, and refuses to pass if a session has not
+declared one. That is what stops the role from being a prose convention: the
+check is embedded in the tool both roles must already run at session start and
+before every commit.
+
+The lock is also the mutual-exclusion mechanism, not just a label. If it is
+already held, this session CANNOT be the operator whatever it was told, and the
+correct response is to say so and offer the helper role instead. The lock needs a
+TTL and heartbeat so a crashed operator does not block everyone (§ Risks).
+
+Multiple helpers from one environment are fine and collision-free: each takes a
+distinct worktree named for its row, and the row is already exclusive because the
+PR is the claim.
 
 ## Operator rules
 
@@ -166,6 +197,7 @@ checker.
 
 | W | Item | Gate |
 |---|---|---|
+| W0 | Role machinery: `.agents/operator.lock` (create-exclusive + TTL + heartbeat), session-scoped role marker, and role resolution printed by `agent-preflight.sh`, which FAILS when a session has not declared one | mutation test |
 | W1 | `check-role-discipline.py`: a commit on `main` touching feature paths must arrive via a merged `row/*` PR, not a direct push | mutation test |
 | W2 | Generated claim view from GitHub PR state; `coordination.md` becomes a report | mutation test + a run against live PRs |
 | W3 | `check-ready-for-helper.py`: the pickable queue, asserting the 5 conditions | mutation test |
@@ -180,12 +212,23 @@ PR, whoever produced it.
 ## Risks/decisions
 
 - **Decided (user, 2026-08-04):** operator may drive features, but only via
-  sub-agents; role derived where possible and ASKED when not; claims PR-derived.
+  sub-agents; claims PR-derived.
+- **Corrected (user, 2026-08-04):** the first draft made environment-derivation
+  the PRIMARY way to determine the role. That is circular — the common case is
+  several sessions started from ONE environment, indistinguishable until a role
+  has already been taken. Role acquisition is therefore an explicit DECLARATION
+  (asked when the user has not said), immediately MATERIALIZED into a lock or a
+  worktree+PR so it becomes a fact, and only then re-derivable. Deriving is how
+  the role SURVIVES, not how it is decided.
 - **Risk: review becomes the bottleneck.** Mitigated by one-row size-capped PRs,
   mechanical merge criteria, and merge-first sessions. Watch the open-PR count;
   if it grows monotonically the cap is too loose.
 - **Risk: the lock is stale.** `.agents/operator.lock` needs a TTL and a
-  heartbeat, or a crashed operator blocks everyone.
+  heartbeat, or a crashed operator blocks everyone. Breaking a stale lock must be
+  logged, never silent.
+- **Risk: the user declares two operators.** Handled by making lock acquisition
+  create-exclusive: the second declaration FAILS and is offered the helper role,
+  rather than both proceeding and racing on `main`.
 - **Risk: helpers starve.** If READY-FOR-HELPER is too strict the queue is
   empty. 98 rows currently fail condition 1 or 2, so the first practical step is
   the anchor backfill, not the protocol.

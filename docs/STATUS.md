@@ -1228,7 +1228,7 @@ sortable anchor `scripts/check-state-order.py` proves. **Orientation** gained [.
 100-line snapshot gated for budget and freshness. **The operating manual** had drifted from the
 checker, so both normative documents carry one machine-readable contract. **Claim state** was triaged: only DeepSeek and
 Laguna are in flight; 54 rows left `ACTIVE`, 29 claims retired to
-[completed/claims-era1-2026-08-04.md](../.agents/completed/claims-era1-2026-08-04.md).
+[completed/claims-era1.md](../.agents/completed/claims-era1-2026-08-04.md).
 Anchor backfill: 12 engine rows cite a real `TEST_CASE`, 19 model rows cite
 their `REGISTER_VLLM_MODEL` line and the `CHECK(has_arch(...))` asserting them
 (15 land `PARTIAL`). 98 rows remain, lacking anchors. **CI gap closed:** the two DIFF-scoped gates carried a
@@ -1237,7 +1237,7 @@ them cancelled, leaving those ranges unvalidated. The roadmap's 484-line chronol
 `completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in
 [.agents/directives.md](../.agents/directives.md), and THIS page gained a
 shrink-only ratchet. Detail is in `.agents/state.md`. An operator/helper
-protocol for concurrent sessions is ACCEPTED, unenforced
+protocol is ACCEPTED, unenforced; roles are DECLARED then locked
 ([spec](../.agents/specs/operator-helper-protocol.md)). No engine code, no
 kernel, no numbers changed.
 

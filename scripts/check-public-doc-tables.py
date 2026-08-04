@@ -321,7 +321,7 @@ def features_errors(text: str) -> list[str]:
 # Lowering these numbers as the page is compacted is the gate closing.
 STATUS = ROOT / "docs/STATUS.md"
 STATUS_RATCHET = {
-    "chars": 289_398,
+    "chars": 289_395,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,
