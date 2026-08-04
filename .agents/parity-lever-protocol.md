@@ -177,24 +177,35 @@ audit the context, not the kernel:
 - **Per-step sync vs async** — a per-step device sync that idles the GPU, vs async
   scheduling that overlaps step-N host/sample work with step-(N+1) forward.
 
-**MANDATORY lane — read vLLM's OWN rationale, not just its kernels.** As a DEFAULT part of
-any perf/parity investigation (a read-only sub-agent is ideal, and it runs box-independent
-so it costs no GPU time), scan vLLM's own performance REASONING: source CODE COMMENTS,
-ENV-VAR docs (`vllm/envs.py`), design docs (`docs/design/`), and GitHub ISSUES/PRs. vLLM's
-tree routinely documents the exact structural pitfall AND its magnitude — you are usually
-READING the answer, not inferring it. Proven 2026-08-04: a wrongly-declared "bf16 DRAM wall"
-(~87% of vLLM, same `gemvx`, same clock, three GPU trace agents trending toward "floor")
-resolved the moment a scan found — vLLM keeps ONE compute stream + a "single global
-auxiliary stream **to avoid an explosion of streams for every layer**"
-(`vllm/utils/torch_utils.py`, `current_stream()`); vLLM's OWN source documents the exact
-~20% "bandwidth-bound decode" penalty from side-stream/allocator-pool structure
-(`vllm/v1/worker/gpu_model_runner.py`); and it disables overlap once the primary kernel
-saturates the bottleneck ("above it the GEMM saturates the device and cross-stream sync is
-PURE OVERHEAD", `vllm/envs.py`, PR #41526, and the ≤256/≤1024-token overlap gates in
-`fused_moe/runner/shared_experts.py` / the DeepSeek-V4 attention). Our 41-stream decode was
-the exact anti-pattern vLLM's comment forbids. RED FLAGS that you skipped this lane:
-concluding "DRAM/hardware wall", "diffuse in-engine inefficiency", or "irreducible" while
-your OWN trace shows vLLM achieving a higher number on the identical kernel — that is a
+**MANDATORY lane — read THE REFERENCE'S OWN rationale (vLLM AND non-vLLM), not just its
+kernels.** As a DEFAULT part of any perf/parity investigation (a read-only sub-agent is
+ideal, and it runs box-independent so it costs no GPU time — run it ALONGSIDE the trace, not
+after), scan the reference's own performance REASONING. This is vLLM for most models, but
+EQUALLY any non-vLLM reference the model is gated against (ds4/DwarfStar, SGLang, llama.cpp):
+read its source CODE COMMENTS + kernel structure, ENV-VAR docs (`vllm/envs.py`), design docs
+(`docs/design/`), and (where they exist) GitHub ISSUES/PRs. The reference's tree routinely
+documents the exact structural pitfall AND its magnitude — you are usually READING the
+answer, not inferring it. Two proofs, both 2026-08-04, from BOTH references:
+
+- **vLLM (Laguna):** a wrongly-declared "bf16 DRAM wall" (~87% of vLLM, same `gemvx`, same
+  clock, three GPU trace agents trending toward "floor") resolved the moment a scan found —
+  vLLM keeps ONE compute stream + a "single global auxiliary stream **to avoid an explosion
+  of streams for every layer**" (`vllm/utils/torch_utils.py`, `current_stream()`); vLLM's
+  OWN source documents the exact ~20% "bandwidth-bound decode" penalty from
+  side-stream/allocator-pool structure (`vllm/v1/worker/gpu_model_runner.py`); and it
+  disables overlap once the primary kernel saturates the bus ("above it the GEMM saturates
+  the device and cross-stream sync is PURE OVERHEAD", `vllm/envs.py`, PR #41526, plus the
+  ≤256/≤1024-token overlap gates). Our 41-stream decode was the exact anti-pattern.
+- **ds4 (DeepSeek):** a wrongly-declared "Q8_0 weight-stream floor" (DeepSeek at ds4 parity,
+  after 7 flat intra-kernel levers) turned into a beat-path the moment a sub-agent READ
+  ds4's OWN kernel source (`ds4_cuda.cu`): our int8 GEMV is at per-launch parity, but ds4
+  OFFLOADS a chunk of projections to f16 tensor-core GEMMs (`matmul_f16_pair` /
+  `cutlass_80_wmma`) — a DECOMPOSITION difference every per-launch kernel scan had missed.
+  The reference need not have public issues/PRs; its SOURCE is the record.
+
+RED FLAGS that you skipped this lane: concluding "DRAM/hardware wall", "Q8_0/weight-stream
+floor", "diffuse in-engine inefficiency", or "irreducible" while your OWN trace shows the
+reference achieving a higher number (or doing LESS work) on the same op — that is a
 structural miss you have not found yet, never a ceiling.
 
 ### MANDATORY during autonomous porting: profile vLLM's ACTUAL kernels, port 1:1 what it runs
