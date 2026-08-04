@@ -59,6 +59,18 @@ jobs:
         run: |
           python3 scripts/check-runner-routing-consistency.py
           python3 tests/scripts/test_check_runner_routing_consistency.py
+      - name: Protocol prose matches the checkers that enforce it
+        run: |
+          python3 scripts/check-protocol-consistency.py
+          python3 tests/scripts/test_check_protocol_consistency.py
+      - name: The state-log tail is anchored and chronological
+        run: |
+          python3 scripts/check-state-order.py
+          python3 tests/scripts/test_check_state_order.py
+      - name: NOW.md stays a short one-Read resume surface
+        run: |
+          python3 scripts/check-now-current.py
+          python3 tests/scripts/test_check_now_current.py
   documentation-checkpoint:
     concurrency:
       group: ci-doc-${{ github.ref }}-${{ github.repository }}
@@ -74,7 +86,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Every feature checkpoint updates README and BENCHMARKS
+      - name: Every feature checkpoint updates STATUS, BENCHMARKS and NOW
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -91,6 +103,7 @@ jobs:
             head="$PUSH_HEAD"
           fi
           python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
+          python3 scripts/check-now-current.py --base "$base" --head "$head"
   commit-protocol-tag:
     concurrency:
       group: ci-commit-${{ github.ref }}-${{ github.repository }}

@@ -1212,6 +1212,34 @@ them verbatim, reading its allowlist from the checker so the two cannot drift.
 No engine code, no kernel, no measured number changed; the scoreboard carries
 the corrected ds4 (~16.5) and Laguna (~43) denominators already on main.
 
+Agent-record substrate repair (2026-08-04): an audit found the protocol rules
+sound and well enforced, but two of the primitives autonomous work rests on had
+decayed. (1) Cold resume was unsound: `.agents/state.md` promises "append,
+newest last", yet union-merged appends from parallel worktrees had interleaved
+the tail, so entries dated 07-27 sat after entries dated 07-30 and reading the
+newest entries returned a jumble. Entries below a one-time marker now carry a
+sortable `<!-- state: YYYY-MM-DD -->` anchor, `scripts/check-state-order.py`
+proves the order, and `scripts/sort-state-tail.py --apply` repairs an
+interleaved merge mechanically; the 34.5k lines of prior history stay frozen and
+exempt. (2) Orientation had no cheap entry point, since the files a cold session
+is told to read are the largest in the repo. New
+[.agents/NOW.md](../.agents/NOW.md) is a 100-line snapshot of live claims,
+current gate and next actions, rewritten in place and gated by
+`scripts/check-now-current.py` for budget and for freshness: any change
+appending to the state log must refresh it. Separately, the session operating
+manual still required a README update at every checkpoint after that obligation
+had moved to this file, so both normative documents now carry an identical
+machine-readable doc-obligation contract that
+`scripts/check-protocol-consistency.py` asserts equal to the checker constants.
+Each gate ships with its mutation test. No engine code, no kernel, no numbers
+changed. Queued, and recorded in NOW.md: coordination-claim triage (187 matrix
+rows read `ACTIVE`), the record-era rollover, roadmap preamble compaction, a
+budget for this page, and an `agent-preflight` entry point. The rollover is
+BLOCKED on a coupling this audit surfaced: `check-agent-record.py` binds `DONE`
+rows to exact LINE anchors in `.agents/parity-ledger.md` (43 references), so
+freezing that file under `completed/` invalidates them. Re-anchoring by row ID
+is the prerequisite.
+
 Measured against an oracle built from source at the ACTUAL parity pin, the gap
 is 0.9970x total throughput, not the 0.9819x published against the older
 pip-installed 0.24.0 release: that release is 1.25% faster than the pin, so
