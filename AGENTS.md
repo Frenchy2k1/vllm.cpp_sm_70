@@ -54,7 +54,19 @@ version, this list is the reminder.
   kernel.
 - **Trace the execution, not just the code.** `nsys` BOTH vLLM and ours on the
   same workload before any perf comparison; graphed local engines need
-  `--cuda-graph-trace=node`. Source finds dispatch logic, not what ran.
+  `--cuda-graph-trace=node`. Source finds dispatch logic, not what ran. **cuBLAS/
+  kernel INVOCATION parity:** any GEMM/GEMV parity claim MUST verify vLLM's ACTUAL
+  call on FOUR axes — (1) output/C dtype (it SELECTS the gemvx template: an
+  API-name match can still be a slower `<bf16,FLOAT>` template than vLLM's
+  `<bf16,bf16>`), (2) compute+scale type, (3) entry point + algo policy
+  (`cublasGemmEx` default-algo vs `cublasLtMatmul` requestedAlgoCount/heuristic),
+  (4) the resolved kernel TEMPLATE dtypes read off the SAME tool's trace. HARD
+  RULE: a CROSS-TOOL comparison (our nsys vs vLLM's torch-profiler) can NEVER
+  establish invocation parity — a same-tool trace where entry point AND resolved
+  template match is required. Op-contract gate:
+  `scripts/check-gemv-invocation-consistency.py`; full lane in
+  [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § The
+  STRUCTURAL lens.
 - **Three MUST-route seams (CI-gated).** A model routes through the fusion
   catalog (`vt::FusedChain`), the merged-GEMM family
   (`layers::MlpGateUpMethodBase`, `vt::MergedGemmGroup`), and the shared decode
