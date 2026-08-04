@@ -277,7 +277,7 @@ real GB10; the real-checkpoint e2e stays W8 (156.7 GiB does not fit ONE GB10) + 
 **MEASURED PARITY LEVERS INTEGRATED TO main (2026-08-03, GB10 build+gate):** four verified branches landed
 together. (1) DeepSeek MHC-pre FP64→FP32 fold (`CLAIM-DSV4-MHC-FOLD`, `VT_V4_MHC_FUSED` default-ON) — the
 float MHC-pre mirroring ds4 is BIT-EXACT (decode ids token-identical `=1`/`=0`; `test_cuda_deepseek_v4`
-Brick-B PASS on GB10) and MEASURED **82.3%→84.3% of ds4**. (2) GGUF UD-IQ2_M CPU bring-up — multi-shard
+Brick-B PASS on GB10) and MEASURED **85.4%→87.5% of ds4 ~16.5** (recomputed onto the corrected ds4 bar). (2) GGUF UD-IQ2_M CPU bring-up — multi-shard
 `gguf-split` stitching (`CLAIM-GGUF-SPLIT-SHARDS`, `test_gguf` 33/33) + IQ2_S/MXFP4 keep-quant `vec_dot`
 (`CLAIM-DSV4-UDIQ2M-QUANT`, CPU-green); the IQ2_S device `DotSuperblock<kIQ2_S>` is now **CUDA-BUILT + LINKED
 on GB10** (sm_121a, `-Werror`; one integration fix: `DotMXFP4` marked `[[maybe_unused]]` — the file had never
@@ -292,7 +292,7 @@ two measured byte-exact decode-glue folds landed on top of the MHC-pre fold. (3)
 (~10×)**, decode +6.1%. (2) MHC-pre finish occupancy widen (256→1024) + sqrsum-fold (`CLAIM-DSV4-MHC-LEAN`,
 `VT_V4_MHC_LEAN` default-ON=1024) — +0.7%; HONEST BOUND: the finish is floored by 86 sequential single-block
 launches/step (NOT warp-latency/memory), the owed residual = a layer-chain-spanning MHC restructure (high-risk).
-Net decode **14.02→14.96 tok/s (+6.7%) → 87.3% of ds4 17.13**. BYTE-EXACT: decode ids token-IDENTICAL `=1`/`=0`
+Net decode **14.02→14.96 tok/s (+6.7%) → 90.7% of ds4 ~16.5** (ds4 bar corrected from the unreproduced 17.13 anchor to the fair same-session ~16.5; a later MHC-SINK4 lever reached ~15.87 tok/s = ~96%). BYTE-EXACT: decode ids token-IDENTICAL `=1`/`=0`
 for BOTH levers on ds4flash IQ2XXS via the resident-decode path (`--gpu --kv-cache`, device kernels genuinely
 exercised) + `test_cuda_deepseek_v4` 20/20·67073 (Brick-7 + Brick-B). **SACRED UNMOVED on the merged GB10 build:
 `test_qwen36_paged_engine` 315/315** (27B checkpoint absent on box ⇒ that gate SKIPs). See docs/BENCHMARKS.md + docs/STATUS.md.
