@@ -79,7 +79,7 @@ are our reading of their documented behavior, not measurements.
 | Qwen3-Coder, Qwen3-VL | ✅ | token-exact |
 | Llama, Mistral, InternLM2/3 | ✅ | token-exact |
 | Gemma 1 / 2 / 3 / 4 | ✅ | token-exact, Gemma-4 multimodal near-tie |
-| DeepSeek-V2 (MLA), DeepSeek-V4-Flash | ✅ | token-exact; DS4-Flash decode beats ds4 1.144x with `VT_V4_RESIDENT_W` (byte-exact, default-OFF) |
+| DeepSeek-V2 (MLA), DeepSeek-V4-Flash | ✅ | token-exact; **DS4-Flash decode beats ds4 1.144x by default** (`VT_V4_RESIDENT_W` default-ON, byte-exact) |
 | GLM-4, GLM-4.7-Flash | ✅ | token-exact |
 | OPT, Phi, MiniCPM, OLMo-2, StableLM, Granite, Yi | ✅ | token-exact |
 | Laguna-S / Laguna-XS 2.1 | ✅ | near-tie; **vLLM parity+ (1.03x) by default** (`VT_LAGUNA_RESIDENT_BF16W` default-ON) |

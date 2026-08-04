@@ -23,7 +23,7 @@ see [docs/FEATURES.md](FEATURES.md).
 | **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | prefill **1.18x ahead**, decode tie, memory parity | byte-identical |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
-| **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | default **parity 0.997x**; **1.144x with `VT_V4_RESIDENT_W`** (18.69 vs 16.33, byte-exact, default-OFF) | n/a, GGUF peer |
+| **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 
 Reading the ratios: throughput is ours/reference, latency is reference/ours, so
 **1.0 or higher is a win** everywhere on this page.
@@ -178,12 +178,12 @@ Sparks with TP2 and is owed.
 |---|---|---:|---:|
 | DwarfStar (`ds4`) | IQ2_XXS mixed | 16.33 | 1.00x |
 | **vllm.cpp** (default) | same GGUF | **16.28** | **0.997x, parity** |
-| **vllm.cpp** + `VT_V4_RESIDENT_W` (default-OFF, recommend-flip) | same GGUF | **18.69** | **1.144x, byte-exact** |
+| **vllm.cpp** (`VT_V4_RESIDENT_W` default-ON) | same GGUF | **18.69** | **1.144x, byte-exact** |
 
 The default arm is parity, measured same-session clean (2026-08-04, single-load
 steady both arms); the earlier 15.87/96% and 17.13 figures are superseded.
 
-Weight residency is the beat-path (2026-08-05, `VT_V4_RESIDENT_W`, default-OFF).
+Weight residency is the beat-path (2026-08-05, `VT_V4_RESIDENT_W`, default-ON).
 The dense Q8_0 MLA/shared-expert/lm_head projection tower is read from the GGUF
 mmap over ATS/unified memory, which the GB10 GPU reads about 20% slower per-GEMV
 than `cudaMalloc`'d device memory. Staging that ~6 GiB tower device-resident once
