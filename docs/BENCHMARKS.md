@@ -199,8 +199,10 @@ token budget, context, corpus bytes, KV and SSM dtypes, kernel family, and
 graphed decode all match, and the audit is
 [recorded](../.agents/specs/benchmark-equivalence-audit-2026-07-15.md). The
 2026-08-04 agent-record substrate change (resume digest, gated state-log
-ordering, doc-obligation contract) touched no engine code and moved no number:
-NOT APPLICABLE, nothing to reproduce.
+ordering, doc-obligation contract) and the claim/lifecycle triage that followed
+it touched no engine code and moved no number: NOT APPLICABLE, nothing to
+reproduce. The triage changed which rows are marked in flight, not any measured
+result on this page.
 
 **Vocabulary.** *Token-exact* means our output ids equal the reference's, byte
 for byte. *Near-tie* means the reference's own greedy decode is not deterministic
