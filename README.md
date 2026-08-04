@@ -391,6 +391,7 @@ the number stays in the README and the label says *speed-pending*.
 | [docs/USAGE.md](docs/USAGE.md) | CLI, OpenAI server (endpoints + flags), C ABI, C++ API |
 | [docs/BUILD.md](docs/BUILD.md) | Build recipes per backend, every CMake option, hardware and quantization state |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | The measured evidence: per-axis grids, memory, reproduction recipes |
+| [docs/FEATURES.md](docs/FEATURES.md) | Feature-by-feature comparison against vLLM, SGLang and llama.cpp |
 | [docs/STATUS.md](docs/STATUS.md) | Per-capability lifecycle ledger, active gaps, next gate |
 | [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | The SGLang-inspired knobs, and when to turn them on |
 | [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) | MTP, DFlash, ngram |

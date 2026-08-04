@@ -1194,6 +1194,24 @@ InternLM2 plus a sliding window).
 
 ## Build and test lanes
 
+Public documentation restructure (2026-08-04): `docs/BENCHMARKS.md` had grown
+into an append log of 11,405 lines and 171 claim-titled sections and was no
+longer readable by users. It is now a keyed-table scoreboard, one row per
+subject, updated in place; the full attempt record moved verbatim to the
+append-only [.agents/benchmark-record.md](../.agents/benchmark-record.md), and
+nothing was edited or deleted. A new [docs/FEATURES.md](FEATURES.md) carries the
+public feature comparison against vLLM, SGLang and llama.cpp under the same
+rules. Two gates keep both current: `scripts/check-public-doc-tables.py` (CI,
+with mutation test `tests/scripts/test_check_public_doc_tables.py`) enforces the
+required sections, the section/prose/character/table-cell budgets and the
+no-em-dash house rule, and rejects the FIRST appended section rather than the
+seventh; `scripts/check-doc-checkpoint.py` now also requires `docs/FEATURES.md`
+to move whenever the feature, model, backend or quantization matrices do. When
+sections have accumulated, `scripts/roll-benchmark-record.py --apply` relocates
+them verbatim, reading its allowlist from the checker so the two cannot drift.
+No engine code, no kernel, no measured number changed; the scoreboard carries
+the corrected ds4 (~16.5) and Laguna (~43) denominators already on main.
+
 Measured against an oracle built from source at the ACTUAL parity pin, the gap
 is 0.9970x total throughput, not the 0.9819x published against the older
 pip-installed 0.24.0 release: that release is 1.25% faster than the pin, so
