@@ -1221,27 +1221,25 @@ them verbatim, reading its allowlist from the checker so the two cannot drift.
 No engine code, no kernel, no measured number changed; the scoreboard carries
 the corrected ds4 (~16.5) and Laguna (~43) denominators already on main.
 
-Agent-record substrate repair, triage and compaction (2026-08-04). An audit
-found the protocol rules sound but the substrate decayed. **Cold resume** was
-unsound (union-merged appends had interleaved `.agents/state.md`), so entries
-below a marker now carry a sortable anchor `scripts/check-state-order.py`
-proves. **Orientation** gained [.agents/NOW.md](../.agents/NOW.md), a 100-line
-snapshot gated for budget and freshness. **The operating manual** had drifted
-from the checker, so both normative documents carry an identical
-machine-readable contract. **Claim state** was triaged against the code: only
-DeepSeek and Laguna are in flight; 54 rows left `ACTIVE` and 29 claims retired
-to [completed/claims-era1-2026-08-04.md](../.agents/completed/claims-era1-2026-08-04.md).
-Anchor backfill: 12 engine rows now cite a real `TEST_CASE`, 19 model rows cite
+Agent-record repair, triage and compaction (2026-08-04). An audit found
+the rules sound but the substrate decayed. **Cold resume** was unsound (union-merged
+appends had interleaved `.agents/state.md`), so entries below a marker carry a
+sortable anchor `scripts/check-state-order.py` proves. **Orientation** gained [.agents/NOW.md](../.agents/NOW.md), a
+100-line snapshot gated for budget and freshness. **The operating manual** had drifted from the
+checker, so both normative documents carry one machine-readable contract. **Claim state** was triaged: only DeepSeek and
+Laguna are in flight; 54 rows left `ACTIVE`, 29 claims retired to
+[completed/claims-era1-2026-08-04.md](../.agents/completed/claims-era1-2026-08-04.md).
+Anchor backfill: 12 engine rows cite a real `TEST_CASE`, 19 model rows cite
 their `REGISTER_VLLM_MODEL` line and the `CHECK(has_arch(...))` asserting them
-(15 land at `PARTIAL`; `ANCHOR-BACKFILL` cannot back a `✅`). 98 rows remain,
-needing anchors they lack. **CI gap closed:** the two DIFF-scoped gates carried
-a `cancel-in-progress` group contradicting their own comments, so two pushes had
-them cancelled and those ranges went unvalidated; groups removed. The roadmap's
-484-line chronology moved to `completed/`, `AGENTS.md` went 697 to 286 lines
-with its directives verbatim in
+(15 land `PARTIAL`). 98 rows remain, lacking anchors. **CI gap closed:** the two DIFF-scoped gates carried a
+`cancel-in-progress` group contradicting their own comments, so two pushes had
+them cancelled, leaving those ranges unvalidated. The roadmap's 484-line chronology moved to
+`completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in
 [.agents/directives.md](../.agents/directives.md), and THIS page gained a
-shrink-only size ratchet. Full detail is in `.agents/state.md`. No engine code,
-no kernel, no numbers changed.
+shrink-only ratchet. Detail is in `.agents/state.md`. An operator/helper
+protocol for concurrent sessions is ACCEPTED, unenforced
+([spec](../.agents/specs/operator-helper-protocol.md)). No engine code, no
+kernel, no numbers changed.
 
 Measured against an oracle built from source at the ACTUAL parity pin, the gap
 is 0.9970x total throughput, not the 0.9819x published against the older

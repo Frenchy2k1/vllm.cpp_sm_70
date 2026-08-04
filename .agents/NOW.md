@@ -63,6 +63,12 @@ comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
    graph — re-anchor by ledger ROW ID first. `state.md` and
    `benchmark-record.md` have no line anchors and can roll now.
 
+**Accepted 2026-08-04, not yet enforced:** the operator/helper protocol,
+[specs/operator-helper-protocol.md](specs/operator-helper-protocol.md). Roles
+derived (asked only as fallback); operator merges PRs first and drives features
+only via sub-agents; helpers work in worktrees on `row/<ROW-ID>` and open a
+DRAFT PR at the START, which IS the claim. W1-W5 guards are the work implied.
+
 ## Protocol invariants that bite most often
 
 - Every commit carries `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by:`; never
