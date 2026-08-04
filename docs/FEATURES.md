@@ -196,10 +196,8 @@ correctness-complete and speed-pending, and [BENCHMARKS.md](BENCHMARKS.md) says
 which is which.
 
 The marks track implementation and gates, not who is working on something. The
-2026-08-04 claim triage and anchor backfill moved 58 agent-record rows out of
-`ACTIVE` into `ANCHOR-BACKFILL` because nobody is flying them, and made 31 rows'
-code/test references precise. Neither changed a capability, so **no mark on this page
-moved**. The 2026-08-05 upstream device inventory likewise records gaps without
-claiming them: all 6 vLLM platforms are covered, 11 llama.cpp ggml backends have
-no row yet, and an uninventoried backend is not a supported one. A row's lifecycle state and its support mark
+2026-08-04 claim triage moved 58 agent-record rows out of `ACTIVE` because
+nobody is flying them; the 2026-08-05 device inventory put 11 llama.cpp ggml
+backends in scope as inventoried rows. Neither changed a capability, so **no
+mark on this page moved**. An inventoried backend is not a supported one. A row's lifecycle state and its support mark
 are independent: see [STATUS.md](STATUS.md).

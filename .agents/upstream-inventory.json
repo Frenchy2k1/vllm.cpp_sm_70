@@ -24,7 +24,8 @@
    "BACKEND-CUDA-SM060",
    "BACKEND-CUDA-SM061",
    "BACKEND-CUDA-SM070"
-  ]
+  ],
+  "supported_with_no_row": []
  },
  "components": {
   "machete": {
