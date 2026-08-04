@@ -101,17 +101,18 @@ Both arms NVFP4, single request, batch 1, GB10.
 | vLLM NVFP4, graphed | 43.10 | 1.00x |
 | **vllm.cpp NVFP4**, resident decode + CUDA graph | **37.55** | **0.87x** |
 
-The gap is now localized, same-tool (nsys with graph-node tracing on BOTH
-engines, 2026-08-04, superseding every earlier cross-tool attribution): the
-entire +3.1 ms/step sits in the bf16 M=1 projection GEMV bucket, two thirds of
-it o_proj (ours 204 us vs vLLM 139 us per call). It is the literally identical
-cuBLAS `gemvx` kernel in both engines; the only difference is the invocation,
-ours `cublasLtMatmul` with f32 output and no algo search, vLLM `F.linear` to
-`cublasGemmEx` with bf16 output, which selects a faster kernel template.
-Attention is tied (537 vs 527 us), MoE is within 0.3 ms, and we win the
-norm/cast glue by 0.46 ms. A gated fix that matches vLLM's bf16-output
-invocation (o_proj first) is in flight; the earlier "overlap window,
-contention-capped" explanation is superseded.
+The gap is localized, same-tool (nsys graph-node tracing on BOTH engines,
+2026-08-04): the entire +3.1 ms/step is the bf16 M=1 projection GEMV bucket,
+two thirds of it o_proj (ours ~196-204 us vs vLLM 139 us per call, the
+identical cuBLAS `gemvx` kernel). Attention is tied (537 vs 527 us), MoE is
+within 0.3 ms, and we win the norm/cast glue by 0.46 ms.
+
+Ruled out by gated same-tool A/Bs: the invocation itself (matching vLLM's
+bf16-output `cublasGemmEx` exactly leaves o_proj at ~196 us, a GPU wash and a
+host regression), stream contention, clocks, allocator pools, and the host
+gap. The open question is why the identical instantiation runs faster per call
+for vLLM; a per-shape byte audit (do our GEMV shapes match vLLM's exactly?) is
+the next probe. The earlier "overlap window" explanation is superseded.
 
 ## Memory
 
