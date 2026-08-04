@@ -152,7 +152,10 @@ MATRICES = {
     # TP-mode reduce-scatter compilation pass; TP/PP already existed, context/CP
     # rides the same abstraction and takes no row). All `SPIKE`,
     # `CLAIM-PARALLELISM-MODES-SPIKE`, spec specs/parallelism-modes.md.
-    "BACKEND": (AGENTS / "backend-matrix.md", 68),
+    # 79 since 2026-08-05: +11 BACKEND-GGML-* rows, the llama.cpp ggml
+    # backends folded into scope (user-directed). All INVENTORIED and
+    # spike-gated; inventorying is not committing.
+    "BACKEND": (AGENTS / "backend-matrix.md", 79),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -897,6 +900,8 @@ def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
         "ROAD-V1-D3",
         "ROAD-V1-D4",
         "ROAD-V1-D5",
+        # +D6 2026-08-05: llama.cpp device breadth folded into scope (user-directed).
+        "ROAD-V1-D6",
     ]
     seen: list[tuple[int, str]] = []
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):

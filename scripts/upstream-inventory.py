@@ -99,6 +99,12 @@ def below_floor(our_rows: set[str], archs: list[str]) -> list[str]:
     return out
 
 
+def missing_arch_rows(our_rows: set[str], archs: list[str]) -> list[str]:
+    """vLLM-supported arches we carry no row for."""
+    have = {int(m.group(1)) for m in (ARCH_ROW.search(r) for r in our_rows) if m}
+    return [a for a in archs if arch_key(a) not in have]
+
+
 def registry_archs(text: str) -> dict[str, int]:
     """Architecture name -> line in vLLM's registry."""
     found: dict[str, int] = {}
@@ -201,6 +207,10 @@ def build() -> dict:
             "supported": archs,
             "anchor": f"CMakeLists.txt:{arch_line}",
             "our_rows_below_floor": below_floor(our_arch_rows(), archs),
+            # Parity is bidirectional (user-directed 2026-08-05: "we want to
+            # support same arches"): a vLLM arch with no row of ours is just as
+            # much a gap as a row of ours below vLLM's floor.
+            "supported_with_no_row": missing_arch_rows(our_arch_rows(), archs),
         },
         "components": component_presence(vllm),
         "devices": device_inventory(refs),
@@ -226,6 +236,8 @@ def render(data: dict) -> str:
         f"{' '.join(data['arch_floor']['supported'])}",
         f"  our arch rows BELOW that floor: "
         f"{', '.join(data['arch_floor']['our_rows_below_floor']) or 'none'}",
+        f"  vLLM arches with NO row of ours: "
+        f"{', '.join(data['arch_floor'].get('supported_with_no_row', [])) or 'none'}",
         "  components:",
     ]
     for name, info in data["components"].items():
@@ -284,6 +296,11 @@ def main() -> int:
                 f"{data['registry']['missing_count']}")
         if stored.get("arch_floor", {}).get("supported") != data["arch_floor"]["supported"]:
             drift.append("vLLM's supported CUDA arch list changed")
+        if data["arch_floor"].get("supported_with_no_row"):
+            drift.append(
+                "vLLM supports arches we have no row for: "
+                + ", ".join(data["arch_floor"]["supported_with_no_row"])
+                + " — we track the SAME arch set as vLLM")
         for key, label in (("vllm_uncovered", "vLLM platform"),
                            ("llamacpp_uncovered", "llama.cpp backend")):
             was = stored.get("devices", {}).get(key)
