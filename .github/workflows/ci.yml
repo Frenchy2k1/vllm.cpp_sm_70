@@ -14,6 +14,15 @@ on:
 # The expensive TREE-scoped jobs carry their own job-level group instead, which
 # does collapse superseded main pushes. Net effect: a superseded push to main
 # keeps only its 2 per-commit gates and drops the other 6 jobs.
+#
+# 2026-08-04: those two jobs DID carry `ci-doc-`/`ci-commit-` groups keyed on
+# `github.ref` with `cancel-in-progress: true`, directly contradicting their own
+# comments and this one. It was not theoretical: two consecutive pushes to main
+# had their documentation-checkpoint and commit-protocol-tag cancelled by the
+# next push, so commits cdec2d10 and 0435746d's ranges went unvalidated by the
+# gates written to cover them. The groups are removed; these two jobs must never
+# regain one. They are a checkout plus a Python script, so the cost of always
+# running them is negligible against a silently skipped gate.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}-${{ github.repository }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -72,9 +81,6 @@ jobs:
           python3 scripts/check-now-current.py
           python3 tests/scripts/test_check_now_current.py
   documentation-checkpoint:
-    concurrency:
-      group: ci-doc-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.
     #
@@ -105,9 +111,6 @@ jobs:
           python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
           python3 scripts/check-now-current.py --base "$base" --head "$head"
   commit-protocol-tag:
-    concurrency:
-      group: ci-commit-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.
     #

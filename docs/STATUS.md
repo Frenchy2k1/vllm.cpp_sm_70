@@ -1213,32 +1213,32 @@ No engine code, no kernel, no measured number changed; the scoreboard carries
 the corrected ds4 (~16.5) and Laguna (~43) denominators already on main.
 
 Agent-record substrate repair and compaction (2026-08-04). An audit found the
-protocol rules sound and well enforced but the substrate decayed, and four
-things were fixed in one day. **Cold resume** was unsound: `.agents/state.md`
-promises "append, newest last" but union-merged appends from parallel worktrees
-had interleaved the tail, so entries below a one-time marker now carry a sortable
-anchor that `scripts/check-state-order.py` proves. **Orientation** had no cheap
-entry point, so [.agents/NOW.md](../.agents/NOW.md) is now a 100-line snapshot of
-live claims, current gate and next actions, gated for budget and freshness.
-**The operating manual** still demanded a README update at every checkpoint after
-that obligation moved to this page, so both normative documents now carry an
-identical machine-readable contract asserted against the checker constants.
-**Claim state** was triaged against the code: only the DeepSeek and Laguna
+protocol rules sound and well enforced but the substrate decayed. **Cold
+resume** was unsound: union-merged appends from parallel worktrees had
+interleaved `.agents/state.md`, so entries below a one-time marker now carry a
+sortable anchor that `scripts/check-state-order.py` proves. **Orientation** had
+no cheap entry point, so [.agents/NOW.md](../.agents/NOW.md) is now a 100-line
+snapshot of live claims, current gate and next actions, gated for budget and
+freshness. **The operating manual** still demanded a README update after that
+obligation moved here, so both normative documents now carry an identical
+machine-readable contract asserted against the checker constants. **Claim
+state** was triaged against the code: only the DeepSeek and Laguna
 speed-parity tracks are in flight, 28 anchor-complete rows moved to
 `ANCHOR-BACKFILL`, and 31 claims retired to
 [.agents/completed/claims-era1-2026-08-04.md](../.agents/completed/claims-era1-2026-08-04.md).
 124 rows still cannot move because every honest destination requires anchors they
-lack; that backfill is the queued work, and the root cause is that the lifecycle
-has no zero-cost parking state for a landed but unowned row. Separately the
+lack; that backfill is queued work, not a blocker. Root cause: the lifecycle has
+no zero-cost parking state for a landed but unowned row. **CI gap closed:** the
+two DIFF-scoped gates carried a `cancel-in-progress` group contradicting their
+own comments, so two consecutive main pushes had them cancelled and those commit
+ranges went unvalidated; groups removed. Separately the
 roadmap's 484-line chronology moved to `completed/`, `AGENTS.md` went from 697 to
 286 lines with its directive bodies verbatim in
 [.agents/directives.md](../.agents/directives.md) (all 600 substantive lines
-verified present), and THIS page gained a size RATCHET in
-`scripts/check-public-doc-tables.py`: it was the only public surface with no size
-gate, in the shape BENCHMARKS.md was in before its conversion, so it may now only
-shrink. A real compaction of this page is still owed. Full detail for all of it
-is in the append-only `.agents/state.md`. No engine code, no kernel, no numbers
-changed.
+verified present), and THIS page gained a size RATCHET: it was the only public
+surface with no size gate, so it may now only shrink. A real compaction is still
+owed. Full detail is in the append-only `.agents/state.md`. No engine code, no
+kernel, no numbers changed.
 
 Measured against an oracle built from source at the ACTUAL parity pin, the gap
 is 0.9970x total throughput, not the 0.9819x published against the older

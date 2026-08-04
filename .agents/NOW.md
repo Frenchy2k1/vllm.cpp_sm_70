@@ -63,6 +63,8 @@ order-0 row is still framed against v0.25.0 and predates the pin advance.
 - Mirror vLLM; do not ask the user how a feature should behave.
 - `nsys` BOTH sides before any perf claim; whole-run kernel sums mix prefill in.
 - Never weaken a checker to make a transition pass; repair the record.
+- Chain the push to the gate in ONE command (`gate && git push`); a separate
+  push line runs even when the checker before it failed. Never force-push main.
 - Verify you are not on a stale base before trusting the tree: this digest was
   first drafted against a branch 34 commits behind main, where the headline
   Laguna and DeepSeek numbers were both wrong.

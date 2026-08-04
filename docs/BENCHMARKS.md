@@ -198,9 +198,8 @@ discarded. Workload equivalence between arms is audited, not assumed: batch cap,
 token budget, context, corpus bytes, KV and SSM dtypes, kernel family, and
 graphed decode all match, and the audit is
 [recorded](../.agents/specs/benchmark-equivalence-audit-2026-07-15.md). The
-2026-08-04 agent-record substrate change (resume digest, gated state-log
-ordering, doc-obligation contract) and the claim/lifecycle triage that followed
-it touched no engine code and moved no number: NOT APPLICABLE, nothing to
+2026-08-04 agent-record substrate, triage, compaction and CI-concurrency changes
+touched no engine code and moved no number: NOT APPLICABLE, nothing to
 reproduce.
 
 **Vocabulary.** *Token-exact* means our output ids equal the reference's, byte
