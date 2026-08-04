@@ -26,11 +26,31 @@ selected by that file. Exact Ettore infrastructure paths retained in the
 environment registry or historical evidence are not commands for other
 developers.
 
-**Session handoff.** Cold-resume context for unfinished work lives in the
+**Read [`.agents/NOW.md`](.agents/NOW.md) FIRST — it is the one-Read resume
+surface.** The canonical record is large by design (evidence is never deleted),
+which made orientation expensive: the files a cold session was told to read are
+the largest in the repo. NOW.md is the fix — a ≤100-line SNAPSHOT, rewritten in
+place, of the live claims, the gate being chased, and the next actions. It is
+never a log; the detail it summarises stays in the append-only record.
+**Refresh it in the SAME change as any `.agents/state.md` append**, because a
+state append is exactly the event that moves what is live.
+`scripts/check-now-current.py` (CI-gated, with its mutation test
+`tests/scripts/test_check_now_current.py`) enforces both its budget and that
+freshness coupling; do not weaken the checker to bypass the obligation.
+
+**Session handoff.** Deeper cold-resume context for unfinished work lives in the
 newest [`.agents/state.md`](.agents/state.md) entries plus the live claim row
 in [`.agents/coordination.md`](.agents/coordination.md): active claim, exact
 source/evidence roots, prohibitions, and the first resume/verification
-commands. Append to the state log for a feature/lifecycle checkpoint, a
+commands. **The state tail is only trustworthy below the
+`<!-- state-order:enforced-below -->` marker**, where every entry carries a
+sortable `<!-- state: YYYY-MM-DD -->` anchor on the line after its heading and
+`scripts/check-state-order.py` proves the order runs oldest-to-newest. That gate
+exists because union-merging appends from parallel worktrees had silently
+interleaved the tail, so "newest last" was false and cold resume returned a
+jumble; repair an interleaved merge with
+`python3 scripts/sort-state-tail.py --apply`, never by hand.
+Append to the state log for a feature/lifecycle checkpoint, a
 material implementation decision, or unfinished work that needs a handoff.
 Routine review, Git housekeeping, and protocol discussion do not require a
 state entry. Before ending a session with work in flight, record the handoff in
@@ -128,6 +148,25 @@ NAMED in `docs/STATUS.md`, ☐ means not yet. Never mark a row ✅ because the c
 compiles, never mark a competitor ☐ to flatter a column, and keep the
 "Not supported yet" table honest, it is the reason the rest of the page is
 believable.
+
+**The obligated public surfaces, declared once.** This block is the single
+statement of what `scripts/check-doc-checkpoint.py` enforces.
+`scripts/check-protocol-consistency.py` (CI-gated, with its mutation test
+`tests/scripts/test_check_protocol_consistency.py`) asserts it equals the
+checker's constants AND appears verbatim in
+[`.agents/workflow.md`](.agents/workflow.md), the session operating manual.
+That gate exists because the obligation was migrated off `README.md` here and in
+the checker but NOT in the manual, which went on instructing agents to do the
+exact thing the migration removed — prose and gate must move together, and prose
+is what agents actually read. `README.md` is deliberately absent from the block.
+
+<!-- doc-obligation-contract:begin -->
+| Public surface | Owed by |
+|---|---|
+| `docs/STATUS.md` | every feature/iteration checkpoint |
+| `docs/BENCHMARKS.md` | every feature/iteration checkpoint |
+| `docs/FEATURES.md` | any change to a feature/model/backend/quantization surface |
+<!-- doc-obligation-contract:end -->
 
 **Keep the ROADMAP (`.agents/roadmap_v1.md`) and its AREA MATRICES CURRENT —
 same-change obligation.** The roadmap is the single top-level portfolio table;
