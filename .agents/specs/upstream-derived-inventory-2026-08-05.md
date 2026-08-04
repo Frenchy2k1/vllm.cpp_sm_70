@@ -59,24 +59,26 @@ open. Only `DEEPGEMM` needs re-scoping, since it is not vLLM code at all.
 `tensor_parallel` (16), `data_parallel` (20) all exist in `vllm/distributed` and
 `vllm/config`. None of the `BACKEND-DISTRIBUTED-*` rows is obsolete.
 
-## Finding 4 — 62 upstream architectures we never inventoried
+## Finding 4 — 43 upstream architectures we never inventoried
 
-vLLM's registry defines **362** architectures. Our model matrix names **300** of
-them, leaving **62 never inventoried at all** — a coverage gap invisible to the
+vLLM's registry defines **362** architectures. Our model matrix names **319** of
+them, leaving **43 never inventoried at all** (the first hand count said 62; the
+regex behind it missed `ForMaskedLM`/`ForRetrieval` suffixes, and W1's tooling
+corrects it) — a coverage gap invisible to the
 existing record because the record only tracks rows we created. The missing set
 is dominated by embedding/retrieval and encoder models: `BertForMaskedLM`,
 `BertForSequenceClassification`, `BertForTokenClassification`,
 `ColModernVBertForRetrieval`, `ColPaliForRetrieval`, `ColQwen3`, `ColQwen3_5`,
-and others.
+`GritLM`, `Cheers`, `Exaone4_5_MTP` and others.
 
 This is the most valuable finding: the backfill was trying to make 79 existing
-rows honest while 62 upstream architectures had no row at all.
+rows honest while 43 upstream architectures had no row at all.
 
 ## Port map
 
 1. close the three sub-floor arch rows as OUT-OF-SCOPE (mirror-vLLM);
 2. re-scope `COMP-DEEPGEMM` as an external dependency, not a vLLM component;
-3. inventory the 62 missing architectures, classified by family and by whether
+3. inventory the 43 missing architectures, classified by family and by whether
    they are generative, embedding or retrieval;
 4. leave every other open row alone — upstream proves the work is real.
 
@@ -87,10 +89,13 @@ tests per the standing directive.
 
 ## Gates
 
-The enumeration must be REPRODUCIBLE, not a one-off reading: the next step is
-`scripts/upstream-inventory.py` emitting this table from the three checkouts, so
-drift between our matrix and upstream becomes a checkable condition rather than
-an occasional audit.
+The enumeration is REPRODUCIBLE, not a one-off reading:
+`scripts/upstream-inventory.py` emits this table from the three checkouts,
+snapshots it to `.agents/upstream-inventory.json`, and CI fails when the
+uninventoried count or vLLM's supported-arch list drifts. `--check` SKIPS
+cleanly when the checkouts are absent rather than pretending to have verified
+something, because CI has no vLLM checkout and a silent pass there would be a
+lie.
 
 ## Dependencies
 
@@ -101,14 +106,14 @@ its comparison is deferred rather than guessed.
 
 | W | Item |
 |---|---|
-| W1 | `scripts/upstream-inventory.py` + mutation test: emit arch-floor, component and registry-coverage diffs from the checkouts |
+| W1 | **LANDED** `scripts/upstream-inventory.py` + 10 mutation tests; snapshot at `.agents/upstream-inventory.json`, drift-checked in CI |
 | W2 | Close the 3 sub-floor arch rows; re-scope DEEPGEMM |
-| W3 | Inventory the 62 missing architectures into `model-matrix.md` |
+| W3 | Inventory the 43 missing architectures into `model-matrix.md` |
 | W4 | Repeat the enumeration against SGLang and llama.cpp for their distinct surfaces |
 
 ## Risks/decisions
 
-- **Risk: the 62 are mostly embedding/retrieval models** we may not want in
+- **Risk: the 43 are mostly embedding/retrieval models** we may not want in
   scope. Inventorying is not committing: they land `INVENTORIED`, which claims
   nothing, and the roadmap decides.
 - **Risk: counting by grep overstates or understates.** File counts are a
