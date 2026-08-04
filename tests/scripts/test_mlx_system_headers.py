@@ -15,8 +15,50 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class MlxSystemHeadersTest(unittest.TestCase):
-    def test_dependency_module_is_shipped(self) -> None:
-        self.assertTrue((ROOT / "cmake" / "MLXDependency.cmake").is_file())
+    def test_dependency_target_marks_mlx_headers_as_system(self) -> None:
+        dependency = (ROOT / "cmake" / "MLXDependency.cmake").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("INTERFACE_SYSTEM_INCLUDE_DIRECTORIES", dependency)
+
+    def test_mlx_includes_have_source_scoped_clang_warning_suppression(self) -> None:
+        provider = (ROOT / "src" / "vt" / "metal" / "metal_mlx_provider.mm").read_text(
+            encoding="utf-8"
+        )
+        required_pragmas = (
+            "#pragma clang diagnostic push",
+            '#pragma clang diagnostic ignored "-Wgnu-folding-constant"',
+            "#pragma clang diagnostic pop",
+        )
+        for pragma in required_pragmas:
+            self.assertIn(pragma, provider)
+        self.assertEqual(provider.count("#if defined(__clang__)"), 2)
+        self.assertIn(
+            "#if defined(__clang__)\n"
+            "#pragma clang diagnostic push\n"
+            '#pragma clang diagnostic ignored "-Wgnu-folding-constant"\n'
+            "#endif\n",
+            provider,
+        )
+        self.assertIn(
+            '#include "mlx/transforms.h"\n'
+            "#if defined(__clang__)\n"
+            "#pragma clang diagnostic pop\n"
+            "#endif\n",
+            provider,
+        )
+        push = provider.index("#pragma clang diagnostic push")
+        ignored = provider.index(
+            '#pragma clang diagnostic ignored "-Wgnu-folding-constant"'
+        )
+        first_mlx_include = provider.index('#include "mlx/allocator.h"')
+        last_mlx_include = provider.index('#include "mlx/transforms.h"')
+        pop = provider.index("#pragma clang diagnostic pop")
+        first_project_include = provider.index('#include "metal_buffers.h"')
+        self.assertLess(push, ignored)
+        self.assertLess(ignored, first_mlx_include)
+        self.assertLess(last_mlx_include, pop)
+        self.assertLess(pop, first_project_include)
 
     @unittest.skipUnless(
         shutil.which("cmake") and shutil.which("clang++") and shutil.which("ar"),
