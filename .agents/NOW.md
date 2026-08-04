@@ -63,13 +63,14 @@ comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
 
 **Operator/helper protocol**
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
-into a lock or worktree+PR; operator merges PRs first, does features only via
+into a lock or worktree+PR; operator merges PRs first and does features only via
 sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
-START, which IS the claim. **W0-W5 LANDED**, all CI-gated. Enforcement OPT-IN:
-set `ROLE_DISCIPLINE_SINCE` + `--require-role`. Queue: 4 pickable rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES, not anchors.
-**Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md)):
-SM060/061/070 below vLLM's 7.5 floor = OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are
-REAL unported work; **43 of vLLM's 362 archs have no row** (`upstream-inventory.py`, drift-gated).
+START, which IS the claim. **W0-W5 LANDED**, CI-gated, enforcement OPT-IN
+(`ROLE_DISCIPLINE_SINCE` + `--require-role`). Queue: 4 rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
+**Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
+drift-gated by `upstream-inventory.py`): SM060/061/070 are below vLLM's 7.5 floor
+= OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **43 of 362 archs
+and 11 llama.cpp device backends have no row**.
 
 ## Protocol invariants that bite most often
 
@@ -80,6 +81,6 @@ REAL unported work; **43 of vLLM's 362 archs have no row** (`upstream-inventory.
 - Mirror vLLM; do not ask the user how a feature should behave.
 - `nsys` BOTH sides, SAME tool, before any perf claim; cross-tool per-kernel
   comparisons can NEVER establish invocation parity; whole-run sums mix prefill.
-- GPU box discipline: park `local-ai-worker` for the whole campaign, flock
-  `$HOME/gpu.lock`, single-load steady-state, never reload per rep, named tmux.
-- Never weaken a checker to make a transition pass; repair the record.
+- GPU box discipline: park `local-ai-worker`, flock `$HOME/gpu.lock`,
+  single-load steady-state, never reload per rep, named tmux.
+- Never weaken a checker to pass; repair the record.

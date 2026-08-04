@@ -1231,7 +1231,10 @@ Laguna are in flight; 54 rows left `ACTIVE`, 29 claims retired to
 [completed/claims-era1.md](../.agents/completed/claims-era1-2026-08-04.md).
 Anchor backfill: 12 engine rows cite a real `TEST_CASE`, 19 model rows cite
 their `REGISTER_VLLM_MODEL` line and the `CHECK(has_arch(...))` asserting them
-(15 land `PARTIAL`). 79 rows remain, 30 anchored; `upstream-inventory.py` gates it. **CI gap closed:** the two DIFF-scoped gates carried a
+(15 land `PARTIAL`). 79 rows remain, 30 anchored; `upstream-inventory.py` gates
+it. Device inventory: all 6 vLLM platforms are covered, but 11 of llama.cpp's 17
+ggml backends have no row (cann, musa, opencl, openvino, rpc, webgpu, zdnn,
+zendnn, hexagon, blas, virtgpu). **CI gap closed:** the two DIFF-scoped gates carried a
 `cancel-in-progress` group contradicting their own comments, so two pushes had
 them cancelled. The roadmap's 484-line chronology moved to
 `completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in

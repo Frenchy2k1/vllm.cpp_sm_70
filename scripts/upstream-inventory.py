@@ -140,6 +140,46 @@ def component_presence(vllm: Path) -> dict[str, dict]:
     return out
 
 
+# Device/platform surfaces. vLLM is the mirror source; llama.cpp is the breadth
+# reference and exposes far more backends than vLLM has platforms, so its list is
+# where uninventoried DEVICES show up.
+OUR_DEVICE_ALIASES = {
+    "cuda": "BACKEND-CUDA", "rocm": "BACKEND-ROCM", "hip": "BACKEND-ROCM",
+    "metal": "BACKEND-METAL", "vulkan": "BACKEND-VULKAN", "sycl": "BACKEND-XPU",
+    "xpu": "BACKEND-XPU", "cpu": "BACKEND-CPU", "zen_cpu": "BACKEND-CPU-ZEN",
+    "tpu": "BACKEND-TPU",
+}
+
+
+def device_inventory(refs: dict) -> dict:
+    vllm_platforms, llama_backends, sglang_platforms = [], [], []
+    if "vllm" in refs:
+        vllm_platforms = sorted(
+            p.stem for p in (refs["vllm"] / "vllm/platforms").glob("*.py")
+            if p.stem not in ("__init__", "interface"))
+    if "llamacpp" in refs:
+        llama_backends = sorted(
+            d.name.replace("ggml-", "")
+            for d in (refs["llamacpp"] / "ggml/src").glob("ggml-*") if d.is_dir())
+    if "sglang" in refs:
+        sglang_platforms = sorted(
+            p.stem for p in (refs["sglang"] / "python/sglang/srt/platforms").glob("*.py")
+            if p.stem != "__init__")
+
+    ours = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+    def covered(name: str) -> bool:
+        row = OUR_DEVICE_ALIASES.get(name)
+        return bool(row and row in ours) or f"BACKEND-{name.upper()}" in ours
+
+    return {
+        "vllm_platforms": vllm_platforms,
+        "vllm_uncovered": [d for d in vllm_platforms if not covered(d)],
+        "llamacpp_backends": llama_backends,
+        "llamacpp_uncovered": [d for d in llama_backends if not covered(d)],
+        "sglang_platforms": sglang_platforms,
+    }
+
+
 def build() -> dict:
     refs = references_available()
     if "vllm" not in refs:
@@ -163,6 +203,7 @@ def build() -> dict:
             "our_rows_below_floor": below_floor(our_arch_rows(), archs),
         },
         "components": component_presence(vllm),
+        "devices": device_inventory(refs),
         "registry": {
             "upstream_total": len(registry),
             "named_by_us": len(set(registry) & ours),
@@ -190,6 +231,14 @@ def render(data: dict) -> str:
     for name, info in data["components"].items():
         verdict = "NOT in vLLM (external dep)" if info["files"] == 0 else "real, unported"
         lines.append(f"    {name:16} files={info['files']:<4} {verdict}")
+    dev = data.get("devices", {})
+    if dev:
+        lines += [
+            f"  devices: vLLM platforms {len(dev['vllm_platforms'])} "
+            f"(uncovered: {', '.join(dev['vllm_uncovered']) or 'none'})",
+            f"           llama.cpp backends {len(dev['llamacpp_backends'])} "
+            f"(uncovered: {', '.join(dev['llamacpp_uncovered']) or 'none'})",
+        ]
     reg = data["registry"]
     lines += [
         f"  registry: {reg['upstream_total']} upstream archs, "
@@ -235,6 +284,12 @@ def main() -> int:
                 f"{data['registry']['missing_count']}")
         if stored.get("arch_floor", {}).get("supported") != data["arch_floor"]["supported"]:
             drift.append("vLLM's supported CUDA arch list changed")
+        for key, label in (("vllm_uncovered", "vLLM platform"),
+                           ("llamacpp_uncovered", "llama.cpp backend")):
+            was = stored.get("devices", {}).get(key)
+            now = data.get("devices", {}).get(key)
+            if was is not None and was != now:
+                drift.append(f"uninventoried {label}s moved {was} -> {now}")
         if drift:
             for item in drift:
                 print(f"ERROR: {item}", file=sys.stderr)
