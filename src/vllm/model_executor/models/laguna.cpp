@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,49 @@ inline int64_t LagunaKvHeadroom() {
     return (v > 0) ? static_cast<int64_t>(v) : static_cast<int64_t>(1024);
   }();
   return rows;
+}
+
+// ── VT_LAGUNA_RESIDENT_BF16W (default OFF): stage the bf16/f32 decode projection
+// weights TRUE device-resident (a cudaMalloc'd copy, uploaded ONCE and reused every
+// step) instead of the unified-memory RETAG of the host bytes (w.View() +
+// .device=dev). On GB10 the GPU reads system-allocated (ATS/unified) memory slower
+// than cudaMalloc'd device memory — worst on the long-K low-parallelism o_proj GEMV
+// — so the retagged host weight caps per-call GEMV bandwidth below vLLM's (whose
+// weights are true device allocations). SAME bytes, SAME MatmulBT kernel, SAME
+// invocation ⇒ byte-exact by construction. Mirrors the canonical
+// dense_attn_block.h ResidentWeight d_dev seam and reuses OwnedTensor's existing
+// mutable d_dev cache. CAPTURE-SAFE: the first touch of each weight happens in the
+// eager cold warm-run (LagunaGraph gstate 0, before any BeginCapture — the same
+// place the Marlin residents build lazily), so the captured replay reads a stable
+// device pointer and does ZERO fresh cudaMalloc.
+inline bool LagunaResidentBf16WEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_RESIDENT_BF16W");
+    return (e != nullptr && e[0] == '1');  // default OFF; =1 opts in
+  }();
+  return on;
+}
+
+// Device operand for a bf16/f32 projection weight consumed by a decode GEMV.
+// Lever ON: lazily upload w.bytes → w.d_dev (cudaMalloc + one H2D copy) and return
+// a view over the DEVICE copy. Lever OFF: the legacy unified-memory retag (host
+// bytes, device-tagged). The operand is byte-identical either way — only the
+// backing allocation (true-device vs system) differs. Starts from w.View() so the
+// shape/stride/nk/repack metadata is exactly the retag path's; only .data changes.
+inline vt::Tensor LagunaResidentBf16W(vt::Queue& q, const OwnedTensor& w, vt::Device dev) {
+  vt::Tensor t = w.View();
+  t.device = dev;
+  if (!LagunaResidentBf16WEnabled()) return t;  // legacy unified-memory retag (byte-identical)
+  if (!w.d_dev) {
+    vt::Backend& b = vt::GetBackend(dev);
+    const size_t nb = w.bytes.size();
+    void* p = b.Alloc(nb);
+    b.Copy(q, p, w.bytes.data(), nb);
+    vt::Backend* bk = &b;
+    w.d_dev = std::shared_ptr<void>(p, [bk](void* pp) { bk->Free(pp); });
+  }
+  t.data = w.d_dev.get();
+  return t;
 }
 
 // Decode an OwnedTensor (host bytes) to a flat f32 vector. Reference path handles
@@ -1896,8 +1940,7 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     vt::Tensor ab = vt::Tensor::Contiguous(abf.data(), DType::kBF16, dev, {1, K});
     vt::CastBf16(q, ab, xf);
     vt::Tensor ot = vt::Tensor::Contiguous(out, DType::kF32, dev, {1, N});
-    vt::Tensor wt = w.View();
-    wt.device = dev;
+    vt::Tensor wt = LagunaResidentBf16W(q, w, dev);  // VT_LAGUNA_RESIDENT_BF16W: device copy vs retag
     vt::MatmulBT(q, ot, ab, wt);
   };
 
@@ -2329,8 +2372,7 @@ struct LagunaGraph {
     vt::Tensor ab = vt::Tensor::Contiguous(abf.data(), vt::DType::kBF16, dev, {1, K});
     vt::CastBf16(q, ab, xf);
     vt::Tensor ot = vt::Tensor::Contiguous(out, vt::DType::kF32, dev, {1, N});
-    vt::Tensor wv = wt.View();
-    wv.device = dev;
+    vt::Tensor wv = LagunaResidentBf16W(q, wt, dev);  // VT_LAGUNA_RESIDENT_BF16W
     vt::MatmulBT(q, ot, ab, wv);
   }
 
@@ -2350,8 +2392,7 @@ struct LagunaGraph {
     vt::Queue& q = *qp;
     vt::Tensor ab = vt::Tensor::Contiguous(hn_bf16.data(), vt::DType::kBF16, dev, {1, K});
     vt::Tensor ot = vt::Tensor::Contiguous(out, vt::DType::kF32, dev, {1, N});
-    vt::Tensor wv = wt.View();
-    wv.device = dev;
+    vt::Tensor wv = LagunaResidentBf16W(q, wt, dev);  // VT_LAGUNA_RESIDENT_BF16W
     vt::MatmulBT(q, ot, ab, wv);
   }
 
@@ -2582,10 +2623,12 @@ struct LagunaGraph {
     if (!glue_fused)  // L4: fused path already produced hn=norm(hidden,final_norm) in the
                       // last layer's Pair-2 tail (next_norm==final_norm_f when l+1==nlayers)
       LAG->rms_norm_seq(q, hn.data(), hidden.data(), final_norm_f.data(), 1, H, eps, true);
-    if (w->lm_head.dtype == vt::DType::kBF16)
-      LAG->lm_head_gemv(q, logits.data(),
-                        reinterpret_cast<const void*>(w->lm_head.bytes.data()), hn.data(), Vsz, H);
-    else
+    if (w->lm_head.dtype == vt::DType::kBF16) {
+      // VT_LAGUNA_RESIDENT_BF16W: stream the ~616 MB lm_head from a true device copy
+      // (uploaded once in the gstate-0 warm-run) instead of the unified host bytes.
+      vt::Tensor lmw = LagunaResidentBf16W(q, w->lm_head, dev);
+      LAG->lm_head_gemv(q, logits.data(), lmw.data, hn.data(), Vsz, H);
+    } else
       GemmBf16(logits.data(), w->lm_head, hn.data(), Vsz, H);
     // VT_LAGUNA_ONDEV_SAMPLE: greedy argmax the logits ON-DEVICE into argmax_id (the next
     // step's input token). vt::GreedyArgmax uses a two-pass reduction with a LOWEST-index

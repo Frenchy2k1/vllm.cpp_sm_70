@@ -11422,3 +11422,40 @@ steady-state per-step / nsys decode tok/s (eager vs graphed) is OWED.
   code. The binding evidence is the AppleClang `-Werror,-Wunknown-warning-option`
   consumer failure and the compiler-boundary regression gate; no speed number
   is owed.
+
+<!-- laguna-resident-bf16w (2026-08-04) -->
+- **Laguna-XS-2.1-NVFP4 decode — `VT_LAGUNA_RESIDENT_BF16W` A/B: ROOT-CAUSE
+  CONFIRMED, closes the whole gap, byte-exact.** GB10, same binary, prod decode
+  config (`VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1
+  VT_LAGUNA_DECODE_GRAPH=1`), prompt `2,785,9626,377,15360,395`, 256 tokens,
+  drop_caches, worker parked, flock, median-of-3. **OFF 38.81/38.78/38.85 → ON
+  44.55/44.31/44.60 tok/s (+14.8%)**; generated ids **IDENTICAL** OFF vs ON
+  (byte-exact by construction — same bytes, same `MatmulBT`/`lm_head_gemv`
+  kernel, only the weight's backing allocation changes). Scaling the pinned
+  37.55 baseline by the same ratio → 43.1 = vLLM 43.10 = parity (measured ON
+  44.6 ≈ 103%). nsys `--cuda-graph-trace=node`, per-shape gemvx avg (128-tok):
+  **o_proj 193.5→131.4 us** (predicted →142; ≈168→249 GB/s), **qkv
+  245.1→225.3 us** (predicted →226), **`LmHeadGemvKernel` 2410→1620 us/call**;
+  every bf16 GEMV shape dropped. MECHANISM: `GemmBf16Into`/`GemmBf16`/`GemmBf16Pre`
+  and the graph `lm_head_gemv` read the bf16 projection weights from UNIFIED/ATS
+  host memory (`w.View(); .device=dev` retag — no `cudaMalloc` staging); GB10 GPU
+  reads of system-allocated memory are bandwidth-capped below true device memory,
+  worst on long-K low-parallelism o_proj (1.5x) vs qkv (1.09x). The lever routes
+  each projection through the canonical `dense_attn_block.h::ResidentWeight` d_dev
+  seam (cudaMalloc + one H2D copy, uploaded once in the gstate-0 eager warm-run →
+  capture-safe, zero fresh cudaMalloc in the replay). Peak host RSS unchanged
+  (40.66 GB both arms — device/unified allocs are not counted in `ru_maxrss`); the
+  ~2.6 GB bf16 device copies sit in the 119 GB unified pool with large headroom,
+  no OOM. VERDICT: weight residency IS the remaining Laguna decode lever;
+  default-OFF gate landed, recommend default-ON flip (per
+  parity-enablers-ship-as-defaults). Supersedes the "open = why the identical
+  gemvx instantiation is slower per call for vLLM" question and the earlier
+  bf16-out-`cublasGemmEx`-WASH framing: the invocation was never the cause, the
+  weight's memory RESIDENCY was.
+- Relocated from docs/STATUS.md (ratchet compaction, same change): the Laguna
+  N1b loader RUN-VERIFICATION detail — `test_laguna_nvfp4_loader` 2/2·29, a
+  synthetic 2-layer NVFP4 checkpoint (L0 dense, L1 MoE 2 W4A4 experts) round-trips
+  byte-identically through `LoadLagunaForCausalLMWeights` (BF16 weights, expert
+  packed/scale byte-identical + `scale2`/`alpha` math + per-expert indexing
+  distinct, F32 bias, shared-expert BF16; RED-first missing-tensor throws);
+  `test_laguna_scaffold` 8/8·167 unchanged (2026-07-31).
