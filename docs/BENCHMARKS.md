@@ -23,7 +23,7 @@ see [docs/FEATURES.md](FEATURES.md).
 | **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | prefill **1.18x ahead**, decode tie, memory parity | byte-identical |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
-| **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **parity**, 0.997x (16.28 vs 16.33 tok/s) | n/a, GGUF peer |
+| **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | default **parity 0.997x**; **1.144x with `VT_V4_RESIDENT_W`** (18.69 vs 16.33, byte-exact, default-OFF) | n/a, GGUF peer |
 
 Reading the ratios: throughput is ours/reference, latency is reference/ours, so
 **1.0 or higher is a win** everywhere on this page.
@@ -177,17 +177,29 @@ Sparks with TP2 and is owed.
 | Engine | Quant | Decode tok/s | Ratio |
 |---|---|---:|---:|
 | DwarfStar (`ds4`) | IQ2_XXS mixed | 16.33 | 1.00x |
-| **vllm.cpp** | same GGUF | **16.28** | **0.997x, parity** |
+| **vllm.cpp** (default) | same GGUF | **16.28** | **0.997x, parity** |
+| **vllm.cpp** + `VT_V4_RESIDENT_W` (default-OFF, recommend-flip) | same GGUF | **18.69** | **1.144x, byte-exact** |
 
-Parity, measured same-session clean (2026-08-04, single-load steady both arms);
-the earlier 15.87/96% and 17.13 figures are superseded. The structure behind
-the tie is real and asymmetric: an nsys trace of both engines shows ds4 does
-about 1.8x less GPU work per token but is host-launch-bound at 57% GPU-busy
-(it graphs only prefill), while we do more GPU work at 97% busy because our
-decode runs as one captured CUDA graph. The old "Q8_0 weight-stream floor"
-framing is corrected: our int8 GEMV is at per-launch parity with ds4's; ds4's
-lighter step comes from routing its small DSA/router/output tensors through f16
-tensor cores, an optional beat-path for us (near-tie class), not a deficit.
+The default arm is parity, measured same-session clean (2026-08-04, single-load
+steady both arms); the earlier 15.87/96% and 17.13 figures are superseded.
+
+Weight residency is the beat-path (2026-08-05, `VT_V4_RESIDENT_W`, default-OFF).
+The dense Q8_0 MLA/shared-expert/lm_head projection tower is read from the GGUF
+mmap over ATS/unified memory, which the GB10 GPU reads about 20% slower per-GEMV
+than `cudaMalloc`'d device memory. Staging that ~6 GiB tower device-resident once
+at load (same bytes, same kernel, same invocation) lifts decode 16.23 to 18.69
+(median-of-3, drop_caches), generated ids byte-identical. It is the same lever
+that took Laguna to vLLM parity+ (`VT_LAGUNA_RESIDENT_BF16W`).
+
+PEAK RESIDENT is flat at 86.68 GiB in both arms: the staged copy is additive but
+the clean mmap file pages evict under the unified pool, so net usage does not
+grow. An nsys A/B (identical instance counts) confirms the mechanism is
+residency-bound, not latency-bound: per-launch time drops about 20% on every
+dense Q8_0 kernel (`QuantDotGemmQ8_0Kernel` 184 to 147 µs, `Q8_0GroupDiagKernel`
+212 to 166 µs, `Q8_0PairKernel` 74 to 60 µs). This corrects the earlier
+"per-launch GEMV parity / Q8_0 weight-stream floor" framing: our GEMV was
+ATS-bound, not at ds4 parity. The routed-expert slabs (the ~70 GiB bulk) are not
+yet staged; that is the Phase-2 surface, blocked on per-tensor mmap reclaim.
 
 ## Speculative decoding
 
