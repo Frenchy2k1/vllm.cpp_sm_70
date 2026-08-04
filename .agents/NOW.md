@@ -70,7 +70,7 @@ first and does features only via sub-agents; helpers work in worktrees on
 `ready-for-helper.py`, PR template + size cap, docs folded), all CI-gated.
 Enforcement is still OPT-IN: set `ROLE_DISCIPLINE_SINCE` to the cutover commit
 and use `agent-preflight.sh --require-role` to make it binding. Queue today: 4
-pickable rows. Backfill: 94 rows still `SPIKE`/`ACTIVE`.
+pickable rows. Backfill: 79 non-live rows still `SPIKE`/`ACTIVE`, 30 fully anchored.
 
 ## Protocol invariants that bite most often
 
