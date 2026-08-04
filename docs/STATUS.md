@@ -1231,7 +1231,7 @@ Laguna are in flight; 54 rows left `ACTIVE`, 29 claims retired to
 [completed/claims-era1.md](../.agents/completed/claims-era1-2026-08-04.md).
 Anchor backfill: 12 engine rows cite a real `TEST_CASE`, 19 model rows cite
 their `REGISTER_VLLM_MODEL` line and the `CHECK(has_arch(...))` asserting them
-(15 land `PARTIAL`). 98 rows remain, lacking anchors. **CI gap closed:** the two DIFF-scoped gates carried a
+(15 land `PARTIAL`). 94 rows remain, lacking anchors. **CI gap closed:** the two DIFF-scoped gates carried a
 `cancel-in-progress` group contradicting their own comments, so two pushes had
 them cancelled, leaving those ranges unvalidated. The roadmap's 484-line chronology moved to
 `completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in
