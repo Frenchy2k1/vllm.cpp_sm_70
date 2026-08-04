@@ -199,10 +199,10 @@ checker.
 |---|---|---|
 | W0 | **LANDED** `scripts/agent-role.py` — role machinery: `.agents/operator.lock` (create-exclusive + TTL + heartbeat), session-scoped role marker, and role resolution printed by `agent-preflight.sh`, which FAILS when a session has not declared one | mutation test |
 | W1 | **LANDED (report-only)** `check-role-discipline.py`: a commit on `main` touching feature paths must arrive via a merged `row/*` PR, not a direct push | mutation test |
-| W2 | Generated claim view from GitHub PR state; `coordination.md` becomes a report | mutation test + a run against live PRs |
-| W3 | `check-ready-for-helper.py`: the pickable queue, asserting the 5 conditions | mutation test |
-| W4 | PR template carrying the evidence block + size cap | CI |
-| W5 | Fold the accepted protocol into `AGENTS.md` T0 and `.agents/workflow.md`, with the contract block kept consistent | `check-protocol-consistency.py` |
+| W2 | **LANDED** `scripts/claim-view.py` — generated claim view from PR state (`--apply` online, `--check` offline, 14-day TTL) | mutation test + a run against live PRs |
+| W3 | **LANDED** `scripts/ready-for-helper.py` — the pickable queue asserting the 5 conditions | mutation test |
+| W4 | **LANDED** `.github/pull_request_template.md` + `scripts/check-pr-size.py` (enforced on `row/*` PRs, reported otherwise) | CI |
+| W5 | **LANDED** folded into `AGENTS.md` T0 and `.agents/workflow.md` step 0 | `check-protocol-consistency.py` |
 
 W1 is the enforcement mechanism for "operator does features only via
 sub-agents": it does not attempt to detect who typed the code, it makes the

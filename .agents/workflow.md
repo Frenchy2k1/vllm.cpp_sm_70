@@ -5,6 +5,12 @@ and continue. Follow this protocol every session.
 
 ## Session protocol
 
+0. **Declare your role** before anything else, if this session has not already:
+   `scripts/agent-role.py show` (exit 3 = undeclared), then
+   `claim operator` or `claim helper --row <ROW-ID>`. Helpers then create their
+   worktree, `row/<ROW-ID>` branch and DRAFT PR immediately — the draft PR is
+   the claim. `scripts/ready-for-helper.py` lists what a helper may pick. Full
+   protocol: [specs/operator-helper-protocol.md](specs/operator-helper-protocol.md).
 1. **Orient**: read [NOW.md](NOW.md) FIRST — it is the one-Read resume surface
    (live claims, current gate, next actions) and is rewritten in place every
    checkpoint. The state tail is trustworthy only below the

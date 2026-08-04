@@ -92,6 +92,21 @@ version, this list is the reminder.
 - **Run `scripts/agent-preflight.sh`** at session start and before committing,
   and chain the push to it (`gate && git push`) so a red gate cannot be followed
   by a green push.
+- **Know your ROLE before you work.** Operator or helper
+  ([protocol](.agents/specs/operator-helper-protocol.md)). It cannot be derived
+  at session start — several sessions launch from one checkout — so DECLARE it
+  (`scripts/agent-role.py claim operator|helper --row <ROW-ID>`), which
+  materializes it into an exclusive lock or a worktree+PR, after which it is
+  re-derived rather than remembered. A helper works in an isolated worktree on
+  `row/<ROW-ID>` and opens a DRAFT PR at the START: that PR **is** the claim.
+  The operator merges PRs first thing, owns `main` and the GPU, and drives
+  feature work through sub-agents rather than writing it.
+- **Never three-way merge a keyed record.** `docs/STATUS.md`,
+  `docs/BENCHMARKS.md`, `docs/FEATURES.md`, `.agents/NOW.md`, the matrices and
+  `coordination.md` are merged by taking `main`'s version wholesale, re-applying
+  your edit, and verifying the other side is byte-identical. A three-way merge
+  silently produced a VARIANT of another session's binding numbers on
+  2026-08-04 — no conflict, no marker. Union-append only the append-only logs.
 
 **Session handoff.** Deeper cold-resume context for unfinished work lives in the
 newest [`.agents/state.md`](.agents/state.md) entries plus the live claim row

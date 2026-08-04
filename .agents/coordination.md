@@ -1557,6 +1557,19 @@ items a-runner/b stay with the async/GDN `runner.cpp` owners.
 | `CLAIM-DSV4-GGUF-LOADER` | `QUANT-GGUF-IQ2_XXS` (INVENTORIED→ACTIVE), `QUANT-GGUF-Q2_K` (INVENTORIED→ACTIVE); cross-refs `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` (stays `SPIKE`, owned by `CLAIM-DEEPSEEK-V4-IMPL`) | Claude Code (opus-4-8) | isolated worktree `.claude/worktrees/gguf-iquant-dsv4` (CPU-only `build-cpu` `-DVLLM_CPP_CUDA=OFF`; NO GPU, NO 90 GB download — the dequant unit gate uses known packed bytes; the GGUF header was HTTP-range-read, no download) | branch `feat/gguf-iquant-dsv4`, base `main` `4d1be010` (confirmed via `git rev-parse HEAD`) | GGUF IQ2_XXS + Q2_K dequant, the DeepSeek-V4-Flash single-Spark GGUF quant-path brick (W1). Owns ONLY the GGUF/quant PATH (NOT the forward — the forward TUs stay owned by `CLAIM-DEEPSEEK-V4-*`): the two `dequantize_row_*` decoders + grid/sign tables in `src/vt/cpu/cpu_quant_dequant.cpp`; the `kQ2_K`/`kIQ2_XXS` vt block dtype registration in `src/vt/dtype.{h,cpp}` + `src/vt/ops.cpp`; the id-16 reader trait in `gguf_reader.cpp` + ids-10/16 dispatch in `gguf_dequant.cpp`; `tests/vllm/test_gguf_dequant.cpp` + `tests/vt/test_ops_quant_traits.cpp`; the two `QUANT-GGUF-*` rows; NEW `.agents/specs/gguf-iquant-dsv4.md`; the V4 GGUF-loadable note on the model-matrix V4 row (row stays SPIKE); the record surfaces. **NON-COLLISION:** additive within the existing GGUF dequant switch + vt block table — does NOT touch any DeepSeek-V4 forward TU (`deepseek_v4.{cpp,h}`/`_dsa`/`_weights`), README, or Metal; the k-quant/NVFP4 decoders are byte-unchanged. | `ACTIVE` | 2026-07-29 — **W1 LANDED + CPU-GATED (foreground, NOT pushed).** IQ2_XXS (id 16, codebook `iq2xxs_grid`+signs+4-bit scale) + Q2_K (id 10, nibble sub-scale/min) ported 1:1 from llama.cpp `ggml-quants.c` `237ad9b96`; both DEQUANT-ONLY (no vec_dot ⇒ route to expand-bf16). `test_gguf_dequant` **15/15·480** (hand-derived literals: IQ2_XXS grid[1] byte0=0x2b→5.375, ksigns[1] flips j=0,7→±3.0, db 0.125/0.375; Q2_K 5.75/-0.25/2.5/0.25) + `test_ops_quant_traits` **9/9·5643** (dequant-only contract). All 7 changed TUs clean under full `-Werror`; the `voxtral.cpp` GCC-13 `-Werror=array-bounds` FP PROVEN pre-existing (fails at base with this diff's `dtype.h` reverted), neutralized only to link the test binaries. **W2 (V4-GGUF loader) DERIVED not landed:** HTTP-range-read the real `UD-IQ2_XXS` header — `general.architecture=deepseek4`, `general.file_type=19` (=IQ2_XXS), `split.tensors.count=1328`, full `deepseek4.*` config-KV schema; the tensor NAME manifest is beyond the CDN range cap + uncached ⇒ the V4 registry GGUF reject STAYS. Residuals: V4 forward (W3-W8, multi-Spark) + the V4-GGUF name map (W2, manifest-blocked) + a vec_dot perf leaf. |
 
 
+<!-- claim-view:begin -->
+<!-- claim-view:generated 2026-08-04 -->
+
+GENERATED from open pull requests by `scripts/claim-view.py --apply`.
+Do not hand-edit: an open `row/<ROW-ID>` PR IS the reservation, and it
+is released by merging or closing it.
+
+| Row | PR | State | Agent | Updated |
+|---|---|---|---|---|
+| _none_ | | | | |
+
+<!-- claim-view:end -->
+
 ## Handoff queue
 
 | Priority | Row/block | Dependency | Next handoff | State |
