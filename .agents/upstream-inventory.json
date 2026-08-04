@@ -60,6 +60,56 @@
    "anchor": "csrc/libtorch_stable/attention/mla:1"
   }
  },
+ "devices": {
+  "vllm_platforms": [
+   "cpu",
+   "cuda",
+   "rocm",
+   "tpu",
+   "xpu",
+   "zen_cpu"
+  ],
+  "vllm_uncovered": [],
+  "llamacpp_backends": [
+   "blas",
+   "cann",
+   "cpu",
+   "cuda",
+   "hexagon",
+   "hip",
+   "metal",
+   "musa",
+   "opencl",
+   "openvino",
+   "rpc",
+   "sycl",
+   "virtgpu",
+   "vulkan",
+   "webgpu",
+   "zdnn",
+   "zendnn"
+  ],
+  "llamacpp_uncovered": [
+   "blas",
+   "cann",
+   "hexagon",
+   "musa",
+   "opencl",
+   "openvino",
+   "rpc",
+   "virtgpu",
+   "webgpu",
+   "zdnn",
+   "zendnn"
+  ],
+  "sglang_platforms": [
+   "cpu",
+   "cuda",
+   "device_mixin",
+   "interface",
+   "rocm"
+  ]
+ },
  "registry": {
   "upstream_total": 362,
   "named_by_us": 319,
