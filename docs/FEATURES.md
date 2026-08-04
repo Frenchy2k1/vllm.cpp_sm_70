@@ -196,7 +196,7 @@ correctness-complete and speed-pending, and [BENCHMARKS.md](BENCHMARKS.md) says
 which is which.
 
 The marks track implementation and gates, not who is working on something. The
-2026-08-04 claim triage and anchor backfill moved 54 agent-record rows out of
+2026-08-04 claim triage and anchor backfill moved 58 agent-record rows out of
 `ACTIVE` into `ANCHOR-BACKFILL` because nobody is flying them, and made 31 rows'
 code/test references precise. Neither changed a capability, so **no mark on this page
 moved**. A row's lifecycle state and its support mark
