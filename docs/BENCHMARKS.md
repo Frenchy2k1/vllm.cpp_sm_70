@@ -20,10 +20,10 @@ see [docs/FEATURES.md](FEATURES.md).
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | ahead at c16/c32, behind at c1 to c8 | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
-| **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | 88% of vLLM (37.9 vs 43 tok/s) | near-tie |
+| **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | 87% of vLLM (37.6 vs 43.1 tok/s), gap localized to the bf16 GEMV invocation | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | prefill **1.18x ahead**, decode tie, memory parity | byte-identical |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
-| **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | 96% of ds4 (15.87 vs ~16.5 tok/s) | n/a, GGUF peer |
+| **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **parity**, 0.997x (16.28 vs 16.33 tok/s) | n/a, GGUF peer |
 
 Reading the ratios: throughput is ours/reference, latency is reference/ours, so
 **1.0 or higher is a win** everywhere on this page.
@@ -98,15 +98,20 @@ Both arms NVFP4, single request, batch 1, GB10.
 
 | Arm | Decode tok/s | Ratio |
 |---|---:|---:|
-| vLLM NVFP4, graphed | ~43 | 1.00x |
-| **vllm.cpp NVFP4**, resident decode + CUDA graph | **37.9** | **0.88x** |
+| vLLM NVFP4, graphed | 43.10 | 1.00x |
+| **vllm.cpp NVFP4**, resident decode + CUDA graph | **37.55** | **0.87x** |
 
-The residual is measured, not guessed, and it is not a kernel we run that vLLM
-does not: per step, cuBLAS `gemvx` bf16 projection GEMVs are 69.3% of decode and
-the fp4 Marlin grouped GEMM is 14.7%, both the same kernels vLLM uses. The gap
-is the missing shared-expert overlap window, now partially recovered by the
-two-stream early fork, with the remainder capped by GB10 unified-LPDDR
-contention between the concurrent GEMVs.
+The gap is now localized, same-tool (nsys with graph-node tracing on BOTH
+engines, 2026-08-04, superseding every earlier cross-tool attribution): the
+entire +3.1 ms/step sits in the bf16 M=1 projection GEMV bucket, two thirds of
+it o_proj (ours 204 us vs vLLM 139 us per call). It is the literally identical
+cuBLAS `gemvx` kernel in both engines; the only difference is the invocation,
+ours `cublasLtMatmul` with f32 output and no algo search, vLLM `F.linear` to
+`cublasGemmEx` with bf16 output, which selects a faster kernel template.
+Attention is tied (537 vs 527 us), MoE is within 0.3 ms, and we win the
+norm/cast glue by 0.46 ms. A gated fix that matches vLLM's bf16-output
+invocation (o_proj first) is in flight; the earlier "overlap window,
+contention-capped" explanation is superseded.
 
 ## Memory
 
@@ -164,14 +169,18 @@ Sparks with TP2 and is owed.
 
 | Engine | Quant | Decode tok/s | Ratio |
 |---|---|---:|---:|
-| DwarfStar (`ds4`) | IQ2_XXS mixed | ~16.5 | 1.00x |
-| **vllm.cpp** | same GGUF | **15.87** | **0.96x** |
+| DwarfStar (`ds4`) | IQ2_XXS mixed | 16.33 | 1.00x |
+| **vllm.cpp** | same GGUF | **16.28** | **0.997x, parity** |
 
-We are about 4% behind, not at or above. The denominator is ds4's same-session
-steady bar; an earlier 17.13 figure was an unreproduced variance peak, and every
-ratio here was recomputed against the fair bar without any measured tok/s
-changing. The residual is the Q8_0 projection-GEMV weight-stream floor, with
-seven levers already proven flat against it.
+Parity, measured same-session clean (2026-08-04, single-load steady both arms);
+the earlier 15.87/96% and 17.13 figures are superseded. The structure behind
+the tie is real and asymmetric: an nsys trace of both engines shows ds4 does
+about 1.8x less GPU work per token but is host-launch-bound at 57% GPU-busy
+(it graphs only prefill), while we do more GPU work at 97% busy because our
+decode runs as one captured CUDA graph. The old "Q8_0 weight-stream floor"
+framing is corrected: our int8 GEMV is at per-launch parity with ds4's; ds4's
+lighter step comes from routing its small DSA/router/output tensors through f16
+tensor cores, an optional beat-path for us (near-tie class), not a deficit.
 
 ## Speculative decoding
 
@@ -218,8 +227,8 @@ built on it rather than keeping the flattering one.
 | 35B prefill TTFT | 0.79x to 0.86x at every concurrency | Portable fusion of the norm/quant/act/combine glue |
 | 35B low-batch MoE decode | c1 TPOT 0.73x, wins by c16 | Attribute and close the batch-1 grouped GEMM |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
-| Laguna-XS NVFP4 | 88% of vLLM | Remaining overlap window, bandwidth-contention-capped |
-| DeepSeek-V4-Flash | 96% of ds4, about 4% behind | Q8_0 projection-GEMV weight-stream floor |
+| Laguna-XS NVFP4 | 87% of vLLM, gap localized same-tool to the bf16 GEMV invocation (f32-out vs vLLM's bf16-out `gemvx`) | Gated bf16-output invocation A/B, o_proj first |
+| DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
 | DFlash speculative decode | Below vLLM throughput | bf16 acceptance floor ~0.85x |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
