@@ -1237,7 +1237,7 @@ them cancelled, leaving those ranges unvalidated. The roadmap's 484-line chronol
 `completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in
 [.agents/directives.md](../.agents/directives.md), and THIS page gained a
 shrink-only ratchet. Detail is in `.agents/state.md`. An operator/helper
-protocol is ACCEPTED, unenforced; roles are DECLARED then locked
+protocol is ACCEPTED; W0 roles + W1 discipline LANDED, reporting
 ([spec](../.agents/specs/operator-helper-protocol.md)). No engine code, no
 kernel, no numbers changed.
 

@@ -84,6 +84,10 @@ jobs:
         run: |
           python3 scripts/check-now-current.py
           python3 tests/scripts/test_check_now_current.py
+      - name: Agent role machinery and role discipline
+        run: |
+          python3 scripts/check-role-discipline.py
+          python3 tests/scripts/test_agent_role.py
   documentation-checkpoint:
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.
@@ -114,6 +118,7 @@ jobs:
           fi
           python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
           python3 scripts/check-now-current.py --base "$base" --head "$head"
+          python3 scripts/check-role-discipline.py --base "$base" --head "$head"
   commit-protocol-tag:
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.
