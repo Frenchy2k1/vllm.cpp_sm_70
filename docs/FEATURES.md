@@ -194,3 +194,9 @@ code compiles, and we do not mark a competitor ☐ to flatter a column.
 Feature parity is not the same as speed parity. Most architectures here are
 correctness-complete and speed-pending, and [BENCHMARKS.md](BENCHMARKS.md) says
 which is which.
+
+The marks track implementation and gates, not who is working on something. The
+2026-08-04 claim triage moved 28 agent-record rows out of `ACTIVE` into
+`ANCHOR-BACKFILL` because nobody is flying them, which changed no capability and
+therefore **no mark on this page**. A row's lifecycle state and its support mark
+are independent: see [STATUS.md](STATUS.md).

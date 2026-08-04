@@ -10,19 +10,19 @@ Refresh it in the SAME change as any `state.md` append (`check-now-current.py`).
 
 ## Live claims
 
-**This section is NOT yet ground truth.** The matrices carry 187 rows in
-`ACTIVE` and 79 in `SPIKE`; nothing close to that is really in flight, so the
-live set cannot be reconstructed from the record. Triaging it is next action 1,
-and it needs the developer, not an agent, to say which rows are still live.
+**In flight (developer-confirmed 2026-08-04): DeepSeek and Laguna speed parity.
+Nothing else.** Everything else with landed code sits in `ANCHOR-BACKFILL` or is
+awaiting anchor backfill; treat any other `ACTIVE` row as not-yet-triaged, not
+as someone's live work.
 
-| Track | State on record | Next step |
+| Live track | State on record | Next step |
 |---|---|---|
 | Laguna-XS NVFP4 decode | 88% of vLLM | Remaining overlap window; bandwidth-contention-capped |
 | DeepSeek-V4-Flash | 96% of ds4 | Q8_0 projection-GEMV weight-stream floor |
-| 35B prefill TTFT | 0.79x-0.86x every concurrency | Portable fusion of norm/quant/act/combine glue |
-| Multimodal image/audio/video | Correctness gated, speed unmeasured | Per-modality speed grids |
-| vLLM 0.26 re-benchmark | Pending since the pin advance | Re-run the binding grids on the advanced pin |
-| SGLang floor arms | Never ran | Both arms of the SGLang comparison |
+
+Not live, but open and often mistaken for live: 35B prefill TTFT (0.79x-0.86x),
+multimodal speed grids (unmeasured), the vLLM 0.26 re-benchmark (pending since
+the pin advance), and both SGLang floor arms (never run).
 
 ## Current gate
 
@@ -37,11 +37,14 @@ order-0 row is still framed against v0.25.0 and predates the pin advance.
 
 ## Next actions
 
-1. **Triage the claim/matrix state.** 187 `ACTIVE` + 79 `SPIKE` rows make
-   "claim before editing" unenforceable and hide what is live. Note the
-   coupling: `check-agent-record.py` requires every `SPIKE`/`ACTIVE` row's owner
-   to appear in `coordination.md`, so archiving claims means moving the matrix
-   rows, not just the claim table.
+1. **Finish the anchor backfill.** The 2026-08-04 triage moved the 28 rows that
+   already had exact code+test anchors out of `ACTIVE` and retired 31 claims.
+   **124 rows remain `SPIKE`/`ACTIVE` and cannot move**: every honest
+   destination is in `EVIDENCED_STATES` and requires anchors they lack, and
+   inventing anchors would be the dishonesty the record prevents. Root cause:
+   the lifecycle has **no zero-cost parking state** for a landed-but-unowned
+   row, so rows rot in `ACTIVE`. Pick one: backfill anchors row by row, or add
+   an explicit unowned/dormant state with no anchor requirement.
 2. **Unblock the record-era rollover.** AGENTS.md § *Periodic live-document
    compaction* already mandates it and the trigger is met (`state.md` 2.5 MB,
    `parity-ledger.md` 2.0 MB, `benchmark-record.md` 1.0 MB), but it is currently
