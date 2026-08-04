@@ -34642,3 +34642,38 @@ do the anchor backfill row by row, or add an explicit unowned/dormant state with
 no anchor requirement. Recorded in NOW.md, not decided here.
 
 No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Record-surface compaction: roadmap preamble archived, STATUS ratcheted, AGENTS.md tiered
+<!-- state: 2026-08-04T20:00 -->
+
+The three remaining shape items from the 2026-08-04 audit.
+
+**Roadmap.** 484 lines of run-by-run chronology sat ABOVE the portfolio table,
+which AGENTS.md's compaction directive explicitly forbids, so the roadmap could
+not answer "what next" without first reading a 2026-07-18 story. Moved verbatim
+to `completed/roadmap-v1-preamble-2026-07-18..2026-08-03.md` (links rebased one
+level); `roadmap_v1.md` is 803 -> 345 lines with the table at line 27. The
+replacement is a current-position block that also NAMES the known staleness: the
+order-0 row is still framed against vLLM v0.25.0 while the pin is 0.26.
+
+**STATUS ratchet, not budget.** `docs/STATUS.md` was the only public surface
+with no size gate, in precisely the shape BENCHMARKS.md was in before its
+conversion: 291,094 chars, 91 paragraphs over the 700-char prose budget, 47
+cells over 220 chars, longest cell 16,181 chars. A hard budget would either fail
+on landing or push detail somewhere worse, and this page is itself where
+BENCHMARKS forensics were told to go. So `check-public-doc-tables.py` gained a
+RATCHET pinned to today's measurements across chars/sections/long-paragraphs/
+oversized-cells: the page may only SHRINK. Same mechanism as the device-leakage
+DSR ratchet. The real compaction is still owed; lowering the ratchet is the gate
+closing. Six mutation tests cover both directions.
+
+**AGENTS.md tiered.** 697 lines of co-equal MUST directives is more than a
+session reliably holds, and with everything at equal weight rules get dropped
+arbitrarily rather than by priority. Now 286 lines: a T0 non-negotiables list of
+13 one-line rules, the doc-obligation contract (which the consistency gate
+requires in place), the commit protocol, TL;DR and index. Every directive body
+moved VERBATIM to the new live `.agents/directives.md` (508 lines), which is the
+binding text; nothing was reworded. A line-level diff proves all 600 substantive
+lines of the original survive in AGENTS.md + directives.md.
+
+No source, kernel, model, gate, benchmark or capability mark changed.

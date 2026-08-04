@@ -1212,52 +1212,33 @@ them verbatim, reading its allowlist from the checker so the two cannot drift.
 No engine code, no kernel, no measured number changed; the scoreboard carries
 the corrected ds4 (~16.5) and Laguna (~43) denominators already on main.
 
-Agent-record substrate repair (2026-08-04): an audit found the protocol rules
-sound and well enforced, but two of the primitives autonomous work rests on had
-decayed. (1) Cold resume was unsound: `.agents/state.md` promises "append,
-newest last", yet union-merged appends from parallel worktrees had interleaved
-the tail, so entries dated 07-27 sat after entries dated 07-30 and reading the
-newest entries returned a jumble. Entries below a one-time marker now carry a
-sortable `<!-- state: YYYY-MM-DD -->` anchor, `scripts/check-state-order.py`
-proves the order, and `scripts/sort-state-tail.py --apply` repairs an
-interleaved merge mechanically; the 34.5k lines of prior history stay frozen and
-exempt. (2) Orientation had no cheap entry point, since the files a cold session
-is told to read are the largest in the repo. New
-[.agents/NOW.md](../.agents/NOW.md) is a 100-line snapshot of live claims,
-current gate and next actions, rewritten in place and gated by
-`scripts/check-now-current.py` for budget and for freshness: any change
-appending to the state log must refresh it. Separately, the session operating
-manual still required a README update at every checkpoint after that obligation
-had moved to this file, so both normative documents now carry an identical
-machine-readable doc-obligation contract that
-`scripts/check-protocol-consistency.py` asserts equal to the checker constants.
-Each gate ships with its mutation test. No engine code, no kernel, no numbers
-changed. Queued, and recorded in NOW.md: the record-era rollover, roadmap
-preamble compaction, and a budget for this page.
-
-Claim/lifecycle triage (2026-08-04). **Correction:** the earlier "187 `ACTIVE`
-rows" figure was a naive grep that counted prose mentions of the word. Parsed
-from the tables, the matrices carried 106 `ACTIVE` + 46 `SPIKE` rows out of 653.
-With the developer confirming that only the DeepSeek and Laguna speed-parity
-tracks are in flight, every other `SPIKE`/`ACTIVE` row was mis-stated, since
-`ACTIVE` means "implementation is in flight". 28 rows that already carried both
-an exact code anchor and an exact test/evidence anchor moved to
-`ANCHOR-BACKFILL` (code exists, evidence contract not closed, explicitly not
-`DONE`), retiring 31 claims into
-[.agents/completed/claims-era1-2026-08-04.md](../.agents/completed/claims-era1-2026-08-04.md);
-no claim was lost and no prose cell was edited. The engine lifecycle summary was
-recomputed from the real per-area states, which had drifted because only its
-`Total` row is gated. 124 rows remain `SPIKE`/`ACTIVE`: they cannot move without
-first being given real code/test anchors, and inventing anchors to clear them
-would be exactly the dishonesty the record exists to prevent. That anchor
-backfill is the queued work. Root cause of the rot, now recorded: the lifecycle
-has **no zero-cost parking state** — every honest destination for a landed but
-unowned row sits in `EVIDENCED_STATES` and demands anchors, so rows rot in
-`ACTIVE` instead. No engine code, no kernel, no numbers changed. The rollover is
-BLOCKED on a coupling this audit surfaced: `check-agent-record.py` binds `DONE`
-rows to exact LINE anchors in `.agents/parity-ledger.md` (43 references), so
-freezing that file under `completed/` invalidates them. Re-anchoring by row ID
-is the prerequisite.
+Agent-record substrate repair and compaction (2026-08-04). An audit found the
+protocol rules sound and well enforced but the substrate decayed, and four
+things were fixed in one day. **Cold resume** was unsound: `.agents/state.md`
+promises "append, newest last" but union-merged appends from parallel worktrees
+had interleaved the tail, so entries below a one-time marker now carry a sortable
+anchor that `scripts/check-state-order.py` proves. **Orientation** had no cheap
+entry point, so [.agents/NOW.md](../.agents/NOW.md) is now a 100-line snapshot of
+live claims, current gate and next actions, gated for budget and freshness.
+**The operating manual** still demanded a README update at every checkpoint after
+that obligation moved to this page, so both normative documents now carry an
+identical machine-readable contract asserted against the checker constants.
+**Claim state** was triaged against the code: only the DeepSeek and Laguna
+speed-parity tracks are in flight, 28 anchor-complete rows moved to
+`ANCHOR-BACKFILL`, and 31 claims retired to
+[.agents/completed/claims-era1-2026-08-04.md](../.agents/completed/claims-era1-2026-08-04.md).
+124 rows still cannot move because every honest destination requires anchors they
+lack; that backfill is the queued work, and the root cause is that the lifecycle
+has no zero-cost parking state for a landed but unowned row. Separately the
+roadmap's 484-line chronology moved to `completed/`, `AGENTS.md` went from 697 to
+286 lines with its directive bodies verbatim in
+[.agents/directives.md](../.agents/directives.md) (all 600 substantive lines
+verified present), and THIS page gained a size RATCHET in
+`scripts/check-public-doc-tables.py`: it was the only public surface with no size
+gate, in the shape BENCHMARKS.md was in before its conversion, so it may now only
+shrink. A real compaction of this page is still owed. Full detail for all of it
+is in the append-only `.agents/state.md`. No engine code, no kernel, no numbers
+changed.
 
 Measured against an oracle built from source at the ACTUAL parity pin, the gap
 is 0.9970x total throughput, not the 0.9819x published against the older

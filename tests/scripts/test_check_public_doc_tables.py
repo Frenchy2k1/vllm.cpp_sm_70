@@ -361,3 +361,73 @@ class RollRecordTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# docs/STATUS.md is guarded by a RATCHET, not a budget: it may only shrink. The
+# mutations therefore prove both directions -- growth fails, shrinkage passes --
+# and that the required sections cannot be dropped.
+STATUS_VALID = "\n".join(
+    [
+        "# Status",
+        "",
+        "## Parity pin",
+        "",
+        "vLLM 0.26.0.dev0.",
+        "",
+        "## Capability status",
+        "",
+        "| Capability | State |",
+        "|---|---|",
+        "| Thing | Works |",
+        "",
+        "## Not supported yet",
+        "",
+        "| Thing | Why |",
+        "|---|---|",
+        "| Other | Not started |",
+    ]
+)
+
+
+class StatusRatchet(unittest.TestCase):
+    def test_small_valid_page_passes(self) -> None:
+        self.assertEqual(doc_tables.status_errors(STATUS_VALID), [])
+
+    def test_each_required_section_is_enforced(self) -> None:
+        for label, matchers in doc_tables.STATUS_REQUIRED:
+            text = STATUS_VALID.replace(f"## {label}", "## Something else")
+            with self.subTest(section=label):
+                self.assertTrue(
+                    any(label in e for e in doc_tables.status_errors(text)),
+                    f"dropping '{label}' was not rejected",
+                )
+
+    def test_growth_past_the_char_ratchet_is_rejected(self) -> None:
+        text = STATUS_VALID + "\n" + "x" * doc_tables.STATUS_RATCHET["chars"]
+        self.assertTrue(any("chars is" in e for e in doc_tables.status_errors(text)))
+
+    def test_growth_past_the_section_ratchet_is_rejected(self) -> None:
+        extra = "\n".join(
+            f"## Extra {i}\n\nprose\n" for i in range(doc_tables.STATUS_RATCHET["h2_sections"] + 1)
+        )
+        errors = doc_tables.status_errors(STATUS_VALID + "\n" + extra)
+        self.assertTrue(any("h2 sections is" in e for e in errors))
+
+    def test_growth_past_the_paragraph_ratchet_is_rejected(self) -> None:
+        para = "y" * (doc_tables.MAX_PARAGRAPH_CHARS + 1)
+        extra = "\n\n".join([para] * (doc_tables.STATUS_RATCHET["long_paragraphs"] + 1))
+        errors = doc_tables.status_errors(STATUS_VALID + "\n\n" + extra)
+        self.assertTrue(any("long paragraphs is" in e for e in errors))
+
+    def test_growth_past_the_cell_ratchet_is_rejected(self) -> None:
+        cell = "z" * (doc_tables.MAX_CELL_CHARS + 1)
+        rows = "\n".join(
+            f"| {cell} | {cell} |" for _ in range(doc_tables.STATUS_RATCHET["oversized_cells"])
+        )
+        errors = doc_tables.status_errors(STATUS_VALID + "\n\n| a | b |\n|---|---|\n" + rows)
+        self.assertTrue(any("oversized cells is" in e for e in errors))
+
+    def test_the_live_page_is_inside_its_ratchet(self) -> None:
+        self.assertEqual(
+            doc_tables.status_errors(doc_tables.STATUS.read_text(encoding="utf-8")), []
+        )
