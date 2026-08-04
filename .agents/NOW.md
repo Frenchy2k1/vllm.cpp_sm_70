@@ -14,7 +14,7 @@ fully merged/superseded; work from main).
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Laguna NVFP4 decode speed | **PARITY+ (44.55 vs 43.10 tok/s, 1.03x), byte-exact, default config** — root cause was WEIGHT RESIDENCY: bf16 projections read unified/ATS host memory; `VT_LAGUNA_RESIDENT_BF16W` (default-ON) stages them device-resident. Detail in `state.md` | Re-verify ds4 bf16 tower same-tool |
+| Laguna NVFP4 decode speed | **PARITY+ 44.46 vs 43.10 (1.03x), byte-exact, default config**. Root cause was WEIGHT RESIDENCY: bf16 projections read unified/ATS host mem via a `w.View()` retag; `VT_LAGUNA_RESIDENT_BF16W` (default-ON) stages them cudaMalloc device-resident. Detail in benchmark record | Closed; goal met. Residual: formal vLLM K-run distributional set when convenient |
 | DeepSeek-V4-Flash decode | **PARITY with ds4** (16.28 vs 16.33, 0.997x, same-session clean). HC-expand fusion byte-exact but perf-neutral, held default-OFF | Optional beat-path only: f16 tensor-core DSA/router (near-tie class — needs user gate-class ratification) |
 | f32-out GEMV systemic audit | Only laguna (high) + deepseek_v4 bf16 tower (medium) affected; gate models & on-framework dense unaffected (bf16-out by construction, e2e-bench-verified) | Same-tool re-verify deepseek_v4's bf16 tower after the Laguna fix proves out |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md invocation-parity checklist being landed (worktree agent) | Review + merge; CUDA build-verify the `kGemvHeuristicAlgos` constant refactor on dgx |

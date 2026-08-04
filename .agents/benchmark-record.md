@@ -11459,3 +11459,14 @@ steady-state per-step / nsys decode tok/s (eager vs graphed) is OWED.
   packed/scale byte-identical + `scale2`/`alpha` math + per-expert indexing
   distinct, F32 bias, shared-expert BF16; RED-first missing-tensor throws);
   `test_laguna_scaffold` 8/8·167 unchanged (2026-07-31).
+
+<!-- laguna-resident-bf16w FLIP default-ON (2026-08-04) -->
+- **`VT_LAGUNA_RESIDENT_BF16W` flipped DEFAULT-ON (parity-enablers-ship-as-defaults).**
+  Binding measurement at the NEW production default (env unset -> ON; decode
+  config `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1
+  VT_LAGUNA_DECODE_GRAPH=1`, 256 tok, median-of-3, drop_caches, worker parked,
+  flock): **default 44.46/44.53/44.41 -> 44.46 tok/s (1.03x vs vLLM 43.10)**;
+  opt-out `=0` (old retag) 38.76/38.79/38.80 -> 38.79 (0.90x); generated ids
+  **IDENTICAL** default vs `=0` (byte-exact, directive gate PASS). Clean rebuild
+  after the gate flip recompiled `laguna.cpp` with -Werror (no warnings) and
+  relinked `laguna-gen`. Supersedes the "default-OFF, recommend flip" note above.
