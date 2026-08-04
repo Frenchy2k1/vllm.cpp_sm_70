@@ -34872,3 +34872,46 @@ worktree is named for its row and the row is already exclusive via its PR.
 
 Added W0 (role machinery) ahead of W1-W5. Still design-only; nothing enforced.
 No source, kernel, model, gate, benchmark or capability mark changed.
+
+## W0 + W1 LANDED: agent role machinery and role discipline
+<!-- state: 2026-08-05T01:00 -->
+
+**W0 — `scripts/agent-role.py`.** Declare, materialize, re-derive. Two identities
+were MEASURED rather than assumed before building on them: `PPID` is stable
+across tool calls within a session (3110653 twice) and differs between concurrent
+sessions, so it is the session id fallback under `VLLM_CPP_AGENT_SESSION`; and
+`git rev-parse --git-dir` is per-worktree (`.git/worktrees/<name>`), so a
+materialized helper is distinguishable with no bookkeeping.
+
+Design points that matter:
+- the operator lock lives in the git COMMON dir, not the work tree - shared by
+  every worktree (the right scope for "one operator per repo") and impossible to
+  commit by accident. This deviates from rev 2's `.agents/operator.lock`; spec
+  updated;
+- the lock is `O_CREAT|O_EXCL`, so a SECOND self-declared operator FAILS and is
+  told to take the helper role, rather than both racing on main;
+- a marker written by a different session sharing the same checkout does NOT
+  resolve - the exact case that made pure environment-derivation circular;
+- an operator marker whose lock has vanished resolves as UNDECLARED, not as
+  operator (a mutation test caught this crashing instead; the early-return dict
+  was missing its `session` key);
+- stale locks are breakable after a 2 h TTL but the break is always LOGGED.
+
+**W1 — `scripts/check-role-discipline.py`.** Enforces the PATH, not authorship:
+feature code (`src/`, `include/`, `tests/`, `examples/`, `cmake/`,
+`CMakeLists.txt`) reaches main only through a merged `row/*` PR or a squash-merge
+carrying `(#N)`. Integration paths (`scripts/`, `.agents/`, `docs/`, `.github/`)
+are exempt BY DESIGN so the operator can fix a gate or repair the record without
+a round trip - an operator who cannot touch anything cannot review.
+
+**REPORT-ONLY, deliberately.** `ROLE_DISCIPLINE_SINCE` is `None`. The project
+pushes to main directly by explicit user policy, so switching this on
+retroactively would redden legitimate history. Set it to the cutover commit when
+the protocol is adopted. Same reasoning for preflight: it PRINTS the role every
+run and fails only under `--require-role`, so an undeclared session is visible
+before it is fatal.
+
+16 mutation tests cover both, including second-operator refusal, cross-session
+non-inheritance, stale-lock breaking, and each acceptance path for W1. Wired into
+CI (tree-scoped `agent-record` + the diff-scoped range job). No source, kernel,
+model, gate, benchmark or capability mark changed.

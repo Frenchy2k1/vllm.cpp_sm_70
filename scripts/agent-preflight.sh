@@ -6,9 +6,10 @@
 # forgotten gate becomes a red build after the push, which is the expensive
 # moment to find out. This runs all of them and prints the resume digest.
 #
-#   scripts/agent-preflight.sh            # gates + print .agents/NOW.md
-#   scripts/agent-preflight.sh --staged   # also check the staged change
-#   scripts/agent-preflight.sh --quiet    # gates only, no digest
+#   scripts/agent-preflight.sh              # gates + role + print .agents/NOW.md
+#   scripts/agent-preflight.sh --staged     # also check the staged change
+#   scripts/agent-preflight.sh --quiet      # gates only, no digest
+#   scripts/agent-preflight.sh --require-role  # FAIL if the role is undeclared
 #
 # It never writes anything, so it is always safe to run.
 
@@ -19,10 +20,12 @@ cd "$ROOT"
 
 STAGED=0
 QUIET=0
+REQUIRE_ROLE=0
 for arg in "$@"; do
   case "$arg" in
     --staged) STAGED=1 ;;
     --quiet) QUIET=1 ;;
+    --require-role) REQUIRE_ROLE=1 ;;
     -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
@@ -30,6 +33,7 @@ done
 
 CHECKERS=(
   check-agent-record
+  check-role-discipline
   check-readme-structure
   check-public-doc-tables
   check-model-checklist
@@ -43,6 +47,7 @@ CHECKERS=(
 
 SUITES=(
   test_agent_record
+  test_agent_role
   test_doc_checkpoint
   test_check_readme_structure
   test_check_public_doc_tables
@@ -68,6 +73,17 @@ run() {
     failed+=("$label")
   fi
 }
+
+echo "Session role:"
+if role_line=$(python3 scripts/agent-role.py show 2>&1); then
+  printf '  \033[32mok\033[0m   %s\n' "$role_line"
+else
+  printf '  \033[33m--\033[0m   %s\n' "$(printf '%s' "$role_line" | head -1)"
+  printf '       declare it: scripts/agent-role.py claim operator | claim helper --row <ROW-ID>\n'
+  if [ "$REQUIRE_ROLE" -eq 1 ]; then
+    failed+=("role-undeclared")
+  fi
+fi
 
 echo "Record gates:"
 for checker in "${CHECKERS[@]}"; do

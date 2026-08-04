@@ -197,8 +197,8 @@ checker.
 
 | W | Item | Gate |
 |---|---|---|
-| W0 | Role machinery: `.agents/operator.lock` (create-exclusive + TTL + heartbeat), session-scoped role marker, and role resolution printed by `agent-preflight.sh`, which FAILS when a session has not declared one | mutation test |
-| W1 | `check-role-discipline.py`: a commit on `main` touching feature paths must arrive via a merged `row/*` PR, not a direct push | mutation test |
+| W0 | **LANDED** `scripts/agent-role.py` — role machinery: `.agents/operator.lock` (create-exclusive + TTL + heartbeat), session-scoped role marker, and role resolution printed by `agent-preflight.sh`, which FAILS when a session has not declared one | mutation test |
+| W1 | **LANDED (report-only)** `check-role-discipline.py`: a commit on `main` touching feature paths must arrive via a merged `row/*` PR, not a direct push | mutation test |
 | W2 | Generated claim view from GitHub PR state; `coordination.md` becomes a report | mutation test + a run against live PRs |
 | W3 | `check-ready-for-helper.py`: the pickable queue, asserting the 5 conditions | mutation test |
 | W4 | PR template carrying the evidence block + size cap | CI |
@@ -208,6 +208,14 @@ W1 is the enforcement mechanism for "operator does features only via
 sub-agents": it does not attempt to detect who typed the code, it makes the
 *path* the rule — feature code reaches `main` only through a reviewed `row/*`
 PR, whoever produced it.
+
+**Activation.** W0 and W1 are implemented and CI-gated, but W1 is REPORT-ONLY:
+`ROLE_DISCIPLINE_SINCE` is `None`. Turning it on retroactively would redden
+history created under the current, explicitly sanctioned direct-push policy. Set
+that constant to the cutover commit when the protocol is adopted, and every
+commit after it is enforced. Likewise `agent-preflight.sh` PRINTS the role every
+run but only fails on `--require-role`, so an undeclared session is visible
+before it is fatal.
 
 ## Risks/decisions
 
