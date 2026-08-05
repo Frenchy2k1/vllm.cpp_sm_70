@@ -21,10 +21,13 @@ If the preference file is absent or silent, use the safe defaults: local edits,
 tests, and commits are allowed; do not push, merge, force-update refs, use
 external hosts, install/download large assets, manage services, or start
 parallel agents. Ask before those actions. In the protocol, `${VLLM_SOURCE}`,
-`${VLLM_ORACLE}`, `${DEPENDENCY_SOURCE}`, and `${GPU_LOCK}` mean the values
-selected by that file. Exact Ettore infrastructure paths retained in the
-environment registry or historical evidence are not commands for other
-developers.
+`${VLLM_ORACLE}`, `${DEPENDENCY_SOURCE}`, `${GPU_LOCK}` and the other
+placeholders mean the values in the untracked `.env` at the repository root:
+copy the tracked [`.env.example`](.env.example) and fill in what your setup
+has. An empty value means unavailable — the gates that need it stay `PENDING`;
+never substitute another developer's paths. Exact Ettore infrastructure paths
+retained in the environment registry or historical evidence are not commands
+for other developers.
 
 **Read [`.agents/NOW.md`](.agents/NOW.md) FIRST — it is the one-Read resume
 surface.** The canonical record is large by design (evidence is never deleted),
@@ -227,8 +230,11 @@ submitting AI-assisted code, read
   ignored, developer-owned execution profile for this workspace (copy the
   tracked example below; absence uses the safe defaults above).
 - [.agents/developer-preferences.example.md](.agents/developer-preferences.example.md)
-  — tracked template for Git integration, paths, hosts, compute, and
-  collaboration preferences.
+  — tracked template for Git integration, hosts, compute, and collaboration
+  preferences.
+- [`.env.example`](.env.example) — tracked template for the untracked `.env`:
+  the machine-readable values (`${VLLM_SOURCE}`, `${VLLM_ORACLE}`, gate host,
+  device arch/toolchain) the protocol placeholders resolve from.
 - [.agents/directives.md](.agents/directives.md) — **the full text of every
   standing directive** summarised in T0 above. Binding; AGENTS.md is the index.
 - [.agents/mission.md](.agents/mission.md) — what this project is and is not.
