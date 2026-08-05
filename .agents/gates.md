@@ -10,7 +10,8 @@
 > start post-MVP work until both models hit parity.
 
 1. **Throughput parity vs vLLM and every equivalent faster floor** on
-   `dgx.casa` (DGX Spark, GB10): serve
+   the release-gate environment (`${GATE_HOST}`; currently the DGX Spark GB10
+   profile in [environment.md](environment.md)): serve
    **Qwen3.6-35B-A3B (NVFP4)** and **Qwen3.6-27B (NVFP4)** with prefill AND
    decode throughput matching vLLM at large concurrency (request-rate sweeps,
    measured with our `bench serve` equivalent, same box, same models).
@@ -42,7 +43,8 @@
 5. **E2E test suites**: op parity vs upstream dumps, engine behavioral tests
    (ported from upstream `tests/v1/core/` semantics), model parity
    (logits + greedy token-for-token), server conformance, gate benchmark
-   regression tracking. CI-runnable on CPU (0.6B model); nightly on dgx.casa.
+   regression tracking. CI-runnable on CPU (0.6B model); nightly on the
+   release-gate environment (`${GATE_HOST}`).
 
 ## PROTOCOL DIRECTIVE — always compare vs vLLM (the oracle), on the SAME workload
 

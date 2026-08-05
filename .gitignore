@@ -25,3 +25,7 @@ a.out
 # Per-developer agent execution preferences. Copy the tracked example and keep
 # machine paths, Git integration choices, and infrastructure policy local.
 .agents/developer-preferences.md
+
+# Per-developer environment values (copy .env.example). Machine paths and
+# hosts; the protocol's ${VLLM_SOURCE}-style placeholders resolve from here.
+.env

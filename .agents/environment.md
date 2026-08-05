@@ -7,6 +7,25 @@ credentials, or assuming its paths exist. The untracked
 workspace and supplies local path/lock overrides. If no profile is selected,
 use only the current local host and mark unavailable hardware gates `PENDING`.
 
+## Registering your own environment
+
+The profiles below are per-developer facts, not requirements: nothing here is
+usable unless your own setup provides it. To make your hardware a gate
+environment:
+
+1. Copy `.env.example` to the untracked `.env` at the repository root and fill
+   in what your setup has (reference checkouts, oracle, gate host, GPU lock,
+   device arch and toolchain). Empty means unavailable, and the gates that
+   need it stay `PENDING` for you.
+2. Copy `developer-preferences.example.md` to the untracked
+   `developer-preferences.md` for the policy choices (Git integration, which
+   remote hosts you may use, contention policy).
+3. Add a profile entry to this file, in the same shape as the entries below:
+   hardware, arch, toolkit versions, oracle availability, and the box's
+   quirks. A PR for it is welcome, so the shared record says where each gate
+   can run. New accelerator classes (an AMD/ROCm box, an Intel GPU) register
+   the same way and become the gate environment for their backend rows.
+
 - **Rich local development/GPU profile (re-verified 2026-07-25):** NVIDIA GeForce RTX
   5070 Ti, 16 GiB, compute capability 12.0 (`sm_120`), driver 595.71.05. The
   cached `Qwen/Qwen3.5-4B` snapshot is the only model large enough for the

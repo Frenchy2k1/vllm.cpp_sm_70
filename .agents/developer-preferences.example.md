@@ -10,13 +10,12 @@ Delete headings that do not apply, but make every allowed remote or destructive
 action explicit. An absent answer uses the safe default documented in
 `AGENTS.md`.
 
-For protocol placeholders, provide these values explicitly (use `unavailable`
-rather than borrowing another developer's path):
-
-- `${VLLM_SOURCE}`: `<absolute checkout path or unavailable>`.
-- `${VLLM_ORACLE}`: `<absolute executable/venv path or unavailable>`.
-- `${DEPENDENCY_SOURCE}`: `<absolute source/site-packages root or unavailable>`.
-- `${GPU_LOCK}`: `<whole-series exclusion command or unavailable>`.
+The machine-readable values behind the protocol placeholders
+(`${VLLM_SOURCE}`, `${VLLM_ORACLE}`, `${DEPENDENCY_SOURCE}`, `${GPU_LOCK}`,
+gate host, device arch/toolchain) live in the untracked `.env` at the
+repository root: copy `.env.example` and fill it in. Leave a variable empty
+rather than borrowing another developer's path. This file keeps the policy
+choices below; `.env` keeps the paths and hosts.
 
 ## Git integration
 
@@ -34,9 +33,9 @@ rather than borrowing another developer's path):
 ## Workspace and upstream oracle
 
 - Repository root: `<absolute path>`.
-- vLLM source checkout: `${VLLM_SOURCE}` above.
-- vLLM oracle executable/venv: `${VLLM_ORACLE}` above.
-- Dependency source/site-packages: `${DEPENDENCY_SOURCE}` above.
+- vLLM source checkout: `${VLLM_SOURCE}` from `.env`.
+- vLLM oracle executable/venv: `${VLLM_ORACLE}` from `.env`.
+- Dependency source/site-packages: `${DEPENDENCY_SOURCE}` from `.env`.
 - Build directories: `<paths or naming rule>`.
 - Model/cache roots: `<paths or unavailable>`.
 - Evidence root: `<path>`.
@@ -47,7 +46,7 @@ rather than borrowing another developer's path):
 - Available backends/accelerators: `<CPU/CUDA/Metal/etc.>`.
 - GPU architecture and memory: `<facts>`.
 - Gate models runnable here: `<models or none>`.
-- Contention policy: `${GPU_LOCK}` above plus when it is required.
+- Contention policy: `${GPU_LOCK}` from `.env` plus when it is required.
 - Profilers: `<nsys/ncu/torch profiler/etc.>`.
 - External services that must be stopped: `<service and authorized action, or
   none>`.
