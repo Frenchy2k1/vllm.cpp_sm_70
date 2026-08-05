@@ -145,10 +145,85 @@ void ParseKimiLinearConfig(const HfConfig& config);
 // DeepSeek-style MoE (`block_sparse_moe.*`) MLP.
 std::vector<std::string> EnumerateKimiLinearTensors(const KimiLinearParams& p);
 
-// Whole Kimi-Linear weights. W1 STRUCTURAL SCAFFOLDING: carries the resolved
-// params + the loader's coverage result. Heavy tensor MATERIALIZATION (device
-// staging of the KDA conv/decay towers, the 256 MoE experts, the MLA projections)
-// is the W2+ residual; the loader here validates the name-map coverage + shapes.
+// ─── HOST (float) MATERIALIZED WEIGHTS — the CPU reference forward (W2-W6) ─────
+// The CPU reference forward composes the landed host primitives (`vllm::kimi_kda`
+// for the KDA deltas, a materialized-MHA MLA reference, a sigmoid-`noaux_tc` MoE
+// reference) into the whole 27-layer hybrid so the ONLY remaining correctness step
+// is the e2e SACRED token golden on GB10 (spike §4/§8, W0/W7). These are plain
+// row-major float arrays (bf16/f32 checkpoint tensors decoded to f32); the DEVICE
+// weights (ResidentWeight staging, the absorbed W_UK/W_UV, the grouped-MoE slabs)
+// are the born-on-the-runner W6/W7 residual, kept refuse-by-name in ForwardDevice.
+// All matrices are torch `[out_features, in_features]` row-major (checkpoint layout).
+
+// One KDA (Kimi Delta Attention) layer's materialized weights
+// (kimi_gdn_linear_attn.py:120-226).
+struct KdaLayerHostWeights {
+  std::vector<float> q_proj, k_proj, v_proj;   // [num_heads*head_dim, hidden]
+  std::vector<float> f_a_proj;                 // [head_dim, hidden]     (rank down)
+  std::vector<float> f_b_proj;                 // [num_heads*head_dim, head_dim]
+  std::vector<float> b_proj;                   // [num_heads, hidden]    (beta)
+  std::vector<float> g_a_proj;                 // [head_dim, hidden]     (gate down)
+  std::vector<float> g_b_proj;                 // [num_heads*head_dim, head_dim]
+  std::vector<float> o_proj;                   // [hidden, num_heads*head_dim]
+  std::vector<float> q_conv, k_conv, v_conv;   // [num_heads*head_dim, kernel_size]
+  std::vector<float> dt_bias;                  // [num_heads*head_dim]   (may be empty)
+  std::vector<float> a_log;                    // [num_heads]
+  std::vector<float> o_norm;                   // [head_dim]  (FusedRMSNormGated weight)
+};
+
+// One NoPE-MLA layer's materialized weights (KimiMLAAttention, kimi_linear.py:217-248;
+// q_lora_rank==null => direct q_proj, mla_use_nope => rotary_emb=None).
+struct MlaLayerHostWeights {
+  std::vector<float> q_proj;              // [num_heads*(qk_nope+qk_rope), hidden]
+  std::vector<float> kv_a_proj_with_mqa;  // [kv_lora+qk_rope, hidden]
+  std::vector<float> kv_a_layernorm;      // [kv_lora]
+  std::vector<float> kv_b_proj;           // [num_heads*(qk_nope+v), kv_lora]
+  std::vector<float> o_proj;              // [hidden, num_heads*v]
+};
+
+// A gated (SwiGLU) MLP — the dense layer-0 MLP AND each shared/routed expert.
+// SiluAndMul: silu(gate @ x) * (up @ x) -> down @ (...).
+struct MlpHostWeights {
+  std::vector<float> gate_proj;  // [inter, hidden]   (== expert w1)
+  std::vector<float> up_proj;    // [inter, hidden]   (== expert w3)
+  std::vector<float> down_proj;  // [hidden, inter]   (== expert w2)
+};
+
+// One MoE block (KimiMoE, kimi_linear.py:104-177): the sigmoid `noaux_tc` router
+// gate + its `e_score_correction_bias`, an optional shared expert, and the routed
+// experts. Router weights (`w1`/`w2`/`w3`) map to gate/down/up
+// (fused_moe_make_expert_params_mapping, kimi_linear.py:469-475).
+struct MoeHostWeights {
+  std::vector<float> gate;                     // [num_experts, hidden]
+  std::vector<float> e_score_correction_bias;  // [num_experts]
+  bool has_shared = false;
+  MlpHostWeights shared;                       // shared expert (moe_inter*num_shared)
+  std::vector<MlpHostWeights> experts;         // [num_experts]
+};
+
+struct KimiLinearLayerHostWeights {
+  std::vector<float> input_layernorm;           // [hidden]
+  std::vector<float> post_attention_layernorm;  // [hidden]
+  bool is_kda = false;
+  KdaLayerHostWeights kda;  // populated iff is_kda
+  MlaLayerHostWeights mla;  // populated iff !is_kda
+  bool is_moe = false;
+  MlpHostWeights dense;   // populated iff !is_moe (dense layer-0)
+  MoeHostWeights moe;     // populated iff is_moe
+};
+
+struct KimiLinearHostWeights {
+  bool materialized = false;
+  std::vector<float> embed_tokens;  // [vocab, hidden]
+  std::vector<float> final_norm;    // [hidden]
+  std::vector<float> lm_head;       // [vocab, hidden]  (== embed if tied)
+  std::vector<KimiLinearLayerHostWeights> layers;
+};
+
+// Whole Kimi-Linear weights. W1 landed the resolved params + the loader's coverage
+// result; W2 (the CPU reference lane) also MATERIALIZES the host float weights that
+// the reference forward composes. Device staging (the absorbed MLA bmm forms, the
+// grouped-MoE slabs) stays the born-on-the-runner W6/W7 residual.
 struct KimiLinearWeights {
   KimiLinearParams params{};
   // Total enumerated checkpoint tensors (structural size of the 27-layer hybrid).
@@ -157,6 +232,8 @@ struct KimiLinearWeights {
   // `enumerated_tensors` on a successful load (the loader throws BY NAME on the
   // first missing tensor, so a partial checkpoint never returns silently).
   int64_t accounted_tensors = 0;
+  // The host-materialized float weights the CPU reference forward composes.
+  KimiLinearHostWeights host{};
 };
 
 // Load `KimiLinearForCausalLM` safetensors. Throws BY NAME (never silent zeros) on
@@ -167,11 +244,75 @@ struct KimiLinearWeights {
 KimiLinearWeights LoadKimiLinearForCausalLMWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config);
 
-// The Kimi-Linear forward. REFUSE-by-name (both entrypoints VT_CHECK(false, ...)):
-// the 27-layer KDA/NoPE-MLA hybrid + 256-expert MoE forward composes primitives
-// that are NOT wired in W1 — the KDA device kernel (W3), the NoPE-MLA routing (W4),
-// the MoE assembly (W5), and the het-KV forward wiring (W6). A forward LOUDLY
-// reports the pending brick. See `.agents/specs/kimi-linear.md` §5.
+// ─── PER-OP CPU REFERENCE FORWARDS (W2-W6, kimi_linear_forward.cpp) ────────────
+// Each is a full-sequence, fresh-state reference over the host float weights,
+// grounded 1:1 in the pinned vLLM forward + composed from the already-gated
+// `vllm::kimi_kda` host refs. They are the per-op gates (test_kimi_linear_forward):
+// the layer output must equal a hand-composition of the parts (a wiring proof), and
+// the whole forward decodes coherently. The DEVICE (born-on-runner) forms are W6/W7.
+
+// One KDA linear-attention layer (kimi_gdn_linear_attn.py:233-268 forward +
+// :390-441 recurrence). `hidden_normed` is [num_tokens, hidden] already through the
+// input RMSNorm. Composes: q/k/v proj -> 3 silu short convs -> per-head q/k L2-norm
+// -> the gated-delta recurrence (`fused_recurrent_kda`, kda gate g = -exp(A_log)*
+// softplus(f_b(f_a(x))+dt_bias), scale head_dim**-0.5) -> FusedRMSNormGated(., g2)
+// -> o_proj. Returns [num_tokens, hidden].
+std::vector<float> KimiKdaLayerForward(const KdaLayerHostWeights& w,
+                                       const std::vector<float>& hidden_normed,
+                                       const KimiLinearParams& p, int64_t num_tokens);
+
+// One NoPE-MLA full-attention layer (KimiMLAAttention, kimi_linear.py:180-285;
+// scaling = qk_head_dim**-0.5, kimi_linear.py:212). The MATERIALIZED-MHA reference
+// (mla_attention.h "the UNABSORBED materialized-MHA reference"): q_proj, kv_a ->
+// kv_a_layernorm(latent) -> kv_b -> per-head causal softmax over the cache with NO
+// RoPE (rotary_emb=None) -> o_proj. Returns [num_tokens, hidden].
+std::vector<float> KimiNoPEMlaLayerForward(const MlaLayerHostWeights& w,
+                                           const std::vector<float>& hidden_normed,
+                                           const KimiLinearParams& p,
+                                           int64_t num_tokens);
+
+// The sigmoid `noaux_tc` top-k routing (grouped_topk_router.py:106-161, the trivial
+// `num_expert_group=1`/`topk_group=1` case): scores=sigmoid(gate@x); select top-k on
+// scores+e_score_correction_bias; weight from the UNBIASED scores; renormalize then
+// scale by routed_scaling_factor. `ids`/`weights` are row-major [num_tokens, top_k].
+struct KimiMoeRouting {
+  std::vector<int32_t> ids;
+  std::vector<float> weights;
+};
+KimiMoeRouting KimiMoeRoute(const MoeHostWeights& w,
+                            const std::vector<float>& hidden_normed,
+                            const KimiLinearParams& p, int64_t num_tokens);
+
+// The whole MoE block: router (above) -> shared expert (always) + routed experts.
+// Returns [num_tokens, hidden].
+std::vector<float> KimiMoeBlockForward(const MoeHostWeights& w,
+                                       const std::vector<float>& hidden_normed,
+                                       const KimiLinearParams& p, int64_t num_tokens);
+
+// The dense layer-0 SwiGLU MLP (KimiMLP, kimi_linear.py:64-101). Returns
+// [num_tokens, hidden].
+std::vector<float> KimiDenseMlpForward(const MlpHostWeights& w,
+                                       const std::vector<float>& hidden_normed,
+                                       const KimiLinearParams& p, int64_t num_tokens);
+
+// Greedy-decode `num_new` tokens from `prompt`, advancing the (recomputed) KDA
+// recurrent + MLA latent context each step (the CPU reference decode driver). The
+// device incremental-cache decode is the born-on-runner W6/W7 residual. Returns the
+// `num_new` generated token ids.
+std::vector<int32_t> KimiLinearGreedyDecode(const KimiLinearHostWeights& host,
+                                            const KimiLinearParams& p,
+                                            const std::vector<int32_t>& prompt,
+                                            int num_new);
+
+// The Kimi-Linear forward.
+//   Forward (host, the `!gather_logits` reference path): a REAL CPU reference over
+//     the host float weights — the whole 27-layer KDA/NoPE-MLA hybrid + 256-expert
+//     MoE, composed from the per-op reference forwards above, so the ONLY remaining
+//     correctness step is the e2e SACRED token golden on GB10 (spike §8).
+//   ForwardDevice (the DEFAULT `gather_logits` production/runner path): still
+//     REFUSE-by-name (VT_CHECK(false)) — the born-on-the-runner device forward (the
+//     KDA device kernel, the absorbed MLA decode, the grouped-MoE slabs, the het-KV
+//     cache wiring) is W6/W7. The row stays SPIKE until that + the e2e gate land.
 class KimiLinearModel {
  public:
   static std::vector<float> Forward(

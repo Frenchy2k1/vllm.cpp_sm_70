@@ -466,6 +466,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp
   src/vllm/model_executor/models/kimi_linear_weights.cpp
+  src/vllm/model_executor/models/kimi_linear_forward.cpp
   src/vllm/model_executor/models/kimi_linear.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
   src/vllm/model_executor/models/glm4_weights.cpp

@@ -268,7 +268,7 @@ built on it rather than keeping the flattering one.
 | DFlash speculative decode | Below vLLM throughput | bf16 acceptance floor ~0.85x |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
-| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | W1 scaffolding landed, no e2e yet | W1 registry+config+loader+KV-spec (CPU-gated, forward refuses). Next: W3-W6 forward, then capture the greedy oracle golden on GB10 (spec §8 recipe; FITS 0.77x pool) + token-exact + speed vs vLLM |
+| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | W2-W6 CPU reference forward landed, no e2e yet | CPU reference forward composes the 27-layer hybrid, per-op gated (`test_kimi_linear_forward` 6/6·246); DEVICE forward refuses. Next: DEVICE forward + oracle golden on GB10 (§8) |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
