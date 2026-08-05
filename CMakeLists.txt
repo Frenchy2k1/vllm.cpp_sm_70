@@ -142,9 +142,12 @@ endif()
 #
 # -fno-sanitize-recover=all makes a finding ABORT instead of print-and-continue,
 # so ctest FAILS the lane rather than burying the report inside passing output.
-# Frame pointers plus -g keep the traces attributable; the lane keeps the
-# project's -ffp-contract=off numerics so a bit-identity test still means what it
-# means in the production build.
+# Frame pointers plus -g1 keep file/line traces attributable without emitting
+# full type/local-variable DWARF. Every test statically links the instrumented
+# library, so full -g duplicates hundreds of MiB into each executable; the
+# ASan+UBSan GitHub runner exhausted its filesystem before the suite finished
+# linking. The lane keeps the project's -ffp-contract=off numerics so a
+# bit-identity test still means what it means in the production build.
 set(VLLM_CPP_SANITIZE "OFF" CACHE STRING
   "Host sanitizer lane: OFF | address | undefined | address,undefined | thread")
 set_property(CACHE VLLM_CPP_SANITIZE PROPERTY STRINGS
@@ -166,7 +169,7 @@ if(NOT VLLM_CPP_SANITIZE STREQUAL "OFF")
     $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=${VLLM_CPP_SANITIZE}>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-sanitize-recover=all>
     $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
-    $<$<COMPILE_LANGUAGE:CXX>:-g>)
+    $<$<COMPILE_LANGUAGE:CXX>:-g1>)
   # -Werror itself is dropped for this lane in cmake/CompilerWarnings.cmake, where
   # the per-target warning flags are set; see the rationale there.
   add_link_options(-fsanitize=${VLLM_CPP_SANITIZE})
@@ -784,6 +787,21 @@ target_include_directories(vllm PRIVATE src)
 # src/vllm/entrypoints/chat_template.cpp.
 target_include_directories(vllm SYSTEM PUBLIC third_party)
 vllm_cpp_set_warnings(vllm)
+# SYSTEM covers the FRONT-END diagnostics from those vendored headers, but not
+# the ones the OPTIMIZER raises after inlining: those are attributed to the TU
+# being compiled, not to the header, so -isystem cannot reach them. GCC 15
+# inlines minja::Parser::parseValueExpression (third_party/minja/minja.hpp),
+# loses track of the allocation base of a std::vector<std::string> it is
+# destroying, and reports -Wfree-nonheap-object against correct vendored code.
+# Demote just that diagnostic, just here: the warning stays visible, -Werror
+# stays in force for every other diagnostic and every other TU, and the
+# vendored source stays unmodified. Ordered after vllm_cpp_set_warnings so the
+# target-level -Werror cannot promote it again (the lesson of the MLX header
+# exception below). cmake/CompilerWarnings.cmake documents the same GCC
+# false-positive class for the sanitizer lanes.
+set_source_files_properties(src/vllm/entrypoints/chat_template.cpp PROPERTIES
+  COMPILE_OPTIONS
+    "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-error=free-nonheap-object>")
 # --- Vendored BLAKE3 (LMCache MODE-1 lm:// token hash, KV-EXTERNAL-CACHE W1) --
 # The official BLAKE3 C implementation (third_party/blake3, upstream tag 1.5.5
 # / commit 81f772a; dual CC0-1.0 / Apache-2.0), the same algorithm the `blake3`
@@ -1415,6 +1433,26 @@ target_link_libraries(vllm_shared PRIVATE vllm)
 if(UNIX AND NOT APPLE)
   target_link_options(vllm_shared PRIVATE
     "LINKER:--version-script,${CMAKE_CURRENT_SOURCE_DIR}/cmake/vllm_export.map")
+endif()
+
+# Sanitizer-only test linkage. Every normal test force-links the complete static
+# `vllm` archive so its registrars are retained. With ASan+UBSan that makes each
+# executable hundreds of MiB and duplicates the same instrumented engine across
+# the whole suite; GitHub's hosted runner ran out of disk while linking. Keep one
+# unversioned internal shared image of the fully instrumented archive instead.
+# This is deliberately separate from packaged `vllm_shared`: that library's
+# version script must continue exporting only the stable C ABI, while the tests
+# need the C++ internals. Production/default builds never create this target.
+if(NOT VLLM_CPP_SANITIZE STREQUAL "OFF")
+  add_library(vllm_sanitize_test_shared SHARED "${_vllm_shared_stub}")
+  add_library(vllm::sanitize_test_shared ALIAS vllm_sanitize_test_shared)
+  target_link_libraries(vllm_sanitize_test_shared PRIVATE vllm)
+  target_include_directories(vllm_sanitize_test_shared INTERFACE
+    "$<TARGET_PROPERTY:vllm,INTERFACE_INCLUDE_DIRECTORIES>")
+  target_include_directories(vllm_sanitize_test_shared SYSTEM INTERFACE
+    "$<TARGET_PROPERTY:vllm,INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>")
+  target_compile_definitions(vllm_sanitize_test_shared INTERFACE
+    "$<TARGET_PROPERTY:vllm,INTERFACE_COMPILE_DEFINITIONS>")
 endif()
 
 # make install => a consumable libvllm.so + libvllm.a + vllm.h (llama.cpp-style).

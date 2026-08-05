@@ -1246,12 +1246,12 @@ protocol is ACCEPTED; W0-W5 LANDED, enforcement opt-in
 ([spec](../.agents/specs/operator-helper-protocol.md)). No engine code, no
 kernel, no numbers changed.
 
-Measured against an oracle built from source at the ACTUAL parity pin, the gap
-is 0.9970x total throughput, not the 0.9819x published against the older
-pip-installed 0.24.0 release: that release is 1.25% faster than the pin, so
-the old denominator was understating us. TPOT (+12.4%) is the one real gap.
-Re-validated 2026-07-29 after rebasing onto 139 upstream commits: 0.9972x /
-TPOT 1.1247x, every axis inside noise and token-identical to the prior series.
+Qwen3.5-4B direct-load remains speed-pending against the oracle built at the
+actual parity pin. The 2026-08-03 revalidation across another 217 upstream
+commits plus the GCC 15 repair measured 0.9980x total throughput and 1.1243x
+TPOT, with output bit-identical to the prior series (128/128 per arm). The
+0.0008x ratio movement was denominator noise. The older 0.9819x result used the
+1.25%-faster pip 0.24.0 release and is not the binding comparison.
 
 One open lead is on record from the same profiling pass: cuBLASLt resolves
 Ampere-class GEMM kernels on this Blackwell device. It is unmeasured and may be
@@ -1265,33 +1265,27 @@ Benchmark provenance is gated as well as measured: both the comparison and the
 same-binary A/B harness refuse to start a leg on a GPU that is not idle, after
 a cooldown rather than before it.
 
-Alongside the default build, `-DVLLM_CPP_SANITIZE=address,undefined` and
-`-DVLLM_CPP_SANITIZE=thread` build the CPU tier under the dynamic detectors, and
-CI runs both as separate jobs. Verified end to end: the ASan+UBSan lane builds
-and passes `test_input_batch`, `test_combine_tokens` and `test_arena` with leak
-detection on. The lanes keep the warnings but drop `-Werror`, because sanitizer
-instrumentation makes GCC's range and initialization analyses fire inside
-libstdc++ on correct code; the plain build is the one that enforces `-Werror`. The lane refuses to configure with the CUDA
-backend on, because a host sanitizer runtime does not instrument nvcc device
-translation units and reports false positives against the CUDA driver; the CUDA
-tier's equivalent is `compute-sanitizer`, and `VT_POOL_BYPASS=1` makes the device
-scratch pool hand out exact-size, really-freed allocations so that tool can see
-tensor boundaries and use-after-free the caching pool otherwise hides.
+The ASan+UBSan and TSan CPU lanes both pass **333/333** on GCC 15.2 after
+merging upstream `main`; ASan leak detection stays enabled. PR #28's hosted
+failure was filesystem exhaustion, not
+a sanitizer finding: sharing one internal instrumented image and using `-g1`
+cut the ASan+UBSan tree from 93 GiB to 5.7 GiB; TSan occupies 1.9 GiB.
+`VT_POOL_BYPASS=1` makes intentional scratch retention visible as real frees,
+and the complete survey fixed one genuine minja context/callable ownership
+cycle. Host sanitizers remain CPU-only; CUDA uses `compute-sanitizer`.
 
-CI concurrency is split by GATE SCOPE, not applied workflow-wide. The two
-DIFF-scoped gates, `documentation-checkpoint` and `commit-protocol-tag`,
-evaluate `github.event.before..github.sha`, so each owns a commit range that no
-later run re-covers (the next run's `before` is this run's `sha`). They
-deliberately carry no concurrency group and are never cancelled. The six
-TREE-scoped jobs (`agent-record`, `cuda-arch-features`, `device-leakage`,
-`build-test-cpu`, and both `sanitize-cpu` lanes) validate HEAD, so only the
-newest push to a ref is meaningful; each carries a per-job group keyed on
-`github.ref` with `cancel-in-progress`. Net effect: a superseded push to `main`
-keeps its 2 per-commit gates and drops the other 6 jobs. The `sanitize-cpu`
-group includes `matrix.lane`, without which the two mutually exclusive
-sanitizer legs of the SAME run would share a group and cancel each other. At
-the workflow level the group is keyed on the SHA for a push, so two pushes to
-`main` never share a group; only pull-request pushes are deduplicated there.
+The plain GCC 15.2 `-Werror` build exposed two optimizer false positives. The
+project-owned `std::vector<bool>` assignment now avoids the packed word-copy
+path without suppression; the vendored minja diagnostic is demoted only for
+`chat_template.cpp` under GNU. Every other diagnostic and unit remains fatal.
+Sanitizer lanes alone omit `-Werror` because instrumentation triggers additional
+libstdc++ range-analysis false positives.
+
+CI concurrency follows gate scope. The diff-scoped documentation and commit
+protocol jobs never cancel because no later run rechecks their commit range.
+Tree-scoped jobs cancel superseded PR runs per ref; sanitizer groups also key on
+the matrix lane so ASan+UBSan and TSan cannot cancel each other. Push workflows
+key on SHA, while pull-request workflows deduplicate the same updated ref.
 
 Known failing on discrete sm_120 (RTX 5070 Ti), pre-existing and not introduced
 by the lanes: `test_cuda_ops` "CUDA matmul (cuBLASLt) matches CPU on odd sizes"
