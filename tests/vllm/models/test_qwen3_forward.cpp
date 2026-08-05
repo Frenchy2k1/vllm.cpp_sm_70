@@ -26,6 +26,7 @@
 #include <string>
 #include <system_error>
 
+#include "vllm/model_executor/model_loader/mxfp4_dequant.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"
@@ -280,6 +281,41 @@ vllm::OwnedTensor DequantToBf16RawNK(const vllm::Nvfp4Weight& w) {
   return o;
 }
 
+// MXFP4 analog of MakeNvfp4: E2M1 packed [n,k/2] + E8M0 scale [n,k/32] (group 32,
+// no global). is_mxfp4=true so the forward routes it through the MXFP4 keep-quant
+// path (Marlin on GPU, dequant fallback on CPU).
+vllm::Nvfp4Weight MakeMxfp4(int64_t n, int64_t k, uint32_t seed) {
+  REQUIRE(k % 32 == 0);
+  vllm::Nvfp4Weight w;
+  w.n = n;
+  w.k = k;
+  w.group_size = 32;
+  w.is_mxfp4 = true;
+  w.scale2 = 0.0f;  // no global
+  w.alpha = 0.0f;   // W4A16
+  w.packed = vllm::dense_loaders::MakeOwned(DType::kI8, {n, k / 2});
+  w.scale = vllm::dense_loaders::MakeOwned(DType::kI8, {n, k / 32});
+  std::mt19937 rng(seed);
+  auto* p = reinterpret_cast<uint8_t*>(w.packed.bytes.data());
+  for (size_t i = 0; i < w.packed.bytes.size(); ++i)
+    p[i] = static_cast<uint8_t>(rng() & 0xFFu);
+  // E8M0 bytes near 127 => scales ~2^-9..2^3 (finite, bf16 normal range).
+  auto* s = reinterpret_cast<uint8_t*>(w.scale.bytes.data());
+  for (size_t i = 0; i < w.scale.bytes.size(); ++i)
+    s[i] = static_cast<uint8_t>(118u + (rng() % 15u));
+  return w;
+}
+
+vllm::OwnedTensor DequantMxfp4ToBf16RawNK(const vllm::Nvfp4Weight& w) {
+  vllm::OwnedTensor o = vllm::dense_loaders::MakeOwned(DType::kBF16, {w.n, w.k});
+  o.nk = true;
+  vllm::DequantMxfp4ToBf16(
+      reinterpret_cast<const uint8_t*>(w.packed.bytes.data()),
+      reinterpret_cast<const uint8_t*>(w.scale.bytes.data()), w.n, w.k,
+      reinterpret_cast<uint16_t*>(o.bytes.data()));
+  return o;
+}
+
 // Merge two raw-NK bf16 [N,K] tensors by output-row concat (the BF16 arm's
 // gate_up layout, which the fp4 arm keeps as two separate operands).
 vllm::OwnedTensor ConcatRawNK(const vllm::OwnedTensor& a,
@@ -371,6 +407,75 @@ TEST_CASE("qwen3 dense forward: NVFP4 W4A16 == BF16-on-dequantized (CPU syntheti
   CHECK(max_abs < 1e-2);
 
   // Determinism: a re-run of the quantized arm is bit-identical.
+  const std::vector<float> a2 = RunForward(c, fp4);
+  CHECK(std::memcmp(a.data(), a2.data(), a.size() * sizeof(float)) == 0);
+}
+
+// MXFP4 analog: the FULL model forward with MXFP4 W4A16 weights must equal the
+// forward on the SAME weights dequantized to BF16 — so any difference is a MXFP4
+// dispatch/layout/merge bug in the model integration, NOT a quantization artifact.
+// On GPU this exercises the Marlin mxf4 path THROUGH the model (merged qkv, split
+// gate_up, o/down) — the exact path the e2e uses, which the op-level unit gate does
+// not (it bypasses the loader/merge/model). RED-first for the e2e residual.
+TEST_CASE("qwen3 dense forward: MXFP4 W4A16 == BF16-on-dequantized (synthetic)") {
+  setenv("VT_FUSED_CHAIN_ADOPT", "1", 1);
+  const HfConfig c = TinyConfig();
+  const int64_t H = c.hidden_size, Hq = c.num_attention_heads;
+  const int64_t Hkv = c.num_key_value_heads, Dh = c.head_dim;
+  const int64_t I = c.intermediate_size;
+  const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
+
+  Qwen3DenseWeights fp4 = TinyWeights(c);
+  Qwen3DenseWeights deq = TinyWeights(c);
+  uint32_t seed = 9000;
+  for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+    auto& fl = fp4.layers[static_cast<size_t>(l)];
+    auto& dl = deq.layers[static_cast<size_t>(l)];
+
+    vllm::Nvfp4Weight qkv = MakeMxfp4(qdim + 2 * kdim, H, seed++);
+    vllm::Nvfp4Weight o = MakeMxfp4(H, qdim, seed++);
+    vllm::Nvfp4Weight g = MakeMxfp4(I, H, seed++);
+    vllm::Nvfp4Weight u = MakeMxfp4(I, H, seed++);
+    vllm::Nvfp4Weight dn = MakeMxfp4(H, I, seed++);
+
+    dl.attn.qkv_proj = DequantMxfp4ToBf16RawNK(qkv);
+    dl.attn.o_proj = DequantMxfp4ToBf16RawNK(o);
+    dl.mlp.gate_up_proj =
+        ConcatRawNK(DequantMxfp4ToBf16RawNK(g), DequantMxfp4ToBf16RawNK(u));
+    dl.mlp.down_proj = DequantMxfp4ToBf16RawNK(dn);
+
+    fl.attn.qkv_proj = vllm::OwnedTensor{};
+    fl.attn.o_proj = vllm::OwnedTensor{};
+    fl.mlp.gate_up_proj = vllm::OwnedTensor{};
+    fl.mlp.down_proj = vllm::OwnedTensor{};
+    fl.attn.qkv_proj_fp4 = std::move(qkv);
+    fl.attn.o_proj_fp4 = std::move(o);
+    fl.mlp.gate_proj_fp4 = std::move(g);
+    fl.mlp.up_proj_fp4 = std::move(u);
+    fl.mlp.down_proj_fp4 = std::move(dn);
+
+    REQUIRE(fl.attn.IsNvfp4());  // emptiness-based dispatch; true for mxfp4 too
+    REQUIRE(fl.mlp.IsNvfp4());
+    REQUIRE_FALSE(dl.attn.IsNvfp4());
+    REQUIRE_FALSE(dl.mlp.IsNvfp4());
+  }
+
+  vllm::dense_nvfp4::ResetW4A16Stats();
+  const std::vector<float> a = RunForward(c, fp4);
+  const vllm::dense_nvfp4::Nvfp4W4A16Stats st = vllm::dense_nvfp4::GetW4A16Stats();
+  REQUIRE(a.size() == static_cast<size_t>(5 * c.vocab_size));
+  for (float x : a) REQUIRE(std::isfinite(x));
+  MESSAGE("MXFP4 W4A16 counters: fallback_gemms=" << st.fallback_gemms
+          << " marlin_gemms=" << st.marlin_gemms);
+
+  const std::vector<float> b = RunForward(c, deq);
+  REQUIRE(b.size() == a.size());
+  double max_abs = 0.0;
+  for (size_t i = 0; i < a.size(); ++i)
+    max_abs = std::max(max_abs, static_cast<double>(std::fabs(a[i] - b[i])));
+  MESSAGE("MXFP4 W4A16 vs BF16-on-dequantized: max |dlogit| = " << max_abs);
+  CHECK(max_abs < 1e-2);
+
   const std::vector<float> a2 = RunForward(c, fp4);
   CHECK(std::memcmp(a.data(), a2.data(), a.size() * sizeof(float)) == 0);
 }

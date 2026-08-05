@@ -36175,6 +36175,57 @@ tmux killed, `/dev/shm` freed, both locks released, `local-ai-worker` left stopp
 found. Evidence: local logs `scratchpad/kimi_build_dgx.log` + `kimi_test_dgx.log`;
 records in spec section 11, model-matrix `MODEL-TEXT-kimi-linear-*`, benchmark record.
 
+## QUANT-CT-MXFP4 Qwen vehicle: W0 checkpoint + W1 kernel target PINNED; empirical GPU/disk-gated
+
+<!-- state: 2026-08-06T21:00 -->
+
+USER re-scope (full MXFP4 at vLLM parity, benchmarked on a Qwen model; DeepSeek/Kimi
+NOT the vehicle). Spike checkpoint on `row/QUANT-CT-MXFP4` (branch off `main`
+`c1a7b452`; helper). No GPU held, no locks touched.
+
+W0 vehicle FOUND: `Yi30/Qwen3-8B-MXFP4` (HF) — dense `Qwen3ForCausalLM`,
+`quant_method=compressed-tensors`, `format=mxfp4-pack-quantized`, group 32,
+`ignore=[lm_head]`, `input_activations` SET (true W4A4), 6.18 GB safetensors,
+complete tokenizer+gen config. Oracle-SUPPORT proved at import/registry on the
+runnable 0.25.0 oracle (`~/venvs/vllm-oracle` -> v0.25.0-stage): `Qwen3ForCausalLM`
+in `get_supported_archs()` AND `CompressedTensorsW4A4Mxfp4` imports; compressed_tensors
+0.17.0. Oracle-RUN greedy golden = GPU-gated, QUEUED. `llm-compressor` NOT installed
+(self-quantize fallback not needed — a runnable checkpoint exists). Alts surveyed:
+`Yi30/*-LLMC` (llm-compressor repro arm), `olka-fi/Qwen3.5-27B-MXFP4` (weight-only
+W4A16, hybrid `Qwen3_5ForConditionalGeneration` — harder arch, secondary),
+`OsaurusAI/Qwen3.6-27B-MXFP4` (MLX mode, NOT compressed-tensors — rejected).
+
+W1 parity target PINNED from the running 0.25.0 tree (site-packages file:line):
+`compressed_tensors_w4a4_mxfp4.py` -> `init_mxfp4_linear_kernel()`
+(`kernels/linear/__init__.py:804`) returns the FIRST supported of
+`_POSSIBLE_MXFP4_KERNELS[CUDA]=[FlashInfer,Marlin,Humming]` (`:462-466`).
+`FlashInferMxFp4LinearKernel.is_supported` (`mxfp4/flashinfer.py:22-28`) =
+`has_device_capability(100) AND has_flashinfer_cutedsl()`; on GB10 BOTH True (cap
+(12,1); cute-dsl import returns True on-box). So the oracle runs the TRUE W4A4
+fp4xf4 cute-dsl GEMM (`flashinfer_mxfp4_quantize` + `flashinfer_scaled_fp4_mm`,
+`block_size=32,use_nvfp4=False`) — Marlin W4A16 is the non-Blackwell/cute-dsl-absent
+fallback only. This OVERRIDES the row's earlier "Marlin W4A16" hypothesis for GB10;
+per mirror policy W4A4 is our target here. Runtime confirm (grep
+`"Using FlashInferMxFp4LinearKernel for MXFP4 GEMM"` + same-tool nsys) = QUEUED.
+A/B lever recorded: `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel` forces Marlin.
+
+W2 route DESIGNED (spec section "W0-W5 (Qwen vehicle)"): extend the landed NVFP4
+cutlass fp4 tensor-core GEMM to the mxf4 block-scale format (group 32, E8M0 SF, no
+global = flashinfer `use_nvfp4=False,block_size=32`; mxf4 mma is consumer-Blackwell
+= GB10-available) + a mxf4 activation-quant emitter; `schemes/mxfp4.h` selection
+method mirroring `schemes/nvfp4.h` (chosen once, ResidentWeight staging per the
+keep-quant-device-slice rule); CPU `mxfp4_emulation.{h,cpp}` mirroring
+`nvfp4_emulation.*` (simpler, no globals) as the gate truth. W3 gates (CPU emulation
+unit + GPU M=1 RED trap + e2e SACRED distributional) and W4 bench (`online_gate.py`
+c1..c8x3, single load) SPEC'd.
+
+EMPIRICAL STATUS: W0-run/W1-runtime/W2-build/W3/W4 all need GB10 exclusively; at spec
+time gpu.lock+/tmp/gpu HELD (Option-A `test_qwen36_async_serving`, 96% util) and a
+Kimi-48B `hf download` (91.5G) was shrinking free disk (98->82G), so a 6.2G pull would
+risk the 15G floor. WAITED (locks not broken, disk not breached). Resume: download
+when disk >= ~15G free + lock free, then greedy golden, then build+gate+bench.
+Evidence: spec `.agents/specs/mxfp4-compressed-tensors.md` (W0-W5 section).
+
 ## SERVE-ASYNC-OPTION-A: decode-graph input H2D staged OUT of capture (faithful vLLM) — LANDS gated OFF; RED finally CONSTRUCTED; throughput WASH refutes "c16 = the baked H2D"
 <!-- state: 2026-08-06T21:00 -->
 
@@ -36236,6 +36287,43 @@ the residual is prefill glue (task #61) + steady host-orchestration/GPU compute,
 async input path. Evidence `dgx:~/work/mirror-ab/option-a/`, branch `row/SERVE-ASYNC-
 OPTION-A`.
 
+## QUANT-CT-MXFP4 Qwen W0+W1 EMPIRICAL: oracle golden RUNS (Marlin W4A16); FlashInfer W4A4 CRASHES on sm_121
+
+<!-- state: 2026-08-06T21:30 -->
+
+Box freed (coordinator); resumed the QUEUED empirical steps under both flock locks,
+mem gate (94-95 GiB free >= 90), tmux + done-markers, oracle alone, single load,
+disk floor respected (31 GiB free after the 6.18 GB pull). Box left clean (locks
+released, tmux killed, GPU idle). Branch `row/QUANT-CT-MXFP4`, PR #38.
+
+W0 DONE: downloaded `Yi30/Qwen3-8B-MXFP4` and the 0.25.0 oracle RAN a greedy golden
+(`temperature=0,seed=0,enforce_eager`, 4 prompts): PYEXIT=0, coherent+correct
+(Paris/Rome/Berlin/Madrid; 2+2=4 ... 5+5=10; a coherent story; a correct recursive
+fibonacci). Satisfies the hard oracle rule (RUNS a greedy golden, not just
+constructs). Golden + evidence: `docs/bench-evidence/mxfp4-qwen/`
+(`golden_marlin_w4a16.json`, `W0-W1-oracle-run.md`).
+
+W1 DONE with a RUNTIME CORRECTION of the source-only trace: `init_mxfp4_linear_kernel`
+selects `FlashInferMxFp4LinearKernel` (is_supported passes on cap 121>=100 + cute-dsl)
+and logs "Using FlashInferMxFp4LinearKernel", THEN engine start DIES:
+`flashinfer.utils.BackendSupportedError: mm_fp4 does not support backend 'cute-dsl'
+with capability 121`. FlashInfer's cute-dsl mxf4 backend covers sm_100 datacenter
+Blackwell, NOT sm_121 GB10 -> the DEFAULT oracle config is non-functional for this
+checkpoint on GB10. WORKING path = `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`
+-> `MarlinMxFp4LinearKernel` (W4A16 weight-only fp4, `apply_fp4_marlin_linear,
+weight_global_scale=None`). So the GB10 parity target is MARLIN W4A16 mxf4, NOT
+FlashInfer W4A4 -- this REVALIDATES the row's original Laguna-B2 hypothesis and
+disproves my source-only W1 conclusion (is_supported != actually-runs; trace the
+execution). W4 bench MUST set that env or the oracle arm crashes.
+
+W2/W3/W4 REMAINING: native Marlin-W4A16-mxf4 keep-quant in our engine (extend
+`src/vt/cuda/marlin/*` FP4 plumbing for group-32 E8M0, no global -- the Laguna B2
+route, NOT a new cute-dsl kernel) + gates (e2e vs this golden, distributional if
+bf16-non-det) + `online_gate.py` bench. Build-env caveat: DGX has NO clean vllm.cpp
+checkout and ~31 GiB free (full CUDA build ~21 GiB, tight/slow; other agents'
+`~/work/*/build` must not be reused) -> W2 needs a git-archive + fresh CUDA build.
+Spec updated (`.agents/specs/mxfp4-compressed-tensors.md`, W1 EMPIRICAL RESULT block).
+
 ## MODEL-TEXT-kimi-linear: §8 SACRED oracle golden CAPTURED (STRICT, 8/8 deterministic); full our-engine e2e f32-loader-blocked (~183 GiB > 119 pool)
 <!-- state: 2026-08-06T23:00 -->
 
@@ -36275,6 +36363,39 @@ Triton-AOT decode + grouped-MoE device slabs, (c) speed. Box left clean; the 91.
 checkpoint retained in the HF cache. Evidence: `dgx:~/kimi-e2e/{oracle_full.log,mem_full.log}`,
 local golden `tests/parity/goldens/kimi_linear_greedy/`.
 
+## QUANT-CT-MXFP4 W2 native Marlin mxf4 keep-quant LANDS (builds+runs on GB10); e2e RED, bug localized to group_blocks=2 GEMM
+
+<!-- state: 2026-08-06T23:30 -->
+
+Coordinator freed the box for W2-W4. Implemented the native MXFP4 (mxfp4-pack-quantized)
+Marlin W4A16 keep-quant path for dense Qwen3, routed through the EXISTING Marlin FP4
+infra (Laguna-B2 route), grounded 1:1 in vLLM marlin_utils_fp4.prepare_fp4_layer_for_marlin
+(is_nvfp4=False). Commit `7068dca6` on `row/QUANT-CT-MXFP4`, PR #38.
+
+LANDED (all additive; NVFP4 + 27B/35B gate paths byte-unchanged): generate_kernels.py
+MXFP4 config (s_type kFE8M0fnu, group_blocks [2]) + regenerated selector/.cu (15 new
+group_blocks=2 instances); MarlinProcessExpertScalesMxfp4 (E8M0 passthrough permute);
+MoeMarlinArgs.{group_size,mxfp4} + cuda_moe_marlin.cu launcher branch (kFE8M0fnu,
+group_size 32, global=nullptr); Nvfp4Weight.{group_size,is_mxfp4} + dense_nvfp4_gemm.h
+branch + MatmulMxfp4W4A16D + MXFP4 CPU fallback; dense_weight_loaders.h MXFP4 loaders
+(U8 E8M0 scale [N,K/32], no global); qwen3_weights.cpp detect+load.
+
+VERIFIED: clean -Werror CUDA build on GB10 (~137-TU incremental; full tree fits if you
+build SPECIFIC targets — bare `ninja` whole-archives libvllm.a into 100+ tests = 28 GiB,
+blows the 15G disk floor, learned the hard way). Loads Yi30/Qwen3-8B-MXFP4; dispatches
+the native group_blocks=2 Marlin kernel; RUNS. e2e NOT token-exact vs golden: a
+DETERMINISTIC UNIFORM numerics error (prefill+decode; identical with VLLM_CPP_CUDAGRAPH=0
+so NOT graph-safety) — robust tokens survive (" Paris"/"there" match golden) but the
+rest degenerates; p4 token-1 also wrong ("#" vs "\n"), so it is a uniform GEMM error not
+an M=1-only mis-route. LOCALIZED: the MXFP4 scale permute is PROVEN byte-exact vs vLLM's
+mxfp4_marlin_process_scales (128x256 CPU check 1024/1024), and the fp4 dequant
+(dequant_skip_flop=false bias path) is a faithful lift — so the residual is the
+group_blocks=2 Marlin GEMM interaction our prior NVFP4-only (group_blocks=1) usage never
+exercised. W3 e2e RED (honest). NEXT: device unit gate MatmulMxfp4W4A16D vs the CPU
+dequant reference at M=1 AND M=8 (RED-first) to pinpoint; then re-gate e2e, then W4 bench.
+Box left clean (locks released, tmux killed, GPU idle, disk 27G). Build tree persists at
+dgx:~/work/mxfp4-w2 for the continuation.
+
 ## MODEL-TEXT-kimi-linear: bf16-resident loader/forward POOL MATH + grounded design (§13); implementation scoped, PENDING
 <!-- state: 2026-08-07T00:30 -->
 
@@ -36307,6 +36428,33 @@ CUDA build + the memory-critical full-model e2e vs the golden) is the scoped NEX
 no code landed beyond records, nothing broken. Row STAYS `ACTIVE`. Next: implement §13 on
 this branch, keep `test_kimi_linear_forward` 12/12·614 green, then the full-model e2e
 (free -g >= 90, monitor, STOP if the pool math does not close in practice).
+
+## QUANT-CT-MXFP4 W3 unit gate GREEN: MXFP4 GEMM PROVEN correct; e2e residual is NOT the compute
+
+<!-- state: 2026-08-07T01:00 -->
+
+Built + ran the owed W3 device unit gate (`test_ops_moe_grouped.cpp`, commit `8469e333`):
+MXFP4 Marlin GEMM vs the INDEPENDENT CPU dequant reference (`DequantMxfp4ToF32` + f32
+matmul), single-expert dense routing, M=1 AND M=8. GREEN — max_rel 3.8e-3 (pure bf16
+rounding). This PROVES the MXFP4 keep-quant compute (repack, E8M0 scale processing,
+group_blocks=2 kernel dispatch, launcher) is correct, so the e2e degeneration
+(`7068dca6`) is NOT the GEMM.
+
+Exhaustive component verification (all GREEN, none is the bug): scale permute byte-exact
+vs vLLM's mxfp4_marlin_process_scales at ALL model shapes (N=6144/12288, K=12288, CPU
+check); GEMM unit gate 0.38% M=1/M=8; loader dequant of the REAL layer-0 q_proj gives
+sane+correct weights (min -0.5/max 0.5/mean 0.02, scales 2^-8..2^-7) with matching
+shapes + working U8-scale discriminator; model dispatch (`IsNvfp4()`=`!fp4.Empty()`)
+routes MXFP4 correctly; graph-off == graph-on (not graph-safety); dense Qwen3 +
+NVFP4-W4A16 are known token-exact e2e. So the e2e residual is NOT the compute NOR the
+loader byte interpretation. PRIME SUSPECT: the group_blocks=2 kernel at LARGE N/K (unit
+gate only ran N=128) — extended shape cases ({4096,4096},{4096,12288},{12288,4096})
+committed RUN-PENDING (`e28130ee`); else a model-integration subtlety needing a
+per-layer activation diff vs the oracle. NEXT: run the extended unit gate (box was taken
+by the Kimi bf16 agent — locks HELD, WAITED, did not intrude); RED at a model shape =>
+large-shape kernel fix; GREEN => per-layer activation dump. Then re-gate e2e + W4 bench.
+Box left as found (Kimi holds the locks; my tmux sessions killed; build tree persists at
+dgx:~/work/mxfp4-w2).
 
 ## MODEL-TEXT-kimi-linear: bf16-resident loader/forward IMPLEMENTED + CPU-gated (§13); dgx CUDA build + full-model e2e PENDING
 <!-- state: 2026-08-07T01:30 -->
@@ -36342,6 +36490,35 @@ PENDING (this row, on dgx.casa GB10 — checkpoint CACHED 92G, 89 GiB free RAM, 
 vs the STRICT golden (free -g >= 90 before load, memory-monitored; STOP + record if the pool math
 diverges toward the limit). Row STAYS `ACTIVE`; `VT_KIMI_DEVICE_COMPUTE` default STAYS OFF until
 the e2e token gate is green.
+
+## QUANT-CT-MXFP4 e2e RESOLVED: compute CORRECT (async-off 3/4 token-exact); async-default degeneration is a PRE-EXISTING classic-dense-Qwen3 bug
+
+<!-- state: 2026-08-07T03:00 -->
+
+Closed the e2e residual. Root-caused via the box-free continuation: the DEFAULT
+(async scheduling ON) degeneration is NOT the MXFP4 compute — with VT_ASYNC_SCHED=0
+the SAME binary is TOKEN-EXACT vs the golden on 3/4 prompts (p1 capitals, p2 arithmetic,
+p4 fibonacci all EXACT; p3 open-ended story diverges after the identical first token
+" there" = bf16/impl non-determinism, near-tie regime). The async executor overlaps
+the prior step's output-copy (async_copy_queue_) with the current forward; classic dense
+Qwen3ForCausalLM (qwen3.cpp) lacks the async device-mirror fix (the #31 "async batch-1
+token-0 degeneration" class wired only for the gate models qwen3_5) -> quant-independent,
+pre-existing classic-dense-Qwen3 async bug (SEPARATE row; would hit bf16/NVFP4 too).
+
+MXFP4 compute PROVEN correct across the full stack: op-level Marlin GEMM vs independent
+CPU dequant (0.36% M=1/M=8, all real shapes, e28130ee); scale permute byte-exact vs vLLM
+at all model shapes; model-facing MakeLinearMethod->Apply->BuildMarlinDenseResident gate
+(bad=0 K=4096+K=12288, 02410453); and e2e async-off 3/4 token-exact. Also surfaced +
+recorded: MarlinDenseResidentFor is keyed by weight POINTER (fine in the model; a reused
+stack slot aliases in tests). Reverted an exploratory per-stream DenseMarlinWorkspace
+change (not the async cause; async overlaps output-copy, not 2 forwards).
+
+REMAINING: (1) classic-dense-Qwen3 async device-mirror fix (separate row, non-MXFP4) for
+a default-config e2e; (2) W4 bench (online_gate.py c1..c8x3) on the async-off compute
+path, oracle arm VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel; (3) formal
+distributional gate for p3. Evidence: docs/bench-evidence/mxfp4-qwen/W3-e2e-result.md.
+Box: locks released, tmux killed, build tree persists at dgx:~/work/mxfp4-w2.
+
 ## MODEL-TEXT-kimi-linear: FULL-MODEL GB10 e2e RUNS via bf16-resident path — NEAR-TIE 106/128 (6/8 prompts token-exact); pool math CLOSES
 <!-- state: 2026-08-07T03:00 -->
 
@@ -36381,3 +36558,4 @@ host round-trips (the 1.59 tok/s is the O(n^2) full-recompute + host-island rate
 decode). `VT_KIMI_DEVICE_COMPUTE` STAYS OFF (parity-enablers: a near-tie is not token-exact). Row STAYS
 `ACTIVE`. Residuals now precisely: (a) STRICT token-exactness (device islands + bf16 stream), (b) the
 paged het-KV incremental decode, (c) speed.
+

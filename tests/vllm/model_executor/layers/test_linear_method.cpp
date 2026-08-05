@@ -16,8 +16,12 @@
 #include <vector>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/schemes/nvfp4.h"
+#include "vllm/model_executor/model_loader/mxfp4_dequant.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+
+#include <cmath>
+#include <random>
 
 namespace {
 
@@ -67,7 +71,115 @@ Nvfp4Weight MakeNvfp4W4A16(int64_t N, int64_t K) {
   return w;
 }
 
+// A random MXFP4 W4A16 weight: E2M1 packed [N,K/2] + E8M0 scale [N,K/32], group
+// 32, no global, is_mxfp4=true — so the factory + Apply route the MXFP4 keep-quant
+// path (Marlin on GPU via BuildMarlinDenseResident).
+Nvfp4Weight MakeMxfp4W4A16(int64_t N, int64_t K, uint32_t seed) {
+  Nvfp4Weight w;
+  w.n = N;
+  w.k = K;
+  w.group_size = 32;
+  w.is_mxfp4 = true;
+  w.scale2 = 0.0f;
+  w.packed.dtype = DType::kI8;
+  w.packed.rank = 2;
+  w.packed.shape[0] = N;
+  w.packed.shape[1] = K / 2;
+  w.packed.bytes.resize(static_cast<size_t>(N) * (K / 2));
+  w.scale.dtype = DType::kI8;
+  w.scale.rank = 2;
+  w.scale.shape[0] = N;
+  w.scale.shape[1] = K / 32;
+  w.scale.bytes.resize(static_cast<size_t>(N) * (K / 32));
+  std::mt19937 rng(seed);
+  for (auto& b : w.packed.bytes) b = static_cast<uint8_t>(rng() & 0xFFu);
+  for (auto& s : w.scale.bytes) s = static_cast<uint8_t>(118u + (rng() % 15u));
+  return w;
+}
+
 }  // namespace
+
+#ifdef VT_MARLIN_NVFP4
+// The model-facing MXFP4 path END-TO-END: MakeLinearMethod(bf16-empty, mxfp4) ->
+// Apply -> MatmulNvfp4W4A16D -> (GPU) MatmulNvfp4MarlinD -> BuildMarlinDenseResident
+// -> MoeGroupedGemmNvfp4Marlin. This is the ONE link the op-level unit gate does NOT
+// cover (it feeds MANUALLY-built residents), so it isolates a resident-builder bug
+// from the kernel. Reference = the INDEPENDENT CPU dequant (DequantMxfp4ToF32 + f32
+// matmul). Real Qwen3-8B projection shapes; M=1 (decode) AND M=8 (prefill).
+TEST_CASE("linear_method: MXFP4 W4A16 Apply (Marlin BuildMarlinDenseResident) == CPU dequant ref") {
+  vt::Backend* gpu = nullptr;
+  try {
+    gpu = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend");
+    return;
+  }
+  // Persist weights in a vector so each shape has a DISTINCT, stable address —
+  // the resident cache (MarlinDenseResidentFor) is keyed by weight pointer, and a
+  // loop-local reused stack slot would alias residents across shapes (a test
+  // artifact, not a model bug: the model's weights are distinct persistent objects).
+  const std::vector<std::pair<int64_t, int64_t>> shapes{{4096, 4096}, {12288, 4096}};
+  std::vector<Nvfp4Weight> weights;
+  for (auto KN : shapes) weights.push_back(MakeMxfp4W4A16(KN.second, KN.first, 2024));
+  for (size_t si = 0; si < shapes.size(); ++si) {
+    const int64_t K = shapes[si].first, N = shapes[si].second;
+    CAPTURE(K);
+    CAPTURE(N);
+    Nvfp4Weight& w = weights[si];
+    OwnedTensor bf16_empty;  // Empty() => factory selects the fp4 method
+
+    std::vector<float> w_f32(static_cast<size_t>(N * K));
+    vllm::DequantMxfp4ToF32(reinterpret_cast<const uint8_t*>(w.packed.bytes.data()),
+                            reinterpret_cast<const uint8_t*>(w.scale.bytes.data()), N, K,
+                            w_f32.data());
+
+    for (int64_t M : {int64_t{1}, int64_t{8}}) {
+      CAPTURE(M);
+      vt::Queue q = gpu->CreateQueue();
+      vllm::dense_attn::Dev d{*gpu, q};
+
+      std::vector<uint16_t> act_bf16(static_cast<size_t>(M * K));
+      std::mt19937 rng(7 + static_cast<uint32_t>(M));
+      std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+      std::vector<float> act_r(static_cast<size_t>(M * K));
+      for (size_t i = 0; i < act_bf16.size(); ++i) {
+        act_bf16[i] = vt::F32ToBF16(dist(rng));
+        act_r[i] = vt::BF16ToF32(act_bf16[i]);
+      }
+      std::vector<float> ref(static_cast<size_t>(M * N), 0.0f);
+      for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+          float acc = 0.0f;
+          for (int64_t k = 0; k < K; ++k)
+            acc += act_r[static_cast<size_t>(m * K + k)] * w_f32[static_cast<size_t>(n * K + k)];
+          ref[static_cast<size_t>(m * N + n)] = acc;
+        }
+
+      vllm::dense_attn::DBuf x(d, DType::kBF16, {M, K}, act_bf16.data());
+      auto method = layers::MakeLinearMethod(bf16_empty, w);
+      vllm::dense_attn::DBuf out = method->Apply(d, x.t(), DType::kBF16);
+      std::vector<uint16_t> got_bf16(static_cast<size_t>(M * N));
+      gpu->Copy(q, got_bf16.data(), out.t().data,
+                got_bf16.size() * sizeof(uint16_t));
+      gpu->Synchronize(q);
+      double max_rel = 0.0, max_abs = 0.0;
+      size_t bad = 0;
+      for (size_t i = 0; i < got_bf16.size(); ++i) {
+        const float g = vt::BF16ToF32(got_bf16[i]);
+        const float a = std::fabs(g - ref[i]);
+        const float tol = 2e-2f + 2e-2f * std::fabs(ref[i]);
+        if (a > tol) ++bad;
+        max_abs = std::max(max_abs, static_cast<double>(a));
+        max_rel = std::max(max_rel, static_cast<double>(a / (std::fabs(ref[i]) + 1e-6f)));
+      }
+      MESSAGE("MXFP4 Apply K=" << K << " N=" << N << " M=" << M
+              << " bad=" << bad << " max_abs=" << max_abs << " max_rel=" << max_rel);
+      CHECK(bad == 0);
+      gpu->DestroyQueue(q);
+    }
+  }
+}
+#endif  // VT_MARLIN_NVFP4
 
 TEST_CASE("linear_method: factory selects bf16 vs nvfp4-w4a16 by weight presence") {
   OwnedTensor bf16 = MakeBf16({4, 16}, 1);

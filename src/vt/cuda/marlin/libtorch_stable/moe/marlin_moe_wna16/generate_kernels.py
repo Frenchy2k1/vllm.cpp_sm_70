@@ -72,6 +72,19 @@ QUANT_CONFIGS = [
         "thread_m_blocks": THREAD_M_BLOCKS,
         "group_blocks": [1],
     },
+    # MXFP4 (compressed-tensors mxfp4-pack-quantized, bf16 activation) — the
+    # QUANT-CT-MXFP4 dense-Qwen W4A16 path. Same E2M1 weight, but E8M0 (UE8M0)
+    # block scales at group_size 32 => group_blocks == 2, and NO global scale.
+    # Mirrors vLLM marlin_utils_fp4.prepare_fp4_layer_for_marlin (is_nvfp4=False:
+    # group_size 32, mxfp4_marlin_process_scales, weight_global_scale=None) @ pin.
+    {
+        "a_type": ["kBFloat16"],
+        "b_type": "kFE2M1f",
+        "s_type": "kFE8M0fnu",
+        "thread_configs": THREAD_CONFIGS,
+        "thread_m_blocks": THREAD_M_BLOCKS,
+        "group_blocks": [2],
+    },
 ]
 
 
