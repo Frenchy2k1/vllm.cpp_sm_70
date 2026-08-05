@@ -305,7 +305,7 @@ built on it rather than keeping the flattering one.
 | DFlash speculative decode | Below vLLM throughput | bf16 acceptance floor ~0.85x |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
-| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | device COMPUTE GPU-verified (f32); §8 oracle golden CAPTURED (STRICT, 8/8); full e2e f32-loader-blocked | §8 golden captured on GB10 (util 0.82, moe=triton, min 15 GiB avail, no reboot): 8/8 DETERMINISTIC K=3, STRICT gate, committed. `test_kimi_linear_forward` 12/12·614 GPU. Full e2e blocked: f32 loader ~183 GiB > 119 pool |
+| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | Full-model GB10 e2e RUNS (bf16-resident §13), NEAR-TIE 106/128, pool math CLOSES; default OFF | Full model RUNS on GB10 (bf16-resident, RSS peak 1.7 GiB, min-avail 21 GiB, no OOM). Token NEAR-TIE 106/128 (6/8 prompts exact, numerics vs deterministic oracle). 1.59 tok/s. Detail: spec §13 |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |

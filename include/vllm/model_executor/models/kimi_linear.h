@@ -220,10 +220,75 @@ struct KimiLinearHostWeights {
   std::vector<KimiLinearLayerHostWeights> layers;
 };
 
+// ─── bf16-RESIDENT WEIGHTS — the full-model device forward (§13) ────────────────
+// The full 48.9B model is 91.5 GiB bf16; materializing it to f32
+// (KimiLinearHostWeights) is ~183 GiB and OOM-reboots the 119 GiB unified pool. The
+// resident path keeps every LARGE matmul weight as a bf16 `OwnedTensor` (cudaMalloc'd
+// `d_dev`, NO ATS penalty — the gb10-weight-residency lever) consumed via the
+// (bf16,bf16)->f32 `vt::MatmulBT` (vLLM's own numerics, best token-exact chance vs the
+// bf16 oracle golden), and keeps only the TINY norm/scale/conv/router vectors as host
+// f32 (ReadF32 from bf16 at load; < 0.1 GiB total, aliased into device kernels via the
+// GB10 unified pool). Activations stay f32 (the residual stream; the two host-fallback
+// islands — KDA recurrence, NoPE-MLA softmax — need f32) with a per-GEMM bf16 cast.
+// STAGED per tensor at load then `ReleaseHost` (only ONE tensor's host bytes live at a
+// time; LOAD peak ~91.5 GiB device + <1 GiB host). Loaded by
+// `LoadKimiLinearResidentBf16Weights` (NEVER `MaterializeHost`); the tiny-config unit
+// gate builds it from the f32 host weights (`BuildKimiResidentFromHost`). Mirrors the
+// laguna_weights.cpp / gemma_weights.cpp OwnedTensor loaders + laguna.cpp:125-139
+// residency + the Laguna cast-GEMM (laguna.cpp:1939-1946).
+struct KdaResidentWeights {
+  OwnedTensor q_proj, k_proj, v_proj;  // bf16 [num_heads*head_dim, hidden]
+  OwnedTensor f_a_proj;                // bf16 [head_dim, hidden]
+  OwnedTensor f_b_proj;                // bf16 [num_heads*head_dim, head_dim]
+  OwnedTensor b_proj;                  // bf16 [num_heads, hidden]
+  OwnedTensor g_a_proj;                // bf16 [head_dim, hidden]
+  OwnedTensor g_b_proj;                // bf16 [num_heads*head_dim, head_dim]
+  OwnedTensor o_proj;                  // bf16 [hidden, num_heads*head_dim]
+  std::vector<float> q_conv, k_conv, v_conv;  // f32 [proj, K]  (short conv; small)
+  std::vector<float> dt_bias;          // f32 [proj]      (host recurrence input)
+  std::vector<float> a_log;            // f32 [num_heads] (host recurrence input)
+  std::vector<float> o_norm;           // f32 [head_dim]  (RmsNormGated weight)
+};
+struct MlaResidentWeights {
+  OwnedTensor q_proj, kv_a_proj_with_mqa, kv_b_proj, o_proj;  // bf16
+  std::vector<float> kv_a_layernorm;   // f32 [kv_lora]
+};
+struct MlpResidentWeights {
+  OwnedTensor gate_proj, up_proj, down_proj;  // bf16
+};
+struct MoeResidentWeights {
+  // bf16 [num_experts, hidden]: the router gate goes through the SAME (bf16,bf16)->f32
+  // GemmBf16 as vLLM's bf16 router — a f32 gate could flip near-tie expert selections
+  // in the 256-expert top-8 MoE (the primary token-divergence risk vs the oracle).
+  OwnedTensor gate;
+  std::vector<float> e_score_correction_bias;  // f32 [num_experts] (added to scores)
+  bool has_shared = false;
+  MlpResidentWeights shared;
+  std::vector<MlpResidentWeights> experts;
+};
+struct KimiLinearLayerResidentWeights {
+  std::vector<float> input_layernorm;           // f32 [hidden]
+  std::vector<float> post_attention_layernorm;  // f32 [hidden]
+  bool is_kda = false;
+  KdaResidentWeights kda;   // populated iff is_kda
+  MlaResidentWeights mla;   // populated iff !is_kda
+  bool is_moe = false;
+  MlpResidentWeights dense; // populated iff !is_moe (dense layer-0)
+  MoeResidentWeights moe;   // populated iff is_moe
+};
+struct KimiLinearResidentWeights {
+  bool resident = false;
+  OwnedTensor embed_tokens;       // bf16 [vocab, hidden]
+  std::vector<float> final_norm;  // f32 [hidden]
+  OwnedTensor lm_head;            // bf16 [vocab, hidden] (Empty() => tied, use embed)
+  bool tie_word_embeddings = false;
+  std::vector<KimiLinearLayerResidentWeights> layers;
+};
+
 // Whole Kimi-Linear weights. W1 landed the resolved params + the loader's coverage
 // result; W2 (the CPU reference lane) also MATERIALIZES the host float weights that
-// the reference forward composes. Device staging (the absorbed MLA bmm forms, the
-// grouped-MoE slabs) stays the born-on-the-runner W6/W7 residual.
+// the reference forward composes. The bf16-RESIDENT lane (§13) populates `resident`
+// instead of `host` for the full-model device forward (host f32 would OOM).
 struct KimiLinearWeights {
   KimiLinearParams params{};
   // Total enumerated checkpoint tensors (structural size of the 27-layer hybrid).
@@ -232,8 +297,13 @@ struct KimiLinearWeights {
   // `enumerated_tensors` on a successful load (the loader throws BY NAME on the
   // first missing tensor, so a partial checkpoint never returns silently).
   int64_t accounted_tensors = 0;
-  // The host-materialized float weights the CPU reference forward composes.
+  // The host-materialized float weights the CPU reference forward composes (W2, tiny
+  // config only for the full model — 183 GiB f32 OOMs the pool).
   KimiLinearHostWeights host{};
+  // The bf16-resident weights the full-model device forward composes (§13). Set by
+  // LoadKimiLinearResidentBf16Weights (full model) or BuildKimiResidentFromHost (tiny
+  // gate); host stays unmaterialized on the full-model resident path.
+  KimiLinearResidentWeights resident{};
 };
 
 // Load `KimiLinearForCausalLM` safetensors. Throws BY NAME (never silent zeros) on
@@ -243,6 +313,33 @@ struct KimiLinearWeights {
 // device materialization is W2+ (the forward still REFUSES-by-name).
 KimiLinearWeights LoadKimiLinearForCausalLMWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+
+// ─── bf16-RESIDENT loader (§13) — the full-model device-forward weights ─────────
+// Load `KimiLinearForCausalLM` as bf16-resident weights (NEVER the 183 GiB f32
+// MaterializeHost): every large matmul weight via `dense_loaders::LoadBf16Direct`
+// into an `OwnedTensor`, the tiny norm/scale/conv/router vectors decoded to host f32.
+// When `stage_queue` is a CUDA queue, each large tensor is STAGED to `d_dev`
+// (cudaMalloc + one H2D) and `ReleaseHost`'d immediately after its copy, so the LOAD
+// peak holds only ONE tensor's host bytes on top of the growing ~91.5 GiB device
+// residency (the pool-math constraint, §13). When `stage_queue` is null (or CPU) the
+// host bf16 bytes are kept and aliased on demand (the CPU tiny-config path). Throws
+// BY NAME on the first missing tensor (same coverage/shape checks as the f32 loader).
+KimiLinearWeights LoadKimiLinearResidentBf16Weights(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config,
+    vt::Queue* stage_queue);
+
+// Build the bf16-resident weights from already-materialized host f32 weights (the
+// tiny-config unit gate: round each large matmul weight f32->bf16 into an OwnedTensor,
+// copy the tiny vectors verbatim as host f32). This exercises the SAME bf16 device
+// forward the full model uses, against the independent f32 host reference.
+KimiLinearResidentWeights BuildKimiResidentFromHost(const KimiLinearHostWeights& host,
+                                                    const KimiLinearParams& p);
+
+// Stage a bf16 OwnedTensor to a CUDA device-resident d_dev copy (cudaMalloc + one
+// H2D, byte-exact) then release its host bytes — the per-tensor stage-then-release
+// the resident loader interleaves with each LoadBf16Direct. No-op on CPU (the host
+// bytes are aliased directly) and when already staged / host already released.
+void StageKimiResidentBf16(vt::Queue& queue, const OwnedTensor& w);
 
 // ─── PER-OP CPU REFERENCE FORWARDS (W2-W6, kimi_linear_forward.cpp) ────────────
 // Each is a full-sequence, fresh-state reference over the host float weights,
