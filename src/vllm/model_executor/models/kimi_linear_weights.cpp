@@ -32,6 +32,7 @@
 #include "vllm/model_executor/models/kimi_linear.h"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -177,6 +178,116 @@ std::string ShapeStr(const std::vector<int64_t>& s) {
     out += std::to_string(s[i]);
   }
   return out + "]";
+}
+
+// ─── HOST (float) MATERIALIZATION — the CPU reference-forward weights (W2) ──────
+using HaveMap = std::unordered_map<std::string, const StTensor*>;
+
+int64_t NumEl(const std::vector<int64_t>& shape) {
+  int64_t n = 1;
+  for (int64_t d : shape) n *= d;
+  return n;
+}
+
+// Decode one enumerated checkpoint tensor to row-major f32. Handles the two dtypes
+// the shipped Kimi-Linear checkpoint uses (BF16 weights, F32 conv/dt_bias/A_log).
+std::vector<float> ReadFloat(const HaveMap& have, const std::string& name) {
+  const auto it = have.find(name);
+  VT_CHECK(it != have.end(),
+           "kimi-linear materialize: missing tensor '" + name + "'");
+  const StTensor& t = *it->second;
+  const int64_t n = NumEl(t.shape);
+  std::vector<float> out(static_cast<size_t>(n), 0.0f);
+  if (t.dtype == "F32") {
+    std::memcpy(out.data(), t.data, static_cast<size_t>(n) * 4);
+  } else if (t.dtype == "BF16") {
+    const uint8_t* p = t.data;
+    for (int64_t i = 0; i < n; ++i) {
+      uint16_t bits = static_cast<uint16_t>(p[i * 2]) |
+                      (static_cast<uint16_t>(p[i * 2 + 1]) << 8);
+      uint32_t u = static_cast<uint32_t>(bits) << 16;
+      std::memcpy(&out[static_cast<size_t>(i)], &u, 4);
+    }
+  } else {
+    VT_CHECK(false, "kimi-linear materialize: tensor '" + name + "' has dtype '" +
+                        t.dtype + "' (only BF16/F32 supported in the CPU reference)");
+  }
+  return out;
+}
+
+KimiLinearHostWeights MaterializeHost(const KimiLinearParams& p,
+                                      const HaveMap& have) {
+  KimiLinearHostWeights h;
+  h.embed_tokens = ReadFloat(have, "model.embed_tokens.weight");
+  h.final_norm = ReadFloat(have, "model.norm.weight");
+  h.lm_head = p.tie_word_embeddings ? h.embed_tokens
+                                    : ReadFloat(have, "lm_head.weight");
+
+  h.layers.resize(static_cast<size_t>(p.num_hidden_layers));
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    KimiLinearLayerHostWeights& lw = h.layers[static_cast<size_t>(l)];
+    const std::string b = "model.layers." + std::to_string(l) + ".";
+    lw.input_layernorm = ReadFloat(have, b + "input_layernorm.weight");
+    lw.post_attention_layernorm = ReadFloat(have, b + "post_attention_layernorm.weight");
+
+    const std::string a = b + "self_attn.";
+    lw.is_kda = p.is_kda_layer(l);
+    if (lw.is_kda) {
+      KdaLayerHostWeights& k = lw.kda;
+      k.q_proj = ReadFloat(have, a + "q_proj.weight");
+      k.k_proj = ReadFloat(have, a + "k_proj.weight");
+      k.v_proj = ReadFloat(have, a + "v_proj.weight");
+      k.f_a_proj = ReadFloat(have, a + "f_a_proj.weight");
+      k.f_b_proj = ReadFloat(have, a + "f_b_proj.weight");
+      k.b_proj = ReadFloat(have, a + "b_proj.weight");
+      k.g_a_proj = ReadFloat(have, a + "g_a_proj.weight");
+      k.g_b_proj = ReadFloat(have, a + "g_b_proj.weight");
+      k.o_proj = ReadFloat(have, a + "o_proj.weight");
+      // conv1d.weight is stored [proj,1,K]; the middle 1 flattens away to [proj,K].
+      k.q_conv = ReadFloat(have, a + "q_conv1d.weight");
+      k.k_conv = ReadFloat(have, a + "k_conv1d.weight");
+      k.v_conv = ReadFloat(have, a + "v_conv1d.weight");
+      k.dt_bias = ReadFloat(have, a + "dt_bias");
+      k.a_log = ReadFloat(have, a + "A_log");
+      k.o_norm = ReadFloat(have, a + "o_norm.weight");
+    } else {
+      MlaLayerHostWeights& m = lw.mla;
+      m.q_proj = ReadFloat(have, a + "q_proj.weight");
+      m.kv_a_proj_with_mqa = ReadFloat(have, a + "kv_a_proj_with_mqa.weight");
+      m.kv_a_layernorm = ReadFloat(have, a + "kv_a_layernorm.weight");
+      m.kv_b_proj = ReadFloat(have, a + "kv_b_proj.weight");
+      m.o_proj = ReadFloat(have, a + "o_proj.weight");
+    }
+
+    lw.is_moe = p.is_moe_layer(l);
+    if (lw.is_moe) {
+      MoeHostWeights& mo = lw.moe;
+      const std::string mp = b + "block_sparse_moe.";
+      mo.gate = ReadFloat(have, mp + "gate.weight");
+      mo.e_score_correction_bias = ReadFloat(have, mp + "gate.e_score_correction_bias");
+      mo.has_shared = p.num_shared_experts > 0;
+      if (mo.has_shared) {
+        mo.shared.gate_proj = ReadFloat(have, mp + "shared_experts.gate_proj.weight");
+        mo.shared.up_proj = ReadFloat(have, mp + "shared_experts.up_proj.weight");
+        mo.shared.down_proj = ReadFloat(have, mp + "shared_experts.down_proj.weight");
+      }
+      mo.experts.resize(static_cast<size_t>(p.num_experts));
+      for (int64_t e = 0; e < p.num_experts; ++e) {
+        const std::string ep = mp + "experts." + std::to_string(e) + ".";
+        MlpHostWeights& ex = mo.experts[static_cast<size_t>(e)];
+        ex.gate_proj = ReadFloat(have, ep + "w1.weight");  // gate == w1
+        ex.down_proj = ReadFloat(have, ep + "w2.weight");  // down == w2
+        ex.up_proj = ReadFloat(have, ep + "w3.weight");    // up   == w3
+      }
+    } else {
+      const std::string mp = b + "mlp.";
+      lw.dense.gate_proj = ReadFloat(have, mp + "gate_proj.weight");
+      lw.dense.up_proj = ReadFloat(have, mp + "up_proj.weight");
+      lw.dense.down_proj = ReadFloat(have, mp + "down_proj.weight");
+    }
+  }
+  h.materialized = true;
+  return h;
 }
 
 }  // namespace
@@ -349,6 +460,11 @@ KimiLinearWeights LoadKimiLinearForCausalLMWeights(
   w.params = p;
   w.enumerated_tensors = static_cast<int64_t>(expected.size());
   w.accounted_tensors = accounted;
+  // W2 CPU-reference lane: materialize the host float weights the reference forward
+  // composes (bf16/f32 -> f32). Coverage/shapes already validated above, so every
+  // ReadFloat resolves. The DEVICE staging (ResidentWeight, absorbed MLA bmm forms,
+  // grouped-MoE slabs) is the born-on-runner W6/W7 residual.
+  w.host = MaterializeHost(p, have);
   return w;
 }
 

@@ -1,10 +1,15 @@
-// Kimi-Linear forward — REFUSE-by-name SKELETON (W1). The 27-layer KDA/NoPE-MLA
-// hybrid + 256-expert MoE forward composes primitives that are NOT wired in this
-// W1 lane, so both entrypoints VT_CHECK(false, ...) — a forward LOUDLY reports the
-// pending brick instead of returning a silent wrong answer, exactly like
-// deepseek_v4.cpp / kimi_k3.cpp. This TU captures the reuse-wiring plan in one
-// place and BUILDS clean on CPU; the config parse + loader name-map (this row's W1)
-// ARE unit-testable (test_kimi_linear_scaffold).
+// Kimi-Linear DEVICE forward — REFUSE-by-name (the born-on-the-runner W6/W7 lane).
+// The CPU reference forward (`KimiLinearModel::Forward`, the host `!gather_logits`
+// path) is now REAL and lives in kimi_linear_forward.cpp — it composes the whole
+// 27-layer KDA/NoPE-MLA hybrid + 256-expert MoE from the landed host primitives so
+// the ONLY remaining correctness step is the e2e SACRED token golden on GB10
+// (spike §8). What stays REFUSE-by-name HERE is `ForwardDevice`: the DEFAULT
+// `gather_logits` production/runner forward (the KDA device kernel W3, the absorbed
+// MLA decode W4, the grouped-MoE slabs W5, the het-KV runner wiring W6) is not yet
+// wired, so it VT_CHECK(false, ...) — a runner forward LOUDLY reports the pending
+// brick instead of returning a silent wrong answer (exactly like deepseek_v4 /
+// kimi_k3's device stubs), and the model-matrix row stays SPIKE. This TU also
+// captures the device reuse-wiring plan in one place and BUILDS clean on CPU.
 //
 // ─── REUSE-WIRING PLAN (what the real forward composes; NOT implemented here) ──
 // Per KimiDecoderLayer (kimi_linear.py:288-378), for each of the 27 layers:
@@ -40,29 +45,15 @@
 namespace vllm {
 
 namespace {
-constexpr const char* kPending =
-    "KimiLinear forward is not yet implemented — the 27-layer KDA/NoPE-MLA hybrid "
-    "+ 256-expert MoE forward is a REFUSE-by-name skeleton (W1 landed registry + "
-    "config + loader name-map). Its assembly is the named residual: the KDA device "
-    "kernel (W3), the NoPE-MLA routing (W4), the sigmoid-noaux_tc MoE (W5), and the "
-    "het-KV born-on-the-runner forward (W6). See .agents/specs/kimi-linear.md §5.";
+constexpr const char* kDevicePending =
+    "KimiLinear DEVICE forward (the default gather_logits runner path) is not yet "
+    "wired — the born-on-the-runner device forward is the named residual: the KDA "
+    "device kernel (W3), the absorbed MLA decode (W4), the grouped-MoE slabs (W5), "
+    "and the het-KV runner wiring (W6). The CPU reference forward "
+    "(KimiLinearModel::Forward) IS implemented (kimi_linear_forward.cpp); the e2e "
+    "SACRED token golden on GB10 is the only remaining correctness step "
+    "(W0/W7). See .agents/specs/kimi-linear.md §5/§8.";
 }  // namespace
-
-std::vector<float> KimiLinearModel::Forward(
-    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
-    const v1::CommonAttentionMetadata& attn_meta,
-    const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
-  (void)token_ids;
-  (void)positions;
-  (void)attn_meta;
-  (void)attn_kv;
-  (void)weights;
-  (void)queue;
-  (void)logits_indices;
-  VT_CHECK(false, kPending);
-  return {};
-}
 
 ForwardLogits KimiLinearModel::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
@@ -76,7 +67,7 @@ ForwardLogits KimiLinearModel::ForwardDevice(
   (void)weights;
   (void)queue;
   (void)logits_indices;
-  VT_CHECK(false, kPending);
+  VT_CHECK(false, kDevicePending);
   return {};
 }
 
