@@ -11536,3 +11536,35 @@ pool headroom. Held default-OFF as a reproducible characterized artifact; the
 routed-expert front is NOT a residency win. Also cleared main's RED `check-env-doc`
 (VT_V4_RESIDENT_W was unallowlisted) by adding both VT_V4_RESIDENT_W and
 VT_V4_RESIDENT_EXPERTS to `scripts/env-doc-allowlist.txt`.
+
+## 35B fresh 3-rep binding grid (2026-08-05, `1ea26427`, post async-UAF fix)
+
+Harness: `tools/bench/online_gate.py bench` (model-key 35), sequential dual-lock
+grid `dgx:~/work/q35-regrid/run_grid2.sh`, SACRED `test_qwen36_paged_engine`
+gate=0 before benching, vLLM arm `--gpu-memory-utilization 0.6
+--mamba-ssm-cache-dtype float32` production-graphed, 3 fresh-server reps per
+engine, evidence `dgx:~/work/q35-regrid/evidence/raw/35/{ours,vllm}/c{N}-r{R}.json`.
+
+Total-token tok/s medians (ours / vLLM / ratio-median-of-per-rep):
+c1 593.7/607.4/0.977 · c2 882.9/911.9/0.964 · c4 1417.6/1374.4/**1.025** ·
+c8 1845.2/1922.1/0.964 · c16 2327.4/2497.2/0.932 · c32 2937.8/3012.9/0.971.
+TTFT ratios (vLLM/ours, >1 ours faster): 0.980/0.947/0.976/0.939/0.933/0.929.
+TPOT ratios: 0.975/0.966/**1.036**/0.976/0.928/0.988. Spreads tight (<2%
+between reps except ours c4 ~7%); the c16 deficit repeats in all three reps.
+
+Versus the prior binding (491.5→593.7 at c1 while vLLM held ~600): the old
+low-batch failing mass CLOSED (c1 0.817x→0.977x, c2 0.849x→0.964x) from the
+levers landed since (GDN glue, fusion pushes, split-K family). NEW: ours
+regressed at c16 in absolute terms (2489.1→2327.4 tok/s, -6.5%) while vLLM
+held (2464.9→2497.2), flipping c16 from 1.010x win to 0.932x. Top suspect:
+the `async_forward_in_flight_` drain the heap-corruption fix added at
+`execute_model` top serializes exactly the depth-2 overlap that paid most at
+c16; A/B next (drain-only-when-needed or event-scoped drain), byte-exactness
+mandatory.
+
+Operational: the previous grid attempt hard-rebooted the box at the ours→vLLM
+transition (05:15:51): the per-leg gate checked `gpu_idle` but not free memory,
+so vLLM began loading ~67 GiB while the kernel was still reclaiming our
+server's allocations. Fix: per-leg `avail_gb >= 90` wait (10 min cap, graceful
+abort) mirroring the queue gate; all six transitions of the fresh run passed
+through it.
