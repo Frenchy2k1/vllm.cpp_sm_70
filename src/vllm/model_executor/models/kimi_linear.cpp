@@ -106,15 +106,18 @@ ForwardLogits KimiLinearModel::ForwardDevice(
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
     vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
-  VT_CHECK(weights.host.materialized, kHostPending);
+  // §13: the FULL model loads bf16-resident (host f32 would OOM the 119 GiB pool), so
+  // the resident path drops the host.materialized precondition and ALWAYS routes to
+  // the bf16 device COMPUTE (there are no host f32 weights to compose off).
+  const bool resident = weights.resident.resident;
+  VT_CHECK(resident || weights.host.materialized, kHostPending);
 
-  // W7 opt-in (VT_KIMI_DEVICE_COMPUTE=1): route the runner path through the REAL
-  // DBuf-resident device COMPUTE (kimi_linear_device.cpp), instead of the W6
-  // host-reference compose below. Default-OFF keeps the CPU-verified host-ref seam
-  // as production until the device compute is GPU-verified against the SACRED
-  // oracle — the device compute is CPU-gated (test_kimi_linear_forward) but its GPU
-  // numerics are a NAMED pending (box down).
-  if (KimiDeviceComputeEnabled()) {
+  // Resident (full-model) path, OR the W7 opt-in (VT_KIMI_DEVICE_COMPUTE=1) on the
+  // tiny/host path: route through the REAL DBuf-resident device COMPUTE
+  // (kimi_linear_device.cpp). Default-OFF on the host path keeps the CPU-verified
+  // W6 host-ref compose below as production until the device compute is GPU-verified
+  // against the SACRED oracle.
+  if (resident || KimiDeviceComputeEnabled()) {
     return KimiLinearModel::ForwardDeviceCompute(token_ids, positions, attn_meta,
                                                  attn_kv, weights, queue,
                                                  logits_indices);

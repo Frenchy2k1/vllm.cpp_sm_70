@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -40,6 +41,9 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dense_weight_loaders.h"  // dense_loaders::LoadBf16Direct/MakeOwned
+#include "vllm/platforms/interface.h"                          // platforms::GetPlatform (is_cpu)
+#include "vt/backend.h"                                        // vt::GetBackend (device staging)
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -290,6 +294,46 @@ KimiLinearHostWeights MaterializeHost(const KimiLinearParams& p,
   return h;
 }
 
+// ─── bf16-RESIDENT materialization helpers (§13) ───────────────────────────────
+// Decode one enumerated checkpoint tensor to row-major f32 THROUGH a TensorResolver
+// (the bf16-resident load path indexes shards by resolver, not the HaveMap the f32
+// reference uses), releasing the mmap source pages after the copy (shard-release per
+// tensor). Handles the two dtypes the small vectors carry (BF16 norms/conv/gate;
+// F32 dt_bias/A_log). Used for the tiny f32-kept vectors only — the large matmul
+// weights load bf16-verbatim via dense_loaders::LoadBf16Direct.
+std::vector<float> ReadFloatVec(const TensorResolver& get, const std::string& name) {
+  const StTensor& t = get(name);
+  const int64_t n = NumEl(t.shape);
+  std::vector<float> out(static_cast<size_t>(n), 0.0f);
+  if (t.dtype == "F32") {
+    std::memcpy(out.data(), t.data, static_cast<size_t>(n) * 4);
+  } else if (t.dtype == "BF16") {
+    const uint8_t* p = t.data;
+    for (int64_t i = 0; i < n; ++i) {
+      const uint16_t bits = static_cast<uint16_t>(p[i * 2]) |
+                            (static_cast<uint16_t>(p[i * 2 + 1]) << 8);
+      const uint32_t u = static_cast<uint32_t>(bits) << 16;
+      std::memcpy(&out[static_cast<size_t>(i)], &u, 4);
+    }
+  } else {
+    VT_CHECK(false, "kimi-linear resident: tensor '" + name + "' has dtype '" +
+                        t.dtype + "' (only BF16/F32 supported for the f32-kept vectors)");
+  }
+  MaybeReleaseSourcePages(t.data, t.nbytes);
+  return out;
+}
+
+// Round a host f32 vector to a flat bf16 OwnedTensor (the tiny-config gate builds the
+// resident weights from the f32 host weights). The device forward always views it
+// with an explicit {N,K} shape, so a flat 1-D store is sufficient.
+OwnedTensor Bf16OwnedFromF32(const std::vector<float>& v) {
+  OwnedTensor o =
+      dense_loaders::MakeOwned(vt::DType::kBF16, {static_cast<int64_t>(v.size())});
+  auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
+  for (size_t i = 0; i < v.size(); ++i) dst[i] = vt::F32ToBF16(v[i]);
+  return o;
+}
+
 }  // namespace
 
 KimiLinearParams ParseKimiLinearParams(const HfConfig& config) {
@@ -466,6 +510,201 @@ KimiLinearWeights LoadKimiLinearForCausalLMWeights(
   // grouped-MoE slabs) is the born-on-runner W6/W7 residual.
   w.host = MaterializeHost(p, have);
   return w;
+}
+
+// ─── bf16-RESIDENT loader + builder + stager (§13) ─────────────────────────────
+void StageKimiResidentBf16(vt::Queue& queue, const OwnedTensor& w) {
+  if (w.d_dev || !w.HasHostBytes()) return;  // already staged / nothing to stage
+  // CPU: the device forward aliases the host bytes directly (host-pointer aliasing is
+  // a CPU property), so keep them — never release the sole copy.
+  if (vllm::platforms::GetPlatform(queue.device.type).is_cpu()) return;
+  vt::Backend& b = vt::GetBackend(queue.device.type);
+  const size_t nb = w.bytes.size();
+  void* p = b.Alloc(nb);            // cudaMalloc'd device memory — no ATS penalty
+  b.Copy(queue, p, w.bytes.data(), nb);
+  b.Synchronize(queue);            // the H2D must finish before the host mirror frees
+  vt::Backend* bk = &b;
+  w.d_dev = std::shared_ptr<void>(p, [bk](void* pp) { bk->Free(pp); });
+  w.ReleaseHost();                 // free the host bf16 bytes — d_dev is authoritative
+}
+
+KimiLinearWeights LoadKimiLinearResidentBf16Weights(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config,
+    vt::Queue* stage_queue) {
+  const KimiLinearParams p = ParseKimiLinearParams(config);
+
+  // name -> shard resolver (mirror laguna_weights.cpp:398).
+  auto where =
+      std::make_shared<std::unordered_map<std::string, const SafetensorsFile*>>();
+  for (const SafetensorsFile& s : shards)
+    for (const std::string& n : s.Names()) (*where)[n] = &s;
+  const TensorResolver get =
+      [where](const std::string& name) -> const StTensor& {
+    auto it = where->find(name);
+    VT_CHECK(it != where->end(),
+             "kimi-linear resident loader: missing checkpoint tensor '" + name +
+                 "' (expected by the KimiLinearForCausalLM name-map)");
+    return it->second->Get(name);
+  };
+
+  // Large matmul weight: bf16-verbatim OwnedTensor, then (on CUDA) staged to d_dev +
+  // ReleaseHost so only ONE tensor's host bytes are live at a time (pool math §13).
+  auto big = [&](const std::string& name) -> OwnedTensor {
+    OwnedTensor o = dense_loaders::LoadBf16Direct(get, name);  // copies bf16, drops src pages
+    if (stage_queue != nullptr) StageKimiResidentBf16(*stage_queue, o);
+    return o;
+  };
+  // Small vector kept host f32 (ReadFloatVec releases the source pages).
+  auto vecf = [&](const std::string& name) { return ReadFloatVec(get, name); };
+
+  KimiLinearResidentWeights r;
+  r.resident = true;
+  r.tie_word_embeddings = p.tie_word_embeddings;
+  r.embed_tokens = big("model.embed_tokens.weight");
+  r.final_norm = vecf("model.norm.weight");
+  if (!p.tie_word_embeddings) r.lm_head = big("lm_head.weight");
+
+  r.layers.resize(static_cast<size_t>(p.num_hidden_layers));
+  for (int64_t l = 0; l < p.num_hidden_layers; ++l) {
+    KimiLinearLayerResidentWeights& lw = r.layers[static_cast<size_t>(l)];
+    const std::string b = "model.layers." + std::to_string(l) + ".";
+    lw.input_layernorm = vecf(b + "input_layernorm.weight");
+    lw.post_attention_layernorm = vecf(b + "post_attention_layernorm.weight");
+
+    const std::string a = b + "self_attn.";
+    lw.is_kda = p.is_kda_layer(l);
+    if (lw.is_kda) {
+      KdaResidentWeights& k = lw.kda;
+      k.q_proj = big(a + "q_proj.weight");
+      k.k_proj = big(a + "k_proj.weight");
+      k.v_proj = big(a + "v_proj.weight");
+      k.f_a_proj = big(a + "f_a_proj.weight");
+      k.f_b_proj = big(a + "f_b_proj.weight");
+      k.b_proj = big(a + "b_proj.weight");
+      k.g_a_proj = big(a + "g_a_proj.weight");
+      k.g_b_proj = big(a + "g_b_proj.weight");
+      k.o_proj = big(a + "o_proj.weight");
+      k.q_conv = vecf(a + "q_conv1d.weight");
+      k.k_conv = vecf(a + "k_conv1d.weight");
+      k.v_conv = vecf(a + "v_conv1d.weight");
+      k.dt_bias = vecf(a + "dt_bias");
+      k.a_log = vecf(a + "A_log");
+      k.o_norm = vecf(a + "o_norm.weight");
+    } else {
+      MlaResidentWeights& m = lw.mla;
+      m.q_proj = big(a + "q_proj.weight");
+      m.kv_a_proj_with_mqa = big(a + "kv_a_proj_with_mqa.weight");
+      m.kv_a_layernorm = vecf(a + "kv_a_layernorm.weight");
+      m.kv_b_proj = big(a + "kv_b_proj.weight");
+      m.o_proj = big(a + "o_proj.weight");
+    }
+
+    lw.is_moe = p.is_moe_layer(l);
+    if (lw.is_moe) {
+      MoeResidentWeights& mo = lw.moe;
+      const std::string mp = b + "block_sparse_moe.";
+      mo.gate = big(mp + "gate.weight");
+      mo.e_score_correction_bias = vecf(mp + "gate.e_score_correction_bias");
+      mo.has_shared = p.num_shared_experts > 0;
+      if (mo.has_shared) {
+        mo.shared.gate_proj = big(mp + "shared_experts.gate_proj.weight");
+        mo.shared.up_proj = big(mp + "shared_experts.up_proj.weight");
+        mo.shared.down_proj = big(mp + "shared_experts.down_proj.weight");
+      }
+      mo.experts.resize(static_cast<size_t>(p.num_experts));
+      for (int64_t e = 0; e < p.num_experts; ++e) {
+        const std::string ep = mp + "experts." + std::to_string(e) + ".";
+        MlpResidentWeights& ex = mo.experts[static_cast<size_t>(e)];
+        ex.gate_proj = big(ep + "w1.weight");  // gate == w1
+        ex.down_proj = big(ep + "w2.weight");  // down == w2
+        ex.up_proj = big(ep + "w3.weight");    // up   == w3
+      }
+    } else {
+      const std::string mp = b + "mlp.";
+      lw.dense.gate_proj = big(mp + "gate_proj.weight");
+      lw.dense.up_proj = big(mp + "up_proj.weight");
+      lw.dense.down_proj = big(mp + "down_proj.weight");
+    }
+  }
+
+  KimiLinearWeights w;
+  w.params = p;
+  w.enumerated_tensors = static_cast<int64_t>(EnumerateSpecs(p).size());
+  w.accounted_tensors = w.enumerated_tensors;  // the resolver throws BY NAME on a miss
+  w.resident = std::move(r);
+  // host stays UNMATERIALIZED on the resident path (183 GiB f32 would OOM the pool).
+  return w;
+}
+
+KimiLinearResidentWeights BuildKimiResidentFromHost(const KimiLinearHostWeights& host,
+                                                    const KimiLinearParams& p) {
+  KimiLinearResidentWeights r;
+  r.resident = true;
+  r.tie_word_embeddings = p.tie_word_embeddings;
+  r.embed_tokens = Bf16OwnedFromF32(host.embed_tokens);
+  r.final_norm = host.final_norm;
+  if (!p.tie_word_embeddings && !host.lm_head.empty())
+    r.lm_head = Bf16OwnedFromF32(host.lm_head);
+
+  r.layers.resize(host.layers.size());
+  for (size_t l = 0; l < host.layers.size(); ++l) {
+    const KimiLinearLayerHostWeights& hl = host.layers[l];
+    KimiLinearLayerResidentWeights& rl = r.layers[l];
+    rl.input_layernorm = hl.input_layernorm;
+    rl.post_attention_layernorm = hl.post_attention_layernorm;
+    rl.is_kda = hl.is_kda;
+    if (hl.is_kda) {
+      const KdaLayerHostWeights& hk = hl.kda;
+      KdaResidentWeights& rk = rl.kda;
+      rk.q_proj = Bf16OwnedFromF32(hk.q_proj);
+      rk.k_proj = Bf16OwnedFromF32(hk.k_proj);
+      rk.v_proj = Bf16OwnedFromF32(hk.v_proj);
+      rk.f_a_proj = Bf16OwnedFromF32(hk.f_a_proj);
+      rk.f_b_proj = Bf16OwnedFromF32(hk.f_b_proj);
+      rk.b_proj = Bf16OwnedFromF32(hk.b_proj);
+      rk.g_a_proj = Bf16OwnedFromF32(hk.g_a_proj);
+      rk.g_b_proj = Bf16OwnedFromF32(hk.g_b_proj);
+      rk.o_proj = Bf16OwnedFromF32(hk.o_proj);
+      rk.q_conv = hk.q_conv;
+      rk.k_conv = hk.k_conv;
+      rk.v_conv = hk.v_conv;
+      rk.dt_bias = hk.dt_bias;
+      rk.a_log = hk.a_log;
+      rk.o_norm = hk.o_norm;
+    } else {
+      const MlaLayerHostWeights& hm = hl.mla;
+      MlaResidentWeights& rm = rl.mla;
+      rm.q_proj = Bf16OwnedFromF32(hm.q_proj);
+      rm.kv_a_proj_with_mqa = Bf16OwnedFromF32(hm.kv_a_proj_with_mqa);
+      rm.kv_b_proj = Bf16OwnedFromF32(hm.kv_b_proj);
+      rm.o_proj = Bf16OwnedFromF32(hm.o_proj);
+      rm.kv_a_layernorm = hm.kv_a_layernorm;
+    }
+    rl.is_moe = hl.is_moe;
+    if (hl.is_moe) {
+      const MoeHostWeights& hmo = hl.moe;
+      MoeResidentWeights& rmo = rl.moe;
+      rmo.gate = Bf16OwnedFromF32(hmo.gate);
+      rmo.e_score_correction_bias = hmo.e_score_correction_bias;
+      rmo.has_shared = hmo.has_shared;
+      if (hmo.has_shared) {
+        rmo.shared.gate_proj = Bf16OwnedFromF32(hmo.shared.gate_proj);
+        rmo.shared.up_proj = Bf16OwnedFromF32(hmo.shared.up_proj);
+        rmo.shared.down_proj = Bf16OwnedFromF32(hmo.shared.down_proj);
+      }
+      rmo.experts.resize(hmo.experts.size());
+      for (size_t e = 0; e < hmo.experts.size(); ++e) {
+        rmo.experts[e].gate_proj = Bf16OwnedFromF32(hmo.experts[e].gate_proj);
+        rmo.experts[e].up_proj = Bf16OwnedFromF32(hmo.experts[e].up_proj);
+        rmo.experts[e].down_proj = Bf16OwnedFromF32(hmo.experts[e].down_proj);
+      }
+    } else {
+      rl.dense.gate_proj = Bf16OwnedFromF32(hl.dense.gate_proj);
+      rl.dense.up_proj = Bf16OwnedFromF32(hl.dense.up_proj);
+      rl.dense.down_proj = Bf16OwnedFromF32(hl.dense.down_proj);
+    }
+  }
+  return r;
 }
 
 }  // namespace vllm

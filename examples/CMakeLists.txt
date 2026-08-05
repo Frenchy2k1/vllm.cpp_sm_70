@@ -22,6 +22,13 @@ add_executable(laguna-gen laguna_gen/main.cpp)
 target_link_libraries(laguna-gen PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(laguna-gen)
 
+# kimi-linear-gen: the single-GB10 Kimi-Linear-48B-A3B full-model e2e harness (§13
+# bf16-resident loader/forward — greedy decode the 8-prompt golden battery through
+# the bf16 ForwardDeviceCompute and token-compare to the STRICT oracle golden).
+add_executable(kimi-linear-gen kimi_linear_gen/main.cpp)
+target_link_libraries(kimi-linear-gen PRIVATE vllm::vllm)
+vllm_cpp_set_warnings(kimi-linear-gen)
+
 # vllm-bench (M2.1): the throughput/latency benchmark harness — the gate-#1
 # measurement tool. Links the full C++ engine (vllm::vllm) so it can build both a
 # synthetic CPU engine (no --model) and a real loaded engine (--model on dgx).

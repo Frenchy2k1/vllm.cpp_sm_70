@@ -36275,3 +36275,109 @@ Triton-AOT decode + grouped-MoE device slabs, (c) speed. Box left clean; the 91.
 checkpoint retained in the HF cache. Evidence: `dgx:~/kimi-e2e/{oracle_full.log,mem_full.log}`,
 local golden `tests/parity/goldens/kimi_linear_greedy/`.
 
+## MODEL-TEXT-kimi-linear: bf16-resident loader/forward POOL MATH + grounded design (§13); implementation scoped, PENDING
+<!-- state: 2026-08-07T00:30 -->
+
+Disk unblocked and the §12 golden merged as #40 (main `32148dd9`). Resumed the final
+phase-3 brick on `row/MODEL-KIMI-LINEAR-BF16`: the bf16-resident loader/forward that
+replaces the f32 `MaterializeHost` (183 GiB) so the full-model e2e fits the 119 GiB pool.
+
+POOL MATH (done BEFORE building, per the design constraint — spec §13): bf16 weights
+91.5 GiB device-resident (`OwnedTensor::d_dev`, cudaMalloc+H2D, no ATS penalty), per-tensor
+stage-then-`ReleaseHost` keeps the load peak ~91.5 GiB device + <1 GiB host + the mmap read
+window; f32 residual-stream activations < ~0.3 GiB at T~36; host f32 norm/scale vectors
+< 0.1 GiB; CUDA context ~2 GiB reserved FIRST. STEADY ~94 GiB -> ~25 GiB headroom. CLOSES.
+
+DESIGN (grounded file:line in the winning patterns): bf16 storage via
+`dense_loaders::LoadBf16Direct`->`OwnedTensor` (mirror laguna/gemma weights), f32
+`MaterializeHost` KEPT for the small-config unit gate; resident GEMM = `KimiResidentBf16W`
+(mirror laguna.cpp:125-139) + `GemmBf16` = `vt::CastBf16(f32-act->bf16)` then `vt::MatmulBT`
+(bf16,bf16)->f32 (the combo CUDA MatmulBT SUPPORTS, cuda_matmul.cu:3; the elementwise
+f32-act x bf16-weight it LACKS, cuda_deepseek_v4.cu:1821) so GEMM numerics are vLLM-bf16;
+residual stream + the two host islands stay f32; norms via ReadF32; runner drops the
+host.materialized precondition on the resident path; GB10 load recipe context-first +
+shard-release (examples/laguna_gen/main.cpp:185-237); e2e = a greedy-decode harness over the
+bf16 ForwardDeviceCompute vs the committed golden (the VT_KIMI_DEVICE_COMPUTE=1 arm only —
+the =0 f32 host Forward cannot fit the full model).
+
+HONEST OUTCOME: this session completed the pool-math + grounded-design phase and landed it in
+the records (spec §13, this entry, benchmark record, matrix, NOW, STATUS/BENCHMARKS/FEATURES).
+The ~500-line implementation (bf16 loader + device-forward rewrite + tiny-config bf16 gate +
+CUDA build + the memory-critical full-model e2e vs the golden) is the scoped NEXT execution;
+no code landed beyond records, nothing broken. Row STAYS `ACTIVE`. Next: implement §13 on
+this branch, keep `test_kimi_linear_forward` 12/12·614 green, then the full-model e2e
+(free -g >= 90, monitor, STOP if the pool math does not close in practice).
+
+## MODEL-TEXT-kimi-linear: bf16-resident loader/forward IMPLEMENTED + CPU-gated (§13); dgx CUDA build + full-model e2e PENDING
+<!-- state: 2026-08-07T01:30 -->
+
+Executed §13 on `row/MODEL-KIMI-LINEAR-BF16` (base `e28ace81`). LANDED (file:line):
+`LoadKimiLinearResidentBf16Weights` + `StageKimiResidentBf16` + `BuildKimiResidentFromHost`
+(`kimi_linear_weights.cpp`) — large matmul weights via `dense_loaders::LoadBf16Direct` ->
+`OwnedTensor`, per-tensor stage-to-`d_dev` (cudaMalloc + one H2D) then `ReleaseHost` so the LOAD
+peak holds ONE tensor's host bytes; tiny norm/scale/conv/bias vectors decoded to host f32
+(`ReadFloatVec`, dtype-agnostic). Real checkpoint verified on dgx: 20 shards, 91.5 GiB bf16,
+tie_word_embeddings=false, ONLY `dt_bias`/`A_log` are F32 (the rest BF16 incl. conv1d + router
+gate + e_score_bias). `KimiLinearResidentWeights` struct + `resident` member on
+`KimiLinearWeights` (`kimi_linear.h`). bf16 device forward `DeviceForwardBodyBf16` +
+`Kda|Mla|MoeBlock|DenseMlp|SwiGluDeviceBf16` with the Laguna cast-GEMM `GemmBf16`
+(`vt::CastBf16` f32-act->bf16 then `vt::MatmulBT` (bf16,bf16)->f32 vs `ResidentBf16W`) at each of
+the ~20 GEMM sites; f32 residual stream; the two host-fallback islands (`KdaRecurrenceIsland`,
+`MlaSoftmaxIsland`) EXTRACTED and SHARED with the f32 path (byte-identical, so the f32 12/12
+stays exact). Router gate made bf16-resident (matches vLLM's bf16 router — a f32 gate could flip
+near-tie top-8 selections; the primary token-divergence risk). `ForwardDevice` drops the
+`host.materialized` precondition on the resident path; `ForwardDeviceCompute` dispatches
+bf16-vs-f32 on `resident.resident`. e2e harness `examples/kimi_linear_gen/main.cpp`
+(context-first + shard-release, greedy the 8-prompt golden battery x16 vs `greedy_ids.npy`).
+
+CPU GATE GREEN: `test_kimi_linear_forward` **13/13·656** = the original 12/12·614 (f32 path
+UNTOUCHED, incl. the extracted islands) + NEW case (k) bf16-resident `ForwardDeviceCompute` ==
+the independent f32 host reference within a bf16 envelope (rtol 6e-2 + atol scaled to |logit|).
+All 3 changed TUs + the harness compile `-Werror` clean; full CPU lib + test + harness build+link
+green (worktree `build-cpu`, on `mudler-ubuntu-box`).
+
+PENDING (this row, on dgx.casa GB10 — checkpoint CACHED 92G, 89 GiB free RAM, no GPU process):
+(1) CUDA build `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`
+(nm GDN check), (2) `test_kimi_linear_forward` on CUDA, (3) full-model e2e via `kimi-linear-gen`
+vs the STRICT golden (free -g >= 90 before load, memory-monitored; STOP + record if the pool math
+diverges toward the limit). Row STAYS `ACTIVE`; `VT_KIMI_DEVICE_COMPUTE` default STAYS OFF until
+the e2e token gate is green.
+## MODEL-TEXT-kimi-linear: FULL-MODEL GB10 e2e RUNS via bf16-resident path — NEAR-TIE 106/128 (6/8 prompts token-exact); pool math CLOSES
+<!-- state: 2026-08-07T03:00 -->
+
+The §13 bf16-resident loader/forward CLEARS the f32-loader block: the full 48.9B Kimi-Linear-48B-A3B
+now runs e2e on ONE GB10 (the primary mission goal). dgx CUDA build (`-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`,
+nvcc 13.0.88, Release, `-Werror` clean, built in `/dev/shm` on dgx.casa): CUTLASS NVFP4 GEMM + FA2
+[121a] + Triton-AOT GDN (14 cubins, all `gdn_*_default` symbols nm-linked). `test_kimi_linear_forward`
+**13/13·656** in the CUDA-built binary. `kimi-linear-gen --gpu` loads the checkpoint (context-first +
+shard-release) and greedy-decodes the §12 8-prompt battery x16 through the bf16 `ForwardDeviceCompute`,
+token-compared to `greedy_ids.npy`.
+
+MEMORY (pool math CLOSES in practice, matches §13): load 117.6s; host RSS PEAK **1.7 GiB**
+(stage-then-ReleaseHost keeps ONE tensor's host bytes live); device peak **98.5 GiB** (100896 MiB);
+min available **21.6 GiB** throughout — above the 15 GiB floor, matches the predicted ~25 GiB headroom.
+NO OOM, NO reboot. A load-only smoke first proved the ~20k per-tensor cudaMalloc staging closes safely.
+Ran UNDER both flock locks (correctly WAITED behind the co-tenant MXFP4 agent's job — never broke the
+lock); box left clean (locks free, no leftover procs).
+
+TOKEN gate: **NEAR-TIE 106/128 (82.8%), NOT STRICT.** Prompts 0,1,3,4,5,6 = 16/16 token-exact; p2
+diverges from token 0 (261 vs golden 276); p7 matches 6 then diverges at a comma boundary (pos 6:
+387 vs golden 11) and cascades. The golden is DETERMINISTIC (K=3 identical) at both divergence points,
+so this is a genuine numerics NEAR-TIE, not a wiring bug — 96 consecutive token-exact tokens across 6
+prompts prove the loader / resident-GEMM / MoE-routing / residual-stream WIRING is correct.
+
+DIVERGENCE ROOT CAUSE (honest): the correctness-vehicle forward is NOT bit-identical to vLLM's bf16
+stream. (1) The residual stream stays f32 (the §13 design — the two host-fallback islands consume it);
+vLLM ROUNDS the residual to bf16 after every add and before every RMSNorm, so its norm variance is over
+bf16 values, ours over f32 (higher precision). (2) The KDA recurrence + NoPE-MLA softmax islands run in
+f64 on host; vLLM runs GDN Triton-AOT + FA2 MLA in bf16/f32 on device. So our per-op numerics are MORE
+accurate than vLLM, which lands a DIFFERENT top-1 where vLLM's deterministic bf16 top-1 has a small
+margin (punctuation/word boundaries; longer prompts accumulate more delta — p2 is the longest at 14
+prompt tokens and flips immediately). PATH TO STRICT (the named W7-speed residuals): the device GDN
+per-channel-decay recurrence + exp/softplus gate op + the paged `mla::ForwardMlaAttentionBlock`, then a
+bf16 residual stream end-to-end (matching vLLM's rounding) — closes the numerics gap AND removes the
+host round-trips (the 1.59 tok/s is the O(n^2) full-recompute + host-island rate, not an optimized
+decode). `VT_KIMI_DEVICE_COMPUTE` STAYS OFF (parity-enablers: a near-tie is not token-exact). Row STAYS
+`ACTIVE`. Residuals now precisely: (a) STRICT token-exactness (device islands + bf16 stream), (b) the
+paged het-KV incremental decode, (c) speed.

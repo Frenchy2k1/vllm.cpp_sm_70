@@ -12143,3 +12143,70 @@ STAYS OFF (a parity-enabler flip needs the gate green). No tok/s (no full-model
 our-engine load was memory-safe). Box left clean: oracle process exited (116 GiB free
 after), tmux sessions killed, both GPU locks released, local-ai-worker untouched (it
 stays stopped). The 91.5 GiB checkpoint is retained in the HF cache for future e2e runs.
+
+## Kimi-Linear-48B-A3B: bf16-resident loader/forward POOL MATH + design (2026-08-06)
+
+Branch `row/MODEL-KIMI-LINEAR-BF16`, base `origin/main` `32148dd9` (the golden merged as
+#40). The final phase-3 brick unblocks the full-model e2e (§12 was blocked on OUR f32
+loader = 183 GiB). This entry records the pool math (done BEFORE building, per the design
+constraint) + the grounded design; the implementation is the scoped next execution.
+
+POOL MATH (spec §13). Weights bf16 = 98,245,528,576 B = 91.5 GiB, staged device-resident
+via OwnedTensor::d_dev (cudaMalloc + one H2D, native GPU memory, no ATS penalty). Per-tensor
+stage-then-ReleaseHost keeps only one tensor's host bytes live (biggest embed/lm_head
+[163840,2304] bf16 = 0.72 GiB), so the LOAD peak is ~91.5 GiB device + <1 GiB host + the
+ReleaseSourcePages mmap read window. The residual stream stays f32; at the golden's T <=
+prompt(<=20)+16 ~= 36 tokens the activation buffers total < ~0.3 GiB (last-row logits [1,V]
+f32 = 0.64 MB). Host f32 norm/scale vectors (ReadF32-on-demand) < 0.1 GiB. CUDA context
+~2 GiB, reserved FIRST (before load). STEADY ~= 94 GiB -> ~25 GiB headroom. CLOSES. The e2e
+harness recomputes context (no paged KV) so there is no KV cache to budget.
+
+DESIGN (grounded file:line). Storage: dense_loaders::LoadBf16Direct -> OwnedTensor (mirror
+laguna_weights.cpp / gemma_weights.cpp); the f32 MaterializeHost is KEPT for the small-config
+unit gate only. Resident GEMM: KimiResidentBf16W (mirror laguna.cpp:125-139, cudaMalloc+H2D
+to d_dev, byte-exact) + GemmBf16 (mirror laguna.cpp:1939-1946): vt::CastBf16(f32-act -> bf16
+scratch) then vt::MatmulBT (bf16,bf16)->f32 — the combo the CUDA MatmulBT SUPPORTS
+(cuda_matmul.cu:3), whereas the elementwise f32-act x bf16-weight it LACKS
+(cuda_deepseek_v4.cu:1821). So the GEMM numerics are vLLM-bf16 (best token-exact chance vs
+the bf16 oracle golden); the residual stream and the two host-fallback islands (KDA
+recurrence, NoPE-MLA softmax) stay f32. Norms via ReadF32 / ResidentWeightF32
+(dense_attn_block.h:202). Runner drops the host.materialized precondition on the resident
+path. GB10 load recipe (context-first + shard-release, examples/laguna_gen/main.cpp:185-237).
+e2e vehicle = a greedy-decode harness over the bf16 ForwardDeviceCompute vs
+tests/parity/goldens/kimi_linear_greedy/greedy_ids.npy — the VT_KIMI_DEVICE_COMPUTE=1 bf16
+arm ONLY (the =0 f32 host Forward cannot fit the full model).
+
+HONEST — implementation PENDING. The ~500-line loader/forward rewrite + a tiny-config bf16
+device gate (bf16 forward == f32 reference within a bf16 tolerance) + the CUDA build + the
+memory-critical full-model e2e are the scoped next execution (§13 Gates). CPU MatmulBT
+supports f32-act x bf16-weight (cuda_deepseek_v4.cu:1821), so a CPU-only variant is possible,
+but the vLLM-parity path is the cast-to-bf16 GEMM above. No code landed this session beyond
+the pool-math/design records; nothing broken.
+
+## Kimi-Linear-48B-A3B: FULL-MODEL GB10 e2e RUNS via bf16-resident path — NEAR-TIE 106/128 (2026-08-06)
+
+The §13 bf16-resident loader/forward LANDED and the full 48.9B model now runs e2e on ONE GB10
+(f32-loader block CLEARED). Build: dgx.casa GB10 sm_121a, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, nvcc 13.0.88,
+Release, `-Werror` clean (in `/dev/shm`); 14 GDN AOT `gdn_*_default` symbols nm-linked;
+`test_kimi_linear_forward` 13/13·656 in the CUDA binary. Vehicle: `kimi-linear-gen --gpu` greedy the
+§12 8-prompt battery x16 through the bf16 `ForwardDeviceCompute` vs `greedy_ids.npy`.
+
+MEMORY (pool math CLOSES): load 117.6s; host RSS PEAK 1.7 GiB (stage-then-ReleaseHost — one tensor's
+host bytes live at a time); device peak 100896 MiB (98.5 GiB); min available 21605 MiB (21.1 GiB)
+throughout — above the 15 GiB floor, matches the predicted ~25 GiB headroom. NO OOM/reboot. Load-only
+smoke first: same profile (min-avail 22.0 GiB, peak-used 100021 MiB). Ran under both flock locks,
+correctly WAITED behind the co-tenant MXFP4 job.
+
+TOKEN gate: NEAR-TIE 106/128 (82.8%), NOT STRICT. Per-prompt matches (of 16): p0 16, p1 16, p2 0,
+p3 16, p4 16, p5 16, p6 16, p7 10. p2 diverges from token 0 (261 vs 276); p7 diverges at a comma
+(pos 6: 387 vs 11). Golden DETERMINISTIC (K=3) at both points, so a genuine numerics near-tie — 96
+consecutive exact tokens across 6 prompts prove the wiring. Root cause: the f32 residual stream (§13
+design, for the host islands) + the host-f64 KDA-recurrence/MLA-softmax islands are MORE precise than
+vLLM's bf16 device kernels, flipping the argmax on small-margin punctuation/word boundaries.
+
+SPEED: 1.59 tok/s steady (0.630 s/step over 127 steps) — the O(n^2) full-recompute + host-island rate,
+a NAMED speed residual, NOT an optimized decode. DEFAULT: `VT_KIMI_DEVICE_COMPUTE` STAYS OFF
+(near-tie != token-exact). PATH TO STRICT + speed = the named W7 residuals: device GDN per-channel
+recurrence + exp/softplus gate op + paged `mla::ForwardMlaAttentionBlock` + a bf16 residual stream
+end-to-end (matches vLLM's rounding, removes the host round-trips).

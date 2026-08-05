@@ -54,6 +54,7 @@
 #include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::{Dev,DBuf,MakeTensor}
 #include "vllm/model_executor/models/device_pool.h"        // Pool()
 #include "vllm/model_executor/models/kimi_kda.h"
+#include "vllm/platforms/interface.h"                       // platforms::GetPlatform (is_cpu)
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -90,6 +91,40 @@ inline double Sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 inline Tensor WF32(const Dev& d, const std::vector<float>& v,
                    const std::vector<int64_t>& shape) {
   return MakeTensor(const_cast<float*>(v.data()), DType::kF32, d.q.device, shape);
+}
+
+// ─── bf16-RESIDENT weight view + cast-GEMM (§13) ───────────────────────────────
+// Device-resident bf16 weight view over an OwnedTensor (mirror laguna.cpp:125-139
+// LagunaResidentBf16W / dense_attn::ResidentWeight). CPU: alias the host bf16 bytes
+// (host-pointer aliasing is a CPU property). CUDA: return the d_dev copy — pre-staged
+// at load (StageKimiResidentBf16 + ReleaseHost, the pool-math path) or, if absent,
+// uploaded ONCE here (cudaMalloc + one H2D, byte-exact — no ATS penalty).
+inline Tensor ResidentBf16W(const Dev& d, const OwnedTensor& w,
+                            const std::vector<int64_t>& shape) {
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu())
+    return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device, shape);
+  if (!w.d_dev) {
+    VT_CHECK(w.HasHostBytes(),
+             "kimi resident: bf16 weight host bytes released before device staging");
+    const size_t nb = w.bytes.size();
+    void* p = d.b.Alloc(nb);
+    d.b.Copy(d.q, p, w.bytes.data(), nb);
+    vt::Backend* bk = &d.b;
+    w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
+}
+
+// bf16 cast-GEMM: out[T,N] f32 = cast(act[T,K] -> bf16) . w_bf16[N,K]^T (mirror
+// laguna.cpp:1939-1946 GemmBf16Into). The (bf16,bf16)->f32 MatmulBT IS vLLM's
+// projection numerics (cuda_matmul.cu:3); the residual stream stays f32.
+void GemmBf16(const Dev& d, Tensor& out, const Tensor& act, const OwnedTensor& w,
+              int64_t N, int64_t K) {
+  const int64_t T = act.shape[0];
+  DBuf ab(d, DType::kBF16, {T, K});
+  vt::CastBf16(d.q, ab.t(), act);
+  Tensor wt = ResidentBf16W(d, w, {N, K});
+  vt::MatmulBT(d.q, out, ab.t(), wt);
 }
 
 // Fused residual add + standard RMSNorm: res += x; out = rmsnorm(res) * w. The
@@ -140,6 +175,129 @@ DBuf ConvSilu(const Dev& d, const Tensor& x, const std::vector<float>& weight,
   return out;
 }
 
+// ── HOST-FALLBACK ISLAND: KDA decay gate + per-k-channel gated-delta RECURRENCE.
+// vt::GdnDecode carries only a per-HEAD scalar decay (ops.h g/beta[T,Hv]); KDA's
+// decay is per-k-channel, so the recurrence is computed on host from the device-
+// resident q_n/k_n/v/g1/beta via the landed kimi_kda refs + the reference recurrence
+// (kimi_linear_forward.cpp:142-183), then uploaded. THE W7-speed residual. Shared by
+// the f32 (KdaLayerDevice) and bf16 (KdaLayerDeviceBf16) paths — the recurrence itself
+// runs the IDENTICAL host code on both; only the GEMMs feeding it differ (f32 alias vs
+// bf16 cast-GEMM), so extracting it keeps the two paths byte-identical here.
+DBuf KdaRecurrenceIsland(const Dev& d, DBuf& qn, DBuf& kn, DBuf& vc, DBuf& g1,
+                         DBuf& braw, const std::vector<float>& a_log,
+                         const std::vector<float>& dt_bias, const KimiLinearParams& p,
+                         int64_t T) {
+  const int64_t nh = p.kda_num_heads;
+  const int64_t hd = p.kda_head_dim;
+  const int64_t proj = nh * hd;
+  std::vector<float> hqn(static_cast<size_t>(T) * proj), hkn(hqn.size()),
+      hv(hqn.size()), hg1(hqn.size()), hbraw(static_cast<size_t>(T) * nh);
+  qn.Download(d, hqn.data());
+  kn.Download(d, hkn.data());
+  vc.Download(d, hv.data());
+  g1.Download(d, hg1.data());
+  braw.Download(d, hbraw.data());
+
+  const std::vector<float> g =
+      kimi_kda::KdaDecayGate(hg1, a_log, dt_bias, T, nh, hd);  // [T,nh,hd]
+  const double scale = std::pow(static_cast<double>(hd), -0.5);
+  std::vector<double> S(static_cast<size_t>(nh) * hd * hd, 0.0);
+  std::vector<float> core(static_cast<size_t>(T) * proj, 0.0f);
+  std::vector<double> u(static_cast<size_t>(hd));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t h = 0; h < nh; ++h) {
+      const int64_t base = t * proj + h * hd;
+      const float* qnp = &hqn[static_cast<size_t>(base)];
+      const float* knp = &hkn[static_cast<size_t>(base)];
+      const float* vvp = &hv[static_cast<size_t>(base)];
+      const float* gh = &g[static_cast<size_t>(base)];
+      const double b = Sigmoid(hbraw[static_cast<size_t>(t * nh + h)]);
+      double* Sp = &S[static_cast<size_t>(h) * hd * hd];
+      for (int64_t vd = 0; vd < hd; ++vd) {
+        double* Sr = &Sp[vd * hd];
+        for (int64_t k = 0; k < hd; ++k) Sr[k] *= std::exp(static_cast<double>(gh[k]));
+      }
+      for (int64_t vd = 0; vd < hd; ++vd) {
+        const double* Sr = &Sp[vd * hd];
+        double pred = 0.0;
+        for (int64_t k = 0; k < hd; ++k) pred += Sr[k] * knp[k];
+        u[static_cast<size_t>(vd)] = (static_cast<double>(vvp[vd]) - pred) * b;
+      }
+      for (int64_t vd = 0; vd < hd; ++vd) {
+        double* Sr = &Sp[vd * hd];
+        const double uv = u[static_cast<size_t>(vd)];
+        for (int64_t k = 0; k < hd; ++k) Sr[k] += uv * knp[k];
+      }
+      float* cr = &core[static_cast<size_t>(base)];
+      for (int64_t vd = 0; vd < hd; ++vd) {
+        const double* Sr = &Sp[vd * hd];
+        double o = 0.0;
+        for (int64_t k = 0; k < hd; ++k)
+          o += Sr[k] * (static_cast<double>(qnp[k]) * scale);
+        cr[vd] = static_cast<float>(o);
+      }
+    }
+  }
+  return DBuf(d, DType::kF32, {T, proj}, core.data());  // upload back to device
+}
+
+// ── HOST-FALLBACK ISLAND: the materialized-MHA attention CORE (causal softmax over
+// the per-head k_nope|k_pe / v, NoPE so no RoPE). Identical math to kimi_linear_
+// forward.cpp:223-258; shared by the f32 and bf16 MLA paths (only the projections
+// feeding dq/dkv/dkpe differ). Returns [T, nah*v_head_dim].
+DBuf MlaSoftmaxIsland(const Dev& d, DBuf& dq, DBuf& dkv, DBuf& dkpe,
+                      const KimiLinearParams& p, int64_t T) {
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim;
+  const int64_t qr = p.qk_rope_head_dim;
+  const int64_t qk = qn + qr;
+  const int64_t vh = p.v_head_dim;
+  const int64_t kvw = nah * (qn + vh);
+  std::vector<float> hq(static_cast<size_t>(T) * nah * qk),
+      hkv(static_cast<size_t>(T) * kvw), hkpe(static_cast<size_t>(T) * qr);
+  dq.Download(d, hq.data());
+  dkv.Download(d, hkv.data());
+  dkpe.Download(d, hkpe.data());
+  const double scale = std::pow(static_cast<double>(qk), -0.5);
+  std::vector<float> out(static_cast<size_t>(T) * nah * vh, 0.0f);
+  std::vector<double> sc(static_cast<size_t>(T));
+  for (int64_t h = 0; h < nah; ++h) {
+    for (int64_t t = 0; t < T; ++t) {
+      const float* q_nope = &hq[static_cast<size_t>(t * nah * qk + h * qk)];
+      const float* q_pe = q_nope + qn;
+      double mx = -INFINITY;
+      for (int64_t s = 0; s <= t; ++s) {
+        const float* k_nope = &hkv[static_cast<size_t>(s * kvw + h * (qn + vh))];
+        const float* kpe = &hkpe[static_cast<size_t>(s * qr)];
+        double dot = 0.0;
+        for (int64_t dd = 0; dd < qn; ++dd)
+          dot += static_cast<double>(q_nope[dd]) * k_nope[dd];
+        for (int64_t dd = 0; dd < qr; ++dd)
+          dot += static_cast<double>(q_pe[dd]) * kpe[dd];
+        dot *= scale;
+        sc[static_cast<size_t>(s)] = dot;
+        mx = std::max(mx, dot);
+      }
+      double sum = 0.0;
+      for (int64_t s = 0; s <= t; ++s) {
+        const double e = std::exp(sc[static_cast<size_t>(s)] - mx);
+        sc[static_cast<size_t>(s)] = e;
+        sum += e;
+      }
+      float* ot = &out[static_cast<size_t>(t * nah * vh + h * vh)];
+      for (int64_t dd = 0; dd < vh; ++dd) {
+        double acc = 0.0;
+        for (int64_t s = 0; s <= t; ++s) {
+          const float* vs = &hkv[static_cast<size_t>(s * kvw + h * (qn + vh) + qn)];
+          acc += (sc[static_cast<size_t>(s)] / sum) * static_cast<double>(vs[dd]);
+        }
+        ot[dd] = static_cast<float>(acc);
+      }
+    }
+  }
+  return DBuf(d, DType::kF32, {T, nah * vh}, out.data());  // upload
+}
+
 // ─── (1) KDA linear-attention layer (device + one host-fallback island) ───────
 // Grounding kimi_linear_forward.cpp:101-190 (the W2 reference this must match).
 DBuf KdaLayerDevice(const Dev& d, const KdaLayerHostWeights& w, const Tensor& dh,
@@ -186,60 +344,9 @@ DBuf KdaLayerDevice(const Dev& d, const KdaLayerHostWeights& w, const Tensor& dh
   DBuf g2(d, DType::kF32, {T, proj});
   vt::MatmulBT(d.q, g2.t(), ga.t(), WF32(d, w.g_b_proj, {proj, hd}));
 
-  // ── HOST-FALLBACK ISLAND: KDA decay gate + per-k-channel gated-delta recurrence.
-  // vt::GdnDecode carries only a per-HEAD scalar decay (ops.h g/beta[T,Hv]); KDA's
-  // decay is per-k-channel, so this is computed on host from the device-resident
-  // q_n/k_n/v/g1/beta via the landed kimi_kda refs + the reference recurrence
-  // (kimi_linear_forward.cpp:142-183), then uploaded. THE W7-speed residual.
-  std::vector<float> hqn(static_cast<size_t>(T) * proj), hkn(hqn.size()),
-      hv(hqn.size()), hg1(hqn.size()), hbraw(static_cast<size_t>(T) * nh);
-  qn.Download(d, hqn.data());
-  kn.Download(d, hkn.data());
-  vc.Download(d, hv.data());
-  g1.Download(d, hg1.data());
-  braw.Download(d, hbraw.data());
-
-  const std::vector<float> g =
-      kimi_kda::KdaDecayGate(hg1, w.a_log, w.dt_bias, T, nh, hd);  // [T,nh,hd]
-  const double scale = std::pow(static_cast<double>(hd), -0.5);
-  std::vector<double> S(static_cast<size_t>(nh) * hd * hd, 0.0);
-  std::vector<float> core(static_cast<size_t>(T) * proj, 0.0f);
-  std::vector<double> u(static_cast<size_t>(hd));
-  for (int64_t t = 0; t < T; ++t) {
-    for (int64_t h = 0; h < nh; ++h) {
-      const int64_t base = t * proj + h * hd;
-      const float* qnp = &hqn[static_cast<size_t>(base)];
-      const float* knp = &hkn[static_cast<size_t>(base)];
-      const float* vvp = &hv[static_cast<size_t>(base)];
-      const float* gh = &g[static_cast<size_t>(base)];
-      const double b = Sigmoid(hbraw[static_cast<size_t>(t * nh + h)]);
-      double* Sp = &S[static_cast<size_t>(h) * hd * hd];
-      for (int64_t vd = 0; vd < hd; ++vd) {
-        double* Sr = &Sp[vd * hd];
-        for (int64_t k = 0; k < hd; ++k) Sr[k] *= std::exp(static_cast<double>(gh[k]));
-      }
-      for (int64_t vd = 0; vd < hd; ++vd) {
-        const double* Sr = &Sp[vd * hd];
-        double pred = 0.0;
-        for (int64_t k = 0; k < hd; ++k) pred += Sr[k] * knp[k];
-        u[static_cast<size_t>(vd)] = (static_cast<double>(vvp[vd]) - pred) * b;
-      }
-      for (int64_t vd = 0; vd < hd; ++vd) {
-        double* Sr = &Sp[vd * hd];
-        const double uv = u[static_cast<size_t>(vd)];
-        for (int64_t k = 0; k < hd; ++k) Sr[k] += uv * knp[k];
-      }
-      float* cr = &core[static_cast<size_t>(base)];
-      for (int64_t vd = 0; vd < hd; ++vd) {
-        const double* Sr = &Sp[vd * hd];
-        double o = 0.0;
-        for (int64_t k = 0; k < hd; ++k)
-          o += Sr[k] * (static_cast<double>(qnp[k]) * scale);
-        cr[vd] = static_cast<float>(o);
-      }
-    }
-  }
-  DBuf dcore(d, DType::kF32, {T, proj}, core.data());  // upload back to device
+  // HOST-FALLBACK ISLAND: KDA decay gate + per-k-channel gated-delta recurrence
+  // (shared KdaRecurrenceIsland — see its definition above). THE W7-speed residual.
+  DBuf dcore = KdaRecurrenceIsland(d, qn, kn, vc, g1, braw, w.a_log, w.dt_bias, p, T);
 
   // sigmoid-gated output RMSNorm then o_proj (ON DEVICE).
   DBuf dcn(d, DType::kF32, {T, proj});
@@ -298,53 +405,11 @@ DBuf MlaLayerDevice(const Dev& d, const MlaLayerHostWeights& w, const Tensor& dh
   DBuf dkv(d, DType::kF32, {T, kvw});
   vt::MatmulBT(d.q, dkv.t(), dkvcn.t(), WF32(d, w.kv_b_proj, {kvw, L}));
 
-  // ── HOST-FALLBACK ISLAND: the materialized-MHA attention core (causal softmax
-  // over the per-head k_nope|k_pe / v, NoPE so no RoPE). The device path is
-  // mla::ForwardMlaAttentionBlock over the runner's paged KV + W_UK/W_UV absorption
-  // — the born-on-runner residual. Identical math to kimi_linear_forward.cpp:223-258.
-  std::vector<float> hq(static_cast<size_t>(T) * nah * qk),
-      hkv(static_cast<size_t>(T) * kvw), hkpe(static_cast<size_t>(T) * qr);
-  dq.Download(d, hq.data());
-  dkv.Download(d, hkv.data());
-  dkpe.Download(d, hkpe.data());
-  const double scale = std::pow(static_cast<double>(qk), -0.5);
-  std::vector<float> out(static_cast<size_t>(T) * nah * vh, 0.0f);
-  std::vector<double> sc(static_cast<size_t>(T));
-  for (int64_t h = 0; h < nah; ++h) {
-    for (int64_t t = 0; t < T; ++t) {
-      const float* q_nope = &hq[static_cast<size_t>(t * nah * qk + h * qk)];
-      const float* q_pe = q_nope + qn;
-      double mx = -INFINITY;
-      for (int64_t s = 0; s <= t; ++s) {
-        const float* k_nope = &hkv[static_cast<size_t>(s * kvw + h * (qn + vh))];
-        const float* kpe = &hkpe[static_cast<size_t>(s * qr)];
-        double dot = 0.0;
-        for (int64_t dd = 0; dd < qn; ++dd)
-          dot += static_cast<double>(q_nope[dd]) * k_nope[dd];
-        for (int64_t dd = 0; dd < qr; ++dd)
-          dot += static_cast<double>(q_pe[dd]) * kpe[dd];
-        dot *= scale;
-        sc[static_cast<size_t>(s)] = dot;
-        mx = std::max(mx, dot);
-      }
-      double sum = 0.0;
-      for (int64_t s = 0; s <= t; ++s) {
-        const double e = std::exp(sc[static_cast<size_t>(s)] - mx);
-        sc[static_cast<size_t>(s)] = e;
-        sum += e;
-      }
-      float* ot = &out[static_cast<size_t>(t * nah * vh + h * vh)];
-      for (int64_t dd = 0; dd < vh; ++dd) {
-        double acc = 0.0;
-        for (int64_t s = 0; s <= t; ++s) {
-          const float* vs = &hkv[static_cast<size_t>(s * kvw + h * (qn + vh) + qn)];
-          acc += (sc[static_cast<size_t>(s)] / sum) * static_cast<double>(vs[dd]);
-        }
-        ot[dd] = static_cast<float>(acc);
-      }
-    }
-  }
-  DBuf dout(d, DType::kF32, {T, nah * vh}, out.data());  // upload
+  // HOST-FALLBACK ISLAND: the materialized-MHA attention core (causal softmax, NoPE)
+  // via the shared MlaSoftmaxIsland (see its definition above). The device path is
+  // mla::ForwardMlaAttentionBlock over the runner's paged KV — the born-on-runner
+  // residual. Identical math to kimi_linear_forward.cpp:223-258.
+  DBuf dout = MlaSoftmaxIsland(d, dq, dkv, dkpe, p, T);
   DBuf attn(d, DType::kF32, {T, H});
   vt::MatmulBT(d.q, attn.t(), dout.t(), WF32(d, w.o_proj, {H, nah * vh}));
   return attn;
@@ -520,6 +585,278 @@ DBuf DeviceForwardBody(const Dev& d, const KimiLinearWeights& weights,
   return logits;
 }
 
+// ═══ bf16-RESIDENT device COMPUTE (§13) — the FULL-model device forward ═════════
+// Byte-for-byte the f32 structure above, with each of the ~20 projection GEMMs
+// swapped from WF32+MatmulBT (f32 host alias) to GemmBf16 over the bf16-resident
+// OwnedTensor (cast the f32 activation to bf16, MatmulBT bf16xbf16->f32 — vLLM's own
+// projection numerics). The two host-fallback islands (KdaRecurrenceIsland /
+// MlaSoftmaxIsland) and every small-vector op (short convs, norms, L2Norm,
+// RmsNormGated, router topk, weighted combine, SwiGLU activation) are UNCHANGED (f32
+// activations; the tiny vectors alias host f32 via WF32). The residual stream stays
+// f32. Same call graph as the f32 path, so the tiny-config gate proves the exact
+// wiring the full model runs.
+DBuf SwiGluDeviceBf16(const Dev& d, const OwnedTensor& gate, const OwnedTensor& up,
+                      const OwnedTensor& down, const Tensor& dh, int64_t H, int64_t I,
+                      int64_t T) {
+  DBuf dg(d, DType::kF32, {T, I});
+  GemmBf16(d, dg.t(), dh, gate, I, H);
+  DBuf du(d, DType::kF32, {T, I});
+  GemmBf16(d, du.t(), dh, up, I, H);
+  DBuf da(d, DType::kF32, {T, I});
+  vt::MoeSiluMul(d.q, da.t(), dg.t(), du.t());
+  DBuf out(d, DType::kF32, {T, H});
+  GemmBf16(d, out.t(), da.t(), down, H, I);
+  return out;
+}
+
+DBuf KdaLayerDeviceBf16(const Dev& d, const KdaResidentWeights& w, const Tensor& dh,
+                        const KimiLinearParams& p, int64_t T) {
+  const int64_t H = p.hidden_size;
+  const int64_t nh = p.kda_num_heads;
+  const int64_t hd = p.kda_head_dim;
+  const int64_t proj = nh * hd;
+  const int64_t K = p.kda_short_conv_kernel_size;
+
+  // q/k/v projections -> silu short convs.
+  DBuf rq(d, DType::kF32, {T, proj});
+  GemmBf16(d, rq.t(), dh, w.q_proj, proj, H);
+  DBuf rk(d, DType::kF32, {T, proj});
+  GemmBf16(d, rk.t(), dh, w.k_proj, proj, H);
+  DBuf rv(d, DType::kF32, {T, proj});
+  GemmBf16(d, rv.t(), dh, w.v_proj, proj, H);
+  DBuf qc = ConvSilu(d, rq.t(), w.q_conv, T, proj, K);
+  DBuf kc = ConvSilu(d, rk.t(), w.k_conv, T, proj, K);
+  DBuf vc = ConvSilu(d, rv.t(), w.v_conv, T, proj, K);  // v (no L2-norm)
+
+  // per-head q/k L2-norm over head_dim — view [T,proj] as [T*nh,hd].
+  DBuf qn(d, DType::kF32, {T, proj});
+  DBuf kn(d, DType::kF32, {T, proj});
+  {
+    Tensor qc3 = MakeTensor(qc.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    Tensor qn3 = MakeTensor(qn.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    Tensor kc3 = MakeTensor(kc.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    Tensor kn3 = MakeTensor(kn.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    vt::L2Norm(d.q, qn3, qc3, vt::L2NormArgs{1e-6f});
+    vt::L2Norm(d.q, kn3, kc3, vt::L2NormArgs{1e-6f});
+  }
+
+  DBuf braw(d, DType::kF32, {T, nh});
+  GemmBf16(d, braw.t(), dh, w.b_proj, nh, H);
+  DBuf fa(d, DType::kF32, {T, hd});
+  GemmBf16(d, fa.t(), dh, w.f_a_proj, hd, H);
+  DBuf g1(d, DType::kF32, {T, proj});
+  GemmBf16(d, g1.t(), fa.t(), w.f_b_proj, proj, hd);
+  DBuf ga(d, DType::kF32, {T, hd});
+  GemmBf16(d, ga.t(), dh, w.g_a_proj, hd, H);
+  DBuf g2(d, DType::kF32, {T, proj});
+  GemmBf16(d, g2.t(), ga.t(), w.g_b_proj, proj, hd);
+
+  // HOST-FALLBACK ISLAND: KDA decay gate + per-k-channel gated-delta recurrence.
+  DBuf dcore = KdaRecurrenceIsland(d, qn, kn, vc, g1, braw, w.a_log, w.dt_bias, p, T);
+
+  DBuf dcn(d, DType::kF32, {T, proj});
+  {
+    Tensor x3 = MakeTensor(dcore.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor g3 = MakeTensor(g2.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor o3 = MakeTensor(dcn.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    vt::RmsNormGated(d.q, o3, x3, g3, WF32(d, w.o_norm, {hd}),
+                     vt::RmsNormGatedArgs{p.rms_norm_eps, /*sigmoid_gate=*/true});
+  }
+  DBuf out(d, DType::kF32, {T, H});
+  GemmBf16(d, out.t(), dcn.t(), w.o_proj, H, proj);
+  return out;
+}
+
+DBuf MlaLayerDeviceBf16(const Dev& d, const MlaResidentWeights& w, const Tensor& dh,
+                        const KimiLinearParams& p, int64_t T) {
+  const int64_t H = p.hidden_size;
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim;
+  const int64_t qr = p.qk_rope_head_dim;
+  const int64_t qk = qn + qr;
+  const int64_t vh = p.v_head_dim;
+  const int64_t L = p.kv_lora_rank;
+  const int64_t kvw = nah * (qn + vh);
+
+  DBuf dq(d, DType::kF32, {T, nah * qk});
+  GemmBf16(d, dq.t(), dh, w.q_proj, nah * qk, H);
+  DBuf dlat(d, DType::kF32, {T, L + qr});
+  GemmBf16(d, dlat.t(), dh, w.kv_a_proj_with_mqa, L + qr, H);
+
+  DBuf dkvc(d, DType::kF32, {T, L});
+  DBuf dkpe(d, DType::kF32, {T, qr});
+  {
+    const size_t rl = static_cast<size_t>(L + qr) * sizeof(float);
+    const char* src = static_cast<const char*>(dlat.ptr());
+    char* pc = static_cast<char*>(dkvc.ptr());
+    char* pp = static_cast<char*>(dkpe.ptr());
+    for (int64_t t = 0; t < T; ++t) {
+      d.b.Copy(d.q, pc + static_cast<size_t>(t) * L * sizeof(float),
+               src + static_cast<size_t>(t) * rl, static_cast<size_t>(L) * sizeof(float));
+      d.b.Copy(d.q, pp + static_cast<size_t>(t) * qr * sizeof(float),
+               src + static_cast<size_t>(t) * rl + static_cast<size_t>(L) * sizeof(float),
+               static_cast<size_t>(qr) * sizeof(float));
+    }
+  }
+  DBuf dkvcn(d, DType::kF32, {T, L});
+  vt::RmsNorm(d.q, dkvcn.t(), dkvc.t(), WF32(d, w.kv_a_layernorm, {L}),
+              vt::RmsNormArgs{p.rms_norm_eps, false});
+  DBuf dkv(d, DType::kF32, {T, kvw});
+  GemmBf16(d, dkv.t(), dkvcn.t(), w.kv_b_proj, kvw, L);
+
+  DBuf dout = MlaSoftmaxIsland(d, dq, dkv, dkpe, p, T);
+  DBuf attn(d, DType::kF32, {T, H});
+  GemmBf16(d, attn.t(), dout.t(), w.o_proj, H, nah * vh);
+  return attn;
+}
+
+DBuf MoeBlockDeviceBf16(const Dev& d, const MoeResidentWeights& w, const Tensor& dh,
+                        const KimiLinearParams& p, int64_t T) {
+  const int64_t H = p.hidden_size;
+  const int64_t E = p.num_experts;
+  const int64_t k = p.num_experts_per_token;
+  const int64_t I = p.moe_intermediate_size;
+
+  // router: logits = gate(x) (bf16, like vLLM) then grouped sigmoid top-k.
+  DBuf dlog(d, DType::kF32, {T, E});
+  GemmBf16(d, dlog.t(), dh, w.gate, E, H);
+  vt::MoeRouterTopKArgs args{};
+  args.top_k = static_cast<int>(k);
+  args.renormalize = p.moe_renormalize;
+  args.scoring_func = vt::MoeScoringFunc::kSigmoid;
+  args.num_expert_group = static_cast<int>(p.num_expert_group);
+  args.topk_group = static_cast<int>(p.topk_group);
+  args.routed_scaling_factor = static_cast<float>(p.routed_scaling_factor);
+  DBuf dtw(d, DType::kF32, {T, k});
+  DBuf dtid(d, DType::kI32, {T, k});
+  std::unique_ptr<Tensor> bias;
+  if (!w.e_score_correction_bias.empty())
+    bias = std::make_unique<Tensor>(WF32(d, w.e_score_correction_bias, {E}));
+  vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(), args, bias.get());
+
+  // routed experts — per-expert gather / SwiGLU / scatter (bf16 GEMMs).
+  DBuf expert_out(d, DType::kF32, {T, k, H});
+  expert_out.Zero(d);
+  std::vector<int32_t> ids(static_cast<size_t>(T) * k);
+  dtid.Download(d, ids.data());
+  std::vector<std::vector<std::pair<int64_t, int64_t>>> lists(static_cast<size_t>(E));
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t j = 0; j < k; ++j)
+      lists[static_cast<size_t>(ids[static_cast<size_t>(t * k + j)])].push_back({t, j});
+  const size_t row_bytes = static_cast<size_t>(H) * sizeof(float);
+  for (int64_t e = 0; e < E; ++e) {
+    const auto& list = lists[static_cast<size_t>(e)];
+    if (list.empty()) continue;
+    const int64_t n = static_cast<int64_t>(list.size());
+    DBuf xg(d, DType::kF32, {n, H});
+    for (int64_t r = 0; r < n; ++r)
+      d.b.Copy(d.q, static_cast<char*>(xg.ptr()) + static_cast<size_t>(r) * row_bytes,
+               static_cast<const char*>(dh.data) +
+                   static_cast<size_t>(list[static_cast<size_t>(r)].first) * row_bytes,
+               row_bytes);
+    const MlpResidentWeights& ex = w.experts[static_cast<size_t>(e)];
+    DBuf y = SwiGluDeviceBf16(d, ex.gate_proj, ex.up_proj, ex.down_proj, xg.t(), H, I, n);
+    for (int64_t r = 0; r < n; ++r) {
+      const auto& tj = list[static_cast<size_t>(r)];
+      d.b.Copy(d.q,
+               static_cast<char*>(expert_out.ptr()) +
+                   static_cast<size_t>(tj.first * k + tj.second) * row_bytes,
+               static_cast<const char*>(y.ptr()) + static_cast<size_t>(r) * row_bytes,
+               row_bytes);
+    }
+  }
+
+  // shared expert (always) + weighted combine.
+  DBuf out(d, DType::kF32, {T, H});
+  if (w.has_shared) {
+    const int64_t shared_i = I * p.num_shared_experts;
+    DBuf shared = SwiGluDeviceBf16(d, w.shared.gate_proj, w.shared.up_proj,
+                                   w.shared.down_proj, dh, H, shared_i, T);
+    vt::MoeCombine(d.q, out.t(), expert_out.t(), dtw.t(), &shared.t());
+  } else {
+    vt::MoeCombine(d.q, out.t(), expert_out.t(), dtw.t(), nullptr);
+  }
+  return out;
+}
+
+DBuf DenseMlpDeviceBf16(const Dev& d, const MlpResidentWeights& w, const Tensor& dh,
+                        const KimiLinearParams& p, int64_t T) {
+  return SwiGluDeviceBf16(d, w.gate_proj, w.up_proj, w.down_proj, dh, p.hidden_size,
+                          p.intermediate_size, T);
+}
+
+DBuf DeviceForwardBodyBf16(const Dev& d, const KimiLinearWeights& weights,
+                           const std::vector<int32_t>& token_ids,
+                           const std::vector<int32_t>& logits_indices) {
+  const KimiLinearResidentWeights& rw = weights.resident;
+  const KimiLinearParams& p = weights.params;
+  const int64_t H = p.hidden_size;
+  const int64_t V = p.vocab_size;
+  const int64_t L = p.num_hidden_layers;
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const float eps = p.rms_norm_eps;
+  VT_CHECK(T > 0, "KimiLinear bf16 device compute: empty token sequence");
+  VT_CHECK(static_cast<int64_t>(rw.layers.size()) == L,
+           "KimiLinear bf16 device compute: resident layer count != num_hidden_layers");
+
+  // embed (bf16 table -> f32 out) -> residual stream.
+  DBuf hidden(d, DType::kF32, {T, H});
+  {
+    DBuf dids(d, DType::kI32, {T}, token_ids.data());
+    Tensor htab = ResidentBf16W(d, rw.embed_tokens, {V, H});
+    Tensor hh = hidden.t();
+    vt::Embedding(d.q, hh, htab, dids.t());
+  }
+  DBuf res(d, DType::kF32, {T, H});
+  res.Zero(d);
+  Tensor hcur = hidden.t();
+  std::shared_ptr<void> hold;
+
+  for (int64_t l = 0; l < L; ++l) {
+    const KimiLinearLayerResidentWeights& lw = rw.layers[static_cast<size_t>(l)];
+    DBuf dhn(d, DType::kF32, {T, H});
+    AddRmsNorm(d, dhn, hcur, WF32(d, lw.input_layernorm, {H}), res, eps);
+    DBuf attn = lw.is_kda ? KdaLayerDeviceBf16(d, lw.kda, dhn.t(), p, T)
+                          : MlaLayerDeviceBf16(d, lw.mla, dhn.t(), p, T);
+    DBuf dh2(d, DType::kF32, {T, H});
+    AddRmsNorm(d, dh2, attn.t(), WF32(d, lw.post_attention_layernorm, {H}), res, eps);
+    DBuf mlp = lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
+                         : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T);
+    auto* held = new DBuf(std::move(mlp));
+    hcur = held->t();
+    hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });
+  }
+
+  DBuf dnorm(d, DType::kF32, {T, H});
+  AddRmsNorm(d, dnorm, hcur, WF32(d, rw.final_norm, {H}), res, eps);
+
+  // logits_indices gather-before-lm_head, in REQUEST order.
+  Tensor src = dnorm.t();
+  DBuf dgather(d, DType::kF32,
+               logits_indices.empty()
+                   ? std::vector<int64_t>{1, 1}
+                   : std::vector<int64_t>{static_cast<int64_t>(logits_indices.size()), H});
+  if (!logits_indices.empty()) {
+    const size_t rb = static_cast<size_t>(H) * sizeof(float);
+    char* dp = static_cast<char*>(dgather.ptr());
+    const char* sp = static_cast<const char*>(dnorm.ptr());
+    for (size_t i = 0; i < logits_indices.size(); ++i) {
+      const int32_t idx = logits_indices[i];
+      VT_CHECK(idx >= 0 && idx < T,
+               "KimiLinear bf16 device compute: logits index out of range");
+      d.b.Copy(d.q, dp + i * rb, sp + static_cast<size_t>(idx) * rb, rb);
+    }
+    src = dgather.t();
+  }
+  const int64_t n_out = src.shape[0];
+
+  const bool tied = p.tie_word_embeddings || rw.lm_head.Empty();
+  const OwnedTensor& lm = tied ? rw.embed_tokens : rw.lm_head;
+  DBuf logits(d, DType::kF32, {n_out, V});
+  GemmBf16(d, logits.t(), src, lm, V, H);
+  return logits;
+}
+
 }  // namespace
 
 // ─── per-op device wrappers (host-in / host-out) — the per-op CPU gates ────────
@@ -584,11 +921,16 @@ ForwardLogits KimiLinearModel::ForwardDeviceCompute(
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
     vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
-  VT_CHECK(weights.host.materialized,
-           "KimiLinear device compute: host-float weights not materialized "
-           "(LoadKimiLinearForCausalLMWeights). The device compute reads the SAME "
-           "host weights the W2 reference does; the CUDA-resident staging (grouped-"
-           "MoE slabs, absorbed W_UK/W_UV) is the born-on-runner residual.");
+  // §13: the FULL model loads as bf16-resident (host f32 would OOM the pool), so
+  // route through the bf16 device forward whenever resident weights are present; the
+  // f32 host path stays for the tiny-config unit gate.
+  const bool bf16 = weights.resident.resident;
+  VT_CHECK(bf16 || weights.host.materialized,
+           "KimiLinear device compute: neither bf16-resident (§13, "
+           "LoadKimiLinearResidentBf16Weights) nor host-float (LoadKimiLinearFor"
+           "CausalLMWeights) weights are populated. The device compute reads one or "
+           "the other; the full model MUST use the bf16-resident path (183 GiB f32 "
+           "OOMs the 119 GiB unified pool).");
   // The device compute manages a fresh single-sequence context (NoPE, causal); the
   // runner's paged het-KV / positions are consumed by the born-on-runner residual
   // (the paged incremental decode), not this seam.
@@ -596,7 +938,8 @@ ForwardLogits KimiLinearModel::ForwardDeviceCompute(
   (void)attn_meta;
   (void)attn_kv;
   Dev d{vt::GetBackend(queue.device.type), queue};
-  DBuf dlogits = DeviceForwardBody(d, weights, token_ids, logits_indices);
+  DBuf dlogits = bf16 ? DeviceForwardBodyBf16(d, weights, token_ids, logits_indices)
+                      : DeviceForwardBody(d, weights, token_ids, logits_indices);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);
 }

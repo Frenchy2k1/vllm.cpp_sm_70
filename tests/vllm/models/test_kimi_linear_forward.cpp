@@ -836,3 +836,58 @@ TEST_CASE("kimi-linear W7 device: ForwardDevice reaches device compute (opt-in g
     CHECK(ba == bb);
   }
 }
+
+// ─── (k) bf16-RESIDENT device compute == the f32 reference within a bf16 envelope ─
+// §13: the full model loads bf16-resident (183 GiB f32 OOMs the pool). The tiny gate
+// builds the SAME bf16 device forward (BuildKimiResidentFromHost rounds every large
+// matmul weight f32->bf16; the device casts each projection activation to bf16 and
+// runs the (bf16,bf16)->f32 MatmulBT — vLLM's projection numerics) and checks it
+// against the INDEPENDENT f32 host reference (KimiLinearModel::Forward, exact f32
+// weights, a different code path). The delta is the bf16 weight-rounding + per-GEMM
+// activation cast through the 2-layer residual stream — a stated bf16 tolerance,
+// scaled to the logit magnitude. This proves the full-model bf16 WIRING (loader +
+// resident GEMM + dispatch) the GB10 e2e runs; the token-exact gate is the full model
+// vs the SACRED golden.
+TEST_CASE("kimi-linear W7 bf16-resident: ForwardDeviceCompute matches the f32 reference") {
+  TempFile f(BuildSt(BuildTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  KimiLinearWeights w = LoadKimiLinearForCausalLMWeights(shards, TinyConfig());
+  // Build the bf16-resident weights from the host f32 weights (CPU aliases the bf16
+  // bytes; the full model instead loads bf16 directly + stages to d_dev). The device
+  // compute now routes to the bf16 path (weights.resident.resident == true).
+  w.resident = vllm::BuildKimiResidentFromHost(w.host, w.params);
+  REQUIRE(w.resident.resident);
+  REQUIRE(w.resident.layers.size() == 2);
+  REQUIRE(w.resident.embed_tokens.dtype == vt::DType::kBF16);
+  REQUIRE_FALSE(w.resident.lm_head.Empty());  // untied
+
+  const std::vector<int32_t> tokens = {1, 3, 0, 5};
+  const std::vector<int32_t> positions = {0, 1, 2, 3};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  vt::Queue q = CpuQueue();
+  vt::Backend& be = vt::GetBackend(q.device.type);
+
+  // Independent f32 reference (the host Forward path, exact f32 weights).
+  const std::vector<float> ref =
+      vllm::KimiLinearModel::Forward(tokens, positions, attn_meta, attn_kv, w, q, {});
+  // bf16-resident device compute (routes to DeviceForwardBodyBf16).
+  const vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardDeviceCompute(
+      tokens, positions, attn_meta, attn_kv, w, q, {});
+  CHECK(fl.on_device());
+  CHECK(fl.host.empty());
+  REQUIRE(fl.rows == static_cast<int64_t>(tokens.size()));
+  REQUIRE(fl.vocab == static_cast<int64_t>(V));
+  REQUIRE(fl.device_tensor.data != nullptr);
+
+  std::vector<float> dl(static_cast<size_t>(fl.rows) * static_cast<size_t>(fl.vocab));
+  be.Copy(q, dl.data(), fl.device_tensor.data, dl.size() * sizeof(float));
+  be.Synchronize(q);
+  REQUIRE(dl.size() == ref.size());
+  // bf16 envelope: rtol 6e-2 + atol scaled to the logit magnitude (6e-2 * max|ref|).
+  double maxabs = 0.0;
+  for (float r : ref) maxabs = std::max(maxabs, std::fabs(static_cast<double>(r)));
+  const double atol = 6e-2 * maxabs;
+  for (size_t i = 0; i < dl.size(); ++i) CHECK(Close(dl[i], ref[i], 6e-2, atol));
+}
