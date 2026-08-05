@@ -110,6 +110,30 @@ __global__ void ProcessScalesKernel(uint8_t* __restrict__ out,
   out[static_cast<size_t>(r) * SN + c] = obyte;
 }
 
+// MXFP4 E8M0 scale processing. Same permute chain as ProcessScalesKernel
+// (marlin_permute_scales 64-wide scale_perm + within-4 [0,2,1,3]), but over the
+// group-32 scale grid [SK32, SN] and the value is the SOURCE E8M0 byte passed
+// through unchanged (no fp8 decode, no *scale_factor*128, no S0E5M3 encode, no
+// <2 clamp). scalebuf is our [N, K/32] E8M0 block-scale (row-major over N).
+__global__ void ProcessScalesMxfp4Kernel(uint8_t* __restrict__ out,
+                                         const uint8_t* __restrict__ scalebuf,
+                                         int size_k, int size_n) {
+  const int SN = size_n;
+  const int SK32 = size_k / 32;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= SK32 || c >= SN) return;
+
+  const int i = r * SN + c;  // flat index into the [SK32, SN] processed tensor
+  const int perm4[4] = {0, 2, 1, 3};
+  const int mi = (i / 4) * 4 + perm4[i % 4];             // undo within-4 reorder
+  const int j = (mi / 64) * 64 + kScalePerm[mi % 64];    // undo permute_scales
+  const int kr = j / SN;
+  const int n = j % SN;
+  // Source E8M0 byte at scale[n][kr] = scalebuf[n*SK32 + kr]; passthrough.
+  out[static_cast<size_t>(r) * SN + c] = scalebuf[static_cast<size_t>(n) * SK32 + kr];
+}
+
 // fp8-e4m3 byte -> float (host, for the combined_scale_factor max reduce).
 float DecodeFp8E4m3(uint8_t b) {
   const int sign = (b >> 7) & 1;
@@ -173,6 +197,23 @@ void MarlinProcessExpertScales(void* stream, const uint8_t* scale_nk16, uint8_t*
   dim3 tg((SN + tb.x - 1) / tb.x, (SK16 + tb.y - 1) / tb.y);
   ProcessScalesKernel<<<tg, tb, 0, s>>>(out_scale, scale_nk16, size_k, size_n, scale_factor);
   RCheck(cudaGetLastError(), "process scales launch");
+}
+
+void MarlinProcessExpertScalesMxfp4(void* stream, const uint8_t* scale_nk32,
+                                    uint8_t* out_scale, int size_k, int size_n) {
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  static bool perm_uploaded = false;
+  if (!perm_uploaded) {
+    RCheck(cudaMemcpyToSymbol(kScalePerm, kScalePermHost, sizeof(kScalePermHost)),
+           "upload scale_perm (mxfp4)");
+    perm_uploaded = true;
+  }
+  const int SN = size_n;
+  const int SK32 = size_k / 32;
+  dim3 tb(32, 8);
+  dim3 tg((SN + tb.x - 1) / tb.x, (SK32 + tb.y - 1) / tb.y);
+  ProcessScalesMxfp4Kernel<<<tg, tb, 0, s>>>(out_scale, scale_nk32, size_k, size_n);
+  RCheck(cudaGetLastError(), "process scales mxfp4 launch");
 }
 
 float MarlinNvfp4CombinedScaleFactor(const std::vector<const uint8_t*>& host_scale_bufs,

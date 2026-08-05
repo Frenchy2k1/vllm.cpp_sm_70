@@ -117,6 +117,15 @@ struct Nvfp4Weight {
   int64_t k = 0;        // in_features (K % 16 == 0)
   bool Empty() const { return packed.Empty(); }
 
+  // Block-scale FORMAT. Default = NVFP4: group_size 16, fp8-e4m3 `scale`, a
+  // per-tensor `scale2` global. is_mxfp4 selects compressed-tensors MXFP4
+  // (`mxfp4-pack-quantized`): group_size 32, E8M0 (UE8M0) `scale` [N, K/32], NO
+  // global (scale2 unused). Same E2M1 `packed`. Set ONLY by the dense MXFP4
+  // loader; the 27B/35B NVFP4 gate paths never touch it (default false) so their
+  // Marlin repack/GEMM are byte-unchanged.
+  int group_size = 16;
+  bool is_mxfp4 = false;
+
   // TRUE W4A4 fields (27B compressed-tensors NVFP4; notes §7). Populated ONLY on
   // the 27B CT load (LoadCtNvfp4Raw); left 0 for the 35B modelopt W4A16 weights
   // (which have no activation quant) so `IsTrueW4A4()` gates the 27B alone.

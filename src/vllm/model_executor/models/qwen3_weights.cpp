@@ -40,11 +40,14 @@
 namespace vllm {
 namespace {
 
+using dense_loaders::IsCtMxfp4Projection;
 using dense_loaders::IsCtNvfp4Projection;
 using dense_loaders::LoadBf16Direct;
 using dense_loaders::LoadBf16Transposed;
+using dense_loaders::LoadCtMxfp4W4A16;
 using dense_loaders::LoadCtNvfp4W4A16;
 using dense_loaders::LoadMergedBf16RawNK;
+using dense_loaders::LoadMergedCtMxfp4W4A16;
 using dense_loaders::LoadMergedCtNvfp4W4A16;
 
 using TensorExists = std::function<bool(const std::string&)>;
@@ -74,7 +77,12 @@ Qwen3DenseLayerWeights LoadQwen3Layer(const TensorResolver& get,
   // `<proj>.weight_packed` instead of `<proj>.weight`. The norms and the embed
   // table stay BF16 either way (they are not Linears, so no config group targets
   // them), and `lm_head` is in the checkpoint's `ignore` list.
-  const bool fp4 = IsCtNvfp4Projection(has, sa + "q_proj");
+  // MXFP4 (`mxfp4-pack-quantized`, U8 E8M0 scale) and NVFP4 (`nvfp4-pack-quantized`,
+  // F8_E4M3 scale) both store `<proj>.weight_packed`; the U8 scale discriminates
+  // MXFP4. Both populate the SAME fp4 fields (Nvfp4Weight, is_mxfp4 set for MXFP4),
+  // so the forward routes on the weight flag with no per-call arch probe.
+  const bool mxfp4 = IsCtMxfp4Projection(get, has, sa + "q_proj");
+  const bool fp4 = mxfp4 || IsCtNvfp4Projection(has, sa + "q_proj");
 
   // QKVParallelLinear: one merged owner in exact [q,k,v] output-row order
   // (packed_modules_mapping qkv_proj<-[q,k,v]_proj), kept raw-NK for MatmulBT.
@@ -82,9 +90,15 @@ Qwen3DenseLayerWeights LoadQwen3Layer(const TensorResolver& get,
   // packed + scale, max-then-reciprocate global scale) — the same single merged
   // parameter vLLM owns.
   if (fp4) {
-    w.attn.qkv_proj_fp4 = LoadMergedCtNvfp4W4A16(
-        get, has, {sa + "q_proj", sa + "k_proj", sa + "v_proj"});
-    w.attn.o_proj_fp4 = LoadCtNvfp4W4A16(get, has, sa + "o_proj");
+    if (mxfp4) {
+      w.attn.qkv_proj_fp4 = LoadMergedCtMxfp4W4A16(
+          get, has, {sa + "q_proj", sa + "k_proj", sa + "v_proj"});
+      w.attn.o_proj_fp4 = LoadCtMxfp4W4A16(get, has, sa + "o_proj");
+    } else {
+      w.attn.qkv_proj_fp4 = LoadMergedCtNvfp4W4A16(
+          get, has, {sa + "q_proj", sa + "k_proj", sa + "v_proj"});
+      w.attn.o_proj_fp4 = LoadCtNvfp4W4A16(get, has, sa + "o_proj");
+    }
   } else {
     w.attn.qkv_proj = LoadMergedBf16RawNK(
         get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"});
@@ -104,9 +118,15 @@ Qwen3DenseLayerWeights LoadQwen3Layer(const TensorResolver& get,
   // vLLM's single merged Marlin operand (size_n=2I) at repack time, or runs the
   // split two-GEMM A/B — both from the same loaded bytes.
   if (fp4) {
-    w.mlp.gate_proj_fp4 = LoadCtNvfp4W4A16(get, has, mlp + "gate_proj");
-    w.mlp.up_proj_fp4 = LoadCtNvfp4W4A16(get, has, mlp + "up_proj");
-    w.mlp.down_proj_fp4 = LoadCtNvfp4W4A16(get, has, mlp + "down_proj");
+    if (mxfp4) {
+      w.mlp.gate_proj_fp4 = LoadCtMxfp4W4A16(get, has, mlp + "gate_proj");
+      w.mlp.up_proj_fp4 = LoadCtMxfp4W4A16(get, has, mlp + "up_proj");
+      w.mlp.down_proj_fp4 = LoadCtMxfp4W4A16(get, has, mlp + "down_proj");
+    } else {
+      w.mlp.gate_proj_fp4 = LoadCtNvfp4W4A16(get, has, mlp + "gate_proj");
+      w.mlp.up_proj_fp4 = LoadCtNvfp4W4A16(get, has, mlp + "up_proj");
+      w.mlp.down_proj_fp4 = LoadCtNvfp4W4A16(get, has, mlp + "down_proj");
+    }
   } else {
     w.mlp.gate_up_proj = LoadMergedBf16RawNK(
         get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});

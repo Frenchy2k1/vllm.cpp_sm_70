@@ -111,11 +111,13 @@ void MoeGroupedGemmNvfp4MarlinKernelCuda(Queue& q, Tensor& c, const Tensor& a,
   cudaStream_t s = AsStream(q);
   const int dev = q.device.index;
 
-  // NVFP4 W4A16, bf16 activation/output (marlin_moe_wna16 generate_kernels.py:94).
+  // NVFP4 W4A16, bf16 activation/output (marlin_moe_wna16 generate_kernels.py:94),
+  // OR MXFP4 W4A16 when args.mxfp4 (E8M0 scales => s_type kFE8M0fnu, group_size 32
+  // => group_blocks 2, NO global scale). Mirrors vLLM's is_nvfp4 branch.
   const vllm::ScalarType a_type = vllm::kBFloat16;
   const vllm::ScalarType b_type = vllm::kFE2M1f;
   const vllm::ScalarType c_type = vllm::kBFloat16;
-  const vllm::ScalarType s_type = vllm::kFE4M3fn;
+  const vllm::ScalarType s_type = args.mxfp4 ? vllm::kFE8M0fnu : vllm::kFE4M3fn;
 
   const int num_experts = static_cast<int>(b_q_weight.shape[0]);
   const int size_m = args.size_m;
@@ -123,8 +125,11 @@ void MoeGroupedGemmNvfp4MarlinKernelCuda(Queue& q, Tensor& c, const Tensor& a,
   const int size_k = args.size_k;
   const int moe_block_size = args.moe_block_size;
   const int top_k = args.top_k;
-  const int group_size = 16;                 // group_blocks == 1
+  const int group_size = args.group_size;    // 16 (nvfp4) or 32 (mxfp4)
   const int num_groups = size_k / group_size;
+  // MXFP4 has NO global scale — the kernel only reads global_scale_ptr under
+  // (b_type==kFE2M1f && s_type==kFE4M3fn), so pass nullptr on the mxfp4 path.
+  void* global_scale_ptr = args.mxfp4 ? nullptr : global_scale.data;
 
   int sms = -1;
   Check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev),
@@ -153,7 +158,7 @@ void MoeGroupedGemmNvfp4MarlinKernelCuda(Queue& q, Tensor& c, const Tensor& a,
 
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data, b_q_weight.data, c.data, c_tmp, /*b_bias=*/nullptr, /*a_s=*/nullptr,
-      b_scales.data, global_scale.data, /*zp=*/nullptr, /*g_idx=*/nullptr, /*perm=*/nullptr,
+      b_scales.data, global_scale_ptr, /*zp=*/nullptr, /*g_idx=*/nullptr, /*perm=*/nullptr,
       /*a_tmp=*/nullptr, sorted_token_ids.data, expert_ids.data, num_tokens_past_padded.data,
       topk_weights.data, moe_block_size, num_experts, top_k, args.mul_topk_weights, size_m,
       size_n, size_k, workspace.data, a_type, b_type, c_type, s_type, /*has_bias=*/false,

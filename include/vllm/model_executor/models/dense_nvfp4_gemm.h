@@ -55,6 +55,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/mxfp4_dequant.h"  // DequantMxfp4ToBf16
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // DequantNvfp4ToBf16
 #include "vllm/model_executor/models/dense_device_glue.h"    // Dev/DBuf/MakeTensor
 #include "vllm/model_executor/models/qwen3_5_weights.h"      // Nvfp4Weight
@@ -149,7 +150,8 @@ inline Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
   }
   Nvfp4Dev r;
   r.packed = MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k / 2});
-  r.scale = MakeTensor(w.d_scale.get(), DType::kI8, d.q.device, {w.n, w.k / 16});
+  // Scale grid is [N, K/group_size]: K/16 for NVFP4, K/32 for MXFP4.
+  r.scale = MakeTensor(w.d_scale.get(), DType::kI8, d.q.device, {w.n, w.k / w.group_size});
   return r;
 }
 
@@ -162,6 +164,24 @@ inline std::vector<uint16_t> DequantNvfp4ToBLayout(const Nvfp4Weight& w) {
   DequantNvfp4ToBf16(reinterpret_cast<const uint8_t*>(w.packed.bytes.data()),
                      reinterpret_cast<const uint8_t*>(w.scale.bytes.data()),
                      w.scale2, out_dim, in_dim, oi.data());
+  std::vector<uint16_t> io(static_cast<size_t>(in_dim) * out_dim);
+  for (int64_t r = 0; r < out_dim; ++r)
+    for (int64_t c = 0; c < in_dim; ++c)
+      io[static_cast<size_t>(c) * out_dim + r] =
+          oi[static_cast<size_t>(r) * in_dim + c];
+  return io;
+}
+
+// MXFP4 analog: host dequant of an E8M0/group-32 fp4 weight to bf16 [K=in, N=out]
+// (Matmul-B layout) — the CPU / Marlin-disabled fallback. Bit-for-bit
+// vllm::DequantMxfp4ToBf16 + transpose. Independent of the Marlin kernel's own
+// E8M0 dequant, so a gate comparing the two paths is a real cross-check.
+inline std::vector<uint16_t> DequantMxfp4ToBLayout(const Nvfp4Weight& w) {
+  const int64_t out_dim = w.n, in_dim = w.k;
+  std::vector<uint16_t> oi(static_cast<size_t>(out_dim) * in_dim);
+  DequantMxfp4ToBf16(reinterpret_cast<const uint8_t*>(w.packed.bytes.data()),
+                     reinterpret_cast<const uint8_t*>(w.scale.bytes.data()),
+                     out_dim, in_dim, oi.data());
   std::vector<uint16_t> io(static_cast<size_t>(in_dim) * out_dim);
   for (int64_t r = 0; r < out_dim; ++r)
     for (int64_t c = 0; c < in_dim; ++c)
@@ -196,27 +216,37 @@ inline void BuildMarlinDenseResident(Dev d, const Nvfp4Weight& w,
   if (mr.ready) return;
   const int K = static_cast<int>(w.k);
   const int N = static_cast<int>(w.n);
+  const int gs = static_cast<int>(w.group_size);  // 16 (nvfp4) or 32 (mxfp4)
   void* stream = d.q.handle;
   const size_t w_i32 = static_cast<size_t>(K / 16) * (static_cast<size_t>(N) * 2);
-  const size_t s_b = static_cast<size_t>(K / 16) * N;
+  const size_t s_b = static_cast<size_t>(K / gs) * N;  // K/16 nvfp4, K/32 mxfp4
   mr.w = d.b.Alloc(w_i32 * 4);
   mr.s = d.b.Alloc(s_b);
   mr.g = d.b.Alloc(sizeof(float));
   mr.n = w.n;
   mr.k = w.k;
-  std::vector<const uint8_t*> bufs{
-      reinterpret_cast<const uint8_t*>(w.scale.bytes.data())};
-  std::vector<size_t> lens{w.scale.bytes.size()};
-  const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
   Nvfp4Dev dw = ResidentNvfp4(d, w);
   vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index,
                                      static_cast<uint32_t*>(mr.w),
                                      static_cast<const uint8_t*>(dw.packed.data), K, N);
-  vt::cuda::MarlinProcessExpertScales(stream,
-                                      static_cast<const uint8_t*>(dw.scale.data),
-                                      static_cast<uint8_t*>(mr.s), K, N, sf);
-  const float g = vt::cuda::MarlinNvfp4ProcessGlobalScale(w.scale2, sf);
-  d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  if (w.is_mxfp4) {
+    // MXFP4: E8M0 passthrough permute (no combined factor, no global scale).
+    vt::cuda::MarlinProcessExpertScalesMxfp4(
+        stream, static_cast<const uint8_t*>(dw.scale.data),
+        static_cast<uint8_t*>(mr.s), K, N);
+    const float g = 1.0F;  // unused (kernel skips global for E8M0)
+    d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  } else {
+    std::vector<const uint8_t*> bufs{
+        reinterpret_cast<const uint8_t*>(w.scale.bytes.data())};
+    std::vector<size_t> lens{w.scale.bytes.size()};
+    const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
+    vt::cuda::MarlinProcessExpertScales(stream,
+                                        static_cast<const uint8_t*>(dw.scale.data),
+                                        static_cast<uint8_t*>(mr.s), K, N, sf);
+    const float g = vt::cuda::MarlinNvfp4ProcessGlobalScale(w.scale2, sf);
+    d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  }
   d.b.Synchronize(d.q);  // repack done -> safe to free the fp4 originals
   w.d_packed.reset();
   w.d_scale.reset();
@@ -290,17 +320,20 @@ inline DBuf MatmulNvfp4MarlinD(Dev d, const Tensor& x, const Nvfp4Weight& w,
   // upcast (the same value it rounds to).
   DBuf outbf(d, DType::kBF16, {M, N});
   Tensor wq = MakeTensor(mr.w, DType::kI32, d.q.device, {1, K / 16, N * 2});
-  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / 16, N});
+  // Scale grid rows = K/group_size (K/16 nvfp4, K/32 mxfp4).
+  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / w.group_size, N});
   Tensor gg = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
   Tensor wst = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
   Tensor sorted = MakeTensor(ac.sorted, DType::kI32, d.q.device, {ac.max_tok});
   Tensor expert = MakeTensor(ac.expert, DType::kI32, d.q.device, {ac.max_blk});
   Tensor numpad = MakeTensor(ac.numpad, DType::kI32, d.q.device, {1});
   Tensor topkw = MakeTensor(ac.topkw, DType::kF32, d.q.device, {M});
-  vt::MoeGroupedGemmNvfp4Marlin(
-      d.q, outbf.t(), x, wq, sc, gg, wst, sorted, expert, numpad, topkw,
-      vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(N),
-                        static_cast<int>(K), false});
+  vt::MoeMarlinArgs margs{ac.block, 1, static_cast<int>(M), static_cast<int>(N),
+                          static_cast<int>(K), false};
+  margs.group_size = static_cast<int>(w.group_size);
+  margs.mxfp4 = w.is_mxfp4;
+  vt::MoeGroupedGemmNvfp4Marlin(d.q, outbf.t(), x, wq, sc, gg, wst, sorted, expert,
+                                numpad, topkw, margs);
   if (out_dtype == DType::kBF16) return outbf;
   DBuf out(d, DType::kF32, {M, N});
   vt::CastF32(d.q, out.t(), outbf.t());
@@ -380,8 +413,12 @@ inline void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw,
 // True when a gate/up pair takes the fused Marlin gate_up path. Must be checked
 // IDENTICALLY at every call site so exactly ONE resident layout is ever built.
 inline bool GateUpFusedEligible(const Nvfp4Weight& gw, const Nvfp4Weight& uw) {
+  // MXFP4 takes the SPLIT path (two W4A16 GEMMs + MoeSiluMul): the fused merged
+  // gate_up resident is an NVFP4-only optimization; forcing split keeps the
+  // MXFP4 lane correct without a fused mxf4 pair repack (still byte-correct).
   return FusedGateUpEnabled() && !gw.Empty() && !uw.Empty() && !gw.IsTrueW4A4() &&
-         !uw.IsTrueW4A4() && gw.n == uw.n && gw.k == uw.k && gw.scale2 == uw.scale2;
+         !uw.IsTrueW4A4() && !gw.is_mxfp4 && !uw.is_mxfp4 && gw.n == uw.n &&
+         gw.k == uw.k && gw.scale2 == uw.scale2;
 }
 
 // silu(x@gate.T) * (x@up.T) -> bf16 [M,N] via ONE fused Marlin gate_up GEMM.
@@ -440,6 +477,14 @@ inline DBuf MatmulNvfp4W4A16D(Dev d, const Tensor& x, const Nvfp4Weight& w,
 #endif
   ++MutableW4A16Stats().fallback_gemms;
   DBuf dout(d, out_dtype, {M, N});
+  // MXFP4 has no naive redundant-dequant device op (that op is NVFP4-only); the
+  // fallback is always the host dequant + bf16 Matmul reference.
+  if (w.is_mxfp4) {
+    std::vector<uint16_t> wb = DequantMxfp4ToBLayout(w);
+    DBuf dwb(d, DType::kBF16, {K, N}, wb.data());
+    vt::Matmul(d.q, dout.t(), x, dwb.t());
+    return dout;
+  }
   // Same class-A conversion: the naive redundant-dequant NVFP4 GEMM exists only
   // where the op table realizes it (kCUDA); elsewhere fall to the host dequant +
   // bf16 Matmul reference. Byte-identical to the old `device == kCUDA` test.
@@ -452,6 +497,16 @@ inline DBuf MatmulNvfp4W4A16D(Dev d, const Tensor& x, const Nvfp4Weight& w,
     vt::Matmul(d.q, dout.t(), x, dwb.t());
   }
   return dout;
+}
+
+// Named MXFP4 W4A16 entry point (mirrors MatmulNvfp4W4A16D). y[M,N] = x[M,K] @
+// dequant_mxfp4(w).T for a compressed-tensors MXFP4 weight-only weight (E8M0,
+// group 32, no global). Routes through the SAME shared Marlin/CPU dispatcher via
+// w.is_mxfp4; the assert documents the contract.
+inline DBuf MatmulMxfp4W4A16D(Dev d, const Tensor& x, const Nvfp4Weight& w,
+                              DType out_dtype) {
+  VT_CHECK(w.is_mxfp4, "dense_mxfp4: non-MXFP4 weight routed into MatmulMxfp4W4A16D");
+  return MatmulNvfp4W4A16D(d, x, w, out_dtype);
 }
 
 }  // namespace dense_nvfp4

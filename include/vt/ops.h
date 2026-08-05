@@ -728,6 +728,12 @@ struct MoeMarlinArgs {
   int size_n = 0;  // output features
   int size_k = 0;  // input features (contraction; multiple of 16)
   bool mul_topk_weights = false;  // fold topk_weights into the output (down proj)
+  // Block-scale format selector. Default = NVFP4 (fp8-e4m3 scales, group 16,
+  // per-tensor global scale). group_size 32 + mxfp4=true selects the MXFP4 path
+  // (E8M0/UE8M0 scales => s_type kFE8M0fnu, group_blocks 2, NO global scale;
+  // the `global_scale` tensor is ignored). Mirrors vLLM's is_nvfp4 branch.
+  int group_size = 16;
+  bool mxfp4 = false;
 };
 using MoeGroupedGemmNvfp4MarlinFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, Tensor&,

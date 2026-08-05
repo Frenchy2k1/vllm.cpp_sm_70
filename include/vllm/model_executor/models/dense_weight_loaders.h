@@ -380,5 +380,126 @@ inline Nvfp4Weight LoadMergedCtNvfp4W4A16(
   return merged;
 }
 
+// --- compressed-tensors MXFP4 **W4A16** (`mxfp4-pack-quantized`) -------------
+// ADDED (append-only; no existing helper touched) by the QUANT-CT-MXFP4 dense-Qwen
+// bring-up. MXFP4 analog of LoadCtNvfp4W4A16: same [N=out, K=in] raw orientation
+// and merged-shard ownership rule, but the block scale is E8M0/UE8M0 at
+// group_size 32 with NO global scale.
+//
+// ON-DISK LAYOUT (verified on Yi30/Qwen3-8B-MXFP4, the format compressed-tensors
+// emits for `mxfp4-pack-quantized`, group_size 32, num_bits 4, type float):
+//   <proj>.weight_packed  U8  [N, K/2]    two E2M1 nibbles per byte
+//   <proj>.weight_scale   U8  [N, K/32]   one E8M0 (biased exponent) per 32 elems
+// and NO `<proj>.weight_global_scale` / `<proj>.input_global_scale` (MXFP4 has no
+// global, and the FlashInfer/Marlin W4A16 path folds the E8M0 scale directly). On
+// GB10 the runnable oracle path is Marlin W4A16 (FlashInfer cute-dsl mxf4 rejects
+// sm_121), which is exactly what this routes to. The result is a raw fp4-resident
+// Nvfp4Weight with is_mxfp4=true, group_size=32, scale2 unused.
+
+// True when `proj` is stored as a compressed-tensors MXFP4 linear: `.weight_packed`
+// present AND `.weight_scale` is U8 (E8M0). The U8 scale is the discriminator vs
+// NVFP4 (whose weight_scale is F8_E4M3), so this never matches an NVFP4 checkpoint.
+inline bool IsCtMxfp4Projection(
+    const TensorResolver& get,
+    const std::function<bool(const std::string&)>& has, const std::string& proj) {
+  if (!has(proj + ".weight_packed") || !has(proj + ".weight_scale")) return false;
+  return get(proj + ".weight_scale").dtype == "U8";
+}
+
+// One compressed-tensors MXFP4 W4A16 Linear -> raw fp4-resident Nvfp4Weight in the
+// on-disk [N=out, K=in] orientation the Marlin W4A16 GEMM reads directly.
+// `has` is unused (MXFP4 carries no optional global/input-scale tensors to probe)
+// but kept for signature parity with LoadCtNvfp4W4A16 so the merged loader and the
+// per-projection call sites are uniform.
+inline Nvfp4Weight LoadCtMxfp4W4A16(
+    const TensorResolver& get,
+    [[maybe_unused]] const std::function<bool(const std::string&)>& has,
+    const std::string& proj) {
+  const StTensor& packed = get(proj + ".weight_packed");
+  VT_CHECK(packed.dtype == "U8",
+           "dense loader: expected U8 weight_packed for " + proj);
+  VT_CHECK(packed.shape.size() == 2,
+           "dense loader: expected 2-D weight_packed for " + proj);
+  const int64_t out_dim = packed.shape[0];
+  const int64_t in_dim = packed.shape[1] * 2;
+  VT_CHECK(in_dim % 32 == 0,
+           "dense loader: MXFP4 in_dim must be a multiple of 32 for " + proj);
+  const StTensor& ws = get(proj + ".weight_scale");
+  VT_CHECK(ws.dtype == "U8",
+           "dense loader: expected U8 (E8M0) weight_scale for " + proj);
+  VT_CHECK(ws.shape.size() == 2 && ws.shape[0] == out_dim &&
+               ws.shape[1] == in_dim / 32,
+           "dense loader: weight_scale shape must be [N, K/32] for " + proj);
+
+  Nvfp4Weight r;
+  r.n = out_dim;
+  r.k = in_dim;
+  r.group_size = 32;
+  r.is_mxfp4 = true;
+  r.scale2 = 0.0F;  // MXFP4 has no global scale (unused)
+  r.alpha = 0.0F;   // W4A16: no activation quant
+  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+           "dense loader: packed byte-size mismatch for " + proj);
+  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+  MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 32});
+  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+           "dense loader: scale byte-size mismatch for " + proj);
+  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+  MaybeReleaseSourcePages(ws.data, ws.nbytes);
+  return r;
+}
+
+// Load and concatenate compressed-tensors MXFP4 W4A16 shards `[N_i, K]` along
+// output rows (the MXFP4 analog of LoadMergedCtNvfp4W4A16). Both weight_packed
+// [N_i,K/2] and weight_scale [N_i,K/32] are row-major over N, so both concat by
+// plain row-stack (grouping runs along K, untouched). No global scale to collapse.
+inline Nvfp4Weight LoadMergedCtMxfp4W4A16(
+    const TensorResolver& get, const std::function<bool(const std::string&)>& has,
+    const std::vector<std::string>& projs) {
+  VT_CHECK(!projs.empty(),
+           "dense loader: merged MXFP4 projection requires at least one shard");
+  std::vector<Nvfp4Weight> shards;
+  shards.reserve(projs.size());
+  int64_t in_dim = -1;
+  int64_t out_dim = 0;
+  for (const std::string& proj : projs) {
+    Nvfp4Weight s = LoadCtMxfp4W4A16(get, has, proj);
+    if (in_dim < 0) in_dim = s.k;
+    VT_CHECK(s.k == in_dim,
+             "dense loader: merged MXFP4 shards must share input width");
+    VT_CHECK(out_dim <= std::numeric_limits<int64_t>::max() - s.n,
+             "dense loader: merged MXFP4 output width overflow");
+    out_dim += s.n;
+    shards.push_back(std::move(s));
+  }
+  if (shards.size() == 1) return std::move(shards[0]);
+
+  Nvfp4Weight merged;
+  merged.n = out_dim;
+  merged.k = in_dim;
+  merged.group_size = 32;
+  merged.is_mxfp4 = true;
+  merged.scale2 = 0.0F;
+  merged.alpha = 0.0F;
+  merged.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+  merged.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 32});
+  size_t p_off = 0;
+  size_t s_off = 0;
+  for (const Nvfp4Weight& s : shards) {
+    std::memcpy(merged.packed.bytes.data() + p_off, s.packed.bytes.data(),
+                s.packed.bytes.size());
+    p_off += s.packed.bytes.size();
+    std::memcpy(merged.scale.bytes.data() + s_off, s.scale.bytes.data(),
+                s.scale.bytes.size());
+    s_off += s.scale.bytes.size();
+  }
+  VT_CHECK(p_off == merged.packed.bytes.size() &&
+               s_off == merged.scale.bytes.size(),
+           "dense loader: merged MXFP4 byte accounting mismatch");
+  return merged;
+}
+
 }  // namespace dense_loaders
 }  // namespace vllm
