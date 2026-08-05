@@ -89,8 +89,11 @@ token_ids` device gather). The full drain is byte-exact and UAF-safe and is
 2026-08-06, speed-NEUTRAL** (same-binary): c16 OFF median 2305.8 vs ON 2303.3
 (0.999x), c32 2928.9 vs 2919.1 (0.997x), bands overlap. It is a drain MOVE (relocate
 the drain past the host prep, not remove it), so it overlaps only the small host
-prep; the drain still serializes GPU input staging, so c16 does not recover. Real
-c16 recovery needs the drain REMOVAL plus double-buffered `exec_state_`/block-table.
+prep; the drain still serializes GPU input staging, so c16 does not recover. The
+drain REMOVAL is `row/SERVE-ASYNC-EXECUTOR` (`VT_ASYNC_EXECUTOR`, landed default-OFF):
+a 2-slot decode-graph ring + reuse event, proven token-exact (async GREEN 5/5 c32,
+SACRED 3/3); hazard-C is real-by-construction but empirically unreproducible on GB10
+so it stays OFF (record has detail + the Option A follow-up).
 
 **But the mirror FIXES a shipping correctness bug, so it is now DEFAULT ON
 (ROW-SERVE-ASYNC-LLM, 2026-08-06).** Baseline async (AsyncLLM depth-2) batch-1 greedy

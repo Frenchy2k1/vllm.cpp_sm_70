@@ -1172,7 +1172,32 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // was already cleared at the top and exec_state_ already reset, so this block is
   // skipped (mirror==false) and the path is byte-identical.
   if (mirror) {
-    if (async_forward_in_flight_) {
+    // VT_ASYNC_EXECUTOR (decode-graph slot double-buffer): if the previous step's
+    // stashed logits are a NON-OWNING decode-graph slot view, the exec_state_ reset
+    // frees nothing the in-flight async sampler reads (hazard-A — the eager owning
+    // WrapDeviceLogits pool block — is absent for a view), and the model's 2-slot
+    // parity ring + per-slot reuse event already guard the persistent decode-graph
+    // host inputs against this step's replay (hazard-C). Both hazards handled, so
+    // SKIP the main-queue Synchronize and let this step's host prep + replay overlap
+    // the previous step's GPU tail — the c16/c32 unlock. An eager/mixed previous
+    // step still owns its logits pool block, whose reset WOULD UAF the async
+    // sampler, so it drains exactly as before. The reset runs on BOTH paths: on the
+    // skip path it releases the no-op-deleter view and clears req_ids/discard for
+    // this step's stash WITHOUT touching the still-live, still-referenced slot
+    // buffer. Inert unless VT_ASYNC_EXECUTOR=1 (async_executor() default OFF), where
+    // skip_drain is always false and the block is byte-identical to the drain.
+    const bool skip_drain = async_executor() && exec_state_.logits.on_device() &&
+                            exec_state_.logits.non_owning_view;
+    if (skip_drain && std::getenv("VT_ASYNC_EXECUTOR_TRACE") != nullptr) {
+      // Diagnostic (test-only): confirm the overlap path is actually engaged — a
+      // skip count of 0 would mean async_executor()/non_owning_view never resolved
+      // and the lever is inert. Single engine thread, so a plain static suffices.
+      static long long kSkips = 0;
+      ++kSkips;
+      if (kSkips == 1 || kSkips % 200 == 0)
+        std::fprintf(stderr, "[VT_ASYNC_EXECUTOR] drain skipped x%lld\n", kSkips);
+    }
+    if (!skip_drain && async_forward_in_flight_) {
       vt::GetBackend(queue_.device.type).Synchronize(queue_);
       async_forward_in_flight_ = false;
     }
@@ -2023,6 +2048,25 @@ bool GPUModelRunner::async_device_mirror() const {
         vllm::platforms::GetPlatform(queue_.device.type).is_integrated_gpu());
 #endif
   async_device_mirror_cached_ = on ? 1 : 0;
+  return on;
+}
+
+// VT_ASYNC_EXECUTOR (decode-graph slot double-buffer, ENG-ASYNC-SCHED c16/c32
+// overlap unlock). DEFAULT OFF — an opt-in speed lever. Engages only where the
+// depth-2 moved drain and the decode graph both exist: the device mirror path on
+// a real CUDA GPU. On the CPU backend / mirror-OFF path the drain does not move
+// and there is no decode graph, so the lever is inert. Memoized. Reading a plain
+// "not 0" env keeps a value of "1" the canonical enable; anything else (unset,
+// "0") leaves the drain in place, which is byte-identical production.
+bool GPUModelRunner::async_executor() const {
+  if (async_executor_cached_ >= 0) return async_executor_cached_ != 0;
+  bool on = false;
+#ifdef VLLM_CPP_CUDA
+  const char* value = std::getenv("VT_ASYNC_EXECUTOR");
+  on = value != nullptr && value[0] == '1' && value[1] == '\0' &&
+       async_device_mirror();
+#endif
+  async_executor_cached_ = on ? 1 : 0;
   return on;
 }
 

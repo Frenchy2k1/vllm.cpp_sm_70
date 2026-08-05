@@ -124,12 +124,17 @@ class CudaBackend final : public Backend {
   void FreePinned(void* p) override {
     if (p != nullptr) Check(cudaFreeHost(p), "cudaFreeHost");
   }
-  Event CreateEvent() override {
+  Event CreateEvent(bool blocking = false) override {
     cudaEvent_t ev = nullptr;
     // cudaEventDisableTiming: we only ever wait on completion, never measure —
     // this is the cheaper synchronization-only event (mirrors torch.Event()).
-    Check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
-          "cudaEventCreateWithFlags");
+    // cudaEventBlockingSync (opt-in): a HOST cudaEventSynchronize on this event
+    // sleeps the thread until completion instead of busy-spinning — the decode-
+    // graph slot-reuse wait (VT_ASYNC_EXECUTOR) is almost always already done, so
+    // spinning would only waste a core on the rare run-ahead.
+    const unsigned int flags =
+        cudaEventDisableTiming | (blocking ? cudaEventBlockingSync : 0u);
+    Check(cudaEventCreateWithFlags(&ev, flags), "cudaEventCreateWithFlags");
     return Event{Device{DeviceType::kCUDA, device_}, reinterpret_cast<void*>(ev)};
   }
   void DestroyEvent(Event& e) override {

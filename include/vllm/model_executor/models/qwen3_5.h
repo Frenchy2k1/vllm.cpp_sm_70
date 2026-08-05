@@ -102,6 +102,13 @@ struct ForwardLogits {
   vt::Tensor device_tensor;               // [rows, vocab] view, valid iff on_device()
   int64_t rows = 0;
   int64_t vocab = 0;
+  // True when device_storage is a NON-owning view over an externally-held buffer
+  // (the decode-graph slot's persistent logits — ViewDeviceLogits). The deleter is
+  // a no-op, so releasing this carrier frees nothing: the runner reads it to decide
+  // whether resetting exec_state_ would free an in-flight-read pool block (the eager
+  // WrapDeviceLogits case, hazard-A) or not (this graphed case). See the
+  // VT_ASYNC_EXECUTOR drain-skip in runner.cpp.
+  bool non_owning_view = false;
   bool on_device() const { return static_cast<bool>(device_storage); }
 };
 

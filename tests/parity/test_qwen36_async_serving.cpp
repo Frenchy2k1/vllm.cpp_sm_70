@@ -159,13 +159,27 @@ TEST_CASE("qwen36 async-serving greedy token-exact gate (dgx-only, 35B) — "
     CHECK(got == want_greedy_ids);
   }
 
-  // ── ARM 2: small CONCURRENCY bracket ──────────────────────────────────────
+  // ── ARM 2: CONCURRENCY bracket ────────────────────────────────────────────
   // N independent greedy requests submitted together so the engine runs them as
   // pure-decode batched steps (num_reqs==N) through the batched decode graph +
   // async combine while the depth-2 loop pipelines. Each request is independent
   // (own KV + GDN state), so each MUST reproduce the same oracle continuation
   // regardless of the step interleave (vLLM's greedy determinism guarantee).
-  constexpr int kN = 4;
+  //
+  // Default N=4 is a SMALL bracket. The decode-graph slot-reuse race (hazard-C:
+  // Refresh(step) overwriting a slot's persistent host inputs while the previous
+  // same-slot replay's baked H2D still reads them) only bites when the HOST runs
+  // AHEAD of the GPU — i.e. at higher concurrency, where a batched replay is heavy
+  // enough that step N+1's Refresh reaches the slot while step N's replay is still
+  // queued/executing. VT_ASYNC_SERVING_CONC overrides N so the VT_ASYNC_EXECUTOR
+  // double-buffer's RED (drain skipped, ring off -> divergence) and GREEN (ring on
+  // -> token-exact) can be exercised at the concurrency where the hazard is live.
+  int kN = 4;
+  if (const char* c = std::getenv("VT_ASYNC_SERVING_CONC")) {
+    const int v = std::atoi(c);
+    if (v > 0) kN = v;
+  }
+  MESSAGE("qwen36_async_serving: concurrency bracket N=" << kN);
   std::vector<vllm::v1::AsyncRequest> reqs;
   reqs.reserve(static_cast<size_t>(kN));
   for (int i = 0; i < kN; ++i) {

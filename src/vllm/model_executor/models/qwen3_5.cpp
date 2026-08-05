@@ -6171,6 +6171,7 @@ static ForwardLogits ViewDeviceLogits(void* base, vt::Device device, int64_t row
   fl.device_tensor = MakeTensor(base, DType::kF32, device, {rows, vocab});
   // Non-owning: keep on_device() true without taking ownership of `base`.
   fl.device_storage = std::shared_ptr<void>(base, [](void*) {});
+  fl.non_owning_view = true;  // releasing this carrier frees nothing (runner drain-skip signal)
   return fl;
 }
 
@@ -7491,6 +7492,42 @@ void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
 
 }  // namespace
 
+// VT_ASYNC_EXECUTOR decode-graph slot double-buffer (parity ring) — the MODEL side
+// of the c16/c32 overlap unlock. Two SizeSlots per padded decode size, alternated
+// each step, each host-waited on its own reuse event before its persistent host
+// inputs are refreshed. That guard replaces the runner's depth-2 drain (which the
+// runner then skips), letting step N+1's host prep + replay overlap step N's GPU
+// tail. DEFAULT OFF: unset/anything-but-"1" ⇒ single-slot (slot[0]), no events,
+// byte-identical to the pre-lever driver. VT_ASYNC_EXECUTOR_NO_DBUF=1 is a TEST-
+// ONLY escape hatch that forces the ring OFF while the runner still skips the drain
+// (VT_ASYNC_EXECUTOR=1), so the async-serving gate SEES hazard-C in the RED arm
+// (drain skipped, no double-buffer ⇒ corruption). Production never sets it.
+static bool DecodeGraphDoubleBufferEnabled() {
+  const char* v = std::getenv("VT_ASYNC_EXECUTOR");
+  if (v == nullptr || v[0] != '1' || v[1] != '\0') return false;
+  const char* nod = std::getenv("VT_ASYNC_EXECUTOR_NO_DBUF");
+  if (nod != nullptr && nod[0] == '1' && nod[1] == '\0') return false;
+  return true;
+}
+
+// Test-only (VT_ASYNC_EXECUTOR_POISON): immediately after a captured ReplayGraph,
+// overwrite the persistent host inputs the replay's baked H2D + EmbedInto read,
+// WITHOUT syncing. If the replay reads them asynchronously — the premise of
+// hazard-C — this corrupts THIS step deterministically, so the token-exact async
+// gate fails, proving the drain/ring is load-bearing WITHOUT depending on the
+// natural Refresh-vs-replay race's narrow timing window. Templated because the two
+// decode-graph drivers nest their own SizeSlot with identical field names. Never
+// set in production (gated by an Impl `poison` member read once at construction, so
+// the default hot path pays no getenv).
+template <class Slot>
+static void MaybePoisonHostInputs(bool poison, Slot& s) {
+  if (!poison) return;
+  std::fill(s.token_ids.begin(), s.token_ids.end(), 0);
+  std::fill(s.positions.begin(), s.positions.end(), 0);
+  std::fill(s.attn_meta.slot_mapping.begin(), s.attn_meta.slot_mapping.end(), 0);
+  std::fill(s.attn_meta.seq_lens.begin(), s.attn_meta.seq_lens.end(), 0);
+}
+
 struct Qwen3_5DecodeGraph::Impl {
   Impl(const Qwen3_5MoeWeights& w, const HfConfig& c, vt::Queue q,
        int64_t max_reqs)
@@ -7501,11 +7538,16 @@ struct Qwen3_5DecodeGraph::Impl {
     enabled = env_on &&
               vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
+    dbuf = enabled && DecodeGraphDoubleBufferEnabled();
+    poison = enabled && std::getenv("VT_ASYNC_EXECUTOR_POISON") != nullptr;
   }
   ~Impl() {
     Backend& b = vt::GetBackend(queue.device.type);
     for (auto& kv : slots)
-      if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
+      for (auto& s : kv.second.slot) {
+        if (s.graph != nullptr) b.DestroyGraph(s.graph);
+        if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
+      }
   }
 
   // One captured padded batch size. Owns its OWN persistent host inputs (the
@@ -7525,6 +7567,11 @@ struct Qwen3_5DecodeGraph::Impl {
     bool captured = false;
     bool warm = false;
     int64_t replays = 0;
+    // VT_ASYNC_EXECUTOR parity-ring reuse guard: recorded on the main queue after
+    // this slot's replay, host-waited before its next Refresh so the replay's baked
+    // H2D of the persistent host inputs can never race that overwrite (hazard-C).
+    // Null-handle (unused) unless the double-buffer is on. Blocking-sync flavor.
+    vt::Event reuse_event{};
 
     // In-place refresh of the persistent host inputs (fixed addresses once the
     // slot's vectors reach size S) so a replay re-reads this step's tokens.
@@ -7577,8 +7624,18 @@ struct Qwen3_5DecodeGraph::Impl {
   vt::Queue queue;
   int64_t max_num_reqs = 0;  // == max_num_seqs; padded decode batch cap
   bool enabled = false;
+  bool dbuf = false;         // VT_ASYNC_EXECUTOR parity ring (2 slots/size + events)
+  bool poison = false;       // VT_ASYNC_EXECUTOR_POISON: deterministic hazard-C proof
 
-  std::map<int64_t, SizeSlot> slots;  // padded size S -> slot
+  // The parity ring: two independent SizeSlots per padded size, alternated per
+  // step (`next`). OFF (dbuf==false) always uses slot[0] with no event — the
+  // second slot stays default-constructed (no graph, no buffers) and the driver is
+  // byte-identical to the single-slot original.
+  struct SlotRing {
+    SizeSlot slot[2];
+    int next = 0;
+  };
+  std::map<int64_t, SlotRing> slots;  // padded size S -> parity ring
   int64_t replays = 0;                // total replays (diagnostics)
   bool any_captured = false;          // diagnostics: at least one live graph
 };
@@ -7625,8 +7682,26 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   }
 
   // Pad this step's real B-request inputs up to S (inert padding rows), then
-  // refresh THIS size's persistent host buffers in place.
-  Impl::SizeSlot& s = impl_->slots[S];
+  // refresh THIS size's persistent host buffers in place. VT_ASYNC_EXECUTOR: pick
+  // this step's slot from the size's parity ring (alternating), and host-wait its
+  // previous replay before Refresh touches its persistent host inputs (hazard-C).
+  // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
+  Impl::SlotRing& ring = impl_->slots[S];
+  const bool dbuf = impl_->dbuf;
+  Impl::SizeSlot& s = ring.slot[dbuf ? ring.next : 0];
+  if (dbuf) {
+    ring.next ^= 1;
+    if (s.reuse_event.handle != nullptr) b.SynchronizeEvent(s.reuse_event);
+  }
+  // Record this slot's reuse event on the main queue after its replay/forward is
+  // enqueued, so the next same-slot Refresh host-waits until the replay's baked
+  // H2D of these host buffers has completed. No-op unless the double-buffer is on.
+  const auto record_reuse = [&] {
+    if (!dbuf) return;
+    if (s.reuse_event.handle == nullptr)
+      s.reuse_event = b.CreateEvent(/*blocking=*/true);
+    b.RecordEvent(s.reuse_event, impl_->queue);
+  };
   const int cols = attn_meta.block_table_num_cols;
   std::vector<int32_t> ptok, ppos;
   v1::CommonAttentionMetadata pam;
@@ -7652,6 +7727,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   if (s.captured) {
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.ReplayGraph(impl_->queue, s.graph);
+    record_reuse();
+    MaybePoisonHostInputs(impl_->poison, s);
     ++s.replays;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -7660,6 +7737,21 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // Warm: the pool + residency were warmed for this size by the previous (eager)
   // step. CAPTURE the layer region once, instantiate the graph, then launch it.
   if (s.warm) {
+    // dbuf: the runner may have skipped the depth-2 drain (the previous step
+    // returned a slot view), so a prior replay can still be in flight. Capture must
+    // begin on an idle stream — drain once here. One-time (≤2 captures per size);
+    // steady-state replay never captures, so this never touches the overlap path.
+    if (dbuf) {
+      b.Synchronize(impl_->queue);
+      // Pre-grow the pool for THIS slot's RETAINED [S,vocab] logits block while the
+      // OTHER ring slot's logits is held, so the captured logits alloc is a pool HIT
+      // (a cudaMalloc mid-capture aborts it). Working scratch is freed at
+      // ForwardLayers return and SAFELY shared between the two graphs — they replay
+      // sequentially on one stream, so only the retained logits needs two live
+      // copies. Alloc+free forces the (out-of-capture) growth; the block returns to
+      // the free list for the capture's own allocation to hit.
+      { DBuf pregrow(d, DType::kF32, std::vector<int64_t>{S, vocab}); }
+    }
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
     DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
@@ -7670,6 +7762,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     s.captured = true;
     impl_->any_captured = true;
     b.ReplayGraph(impl_->queue, s.graph);
+    record_reuse();
     s.replays = 1;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -7685,6 +7778,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
                           attn_kv, gdn_state, impl_->weights, impl_->config);
   s.warm = true;
   s.captured = false;
+  record_reuse();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);
   if (fl.rows != B) {
@@ -7716,6 +7810,8 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     enabled = env_on &&
               vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
+    dbuf = enabled && DecodeGraphDoubleBufferEnabled();
+    poison = enabled && std::getenv("VT_ASYNC_EXECUTOR_POISON") != nullptr;
   }
   ~Impl() {
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
@@ -7724,7 +7820,10 @@ struct Qwen3_5DenseDecodeGraph::Impl {
                    static_cast<long long>(replays), slots.size());
     Backend& b = vt::GetBackend(queue.device.type);
     for (auto& kv : slots)
-      if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
+      for (auto& s : kv.second.slot) {
+        if (s.graph != nullptr) b.DestroyGraph(s.graph);
+        if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
+      }
   }
 
   // One captured padded batch size (mirror of Qwen3_5DenseDecodeGraph SizeSlot).
@@ -7740,6 +7839,11 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     bool captured = false;
     bool warm = false;
     int64_t replays = 0;
+    // VT_ASYNC_EXECUTOR parity-ring reuse guard: recorded on the main queue after
+    // this slot's replay, host-waited before its next Refresh so the replay's baked
+    // H2D of the persistent host inputs can never race that overwrite (hazard-C).
+    // Null-handle (unused) unless the double-buffer is on. Blocking-sync flavor.
+    vt::Event reuse_event{};
 
     // In-place refresh of the persistent host inputs (fixed addresses once the
     // slot's vectors reach size S) so a replay re-reads this step's tokens.
@@ -7792,8 +7896,18 @@ struct Qwen3_5DenseDecodeGraph::Impl {
   vt::Queue queue;
   int64_t max_num_reqs = 0;  // == max_num_seqs; padded decode batch cap
   bool enabled = false;
+  bool dbuf = false;         // VT_ASYNC_EXECUTOR parity ring (2 slots/size + events)
+  bool poison = false;       // VT_ASYNC_EXECUTOR_POISON: deterministic hazard-C proof
 
-  std::map<int64_t, SizeSlot> slots;  // padded size S -> slot
+  // The parity ring: two independent SizeSlots per padded size, alternated per
+  // step (`next`). OFF (dbuf==false) always uses slot[0] with no event — the
+  // second slot stays default-constructed (no graph, no buffers) and the driver is
+  // byte-identical to the single-slot original.
+  struct SlotRing {
+    SizeSlot slot[2];
+    int next = 0;
+  };
+  std::map<int64_t, SlotRing> slots;  // padded size S -> parity ring
   int64_t replays = 0;                // total replays (diagnostics)
   bool any_captured = false;          // diagnostics: at least one live graph
 };
@@ -7838,8 +7952,26 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   }
 
   // Pad this step's real B-request inputs up to S (inert padding rows), then
-  // refresh THIS size's persistent host buffers in place.
-  Impl::SizeSlot& s = impl_->slots[S];
+  // refresh THIS size's persistent host buffers in place. VT_ASYNC_EXECUTOR: pick
+  // this step's slot from the size's parity ring (alternating), and host-wait its
+  // previous replay before Refresh touches its persistent host inputs (hazard-C).
+  // OFF: always slot[0], no wait — byte-identical to the single-slot driver.
+  Impl::SlotRing& ring = impl_->slots[S];
+  const bool dbuf = impl_->dbuf;
+  Impl::SizeSlot& s = ring.slot[dbuf ? ring.next : 0];
+  if (dbuf) {
+    ring.next ^= 1;
+    if (s.reuse_event.handle != nullptr) b.SynchronizeEvent(s.reuse_event);
+  }
+  // Record this slot's reuse event on the main queue after its replay/forward is
+  // enqueued, so the next same-slot Refresh host-waits until the replay's baked
+  // H2D of these host buffers has completed. No-op unless the double-buffer is on.
+  const auto record_reuse = [&] {
+    if (!dbuf) return;
+    if (s.reuse_event.handle == nullptr)
+      s.reuse_event = b.CreateEvent(/*blocking=*/true);
+    b.RecordEvent(s.reuse_event, impl_->queue);
+  };
   const int cols = attn_meta.block_table_num_cols;
   std::vector<int32_t> ptok, ppos;
   v1::CommonAttentionMetadata pam;
@@ -7869,6 +8001,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
         static_cast<uint64_t>(s.replays));
 #endif
     b.ReplayGraph(impl_->queue, s.graph);
+    record_reuse();
+    MaybePoisonHostInputs(impl_->poison, s);
     ++s.replays;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -7877,6 +8011,20 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // Warm: the pool + residency were warmed for this size by the previous (eager)
   // step. CAPTURE the dense layer region once, instantiate the graph, launch it.
   if (s.warm) {
+    // dbuf: the runner may have skipped the depth-2 drain (the previous step
+    // returned a slot view), so a prior replay can still be in flight. Capture must
+    // begin on an idle stream — drain once here. One-time (≤2 captures per size);
+    // steady-state replay never captures, so this never touches the overlap path.
+    if (dbuf) {
+      b.Synchronize(impl_->queue);
+      // Pre-grow the pool for THIS slot's RETAINED [S,vocab] logits block while the
+      // OTHER ring slot's logits is held, so the captured logits alloc is a pool HIT
+      // (a cudaMalloc mid-capture aborts it). Working scratch is freed at
+      // DenseForwardLayers return and SAFELY shared between the two graphs — they
+      // replay sequentially on one stream, so only the retained logits needs two
+      // live copies.
+      { DBuf pregrow(d, DType::kF32, std::vector<int64_t>{S, vocab}); }
+    }
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
     DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
@@ -7891,6 +8039,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                            "for padded size S=%lld (real B=%lld)\n",
                    static_cast<long long>(S), static_cast<long long>(B));
     b.ReplayGraph(impl_->queue, s.graph);
+    record_reuse();
     s.replays = 1;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -7907,6 +8056,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                                impl_->config);
   s.warm = true;
   s.captured = false;
+  record_reuse();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);
   if (fl.rows != B) {
