@@ -61,6 +61,30 @@ cmake -S . -B build-vulkan -DVLLM_CPP_VULKAN=ON
 cmake --build build-vulkan -j
 ```
 
+## Nix shells
+
+The checked-in flake pins CMake, Ninja and the CUDA toolchain, so nothing has
+to be globally installed:
+
+```sh
+# CPU (correctness / CI reference)
+nix develop .#default --command cmake -S . -B build-nix-cpu -G Ninja \
+  -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo
+nix develop .#default --command cmake --build build-nix-cpu -j4
+
+# CUDA (set the arch for your GPU)
+nix develop .#cuda --command bash -lc \
+  'cmake -S . -B build-nix-cuda -G Ninja -DVLLM_CPP_CUDA=ON \
+    -DCMAKE_CUDA_COMPILER="$CMAKE_CUDA_COMPILER" \
+    -DCMAKE_CUDA_HOST_COMPILER="$CMAKE_CUDA_HOST_COMPILER" \
+    -DVLLM_CPP_CUDA_ARCHITECTURES=120a -DCMAKE_BUILD_TYPE=RelWithDebInfo'
+nix develop .#cuda --command cmake --build build-nix-cuda -j4
+```
+
+On NixOS the CUDA shell exports the driver-library path and
+`TRITON_LIBCUDA_PATH=/run/opengl-driver/lib` so Triton finds `libcuda` without
+`/sbin/ldconfig`.
+
 ## CMake options
 
 Read from [`CMakeLists.txt`](../CMakeLists.txt). Defaults shown are the shipped
