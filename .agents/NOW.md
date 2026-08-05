@@ -19,7 +19,7 @@ Working head: `origin/main`.
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
 | Protocol substrate repair | BENCHMARKS.md converted to scoreboard (landed); STATUS.md budget + record-era roll still open | Items below |
-| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **W6 device SEAM landed** (`CLAIM-KIMI-LINEAR-W6`, `SPIKE`→`ACTIVE`): `ForwardDevice` returns DEVICE-RESIDENT logits (born-on-runner, no host download); routing+fusion green; `test_kimi_linear_forward` 7/7·300 | GPU-verify W7: device COMPUTE (KDA/MLA/MoE) + e2e golden (§8) |
+| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **W7 device COMPUTE landed, CPU-gated** (`CLAIM-KIMI-LINEAR-W7`, `ACTIVE`): DBuf-resident `ForwardDeviceCompute` (2 host islands: KDA recurrence, NoPE-MLA softmax); `test_kimi_linear_forward` **12/12·614**; opt-in `VT_KIMI_DEVICE_COMPUTE=1` | GPU-verify: CUDA build, token-exact vs oracle, e2e §8 |
 | 35B serving heap-corruption (async depth-2) | **FIXED 2026-08-05** — depth-2 overlap freed/mutated `exec_state_`/`last_sampled_tokens` under a still-running prior-step kernel (GB10 UMA UAF; `ignore_eos` past ~4-8 tok; CPU + memcheck clean). Fix = runner drains async work first. See [state](state.md) | Unblocks 35B grid |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`

@@ -268,7 +268,7 @@ built on it rather than keeping the flattering one.
 | DFlash speculative decode | Below vLLM throughput | bf16 acceptance floor ~0.85x |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
-| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | W6 born-on-runner DEVICE forward SEAM landed, no e2e yet | `ForwardDevice` returns device-resident logits (born-on-runner, CPU-gated `test_kimi_linear_forward` 7/7·300); the DBuf device COMPUTE (KDA/MLA/MoE) + oracle golden (§8) are GPU-verify-pending |
+| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | W7 device COMPUTE landed (CPU-gated), no e2e yet | `ForwardDeviceCompute` runs the hybrid over pooled DBufs via `vt::` ops (CPU-gated `test_kimi_linear_forward` 12/12·614, device==W2 ref); 2 host islands (KDA recurrence, NoPE-MLA softmax); GPU + oracle §8 pending |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |

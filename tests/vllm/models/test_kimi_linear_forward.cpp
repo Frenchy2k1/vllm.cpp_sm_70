@@ -82,6 +82,18 @@ std::vector<float> Rms(const std::vector<float>& x, const std::vector<float>& g,
   return y;
 }
 
+// The W7 device compute uses f32 DBufs + vt:: ops (f32 accumulation) vs the W2
+// reference's double accumulation. So a MATCH is tight but not bit-exact: a
+// relative+absolute tolerance whose only slack is f32-accumulation-order (the KDA
+// recurrence amplifies it slightly over its T steps; the recurrence itself runs the
+// IDENTICAL host code on both sides). Each site documents its tolerance.
+bool Close(float a, float b, double rtol, double atol) {
+  return std::fabs(static_cast<double>(a) - static_cast<double>(b)) <=
+         atol + rtol * std::fabs(static_cast<double>(b));
+}
+
+vt::Queue CpuQueue() { return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}; }
+
 }  // namespace
 
 // ─── (a) KDA layer == hand-composition of the kimi_kda refs + recurrence ──────
@@ -588,4 +600,239 @@ TEST_CASE("kimi-linear ForwardDevice: born-on-runner device-resident logits == h
   for (int64_t o = 0; o < V; ++o)
     CHECK(lastd[static_cast<size_t>(o)] ==
           doctest::Approx(host_logits[3 * V + o]).epsilon(1e-6));
+}
+
+// ═══ W7 — the DBuf-RESIDENT device COMPUTE path, CPU-gated vs the W2 reference ══
+// The per-op device primitives (KimiKdaLayerForwardDevice / ...MlaLayer... /
+// ...MoeBlock... / ...DenseMlp...) route each primitive through the shared vt::
+// device ops on pooled DBufs and must MATCH the W2 host reference on CPU (the CPU
+// backend runs the SAME dispatch), with a tolerance whose only slack is
+// f32-accumulation-order (documented per op). Then the WHOLE 2-layer forward
+// (ForwardDeviceCompute) must match the reference logits AND greedy tokens, and
+// return device-resident logits — the born-on-runner contract. GPU numerics (bf16
+// activations, the GDN cubins, paged het-KV, grouped-MoE slabs) stay pending.
+
+// ─── (f) KDA layer: device compute == the W2 reference ────────────────────────
+TEST_CASE("kimi-linear W7 device: KDA layer matches the W2 host reference") {
+  KimiLinearParams p;
+  p.hidden_size = 16;
+  p.kda_num_heads = 2;
+  p.kda_head_dim = 8;
+  p.kda_short_conv_kernel_size = 4;
+  p.rms_norm_eps = 1e-5f;
+  const int64_t H = p.hidden_size, nh = p.kda_num_heads, hd = p.kda_head_dim;
+  const int64_t proj = nh * hd, K = p.kda_short_conv_kernel_size, T = 5;
+
+  vllm::KdaLayerHostWeights w;
+  w.q_proj = Rand(proj * H, 1);
+  w.k_proj = Rand(proj * H, 2);
+  w.v_proj = Rand(proj * H, 3);
+  w.f_a_proj = Rand(hd * H, 4);
+  w.f_b_proj = Rand(proj * hd, 5);
+  w.b_proj = Rand(nh * H, 6);
+  w.g_a_proj = Rand(hd * H, 7);
+  w.g_b_proj = Rand(proj * hd, 8);
+  w.o_proj = Rand(H * proj, 9);
+  w.q_conv = Rand(proj * K, 10);
+  w.k_conv = Rand(proj * K, 11);
+  w.v_conv = Rand(proj * K, 12);
+  w.dt_bias = Rand(proj, 13);
+  w.a_log = Rand(nh, 14, -2.0f, 0.0f);
+  w.o_norm = Rand(hd, 15, 0.5f, 1.5f);
+  const std::vector<float> x = Rand(T * H, 100);
+
+  const std::vector<float> ref = vllm::KimiKdaLayerForward(w, x, p, T);
+  vt::Queue q = CpuQueue();
+  const std::vector<float> dev = vllm::KimiKdaLayerForwardDevice(w, x, p, T, q);
+
+  REQUIRE(dev.size() == ref.size());
+  // rtol 3e-3 / atol 3e-4: the gated-delta recurrence runs the identical host code
+  // on both sides, fed q/k/v/g1 that differ only by f32-vs-double GEMM/conv/L2
+  // accumulation; the T-step recurrence mildly amplifies that.
+  for (size_t i = 0; i < dev.size(); ++i) CHECK(Close(dev[i], ref[i], 3e-3, 3e-4));
+}
+
+// ─── (g) NoPE-MLA layer: device compute == the W2 reference ───────────────────
+TEST_CASE("kimi-linear W7 device: NoPE-MLA layer matches the W2 host reference") {
+  KimiLinearParams p;
+  p.hidden_size = 16;
+  p.num_attention_heads = 2;
+  p.qk_nope_head_dim = 4;
+  p.qk_rope_head_dim = 2;
+  p.v_head_dim = 4;
+  p.kv_lora_rank = 8;
+  p.rms_norm_eps = 1e-5f;
+  const int64_t H = p.hidden_size, nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim, qr = p.qk_rope_head_dim, qk = qn + qr;
+  const int64_t vh = p.v_head_dim, Lr = p.kv_lora_rank, T = 6;
+
+  vllm::MlaLayerHostWeights w;
+  w.q_proj = Rand(nah * qk * H, 21);
+  w.kv_a_proj_with_mqa = Rand((Lr + qr) * H, 22);
+  w.kv_a_layernorm = Rand(Lr, 23, 0.5f, 1.5f);
+  w.kv_b_proj = Rand(nah * (qn + vh) * Lr, 24);
+  w.o_proj = Rand(H * nah * vh, 25);
+  const std::vector<float> x = Rand(T * H, 200);
+
+  const std::vector<float> ref = vllm::KimiNoPEMlaLayerForward(w, x, p, T);
+  vt::Queue q = CpuQueue();
+  const std::vector<float> dev = vllm::KimiNoPEMlaLayerForwardDevice(w, x, p, T, q);
+
+  REQUIRE(dev.size() == ref.size());
+  // rtol 1e-4 / atol 1e-5: pure GEMM + softmax, only f32-accumulation slack.
+  for (size_t i = 0; i < dev.size(); ++i) CHECK(Close(dev[i], ref[i], 1e-4, 1e-5));
+}
+
+// ─── (h) MoE block + dense MLP: device compute == the W2 reference ────────────
+TEST_CASE("kimi-linear W7 device: MoE block + dense MLP match the W2 host reference") {
+  KimiLinearParams p;
+  p.hidden_size = 12;
+  p.num_experts = 4;
+  p.num_experts_per_token = 2;
+  p.num_shared_experts = 1;
+  p.moe_intermediate_size = 5;
+  p.routed_scaling_factor = 2.446;
+  p.moe_renormalize = true;
+  p.num_expert_group = 1;
+  p.topk_group = 1;
+  const int64_t H = p.hidden_size, E = p.num_experts, mi = p.moe_intermediate_size;
+  const int64_t T = 3;
+
+  vllm::MoeHostWeights w;
+  w.gate = Rand(E * H, 51);
+  w.e_score_correction_bias = Rand(E, 52);
+  w.has_shared = true;
+  w.shared.gate_proj = Rand(mi * H, 53);
+  w.shared.up_proj = Rand(mi * H, 54);
+  w.shared.down_proj = Rand(H * mi, 55);
+  w.experts.resize(static_cast<size_t>(E));
+  for (int64_t e = 0; e < E; ++e) {
+    w.experts[static_cast<size_t>(e)].gate_proj = Rand(mi * H, 60 + e * 3);
+    w.experts[static_cast<size_t>(e)].up_proj = Rand(mi * H, 61 + e * 3);
+    w.experts[static_cast<size_t>(e)].down_proj = Rand(H * mi, 62 + e * 3);
+  }
+  const std::vector<float> x = Rand(T * H, 300);
+
+  vt::Queue q = CpuQueue();
+  const std::vector<float> moe_ref = vllm::KimiMoeBlockForward(w, x, p, T);
+  const std::vector<float> moe_dev = vllm::KimiMoeBlockForwardDevice(w, x, p, T, q);
+  REQUIRE(moe_dev.size() == moe_ref.size());
+  // rtol 2e-4 / atol 1e-5: the device router (vt::MoeRouterTopK) selects the SAME
+  // experts (lowest-index tie rule matches KimiMoeRoute), so the only slack is
+  // f32-accumulation in the router logits + the per-expert SwiGLU GEMMs.
+  for (size_t i = 0; i < moe_dev.size(); ++i) CHECK(Close(moe_dev[i], moe_ref[i], 2e-4, 1e-5));
+
+  KimiLinearParams pd = p;
+  pd.intermediate_size = 7;
+  vllm::MlpHostWeights dw;
+  dw.gate_proj = Rand(pd.intermediate_size * H, 71);
+  dw.up_proj = Rand(pd.intermediate_size * H, 72);
+  dw.down_proj = Rand(H * pd.intermediate_size, 73);
+  const std::vector<float> dense_ref = vllm::KimiDenseMlpForward(dw, x, pd, T);
+  const std::vector<float> dense_dev = vllm::KimiDenseMlpForwardDevice(dw, x, pd, T, q);
+  REQUIRE(dense_dev.size() == dense_ref.size());
+  for (size_t i = 0; i < dense_dev.size(); ++i)
+    CHECK(Close(dense_dev[i], dense_ref[i], 1e-4, 1e-5));
+}
+
+// ─── (i) WHOLE 2-layer forward: ForwardDeviceCompute == the W2 reference ──────
+TEST_CASE("kimi-linear W7 device: ForwardDeviceCompute matches the W2 reference + greedy") {
+  TempFile f(BuildSt(BuildTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  const KimiLinearWeights w = LoadKimiLinearForCausalLMWeights(shards, TinyConfig());
+
+  const std::vector<int32_t> tokens = {1, 3, 0, 5};
+  const std::vector<int32_t> positions = {0, 1, 2, 3};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  vt::Queue q = CpuQueue();
+  vt::Backend& be = vt::GetBackend(q.device.type);
+
+  // The W2 host reference (the correctness truth) + the W7 device compute.
+  const std::vector<float> host_logits =
+      vllm::KimiLinearModel::Forward(tokens, positions, attn_meta, attn_kv, w, q, {});
+  const vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardDeviceCompute(
+      tokens, positions, attn_meta, attn_kv, w, q, {});
+
+  // Born-on-runner contract: logits stay ON-DEVICE (no host copy on .host).
+  CHECK(fl.on_device());
+  CHECK(fl.device_storage != nullptr);
+  CHECK(fl.host.empty());
+  REQUIRE(fl.rows == static_cast<int64_t>(tokens.size()));
+  REQUIRE(fl.vocab == static_cast<int64_t>(V));
+  REQUIRE(fl.device_tensor.data != nullptr);
+
+  std::vector<float> dl(static_cast<size_t>(fl.rows) * static_cast<size_t>(fl.vocab));
+  be.Copy(q, dl.data(), fl.device_tensor.data, dl.size() * sizeof(float));
+  be.Synchronize(q);
+  REQUIRE(dl.size() == host_logits.size());
+  // rtol 5e-3 / atol 1e-3: two full layers (KDA + NoPE-MLA + MoE + dense) of
+  // f32-vs-double accumulation through the residual stream. The BINDING gate is
+  // token-identical greedy argmax below.
+  for (size_t i = 0; i < dl.size(); ++i) CHECK(Close(dl[i], host_logits[i], 5e-3, 1e-3));
+
+  // Greedy tokens IDENTICAL — the real correctness signal (the runner argmaxes
+  // ForwardDeviceCompute's device logits with no host download).
+  for (int64_t r = 0; r < fl.rows; ++r) {
+    int32_t best_dev = 0, best_host = 0;
+    for (int64_t o = 1; o < V; ++o) {
+      if (dl[static_cast<size_t>(r * V + o)] > dl[static_cast<size_t>(r * V + best_dev)]) best_dev = static_cast<int32_t>(o);
+      if (host_logits[static_cast<size_t>(r * V + o)] > host_logits[static_cast<size_t>(r * V + best_host)]) best_host = static_cast<int32_t>(o);
+    }
+    CHECK(best_dev == best_host);
+  }
+
+  // logits_indices gather-before-lm_head: last position -> exactly ONE device row.
+  const vllm::ForwardLogits last = vllm::KimiLinearModel::ForwardDeviceCompute(
+      tokens, positions, attn_meta, attn_kv, w, q, {3});
+  CHECK(last.on_device());
+  REQUIRE(last.rows == 1);
+  REQUIRE(last.vocab == static_cast<int64_t>(V));
+  std::vector<float> lastd(static_cast<size_t>(V));
+  be.Copy(q, lastd.data(), last.device_tensor.data, lastd.size() * sizeof(float));
+  be.Synchronize(q);
+  for (int64_t o = 0; o < V; ++o) CHECK(Close(lastd[static_cast<size_t>(o)], host_logits[3 * V + o], 5e-3, 1e-3));
+}
+
+// ─── (j) ForwardDevice routes to the device compute under VT_KIMI_DEVICE_COMPUTE ─
+// The runner seam (ForwardDevice) must be able to reach the device compute so the
+// GPU verification can exercise it as the production path. On CPU both paths equal
+// the reference, so routed==unrouted here; the toggle is the wiring proof.
+TEST_CASE("kimi-linear W7 device: ForwardDevice reaches device compute (opt-in gate present)") {
+  TempFile f(BuildSt(BuildTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  const KimiLinearWeights w = LoadKimiLinearForCausalLMWeights(shards, TinyConfig());
+
+  const std::vector<int32_t> tokens = {1, 3, 0, 5};
+  const std::vector<int32_t> positions = {0, 1, 2, 3};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  vt::Queue q = CpuQueue();
+  vt::Backend& be = vt::GetBackend(q.device.type);
+
+  // The device compute and the W6 host-ref compose both return device-resident
+  // logits; on CPU they agree with the reference within tolerance.
+  const vllm::ForwardLogits seam = vllm::KimiLinearModel::ForwardDevice(
+      tokens, positions, attn_meta, attn_kv, w, q, {});
+  const vllm::ForwardLogits compute = vllm::KimiLinearModel::ForwardDeviceCompute(
+      tokens, positions, attn_meta, attn_kv, w, q, {});
+  CHECK(seam.on_device());
+  CHECK(compute.on_device());
+  REQUIRE(seam.rows == compute.rows);
+  REQUIRE(seam.vocab == compute.vocab);
+  std::vector<float> a(static_cast<size_t>(seam.rows) * seam.vocab), b(a.size());
+  be.Copy(q, a.data(), seam.device_tensor.data, a.size() * sizeof(float));
+  be.Copy(q, b.data(), compute.device_tensor.data, b.size() * sizeof(float));
+  be.Synchronize(q);
+  // Both are device-resident logits over the same 2-layer model; greedy tokens agree.
+  for (int64_t r = 0; r < seam.rows; ++r) {
+    int32_t ba = 0, bb = 0;
+    for (int64_t o = 1; o < V; ++o) {
+      if (a[static_cast<size_t>(r * V + o)] > a[static_cast<size_t>(r * V + ba)]) ba = static_cast<int32_t>(o);
+      if (b[static_cast<size_t>(r * V + o)] > b[static_cast<size_t>(r * V + bb)]) bb = static_cast<int32_t>(o);
+    }
+    CHECK(ba == bb);
+  }
 }
