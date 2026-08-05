@@ -36,7 +36,7 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Model | Quant | vLLM pin | Axes passing | Disposition |
 |---|---|---|---:|---|
 | Qwen3.6-27B | NVFP4 | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality |
-| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 70/124 | c4-c32 win, c1/c2 residual 2-4% |
+| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 70/124 | c4-c32 win, c1/c2 residual 2-4%; a 2026-08-05 re-grid was blocked by an async-serving heap corruption (`ignore_eos` past ~4-8 decode tokens), now fixed so the re-run is unblocked |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
 | Qwen3.5-4B | bf16 direct-load | 0.24.0 | 5/8 | Throughput 0.98x, TTFT and memory win |
 

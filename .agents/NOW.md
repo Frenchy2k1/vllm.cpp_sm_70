@@ -13,17 +13,17 @@ Working head: `origin/main`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Laguna NVFP4 decode speed | **PARITY+ 44.46 vs 43.10 (1.03x), byte-exact, default config**. Root cause was WEIGHT RESIDENCY: bf16 projections read unified/ATS host mem via a `w.View()` retag; `VT_LAGUNA_RESIDENT_BF16W` (default-ON) stages them cudaMalloc device-resident. Detail in benchmark record | Closed; goal met. Residual: formal vLLM K-run distributional set when convenient |
-| DeepSeek-V4-Flash decode | **BEATS ds4** (`VT_V4_RESIDENT_W` on): 18.69 vs 16.33 (1.144x), byte-exact | Closed. **Phase-2 (`VT_V4_RESIDENT_EXPERTS`, ~70 GiB routed-expert slabs, madvise move) NEGATIVE 2026-08-05: −3.4%, byte-exact, memory-flat → HELD OFF** — grouped-MoE dequant/latency-bound, residency can't help. See state |
-| f32-out GEMV systemic audit | Only laguna (high) + deepseek_v4 bf16 tower (medium) affected; gate models & on-framework dense unaffected (bf16-out by construction, e2e-bench-verified) | Same-tool re-verify deepseek_v4's bf16 tower after the Laguna fix proves out |
-| Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md invocation-parity checklist being landed (worktree agent) | Review + merge; CUDA build-verify the `kGemvHeuristicAlgos` constant refactor on dgx |
+| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (44.46 vs 43.10, byte-exact, default). Root cause = bf16 weight residency via `VT_LAGUNA_RESIDENT_BF16W` (default-ON). Detail in benchmark record | Residual: formal vLLM K-run set when convenient |
+| DeepSeek-V4-Flash decode | **Closed: BEATS ds4 1.144x** (`VT_V4_RESIDENT_W` on, byte-exact). Phase-2 routed-expert residency NEGATIVE 2026-08-05 (−3.4%), HELD default-OFF. See state | — |
+| f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate models & on-framework dense unaffected (bf16-out, e2e-verified) | Re-verify deepseek_v4 bf16 tower same-tool |
+| Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
 | Protocol substrate repair | BENCHMARKS.md converted to scoreboard (landed); STATUS.md budget + record-era roll still open | Items below |
-| Kimi-Linear-48B W2-W6 | **CPU ref forward LANDED** (`CLAIM-KIMI-LINEAR-W2`): host `Forward` runs the hybrid; `test_kimi_linear_forward` 6/6·246; SPIKE | DEVICE forward + golden §8 |
+| Kimi-Linear-48B W0 spike | **DONE** (`CLAIM-KIMI-LINEAR-W0`, [kimi-linear.md](specs/kimi-linear.md)): SPIKE, e2e-gateable (FITS one GB10); NET-NEW = KDA kernel + NoPE-MLA + hybrid loader | W1 registry+config (CPU); GPU recipe ready (§8) |
+| 35B serving heap-corruption (async depth-2) | **FIXED 2026-08-05** — depth-2 overlap freed/mutated `exec_state_`/`last_sampled_tokens` under a still-running prior-step kernel (GB10 UMA UAF; `ignore_eos` past ~4-8 tok; CPU + memcheck clean). Fix = runner drains async work first. See [state](state.md) | Unblocks 35B grid |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
-(b357a4f6, fp4 opt-in 141-162%), laguna bf16/legacy/pipeline-gemv,
-`ds4-hc-expand-fuse` (200c86bd), VT_V4_RESIDENT_W (de508511, flip ON).
+(fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
 
 ## Current gate
 
