@@ -1224,17 +1224,19 @@ the corrected ds4 (~16.5) and Laguna (~43) denominators already on main.
 
 Agent-record repair, triage and compaction (2026-08-04). An audit found
 the rules sound but the substrate decayed. **Cold resume** was unsound (union-merged
-appends had interleaved `.agents/state.md`), so entries below a marker carry a
-sortable anchor `scripts/check-state-order.py` proves. **Orientation** gained [.agents/NOW.md](../.agents/NOW.md), a
-100-line snapshot gated for budget and freshness. **The operating manual** had drifted from the
-checker, so both normative documents carry one machine-readable contract. **Claim state** was triaged: only DeepSeek and
+appends had interleaved `.agents/state.md`); entries below a marker now carry a
+sortable anchor. **Orientation** gained [.agents/NOW.md](../.agents/NOW.md).
+**The operating manual** had drifted from the checker; both now carry one
+machine-readable contract. **Claim state** was triaged: only DeepSeek and
 Laguna are in flight; 54 rows left `ACTIVE`, 29 claims retired to
 [completed/claims-era1.md](../.agents/completed/claims-era1-2026-08-04.md).
-Backfill: 12 engine rows cite a `TEST_CASE`, 19 model rows their
-`REGISTER_VLLM_MODEL` line (15 land `PARTIAL`). 79 rows remain, 30 anchored; `upstream-inventory.py` gates
-it. All 362 vLLM registry archs now carry a row (31 added).
-Devices: 6/6 vLLM platforms covered; llama.cpp's 11 extra ggml backends are in
-scope as spike-gated `BACKEND-GGML-*` rows (`ROAD-V1-D6`). Arch parity is checked both ways. **CI gap closed:** the two DIFF-scoped gates carried a
+Backfill: 12 engine rows cite a `TEST_CASE`, 19 model rows a
+`REGISTER_VLLM_MODEL` line. 79 rows remain, 30 anchored; `upstream-inventory.py` gates
+it. All 362 vLLM registry archs carry a row (31 added).
+Devices: 6/6 vLLM platforms covered; llama.cpp's 11 extra ggml backends are
+spike-gated `BACKEND-GGML-*` rows (`ROAD-V1-D6`). Arch parity is checked both ways. **Role discipline
+ENFORCES** since `44e8225c`: feature code reaches `main` only via a merged
+`row/*` PR. **CI gap closed:** the two DIFF-scoped gates carried a
 `cancel-in-progress` group contradicting their own comments, so two pushes had
 them cancelled. The roadmap's 484-line chronology moved to
 `completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in
