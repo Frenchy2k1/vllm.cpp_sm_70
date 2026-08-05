@@ -36,7 +36,7 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Model | Quant | vLLM pin | Axes passing | Disposition |
 |---|---|---|---:|---|
 | Qwen3.6-27B | NVFP4 | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality |
-| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | fresh 3-rep grid 2026-08-05 @`1ea26427`: tput 0.93-1.03x (c4 wins), TTFT 0.93-0.98x; c1 closed 0.82→0.98; c16 0.93x is NEW (was a win); suspect the async-UAF drain sync |
+| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | fresh 3-rep grid 2026-08-05 @`1ea26427`: tput 0.93-1.03x (c4 wins), TTFT 0.93-0.98x; c1 closed 0.82→0.98; c16 0.93x. c16 drain-sync lever A/B'd (below): blocking-event LOST -1.9%, drain kept; cost = serialization |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
 | Qwen3.5-4B | bf16 direct-load | 0.24.0 | 5/8 | Throughput 0.98x, TTFT and memory win |
 
@@ -73,7 +73,17 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 Fresh 3-rep grid 2026-08-05 at `1ea26427` (post async-UAF fix), medians, SACRED
 gate passed pre-bench. The prior low-batch gap closed hard (c1 0.817x→0.977x);
 the open mass is now TTFT 0.93-0.98x everywhere and a NEW c16 dip to 0.932x
-(prior binding won c16); top suspect is the async-UAF drain sync, measured next.
+(prior binding won c16). **c16 drain-sync lever, MEASURED NEGATIVE 2026-08-05**
+(3+3 reps, single load/arm, ours only): the UAF fix's full-stream drain vs a
+blocking-event drain (mirrors vLLM's `prepare_inputs_event`, blocking=True) gave
+2308.0 vs 2263.2 total tok/s medians, non-overlapping bands, the event arm
+**-1.9%** (TPOT 47.6 to 49.0 ms). So the c16 cost is NOT driver-lock spin but the
+depth-2 **serialization** the drain guards: `update_states`' host `condense`
+read-after-writes the previous step's device scatter of `last_sampled_tokens`, a
+true data dependency on the integrated host-array combine path that cannot be
+overlapped without moving sampled tokens GPU-resident (vLLM's `prev_sampled_
+token_ids` device gather). The full drain is byte-exact and UAF-safe and is
+**kept**; the device-resident lever is the open follow-up.
 
 ### DeepSeek-V2-Lite (MLA)
 
@@ -262,7 +272,7 @@ built on it rather than keeping the flattering one.
 | Track | Status | Next gate |
 |---|---|---|
 | 35B prefill TTFT | 0.93x to 0.98x at every concurrency (2026-08-05) | Attribute the residual, then close |
-| 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 now 0.93x | A/B the async-UAF drain sync at c16 |
+| 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x, drain-sync lever measured NEGATIVE 2026-08-05 (blocking-event −1.9%) | GPU-resident sampled tokens (vLLM `prev_sampled_token_ids`) so host `condense` stops data-depending on the device scatter |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
 | Laguna-XS NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |

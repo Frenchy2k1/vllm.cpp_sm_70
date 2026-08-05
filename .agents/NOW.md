@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-05 -->
+<!-- now-updated: 2026-08-06 -->
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
@@ -20,7 +20,7 @@ Working head: `origin/main`.
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
 | Protocol substrate repair | BENCHMARKS.md converted to scoreboard (landed); STATUS.md budget + record-era roll still open | Items below |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **W7 device COMPUTE landed, CPU-gated** (`CLAIM-KIMI-LINEAR-W7`, `ACTIVE`): DBuf-resident `ForwardDeviceCompute` (2 host islands: KDA recurrence, NoPE-MLA softmax); `test_kimi_linear_forward` **12/12·614**; opt-in `VT_KIMI_DEVICE_COMPUTE=1` | GPU-verify: CUDA build, token-exact vs oracle, e2e §8 |
-| 35B fresh grid (post async-UAF fix) | **BOUND 2026-08-05** @`1ea26427`, 3 reps, gate=0: tput 0.93-1.03x (c4 wins), TTFT 0.93-0.98x; c1 closed 0.82→0.98; c16 0.93x NEW (ours 2489→2327 while vLLM held). Suspect = the UAF drain sync at `execute_model` top | A/B a scoped drain at c16, byte-exact, then TTFT attribution |
+| 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, TTFT 0.93-0.98x, c1 closed, c16 0.93x. c16 drain-sync lever **A/B'd NEGATIVE 2026-08-06** (blocking-event −1.9%; drain KEPT). Cost = depth-2 serialization, not the drain (see state) | Real lever = GPU-resident sampled tokens (W4 `VT_ASYNC_DEVICE_MIRROR` on integrated); then TTFT |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
 (fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -46,7 +46,7 @@ comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
 3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
-   (`docker update --restart=always local-ai-worker && docker start ...`).
+   (`docker update --restart=always` + `docker start`).
 5. **Protocol substrate — partly done.** Claim triage DONE (54 rows out of
    `ACTIVE`, 29 claims retired); `docs/STATUS.md` now under a shrink-only
    ratchet; roadmap compacted; `AGENTS.md` tiered. REMAINING: (a) anchor

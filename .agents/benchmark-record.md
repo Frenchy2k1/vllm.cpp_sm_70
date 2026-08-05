@@ -11568,3 +11568,74 @@ so vLLM began loading ~67 GiB while the kernel was still reclaiming our
 server's allocations. Fix: per-leg `avail_gb >= 90` wait (10 min cap, graceful
 abort) mirroring the queue gate; all six transitions of the fresh run passed
 through it.
+
+## 2026-08-05 — 35B c16 drain-sync lever: blocking-event drain MEASURED NEGATIVE (−1.9%), drain KEPT
+
+Followed up the 35B grid's c16 regression (2489.1→2327.4, prev entry). The
+suspect was the async-UAF fix's (`1ea26427`) full-stream drain at
+`execute_model` top (`GetBackend(...).Synchronize(queue_)` when
+`async_forward_in_flight_`), guessed to serialize the depth-2 overlap. A/B'd the
+one SAFE, byte-exact, vLLM-mirroring scoped variant on dgx.casa GB10.
+
+**Mechanism tried (mirror vLLM).** Replace the spinning `cudaStreamSynchronize`
+with a BLOCKING (sleep) completion event recorded on the main queue right after
+the sample/scatter in `sample_tokens_async` and host-waited at the top of the
+next `execute_model` — same wait BOUNDARY (all forward/sample/scatter precede the
+record), so byte-identical and equally UAF-safe; only the wait MECHANISM changes
+(host sleeps vs busy-polls the CUDA driver lock). This mirrors vLLM's
+`prepare_inputs_event = torch.cuda.Event(blocking=True)`
+(`gpu_model_runner.py:738-743`, `synchronize_input_prep` 3857-3870), which vLLM
+chose specifically to keep the spin off the shared driver lock. Added `bool
+blocking` to `vt::Backend::CreateEvent` (CUDA sets `cudaEventBlockingSync`).
+
+**A/B (dgx.casa GB10, dual-lock, worker parked, drop_caches, per-start avail>=90,
+single server load per arm, 3 reps c16 in ONE load, NEVER reload per rep; both
+binaries recompiled 81 TUs from the SAME box src toggling only the 5-file diff,
+md5 A `852ee96c` != B `6112a885`, both 1812 gdn symbols; corpus `c16-r{1,2,3}`
+identical both arms).** Total token throughput (the grid "tput"):
+
+| Arm | rep1 | rep2 | rep3 | **median** | out tok/s med | TPOT ms med | TTFT ms med |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| A full-stream drain (baseline) | 2307.1 | 2308.0 | 2336.9 | **2308.0** | 256.4 | 47.56 | 1886 |
+| B blocking-event drain | 2263.2 | 2259.3 | 2263.9 | **2263.2** | 251.5 | 49.05 | 1905 |
+
+Ratio B/A = **0.981x (−1.9%)**, bands NON-OVERLAPPING (A min 2307.1 > B max
+2263.9), worse on every axis (tput, TPOT, TTFT). 96/96 completed, 0 failed both
+arms. **The lever LOSES.** Byte-exactness/safety held: SACRED
+`test_qwen36_paged_engine` exit=0 on the Arm-B build (token-exact greedy); the
+served ignore_eos UAF repro bracket (mt 4/8/16/32/64/128) all http 200 + ALIVE
+on Arm B (drain still fixes the heap corruption). CPU gates green (test_runner
+17/17 incl. the drain-invariant RED test, test_llm_engine 11/11, dense 6/6,
+engine_core_proc 10/10, async_llm 8/8).
+
+**Root cause CONFIRMED (was a suspect, now measured).** The c16 cost is NOT
+driver-lock spin — a blocking event at the same boundary is slightly SLOWER
+(per-step sleep/wake latency ~+1.5 ms TPOT, and single-rank GB10 has no TP
+driver-lock contention to relieve; vLLM's blocking event pays off only under TP).
+The cost is the depth-2 **serialization** the drain guards. Decode is inherently
+sequential (token N feeds token N+1), and on the integrated host-array combine
+path (GB10 default) `update_states`' host `condense` reorders
+`input_batch_.last_sampled_tokens` — the very array the previous step's device
+scatter WRITES and the next step's device combine READS — so `condense` has a
+true read-after-write dependency on the scatter (the LAST main-queue op). Any
+safe drain must therefore wait for ~the whole GPU tail before `update_states`,
+and `prepare_inputs` (the bulk host prep) is gated behind `update_states`. No
+scoped/event/conditional drain recovers this on the current architecture; the
+pre-fix "1.010x @ c16" was the RACE itself (matches the prior "corruption-
+subsidized state bandwidth" finding for c16/c32). **Disposition: full drain KEPT
+as-is (byte-exact, UAF-safe); blocking-event change REVERTED.**
+
+**The real lever (mirror vLLM, larger, separately-gated).** Keep sampled tokens
+GPU-resident and do the reorder on the GPU — vLLM's `input_batch.prev_sampled_
+token_ids` (a device tensor) + `_prepare_input_ids` GPU gather
+(`gpu_model_runner.py:1786-1881`), so `_update_states` never touches a device-
+written buffer and its `prepare_inputs_event` need only guard the H2D input
+staging (early, cheap). Our W4 device-mirror path (`AsyncDeviceInputs`,
+`replay_last_sampled_ops`, `VT_ASYNC_DEVICE_MIRROR=1`) already implements this for
+DISCRETE CUDA (gated OFF on integrated GB10, its serving A/B never run). Enabling
+it on the integrated path (removing the `is_integrated_gpu()` host-array branch)
+would remove the `condense`↔scatter data dependency and additionally needs
+hazard-A handling (double-buffer `exec_state_` so freeing the prior StepInputs
+doesn't race the in-flight forward) and hazard-C (block-table device buffer). Not
+a "small scoped drain" — it is the device-resident-sampled-tokens architecture.
+Evidence: `dgx:~/work/q35-regrid/evidence/raw/35/ours/c16-r{1,2,3}-{abdrain,abevent}.json`.
