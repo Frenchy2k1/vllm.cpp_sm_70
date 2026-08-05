@@ -34537,6 +34537,50 @@ This is build portability only and changes no runtime, model lifecycle,
 correctness result, or benchmark disposition. Darwin consumer CI remains the
 binding AppleClang verification.
 
+## 2026-08-04 - PR #28 sanitizer CI disk and leak repair
+
+Ordino task `t-e19dc73f`, PR #28, branch
+`fix/minja-gcc15-werror-20260803`. GitHub run `30819266647`, job
+`91704728276`, failed during the ASan+UBSan **Build** at about 60%: the hosted
+runner reported 99 MiB free and `ld` returned `No space left on device` while
+linking `test_mtp_speculator` and `test_rejection_sampler`. There was no
+sanitizer runtime finding in that run. Each test force-linked the full static
+instrumented engine, duplicating hundreds of MiB about 330 times.
+
+The sanitizer configuration now emits `-g1` and links helper-generated tests to
+one internal, unversioned `libvllm_sanitize_test_shared.so` that retains the
+whole static archive and its registrars. The packaged `libvllm.so` and default
+static test linkage are unchanged. The ASan+UBSan build fell from 93 GiB to
+5.6 GiB (shared image 289,836,680 bytes; `test_version` 3,025,144 bytes), and
+the TSan build is 1.9 GiB. CI runs the existing `VT_POOL_BYPASS=1` detector mode
+so the intentionally retained scratch pool uses real frees. The now-reachable
+leak survey found one genuine minja ownership cycle: `MacroNode` stored a
+callable in a context while strongly capturing that same context. A weak
+capture preserves invocation lifetime through the caller's parent chain and
+releases the graph after rendering.
+
+Two previously recorded Nix host-portability failures are also closed. The
+packed-component test resolves `true` from `PATH`, its clean-environment import
+uses the current absolute Python executable, and CTest removes an inherited
+`PYTHONHASHSEED` only for the suite whose control arm explicitly requires no
+seed configuration.
+
+Binding local evidence on GCC 15.2.0:
+
+- ASan+UBSan full build, then `UBSAN_OPTIONS=print_stacktrace=1
+  ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 VT_POOL_BYPASS=1 ctest
+  --test-dir build-nix-sanitize-g1 --output-on-failure`: **331/331 PASS**.
+- TSan full build, then the same CTest command against
+  `build-nix-sanitize-thread-shared`: **331/331 PASS**.
+- Plain GCC 15 `-Werror` affected-target build and focused CTest
+  (`test_serve_low_tools`, `test_none_hash_determinism`,
+  `test_chat_template`): **3/3 PASS**.
+
+No model, kernel, runtime default, CUDA path, correctness lifecycle, or
+benchmark headline changed. Performance is NOT APPLICABLE. Next external gate:
+push the checkpoint through the Ordino action-request path and confirm both
+hosted sanitizer jobs before removing their first-survey `continue-on-error`.
+
 ## 2026-08-03 - MLX system-header dependency boundary
 
 LocalAI Darwin consumer run `30783379823` showed that translation-unit warning
@@ -35800,47 +35844,6 @@ is the device-resident-sampled-tokens architecture, not a small drain tweak.
 Evidence `dgx:~/work/q35-regrid/evidence/raw/35/ours/c16-r{1,2,3}-{abdrain,abevent}.json`;
 full A/B in benchmark-record. No source/kernel/model/gate mark changed (code at baseline).
 
-## 35B TTFT growing-deficit ATTRIBUTED: serving INTAKE (async engine-core admission), not prefill kernels
-<!-- state: 2026-08-06T02:00 -->
-
-`row/BENCH-35B-TTFT` (helper, NOT pushed to main; 3 diagnostic commits off
-`35542ad3`). Chased the fresh 3-rep grid's 35B online-serve TTFT deficit that
-WORSENS with concurrency (TTFT ratio vLLM/ours c2 0.948 -> c32 0.915), which the
-c1-focused task #61 prefill attribution never explained. Reproduced (single-rep
-slice) and split queue-vs-execution with the SAME tool both engines.
-
-**Measurement.** `vllm bench serve` (in1024/out128, request-rate inf, max-conc c,
-ignore-eos, frozen grid corpus) vs OUR server and the vLLM oracle sequentially
-(dual-lock, worker parked). Config SYMMETRIC (max-num-seqs 32, mnbt 8192, no
-prefix cache). Both run ASYNC scheduling (vLLM logged it, vllm.py:1042; ours
-mcb=2) -> async-vs-sync REFUTED. vLLM split from `/metrics`; ours from a
-`VT_TTFT_DUMP` per-request stderr dump. Wiring the ours side surfaced a real
-SERVE-RESPONSE-METRICS residual: the async serving path passes
-`iteration_stats=nullptr` (output_processor.cpp:379-426 gate) AND never stamps
-`EngineCoreOutputs.timestamp` (step_with_batch_queue vs step()), so per-request
-timing is UNTRACKED on the production serving path (all-zero split). Both wired
-only under the diagnostic (byte-identical when unset); durable fix = async
-`/metrics` stat logger.
-
-**Attribution (ms, c32, ours bench-only / vLLM `/metrics` warmup-incl).**
-server-side TTFT-from-arrival ours 2884 vs vLLM 2724 (deficit +160): INTAKE
-(arrival->QUEUED, async engine-core input-queue drain) ours 612 vs vLLM 509 =
-**+103**; PREFILL (exec) +92; QUEUE (waiting-for-slot) -34 (ours better). c16:
-intake +34, prefill +82, queue +32. Client tok+egress ~7 ms (negligible). Ours
-INTAKE is the FASTEST-growing term (30/52/264/612 ms c2/4/16/32 = 20x, UNIFORM
-p50 577) vs prefill 6.7x. Ruled OUT: TCP_NODELAY (ON), tokenizer locks (none),
-egress, admission.
-
-**Verdict + levers.** Two terms: a ~flat PREFILL glue gap (+82..92 ms, ~5% =
-task #61 residual) and a concurrency-GROWING INTAKE gap (engine-core admission
-latency, +34..103 ms = the NEW signature, host/serving orchestration scaling
-with concurrent admissions). Engine scheduler-queue + kernels at/near parity.
-LEVERS: (A) reduce INTAKE - mirror vLLM's EngineCoreProc input-drain cadence
-(`core_proc.cpp run_busy_loop` drains once per step; under async depth-2 a new
-request waits ~step-cadence, which grows with batch); needs finer busy-loop
-timing before a byte-safe change, NOT implemented blind; (B) PREFILL glue fusion
-(task #61); (C) durable async `/metrics` logger. SACRED `test_qwen36_paged_engine`
-PASS on the instrumented binary. Evidence `dgx:~/work/q35-regrid/ttft-attr/`.
 
 ## 35B device-resident sampled tokens on integrated (VT_ASYNC_DEVICE_MIRROR): c16 NEUTRAL, but UNCOVERS a latent async-serving decode bug the mirror FIXES
 <!-- state: 2026-08-06T03:00 -->

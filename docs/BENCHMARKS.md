@@ -38,7 +38,7 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Qwen3.6-27B | NVFP4 | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality |
 | Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x (c4 wins), c16 0.93x. Both c16 levers A/B'd NEG: drain event -1.9%, mirror 0.999x. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
-| Qwen3.5-4B | bf16 direct-load | 0.24.0 | 5/8 | Throughput 0.98x, TTFT and memory win |
+| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | 2/7 | 0.998x throughput; TTFT/PSS win. TPOT 1.124x and VRAM open ([evidence](bench-evidence/qwen35-4b-gcc15fix-20260803.md)) |
 
 ### Qwen3.6-27B by concurrency
 
@@ -273,6 +273,12 @@ graphed decode all match, and the audit is
 compaction, CI concurrency, anchor backfill, the operator/helper protocol W0-W5
 with role discipline now enforcing, and the upstream/device inventory) touched
 no engine code and moved no number: NOT APPLICABLE, nothing to reproduce.
+
+The PR #28 sanitizer repair is also NOT APPLICABLE to performance: both full
+333-test CPU detector lanes pass after merging upstream `main`, while the
+ASan+UBSan build footprint falls from 93 GiB to 5.7 GiB and TSan occupies
+1.9 GiB. Reproduce with the sanitizer
+CTest commands recorded in `.agents/state.md`.
 
 **Vocabulary.** *Token-exact* means our output ids equal the reference's, byte
 for byte. *Near-tie* means the reference's own greedy decode is not deterministic

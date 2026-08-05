@@ -11640,13 +11640,81 @@ doesn't race the in-flight forward) and hazard-C (block-table device buffer). No
 a "small scoped drain" — it is the device-resident-sampled-tokens architecture.
 Evidence: `dgx:~/work/q35-regrid/evidence/raw/35/ours/c16-r{1,2,3}-{abdrain,abevent}.json`.
 
-**35B TTFT growing-deficit ATTRIBUTED to serving INTAKE (async engine-core admission), not prefill kernels (2026-08-05, `row/BENCH-35B-TTFT`, NOT pushed to main).** The fresh 3-rep binding grid showed a 35B online-serve TTFT deficit that WORSENS with concurrency (mean-TTFT ratio vLLM/ours c1 0.978, c2 0.968, c4 1.031, c8 0.960, c16 0.932, c32 0.975 for TPUT; TTFT ratios c2 0.948, c4 0.963, c8 0.940, c16 0.935, c32 0.915). The c1-focused task #61 attribution (prefill 99.4% GPU-busy, ~20% glue, ~3.5% per-step) never explained the GROWTH. Chased it with the SERVE-RESPONSE-METRICS split (queue vs execution), same tool both engines.
+## Qwen3.5-4B revalidation across the 217-commit rebase and GCC 15 repair (2026-08-03)
 
-Method: drove the pinned `vllm bench serve` (INPUT_LEN 1024 / OUTPUT_LEN 128, `--request-rate inf --max-concurrency c --ignore-eos`, frozen grid corpus) against OUR instrumented server and the vLLM oracle sequentially (dual-lock, worker parked, single load/arm). Config SYMMETRIC (both `--max-num-seqs 32 --max-num-batched-tokens 8192 --no-enable-prefix-caching`). Both engines run ASYNC scheduling (vLLM logged `Asynchronous scheduling is enabled` vllm.py:1042; ours `max_concurrent_batches=2`) - the async-vs-sync hypothesis is REFUTED. vLLM split from `/metrics` (`vllm:request_{queue,prefill,decode}_time_seconds`, `time_to_first_token_seconds`); ours from a `VT_TTFT_DUMP` per-request stderr dump (the async serving path passes `iteration_stats=nullptr` and never stamps `EngineCoreOutputs.timestamp`, so it tracked NOTHING - both wired only under the diagnostic; the durable fix is the async `/metrics` stat logger, a named residual).
+`CLAIM-CPU-GCC15-WERROR-LOCAL`. Measured, not assumed. `main` advanced from
+`f3ecbe70d` to `265e3bf98` (217 upstream commits) and the GCC 15 `-Werror`
+repair landed on top, so the 4B lever was rerun against the pinned oracle on
+the identical workload.
 
-DECOMPOSITION (ms, c32, ours bench-only / vLLM `/metrics` warmup-incl): server-side TTFT-from-arrival ours 2884 vs vLLM 2724 (ours +160 = the deficit). Splits: INTAKE (arrival->QUEUED, the async engine-core input-queue drain) ours 612 vs vLLM 509 = **+103**; PREFILL (scheduled->first-token exec) ours 1983 vs vLLM 1891 = +92; QUEUE (queued->scheduled, waiting-for-slot) ours 290 vs vLLM 324 = -34. c16: intake +34, prefill +82, queue +32 (deficit +147). Client tok+egress NEGLIGIBLE (~7 ms both, from ours frontend 619 ~= intake 612). Ruled OUT: TCP_NODELAY (already ON api_server.cpp:72), tokenizer/input-processor locks (none), output-handler egress, scheduler admission (ours queue <= vLLM). Ours INTAKE is the FASTEST-growing TTFT term (30/52/264/612 ms at c2/4/16/32 = 20x) vs prefill 6.7x and decode 4.4x, distribution UNIFORM (c32 intake p50 577, not outlier-driven).
+| Axis | ours | vLLM at pin | ratio | 2026-07-29 | Disposition |
+|---|---:|---:|---:|---:|---|
+| Total throughput (tok/s) | 6611.397 | 6624.585 | 0.9980x | 0.9972x | FAIL |
+| Output throughput (tok/s) | 731.070 | 732.528 | 0.9980x | 0.9972x | FAIL |
+| Requests/s | 5.710 | 5.723 | 0.9978x | 0.9971x | FAIL |
+| Mean TTFT (ms) | 728.243 | 948.961 | 0.7674x | 0.7701x | PASS |
+| Mean TPOT (ms) | 38.160 | 33.942 | 1.1243x | 1.1247x | FAIL |
+| Peak PSS (GiB) | 2.147 | 7.621 | 0.2816x | | PASS |
+| Peak VRAM (MiB) | 12850.7 | 12832.0 | 1.0015x | | FAIL |
 
-VERDICT: two terms. (1) A ~flat PREFILL-exec gap (+82..92 ms, ~5%) = the known task-#61 glue/kernel residual. (2) A concurrency-GROWING INTAKE gap (engine-core admission latency, +34..103 ms) = the NEW signature; host/serving orchestration scaling with concurrent admissions, exactly the task hypothesis. The engine's scheduler-queue and kernels are at/near parity (queue better). LEVER RANK: (A) reduce INTAKE - instrument the busy-loop input-drain frequency vs step cadence and mirror vLLM's EngineCoreProc input handling precisely (`core_proc.cpp run_busy_loop` drains the input queue once per step; under async batch-queue depth 2 a new request waits ~step-cadence, which grows with batch); needs finer engine-core-loop timing before a byte-safe change - NOT implemented blind. (B) the PREFILL glue fusion (task #61, modest ~3.5%@c1). (C) durable async `/metrics` stat logger (observability residual). Warmup confound: vLLM `/metrics` includes each c's warmups (14% at c16/c32) so its intake/prefill split is approximate; ours is clean bench-only. Evidence: `dgx:~/work/q35-regrid/ttft-attr/` (ours/server.log TTFTSPLIT, vllm/metrics-*.txt, {ours,vllm}/c{2,4,16,32}.json); SACRED `test_qwen36_paged_engine` PASS on the instrumented binary (byte-exact preserved).
+Every axis reproduced the 2026-07-29 series inside run-to-run noise. Our
+generated tokens were bit-identical, 128/128 within each repetition and
+128/128 against the earlier series for every arm. Agreement with vLLM remained
+89/128, so the residual stayed the known near-tie sampling difference. The
+0.0008x ratio movement came from the denominator: ours moved +0.017% while the
+oracle ran 0.06% slower than its previous series. This was a null result, not
+an improvement.
+
+The open gaps remained total/output throughput, requests/s, TPOT, and peak
+VRAM. Peak host memory remained the decisive win. Oracle:
+`.venv-vllm-pin`, vLLM `0.23.1rc1.dev1511+g555967922`, built from source at the
+parity pin rather than the faster 0.24.0 release. A clean CUDA build passed
+899/899. Three interleaved repetitions per arm ran under one `flock /tmp/gpu`;
+all 18 legs observed 0% GPU utilization before starting. No 4B result implies
+support or speed for the 27B/35B gates.
+
+Evidence and full reproduction:
+[Qwen3.5-4B GCC 15 fix revalidation](../docs/bench-evidence/qwen35-4b-gcc15fix-20260803.md).
+
+## PR #28 sanitizer CI disk and leak repair (2026-08-04)
+
+`HARDEN-DETECTOR-LANES`, infrastructure, performance NOT APPLICABLE. GitHub run
+`30819266647`, job `91704728276`, did not report a sanitizer finding. The
+hosted runner reached 99 MiB free and `ld` failed with `No space left on
+device`, because every sanitizer test force-linked another complete
+instrumented static engine.
+
+Sanitizer tests now share one internal instrumented image and emit `-g1`. The
+ASan+UBSan build footprint fell from 93 GiB to 5.6 GiB; the TSan tree occupies
+1.9 GiB. CI uses `VT_POOL_BYPASS=1`, so intentionally cached scratch blocks are
+really freed during detector runs. The complete leak survey then found and
+fixed a genuine minja ownership cycle: a `MacroNode` callable strongly captured
+the context that owned the callable. Two Nix-only test environment assumptions
+were also removed.
+
+Binding GCC 15.2 local evidence: ASan+UBSan **331/331 PASS** with
+`detect_leaks=1`, `strict_string_checks=1`, and `VT_POOL_BYPASS=1`; TSan
+**331/331 PASS**; the affected plain `-Werror` tests **3/3 PASS**. No model,
+kernel, runtime default, GPU path, or timing path changed, so no performance
+number is applicable. Exact commands and binary sizes are retained in
+`.agents/state.md` under "PR #28 sanitizer CI disk and leak repair".
+
+## PR #28 post-upstream-merge re-gate (2026-08-05)
+
+Merged `upstream/main` at `35542ad3a` into the PR branch and repeated the full
+GCC 15.2 detector lanes. ASan+UBSan with `detect_leaks=1`,
+`strict_string_checks=1`, and `VT_POOL_BYPASS=1` passed **333/333**; TSan with
+`VT_POOL_BYPASS=1` passed **333/333**. The merged ASan+UBSan tree is 5.7 GiB
+and the TSan tree remains 1.9 GiB.
+
+The first merged ASan survey exposed a stale exact error-message expectation:
+the architecture list in `test_model_loader_gguf` omitted upstream's newly
+registered `KimiLinearForCausalLM`. Updating that expectation restored the
+full lane, and the focused plain GCC tests (`test_chat_template`,
+`test_none_hash_determinism`, `test_serve_low_tools`, and
+`test_model_loader_gguf`) passed **4/4**. This integration repair changes no
+model, kernel, runtime default, GPU path, or timing path, so performance remains
+NOT APPLICABLE.
 ## 2026-08-06 — 35B device-resident sampled tokens on integrated (VT_ASYNC_DEVICE_MIRROR): c16 NEUTRAL + a latent async-serving decode bug the mirror FIXES
 
 The prior entry's "real lever = GPU-resident sampled tokens" built and A/B'd.
