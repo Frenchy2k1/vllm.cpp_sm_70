@@ -834,22 +834,58 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // use-after-free that corrupts the host heap. It only manifests with REAL GPU
   // overlap: the CPU eager backend and compute-sanitizer both serialize the
   // queue and never see it, which is exactly why the CPU gates stayed green while
-  // the served 35B aborted. Drain the outstanding work before touching anything.
-  if (async_forward_in_flight_) {
+  // the served 35B aborted.
+  //
+  // Two dispositions of that drain, selected by async_device_mirror():
+  //  - DEFAULT (mirror OFF, byte-identical production): last_sampled_tokens is a
+  //    HOST array the scatter writes and update_states' condense reorders, so the
+  //    drain MUST sit here, at the TOP, before update_states touches it.
+  //  - MIRROR ON (VT_ASYNC_DEVICE_MIRROR, device-resident sampled tokens): the
+  //    scatter writes and the combine reads the DEVICE mirror (dev->last_sampled),
+  //    and condense only reorders a now-stale host array + records ops replayed
+  //    on-queue (input_batch_.last_sampled_ops). The host condense<->scatter
+  //    read-after-write is gone, so the drain no longer has to PRECEDE
+  //    update_states. It MOVES to just before the forward (below): update_states +
+  //    prepare_inputs + the attention/GDN metadata build (the bulk host prep, all
+  //    of which read input_batch_ only, never exec_state_) then overlap the
+  //    previous step's GPU tail, while exec_state_ and the persistent decode-graph
+  //    buffers stay untouched — and therefore UAF-safe — until that later drain.
+  //    This is a drain MOVE, not a drain REMOVAL: removal would additionally need
+  //    double-buffered exec_state_ + block-table device buffers, which the moved
+  //    drain makes unnecessary because nothing is freed/overwritten before it.
+  //    Mirrors vLLM keeping input_batch.prev_sampled_token_ids device-resident
+  //    (states.py:64) with the _prepare_input_ids GPU gather
+  //    (gpu_model_runner.py:1786-1881) so _update_states never reads a
+  //    device-written buffer and the sync only guards the input staging.
+  const bool mirror = async_device_mirror();
+  if (async_forward_in_flight_ && !mirror) {
     vt::GetBackend(queue_.device.type).Synchronize(queue_);
     async_forward_in_flight_ = false;
   }
 
   // update_states: admit new reqs (incl. prefill_token_ids) + apply cached diffs
-  // + remove finished/unscheduled + condense (M1.5).
+  // + remove finished/unscheduled + condense (M1.5). Reads/mutates input_batch_
+  // only (never exec_state_), so on the mirror path it is safe to run while the
+  // previous step's kernels still read exec_state_.
   update_states(input_batch_, scheduler_output);
 
   // Reset the stash. A 0-token step (e.g. an aborted-request flush) runs no
   // forward — mark num_reqs == 0 so sample_tokens returns an empty output
-  // (mirrors upstream execute_model's total==0 early return).
-  exec_state_ = ExecuteModelState{};
+  // (mirrors upstream execute_model's total==0 early return). MIRROR ON DEFERS
+  // this reset (and the drain) to just before the forward, because exec_state_
+  // still holds the previous step's device logits the in-flight sampler reads;
+  // freeing it here would be the very UAF the guard exists to prevent.
+  if (!mirror) exec_state_ = ExecuteModelState{};
   if (scheduler_output.total_num_scheduled_tokens == 0 ||
       input_batch_.num_reqs() == 0) {
+    // Mirror path deferred the drain + reset; do them now before returning. The
+    // recorded structural ops (this step's condense) survive to the next step
+    // that runs a combine — see the last_sampled_ops note below.
+    if (async_forward_in_flight_) {
+      vt::GetBackend(queue_.device.type).Synchronize(queue_);
+      async_forward_in_flight_ = false;
+    }
+    if (mirror) exec_state_ = ExecuteModelState{};
     return std::nullopt;
   }
 
@@ -881,52 +917,35 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // persistent batch is already condensed dense (batch row == req_state slot).
   // Runs on the HOST side of input prep, BEFORE the forward and OUTSIDE any
   // CUDA-graph capture (input prep always precedes the decode graph replay), so
-  // it is capture-safe. Default OFF: production keeps the byte-identical sync
-  // host path (both give the same id, since sample_tokens writes the same token
-  // to token_ids_cpu and last_sampled_tokens).
-  // Non-null only on the W4 discrete-CUDA path below: the device input-id buffer
-  // the combine patched, handed to the forward so it embeds the spliced ids
-  // instead of the (deliberately stale) host vector.
+  // it is capture-safe. The mirror is DEFAULT ON (ROW-SERVE-ASYNC-LLM P0 fix);
+  // VT_ASYNC_DEVICE_MIRROR=0 rolls back to the host-array combine, whose host
+  // decode-graph read races this combine's device write (the bug the flip fixes).
+  // Non-null on the W4 mirror path below (the default; integrated OR discrete):
+  // the device input-id buffer the combine patched, handed to the forward so it
+  // embeds the spliced ids instead of the (deliberately stale) host vector.
   const int32_t* device_input_ids = nullptr;
   if (async_input_combine_ && num_reqs > 0) {
 #ifdef VLLM_CPP_CUDA
-    // S7: the DEVICE combine splices input ids from device-ADDRESSABLE host
-    // arrays (pageable on GB10's UMA) — an INTEGRATED-GPU property, not just
-    // "is CUDA". is_integrated_gpu() is byte-identical on the only registered
-    // CUDA platform (GB10 reports integrated) yet correctly decouples: a future
-    // DISCRETE GPU answers false and takes the host combine, which is the right
-    // path there (its host arrays are NOT device-addressable). Definition lives
-    // in the allowlisted CUDA platform leg, so the device token drops.
-    if (vllm::platforms::GetPlatform(queue_.device.type).is_integrated_gpu()) {
-      // DEVICE combine (W3 DGX leaf): splice each decode row's input id from the
-      // device-resident-analog last_sampled_tokens on the MAIN queue, BEFORE the
-      // forward (which embeds input_token_ids on the same queue → sees the patch)
-      // and OUTSIDE any decode-graph capture. idx_mapping is identity (condensed-
-      // dense batch), passed as nullptr. All inputs live in `step` (moved to
-      // exec_state_, buffer preserved) / persistent InputBatch members, so they
-      // outlive the async launch. On GB10's pageable memory the host arrays are
-      // device-addressable; this removes the sample_tokens_async pre-scatter
-      // Synchronize (see below). num_new_sampled_tokens == 1 (T0 non-spec).
-      vt::cuda::LaunchCombineSampledAndDraftTokens(
-          queue_, step.input_token_ids.data(), /*idx_mapping=*/nullptr,
-          input_batch_.last_sampled_tokens.data(), step.query_start_loc.data(),
-          step.seq_lens.data(), input_batch_.prefill_len.data(), num_reqs,
-          /*num_new_sampled_tokens=*/1);
-    } else if (AsyncDeviceInputs* dev = get_or_create_async_device_inputs();
-               dev != nullptr) {
-      // W4 DISCRETE device combine. Same kernel, same semantics; the difference
-      // is WHERE the operands live. `last_sampled` is already on the device (the
-      // previous step's scatter wrote it there and nothing read it back), so the
-      // three host-known inputs plus the freshly built input_ids are uploaded
-      // through the pinned staging buffer, the recorded structural edits are
-      // replayed first so the mirror's row order matches this step's batch, and
-      // the combine patches the DEVICE input_ids the forward will embed.
-      //
-      // Ordering, all on the MAIN queue and therefore exact: replay -> uploads
-      // -> combine -> forward. The forward is handed `device_input_ids` below,
-      // so the host copy of step.input_token_ids is deliberately left stale for
-      // decode rows; nothing on this path reads it (the rejection-sampler path
-      // that does is spec-only, and spec forces the sync runner).
+    // W4 device-resident sampled tokens. Preferred whenever engaged
+    // (async_device_mirror(): CUDA + VT_ASYNC_DEVICE_MIRROR, INTEGRATED OR
+    // DISCRETE). `last_sampled` is already on the device (the previous step's
+    // scatter wrote it there and nothing read it back), so the three host-known
+    // inputs plus the freshly built input_ids are uploaded through the staging
+    // copy, the recorded structural edits are replayed first so the mirror's row
+    // order matches this step's batch, and the combine patches the DEVICE
+    // input_ids the forward will embed. On the INTEGRATED path this is what keeps
+    // the sampled tokens OFF the host array update_states' condense reorders,
+    // which is what lets the depth-2 drain move past update_states (execute_model
+    // top). Mirrors vLLM's prev_sampled_token_ids device tensor + _prepare_input_
+    // ids GPU gather (gpu_model_runner.py:1786-1881).
+    //
+    // Ordering, all on the MAIN queue and therefore exact: replay -> uploads ->
+    // combine -> forward. The forward is handed `device_input_ids` below, so the
+    // host copy of step.input_token_ids is deliberately left stale for decode
+    // rows; nothing on this path reads it (the rejection-sampler path that does is
+    // spec-only, and spec forces the sync runner).
+    if (AsyncDeviceInputs* dev = get_or_create_async_device_inputs();
+        dev != nullptr) {
       replay_last_sampled_ops(*dev);
       const int64_t num_tokens =
           static_cast<int64_t>(step.input_token_ids.size());
@@ -945,6 +964,26 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
           dev->query_start_loc, dev->seq_lens, dev->prefill_len, num_reqs,
           /*num_new_sampled_tokens=*/1);
       device_input_ids = dev->input_ids;
+    } else if (vllm::platforms::GetPlatform(queue_.device.type)
+                   .is_integrated_gpu()) {
+      // DEVICE combine, HOST-ARRAY residence (W3 DGX leaf; mirror OFF = the GB10
+      // production default). Splice each decode row's input id from the device-
+      // ADDRESSABLE host last_sampled_tokens (pageable on GB10's UMA) on the MAIN
+      // queue, BEFORE the forward (which embeds input_token_ids on the same queue →
+      // sees the patch) and OUTSIDE any decode-graph capture. idx_mapping identity
+      // (condensed-dense batch), nullptr. num_new_sampled_tokens == 1 (T0
+      // non-spec). All inputs live in `step` / persistent InputBatch members, so
+      // they outlive the async launch. Its scatter counterpart writes the SAME
+      // host array update_states' condense reorders, which is why the drain must
+      // sit at execute_model's top on this path (the mirror path lifts that).
+      // is_integrated_gpu() decouples a future discrete GPU (answers false → host
+      // combine below, the right path there since its host arrays are not
+      // device-addressable).
+      vt::cuda::LaunchCombineSampledAndDraftTokens(
+          queue_, step.input_token_ids.data(), /*idx_mapping=*/nullptr,
+          input_batch_.last_sampled_tokens.data(), step.query_start_loc.data(),
+          step.seq_lens.data(), input_batch_.prefill_len.data(), num_reqs,
+          /*num_new_sampled_tokens=*/1);
     } else
 #endif
     {
@@ -958,12 +997,12 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   }
 
   // W4: the structural-op log has exactly one consumer, the device mirror's
-  // replay above. On every other configuration (integrated GPU, CPU backend, the
-  // VT_ASYNC_DEVICE_MIRROR=0 rollback, async off) nothing drains it, so drop it
-  // here rather than let it grow for the life of a serving process. Deliberately
-  // NOT cleared when the mirror is on: a step with no requests replays nothing,
-  // and its ops must survive to the next step that does.
-  if (!async_device_mirror()) input_batch_.last_sampled_ops.clear();
+  // replay above. On every other configuration (host-array integrated path, CPU
+  // backend, the VT_ASYNC_DEVICE_MIRROR=0 rollback, async off) nothing drains it,
+  // so drop it here rather than let it grow for the life of a serving process.
+  // Deliberately NOT cleared when the mirror is on: a step with no requests
+  // replays nothing, and its ops must survive to the next step that does.
+  if (!mirror) input_batch_.last_sampled_ops.clear();
 
   // Full-attention KV group metadata (M1.6 MakeCommonAttentionMetadata).
   int fa_cols = 0;
@@ -1118,6 +1157,28 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // Set after construction because the field sits at the END of the struct, where
   // it cannot shift the positional aggregate initializers other callers use.
   forward_input.device_token_ids = device_input_ids;
+
+  // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD — the MOVED drain (mirror path only).
+  // The bulk host prep above (update_states + prepare_inputs + attention/GDN
+  // metadata + forward_input assembly) has overlapped the previous step's GPU
+  // tail. Drain it NOW, before we (1) free the previous step's exec_state_ — the
+  // device logits the in-flight sampler still reads — and (2) let the forward
+  // stage this step's inputs / replay the decode graph into the persistent buffers
+  // the previous step's kernels read. `device_input_ids` (dev->input_ids) and the
+  // combine/replay this step already enqueued live in the mirror's own persistent
+  // buffers, not exec_state_, so the reset does not disturb them; the forward's
+  // CopyInPlace of dev->input_ids into the graph inputs is main-queue-ordered after
+  // this step's combine. On the DEFAULT (mirror OFF) path async_forward_in_flight_
+  // was already cleared at the top and exec_state_ already reset, so this block is
+  // skipped (mirror==false) and the path is byte-identical.
+  if (mirror) {
+    if (async_forward_in_flight_) {
+      vt::GetBackend(queue_.device.type).Synchronize(queue_);
+      async_forward_in_flight_ = false;
+    }
+    exec_state_ = ExecuteModelState{};
+  }
+
   // KV-EXTERNAL-CACHE (LMCache): apply any external-prefix loads recorded by the
   // scheduler's connector for THIS step into the freshly-allocated KV blocks
   // BEFORE the forward reads them (load-before-compute, base.py:293). Inert when
@@ -1896,28 +1957,45 @@ AsyncOutputPool& GPUModelRunner::get_or_create_async_output_pool() {
   return *async_output_pool_;
 }
 
-// ─── ENG-ASYNC-SCHED W4: discrete-CUDA device-resident async inputs ──────────
+// ─── ENG-ASYNC-SCHED W4: CUDA device-resident async inputs ───────────────────
 
-// W4 opt-in, DEFAULT OFF — deliberately, and following the precedent W3 set for
-// exactly this situation: the W3 device combine/scatter kernels also landed
-// default OFF and were flipped on only after a measured A/B on the hardware they
-// targeted. W4's target is the depth-2 overlap of the ASYNC serving loop
-// (AsyncLLM -> step_with_batch_queue -> sample_tokens_async). The synchronous
-// LLMEngine::step() loop that vllm-bench and every synchronous embedding drive
-// has no overlap to unlock, so on that path W4 is correct but cannot pay: it
-// adds four small uploads and two kernels per step and removes nothing. Until a
-// SERVING A/B shows the win it was built for, production keeps the byte-identical
-// host path and this is the switch that turns the mechanism on.
+// W4, DEFAULT ON since the 2026-08-06 CORRECTNESS flip (ROW-SERVE-ASYNC-LLM P0).
+// It landed default OFF (W3's A/B precedent: prove the speed win before flipping),
+// and the c16 A/B came back NEUTRAL (0.999x — the drain MOVE overlaps only host
+// prep). But the token-exactness probe that A/B ran uncovered a latent, SHIPPING
+// correctness bug the OFF path CANNOT avoid: on the async serving loop
+// (AsyncLLM -> step_with_batch_queue -> sample_tokens_async) the sampled token is
+// not written to token_ids_cpu synchronously (see sample_tokens_async), so the
+// next step's prepare_inputs reads a stale/zero decode-row placeholder and RELIES
+// on the device combine. On the OFF integrated path the combine patches
+// step.input_token_ids on the MAIN QUEUE while the Qwen3.5 decode graph reads that
+// same host vector on the CPU (BuildPaddedDecode -> CopyInPlace -> EmbedInto's
+// host->device upload) with NO intervening sync — an unsynchronized
+// device-write/host-read race that nondeterministically embeds the zero
+// placeholder and degenerates batch-1 greedy decode into repeated token-0 garbage.
+// Making step.input_token_ids device-resident (this mirror) routes the combine's
+// output into the embed via ApplyDeviceTokenIdsOverride, main-queue-ordered after
+// the combine, so the embed never does the racing host read. The only OFF-path
+// alternative is a per-step Synchronize after the combine — which reintroduces the
+// host sync the async path exists to remove (a c16 REGRESSION) and is a GB10-only
+// band-aid, not parity. This is exactly what upstream does on every platform
+// (states.py:64 keeps prev_sampled_token_ids a GPU tensor; gpu_model_runner.py's
+// _prepare_input_ids gathers on the GPU), so flipping the default ON is MIRROR-vLLM
+// parity, speed-neutral, and gated: VT_ASYNC_DEVICE_MIRROR=0 is the rollback to the
+// (racy) host-array path for an A/B. The async-serving token-exact gate
+// (test_qwen36_async_serving.cpp) is RED on =0 and GREEN on the default.
 //
-// VT_ASYNC_DEVICE_MIRROR=1 engages it. Distinct from VT_ASYNC_RUNNER, which would
-// also turn off async scheduling itself; keeping them separate is what makes an
-// honest A/B of W4 alone possible — same binary, same scheduler, one mechanism.
+// Distinct from VT_ASYNC_RUNNER, which would also turn off async scheduling
+// itself; keeping them separate is what makes an honest A/B of W4 alone possible —
+// same binary, same scheduler, one mechanism.
 #ifdef VLLM_CPP_CUDA
 // Guarded with its only use below: on a CPU build the mirror cannot exist, and
-// an unused static function is a -Werror=unused-function break there.
+// an unused static function is a -Werror=unused-function break there. DEFAULT ON:
+// on unless VT_ASYNC_DEVICE_MIRROR is explicitly "0" (the rollback), mirroring the
+// AsyncRunnerFlagIsOn convention.
 static bool AsyncDeviceMirrorEnvDefault() {
   const char* value = std::getenv("VT_ASYNC_DEVICE_MIRROR");
-  return value != nullptr && value[0] == '1';
+  return value == nullptr || value[0] != '0';
 }
 #endif
 
@@ -1925,16 +2003,24 @@ bool GPUModelRunner::async_device_mirror() const {
   if (async_device_mirror_cached_ >= 0) return async_device_mirror_cached_ != 0;
   bool on = false;
 #ifdef VLLM_CPP_CUDA
-  // The question is not "is this CUDA" but "is device memory addressable from
-  // the host", which is exactly what the BACKEND already answers. A unified
-  // memory device (GB10, and the CPU backend trivially) keeps the W3 in-place
-  // path, because its host arrays ARE device-addressable and mirroring would
-  // only add copies; a device with separate memory needs the mirror, because the
-  // alternative is the host fallback's main-stream Synchronize. Asking the
-  // capability rather than the device type is also what keeps this file out of
-  // the shared-layer device-leakage ratchet.
+  // Engage on any real CUDA GPU, integrated OR discrete — NOT the CPU backend.
+  //  - DISCRETE (separate memory, !UnifiedMemory): the mirror is REQUIRED, because
+  //    the host fallback would main-stream Synchronize to read the sampled ids.
+  //  - INTEGRATED (GB10, UnifiedMemory AND is_integrated_gpu): the mirror is not
+  //    required for addressability (host arrays ARE device-addressable), but
+  //    making last_sampled_tokens device-resident removes the host condense<->
+  //    scatter read-after-write that pins the async drain to the TOP of
+  //    execute_model, letting the bulk host prep overlap the GPU tail (a drain
+  //    MOVE) AND — the reason it is now DEFAULT ON — removes the unsynchronized
+  //    combine-write/host-read race the OFF path has with the decode-graph embed
+  //    (ROW-SERVE-ASYNC-LLM P0). VT_ASYNC_DEVICE_MIRROR=0 rolls back to it.
+  //  - The CPU backend (UnifiedMemory AND not an integrated GPU) keeps the in-place
+  //    host path — mirroring there would only add copies with no GPU tail to hide.
+  // is_integrated_gpu() is already read at the combine/scatter sites in this file,
+  // so it introduces no new device-type token to the leakage ratchet.
   on = async_input_combine_ && AsyncDeviceMirrorEnvDefault() &&
-       !vt::GetBackend(queue_.device.type).UnifiedMemory();
+       (!vt::GetBackend(queue_.device.type).UnifiedMemory() ||
+        vllm::platforms::GetPlatform(queue_.device.type).is_integrated_gpu());
 #endif
   async_device_mirror_cached_ = on ? 1 : 0;
   return on;
@@ -2087,19 +2173,43 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   //
   skeleton.req_ids.reserve(static_cast<size_t>(num_reqs));
 #ifdef VLLM_CPP_CUDA
-  // S7: the DEVICE scatter writes sampled ids into device-ADDRESSABLE host
-  // memory (pageable on GB10's UMA) — an INTEGRATED-GPU property. is_integrated_gpu()
-  // is byte-identical on GB10 (the only registered CUDA platform) yet decouples a
-  // future discrete GPU (false -> host bookkeeping, the correct path there).
-  if (vllm::platforms::GetPlatform(dev.type).is_integrated_gpu()) {
-    // DEVICE scatter (W3 DGX leaf): write each row's sampled id into
-    // last_sampled_tokens on the MAIN queue — main-stream-ordered with the next
-    // step's device combine, so the sampled ids NEVER round-trip the host. This
-    // DELETES the pre-scatter `Synchronize` the host-array path needed (its ONLY
-    // purpose was making the host read of dev_ids well-defined). On GB10's
-    // pageable memory last_sampled_tokens.data() is device-addressable; idx_mapping
-    // is identity (nullptr). Runs OUTSIDE any CUDA-graph capture (post-sample). The
-    // host-side bookkeeping below needs NO device read.
+  // W4 device-resident scatter. Preferred whenever the mirror is engaged
+  // (async_device_mirror(): CUDA + VT_ASYNC_DEVICE_MIRROR, INTEGRATED OR DISCRETE):
+  // write each row's sampled id into the DEVICE mirror (dinp->last_sampled) on the
+  // MAIN queue, main-stream-ordered with the next step's combine, so the sampled
+  // ids never round-trip the host. On the INTEGRATED path this is what keeps the
+  // sampled tokens OFF the host array update_states' condense reorders (the drain-
+  // move lever). The host `last_sampled_tokens` is deliberately NOT updated here —
+  // reading the ids back is the cost being removed; its rows still move with
+  // condense/swap and those moves are replayed onto the mirror, but its VALUES are
+  // stale and nothing reads them (the sampled ids reach the engine through the
+  // async output's own copy, as upstream does). Runs OUTSIDE any CUDA-graph capture.
+  if (AsyncDeviceInputs* dinp = get_or_create_async_device_inputs();
+      dinp != nullptr) {
+    vt::cuda::LaunchScatterLastSampled(queue_, dinp->last_sampled,
+                                       static_cast<const int64_t*>(dev_ids),
+                                       /*idx_mapping=*/nullptr, num_reqs);
+    for (int i = 0; i < num_reqs; ++i) {
+      const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+      skeleton.req_ids.push_back(req_id);
+      skeleton.req_id_to_index[req_id] = i;
+      if (i < static_cast<int>(exec_state_.discard.size()) &&
+          exec_state_.discard[static_cast<size_t>(i)]) {
+        continue;
+      }
+      input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
+    }
+  } else if (vllm::platforms::GetPlatform(dev.type).is_integrated_gpu()) {
+    // DEVICE scatter, HOST-ARRAY residence (W3 DGX leaf; mirror OFF = GB10 default):
+    // write each row's sampled id into the device-ADDRESSABLE host
+    // last_sampled_tokens (pageable on GB10's UMA) on the MAIN queue, main-stream-
+    // ordered with the next step's device combine, so the ids never round-trip the
+    // host. DELETES the pre-scatter `Synchronize` the host-fallback needed (its ONLY
+    // purpose was making the host read of dev_ids well-defined). idx_mapping
+    // identity (nullptr); the host bookkeeping below needs no device read. Because
+    // this is the array condense reorders, its scatter pins the drain to
+    // execute_model's top (the mirror path lifts that). is_integrated_gpu()
+    // decouples a future discrete GPU (false -> host bookkeeping below).
     vt::cuda::LaunchScatterLastSampled(
         queue_, input_batch_.last_sampled_tokens.data(),
         static_cast<const int64_t*>(dev_ids), /*idx_mapping=*/nullptr, num_reqs);
@@ -2112,33 +2222,6 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
       // would desync num_tokens from the scheduler). The stale last_sampled row
       // the scatter wrote is never read while the request is prefilling (combine
       // skips seq_len <= prefill_len) and is overwritten on its first decode.
-      if (i < static_cast<int>(exec_state_.discard.size()) &&
-          exec_state_.discard[static_cast<size_t>(i)]) {
-        continue;
-      }
-      input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
-    }
-  } else if (AsyncDeviceInputs* dinp = get_or_create_async_device_inputs();
-             dinp != nullptr) {
-    // W4 DISCRETE device scatter. Identical in effect to the integrated branch,
-    // but the destination is the device mirror rather than a device-addressable
-    // host array. This is what DELETES the `Synchronize` below on a discrete GPU:
-    // the sampled ids stay on the device, main-stream-ordered with the next
-    // step's combine, and the host bookkeeping in this loop needs no device read.
-    //
-    // The host `last_sampled_tokens` is deliberately NOT updated here — it would
-    // require reading the ids back, which is the cost being removed. It stays
-    // valid as a structural array (its rows still move with condense/swap, and
-    // those moves are replayed onto the mirror), but its VALUES are stale on this
-    // path and nothing reads them; the sampled ids reach the engine through the
-    // async output's own copy, as upstream does.
-    vt::cuda::LaunchScatterLastSampled(queue_, dinp->last_sampled,
-                                       static_cast<const int64_t*>(dev_ids),
-                                       /*idx_mapping=*/nullptr, num_reqs);
-    for (int i = 0; i < num_reqs; ++i) {
-      const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
-      skeleton.req_ids.push_back(req_id);
-      skeleton.req_id_to_index[req_id] = i;
       if (i < static_cast<int>(exec_state_.discard.size()) &&
           exec_state_.discard[static_cast<size_t>(i)]) {
         continue;
