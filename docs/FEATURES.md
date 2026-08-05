@@ -175,7 +175,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Gap | State | Detail |
 |---|---|---|
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | W7 DBuf device COMPUTE landed, CPU-gated | Full 27-layer hybrid via shared `vt::` ops (opt-in `VT_KIMI_DEVICE_COMPUTE`), 12/12·614 vs the host reference, token-identical; pending GPU numerics + e2e golden |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | W7 device COMPUTE GPU-verified (f32); e2e disk-blocked | 27-layer hybrid via shared `vt::` ops (opt-in `VT_KIMI_DEVICE_COMPUTE=1`) 12/12·614 GREEN on GB10 CUDA build, device f32==host ref, token-identical; pending bf16 numerics + e2e §8 golden (disk-blocked) |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |

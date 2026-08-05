@@ -12000,3 +12000,51 @@ percentages are warmup/JIT/capture-contaminated and are not used as binding
 steady-state weights. Raw root `/tmp/qwen35-upstream-312af21a9`; aggregate
 `/tmp/qwen35-upstream-312af21a9/aggregate.json`. Full commands and evidence:
 [Qwen3.5-4B post-upstream revalidation](../docs/bench-evidence/qwen35-4b-upstream-20260805.md).
+
+## Kimi-Linear-48B-A3B: W7 device compute GPU-VERIFIED on GB10; e2e SACRED golden disk-blocked (2026-08-06)
+
+Branch `row/MODEL-KIMI-LINEAR-GPU`, base `origin/main` `c587f2b9`. First time any
+Kimi-Linear code ran on a GPU (prior W0-W7 were CPU-gated only).
+
+Build (dgx.casa, GB10, sm_121a). Clean from-`origin/main` CUDA build staged in
+`/dev/shm` because the root disk is 100% full: `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, nvcc 13.0.88, Release, `-Werror` clean
+(rc=0). Configure resolved the full production stack: `CUTLASS found ... enabling
+sm120a NVFP4 cutlass GEMM`, `FlashAttention-2 prefill/decode: ENABLED [121a]`, vendored
+`Triton AOT ... sm_121a (MANIFEST hashes OK)`. `nm` on the linked test binary confirms
+all 14 GDN AOT stable symbols
+(`gdn_{chunko,chunko_bf16,decode,deltah,kkt,tril,wu}_h{32,48}_default`).
+
+Test (per-op device-vs-reference gate, tiny config, no checkpoint), run under both
+flock GPU locks (`$HOME/gpu.lock` + `/tmp/gpu`) in a named tmux with a done-marker.
+Arm 1 `VT_KIMI_DEVICE_COMPUTE=1` (the device-compute path): 12/12 cases, 614/614
+assertions PASS, rc=0. Arm 2 default host-ref W6 compose: 12/12, 614/614 PASS, rc=0.
+The f32 `vt::` device dispatch (embed, FusedChain add+RMSNorm, MatmulBT projections,
+CausalConv1dFwd, L2Norm, RmsNormGated, MoeRouterTopK, MoeSiluMul, MoeCombine, lm_head)
+matches the W2 host f32 reference on real Blackwell within the CPU-gate tolerances (KDA
+rtol 3e-3, NoPE-MLA 1e-4, MoE/dense 2e-4/1e-4, whole forward 5e-3 with
+greedy-token-identical + device-resident logits). No numerics divergence; none of the
+recorded DeepSeek-class traps (bf16 into ReadF32 norms, async inputs via MakeTensor,
+keep-quant device slices, CUDA-graph capture stack addresses) triggered. The two
+documented host-fallback islands (KDA per-channel recurrence+gate, NoPE-MLA softmax
+core) still run on host by design.
+
+Oracle gateability RE-CONFIRMED without a weight load: the live `~/venvs/vllm-oracle`
+resolves to `vllm-oracle-v0.25.0-stage` (vLLM 0.25.0), whose `registry.py` registers
+`KimiLinearForCausalLM` with `models/kimi_linear.py` and
+`transformers_utils/configs/kimi_linear.py` present, so the oracle can construct and
+serve the model (matches the 2026-07-25 sweep and spec section 0).
+
+e2e SACRED section-8 golden: DISK-BLOCKED (honest, recorded). The 91.5 GiB bf16
+checkpoint `moonshotai/Kimi-Linear-48B-A3B-Instruct` is ABSENT (not in `~/models`, not
+in the HF hub cache) and cannot be fetched: dgx root (`/`, 3.6T) is 100% full with only
+34 GiB free against a ~91.5 GiB need. The ~60 GiB reclaim would mean deleting other
+agents' ACTIVE laguna/ds4/bench campaign trees, which this row did not do unilaterally,
+and there are no stale `source-*` grid trees to prune. No smaller published quant
+exists. So the section-8 oracle golden, the bf16-activation parity vs the oracle, and
+speed stay the NAMED residual. What GPU-verify PROVES: the f32 device-compute WIRING
+(vt-op dispatch, MoE routing, device-resident logits, GDN cubin linkage) runs on GB10.
+What it does NOT: bf16 numerics vs the oracle and the e2e token gate. Row STAYS
+`ACTIVE`. Box left clean: tmux sessions killed, `/dev/shm` build tree removed, both GPU
+locks released, `local-ai-worker` left stopped (Exited, restart=no) as found.
