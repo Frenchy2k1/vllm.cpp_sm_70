@@ -35844,6 +35844,93 @@ is the device-resident-sampled-tokens architecture, not a small drain tweak.
 Evidence `dgx:~/work/q35-regrid/evidence/raw/35/ours/c16-r{1,2,3}-{abdrain,abevent}.json`;
 full A/B in benchmark-record. No source/kernel/model/gate mark changed (code at baseline).
 
+## 35B TTFT growing-deficit ATTRIBUTED: serving INTAKE (async engine-core admission), not prefill kernels
+<!-- state: 2026-08-06T02:00 -->
+
+`row/BENCH-35B-TTFT` (helper, NOT pushed to main; 3 diagnostic commits off
+`35542ad3`). Chased the fresh 3-rep grid's 35B online-serve TTFT deficit that
+WORSENS with concurrency (TTFT ratio vLLM/ours c2 0.948 -> c32 0.915), which the
+c1-focused task #61 prefill attribution never explained. Reproduced (single-rep
+slice) and split queue-vs-execution with the SAME tool both engines.
+
+**Measurement.** `vllm bench serve` (in1024/out128, request-rate inf, max-conc c,
+ignore-eos, frozen grid corpus) vs OUR server and the vLLM oracle sequentially
+(dual-lock, worker parked). Config SYMMETRIC (max-num-seqs 32, mnbt 8192, no
+prefix cache). Both run ASYNC scheduling (vLLM logged it, vllm.py:1042; ours
+mcb=2) -> async-vs-sync REFUTED. vLLM split from `/metrics`; ours from a
+`VT_TTFT_DUMP` per-request stderr dump. Wiring the ours side surfaced a real
+SERVE-RESPONSE-METRICS residual: the async serving path passes
+`iteration_stats=nullptr` (output_processor.cpp:379-426 gate) AND never stamps
+`EngineCoreOutputs.timestamp` (step_with_batch_queue vs step()), so per-request
+timing is UNTRACKED on the production serving path (all-zero split). Both wired
+only under the diagnostic (byte-identical when unset); durable fix = async
+`/metrics` stat logger.
+
+**Attribution (ms, c32, ours bench-only / vLLM `/metrics` warmup-incl).**
+server-side TTFT-from-arrival ours 2884 vs vLLM 2724 (deficit +160): INTAKE
+(arrival->QUEUED, async engine-core input-queue drain) ours 612 vs vLLM 509 =
+**+103**; PREFILL (exec) +92; QUEUE (waiting-for-slot) -34 (ours better). c16:
+intake +34, prefill +82, queue +32. Client tok+egress ~7 ms (negligible). Ours
+INTAKE is the FASTEST-growing term (30/52/264/612 ms c2/4/16/32 = 20x, UNIFORM
+p50 577) vs prefill 6.7x. Ruled OUT: TCP_NODELAY (ON), tokenizer locks (none),
+egress, admission.
+
+**Verdict + levers.** Two terms: a ~flat PREFILL glue gap (+82..92 ms, ~5% =
+task #61 residual) and a concurrency-GROWING INTAKE gap (engine-core admission
+latency, +34..103 ms = the NEW signature, host/serving orchestration scaling
+with concurrent admissions). Engine scheduler-queue + kernels at/near parity.
+LEVERS: (A) reduce INTAKE - mirror vLLM's EngineCoreProc input-drain cadence
+(`core_proc.cpp run_busy_loop` drains once per step; under async depth-2 a new
+request waits ~step-cadence, which grows with batch); needs finer busy-loop
+timing before a byte-safe change, NOT implemented blind; (B) PREFILL glue fusion
+(task #61); (C) durable async `/metrics` logger. SACRED `test_qwen36_paged_engine`
+PASS on the instrumented binary. Evidence `dgx:~/work/q35-regrid/ttft-attr/`.
+
+## 35B INTAKE lever RESOLVED: attribution boundary (intake<->queued), NOT a reducible TTFT term - HONEST NEGATIVE
+<!-- state: 2026-08-06T03:00 -->
+
+`row/SERVE-INTAKE-CADENCE` (helper, off `52727e7d` = BENCH-35B-TTFT head; pushed,
+NOT to main). Took the prior attribution's lever A (mirror vLLM input-drain
+cadence), did the demanded cadence measurement BEFORE touching the hot loop, then
+A/B'd the fix. Both commits: (1) `VT_LOOP_TRACE` byte-exact busy-loop probe
+(KEPT); (2) `VT_INTAKE_DRAIN` runner idle-drain hook (A/B'd, REVERTED).
+
+**Cadence (VT_LOOP_TRACE, dgx GB10 dual-lock).** Input-queue residence TRACKS
+step_ms: quiet decode windows interval~=step~=45 ms admits=0 depth=0 residence=0;
+BURST windows (uniform-length ignore_eos batch finishes together -> client fires N
+new requests at once) hit an in-flight long PREFILL step (step_ms up to 1315 c16
+/ 2005 c32) and N pile up (depth_max 7 c16 / 31 c32) waiting residence ~= that
+step's duration. So intake == one busy-loop iteration AND the iteration is a
+GPU-bound long prefill step; the wait is bursty-arrival-during-a-long-step, not a
+drain deficiency. c32 intake p50 475 mean 601 max 1923 ms.
+
+**vLLM loop (core.py @555967922).** run_busy_loop :1374 / _process_input_queue
+:1384 / _process_engine_step :1415 are STRUCTURALLY IDENTICAL to ours (ported
+1:1). vLLM's lower intake is its ASYNC executor (execute_model non_block :653 ->
+Future; process_input_sockets :1599 admits off-thread) freeing the engine thread
+during the forward. Our integrated-GB10 synchronous runner blocks the engine
+thread on the prior forward (async-UAF Synchronize, runner.cpp:838). The faithful
+mirror is the device-resident-sampled-tokens executor (VT_ASYNC_DEVICE_MIRROR,
+OFF on integrated GB10) - out of scope, separately gated.
+
+**A/B (VT_INTAKE_DRAIN, env toggle, single build, 3 reps c16+c32).** The lever
+WORKS mechanically: intake collapses (c32 600 -> 54 ms, -91%) and shifts into
+queued (c32 345 -> 867, +522); arrival->scheduled (intake+queued) INVARIANT (c32
+945 -> 920, c16 335 -> 357 = noise). Payoff NEUTRAL: throughput 1.001x, TPOT flat,
+TTFT mean -2..3% but MEDIAN neutral-to-worse (c32 +68 ms) - within the std~465 ms
+noise, no clean win. Online serve is inherently run-to-run non-deterministic at
+temp 0 (A-vs-A same input mismatch 82/96 == A-vs-B 84/96 - batch composition is
+wall-clock-timed and cascades), so exact-token cannot gate it; OFFLINE SACRED is
+the authority and PASSED with VT_INTAKE_DRAIN=1 (68.3 s).
+
+**Verdict.** The recorded "INTAKE +103" is an attribution boundary offset by
+"queued -34"; net arrival->scheduled +69 is GPU-scheduling-bound (a burst cannot
+be prefilled until the in-flight prefill frees the GPU, regardless of admission
+timing). Draining earlier only re-labels intake as queued. Reducible TTFT terms:
+PREFILL speed (task #61, +82..92) and the async device-resident executor. Lever
+REVERTED (code == VT_LOOP_TRACE-only baseline); instrument KEPT. CPU gates
+10/8/11/17 PASS, CUDA 1812 gdn, SACRED PASS (default+drain). Evidence
+`dgx:~/work/q35-regrid/{cadence,intake-ab}/`.
 
 ## 35B device-resident sampled tokens on integrated (VT_ASYNC_DEVICE_MIRROR): c16 NEUTRAL, but UNCOVERS a latent async-serving decode bug the mirror FIXES
 <!-- state: 2026-08-06T03:00 -->

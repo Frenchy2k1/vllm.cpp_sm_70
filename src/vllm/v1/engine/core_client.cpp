@@ -4,8 +4,11 @@
 // See core_client.h for scope, deviations and deferrals.
 #include "vllm/v1/engine/core_client.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <utility>
+
+#include "vllm/v1/metrics/stats.h"  // MonotonicSeconds (VT_LOOP_TRACE diagnostic)
 
 namespace vllm::v1 {
 
@@ -60,6 +63,13 @@ void InprocClient::add_request_async(std::unique_ptr<Request> request) {
   EngineCoreInputItem item;
   item.type = EngineCoreRequestType::kAdd;
   item.request = std::move(request);
+  // DIAGNOSTIC (VT_LOOP_TRACE): stamp the enqueue time so the engine thread can
+  // attribute input-queue residence (enqueue -> drain). Read the env once; when
+  // unset, enqueue_ts stays 0.0 and nothing downstream reads it (byte-exact).
+  static const bool kLoopTrace = std::getenv("VT_LOOP_TRACE") != nullptr;
+  if (kLoopTrace) {
+    item.enqueue_ts = MonotonicSeconds();
+  }
   proc_.input_queue.put_nowait(std::move(item));
 }
 
