@@ -38,7 +38,7 @@ are our reading of their documented behavior, not measurements.
 | Priority scheduling | ◐ gating | ✅ | ✅ | ☐ |
 | LPM cache-aware admission | ✅ | ☐ | ✅ | ☐ |
 | In-batch prefix de-prioritization | ✅ | ☐ | ✅ | ☐ |
-| Async / overlap scheduling | ✅ default on (UAF-safe drain; opt-in `VT_ASYNC_EXECUTOR` out-of-capture H2D staging) | ✅ | ✅ | ☐ |
+| Async / overlap scheduling | ✅ default on (UAF-safe drain; device token-ids mirror on gate + classic-dense models; opt-in `VT_ASYNC_EXECUTOR` out-of-capture H2D staging) | ✅ | ✅ | ☐ |
 | CUDA graph decode capture | ◐ per-family | ✅ | ✅ | ✅ |
 | Partial-prefill concurrency | ☐ | ✅ | ✅ | ☐ |
 | Cascade attention | ☐ | ✅ | ◐ | ☐ |
@@ -65,7 +65,7 @@ are our reading of their documented behavior, not measurements.
 | GGUF k-quants and i-quants | ✅ | ☐ | ☐ | ✅ |
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
-| MXFP4 compressed-tensors | ◐ W4A16 Marlin compute proven, bench owed | ✅ | ✅ | ☐ |
+| MXFP4 compressed-tensors | ◐ W4A16 Marlin compute proven; default-config e2e coherent + 3/4 token-exact (async-mirror fix); throughput bench owed | ✅ | ✅ | ☐ |
 | fp8 weights | ✅ | ✅ | ✅ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |

@@ -22,6 +22,7 @@
 #include "vllm/model_executor/models/qwen3.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIdsScope
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
@@ -85,6 +86,15 @@ ForwardLogits ForwardQwen3ForCausalLM(LoadedModel& model,
                                       const ModelForwardInput& input) {
   auto& qwen = static_cast<Qwen3DenseLoadedModel&>(model);
   const Qwen3DenseWeights& weights = qwen.weights();
+  // ROW-SERVE-ASYNC-DENSE-MIRROR: publish the async runner's device-resident input
+  // ids for the duration of THIS forward, so the shared EmbedInto (eager
+  // Forward/ForwardDevice AND the decode-graph replay, all of which route through
+  // qwen3.cpp) reads them instead of racing the stale host `token_ids` against the
+  // combine's device write (the #31 async batch-1 token-0 degeneration, ported to
+  // the classic dense family). Null on every non-async-CUDA path, RAII-scoped so it
+  // cannot outlive the call — byte-identical when the mirror is off.
+  const detail::DeviceTokenIdsScope device_ids_scope(
+      input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
   // Shared pure-dense decode CUDA-graph (opt-in via VLLM_CPP_QWEN3_DENSE_DECODE_
   // GRAPH): route a graph-eligible pure-decode CUDA step through the model's driver
   // (pad-to-nearest capture set + replay), else fall through to the byte-identical

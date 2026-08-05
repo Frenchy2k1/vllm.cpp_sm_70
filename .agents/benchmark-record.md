@@ -12210,3 +12210,58 @@ a NAMED speed residual, NOT an optimized decode. DEFAULT: `VT_KIMI_DEVICE_COMPUT
 (near-tie != token-exact). PATH TO STRICT + speed = the named W7 residuals: device GDN per-channel
 recurrence + exp/softplus gate op + paged `mla::ForwardMlaAttentionBlock` + a bf16 residual stream
 end-to-end (matches vLLM's rounding, removes the host round-trips).
+
+## 2026-08-07T05:00 — ROW-SERVE-ASYNC-DENSE-MIRROR: classic-dense async P0 fix (code+CPU gates) + W4 MXFP4 bench PLAN
+
+CORRECTNESS (not a speed lever): the #31 async device token-ids mirror, ported to the
+classic dense family. Classic dense `Qwen3ForCausalLM` (qwen3.cpp `EmbedInto`) raced
+the async combine's device input-ids write against a stale host upload → nondeterministic
+token-0 degeneration on the depth-2 AsyncLLM serving path (surfaced by the MXFP4
+campaign; quant-independent). Fix: EmbedInto consumes `ApplyDeviceTokenIdsOverride`
+(main-queue-ordered `d.b.Copy` over the DBuf prefix) published by
+`ForwardQwen3ForCausalLM`'s `DeviceTokenIdsScope` — verbatim the 27B-dense template.
+Byte-identical when the mirror is off. Gate `test_qwen3_dense_async_serving` (Qwen3-0.6B/4B,
+async==in-process-SYNC anchor; RED on VT_ASYNC_DEVICE_MIRROR=0, GREEN default). CPU
+-Werror clean; regression suites GREEN (input_batch 183 / combine_tokens 14 / runner 323 /
+engine_core_proc 576 / async_llm 309); test_llm_engine = documented flaky (unrelated TU).
+
+OWED ON DGX (this row):
+- Async gate RED→GREEN (same binary, VT_ASYNC_DEVICE_MIRROR env-toggled) + SACRED
+  test_qwen3_paged_engine (0.6B/4B) unchanged + ignore_eos bracket + compute-sanitizer
+  memcheck on the new gate.
+- THE MXFP4 W4 BENCH (now unblocked): `tools/bench/online_gate.py` c1..c8 x3 reps, single
+  load per arm, OURS (fixed default config) vs ORACLE on Yi30/Qwen3-8B-MXFP4. Oracle arm
+  MUST set `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel` (its default MXFP4 dispatch
+  crashes on sm_121). Match-or-beat is the bar; honest either way. Update the BENCHMARKS
+  MXFP4 Qwen3-8B row + quantization-matrix with the numbers.
+- p3 (open-ended story) near-tie distributional verdict against the oracle K-run set while
+  the oracle is loaded (converts the QUANT-CT-MXFP4 "3/4 token-exact, p3 diverges after
+  identical first token" into a ratified near-tie).
+Box safety: both locks (flock $HOME/gpu.lock AND /tmp/gpu), free -g >= 90, no oracle
+alongside our server, local-ai-worker stopped, tmux + done-markers, git archive not rsync.
+
+## 2026-08-07T07:00 — ROW-SERVE-ASYNC-DENSE-MIRROR dgx GB10 verification (f9c969ae)
+
+CUDA build (/dev/shm, 121a, cutlass 4.5.0, nvcc 13.0, Release). Both flock locks per run,
+tmux + done-markers, free-g 98-100 GiB. CORRECTNESS (this row is a correctness fix, not a
+speed lever):
+- ASYNC GATE (same binary, env-toggled): 0.6B + 4B GREEN (default) 41/41 async==sync;
+  0.6B + 4B RED (VT_ASYNC_DEVICE_MIRROR=0) FAIL 3 CHECKs — concurrency requests degenerate
+  into "...the Germany is!!!!!!" token-0 garbage. P0 reproduced + fixed on real HW.
+- SACRED test_qwen3_paged_engine 0.6B+4B 184/184, 16/16 prompts each, 0 forward-divergent
+  (byte-neutral sync path).
+- compute-sanitizer memcheck on 0.6B async GREEN: 0 errors.
+- MXFP4 Yi30/Qwen3-8B-MXFP4 DEFAULT-config (async ON + fix) vllm-cli greedy 48 tok: p0/p1/p3
+  TOKEN-EXACT vs golden, p2 story coherent near-tie; VT_ASYNC_DEVICE_MIRROR=0 same binary
+  DEGENERATES (" Paris. What I I I What... !!!!!!") = the W3 async-default degeneration, CLOSED.
+- p3/p2 NEAR-TIE RATIFIED: oracle (VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel, ninja+nvcc
+  on PATH) re-reproduces the golden; story greedy K=8 singleton; teacher-forcing the oracle on
+  OUR sequence => our token is the oracle argmax at EVERY position (max gap 0.0000 nats). The
+  free-run " wise old man" vs our " young girl" is the oracle's own prefill-vs-decode tie.
+
+W4 THROUGHPUT BENCH NOT DONE (harness gap, honest): online_gate.py MODEL_REVISIONS carries
+only "27"/"35"; no Yi30/8B key. Retargeting = MODEL_REVISIONS/REPOSITORIES entry + corpus
+(make_serve_low_corpus) + record-oracle (needs an 8B paged_engine test binary) + num-blocks/
+max-num-seqs sizing. The fix unblocks the DEFAULT-config bench (no more VT_ASYNC_SCHED=0
+workaround); oracle proven to run the model today. Evidence: dgx:/dev/shm/serve-async-dense/
+{gates_06b.log,gates2.log,mxfp4_e2e.log,oracle_neartie2.log,oracle_tf.log}.
