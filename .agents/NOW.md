@@ -68,8 +68,7 @@ START, which IS the claim. **W0-W5 LANDED**, CI-gated, enforcement OPT-IN
 (`ROLE_DISCIPLINE_SINCE` + `--require-role`). Queue: 4 rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
-OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **43 of 362 archs
-have no row**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated
+OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated
 (`ROAD-V1-D6`).
 
 ## Protocol invariants that bite most often

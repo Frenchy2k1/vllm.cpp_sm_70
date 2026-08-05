@@ -41,14 +41,14 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 
 | State | Rows |
 |---|---|
-| INVENTORIED | 284 |
+| INVENTORIED | 315 |
 | PARTIAL | 18 |
 | ACTIVE | 10 |
 | SPIKE | 6 |
 | BLOCKED | 5 |
 | DONE | 3 |
 | GATING | 1 |
-| **Total** | **327** |
+| **Total** | **358** |
 
 Engaged architectures (the 43 non-`INVENTORIED` rows):
 
@@ -525,6 +525,37 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-HFBACKEND-transformers-transformers-for-sequence-classification` | `TransformersForSequenceClassification` | `registry.py:668-671`; `vllm/model_executor/models/transformers/__init__.py::TransformersForSequenceClassification` | sequence classification / backend-generic | Transformers compatibility adapter | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-HFBACKEND-transformers-transformers-mo-efor-sequence-classification` | `TransformersMoEForSequenceClassification` | `registry.py:672-675`; `vllm/model_executor/models/transformers/__init__.py::TransformersMoEForSequenceClassification` | sequence classification / backend-generic | Transformers compatibility adapter | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-HFBACKEND-transformers-transformers-multi-modal-for-sequence-classification` | `TransformersMultiModalForSequenceClassification` | `registry.py:676-679`; `vllm/model_executor/models/transformers/__init__.py::TransformersMultiModalForSequenceClassification` | sequence classification / backend-generic | Transformers compatibility adapter | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-bert-bert-for-masked-lm` | `BertForMaskedLM` | `registry.py:217`; `vllm/model_executor/models/bert.py` | embedding / pooling | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-cheers-cheers` | `Cheers` | `registry.py:354`; `vllm/model_executor/models/cheers.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-colqwen3-col-qwen3` | `ColQwen3` | `registry.py:278`; `vllm/model_executor/models/colqwen3.py` | late-interaction retrieval | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-colqwen3-5-col-qwen3_5` | `ColQwen3_5` | `registry.py:280`; `vllm/model_executor/models/colqwen3_5.py` | late-interaction retrieval | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-cosmos3edgeforconditionalgeneration-cosmos3-edge-for-conditional-generation` | `Cosmos3EdgeForConditionalGeneration` | `registry.py:361`; `vllm/model_executor/models/cosmos3edgeforconditionalgeneration.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-diffusiongemmaforblockdiffusion-diffusion-gemma-for-block-diffusion` | `DiffusionGemmaForBlockDiffusion` | `registry.py:400`; `vllm/model_executor/models/diffusiongemmaforblockdiffusion.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-SPEC-exaone4-5-mtp-exaone4_5_mtp` | `Exaone4_5_MTP` | `registry.py:637`; `vllm/model_executor/models/exaone4_5_mtp.py` | speculative draft head | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-SPEC-gemma4-dspark-gemma4-dspark-model` | `Gemma4DSparkModel` | `registry.py:611`; `vllm/model_executor/models/gemma4_dspark.py` | speculative draft head | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-colbert-hf_col-bert` | `HF_ColBERT` | `registry.py:270`; `vllm/model_executor/models/colbert.py` | late-interaction retrieval | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-moondream3-hf-moondream` | `HfMoondream` | `registry.py:510`; `vllm/model_executor/models/moondream3.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-TEXT-vllm.models.inkling-inkling-for-causal-lm` | `InklingForCausalLM` | `registry.py:163`; `vllm/model_executor/models/vllm.models.inkling.py` | causal generation / text | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-TEXT-inklingforconditionalgeneration-inkling-for-conditional-generation` | `InklingForConditionalGeneration` | `registry.py:164`; `vllm/model_executor/models/inklingforconditionalgeneration.py` | causal generation / text | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-SPEC-vllm.models.inkling-inkling-mtpmodel` | `InklingMTPModel` | `registry.py:633`; `vllm/model_executor/models/vllm.models.inkling.py` | speculative draft head | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-jina-jina-for-ranking` | `JinaForRanking` | `registry.py:274`; `vllm/model_executor/models/jina.py` | late-interaction retrieval | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-jina-vl-jina-vlfor-ranking` | `JinaVLForRanking` | `registry.py:333`; `vllm/model_executor/models/jina_vl.py` | sequence classification | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-SPEC-llama-eagle3-llama-for-causal-lmeagle3` | `LlamaForCausalLMEagle3` | `registry.py:616`; `vllm/model_executor/models/llama_eagle3.py` | speculative draft head | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-nemotron-vl-llama_nemotron_nano_vl` | `Llama_Nemotron_Nano_VL` | `registry.py:472`; `vllm/model_executor/models/nemotron_vl.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-TEXT-longcatflashngramforcausallm-longcat-flash-ngram-for-causal-lm` | `LongcatFlashNgramForCausalLM` | `registry.py:149`; `vllm/model_executor/models/longcatflashngramforcausallm.py` | causal generation / text | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-SPEC-vllm.models.minimax-m3-mini-max-m3-mtp` | `MiniMaxM3MTP` | `registry.py:631`; `vllm/model_executor/models/vllm.models.minimax_m3.py` | speculative draft head | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-nvlm-d-nvlm_d` | `NVLM_D` | `registry.py:514`; `vllm/model_executor/models/nvlm_d.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-nano-nemotron-vl-nemotron-h_nano_omni_reasoning_v3` | `NemotronH_Nano_Omni_Reasoning_V3` | `registry.py:512`; `vllm/model_executor/models/nano_nemotron_vl.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-nano-nemotron-vl-nemotron-h_nano_vl_v2` | `NemotronH_Nano_VL_V2` | `registry.py:511`; `vllm/model_executor/models/nano_nemotron_vl.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-nano-nemotron-vl-nemotron-h_super_omni_reasoning_v3` | `NemotronH_Super_Omni_Reasoning_V3` | `registry.py:513`; `vllm/model_executor/models/nano_nemotron_vl.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-ovis2-5-ovis2_5` | `Ovis2_5` | `registry.py:522`; `vllm/model_executor/models/ovis2_5.py` | multimodal generation | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-terratorch-prithvi-geo-spatial-mae` | `PrithviGeoSpatialMAE` | `registry.py:264`; `vllm/model_executor/models/terratorch.py` | embedding / pooling | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-SPEC-qwen3-5-mtp-qwen3_5-mtp` | `Qwen3_5MTP` | `registry.py:647`; `vllm/model_executor/models/qwen3_5_mtp.py` | speculative draft head | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-SPEC-qwen3-5-mtp-qwen3_5-moe-mtp` | `Qwen3_5MoeMTP` | `registry.py:648`; `vllm/model_executor/models/qwen3_5_mtp.py` | speculative draft head | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-roberta-roberta-for-token-classification` | `RobertaForTokenClassification` | `registry.py:304`; `vllm/model_executor/models/roberta.py` | token classification | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-HFBACKEND-transformers-vault-gemma-for-causal-lm` | `VaultGemmaForCausalLM` | `registry.py:662`; `vllm/model_executor/models/transformers.py` | backend-generic adapter | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-HFBACKEND-vibevoiceasrforconditionalgeneration-vibe-voice-asr-for-conditional-generation` | `VibeVoiceAsrForConditionalGeneration` | `registry.py:668`; `vllm/model_executor/models/vibevoiceasrforconditionalgeneration.py` | backend-generic adapter | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-EMBED-xlmrobertafortokenclassification-xlmroberta-for-token-classification` | `XLMRobertaForTokenClassification` | `registry.py:305`; `vllm/model_executor/models/xlmrobertafortokenclassification.py` | token classification | upstream-derived 2026-08-05, never previously inventoried | ☐ required | `INVENTORIED` | none | unassigned |
 
 ## Dynamic Transformers compatibility
 

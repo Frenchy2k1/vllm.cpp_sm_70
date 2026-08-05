@@ -200,5 +200,6 @@ The marks track implementation and gates, not who is working on something. The
 2026-08-04 claim triage moved 58 agent-record rows out of `ACTIVE` because
 nobody is flying them; the 2026-08-05 device inventory put 11 llama.cpp ggml
 backends in scope as inventoried rows. Neither changed a capability, so **no
-mark on this page moved**. An inventoried backend is not a supported one. A row's lifecycle state and its support mark
+mark on this page moved**. An inventoried backend is not a supported one, and the same
+holds for the 31 architectures inventoried on 2026-08-05. A row's lifecycle state and its support mark
 are independent: see [STATUS.md](STATUS.md).

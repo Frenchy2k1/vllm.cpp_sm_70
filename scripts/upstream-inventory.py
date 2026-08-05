@@ -115,10 +115,11 @@ def registry_archs(text: str) -> dict[str, int]:
 
 def our_named_archs() -> set[str]:
     text = (ROOT / ".agents/model-matrix.md").read_text(encoding="utf-8")
-    return set(re.findall(
-        r"`([A-Za-z0-9_]+(?:ForCausalLM|ForConditionalGeneration|Model|"
-        r"ForSequenceClassification|ForMaskedLM|ForTokenClassification|"
-        r"ForRetrieval))`", text))
+    # Suffix matching alone UNDERCOUNTS us: architectures like `GritLM`,
+    # `MiniCPMO` and `ExaoneMoeMTP` carry no recognised suffix, so a
+    # suffix-only regex reported them as uninventoried when they had rows.
+    # Any backticked CamelCase token in the matrix counts as named.
+    return set(re.findall(r"`([A-Z][A-Za-z0-9_]{3,})`", text))
 
 
 def our_arch_rows() -> set[str]:
