@@ -87,6 +87,7 @@ Read-only observability; none change output.
 | `VT_GDN_VALIDATE` | off | Run the GDN validation/cross-check path (slower; for kernel debugging) |
 | `VT_FP4_AUTOTUNE_VERBOSE` | off | Log the NVFP4 GEMM autotuner's tactic selection |
 | `VT_POOL_BYPASS` | off | `=1` makes every device-scratch pool allocation an exact-size driver `Alloc` and every release a real `Free`, so `compute-sanitizer` can see tensor boundaries and use-after-free that the caching, size-class-rounding pool hides. DEBUGGING ONLY: it reinstates the per-op `cudaMalloc`/`cudaFree` device-sync storm the pool exists to remove, so it is never a timing configuration |
+| `VT_TTFT_DUMP` | unset | `=1` prints one `TTFTSPLIT rid=... intake=.. queued=.. prefill=.. decode=.. e2e=..` line per finished request to stderr, reconstructing the per-request timing split from the event-populated `req_state` timestamps. The async serving frontend otherwise tracks no per-request stats (passes `iteration_stats=nullptr` and never stamps `EngineCoreOutputs.timestamp`); under this flag both are wired so a serving TTFT attribution can read the queue-vs-execution split against vLLM's own `request_{queue,prefill,decode}_time_seconds`. Generation is byte-identical when unset (the default path is instruction-identical to production); the durable replacement is the async `/metrics` stat logger |
 
 ## Kernel-internal knobs (deferred)
 

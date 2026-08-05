@@ -4,6 +4,7 @@
 #include "vllm/v1/engine/core.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -204,6 +205,18 @@ EngineCore::step_with_batch_queue() {
         executor_.sample_tokens_async(grammar_output);
     batch_queue_.push_front(
         BatchQueueItem{std::move(sampled), std::move(*deferred_scheduler_output)});
+  }
+
+  // DIAGNOSTIC (VT_TTFT_DUMP): unlike the synchronous step() (which stamps
+  // scheduler_stats + timestamp at core.py parity above), the batch-queue path
+  // leaves engine_core_outputs.timestamp at 0, so the frontend's TTFT/prefill/
+  // decode intervals (engine_core_timestamp - arrival/last_token) are wrong on
+  // the async serving path. That is the SERVE-RESPONSE-METRICS residual (async
+  // per-request stats are never tracked). Stamp it only under the diagnostic so
+  // the production async path stays byte-AND-instruction-identical when unset.
+  static const bool kStampAsyncTs = std::getenv("VT_TTFT_DUMP") != nullptr;
+  if (kStampAsyncTs) {
+    engine_core_outputs.timestamp = MonotonicSeconds();
   }
 
   std::map<int, EngineCoreOutputs> outputs_by_client;
