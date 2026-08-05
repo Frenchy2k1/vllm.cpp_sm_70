@@ -3,12 +3,14 @@
 // abort :709-745). See async_llm.h for scope and the in-process deviation.
 #include "vllm/v1/engine/async_llm.h"
 
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <utility>
 
+#include "vllm/v1/metrics/stats.h"  // IterationStats (VT_TTFT_DUMP diagnostic)
 #include "vllm/v1/request.h"
 
 namespace vllm::v1 {
@@ -265,7 +267,24 @@ void AsyncLLM::RunOutputHandler() {
         std::lock_guard<std::mutex> lock(output_processor_mutex_);
         // RequestOutputs are pushed to their collectors by OutputProcessor;
         // the synchronous return list must therefore stay empty.
-        processed = output_processor_.process_outputs(outputs);
+        //
+        // DIAGNOSTIC (VT_TTFT_DUMP): the production async frontend passes
+        // nullptr, so process_outputs skips the per-request timing block
+        // (queued/prefill/decode intervals + engine-core events) entirely — the
+        // SERVE-RESPONSE-METRICS residual. Under the diagnostic, pass a throwaway
+        // IterationStats so req_state timing is populated for the TTFT-split dump
+        // (paired with the async timestamp stamp in EngineCore::step_with_batch_
+        // queue). Observational only; generation is byte-identical, and the
+        // default (unset) path is instruction-identical to production.
+        static const bool kTrackAsyncStats =
+            std::getenv("VT_TTFT_DUMP") != nullptr;
+        if (kTrackAsyncStats) {
+          IterationStats async_iteration_stats;
+          processed =
+              output_processor_.process_outputs(outputs, &async_iteration_stats);
+        } else {
+          processed = output_processor_.process_outputs(outputs);
+        }
       }
       // Stop-string finishes detected by the detokenizer must be reflected in
       // EngineCore after leaving the OutputProcessor critical section.
