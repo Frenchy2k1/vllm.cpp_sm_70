@@ -1230,12 +1230,11 @@ sortable anchor `scripts/check-state-order.py` proves. **Orientation** gained [.
 checker, so both normative documents carry one machine-readable contract. **Claim state** was triaged: only DeepSeek and
 Laguna are in flight; 54 rows left `ACTIVE`, 29 claims retired to
 [completed/claims-era1.md](../.agents/completed/claims-era1-2026-08-04.md).
-Anchor backfill: 12 engine rows cite a real `TEST_CASE` and 19
-model rows their `REGISTER_VLLM_MODEL` line (15 land `PARTIAL`). 79 rows remain, 30 anchored; `upstream-inventory.py` gates
+Backfill: 12 engine rows cite a `TEST_CASE`, 19 model rows their
+`REGISTER_VLLM_MODEL` line (15 land `PARTIAL`). 79 rows remain, 30 anchored; `upstream-inventory.py` gates
 it. All 362 vLLM registry archs now carry a row (31 added).
 Devices: 6/6 vLLM platforms covered; llama.cpp's 11 extra ggml backends are in
-scope as spike-gated `BACKEND-GGML-*` rows (`ROAD-V1-D6`). Arch parity is
-checked both ways. **CI gap closed:** the two DIFF-scoped gates carried a
+scope as spike-gated `BACKEND-GGML-*` rows (`ROAD-V1-D6`). Arch parity is checked both ways. **CI gap closed:** the two DIFF-scoped gates carried a
 `cancel-in-progress` group contradicting their own comments, so two pushes had
 them cancelled. The roadmap's 484-line chronology moved to
 `completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in

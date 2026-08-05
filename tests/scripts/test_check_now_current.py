@@ -114,3 +114,20 @@ class LiveTree(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReorderIsNotAnAppend(unittest.TestCase):
+    """A repaired interleave moves no entry, so it owes no NOW.md refresh."""
+
+    def test_reorder_only_is_exempt(self) -> None:
+        self.assertEqual(
+            now.freshness_errors({".agents/state.md"}, entries_changed=False), []
+        )
+
+    def test_a_real_append_still_requires_the_refresh(self) -> None:
+        self.assertTrue(
+            now.freshness_errors({".agents/state.md"}, entries_changed=True)
+        )
+
+    def test_default_still_demands_the_refresh(self) -> None:
+        self.assertTrue(now.freshness_errors({".agents/state.md"}))
