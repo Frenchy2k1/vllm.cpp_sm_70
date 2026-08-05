@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / ".agents"
 
 MATRICES = {
-    "MODEL": (AGENTS / "model-matrix.md", 327),
+    # 358 since 2026-08-05: +31 architectures vLLM's registry defines that we had
+    # NEVER inventoried (found by scripts/upstream-inventory.py). All INVENTORIED;
+    # inventorying is not committing.
+    "MODEL": (AGENTS / "model-matrix.md", 358),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
