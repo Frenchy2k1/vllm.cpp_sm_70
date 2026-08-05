@@ -198,8 +198,24 @@ residency-bound, not latency-bound: per-launch time drops about 20% on every
 dense Q8_0 kernel (`QuantDotGemmQ8_0Kernel` 184 to 147 µs, `Q8_0GroupDiagKernel`
 212 to 166 µs, `Q8_0PairKernel` 74 to 60 µs). This corrects the earlier
 "per-launch GEMV parity / Q8_0 weight-stream floor" framing: our GEMV was
-ATS-bound, not at ds4 parity. The routed-expert slabs (the ~70 GiB bulk) are not
-yet staged; that is the Phase-2 surface, blocked on per-tensor mmap reclaim.
+ATS-bound, not at ds4 parity.
+
+Phase-2 staged the routed-expert slabs too (the ~70 GiB IQ2/Q2_K bulk,
+`VT_V4_RESIDENT_EXPERTS`, first-touch `cudaMalloc` plus immediate
+`madvise(MADV_DONTNEED)` per slab so the transient stays ~flat). It was **measured
+NEGATIVE (2026-08-05) and is HELD default-OFF** as a characterized artifact.
+Same-binary median-of-3, warm-cancelled steady, drop_caches: OFF (Phase-1) **19.43
+tok/s** vs ON **18.76 tok/s** (0.966x, ~3.4% slower), generated ids byte-identical
+(md5 equal across all 6 runs), PEAK RESIDENT flat at 86.6 GiB. The move itself
+works: host RSS drops 86 to 14 GiB as the mmap pages are reclaimed.
+
+The regression matches the roofline. Unlike the dense Q8_0 tower (63% of DRAM
+peak, bandwidth-bound), the grouped-MoE `QuantDotGemmGrouped<IQ2_XXS>`/`<Q2_K>`
+kernels run at only ~19-24% of peak (dequant/latency-bound), so weight residency,
+a bandwidth lever, cannot help them. It also adds a large one-time graph-capture
+cost, and pinning the 70 GiB as `cudaMalloc` (vs evictable mmap file cache) cuts
+the unified-pool reclaimable headroom from ~103 to ~30 GiB avail. The lever stays
+in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 
 ## Speculative decoding
 

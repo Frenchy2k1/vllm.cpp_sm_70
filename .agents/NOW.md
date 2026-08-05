@@ -14,8 +14,8 @@ fully merged/superseded; work from main).
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Laguna NVFP4 decode speed | **PARITY+ 44.46 vs 43.10 (1.03x), byte-exact, default config**. Root cause = WEIGHT RESIDENCY: bf16 projections read unified/ATS host mem; `VT_LAGUNA_RESIDENT_BF16W` (default-ON) stages them cudaMalloc device-resident | Closed; goal met. Residual: formal vLLM K-run distributional set |
-| DeepSeek-V4-Flash decode | **BEATS ds4** (`VT_V4_RESIDENT_W` default-ON): 18.69 vs 16.33 (1.144x), byte-exact — dense Q8_0 tower cudaMalloc-device | Closed. Phase-2 routed-expert slabs = optional +~4% |
+| Laguna NVFP4 decode speed | **PARITY+ 44.46 vs 43.10 (1.03x), byte-exact, default config**. Root cause was WEIGHT RESIDENCY: bf16 projections read unified/ATS host mem via a `w.View()` retag; `VT_LAGUNA_RESIDENT_BF16W` (default-ON) stages them cudaMalloc device-resident. Detail in benchmark record | Closed; goal met. Residual: formal vLLM K-run distributional set when convenient |
+| DeepSeek-V4-Flash decode | **BEATS ds4** (`VT_V4_RESIDENT_W` on): 18.69 vs 16.33 (1.144x), byte-exact | Closed. **Phase-2 (`VT_V4_RESIDENT_EXPERTS`, ~70 GiB routed-expert slabs, madvise move) NEGATIVE 2026-08-05: −3.4%, byte-exact, memory-flat → HELD OFF** — grouped-MoE dequant/latency-bound, residency can't help. See state |
 | f32-out GEMV systemic audit | Only laguna (high) + deepseek_v4 bf16 tower (medium) affected; gate models & on-framework dense unaffected (bf16-out by construction, e2e-bench-verified) | Same-tool re-verify deepseek_v4's bf16 tower after the Laguna fix proves out |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md invocation-parity checklist being landed (worktree agent) | Review + merge; CUDA build-verify the `kGemvHeuristicAlgos` constant refactor on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |

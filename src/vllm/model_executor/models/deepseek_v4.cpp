@@ -50,6 +50,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(__unix__)
+#include <sys/mman.h>  // madvise(MADV_DONTNEED) — Phase-2 routed-expert mmap reclaim
+#include <unistd.h>    // sysconf(_SC_PAGESIZE)
+#endif
+
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
 #include "vllm/model_executor/models/deepseek_v4_device.h"
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
@@ -1190,6 +1195,99 @@ inline vt::Tensor V4ResidentW(vt::Queue& gq, const OwnedTensor& w) {
   return t;
 }
 
+// ── VT_V4_RESIDENT_EXPERTS (default OFF; =1 stages the ~70 GiB routed-expert
+// keep-quant slabs TRUE device-resident with MOVE semantics — Phase-2, extending
+// Phase-1's dense-tower VT_V4_RESIDENT_W). The three stacked expert slabs per layer
+// (moe_gate_exps/up/down, IQ2_XXS/Q2_K) are mmap-BORROWED whole-file GGUF pages
+// (OwnedBytes::Borrow, deepseek_v4_weights.cpp Sew()) consumed by the grouped GEMM via
+// an ATS retag (`weight.View(); .device=dev`) — every routed GEMM reads host bytes over
+// ATS/unified, the same per-GEMV penalty Phase-1 fixed for the dense Q8_0 tower.
+//
+// A NAIVE additive stage (Phase-1's V4ResidentBase, keeping the mmap pages) would
+// transiently need ~156 GiB (70 mmap + 70 device) > the 119 GiB unified pool → OOM. So
+// this is a MOVE, not an add: each slab is staged cudaMalloc-device ONCE (lazily, on
+// first touch — the eager gstate-0 decode-graph warm run, BEFORE any BeginCapture,
+// mirroring Phase-1's capture-safe first touch), and its borrowed mmap pages are
+// reclaimed with madvise(MADV_DONTNEED) IMMEDIATELY after the copy completes, so the
+// transient never exceeds ~one slab (~0.5 GiB) over the resident baseline and PEAK stays
+// flat (device grows as host shrinks, in lockstep). SAME bytes, SAME
+// MatmulBTQuantGrouped kernel, SAME invocation ⇒ byte-exact by construction. The mmap
+// VMA stays mapped (only resident pages drop; the borrow keep-alive still pins the
+// mapping for every other tensor); the resident path never reads the host bytes again —
+// the consumer reads the device copy. Default OFF as the A/B artifact; recommend-flip
+// only after an on-box bit-exact decode win. Rides the mmap-borrow residency (the slabs
+// must be borrowed, i.e. VT_GGUF_MMAP on — the production default for this model).
+inline bool V4ResidentExpertsEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_V4_RESIDENT_EXPERTS");
+    return e != nullptr && e[0] != '\0' && std::string(e) != "0";  // default OFF; =1 opts in
+  }();
+  return on;
+}
+
+// Reclaim the resident pages of a keep-quant slab's BORROWED mmap byte range after it
+// has been copied device-resident for the LAST time. INTERIOR whole pages only — a
+// boundary page may hold the first/last bytes of a neighbouring tensor still borrowed in
+// place, so it is never dropped (partial edge pages stay). This is the exact page math of
+// GgufFile::DropSpanResidency (gguf_reader.cpp:602, llama.cpp `unmap_fragment` adapted to
+// an interleaved file); replicated here because the consumer holds only the OwnedTensor
+// (a type-erased borrow), not the GgufFile. The mapping is PROT_READ / MAP_PRIVATE and
+// file-backed, so this is a pure residency hint — a later read (never taken on the
+// resident path) simply re-faults the same bytes. No-op for an OWNED (non-borrowed)
+// buffer: there are no mmap pages to reclaim.
+inline void V4DropBorrowedResidency(const OwnedBytes& b) {
+#if defined(__unix__)
+  if (!b.borrowed() || b.empty()) return;
+  const long ps_l = ::sysconf(_SC_PAGESIZE);
+  const auto ps = static_cast<uintptr_t>(ps_l > 0 ? ps_l : 4096);
+  const auto begin = reinterpret_cast<uintptr_t>(b.data());
+  const uintptr_t end = begin + b.size();
+  const uintptr_t page_begin = (begin + ps - 1) & ~(ps - 1);  // round UP
+  const uintptr_t page_end = end & ~(ps - 1);                 // round DOWN
+  if (page_end > page_begin) {
+    // Best-effort by contract: a failure costs resident pages, never correctness.
+    (void)::madvise(reinterpret_cast<void*>(page_begin),
+                    static_cast<size_t>(page_end - page_begin), MADV_DONTNEED);
+  }
+#else
+  (void)b;
+#endif
+}
+
+// Stage a routed-expert slab's host bytes → a cudaMalloc device copy ONCE (cached in the
+// OwnedTensor's mutable d_dev), then MOVE: synchronize the copy and reclaim the borrowed
+// mmap pages. The SYNCHRONIZE is MANDATORY — Backend::Copy is cudaMemcpyAsync, so dropping
+// the source pages before the DMA has read them would corrupt the device copy. It fires
+// only on the one-time first touch (d_dev null), during the eager warm run; steady-state
+// replay reuses d_dev with ZERO Alloc/Copy/Sync/madvise (capture-safe). `gq` must be the
+// device queue. Mirrors V4ResidentBase (Phase-1) plus the move-semantics reclaim.
+inline const uint8_t* V4ResidentExpertBase(vt::Queue& gq, const OwnedTensor& w) {
+  if (!w.d_dev) {
+    vt::Backend& b = vt::GetBackend(gq.device);
+    const size_t nb = w.bytes.size();
+    void* p = b.Alloc(nb);
+    b.Copy(gq, p, w.bytes.data(), nb);  // async H2D (reads/faults in the whole slab)
+    b.Synchronize(gq);                  // the copy MUST complete before dropping the source
+    V4DropBorrowedResidency(w.bytes);   // MOVE: reclaim the mmap pages (PEAK stays flat)
+    vt::Backend* bk = &b;
+    w.d_dev = std::shared_ptr<void>(p, [bk](void* pp) { bk->Free(pp); });
+  }
+  return static_cast<const uint8_t*>(w.d_dev.get());
+}
+
+// Device operand for a stacked routed-expert weight consumed by the grouped GEMM. Lever
+// ON: a View over the true-device (moved) copy. Lever OFF: the legacy ATS retag (host mmap
+// bytes, device-tagged). Byte-identical either way — only the backing allocation differs;
+// shape/stride/nk/dtype come straight from w.View(), so it is exactly the retag path's
+// metadata. `gq` must be the device queue.
+inline vt::Tensor V4ResidentExpertW(vt::Queue& gq, const OwnedTensor& w) {
+  vt::Tensor t = w.View();
+  t.device = gq.device;
+  if (V4ResidentExpertsEnabled() && !w.bytes.empty())
+    t.data = const_cast<uint8_t*>(V4ResidentExpertBase(gq, w));
+  return t;
+}
+
 // Keep-quant GEMM into a caller-provided unified `out` (T rows), NO sync — the
 // resident chain drains once at the end. Mirrors Gemm's device branch; a
 // block-quant weight → the device kMatmulBTQuant, a bf16 weight (e.g. the router
@@ -1320,8 +1418,8 @@ void GemmGroupedInto(const V4Backend& be, const OwnedTensor& weight, const float
   vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, gq.device, {P, N});
   vt::Tensor eid =
       vt::Tensor::Contiguous(const_cast<int32_t*>(eids), vt::DType::kI32, gq.device, {P});
-  vt::Tensor w = weight.View();
-  w.device = gq.device;
+  // VT_V4_RESIDENT_EXPERTS (Phase-2): device (moved) copy vs the ATS retag. Byte-identical.
+  vt::Tensor w = V4ResidentExpertW(gq, weight);
   vt::MatmulBTQuantGrouped(gq, o, a, w, eid);  // NO sync — resident
 }
 
@@ -1343,10 +1441,9 @@ void MoeGateUpSwiGLUInto(const V4Backend& be, const OwnedTensor& gate_w, const O
   vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, gq.device, {P, mi});
   vt::Tensor eid =
       vt::Tensor::Contiguous(const_cast<int32_t*>(eids), vt::DType::kI32, gq.device, {P});
-  vt::Tensor gw = gate_w.View();
-  gw.device = gq.device;
-  vt::Tensor uw = up_w.View();
-  uw.device = gq.device;
+  // VT_V4_RESIDENT_EXPERTS (Phase-2): device (moved) copies vs the ATS retag. Byte-identical.
+  vt::Tensor gw = V4ResidentExpertW(gq, gate_w);
+  vt::Tensor uw = V4ResidentExpertW(gq, up_w);
   deepseek_v4::MoeDevice()->moe_gate_up_swiglu(gq, o, a, gw, uw, eid, limit);  // NO sync
 }
 

@@ -11470,3 +11470,69 @@ steady-state per-step / nsys decode tok/s (eager vs graphed) is OWED.
   **IDENTICAL** default vs `=0` (byte-exact, directive gate PASS). Clean rebuild
   after the gate flip recompiled `laguna.cpp` with -Werror (no warnings) and
   relinked `laguna-gen`. Supersedes the "default-OFF, recommend flip" note above.
+
+## DeepSeek-V4 Phase-2 routed-expert device residency (2026-08-05) - MEASURED NEGATIVE, HELD default-OFF
+
+`CLAIM-DEEPSEEK-V4-RESIDENT-EXPERTS`, GB10 sm_121a, incremental build off the
+Phase-1 tree (`VT_V4_RESIDENT_W` default-ON, base main `20b3db88`), branch
+`worktree-agent-a1721751cb475ced0`. Extends Phase-1 (which staged the dense Q8_0
+MLA/shared/lm_head projection tower device-resident, 18.69 vs ds4 16.33, 1.144x)
+to the ~70 GiB routed-expert keep-quant slabs (`moe_gate/up/down_exps`,
+IQ2_XXS/Q2_K), new env `VT_V4_RESIDENT_EXPERTS` (default-OFF).
+
+**Design/impl (deepseek_v4.cpp).** MOVE, not add: `V4ResidentExpertBase` first-touch
+`cudaMalloc`+`Backend::Copy` (async H2D) a slab into `OwnedTensor::d_dev`, then
+`Backend::Synchronize` (the copy is `cudaMemcpyAsync`; the DMA must finish before
+the source pages are dropped or the device copy corrupts), then
+`V4DropBorrowedResidency` = interior-whole-page `madvise(MADV_DONTNEED)` over the
+borrowed GGUF mmap byte range (round-up begin / round-down end, exactly
+`GgufFile::DropSpanResidency`'s page math, replicated because the consumer holds
+only the type-erased `OwnedBytes` borrow, not the GgufFile). Consumers
+`GemmGroupedInto` + `MoeGateUpSwiGLUInto` route through `V4ResidentExpertW`.
+Capture-safe: staging is on the gstate-0 eager warm run BEFORE `BeginCapture`
+(mirrors Phase-1); gstate-1 capture / gstate-2 replay reuse `d_dev` with no cuda
+calls. GGUF mmap is `PROT_READ, MAP_PRIVATE`, so a dropped page re-faults the
+same bytes (never taken on the resident path). Load-time staging (the spike's
+literal wording) is infeasible: the model_loader is device-free by design (no
+queue), so first-touch-in-the-warm-run is the same copy+immediate-reclaim
+contract at the only place a queue exists.
+
+**Method.** `deepseek-v4-gen --gpu --kv-cache --model ds4flash.gguf
+(IQ2XXS UD, 80.7 GB) --max-tokens 256`, default prompt. Single-load per rep,
+drop_caches before each load, one `flock $HOME/gpu.lock`, worker PARKED,
+median-of-3, same binary (`VT_V4_RESIDENT_EXPERTS=1` vs unset). Steady is
+WARM-CANCELLED = `(steps-3)/(decode_total - t0 - t1 - t2)`: the naive harness
+average is worthless here because step 0 (eager warm + 70 GiB staging), step 1
+(graph capture, 6-8.6 s) and step 2 (settle) are large one-time costs; subtracting
+them isolates the ~0.05 s/step replay at ~0.13% resolution (the 2-decimal per-step
+log cannot resolve a 4% delta directly).
+
+| arm | env | DT(s) | steps | t0 | t1 | t2 | steady tok/s | ids md5 | PEAK GiB | min avail |
+|---|---|---|---|---|---|---|---|---|---|---|
+| OFF (Phase-1) r1 | default | 13.93 | 255 | 0.43 | 0.47 | 0.06 | 19.429 | f0b88b70… | 86.68 | 103 |
+| OFF r2 | default | 13.95 | 255 | 0.45 | 0.47 | 0.06 | 19.429 | f0b88b70… | 86.68 | 103 |
+| OFF r3 | default | 13.95 | 255 | 0.43 | 0.48 | 0.06 | 19.414 | f0b88b70… | 86.68 | 103 |
+| ON (Phase-2) r1 | `=1` | 22.59 | 255 | 0.43 | 8.58 | 0.11 | 18.708 | f0b88b70… | 86.63 | 30 |
+| ON r2 | `=1` | 20.15 | 255 | 0.43 | 6.01 | 0.36 | 18.876 | f0b88b70… | 86.64 | 29 |
+| ON r3 | `=1` | 20.67 | 255 | 0.43 | 6.41 | 0.40 | 18.764 | f0b88b70… | 86.64 | 30 |
+
+**Result: OFF median 19.43 vs ON median 18.76 = 0.966x, −3.4% (bands
+non-overlapping).** BYTE-EXACT: all 6 runs md5 `f0b88b70fa208b23` (OFF==ON).
+Memory a genuine MOVE: PEAK RESIDENT (VmHWM) flat ~86.6 GiB, and per-step host RSS
+drops 86.3→13.9 GiB the moment the warm run stages+reclaims (the ~70 GiB leaves
+host RSS for device cudaMalloc). Memory SAFE throughout (min avail 29-30 GiB, 0
+sentinel kills). NOTE the `free` avail lens tells the real pool story: OFF keeps
+the experts as EVICTABLE mmap file cache (avail 103 GiB), ON PINS them as
+cudaMalloc (avail 30 GiB) — so Phase-2 is memory-WORSE for reclaimable headroom
+even though VmHWM is flat.
+
+**Attribution (why it loses).** Consistent with the last-mile roofline
+(`CLAIM-DEEPSEEK-V4-DEVICE-DECODE` Brick 0): the dense Q8_0 tower Phase-1 sped up
+is BANDWIDTH-bound (63% of the 240 GB/s peak) so device residency helped it; the
+grouped-MoE `QuantDotGemmGrouped<IQ2_XXS>` (~19% of peak) / `<Q2_K>` (~24%)
+kernels are DEQUANT/LATENCY-bound, so weight residency (a bandwidth lever) cannot
+help and slightly hurts, plus a large one-time graph-capture penalty and reduced
+pool headroom. Held default-OFF as a reproducible characterized artifact; the
+routed-expert front is NOT a residency win. Also cleared main's RED `check-env-doc`
+(VT_V4_RESIDENT_W was unallowlisted) by adding both VT_V4_RESIDENT_W and
+VT_V4_RESIDENT_EXPERTS to `scripts/env-doc-allowlist.txt`.
