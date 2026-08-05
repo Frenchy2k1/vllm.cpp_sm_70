@@ -566,6 +566,56 @@ bf16 numerics vs the oracle, and the e2e token gate. Row STAYS `ACTIVE`.
 
 ---
 
+## 12. §8 SACRED ORACLE GOLDEN CAPTURED (STRICT); full our-engine e2e f32-loader-blocked (2026-08-06, branch `row/MODEL-KIMI-LINEAR-E2E`)
+
+Disk was unblocked upstream (129 GiB free) and the mission resumed on a fresh
+branch off `origin/main` `c1a7b452` (the §11 GPU-verify records merged as #37).
+
+**Step 3 (download) DONE.** `moonshotai/Kimi-Linear-48B-A3B-Instruct` pulled into the
+HF cache (snapshot `e1df551a…`), 20 safetensors shards, exact size 98,245,528,576 B =
+**91.5 GiB bf16 / ~49.1B params**; `config.json` matches this spec byte-for-byte
+(27 layers, H=2304, vocab 163840, 256 experts, `num_nextn_predict_layers=0`, the KDA
+`kda_layers`/`full_attn_layers` schedule). df landed at 37 GiB free (> the 15 GiB
+floor). tiktoken tokenizer via remote code (`tokenization_kimi.py`, `tiktoken.model`).
+
+**Step 4 (§8 oracle golden) DONE — STRICT.** Captured on GB10 with the live
+`~/venvs/vllm-oracle` (→ 0.25.0-stage), oracle ALONE under both flock locks, after
+`drop_caches` with 116 GiB available. Recipe (mirrors `deepseek-v2-oracle-capture.py`):
+`moe_backend=triton` (MANDATORY — the FlashInfer CUTLASS MoE workspace OOM-reboots this
+box), `enforce_eager`, `max_num_batched_tokens=512`, `max_num_seqs=1`,
+`max_model_len=2048`, per-prompt batch=1, K=3, T=16, the 8-prompt battery.
+**MEMORY (the crux): vLLM footprint ≈ util × 119 GiB, so a 91.5 GiB model needs
+util ≈ 0.82 (NOT the ≤0.60 that cannot even hold the weights — 0.60×119=71<91.5).**
+`gpu_memory_utilization=0.82` → ~97.6 GiB footprint, **min available memory 15 GiB
+throughout, no reboot**. Verdict: **ALL 8 prompts DETERMINISTIC over K=3 → STRICT
+token-exact gate** (as §4 predicted for a 48.9B MoE). All completions coherent (Paris/
+Rome/Berlin; `def fibonacci`; "Au … Latin word aurum"; Shakespeare's Hamlet). Golden
+committed at `tests/parity/goldens/kimi_linear_greedy/` (`greedy_ids.npy` [8,16],
+`greedy_dist.npy` [8,16,3], `p{0-7}_prompt.i32`); recipe at
+`scripts/kimi-linear-oracle-capture.py`. NOTE: the §8-step-4 reduced-layer smoke
+(`hf_overrides num_hidden_layers=4`) is INCOMPATIBLE with the Kimi hybrid schedule in
+vLLM 0.25.0 (loader `KeyError: layers.4.block_sparse_moe.…`); the full run needs no
+override, so the smoke was skipped.
+
+**Step 5 (our-engine e2e) BLOCKED on OUR f32 loader — NOT disk, NOT oracle.**
+`kimi_linear_weights.cpp::MaterializeHost` decodes EVERY weight tensor to row-major
+`std::vector<float>` (f32) for the W2 CPU reference — all 27 layers + 256 experts, so
+~49.1B params × 4 B ≈ **183 GiB resident, well over the 119 GiB unified pool** (plus the
+mmap'd bf16 shards during load). Loading the full model in our engine would OOM-reboot
+the box, so it was NOT attempted (safety). This is exactly the §10/§11 "bf16 activations
+(vLLM parity)" residual: the **bf16-resident loader + forward** must land before the
+full-model our-engine e2e token gate can run. The device compute is already GPU-verified
+(§11, `test_kimi_linear_forward` 12/12·614), and the STRICT golden is now committed and
+ready to gate against the moment the bf16 path exists.
+
+**Step 6.** Row STAYS `ACTIVE` (the e2e token gate did not run). `VT_KIMI_DEVICE_COMPUTE`
+default STAYS OFF (a parity-enabler flip needs the e2e gate green). No tok/s (no
+full-model our-engine load was safe). Residuals now precisely: (a) the bf16-resident
+loader/forward (unblocks the full our-engine e2e vs this golden), (b) the paged het-KV +
+GDN Triton-AOT decode + grouped-MoE device slabs, (c) speed. Box left clean.
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope
