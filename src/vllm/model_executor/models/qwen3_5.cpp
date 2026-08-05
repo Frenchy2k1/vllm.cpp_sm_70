@@ -3346,6 +3346,18 @@ void MaybeBuildAttnCosSin(Dev d, StepDevInputs& sdi, const HfConfig& cfg, int64_
   sdi.has_attn_cos_sin = true;
 }
 
+// VT_ASYNC_EXECUTOR (Option A): re-fill an ALREADY-ALLOCATED cos|sin cache in place
+// from the current sdi.positions. The alloc happened pre-capture (MaybeBuildAttnCosSin
+// on the persistent StepDevInputs); this fill runs INSIDE the captured region so each
+// replay re-derives rope from the freshly-staged positions. No allocation, capture-
+// safe. Only reached when sdi.has_attn_cos_sin (the fused-preamble arch, e.g. 27B W4A4).
+void FillAttnCosSin(Dev d, StepDevInputs& sdi, const HfConfig& cfg) {
+  const int rot = static_cast<int>(cfg.rotary_dim);
+  if (rot <= 0) return;
+  vt::RopeCosSinCache(d.q, sdi.attn_cos_sin.t(), sdi.positions.t(),
+                      vt::RopeArgs{static_cast<float>(cfg.rope_theta), rot});
+}
+
 // --- Batched PAGED GDN block (M1.8 Task 3). Same conv1d + l2norm + q/k/v/g/beta
 // prep + gated-norm + out_proj as GdnBlock, but driven by the batched
 // GDNAttentionMetadata segmentation over the PERSISTENT ssm_state/conv_state:
@@ -5997,7 +6009,8 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const std::vector<int32_t>& logits_indices = {},
                           const Tensor* hidden_tap = nullptr,
                           const std::vector<int32_t>* aux_layer_ids = nullptr,
-                          const Tensor* aux_out = nullptr) {
+                          const Tensor* aux_out = nullptr,
+                          StepDevInputs* persistent_sdi = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -6014,18 +6027,33 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   // Upload the per-step inputs ONCE (positions + full-attn metadata + GDN decode
   // state indices) into persistent device buffers all layers read — replaces the
   // per-layer H2D re-uploads (the decode host-stall root; see StepDevInputs).
+  // VT_ASYNC_EXECUTOR (Option A): a non-null persistent_sdi points at the SizeSlot's
+  // persistent device buffers, which the graph driver stages the H2D into OUTSIDE
+  // this captured region — so here we do NOT allocate or upload; we only re-derive
+  // the on-device cos|sin cache from the (re-staged) persistent positions so replays
+  // pick up each new token's rope. Eager / capture-of-Option-B path (nullptr) builds
+  // and uploads the inputs inline as before (byte-identical).
   const int64_t gdn_state_slots =
       gdn_state.empty() ? 0 : gdn_state.front().ssm_state.shape[0];
-  StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta,
-                                         gdn_state_slots);
-  // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
-  // default (fp8/bf16 attn — the 35B — stays OFF; VT_FUSE_ATTN_PREAMBLE overrides).
   const bool fp4_attn = [&] {
     for (const auto& l : weights.layers)
       if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
     return false;
   }();
-  MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
+  std::optional<StepDevInputs> local_sdi;
+  if (persistent_sdi == nullptr)
+    local_sdi.emplace(
+        BuildStepDevInputs(d, positions, attn_meta, gdn_meta, gdn_state_slots));
+  StepDevInputs& sdi = persistent_sdi != nullptr ? *persistent_sdi : *local_sdi;
+  // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
+  // default (fp8/bf16 attn — the 35B — stays OFF; VT_FUSE_ATTN_PREAMBLE overrides).
+  if (persistent_sdi != nullptr) {
+    // Persistent buffer already allocated (pre-capture); re-fill only, captured so
+    // every replay re-derives rope from the freshly-staged positions.
+    if (sdi.has_attn_cos_sin) FillAttnCosSin(d, sdi, config);
+  } else {
+    MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
+  }
 
   int64_t fa_idx = 0, gdn_idx = 0;
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
@@ -6744,7 +6772,8 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                                const Tensor* hidden_tap = nullptr,
                                const std::vector<float>* mrope_cos_sin = nullptr,
                                const std::vector<int32_t>* aux_layer_ids = nullptr,
-                               const Tensor* aux_out = nullptr) {
+                               const Tensor* aux_out = nullptr,
+                               StepDevInputs* persistent_sdi = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -6759,10 +6788,17 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   res.Zero(d);
 
   // Per-step inputs uploaded ONCE (see StepDevInputs) — no per-layer re-upload.
+  // VT_ASYNC_EXECUTOR (Option A): a non-null persistent_sdi points at the SizeSlot's
+  // persistent device buffers the graph driver stages the H2D into OUTSIDE this
+  // captured region (see ForwardLayers for the full note); here we only re-derive
+  // cos|sin from the re-staged persistent positions.
   const int64_t gdn_state_slots =
       gdn_state.empty() ? 0 : gdn_state.front().ssm_state.shape[0];
-  StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta,
-                                         gdn_state_slots);
+  std::optional<StepDevInputs> local_sdi;
+  if (persistent_sdi == nullptr)
+    local_sdi.emplace(
+        BuildStepDevInputs(d, positions, attn_meta, gdn_meta, gdn_state_slots));
+  StepDevInputs& sdi = persistent_sdi != nullptr ? *persistent_sdi : *local_sdi;
   // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
   // default (the real 27B W4A4 => ON; bf16/GGUF dense => OFF; env overrides).
   const bool fp4_attn = [&] {
@@ -6776,7 +6812,13 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   // would build. FuseAttnPreamble is default-ON (VT_FUSE_ATTN_PREAMBLE) so
   // AttnQkNormRopeGate reads this per-token cache; sdi.positions is unused for rope
   // then. mrope_cos_sin==nullptr (every text caller) ⇒ byte-identical to before.
-  if (mrope_cos_sin != nullptr) {
+  if (persistent_sdi != nullptr) {
+    // Option A: the persistent cos|sin buffer was allocated pre-capture; re-fill only
+    // (captured) so every replay re-derives rope from the freshly-staged positions.
+    // The MRoPE VL path never drives the decode graph (persistent_sdi is nullptr
+    // there), so text-decode's 1-D RoPE re-fill is the only persistent case.
+    if (sdi.has_attn_cos_sin) FillAttnCosSin(d, sdi, config);
+  } else if (mrope_cos_sin != nullptr) {
     const int rot = static_cast<int>(config.rotary_dim);
     VT_CHECK(rot > 0 && static_cast<int64_t>(mrope_cos_sin->size()) == T * rot,
              "qwen3_5 VL: MRoPE cos|sin cache must be [T, rotary_dim]");
@@ -7492,16 +7534,27 @@ void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
 
 }  // namespace
 
-// VT_ASYNC_EXECUTOR decode-graph slot double-buffer (parity ring) — the MODEL side
-// of the c16/c32 overlap unlock. Two SizeSlots per padded decode size, alternated
-// each step, each host-waited on its own reuse event before its persistent host
-// inputs are refreshed. That guard replaces the runner's depth-2 drain (which the
-// runner then skips), letting step N+1's host prep + replay overlap step N's GPU
-// tail. DEFAULT OFF: unset/anything-but-"1" ⇒ single-slot (slot[0]), no events,
-// byte-identical to the pre-lever driver. VT_ASYNC_EXECUTOR_NO_DBUF=1 is a TEST-
-// ONLY escape hatch that forces the ring OFF while the runner still skips the drain
-// (VT_ASYNC_EXECUTOR=1), so the async-serving gate SEES hazard-C in the RED arm
-// (drain skipped, no double-buffer ⇒ corruption). Production never sets it.
+// VT_ASYNC_EXECUTOR — Option A: the decode-graph per-step input H2D staged OUT of
+// the captured replay (the faithful vLLM structure, the real c8-c32 overlap unlock).
+// vLLM stages each step's inputs on the main stream OUTSIDE its graph into PERSISTENT
+// DEVICE buffers the graph reads (gpu_model_runner.py _prepare_input_ids), guarded by
+// a blocking input-prep event recorded right after the staging H2D (states.py:64,
+// synchronize_input_prep) — so the next step's host prep waits only that tiny copy,
+// never the forward. Option A ports exactly that: each SizeSlot gets persistent device
+// input buffers (a StepDevInputs, s.dev) and PINNED host staging buffers (s.pin); the
+// graph is captured reading s.dev; per step the H2D is enqueued on the main queue
+// BEFORE ReplayGraph and an input-staged event is recorded right after it. This
+// REPLACES Option B (#36), where the H2D was baked inside the captured replay so the
+// runner's depth-2 drain had to wait the whole GPU tail (c16 ~7%).
+//
+// The 2-slot parity ring is RETAINED: the depth-2 loop enqueues sample(i-1) AFTER
+// forward(i) (core.cpp step_with_batch_queue), so the persistent logits MUST double-
+// buffer or forward(i+1) overwrites logits(i) before sample(i) reads them; the ring
+// also gives each slot's pinned inputs a 2-step reuse window. DEFAULT OFF:
+// unset/anything-but-"1" ⇒ single-slot (slot[0]), no staging, no events — byte-
+// identical to the pre-lever baked-H2D driver. VT_ASYNC_EXECUTOR_NO_DBUF=1 is a TEST-
+// ONLY escape hatch that forces the ring OFF while the runner still skips the drain,
+// so the gate SEES the logits/input hazard in a RED arm. Production never sets it.
 static bool DecodeGraphDoubleBufferEnabled() {
   const char* v = std::getenv("VT_ASYNC_EXECUTOR");
   if (v == nullptr || v[0] != '1' || v[1] != '\0') return false;
@@ -7510,22 +7563,120 @@ static bool DecodeGraphDoubleBufferEnabled() {
   return true;
 }
 
-// Test-only (VT_ASYNC_EXECUTOR_POISON): immediately after a captured ReplayGraph,
-// overwrite the persistent host inputs the replay's baked H2D + EmbedInto read,
-// WITHOUT syncing. If the replay reads them asynchronously — the premise of
-// hazard-C — this corrupts THIS step deterministically, so the token-exact async
-// gate fails, proving the drain/ring is load-bearing WITHOUT depending on the
-// natural Refresh-vs-replay race's narrow timing window. Templated because the two
-// decode-graph drivers nest their own SizeSlot with identical field names. Never
-// set in production (gated by an Impl `poison` member read once at construction, so
-// the default hot path pays no getenv).
+// Pinned host staging for the per-step-varying decode-graph inputs (positions,
+// slot_mapping, block_table, seq_lens, query_start_loc, gdn_state_idx, token_ids).
+// cudaHostAlloc'd so the H2D into the persistent device buffers is a TRUE async DMA:
+// a pageable std::vector H2D on GB10 is effectively host-synchronous (which is
+// precisely why #36's poison could never race the copy and its RED was
+// unreproducible). Sized once at capture for the padded size S / block-table cols /
+// gdn index count. Non-owning of the SizeSlot's std::vectors — StageStepInputs copies
+// them in each step, then enqueues the async device copy.
+struct PinnedStepInputs {
+  Backend* b = nullptr;
+  int32_t* positions = nullptr;
+  int64_t* slot_mapping = nullptr;
+  int32_t* block_table = nullptr;
+  int32_t* seq_lens = nullptr;
+  int32_t* qsl = nullptr;
+  int32_t* gdn_state_idx = nullptr;
+  int32_t* token_ids = nullptr;
+  int64_t S = 0, cols = 0, idx = 0;
+  bool has_idx = false;
+  bool ready = false;
+
+  PinnedStepInputs() = default;
+  PinnedStepInputs(const PinnedStepInputs&) = delete;
+  PinnedStepInputs& operator=(const PinnedStepInputs&) = delete;
+  ~PinnedStepInputs() { Free(); }
+  void Free() {
+    if (b == nullptr) return;
+    for (void* p : {static_cast<void*>(positions), static_cast<void*>(slot_mapping),
+                    static_cast<void*>(block_table), static_cast<void*>(seq_lens),
+                    static_cast<void*>(qsl), static_cast<void*>(gdn_state_idx),
+                    static_cast<void*>(token_ids)})
+      if (p != nullptr) b->FreePinned(p);
+    positions = nullptr; slot_mapping = nullptr; block_table = nullptr;
+    seq_lens = nullptr; qsl = nullptr; gdn_state_idx = nullptr; token_ids = nullptr;
+    b = nullptr; ready = false;
+  }
+  void Alloc(Backend& bk, int64_t S_, int64_t cols_, int64_t idx_, bool has_idx_) {
+    Free();
+    b = &bk; S = S_; cols = cols_; idx = idx_; has_idx = has_idx_;
+    positions = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
+    slot_mapping = static_cast<int64_t*>(bk.AllocPinned(sizeof(int64_t) * S));
+    block_table = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S * cols));
+    seq_lens = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
+    qsl = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * (S + 1)));
+    token_ids = static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * S));
+    if (has_idx) gdn_state_idx =
+        static_cast<int32_t*>(bk.AllocPinned(sizeof(int32_t) * idx));
+    ready = true;
+  }
+};
+
+// Dedicated pool for the Option A PERSISTENT decode-graph device inputs (s.dev) and
+// the persistent cos|sin cache. These are RETAINED across steps, so drawing them
+// from the main scratch Pool() would pop-and-hold a block out of a size-class the
+// captured forward's own scratch then needs — an empty free list there is a
+// cudaMalloc mid-capture (aborts capture). Isolating them in their own pool leaves
+// the main Pool() exactly as the eager pre-warm step left it, so every allocation
+// the captured region makes is a pool HIT. DBuf remembers its owning pool, so these
+// buffers return here on slot reset. Single device per process (ResolveDevicePool
+// Policy), so a static instance is safe.
+static DevicePool& PersistentDecodeInputPool() {
+  static DevicePool p;
+  return p;
+}
+
+// Option A per-step input staging: copy the slot's refreshed host inputs into its
+// pinned buffers (host memcpy), then enqueue the true-async H2D pinned->persistent
+// device buffers on the main queue. This is the H2D moved OUT of the captured replay.
+// The caller records the input-staged event immediately after, so the next same-slot
+// Refresh waits only this tiny copy, not the GPU tail. Templated because the two
+// decode-graph drivers nest their own SizeSlot with identical field names.
 template <class Slot>
-static void MaybePoisonHostInputs(bool poison, Slot& s) {
-  if (!poison) return;
-  std::fill(s.token_ids.begin(), s.token_ids.end(), 0);
-  std::fill(s.positions.begin(), s.positions.end(), 0);
-  std::fill(s.attn_meta.slot_mapping.begin(), s.attn_meta.slot_mapping.end(), 0);
-  std::fill(s.attn_meta.seq_lens.begin(), s.attn_meta.seq_lens.end(), 0);
+static void StageStepInputs(Dev d, Slot& s) {
+  PinnedStepInputs& pin = s.pin;
+  StepDevInputs& dev = *s.dev;
+  const int64_t S = pin.S, cols = pin.cols;
+  std::memcpy(pin.positions, s.positions.data(), sizeof(int32_t) * S);
+  std::memcpy(pin.slot_mapping, s.attn_meta.slot_mapping.data(), sizeof(int64_t) * S);
+  std::memcpy(pin.block_table, s.attn_meta.block_table_tensor.data(),
+              sizeof(int32_t) * S * cols);
+  std::memcpy(pin.seq_lens, s.attn_meta.seq_lens.data(), sizeof(int32_t) * S);
+  std::memcpy(pin.qsl, s.attn_meta.query_start_loc.data(), sizeof(int32_t) * (S + 1));
+  std::memcpy(pin.token_ids, s.token_ids.data(), sizeof(int32_t) * S);
+  if (pin.has_idx && dev.has_gdn_idx &&
+      s.gdn_meta.non_spec_state_indices_tensor.has_value())
+    std::memcpy(pin.gdn_state_idx,
+                s.gdn_meta.non_spec_state_indices_tensor->data(),
+                sizeof(int32_t) * pin.idx);
+  d.b.Copy(d.q, dev.positions.ptr(), pin.positions, sizeof(int32_t) * S);
+  d.b.Copy(d.q, dev.slot_mapping.ptr(), pin.slot_mapping, sizeof(int64_t) * S);
+  d.b.Copy(d.q, dev.block_table.ptr(), pin.block_table, sizeof(int32_t) * S * cols);
+  d.b.Copy(d.q, dev.seq_lens.ptr(), pin.seq_lens, sizeof(int32_t) * S);
+  d.b.Copy(d.q, dev.query_start_loc.ptr(), pin.qsl, sizeof(int32_t) * (S + 1));
+  if (pin.has_idx && dev.has_gdn_idx)
+    d.b.Copy(d.q, dev.gdn_state_idx.ptr(), pin.gdn_state_idx,
+             sizeof(int32_t) * pin.idx);
+}
+
+// Test-only (VT_ASYNC_EXECUTOR_POISON): immediately AFTER StageStepInputs enqueued the
+// async H2D and the input-staged event was recorded, overwrite the PINNED source
+// WITHOUT syncing. A true-async DMA reads the corrupted source, so s.dev — and the
+// replay that reads it — see garbage: the DETERMINISTIC RED proving the input-staged
+// event is load-bearing (a Refresh that ran ahead of that event would do exactly
+// this). Pageable staging is host-synchronous and could not race, which is why the
+// #36 poison never reproduced. Never set in production (gated by an Impl `poison`
+// member read once at construction, so the default hot path pays no getenv).
+template <class Slot>
+static void MaybePoisonStagedInputs(bool poison, Slot& s) {
+  if (!poison || !s.pin.ready) return;
+  PinnedStepInputs& pin = s.pin;
+  std::fill(pin.positions, pin.positions + pin.S, 0);
+  std::fill(pin.slot_mapping, pin.slot_mapping + pin.S, 0);
+  std::fill(pin.seq_lens, pin.seq_lens + pin.S, 0);
+  std::fill(pin.token_ids, pin.token_ids + pin.S, 0);
 }
 
 struct Qwen3_5DecodeGraph::Impl {
@@ -7567,11 +7718,19 @@ struct Qwen3_5DecodeGraph::Impl {
     bool captured = false;
     bool warm = false;
     int64_t replays = 0;
-    // VT_ASYNC_EXECUTOR parity-ring reuse guard: recorded on the main queue after
-    // this slot's replay, host-waited before its next Refresh so the replay's baked
-    // H2D of the persistent host inputs can never race that overwrite (hazard-C).
-    // Null-handle (unused) unless the double-buffer is on. Blocking-sync flavor.
+    // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
+    // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
+    // host-waited before this slot's next Refresh — so the wait costs only the tiny
+    // staging copy, never the GPU tail (the c16/c32 unlock). Blocking-sync flavor;
+    // null-handle (unused) unless the double-buffer is on.
     vt::Event reuse_event{};
+    // Option A persistent per-step device inputs the captured graph reads (positions/
+    // slot_mapping/block_table/seq_lens/qsl/gdn_state_idx + stubs + cos|sin). Built
+    // once at capture; the H2D is staged into these OUTSIDE the captured region each
+    // step. Null (unused) unless the double-buffer is on.
+    std::unique_ptr<StepDevInputs> dev;
+    // Option A pinned host staging (the true-async H2D source). Sized once at capture.
+    PinnedStepInputs pin;
 
     // In-place refresh of the persistent host inputs (fixed addresses once the
     // slot's vectors reach size S) so a replay re-reads this step's tokens.
@@ -7691,12 +7850,16 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   Impl::SizeSlot& s = ring.slot[dbuf ? ring.next : 0];
   if (dbuf) {
     ring.next ^= 1;
+    // Wait this slot's input-staged event (2 steps back) before Refresh overwrites its
+    // host inputs / StageStepInputs re-fills its pinned buffers — the staged copy that
+    // read them must be done. It is a tiny copy at the FRONT of a 2-steps-back replay,
+    // so this is effectively free (never the GPU tail; that is the Option A unlock).
     if (s.reuse_event.handle != nullptr) b.SynchronizeEvent(s.reuse_event);
   }
-  // Record this slot's reuse event on the main queue after its replay/forward is
-  // enqueued, so the next same-slot Refresh host-waits until the replay's baked
-  // H2D of these host buffers has completed. No-op unless the double-buffer is on.
-  const auto record_reuse = [&] {
+  // Record this slot's input-staged event on the main queue right AFTER the H2D stage
+  // (Option A), so the next same-slot Refresh waits only that tiny copy. No-op unless
+  // the double-buffer is on.
+  const auto record_staged = [&] {
     if (!dbuf) return;
     if (s.reuse_event.handle == nullptr)
       s.reuse_event = b.CreateEvent(/*blocking=*/true);
@@ -7710,8 +7873,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
                     pam, pgm);
 
   // A block-table column-count change reallocates the persistent block_table (the
-  // captured H2D copy's source address moves) → invalidate this slot's graph and
-  // re-warm/re-capture.
+  // staged/baked H2D dest shape moves) → invalidate this slot's graph and persistent
+  // device inputs, and re-warm/re-capture.
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
   s.Refresh(ptok, ppos, pam, pgm);
   s.fa_cols = cols;
@@ -7720,15 +7883,21 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     s.graph = nullptr;
     s.captured = false;
     s.warm = false;
+    s.dev.reset();
+    s.pin.Free();
   }
 
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
-  // persistent hidden buffer, then relaunch the captured layer region.
+  // persistent hidden buffer, stage this step's inputs into the persistent device
+  // buffers (Option A: H2D out of the captured region), then relaunch the graph.
   if (s.captured) {
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    if (dbuf) {
+      StageStepInputs(d, s);
+      record_staged();
+      MaybePoisonStagedInputs(impl_->poison, s);
+    }
     b.ReplayGraph(impl_->queue, s.graph);
-    record_reuse();
-    MaybePoisonHostInputs(impl_->poison, s);
     ++s.replays;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -7751,18 +7920,46 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       // copies. Alloc+free forces the (out-of-capture) growth; the block returns to
       // the free list for the capture's own allocation to hit.
       { DBuf pregrow(d, DType::kF32, std::vector<int64_t>{S, vocab}); }
+      // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
+      // the capture. BuildStepDevInputs fills s.dev from the refreshed host vectors so
+      // the capture step reads correct inputs; the persistent cos|sin (fused-preamble
+      // arch) is allocated + filled here (pre-capture) and only RE-FILLED inside the
+      // captured region (FillAttnCosSin), so nothing allocates during capture. These
+      // RETAINED buffers draw from a DEDICATED pool (not the main scratch Pool()) so
+      // they never pop-and-hold a block the captured forward's scratch then needs.
+      const int64_t gdn_state_slots =
+          gdn_state.empty() ? 0 : gdn_state.front().ssm_state.shape[0];
+      const bool fp4_attn = [&] {
+        for (const auto& l : impl_->weights.layers)
+          if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
+        return false;
+      }();
+      {
+        ActivePoolScope persistent_scope(&PersistentDecodeInputPool());
+        s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(
+            d, s.positions, s.attn_meta, s.gdn_meta, gdn_state_slots));
+        MaybeBuildAttnCosSin(d, *s.dev, impl_->config, S, fp4_attn);
+      }
+      const bool has_idx = s.dev->has_gdn_idx &&
+                           s.gdn_meta.non_spec_state_indices_tensor.has_value();
+      const int64_t idx =
+          has_idx ? static_cast<int64_t>(
+                        s.gdn_meta.non_spec_state_indices_tensor->size())
+                  : 0;
+      s.pin.Alloc(b, S, cols, idx, has_idx);
     }
     EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
     DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                             s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                            impl_->config);
+                            impl_->config, {}, nullptr, nullptr, nullptr,
+                            dbuf ? s.dev.get() : nullptr);
     s.graph = b.EndCaptureGraph(impl_->queue);
     s.logits = std::make_unique<DBuf>(std::move(lg));
     s.captured = true;
     impl_->any_captured = true;
     b.ReplayGraph(impl_->queue, s.graph);
-    record_reuse();
+    record_staged();
     s.replays = 1;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -7778,7 +7975,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
                           attn_kv, gdn_state, impl_->weights, impl_->config);
   s.warm = true;
   s.captured = false;
-  record_reuse();
+  record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);
   if (fl.rows != B) {
@@ -7839,11 +8036,19 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     bool captured = false;
     bool warm = false;
     int64_t replays = 0;
-    // VT_ASYNC_EXECUTOR parity-ring reuse guard: recorded on the main queue after
-    // this slot's replay, host-waited before its next Refresh so the replay's baked
-    // H2D of the persistent host inputs can never race that overwrite (hazard-C).
-    // Null-handle (unused) unless the double-buffer is on. Blocking-sync flavor.
+    // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
+    // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
+    // host-waited before this slot's next Refresh — so the wait costs only the tiny
+    // staging copy, never the GPU tail (the c16/c32 unlock). Blocking-sync flavor;
+    // null-handle (unused) unless the double-buffer is on.
     vt::Event reuse_event{};
+    // Option A persistent per-step device inputs the captured graph reads (positions/
+    // slot_mapping/block_table/seq_lens/qsl/gdn_state_idx + stubs + cos|sin). Built
+    // once at capture; the H2D is staged into these OUTSIDE the captured region each
+    // step. Null (unused) unless the double-buffer is on.
+    std::unique_ptr<StepDevInputs> dev;
+    // Option A pinned host staging (the true-async H2D source). Sized once at capture.
+    PinnedStepInputs pin;
 
     // In-place refresh of the persistent host inputs (fixed addresses once the
     // slot's vectors reach size S) so a replay re-reads this step's tokens.
@@ -7961,12 +8166,15 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   Impl::SizeSlot& s = ring.slot[dbuf ? ring.next : 0];
   if (dbuf) {
     ring.next ^= 1;
+    // Wait this slot's input-staged event (2 steps back) before Refresh/StageStepInputs
+    // touch its host + pinned inputs — a tiny copy at the front of a 2-steps-back
+    // replay, never the GPU tail (the Option A c16/c32 unlock).
     if (s.reuse_event.handle != nullptr) b.SynchronizeEvent(s.reuse_event);
   }
-  // Record this slot's reuse event on the main queue after its replay/forward is
-  // enqueued, so the next same-slot Refresh host-waits until the replay's baked
-  // H2D of these host buffers has completed. No-op unless the double-buffer is on.
-  const auto record_reuse = [&] {
+  // Record this slot's input-staged event on the main queue right AFTER the H2D stage
+  // (Option A), so the next same-slot Refresh waits only that tiny copy. No-op unless
+  // the double-buffer is on.
+  const auto record_staged = [&] {
     if (!dbuf) return;
     if (s.reuse_event.handle == nullptr)
       s.reuse_event = b.CreateEvent(/*blocking=*/true);
@@ -7980,7 +8188,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                     pam, pgm);
 
   // A block-table column-count change reallocates the persistent block_table (the
-  // captured H2D copy's source address moves) → invalidate this slot's graph.
+  // staged/baked H2D dest shape moves) → invalidate this slot's graph + device inputs.
   const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
   s.Refresh(ptok, ppos, pam, pgm);
   s.fa_cols = cols;
@@ -7989,20 +8197,26 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     s.graph = nullptr;
     s.captured = false;
     s.warm = false;
+    s.dev.reset();
+    s.pin.Free();
   }
 
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
-  // persistent hidden buffer, then relaunch the captured dense layer region.
+  // persistent hidden buffer, stage this step's inputs into the persistent device
+  // buffers (Option A: H2D out of the captured region), then relaunch the graph.
   if (s.captured) {
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    if (dbuf) {
+      StageStepInputs(d, s);
+      record_staged();
+      MaybePoisonStagedInputs(impl_->poison, s);
+    }
 #ifdef VT_BENCH_PROFILE_CONTROL
     vt::cuda::MarkCudaGraphReplayProfilerEligible(
         s.graph, static_cast<uint32_t>(B), static_cast<uint32_t>(S),
         static_cast<uint64_t>(s.replays));
 #endif
     b.ReplayGraph(impl_->queue, s.graph);
-    record_reuse();
-    MaybePoisonHostInputs(impl_->poison, s);
     ++s.replays;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -8024,12 +8238,39 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       // replay sequentially on one stream, so only the retained logits needs two
       // live copies.
       { DBuf pregrow(d, DType::kF32, std::vector<int64_t>{S, vocab}); }
+      // Option A: build this slot's PERSISTENT device inputs + pinned staging OUTSIDE
+      // the capture (see the 35B driver). The dense fused-preamble arch (27B W4A4)
+      // allocates + fills the persistent cos|sin here (pre-capture); the captured
+      // region only RE-FILLS it (FillAttnCosSin), so nothing allocates during capture.
+      // The RETAINED buffers draw from a DEDICATED pool (not the main scratch Pool())
+      // so they never pop-and-hold a block the captured forward's scratch then needs.
+      const int64_t gdn_state_slots =
+          gdn_state.empty() ? 0 : gdn_state.front().ssm_state.shape[0];
+      const bool fp4_attn = [&] {
+        for (const auto& l : impl_->weights.layers)
+          if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
+        return false;
+      }();
+      {
+        ActivePoolScope persistent_scope(&PersistentDecodeInputPool());
+        s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(
+            d, s.positions, s.attn_meta, s.gdn_meta, gdn_state_slots));
+        MaybeBuildAttnCosSin(d, *s.dev, impl_->config, S, fp4_attn);
+      }
+      const bool has_idx = s.dev->has_gdn_idx &&
+                           s.gdn_meta.non_spec_state_indices_tensor.has_value();
+      const int64_t idx =
+          has_idx ? static_cast<int64_t>(
+                        s.gdn_meta.non_spec_state_indices_tensor->size())
+                  : 0;
+      s.pin.Alloc(b, S, cols, idx, has_idx);
     }
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
     DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                                  s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                                 impl_->config);
+                                 impl_->config, {}, nullptr, nullptr, nullptr,
+                                 nullptr, dbuf ? s.dev.get() : nullptr);
     s.graph = b.EndCaptureGraph(impl_->queue);
     s.logits = std::make_unique<DBuf>(std::move(lg));
     s.captured = true;
@@ -8039,7 +8280,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                            "for padded size S=%lld (real B=%lld)\n",
                    static_cast<long long>(S), static_cast<long long>(B));
     b.ReplayGraph(impl_->queue, s.graph);
-    record_reuse();
+    record_staged();
     s.replays = 1;
     ++impl_->replays;
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -8056,7 +8297,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                                impl_->config);
   s.warm = true;
   s.captured = false;
-  record_reuse();
+  record_staged();
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
   ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);
   if (fl.rows != B) {
