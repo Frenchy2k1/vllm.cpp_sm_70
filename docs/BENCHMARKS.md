@@ -252,6 +252,7 @@ built on it rather than keeping the flattering one.
 | DFlash speculative decode | Below vLLM throughput | bf16 acceptance floor ~0.85x |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
+| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | W0 spike complete, no e2e yet | Capture the greedy oracle golden on GB10 (spec §8 recipe; FITS 0.77x pool), then token-exact + speed vs vLLM |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |

@@ -175,6 +175,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Gap | State | Detail |
 |---|---|---|
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | Spiked (W0 complete) | Full dedicated spike landed; FITS one GB10 (e2e-gateable). Pending the KDA device kernel + NoPE-MLA branch + hybrid schedule/loader; KDA host refs + MLA + sigmoid MoE already landed |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |
