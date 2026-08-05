@@ -18,7 +18,7 @@ see [docs/FEATURES.md](FEATURES.md).
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
-| **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | ahead at c16/c32, behind at c1 to c8 | identical |
+| **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
 | **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | prefill **1.18x ahead**, decode tie, memory parity | byte-identical |
@@ -36,7 +36,7 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Model | Quant | vLLM pin | Axes passing | Disposition |
 |---|---|---|---:|---|
 | Qwen3.6-27B | NVFP4 | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality |
-| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 70/124 | c4-c32 win, c1/c2 residual 2-4%; the 2026-08-05 re-grid hit an async-serving heap corruption, fixed (`1ea26427`); staged re-run awaits dgx recovery (box down mid-run) |
+| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | fresh 3-rep grid 2026-08-05 @`1ea26427`: tput 0.93-1.03x (c4 wins), TTFT 0.93-0.98x; c1 closed 0.82→0.98; c16 0.93x is NEW (was a win); suspect the async-UAF drain sync |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
 | Qwen3.5-4B | bf16 direct-load | 0.24.0 | 5/8 | Throughput 0.98x, TTFT and memory win |
 
@@ -64,14 +64,16 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|---:|
-| **vllm.cpp** tok/s | 491.5 | 767.7 | 1236.4 | 1855.1 | **2489.1** | **3030.5** |
-| vLLM tok/s | 601.9 | 904.7 | 1366.8 | 1923.2 | 2464.9 | 2993.0 |
-| **Ratio** | 0.817x | 0.849x | 0.905x | 0.965x | **1.010x** | **1.013x** |
-| Mean TPOT | 0.813x | 0.852x | 0.929x | **1.022x** | **1.103x** | **1.097x** |
+| **vllm.cpp** tok/s | 593.7 | 882.9 | **1417.6** | 1845.2 | 2327.4 | 2937.8 |
+| vLLM tok/s | 607.4 | 911.9 | 1374.4 | 1922.1 | 2497.2 | 3012.9 |
+| **Ratio** | 0.977x | 0.964x | **1.025x** | 0.964x | 0.932x | 0.971x |
+| Mean TPOT | 0.975x | 0.966x | **1.036x** | 0.976x | 0.928x | 0.988x |
+| Mean TTFT | 0.980x | 0.947x | 0.976x | 0.939x | 0.933x | 0.929x |
 
-All four memory axes beat vLLM. The open gaps are low-batch MoE decode (the
-Marlin grouped GEMM is inefficient at batch 1 and scales to winning by c16) and
-prefill TTFT at 0.79x to 0.86x across the board.
+Fresh 3-rep grid 2026-08-05 at `1ea26427` (post async-UAF fix), medians, SACRED
+gate passed pre-bench. The prior low-batch gap closed hard (c1 0.817x→0.977x);
+the open mass is now TTFT 0.93-0.98x everywhere and a NEW c16 dip to 0.932x
+(prior binding won c16); top suspect is the async-UAF drain sync, measured next.
 
 ### DeepSeek-V2-Lite (MLA)
 
@@ -259,8 +261,8 @@ built on it rather than keeping the flattering one.
 
 | Track | Status | Next gate |
 |---|---|---|
-| 35B prefill TTFT | 0.79x to 0.86x at every concurrency | Portable fusion of the norm/quant/act/combine glue |
-| 35B low-batch MoE decode | c1 TPOT 0.73x, wins by c16 | Attribute and close the batch-1 grouped GEMM |
+| 35B prefill TTFT | 0.93x to 0.98x at every concurrency (2026-08-05) | Attribute the residual, then close |
+| 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 now 0.93x | A/B the async-UAF drain sync at c16 |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
 | Laguna-XS NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
