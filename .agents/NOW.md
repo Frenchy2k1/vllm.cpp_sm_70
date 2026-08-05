@@ -9,8 +9,7 @@ and the benchmark record. Budget: 100 lines.
 
 ## Live claims
 
-Working head: `origin/main` (the old `laguna-s21-w7-speed-profile` branch is
-fully merged/superseded; work from main).
+Working head: `origin/main`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
@@ -20,7 +19,7 @@ fully merged/superseded; work from main).
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md invocation-parity checklist being landed (worktree agent) | Review + merge; CUDA build-verify the `kGemvHeuristicAlgos` constant refactor on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
 | Protocol substrate repair | BENCHMARKS.md converted to scoreboard (landed); STATUS.md budget + record-era roll still open | Items below |
-| Kimi-Linear-48B W0 spike | **DONE** (`CLAIM-KIMI-LINEAR-W0`, [kimi-linear.md](specs/kimi-linear.md)): row stays SPIKE (claimed), e2e-gateable (FITS one GB10); NET-NEW = KDA device kernel + NoPE-MLA + hybrid schedule/loader | W1 registry+config (CPU); GPU golden recipe ready (§8) |
+| Kimi-Linear-48B W1 | **LANDED** (`CLAIM-KIMI-LINEAR-W1`): registry+config+loader+het-KV+refuse forward; gates 9/9+24/24, stays SPIKE | W3-W6 forward, then W7 gate (§8) |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
 (b357a4f6, fp4 opt-in 141-162%), laguna bf16/legacy/pipeline-gemv,

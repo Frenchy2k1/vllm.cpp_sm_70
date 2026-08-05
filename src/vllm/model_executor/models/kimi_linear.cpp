@@ -1,0 +1,83 @@
+// Kimi-Linear forward — REFUSE-by-name SKELETON (W1). The 27-layer KDA/NoPE-MLA
+// hybrid + 256-expert MoE forward composes primitives that are NOT wired in this
+// W1 lane, so both entrypoints VT_CHECK(false, ...) — a forward LOUDLY reports the
+// pending brick instead of returning a silent wrong answer, exactly like
+// deepseek_v4.cpp / kimi_k3.cpp. This TU captures the reuse-wiring plan in one
+// place and BUILDS clean on CPU; the config parse + loader name-map (this row's W1)
+// ARE unit-testable (test_kimi_linear_scaffold).
+//
+// ─── REUSE-WIRING PLAN (what the real forward composes; NOT implemented here) ──
+// Per KimiDecoderLayer (kimi_linear.py:288-378), for each of the 27 layers:
+//   1. input_layernorm (fused add+RMSNorm residual, kimi_linear.py:361-365) via the
+//      shared vt::FusedChain glue seam.
+//   2. self_attn dispatch by is_kda_layer (kimi_linear.py:304-326):
+//      - KDA layer (20 of 27): KimiGatedDeltaNetAttention
+//        (kimi_gdn_linear_attn.py:85). REUSES our landed GDN state/conv/chunked-
+//        delta/WY machinery (src/vt/cuda/cuda_gdn.cu, gdn_attn.cpp) + the KDA host
+//        refs (kimi_kda.{h,cpp}, task #173) as the device-kernel oracle. NET-NEW
+//        device kernel = spike W3.
+//      - MLA layer (7 of 27): KimiMLAAttention (kimi_linear.py:180) at the NoPE
+//        Kimi geometry (kv_lora 512 / qk_nope 128 / qk_rope 64 / v 128, q_lora
+//        null, rotary_emb=None). REUSES our landed DeepSeek-MLA block
+//        (src/vllm/model_executor/layers/attention/mla_attention.cpp) with RoPE
+//        SKIPPED (spike W4 NoPE branch).
+//   3. post_attention_layernorm (kimi_linear.py:376).
+//   4. mlp dispatch (kimi_linear.py:328-347): MoE (KimiMoE, :104) with the
+//      DeepSeek-style sigmoid noaux_tc router + e_score_correction_bias + 1 shared
+//      expert, 256 experts / top-8 / routed_scaling 2.446 — REUSES deepseek_v2.cpp
+//      RunMoeBlock + the merged-GEMM MergedGemmGroup seam (spike W5); OR dense
+//      KimiMLP for layer 0 (first_k_dense_replace=1).
+// Final: norm -> untied lm_head -> logits (kimi_linear.py:457, 635-639), routed
+// through ModelRegistry::Forward (born-on-the-runner, spike W6). Grounding:
+// kimi_linear.py:426-458.
+#include "vllm/model_executor/models/kimi_linear.h"
+
+#include <cstdint>
+#include <vector>
+
+#include "vt/dtype.h"
+
+namespace vllm {
+
+namespace {
+constexpr const char* kPending =
+    "KimiLinear forward is not yet implemented — the 27-layer KDA/NoPE-MLA hybrid "
+    "+ 256-expert MoE forward is a REFUSE-by-name skeleton (W1 landed registry + "
+    "config + loader name-map). Its assembly is the named residual: the KDA device "
+    "kernel (W3), the NoPE-MLA routing (W4), the sigmoid-noaux_tc MoE (W5), and the "
+    "het-KV born-on-the-runner forward (W6). See .agents/specs/kimi-linear.md §5.";
+}  // namespace
+
+std::vector<float> KimiLinearModel::Forward(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const v1::CommonAttentionMetadata& attn_meta,
+    const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+  (void)token_ids;
+  (void)positions;
+  (void)attn_meta;
+  (void)attn_kv;
+  (void)weights;
+  (void)queue;
+  (void)logits_indices;
+  VT_CHECK(false, kPending);
+  return {};
+}
+
+ForwardLogits KimiLinearModel::ForwardDevice(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const v1::CommonAttentionMetadata& attn_meta,
+    const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+  (void)token_ids;
+  (void)positions;
+  (void)attn_meta;
+  (void)attn_kv;
+  (void)weights;
+  (void)queue;
+  (void)logits_indices;
+  VT_CHECK(false, kPending);
+  return {};
+}
+
+}  // namespace vllm
