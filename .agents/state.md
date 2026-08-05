@@ -36559,3 +36559,122 @@ decode). `VT_KIMI_DEVICE_COMPUTE` STAYS OFF (parity-enablers: a near-tie is not 
 `ACTIVE`. Residuals now precisely: (a) STRICT token-exactness (device islands + bf16 stream), (b) the
 paged het-KV incremental decode, (c) speed.
 
+
+## ROW-SERVE-ASYNC-DENSE-MIRROR: ported the #31 async device-mirror to the classic dense family (Qwen3ForCausalLM); RED-first async-serving gate; W4 MXFP4 bench in flight
+<!-- state: 2026-08-07T05:00 -->
+
+Closed the classic-dense half of the #31 P0 (the residual named by QUANT-CT-MXFP4
+2026-08-07T03:00): classic dense `Qwen3ForCausalLM` (qwen3.cpp) lacked the async
+device-token-ids mirror the gate models (qwen3_5) already had, so on the depth-2
+AsyncLLM serving path its batch-1 greedy decode nondeterministically degenerated into
+token-0 garbage. Quant-independent (surfaced by the MXFP4 campaign; hits bf16/NVFP4
+classic dense too).
+
+MECHANISM (file:line, identical to the 27B-dense template qwen3_5.cpp:6737/6746).
+On async serving the sampled token is NOT written to token_ids_cpu synchronously; the
+runner's device combine splices each decode row's real token into the DEVICE input-ids
+on the main queue while host `token_ids` stays stale (runner.cpp:1159 publishes the
+pointer as `ModelForwardInput::device_token_ids`, non-null only on the async CUDA
+path). The SHARED pure-dense embed `EmbedInto` (qwen3.cpp) uploaded the stale host
+vector (`DBuf dids(d, kI32, {T}, token_ids.data())`) — racing the combine's device
+write (unsynchronized device-write/host-read) → token-0 degeneration when the host
+read wins. Note the classic-dense decode graph is default-OFF, so the racing path is
+the EAGER `ForwardBody`→`EmbedInto`, not only the decode graph.
+
+FIX (two edits, byte-identical when the mirror is off).
+(1) qwen3.cpp: added `ApplyDeviceTokenIdsOverride(Dev,DBuf&,int64_t)` (verbatim analog
+of qwen3_5.cpp:5904) and called it in `EmbedInto` right after the host-`token_ids`
+DBuf construction — overwrites the real prefix with the device combine's ids via a
+main-queue-ordered `d.b.Copy`, so the embed never does the racing host read. The
+`detail::DeviceTokenIds` seam (qwen3_5_internal.h:175-193, thread_local defined in
+qwen3_5.cpp:344) is shared across TUs; qwen3.cpp now includes that header.
+(2) qwen3_dense.cpp: `ForwardQwen3ForCausalLM` establishes
+`detail::DeviceTokenIdsScope(input.device_token_ids, token_ids.size())` at the top
+(mirrors qwen3_5_dense.cpp:118), publishing the override for the whole forward (eager
+Forward/ForwardDevice AND the decode-graph replay, all of which route through the
+shared EmbedInto). Consume-on-first-use; null everywhere except the async CUDA runner.
+
+GATE (RED-first). New `tests/parity/test_qwen3_dense_async_serving.cpp` (registered in
+tests/CMakeLists.txt), the classic-dense sibling of test_qwen36_async_serving. Drives
+`LoadedEngine::async_engine()` (depth-2 AsyncLLM, batch-1 x5 reps + N=4 concurrency)
+and requires every async continuation to reproduce the IN-PROCESS SYNC engine
+continuation token-for-token. The sync engine is the race-free, drift-proof,
+near-tie-proof anchor (these bf16 dense checkpoints are near-tie, so a committed strict
+golden is ill-posed; async and sync run the IDENTICAL per-step device forward → equal
+token-for-token with the fix). Qwen3-0.6B (primary vehicle) + Qwen3-4B (bigger
+confirmation), checkpoint-gated + dgx-only. POLARITY: VT_ASYNC_DEVICE_MIRROR=0 => RED
+(EmbedInto races), default => GREEN (async==sync).
+
+CPU GATES (mudler-ubuntu-box, Release -Werror clean): full library + new test build
+0 errors; test compiles/links/skips (checkpoints absent). Regression suites GREEN:
+test_input_batch 183, test_combine_tokens 14, test_runner 323, test_engine_core_proc
+576, test_async_llm 309. test_llm_engine is the documented flaky suite (starves >120s
+on a loaded box; my diff touches only qwen3.cpp/qwen3_dense.cpp model TUs it does not
+exercise on CPU) — cross-check on dgx.
+
+RESIDUALS (named, NOT fixed this pass). The 3 sibling registries sharing this driver —
+InternLM2, Mistral, Llama (all "== Qwen3DenseModel", route through the now-fixed
+EmbedInto) — get the fixed CONSUMER for free but still lack the one-line
+`DeviceTokenIdsScope` PRODUCER, so they stay byte-identical to today (override null on
+their path) and remain exposed on the async CUDA path; each needs exactly the
+qwen3_dense.cpp scope line + the qwen3_5_internal.h include. Own-embed decode models
+(deepseek_v2/v4, gemma2/3/4, glm4*, granite, kimi*, laguna, minicpm*, olmo2, opt,
+phi*, qwen3_moe, qwen3_vl, stablelm, commandr) need the same two-part seam (consumer +
+scope); track via [[decode-framework-routing-audit]] (qwen3_vl already flagged
+off-framework).
+
+OWED ON DGX (this row): (1) the async gate RED→GREEN + SACRED dense gates
+(test_qwen3_paged_engine 0.6B/4B) + ignore_eos bracket + memcheck; (2) THE MXFP4 W4
+bench — tools/bench/online_gate.py c1..c8 x3, single load/arm, ours vs oracle on
+Yi30/Qwen3-8B-MXFP4, oracle arm VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel;
+(3) the p3 near-tie distributional verdict (oracle K-run set) while the oracle is
+loaded. Branch `row/SERVE-ASYNC-DENSE-MIRROR`.
+
+## ROW-SERVE-ASYNC-DENSE-MIRROR: dgx GB10 verification — async gate RED→GREEN (0.6B+4B) + SACRED no-regression + memcheck + MXFP4 default-config e2e + p3 near-tie RATIFIED
+<!-- state: 2026-08-07T07:00 -->
+
+Ran the full dgx GB10 campaign for `f9c969ae` (git-archive → /dev/shm build, CUDA
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, Release, nvcc 13.0; both flock locks
+held per run, tmux + done-markers, free-g 98-100 GiB throughout, local-ai-worker
+parked). All correctness proofs GREEN.
+
+ASYNC GATE RED→GREEN (same binary, `VT_ASYNC_DEVICE_MIRROR` env-toggled):
+- 0.6B GREEN (default) 41/41 — every async batch-1 rep + concurrent request reproduces
+  the SYNC anchor (" capital of Italy is Rome. ... Beijing. The capital of Japan").
+- 0.6B RED (`=0`) FAILURE, 3 CHECKs — concurrency requests degenerate into
+  " capital of Italy the Germany is!!!!!!!!!!" (token-0 garbage). P0 reproduced.
+- 4B GREEN 41/41; 4B RED FAILURE 3 CHECKs. Both models.
+
+SACRED NO-REGRESSION: `test_qwen3_paged_engine` 0.6B+4B 184/184, 16/16 prompts each
+(11/16 strict + 5/16 near-tie, max gap 0.125/0.25 nats, 0 forward-divergent) — my
+change is byte-neutral on the sync path (the mirror override is null there), confirmed.
+
+MEMCHECK: compute-sanitizer memcheck on the 0.6B async gate GREEN arm = ERROR SUMMARY
+0 errors, 41/41 assertions under the sanitizer.
+
+MXFP4 Yi30/Qwen3-8B-MXFP4 (a classic dense `Qwen3ForCausalLM`) DEFAULT-config e2e
+(vllm-cli, async ON + fix, greedy 48 tok): p0 " Paris. What is the capital of Italy?...",
+p1 " 4. Q: What is 3+3? A: 6...", p3 fibonacci = TOKEN-EXACT vs golden; p2 story
+coherent " there lived a young girl named Lily..." (near-tie). Same binary with
+`VT_ASYNC_DEVICE_MIRROR=0` DEGENERATES (" Paris. What I I I What What ... !!!!!!") —
+exactly the QUANT-CT-MXFP4 W3 async-default degeneration, now CLOSED by the fix.
+
+p3/p2 NEAR-TIE RATIFIED (oracle, `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`
++ ninja/nvcc on PATH — the DGX non-interactive quirk): oracle re-reproduces the 4-prompt
+golden today (Marlin W4A16); its story greedy is deterministic (K=8 singleton
+" there was a wise old man"). Teacher-forcing the oracle on OUR story sequence: our
+token is the oracle's OWN argmax at EVERY continuation position (max gap 0.0000 nats,
+no divergence in the 0.5-nat band) — the free-run divergence is the oracle contradicting
+itself at a genuine bf16 tie (prefill-vs-decode), the documented near-tie regime. VERDICT
+NEAR-TIE-RATIFIED.
+
+RESIDUAL (owed): the W4 THROUGHPUT bench (online_gate.py c1..c8x3 ours vs oracle) is
+NOT done — `online_gate.py` MODEL_REVISIONS only carries the "27"/"35" NVFP4 gate-model
+keys; the fingerprinted harness (`dgx-online-serving.sh`, per-model corpora +
+`record-oracle` via a paged_engine test binary) has no Yi30/8B entry. Retargeting needs
+a MODEL_REVISIONS/REPOSITORIES entry + corpus generation + oracle recording + sizing.
+The fix UNBLOCKS the default-config number (the async-default degeneration no longer
+forces `VT_ASYNC_SCHED=0`); the oracle is proven to run the model today. Plus the
+sibling scope one-liner (InternLM2/Mistral/Llama). dgx build tree persists at
+`dgx:/dev/shm/serve-async-dense`.

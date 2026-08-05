@@ -102,7 +102,7 @@ and coherent. The missing gate now exists, `test_qwen36_async_serving` (depth-2
 AsyncLLM, batch-1 + concurrency, token-exact vs the SACRED oracle): RED on `=0`, GREEN
 on the default. c16 re-checked on the default: 2312.9/2303.9/2294.4 (median
 **2303.9**), c32 2942.7 (no regression). Root cause + file:line in the benchmark
-record. The intake-drain lever likewise measured NEUTRAL (2026-08-06, `VT_INTAKE_DRAIN` A/B 3+3 reps): admitting during the forward wait collapses intake -91% but shifts it into queued, arrival-to-scheduled invariant, so the recorded INTAKE term is an attribution boundary over a GPU-bound prefill wait, not reducible; lever reverted, byte-exact `VT_LOOP_TRACE` probe kept.
+record. The same P0 hit classic dense `Qwen3ForCausalLM` (quant-independent), fixed by `ROW-SERVE-ASYNC-DENSE-MIRROR` (see the MXFP4 Qwen3-8B row). The intake-drain lever likewise measured NEUTRAL (2026-08-06, `VT_INTAKE_DRAIN` A/B 3+3 reps): admitting during the forward wait collapses intake -91% but shifts it into queued, arrival-to-scheduled invariant, so the recorded INTAKE term is an attribution boundary over a GPU-bound prefill wait, not reducible; lever reverted, byte-exact `VT_LOOP_TRACE` probe kept.
 
 ### DeepSeek-V2-Lite (MLA)
 
@@ -307,7 +307,7 @@ built on it rather than keeping the flattering one.
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
 | Kimi-Linear-48B-A3B (KDA+MLA+MoE) | Full-model GB10 e2e RUNS (bf16-resident §13), NEAR-TIE 106/128, pool math CLOSES; default OFF | Full model RUNS on GB10 (bf16-resident, RSS peak 1.7 GiB, min-avail 21 GiB, no OOM). Token NEAR-TIE 106/128 (6/8 prompts exact, numerics vs deterministic oracle). 1.59 tok/s. Detail: spec §13 |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
-| MXFP4 Qwen3-8B (W4A16 Marlin) | Compute proven (#38); e2e 3/4 token-exact async-off | W4 bench after the classic-dense async-mirror fix; oracle arm needs `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel` |
+| MXFP4 Qwen3-8B (W4A16 Marlin) | Compute proven (#38); **DEFAULT-config (async ON) e2e coherent + 3/4 token-exact** on dgx after `ROW-SERVE-ASYNC-DENSE-MIRROR`; degenerate without the fix | p2/p3 near-tie RATIFIED (oracle teacher-forced: max gap 0.0000 nats). W4 THROUGHPUT bench still owed: online_gate lacks a Yi30/8B key (see benchmark-record) |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
 

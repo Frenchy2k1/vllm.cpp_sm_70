@@ -949,6 +949,17 @@ target_compile_definitions(test_qwen3_paged_engine PRIVATE
 target_include_directories(test_qwen3_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# ROW-SERVE-ASYNC-DENSE-MIRROR — the classic-dense async-serving greedy gate:
+# Qwen3-0.6B/4B async batch-1 + concurrency reproduce the race-free SYNC engine
+# continuation token-for-token. RED on VT_ASYNC_DEVICE_MIRROR=0 (dense EmbedInto
+# races the combine), GREEN on the default fix (checkpoint-gated, dgx-only; skips
+# on CPU/CI when the snapshot is absent).
+vllm_cpp_add_test(test_qwen3_dense_async_serving parity/test_qwen3_dense_async_serving.cpp)
+target_compile_definitions(test_qwen3_dense_async_serving PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen3_dense_async_serving PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # ROAD-V1-D4-APC W3 — the cache-ON automatic-prefix-caching e2e gate on Qwen3-4B
 # (dense, full-attention, APC-eligible): APC-ON == APC-OFF token-exact (RED-first
 # cache-bug catch) + non-zero hit counters + vLLM K-run membership + prefill/TTFT
