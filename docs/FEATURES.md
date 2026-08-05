@@ -175,7 +175,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Gap | State | Detail |
 |---|---|---|
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | W2-W6 CPU reference forward landed (CPU) | CPU reference `Forward` composes the 27-layer hybrid (KDA/kimi_kda, NoPE-MLA, sigmoid-noaux MoE, dense), per-op gated (`test_kimi_linear_forward` 6/6·246); FITS GB10; pending the DEVICE forward + e2e golden |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | W6 born-on-runner DEVICE forward SEAM landed (CPU) | `ForwardDevice` returns device-resident logits (born-on-runner, no host download; routing+fusion green); per-op gated `test_kimi_linear_forward` 7/7·300; FITS GB10; pending the DBuf device COMPUTE + e2e golden |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |

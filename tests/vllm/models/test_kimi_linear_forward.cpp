@@ -16,6 +16,7 @@
 #include "vllm/model_executor/models/kimi_linear.h"
 #include "vllm/model_executor/models/kimi_kda.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 #include <doctest/doctest.h>
@@ -515,4 +516,76 @@ TEST_CASE("kimi-linear forward: greedy decode advances the context N tokens") {
   for (int64_t o = 0; o < V; ++o)
     if (std::fabs(l1[static_cast<size_t>(o)] - l2[static_cast<size_t>(o)]) > 1e-6f) differ = true;
   CHECK(differ);
+}
+
+// ─── (e) W6 born-on-the-runner SEAM: ForwardDevice returns DEVICE-RESIDENT logits ─
+// The runner routes the default gather_logits path to ForwardDevice; it must hand
+// the logits back on_device() (fed to the on-GPU sampler with no host download) AND
+// the composed logits must MATCH the W2 host reference. On the CPU backend the
+// pooled DBuf is a device buffer too, so on_device() holds and the CPU gate
+// exercises the exact contract the GPU will. (The device-COMPUTE lane — KDA/NoPE-MLA
+// /MoE over the paged het-KV caches — is the GPU-verify-pending W7 residual, so this
+// SEAM composes off the same host reference and the match is EXACT.)
+TEST_CASE("kimi-linear ForwardDevice: born-on-runner device-resident logits == host ref") {
+  TempFile f(BuildSt(BuildTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  const KimiLinearWeights w = LoadKimiLinearForCausalLMWeights(shards, TinyConfig());
+
+  const std::vector<int32_t> tokens = {1, 3, 0, 5};
+  const std::vector<int32_t> positions = {0, 1, 2, 3};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  std::vector<vllm::PagedKvCache> attn_kv;
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Backend& be = vt::GetBackend(q.device.type);
+
+  // Host reference (the !gather_logits path) — the correctness truth.
+  const std::vector<float> host_logits =
+      vllm::KimiLinearModel::Forward(tokens, positions, attn_meta, attn_kv, w, q, {});
+
+  // ForwardDevice (the DEFAULT gather_logits runner path).
+  const vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardDevice(
+      tokens, positions, attn_meta, attn_kv, w, q, {});
+
+  // (a) the runner-routing contract: logits stay ON-DEVICE (no host copy on .host).
+  CHECK(fl.on_device());
+  CHECK(fl.device_storage != nullptr);
+  CHECK(fl.host.empty());
+  REQUIRE(fl.rows == static_cast<int64_t>(tokens.size()));
+  REQUIRE(fl.vocab == static_cast<int64_t>(V));
+  REQUIRE(fl.device_tensor.data != nullptr);
+
+  // Download the device-resident logits and compare to the host reference — the
+  // device SEAM composes off the same reference, so the round-trip is byte-exact.
+  std::vector<float> dl(static_cast<size_t>(fl.rows) * static_cast<size_t>(fl.vocab));
+  be.Copy(q, dl.data(), fl.device_tensor.data,
+          dl.size() * sizeof(float));
+  be.Synchronize(q);
+  REQUIRE(dl.size() == host_logits.size());
+  for (size_t i = 0; i < dl.size(); ++i)
+    CHECK(dl[i] == doctest::Approx(host_logits[i]).epsilon(1e-6));
+
+  // Greedy tokens are identical (the runner argmaxes ForwardDevice's device logits).
+  for (int64_t r = 0; r < fl.rows; ++r) {
+    int32_t best_dev = 0, best_host = 0;
+    for (int64_t o = 1; o < V; ++o) {
+      if (dl[static_cast<size_t>(r * V + o)] > dl[static_cast<size_t>(r * V + best_dev)]) best_dev = static_cast<int32_t>(o);
+      if (host_logits[static_cast<size_t>(r * V + o)] > host_logits[static_cast<size_t>(r * V + best_host)]) best_host = static_cast<int32_t>(o);
+    }
+    CHECK(best_dev == best_host);
+  }
+
+  // (b) logits_indices gather-before-lm_head: selecting the last position returns
+  // exactly ONE device row == the host reference's last row (request-order return).
+  const vllm::ForwardLogits last = vllm::KimiLinearModel::ForwardDevice(
+      tokens, positions, attn_meta, attn_kv, w, q, {3});
+  CHECK(last.on_device());
+  REQUIRE(last.rows == 1);
+  REQUIRE(last.vocab == static_cast<int64_t>(V));
+  std::vector<float> lastd(static_cast<size_t>(V));
+  be.Copy(q, lastd.data(), last.device_tensor.data, lastd.size() * sizeof(float));
+  be.Synchronize(q);
+  for (int64_t o = 0; o < V; ++o)
+    CHECK(lastd[static_cast<size_t>(o)] ==
+          doctest::Approx(host_logits[3 * V + o]).epsilon(1e-6));
 }
