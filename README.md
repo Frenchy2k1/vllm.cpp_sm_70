@@ -208,8 +208,9 @@ you get on top, most of it borrowed from whichever engine does it best:
 - **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 9 reasoning
   parsers, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
   render through the vendored google/minja engine, the same renderer llama.cpp ships.
-- **Multimodal.** Image, video, and audio to text, correctness-complete on a single-sequence path
-  (not yet wired into the OpenAI server).
+- **Multimodal.** Image, video, and audio to text, correctness-complete. Image chat requests are
+  wired through the OpenAI server (content parts on `/v1/chat/completions`) into the engine's
+  registered forward; video and audio still run on the single-sequence path.
 - **Quantization.** NVFP4 W4A4/W4A16, compressed-tensors NVFP4A16, GGUF
   F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K, and an FP8 W8A8 slice.
 - **External KV.** KV offload to CPU/disk and an `lm://` LMCache client, plus KV-cache events for
