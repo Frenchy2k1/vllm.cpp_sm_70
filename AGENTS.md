@@ -25,9 +25,16 @@ parallel agents. Ask before those actions. In the protocol, `${VLLM_SOURCE}`,
 placeholders mean the values in the untracked `.env` at the repository root:
 copy the tracked [`.env.example`](.env.example) and fill in what your setup
 has. An empty value means unavailable — the gates that need it stay `PENDING`;
-never substitute another developer's paths. Exact Ettore infrastructure paths
-retained in the environment registry or historical evidence are not commands
-for other developers.
+never substitute another developer's paths. **When `.env` is missing, set it
+up interactively — like the role claim, it is asked, never inferred.** Walk
+the developer through what their setup has (reference checkouts, oracle, gate
+hardware and its SSH target, GPU lock, device arch/toolchain, plus the policy
+choices in the preferences template), generate `.env` and
+`.agents/developer-preferences.md` from the tracked examples with their
+answers, and offer to register their box as a profile in
+[.agents/environment.md](.agents/environment.md). Exact Ettore infrastructure
+paths retained in the environment registry or historical evidence are not
+commands for other developers.
 
 **Read [`.agents/NOW.md`](.agents/NOW.md) FIRST — it is the one-Read resume
 surface.** The canonical record is large by design (evidence is never deleted),

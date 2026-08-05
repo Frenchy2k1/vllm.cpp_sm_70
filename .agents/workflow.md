@@ -11,6 +11,10 @@ and continue. Follow this protocol every session.
    worktree, `row/<ROW-ID>` branch and DRAFT PR immediately — the draft PR is
    the claim. `scripts/ready-for-helper.py` lists what a helper may pick. Full
    protocol: [specs/operator-helper-protocol.md](specs/operator-helper-protocol.md).
+   In a fresh checkout with no untracked `.env`, first walk the developer
+   through creating it interactively (the `.env.example` template +
+   [environment registration](environment.md#registering-your-own-environment)
+   — see AGENTS.md); like the role, the environment is asked, never inferred.
 1. **Orient**: read [NOW.md](NOW.md) FIRST — it is the one-Read resume surface
    (live claims, current gate, next actions) and is rewritten in place every
    checkpoint. The state tail is trustworthy only below the
