@@ -432,3 +432,134 @@ CPU-only spike. Serialize + protect the box:
 5. **Record** the golden md5 + the determinism verdict into the Kimi-Linear row
    and `benchmark-record.md`; that unblocks W7's e2e gate. Speed comes after
    token-exact (nsys BOTH sides, vLLM graphed denominator, match/beat every axis).
+
+---
+
+## 9. W6 DEVICE FORWARD SEAM LANDED (2026-08-05, `CLAIM-KIMI-LINEAR-W6`)
+
+The born-on-the-runner `KimiLinearModel::ForwardDevice` (the DEFAULT `gather_logits`
+production/runner path) replaces the refuse-by-name stub. It composes the
+`[rows,vocab]` logits via the landed CPU reference (`KimiLinearModel::Forward` ->
+HostForwardSeq, the whole 27-layer hybrid, honoring `logits_indices` gather) and
+hands them back **DEVICE-RESIDENT** — a pooled `DBuf` wrapped verbatim like
+`deepseek_v2.cpp:633 WrapDeviceLogits`, so `ForwardLogits.on_device()==true` on CPU
+and CUDA alike and the runner's on-GPU sampler consumes them with NO host logit
+download on the default path (the third MUST-route seam). `check-runner-routing-
+consistency` reclassifies Kimi-Linear device-resident (refuse-skipped stubs 2->1,
+NO allowlist) and `check-fusion-consistency` stays green. Gate
+`tests/vllm/models/test_kimi_linear_forward.cpp` **7/7·300** — case (e) asserts the
+device path returns `on_device()` logits byte-exact to the host reference, greedy
+tokens identical, `logits_indices` gather -> one device row. Row `SPIKE -> ACTIVE`.
+
+**GPU-verify-pending W7 device-COMPUTE residual (the reuse-wiring plan, authored as
+comments in `kimi_linear.cpp`, NOT gateable CPU-only):** a `DBuf`-resident bf16
+forward that routes each layer through the reused device blocks —
+- **KDA (20 layers):** q/k/v/f_a/f_b/g_a/g_b `vt::MatmulBT`, the 3 short convs
+  `vt::CausalConv1dFwd/Update`, q/k `vt::L2Norm`, the reused GDN decode/prefill
+  `vt::GdnDecode`/`GdnPrefill`/`GdnPackedDecode`, `vt::RmsNormGated` output norm; the
+  KDA decay gate `g = -exp(A_log)*softplus(f_b(f_a(x))+dt_bias)` has NO device
+  exp/softplus op -> **host-fallback** via `vllm::kimi_kda` {KdaLowRankDecay,
+  KdaDecayGate} then upload (a genuinely-missing KDA piece, W7-speed residual).
+- **NoPE-MLA (7 layers):** `mla::ForwardMlaAttentionBlock` with NoPE `MlaBlockDims`
+  (rotary_emb=None, q_lora=null, scaling qk_head_dim**-0.5).
+- **MoE (26 layers):** `vt::MoeRouterTopK` (kSigmoid, top-8, group 1/1, scaling
+  2.446, `e_score_correction_bias`) + grouped GEMM (CPU fallback: per-expert
+  `Matmul`+`MoeSiluMul`) + shared expert + `vt::MoeCombine`; dense layer-0 SwiGLU.
+- **Fusion:** add+RMSNorm via `vt::FusedChain(kFusedAddRmsNormStd)`; het-KV = the MLA
+  latent-576 group + the KDA GDN MambaSpec group advanced in place per step.
+This lands the runner SEAM + the full PLAN so only the GPU verify (the compute vs the
+pinned oracle, the GDN Triton-AOT cubins, bf16 numerics) + the W0/W7 e2e SACRED
+golden remain. Every op named is CPU+CUDA-registered except the bf16 grouped-MoE GEMM.
+
+---
+
+## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
+
+## Scope
+Bring up `KimiLinearForCausalLM` (Kimi-Linear-48B-A3B, `MODEL-TEXT-kimi-linear-kimi-
+linear-for-causal-lm`) — a hybrid **20 KDA + 7 NoPE-MLA** decoder with a DeepSeek-
+style **256-expert sigmoid `noaux_tc` MoE** (top-8, 1 shared, `first_k_dense_replace
+=1`). It FITS one GB10 (91.5 GiB / 0.77x pool) and the pinned oracle serves it, so it
+earns a REAL e2e SACRED token gate. In scope through W6: registry+config (W1), loader
+name-map (W2), the CPU reference forward (W2-W6), and the born-on-the-runner
+device-resident-logits SEAM (W6). Out of scope (named residuals): the DBuf-resident
+device COMPUTE (§9, GPU-verify-pending W7), the e2e SACRED golden (W7, §8 recipe),
+speed, MXFP4 (K3-only), and MTP (`num_nextn_predict_layers=0` in this checkpoint).
+
+## Upstream chain
+Pinned vLLM `555967922` (0.26.0.dev0): `registry.py:140` -> `kimi_linear`,
+`KimiLinearForCausalLM`; `transformers_utils/configs/kimi_linear.py` (config +
+`is_kda_layer`); `models/kimi_linear.py` (`KimiDecoderLayer`, `KimiMLAAttention`
+NoPE, `KimiMoE` sigmoid-`noaux_tc`, load_weights); `models/layers/mamba/gdn/
+kimi_gdn_linear_attn.py` (KDA modules + forward); `third_party/flash_linear_
+attention/ops/kda.py` (the KDA gate + gated output, delta-rule shared with GDN);
+`layers/mla.py`, `layers/fused_moe/*`, `layers/mamba/mamba_utils.py` (kda_state
+shape/dtype). Full `file:line` map in §1.
+
+## Our baseline
+HEAVY reuse of landed+gated primitives (§2): DeepSeek MLA (`mla_attention.{h,cpp}`,
+`cuda_mla_*.cu`), the sigmoid/`noaux_tc` grouped MoE + shared expert
+(`deepseek_v2.cpp RunMoeBlock`, `cuda_moe*.cu`, `MoeRouterTopK`), the GDN
+state/conv/recurrence family (KDA's parent: `cuda_gdn.cu`, `gdn_attn.*`, AOT
+cubins), the KDA host references (`kimi_kda.{h,cpp}`, `test_kimi_kda` 14/14), and the
+Qwen3.6-35B GDN-hybrid-MoE model skeleton (`qwen3_5_moe.cpp`). The born-on-the-runner
+DBuf/FusedChain/MergedGemm/mla::ForwardMlaAttentionBlock seams are all dual-
+registered CPU+CUDA (only the bf16 grouped-MoE GEMM is CUDA-only).
+
+## Port map
+Ours (@ HEAD): `include/vllm/model_executor/models/kimi_linear.h`;
+`src/vllm/model_executor/models/kimi_linear_registry.cpp` (REGISTER + het-KV spec),
+`kimi_linear_weights.cpp` (`ParseKimiLinearParams`/`EnumerateKimiLinearTensors`/
+loader + host materialization), `kimi_linear_forward.cpp` (the CPU reference forward:
+`KimiKdaLayerForward`/`KimiNoPEMlaLayerForward`/`KimiMoeRoute`/`KimiMoeBlockForward`/
+`KimiDenseMlpForward` + `Forward`), `kimi_linear.cpp` (`ForwardDevice` device-
+resident SEAM + the W7 device-compute reuse-wiring plan). NET-NEW = the KDA device
+kernel (host-ref-oracled), the NoPE-MLA branch, the hybrid schedule + het-KV wiring,
+the loader name-map.
+
+## Tests to port
+`tests/vllm/models/test_kimi_linear_scaffold.cpp` (9/9, registry+config+name-map),
+`test_kimi_linear_forward.cpp` (7/7·300: per-op KDA/NoPE-MLA/router gates + the whole
+2-layer forward + greedy decode + the W6 `ForwardDevice` device-resident gate),
+`test_kimi_kda.cpp` (14/14, the four net-new-vs-GDN numerics). From vLLM `tests/`:
+`registry.py` `_HfExamplesInfo` + `test_initialization.py` (construct-only — no GPU);
+no upstream text-correctness fixture exists, so the e2e oracle golden (§8) is the
+correctness truth.
+
+## Gates
+Unit (CPU, landed): the three test files above, all green on a clean CPU build;
+`check-runner-routing-consistency`/`check-fusion-consistency`/`check-model-checklist`/
+`check-agent-record` rc=0. Pending (GPU): the e2e SACRED greedy golden vs the pinned
+oracle on GB10 (STRICT expected for a 48.9B MoE; near-tie fallback ratified), then
+the device-compute gate (device==host within bf16 near-tie) and speed (nsys both
+sides, vLLM graphed denominator, match/beat every axis).
+
+## Dependencies
+W1 (registry/config) -> W2 (loader) -> W2-W6 (CPU reference) -> W6 (device SEAM,
+landed). W7 device compute depends on the reused GDN/MLA/MoE device blocks (landed)
++ a free GB10 slot + ~10 GiB dgx disk reclaim. Shared claims: `CLAIM-MLA-DEEPSEEK`
+(MLA half), `CLAIM-KDA-KERNEL` (KDA host refs) — coordinate before the W7 device
+KDA/MLA kernels so nothing is implemented twice.
+
+## Work breakdown
+**DONE:** W0 spike -> W1 registry/config/loader -> W2-W6 CPU reference forward -> **W6
+device-resident-logits SEAM (this brick).** **Residual (keeps the row out of DONE):**
+(a) the DBuf-resident device COMPUTE (§9 — KDA via the GDN family, NoPE-MLA via
+`mla::ForwardMlaAttentionBlock`, the DeepSeek-V2 grouped-MoE, over the paged het-KV;
+GPU-verify-pending); (b) the KDA decay-gate host-fallback -> a device exp/softplus
+composition (W7-speed); (c) the W0/W7 e2e SACRED golden on GB10 (§8 recipe);
+(d) speed. Full W0-W7 table in §5.
+
+## Risks/decisions
+- **Decision (correctness-first, box down):** W6 lands the runner SEAM + the full
+  device-compute PLAN but NOT the device compute, because CPU cannot gate the GDN
+  Triton-AOT cubins or the bf16 numerics against the oracle — authoring it now would
+  present as "done" without evidence. Mirrors the DeepSeek-V4 device-forward cadence.
+- **Decision:** `ForwardDevice` returns device-resident logits via a pooled `DBuf`
+  (`on_device()` on CPU+CUDA), so the CPU gate exercises the exact born-on-the-runner
+  contract the GPU will; no runner-routing allowlist entry is needed.
+- **Risk (small):** the NoPE-MLA branch must skip RoPE explicitly (do not silently
+  apply the decoupled DeepSeek RoPE to a NoPE model) — gated by the `mla_use_nope`
+  assert in `ParseKimiLinearParams` + the NoPE unit reference.
+- **Risk:** GB10 unified-memory OOM on the 91.5 GiB load — keep `gpu_memory_util`
+  ~0.55-0.65 (§3), never 0.85.

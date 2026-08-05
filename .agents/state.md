@@ -35235,6 +35235,7 @@ ROAD-V1-C2 breadth note;
 stamp. Record checkers green (`check-model-checklist`, `check-agent-record`, `check-doc-checkpoint`,
 `check-now-current`). Co-owns the row with `CLAIM-MLA-DEEPSEEK` (MLA half) + `CLAIM-KDA-KERNEL`
 (KDA host refs). NEXT: W1 registry + `ParseKimiLinearParams` (CPU). No source/kernel/gate changed.
+
 ## DeepSeek-V4 Phase-2 routed-expert residency MEASURED NEGATIVE, held default-OFF
 <!-- state: 2026-08-05T12:00 -->
 
@@ -35288,6 +35289,75 @@ Kept in the tree default-OFF for reproducibility. Also **resolved the RED
 in `scripts/env-doc-allowlist.txt` (kernel-internal A/B switches). Docs
 STATUS/BENCHMARKS/FEATURES + NOW.md updated to the held-OFF negative; STATUS kept
 under its 288,036 ratchet.
+
+## 35B serving heap corruption FIXED — async depth-2 GPU-overlap use-after-free
+<!-- state: 2026-08-05T13:00 -->
+
+Root-caused and fixed the reproducible heap corruption (`malloc(): unaligned
+tcache chunk detected` / `malloc_consolidate(): unaligned fastbin chunk`) that
+aborted `examples/server` on the Qwen3.6-35B-A3B-NVFP4 binding-bench workload and
+BLOCKED the 35B binding-grid re-run. gdb: the abort fires on the first small
+`operator new` inside `vllm::v1::prepare_inputs` on the engine busy-loop thread
+(`EngineCoreProc::run_busy_loop -> step_with_batch_queue -> execute_model`), i.e.
+a detector, not the corrupting write.
+
+**Trigger (bench, re-confirmed on dgx repro5):** async scheduling default-ON
+(mcb=2) + `ignore_eos=true` + generation past ~4-8 decode tokens. `Hello there
+friend` max_tokens=4 → http 200; max_tokens=8 → http 000 (server thread dead);
+`ignore_eos=false` fine (it stops at the natural eos before the trigger). The
+model naturally samples eos within a few tokens; ignore_eos forces it PAST, which
+is what runs the pipeline long enough to detonate.
+
+**Localization (the decisive evidence chain):**
+- CPU repros are CLEAN under ASAN even with faithful eos-continuation — a dense
+  `LoadedEngine` async depth-2 run AND a MoE `LoadedEngine` async depth-2 run
+  (synthetic Qwen3.5 dense + Qwen3.5-MoE, eos set to an emitted token,
+  ignore_eos true vs false, multi-block paging). So the backend-neutral host code
+  (scheduler placeholders, `prepare_inputs`, `combine_sampled_and_draft_tokens`,
+  `InputBatch` condense/swap, block table, detok) is correct.
+- `compute-sanitizer --tool memcheck` on the real 35B: the crash DID NOT
+  reproduce and reported ZERO device errors → NOT a CUDA-kernel OOB write.
+- Env toggles on the real 35B: `VT_ASYNC_SCHED=0` (sync Scheduler, depth-1, but
+  the runner combine still ON) = CLEAN; `VT_ASYNC_RUNNER=0` = CLEAN; DEFAULT
+  (mcb=2) = CRASH at mt=8. memcheck keeps the AsyncScheduler accounting but
+  SERIALIZES the GPU → clean; so the cause is the real depth-2 GPU OVERLAP, not
+  the scheduler accounting.
+
+**Root cause.** `sample_tokens_async` (the depth-2 serving sampler) issues the
+sampled-id D2H on the COPY queue and DEFERS its wait to the consuming step's
+`get_output()`, which lands one `step_with_batch_queue` call LATER. So on entry
+to the next `execute_model` the previous step's forward / sample / scatter are
+still IN FLIGHT on the MAIN queue and still reference `exec_state_` (device
+logits + the `StepInputs` host arrays) and write
+`input_batch_.last_sampled_tokens`. That `execute_model` immediately reset
+`exec_state_` and ran `update_states` (condense/swap read+move
+`last_sampled_tokens`) — mutating/freeing state a live kernel still used on GB10
+unified memory. A use-after-free that corrupts the HOST heap. It only manifests
+under REAL GPU overlap, which is exactly why the CPU eager backend and
+compute-sanitizer (both serialize the queue) never saw it while the served model
+aborted. (Matches the recorded "compute-sanitizer clean while wrong / capture
+lifetime" trap.)
+
+**Fix** (`src/vllm/v1/worker/gpu/runner.cpp` + `runner.h`): a depth-2 lifetime
+guard. `sample_tokens_async` sets `async_forward_in_flight_` when it leaves
+main-queue work outstanding; `execute_model` drains it
+(`GetBackend(...).Synchronize(queue_)`) at the very TOP, before it touches
+`exec_state_` or `input_batch_`. Cost is minimal — the forward already overlapped
+the call's own host work (`get_output`/`update_from_output`/schedule); the D2H
+copy-queue overlap that the async design buys is preserved (the drain is the main
+queue only). Byte-identical output.
+
+**Verification.** dgx incremental server rebuild at this SHA: the repro5 bracket
+(`ignore_eos=T`, mt 4/8/16/32/64/128) all http 200 + ALIVE (was 000 from mt=8),
+`Once upon a time` 128+ignore_eos 200/ALIVE, non-ignore_eos correctness output
+intact; SACRED `test_qwen36_paged_engine` 1/1 (74.96 s). New CPU regression
+`test_runner` "async sample_tokens_async work is drained before the next
+execute_model" (RED→GREEN verified: disabling the drain fails 10 assertions) +
+e2e `test_llm_engine` async-depth-2-past-ignore_eos. CPU ASAN suites green:
+test_runner 17/17, test_loaded_engine_dense 6/6, test_llm_engine (serial),
+engine_core_proc / async_llm / openai_conformance (serial). Docs
+STATUS/BENCHMARKS + NOW.md updated; STATUS kept under its 287,962 ratchet
+(trimmed a dated audit meta-clause to offset the fix note).
 
 ## Kimi-Linear-48B-A3B W1 — registry + config + loader scaffolding LANDED (row stays SPIKE)
 <!-- state: 2026-08-05T14:00 -->
@@ -35395,71 +35465,80 @@ New code: `src/vllm/model_executor/models/kimi_linear_forward.cpp`,
 per-op declarations in `include/vllm/model_executor/models/kimi_linear.h`, the
 host-materialization pass in `kimi_linear_weights.cpp`, two CMake lines. Row STAYS
 `SPIKE`/`📋` (the DEVICE forward refuses; the W0/W7 e2e SACRED token golden on GB10
-— spec §8 golden-capture recipe — plus speed are the residual).## 35B serving heap corruption FIXED — async depth-2 GPU-overlap use-after-free
-<!-- state: 2026-08-05T13:00 -->
+— spec §8 golden-capture recipe — plus speed are the residual).
 
-Root-caused and fixed the reproducible heap corruption (`malloc(): unaligned
-tcache chunk detected` / `malloc_consolidate(): unaligned fastbin chunk`) that
-aborted `examples/server` on the Qwen3.6-35B-A3B-NVFP4 binding-bench workload and
-BLOCKED the 35B binding-grid re-run. gdb: the abort fires on the first small
-`operator new` inside `vllm::v1::prepare_inputs` on the engine busy-loop thread
-(`EngineCoreProc::run_busy_loop -> step_with_batch_queue -> execute_model`), i.e.
-a detector, not the corrupting write.
+## Kimi-Linear-48B-A3B W6 — the born-on-the-runner DEVICE forward SEAM LANDED (row SPIKE→ACTIVE)
+<!-- state: 2026-08-05T20:00 -->
 
-**Trigger (bench, re-confirmed on dgx repro5):** async scheduling default-ON
-(mcb=2) + `ignore_eos=true` + generation past ~4-8 decode tokens. `Hello there
-friend` max_tokens=4 → http 200; max_tokens=8 → http 000 (server thread dead);
-`ignore_eos=false` fine (it stops at the natural eos before the trigger). The
-model naturally samples eos within a few tokens; ignore_eos forces it PAST, which
-is what runs the pipeline long enough to detonate.
+**`CLAIM-KIMI-LINEAR-W6` (foreground, isolated worktree
+`.claude/worktrees/agent-a01ce06793789391e`, base `origin/main` `1ea26427`, CPU-only,
+NOT pushed).** Wired the born-on-the-runner DEVICE forward
+`KimiLinearModel::ForwardDevice` — the DEFAULT `gather_logits` production/runner path
+that had been a `VT_CHECK(false)` refuse stub. It now composes the `[rows,vocab]`
+logits via the landed CPU reference (`KimiLinearModel::Forward` → HostForwardSeq, the
+whole 27-layer KDA/NoPE-MLA + 256-expert-MoE hybrid, honoring `logits_indices`
+gather) and hands them back **DEVICE-RESIDENT** — a pooled `DBuf` wrapped verbatim
+like `deepseek_v2.cpp:633 WrapDeviceLogits`, so `ForwardLogits.on_device()==true` on
+CPU **and** CUDA and the runner's on-GPU sampler consumes them with NO host logit
+download on the default path (the third MUST-route seam).
 
-**Localization (the decisive evidence chain):**
-- CPU repros are CLEAN under ASAN even with faithful eos-continuation — a dense
-  `LoadedEngine` async depth-2 run AND a MoE `LoadedEngine` async depth-2 run
-  (synthetic Qwen3.5 dense + Qwen3.5-MoE, eos set to an emitted token,
-  ignore_eos true vs false, multi-block paging). So the backend-neutral host code
-  (scheduler placeholders, `prepare_inputs`, `combine_sampled_and_draft_tokens`,
-  `InputBatch` condense/swap, block table, detok) is correct.
-- `compute-sanitizer --tool memcheck` on the real 35B: the crash DID NOT
-  reproduce and reported ZERO device errors → NOT a CUDA-kernel OOB write.
-- Env toggles on the real 35B: `VT_ASYNC_SCHED=0` (sync Scheduler, depth-1, but
-  the runner combine still ON) = CLEAN; `VT_ASYNC_RUNNER=0` = CLEAN; DEFAULT
-  (mcb=2) = CRASH at mt=8. memcheck keeps the AsyncScheduler accounting but
-  SERIALIZES the GPU → clean; so the cause is the real depth-2 GPU OVERLAP, not
-  the scheduler accounting.
+**Why the compose stays on the CPU reference (correctness-first; the DGX box is
+down).** The device-COMPUTE lane — a `DBuf`-resident bf16 forward that routes each
+layer through the reused device blocks — can only be GATED against the pinned vLLM
+oracle on GB10 (the GDN Triton-AOT decode cubins, the paged het-KV caches, bf16
+numerics), so authoring it now would present as "done" without evidence. This brick
+lands the runner SEAM + the full reuse-wiring PLAN (documented as comments in
+`kimi_linear.cpp` + spec §9) so only the GPU verify + the W0/W7 e2e golden remain.
+This mirrors the DeepSeek-V4 device-forward cadence (compose off the host tower,
+return device-resident logits, the DBuf-resident paged decode is a named residual).
+The Explore audit confirmed every reused op (`vt::MatmulBT`, `FusedChain`,
+`GdnDecode`/`GdnPrefill`, `mla::ForwardMlaAttentionBlock`, `MoeRouterTopK`,
+`MoeCombine`, `L2Norm`, `RmsNormGated`, `CausalConv1dFwd`) is CPU+CUDA-registered —
+only the bf16 grouped-MoE GEMM is CUDA-only (CPU lane = per-expert `Matmul`+
+`MoeSiluMul`), and the KDA decay gate `-exp(A_log)*softplus(...)` has no device
+exp/softplus op → a documented host-fallback (`vllm::kimi_kda`, upload). So the W7
+device compute IS feasible + CPU-runnable; it is deferred purely because it needs the
+GPU-vs-oracle gate to be trustworthy.
 
-**Root cause.** `sample_tokens_async` (the depth-2 serving sampler) issues the
-sampled-id D2H on the COPY queue and DEFERS its wait to the consuming step's
-`get_output()`, which lands one `step_with_batch_queue` call LATER. So on entry
-to the next `execute_model` the previous step's forward / sample / scatter are
-still IN FLIGHT on the MAIN queue and still reference `exec_state_` (device
-logits + the `StepInputs` host arrays) and write
-`input_batch_.last_sampled_tokens`. That `execute_model` immediately reset
-`exec_state_` and ran `update_states` (condense/swap read+move
-`last_sampled_tokens`) — mutating/freeing state a live kernel still used on GB10
-unified memory. A use-after-free that corrupts the HOST heap. It only manifests
-under REAL GPU overlap, which is exactly why the CPU eager backend and
-compute-sanitizer (both serialize the queue) never saw it while the served model
-aborted. (Matches the recorded "compute-sanitizer clean while wrong / capture
-lifetime" trap.)
+**Gates.** `test_kimi_linear_forward` **7/7·300** — new case (e) asserts
+`ForwardDevice` returns `on_device()` logits byte-exact to the host reference, greedy
+tokens identical, and the `logits_indices` gather returns exactly one device row in
+request order. `check-runner-routing-consistency` reclassifies Kimi-Linear
+device-resident (25 routed models; refuse-skipped stubs 2→1) with **NO allowlist**
+entry (the wrapper hand-rolls no residual stream), and `check-fusion-consistency`
+stays green. `test_kimi_linear_scaffold` 9/9·83 + `test_kimi_kda` 14/14 +
+`test_model_registry` 24/24 UNCHANGED; clean CPU `-DVLLM_CPP_CUDA=OFF` Release build;
+`check-model-checklist` + `check-agent-record` rc=0.
 
-**Fix** (`src/vllm/v1/worker/gpu/runner.cpp` + `runner.h`): a depth-2 lifetime
-guard. `sample_tokens_async` sets `async_forward_in_flight_` when it leaves
-main-queue work outstanding; `execute_model` drains it
-(`GetBackend(...).Synchronize(queue_)`) at the very TOP, before it touches
-`exec_state_` or `input_batch_`. Cost is minimal — the forward already overlapped
-the call's own host work (`get_output`/`update_from_output`/schedule); the D2H
-copy-queue overlap that the async design buys is preserved (the drain is the main
-queue only). Byte-identical output.
+**Records.** Row `SPIKE`→`ACTIVE` (device SEAM wired; device compute + e2e golden
+pending — matching the deepseek_v4 "device-forward wired, e2e-pending" precedent),
+checklist mark `📋`→`🚧`, rollup `SPIKE 7→6`/`ACTIVE 9→10` (Total 327 unchanged). The
+ACTIVE advance required a machine-readable structured-contract appendix in
+`specs/kimi-linear.md` (§9 + the Scope/Upstream chain/Our baseline/Port map/Tests to
+port/Gates/Dependencies/Work breakdown/Risks blocks the deepseek-v4-flash.md
+convention uses) so `check-agent-record`'s READY-state spec structure passes.
 
-**Verification.** dgx incremental server rebuild at this SHA: the repro5 bracket
-(`ignore_eos=T`, mt 4/8/16/32/64/128) all http 200 + ALIVE (was 000 from mt=8),
-`Once upon a time` 128+ignore_eos 200/ALIVE, non-ignore_eos correctness output
-intact; SACRED `test_qwen36_paged_engine` 1/1 (74.96 s). New CPU regression
-`test_runner` "async sample_tokens_async work is drained before the next
-execute_model" (RED→GREEN verified: disabling the drain fails 10 assertions) +
-e2e `test_llm_engine` async-depth-2-past-ignore_eos. CPU ASAN suites green:
-test_runner 17/17, test_loaded_engine_dense 6/6, test_llm_engine (serial),
-engine_core_proc / async_llm / openai_conformance (serial). Docs
-STATUS/BENCHMARKS + NOW.md updated; STATUS kept under its 287,962 ratchet
-(trimmed a dated audit meta-clause to offset the fix note).
+**Records-hygiene repair (inherited, not my landing):** the base tree had a
+merge artifact — the `35B serving heap corruption` state heading was glued onto the
+end of the W2-W6 entry's last line (so its `T13:00` anchor was unattached) and out of
+order. Split the newline and ran `scripts/sort-state-tail.py --apply` (reordered 3
+entries); `check-state-order` now green.
+
+New code: `src/vllm/model_executor/models/kimi_linear.cpp` (`ForwardDevice` +
+`WrapKimiLinearDeviceLogits` + the W7 device-compute reuse-wiring plan), the
+`ForwardDevice` doc in `include/vllm/model_executor/models/kimi_linear.h`, case (e)
+in `tests/vllm/models/test_kimi_linear_forward.cpp`. NO new CUDA kernel, NO CMake
+change.
+
+**GPU-verify recipe (box-return):** build `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` on dgx (sm_121a); run
+`test_kimi_linear_forward` on a CUDA queue (proves `ForwardDevice` returns
+device-resident logits fed to the on-GPU sampler); then author + gate the W7 DBuf
+device compute vs the pinned oracle, and capture the §8 e2e SACRED greedy golden.
+
+**RESIDUAL (GPU-verify-pending W7):** the DBuf-resident device COMPUTE (KDA via the
+GDN device family + the KDA-gate host-fallback, NoPE-MLA via
+`mla::ForwardMlaAttentionBlock`, the DeepSeek-V2 sigmoid-`noaux_tc` grouped-MoE, over
+the paged het-KV caches) + the W0/W7 e2e SACRED token golden on GB10 (spec §8) +
+speed. Row stays `ACTIVE` until those land.
+

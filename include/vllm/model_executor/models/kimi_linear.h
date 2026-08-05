@@ -309,10 +309,16 @@ std::vector<int32_t> KimiLinearGreedyDecode(const KimiLinearHostWeights& host,
 //     the host float weights — the whole 27-layer KDA/NoPE-MLA hybrid + 256-expert
 //     MoE, composed from the per-op reference forwards above, so the ONLY remaining
 //     correctness step is the e2e SACRED token golden on GB10 (spike §8).
-//   ForwardDevice (the DEFAULT `gather_logits` production/runner path): still
-//     REFUSE-by-name (VT_CHECK(false)) — the born-on-the-runner device forward (the
-//     KDA device kernel, the absorbed MLA decode, the grouped-MoE slabs, the het-KV
-//     cache wiring) is W6/W7. The row stays SPIKE until that + the e2e gate land.
+//   ForwardDevice (the DEFAULT `gather_logits` production/runner path, W6): the
+//     born-on-the-runner SEAM — it composes the [rows,vocab] logits via `Forward`
+//     and returns them DEVICE-RESIDENT (a pooled `DBuf`, `ForwardLogits.on_device()
+//     ==true` on CPU and CUDA), so the runner's on-GPU sampler consumes them with NO
+//     host logit download (the third MUST-route seam). The device-COMPUTE lane —
+//     routing KDA through the GDN device family, the NoPE-MLA layers through
+//     `mla::ForwardMlaAttentionBlock`, and the MoE through the DeepSeek-V2 grouped
+//     GEMM over the paged het-KV caches — is the GPU-verify-pending W7 residual
+//     (kimi_linear.cpp documents the full reuse-wiring plan). The row stays SPIKE
+//     until the device compute + the e2e SACRED golden land on GB10.
 class KimiLinearModel {
  public:
   static std::vector<float> Forward(
