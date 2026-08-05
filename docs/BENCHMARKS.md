@@ -183,7 +183,7 @@ Sparks with TP2 and is owed.
 The default arm is parity, measured same-session clean (2026-08-04, single-load
 steady both arms); the earlier 15.87/96% and 17.13 figures are superseded.
 
-Weight residency is the beat-path (2026-08-05, `VT_V4_RESIDENT_W`, default-ON).
+Weight residency is the beat-path (2026-08-05, `VT_V4_RESIDENT_W`, default-ON). Env var allowlisted (env-doc gate green).
 The dense Q8_0 MLA/shared-expert/lm_head projection tower is read from the GGUF
 mmap over ATS/unified memory, which the GB10 GPU reads about 20% slower per-GEMV
 than `cudaMalloc`'d device memory. Staging that ~6 GiB tower device-resident once
