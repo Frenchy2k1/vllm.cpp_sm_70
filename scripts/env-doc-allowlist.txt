@@ -185,10 +185,12 @@ VT_LAGUNA_KV_BF16
 VT_LAGUNA_KV_HEADROOM
 VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH
 # Test-only escape hatch: skip the depth-2 drain (VT_ASYNC_EXECUTOR=1) while
-# forcing the decode-graph double-buffer OFF, so the async-serving gate SEES
-# hazard-C (the RED arm proof). Never set in production.
+# forcing the decode-graph parity ring OFF (single slot), so the async-serving gate
+# SEES the logits/input reuse hazard (a RED arm). Never set in production.
 VT_ASYNC_EXECUTOR_NO_DBUF
-# Test-only: deterministic hazard-C proof (poison the persistent host inputs right
-# after a captured replay) and a drain-skip counter. Never set in production.
+# Test-only: deterministic RED for Option A — poison the PINNED H2D source right
+# after StageStepInputs enqueues the async copy (a true-async DMA reads the garbage),
+# proving the input-staged event boundary is load-bearing. Also a drain-skip counter
+# (VT_ASYNC_EXECUTOR_TRACE). Never set in production.
 VT_ASYNC_EXECUTOR_POISON
 VT_ASYNC_EXECUTOR_TRACE

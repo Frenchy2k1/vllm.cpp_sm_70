@@ -12001,6 +12001,52 @@ steady-state weights. Raw root `/tmp/qwen35-upstream-312af21a9`; aggregate
 `/tmp/qwen35-upstream-312af21a9/aggregate.json`. Full commands and evidence:
 [Qwen3.5-4B post-upstream revalidation](../docs/bench-evidence/qwen35-4b-upstream-20260805.md).
 
+## 2026-08-06 — SERVE-ASYNC-OPTION-A: decode-graph input H2D staged OUT of capture — RED constructed, GREEN, binding A/B WASH (default OFF)
+
+Option A (`row/SERVE-ASYNC-OPTION-A`, `VT_ASYNC_EXECUTOR`) ports vLLM's actual async
+decode-input structure: per-step input H2D enqueued on the main queue BEFORE
+`ReplayGraph` into PERSISTENT device buffers the captured graph reads, guarded by an
+input-staged event recorded right after the tiny staging copy (`gpu_model_runner.py`
+`_prepare_input_ids` / `synchronize_input_prep`, `states.py:64`). PINNED host staging
+makes the H2D a TRUE async DMA (pageable GB10 H2D is host-synchronous — why #36's
+poison could never race). Supersedes #36's in-capture-baked ring (ring retained for the
+depth-2 logits double-buffer). Bug found+fixed: `BuildStepDevInputs` popped-and-retained
+input-buffer blocks from the main scratch `Pool()`, starving a size-class the captured
+forward's scratch needs -> `cudaMalloc when stream is capturing`; fixed with a dedicated
+`PersistentDecodeInputPool` under `ActivePoolScope`.
+
+Correctness (dgx GB10 sm_121a, both locks, single load/arm, drop_caches; build `1db5b844`
+qwen3_5.cpp, GDN cubins present):
+- RED `VT_ASYNC_EXECUTOR_POISON` (overwrite pinned source after the async stage) —
+  DETERMINISTIC FAILURE: 16/16 coherent-but-WRONG tokens ("capital of Germany is
+  Berlin") every rep, no crash. Proves the async DMA is real + the input-staged event is
+  load-bearing. (This is the RED #36 could not produce.)
+- GREEN `test_qwen36_async_serving` ON @conc-32: 5/5 PASS + control PASS.
+- SACRED `test_qwen36_paged_engine` ON x3: PASS (97.9/101.2/91.0 s) — sync token-exact.
+- compute-sanitizer memcheck x2: 0 errors. `VT_ASYNC_EXECUTOR_NO_DBUF` (baked single
+  slot): PASS. Served ignore_eos UAF bracket mt 4/8/16/32/64/128: all http=200 ALIVE.
+- Engagement confirmed: server `VT_ASYNC_EXECUTOR_TRACE` "drain skipped" fired.
+
+Binding A/B (`tools/bench/online_gate.py bench`, ONE binary env-toggled OFF vs ON, single
+server load per arm, 3 reps, never reload; vLLM client, model-key 35, frozen corpus):
+
+| conc | OFF total tok/s | ON total tok/s | delta | OFF mean TTFT ms | ON mean TTFT ms |
+|---|---|---|---|---|---|
+| c8  | 1778.9 | 1781.4 | +0.14% | 1130 | 1115 |
+| c16 | 2294.4 | 2294.8 | +0.02% | 1910 | 1925 |
+| c32 | 2914.5 | 2916.3 | +0.06% | 2820 | 2822 |
+
+OFF reps c8 {1778.7,1777.8,1780.1} c16 {2297.7,2298.4,2287.2} c32 {2915.8,2901.7,2925.9};
+ON reps c8 {1793.2,1766.6,1784.5} c16 {2312.4,2280.7,2291.2} c32 {2914.7,2926.8,2907.4}.
+All WASH (inside the +-0.5-1% rep band). vs vLLM (2497/3013/1922 tok/s; 1834/2703/1085 ms
+TTFT) still 0.92/0.97/0.93x tput.
+
+VERDICT: correctness-complete + faithful vLLM structure + a working RED, but SPEED-NEUTRAL
+-> DEFAULT OFF (parity-enablers). DEFINITIVE NEGATIVE: removing exactly the depth-2 drain
+AND the in-capture baked H2D leaves throughput and TTFT unchanged, so the c8/c16/c32
+deficit to vLLM is NOT the decode-graph input-H2D structure. Closes the "c16 = the moved
+drain / baked H2D" hypothesis; residual is prefill glue (task #61) + steady host-
+orchestration/GPU compute. Evidence `dgx:~/work/mirror-ab/option-a/`.
 ## Kimi-Linear-48B-A3B: W7 device compute GPU-VERIFIED on GB10; e2e SACRED golden disk-blocked (2026-08-06)
 
 Branch `row/MODEL-KIMI-LINEAR-GPU`, base `origin/main` `c587f2b9`. First time any

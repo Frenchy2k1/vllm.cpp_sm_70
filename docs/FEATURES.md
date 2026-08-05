@@ -38,7 +38,7 @@ are our reading of their documented behavior, not measurements.
 | Priority scheduling | ◐ gating | ✅ | ✅ | ☐ |
 | LPM cache-aware admission | ✅ | ☐ | ✅ | ☐ |
 | In-batch prefix de-prioritization | ✅ | ☐ | ✅ | ☐ |
-| Async / overlap scheduling | ✅ default on (UAF-safe drain; opt-in `VT_ASYNC_EXECUTOR` slot ring) | ✅ | ✅ | ☐ |
+| Async / overlap scheduling | ✅ default on (UAF-safe drain; opt-in `VT_ASYNC_EXECUTOR` out-of-capture H2D staging) | ✅ | ✅ | ☐ |
 | CUDA graph decode capture | ◐ per-family | ✅ | ✅ | ✅ |
 | Partial-prefill concurrency | ☐ | ✅ | ✅ | ☐ |
 | Cascade attention | ☐ | ✅ | ◐ | ☐ |

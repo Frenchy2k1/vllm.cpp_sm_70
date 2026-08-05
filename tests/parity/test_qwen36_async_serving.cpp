@@ -166,14 +166,16 @@ TEST_CASE("qwen36 async-serving greedy token-exact gate (dgx-only, 35B) — "
   // (own KV + GDN state), so each MUST reproduce the same oracle continuation
   // regardless of the step interleave (vLLM's greedy determinism guarantee).
   //
-  // Default N=4 is a SMALL bracket. The decode-graph slot-reuse race (hazard-C:
-  // Refresh(step) overwriting a slot's persistent host inputs while the previous
-  // same-slot replay's baked H2D still reads them) only bites when the HOST runs
-  // AHEAD of the GPU — i.e. at higher concurrency, where a batched replay is heavy
-  // enough that step N+1's Refresh reaches the slot while step N's replay is still
-  // queued/executing. VT_ASYNC_SERVING_CONC overrides N so the VT_ASYNC_EXECUTOR
-  // double-buffer's RED (drain skipped, ring off -> divergence) and GREEN (ring on
-  // -> token-exact) can be exercised at the concurrency where the hazard is live.
+  // Default N=4 is a SMALL bracket. Under VT_ASYNC_EXECUTOR (Option A) the runner
+  // skips the depth-2 drain and the decode-graph stages each step's input H2D OUT of
+  // the captured replay into persistent device buffers, guarded by an input-staged
+  // event; the next same-slot Refresh waits only that tiny copy. Higher concurrency
+  // (VT_ASYNC_SERVING_CONC) makes the batched replay heavy enough that the host runs
+  // ahead — the regime the input-staged event must cover. The DETERMINISTIC RED is
+  // VT_ASYNC_EXECUTOR_POISON=1, which overwrites the PINNED H2D source immediately
+  // after the async copy is enqueued (a true-async DMA reads the garbage): if the
+  // event boundary were unsound this is exactly what a Refresh that ran ahead would
+  // do, so the gate must FAIL. GREEN (VT_ASYNC_EXECUTOR=1, no poison) => token-exact.
   int kN = 4;
   if (const char* c = std::getenv("VT_ASYNC_SERVING_CONC")) {
     const int v = std::atoi(c);
