@@ -82,7 +82,13 @@ class Backend {
 
   // Cross-stream event lifecycle. Base implementations are no-ops returning a
   // null-handle Event (synchronous backends have nothing to wait on).
-  virtual Event CreateEvent();
+  // `blocking` requests an event whose HOST wait (SynchronizeEvent) SLEEPS the
+  // calling thread until completion instead of busy-spinning (CUDA:
+  // cudaEventBlockingSync). Used by the decode-graph slot double-buffer
+  // (VT_ASYNC_EXECUTOR): the reuse wait is nearly always already-signaled at
+  // depth-2, so on the rare occasion the engine runs ahead the host should sleep,
+  // not burn a core spinning. Ignored on synchronous backends (no handle).
+  virtual Event CreateEvent(bool blocking = false);
   virtual void DestroyEvent(Event& e);
   // Record `e` on the queue's stream: it completes once all work submitted to
   // `q` up to this point has finished (async_utils.py copy_event.record).

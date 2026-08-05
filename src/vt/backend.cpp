@@ -18,7 +18,7 @@ uint64_t NextQueueId() noexcept {
 // CUDA overrides all six with cudaHostAlloc + cudaEvent_t. (CPU inherits these.)
 void* Backend::AllocPinned(size_t bytes) { return Alloc(bytes == 0 ? 1 : bytes); }
 void Backend::FreePinned(void* p) { Free(p); }
-Event Backend::CreateEvent() { return Event{}; }
+Event Backend::CreateEvent(bool /*blocking*/) { return Event{}; }
 void Backend::DestroyEvent(Event&) {}
 void Backend::RecordEvent(Event&, Queue&) {}
 void Backend::SynchronizeEvent(Event&) {}

@@ -11836,6 +11836,139 @@ Evidence `dgx:~/work/mirror-ab/{asyncgate2-{RED,GREEN}.log,
 asyncgate-SACRED-default.log,mab-defmeasure.log,mab-asyncmemcheck.log,
 evidence/raw/35/ours/c16-r{1,2,3}-{defaulton,rollback0}.json}`.
 
+## ROW-SERVE-ASYNC-EXECUTOR: decode-graph slot double-buffer (Option B), gated `VT_ASYNC_EXECUTOR` — the c16/c32 overlap unlock
+
+CONTEXT. With `VT_ASYNC_DEVICE_MIRROR` default ON (the ROW-SERVE-ASYNC-LLM fix
+above), the async serving loop's remaining serialization is a depth-2 pre-forward
+drain: `runner.cpp` (mirror path, before the forward) does a main-queue
+`Synchronize` every step. It exists because of hazard-C below. Removing it is the
+c16 (and c32) unlock — the overlap that lets step N+1's host prep + replay run
+while step N's GPU tail is still in flight.
+
+THE THREE HAZARDS (why the drain is there, and what each needs to be safe to skip).
+
+hazard-C (the drain's REASON; decode-graph only). The Qwen3.5 decode graph bakes
+its per-step H2D INSIDE the captured replay: `BuildStepDevInputs` (`qwen3_5.cpp`) is
+called inside the captured `ForwardLayers`, and it uploads
+positions / slot_mapping / block_table / seq_lens / query_start_loc / GDN state
+indices from the per-size `SizeSlot`'s PERSISTENT HOST vectors
+(`token_ids, positions, attn_meta.*, gdn_meta.*`). `s.Refresh` overwrites those same
+host vectors with a plain host `memcpy` (`CopyInPlace`), OFF the queue; `EmbedInto`
+reads `s.token_ids` via an on-queue async H2D. So `Replay(N)` reads `s.*` on the main
+queue while `Refresh(N+1)` overwrites them off-queue → corruption without an
+intervening drain. This is the blocker the drain solves and the reason a naive
+drain-removal degenerates (proven by the RED arm below).
+
+hazard-A (EAGER path only). `exec_state_.logits` OWNS a pool block on the eager
+forward (`WrapDeviceLogits`), freed by the pre-forward `exec_state_` reset while the
+deferred async sampler still reads it → use-after-free. The graphed path's
+`ViewDeviceLogits` is NON-owning (`non_owning_view=true`, no-op deleter), so resetting
+`exec_state_` frees nothing and the slot buffer stays live — hazard-A is absent for a
+graph-slot view.
+
+vLLM's structure (reference). `synchronize_input_prep` is a blocking event
+(gpu_model_runner.py); on-stream out-of-graph H2D into PERSISTENT DEVICE buffers
+(states.py:64) so `_update_states` never reads a device-written buffer and the sync
+only guards input staging. Option B below is the lower-risk equivalent (a per-slot
+host-wait ring instead of vLLM's out-of-graph device staging); it is recorded as a
+stepping stone to the faithful Option A (move the H2D OUT of the captured replay into
+persistent device buffers, then no host-buffer reuse hazard exists at all).
+
+OPTION B (what landed, gated `VT_ASYNC_EXECUTOR`, default OFF). (1) Each decode-graph
+driver's `slots` map goes from one `SizeSlot` per size to a `SlotRing{SizeSlot[2]}`
+(parity ring), alternated each step. Each slot records a BLOCKING-sync reuse event
+(`cudaEventBlockingSync`, new `Backend::CreateEvent(bool blocking)`) on the main queue
+AFTER its replay; before Refresh-ing a slot for reuse the host `SynchronizeEvent`s it.
+At depth-2 with 2 slots this wait is almost always already-signaled; it self-limits if
+the engine runs ahead. The warm-capture step drains once (idle-stream capture) since
+the runner may have skipped the drain. (2) `runner.cpp`: under `VT_ASYNC_EXECUTOR=1`,
+SKIP the drain's `Synchronize` when the previous step's logits are a non-owning
+graph-slot view (hazard-A absent, hazard-C handled by the ring); the `exec_state_`
+reset still runs (releasing the no-op-deleter view). Eager/mixed previous steps still
+own their logits and drain as before — the drain-on-eager fallback is acceptable
+because c16/c32 steady-state is all-graphed. (3) OFF routes through the single-slot
+code with the drain intact — byte-identical by construction (`dbuf=false` picks
+`slot[0]` with no events; `skip_drain` is always false). Memory: doubling slots
+≈ +76 MB (logits-dominated), one-time; capture time doubles (one-time).
+
+RESULTS (dgx GB10 sm_121a, cutlass-4.5.0, triton ON, commit `fa971248`, dual-lock,
+free>=90, worker down; evidence `dgx:~/work/mirror-ab/serve-async-executor/`).
+
+CPU (bar a): -Werror clean; runner / llm_engine / engine_core_proc / async_llm /
+input_batch 6/6 pass.
+
+CAPTURE-SAFETY (a real bug found + fixed). The FIRST ring build aborted every
+captured step with `cudaMalloc: operation not permitted when stream is capturing`.
+Root cause: the pool is pre-warmed for ONE graph's RETAINED `[S,vocab]` logits block
+(allocated inside `ForwardLayers`/`DenseForwardLayers` and kept as `s.logits`); the
+ring needs TWO retained simultaneously (one per slot), so the second slot's capture
+hit a pool MISS. Working scratch (`hidden`/`res`/MoE grouped-GEMM workspace) is freed
+at ForwardLayers return and SAFELY shared between the two graphs — they replay
+SEQUENTIALLY on the one main stream, so only the retained logits needs two live
+copies. FIX: in the warm-capture branch, when dbuf, pre-grow the pool with a
+throwaway `[S,vocab]` f32 alloc+free (out-of-capture growth) so the captured logits
+alloc is a pool HIT. `fix-check` (ring ON, conc-4): PASS, 0 `capturing` lines.
+
+HAZARD-C IS REAL BY CONSTRUCTION, but its empirical RED does NOT reproduce on GB10.
+The captured decode graph re-reads its persistent host input buffers at EVERY replay
+(that is HOW `Refresh` updates each step's inputs; if it did not re-read, every
+replay would emit identical tokens, which it does not) — so overwriting them while a
+replay is in flight corrupts it, and the drain/ring is load-bearing IN PRINCIPLE. But
+the RED arm (drain skipped, ring OFF via `VT_ASYNC_EXECUTOR_NO_DBUF`) PASSED 3/3 at
+conc-4 AND 3/3 at conc-32 (`VT_ASYNC_SERVING_CONC=32`), and the deterministic POISON
+arm (overwrite the host inputs right AFTER `ReplayGraph`) also PASSED at conc-4. The
+reason: the baked H2D is a TINY, FAST copy (~32 ints for positions/slot_mapping) at
+the very START of the replay, and on GB10 the GPU executes it before the host
+completes a full depth-2 iteration and reaches the next `Refresh` — the race window
+is microscopic and closed by pipeline latency. So the token-exact serving gate at any
+reachable concurrency can neither RED nor meaningfully protective-GREEN the hazard;
+the divergence would require the host to outrun the GPU inside that ~1us H2D window,
+which does not happen at conc<=32 on this box. Per the brief's STOP rule the natural
+RED is unmet; recorded as an honest partial, not shipped-ON.
+
+RING CORRECTNESS (proven, the token gates are the authority). GREEN (ring ON,
+conc-32) `test_qwen36_async_serving` 5/5 consecutive PASS. OFF baseline (drain on,
+conc-32) PASS. SACRED SYNC `test_qwen36_paged_engine` with the ring ON (the ring is
+active on the sync path too, and the sync path is DETERMINISTIC token-exact) 3/3
+PASS — the ring produces byte-identical output. The ring is CORRECT; the OFF default
+is byte-identical to production by construction (single-slot, drain intact).
+
+MEMORY (paged-engine single load, `free -m` sampled): peak used OFF 46.8 GB vs ON
+44.5 GB of the 119 GB pool — the ~40-80 MB slot-doubling is BELOW the free-g noise
+floor (system-used swings GBs run-to-run) so it is not resolvable, but it is well
+within budget and there is no OOM. SANITIZER (compute-sanitizer memcheck, ring ON,
+`VT_ASYNC_EXECUTOR=1`, x2): both `ERROR SUMMARY: 0 errors`, exit=0 — NO invalid memory
+accesses. (`--leak-check full` additionally flags 726 `Leaked` reports, but all are
+intentionally-resident LOAD-TIME weight buffers — `BuildMarlinDensePairResident` /
+`PrepareMarlinResident` — identical OFF vs ON and freed at teardown, not a ring
+defect; plain memcheck, matching the prior methodology, is clean.) The repeated token
+gates remain the capture-safety authority, per the brief.
+
+DEFAULT DECISION: **OFF** (opt-in `VT_ASYNC_EXECUTOR`). The brief flips ON only on a
+clean speed win AND the full correctness bar; the empirical RED could not be met
+(hazard real-by-construction but unreproducible on GB10), so the conservative default
+is OFF with this honest result recorded. The ring is proven correct + capture-safe
+and stands as the provably-safe drain-removal mechanism and the stepping stone to the
+faithful Option A (move the per-step H2D OUT of the captured replay into persistent
+DEVICE buffers, vLLM states.py:64 / _prepare_input_ids — then no host-buffer reuse
+hazard exists and no ring is needed). SPEED A/B (`vllm bench serve`,
+decode-dominated random 128-in/256-out, single server load per arm, dual-lock):
+NEUTRAL — c16 output tok/s OFF 50.3/50.8 vs ON 50.6 (~1.00x); c32 OFF 93.6 vs ON 93.4
+(~0.998x). The drain-skip IS engaged (`VT_ASYNC_EXECUTOR_TRACE` logs skips). But this
+regime is host-orchestration / HTTP-streaming bound (TPOT ~312-337 ms, GPU ~14 W at
+96% "util"), so it does not cleanly isolate the engine-level overlap, and it is a
+different workload from the binding online-serving grid (which reports ~2300 tok/s
+TOTAL at c16). No measurable win here. Combined with the unreproducible RED, the
+default is OFF. The prior mirror A/B (drain MOVE) was likewise c16-neutral for the
+same host-bound reason; the true c16 recovery is Option A (out-of-graph device
+staging), of which this ring is the correct-and-safe stepping stone.
+
+RESIDUALS: (1) Option A is the faithful follow-up. (2) the eager exec_state_ 2-deep
+ring was NOT needed (the drain-on-eager fallback is retained; eager/mixed steps still
+own their logits and drain). (3) test-only knobs `VT_ASYNC_EXECUTOR_NO_DBUF`
+(ring-off), `VT_ASYNC_EXECUTOR_POISON` (deterministic host-input poison),
+`VT_ASYNC_EXECUTOR_TRACE` (drain-skip counter), `VT_ASYNC_SERVING_CONC` (gate
+concurrency) are retained for reproducing this analysis and future Option-A work.
 ## Qwen3.5-4B revalidation after merging current upstream (2026-08-05)
 
 Merged `upstream/main` at `59674cf1d` into the branch as `312af21a9`, rebuilt

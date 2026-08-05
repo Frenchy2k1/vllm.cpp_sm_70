@@ -20,8 +20,8 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **W7 device COMPUTE landed, CPU-gated** (`CLAIM-KIMI-LINEAR-W7`, `ACTIVE`): DBuf-resident `ForwardDeviceCompute` (2 host islands: KDA recurrence, NoPE-MLA softmax); `test_kimi_linear_forward` **12/12·614**; opt-in `VT_KIMI_DEVICE_COMPUTE=1` | GPU-verify: CUDA build, token-exact vs oracle, e2e §8 |
-| 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE lever **RESOLVED NEGATIVE**: attribution boundary (drain A/B collapses intake -91% but shifts to queued; arrival→sched GPU-bound, NEUTRAL). Probe kept, lever reverted | Real levers: prefill glue (task #61) + async device-resident executor (also the c16 fix) |
-| Async-serving decode bug **FIXED** | Batch-1 nondet token-0 garbage: combine device-write raced the decode-graph host read (SYNC SACRED missed it). FIX: `VT_ASYNC_DEVICE_MIRROR` **default ON**; gate `test_qwen36_async_serving` RED→GREEN, SACRED/UAF clean | MERGED (#31) |
+| 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE lever **RESOLVED NEGATIVE** (attribution boundary, drain A/B, sum invariant); probe kept, lever reverted | Real levers: prefill glue (task #61) + Option A (H2D out of capture) |
+| Async decode: mirror fix MERGED (#31); slot double-buffer (`VT_ASYNC_EXECUTOR`) landed gated **OFF** | Ring+reuse-event replaces the depth-2 drain; proven correct (async gate 5/5 @c32, SACRED 3/3, capture-malloc fixed); RED unreproducible, speed neutral in a host-bound regime | Option A follow-up; binding-harness A/B owed |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
