@@ -921,6 +921,16 @@ target_compile_definitions(test_qwen36_paged_engine PRIVATE
 target_include_directories(test_qwen36_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# ROW-SERVE-ASYNC-LLM — the ASYNC-serving 35B greedy token-exact gate (the
+# depth-2 AsyncLLM counterpart of the SYNC SACRED gate above). Reproduces the
+# async batch-1 token-0 degeneration P0 on the mirror-OFF default and proves the
+# device-resident mirror fixes it (checkpoint-gated, dgx-only; skips on CPU/CI).
+vllm_cpp_add_test(test_qwen36_async_serving parity/test_qwen36_async_serving.cpp)
+target_compile_definitions(test_qwen36_async_serving PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen36_async_serving PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # ADDITIVE-MODEL W4 — the SACRED token-exact gate: Qwen3-0.6B (dense) greedy
 # decode vs the vLLM 0.25.0 oracle, through the full paged engine
 # (checkpoint-gated, dgx-only; skips on CPU/CI when the snapshot is absent).

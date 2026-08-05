@@ -35799,3 +35799,138 @@ integrated path (drop the `is_integrated_gpu()` host-array branch) removes the
 is the device-resident-sampled-tokens architecture, not a small drain tweak.
 Evidence `dgx:~/work/q35-regrid/evidence/raw/35/ours/c16-r{1,2,3}-{abdrain,abevent}.json`;
 full A/B in benchmark-record. No source/kernel/model/gate mark changed (code at baseline).
+
+
+## 35B device-resident sampled tokens on integrated (VT_ASYNC_DEVICE_MIRROR): c16 NEUTRAL, but UNCOVERS a latent async-serving decode bug the mirror FIXES
+<!-- state: 2026-08-06T03:00 -->
+
+Followed up the prior drain A/B's "real lever = GPU-resident sampled tokens". Built
+it, gated `VT_ASYNC_DEVICE_MIRROR` (default OFF, OFF path byte-identical), A/B'd on
+dgx. Speed **NEUTRAL**; but the token-exactness probe surfaced a **pre-existing
+production bug** the mirror repairs.
+
+HAZARD RE-VERIFICATION (corrects the prior list). The prior note said enabling the
+mirror on integrated additionally needs hazard-A (double-buffer `exec_state_`) +
+hazard-C (block-table device buffer). VERIFIED against current code: those are real
+ONLY for a drain REMOVAL. This is a drain **MOVE**, not a removal — the drain stays
+but relocates from `execute_model` top to just before the forward. All bulk host
+prep (`update_states`+`prepare_inputs`+attn/GDN metadata — free functions on
+`input_batch_`, never `exec_state_`) runs before the moved drain and overlaps the
+GPU tail; `exec_state_` and the persistent decode-graph buffers stay guarded by the
+moved drain, so NO double-buffering is needed. Device combine/scatter/replay are all
+main-queue-ordered after the prior scatter, so token order is exact.
+
+IMPLEMENTED (`runner.cpp`/`runner.h`, gated; vLLM `states.py:64` +
+`gpu_model_runner.py:1786-1881`): `async_device_mirror()` engages on any real CUDA
+GPU (`!UnifiedMemory() || is_integrated_gpu()`, not CPU); combine+scatter sites put
+the mirror branch FIRST then the integrated host-array path; `execute_model` defers
+the drain+`exec_state_` reset to just before the forward on the mirror path only.
+
+GATES. CPU -Werror clean; test_runner 17/17 (incl. drain-invariant), input_batch
+25/25, combine_tokens 7/7, llm_engine 11/11, engine_core_proc 10/10, async_llm 8/8.
+dgx CUDA build (Release/121a/cutlass-4.5.0/TRITON) clean, 1669 GDN cubin syms (nm).
+SACRED `test_qwen36_paged_engine` mirror ON exit=0 (token-exact vs oracle, SYNC
+engine). UAF served ignore_eos bracket mt 4-128 all http 200 + ALIVE (mirror ON);
+compute-sanitizer memcheck **0 errors** + 2/2 SACRED cases pass (mirror ON).
+
+SPEED A/B (SAME binary, `VT_ASYNC_DEVICE_MIRROR` 0 vs 1, dual-lock, single load/arm,
+3 reps c16 + 1 c32, never reload/rep). c16 total tok/s OFF median **2305.8**
+(2305.8/2299.9/2311.7) vs ON **2303.3** (2305.8/2303.3/2297.5) = **0.999x**; c32
+**2928.9** vs **2919.1** = 0.997x. Bands overlap. **NEUTRAL — the drain-MOVE does
+NOT recover c16 (target 2489+).** Mechanism: the move overlaps only the small host
+prep; the drain still serializes GPU input staging before the next forward. The
+pre-fix 2489 was partly the unsafe RACE. Recovering it needs the drain-REMOVAL +
+double-buffered `exec_state_`/block-table (hazard-A/C) so the next forward stages
+while the current runs — the larger architecture the move deliberately avoids.
+
+★ CORRECTNESS FINDING (unexpected, high-value). The served greedy token-exactness
+probe DIFFERED OFF vs ON. Root-caused: the **async batch-1 greedy decode
+degenerates into repeated token-0 garbage** (" a young man named ... !!!!"),
+nondeterministically. This reproduces byte-identically on (a) my OFF path and (b)
+the UNCHANGED pinned production server (`~/work/q35-regrid/build` @`1ea26427`): both
+give the same 143-byte degenerate output, nondet 143/138/138. So it is a
+**pre-existing production bug**, not my regression (my OFF path == production). The
+device-resident mirror (ON) FIXES it: deterministic (623/623/623 bytes) coherent
+output. Never gated because SACRED uses the SYNC engine; the async served decode has
+no token-exact gate (matches the roadmap "C6 async-serving still GATING"). Likely
+cause: on the OFF integrated path the host-array combine patches a host id vector
+the batch-1 decode GRAPH does not read, so the decode input id goes stale; the
+mirror routes `device_token_ids` into the graph buffer via CopyInPlace.
+
+DECISION. Speed gate NEUTRAL → default stays **OFF** (no speed win → no flip per
+parity-enablers). Change KEPT gated (byte-identical production, tested; the fix for
+the correctness bug AND the base for the future drain-removal work). Did NOT flip
+default-ON on the correctness finding: the async mirror path lacks a token-exact
+oracle gate (only SYNC SACRED + observed determinism/coherence), and flipping a
+hot-path default needs the async-serving correctness gate first. TOP follow-ups: (1)
+add an async-serving (AsyncLLM/served) token-exact gate — the missing gate that let
+this ship; (2) precise root-cause of the batch-1 host-combine↔decode-graph
+interaction; (3) then decide the mirror default on correctness; (4) c16 speed still
+needs drain-removal + double-buffer. Evidence
+`dgx:~/work/mirror-ab/{mab-measure.log,mab-tokdiag.log,mab-prodcheck.log,evidence/raw/35/ours/c16-r{1,2,3}-abmirr{off,on}.json,greedy/*}`.
+
+
+## ROW-SERVE-ASYNC-LLM P0 RESOLVED: root-caused the async batch-1 token-0 degeneration, added the missing async-serving token-exact gate (RED-first), flipped the device mirror default ON
+<!-- state: 2026-08-06T14:00 -->
+
+Closed the P0 from `2026-08-06T03:00`: production async (AsyncLLM) batch-1 greedy
+decode on 35B NVFP4 nondeterministically degenerated into repeated token-0 garbage.
+Delivered all four: the missing GATE (RED-first), the ROOT CAUSE (file:line), the
+FIX (mirror default flip), and the c16 no-regression re-check.
+
+ROOT CAUSE (mechanism, file:line). On the async serving loop the sampled token is
+NOT written to `token_ids_cpu` synchronously — `sample_tokens_async`
+(`runner.cpp:2148-2154`, "The token VALUE append to token_ids_cpu ... is DELETED on
+the async path"). So the next step's `prepare_inputs`
+(`prepare_inputs.cpp:146-147`, `input_token_ids[t]=token_id(r,pos)`) reads a
+STALE/zero decode-row placeholder and RELIES on the device combine to splice the
+real token from `last_sampled_tokens`. On the pre-fix (`VT_ASYNC_DEVICE_MIRROR=0`)
+integrated path the combine patches `step.input_token_ids` on the MAIN QUEUE
+(`runner.cpp:982-986`) while the Qwen3.5 decode graph reads that SAME host vector on
+the CPU — `Qwen3_5DecodeGraph::Step`→`BuildPaddedDecode`
+(`qwen3_5.cpp:7634`)→`s.Refresh`/`CopyInPlace` (`qwen3_5.cpp:7641,7534`)→`EmbedInto`
+host→device upload (`qwen3_5.cpp:5923`) — with NO intervening sync. Unsynchronized
+device-write/host-read race: when the CPU wins, it embeds the zero placeholder →
+token-0 degeneration. NONDETERMINISTIC because it is a genuine per-decode-step data
+race (combine kernel launch/exec vs host prep). Why SACRED (SYNC engine) missed it:
+`LLMEngine::step` (`llm_engine.cpp:145`) calls `EngineCore::step` (depth-1, SYNC
+`sample_tokens`), which writes `token_ids_cpu` synchronously (`runner.cpp:1530-1531`)
+so the combine is REDUNDANT and the race harmless — only depth-2
+(`step_with_batch_queue`, AsyncLLM) exposes it. Confirmed on the box: RED arm
+degenerates run-to-run differently (`{...,271,271,...}` one rep, `{...,0,0,0,0}`
+others) — nondeterministic token-0 garbage.
+
+FIX (outcome B — the mirror IS the fix; parity-enablers). Flipped
+`VT_ASYNC_DEVICE_MIRROR` DEFAULT ON (one functional line in
+`AsyncDeviceMirrorEnvDefault`: on unless "0"). The mirror routes the combine's
+device output into the embed via `ApplyDeviceTokenIdsOverride` (`qwen3_5.cpp:5901`),
+main-queue-ordered after the combine, so the embed never does the racing host read
+— exactly upstream (states.py:64 device-resident prev_sampled_token_ids +
+gpu_model_runner.py `_prepare_input_ids` GPU gather). Chose the flip, NOT a
+per-step `Synchronize` after the combine on the OFF path: that band-aid reintroduces
+the host sync the async path exists to remove (a c16 regression) and is a GB10-only
+hack, not vLLM parity. The mirror is speed-neutral (prior c16 A/B 0.999x, re-checked
+below). `VT_ASYNC_DEVICE_MIRROR=0` is the rollback.
+
+GATE (deliverable 1, the missing async-serving token-exact gate that let this ship).
+`tests/parity/test_qwen36_async_serving.cpp` drives `LoadedEngine::async_engine()`
+(the depth-2 AsyncLLM path SACRED never exercises), batch-1 (5 reps) + a 4-way
+concurrency bracket, token-exact vs the SAME pinned oracle continuation
+(`qwen36_logits_35b/greedy_ids.npy`) the SYNC SACRED gate uses (greedy is
+deterministic regardless of interleave). Checkpoint-gated + dgx-only (needs the CUDA
+decode-graph + real GPU overlap); skips with a recorded reason on CPU/CI. RED→GREEN
+PROVEN on GB10 (same binary, env-toggled): `VT_ASYNC_DEVICE_MIRROR=0` → ctest
+exit=8 (FAIL, P0 reproduced); default (mirror ON) → 100% pass, 0 failed, 39.3s.
+
+GATES (all on the box, dual-lock, this binary). Async gate RED(=0)=FAIL /
+GREEN(default)=PASS. SACRED `test_qwen36_paged_engine` on the new default (mirror
+ON) exit=0 (SYNC token-exact vs oracle). UAF served ignore_eos bracket mt 4-128 on
+the DEFAULT server: all http 200 + ALIVE. compute-sanitizer memcheck on the async
+gate (default): MEMCHECK_EXIT=0 (ERROR SUMMARY: 0 errors; the async gate passed 39/39 assertions under the sanitizer). CPU: -Werror clean; runner/async_llm/
+llm_engine/engine_core_proc/input_batch 5/5 pass; the new gate compiles+links+skips.
+c16 3-rep on the FINAL default (no env → mirror ON), single load: total tok/s
+2312.9/2303.9/2294.4 (median 2303.9), c32 2942.7, vs the ~2305 drained baseline (rollback =0 arm median 2290.0) —
+NO regression. Evidence `dgx:~/work/mirror-ab/{asyncgate2-{RED,GREEN}.log,
+asyncgate-SACRED-default.log,mab-defmeasure.log,mab-asyncmemcheck.log,
+evidence/raw/35/ours/c16-r{1,2,3}-{defaulton,rollback0}.json}`. Commit on
+`row/SERVE-ASYNC-LLM`.

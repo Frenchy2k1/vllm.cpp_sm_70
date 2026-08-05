@@ -439,20 +439,27 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::unique_ptr<AsyncOutputPool> async_output_pool_;
   AsyncOutputPool& get_or_create_async_output_pool();
 
-  // ─── ENG-ASYNC-SCHED W4: discrete-CUDA device-resident async inputs ─────────
-  // On an INTEGRATED GPU the W3 combine/scatter kernels operate on the runner's
-  // host arrays in place, because pageable host memory is device-addressable
-  // there. A DISCRETE GPU cannot do that, and the host fallback has to
-  // synchronize the main stream to read the sampled ids — which is precisely
-  // what makes the depth-2 async scheduler overlap nothing on this hardware.
+  // ─── ENG-ASYNC-SCHED W4: CUDA device-resident async inputs ──────────────────
+  // last_sampled_tokens held in a persistent DEVICE buffer, the AUTHORITATIVE copy
+  // (the scatter writes it on the main queue and the next step's combine reads it
+  // there, so no sampled id crosses to the host on the critical path). Exactly
+  // what upstream does on every platform — vllm/v1/worker/gpu/states.py:64 makes
+  // last_sampled_tokens a GPU tensor unconditionally.
   //
-  // These are the discrete equivalent: the small per-step inputs the combine
-  // reads, held in persistent device buffers, with last_sampled_tokens the
-  // AUTHORITATIVE copy (the scatter writes it on the main queue and the next
-  // step's combine reads it there, so no sampled id ever crosses to the host on
-  // the critical path). That is exactly what upstream does on every platform —
-  // vllm/v1/worker/gpu/states.py:64 makes last_sampled_tokens a GPU tensor
-  // unconditionally.
+  // Two reasons to engage it (async_device_mirror, gated VT_ASYNC_DEVICE_MIRROR):
+  //  - DISCRETE GPU: REQUIRED. Its host arrays are not device-addressable, so the
+  //    W3 host fallback has to synchronize the main stream to read the sampled ids,
+  //    which makes the depth-2 async scheduler overlap nothing.
+  //  - INTEGRATED GPU (GB10): the W3 kernels CAN operate on the runner's host
+  //    arrays in place (pageable host memory is device-addressable), but then
+  //    update_states' condense reorders that host array between the scatter that
+  //    writes it and the combine that reads it — a read-after-write that pins the
+  //    async drain to the TOP of execute_model. Moving last_sampled_tokens onto
+  //    this device buffer removes that host RAW (condense records ops replayed
+  //    on-queue instead), which lets the drain MOVE past the bulk host prep.
+  //
+  // Sized once from the batch bound; all zero-initialized. The per-step uploads
+  // copy from the caller's pageable host buffers on purpose (see stage_upload).
   //
   // Sized once from the batch bound; all zero-initialized. The per-step uploads
   // copy from the caller's pageable host buffers on purpose (see stage_upload).
@@ -467,12 +474,14 @@ class GPUModelRunner final : public ModelRunnerBase {
     int32_t max_reqs = 0;
   };
   std::unique_ptr<AsyncDeviceInputs> async_device_inputs_;
-  // Allocate on first use, or return nullptr when this device does not need the
-  // mirror (integrated GPU, non-CUDA backend, or async not engaged). Caller
-  // treats nullptr as "take the pre-W4 path".
+  // Allocate on first use, or return nullptr when the mirror is not engaged
+  // (non-CUDA backend, async not engaged, or VT_ASYNC_DEVICE_MIRROR=0). Caller
+  // treats nullptr as "take the pre-W4 host-array path".
   AsyncDeviceInputs* get_or_create_async_device_inputs();
-  // True when this runner must mirror the async inputs onto the device: CUDA,
-  // async engaged, and the platform is NOT integrated. Memoized.
+  // True when this runner mirrors the async inputs onto the device: CUDA, async
+  // engaged, VT_ASYNC_DEVICE_MIRROR not "0", on a real GPU (integrated OR discrete;
+  // not the CPU backend). Memoized. Default ON since the 2026-08-06 correctness
+  // flip (ROW-SERVE-ASYNC-LLM P0); VT_ASYNC_DEVICE_MIRROR=0 is the rollback.
   bool async_device_mirror() const;
   mutable int async_device_mirror_cached_ = -1;  // -1 unknown, 0 no, 1 yes
   // Push the recorded InputBatch structural edits (seed/move/swap) to the device
