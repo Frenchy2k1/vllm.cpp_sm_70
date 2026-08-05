@@ -209,8 +209,8 @@ sub-agents": it does not attempt to detect who typed the code, it makes the
 *path* the rule — feature code reaches `main` only through a reviewed `row/*`
 PR, whoever produced it.
 
-**Activation.** W0 and W1 are implemented and CI-gated, but W1 is REPORT-ONLY:
-`ROLE_DISCIPLINE_SINCE` is `None`. Turning it on retroactively would redden
+**Activation.** W1 is ENFORCING since `44e8225c` (user-directed 2026-08-05).
+`ROLE_DISCIPLINE_SINCE` names that cutover. Turning it on retroactively would redden
 history created under the current, explicitly sanctioned direct-push policy. Set
 that constant to the cutover commit when the protocol is adopted, and every
 commit after it is enforced. Likewise `agent-preflight.sh` PRINTS the role every

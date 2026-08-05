@@ -14,11 +14,16 @@ gate, resolve a conflict or repair the record without a round trip -- an operato
 who cannot touch anything cannot review, which is the rubber-stamp failure the
 protocol is designed to avoid.
 
-ACTIVATION. `ROLE_DISCIPLINE_SINCE` is None, so this reports and passes. The
-protocol is accepted but not yet adopted, and the project currently pushes to
-main directly by explicit policy; switching this on retroactively would redden
-history that was created under the old rule. Set it to the cutover commit when
-the protocol goes live, and every commit after that commit is enforced.
+ACTIVATION. ENFORCING since the cutover commit 44e8225cf (user-directed
+2026-08-05). Every commit from that one ONWARD must land feature code through a
+merged `row/*` PR; everything before it is exempt, because it was created under
+the previous direct-push policy and rewriting that judgement retroactively would
+redden honest history. The cutover itself is a records-only commit, so it passes.
+
+What this changes in practice: feature paths (src/, include/, tests/, examples/,
+cmake/, CMakeLists.txt) can no longer be pushed straight to main. Integration
+paths (scripts/, .agents/, docs/, .github/) still can, deliberately, so the
+operator can fix a gate or repair the record without a round trip.
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # Set to the cutover commit SHA to switch enforcement on. None = report only.
-ROLE_DISCIPLINE_SINCE: str | None = None
+ROLE_DISCIPLINE_SINCE: str | None = "44e8225cf95fff12de6c5d4f3c3b4ecc9f0b1f94"
 
 # Product code. A change here must arrive through a reviewed row/* PR.
 FEATURE_PREFIXES = (

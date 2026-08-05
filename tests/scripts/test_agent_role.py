@@ -165,12 +165,26 @@ class RoleDiscipline(unittest.TestCase):
                 ["docs/STATUS.md", "src/vllm/a.cpp"])
         )
 
-    def test_report_only_until_the_cutover_is_named(self) -> None:
-        self.assertIsNone(
-            discipline.ROLE_DISCIPLINE_SINCE,
-            "enforcement must stay opt-in until the protocol is adopted",
-        )
-        self.assertFalse(discipline.enforced("HEAD"))
+    def test_enforcement_is_live_and_anchored_to_a_real_commit(self) -> None:
+        """Enabled 2026-08-05. The cutover must be a commit that exists."""
+        self.assertIsNotNone(discipline.ROLE_DISCIPLINE_SINCE)
+        import subprocess
+        subprocess.check_call(
+            ["git", "cat-file", "-e", f"{discipline.ROLE_DISCIPLINE_SINCE}^{{commit}}"],
+            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def test_the_cutover_commit_itself_is_exempt(self) -> None:
+        """History created under the previous direct-push policy stays green."""
+        self.assertTrue(discipline.enforced(discipline.ROLE_DISCIPLINE_SINCE))
+        first = discipline.git("rev-list", "--max-parents=0", "HEAD").split()[0]
+        self.assertFalse(discipline.enforced(first))
+
+    def test_a_direct_feature_push_after_cutover_now_FAILS(self) -> None:
+        """The whole point of enabling it: this is an error, not a report."""
+        problems = discipline.commit_violations(
+            "deadbee", ["p1"], "perf: hand-edit a kernel", "", ["src/vt/cuda/x.cu"])
+        self.assertTrue(problems)
+        self.assertTrue(discipline.enforced("HEAD"))
 
     def test_live_repository_is_reportable(self) -> None:
         self.assertEqual(discipline.main(), 0)

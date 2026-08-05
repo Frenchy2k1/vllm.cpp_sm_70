@@ -64,8 +64,8 @@ comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
 into a lock or worktree+PR; operator merges PRs first and does features only via
 sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
-START, which IS the claim. **W0-W5 LANDED**, CI-gated, enforcement OPT-IN
-(`ROLE_DISCIPLINE_SINCE` + `--require-role`). Queue: 4 rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
+START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
+`--require-role` still opt-in. Queue: 4 rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
 OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated
@@ -75,11 +75,12 @@ OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now h
 
 - Every commit carries `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by:`; never
   `Co-Authored-By` or `Signed-off-by` from AI.
-- Three MUST-route seams: fusion catalog, merged-GEMM family, born-on-the-runner
-  decode. Not routing is drift — allowlist consciously or fold.
+- Three MUST-route seams: fusion, merged-GEMM, born-on-the-runner decode.
+  Not routing is drift; allowlist consciously or fold.
 - Mirror vLLM; never ask how a feature should behave.
-- `nsys` BOTH sides, SAME tool, before any perf claim; cross-tool per-kernel
-  comparisons can NEVER establish invocation parity; whole-run sums mix prefill.
-- GPU box discipline: park `local-ai-worker`, flock `$HOME/gpu.lock`,
-  single-load steady-state, never reload per rep, named tmux.
+- `nsys` BOTH sides, SAME tool, before any perf claim; cross-tool comparisons
+  never establish invocation parity; whole-run sums mix prefill.
+- GPU: park `local-ai-worker`, flock `$HOME/gpu.lock`, single-load
+  steady-state, never reload per rep, named tmux.
 - Never weaken a checker to pass; repair the record.
+- Feature code needs a `row/*` PR (enforced); integration paths push direct.
