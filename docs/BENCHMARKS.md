@@ -99,7 +99,7 @@ and coherent. The missing gate now exists, `test_qwen36_async_serving` (depth-2
 AsyncLLM, batch-1 + concurrency, token-exact vs the SACRED oracle): RED on `=0`, GREEN
 on the default. c16 re-checked on the default: 2312.9/2303.9/2294.4 (median
 **2303.9**), c32 2942.7 (no regression). Root cause + file:line in the benchmark
-record.
+record. The intake-drain lever likewise measured NEUTRAL (2026-08-06, `VT_INTAKE_DRAIN` A/B 3+3 reps): admitting during the forward wait collapses intake -91% but shifts it into queued, arrival-to-scheduled invariant, so the recorded INTAKE term is an attribution boundary over a GPU-bound prefill wait, not reducible; lever reverted, byte-exact `VT_LOOP_TRACE` probe kept.
 
 ### DeepSeek-V2-Lite (MLA)
 

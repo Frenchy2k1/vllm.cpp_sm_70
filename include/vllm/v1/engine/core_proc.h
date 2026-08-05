@@ -122,6 +122,13 @@ class BlockingQueue {
     return items_.empty();
   }
 
+  // DIAGNOSTIC (VT_LOOP_TRACE): current backlog depth. Not on any hot path when
+  // the trace is off; used only to attribute input-queue residence.
+  std::size_t size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return items_.size();
+  }
+
  private:
   mutable std::mutex mutex_;
   std::condition_variable cv_;
@@ -134,6 +141,10 @@ struct EngineCoreInputItem {
   EngineCoreRequestType type = EngineCoreRequestType::kWakeup;
   std::unique_ptr<Request> request;      // kAdd payload
   std::vector<std::string> request_ids;  // kAbort payload
+  // DIAGNOSTIC (VT_LOOP_TRACE): MonotonicSeconds() at enqueue, stamped only when
+  // the trace is on. 0.0 => not stamped; the drain measures residence = drain -
+  // enqueue to attribute the INTAKE (arrival->QUEUED) admission latency.
+  double enqueue_ts = 0.0;
 };
 
 // The output-queue message: upstream tuple[int, EngineCoreOutputs] | bytes
@@ -235,6 +246,39 @@ class EngineCoreProc : public EngineCore {
   // VllmConfig.shutdown_timeout (vllm/config/vllm.py:377): selects the
   // abort-vs-drain shutdown mode in handle_shutdown (core.py:1330-1332).
   int shutdown_timeout_s_ = 0;
+
+  // DIAGNOSTIC (VT_LOOP_TRACE): busy-loop cadence + input-queue residence probe.
+  // ZERO behavioral effect when the env var is unset (byte-identical) — every
+  // field is read/written only under `loop_trace_.enabled`. It answers the one
+  // open question in the INTAKE attribution: is the admission wait ~= the step
+  // cadence (a request waits one busy-loop iteration for the drain), or is the
+  // input queue backing up (residence >> iteration)? Windowed 1 s aggregate is
+  // printed to stderr, tagged LOOPTRACE. All fields live on the engine thread.
+  struct LoopTrace {
+    bool enabled = false;
+    bool initialized = false;
+    double window_start = 0.0;     // wall of the current dump window
+    double last_iter_start = 0.0;  // wall at the top of the previous iteration
+    long iters = 0;                // iterations this window
+    double interval_sum = 0.0;     // full-iteration cadence (drain+step)
+    double interval_max = 0.0;
+    double step_sum = 0.0;  // process_engine_step wall
+    double step_max = 0.0;
+    long admits = 0;         // kAdd requests admitted this window
+    long admits_max = 0;     // max admitted in a single drain
+    double resid_sum = 0.0;  // enqueue->drain residence over admits
+    double resid_max = 0.0;
+    long depth_max = 0;  // max input_queue backlog seen at a drain
+  } loop_trace_;
+
+  // Per-drain admit counter (reset each process_input_queue), folded into the
+  // window aggregate. Only touched under loop_trace_.enabled.
+  long loop_trace_drain_admits_ = 0;
+
+  // Fold one admitted request's residence into the window (VT_LOOP_TRACE).
+  void loop_trace_record_admit(double enqueue_ts);
+  // Emit + reset the window aggregate if >= 1 s has elapsed (VT_LOOP_TRACE).
+  void loop_trace_maybe_dump(double now);
 };
 
 }  // namespace vllm::v1

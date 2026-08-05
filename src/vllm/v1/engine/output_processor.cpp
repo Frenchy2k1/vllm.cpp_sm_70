@@ -4,6 +4,8 @@
 #include "vllm/v1/engine/output_processor.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <stdexcept>
 #include <utility>
@@ -499,6 +501,34 @@ OutputProcessorOutput OutputProcessor::process_outputs(
         f.inference_time = req_state.last_token_ts - req_state.scheduled_ts;
         // num_cached_tokens deferred → 0.
         iteration_stats->finished_requests.push_back(f);
+      }
+
+      // DIAGNOSTIC (VT_TTFT_DUMP): the async serving frontend calls
+      // process_outputs with iteration_stats == nullptr, so the FinishedRequest
+      // block above never runs and the per-request queue/prefill/decode split is
+      // invisible on the production /metrics path (deliberately 404, see
+      // api_server.cpp). This env-gated stderr line reconstructs that split
+      // directly from the event-populated req_state timestamps (identical
+      // arithmetic to stats.py:459-476), so a serving TTFT attribution can read
+      // vLLM's own request_{queue,prefill,decode}_time_seconds against ours on
+      // the SAME workload. Reads only; byte-identical generation when unset.
+      static const bool kDumpTtftSplit = std::getenv("VT_TTFT_DUMP") != nullptr;
+      if (kDumpTtftSplit) {
+        // intake = QUEUED - arrival: the async engine-core intake wait, from
+        // OutputProcessor registration (arrival_time, MonotonicSeconds set in
+        // add_request AFTER tokenize) to the scheduler's QUEUED event (same
+        // steady clock). This isolates the engine-side ingress cost (input-queue
+        // drain / step cadence) from tokenize (before arrival) and egress.
+        const double intake = req_state.queued_ts - req_state.arrival_time;
+        const double queued = req_state.scheduled_ts - req_state.queued_ts;
+        const double prefill = req_state.first_token_ts - req_state.scheduled_ts;
+        const double decode = req_state.last_token_ts - req_state.first_token_ts;
+        const double e2e = engine_core_timestamp - req_state.arrival_time;
+        std::fprintf(stderr,
+                     "TTFTSPLIT rid=%s intake=%.6f queued=%.6f prefill=%.6f "
+                     "decode=%.6f e2e=%.6f gen=%lld\n",
+                     req_id.c_str(), intake, queued, prefill, decode, e2e,
+                     static_cast<long long>(req_state.num_generation_tokens));
       }
 
       FinishRequest(req_state);  // invalidates req_state / it

@@ -8,6 +8,8 @@
 #include "vllm/v1/engine/core_proc.h"
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <thread>
 
@@ -54,16 +56,98 @@ bool EngineCoreProc::is_running() const {
 void EngineCoreProc::run_busy_loop() {
   // core.py:1259-1266. Upstream ends with `raise SystemExit`, caught by
   // run_engine_core; here the loop simply returns and the engine thread ends.
-  while (handle_shutdown()) {
-    // 1) Poll the input queue until there is work to do.
-    process_input_queue();
-    // 2) Step the engine core and return the outputs.
-    process_engine_step();
+
+  // DIAGNOSTIC (VT_LOOP_TRACE): read the env once on the engine thread. Off =>
+  // the loop below is byte-identical to the upstream port (every trace read is
+  // guarded by loop_trace_.enabled).
+  if (!loop_trace_.initialized) {
+    loop_trace_.initialized = true;
+    loop_trace_.enabled = std::getenv("VT_LOOP_TRACE") != nullptr;
+    if (loop_trace_.enabled) {
+      loop_trace_.window_start = MonotonicSeconds();
+      loop_trace_.last_iter_start = loop_trace_.window_start;
+    }
   }
+
+  while (handle_shutdown()) {
+    if (!loop_trace_.enabled) {
+      // 1) Poll the input queue until there is work to do.
+      process_input_queue();
+      // 2) Step the engine core and return the outputs.
+      process_engine_step();
+      continue;
+    }
+    // Instrumented path: measure the full-iteration cadence (the admission wait
+    // a fresh request pays for the once-per-iteration drain) and the step wall.
+    const double iter_top = MonotonicSeconds();
+    const double interval = iter_top - loop_trace_.last_iter_start;
+    loop_trace_.last_iter_start = iter_top;
+    loop_trace_.iters += 1;
+    loop_trace_.interval_sum += interval;
+    if (interval > loop_trace_.interval_max) loop_trace_.interval_max = interval;
+
+    process_input_queue();
+
+    const double step_t0 = MonotonicSeconds();
+    process_engine_step();
+    const double step_dt = MonotonicSeconds() - step_t0;
+    loop_trace_.step_sum += step_dt;
+    if (step_dt > loop_trace_.step_max) loop_trace_.step_max = step_dt;
+    loop_trace_maybe_dump(MonotonicSeconds());
+  }
+}
+
+void EngineCoreProc::loop_trace_record_admit(double enqueue_ts) {
+  // VT_LOOP_TRACE: fold one admitted kAdd request's input-queue residence
+  // (enqueue -> drain) into the window. Caller guards on loop_trace_.enabled.
+  loop_trace_.admits += 1;
+  loop_trace_drain_admits_ += 1;
+  if (enqueue_ts > 0.0) {
+    const double resid = MonotonicSeconds() - enqueue_ts;
+    loop_trace_.resid_sum += resid;
+    if (resid > loop_trace_.resid_max) loop_trace_.resid_max = resid;
+  }
+}
+
+void EngineCoreProc::loop_trace_maybe_dump(double now) {
+  // VT_LOOP_TRACE: emit + reset the 1 s window aggregate. interval == the
+  // admission cadence (one drain per iteration); resid == the measured
+  // arrival->QUEUED input-queue wait; depth_max/admits_max expose backlog.
+  const double elapsed = now - loop_trace_.window_start;
+  if (elapsed < 1.0 || loop_trace_.iters == 0) return;
+  const double iters = static_cast<double>(loop_trace_.iters);
+  const double amean =
+      loop_trace_.admits > 0
+          ? loop_trace_.resid_sum / static_cast<double>(loop_trace_.admits)
+          : 0.0;
+  std::fprintf(
+      stderr,
+      "LOOPTRACE win=%.3f iters=%ld interval_ms(mean/max)=%.3f/%.3f "
+      "step_ms(mean/max)=%.3f/%.3f admits=%ld admits_max/drain=%ld "
+      "resid_ms(mean/max)=%.3f/%.3f depth_max=%ld\n",
+      elapsed, loop_trace_.iters, 1e3 * loop_trace_.interval_sum / iters,
+      1e3 * loop_trace_.interval_max, 1e3 * loop_trace_.step_sum / iters,
+      1e3 * loop_trace_.step_max, loop_trace_.admits, loop_trace_.admits_max,
+      1e3 * amean, 1e3 * loop_trace_.resid_max, loop_trace_.depth_max);
+  // Reset the window (keep last_iter_start / initialized).
+  loop_trace_.window_start = now;
+  loop_trace_.iters = 0;
+  loop_trace_.interval_sum = loop_trace_.interval_max = 0.0;
+  loop_trace_.step_sum = loop_trace_.step_max = 0.0;
+  loop_trace_.admits = loop_trace_.admits_max = 0;
+  loop_trace_.resid_sum = loop_trace_.resid_max = 0.0;
+  loop_trace_.depth_max = 0;
 }
 
 void EngineCoreProc::process_input_queue() {
   // core.py:1269-1298. "Exits when an engine step needs to be performed."
+  if (loop_trace_.enabled) {
+    // VT_LOOP_TRACE: snapshot the backlog this drain must clear and reset the
+    // per-drain admit counter (folded into admits_max at the tail).
+    loop_trace_drain_admits_ = 0;
+    const long depth = static_cast<long>(input_queue.size());
+    if (depth > loop_trace_.depth_max) loop_trace_.depth_max = depth;
+  }
   while (!has_work() && is_running()) {
     // core.py:1273 _notify_idle_state_callbacks() — deferred (pause/sleep).
     // core.py:1275-1278 aborts_queue drain — deferred with the aborts_queue
@@ -88,6 +172,10 @@ void EngineCoreProc::process_input_queue() {
   EngineCoreInputItem item;
   while (input_queue.try_get(item)) {
     handle_client_request(item);
+  }
+
+  if (loop_trace_.enabled && loop_trace_drain_admits_ > loop_trace_.admits_max) {
+    loop_trace_.admits_max = loop_trace_drain_admits_;
   }
 }
 
@@ -168,6 +256,12 @@ void EngineCoreProc::handle_client_request(EngineCoreInputItem& item) {
       if (shutdown_state.load() != EngineShutdownState::kRunning) {
         send_finish_outputs({item.request->request_id}, FinishReason::kAbort);
         return;
+      }
+      // VT_LOOP_TRACE: measure residence BEFORE add_request stamps the QUEUED
+      // event, so resid endpoint == the scheduler's QUEUED timestamp (the same
+      // point the TTFTSPLIT intake terminates at).
+      if (loop_trace_.enabled) {
+        loop_trace_record_admit(item.enqueue_ts);
       }
       add_request(std::move(item.request));
       return;
