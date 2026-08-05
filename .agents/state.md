@@ -35236,6 +35236,38 @@ stamp. Record checkers green (`check-model-checklist`, `check-agent-record`, `ch
 `check-now-current`). Co-owns the row with `CLAIM-MLA-DEEPSEEK` (MLA half) + `CLAIM-KDA-KERNEL`
 (KDA host refs). NEXT: W1 registry + `ParseKimiLinearParams` (CPU). No source/kernel/gate changed.
 
+## W3 LANDED: 31 never-inventoried architectures rowed; the "43" was itself overstated
+<!-- state: 2026-08-05T09:00 -->
+
+Every vLLM registry architecture now carries a row: **362 upstream, 362 named**.
+
+**The count was wrong twice, and the tooling caught it both times.** The hand
+audit said 62; W1's tooling said 43; applying it revealed **12 of those 43
+already had rows** under names the detector could not see - `GritLM`,
+`MiniCPMO`, `ExaoneMoeMTP` and nine others carry no `ForCausalLM`-style suffix,
+so a suffix-anchored regex reported them as absent. The duplicate-ID check in
+`check-agent-record.py` refused the rows outright, which is how it surfaced.
+**31 architectures were genuinely new.** The detector now counts any backticked
+CamelCase token in the matrix rather than suffix-matching, so this class of
+undercount cannot recur.
+
+The sequence is worth keeping: grep said 62, tooling said 43, applying said 31.
+Each step was more grounded than the last, and only the last one touched the
+record.
+
+**What landed:** 31 rows, each citing its `registry.py:LINE` and module path,
+classified from the registry dict it lives in - 17 multimodal, 10 speculative
+draft heads, 10 embedding/retrieval/classification, 4 text-generation, 2
+backend-generic. All `INVENTORIED` with "☐ required" spikes. Pinned MODEL count
+327 -> 358; the lifecycle rollup was recomputed from the real states
+(`INVENTORIED` 284 -> 315).
+
+Inventorying is not committing: these rows claim nothing, no capability mark
+moved, and whether any is worth building is now a visible roadmap decision
+rather than an invisible gap.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
 ## DeepSeek-V4 Phase-2 routed-expert residency MEASURED NEGATIVE, held default-OFF
 <!-- state: 2026-08-05T12:00 -->
 
@@ -35627,35 +35659,3 @@ match/beat every axis — the KDA per-channel-decay device recurrence op + a dev
 exp/softplus KDA-gate op + the mla::ForwardMlaAttentionBlock paged wiring +
 grouped-MoE slabs replace the two host-fallback islands.
 
-
-## W3 LANDED: 31 never-inventoried architectures rowed; the "43" was itself overstated
-<!-- state: 2026-08-05T09:00 -->
-
-Every vLLM registry architecture now carries a row: **362 upstream, 362 named**.
-
-**The count was wrong twice, and the tooling caught it both times.** The hand
-audit said 62; W1's tooling said 43; applying it revealed **12 of those 43
-already had rows** under names the detector could not see - `GritLM`,
-`MiniCPMO`, `ExaoneMoeMTP` and nine others carry no `ForCausalLM`-style suffix,
-so a suffix-anchored regex reported them as absent. The duplicate-ID check in
-`check-agent-record.py` refused the rows outright, which is how it surfaced.
-**31 architectures were genuinely new.** The detector now counts any backticked
-CamelCase token in the matrix rather than suffix-matching, so this class of
-undercount cannot recur.
-
-The sequence is worth keeping: grep said 62, tooling said 43, applying said 31.
-Each step was more grounded than the last, and only the last one touched the
-record.
-
-**What landed:** 31 rows, each citing its `registry.py:LINE` and module path,
-classified from the registry dict it lives in - 17 multimodal, 10 speculative
-draft heads, 10 embedding/retrieval/classification, 4 text-generation, 2
-backend-generic. All `INVENTORIED` with "☐ required" spikes. Pinned MODEL count
-327 -> 358; the lifecycle rollup was recomputed from the real states
-(`INVENTORIED` 284 -> 315).
-
-Inventorying is not committing: these rows claim nothing, no capability mark
-moved, and whether any is worth building is now a visible roadmap decision
-rather than an invisible gap.
-
-No source, kernel, model, gate, benchmark or capability mark changed.

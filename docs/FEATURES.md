@@ -150,7 +150,7 @@ kernels for it.
 | Streaming (SSE) | ✅ | ✅ | ✅ | ✅ |
 | Offline batch API | ✅ | ✅ | ◐ | ☐ |
 | Prometheus metrics | ✅ | ✅ | ✅ | ◐ |
-| Plugin / out-of-tree model registration | ✅ | ✅ | ◐ | ☐ |
+| Plugin / out-of-tree model registration | ✅ in-tree factory `DONE` + plugin seam | ✅ | ◐ | ☐ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |
 | Embedding / pooling endpoints | ◐ engine only | ✅ | ✅ | ✅ |
 | Flat C ABI for embedding in other languages | ✅ versioned | ☐ | ☐ | ✅ |
