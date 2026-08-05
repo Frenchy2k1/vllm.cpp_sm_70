@@ -111,7 +111,7 @@ the registered engine forward.
 | Draft model | ◐ CPU brick | ✅ | ✅ |
 | Medusa | ◐ CPU brick | ✅ | ✅ |
 | EAGLE | ☐ | ✅ | ✅ |
-| DFlash block diffusion | ◐ ~2x over spec-off | ✅ | ☐ |
+| DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ☐ | ✅ | ✅ |
 
 ## Structured output and tool calling

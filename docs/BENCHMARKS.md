@@ -253,7 +253,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | Speculator | Model | Result | Status |
 |---|---|---|---|
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
-| DFlash | Qwen3.6-27B NVFP4 | ~2x over spec-off, below vLLM throughput | bf16 acceptance floor open |
+| DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 
 ## How we measure
 
@@ -302,7 +302,7 @@ built on it rather than keeping the flattering one.
 | Laguna-XS NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
-| DFlash speculative decode | Below vLLM throughput | bf16 acceptance floor ~0.85x |
+| DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
 | Kimi-Linear-48B-A3B (KDA+MLA+MoE) | Full-model GB10 e2e RUNS (bf16-resident §13), NEAR-TIE 106/128, pool math CLOSES; default OFF | Full model RUNS on GB10 (bf16-resident, RSS peak 1.7 GiB, min-avail 21 GiB, no OOM). Token NEAR-TIE 106/128 (6/8 prompts exact, numerics vs deterministic oracle). 1.59 tok/s. Detail: spec §13 |
