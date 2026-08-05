@@ -304,6 +304,53 @@ std::vector<int32_t> KimiLinearGreedyDecode(const KimiLinearHostWeights& host,
                                             const std::vector<int32_t>& prompt,
                                             int num_new);
 
+// ─── PER-OP DEVICE-COMPUTE PRIMITIVES (W7, kimi_linear_device.cpp) ──────────────
+// The REAL DBuf-resident device-compute lane — each primitive routes the whole
+// per-layer/per-block computation through the shared vt:: device ops on POOLED
+// DBufs (embed/GEMMs/norms/convs/L2Norm/gated-norm/MoE router+combine), with two
+// documented HOST-FALLBACK islands where no portable device op yet expresses the
+// KDA-specific numerics (the per-k-channel gated-delta RECURRENCE + its exp/
+// softplus decay gate — vt::GdnDecode carries only a per-HEAD scalar decay, ops.h
+// GdnPrefill/GdnDecode "g/beta[T,Hv]") and the NoPE-MLA attention CORE (the device
+// path is mla::ForwardMlaAttentionBlock over the runner's paged het-KV + the
+// load-time W_UK/W_UV absorption — the born-on-runner residual). These islands are
+// the W7-speed residuals; every OTHER op is genuine on-device vt:: dispatch.
+//
+// Because the CPU backend executes the SAME vt:: dispatch (a pooled DBuf is a
+// device buffer on CPU too, and ResidentWeight ALIASES the host weight bytes on
+// CPU), running these on a CPU queue and matching the W2 host f32 reference is a
+// REAL wiring gate — the residual/vt-op/routing plumbing the GPU will run, proven
+// on CPU. Activations are f32 DBufs (the reference holds f32), so the match is
+// tight (f32-accumulation-order only). GPU numerics (bf16 activations for vLLM
+// parity, the GDN Triton-AOT decode cubins, the paged het-KV, the grouped-MoE
+// slabs) stay a NAMED pending — box down. Each returns the host [num_tokens,*]
+// result of the device compute so the per-op gate can compare to the W2 reference.
+std::vector<float> KimiKdaLayerForwardDevice(const KdaLayerHostWeights& w,
+                                             const std::vector<float>& hidden_normed,
+                                             const KimiLinearParams& p,
+                                             int64_t num_tokens, vt::Queue& queue);
+std::vector<float> KimiNoPEMlaLayerForwardDevice(const MlaLayerHostWeights& w,
+                                                 const std::vector<float>& hidden_normed,
+                                                 const KimiLinearParams& p,
+                                                 int64_t num_tokens, vt::Queue& queue);
+std::vector<float> KimiMoeBlockForwardDevice(const MoeHostWeights& w,
+                                             const std::vector<float>& hidden_normed,
+                                             const KimiLinearParams& p,
+                                             int64_t num_tokens, vt::Queue& queue);
+std::vector<float> KimiDenseMlpForwardDevice(const MlpHostWeights& w,
+                                             const std::vector<float>& hidden_normed,
+                                             const KimiLinearParams& p,
+                                             int64_t num_tokens, vt::Queue& queue);
+
+// Opt-in switch (VT_KIMI_DEVICE_COMPUTE, default OFF) that makes the runner
+// `ForwardDevice` seam route through `ForwardDeviceCompute` (the real device
+// compute) instead of the W6 host-reference compose. Default-OFF keeps the
+// CPU-VERIFIED host-ref-compose seam as the production runner path until the
+// device compute is GPU-verified against the SACRED oracle; the flag exists so the
+// device compute CAN be exercised as the runner path for that verification when
+// the box is up. Mirrors the project's gated-default-OFF in-flight convention.
+bool KimiDeviceComputeEnabled();
+
 // The Kimi-Linear forward.
 //   Forward (host, the `!gather_logits` reference path): a REAL CPU reference over
 //     the host float weights — the whole 27-layer KDA/NoPE-MLA hybrid + 256-expert
@@ -328,6 +375,22 @@ class KimiLinearModel {
       vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
 
   static ForwardLogits ForwardDevice(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+
+  // W7 — the REAL DBuf-resident device COMPUTE forward. Composes the whole
+  // 27-layer KDA/NoPE-MLA + 256-expert-MoE hybrid over POOLED f32 DBufs through
+  // the shared vt:: device ops (embed -> per-layer FusedChain add+RMSNorm ->
+  // KDA/NoPE-MLA self-attn -> FusedChain -> dense/MoE MLP -> final FusedChain ->
+  // lm_head), returning DEVICE-RESIDENT [rows,vocab] f32 logits (the same pooled-
+  // DBuf carrier ForwardDevice returns). The two documented host-fallback islands
+  // (the KDA per-k-channel recurrence + decay gate; the NoPE-MLA attention core)
+  // are the W7-speed residuals. CPU-gated against the W2 host reference
+  // (KimiLinearModel::Forward) — see the per-op primitives above. GPU numerics are
+  // a NAMED pending. Reachable as the runner path via VT_KIMI_DEVICE_COMPUTE=1.
+  static ForwardLogits ForwardDeviceCompute(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const KimiLinearWeights& weights,

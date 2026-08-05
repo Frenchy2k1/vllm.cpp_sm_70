@@ -473,6 +473,59 @@ golden remain. Every op named is CPU+CUDA-registered except the bf16 grouped-MoE
 
 ---
 
+## 10. W7 DEVICE COMPUTE LANDED, CPU-gated (2026-08-05, `CLAIM-KIMI-LINEAR-W7`)
+
+The §9 plan is now IMPLEMENTED in the additive TU
+`src/vllm/model_executor/models/kimi_linear_device.cpp`.
+`KimiLinearModel::ForwardDeviceCompute` composes the whole 27-layer hybrid over
+POOLED f32 `DBuf`s through the SHARED `vt::` device ops (mirroring `deepseek_v2.cpp`'s
+device forward). **On device** (genuine `vt::` dispatch): `vt::Embedding`; the
+residual add+RMSNorm glue via `vt::FusedChain(kFusedAddRmsNormStd)`; every projection
+via `vt::MatmulBT` (host weights are torch `[out,in]`=`[N,K]`); the 3 KDA short convs
+via `vt::CausalConv1dFwd` (silu, fresh zero conv-state); q/k `vt::L2Norm`; the KDA
+output `vt::RmsNormGated` (sigmoid); the MoE router `vt::MoeRouterTopK` (sigmoid
+`noaux_tc`, group 1/1, `e_score_correction_bias`, `routed_scaling=2.446`); the
+per-expert / dense / shared SwiGLU via `vt::MoeSiluMul`; the weighted `vt::MoeCombine`;
+the `lm_head` `vt::MatmulBT`; device-resident logits via the pooled-`DBuf` carrier.
+
+**Two documented HOST-FALLBACK islands (the W7-speed residuals — no portable device
+op yet):** (1) the **KDA per-k-channel gated-delta RECURRENCE + its decay gate**
+`g=-exp(A_log)*softplus(f_b(f_a(x))+dt_bias)` + `beta=sigmoid(b_proj)` — `vt::GdnDecode`
+/`GdnPrefill` carry only a per-HEAD scalar decay `g[T,Hv]` (ops.h), so they CANNOT
+express KDA's per-channel `g[T,H,D]`; computed on host from the device-resident
+q/k/v/g1/beta via the landed `kimi_kda` refs + the reference recurrence, then
+uploaded. (2) the **NoPE-MLA attention CORE** (causal softmax) — the device path is
+`mla::ForwardMlaAttentionBlock` over the runner's paged het-KV + load-time W_UK/W_UV
+absorption (the born-on-runner residual), so this seam keeps every MLA projection +
+`kv_a_layernorm` + `kv_b` ON DEVICE and computes only the softmax core on host
+(identical materialized-MHA math, NoPE so no RoPE).
+
+**Why a CPU match is a REAL gate:** the CPU backend runs the SAME `vt::` dispatch (a
+pooled `DBuf` is a device buffer on CPU; weights alias the host f32 bytes exactly as
+`ResidentWeight`'s CPU branch), and activations are f32 (the reference holds f32), so
+the device compute matching the W2 host f32 reference proves the residual-stream /
+vt-op / MoE-routing / device-logits WIRING the GPU will run — only the GPU numerics
+stay pending. Gate `tests/vllm/models/test_kimi_linear_forward.cpp` **12/12·614**:
+(f) KDA layer device==ref (rtol 3e-3), (g) NoPE-MLA (rtol 1e-4), (h) MoE + dense
+(rtol 2e-4/1e-4 — the device router selects the SAME experts, lowest-index tie),
+(i) the whole `ForwardDeviceCompute` == ref logits (rtol 5e-3) AND
+greedy-token-identical AND device-resident, (j) `ForwardDevice` reaches the device
+compute under the opt-in flag. Runner routing: `ForwardDevice` routes to
+`ForwardDeviceCompute` under `VT_KIMI_DEVICE_COMPUTE=1` (default OFF keeps the
+CPU-verified W6 host-ref compose as production until GPU-verified).
+
+**HONEST — NOT DONE for GPU (box down):** bf16 activations (vLLM parity), the GDN
+Triton-AOT decode cubins, the paged het-KV, the grouped-MoE slabs, and the e2e SACRED
+greedy golden vs the pinned oracle (§8) stay a NAMED pending. Box-return: CUDA build
+(`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`), run
+`test_kimi_linear_forward` on a CUDA queue (token-identical to the W2 ref within a
+bf16 envelope), then the §8 e2e golden, then speed (`nsys` both sides, replacing the
+two host-fallback islands with a device KDA per-channel recurrence + exp/softplus gate
+op + the paged `mla::ForwardMlaAttentionBlock` + the grouped-MoE slabs). Row STAYS
+`ACTIVE`.
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope
@@ -542,13 +595,19 @@ landed). W7 device compute depends on the reused GDN/MLA/MoE device blocks (land
 KDA/MLA kernels so nothing is implemented twice.
 
 ## Work breakdown
-**DONE:** W0 spike -> W1 registry/config/loader -> W2-W6 CPU reference forward -> **W6
-device-resident-logits SEAM (this brick).** **Residual (keeps the row out of DONE):**
-(a) the DBuf-resident device COMPUTE (§9 — KDA via the GDN family, NoPE-MLA via
-`mla::ForwardMlaAttentionBlock`, the DeepSeek-V2 grouped-MoE, over the paged het-KV;
-GPU-verify-pending); (b) the KDA decay-gate host-fallback -> a device exp/softplus
-composition (W7-speed); (c) the W0/W7 e2e SACRED golden on GB10 (§8 recipe);
-(d) speed. Full W0-W7 table in §5.
+**DONE:** W0 spike -> W1 registry/config/loader -> W2-W6 CPU reference forward -> W6
+device-resident-logits SEAM -> **W7 DBuf-resident device COMPUTE, CPU-gated (§10 —
+the whole hybrid over pooled DBufs via the shared `vt::` ops; two documented
+host-fallback islands: the KDA per-k-channel recurrence+gate and the NoPE-MLA softmax
+core; `test_kimi_linear_forward` 12/12·614 device==W2 ref + greedy-identical; runner
+opt-in `VT_KIMI_DEVICE_COMPUTE=1`).** **Residual (keeps the row out of DONE, all
+GPU-verify / box-down):** (a) the GPU numerics of the device compute — bf16
+activations (vLLM parity), the GDN Triton-AOT cubins, the paged het-KV, the
+grouped-MoE slabs — token-exact vs the pinned oracle on a CUDA queue; (b) the two
+host-fallback islands -> device ops (a KDA per-channel-decay recurrence + an
+exp/softplus KDA-gate op; the paged `mla::ForwardMlaAttentionBlock` over W_UK/W_UV
+absorption) (W7-speed); (c) the W0/W7 e2e SACRED golden on GB10 (§8 recipe);
+(d) speed. Full W0-W7 table in §5; W7 detail in §10.
 
 ## Risks/decisions
 - **Decision (correctness-first, box down):** W6 lands the runner SEAM + the full
