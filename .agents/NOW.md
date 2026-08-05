@@ -2,10 +2,10 @@
 
 <!-- now-updated: 2026-08-05 -->
 
-Read this FIRST, every session. It is a SNAPSHOT, rewritten in place: what is
-live, what gate is being chased, what to do next. It is never a log — evidence
-lives in the append-only [state.md](state.md), [parity-ledger.md](parity-ledger.md)
-and the benchmark record. Budget: 100 lines.
+Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
+the gate being chased, what to do next. Never a log — evidence lives in the
+append-only [state.md](state.md), [parity-ledger.md](parity-ledger.md) and the
+benchmark record. Budget: 100 lines.
 
 ## Live claims
 

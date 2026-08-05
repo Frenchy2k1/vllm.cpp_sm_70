@@ -93,9 +93,32 @@ def structure_errors(text: str) -> list[str]:
     return errors
 
 
-def freshness_errors(paths: set[str]) -> list[str]:
+def state_entries_changed(commit: str) -> bool:
+    """Whether this commit ADDED or REMOVED a state entry, vs merely reordering.
+
+    `sort-state-tail.py` rewrites the log to repair an interleave caused by
+    concurrent sessions. That moves no entry in or out and changes nothing about
+    what is live, so demanding a NOW.md refresh for it is an over-trigger: the
+    rule is "a state APPEND moves what is live", not "any byte changed".
+    """
+    import re
+    parents = git("rev-list", "--parents", "-n", "1", commit).split()[1:]
+    if not parents:
+        return True
+    def headings(rev: str) -> set[str]:
+        try:
+            blob = git("show", f"{rev}:.agents/state.md")
+        except subprocess.CalledProcessError:
+            return set()
+        return set(re.findall(r"^## (.+)$", blob, re.M))
+    return headings(parents[0]) != headings(commit)
+
+
+def freshness_errors(paths: set[str], entries_changed: bool = True) -> list[str]:
     """Return staleness problems for one atomic change."""
     triggers = sorted(FRESHNESS_TRIGGERS & paths)
+    if triggers and not entries_changed:
+        return []  # a pure reorder: no entry added, nothing live moved
     if triggers and NOW_PATH not in paths:
         return [
             f"{', '.join(triggers)} changed but {NOW_PATH} did not; a state "
@@ -169,13 +192,15 @@ def main() -> int:
             short = git("rev-parse", "--short", commit)
             failures.extend(
                 f"commit {short}: {error}"
-                for error in freshness_errors(commit_paths(commit))
+                for error in freshness_errors(
+                    commit_paths(commit), state_entries_changed(commit))
             )
     elif args.commit is not None:
         short = git("rev-parse", "--short", args.commit)
         failures.extend(
             f"commit {short}: {error}"
-            for error in freshness_errors(commit_paths(args.commit))
+            for error in freshness_errors(
+                commit_paths(args.commit), state_entries_changed(args.commit))
         )
 
     if failures:

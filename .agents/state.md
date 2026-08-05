@@ -35659,3 +35659,32 @@ match/beat every axis — the KDA per-channel-decay device recurrence op + a dev
 exp/softplus KDA-gate op + the mla::ForwardMlaAttentionBlock paged wiring +
 grouped-MoE slabs replace the two host-fallback islands.
 
+
+## State-tail re-sorted; the freshness gate's over-trigger corrected
+<!-- state: 2026-08-05T23:30 -->
+
+**The env-doc issue is NOT mine and is already closed.** `788ad913`
+("chore(env-doc): allowlist VT_V4_RESIDENT_W") landed while this session was
+working, and `check-env-doc` now passes on main: 225 production env vars all
+documented or classified. The classification is right - `VT_V4_RESIDENT_W` is a
+default-OFF DeepSeek-V4 residency switch whose mechanism was transferred from
+Laguna's `VT_LAGUNA_RESIDENT_BF16W`, so kernel-internal matches its sibling.
+
+**What WAS broken:** concurrent appends from two sessions left the state tail
+non-chronological (a 08-05T09:00 entry after a 08-05T22:00 one).
+`check-state-order.py` caught it; `sort-state-tail.py --apply` repaired it - 7
+entries reordered, 675 headings before and after, byte count identical. That is
+the 2026-08-04 gate working end to end on exactly the failure it was built for.
+
+**And a defect in my own checker, fixed rather than worked around.** The repair
+tripped `check-now-current`, which demanded a NOW.md refresh because
+`.agents/state.md` had changed. But a re-sort ADDS NO ENTRY and moves nothing
+live - the rule is "a state APPEND moves what is live", not "any byte changed".
+I nearly satisfied it by trimming another session's digest to make room for a
+cosmetic edit, which would have been gaming the gate. Instead
+`freshness_errors()` now takes whether the commit's state-entry HEADING SET
+actually changed, computed against the parent, and a pure reorder is exempt. A
+real append still requires the refresh, and three mutation tests pin all three
+cases.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
