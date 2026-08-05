@@ -526,6 +526,46 @@ op + the paged `mla::ForwardMlaAttentionBlock` + the grouped-MoE slabs). Row STA
 
 ---
 
+## 11. W7 GPU-VERIFY LANDED — device compute runs on GB10; e2e still disk-blocked (2026-08-06, `CLAIM-KIMI-LINEAR-W7` GPU-verify, branch `row/MODEL-KIMI-LINEAR-GPU`)
+
+The §10 device compute is now GPU-VERIFIED on dgx.casa (GB10, sm_121a). A clean
+from-`origin/main` CUDA build (`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`,
+nvcc 13.0.88, Release, `-Werror` clean, built in `/dev/shm` because the root disk is
+100% full) resolved the full PRODUCTION stack — the configure log prints `CUTLASS
+found … enabling sm120a NVFP4 cutlass GEMM`, `FlashAttention-2 prefill/decode: ENABLED
+[121a]`, and the vendored `Triton AOT … sm_121a (MANIFEST hashes OK)` GDN kernels; `nm`
+on the test binary confirms all 14 GDN AOT stable symbols
+(`gdn_{chunko,chunko_bf16,decode,deltah,kkt,tril,wu}_h{32,48}_default`) linked in.
+`tests/vllm/models/test_kimi_linear_forward.cpp` runs **12/12·614 GREEN on the GPU**,
+BOTH arms: `VT_KIMI_DEVICE_COMPUTE=1` (the device-compute path, the gate) AND the
+default host-ref W6 compose. So the f32 `vt::` device dispatch (embed / `FusedChain`
+add+RMSNorm / `MatmulBT` projections / `CausalConv1dFwd` / `L2Norm` / `RmsNormGated` /
+`MoeRouterTopK` / `MoeSiluMul` / `MoeCombine` / lm_head) matches the W2 host f32
+reference on real Blackwell hardware within the same tolerances the CPU gate used — no
+numerics divergence, no DeepSeek-class trap (norms bf16→ReadF32, async-inputs,
+keep-quant slices, capture) triggered. The two documented host-fallback islands (KDA
+per-channel recurrence+gate, NoPE-MLA softmax core) still run on host by design.
+
+Oracle gateability RE-CONFIRMED (cheap, no weight load): the live `~/venvs/vllm-oracle`
+(→ `vllm-oracle-v0.25.0-stage`, vLLM 0.25.0) registers `KimiLinearForCausalLM`
+(`registry.py`) with `models/kimi_linear.py` + `transformers_utils/configs/kimi_linear.py`
+present — it CAN construct/serve the model (matches the 2026-07-25 sweep and §0).
+
+**STILL disk-BLOCKED (honest, recorded — not hidden):** the §8 e2e SACRED greedy
+golden vs the oracle needs the 91.5 GiB bf16 checkpoint, which is ABSENT (not in
+`~/models`, not in the HF hub cache) and cannot be fetched — dgx root is 100% full with
+only **34 GiB free** (need ~91.5 GiB; the ~60 GiB reclaim would mean deleting other
+agents' ACTIVE laguna/ds4/bench campaign trees, which this row will not do
+unilaterally, and there are no stale `source-*` grid trees to prune). No smaller
+published quant exists (§3). So Steps 3-5 of the §8 box-return recipe are recorded
+disk-BLOCKED; the oracle golden + bf16-activation parity + speed stay the NAMED
+residual. What GPU-verify PROVES: the f32 device-compute WIRING (vt-op dispatch, MoE
+routing, device-resident logits, GDN cubin linkage) runs on GB10. What it does NOT:
+bf16 numerics vs the oracle, and the e2e token gate. Row STAYS `ACTIVE`.
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope
