@@ -19,9 +19,8 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate models & on-framework dense unaffected (bf16-out, e2e-verified) | Re-verify deepseek_v4 bf16 tower same-tool |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
-| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **W7 GPU-VERIFIED on GB10** (#37): CUDA build clean, `test_kimi_linear_forward` **12/12·614** both arms | e2e §8 golden IN FLIGHT (disk freed, checkpoint downloading, `row/MODEL-KIMI-LINEAR-E2E`) |
+| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **§8 golden CAPTURED, STRICT** (#37 GPU-verify + `row/MODEL-KIMI-LINEAR-E2E`): 8/8 deterministic K=3, committed; device compute 12/12·614 both arms | full our-engine e2e **f32-loader-blocked** (~183 GiB > 119 pool): bf16-resident loader is THE brick; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
-| Async decode: Option A (`VT_ASYNC_EXECUTOR`) gated **OFF** | H2D staged OUT of capture (persistent dev buf + pinned + staged event, `states.py:64`); RED reproduces (pinned poison); GREEN 5/5 c32, SACRED 3/3, memcheck 0; binding A/B WASH -> the c16 gap is NOT drain/baked-H2D | prefill glue next |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
