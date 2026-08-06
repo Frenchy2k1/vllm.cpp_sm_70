@@ -39885,3 +39885,36 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
   MoE, GDN/MLA and every sampler beyond greedy argmax.
   `get_attn_backend_priority()` remains EMPTY, so no model runs end to end on
   Vulkan and no speed number is measured, claimed or owed.
+
+- **2026-08-06 (later still, 3)** — **Vulkan gains the KV-CACHE WRITE
+  (`kReshapeAndCache`), completing the attention block's device side
+  (`CLAIM-VULKAN-FULL-1`).** Native **13 → 14**, reference tier **74 → 73**. Paged
+  attention reads the cache; this writes it.
+
+  Ported from `cpu_cache.cpp` (:33-72), which is two memcpys per token and
+  CONVERTS NOTHING — so the dtype selects only the copy WIDTH (32-bit via the
+  uint32 view, 16-bit via the uint16 view, never mixed) and the gate is
+  BIT-EXACTNESS, not NMSE. The host refuses a source/cache dtype mismatch rather
+  than silently converting. Slot `-1` is a PADDED token and must be SKIPPED
+  (:60); the mapping is i64, so the shader tests the HIGH word for the sign —
+  reading it unsigned would turn `-1` into `0xFFFFFFFF` and index astronomically
+  out of range. The gate seeds the cache with RANDOM contents (not zeros, so
+  "padded token left the page intact" cannot pass vacuously) and uses scattered
+  out-of-order slots so a kernel assuming `slot == token index` fails.
+
+  **RoPE IS NEXT AND IT NEEDS A DECISION FIRST — flagged rather than half-built.**
+  The CPU kernel computes the angle in DOUBLE (`cpu_ops.cpp:701-705`: `std::pow`
+  for the frequency, `std::cos`/`std::sin` of `pos * freq`). An f32 transcription
+  loses precision badly at long context, where `pos` is in the thousands and the
+  angle is large — i.e. it would be subtly wrong in exactly the regime that
+  matters, and would still pass a short-sequence gate. Two ways out: (a) require
+  `shaderFloat64` and transcribe faithfully, or (b) implement `kRopeFromCache`
+  (the apply — pure f32 multiply-add) natively and leave `kRopeCosSinCache` (the
+  once-per-model table build, where the double math lives) on the reference tier.
+  (b) matches vLLM's own structure and costs no device feature; it is the
+  recommendation on record.
+
+  Still on the reference tier: the whole RoPE family, quant, MoE, GDN/MLA and
+  every sampler beyond greedy argmax. `get_attn_backend_priority()` remains EMPTY,
+  so no model runs end to end on Vulkan and no speed number is measured, claimed
+  or owed.

@@ -113,14 +113,23 @@ Vulkan-ON build, by asking `vt::OpRegistered` and `vt::GetOp` for every `OpId`:
 | | at `VK-A1` | after the first `VK-B` bricks |
 |---|---|---|
 | CPU-registered ops | **87** | **87** |
-| **NATIVE** on Vulkan | **8** | **13** |
-| served by the **portable reference tier** (S5, CPU kernel on shared memory) | **79** | **74** |
+| **NATIVE** on Vulkan | **8** | **14** |
+| served by the **portable reference tier** (S5, CPU kernel on shared memory) | **79** | **73** |
 | **ABSENT** (`GetOp` throws) | **0** | **0** |
 
-The five that moved are `kMatmul`, `kMatmulBT` (dense GEMM, both orientations),
-`kEmbedding`, `kGreedyArgmax` and `kPagedAttention` — the model's two ends, the op
-it spends most of its time in, and the one kernel with no llama.cpp Vulkan
-counterpart to port from. Re-measure with the same method rather than quoting this table.
+The six that moved are `kMatmul`, `kMatmulBT` (dense GEMM, both orientations),
+`kEmbedding`, `kGreedyArgmax`, `kPagedAttention` and `kReshapeAndCache` — the
+model's two ends, the op it spends most of its time in, and the attention block's
+read and write halves.
+
+**`VK-B`'s next brick needs a DECISION, not just work: RoPE.** The CPU kernel
+computes the angle in DOUBLE (`cpu_ops.cpp:701-705` — `std::pow` for the
+frequency, `std::cos`/`std::sin` of `pos * freq`), and an f32 transcription loses
+precision badly at long context, where `pos` is in the thousands. Two ways out:
+require `shaderFloat64` and transcribe faithfully, or implement `kRopeFromCache`
+(the apply, pure f32 multiply-add) natively and leave `kRopeCosSinCache` (the
+once-per-model table build, where the double math lives) on the reference tier.
+The second is what vLLM's own structure suggests and costs no device feature. Re-measure with the same method rather than quoting this table.
 
 `vt::ReferenceTierEligible(kVULKAN)` is TRUE — GB10 integrated and llvmpipe both
 report unified memory. So **every op the CPU backend has is already reachable on
