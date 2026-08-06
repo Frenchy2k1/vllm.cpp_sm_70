@@ -314,7 +314,7 @@ built on it rather than keeping the flattering one.
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
 | Ampere consumer (`sm_86`, RTX 3090 class) | **No number owed; no such board here.** 2026-08-06 build-verify: 7/7 FA2 TUs 0-warn, real `sm_86` SASS. [Detail](../.agents/benchmark-record.md) | External RTX 3090 report. Floor is llama.cpp on that card (GGUF, not our Blackwell-only NVFP4 grid) |
-| Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **No number owed; nothing runs on these arches.** 2026-08-06 `sm_75`: 20/20 TUs PASS (0 err/warn), WMMA bodies + all 3 selectors arch-gated; GB10 SASS byte-identical. [Detail](../.agents/benchmark-record.md) | Port the llama.cpp `fattn-tile`/`fattn-vec` fp16 body. Perf floor when a card exists is **llama.cpp on the same card** (vLLM does not run there) |
+| Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **No number owed; nothing runs on these arches.** 2026-08-06 `sm_75`: 20/20 TUs PASS (0 err/warn), WMMA bodies + all 3 selectors arch-gated; GB10 SASS byte-identical. [Detail](../.agents/benchmark-record.md) | Full-library LINK at `sm_75` + `cuobjdump` SASS, then a build-supported row. The fp16 `fattn` port is speed-only now; its floor when a card exists is llama.cpp on that card |
 
 ## Reproduce
 
