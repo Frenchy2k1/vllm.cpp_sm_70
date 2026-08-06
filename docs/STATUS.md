@@ -1213,6 +1213,8 @@ InternLM2 plus a sliding window).
 Record hygiene (2026-08-06): `check-state-order` now rejects future-dated
 state anchors (one-day timezone grace) after a chained stamp bug recurred
 three times; the third recurrence was re-anchored to its git-evidenced date.
+A #77 landing slip that swept personal working-tree items into the squash
+was reverted the same day (tree-only; no feature content changed).
 
 Public documentation restructure (2026-08-04): `docs/BENCHMARKS.md` had grown
 into an append log of 11,405 lines and 171 claim-titled sections and was no
