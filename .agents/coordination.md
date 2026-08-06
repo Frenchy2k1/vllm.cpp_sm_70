@@ -1596,6 +1596,39 @@ is released by merging or closing it.
 
 <!-- claim-view:end -->
 
+**16-bit CPU GEMM: wide x86 ISA tiers + tiled sgemm (`KERNEL-GEMM-CPU-ELEM-X86WIDE`
++ `KERNEL-GEMM-CPU-TILED`, 2026-08-06, `CLAIM-KERNEL-CPU-ELEM-WIDE-1`).** Claude
+Code (opus-5), helper role claimed via `scripts/agent-role.py claim helper --row
+KERNEL-GEMM-CPU-ELEM-X86WIDE`, isolated worktree
+`/home/mudler/_git/vllm.cpp-x86wide` on branch
+`row/KERNEL-GEMM-CPU-ELEM-X86WIDE`, base `cbc56f12`. Spike:
+[specs/cpu-elem-gemm-wide-isa-and-tiling.md](specs/cpu-elem-gemm-wide-isa-and-tiling.md).
+
+Owns EXACTLY: new `src/vt/cpu/cpu_matmul_elem_avx2.cpp` and
+`cpu_matmul_elem_avx512.cpp`; the `BuildTier()` probe and tier-table plumbing in
+`src/vt/cpu/cpu_matmul_elem.{h,cpp}`; the `btm` tiled-kernel family in those same
+files; one per-file `COMPILE_OPTIONS` block in `CMakeLists.txt` beside the
+existing i8mm block; the tier sweep in `tests/vt/test_ops_matmul_elem.cpp`; the
+two new `kernel-matrix.md` rows and the `check-agent-record.py` KERNEL count;
+this claim row. MUST NOT touch a model forward, a loader, the quant GEMM
+(`cpu_quant_*`, that is G5/G8), any op contract, or any golden. MUST NOT trade
+bit-exactness for speed: the E1-E4 invariant is that widening adds OUTPUT lanes
+or M rows and NEVER splits the K reduction, which makes the result byte-identical
+by construction and keeps the existing `memcmp` gate valid.
+
+Grounded in the measured attribution in `.agents/benchmark-record.md` (2026-08-06,
+"Why vt's 16-bit CPU GEMM trails ggml"): our NEON kernel is at ggml-stock parity,
+the Arm deficit is entirely llamafile (~1.9x f16), and x86 carries an additional
+~3.5x SSE2-vs-AVX-512 width gap.
+
+**Known limitation, stated at claim time:** the x86 row CANNOT be speed-gated.
+The x86 dev box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1` and
+`GATE_HOST` is aarch64, so x86 numbers are INDICATIVE only and no x86 ratio is
+binding. Correctness (memcmp byte-identity) IS gatable on x86 and is the bar
+this claim will meet. The tiled row is speed-gatable on dgx.
+
+| `CLAIM-KERNEL-CPU-ELEM-WIDE-1` | `KERNEL-GEMM-CPU-ELEM-X86WIDE` + `KERNEL-GEMM-CPU-TILED` | Claude Code (opus-5) | worktree `/home/mudler/_git/vllm.cpp-x86wide`, base `cbc56f12` | branch `row/KERNEL-GEMM-CPU-ELEM-X86WIDE` | see ownership above | `SPIKE` | 2026-08-06 spike committed; W4 (widen the test tier sweep) is the first implementation step, deliberately before any kernel |
+
 ## Handoff queue
 
 | Priority | Row/block | Dependency | Next handoff | State |
