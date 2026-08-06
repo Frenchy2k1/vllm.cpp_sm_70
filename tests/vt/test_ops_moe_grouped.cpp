@@ -127,6 +127,7 @@ void CheckClose(const std::vector<float>& got, const std::vector<float>& want, f
 // max|dense-moe|==0). Per-element byte-fidelity is still gated EXACTLY by the
 // dense==MoE check below; a wrong stride still fails this L2 gate (the row-shifted
 // reference is uncorrelated => ||got-shift|| ~ ||want||, ratio ~1 >> rtol).
+#ifdef VT_MARLIN_NVFP4
 void CheckCloseL2(const std::vector<float>& got, const std::vector<float>& want, float rtol) {
   REQUIRE(got.size() == want.size());
   double num = 0.0, den = 0.0;
@@ -139,6 +140,7 @@ void CheckCloseL2(const std::vector<float>& got, const std::vector<float>& want,
   CAPTURE(rel);
   CHECK(rel <= rtol);
 }
+#endif  // VT_MARLIN_NVFP4
 
 struct Nvfp4Weight {
   std::vector<uint8_t> packed;  // [N, K/2]
@@ -170,6 +172,7 @@ struct Mxfp4Weight {
   std::vector<uint8_t> scale;   // [N, K/32]  E8M0 biased exponent (2^(byte-127))
 };
 
+#ifdef VT_MARLIN_NVFP4
 Mxfp4Weight MakeMxfp4Weight(int64_t n, int64_t k, uint32_t seed) {
   Mxfp4Weight w;
   w.packed.resize(static_cast<size_t>(n * (k / 2)));
@@ -182,6 +185,7 @@ Mxfp4Weight MakeMxfp4Weight(int64_t n, int64_t k, uint32_t seed) {
   for (auto& s : w.scale) s = static_cast<uint8_t>(e8m0_dist(rng));
   return w;
 }
+#endif  // VT_MARLIN_NVFP4
 
 std::vector<float> RandomF32(size_t numel, uint32_t seed) {
   std::mt19937 rng(seed);
