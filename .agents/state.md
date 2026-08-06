@@ -39918,3 +39918,58 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
   every sampler beyond greedy argmax. `get_attn_backend_priority()` remains EMPTY,
   so no model runs end to end on Vulkan and no speed number is measured, claimed
   or owed.
+
+- **2026-08-06 (later still, 4)** — **★ A MODEL RUNS END TO END ON VULKAN, STRICT
+  TOKEN-EXACT (`CLAIM-VULKAN-FULL-1`, row `BACKEND-VULKAN`).** Native **14 → 16**,
+  reference tier **73 → 71**.
+
+  ```
+  opt-125m: the engine selected device type 3 (VULKAN)
+  BACKEND PROOF — all 9 OPT ops dispatched on device type 3 with 0 declines
+                  (kPagedAttention selections=1152)
+  STRICT correctness gate: 6/6 prompts token-exact (96/96 tokens)
+                  vs the vLLM 0.25.0 oracle
+  ```
+
+  This is the STRONG form, not "it produced plausible text". The gate first
+  verifies vLLM's own greedy is DETERMINISTIC on these prompts (0 multi-valued
+  cells over K=5 runs), so it is the STRICT bar rather than the ratified
+  distributional one. The engine selected Vulkan ITSELF through
+  `CurrentPlatform()` with no test-side override. And **0 declines is the
+  load-bearing half**: a provider can be selected and then decline INSIDE its
+  kernel and forward down to the CPU tier, so 1152 `kPagedAttention` selections
+  with zero declines is what proves attention actually ran on Vulkan rather than
+  on the host fallback wearing its name.
+
+  **Measured on llvmpipe** (software rasterizer) — no Vulkan GPU is reachable from
+  this VM. That is a correctness proof, not a performance one, and no speed number
+  is measured, claimed or owed.
+
+  Three pieces closed the gap. (1) **RoPE split the way vLLM splits it** (user
+  directive "we want to be faithful to vllm"): `RotaryEmbedding` builds
+  `cos_sin_cache` once in `__init__` and the forward only applies it — which is
+  why `ops.rotary_embedding()` takes the cache rather than a base and a scaling
+  factor (`rotary_embedding/base.py:160-252`, `common.py:145-185` @ `e24d1b24fe96`).
+  So the TABLE build stays on the portable tier, where the double-precision
+  `pow`/`cos`/`sin` lives, and the per-token APPLY is native. Faithfulness and
+  numerics agreed: an f32 transcription of the angle construction is wrong at long
+  context AND would still pass a short-sequence gate. mrope DECLINES through the
+  provider seam rather than throwing. (2) **`kQkvSplit`**, mirroring
+  `QKVParallelLinear`'s `qkv.split([q_size, kv_size, kv_size])` — three
+  INDEPENDENT widths, because under GQA k and v are narrower than q.
+  (3) **`FLASH_ATTN` registered for `kVULKAN`** on exactly Metal's footing; the
+  real precondition is not the device name but that our `kPagedAttention` and
+  `kReshapeAndCache` use the same NHD layout `get_kv_cache_shape` allocates, which
+  they do because both are ports of the CPU pair. **MLA still returns EMPTY
+  deliberately** — `kMlaDecodeAttention`/`kMlaPrefillAttention`/
+  `kConcatAndCacheMla` have no Vulkan kernel, and naming a backend there would
+  route an MLA model into one that cannot serve it.
+
+  Gates: clean `-Werror` Vulkan-ON build 0 warnings; `test_vulkan_backend` 10/10
+  (480 assertions), `test_backend_cross_device` 11/11 (123), `test_opt_load` 1/1
+  (958), `test_opt_paged_engine` 1/1 (63), generator suite 13/13. CPU-only build
+  (`AUTO`=OFF) rebuilt clean and its ctest re-run, since `attention/backend.cpp`
+  is shared.
+
+  Still on the reference tier: quant, MoE, GDN/MLA, the rotary TABLE build and
+  every sampler beyond greedy argmax.

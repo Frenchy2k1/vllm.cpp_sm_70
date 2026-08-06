@@ -113,8 +113,8 @@ Vulkan-ON build, by asking `vt::OpRegistered` and `vt::GetOp` for every `OpId`:
 | | at `VK-A1` | after the first `VK-B` bricks |
 |---|---|---|
 | CPU-registered ops | **87** | **87** |
-| **NATIVE** on Vulkan | **8** | **14** |
-| served by the **portable reference tier** (S5, CPU kernel on shared memory) | **79** | **73** |
+| **NATIVE** on Vulkan | **8** | **16** |
+| served by the **portable reference tier** (S5, CPU kernel on shared memory) | **79** | **71** |
 | **ABSENT** (`GetOp` throws) | **0** | **0** |
 
 The six that moved are `kMatmul`, `kMatmulBT` (dense GEMM, both orientations),
