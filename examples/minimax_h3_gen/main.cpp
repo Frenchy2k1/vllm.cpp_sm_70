@@ -29,7 +29,9 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -164,6 +166,8 @@ int main(int argc, char** argv) {
   std::string device_name = "cpu";
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   std::string first_frame_path, last_frame_path;
+  std::string decode_latent_path;  // diagnostic: decode a dumped VAE-input latent
+  std::string roundtrip_path;      // diagnostic: encode->decode a real image
   std::vector<std::string> ref_image_paths;
   std::string ref_video_prefix, ref_audio_path;
   double imgvid_noise_aug = 1.0;
@@ -188,6 +192,8 @@ int main(int argc, char** argv) {
       else if (f == "--dry-run") dry_run = true;
       else if (f == "--denoise-only") denoise_only = true;
       else if (f == "--dump-params") dump_params = true;
+      else if (f == "--decode-latent") decode_latent_path = Need(argc, argv, ++i, f);
+      else if (f == "--roundtrip") roundtrip_path = Need(argc, argv, ++i, f);
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
@@ -213,11 +219,15 @@ int main(int argc, char** argv) {
     // no VAEs, no conditioning, no output path. Requiring them would make the one
     // tool that works on a checkpoint too large to load unusable on exactly that
     // checkpoint.
-    const bool need_vaes = !denoise_only && !dump_params;
-    const bool need_cond = !dump_params;
-    if (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
-        (need_vaes && out_path.empty()) ||
-        (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty()))) {
+    const bool diag_vae_only = !decode_latent_path.empty() || !roundtrip_path.empty();
+    const bool need_vaes = !denoise_only && !dump_params && !diag_vae_only;
+    const bool need_cond = !dump_params && !diag_vae_only;
+    // --decode-latent / --roundtrip need NO DiT and NO conditioning (their own blocks
+    // validate their inputs); the shared check below would otherwise reject --dit.
+    if (!diag_vae_only &&
+        (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
+         (need_vaes && out_path.empty()) ||
+         (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty())))) {
       std::cerr << "usage: minimax-h3-gen --dit <f> --video-vae <f> --audio-vae <f> "
                    "--prompt-embeds <f32.bin> --out <out.mp4> [--video-vae-config <j>] "
                    "[--audio-vae-config <j>] [--keep-quant] [--steps N] [--frames N] "
@@ -275,6 +285,124 @@ int main(int argc, char** argv) {
                 << "\nrope_inv_freq_len=" << pr.rope_inv_freq_len
                 << "\nvideo_row_width=" << pr.video_row_width()
                 << "\nrope_rot_dim=" << pr.rope_rot_dim() << "\n";
+      return 0;
+    }
+
+    // --decode-latent DIAGNOSTIC: decode a dumped VAE-input latent
+    // (VT_H3_DUMP_DIR/vae_input_video_latent.f32) directly, with NO DiT and NO
+    // conditioning, on either device. Lets the device ViT3D decoder be compared
+    // against the scalar CPU reference (gated vs upstream at 8.9e-8) on the SAME
+    // real latent -- the VAE-branch oracle test for the render-coherence bisection.
+    if (!decode_latent_path.empty()) {
+      if (video_cfg_path.empty() || video_vae_path.empty() || out_path.empty()) {
+        throw std::runtime_error(
+            "--decode-latent needs --video-vae, --video-vae-config, --out and --width/--height/--frames");
+      }
+      vllm::MiniMaxH3LatentStats vstats;
+      vllm::MiniMaxH3VideoVaeDecoderConfig vcfg =
+          vllm::ParseMiniMaxH3VideoVaeDecoderConfig(ReadJson(video_cfg_path), &vstats);
+      vllm::SafetensorsFile vfile = vllm::SafetensorsFile::Open(video_vae_path);
+      vllm::MiniMaxH3AudioVaeWeights vweights = vllm::LoadMiniMaxH3VideoVaeDecoderWeights(vfile);
+      const vllm::MiniMaxH3ShapePlan plan = vllm::MiniMaxH3ResolveShape(
+          "t2va", 0.0, frames, height, width, 0, 0);
+      const int64_t lt = plan.latent_t, lh = plan.height / vllm::kMiniMaxH3VaeRatio,
+                    lw = plan.width / vllm::kMiniMaxH3VaeRatio, ch = vcfg.in_channels;
+      const int64_t need = ch * lt * lh * lw;
+      std::ifstream lf(decode_latent_path, std::ios::binary);
+      if (!lf) throw std::runtime_error("cannot open --decode-latent file");
+      std::vector<float> latent(static_cast<size_t>(need));
+      lf.read(reinterpret_cast<char*>(latent.data()), need * static_cast<int64_t>(sizeof(float)));
+      if (!lf) throw std::runtime_error("--decode-latent file too small for [C,T,H,W]");
+      std::cerr << "decode-latent: [" << ch << "," << lt << "," << lh << "," << lw << "] on "
+                << device_name << "\n";
+      vllm::MiniMaxH3T2vaResult result;
+      if (device_name == "cuda") {
+        vt::Device dev = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
+        vt::Queue vq = vt::GetBackend(dev.type).CreateQueue();
+        const vllm::MiniMaxH3VideoVaeDeviceWeights staged =
+            vllm::StageMiniMaxH3VideoVaeWeights(vq, vcfg, vweights);
+        result.frames = vllm::MiniMaxH3VideoVaeDecodeTemporalDevice(
+            dev, vcfg, staged, latent, lt, lh, lw, plan.num_frames, &result.frame_shape);
+      } else {
+        result.frames = vllm::MiniMaxH3VideoVaeDecode(vcfg, vweights, latent, lt, lh, lw,
+                                                      &result.frame_shape);
+      }
+      vllm::MiniMaxH3VideoDenormalizePixels(
+          result.frames, result.frame_shape.channels,
+          result.frame_shape.t * result.frame_shape.h * result.frame_shape.w);
+      std::string mkc = "mkdir -p '" + workdir + "'";
+      if (std::system(mkc.c_str()) != 0) throw std::runtime_error("cannot create " + workdir);
+      for (int64_t fr = 0; fr < result.frame_shape.t; ++fr) {
+        char nm[512];
+        std::snprintf(nm, sizeof(nm), "%s/frame_%06lld.ppm", workdir.c_str(),
+                      static_cast<long long>(fr));
+        WriteFile(nm, vllm::MiniMaxH3WritePpmFrame(result.frames, result.frame_shape, fr));
+      }
+      std::cerr << "decode-latent: wrote " << result.frame_shape.t << " frames to " << workdir
+                << "\n";
+      return 0;
+    }
+
+    // --roundtrip DIAGNOSTIC: encode a real image through the video VAE encoder,
+    // apply post_quant_conv, and decode -- a DiT-independent gold-standard test of
+    // the decoder. A coherent round-trip proves the decoder works and localizes the
+    // render bug to the DiT-produced latent; a grid proves the decoder itself.
+    if (!roundtrip_path.empty()) {
+      if (video_cfg_path.empty() || video_vae_path.empty()) {
+        throw std::runtime_error("--roundtrip needs --video-vae and --video-vae-config");
+      }
+      vllm::MiniMaxH3LatentStats vstats;
+      vllm::MiniMaxH3VideoVaeDecoderConfig vcfg =
+          vllm::ParseMiniMaxH3VideoVaeDecoderConfig(ReadJson(video_cfg_path), &vstats);
+      vllm::SafetensorsFile vfile = vllm::SafetensorsFile::Open(video_vae_path);
+      vllm::MiniMaxH3AudioVaeWeights dec_w = vllm::LoadMiniMaxH3VideoVaeDecoderWeights(vfile);
+      vllm::MiniMaxH3AudioVaeWeights enc_w = vllm::LoadMiniMaxH3VideoVaeEncoderWeights(vfile);
+      int64_t ih = 0, iw = 0;
+      std::vector<float> chw = ReadPpmAsChw(roundtrip_path, &ih, &iw);  // [3,H,W] in [0,1]
+      vllm::MiniMaxH3VideoNormalizePixels(chw, 3, ih * iw);             // -> imagenet space
+      vllm::MiniMaxH3EncoderFcn3dConfig enc_cfg;
+      enc_cfg.z_channels = 2 * vcfg.in_channels;  // moments (mean|logvar)
+      enc_cfg.t = 1; enc_cfg.h = ih; enc_cfg.w = iw;
+      vllm::MiniMaxH3VideoFrameShape ls{};
+      std::vector<float> z = vllm::MiniMaxH3VideoVaeEncodeToLatent(enc_cfg, enc_w, chw, &ls);
+      std::cerr << "roundtrip: encoded [" << vcfg.in_channels << "," << ls.t << "," << ls.h << ","
+                << ls.w << "]\n";
+      const int64_t per = ls.t * ls.h * ls.w;
+      // per-channel stats of the ENCODED latent (the in-distribution reference)
+      { double s2 = 0; for (float v : z) s2 += double(v) * v;
+        std::cerr << "roundtrip: encoded-latent rms=" << std::sqrt(s2 / z.size()) << "\n"; }
+      if (const char* dd = std::getenv("VT_H3_DUMP_DIR")) {
+        std::string p = std::string(dd) + "/encoder_latent.f32";
+        if (std::FILE* fp = std::fopen(p.c_str(), "wb")) {
+          std::fwrite(z.data(), sizeof(float), z.size(), fp); std::fclose(fp);
+          std::cerr << "roundtrip: dumped encoder latent [" << vcfg.in_channels << "," << ls.t
+                    << "," << ls.h << "," << ls.w << "] to " << p << "\n";
+        }
+      }
+      if (dec_w.Has("post_quant_conv.weight")) {
+        z = vllm::MiniMaxH3VideoVaePostQuantConv(dec_w, z, vcfg.in_channels, per);
+      }
+      vllm::MiniMaxH3T2vaResult result;
+      if (device_name == "cuda") {
+        vt::Device dev = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
+        vt::Queue vq = vt::GetBackend(dev.type).CreateQueue();
+        const vllm::MiniMaxH3VideoVaeDeviceWeights staged =
+            vllm::StageMiniMaxH3VideoVaeWeights(vq, vcfg, dec_w);
+        result.frames = vllm::MiniMaxH3VideoVaeDecodeTemporalDevice(
+            dev, vcfg, staged, z, ls.t, ls.h, ls.w, 1, &result.frame_shape);
+      } else {
+        result.frames = vllm::MiniMaxH3VideoVaeDecode(vcfg, dec_w, z, ls.t, ls.h, ls.w,
+                                                      &result.frame_shape);
+      }
+      vllm::MiniMaxH3VideoDenormalizePixels(
+          result.frames, result.frame_shape.channels,
+          result.frame_shape.t * result.frame_shape.h * result.frame_shape.w);
+      std::string mkc = "mkdir -p '" + workdir + "'";
+      if (std::system(mkc.c_str()) != 0) throw std::runtime_error("cannot create " + workdir);
+      WriteFile(workdir + "/roundtrip.ppm",
+                vllm::MiniMaxH3WritePpmFrame(result.frames, result.frame_shape, 0));
+      std::cerr << "roundtrip: wrote " << workdir << "/roundtrip.ppm ("
+                << result.frame_shape.w << "x" << result.frame_shape.h << ")\n";
       return 0;
     }
 
@@ -622,15 +750,31 @@ int main(int argc, char** argv) {
     // NOT reproduce torch's RNG: matching it bit-for-bit decides WHICH sample you
     // get, not whether the pipeline is correct, and pretending otherwise would
     // invite comparing our sample against upstream's as if they should match.
-    auto fill = [](std::vector<float>& out, uint64_t seed) {
+    // A flow-matching model is trained with GAUSSIAN N(0,1) noise at sigma=1
+    // (torch.randn); feeding uniform[-1,1] (std 0.577) is out-of-distribution.
+    // Upstream draws torch.randn — Gaussian is the DEFAULT (mirror policy);
+    // VT_H3_GAUSSIAN_NOISE=0 keeps the legacy uniform draw for the A/B.
+    const char* gn = std::getenv("VT_H3_GAUSSIAN_NOISE");
+    const bool gaussian = !(gn != nullptr && gn[0] == '0');
+    auto fill = [gaussian](std::vector<float>& out, uint64_t seed) {
       uint64_t x = seed;
-      for (float& v : out) {
+      auto u01 = [&x]() {
         x += 0x9E3779B97F4A7C15ULL;
         uint64_t z = x;
         z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
         z ^= z >> 31;
-        v = static_cast<float>((z >> 11) * 0x1.0p-53 * 2.0 - 1.0);
+        return (z >> 11) * 0x1.0p-53;  // [0,1)
+      };
+      for (size_t i = 0; i < out.size(); ++i) {
+        if (gaussian) {
+          double u1 = u01(), u2 = u01();
+          if (u1 < 1e-12) u1 = 1e-12;
+          out[i] = static_cast<float>(std::sqrt(-2.0 * std::log(u1)) *
+                                      std::cos(2.0 * 3.14159265358979323846 * u2));
+        } else {
+          out[i] = static_cast<float>(u01() * 2.0 - 1.0);  // uniform [-1,1]
+        }
       }
     };
     std::vector<float> noise_video(

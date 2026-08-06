@@ -463,7 +463,20 @@ video flow_shift 12 / audio 3, no CFG; default canvas **768×1344**, default fra
   fp4-resident DiT → both VAEs → ffmpeg, producing a valid `h264 256×256 + AAC 32 kHz`
   mp4 + wav. **But the decoded frame is a structured multicolour patch-grid at the
   latent-cell scale, NOT a coherent scene — identically at 12/20/50 steps, conditioned
-  or not.** So the composed path is proven to RUN e2e on the real checkpoint, but a
+  or not.**
+  - **ROOT-CAUSED (2026-08-06, `row/H3-RENDER-COHERENCE` PR #70) by latent
+    bisection:** the VAE decoder is **CORRECT** — a real image encode→post_quant_conv→
+    decode round-trip (`--roundtrip`) returns a coherent frame — and the denoise loop
+    moves the latent step-dependently (byte-different finals at 3/12/50 steps). The bug
+    is the **DiT forward emitting a spatially-WHITE latent** at real geometry: adjacent
+    latent-cell cosine is **0.06** vs **0.789** for a real encoded latent, so every VAE
+    token decodes an independent patch = the grid. NOT fp4 (bf16 equally white), NOT the
+    attention kernel (MMA≡chunk, VAE chunk≡warp≡keylane), NOT the init noise. The DiT
+    gate runs spatial 2×3 (matches upstream 1.6e-7); the divergence is real-geometry
+    only (2×3→8×8). Secondary: driver used uniform init noise, not Gaussian
+    (`VT_H3_GAUSSIAN_NOISE`). Exact DiT line pends an upstream-oracle diff at real
+    geometry. See the benchmark record + state entry.
+  - So the composed path is proven to RUN e2e on the real checkpoint, but a
   coherent render is an OPEN bug (device video-VAE decode and/or denoise convergence
   at real geometry), independent of the fp4 speed work. **DiT s/step (full 50-layer
   fp4-resident, per forward):** 5.45 s @512×512/22f, 20.03 s @768×768/61f, 209.09 s
