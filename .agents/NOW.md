@@ -24,7 +24,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | MXFP4 parity (Qwen3-8B) | **`MARLIN-STRUCT`: decode-graph + gate_up FUSION default-ON (180→144 GEMM/step); #44 3/3, 0.6B/4B 184/184, 32B 142/142** | residual = marlin CTA + flash |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
-| MXFP4 parity goal | graph+fuse default-ON; c8 dominant residual = marlin CTA 144 vs 48. **`KERNEL-MARLIN-DENSE-PORT` gated-OFF** (`VT_MARLIN_DENSE`): vLLM's own dense marlin = byte-preserving E=1; 3 dense `.cu` compile-clean dgx; unit WRITTEN | NEXT (dgx): strict dense-ON vs oracle + nsys + binding (state) |
+| MXFP4 parity goal | **`VT_MARLIN_DENSE` FLIPPED DEFAULT-ON** (`row/KERNEL-MARLIN-DENSE-EXEC` `200b4b56`): dense E=1 marlin, 48-CTA vs 128. Ratified near-tie (32B razor gap 0.000, TIGHTER than MoE; goldens regen). Binding beats #51 every axis (c8 0.969, GPU mem 2.63x). Goal still <1.0x c2-c8 (state) | Merge row; next = decode-flash |
 
 In-flight branches (default-OFF, not pushed): `laguna-fp4proj-prod` (fp4),
 laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`. Records:

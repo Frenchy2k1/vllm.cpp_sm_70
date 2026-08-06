@@ -103,20 +103,25 @@ inline bool FusedGateUpEnabled() {
   return on;
 }
 
-// VT_MARLIN_DENSE (default OFF): route the E=1 dense NVFP4/MXFP4 projections through
-// vLLM's OWN dense marlin GEMM (vt::MarlinDenseGemm) instead of the single-expert
-// MoE-marlin route. The dense kernel is direct-A + tile-per-CTA with vLLM's dense
-// fp32-C_tmp reduce, so at M<=8 it naturally runs the 48-CTA (sms-wide) grid the MoE
-// path only reaches with the VT_MARLIN_E1_PAR1 clamp — WITHOUT that clamp's par
-// regrouping, which costs one bf16 ULP vs the oracle and flips a strict 32B token
-// (row QUANT-CT-MXFP4-MARLIN-STRUCT / #50 / #54). Same resident weights + workspace;
-// the repack permute is vLLM's shared marlin_permute for both dense and MoE. Default
-// OFF until the strict-gate battery + binding prove it byte-matches the oracle
-// everywhere and beats the MoE route; then flipped ON per parity-enablers.
+// VT_MARLIN_DENSE (default ON; VT_MARLIN_DENSE=0 opts back out to the MoE route):
+// route the E=1 dense NVFP4/MXFP4 projections through vLLM's OWN dense marlin GEMM
+// (vt::MarlinDenseGemm) instead of the single-expert MoE-marlin route. The dense
+// kernel is direct-A + tile-per-CTA with vLLM's dense fp32-C_tmp reduce, so at M<=8
+// it naturally runs the 48-CTA (sms-wide) grid the MoE path only reaches with the
+// VT_MARLIN_E1_PAR1 clamp — WITHOUT that clamp's par regrouping, which costs one bf16
+// ULP vs the oracle and flips a strict 32B token (row QUANT-CT-MXFP4-MARLIN-STRUCT /
+// #50 / #54). Same resident weights + workspace; the repack permute is vLLM's shared
+// marlin_permute for both dense and MoE. FLIPPED ON (row KERNEL-MARLIN-DENSE-EXEC):
+// the dense reduce IS vLLM's own numerics — the teacher-forced near-tie razor on the
+// 32B-NVFP4A16 SACRED gate scores max gap 0.000 nats (every dense token == vLLM's
+// teacher-forced argmax, TIGHTER than the MoE route's 62 mnats), and the c8 decode
+// marlin runs the 48-CTA grid at ~86us/call vs the MoE route's 128-CTA ~118us/call.
+// The MoE route's greedy anchor (our_ids) shifts at two exact bf16 ties, so the 32B
+// goldens were regenerated under dense-ON per the ratified-tie regen rule.
 inline bool MarlinDenseEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_MARLIN_DENSE");
-    return e != nullptr && e[0] == '1';
+    return !(e != nullptr && e[0] == '0');
   }();
   return on;
 }
