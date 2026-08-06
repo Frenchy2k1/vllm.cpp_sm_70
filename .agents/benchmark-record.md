@@ -13476,3 +13476,101 @@ measuring here.
 
 A binding number needs an idle, qualified x86 host, which the project does not
 currently have.
+
+## Deep dive: what byte-identity actually costs, and what it does NOT (2026-08-06)
+
+Decision taken: **byte-identity is kept.** This entry separates the costs that
+are genuinely forced by that contract from the costs we are paying for unrelated
+reasons, because the previous entry conflated them and closed the tiled row too
+early.
+
+### The invariant, precisely
+
+Byte-identity requires only this: **each output's K reduction must happen in the
+same ORDER as the scalar reference.** It says nothing about layout, tiling, or
+vector width. Everything below follows from taking that literally.
+
+### Finding 1: the transpose is NOT required by byte-identity
+
+`vt` has two elementwise families and both satisfy the invariant:
+
+- `Bt16*` ([N,K] weight): outputs strided by K, so it must TRANSPOSE a
+  4x4/8x8/16x16 block per tile to get "element p across the 16 outputs".
+- `Nk16*` ([K,N] weight): outputs contiguous per p, **no transpose at all**.
+
+Measured on idle dgx (load 0.12, one flock), same logical GEMM, same operands,
+only storage orientation differing, f16 weight + f32 activations, GFLOP/s:
+
+| shape | bt ([N,K], transpose) | nk ([K,N], none) | agreement |
+|---|---:|---:|---|
+| 256,256,5220 | 224.5 | 247.9 | **BYTE-IDENTICAL** |
+| 131,2048,512 | 223.7 | 262.7 | **BYTE-IDENTICAL** |
+| 131,512,2048 | 219.2 | 211.4 | **BYTE-IDENTICAL** |
+| 131,512,512 | 215.0 | 269.2 | **BYTE-IDENTICAL** |
+| 261,512,512 | 243.5 | 274.8 | **BYTE-IDENTICAL** |
+| 1,640,2560 | 144.3 | 178.9 | **BYTE-IDENTICAL** |
+
+Every output bit agrees between the two orientations, verified by exact
+comparison rather than tolerance. So the transpose is a cost of LAYOUT, not of
+bit-exactness, and it is worth ~1.15x (1.10x to 1.25x, one shape regressing).
+
+### Finding 2: the nk path has NO M blocking, and that is just an omission
+
+`src/vt/cpu/cpu_ops.cpp:135`:
+
+    const int mr = (kBT && tier.btm[bi] != nullptr) ? tier.mr : 1;
+
+M blocking applies ONLY to the `bt` path. The `nk` path always runs `mr = 1` and
+reloads the entire weight tile for every activation row. Note nk still BEATS bt
+by ~1.17x while carrying that handicap.
+
+Standalone aarch64 prototype (`-ffp-contract=off`, mul-then-add, single
+threaded, so read the RATIO not the absolute):
+
+| shape | nk mr=1 | nk mr=4 | gain |
+|---|---:|---:|---:|
+| 131,2048,512 | 36.8 | 52.9 | **1.44x** |
+| 131,512,2048 | 29.6 | 52.5 | **1.78x** |
+| 131,512,512 | 36.7 | 53.0 | **1.44x** |
+| 261,512,512 | 36.8 | 53.7 | **1.46x** |
+| 1,640,2560 | 30.8 | 30.8 | 1.00x (M=1, nothing to block) |
+
+M blocking preserves the invariant trivially: it reuses a loaded weight vector
+across MR activation rows and touches no output's accumulation order.
+
+Honest caveat on that prototype: its byte-identity self-check reported DIFFERS,
+but the diagnostic shows `o1=nan o4=nan` with `maxabs=0`, i.e. every reported
+difference is NaN != NaN and there is NO numeric divergence. The harness has a
+NaN bug. The timing ratio is unaffected (both arms do identical work), but the
+byte-identity property must be established by the real `test_ops_matmul_elem`
+memcmp battery on a real kernel, not by this probe.
+
+### What byte-identity genuinely costs
+
+Two things, both irreducible:
+
+1. **FMA.** The scalar reference rounds the product before the add. Every
+   llamafile `madd` is an FMA.
+2. **Vectorising along K with a final `hsum`.** That is a different summation
+   order per output.
+
+Those are the real price, and they are the part of the llamafile gap we are
+choosing not to buy. Everything else in that gap is ours to take.
+
+### Revised plan for KERNEL-GEMM-CPU-TILED, byte-identity retained
+
+The previous entry said the row's headroom was unreachable. That was too
+strong: it was true of llamafile's STRUCTURE, not of the gap. Reachable, in
+order:
+
+1. **Add an M-blocked `nk` kernel** (`nkm` in the tier table, plus the
+   `cpu_ops.cpp:135` dispatch). Prototype says ~1.44x to 1.78x. Pure omission,
+   no contract question.
+2. **Repack [N,K] -> [K,N] at load** so `MatmulBT` reaches the no-transpose
+   family, exactly as the q8_0 G7 tier already repacks at load and flags it on
+   the tensor. Worth a further ~1.15x, and the precedent for doing it is in
+   this repo.
+
+Neither needs FMA and neither reorders any reduction. Combined they plausibly
+recover most of the llamafile delta while the memcmp gate stays valid and
+unchanged, which is the whole point.
