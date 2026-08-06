@@ -68,6 +68,7 @@ CHECKERS=(
   check-protocol-consistency
   check-state-order
   check-now-current
+  check-gate-commands
 )
 
 SUITES=(
@@ -88,6 +89,7 @@ SUITES=(
   test_check_state_order
   test_check_now_current
   test_audit_live_rows
+  test_check_gate_commands
 )
 
 failed=()
@@ -138,7 +140,10 @@ fi
 echo "Record gates:"
 for checker in "${CHECKERS[@]}"; do
   case "$checker" in
-    claim-view) run "$checker" python3 "scripts/$checker.py" --check ;;
+    # Both default to a REPORT that exits 0 whatever the record says; the gate
+    # is the flag. Wiring either without --check installs a gate that cannot
+    # fail, which for check-gate-commands is the very defect it classifies.
+    claim-view|check-gate-commands) run "$checker" python3 "scripts/$checker.py" --check ;;
     *) run "$checker" python3 "scripts/$checker.py" ;;
   esac
 done

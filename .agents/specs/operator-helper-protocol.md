@@ -120,6 +120,18 @@ PR is the claim.
 2. **Features only via sub-agents.** The operator may drive feature work, but
    only by dispatching sub-agents or a dynamic workflow — never by writing the
    feature itself. Enforced mechanically: see § Enforcement.
+   The loop itself lives in the manual agents actually read —
+   [workflow.md § Running a row through sub-agents](../workflow.md#running-a-row-through-sub-agents),
+   gated by `scripts/check-protocol-consistency.py` — and the two sub-agent
+   contracts are tracked artifacts: [implementer](../prompts/implementer.md)
+   and [reviewer](../prompts/reviewer.md). Serially per task: dispatch a fresh
+   implementer, **run the row's gate yourself** (a "done" that is only the
+   author's opinion of its own work gives the loop no floor), then dispatch an
+   INDEPENDENT reviewer whose binding instruction is to **mutate, not read** —
+   delete the line each test names and re-run, because a test that stays green
+   is a finding and none of the seventeen found so far was visible in a diff.
+   **Never fix findings yourself**: a controller fix pollutes the context that
+   exists to coordinate, and skips review entirely.
 3. **Directly permitted, because review needs it:** reading any diff, running
    any gate, resolving merge conflicts, fixing doc obligations, retuning a
    ratchet, and running benchmarks. An operator that cannot touch anything

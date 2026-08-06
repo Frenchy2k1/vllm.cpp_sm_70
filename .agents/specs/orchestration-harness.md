@@ -147,6 +147,20 @@ Three rules, each of which this project has already been bitten by:
    runs `--staged` in preflight, which passes vacuously once work is committed.
    Eleven commits on the P0 branch were red while every preflight was green.
 
+`scripts/check-gate-commands.py` enforces rules 1 and 2 over the rows that
+already carry a gate command, and
+[gate-command-audit-2026-08-06.md](gate-command-audit-2026-08-06.md) is the
+artifact behind it — **read it before touching that gate.** It records what the
+25 pinned rows are, that the pin is EXACT (growth reds the suite too, so any
+movement re-pins `RUNNABLE_BASELINE` in the same change), that **72 of 97 gated
+rows** cannot name a runnable command today and why that is *not* a claim they
+are unverified, and six named risks: the vocabulary's measured false-credit
+exposure (a naive widening would credit 21 rows on nothing), `classify_row`
+reading only `specs[0]` (12 verdicts, `runnable` 25 → 31), the **five weak
+credits** pinned deliberately, what the gate stops being able to see once it
+runs, the rows only a human could judge, and `sglang-matrix.md`'s
+listed-but-empty audit, now resolved by dropping it.
+
 ### Headless mode
 
 Subsystem A made mode a declaration: interactive by default, headless only when

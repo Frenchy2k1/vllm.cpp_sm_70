@@ -124,7 +124,18 @@ version, this list is the reminder.
   helper works in an isolated worktree on `row/<ROW-ID>` and opens a DRAFT PR at
   the START: that PR **is** the claim. The operator merges PRs first thing, owns
   `main` and the GPU, and drives feature work through sub-agents rather than
-  writing it. Add `--headless` only when the developer has SAID the run is
+  writing it — the loop is written down in
+  [workflow.md § Running a row through sub-agents](.agents/workflow.md#running-a-row-through-sub-agents)
+  and its two sub-agent contracts are tracked artifacts
+  ([implementer](.agents/prompts/implementer.md),
+  [reviewer](.agents/prompts/reviewer.md), gated by
+  `scripts/check-protocol-consistency.py`). Three rules carry it: the operator
+  RUNS the row's gate itself rather than believing the implementer's report; the
+  reviewer is a FRESH agent whose binding instruction is to MUTATE, not read,
+  because every finding that mattered here came from deleting a line and
+  re-running, never from reading a diff; and findings are NEVER fixed in the
+  operator's own session — they go back to a fresh implementer, then a scoped
+  re-review. Add `--headless` only when the developer has SAID the run is
   unattended; it is declared, never inferred.
 - **Never three-way merge a keyed record.** `docs/STATUS.md`,
   `docs/BENCHMARKS.md`, `docs/FEATURES.md`, `.agents/NOW.md`, the matrices and
