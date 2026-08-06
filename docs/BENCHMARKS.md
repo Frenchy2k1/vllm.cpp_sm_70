@@ -260,7 +260,8 @@ so the set is never re-pinned silently in either direction.
 **Hardware.** NVIDIA GB10 / DGX Spark (sm_121a) for CUDA, `dgx.casa` aarch64 for
 CPU, Apple M4 for Metal. GB10's 119 GiB pool is unified, so host and device
 memory compete; end-to-end wall-clock on a cold page cache is unusable there,
-and steady-state per-step timing or `nsys` GPU-busy is the anchor.
+and steady-state per-step timing or `nsys` GPU-busy is the anchor. The
+2026-08-06 #77-slip tree-revert changed no benchmark content or number.
 
 **Oracle pin.** vLLM 0.26.0.dev0 (`55596792`) plus transformers 5.14.1, built from
 source for sm_121a. Speed figures labelled 0.25.0 are the last binding run; the
