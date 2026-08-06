@@ -19,6 +19,79 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## QUANT-CT-MXFP4-FLASH-AUDIT — `--use_fast_math` on the FA2 TUs REJECTED (measured flash REGRESSION); the flash decode gap vs vLLM is a runtime memory/occupancy effect, not the SASS instruction count (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-AUDIT`, base `origin/main` `4ce9fb74`, GB10 sm_121a, PR #69)
+
+The #67 refutation re-attributed the c2-c8 MXFP4 residual FLASH-dominant and OWED a
+STRUCTURAL-lens audit of why the IDENTICAL-grid `flash_fwd_splitkv` decode kernel runs
+slower on our side. This row runs that audit to a MEASURED verdict.
+
+**W1 — the flash term is REAL and fresh same-tool; on CURRENT main it is SMALLER than #57.**
+`analyze_decode2.py` (dense-marlin-aware) c8 decode-window, both `nsys --cuda-graph-trace=node`,
+modal marlin=144 / gridZ=64 / 231 steady steps:
+
+| build (current-main dense-direct default) | flash MAIN us/step (us/call) | marlin us/step | glue |
+|---|---|---|---|
+| ours (no fast-math) | 6075.7 (**168.8**) | 16203.8 | 776.0 |
+| vLLM oracle | 5628.5 (**156.3**) | 16286.2 | 670.6 |
+
+Gap = **+12.5 us/call (+450 us/step)** — NOT #57's +807. Current-main's leaner marlin/glue
+(16204/776 vs #57's 16512/869) drop flash 178.1→168.8, itself a hint the residual is L2/context
+(the flash kernel's cost moves with its NEIGHBOURS' L2 footprint), not the kernel body.
+
+**W2 lens 1 (cuobjdump, HYPOTHESIS) — vLLM's flash-attn is `--use_fast_math`, ours was not.**
+Kernel-version REFUTED: vLLM v0.25.0 pins vllm-flash-attn @ `2c839c33`, the exact commit we
+vendored — flash SOURCE byte-identical. vLLM ships sm_80 ELF + compute_80 PTX (driver-JIT to
+sm_121). Decode kernel `<128,64,128,4>`: ours 5448 instrs/REG246; +`-use_fast_math` → 4832/REG255
+(= vLLM's 4880/REG255), HMMA(768)/LDSM(408)/LDGSTS(120) byte-identical. The compile lens
+SUGGESTED the +11.6% scalar bloat was the gap.
+
+**W2 lens 2 (MEASURED, the arbiter) — the compile lens was WRONG; `-use_fast_math` REGRESSES
+flash.** Controlled SAME-BUILD nsys A/B (current-main dense-direct default, flash source
+identical, only the flag differs), same-tool c8 decode-window:
+
+| build | flash MAIN us/call | flash instrs / REG |
+|---|---|---|
+| ours **no fast-math** | **168.8** | 5448 / 246 |
+| ours **+`-use_fast_math`** | **189.8** | 4832 / 255 |
+| vLLM | 156.3 | 4880 / 255 |
+
+**`-use_fast_math` makes flash +21 us/call SLOWER (168.8 → 189.8), not faster.** The kernel is
+MEMORY-LATENCY-bound: the instruction count barely gates time, and fast-math's higher register
+count (246→255) LOWERS occupancy, which dominates. Matching vLLM's SASS profile (4832/255 ≈
+4880/255) did NOT close the gap — ours-fastmath is +33 us/call above vLLM at the SAME instr/reg
+profile. This is the STRUCTURAL-lens "same kernel NAME, different resolved cost" rule and the
+"MEASURED not inferred" rule: cuobjdump was necessary but NOT sufficient. Correctness footnote:
+fast-math stayed token-exact (#44 smoke 3/3 + coherent) — a faithful mirror of vLLM's build,
+just not a speed win.
+
+**W2 real mechanism (sudo ncu; OURS characterized, vLLM-side LOST to a box OOM-reboot,
+OWED).** OURS no-fastmath flash (c1): **Achieved Occupancy 8.3%** (register-limited — 4 of 12
+warps/SM at 246 regs; fast-math's 255 regs → even fewer warps = the measured regression),
+**L2 Hit 53%**, Memory/Compute throughput ~1-1.5% (pure latency-bound). Warp stalls: **~38%
+short-scoreboard (MMA waiting on LDSM K/V staged to shared memory) + ~37% CTA-barrier
+(`__syncthreads`)** = ~75% of cycles. The flash decode is OCCUPANCY-STARVED: too few warps to
+hide the LDSM→MMA shared-memory dependency and the barrier. vLLM runs the SAME-SOURCE kernel at
+255 regs (same-or-worse occupancy) yet 156.3 — so its ~12 us/call edge is NOT occupancy; the
+precise ours-vs-vLLM L2/scheduling delta needs the vLLM-side ncu, lost when the shared box
+OOM-rebooted mid-capture (twice this session, under 3-way `row/H3-FP4-GPU-E2E` + CPU-GGUF-gate
+contention) — re-run owed on an idle box. Counter-pointed NEXT lever: lift occupancy above
+8.3% (cut the flash kernel's register pressure / `__launch_bounds__`) or cut the
+barrier/smem-scoreboard stalls (ncu's own hint: smaller warp groups / fewer syncs).
+
+**VERDICT.** `-use_fast_math` REJECTED and REVERTED (measured +21 us/call regression; a
+non-byte-exact change with a negative speed effect). No functional code ships (a CMakeLists
+NOTE records why not, so it is not re-tried). The flash decode residual vs vLLM is **+12.5
+us/call (+450 us/step) at c8**, a runtime memory/occupancy effect (ncu above), NOT the
+instruction count. The full SACRED battery + c1..c8 binding a default-flip would need are
+therefore NOT owed (no throughput win to flip). NEXT lever = the occupancy/L2 difference
+(candidate axes a/c: L2 pollution from our marlin/glue neighbours, register pressure /
+`__launch_bounds__`) — the +450 us/step is ~40% of the c8 residual after the dense-direct
+marlin banked the rest.
+
+Evidence: `dgx:~/mxfp4-nsys/{ours_fm_c8,ours_nofm_c8}_cuda_gpu_trace.csv` + `analyze_decode2.py`
+(A/B); `ours_nofm_flash_ncu.ncu-rep` (mechanism); `smoke_fm.log` (#44 3/3); compile arbiter
+(superseded lens). Box OOM-rebooted twice under 3-way contention; left clean.
+
 ## QUANT-CT-MXFP4-FUSED-GLUE W0 — the funded glue-fusion-into-Marlin kernel target is SOURCE-REFUTED; vLLM does NOT fuse glue into the extern Marlin GEMM for W4A16; the c2-c8 residual is FLASH-dominant, not glue (2026-08-06, `row/QUANT-CT-MXFP4-FUSED-GLUE`, source-side on dev box; GPU dumps box-contended by `row/H3-FP4-GPU-E2E`, base `origin/main` `672fc760`)
 
 W0 of the funded MXFP4 kernel campaign. The chartered vehicle is `Yi30/Qwen3-8B-MXFP4`

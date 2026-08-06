@@ -1412,6 +1412,15 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})
     target_compile_definitions(vllm PUBLIC VLLM_CPP_FLASH_ATTN)
+    # NOTE (QUANT-CT-MXFP4-FLASH-AUDIT #68): -use_fast_math was TRIED here to mirror
+    # vLLM's own flash-attn build (its _vllm_fa2_C is fast-math; it makes our decode
+    # kernel's SASS match vLLM's 4832/REG255 vs 4880/REG255). But a controlled
+    # same-build nsys A/B REFUTED it as a speed lever: this decode kernel is
+    # memory-latency-bound (ncu occ ~10.7%), so the +11.6% instruction reduction does
+    # not help, while fast-math's higher register count (246->255) LOWERS occupancy
+    # and REGRESSED flash 168.8 -> 189.8 us/call. So we do NOT pass -use_fast_math.
+    # The residual flash gap to vLLM (168.8 vs 156.3 us/call) is a runtime memory/L2
+    # effect, not the SASS; see .agents/benchmark-record.md.
     set_source_files_properties(
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS} PROPERTIES
