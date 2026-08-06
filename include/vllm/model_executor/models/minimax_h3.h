@@ -49,6 +49,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/models/qwen3_5_weights.h"  // Nvfp4Weight (fp4 arm)
 #include "vt/device.h"
 #include "vt/tensor.h"
 
@@ -1100,6 +1101,16 @@ struct MiniMaxH3DitBlockWeights {
   vt::Tensor fc2;        // [H, ffn]
   vt::Tensor adaln_w;    // [expand*modality*H, time_embed_dim] (blocks only)
   vt::Tensor adaln_b;    // [expand*modality*H]
+
+  // W-FP4a: the fp4 SPEED arm. When the DiT is loaded fp4-RESIDENT (the NVFP4
+  // checkpoint kept packed instead of dequantized), these carry the U8-packed
+  // E2M1 weight + its E4M3 group-16 scale + f32 global for each quantized
+  // projection, and the matching bf16 `vt::Tensor` above is left Empty(). The
+  // device forward routes a non-Empty() fp4 weight through
+  // dense_nvfp4::MatmulNvfp4W4A16D (Marlin W4A16 on sm_121, the SAME kernel the
+  // Laguna routed-expert + dense-Qwen3 NVFP4 arms use) instead of vt::MatmulBT;
+  // adaln_b keeps its bias `vt::Tensor` because the fp4 GEMM carries no bias.
+  Nvfp4Weight qkv_fp4, out_fp4, fc1_fp4, fc2_fp4, adaln_fp4;
 };
 
 struct MiniMaxH3DitWeights {
@@ -1116,6 +1127,11 @@ struct MiniMaxH3DitWeights {
   vt::Tensor final_adaln_w, final_adaln_b;
   vt::Tensor video_out_w, video_out_b;
   vt::Tensor audio_out_w, audio_out_b;
+
+  // W-FP4a fp4 SPEED arm (see MiniMaxH3DitBlockWeights): the two quantized
+  // projections outside the block loop. condition_proj carries a bias
+  // (condition_proj_b, kept above); final_adaln carries final_adaln_b.
+  Nvfp4Weight condition_fp4, final_adaln_fp4;
 };
 
 // A GGUF-loaded DiT: owned dequantized buffers plus the views the forward takes.
@@ -1263,6 +1279,23 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
                                                            const SafetensorsFile& file,
                                                            MiniMaxH3DitParams* out_params = nullptr);
+
+// W-FP4a — the fp4 SPEED twin of the streamer above. Instead of dequantizing each
+// U8 projection to bf16 and running vt::MatmulBT, this keeps the compressed-tensors
+// FP4 triple RESIDENT (an Nvfp4Weight per quantized projection) so the device
+// forward routes those GEMMs through dense_nvfp4::MatmulNvfp4W4A16D — the Marlin
+// W4A16 grouped GEMM (sm_121a native FP4 tensor cores) that the Laguna routed-expert
+// and dense-Qwen3 NVFP4 arms already use. The fp32 ISLANDS (both patch projections,
+// the time embedder, both output heads, rope.inv_freq) and the norms/biases stay
+// exactly as the bf16 streamer stages them. The packed weight bytes are held host-
+// resident on each Nvfp4Weight and uploaded (once, lazily) by the dispatcher's
+// resident-repack on first forward, then freed — so peak device memory is ~1/4 of
+// the bf16-dequant arm (the DiT is ~16 GB packed vs ~66 GB bf16). Correctness of
+// the Marlin kernel itself is gated on CUDA by test_ops_nvfp4_matmul /
+// test_linear_method; this arm is a loader+dispatch wiring, adding NO quant code.
+MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
+                                                          const SafetensorsFile& file,
+                                                          MiniMaxH3DitParams* out_params = nullptr);
 
 MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
                                                    const MiniMaxH3DitParams& params,

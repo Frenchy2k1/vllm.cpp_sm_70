@@ -10,6 +10,7 @@
 // that feeds RoPE), the flow-matching scheduler, the latent<->token packing, and
 // the full DiT forward all reproduce upstream's numbers. See
 // .agents/specs/minimax-h3.md sections 0 and 4.
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // W-FP4a: W4A16 exec stats
 #include "vllm/model_executor/models/minimax_h3.h"
 
 #include <doctest/doctest.h>
@@ -3087,6 +3088,67 @@ TEST_CASE("minimax_h3: an NVFP4 checkpoint loads into a runnable DiT") {
   CHECK(static_cast<int64_t>(got.video_logits.size()) == num_img * video_width);
   for (float v : got.video_logits) REQUIRE(std::isfinite(v));
   for (float v : got.audio_logits) REQUIRE(std::isfinite(v));
+
+  // ── W-FP4a: the fp4 SPEED path vs the bf16 arm on the SAME loaded checkpoint ──
+  // The bf16 arm dequantizes each NVFP4 projection to bf16 and runs vt::MatmulBT;
+  // the fp4 arm keeps the packed FP4 resident and routes those GEMMs through
+  // dense_nvfp4::MatmulNvfp4W4A16D (Marlin W4A16 on sm_121a). Both consume the SAME
+  // fp4 bytes, so the delta is the GEMM PATH only — not quantization. On the CPU
+  // backend the dispatcher has no Marlin op, so it falls back to a redundant-dequant
+  // GEMM (numerically the bf16 arm's own math), which makes this a WIRING gate here:
+  // it proves the loader sets the fp4 slots and the forward routes them. The real
+  // Marlin-vs-bf16 numeric delta is measured on the GB10 (test_ops_nvfp4_matmul /
+  // test_linear_method gate the Marlin kernel itself on CUDA at 2e-3/8e-3).
+  {
+    vt::Queue q = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+    vllm::MiniMaxH3DitParams bf16_params, fp4_params;
+    const vllm::MiniMaxH3DitDeviceWeights bf16_staged =
+        vllm::StreamMiniMaxH3Nvfp4ToDeviceBf16(q, st, &bf16_params);
+    const vllm::MiniMaxH3DitDeviceWeights fp4_staged =
+        vllm::StreamMiniMaxH3Nvfp4ToDeviceFp4(q, st, &fp4_params);
+
+    // The fp4 loader must have kept the quantized projections PACKED (an Nvfp4Weight
+    // per projection) and left their bf16 tensor slot Empty(), while the bf16 loader
+    // did the opposite. Getting this backwards is the silent failure this asserts.
+    CHECK(!fp4_staged.weights.blocks[0].qkv_fp4.Empty());
+    CHECK(fp4_staged.weights.blocks[0].qkv_proj.data == nullptr);
+    CHECK(bf16_staged.weights.blocks[0].qkv_fp4.Empty());
+    CHECK(bf16_staged.weights.blocks[0].qkv_proj.data != nullptr);
+    // The 11 quantized projections of this reduced model (refiner: qkv/out/fc1/fc2;
+    // block: +adaln; condition_proj; final_adaln) all keep FP4.
+    CHECK(!fp4_staged.weights.condition_fp4.Empty());
+    CHECK(!fp4_staged.weights.final_adaln_fp4.Empty());
+    CHECK(!fp4_staged.weights.blocks[0].adaln_fp4.Empty());
+    CHECK(fp4_staged.weights.refiner[0].adaln_fp4.Empty());  // refiner has no adaln
+
+    const MiniMaxH3DitOutputs bf16_out =
+        MiniMaxH3DitForwardDevice(q, bf16_params, bf16_staged.weights, in, vt::DType::kBF16);
+    vllm::dense_nvfp4::ResetW4A16Stats();
+    const MiniMaxH3DitOutputs fp4_out =
+        MiniMaxH3DitForwardDevice(q, fp4_params, fp4_staged.weights, in, vt::DType::kBF16);
+    const vllm::dense_nvfp4::Nvfp4W4A16Stats stats = vllm::dense_nvfp4::GetW4A16Stats();
+
+    // POSITIVE signal: the W4A16 dispatcher actually RAN for every quantized
+    // projection (11 GEMMs). On CPU these are `fallback_gemms`; on CUDA the same
+    // count lands as `marlin_gemms`. A silently-unwired forward would show zero.
+    const uint64_t w4a16_calls = stats.marlin_gemms + stats.fallback_gemms;
+    INFO("W4A16 GEMMs executed by the fp4 forward = " << w4a16_calls);
+    CHECK(w4a16_calls == 11);
+
+    REQUIRE(fp4_out.video_logits.size() == bf16_out.video_logits.size());
+    REQUIRE(fp4_out.audio_logits.size() == bf16_out.audio_logits.size());
+    for (float v : fp4_out.video_logits) REQUIRE(std::isfinite(v));
+    const double video_delta =
+        MaxAbsDiff(fp4_out.video_logits, bf16_out.video_logits.data(), fp4_out.video_logits.size());
+    const double audio_delta =
+        MaxAbsDiff(fp4_out.audio_logits, bf16_out.audio_logits.data(), fp4_out.audio_logits.size());
+    INFO("fp4-vs-bf16 (CPU fallback) video max|diff| = " << video_delta
+                                                         << ", audio max|diff| = " << audio_delta);
+    // CPU fallback == the bf16 arm's own dequant+matmul, so the two agree to matmul
+    // reduction-order slack; a real fp4/bf16 divergence only appears on the GB10.
+    CHECK(video_delta <= 2e-3);
+    CHECK(audio_delta <= 2e-3);
+  }
   std::remove(path.c_str());
 }
 

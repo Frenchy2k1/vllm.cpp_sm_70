@@ -18,7 +18,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | DeepSeek-V4-Flash decode | **Closed: BEATS ds4 1.144x** (`VT_V4_RESIDENT_W`, byte-exact). Phase-2 routed-expert residency NEGATIVE (−3.4%), default-OFF | — |
 | f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate/on-framework dense unaffected | Re-verify deepseek_v4 tower same-tool |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **LANDED on main (#26)**: portable path complete; e2e video on real weights (Thor); clean CPU build+ctest gated | FP4 speed path on GB10 (sm_121) |
+| MiniMax-H3 lane | **W-FP4a fp4 routing CPU-landed** (`row/H3-FP4-SPEED`): NVFP4 kept packed -> Marlin W4A16, no new quant code; gate 62/62 | GB10 CUDA gate; real e2e disk-blocked |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13): CPU+CUDA 13/13·656, no OOM. **Token gate NEAR-TIE 106/128** (6/8 token-exact) | device GDN/MLA islands + bf16 stream; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |

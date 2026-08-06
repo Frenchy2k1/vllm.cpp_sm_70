@@ -13093,6 +13093,54 @@ regenerate the GGUF manifest by range-fetching the first 4 MiB of the .gguf and 
 **Next gate:** download a quantized checkpoint and close the e2e loop (encoder -> VAEs -> pipeline), then W2b/W10 for speed. See
 [.agents/specs/minimax-h3.md](../.agents/specs/minimax-h3.md).
 
+## MiniMax-H3 W-FP4a — fp4-RESIDENT Marlin-W4A16 routing wired; CPU wiring-gate GREEN; GB10 fp4-vs-bf16 delta + s/step PENDING (2026-08-06, `row/H3-FP4-SPEED`, `ROAD-V1-H3`)
+
+**What changed.** The NVFP4 arm dequantized every packed FP4 projection to bf16 and
+ran `vt::MatmulBT`, so the sm_121a FP4 tensor-core route had NEVER run for H3. This
+keeps the FP4 packed and routes each quantized projection through
+`dense_nvfp4::MatmulNvfp4W4A16D` (Marlin W4A16, forced by vLLM's own a16 selection —
+the checkpoint is weight-only NVFP4, `IsTrueW4A4()==false`). No new quant code; it
+reuses the same dispatcher as Laguna routed-experts + dense Qwen3-32B NVFP4.
+
+**Per-shape routing (real geometry, spec §8.1):** all quantized projections are
+uniformly Marlin W4A16 — `qkv_proj [21504,5376]`, `out_proj [5376,7168]`, `fc1
+[28672,5376]`(+SiluAndMul, pre-merged so no fused-pair), `fc2 [5376,14336]`, block
+`adaln [96768,2688]`, `condition_proj [5376,5120]`, `final_adaln [10752,2688]`,
+refiner qkv/out/fc1/fc2. Islands + norms/biases stay bf16/f32. All N,K %16==0 and
+%128==0 — no Marlin shape blocker. Peak device memory ~1/4 of bf16 (~16 GB packed
+vs ~66 GB bf16).
+
+**CPU gate (verified, this box has no nvcc):** `test_minimax_h3` 62/62 cases /
+30039 assertions, 0 failed (Release, gcc-13). The synthetic-NVFP4 case now streams
+BOTH arms on the SAME file, asserts the fp4 loader kept projections PACKED (fp4 slot
+set / bf16 slot Empty; inverse for the bf16 loader), and asserts the W4A16
+dispatcher executed all 11 quantized GEMMs (the `Nvfp4W4A16Stats` this-path-ran
+counter == 11). fp4-vs-bf16 bounded <= 2e-3. On CPU the dispatcher has no Marlin op,
+so it falls back to the bf16 arm's own dequant+matmul: this is a WIRING gate here,
+proving the loader sets the fp4 slots and the forward routes them, NOT the kernel
+numerics. The Marlin W4A16 kernel itself is CUDA-gated independently by
+`test_ops_nvfp4_matmul` (odd shapes, 2e-3 f32-out / 4e-3 bf16-out vs bf16 ref) and
+`test_linear_method`.
+
+**PENDING (GB10, handoff recipe):** git-archive the row to dgx.casa, configure with
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, build ONLY
+`test_minimax_h3` (targeted — not a whole-archive), run
+`test_minimax_h3 --test-case="*NVFP4 checkpoint loads*"` — on CUDA the same case
+exercises Marlin (`stats.marlin_gemms==11`) and reports the real fp4-vs-bf16 delta;
+add a steady per-step timer around `MiniMaxH3DitForwardDevice`. Blocked on a safe
+disk/build window (dgx 33 G free vs 15 G floor; 570 G `.cache` is shared, not ours).
+Real-checkpoint t2va e2e is DISK-BLOCKED (~41 GB NVFP4 working set to download vs
+~18 GB usable, encoder required for a real render). `benchmark_binding=false`.
+
+**Comparability (mission #3):** vLLM-Omni CANNOT serve a quantized H3 on one GPU —
+BF16-only in practice (source-audited at `a4ea67a2`/v0.26.0: no quantized H3
+checkpoint exists; the fp32-island guard `minimax_h3_transformer.py:898-904` aborts
+a naive quant; text encoder hard-bf16 `encoder.py:930`; GGUF not wired into H3).
+Single-GPU IS supported but as BF16 + `--enable-cpu-offload`. -> HW/loader-forced-
+indirect (DeepSeek-GGUF precedent). The "DiT = 88% of latency" figure is NOT in the
+vllm-omni source; the documented anchor is the recipe's 4×B300 BF16 evidence (FL2VA
+209f 1248×768 = 86.964 s; two-video Ref2VA = 784.394 s, `recipe:298-311`).
+
 
 ## Laguna-S-2.1-NVFP4 decode — router top-k KERNEL-EFFICIENCY (`VT_LAGUNA_TOPK_SHFL`), BYTE-EXACT, SigmoidTopK 1.67×, −0.57% decode-step GPU (2026-08-03, `CLAIM-LAGUNA-TOPK-SHFL`)
 Measured results for vllm.cpp, against the reference engine each workload
