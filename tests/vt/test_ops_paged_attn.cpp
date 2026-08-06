@@ -1510,7 +1510,8 @@ Fa2DecodeRunStats RunFa2DecodeCase(Fa2DecodeCase& c, const char* toggle,
 Fa2DecodeRunStats RunFa2VarlenDecodeCase(Fa2DecodeCase& c, const char* toggle,
                                          bool expect_fa2, const char* swap_toggle = "0",
                                          bool expect_swap = false,
-                                         std::vector<uint16_t>* out_bits = nullptr) {
+                                         std::vector<uint16_t>* out_bits = nullptr,
+                                         const char* nsplits_cap = nullptr) {
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard guard(gpu);
   DeviceTensor query(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d},
@@ -1528,6 +1529,10 @@ Fa2DecodeRunStats RunFa2VarlenDecodeCase(Fa2DecodeCase& c, const char* toggle,
 
   EnvGuard qwen3_toggle("VT_FA2_DECODE_QWEN3", toggle);
   EnvGuard swap_env("VT_FA2_DECODE_GQA_SWAP", swap_toggle);
+  // VT_FA2_NSPLITS_CAP is read fresh per launch, so within-process A/B works.
+  // Passing nullptr leaves it OFF (default); an explicit value drives the cap for
+  // the num_splits regime-change proof.
+  EnvGuard cap_env("VT_FA2_NSPLITS_CAP", nsplits_cap == nullptr ? "0" : nsplits_cap);
   vt::cuda::testing::ResetFa2DecodeDebugCounters();
   PagedAttentionArgs args{c.scale, true};
   args.query_start_loc_host = c.qsl.data();
@@ -1668,6 +1673,71 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode swap near-ties the plain
         INFO("swap vs plain max_abs = " << max_abs);
         CHECK(max_abs < 2.0e-2);
       }
+    }
+  }
+}
+
+// GB10 num_splits cap (VT_FA2_NSPLITS_CAP): the FA2 heuristic OVER-SPLITS the
+// batch-1 decode (fed num_sms*2, all waves<1 => runs to max eligible splits). The
+// cap clamps the split count. This must (a) still match the same f32 composed
+// reference at BOTH gate ratios (0.6B 16/8, 4B 32/8) in the capped regime, and
+// (b) PROVE the cap engaged: at a long context that normally splits (base_len
+// 1024 => num_splits>1), forcing cap="1" collapses the launch onto the no-split
+// path (no_split_launches==1, split_launches==0), while the uncapped run splits
+// (split_launches==1). A cap that silently no-op'd would fail this regime check.
+// The swap is ON here (the shipped default), so this covers the production grid.
+TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode num_splits cap engages and stays correct") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 varlen d128 num_splits-cap check (dgx-pending)");
+    return;
+  }
+  for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
+                            std::pair<int64_t, int64_t>{32, 8}}) {
+    for (const int batch : {1, 2, 4}) {
+      CAPTURE(ratio.first);
+      CAPTURE(batch);
+      // base_len 1024 => the uncapped heuristic splits (num_splits>1).
+      std::vector<int32_t> lengths(static_cast<size_t>(batch));
+      for (int i = 0; i < batch; ++i)
+        lengths[static_cast<size_t>(i)] = 1024 + i * 3;
+      Fa2DecodeCase c(ratio.first, ratio.second, lengths,
+                      7500U + static_cast<uint32_t>(batch * 31), /*capacity_blocks=*/0,
+                      /*head_dim=*/128);
+
+      // Uncapped (default OFF) with swap ON: the long context splits.
+      std::vector<uint16_t> uncapped;
+      const Fa2DecodeRunStats base = RunFa2VarlenDecodeCase(
+          c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"1", /*expect_swap=*/true,
+          &uncapped, /*nsplits_cap=*/nullptr);
+      CHECK(base.split_launches == 1U);
+      CHECK(base.no_split_launches == 0U);
+
+      // Cap to 1: the same launch collapses onto the no-split kernel, and the
+      // output still matches the composed reference (asserted inside the helper).
+      std::vector<uint16_t> capped1;
+      const Fa2DecodeRunStats cap1 = RunFa2VarlenDecodeCase(
+          c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"1", /*expect_swap=*/true,
+          &capped1, /*nsplits_cap=*/"1");
+      CHECK(cap1.split_launches == 0U);
+      CHECK(cap1.no_split_launches == 1U);
+
+      // Cap to 2: a DIFFERENT split count than the uncapped heuristic, still
+      // splitting and still correct — near-ties the uncapped output (the cap is a
+      // reduction-order change over the SAME q/k/v, not a different computation).
+      std::vector<uint16_t> capped2;
+      const Fa2DecodeRunStats cap2 = RunFa2VarlenDecodeCase(
+          c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"1", /*expect_swap=*/true,
+          &capped2, /*nsplits_cap=*/"2");
+      CHECK(cap2.split_launches == 1U);
+      REQUIRE(uncapped.size() == capped2.size());
+      double max_abs = 0.0;
+      for (size_t i = 0; i < uncapped.size(); ++i) {
+        const double diff = static_cast<double>(Bf16BitsToF32(uncapped[i])) -
+                            static_cast<double>(Bf16BitsToF32(capped2[i]));
+        max_abs = std::max(max_abs, std::abs(diff));
+      }
+      INFO("uncapped vs cap=2 max_abs = " << max_abs);
+      CHECK(max_abs < 2.0e-2);
     }
   }
 }

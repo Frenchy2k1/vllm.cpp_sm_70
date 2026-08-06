@@ -22,9 +22,8 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13): CPU+CUDA 13/13·656, no OOM. **Token gate NEAR-TIE 106/128** (6/8 token-exact) | device GDN/MLA islands + bf16 stream; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| MXFP4 parity | c1 1.020 PASS, mem 2.63x; c2-c8 0.96-0.97 (#57). Kernel side CLOSED (flash refuted) | Frontend slice MEASURED 0.26ms/step, ~99% CPU-idle (latency, not compute); NOT a parity lever; c2-c8 gap GPU-intrinsic |
+| MXFP4 parity | **TERMINAL (`QUANT-CT-MXFP4-FINAL-STACK`)**: c1 1.020x PASS + mem 2.63x; c2-c8 0.962-0.969 GPU-intrinsic. Both last levers exhausted: num_splits cap `VT_FA2_NSPLITS_CAP` gated-OFF (c1-only, green, 32B strict char-identical); glue folds via `vt::FusedChain`, residual out-of-catalog Inductor GEMM-epilogue fusion (#46). `VT_MARLIN_DENSE` on | Record; branch not merged |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
-| MXFP4 parity goal | `VT_MARLIN_DENSE` default-ON (`KERNEL-MARLIN-DENSE-EXEC` `200b4b56`, merged): dense 48-CTA marlin beats MoE every axis (c8 0.969, mem 2.63x). c2-c8 still <1.0x; frontend REFUTED as the lever (`SERVE-FRONTEND-SLICE`), residual is GPU-intrinsic | Attribution DONE |
 
 In-flight branches (default-OFF, not pushed): `laguna-fp4proj-prod` (fp4),
 laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`. Records:
