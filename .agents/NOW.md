@@ -22,7 +22,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **e2e RUNS** (bf16-resident §13): 13/13·656. Token gate **NEAR-TIE 106/128** | device GDN/MLA islands; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| MXFP4 parity | **TERMINAL (`QUANT-CT-MXFP4-FINAL-STACK`)**: c1 1.020x PASS, mem 2.63x; c2-c8 0.962-0.969 GPU-intrinsic, both last levers exhausted (residual #46). `VT_MARLIN_DENSE` on | Record; branch not merged |
+| MXFP4 parity | **c1 1.020 PASS, c2-c8 0.962-0.969, mem 2.63x** (`VT_MARLIN_DENSE` banks +951us marlin). `FUSED-GLUE` W0: glue-into-marlin REFUTED at source; residual FLASH-dominant | flash same-tool audit OWED |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 
