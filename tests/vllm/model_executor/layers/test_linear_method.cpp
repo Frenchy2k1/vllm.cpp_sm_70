@@ -71,6 +71,7 @@ Nvfp4Weight MakeNvfp4W4A16(int64_t N, int64_t K) {
   return w;
 }
 
+#ifdef VT_MARLIN_NVFP4
 // A random MXFP4 W4A16 weight: E2M1 packed [N,K/2] + E8M0 scale [N,K/32], group
 // 32, no global, is_mxfp4=true — so the factory + Apply route the MXFP4 keep-quant
 // path (Marlin on GPU via BuildMarlinDenseResident).
@@ -97,6 +98,7 @@ Nvfp4Weight MakeMxfp4W4A16(int64_t N, int64_t K, uint32_t seed) {
   return w;
 }
 
+#endif  // VT_MARLIN_NVFP4
 }  // namespace
 
 #ifdef VT_MARLIN_NVFP4
