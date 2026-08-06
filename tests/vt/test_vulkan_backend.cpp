@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "vllm/platforms/interface.h"
@@ -221,15 +222,37 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
                       vt::OpId::kRmsNorm, vt::OpId::kFusedChain}) {
     CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
-  // Still stubbed — GEMM, attention, KV cache, quant, sampling. A partial backend
-  // is a supported state (src/vt/ops.cpp:104-111 throws on lookup). NO MODEL RUNS
-  // ON VULKAN.
+  // No NATIVE Vulkan kernel yet for GEMM, attention, KV cache, quant, sampling.
   for (vt::OpId op : {vt::OpId::kMatmul, vt::OpId::kMatmulBT, vt::OpId::kPagedAttention,
                       vt::OpId::kReshapeAndCache, vt::OpId::kEmbedding,
                       vt::OpId::kGreedyArgmax}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
-  CHECK_THROWS_AS(vt::GetOp(vt::OpId::kMatmul, DeviceType::kVULKAN), std::runtime_error);
+  // ...but they no longer THROW, and this assertion used to say they did.
+  //
+  // Accelerator-seam work row S5 (af0b21ba) added the PORTABLE REFERENCE TIER:
+  // for a unified-memory device, a missed GetOp lazily installs the CPU kernel as
+  // a priority -1000 provider, below every native kernel. Vulkan is eligible (GB10
+  // integrated and llvmpipe both report unified), so every op the CPU backend has
+  // resolves here and runs ON THE HOST against shared memory — correct, and
+  // arbitrarily slow.
+  //
+  // The Metal sibling was updated for this (test_metal_backend.cpp:215-231); THIS
+  // file was not, and the assertion sat RED from the moment S5 landed because no
+  // CI leg builds the Vulkan backend and nobody built it locally. The mirrored
+  // form below is deliberate: the two backends should fail the same way.
+  //
+  // Measured on this tree (VK-A1, 2026-08-06): of 87 CPU-registered ops, 8 are
+  // NATIVE on Vulkan, 79 are served by the reference tier, and ZERO throw.
+  REQUIRE(vt::ReferenceTierEligible(DeviceType::kVULKAN));
+  void* matmul = nullptr;
+  CHECK_NOTHROW(matmul = vt::GetOp(vt::OpId::kMatmul, DeviceType::kVULKAN));
+  CHECK(matmul != nullptr);
+  // BY NAME, so a host kernel can never masquerade as a native Vulkan one (Risk 7).
+  const auto stats = vt::GetOpProviderStats(vt::OpId::kMatmul, DeviceType::kVULKAN);
+  REQUIRE(stats.last_selected != nullptr);
+  CHECK(std::string(stats.last_selected) == std::string(vt::kReferenceProviderName));
+  CHECK(vt::GetReferenceTierHits() > 0);
 }
 
 TEST_CASE("Vulkan float-controls are PROBED and reported, not assumed") {
