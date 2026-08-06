@@ -104,12 +104,25 @@ Honest gaps, verified 2026-08-06 by grep and by the parakeet.cpp probe in
 | Log-mel front end | NONE | Extractor port |
 | GEMM, LayerNorm, elementwise | Present and tuned | None |
 
-Measured context (parakeet.cpp probe, same shapes, both runtimes): on GB10 CUDA
-`vt::MatmulBT` is **1.4x to 3.5x FASTER** than ggml at this encoder's real GEMM
-shapes (2.03x weighted, all 12 cases numerically verified). On CPU, ggml is
-ahead (1.2x to 2.2x on aarch64, more on x86). So the CUDA case for hosting this
-encoder on `vt::` is measured and strong; the CPU case is not, and this spike
-does not claim it.
+Measured context (parakeet.cpp probe, same shapes, both runtimes), CORRECTED
+2026-08-06:
+
+- **GB10 CUDA, 16-bit:** `vt::MatmulBT` is **1.4x to 3.5x FASTER** than ggml at
+  this encoder's real GEMM shapes (2.03x weighted, all 12 cases numerically
+  verified against an f64 host reference).
+- **GB10 Arm CPU, q8_0 with the G7 repack tier engaged:** `vt` is **1.38x to
+  4.97x FASTER** than ggml (628 to 1962 GFLOP/s vs 394 to 456).
+- **GB10 Arm CPU, 16-bit (f32 activations, f16 weight):** ggml is ahead
+  **1.14x to 2.00x** (403 to 444 vs 141 to 242 GFLOP/s).
+- **x86 CPU:** ggml ahead everywhere, because `QuantRepackEligible` is false off
+  i8mm and G5 is unimplemented, so `vt` runs a portable scalar tier.
+
+An earlier revision of this spike said ggml wins CPU outright. That was a
+benchmark defect: `Tensor.repacked` was left false, and since the G6 mmla tier
+only engages when M AND N are both even, the conformer's odd M (131, 261, 1)
+fell through to the portable tier. Production repacks at load
+(`qwen3_5_gguf_weights.cpp:104-107`), so the corrected numbers above are the
+binding ones.
 
 ## Port map
 
@@ -196,9 +209,13 @@ an HF one.
    upstream anywhere in the chain. Folding parakeet.cpp in FULLY requires it;
    folding in the encoder plus CTC does not. Until this is decided, P1-P5 stand
    on their own and parakeet.cpp keeps the transducer.
-2. **Is CPU a target for this encoder?** Measured: `vt::` loses to ggml on CPU
-   at these shapes on both x86 and aarch64. If CPU ASR matters, this fold makes
-   it slower, and parakeet.cpp should stay the CPU path.
+2. **Is CPU a target for this encoder, and at which dtype?** Measured, and the
+   answer differs by dtype rather than being uniform. On Arm, `vt` is 1.38x to
+   4.97x FASTER than ggml for q8_0 weights (i8mm repack tier) and 1.14x to 2.00x
+   SLOWER for 16-bit weights, where it has no integer tier to reach for. So a
+   quantized Arm CPU encoder is attractive, an f16 Arm CPU encoder is a
+   regression, and x86 is a regression at every dtype until G5 lands. If the
+   fold targets CPU, it should ship q8_0 as the CPU default rather than f16.
 
 **Engineering risks, not reopened:**
 
