@@ -357,6 +357,75 @@ TEST_CASE("elementwise ops match the CPU oracle within NMSE <= 5e-4") {
   cpu.DestroyQueue(cq);
 }
 
+TEST_CASE("RopeFromCache matches the CPU oracle within NMSE <= 5e-4, both styles") {
+  // The APPLY half of vLLM's rotary split: the cos/sin table is built once (on
+  // the portable tier, in double) and this rotates q and k with it.
+  constexpr int64_t kTokens = 11, kHq = 4, kHk = 2, kD = 16, kRot = 16;
+  constexpr int64_t kMaxPos = 64;
+
+  const std::vector<float> q0 = RandomVec(kTokens * kHq * kD, 801);
+  const std::vector<float> k0 = RandomVec(kTokens * kHk * kD, 802);
+  const std::vector<float> cache = RandomVec(kMaxPos * kRot, 803, -1.0f, 1.0f);
+  // Positions are NOT 0..n-1: a kernel that used the token index instead of the
+  // position would pass on the identity mapping and fail here.
+  std::vector<int32_t> pos(kTokens);
+  for (int64_t i = 0; i < kTokens; ++i) pos[static_cast<size_t>(i)] = int32_t((i * 7 + 3) % kMaxPos);
+
+  // NeoX rotates (pair, pair+half); GPT-J style rotates (2*pair, 2*pair+1). They
+  // are different element pairings, so a kernel that hardcoded one passes half
+  // the models and silently corrupts the other half.
+  for (bool neox : {true, false}) {
+    CAPTURE(neox);
+    vt::RopeArgs args;
+    args.rotary_dim = kRot;
+    args.is_neox_style = neox;
+
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> refq = q0, refk = k0, ccache = cache;
+    std::vector<int32_t> cpos = pos;
+    {
+      Tensor tq = Tensor::Contiguous(refq.data(), DType::kF32, cd, {kTokens, kHq, kD});
+      Tensor tk = Tensor::Contiguous(refk.data(), DType::kF32, cd, {kTokens, kHk, kD});
+      Tensor tc = Tensor::Contiguous(ccache.data(), DType::kF32, cd, {kMaxPos, kRot});
+      Tensor tp = Tensor::Contiguous(cpos.data(), DType::kI32, cd, {kTokens});
+      vt::RopeFromCache(cq, tq, &tk, tp, tc, args);
+    }
+    cpu.DestroyQueue(cq);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kRopeFromCache, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dq(dev, q, kTokens * kHq * kD), dk(dev, q, kTokens * kHk * kD),
+          dc(dev, q, kMaxPos * kRot);
+      dq.Upload(q0);   // rotation is IN PLACE, so re-upload the pristine input
+      dk.Upload(k0);
+      dc.Upload(cache);
+      void* dpos = dev.Alloc(kTokens * sizeof(int32_t));
+      dev.Copy(q, dpos, pos.data(), kTokens * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {kTokens, kHq, kD});
+      Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {kTokens, kHk, kD});
+      Tensor tc = Tensor::Contiguous(dc.ptr(), DType::kF32, d, {kMaxPos, kRot});
+      Tensor tp = Tensor::Contiguous(dpos, DType::kI32, d, {kTokens});
+      vt::RopeFromCache(q, tq, &tk, tp, tc, args);
+      dev.Synchronize(q);
+
+      CHECK(Nmse(refq, dq.Download()) <= kNmseTol);
+      CHECK(Nmse(refk, dk.Download()) <= kNmseTol);
+
+      dev.Free(dpos);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
 TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
   // Byte movement, so the bar is memcmp against the CPU oracle, not NMSE.
   constexpr int64_t kTokens = 9, kHk = 2, kD = 8, kBS = 4, kBlocks = 6;

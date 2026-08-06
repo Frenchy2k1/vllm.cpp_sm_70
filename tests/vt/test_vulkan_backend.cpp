@@ -53,7 +53,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 12);
+  CHECK(n == 14);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -65,8 +65,9 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // rather than at pipeline-creation time on a device we might not have.
   for (const char* want : {"vt_add", "vt_cast", "vt_embedding", "vt_fused_chain",
                            "vt_greedy_argmax", "vt_layer_norm", "vt_matmul",
-                           "vt_paged_attn", "vt_relu", "vt_reshape_and_cache",
-                           "vt_rms_norm", "vt_silu_and_mul"}) {
+                           "vt_paged_attn", "vt_qkv_split", "vt_relu",
+                           "vt_reshape_and_cache", "vt_rms_norm",
+                           "vt_rope_from_cache", "vt_silu_and_mul"}) {
     bool found = false;
     for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
       if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
@@ -109,6 +110,14 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // table dtype, out dtype, id width (i32 vs i64).
       REQUIRE(m.spec_id_count == 3);
       for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_rope_from_cache") == 0) {
+      // q / k / cache dtype, the NeoX-vs-GPT-J pairing, and the position width.
+      REQUIRE(m.spec_id_count == 5);
+      for (uint32_t want = 0; want < 5; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_qkv_split") == 0) {
+      // source dtype, destination dtype.
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_reshape_and_cache") == 0) {
       // A single WIDTH selector, not a dtype code: this op moves bytes and
       // converts nothing, so 32-bit and 16-bit are the only two paths.
@@ -319,10 +328,25 @@ TEST_CASE("Vulkan platform is registered and reports unified/no-pool residency")
   CHECK_FALSE(rp.release_host_weights_after_upload);
   CHECK_FALSE(rp.uses_device_memory_pool);
 
-  // No Vulkan attention kernel exists yet, so the priority list is EMPTY by
-  // design (see src/vllm/platforms/vulkan.cpp) — selection must fail loudly
-  // rather than name a backend whose kernels are absent.
-  CHECK(p.get_attn_backend_priority().empty());
+  // Vulkan now HAS native kPagedAttention + kReshapeAndCache reading and writing
+  // the NHD layout FlashAttentionBackend::get_kv_cache_shape allocates, so the
+  // selector may reach FLASH_ATTN — on exactly the footing Metal reached it.
+  // This is what let OPT-125m run end to end on Vulkan.
+  {
+    vllm::platforms::AttnSelectorConfig cfg;
+    const auto prio = p.get_attn_backend_priority(cfg);
+    REQUIRE(prio.size() == 1);
+    CHECK(prio[0] == "FLASH_ATTN");
+  }
+  // MLA stays EMPTY, and that is a capability statement rather than a stub:
+  // kMlaDecodeAttention / kMlaPrefillAttention / kConcatAndCacheMla have no
+  // Vulkan kernel, so naming a backend here would route an MLA model into one
+  // that cannot serve it. Selection must fail loudly instead.
+  {
+    vllm::platforms::AttnSelectorConfig mla;
+    mla.use_mla = true;
+    CHECK(p.get_attn_backend_priority(mla).empty());
+  }
 }
 
 TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
@@ -337,13 +361,17 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
                       vt::OpId::kMatmul, vt::OpId::kMatmulBT,
                       vt::OpId::kEmbedding, vt::OpId::kGreedyArgmax,
                       // The attention block: paged attention (the one kernel
-                      // with no llama.cpp Vulkan counterpart) and the KV write.
-                      vt::OpId::kPagedAttention, vt::OpId::kReshapeAndCache}) {
+                      // with no llama.cpp Vulkan counterpart), the KV write, the
+                      // QKV split and the rotary APPLY.
+                      vt::OpId::kPagedAttention, vt::OpId::kReshapeAndCache,
+                      vt::OpId::kQkvSplit, vt::OpId::kRopeFromCache}) {
     CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
-  // No NATIVE Vulkan kernel yet for RoPE, quant, MoE, or the sampler beyond
+  // No NATIVE Vulkan kernel yet for the rotary TABLE BUILD (kRopeCosSinCache and
+  // kRopeNeox both construct the angle in double -- deliberately left on the
+  // portable tier, mirroring vLLM's own split), quant, MoE, or the sampler beyond
   // greedy argmax.
-  for (vt::OpId op : {vt::OpId::kRopeNeox, vt::OpId::kRopeFromCache,
+  for (vt::OpId op : {vt::OpId::kRopeNeox, vt::OpId::kRopeCosSinCache,
                       vt::OpId::kApplyTemperature, vt::OpId::kMoeRouterTopK}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kVULKAN));
   }

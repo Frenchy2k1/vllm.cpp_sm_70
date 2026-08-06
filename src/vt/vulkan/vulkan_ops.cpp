@@ -112,6 +112,14 @@ struct EmbeddingParams {
 struct ArgmaxParams {
   uint32_t n, v, logits_off, out_off;
 };
+struct QkvSplitParams {
+  uint32_t tokens, q_dim, k_dim, v_dim, src_off, q_off, k_off, v_off;
+};
+struct RopeFromCacheParams {
+  uint32_t tokens, half_dim, rotary_dim, hq, hk;
+  uint32_t q_s0, q_s1, k_s0, k_s1;
+  uint32_t q_off, k_off, c_off, p_off;
+};
 struct ReshapeAndCacheParams {
   uint32_t num_slots, n_elems, block_size;
   uint32_t k_blk, k_pg, v_blk, v_pg;
@@ -541,6 +549,93 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
   Go("vt_reshape_and_cache", bind, p, FlatGroupCount(num_slots * n_elems), spec, 1);
 }
 
+// vt::RopeFromCache — the APPLY half of vLLM's rotary split.
+// Upstream: rotary_embedding/base.py:160-252, common.py:145-185 @ e24d1b24fe96;
+// our reference is cpu_ops.cpp RopeFromCacheKernel (:751-802).
+//
+// vLLM's RotaryEmbedding builds cos_sin_cache once in __init__ and the forward
+// only applies it, so kRopeCosSinCache (the table, built in double) stays on the
+// portable tier and this native kernel is the per-token apply. See the shader for
+// why that boundary is also the right one numerically.
+void RopeFromCacheKernel(Queue& queue, Tensor& qs, Tensor* ks, const Tensor& positions,
+                         const Tensor& cache, const RopeArgs& args) {
+  // MROPE DECLINES rather than throws. Multimodal RoPE selects a different
+  // position AXIS per pair (cpu_ops.cpp:769-771 via MropeAxisForPair, mirroring
+  // vLLM mrope.py), which this shader does not implement -- and throwing would
+  // REMOVE a capability the portable reference tier already provides. Forwarded
+  // through the provider seam, the same per-call refusal fp8 KV uses.
+  if (positions.rank == 2) {
+    auto next = reinterpret_cast<RopeFromCacheFn>(
+        GetOpFallback(OpId::kRopeFromCache, DeviceType::kVULKAN, kNativeProviderName));
+    next(queue, qs, ks, positions, cache, args);
+    return;
+  }
+
+  const int64_t tokens = qs.shape[0];
+  const int64_t hq = qs.shape[1];
+  const int64_t hk = ks == nullptr ? 0 : ks->shape[1];
+  const int64_t half = args.rotary_dim / 2;
+  if (tokens == 0 || half == 0 || (hq + hk) == 0) return;
+  VT_CHECK(positions.dtype == DType::kI32 || positions.dtype == DType::kI64,
+           "vulkan rope_from_cache: positions must be i32 or i64");
+
+  Binder bind;
+  const uint32_t q_off = bind.Add(qs, "rope_from_cache: q");
+  // Bindings 2/3 are declared by the shader whether or not k exists, and a
+  // descriptor a shader statically uses must be valid even on the path that never
+  // reads it -- so with hk == 0 they alias q and are dead. Same arrangement the
+  // rmsnorm kernel already uses for its optional residual.
+  const uint32_t k_off = ks != nullptr ? bind.Add(*ks, "rope_from_cache: k")
+                                       : bind.Add(qs, "rope_from_cache: q");
+  const uint32_t c_off = bind.Add(cache, "rope_from_cache: cos_sin_cache");
+  const uint32_t p_off = bind.AddU32Only(positions, "rope_from_cache: positions");
+
+  const uint32_t spec[5] = {DtypeCode(qs.dtype),
+                            ks != nullptr ? DtypeCode(ks->dtype) : DtypeCode(qs.dtype),
+                            DtypeCode(cache.dtype),
+                            args.is_neox_style ? 1u : 0u,
+                            positions.dtype == DType::kI64 ? 1u : 0u};
+  RopeFromCacheParams p{static_cast<uint32_t>(tokens),
+                        static_cast<uint32_t>(half),
+                        static_cast<uint32_t>(args.rotary_dim),
+                        static_cast<uint32_t>(hq),
+                        static_cast<uint32_t>(hk),
+                        static_cast<uint32_t>(qs.stride[0]),
+                        static_cast<uint32_t>(qs.stride[1]),
+                        static_cast<uint32_t>(ks != nullptr ? ks->stride[0] : 0),
+                        static_cast<uint32_t>(ks != nullptr ? ks->stride[1] : 0),
+                        q_off,
+                        k_off,
+                        c_off,
+                        p_off};
+  Go("vt_rope_from_cache", bind, p, FlatGroupCount(tokens * half * (hq + hk)), spec, 5);
+}
+
+// cpu_ops.cpp:2162-2176 QkvSplitKernel. Mirrors vLLM's QKVParallelLinear output
+// split (qkv.split([q_size, kv_size, kv_size], dim=-1)); the three widths are
+// independent because under GQA k and v are narrower than q. One invocation per
+// OUTPUT element across all three destinations, so this is one dispatch.
+void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
+  const int64_t t = qkv.shape[0];
+  if (t == 0) return;
+  const int64_t q_dim = q_out.Numel() / t;
+  const int64_t k_dim = k_out.Numel() / t;
+  const int64_t v_dim = v_out.Numel() / t;
+  VT_CHECK(q_out.dtype == k_out.dtype && k_out.dtype == v_out.dtype,
+           "vulkan qkv_split: the three destinations must share a dtype");
+  Binder bind;
+  const uint32_t src_off = bind.Add(qkv, "qkv_split: qkv");
+  const uint32_t q_off = bind.Add(q_out, "qkv_split: q");
+  const uint32_t k_off = bind.Add(k_out, "qkv_split: k");
+  const uint32_t v_off = bind.Add(v_out, "qkv_split: v");
+  const uint32_t spec[2] = {DtypeCode(qkv.dtype), DtypeCode(q_out.dtype)};
+  QkvSplitParams p{static_cast<uint32_t>(t),     static_cast<uint32_t>(q_dim),
+                   static_cast<uint32_t>(k_dim), static_cast<uint32_t>(v_dim),
+                   src_off,                      q_off,
+                   k_off,                        v_off};
+  Go("vt_qkv_split", bind, p, FlatGroupCount(t * (q_dim + k_dim + v_dim)), spec, 2);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -549,6 +644,10 @@ struct Registrar {
     if (!VulkanContext::Available()) return;
     // static_cast against the ops.h aliases ties every kernel signature to the
     // registration contract at COMPILE time (the cpu_ops.cpp idiom).
+    RegisterOp(OpId::kQkvSplit, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
+    RegisterOp(OpId::kRopeFromCache, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<RopeFromCacheFn>(&RopeFromCacheKernel)));
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
     RegisterOp(OpId::kPagedAttention, DeviceType::kVULKAN,
