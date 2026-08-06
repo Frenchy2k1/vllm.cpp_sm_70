@@ -13359,3 +13359,75 @@ and neither lever touches the 47% decode threadpool cost that profile found.
 Minor observation: `vt` f16 costs ~1.2x more than its own f32 on Arm (216-242 vs
 260-322) but nothing on x86 (166-206 vs 148-204), so the NEON `vcvt_f32_f16`
 widen in the inner loop has a small cost the x86 F16C path does not.
+
+## KERNEL-GEMM-CPU-TILED: the llamafile 1.9x is UNREACHABLE under byte-identity (2026-08-06)
+
+Spike follow-up that changes the row. The tiled-sgemm row was scoped at ~1.9x on
+Arm 16-bit, taken from the measured llamafile delta. Reading llamafile's actual
+inner loop, and then testing the reachable part, shows that headroom is not
+available to us without abandoning the bit-exactness contract.
+
+### What llamafile actually does
+
+`ggml/src/ggml-cpu/llamafile/sgemm.cpp` @ `237ad9b96`, `gemm<RM,RN,BM>`:
+
+- `:550` `D Cv[RN][RM] = {}` are VECTOR accumulators.
+- `:561` `Cv[j][i] = madd(Av[i], Bv, Cv[j][i])` accumulates along K **in vector
+  lanes**, so lane `l` holds the partial sum for a different `k`.
+- `:232-293` `hsum(...)` horizontally reduces each accumulator at the END.
+- `:134-170` `madd` is FMA everywhere (`vfmaq_f32`, `_mm256_fmadd_ps`,
+  `_mm512_fmadd_ps`, plus `float16x8_t` and `__m512bh` variants).
+
+Both properties are order-changing. Splitting K across lanes and hsum-ing at the
+end is a DIFFERENT summation order per output, and FMA does not round the
+product. Our kernel vectorises across OUTPUT COLUMNS specifically so each output
+keeps a strictly sequential K reduction (the E1-E4 invariant), and that choice is
+what forces the 4x4/8x8/16x16 transpose which is our dominant per-tile cost.
+
+So llamafile is not "the same kernel, better tiled". It is a structurally
+different kernel whose speed comes from the exact freedoms we gave up.
+
+### The reachable part, MEASURED NEGATIVE
+
+If the win were merely a bigger register tile, raising `kMrNeon` would show it.
+Idle dgx aarch64 (load 0.12), one flock, same binary discipline, f16 weight with
+f32 activations, GFLOP/s:
+
+| shape | MR=4 (today) | MR=6 | delta |
+|---|---:|---:|---:|
+| 256,256,5220 | 220.1 | 204.4 | **-7.1%** |
+| 131,2048,512 | 216.6 | 228.4 | +5.4% |
+| 131,512,2048 | 213.8 | 224.5 | +5.0% |
+| 131,512,512 | 212.6 | 224.0 | +5.4% |
+| 261,512,512 | 239.1 | 219.0 | **-8.4%** |
+| 1,640,2560 | 140.7 | 138.2 | -1.8% |
+
+A wash: three shapes gain ~5%, two lose 7-8%. Register pressure (MR*4 + 4 of 32
+vectors) trades against transpose amortisation and the two effects cancel. This
+is NOT a 1.9x lever and no further MR sweep is warranted.
+
+### Consequence, and the decision it needs
+
+`KERNEL-GEMM-CPU-TILED` as scoped is **not achievable while byte-identity
+holds**. Two honest options, and the choice is a PRODUCT call, not an
+engineering one:
+
+1. **Keep byte-identity.** The row's realistic headroom is a few percent, not
+   1.9x. It should be rescoped or closed, and the 16-bit CPU gap against ggml
+   stands as a deliberate cost of bit-exactness.
+2. **Add an OPT-IN fast path** (`VT_CPU_MATMUL_FAST` style, default OFF) that
+   vectorises along K with FMA and hsum, matching llamafile's structure. It
+   would NOT be byte-identical to the portable tier, so it needs its own
+   numerical gate (NMSE against an f64 reference rather than memcmp) and an
+   explicit statement of which surfaces may use it. T0 forbids trading the
+   token-exactness precondition on the gate models, so such a path must be
+   provably off wherever that precondition applies.
+
+Recorded WITHOUT choosing. No row is being marked done or dead here.
+
+### Unaffected
+
+The x86 wide-ISA row (`KERNEL-GEMM-CPU-ELEM-X86WIDE`, W1/W2 landed) is NOT
+affected by any of this: AVX2 and AVX-512 widen the OUTPUT-lane dimension, which
+preserves the reduction order, and both pass the 654-assertion memcmp gate. Its
+~3.5x width headroom stands on its own.
