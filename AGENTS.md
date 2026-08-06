@@ -101,7 +101,9 @@ version, this list is the reminder.
   never `Signed-off-by` or `Co-Authored-By` from an AI.
 - **Run `scripts/agent-preflight.sh`** at session start and before committing,
   and chain the push to it (`gate && git push`) so a red gate cannot be followed
-  by a green push.
+  by a green push. Enable the backstop once per clone with `git config
+  core.hooksPath .githooks` — the pre-push hook re-runs the two public-doc page
+  gates on the commits being pushed ([hooks](.githooks/README.md)).
 - **Know your ROLE before you work**, and ASK for it as the FIRST question of
   the session — the interview is in
   [workflow.md](.agents/workflow.md#first-question-of-every-session)
