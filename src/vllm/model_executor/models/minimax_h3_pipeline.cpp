@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -406,6 +408,22 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
     video_latent = MiniMaxH3VideoVaePostQuantConv(video_weights, video_latent,
                                                   dit_params.latents_dim, video_per_channel);
   }
+  // DIAGNOSTIC (env-gated, byte-identical when unset): dump the exact latent that
+  // enters the video VAE (post unpatchify + denormalize + post_quant_conv) as raw
+  // f32, so the VAE decode can be replayed on a KNOWN latent and runs byte-compared
+  // (H3 render-coherence bisection at the VAE boundary).
+  if (const char* dump_dir = std::getenv("VT_H3_DUMP_DIR")) {
+    std::string path = std::string(dump_dir) + "/vae_input_video_latent.f32";
+    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+      std::fwrite(video_latent.data(), sizeof(float), video_latent.size(), f);
+      std::fclose(f);
+      std::fprintf(stderr, "[h3-dump] wrote %s (%zu floats, channels=%lld per_channel=%lld)\n",
+                   path.c_str(), video_latent.size(),
+                   static_cast<long long>(dit_params.latents_dim),
+                   static_cast<long long>(video_per_channel));
+    }
+  }
+
   // On a device, run the ViT3D decoder device-resident. The portable decoder is a
   // scalar reference; at real resolutions it is the stage that does not finish. It
   // stays the CPU path, and stays the thing the device path is gated against.
@@ -419,6 +437,58 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
     result.frames = MiniMaxH3VideoVaeDecodeTemporalDevice(
         device, video_config, staged_vae, video_latent, request.latent_t, request.latent_h,
         request.latent_w, request.num_frames, &result.frame_shape);
+
+    // DIAGNOSTIC (env-gated): VAE receptive-field probe. Perturb ONE interior spatial
+    // latent cell across all channels + temporal frames, re-decode, and report the
+    // per-16px-block RMS change on output frame 0. If ONLY the perturbed cell's block
+    // moves, the decoder is not mixing tokens spatially (render-coherence bisection).
+    if (std::getenv("VT_H3_VAE_PROBE")) {
+      const int64_t lh = request.latent_h, lw = request.latent_w, lt = request.latent_t;
+      const int64_t C = dit_params.latents_dim;
+      const int64_t per = lt * lh * lw;
+      const int64_t ch = lh / 2, cw = lw / 2;  // center latent cell
+      std::vector<float> pert = video_latent;
+      for (int64_t c = 0; c < C; ++c) {
+        for (int64_t t = 0; t < lt; ++t) {
+          const int64_t idx = c * per + (t * lh + ch) * lw + cw;
+          pert[static_cast<size_t>(idx)] += 8.0f;  // large, unambiguous impulse
+        }
+      }
+      MiniMaxH3VideoFrameShape ps{};
+      std::vector<float> pf = MiniMaxH3VideoVaeDecodeTemporalDevice(
+          device, video_config, staged_vae, pert, request.latent_t, request.latent_h,
+          request.latent_w, request.num_frames, &ps);
+      const int64_t oh = result.frame_shape.h, ow = result.frame_shape.w, oc = result.frame_shape.channels;
+      const int64_t ratio = oh / lh;  // pixels per latent cell (== vae spatial ratio)
+      // block-diff map over the lh x lw grid, output frame 0
+      std::fprintf(stderr, "[h3-vae-probe] latent %lldx%lldx%lld -> frame %lldx%lld, ratio=%lld, "
+                   "perturbed cell (h=%lld,w=%lld). Per-block RMS |delta| (x1000):\n",
+                   (long long)lt, (long long)lh, (long long)lw, (long long)oh, (long long)ow,
+                   (long long)ratio, (long long)ch, (long long)cw);
+      const int64_t plane = oh * ow;
+      for (int64_t bh = 0; bh < lh; ++bh) {
+        std::string line;
+        for (int64_t bw = 0; bw < lw; ++bw) {
+          double s2 = 0.0; int64_t n = 0;
+          for (int64_t c = 0; c < oc; ++c) {
+            for (int64_t py = 0; py < ratio; ++py) {
+              for (int64_t px = 0; px < ratio; ++px) {
+                const int64_t oy = bh * ratio + py, ox = bw * ratio + px;
+                if (oy >= oh || ox >= ow) continue;
+                const int64_t k = c * plane + oy * ow + ox;
+                const double dd = static_cast<double>(pf[static_cast<size_t>(k)]) -
+                                  static_cast<double>(result.frames[static_cast<size_t>(k)]);
+                s2 += dd * dd; ++n;
+              }
+            }
+          }
+          const int v = static_cast<int>(1000.0 * std::sqrt(s2 / (n > 0 ? n : 1)));
+          char buf[16]; std::snprintf(buf, sizeof(buf), "%5d", v); line += buf;
+        }
+        std::fprintf(stderr, "[h3-vae-probe] %s\n", line.c_str());
+      }
+      std::fflush(stderr);
+    }
   } else {
     result.frames = MiniMaxH3VideoVaeDecode(video_config, video_weights, video_latent,
                                             request.latent_t, request.latent_h, request.latent_w,

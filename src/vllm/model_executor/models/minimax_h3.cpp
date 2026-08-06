@@ -777,6 +777,44 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     ++audio_ref_index;
   }
 
+  // DIAGNOSTIC (env-gated, byte-identical when unset): VT_H3_TRACE_MOTION prints
+  // per-step velocity + latent-motion stats to stderr; VT_H3_DUMP_DIR writes the
+  // initial and final video latent rows as raw f32 so runs can be byte-compared.
+  // The rectified-flow Euler integration telescopes to (sigma0 - sigmaN) * v ~= v,
+  // so a velocity that does NOT evolve across steps yields a step-count-INVARIANT
+  // result -- this trace measures exactly that (see H3 render-coherence bisection).
+  const bool trace_motion = std::getenv("VT_H3_TRACE_MOTION") != nullptr;
+  const char* dump_dir = std::getenv("VT_H3_DUMP_DIR");
+  auto rms_absmax = [](const float* p, int64_t n, double* rms, double* absmax, double* mean) {
+    double s2 = 0.0, amax = 0.0, sum = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+      const double v = static_cast<double>(p[i]);
+      s2 += v * v;
+      sum += v;
+      if (std::fabs(v) > amax) amax = std::fabs(v);
+    }
+    const double denom = n > 0 ? static_cast<double>(n) : 1.0;
+    *rms = std::sqrt(s2 / denom);
+    *absmax = amax;
+    *mean = sum / denom;
+  };
+  auto dump_rows = [&](const char* name, const std::vector<float>& v) {
+    if (dump_dir == nullptr) return;
+    std::string path = std::string(dump_dir) + "/" + name;
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) return;
+    std::fwrite(v.data(), sizeof(float), v.size(), f);
+    std::fclose(f);
+  };
+  dump_rows("init_video_rows.f32", initial_video_rows);
+  if (trace_motion) {
+    double r = 0, a = 0, mn = 0;
+    rms_absmax(initial_video_rows.data(), static_cast<int64_t>(initial_video_rows.size()), &r, &a,
+               &mn);
+    std::fprintf(stderr, "[h3-motion] INIT video_rows n=%lld rms=%.6g absmax=%.6g mean=%.6g\n",
+                 static_cast<long long>(initial_video_rows.size()), r, a, mn);
+  }
+
   const int64_t num_steps = static_cast<int64_t>(sigmas_video.size()) - 1;
   for (int64_t step = 0; step < num_steps; ++step) {
     const double s_v = sigmas_video[static_cast<size_t>(step)];
@@ -892,6 +930,8 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
       }
     };
 
+    std::vector<float> motion_prev;
+    if (trace_motion) motion_prev = result.video_rows;
     advance(result.video_rows, velocity.video_logits, packed.update_mask, num_img, video_width, t_v,
             s_v, s_v_next);
     cond_index = 0;
@@ -913,6 +953,58 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
                   static_cast<size_t>(audio_width) * sizeof(float));
       ++audio_ref_index;
     }
+
+    if (trace_motion) {
+      double v_rms = 0, v_amax = 0, v_mean = 0;
+      rms_absmax(velocity.video_logits.data(),
+                 static_cast<int64_t>(velocity.video_logits.size()), &v_rms, &v_amax, &v_mean);
+      // Motion this step, over the UPDATE (denoise-target) rows only.
+      double d2 = 0.0;
+      int64_t dn = 0;
+      for (int64_t rr = 0; rr < num_img; ++rr) {
+        if (!packed.update_mask[static_cast<size_t>(rr)]) continue;
+        for (int64_t c = 0; c < video_width; ++c) {
+          const size_t idx = static_cast<size_t>(rr * video_width + c);
+          const double diff =
+              static_cast<double>(result.video_rows[idx]) - static_cast<double>(motion_prev[idx]);
+          d2 += diff * diff;
+          ++dn;
+        }
+      }
+      const double drows_rms = std::sqrt(d2 / (dn > 0 ? static_cast<double>(dn) : 1.0));
+      double rows_rms = 0, rows_amax = 0, rows_mean = 0;
+      rms_absmax(result.video_rows.data(), static_cast<int64_t>(result.video_rows.size()),
+                 &rows_rms, &rows_amax, &rows_mean);
+      std::fprintf(stderr,
+                   "[h3-motion] step %lld/%lld sig_v=%.5f->%.5f v_rms=%.6g v_amax=%.6g "
+                   "v_mean=%.6g drows_rms=%.6g rows_rms=%.6g rows_amax=%.6g\n",
+                   static_cast<long long>(step + 1), static_cast<long long>(num_steps),
+                   sigmas_video[static_cast<size_t>(step)],
+                   sigmas_video[static_cast<size_t>(step + 1)], v_rms, v_amax, v_mean, drows_rms,
+                   rows_rms, rows_amax);
+      std::fflush(stderr);
+    }
+  }
+
+  dump_rows("final_video_rows.f32", result.video_rows);
+  if (trace_motion) {
+    double r = 0, a = 0, mn = 0;
+    rms_absmax(result.video_rows.data(), static_cast<int64_t>(result.video_rows.size()), &r, &a,
+               &mn);
+    // Total displacement from the initial noise, over all rows.
+    double d2 = 0.0;
+    const size_t n = std::min(result.video_rows.size(), initial_video_rows.size());
+    for (size_t i = 0; i < n; ++i) {
+      const double diff =
+          static_cast<double>(result.video_rows[i]) - static_cast<double>(initial_video_rows[i]);
+      d2 += diff * diff;
+    }
+    const double disp_rms = std::sqrt(d2 / (n > 0 ? static_cast<double>(n) : 1.0));
+    std::fprintf(stderr,
+                 "[h3-motion] FINAL video_rows rms=%.6g absmax=%.6g mean=%.6g "
+                 "disp_from_init_rms=%.6g\n",
+                 r, a, mn, disp_rms);
+    std::fflush(stderr);
   }
   return result;
 }

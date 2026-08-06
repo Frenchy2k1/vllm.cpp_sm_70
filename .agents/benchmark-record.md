@@ -13998,3 +13998,49 @@ and we are now at ~281 on `131,2048,512`, so we are **ahead of ggml's own
 kernel by ~1.3x**; ggml WITH llamafile is ~419, so ~1.5x still separates us and
 that residue is the FMA plus K-vectorised-hsum structure we are deliberately not
 adopting.
+
+## MiniMax-H3 render-coherence ROOT-CAUSED — VAE decoder is CORRECT (encode->decode round-trip is coherent); the DiT emits a spatially-WHITE latent at real geometry (2026-08-06, `row/H3-RENDER-COHERENCE` PR #70, `ROAD-V1-H3`, dgx GB10 sm_121a)
+
+**Setup.** dgx.casa GB10, dual-lock (`$HOME/gpu.lock`+`/tmp/gpu`), worker down,
+`drop_caches` before loads. Real ~39 GB NVFP4 arm cached at `~/h3fp4/ckpt`
+(DiT `minimax_h3_ref2va_nvfp4_full.safetensors` 18.75 GB + both VAEs + GGUF
+encoder). Diagnostics built on `7d05aee9`: env-gated `VT_H3_TRACE_MOTION`
+(per-step velocity + latent-motion), `VT_H3_DUMP_DIR` (raw f32 latents),
+`VT_H3_VAE_PROBE` (receptive field), `VT_H3_GAUSSIAN_NOISE`, and two driver
+modes `--decode-latent` / `--roundtrip`. Spatial coherence metric = mean cosine
+of adjacent latent-cell channel-vectors (16x16 grid) vs random-pair cosine.
+
+**Latent bisection (each rung MEASURED at 256x256/22f):**
+| Rung | Measurement | Verdict |
+|---|---|---|
+| Denoise loop | final latents byte-DIFFER at 3/12/50 steps (md5; s12-s50 corr 0.25); velocity 1.40->5.52 rms; disp-from-init ~1.9 | loop MOVES latent, not frozen -> not upstream-loop |
+| **VAE decoder** | `--roundtrip`: real test pattern encode->post_quant_conv->decode returns a COHERENT image (bars/timecode/diagonal), no grid | **DECODER CORRECT** (overturns #64 "device VAE decode" framing) |
+| DiT latent | adjacent-cos: encoded (coherent) **0.789** vs DiT **0.06**; laplacian 0.93 vs 4.2; 8x8-token adj-cos ~0 (== random) | DiT latent is spatially WHITE -> the grid |
+| fp4 vs bf16 | both white (cos 0.057 / 0.040); NOT byte-exact on real weights (max|diff| 11.2) | not the residency/precision path |
+| DiT attn kernel | MMA vs chunk (`VT_DFLASH_ATTN_MMA=0`): both white (0.057/0.056) | not the attention kernel |
+| VAE attn kernel | f32 chunk/warp/keylane identical (max|diff| 1/255) | not the VAE attention kernel |
+| init noise | Gaussian vs uniform: 0.077 vs 0.057 | marginal, not the fix |
+
+**Why the gates missed it.** DiT-forward gate runs latent 4x6 (spatial 2x3 = 6
+tokens) and matches upstream at **1.6e-7** there, so spatial mixing is correct
+at small scale; the divergence is real-geometry-specific, appearing only between
+2x3 and the real 8x8 (64 tokens) — same shape as the earlier temporal-chunking
+and VAE-tiling misses (every gate sits below the regime that breaks).
+
+**The mechanism of the grid.** The ViT3D decoder's `proj_out` maps EACH latent
+token to its own 16-px pixel patch; cross-patch coherence comes only from the
+latent's spatial structure. Given a real (spatially-coherent) latent it renders
+a coherent image (round-trip proves this); given the DiT's spatially-white
+latent it renders one independent smooth block per cell = the observed grid,
+identically at any step count (the loop only decides WHICH white latent).
+
+**Secondary real bug.** Driver seeded uniform[-1,1] init noise (std 0.577); a
+flow model needs Gaussian N(0,1) (torch.randn). `VT_H3_GAUSSIAN_NOISE=1` fixes
+INIT rms 0.58->1.0; correctness deviation, not the render fix.
+
+**Residual / handoff.** Bug RE-LOCALIZED to the DiT forward's spatial mixing at
+real geometry (video tokens not mixed). Exact line needs an upstream (vllm-omni)
+DiT-activation diff at real geometry — impractical on one GB10 (no quantized
+vllm-omni H3 arm; bf16 is 4xB300). Diagnostics committed on PR #70; latents at
+`dgx:~/h3fp4/diag`. fp4 speed path unchanged/CLOSED. No source/kernel/model/gate
+mark changed (all additions are env-gated diagnostics, byte-identical when off).

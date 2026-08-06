@@ -159,7 +159,7 @@ model architecture is wired.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ portable path complete; fp4-resident e2e RUNS on GB10 (real 18.75 GB NVFP4 DiT + VAEs + GGUF encoder → valid mp4/wav); Marlin W4A16 GB10-verified byte-exact; render COHERENCE open (non-scene patch-grid) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ portable path complete; fp4-resident e2e RUNS on GB10 (real NVFP4 DiT + VAEs + GGUF encoder → mp4/wav); Marlin W4A16 byte-exact; render COHERENCE open, root-caused (#70) to the DiT (not the VAE) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
 | Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Serving them
