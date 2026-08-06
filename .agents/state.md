@@ -36079,6 +36079,21 @@ graph child kernels on both arms. Evidence:
 `docs/bench-evidence/qwen35-4b-upstream-20260805.md`; raw root
 `/tmp/qwen35-upstream-312af21a9`.
 
+## KERNEL-MARLIN-DENSE-DIRECT (#50): dense-marlin port arbitrated NO-GO
+<!-- state: 2026-08-06T14:30 -->
+
+The named residual-#1 lever (port vLLM's dense marlin_gemm, ~2000 lines) was
+arbitrated with the mandated same-tool per-shape ubench BEFORE implementation:
+4 fresh runs on idle GB10, moe/dense per-step ratios M=1/2/4 within +-1% with
+run-to-run sign flips (true zero; the +7-9% was nsys-vs-torch cross-tool bias),
+M=8 reproducibly +0.33ms/step, mechanistically the m_block_size_8 8-row tile
+vs our moe_block_size=16 padding 8 rows. NO-GO on the port; the sliver is
+capturable by forcing moe_block_size=8 for E=1 dense in
+dense_nvfp4_gemm.h::DenseAlignFor (kernels already vendored). Remaining real
+terms: that tweak (~0.8pp at c8), the defensive per-call ws Memset drop
+(micro), and the ~0.7ms/step host/sched slice (the substantive one).
+MXFP4 parity stays BELOW (best c8 0.942). Evidence dgx:~/mxfp4-nsys/ubench_3x.log.
+
 ## SERVE-ASYNC-EXECUTOR: decode-graph slot double-buffer (Option B) landed gated default-OFF; ring PROVEN correct; hazard-C real-by-construction but empirical RED unreproducible on GB10
 <!-- state: 2026-08-06T18:30 -->
 
@@ -36558,7 +36573,6 @@ host round-trips (the 1.59 tok/s is the O(n^2) full-recompute + host-island rate
 decode). `VT_KIMI_DEVICE_COMPUTE` STAYS OFF (parity-enablers: a near-tie is not token-exact). Row STAYS
 `ACTIVE`. Residuals now precisely: (a) STRICT token-exactness (device islands + bf16 stream), (b) the
 paged het-KV incremental decode, (c) speed.
-
 
 ## ROW-SERVE-ASYNC-DENSE-MIRROR: ported the #31 async device-mirror to the classic dense family (Qwen3ForCausalLM); RED-first async-serving gate; W4 MXFP4 bench in flight
 <!-- state: 2026-08-07T05:00 -->
@@ -37055,3 +37069,4 @@ grouped-Marlin decode **+7-9% per-call** — `MoeGroupedGemmNvfp4Marlin` E=1 ind
 `sorted_token_ids` gather + fp32 `C_tmp` vs vLLM dense `marlin_gemm` direct-A (per-shape parity
 at M≤8 per #46 → a delicate grouped→dense-direct-A port, not a config knob); (2) **~0.7ms/step
 host/sched**. No single lever ≥1.0x. NEXT lever candidate = grouped→dense-direct-A marlin decode.
+
