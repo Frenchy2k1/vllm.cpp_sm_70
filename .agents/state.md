@@ -39745,6 +39745,7 @@ FL2VA-Q3_K_M.gguf`, `~/h3fp4/fl2va_t2va_20/`. Box left clean.
 
 
 ## 2026-08-06 — startup latency becomes a MEASURABLE axis (harness only; no number)
+<!-- state: 2026-08-06T23:55 -->
 
 User question: "do we have also faster startup time compared to vLLM?" Answer at
 the time: **unknown, never measured.** `startup` is listed in the online-serving
@@ -39784,3 +39785,40 @@ Open: **the number.** dgx.casa root was at 100% (20 GiB free) with no existing
 CUDA `server` build, so the ours arm could not be built. User authorized
 reclaiming the untagged 7.37 GB docker image + 4.4 GB builder cache (NOT the
 stopped `local-ai-worker` container). Run owed: 27B, 3 interleaved repetitions.
+## MiniMax-H3 task/partition GUARD landed — mirror `_resolve_task`'s raise (`row/H3-TASK-PARTITION-GUARD` PR #84, helper, DRAFT PR, CPU-only)
+<!-- state: 2026-08-06T23:59 -->
+
+The #77 follow-up: the driver silently accepted `task=t2va` on the Ref2VA-partition
+checkpoint (the #70/#74 white grid, three campaigns). Upstream `pipeline._resolve_task`
+RAISES on the mismatch (`vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py:374-391`,
+raise at 387-390); the recipe documents the split (`recipes/MiniMaxAI/MiniMax-H3.md:50-51,289`:
+one server serves one partition, FL2VA→{t2va,fl2va}, Ref2VA→{ref2va}). Mirrored 1:1.
+
+DISCRIMINATOR FINDING (definitive, both sides). Upstream reads the served-task set from the
+release config `model_index.json` → `_minimax_h3` → `{partition,tasks}` (pipeline:279-282);
+`MiniMaxH3PartitionFromModelIndex` mirrors those exact keys. Community GGUF/NVFP4 STRIP that
+block, and there is NO structural fallback — MEASURED on the two real captured manifests: the
+Ref2VA NVFP4 (`minimax_h3_nvfp4_manifest.inc`, 1051 tensors) and FL2VA GGUF
+(`minimax_h3_gguf_manifest.inc`, 535) carry the IDENTICAL DiT. Collapsing the NVFP4
+`{weight,weight_scale,weight_scale_2}` split, both reduce to the SAME 535 base tensor names AND
+the SAME shapes (`comm` empty both ways; video_patch_proj `[5376,96]`, condition_proj
+`[5376,5120]`, etc. equal). Ref2VA prepends reference rows through the SAME
+`video/audio_patch_proj`, adding no reference-specific tensor. So a stripped file must DECLARE
+`--partition fl2va|ref2va` (server `--video-partition`); `MiniMaxH3PartitionFromFlag` maps it.
+
+CODE. New (pure, gated-on-any-machine, `minimax_h3_planner.cpp`): `MiniMaxH3PartitionInfo`
+(`declared`/`partition`/`supported_tasks`), `MiniMaxH3PartitionFromModelIndex`,
+`MiniMaxH3PartitionFromFlag`, `MiniMaxH3TaskOfRequest` (ref_blocks→ref2va, keyframes→fl2va,
+else t2va), and the raise `MiniMaxH3CheckTaskPartition`. `MiniMaxH3GenerateT2va` calls the
+pair before denoising; a default `declared=false` request leaves it inert (pipeline-math tests
+unaffected). Driver `--partition` + server `--video-partition` wired. An unknown partition
+refuses EVERY task (ambiguous) and names the recipe lines.
+
+GATE. New case `test_minimax_h3 :: "the task/partition guard refuses the #77 mismatch"` (38
+assertions): #77 combo throws, correct pairings pass, stripped refuses+`--partition` recovers,
+task-of-request maps all three shapes, and the two real manifests are asserted to the same
+535-name set. RED-first (reviewer mutation): neutralizing the guard body → 10 failed
+assertions; restored → GREEN. Suite 67/67 (66 prior +1), 46549 assertions; `test_video_api`
+4/4 (server wiring). No numbers changed (refusal gate, not a perf lever). Records: spec §8.7,
+STATUS/BENCHMARKS H3 rows, benchmark-record, NOW. Pre-existing preflight red
+(check-fusion-consistency `minimax_h3_video_vae_device`) is not this row.

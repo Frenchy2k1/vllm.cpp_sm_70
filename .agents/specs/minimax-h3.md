@@ -565,3 +565,62 @@ trailing target rows are the clip; the old code fed unpatchify the full buffer a
 guard mirroring upstream (community files strip the release config); the encoder vision
 tower (W3) is still unported, so image/video-conditioned ref2va/fl2va renders are not yet
 clean (ref2va with a synthetic reference + text-only encoder still grids).
+
+## 8.7 TASK/PARTITION GUARD — mirror `_resolve_task`'s raise (2026-08-06, `row/H3-TASK-PARTITION-GUARD` PR #84)
+
+The #70/#74 white grid cost three campaigns because our driver silently accepted
+`task=t2va` on the Ref2VA-partition checkpoint. Upstream `pipeline._resolve_task`
+RAISES on the mismatch (`pipeline_minimax_h3.py:374-391`, esp. 387-390); the recipe
+documents the split (`recipes/MiniMaxAI/MiniMax-H3.md:50-51,289`: "One server loads one
+checkpoint partition … must match the served partition"). This row mirrors the raise 1:1.
+
+**Partition detection — two paths, and the definitive no-discriminator finding.**
+Upstream reads the served-task set from the release config
+(`pipeline_minimax_h3.py:279-282`):
+
+```
+release = model_index.get("_minimax_h3") or {}
+self.partition       = str(release.get("partition", ""))       # "fl2va" | "ref2va"
+self.supported_tasks = frozenset(release.get("tasks") or ())
+```
+
+`MiniMaxH3PartitionFromModelIndex(model_index)` mirrors those exact keys. But community
+GGUF/NVFP4 redistributions STRIP that block, and — measured on the two real manifests
+this spec already captured — there is **NO structural fallback**: the Ref2VA NVFP4
+(1051 tensors) and FL2VA GGUF (535 tensors) carry the **IDENTICAL DiT**. Normalizing the
+NVFP4 `{weight, weight_scale, weight_scale_2}` split, both files reduce to the **SAME 535
+base tensor names AND the SAME shapes** (video_patch_proj `[5376,96]`, audio_patch_proj
+`[5376,32]`, condition_proj `[5376,5120]`, time_embedder.proj_in `[5376,256]` on both;
+`comm -23`/`-13` of the normalized name sets is empty both ways). Ref2VA conditioning is
+achieved by PREPENDING reference rows through the SAME `video/audio_patch_proj` weights,
+so it introduces no reference-specific tensor to key on. A name/shape auto-detector is
+therefore impossible in principle. When the config is stripped the partition must be
+**DECLARED** (`--partition fl2va|ref2va`), never guessed; `MiniMaxH3PartitionFromFlag`
+maps it to the recipe's served-task set (fl2va→{t2va,fl2va}, ref2va→{ref2va}).
+
+**The refuse.** `MiniMaxH3CheckTaskPartition(task, info)` is the raise half of
+`_resolve_task`. The task is what the request ENCODES (`MiniMaxH3TaskOfRequest`:
+`ref_blocks`→ref2va, `keyframe_frame_indices`→fl2va, else t2va), and
+`MiniMaxH3GenerateT2va` calls the pair before denoising. A declared partition refuses a
+task it does not serve; an UNKNOWN partition (stripped file, no `--partition`) refuses
+EVERY task as ambiguous and names the recipe lines. A default-constructed
+`MiniMaxH3PartitionInfo` (`declared=false`) leaves the guard inactive, so the pure
+pipeline-math unit tests are unaffected. Wired at both checkpoint-loading entry points:
+the driver (`--partition`) and the server (`--video-partition`).
+
+**Guard behavior table (task × partition → pass/refuse):**
+
+| task \ partition | FL2VA {t2va,fl2va} | Ref2VA {ref2va} | unknown/stripped |
+|---|---|---|---|
+| **t2va**  | pass | **REFUSE (the #77 mismatch)** | REFUSE (declare `--partition`) |
+| **fl2va** | pass | REFUSE | REFUSE |
+| **ref2va**| REFUSE | pass | REFUSE |
+
+**RED-first proof.** New case `test_minimax_h3 :: "the task/partition guard refuses the
+#77 mismatch"` (38 assertions): the #77 combo `MiniMaxH3CheckTaskPartition("t2va",
+ref2va)` throws; the correct pairings pass; the stripped case refuses every task and
+`--partition` recovers it; `MiniMaxH3TaskOfRequest` maps the three request shapes; and it
+asserts the two real manifests reduce to the identical 535-name set (proving the
+no-discriminator premise in the harness). Neutralizing the guard body (reviewer mutation)
+turned the case RED at 10 assertions, restoring it turned it GREEN — the test has teeth.
+Suite: 67/67 (66 prior + this), 46549 assertions. `test_video_api` 4/4 (server wiring).

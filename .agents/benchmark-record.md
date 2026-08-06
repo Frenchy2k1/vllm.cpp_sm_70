@@ -14167,3 +14167,48 @@ noise fix from #70 stands but was already known not to be the render fix.
 | NVFP4 dequant | independent torch dequant of `blocks.0.attn.qkv_proj` + Laguna/Qwen3 already prove `DequantNvfp4ToBf16` byte-exact | sane trained weight (rms 0.089, absmax=ws2·6·maxscale=3.61) |
 | CUDA kernels at real seq | NEW gate `test_minimax_h3 :: CUDA device forward tracks the host at the REAL render seq (1920)` (RealRatioParams head_dim=128, seq 1920) | **CUDA device == CPU host** (28/28) — no scale-dependent kernel bug (#74 only ran device-vs-host on the CPU backend) |
 | forward math | RefDiT restatement vs true upstream source, read side by side (block, attention, AdaLN view(m*3,6H), 3D-RoPE, modulate) | identical |
+
+## MiniMax-H3 TASK/PARTITION GUARD — mirror `_resolve_task`'s raise; the two arms have NO structural discriminator so a stripped file must DECLARE its partition (2026-08-06, `row/H3-TASK-PARTITION-GUARD` PR #84, `ROAD-V1-H3`, CPU-only dev box)
+
+The #70/#74 follow-up. The white grid was `task=t2va` run on the Ref2VA-partition
+checkpoint; upstream `pipeline._resolve_task` RAISES on the mismatch
+(`pipeline_minimax_h3.py:374-391`, raise at 387-390), and the recipe documents the split
+(`recipes/MiniMaxAI/MiniMax-H3.md:50-51,289`). This row mirrors the raise 1:1 and adds the
+community-file fallback.
+
+**The discriminator finding (grounded both sides).** Upstream derives the partition from
+the release config `model_index.json` → `_minimax_h3` → `{partition, tasks}`
+(`pipeline_minimax_h3.py:279-282`). Community GGUF/NVFP4 STRIP that block, and there is
+NO structural fallback — MEASURED on the two real captured manifests:
+
+| Arm | Manifest (tensors) | Normalized base names | Key shapes (video/audio/condition/time patch) |
+|---|---|---|---|
+| Ref2VA | `minimax_h3_nvfp4_manifest.inc` (1051) | 535 after collapsing `{weight,weight_scale,weight_scale_2}` | `[5376,96]`/`[5376,32]`/`[5376,5120]`/`[5376,256]` |
+| FL2VA | `minimax_h3_gguf_manifest.inc` (535) | 535 | identical |
+
+`comm -23`/`-13` of the two normalized name sets is EMPTY both ways; all reference-relevant
+shapes match. Ref2VA prepends reference rows through the SAME `video/audio_patch_proj`, so
+it adds no reference-specific tensor. A name/shape auto-detector is impossible in principle,
+so a stripped file must DECLARE `--partition fl2va|ref2va` (server: `--video-partition`);
+`MiniMaxH3PartitionFromFlag` maps it to the recipe's served-task set (fl2va→{t2va,fl2va},
+ref2va→{ref2va}).
+
+**Guard behavior table (task × partition → pass/refuse):**
+
+| task \ partition | FL2VA {t2va,fl2va} | Ref2VA {ref2va} | unknown/stripped |
+|---|---|---|---|
+| t2va  | pass | **REFUSE (#77 mismatch)** | REFUSE (declare `--partition`) |
+| fl2va | pass | REFUSE | REFUSE |
+| ref2va| REFUSE | pass | REFUSE |
+
+**RED-first proof (reviewer mutation).** New case `test_minimax_h3 :: "the task/partition
+guard refuses the #77 mismatch"`, 38 assertions: the #77 combo throws, correct pairings
+pass, stripped refuses every task, `--partition` recovers, `MiniMaxH3TaskOfRequest` maps
+the three request shapes, and the two real manifests are asserted to reduce to the same
+535-name set. Neutralizing the guard body (`return;` at the top of
+`MiniMaxH3CheckTaskPartition`) turned the case RED at **10 failed assertions** (t2va-on-
+ref2va, the stripped refusals, the dispatch-level `t2va_req` on Ref2VA); restoring it went
+GREEN. Suite **67/67** (66 prior + this), 46549 assertions; `test_video_api` 4/4 (server
+wiring). Wired at both loading entry points: `MiniMaxH3GenerateT2va` guards every full
+render; the pure pipeline-math tests build `declared=false` requests so the guard is inert
+there. No numbers changed — this is a correctness/refusal gate, not a perf lever.
