@@ -2878,6 +2878,15 @@ template <typename TD>
 struct WmmaCfg;
 template <>
 struct WmmaCfg<__nv_bfloat16> {
+// bf16 WMMA fragments are complete types only for __CUDA_ARCH__ >= 800 (bf16
+// tensor cores are Ampere+). The MEMBERS are guarded rather than the struct so
+// the specialization still exists for every arch; every consumer is a device
+// body that is itself guarded, so nothing references these on <sm_80. WK is
+// inside the guard too: with the bodies compiled out it would otherwise trip
+// #177-D (declared but never referenced), which this build promotes to an error
+// under -Werror=all-warnings. sm_80+ is a preprocessor identity ->
+// byte-identical. See .agents/specs/cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   static constexpr int WK = 16;
   using Acc = wmma::fragment<wmma::accumulator, kWM, kWM, WK, float>;
   using Arow = wmma::fragment<wmma::matrix_a, kWM, kWM, WK, __nv_bfloat16, wmma::row_major>;
@@ -2888,9 +2897,17 @@ struct WmmaCfg<__nv_bfloat16> {
   __device__ static void load(F& f, const __nv_bfloat16* p, int ld) {
     wmma::load_matrix_sync(f, p, ld);
   }
+#endif
 };
 template <>
 struct WmmaCfg<float> {
+// TF32 is a SECOND Ampere-gated tensor-core type, and it fails harder than bf16:
+// `wmma::precision::tf32` is not declared at all below sm_80, so an UNGUARDED
+// alias here is a namespace-lookup error at the DEFINITION of this explicit
+// specialization (not an incomplete type at a use site), which is why guarding
+// only the kernel bodies is insufficient for this struct. Same shape as the bf16
+// specialization above; sm_80+ is a preprocessor identity -> byte-identical.
+#if __CUDA_ARCH__ >= 800
   static constexpr int WK = 8;
   using Acc = wmma::fragment<wmma::accumulator, kWM, kWM, WK, float>;
   using Arow = wmma::fragment<wmma::matrix_a, kWM, kWM, WK, wmma::precision::tf32, wmma::row_major>;
@@ -2902,6 +2919,7 @@ struct WmmaCfg<float> {
     wmma::load_matrix_sync(f, p, ld);
     for (int i = 0; i < f.num_elements; ++i) f.x[i] = wmma::__float_to_tf32(f.x[i]);
   }
+#endif
 };
 
 // 128-bit (int4/float4) staging: one coalesced 16-byte transfer moves N=16/
@@ -2915,6 +2933,10 @@ template <typename TD>
 struct V128;
 template <>
 struct V128<__nv_bfloat16> {
+// 128-bit staging is used ONLY by the WMMA bodies guarded above, so on <sm_80
+// every member here is unreferenced and trips #177-D under -Werror=all-warnings.
+// Guarded on the same condition; sm_80+ is a preprocessor identity.
+#if __CUDA_ARCH__ >= 800
   static constexpr int N = 8;
   __device__ static void Uf(const __nv_bfloat16* p, float* f) {
     const int4 v = *reinterpret_cast<const int4*>(p);
@@ -2933,9 +2955,12 @@ struct V128<__nv_bfloat16> {
   __device__ static void Cpy(__nv_bfloat16* d, const __nv_bfloat16* s) {
     *reinterpret_cast<int4*>(d) = *reinterpret_cast<const int4*>(s);
   }
+#endif
 };
 template <>
 struct V128<float> {
+// Same rationale as the bf16 specialization above.
+#if __CUDA_ARCH__ >= 800
   static constexpr int N = 4;
   __device__ static void Uf(const float* p, float* f) {
     const float4 v = *reinterpret_cast<const float4*>(p);
@@ -2951,6 +2976,7 @@ struct V128<float> {
   __device__ static void Cpy(float* d, const float* s) {
     *reinterpret_cast<float4*>(d) = *reinterpret_cast<const float4*>(s);
   }
+#endif
 };
 
 // DeltaH (WMMA). One block per (sequence, v-head), SEQUENTIAL over chunks.
@@ -2964,6 +2990,12 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
                                          const TD* u, const TD* w, const float* gcum,
                                          const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                                          int64_t dk, int64_t hv_n, int64_t dv, bool vec) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   using V = V128<TD>;
   constexpr int WK = Cfg::WK;
@@ -3110,6 +3142,9 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
       V128<float>::Cpy(s_head + g * 4, Hf + g * 4);
   else
     for (int64_t e = tid; e < sd; e += blockDim.x) s_head[e] = Hf[e];
+#else
+  __trap();
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -3147,6 +3182,12 @@ __global__ void GdnChunkDeltaHRegKernel(float* state, TD* hstate, TD* v_new, con
                                         const TD* u, const TD* w, const float* gcum,
                                         const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                                         int64_t dk, int64_t hv_n, int64_t dv) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   constexpr int BT = kChunk;         // 64
@@ -3298,6 +3339,9 @@ __global__ void GdnChunkDeltaHRegKernel(float* state, TD* hstate, TD* v_new, con
     wmma::store_matrix_sync(sH + vrow0 * dk + kt * kWM, h1[kt], dk, wmma::mem_row_major);
     wmma::store_matrix_sync(sH + vrow0 * dk + 64 + kt * kWM, h2[kt], dk, wmma::mem_row_major);
   }
+#else
+  __trap();
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -3320,6 +3364,12 @@ __global__ void GdnChunkDeltaHRegRingKernel(float* state, TD* hstate, TD* v_new,
                                             const TD* u, const TD* w, const float* gcum,
                                             const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                                             int64_t dk, int64_t hv_n, int64_t dv) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   constexpr int BT = kChunk;
@@ -3483,6 +3533,9 @@ __global__ void GdnChunkDeltaHRegRingKernel(float* state, TD* hstate, TD* v_new,
     wmma::store_matrix_sync(sH + vrow0 * dk + kt * kWM, h1[kt], dk, wmma::mem_row_major);
     wmma::store_matrix_sync(sH + vrow0 * dk + 64 + kt * kWM, h2[kt], dk, wmma::mem_row_major);
   }
+#else
+  __trap();
+#endif
 }
 
 // DeltaH (REGISTER-tiled + N-stage TMA+mbarrier ring, vt::tile Rung-2). Identical
@@ -3508,6 +3561,12 @@ __global__ void GdnChunkDeltaHTmaKernel(float* state, TD* hstate, TD* v_new, con
                                         int64_t dk, int64_t hv_n, int64_t dv,
                                         const __grid_constant__ CUtensorMap descW,
                                         const __grid_constant__ CUtensorMap descK) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   namespace tp = vt::cuda::tile;
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
@@ -3672,6 +3731,9 @@ __global__ void GdnChunkDeltaHTmaKernel(float* state, TD* hstate, TD* v_new, con
     wmma::store_matrix_sync(sH + vrow0 * dk + kt * kWM, h1[kt], dk, wmma::mem_row_major);
     wmma::store_matrix_sync(sH + vrow0 * dk + 64 + kt * kWM, h2[kt], dk, wmma::mem_row_major);
   }
+#else
+  __trap();
+#endif
 }
 
 // ChunkO (WMMA). One block per (chunk, v-head). cross = Q@Hstartᵀ; A = Q@Kᵀ
@@ -3682,6 +3744,12 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
                                     const TD* hstate, const float* gcum, const int32_t* tok0a,
                                     const int32_t* lena, int64_t hk_n, int64_t dk, int64_t hv_n,
                                     int64_t dv, float scale, bool vec) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   using V = V128<TD>;
   constexpr int WK = Cfg::WK;
@@ -3798,6 +3866,9 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
     const int64_t i = e / dv, vi = e % dv;
     if (i < len) Store(out, (tok0 + i) * hv_n * dv + hv * dv + vi, scale * outc[e]);
   }
+#else
+  __trap();
+#endif
 }
 
 // Step B (WMMA) — chunk_scaled_dot_kkt Gram on tensor cores. The scalar
@@ -3817,6 +3888,12 @@ template <typename TD>
 __global__ void GdnChunkWUWmmaKernel(TD* u, TD* w, const TD* k, const TD* v, const float* beta,
                                      const float* gcum, const int32_t* tok0a, const int32_t* lena,
                                      int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   const int64_t gc = blockIdx.x, hv = blockIdx.y;
@@ -3893,6 +3970,9 @@ __global__ void GdnChunkWUWmmaKernel(TD* u, TD* w, const TD* k, const TD* v, con
     for (int64_t i = 0; i < len; ++i)
       Store(w, (tok0 + i) * hv_n * dk + hv * dk + ki, wcol[i]);
   }
+#else
+  __trap();
+#endif
 }
 
 // Step B (WMMA, VEC path — VT_GDN_CHUNK_VEC, default). FLA-faithful WY: the
@@ -3929,6 +4009,14 @@ constexpr int kOBlk = 64;  // WMMA apply output column block (multiple of kWM)
 // BOTH kernel dtypes (Am/Tf/Pw are f32; the apply rounds Tf→Tb(TD) afterwards), so
 // the merges use the f32/TF32 WMMA config unconditionally — the same precision the
 // f32 apply already runs at (solve_tril output_dtype=k.dtype).
+// bf16/TF32 WMMA tensor-core code is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Unlike the
+// __global__ kernels below, the WHOLE function is guarded rather than just its
+// body: every caller is itself guarded out on <sm_80, so a body-only guard would
+// leave an emitted-but-uncalled definition that trips #177-D (declared but never
+// referenced) under -Werror=all-warnings. sm_80+ is a preprocessor identity ->
+// byte-identical. See .agents/specs/cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
 __device__ inline void WyMerge(float* Tf, const float* Am, float* Pw, int64_t BT, int bi,
                                int bj) {
   using Cfg = WmmaCfg<float>;
@@ -3960,12 +4048,19 @@ __device__ inline void WyMerge(float* Tf, const float* Am, float* Pw, int64_t BT
   for (int i = 0; i < accT.num_elements; ++i) accT.x[i] = -accT.x[i];
   wmma::store_matrix_sync(Tf + (bi * kWM) * BT + (bj * kWM), accT, BT, wmma::mem_row_major);
 }
+#endif
 
 template <typename TD>
 __global__ void GdnChunkWUWmmaVecKernel(TD* u, TD* w, const TD* k, const TD* v,
                                         const float* beta, const float* gcum,
                                         const int32_t* tok0a, const int32_t* lena, int64_t hk_n,
                                         int64_t dk, int64_t hv_n, int64_t dv, bool blocked) {
+// bf16/TF32 WMMA tensor-core body is Ampere+ (bf16 fragments and
+// wmma::precision::tf32 are complete only for __CUDA_ARCH__ >= 800). Guard so
+// Turing/Volta/Pascal device passes compile this TU; sm_80+ keeps the body
+// verbatim (preprocessor identity -> byte-identical). Never launched on <sm_80:
+// no tactic registers these for major<8. See cuda-arch-breadth-fp16.md §V0-a.
+#if __CUDA_ARCH__ >= 800
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   const int64_t gc = blockIdx.x, hv = blockIdx.y;
@@ -4129,6 +4224,9 @@ __global__ void GdnChunkWUWmmaVecKernel(TD* u, TD* w, const TD* k, const TD* v,
       __syncthreads();
     }
   }
+#else
+  __trap();
+#endif
 }
 
 // Builds the per-chunk layout (tok0/len) + per-seq base-offset (boh) arrays
