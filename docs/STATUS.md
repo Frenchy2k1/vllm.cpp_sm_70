@@ -31,13 +31,10 @@ citing "vLLM 0.25.0" are the last binding measurement against the prior oracle
 
 ## Capability status
 
-Startup-latency axis (2026-08-06): `GATING / number-pending`. Cold launch-to-first-`/health` is now
-measurable on both arms through one shared probe (`scripts/dgx-online-serving.sh --startup-only`,
-`online_gate.py record-startup` / `summarize-startup`, 19 contract cases in
-`tests/tools/test_online_gate_startup.py`). The readiness cadence went 5 s -> 0.2 s (same 1800 s
-budget) because the old cadence was ~12% of the quantity being measured. A record cannot exist for a
-leg whose page cache was not dropped. **No ours-vs-vLLM startup number exists yet**; next gate is the
-3-repetition interleaved run on dgx. Detail: [spec](../.agents/specs/startup-latency-axis.md).
+Startup-latency axis (2026-08-06): `GATING / number-pending`. Cold launch-to-first-`/health` is
+measurable on both arms through one shared probe, cache-drop enforced per leg. **No ours-vs-vLLM
+number exists yet**; next gate is the 3-repetition interleaved dgx run.
+[Detail](../.agents/specs/startup-latency-axis.md).
 
 Orchestration prompts (2026-08-06): tracked pair; 25 gate rows exact-pinned, step 5/5.
 
@@ -160,18 +157,17 @@ engine spec-config registration are named residuals. **BEAT-ds4 sweep (2026-07-3
 `CLAIM-DSV4-BEAT-SWEEP`, analysis-only):** our raw autoregressive decode is at its
 GB10 ceiling (~13.1-13.2 tok/s, Q8_0 front CLOSED after Bricks 3-14), and ds4's
 16.5-17.2 is itself RAW decode (its MTP/DSpark spec is opt-in, NOT in that
-number). The one path PAST 16.5 is MTP self-spec: `13.19 × (1+p)/1.05`, break-even
-acceptance p≈0.31, plausible p 0.55-0.85 → ~18-23 tok/s. Lossless (token-identical
-to greedy). Gated on unblocking a nextn-carrying GGUF (R1) + the propose/verify
-loop (R2) + device draft (R4). fp16 dequant cache refuted net-slower on GB10; MHC
-a measured tie; routed-MoE we already win. See
+number). Its "only path PAST 16.5 is MTP self-spec" verdict is SUPERSEDED by the
+1.14x BINDING below, which passes 16.5 with no spec at all; the self-spec math
+(break-even p≈0.31, R1/R2/R4 residuals) and the refuted or tied levers (fp16
+dequant cache, MHC) are in the spec. See
 `.agents/specs/deepseek-beat-ds4-sweep-2026-07-30.md`.
 
-**DeepSeek-V4-Flash decode levers (2026-08-03, byte-exact, default-ON; SUPERSEDED by the 1.14x BINDING below).** The Q8_K-preq launch-geometry port (+5.4%), the MHC-pre and norm+RoPE FP64->FP32 folds and the MHC-lean occupancy widen climbed decode ~13.5 -> 14.96 tok/s toward ds4 ~16.5; per-lever forensics in `.agents/benchmark-record.md`.
+**DeepSeek-V4-Flash decode levers (2026-08-03, byte-exact, default-ON; SUPERSEDED by the 1.14x BINDING below).** Four glue/geometry folds climbed decode ~13.5 -> 14.96 tok/s; per-lever forensics in `.agents/benchmark-record.md`.
 
 **BINDING 2026-08-05: `VT_V4_RESIDENT_W` (default-ON) BEATS ds4 — 18.69 vs 16.33 tok/s (1.144x), byte-exact:** the dense Q8_0 MLA/shared/lm_head proj tower was read from GGUF-mmap over ATS; staging it `cudaMalloc`-device once (Q8_0 per-launch ~20% each, ids-IDENTICAL) lifts decode 16.23→18.69 (median-of-3, drop_caches, PEAK flat 86.68 GiB, net move). Mirrors Laguna `VT_LAGUNA_RESIDENT_BF16W`; our GEMV was ATS-bound, not at ds4 parity. **Phase-2 routed-expert residency (`VT_V4_RESIDENT_EXPERTS`) MEASURED NEGATIVE, HELD default-OFF (2026-08-05):** the ~70 GiB IQ2/Q2_K expert slabs staged device-resident (madvise move-semantics) are byte-exact but **−3.4% steady** (18.76 vs 19.43 tok/s, same-binary median-of-3) + a one-time capture cost — the grouped-MoE kernels are dequant/latency-bound (~19-24% of DRAM peak), so residency (a bandwidth lever) cannot help, and device pinning cuts pool headroom (103→30 GiB avail). Prior (superseded, see record): PARITY 16.28 vs 16.33 (0.997x); `VT_V4_MHC_SINK4` +4.6% byte-exact; HC-expand + f16-DSA held default-OFF.
 
-**Integration re-verify (2026-08-03, GB10 sm_121a, clean CUDA+Triton Release build off `6576814b`).** Both decode glue-fold levers (`CLAIM-DSV4-ROPE-FLOAT` + `CLAIM-DSV4-MHC-LEAN`) cherry-picked clean and re-gated on a fresh GB10 build: build **EXIT 0**; **SACRED `test_qwen36_paged_engine` 315/315, 0 failed (UNMOVED)**; `test_cuda_deepseek_v4` **20/20·67073**; **byte-exact re-confirmed on the resident-decode path** — `deepseek-v4-gen --gpu --kv-cache` on ds4flash IQ2XXS gives decode ids token-IDENTICAL for `VT_V4_ROPE_FLOAT=1`/`=0` AND `VT_V4_MHC_LEAN=1024`/`=0` (the `--kv-cache` T==1 steps engage `ForwardResidentDecodeGguf`, so the gated device `NormRopeRows`/`MhcPre` kernels are genuinely exercised — decode ~0.06 s/step confirms the GPU path). The 27B paged-engine gate SKIPs (checkpoint absent on box).
+**Integration re-verify (2026-08-03, GB10 sm_121a, clean CUDA+Triton Release build off `6576814b`).** Both decode glue-fold levers (`CLAIM-DSV4-ROPE-FLOAT` + `CLAIM-DSV4-MHC-LEAN`) cherry-picked clean and re-gated on a fresh GB10 build: **SACRED `test_qwen36_paged_engine` 315/315, 0 failed (UNMOVED)**; `test_cuda_deepseek_v4` **20/20·67073**; **byte-exact re-confirmed on the resident-decode path** — `deepseek-v4-gen --gpu --kv-cache` on ds4flash IQ2XXS gives decode ids token-IDENTICAL for `VT_V4_ROPE_FLOAT=1`/`=0` AND `VT_V4_MHC_LEAN=1024`/`=0` (the `--kv-cache` T==1 steps run `ForwardResidentDecodeGguf`, so the gated device kernels are genuinely exercised). The 27B paged-engine gate SKIPs (checkpoint absent on box).
 
 **Cross-reference lever scan (2026-07-31, `CLAIM-XREF-LEVER-SCAN`, `.agents/specs/cross-ref-lever-scan-2026-07-31.md`).** A 5-source parallel scan (vLLM/SGLang/llama.cpp/ds4/ours) for batch-1 raw-decode levers, no-spec, adversarially verified against our code. **Corrects the record:** ds4/DwarfStar has NO register-prefetch (grep-verified) — the Brick-14 theory below was a misattribution; ds4's 90% comes from full-warp-per-row + lane-strided 34-B Q8_0 blocks (1088-B coalesced burst). Our production Q8_0 ships SUB-warp (8/16-lane/row) for medium-K (`LaunchQ8_0Subwarp`), so the one non-refuted Path-B lever left is **B1: port ds4's exact 32-lane/8-row `warp8` for medium-K + measure** (DGX A/B, not guaranteed). Verified cross-cutting gap: **PDL** (Programmatic Dependent Launch) — we have zero, both llama.cpp+SGLang use it on Blackwell. Path A (Laguna beat vLLM): the NVFP4 arm (#230) + the note that vLLM's 18.8 is MARLIN W4A16 (a lower bound; real default FLASHINFER_CUTLASS W4A4 is faster). Full ranked plan + citations in the spec.
 
