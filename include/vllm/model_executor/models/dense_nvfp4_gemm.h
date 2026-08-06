@@ -270,7 +270,20 @@ inline DenseAlignCache& DenseAlignFor(Dev d, int M) {
   auto it = cache.find(M);
   if (it != cache.end()) return it->second;
   DenseAlignCache c;
-  c.block = vt::cuda::MarlinMoeAlignBlockSizeSelect(M, 1, 1);
+  // c8 sliver (#46/#50): vLLM's DENSE marlin uses an 8-row tile for the a16
+  // path at prob_m<=8 (`m_block_size_8 = prob_m<=8 && a16`,
+  // csrc/libtorch_stable/quantization/marlin/marlin.cu:438) — NO padding. Our
+  // grouped single-expert MoE-align picks block_size_m=16 at M=8
+  // (MarlinMoeAlignBlockSizeSelect: 8*1/1/8 == 1.0 fails the `< 0.9` test at
+  // cuda_marlin_repack.cu:362), padding 8 dummy rows into a 16-row tile
+  // (m_block_size_8=false) and wasting ~half the tile — the reproducible
+  // ~0.33ms/step at c8. The m_block_size_8=true 8-row kernels are vendored
+  // (kernel_selector.h:3-8 nvfp4, :33-38 mxfp4) and the fp32 C_tmp reduce is
+  // handled (marlin_mm_moe.cu:363-364 map block=8 -> thread_m_blocks=1 +
+  // m_block_size_8=true). Force block=8 for the single-expert dense case at
+  // M<=8 to match vLLM's dense tile exactly; M>8 is unchanged (already matches
+  // vLLM, which drops m_block_size_8 above 8).
+  c.block = (M <= 8) ? 8 : vt::cuda::MarlinMoeAlignBlockSizeSelect(M, 1, 1);
   vt::cuda::MarlinMoeAlignSizes(M, 1, 1, c.block, &c.max_tok, &c.max_blk);
   c.sorted = d.b.Alloc(static_cast<size_t>(c.max_tok) * sizeof(int32_t));
   c.expert = d.b.Alloc(static_cast<size_t>(c.max_blk) * sizeof(int32_t));
@@ -289,8 +302,10 @@ inline DenseAlignCache& DenseAlignFor(Dev d, int M) {
   return cache.emplace(M, c).first->second;
 }
 
-// Shared zeroed reduction workspace for the dense Marlin GEMMs (sms*4 i32 locks,
-// mirror marlin_make_workspace_new). Memset to zero before each launch.
+// Shared reduction workspace for the dense Marlin GEMMs (sms*4 i32 locks, mirror
+// marlin_make_workspace_new). Zeroed ONCE at allocation; NOT re-zeroed per call
+// (see the self-reset invariant below), exactly as vLLM allocates it with
+// `torch.zeros` (marlin_utils.py:399-407) and reuses it across every call.
 inline void* DenseMarlinWorkspace(Dev d, int* out_sms) {
   static std::mutex mu;
   static void* ws = nullptr;
@@ -299,6 +314,17 @@ inline void* DenseMarlinWorkspace(Dev d, int* out_sms) {
   if (!ws) {
     sms = vt::cuda::MarlinDeviceSms(d.q.device.index);
     ws = d.b.Alloc(static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+    // Zero ONCE. The kernel self-resets its barrier locks: our launch pins
+    // use_atomic_add=false / use_fp32_reduce=true (cuda_moe_marlin.cu:141-142),
+    // so the ONLY reachable cross-CTA reduce is the fp32 barrier, whose LAST
+    // slice-block release re-zeroes the lock (marlin_template.h:2170
+    // `barrier_release(&locks[locks_off], last)` -> `lock[0]=0` at :204); the
+    // slice_count==1 case never touches locks at all (:2162). So every completed
+    // GEMM leaves the workspace back at 0 and re-zeroing before each of the ~120
+    // dense GEMMs/step is redundant host/launch work. (The non-self-clearing
+    // atomic-add path at :614 is unreachable under this pinned config; if that
+    // config ever flips, restore the per-call zero.)
+    d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
   }
   *out_sms = sms;
   return ws;
@@ -312,8 +338,7 @@ inline DBuf MatmulNvfp4MarlinD(Dev d, const Tensor& x, const Nvfp4Weight& w,
   if (!mr.ready) BuildMarlinDenseResident(d, w, mr);
   DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   int sms = 0;
-  void* ws = DenseMarlinWorkspace(d, &sms);
-  d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  void* ws = DenseMarlinWorkspace(d, &sms);  // zeroed once; kernel self-resets
   ++MutableW4A16Stats().marlin_gemms;
 
   // Marlin's output is bf16 (c_type=kBFloat16); an f32 result is the bf16 output
@@ -429,8 +454,7 @@ inline DBuf GateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
   if (!mr.ready) BuildMarlinDensePairResident(d, gw, uw, mr);
   DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   int sms = 0;
-  void* ws = DenseMarlinWorkspace(d, &sms);
-  d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  void* ws = DenseMarlinWorkspace(d, &sms);  // zeroed once; kernel self-resets
   ++MutableW4A16Stats().fused_gate_up;
 
   DBuf gu(d, DType::kBF16, {M, 2 * N});
