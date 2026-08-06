@@ -113,13 +113,14 @@ Vulkan-ON build, by asking `vt::OpRegistered` and `vt::GetOp` for every `OpId`:
 | | at `VK-A1` | after the first `VK-B` bricks |
 |---|---|---|
 | CPU-registered ops | **87** | **87** |
-| **NATIVE** on Vulkan | **8** | **12** |
-| served by the **portable reference tier** (S5, CPU kernel on shared memory) | **79** | **75** |
+| **NATIVE** on Vulkan | **8** | **13** |
+| served by the **portable reference tier** (S5, CPU kernel on shared memory) | **79** | **74** |
 | **ABSENT** (`GetOp` throws) | **0** | **0** |
 
-The four that moved are `kMatmul`, `kMatmulBT` (dense GEMM, both orientations),
-`kEmbedding` and `kGreedyArgmax` — the model's two ends plus the op it spends most
-of its time in. Re-measure with the same method rather than quoting this table.
+The five that moved are `kMatmul`, `kMatmulBT` (dense GEMM, both orientations),
+`kEmbedding`, `kGreedyArgmax` and `kPagedAttention` — the model's two ends, the op
+it spends most of its time in, and the one kernel with no llama.cpp Vulkan
+counterpart to port from. Re-measure with the same method rather than quoting this table.
 
 `vt::ReferenceTierEligible(kVULKAN)` is TRUE — GB10 integrated and llvmpipe both
 report unified memory. So **every op the CPU backend has is already reachable on

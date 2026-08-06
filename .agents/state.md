@@ -39827,3 +39827,61 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
   the KV cache ops, the whole RoPE family, quant, MoE, GDN/MLA and every sampler
   beyond greedy argmax. `get_attn_backend_priority()` remains EMPTY, so no model
   runs end to end on Vulkan and no speed number is measured, claimed or owed.
+
+- **2026-08-06 (later still, 2)** — **Vulkan gains NATIVE BLOCK-PAGED ATTENTION
+  (`CLAIM-VULKAN-FULL-1`, row `BACKEND-VULKAN`).** Native **12 → 13**,
+  reference-tier **75 → 74**.
+
+  **This is the only kernel in the backend with NO Vulkan port source**, and the
+  spec predicted it: `grep` over all 132 `.comp` + 26 `.glsl` at pin `237ad9b96`
+  finds ZERO `block_table`/`paged` matches, because ggml attention takes a
+  contiguous KV buffer plus a mask. The online-softmax SKELETON follows
+  `flash_attn.comp`'s shape; the block-table indirection, GQA mapping and
+  windowing are ported from our own `cpu_paged_attn.cpp` (:52-171), which is also
+  the numeric oracle. Recorded as partial-from-scratch.
+
+  **The CPU's three passes could not be mirrored, for a structural reason.** The
+  CPU kernel materialises a `probs` array of one float PER KEY IN THE WINDOW
+  (:121,131) — unbounded, thousands at long context — and a shader has no such
+  allocation. The passes fuse into the standard running max/denominator
+  recurrence: same mathematical result, different rounding ORDER, so this op sits
+  in the NMSE ≤ 5e-4 tier and claims no bit-exactness against the CPU. That is a
+  deliberate tier choice, not a tolerance that was widened to fit.
+
+  Structure: ONE WORKGROUP per (query token, query head), lanes splitting the head
+  dimension, each key's q·k a cooperative `vt_tg_sum`. A first draft added a
+  lane-0 broadcast of the score plus two barriers; that was removed once
+  `vt_tg_sum`'s contract was actually read — it returns `smem[0]` to EVERY lane
+  and its leading barrier makes back-to-back calls in a loop safe, so all lanes
+  derive the score from the same dot with the same instructions. Simpler, and one
+  fewer barrier hazard.
+
+  **fp8 KV DECLINES rather than throws.** Those pages are 1-byte and need
+  `Dequant(fp8) * k_scale|v_scale` before the f32 softmax
+  (`cpu_paged_attn.cpp:79-93`), which this shader does not do — and throwing would
+  REMOVE a capability the portable reference tier already provides. It forwards
+  through `GetOpFallback`, which `op_provider.h:94-100` documents as exactly the
+  place for a per-call refusal since `GetOp` has no shape or dtype to inspect.
+
+  Gated in THREE configurations (causal; causal+softcap; sliding window) because
+  they are different branches and one causal case would leave two unexercised. The
+  block table is deliberately NON-IDENTITY (page j at cache block `nblocks-1-j`)
+  so a kernel that ignored it and indexed linearly fails, and 37 tokens over block
+  size 4 leaves the last page partly occupied so a whole-page walk reads past the
+  sequence. One defect found by the gate and it was the TEST's: `AttentionWindow`
+  requires both bounds ≥ 0 (`ops.cpp:2778`), so `{8, -1}` threw at the seam.
+
+  **AMD Vulkan testing asked about and ANSWERED NO (2026-08-06).** The dev box is
+  a KVM virtual machine; the AMD here is the **CPU** (Ryzen 9 9950X3D), not a GPU.
+  Display is QEMU virtual VGA `1234:1111`, `/dev/dri` has **no `renderD*` node**,
+  and Vulkan enumerates only `llvmpipe`. Useful corollary: `radeon_icd.json`
+  (RADV) IS installed, so an AMD GPU passed into this VM would enumerate with zero
+  code changes and `VK-I`'s discrete-GPU staging path would become testable. The
+  blocker is hardware passthrough, not software. (Separately, `environment.md`
+  describes the dev box as having an RTX 5070 Ti, which this VM does not see —
+  left for the owner rather than guessed at.)
+
+  Still on the reference tier: the KV cache write, the whole RoPE family, quant,
+  MoE, GDN/MLA and every sampler beyond greedy argmax.
+  `get_attn_backend_priority()` remains EMPTY, so no model runs end to end on
+  Vulkan and no speed number is measured, claimed or owed.
