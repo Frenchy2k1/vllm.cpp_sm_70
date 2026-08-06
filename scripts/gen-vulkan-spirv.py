@@ -47,6 +47,7 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SHADER_DIR = REPO / "src" / "vt" / "vulkan" / "shaders"
 OUT_HEADER = REPO / "src" / "vt" / "vulkan" / "vulkan_spirv.h"
+OUT_SOURCE = REPO / "src" / "vt" / "vulkan" / "vulkan_spirv.cpp"
 
 # Vulkan 1.1 is the floor the backend requires (src/vt/vulkan/vulkan_context.cpp).
 TARGET_ENV = "vulkan1.1"
@@ -132,24 +133,33 @@ def spec_ids(blob: bytes) -> list[int]:
     return sorted(ids)
 
 
-def render(blobs: dict[str, bytes], version: str) -> str:
-    lines: list[str] = []
+BANNER = [
+    "// GENERATED FILE - DO NOT EDIT BY HAND.",
+    "// Regenerate with: scripts/gen-vulkan-spirv.py",
+    "//",
+    "// SPIR-V for the Vulkan backend's compute kernels (BACKEND-VULKAN),",
+    "// compiled from the GLSL in src/vt/vulkan/shaders/*.comp.",
+    "//",
+    "// WHY THE SPIR-V IS COMMITTED rather than compiled by the build, as",
+    "// llama.cpp's vulkan-shaders-gen does at build time: the build then needs NO",
+    "// shader toolchain on any machine, which is hermetic everywhere including CI",
+    "// and the aarch64 gate box. libshaderc would also be a compiled third-party",
+    "// dependency, which .agents/discipline.md forbids. The cost is an obligation",
+    "// to re-run this generator when a .comp changes, which the",
+    "// vulkan-spirv-freshness CI job enforces.",
+    "//",
+    "// WHY THE WORDS LIVE IN THE .cpp AND NOT THE HEADER (VK-A1): at the target",
+    "// shader surface the blobs are megabytes of array initializer, and anything in",
+    "// the header is re-parsed by every including TU. The header carries the struct",
+    "// and extern declarations; vulkan_spirv.cpp carries the data, so adding shaders",
+    "// costs one TU's compile time rather than all of them.",
+    "//",
+]
+
+
+def render_header(blobs: dict[str, bytes], version: str) -> str:
+    lines = list(BANNER)
     add = lines.append
-    add("// GENERATED FILE — DO NOT EDIT BY HAND.")
-    add("// Regenerate with: scripts/gen-vulkan-spirv.py")
-    add("//")
-    add("// SPIR-V for the Vulkan backend's compute kernels (BACKEND-VULKAN, W0),")
-    add("// compiled from the GLSL in src/vt/vulkan/shaders/*.comp.")
-    add("//")
-    add("// WHY THE SPIR-V IS COMMITTED rather than compiled by the build, as")
-    add("// llama.cpp's vulkan-shaders-gen does at build time: neither of our boxes")
-    add("// has a GLSL compiler (no glslc/glslangValidator/libshaderc, no sudo), and")
-    add("// libshaderc would be a compiled third-party dependency, which")
-    add("// .agents/discipline.md forbids. Committing the SPIR-V makes the build")
-    add("// hermetic everywhere — including CI and the aarch64 gate box — at the cost")
-    add("// of re-running the generator when a .comp changes. See the generator's")
-    add("// docstring for the full rationale.")
-    add("//")
     add(f"// Produced by: {version}")
     add(f"// Target environment: {TARGET_ENV}")
     add("#ifndef VT_VULKAN_VULKAN_SPIRV_H_")
@@ -160,30 +170,14 @@ def render(blobs: dict[str, bytes], version: str) -> str:
     add("")
     add("namespace vt::vulkan {")
     add("")
-    for name in sorted(blobs):
-        words = [int.from_bytes(blobs[name][i:i + 4], "little")
-                 for i in range(0, len(blobs[name]), 4)]
-        add(f"inline constexpr uint32_t kSpv_{name}[] = {{")
-        for i in range(0, len(words), 8):
-            chunk = ", ".join(f"0x{w:08x}u" for w in words[i:i + 8])
-            add(f"    {chunk},")
-        add("};")
-        add("")
-    for name in sorted(blobs):
-        ids = spec_ids(blobs[name])
-        if ids:
-            add(f"inline constexpr uint32_t kSpecIds_{name}[] = {{")
-            add("    " + ", ".join(f"{i}u" for i in ids) + ",")
-            add("};")
-            add("")
     add("// Name -> SPIR-V module. The NAME is the shader's file stem and is also the")
     add("// key the pipeline cache uses (src/vt/vulkan/vulkan_context.cpp).")
     add("//")
     add("// spec_ids lists the SPECIALIZATION CONSTANT IDs the module declares, parsed")
-    add("// from its OpDecorate SpecId instructions and sorted ascending. The host passes")
-    add("// specialization values BY ID, and Vulkan SILENTLY IGNORES a map entry whose ID")
-    add("// the module does not declare — so without this table a host/shader drift")
-    add("// produces WRONG NUMBERS instead of a clean failure.")
+    add("// from its OpDecorate SpecId instructions and sorted ascending. The host")
+    add("// passes specialization values BY ID, and Vulkan SILENTLY IGNORES a map entry")
+    add("// whose ID the module does not declare - so without this table a host/shader")
+    add("// drift produces WRONG NUMBERS instead of a clean failure.")
     add("struct SpirvModule {")
     add("  const char* name;")
     add("  const uint32_t* words;")
@@ -192,13 +186,11 @@ def render(blobs: dict[str, bytes], version: str) -> str:
     add("  size_t spec_id_count;")
     add("};")
     add("")
-    add("inline constexpr SpirvModule kSpirvModules[] = {")
-    for name in sorted(blobs):
-        ids = spec_ids(blobs[name])
-        idp = f"kSpecIds_{name}" if ids else "nullptr"
-        add(f'    {{"{name}", kSpv_{name}, sizeof(kSpv_{name}) / sizeof(uint32_t), '
-            f'{idp}, {len(ids)}}},')
-    add("};")
+    add("// DEFINED IN vulkan_spirv.cpp. The array is `extern` and therefore of unknown")
+    add("// bound here, so kSpirvModuleCount is the ONLY way to size it - use it rather")
+    add("// than sizeof/sizeof.")
+    add("extern const SpirvModule kSpirvModules[];")
+    add("extern const size_t kSpirvModuleCount;")
     add("")
     add("}  // namespace vt::vulkan")
     add("")
@@ -206,11 +198,58 @@ def render(blobs: dict[str, bytes], version: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_source(blobs: dict[str, bytes], version: str) -> str:
+    lines = list(BANNER)
+    add = lines.append
+    add(f"// Produced by: {version}")
+    add(f"// Target environment: {TARGET_ENV}")
+    add("")
+    add('#include "vulkan_spirv.h"')
+    add("")
+    add("namespace vt::vulkan {")
+    add("namespace {")
+    add("")
+    for name in sorted(blobs):
+        words = [int.from_bytes(blobs[name][i:i + 4], "little")
+                 for i in range(0, len(blobs[name]), 4)]
+        add(f"constexpr uint32_t kSpv_{name}[] = {{")
+        for i in range(0, len(words), 8):
+            chunk = ", ".join(f"0x{w:08x}u" for w in words[i:i + 8])
+            add(f"    {chunk},")
+        add("};")
+        add("")
+    for name in sorted(blobs):
+        ids = spec_ids(blobs[name])
+        if ids:
+            add(f"constexpr uint32_t kSpecIds_{name}[] = {{")
+            add("    " + ", ".join(f"{i}u" for i in ids) + ",")
+            add("};")
+            add("")
+    add("}  // namespace")
+    add("")
+    add("const SpirvModule kSpirvModules[] = {")
+    for name in sorted(blobs):
+        ids = spec_ids(blobs[name])
+        idp = f"kSpecIds_{name}" if ids else "nullptr"
+        add(f'    {{"{name}", kSpv_{name}, sizeof(kSpv_{name}) / sizeof(uint32_t), '
+            f'{idp}, {len(ids)}}},')
+    add("};")
+    add("const size_t kSpirvModuleCount = sizeof(kSpirvModules) / sizeof(kSpirvModules[0]);")
+    add("")
+    add("}  // namespace vt::vulkan")
+    return "\n".join(lines) + "\n"
+
+
+def strip_version(s: str) -> str:
+    """Drop the compiler-version line, which legitimately differs per machine."""
+    return "\n".join(l for l in s.splitlines() if not l.startswith("// Produced by:"))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--compiler", default=None)
     ap.add_argument("--check", action="store_true",
-                    help="fail if the committed header is stale instead of rewriting it")
+                    help="fail if the committed artifacts are stale instead of rewriting them")
     args = ap.parse_args()
 
     cc = find_compiler(args.compiler)
@@ -220,22 +259,24 @@ def main() -> None:
         sys.exit(f"no shaders found in {SHADER_DIR}")
 
     blobs = {src.stem: compile_one(cc, src) for src in sources}
-    text = render(blobs, version)
+    outputs = ((OUT_HEADER, render_header(blobs, version)),
+               (OUT_SOURCE, render_source(blobs, version)))
 
     if args.check:
-        current = OUT_HEADER.read_text() if OUT_HEADER.exists() else ""
-        # The compiler-version line legitimately differs between machines, so
-        # compare everything else.
-        def strip_version(s: str) -> str:
-            return "\n".join(l for l in s.splitlines() if not l.startswith("// Produced by:"))
-        if strip_version(current) != strip_version(text):
-            sys.exit("vulkan_spirv.h is STALE — re-run scripts/gen-vulkan-spirv.py")
-        print("vulkan_spirv.h is up to date")
+        stale = [path.relative_to(REPO) for path, text in outputs
+                 if strip_version(path.read_text() if path.exists() else "")
+                 != strip_version(text)]
+        if stale:
+            sys.exit("STALE, re-run scripts/gen-vulkan-spirv.py: "
+                     + ", ".join(str(p) for p in stale))
+        print("committed SPIR-V is up to date")
         return
 
-    OUT_HEADER.write_text(text)
+    for path, text in outputs:
+        path.write_text(text)
     total = sum(len(b) for b in blobs.values())
-    print(f"wrote {OUT_HEADER.relative_to(REPO)}: {len(blobs)} modules, {total} bytes of SPIR-V")
+    print(f"wrote {OUT_HEADER.relative_to(REPO)} + {OUT_SOURCE.relative_to(REPO)}: "
+          f"{len(blobs)} modules, {total} bytes of SPIR-V")
     print(f"compiler: {version}")
 
 

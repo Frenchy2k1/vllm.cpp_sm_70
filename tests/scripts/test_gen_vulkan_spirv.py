@@ -65,11 +65,11 @@ class CommittedArtifact(unittest.TestCase):
     def test_module_table_carries_the_spec_id_columns(self):
         """The committed header must expose the specialization columns at all.
 
-        Read from the COMMITTED header rather than by recompiling, so this runs
+        Read from the COMMITTED artifacts rather than by recompiling, so this runs
         with no shader toolchain — the same property that lets the C++ gate check
         the artifact on a box with no Vulkan.
 
-        assertIn is avoided throughout: the haystack is a ~110 KB generated header
+        assertIn is avoided throughout: the haystack is a ~110 KB generated file
         and assertIn prints it in full on failure, burying the message.
         """
         header = (ROOT / "src/vt/vulkan/vulkan_spirv.h").read_text()
@@ -77,6 +77,22 @@ class CommittedArtifact(unittest.TestCase):
             self.assertTrue(field in header,
                             f"SpirvModule is missing {field!r}; "
                             f"re-run scripts/gen-vulkan-spirv.py")
+
+    def test_header_declares_but_does_not_define_the_blobs(self):
+        """The words belong in the .cpp; the header only declares the table.
+
+        This is the split's whole point, so it is asserted rather than assumed: a
+        regression that put the arrays back in the header would be invisible until
+        compile times grew.
+        """
+        header = (ROOT / "src/vt/vulkan/vulkan_spirv.h").read_text()
+        source = (ROOT / "src/vt/vulkan/vulkan_spirv.cpp").read_text()
+        self.assertTrue("extern const SpirvModule kSpirvModules[];" in header)
+        self.assertTrue("extern const size_t kSpirvModuleCount;" in header)
+        self.assertTrue("kSpv_" not in header,
+                        "SPIR-V word arrays are back in the header; they belong "
+                        "in vulkan_spirv.cpp")
+        self.assertTrue("kSpv_vt_cast[]" in source)
 
     def test_vt_cast_declares_its_dtype_pair(self):
         """vt_cast is the backend's first variant axis: src and dst dtype.
@@ -86,8 +102,8 @@ class CommittedArtifact(unittest.TestCase):
         deliberately NOT such a constant: local_size_x_id emits LocalSize 1 1 1 at
         the vulkan1.1 target (see vt_common.glsl).
         """
-        header = (ROOT / "src/vt/vulkan/vulkan_spirv.h").read_text()
-        self.assertTrue("kSpecIds_vt_cast[]" in header,
+        source = (ROOT / "src/vt/vulkan/vulkan_spirv.cpp").read_text()
+        self.assertTrue("kSpecIds_vt_cast[]" in source,
                         "vt_cast no longer declares specialization constants; "
                         "re-run scripts/gen-vulkan-spirv.py")
 
@@ -97,13 +113,13 @@ class CommittedArtifact(unittest.TestCase):
         Whoever adds one is then forced to supply matching values at its dispatch,
         which GetPipeline checks by count against the declared SpecIds.
         """
-        header = (ROOT / "src/vt/vulkan/vulkan_spirv.h").read_text()
+        source = (ROOT / "src/vt/vulkan/vulkan_spirv.cpp").read_text()
         for src in sorted((ROOT / "src/vt/vulkan/shaders").glob("*.comp")):
             if src.stem == "vt_cast":
                 continue
             with self.subTest(shader=src.name):
                 self.assertTrue(
-                    f"kSpecIds_{src.stem}[]" not in header,
+                    f"kSpecIds_{src.stem}[]" not in source,
                     f"{src.name} now declares a specialization constant; update "
                     f"this test and pass its value at the dispatch")
 

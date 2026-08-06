@@ -48,9 +48,14 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // Independent of any device: this is a property of the CHECKED-IN artifact, so
   // it also gates the generator (scripts/gen-vulkan-spirv.py) on a box with no
   // Vulkan at all.
-  const size_t n = sizeof(vt::vulkan::kSpirvModules) / sizeof(vt::vulkan::kSpirvModules[0]);
+  // The blobs live in vulkan_spirv.cpp, so the array is `extern` and of unknown
+  // bound here and the generated count is the only way to size it. That is the
+  // point of the split: at the target shader surface the words must not be
+  // re-parsed by every TU that merely needs the table.
+  const size_t n = vt::vulkan::kSpirvModuleCount;
   CHECK(n == 7);
-  for (const auto& m : vt::vulkan::kSpirvModules) {
+  for (size_t mi = 0; mi < n; ++mi) {
+    const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
     REQUIRE(m.word_count > 5);          // a SPIR-V header alone is 5 words
     CHECK(m.words[0] == 0x07230203u);   // SPIR-V magic
@@ -61,8 +66,8 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   for (const char* want : {"vt_add", "vt_cast", "vt_fused_chain", "vt_layer_norm", "vt_relu",
                            "vt_rms_norm", "vt_silu_and_mul"}) {
     bool found = false;
-    for (const auto& m : vt::vulkan::kSpirvModules) {
-      if (std::strcmp(m.name, want) == 0) found = true;
+    for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
+      if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
     }
     CAPTURE(want);
     CHECK(found);
@@ -77,7 +82,8 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
   // a VkSpecializationMapEntry whose ID the module does not declare, so a drift
   // between host and shader is WRONG NUMBERS, not a clean error. Recording the
   // declared IDs alongside each blob is what lets GetPipeline check it.
-  for (const auto& m : vt::vulkan::kSpirvModules) {
+  for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
+    const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
     // Structural: the pointer and the count agree, and the IDs are sorted with no
     // duplicates — GetPipeline builds VkSpecializationMapEntry positionally from
