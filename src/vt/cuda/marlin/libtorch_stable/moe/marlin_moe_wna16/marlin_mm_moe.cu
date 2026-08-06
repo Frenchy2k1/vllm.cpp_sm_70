@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 // [vt lift] torch host launcher removed; marlin_mm dispatcher kept verbatim.
 // See src/vt/cuda/cuda_moe_marlin.cu for the vt::Tensor launcher.
 
@@ -485,6 +486,31 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
         has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
         max_shared_mem, sms);
+    // vllm.cpp E=1 DECODE CTA-PARITY clamp (row QUANT-CT-MXFP4-MARLIN-STRUCT step 3;
+    // opt-in DEFAULT OFF, enable with VT_MARLIN_E1_PAR1=1). For a SINGLE-EXPERT
+    // (num_experts==1) DECODE GEMM (thread_m_blocks==1) — the dense linear-via-MoE path
+    // EVERY dense NVFP4/MXFP4 model runs — the persistent sms*par grid OVER-SUBSCRIBES:
+    // determine_exec_config picks par=3 (blocks = 48*3 = 144 CTAs on GB10) for one dense
+    // memory-bound W4A16 tile set that vLLM's dense marlin covers with a tile-per-CTA grid
+    // of 48. Measured same-tool in-model (c8 decode window, Qwen3-8B-MXFP4): clamping to
+    // par=1 (blocks == sms == 48) drops marlin 17,463->16,512 us/step (-5.4%; per-call
+    // 121.3->114.7 vs vLLM 113.1 => +1.4% near-parity) and TPOT 37.22->36.23 ms, and stays
+    // TOKEN-EXACT there (the #44 smoke passes 3/3). REAL MoE (num_experts>1: the
+    // 27B/35B/Coder gate models) is UNTOUCHED — the condition is false there, byte-identical
+    // grid — and PREFILL (thread_m_blocks>1) is untouched too. WHY DEFAULT OFF: like every
+    // marlin split-K reduce, changing `par` regroups the fp32 C_tmp reduce, so the E=1
+    // decode output differs from the par=3 default by one bf16 ULP; on the 64-layer
+    // Qwen3-32B-NVFP4A16 that ULP accumulates and FLIPS a strict token vs its committed
+    // SACRED anchor (test_qwen3_32b_nvfp4a16_paged_engine REQUIRE at :344), so it cannot be
+    // default without a byte-preserving CTA reduction — that is the dense-template marlin
+    // port (#50 NO-GO), scoped for a later dispatch. Until then this is a measured,
+    // MXFP4-8B-token-exact opt-in that proves the CTA count is the residual marlin term.
+    static const bool e1_par1 = [] {
+      const char* e = std::getenv("VT_MARLIN_E1_PAR1");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (num_experts == 1 && thread_m_blocks == 1 && e1_par1)
+      exec_cfg.blocks_per_sm = 1;
     thread_tfg = exec_cfg.tb_cfg;
   }
 
