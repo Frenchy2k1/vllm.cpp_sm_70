@@ -3,7 +3,10 @@
 Status: **SPIKE (scoping) — DERIVE-AND-SHIP framed. W1 (Turing `sm_75` bf16-WMMA
 guard) has LANDED and is BUILD-VERIFIED + SASS on nvcc 13.0 (base `034be66e`,
 `CLAIM-CUDA-TURING-SM75`); W2+ (the fp16 fast body) and all runtime gates remain
-open.** Read-only on production code except the W1 guard; this document is the
+open. V0 (the full-library compile audit W1 never ran) is MEASURED as of
+2026-08-06 — see §V0: 18 of 20 unconditional CUDA TUs already compile clean at
+`sm_75`, and the residual is exactly TWO files.** Read-only on production code
+except the W1 guard; this document is the
 committed scope for a "support MORE than vLLM" lane
 that vLLM **drops** but llama.cpp **still supports**: the pre-Ampere NVIDIA
 arches Pascal (`sm_60`/`sm_61`), Volta (`sm_70`) and Turing (`sm_75`). The port
@@ -216,10 +219,106 @@ the sm12x tactic declines a synthetic Hopper cap.
 | `src/vt/cuda/cuda_arch_tactics.{h,cu}` | the runtime tactic registry; a fp16 attention tactic registers here keyed on old-arch caps |
 | `src/vt/cuda/cuda_device_caps.h` | cached `(major,minor)` probe — already the single source of truth |
 
-**Honest gaps:** (1) the bf16-WMMA TU is not compile-guarded, so no old arch
-compiles; (2) no fp16 attention body ported; (3) FEATURE-TABLE has no
-`fattn-fp16` row; (4) no `sm_60`/`sm_61` rows exist; (5) no `<13` toolkit wired
-for Volta/Pascal; (6) no legacy card anywhere here for a runtime gate.
+**Honest gaps:** (1) ~~the bf16-WMMA TU is not compile-guarded~~ — W1 guarded
+`cuda_paged_attn.cu`, and §V0 now MEASURES the rest: two more TUs remain
+(`cuda_gdn.cu`, `cuda_matmul_nvfp4.cu`); (2) no fp16 attention body ported;
+(3) FEATURE-TABLE has no `fattn-fp16` row; (4) no `sm_60`/`sm_61` rows exist;
+(5) no `<13` toolkit wired for Volta/Pascal; (6) no legacy card anywhere here
+for a runtime gate.
+
+## §V0 — the full-library compile audit (MEASURED 2026-08-06)
+
+W1 build-verified exactly ONE translation unit (`cuda_paged_attn.cu`) and the
+B1 row honestly recorded "full-lib link … await W2". That left the size of the
+remaining `<sm_80` compile surface UNKNOWN, and an unknown-size pile of `#if`s
+is not a costable plan. V0 closes that: **compile every unconditionally-built
+CUDA TU at `sm_75` and count what breaks.**
+
+**Method.** `git archive` of `249697b7` onto dgx (nvcc **13.0.88**, cutlass
+4.5.0), configured `-DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=75 -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_METAL=OFF
+-DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` (configure EXIT=0), then each `.cu` entry in
+`compile_commands.json` re-run VERBATIM with only `-o` redirected to a throwaway
+(no objects retained — the box was at 20 GB free). Compile-only: **no GPU lock
+taken, no GPU touched.**
+
+**The arch-gating seam holds — measured, not assumed.** The configure reports
+**all eight** fast-path FEATURE-TABLE cells `DISABLED (no requested arch in [75]
+provides it)`: `fp4-mma`, `cutlass-nvfp4`, `cutlass-nvfp4-sm100`, `cutlass-fp8`,
+`scaledmm-c3x-sm90`, `scaledmm-c3x-sm100`, `marlin-nvfp4`, `fa2`. So the audit
+surface is bounded at the **20 TUs** in the unconditional `target_sources` list
+(`CMakeLists.txt:896-916`), not the 37 `.cu` files in the tree.
+
+**Result: 20 TUs · 18 PASS (0 errors, 0 warnings) · 2 FAIL.**
+
+| TU | Result | Root cause |
+|---|---|---|
+| 18 of 20 (`cuda_arch_tactics`, `cuda_backend`, `cuda_cache`, `cuda_combine_tokens`, `cuda_deepseek_v4`, `cuda_dropin`, `cuda_glue`, `cuda_laguna`, `cuda_layernorm`, `cuda_matmul`, `cuda_mla_attn`, `cuda_mla_prefill`, `cuda_moe`, `cuda_ops`, `cuda_paged_attn`, `cuda_quant_dot`, `cuda_sample`, `nccl_communicator`) | **PASS** | — (`cuda_paged_attn` passes *because of* W1) |
+| `cuda_gdn.cu` | **FAIL**, 110 error lines | two classes, below |
+| `cuda_matmul_nvfp4.cu` | **FAIL**, 10 errors | bf16 WMMA fragments, W1's exact class |
+
+### V0-a — `cuda_gdn.cu` is a second W1, plus a class W1 never faced
+
+The file carries **zero `__CUDA_ARCH__` guards**. Two distinct root causes:
+
+| Class | Count | Sites |
+|---|---|---|
+| `wmma::precision::tf32` — *"name followed by `::` must be a class or namespace name"* | 4 | `cuda_gdn.cu:2896-2899` |
+| tf32 accumulator `fragment<accumulator,16,16,8,float>` incomplete | 16 | span `:3032-4113` |
+| bf16 `fragment<…,__nv_bfloat16,…>` incomplete | 37 | span `:3035-4117` |
+| cascades from the above (`<error-type>`) + follow-on | 53 | span `:3033-4117` |
+
+**TF32 is the new class, and it is strictly harder than W1's.** `wmma::precision::tf32`
+is Ampere-and-later, so on `sm_75`/`sm_70` the failure is a **namespace lookup
+failure at the type-alias definition** (`WmmaCfg<float>`, `:2896-2899`), not an
+incomplete type at a use site. W1's pattern — guard the kernel *body*, `#else
+__trap()` — is therefore NOT sufficient here: the alias block itself must be
+conditionally defined, or the TU fails before any kernel body is reached. The
+bf16 half (37) is W1's familiar class and takes W1's familiar fix.
+
+### V0-b — `cuda_matmul_nvfp4.cu` compiles unconditionally with its feature OFF
+
+Ten errors, one class: bf16 WMMA fragments at five paired sites
+(`:427-428`, `:737-738`, `:1087-1088`, `:1269-1270`, `:2721-2722`).
+
+The finding is the *build wiring*, not the kernel: this TU sits in the
+**unconditional** source list (`CMakeLists.txt:903`) even though its own
+`fp4-mma` FEATURE-TABLE cell resolves DISABLED at `sm_75`. Every other fp4/CUTLASS
+TU is correctly gated behind its cell (`CMakeLists.txt:953`, `:1063`, `:1368`).
+So the fix is a choice — guard the bodies W1-style, or move the TU behind its
+already-existing feature cell — and the second is more faithful to the
+additivity seam the rest of the file already honours.
+
+### What V0 changes about the plan
+
+1. **The surface is small and finite.** 90% of the unconditional CUDA tree
+   already compiles at `sm_75`. The pre-Ampere blocker is two files, not a
+   diffuse sweep — this lane is far cheaper than "no old arch compiles" implied.
+2. **bf16-as-a-dtype is NOT a blocker, and no fp16 model path is needed.** There
+   are **zero** bf16 *arithmetic* intrinsics anywhere in the CUDA TUs; the tree's
+   pattern is convert-on-load then compute in fp32 (`cuda_layernorm.cu:56`,
+   `__bfloat162float`), and those conversions are available pre-Ampere. The three
+   TUs touching `__nv_bfloat162` use it for vectorized *loads*
+   (`cuda_laguna.cu:1140`, `cuda_ops.cu:140`), not packed math. `cuda_quant_dot.cu:327`
+   uses `__dp4a`, which needs `sm_61` — V100 is `sm_70`, so it is satisfied.
+   **Models stay bf16 on Volta**; only WMMA fragment *instantiation* is Ampere-gated.
+3. **W1 is not one row, it is three.** `cuda_paged_attn.cu` (DONE),
+   `cuda_gdn.cu` (bf16 + tf32), `cuda_matmul_nvfp4.cu` (bf16 or re-gate).
+4. **`sm_70` is still not compilable here** — nvcc 13.0 rejects it outright, so
+   V0 could only be run at `sm_75`. Both failing TUs fail for capability reasons
+   (`sm_70` has neither bf16 nor tf32 tensor cores) that hold on Volta by
+   construction, so the fix list transfers; the SASS proof does not, and still
+   waits on a CUDA 12.x toolkit (W5).
+
+### Honest scope of a shipped V100 row
+
+What would actually RUN on a V100 is **dense bf16 models** (Llama / Qwen dense)
+on the portable fp32-accumulate GEMM plus the ported fp16 tile/vec attention.
+GDN (Qwen3-Next), NVFP4, the MLA fast paths and fp8 are Ampere+ by construction;
+their TUs compile to `__trap()` stubs and those models are simply not supported
+there. The claim to publish is **"V100 runs dense bf16 models"**, never "V100
+runs vllm.cpp".
 
 ## Port map
 
@@ -261,7 +360,7 @@ top stage is honestly hardware-blocked.
 | Gate | Requirement | Reachable here? |
 |---|---|---|
 | **B0 guard** ✅ PASSED | bf16-WMMA TU guarded; `sm_121a` GB10 build byte-identical (default path untouched) | **PASSED** (base `034be66e`): guard landed; sm_121a same TU `-Werror` 0-warn + 0 SASS instruction diffs vs unguarded (byte-identical) |
-| **B1 build (Turing)** ✅ PASSED (TU) | clean `-DVLLM_CPP_CUDA_ARCHITECTURES=75 -DVLLM_CPP_TRITON=OFF` build, `-Werror` 0-warn; `cuobjdump -lelf` shows real `sm_75` cubins | **PASSED for the `cuda_paged_attn` TU** (dgx nvcc 13.0.88): single-arch `75` compile `-Werror=all-warnings` 0-warn EXIT=0, `cuobjdump -lelf` → real `cuda_paged_attn.cu.1.sm_75.cubin`. Full-lib link / fp16 attn TU await W2 |
+| **B1 build (Turing)** ✅ PASSED (TU) | clean `-DVLLM_CPP_CUDA_ARCHITECTURES=75 -DVLLM_CPP_TRITON=OFF` build, `-Werror` 0-warn; `cuobjdump -lelf` shows real `sm_75` cubins | **PASSED for the `cuda_paged_attn` TU** (dgx nvcc 13.0.88): single-arch `75` compile `-Werror=all-warnings` 0-warn EXIT=0, `cuobjdump -lelf` → real `cuda_paged_attn.cu.1.sm_75.cubin`. **W1a/§V0 2026-08-06 widened this from one TU to all 20: 18 PASS, 2 FAIL (`cuda_gdn.cu`, `cuda_matmul_nvfp4.cu`).** Full-lib LINK still awaits W1b+W2 — a per-TU compile pass is not a link |
 | **B1 build (Volta/Pascal)** | same for `70`/`61`/`60` | **NO** until a `<13` toolkit is provisioned (`NOT-YET-BUILDABLE`) |
 | **C1 kernel correctness** | ported tile/vec numerics vs CPU oracle (NMSE ≤ 5e-4); FEATURE-TABLE + registry-selection asserted host-side | YES (no GPU needed for the host asserts; numerics run on any CUDA dev) |
 | **C3 e2e / P performance** | a gate model token-checked AND ≥ llama.cpp on the same old card | **NO — hardware-blocked**; this is the `testing-welcome` frontier |
@@ -317,7 +416,9 @@ until a card exists.
 | # | Row | Deliverable | Blocked on |
 |---|---|---|---|
 | W1 ✅ **DONE** | guard the bf16-WMMA TU | `#if __CUDA_ARCH__ >= 800` wraps the bodies of all 5 bf16-WMMA prefill kernels (`cuda_paged_attn.cu:732,958,1197,1472,1716`; `#else __trap()`), so `__CUDA_ARCH__ < 800` compiles the TU selecting the existing scalar path. **Build-verified (dgx nvcc 13.0.88 + cutlass 4.5.0, base `034be66e`):** single-arch `75` `-Werror=all-warnings` 0-warn EXIT=0, `cuobjdump -lelf` → real `cuda_paged_attn.cu.1.sm_75.cubin`; the `:1797 __nv_bfloat16 fragment` error GONE (RED: unguarded HEAD FAILS 21 errors). GB10 sm_121a byte-identical — same TU `-Werror` 0-warn AND 0 SASS instruction diffs vs unguarded. NO Turing board ran it | DONE — (mechanical, nvcc 13) |
-| W2 | port `fattn-tile`+`fattn-vec` fp16 body | new `cuda_paged_attn_fp16.cu`, 1:1 from `fattn-tile.cuh`/`fattn-vec.cuh:21`; fp16 accum + `sm_61` fp32 variant; C1 numerics vs CPU oracle | W1 |
+| W1a ✅ **DONE** | **V0 full-library compile audit** — every unconditionally-built CUDA TU compiled at `sm_75`, failures enumerated and classified. **MEASURED 2026-08-06 (base `249697b7`, dgx nvcc 13.0.88): 20 TUs, 18 PASS (0 err / 0 warn), 2 FAIL** (`cuda_gdn.cu` 110 errors, `cuda_matmul_nvfp4.cu` 10). All 8 fast-path FEATURE-TABLE cells confirmed DISABLED at `75`, bounding the surface at the `CMakeLists.txt:896-916` list. Compile-only, no GPU. Full detail + classification in §V0 | DONE — nvcc 13, no card |
+| W1b | **finish the guard set** (the residual W1a found) — (a) `cuda_gdn.cu`: guard the bf16 fragments W1-style AND conditionally define the `WmmaCfg<float>` tf32 alias block at `:2896-2899` (a lookup failure at the alias, so a body-only guard will NOT compile); (b) `cuda_matmul_nvfp4.cu`: either guard the 5 bf16 sites or — preferred — move the TU behind its already-existing `fp4-mma` feature cell, matching how every other fp4/CUTLASS TU is gated. Re-run W1a to green; `sm_121a` SASS must stay byte-identical | W1a |
+| W2 | port `fattn-tile`+`fattn-vec` fp16 body | new `cuda_paged_attn_fp16.cu`, 1:1 from `fattn-tile.cuh`/`fattn-vec.cuh:21`; fp16 accum + `sm_61` fp32 variant; C1 numerics vs CPU oracle | W1b |
 | W3 | FEATURE-TABLE + tactic registration | `fattn-fp16` feature row + `sm_75/70/61/60` cells; register `fattn-fp16-tile/vec` tactics; selector arch term at `:2562`; `CudaArchFeaturesTest.cmake` + registry-selection tests | W2 |
 | W4 | **Turing derive-and-ship** | `sm_75` `-Werror` build + `cuobjdump` SASS proof; row → `DERIVED+BUILD-VERIFIED (testing-welcome)`; labeled untested | W3, nvcc 13 (**doable now**) |
 | W5 | wire a `<13` toolkit | provision CUDA 12.x; Volta/Pascal build-verify (`70`/`61`/`60` SASS); those rows → `DERIVED+BUILD-VERIFIED` | a 12.x toolkit |
@@ -348,3 +449,19 @@ until a card exists.
 6. **Turing HAS fp16 tensor cores** (`fp16_mma_hardware_available`, `cc>=VOLTA`)
    — the bf16 blocker is specifically bf16, so a fp16-WMMA speed tactic (W6) is
    available later; correctness never needs it (tile/vec suffice).
+7. **TF32 is a SECOND Ampere-gated tensor-core type, and this spec missed it
+   until W1a measured it.** `wmma::precision::tf32` (`cuda_gdn.cu:2896-2899`)
+   fails as a *namespace lookup at the alias definition*, so it breaks the TU
+   earlier and more thoroughly than an incomplete bf16 fragment does. Any future
+   "is this arch additive?" audit must scan for `precision::tf32` alongside
+   `__nv_bfloat16`, and must not assume W1's body-guard pattern generalizes.
+8. **An unconditional TU can outlive its own feature gate.**
+   `cuda_matmul_nvfp4.cu` is compiled for every arch while its `fp4-mma` cell is
+   DISABLED — the FEATURE-TABLE seam is only as good as the `target_sources`
+   list that honours it. Worth a standing check: any TU whose kernels are
+   arch-specific should sit behind its cell, and `CMakeLists.txt:903` currently
+   does not.
+9. **A per-TU compile sweep is NOT a link.** W1a compiled 20 TUs to throwaway
+   objects; it proves no TU has an `<sm_80` *compile* blocker beyond the two
+   named, and nothing about undefined symbols, `__trap()` stubs reachable at
+   link, or fatbin assembly. Do not quote 18/20 as "the library builds".

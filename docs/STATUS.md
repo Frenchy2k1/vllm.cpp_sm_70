@@ -1423,16 +1423,19 @@ MXFP4, CUTLASS MLA) remain scoped.
 
 A separate **beyond-vLLM breadth lane** targets the older NVIDIA arches vLLM
 DROPS but llama.cpp still runs (Pascal/Volta/Turing). Its first brick landed
-2026-07-28: **Turing `sm_75` is BUILD-VERIFIED.** The bf16-WMMA prefill kernels
-(bf16 tensor-core fragments are Ampere+ only) are now guarded
-`#if __CUDA_ARCH__ >= 800`, so a single-arch `75` build compiles `-Werror` 0
-warnings on nvcc 13.0 and `cuobjdump` shows real `sm_75` cubins — the TU falls
-back to the existing scalar CUDA-core attention path (the llama.cpp fp16 fast
-body is a later brick). On `sm_80`+ the guard is a no-op (preprocessor identity),
-so the GB10 gate build is byte-identical. This is
+2026-07-28: **the Turing `sm_75` attention TU is BUILD-VERIFIED.** The bf16-WMMA
+prefill kernels (bf16 tensor-core fragments are Ampere+ only) are now guarded
+`#if __CUDA_ARCH__ >= 800`, so `cuda_paged_attn.cu` compiles `-Werror` 0
+warnings at single-arch `75` on nvcc 13.0 and `cuobjdump` shows a real `sm_75`
+cubin — the TU falls back to the existing scalar CUDA-core attention path (the
+llama.cpp fp16 fast body is a later brick). On `sm_80`+ the guard is a no-op
+(preprocessor identity), so the GB10 gate build is byte-identical. This is
 **DERIVED+BUILD-VERIFIED (testing-welcome), NOT runtime** — no Turing board ran
 it; there is no vLLM oracle on Turing (vLLM dropped it), so correctness is
-referenced against llama.cpp-on-card plus a portable cross-check. Volta/Pascal
+referenced against llama.cpp-on-card plus a portable cross-check. **A 2026-08-06
+audit of all 20 unconditionally-built CUDA TUs at `sm_75` measures 18 PASS / 2
+FAIL** (`cuda_gdn.cu`, `cuda_matmul_nvfp4.cu`), so no `sm_75` library build
+exists yet — see the backend detail section below. Volta/Pascal
 need a CUDA `<13` toolkit (nvcc 13 rejects `sm_70`/`sm_60`/`sm_61`). See
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM075`.
 
@@ -1527,17 +1530,35 @@ competitor floor. Our portable attention uses bf16 tensor-core WMMA, which does
 not exist before Ampere, so these arches need the bf16-WMMA path compile-guarded
 (and, for a fast path, a new fp16/non-tensor-core kernel body ported 1:1 from
 llama.cpp's `fattn-tile`/`fattn-vec`). The lane is derive-and-ship, and its first
-brick has LANDED: **Turing (`sm_75`, e.g. the cloud-common T4) is BUILD-VERIFIED**
-(2026-07-28, `CLAIM-CUDA-TURING-SM75`). The bf16-WMMA prefill kernels are now
-guarded `#if __CUDA_ARCH__ >= 800`, so a single-arch `75` build compiles `-Werror`
-0-warn on our current CUDA 13 toolkit and `cuobjdump` shows real `sm_75` cubins —
-the TU falls back to the existing scalar CUDA-core attention path (the fp16 fast
-body is a separate later brick). On `sm_80`+ the guard is a no-op (byte-identical
-GB10 build). It ships labeled "derived, build-verified, not hardware-tested here,
-community testing welcome" — no Turing board ran it; a green compile + SASS is not
-execution evidence. **Volta (`sm_70`, V100) and Pascal (`sm_60`/`sm_61`, P100/P40)
+brick has LANDED: the **Turing (`sm_75`, e.g. the cloud-common T4) attention TU is
+BUILD-VERIFIED** (2026-07-28, `CLAIM-CUDA-TURING-SM75`). The bf16-WMMA prefill
+kernels are now guarded `#if __CUDA_ARCH__ >= 800`, so `cuda_paged_attn.cu`
+compiles `-Werror` 0-warn at single-arch `75` on our current CUDA 13 toolkit and
+`cuobjdump` shows a real `sm_75` cubin — the TU falls back to the existing scalar
+CUDA-core attention path (the fp16 fast body is a separate later brick). On
+`sm_80`+ the guard is a no-op (byte-identical GB10 build). It ships labeled
+"derived, build-verified, not hardware-tested here, community testing welcome" —
+no Turing board ran it; a green compile + SASS is not execution evidence.
+
+**Scope correction (2026-08-06): that was ONE translation unit, not a library
+build**, and this page previously read as the latter. A full compile audit of all
+20 unconditionally-built CUDA TUs at `sm_75` (base `249697b7`, nvcc 13.0.88) now
+measures **18 PASS (0 errors, 0 warnings) and 2 FAIL**: `cuda_gdn.cu` (110 error
+lines — bf16 WMMA fragments plus `wmma::precision::tf32`, which is also Ampere+
+and fails at the type-alias definition rather than at a use site) and
+`cuda_matmul_nvfp4.cu` (10 errors — bf16 fragments; the TU is compiled
+unconditionally even though its own `fp4-mma` feature cell resolves DISABLED).
+The audit also confirms all eight fast-path feature cells resolve DISABLED at
+`75`, so the remaining surface is those two files. **No `sm_75` library build or
+link exists yet** — a per-TU compile sweep is not a link. Separately, the audit
+established that bf16 needs no fp16 model path on these arches: there are zero
+bf16 *arithmetic* intrinsics in the CUDA tree (the pattern is convert-on-load,
+compute in fp32), so models stay bf16 and only WMMA fragment instantiation is
+Ampere-gated. **Volta (`sm_70`, V100) and Pascal (`sm_60`/`sm_61`, P100/P40)
 are not-yet-buildable** because CUDA 13 dropped their code generation and no
-CUDA 12.x toolkit is provisioned here. There is no vLLM oracle on these cards
+CUDA 12.x toolkit is provisioned here; both failing TUs fail for capability
+reasons that hold on Volta by construction, so the fix list transfers but the
+SASS proof does not. There is no vLLM oracle on these cards
 (vLLM will not run there), so a real correctness test uses llama.cpp on the same
 card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
 
