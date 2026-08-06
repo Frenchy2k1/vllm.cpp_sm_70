@@ -16,15 +16,15 @@ checkpoint on `upstream/main` at `59674cf1d`.
 |---|---|---|
 | Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (byte-exact, default; `VT_LAGUNA_RESIDENT_BF16W` bf16-residency). Benchmark record | vLLM K-run set when convenient |
 | DeepSeek-V4-Flash decode | **Closed: BEATS ds4 1.144x** (`VT_V4_RESIDENT_W`, byte-exact). Phase-2 routed-expert residency NEGATIVE (−3.4%), default-OFF | — |
-| f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate models & on-framework dense unaffected (bf16-out, e2e-verified) | Re-verify deepseek_v4 bf16 tower same-tool |
+| f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate/on-framework dense unaffected | Re-verify deepseek_v4 tower same-tool |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13): CPU+CUDA 13/13·656, no OOM. **Token gate NEAR-TIE 106/128** (6/8 token-exact) | device GDN/MLA islands + bf16 stream; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| MXFP4 parity (Qwen3-8B) | **`MARLIN-STRUCT`: decode-graph + gate_up FUSION default-ON (marlin 180→144 GEMM/step = vLLM-structural); #44 3/3, 0.6B/4B 184/184, 32B-NVFP4A16 142/142** | residual = marlin CTA + flash |
+| MXFP4 parity (Qwen3-8B) | **`MARLIN-STRUCT`: decode-graph + gate_up FUSION default-ON (180→144 GEMM/step); #44 3/3, 0.6B/4B 184/184, 32B 142/142** | residual = marlin CTA + flash |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
-| MXFP4 parity goal | graph+fuse default-ON. c8 residual: marlin CTA 144 vs 48 = DOMINANT +1,177us (`VT_MARLIN_E1_PAR1` opt-in → near-parity, but flips strict 32B token → default-OFF), flash +784, glue +195 | NEXT: dense-template marlin port + full binding (oracle) |
+| MXFP4 parity goal | graph+fuse default-ON; c8 dominant residual = marlin CTA 144 vs 48. **`KERNEL-MARLIN-DENSE-PORT` gated-OFF** (`VT_MARLIN_DENSE`): vLLM's own dense marlin = byte-preserving E=1; 3 dense `.cu` compile-clean dgx; unit WRITTEN | NEXT (dgx): strict dense-ON vs oracle + nsys + binding (state) |
 
 In-flight branches (default-OFF, not pushed): `laguna-fp4proj-prod` (fp4),
 laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`. Records:

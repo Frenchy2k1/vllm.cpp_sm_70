@@ -568,6 +568,38 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     `nvfp4_marlin_process_scales`/`_global_scale`), the `moe_align_block_size`
     port, the 35B forward wiring, 16/16 parity, and the A/B TFLOPS measurement.
 
+    **DENSE Marlin (row `KERNEL-MARLIN-DENSE-PORT`, gated OFF `VT_MARLIN_DENSE`,
+    2026-08-06)**: the byte-preserving E=1 route. `src/vt/cuda/marlin/libtorch_stable/
+    quantization/marlin/` now also vendors vLLM's OWN dense marlin (a DISTINCT
+    kernel from the moe one — direct-A, `lda`, no sorted_token_ids/expert_ids/top_k
+    gather, its own par-split fp32 C_tmp reduce), all from vLLM @ `555967922`
+    `csrc/libtorch_stable/quantization/marlin/`:
+      * `kernel.h` ← `kernel.h` (verbatim; `namespace marlin`, dense `MARLIN_KERNEL_PARAMS` with `lda`)
+      * `marlin_template.h` ← `marlin_template.h:1-2081` (verbatim dense kernel; the
+        SHARED `marlin.cuh`/`marlin_dtypes.cuh`/`dequant.h`/`marlin_mma.h` it includes
+        are byte-identical to our existing vendored copies — diff-verified)
+      * `marlin_mm_dense.{h,cu}` ← `marlin.cu:326-541` `marlin::marlin_mm` + config
+        helpers (`get_marlin_kernel`/`determine_exec_config`/`is_valid_config`/…);
+        the torch::stable `marlin_gemm` host wrapper (`marlin.cu:545-894`) is stripped,
+        replaced by the torch-free launcher `vt::MarlinDenseGemm`
+        (`src/vt/cuda/cuda_marlin_dense.cu`, mirrors `cuda_moe_marlin.cu`). Only the
+        original's redundant inner `is_a_8bit` shadow is dropped (identical value,
+        avoids `-Wshadow`). `STD_TORCH_CHECK` → `vt_marlin_check.h` as for the moe TU.
+      * `kernel_selector.h`, `sm80_kernel_bfloat16_fe2m1f_bfloat16.cu` ←
+        `generate_kernels.py` output. KEY: the dense kernel is the SAME 12-param
+        `Marlin<>` template as the moe one, so these are the SAME instantiation set —
+        the dense kernel BODY + `namespace marlin` come from the local dense
+        `kernel.h`/`marlin_template.h` this TU includes.
+    New op `vt::OpId::kMarlinDenseGemm` + `MarlinDenseArgs` (ops.h, appended before
+    `kCount` — no id shift); routing in `dense_nvfp4_gemm.h` reuses the EXISTING
+    resident weights + workspace (same `marlin_permute` repack for dense and moe —
+    CONFIRMED via the shared repack ops; no shim needed) with rank-2 operand views
+    and NO moe_align. **Compile-VERIFIED GB10 sm_121a (2026-08-06): all 3 new dense
+    `.cu` compile clean under the exact production flags** (`-Werror=all-warnings`,
+    `-static-global-template-stub=false`, `--generate-code=…sm_121a`). GPU exec gates
+    (unit RED-first battery, strict token battery dense-ON, nsys 48-CTA, binding
+    c1..c8) are the dgx follow-up; extracted tree kept at dgx `~/dense_check/vllm.cpp`.
+
 11. **Vendored FlashAttention-2 (head-dim-256 GQA prefill implemented; ratio-6
     split-KV decode `ACTIVE`)**: `src/vt/cuda/flash_attn/` is a byte-identical,
     torch-free vendor of vllm-project/flash-attention @ `2c839c33`, still the

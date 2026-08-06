@@ -843,6 +843,25 @@ void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tenso
       num_tokens_past_padded, topk_weights, args);
 }
 
+void MarlinDenseGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,
+                     const Tensor& b_scales, const Tensor& global_scale, Tensor& workspace,
+                     const MarlinDenseArgs& args) {
+  VT_CHECK(a.rank == 2 && c.rank == 2, "marlin_dense: a/c must be rank-2");
+  VT_CHECK(a.dtype == DType::kBF16 && c.dtype == DType::kBF16, "marlin_dense: a/c must be bf16");
+  VT_CHECK(args.size_k % 16 == 0, "marlin_dense: size_k must be a multiple of 16 (group size)");
+  VT_CHECK(args.group_size == 16 || args.group_size == 32,
+           "marlin_dense: group_size must be 16 (nvfp4) or 32 (mxfp4)");
+  VT_CHECK(a.shape[0] == args.size_m && a.shape[1] == args.size_k,
+           "marlin_dense: a shape must be [size_m, size_k]");
+  VT_CHECK(c.shape[0] == args.size_m && c.shape[1] == args.size_n,
+           "marlin_dense: c shape must be [size_m, size_n]");
+  VT_CHECK(b_q_weight.rank == 2, "marlin_dense: b_q_weight must be rank-2 [K/16, N*8/pack]");
+  VT_CHECK(global_scale.dtype == DType::kF32, "marlin_dense: global_scale must be f32");
+  VT_CHECK(workspace.dtype == DType::kI32, "marlin_dense: workspace must be i32 (reduction locks)");
+  reinterpret_cast<MarlinDenseGemmFn>(GetOp(OpId::kMarlinDenseGemm, q.device.type))(
+      q, c, a, b_q_weight, b_scales, global_scale, workspace, args);
+}
+
 void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up) {
   VT_CHECK(gate.Numel() == out.Numel() && up.Numel() == out.Numel(),
            "moe_silu_mul: out/gate/up must have the same element count");
