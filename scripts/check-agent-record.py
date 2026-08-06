@@ -132,7 +132,12 @@ MATRICES = {
     # specs/deepseek-v4-flash.md §W8.)
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 45),
+    # 47 since 2026-08-06: +`KERNEL-GEMM-CPU-ELEM-X86WIDE` (the AVX2/AVX-512
+    # elementwise tiers; our x86 tier is SSE2 while the box has avx512f, a
+    # measured 3.5x) and +`KERNEL-GEMM-CPU-TILED` (the tinyBLAS-style tiled
+    # sgemm; controls proved our NEON kernel is at ggml-stock parity and the
+    # whole 16-bit deficit is llamafile, ~1.9x Arm / ~2.4x x86).
+    "KERNEL": (AGENTS / "kernel-matrix.md", 47),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
