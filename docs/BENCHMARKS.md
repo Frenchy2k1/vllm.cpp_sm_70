@@ -307,7 +307,7 @@ built on it rather than keeping the flattering one.
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
 | Kimi-Linear-48B-A3B (KDA+MLA+MoE) | Full-model GB10 e2e RUNS (bf16-resident §13), NEAR-TIE 106/128, pool math CLOSES; default OFF | Full model RUNS on GB10 (bf16-resident, RSS peak 1.7 GiB, min-avail 21 GiB, no OOM). Token NEAR-TIE 106/128 (6/8 prompts exact, numerics vs deterministic oracle). 1.59 tok/s. Detail: spec §13 |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
-| MXFP4 Qwen3-8B (W4A16 Marlin) | Closers binding x3 (d3b412f5): c1 **1.005 PASSES**, c2/c4/c8 0.925/0.939/0.953 BELOW (+0.3/0.9/1.1pp vs #49), TTFT parity, mem 2.18x WIN; byte-exact slivers (bitdiff=0), #44 3/3, gate NO | grouped→dense-direct-A marlin; host slice NOT engine-loop (VT_LOOP_TRACE interval≈step) |
+| MXFP4 Qwen3-8B (W4A16 Marlin) | Closers binding x3 (d3b412f5): c1 **1.005 PASSES**, c2/c4/c8 0.925/0.939/0.953 BELOW (+0.3/0.9/1.1pp vs #49), TTFT parity, mem 2.18x WIN; byte-exact slivers (bitdiff=0), #44 3/3, gate NO | c8 same-tool diff (`QUANT-CT-MXFP4-C8-DIFF`): marlin grouped-5-GEMM DOMINANT (gate_up unfused); eager gap +0.88ms graph-closeable (decode-graph opt-in +1.3%); flash same-grid +11%; #50 = isolated-shape artifact |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
 

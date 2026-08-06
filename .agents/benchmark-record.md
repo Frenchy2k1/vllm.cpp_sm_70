@@ -12615,3 +12615,50 @@ within the cross-tool attribution boundary (~0.7ms is ~24% of the c2 gap, near m
 Not a born-on-runner lever. (Caveat: the curl load under-saturated vs steady c8, so step_ms 25.5
 is not the c8 TPOT 37.6; the interval≈step finding is batch-independent and robust.)
 Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
+
+## QUANT-CT-MXFP4-C8-DIFF: fresh SAME-TOOL c8 decode-window per-step diff (POST-SLIVER `d3b412f5`==`4dd4e206`/#51) — marlin grouped-5-GEMM DOMINANT; eager launch-gap +880µs graph-closeable nets only −334µs; #50 grouped==dense SETTLED as isolated-shape ubench artifact; decode-graph opt-in = +1.3% byte-coherent (2026-08-09, GB10 sm_121a CUDA 13.0, RelWithDebInfo MARLIN=ON oracle-cutlass, vLLM oracle 0.25.0 `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`)
+
+SAME-TOOL both sides (the fix for the recorded cross-tool trap): nsys `--cuda-graph-trace=node`.
+OURS = online server, 24×128 window at c8. vLLM online-under-nsys does NOT capture the V1 EngineCore
+subprocess (empty rep at c8, MP-on AND MP-off) → captured vLLM via OFFLINE `LLM()` with
+`VLLM_ENABLE_V1_MULTIPROCESSING=0` (in-process) + cudaProfilerApi fence, IDENTICAL 8 corpus prompts
+(1024 tok) = clean M=8 batched decode. Kernel per-call times are frontend-independent. Steps segmented
+by lm_head anchor; steady window = modal-marlin-count; BOTH at flash gridZ=64 (matched M=8). Single
+node-trace per arm (per-step medians over 300+ steps are stable); binding c1–c8 x3 is #51's (0.953 c8).
+
+PER-STEP DECODE (median µs), OURS EAGER (as-shipped) vs vLLM (graphed):
+| class        | ours µs/step (calls) | vLLM µs/step (calls) | Δ           |
+|--------------|---------------------:|---------------------:|------------:|
+| marlin W4A16 | 17,183 (180=5×36)    | 16,286 (144=4×36)    | +897 (+5.5%)|
+| flash decode |  6,250 (36)          |  5,629 (36)          | +621 (+11%) |
+| glue         |    927 (291)         |    671 (299)         | +256        |
+| lm_head      |  5,413 (1)           |  5,395 (1)           | +18         |
+| flash_comb   |    130 (36)          |    140 (36)          | −10         |
+| sample+other |     36               |     23               | +13         |
+| GPU BUSY     | 30,027               | 28,190               | +1,837      |
+| GAP (idle)   | 1,184 (3.8%)         | 304 (1.1%)           | +880        |
+| STEP SPAN    | 31,211               | 28,491               | +2,720      |
+Measured median TPOT ours 37.56 / vLLM 34.58 ms (+2.98); GPU SPAN accounts 91%; ~0.26ms = async frontend.
+
+GAP LOCALIZATION (ours): uniform ~2.0–2.4µs idle between EVERY consecutive kernel + ~14 H2D + ~2 memset
+per step = host-launch-bound EAGER. vLLM ~0.4–0.76µs/gap = piecewise-CUDA-graph replay. Grids: ours
+marlin 144×1×1 (3 waves M=8), vLLM 48×1×1 (1 wave); flash IDENTICAL 1×3×64 both (GQA-swap parity).
+
+DECODE-GRAPH A/B (ours, `VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH=1`, default-OFF opt-in, byte-identical-to-eager
+per source; SACRED gate unrun): the generic Qwen3-MXFP4 decode is EAGER by default (root-caused in
+`qwen3.cpp:DenseDecodeGraphForward`; no quant restriction). Graph ON: GAP 1,184→305µs (−880, =vLLM's,
+confirms the mechanism), BUSY 30,027→30,575µs (+547 bandwidth contention when packed), SPAN 31,211→30,877
+(−334), median TPOT 37.56→37.09ms (−1.3%), coherent. → c8 0.953→~0.965, still <1.0x. Self-limiting.
+
+FAIR graphed-vs-graphed (ours-graph vs vLLM): SPAN +2,386µs = marlin +1,377 (58%) + flash +658 (28%) +
+glue +290 (12%) + gap ~0. Dominant = MARLIN.
+
+VERDICT (a): dominant term = MARLIN — ours runs 5 grouped-MoE-E1 GEMM/layer (gate+up UNFUSED, 144-CTA)
+vs vLLM 4 dense (gate_up FUSED, 48-CTA) = +5.5%(eager)/+8.5%(graphed)/step, mostly the +25% GEMM count.
+SETTLES #50: its "grouped==dense parity" was vLLM-op-vs-vLLM-op at one ISOLATED shape, blind to OUR
+kernel's +36 GEMM/step + 3× CTAs; the residual is real per-step. Fix = grouped→dense-direct + gate_up
+fuse (delicate ~2000-line port, next dispatch). Secondary = decode-graph opt-in (+1.3%, SACRED owed).
+Tertiary = flash same-kernel/IDENTICAL-grid +11% (KV/splitkv), glue Inductor-fusion.
+Evidence dgx:~/mxfp4-nsys/{kern_sum_c8_dflt,vllm_offline_kern_c8,kern_sum_c8_graph}.txt +
+gpu_trace_c8_{dflt,graph}/vllm_offline_trace_c8_cuda_gpu_trace.csv + analyze_decode.py/gap_and_shape.py.
+Box left clean (both locks free, GPU idle, worker down, disk 20G, tmux gone).
