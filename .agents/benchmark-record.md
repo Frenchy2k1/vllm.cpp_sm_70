@@ -12781,3 +12781,87 @@ remaining c8 term is the ~0.7ms/step host/sched slice (engine loop proven
 clean in #51 — the slice lives in the shared async frontend). Parity verdict
 unchanged: c1 1.020 / c2-c8 0.962-0.969. Evidence dgx:/tmp/fa2dump.err,
 /tmp/fa2ncu2.out, /tmp/fa2ab_n{1,3}.out.
+
+## SERVE-FRONTEND-SLICE: the c2-c8 frontend residual MEASURED (perf, c8 online decode) — the frontend is ~99% CPU-IDLE, so the ~0.26ms/step slice is handoff/scheduling LATENCY + syscalls, NOT frontend compute; detok Slow-vs-Fast is quantitatively negligible at 128-tok output; the mission's "~0.7ms dominant frontend term" premise is REFUTED, the c2-c8 gap is GPU-intrinsic — 2026-08-09 (branch `row/SERVE-FRONTEND-SLICE`, base `origin/main` `efe94402`)
+
+The campaign that owed the frontend attribution. Method step 1 (instrument OUR
+frontend per-step at c8) executed as a `perf` profile of the PRODUCTION server
+binary under a sustained c8 streaming load, NO rebuild — the built binary
+(dgx `~/mxfp4-bench/build`, sha `735f3b8d`) has a `git diff`-IDENTICAL frontend
+(output_processor / detokenizer / serving_completion / api_server / async_llm)
+to main `efe94402`, so its frontend profile IS main's. Box left clean (server
+gone, both locks free, 78 MB perf .data removed, disk 35 G).
+
+WORKLOAD (matches the #52 binding): `/v1/completions` streaming, 1024-in/128-out,
+greedy, 8 concurrent workers cycling the c8 corpus, 60 s. Sustained ITL mean
+40.8 ms / median 31.4 ms ≈ #52's c8 TPOT 37.56 ms — the load is the real c8
+decode regime. `sudo perf record -F 999 -p PID` (flat, 22 s) + `-F 499
+--call-graph dwarf` (18 s).
+
+THE DECISIVE NUMBER (flat profile): the GB10 splits work across two PMU core
+clusters. The ENGINE core (counter armv8_pmuv3_1) drew 22 K on-CPU samples =
+86.5 B cycles, 75.4 % libcuda + 21.4 % vdso (clock_gettime = CUDA busy-poll) —
+pure GPU orchestration. The FRONTEND cores (counter armv8_pmuv3_0) drew only
+**186 on-CPU samples over 22 s at 999 Hz** → the frontend was on-CPU ~0.8 % of
+wall-time = **~99 % IDLE (blocked on __poll / futir waits)**. So the ~0.26 ms/step
+residual (#52: TPOT ours 37.56 − vLLM 34.58 = +2.98 ms, GPU SPAN accounts +2.72 ms
+= 91 %, residual +0.26 ms) is thread-handoff/scheduling LATENCY + syscalls, NOT
+frontend COMPUTE — there is no heavy frontend work to remove.
+
+FRONTEND on-CPU ATTRIBUTION (of counter_0's 186 samples; noisy but directional):
+| bucket | share | detail |
+|---|---:|---|
+| kernel/syscall | 56.6% | `__poll` (httplib), futex (condvar handoffs), socket sendmsg (SSE write), + `nf_conntrack`/`nf_nat` ~5.6% = loopback conntrack, a box iptables artifact absent for real remote clients |
+| libc | 23.6% | malloc/free churn ~9.6% (per-token RequestOutput + json tree + SSE string), memcpy/strlen ~4.2% |
+| server (our code) | 13.25% | dominated by per-token SSE-frame JSON build+serialize |
+| libstdc++ | 0.93% | std::string / map ops |
+
+CALL-GRAPH (dwarf) of the httplib content-provider worker: inside
+`CompletionSseStream::next` (serving_completion.cpp:39-114) **~34 % goes to
+`to_json(...CompletionStreamResponse)`** — and OF THAT ~26 % is nlohmann
+`basic_json(initializer_list)` CONSTRUCTION + `~basic_json` teardown (nlohmann's
+`std::map`-backed object allocates a node tree per token), only ~8 % is the actual
+string dump. Then `RequestOutput::~RequestOutput` + `__libc_free` (freeing the
+per-token full `prompt_token_ids` copy, output_processor.cpp:253-254). Detok is
+INVISIBLE: the only tokenizer symbols (`vt::tok::BpeMerge`/`MergeKey` ~1.85 %) are
+per-REQUEST INPUT tokenization (which vLLM also does), NOT per-token decode; the
+per-token `DetokenizeIncrementally`/`ConvertTokensToString` are below the 0.15 %
+floor.
+
+NAMED MECHANISMS (ours file:line vs vLLM file:line):
+1. **Detokenizer default.** Ours: `IncrementalDetokenizer::FromNewRequest`
+   (`src/vllm/v1/engine/detokenizer.cpp:402-412`) ALWAYS returns
+   `SlowIncrementalDetokenizer`; `DetokenizeIncrementally`
+   (`detokenizer.cpp:347`) deep-copies the whole growing `tokens_` vector per
+   token (O(num_generated), but `tokens_` is seeded with only a ~7-token prompt
+   window in the ctor `detokenizer.cpp:515-530`, so at 128-tok output it caps
+   ~135 strings ≈ 2 µs/step — negligible). vLLM: `from_new_request`
+   (`vllm/v1/engine/detokenizer.py:59-75`) defaults to `FastIncrementalDetokenizer`
+   (`detokenizer.py:167-236`) = Rust `tokenizers.decoders.DecodeStream.step`, O(1)
+   per token. Our Slow path MIRRORS vLLM's fallback but not its DEFAULT; measured
+   impact at this workload is nil. It grows only for long generations.
+2. **SSE-frame serialization.** Ours: `nlohmann::json(frame).dump()`
+   (`serving_completion.cpp:102`) — `std::map`-backed init-list construction, the
+   largest MEASURED frontend-compute term (~34 % of the SSE worker path). vLLM:
+   `chunk.model_dump_json(exclude_unset=True)`
+   (`vllm/entrypoints/openai/completion/serving.py:441`) = pydantic-core (Rust).
+3. **Architecture.** Ours: EngineCore in-process thread → output_handler thread →
+   collector condvar → 8 httplib worker threads (async_llm.cpp:260-311). NO IPC.
+   vLLM: EngineCore SUBPROCESS → ZMQ msgpack IPC → asyncio single-loop output
+   handler → completion_stream_generator coroutine. We SAVE the ZMQ IPC vLLM pays;
+   we PAY multi-thread wakeup latency. The ~0.26 ms residual is the NET.
+
+VERDICT: the frontend slice is a diffuse ~0.26 ms/step (≈9 % of the +2.98 ms c8
+TPOT gap), and it is scheduling/handoff LATENCY, not compute — there is NO
+dominant closable frontend-compute mechanism, and the one structural divergence
+(Slow vs Fast detok) is quantitatively irrelevant at 128-tok output. NO code
+shipped: mirroring vLLM's Fast detok (needs HF Rust DecodeStream) or replacing
+nlohmann with a hand-rolled serializer are LOW-ROI general-serving efficiency
+levers (help long-output / high-QPS), NOT MXFP4 parity levers — the frontend is
+idle, so neither moves TPOT. The c2-c8 gap is GPU-INTRINSIC (KERNEL-FA2-DECODE-PARAMS
+refuted flash as intrinsic-identical; #52 fair graphed-vs-graphed = marlin +
+flash + glue = 91 % of the gap; #57 recovered marlin byte-safe). MXFP4 PARITY
+VERDICT stands UNCHANGED: c1 1.020 PASS, c2-c8 0.962/0.966/0.969 BELOW-FLOOR, mem
+2.63x — and the residual is NOT frontend-closable. Evidence
+dgx:`~/frontend-attrib/{report.txt,cg_report.txt,run.log,load.json}` (perf .data
+pruned for disk).
