@@ -90,6 +90,9 @@ struct UnaryParams {
 struct CastParams {
   uint32_t n, a_off, out_off;
 };
+struct MatmulParams {
+  uint32_t m, n, k, a_off, b_off, out_off;
+};
 struct SiluMulParams {
   uint32_t t, d, x_dt, out_dt, x_off, out_off;
 };
@@ -309,6 +312,31 @@ void FusedChainKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight
   Go("vt_fused_chain", bind, p, static_cast<uint32_t>(t));
 }
 
+// cpu_ops.cpp:187-260 MatmulChunked / MatmulKernel / MatmulBTKernel. One
+// invocation per OUTPUT ELEMENT with the whole K reduction on it, which is what
+// the CPU kernel does too (it deliberately never splits a K reduction across
+// threads), so the accumulation ORDER matches rather than merely the tolerance.
+//
+// The naive body is the portable correctness tier on purpose; the tiled and
+// cooperative-matrix ports (llama.cpp mul_mm.comp / mul_mm_cm2.comp) are VK-C,
+// which needs exactly this as its same-device A/B reference.
+template <bool kBT>
+void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  const int64_t m = a.shape[0], k = a.shape[1];
+  const int64_t n = kBT ? b.shape[0] : b.shape[1];
+  if (m == 0 || n == 0) return;
+  Binder bind;
+  const uint32_t a_off = bind.Add(a, "matmul: a");
+  const uint32_t b_off = bind.Add(b, "matmul: b");
+  const uint32_t out_off = bind.Add(out, "matmul: out");
+  // Ascending constantID order: a dtype, b dtype, out dtype, orientation.
+  const uint32_t spec[4] = {DtypeCode(a.dtype), DtypeCode(b.dtype), DtypeCode(out.dtype),
+                            kBT ? 1u : 0u};
+  MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n), static_cast<uint32_t>(k),
+                 a_off, b_off, out_off};
+  Go("vt_matmul", bind, p, FlatGroupCount(m * n), spec, 4);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -317,6 +345,10 @@ struct Registrar {
     if (!VulkanContext::Available()) return;
     // static_cast against the ops.h aliases ties every kernel signature to the
     // registration contract at COMPILE time (the cpu_ops.cpp idiom).
+    RegisterOp(OpId::kMatmul, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulGeneric<false>)));
+    RegisterOp(OpId::kMatmulBT, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulGeneric<true>)));
     RegisterOp(OpId::kAdd, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<AddFn>(&AddKernel)));
     RegisterOp(OpId::kRelu, DeviceType::kVULKAN,
