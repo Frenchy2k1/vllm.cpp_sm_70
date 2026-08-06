@@ -312,7 +312,7 @@ built on it rather than keeping the flattering one.
 | MXFP4 Qwen3-8B (W4A16 Marlin) | #51 x3: c1 1.005, c2/c4/c8 0.925/0.939/0.953, mem 2.18x. `MARLIN-STRUCT`: decode-graph + gate_up FUSION default-ON, marlin 180->144 GEMM/step (vLLM-structural); #44 3/3, 32B-NVFP4A16 142/142 | nsys c8: marlin +1,177us (CTA 144 vs 48, dominant); `VT_MARLIN_E1_PAR1` E=1->48 CTAs near-parity but flips a strict 32B token (OFF). Byte-preserving `KERNEL-MARLIN-DENSE-PORT` landed gated-OFF; GPU binding pending |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
-| Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **NO NUMBER OWED, nothing executes on these arches.** 2026-08-06 sm_75 compile audit (nvcc 13.0.88): 20 unconditional sm_80+ constructs enumerated; detail in .agents/benchmark-record.md | Port the llama.cpp `fattn-tile`/`fattn-vec` fp16 body. Perf floor when a card exists is **llama.cpp on the same card** (vLLM does not run there) |
+| Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **No number owed; nothing runs on these arches.** 2026-08-06 `sm_75`: 20/20 TUs PASS (0 err/warn), WMMA bodies + all 3 selectors arch-gated; GB10 SASS byte-identical. [Detail](../.agents/benchmark-record.md) | Port the llama.cpp `fattn-tile`/`fattn-vec` fp16 body. Perf floor when a card exists is **llama.cpp on the same card** (vLLM does not run there) |
 
 ## Reproduce
 

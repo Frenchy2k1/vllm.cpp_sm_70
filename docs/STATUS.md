@@ -1538,36 +1538,34 @@ no Turing board ran it; a green compile + SASS is not execution evidence.
 
 **Scope correction (2026-08-06): that was ONE translation unit, not a library
 build**, and this page previously read as the latter. A full compile audit of all
-20 unconditionally-built CUDA TUs at `sm_75` (base `249697b7`, nvcc 13.0.88) now
-measures **18 PASS (0 errors, 0 warnings) and 2 FAIL**: `cuda_gdn.cu` (110 error
-lines — bf16 WMMA fragments plus `wmma::precision::tf32`, which is also Ampere+
-and fails at the type-alias definition rather than at a use site) and
-`cuda_matmul_nvfp4.cu` (10 errors — bf16 fragments; the TU is compiled
-unconditionally even though its own `fp4-mma` feature cell resolves DISABLED).
-The audit also confirms all eight fast-path feature cells resolve DISABLED at
-`75`, so the remaining surface is those two files.
+20 unconditionally-built CUDA TUs at `sm_75` (nvcc 13.0.88) first measured 18 PASS
+/ 2 FAIL and **now measures 20/20 PASS, 0 errors and 0 warnings**. The two
+residuals (`cuda_gdn.cu`, `cuda_matmul_nvfp4.cu`) carried bf16 WMMA fragments plus
+a harder second class, `wmma::precision::tf32` — also Ampere+, but failing at the
+type-alias definition rather than at a use site, so a body-only guard does not
+compile. Both are now wrapped `#if __CUDA_ARCH__ >= 800` with a `__trap()`
+fallback, along with the helpers only those bodies use. All eight fast-path
+feature cells resolve DISABLED at `75`.
 
-**Both are now guarded, and the audit is green: `sm_75` compiles 20/20 TUs, 0
-errors and 0 warnings** (2026-08-06). The bf16 and TF32 WMMA bodies in both files
-are wrapped `#if __CUDA_ARCH__ >= 800` with a `__trap()` fallback, together with
-the helper structs and device functions that only those bodies use. **The GB10
-gate build is unaffected, by measurement:** at `sm_121a` both TUs compile
-`-Werror=all-warnings` 0-warn, `cuda_gdn.cu` SASS is bit-identical across 824,704
-lines, and `cuda_matmul_nvfp4.cu` shows zero instruction-level differences (the
-only 148 differing lines are `Function :` headers carrying the anonymous-namespace
-hash, which shifts on any edit to a file). **No `sm_75` library link exists yet**
-— a per-TU compile sweep is not a link, and no Turing, Volta or Pascal board has
-run any of this. Separately, the audit
-established that bf16 needs no fp16 model path on these arches: there are zero
-bf16 *arithmetic* intrinsics in the CUDA tree (the pattern is convert-on-load,
-compute in fp32), so models stay bf16 and only WMMA fragment instantiation is
-Ampere-gated. **Volta (`sm_70`, V100) and Pascal (`sm_60`/`sm_61`, P100/P40)
-are not-yet-buildable** because CUDA 13 dropped their code generation and no
-CUDA 12.x toolkit is provisioned here; both failing TUs fail for capability
-reasons that hold on Volta by construction, so the fix list transfers but the
-SASS proof does not. There is no vLLM oracle on these cards
-(vLLM will not run there), so a real correctness test uses llama.cpp on the same
-card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
+**The three WMMA selectors are arch-gated too, which the compile guards alone did
+not cover:** each predicate was host-side only (shape, dtype, env), so a
+pre-Ampere board would still have selected a `__trap()` body — a build error
+turned into a runtime crash. All three now require `sm_major >= 8` and fall
+through to paths that already exist: the portable CUDA-core flash (attention), the
+sequential scan (GDN), and the naive/tiled/split-K kernels (NVFP4/MoE). Each fails
+safe if the device capability is unreadable. **GB10 is unaffected by measurement**
+— the three TUs compile 0-warn at `sm_121a` with byte-identical SASS.
+
+**No `sm_75` library link exists yet** — a per-TU compile sweep is not a link, and
+no Turing, Volta or Pascal board has run any of this. bf16 needs no fp16 model
+path here: there are zero bf16 *arithmetic* intrinsics in the CUDA tree
+(convert-on-load, compute in fp32), so models stay bf16 and only WMMA fragment
+instantiation is Ampere-gated. **Volta (`sm_70`, V100) and Pascal are
+not-yet-buildable** — CUDA 13 dropped their code generation and no 12.x toolkit is
+provisioned here; the fix list transfers to Volta by construction, the SASS proof
+does not. There is no vLLM oracle on these cards, so real correctness testing
+means llama.cpp on the same card plus a newer-card/CPU cross-check; nothing is
+runtime-verified yet.
 
 ## Serving and API notes
 

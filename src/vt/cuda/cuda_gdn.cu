@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "vt/cuda/conv_update_fast.h"
+#include "vt/cuda/cuda_device_caps.h"
 #include "vt/cuda/cuda_gdn_internal.h"
 #include "vt/cuda/gdn_packed_decode_triton.h"
 #include "vt/cuda/gdn_prefill_conv.h"
@@ -5356,9 +5357,22 @@ void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
   // fallback (VT_GDN_CHUNKED=0). The bf16 chunked path is WMMA (tensor-core),
   // which tiles at 16 and 32 — bf16 dims that are not WMMA-friendly fall back
   // to the sequential scan (real gate dims Dk=Dv=128 satisfy both).
+  // ARCH TERM (required, not an optimisation). Every kernel LaunchChunkedPrefill
+  // reaches — the WU, delta_h (wmma/reg/regring/tma) and chunk_o bodies — is
+  // compiled `#if __CUDA_ARCH__ >= 800` with an `#else __trap()`, because bf16
+  // fragments AND wmma::precision::tf32 are Ampere+. That holds for BOTH scratch
+  // dtypes: the TSc=float instantiations use the TF32 WmmaCfg, so f32 is not a
+  // way around it. This routing is the single chokepoint (all 7 launches live in
+  // LaunchChunkedPrefill, itself reached only from here), so gating it sends
+  // <sm_80 to GdnScanCuda, the portable sequential scan that already serves the
+  // arbitrary-dim corners. Fails safe: caps invalid -> scan. On sm_80+ the term
+  // is always true, so the gate models' path is unchanged.
+  // See .agents/specs/cuda-arch-breadth-fp16.md §V0-a / W1c.
+  const DeviceCaps& gdn_caps = GetDeviceCaps();
+  const bool arch_has_mma = gdn_caps.valid && gdn_caps.sm_major >= 8;
   const bool wmma_ok = q_in.dtype != DType::kBF16 || (dk % kWM == 0 && dv % kNB == 0);
   if (ChunkedPrefillEnabled() && dk <= kChunkMaxDim && dv <= kChunkMaxDim && args.scale != 0.0f &&
-      wmma_ok) {
+      wmma_ok && arch_has_mma) {
     GdnPrefillChunkedCuda(q, out, q_in, k, v, g, beta, state, qsl, args);
     return;
   }

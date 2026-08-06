@@ -2608,7 +2608,17 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // so they fall through to the correctness-grade f32 CUDA-core flash below.
   // (Latent bug the first additive dense model, MODEL-TEXT-qwen3, forced out; the
   // gate models keep the WMMA path unchanged — they run d=256, TQ/TKV=bf16.)
-  const bool wmma = is_prefill && d == 256 && PrefillWmmaEnabled() &&
+  // ARCH TERM (required, not an optimisation). The five WMMA prefill kernels are
+  // compiled `#if __CUDA_ARCH__ >= 800` with an `#else __trap()` (W1/W1b) because
+  // bf16 WMMA fragments are Ampere+. This predicate is otherwise entirely
+  // host-side (shape + dtype + env), so on a Turing/Volta/Pascal board it would
+  // still SELECT a kernel whose body is a trap. Gate on the cached device
+  // capability so <sm_80 falls through to the portable CUDA-core flash below,
+  // which is correctness-grade and needs no tensor cores. On sm_80+ this term is
+  // always true, so the gate models' selection is unchanged.
+  // See .agents/specs/cuda-arch-breadth-fp16.md §V0-a / W1c.
+  const bool arch_has_bf16_mma = GetDeviceCaps().sm_major >= 8;
+  const bool wmma = is_prefill && d == 256 && arch_has_bf16_mma && PrefillWmmaEnabled() &&
                     std::is_same<TKV, __nv_bfloat16>::value &&
                     std::is_same<TQ, __nv_bfloat16>::value;
   // GQA K/V reuse: eligible when qpk = hq/num_kv_heads is a multiple of the reuse
