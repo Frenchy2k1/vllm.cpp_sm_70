@@ -206,9 +206,9 @@ CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 is a correctness venue only: CUTLASS has no FP4 tensor-core
 kernels for it.
 
-Vulkan is partial and the ◐ is honest but generous. It has **12 native compute
-kernels** (dense GEMM in both orientations, embedding, greedy argmax, and the
-elementwise/norm/fusion set); the other 75 ops the CPU backend registers resolve
+Vulkan is partial and the ◐ is honest but generous. It has **13 native compute
+kernels** (dense GEMM in both orientations, block-paged attention, embedding,
+greedy argmax, and the elementwise/norm/fusion set); the other 74 ops the CPU backend registers resolve
 through the portable reference tier, which runs the CPU kernel against shared
 memory on a unified device. That is correct and arbitrarily slow, no model has
 been run end to end on it, and no speed number exists or is owed. Build it with
