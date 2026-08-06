@@ -14,17 +14,17 @@ checkpoint on `upstream/main` at `59674cf1d`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (byte-exact, default; `VT_LAGUNA_RESIDENT_BF16W` bf16-residency). Benchmark record | vLLM K-run set when convenient |
-| DeepSeek-V4-Flash decode | **Closed: BEATS ds4 1.144x** (`VT_V4_RESIDENT_W`, byte-exact). Phase-2 routed-expert residency NEGATIVE (−3.4%), default-OFF | — |
-| f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate/on-framework dense unaffected | Re-verify deepseek_v4 tower same-tool |
-| Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **W-FP4a fp4 routing CPU-landed** (`row/H3-FP4-SPEED`): NVFP4 kept packed -> Marlin W4A16, no new quant code; gate 62/62 | GB10 CUDA gate; real e2e disk-blocked |
-| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13): CPU+CUDA 13/13·656, no OOM. **Token gate NEAR-TIE 106/128** (6/8 token-exact) | device GDN/MLA islands + bf16 stream; 1.59 tok/s; default OFF |
-| 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
+| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (byte-exact, default; `VT_LAGUNA_RESIDENT_BF16W`) | vLLM K-run when convenient |
+| DeepSeek-V4-Flash decode | **Closed: beats ds4 1.144x** (`VT_V4_RESIDENT_W`, byte-exact); phase-2 residency NEG, default-OFF | — |
+| f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
+| Invocation-parity prevention | CI guard + AGENTS.md checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
+| MiniMax-H3 lane | **W-FP4a fp4 routing CPU-landed** (`row/H3-FP4-SPEED`): NVFP4 kept packed -> Marlin W4A16; 62/62 | GB10 CUDA gate; e2e disk-blocked |
+| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **e2e RUNS** (bf16-resident §13): 13/13·656. Token gate **NEAR-TIE 106/128** | device GDN/MLA islands; 1.59 tok/s; default OFF |
+| 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| MXFP4 parity | **TERMINAL (`QUANT-CT-MXFP4-FINAL-STACK`)**: c1 1.020x PASS + mem 2.63x; c2-c8 0.962-0.969 GPU-intrinsic. Both last levers exhausted: num_splits cap `VT_FA2_NSPLITS_CAP` gated-OFF (c1-only, green, 32B strict char-identical); glue folds via `vt::FusedChain`, residual out-of-catalog Inductor GEMM-epilogue fusion (#46). `VT_MARLIN_DENSE` on | Record; branch not merged |
-| ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
-| CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** (20.7% dtype switch, `cpu_paged_attn.cpp:29`). **G5 not next** | Parakeet encoder; attn dtype hoist |
+| MXFP4 parity | **TERMINAL (`QUANT-CT-MXFP4-FINAL-STACK`)**: c1 1.020x PASS, mem 2.63x; c2-c8 0.962-0.969 GPU-intrinsic, both last levers exhausted (residual #46). `VT_MARLIN_DENSE` on | Record; branch not merged |
+| ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
+| CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 
 In-flight branches (default-OFF, not pushed): `laguna-fp4proj-prod` (fp4),
 laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`. Records:
