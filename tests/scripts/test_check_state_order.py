@@ -121,5 +121,31 @@ class LiveTree(unittest.TestCase):
         self.assertEqual(order.main(), 0)
 
 
+
+class FutureAnchorTests(unittest.TestCase):
+    def test_future_dated_anchor_is_rejected(self):
+        text = (
+            "history\n"
+            + order.MARKER
+            + "\n## legit entry\n<!-- state: 2026-08-06 -->\n\nbody\n"
+            + "## future entry\n<!-- state: 2099-01-01 -->\n\nbody\n"
+        )
+        errors = order.entry_errors(text)
+        self.assertTrue(any("future" in e for e in errors), errors)
+
+    def test_today_and_tomorrow_are_accepted(self):
+        import datetime
+
+        today = datetime.date.today().isoformat()
+        tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        text = (
+            "history\n"
+            + order.MARKER
+            + f"\n## a\n<!-- state: {today} -->\n\nbody\n"
+            + f"## b\n<!-- state: {tomorrow} -->\n\nbody\n"
+        )
+        self.assertEqual(order.entry_errors(text), [])
+
+
 if __name__ == "__main__":
     unittest.main()

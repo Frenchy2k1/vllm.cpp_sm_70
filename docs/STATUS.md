@@ -1201,6 +1201,10 @@ InternLM2 plus a sliding window).
 
 ## Build and test lanes
 
+Record hygiene (2026-08-06): `check-state-order` now rejects future-dated
+state anchors (one-day timezone grace) after a chained stamp bug recurred
+three times; the third recurrence was re-anchored to its git-evidenced date.
+
 Public documentation restructure (2026-08-04): `docs/BENCHMARKS.md` had grown
 into an append log of 11,405 lines and 171 claim-titled sections and was no
 longer readable by users. It is now a keyed-table scoreboard, one row per

@@ -103,6 +103,18 @@ def entry_errors(text: str) -> list[str]:
             "anchor on the line after its heading"
         )
 
+    import datetime as _dt
+
+    horizon = (_dt.date.today() + _dt.timedelta(days=1)).isoformat()
+    for key, _, title in anchors:
+        if key[0] > horizon:
+            errors.append(
+                f"entry {title!r} is anchored {key[0]}T{key[1]}, later than "
+                f"tomorrow ({horizon}) - a stamp cannot be in the future. This "
+                "is the chained future-dating bug: never copy a prior entry's "
+                "date; stamp with the real `date` output"
+            )
+
     for (key, _, title), (previous_key, _, previous_title) in zip(
         anchors[1:], anchors
     ):

@@ -39315,7 +39315,7 @@ audit. Costed surpass-rung proposal (scoped, NOT built) recorded. No code shippe
 the glue Marlin would gold-plate a source-refuted hypothesis. Box untouched; H3 uninterrupted.
 
 ## QUANT-GGUF-CIQ-GEMM: the OWED fresh CPU op-dispatch profile is DONE and it re-ranks the levers away from G5; decode is 47% threadpool synchronisation and prefill is ~39% paged attention
-<!-- state: 2026-08-09T18:00 -->
+<!-- state: 2026-08-06T15:45 -->
 
 `CLAIM-KERNEL-CPU-ELEM-GEMM-1` closed owing one thing before any further CPU
 lever could start: a fresh op-dispatch profile, because E4's M-blocking bought
