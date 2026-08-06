@@ -1549,8 +1549,19 @@ and fails at the type-alias definition rather than at a use site) and
 `cuda_matmul_nvfp4.cu` (10 errors — bf16 fragments; the TU is compiled
 unconditionally even though its own `fp4-mma` feature cell resolves DISABLED).
 The audit also confirms all eight fast-path feature cells resolve DISABLED at
-`75`, so the remaining surface is those two files. **No `sm_75` library build or
-link exists yet** — a per-TU compile sweep is not a link. Separately, the audit
+`75`, so the remaining surface is those two files.
+
+**Both are now guarded, and the audit is green: `sm_75` compiles 20/20 TUs, 0
+errors and 0 warnings** (2026-08-06). The bf16 and TF32 WMMA bodies in both files
+are wrapped `#if __CUDA_ARCH__ >= 800` with a `__trap()` fallback, together with
+the helper structs and device functions that only those bodies use. **The GB10
+gate build is unaffected, by measurement:** at `sm_121a` both TUs compile
+`-Werror=all-warnings` 0-warn, `cuda_gdn.cu` SASS is bit-identical across 824,704
+lines, and `cuda_matmul_nvfp4.cu` shows zero instruction-level differences (the
+only 148 differing lines are `Function :` headers carrying the anonymous-namespace
+hash, which shifts on any edit to a file). **No `sm_75` library link exists yet**
+— a per-TU compile sweep is not a link, and no Turing, Volta or Pascal board has
+run any of this. Separately, the audit
 established that bf16 needs no fp16 model path on these arches: there are zero
 bf16 *arithmetic* intrinsics in the CUDA tree (the pattern is convert-on-load,
 compute in fp32), so models stay bf16 and only WMMA fragment instantiation is

@@ -370,6 +370,13 @@ template <typename Tout, int BM, int BN, int BK, int WARPS_M, int WARPS_N>
 __global__ void MatmulNvfp4Wmma(Tout* out, const __nv_bfloat16* act, const uint8_t* packed,
                                 const uint8_t* scale, float scale2, int64_t m_rows,
                                 int64_t n_cols, int64_t k_dim) {
+// bf16 WMMA tensor-core body is Ampere+ (bf16 fragments are complete only for
+// __CUDA_ARCH__ >= 800). Guard so Turing/Volta/Pascal device passes compile
+// this TU; sm_80+ keeps the body verbatim (preprocessor identity ->
+// byte-identical). This TU is compiled for EVERY arch (CMakeLists.txt:903)
+// because it also carries the generic bf16 MoE GEMMs, so it cannot simply be
+// gated behind its fp4-mma cell. See cuda-arch-breadth-fp16.md §V0-b.
+#if __CUDA_ARCH__ >= 800
   constexpr int kThreads = WARPS_M * WARPS_N * 32;
   constexpr int WMPER = BM / WARPS_M;  // rows a warp owns
   constexpr int WNPER = BN / WARPS_N;  // cols a warp owns
@@ -453,6 +460,9 @@ __global__ void MatmulNvfp4Wmma(Tout* out, const __nv_bfloat16* act, const uint8
     const int64_t gr = row0 + r, gc = col0 + c;
     if (gr < m_rows && gc < n_cols) Store(out, gr * n_cols + gc, Cs[idx]);
   }
+#else
+  __trap();
+#endif
 }
 
 // Below this many activation rows the naive one-thread-per-output kernel wins
@@ -680,6 +690,13 @@ __global__ void MoeGroupedGemmNvfp4Wmma(Tout* out, const Tin* act, const int32_t
                                         const int64_t* scale_ptrs, const float* scale2s,
                                         const int32_t* tile_expert, const int32_t* tile_row0,
                                         const int32_t* tile_rows, int64_t n_cols, int64_t k_dim) {
+// bf16 WMMA tensor-core body is Ampere+ (bf16 fragments are complete only for
+// __CUDA_ARCH__ >= 800). Guard so Turing/Volta/Pascal device passes compile
+// this TU; sm_80+ keeps the body verbatim (preprocessor identity ->
+// byte-identical). This TU is compiled for EVERY arch (CMakeLists.txt:903)
+// because it also carries the generic bf16 MoE GEMMs, so it cannot simply be
+// gated behind its fp4-mma cell. See cuda-arch-breadth-fp16.md §V0-b.
+#if __CUDA_ARCH__ >= 800
   const int rcount = tile_rows[blockIdx.y];
   if (rcount == 0) return;
   constexpr int kThreads = WARPS_M * WARPS_N * 32;
@@ -764,6 +781,9 @@ __global__ void MoeGroupedGemmNvfp4Wmma(Tout* out, const Tin* act, const int32_t
     if (r < rcount && gc < n_cols) Store(out, static_cast<int64_t>(sp[row0 + r]) * n_cols + gc,
                                          Cs[idx]);
   }
+#else
+  __trap();
+#endif
 }
 
 // Persistent scratch for the MoE expert-grouping counting-sort + ragged tile map
@@ -1042,6 +1062,13 @@ __global__ void MoeGroupedGemmBf16Wmma(Tout* out, const __nv_bfloat16* act, cons
                                        const int32_t* sr, const int64_t* weight_ptrs,
                                        const int32_t* tile_expert, const int32_t* tile_row0,
                                        const int32_t* tile_rows, int64_t n_cols, int64_t k_dim) {
+// bf16 WMMA tensor-core body is Ampere+ (bf16 fragments are complete only for
+// __CUDA_ARCH__ >= 800). Guard so Turing/Volta/Pascal device passes compile
+// this TU; sm_80+ keeps the body verbatim (preprocessor identity ->
+// byte-identical). This TU is compiled for EVERY arch (CMakeLists.txt:903)
+// because it also carries the generic bf16 MoE GEMMs, so it cannot simply be
+// gated behind its fp4-mma cell. See cuda-arch-breadth-fp16.md §V0-b.
+#if __CUDA_ARCH__ >= 800
   const int rcount = tile_rows[blockIdx.y];
   if (rcount == 0) return;
   constexpr int kThreads = WARPS_M * WARPS_N * 32;
@@ -1114,6 +1141,9 @@ __global__ void MoeGroupedGemmBf16Wmma(Tout* out, const __nv_bfloat16* act, cons
     if (r < rcount && gc < n_cols)
       Store(out, static_cast<int64_t>(sp[row0 + r]) * n_cols + gc, Cs[idx]);
   }
+#else
+  __trap();
+#endif
 }
 
 // --- W6: PIPELINED bf16 grouped-MoE WMMA tile (the tuned prefill/decode GEMM) --
@@ -1166,6 +1196,13 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N * 32) void MoeGroupedGemmBf16WmmaP
     Tout* out, const __nv_bfloat16* act, const int32_t* sp, const int32_t* sr,
     const int64_t* weight_ptrs, const int32_t* tile_expert, const int32_t* tile_row0,
     const int32_t* tile_rows, int64_t n_cols, int64_t k_dim) {
+// bf16 WMMA tensor-core body is Ampere+ (bf16 fragments are complete only for
+// __CUDA_ARCH__ >= 800). Guard so Turing/Volta/Pascal device passes compile
+// this TU; sm_80+ keeps the body verbatim (preprocessor identity ->
+// byte-identical). This TU is compiled for EVERY arch (CMakeLists.txt:903)
+// because it also carries the generic bf16 MoE GEMMs, so it cannot simply be
+// gated behind its fp4-mma cell. See cuda-arch-breadth-fp16.md §V0-b.
+#if __CUDA_ARCH__ >= 800
   const int rcount = tile_rows[blockIdx.y];
   if (rcount == 0) return;
   constexpr int kThreads = WARPS_M * WARPS_N * 32;
@@ -1296,6 +1333,9 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N * 32) void MoeGroupedGemmBf16WmmaP
     if (r < rcount && gc < n_cols)
       Store(out, static_cast<int64_t>(sp[row0 + r]) * n_cols + gc, Cs[idx]);
   }
+#else
+  __trap();
+#endif
 }
 
 // The W6 pipelined tile stages 16-byte granules, so it requires the activation
@@ -2693,6 +2733,13 @@ template <typename Tout, int BM, int BN, int BK, int WARPS_M, int WARPS_N>
 __global__ void MatmulNvfp4Fp4Wmma(Tout* out, const uint8_t* a_packed, const uint8_t* a_scale,
                                    const uint8_t* b_packed, const uint8_t* b_scale, float alpha,
                                    int64_t m_rows, int64_t n_cols, int64_t k_dim) {
+// bf16 WMMA tensor-core body is Ampere+ (bf16 fragments are complete only for
+// __CUDA_ARCH__ >= 800). Guard so Turing/Volta/Pascal device passes compile
+// this TU; sm_80+ keeps the body verbatim (preprocessor identity ->
+// byte-identical). This TU is compiled for EVERY arch (CMakeLists.txt:903)
+// because it also carries the generic bf16 MoE GEMMs, so it cannot simply be
+// gated behind its fp4-mma cell. See cuda-arch-breadth-fp16.md §V0-b.
+#if __CUDA_ARCH__ >= 800
   constexpr int kThreads = WARPS_M * WARPS_N * 32;
   constexpr int WMPER = BM / WARPS_M, WNPER = BN / WARPS_N;
   constexpr int MF = WMPER / 16, NF = WNPER / 16;
@@ -2747,6 +2794,9 @@ __global__ void MatmulNvfp4Fp4Wmma(Tout* out, const uint8_t* a_packed, const uin
     const int64_t gr = row0 + r, gc = col0 + c;
     if (gr < m_rows && gc < n_cols) Store(out, gr * n_cols + gc, alpha * Cs[idx]);
   }
+#else
+  __trap();
+#endif
 }
 
 // --- NATIVE block-scaled fp4xfp4 MMA (Blackwell sm120a mxf4nvf4 tensor cores) --
