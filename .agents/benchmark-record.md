@@ -12413,3 +12413,80 @@ c2 28.27→25.45). #47 projects flash alone closes ~28%@c2 / ~55%@c8 (decode fla
 so a single lever may not reach ≥1.0x — record the honest per-axis outcome. Then Qwen3
 0.6B/4B e2e SACRED swap-ON, then flip per parity-enablers. Box left clean (both locks
 free, GPU idle, worker down, disk 22G).
+
+## QUANT-CT-MXFP4 flip campaign — FA2 decode GQA group-swap FLIPPED DEFAULT-ON; binding improves c2-c8 with NO regression; MXFP4 goal still <1.0x (2026-08-06, `row/KERNEL-FA2-GQA-SWAP-FLIP`, GB10, HEAD `1f446fd7`+flip)
+
+Ran the full flip campaign for `VT_FA2_DECODE_GQA_SWAP` (#47 lever, #48 correctness-complete
+gated-OFF): model-level e2e SACRED, the #45-contract binding re-bench swap-ON, the ours-only
+nsys mechanism confirm, and the default decision. **Result: FLIPPED DEFAULT-ON.** Box left
+clean (both locks free, GPU idle, worker down, disk 21G).
+
+BUILD PROVENANCE (the trap that cost the first grid attempt, recorded): the box
+`~/mxfp4-bench/src` tree was git `33e93608` (#45) with the 4 #48 files OVERLAID (dirty), and
+the built server binary was STALE (lacked the `VT_FA2_DECODE_GQA_SWAP` getenv string; the
+"ninja: no work to do" rebuild had been fooled by the overlay's preserved mtimes). The grid
+driver's `--execute` REQUIRES `git HEAD == --vllm-cpp-sha` AND a clean tree (dgx-online-serving.sh
+:168,:172), so the overlay fails both. FIX: `git fetch origin 1f446fd7` + `git checkout -f
+1f446fd7` (the overlay was byte-identical to HEAD, so no code changed) → clean tree at the
+exact sha; rebuild (swap string verified present in `examples/server` AND `libvllm.so.0.0.1`).
+Clean full-tree provenance beats an overlay for a SACRED binding.
+
+CORRECTNESS (fresh 1f446fd7+flip binary, GB10 CUDA 13.0 sm_121a, GPU-locked):
+- op `test_ops_paged_attn --test-case="*varlen d128*"`: **5/5 cases, 280/280 assn GREEN**.
+- SACRED `test_qwen3_paged_engine` (Qwen3-0.6B 16/8 + 4B 32/8), ALL arms **16/16 both, 184/184**:
+  swap-OFF baseline, swap-ON (`=1`), NEW DEFAULT (no env), and opt-out (`=0`) are CHARACTER-
+  IDENTICAL — same 11/16 strict + 5/16 near-tie split, same max-gap positions (0.6B 0.125 nats
+  @p5t11, 4B 0.25 nats @p2t11), 0 forward-divergent. The swap flips NO token e2e at these
+  lengths; the near-tie razor was never needed.
+- #44 MXFP4-8B smoke at the new default: deterministic **3/3 TOKEN-EXACT** + near-tie coherent.
+- In-grid smoke gate (swap-ON) passed (grid ran all 24 legs).
+
+NSYS MECHANISM (ours-only c2 decode-window, `--cuda-graph-trace=node`, 24×128, dominant
+decode-flash by launch frequency; aggregation-trap-separated):
+| arm | decode-flash grid | gridZ | CTAs | per-call Med |
+|-----|-------------------|-------|------|--------------|
+| swap OFF (baseline) | **(1,3,64)** | 64 = batch(2)×**q_heads(32)** | 192 | **63.68us** |
+| swap ON (`=1`)      | **(1,5,16)** | 16 = batch(2)×**kv_heads(8)** | 80 | **45.31us** |
+| NEW DEFAULT (no env)| **(1,5,16)** | 16 = batch(2)×kv_heads(8) | 80 | 45.6us |
+The default no-env run reproduces the swap grid → the flip engages the swap by default (the
+definitive flipped-default proof, since SACRED output is identical for both defaults). Marlin
+decode ~flat (120.7→118.4us). Per-call drop −28.8% (below #47's projected 41.7us / −34%; ours
+num_splits picks 5 vs vLLM's 6, both ~1 wave).
+
+BINDING GRID (swap-ON on OURS legs, oracle `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`,
+c1/c2/c4/c8 ×3 interleaved, single-load/arm, drop_caches+mincore proof, RelWithDebInfo + oracle
+flashinfer-cutlass, oracle vLLM 0.25.0; evidence
+`dgx:~/work/vllm.cpp-online-gate/evidence/1f446fd7fb125284e6c4ba44b1e6dd82b99c084c`):
+| conc | total tok/s ours→vllm (ratio) | out tok/s r | med TPOT ms ours→vllm (r) | med TTFT (r) |
+|------|------------------------------|-------------|--------------------------|--------------|
+| c1 | 325.0 → 328.2 (**0.990**) | 0.990 | 25.65 → 25.32 (0.987) | 285.6 → 294.8 (**1.032** PASS) |
+| c2 | 575.9 → 624.4 (**0.922**) | 0.922 | 27.97 → 25.52 (0.912) | 444.8 → 446.2 (**1.003** PASS) |
+| c4 | 964.1 → 1036.3 (**0.930**) | 0.930 | 30.82 → 28.09 (0.911) | 864.1 → 864.5 (**1.000** PASS) |
+| c8 | 1464.0 → 1553.9 (**0.942**) | 0.942 | 38.23 → 35.31 (0.924) | 1413.9 → 1411.2 (0.998) |
+| memory | peak GPU 28210 → 73723 MiB = **2.614 PASS** (ours 2.6x LESS) | — | — | — |
+Per-rep ours total tok/s (tight, CoV 0.06–0.28%): c1 324.4/325.0/326.6; c2 575.4/575.9/576.2;
+c4 961.1/964.1/965.9; c8 1462.9/1464.0/1468.7. Per-rep ours median TPOT ms: c1 25.53/25.65/25.71;
+c2 27.88/27.97/27.99; c4 30.71/30.82/31.69; c8 38.01/38.23/38.24.
+
+DELTA vs #45 (swap-OFF, `33e93608`): tput c1 0.989→0.990 (+0.001 FLAT), c2 0.911→0.922 (+0.011),
+c4 0.919→0.930 (+0.011), c8 0.913→0.942 (+0.029); TPOT c1 0.986→0.987, c2 0.900→0.912, c4
+0.905→0.911, c8 0.891→0.924. The c2/c4/c8 gains are OUTSIDE per-rep noise — swap-ON's WORST rep
+beats swap-OFF's BEST rep at every one (c2 575.4>569.9, c4 961.1>958.9, c8 1462.9>1433.9); c1
+overlaps (flat). TTFT at/above parity (prefill-only, mechanically untouched by the decode swap).
+Memory win preserved (2.607→2.614x).
+
+DEFAULT DECISION = **FLIP ON** (parity-enablers-ship-as-defaults): every correctness gate holds,
+speed IMPROVES at c2/c4/c8, and there is NO regression anywhere (c1 flat, TTFT parity, memory
+win). `Fa2DecodeGqaSwapEnabled()` default OFF→ON (`cuda_paged_attn.cu`; `=0` opts out, mirroring
+`VT_V4_MHC_FUSED`). Flipped-default proof above (SACRED no-env 16/16 + smoke token-exact + nsys
+no-env grid (1,5,16)).
+
+PARITY VERDICT (MXFP4 goal) = **still BELOW-FLOOR <1.0x on tput/TPOT at every concurrency** (best
+c8 tput 0.942, 5.8% short); gate NO. RESIDUAL MAP (per-shape, named): flash closed only ~12%@c2 /
+~30%@c8 of the tput gap (below #47's optimistic 28/55% — actual flash drop was −29% not the
+projected −34%, and flash is one term of the step). What remains at c2 (per #46/#47 same-tool
+attribution): (1) **grouped-Marlin decode +7-9% per-call** — our `MoeGroupedGemmNvfp4Marlin` E=1
+uses indirect `sorted_token_ids` gather + fp32 `C_tmp` reduce vs vLLM's dense `marlin_gemm`
+direct-A addressing; per-shape parity was shown at M≤8 (#46 microbench), so this is a delicate
+grouped→dense-direct-A port, not a config knob. (2) **~0.7ms/step host/sched slice**. No single
+lever reaches ≥1.0x. NEXT lever candidate: the grouped→dense-direct-A marlin decode path.
