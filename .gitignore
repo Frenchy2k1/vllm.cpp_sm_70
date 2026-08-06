@@ -29,3 +29,7 @@ a.out
 # Per-developer environment values (copy .env.example). Machine paths and
 # hosts; the protocol's ${VLLM_SOURCE}-style placeholders resolve from here.
 .env
+
+# Logs and local capture artifacts (demo recordings, screencasts)
+*.log
+*.mp4
