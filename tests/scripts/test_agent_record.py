@@ -106,10 +106,19 @@ class AgentRecordMutationTests(unittest.TestCase):
         )
 
     def test_active_requires_claim_owner(self) -> None:
-        active = with_field(self.by_id["KERNEL-GDN-AOT-BF16"], "owner", "-")
+        # The fixture row must actually be `ACTIVE` today, or the mutation stops
+        # exercising the ACTIVE branch and the test passes vacuously. It was
+        # pinned to KERNEL-GDN-AOT-BF16 until the 2026-08-06 live-state audit
+        # moved that row to READY, so it is now picked from the live record.
+        active_id = next(
+            row.item_id
+            for row in self.rows
+            if row.state == "ACTIVE" and row.path.name == "kernel-matrix.md"
+        )
+        active = with_field(self.by_id[active_id], "owner", "-")
         require(
             validate_mutation(self.rows, active),
-            r"ACTIVE row KERNEL-GDN-AOT-BF16 has no CLAIM-\* owner",
+            rf"ACTIVE row {re.escape(active_id)} has no CLAIM-\* owner",
         )
 
     def test_implemented_state_requires_exact_code_anchor(self) -> None:

@@ -95,6 +95,28 @@ jobs:
           python3 scripts/upstream-inventory.py --check
           python3 tests/scripts/test_claim_view.py
           python3 tests/scripts/test_upstream_inventory.py
+      - name: Live-state rows are reconciled against Git reality
+        # The classifier reads its evidence from `origin/main`. This job's
+        # checkout already uses `fetch-depth: 0`, which DOES leave
+        # `refs/remotes/origin/*` behind, so the ref is present today -- the
+        # fetch makes that independent of the checkout block above rather than
+        # a standing assumption about it, and refreshes the ref besides.
+        # Without a resolvable `origin/main` the audit aborts by design
+        # (require_origin_main): "no origin/main" would otherwise read as
+        # "every ACTIVE row is abandoned", absence of information wearing
+        # absence of work's face.
+        #
+        # The refspec is EXPLICIT and forced, not a bare `git fetch origin
+        # main`. A bare fetch only updates a remote-tracking ref when a
+        # CONFIGURED `remote.origin.fetch` refspec matches, and checkout sets
+        # that config from its own inputs (at shallower settings it narrows to
+        # the triggering ref, on a PR `refs/pull/N/merge`); with no match it
+        # writes FETCH_HEAD only. Naming the refspec creates the ref whatever
+        # the checkout is configured to do.
+        run: |
+          git fetch -q origin +refs/heads/main:refs/remotes/origin/main
+          python3 scripts/audit-live-rows.py --check
+          python3 tests/scripts/test_audit_live_rows.py
   documentation-checkpoint:
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.

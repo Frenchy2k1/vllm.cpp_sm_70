@@ -153,6 +153,20 @@ landing page into a status log.
 | `BLOCKED` | External dependency prevents progress | Concrete blocker + unblocking condition |
 | `ANCHOR-BACKFILL` | Legacy code exists but the new evidence contract is incomplete | Honest working-scope note; cannot count as `DONE` |
 
+**`ACTIVE` carries a Git precondition, and it is GATED.**
+`scripts/audit-live-rows.py --check` runs in `scripts/agent-preflight.sh` and in
+CI, and it fails the whole repo when any row sits in `ACTIVE` with neither a
+`row/<ID>` branch carrying commits not yet on `origin/main`, nor a commit
+already on `origin/main` naming the row ID as a whole token. So materialize the
+claim (worktree + `row/<ID>` branch) before you write `ACTIVE`, and name the
+stable row ID in every commit message for that row. **When the gate is red, the
+answer is never to relax it:** either the work is real, in which case it needs
+its `row/<ID>` branch, or the row does not belong in `ACTIVE` and moves to the
+state its evidence actually satisfies (`READY` is the legality floor — see
+[specs/live-state-audit-2026-08-06.md](specs/live-state-audit-2026-08-06.md)).
+Nothing in the record teaches this reflex by example yet: zero rows currently
+classify `IN-FLIGHT`, and zero reach `LANDED` through a branch.
+
 Support inventories retain `DONE` rows permanently. When a roadmap execution
 block has no open rows, archive its plan/report under `completed/` and point the
 portfolio row at that archive; do not erase current support evidence.

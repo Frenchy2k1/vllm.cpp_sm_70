@@ -36411,6 +36411,107 @@ dequant reference at M=1 AND M=8 (RED-first) to pinpoint; then re-gate e2e, then
 Box left clean (locks released, tmux killed, GPU idle, disk 27G). Build tree persists at
 dgx:~/work/mxfp4-w2 for the continuation.
 
+## Live-state audit APPLIED: the 10 unevidenced `ACTIVE` rows vacated, 11 dead claims retired, 9 amended — the record's ACTIVE set is now Git-supportable
+<!-- state: 2026-08-06T23:45 -->
+
+P0 step 6 of the live-state audit ([live-state-audit-2026-08-06.md](specs/live-state-audit-2026-08-06.md)).
+The census found 54 rows claiming `ACTIVE` at once, NOT ONE with an unmerged `row/<ID>`
+branch, and 10 with zero commits and zero branches on any ref. Those 10 are corrected here,
+one matrix per commit: engine 3, model 3, kernel 2, quantization 1, backend 1.
+
+RE-FETCH FIRST: the artifact pinned `origin/main` at `cf32c619` and the remote had advanced
+to `828f6420`. `scripts/audit-live-rows.py --json` was re-run against the new ref and returned
+EXACTLY the same 10 IDs, so the artifact's list was applied, not a stale one.
+
+WHAT `ABANDONED` MEANS, AND WHAT IT DOES NOT. It is a statement about GIT: no `row/<ID>` branch
+and no commit on `origin/main` naming the stable ID. It is NOT a finding that the work is
+unstarted — every one of the ten asserts a passing gate in its own anchors (`ENG-MM-AUDIO-ENCODER`
+A2 203/203; `MODEL-MM-voxtral-…` audio→text 14/14; `BACKEND-DISTRIBUTED-TP` CPU multi-rank 60/60;
+`MODEL-TEXT-glm4-…` SACRED 16/16). The real defect is that the commits never named the row ID.
+So all ten went to `READY`, which is the state contracts' LEGALITY FLOOR (all ten resolve a real
+spec naming their token), explicitly NOT a semantic verdict. Choosing between `READY`, `PARTIAL`,
+`GATING` and `DONE` needs a human reading each row's anchors against gate output; the audit
+refused to guess and so does this change. Only the `State` and `Owner` cells moved — `Our code`,
+`Tests/evidence`, `Upstream` and `Spike/spec` are durable anchors and are untouched.
+
+THE COUPLED CLAIM OBLIGATION. `check_row_contracts` fails a claim referencing a non-`SPIKE`/`ACTIVE`
+row AND fails a claim with no row IDs, so the claim surface had to move in the SAME commit as each
+matrix edit. `parse_active_claims` keys on a line starting with `` | `CLAIM- ``, so a claim moved to
+a table row elsewhere is STILL parsed as active — retirement therefore follows the repo's existing
+prose-bullet convention under "Closing and archival", each with its recorded outcome. RETIRED 11
+(reference only abandoned rows): CLAIM-MULTIMODAL-M1, -M3C, -TOWER-FIDELITY, CLAIM-AUDIO-ENCODER,
+CLAIM-GEMMA4-G1/-G2/-G2-IMPL/-G3/-MM-E2E, CLAIM-PR3, CLAIM-TRITON-AOT-PER-ARCH. AMENDED 9 (also hold
+live rows, so retiring them would strand those): CLAIM-GEMMA4-G1B, CLAIM-GEMMA4-MULTIMODAL,
+CLAIM-MULTIMODAL-TRACK, CLAIM-GLM-DSA-LATEST-DEEPSEEK, CLAIM-AUDIO-E2E, CLAIM-DEEPSEEK-V4-W8,
+CLAIM-PARALLELISM-MODES-SPIKE, CLAIM-SCALE-OUT-SPIKE, CLAIM-SCALE-OUT-W2. One row
+(`MODEL-MM-gemma4-mm-…`) was claimed EIGHT times over; `BACKEND-DISTRIBUTED-TP` three times.
+
+COUPLED DERIVED VIEWS, moved in the same commits because CI gates them: the engine area rollup
+(Engine and scheduling `ACTIVE` 9→6, `READY` 0→3); the model rollup (`ACTIVE` 10→7, `READY` 3 added)
+and three architecture-support marks ✅→🚧, because `check-model-checklist` allows ✅ only for
+DONE/ACTIVE/GATING/PARTIAL — the mark the contract permits at `READY`, NOT a claim that those models
+regressed. `tests/scripts/test_agent_record.py` had its ACTIVE-owner mutation fixture PINNED by
+stable ID to `KERNEL-GDN-AOT-BF16`, so the transition made it stop exercising the ACTIVE branch; it
+now picks a live `ACTIVE` kernel row from the record. The assertion is unchanged and
+`check-agent-record.py` was not touched — the record was repaired, the checker was not weakened.
+
+VERIFIED after every commit: `check-agent-record.py` rc=0 and `agent-preflight.sh` rc=0, with the
+abandoned count dropping by exactly the rows corrected in that matrix (10→7→4→2→1→0).
+`audit-live-rows.py --check` now exits 0.
+
+CONSEQUENCE A HELPER MUST NOT MISREAD: `ready-for-helper.py` offers `READY` rows, so its queue went
+4 → 10 and SIX of the new entries are these audit-vacated rows. Their anchors assert LANDED,
+gated work. A helper picking one as greenfield would redo it. NOW.md carries the warning; the
+durable fix is the human state adjudication the audit deferred.
+
+DELIBERATELY OUT OF SCOPE (user-directed), and still visible in the artifact: the 44 `LANDED`
+`ACTIVE` rows (every verdict rests on a commit merely MENTIONING the ID, and 8 of those commits
+changed no code, so `LANDED` is not evidence of completion — none is touched); the ~30 vague
+`PARTIAL` rows (the repair is editorial and needs per-row knowledge); and the 2 duplicate live IDs
+`BACKEND-CPU` / `BACKEND-CUDA-SM121` (ownership decided in the artifact, deliberately not applied).
+
+
+## FOLLOW-UP OWED — the live-rows gate self-blinds on the 10 rows it just repaired; `ACTIVE` precondition now in workflow.md
+<!-- state: 2026-08-06T23:55 -->
+
+Whole-branch review of `spec/issue-native-tracking`, records/prose repairs only, no tool logic changed.
+
+**THE HAZARD (named follow-up, NOT fixed here).** `audit-live-rows.py:main_commits()` credits `LANDED`
+to any commit on `origin/main` whose MESSAGE names the row ID — there is no code-touch discriminator.
+Record commits in this repo routinely name row IDs, so the gate's discriminating power decays with
+every records-only commit. Measured on this branch: **9 of the 10 vacated IDs are named in this
+branch's OWN commit messages** (all but `MODEL-MM-gemma4-mm-…`; `BACKEND-DISTRIBUTED-TP` and
+`ENG-MM-AUDIO-ENCODER` twice each). A squash concatenates those messages, so merging does not shed
+them. Once they land on `origin/main`, `main_commits()` is non-empty for those nine FOREVER and
+`--check` can never flag them abandoned again — including if someone re-flips one to `ACTIVE` with no
+work behind it. The gate keeps full force on every row it has not yet fired on; it spent itself
+exactly on the ten it repaired.
+
+**THE KNOWN FIX, and why it is deferred.** Filter `main_commits()` by whether the commit touched
+`src/`/`include/`/`tests/`/`cmake/`/`scripts/` — the discriminator the artifact already computed
+(§➁ splits the 44 `LANDED` verdicts 36 code-touching / 8 records-only). Applying it TODAY flips those
+8 records-only-backed `LANDED` rows to `ABANDONED` and turns the standing preflight+CI gate RED for
+everyone. Vacating 8 more rows is a correction that needs its own evidence and its own decision; it
+must not ride in on a tool tweak. Recorded in `.agents/specs/live-state-audit-2026-08-06.md` §➁a.
+NEXT: adjudicate those 8 rows (`BACKEND-CUDA-OTHER`, `BACKEND-CUDA-SM087`, `BACKEND-CUDA-SM110`,
+`BACKEND-MLX`, `KERNEL-GEMM-CPU-ELEM`, `MODEL-SPEC`, `MODEL-TEXT-deepseek-v2-…`,
+`MODEL-TEXT-kimi-linear-…`) against their own anchors, THEN land the path filter with them.
+
+**PROSE CAUGHT UP WITH THE GATE.** The gate shipped in `5d8ed26d` imposing a repo-wide precondition
+nothing an agent reads stated: `ACTIVE` requires a `row/<ID>` branch with unmerged commits, or a
+commit on `origin/main` naming the ID. `.agents/workflow.md` (Tabular lifecycle) now states it and
+states that a RED gate is never relaxed — either the work is real and needs its branch, or the row
+leaves `ACTIVE`. The trap was live: 0 rows classify `IN-FLIGHT` and 0 reach `LANDED` via a branch, so
+no agent working today has the reflex. `check-protocol-consistency.py` green (the contract block is
+untouched).
+
+Also: `docs/FEATURES.md` said the audit moved "3 model, 1 quantization, 1 backend" — it moved **10**
+(3 model, 3 engine, 2 kernel, 1 quant, 1 backend), and the two engine rows behind the public
+`Video`/`Audio ✅ correctness-gated` marks (`ENG-MM-VIDEO-FORWARD`, `ENG-MM-AUDIO-ENCODER`) are among
+them; the reasoning that keeps those marks ✅ is now written down, no mark demoted. `sglang-matrix.md`
+holds **0** live rows, not a share of 11 (its lifecycle column is `Class`, not `State`) — corrected in
+the tool comment and the artifact; it stays in `AUDIT_MATRIX_PATHS` for free future coverage.
+
 ## MODEL-TEXT-kimi-linear: bf16-resident loader/forward POOL MATH + grounded design (§13); implementation scoped, PENDING
 <!-- state: 2026-08-07T00:30 -->
 
