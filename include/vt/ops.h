@@ -331,6 +331,13 @@ enum class OpId : uint8_t {
   // BYTE-EXACT (sequential reductions) to the host Laguna forward. Additive: only
   // LagunaForwardResidentDecode dispatches it. Appended before kCount (no id shift).
   kLaguna,
+  // DENSE Marlin W4A16 GEMM (lift of vLLM's own dense marlin.cu marlin_gemm; see
+  // MarlinDenseGemm below). Byte-preserving replacement for the single-expert
+  // MoE-marlin route the dense E=1 NVFP4/MXFP4 projections use today — direct-A,
+  // tile-per-CTA, vLLM's own dense fp32-C_tmp reduce (no par regrouping ULP).
+  // CUDA-only (Blackwell sm_12xa; vendored dense marlin TUs, VT_MARLIN_NVFP4).
+  // Appended before kCount (no existing op's id shifts).
+  kMarlinDenseGemm,
   kCount
 };
 
@@ -738,6 +745,25 @@ struct MoeMarlinArgs {
 using MoeGroupedGemmNvfp4MarlinFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, Tensor&,
              const Tensor&, const Tensor&, const Tensor&, const Tensor&, const MoeMarlinArgs&);
+// DENSE Marlin W4A16 GEMM (lift of vLLM's own dense marlin_gemm; see
+// MarlinDenseGemm below). Scalar params travel in MarlinDenseArgs. Unlike the
+// MoE path there is NO moe_align gather (sorted_token_ids/expert_ids/top_k):
+// `a` is a plain [size_m, size_k] contiguous activation (lda = size_k).
+struct MarlinDenseArgs {
+  int size_m = 0;  // number of tokens (rows of `a`)
+  int size_n = 0;  // output features
+  int size_k = 0;  // input features (contraction; multiple of 16)
+  // Block-scale format selector, identical semantics to MoeMarlinArgs: default =
+  // NVFP4 (fp8-e4m3 scales, group 16, per-tensor global scale). group_size 32 +
+  // mxfp4=true selects the MXFP4 path (E8M0 scales, group_blocks 2, NO global
+  // scale; the `global_scale` tensor is ignored). Mirrors vLLM's is_nvfp4 branch.
+  int group_size = 16;
+  bool mxfp4 = false;
+};
+using MarlinDenseGemmFn =
+    void (*)(Queue&, Tensor& /*c*/, const Tensor& /*a*/, const Tensor& /*b_q_weight*/,
+             const Tensor& /*b_scales*/, const Tensor& /*global_scale*/, Tensor& /*workspace*/,
+             const MarlinDenseArgs&);
 using MoeSiluMulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). These replace host-side
 // loops so the decode step can run entirely on-device (CUDA-graph capture).
@@ -1355,6 +1381,24 @@ void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tenso
                                Tensor& workspace, const Tensor& sorted_token_ids,
                                const Tensor& expert_ids, const Tensor& num_tokens_past_padded,
                                const Tensor& topk_weights, const MoeMarlinArgs& args);
+
+// MarlinDenseGemm (lift of vLLM's DENSE marlin_gemm, marlin.cu:545 -> marlin_mm
+// at :326 — the byte-preserving dense W4A16 kernel vLLM itself ships for a16
+// weight-only linears). One launch computes y = a @ dequant(b).T with vLLM's own
+// direct-A, tile-per-CTA layout and dense fp32-C_tmp reduce — NOT the MoE
+// single-expert route, whose par regrouping of the reduce costs one bf16 ULP.
+//   c            [size_m, size_n]         bf16 (out)
+//   a            [size_m, size_k]         bf16 (token hidden; contiguous, lda=size_k)
+//   b_q_weight   [size_k/16, size_n*8/pack] i32 — Marlin-interleaved fp4 (SAME
+//                repack as the MoE path: marlin_permute; a shim is added only if
+//                a layout divergence is proven — see dense_nvfp4_gemm.h)
+//   b_scales     [size_k/group_size, size_n] fp8 (processed marlin scales)
+//   global_scale [1]                      f32 (nvfp4 only; ignored for mxfp4)
+//   workspace    [>= sms]                 i32 (zeroed reduction locks)
+// CUDA-only (Blackwell sm_12xa; needs the vendored dense Marlin TUs, VT_MARLIN_NVFP4).
+void MarlinDenseGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,
+                     const Tensor& b_scales, const Tensor& global_scale, Tensor& workspace,
+                     const MarlinDenseArgs& args);
 
 // out[R,I] = silu(gate[R,I]) * up[R,I]  (moe-semantics.md §4; the fused-MoE
 // element-wise activation between the grouped gate/up and down GEMMs). gate/up

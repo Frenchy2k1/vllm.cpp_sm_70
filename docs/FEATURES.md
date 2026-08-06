@@ -65,7 +65,7 @@ are our reading of their documented behavior, not measurements.
 | GGUF k-quants and i-quants | ✅ | ☐ | ☐ | ✅ |
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
-| MXFP4 compressed-tensors | ◐ W4A16 Marlin compute proven; mem 2.6x less. gate_up FUSION + decode-graph default-ON (marlin 180->144 GEMM/step, vLLM-structural); #44 3/3, 32B 142/142. Residual = marlin CTA (`VT_MARLIN_E1_PAR1` opt-in), <1.0x | ✅ | ✅ | ☐ |
+| MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.6x less. gate_up FUSION + decode-graph default-ON (180->144 GEMM/step); #44 3/3, 32B 142/142. Residual = marlin CTA; byte-preserving `KERNEL-MARLIN-DENSE-PORT` landed gated-OFF, GPU gates pending | ✅ | ✅ | ☐ |
 | fp8 weights | ✅ | ✅ | ✅ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |

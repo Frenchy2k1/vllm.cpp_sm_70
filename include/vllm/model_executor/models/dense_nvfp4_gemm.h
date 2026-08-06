@@ -103,6 +103,24 @@ inline bool FusedGateUpEnabled() {
   return on;
 }
 
+// VT_MARLIN_DENSE (default OFF): route the E=1 dense NVFP4/MXFP4 projections through
+// vLLM's OWN dense marlin GEMM (vt::MarlinDenseGemm) instead of the single-expert
+// MoE-marlin route. The dense kernel is direct-A + tile-per-CTA with vLLM's dense
+// fp32-C_tmp reduce, so at M<=8 it naturally runs the 48-CTA (sms-wide) grid the MoE
+// path only reaches with the VT_MARLIN_E1_PAR1 clamp — WITHOUT that clamp's par
+// regrouping, which costs one bf16 ULP vs the oracle and flips a strict 32B token
+// (row QUANT-CT-MXFP4-MARLIN-STRUCT / #50 / #54). Same resident weights + workspace;
+// the repack permute is vLLM's shared marlin_permute for both dense and MoE. Default
+// OFF until the strict-gate battery + binding prove it byte-matches the oracle
+// everywhere and beats the MoE route; then flipped ON per parity-enablers.
+inline bool MarlinDenseEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MARLIN_DENSE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 // --- Execution counters (the "this path actually RAN" positive signal) ------
 // A passing correctness gate does NOT prove a new code path was exercised — a
 // mis-wired dispatch that silently fell back to the BF16 arm would also pass if
@@ -113,6 +131,7 @@ struct Nvfp4W4A16Stats {
   uint64_t marlin_gemms = 0;      // MatmulNvfp4MarlinD launches
   uint64_t fused_gate_up = 0;     // GateUpFusedMarlinD launches (one per MLP)
   uint64_t fallback_gemms = 0;    // naive vt::MatmulNvfp4 / CPU dequant launches
+  uint64_t dense_gemms = 0;       // vt::MarlinDenseGemm launches (VT_MARLIN_DENSE route)
 };
 
 inline Nvfp4W4A16Stats& MutableW4A16Stats() {
@@ -336,9 +355,33 @@ inline DBuf MatmulNvfp4MarlinD(Dev d, const Tensor& x, const Nvfp4Weight& w,
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
   MarlinDenseResident& mr = MarlinDenseResidentFor(&w);
   if (!mr.ready) BuildMarlinDenseResident(d, w, mr);
-  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   int sms = 0;
   void* ws = DenseMarlinWorkspace(d, &sms);  // zeroed once; kernel self-resets
+
+  // VT_MARLIN_DENSE (default OFF): route through vLLM's OWN dense marlin GEMM.
+  // Same resident (mr.w/mr.s/mr.g) + workspace; rank-2 operand views (the dense
+  // launcher wants [K/16, N*2] / [K/gs, N], not the MoE rank-3 [1, ...]); NO
+  // moe_align cache (direct-A). Byte-preserving vs the oracle (its own dense
+  // fp32-C_tmp reduce). Only when the op is realized for this device.
+  if (MarlinDenseEnabled() &&
+      vt::OpRegistered(vt::OpId::kMarlinDenseGemm, d.q.device.type)) {
+    ++MutableW4A16Stats().dense_gemms;
+    DBuf outbf(d, DType::kBF16, {M, N});
+    Tensor wqd = MakeTensor(mr.w, DType::kI32, d.q.device, {K / 16, N * 2});
+    Tensor scd = MakeTensor(mr.s, DType::kI8, d.q.device, {K / w.group_size, N});
+    Tensor ggd = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
+    Tensor wstd = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
+    vt::MarlinDenseArgs dargs{static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)};
+    dargs.group_size = static_cast<int>(w.group_size);
+    dargs.mxfp4 = w.is_mxfp4;
+    vt::MarlinDenseGemm(d.q, outbf.t(), x, wqd, scd, ggd, wstd, dargs);
+    if (out_dtype == DType::kBF16) return outbf;
+    DBuf out(d, DType::kF32, {M, N});
+    vt::CastF32(d.q, out.t(), outbf.t());
+    return out;
+  }
+
+  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   ++MutableW4A16Stats().marlin_gemms;
 
   // Marlin's output is bf16 (c_type=kBFloat16); an f32 result is the bf16 output
@@ -473,9 +516,31 @@ inline DBuf GateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
   const int64_t M = x.shape[0], K = x.shape[1], N = gw.n;
   MarlinDensePairResident& mr = MarlinDensePairResidentFor(&gw);
   if (!mr.ready) BuildMarlinDensePairResident(d, gw, uw, mr);
-  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   int sms = 0;
   void* ws = DenseMarlinWorkspace(d, &sms);  // zeroed once; kernel self-resets
+
+  // VT_MARLIN_DENSE (default OFF): fused gate_up over the 2N-concatenated operand
+  // via vLLM's OWN dense marlin GEMM. Same merged resident (mr.w/mr.s/mr.g), rank-2
+  // views, no moe_align; byte-preserving reduce. Only when the op is realized here.
+  if (MarlinDenseEnabled() &&
+      vt::OpRegistered(vt::OpId::kMarlinDenseGemm, d.q.device.type)) {
+    ++MutableW4A16Stats().dense_gemms;
+    DBuf gud(d, DType::kBF16, {M, 2 * N});
+    Tensor wqd = MakeTensor(mr.w, DType::kI32, d.q.device, {K / 16, 2 * N * 2});
+    Tensor scd = MakeTensor(mr.s, DType::kI8, d.q.device, {K / gw.group_size, 2 * N});
+    Tensor ggd = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
+    Tensor wstd = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
+    vt::MarlinDenseArgs dargs{static_cast<int>(M), static_cast<int>(2 * N),
+                              static_cast<int>(K)};
+    dargs.group_size = static_cast<int>(gw.group_size);
+    dargs.mxfp4 = gw.is_mxfp4;
+    vt::MarlinDenseGemm(d.q, gud.t(), x, wqd, scd, ggd, wstd, dargs);
+    DBuf actd(d, DType::kBF16, {M, N});
+    vt::SiluAndMul(d.q, actd.t(), gud.t());
+    return actd;
+  }
+
+  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
   ++MutableW4A16Stats().fused_gate_up;
 
   DBuf gu(d, DType::kBF16, {M, 2 * N});
