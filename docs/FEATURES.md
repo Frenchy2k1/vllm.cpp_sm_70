@@ -56,6 +56,8 @@ are our reading of their documented behavior, not measurements.
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |
 | Prefix-cache matching unit | ◐ resolver only | ✅ | ☐ | ☐ |
 | Compute directly on quantized blocks | ✅ | ☐ | ☐ | ✅ |
+| Automatic memory sizing (no hand-tuned budget) | ☐ hand-typed block count | ☐ percent, hand-tuned | ☐ | ◐ |
+| Memory cap with a pre-flight error instead of an OOM | ☐ | ◐ KV pool only | ◐ | ☐ |
 
 ## Quantization and weight formats
 
@@ -246,6 +248,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 | Embedding / reranking models | Engine side only | Pooler and runner path landed, no model architecture registered |
 | ROCm, XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan only |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
+| Memory budgeting (`ROAD-V1-MEM`, #83) | Scoped, spike owed | No profiling; KV pool is a hand-typed `--num-blocks`. Target: auto-size to the declared workload, optional total-footprint cap, refuse before allocating |
 
 ## How to read this page
 

@@ -393,51 +393,53 @@ The correctness form and the full D0-D14 measured chronology live in
 
 ## Not supported yet
 
-LoRA (W1 CPU runtime brick landed — see the capability table; not yet usable
-end-to-end), multi-GPU, Vulkan (gated skeleton: 8 of the CPU backend's 83 ops,
-no model runs; [campaign](../.agents/specs/vulkan-full-support.md)), and the
-full tool-calling template surface. **Scale-out /
-distributed execution is scoped but unbuilt** (spike, 2026-07-28): the engine is
-single-GPU today (verified — no NCCL / tensor-parallel / process-group code in
-`src/`). A single-dimension design is on record covering all three legs —
+LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
+Vulkan (gated skeleton: 8 of the CPU backend's 83 ops, no model runs;
+[campaign](../.agents/specs/vulkan-full-support.md)), and the full tool-calling
+template surface. **Scale-out / distributed execution is scoped but unbuilt**
+(2026-07-28): the engine is single-GPU today — no NCCL / tensor-parallel /
+process-group code in `src/`. One `vt::` collective / process-group abstraction with
+backend-specific transports (NCCL / RDMA / MLX-ring) covers all three legs —
 multi-GPU tensor+pipeline parallel, multiple DGX Sparks over the ConnectX-7
 200GbE RoCE/RDMA cable (the path that lets DeepSeek-V4-Flash fp8 ~167 GiB run
-across 2×119 GiB Sparks), and MLX multi-node over Thunderbolt — all expressed
-ONCE against one `vt::` collective / process-group abstraction with
-backend-specific transports (NCCL / RDMA / MLX-ring), mirroring vLLM's
-`device_communicators`. `world_size==1` stays byte-identical. **W1 landed
-(2026-07-28) the collective ABSTRACTION leg**: `vt::Communicator`
-(`include/vt/communicator.h` + `src/vt/communicator.cpp`) with
-AllReduce/AllGather/Send/Recv, proven by a CPU in-process multi-rank gate
-(`tests/vt/test_communicator.cpp`, a real cross-rank sum, no GPU) and a
-byte-identical `world_size==1` no-op. **W2 landed (2026-07-28) same-host
-multi-GPU tensor parallel (CPU-gated)**: the multi-device backend registry
-(per-`Device{type,index}`, byte-neutral device 0), collective `OpId` routing, the
-NCCL transport (mirrors `pynccl.py`, built only under `-DVLLM_CPP_NCCL=ON`), and
-`TensorParallel` wired into the Qwen3-dense forward — the sharded-matmul +
-all-reduce is proven **equal to the unsharded tp=1 forward** (`test_tp_forward`,
-60/60, RED-verified, no GPU); `tp_size==1` byte-identical. The **real TP-2
-multi-GPU RUN + the NCCL build-verify remain HW-blocked** (no ≥2-GPU box), as do
-pipeline parallel, multi-Spark and MLX. Full scope + seam map + the 2× RTX-6000-Ada
-recipe:
+across 2×119 GiB Sparks), and MLX multi-node over Thunderbolt — mirroring vLLM's
+`device_communicators`; `world_size==1` stays byte-identical. Two legs landed
+CPU-gated (2026-07-28): `vt::Communicator` collectives proven by an in-process
+multi-rank cross-rank sum, and same-host multi-GPU tensor parallel (multi-device
+backend registry, collective `OpId` routing, the NCCL transport behind
+`-DVLLM_CPP_NCCL=ON`, and `TensorParallel` in the Qwen3-dense forward proven
+**equal to the unsharded tp=1 forward**; `tp_size==1` byte-identical). The
+**real TP-2 multi-GPU RUN + the NCCL build-verify remain HW-blocked** (no ≥2-GPU
+box), as do pipeline parallel, multi-Spark and MLX. Scope, seam map and
+per-attempt narrative:
 [.agents/specs/scale-out-distributed.md](../.agents/specs/scale-out-distributed.md).
 Every parallelism MODE vLLM has (tensor / pipeline / data / expert / sequence /
-context parallel) is now enumerated and grounded in upstream source, mapped onto
-that one abstraction and priority-ranked, in
+context parallel) is enumerated, upstream-grounded and priority-ranked in
 [.agents/specs/parallelism-modes.md](../.agents/specs/parallelism-modes.md)
-(2026-07-28) — with the honest note that vLLM's "sequence parallel" is a
+— with the honest note that vLLM's "sequence parallel" is a
 tensor-parallel compilation pass, not a separate parallel axis.
 Multimodal
-(image/video/audio) is correctness-complete; its OpenAI-server wiring has landed
-all three CPU bricks (content-part parse + processor routing; the engine
-mm-request plumbing — `add_request(MultiModalInputs)` on both engines, default-inert
-to the text path; and the W3 `MultiModalChatFn` seam BODY that renders an image
-chat request into the placeholder-EXPANDED engine input, wired into the production
-server). It is not yet servable end-to-end: the closing GPU gate `MM-SERVE-E2E` is
-architecturally blocked on the engine model runner having no multimodal forward
+(image/video/audio) is correctness-complete and its OpenAI-server wiring has
+landed all three CPU bricks (content-part parse + processor routing, the
+default-inert engine mm-request plumbing, and the `MultiModalChatFn` seam body
+rendering an image chat request into the placeholder-EXPANDED engine input).
+It is not yet servable end-to-end: the closing GPU gate `MM-SERVE-E2E` is
+blocked on the engine model runner having no multimodal forward
 (the vision tower + merge lives in the standalone M2c driver, not in
 `ModelRegistry::Forward`) — folding that forward into the registered engine path is
 the named residual (`.agents/specs/mm-serving.md`).
+
+**Memory budgeting is manual and behind vLLM** (`ROAD-V1-MEM`,
+[#83](https://github.com/mudler/vllm.cpp/issues/83), scoped 2026-08-06): there is
+no memory profiling, and none of upstream's three `config/cache.py` knobs is
+exposed. The KV pool is a raw block count typed by hand
+(`EngineParams::num_blocks = 256`, `--num-blocks`, `vllm_model_params.num_blocks`),
+so sizing a run means converting free bytes, context and concurrency into blocks
+yourself. Target shape, rowed in
+[.agents/roadmap_v1.md](../.agents/roadmap_v1.md) (`kv-sizing` spike owed):
+auto-size to the declared workload by default, cap the TOTAL engine footprint
+when asked, refuse before allocating with a computed remedy breakdown rather
+than an OOM.
 
 **Open, not root-caused (observed 2026-07-28):** the C-ABI custom logits
 processor case (`tests/capi/test_capi.cpp:410`, ABI v8) SIGSEGVs in a CUDA build
