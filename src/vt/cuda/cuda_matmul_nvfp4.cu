@@ -79,7 +79,20 @@ bool WmmaEnabled() {
     const char* e = std::getenv("VT_NVFP4_WMMA");
     return e == nullptr || (e[0] != '0');
   }();
-  return on;
+  // ARCH TERM (required, not an optimisation). Every WMMA body this predicate
+  // selects is compiled `#if __CUDA_ARCH__ >= 800` with an `#else __trap()`
+  // (bf16 WMMA fragments are Ampere+), while all six call sites are otherwise
+  // host-side shape/env tests — so on a pre-Ampere board they would select a
+  // trap. Folded in HERE rather than at each call site because every one of the
+  // six means the same thing ("take the bf16 tensor-core path"), and each already
+  // has a CUDA-core fallthrough (naive / tiled / split-K) that is
+  // correctness-grade. Queried live rather than cached in the static above: the
+  // device context need not exist at static-init time, and a wrong value latched
+  // there would be unrecoverable. Fails safe: caps invalid -> CUDA-core path. On
+  // sm_80+ this is always true, so gate-model selection is unchanged.
+  // See .agents/specs/cuda-arch-breadth-fp16.md §V0-b / W1c.
+  const DeviceCaps& caps = GetDeviceCaps();
+  return on && caps.valid && caps.sm_major >= 8;
 }
 
 // M=1/decode-path 128-bit vectorized fp4 weight loads (A/B; default ON). Set
@@ -1413,6 +1426,9 @@ template <typename Tout>
 void LaunchGroupedBf16(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                        const Tensor* row_map, const Tensor& weight_ptrs, int64_t p, int64_t n,
                        int64_t k, int64_t e_count) {
+  // The <sm_80 arch term lives inside WmmaEnabled(), so this branch (and the
+  // other five call sites) route to the WMMA-free naive / split-K path on a
+  // pre-Ampere board without a local check.
   if (p < kTileMinRows || !WmmaEnabled()) {
     const int64_t y = p < 65535 ? p : 65535;
     constexpr int kBlock = 256;

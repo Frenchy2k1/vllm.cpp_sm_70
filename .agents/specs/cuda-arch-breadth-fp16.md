@@ -428,7 +428,8 @@ until a card exists.
 | W1 ✅ **DONE** | guard the bf16-WMMA TU | `#if __CUDA_ARCH__ >= 800` wraps the bodies of all 5 bf16-WMMA prefill kernels (`cuda_paged_attn.cu:732,958,1197,1472,1716`; `#else __trap()`), so `__CUDA_ARCH__ < 800` compiles the TU selecting the existing scalar path. **Build-verified (dgx nvcc 13.0.88 + cutlass 4.5.0, base `034be66e`):** single-arch `75` `-Werror=all-warnings` 0-warn EXIT=0, `cuobjdump -lelf` → real `cuda_paged_attn.cu.1.sm_75.cubin`; the `:1797 __nv_bfloat16 fragment` error GONE (RED: unguarded HEAD FAILS 21 errors). GB10 sm_121a byte-identical — same TU `-Werror` 0-warn AND 0 SASS instruction diffs vs unguarded. NO Turing board ran it | DONE — (mechanical, nvcc 13) |
 | W1a ✅ **DONE** | **V0 full-library compile audit** — every unconditionally-built CUDA TU compiled at `sm_75`, failures enumerated and classified. **MEASURED 2026-08-06 (base `249697b7`, dgx nvcc 13.0.88): 20 TUs, 18 PASS (0 err / 0 warn), 2 FAIL** (`cuda_gdn.cu` 110 errors, `cuda_matmul_nvfp4.cu` 10). All 8 fast-path FEATURE-TABLE cells confirmed DISABLED at `75`, bounding the surface at the `CMakeLists.txt:896-916` list. Compile-only, no GPU. Full detail + classification in §V0 | DONE — nvcc 13, no card |
 | W1b ✅ **DONE** | **finish the guard set.** `cuda_gdn.cu`: both `WmmaCfg` specializations' members guarded (bf16 fragments AND the tf32 alias block — a lookup failure at the alias, so a body-only guard does NOT compile), 8 device bodies guarded `#if __CUDA_ARCH__ >= 800` / `#else __trap()`, plus the `V128<T>` staging helpers and `WyMerge`. `cuda_matmul_nvfp4.cu`: 5 WMMA bodies guarded, TU left compiled for every arch (see the §V0-b correction — gating it on `fp4-mma` would have stripped the generic bf16 MoE GEMMs from `sm_80/90a/100a/110`). **VERIFIED (dgx nvcc 13.0.88): `sm_75` 20/20 TUs PASS, 0 errors 0 warnings** (was 18/20). **`sm_121a` byte-identity HELD:** both TUs `-Werror=all-warnings` 0-warn, `cuda_gdn.cu` SASS bit-identical across 824,704 lines, `cuda_matmul_nvfp4.cu` **zero instruction-level diffs** (all 148 differing lines are `Function :` headers carrying the anon-namespace hash, which shifts on any edit — same artifact W1 recorded). NO board ran any of it | DONE |
-| W2 | port `fattn-tile`+`fattn-vec` fp16 body | new `cuda_paged_attn_fp16.cu`, 1:1 from `fattn-tile.cuh`/`fattn-vec.cuh:21`; fp16 accum + `sm_61` fp32 variant; C1 numerics vs CPU oracle | W1b |
+| W1c ✅ **DONE** | **arch-gate the SELECTORS — the guards alone were a live trap.** W1/W1b made the WMMA bodies compile on `<sm_80` behind `__trap()`, but every predicate that SELECTS them was host-side only (shape/dtype/env), so a pre-Ampere board would still pick a trapping kernel. Three chokepoints, each now requiring `DeviceCaps::sm_major >= 8` and each falling through to an EXISTING portable path: (a) `cuda_paged_attn.cu:2611` → `LaunchPrefillFlash` (CUDA-core register-tiled flash); (b) `cuda_gdn.cu:5359` `GdnPrefillKernelCuda` → `GdnScanCuda` (sequential scan) — the single chokepoint, since all 7 guarded GDN launches live in `LaunchChunkedPrefill`, itself reached only from there, and the `TSc=float` instantiations use the TF32 `WmmaCfg` so f32 is not a way around it; (c) `cuda_matmul_nvfp4.cu` `WmmaEnabled():77` → naive/tiled/split-K. (c) is folded into the predicate itself rather than its six call sites because all six mean the same thing and each already has a CUDA-core fallthrough; it is queried LIVE, not latched in the static env cache, since the device context need not exist at static-init time. All three fail safe (caps invalid → portable). **VERIFIED (dgx nvcc 13.0.88): all 3 TUs `-Werror=all-warnings` rc=0 0-warn at BOTH `sm_75` and `sm_121a`; `sm_121a` SASS IDENTICAL for all three** (933,178 + 825,294 + 137,542 lines, anon-namespace hash normalized) — host-side change, device code untouched. NO board ran it | W1b |
+| W2 | port `fattn-tile`+`fattn-vec` fp16 body — **RESCOPED to a SPEED brick by W1c.** The bf16-WMMA path is only `is_prefill && d == 256 && bf16 q+KV` (`cuda_paged_attn.cu:2611`); all decode and every other prefill shape already run portable kernels, and W1c routes the d=256 case to `LaunchPrefillFlash` on `<sm_80`. So pre-Ampere CORRECTNESS is covered by paths that exist today, and this port buys prefill throughput only. ~2,000 lines adapted from llama.cpp's contiguous KV to our paged block-table layout, against a floor (llama.cpp on-card) that needs hardware we do not have. **Do this only for a genuine speed claim on T4/V100, and only once a card is reachable** | W1b; hardware for any payoff |
 | W3 | FEATURE-TABLE + tactic registration | `fattn-fp16` feature row + `sm_75/70/61/60` cells; register `fattn-fp16-tile/vec` tactics; selector arch term at `:2562`; `CudaArchFeaturesTest.cmake` + registry-selection tests | W2 |
 | W4 | **Turing derive-and-ship** | `sm_75` `-Werror` build + `cuobjdump` SASS proof; row → `DERIVED+BUILD-VERIFIED (testing-welcome)`; labeled untested | W3, nvcc 13 (**doable now**) |
 | W5 | wire a `<13` toolkit | provision CUDA 12.x; Volta/Pascal build-verify (`70`/`61`/`60` SASS); those rows → `DERIVED+BUILD-VERIFIED` | a 12.x toolkit |
@@ -471,7 +472,16 @@ until a card exists.
    list that honours it. Worth a standing check: any TU whose kernels are
    arch-specific should sit behind its cell, and `CMakeLists.txt:903` currently
    does not.
-9. **Guarding a body orphans its helpers, and `-Werror=all-warnings` turns that
+9. **A COMPILE guard without a SELECTOR guard is a trap, not a fix.** This is the
+   single most important lesson of W1a-W1c. `#if __CUDA_ARCH__ >= 800` /
+   `#else __trap()` makes a TU *compile* on an old arch; it does nothing about the
+   host code that decides to launch it. Every predicate selecting a guarded kernel
+   here was pure host-side shape/dtype/env, so the "fix" would have turned a
+   compile error into a runtime crash on exactly the boards it was meant to
+   enable. Any future arch-guarding must pair each `#if` with an arch term on its
+   selector and name the portable path it falls through to — and if no portable
+   path exists, that is a design problem, not a mechanical edit.
+10. **Guarding a body orphans its helpers, and `-Werror=all-warnings` turns that
    into a build failure.** W1b needed three iterations for exactly this: after the
    8 GDN bodies were guarded, `nvcc` reported `#177-D "declared but never
    referenced"` for `WmmaCfg::WK`, every `V128<T>` member, and finally `WyMerge`
@@ -480,7 +490,7 @@ until a card exists.
    `__device__` function whose callers are all guarded, wrap the WHOLE function
    (a body-only guard leaves an emitted-but-uncalled definition that still trips
    `#177-D`). Expect this cascade on any future `<sm_80` guarding.
-10. **A per-TU compile sweep is NOT a link.** W1a compiled 20 TUs to throwaway
+11. **A per-TU compile sweep is NOT a link.** W1a compiled 20 TUs to throwaway
    objects; it proves no TU has an `<sm_80` *compile* blocker beyond the two
    named, and nothing about undefined symbols, `__trap()` stubs reachable at
    link, or fatbin assembly. Do not quote 18/20 as "the library builds".
