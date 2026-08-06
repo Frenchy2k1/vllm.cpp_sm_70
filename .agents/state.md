@@ -39601,3 +39601,45 @@ full canvas, real per-token timesteps) is fed with RANDOM data in the harness; a
 real-weights activation diff of the DiT inputs at real geometry is the untested
 surface #70 did not isolate. Pre-existing preflight red
 (check-fusion-consistency minimax_h3_video_vae_device) is NOT this row's.
+
+## 2026-08-06T21:45 - QUANT-CT-MXFP4-FLASH-OCCUPANCY: the owed matched-c8 flash ncu diff - occupancy is IDENTICAL (8.33%), the gap is an irreducible-for-us ptxas SASS-scheduling quality difference (matched vLLM's exact reg+instr, still +10us), NO lever on our stack
+
+<!-- state: 2026-08-06T21:45 -->
+
+Ran the #69-owed ours-vs-vLLM flash decode ncu diff to a MEASURED verdict on an
+idle box (PR #75, `row/QUANT-CT-MXFP4-FLASH-OCCUPANCY`, base `f7a1e322`).
+
+**The #69 premise is REFRAMED (and its "occupancy/L2-bound" line CORRECTED).** The
+prior ncu pair was context-MISMATCHED: ours ran a ~5-token cli prompt
+(`num_splits=1`, Split=false), vLLM ran lens=1024 (Split=true) - different kernel
+instances. At the REAL c8 decode kernel both engines run the IDENTICAL grid
+`1x3x64`. The matched-c8 ncu (both engines, full section set; vLLM `enforce_eager`
+to dodge a FULL-cudagraph node-profiling driver-resource conflict; vLLM util
+0.5->0.15 after ncu-replay + the 0.5 reservation OOM-rebooted the 119 GiB pool
+once - the same #69 failure mode, now root-caused) shows: **occupancy IDENTICAL
+8.33%** (both smem-limited to 1 CTA/SM by the byte-identical 81.92 KB smem - the
+216-vs-241 reg delta is moot), **L2 ~1% on both** (KV streamed from DRAM, no
+adjacency/warmth to win), identical short-scoreboard stall structure. The only
+measured diff: ours +13% executed instructions.
+
+**W2 refuted every mirror-first lever, DECISIVELY via the exact vLLM recipe.**
+Arch-mirror (compute_80 PTX driver-JIT) is neutral. Building vLLM's EXACT recipe
+(compute_80 + `-use_fast_math`) reproduces vLLM's SASS profile EXACTLY - 241 reg,
+17,008 instr vs vLLM 241/17,020 - and is STILL ~167 us, the same as our native
+~165 us and ~10 us slower than vLLM's ~157 us. So the -13% instruction reduction
+does NOT translate to speed (the kernel is not instruction-bound) and matching
+vLLM's arch/fast-math/reg/instr does not close the gap. The residual is vLLM's
+wheel-`ptxas` SASS-scheduling quality, un-reachable from nvcc 13.0. (native+fast-
+math REGRESSES to 189.8 us per #68; compute_80+fast-math is neutral - the arch
+changes how fast-math lands but neither wins.) CMake has no per-source
+`CUDA_ARCHITECTURES` property, so build variants were made by swapping
+`--generate-code` in the exact ninja command + manual ar/link, cuobjdump-verified.
+
+**Verdict.** MXFP4 stays BELOW-FLOOR at c2-c8 (binding unchanged
+1.020/0.962/0.966/0.969). NO lever exists on our stack: occupancy, L2, num_splits,
+reg count, instruction count, `__launch_bounds__`, arch-mirror and fast-math are
+ALL refuted by measurement. The flash term (+450 us/step, ~40% of the c8 residual)
+is an irreducible-for-us ptxas quality gap. NO default flip owed; no functional
+code shipped (CMakeLists NOTE + benchmark-record #75 record the closed levers).
+Box left clean (GPU idle, both locks free, worker down). Evidence:
+`dgx:~/mxfp4-nsys/{ours,vllm,buildB,buildC}_flash_c8_ncu.ncu-rep`; PR #75.

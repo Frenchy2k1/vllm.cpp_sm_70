@@ -1412,15 +1412,27 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})
     target_compile_definitions(vllm PUBLIC VLLM_CPP_FLASH_ATTN)
-    # NOTE (QUANT-CT-MXFP4-FLASH-AUDIT #68): -use_fast_math was TRIED here to mirror
-    # vLLM's own flash-attn build (its _vllm_fa2_C is fast-math; it makes our decode
-    # kernel's SASS match vLLM's 4832/REG255 vs 4880/REG255). But a controlled
-    # same-build nsys A/B REFUTED it as a speed lever: this decode kernel is
-    # memory-latency-bound (ncu occ ~10.7%), so the +11.6% instruction reduction does
-    # not help, while fast-math's higher register count (246->255) LOWERS occupancy
-    # and REGRESSED flash 168.8 -> 189.8 us/call. So we do NOT pass -use_fast_math.
-    # The residual flash gap to vLLM (168.8 vs 156.3 us/call) is a runtime memory/L2
-    # effect, not the SASS; see .agents/benchmark-record.md.
+    # NOTE (QUANT-CT-MXFP4-FLASH-AUDIT #68 + FLASH-OCCUPANCY #75): the c8 decode
+    # flash gap vs vLLM (ours ~168-174 vs vLLM ~156 us/call) is a COMPILER-CODEGEN
+    # gap, MEASURED to a verdict — NOT occupancy, NOT L2, NOT num_splits, and NOT a
+    # flag we can set. The owed matched-c8 ncu (both engines, IDENTICAL grid
+    # 1x3x64) shows occupancy is IDENTICAL 8.33% (both smem-limited to 1 CTA/SM by
+    # the byte-identical 81.92 KB kSmemSize — the 216-vs-241 reg delta is moot),
+    # L2 hit ~1% on BOTH (KV streamed from DRAM: no adjacency/warmth to win), and
+    # the same ~60% short-scoreboard stall structure. The ONLY difference: vLLM's
+    # SASS executes ~13% FEWER instructions (3.27M vs 3.70M) in this latency-bound
+    # ~1-warp/scheduler regime — but that instruction count is NOT the cause. #75
+    # built the exact vLLM recipe: compiling the kernel TUs for compute_80 PTX +
+    # -use_fast_math REPRODUCES vLLM's SASS profile EXACTLY (241 reg, 17,008 instr
+    # vs vLLM 241/17,020) and is STILL ~167 us — the SAME as our native ~165 us and
+    # still ~10 us slower than vLLM's ~157 us. So matching vLLM's arch, fast-math,
+    # register AND instruction counts does NOT close the gap: the kernel is not
+    # instruction-bound, and the residual is vLLM's wheel-`ptxas` SASS-SCHEDULING
+    # quality, not reachable from our nvcc 13.0. (native+fast-math REGRESSES to
+    # 189.8 us, #68; compute_80 PTX driver-JIT alone is neutral, #75 Build B.) So
+    # we keep the plain native sm_121a compile and pass no -use_fast_math. The
+    # residual is an irreducible-for-us ptxas SASS-quality gap on a byte-identical
+    # kernel; see .agents/benchmark-record.md (#75).
     set_source_files_properties(
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS} PROPERTIES

@@ -19,6 +19,46 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## QUANT-CT-MXFP4-FLASH-OCCUPANCY — the owed ours-vs-vLLM flash decode ncu diff: occupancy is IDENTICAL (8.33%, smem-limited); the flash gap is a COMPILER-CODEGEN difference (vLLM's wheel SASS runs 13% fewer instructions on the byte-identical kernel), NOT occupancy/L2/arch/fast-math — no lever exists on our stack (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-OCCUPANCY`, base `f7a1e322`, GB10 sm_121a, PR #75)
+
+#69 closed the compile lens (flash source byte-identical to vLLM's `2c839c33`; `-use_fast_math` REJECTED, +21us/call) and OWED the ours-vs-vLLM ncu diff (vLLM side lost to a box OOM-reboot). This row runs that diff to a MEASURED verdict on an idle box and re-frames the #69 premise. **Vehicle** `Yi30/Qwen3-8B-MXFP4` (dense W4A16 Marlin), oracle arm `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`.
+
+**W0 (free, existing c8 nsys CSVs) — the #69 "8.3% occupancy, register-limited" figure was the WRONG kernel.** The prior ncu pair was context-MISMATCHED: ours ran `vllm-cli` with a ~5-token prompt (context ~5 → `num_splits=1`, Split=false — a different kernel instance), vLLM ran `lens=[1024]` (Split=true). At the REAL c8 decode kernel (`gpu_trace_c8_dflt` vs `vllm_offline_trace_c8`) both run the IDENTICAL grid `1x3x64` (num_splits=3, gridZ=64=batch×kv_heads) and ours uses FEWER registers (216 vs 241) → more occupancy headroom, not less.
+
+**W1 — matched-c8 ncu diff (both engines, grid `1x3x64`, full section set; ours = `vllm-bench --input-len 1024 --output-len 128 -c 8`; vLLM = offline NPROMPTS=8, `enforce_eager` to dodge the FULL-cudagraph node-profiling driver-resource conflict; vLLM `gpu_memory_utilization` dropped 0.5→0.15 after full-section replay + the 0.5-util reservation OOM-rebooted the 119 GiB unified pool once — the SAME #69 failure mode, now root-caused: ncu kernel-replay on the vLLM process is memory-heavy):**
+
+| metric | OURS (native sm_121a) | vLLM (sm_80-PTX driver-JIT wheel) |
+|---|---|---|
+| grid (X×Y×Z) | **192 (1×3×64)** | **192 (1×3×64)** — identical |
+| block / dyn smem per block | 128 / **81.92 KB** | 128 / **81.92 KB** — identical |
+| Block Limit Shared Mem | **1** | **1** (both smem-limited to 1 CTA/SM) |
+| **Achieved Occupancy** | **8.33%** | **8.33%** — IDENTICAL |
+| Registers / thread | 216 | 241 |
+| **Executed Instructions** | **3,695,180** (19,245/sched) | **3,267,840** (17,020/sched) — ours **+13.1%** |
+| Duration (ncu, median) | ~165 us | ~157 us |
+| L2 hit / L1 hit | 1.03% / 0.39% | 1.23% / 1.07% |
+| SM / Memory throughput | 13.5% / 10.4% | 14.2% / 11.0% |
+| Active warps/sched (eligible) | ~1.0 (0.06) | ~1.0 (0.06) |
+| stall: short-scoreboard (LDS→MMA) | ~63% of ~16.6 cyc | ~58% of ~16.9 cyc — same KIND |
+
+**Answer to the owed W1 question: YES — vLLM's instance runs at the SAME 8.33% occupancy.** Both are SMEM-limited to 1 CTA/SM by the byte-identical 81.92 KB `kSmemSize` (the 216-vs-241 reg delta is MOOT — smem binds first). Occupancy is refuted as the lever. L2-warmth/adjacency is refuted: both stream KV from DRAM at ~1% L2 hit (c8 KV working set ≫ L2 → nothing a preceding kernel leaves stays hot), so the flash kernel's own memory profile is context-independent. num_splits/grid/GQA-pack are identical. The ONLY measured difference is **executed instructions: ours +13.1%** (the same +11.6% scalar bloat #69's cuobjdump saw on the non-split kernel, now on the actual c8 decode kernel with EVERYTHING ELSE held identical). That made instruction-count the leading CODEGEN hypothesis — but W2 tests it directly and **REFUTES it as the cause**: matching vLLM's exact instruction count does NOT close the gap.
+
+**W2 — mirror-first lever exploration (controlled ncu on the SAME c8 kernel; flash TUs recompiled per cell into an isolated build):**
+
+| flash-TU build variant | reg | executed instr | ncu duration | vs vLLM 3.27M/157us |
+|---|---|---|---|---|
+| A native sm_121a (main default) | 216 | 3.70M (19,245/sched) | ~165 us | baseline |
+| B compute_80 PTX driver-JIT (mirror vLLM's arch) | 236 | 3.69M (19,212/sched) | ~165 us | **NEGATIVE — no change** |
+| **C** compute_80 + `-use_fast_math` (vLLM's EXACT recipe) | **241** | **3,267,072 (17,008/sched)** | **~167 us (161-170)** | **matches vLLM reg+instr EXACTLY, STILL ~10us slower** |
+| #68 native sm_121a + `-use_fast_math` | 255 | (fewer) | 189.8 us | REGRESSED (prior row) |
+| vLLM `_vllm_fa2_C` (sm_80+PTX+fast-math wheel) | 241 | 3,267,840 (17,020/sched) | ~157 us | the target |
+
+**The decisive cell is C.** Arch-mirror alone (B) is NEUTRAL (compute_80 PTX driver-JIT = native instr/duration). Adding fast-math (C) reproduces vLLM's SASS profile EXACTLY — 241 reg and 17,008 instr vs vLLM's 241/17,020, a −13% instruction drop from A's 19,245 — and YET C is ~167 us, essentially the SAME as A/B's ~165 us and still ~10 us SLOWER than vLLM's ~157 us. So the −13% instruction reduction does NOT translate to speed (the kernel is NOT instruction-bound — our toolchain sits at ~165 us regardless of 19,245 or 17,008 instr), and matching vLLM's exact register+instruction profile still leaves the gap. The residual is the specific SASS instruction-SCHEDULING/selection quality of vLLM's wheel `ptxas`, applied to the byte-identical source — which our nvcc-13.0 `ptxas` does not reproduce even when told to emit the same arch, fast-math, register count and instruction count. (Sub-finding: native+fast-math REGRESSES to 189.8 us (#68) but compute_80+fast-math is neutral at ~167 us — the arch target changes how fast-math's SASS lands, but neither is a win.) Build variants were made by swapping `--generate-code` and adding `-use_fast_math` in the exact ninja compile command, then ar+link'ing `libvllm.a`/binaries manually (CMake has no per-source `CUDA_ARCHITECTURES` property — `set_source_files_properties(... CUDA_ARCHITECTURES ...)` silently no-ops; each variant verified via `cuobjdump` and an ncu regs/instr read).
+
+**W3 — THE PARITY VERDICT: MXFP4 stays BELOW-FLOOR at c2-c8 (binding unchanged: c1 1.020 / c2 0.962 / c4 0.966 / c8 0.969 — nothing landed to move it).** Every candidate the diff could name is refuted by measurement: occupancy (identical 8.33%, smem-bound), L2-warmth (~1% both, KV ≫ L2), num_splits/grid (identical), register count (matched vLLM's 241 in C), instruction count (matched vLLM's 17k in C — and it did NOT help: the kernel is not instruction-bound), `__launch_bounds__`/reg-pressure (moot — smem-bound), arch-mirror (neutral), fast-math (regresses on native, neutral on compute_80). The flash decode term (+12.5 us/call ≈ +450 us/step, ~40% of the c8 residual after the dense-direct marlin banked the rest) is an IRREDUCIBLE (for us) **ptxas SASS-scheduling-quality gap**: on the byte-identical source, at identical grid/occupancy/smem/L2/stall-structure AND matched register+instruction counts, vLLM's wheel-`ptxas` schedules the SAME work ~10 us/call tighter than our nvcc-13.0 `ptxas`. Closing it requires vLLM's exact build `ptxas`, not something reachable by source, arch, flag, register or instruction control on our stack — so it is NOT a code, kernel, occupancy, or scheduling lever available to us. Honest c8 residual map: ~0.969 = flash ptxas-quality ~40% (this row, un-closable-by-us) + glue ~18% (portable-fusion, numerics-delicate, sub-parity) + residual-marlin/host the remainder. NO default flip owed (no throughput win). The CMakeLists NOTE records why -use_fast_math and the arch-mirror are NOT used, so they are not re-tried.
+
+Evidence: `dgx:~/mxfp4-nsys/{ours_flash_c8_ncu,vllm_flash_c8_ncu,buildB_flash_c8_ncu,buildC_flash_c8_ncu}.ncu-rep`; drivers `{ncu_flash_c8,ncu_vllm_eager2,perf_ab,buildc_ncu}.sh` + `vllm_offline_decode8_eager015.py`. Box OOM-rebooted once (util-0.5 vLLM ncu-replay), recovered, left clean.
+
 ## QUANT-CT-MXFP4-FLASH-AUDIT — `--use_fast_math` on the FA2 TUs REJECTED (measured flash REGRESSION); the flash decode gap vs vLLM is a runtime memory/occupancy effect, not the SASS instruction count (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-AUDIT`, base `origin/main` `4ce9fb74`, GB10 sm_121a, PR #69)
 
 The #67 refutation re-attributed the c2-c8 MXFP4 residual FLASH-dominant and OWED a
