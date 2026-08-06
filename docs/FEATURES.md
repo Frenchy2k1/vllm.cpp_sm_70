@@ -201,7 +201,7 @@ the registered engine forward.
 | CPU (x86 AVX-512, Arm i8mm) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | ☐ | ✅ | ✅ | ✅ |
+| ROCm | ☐ (device type + capability parse only) | ✅ | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX

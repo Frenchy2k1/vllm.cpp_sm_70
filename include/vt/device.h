@@ -13,8 +13,15 @@ uint64_t NextQueueId() noexcept;
 
 // Open device enum (.agents/backends.md): reserved entries for platforms we
 // have not implemented yet keep engine-visible types backend-agnostic.
-enum class DeviceType : uint8_t { kCPU = 0, kCUDA = 1, kMETAL = 2, kVULKAN = 3, kXPU = 4 };
-constexpr size_t kNumDeviceTypes = 5;
+enum class DeviceType : uint8_t {
+  kCPU = 0,
+  kCUDA = 1,
+  kMETAL = 2,
+  kVULKAN = 3,
+  kXPU = 4,
+  kROCM = 5
+};
+constexpr size_t kNumDeviceTypes = 6;
 
 // The canonical lowercase spelling of a device, for user-facing messages (and
 // the docs that quote them). Lives here, beside the enum, rather than in the
@@ -33,6 +40,12 @@ constexpr const char* DeviceTypeName(DeviceType device) {
       return "vulkan";
     case DeviceType::kXPU:
       return "xpu";
+    case DeviceType::kROCM:
+      // Upstream `vllm/platforms/rocm.py` sets `device_name = "rocm"` while its
+      // torch-facing `device_type` stays "cuda" (rocm.py:447-449) because ROCm
+      // reuses the CUDA dispatch key. We have no torch, so only the honest name
+      // survives here; the HIP-reuses-CUDA-spelling question does not arise.
+      return "rocm";
   }
   return "unknown";
 }

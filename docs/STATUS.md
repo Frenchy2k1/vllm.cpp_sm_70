@@ -1342,6 +1342,11 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 
 ## Backend detail
 
+**Platform SELECTION is the one non-additive site, and is now gated.** A
+platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers
+correctly but is NEVER selected, with no compiler diagnostic. `test_platform`
+now gates that every `DeviceType` is in the walk and CPU is last.
+
 **CUDA architectures.** The runtime-gated production arch is GB10 `sm_121a`
 (every gate model, every benchmark). A build-supported cross-family fan-out
 (`sm_80/86/87/89`, `sm_90a`, `sm_100a/103a`, `sm_110`) compiles single-arch,
@@ -1354,17 +1359,15 @@ SASS. It ran the Llama-3.2-1B paged-engine
 greedy gate and was **STRICT token-exact 12/16 prompts (192/192 tokens) vs the
 committed vLLM oracle golden** (every vLLM-deterministic prompt),
 **15/16 bit-identical to the GB10 `sm_121a` anchor**; the remaining 4/16 are the
-ratified bf16 near-tie prompts (committed teacher-forced gap 0.000 nats). Scope
-is precise: it covers only the portable bf16 path that ran; the fp8/fp4/CUTLASS
-fast paths on `sm_110` remain DERIVED/NOT-YET (a cutlass-backed kernel
-campaign). The other fan-out boards remain build-supported only (no board
-here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
+ratified bf16 near-tie prompts (gap 0.000 nats). Scope covers only the portable
+bf16 path that ran; `sm_110` fp8/fp4/CUTLASS remain DERIVED/NOT-YET. Other
+fan-out boards are build-supported only (no board here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
 
 **GDN Triton-AOT cubins are now vendored per-arch (2026-07-28).** The vendored
 Triton-AOT GDN fast-path cubins (the measured codegen-win packed decode plus the
-delta_h/chunk_o FLA kernels for the Qwen3.6 GDN-hybrid models) previously existed
-for GB10 `sm_121a` ONLY. Because a cubin loads only on the SM it was built for
+delta_h/chunk_o FLA kernels for Qwen3.6 GDN-hybrids) previously existed for GB10
+`sm_121a` ONLY. Because a cubin loads only on the SM it was built for
 and the cross-family arch builds ship `-DVLLM_CPP_TRITON=OFF`, GDN decode on
 other arches ran the slower spilling hand kernel. The full GDN AOT set is now
 regenerated and vendored for `sm_80/86/89/90a/100a` (`cuobjdump` shows real
@@ -1377,11 +1380,9 @@ intact). Evidence: [.agents/specs/triton-aot-per-arch.md](../.agents/specs/trito
 **As of 2026-07-28, `sm_87` is also RUNTIME-VERIFIED (portable bf16 SYNC path) on
 real silicon — the SECOND non-GB10 runtime proof.** vllm.cpp was built
 portable-only for `sm_87` on an NVIDIA Jetson AGX Orin (Tegra R36.4.3 / JetPack 6,
-aarch64; the integrated GPU self-reports `sm_87`, unified memory). Because the
-Orin driver advertises only CUDA 12.6, the CUDA-13 container is refused by the
-NVIDIA container runtime, so the build used the JetPack-6 `l4t-jetpack:r36.4.0`
-image (nvcc 12.6) with g++-13 (the tree needs GCC ≥ 13). All fp8/fp4/CUTLASS/FA2
-fast paths resolve EMPTY on `sm_87` (Ampere: bf16 + int8; no cutlass). It ran the
+aarch64; the integrated GPU self-reports `sm_87`, unified memory; toolchain
+detail in the matrix row). All fp8/fp4/CUTLASS/FA2 fast paths resolve EMPTY on
+`sm_87` (Ampere: bf16 + int8; no cutlass). It ran the
 Llama-3.2-1B paged-engine greedy gate and was **13/16 prompts
 STRICT token-exact vs the committed vLLM 0.25.0 oracle golden, 16/16 under the
 near-tie distributional gate, 0 forward-divergent** (exceeding Thor's 12/16), plus
