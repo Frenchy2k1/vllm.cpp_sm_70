@@ -55,6 +55,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -119,6 +121,49 @@ int NumSplitsHeuristic(int batch_nheads_mblocks, int num_sms, int num_n_blocks,
     }
   }
   return 1;
+}
+
+// GB10-calibrated split-count cap (VT_FA2_NSPLITS_CAP, default OFF).
+//
+// NumSplitsHeuristic is the exact FA2 2c839c33 port; it is fed num_sms*2 on the
+// upstream "128-thread CTA => 2 blocks/SM" occupancy model. On GB10 the batch-1
+// decode split kernel is latency/occupancy-bound (ncu KERNEL-FA2-DECODE-PARAMS:
+// occ 10.7%, SM 7.7%), so it does NOT reach 2 blocks/SM; against the doubled
+// denominator every eligible split at c1 keeps waves<1, and the efficiency
+// metric waves/ceil(waves) then rises MONOTONICALLY, so the heuristic runs to
+// the maximum eligible split (= num_n_blocks). Measured on GB10 (48 SMs), 8B
+// MXFP4, c1 (bnh=8, nnblk=7): the heuristic picks 7 -> ~41us/layer, while 3 is
+// optimal (~33us, ~17% flash win) and 1 is ~35us (dgx:/tmp/fa2ab_n{1,3}.out,
+// ncu). The over-split self-corrects to ~3 at c8, so this ONLY moves c1-c2.
+//
+//   VT_FA2_NSPLITS_CAP unset or "0"  -> OFF, heuristic returned unchanged.
+//   VT_FA2_NSPLITS_CAP = "auto"      -> wave-optimal cap: keep ctas_per_split *
+//                                        splits within ONE true wave of the
+//                                        ACTUAL SM count (max(1, num_sms/ctas)).
+//   VT_FA2_NSPLITS_CAP = N (N>=1)    -> explicit cap at N (the fa2ab A/B knob).
+//
+// Non-byte-exact when it changes num_splits (>1): the split-KV combine sums a
+// different number of F32 partials, a near-tie reduction-order shift toward
+// vLLM's numerics — hence gated OFF and razor-gated (SACRED strict + the
+// distributional gate on the small models). Read fresh (host path per step, like
+// Fa2DecodeGqaSwapEnabled) so a single-process op test can A/B the regimes.
+int Fa2NsplitsCapConfig() {
+  // >0 explicit cap; 0 OFF; -1 AUTO.
+  const char* e = std::getenv("VT_FA2_NSPLITS_CAP");
+  if (e == nullptr || e[0] == '\0' || e[0] == '0') return 0;
+  if (std::strcmp(e, "auto") == 0 || std::strcmp(e, "AUTO") == 0) return -1;
+  const int n = std::atoi(e);
+  return n >= 1 ? n : 0;
+}
+
+// Apply the cap to a heuristic-chosen split count. ctas_per_split is the grid
+// launched per split (= batch*heuristic_heads*num_m_blocks, the first arg to
+// NumSplitsHeuristic); num_sms is the ACTUAL SM count (NOT the doubled value).
+int ApplyNsplitsCap(int num_splits, int ctas_per_split, int num_sms) {
+  const int cfg = Fa2NsplitsCapConfig();
+  if (cfg == 0 || num_splits <= 1) return num_splits;
+  const int cap = (cfg < 0) ? std::max(1, num_sms / std::max(1, ctas_per_split)) : cfg;
+  return std::min(num_splits, cap);
 }
 
 struct ScratchBuffer {
@@ -751,8 +796,10 @@ void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
   constexpr int kBlockM = 64;
   const int num_n_blocks = (max_seqlen_k + kBlockN - 1) / kBlockN;
   const int num_m_blocks = (query_groups + kBlockM - 1) / kBlockM;
-  const int num_splits = NumSplitsHeuristic(
-      batch * heads * num_m_blocks, stream_scratch->num_sms * 2, num_n_blocks, 128);
+  const int ctas_per_split = batch * heads * num_m_blocks;
+  const int num_splits = ApplyNsplitsCap(
+      NumSplitsHeuristic(ctas_per_split, stream_scratch->num_sms * 2, num_n_blocks, 128),
+      ctas_per_split, stream_scratch->num_sms);
 
   const DecodeShapeKey key{batch,       static_cast<int>(hq), heads,
                            query_groups, head_dim,              max_blocks,
@@ -993,8 +1040,10 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   const int heuristic_heads = do_swap ? kv_heads : heads;
   const int num_n_blocks = (max_seqlen_k + kBlockN - 1) / kBlockN;
   const int num_m_blocks = (p_seqlen_q + kBlockM - 1) / kBlockM;
-  const int num_splits = NumSplitsHeuristic(
-      batch * heuristic_heads * num_m_blocks, stream_scratch->num_sms * 2, num_n_blocks, 128);
+  const int ctas_per_split = batch * heuristic_heads * num_m_blocks;
+  const int num_splits = ApplyNsplitsCap(
+      NumSplitsHeuristic(ctas_per_split, stream_scratch->num_sms * 2, num_n_blocks, 128),
+      ctas_per_split, stream_scratch->num_sms);
 
   // softmax_lse is f32, batch*hq elements either way (swap: b*kv_heads*ngroups ==
   // b*hq; plain: hq*total_q == hq*b). The swap only reinterprets the stride

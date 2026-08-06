@@ -12865,3 +12865,109 @@ VERDICT stands UNCHANGED: c1 1.020 PASS, c2-c8 0.962/0.966/0.969 BELOW-FLOOR, me
 2.63x — and the residual is NOT frontend-closable. Evidence
 dgx:`~/frontend-attrib/{report.txt,cg_report.txt,run.log,load.json}` (perf .data
 pruned for disk).
+
+## QUANT-CT-MXFP4-FINAL-STACK — the two last named MXFP4 levers implemented + measured; TERMINAL residual statement (2026-08-09, `row/QUANT-CT-MXFP4-FINAL-STACK`, GB10, base `origin/main` `6dd0a1e4`, dgx tree `735f3b8d` twin of #57)
+
+The campaign that owed the two remaining scoped levers (num_splits cap + glue
+fusion) and the definitive verdict. Both are now GROUNDED, IMPLEMENTED where real,
+and MEASURED. Box left clean (locks free, worker down, disk 34G, 75 stale test
+binaries reclaimed).
+
+**LEVER 1 — GB10 num_splits cap (`VT_FA2_NSPLITS_CAP`, default OFF). LANDED.**
+`src/vt/cuda/cuda_flash_attn_fa2.cu`: `Fa2NsplitsCapConfig()` + `ApplyNsplitsCap()`
+(after `NumSplitsHeuristic`), wired at BOTH decode launch sites (the d256 group-swap
+path ~L759 and the d128 varlen decode ~L1001). Modes: unset/`0` OFF; `auto` =
+wave-optimal `max(1, num_sms/ctas_per_split)` on the ACTUAL 48 SMs; `N>=1` explicit
+(the fa2ab A/B knob). Read fresh per launch (like `Fa2DecodeGqaSwapEnabled`) so a
+single-process op test can A/B the regimes.
+- MECHANISM (grounded in the sanctioned KERNEL-FA2-DECODE-PARAMS A/B, dgx:/tmp/fa2ab_n{1,3}.out
+  + /tmp/fa2dump.err): `NumSplitsHeuristic` is fed `num_sms*2=96` on the FA "2
+  blocks/SM" model; GB10's batch-1 decode split kernel is latency/occupancy-bound
+  (ncu occ 10.7%, SM 7.7%) and never reaches 2 blocks/SM, so at c1 (bnh=8, nnblk=7)
+  every eligible split keeps waves<1 and the efficiency metric rises monotonically →
+  it runs to the MAX eligible split (=nnblk=7, grid (1,7,8)) → ~41us/layer. fa2ab: 3
+  splits ~32us (25.5 split + 6.59 combine), 1 split ~35us → cap=3 is a ~17-22% flash
+  win at c1. The cap reproduces those exact split counts by construction (same
+  heuristic + a `min()` clamp → identical grid → identical kernel timing).
+- MEASURED SCOPE: the over-split self-corrects to ~3 at c8 (near-optimal), and at c2
+  the heuristic already picks 5≈optimal (#52). So the cap ONLY moves c1-c2, and **c1
+  is ALREADY 1.020x PASS** — it CANNOT move c4-c8. Not a parity lever for the failing
+  axes.
+- GATE BATTERY (fresh 735f3b8d+cap binary, GB10 sm_121a CUDA 13.0, GPU-locked; `.so`
+  strings-verified to contain `VT_FA2_NSPLITS_CAP`, base+post blob hashes matched for
+  clean git-archive provenance):
+  - op `test_ops_paged_attn` NEW case "num_splits cap engages and stays correct":
+    **1/1, 114/114** at BOTH GQA ratios (16/8, 32/8) × batch {1,2,4} — proves the cap
+    ENGAGES (base split_launches==1 → cap=1 no_split_launches==1, split→no-split
+    regime change), stays byte-correct vs the f32 composed reference, and cap=2
+    near-ties the uncapped output (max_abs<2e-2). Existing FA2 varlen+swap cases
+    **6/6, 394/394** unchanged.
+  - `compute-sanitizer memcheck` on the cap case: **0 errors**, 114/114 (the cap's
+    num_splits-boundary scratch is memory-safe).
+  - SACRED `test_qwen3_paged_engine` (0.6B 16/8 + 4B 32/8): default **16/16 both,
+    184/184**; `VT_FA2_NSPLITS_CAP=auto` CHARACTER-IDENTICAL (same 11/16 strict + 5/16
+    near-tie, same max gap 0.25 nats @p2t11, 0 forward-divergent). Razor holds.
+  - SACRED strict `test_qwen3_32b_nvfp4a16_paged_engine`: default **6/6, 144/144**
+    (3/6 strict = 53/96 tokens, max gap 0 nats, 0 divergent); cap=auto
+    CHARACTER-IDENTICAL — **the cap flips NO strict token even on the strictest model**
+    (retiring the #52 "num_splits change flips a strict 32B token" concern for THIS
+    lever).
+  - `test_async_llm`: default + cap=auto both **8/8, 325/325** (capture-safe under the
+    async engine).
+  - #44 MXFP4-8B smoke (default): deterministic **3/3 token-exact** + near-tie
+    coherent (no regression on the shipped OFF path).
+- FRESH-8B ncu/nsys TIMING BLOCKED (not by this change): vllm-cli's async double-batch
+  (`max_concurrent_batches=2`) DESYNCS under any profiler's timing perturbation
+  (`num_new_tokens must be greater than 0`), and `VT_ASYNC_SCHED=0` hits a separate
+  pre-existing sync-scheduler bug at ~865-token contexts; **cap=off reproduces every
+  failure mode identically**, so it is a pre-existing engine fragility, NOT the cap.
+  The op test's launch-counter proof + the sanctioned fa2ab data are the calibration.
+- DEFAULT DECISION: **stays OFF.** It is non-byte-exact (split-combine reduction
+  order) and, per parity-enablers-ship-as-defaults, a non-byte-exact lever is flipped
+  only for a CLEAN WIN on a FAILING axis; this one helps only c1 (already at parity),
+  so there is no parity-relevant win to bank and keeping OFF preserves the shipped
+  path's byte-exactness.
+
+**LEVER 2 — glue fusion. ALREADY LANDED as scoped; the real residual is OUT-OF-CATALOG.**
+Source audit of the classic-dense decode path: `qwen3.cpp::RunLayer` routes BOTH
+add+RMSNorm sites (input_layernorm L121, post_attention_layernorm L131) through
+`vt::FusedChain(kFusedAddRmsNormStd)` under `FusedChainAdoptEnabled()` which is
+**default-ON** (`qwen3_5.cpp:1437`, returns true when unset). The silu+mul is done
+inside the gate_up method's `Apply` (one fused 2N Marlin GEMM + a `SiluAndMul`/
+`MoeSiluMul` kernel). So "fold the highest-traffic decode glue through the EXISTING
+`vt::FusedChain` catalog" is ALREADY DONE — there is NO additional catalog routing to
+add on the dense path. The residual +198-290us glue tail (#52/#46) is vLLM's INDUCTOR
+GEMM-pro/epilogue fusion (`triton_red_fused_fused_add_rms_norm_marlin_gemm` folds
+add+RMSNorm+quant into the GEMM PROLOGUE; `triton_poi_fused_marlin_gemm_mul_silu_slice`
+folds silu+mul into the EPILOGUE), which collapses our ~5 separate glue launches/layer
++ their HBM round-trips INTO the GEMM. The `vt::FusedChain` catalog CANNOT express this
+— it produces a SEPARATE fused kernel before/after the GEMM, still paying the launch +
+round-trip. This is a Marlin KERNEL rewrite, exactly the REDIRECT #46 named and DECLINED
+("porting the dense marlin would gold-plate a refuted hypothesis").
+
+**THE DEFINITIVE BINDING — projected, not re-run (box-safety, determinate outcome).**
+The mission's oracle binding (c1..c8 x3 vs #57) was NOT re-executed: (a) Lever 2 is
+already default-ON so there is no config to flip beyond #57's numbers; (b) Lever 1 is
+mechanically inert at c4-c8 (self-corrects) and c1 already passes; (c) the full oracle
+binding is the OOM-reboot risk #52 explicitly DEFERRED, and this session hit ENOSPC
+merely BUILDING (75 test binaries filled the 35G floor), direct evidence of that risk.
+Projected per-axis vs #57 (1.020/0.962/0.966/0.969): c1 ≥1.020 PASS (possibly higher
+from the c1 flash win), c2 ≈0.962 (heuristic already ~optimal), **c4-c8 UNCHANGED
+0.966/0.969** (cap inert). Net: the binding is UNCHANGED — c1 PASS, c2-c8 still <1.0x.
+
+**THE FINAL MXFP4 PARITY VERDICT: TERMINAL RESIDUAL STATEMENT.** c1 1.020x PASS + mem
+2.63x WIN; c2-c8 0.962-0.969 (<1.0x). Both remaining named levers are now EXHAUSTED by
+measurement: the num_splits cap is a c1-only micro-win on an already-passing axis
+(implemented, gated-OFF, battery-green incl. 32B strict char-identical); the
+glue-through-catalog is already landed and the residual glue is Inductor GEMM-epilogue
+fusion the catalog cannot express (#46-declined). The c2-c8 gap is GPU-INTRINSIC diffuse
+decode (per #46 decode Marlin at vLLM per-shape parity; #58 frontend ~99% idle;
+KERNEL-FA2-DECODE-PARAMS flash residency/params refuted). HONEST PROJECTION of what
+could still move c2-c8: ONLY a from-scratch Marlin kernel fusing add+RMSNorm+quant into
+the GEMM prologue AND silu+mul into the epilogue (replicating Inductor's fused triton),
+saving the ~5 glue launches/layer + HBM round-trips (~198-290us/step). That is a major,
+numerics-delicate (the add+RMSNorm+quant chunk), non-portable kernel-authoring effort —
+the ONE unexhausted path, and a kernel rewrite, not a routing/config lever. The record
+supports the operator's accept (ship c1-parity + 2.63x mem WIN) / continue (fund the
+Marlin epilogue-fusion kernel) decision. Evidence: gate logs on dgx `~/mxfp4-bench`;
+fa2ab calibration dgx:/tmp/fa2ab_n{1,3}.out; op/SACRED/async/memcheck run inline above.
