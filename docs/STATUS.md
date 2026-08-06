@@ -388,7 +388,9 @@ The correctness form and the full D0-D14 measured chronology live in
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed — see the capability table; not yet usable
-end-to-end), multi-GPU, and the full tool-calling template surface. **Scale-out /
+end-to-end), multi-GPU, Vulkan (gated skeleton: 8 of the CPU backend's 83 ops,
+no model runs; [campaign](../.agents/specs/vulkan-full-support.md)), and the
+full tool-calling template surface. **Scale-out /
 distributed execution is scoped but unbuilt** (spike, 2026-07-28): the engine is
 single-GPU today (verified — no NCCL / tensor-parallel / process-group code in
 `src/`). A single-dimension design is on record covering all three legs —
@@ -1333,31 +1335,31 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 **CUDA architectures.** The runtime-gated production arch is GB10 `sm_121a`
 (every gate model, every benchmark). A build-supported cross-family fan-out
 (`sm_80/86/87/89`, `sm_90a`, `sm_100a/103a`, `sm_110`) compiles single-arch,
-portable-kernels-only (all fp8/fp4/CUTLASS/Marlin/FA2 fast paths resolve EMPTY).
-**As of 2026-07-27, `sm_110` is RUNTIME-VERIFIED (portable bf16 path) on real
-silicon — the FIRST non-GB10 runtime proof.** vllm.cpp was built natively for
-`sm_110` on an NVIDIA Jetson Thor board (aarch64, JetPack R38, nvcc 13.0,
-on-box `compute_cap=11.0`; cutlass absent and not needed), Release `-Werror`
-0 warnings, 16 TUs of real `sm_110` SASS. It then ran the Llama-3.2-1B
+portable-kernels-only (fp8/fp4/CUTLASS/Marlin/FA2 fast paths resolve EMPTY).
+**As of 2026-07-27, `sm_110` is RUNTIME-VERIFIED on real silicon — the FIRST
+non-GB10 runtime proof.** vllm.cpp was built natively for `sm_110` on an NVIDIA
+Jetson Thor board (aarch64, JetPack R38, nvcc 13.0, `compute_cap=11.0`; cutlass
+absent and not needed), Release `-Werror` 0 warnings, 16 TUs of real `sm_110`
+SASS. It then ran the Llama-3.2-1B
 paged-engine greedy gate and was **STRICT token-exact 12/16 prompts (192/192
 tokens) vs the committed vLLM oracle golden** (every vLLM-deterministic prompt),
 **15/16 bit-identical to the GB10 `sm_121a` anchor**; the remaining 4/16 are the
 ratified bf16 near-tie prompts (committed teacher-forced gap 0.000 nats). Scope
-is precise: RUNTIME-VERIFIED covers only the portable bf16 path that actually ran;
-the fp8/fp4/CUTLASS fast paths on `sm_110` remain DERIVED/NOT-YET (a cutlass-backed
-kernel campaign). The other fan-out boards remain build-supported only (no board
+is precise: it covers only the portable bf16 path that ran; the fp8/fp4/CUTLASS
+fast paths on `sm_110` remain DERIVED/NOT-YET (a cutlass-backed kernel
+campaign). The other fan-out boards remain build-supported only (no board
 here). Repro and evidence: [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM110`.
 
 **GDN Triton-AOT cubins are now vendored per-arch (2026-07-28).** The vendored
 Triton-AOT GDN fast-path cubins (the measured codegen-win packed decode plus the
 delta_h/chunk_o FLA kernels for the Qwen3.6 GDN-hybrid models) previously existed
-for GB10 `sm_121a` ONLY. Because a cubin loads only on the SM it was compiled for
-and the cross-family arch builds ship `-DVLLM_CPP_TRITON=OFF`, GDN decode on the
+for GB10 `sm_121a` ONLY. Because a cubin loads only on the SM it was built for
+and the cross-family arch builds ship `-DVLLM_CPP_TRITON=OFF`, GDN decode on
 other arches ran the slower spilling hand kernel. The full GDN AOT set is now
 regenerated and vendored for `sm_80/86/89/90a/100a` (`cuobjdump` shows real
-per-target SASS), so a `-DVLLM_CPP_TRITON=ON` single-arch build on those arches
-selects the non-spilling path too — **DERIVED+BUILD-VERIFIED (testing-welcome):
+per-target SASS), so a `-DVLLM_CPP_TRITON=ON` single-arch build there selects
+the non-spilling path too — **DERIVED+BUILD-VERIFIED (testing-welcome):
 no non-`sm_121` board runs a GDN model here, so this is not a runtime
 GDN-decode-parity claim on any arch.** `sm_121a` is byte-unchanged (SACRED gate
 intact). Evidence: [.agents/specs/triton-aot-per-arch.md](../.agents/specs/triton-aot-per-arch.md).
@@ -1369,15 +1371,15 @@ aarch64; the integrated GPU self-reports `sm_87`, unified memory). Because the
 Orin driver advertises only CUDA 12.6, the CUDA-13 container is refused by the
 NVIDIA container runtime, so the build used the JetPack-6 `l4t-jetpack:r36.4.0`
 image (nvcc 12.6) with g++-13 (the tree needs GCC ≥ 13). All fp8/fp4/CUTLASS/FA2
-fast paths resolve EMPTY on `sm_87` (Ampere: bf16 + int8, no fp8/fp4; cutlass not
-present). It ran the Llama-3.2-1B paged-engine greedy gate and was **13/16 prompts
+fast paths resolve EMPTY on `sm_87` (Ampere: bf16 + int8; no cutlass). It ran the
+Llama-3.2-1B paged-engine greedy gate and was **13/16 prompts
 STRICT token-exact vs the committed vLLM 0.25.0 oracle golden, 16/16 under the
 near-tie distributional gate, 0 forward-divergent** (exceeding Thor's 12/16), plus
 `test_cuda_backend`/`test_cuda_ops` (461 assertions of real on-device kernel
-execution). One honest `sm_87` bug surfaced: the DEFAULT asynchronous runner path
-crashes on the first forward with an illegal memory access, so RUNTIME-VERIFIED is
-scoped to the portable bf16 **synchronous** path (`VT_ASYNC_RUNNER=0`) — the async
-runner on `sm_87` is a tracked unblock item. Repro and evidence:
+execution). One honest `sm_87` bug surfaced: the DEFAULT async runner path crashes
+on the first forward with an illegal memory access, so RUNTIME-VERIFIED is scoped
+to the portable bf16 **synchronous** path (`VT_ASYNC_RUNNER=0`); the async runner
+on `sm_87` is a tracked unblock item. Repro and evidence:
 [docs/BENCHMARKS.md](BENCHMARKS.md),
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM087`.
 
@@ -1387,11 +1389,11 @@ FAST-PATH body: the **NVFP4 tcgen05 block-scaled GEMM is BUILD-VERIFIED**
 `Fp4GemmSm100` (`ArchTag=Sm100` + `KernelScheduleAuto` — CUTLASS 4.5.0 selects the
 5th-gen tcgen05 collective) compiles single-arch `100a` on nvcc 13.0 `-Werror`-equiv
 0 warnings and `cuobjdump` shows a real `sm_100a` cubin; it is gated by its own
-`cutlass-nvfp4-sm100` feature cell (enabled only for `100a`, so the GB10 `sm_121a`
-gate build is byte-unchanged). The native consumer `mma.sync kind::mxf4nvf4` fp4
+`cutlass-nvfp4-sm100` cell (enabled only for `100a`, so the GB10 `sm_121a` gate
+build is byte-unchanged). The native consumer `mma.sync kind::mxf4nvf4` fp4
 path stays `sm_12x`-only (it does not port to sm_100's tcgen05). **No B200/sm_100
-board ran it** — a green compile + SASS is not execution evidence, not runtime
-support, and not vLLM-competitive; the other sm_100 fast paths (CUTLASS C3x FP8,
+board ran it**: a green compile + SASS is not execution evidence, runtime
+support, or vLLM-competitive; the other sm_100 fast paths (CUTLASS C3x FP8,
 MoE, MXFP4, MLA) remain scoped.
 
 As of 2026-07-28, the Hopper `sm_90a` fan-out gained its first FAST-PATH body: the

@@ -39643,3 +39643,68 @@ is an irreducible-for-us ptxas quality gap. NO default flip owed; no functional
 code shipped (CMakeLists NOTE + benchmark-record #75 record the closed levers).
 Box left clean (GPU idle, both locks free, worker down). Evidence:
 `dgx:~/mxfp4-nsys/{ours,vllm,buildB,buildC}_flash_c8_ncu.ncu-rep`; PR #75.
+
+- **2026-08-06** — **Vulkan full-support campaign SPEC (PLAN ONLY;
+  `CLAIM-VULKAN-FULL-1`, [spec](specs/vulkan-full-support.md), rows
+  `BACKEND-VULKAN` / `BACKEND-GATE-VULKAN-LLAMACPP` / `BENCH-VK-LLAMA`).** No
+  code, no shader, no build, no benchmark, no model; no row moves lifecycle
+  state. The spec scopes Vulkan from its landed skeleton (one commit,
+  `1cb5f643`, untouched since 2026-07-22) to the CPU backend's full op surface,
+  optimized against llama.cpp's Vulkan backend on GB10, decomposed into ten
+  sub-projects each owning its own spec, row and gate. Ordering follows two
+  rules: decisions that get more expensive with delay go first (the
+  shader-variant pipeline), and the denominator exists before anything is
+  optimized (the llama.cpp harness precedes every optimization row).
+
+  **The baseline was re-counted from the tree rather than quoted, correcting
+  three record errors.** (1) The `OpId` table holds **106** entries, not the
+  "75-entry `OpId` table" that both [accelerator-seam-audit.md](specs/accelerator-seam-audit.md)
+  and [backend-fanout-metal-vulkan-xpu.md](specs/backend-fanout-metal-vulkan-xpu.md)
+  cite; the table grew and the figure went stale. Counted `RegisterOp` coverage:
+  **CUDA 103, CPU 83, Metal 19, Vulkan 8.** (2) The scope therefore resolves to
+  **83 - 8 = exactly 75 ops**, enumerated and grouped in the spec and verified
+  programmatically to partition the gap exactly (75 listed, 75 unique, empty in
+  both directions); **21 `OpId`s are vendor-specific by construction** (cutlass,
+  Marlin, cuBLASLt, NCCL, Laguna, DeepSeek-V4) and are not owed on Vulkan at
+  all. (3) The fan-out spec's toolchain premise, *"neither box grants sudo"*
+  (measured 2026-07-22, and part of why SPIR-V is committed rather than
+  generated), is **stale**: `sudo -n true` now returns 0 on the dev box and dgx
+  has carried NOPASSWD sudo since 2026-07-30. That does not by itself reverse
+  the committed-SPIR-V decision, but it removes the constraint that forced it,
+  and llama.cpp's Vulkan backend needs `glslc` at build time regardless.
+
+  **Two findings from the port source changed the plan's shape.** The
+  linear-attention sub-project is a **port, not an invention**: llama.cpp
+  carries `gated_delta_net.comp` (189 lines) at our pin `237ad9b96`, whose spec
+  constants include `KDA`, so it covers both linear-attention families we run,
+  with `solve_tri.comp` / `cumsum*.comp` / `tri.comp` supplying the
+  chunked-delta-rule primitives; it stays last for size, not for risk.
+  Conversely **paged KV has no Vulkan port source anywhere**: zero occurrences
+  of `block_table` or `paged` across all 132 `.comp` + 26 `.glsl` at the pin, so
+  the block-table indirection comes from our own CUDA kernel and is recorded as
+  partial-from-scratch in [porting-inventory.md](porting-inventory.md) §9 when
+  it lands. The shader-variant pipeline is sequenced first because llama.cpp's
+  generator has **242 `string_to_spv(` call sites** (most inside dtype x quant x
+  coopmat-tier loops) against our current 7 modules / 3,491-line committed
+  header, so every shader written before that decision is a shader written
+  twice.
+
+  **Recorded limits.** On GB10, an integrated NVIDIA part, llama.cpp's own CUDA
+  backend beats both Vulkan arms, so a win there is a win over the Vulkan
+  maturity floor on the box we own, not over llama.cpp; the benchmark gate
+  therefore records **three** columns (ours-Vulkan, llama.cpp-Vulkan,
+  ours-CUDA), not one. The claim that would matter to a user needs an AMD or Arc
+  board, which no box here has (user decision 2026-08-06: GB10 first, acquire
+  later), and that deferred sub-project is also the only thing that would
+  exercise the skeleton's missing staging path for non-host-visible memory. The
+  per-op record+submit+fence-wait is an architectural speed cap rather than a
+  constant factor, so an anticipated re-order (pull async dispatch ahead of the
+  GEMM tactics if the first competitive number is catastrophic rather than
+  merely behind) is written down now instead of read later as a slip. One record
+  drift is left for the first implementation row so the repair rides with the
+  re-count: [feature-matrix.md](feature-matrix.md) line 280 still carries
+  `BACKEND-VULKAN` as `INVENTORIED | runtime absent` against
+  [backend-matrix.md](backend-matrix.md) line 233's `ACTIVE`.
+
+  Next: `VK-A1` (shader-variant pipeline + the feature-matrix drift repair),
+  which blocks every shader written after it.
