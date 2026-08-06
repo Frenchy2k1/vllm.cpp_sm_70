@@ -338,6 +338,16 @@ enum class OpId : uint8_t {
   // CUDA-only (Blackwell sm_12xa; vendored dense marlin TUs, VT_MARLIN_NVFP4).
   // Appended before kCount (no existing op's id shifts).
   kMarlinDenseGemm,
+  // MiniMax-H3 DiT device-resident-forward glue table (brick H3-2b). Only the 3
+  // small ops the shared vt:: surface does NOT already cover: the two indexed
+  // AdaLN modulates and plain elementwise SiLU. Everything else in the DiT
+  // forward reuses tuned shared ops (kMatmulBT, kRmsNorm, kQkvSplit, kSiluAndMul,
+  // kAdd, kIndexSelect, kIndexCopy, kRopeFromCache, kDFlashBlockAttention), so
+  // this table stays deliberately tiny. Registered on BOTH kCPU and kCUDA
+  // (cpu_ops.cpp / cuda_minimax_h3.cu) so the device forward is exercised in CPU
+  // CI too; resolved via minimax_h3::MiniMaxH3Device(). Additive: only
+  // MiniMaxH3DitForwardDevice dispatches it. Appended before kCount (no id shift).
+  kMiniMaxH3,
   kCount
 };
 

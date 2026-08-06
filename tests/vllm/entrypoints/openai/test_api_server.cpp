@@ -11,6 +11,7 @@
 // The synthetic model mirrors tests/vllm/entrypoints/openai/test_serving.cpp
 // (tiny hybrid-MoE Qwen3.6 + the BPE fixture, vocab ids 0..21).
 #include "vllm/entrypoints/openai/api_server.h"
+#include "vllm/entrypoints/openai/video_api.h"
 
 #include <doctest/doctest.h>
 
@@ -1641,4 +1642,107 @@ TEST_CASE(
   h.server.stop();
   server_thread.join();
 #endif  // defined(__linux__)
+}
+
+// ---------------------------------------------------------------------------
+// MiniMax-H3 /v1/videos routes. These are ADDITIVE and OPT-IN: without a runner
+// attached the handlers refuse, and the routes are never registered at all.
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string VideoBody() {
+  return R"({"prompt":"a cat","num_inference_steps":4})";
+}
+}  // namespace
+
+TEST_CASE("api_server: /v1/videos without a runner is a 500, not a crash") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  ApiServer::DispatchResult async_result = h.server.handle_videos(VideoBody());
+  CHECK(async_result.status == 500);
+  ApiServer::DispatchResult sync_result =
+      h.server.handle_videos_sync(VideoBody());
+  CHECK(sync_result.status == 500);
+  // And an unknown job id is a 404 rather than an empty 200.
+  CHECK(h.server.handle_video_status("video-0").status == 404);
+}
+
+TEST_CASE("api_server: /v1/videos/sync runs the runner and returns its path") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  std::string seen_prompt;
+  int64_t seen_steps = 0;
+  h.server.set_video_runner(
+      [&](const vllm::openai::VideoRequest& req) -> std::string {
+        seen_prompt = req.prompt;
+        seen_steps = req.num_inference_steps;
+        return "/tmp/out.mp4";
+      });
+
+  ApiServer::DispatchResult r = h.server.handle_videos_sync(VideoBody());
+  REQUIRE(r.status == 200);
+  CHECK(r.content_type == "application/json");
+  nlohmann::json body = nlohmann::json::parse(r.body);
+  CHECK(body.at("status") == "succeeded");
+  CHECK(body.at("output_path") == "/tmp/out.mp4");
+  // The parsed request actually reached the runner.
+  CHECK(seen_prompt == "a cat");
+  CHECK(seen_steps == 4);
+
+  // The job is retrievable afterwards by id.
+  ApiServer::DispatchResult status =
+      h.server.handle_video_status(body.at("id").get<std::string>());
+  REQUIRE(status.status == 200);
+  CHECK(nlohmann::json::parse(status.body).at("status") == "succeeded");
+}
+
+TEST_CASE("api_server: a throwing runner fails the job, sync and async alike") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  h.server.set_video_runner(
+      [](const vllm::openai::VideoRequest&) -> std::string {
+        throw std::runtime_error("ffmpeg missing");
+      });
+
+  ApiServer::DispatchResult sync_result =
+      h.server.handle_videos_sync(VideoBody());
+  CHECK(sync_result.status == 500);
+  CHECK(nlohmann::json::parse(sync_result.body)
+            .at("error")
+            .at("message")
+            .get<std::string>() == "ffmpeg missing");
+
+  // The async endpoint still accepts the job; the FAILURE surfaces on polling,
+  // and crucially the worker thread does not terminate the process.
+  ApiServer::DispatchResult async_result = h.server.handle_videos(VideoBody());
+  REQUIRE(async_result.status == 200);
+  const std::string id =
+      nlohmann::json::parse(async_result.body).at("id").get<std::string>();
+  std::string status;
+  for (int i = 0; i < 400; ++i) {
+    status = nlohmann::json::parse(h.server.handle_video_status(id).body)
+                 .at("status")
+                 .get<std::string>();
+    if (status == "failed" || status == "succeeded") break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  CHECK(status == "failed");
+}
+
+TEST_CASE("api_server: /v1/videos rejects a malformed body with 400") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  h.server.set_video_runner(
+      [](const vllm::openai::VideoRequest&) -> std::string {
+        FAIL("the runner must not be reached for an invalid request");
+        return {};
+      });
+  CHECK(h.server.handle_videos("{not json").status == 400);
+  CHECK(h.server.handle_videos_sync("{not json").status == 400);
+  // A body that parses but carries no prompt is equally a client error.
+  CHECK(h.server.handle_videos_sync(R"({"num_inference_steps":4})").status == 400);
 }

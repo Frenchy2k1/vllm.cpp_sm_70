@@ -26,12 +26,15 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
+#include "vllm/entrypoints/openai/video_api.h"
 
 namespace vllm::tok {
 class Tokenizer;
@@ -105,6 +108,13 @@ class ApiServer {
   // (serve/instrumentator/metrics.py). Registered only when a metrics logger is
   // attached. Returns 404 (route absent) otherwise; the handler itself returns
   // the exposition with the prometheus content type.
+  // POST /v1/videos       -> enqueue, return {id, status} immediately
+  // POST /v1/videos/sync  -> run to completion, return the .mp4 path
+  // GET  /v1/videos/{id}  -> job status
+  DispatchResult handle_videos(const std::string& request_body);
+  DispatchResult handle_videos_sync(const std::string& request_body);
+  DispatchResult handle_video_status(const std::string& job_id) const;
+
   DispatchResult handle_metrics() const;
   // POST /tokenize, POST /detokenize (serve/tokenize/api_router.py). Registered
   // only when a tokenizer is attached. /tokenize accepts BOTH forms of the
@@ -140,6 +150,19 @@ class ApiServer {
   void set_metrics_logger(const v1::metrics::PrometheusStatLogger* logger) {
     metrics_ = logger;
   }
+  // Attach the video generation+mux runner backing POST /v1/videos and
+  // POST /v1/videos/sync (MiniMax-H3). ADDITIVE and OPT-IN like the routes
+  // above: absent runner => routes unregistered => 404, byte-identical to a
+  // server built without video support.
+  //
+  // The runner performs generation AND muxing and returns the .mp4 path, or
+  // throws to fail the job. The LIBRARY NEVER SPAWNS A PROCESS -- the ffmpeg
+  // invocation lives in examples/ (developer-ratified 2026-08-03), which is
+  // precisely why this enters as a callback rather than a built-in.
+  void set_video_runner(::vllm::openai::VideoRunner runner) {
+    video_runner_ = std::move(runner);
+  }
+
   // Attach the tokenizer + max_model_len backing /tokenize and /detokenize
   // (non-owning; must outlive the server).
   void set_tokenizer(const vllm::tok::Tokenizer* tokenizer,
@@ -197,6 +220,13 @@ class ApiServer {
 
   // Opt-in C8 backings (all nullptr/empty by default → routes not registered).
   const v1::metrics::PrometheusStatLogger* metrics_ = nullptr;
+  ::vllm::openai::VideoRunner video_runner_;
+  mutable ::vllm::openai::VideoJobStore video_jobs_;
+  // Background workers for the ASYNC endpoint. Joined in ~ApiServer, which is
+  // why they are joinable threads and not detached: a detached worker would
+  // outlive `this` and write into a destroyed job store.
+  std::vector<std::thread> video_workers_;
+  std::mutex video_workers_mutex_;
   const vllm::tok::Tokenizer* tokenizer_ = nullptr;
   int64_t max_model_len_ = 0;
   bool tokenizer_info_enabled_ = false;
