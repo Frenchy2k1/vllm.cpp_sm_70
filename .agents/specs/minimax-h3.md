@@ -335,7 +335,13 @@ alpha==0) is **forced to the Marlin W4A16 grouped GEMM**, bypassing the
 capability-based kernel registry. So on sm_121a **every quantized H3 projection
 takes the SAME kernel** — `dense_nvfp4::MatmulNvfp4MarlinD` (single-expert
 `vt::MoeGroupedGemmNvfp4Marlin`), the exact path the Laguna routed-experts
-(`laguna.cpp`) and the dense Qwen3-32B NVFP4 arm (`qwen3_5.cpp`) use. The
+(`laguna.cpp`) and the dense Qwen3-32B NVFP4 arm (`qwen3_5.cpp`) use.
+**MEASURED CORRECTION (GB10, 2026-08-06):** the PRODUCTION default is one level up —
+`VT_MARLIN_DENSE` is default-ON, so `MatmulNvfp4W4A16D` routes each projection through
+vLLM's OWN **dense** Marlin GEMM (`vt::MarlinDenseGemm`, counter `dense_gemms`), and
+the grouped `MoeGroupedGemmNvfp4Marlin` (`marlin_gemms`) is taken only under
+`VT_MARLIN_DENSE=0`. Both are Marlin W4A16 and both are byte-exact to the bf16 arm;
+dense is marginally faster. See §8.4 + the benchmark record. The
 cutlass-FP4 / true-W4A4 route (`MatmulNvfp4Fp4D`) is NOT taken here: it needs fp4
 ACTIVATIONS this checkpoint does not carry, and is deliberately private to
 `qwen3_5.cpp` (`dense_nvfp4_gemm.h:12-18`).
@@ -436,14 +442,36 @@ video flow_shift 12 / audio 3, no CFG; default canvas **768×1344**, default fra
 
 - **W-FP4a: CPU-LANDED + gated** — fp4-resident loader + Marlin-W4A16 routing + the
   fp4-vs-bf16 wiring gate. No new quant code.
-- **W-FP4a GB10 leg: PENDING** — build the CUDA `test_minimax_h3` on dgx.casa,
-  run the CUDA `an NVFP4 checkpoint loads into a runnable DiT` case (the same gate
-  exercises the Marlin path via `marlin_gemms`), and capture the fp4-vs-bf16 delta +
-  steady per-step time. Gated on a safe disk/build window (dgx: 33 G free vs 15 G
-  floor; the 570 G shared `.cache` is not ours to prune).
-- **W-FP4b real-checkpoint t2va e2e: DISK-BLOCKED.** The NVFP4 arm working set is
-  DiT + Qwen3-VL-32B NVFP4 encoder + both VAEs (~41 GB+ on disk to download); with
-  ~18 GB usable above the disk floor it does not fit, and the encoder is required
-  for a real conditioned render. Recorded HW/disk-forced-indirect. A DiT-only
-  steady-per-step at real geometry (fp4 vs bf16) is the reachable speed number once
-  a single NVFP4 DiT variant download fits.
+- **W-FP4a GB10 leg: LANDED (2026-08-06, `row/H3-FP4-GPU-E2E`).** A dedicated CUDA
+  case `minimax_h3: the NVFP4 fp4 forward runs Marlin W4A16 on CUDA (speed)` (the
+  existing "loads into a runnable DiT" case runs the forwards on a CPU queue, so it
+  could never bump the GPU counter) builds the synthetic NVFP4 file at REAL geometry
+  and runs both arms on a CUDA queue. **Marlin RAN:** default `dense_gemms==11`
+  (VT_MARLIN_DENSE is default-ON → vLLM's OWN dense Marlin GEMM, NOT the grouped
+  route §8.1 assumed), `marlin_gemms==11` under VT_MARLIN_DENSE=0, `fallback_gemms==0`
+  in both. **fp4-vs-bf16 delta = 0 (byte-exact).** **Timing crossover** (median/12,
+  cold discarded): per-forward ratio bf16/fp4 = 3.47× @seq64 (fp4 faster,
+  memory-bound), 0.825× @seq4224, 0.788× @seq7040 (fp4 slower, compute-bound). So
+  fp4 W4A16 is a WEIGHT-BANDWIDTH win (decode-like small M) and a ~1.2× LOSS in H3's
+  large-M diffusion forward; its H3 value is MEMORY (~16 GB vs ~66 GB bf16). Benchmark
+  record has the full per-GEMM tables.
+- **W-FP4b real-checkpoint t2va e2e: RUNS on real weights; frame COHERENCE is an open
+  bug.** dgx now has room; the real NVFP4 DiT (`minimax_h3_ref2va_nvfp4_full`,
+  18.75 GB, unpruned) + both VAEs + the GGUF Qwen3-VL-32B encoder were downloaded and
+  the WHOLE t2va chain runs with `--fp4-resident` (new driver flag → the fp4-resident
+  streamer, ~16 GB device vs ~66 GB bf16): encoder → [16,5120] text conditioning →
+  fp4-resident DiT → both VAEs → ffmpeg, producing a valid `h264 256×256 + AAC 32 kHz`
+  mp4 + wav. **But the decoded frame is a structured multicolour patch-grid at the
+  latent-cell scale, NOT a coherent scene — identically at 12/20/50 steps, conditioned
+  or not.** So the composed path is proven to RUN e2e on the real checkpoint, but a
+  coherent render is an OPEN bug (device video-VAE decode and/or denoise convergence
+  at real geometry), independent of the fp4 speed work. **DiT s/step (full 50-layer
+  fp4-resident, per forward):** 5.45 s @512×512/22f, 20.03 s @768×768/61f, 209.09 s
+  @768×1344/209f (the vllm-omni REF canvas). The REF canvas fits in the pool but a full
+  50-step render is ~2.85 h, so it was not run (largest-fitting-config honesty).
+- **Comparability (mission #3):** HW/loader-forced-INDIRECT. 4× B300 BF16 renders a
+  whole 50-step FL2VA 209f in 86.964 s (~1.8 s/forward-equiv); one GB10 fp4-resident
+  is 209 s for ONE forward at the comparable canvas (~116× per-forward) — 4 datacenter
+  GPUs + BF16 + USP-4 + torch.compile + block-caching vs one GB10 + fp4 + none, and
+  vLLM-Omni cannot serve a quantized H3 on one GPU at all. The honest same-box number
+  is the fp4-vs-bf16 ratio (0.79–0.83× per forward, 4× less weight memory).
