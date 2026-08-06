@@ -13286,3 +13286,76 @@ portable tier by construction until G5 lands.
 **Standing lesson for benchmarks against this engine.** A `vt::` quant GEMM
 measured without the loader's repack, or at odd M, is measuring a tier
 production never selects. Any future A/B must state which tier it engaged.
+
+## Why vt's 16-bit CPU GEMM trails ggml: it is llamafile, plus SSE2 on x86 (2026-08-06)
+
+Follow-up to the CORRECTION above. That entry closed the q8_0 question (vt wins
+on Arm once the G7 repack tier is engaged) and left 16-bit open. This attributes
+the 16-bit gap to a specific cause with two controls, rather than assuming the
+kernel is weak. All figures GFLOP/s, f16 weight with f32 activations, conformer
+encoder shapes, 8 threads, median of 7 batches, idle boxes.
+
+### Control 1: native fp16 arithmetic, REFUTED
+
+dgx reports `fphp` and `asimdhp`, and ggml's `simd-mappings.h:254-259` uses
+`float16x8_t` + `vfmaq_f16` (8 half-lanes vs our 4 f32 lanes after widening), so
+the obvious hypothesis was that ggml wins on fp16 FMA throughput. Giving ggml
+f32 weights instead makes no difference (ffn_down 419.8 f16 vs 422.1 f32;
+attn_261 412.9 vs 422.7), so fp16 arithmetic is NOT the mechanism. Recorded as a
+refuted hypothesis so it is not re-run.
+
+### Control 2: llamafile tinyBLAS, CONFIRMED
+
+ggml ships llamafile's tiled sgemm and we have no equivalent. Rebuilding ggml
+with `GGML_LLAMAFILE=OFF`, Arm:
+
+| shape | vt | ggml no-llamafile | ggml stock |
+|---|---:|---:|---:|
+| 256,256,5220 | 222.1 | 212.0 | 441.4 |
+| 131,2048,512 | 220.6 | 214.4 | 419.8 |
+| 131,512,2048 | 216.8 | 215.4 | 416.3 |
+| 131,512,512 | 215.4 | 208.1 | 404.0 |
+| 261,512,512 | 241.7 | 209.9 | 412.9 |
+| 1,640,2560 | 141.3 | 159.2 | 164.9 |
+
+**On Arm our NEON MR=4 kernel is at parity with ggml's stock kernel and slightly
+ahead on four of six shapes.** The whole 16-bit deficit is llamafile: ~1.9x on
+f16, ~1.2x on f32. `KERNEL-GEMM-CPU-ELEM` is not defective.
+
+### x86 carries a second cause
+
+Our x86 tier is SSE2 (128-bit, MR=2, `cpu_matmul_elem.cpp:226-231`) plus F16C
+for conversion only, while the dev box reports `avx2`, `avx512f`, `avx512_bf16`
+and `fma`, none of which we use:
+
+| shape | vt | ggml no-llamafile | ggml stock |
+|---|---:|---:|---:|
+| 256,256,5220 | 170.5 | 449.7 | 423.4 |
+| 131,2048,512 | 166.6 | 587.0 | 1403.2 |
+| 131,512,2048 | 201.6 | 531.9 | 1333.4 |
+| 131,512,512 | 199.2 | 506.5 | 1107.1 |
+| 261,512,512 | 205.9 | 516.9 | 1166.9 |
+| 1,640,2560 | 136.2 | 282.3 | 280.0 |
+
+Decomposing `131,2048,512`: 166.6 to 587.0 is **3.5x and is the
+SSE2-vs-AVX-512 width ratio**; llamafile then adds **2.4x** (587.0 to 1403.2)
+for the ~8.4x total. llamafile does nothing for the 256,256,5220 shape on either
+arch, so its benefit is shape dependent, not uniform.
+
+### Levers this identifies, in priority order
+
+1. **A tinyBLAS-style tiled sgemm for `vt::`.** ~1.9x on 16-bit on Arm and ~2.4x
+   on x86, and it helps every architecture at once. Largest single 16-bit lever.
+2. **x86 AVX2/AVX-512 elementwise tiers.** ~3.5x on x86 alone. This is the
+   SIBLING of quant work row G5: G5 covers the quantized kernels, and nothing
+   currently covers the elementwise ones on x86. Worth a row of its own.
+
+Neither is a micro-optimisation of the current kernel, which is already
+competitive with stock ggml. Caveat carried from the 2026-08-06 op-dispatch
+profile: on the GGUF bench workload the elementwise GEMM is 21.5% of prefill and
+24.9% of decode, so a 1.9x on that term is bounded well below 1.9x end to end,
+and neither lever touches the 47% decode threadpool cost that profile found.
+
+Minor observation: `vt` f16 costs ~1.2x more than its own f32 on Arm (216-242 vs
+260-322) but nothing on x86 (166-206 vs 148-204), so the NEON `vcvt_f32_f16`
+widen in the inner loop has a small cost the x86 F16C path does not.
