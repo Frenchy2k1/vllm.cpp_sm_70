@@ -637,6 +637,41 @@ TEST_CASE("qwen3 dense forward: real Qwen3-0.6B CUDA prefill argmax (dgx-only)")
   CHECK(argmax == 12095);
 }
 
+#ifdef VT_MARLIN_NVFP4
+// QUANT-CT-MXFP4-CLOSERS sliver (a): the shared dense NVFP4/MXFP4 W4A16 route
+// forces moe_block_size=8 at M<=8 (dense_nvfp4_gemm.h::DenseAlignFor), matching
+// vLLM's dense marlin m_block_size_8 = prob_m<=8, while leaving M>8 on the raw
+// MoE-align selection. Direct launch-config assertion: RED against the pre-fix
+// code, whose DenseAlignFor returned MarlinMoeAlignBlockSizeSelect(M,1,1) == 16
+// at M=8. DenseAlignFor allocs device memory + runs the moe_align kernel, so
+// this is CUDA-only. Only dense_nvfp4_gemm.h is changed — the qwen3_5.cpp twin
+// (27B/35B gate models' dense attn + shared-expert) is deliberately untouched.
+TEST_CASE("dense_nvfp4 DenseAlignFor forces block=8 at M<=8 (dgx-only)") {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  vt::Queue q = cuda->CreateQueue();
+  vllm::dense_nvfp4::Dev d{*cuda, q};
+  // The pre-fix production route at M=8 was 16 (padded tile); the sliver forces 8.
+  CHECK(vt::cuda::MarlinMoeAlignBlockSizeSelect(8, 1, 1) == 16);
+  for (int M : {1, 2, 4, 8}) {
+    CAPTURE(M);
+    CHECK(vllm::dense_nvfp4::DenseAlignFor(d, M).block == 8);
+  }
+  // M>8 unchanged: still the MoE-align pick (16 at M in (8,16], 32 at M=16).
+  for (int M : {12, 16}) {
+    CAPTURE(M);
+    CHECK(vllm::dense_nvfp4::DenseAlignFor(d, M).block ==
+          vt::cuda::MarlinMoeAlignBlockSizeSelect(M, 1, 1));
+  }
+  cuda->DestroyQueue(q);
+}
+#endif  // VT_MARLIN_NVFP4
+
 TEST_CASE("qwen3 dense forward: fusion-catalog ADOPT == hand-call fallback (byte-exact)") {
   const HfConfig c = TinyConfig();
   const Qwen3DenseWeights w = TinyWeights(c);
