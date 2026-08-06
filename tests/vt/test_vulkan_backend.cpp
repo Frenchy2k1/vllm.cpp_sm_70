@@ -53,7 +53,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 8);
+  CHECK(n == 10);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -63,8 +63,9 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // The eight registered ops are served by exactly these seven modules (kCastBf16
   // and kCastF32 share vt_cast), so a rename in either direction breaks here
   // rather than at pipeline-creation time on a device we might not have.
-  for (const char* want : {"vt_add", "vt_cast", "vt_fused_chain", "vt_layer_norm", "vt_matmul",
-                           "vt_relu", "vt_rms_norm", "vt_silu_and_mul"}) {
+  for (const char* want : {"vt_add", "vt_cast", "vt_embedding", "vt_fused_chain",
+                           "vt_greedy_argmax", "vt_layer_norm", "vt_matmul", "vt_relu",
+                           "vt_rms_norm", "vt_silu_and_mul"}) {
     bool found = false;
     for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
       if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
@@ -103,6 +104,10 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       REQUIRE(m.spec_id_count == 2);  // src dtype, dst dtype
       CHECK(m.spec_ids[0] == 0u);
       CHECK(m.spec_ids[1] == 1u);
+    } else if (std::strcmp(m.name, "vt_embedding") == 0) {
+      // table dtype, out dtype, id width (i32 vs i64).
+      REQUIRE(m.spec_id_count == 3);
+      for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul") == 0) {
       // a dtype, b dtype, out dtype, orientation: 3*3*3*2 = 54 variants served by
       // ONE committed module, which is the argument for specialization constants
@@ -317,13 +322,16 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
   for (vt::OpId op : {vt::OpId::kAdd, vt::OpId::kRelu, vt::OpId::kSiluAndMul,
                       vt::OpId::kCastBf16, vt::OpId::kCastF32, vt::OpId::kLayerNorm,
                       vt::OpId::kRmsNorm, vt::OpId::kFusedChain,
-                      // VK-B: the dense path's GEMM, both orientations.
-                      vt::OpId::kMatmul, vt::OpId::kMatmulBT}) {
+                      // VK-B: the dense path's GEMM (both orientations) and the
+                      // two ends of the model, token ids in and out.
+                      vt::OpId::kMatmul, vt::OpId::kMatmulBT,
+                      vt::OpId::kEmbedding, vt::OpId::kGreedyArgmax}) {
     CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
-  // No NATIVE Vulkan kernel yet for attention, KV cache, embedding, sampling.
+  // No NATIVE Vulkan kernel yet for attention, the KV cache, RoPE, or the
+  // sampler beyond greedy argmax.
   for (vt::OpId op : {vt::OpId::kPagedAttention, vt::OpId::kReshapeAndCache,
-                      vt::OpId::kEmbedding, vt::OpId::kGreedyArgmax}) {
+                      vt::OpId::kRopeNeox, vt::OpId::kApplyTemperature}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
   // ...but they no longer THROW, and this assertion used to say they did.

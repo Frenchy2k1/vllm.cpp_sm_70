@@ -68,6 +68,19 @@ class Binder {
   // A raw buffer bound ONCE (no 16-bit view): the fused-chain step list.
   void AddRaw(void* buffer) { buffers_.push_back(buffer); }
 
+  // A tensor bound through the uint32_t view ONLY, for shaders that declare a
+  // single binding per operand because the operand is integer (embedding ids,
+  // sampler token ids) or f32-by-contract (logits). Binding the unused 16-bit
+  // view would need the shader to declare it too, and a descriptor a shader does
+  // not declare must not be written.
+  uint32_t AddU32Only(const Tensor& t, const char* what) {
+    Resolved r = Resolve(t.data, what);
+    buffers_.push_back(r.buffer);
+    VT_CHECK(r.offset % 4 == 0,
+             std::string("vulkan: ") + what + " has a byte offset that is not 4-byte aligned");
+    return r.offset;
+  }
+
   const void* const* data() const { return buffers_.data(); }
   uint32_t count() const { return static_cast<uint32_t>(buffers_.size()); }
 
@@ -92,6 +105,12 @@ struct CastParams {
 };
 struct MatmulParams {
   uint32_t m, n, k, a_off, b_off, out_off;
+};
+struct EmbeddingParams {
+  uint32_t t, h, table_off, ids_off, out_off;
+};
+struct ArgmaxParams {
+  uint32_t n, v, logits_off, out_off;
 };
 struct SiluMulParams {
   uint32_t t, d, x_dt, out_dt, x_off, out_off;
@@ -337,6 +356,42 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   Go("vt_matmul", bind, p, FlatGroupCount(m * n), spec, 4);
 }
 
+// cpu_ops.cpp:661-672 EmbeddingKernel. One output ELEMENT per invocation.
+// The id dtype (i32 vs i64) is a specialization constant rather than a
+// per-element branch; see the shader for why only the low 32 bits are read.
+void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
+  const int64_t t = ids.shape[0], h = table.shape[1];
+  if (t == 0 || h == 0) return;
+  VT_CHECK(ids.dtype == DType::kI32 || ids.dtype == DType::kI64,
+           "vulkan embedding: ids must be i32 or i64");
+  Binder bind;
+  const uint32_t table_off = bind.Add(table, "embedding: table");
+  const uint32_t ids_off = bind.Add(ids, "embedding: ids");
+  const uint32_t out_off = bind.Add(out, "embedding: out");
+  const uint32_t spec[3] = {DtypeCode(table.dtype), DtypeCode(out.dtype),
+                            ids.dtype == DType::kI64 ? 1u : 0u};
+  EmbeddingParams p{static_cast<uint32_t>(t), static_cast<uint32_t>(h), table_off, ids_off,
+                    out_off};
+  Go("vt_embedding", bind, p, FlatGroupCount(t * h), spec, 3);
+}
+
+// cpu_sample.cpp:40-56 GreedyArgmaxKernel. ONE INVOCATION PER ROW, because the
+// tie-break (strict `>`, so the first maximum wins) is part of the token-exact
+// contract and a tree reduction would have to carry the index and break ties
+// toward the lower one at every merge. Rows are few at decode; the vocabulary
+// scan is the slow axis and is deliberately left for a later change.
+void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  if (n == 0 || v == 0) return;
+  VT_CHECK(logits.dtype == DType::kF32, "vulkan greedy argmax: logits must be f32");
+  VT_CHECK(token_ids.dtype == DType::kI64, "vulkan greedy argmax: token_ids must be i64");
+  Binder bind;
+  const uint32_t logits_off = bind.AddU32Only(logits, "argmax: logits");
+  const uint32_t out_off = bind.AddU32Only(token_ids, "argmax: token_ids");
+  ArgmaxParams p{static_cast<uint32_t>(n), static_cast<uint32_t>(v), logits_off, out_off};
+  Go("vt_greedy_argmax", bind, p, FlatGroupCount(n));
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -345,6 +400,10 @@ struct Registrar {
     if (!VulkanContext::Available()) return;
     // static_cast against the ops.h aliases ties every kernel signature to the
     // registration contract at COMPILE time (the cpu_ops.cpp idiom).
+    RegisterOp(OpId::kEmbedding, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
+    RegisterOp(OpId::kGreedyArgmax, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<GreedyArgmaxFn>(&GreedyArgmaxKernel)));
     RegisterOp(OpId::kMatmul, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulGeneric<false>)));
     RegisterOp(OpId::kMatmulBT, DeviceType::kVULKAN,
