@@ -21,6 +21,13 @@ The contract block looks like this, and is a normal Markdown table to a reader:
     |---|---|
     | `docs/STATUS.md` | every feature/iteration checkpoint |
     <!-- doc-obligation-contract:end -->
+
+The same gate now also asserts that `.agents/workflow.md` carries the ROLE
+INTERVIEW, between `<!-- role-interview:begin -->` and its `:end`. That is the
+same failure with the polarity flipped: agent-preflight.sh refuses a session
+that has not declared a role, so an agent who is never told the question, or
+never told that `read-only` is one of the answers, meets a red gate with no
+instructions -- and a gate people cannot satisfy is a gate people route around.
 """
 
 from __future__ import annotations
@@ -39,6 +46,15 @@ CONTRACT_DOCUMENTS = ("AGENTS.md", ".agents/workflow.md")
 
 BEGIN = "<!-- doc-obligation-contract:begin -->"
 END = "<!-- doc-obligation-contract:end -->"
+
+# The session manual must carry the role interview, because agent-preflight.sh
+# now FAILS a session that has not declared a role. A gate whose precondition is
+# written down nowhere is the same drift this file exists to prevent, with the
+# polarity flipped: instead of prose demanding what the checker dropped, the
+# checker demands what no prose ever taught.
+INTERVIEW_DOCUMENT = ".agents/workflow.md"
+INTERVIEW_MARKER = "<!-- role-interview:begin -->"
+INTERVIEW_REQUIRED = ("claim operator", "claim helper --row", "claim read-only", "--headless")
 
 # A path in a table cell, e.g. `docs/STATUS.md`.
 CELL_PATH = re.compile(r"`([^`]+\.md)`")
@@ -114,10 +130,29 @@ def document_errors(name: str, text: str, expected: tuple[str, ...]) -> list[str
     return errors
 
 
+def interview_errors(text: str) -> list[str]:
+    """The role interview must live where agents read it, not only in a gate."""
+    if INTERVIEW_MARKER not in text:
+        return [f"{INTERVIEW_DOCUMENT} is missing the role-interview block"]
+    return [
+        f"{INTERVIEW_DOCUMENT} role interview omits {needle!r}"
+        for needle in INTERVIEW_REQUIRED
+        if needle not in text
+    ]
+
+
 def main() -> int:
     expected = obligated_surfaces()
     failures: list[str] = []
     blocks: dict[str, list[str] | None] = {}
+
+    interview = ROOT / INTERVIEW_DOCUMENT
+    if not interview.exists():
+        failures.append(f"{INTERVIEW_DOCUMENT} does not exist")
+    else:
+        failures.extend(
+            interview_errors(interview.read_text(encoding="utf-8"))
+        )
 
     for name in CONTRACT_DOCUMENTS:
         path = ROOT / name
@@ -145,7 +180,9 @@ def main() -> int:
             "The obligated public surfaces are defined by PUBLIC_CHECKPOINTS and "
             "FEATURE_CHECKPOINT in scripts/check-doc-checkpoint.py. Mirror them "
             "in the contract block of every document listed in "
-            "CONTRACT_DOCUMENTS.",
+            "CONTRACT_DOCUMENTS. The role interview is the block between "
+            f"{INTERVIEW_MARKER} and its :end in {INTERVIEW_DOCUMENT}; it must "
+            "name every answer agent-role.py accepts.",
             file=sys.stderr,
         )
         return 1
@@ -153,7 +190,8 @@ def main() -> int:
     print(
         "OK: the doc-obligation contract in "
         f"{' and '.join(CONTRACT_DOCUMENTS)} matches "
-        "scripts/check-doc-checkpoint.py."
+        f"scripts/check-doc-checkpoint.py, and {INTERVIEW_DOCUMENT} carries the "
+        "role interview."
     )
     return 0
 

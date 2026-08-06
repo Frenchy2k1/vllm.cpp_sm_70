@@ -92,6 +92,7 @@ jobs:
         run: |
           python3 scripts/check-role-discipline.py
           python3 tests/scripts/test_agent_role.py
+          python3 tests/scripts/test_agent_onboard.py
       - name: Claim view, helper queue and PR reviewability
         run: |
           python3 scripts/claim-view.py --check

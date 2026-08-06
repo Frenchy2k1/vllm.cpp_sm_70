@@ -5,16 +5,57 @@ and continue. Follow this protocol every session.
 
 ## Session protocol
 
+<!-- role-interview:begin -->
+### First question of every session
+
+`scripts/agent-preflight.sh` fails until this session has declared a role. Ask
+what the work is — not which role the developer wants, which is vocabulary they
+should not have to learn first.
+
+**Run `scripts/agent-role.py show` before asking.** The marker is keyed on the
+WORKTREE and has no TTL, so a checkout that ever claimed carries that role into
+every later session silently, and preflight will not prompt. "First question of
+every session" is therefore first question per WORKTREE: if `show` reports a
+role this session did not choose, re-claim rather than inherit it.
+
+| What are you here to do? | Claim | What it means |
+|---|---|---|
+| A long or multi-step campaign — several changes, a benchmark grid, a whole row block | `scripts/agent-role.py claim operator` | Owns `main` and the GPU. Merges PRs first. Drives feature work through sub-agents rather than writing it. One at a time, repo-wide. |
+| One scoped change — a fix, a port, a single row | `scripts/agent-role.py claim helper --row <ROW-ID>` | Isolated worktree on `row/<ROW-ID>`, draft PR opened at the START. That PR **is** the claim. Never touches `main`. |
+| Just looking — reading code, answering a question | `scripts/agent-role.py claim read-only` | No lock, no worktree, no claim. Passes a plain preflight; `scripts/agent-preflight.sh --staged` refuses it. |
+
+`read-only` is a declared **absence** of claim, not a third role. Escalating is
+one command. Its refusal is NARROW, and saying otherwise would be the drift this
+manual exists to prevent: `scripts/agent-preflight.sh --staged` is the ONLY
+write path that refuses a `read-only` session. `git commit`, `git push`, the
+`gate && git push` chain (that preflight runs WITHOUT `--staged`) and every
+record or matrix edit all proceed unimpeded. Past staging, `read-only` is the
+honour system, not a guard — repo-wide write refusal is not built.
+
+Add `--headless` when the developer has said the run is unattended: decide,
+record each decision in `.agents/state.md`, never block, never merge, park what
+will not go green. Headless is **declared, never inferred** — not from the hour,
+not from silence, not from a long task.
+
+`.env` is asked **just in time**: when a gate needs a value, ask for that value
+and write it with `scripts/agent-onboard.py --env-set KEY=VALUE`. Never walk the
+whole template up front, and never infer a value from a username, a path or a
+machine identity. Unanswered means empty, and empty means the gates that need it
+stay `PENDING`.
+
+Run `scripts/agent-onboard.py --probe` to see what is still unresolved.
+<!-- role-interview:end -->
+
 0. **Declare your role** before anything else, if this session has not already:
-   `scripts/agent-role.py show` (exit 3 = undeclared), then
-   `claim operator` or `claim helper --row <ROW-ID>`. Helpers then create their
-   worktree, `row/<ROW-ID>` branch and DRAFT PR immediately — the draft PR is
-   the claim. `scripts/ready-for-helper.py` lists what a helper may pick. Full
-   protocol: [specs/operator-helper-protocol.md](specs/operator-helper-protocol.md).
-   In a fresh checkout with no untracked `.env`, first walk the developer
-   through creating it interactively (the `.env.example` template +
-   [environment registration](environment.md#registering-your-own-environment)
-   — see AGENTS.md); like the role, the environment is asked, never inferred.
+   `scripts/agent-role.py show` (exit 3 = undeclared), then the answer from the
+   interview above. A role keys on the WORKTREE, so one worktree is one role and
+   it survives the loss of a session id. Helpers then create their worktree,
+   `row/<ROW-ID>` branch and DRAFT PR immediately — the draft PR is the claim.
+   `scripts/ready-for-helper.py` lists what a helper may pick. Full protocol:
+   [specs/operator-helper-protocol.md](specs/operator-helper-protocol.md).
+   The environment is asked the same way — never inferred — but per VALUE and
+   only when a gate needs it, against the `.env.example` template and
+   [environment registration](environment.md#registering-your-own-environment).
 1. **Orient**: read [NOW.md](NOW.md) FIRST — it is the one-Read resume surface
    (live claims, current gate, next actions) and is rewritten in place every
    checkpoint. The state tail is trustworthy only below the

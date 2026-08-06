@@ -35,6 +35,7 @@ def _load(name: str, relative: str):
 
 
 discipline = _load("role_discipline", "scripts/check-role-discipline.py")
+role = _load("agent_role", "scripts/agent-role.py")
 ROLE_SCRIPT = ROOT / "scripts/agent-role.py"
 
 
@@ -46,8 +47,8 @@ def run_role(repo: Path, session: str, *args: str):
     )
 
 
-class RoleLifecycle(unittest.TestCase):
-    """Exercised against a throwaway repo, never the real one."""
+class _TempRepo:
+    """A throwaway git repo per test. The real checkout is never touched."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -61,6 +62,22 @@ class RoleLifecycle(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def worktree(self, name: str) -> Path:
+        """A real second worktree of the throwaway repo.
+
+        A role keys on the worktree, so both surviving invariants -- one
+        operator per repo, and helper isolation -- can only be proven with a
+        genuine second worktree rather than a second session id.
+        """
+        path = self.repo / f".{name}"
+        subprocess.run(["git", "worktree", "add", "-q", str(path), "-b", name],
+                       cwd=self.repo, check=True, capture_output=True)
+        return path
+
+
+class RoleLifecycle(_TempRepo, unittest.TestCase):
+    """Exercised against a throwaway repo, never the real one."""
+
     def test_undeclared_session_exits_3(self) -> None:
         self.assertEqual(run_role(self.repo, "a", "show").returncode, 3)
 
@@ -71,18 +88,33 @@ class RoleLifecycle(unittest.TestCase):
         self.assertIn("role=operator", out.stdout)
 
     def test_second_operator_is_refused(self) -> None:
-        """The core mutual-exclusion guarantee."""
+        """The core mutual-exclusion guarantee.
+
+        Stated across WORKTREES since the 2026-08-06 correction: a role keys on
+        the worktree, so a second session in the SAME worktree is the same
+        operator (idempotent), while the lock in the git common dir still
+        refuses a genuinely different one.
+        """
         run_role(self.repo, "a", "claim", "operator")
-        second = run_role(self.repo, "b", "claim", "operator")
+        second = run_role(self.worktree("rival"), "b", "claim", "operator")
         self.assertEqual(second.returncode, 1)
         self.assertIn("already held", second.stderr)
 
-    def test_other_session_does_not_inherit_the_role(self) -> None:
-        """Sessions sharing one checkout must not read each other's marker."""
+    def test_another_session_in_the_same_worktree_shares_the_role(self) -> None:
+        """The accepted cost of keying on the worktree, made explicit.
+
+        This test asserted the opposite until 2026-08-06. The session id was
+        measured NOT to be stable across tool calls in a real harness, so
+        requiring it made a declared role invisible one call later and turned
+        --require-role default-on into an unpassable gate rather than a strict
+        one. Isolation is preserved where it is real -- see
+        test_helper_marker_does_not_leak_into_another_worktree -- and
+        .agents/specs/session-onboarding.md records the trade.
+        """
         run_role(self.repo, "a", "claim", "operator")
         other = run_role(self.repo, "b", "show")
-        self.assertEqual(other.returncode, 3)
-        self.assertIn("UNDECLARED", other.stdout)
+        self.assertEqual(other.returncode, 0)
+        self.assertIn("role=operator", other.stdout)
 
     def test_helper_requires_a_row(self) -> None:
         self.assertEqual(run_role(self.repo, "a", "claim", "helper").returncode, 2)
@@ -104,7 +136,10 @@ class RoleLifecycle(unittest.TestCase):
         record = json.loads(lock.read_text())
         record["heartbeat"] = time.time() - (10 * 60 * 60)
         lock.write_text(json.dumps(record))
-        took = run_role(self.repo, "b", "claim", "operator")
+        # From ANOTHER worktree: re-claiming inside the worktree that already
+        # holds the lock is the same operator and is idempotent, so a crashed
+        # operator can only be displaced from somewhere else.
+        took = run_role(self.worktree("successor"), "b", "claim", "operator")
         self.assertEqual(took.returncode, 0)
         self.assertIn("STALE", took.stderr)  # broken, but never silently
 
@@ -115,6 +150,218 @@ class RoleLifecycle(unittest.TestCase):
             cwd=self.repo, text=True).strip()
         (Path(common) / "vllm-cpp-operator.lock").unlink()
         self.assertEqual(run_role(self.repo, "a", "show").returncode, 3)
+
+
+class WorktreeKeyedRole(_TempRepo, unittest.TestCase):
+    """A role keys on the WORKTREE, not the session (user-directed 2026-08-06).
+
+    `.agents/specs/session-onboarding.md`, "Correction: a role keys on the
+    WORKTREE, not the session". Every test here dies if `resolve()` goes back to
+    comparing `marker['session']` to the current process.
+    """
+
+    def test_helper_role_survives_a_new_session_id(self) -> None:
+        # THE regression this correction exists to prevent: claim in one tool
+        # call, resolve in the next, where the parent pid has already changed.
+        self.assertEqual(
+            run_role(self.repo, "call-1", "claim", "helper", "--row", "ENG-FOO").returncode,
+            0,
+        )
+        later = run_role(self.repo, "call-2-different-pid", "show")
+        self.assertEqual(later.returncode, 0)
+        self.assertIn("role=helper", later.stdout)
+        self.assertIn("row=ENG-FOO", later.stdout)
+
+    def test_operator_role_survives_a_new_session_id(self) -> None:
+        # The lock is what makes an operator an operator, so lock OWNERSHIP has
+        # to key on the worktree too. Key only the marker and the operator alone
+        # still dies at the call boundary, which is the failure that matters
+        # most: the operator is the role that lands on main.
+        run_role(self.repo, "call-1", "claim", "operator")
+        later = run_role(self.repo, "call-2-different-pid", "show")
+        self.assertEqual(later.returncode, 0)
+        self.assertIn("role=operator", later.stdout)
+
+    def test_resolve_ignores_the_marker_session(self) -> None:
+        # The same pin driven through resolve() itself rather than the CLI: a
+        # marker whose recorded session is NOT this process's must still
+        # resolve, and the recorded session must survive as provenance.
+        run_role(self.repo, "some-other-session", "claim", "helper", "--row", "ENG-BAR")
+        marker = json.loads(
+            (self.repo / ".git/vllm-cpp-agent-role").read_text(encoding="utf-8"))
+        self.assertEqual(marker["session"], "some-other-session")
+
+        saved_env = os.environ.get("VLLM_CPP_AGENT_SESSION")
+        saved_cwd = os.getcwd()
+        os.environ["VLLM_CPP_AGENT_SESSION"] = "a-completely-different-session"
+        os.chdir(self.repo)
+        try:
+            state = role.resolve()
+        finally:
+            os.chdir(saved_cwd)
+            if saved_env is None:
+                os.environ.pop("VLLM_CPP_AGENT_SESSION", None)
+            else:
+                os.environ["VLLM_CPP_AGENT_SESSION"] = saved_env
+
+        self.assertEqual(state["role"], "helper")
+        self.assertEqual(state["row"], "ENG-BAR")
+        self.assertEqual(state["declared_by"], "some-other-session")
+
+    def test_one_operator_per_repo_holds_across_worktrees(self) -> None:
+        # Keying on the worktree must not WIDEN the lock: it lives in the git
+        # common dir, shared by every worktree, and that is the scope of "one
+        # operator per repo".
+        self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
+        second = run_role(self.worktree("rival"), "b", "claim", "operator")
+        self.assertEqual(second.returncode, 1)
+        self.assertIn("already held", second.stderr)
+
+    def test_helper_marker_does_not_leak_into_another_worktree(self) -> None:
+        # Isolation, asserted where it is now real. The SAME session id in
+        # another worktree must resolve as undeclared: a helper materializes its
+        # own worktree, so its marker cannot reach anyone else's.
+        run_role(self.repo, "a", "claim", "helper", "--row", "ENG-FOO")
+        out = run_role(self.worktree("elsewhere"), "a", "show")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("UNDECLARED", out.stdout)
+
+    def _lock(self, repo: Path) -> Path:
+        common = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=repo, text=True).strip()
+        return Path(common) / "vllm-cpp-operator.lock"
+
+    def _resolve_in(self, where: Path) -> dict:
+        """resolve()'s OWN return value, read in `where`.
+
+        The CLI prints a rendering; several keys of the resolved state never
+        reach stdout, so a dict-level assertion is the only way to pin them.
+        """
+        saved = os.getcwd()
+        os.chdir(where)
+        try:
+            return role.resolve()
+        finally:
+            os.chdir(saved)
+
+    def test_reclaiming_your_own_lock_refreshes_the_heartbeat(self) -> None:
+        # The idempotent branch REWRITES the record instead of passing. With
+        # ownership keyed on the worktree a live operator is likelier to
+        # re-claim than to heartbeat, and a lock that ages out while its owner
+        # is alive gets broken by someone else.
+        run_role(self.repo, "a", "claim", "operator")
+        lock = self._lock(self.repo)
+        record = json.loads(lock.read_text(encoding="utf-8"))
+        record["heartbeat"] = time.time() - (10 * 60 * 60)
+        lock.write_text(json.dumps(record), encoding="utf-8")
+
+        run_role(self.repo, "b", "claim", "operator")
+        self.assertGreater(
+            json.loads(lock.read_text(encoding="utf-8"))["heartbeat"],
+            time.time() - 60,
+        )
+
+    def test_a_legacy_lock_cannot_produce_two_operators(self) -> None:
+        # A lock written BEFORE the 2026-08-06 correction carries no worktree,
+        # so ownership falls back to its recorded session -- and two worktrees
+        # under the same session id would both read it as theirs. Rewriting on
+        # the idempotent branch stamps the worktree on, so the fallback heals
+        # the first time it is used and only one worktree stays the operator.
+        run_role(self.repo, "s1", "claim", "operator")
+        lock = self._lock(self.repo)
+        legacy = json.loads(lock.read_text(encoding="utf-8"))
+        del legacy["worktree"]
+        lock.write_text(json.dumps(legacy), encoding="utf-8")
+
+        twin = self.worktree("twin")
+        self.assertEqual(run_role(twin, "s1", "claim", "operator").returncode, 0)
+        resolved = [
+            run_role(self.repo, "s1", "show"),
+            run_role(twin, "s1", "show"),
+        ]
+        operators = [r for r in resolved if r.returncode == 0 and "role=operator" in r.stdout]
+        self.assertEqual(
+            len(operators), 1,
+            f"exactly one operator expected, got {[r.stdout for r in resolved]}")
+
+    def test_an_operator_marker_beaten_to_the_lock_reports_the_lockout(self) -> None:
+        # Keying lock OWNERSHIP on the worktree made this branch reachable from
+        # a LIVE RIVAL, not only from a self-lost lock: another worktree can now
+        # hold the lock while this one still carries an operator marker. Without
+        # operator_held_by_other the state is indistinguishable from "never
+        # declared" -- same JSON, same cmd_show output, same probe NOTE (none) --
+        # and every one of those tells the session to `claim operator`, which
+        # exits 1. Deleting the key from this branch must go red.
+        self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
+        self._lock(self.repo).unlink()
+        rival = self.worktree("live-rival")
+        self.assertEqual(run_role(rival, "b", "claim", "operator").returncode, 0)
+
+        state = self._resolve_in(self.repo)
+        self.assertIsNone(state["role"])
+        self.assertEqual(
+            state["reason"], "operator marker without a held lock; re-claim")
+        # .get, so DROPPING the key fails on the value rather than erroring
+        # on the lookup: a missing signal is the same defect as a false one.
+        self.assertIs(state.get("operator_held_by_other"), True)
+        # the CLI surface, which is what an agent actually reads
+        shown = run_role(self.repo, "a", "show")
+        self.assertEqual(shown.returncode, 3)
+        self.assertIn("held by another live session", shown.stdout)
+
+    def test_a_self_lost_lock_is_not_reported_as_a_rival(self) -> None:
+        # The other side of the same key: with the lock simply GONE there is no
+        # rival, so a blanket True would be a different lie. Hardcoding the key
+        # either way now fails one of these two tests.
+        run_role(self.repo, "a", "claim", "operator")
+        self._lock(self.repo).unlink()
+        state = self._resolve_in(self.repo)
+        self.assertIsNone(state["role"])
+        self.assertIs(state.get("operator_held_by_other"), False)
+        self.assertNotIn("another live session", run_role(self.repo, "a", "show").stdout)
+
+    def test_downgrading_out_of_operator_releases_the_lock(self) -> None:
+        # `claim read-only` ("just looking") is the exact next command an
+        # operator types, and leaving the lock behind is worse than holding no
+        # role: heartbeat answers "not the operator; nothing to heartbeat", so
+        # nothing renews it, and a second worktree is refused for the full 2h
+        # TTL by a session that holds no role at all.
+        self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
+        self.assertTrue(self._lock(self.repo).exists())
+        downgrade = run_role(self.repo, "a", "claim", "read-only")
+        self.assertEqual(downgrade.returncode, 0, downgrade.stderr)
+        self.assertFalse(self._lock(self.repo).exists())
+        self.assertIn("role=read-only", run_role(self.repo, "a", "show").stdout)
+        # the lock is genuinely free, not merely absent from this worktree
+        successor = run_role(self.worktree("successor"), "b", "claim", "operator")
+        self.assertEqual(successor.returncode, 0, successor.stderr)
+
+    def test_downgrading_to_helper_releases_the_lock_too(self) -> None:
+        # Same rule, the other non-operator answer: the release keys on "the
+        # claimed role is not operator", not on read-only specifically.
+        run_role(self.repo, "a", "claim", "operator")
+        self.assertEqual(
+            run_role(self.repo, "a", "claim", "helper", "--row", "ENG-FOO").returncode, 0)
+        self.assertFalse(self._lock(self.repo).exists())
+
+    def test_a_downgrade_never_frees_ANOTHER_worktrees_lock(self) -> None:
+        # The release must use the same ownership test `release` does. A
+        # read-only claim in one worktree stealing the operator lock from
+        # another would be the mutual-exclusion guarantee inverted.
+        run_role(self.repo, "a", "claim", "operator")
+        elsewhere = self.worktree("bystander")
+        self.assertEqual(run_role(elsewhere, "b", "claim", "read-only").returncode, 0)
+        self.assertTrue(self._lock(self.repo).exists())
+        self.assertIn("role=operator", run_role(self.repo, "a", "show").stdout)
+
+    def test_release_from_a_new_session_frees_the_lock(self) -> None:
+        # Release has to cross the call boundary as well, or a lock taken in one
+        # call is unreleasable in the next and wedges the repo until the TTL.
+        run_role(self.repo, "call-1", "claim", "operator")
+        run_role(self.repo, "call-2-different-pid", "release")
+        taken = run_role(self.worktree("next"), "c", "claim", "operator")
+        self.assertEqual(taken.returncode, 0)
 
 
 class RoleDiscipline(unittest.TestCase):
@@ -187,7 +434,101 @@ class RoleDiscipline(unittest.TestCase):
         self.assertTrue(discipline.enforced("HEAD"))
 
     def test_live_repository_is_reportable(self) -> None:
-        self.assertEqual(discipline.main(), 0)
+        # main() parses sys.argv, which under `unittest -v` still carries the
+        # runner's own flags and made argparse SystemExit(2) here. The argv is
+        # isolated; the assertion is unchanged.
+        saved = sys.argv
+        sys.argv = [saved[0]]
+        try:
+            self.assertEqual(discipline.main(), 0)
+        finally:
+            sys.argv = saved
+
+
+class ReadOnlyAndModeTests(unittest.TestCase):
+    def test_claimable_roles_stay_exactly_two(self):
+        # read-only must never become a third claimable role: it takes no lock
+        # and no worktree. CLAIMABLE_ROLES is the vocabulary a "may this session
+        # write?" test is meant to key on; it has no consumer outside
+        # agent-role.py and this suite today, so this pin protects the
+        # constant's meaning rather than a live refusal.
+        self.assertEqual(role.CLAIMABLE_ROLES, ("operator", "helper"))
+        self.assertIn("read-only", role.DECLARABLE)
+        self.assertNotIn("read-only", role.CLAIMABLE_ROLES)
+
+    def test_read_only_is_declarable(self):
+        self.assertIn("read-only", role.DECLARABLE)
+
+    def test_the_roles_alias_is_not_widened(self):
+        # ROLES is the alias a write-gating call site would import; no such
+        # call site exists yet, so keeping it the CLAIMABLE pair is what stops
+        # the first one from being born wrong. Mutating it to DECLARABLE leaves every other
+        # assertion in this suite green, so the constraint that keeps read-only
+        # out of "may this session write?" would be enforced by comment only.
+        self.assertEqual(role.ROLES, role.CLAIMABLE_ROLES)
+        self.assertNotIn("read-only", role.ROLES)
+
+    def test_mode_defaults_to_interactive(self):
+        # Headless is DECLARED, never inferred. Absent an explicit flag the
+        # session is interactive.
+        self.assertEqual(role.mode_from_marker({}), "interactive")
+        self.assertEqual(role.mode_from_marker({"mode": "headless"}), "headless")
+        self.assertEqual(role.mode_from_marker({"mode": "nonsense"}), "interactive")
+
+
+class ReadOnlyAndModeResolved(_TempRepo, unittest.TestCase):
+    """Drives resolve() itself, not only the pure helpers above.
+
+    mode_from_marker() can be perfectly correct while resolve() never calls it:
+    the key would simply be absent from the resolved state and a test that only
+    exercised the helper would stay green. So these claim through the real CLI
+    and read the mode back out of resolve()'s OWN return value.
+    """
+
+    def _resolve_as(self, session: str, where: Path | None = None) -> dict:
+        cwd = os.getcwd()
+        saved = os.environ.get("VLLM_CPP_AGENT_SESSION")
+        os.chdir(where or self.repo)
+        os.environ["VLLM_CPP_AGENT_SESSION"] = session
+        try:
+            return role.resolve()
+        finally:
+            os.chdir(cwd)
+            if saved is None:
+                del os.environ["VLLM_CPP_AGENT_SESSION"]
+            else:
+                os.environ["VLLM_CPP_AGENT_SESSION"] = saved
+
+    def test_resolve_carries_a_declared_headless_mode(self) -> None:
+        claimed = run_role(self.repo, "a", "claim", "read-only", "--headless")
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        state = self._resolve_as("a")
+        self.assertEqual(state["role"], "read-only")
+        self.assertEqual(state["mode"], "headless")
+
+    def test_resolve_reports_interactive_unless_headless_was_declared(self) -> None:
+        run_role(self.repo, "a", "claim", "helper", "--row", "ENG-FOO")
+        self.assertEqual(self._resolve_as("a")["mode"], "interactive")
+        # An UNDECLARED context is interactive too: silence is never headless.
+        # Genuinely undeclared means another WORKTREE since the 2026-08-06
+        # correction; another session id in THIS one resolves to the role that
+        # was declared here.
+        undeclared = self._resolve_as("b", where=self.worktree("undeclared"))
+        self.assertIsNone(undeclared["role"])
+        self.assertEqual(undeclared["mode"], "interactive")
+
+    def test_read_only_takes_no_operator_lock(self) -> None:
+        # The whole reason read-only exists: a session that only reads must not
+        # hold the repo-wide operator lock, or it blocks a real operator.
+        self.assertEqual(run_role(self.repo, "a", "claim", "read-only").returncode, 0)
+        common = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=self.repo, text=True).strip()
+        self.assertFalse((Path(common) / "vllm-cpp-operator.lock").exists())
+        self.assertIn("role=read-only", run_role(self.repo, "a", "show").stdout)
+        # ... and a real operator elsewhere is still free to take the lock.
+        self.assertEqual(
+            run_role(self.worktree("real-operator"), "b", "claim", "operator").returncode, 0)
 
 
 if __name__ == "__main__":

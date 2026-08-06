@@ -69,7 +69,7 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 into a lock or worktree+PR; operator merges PRs first and does features only via
 sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
 START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
-`--require-role` still opt-in. Queue: 10 rows — 6 are audit-vacated, with LANDED gate anchors; READ before picking. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
+`--require-role` is the DEFAULT. Queue: 10 rows — 6 are audit-vacated, with LANDED gate anchors; READ before picking. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
 OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated

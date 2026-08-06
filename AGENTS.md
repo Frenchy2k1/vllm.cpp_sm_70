@@ -102,15 +102,30 @@ version, this list is the reminder.
 - **Run `scripts/agent-preflight.sh`** at session start and before committing,
   and chain the push to it (`gate && git push`) so a red gate cannot be followed
   by a green push.
-- **Know your ROLE before you work.** Operator or helper
+- **Know your ROLE before you work**, and ASK for it as the FIRST question of
+  the session — the interview is in
+  [workflow.md](.agents/workflow.md#first-question-of-every-session)
   ([protocol](.agents/specs/operator-helper-protocol.md)). It cannot be derived
   at session start — several sessions launch from one checkout — so DECLARE it
-  (`scripts/agent-role.py claim operator|helper --row <ROW-ID>`), which
-  materializes it into an exclusive lock or a worktree+PR, after which it is
-  re-derived rather than remembered. A helper works in an isolated worktree on
-  `row/<ROW-ID>` and opens a DRAFT PR at the START: that PR **is** the claim.
-  The operator merges PRs first thing, owns `main` and the GPU, and drives
-  feature work through sub-agents rather than writing it.
+  (`scripts/agent-role.py claim operator|helper --row <ROW-ID>|read-only`),
+  which materializes it into an exclusive lock or a worktree+PR, after which it
+  is re-derived from the WORKTREE rather than remembered. The marker carries no
+  TTL, so in practice this is the first question per WORKTREE, not per session:
+  a later session in a checkout that ever claimed INHERITS that role silently.
+  Run `scripts/agent-role.py show` first and re-declare if it is not yours.
+  `scripts/agent-preflight.sh` FAILS an undeclared session BY DEFAULT
+  (`--no-require-role` opts out), so this is a gate, not a convention.
+  `read-only` is the third answer and a declared ABSENCE of claim — no lock, no
+  worktree, passes a plain preflight, and refused by `agent-preflight.sh
+  --staged`, which is the ONLY write path that refuses it. `git commit`,
+  `git push`, the `gate && git push` chain above (that preflight runs WITHOUT
+  `--staged`) and every record or matrix edit all proceed: past staging,
+  `read-only` is the honour system, not a guard. A
+  helper works in an isolated worktree on `row/<ROW-ID>` and opens a DRAFT PR at
+  the START: that PR **is** the claim. The operator merges PRs first thing, owns
+  `main` and the GPU, and drives feature work through sub-agents rather than
+  writing it. Add `--headless` only when the developer has SAID the run is
+  unattended; it is declared, never inferred.
 - **Never three-way merge a keyed record.** `docs/STATUS.md`,
   `docs/BENCHMARKS.md`, `docs/FEATURES.md`, `.agents/NOW.md`, the matrices and
   `coordination.md` are merged by taking `main`'s version wholesale, re-applying

@@ -57,9 +57,30 @@ Acquisition and persistence are different problems and need different mechanisms
 session ASKS before doing anything else. This is unavoidable: the information
 does not exist in the environment yet. It is also cheap, once per session.
 
+The question is "what are you here to do?", never "operator or helper?" — the
+answer must not require the developer to learn this spec's vocabulary first. The
+three answers, and the exact table an agent reads, live in
+[`.agents/workflow.md`](../workflow.md#first-question-of-every-session), which
+`check-protocol-consistency.py` asserts still carries them.
+
+**`read-only` is the third answer**, and it is a declared ABSENCE of claim
+rather than a third role: it takes no lock and creates no worktree, so a session
+that only reads has an honest thing to say. Without it the only ways to satisfy
+the gate were the repo-wide operator lock or a throwaway worktree, and faced
+with that people reach for `--no-require-role` until the gate means nothing.
+Escalating to a real role is one command.
+
+**The MODE is declared in the same breath.** `--headless` on the claim records
+an unattended run in the marker: decide, record each decision in
+`.agents/state.md`, never block, never merge, park what will not go green.
+It is DECLARED, never inferred — not from the hour, not from silence, not from
+the length of the task — and `mode_from_marker` defaults to interactive.
+
 **2. Materialize — make the answer a FACT.** Immediately on answering:
 
-- *operator*: atomically acquire `.agents/operator.lock` (create-exclusive, so a
+- *operator*: atomically acquire the operator lock — `vllm-cpp-operator.lock` in
+  the git COMMON dir, so it is shared by every worktree and can never be
+  committed (create-exclusive, so a
   second self-declared operator FAILS rather than racing), carrying session id,
   host, PID and a heartbeat timestamp;
 - *helper*: create its worktree and `row/<ROW-ID>` branch and open the draft PR
@@ -68,10 +89,13 @@ does not exist in the environment yet. It is also cheap, once per session.
 After this step the session IS distinguishable from the outside, which is what
 the first draft wrongly assumed at the start.
 
-**3. Persist and re-derive — never ask twice.** The role is recorded in a
-session-scoped marker (keyed by session id, outside the repo). Re-derivation, not
-memory, is what survives context compaction: a session that has forgotten its
-role reads the marker and the lock rather than guessing or asking again.
+**3. Persist and re-derive — never ask twice.** The role is recorded in a marker
+inside the worktree's own git dir, keyed by the WORKTREE and not by the session
+id (corrected 2026-08-06: a session id is not stable across tool calls in every
+harness, so keying on it made a declared role invisible one call later — see
+`.agents/specs/session-onboarding.md`). Re-derivation, not memory, is what
+survives context compaction: a session that has forgotten its role reads the
+marker and the lock rather than guessing or asking again.
 
 **4. Resolution rides on the mandatory preflight.** `scripts/agent-preflight.sh`
 resolves and PRINTS the role every run, and refuses to pass if a session has not
@@ -197,7 +221,7 @@ checker.
 
 | W | Item | Gate |
 |---|---|---|
-| W0 | **LANDED** `scripts/agent-role.py` — role machinery: `.agents/operator.lock` (create-exclusive + TTL + heartbeat), session-scoped role marker, and role resolution printed by `agent-preflight.sh`, which FAILS when a session has not declared one | mutation test |
+| W0 | **LANDED** `scripts/agent-role.py` — role machinery: `<git-common-dir>/vllm-cpp-operator.lock` (create-exclusive + TTL + heartbeat), WORKTREE-scoped role marker (§ Determining the role — a session id is not stable across tool calls), `read-only` and `--headless` as declarations, and role resolution printed by `agent-preflight.sh`, which FAILS by default when a session has not declared one | mutation test |
 | W1 | **LANDED (report-only)** `check-role-discipline.py`: a commit on `main` touching feature paths must arrive via a merged `row/*` PR, not a direct push | mutation test |
 | W2 | **LANDED** `scripts/claim-view.py` — generated claim view from PR state (`--apply` online, `--check` offline, 14-day TTL) | mutation test + a run against live PRs |
 | W3 | **LANDED** `scripts/ready-for-helper.py` — the pickable queue asserting the 5 conditions | mutation test |
@@ -213,9 +237,10 @@ PR, whoever produced it.
 `ROLE_DISCIPLINE_SINCE` names that cutover. Turning it on retroactively would redden
 history created under the current, explicitly sanctioned direct-push policy. Set
 that constant to the cutover commit when the protocol is adopted, and every
-commit after it is enforced. Likewise `agent-preflight.sh` PRINTS the role every
-run but only fails on `--require-role`, so an undeclared session is visible
-before it is fatal.
+commit after it is enforced. `agent-preflight.sh` PRINTS the role every run, and
+that was its only effect until 2026-08-06, when an undeclared role became a
+FAILING gate by default; `--no-require-role` is the explicit opt-out, and a
+`read-only` declaration passes a plain run while failing `--staged`.
 
 ## Risks/decisions
 
@@ -231,7 +256,7 @@ before it is fatal.
 - **Risk: review becomes the bottleneck.** Mitigated by one-row size-capped PRs,
   mechanical merge criteria, and merge-first sessions. Watch the open-PR count;
   if it grows monotonically the cap is too loose.
-- **Risk: the lock is stale.** `.agents/operator.lock` needs a TTL and a
+- **Risk: the lock is stale.** `<git-common-dir>/vllm-cpp-operator.lock` needs a TTL and a
   heartbeat, or a crashed operator blocks everyone. Breaking a stale lock must be
   logged, never silent.
 - **Risk: the user declares two operators.** Handled by making lock acquisition
