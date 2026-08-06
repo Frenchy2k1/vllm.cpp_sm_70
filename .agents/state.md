@@ -37502,7 +37502,7 @@ needs drain-removal + double-buffer. Evidence
 `dgx:~/work/mirror-ab/{mab-measure.log,mab-tokdiag.log,mab-prodcheck.log,evidence/raw/35/ours/c16-r{1,2,3}-abmirr{off,on}.json,greedy/*}`.
 
 ## ROW-SERVE-ASYNC-LLM P0 RESOLVED: root-caused the async batch-1 token-0 degeneration, added the missing async-serving token-exact gate (RED-first), flipped the device mirror default ON
-<!-- state: 2026-08-06T14:00 -->
+<!-- state: 2026-08-06T13:10 -->
 
 Closed the P0 from `2026-08-06T03:00`: production async (AsyncLLM) batch-1 greedy
 decode on 35B NVFP4 nondeterministically degenerated into repeated token-0 garbage.
@@ -37567,7 +37567,7 @@ evidence/raw/35/ours/c16-r{1,2,3}-{defaulton,rollback0}.json}`. Commit on
 `row/SERVE-ASYNC-LLM`.
 
 ## Qwen3.5-4B upstream revalidation is a local null; binding ratio 0.9971x
-<!-- state: 2026-08-06T14:00 -->
+<!-- state: 2026-08-06T13:11 -->
 
 Measurement date 2026-08-05. Branch `fix/minja-gcc15-werror-20260803` merged
 the four new `upstream/main` commits through `59674cf1d` as `312af21a9`, then
@@ -37582,7 +37582,7 @@ graph child kernels on both arms. Evidence:
 `/tmp/qwen35-upstream-312af21a9`.
 
 ## KERNEL-MARLIN-DENSE-DIRECT (#50): dense-marlin port arbitrated NO-GO
-<!-- state: 2026-08-06T14:30 -->
+<!-- state: 2026-08-06T13:12 -->
 
 The named residual-#1 lever (port vLLM's dense marlin_gemm, ~2000 lines) was
 arbitrated with the mandated same-tool per-shape ubench BEFORE implementation:
@@ -37597,7 +37597,7 @@ terms: that tweak (~0.8pp at c8), the defensive per-call ws Memset drop
 MXFP4 parity stays BELOW (best c8 0.942). Evidence dgx:~/mxfp4-nsys/ubench_3x.log.
 
 ## SERVE-ASYNC-EXECUTOR: decode-graph slot double-buffer (Option B) landed gated default-OFF; ring PROVEN correct; hazard-C real-by-construction but empirical RED unreproducible on GB10
-<!-- state: 2026-08-06T18:30 -->
+<!-- state: 2026-08-06T13:13 -->
 
 The c16/c32 overlap unlock. With the mirror default ON (ROW-SERVE-ASYNC-LLM), the
 async serving loop's remaining serialization is the depth-2 pre-forward drain
@@ -37653,7 +37653,7 @@ device-staged H2D, vLLM states.py:64) is the faithful follow-up; the eager
 `fa971248` on `row/SERVE-ASYNC-EXECUTOR`.
 
 ## MODEL-TEXT-kimi-linear: W7 device compute GPU-VERIFIED on GB10 (12/12·614 both arms); e2e SACRED golden DISK-BLOCKED, oracle gateability re-confirmed
-<!-- state: 2026-08-06T20:30 -->
+<!-- state: 2026-08-06T13:14 -->
 
 First GPU run of any Kimi-Linear code. Branch `row/MODEL-KIMI-LINEAR-GPU`, base
 `origin/main` `c587f2b9`. This closes the primary GPU-verify residual named by W7
@@ -37694,7 +37694,7 @@ records in spec section 11, model-matrix `MODEL-TEXT-kimi-linear-*`, benchmark r
 
 ## QUANT-CT-MXFP4 Qwen vehicle: W0 checkpoint + W1 kernel target PINNED; empirical GPU/disk-gated
 
-<!-- state: 2026-08-06T21:00 -->
+<!-- state: 2026-08-06T13:15 -->
 
 USER re-scope (full MXFP4 at vLLM parity, benchmarked on a Qwen model; DeepSeek/Kimi
 NOT the vehicle). Spike checkpoint on `row/QUANT-CT-MXFP4` (branch off `main`
@@ -37744,7 +37744,7 @@ when disk >= ~15G free + lock free, then greedy golden, then build+gate+bench.
 Evidence: spec `.agents/specs/mxfp4-compressed-tensors.md` (W0-W5 section).
 
 ## SERVE-ASYNC-OPTION-A: decode-graph input H2D staged OUT of capture (faithful vLLM) — LANDS gated OFF; RED finally CONSTRUCTED; throughput WASH refutes "c16 = the baked H2D"
-<!-- state: 2026-08-06T21:00 -->
+<!-- state: 2026-08-06T13:16 -->
 
 The Option A follow-up to #36 (SERVE-ASYNC-EXECUTOR). #36 (Option B) kept the per-step
 input H2D BAKED INSIDE the captured decode replay and worked around the host-input
@@ -37806,7 +37806,7 @@ OPTION-A`.
 
 ## QUANT-CT-MXFP4 Qwen W0+W1 EMPIRICAL: oracle golden RUNS (Marlin W4A16); FlashInfer W4A4 CRASHES on sm_121
 
-<!-- state: 2026-08-06T21:30 -->
+<!-- state: 2026-08-06T13:17 -->
 
 Box freed (coordinator); resumed the QUEUED empirical steps under both flock locks,
 mem gate (94-95 GiB free >= 90), tmux + done-markers, oracle alone, single load,
@@ -37842,7 +37842,7 @@ checkout and ~31 GiB free (full CUDA build ~21 GiB, tight/slow; other agents'
 Spec updated (`.agents/specs/mxfp4-compressed-tensors.md`, W1 EMPIRICAL RESULT block).
 
 ## MODEL-TEXT-kimi-linear: §8 SACRED oracle golden CAPTURED (STRICT, 8/8 deterministic); full our-engine e2e f32-loader-blocked (~183 GiB > 119 pool)
-<!-- state: 2026-08-06T23:00 -->
+<!-- state: 2026-08-06T13:18 -->
 
 Disk unblocked upstream (129 GiB free); the §11 GPU-verify merged as #37. Resumed
 Steps 3-6 on a fresh branch `row/MODEL-KIMI-LINEAR-E2E` off `origin/main` `c1a7b452`.
@@ -37882,7 +37882,7 @@ local golden `tests/parity/goldens/kimi_linear_greedy/`.
 
 ## QUANT-CT-MXFP4 W2 native Marlin mxf4 keep-quant LANDS (builds+runs on GB10); e2e RED, bug localized to group_blocks=2 GEMM
 
-<!-- state: 2026-08-06T23:30 -->
+<!-- state: 2026-08-06T13:19 -->
 
 Coordinator freed the box for W2-W4. Implemented the native MXFP4 (mxfp4-pack-quantized)
 Marlin W4A16 keep-quant path for dense Qwen3, routed through the EXISTING Marlin FP4
@@ -37914,7 +37914,7 @@ Box left clean (locks released, tmux killed, GPU idle, disk 27G). Build tree per
 dgx:~/work/mxfp4-w2 for the continuation.
 
 ## Live-state audit APPLIED: the 10 unevidenced `ACTIVE` rows vacated, 11 dead claims retired, 9 amended — the record's ACTIVE set is now Git-supportable
-<!-- state: 2026-08-06T23:45 -->
+<!-- state: 2026-08-06T13:20 -->
 
 P0 step 6 of the live-state audit ([live-state-audit-2026-08-06.md](specs/live-state-audit-2026-08-06.md)).
 The census found 54 rows claiming `ACTIVE` at once, NOT ONE with an unmerged `row/<ID>`
@@ -37973,7 +37973,7 @@ changed no code, so `LANDED` is not evidence of completion — none is touched);
 `BACKEND-CPU` / `BACKEND-CUDA-SM121` (ownership decided in the artifact, deliberately not applied).
 
 ## FOLLOW-UP OWED — the live-rows gate self-blinds on the 10 rows it just repaired; `ACTIVE` precondition now in workflow.md
-<!-- state: 2026-08-06T23:55 -->
+<!-- state: 2026-08-06T13:21 -->
 
 Whole-branch review of `spec/issue-native-tracking`, records/prose repairs only, no tool logic changed.
 
@@ -38014,7 +38014,7 @@ holds **0** live rows, not a share of 11 (its lifecycle column is `Class`, not `
 the tool comment and the artifact; it stays in `AUDIT_MATRIX_PATHS` for free future coverage.
 
 ## MODEL-TEXT-kimi-linear: bf16-resident loader/forward POOL MATH + grounded design (§13); implementation scoped, PENDING
-<!-- state: 2026-08-07T00:30 -->
+<!-- state: 2026-08-06T13:22 -->
 
 Disk unblocked and the §12 golden merged as #40 (main `32148dd9`). Resumed the final
 phase-3 brick on `row/MODEL-KIMI-LINEAR-BF16`: the bf16-resident loader/forward that
@@ -38048,7 +38048,7 @@ this branch, keep `test_kimi_linear_forward` 12/12·614 green, then the full-mod
 
 ## QUANT-CT-MXFP4 W3 unit gate GREEN: MXFP4 GEMM PROVEN correct; e2e residual is NOT the compute
 
-<!-- state: 2026-08-07T01:00 -->
+<!-- state: 2026-08-06T13:23 -->
 
 Built + ran the owed W3 device unit gate (`test_ops_moe_grouped.cpp`, commit `8469e333`):
 MXFP4 Marlin GEMM vs the INDEPENDENT CPU dequant reference (`DequantMxfp4ToF32` + f32
@@ -38074,7 +38074,7 @@ Box left as found (Kimi holds the locks; my tmux sessions killed; build tree per
 dgx:~/work/mxfp4-w2).
 
 ## MODEL-TEXT-kimi-linear: bf16-resident loader/forward IMPLEMENTED + CPU-gated (§13); dgx CUDA build + full-model e2e PENDING
-<!-- state: 2026-08-07T01:30 -->
+<!-- state: 2026-08-06T13:24 -->
 
 Executed §13 on `row/MODEL-KIMI-LINEAR-BF16` (base `e28ace81`). LANDED (file:line):
 `LoadKimiLinearResidentBf16Weights` + `StageKimiResidentBf16` + `BuildKimiResidentFromHost`
@@ -38110,7 +38110,7 @@ the e2e token gate is green.
 
 ## QUANT-CT-MXFP4 e2e RESOLVED: compute CORRECT (async-off 3/4 token-exact); async-default degeneration is a PRE-EXISTING classic-dense-Qwen3 bug
 
-<!-- state: 2026-08-07T03:00 -->
+<!-- state: 2026-08-06T13:25 -->
 
 Closed the e2e residual. Root-caused via the box-free continuation: the DEFAULT
 (async scheduling ON) degeneration is NOT the MXFP4 compute — with VT_ASYNC_SCHED=0
@@ -38137,7 +38137,7 @@ distributional gate for p3. Evidence: docs/bench-evidence/mxfp4-qwen/W3-e2e-resu
 Box: locks released, tmux killed, build tree persists at dgx:~/work/mxfp4-w2.
 
 ## MODEL-TEXT-kimi-linear: FULL-MODEL GB10 e2e RUNS via bf16-resident path — NEAR-TIE 106/128 (6/8 prompts token-exact); pool math CLOSES
-<!-- state: 2026-08-07T03:00 -->
+<!-- state: 2026-08-06T13:26 -->
 
 The §13 bf16-resident loader/forward CLEARS the f32-loader block: the full 48.9B Kimi-Linear-48B-A3B
 now runs e2e on ONE GB10 (the primary mission goal). dgx CUDA build (`-DVLLM_CPP_CUDA=ON
@@ -38177,10 +38177,10 @@ decode). `VT_KIMI_DEVICE_COMPUTE` STAYS OFF (parity-enablers: a near-tie is not 
 paged het-KV incremental decode, (c) speed.
 
 ## ROW-SERVE-ASYNC-DENSE-MIRROR: ported the #31 async device-mirror to the classic dense family (Qwen3ForCausalLM); RED-first async-serving gate; W4 MXFP4 bench in flight
-<!-- state: 2026-08-07T05:00 -->
+<!-- state: 2026-08-06T13:27 -->
 
 Closed the classic-dense half of the #31 P0 (the residual named by QUANT-CT-MXFP4
-2026-08-07T03:00): classic dense `Qwen3ForCausalLM` (qwen3.cpp) lacked the async
+2026-08-06T13:25): classic dense `Qwen3ForCausalLM` (qwen3.cpp) lacked the async
 device-token-ids mirror the gate models (qwen3_5) already had, so on the depth-2
 AsyncLLM serving path its batch-1 greedy decode nondeterministically degenerated into
 token-0 garbage. Quant-independent (surfaced by the MXFP4 campaign; hits bf16/NVFP4
@@ -38247,7 +38247,7 @@ Yi30/Qwen3-8B-MXFP4, oracle arm VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKerne
 loaded. Branch `row/SERVE-ASYNC-DENSE-MIRROR`.
 
 ## ROW-SERVE-ASYNC-DENSE-MIRROR: dgx GB10 verification — async gate RED→GREEN (0.6B+4B) + SACRED no-regression + memcheck + MXFP4 default-config e2e + p3 near-tie RATIFIED
-<!-- state: 2026-08-07T07:00 -->
+<!-- state: 2026-08-06T13:28 -->
 
 Ran the full dgx GB10 campaign for `f9c969ae` (git-archive → /dev/shm build, CUDA
 `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
@@ -38296,10 +38296,10 @@ sibling scope one-liner (InternLM2/Mistral/Llama). dgx build tree persists at
 `dgx:/dev/shm/serve-async-dense`.
 
 ## QUANT-CT-MXFP4-BENCH: online-serving harness PLUMBED for the MXFP4 W4 throughput grid (q3mxfp4 key); grid GATING on dgx execution
-<!-- state: 2026-08-07T09:00 -->
+<!-- state: 2026-08-06T13:29 -->
 
 Closed the harness half of the QUANT-CT-MXFP4 W4 bench residual (the one named by
-`ROW-SERVE-ASYNC-DENSE-MIRROR` 2026-08-07T07:00 and NOW.md): `online_gate.py`
+`ROW-SERVE-ASYNC-DENSE-MIRROR` 2026-08-06T13:28 and NOW.md): `online_gate.py`
 carried only the "27"/"35" NVFP4 gate-model keys, so the MXFP4 checkpoint could not
 be benched ours-vs-oracle. Branch `row/QUANT-CT-MXFP4-BENCH` off `origin/main`
 `52d76f3a`. No GPU held, no locks touched (all work + validation on the dev box).
@@ -38355,7 +38355,7 @@ any cell → record the failing cells + a same-tool decode-window nsys attributi
 quantization-matrix + benchmark-record + NOW updated in the same change.
 
 ## QUANT-CT-MXFP4-BENCH: W4 throughput grid RAN on GB10 — BELOW-FLOOR (~0.91x c2-c8, batched-decode gap), memory 2.6x WIN
-<!-- state: 2026-08-07T11:00 -->
+<!-- state: 2026-08-06T13:30 -->
 
 Executed the full binding grid on dgx GB10 for `33e93608` (`row/QUANT-CT-MXFP4-BENCH`).
 The harness plumbing landed correctly and the grid produced honest numbers. Box left
@@ -38400,7 +38400,7 @@ non-empty evidence root); fixed in `mxfp4-online-serving-grid.sh` this change. R
 found (down); dgx /home build tree `~/mxfp4-bench` retained for the nsys continuation.
 
 ## QUANT-CT-MXFP4-M28-LEVER: grouped-Marlin config lever REFUTED — our Marlin already at vLLM per-shape parity; the c2-c8 gap is diffuse decode (vLLM's edge = Inductor FUSION of the norm/quant/act glue)
-<!-- state: 2026-08-08T09:00 -->
+<!-- state: 2026-08-06T13:31 -->
 
 Chased the binding's named lever (#45 / NOW `QUANT-CT-MXFP4-BENCH`): "the c2-c8 TPOT
 gap is the batched grouped Marlin W4A16 decode GEMM as M grows 2->8; port vLLM's
@@ -38460,7 +38460,7 @@ dead hypothesis). Evidence text: `dgx:~/mxfp4-nsys/{kern_sum.txt,vllm_kern_sum.t
 Box: both locks free, GPU idle, disk unchanged 23G, local-ai-worker left down, tmux clean.
 
 ## QUANT-CT-MXFP4-GLUE: c1-vs-c2 localization — GLUE-fusion lever REFUTED; the c2-c8 step is the FLASH decode GQA group-swap (ours iterates 32 q-heads, vLLM 8 kv-heads)
-<!-- state: 2026-08-08T15:00 -->
+<!-- state: 2026-08-06T13:32 -->
 
 Ran the #46-prescribed discriminator (ours-only nsys c1-vs-c2 decode-window, same
 binary `33e93608` == main MXFP4 code) + the mandated SAME-tool re-check of the two
@@ -38535,7 +38535,7 @@ vllm_kern_sum.txt}` + reps `ours_c1/ours_c2/vllm_c2.nsys-rep`.
 Box: both locks free, GPU idle, disk 22G, local-ai-worker left down, tmux clean.
 
 ## KERNEL-FA2-GQA-SWAP: the #47 lever LANDS — vLLM decode group-swap ported into the d128 varlen launcher, correctness-complete gated default-OFF (op RED/GREEN + memcheck + swap-ON smoke TOKEN-EXACT); bench + flip = next step
-<!-- state: 2026-08-08T18:00 -->
+<!-- state: 2026-08-06T13:33 -->
 
 Implemented the #47-localized lever on `row/KERNEL-FA2-GQA-SWAP` off `origin/main`
 `2f235beb`. **The port is DONE and correctness-complete on GB10; it ships gated
@@ -38619,7 +38619,7 @@ Evidence: dgx smoke `~/smoke.log` (transient), op/memcheck run inline (above).
 Box: both locks free, GPU idle, disk 22G, local-ai-worker left down, tmux clean.
 
 ## KERNEL-FA2-GQA-SWAP-FLIP: the #48 lever FLIPS DEFAULT-ON — flip campaign COMPLETE on GB10 (SACRED 0.6B/4B 16/16 token-identical, nsys grid (1,3,64)→(1,5,16), binding c2-c8 improves NO-regression); MXFP4 goal still <1.0x, residual named
-<!-- state: 2026-08-08T21:00 -->
+<!-- state: 2026-08-06T13:34 -->
 
 Executed the full flip campaign for `VT_FA2_DECODE_GQA_SWAP` (the #47-localized / #48-landed
 FA2 decode GQA group-swap) on `row/KERNEL-FA2-GQA-SWAP-FLIP` off `origin/main` `1f446fd7`.
@@ -38673,7 +38673,7 @@ at M≤8 per #46 → a delicate grouped→dense-direct-A port, not a config knob
 host/sched**. No single lever ≥1.0x. NEXT lever candidate = grouped→dense-direct-A marlin decode.
 
 ## QUANT-CT-MXFP4-CLOSERS: the two arbitrated slivers LAND byte-exact + default-ON — dense M≤8 8-row Marlin tile (#50 (a)) + per-call workspace re-zero dropped (#50 (b)); correctness-complete on GB10, binding re-bench pending
-<!-- state: 2026-08-09T10:00 -->
+<!-- state: 2026-08-06T13:35 -->
 
 Implemented the two #50-arbitrated closer slivers on `row/QUANT-CT-MXFP4-CLOSERS`
 off `origin/main` `b1ac444e`. **Both are BYTE-EXACT (proven, not asserted) so they
@@ -38747,7 +38747,7 @@ binding x3 confirms + attributes. NEXT: clean-checkout binding grid
 (`mxfp4-online-serving-grid.sh`) + host-slice nsys.
 
 ## QUANT-CT-MXFP4-CLOSERS BINDING + host-slice attribution: slivers improve EVERY throughput axis vs #49 (c1 crosses to parity+); MXFP4 goal still <1.0x on c2-c8 → NOT DONE; the ~0.7ms host slice is NOT in the engine loop
-<!-- state: 2026-08-09T12:00 -->
+<!-- state: 2026-08-06T13:36 -->
 
 Ran the definitive clean-checkout binding grid at the committed sha `d3b412f5` (NOT an overlay:
 `git checkout -f d3b412f5` in `~/mxfp4-bench/src`, tree clean, binaries rebuilt) via
@@ -38783,7 +38783,7 @@ grouped→dense-direct-A marlin decode (#50 NO-GO'd the full port; a targeted E1
 open candidate). Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
 
 ## SPEC-DECODE-INVENTORY: full vLLM speculative-method surface enumerated from source; 9 ABSENT methods rowed INVENTORIED
-<!-- state: 2026-08-09T13:00 -->
+<!-- state: 2026-08-06T13:37 -->
 
 Records-only branch `row/SPEC-DECODE-INVENTORY` off origin/main `4dd4e206`; pinned
 vLLM verified `555967922` / 0.26.0.dev0. No C++ — inventory/records only.
@@ -38831,7 +38831,7 @@ NEXT (value order): implementable draft-free gaps first — `SPEC-NGRAM-GPU`,
 / public-doc-tables / now-current.
 
 ## QUANT-CT-MXFP4-C8-DIFF: fresh SAME-TOOL c8 decode-window diff on the POST-SLIVER binary — kernels are NOT identical; marlin grouped-5-GEMM is DOMINANT (+897us eager/+1377us graphed), eager launch-gap +880us is graph-closeable but nets only −334us (bandwidth contention); #50 "grouped==dense parity" SETTLED as an isolated-shape ubench artifact; decode-graph opt-in is a measured +1.3% byte-coherent secondary lever
-<!-- state: 2026-08-09T14:00 -->
+<!-- state: 2026-08-06T13:38 -->
 
 The deciding measurement the campaign owed: a FRESH same-tool (nsys `--cuda-graph-trace=node`
 BOTH sides) c8 decode-window per-step diff on the post-sliver binary (box build `d3b412f5` ==
@@ -38909,7 +38909,7 @@ gpu_trace_c8_{dflt,graph}_cuda_gpu_trace.csv, vllm_offline_trace_c8_cuda_gpu_tra
 analyze_decode.py + gap_and_shape.py; vLLM offline capture nsys_vllm_c8_v2.sh/run_vllm_offline_nsys.sh.
 
 ## QUANT-CT-MXFP4-MARLIN-STRUCT: decode-graph default-ON + MXFP4 gate_up FUSION default-ON (180->144 GEMM/step, vLLM-structural) + E=1 CTA-parity par=1 opt-in (arbiter: marlin near-parity, 32B-strict-blocked from default); 4 gated GB10 SHAs
-<!-- state: 2026-08-09T16:00 -->
+<!-- state: 2026-08-06T13:39 -->
 
 Closes the #52 marlin-structural + decode-graph levers on `row/QUANT-CT-MXFP4-MARLIN-STRUCT`
 (base `origin/main` `027af9b0`/#52). Build in `/dev/shm/vc-mxfp4` (root disk at floor),
@@ -38983,7 +38983,7 @@ step1_gate,step1_smoke}.log. Env: `VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH` (now defau
 (default ON, now covers mxfp4), `VT_MARLIN_E1_PAR1` (NEW, default OFF opt-in).
 
 ## KERNEL-MARLIN-DENSE-PORT: vLLM's OWN dense marlin GEMM vendored + wired to the E=1 NVFP4/MXFP4 dense projections (byte-preserving, no par-regroup ULP), gated OFF; 3 new dense .cu compile-CLEAN on GB10 sm_121a; RED-first unit battery WRITTEN; GPU exec/strict/nsys/binding gates SCOPED for the operator
-<!-- state: 2026-08-09T17:00 -->
+<!-- state: 2026-08-06T13:40 -->
 
 WHAT + WHY. #54 (`QUANT-CT-MXFP4-MARLIN-STRUCT`) settled the c8 marlin residual as CTA count:
 the single-expert MoE-marlin route the dense E=1 projections use pads M<=8 into a 144-CTA grid,
@@ -39050,7 +39050,7 @@ Default stays OFF until (b) proves byte-match vs the oracle and (d) beats the Mo
 landing: `row/KERNEL-MARLIN-DENSE-PORT` (code commit + this records commit).
 
 ## KERNEL-MARLIN-DENSE-EXEC: the four scoped gates RAN on GB10 — VT_MARLIN_DENSE FLIPS DEFAULT-ON (dense reduce IS vLLM's numerics: teacher-forced near-tie gap 0.000 nats, TIGHTER than MoE; 48-CTA grid beats the MoE route on EVERY binding throughput axis)
-<!-- state: 2026-08-09T18:00 -->
+<!-- state: 2026-08-06T13:41 -->
 
 Executed the operator dgx follow-up for `KERNEL-MARLIN-DENSE-PORT` (#55) on
 `row/KERNEL-MARLIN-DENSE-EXEC` off `origin/main` `828f6420`. Clean git-archive tree at the
@@ -39109,7 +39109,7 @@ ratified + beats MoE every axis + no regression + memory win. Landing `row/KERNE
 (`200b4b56`): flip `dense_nvfp4_gemm.h`, regen 32B goldens, gate-conditional counters, L2 unit fix.
 
 ## KERNEL-FA2-DECODE-PARAMS: flash hypothesis refuted; kernel side of MXFP4 CLOSED
-<!-- state: 2026-08-09T19:00 -->
+<!-- state: 2026-08-06T13:42 -->
 
 Direct measurement on the post-#57 binary refuted the last kernel-side
 hypothesis: all flash decode buffers DEVICE-resident, KV layout/params
@@ -39121,7 +39121,7 @@ Remaining terms: the ~0.7ms/step frontend slice (dominant, next campaign),
 the c1-c2 num_splits cap (oracle-gated), the glue tail.
 
 ## SERVE-FRONTEND-SLICE: the c2-c8 frontend residual MEASURED — the frontend is ~99% CPU-IDLE, so the slice is handoff/scheduling LATENCY not compute; premise "~0.7ms dominant frontend term" REFUTED; the c2-c8 gap is GPU-intrinsic; NO code shipped
-<!-- state: 2026-08-09T20:00 -->
+<!-- state: 2026-08-06T13:43 -->
 
 Executed the frontend attribution the campaign owed, on `row/SERVE-FRONTEND-SLICE`
 off `origin/main` `efe94402`. Method step 1 (instrument OUR frontend per-step at
@@ -39177,7 +39177,7 @@ call-graph in the benchmark record. Evidence
 dgx:`~/frontend-attrib/{report.txt,cg_report.txt,run.log,load.json}`.
 
 ## QUANT-CT-MXFP4-FINAL-STACK: the two last named MXFP4 levers implemented + measured; num_splits cap LANDED gated-OFF (c1-only, battery-green incl. 32B strict char-identical), glue already folds via FusedChain (residual is out-of-catalog Inductor GEMM-epilogue fusion); TERMINAL residual statement — every measured lever exhausted, c1 1.020x PASS, c2-c8 GPU-intrinsic
-<!-- state: 2026-08-09T21:00 -->
+<!-- state: 2026-08-06T13:44 -->
 
 Closed the MXFP4 parity leg's last two scoped levers on `row/QUANT-CT-MXFP4-FINAL-STACK`
 (base `origin/main` `6dd0a1e4`; dgx built on the `735f3b8d` twin of #57 via clean
@@ -39216,3 +39216,19 @@ numerics-delicate) — a kernel rewrite, not a routing/config lever. Full forens
 benchmark record (QUANT-CT-MXFP4-FINAL-STACK). Branch pushed to
 `row/QUANT-CT-MXFP4-FINAL-STACK`; not merged to main.
 
+
+## 2026-08-06T13:45 - RECORDS REPAIR: future-dated stamps corrected to the evidenced date
+<!-- state: 2026-08-06T13:45 -->
+
+The MXFP4-campaign records carried stamps dated 2026-08-06T14:00 through
+2026-08-09T21:00 while every corresponding landing is git-author-dated
+2026-08-06 00:00-13:43 (and PR #59 was created 2026-08-06T12:43Z) - a chained
+stamp bug: each agent placed its entry after the previous (already wrong)
+stamp. Repair: the 35 future state anchors were rewritten to 2026-08-06 with
+a synthetic order-preserving minute sequence (T13:10-T13:44); matching
+heading/body stamps and the date-only 08-07..09 stamps in NOW.md,
+benchmark-record.md, parity-ledger.md, docs/STATUS.md and docs/BENCHMARKS.md
+were mapped the same way (body cross-references of duplicated stamps map to
+the first occurrence). The DATES are now evidence-true; the intra-day minutes
+on corrected entries are synthetic ordering values, not measured times. No
+cited SHA changed.

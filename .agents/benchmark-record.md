@@ -81,7 +81,7 @@ this row (all additive; 27/35 byte-unchanged; CPU contract tests 45/45): `online
 `q3mxfp4` key + `POINTS_BY_MODEL`/`points_for`; `mxfp4_smoke_gate.py`;
 `dgx-online-serving.sh` q3mxfp4 branches; `mxfp4-online-serving-grid.sh` orchestrator.
 
-## QUANT-CT-MXFP4 c2-c8 gap — grouped-Marlin config lever REFUTED (2026-08-08, `row/QUANT-CT-MXFP4-M28-LEVER`, GB10, build `33e93608`==main)
+## QUANT-CT-MXFP4 c2-c8 gap — grouped-Marlin config lever REFUTED (2026-08-06, `row/QUANT-CT-MXFP4-M28-LEVER`, GB10, build `33e93608`==main)
 
 The binding (#45) attributed the c2-c8 TPOT deficit to "our per-expert/grouped Marlin
 tiling vs vLLM's Marlin as M grows 2->8" and named the fix as porting vLLM's M-dependent
@@ -12322,7 +12322,7 @@ a NAMED speed residual, NOT an optimized decode. DEFAULT: `VT_KIMI_DEVICE_COMPUT
 recurrence + exp/softplus gate op + paged `mla::ForwardMlaAttentionBlock` + a bf16 residual stream
 end-to-end (matches vLLM's rounding, removes the host round-trips).
 
-## 2026-08-07T05:00 — ROW-SERVE-ASYNC-DENSE-MIRROR: classic-dense async P0 fix (code+CPU gates) + W4 MXFP4 bench PLAN
+## 2026-08-06T13:27 — ROW-SERVE-ASYNC-DENSE-MIRROR: classic-dense async P0 fix (code+CPU gates) + W4 MXFP4 bench PLAN
 
 CORRECTNESS (not a speed lever): the #31 async device token-ids mirror, ported to the
 classic dense family. Classic dense `Qwen3ForCausalLM` (qwen3.cpp `EmbedInto`) raced
@@ -12351,7 +12351,7 @@ OWED ON DGX (this row):
 Box safety: both locks (flock $HOME/gpu.lock AND /tmp/gpu), free -g >= 90, no oracle
 alongside our server, local-ai-worker stopped, tmux + done-markers, git archive not rsync.
 
-## 2026-08-07T07:00 — ROW-SERVE-ASYNC-DENSE-MIRROR dgx GB10 verification (f9c969ae)
+## 2026-08-06T13:28 — ROW-SERVE-ASYNC-DENSE-MIRROR dgx GB10 verification (f9c969ae)
 
 CUDA build (/dev/shm, 121a, cutlass 4.5.0, nvcc 13.0, Release). Both flock locks per run,
 tmux + done-markers, free-g 98-100 GiB. CORRECTNESS (this row is a correctness fix, not a
@@ -12377,7 +12377,7 @@ max-num-seqs sizing. The fix unblocks the DEFAULT-config bench (no more VT_ASYNC
 workaround); oracle proven to run the model today. Evidence: dgx:/dev/shm/serve-async-dense/
 {gates_06b.log,gates2.log,mxfp4_e2e.log,oracle_neartie2.log,oracle_tf.log}.
 
-## 2026-08-08T18:00 — KERNEL-FA2-GQA-SWAP: d128 varlen decode group-swap gated-OFF, correctness gates GREEN (bench PENDING)
+## 2026-08-06T13:33 — KERNEL-FA2-GQA-SWAP: d128 varlen decode group-swap gated-OFF, correctness gates GREEN (bench PENDING)
 
 The #47-localized lever (`row/KERNEL-FA2-GQA-SWAP`, `VT_FA2_DECODE_GQA_SWAP`, default
 OFF): vLLM's FA2 `seqlenq_ngroups_swapped` decode grid ported into
@@ -12555,7 +12555,7 @@ not a kernel port. No single lever reaches ≥1.0x; the MXFP4 parity goal stays 
 0.942). Evidence: `dgx:~/mxfp4-nsys/{mxfp4_marlin_ubench.py,ubench.log,ubench_3x.log}`. Box left
 clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
 
-## QUANT-CT-MXFP4-CLOSERS: slivers (a)+(b) land BYTE-EXACT + default-ON; correctness gates GREEN, binding re-bench PENDING (2026-08-09, `row/QUANT-CT-MXFP4-CLOSERS`, GB10 sm_121a CUDA 13.0, `~/mxfp4-bench` overlay `1f446fd7`+swap-ON+3 files md5-matched)
+## QUANT-CT-MXFP4-CLOSERS: slivers (a)+(b) land BYTE-EXACT + default-ON; correctness gates GREEN, binding re-bench PENDING (2026-08-06, `row/QUANT-CT-MXFP4-CLOSERS`, GB10 sm_121a CUDA 13.0, `~/mxfp4-bench` overlay `1f446fd7`+swap-ON+3 files md5-matched)
 The two #50-arbitrated slivers, both in the SHARED header
 `include/vllm/model_executor/models/dense_nvfp4_gemm.h` (the qwen3_5.cpp twin serving the 27B/35B
 gate models is deliberately untouched): **(a)** `DenseAlignFor` forces `block=8` at M≤8 (:286),
@@ -12577,7 +12577,7 @@ Laguna) closed by proving BOTH quant schemes byte-exact. Binding c1-c8 x3 (clean
 substantive ~0.7ms/step host/sched slice (the #47 residual) remain the parity verdict's open terms.
 Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
 
-## QUANT-CT-MXFP4-CLOSERS BINDING: clean-checkout grid at d3b412f5 — slivers improve EVERY throughput axis vs #49 (c1 crosses to parity+); MXFP4 goal still <1.0x on c2-c8 (2026-08-09, GB10, vLLM oracle 0.25.0, evidence `dgx:~/work/vllm.cpp-online-gate/evidence/d3b412f5c191aace1f2960fa7940d8eef925762a`)
+## QUANT-CT-MXFP4-CLOSERS BINDING: clean-checkout grid at d3b412f5 — slivers improve EVERY throughput axis vs #49 (c1 crosses to parity+); MXFP4 goal still <1.0x on c2-c8 (2026-08-06, GB10, vLLM oracle 0.25.0, evidence `dgx:~/work/vllm.cpp-online-gate/evidence/d3b412f5c191aace1f2960fa7940d8eef925762a`)
 Full c1/c2/c4/c8 x3 binding on the CLEAN-checkout build at the committed sha d3b412f5 (not an
 overlay), oracle `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`, single-load/arm,
 drop_caches+mincore, RelWithDebInfo+oracle-cutlass. #44 model gate re-passed inside the grid
@@ -12616,7 +12616,7 @@ Not a born-on-runner lever. (Caveat: the curl load under-saturated vs steady c8,
 is not the c8 TPOT 37.6; the interval≈step finding is batch-independent and robust.)
 Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
 
-## QUANT-CT-MXFP4-C8-DIFF: fresh SAME-TOOL c8 decode-window per-step diff (POST-SLIVER `d3b412f5`==`4dd4e206`/#51) — marlin grouped-5-GEMM DOMINANT; eager launch-gap +880µs graph-closeable nets only −334µs; #50 grouped==dense SETTLED as isolated-shape ubench artifact; decode-graph opt-in = +1.3% byte-coherent (2026-08-09, GB10 sm_121a CUDA 13.0, RelWithDebInfo MARLIN=ON oracle-cutlass, vLLM oracle 0.25.0 `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`)
+## QUANT-CT-MXFP4-C8-DIFF: fresh SAME-TOOL c8 decode-window per-step diff (POST-SLIVER `d3b412f5`==`4dd4e206`/#51) — marlin grouped-5-GEMM DOMINANT; eager launch-gap +880µs graph-closeable nets only −334µs; #50 grouped==dense SETTLED as isolated-shape ubench artifact; decode-graph opt-in = +1.3% byte-coherent (2026-08-06, GB10 sm_121a CUDA 13.0, RelWithDebInfo MARLIN=ON oracle-cutlass, vLLM oracle 0.25.0 `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`)
 
 SAME-TOOL both sides (the fix for the recorded cross-tool trap): nsys `--cuda-graph-trace=node`.
 OURS = online server, 24×128 window at c8. vLLM online-under-nsys does NOT capture the V1 EngineCore
@@ -12663,7 +12663,7 @@ Evidence dgx:~/mxfp4-nsys/{kern_sum_c8_dflt,vllm_offline_kern_c8,kern_sum_c8_gra
 gpu_trace_c8_{dflt,graph}/vllm_offline_trace_c8_cuda_gpu_trace.csv + analyze_decode.py/gap_and_shape.py.
 Box left clean (both locks free, GPU idle, worker down, disk 20G, tmux gone).
 
-### QUANT-CT-MXFP4-MARLIN-STRUCT (2026-08-09) — decode-graph + gate_up FUSION default-ON, E=1 par=1 arbiter
+### QUANT-CT-MXFP4-MARLIN-STRUCT (2026-08-06) — decode-graph + gate_up FUSION default-ON, E=1 par=1 arbiter
 
 Base `origin/main` `027af9b0` (#52). GB10 sm_121a Release, build in `/dev/shm/vc-mxfp4`. Same-tool
 nsys `--cuda-graph-trace=node` c8 decode-window (24×128, M=8-pinned, 235 steady steps, `analyze_decode.py`);
@@ -12782,7 +12782,7 @@ clean in #51 — the slice lives in the shared async frontend). Parity verdict
 unchanged: c1 1.020 / c2-c8 0.962-0.969. Evidence dgx:/tmp/fa2dump.err,
 /tmp/fa2ncu2.out, /tmp/fa2ab_n{1,3}.out.
 
-## SERVE-FRONTEND-SLICE: the c2-c8 frontend residual MEASURED (perf, c8 online decode) — the frontend is ~99% CPU-IDLE, so the ~0.26ms/step slice is handoff/scheduling LATENCY + syscalls, NOT frontend compute; detok Slow-vs-Fast is quantitatively negligible at 128-tok output; the mission's "~0.7ms dominant frontend term" premise is REFUTED, the c2-c8 gap is GPU-intrinsic — 2026-08-09 (branch `row/SERVE-FRONTEND-SLICE`, base `origin/main` `efe94402`)
+## SERVE-FRONTEND-SLICE: the c2-c8 frontend residual MEASURED (perf, c8 online decode) — the frontend is ~99% CPU-IDLE, so the ~0.26ms/step slice is handoff/scheduling LATENCY + syscalls, NOT frontend compute; detok Slow-vs-Fast is quantitatively negligible at 128-tok output; the mission's "~0.7ms dominant frontend term" premise is REFUTED, the c2-c8 gap is GPU-intrinsic — 2026-08-06 (branch `row/SERVE-FRONTEND-SLICE`, base `origin/main` `efe94402`)
 
 The campaign that owed the frontend attribution. Method step 1 (instrument OUR
 frontend per-step at c8) executed as a `perf` profile of the PRODUCTION server
@@ -12866,7 +12866,7 @@ VERDICT stands UNCHANGED: c1 1.020 PASS, c2-c8 0.962/0.966/0.969 BELOW-FLOOR, me
 dgx:`~/frontend-attrib/{report.txt,cg_report.txt,run.log,load.json}` (perf .data
 pruned for disk).
 
-## QUANT-CT-MXFP4-FINAL-STACK — the two last named MXFP4 levers implemented + measured; TERMINAL residual statement (2026-08-09, `row/QUANT-CT-MXFP4-FINAL-STACK`, GB10, base `origin/main` `6dd0a1e4`, dgx tree `735f3b8d` twin of #57)
+## QUANT-CT-MXFP4-FINAL-STACK — the two last named MXFP4 levers implemented + measured; TERMINAL residual statement (2026-08-06, `row/QUANT-CT-MXFP4-FINAL-STACK`, GB10, base `origin/main` `6dd0a1e4`, dgx tree `735f3b8d` twin of #57)
 
 The campaign that owed the two remaining scoped levers (num_splits cap + glue
 fusion) and the definitive verdict. Both are now GROUNDED, IMPLEMENTED where real,
