@@ -13574,3 +13574,67 @@ order:
 Neither needs FMA and neither reorders any reduction. Combined they plausibly
 recover most of the llamafile delta while the memcmp gate stays valid and
 unchanged, which is the whole point.
+
+## 2026-08-06 — `sm_86` (Ampere consumer / RTX 3090 class) BUILD-VERIFIED, no runtime
+
+Prompted by an external report: someone built the CUDA server for 2x RTX 3090 and
+saw ~10 tok/s on a `qwen35moe` 35B MoE GGUF (InternScience/Agents-A1 Q4_K_M). No
+`sm_86` board is reachable here, so this entry is a build-verification only and
+owes no throughput number. Nothing has executed on that arch.
+
+Host: dgx.casa GB10, CUDA 13.0.88, gcc 13.3.0, commit `ab130737` transferred by
+`git archive`.
+
+Configure, single-arch `86`:
+
+* `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` and `-DVLLM_CPP_CUTLASS_FETCH=ON`
+  BOTH resolve clean, exit 0. FETCH pulls CUTLASS 4.5.0 over the network.
+* Reports `CUDA feature fa2: ENABLED for [86]` and `FlashAttention-2
+  prefill/decode: ENABLED for arch(es) [86]`.
+* Every sm_12x-only feature (fp4-mma, cutlass-nvfp4, cutlass-nvfp4-sm100,
+  cutlass-fp8, scaledmm-c3x-sm90/sm100, marlin-nvfp4) reports `DISABLED (no
+  requested arch in [86] provides it)` rather than erroring, so the cross-family
+  target resolves honestly.
+
+Compile, all 7 FA2 translation units, `-Werror` present in the command line:
+
+| TU | rc | time |
+|---|---|---|
+| `cuda_flash_attn_fa2.cu` | 0 | 2s |
+| `flash_fwd_split_hdim256_bf16_causal_sm80.cu` | 0 | 81s |
+| `flash_fwd_split_hdim256_bf16_sm80.cu` | 0 | 137s |
+| `flash_fwd_split_hdim128_bf16_causal_sm80.cu` | 0 | 85s |
+| `flash_fwd_split_hdim128_bf16_sm80.cu` | 0 | 140s |
+| `flash_fwd_split_hdim192_bf16_causal_sm80.cu` | 0 | 69s |
+| `flash_fwd_split_hdim192_bf16_sm80.cu` | 0 | 116s |
+
+Zero warnings across all seven. Gencode was
+`--generate-code=arch=compute_86,code=[compute_86,sm_86]`, and `cuobjdump -lelf`
+shows `sm_86` in every resulting object, so these are real cubins and not PTX
+that would JIT at load. This upgrades `86` from inherited-same-major (the WA-1
+claim build-verified only `80` and `87`) to directly build-verified. `89` still
+inherits.
+
+### The finding that shipped a fix
+
+With no CUTLASS tree the configure printed `CUDA feature fa2: ENABLED for [86]`
+from the arch-capability table, then four lines later a STATUS line saying FA2
+was disabled, and proceeded to a binary with no FlashAttention and nothing red.
+The arch-capability table answers "does this arch support FA2", not "was it
+built", so the two lines are each individually true and together misleading.
+
+Reachable from a bare `cmake -S . -B build`: `VLLM_CPP_CUDA` defaults to `AUTO`,
+so on a CUDA box that enables CUDA, resolves fa2 for `121a`, and drops FA2
+because the default `third_party/cutlass` does not exist. This is the same
+degraded-cutlass condition that has drifted near-tie gates here before.
+
+The missing-CUTLASS branch now splits on `VT_FA2_ARCHS` and warns when the arch
+did support FA2. Four configure cases checked: arch 86 without CUTLASS warns;
+GB10 default with CUTLASS silent and still builds FA2; bare `cmake -S . -B build`
+on the CUDA box warns (true positive); `-DVLLM_CPP_CUDA=OFF` completely silent,
+so CPU builds gain no noise.
+
+### Not verified
+
+That any of it runs. There is no `sm_86` board on this network, and a compile
+plus a SASS dump is not execution evidence.
