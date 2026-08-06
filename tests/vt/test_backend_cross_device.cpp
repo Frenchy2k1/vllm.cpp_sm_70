@@ -349,6 +349,65 @@ TEST_CASE("elementwise ops match the CPU oracle within NMSE <= 5e-4") {
   cpu.DestroyQueue(cq);
 }
 
+TEST_CASE("GEMM matches the CPU oracle within NMSE <= 5e-4, both orientations") {
+  // Shapes are deliberately RAGGED and not multiples of the workgroup size, so a
+  // kernel that silently processed only whole tiles would fail rather than pass
+  // on a friendly shape. K is the reduction length and gets the awkward value.
+  constexpr int64_t kM = 13;
+  constexpr int64_t kK = 37;
+  constexpr int64_t kN = 9;
+
+  const std::vector<float> a = RandomVec(kM * kK, 401);
+  const std::vector<float> b = RandomVec(kK * kN, 402);   // [K,N] for Matmul
+  const std::vector<float> bt = RandomVec(kN * kK, 403);  // [N,K] for MatmulBT
+
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> ca = a, cb = b, cbt = bt;
+  std::vector<float> ref_mm(kM * kN), ref_mmbt(kM * kN);
+  {
+    Tensor ta = T2(ca.data(), cd, kM, kK);
+    Tensor tb = T2(cb.data(), cd, kK, kN);
+    Tensor tbt = T2(cbt.data(), cd, kN, kK);
+    Tensor tmm = T2(ref_mm.data(), cd, kM, kN);
+    Tensor tmmbt = T2(ref_mmbt.data(), cd, kM, kN);
+    vt::Matmul(cq, tmm, ta, tb);
+    vt::MatmulBT(cq, tmmbt, ta, tbt);
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+
+    DevBuf da(dev, q, kM * kK), dout(dev, q, kM * kN);
+    da.Upload(a);
+    Tensor ta = T2(da.ptr(), d, kM, kK);
+    Tensor to = T2(dout.ptr(), d, kM, kN);
+
+    if (OpAvailable(vt::OpId::kMatmul, dt)) {
+      DevBuf db(dev, q, kK * kN);
+      db.Upload(b);
+      Tensor tb = T2(db.ptr(), d, kK, kN);
+      vt::Matmul(q, to, ta, tb);
+      CHECK(Nmse(ref_mm, dout.Download()) <= kNmseTol);
+    }
+    // MatmulBT is a DIFFERENT indexing path (the torch Linear [N,K] weight
+    // layout), not a transpose of the same code, so it gets its own case.
+    if (OpAvailable(vt::OpId::kMatmulBT, dt)) {
+      DevBuf dbt(dev, q, kN * kK);
+      dbt.Upload(bt);
+      Tensor tbt = T2(dbt.ptr(), d, kN, kK);
+      vt::MatmulBT(q, to, ta, tbt);
+      CHECK(Nmse(ref_mmbt, dout.Download()) <= kNmseTol);
+    }
+    dev.DestroyQueue(q);
+  }
+  cpu.DestroyQueue(cq);
+}
+
 TEST_CASE("row-reducing ops match the CPU oracle within NMSE <= 5e-4") {
   // Widths chosen to exercise BOTH threadgroup regimes on a GPU: one that is a
   // clean power of two and one that is not (so the strided row loop has a

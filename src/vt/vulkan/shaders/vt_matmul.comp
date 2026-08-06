@@ -1,0 +1,69 @@
+#version 450
+// vt::Matmul / vt::MatmulBT — dense f32-accumulating GEMM.
+//
+// NUMERIC CONTRACT, ported from src/vt/cpu/cpu_ops.cpp MatmulChunked (:187-249):
+// one output element per invocation, SEQUENTIAL f32 accumulation over K, rounded
+// once on store. The CPU kernel leaves each output element's whole K reduction on
+// a single thread for exactly this reason, so keeping one invocation per element
+// here makes the two orientations and the two backends share an accumulation
+// order rather than merely a tolerance.
+//
+// DELIBERATELY NOT TILED. This is the portable correctness tier: no shared-memory
+// blocking, no cooperative matrix. llama.cpp's mul_mm.comp (466 lines, scalar +
+// coopmat1 by define) and mul_mm_cm2.comp (658, NV coopmat2) are the performance
+// port, and they belong to work row VK-C together with the tactic selection that
+// picks between them. Landing the naive body first is what lets VK-C be an A/B
+// against a known-correct reference on the same device instead of a rewrite.
+//
+// ONE MODULE SERVES 54 VARIANTS: three dtypes each for a, b and out, times the
+// two orientations, as SPECIALIZATION CONSTANTS. llama.cpp spells the same axis
+// as GLSL #defines and therefore emits a separate SPIR-V module per combination.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 2) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 3) readonly buffer Bb16 { uint16_t v[]; } B16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+
+// Storage dtypes, and the ORIENTATION of b.
+//   VT_MM_BT == 0 : b is [K,N] row-major, b[p*n + j]      (vt::Matmul)
+//   VT_MM_BT == 1 : b is [N,K] row-major, b[j*k + p]      (vt::MatmulBT — the
+//                   torch Linear weight layout; see vt::MatmulBT's contract)
+// Folding the orientation at pipeline creation removes a per-ELEMENT branch from
+// the inner K loop, which is the whole point of specializing it rather than
+// passing it in the push block.
+layout(constant_id = 0) const uint VT_MM_A_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_MM_B_DT = VT_DT_F32;
+layout(constant_id = 2) const uint VT_MM_OUT_DT = VT_DT_F32;
+layout(constant_id = 3) const uint VT_MM_BT = 0u;
+
+layout(push_constant) uniform Params {
+  uint m;
+  uint n;
+  uint k;
+  uint a_off;
+  uint b_off;
+  uint out_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.m * p.n) { return; }
+  uint i = gid / p.n;  // output row
+  uint j = gid % p.n;  // output column
+
+  uint a_row = i * p.k;
+  float acc = 0.0;
+  for (uint q = 0u; q < p.k; ++q) {
+    float av = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q);
+    uint b_idx = VT_MM_BT == 1u ? (j * p.k + q) : (q * p.n + j);
+    float bv = VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_idx);
+    acc += av * bv;
+  }
+  VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, gid, acc);
+}
