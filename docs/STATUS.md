@@ -388,8 +388,8 @@ The correctness form and the full D0-D14 measured chronology live in
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed — see the capability table; not yet usable
-end-to-end), multi-GPU, Vulkan (gated skeleton: 8 of the CPU backend's 83 ops,
-no model runs; [campaign](../.agents/specs/vulkan-full-support.md)), and the
+end-to-end), multi-GPU, Vulkan (8 native kernels, 79 ops on the CPU tier, no
+model run e2e; [campaign](../.agents/specs/vulkan-full-support.md)), and the
 full tool-calling template surface. **Scale-out /
 distributed execution is scoped but unbuilt** (spike, 2026-07-28): the engine is
 single-GPU today (verified — no NCCL / tensor-parallel / process-group code in
