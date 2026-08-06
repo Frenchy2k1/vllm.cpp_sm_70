@@ -406,13 +406,34 @@ TEST_CASE(
       vllm::dense_nvfp4::GetW4A16Stats();
   MESSAGE("Qwen3-32B-NVFP4A16 W4A16 execution counters: marlin_gemms="
           << st.marlin_gemms << " fused_gate_up=" << st.fused_gate_up
+          << " dense_gemms=" << st.dense_gemms
           << " fallback_gemms=" << st.fallback_gemms);
-  CHECK_MESSAGE(st.marlin_gemms > 0,
-                "the NVFP4 W4A16 Marlin dense GEMM never ran — the quantized "
-                "path was NOT exercised by this gate");
-  CHECK_MESSAGE(st.fused_gate_up > 0,
-                "the fused gate_up Marlin GEMM never ran — the MLP did not take "
-                "vLLM's merged gate_up_proj layout");
+  // Under VT_MARLIN_DENSE (row KERNEL-MARLIN-DENSE-*), BOTH MatmulNvfp4MarlinD and
+  // GateUpFusedMarlinD route through vLLM's OWN dense marlin GEMM (dense_gemms++),
+  // so the single-expert MoE-marlin counters (marlin_gemms / fused_gate_up) must
+  // stay at zero. Assert the dense route actually RAN and the MoE route did NOT —
+  // the "the path RAN" positive signal for the flip decider.
+  if (vllm::dense_nvfp4::MarlinDenseEnabled()) {
+    CHECK_MESSAGE(st.dense_gemms > 0,
+                  "VT_MARLIN_DENSE set but the dense marlin GEMM never ran — the "
+                  "dense route was NOT exercised by this gate");
+    CHECK_MESSAGE(st.marlin_gemms == 0,
+                  "VT_MARLIN_DENSE set but the single-expert MoE-marlin GEMM still "
+                  "ran — the dense route did not fully replace it");
+    CHECK_MESSAGE(st.fused_gate_up == 0,
+                  "VT_MARLIN_DENSE set but the MoE fused gate_up still ran — the "
+                  "dense route did not fully replace the fused MLP GEMM");
+  } else {
+    CHECK_MESSAGE(st.marlin_gemms > 0,
+                  "the NVFP4 W4A16 Marlin dense GEMM never ran — the quantized "
+                  "path was NOT exercised by this gate");
+    CHECK_MESSAGE(st.fused_gate_up > 0,
+                  "the fused gate_up Marlin GEMM never ran — the MLP did not take "
+                  "vLLM's merged gate_up_proj layout");
+  }
+  CHECK_MESSAGE(st.fallback_gemms == 0,
+                "the naive NVFP4 fallback GEMM ran on CUDA — a Marlin route "
+                "silently fell back");
 
   MESSAGE("Qwen3-32B-NVFP4A16 correctness gate: "
           << (strict_exact + neartie_only) << "/" << N << " prompts PASS  "

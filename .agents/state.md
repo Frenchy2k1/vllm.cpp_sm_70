@@ -37446,3 +37446,62 @@ not attempted here):
 Default stays OFF until (b) proves byte-match vs the oracle and (d) beats the MoE route. SHA of this
 landing: `row/KERNEL-MARLIN-DENSE-PORT` (code commit + this records commit).
 
+## KERNEL-MARLIN-DENSE-EXEC: the four scoped gates RAN on GB10 — VT_MARLIN_DENSE FLIPS DEFAULT-ON (dense reduce IS vLLM's numerics: teacher-forced near-tie gap 0.000 nats, TIGHTER than MoE; 48-CTA grid beats the MoE route on EVERY binding throughput axis)
+<!-- state: 2026-08-09T18:00 -->
+
+Executed the operator dgx follow-up for `KERNEL-MARLIN-DENSE-PORT` (#55) on
+`row/KERNEL-MARLIN-DENSE-EXEC` off `origin/main` `828f6420`. Clean git-archive tree at the
+port sha built RelWithDebInfo on GB10 sm_121a (full production stack: marlin-nvfp4 [121a] +
+CUTLASS sm120a NVFP4 + FA2 [121a] + Triton-AOT vendored). **DECISION: FLIP VT_MARLIN_DENSE
+DEFAULT ON** (`200b4b56`; `=0` opts back out to the MoE route). Box left clean (gpu.lock free,
+GPU idle, worker down, disk 36G, tmux gone).
+
+(a) UNIT EXEC. First-ever execution of the #55 dense unit battery (`test_ops_moe_grouped`,
+NVFP4+MXFP4, M=1..8 × model shapes). **First run RED on NVFP4** — but the diagnostic proved it is a
+TEST-AUTHORING artifact, NOT a kernel bug: `max|dense-moe| == 0` at EVERY shape/M (dense output is
+BYTE-IDENTICAL to the validated single-expert MoE route), while the failing elements are all
+catastrophic-cancellation outputs (true |ref| 0.04-5, summands ~O(1e3)) where the bf16 tensor-core
+result parts from the naive fp32-accumulate CPU reference by O(1) — IDENTICALLY for the MoE route.
+The MXFP4 arm (looser 4e-2 + no cancellation in its RNG) passed. FIX (`200b4b56`): the NVFP4
+vs-reference checks use the standard cancellation-robust L2-relative metric; per-element
+byte-fidelity stays the EXACT dense==MoE gate; the row-shift RED injection still fires. Re-run
+**2/2 cases, 263/263 GREEN**. MEMCHECK (`compute-sanitizer memcheck --leak-check full`): **0
+invalid-access/race errors**; the 42 leak allocations are the graph-safe c_tmp retire-pool + static
+harness caches at process exit (same benign class as #54).
+
+(b) STRICT BATTERY dense-ON vs the ORACLE goldens. `test_qwen3_32b_nvfp4a16_paged_engine` (THE
+decider): baseline dense-OFF 6/6·143 reproduced (marlin_gemms=1536, dense_gemms=0). Dense-ON shifts
+the greedy anchor at two EXACT bf16 ties — prompt[2] tok0 264->304, prompt[3] tok3 374->702 — so the
+:344 hard REQUIRE fired (as it did for the #54 par1 clamp). **Near-tie razor (ratified method):**
+teacher-forcing the vLLM 0.25.0 oracle with OUR dense prefix, **every dense token == vLLM's
+teacher-forced argmax, max gap 0.000000 nats, 0 out-of-topK** — TIGHTER than the MoE route (which
+had 62 mnats at [2,1]). vLLM's greedy CAPTURE landed on 264/374; its teacher-forced run lands on
+304/702 (vLLM's OWN bf16 non-determinism at the tie) and dense tracks the tf-argmax. So the "dense =
+vLLM's own numerics" premise is CONFIRMED, and the shift is a RATIFIED tie -> regenerated the 32B
+`our_ids.npy`+`neartie_gap_mnats.npy` (all-zero gaps) under dense-ON. Re-run dense-ON **6/6·144
+graphed AND eager (byte-identical, capture-safe)**, counters `dense_gemms=2048, marlin_gemms=0,
+fused_gate_up=0, fallback_gemms=0` (gate-conditional counter assertion added, `d250893e`). Canaries
+(dense inert on bf16): `test_qwen3_paged_engine` 0.6B/4B 2/2·184; `test_qwen3_dense_async_serving`
+2/2·82. #44 MXFP4-8B smoke dense-ON **3/3 token-exact + near-tie coherent**.
+
+(c) NSYS c8 decode (same tool, MXFP4-8B, dense-OFF vs dense-ON A/B): the marlin kernel NAME changes
+`marlin_moe_wna16::Marlin` -> `marlin::Marlin` (the vendored dense template RAN), the decode grid
+drops **128x1x1 -> 48x1x1** (the designed sms-wide grid), and per-call median **117.8us -> 85.8us**
+(Avg 111.2us), total decode-marlin GPU -5%. Confirms the 48-CTA mechanism, now byte-safe.
+
+(d) BINDING c1..c8 x3 (`mxfp4-online-serving-grid.sh`, oracle vLLM 0.25.0
+`VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`, RelWithDebInfo strict-contract build in
+`~/mxfp4-bench/src` at the flip sha, single-load/arm, drop_caches+mincore, free>=90 gated,
+reps tight CoV~1%). total_token_throughput ours/vLLM **c1 1.020 / c2 0.962 / c4 0.966 / c8 0.969**
+vs #51 [1.005/0.925/0.939/0.953] = **+0.015/+0.037/+0.027/+0.016 — dense-ON BEATS the MoE route on
+EVERY axis, no regression**; median TPOT 1.019/0.960/0.958/0.961 (all improve vs #51); peak GPU mem
+28055 vs 73795 MiB = **2.63x LESS**. Evidence
+`dgx:~/work/vllm.cpp-online-gate/evidence/6a992a59.../summary-q3mxfp4/`.
+
+PARITY VERDICT (MXFP4 goal) = still BELOW-FLOOR <1.0x at c2-c8 (best c8 0.969, gate_pass NO) but
+CLOSER than #51; c1 crosses to 1.02x. RESIDUAL MAP (per #54 fair graphed-vs-graphed): the marlin
+term is now byte-safe-recovered; the next-dominant is decode-flash (+658-784us) then the norm/quant/
+act GLUE tail (+195-290us) + ~0.7ms host/sched. FLIP conditions (parity-enablers) MET: correctness
+ratified + beats MoE every axis + no regression + memory win. Landing `row/KERNEL-MARLIN-DENSE-EXEC`
+(`200b4b56`): flip `dense_nvfp4_gemm.h`, regen 32B goldens, gate-conditional counters, L2 unit fix.
+
