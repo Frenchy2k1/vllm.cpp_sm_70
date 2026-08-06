@@ -103,6 +103,7 @@ class CommittedArtifact(unittest.TestCase):
         "vt_matmul": "a/b/out dtype plus the b orientation",
         "vt_embedding": "table/out dtype plus the id width",
         "vt_paged_attn": "query/k-cache/v-cache/out dtype",
+        "vt_reshape_and_cache": "the 32- vs 16-bit copy width",
     }
 
     def test_specialized_shaders_declare_their_constants(self):

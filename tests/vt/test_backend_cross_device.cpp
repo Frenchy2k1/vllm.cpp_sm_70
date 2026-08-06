@@ -357,6 +357,75 @@ TEST_CASE("elementwise ops match the CPU oracle within NMSE <= 5e-4") {
   cpu.DestroyQueue(cq);
 }
 
+TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
+  // Byte movement, so the bar is memcmp against the CPU oracle, not NMSE.
+  constexpr int64_t kTokens = 9, kHk = 2, kD = 8, kBS = 4, kBlocks = 6;
+  constexpr int64_t kElems = kHk * kD;          // one token's page payload
+  constexpr int64_t kCacheN = kBlocks * kBS * kHk * kD;
+
+  const std::vector<float> knew = RandomVec(kTokens * kElems, 701);
+  const std::vector<float> vnew = RandomVec(kTokens * kElems, 702);
+  // Pre-existing cache contents: the padded-token case must leave these INTACT,
+  // so they cannot start as zeros or the check would pass vacuously.
+  const std::vector<float> kc0 = RandomVec(kCacheN, 703);
+  const std::vector<float> vc0 = RandomVec(kCacheN, 704);
+
+  // Slots are deliberately SCATTERED and out of order, and two tokens carry -1.
+  // Upstream pads the mapping and marks padded tokens negative (cpu_cache.cpp:60);
+  // a kernel that clamped instead of skipping would corrupt a real page, and one
+  // that read the i64 slot as unsigned would index astronomically out of range.
+  const std::vector<int64_t> slots = {20, -1, 3, 11, -1, 0, 23, 7, 15};
+
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> ck = knew, cv = vnew, ref_kc = kc0, ref_vc = vc0;
+  std::vector<int64_t> cslots = slots;
+  {
+    Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {kTokens, kHk, kD});
+    Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {kTokens, kHk, kD});
+    Tensor tkc = Tensor::Contiguous(ref_kc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+    Tensor tvc = Tensor::Contiguous(ref_vc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+    Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {kTokens});
+    vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
+  }
+  cpu.DestroyQueue(cq);
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+
+    DevBuf dk(dev, q, kTokens * kElems), dv(dev, q, kTokens * kElems),
+        dkc(dev, q, kCacheN), dvc(dev, q, kCacheN);
+    dk.Upload(knew);
+    dv.Upload(vnew);
+    dkc.Upload(kc0);   // seeded, so an untouched page must survive
+    dvc.Upload(vc0);
+    void* dsm = dev.Alloc(kTokens * sizeof(int64_t));
+    dev.Copy(q, dsm, slots.data(), kTokens * sizeof(int64_t));
+    dev.Synchronize(q);
+
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {kTokens, kHk, kD});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {kTokens, kHk, kD});
+    Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+    Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+    Tensor tsm = Tensor::Contiguous(dsm, DType::kI64, d, {kTokens});
+    vt::ReshapeAndCache(q, tk, tv, tkc, tvc, tsm);
+    dev.Synchronize(q);
+
+    const std::vector<float> got_kc = dkc.Download();
+    const std::vector<float> got_vc = dvc.Download();
+    CHECK(std::memcmp(ref_kc.data(), got_kc.data(), ref_kc.size() * sizeof(float)) == 0);
+    CHECK(std::memcmp(ref_vc.data(), got_vc.data(), ref_vc.size() * sizeof(float)) == 0);
+
+    dev.Free(dsm);
+    dev.DestroyQueue(q);
+  }
+}
+
 TEST_CASE("paged attention matches the CPU oracle within NMSE <= 5e-4") {
   // GQA prefill: Hq=4 query heads over Hk=2 kv heads, head dim 8, block size 4,
   // one request of 37 tokens spanning 10 pages. Ragged on purpose -- 37 is not a

@@ -1,0 +1,75 @@
+#version 450
+// vt::ReshapeAndCache — scatter this step's K/V rows into their KV-cache pages.
+// Ported from src/vt/cpu/cpu_cache.cpp ReshapeAndCacheKernel (:33-72).
+//
+// THIS OP MOVES BYTES, IT DOES NOT COMPUTE. The CPU kernel is two memcpys per
+// token (:67-70) and nothing is converted, reassociated or rounded, so the gate
+// for it is BIT-EXACTNESS rather than NMSE. The dtype therefore selects only the
+// STORAGE WIDTH to copy at, never a conversion: a 32-bit dtype copies through the
+// uint32 view and a 16-bit dtype through the uint16 view, which is why the dtype
+// is a specialization constant and the two branches never mix.
+//
+// SLOT -1 IS NOT AN ERROR. Upstream pads the slot mapping and marks padded tokens
+// with a negative slot (:60, "upstream NOTE: slot can be -1"); those tokens are
+// SKIPPED, leaving whatever the cache already held. A kernel that clamped instead
+// of skipping would silently corrupt a real page.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Kb32 { uint v[]; } K32;
+layout(binding = 1) readonly buffer Kb16 { uint16_t v[]; } K16;
+layout(binding = 2) readonly buffer Vb32 { uint v[]; } V32;
+layout(binding = 3) readonly buffer Vb16 { uint16_t v[]; } V16;
+layout(binding = 4) buffer KCb32 { uint v[]; } KC32;
+layout(binding = 5) buffer KCb16 { uint16_t v[]; } KC16;
+layout(binding = 6) buffer VCb32 { uint v[]; } VC32;
+layout(binding = 7) buffer VCb16 { uint16_t v[]; } VC16;
+layout(binding = 8) readonly buffer SMb { uint v[]; } SM;  // slot mapping, i64
+
+// 0 = the operand is 32-bit (f32), 1 = 16-bit (f16/bf16). NOT a VT_DT_* code:
+// nothing here converts, so only the width matters.
+layout(constant_id = 0) const uint VT_RAC_W16 = 0u;
+
+layout(push_constant) uniform Params {
+  uint num_slots;
+  uint n_elems;       // num_kv_heads * head_size — one token's page payload
+  uint block_size;
+  uint k_blk, k_pg;   // k-cache block / page strides, in ELEMENTS
+  uint v_blk, v_pg;
+  uint k_tok, v_tok;  // source per-token strides, in elements
+  uint k_off, v_off, kc_off, vc_off, sm_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.num_slots * p.n_elems) { return; }
+  uint t = gid / p.n_elems;  // token
+  uint e = gid % p.n_elems;  // element within the token's page
+
+  // slot_mapping is i64; read the LOW word and the HIGH word so the sign is
+  // visible. A padded token carries -1, which is 0xFFFFFFFF in both halves, and
+  // treating it as unsigned would index astronomically out of range.
+  uint sm_base = (p.sm_off >> 2) + 2u * t;
+  int slot_hi = int(SM.v[sm_base + 1u]);
+  int slot_lo = int(SM.v[sm_base]);
+  if (slot_hi < 0) { return; }  // negative slot => padded token, skip (cpu_cache.cpp:60)
+
+  uint slot = uint(slot_lo);
+  uint block = slot / p.block_size;
+  uint offset = slot % p.block_size;
+
+  uint kdst = block * p.k_blk + offset * p.k_pg + e;
+  uint vdst = block * p.v_blk + offset * p.v_pg + e;
+  uint ksrc = t * p.k_tok + e;
+  uint vsrc = t * p.v_tok + e;
+
+  if (VT_RAC_W16 == 1u) {
+    KC16.v[(p.kc_off >> 1) + kdst] = K16.v[(p.k_off >> 1) + ksrc];
+    VC16.v[(p.vc_off >> 1) + vdst] = V16.v[(p.v_off >> 1) + vsrc];
+  } else {
+    KC32.v[(p.kc_off >> 2) + kdst] = K32.v[(p.k_off >> 2) + ksrc];
+    VC32.v[(p.vc_off >> 2) + vdst] = V32.v[(p.v_off >> 2) + vsrc];
+  }
+}

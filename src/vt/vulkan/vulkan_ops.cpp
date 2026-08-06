@@ -112,6 +112,12 @@ struct EmbeddingParams {
 struct ArgmaxParams {
   uint32_t n, v, logits_off, out_off;
 };
+struct ReshapeAndCacheParams {
+  uint32_t num_slots, n_elems, block_size;
+  uint32_t k_blk, k_pg, v_blk, v_pg;
+  uint32_t k_tok, v_tok;
+  uint32_t k_off, v_off, kc_off, vc_off, sm_off;
+};
 struct PagedAttnParams {
   uint32_t total_q, hq, d, block_size, qpk, num_reqs;
   uint32_t causal;
@@ -495,6 +501,46 @@ void PagedAttentionKernel(Queue& q, Tensor& out, const Tensor& query, const Tens
   Go("vt_paged_attn", bind, p, static_cast<uint32_t>(total_q * hq), spec, 4);
 }
 
+// cpu_cache.cpp:33-72 ReshapeAndCacheKernel. Pure BYTE MOVEMENT -- the CPU
+// kernel is two memcpys per token and converts nothing -- so the dtype selects
+// only the storage WIDTH to copy at, and the gate for it is bit-exactness.
+void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                           Tensor& v_cache, const Tensor& slot_mapping) {
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t n_elems = k_cache.shape[2] * k_cache.shape[3];  // one token's page
+  if (num_slots == 0 || n_elems == 0) return;
+  VT_CHECK(slot_mapping.dtype == DType::kI64,
+           "vulkan reshape_and_cache: slot_mapping must be i64");
+  VT_CHECK(k.dtype == k_cache.dtype && v.dtype == v_cache.dtype,
+           "vulkan reshape_and_cache: source and cache dtypes must match (this op "
+           "moves bytes and converts nothing)");
+
+  Binder bind;
+  const uint32_t k_off = bind.Add(k, "reshape_and_cache: k");
+  const uint32_t v_off = bind.Add(v, "reshape_and_cache: v");
+  const uint32_t kc_off = bind.Add(k_cache, "reshape_and_cache: k_cache");
+  const uint32_t vc_off = bind.Add(v_cache, "reshape_and_cache: v_cache");
+  const uint32_t sm_off = bind.AddU32Only(slot_mapping, "reshape_and_cache: slot_mapping");
+
+  const uint32_t spec[1] = {k.dtype == DType::kF32 ? 0u : 1u};
+  ReshapeAndCacheParams p{static_cast<uint32_t>(num_slots),
+                          static_cast<uint32_t>(n_elems),
+                          static_cast<uint32_t>(block_size),
+                          static_cast<uint32_t>(k_cache.stride[0]),
+                          static_cast<uint32_t>(k_cache.stride[1]),
+                          static_cast<uint32_t>(v_cache.stride[0]),
+                          static_cast<uint32_t>(v_cache.stride[1]),
+                          static_cast<uint32_t>(k.stride[0]),
+                          static_cast<uint32_t>(v.stride[0]),
+                          k_off,
+                          v_off,
+                          kc_off,
+                          vc_off,
+                          sm_off};
+  Go("vt_reshape_and_cache", bind, p, FlatGroupCount(num_slots * n_elems), spec, 1);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -503,6 +549,8 @@ struct Registrar {
     if (!VulkanContext::Available()) return;
     // static_cast against the ops.h aliases ties every kernel signature to the
     // registration contract at COMPILE time (the cpu_ops.cpp idiom).
+    RegisterOp(OpId::kReshapeAndCache, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
     RegisterOp(OpId::kPagedAttention, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<PagedAttentionFn>(&PagedAttentionKernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kVULKAN,
