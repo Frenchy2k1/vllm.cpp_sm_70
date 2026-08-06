@@ -36917,3 +36917,87 @@ bigger delicate lift) and the ~0.7ms host/sched slice. No single lever reaches >
 Evidence: `dgx:~/mxfp4-nsys/{kern_sum_c1.txt,kern_sum_c2.txt,vllm_torch_c2.txt,vllm_kern_nsys_c2.txt,
 vllm_kern_sum.txt}` + reps `ours_c1/ours_c2/vllm_c2.nsys-rep`.
 Box: both locks free, GPU idle, disk 22G, local-ai-worker left down, tmux clean.
+
+## KERNEL-FA2-GQA-SWAP: the #47 lever LANDS — vLLM decode group-swap ported into the d128 varlen launcher, correctness-complete gated default-OFF (op RED/GREEN + memcheck + swap-ON smoke TOKEN-EXACT); bench + flip = next step
+<!-- state: 2026-08-08T18:00 -->
+
+Implemented the #47-localized lever on `row/KERNEL-FA2-GQA-SWAP` off `origin/main`
+`2f235beb`. **The port is DONE and correctness-complete on GB10; it ships gated
+default-OFF, so production is byte-unchanged.** The c1-c8 x3 binding re-bench and
+the default flip are the recorded next step (not run this session — the 72 GiB-
+oracle grid is the box-safety-heavy arm; the correctness bar that GATES the flip
+is fully met). Box left clean (both locks free, GPU idle, worker down, disk 22G).
+
+WHAT SHIPPED (the port, file:line):
+- `src/vt/cuda/cuda_flash_attn_fa2.cu` `LaunchDecodeVarlenFA2Bf16` (now takes
+  `bool gqa_swap`): when TRUE-GQA pure decode (`max_seqlen_q==1`, `hq%kv==0`,
+  ngroups>1) and `gqa_swap`, presents q/o logically as `[b, ngroups, kv_heads, d]`
+  via kv-major-group-minor strides (`q_head_stride = ngroups*stride[1]`, no
+  materialized transpose), clears `cu_seqlens_q` (batched layout), sets
+  `h=kv_heads / h_h_k_ratio=1 / seqlen_q=ngroups / total_q=b*ngroups`, recomputes
+  `num_splits` on `batch*kv_heads*num_m_blocks`, normalizes causal→non-causal
+  (every seqlen_q row is the SAME decode token across a group's heads), sets
+  `seqlenq_ngroups_swapped=true`, dispatches `<bf16,128,false>`. This is a 1:1
+  mirror of the SHIPPED d256 `LaunchDecodeFA2Bf16` swap (which was the proof the
+  vendored `flash_fwd_kernel.h` get_lse_tile/combine already honor the flag in
+  BOTH the num_splits==1 direct-write and >1 combine paths). Scratch BYTES are
+  identical to the plain arm (`b*hq` LSE elements either way) so capture-safe; the
+  `DecodeShapeKey.groups` field keys swap-on vs swap-off apart. OFF path is the
+  UNTOUCHED prior code (byte-identical, proven).
+- Gate `Fa2DecodeGqaSwapEnabled()` (`VT_FA2_DECODE_GQA_SWAP`, default OFF, `=1`
+  opt-in) + call-site `gqa_swap = qpk>1 && enabled` in `cuda_paged_attn.cu`
+  `LaunchPaged` (the `fa2_decode_qwen3` branch). Fwd-decl + internal header
+  (`Fa2DecodeSwapLaunchesForTesting`) updated; `RecordDecodeLaunch` gained a
+  `swapped` arg (+`swap_launches` counter; the d256 arms pass true).
+
+BLAST RADIUS (enumerated from the dispatcher): the d128 varlen decode
+(`fa2_decode_qwen3` → `LaunchDecodeVarlenFA2Bf16`) is the SHARED dense FA2 decode
+launcher. Under the toggle the swap engages for the Qwen3-dense family — 0.6B
+(16/8, ngroups 2), 4B (32/8, ngroups 4), 8B / MXFP4-8B (32/8, ngroups 4) — and
+ONLY those (d128 + bf16 + groups>1). The 27B/35B gate models decode on their OWN
+d256 `LaunchDecodeFA2Bf16` (already swapped) — NOT touched. Voxtral's audio decode
+also routes the d128 varlen launcher but is MHA (qpk==1 where applicable) → inert.
+
+GATE VERDICTS (dgx GB10, CUDA 13.0, sm_121a, RelWithDebInfo, VLLM_CPP_FLASH_ATTN=ON;
+build in `~/mxfp4-bench` overlay of the 4 files, git-archived by SHA, md5-matched):
+- BUILD: clean (`ninja test_ops_paged_attn` + `vllm-cli`, EXIT 0; the two CUDA TUs
+  compile on nvcc). One typo fixed (`std::max(double,float)` in the new test).
+- OP UNIT TEST (RED-first): `test_ops_paged_attn --test-case="*varlen d128*"` =
+  **5/5 cases, 280/280 assertions GREEN** — the shipped OFF-path parity + 3 NEW
+  swap cases: (a) group-swap matches the f32 ComposedPagedRef across both ratios
+  ×batch{1,2,4,8}×len{5,21,1024} (short num_splits==1 + long split) with
+  `swap_launches==1` ASSERTED (grid engaged), (b) swap-ON near-ties the plain arm
+  directly (max_abs < 2e-2), (c) swap inert for MHA qpk==1 (`swap_launches==0`).
+  **RED PROVEN:** injecting a wrong swapped `o_head_stride` (drop the ngroups
+  factor) on dgx → the group-swap case FAILS loudly (26528 violations, max_abs
+  2.60), so a GREEN means the layout is read correctly (not a vacuous fallback).
+  Full binary 28/28 cases / 454,679 assertions (no regression from the
+  RecordDecodeLaunch signature change; d256 arms unmoved).
+- MEMCHECK: `compute-sanitizer --tool memcheck --leak-check full` on the swap
+  cases = **0 errors, 0 bytes leaked**.
+- #44 SMOKE (Yi30/Qwen3-8B-MXFP4, the blast-radius model, groups=4, DEFAULT async
+  config = graphed decode) BOTH arms PASS: swap-OFF 3/3 det token-exact + coherent;
+  **swap-ON 3/3 deterministic TOKEN-EXACT vs golden AND byte-identical to the OFF
+  arm** (capitals/arithmetic/fibonacci char-identical; the near-tie story
+  identical too) — the swap does NOT flip a token e2e at these lengths, so the
+  near-tie razor was not needed. This is the capture-safety graphed token gate ON.
+- SACRED e2e for Qwen3-0.6B/4B (16/8 + 32/8): the OP test covers both ratios at
+  the kernel level; the model-level e2e SACRED with those checkpoints' oracle
+  goldens is PENDING (bundled with the flip campaign below).
+
+DEFAULT DECISION: keep **OFF** this session — the flip is conditioned
+(parity-enablers) on the speed bench showing ≥1.0x on every axis with no c1
+regression, which is NOT yet measured. The correctness half of that bar is met.
+
+REMAINING (the flip campaign, exact recipe): (1) `scripts/mxfp4-online-serving-grid.sh
+--snapshot <Yi30/Qwen3-8B-MXFP4 b3e7ab32> --build-dir ~/mxfp4-bench/build
+--configure-log <log>` with `VT_FA2_DECODE_GQA_SWAP=1` on the OURS legs, vs the
+#45 numbers (c1 0.989 / c2 0.911 / c4 0.919 / c8 0.913 tput; TPOT c2 28.27→25.45).
+#47 projects flash alone closes ~28%@c2 / ~55%@c8 of the gap (decode flash
+63.7→~41.7us c2 as the grid drops 192→96 CTAs); residual = marlin +7-9%
+(grouped→dense-direct-A, refuted as a config lever) + ~0.7ms host/sched, so a
+single lever may not reach ≥1.0x — record the honest per-axis outcome either way.
+(2) Qwen3-0.6B/4B e2e SACRED with swap ON (near-tie razor if a token flips — the
+smoke suggests it won't at short contexts). (3) then flip default per (f).
+Evidence: dgx smoke `~/smoke.log` (transient), op/memcheck run inline (above).
+Box: both locks free, GPU idle, disk 22G, local-ai-worker left down, tmux clean.

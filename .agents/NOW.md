@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-06 -->
+<!-- now-updated: 2026-08-08 -->
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
@@ -14,14 +14,15 @@ checkpoint on `upstream/main` at `59674cf1d`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (44.46 vs 43.10, byte-exact, default). Root cause = bf16 weight residency via `VT_LAGUNA_RESIDENT_BF16W` (default-ON). Detail in benchmark record | Residual: formal vLLM K-run set when convenient |
-| DeepSeek-V4-Flash decode | **Closed: BEATS ds4 1.144x** (`VT_V4_RESIDENT_W` on, byte-exact). Phase-2 routed-expert residency NEGATIVE 2026-08-05 (−3.4%), HELD default-OFF. See state | — |
+| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (byte-exact, default; `VT_LAGUNA_RESIDENT_BF16W` bf16-residency). Benchmark record | vLLM K-run set when convenient |
+| DeepSeek-V4-Flash decode | **Closed: BEATS ds4 1.144x** (`VT_V4_RESIDENT_W`, byte-exact). Phase-2 routed-expert residency NEGATIVE (−3.4%), default-OFF | — |
 | f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate models & on-framework dense unaffected (bf16-out, e2e-verified) | Re-verify deepseek_v4 bf16 tower same-tool |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
-| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13, f32-loader block CLEARED): CPU+CUDA 13/13·656; host RSS peak 1.7 GiB, min-avail 21 GiB, no OOM. **Token gate NEAR-TIE 106/128** (6/8 prompts token-exact; numerics near-tie vs deterministic oracle, not a bug) | STRICT path = device GDN/MLA islands + bf16 stream (W7-speed residuals); 1.59 tok/s; default OFF |
+| MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis |
+| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13): CPU+CUDA 13/13·656, no OOM. **Token gate NEAR-TIE 106/128** (6/8 token-exact) | device GDN/MLA islands + bf16 stream; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
+| MXFP4 c2-c8 lever = FA2 decode GQA group-swap | **Ported gated OFF** (`VT_FA2_DECODE_GQA_SWAP`): vLLM decode swap in the d128 varlen launcher; correctness-complete GB10 (op RED/GREEN, memcheck, swap-ON smoke token-exact), OFF byte-identical | bench + flip: state `KERNEL-FA2-GQA-SWAP` |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
 | QUANT-CT-MXFP4-BENCH | ~0.91x@c2-c8; marlin+glue levers **both REFUTED**; step = flash GQA group-swap | LEVER + detail: state `QUANT-CT-MXFP4-GLUE` (`cuda_flash_attn_fa2.cu:1075`) |
 

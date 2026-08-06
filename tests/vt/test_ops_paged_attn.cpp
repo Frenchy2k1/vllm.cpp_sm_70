@@ -45,6 +45,7 @@ void DisableFa2DecodeDebugCounters();
 uint64_t Fa2DecodeLaunchesForTesting();
 uint64_t Fa2DecodeSplitLaunchesForTesting();
 uint64_t Fa2DecodeNoSplitLaunchesForTesting();
+uint64_t Fa2DecodeSwapLaunchesForTesting();
 uint64_t Fa2DecodeScratchAllocationsForTesting();
 uint64_t Fa2DecodeScratchReusesForTesting();
 size_t Fa2DecodeScratchShapeCountForTesting(int device, void* stream);
@@ -1448,6 +1449,7 @@ struct Fa2DecodeRunStats {
   uint64_t launches = 0;
   uint64_t split_launches = 0;
   uint64_t no_split_launches = 0;
+  uint64_t swap_launches = 0;
 };
 
 Fa2DecodeRunStats RunFa2DecodeCase(Fa2DecodeCase& c, const char* toggle,
@@ -1498,12 +1500,17 @@ Fa2DecodeRunStats RunFa2DecodeCase(Fa2DecodeCase& c, const char* toggle,
   return stats;
 }
 
-// VARLEN d128 decode harness (Qwen3-dense): the exact non-swap
-// flash_attn_varlen_func path (VT_FA2_DECODE_QWEN3). Same host/device fixture,
-// but head_dim 128 and the plain-varlen launcher (cu_seqlens_q = qsl, causal,
-// no group swap). Validated against the same f32 ComposedPagedRef.
+// VARLEN d128 decode harness (Qwen3-dense): the flash_attn_varlen_func path
+// (VT_FA2_DECODE_QWEN3), head_dim 128. `swap_toggle` drives VT_FA2_DECODE_GQA_SWAP
+// so one harness covers both the plain-varlen reduction and vLLM's decode
+// seqlenq_ngroups_swapped grid. `expect_swap` asserts the swapped launcher engaged
+// (or did NOT, for the eligibility guards). Both validated against the same f32
+// ComposedPagedRef. When `out_bits` is non-null the downloaded bf16 output is
+// copied out so callers can cross-check swap-ON vs swap-OFF (the near-tie razor).
 Fa2DecodeRunStats RunFa2VarlenDecodeCase(Fa2DecodeCase& c, const char* toggle,
-                                         bool expect_fa2) {
+                                         bool expect_fa2, const char* swap_toggle = "0",
+                                         bool expect_swap = false,
+                                         std::vector<uint16_t>* out_bits = nullptr) {
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard guard(gpu);
   DeviceTensor query(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d},
@@ -1520,6 +1527,7 @@ Fa2DecodeRunStats RunFa2VarlenDecodeCase(Fa2DecodeCase& c, const char* toggle,
   DeviceTensor out(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d});
 
   EnvGuard qwen3_toggle("VT_FA2_DECODE_QWEN3", toggle);
+  EnvGuard swap_env("VT_FA2_DECODE_GQA_SWAP", swap_toggle);
   vt::cuda::testing::ResetFa2DecodeDebugCounters();
   PagedAttentionArgs args{c.scale, true};
   args.query_start_loc_host = c.qsl.data();
@@ -1532,11 +1540,16 @@ Fa2DecodeRunStats RunFa2VarlenDecodeCase(Fa2DecodeCase& c, const char* toggle,
   const Fa2DecodeRunStats stats{
       vt::cuda::testing::Fa2DecodeLaunchesForTesting(),
       vt::cuda::testing::Fa2DecodeSplitLaunchesForTesting(),
-      vt::cuda::testing::Fa2DecodeNoSplitLaunchesForTesting()};
+      vt::cuda::testing::Fa2DecodeNoSplitLaunchesForTesting(),
+      vt::cuda::testing::Fa2DecodeSwapLaunchesForTesting()};
   vt::cuda::testing::DisableFa2DecodeDebugCounters();
   CheckBf16AgainstReference(got, c.Reference(c.seq_lens),
                             expect_fa2 ? "FA2 varlen decode d128" : "paged fallback");
   CHECK(stats.launches == (expect_fa2 ? 1U : 0U));
+  // The swap grid MUST have engaged (or not) as expected — a plain-path fallback
+  // that still matched the reference would otherwise pass the port vacuously.
+  CHECK(stats.swap_launches == (expect_swap ? 1U : 0U));
+  if (out_bits != nullptr) *out_bits = std::move(got);
   return stats;
 }
 
@@ -1581,6 +1594,96 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode toggle-off uses fallback
   Fa2DecodeCase c(/*Hq=*/16, /*Hkv=*/8, {21, 24, 27}, 7333,
                   /*capacity_blocks=*/0, /*head_dim=*/128);
   RunFa2VarlenDecodeCase(c, "0", /*expect_fa2=*/false);
+}
+
+// Qwen3-dense VARLEN d128 decode GQA GROUP-SWAP (VT_FA2_DECODE_GQA_SWAP): vLLM's
+// seqlenq_ngroups_swapped decode grid ported into the varlen launcher (#47). The
+// port must (a) match the same f32 composed reference within the near-tie band at
+// both gate ratios (0.6B 16/8 => ngroups 2, 4B 32/8 => ngroups 4), across batch
+// and both num_splits regimes, AND (b) PROVE the swapped grid actually engaged
+// (swap_launches==1) — a silent fallback to the plain arm that still matched the
+// reference would pass the port vacuously. Grid-sensitivity (the RED anchor): a
+// wrong swapped stride / seqlen_q / head count corrupts the output and trips
+// CheckBf16AgainstReference, so a GREEN here means the layout is read correctly.
+TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode GQA group-swap matches composed reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 varlen d128 group-swap parity (dgx-pending)");
+    return;
+  }
+  for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
+                            std::pair<int64_t, int64_t>{32, 8}}) {
+    for (const int batch : {1, 2, 4, 8}) {
+      for (const int base_len : {5, 21, 1024}) {  // short => num_splits==1; long => split
+        CAPTURE(ratio.first);
+        CAPTURE(batch);
+        CAPTURE(base_len);
+        std::vector<int32_t> lengths(static_cast<size_t>(batch));
+        for (int i = 0; i < batch; ++i)
+          lengths[static_cast<size_t>(i)] = base_len + i * 3;
+        Fa2DecodeCase c(ratio.first, ratio.second, std::move(lengths),
+                        7700U + static_cast<uint32_t>(batch * 31 + base_len),
+                        /*capacity_blocks=*/0, /*head_dim=*/128);
+        RunFa2VarlenDecodeCase(c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"1",
+                               /*expect_swap=*/true);
+      }
+    }
+  }
+}
+
+// Near-tie razor: the swap arm and the plain-varlen arm read the SAME q/k/v, so
+// their bf16 outputs must agree within the split-reduction near-tie band (they are
+// only non-byte-exact when num_splits>1). Directly comparing the two engine
+// outputs (not just each vs the host reference) pins that the swap is a numerics-
+// preserving reshape of vLLM's own reduction, not a different computation.
+TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode swap near-ties the plain-varlen arm") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 varlen d128 swap-vs-plain near-tie (dgx-pending)");
+    return;
+  }
+  for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
+                            std::pair<int64_t, int64_t>{32, 8}}) {
+    for (const int batch : {2, 8}) {
+      for (const int base_len : {21, 1024}) {
+        CAPTURE(ratio.first);
+        CAPTURE(batch);
+        CAPTURE(base_len);
+        std::vector<int32_t> lengths(static_cast<size_t>(batch));
+        for (int i = 0; i < batch; ++i)
+          lengths[static_cast<size_t>(i)] = base_len + i * 3;
+        Fa2DecodeCase c(ratio.first, ratio.second, std::move(lengths),
+                        7900U + static_cast<uint32_t>(batch * 31 + base_len),
+                        /*capacity_blocks=*/0, /*head_dim=*/128);
+        std::vector<uint16_t> plain, swapped;
+        RunFa2VarlenDecodeCase(c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"0",
+                               /*expect_swap=*/false, &plain);
+        RunFa2VarlenDecodeCase(c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"1",
+                               /*expect_swap=*/true, &swapped);
+        REQUIRE(plain.size() == swapped.size());
+        double max_abs = 0.0;
+        for (size_t i = 0; i < plain.size(); ++i) {
+          const double diff = static_cast<double>(Bf16BitsToF32(plain[i])) -
+                              static_cast<double>(Bf16BitsToF32(swapped[i]));
+          max_abs = std::max(max_abs, std::abs(diff));
+        }
+        INFO("swap vs plain max_abs = " << max_abs);
+        CHECK(max_abs < 2.0e-2);
+      }
+    }
+  }
+}
+
+// Eligibility guard: with the swap env ON but a NON-GQA topology (MHA, qpk==1) the
+// launcher must stay on the plain-varlen path — there are no query groups to pack.
+// Proves the dispatcher/launcher gate, not just the happy path.
+TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode swap is inert for MHA (qpk==1)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 varlen d128 swap MHA-ineligibility (dgx-pending)");
+    return;
+  }
+  Fa2DecodeCase c(/*Hq=*/8, /*Hkv=*/8, {21, 24, 27}, 7811,
+                  /*capacity_blocks=*/0, /*head_dim=*/128);
+  RunFa2VarlenDecodeCase(c, "1", /*expect_fa2=*/true, /*swap_toggle=*/"1",
+                         /*expect_swap=*/false);
 }
 
 TEST_CASE("paged_attention CUDA FA-2 split heuristic mirrors upstream") {

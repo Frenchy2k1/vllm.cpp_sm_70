@@ -85,6 +85,25 @@ trace-proven at **180.28 us/call**, within 1.1% of the matched vLLM FA2 kernel
 at 178.40 us/call. Evidence:
 [2026-07-25 4B repair](../docs/bench-evidence/qwen35-4b-main-repair-20260725.md).
 
+`KERNEL-ATTN-FA2` d128 varlen decode GQA group-swap (2026-08-06,
+`row/KERNEL-FA2-GQA-SWAP`, `VT_FA2_DECODE_GQA_SWAP`, default OFF): vLLM's
+`seqlenq_ngroups_swapped` decode grid ported into `LaunchDecodeVarlenFA2Bf16`
+(`cuda_flash_attn_fa2.cu`) so the Qwen3-dense d128 decode launches
+(batch, kv_heads) not (batch, hq) — the ngroups query heads pack into seqlen_q,
+KV read once per group, heuristic sees `batch*kv_heads` — halving the CTA count
+at batch>=2 (#47: ours over-waved 192 CTAs c2 / ~5 waves c8). Presented WITHOUT a
+materialized transpose via kv-major-group-minor strides, mirroring the shipped
+d256 `LaunchDecodeFA2Bf16` swap (the vendored `get_lse_tile`/combine already
+honor the flag). Gated so OFF is byte-identical to the shipped plain-varlen
+reduction; ON is non-byte-exact only when num_splits>1 (split reduction order
+→ near-tie, toward vLLM). Correctness-complete on GB10 (CUDA 13.0, sm_121a):
+op RED-first test **280/280 assn GREEN** (both ratios 16/8+32/8, batch 1/2/4/8,
+short+long context; `swap_launches==1` proves the grid engaged; wrong-stride RED
+= 26528 violations), compute-sanitizer **0-err/0-leak**, and the #44 MXFP4 e2e
+smoke swap-ON **3/3 deterministic TOKEN-EXACT + coherent**, byte-identical to
+swap-OFF (no token flip, near-tie razor unneeded). c1-c8 x3 binding re-bench +
+default flip is the recorded next step. Detail: state `KERNEL-FA2-GQA-SWAP`.
+
 | ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|
 | `KERNEL-ACCEL-PROVIDER-SELECT` | **WHICH implementation of an op runs, when more than one exists on a device** — the selection layer above every kernel family in this matrix. Distinct from `KERNEL-CUDA-DISPATCH-AOT`, which is about which ARCH a CUDA kernel is compiled/selected for; this is about which PROVIDER (ours, a vendor library, MLX, llama.cpp) serves the op at all | no single upstream file: this is the shape vLLM's runtime chain uses everywhere — flashinfer tactic registries, cuBLASLt/CUTLASS per-call heuristics, and torch's backend selection — rather than compile-time pinning | `vt::OpProvider` [op_provider.h](../include/vt/op_provider.h) + [op_provider.cpp](../src/vt/op_provider.cpp); the flat `[OpId][DeviceType]` `void*` table it replaces is gone from [ops.cpp](../src/vt/ops.cpp) with the ~70 op wrappers untouched. Providers registered today: `vt-native` (every backend kernel in the tree, priority 0, unconditional — behaviour preserved exactly), `mlx` (priority 100, Metal `kMatmul`/`kMatmulBT`, build-gated `VLLM_CPP_MLX`, [metal_mlx_provider.mm](../src/vt/metal/metal_mlx_provider.mm)), and — NEW 2026-07-23 (`CLAIM-BACKEND-SEAM-S5-1`, work row `S5`) — **`vt-cpu-ref` (priority −1000, the portable reference tier)**: the CPU kernel installed LAZILY as a negative-priority fallback on a UNIFIED-MEMORY device's first `GetOp` miss, mirroring `custom_op.py:138 forward_native`, so a partial backend runs an op it lacks natively instead of throwing. Native always wins (priority); gated on `Backend::UnifiedMemory()` (a discrete GPU never gets it — a CPU kernel on true device memory is corruption); observable via `GetReferenceTierHits()` + a one-time loud stderr line | [test_op_provider.cpp](../tests/vt/test_op_provider.cpp) 11 cases / 47 assertions — deterministic selection under REVERSED registration order, name tie-break, duplicate rejection, capability predicate, caps re-resolution, decline-and-fall-back, stats, runtime disable; [test_metal_backend.cpp](../tests/vt/test_metal_backend.cpp) 9 cases / 108 assertions on the M4 with MLX ON, including MLX-vs-MSL-vs-CPU NMSE per op at real shapes and an end-to-end DECLINE; **[test_reference_tier.cpp](../tests/vt/test_reference_tier.cpp) (S5): discrete-device refusal + unified-device zero-native-kernel fallback correctness + native-wins + observability, hardware-free via a fake backend on `kXPU`.** Linux CPU 156/156; dgx regression set ALL UNCHANGED — anchor `tests/vt/test_op_provider.cpp:64` | [Metal/MLX reuse study §6](specs/metal-mlx-reuse-study.md); [accelerator-seam-audit §10](specs/accelerator-seam-audit.md); [drop-in kernel ABI](specs/dropin-kernel-abi.md) (the complementary ARGUMENT half) | `ACTIVE` — mechanism landed and gated with THREE provider kinds (`vt-native`, `mlx`, `vt-cpu-ref`); the CUDA/CPU/Vulkan vendor provider rows it was designed for are not yet populated (so the row is deliberately left open) | `CLAIM-BACKEND-ACCEL-PROVIDER-1` |

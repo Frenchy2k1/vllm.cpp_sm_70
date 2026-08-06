@@ -22,6 +22,11 @@ void DisableFa2DecodeDebugCounters();
 uint64_t Fa2DecodeLaunchesForTesting();
 uint64_t Fa2DecodeSplitLaunchesForTesting();
 uint64_t Fa2DecodeNoSplitLaunchesForTesting();
+// Decode launches that used the seqlenq_ngroups_swapped presentation. Lets a test
+// PROVE the swapped grid engaged (VT_FA2_DECODE_GQA_SWAP), not just that a launch
+// happened. The d256 group-swap arms always count; the d128 varlen arm counts
+// only under the swap toggle.
+uint64_t Fa2DecodeSwapLaunchesForTesting();
 uint64_t Fa2DecodeScratchAllocationsForTesting();
 uint64_t Fa2DecodeScratchReusesForTesting();
 

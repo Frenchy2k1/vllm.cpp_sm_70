@@ -250,6 +250,10 @@ struct Fa2DebugCounters {
   std::atomic<uint64_t> no_split_launches{0};
   std::atomic<uint64_t> scratch_allocations{0};
   std::atomic<uint64_t> scratch_reuses{0};
+  // Decode launches that presented q via the seqlenq_ngroups_swapped layout
+  // (the d256 group-swap arms are always swapped; the d128 varlen arm swaps only
+  // under VT_FA2_DECODE_GQA_SWAP). Lets the op test PROVE the swap grid engaged.
+  std::atomic<uint64_t> swap_launches{0};
 };
 
 Fa2DebugCounters& DebugCounters() {
@@ -257,7 +261,7 @@ Fa2DebugCounters& DebugCounters() {
   return counters;
 }
 
-void RecordDecodeLaunch(bool split, bool allocated) {
+void RecordDecodeLaunch(bool split, bool allocated, bool swapped) {
   Fa2DebugCounters& counters = DebugCounters();
   if (!counters.enabled.load(std::memory_order_relaxed)) return;
   counters.decode_launches.fetch_add(1, std::memory_order_relaxed);
@@ -265,6 +269,7 @@ void RecordDecodeLaunch(bool split, bool allocated) {
       .fetch_add(1, std::memory_order_relaxed);
   (allocated ? counters.scratch_allocations : counters.scratch_reuses)
       .fetch_add(1, std::memory_order_relaxed);
+  if (swapped) counters.swap_launches.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace
@@ -867,36 +872,56 @@ void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
   p.seqlenq_ngroups_swapped = true;
   p.num_splits = num_splits;
 
-  RecordDecodeLaunch(num_splits > 1, inserted);
+  RecordDecodeLaunch(num_splits > 1, inserted, /*swapped=*/true);
   FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p,
                                                                                 stream);
   Check(cudaGetLastError(), "decode splitkv dispatch launch");
 }
 
-// Launch the pinned FA2 VARLEN decode — the EXACT reduction vLLM's
-// flash_attn_varlen_func runs for a paged bf16 KV cache at head_dim 128
-// (Qwen3-dense). Unlike LaunchDecodeFA2Bf16 (the d256 group-swap
-// seqlenq_ngroups_swapped route), this presents the decode batch as PLAIN
-// varlen: one query row per request (cu_seqlens_q = query_start_loc), full
-// query heads (h = hq, h_h_k_ratio = groups), per-request K length via
-// seqused_k, causal = true, NO group swap. Because a block_table is present,
-// upstream forces the split-KV kernel even at num_splits==1, so we dispatch
-// run_mha_fwd_splitkv_dispatch<..., 128, causal> exactly like the varlen
-// prefill launcher (Split=false when num_splits==1). num_splits is the exact
-// port of upstream num_splits_heuristic (=1 for the short gate contexts), and
-// for num_splits>1 the split combine addresses O via batch_idx*o_batch_stride;
-// with seqlen_q==1 per request that equals o_row_stride, so we set
-// o_batch_stride = o_row_stride and the combine writes the packed [total_q,Hq,D]
-// output correctly (this is why the packed-prefill combine restriction —
-// seqlen_q>1, irregular row spacing — does NOT apply to decode).
-// Ported from vllm-project/flash-attention @ 2c839c33 (mha_varlen_fwd paged
-// path + set_params_splitkv) and vLLM v0.25.0 flash_attn.py flash_attn_varlen_func.
+// Launch the pinned FA2 VARLEN decode for a paged bf16 KV cache at head_dim 128
+// (Qwen3-dense). Two presentations of the same vendored split-KV kernel, chosen
+// by gqa_swap (VT_FA2_DECODE_GQA_SWAP):
+//
+//   gqa_swap == false (DEFAULT, byte-identical to the shipped path): PLAIN
+//   varlen — one query row per request (cu_seqlens_q = query_start_loc), full
+//   query heads (h = hq, h_h_k_ratio = groups), per-request K length via
+//   seqused_k, causal = true, NO group swap. Because a block_table is present,
+//   upstream forces the split-KV kernel even at num_splits==1, so we dispatch
+//   run_mha_fwd_splitkv_dispatch<..., 128, causal> exactly like the varlen
+//   prefill launcher (Split=false when num_splits==1). num_splits is the exact
+//   port of upstream num_splits_heuristic (=1 for the short gate contexts), and
+//   for num_splits>1 the split combine addresses O via batch_idx*o_batch_stride;
+//   with seqlen_q==1 per request that equals o_row_stride, so we set
+//   o_batch_stride = o_row_stride and the combine writes the packed [total_q,Hq,D]
+//   output correctly (this is why the packed-prefill combine restriction —
+//   seqlen_q>1, irregular row spacing — does NOT apply to decode).
+//
+//   gqa_swap == true: the exact seqlenq_ngroups_swapped decode optimization vLLM
+//   runs (mha_fwd_kvcache / set_params_splitkv). vLLM's varlen decode grid is
+//   (b, kv_heads) not (b, hq): the ngroups query heads of a KV group are packed
+//   into the seqlen_q dimension, KV is read once per group, and the heuristic
+//   sees batch*kv_heads instead of batch*hq — halving the CTA count at batch>=2
+//   (#47: ours over-waved at c2/c8). Presented WITHOUT a materialized transpose,
+//   exactly like LaunchDecodeFA2Bf16 (d256): the physical query head layout is
+//   kv-major group-minor (head = kv*ngroups + g, the same mapping the non-swap
+//   kernel reads via bidh/h_h_k_ratio), so independent strides expose the logical
+//   [b, ngroups, kv_heads, d] view. cu_seqlens_q is cleared (batched, non-varlen),
+//   causal is normalized to non-causal (every swapped seqlen_q row is the SAME
+//   decode token across query heads, so a causal mask across them would be
+//   wrong), and the vendored get_lse_tile/combine already honor
+//   seqlenq_ngroups_swapped for the LSE/O strides. NON-byte-exact vs the plain
+//   arm only when num_splits>1 (the split reduction order differs) — a near-tie
+//   that moves TOWARD vLLM's own numerics.
+//
+// Ported from vllm-project/flash-attention @ 2c839c33 (mha_varlen_fwd paged path
+// + mha_fwd_kvcache seqlenq_ngroups_swapped + set_params_splitkv) and vLLM
+// v0.25.0 flash_attn.py flash_attn_varlen_func.
 void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
                                const Tensor& k_cache, const Tensor& v_cache,
                                const Tensor& block_table, const Tensor& seq_lens,
                                const Tensor& query_start_loc, const PagedAttentionArgs& args,
                                int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
-                               int64_t block_size) {
+                               int64_t block_size, bool gqa_swap) {
   const int64_t total_q = query.shape[0];
   if (total_q == 0 || num_reqs == 0 || hq == 0 || d == 0) return;
   if (query.dtype != DType::kBF16 || out.dtype != DType::kBF16 ||
@@ -945,23 +970,38 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   const int kv_heads = static_cast<int>(num_kv_heads);
   const int head_dim = static_cast<int>(d);
   const int max_blocks = static_cast<int>(block_table.shape[1]);
+  const int query_groups = (kv_heads > 0) ? heads / kv_heads : 0;
+
+  // seqlenq_ngroups_swapped decode presentation (VT_FA2_DECODE_GQA_SWAP). Only for
+  // TRUE GQA pure decode: one query token per request (max_seqlen_q==1) and
+  // ngroups>1. groups==1 (MHA) has nothing to pack; multi-token would break the
+  // "all seqlen_q rows are the same decode token" normalization.
+  const bool do_swap = gqa_swap && kv_heads > 0 && (heads % kv_heads == 0) &&
+                       query_groups > 1 && max_seqlen_q == 1;
 
   const auto stream_scratch = Fa2ScratchFor(query.device.index, s);
   std::lock_guard<std::mutex> submit_lock(stream_scratch->submit_mu);
 
   // Exact port of set_params_splitkv for head_dim 128: block-N is 128, block-M
   // is 64, and the heuristic receives 2*numSM for the 128-thread CTA occupancy
-  // model. For the gate contexts (<=2 key blocks, batch 1) this yields 1.
+  // model. For the gate contexts (<=2 key blocks, batch 1) this yields 1. Under
+  // the swap the heuristic sees (b, kv_heads, ngroups-as-seqlen_q) instead of
+  // (b, hq, 1) — the exact grid dims vLLM's mha_fwd_kvcache feeds it.
   constexpr int kBlockN = 128;  // Headdim <= 128
   constexpr int kBlockM = 64;
+  const int p_seqlen_q = do_swap ? query_groups : max_seqlen_q;
+  const int heuristic_heads = do_swap ? kv_heads : heads;
   const int num_n_blocks = (max_seqlen_k + kBlockN - 1) / kBlockN;
-  const int num_m_blocks = (max_seqlen_q + kBlockM - 1) / kBlockM;
+  const int num_m_blocks = (p_seqlen_q + kBlockM - 1) / kBlockM;
   const int num_splits = NumSplitsHeuristic(
-      batch * heads * num_m_blocks, stream_scratch->num_sms * 2, num_n_blocks, 128);
+      batch * heuristic_heads * num_m_blocks, stream_scratch->num_sms * 2, num_n_blocks, 128);
 
-  // softmax_lse is [nheads, total_q] f32 (unpadded/varlen LSE, written+consumed
-  // by the combine). oaccum/lseaccum only when the KV dimension is split.
-  const DecodeShapeKey key{batch,     heads,     kv_heads,  0,
+  // softmax_lse is f32, batch*hq elements either way (swap: b*kv_heads*ngroups ==
+  // b*hq; plain: hq*total_q == hq*b). The swap only reinterprets the stride
+  // (seqlenq_ngroups_swapped), so the scratch BYTES are identical — capture-safe.
+  // `groups` keys swap-on vs swap-off apart so one process can A/B without alias.
+  // oaccum/lseaccum only when the KV dimension is split.
+  const DecodeShapeKey key{batch,     heads,     kv_heads,  do_swap ? query_groups : 0,
                            head_dim,  max_blocks, static_cast<int>(block_size), num_splits};
   auto [it, inserted] = stream_scratch->varlen_decode.try_emplace(key);
   DecodeScratch& scratch = it->second;
@@ -1002,15 +1042,30 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.v_ptr = v_cache.data;
   p.o_ptr = out.data;
 
-  // Varlen q/o: cu_seqlens_q drives the row offset; batch strides are ignored on
-  // the non-split path but MUST equal o_row_stride so the split combine (which
-  // writes O via batch_idx*o_batch_stride, seqlen_q==1) lands each request's row.
-  p.q_batch_stride = query.stride[0];
-  p.q_row_stride = query.stride[0];
-  p.q_head_stride = query.stride[1];
-  p.o_batch_stride = out.stride[0];
-  p.o_row_stride = out.stride[0];
-  p.o_head_stride = out.stride[1];
+  if (do_swap) {
+    // Group-swap presentation (mirrors LaunchDecodeFA2Bf16): expose the logical
+    // [b, ngroups, kv_heads, d] view over the physical kv-major group-minor query
+    // [total_q=b, hq, d] via independent strides, no materialized transpose.
+    //   physical q[req, kv*ngroups + g, :]  ->  logical q[b=req, row=g, head=kv, :]
+    // cu_seqlens_q is cleared so the kernel reads the batched (b, seqlen_q=ngroups)
+    // layout; per-request K length still comes from seqused_k.
+    p.q_batch_stride = query.stride[0];
+    p.q_row_stride = query.stride[1];
+    p.q_head_stride = static_cast<int64_t>(query_groups) * query.stride[1];
+    p.o_batch_stride = out.stride[0];
+    p.o_row_stride = out.stride[1];
+    p.o_head_stride = static_cast<int64_t>(query_groups) * out.stride[1];
+  } else {
+    // Varlen q/o: cu_seqlens_q drives the row offset; batch strides are ignored on
+    // the non-split path but MUST equal o_row_stride so the split combine (which
+    // writes O via batch_idx*o_batch_stride, seqlen_q==1) lands each request's row.
+    p.q_batch_stride = query.stride[0];
+    p.q_row_stride = query.stride[0];
+    p.q_head_stride = query.stride[1];
+    p.o_batch_stride = out.stride[0];
+    p.o_row_stride = out.stride[0];
+    p.o_head_stride = out.stride[1];
+  }
   // Paged k/v [num_blocks, block_size, num_kv_heads, d].
   p.k_batch_stride = k_cache.stride[0];
   p.k_row_stride = k_cache.stride[1];
@@ -1019,7 +1074,9 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.v_row_stride = v_cache.stride[1];
   p.v_head_stride = v_cache.stride[2];
 
-  p.cu_seqlens_q = query_start_loc.Ptr<int32_t>();  // [0,1,2,...,num_reqs]
+  // Swap presents the batched (non-varlen) layout: cu_seqlens_q == nullptr makes
+  // BlockInfo read seqlen_q = params.seqlen_q (=ngroups) and q_offset = b*batch_stride.
+  p.cu_seqlens_q = do_swap ? nullptr : query_start_loc.Ptr<int32_t>();  // else [0,1,...,num_reqs]
   p.cu_seqlens_k = nullptr;                          // paged: block_table + seqused_k
   p.seqused_k = seq_lens.Ptr<int32_t>();
   p.softmax_lse_ptr = scratch.softmax_lse.ptr;
@@ -1027,16 +1084,16 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.oaccum_ptr = scratch.out_accum.ptr;
 
   p.b = batch;
-  p.h = heads;
+  p.h = do_swap ? kv_heads : heads;               // swap packs groups into seqlen_q
   p.h_k = kv_heads;
-  p.h_h_k_ratio = static_cast<int>(hq / num_kv_heads);
-  p.seqlen_q = max_seqlen_q;  // 1 per decode request
+  p.h_h_k_ratio = do_swap ? 1 : static_cast<int>(hq / num_kv_heads);
+  p.seqlen_q = p_seqlen_q;                         // ngroups (swap) or 1 (plain)
   p.seqlen_k = max_seqlen_k;
-  p.seqlen_q_rounded = RoundMultiple(max_seqlen_q, 128);
+  p.seqlen_q_rounded = RoundMultiple(p_seqlen_q, 128);
   p.seqlen_k_rounded = RoundMultiple(max_seqlen_k, 128);
   p.d = head_dim;
   p.d_rounded = RoundMultiple(head_dim, 64);
-  p.total_q = static_cast<int>(total_q);
+  p.total_q = do_swap ? batch * query_groups : static_cast<int>(total_q);
 
   // Attention logit soft-cap fold (vLLM Attention(logits_soft_cap=...),
   // gemma2.py:202). flash-attn convention: p.softcap = scale/cap, scale_softmax =
@@ -1058,12 +1115,23 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.scale_softmax_rp_dropout = args.scale;
   p.philox_args = at::PhiloxCudaState(0, 0);
 
-  // Plain causal decode (NO group-swap normalization): vLLM passes causal=True to
-  // flash_attn_varlen_func; with seqlen_q==1 the single query still sees the full
-  // context, and the causal template selects the exact n_block geometry vLLM runs.
-  p.is_causal = args.causal;
-  p.window_size_left = -1;
-  p.window_size_right = args.causal ? 0 : -1;
+  if (do_swap) {
+    // Upstream normalizes max_seqlen_q==1 causal decode to NON-causal before the
+    // swap: the ngroups seqlen_q rows are the SAME decode token replicated across
+    // a KV group's query heads, so a causal mask ACROSS those rows would be wrong.
+    // The single decode token already sees the full context, so non-causal +
+    // per-request seqused_k is exact. Matches LaunchDecodeFA2Bf16.
+    p.is_causal = false;
+    p.window_size_left = -1;
+    p.window_size_right = -1;
+  } else {
+    // Plain causal decode (NO group-swap normalization): vLLM passes causal=True to
+    // flash_attn_varlen_func; with seqlen_q==1 the single query still sees the full
+    // context, and the causal template selects the exact n_block geometry vLLM runs.
+    p.is_causal = args.causal;
+    p.window_size_left = -1;
+    p.window_size_right = args.causal ? 0 : -1;
+  }
   p.is_seqlens_k_cumulative = true;  // ignored while cu_seqlens_k == nullptr
   p.is_rotary_interleaved = false;
   p.rotary_dim = 0;
@@ -1071,14 +1139,16 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.block_table = block_table.Ptr<int32_t>();
   p.block_table_batch_stride = block_table.stride[0];
   p.page_block_size = static_cast<int>(block_size);
-  p.unpadded_lse = true;             // LSE is [nheads, total_q]
-  p.seqlenq_ngroups_swapped = false;  // the whole point: no group swap
+  p.unpadded_lse = true;             // LSE is [nheads, total_q] (get_lse_tile honors the swap)
+  p.seqlenq_ngroups_swapped = do_swap;
   p.num_splits = num_splits;
 
-  RecordDecodeLaunch(num_splits > 1, inserted);
-  if (args.causal) {
+  RecordDecodeLaunch(num_splits > 1, inserted, do_swap);
+  if (!do_swap && args.causal) {
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, s);
   } else {
+    // Swap decode is normalized non-causal (like the d256 arm); a plain non-causal
+    // caller also lands here.
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, s);
   }
   Check(cudaGetLastError(), "varlen decode splitkv dispatch launch");
@@ -1133,6 +1203,7 @@ void ResetFa2DecodeDebugCounters() {
   counters.no_split_launches.store(0, std::memory_order_relaxed);
   counters.scratch_allocations.store(0, std::memory_order_relaxed);
   counters.scratch_reuses.store(0, std::memory_order_relaxed);
+  counters.swap_launches.store(0, std::memory_order_relaxed);
   counters.enabled.store(true, std::memory_order_release);
 }
 
@@ -1150,6 +1221,10 @@ uint64_t Fa2DecodeSplitLaunchesForTesting() {
 
 uint64_t Fa2DecodeNoSplitLaunchesForTesting() {
   return DebugCounters().no_split_launches.load(std::memory_order_relaxed);
+}
+
+uint64_t Fa2DecodeSwapLaunchesForTesting() {
+  return DebugCounters().swap_launches.load(std::memory_order_relaxed);
 }
 
 uint64_t Fa2DecodeScratchAllocationsForTesting() {
