@@ -1442,10 +1442,9 @@ llama.cpp fp16 fast body is a later brick). On `sm_80`+ the guard is a no-op
 (preprocessor identity), so the GB10 gate build is byte-identical. This is
 **DERIVED+BUILD-VERIFIED (testing-welcome), NOT runtime** — no Turing board ran
 it; there is no vLLM oracle on Turing (vLLM dropped it), so correctness is
-referenced against llama.cpp-on-card plus a portable cross-check. **A 2026-08-06
-audit of all 20 unconditionally-built CUDA TUs at `sm_75` measures 18 PASS / 2
-FAIL** (`cuda_gdn.cu`, `cuda_matmul_nvfp4.cu`), so no `sm_75` library build
-exists yet — see the backend detail section below. Volta/Pascal
+referenced against llama.cpp-on-card plus a portable cross-check. **A 2026-08-06 audit of all 20 unconditionally-built CUDA TUs at `sm_75` now
+measures 20 PASS / 0 FAIL** (W1b guards, W1c selector gating); the
+full-library LINK + SASS proof is owed — see below. Volta/Pascal
 need a CUDA `<13` toolkit (nvcc 13 rejects `sm_70`/`sm_60`/`sm_61`). See
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM075`.
 
