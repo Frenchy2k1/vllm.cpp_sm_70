@@ -22,7 +22,8 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13, f32-loader block CLEARED): CPU+CUDA 13/13·656; host RSS peak 1.7 GiB, min-avail 21 GiB, no OOM. **Token gate NEAR-TIE 106/128** (6/8 prompts token-exact; numerics near-tie vs deterministic oracle, not a bug) | STRICT path = device GDN/MLA islands + bf16 stream (W7-speed residuals); 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED + dgx-VERIFIED** (`f9c969ae`): #31 async mirror ported to classic dense `Qwen3ForCausalLM`. Async gate RED→GREEN 0.6B+4B, SACRED 184/184, memcheck 0, MXFP4 default e2e 3/4 + near-tie RATIFIED | Residual: **W4 throughput bench** (online_gate lacks Yi30/8B key); sibling scope one-liner |
+| ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
+| QUANT-CT-MXFP4-BENCH | **Grid RAN** (`33e93608`): BELOW-FLOOR — 0.99x@c1 / ~0.91x@c2-c8, TPOT +10-12%@c2-c8, GPU mem 2.6x LESS | Lever: batched Marlin decode GEMM (M=2..8); nsys c8 both engines |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
 (fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.

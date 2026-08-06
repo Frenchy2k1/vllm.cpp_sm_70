@@ -200,17 +200,28 @@ REPETITIONS = (1, 2, 3)
 # accepted domain so the component can reuse ``OnlineRun`` / ``build_client_command``.
 MAX_ONLINE_REPETITION = 5
 POINTS = ((1, 6), (2, 6), (4, 12), (8, 24), (16, 96), (32, 192))
+# Bench-only additive model keys may sweep a reduced low-concurrency point set.
+# The NVFP4 gate models ("27"/"35") keep the full six-point sweep (the default);
+# the MXFP4 W4 throughput row ("q3mxfp4", a dense 8B keep-quant vehicle) benches
+# only c1/c2/c4/c8 (the decode/low-concurrency regime the row is scoped to). The
+# concurrency -> num_prompts mapping is a strict prefix of POINTS, so prompts_for
+# stays unchanged; only the SET of benched concurrencies narrows per model.
+POINTS_BY_MODEL = {
+    "q3mxfp4": ((1, 6), (2, 6), (4, 12), (8, 24)),
+}
 MODEL_REVISIONS = {
     "27": "890bdef7a42feba6d83b6e17a03315c694112f2a",
     "35": "491c2f1ea524c639598bf8fa787a93fed5a6fbce",
+    "q3mxfp4": "b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47",
 }
 MODEL_REPOSITORIES = {
     "27": "unsloth/Qwen3.6-27B-NVFP4",
     "35": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+    "q3mxfp4": "Yi30/Qwen3-8B-MXFP4",
 }
 MAX_NUM_SEQS = 32
-MAX_NUM_BATCHED_TOKENS = {"27": 2048, "35": 8192}
-MAX_MODEL_LEN = {"27": 262144, "35": 262144}
+MAX_NUM_BATCHED_TOKENS = {"27": 2048, "35": 8192, "q3mxfp4": 2048}
+MAX_MODEL_LEN = {"27": 262144, "35": 262144, "q3mxfp4": 40960}
 ENGINES = ("ours", "vllm")
 PERCENTILE_METRICS = ("ttft", "tpot", "itl", "e2el")
 PERCENTILES = (50, 90, 99)
@@ -275,6 +286,20 @@ def prompts_for(concurrency: int) -> int:
         return dict(POINTS)[concurrency]
     except KeyError as error:
         raise HarnessError(f"unsupported online-gate concurrency: {concurrency}") from error
+
+
+def points_for(model_key: str) -> tuple[tuple[int, int], ...]:
+    """The (concurrency, num_prompts) sweep for ``model_key``.
+
+    Defaults to the full six-point :data:`POINTS`; a key present in
+    :data:`POINTS_BY_MODEL` uses its reduced set (a prefix of POINTS, so the
+    per-concurrency prompt counts are identical). This is the single source of
+    truth both this module and :mod:`online_gate_summary` consult so a bench-only
+    model key never triggers a spurious "missing result group" for a concurrency
+    it was never scoped to sweep.
+    """
+
+    return POINTS_BY_MODEL.get(model_key, POINTS)
 
 
 def trace_primary_graph_contract(
@@ -804,7 +829,7 @@ def prepare_corpus_views(
     files: list[dict[str, Any]] = []
     prompt_hashes: set[str] = set()
     for repetition in repetitions:
-        for concurrency, expected in POINTS:
+        for concurrency, expected in points_for(model_key):
             source = source_root / f"c{concurrency}-r{repetition}.jsonl"
             rows = list(read_jsonl(source))
             if len(rows) < expected:

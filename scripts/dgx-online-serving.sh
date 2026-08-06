@@ -98,11 +98,14 @@ if [[ ${mode} == dry-run ]]; then
   exit 0
 fi
 
-[[ ${model} == 27 || ${model} == 35 ]] || { echo "--model must be 27 or 35" >&2; exit 2; }
-if [[ ${model} == 27 ]]; then
-  max_num_batched_tokens=2048
-else
+[[ ${model} == 27 || ${model} == 35 || ${model} == q3mxfp4 ]] || {
+  echo "--model must be 27, 35 or q3mxfp4" >&2; exit 2; }
+# 35B MoE prefills a wider chunk; the 27B NVFP4 dense and the q3mxfp4 MXFP4 dense
+# 8B both use the dense 2048 batched-token gate value.
+if [[ ${model} == 35 ]]; then
   max_num_batched_tokens=8192
+else
+  max_num_batched_tokens=2048
 fi
 [[ -n ${evidence} ]] || { echo "--evidence is required" >&2; exit 2; }
 [[ -n ${source_corpus} ]] || { echo "--source-corpus is required" >&2; exit 2; }
@@ -223,8 +226,17 @@ else
 fi
 if [[ ${model} == 27 ]]; then
   test_name=test_qwen27_paged_engine
-else
+  gate_target=${test_name}
+elif [[ ${model} == 35 ]]; then
   test_name=test_qwen36_paged_engine
+  gate_target=${test_name}
+else
+  # q3mxfp4 (MXFP4 W4A16 keep-quant dense 8B) has no committed npy near-tie
+  # paged-engine golden; its correctness precondition is the #44 MXFP4 e2e smoke
+  # battery (vllm-cli greedy vs docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json),
+  # so the model gate builds + runs vllm-cli instead of a ctest binary.
+  test_name=mxfp4_smoke_battery
+  gate_target=vllm-cli
 fi
 cmake_home=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${build_dir}/CMakeCache.txt")
 [[ -n ${cmake_home} && $(realpath -e "${cmake_home}") == "$(realpath -e "${repo_root}")" ]] || {
@@ -248,7 +260,7 @@ build_log="${execution_dir}/${model}-build.log"
 build_jobs=$(nproc)
 build_cmd=(
   cmake --build "${build_dir}"
-  --target server "${test_name}"
+  --target server "${gate_target}"
   --parallel "${build_jobs}"
 )
 printf '%q ' "${build_cmd[@]}" >"${build_command}"
@@ -259,6 +271,10 @@ if ! "${build_cmd[@]}" >"${build_log}" 2>&1; then
 fi
 [[ -x ${build_dir}/examples/server ]] || {
   echo "provenance-recorded build did not produce examples/server" >&2
+  exit 1
+}
+[[ ${model} != q3mxfp4 || -x ${build_dir}/examples/vllm-cli ]] || {
+  echo "provenance-recorded build did not produce examples/vllm-cli" >&2
   exit 1
 }
 # Timed grids record the production (profile-control-OFF) build; the H1d
@@ -384,6 +400,22 @@ start_server() {
       --no-enable-prefix-caching
       --served-model-name gate
     )
+  elif [[ ${model} == q3mxfp4 ]]; then
+    # MXFP4 dense 8B oracle. On sm_121 GB10 the default FlashInfer cute-dsl mxf4
+    # backend aborts engine start (BackendSupportedError mm_fp4 cap 121), so we
+    # force the Marlin W4A16 keep-quant kernel our arm mirrors. Dense Qwen3 has no
+    # mamba SSM state, so the hybrid-only SSM cache-dtype flag is omitted here.
+    server_cmd=(
+      env "PATH=$(dirname "${client}"):${PATH}"
+      "VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel"
+      "${client}" serve "${snapshot}"
+      --served-model-name gate
+      --gpu-memory-utilization 0.6
+      --max-num-seqs "${max_num_seqs}"
+      --max-num-batched-tokens "${max_num_batched_tokens}"
+      --no-enable-prefix-caching
+      --port "${port}"
+    )
   else
     server_cmd=(
       env "PATH=$(dirname "${client}"):${PATH}"
@@ -436,8 +468,13 @@ run_leg() {
     --minimum-spread 0.05 \
     --output "${preflight_dir}/r${repetition}-stream.json"
 
+  # q3mxfp4 (MXFP4 W4 row) is scoped to the low-concurrency decode regime; the
+  # NVFP4 gate models sweep the full six points. Kept in lockstep with
+  # online_gate.points_for so the summary never flags a missing result group.
+  local concurrency_points="1 2 4 8 16 32"
+  [[ ${model} == q3mxfp4 ]] && concurrency_points="1 2 4 8"
   local concurrency
-  for concurrency in 1 2 4 8 16 32; do
+  for concurrency in ${concurrency_points}; do
     kill -0 "${spid}" 2>/dev/null || {
       echo "server died before c${concurrency}" >&2
       return 1
@@ -912,7 +949,20 @@ mkdir -p "${gate_dir}"
   echo "refusing to overwrite model-gate evidence for ${model}" >&2
   exit 1
 }
-if ! "${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" \
+if [[ ${model} == q3mxfp4 ]]; then
+  # MXFP4 correctness precondition = the #44 e2e smoke battery (default config,
+  # async ON + the classic-dense device-mirror fix). vllm-cli links vllm::shared
+  # (build-tree RPATH) and needs the operator CUDA environment, so it runs in the
+  # script shell rather than the ultra-clean measurement env used for timed legs.
+  if ! python3 "${repo_root}/tools/bench/mxfp4_smoke_gate.py" \
+    --vllm-cli "${build_dir}/examples/vllm-cli" \
+    --snapshot "${snapshot}" \
+    --golden "${repo_root}/docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json" \
+    >"${gate_log}" 2>&1; then
+    cat "${gate_log}" >&2
+    exit 1
+  fi
+elif ! "${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" \
   ctest --test-dir "${build_dir}" -R "^${test_name}$" --output-on-failure \
   >"${gate_log}" 2>&1; then
   cat "${gate_log}" >&2

@@ -36678,3 +36678,107 @@ The fix UNBLOCKS the default-config number (the async-default degeneration no lo
 forces `VT_ASYNC_SCHED=0`); the oracle is proven to run the model today. Plus the
 sibling scope one-liner (InternLM2/Mistral/Llama). dgx build tree persists at
 `dgx:/dev/shm/serve-async-dense`.
+
+## QUANT-CT-MXFP4-BENCH: online-serving harness PLUMBED for the MXFP4 W4 throughput grid (q3mxfp4 key); grid GATING on dgx execution
+<!-- state: 2026-08-07T09:00 -->
+
+Closed the harness half of the QUANT-CT-MXFP4 W4 bench residual (the one named by
+`ROW-SERVE-ASYNC-DENSE-MIRROR` 2026-08-07T07:00 and NOW.md): `online_gate.py`
+carried only the "27"/"35" NVFP4 gate-model keys, so the MXFP4 checkpoint could not
+be benched ours-vs-oracle. Branch `row/QUANT-CT-MXFP4-BENCH` off `origin/main`
+`52d76f3a`. No GPU held, no locks touched (all work + validation on the dev box).
+
+LANDED (additive; existing 27/35 paths byte-unchanged; harness CPU contract tests
+GREEN 45/45 via `python3 -m unittest tests.tools.test_online_gate_{client,summary,trace}`):
+- `tools/bench/online_gate.py`: `MODEL_REVISIONS`/`MODEL_REPOSITORIES` q3mxfp4 =
+  `Yi30/Qwen3-8B-MXFP4` @ snapshot `b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47` (dense
+  `Qwen3ForCausalLM`, 36L, max_pos 40960, mxfp4-pack-quantized group-32 E8M0);
+  `MAX_NUM_BATCHED_TOKENS`=2048 (dense, mirrors 27B), `MAX_MODEL_LEN`=40960;
+  `POINTS_BY_MODEL={"q3mxfp4": c1/c2/c4/c8}` + a `points_for(model_key)` helper (the
+  reduced set is a strict PREFIX of POINTS so `prompts_for` is unchanged) consulted
+  by `prepare_corpus_views` and by `online_gate_summary` (the four per-model POINTS
+  loops) so a c1-c8 key never flags a missing c16/c32 result group.
+- `tools/bench/mxfp4_smoke_gate.py` (NEW): the q3mxfp4 model gate = the #44 e2e smoke
+  battery. Runs `vllm-cli` greedy (temp 0, seed 0, max_tokens = each golden's token
+  count) on the 4 prompts of `docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json`;
+  PASS = the 3 deterministic prompts (capitals/arithmetic/fibonacci) token-exact vs
+  golden text AND the story prompt coherent (not the async-race degeneration). Locally
+  validated with a fake vllm-cli across PASS + deterministic-mismatch FAIL + degenerate
+  FAIL. This is a text-level gate (vllm-cli emits text, not token-ids); the strong
+  op-level correctness lives in the #38 unit gates.
+- `scripts/dgx-online-serving.sh`: q3mxfp4 branches — model validation (27/35/q3mxfp4),
+  dense 2048 batched-tokens, `gate_target=vllm-cli` + smoke-gate model gate (no
+  paged-engine ctest; the 8B is near-tie so a committed npy golden is ill-posed, same
+  reason the async-dense gate uses sync==async), oracle server arm
+  `env VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel "${client}" serve` with NO
+  `--mamba-ssm-cache-dtype` (dense, no mamba), and the `1 2 4 8` leg loop. bash -n +
+  shellcheck -S error clean. The existing shell-parse test that pins the mamba flag on
+  the vLLM arm was updated to target the 27/35 block and STRENGTHENED to also assert the
+  q3mxfp4 arm sets the disabled-kernel + omits mamba.
+- `scripts/mxfp4-online-serving-grid.sh` (NEW): the one-command orchestrator (source
+  corpus gen via `make_serve_low_corpus --concurrencies 1,2,4,8` + dry-run manifest +
+  locked `--execute --model q3mxfp4` grid + summary). Thin wrapper; all locks/gating/
+  single-load/drop_caches/oracle-record live in the tested `dgx-online-serving.sh`.
+- New harness tests: `test_q3mxfp4_bench_key_is_registered_with_a_reduced_low_concurrency_sweep`
+  + `test_prepare_corpus_for_q3mxfp4_only_materializes_its_scoped_points`.
+
+WHY NO NUMBERS: the grid needs GB10 exclusively (fresh /dev/shm CUDA build of
+`server`+`vllm-cli`, oracle serve, 2 arms x 3 reps x c1-c8 sequential legs, both
+flock locks, free-g ≥ 90, drop_caches between legs) — this session did the plumbing
++ validation on the dev box only. The plumbing UNBLOCKS the grid; run
+`scripts/mxfp4-online-serving-grid.sh --snapshot <SNAP> --build-dir <PROD_BUILD>
+--configure-log <LOG>` on dgx. Build recipe: git-archive → /dev/shm,
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, Release, nvcc 13.0, specific targets
+only (never bare `ninja` — disk floor). VERDICT rule per match-or-beat: ≥ vLLM on
+total+output tok/s AND ≤ on TTFT+TPOT across all four cells → MXFP4 row DONE; below on
+any cell → record the failing cells + a same-tool decode-window nsys attribution pass
+(no ceiling declared). Box state at hand-off: idle, 115 GiB avail, GPU free, disk 26 GiB
+(tight — the /dev/shm build sidesteps the /home floor). Evidence: this row's diff +
+`docs/bench-evidence/mxfp4-qwen/` golden. Records: STATUS/BENCHMARKS/FEATURES +
+quantization-matrix + benchmark-record + NOW updated in the same change.
+
+## QUANT-CT-MXFP4-BENCH: W4 throughput grid RAN on GB10 — BELOW-FLOOR (~0.91x c2-c8, batched-decode gap), memory 2.6x WIN
+<!-- state: 2026-08-07T11:00 -->
+
+Executed the full binding grid on dgx GB10 for `33e93608` (`row/QUANT-CT-MXFP4-BENCH`).
+The harness plumbing landed correctly and the grid produced honest numbers. Box left
+clean (both flock locks free, GPU idle, /dev/shm scratch removed, evidence 9.6M on /home).
+
+RESULT (production graphed vLLM 0.25.0, oracle `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`
+-> Marlin W4A16; ours native Marlin W4A16 keep-quant; c1/c2/c4/c8x3 interleaved, single
+load/arm, drop_caches + memory-return between legs; smoke model gate reproduced #44
+3/3-det-token-exact + coherent near-tie): **gate NO, 74/84 axes below floor.** Medians
+(ours->vllm, ratio): total tok/s c1 324.2->327.9 (0.989), c2 569.2->624.7 (0.911), c4
+951.4->1034.7 (0.919), c8 1419.6->1554.8 (0.913); median TPOT ms c1 25.70->25.34 (0.986),
+c2 28.27->25.45 (0.900), c4 31.03->28.07 (0.905), c8 39.64->35.30 (0.891); median TTFT
+at parity (c1 1.027 PASS, c4 1.006 PASS, c2 0.982, c8 0.997); peak GPU mem 28284 vs 73723
+MiB = **2.607 (ours 2.6x LESS)**. Per-rep spread ~1-3% (tight/reproducible).
+
+FIRST ATTRIBUTION (grounded in the per-concurrency curve; no ceiling): the gap is a
+BATCHED-decode cost that is ABSENT at batch-1 — c1 (single-stream decode) is at parity
+(0.989 tput / 0.986 TPOT, within noise), while c2-c8 (batched decode 2-8 seqs) is ~0.91x
+tput driven ENTIRELY by TPOT +10-12%, with prefill/TTFT at parity. So the divergent hot
+path is the GROUPED Marlin W4A16 keep-quant decode GEMM as M grows 2->8 (our per-expert/
+grouped tiling vs vLLM's Marlin), NOT the batch-1 GEMV nor prefill. Memory is a clean 2.6x
+WIN (keep-quant weights stay compressed). NEXT (grounded lever start): same-tool nsys
+decode-window on the WORST cell (c8) BOTH engines (our server under nsys AND vLLM under
+nsys — same tool, per the aggregation trap, not the torch profiler) to name the exact
+divergent kernel/shape at M=8, then a lever on the batched Marlin decode GEMM.
+
+BUILD-CONTRACT LESSONS (cost 2 rebuild cycles; recorded so the next runner does not
+repeat them): the online-serving `record-execution` is STRICT and differs from the generic
+build recipe. (1) The build MUST be on a REAL disk, NOT /dev/shm — tmpfs pages are always
+resident, so the cache-drop POSIX_FADV_DONTNEED+mincore==0 proof retains the 441 MB server
+binary and every leg fails; a /home build (whole tree only ~3 GiB, well within the floor)
+fixes it AND frees the RAM pool for the oracle's 72 GiB reservation. (2) The CMake cache
+must be RelWithDebInfo (not Release), CMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc,
+CMAKE_MAKE_PROGRAM=the oracle-venv ninja, EXPORT_COMPILE_COMMANDS=ON, BENCH_PROFILE_CONTROL
+=OFF, BUILD_TESTS=ON, and VLLM_CPP_CUTLASS_DIR = the ORACLE's flashinfer-bundled cutlass
+(also 4.5.0), NOT $HOME/cutlass-4.5.0 (record-execution pins it to the oracle's own tree).
+(3) The orchestrator's plan step must precede corpus-gen (online_gate.py `plan` refuses a
+non-empty evidence root); fixed in `mxfp4-online-serving-grid.sh` this change. Repro:
+`scripts/mxfp4-online-serving-grid.sh --snapshot <SNAP> --build-dir <DISK_RELWITHDEBINFO_BUILD>
+--configure-log <LOG>`. Evidence: `dgx:~/work/vllm.cpp-online-gate/evidence/33e93608...`
+(ratios.json + report.md + 24 raws + memory/thermal/cache-drop). local-ai-worker left as
+found (down); dgx /home build tree `~/mxfp4-bench` retained for the nsys continuation.
