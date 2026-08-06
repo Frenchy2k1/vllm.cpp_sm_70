@@ -108,6 +108,7 @@ struct Args {
   std::string video_encoder, video_tokenizer;
   int video_encoder_max_layers = 50;
   std::string video_ffmpeg = "ffmpeg", video_device = "cuda";
+  std::string video_partition;  // served partition (fl2va|ref2va); see the #77 guard
   bool video_keep_quant = false;
   int cuda_profile_graph_replays = 0;  // trace-only diagnostic build seam.
   int cuda_profile_graph_batch = 0;  // 0 => accepted c16 trace contract.
@@ -244,6 +245,8 @@ Args ParseArgs(int argc, char** argv) {
       a.video_ffmpeg = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-device") {
       a.video_device = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-partition") {
+      a.video_partition = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-keep-quant") {
       a.video_keep_quant = true;
     } else if (flag == "--enable-server-dev-mode") {
@@ -604,6 +607,10 @@ int main(int argc, char** argv) {
       std::unique_ptr<vllm::tok::Tokenizer> tokenizer;
       vt::Queue enc_queue{};
       std::string workdir, ffmpeg;
+      // The served partition (fl2va|ref2va). Resolved ONCE at load from
+      // --video-partition; the per-request guard in MiniMaxH3GenerateT2va refuses a
+      // task this partition does not serve (the #77 follow-up).
+      vllm::MiniMaxH3PartitionInfo partition_info;
       vt::Device device;
       std::atomic<int64_t> counter{0};
     };
@@ -669,6 +676,7 @@ int main(int argc, char** argv) {
       }
       video->workdir = args.video_workdir;
       video->ffmpeg = args.video_ffmpeg;
+      video->partition_info = vllm::MiniMaxH3PartitionFromFlag(args.video_partition);
       if (args.video_device == "cuda") {
         video->device = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
       }
@@ -716,6 +724,8 @@ int main(int argc, char** argv) {
         }
         const vllm::MiniMaxH3DitParams& p = video->dit.params;
         vllm::MiniMaxH3T2vaRequest r;
+        r.partition = video->partition_info;  // #77 guard: MiniMaxH3GenerateT2va
+                                              // refuses a task this partition can't serve.
         const vllm::MiniMaxH3ShapePlan plan = vllm::MiniMaxH3ResolveShape(
             req.task.empty() ? "t2va" : req.task, req.duration_seconds, req.num_frames,
             req.height, req.width, 0, 0);

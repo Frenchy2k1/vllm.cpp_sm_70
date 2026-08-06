@@ -18,6 +18,9 @@ usage:
     [--trace-concurrency 2|16] [--gdn-ba-mode both] [--gdn-packed-mode both]
   dgx-online-serving.sh --execute --model 27|35 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N]
+  dgx-online-serving.sh --startup-only --model 27|35|q3mxfp4 --snapshot DIR \
+    --source-corpus DIR --evidence DIR --build-dir DIR --configure-log FILE \
+    [--client PATH] [--port N]
 EOF
 }
 
@@ -38,10 +41,16 @@ max_num_batched_tokens=""
 trace_concurrency=16
 gdn_ba_mode=""
 gdn_packed_mode=""
+# Readiness cadence. 0.2 s resolves a startup of a few tens of seconds to well
+# under 1%; the previous 5 s cadence was itself ~12% of the measured quantity,
+# which is why launch->ready was never a reportable number. The 1800 s budget is
+# the old 360 x 5 s timeout, preserved exactly.
+ready_poll_interval=0.2
+ready_timeout_seconds=1800
 
 while (($#)); do
   case "$1" in
-    --dry-run|--prepare-corpus|--trace-only|--execute)
+    --dry-run|--prepare-corpus|--trace-only|--execute|--startup-only)
       [[ -z ${mode} ]] || { echo "choose exactly one mode" >&2; exit 2; }
       mode=${1#--}
       shift
@@ -131,7 +140,7 @@ if [[ ${mode} == prepare-corpus ]]; then
   exit 0
 fi
 
-[[ ${mode} == execute || ${mode} == trace-only ]] || { usage; exit 2; }
+[[ ${mode} == execute || ${mode} == trace-only || ${mode} == startup-only ]] || { usage; exit 2; }
 # The H1d-era unconditional --execute hold was LIFTED 2026-07-15: its stated
 # precondition (H1d/G4 complete; separate production and trace builds) was met
 # on 2026-07-13, and the W1D3 closure (b80663a) authorized the fresh
@@ -176,7 +185,13 @@ fi
 python3 "${repo_root}/tools/bench/online_gate.py" validate-plan \
   "${evidence}/manifest.json" \
   --vllm-cpp-sha "${vllm_cpp_sha}" >/dev/null
-prepare_corpus
+if [[ ${mode} == startup-only ]]; then
+  # No timed request is issued, so no corpus is built; the directory still has
+  # to exist because the cache-drop inventory is a fixed four-root artifact.
+  mkdir -p "${source_corpus}"
+else
+  prepare_corpus
+fi
 
 # The execution manifest validates this environment before the GPU lock.  Run
 # every model-bearing command from a fixed allowlist instead of inheriting an
@@ -258,9 +273,15 @@ build_log="${execution_dir}/${model}-build.log"
   exit 1
 }
 build_jobs=$(nproc)
+# --startup-only runs no model gate (it compares no token), so the gate binary
+# is not built: on a full box that target is pure disk and wall-clock cost.
+build_targets=(server)
+if [[ ${mode} != startup-only ]]; then
+  build_targets+=("${gate_target}")
+fi
 build_cmd=(
   cmake --build "${build_dir}"
-  --target server "${gate_target}"
+  --target "${build_targets[@]}"
   --parallel "${build_jobs}"
 )
 printf '%q ' "${build_cmd[@]}" >"${build_command}"
@@ -301,6 +322,8 @@ profile_control_flag=$([[ ${mode} == trace-only ]] && echo on || echo off)
 
 spid=""
 mpid=""
+startup_launch_epoch=""
+startup_ready_epoch=""
 profiled_pid=""
 profiled_pgid=""
 cleanup_server() {
@@ -363,7 +386,10 @@ drop_caches() {
 
 wait_ready() {
   local log=$1
-  for _ in $(seq 1 360); do
+  local deadline
+  deadline=$(awk -v now="$(date +%s.%N)" -v budget="${ready_timeout_seconds}" \
+    'BEGIN{printf "%.3f", now + budget}')
+  while :; do
     if curl -fsS --max-time 5 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
       return 0
     fi
@@ -372,7 +398,11 @@ wait_ready() {
       tail -n 80 "${log}" >&2 || true
       return 1
     fi
-    sleep 5
+    if awk -v now="$(date +%s.%N)" -v deadline="${deadline}" \
+      'BEGIN{exit !(now > deadline)}'; then
+      break
+    fi
+    sleep "${ready_poll_interval}"
   done
   echo "server readiness timed out" >&2
   return 1
@@ -431,6 +461,12 @@ start_server() {
   fi
   printf '%q ' "${server_cmd[@]}" >"${command_file}"
   printf '\n' >>"${command_file}"
+  # The launch stamp is taken immediately before the spawn so nothing else is
+  # attributed to startup. The memory sampler below IS inside the measured
+  # window, but it is launched identically on both arms, so it cancels in the
+  # ratio; only the absolute number carries its (sub-100 ms) cost.
+  local startup_status=0
+  startup_launch_epoch=$(date +%s.%N)
   setsid "${server_cmd[@]}" >"${log}" 2>&1 &
   spid=$!
   python3 "${repo_root}/tools/bench/sample_process_memory.py" \
@@ -439,7 +475,59 @@ start_server() {
     --interval 0.1 \
     --include-gpu >"${memory_dir}/r${repetition}.summary.json" &
   mpid=$!
-  wait_ready "${log}"
+  wait_ready "${log}" || startup_status=$?
+  startup_ready_epoch=$(date +%s.%N)
+  return "${startup_status}"
+}
+
+startup_elapsed_seconds() {
+  awk -v ready="${startup_ready_epoch}" -v launch="${startup_launch_epoch}" \
+    'BEGIN{printf "%.3f", ready - launch}'
+}
+
+# One cold launch->ready measurement. No timed client runs: the axis is server
+# lifecycle, and paying for a full bench grid to read a startup number would
+# make the measurement cost hours instead of minutes. Both arms go through the
+# SAME start_server, so the launched commands are the grid's verbatim.
+run_startup_leg() {
+  local engine=$1 repetition=$2
+  local memory_dir="${evidence}/startup-memory/${model}/${engine}"
+  local cache_dir="${evidence}/startup-cache-drop/${model}/${engine}"
+  local startup_dir="${evidence}/startup/${model}/${engine}"
+  local before_cache="${cache_dir}/r${repetition}-before.json"
+  local idle_ok=0 elapsed
+  mkdir -p "${memory_dir}" "${cache_dir}" "${startup_dir}"
+
+  gpu_idle || {
+    echo "GPU is not idle before startup ${model}/${engine}/r${repetition}" >&2
+    return 1
+  }
+  drop_caches "${before_cache}"
+  start_server "${engine}" "${repetition}" "${memory_dir}"
+  elapsed=$(startup_elapsed_seconds)
+  cleanup_server
+
+  for _ in $(seq 1 120); do
+    if gpu_idle; then
+      idle_ok=1
+      break
+    fi
+    sleep 1
+  done
+  ((idle_ok == 1)) || {
+    echo "GPU did not return after startup ${model}/${engine}/r${repetition}" >&2
+    return 1
+  }
+  python3 "${repo_root}/tools/bench/online_gate.py" record-startup \
+    --output "${startup_dir}/r${repetition}.json" \
+    --engine "${engine}" \
+    --model-key "${model}" \
+    --repetition "${repetition}" \
+    --elapsed-seconds "${elapsed}" \
+    --poll-interval-seconds "${ready_poll_interval}" \
+    --probe-url "http://127.0.0.1:${port}/health" \
+    --cache-drop-report "${before_cache}"
+  echo "startup ${model}/${engine}/r${repetition}: ${elapsed}s" >&2
 }
 
 run_leg() {
@@ -940,6 +1028,27 @@ PY
 exec 9>/tmp/gpu
 flock 9
 gpu_idle || { echo "GPU has a compute owner after acquiring /tmp/gpu" >&2; exit 1; }
+
+# --startup-only measures ONE axis: cold launch -> first /health, interleaved
+# ours/vLLM under this single lock. It deliberately skips the token model gate
+# and the timed grid: no generated token is compared and no throughput number is
+# produced, so neither is a precondition for it (and running the gate here would
+# collide with a real grid's gate evidence in the same root).
+if [[ ${mode} == startup-only ]]; then
+  # Loop variable is deliberately NOT the grid's `repetition`: the --execute
+  # contract test anchors on that exact loop header to isolate the timed tail.
+  for startup_repetition in 1 2 3; do
+    run_startup_leg ours "${startup_repetition}"
+    run_startup_leg vllm "${startup_repetition}"
+  done
+  python3 "${repo_root}/tools/bench/online_gate.py" summarize-startup \
+    --evidence "${evidence}" \
+    --model-key "${model}" \
+    --repetitions 1 2 3 \
+    --output "${evidence}/startup/${model}/summary.json"
+  cat "${evidence}/startup/${model}/summary.json"
+  exit 0
+fi
 
 gate_dir="${evidence}/preflight/model-gate"
 gate_log="${gate_dir}/${model}.log"

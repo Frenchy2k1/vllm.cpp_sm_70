@@ -56,6 +56,8 @@ are our reading of their documented behavior, not measurements.
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |
 | Prefix-cache matching unit | ◐ resolver only | ✅ | ☐ | ☐ |
 | Compute directly on quantized blocks | ✅ | ☐ | ☐ | ✅ |
+| Automatic memory sizing (no hand-tuned budget) | ☐ hand-typed block count | ☐ percent, hand-tuned | ☐ | ◐ |
+| Memory cap with a pre-flight error instead of an OOM | ☐ | ◐ KV pool only | ◐ | ☐ |
 
 ## Quantization and weight formats
 
@@ -131,7 +133,7 @@ they sit outside the gated list above.
 |---|---|---|---|
 | Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder TTFT ~17x, pending |
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
-| MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable path 65/65 (DiT geometry ladder 2x3->8x8+temporal, host+device vs oracle); real-weights render coherence OPEN (DiT-math bug REFUTED by the ladder, PR #74) | FP4/Marlin routing landed, GB10 speed pending |
+| MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable path 66/66 (DiT geometry ladder + CUDA-vs-host at the REAL render seq 1920); t2va renders a COHERENT prompt-matched scene on GB10 (render bug CLOSED: #70/#74 was wrong-partition usage, not a code bug) | FP4/Marlin routing landed, GB10 speed pending |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
@@ -159,7 +161,7 @@ model architecture is wired.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ portable path complete; fp4-resident e2e RUNS on GB10 (real NVFP4 DiT + VAEs + GGUF encoder → mp4/wav); Marlin W4A16 byte-exact; render COHERENCE open, root-caused (#70) to the DiT (not the VAE) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va renders a COHERENT prompt-matched scene on GB10 (FL2VA-partition GGUF → h264/AAC mp4); render bug CLOSED (was wrong-partition usage); task/partition guard mirrors `_resolve_task`; Marlin W4A16 byte-exact | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
 | Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Serving them
@@ -254,6 +256,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 | Embedding / reranking models | Engine side only | Pooler and runner path landed, no model architecture registered |
 | ROCm, XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan only |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
+| Memory budgeting (`ROAD-V1-MEM`, #83) | Scoped, spike owed | No profiling; KV pool is a hand-typed `--num-blocks`. Target: auto-size to the declared workload, optional total-footprint cap, refuse before allocating |
 
 ## How to read this page
 

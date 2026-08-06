@@ -19,6 +19,33 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## QUANT-CT-MXFP4-FLASH-PTXAS — the ptxas-lineage hypothesis is REFUTED three ways: vLLM's fa2 wheel ships NO sm_12x cubin (only CUDA-13.0 PTX-ISA-9.0 compute_80 PTX, driver-JIT'd on GB10), an "old CUDA 12.x ptxas" cannot even target sm_121a, and a same-params cuModule A/B shows our-PTX and vLLM's-OWN-PTX schedule the c8 decode kernel identically (~144 us) across driver-JIT / ptxas 13.0 / ptxas 13.2 — the +10 us/call engine gap is ENGINE CONTEXT, not flash codegen (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-PTXAS`, base `362a3c99`, GB10 sm_121a, PR #82)
+
+#75 attributed the residual +10 us/call c8 flash gap (ours ~167 vs vLLM ~157) to "vLLM's wheel `ptxas` SASS-scheduling quality (older CUDA 12.x lineage)" and OWED obtaining that ptxas and A/B'ing it. This row did. **The lineage hypothesis dies at the premise, then again at the measurement.**
+
+**W1(a) — the wheel has no old lineage and no runnable GB10 cubin (`cuobjdump` `_vllm_fa2_C.abi3.so`, vLLM 0.25.0-stage).** 52 ELF cubins ALL `sm_80`; 52 PTX ALL `.target sm_80 .version 9.0`. PTX ISA 9.0 = **CUDA 13.0**, the SAME major lineage as our nvcc 13.0 — not an older 12.x. There is **NO sm_90/100/120/121 cubin**. On GB10 (sm_121a) the sm_80 SASS cannot execute, so the flash SASS that actually RUNS is **driver-JIT'd from the compute_80 PTX by the box CUDA-13.0 driver (580.159.03)** — produced by the DRIVER's JIT, never by a wheel `ptxas`. #75's mental model (a wheel `ptxas` baked vLLM's fast sm_121a cubin) is factually wrong; vLLM ships portable PTX and relies on the same driver JIT our own build can invoke. #75's own Build C already used that exact assembler (it compiled `code=compute_80` → driver-JIT) and matched vLLM's reg+instr — the assembler was never a variable we lacked.
+
+**W1(b) — an "old CUDA 12.x ptxas" cannot target the arch.** Box `ptxas`: 12.8 (triton), 13.0 (toolkit, our build default), 13.2 (nvidia/cu13 wheel). `ptxas 12.8` tops out at **sm_120a — no sm_121a** (first appears in 13.0), and it cannot read PTX ISA 9.0. So the mission's literal recipe (get the old ptxas, assemble our PTX for sm_121a) is **impossible by construction**: sm_121a SASS only exists from ptxas 13.0+.
+
+**W1(c) — same-params cuModule A/B (THE ARBITER), locked idle box, CUDA-event medians (100× back-to-back × 15 reps).** A standalone harness builds `Flash_fwd_params` for the exact c8 GQA-swap decode (b=8, kv_heads=8, ngroups=4, d=128, seqlen_k=1024, num_splits=3 → grid (1,3,64), block 128, dyn-smem 81 920 B) and times the SAME decode kernel (`flash_fwd_splitkv_kernel<…128,64,128,4…,0,0,0,0,1,0,1,0>`, mangled-identical in our build and vLLM PTX #30) loaded from our compute_80+fast-math PTX and from vLLM's extracted PTX #30, each via {driver-JIT, ptxas 13.0, ptxas 13.2}. All six cubins REG=241 (matched vLLM). Result:
+
+| decode-kernel arm (single split-launch) | module us/call | module/native |
+|---|---|---|
+| our compute_80+fm — driver-JIT | 144.96 | 0.998 |
+| our compute_80+fm — ptxas 13.0 | 149.07 | 1.004 |
+| our compute_80+fm — ptxas 13.2 | 150.78 | 1.009 |
+| vLLM PTX #30 — driver-JIT | 144.55 | 1.007 |
+| vLLM PTX #30 — ptxas 13.0 | 135.95 | 0.969 |
+| vLLM PTX #30 — ptxas 13.2 | 140.54 | 1.013 |
+
+Native sm_121a anchors drifted 138.7–149.4 across the sequential arms (box clock drift), so the module/native RATIO is the drift-normalized read: all six ∈ [0.969, 1.013], i.e. **within ±1.3% — a tie.** No ptxas lineage (13.0/13.2/driver-JIT) moves our kernel, and vLLM's OWN PTX through the same assemblers runs the same as ours. The single 0.969 excursion (vLLM PTX+ptxas13.0) is contradicted by its two sister vLLM arms (driver-JIT 1.007, ptxas13.2 1.013) and by our-PTX+ptxas13.0 (1.004): neither ptxas 13.0 nor vLLM's PTX is systematically faster — it is the low tail of box drift.
+
+**THE ARBITER VERDICT: NO.** No old-ptxas cubin hits ~157 (none can be built; and the driver-JIT that vLLM actually uses was already our #75 Build C). The flash decode kernel's CODEGEN is at PARITY across every reachable toolchain AND against vLLM's own PTX. **The corrected mechanism:** in ISOLATION every variant is ~144–151 us, whereas in the real engine #75 measured ours 167 / vLLM 157 — so the +10 us/call gap is NOT in the flash kernel's SASS at all; it is ENGINE CONTEXT (the L2/TLB/clock state the neighbour kernels leave for the flash launch — exactly #69's "the flash kernel's cost moves with its NEIGHBOURS' L2 footprint"). This RETIRES #75's "ptxas SASS-scheduling quality" attribution. (Caveat, stated: the microbench is L2-warm — KV re-read back-to-back — so its ~144 us absolute sits below the engine's DRAM-cold 157–167; this does not affect the codegen arbitration because #75 showed the dominant stalls are smem-scoreboard/CTA-barrier, regime-independent, and they tie here across all toolchains.)
+
+**W2/W3 — none owed.** NO vendor (nothing beat the driver JIT we already use). Binding UNCHANGED: c1 1.020 / c2 0.962 / c4 0.966 / c8 0.969. THE PARITY VERDICT: MXFP4 stays BELOW-FLOOR at c2–c8, TERMINAL, with the corrected residual map — flash-kernel codegen at PARITY (this row); the c8 ~0.969 residual = flash ENGINE-CONTEXT adjacency (glue/marlin-neighbour L2/orchestration, a different lever than the kernel) + portable-fusion glue ~18% (numerics-delicate, sub-parity) + marlin/host remainder. No default flip owed. **hd256 (27B/35B) cross-model projection:** structurally identical — vLLM's fa2 wheel ships the hd256 splitkv kernels as sm_80-only PTX driver-JIT'd on GB10 too (no old-ptxas lineage, same driver JIT), so NO hd256 flash-ptxas vendor is owed either; the 27B/35B flash-decode codegen is at the same parity and their residuals are likewise context/glue, not ptxas.
+
+Evidence: `dgx:~/mxfp4-ptxas/{exp.sh,exp.log,bench_flash_ptxas.cu,*.cubin,our_c80fm.ptx,vllm.ptx}`; wheel `_vllm_fa2_C.abi3.so` cuobjdump (52×sm_80, PTX 9.0). The CMakeLists NOTE + this entry record the closed levers so they are not re-tried.
+
 ## QUANT-CT-MXFP4-FLASH-OCCUPANCY — the owed ours-vs-vLLM flash decode ncu diff: occupancy is IDENTICAL (8.33%, smem-limited); the flash gap is a COMPILER-CODEGEN difference (vLLM's wheel SASS runs 13% fewer instructions on the byte-identical kernel), NOT occupancy/L2/arch/fast-math — no lever exists on our stack (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-OCCUPANCY`, base `f7a1e322`, GB10 sm_121a, PR #75)
 
 #69 closed the compile lens (flash source byte-identical to vLLM's `2c839c33`; `-use_fast_math` REJECTED, +21us/call) and OWED the ours-vs-vLLM ncu diff (vLLM side lost to a box OOM-reboot). This row runs that diff to a MEASURED verdict on an idle box and re-frames the #69 premise. **Vehicle** `Yi30/Qwen3-8B-MXFP4` (dense W4A16 Marlin), oracle arm `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`.
@@ -14159,3 +14186,56 @@ noise fix from #70 stands but was already known not to be the render fix.
    full canvas, and the real per-token timestep layout. A real-weights activation diff of
    the DiT INPUTS (encoder output, position grid, condition-noise) at real geometry is
    the untested surface #70 did not isolate.
+
+| Suspect | Test | Result |
+|---|---|---|
+| S1 (a)(b) DiT INPUT wiring at real scale | `VT_H3_DUMP_INPUTS` dumped every step-0 DiT input; diffed vs upstream `pipeline_minimax_h3.py` at t2va 512x512/22f (text_len=8, latent 7x32x32, seq_len 1920) | **EXACT** — packed layout, fp64 grid, token_tags, inverse/combined AdaLN indices, sigmas all byte-equal; tokenization byte-equal to `tokenizer(prompt,add_special_tokens=False)` |
+| encoder conditioning | shape/stat check | correct [8,5120], carries the expected Qwen massive-activation (row0 ch731=15915, others rms~4) — not all-pad, not garbage |
+| NVFP4 dequant | independent torch dequant of `blocks.0.attn.qkv_proj` + Laguna/Qwen3 already prove `DequantNvfp4ToBf16` byte-exact | sane trained weight (rms 0.089, absmax=ws2·6·maxscale=3.61) |
+| CUDA kernels at real seq | NEW gate `test_minimax_h3 :: CUDA device forward tracks the host at the REAL render seq (1920)` (RealRatioParams head_dim=128, seq 1920) | **CUDA device == CPU host** (28/28) — no scale-dependent kernel bug (#74 only ran device-vs-host on the CPU backend) |
+| forward math | RefDiT restatement vs true upstream source, read side by side (block, attention, AdaLN view(m*3,6H), 3D-RoPE, modulate) | identical |
+
+## MiniMax-H3 TASK/PARTITION GUARD — mirror `_resolve_task`'s raise; the two arms have NO structural discriminator so a stripped file must DECLARE its partition (2026-08-06, `row/H3-TASK-PARTITION-GUARD` PR #84, `ROAD-V1-H3`, CPU-only dev box)
+
+The #70/#74 follow-up. The white grid was `task=t2va` run on the Ref2VA-partition
+checkpoint; upstream `pipeline._resolve_task` RAISES on the mismatch
+(`pipeline_minimax_h3.py:374-391`, raise at 387-390), and the recipe documents the split
+(`recipes/MiniMaxAI/MiniMax-H3.md:50-51,289`). This row mirrors the raise 1:1 and adds the
+community-file fallback.
+
+**The discriminator finding (grounded both sides).** Upstream derives the partition from
+the release config `model_index.json` → `_minimax_h3` → `{partition, tasks}`
+(`pipeline_minimax_h3.py:279-282`). Community GGUF/NVFP4 STRIP that block, and there is
+NO structural fallback — MEASURED on the two real captured manifests:
+
+| Arm | Manifest (tensors) | Normalized base names | Key shapes (video/audio/condition/time patch) |
+|---|---|---|---|
+| Ref2VA | `minimax_h3_nvfp4_manifest.inc` (1051) | 535 after collapsing `{weight,weight_scale,weight_scale_2}` | `[5376,96]`/`[5376,32]`/`[5376,5120]`/`[5376,256]` |
+| FL2VA | `minimax_h3_gguf_manifest.inc` (535) | 535 | identical |
+
+`comm -23`/`-13` of the two normalized name sets is EMPTY both ways; all reference-relevant
+shapes match. Ref2VA prepends reference rows through the SAME `video/audio_patch_proj`, so
+it adds no reference-specific tensor. A name/shape auto-detector is impossible in principle,
+so a stripped file must DECLARE `--partition fl2va|ref2va` (server: `--video-partition`);
+`MiniMaxH3PartitionFromFlag` maps it to the recipe's served-task set (fl2va→{t2va,fl2va},
+ref2va→{ref2va}).
+
+**Guard behavior table (task × partition → pass/refuse):**
+
+| task \ partition | FL2VA {t2va,fl2va} | Ref2VA {ref2va} | unknown/stripped |
+|---|---|---|---|
+| t2va  | pass | **REFUSE (#77 mismatch)** | REFUSE (declare `--partition`) |
+| fl2va | pass | REFUSE | REFUSE |
+| ref2va| REFUSE | pass | REFUSE |
+
+**RED-first proof (reviewer mutation).** New case `test_minimax_h3 :: "the task/partition
+guard refuses the #77 mismatch"`, 38 assertions: the #77 combo throws, correct pairings
+pass, stripped refuses every task, `--partition` recovers, `MiniMaxH3TaskOfRequest` maps
+the three request shapes, and the two real manifests are asserted to reduce to the same
+535-name set. Neutralizing the guard body (`return;` at the top of
+`MiniMaxH3CheckTaskPartition`) turned the case RED at **10 failed assertions** (t2va-on-
+ref2va, the stripped refusals, the dispatch-level `t2va_req` on Ref2VA); restoring it went
+GREEN. Suite **67/67** (66 prior + this), 46549 assertions; `test_video_api` 4/4 (server
+wiring). Wired at both loading entry points: `MiniMaxH3GenerateT2va` guards every full
+render; the pure pipeline-math tests build `declared=false` requests so the guard is inert
+there. No numbers changed — this is a correctness/refusal gate, not a perf lever.

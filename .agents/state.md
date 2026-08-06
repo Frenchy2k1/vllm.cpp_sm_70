@@ -39708,6 +39708,167 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
 
   Next: `VK-A1` (shader-variant pipeline + the feature-matrix drift repair),
   which blocks every shader written after it.
+## MiniMax-H3 render bug CLOSED — wrong checkpoint PARTITION, not a code bug (`row/H3-RENDER-CLOSE` PR #77)
+<!-- state: 2026-08-06T23:55 -->
+
+The #70/#74 white render was **using the wrong partition for the task**, not a bug.
+MiniMax-H3 has two independently-served DiT partitions; the task MUST match (upstream
+`recipes/MiniMaxAI/MiniMax-H3.md:50,289` + `_resolve_task` raises): **FL2VA serves
+t2va+fl2va, Ref2VA serves ref2va.** Every render up to #74 ran **t2va on
+`minimax_h3_ref2va_nvfp4_full` (the REF2VA partition)** — out of distribution → the
+white latent, invariant to prompt/steps.
+
+BEFORE switching partitions I exonerated everything else (all NEW, dgx, real 512x512/22f):
+(1) `VT_H3_DUMP_INPUTS` — the t2va DiT step-0 inputs diff EXACTLY vs upstream
+`pipeline_minimax_h3.py` (packed layout, fp64 grid, token_tags, inverse/combined AdaLN
+indices, sigmas byte-equal; tokenization byte-equal). (2) encoder conditioning correctly
+shaped, carries the expected Qwen massive-activation. (3) `DequantNvfp4ToBf16` byte-exact
+(Laguna/Qwen3 + independent torch dequant). (4) NEW permanent gate `test_minimax_h3 ::
+"CUDA device forward tracks the host at the REAL render seq (1920)"` — CUDA device == CPU
+host at head_dim=128, seq 1920 (#74's device-vs-host only ran the CPU backend). (5) forward
+math == upstream source, read side by side.
+
+PROOF: downloaded `MiniMax-H3-FL2VA-Q3_K_M.gguf` (15.58 GB, `realrebelai/MiniMax-H3_GGUFs`,
+FL2VA partition, same geometry) and rendered t2va "an orange cat sitting on a wooden table"
+(`--dequant-bf16`, 512x512/22f, 20 steps) → a COHERENT photorealistic orange cat on a wooden
+table: VAE-input latent adj-cos **0.9467** (white=0.06), frame seam16/interior **1.00** (no
+patch grid), velocity stable ~1.37, final latent rms **1.00**, valid h264+AAC mp4. A 50-step
+768x1344 render was run as the artifact leg.
+
+FIXED (code): `MiniMaxH3GenerateT2va` now strips the PREPENDED pinned reference rows (ref2va)
+before unpatchify/unpack (zeroed in the DiT output; only the trailing target rows are the
+clip) — old code hit "rows not divisible by t*h*w"; no-op for t2va/fl2va. OPEN: a
+partition/supported_tasks guard mirroring upstream (community files strip the release config),
+and the encoder vision tower (W3) for clean image/video-conditioned ref2va/fl2va (ref2va with
+a synthetic reference + text-only encoder still grids). dgx assets: `~/h3fp4/ckpt/MiniMax-H3-
+FL2VA-Q3_K_M.gguf`, `~/h3fp4/fl2va_t2va_20/`. Box left clean.
+
+
+## 2026-08-06 — startup latency becomes a MEASURABLE axis (harness only; no number)
+<!-- state: 2026-08-06T23:55 -->
+
+User question: "do we have also faster startup time compared to vLLM?" Answer at
+the time: **unknown, never measured.** `startup` is listed in the online-serving
+gate protocol as an axis every interleaved repetition must record, but the
+driver waited for readiness and discarded the duration; no manifest field, no
+`startup_s`/`time_to_ready` anywhere in `tools/`, `scripts/`, `docs/`. The only
+datapoint in the record was incidental (`c2-c8-attribution-2026-07-16.md:152`,
+ours-only "startup 43 s", no vLLM arm).
+
+Landed (test-first, CPU, no GPU): `--startup-only` on the campaign driver;
+`online_gate.py record-startup` / `summarize-startup`; readiness cadence 5 s ->
+0.2 s with the 1800 s budget preserved exactly (the old cadence was ~12% of the
+measured quantity, i.e. the resolution floor); launch/ready stamps immediately
+around the spawn; and a cold-gate — `record-startup` embeds and validates the
+leg's cache-drop report, so a startup artifact cannot exist for a warm leg.
+`tests/tools/test_online_gate_startup.py` 19/19; the 5 neighbouring tool suites
+66/66 together; `shellcheck` + `bash -n` clean. Spec:
+[startup-latency-axis](specs/startup-latency-axis.md).
+
+Two process findings worth carrying forward:
+
+1. **A concurrent process on the dev box repeatedly reset this worktree.** Three
+   `git pull --ff-only` / checkout events during one session reverted
+   `scripts/dgx-online-serving.sh` twice (silently — the edits simply were not
+   there on the next read), and an unrelated squash (`b95543c4`, #77) SWEPT the
+   half-written `tests/tools/test_online_gate_startup.py` onto main WITHOUT its
+   implementation, leaving main's tool suite RED. Work moved to an isolated
+   worktree/branch; this change is also the repair for that red. Reinforces
+   [parallel subagents -> worktree isolation] and "never `git add -A` mid-write".
+2. **A grep-only contract test is not proof a flag works.** The first version of
+   the `--startup-only` driver test asserted only that the string appeared in
+   the script, and it passed happily against a tree where the `case` arm had
+   been reverted and the mode could never be selected. Replaced with a test that
+   actually invokes the script and asserts stderr lacks "unknown argument".
+
+Open: **the number.** dgx.casa root was at 100% (20 GiB free) with no existing
+CUDA `server` build, so the ours arm could not be built. User authorized
+reclaiming the untagged 7.37 GB docker image + 4.4 GB builder cache (NOT the
+stopped `local-ai-worker` container). Run owed: 27B, 3 interleaved repetitions.
+## MiniMax-H3 task/partition GUARD landed — mirror `_resolve_task`'s raise (`row/H3-TASK-PARTITION-GUARD` PR #84, helper, DRAFT PR, CPU-only)
+<!-- state: 2026-08-06T23:59 -->
+
+The #77 follow-up: the driver silently accepted `task=t2va` on the Ref2VA-partition
+checkpoint (the #70/#74 white grid, three campaigns). Upstream `pipeline._resolve_task`
+RAISES on the mismatch (`vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3.py:374-391`,
+raise at 387-390); the recipe documents the split (`recipes/MiniMaxAI/MiniMax-H3.md:50-51,289`:
+one server serves one partition, FL2VA→{t2va,fl2va}, Ref2VA→{ref2va}). Mirrored 1:1.
+
+DISCRIMINATOR FINDING (definitive, both sides). Upstream reads the served-task set from the
+release config `model_index.json` → `_minimax_h3` → `{partition,tasks}` (pipeline:279-282);
+`MiniMaxH3PartitionFromModelIndex` mirrors those exact keys. Community GGUF/NVFP4 STRIP that
+block, and there is NO structural fallback — MEASURED on the two real captured manifests: the
+Ref2VA NVFP4 (`minimax_h3_nvfp4_manifest.inc`, 1051 tensors) and FL2VA GGUF
+(`minimax_h3_gguf_manifest.inc`, 535) carry the IDENTICAL DiT. Collapsing the NVFP4
+`{weight,weight_scale,weight_scale_2}` split, both reduce to the SAME 535 base tensor names AND
+the SAME shapes (`comm` empty both ways; video_patch_proj `[5376,96]`, condition_proj
+`[5376,5120]`, etc. equal). Ref2VA prepends reference rows through the SAME
+`video/audio_patch_proj`, adding no reference-specific tensor. So a stripped file must DECLARE
+`--partition fl2va|ref2va` (server `--video-partition`); `MiniMaxH3PartitionFromFlag` maps it.
+
+CODE. New (pure, gated-on-any-machine, `minimax_h3_planner.cpp`): `MiniMaxH3PartitionInfo`
+(`declared`/`partition`/`supported_tasks`), `MiniMaxH3PartitionFromModelIndex`,
+`MiniMaxH3PartitionFromFlag`, `MiniMaxH3TaskOfRequest` (ref_blocks→ref2va, keyframes→fl2va,
+else t2va), and the raise `MiniMaxH3CheckTaskPartition`. `MiniMaxH3GenerateT2va` calls the
+pair before denoising; a default `declared=false` request leaves it inert (pipeline-math tests
+unaffected). Driver `--partition` + server `--video-partition` wired. An unknown partition
+refuses EVERY task (ambiguous) and names the recipe lines.
+
+GATE. New case `test_minimax_h3 :: "the task/partition guard refuses the #77 mismatch"` (38
+assertions): #77 combo throws, correct pairings pass, stripped refuses+`--partition` recovers,
+task-of-request maps all three shapes, and the two real manifests are asserted to the same
+535-name set. RED-first (reviewer mutation): neutralizing the guard body → 10 failed
+assertions; restored → GREEN. Suite 67/67 (66 prior +1), 46549 assertions; `test_video_api`
+4/4 (server wiring). No numbers changed (refusal gate, not a perf lever). Records: spec §8.7,
+STATUS/BENCHMARKS H3 rows, benchmark-record, NOW. Pre-existing preflight red
+(check-fusion-consistency `minimax_h3_video_vae_device`) is not this row.
+## 2026-08-07T00:45 - QUANT-CT-MXFP4-FLASH-PTXAS: the ptxas-lineage arbiter = NO; #75's "wheel ptxas SASS-quality" attribution RETIRED - vLLM's flash SASS is driver-JIT'd from CUDA-13.0 PTX, codegen ties across all ptxas AND vs vLLM's own PTX, the +10us gap is ENGINE CONTEXT (row/QUANT-CT-MXFP4-FLASH-PTXAS, helper, PR #82)
+<!-- state: 2026-08-07T00:45 -->
+
+The last MXFP4 flash lever. #75 owed obtaining vLLM's wheel `ptxas` (hypothesized
+"older CUDA 12.x lineage") and A/B'ing it against our flash PTX. Done. **Arbiter =
+NO, refuted three ways.**
+
+- **(a) No old lineage / no runnable GB10 cubin.** `cuobjdump` of vLLM 0.25.0's
+  `_vllm_fa2_C.abi3.so` = 52 `sm_80` cubins + 52 `.target sm_80 .version 9.0` PTX.
+  PTX ISA 9.0 = CUDA 13.0 (our own major), NOT 12.x; NO sm_12x cubin. On GB10 the
+  sm_80 SASS can't run, so vLLM's flash SASS is **driver-JIT'd from compute_80 PTX
+  by the box CUDA-13.0 driver (580.159.03)** - the SAME assembler #75's Build C
+  (`code=compute_80`) already used. The "wheel ptxas baked a fast sm_121a cubin"
+  premise is factually wrong.
+- **(b) Impossible by construction.** Box ptxas = 12.8 (triton), 13.0 (toolkit,
+  build default), 13.2 (nvidia/cu13). ptxas 12.8 tops out at sm_120a - it CANNOT
+  target sm_121a (first in 13.0) nor read PTX 9.0. So an old-12.x sm_121a cubin
+  cannot be built at all.
+- **(c) Measured tie.** Standalone cuModule harness (`dgx:~/mxfp4-ptxas/`,
+  `bench_flash_ptxas.cu`) times the byte-identical c8 GQA-swap decode kernel
+  (grid (1,3,64), dyn-smem 81 920 B, all cubins REG=241) from our compute_80+
+  fast-math PTX and vLLM's PTX #30, each via driver-JIT / ptxas 13.0 / ptxas 13.2.
+  Module/native ratios ∈ [0.969, 1.013] - a ±1.3% tie (native anchors drifted
+  138.7-149.4 across the sequential arms; the lone 0.969 is contradicted by both
+  sister vLLM arms 1.007/1.013 and our-PTX+ptxas13.0 1.004 = box drift, not a
+  lever).
+
+**Corrected mechanism:** the flash decode kernel codegen is at PARITY across every
+reachable toolchain AND vs vLLM's own PTX (~144-151 us in isolation); the +10
+us/call the engine showed (ours 167 / vLLM 157, #75) is ENGINE CONTEXT
+(neighbour-kernel L2/orchestration, exactly #69's finding), NOT the kernel's SASS.
+This RETIRES #75's "ptxas SASS-scheduling quality" attribution. (Microbench is
+L2-warm so its absolute sits below the engine's DRAM-cold number; irrelevant to the
+codegen arbitration since the dominant stalls are smem-scoreboard/CTA-barrier per
+#75, regime-independent, and they tie here.)
+
+**Verdict / follow-up.** W2/W3 none owed: NO vendor (nothing beat the driver JIT we
+already use), binding UNCHANGED c1 1.020 / c2 0.962 / c4 0.966 / c8 0.969, MXFP4
+TERMINAL below-floor at c2-c8 with the corrected map (flash codegen at parity;
+residual = flash engine-context adjacency + portable-fusion glue ~18% +
+marlin/host). No default flip owed. hd256 (27B/35B) cross-model projection:
+structurally identical (sm_80-only PTX driver-JIT'd), NO hd256 vendor owed; their
+flash-decode residuals are likewise context/glue, not ptxas. No functional code
+shipped; CMakeLists NOTE + benchmark-record (#82) + spec CLOSED capture the closed
+levers. Box: experiment left artifacts under `~/mxfp4-ptxas/`; box OOM-rebooted
+mid-confirmatory-run (another agent's 25 GiB vLLM on the 119 GiB unified pool, not
+this <1 GiB microbench) - run-1 data is on disk and decisive.
 
 - **2026-08-06 (later)** — **`VK-A1` LANDED: the Vulkan shader-variant mechanism,
   two CI gates, and a corrected baseline (`CLAIM-VULKAN-FULL-1`, row
