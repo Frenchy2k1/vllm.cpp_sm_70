@@ -220,12 +220,14 @@ class Qwen3DenseDecodeGraph {
   std::unique_ptr<Impl> impl_;
 };
 
-// Per-family opt-in for the shared dense decode CUDA-graph. Reads
-// VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH (DEFAULT OFF — the graph is a same-binary
-// opt-in until its per-model SACRED token-exact gate has been run on GB10; the
-// eager default path is then byte-identical to the pre-change forward), and honors
-// the framework kill switch VLLM_CPP_CUDAGRAPH=0. When false the dense factories'
-// forward is LITERALLY unchanged (never constructs or routes through a graph).
+// Per-family gate for the shared dense decode CUDA-graph. Reads
+// VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH (DEFAULT ON as of row QUANT-CT-MXFP4-MARLIN-STRUCT
+// step 1 — its per-model SACRED token-exact gate PASSED on GB10: paged-engine 184/184
+// + async 82/82 graph ON == OFF, and the Qwen3-8B-MXFP4 #44 smoke 3/3 token-exact +
+// coherent). An explicit =0 opts back out to eager (byte-identical to the pre-graph
+// forward); the framework kill switch VLLM_CPP_CUDAGRAPH=0 also forces eager inside
+// the driver. When false the dense factories' forward is LITERALLY unchanged (never
+// constructs or routes through a graph).
 bool DenseDecodeGraphEnabled();
 
 // SHARED routing helper used by all five dense factory forwards. When this step is

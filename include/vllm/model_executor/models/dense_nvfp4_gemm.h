@@ -387,28 +387,21 @@ inline void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw,
   if (mr.ready) return;
   const int K = static_cast<int>(gw.k);
   const int N = static_cast<int>(gw.n);
+  const int gs = static_cast<int>(gw.group_size);  // 16 (nvfp4) or 32 (mxfp4)
   void* stream = d.q.handle;
   const size_t w_i32 = static_cast<size_t>(K / 16) * (static_cast<size_t>(2 * N) * 2);
-  const size_t s_b = static_cast<size_t>(K / 16) * (2 * N);
+  const size_t s_b = static_cast<size_t>(K / gs) * (2 * N);  // K/16 nvfp4, K/32 mxfp4
   const size_t pk_b = static_cast<size_t>(N) * (K / 2);   // one shard's packed bytes
-  const size_t sc_b = static_cast<size_t>(N) * (K / 16);  // one shard's scale bytes
+  const size_t sc_b = static_cast<size_t>(N) * (K / gs);  // one shard's scale bytes
   mr.w = d.b.Alloc(w_i32 * 4);
   mr.s = d.b.Alloc(s_b);
   mr.g = d.b.Alloc(sizeof(float));
   mr.n = gw.n;
   mr.k = gw.k;
-  // combined_scale_factor over BOTH shards (vLLM computes it over the MERGED
-  // gate_up scale tensor — marlin_utils_fp4.py:281-284 operates on the whole
-  // parameter, which for gate_up_proj is already the concatenation).
-  std::vector<const uint8_t*> bufs{
-      reinterpret_cast<const uint8_t*>(gw.scale.bytes.data()),
-      reinterpret_cast<const uint8_t*>(uw.scale.bytes.data())};
-  std::vector<size_t> lens{gw.scale.bytes.size(), uw.scale.bytes.size()};
-  const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
   Nvfp4Dev dg = ResidentNvfp4(d, gw);
   Nvfp4Dev du = ResidentNvfp4(d, uw);
-  // Flat row-stack concat (packed [N,K/2] u8 / scales [N,K/16] fp8 are row-major
-  // over N; gate rows FIRST — vLLM's merged shard order, qwen3.py:271-274
+  // Flat row-stack concat (packed [N,K/2] u8 / scales [N,K/gs] are row-major over
+  // N; gate rows FIRST — vLLM's merged shard order, qwen3.py:271-274
   // `gate_up_proj: [gate_proj, up_proj]`).
   auto* tmp_w = static_cast<uint8_t*>(d.b.Alloc(2 * pk_b));
   auto* tmp_s = static_cast<uint8_t*>(d.b.Alloc(2 * sc_b));
@@ -418,13 +411,33 @@ inline void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw,
   d.b.Copy(d.q, tmp_s + sc_b, du.scale.data, sc_b);
   vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index,
                                      static_cast<uint32_t*>(mr.w), tmp_w, K, 2 * N);
-  vt::cuda::MarlinProcessExpertScales(stream, tmp_s, static_cast<uint8_t*>(mr.s), K,
-                                      2 * N, sf);
-  // ONE global scale for both shards (vLLM's merged parameter has exactly one
-  // weight_global_scale — it takes `.max()` across the shards at
-  // compressed_tensors_w4a4_nvfp4.py:111-114; equality is guarded by the caller).
-  const float g = vt::cuda::MarlinNvfp4ProcessGlobalScale(gw.scale2, sf);
-  d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  if (gw.is_mxfp4) {
+    // MXFP4: E8M0 passthrough permute over the MERGED 2N scales (no combined
+    // factor, no global — the kernel skips global for E8M0). Byte-identical PER
+    // SHARD to the split-path single-expert resident, because the E8M0 permute is
+    // row-local (each output column's scales depend only on its own group bytes),
+    // so [gate;up] stacked == the two residents concatenated.
+    vt::cuda::MarlinProcessExpertScalesMxfp4(stream, tmp_s,
+                                             static_cast<uint8_t*>(mr.s), K, 2 * N);
+    const float g = 1.0F;  // unused (kernel skips global for E8M0)
+    d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  } else {
+    // combined_scale_factor over BOTH shards (vLLM computes it over the MERGED
+    // gate_up scale tensor — marlin_utils_fp4.py:281-284 operates on the whole
+    // parameter, which for gate_up_proj is already the concatenation).
+    std::vector<const uint8_t*> bufs{
+        reinterpret_cast<const uint8_t*>(gw.scale.bytes.data()),
+        reinterpret_cast<const uint8_t*>(uw.scale.bytes.data())};
+    std::vector<size_t> lens{gw.scale.bytes.size(), uw.scale.bytes.size()};
+    const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
+    vt::cuda::MarlinProcessExpertScales(stream, tmp_s, static_cast<uint8_t*>(mr.s),
+                                        K, 2 * N, sf);
+    // ONE global scale for both shards (vLLM's merged parameter has exactly one
+    // weight_global_scale — it takes `.max()` across the shards at
+    // compressed_tensors_w4a4_nvfp4.py:111-114; equality is guarded by the caller).
+    const float g = vt::cuda::MarlinNvfp4ProcessGlobalScale(gw.scale2, sf);
+    d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  }
   d.b.Synchronize(d.q);  // repack done -> safe to free staging + fp4 originals
   d.b.Free(tmp_w);
   d.b.Free(tmp_s);
@@ -438,12 +451,20 @@ inline void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw,
 // True when a gate/up pair takes the fused Marlin gate_up path. Must be checked
 // IDENTICALLY at every call site so exactly ONE resident layout is ever built.
 inline bool GateUpFusedEligible(const Nvfp4Weight& gw, const Nvfp4Weight& uw) {
-  // MXFP4 takes the SPLIT path (two W4A16 GEMMs + MoeSiluMul): the fused merged
-  // gate_up resident is an NVFP4-only optimization; forcing split keeps the
-  // MXFP4 lane correct without a fused mxf4 pair repack (still byte-correct).
+  // Both NVFP4 (group 16, combined scale + per-tensor global) or both MXFP4
+  // (group 32, E8M0 passthrough, NO global). The fused merged gate_up resident
+  // row-stacks the two shards ([gate;up] -> one [2N,K] operand). MXFP4 has NO
+  // cross-shard scale interaction — each group's E8M0 byte is passed through
+  // independently (MarlinProcessExpertScalesMxfp4), with no combined_scale_factor
+  // and no global — so the fused MXFP4 GEMM is byte-identical to the two split
+  // single-expert GEMMs (strictly SAFER than the NVFP4 case, which additionally
+  // needs scale2 equality because its combined factor spans both shards). The
+  // format/group must match (a MLP's gate and up always share both) and, for the
+  // NVFP4 arm, scale2 must be equal (trivially true for MXFP4: both 0).
   return FusedGateUpEnabled() && !gw.Empty() && !uw.Empty() && !gw.IsTrueW4A4() &&
-         !uw.IsTrueW4A4() && !gw.is_mxfp4 && !uw.is_mxfp4 && gw.n == uw.n &&
-         gw.k == uw.k && gw.scale2 == uw.scale2;
+         !uw.IsTrueW4A4() && gw.is_mxfp4 == uw.is_mxfp4 &&
+         gw.group_size == uw.group_size && gw.n == uw.n && gw.k == uw.k &&
+         gw.scale2 == uw.scale2;
 }
 
 // silu(x@gate.T) * (x@up.T) -> bf16 [M,N] via ONE fused Marlin gate_up GEMM.
@@ -458,18 +479,22 @@ inline DBuf GateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
   ++MutableW4A16Stats().fused_gate_up;
 
   DBuf gu(d, DType::kBF16, {M, 2 * N});
+  // Weight is always K/16-tiled (marlin interleave is group-independent); the
+  // SCALE grid rows are K/group_size (K/16 nvfp4, K/32 mxfp4).
   Tensor wq = MakeTensor(mr.w, DType::kI32, d.q.device, {1, K / 16, 2 * N * 2});
-  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / 16, 2 * N});
+  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / gw.group_size, 2 * N});
   Tensor gg = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
   Tensor wst = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
   Tensor sorted = MakeTensor(ac.sorted, DType::kI32, d.q.device, {ac.max_tok});
   Tensor expert = MakeTensor(ac.expert, DType::kI32, d.q.device, {ac.max_blk});
   Tensor numpad = MakeTensor(ac.numpad, DType::kI32, d.q.device, {1});
   Tensor topkw = MakeTensor(ac.topkw, DType::kF32, d.q.device, {M});
-  vt::MoeGroupedGemmNvfp4Marlin(
-      d.q, gu.t(), x, wq, sc, gg, wst, sorted, expert, numpad, topkw,
-      vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
-                        static_cast<int>(K), false});
+  vt::MoeMarlinArgs margs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
+                          static_cast<int>(K), false};
+  margs.group_size = static_cast<int>(gw.group_size);
+  margs.mxfp4 = gw.is_mxfp4;
+  vt::MoeGroupedGemmNvfp4Marlin(d.q, gu.t(), x, wq, sc, gg, wst, sorted, expert,
+                                numpad, topkw, margs);
   DBuf act(d, DType::kBF16, {M, N});
   vt::SiluAndMul(d.q, act.t(), gu.t());
   return act;

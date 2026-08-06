@@ -12662,3 +12662,36 @@ Tertiary = flash same-kernel/IDENTICAL-grid +11% (KV/splitkv), glue Inductor-fus
 Evidence dgx:~/mxfp4-nsys/{kern_sum_c8_dflt,vllm_offline_kern_c8,kern_sum_c8_graph}.txt +
 gpu_trace_c8_{dflt,graph}/vllm_offline_trace_c8_cuda_gpu_trace.csv + analyze_decode.py/gap_and_shape.py.
 Box left clean (both locks free, GPU idle, worker down, disk 20G, tmux gone).
+
+### QUANT-CT-MXFP4-MARLIN-STRUCT (2026-08-09) — decode-graph + gate_up FUSION default-ON, E=1 par=1 arbiter
+
+Base `origin/main` `027af9b0` (#52). GB10 sm_121a Release, build in `/dev/shm/vc-mxfp4`. Same-tool
+nsys `--cuda-graph-trace=node` c8 decode-window (24×128, M=8-pinned, 235 steady steps, `analyze_decode.py`);
+vLLM side reused from #52 (same pin `55596792`). ours-default = graph+fuse (par1 OFF); ours+par1 = opt-in.
+
+| class | ours-dflt us/step (calls) | ours+par1 | vLLM us/step (calls) | dflt gap | par1 gap |
+|-------|--------------------------:|----------:|---------------------:|---------:|---------:|
+| marlin | 17,463 (144) | 16,512 | 16,286 (144) | +1,177 | +226 |
+| flash  |  6,413 (36)  |  6,436 |  5,629 (36)  | +784   | +807  |
+| glue   |    866 (255) |    869 |    671 (299) | +195   | +198  |
+| lm_head|  5,387       |  5,398 |  5,395       | ~0     | ~0    |
+| BUSY   | 30,431       | 29,510 | 28,190       | +2,241 | +1,320 |
+| GAP    |    297 (1.0%)|    293 |    304 (1.1%) | ~0     | ~0    |
+| SPAN   | 30,732       | 29,800 | 28,491       | +2,241 | +1,309 |
+| TPOT ms (client, nsys-inflated) | 37.22 | 36.23 | 34.58 | +2.64 | +1.65 |
+
+FINDINGS: (1) gate_up FUSION drops modal marlin 180→**144 GEMM/step** (vLLM-structural parity) but only
+−200us marlin — the count was cheap (fused 2N GEMM reads the same weight bytes as 2 narrow, W4A16
+memory-bound); step 2 = structural/correctness parity, not a speed win. (2) At MATCHED 144-count ours
+marlin is 121.3us/call vs vLLM 113.1 = **+7.2%/call = +1,177us = the DOMINANT residual** — the CTA count
+(ours 144 = sms×par3, vLLM dense 48 = sms×1, `blocks = sms*blocks_per_sm` marlin_mm_moe.cu:494), REFUTING
+#52's "per-call near-parity". (3) `VT_MARLIN_E1_PAR1=1` clamp (48 CTAs) recovers 951/1177us (marlin +226
+near-parity, TPOT −0.99ms), token-exact on 8B-MXFP4 (#44 3/3) — MEASURABLY SUFFICIENT, no dense-port
+needed — but flips a strict 32B-NVFP4 token (fp32-reduce regroup, `test_qwen3_32b_nvfp4a16` REQUIRE :344;
+isolated: baseline 142/142, graph-only 142/142, par1-only 59/60) ⇒ default-OFF opt-in; byte-preserving CTA
+reduction = the dense-template marlin port (#50 NO-GO), scoped. Post-par1 the DOMINANT residual is FLASH
+(+807, same kernel+grid, unresolved), then glue (+198, portable-fusion). Full strict binding ratio table
+(c1..c8 x3, fresh oracle) DEFERRED — the strict harness needs an on-REAL-disk RelWithDebInfo build (tmpfs
+fails the mincore cache-drop) + the vLLM oracle whose host-RAM reservation alongside the 27G tmpfs tree is
+the GB10 OOM-reboot risk. Evidence dgx:~/mxfp4-nsys/{oursfused_c8,ourspar1_c8}.nsys-rep, kern_sum_oursfused_c8.txt,
+gpu_trace_{oursfused,ourspar1}_c8_*.csv; gates ~/{gate2,gate4,gate5,iso32b,step1_gate,step1_smoke}.log.

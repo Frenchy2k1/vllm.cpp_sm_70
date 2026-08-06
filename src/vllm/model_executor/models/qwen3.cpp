@@ -610,12 +610,18 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
   return fl;
 }
 
-// Per-family opt-in gate (see qwen3.h). DEFAULT OFF: the shared dense decode graph
-// is a same-binary opt-in until its per-model SACRED token-exact gate has been run
-// on GB10; when off, the dense factories' forward is byte-identical to before.
+// Per-family gate (see qwen3.h). DEFAULT ON (row QUANT-CT-MXFP4-MARLIN-STRUCT step 1,
+// parity-enabler): the shared dense decode CUDA-graph is byte-coherent + token-exact
+// vs the eager forward on both dense checkpoints — test_qwen3_paged_engine 184/184
+// (Qwen3-0.6B near-tie + Qwen3-4B) and test_qwen3_dense_async_serving 82/82, graph
+// ON == OFF — and on the Qwen3-8B-MXFP4 #44 smoke (deterministic 3/3 token-exact +
+// coherent), all captured on GB10. An explicit VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH=0
+// opts back out to the eager path (byte-identical to the pre-graph forward); the
+// framework kill switch VLLM_CPP_CUDAGRAPH=0 additionally forces eager inside the
+// driver (Impl::enabled), so the graph never captures under either opt-out.
 bool DenseDecodeGraphEnabled() {
   const char* value = std::getenv("VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH");
-  return value != nullptr && value[0] != '0';
+  return !(value != nullptr && value[0] == '0');
 }
 
 std::optional<ForwardLogits> DenseDecodeGraphForward(
