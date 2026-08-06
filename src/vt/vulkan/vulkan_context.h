@@ -63,8 +63,25 @@ class VulkanContext {
   // src/vt/vulkan/shaders/vt_common.glsl § STORAGE MODEL).
   // Serialized by an internal mutex: the command buffer and each pipeline's
   // descriptor set are single instances that are re-recorded per dispatch.
+  //
+  // `spec_values` are SPECIALIZATION CONSTANT values, supplied in ASCENDING
+  // constantID order and matching the module's declared `spec_ids` (recorded in
+  // the committed SPIR-V table) exactly. They are part of the pipeline cache KEY:
+  // each distinct combination becomes its own VkPipeline, specialized once and
+  // reused, with the driver folding the constant and eliminating the branches it
+  // kills. This is the variant mechanism that replaces llama.cpp's
+  // one-module-per-#define explosion (its vulkan-shaders-gen has 242
+  // `string_to_spv` call sites at pin 237ad9b96, most inside dtype/quant/coopmat
+  // loops) — here one module covers the axis and the count of committed artifacts
+  // tracks shader FILES instead of their cross product.
   void Dispatch(const std::string& name, const void* const* buffers, uint32_t buffer_count,
-                const void* push_constants, uint32_t push_size, uint32_t group_count_x);
+                const void* push_constants, uint32_t push_size, uint32_t group_count_x,
+                const uint32_t* spec_values = nullptr, uint32_t spec_count = 0);
+
+  // Number of distinct pipelines currently cached. Exposed for the unit gate: it
+  // is how a test proves a new specialization produced a NEW pipeline rather than
+  // silently reusing an existing one — which would look identical in the results.
+  size_t PipelineCacheSize() const;
 
   // Allocate one host-visible, host-coherent storage buffer of `bytes` and keep
   // it PERSISTENTLY MAPPED. Returns the mapped host pointer — which is what
@@ -106,7 +123,8 @@ class VulkanContext {
  private:
   VulkanContext();
   struct Pipeline;
-  Pipeline& GetPipeline(const std::string& name, uint32_t buffer_count, uint32_t push_size);
+  Pipeline& GetPipeline(const std::string& name, uint32_t buffer_count, uint32_t push_size,
+                        const uint32_t* spec_values, uint32_t spec_count);
 
   void* instance_ = nullptr;         // VkInstance
   void* physical_device_ = nullptr;  // VkPhysicalDevice

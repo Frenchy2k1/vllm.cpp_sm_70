@@ -86,17 +86,72 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
     for (size_t i = 1; i < m.spec_id_count; ++i) {
       CHECK(m.spec_ids[i - 1] < m.spec_ids[i]);
     }
-    // TODAY every module declares ZERO specialization constants: none of the W0
-    // shaders has a variant axis. This asserts that as a fact rather than leaving
-    // it implied, so the first shader that DOES take a constant (a dtype, a quant
-    // format, a coopmat tier) flips this loudly and whoever adds it is forced to
-    // supply the matching values at the GetPipeline call.
+    // vt_cast is the backend's FIRST variant axis: constants 0 and 1 are its
+    // source and destination dtype, so one module serves every (src, dst) pair
+    // instead of a module per pair. Every other W0 shader still declares none.
     //
-    // The workgroup size is deliberately NOT that constant — see the measured
+    // The workgroup size is deliberately NOT such a constant — see the measured
     // reason in src/vt/vulkan/shaders/vt_common.glsl (local_size_x_id emits
     // LocalSize 1 1 1 at the vulkan1.1 target and computes ~1/128 of the tensor).
-    CHECK(m.spec_id_count == 0);
+    if (std::strcmp(m.name, "vt_cast") == 0) {
+      REQUIRE(m.spec_id_count == 2);
+      CHECK(m.spec_ids[0] == 0u);
+      CHECK(m.spec_ids[1] == 1u);
+    } else {
+      CHECK(m.spec_id_count == 0);
+    }
   }
+}
+
+TEST_CASE("Vulkan specializes pipelines per dtype pair and caches them separately") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // Two DIFFERENT dtype pairs through the same committed module. The results
+  // being right is necessary but not sufficient: a specialization that silently
+  // did nothing would also produce right results here, because the shader's
+  // defaults happen to be f32->f32. What proves the mechanism engaged is that the
+  // pipeline cache GREW BY TWO — one specialized pipeline per pair.
+  const size_t before = ctx.PipelineCacheSize();
+
+  const int64_t n = 300;  // not a multiple of the workgroup size
+  std::vector<float> src(n);
+  for (int64_t i = 0; i < n; ++i) src[i] = static_cast<float>(i) - 150.5f;
+
+  auto* f32_in = static_cast<float*>(vk.Alloc(n * sizeof(float)));
+  auto* bf16_mid = static_cast<uint16_t*>(vk.Alloc(n * sizeof(uint16_t)));
+  auto* f32_out = static_cast<float*>(vk.Alloc(n * sizeof(float)));
+  vk.Copy(q, f32_in, src.data(), n * sizeof(float));
+
+  Tensor t_f32_in = Tensor::Contiguous(f32_in, vt::DType::kF32, d, {n});
+  Tensor t_bf16 = Tensor::Contiguous(bf16_mid, vt::DType::kBF16, d, {n});
+  Tensor t_f32_out = Tensor::Contiguous(f32_out, vt::DType::kF32, d, {n});
+
+  vt::CastBf16(q, t_bf16, t_f32_in);   // f32 -> bf16 : one specialization
+  vt::CastF32(q, t_f32_out, t_bf16);   // bf16 -> f32 : a different one
+  vk.Synchronize(q);
+
+  CHECK(ctx.PipelineCacheSize() == before + 2);
+
+  // The round trip must be EXACTLY the CPU codec's, so this stays in the
+  // bit-exact tier rather than the NMSE tier: bf16 keeps the high 16 bits under
+  // round-to-nearest-even, so a value that survives the narrowing must come back
+  // identical.
+  std::vector<float> back(n);
+  vk.Copy(q, back.data(), f32_out, n * sizeof(float));
+  vk.Synchronize(q);
+  for (int64_t i = 0; i < n; ++i) {
+    CAPTURE(i);
+    CHECK(back[i] == vt::BF16ToF32(vt::F32ToBF16(src[i])));
+  }
+
+  vk.Free(f32_in);
+  vk.Free(bf16_mid);
+  vk.Free(f32_out);
+  vk.DestroyQueue(q);
 }
 
 TEST_CASE("Vulkan backend is registered on a Vulkan-capable host") {

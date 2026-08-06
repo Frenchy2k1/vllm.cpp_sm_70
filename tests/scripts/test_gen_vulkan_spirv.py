@@ -78,19 +78,34 @@ class CommittedArtifact(unittest.TestCase):
                             f"SpirvModule is missing {field!r}; "
                             f"re-run scripts/gen-vulkan-spirv.py")
 
-    def test_no_committed_shader_declares_a_constant_yet(self):
-        """None of the W0 shaders has a variant axis, so none declares a SpecId.
+    def test_vt_cast_declares_its_dtype_pair(self):
+        """vt_cast is the backend's first variant axis: src and dst dtype.
 
-        Stated as a fact so the first shader that DOES take one flips this test
-        and its author is forced to supply matching values at the dispatch. The
-        workgroup size is deliberately not such a constant: local_size_x_id emits
-        LocalSize 1 1 1 at the vulkan1.1 target (see vt_common.glsl).
+        One committed module serves every (src, dst) pair, specialized at pipeline
+        creation, instead of llama.cpp's module-per-#define. The workgroup size is
+        deliberately NOT such a constant: local_size_x_id emits LocalSize 1 1 1 at
+        the vulkan1.1 target (see vt_common.glsl).
         """
         header = (ROOT / "src/vt/vulkan/vulkan_spirv.h").read_text()
-        self.assertTrue("kSpecIds_" not in header,
-                        "a committed shader now declares a specialization "
-                        "constant; update this test and pass its value at the "
-                        "GetPipeline call")
+        self.assertTrue("kSpecIds_vt_cast[]" in header,
+                        "vt_cast no longer declares specialization constants; "
+                        "re-run scripts/gen-vulkan-spirv.py")
+
+    def test_other_shaders_declare_none_yet(self):
+        """Stated as a fact so the next shader to take a constant flips this test.
+
+        Whoever adds one is then forced to supply matching values at its dispatch,
+        which GetPipeline checks by count against the declared SpecIds.
+        """
+        header = (ROOT / "src/vt/vulkan/vulkan_spirv.h").read_text()
+        for src in sorted((ROOT / "src/vt/vulkan/shaders").glob("*.comp")):
+            if src.stem == "vt_cast":
+                continue
+            with self.subTest(shader=src.name):
+                self.assertTrue(
+                    f"kSpecIds_{src.stem}[]" not in header,
+                    f"{src.name} now declares a specialization constant; update "
+                    f"this test and pass its value at the dispatch")
 
 
 if __name__ == "__main__":

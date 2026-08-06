@@ -416,16 +416,36 @@ void VulkanContext::FreeBuffer(void* buffer, void* memory) {
   vk.vkFreeMemory(device, Unpack<VkDeviceMemory>(memory), nullptr);
 }
 
+namespace {
+
+// The pipeline cache key: the module name plus its specialization values, which
+// together identify one VkPipeline. Decimal so the key reads back in the
+// VT_CHECK messages below.
+std::string PipelineKey(const std::string& name, const uint32_t* spec_values,
+                        uint32_t spec_count) {
+  std::string key = name;
+  for (uint32_t i = 0; i < spec_count; ++i) {
+    key += (i == 0 ? '|' : ',');
+    key += std::to_string(spec_values[i]);
+  }
+  return key;
+}
+
+}  // namespace
+
 VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
-                                                    uint32_t buffer_count, uint32_t push_size) {
+                                                    uint32_t buffer_count, uint32_t push_size,
+                                                    const uint32_t* spec_values,
+                                                    uint32_t spec_count) {
+  const std::string key = PipelineKey(name, spec_values, spec_count);
   auto& cache = *static_cast<std::map<std::string, Pipeline>*>(pipelines_);
-  auto it = cache.find(name);
+  auto it = cache.find(key);
   if (it != cache.end()) {
     // A kernel's binding count and push-constant size are properties of its
     // SPIR-V; a mismatch means the host and the committed shader have drifted,
     // which would corrupt memory rather than fail cleanly.
     VT_CHECK(it->second.buffer_count == buffer_count && it->second.push_size == push_size,
-             "vulkan: pipeline " + name + " re-requested with a different binding layout");
+             "vulkan: pipeline " + key + " re-requested with a different binding layout");
     return it->second;
   }
 
@@ -439,6 +459,17 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   VT_CHECK(module != nullptr,
            "vulkan: no committed SPIR-V for kernel '" + name +
                "' — regenerate with scripts/gen-vulkan-spirv.py");
+
+  // Specialization values are passed POSITIONALLY against the module's declared
+  // SpecIds. Vulkan SILENTLY IGNORES a map entry whose constantID the module does
+  // not declare, so an unchecked host/shader drift is wrong numbers rather than an
+  // error — the same class as the binding-layout check above, and just as fatal.
+  VT_CHECK(spec_count == module->spec_id_count,
+           "vulkan: kernel '" + name + "' declares " +
+               std::to_string(module->spec_id_count) +
+               " specialization constant(s) but " + std::to_string(spec_count) +
+               " value(s) were supplied — host and committed SPIR-V have drifted;"
+               " regenerate with scripts/gen-vulkan-spirv.py");
 
   Pipeline p;
   p.buffer_count = buffer_count;
@@ -481,12 +512,31 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   plci.pPushConstantRanges = &pcr;
   Check(vk.vkCreatePipelineLayout(device, &plci, nullptr, &p.layout), "vkCreatePipelineLayout");
 
+  // One uint32 per constant, tightly packed; entry i carries the module's i-th
+  // declared SpecId (the generator emits them sorted ascending). These two must
+  // OUTLIVE vkCreateComputePipelines below — a temporary whose address is
+  // captured and read later is the use-after-free class this project has already
+  // hit twice with CUDA-graph capture, so they are named locals in this scope,
+  // never a nested block.
+  std::vector<VkSpecializationMapEntry> spec_entries(spec_count);
+  for (uint32_t i = 0; i < spec_count; ++i) {
+    spec_entries[i].constantID = module->spec_ids[i];
+    spec_entries[i].offset = i * static_cast<uint32_t>(sizeof(uint32_t));
+    spec_entries[i].size = sizeof(uint32_t);
+  }
+  VkSpecializationInfo spec_info{};
+  spec_info.mapEntryCount = spec_count;
+  spec_info.pMapEntries = spec_entries.data();
+  spec_info.dataSize = spec_count * sizeof(uint32_t);
+  spec_info.pData = spec_values;
+
   VkComputePipelineCreateInfo cpci{};
   cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   cpci.stage.module = p.module;
   cpci.stage.pName = "main";
+  cpci.stage.pSpecializationInfo = spec_count != 0 ? &spec_info : nullptr;
   cpci.layout = p.layout;
   Check(vk.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &p.pipeline),
         "vkCreateComputePipelines");
@@ -498,12 +548,18 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   dsai.pSetLayouts = &p.set_layout;
   Check(vk.vkAllocateDescriptorSets(device, &dsai, &p.set), "vkAllocateDescriptorSets");
 
-  return cache.emplace(name, p).first->second;
+  return cache.emplace(key, p).first->second;
+}
+
+size_t VulkanContext::PipelineCacheSize() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return static_cast<std::map<std::string, Pipeline>*>(pipelines_)->size();
 }
 
 void VulkanContext::Dispatch(const std::string& name, const void* const* buffers,
                              uint32_t buffer_count, const void* push_constants,
-                             uint32_t push_size, uint32_t group_count_x) {
+                             uint32_t push_size, uint32_t group_count_x,
+                             const uint32_t* spec_values, uint32_t spec_count) {
   if (group_count_x == 0) return;  // nothing to do; an empty dispatch is illegal
   VT_CHECK(group_count_x <= max_workgroup_count_x_,
            "vulkan: dispatch needs " + std::to_string(group_count_x) +
@@ -518,7 +574,7 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   // one command buffer per op (src/vt/metal/metal_ops.mm § DISPATCH MODEL).
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
 
-  Pipeline& p = GetPipeline(name, buffer_count, push_size);
+  Pipeline& p = GetPipeline(name, buffer_count, push_size, spec_values, spec_count);
 
   std::vector<VkDescriptorBufferInfo> infos(buffer_count);
   std::vector<VkWriteDescriptorSet> writes(buffer_count);
