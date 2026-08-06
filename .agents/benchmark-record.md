@@ -14044,3 +14044,78 @@ DiT-activation diff at real geometry — impractical on one GB10 (no quantized
 vllm-omni H3 arm; bf16 is 4xB300). Diagnostics committed on PR #70; latents at
 `dgx:~/h3fp4/diag`. fp4 speed path unchanged/CLOSED. No source/kernel/model/gate
 mark changed (all additions are env-gated diagnostics, byte-identical when off).
+
+## MiniMax-H3 DiT-forward GEOMETRY LADDER — the #70 spatial-mixing hypothesis is REFUTED at reduced dims; the divergence is NOT a reduced-dim-reproducible DiT math bug (2026-08-06, `row/H3-DIT-SCALE-GATE` PR #74, `ROAD-V1-H3`, CPU-only dev box)
+
+**Question (#70 follow-up).** #70 root-caused the H3 render grid to the DiT emitting
+a spatially-WHITE latent at real token geometry (adjacent-cell cosine 0.06 vs 0.789
+for a real encode; VAE/loop/fp4/bf16/attention-kernels all ruled out). The DiT parity
+gate only ran 2x3 spatial tokens (1.6e-7 vs upstream). Hypothesis: a spatial-MIXING
+bug in position/packing/modulation MATH (not weight values) should reproduce with the
+H3Rand random-weight harness at real TOKEN geometry with reduced hidden dims.
+
+**Method (CPU-only, no dgx).** Extended the reduced-dim DiT-forward parity gate
+(`scripts/gen-minimax-h3-goldens.py` :: `emit_dit_ladder`; RefDiT oracle + upstream
+`minimax_h3_packed_sequence`, both from the shared FNV-1a+splitmix64 stream) into a
+GEOMETRY LADDER. Each rung gates, at reduced hidden dims (hidden=64, head_dim=16):
+(1) the upstream packed-sequence layout (cu_seqlens / img_position_ids fp64 grid /
+masks — the 2x3-only packed gate was the same blind spot); (2) the HOST forward
+(`MiniMaxH3DitForward`); (3) the DEVICE-resident forward (`MiniMaxH3DitForwardDevice`,
+CPU backend — the path the real pipeline runs); (4) a spatial-MIXING probe (perturb one
+video-target token, measure the per-output response). New permanent gate case
+`test_minimax_h3.cpp :: "DiT-forward geometry ladder matches upstream (host+device,
+mixing)"`. Goldens regenerate byte-identically against local `~/_git/vllm-omni`.
+
+**Ladder result — ours == upstream oracle at EVERY rung (host AND device):**
+| Rung | latent t×h×w | spatial grid | video tokens | host max\|diff\| | device max\|diff\| | mix fraction | verdict |
+|---|---|---|---|---|---|---|---|
+| 2x3 | 1×4×6 | 2×3 | 12 (6 tgt) | 1.8e-7 | ≤2.4e-7 | 1.0 | PASS |
+| 4x4 | 1×8×8 | 4×4 | 32 (16 tgt) | 1.8e-7 | ≤2.4e-7 | 1.0 | PASS |
+| 6x6 | 1×12×12 | 6×6 | 72 (36 tgt) | 2.1e-7 | ≤2.4e-7 | 1.0 | PASS |
+| **8x8** | 1×16×16 | **8×8** | **128 (64 tgt)** | **2.4e-7** | **≤2.4e-7** | **1.0** | **PASS** |
+| 4x8 | 1×8×16 | 4×8 | 64 (32 tgt) | 1.8e-7 | ≤2.4e-7 | 1.0 | PASS |
+| 8x8t3 | 3×16×16 | 8×8 ×3f | 256 (192 tgt) | 2.4e-7 | ≤2.4e-7 | 1.0 | PASS |
+| 12x20t5 | 5×12×20 | 6×10 ×5f | 360 (300 tgt) | 3.0e-7 | ≤5.4e-7 | 1.0 | PASS |
+
+All ≤ 3e-7 vs the 2e-5 gate. The mixing probe: perturbing ONE video-target token
+changes EVERY other target token's output (fraction 1.0 at all rungs) — the packed
+bidirectional attention (`cu_seqlens = [0, used, seq_len]`, one document) couples all
+video tokens at real geometry, exactly the property #70 found broken in the real run.
+
+**Hidden-dim-scale leg (the other #70 escape hatch).** A second gate case runs the SAME
+geometries at the REAL head_dim=128 / rope_inv_freq_len=16 (rot_dim=96) ratio and
+requires the DEVICE forward to track the trusted HOST loops (no oracle needed).
+Device-vs-host max\|diff\| = 5e-7…1.2e-6 across all 7 rungs — no head_dim- or
+rope-scale assumption in a shared device op. `"DiT device-vs-host forward holds at the
+REAL head_dim=128 ratio"`.
+
+**The metric that does NOT translate (why the ladder can't SHOW #70's symptom).**
+Measured the #70 adjacent-cell COSINE on the CORRECT RefDiT oracle output at reduced
+dims: adj_cos ≈ random-pair cos ≈ 0 at EVERY geometry (2x3 +0.11/−0.03; 8x8
++0.05/−0.01; 8x8t3 +0.02/+0.02). With RANDOM weights the correct reference is ALREADY
+spatially white by the cosine metric — spatial coherence in the real model is a
+TRAINED-WEIGHTS property, not an architecture-math property. So the random-weight
+harness fundamentally cannot reproduce #70's cosine symptom; its valid discriminators
+are oracle-logit equality and information flow (both green), NOT the cosine.
+
+**VERDICT.** The "spatial-mixing bug in the DiT-forward MATH" hypothesis is **REFUTED**
+at reduced dims and real token geometry: our port (host AND device) is byte-exact to the
+oracle at 2x3→8x8→temporal→packed-mix and at the real head_dim=128 ratio, and the
+attention demonstrably mixes all video tokens. The #70 white latent is therefore NOT a
+reduced-dim-reproducible DiT-forward bug; it is a **trained-weights / real-scale**
+phenomenon the harness cannot see. A **GPU re-render is NOT expected to be coherent** on
+the strength of this work — nothing was fixed in the render path; the secondary Gaussian-
+noise fix from #70 stands but was already known not to be the render fix.
+
+**Residuals / where the #70 hunt goes next (both beyond this CPU box):**
+1. **Shared port⇄RefDiT bug vs TRUE upstream.** `vllm`/`cache_dit`/`aenum` are not
+   importable here, so the DiT oracle is the RefDiT *restatement*, not the real
+   `minimax_h3_transformer.py`. A bug shared identically by our port AND RefDiT (a
+   co-mirrored misreading) is invisible to this ladder ("gate on a shared helper =
+   consistency, not correctness"). CLOSE IT on the dgx oracle venv (vllm IS installed):
+   run the real `MiniMaxH3DiTModel` at TP=1 / reduced dims vs RefDiT.
+2. **Real-scale DiT INPUT wiring.** The harness feeds RANDOM prompt-embeds / video rows;
+   the real render feeds the Qwen3-VL encoder embeddings, the real fp64 position grid at
+   full canvas, and the real per-token timestep layout. A real-weights activation diff of
+   the DiT INPUTS (encoder output, position grid, condition-noise) at real geometry is
+   the untested surface #70 did not isolate.

@@ -815,6 +815,212 @@ def emit_dit(out, packed) -> None:
     emit_f64(out, "kH3RandProbe", h3_rand("h3.probe", 8))
 
 
+# ---------------------------------------------------------------------------
+# Section 5b: the DiT-forward GEOMETRY LADDER (the #70 below-one-tile close).
+#
+# The section-5 DiT gate only ever ran ONE geometry: fl2va latent 4x6 (spatial
+# 2x3 = 6 video tokens). PR #70 root-caused the render grid to the DiT emitting a
+# spatially-WHITE latent at REAL token geometry (8x8 = 64 video tokens) while the
+# 2x3 gate matched upstream at 1.6e-7 -- the divergence lives strictly between
+# 2x3 and 8x8. A spatial-MIXING bug is in the position/packing/modulation MATH and
+# the varlen attention span, NOT in weight values, so it must reproduce with the
+# H3Rand random-weight harness at real TOKEN geometry with the SAME reduced hidden
+# dims. This ladder walks the video grid 2x3 -> 4x4 -> 6x6 -> 8x8 (+ a rectangle,
+# a multi-frame temporal 3D grid, and a larger video+audio packed mix) and, at
+# each rung, emits: the upstream packed-sequence layout (so the C++ packed-sequence
+# port is gated at every geometry, not just 2x3), the RefDiT forward logits, and a
+# SPATIAL-MIXING PROBE. The probe perturbs one video-target input token and records
+# the per-output-row response; a correctly-mixing DiT couples every target token
+# through the packed bidirectional attention (response spread ~= 1.0), a white DiT
+# (the #70 symptom) responds only at the perturbed row (spread ~= 0.0). The probe
+# is oracle-INDEPENDENT: it measures the property #70 found broken directly, so it
+# still bites if the RefDiT restatement and the C++ port ever shared a bug.
+# ---------------------------------------------------------------------------
+
+# name, text_len, latent_t, latent_h, latent_w, audio_t, audio_channel, frame_count
+LADDER_RUNGS = [
+    ("2x3", 7, 1, 4, 6, 3, 2, 9),        # baseline spatial grid, single frame
+    ("4x4", 7, 1, 8, 8, 3, 2, 9),
+    ("6x6", 5, 1, 12, 12, 3, 2, 9),
+    ("8x8", 5, 1, 16, 16, 4, 2, 9),      # the real-geometry target (#70)
+    ("4x8", 5, 1, 8, 16, 3, 2, 9),       # a non-square rectangle
+    ("8x8t3", 6, 3, 16, 16, 6, 2, 9),    # multi-frame: the full 3D (t,h,w) grid
+    ("12x20t5", 9, 5, 12, 20, 8, 2, 9),  # larger video+audio packed mix
+]
+
+# A stable, in-word suffix for each rung's C++ identifiers (kH3LadderR0*, ...).
+_LADDER_MIX_EPS = 1e-6
+
+
+def _run_ladder_dit(model, arch, packed, rung_name):
+    """Build the fl2va DiT inputs for one geometry rung and run RefDiT.
+
+    Mirrors emit_dit's input construction EXACTLY (same scatter, same timestep
+    layout, same refiner cu) but parameterised by the rung's packed sequence and
+    given rung-distinct H3Rand names so each rung's random rows are independent
+    and reproducible on the C++ side.
+    """
+    seq_len = int(packed["seq_len"])
+    img_pos = packed["img_pos"].to(torch.long)
+    audio_pos = packed["audio_pos"].to(torch.long)
+    text_pos = packed["text_pos"].to(torch.long)
+    token_tags = packed["token_tags"].to(torch.long)
+    update_mask = packed["update_mask"].to(torch.bool)
+    cu_seqlens = packed["cu_seqlens"].to(torch.int64)
+    img_position_ids = packed["img_position_ids"].to(torch.float32)[None]
+
+    video_width = arch["latents_dim"] * int(np.prod(arch["patch_size"]))
+    x = torch.zeros(1, seq_len, video_width, dtype=torch.float32)
+    x[0].index_copy_(
+        0,
+        img_pos,
+        torch.from_numpy(
+            h3_rand(f"ladder.{rung_name}.video_rows", img_pos.shape[0] * video_width).astype(np.float32)
+        ).reshape(img_pos.shape[0], video_width),
+    )
+    audio_x = torch.zeros(1, seq_len, arch["audio_latents_dim"], dtype=torch.float32)
+    if audio_pos.shape[0] > 0:
+        audio_x[0].index_copy_(
+            0,
+            audio_pos,
+            torch.from_numpy(
+                h3_rand(f"ladder.{rung_name}.audio_rows",
+                        audio_pos.shape[0] * arch["audio_latents_dim"]).astype(np.float32)
+            ).reshape(audio_pos.shape[0], arch["audio_latents_dim"]),
+        )
+    prompt_embeds = torch.from_numpy(
+        h3_rand(f"ladder.{rung_name}.prompt_embeds", text_pos.shape[0] * arch["text_dim"]).astype(np.float32)
+    ).reshape(text_pos.shape[0], arch["text_dim"])
+
+    t_video, t_audio, cond_t = 0.4, 0.35, 0.999
+    timesteps = torch.full((seq_len,), t_video, dtype=torch.float32)
+    timesteps[img_pos[update_mask]] = t_video
+    timesteps[img_pos[~update_mask]] = cond_t
+    if audio_pos.shape[0] > 0:
+        timesteps[audio_pos] = t_audio
+    unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
+    refiner_cu = torch.tensor([0, text_pos.shape[0], text_pos.shape[0]], dtype=torch.int64)
+
+    def forward(x_in):
+        return model(
+            x=x_in,
+            audio_x=audio_x,
+            img_position_ids=img_position_ids,
+            unique_timesteps=unique_timesteps,
+            inverse_indices=inverse_indices,
+            update_mask=update_mask,
+            token_tags=token_tags,
+            prompt_embeds=prompt_embeds,
+            img_pos=img_pos,
+            audio_pos=audio_pos,
+            text_pos=text_pos,
+            infer_out_pos=img_pos,
+            cu_seqlens=cu_seqlens,
+            refiner_cu_seqlens=refiner_cu,
+        )
+
+    video_logits, audio_logits = forward(x)
+
+    # --- spatial-mixing probe (oracle-independent) ---
+    # Perturb the FIRST video-TARGET token (update_mask True; cond rows are zeroed
+    # by the update mask so their output never responds) and measure the per-output
+    # -row response. A mixing DiT couples every target token via the packed
+    # bidirectional attention; a white DiT responds only at the perturbed row.
+    target_local = [r for r in range(img_pos.shape[0]) if bool(update_mask[r])]
+    first_target = target_local[0]
+    x_pert = x.clone()
+    x_pert[0, int(img_pos[first_target]), :] += 1.0
+    video_pert, _ = forward(x_pert)
+    delta = (video_pert - video_logits).abs().amax(dim=-1)  # [num_img]
+    other_targets = [r for r in target_local if r != first_target]
+    if other_targets:
+        responded = sum(1 for r in other_targets if float(delta[r]) > _LADDER_MIX_EPS)
+        mix_fraction = responded / len(other_targets)
+    else:
+        mix_fraction = -1.0  # single-token grid: mixing is undefined
+
+    return dict(
+        seq_len=seq_len,
+        img_pos=img_pos,
+        audio_pos=audio_pos,
+        text_pos=text_pos,
+        update_mask=update_mask,
+        token_tags=token_tags,
+        cu_seqlens=cu_seqlens,
+        img_position_ids=packed["img_position_ids"],
+        unique_timesteps=unique_timesteps,
+        inverse_indices=inverse_indices,
+        video_logits=video_logits,
+        audio_logits=audio_logits,
+        video_width=video_width,
+        first_target=first_target,
+        mix_delta=delta,
+        mix_fraction=mix_fraction,
+    )
+
+
+def emit_dit_ladder(out, packed_sequence) -> None:
+    out.write("// --- section 5b: DiT-forward GEOMETRY LADDER (#70 spatial-mixing close) ---\n")
+    torch.manual_seed(0)
+    arch = ARCH
+    model = RefDiT(arch)
+
+    emit_scalar(out, "kH3LadderRungs", len(LADDER_RUNGS))
+    out.write("#define H3_LADDER_FOR_EACH(X) " + " ".join(f"X({i})" for i in range(len(LADDER_RUNGS))) + "\n\n")
+
+    for index, (name, text_len, latent_t, latent_h, latent_w, audio_t, audio_channel, frame_count) in enumerate(
+        LADDER_RUNGS
+    ):
+        packed = packed_sequence.minimax_h3_packed_sequence(
+            text_len=text_len,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            audio_t=audio_t,
+            audio_channel=audio_channel,
+            include_keyframe_cond=True,
+            keyframe_frame_indices=(0,),
+            frame_count=frame_count,
+        )
+        r = _run_ladder_dit(model, arch, packed, name)
+        p = f"kH3LadderR{index}"
+
+        out.write(f"// rung {index}: {name} (latent {latent_t}x{latent_h}x{latent_w}, "
+                  f"spatial {latent_h // 2}x{latent_w // 2}, audio_t {audio_t})\n")
+        out.write(f'inline constexpr char {p}_name[] = "{name}";\n')
+        emit_scalar(out, f"{p}_text_len", text_len)
+        emit_scalar(out, f"{p}_latent_t", latent_t)
+        emit_scalar(out, f"{p}_latent_h", latent_h)
+        emit_scalar(out, f"{p}_latent_w", latent_w)
+        emit_scalar(out, f"{p}_audio_t", audio_t)
+        emit_scalar(out, f"{p}_audio_channel", audio_channel)
+        emit_scalar(out, f"{p}_frame_count", frame_count)
+        emit_scalar(out, f"{p}_seq_len", r["seq_len"])
+        emit_scalar(out, f"{p}_num_img", int(r["img_pos"].shape[0]))
+        emit_scalar(out, f"{p}_num_audio", int(r["audio_pos"].shape[0]))
+        emit_scalar(out, f"{p}_num_text", int(r["text_pos"].shape[0]))
+        emit_scalar(out, f"{p}_num_unique", int(r["unique_timesteps"].shape[0]))
+        emit_scalar(out, f"{p}_video_width", int(r["video_width"]))
+        emit_scalar(out, f"{p}_first_target", int(r["first_target"]))
+        out.write("\n")
+        # Upstream packed-sequence layout: gates BuildMiniMaxH3PackedSequence at
+        # this geometry (the 2x3-only packed gate is the same blind spot).
+        emit_i64(out, f"{p}CuSeqlens", r["cu_seqlens"])
+        emit_i64(out, f"{p}ImgPos", r["img_pos"])
+        emit_i64(out, f"{p}AudioPos", r["audio_pos"])
+        emit_i64(out, f"{p}TextPos", r["text_pos"])
+        emit_i64(out, f"{p}UpdateMask", r["update_mask"].to(torch.int64))
+        emit_i64(out, f"{p}TokenTags", r["token_tags"])
+        emit_f64(out, f"{p}ImgPositionIds", r["img_position_ids"])
+        emit_f32(out, f"{p}UniqueTimesteps", r["unique_timesteps"])
+        emit_i64(out, f"{p}InverseIndices", r["inverse_indices"])
+        # RefDiT forward + the spatial-mixing probe.
+        emit_f32(out, f"{p}VideoLogits", r["video_logits"])
+        emit_f32(out, f"{p}AudioLogits", r["audio_logits"])
+        emit_f32(out, f"{p}VideoMixDelta", r["mix_delta"])
+        emit_f64(out, f"{p}MixFraction", [r["mix_fraction"]])
+
+
 def emit_condition_noise(out, condition_noise, packed_tokens) -> None:
     """Section 7: condition-noise augmentation (condition_noise.py, VERBATIM).
 
@@ -1142,6 +1348,7 @@ def main() -> int:
         emit_packing(out, packed_tokens)
         emit_scheduler(out, scheduling)
         emit_dit(out, packed)
+        emit_dit_ladder(out, packed_sequence)
         emit_planner(out, time_request)
         emit_condition_noise(out, condition_noise, packed_tokens)
         emit_reference_video(out)

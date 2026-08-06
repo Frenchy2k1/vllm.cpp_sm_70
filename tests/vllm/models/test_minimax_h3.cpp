@@ -217,9 +217,9 @@ void BuildBlock(GoldenWeights& w, const std::string& prefix, bool with_adaln) {
   }
 }
 
-std::unique_ptr<GoldenWeights> BuildGoldenWeights() {
+std::unique_ptr<GoldenWeights> BuildGoldenWeights(const MiniMaxH3DitParams& params) {
   auto w = std::make_unique<GoldenWeights>();
-  w->params = GoldenParams();
+  w->params = params;
   const MiniMaxH3DitParams& p = w->params;
   const int64_t h = p.hidden_size;
   const int64_t video_width = p.video_row_width();
@@ -279,6 +279,31 @@ std::unique_ptr<GoldenWeights> BuildGoldenWeights() {
              p.audio_latents_dim, h);
   w->views.audio_out_b = View1D(w->Add("final_layer.audio_out.bias", p.audio_latents_dim, 0.02));
   return w;
+}
+
+// The section-5 reduced arch, kept as the default so every existing caller is
+// unchanged.
+std::unique_ptr<GoldenWeights> BuildGoldenWeights() { return BuildGoldenWeights(GoldenParams()); }
+
+// A REAL-RATIO arch: the section-5 reduced dims keep hidden=64 / head_dim=16 /
+// rope_inv_freq_len=2, none of which exercises the real checkpoint's head_dim=128
+// (rot_dim=96) or its wide hidden state. #70's white latent is a real-scale
+// phenomenon, so the ladder's device-vs-host diff must also run at the REAL head
+// geometry, where a head_dim- or rope-scale assumption in a shared device op would
+// make the device-resident forward diverge from the trusted host loops. Inputs
+// (video_width=32, text_dim, audio_latents_dim) are held identical to the reduced
+// arch so the same ladder cases feed both; only the internal widths grow.
+MiniMaxH3DitParams RealRatioParams() {
+  MiniMaxH3DitParams p = GoldenParams();
+  p.hidden_size = 256;
+  p.num_attention_heads = 2;
+  p.attention_head_dim = 128;  // the real checkpoint's head_dim
+  p.ffn_hidden_size = 512;
+  p.time_embed_hidden_size = 128;
+  p.rope_inv_freq_len = 16;  // rot_dim = 96 <= 128, the real ratio
+  p.adaln_out_features = 18 * p.hidden_size;
+  p.final_adaln_out_features = 2 * p.hidden_size;
+  return p;
 }
 
 // The fl2va DiT forward case: the packed sequence, the scattered video/audio rows
@@ -615,6 +640,297 @@ TEST_CASE("minimax_h3: DiT forward matches upstream at reduced dimensions") {
     for (int64_t i = 0; i < c->video_width; ++i) {
       CHECK(got.video_logits[static_cast<size_t>(r * c->video_width + i)] == 0.0f);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Section 5b: the DiT-forward GEOMETRY LADDER (the #70 below-one-tile close).
+//
+// The section-5 DiT gate ran ONE geometry: fl2va latent 4x6 (spatial 2x3 = 6
+// video tokens). PR #70 root-caused the render grid to the DiT emitting a
+// spatially-WHITE latent at REAL token geometry (8x8 = 64 tokens) while the 2x3
+// gate matched upstream at 1.6e-7; the divergence lives strictly between 2x3 and
+// 8x8. A spatial-mixing bug is in the position/packing/modulation MATH and the
+// varlen attention span, NOT in weight values, so it must reproduce with the
+// H3Rand random-weight harness at real TOKEN geometry with the SAME reduced
+// hidden dims. This ladder (minimax_h3_goldens.inc :: kH3LadderR*) walks the
+// video grid 2x3 -> 4x4 -> 6x6 -> 8x8 (+ a rectangle, a multi-frame temporal 3D
+// grid, and a larger video+audio packed mix) and, at each rung, gates: (1) the
+// packed-sequence layout at that geometry (the 2x3-only packed gate is the same
+// blind spot); (2) the HOST forward AND (3) the DEVICE-resident forward (the one
+// the real pipeline runs) against the RefDiT oracle; and (4) a SPATIAL-MIXING
+// probe -- perturb one video-target token, confirm the per-output response
+// matches the oracle byte-for-byte AND that the reduced-dim DiT actually couples
+// every target token through the packed bidirectional attention (the property
+// #70 found broken). NOTE: the #70 adjacent-cell-COSINE metric does NOT translate
+// here -- with random weights the CORRECT reference is already spatially white by
+// that metric (spatial coherence is a TRAINED-weights property); so the ladder's
+// valid discriminators are oracle-logit equality and information flow, not the
+// cosine. See .agents/specs/minimax-h3.md section 8.4.
+namespace {
+
+struct LadderGoldens {
+  const char* name;
+  int64_t text_len, latent_t, latent_h, latent_w, audio_t, audio_channel, frame_count;
+  int64_t seq_len, num_img, num_audio, num_text, num_unique, video_width, first_target;
+  const int64_t* cu_seqlens;      size_t n_cu;
+  const int64_t* img_pos;         size_t n_img;
+  const int64_t* audio_pos;       size_t n_audio;
+  const int64_t* text_pos;        size_t n_text;
+  const int64_t* update_mask;     size_t n_um;
+  const int64_t* token_tags;      size_t n_tags;
+  const double*  img_position_ids; size_t n_pos;
+  const float*   unique_ts;       size_t n_uts;
+  const int64_t* inverse;         size_t n_inv;
+  const float*   video_logits;    size_t n_vl;
+  const float*   audio_logits;    size_t n_al;
+  const float*   mix_delta;       size_t n_md;
+  double         mix_fraction;
+};
+
+#define VT_H3_LADDER_RUNG(i)                                                        \
+  LadderGoldens {                                                                   \
+    vllm_test::kH3LadderR##i##_name, vllm_test::kH3LadderR##i##_text_len,           \
+    vllm_test::kH3LadderR##i##_latent_t, vllm_test::kH3LadderR##i##_latent_h,       \
+    vllm_test::kH3LadderR##i##_latent_w, vllm_test::kH3LadderR##i##_audio_t,        \
+    vllm_test::kH3LadderR##i##_audio_channel, vllm_test::kH3LadderR##i##_frame_count,\
+    vllm_test::kH3LadderR##i##_seq_len, vllm_test::kH3LadderR##i##_num_img,         \
+    vllm_test::kH3LadderR##i##_num_audio, vllm_test::kH3LadderR##i##_num_text,      \
+    vllm_test::kH3LadderR##i##_num_unique, vllm_test::kH3LadderR##i##_video_width,  \
+    vllm_test::kH3LadderR##i##_first_target,                                        \
+    vllm_test::kH3LadderR##i##CuSeqlens, std::size(vllm_test::kH3LadderR##i##CuSeqlens),        \
+    vllm_test::kH3LadderR##i##ImgPos, std::size(vllm_test::kH3LadderR##i##ImgPos),              \
+    vllm_test::kH3LadderR##i##AudioPos, std::size(vllm_test::kH3LadderR##i##AudioPos),          \
+    vllm_test::kH3LadderR##i##TextPos, std::size(vllm_test::kH3LadderR##i##TextPos),            \
+    vllm_test::kH3LadderR##i##UpdateMask, std::size(vllm_test::kH3LadderR##i##UpdateMask),      \
+    vllm_test::kH3LadderR##i##TokenTags, std::size(vllm_test::kH3LadderR##i##TokenTags),        \
+    vllm_test::kH3LadderR##i##ImgPositionIds, std::size(vllm_test::kH3LadderR##i##ImgPositionIds),\
+    vllm_test::kH3LadderR##i##UniqueTimesteps, std::size(vllm_test::kH3LadderR##i##UniqueTimesteps),\
+    vllm_test::kH3LadderR##i##InverseIndices, std::size(vllm_test::kH3LadderR##i##InverseIndices),  \
+    vllm_test::kH3LadderR##i##VideoLogits, std::size(vllm_test::kH3LadderR##i##VideoLogits),    \
+    vllm_test::kH3LadderR##i##AudioLogits, std::size(vllm_test::kH3LadderR##i##AudioLogits),    \
+    vllm_test::kH3LadderR##i##VideoMixDelta, std::size(vllm_test::kH3LadderR##i##VideoMixDelta),\
+    vllm_test::kH3LadderR##i##MixFraction[0]                                        \
+  }
+
+std::vector<LadderGoldens> AllLadderRungs() {
+  std::vector<LadderGoldens> rungs;
+#define X(i) rungs.push_back(VT_H3_LADDER_RUNG(i));
+  H3_LADDER_FOR_EACH(X)
+#undef X
+  return rungs;
+}
+
+// The ladder analogue of DitForwardCase, parameterised by one rung's geometry.
+// Owns every buffer the returned MiniMaxH3DitInputs points at.
+struct LadderCase {
+  MiniMaxH3PackedSequence packed;
+  std::vector<float> x, audio_x, prompt_embeds;
+  std::vector<float> unique_timesteps;
+  std::vector<int64_t> inverse;
+  std::vector<int32_t> refiner_cu;
+  int64_t seq_len = 0, num_img = 0, num_audio = 0, num_text = 0, video_width = 0;
+  MiniMaxH3DitInputs in;
+};
+
+std::unique_ptr<LadderCase> BuildLadderCase(const MiniMaxH3DitParams& p,
+                                            const LadderGoldens& g) {
+  auto c = std::make_unique<LadderCase>();
+  c->packed = BuildMiniMaxH3PackedSequence(g.text_len, g.latent_t, g.latent_h, g.latent_w,
+                                           g.audio_t, g.audio_channel,
+                                           /*include_keyframe_cond=*/true, {0}, g.frame_count);
+  c->seq_len = c->packed.seq_len;
+  c->video_width = p.video_row_width();
+  c->num_img = static_cast<int64_t>(c->packed.img_pos.size());
+  c->num_audio = static_cast<int64_t>(c->packed.audio_pos.size());
+  c->num_text = static_cast<int64_t>(c->packed.text_pos.size());
+
+  // The generator seeded each rung's random rows as "ladder.<name>.<field>".
+  const std::string base = std::string("ladder.") + g.name;
+  c->x.assign(static_cast<size_t>(c->seq_len * c->video_width), 0.0f);
+  const std::vector<float> video_rows =
+      MakeParam(base + ".video_rows", c->num_img * c->video_width, 1.0);
+  for (int64_t r = 0; r < c->num_img; ++r) {
+    std::memcpy(c->x.data() + c->packed.img_pos[static_cast<size_t>(r)] * c->video_width,
+                video_rows.data() + r * c->video_width,
+                static_cast<size_t>(c->video_width) * sizeof(float));
+  }
+  c->audio_x.assign(static_cast<size_t>(c->seq_len * p.audio_latents_dim), 0.0f);
+  if (c->num_audio > 0) {
+    const std::vector<float> audio_rows =
+        MakeParam(base + ".audio_rows", c->num_audio * p.audio_latents_dim, 1.0);
+    for (int64_t r = 0; r < c->num_audio; ++r) {
+      std::memcpy(
+          c->audio_x.data() + c->packed.audio_pos[static_cast<size_t>(r)] * p.audio_latents_dim,
+          audio_rows.data() + r * p.audio_latents_dim,
+          static_cast<size_t>(p.audio_latents_dim) * sizeof(float));
+    }
+  }
+  c->prompt_embeds = MakeParam(base + ".prompt_embeds", c->num_text * p.text_dim, 1.0);
+  c->unique_timesteps.assign(g.unique_ts, g.unique_ts + g.n_uts);
+  c->inverse.assign(g.inverse, g.inverse + g.n_inv);
+  c->refiner_cu = {0, static_cast<int32_t>(c->num_text), static_cast<int32_t>(c->num_text)};
+
+  MiniMaxH3DitInputs& in = c->in;
+  in.seq_len = c->seq_len;
+  in.x = c->x.data();
+  in.audio_x = c->audio_x.data();
+  in.img_position_ids = c->packed.img_position_ids.data();
+  in.unique_timesteps = c->unique_timesteps.data();
+  in.num_unique_timesteps = static_cast<int64_t>(c->unique_timesteps.size());
+  in.inverse_indices = c->inverse.data();
+  in.token_tags = c->packed.token_tags.data();
+  in.prompt_embeds = c->prompt_embeds.data();
+  in.img_pos = c->packed.img_pos.data();
+  in.num_img_pos = c->num_img;
+  in.audio_pos = c->packed.audio_pos.data();
+  in.num_audio_pos = c->num_audio;
+  in.text_pos = c->packed.text_pos.data();
+  in.num_text_pos = c->num_text;
+  in.infer_out_pos = c->packed.img_pos.data();
+  in.num_infer_out_pos = c->num_img;
+  in.update_mask = c->packed.update_mask.data();
+  in.cu_seqlens = c->packed.cu_seqlens.data();
+  in.num_cu_seqlens = static_cast<int64_t>(c->packed.cu_seqlens.size());
+  in.refiner_cu_seqlens = c->refiner_cu.data();
+  in.num_refiner_cu_seqlens = static_cast<int64_t>(c->refiner_cu.size());
+  return c;
+}
+
+// The mixing threshold; well above the 2e-5 logit tolerance so summation-order
+// noise can never flip a "no response" into a spurious "response".
+constexpr double kLadderMixEps = 1e-6;
+
+}  // namespace
+
+// The whole ladder in one case: layout + host forward + device forward + spatial
+// mixing, at every geometry rung. This is the permanent below-one-tile gate.
+TEST_CASE("minimax_h3: DiT-forward geometry ladder matches upstream (host+device, mixing)") {
+  const std::unique_ptr<GoldenWeights> weights = BuildGoldenWeights();
+  const MiniMaxH3DitParams& p = weights->params;
+  vt::Queue q{Cpu(), nullptr};
+  const MiniMaxH3DitDeviceWeights staged = StageMiniMaxH3DitWeights(q, p, weights->views);
+
+  REQUIRE(static_cast<int64_t>(AllLadderRungs().size()) == vllm_test::kH3LadderRungs);
+  for (const LadderGoldens& g : AllLadderRungs()) {
+    const std::string rung = g.name;
+    CAPTURE(rung);
+
+    // (1) The packed-sequence LAYOUT at this geometry: the 2x3-only packed gate is
+    // the same blind spot, so gate cu_seqlens / positions / masks here too.
+    const std::unique_ptr<LadderCase> c = BuildLadderCase(p, g);
+    REQUIRE(c->packed.seq_len == g.seq_len);
+    REQUIRE(c->num_img == g.num_img);
+    REQUIRE(c->num_audio == g.num_audio);
+    CheckI64(c->packed.cu_seqlens, g.cu_seqlens, g.n_cu);
+    CheckI64(c->packed.img_pos, g.img_pos, g.n_img);
+    CheckI64(c->packed.audio_pos, g.audio_pos, g.n_audio);
+    CheckI64(c->packed.text_pos, g.text_pos, g.n_text);
+    CheckI64(c->packed.update_mask, g.update_mask, g.n_um);
+    CheckI64(c->packed.token_tags, g.token_tags, g.n_tags);
+    // The FP64 position grid feeds RoPE directly; gate it BIT-EXACT at every grid.
+    REQUIRE(c->packed.img_position_ids.size() == g.n_pos);
+    for (size_t i = 0; i < g.n_pos; ++i) {
+      CHECK(c->packed.img_position_ids[i] == g.img_position_ids[i]);
+    }
+
+    // (2) HOST forward vs the RefDiT oracle.
+    const MiniMaxH3DitOutputs host =
+        MiniMaxH3DitForward(Cpu(), p, weights->views, c->in, vt::DType::kF32);
+    const double hv = MaxAbsDiff(host.video_logits, g.video_logits, host.video_logits.size());
+    const double ha = MaxAbsDiff(host.audio_logits, g.audio_logits, host.audio_logits.size());
+    INFO("host: video max|diff| = " << hv << ", audio max|diff| = " << ha);
+    CHECK(hv <= 2e-5);
+    CHECK(ha <= 2e-5);
+
+    // (3) DEVICE-resident forward vs the same oracle (the pipeline's own path).
+    const MiniMaxH3DitOutputs dev =
+        MiniMaxH3DitForwardDevice(q, p, staged.weights, c->in, vt::DType::kF32);
+    const double dv = MaxAbsDiff(dev.video_logits, g.video_logits, dev.video_logits.size());
+    const double da = MaxAbsDiff(dev.audio_logits, g.audio_logits, dev.audio_logits.size());
+    INFO("device: video max|diff| = " << dv << ", audio max|diff| = " << da);
+    CHECK(dv <= 2e-5);
+    CHECK(da <= 2e-5);
+
+    // The pinned keyframe (cond) rows must be zeroed by the update mask.
+    for (int64_t r = 0; r < c->num_img; ++r) {
+      if (c->packed.update_mask[static_cast<size_t>(r)]) continue;
+      for (int64_t i = 0; i < c->video_width; ++i) {
+        CHECK(host.video_logits[static_cast<size_t>(r * c->video_width + i)] == 0.0f);
+      }
+    }
+
+    // (4) SPATIAL-MIXING probe: perturb one video-target token's input, measure the
+    // per-output-row response, and require it to match the oracle AND to show that
+    // every target token couples through the packed bidirectional attention.
+    const std::unique_ptr<LadderCase> cp = BuildLadderCase(p, g);
+    const int64_t pert_pos = cp->packed.img_pos[static_cast<size_t>(g.first_target)];
+    for (int64_t i = 0; i < c->video_width; ++i) {
+      cp->x[static_cast<size_t>(pert_pos * c->video_width + i)] += 1.0f;
+    }
+    const MiniMaxH3DitOutputs pert =
+        MiniMaxH3DitForward(Cpu(), p, weights->views, cp->in, vt::DType::kF32);
+    std::vector<float> delta(static_cast<size_t>(c->num_img), 0.0f);
+    for (int64_t r = 0; r < c->num_img; ++r) {
+      float worst = 0.0f;
+      for (int64_t i = 0; i < c->video_width; ++i) {
+        const size_t idx = static_cast<size_t>(r * c->video_width + i);
+        worst = std::max(worst, std::abs(pert.video_logits[idx] - host.video_logits[idx]));
+      }
+      delta[static_cast<size_t>(r)] = worst;
+    }
+    // The response vector must match the oracle's byte-for-byte (to logit tol).
+    CHECK(MaxAbsDiff(delta, g.mix_delta, delta.size()) <= 2e-5);
+    // Fraction of OTHER video-target rows that responded to the perturbation.
+    int64_t responded = 0, others = 0;
+    for (int64_t r = 0; r < c->num_img; ++r) {
+      if (!c->packed.update_mask[static_cast<size_t>(r)]) continue;  // cond rows are zeroed
+      if (r == g.first_target) continue;
+      ++others;
+      if (delta[static_cast<size_t>(r)] > kLadderMixEps) ++responded;
+    }
+    const double frac = others > 0 ? static_cast<double>(responded) / static_cast<double>(others)
+                                   : -1.0;
+    INFO("mix fraction port=" << frac << " oracle=" << g.mix_fraction);
+    CHECK(frac == doctest::Approx(g.mix_fraction).epsilon(1e-9));
+    // The reduced-dim DiT MUST spatially couple all target tokens at real geometry
+    // (this is exactly the property #70 found broken). If a rung ever drops below
+    // full coupling, the spatial mixer regressed.
+    if (others > 0) CHECK(g.mix_fraction >= 0.999);
+  }
+}
+
+// The hidden-dim-scale leg of the ladder: run the SAME geometries at the REAL
+// head_dim=128 / rope_inv_freq_len=16 ratio and require the DEVICE-resident
+// forward to still match the trusted HOST loops. The reduced arch never exercises
+// head_dim=128 or rot_dim=96, so a head_dim- or rope-scale assumption in a shared
+// device op (attention tile, RoPE cache) would slip past the section-5b ladder but
+// surface here -- exactly the "scale-dependent in hidden dims" escape hatch #70
+// leaves open. No oracle is needed: the host forward is the reference the reduced
+// ladder already proved correct, and this asks only whether the device path tracks
+// it at real head geometry.
+TEST_CASE("minimax_h3: DiT device-vs-host forward holds at the REAL head_dim=128 ratio") {
+  const MiniMaxH3DitParams p = RealRatioParams();
+  const std::unique_ptr<GoldenWeights> weights = BuildGoldenWeights(p);
+  vt::Queue q{Cpu(), nullptr};
+  const MiniMaxH3DitDeviceWeights staged = StageMiniMaxH3DitWeights(q, p, weights->views);
+
+  for (const LadderGoldens& g : AllLadderRungs()) {
+    const std::string rung = g.name;
+    CAPTURE(rung);
+    // Geometry only from the rung; the arch is the real-ratio one above.
+    const std::unique_ptr<LadderCase> c = BuildLadderCase(p, g);
+    const MiniMaxH3DitOutputs host =
+        MiniMaxH3DitForward(Cpu(), p, weights->views, c->in, vt::DType::kF32);
+    const MiniMaxH3DitOutputs dev =
+        MiniMaxH3DitForwardDevice(q, p, staged.weights, c->in, vt::DType::kF32);
+    const double dv = MaxAbsDiff(dev.video_logits, host.video_logits.data(), host.video_logits.size());
+    const double da = MaxAbsDiff(dev.audio_logits, host.audio_logits.data(), host.audio_logits.size());
+    INFO("real-ratio device-vs-host: video max|diff| = " << dv << ", audio max|diff| = " << da);
+    // f32 summation-order slack only; a structural head_dim/rope regression would be
+    // orders of magnitude larger.
+    CHECK(dv <= 1e-3);
+    CHECK(da <= 1e-3);
   }
 }
 
