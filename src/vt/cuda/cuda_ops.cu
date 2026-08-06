@@ -44,6 +44,40 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);  // round-to-nearest-even, same as host F32ToBF16
 }
 
+// VECTOR load of N CONSECUTIVE elements into f32, for the attention inner loops.
+// N is a compile-time width, so N==4/2 collapse to one LDG.128/LDG.64 (f32) or
+// LDG.64/LDG.32 (bf16) instead of N separate scalar loads. Callers guarantee the
+// element offset is a multiple of N, which is what makes the wide load legal.
+template <int N>
+__device__ inline void LoadVec(const float* p, int64_t i, float* o) {
+  if (N == 4) {
+    const float4 v = *reinterpret_cast<const float4*>(p + i);
+    o[0] = v.x; o[1] = v.y; o[2] = v.z; o[3] = v.w;
+  } else if (N == 2) {
+    const float2 v = *reinterpret_cast<const float2*>(p + i);
+    o[0] = v.x; o[1] = v.y;
+  } else {
+#pragma unroll
+    for (int c = 0; c < N; ++c) o[c] = p[i + c];
+  }
+}
+template <int N>
+__device__ inline void LoadVec(const __nv_bfloat16* p, int64_t i, float* o) {
+  if (N == 4) {
+    const uint2 raw = *reinterpret_cast<const uint2*>(p + i);
+    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
+    const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
+    o[0] = a.x; o[1] = a.y; o[2] = b.x; o[3] = b.y;
+  } else if (N == 2) {
+    const unsigned raw = *reinterpret_cast<const unsigned*>(p + i);
+    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw));
+    o[0] = a.x; o[1] = a.y;
+  } else {
+#pragma unroll
+    for (int c = 0; c < N; ++c) o[c] = __bfloat162float(p[i + c]);
+  }
+}
+
 // Round-trip a f32 value through the residual store dtype so the variance below
 // squares the SAME rounded value that gets written back to the residual stream —
 // mirrors vLLM fused_add_rms_norm, whose bf16 residual add (`z += residual`) rounds
@@ -1583,6 +1617,1007 @@ __global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Ti
   for (int64_t e = threadIdx.x; e < d; e += blockDim.x) Store(out, qoff + e, acc[e] * inv);
 }
 
+// WARP-PER-QUERY fast path for the common head_dim (a multiple of the warp width).
+//
+// The general kernel above spends one block per query row and walks keys ONE AT A
+// TIME, doing a shared-memory tree reduction plus ~11 __syncthreads() PER KEY. At
+// seq 3264 that is ~36k barriers per query row, and Q is re-read from global for
+// every key — measured ~36 GFLOP/s, which made attention dominate everything at
+// realistic sequence lengths.
+//
+// Here ONE WARP owns a query row: Q and the output accumulator live in REGISTERS
+// (d/32 each per lane), the dot product is a warp shuffle reduction, and the online
+// softmax runs inside the warp. No __syncthreads at all, and Q is read once.
+//
+// The arithmetic is deliberately IDENTICAL to the general kernel — same sequential
+// key order, same online-softmax recurrence (m/corr/p/l), same f32 accumulation — so
+// this is a scheduling change, not a numerics change.
+// Q-BLOCKED warp attention: one warp carries kQ queries at once.
+//
+// *** MEASURED NEGATIVE ON sm_110 AND DELIBERATELY NOT DISPATCHED. Do not wire
+// *** this up again on this hardware without re-reading the numbers below.
+//
+// The idea: the one-query-per-warp kernel re-reads every K and V row for EVERY
+// query, so global traffic is O(seq^2 * d) per head -- ~341 TB per step at H3's
+// default canvas (seq 15424, 56 heads, 50 layers, d 64) against Thor's 273 GB/s.
+// Holding kQ queries per warp loads each K/V row ONCE and reuses it kQ times.
+//
+// It was dispatched, gated (all five DFlash/attention suites green at kQ 4 and 8,
+// with a RED proof that the kernel really produced the output) and MEASURED on the
+// real H3 denoise loop, 2 paired reps per arm, order reversed between reps:
+//
+//   864x480/124f, seq 15424:  per-query 557.80 s   kQ=4 553.14 s (-0.84%)   kQ=8 765.57 s (+37%)
+//   512x512/33f,  seq  3264:  per-query  28.04 s   kQ=4  28.98 s (+3.3%)    kQ=8  36.33 s (+30%)
+//
+// So the premise is WRONG here, and the reason is the same one that killed the
+// shared-memory tiling attempt: the K/V re-reads were never coming from HBM. One
+// head's K+V at seq 15424 is 15424*64*2*2 B = 3.9 MB against Thor's 32 MB L2, and
+// every warp on a given blockIdx.y streams the SAME rows, so the traffic this
+// kernel removes was already L2-resident and nearly free. What it does NOT remove
+// is the per-key warp-shuffle reduction -- it still performs kQ of them per K row
+// loaded, i.e. exactly as many in total as before. It only adds cost: registers go
+// 64 -> 108 (kQ 4 -> 8) at kPerLane 2, which cuts occupancy, and the kQ online-
+// softmax updates per key form a serial expf dependency chain, which is why kQ=8
+// is far worse than kQ=4 rather than twice as good.
+//
+// Kept as source (it compiles to nothing while uninstantiated) because the
+// conclusion is HARDWARE-SPECIFIC: on a part with a small L2 relative to one head's
+// K/V the arithmetic could flip. Full disposition in docs/BENCHMARKS.md.
+//
+// Deliberately uses NO SHARED MEMORY. A previous attempt staged K/V tiles in
+// shared and measured 23% SLOWER: 32 KB per block against Thor's 48 KB/block limit
+// allowed ~one block per SM and occupancy collapsed. Registers cost nothing here --
+// kQ * kPerLane accumulators plus the same for Q, which fits comfortably.
+//
+// Per-query key ranges are computed up front, so causal, sliding-window and
+// multi-request layouts all work: the mask is warp-UNIFORM for each query (j, qs,
+// qe and ii are all warp-wide), so the skip costs no divergence.
+//
+// Arithmetic is unchanged -- same sequential key order, same online-softmax
+// recurrence, same f32 accumulation -- so this is a scheduling change.
+template <typename Tin, typename Tout, int kPerLane, int kQ>
+__global__ void DFlashAttnQBlockKernel(Tout* out, const Tin* query, const Tin* key,
+                                       const Tin* value, const int32_t* cu, int num_reqs,
+                                       int64_t rows, int64_t hq, int64_t hk, int64_t d,
+                                       float scale, bool causal, int64_t window) {
+  const int lane = threadIdx.x & 31;
+  const int64_t wid =
+      (static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5)) + (threadIdx.x >> 5);
+  const int64_t i0 = wid * kQ;
+  if (i0 >= rows) return;
+  const int64_t h = blockIdx.y;
+  const int64_t g = h / (hq / hk);
+
+  float qreg[kQ][kPerLane], acc[kQ][kPerLane], m[kQ], l[kQ];
+  int64_t jlo[kQ], jhi[kQ];
+  bool act[kQ];
+  int64_t lo = rows, hi = 0;
+
+#pragma unroll
+  for (int u = 0; u < kQ; ++u) {
+    const int64_t i = i0 + u;
+    act[u] = (i < rows);
+    m[u] = -CUDART_INF_F;
+    l[u] = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) acc[u][c] = 0.0f;
+    jlo[u] = 0;
+    jhi[u] = -1;
+    if (!act[u]) continue;
+    int64_t qs = 0, qe = rows;
+    for (int r = 0; r < num_reqs; ++r) {
+      if (i >= cu[r] && i < cu[r + 1]) { qs = cu[r]; qe = cu[r + 1]; break; }
+    }
+    const int64_t ii = i - qs;
+    const int64_t rel_hi = causal ? ii : (qe - qs - 1);
+    int64_t rel_lo = 0;
+    if (causal && window > 0) rel_lo = (ii - (window - 1) > 0) ? ii - (window - 1) : 0;
+    jlo[u] = qs + rel_lo;
+    jhi[u] = qs + rel_hi;
+    lo = min(lo, jlo[u]);
+    hi = max(hi, jhi[u]);
+    const int64_t qoff = (i * hq + h) * d;
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      qreg[u][c] = Load(query, qoff + static_cast<int64_t>(c) * 32 + lane);
+    }
+  }
+  if (hi < lo) return;
+
+  for (int64_t j = lo; j <= hi; ++j) {
+    const int64_t koff = (j * hk + g) * d;
+    float kreg[kPerLane], vreg[kPerLane];
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      kreg[c] = Load(key, koff + static_cast<int64_t>(c) * 32 + lane);
+      vreg[c] = Load(value, koff + static_cast<int64_t>(c) * 32 + lane);
+    }
+#pragma unroll
+    for (int u = 0; u < kQ; ++u) {
+      if (!act[u] || j < jlo[u] || j > jhi[u]) continue;  // warp-uniform
+      float part = 0.0f;
+#pragma unroll
+      for (int c = 0; c < kPerLane; ++c) part += qreg[u][c] * kreg[c];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xFFFFFFFFu, part, off);
+      const float s = __shfl_sync(0xFFFFFFFFu, part, 0) * scale;
+      const float m_new = fmaxf(m[u], s);
+      const float corr = expf(m[u] - m_new);
+      const float pw = expf(s - m_new);
+#pragma unroll
+      for (int c = 0; c < kPerLane; ++c) acc[u][c] = acc[u][c] * corr + pw * vreg[c];
+      l[u] = l[u] * corr + pw;
+      m[u] = m_new;
+    }
+  }
+
+#pragma unroll
+  for (int u = 0; u < kQ; ++u) {
+    if (!act[u] || l[u] == 0.0f) continue;
+    const int64_t qoff = ((i0 + u) * hq + h) * d;
+    const float inv = 1.0f / l[u];
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      Store(out, qoff + static_cast<int64_t>(c) * 32 + lane, acc[u][c] * inv);
+    }
+  }
+}
+
+template <typename Tin, typename Tout, int kPerLane>
+__global__ void DFlashBlockAttentionWarpKernel(Tout* out, const Tin* query, const Tin* key,
+                                              const Tin* value, const int32_t* cu, int num_reqs,
+                                              int64_t hq, int64_t hk, int64_t d, float scale,
+                                              bool causal, int64_t window) {
+  const int lane = threadIdx.x & 31;
+  const int64_t warp_id =
+      (static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5)) + (threadIdx.x >> 5);
+  const int64_t total = gridDim.y;  // unused; kept for symmetry with the grid below
+  (void)total;
+  const int64_t i = warp_id;        // GLOBAL query row
+  const int64_t h = blockIdx.y;     // q-head
+  const int64_t rows = cu[num_reqs];
+  if (i >= rows) return;
+  const int64_t g = h / (hq / hk);
+
+  int64_t qs = 0, qe = 0;
+  for (int r = 0; r < num_reqs; ++r) {
+    if (i >= cu[r] && i < cu[r + 1]) {
+      qs = cu[r];
+      qe = cu[r + 1];
+      break;
+    }
+  }
+  const int64_t ii = i - qs;
+  const int64_t jhi = causal ? ii : (qe - qs - 1);
+  int64_t jlo = 0;
+  if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+  const int64_t qoff = (i * hq + h) * d;
+
+  // Q and the accumulator in registers: lane L holds elements L, L+32, L+64, ...
+  float qreg[kPerLane], acc[kPerLane];
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) {
+    qreg[c] = Load(query, qoff + static_cast<int64_t>(c) * 32 + lane);
+    acc[c] = 0.0f;
+  }
+  float m = -CUDART_INF_F, l = 0.0f;
+
+  for (int64_t jj = jlo; jj <= jhi; ++jj) {
+    const int64_t koff = ((qs + jj) * hk + g) * d;
+    float part = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      part += qreg[c] * Load(key, koff + static_cast<int64_t>(c) * 32 + lane);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xFFFFFFFFu, part, off);
+    float s = __shfl_sync(0xFFFFFFFFu, part, 0) * scale;
+
+    const float m_new = fmaxf(m, s);
+    const float corr = expf(m - m_new);
+    const float pw = expf(s - m_new);
+    const int64_t voff = ((qs + jj) * hk + g) * d;
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      acc[c] = acc[c] * corr + pw * Load(value, voff + static_cast<int64_t>(c) * 32 + lane);
+    }
+    l = l * corr + pw;
+    m = m_new;
+  }
+
+  const float inv = 1.0f / l;
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) {
+    Store(out, qoff + static_cast<int64_t>(c) * 32 + lane, acc[c] * inv);
+  }
+}
+
+// VT_DFLASH_ATTN_WARP=1 falls back to the older per-key warp-reduction kernel, so
+// the two forms can be A/B'd on ONE binary (same-binary A/B is the benchmark
+// protocol here). Cached once; getenv is not hot-path-safe.
+inline bool UseDflashAttnWarpKernel() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_DFLASH_ATTN_WARP");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+// VT_DFLASH_ATTN_KEYLANE=1 selects the MEASURED-NEGATIVE one-key-per-lane form
+// (kept for the same-binary 3-way A/B that recorded the verdict).
+inline bool UseDflashAttnKeyLaneKernel() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_DFLASH_ATTN_KEYLANE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+// ---------------------------------------------------------------------------
+// TWO-PHASE, ONE-KEY-PER-LANE attention.
+//
+// *** MEASURED NEGATIVE ON sm_110: 28.90 s/step against 18.73 s/step for the
+// *** per-key warp kernel on the SAME binary (H3 --denoise-only, 512x512/33f,
+// *** seq 3224, 3 steps) -- 54% SLOWER. NOT the default; reachable only via
+// *** VT_DFLASH_ATTN_KEYLANE=1. It is kept because it is the experiment that
+// *** located the real constraint, and the reason is recorded below.
+// ***
+// *** WHY IT LOST. Giving each lane a WHOLE K row removes the cross-lane
+// *** reduction, exactly as intended -- but it also makes every K load
+// *** instruction 32-WAY SCATTERED (lane L addresses row base+L, one 32-byte
+// *** sector per lane, ~32 sectors per instruction against 2-4 for a coalesced
+// *** one). The rows are L1-resident so nothing goes to HBM, yet the load/store
+// *** unit still replays every one of those addresses, and the work simply moved
+// *** from the shuffle pipe to the memory pipe. The lesson is the one the
+// *** SUCCESSOR kernel below is built on: kill the per-key reduction WITHOUT
+// *** giving up lane==element coalescing.
+//
+// WHY IT WAS TRIED. The warp-per-query kernel above is 47x slower than this
+// file's own GEMMs
+// on the same chip: MEASURED 0.63 TFLOP/s of attention against 30.0 TFLOP/s of
+// cuBLASLt GEMM and a ~7.7 TFLOP/s CUDA-core f32 ceiling. Two causes, neither of
+// them memory:
+//
+//   (1) ~32% of its instructions are USEFUL. Per (query,key) pair a lane does
+//       d/32 (= 2 at H3's head_dim 64) FMAs and then a FIVE-STAGE
+//       __shfl_down_sync tree plus a broadcast to collapse them to one scalar.
+//   (2) A SERIAL DEPENDENCY CHAIN. Every key's (m, l, acc) update reads the
+//       previous key's, so the warp is LATENCY-bound: ~8% of the CUDA-core
+//       ceiling rather than the ~32% its instruction mix would allow.
+//
+// This kernel removes both. One warp still owns one query row, but keys are
+// processed 32 AT A TIME in two phases with a different lane->data mapping in
+// each, and NEITHER phase contains a cross-lane reduction of a dot product:
+//
+//   Phase A -- LANE == KEY. Lane L computes the WHOLE dot product for key
+//     base+L by looping all d elements. Q comes from SHARED, where every lane
+//     reads the SAME address (a broadcast, free). Each lane owns a complete
+//     score, so there is nothing to reduce. K is strided ACROSS lanes but each
+//     lane streams its own row contiguously in 4-element vector loads; the 32
+//     live rows are ~4-8 KB, i.e. L1-resident, so the strided form costs
+//     nothing here.
+//   Then ONE warp max + ONE warp sum + ONE online-softmax update per 32 keys.
+//     That is the 32x shortening of the dependency chain.
+//   Phase B -- LANE == ELEMENT. Lane L owns the CONTIGUOUS element block
+//     [L*kPerLane, (L+1)*kPerLane) and loops the 32 probabilities (broadcast
+//     from shared), so V loads are COALESCED and vectorized, and again no lane
+//     ever reduces against another.
+//
+// Useful-FMA accounting per 32 keys per warp: d (phase A) + d (phase B) = 2d
+// FMA instructions, against ~800 total instructions for the same work before.
+//
+// MEMORY IS NOT THE BOUND, AND TWO EARLIER ATTEMPTS PROVED IT. Shared-memory K/V
+// tiling measured 23% SLOWER (32 KB/block against Thor's 48 KB limit collapsed
+// occupancy) and register Q-blocking measured -0.84% at seq 15424 / +3.3% at seq
+// 3264 (DFlashAttnQBlockKernel above). One head's K+V at seq 15424 is 3.9 MB
+// against a 32 MB L2, so the traffic those attempts removed was already free.
+// This kernel therefore keeps its shared footprint DELIBERATELY TINY -- q (d
+// floats) + p (32 floats) per warp, ~5 KB for a 8-warp block at d=128 -- so
+// occupancy stays where the warp kernel had it.
+//
+// NUMERICS. Chunked max/sum is mathematically the same softmax but NOT bitwise
+// identical to the per-key recurrence (fewer rescalings, pairwise accumulation
+// inside a chunk -- if anything better conditioned). Gated on tolerance against
+// the CPU reference, not on bit-equality.
+//
+// MASKS. jlo/jhi are per-query GLOBAL key bounds computed exactly as the warp
+// kernel computes them, so non-causal, causal, sliding-window and multi-request
+// (cu_seqlens) layouts all work, including a warp whose neighbours live in a
+// different document -- each warp is independent, and a partial final chunk is
+// handled by the `valid` predicate rather than by a shape guard. (A previous
+// long-sequence kernel here was guarded to num_reqs == 1 and so silently never
+// ran on H3's packed {0, used, seq_len} TWO-document layout while the suite
+// stayed green; there is no such guard in this one.)
+template <typename Tin, typename Tout, int kPerLane>
+__global__ void DFlashAttnKeyLaneKernel(Tout* out, const Tin* query, const Tin* key,
+                                        const Tin* value, const int32_t* cu, int num_reqs,
+                                        int64_t hq, int64_t hk, float scale, bool causal,
+                                        int64_t window) {
+  constexpr int kD = kPerLane * 32;  // head_dim, compile-time (dispatch guarantees it)
+  extern __shared__ float dfa_smem[];
+
+  const int lane = threadIdx.x & 31;
+  const int warp = static_cast<int>(threadIdx.x >> 5);
+  const int warps = static_cast<int>(blockDim.x >> 5);
+  float* qsh = dfa_smem + static_cast<size_t>(warp) * (kD + 32);
+  float* psh = qsh + kD;
+
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * warps + warp;  // GLOBAL query row
+  const int64_t rows = cu[num_reqs];
+  if (i >= rows) return;  // whole-warp exit; this kernel never uses __syncthreads
+  const int64_t h = blockIdx.y;
+  const int64_t g = h / (hq / hk);
+
+  int64_t qs = 0, qe = 0;
+  for (int r = 0; r < num_reqs; ++r) {
+    if (i >= cu[r] && i < cu[r + 1]) {
+      qs = cu[r];
+      qe = cu[r + 1];
+      break;
+    }
+  }
+  const int64_t ii = i - qs;
+  const int64_t jhi = qs + (causal ? ii : (qe - qs - 1));  // last visible GLOBAL key
+  int64_t jlo = qs;
+  if (causal && window > 0) jlo = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+
+  const int64_t qoff = (i * hq + h) * kD;
+  for (int e = lane; e < kD; e += 32) qsh[e] = Load(query, qoff + e);
+  __syncwarp();
+
+  float acc[kPerLane];
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) acc[c] = 0.0f;
+  float m = -CUDART_INF_F, l = 0.0f;
+
+  const int64_t ebase = static_cast<int64_t>(lane) * kPerLane;  // this lane's element block
+
+  for (int64_t base = jlo; base <= jhi; base += 32) {
+    // ---- Phase A: lane == key. One FULL dot product per lane, no reduction. --
+    const int64_t j = base + lane;
+    const bool valid = (j <= jhi);
+    float s = -CUDART_INF_F;
+    if (valid) {
+      const int64_t koff = (j * hk + g) * kD;
+      float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;  // 4 independent FMA chains
+#pragma unroll
+      for (int c = 0; c < kD; c += 4) {
+        float qv[4], kv[4];
+        LoadVec<4>(qsh, static_cast<int64_t>(c), qv);
+        LoadVec<4>(key, koff + c, kv);
+        a0 += qv[0] * kv[0];
+        a1 += qv[1] * kv[1];
+        a2 += qv[2] * kv[2];
+        a3 += qv[3] * kv[3];
+      }
+      s = ((a0 + a1) + (a2 + a3)) * scale;
+    }
+
+    // ---- ONE online-softmax update per 32 keys (the dependency-chain fix). ---
+    float mx = s;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+    const float m_new = fmaxf(m, mx);  // mx is finite: lane 0 of every chunk is valid
+    const float corr = expf(m - m_new);
+    const float p = valid ? expf(s - m_new) : 0.0f;
+    float sum = p;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xFFFFFFFFu, sum, off);
+    l = l * corr + sum;
+    m = m_new;
+
+    psh[lane] = p;
+    __syncwarp();
+
+    // ---- Phase B: lane == element. Coalesced V, probabilities broadcast. ----
+    const int cnt = static_cast<int>(jhi - base + 1) < 32 ? static_cast<int>(jhi - base + 1) : 32;
+    float t0[kPerLane], t1[kPerLane];
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) { t0[c] = 0.0f; t1[c] = 0.0f; }
+    int jj = 0;
+    for (; jj + 1 < cnt; jj += 2) {
+      float v0[kPerLane], v1[kPerLane];
+      LoadVec<kPerLane>(value, ((base + jj) * hk + g) * kD + ebase, v0);
+      LoadVec<kPerLane>(value, ((base + jj + 1) * hk + g) * kD + ebase, v1);
+      const float p0 = psh[jj], p1 = psh[jj + 1];
+#pragma unroll
+      for (int c = 0; c < kPerLane; ++c) {
+        t0[c] += p0 * v0[c];
+        t1[c] += p1 * v1[c];
+      }
+    }
+    if (jj < cnt) {
+      float v0[kPerLane];
+      LoadVec<kPerLane>(value, ((base + jj) * hk + g) * kD + ebase, v0);
+      const float p0 = psh[jj];
+#pragma unroll
+      for (int c = 0; c < kPerLane; ++c) t0[c] += p0 * v0[c];
+    }
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) acc[c] = acc[c] * corr + (t0[c] + t1[c]);
+    __syncwarp();  // psh is rewritten by the next chunk
+  }
+
+  const float inv = 1.0f / l;
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) Store(out, qoff + ebase + c, acc[c] * inv);
+}
+
+// The per-lane ELEMENT PARTITION used by the chunked attention kernel. Any
+// partition of the head_dim across the 32 lanes computes the same dot product,
+// so the only thing that matters is which one loads FASTEST:
+//
+//   kPerLane 2 or 4 -> CONTIGUOUS blocks ([L*n, (L+1)*n)). One vector load per
+//     lane covers the whole block, the warp reads 32*n consecutive elements, and
+//     the access is perfectly coalesced with n-times FEWER instructions.
+//   otherwise (1, 3) -> STRIDED (elements L, L+32, L+64...). A contiguous block
+//     of 3 would make each warp instruction read at a 3-element stride, spanning
+//     ~3x the sectors it needs; strided scalar loads stay perfectly coalesced.
+//     head_dim 96 -- MiniMax-H3's production shape, 5376/56 -- lands here.
+//
+// Q, K, V and the output all use the SAME partition, so it never escapes the
+// kernel.
+template <int N, typename T>
+__device__ inline void LoadLane(const T* p, int64_t row, int lane, float* o) {
+  if (N == 2 || N == 4) {
+    LoadVec<N>(p, row + static_cast<int64_t>(lane) * N, o);
+  } else {
+#pragma unroll
+    for (int c = 0; c < N; ++c) o[c] = Load(p, row + static_cast<int64_t>(c) * 32 + lane);
+  }
+}
+template <int N, typename T>
+__device__ inline void StoreLane(T* p, int64_t row, int lane, const float* v) {
+  if (N == 2 || N == 4) {
+#pragma unroll
+    for (int c = 0; c < N; ++c) Store(p, row + static_cast<int64_t>(lane) * N + c, v[c]);
+  } else {
+#pragma unroll
+    for (int c = 0; c < N; ++c) Store(p, row + static_cast<int64_t>(c) * 32 + lane, v[c]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CHUNKED attention with a warp REDUCE-SCATTER (the D15 default).
+//
+// This is the kernel that actually beats the per-key warp form. It keeps that
+// kernel's COALESCED lane==element loads -- which is what killed the key-lane
+// variant above -- and attacks the two things the diagnosis actually named: the
+// per-key cross-lane REDUCTION and the per-key SERIAL DEPENDENCY CHAIN.
+//
+// Per warp = one query row; keys are processed 32 AT A TIME:
+//
+//   1. For each of the 32 keys in the chunk, every lane computes its PARTIAL of
+//      the dot product from the kPerLane elements it owns -- a plain coalesced
+//      vector load, exactly as before, but the partial is KEPT IN A REGISTER
+//      instead of being reduced immediately. After the chunk each lane holds a
+//      32-entry partial vector p[], indexed only by compile-time constants so it
+//      stays in registers.
+//   2. ONE butterfly REDUCE-SCATTER (5 rounds, 16+8+4+2+1 = 31 shuffles) turns
+//      that 32x32 partial matrix into "lane L holds the complete score for key
+//      base+L". The per-key form needs 5 shuffles + a broadcast for EVERY key,
+//      i.e. 192 shuffles per 32 keys; this needs 31. Each round exchanges only
+//      the half of the live range the partner is responsible for, so the array
+//      indices stay compile-time (a lane-dependent SELECT, never a
+//      lane-dependent INDEX -- a dynamic index into p[] would spill it to local
+//      memory and lose everything).
+//   3. ONE online-softmax update per 32 keys instead of 32: one warp max, one
+//      warp sum, TWO expf calls per chunk against 64. That is the 32x shortening
+//      of the (m, l, acc) dependency chain, which is why the old kernel sat at
+//      ~8% of the CUDA-core ceiling rather than the ~32% its instruction mix
+//      allowed -- it was latency-bound, not throughput-bound.
+//   4. The 32 probabilities go through shared (32 floats per warp, a broadcast
+//      read) and V is accumulated with the same coalesced lane==element mapping,
+//      into TWO alternating accumulator sets so the FMA chain has ILP.
+//
+// The element mapping is whichever of contiguous/strided LOADS FASTEST for the
+// head_dim (see LoadLane above): contiguous vector loads at head_dim 64/128,
+// strided scalar loads at 96 -- H3's production shape -- where a contiguous
+// 3-element block would span ~3x the sectors it needs.
+//
+// MEMORY IS NOT THE BOUND -- THREE MEASUREMENTS SAY SO. Shared-memory K/V
+// tiling: 23% SLOWER (32 KB/block against Thor's 48 KB limit collapsed
+// occupancy). Register Q-blocking: -0.84% at seq 15424, +3.3% at seq 3264
+// (DFlashAttnQBlockKernel above). One-key-per-lane with Q in shared
+// (DFlashAttnKeyLaneKernel above): 54% SLOWER, because giving each lane a whole
+// K row makes every load instruction 32-way scattered -- it removes the
+// reduction but pays for it in the load/store pipe. One head's K+V at seq 15424
+// is 3.9 MB against a 32 MB L2, so K/V were never coming from HBM in the first
+// place. This kernel therefore changes NOTHING about where K and V come from,
+// and its shared footprint is 32 floats per warp.
+//
+// NUMERICS. Chunked max/sum is the same softmax but not bitwise identical to the
+// per-key recurrence (far fewer rescalings, pairwise accumulation within a
+// chunk -- if anything better conditioned). Gated on tolerance against the CPU
+// reference.
+//
+// MASKS. jlo/jhi are the per-query GLOBAL key bounds, computed exactly as the
+// per-key kernel computes them, so non-causal, causal, sliding-window and
+// multi-request (cu_seqlens) layouts all work, including warps whose neighbours
+// live in a different document. Full chunks and the partial tail chunk run the
+// SAME body under a compile-time kFull flag: the tail clamps its row index to
+// stay in bounds and zeroes the out-of-range probabilities, so there is no
+// shape guard anywhere. (A previous long-sequence kernel here was guarded to
+// num_reqs == 1 and therefore silently never ran on H3's packed
+// {0, used, seq_len} TWO-document layout while the suite stayed green.)
+template <typename Tin, int kPerLane, bool kFull>
+__device__ inline void DFlashAttnChunk(const Tin* key, const Tin* value, int64_t base, int cnt,
+                                       int64_t hk, int64_t g, int lane, const float* qreg,
+                                       float scale, float* psh, float& m, float& l, float* acc) {
+  constexpr int kD = kPerLane * 32;
+
+  // (1) Per-key partials, coalesced, kept in registers.
+  float p[32];
+#pragma unroll
+  for (int t = 0; t < 32; ++t) {
+    const int ti = kFull ? t : (t < cnt ? t : cnt - 1);  // clamp keeps loads in bounds
+    float kv[kPerLane];
+    LoadLane<kPerLane>(key, ((base + ti) * hk + g) * kD, lane, kv);
+    float d0 = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) d0 += qreg[c] * kv[c];
+    p[t] = (kFull || t < cnt) ? d0 : 0.0f;
+  }
+
+  // (2) Butterfly reduce-scatter: 31 shuffles total; lane L ends with key L.
+#pragma unroll
+  for (int half = 16; half >= 1; half >>= 1) {
+    const bool hi = (lane & half) != 0;
+#pragma unroll
+    for (int t = 0; t < half; ++t) {
+      const float send = hi ? p[t] : p[t + half];
+      const float keep = hi ? p[t + half] : p[t];
+      p[t] = keep + __shfl_xor_sync(0xFFFFFFFFu, send, half);
+    }
+  }
+
+  // (3) ONE online-softmax update for the whole chunk.
+  float s = p[0] * scale;
+  const bool live = kFull || (lane < cnt);
+  if (!live) s = -CUDART_INF_F;
+  float mx = s;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+  const float m_new = fmaxf(m, mx);  // mx is finite: lane 0 of every chunk is live
+  const float corr = expf(m - m_new);
+  const float pv = live ? expf(s - m_new) : 0.0f;
+  float sum = pv;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xFFFFFFFFu, sum, off);
+  l = l * corr + sum;
+  m = m_new;
+
+  psh[lane] = pv;
+  __syncwarp();
+
+  // (4) V accumulation, same coalesced mapping, two interleaved FMA chains.
+  float t0[kPerLane], t1[kPerLane];
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) { t0[c] = 0.0f; t1[c] = 0.0f; }
+#pragma unroll
+  for (int t = 0; t < 32; t += 2) {
+    const int i0 = kFull ? t : (t < cnt ? t : cnt - 1);
+    const int i1 = kFull ? (t + 1) : (t + 1 < cnt ? t + 1 : cnt - 1);
+    float v0[kPerLane], v1[kPerLane];
+    LoadLane<kPerLane>(value, ((base + i0) * hk + g) * kD, lane, v0);
+    LoadLane<kPerLane>(value, ((base + i1) * hk + g) * kD, lane, v1);
+    const float p0 = psh[t], p1 = psh[t + 1];  // 0 beyond cnt, so the clamp is harmless
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      t0[c] += p0 * v0[c];
+      t1[c] += p1 * v1[c];
+    }
+  }
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) acc[c] = acc[c] * corr + (t0[c] + t1[c]);
+  __syncwarp();  // psh is rewritten by the next chunk
+}
+
+template <typename Tin, typename Tout, int kPerLane>
+__global__ void DFlashAttnChunkKernel(Tout* out, const Tin* query, const Tin* key,
+                                      const Tin* value, const int32_t* cu, int num_reqs,
+                                      int64_t hq, int64_t hk, float scale, bool causal,
+                                      int64_t window) {
+  constexpr int kD = kPerLane * 32;  // head_dim, compile-time (dispatch guarantees it)
+  extern __shared__ float dfa_smem[];
+
+  const int lane = threadIdx.x & 31;
+  const int warp = static_cast<int>(threadIdx.x >> 5);
+  const int warps = static_cast<int>(blockDim.x >> 5);
+  float* psh = dfa_smem + static_cast<size_t>(warp) * 32;
+
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * warps + warp;  // GLOBAL query row
+  const int64_t rows = cu[num_reqs];
+  if (i >= rows) return;  // whole-warp exit; this kernel never uses __syncthreads
+  const int64_t h = blockIdx.y;
+  const int64_t g = h / (hq / hk);
+
+  int64_t qs = 0, qe = 0;
+  for (int r = 0; r < num_reqs; ++r) {
+    if (i >= cu[r] && i < cu[r + 1]) {
+      qs = cu[r];
+      qe = cu[r + 1];
+      break;
+    }
+  }
+  const int64_t ii = i - qs;
+  const int64_t jhi = qs + (causal ? ii : (qe - qs - 1));  // last visible GLOBAL key
+  int64_t jlo = qs;
+  if (causal && window > 0) jlo = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+
+  const int64_t qoff = (i * hq + h) * kD;
+  float qreg[kPerLane], acc[kPerLane];
+  LoadLane<kPerLane>(query, qoff, lane, qreg);
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) acc[c] = 0.0f;
+  float m = -CUDART_INF_F, l = 0.0f;
+
+  const int64_t nkeys = jhi - jlo + 1;
+  const int64_t tail = jlo + (nkeys & ~static_cast<int64_t>(31));  // first partial-chunk base
+  for (int64_t base = jlo; base < tail; base += 32) {
+    DFlashAttnChunk<Tin, kPerLane, true>(key, value, base, 32, hk, g, lane, qreg, scale, psh, m,
+                                         l, acc);
+  }
+  if (tail <= jhi) {
+    DFlashAttnChunk<Tin, kPerLane, false>(key, value, tail, static_cast<int>(jhi - tail + 1), hk,
+                                          g, lane, qreg, scale, psh, m, l, acc);
+  }
+
+  const float inv = 1.0f / l;
+  float res[kPerLane];
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) res[c] = acc[c] * inv;
+  StoreLane<kPerLane>(out, qoff, lane, res);
+}
+
+// ---------------------------------------------------------------------------
+// TENSOR-CORE (bf16 mma.sync) FlashAttention — the D16 default for bf16 streams.
+//
+// Every kernel above computes attention on the CUDA CORES: at head_dim 128 the
+// chunked reduce-scatter form measured 1.13 TFLOP/s against a ~7.7 TFLOP/s f32
+// CUDA-core ceiling and 30.0 TFLOP/s of cuBLASLt GEMM on the SAME chip. That gap
+// is not a scheduling problem any more — it is the wrong MATH UNIT. This kernel
+// moves both GEMMs of attention onto the bf16 tensor cores with
+// `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`, which is Ampere-and-later
+// (it assembles, launches and accumulates on sm_110; the FP4 `kind::mxf4nvf4`
+// restriction recorded for this box applies to the block-scaled FP4 MMA ONLY).
+//
+// SHAPE. One WARP owns 16 query rows and the FULL head_dim of output; a block is
+// kMmaWarps warps, so 64 query rows share one staged K/V tile of kMmaKeys keys.
+//
+//   S[16q x 32k] = Q[16q x d] · Kᵀ[d x 32k]   — d/16 k-steps x 4 n-tiles
+//   O[16q x d]  += P[16q x 32k] · V[32k x d]  — 2 k-steps x d/8 n-tiles
+//
+// SHARED MEMORY IS A FIRST-CLASS CONSTRAINT here, because the previous
+// shared-memory attempt in this file died of occupancy (32 KB/block, 23% SLOWER).
+// So ONLY K and V are staged: 2 * 32 * (d+8) * 2 B = 17.4 KB/block at d=128,
+// 4.6 KB at d=64. S, P and the whole O accumulator stay in REGISTERS. That is
+// possible because the m16n8k16 C fragment maps EXACTLY onto the next MMA's A
+// fragment: the accumulator lane layout (rows groupID / groupID+8, cols
+// threadInGroup*2 + {0,1}) is the same partition the A operand wants, so P needs
+// zero shuffles and zero shared round-trip — the reason FlashAttention-2 uses raw
+// mma.sync rather than the nvcuda::wmma API (whose fragments are opaque and must
+// go through memory; see PagedFlashWmmaKernel in cuda_paged_attn.cu, which pays
+// exactly that cost).
+//
+// FRAGMENT LAYOUT (PTX ISA "Matrix Fragments for mma.m16n8k16"), gid = lane>>2,
+// tig = lane&3:
+//   A (16x16 row): reg0={row gid, col tig*2, +1}   reg1={row gid+8, same cols}
+//                  reg2={row gid, col tig*2+8, +9} reg3={row gid+8, same cols}
+//   B (16x8 col):  reg0={col gid, row tig*2, +1}   reg1={col gid, row tig*2+8, +9}
+//   C (16x8 f32):  c0,c1={row gid,   col tig*2, +1}
+//                  c2,c3={row gid+8, col tig*2, +1}
+// So every lane owns exactly TWO query rows for its whole lifetime, and the online
+// softmax state (m, l) is two registers reduced across the 4 lanes of a QUAD
+// (__shfl_xor 1 and 2) — no block barrier, no shared scratch.
+//
+// SHARED BANKS. K/V rows are padded to d+8 elements. d is a multiple of 16, so the
+// row stride in 4-byte banks is (d+8)/2 = an ODD multiple of 4, and the 8 distinct
+// rows a warp touches land on banks 4*gid (mod 32) — all distinct — while tig adds
+// 0..3. The K fragment load is therefore CONFLICT-FREE. The V fragment reads a
+// COLUMN (b0/b1 are consecutive KEYS, not consecutive elements), so it costs four
+// 16-bit shared loads with a 2-way conflict; that is the one structural tax of
+// keeping V row-major, and it is paid against 2x the MMA work it feeds.
+//
+// MASKS. Identical bookkeeping to the chunked kernel, evaluated per (row, key)
+// on the f32 S fragment: non-causal, causal, sliding-window and multi-request
+// (cu_seqlens) all work, including a warp whose 16 rows straddle a document
+// boundary. The block walks the UNION of its 64 rows' key ranges so the staged
+// tile is block-uniform (every barrier is reached by every warp), and rows mask
+// out what they cannot see. Query rows past cu[num_reqs] clamp their row index
+// and skip the store.
+//
+// NUMERICS. Q, K and V are already bf16 in the production stream, so QKᵀ loses
+// NOTHING (bf16 in, f32 accumulate — the CUDA-core path converts the same bf16 to
+// f32 and accumulates in f32). The PV GEMM must round P to bf16, exactly as
+// FlashAttention does; that is a real ~2^-9 relative error on the probabilities
+// and it is why this path is gated at a bf16 tolerance rather than the f32 path's
+// 2e-5. f32 inputs therefore stay on DFlashAttnChunkKernel, whose f32 tolerance
+// this could not hold.
+__device__ __forceinline__ void MmaBf16M16N8K16(float* c, const unsigned* a, const unsigned* b) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+  (void)c;
+  (void)a;
+  (void)b;
+#endif
+}
+
+constexpr int kMmaWarps = 4;   // warps per block (4 * 16 = 64 query rows per block)
+constexpr int kMmaQ = 16;      // query rows per warp = the MMA's M
+constexpr int kMmaKeys = 32;   // keys per staged K/V tile = 4 n-tiles of the QKᵀ MMA
+constexpr int kMmaPad = 8;     // shared row padding, in elements (see SHARED BANKS)
+
+// kDT = head_dim / 16 (the QKᵀ k-step count). head_dim = 16 * kDT is a compile-time
+// constant so every fragment index below is a compile-time index into a register
+// array — a dynamic index would spill the accumulator to local memory.
+template <typename Tout, int kDT>
+__global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
+    Tout* out, const __nv_bfloat16* query, const __nv_bfloat16* key,
+    const __nv_bfloat16* value, const int32_t* cu, int num_reqs, int64_t hq, int64_t hk,
+    float scale, bool causal, int64_t window) {
+#if __CUDA_ARCH__ >= 800
+  constexpr int kD = kDT * 16;        // head_dim
+  constexpr int kNT = kD / 8;         // P·V n-tiles (8 output columns each)
+  constexpr int kStride = kD + kMmaPad;
+
+  extern __shared__ uint4 dfa_mma_smem[];  // uint4 => guaranteed 16-byte aligned
+  __nv_bfloat16* ksh = reinterpret_cast<__nv_bfloat16*>(dfa_mma_smem);
+  __nv_bfloat16* vsh = ksh + kMmaKeys * kStride;
+  const unsigned short* vsh_u = reinterpret_cast<const unsigned short*>(vsh);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int gid = lane >> 2;  // 0..7 : which of the 8 row-pairs this lane owns
+  const int tig = lane & 3;   // 0..3 : which column pair
+
+  const int64_t rows = cu[num_reqs];
+  const int64_t h = blockIdx.y;
+  const int64_t g = h / (hq / hk);
+  const int64_t qblk = static_cast<int64_t>(blockIdx.x) * (kMmaWarps * kMmaQ);
+  if (qblk >= rows) return;  // block-uniform
+
+  // --- block-wide key range: the UNION over this block's 64 query rows ------
+  const int64_t qend = (qblk + kMmaWarps * kMmaQ < rows) ? (qblk + kMmaWarps * kMmaQ) : rows;
+  int64_t klo = rows, khi = -1;
+  for (int r = 0; r < num_reqs; ++r) {
+    const int64_t rs = cu[r], re = cu[r + 1];
+    const int64_t lo = rs > qblk ? rs : qblk;
+    const int64_t hi = (re < qend ? re : qend) - 1;
+    if (lo > hi) continue;
+    const int64_t jhi = causal ? hi : (re - 1);
+    int64_t jlo = rs;
+    if (causal && window > 0) {
+      const int64_t ii = lo - rs;
+      jlo = rs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+    }
+    if (jlo < klo) klo = jlo;
+    if (jhi > khi) khi = jhi;
+  }
+  if (khi < klo) return;  // block-uniform
+
+  // --- this lane's TWO query rows and their per-row mask bounds -------------
+  const int64_t qbase = qblk + static_cast<int64_t>(warp) * kMmaQ;
+  int64_t qrow[2], rlo[2], rhi[2];
+  bool live[2];
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int64_t i = qbase + gid + 8 * u;
+    live[u] = i < rows;
+    const int64_t ic = live[u] ? i : (rows - 1);  // clamp: reads stay in bounds
+    qrow[u] = ic;
+    int64_t qs = 0, qe = 0;
+    for (int r = 0; r < num_reqs; ++r) {
+      if (ic >= cu[r] && ic < cu[r + 1]) {
+        qs = cu[r];
+        qe = cu[r + 1];
+        break;
+      }
+    }
+    const int64_t ii = ic - qs;
+    rhi[u] = qs + (causal ? ii : (qe - qs - 1));
+    rlo[u] = qs;
+    if (causal && window > 0) rlo[u] = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+  }
+
+  // --- Q A-fragments, read ONCE straight from global into registers ---------
+  unsigned qfrag[kDT][4];
+#pragma unroll
+  for (int kd = 0; kd < kDT; ++kd) {
+    const int64_t c0 = static_cast<int64_t>(kd) * 16 + tig * 2;
+    const int64_t o0 = (qrow[0] * hq + h) * kD;
+    const int64_t o1 = (qrow[1] * hq + h) * kD;
+    qfrag[kd][0] = *reinterpret_cast<const unsigned*>(query + o0 + c0);
+    qfrag[kd][1] = *reinterpret_cast<const unsigned*>(query + o1 + c0);
+    qfrag[kd][2] = *reinterpret_cast<const unsigned*>(query + o0 + c0 + 8);
+    qfrag[kd][3] = *reinterpret_cast<const unsigned*>(query + o1 + c0 + 8);
+  }
+
+  float acc[kNT][4];
+#pragma unroll
+  for (int nt = 0; nt < kNT; ++nt) {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) acc[nt][c] = 0.0f;
+  }
+  float mrow[2] = {-CUDART_INF_F, -CUDART_INF_F};
+  float lrow[2] = {0.0f, 0.0f};
+
+  for (int64_t base = klo; base <= khi; base += kMmaKeys) {
+    // (1) stage the K and V tiles: 8 bf16 (16 B) per thread per step, coalesced.
+    __syncthreads();
+    for (int idx = tid * 8; idx < kMmaKeys * kD; idx += static_cast<int>(blockDim.x) * 8) {
+      const int kk = idx / kD, col = idx % kD;
+      const int64_t j = base + kk;
+      const int64_t jc = j < rows ? j : (rows - 1);  // clamp; masked keys score -inf
+      const int64_t off = (jc * hk + g) * kD + col;
+      const int sh = kk * kStride + col;
+      *reinterpret_cast<uint4*>(ksh + sh) = *reinterpret_cast<const uint4*>(key + off);
+      *reinterpret_cast<uint4*>(vsh + sh) = *reinterpret_cast<const uint4*>(value + off);
+    }
+    __syncthreads();
+
+    // (2) S = Q·Kᵀ on the tensor cores. 4 independent n-tiles => 4-way ILP over
+    //     the kDT-long serial accumulate chain.
+    float s[4][4];
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) s[nt][c] = 0.0f;
+#pragma unroll
+      for (int kd = 0; kd < kDT; ++kd) {
+        const int krow = nt * 8 + gid;
+        unsigned b[2];
+        b[0] = *reinterpret_cast<const unsigned*>(ksh + krow * kStride + kd * 16 + tig * 2);
+        b[1] = *reinterpret_cast<const unsigned*>(ksh + krow * kStride + kd * 16 + tig * 2 + 8);
+        MmaBf16M16N8K16(s[nt], qfrag[kd], b);
+      }
+    }
+
+    // (3) scale + MASK, then the per-row max over this lane's 8 columns.
+    float rmax[2] = {-CUDART_INF_F, -CUDART_INF_F};
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const int u = c >> 1;
+        const int64_t j = base + nt * 8 + tig * 2 + (c & 1);
+        float v = s[nt][c] * scale;
+        if (j < rlo[u] || j > rhi[u]) v = -CUDART_INF_F;
+        s[nt][c] = v;
+        rmax[u] = fmaxf(rmax[u], v);
+      }
+    }
+    // The 8 columns of a row live in the 4 lanes of a QUAD: reduce with xor 1,2.
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      rmax[u] = fmaxf(rmax[u], __shfl_xor_sync(0xFFFFFFFFu, rmax[u], 1));
+      rmax[u] = fmaxf(rmax[u], __shfl_xor_sync(0xFFFFFFFFu, rmax[u], 2));
+    }
+
+    // (4) online softmax. A row can see NOTHING in this tile (the block walks the
+    //     union of 64 rows' ranges), so guard the -inf minus -inf that would NaN.
+    float corr[2];
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      const bool any = rmax[u] > -CUDART_INF_F;
+      const float mn = any ? fmaxf(mrow[u], rmax[u]) : mrow[u];
+      corr[u] = any ? __expf(mrow[u] - mn) : 1.0f;  // 0 on the first live tile
+      mrow[u] = mn;
+    }
+    float rsum[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const int u = c >> 1;
+        const float p = s[nt][c] > -CUDART_INF_F ? __expf(s[nt][c] - mrow[u]) : 0.0f;
+        s[nt][c] = p;
+        rsum[u] += p;
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      rsum[u] += __shfl_xor_sync(0xFFFFFFFFu, rsum[u], 1);
+      rsum[u] += __shfl_xor_sync(0xFFFFFFFFu, rsum[u], 2);
+      lrow[u] = lrow[u] * corr[u] + rsum[u];
+    }
+#pragma unroll
+    for (int nt = 0; nt < kNT; ++nt) {
+      acc[nt][0] *= corr[0];
+      acc[nt][1] *= corr[0];
+      acc[nt][2] *= corr[1];
+      acc[nt][3] *= corr[1];
+    }
+
+    // (5) P -> bf16 A-fragments. The C layout of step (2) IS the A layout, so this
+    //     is a pure pack: n-tiles {2kk, 2kk+1} become the 16-key k-step kk.
+    unsigned pf[2][4];
+#pragma unroll
+    for (int kk = 0; kk < 2; ++kk) {
+      const __nv_bfloat162 r0 = __floats2bfloat162_rn(s[2 * kk][0], s[2 * kk][1]);
+      const __nv_bfloat162 r1 = __floats2bfloat162_rn(s[2 * kk][2], s[2 * kk][3]);
+      const __nv_bfloat162 r2 = __floats2bfloat162_rn(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+      const __nv_bfloat162 r3 = __floats2bfloat162_rn(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+      pf[kk][0] = *reinterpret_cast<const unsigned*>(&r0);
+      pf[kk][1] = *reinterpret_cast<const unsigned*>(&r1);
+      pf[kk][2] = *reinterpret_cast<const unsigned*>(&r2);
+      pf[kk][3] = *reinterpret_cast<const unsigned*>(&r3);
+    }
+
+    // (6) O += P·V on the tensor cores. B wants consecutive KEYS in one register,
+    //     which V's row-major tile does not give: four 16-bit shared reads.
+#pragma unroll
+    for (int nt = 0; nt < kNT; ++nt) {
+      const int dcol = nt * 8 + gid;
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) {
+        const int r0 = kk * 16 + tig * 2;
+        unsigned b[2];
+        b[0] = static_cast<unsigned>(vsh_u[r0 * kStride + dcol]) |
+               (static_cast<unsigned>(vsh_u[(r0 + 1) * kStride + dcol]) << 16);
+        b[1] = static_cast<unsigned>(vsh_u[(r0 + 8) * kStride + dcol]) |
+               (static_cast<unsigned>(vsh_u[(r0 + 9) * kStride + dcol]) << 16);
+        MmaBf16M16N8K16(acc[nt], pf[kk], b);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    if (!live[u]) continue;
+    const float inv = lrow[u] > 0.0f ? 1.0f / lrow[u] : 0.0f;
+    const int64_t ooff = (qrow[u] * hq + h) * kD;
+#pragma unroll
+    for (int nt = 0; nt < kNT; ++nt) {
+      const int64_t col = nt * 8 + tig * 2;
+      Store(out, ooff + col, acc[nt][2 * u] * inv);
+      Store(out, ooff + col + 1, acc[nt][2 * u + 1] * inv);
+    }
+  }
+#else
+  (void)out; (void)query; (void)key; (void)value; (void)cu; (void)num_reqs; (void)hq;
+  (void)hk; (void)scale; (void)causal; (void)window;
+  __trap();  // never launched below sm_80 (host gate: DFlashMmaSupported)
+#endif
+}
+
+// The bf16 tensor-core path needs BOTH a compile-time and a runtime guarantee:
+// mma.sync's bf16 form is Ampere-and-later, so it must be in the compiled arch set
+// AND on the device we are actually running. VT_DFLASH_ATTN_MMA=0 disables it for
+// the same-binary A/B this project's benchmark protocol requires.
+#if defined(__CUDA_ARCH_LIST__)
+constexpr int kBuiltArchList[] = {__CUDA_ARCH_LIST__};
+constexpr bool BuiltArchesAllHaveBf16Mma() {
+  for (int a : kBuiltArchList) {
+    if (a < 800) return false;
+  }
+  return true;
+}
+#else
+constexpr bool BuiltArchesAllHaveBf16Mma() { return false; }
+#endif
+
+inline bool DFlashMmaSupported() {
+  static const bool on = [] {
+    if (!BuiltArchesAllHaveBf16Mma()) return false;
+    const char* e = std::getenv("VT_DFLASH_ATTN_MMA");
+    if (e != nullptr && e[0] == '0') return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess)
+      return false;
+    return major >= 8;
+  }();
+  return on;
+}
+
 template <typename Tin>
 void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query,
                                 const Tensor& key, const Tensor& value,
@@ -1597,6 +2632,138 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
   Check(cudaMemcpyAsync(d_cu, args.cu_seqlens, cub, cudaMemcpyHostToDevice, s),
         "dflash-block-attn cu upload");
   const dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq));
+  // TENSOR-CORE fast path: bf16 in, head_dim a multiple of the MMA's k (16), up to
+  // 128 (the largest head this port uses). f32 streams stay on the CUDA-core kernel
+  // below -- rounding them to bf16 to reach the tensor cores would trade the f32
+  // path's 2e-5 tolerance for a bf16 one, which is not a trade this op may make.
+  if (std::is_same<Tin, __nv_bfloat16>::value && d % 16 == 0 && d >= 16 && d <= 128 &&
+      DFlashMmaSupported()) {
+    const dim3 mgrid(static_cast<unsigned>((t + kMmaWarps * kMmaQ - 1) / (kMmaWarps * kMmaQ)),
+                     static_cast<unsigned>(hq));
+    const unsigned mblock = kMmaWarps * 32;
+    const size_t mshmem =
+        2u * kMmaKeys * static_cast<size_t>(d + kMmaPad) * sizeof(__nv_bfloat16);
+#define VT_DFLASH_MMA(DT)                                                                     \
+  do {                                                                                        \
+    if (out.dtype == DType::kF32) {                                                           \
+      DFlashAttnMmaKernel<float, DT><<<mgrid, mblock, mshmem, s>>>(                           \
+          out.Ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(query.data),               \
+          reinterpret_cast<const __nv_bfloat16*>(key.data),                                   \
+          reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, args.num_reqs, hq, hk,    \
+          args.scale, args.causal, args.sliding_window);                                      \
+    } else {                                                                                  \
+      DFlashAttnMmaKernel<__nv_bfloat16, DT><<<mgrid, mblock, mshmem, s>>>(                   \
+          out.Ptr<__nv_bfloat16>(), reinterpret_cast<const __nv_bfloat16*>(query.data),       \
+          reinterpret_cast<const __nv_bfloat16*>(key.data),                                   \
+          reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, args.num_reqs, hq, hk,    \
+          args.scale, args.causal, args.sliding_window);                                      \
+    }                                                                                         \
+  } while (0)
+    switch (d / 16) {
+      case 1: VT_DFLASH_MMA(1); break;
+      case 2: VT_DFLASH_MMA(2); break;
+      case 3: VT_DFLASH_MMA(3); break;
+      case 4: VT_DFLASH_MMA(4); break;
+      case 5: VT_DFLASH_MMA(5); break;
+      case 6: VT_DFLASH_MMA(6); break;
+      case 7: VT_DFLASH_MMA(7); break;
+      default: VT_DFLASH_MMA(8); break;
+    }
+#undef VT_DFLASH_MMA
+    Check(cudaGetLastError(), "dflash-block-attn mma launch");
+    Check(cudaFreeAsync(d_cu, s), "dflash-block-attn cu free");
+    return;
+  }
+  // Warp-per-query fast path when head_dim is a whole number of warp widths (64 and
+  // 128 cover every head this port uses). Three forms live here so the verdict can
+  // be reproduced on ONE binary (same-binary A/B is this project's benchmark rule):
+  // the CHUNKED reduce-scatter kernel is the default, VT_DFLASH_ATTN_KEYLANE=1
+  // selects the measured-negative one-key-per-lane form, and VT_DFLASH_ATTN_WARP=1
+  // selects the original per-key warp-reduction form.
+  if (d % 32 == 0 && d / 32 <= 4 && !UseDflashAttnWarpKernel()) {
+    constexpr int kWarpsPerBlock = 8;
+    const dim3 kgrid(static_cast<unsigned>((t + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                     static_cast<unsigned>(hq));
+    const unsigned kblock = kWarpsPerBlock * 32;
+    const bool keylane = UseDflashAttnKeyLaneKernel();
+    const size_t kshmem =
+        static_cast<size_t>(kWarpsPerBlock) * (keylane ? (d + 32) : 32) * sizeof(float);
+#define VT_DFLASH_CHUNK(PER_LANE)                                                               \
+  do {                                                                                          \
+    if (out.dtype == DType::kF32) {                                                             \
+      DFlashAttnChunkKernel<Tin, float, PER_LANE><<<kgrid, kblock, kshmem, s>>>(                \
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,           \
+          args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);                 \
+    } else {                                                                                    \
+      DFlashAttnChunkKernel<Tin, __nv_bfloat16, PER_LANE><<<kgrid, kblock, kshmem, s>>>(        \
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,   \
+          args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);                 \
+    }                                                                                           \
+  } while (0)
+    if (!keylane) {
+      switch (d / 32) {
+        case 1: VT_DFLASH_CHUNK(1); break;
+        case 2: VT_DFLASH_CHUNK(2); break;
+        case 3: VT_DFLASH_CHUNK(3); break;
+        default: VT_DFLASH_CHUNK(4); break;
+      }
+#undef VT_DFLASH_CHUNK
+      Check(cudaGetLastError(), "dflash-block-attn chunk launch");
+      Check(cudaFreeAsync(d_cu, s), "dflash-block-attn cu free");
+      return;
+    }
+#define VT_DFLASH_KEYLANE(PER_LANE)                                                             \
+  do {                                                                                          \
+    if (out.dtype == DType::kF32) {                                                             \
+      DFlashAttnKeyLaneKernel<Tin, float, PER_LANE><<<kgrid, kblock, kshmem, s>>>(              \
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,           \
+          args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);                 \
+    } else {                                                                                    \
+      DFlashAttnKeyLaneKernel<Tin, __nv_bfloat16, PER_LANE><<<kgrid, kblock, kshmem, s>>>(      \
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,   \
+          args.num_reqs, hq, hk, args.scale, args.causal, args.sliding_window);                 \
+    }                                                                                           \
+  } while (0)
+    switch (d / 32) {
+      case 1: VT_DFLASH_KEYLANE(1); break;
+      case 2: VT_DFLASH_KEYLANE(2); break;
+      case 3: VT_DFLASH_KEYLANE(3); break;
+      default: VT_DFLASH_KEYLANE(4); break;
+    }
+#undef VT_DFLASH_KEYLANE
+    Check(cudaGetLastError(), "dflash-block-attn key-lane launch");
+    Check(cudaFreeAsync(d_cu, s), "dflash-block-attn cu free");
+    return;
+  }
+  if (d % 32 == 0 && d / 32 <= 4) {
+    constexpr int kWarpsPerBlock = 4;
+    const dim3 wgrid(static_cast<unsigned>((t + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                     static_cast<unsigned>(hq));
+    const unsigned wblock = kWarpsPerBlock * 32;
+#define VT_DFLASH_WARP(PER_LANE)                                                              \
+  do {                                                                                        \
+    if (out.dtype == DType::kF32) {                                                           \
+      DFlashBlockAttentionWarpKernel<Tin, float, PER_LANE><<<wgrid, wblock, 0, s>>>(          \
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,         \
+          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);            \
+    } else {                                                                                  \
+      DFlashBlockAttentionWarpKernel<Tin, __nv_bfloat16, PER_LANE><<<wgrid, wblock, 0, s>>>(  \
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu, \
+          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);            \
+    }                                                                                         \
+  } while (0)
+    switch (d / 32) {
+      case 1: VT_DFLASH_WARP(1); break;
+      case 2: VT_DFLASH_WARP(2); break;
+      case 3: VT_DFLASH_WARP(3); break;
+      default: VT_DFLASH_WARP(4); break;
+    }
+#undef VT_DFLASH_WARP
+    Check(cudaGetLastError(), "dflash-block-attn warp launch");
+    Check(cudaFreeAsync(d_cu, s), "dflash-block-attn cu free");
+    return;
+  }
+
   const size_t shmem = (static_cast<size_t>(d) + kBlock) * sizeof(float);
   switch (out.dtype) {
     case DType::kF32:

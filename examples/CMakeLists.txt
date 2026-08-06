@@ -62,3 +62,17 @@ if(VLLM_CPP_SERVER)
       PASS_REGULAR_EXPRESSION "--max-num-seqs N.*--max-num-batched-tokens N.*--cuda-profile-graph-replays N.*--cuda-profile-graph-batch N.*--benchmark-shutdown-fifo F.*--enable-force-include-usage.*--\\[no-\\]enable-prefix-caching")
   endif()
 endif()
+
+# minimax-h3-mux: muxes MiniMax-H3 PPM frames + WAV into an MP4 by invoking
+# ffmpeg. This is the RATIFIED home of that process spawn (developer decision
+# 2026-08-03): the library builds the artifacts and the argv, examples/ runs it.
+add_executable(minimax-h3-mux minimax_h3_mux/main.cpp)
+target_link_libraries(minimax-h3-mux PRIVATE vllm::vllm)
+vllm_cpp_set_warnings(minimax-h3-mux)
+
+# minimax-h3-gen: the ASSEMBLY driver — opens the real checkpoints, runs the whole
+# t2va path and writes an MP4. Lives here because it invokes ffmpeg (the ratified
+# boundary) and because it is a driver, not library surface.
+add_executable(minimax-h3-gen minimax_h3_gen/main.cpp)
+target_link_libraries(minimax-h3-gen PRIVATE vllm::vllm)
+vllm_cpp_set_warnings(minimax-h3-gen)

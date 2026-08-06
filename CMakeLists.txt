@@ -466,6 +466,25 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/kimi_k3_registry.cpp
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp
+  src/vllm/model_executor/models/minimax_h3.cpp
+  src/vllm/model_executor/models/minimax_h3_packing.cpp
+  src/vllm/model_executor/models/minimax_h3_planner.cpp
+  src/vllm/model_executor/models/minimax_h3_gguf.cpp
+  src/vllm/model_executor/models/minimax_h3_nvfp4.cpp
+  src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
+  src/vllm/model_executor/models/minimax_h3_video_vae.cpp
+  src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp
+  src/vllm/model_executor/models/minimax_h3_vae_cnn.cpp
+  src/vllm/model_executor/models/minimax_h3_encoder.cpp
+  src/vllm/model_executor/models/minimax_h3_pipeline.cpp
+  src/vllm/model_executor/models/minimax_h3_wav.cpp
+  src/vllm/model_executor/models/minimax_h3_mux.cpp
+  src/vllm/model_executor/models/minimax_h3_device_resolve.cpp
+  src/vllm/model_executor/models/minimax_h3_device.cpp
+  src/vllm/model_executor/models/minimax_h3_vae_loader.cpp
+  src/vllm/model_executor/models/minimax_h3_encoder_gguf.cpp
+  src/vllm/model_executor/models/minimax_h3_encoder_device.cpp
+  src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp
   src/vllm/model_executor/models/kimi_linear_weights.cpp
@@ -724,6 +743,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
+  src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
   src/vt/cpu/cpu_quant_dequant.cpp
   src/vt/cpu/cpu_quant_act.cpp
@@ -913,7 +933,8 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu
     src/vt/cuda/cuda_deepseek_v4.cu
-    src/vt/cuda/cuda_laguna.cu)
+    src/vt/cuda/cuda_laguna.cu
+    src/vt/cuda/cuda_minimax_h3.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

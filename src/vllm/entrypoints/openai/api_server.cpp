@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -111,7 +112,19 @@ ApiServer::ApiServer(OpenAIServingCompletion& completion,
       version_(std::move(version)),
       impl_(std::make_unique<Impl>(max_concurrent_streams, worker_pool_mode)) {}
 
-ApiServer::~ApiServer() = default;
+ApiServer::~ApiServer() {
+  // Drain the async /v1/videos workers before the job store they write into is
+  // destroyed. Threads are joined, never detached, precisely so this ordering is
+  // guaranteed rather than hoped for.
+  std::vector<std::thread> workers;
+  {
+    std::lock_guard<std::mutex> lock(video_workers_mutex_);
+    workers.swap(video_workers_);
+  }
+  for (auto& worker : workers) {
+    if (worker.joinable()) worker.join();
+  }
+}
 
 ApiServer::DispatchResult ApiServer::handle_completions(
     const std::string& request_body) {
@@ -247,6 +260,101 @@ ApiServer::DispatchResult ApiServer::handle_ping() const {
   // sagemaker/api_router.py:47-50 — GET/POST /ping is a liveness probe that
   // returns the same empty 200 as /health.
   return handle_health();
+}
+
+namespace {
+
+ApiServer::DispatchResult VideoJsonOk(std::string body) {
+  ApiServer::DispatchResult out;
+  out.status = 200;
+  out.content_type = "application/json";
+  out.body = std::move(body);
+  return out;
+}
+
+}  // namespace
+
+ApiServer::DispatchResult ApiServer::handle_videos(
+    const std::string& request_body) {
+  // vLLM-Omni's ASYNC video endpoint: validate, enqueue, and return the job id
+  // immediately. Generation is minutes-long (a 50-step denoise over the packed
+  // video+audio sequence), so answering inline would hold an HTTP worker for the
+  // whole run -- which is exactly why upstream splits async from /sync.
+  if (!video_runner_) {
+    return MakeError(500, "InternalServerError", "No video runner configured.");
+  }
+  ::vllm::openai::VideoRequest request;
+  try {
+    request = ::vllm::openai::ParseVideoRequest(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError", e.what());
+  }
+
+  const std::string id = video_jobs_.Create();
+  std::thread worker([this, id, request]() {
+    try {
+      video_jobs_.MarkRunning(id);
+      video_jobs_.MarkSucceeded(id, video_runner_(request));
+    } catch (const std::exception& e) {
+      // A runner throw is a FAILED job, not a crashed server: the thread must
+      // never let an exception escape (std::terminate) and must always leave the
+      // job in a terminal state, or a poller would wait on "running" forever.
+      try {
+        video_jobs_.MarkFailed(id, e.what());
+      } catch (const std::exception&) {
+      }
+    } catch (...) {
+      try {
+        video_jobs_.MarkFailed(id, "unknown error");
+      } catch (const std::exception&) {
+      }
+    }
+  });
+  {
+    std::lock_guard<std::mutex> lock(video_workers_mutex_);
+    video_workers_.push_back(std::move(worker));
+  }
+
+  ::vllm::openai::VideoJob job;
+  video_jobs_.Get(id, &job);
+  return VideoJsonOk(::vllm::openai::VideoJobStatusJson(job));
+}
+
+ApiServer::DispatchResult ApiServer::handle_videos_sync(
+    const std::string& request_body) {
+  // The SYNCHRONOUS twin: run to completion on the calling worker and answer with
+  // the terminal job record. Same runner, same failure mapping -- only the
+  // waiting differs.
+  if (!video_runner_) {
+    return MakeError(500, "InternalServerError", "No video runner configured.");
+  }
+  ::vllm::openai::VideoRequest request;
+  try {
+    request = ::vllm::openai::ParseVideoRequest(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError", e.what());
+  }
+
+  const std::string id = video_jobs_.Create();
+  try {
+    video_jobs_.MarkRunning(id);
+    video_jobs_.MarkSucceeded(id, video_runner_(request));
+  } catch (const std::exception& e) {
+    video_jobs_.MarkFailed(id, e.what());
+    return MakeError(500, "InternalServerError", e.what());
+  }
+  ::vllm::openai::VideoJob job;
+  video_jobs_.Get(id, &job);
+  return VideoJsonOk(::vllm::openai::VideoJobStatusJson(job));
+}
+
+ApiServer::DispatchResult ApiServer::handle_video_status(
+    const std::string& job_id) const {
+  ::vllm::openai::VideoJob job;
+  if (!video_jobs_.Get(job_id, &job)) {
+    return MakeError(404, "NotFoundError", "Unknown video job: " + job_id);
+  }
+  return VideoJsonOk(::vllm::openai::VideoJobStatusJson(job));
 }
 
 ApiServer::DispatchResult ApiServer::handle_metrics() const {
@@ -648,6 +756,25 @@ void ApiServer::register_routes() {
                write(handle_server_info(), res);
              });
 
+  if (video_runner_) {
+    // MiniMax-H3. Registered ONLY when a runner is attached, so a server built
+    // without video support answers 404 exactly as before.
+    server.Post("/v1/videos",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_videos(req.body), res);
+                });
+    server.Post("/v1/videos/sync",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_videos_sync(req.body), res);
+                });
+    server.Get(R"(/v1/videos/([^/]+))",
+               [this, write](const httplib::Request& req,
+                             httplib::Response& res) {
+                 write(handle_video_status(req.matches[1]), res);
+               });
+  }
   if (metrics_ != nullptr) {
     server.Get("/metrics",
                [this, write](const httplib::Request&, httplib::Response& res) {

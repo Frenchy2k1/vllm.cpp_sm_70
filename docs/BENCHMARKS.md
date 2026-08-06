@@ -1,18 +1,5 @@
 # Benchmarks
 
-Measured results for vllm.cpp, against the reference engine each workload
-actually competes with. Every number here was produced on real hardware, greedy,
-with the reference in its own production configuration. Ties are called ties,
-and where we are behind the row says so.
-
-This page is a **scoreboard**: one row per subject, kept current. It is not a
-changelog. The full attempt record, including refuted hypotheses, profiler
-traces, and superseded numbers, lives in
-[.agents/benchmark-record.md](../.agents/benchmark-record.md). For what the
-project is and how to run it, see the [README](../README.md); for per-capability
-lifecycle state, see [docs/STATUS.md](STATUS.md); for what is supported at all,
-see [docs/FEATURES.md](FEATURES.md).
-
 ## At a glance
 
 | Reference | Workload | Headline | Tokens |
