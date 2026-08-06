@@ -526,3 +526,101 @@ reduced-dim DiT gate into a GEOMETRY LADDER.
   embeddings, real fp64 position grid at full canvas, real per-token timesteps) is fed with
   RANDOM data here; a real-weights activation diff of the DiT inputs is the untested surface.
   Full tables: benchmark record (`row/H3-DIT-SCALE-GATE`).
+
+## 8.6 RENDER BUG CLOSED — wrong checkpoint PARTITION, not a code bug (2026-08-06, `row/H3-RENDER-CLOSE` PR #77)
+
+The #70/#74 white render was **using the wrong checkpoint partition for the task.**
+MiniMax-H3 ships two independently-served DiT partitions and the task MUST match
+(`recipes/MiniMaxAI/MiniMax-H3.md:50,289`; `pipeline._resolve_task` raises otherwise):
+
+| Partition | Serves | Available quantized DiT |
+|---|---|---|
+| **FL2VA** | **t2va + fl2va** | `MiniMax-H3-FL2VA-Q3_K_M.gguf` (GGUF), FL2VA NVFP4 (not downloaded) |
+| **Ref2VA** | ref2va (image/video + audio references) | `minimax_h3_ref2va_nvfp4_full` (the NVFP4 we had), REF2VA GGUF |
+
+Every render up to #74 ran **t2va on `minimax_h3_ref2va_nvfp4_full` (the Ref2VA
+partition)** — an out-of-distribution task/partition combination upstream rejects. That
+is the white latent, invariant to prompt/steps.
+
+**Verified before switching partitions (all NEW, real 512x512/22f scale, dgx):** the
+t2va DiT INPUTS diff EXACTLY vs upstream `pipeline_minimax_h3.py` (`VT_H3_DUMP_INPUTS`:
+packed layout / fp64 grid / token_tags / inverse+combined AdaLN indices / sigmas all
+byte-equal; tokenization byte-equal); the encoder conditioning is correctly shaped and
+carries the expected Qwen massive-activation; `DequantNvfp4ToBf16` is byte-exact
+(Laguna/Qwen3 + independent torch dequant); and the CUDA device forward == the CPU host
+forward at the REAL render seq (1920) at head_dim=128 (new permanent gate
+`test_minimax_h3 :: "CUDA device forward tracks the host at the REAL render seq (1920)"`,
+28/28) — closing the "CUDA kernel at scale" hole #74's CPU-backend device-vs-host left open.
+
+**Proof:** t2va on `MiniMax-H3-FL2VA-Q3_K_M.gguf` (`--dequant-bf16`, 512x512/22f, prompt
+"an orange cat sitting on a wooden table") renders a **COHERENT photorealistic orange cat
+on a wooden table** — VAE-input latent adj-cell cosine **0.9467** (white was 0.06), frame
+seam16/interior **1.00** (no patch grid), velocity stable ~1.37, final latent rms **1.00**.
+Valid h264 512x512 + AAC 32kHz mp4.
+
+**Fixed in this row:** `MiniMaxH3GenerateT2va` now strips the PREPENDED pinned reference
+rows (ref2va) before unpatchify/unpack — they are zeroed in the DiT output and only the
+trailing target rows are the clip; the old code fed unpatchify the full buffer and hit
+"rows not divisible by t*h*w" (no-op for t2va/fl2va). **Open:** a partition/supported_tasks
+guard mirroring upstream (community files strip the release config); the encoder vision
+tower (W3) is still unported, so image/video-conditioned ref2va/fl2va renders are not yet
+clean (ref2va with a synthetic reference + text-only encoder still grids).
+
+## 8.7 TASK/PARTITION GUARD — mirror `_resolve_task`'s raise (2026-08-06, `row/H3-TASK-PARTITION-GUARD` PR #84)
+
+The #70/#74 white grid cost three campaigns because our driver silently accepted
+`task=t2va` on the Ref2VA-partition checkpoint. Upstream `pipeline._resolve_task`
+RAISES on the mismatch (`pipeline_minimax_h3.py:374-391`, esp. 387-390); the recipe
+documents the split (`recipes/MiniMaxAI/MiniMax-H3.md:50-51,289`: "One server loads one
+checkpoint partition … must match the served partition"). This row mirrors the raise 1:1.
+
+**Partition detection — two paths, and the definitive no-discriminator finding.**
+Upstream reads the served-task set from the release config
+(`pipeline_minimax_h3.py:279-282`):
+
+```
+release = model_index.get("_minimax_h3") or {}
+self.partition       = str(release.get("partition", ""))       # "fl2va" | "ref2va"
+self.supported_tasks = frozenset(release.get("tasks") or ())
+```
+
+`MiniMaxH3PartitionFromModelIndex(model_index)` mirrors those exact keys. But community
+GGUF/NVFP4 redistributions STRIP that block, and — measured on the two real manifests
+this spec already captured — there is **NO structural fallback**: the Ref2VA NVFP4
+(1051 tensors) and FL2VA GGUF (535 tensors) carry the **IDENTICAL DiT**. Normalizing the
+NVFP4 `{weight, weight_scale, weight_scale_2}` split, both files reduce to the **SAME 535
+base tensor names AND the SAME shapes** (video_patch_proj `[5376,96]`, audio_patch_proj
+`[5376,32]`, condition_proj `[5376,5120]`, time_embedder.proj_in `[5376,256]` on both;
+`comm -23`/`-13` of the normalized name sets is empty both ways). Ref2VA conditioning is
+achieved by PREPENDING reference rows through the SAME `video/audio_patch_proj` weights,
+so it introduces no reference-specific tensor to key on. A name/shape auto-detector is
+therefore impossible in principle. When the config is stripped the partition must be
+**DECLARED** (`--partition fl2va|ref2va`), never guessed; `MiniMaxH3PartitionFromFlag`
+maps it to the recipe's served-task set (fl2va→{t2va,fl2va}, ref2va→{ref2va}).
+
+**The refuse.** `MiniMaxH3CheckTaskPartition(task, info)` is the raise half of
+`_resolve_task`. The task is what the request ENCODES (`MiniMaxH3TaskOfRequest`:
+`ref_blocks`→ref2va, `keyframe_frame_indices`→fl2va, else t2va), and
+`MiniMaxH3GenerateT2va` calls the pair before denoising. A declared partition refuses a
+task it does not serve; an UNKNOWN partition (stripped file, no `--partition`) refuses
+EVERY task as ambiguous and names the recipe lines. A default-constructed
+`MiniMaxH3PartitionInfo` (`declared=false`) leaves the guard inactive, so the pure
+pipeline-math unit tests are unaffected. Wired at both checkpoint-loading entry points:
+the driver (`--partition`) and the server (`--video-partition`).
+
+**Guard behavior table (task × partition → pass/refuse):**
+
+| task \ partition | FL2VA {t2va,fl2va} | Ref2VA {ref2va} | unknown/stripped |
+|---|---|---|---|
+| **t2va**  | pass | **REFUSE (the #77 mismatch)** | REFUSE (declare `--partition`) |
+| **fl2va** | pass | REFUSE | REFUSE |
+| **ref2va**| REFUSE | pass | REFUSE |
+
+**RED-first proof.** New case `test_minimax_h3 :: "the task/partition guard refuses the
+#77 mismatch"` (38 assertions): the #77 combo `MiniMaxH3CheckTaskPartition("t2va",
+ref2va)` throws; the correct pairings pass; the stripped case refuses every task and
+`--partition` recovers it; `MiniMaxH3TaskOfRequest` maps the three request shapes; and it
+asserts the two real manifests reduce to the identical 535-name set (proving the
+no-discriminator premise in the harness). Neutralizing the guard body (reviewer mutation)
+turned the case RED at 10 assertions, restoring it turned it GREEN — the test has teeth.
+Suite: 67/67 (66 prior + this), 46549 assertions. `test_video_api` 4/4 (server wiring).

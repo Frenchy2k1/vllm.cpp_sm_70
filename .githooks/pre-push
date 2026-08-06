@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Run the public-doc page gates against the COMMITS BEING PUSHED.
+#
+# Why this exists: docs/STATUS.md carries a shrink-only size ratchet and
+# docs/BENCHMARKS.md a per-cell budget, and both are enforced only in CI. A
+# landing that overshoots them turns main red for whoever pushes next, which is
+# the expensive moment to find out. scripts/agent-preflight.sh already runs
+# these two checkers, but it is opt-in and a forgotten run is exactly how
+# 8f752ae5 reached main over both limits.
+#
+# It checks the PUSHED COMMIT's tree, not the working tree, for two reasons:
+# a dirty checkout must not fail a clean push, and an uncommitted fix must not
+# let a broken commit through. This is the same content CI will see.
+#
+# Enable (once per clone):   git config core.hooksPath .githooks
+# Bypass a single push:      git push --no-verify
+#
+# stdin: <local_ref> <local_sha> <remote_ref> <remote_sha> per ref.
+
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+ZERO='0000000000000000000000000000000000000000'
+
+# The checkers and the paths they read. Keep both lists in sync with
+# scripts/agent-preflight.sh's CHECKERS entries for the same two gates.
+CHECKERS=(check-readme-structure.py check-public-doc-tables.py)
+EXPORT_PATHS=(README.md docs scripts .agents)
+
+shas=()
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  # A branch deletion pushes the null sha and has no tree to check.
+  [ "$local_sha" = "$ZERO" ] && continue
+  [ -z "$local_sha" ] && continue
+  shas+=("$local_sha")
+done
+
+# Nothing on stdin (a hand-run, or a git that passed no refs): check HEAD.
+if [ ${#shas[@]} -eq 0 ]; then
+  shas=("$(git rev-parse HEAD)")
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+failed=0
+for sha in "${shas[@]}"; do
+  work="$tmp/${sha}"
+  mkdir -p "$work"
+  # Fail CLOSED: an export we cannot read is content we cannot gate, and a
+  # silent skip is how an ungated page reaches main in the first place.
+  if ! git -C "$ROOT" archive "$sha" -- "${EXPORT_PATHS[@]}" 2>"$work/.archive-err" \
+      | tar -x -C "$work" 2>/dev/null; then
+    printf 'pre-push: could not export %s for checking\n' "${sha:0:12}" >&2
+    sed 's/^/  /' "$work/.archive-err" >&2
+    failed=1
+    continue
+  fi
+  for checker in "${CHECKERS[@]}"; do
+    [ -f "$work/scripts/$checker" ] || continue
+    if ! output="$(cd "$work" && python3 "scripts/$checker" 2>&1)"; then
+      printf 'pre-push: %s FAILED on %s\n' "$checker" "${sha:0:12}" >&2
+      printf '%s\n' "$output" | sed 's/^/  /' >&2
+      failed=1
+    fi
+  done
+done
+
+if [ "$failed" -ne 0 ]; then
+  cat >&2 <<'MSG'
+
+pre-push: refusing to push. Fix the pages and amend, or re-run with
+--no-verify if you are deliberately pushing over the budget.
+MSG
+  exit 1
+fi
+
+exit 0

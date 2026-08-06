@@ -168,7 +168,8 @@ defaults.
 | Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill (where we are 1.5% ahead). Indicative |
 | Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet |
 | Intel XPU | Intel GPUs | Spiked, hardware-blocked |
-| ROCm / ANE | AMD GPUs / Apple Neural Engine | Post-parity roadmap |
+| ROCm | AMD GPUs | No code yet. Bring-up is open for contribution: [ROCM.md](ROCM.md) |
+| ANE | Apple Neural Engine | Post-parity roadmap |
 
 Only GB10 / sm_121a is a runtime-gated CUDA target today. Consumer Blackwell
 (`120a`) plus the cross-family targets are build-supported (they compile and emit

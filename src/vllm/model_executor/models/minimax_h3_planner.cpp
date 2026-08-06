@@ -152,6 +152,115 @@ std::string MiniMaxH3ResolveTask(const std::string& requested, const std::string
   return task;
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoint PARTITION / task guard (the #77 follow-up)
+// ---------------------------------------------------------------------------
+namespace {
+
+// "{a, b, c}" for an error message.
+std::string JoinBraced(const std::vector<std::string>& items) {
+  std::string out = "{";
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (i != 0) out += ", ";
+    out += items[i];
+  }
+  out += "}";
+  return out;
+}
+
+}  // namespace
+
+// pipeline_minimax_h3.py:279-282 —
+//   release = model_index.get("_minimax_h3") or {}
+//   self.partition       = str(release.get("partition", ""))
+//   self.supported_tasks = frozenset(release.get("tasks") or ())
+MiniMaxH3PartitionInfo MiniMaxH3PartitionFromModelIndex(const nlohmann::json& model_index) {
+  MiniMaxH3PartitionInfo info;
+  info.declared = true;  // a real model_index.json was read; absence of the block
+                         // below leaves partition unknown (and the guard refuses).
+  if (!model_index.is_object()) return info;
+  const auto release_it = model_index.find("_minimax_h3");
+  if (release_it == model_index.end() || !release_it->is_object()) return info;
+  const nlohmann::json& release = *release_it;
+  const auto part_it = release.find("partition");
+  if (part_it != release.end() && part_it->is_string()) {
+    info.partition = ToLower(part_it->get<std::string>());
+  }
+  const auto tasks_it = release.find("tasks");
+  if (tasks_it != release.end() && tasks_it->is_array()) {
+    for (const nlohmann::json& t : *tasks_it) {
+      if (t.is_string()) info.supported_tasks.push_back(ToLower(t.get<std::string>()));
+    }
+  }
+  return info;
+}
+
+// The recipe's one-server-one-partition split (recipes/MiniMaxAI/MiniMax-H3.md:50-51):
+// FL2VA serves t2va + fl2va, Ref2VA serves ref2va. Mirrors the served-task set the
+// release model_index.json would have carried, for the community files that strip it.
+MiniMaxH3PartitionInfo MiniMaxH3PartitionFromFlag(const std::string& partition) {
+  MiniMaxH3PartitionInfo info;
+  info.declared = true;
+  info.partition = ToLower(partition);
+  if (info.partition.empty()) {
+    return info;  // declared-but-unknown: the guard refuses every task.
+  }
+  if (info.partition == "fl2va") {
+    info.supported_tasks = {"t2va", "fl2va"};
+  } else if (info.partition == "ref2va") {
+    info.supported_tasks = {"ref2va"};
+  } else {
+    VT_CHECK(false,
+             "minimax_h3: unknown --partition '" + partition +
+                 "' — expected fl2va or ref2va (recipes/MiniMaxAI/MiniMax-H3.md:50-51). "
+                 "FL2VA serves t2va+fl2va, Ref2VA serves ref2va.");
+  }
+  return info;
+}
+
+// The request fields are mutually exclusive (packed layout enforces it via
+// BuildMiniMaxH3PackedSequenceRef2va vs the keyframe path); ref2va prepends whole
+// reference BLOCKS, fl2va pins keyframe FRAMES of the output.
+std::string MiniMaxH3TaskOfRequest(const MiniMaxH3T2vaRequest& request) {
+  if (!request.ref_blocks.empty()) return "ref2va";
+  if (!request.keyframe_frame_indices.empty()) return "fl2va";
+  return "t2va";
+}
+
+// The raise half of `_resolve_task` (pipeline_minimax_h3.py:387-390):
+//   if task not in self.supported_tasks:
+//     raise ValueError(f"checkpoint partition {self.partition!r} supports "
+//                      f"{sorted(self.supported_tasks)}, got task={task!r}")
+// Extended for the stripped community files that carry no served-task set: an
+// unknown partition makes EVERY task ambiguous (the FL2VA/Ref2VA DiTs are
+// indistinguishable), so it refuses and names the recipe lines instead of guessing.
+void MiniMaxH3CheckTaskPartition(const std::string& task, const MiniMaxH3PartitionInfo& info) {
+  if (!info.declared) return;  // no checkpoint metadata supplied → guard inactive.
+  const std::string t = ToLower(task);
+  if (info.supported_tasks.empty()) {
+    VT_CHECK(false,
+             "minimax_h3: cannot run task '" + t +
+                 "' — this checkpoint does not declare its partition. Community "
+                 "GGUF/NVFP4 files strip model_index.json `_minimax_h3`, and the "
+                 "FL2VA and Ref2VA DiTs are byte-structurally identical (same tensor "
+                 "names AND shapes), so the partition cannot be inferred from the "
+                 "weights. Pass --partition fl2va|ref2va. One server serves one "
+                 "partition: FL2VA serves t2va+fl2va, Ref2VA serves ref2va "
+                 "(recipes/MiniMaxAI/MiniMax-H3.md:50-51,289; "
+                 "pipeline_minimax_h3.py:374-391).");
+  }
+  const bool served =
+      std::find(info.supported_tasks.begin(), info.supported_tasks.end(), t) !=
+      info.supported_tasks.end();
+  VT_CHECK(served,
+           "minimax_h3: checkpoint partition '" + info.partition + "' supports " +
+               JoinBraced(info.supported_tasks) + ", got task='" + t +
+               "'. t2va/fl2va require the FL2VA partition, ref2va requires Ref2VA; "
+               "one server serves one partition "
+               "(recipes/MiniMaxAI/MiniMax-H3.md:50-51,289; "
+               "pipeline_minimax_h3.py:387-390).");
+}
+
 // _resolve_shape (pipeline_minimax_h3.py:393-434).
 MiniMaxH3ShapePlan MiniMaxH3ResolveShape(const std::string& task, double duration_seconds,
                                          int64_t requested_frames, int64_t height, int64_t width,

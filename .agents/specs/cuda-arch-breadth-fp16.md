@@ -95,6 +95,20 @@ SIGNAL:
 |---|---|---|---|---|
 | Turing `sm_75` | T4 (cloud-ubiquitous), RTX 20-series, GTX 16-series, Quadro RTX | **common + cloud-reachable** (T4 on every major cloud) | `DERIVED+BUILD-VERIFIED (testing-welcome)` | no Turing board here; W-work stops at build+SASS |
 | Volta `sm_70` | V100 (cloud), Titan V, Quadro GV100 | cloud-reachable (V100) | `NOT-YET-BUILDABLE` → then `DERIVED+BUILD-VERIFIED` | needs `<13` toolkit first |
+
+**Prior art on Volta, and independent confirmation of the toolkit pin
+(2026-08-06, user-supplied).** [`1CatAI/1Cat-vLLM`](https://github.com/1CatAI/1Cat-vLLM)
+is a V100 / `sm_70`-focused **fork of vLLM** serving Qwen-class AWQ (and
+experimental fp8) models on Volta. It **pins CUDA 12.8**, which is an
+independent confirmation of the `<13` toolkit constraint W5 records rather than
+an assumption of ours. Its `sm_70` kernels derive from **TurboMind** plus a
+custom Volta FlashAttention, so it is a SECOND reference body for this lane
+next to llama.cpp's `ggml-cuda` (`fattn-tile`/`fattn-vec`) — useful when W5/W6
+pick a source, and evidence that the arch is worth the work to somebody. Its
+own stated limits are worth carrying into any claim we make: slow first-request
+warmup on V100, MTP degrading long-context throughput there, fp8 experimental.
+Not a vLLM upstream capability: upstream vLLM still drops Volta, so this changes
+nothing about the "no vLLM oracle on these cards" rule in Risks §2.
 | Pascal `sm_60` | P100 (datacenter, fast fp16) | old, some cloud | `NOT-YET-BUILDABLE` → then `DERIVED+BUILD-VERIFIED` | needs `<13` toolkit first |
 | Pascal `sm_61` | P40, GTX 10-series, Titan X/Xp | old, plentiful used | `NOT-YET-BUILDABLE` → then `DERIVED+BUILD-VERIFIED` | needs `<13` toolkit + fp32-accum (slow fp16, see below) |
 

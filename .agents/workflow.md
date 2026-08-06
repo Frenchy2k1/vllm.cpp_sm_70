@@ -163,6 +163,50 @@ Run `scripts/agent-onboard.py --probe` to see what is still unresolved.
      by `developer-preferences.md`. The project protocol itself grants no push,
      merge, force-update, or remote-host authority.
 
+<!-- orchestration-loop:begin -->
+### Running a row through sub-agents
+
+If you claimed `operator` in the role interview above, this is the loop. It sits
+BELOW the numbered protocol on purpose: steps 0–6 apply to every role, this
+section only to an operator, and a helper skipping an operator-only heading must
+never skip "Declare your role". You decompose, dispatch, verify and integrate;
+you do not write the feature. Tasks run **serially** — never two implementers in
+one worktree.
+
+1. Dispatch a **fresh** implementer ([prompt](prompts/implementer.md)). It works
+   TDD, commits in its own worktree, and returns the SHA.
+2. **Run the row's gate yourself.** Never take the implementer's word for
+   "done": if done is the author's own opinion of its work, the loop has no
+   floor at all.
+3. Dispatch a **fresh** reviewer ([prompt](prompts/reviewer.md)) —
+   never the agent that wrote the code. Its binding instruction is to
+   **mutate, not read**: delete the line each test names, re-run, and a test
+   that stays green is a finding. Seventeen such tests are known as of
+   2026-08-06 — eleven across the two branches that built this protocol, six
+   more on this one — a gate's own default satisfied by an unrelated line, a
+   probe with five hardcoded fields, a cannot-fail rule that rejected nothing,
+   a wiring test green even with its gate in report mode — and **not one was
+   visible by reading a diff**. Read that as a dated floor, not a running
+   total: the reviewer prompt still carries the earlier floor of eleven, and
+   these counts only grow. A reviewer who reads is worth very little. The whole
+   return is in the mutation step.
+4. Findings go back to a fresh implementer, then a **scoped re-review** of the
+   fix diff only. **Never fix findings yourself** — a controller fix pollutes
+   the context that exists to coordinate, and skips review entirely.
+
+A gate command must exit nonzero on failure. Never `true`, never `echo ok`,
+never piped — `cmd | tail` reports `tail`'s status, not the command's.
+`scripts/check-gate-commands.py` pins the SET of rows that already carry a gate
+command, and it is an **exact pin**, not a shrink-only floor: a row may never
+lose one, and a row that gains one turns the suite red just the same. Any
+movement, up or down, re-pins `RUNNABLE_BASELINE` in the same change, naming the
+rows and the reason. Growth is welcome; silent growth is not.
+
+Interactive is the default. In a **declared** headless run, decide rather than
+ask, record every decision in [state.md](state.md), park what will not go
+green, and never merge.
+<!-- orchestration-loop:end -->
+
 ## Obligated public surfaces
 
 These are the surfaces `scripts/check-doc-checkpoint.py` enforces, declared here

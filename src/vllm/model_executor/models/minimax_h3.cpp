@@ -891,6 +891,86 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     in.refiner_cu_seqlens = refiner_cu.data();
     in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
 
+    // DIAGNOSTIC (env-gated, byte-identical when unset): VT_H3_DUMP_INPUTS=<dir>
+    // dumps every DiT input at STEP 0 as raw little-endian binary plus a text
+    // manifest, so the real-scale driver's DiT inputs can be diffed EXACTLY against
+    // upstream pipeline_minimax_h3.py's construction (packed layout, fp64 position
+    // grid, per-token modality tags, per-token timestep -> unique/inverse ->
+    // combined AdaLN index) and the encoder conditioning statistically. This is the
+    // S1 surface #70/#74 never isolated: the ladder fed RANDOM inputs; the real
+    // render's INPUTS are the untested corner. Only step 0 (the layout and the
+    // timestep partition are the same shape every step).
+    if (step == 0) {
+      if (const char* dump_inputs_dir = std::getenv("VT_H3_DUMP_INPUTS")) {
+        const std::string dir(dump_inputs_dir);
+        auto wr = [&](const char* name, const void* p, size_t bytes) {
+          std::FILE* f = std::fopen((dir + "/" + name).c_str(), "wb");
+          if (f == nullptr) return;
+          std::fwrite(p, 1, bytes, f);
+          std::fclose(f);
+        };
+        // per-token pre-unique timesteps (before torch.unique) and combined AdaLN idx
+        std::vector<int64_t> combined_dump(static_cast<size_t>(seq_len));
+        for (int64_t i = 0; i < seq_len; ++i) {
+          const int64_t tag = branch.token_tags[static_cast<size_t>(i)] < 0
+                                  ? 0
+                                  : branch.token_tags[static_cast<size_t>(i)];
+          combined_dump[static_cast<size_t>(i)] =
+              inverse[static_cast<size_t>(i)] * kMiniMaxH3AdalnModalityNum + tag;
+        }
+        wr("timesteps_pretoken.f32", timesteps.data(), timesteps.size() * sizeof(float));
+        wr("unique_timesteps.f32", unique.data(), unique.size() * sizeof(float));
+        wr("inverse_indices.i64", inverse.data(), inverse.size() * sizeof(int64_t));
+        wr("combined_indices.i64", combined_dump.data(), combined_dump.size() * sizeof(int64_t));
+        wr("token_tags.i64", branch.token_tags.data(),
+           branch.token_tags.size() * sizeof(int64_t));
+        wr("img_position_ids.f64", packed.img_position_ids.data(),
+           packed.img_position_ids.size() * sizeof(double));
+        wr("input_ids.i64", packed.input_ids.data(), packed.input_ids.size() * sizeof(int64_t));
+        wr("image_mask.u8", packed.image_mask.data(), packed.image_mask.size());
+        wr("audio_mask.u8", packed.audio_mask.data(), packed.audio_mask.size());
+        wr("img_pos.i64", packed.img_pos.data(), packed.img_pos.size() * sizeof(int64_t));
+        wr("audio_pos.i64", packed.audio_pos.data(), packed.audio_pos.size() * sizeof(int64_t));
+        wr("text_pos.i64", packed.text_pos.data(), packed.text_pos.size() * sizeof(int64_t));
+        wr("update_mask.u8", packed.update_mask.data(), packed.update_mask.size());
+        wr("audio_update_mask.u8", audio_update.data(), audio_update.size());
+        wr("cu_seqlens.i32", packed.cu_seqlens.data(),
+           packed.cu_seqlens.size() * sizeof(int32_t));
+        wr("document_id.i64", packed.document_id.data(),
+           packed.document_id.size() * sizeof(int64_t));
+        wr("sigmas_video.f64", sigmas_video.data(), sigmas_video.size() * sizeof(double));
+        wr("sigmas_audio.f64", sigmas_audio.data(), sigmas_audio.size() * sizeof(double));
+        wr("prompt_embeds.f32", branch.text_embeddings.data(),
+           branch.text_embeddings.size() * sizeof(float));
+        std::FILE* mf = std::fopen((dir + "/manifest.txt").c_str(), "wb");
+        if (mf != nullptr) {
+          std::fprintf(mf,
+                       "seq_len=%lld\nnum_unique_timesteps=%lld\nnum_img_pos=%lld\n"
+                       "num_audio_pos=%lld\nnum_text_pos=%lld\ntext_dim=%lld\n"
+                       "video_row_width=%lld\naudio_latents_dim=%lld\nnum_steps=%lld\n"
+                       "s_v0=%.17g\ns_a0=%.17g\nt_v0=%.17g\nt_a0=%.17g\n"
+                       "imgvid_cond_t0=%.17g\naudio_ref_cond_t0=%.17g\n"
+                       "prompt_embeds_rows=%lld\n",
+                       static_cast<long long>(seq_len),
+                       static_cast<long long>(unique.size()),
+                       static_cast<long long>(num_img),
+                       static_cast<long long>(num_audio),
+                       static_cast<long long>(packed.text_pos.size()),
+                       static_cast<long long>(params.text_dim),
+                       static_cast<long long>(video_width),
+                       static_cast<long long>(audio_width),
+                       static_cast<long long>(num_steps), s_v, s_a, t_v, t_a, imgvid_cond_t,
+                       audio_ref_cond_t,
+                       static_cast<long long>(branch.text_embeddings.size() /
+                                              (params.text_dim > 0 ? params.text_dim : 1)));
+          std::fclose(mf);
+        }
+        std::fprintf(stderr, "[h3-dump-inputs] wrote DiT step-0 inputs to %s (seq_len=%lld)\n",
+                     dir.c_str(), static_cast<long long>(seq_len));
+        std::fflush(stderr);
+      }
+    }
+
     const auto step_t0 = now();
     const MiniMaxH3DitOutputs velocity =
         on_device ? MiniMaxH3DitForwardDevice(
