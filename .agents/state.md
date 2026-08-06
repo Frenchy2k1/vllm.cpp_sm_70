@@ -39708,3 +39708,80 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
 
   Next: `VK-A1` (shader-variant pipeline + the feature-matrix drift repair),
   which blocks every shader written after it.
+
+- **2026-08-06 (later)** — **`VK-A1` LANDED: the Vulkan shader-variant mechanism,
+  two CI gates, and a corrected baseline (`CLAIM-VULKAN-FULL-1`, row
+  `BACKEND-VULKAN`, [spec §6.1](specs/vulkan-full-support.md)).**
+
+  **DECISION.** Keep the committed-SPIR-V route (the build needs no shader
+  toolchain on any machine) but make **specialization constants** the variant
+  mechanism instead of GLSL `#define`s. llama.cpp spells a variant as a `#define`,
+  so every dtype x quant x coopmat-tier combination is a separate module — 242
+  `string_to_spv(` call sites at pin `237ad9b96`. A specialization constant is ONE
+  module specialized at pipeline creation, so artifact count tracks shader FILES
+  rather than their cross product.
+
+  **THE BASELINE IN THE SPEC WAS WRONG, and the gate that should have said so was
+  RED and invisible.** `test_vulkan_backend` asserted that Vulkan's unimplemented
+  ops make `vt::GetOp` throw. They have not since accelerator-seam row `S5`
+  (`af0b21ba`) gave unified-memory devices the portable reference tier; the Metal
+  sibling was updated as Metal work continued, Vulkan was not, and **nothing could
+  catch it because `VLLM_CPP_VULKAN=ON` appeared nowhere in `ci.yml`** — the
+  backend was built on no machine. Re-counted at RUNTIME on a Vulkan-ON build: of
+  **87** CPU-registered ops, **8** are NATIVE on Vulkan, **79** are served by the
+  reference tier (CPU kernel against shared memory), and **0** throw. So the
+  spec's "`GetOp` throws" and "8 of 83" are both superseded, every op a model
+  needs already resolves, and the campaign's real content is moving those 79 off
+  the host — a PERFORMANCE project, not a make-it-run one.
+  `vt::GetReferenceTierHits()` is the progress metric; it must reach 0.
+  HONEST LIMIT: op resolution is not an end-to-end claim —
+  `get_attn_backend_priority()` is still EMPTY and no model was run.
+
+  **MEASURED NEGATIVE RESULT — the workgroup size cannot be a specialization
+  constant at this target, do not retry it.** `VT_TG` is written down three times
+  (`vt_common.glsl`, each `.comp`'s `local_size_x`, `kWorkgroupSize` on the host,
+  which derives the workgroup COUNT from it), exactly the shape a specialization
+  constant should collapse. `layout(local_size_x_id = 0)` makes glslang emit
+  `ExecutionMode LocalSize 1 1 1` plus the legacy `BuiltIn WorkgroupSize` vector,
+  because the modern `LocalSizeId` mode needs SPIR-V 1.2 + `VK_KHR_maintenance4`
+  (core in Vulkan 1.3) and this backend targets `vulkan1.1` deliberately. On
+  llvmpipe the literal `LocalSize 1` wins: each workgroup runs ONE thread against
+  a `ceil(n/128)` dispatch, and cross-device NMSE went from ~1e-14 to **0.99 on
+  `kAdd`**. An A/B isolated it (keep the constant, revert only `local_size_x_id`
+  → fully green), so specialization constants work and the launch geometry is what
+  cannot use them. Half-converting would be worse than not converting — a
+  host-settable `VT_TG` the actual workgroup size does not follow silently
+  corrupts — so it stays a `#define` with the measurement recorded beside it.
+
+  **Delivered.** glslang **16.5.0** pinned (the recorded `16.4.0` ships NO release
+  assets, so it could never back a CI gate; the committed SPIR-V reproduces
+  byte-for-byte under 16.5.0, proving both the artifact's provenance and that the
+  output survives a minor bump). CI job `vulkan-spirv-freshness`, pinning the
+  download URL rather than a version string, mutation-proved red-then-green. CI job
+  `build-test-vulkan`, GPU-free on llvmpipe, running the backend gate and the
+  cross-device numerics — the hole that let the suite rot. SpecId metadata parsed
+  from `OpDecorate SpecId` in the emitted module, checked by count in
+  `GetPipeline` because Vulkan SILENTLY IGNORES an undeclared constantID.
+  Specialized pipelines with the cache keyed by specialization, the
+  `VkSpecializationInfo` held in named locals that outlive
+  `vkCreateComputePipelines`. **`vt_cast`'s dtype pair as the first real variant
+  axis** — one module still serves every (src, dst) pair and the module got
+  SMALLER, 109,436 → 109,216 bytes, gated on the pipeline cache growing by TWO
+  across two pairs. SPIR-V words moved into `vulkan_spirv.cpp`, header 3,487 → 55
+  lines. A latent descriptor-pool bug fixed: the pool was sized one set per MODULE,
+  but since specialization a module has many pipelines each allocating a set.
+  Record repaired: `feature-matrix.md:280` `INVENTORIED` → `ACTIVE`.
+
+  **Deliberately NOT done:** the `vt::arch_tactics` generalization. A tactic
+  registry with exactly one tactic is speculative; it belongs with `VK-C`.
+
+  Gates: clean `-Werror` Vulkan-ON build 0 warnings; `test_vulkan_backend` 10/10
+  (405 assertions), `test_backend_cross_device` 6/6 (73, incl. the bit-exact bf16
+  codec tier), generator suite 9/9, `--check` green on both generated files.
+  `CMakeLists.txt`'s tri-state untouched, so `AUTO` still resolves OFF and the CUDA
+  gate build is unaffected by construction. **No speed number measured, claimed or
+  owed.**
+
+  Next: `VK-B` — but re-scoped by the reference-tier finding. It is no longer
+  "make a model run"; it is "get the dense path off the host tier", starting with
+  `get_attn_backend_priority()`, which is the untested platform-seam gate.
