@@ -39785,3 +39785,45 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
   Next: `VK-B` — but re-scoped by the reference-tier finding. It is no longer
   "make a model run"; it is "get the dense path off the host tier", starting with
   `get_attn_backend_priority()`, which is the untested platform-seam gate.
+
+- **2026-08-06 (later still)** — **First `VK-B` bricks: Vulkan gains native GEMM,
+  embedding and greedy argmax (`CLAIM-VULKAN-FULL-1`, row `BACKEND-VULKAN`).**
+  Native kernels **8 → 12**; reference-tier ops **79 → 75** (re-measured with the
+  same runtime probe, not re-grepped). The four that moved are `kMatmul`,
+  `kMatmulBT`, `kEmbedding`, `kGreedyArgmax` — the model's two ends plus the op it
+  spends most of its time in.
+
+  **GEMM** ports the CPU numeric contract exactly (`cpu_ops.cpp:187-260`
+  `MatmulChunked`): one invocation per OUTPUT ELEMENT with the whole K reduction
+  on it, sequential f32 accumulation, rounded once on store — the CPU kernel never
+  splits a K reduction across threads, so the two backends share an accumulation
+  ORDER rather than merely a tolerance. **Deliberately not tiled**: llama.cpp's
+  `mul_mm.comp` / `mul_mm_cm2.comp` are `VK-C`, which needs this as a
+  known-correct same-device A/B reference. ONE module serves **54 variants**
+  (3 dtypes x a/b/out, times 2 orientations) through specialization constants —
+  the `VK-A1` mechanism paying for itself at 54:1, where llama.cpp would emit 54
+  modules.
+
+  **Greedy argmax is one invocation per ROW, and that is a contract decision.**
+  `cpu_sample.cpp:49` scans with a strict `>`, so the FIRST maximum wins; greedy
+  decode is gated token-for-token against a vLLM golden, so a tie-indifferent tree
+  reduction returns a DIFFERENT TOKEN, not a rounding difference. The gate plants
+  a deliberate tie (row 0, columns 2 and 5) and requires 2, and asserts the ORACLE
+  honours it first so the test cannot pass by both sides being wrong together.
+  A parallel reduction must carry the index and break ties toward the lower one at
+  every merge; that is a separate change with its own gate.
+
+  **Embedding** reads only the low 32 bits of an i64 id (a vocabulary index the
+  host already range-checked, far below 2^31), avoiding `VK_KHR_shader_int64` at
+  the 1.1 floor. The CPU `VT_CHECK` on id range has no shader equivalent — a
+  shader cannot throw and a per-element bounds branch would cost the gather — but
+  `vt::Embedding` validates on the host before dispatch. Gated EXACTLY, not by
+  NMSE (a gather moves bytes), with REPEATED ids so a positional consumer fails,
+  and i32/i64 covered separately as different index paths.
+
+  Gates: clean `-Werror` Vulkan-ON build 0 warnings; `test_vulkan_backend` 10/10
+  (434 assertions), `test_backend_cross_device` 8/8 (88), generator suite 9/9,
+  `--check` green. Still on the reference tier and NOT native: paged attention,
+  the KV cache ops, the whole RoPE family, quant, MoE, GDN/MLA and every sampler
+  beyond greedy argmax. `get_attn_backend_priority()` remains EMPTY, so no model
+  runs end to end on Vulkan and no speed number is measured, claimed or owed.
