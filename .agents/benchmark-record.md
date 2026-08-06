@@ -81,6 +81,55 @@ this row (all additive; 27/35 byte-unchanged; CPU contract tests 45/45): `online
 `q3mxfp4` key + `POINTS_BY_MODEL`/`points_for`; `mxfp4_smoke_gate.py`;
 `dgx-online-serving.sh` q3mxfp4 branches; `mxfp4-online-serving-grid.sh` orchestrator.
 
+## QUANT-CT-MXFP4 c2-c8 gap — grouped-Marlin config lever REFUTED (2026-08-08, `row/QUANT-CT-MXFP4-M28-LEVER`, GB10, build `33e93608`==main)
+
+The binding (#45) attributed the c2-c8 TPOT deficit to "our per-expert/grouped Marlin
+tiling vs vLLM's Marlin as M grows 2->8" and named the fix as porting vLLM's M-dependent
+`thread_m_blocks`/tile selection. Profiled BOTH engines and ran the per-shape arbiter; the
+attribution is **wrong** — our Marlin already matches vLLM's per-shape.
+
+**Same-tool per-shape microbench** (`~/mxfp4-nsys/mxfp4_marlin_ubench.py`; oracle compiled
+ops, cuda-event timed; dense `ops.marlin_gemm` = what vLLM runs for a dense MXFP4 linear vs
+`ops.moe_wna16_marlin_gemm` E=1 = our production kernel's 1:1 upstream twin; Qwen3-8B decode
+shapes qkv 6144x4096, o 4096x4096, gate/up 12288x4096, down 4096x12288, gs=32):
+
+| M | dense/layer us | moe/layer us | moe/dense | dense step ms (x36) | moe step ms | delta ms |
+|---|---|---|---|---|---|---|
+| 1 | 226.6 | 231.7 | 1.023 | 8.16 | 8.34 | +0.18 |
+| 2 | 231.5 | 228.3 | 0.986 | 8.33 | 8.22 | -0.12 |
+| 4 | 223.7 | 240.8 | 1.077 | 8.05 | 8.67 | +0.62 |
+| 8 | 237.6 | 242.3 | 1.020 | 8.55 | 8.72 | +0.17 |
+
+Per-shape at M=8: qkv 1.111, o 1.026, gate 1.002, up 0.998, down 1.030. All deltas are noise
+(<0.6 ms/step; M=2 favors MoE). **Our MoE-E1 Marlin == vLLM dense `marlin_gemm` at every M**,
+so routing to vLLM's dense marlin config cannot close the ~4.3 ms/step (11%) gap. (Source:
+vLLM dense route `apply_fp4_marlin_linear`->`ops.marlin_gemm`, `marlin.cu:438`
+`m_block_size_8=prob_m<=8`; ours `MoeGroupedGemmNvfp4Marlin` E=1, `marlin_mm_moe.cu:363`
+`thread_m_blocks=div_ceil(moe_block_size,16)`, `MarlinMoeAlignBlockSizeSelect`=16 at M=8.
+The dispatchers differ but the cost does not.)
+
+**nsys BOTH engines at c8** (aggregation-trap separated; TPOT reproduced: ours 39.53 vs vLLM
+33.81 ms). OURS (`nsys -t cuda --cuda-graph-trace=node`, kern_sum): decode Marlin dominates
+(`marlin_moe_wna16::Marlin` 58,854 inst Med **123us**; prefill Marlin separated 3,240 @ 2.03ms);
+attention flash_fwd_splitkv<128,64,128,4> Med **218us**; glue = SEPARATE launches
+(RmsNormRow*, MoeSiluMul, QkvSplit, RopeFromCache, ReshapeAndCache), one per op per layer.
+VLLM (online `/start_profile` torch profiler, chrome-trace aggregate): decode marlin
+`void marlin::Marlin` 13,680 @ **112.9us**; flash same traits @ **151us**; and the structural
+tell — the glue is **FUSED into the GEMM by Inductor**:
+`triton_red_fused_fused_add_rms_norm_marlin_gemm_{0,2}` (add+RMSNorm+quant prologue) and
+`triton_poi_fused_marlin_gemm_mul_silu_slice` (silu+mul epilogue). vLLM collapses our ~5
+separate glue launches/layer into the GEMM pro/epilogue.
+
+VERDICT: the decode Marlin GEMM is at vLLM per-shape parity (REFUTED lever). The residual is
+diffuse decode; the robust structural divergence is vLLM's Inductor **glue fusion** (portable-
+fusion class). REDIRECT (no ceiling): (1) portable fusion of add+RMSNorm+quant into the Marlin
+prologue and silu+mul into the epilogue; (2) a SAME-tool c1-vs-c2 OURS nsys diff to localize
+the STEP at c2 (our Marlin is M-independent M1->M2 per the microbench, so the step is attention
+batching, unfused glue traffic, or the async `max_concurrent_batches=2` overlap — not the GEMM);
+(3) same-tool re-check of the cross-tool per-call flags (marlin 123 vs 113us; attention 218 vs
+151us on identical flash traits). No code shipped — porting the dense marlin would gold-plate a
+refuted hypothesis. Evidence: `dgx:~/mxfp4-nsys/{kern_sum.txt,vllm_kern_sum.txt,ubench.log}`.
+
 ## DeepSeek-V4-Flash UD-IQ2_M — IQ2_S + MXFP4 CPU keep-quant bring-up (2026-08-03, `CLAIM-DSV4-UDIQ2M-QUANT`) — no throughput owed (off-GPU correctness bring-up)
 
 Off-GPU task (GB10 down, no nvcc on the dev box), so NO throughput is measured or owed. Adds the two per-tensor "dynamic" encodings the `unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_M` checkpoint's last 4 routed-expert slabs use — **IQ2_S** (ggml type 22; 2.5625 bpw codebook, Q8_K activation) and **MXFP4** (type 39; OCP micro-scaling fp4, 32-elem blocks, Q8_0 activation) — as first-class vt block dtypes (`kIQ2_S`/`kMXFP4`): block traits + dequant + a keep-quant `vec_dot`, ported 1:1 from llama.cpp `ggml-quants.c` @ 237ad9b96 (`iq2s_grid` 1024-entry codebook copied verbatim + direct sign bytes; `kvalues_mxfp4` + `e8m0_to_fp32_half`). The memory point: these load COMPRESSED (keep-quant) instead of the ~17 GiB bf16 expansion that OOM-reboots the 119 GiB pool.
