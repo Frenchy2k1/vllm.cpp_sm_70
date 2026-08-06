@@ -31,6 +31,14 @@ citing "vLLM 0.25.0" are the last binding measurement against the prior oracle
 
 ## Capability status
 
+Startup-latency axis (2026-08-06): `GATING / number-pending`. Cold launch-to-first-`/health` is now
+measurable on both arms through one shared probe (`scripts/dgx-online-serving.sh --startup-only`,
+`online_gate.py record-startup` / `summarize-startup`, 19 contract cases in
+`tests/tools/test_online_gate_startup.py`). The readiness cadence went 5 s -> 0.2 s (same 1800 s
+budget) because the old cadence was ~12% of the quantity being measured. A record cannot exist for a
+leg whose page cache was not dropped. **No ours-vs-vLLM startup number exists yet**; next gate is the
+3-repetition interleaved run on dgx. Detail: [spec](../.agents/specs/startup-latency-axis.md).
+
 Orchestration prompts (2026-08-06): tracked pair; 25 gate rows exact-pinned, step 5/5.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
