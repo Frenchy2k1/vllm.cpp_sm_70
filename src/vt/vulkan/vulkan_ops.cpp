@@ -112,6 +112,18 @@ struct EmbeddingParams {
 struct ArgmaxParams {
   uint32_t n, v, logits_off, out_off;
 };
+struct PagedAttnParams {
+  uint32_t total_q, hq, d, block_size, qpk, num_reqs;
+  uint32_t causal;
+  int32_t window_left, window_right;
+  uint32_t kc_blk, kc_pg, kc_hd;
+  uint32_t vc_blk, vc_pg, vc_hd;
+  uint32_t bt_row, bt_col;
+  uint32_t q_off, k_off, v_off, out_off;
+  uint32_t bt_off, sl_off, qsl_off;
+  float scale;
+  float softcap;
+};
 struct SiluMulParams {
   uint32_t t, d, x_dt, out_dt, x_off, out_off;
 };
@@ -133,6 +145,8 @@ struct FcParams {
 static_assert(sizeof(RmsParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(LayerNormParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(FcParams) <= 128, "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(PagedAttnParams) <= 128,
+              "push constants must fit the guaranteed 128 bytes");
 
 template <typename P>
 void Go(const char* name, const Binder& b, const P& p, uint32_t groups,
@@ -392,6 +406,95 @@ void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
   Go("vt_greedy_argmax", bind, p, FlatGroupCount(n));
 }
 
+// cpu_paged_attn.cpp:52-171 PagedAttentionKernel. ONE WORKGROUP per (query
+// token, query head), lanes splitting the head dimension; see the shader for why
+// the CPU's three passes become one online-softmax recurrence (its `probs` array
+// is one float per key in the window, which a shader cannot allocate).
+//
+// This is the only kernel in the backend with NO llama.cpp counterpart to port
+// from: its Vulkan backend has no paged KV anywhere. The block-table indirection
+// and windowing come from the CPU kernel above, the online-softmax skeleton from
+// flash_attn.comp's shape.
+void PagedAttentionKernel(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                          const Tensor& v_cache, const Tensor& block_table,
+                          const Tensor& seq_lens, const Tensor& query_start_loc,
+                          const PagedAttentionArgs& args) {
+  const int64_t num_reqs = seq_lens.shape[0];
+  const int64_t total_q = query.shape[0];
+  const int64_t hq = query.shape[1], d = query.shape[2];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t num_kv_heads = k_cache.shape[2];
+
+  // PER-CALL REFUSAL, not a silent regression. An fp8 KV cache stores 1-byte
+  // pages that must be dequantised as Dequant(fp8) * k_scale|v_scale before the
+  // f32 softmax (cpu_paged_attn.cpp:79-93). This shader reads f32/f16/bf16 only,
+  // so rather than throw -- which would REMOVE a capability the portable
+  // reference tier already provides -- it declines through the provider seam and
+  // forwards to the next provider down, which is exactly what GetOpFallback is
+  // for (op_provider.h:94-100: per-call refusal belongs in the kernel, because
+  // GetOp has no shape or dtype to inspect).
+  if (args.kv_cache_dtype != vt::Fp8KVCacheDataType::kAuto) {
+    auto next = reinterpret_cast<PagedAttentionFn>(
+        GetOpFallback(OpId::kPagedAttention, DeviceType::kVULKAN, kNativeProviderName));
+    next(q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
+    return;
+  }
+
+  if (total_q == 0 || hq == 0 || d == 0) return;
+  // The shader keeps its accumulator in VT_PA_ACC_MAX slots per lane, one per
+  // head-dim element the lane owns. Asserted rather than trusted: overflowing it
+  // would write past a local array.
+  VT_CHECK(d <= 8 * static_cast<int64_t>(kWorkgroupSize),
+           "vulkan paged attention: head dim " + std::to_string(d) +
+               " exceeds the per-lane accumulator (8 * workgroup)");
+  VT_CHECK(num_kv_heads > 0 && hq % num_kv_heads == 0,
+           "vulkan paged attention: query heads must be a multiple of kv heads");
+
+  Binder bind;
+  const uint32_t q_off = bind.Add(query, "paged_attn: query");
+  const uint32_t k_off = bind.Add(k_cache, "paged_attn: k_cache");
+  const uint32_t v_off = bind.Add(v_cache, "paged_attn: v_cache");
+  const uint32_t out_off = bind.Add(out, "paged_attn: out");
+  const uint32_t bt_off = bind.AddU32Only(block_table, "paged_attn: block_table");
+  const uint32_t sl_off = bind.AddU32Only(seq_lens, "paged_attn: seq_lens");
+  const uint32_t qsl_off = bind.AddU32Only(query_start_loc, "paged_attn: query_start_loc");
+
+  const int64_t wl = args.window_size.has_value() ? args.window_size->left : -1;
+  const int64_t wr = args.window_size.has_value() ? args.window_size->right : -1;
+
+  const uint32_t spec[4] = {DtypeCode(query.dtype), DtypeCode(k_cache.dtype),
+                            DtypeCode(v_cache.dtype), DtypeCode(out.dtype)};
+  PagedAttnParams p{static_cast<uint32_t>(total_q),
+                    static_cast<uint32_t>(hq),
+                    static_cast<uint32_t>(d),
+                    static_cast<uint32_t>(block_size),
+                    static_cast<uint32_t>(hq / num_kv_heads),
+                    static_cast<uint32_t>(num_reqs),
+                    args.causal ? 1u : 0u,
+                    static_cast<int32_t>(wl),
+                    static_cast<int32_t>(wr),
+                    static_cast<uint32_t>(k_cache.stride[0]),
+                    static_cast<uint32_t>(k_cache.stride[1]),
+                    static_cast<uint32_t>(k_cache.stride[2]),
+                    static_cast<uint32_t>(v_cache.stride[0]),
+                    static_cast<uint32_t>(v_cache.stride[1]),
+                    static_cast<uint32_t>(v_cache.stride[2]),
+                    static_cast<uint32_t>(block_table.stride[0]),
+                    static_cast<uint32_t>(block_table.stride[1]),
+                    q_off,
+                    k_off,
+                    v_off,
+                    out_off,
+                    bt_off,
+                    sl_off,
+                    qsl_off,
+                    args.scale,
+                    args.logits_soft_cap};
+  // One workgroup per (token, head) -- NOT FlatGroupCount, which divides by the
+  // workgroup size; here the whole workgroup cooperates on one output row.
+  Go("vt_paged_attn", bind, p, static_cast<uint32_t>(total_q * hq), spec, 4);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -400,6 +503,8 @@ struct Registrar {
     if (!VulkanContext::Available()) return;
     // static_cast against the ops.h aliases ties every kernel signature to the
     // registration contract at COMPILE time (the cpu_ops.cpp idiom).
+    RegisterOp(OpId::kPagedAttention, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<PagedAttentionFn>(&PagedAttentionKernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kGreedyArgmax, DeviceType::kVULKAN,

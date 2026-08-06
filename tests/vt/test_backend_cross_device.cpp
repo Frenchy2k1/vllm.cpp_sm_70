@@ -357,6 +357,102 @@ TEST_CASE("elementwise ops match the CPU oracle within NMSE <= 5e-4") {
   cpu.DestroyQueue(cq);
 }
 
+TEST_CASE("paged attention matches the CPU oracle within NMSE <= 5e-4") {
+  // GQA prefill: Hq=4 query heads over Hk=2 kv heads, head dim 8, block size 4,
+  // one request of 37 tokens spanning 10 pages. Ragged on purpose -- 37 is not a
+  // multiple of the block size, so the last page is partly occupied and a kernel
+  // that walked whole pages would read past the sequence.
+  constexpr int64_t kT = 37, kHq = 4, kHk = 2, kD = 8, kBS = 4;
+  constexpr int64_t kBlocks = (kT + kBS - 1) / kBS;  // 10
+
+  const std::vector<float> query = RandomVec(kT * kHq * kD, 601);
+  const std::vector<float> kc = RandomVec(kBlocks * kBS * kHk * kD, 602);
+  const std::vector<float> vc = RandomVec(kBlocks * kBS * kHk * kD, 603);
+  std::vector<int32_t> block_table(kBlocks);
+  // A NON-IDENTITY mapping, so a kernel that ignored the block table and indexed
+  // the cache linearly would fail. Page j lives at cache block (kBlocks-1-j).
+  for (int64_t b = 0; b < kBlocks; ++b) {
+    block_table[static_cast<size_t>(b)] = static_cast<int32_t>(kBlocks - 1 - b);
+  }
+  const std::vector<int32_t> seq_lens = {static_cast<int32_t>(kT)};
+  const std::vector<int32_t> qsl = {0, static_cast<int32_t>(kT)};
+
+  // Three configurations, because they are different branches in the kernel and
+  // a single causal case would leave two of them unexercised.
+  struct Cfg { const char* name; bool causal; bool window; float softcap; };
+  const Cfg cfgs[] = {
+      {"causal", true, false, 0.0f},
+      {"causal+softcap", true, false, 30.0f},   // cap * tanh(s / cap)
+      {"sliding-window", true, true, 0.0f},     // window_left bounds jmin
+  };
+
+  for (const Cfg& cfg : cfgs) {
+    CAPTURE(cfg.name);
+    vt::PagedAttentionArgs args;
+    args.scale = 0.353553f;
+    args.causal = cfg.causal;
+    args.logits_soft_cap = cfg.softcap;
+    // Both bounds must be >= 0 (ops.cpp:2778). right = 0 is the causal
+    // sliding window: no future keys, at most 8 past ones.
+    if (cfg.window) args.window_size = vt::AttentionWindow{8, 0};
+
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cq_v = query, ckc = kc, cvc = vc, ref(kT * kHq * kD);
+    std::vector<int32_t> cbt = block_table, csl = seq_lens, cqsl = qsl;
+    {
+      Tensor tq = Tensor::Contiguous(cq_v.data(), DType::kF32, cd, {kT, kHq, kD});
+      Tensor tkc = Tensor::Contiguous(ckc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+      Tensor tvc = Tensor::Contiguous(cvc.data(), DType::kF32, cd, {kBlocks, kBS, kHk, kD});
+      Tensor tbt = Tensor::Contiguous(cbt.data(), DType::kI32, cd, {1, kBlocks});
+      Tensor tsl = Tensor::Contiguous(csl.data(), DType::kI32, cd, {1});
+      Tensor tqsl = Tensor::Contiguous(cqsl.data(), DType::kI32, cd, {2});
+      Tensor to = Tensor::Contiguous(ref.data(), DType::kF32, cd, {kT, kHq, kD});
+      vt::PagedAttention(cq, to, tq, tkc, tvc, tbt, tsl, tqsl, args);
+    }
+    cpu.DestroyQueue(cq);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kPagedAttention, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dq(dev, q, kT * kHq * kD), dkc(dev, q, kBlocks * kBS * kHk * kD),
+          dvc(dev, q, kBlocks * kBS * kHk * kD), dout(dev, q, kT * kHq * kD);
+      dq.Upload(query);
+      dkc.Upload(kc);
+      dvc.Upload(vc);
+      void* dbt = dev.Alloc(kBlocks * sizeof(int32_t));
+      void* dsl = dev.Alloc(sizeof(int32_t));
+      void* dqsl = dev.Alloc(2 * sizeof(int32_t));
+      dev.Copy(q, dbt, block_table.data(), kBlocks * sizeof(int32_t));
+      dev.Copy(q, dsl, seq_lens.data(), sizeof(int32_t));
+      dev.Copy(q, dqsl, qsl.data(), 2 * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {kT, kHq, kD});
+      Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+      Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kF32, d, {kBlocks, kBS, kHk, kD});
+      Tensor tbt = Tensor::Contiguous(dbt, DType::kI32, d, {1, kBlocks});
+      Tensor tsl = Tensor::Contiguous(dsl, DType::kI32, d, {1});
+      Tensor tqsl = Tensor::Contiguous(dqsl, DType::kI32, d, {2});
+      Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {kT, kHq, kD});
+      vt::PagedAttention(q, to, tq, tkc, tvc, tbt, tsl, tqsl, args);
+      dev.Synchronize(q);
+
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+
+      dev.Free(dbt);
+      dev.Free(dsl);
+      dev.Free(dqsl);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
 TEST_CASE("Embedding gather and greedy argmax match the CPU oracle EXACTLY") {
   // Neither op is arithmetic, so neither gets the NMSE tier: a gather must move
   // the exact bytes, and an argmax must pick the exact index.

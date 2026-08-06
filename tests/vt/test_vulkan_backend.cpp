@@ -53,7 +53,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 10);
+  CHECK(n == 11);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -64,8 +64,9 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // and kCastF32 share vt_cast), so a rename in either direction breaks here
   // rather than at pipeline-creation time on a device we might not have.
   for (const char* want : {"vt_add", "vt_cast", "vt_embedding", "vt_fused_chain",
-                           "vt_greedy_argmax", "vt_layer_norm", "vt_matmul", "vt_relu",
-                           "vt_rms_norm", "vt_silu_and_mul"}) {
+                           "vt_greedy_argmax", "vt_layer_norm", "vt_matmul",
+                           "vt_paged_attn", "vt_relu", "vt_rms_norm",
+                           "vt_silu_and_mul"}) {
     bool found = false;
     for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
       if (std::strcmp(vt::vulkan::kSpirvModules[mi].name, want) == 0) found = true;
@@ -108,6 +109,10 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // table dtype, out dtype, id width (i32 vs i64).
       REQUIRE(m.spec_id_count == 3);
       for (uint32_t want = 0; want < 3; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_paged_attn") == 0) {
+      // query / k-cache / v-cache / out dtype.
+      REQUIRE(m.spec_id_count == 4);
+      for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul") == 0) {
       // a dtype, b dtype, out dtype, orientation: 3*3*3*2 = 54 variants served by
       // ONE committed module, which is the argument for specialization constants
@@ -325,13 +330,16 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
                       // VK-B: the dense path's GEMM (both orientations) and the
                       // two ends of the model, token ids in and out.
                       vt::OpId::kMatmul, vt::OpId::kMatmulBT,
-                      vt::OpId::kEmbedding, vt::OpId::kGreedyArgmax}) {
+                      vt::OpId::kEmbedding, vt::OpId::kGreedyArgmax,
+                      // Block-paged attention: the one kernel with no llama.cpp
+                      // Vulkan counterpart to port from.
+                      vt::OpId::kPagedAttention}) {
     CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
-  // No NATIVE Vulkan kernel yet for attention, the KV cache, RoPE, or the
-  // sampler beyond greedy argmax.
-  for (vt::OpId op : {vt::OpId::kPagedAttention, vt::OpId::kReshapeAndCache,
-                      vt::OpId::kRopeNeox, vt::OpId::kApplyTemperature}) {
+  // No NATIVE Vulkan kernel yet for the KV cache write, RoPE, or the sampler
+  // beyond greedy argmax.
+  for (vt::OpId op : {vt::OpId::kReshapeAndCache, vt::OpId::kRopeNeox,
+                      vt::OpId::kApplyTemperature, vt::OpId::kMoeRouterTopK}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kVULKAN));
   }
   // ...but they no longer THROW, and this assertion used to say they did.
@@ -351,14 +359,14 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
   // Measured on this tree (VK-A1, 2026-08-06): of 87 CPU-registered ops, 8 are
   // NATIVE on Vulkan, 79 are served by the reference tier, and ZERO throw.
   REQUIRE(vt::ReferenceTierEligible(DeviceType::kVULKAN));
-  // kPagedAttention, NOT kMatmul: matmul now has a native Vulkan kernel, so it
-  // would no longer exercise the tier. This op must stay one that is genuinely
-  // unimplemented, and it moves to the next such op as the backend fills in.
-  void* paged = nullptr;
-  CHECK_NOTHROW(paged = vt::GetOp(vt::OpId::kPagedAttention, DeviceType::kVULKAN));
-  CHECK(paged != nullptr);
+  // This must stay an op that is GENUINELY unimplemented natively, and it moves
+  // on as the backend fills in: it was kMatmul, then kPagedAttention, and both
+  // now have native kernels. kReshapeAndCache is the current one.
+  void* rac = nullptr;
+  CHECK_NOTHROW(rac = vt::GetOp(vt::OpId::kReshapeAndCache, DeviceType::kVULKAN));
+  CHECK(rac != nullptr);
   // BY NAME, so a host kernel can never masquerade as a native Vulkan one (Risk 7).
-  const auto stats = vt::GetOpProviderStats(vt::OpId::kPagedAttention, DeviceType::kVULKAN);
+  const auto stats = vt::GetOpProviderStats(vt::OpId::kReshapeAndCache, DeviceType::kVULKAN);
   REQUIRE(stats.last_selected != nullptr);
   CHECK(std::string(stats.last_selected) == std::string(vt::kReferenceProviderName));
   CHECK(vt::GetReferenceTierHits() > 0);

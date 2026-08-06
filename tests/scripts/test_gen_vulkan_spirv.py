@@ -102,6 +102,7 @@ class CommittedArtifact(unittest.TestCase):
         "vt_cast": "src and dst dtype",
         "vt_matmul": "a/b/out dtype plus the b orientation",
         "vt_embedding": "table/out dtype plus the id width",
+        "vt_paged_attn": "query/k-cache/v-cache/out dtype",
     }
 
     def test_specialized_shaders_declare_their_constants(self):
