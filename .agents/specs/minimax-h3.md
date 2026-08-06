@@ -313,3 +313,137 @@ covers only the vLLM repo; H3 lives outside it. (b) The MP4 dependency decision.
 (c) Hardware: nothing past W2b/W3 can be END-TO-END gated on this project's boxes,
 so W4-W8 should be reviewed as structural ports with unit gates, and the honest
 lifecycle cap for this row is "correctness-complete, hardware-blocked".
+
+## 8. W-FP4 — the fp4 SPEED path (row `row/H3-FP4-SPEED`, 2026-08-06)
+
+Until this change the NVFP4 arm ran the DiT projections in **bf16**: both the
+reference loader (`LoadMiniMaxH3DitFromNvfp4`) and the streaming stager
+(`StreamMiniMaxH3Nvfp4ToDeviceBf16`) DEQUANTIZE every packed FP4 weight to bf16 and
+the device forward calls `vt::MatmulBT`. The sm_121a FP4 tensor-core route had
+never actually run for H3. W-FP4a wires it.
+
+### 8.1 W-FP4a — per-shape routing table (grounded in `dense_nvfp4_gemm.h`)
+
+The `lilcheaty/MiniMax-H3-NVFP4` checkpoint is **weight-only NVFP4 (W4A16)**: every
+quantized projection carries only `weight` (U8 E2M1) + `weight_scale` (E4M3, group
+16) + `weight_scale_2` (F32) and **no `input_activations`** (confirmed
+`minimax_h3_nvfp4.cpp:63-76` and the real manifest, spec §4). Per the dispatcher's
+own contract (`dense_nvfp4_gemm.h:12-22`, mirroring vLLM
+`kernels/linear/__init__.py:879-881` — *"Force a16 (Marlin) when running
+weight-only quantization"*), a W4A16 weight (`Nvfp4Weight::IsTrueW4A4()==false`,
+alpha==0) is **forced to the Marlin W4A16 grouped GEMM**, bypassing the
+capability-based kernel registry. So on sm_121a **every quantized H3 projection
+takes the SAME kernel** — `dense_nvfp4::MatmulNvfp4MarlinD` (single-expert
+`vt::MoeGroupedGemmNvfp4Marlin`), the exact path the Laguna routed-experts
+(`laguna.cpp`) and the dense Qwen3-32B NVFP4 arm (`qwen3_5.cpp`) use. The
+cutlass-FP4 / true-W4A4 route (`MatmulNvfp4Fp4D`) is NOT taken here: it needs fp4
+ACTIVATIONS this checkpoint does not carry, and is deliberately private to
+`qwen3_5.cpp` (`dense_nvfp4_gemm.h:12-18`).
+
+Real geometry: H=5376, ffn=14336, heads=56×128 (inner=7168), time_embed_dim=2688,
+text_dim=5120, adaln_out=18·H=96768, final_adaln=2·H=10752.
+
+| Projection (per layer unless noted) | `[N, K]` | Route | Why (file:line) |
+|---|---|---|---|
+| `attn.qkv_proj` | `[21504, 5376]` | **Marlin W4A16** | W4A16 forced-Marlin `dense_nvfp4_gemm.h:512-525` |
+| `attn.out_proj` | `[5376, 7168]` | **Marlin W4A16** | same |
+| `mlp.fc1` (merged `[gate;up]`) | `[28672, 5376]` | **Marlin W4A16** → `SiluAndMul` | fc1 is ALREADY merged, so ONE GEMM to `[M,2·ffn]` then `vt::SiluAndMul`; the fused-pair `GateUpFusedMarlinD` does NOT apply (no separate gate/up shards) — `minimax_h3_device.cpp` `MlpDev` |
+| `mlp.fc2` | `[5376, 14336]` | **Marlin W4A16** | same |
+| `adaln_proj.linear` (block) | `[96768, 2688]` | **Marlin W4A16** (+ bias `vt::Add`) | skinny-M (M=num_unique_timesteps): Marlin `block=8` dense tile at M≤8, `dense_nvfp4_gemm.h:273-286` |
+| `condition_proj` | `[5376, 5120]` | **Marlin W4A16** (+ bias) | embed, once |
+| `final_layer.adaln_proj.linear` | `[10752, 2688]` | **Marlin W4A16** (+ bias) | final, once |
+| refiner `qkv/out/fc1/fc2` (×2) | same as block | **Marlin W4A16** | refiner has no adaln |
+| **islands** (`video/audio_patch_proj`, `time_embedder.*`, `final_layer.{video,audio}_out`) + all norms/biases | — | **`vt::MatmulBT` bf16 / f32 (unchanged)** | fp32 island policy (`minimax_h3_transformer.py:85-101`); never quantized in the checkpoint |
+
+All N and K are multiples of 16 (group) and of 128 (Marlin tile) — no shape blocker.
+The activation MUST be bf16 for the Marlin path; in the bf16 production stream it is,
+so the fp4 arm pairs with the bf16 stream. In the f32 parity stream (or any backend
+without the Marlin op — e.g. CPU) the SAME dispatcher falls back to a
+redundant-dequant GEMM, so the arm is correct either way, fast only where Marlin is
+realized (kCUDA sm_121a).
+
+**Implementation (this change, NO new quant code):** `Nvfp4Weight` fp4 carriers on
+`MiniMaxH3DitBlockWeights`/`MiniMaxH3DitWeights`; a new fp4-resident streamer
+`StreamMiniMaxH3Nvfp4ToDeviceFp4` (keeps packed FP4 host-resident, dispatcher
+uploads + repacks lazily on first forward, then frees the fp4 originals — peak
+device memory ~1/4 of the bf16 arm: ~16 GB packed vs ~66 GB bf16); `LinearDev`
+routes a non-Empty fp4 weight through `dense_nvfp4::MatmulNvfp4W4A16D`.
+
+**Gate.** CPU: `test_minimax_h3` "an NVFP4 checkpoint loads into a runnable DiT" now
+also streams the fp4 twin, asserts the loader kept the projections PACKED (fp4 slot
+set, bf16 slot Empty), runs the fp4 and bf16 device forwards on the SAME synthetic
+NVFP4 file, asserts the W4A16 dispatcher executed all 11 quantized GEMMs (the
+"this-path-ran" counter), and bounds the fp4-vs-bf16 delta. On CPU the dispatcher
+has no Marlin op so it falls to the bf16 arm's own dequant+matmul — this is a
+**wiring** gate here. The Marlin kernel's real numeric behaviour is CUDA-gated
+independently by `test_ops_nvfp4_matmul` / `test_linear_method` (2e-3/8e-3 vs a
+bf16 reference). **GB10 leg (fp4-vs-bf16 numeric delta + per-step timing at real
+geometry): PENDING** — see §8.3.
+
+### 8.2 Supports-audit vs vLLM-Omni (source-pinned to `a4ea67a2`, v0.26.0)
+
+vLLM-Omni H3 modules at `vllm_omni/diffusion/models/minimax_h3/`; serving in
+`vllm_omni/entrypoints/openai/`.
+
+| Capability | vLLM-Omni (file:line) | Ours (file:line) | Verdict |
+|---|---|---|---|
+| Async video route `POST /v1/videos` | `api_server.py:3146` | `ApiServer` `/v1/videos` (W7, `minimax_h3` serving) | **DONE** |
+| Sync route `POST /v1/videos/sync` | `api_server.py:3189` | `/v1/videos/sync` | **DONE** |
+| Status `GET /v1/videos/{id}` | `api_server.py:3305` | registered | **DONE** |
+| List / DELETE / `/content` download | `api_server.py:3268,3333,3385` | — | **MISSING** (list/delete/content-GET) |
+| WebSocket `/v1/video/chat/stream`, `/v1/realtime/video` | `api_server.py:1593,1610` | — | **MISSING** (streaming/realtime) |
+| Request schema (prompt, size/w/h, num_frames, fps, seed, steps, refs) | `protocol/videos.py:97-249` | request contract (W7) | **PARTIAL** (core fields; frame-interp/lora/generate_sound absent) |
+| H3 knobs via `extra_params.{task,duration,flow_shift,audio_flow_shift}` | `pipeline:1034,403,1157-1158` | planner reads task/duration/shift | **DONE** |
+| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; fl2va/ref2va image/video/audio WIRED (W6/ref2va) | **PARTIAL** (encoder vision tower still open) |
+| Output: joint video+audio, 24 fps, 32 kHz stereo | `pipeline:106-111,1187` | frames + WAV + MP4 mux (W7) | **DONE** |
+| Scheduler: euler-ancestral rectified flow (single) | `scheduling_...euler_ancestral.py`; `time_request.py:34-61` | `MiniMaxH3EulerEta0Step` / `MiniMaxH3TimeShiftSigmas` | **DONE** |
+| CFG: distilled, no CFG (guidance params accepted+ignored; `cfg_parallel_size==1`) | `pipeline:250,275-276` | no CFG branch | **DONE** (matches) |
+| Res/frame bounds: mult-32, aspect 1:4–4:1, 17n+5 frames, 24 fps, canvas 768×1344 | `pipeline:399-430`, `time_request.py:5-31` | request planner (17n+5, canvas, sigma) EXACT | **DONE** |
+| Task dispatch t2va/fl2va/ref2va | `pipeline:374-391` | planner dispatch (W6a) | **DONE** |
+| Single-GPU serving | `--num-gpus 1 --enable-cpu-offload` (`recipe:53-74`) | single GB10, quantized-resident | **DONE (ours needs no offload — quantized fits)** |
+| USP / DiT-TP / VAE patch-parallel | `pipeline` collectives (throughput) | `vt::communicator`/NCCL present, USP not ported (W8) | **MISSING** (multi-GPU only) |
+
+### 8.3 Speed statement + comparability verdict (mission #3)
+
+**vLLM-Omni CANNOT serve a quantized H3 on one GPU** (source-pinned, spec-audited):
+it is **BF16-only in practice**. The generic diffusion framework has ModelOpt
+FP8/NVFP4 plumbing and the H3 DiT forwards a `quant_config` to vLLM quant-capable
+linears, but (i) **no quantized H3 checkpoint exists or is referenced** anywhere in
+the repo; (ii) the fp32-island guard `post_load_weights()` (`minimax_h3_transformer.py:898-904`)
+**raises** if the patch/time/output layers are not fp32, so a naive blanket quant
+aborts; (iii) the **text encoder is hard-coded bf16** (`encoder.py:930`, no
+quant_config) and the **VAEs load unquantized**; (iv) GGUF is **not wired into H3's
+bespoke `load_weights`** at all. Single-GPU IS supported — but as **BF16 +
+`--enable-cpu-offload`** (`recipe:53-74`).
+
+**Therefore the comparison is HW/loader-FORCED-INDIRECT** (the DeepSeek-GGUF
+precedent): a like-for-like quant-matched vllm-omni run on one GB10 is impossible
+because vllm-omni has no quantized H3 arm. The honest baselines are our own bf16
+arm (`StreamMiniMaxH3Nvfp4ToDeviceBf16`) and the portable path; vLLM-Omni's own best
+published numbers are **4× B300 BF16**.
+
+**Honesty correction on the "88%":** the *"DiT ≈ 88% of request latency on 4× B300"*
+figure is **NOT documented anywhere in the vllm-omni checkout** (exhaustive grep).
+The real documented anchor is the recipe's *"Validated four-GPU evidence"*
+(`recipes/MiniMaxAI/MiniMax-H3.md:298-311`): FL2VA 209-frame 1248×768 = **86.964 s**
+mean client latency on 4× B300; two-video Ref2VA 362-frame = **784.394 s**. The DiT
+`diffuse` stage share is measurable per-request (`pipeline:255-262`) but no fixed
+percentage is written down. The upstream **reference config** is 50 steps, 24 fps,
+video flow_shift 12 / audio 3, no CFG; default canvas **768×1344**, default frames
+**209** (t2va/fl2va) / **124** (ref2va) — NOT the "864×480 / 124" in the task brief.
+
+### 8.4 Status (this row)
+
+- **W-FP4a: CPU-LANDED + gated** — fp4-resident loader + Marlin-W4A16 routing + the
+  fp4-vs-bf16 wiring gate. No new quant code.
+- **W-FP4a GB10 leg: PENDING** — build the CUDA `test_minimax_h3` on dgx.casa,
+  run the CUDA `an NVFP4 checkpoint loads into a runnable DiT` case (the same gate
+  exercises the Marlin path via `marlin_gemms`), and capture the fp4-vs-bf16 delta +
+  steady per-step time. Gated on a safe disk/build window (dgx: 33 G free vs 15 G
+  floor; the 570 G shared `.cache` is not ours to prune).
+- **W-FP4b real-checkpoint t2va e2e: DISK-BLOCKED.** The NVFP4 arm working set is
+  DiT + Qwen3-VL-32B NVFP4 encoder + both VAEs (~41 GB+ on disk to download); with
+  ~18 GB usable above the disk floor it does not fit, and the encoder is required
+  for a real conditioned render. Recorded HW/disk-forced-indirect. A DiT-only
+  steady-per-step at real geometry (fp4 vs bf16) is the reachable speed number once
+  a single NVFP4 DiT variant download fits.

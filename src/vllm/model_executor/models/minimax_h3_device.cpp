@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // W-FP4a: MatmulNvfp4W4A16D
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
@@ -95,11 +96,31 @@ const minimax_h3::MiniMaxH3DeviceKernels* Glue(const Dev& d) {
 // vt::MatmulBT + optional rank-1 bias, the device twin of the reference `Linear`.
 // Weight is [out_features, in_features] — every {Column,Row,QKV,MergedColumn}
 // ParallelLinear at TP=1.
+//
+// W-FP4a: when `fp4` is non-null and non-Empty(), the projection is fp4-RESIDENT.
+// The GEMM routes through dense_nvfp4::MatmulNvfp4W4A16D instead of vt::MatmulBT —
+// the SAME forced-Marlin W4A16 dispatch the Laguna/dense-Qwen3 NVFP4 arms use
+// (vLLM __init__.py:879-881: a weight-only NVFP4 scheme forces the Marlin kernel).
+// On sm_121a with a bf16 activation that is the native FP4-tensor-core path; in the
+// f32 parity stream (or on a backend without the Marlin op) the SAME dispatcher
+// falls back to a redundant-dequant GEMM, so the arm is correct either way. The
+// dequant lives entirely inside the shared dispatcher — this adds NO quant code.
 void LinearDev(Dev d, const Tensor& in, int64_t rows, int64_t in_features, const Tensor& weight,
-               const Tensor* bias, Tensor& out) {
+               const Tensor* bias, Tensor& out, const Nvfp4Weight* fp4 = nullptr) {
+  Tensor a = dense_attn::Reshape(in, {rows, in_features});
+  if (fp4 != nullptr && !fp4->Empty()) {
+    VT_CHECK(fp4->k == in_features,
+             "minimax_h3 fp4 linear: packed weight K does not match input width");
+    Tensor o = dense_attn::Reshape(out, {rows, fp4->n});
+    DBuf r = dense_nvfp4::MatmulNvfp4W4A16D(d, a, *fp4, o.dtype);
+    d.b.Copy(d.q, o.data, r.t().data, r.bytes());
+    if (bias != nullptr && bias->data != nullptr) {
+      vt::Add(d.q, o, o, *bias);  // rank-1 row-broadcast == a nn.Linear bias term
+    }
+    return;
+  }
   VT_CHECK(weight.rank == 2 && weight.shape[1] == in_features,
            "minimax_h3 device linear: weight shape does not match input width");
-  Tensor a = dense_attn::Reshape(in, {rows, in_features});
   Tensor o = dense_attn::Reshape(out, {rows, weight.shape[0]});
   vt::MatmulBT(d.q, o, a, weight);
   if (bias != nullptr && bias->data != nullptr) {
@@ -143,6 +164,9 @@ struct AttnWeightsDev {
   const Tensor* q_norm;
   const Tensor* k_norm;
   const Tensor* out_proj;
+  // W-FP4a: fp4-resident twins of qkv/out_proj (null on the bf16/f32 arms).
+  const Nvfp4Weight* qkv_fp4 = nullptr;
+  const Nvfp4Weight* out_fp4 = nullptr;
 };
 
 // MiniMaxH3Attention.forward (minimax_h3_transformer.py:421-467).
@@ -155,7 +179,7 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
   const int64_t inner = heads * head_dim;
 
   DBuf qkv(d, dt.S(), {rows, 3 * inner});
-  LinearDev(d, in, rows, params.hidden_size, *w.qkv, nullptr, qkv.t());
+  LinearDev(d, in, rows, params.hidden_size, *w.qkv, nullptr, qkv.t(), w.qkv_fp4);
 
   DBuf qb(d, dt.S(), {rows, inner});
   DBuf kb(d, dt.S(), {rows, inner});
@@ -192,19 +216,22 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
   vt::DFlashBlockAttention(d.q, attn.t(), tq, tk, tv, args);
 
   Tensor flat = dense_attn::Reshape(attn.t(), {rows, inner});
-  LinearDev(d, flat, rows, inner, *w.out_proj, nullptr, out);
+  LinearDev(d, flat, rows, inner, *w.out_proj, nullptr, out, w.out_fp4);
 }
 
 // MiniMaxH3MLP.forward (minimax_h3_transformer.py:512-517): silu(gate) * up.
 // fc1 emits [gate; up] per row, which is exactly vt::SiluAndMul's input layout.
 void MlpDev(Dev d, const MiniMaxH3DitParams& params, const Tensor& fc1, const Tensor& fc2,
-            const Tensor& in, int64_t rows, const DeviceStreamDtype& dt, Tensor& out) {
+            const Tensor& in, int64_t rows, const DeviceStreamDtype& dt, Tensor& out,
+            const Nvfp4Weight* fc1_fp4 = nullptr, const Nvfp4Weight* fc2_fp4 = nullptr) {
   const int64_t ffn = params.ffn_hidden_size;
   DBuf hidden(d, dt.S(), {rows, 2 * ffn});
-  LinearDev(d, in, rows, params.hidden_size, fc1, nullptr, hidden.t());
+  // fc1 is already the merged [gate; up] (SwiGLU) — one W4A16 GEMM to [rows, 2*ffn]
+  // then SiluAndMul, so the fused gate_up pair (GateUpFusedMarlinD) does not apply.
+  LinearDev(d, in, rows, params.hidden_size, fc1, nullptr, hidden.t(), fc1_fp4);
   DBuf act(d, dt.S(), {rows, ffn});
   vt::SiluAndMul(d.q, act.t(), hidden.t());
-  LinearDev(d, act.t(), rows, ffn, fc2, nullptr, out);
+  LinearDev(d, act.t(), rows, ffn, fc2, nullptr, out, fc2_fp4);
 }
 
 // MiniMaxH3AdalnProj.forward (minimax_h3_transformer.py:555-561):
@@ -212,8 +239,9 @@ void MlpDev(Dev d, const MiniMaxH3DitParams& params, const Tensor& fc1, const Te
 // the block loop by the caller: t_emb does not change across blocks, so the
 // reference's per-block silu is redundant work the device path simply does once.
 void AdalnProjectDev(Dev d, const Tensor& activated, int64_t m, int64_t time_embed_dim,
-                     const Tensor& weight, const Tensor& bias, Tensor& out) {
-  LinearDev(d, activated, m, time_embed_dim, weight, &bias, out);
+                     const Tensor& weight, const Tensor& bias, Tensor& out,
+                     const Nvfp4Weight* fp4 = nullptr) {
+  LinearDev(d, activated, m, time_embed_dim, weight, &bias, out, fp4);
 }
 
 }  // namespace
@@ -548,7 +576,7 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   CastTo(d, text_rows.t(), text_rows_f32.t());
   DBuf text_embed(d, dt.S(), {inputs.num_text_pos, hidden});
   LinearDev(d, text_rows.t(), inputs.num_text_pos, params.text_dim, weights.condition_proj_w,
-            &weights.condition_proj_b, text_embed.t());
+            &weights.condition_proj_b, text_embed.t(), &weights.condition_fp4);
 
   // Token refiner: a plain pre-norm stack, no AdaLN and no RoPE (:564-623), on the
   // REPLICATED text rows, so it uses the refiner's own cu_seqlens.
@@ -560,8 +588,9 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
     args.eps = static_cast<float>(params.norm_eps);
     for (const MiniMaxH3DitBlockWeights& block : weights.refiner) {
       vt::RmsNorm(d.q, normed.t(), text_embed.t(), block.norm1, args);
-      AttentionDev(d, params, AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm,
-                                             &block.out_proj},
+      AttentionDev(d, params,
+                   AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm, &block.out_proj,
+                                  &block.qkv_fp4, &block.out_fp4},
                    normed.t(), rows, nullptr, nullptr, inputs.refiner_cu_seqlens,
                    static_cast<int>(inputs.num_refiner_cu_seqlens - 1), dt, tmp.t());
       // FOLD onto the catalog recipe. This was DECLINED one milestone ago because
@@ -573,7 +602,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
       // one launch instead of two.
       vt::FusedChain(d.q, normed.t(), tmp.t(), block.norm2, &text_embed.t(),
                      vt::kFusedAddRmsNormStd, args.eps);
-      MlpDev(d, params, block.fc1, block.fc2, normed.t(), rows, dt, tmp.t());
+      MlpDev(d, params, block.fc1, block.fc2, normed.t(), rows, dt, tmp.t(), &block.fc1_fp4,
+             &block.fc2_fp4);
       vt::Add(d.q, text_embed.t(), text_embed.t(), tmp.t());
     }
     vt::RmsNormArgs final_args;
@@ -671,7 +701,7 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
 
   for (const MiniMaxH3DitBlockWeights& block : weights.blocks) {
     AdalnProjectDev(d, t_emb_s.t(), m, params.time_embed_dim, block.adaln_w, block.adaln_b,
-                    projected.t());
+                    projected.t(), &block.adaln_fp4);
     const Tensor shift_msa = chunk_view(projected, adaln_rows, 6, 0);
     const Tensor scale_msa = chunk_view(projected, adaln_rows, 6, 1);
     const Tensor gate_msa = chunk_view(projected, adaln_rows, 6, 2);
@@ -684,7 +714,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
                                d_combined.t().Ptr<int32_t>(), seq_len, hidden, 6 * hidden,
                                dt.S());
     AttentionDev(d, params,
-                 AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm, &block.out_proj},
+                 AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm, &block.out_proj,
+                                &block.qkv_fp4, &block.out_fp4},
                  normed.t(), seq_len, &d_rope_cache.t(), &d_rope_pos.t(), inputs.cu_seqlens,
                  num_reqs, dt, tmp.t());
     glue->modulate_gate(d.q, stream.t().data, gate_msa.data, tmp.t().data,
@@ -694,7 +725,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
     glue->modulate_scale_shift(d.q, normed.t().data, shift_mlp.data, scale_mlp.data,
                                d_combined.t().Ptr<int32_t>(), seq_len, hidden, 6 * hidden,
                                dt.S());
-    MlpDev(d, params, block.fc1, block.fc2, normed.t(), seq_len, dt, tmp.t());
+    MlpDev(d, params, block.fc1, block.fc2, normed.t(), seq_len, dt, tmp.t(), &block.fc1_fp4,
+           &block.fc2_fp4);
     glue->modulate_gate(d.q, stream.t().data, gate_mlp.data, tmp.t().data,
                         d_combined.t().Ptr<int32_t>(), seq_len, hidden, 6 * hidden, dt.S());
   }
@@ -702,7 +734,7 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   // --- final layer (minimax_h3_transformer.py:724-743) ---
   DBuf final_projected(d, dt.S(), {m, 2 * hidden});
   AdalnProjectDev(d, t_emb_s.t(), m, params.time_embed_dim, weights.final_adaln_w,
-                  weights.final_adaln_b, final_projected.t());
+                  weights.final_adaln_b, final_projected.t(), &weights.final_adaln_fp4);
   const Tensor final_shift = chunk_view(final_projected, m, 2, 0);
   const Tensor final_scale = chunk_view(final_projected, m, 2, 1);
   vt::RmsNormArgs final_args;
@@ -806,6 +838,74 @@ void BindStreamedDitViews(const std::map<std::string, Tensor>& views,
   }
   w.final_norm = view("final_layer.norm.weight");
   w.final_adaln_w = view("final_layer.adaln_proj.linear.weight");
+  w.final_adaln_b = view("final_layer.adaln_proj.linear.bias");
+  w.video_out_w = view("final_layer.video_out.weight");
+  w.video_out_b = view("final_layer.video_out.bias");
+  w.audio_out_w = view("final_layer.audio_out.weight");
+  w.audio_out_b = view("final_layer.audio_out.bias");
+}
+
+// W-FP4a binder: the fp4-resident twin of BindStreamedDitViews. Every non-quantized
+// tensor (norms, biases, fp32 islands) is bound from `views` exactly as above; each
+// quantized projection is MOVED out of `fp4` into its Nvfp4Weight slot, and its bf16
+// `vt::Tensor` slot is left Empty(). A projection absent from `fp4` was stored
+// unquantized in the checkpoint and falls back to a `views` bind, so an
+// island-only-quantized file still lands on the same contract.
+void BindStreamedDitViewsFp4(const std::map<std::string, Tensor>& views,
+                             std::map<std::string, Nvfp4Weight>& fp4,
+                             const MiniMaxH3DitParams& params, MiniMaxH3DitWeights* out) {
+  auto view = [&](const std::string& name) -> Tensor {
+    const auto it = views.find(name);
+    VT_CHECK(it != views.end(),
+             "minimax_h3 nvfp4-fp4: checkpoint is missing a required tensor");
+    return it->second;
+  };
+  // Route a projection: fp4-resident when present in `fp4`, else its bf16 view.
+  auto proj = [&](const std::string& name, Nvfp4Weight& wdst, Tensor& tdst) {
+    const auto it = fp4.find(name);
+    if (it != fp4.end()) {
+      wdst = std::move(it->second);
+      tdst = Tensor{};
+    } else {
+      tdst = view(name);
+    }
+  };
+  MiniMaxH3DitWeights& w = *out;
+  w.video_patch_proj_w = view("video_patch_proj.weight");
+  w.video_patch_proj_b = view("video_patch_proj.bias");
+  w.audio_patch_proj_w = view("audio_patch_proj.weight");
+  w.audio_patch_proj_b = view("audio_patch_proj.bias");
+  proj("condition_proj.weight", w.condition_fp4, w.condition_proj_w);
+  w.condition_proj_b = view("condition_proj.bias");
+  w.time_proj_in_w = view("time_embedder.proj_in.weight");
+  w.time_proj_in_b = view("time_embedder.proj_in.bias");
+  w.time_proj_out_w = view("time_embedder.proj_out.weight");
+  w.time_proj_out_b = view("time_embedder.proj_out.bias");
+  auto block = [&](const std::string& prefix, bool adaln) {
+    MiniMaxH3DitBlockWeights b;
+    b.norm1 = view(prefix + ".norm1.weight");
+    b.norm2 = view(prefix + ".norm2.weight");
+    proj(prefix + ".attn.qkv_proj.weight", b.qkv_fp4, b.qkv_proj);
+    b.q_norm = view(prefix + ".attn.q_norm.weight");
+    b.k_norm = view(prefix + ".attn.k_norm.weight");
+    proj(prefix + ".attn.out_proj.weight", b.out_fp4, b.out_proj);
+    proj(prefix + ".mlp.fc1.weight", b.fc1_fp4, b.fc1);
+    proj(prefix + ".mlp.fc2.weight", b.fc2_fp4, b.fc2);
+    if (adaln) {
+      proj(prefix + ".adaln_proj.linear.weight", b.adaln_fp4, b.adaln_w);
+      b.adaln_b = view(prefix + ".adaln_proj.linear.bias");
+    }
+    return b;
+  };
+  for (int64_t i = 0; i < params.token_refiner_num_layers; ++i) {
+    w.refiner.push_back(block("token_refiner.blocks." + std::to_string(i), false));
+  }
+  w.refiner_final_norm = view("token_refiner.final_norm.weight");
+  for (int64_t i = 0; i < params.num_layers; ++i) {
+    w.blocks.push_back(block("blocks." + std::to_string(i), true));
+  }
+  w.final_norm = view("final_layer.norm.weight");
+  proj("final_layer.adaln_proj.linear.weight", w.final_adaln_fp4, w.final_adaln_w);
   w.final_adaln_b = view("final_layer.adaln_proj.linear.bias");
   w.video_out_w = view("final_layer.video_out.weight");
   w.video_out_b = view("final_layer.video_out.bias");
@@ -1040,6 +1140,133 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
   }
 
   BindStreamedDitViews(views, params, &staged.weights);
+  return staged;
+}
+
+// W-FP4a: the fp4-RESIDENT NVFP4 streamer. Structurally identical to
+// StreamMiniMaxH3Nvfp4ToDeviceBf16, except a U8-packed projection is KEPT as an
+// Nvfp4Weight (host packed + E4M3 scale + f32 global) instead of being dequantized
+// to bf16 and uploaded — so the device forward routes it through the Marlin W4A16
+// GEMM. Islands stay f32, norms/biases bf16. Peak device memory is ~1/4 of the bf16
+// arm because the ~16 GB of packed FP4 never expands to ~66 GB of bf16.
+MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
+                                                         const SafetensorsFile& file,
+                                                         MiniMaxH3DitParams* out_params) {
+  vt::Backend& backend = vt::GetBackend(queue.device.type);
+  const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
+
+  auto is_sidecar = [](const std::string& n) {
+    return (n.size() > 12 && n.compare(n.size() - 12, 12, "weight_scale") == 0) ||
+           (n.size() > 14 && n.compare(n.size() - 14, 14, "weight_scale_2") == 0);
+  };
+  auto is_fp32_island = [](const std::string& n) {
+    return n.rfind("video_patch_proj.", 0) == 0 || n.rfind("audio_patch_proj.", 0) == 0 ||
+           n.rfind("time_embedder.", 0) == 0 || n.rfind("final_layer.video_out.", 0) == 0 ||
+           n.rfind("final_layer.audio_out.", 0) == 0 || n == "rope.inv_freq";
+  };
+
+  // Pass 1: logical shapes (U8 packed [out, in/2] is logically [out, in]).
+  std::vector<MiniMaxH3TensorSpec> manifest;
+  for (const std::string& name : file.Names()) {
+    if (is_sidecar(name)) continue;
+    const StTensor& t = file.Get(name);
+    MiniMaxH3TensorSpec spec;
+    spec.name = name;
+    spec.shape = t.shape;
+    if (t.dtype == "U8") {
+      VT_CHECK(t.shape.size() == 2, "minimax_h3 nvfp4-fp4: a packed weight must be rank 2");
+      spec.shape = {t.shape[0], t.shape[1] * 2};
+    }
+    manifest.push_back(std::move(spec));
+  }
+  const MiniMaxH3DitParams params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+  if (out_params != nullptr) *out_params = params;
+
+  MiniMaxH3DitDeviceWeights staged;
+  std::map<std::string, Tensor> views;
+  std::map<std::string, Nvfp4Weight> fp4;
+  size_t done = 0;
+  for (const MiniMaxH3TensorSpec& spec : manifest) {
+    const StTensor& t = file.Get(spec.name);
+
+    if (spec.name == "rope.inv_freq") {
+      staged.rope_inv_freq_host = MiniMaxH3ReadSafetensorF32(t);
+      staged.weights.rope_inv_freq = vt::Tensor::Contiguous(
+          staged.rope_inv_freq_host.data(), DType::kF32, vt::Device{},
+          {static_cast<int64_t>(staged.rope_inv_freq_host.size())});
+      continue;
+    }
+
+    // A packed projection -> keep the FP4 triple RESIDENT (no dequant, no upload;
+    // the dispatcher uploads + repacks lazily on first forward).
+    if (t.dtype == "U8") {
+      const int64_t out_dim = spec.shape[0], in_dim = spec.shape[1];
+      const StTensor& scale = file.Get(spec.name + "_scale");
+      const StTensor& global = file.Get(spec.name + "_scale_2");
+      VT_CHECK(scale.dtype == "F8_E4M3", "minimax_h3 nvfp4-fp4: weight_scale must be F8_E4M3");
+      VT_CHECK(global.dtype == "F32", "minimax_h3 nvfp4-fp4: weight_scale_2 must be F32");
+      VT_CHECK(scale.shape.size() == 2 && scale.shape[0] == out_dim &&
+                   scale.shape[1] * 16 == in_dim,
+               "minimax_h3 nvfp4-fp4: weight_scale must be [out, in/16] (group size 16)");
+      VT_CHECK(global.nbytes >= sizeof(float), "minimax_h3 nvfp4-fp4: weight_scale_2 too small");
+      Nvfp4Weight w;
+      w.n = out_dim;
+      w.k = in_dim;
+      std::memcpy(&w.scale2, global.data, sizeof(float));
+      w.packed.dtype = DType::kI8;
+      w.packed.rank = 2;
+      w.packed.shape[0] = out_dim;
+      w.packed.shape[1] = in_dim / 2;
+      w.packed.bytes.resize(static_cast<size_t>(out_dim) * (in_dim / 2));
+      VT_CHECK(t.nbytes == w.packed.bytes.size(), "minimax_h3 nvfp4-fp4: packed byte-size mismatch");
+      std::memcpy(w.packed.bytes.data(), t.data, t.nbytes);
+      w.scale.dtype = DType::kI8;
+      w.scale.rank = 2;
+      w.scale.shape[0] = out_dim;
+      w.scale.shape[1] = in_dim / 16;
+      w.scale.bytes.resize(static_cast<size_t>(out_dim) * (in_dim / 16));
+      VT_CHECK(scale.nbytes == w.scale.bytes.size(), "minimax_h3 nvfp4-fp4: scale byte-size mismatch");
+      std::memcpy(w.scale.bytes.data(), scale.data, scale.nbytes);
+      fp4[spec.name] = std::move(w);
+    } else {
+      // Island (f32) or norm/bias (bf16) -> upload a plain tensor, exactly like the
+      // bf16 streamer's non-U8 branch.
+      const bool island = is_fp32_island(spec.name);
+      const DType want = island ? DType::kF32 : DType::kBF16;
+      std::vector<float> f32 = MiniMaxH3ReadSafetensorF32(t);
+      const void* src = nullptr;
+      size_t bytes = 0;
+      std::vector<uint16_t> bf16;
+      if (island) {
+        src = f32.data();
+        bytes = f32.size() * sizeof(float);
+      } else {
+        bf16.resize(f32.size());
+        for (size_t i = 0; i < f32.size(); ++i) {
+          uint32_t bits;
+          std::memcpy(&bits, &f32[i], sizeof(bits));
+          const uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
+          bf16[i] = static_cast<uint16_t>(rounded >> 16);
+        }
+        src = bf16.data();
+        bytes = bf16.size() * sizeof(uint16_t);
+      }
+      void* pdev = backend.Alloc(bytes);
+      std::shared_ptr<void> owner(pdev, [&backend](void* q) { backend.Free(q); });
+      backend.Copy(queue, pdev, src, bytes);
+      backend.Synchronize(queue);  // host buffers die at end of iteration
+      views[spec.name] = dense_attn::MakeTensor(pdev, want, queue.device, spec.shape);
+      staged.storage.push_back(std::move(owner));
+    }
+
+    if (trace && (++done % 50 == 0 || done == manifest.size())) {
+      std::fprintf(stderr, "[h3] nvfp4-fp4-streamed %zu/%zu tensors (last: %s)\n", done,
+                   manifest.size(), spec.name.c_str());
+      std::fflush(stderr);
+    }
+  }
+
+  BindStreamedDitViewsFp4(views, fp4, params, &staged.weights);
   return staged;
 }
 
