@@ -41,6 +41,7 @@ the [quantization format table](BUILD.md#quantization-formats).
 | `VT_GGUF_KEEP_F16` | on (when weights expand) | Keep F16 GGUF weights in F16 rather than promoting them, an RSS/perf tradeoff |
 | `VT_GGUF_MMAP` | on when weights stay quantized | Keep the GGUF file mmap-resident instead of copying weight bytes into owned buffers, trading RSS for page-cache residency |
 | `VT_GGUF_PREFAULT` | off | Pre-fault the mmap-resident weight pages at load, trading a slower load for steadier first-token latency |
+| `VT_H3_DROP_PAGES` | off (MiniMax-H3 device staging) | Set (to any value) to opt the mapping into page release while streaming the H3 DiT weights to the device, so the read-once file pages do not accumulate against the same unified pool the weights live in. Without it the `DropSpanResidency` calls are no-ops. **Off by default deliberately, not by oversight:** it was enabled once and the load was SIGKILLed early at only ~21 GB peak, which is not a memory ceiling, so it stays gated until that is understood rather than left on by faith |
 
 ## Rollback and bisect switches
 
@@ -79,6 +80,9 @@ portable/reference path. In normal operation leave them unset.
 | `VT_DFLASH_PAGED` | on (CUDA, DFlash spec-decode) | The materialized `[context;block]` draft forward instead of the fixed-capacity paged draft-KV store read through `vt::DFlashPagedBlockAttention` (bit-identical; only the DFlash single-request propose path) |
 | `VT_DFLASH_GRAPH` | on (CUDA, DFlash spec-decode) | The eager paged draft step instead of the captured/replayed draft-step CUDA graph (replayed==eager bit-identical; only the DFlash single-request propose path) |
 | `VT_DFLASH_ATTN_BLOCK` | off (CUDA, DFlash spec-decode) | `=1` selects the D12/D13 block-per-(query,head) draft paged-attention kernel instead of the D14 default warp-scoped online-softmax kernel (same f32-softmax math within the bf16 envelope; the D14 warp kernel is ~3x faster and closed the ~2% speed residual; only the DFlash single-request propose path) |
+| `VT_DFLASH_ATTN_MMA` | on where the built arch set and the running device both have bf16 `mma.sync` (Ampere and later) | `=0` disables the bf16 tensor-core block-attention path and falls back to the CUDA-core form. The guard is both compile-time (`__CUDA_ARCH_LIST__` all >= 800) and runtime (queried compute capability), so on a pre-Ampere board the path is already off and this flag changes nothing; it exists so the tensor-core and CUDA-core forms can be A/B'd on ONE binary, which is this project's benchmark protocol |
+| `VT_DFLASH_ATTN_WARP` | off (CUDA) | `=1` falls back to the older per-key warp-reduction block-attention kernel instead of the default chunked reduce-scatter form. Kept for the same-binary A/B that recorded the verdict |
+| `VT_DFLASH_ATTN_KEYLANE` | off (CUDA) | `=1` selects the one-key-per-lane block-attention form. **MEASURED NEGATIVE and not a tuning knob:** 28.90 s/step against the per-key warp kernel's 18.73 on the same binary (sm_110, MiniMax-H3 512x512/33f, seq 3224), 54% slower, because giving each lane a whole K row makes every K load 32-way scattered. Kept only because it is the experiment that located the real constraint |
 
 ## Diagnostic
 
