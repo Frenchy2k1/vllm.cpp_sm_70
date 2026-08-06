@@ -367,14 +367,34 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                            initial_video_rows, initial_audio_rows, compute_dtype, prestaged);
 
   // --- 4. rows -> latents ---
+  // ref2va PREPENDS pinned reference rows (encoded image/video/audio) to the
+  // packed layout; the DiT zeroes them in its output (skip_mask_out_condition),
+  // and only the TRAILING target rows are the generated clip. t2va/fl2va have no
+  // such prefix, so the tail is the whole buffer -- this is a no-op there. Without
+  // this, unpatchify sees (ref + target) rows and rejects a non-divisible count.
   const int64_t ph = request.latent_h / dit_params.patch_size_h;
   const int64_t pw = request.latent_w / dit_params.patch_size_w;
+  const int64_t video_row_width = dit_params.video_row_width();
+  const int64_t target_video_rows = request.latent_t * ph * pw;
+  const int64_t have_video_rows =
+      video_row_width > 0 ? static_cast<int64_t>(denoised.video_rows.size()) / video_row_width : 0;
+  VT_CHECK(have_video_rows >= target_video_rows,
+           "minimax_h3 t2va: denoise produced fewer video rows than the target clip needs");
+  const std::vector<float> video_target_rows(
+      denoised.video_rows.end() - target_video_rows * video_row_width, denoised.video_rows.end());
   std::vector<float> video_latent = MiniMaxH3UnpatchifyVideoTokens(
-      denoised.video_rows, request.latent_t, ph, pw, dit_params.latents_dim,
+      video_target_rows, request.latent_t, ph, pw, dit_params.latents_dim,
       dit_params.patch_size_t, dit_params.patch_size_h, dit_params.patch_size_w);
+  const int64_t audio_width = dit_params.audio_latents_dim;
+  const int64_t target_audio_rows = request.audio_t * request.audio_channel;
+  const int64_t have_audio_rows =
+      audio_width > 0 ? static_cast<int64_t>(denoised.audio_rows.size()) / audio_width : 0;
+  VT_CHECK(have_audio_rows >= target_audio_rows,
+           "minimax_h3 t2va: denoise produced fewer audio rows than the target clip needs");
+  const std::vector<float> audio_target_rows(
+      denoised.audio_rows.end() - target_audio_rows * audio_width, denoised.audio_rows.end());
   std::vector<float> audio_latent = MiniMaxH3UnpackAudioTokens(
-      denoised.audio_rows, request.audio_t * request.audio_channel, request.audio_channel,
-      dit_params.audio_latents_dim);
+      audio_target_rows, target_audio_rows, request.audio_channel, dit_params.audio_latents_dim);
 
   // --- 5. denormalize (vae.py:252-270, :341-357) ---
   auto denormalize = [](std::vector<float>& latent, int64_t channels, int64_t per_channel,

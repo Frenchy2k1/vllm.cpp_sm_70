@@ -487,6 +487,19 @@ int main(int argc, char** argv) {
         const std::vector<int32_t> ids = tokenizer.Encode(prompt);
         VT_CHECK(!ids.empty(), "minimax-h3-gen: the prompt tokenized to nothing");
         std::cerr << "  prompt tokens = " << ids.size() << "\n";
+        // DIAGNOSTIC (env-gated): dump the raw prompt token ids so the tokenization
+        // can be diffed against upstream `minimax_h3_text_only_ids` (verbatim prompt,
+        // add_special_tokens=False). A BOS/template mismatch shifts every text row and
+        // feeds the 32B tower a different string -> different conditioning.
+        if (const char* dd = std::getenv("VT_H3_DUMP_INPUTS")) {
+          if (std::FILE* fp = std::fopen((std::string(dd) + "/prompt_token_ids.i32").c_str(), "wb")) {
+            std::fwrite(ids.data(), sizeof(int32_t), ids.size(), fp);
+            std::fclose(fp);
+            std::cerr << "  [h3-dump-inputs] prompt_token_ids.i32 (" << ids.size() << " ids): ";
+            for (size_t k = 0; k < ids.size() && k < 64; ++k) std::cerr << ids[k] << " ";
+            std::cerr << "\n";
+          }
+        }
         const std::vector<float> embeds = vllm::MiniMaxH3EncoderEmbedTokens(enc, ids);
         // Text-only: all three M-RoPE axes are the token index.
         const int64_t seq = static_cast<int64_t>(ids.size());

@@ -14160,46 +14160,10 @@ noise fix from #70 stands but was already known not to be the render fix.
    the DiT INPUTS (encoder output, position grid, condition-noise) at real geometry is
    the untested surface #70 did not isolate.
 
-## MAIN IS RED: the GGUF oracle gate emits all-zero tokens on a CPU-only build (2026-08-06)
-
-Found while trying to run the owed oracle gate for `VT_CPU_ELEM_KN_REPACK`. It
-is NOT caused by that work, and not by anything on
-`row/KERNEL-GEMM-CPU-ELEM-X86WIDE`.
-
-**Reproduce.** dgx, idle, one flock, CPU-only Release build of PRISTINE `main`
-@`4a62c43f`, `test_qwen36_gguf_engine`, APEX-Compact 35B
-(`Qwen3.6-35B-A3B-APEX-Compact.gguf`):
-
-    got  = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}   continuation "!!!!!!!!!!!!!!!!"
-    want = {11751, 11, 9338, 13, 1049, 369, 799, 314, 279, 1379, ...}
-
-Every generated token is id 0. What still works: prompt tokenisation is exact
-(`prompt_token_ids` matches the golden), the engine reports `finished`, and
-16/16 tokens are produced. Only their values are garbage. The SIGSEGV doctest
-then reports at `:145` is a second-order effect on the following prompt.
-
-**Attribution: my branch is exonerated.** The identical failure (same line, same
-signature, same 8/9 assertions) reproduces on pristine `main` with none of the
-elem-GEMM work present.
-
-**Hypothesis RAISED AND REFUTED, recorded so nobody re-runs it.** The engine
-banner said "Asynchronous scheduling is enabled (max_concurrent_batches=2)", and
-the token-0 signature is exactly what `ROW-SERVE-ASYNC-LLM` and
-`ROW-SERVE-ASYNC-DENSE-MIRROR` describe ("batch-1 greedy decode degenerated into
-nondeterministic token-0 garbage"), so a third uncovered async path looked
-likely. It is not: with `VT_ASYNC_SCHED=0` ("Asynchronous scheduling is disabled
-(max_concurrent_batches=1)") the output is byte-for-byte the same all-zero
-stream. Async scheduling is NOT the cause.
-
-**What this means.** This gate is recorded PASSING on a CPU-only dgx build in
-the CIQ G4 entry (2026-07-22: "2/2 cases, 16/16 greedy tokens on APEX-Compact
-AND APEX-Balanced"). It does not pass there now. Either the CPU-only k-quant MoE
-decode path regressed since, or the gate's CPU-only support was lost silently.
-Bisecting that is a separate piece of work and is NOT attempted here.
-
-**Consequence for the repack.** The oracle token gate cannot certify
-`VT_CPU_ELEM_KN_REPACK` while it cannot certify main itself. The flag stays
-opt-in and its promotion evidence stays owed. The e2e self-comparison result
-(three prompts byte-identical with 55 tensors / 358,612,992 elements proven
-repacked) is unaffected and stands, but it is not oracle-verified and is not
-being presented as such.
+| Suspect | Test | Result |
+|---|---|---|
+| S1 (a)(b) DiT INPUT wiring at real scale | `VT_H3_DUMP_INPUTS` dumped every step-0 DiT input; diffed vs upstream `pipeline_minimax_h3.py` at t2va 512x512/22f (text_len=8, latent 7x32x32, seq_len 1920) | **EXACT** — packed layout, fp64 grid, token_tags, inverse/combined AdaLN indices, sigmas all byte-equal; tokenization byte-equal to `tokenizer(prompt,add_special_tokens=False)` |
+| encoder conditioning | shape/stat check | correct [8,5120], carries the expected Qwen massive-activation (row0 ch731=15915, others rms~4) — not all-pad, not garbage |
+| NVFP4 dequant | independent torch dequant of `blocks.0.attn.qkv_proj` + Laguna/Qwen3 already prove `DequantNvfp4ToBf16` byte-exact | sane trained weight (rms 0.089, absmax=ws2·6·maxscale=3.61) |
+| CUDA kernels at real seq | NEW gate `test_minimax_h3 :: CUDA device forward tracks the host at the REAL render seq (1920)` (RealRatioParams head_dim=128, seq 1920) | **CUDA device == CPU host** (28/28) — no scale-dependent kernel bug (#74 only ran device-vs-host on the CPU backend) |
+| forward math | RefDiT restatement vs true upstream source, read side by side (block, attention, AdaLN view(m*3,6H), 3D-RoPE, modulate) | identical |
