@@ -12760,3 +12760,24 @@ reduction = the dense-template marlin port (#50 NO-GO), scoped. Post-par1 the DO
 fails the mincore cache-drop) + the vLLM oracle whose host-RAM reservation alongside the 27G tmpfs tree is
 the GB10 OOM-reboot risk. Evidence dgx:~/mxfp4-nsys/{oursfused_c8,ourspar1_c8}.nsys-rep, kern_sum_oursfused_c8.txt,
 gpu_trace_{oursfused,ourspar1}_c8_*.csv; gates ~/{gate2,gate4,gate5,iso32b,step1_gate,step1_smoke}.log.
+
+## KERNEL-FA2-DECODE-PARAMS: flash residency+params hypothesis REFUTED (post-#57)
+
+Measured on `735f3b8d` (content-identical twin of #57 `efa6e40d`), MXFP4-8B
+decode, env-gated params dump + cudaPointerGetAttributes + sudo ncu. All
+flash buffers (q/k/v/o/lse/oaccum/lseaccum) are DEVICE-resident (no ATS
+target — this is not the GGUF-mmap class); KV layout
+[num_blocks,2,block,heads,d] + strides byte-match vLLM. Sole divergence:
+num_splits (our FA2@2c839c33 static heuristic vs vllm-flash-attn@~5824e6e;
+5 vs 6 at c2, near-tie class). ncu: the decode split kernel is
+latency/occupancy-bound (occ 10.7%, SM 7.7%, mem 6.5%, L2 7%) — intrinsic
+to batch-1 decode, identical kernel both engines; the combine kernel is a
+~13us tax scaling with split count. Self-contained A/B: the heuristic
+OVER-SPLITS at low base (c1: splits=7 → ~41us/layer; optimal ~3 → ~33us,
+~17% win) but self-selects ~3 at c8 (near-optimal) → NOT the c8 residual.
+Scoped next lever: GB10-calibrated num_splits cap (cuda_flash_attn_fa2.cu:996),
+near-tie, oracle-gated, helps c1-c2 only (c1 already 1.020x). The dominant
+remaining c8 term is the ~0.7ms/step host/sched slice (engine loop proven
+clean in #51 — the slice lives in the shared async frontend). Parity verdict
+unchanged: c1 1.020 / c2-c8 0.962-0.969. Evidence dgx:/tmp/fa2dump.err,
+/tmp/fa2ncu2.out, /tmp/fa2ab_n{1,3}.out.

@@ -37505,3 +37505,15 @@ act GLUE tail (+195-290us) + ~0.7ms host/sched. FLIP conditions (parity-enablers
 ratified + beats MoE every axis + no regression + memory win. Landing `row/KERNEL-MARLIN-DENSE-EXEC`
 (`200b4b56`): flip `dense_nvfp4_gemm.h`, regen 32B goldens, gate-conditional counters, L2 unit fix.
 
+
+## KERNEL-FA2-DECODE-PARAMS: flash hypothesis refuted; kernel side of MXFP4 CLOSED
+<!-- state: 2026-08-09T19:00 -->
+
+Direct measurement on the post-#57 binary refuted the last kernel-side
+hypothesis: all flash decode buffers DEVICE-resident, KV layout/params
+byte-match vLLM, decode kernel latency-bound identically both engines; only
+num_splits differs (heuristic version skew, near-tie, self-corrects at c8;
+over-splits at c1-c2 where we already pass). Full detail + evidence paths in
+the benchmark record. MXFP4 stands: c1 1.020 / c2-c8 0.962-0.969 / mem 2.63x.
+Remaining terms: the ~0.7ms/step frontend slice (dominant, next campaign),
+the c1-c2 num_splits cap (oracle-gated), the glue tail.

@@ -22,7 +22,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13): CPU+CUDA 13/13·656, no OOM. **Token gate NEAR-TIE 106/128** (6/8 token-exact) | device GDN/MLA islands + bf16 stream; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| MXFP4 parity (Qwen3-8B) | **`MARLIN-STRUCT`: decode-graph + gate_up FUSION default-ON (180→144 GEMM/step); #44 3/3, 0.6B/4B 184/184, 32B 142/142** | residual = marlin CTA + flash |
+| MXFP4 parity (Qwen3-8B) | c1 1.020 PASS + mem 2.63x WIN; c2-c8 0.962-0.969 (#57 dense-marlin ON). Kernel side CLOSED: flash residency/params REFUTED (all DEVICE, params match; kernel latency-bound both engines) | Last terms: ~0.7ms/step frontend slice (dominant) + c1-c2 num_splits cap (near-tie) + glue tail |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
 | MXFP4 parity goal | **`VT_MARLIN_DENSE` FLIPPED DEFAULT-ON** (`row/KERNEL-MARLIN-DENSE-EXEC` `200b4b56`): dense E=1 marlin, 48-CTA vs 128. Ratified near-tie (32B razor gap 0.000, TIGHTER than MoE; goldens regen). Binding beats #51 every axis (c8 0.969, GPU mem 2.63x). Goal still <1.0x c2-c8 (state) | Merge row; next = decode-flash |
 
