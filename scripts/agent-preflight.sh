@@ -9,7 +9,22 @@
 #   scripts/agent-preflight.sh              # gates + role + print .agents/NOW.md
 #   scripts/agent-preflight.sh --staged     # also check the staged change
 #   scripts/agent-preflight.sh --quiet      # gates only, no digest
-#   scripts/agent-preflight.sh --require-role  # FAIL if the role is undeclared
+#   scripts/agent-preflight.sh --no-require-role  # tolerate an undeclared role
+#   scripts/agent-preflight.sh --role-only  # ONLY the role gate; NOT a preflight
+#
+# A session declares a role, and an UNDECLARED one is a failing gate by default:
+# the obligation used to live in prose and in an opt-in flag, and neither fired.
+# read-only passes a plain run and fails --staged, because staging is writing.
+#
+# --role-only exists so the mutation suite can EXECUTE that gate instead of
+# grepping it: text assertions catch a REWRITE of the default and miss an
+# OVERRIDE on a later line. A nested FULL run is impossible -- this script runs
+# the very suite that would call it, so it would recurse without bound -- hence
+# a mode that runs the role block and stops. It is not an opt-out: it checks the
+# ROLE strictly, which --no-require-role does not, and it never prints the "All
+# gates green." banner, because it skips every record gate and mutation suite
+# --no-require-role runs and so has not earned it. Neither mode is a superset of
+# the other; --role-only is narrower and stricter, and says so on stdout.
 #
 # It never writes anything, so it is always safe to run.
 
@@ -20,13 +35,21 @@ cd "$ROOT"
 
 STAGED=0
 QUIET=0
-REQUIRE_ROLE=0
+ROLE_ONLY=0
+# ON by default: an undeclared session is a FAILING gate. The mutation suite
+# anchors on THIS line (`^REQUIRE_ROLE=1$`) and refuses any line-anchored
+# assignment of zero, quoted or not, so a silent revert of the default goes red
+# however it is spelled. The opt-out in the arg loop is indented and therefore
+# not line-anchored, which is what keeps the two distinguishable.
+REQUIRE_ROLE=1
 for arg in "$@"; do
   case "$arg" in
     --staged) STAGED=1 ;;
     --quiet) QUIET=1 ;;
     --require-role) REQUIRE_ROLE=1 ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-require-role) REQUIRE_ROLE=0 ;;
+    --role-only) ROLE_ONLY=1 ;;
+    -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -50,6 +73,7 @@ CHECKERS=(
 SUITES=(
   test_agent_record
   test_agent_role
+  test_agent_onboard
   test_claim_view
   test_upstream_inventory
   test_doc_checkpoint
@@ -85,10 +109,30 @@ if role_line=$(python3 scripts/agent-role.py show 2>&1); then
   printf '  \033[32mok\033[0m   %s\n' "$role_line"
 else
   printf '  \033[33m--\033[0m   %s\n' "$(printf '%s' "$role_line" | head -1)"
-  printf '       declare it: scripts/agent-role.py claim operator | claim helper --row <ROW-ID>\n'
+  printf '       This session has not declared a role. Ask what the work is:\n'
+  printf '         a long or multi-step campaign  -> scripts/agent-role.py claim operator\n'
+  printf '         one scoped change              -> scripts/agent-role.py claim helper --row <ROW-ID>\n'
+  printf '         just reading or answering      -> scripts/agent-role.py claim read-only\n'
+  printf '       Add --headless to an unattended run. See .agents/workflow.md.\n'
   if [ "$REQUIRE_ROLE" -eq 1 ]; then
     failed+=("role-undeclared")
   fi
+fi
+
+# read-only PASSES a plain preflight -- that is the point of the third answer.
+# It fails --staged, because staging is writing.
+if [ "$STAGED" -eq 1 ] && printf '%s' "$role_line" | grep -q 'role=read-only'; then
+  printf '  \033[31mFAIL\033[0m read-only sessions do not write. Claim operator or helper first.\n'
+  failed+=("read-only-cannot-stage")
+fi
+
+if [ "$ROLE_ONLY" -eq 1 ]; then
+  echo "ROLE CHECK ONLY -- this is NOT a full preflight; no record gate ran."
+  if [ "${#failed[@]}" -ne 0 ]; then
+    echo "${#failed[@]} gate(s) failed: ${failed[*]}"
+    exit 1
+  fi
+  exit 0
 fi
 
 echo "Record gates:"
