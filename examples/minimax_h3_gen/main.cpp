@@ -17,6 +17,10 @@
 //                  --audio-vae <audio_vae.safetensors> --audio-vae-config <config.json>
 //                  --prompt-embeds <f32.bin>   (rows of text_dim, little-endian f32)
 //                  --out <out.mp4>
+//                  [--partition fl2va|ref2va]  (REQUIRED for a full render: the
+//                    served checkpoint partition — community GGUF/NVFP4 strip it and
+//                    the FL2VA/Ref2VA DiTs are indistinguishable. t2va/fl2va need
+//                    fl2va, ref2va needs ref2va; recipe:50-51,289)
 //                  [--keep-quant] [--steps N] [--frames N] [--height N] [--width N]
 //                  [--workdir DIR] [--ffmpeg PATH] [--dry-run]
 //
@@ -170,6 +174,11 @@ int main(int argc, char** argv) {
   std::string roundtrip_path;      // diagnostic: encode->decode a real image
   std::vector<std::string> ref_image_paths;
   std::string ref_video_prefix, ref_audio_path;
+  // The served checkpoint PARTITION. Community GGUF/NVFP4 files strip the release
+  // model_index.json `_minimax_h3` block, and the FL2VA/Ref2VA DiTs are structurally
+  // identical, so it cannot be inferred from the weights — it must be DECLARED. Empty
+  // => the guard refuses a full render and tells the user to pass it (the #77 catch).
+  std::string partition_flag;
   double imgvid_noise_aug = 1.0;
   int64_t encoder_max_layers = 0;
   int64_t steps = 0, frames = 0, height = 0, width = 0;
@@ -204,6 +213,7 @@ int main(int argc, char** argv) {
       else if (f == "--ref-image") ref_image_paths.push_back(Need(argc, argv, ++i, f));
       else if (f == "--ref-video") ref_video_prefix = Need(argc, argv, ++i, f);
       else if (f == "--ref-audio") ref_audio_path = Need(argc, argv, ++i, f);
+      else if (f == "--partition") partition_flag = Need(argc, argv, ++i, f);
       else if (f == "--noise-aug") imgvid_noise_aug = std::stod(Need(argc, argv, ++i, f));
       else if (f == "--encoder-max-layers") encoder_max_layers = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
@@ -234,7 +244,8 @@ int main(int argc, char** argv) {
                    "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
                    "[--dry-run] [--denoise-only] [--dump-params] "
                    "[--first-frame f.ppm] [--last-frame f.ppm] [--noise-aug A] "
-                   "[--ref-image f.ppm ...] [--ref-video DIR] [--ref-audio f.wav]\n";
+                   "[--ref-image f.ppm ...] [--ref-video DIR] [--ref-audio f.wav] "
+                   "[--partition fl2va|ref2va]\n";
       return 2;
     }
 
@@ -578,6 +589,11 @@ int main(int argc, char** argv) {
     request.video_latents_std = video_stats.std_dev;
     request.audio_latents_mean = audio_stats.mean;
     request.audio_latents_std = audio_stats.std_dev;
+    // Declare the served partition so MiniMaxH3GenerateT2va can refuse a task the
+    // checkpoint does not serve (the #77 catch: t2va on the Ref2VA arm). An empty
+    // --partition is declared-but-unknown; the guard then names the recipe lines and
+    // asks for fl2va|ref2va rather than silently rendering the wrong combination.
+    request.partition = vllm::MiniMaxH3PartitionFromFlag(partition_flag);
 
     // --- ref2va VIDEO reference: a CLIP prepended to the sequence. Reads
     // DIR/frame_%06d.ppm, which is exactly what this example WRITES, so a previous

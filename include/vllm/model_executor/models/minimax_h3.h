@@ -281,6 +281,72 @@ std::string MiniMaxH3ResolveTask(const std::string& requested, const std::string
                                  bool has_image, const std::vector<std::string>& supported_tasks);
 
 // ---------------------------------------------------------------------------
+// Checkpoint PARTITION / task guard (the #77 follow-up)
+// ---------------------------------------------------------------------------
+struct MiniMaxH3T2vaRequest;  // defined below; MiniMaxH3TaskOfRequest takes it by ref
+// MiniMax-H3 ships as TWO independently-served DiT partitions and the task MUST
+// match the partition upstream loads (recipes/MiniMaxAI/MiniMax-H3.md:50-51,289;
+// pipeline_minimax_h3.py:374-391 raises on a mismatch):
+//
+//   FL2VA  serves {t2va, fl2va}
+//   Ref2VA serves {ref2va}
+//
+// The #70/#74 white render was exactly this: t2va run on the Ref2VA NVFP4
+// checkpoint — an out-of-distribution task/partition combination upstream
+// rejects. Our driver silently accepted it. This mirrors the raise.
+//
+// PARTITION DETECTION. The release safetensors carries the served-task set in
+// `model_index.json` -> `_minimax_h3` -> {"partition","tasks"}
+// (pipeline_minimax_h3.py:279-282). Community GGUF/NVFP4 redistributions STRIP
+// that block, and there is NO structural fallback: the FL2VA and Ref2VA DiTs are
+// byte-structurally identical — the two real manifests carry the SAME 535 base
+// tensor names AND the SAME shapes (ref2va prepends reference rows through the
+// SAME video/audio_patch_proj, adding no tensor), so nothing in a stripped file
+// discriminates the partition. When the block is gone the partition must be
+// DECLARED (an explicit --partition), never guessed.
+struct MiniMaxH3PartitionInfo {
+  // false => no partition metadata was supplied. The guard is then a no-op: it
+  // gates the entry points that LOAD a checkpoint (driver/server), not the pure
+  // pipeline-math unit tests that build a request by hand. Every resolver below
+  // sets it true.
+  bool declared = false;
+  // The served partition ("fl2va" | "ref2va"), or "" when a stripped file gave no
+  // way to know it. Mirrors `self.partition` (pipeline_minimax_h3.py:281).
+  std::string partition;
+  // The served-task set. Mirrors `self.supported_tasks` (pipeline:282). Empty when
+  // the partition is unknown — then EVERY task is ambiguous and refused.
+  std::vector<std::string> supported_tasks;
+};
+
+// Read `_minimax_h3.{partition,tasks}` from a parsed model_index.json, mirroring
+// pipeline_minimax_h3.py:279-282 exactly. Always sets `declared` true; a missing
+// `_minimax_h3` block (or missing keys) yields {true,"",{}}, which the guard
+// treats as an unknown partition and refuses rather than guesses.
+MiniMaxH3PartitionInfo MiniMaxH3PartitionFromModelIndex(const nlohmann::json& model_index);
+
+// Build partition info from an explicit --partition override, grounded in the
+// recipe's one-server-one-partition split (recipes/MiniMaxAI/MiniMax-H3.md:50-51):
+// "fl2va" serves {t2va, fl2va}, "ref2va" serves {ref2va}. An empty string yields
+// the unknown/declared state (the guard then refuses every task); any other
+// non-empty value is refused as an invalid partition name.
+MiniMaxH3PartitionInfo MiniMaxH3PartitionFromFlag(const std::string& partition);
+
+// The task a built request ENCODES: non-empty `ref_blocks` => "ref2va", else
+// non-empty `keyframe_frame_indices` => "fl2va", else "t2va". The two conditioning
+// fields are mutually exclusive (packed layout enforces it), so this is the same
+// key the pipeline dispatch already branches on.
+std::string MiniMaxH3TaskOfRequest(const MiniMaxH3T2vaRequest& request);
+
+// The task/partition guard — the raise half of `_resolve_task`
+// (pipeline_minimax_h3.py:387-390). Throws when `task` is not served by the
+// partition ("checkpoint partition 'ref2va' supports {ref2va}, got task='t2va'").
+// When the partition is UNKNOWN (stripped community file, no --partition) EVERY
+// task is ambiguous — t2va/fl2va are valid only on FL2VA, ref2va only on Ref2VA,
+// and the two DiTs are indistinguishable — so it refuses and names the recipe
+// lines. A no-op when `info.declared` is false.
+void MiniMaxH3CheckTaskPartition(const std::string& task, const MiniMaxH3PartitionInfo& info);
+
+// ---------------------------------------------------------------------------
 // Flow-matching scheduler (scheduling_minimax_h3_euler_ancestral.py)
 // ---------------------------------------------------------------------------
 
@@ -1379,6 +1445,15 @@ struct MiniMaxH3T2vaRequest {
   // chunks and upstream center-crops to this (trim_output); 0 keeps every frame.
   int64_t num_frames = 0;
   int64_t num_steps = kMiniMaxH3DefaultSteps;
+
+  // The served checkpoint partition, for the task/partition guard mirrored from
+  // upstream `_resolve_task` (pipeline_minimax_h3.py:374-391). MiniMaxH3GenerateT2va
+  // refuses a task the partition does not serve (t2va/fl2va need FL2VA, ref2va needs
+  // Ref2VA). Default-constructed (`declared=false`) leaves the guard INACTIVE, so a
+  // direct caller building a request by hand is unaffected; the checkpoint-loading
+  // entry points (driver/server) fill it via MiniMaxH3PartitionFromFlag /
+  // MiniMaxH3PartitionFromModelIndex. See the #77 follow-up.
+  MiniMaxH3PartitionInfo partition;
 
   // --- fl2va KEYFRAME CONDITIONING (empty => plain t2va) ---
   // Which generated frames the supplied keyframes pin. Upstream allows exactly

@@ -362,6 +362,15 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                                           const std::vector<float>& initial_audio_rows,
                                           vt::DType compute_dtype,
                                           const MiniMaxH3DitDeviceWeights* prestaged) {
+  // The task/partition guard — the raise half of `_resolve_task`
+  // (pipeline_minimax_h3.py:374-391), which the #70/#74 white render bypassed by
+  // running t2va on the Ref2VA NVFP4 checkpoint. The task is what the request
+  // ENCODES (ref_blocks => ref2va, keyframes => fl2va, else t2va); a checkpoint that
+  // declared its partition (driver --partition / server model_index.json) refuses a
+  // task it does not serve. A request that never set `partition` (declared=false)
+  // leaves the guard inactive, so the pipeline-math tests are unaffected.
+  MiniMaxH3CheckTaskPartition(MiniMaxH3TaskOfRequest(request), request.partition);
+
   const MiniMaxH3DenoiseResult denoised =
       MiniMaxH3DenoiseT2va(device, request, dit_params, dit_weights, prompt_embeds,
                            initial_video_rows, initial_audio_rows, compute_dtype, prestaged);

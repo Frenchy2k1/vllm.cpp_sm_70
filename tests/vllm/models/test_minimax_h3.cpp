@@ -1299,6 +1299,118 @@ TEST_CASE("minimax_h3: request planning matches upstream") {
   CHECK_THROWS(vllm::MiniMaxH3ResolveTask("ref2va", "FL2VA", false, fl2va_partition));
 }
 
+// The #77 follow-up: the task/partition GUARD. The #70/#74 white render cost three
+// campaigns because the driver silently accepted t2va on the Ref2VA NVFP4
+// checkpoint — a task/partition mismatch upstream `_resolve_task` RAISES on
+// (pipeline_minimax_h3.py:374-391; recipes/MiniMaxAI/MiniMax-H3.md:50-51,289). This
+// gates the mirror: the mismatch now FAILS LOUDLY, the correct pairings pass, and
+// the community-file (stripped-config) path refuses ambiguity rather than guessing.
+TEST_CASE("minimax_h3: the task/partition guard refuses the #77 mismatch") {
+  using vllm::MiniMaxH3CheckTaskPartition;
+  using vllm::MiniMaxH3PartitionFromFlag;
+  using vllm::MiniMaxH3PartitionFromModelIndex;
+
+  // --- Partition detection path 1: the release model_index.json `_minimax_h3`
+  // block (pipeline_minimax_h3.py:279-282). Synthetic manifests of BOTH shapes.
+  const nlohmann::json fl2va_index = {
+      {"_minimax_h3", {{"partition", "fl2va"}, {"tasks", {"t2va", "fl2va"}}}}};
+  const nlohmann::json ref2va_index = {
+      {"_minimax_h3", {{"partition", "ref2va"}, {"tasks", {"ref2va"}}}}};
+  const vllm::MiniMaxH3PartitionInfo fl2va = MiniMaxH3PartitionFromModelIndex(fl2va_index);
+  const vllm::MiniMaxH3PartitionInfo ref2va = MiniMaxH3PartitionFromModelIndex(ref2va_index);
+  CHECK(fl2va.declared);
+  CHECK(fl2va.partition == "fl2va");
+  CHECK(fl2va.supported_tasks == std::vector<std::string>{"t2va", "fl2va"});
+  CHECK(ref2va.partition == "ref2va");
+  CHECK(ref2va.supported_tasks == std::vector<std::string>{"ref2va"});
+
+  // The GUARD BEHAVIOR TABLE (task x partition -> pass/refuse). The whole point of
+  // the row: the top-left cell (t2va on Ref2VA) is the #77 failure mode.
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition("t2va", ref2va));   // <-- #77: FAIL LOUDLY
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition("fl2va", ref2va));  // fl2va needs FL2VA
+  CHECK_NOTHROW(MiniMaxH3CheckTaskPartition("ref2va", ref2va));
+  CHECK_NOTHROW(MiniMaxH3CheckTaskPartition("t2va", fl2va));
+  CHECK_NOTHROW(MiniMaxH3CheckTaskPartition("fl2va", fl2va));
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition("ref2va", fl2va));  // ref2va needs Ref2VA
+  // Case-insensitive, mirroring `str(requested).lower()` (pipeline:386).
+  CHECK_NOTHROW(MiniMaxH3CheckTaskPartition("T2VA", fl2va));
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition("T2VA", ref2va));
+
+  // --- Partition detection path 2: an explicit --partition flag (community
+  // GGUF/NVFP4 strip the config). The recipe's one-server-one-partition split.
+  const vllm::MiniMaxH3PartitionInfo fl2va_flag = MiniMaxH3PartitionFromFlag("fl2va");
+  const vllm::MiniMaxH3PartitionInfo ref2va_flag = MiniMaxH3PartitionFromFlag("ref2va");
+  CHECK(fl2va_flag.supported_tasks == std::vector<std::string>{"t2va", "fl2va"});
+  CHECK(ref2va_flag.supported_tasks == std::vector<std::string>{"ref2va"});
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition("t2va", ref2va_flag));   // same #77 catch
+  CHECK_NOTHROW(MiniMaxH3CheckTaskPartition("fl2va", fl2va_flag));
+  CHECK_THROWS(MiniMaxH3PartitionFromFlag("bogus"));  // invalid partition name
+
+  // --- The ambiguous / stripped case: NO config block AND NO --partition. The
+  // partition is unknown, and (see the structural check below) unknowable from the
+  // weights, so the guard REFUSES every task rather than guessing.
+  const vllm::MiniMaxH3PartitionInfo stripped = MiniMaxH3PartitionFromModelIndex(nlohmann::json::object());
+  CHECK(stripped.declared);
+  CHECK(stripped.partition.empty());
+  CHECK(stripped.supported_tasks.empty());
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition("t2va", stripped));
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition("fl2va", stripped));
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition("ref2va", stripped));
+  const vllm::MiniMaxH3PartitionInfo empty_flag = MiniMaxH3PartitionFromFlag("");
+  CHECK(empty_flag.declared);
+  CHECK(empty_flag.supported_tasks.empty());
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition("t2va", empty_flag));  // --partition required
+
+  // --- A DEFAULT-CONSTRUCTED (declared=false) request leaves the guard INACTIVE:
+  // the pure pipeline-math tests build requests by hand and must be unaffected.
+  const vllm::MiniMaxH3PartitionInfo undeclared;
+  CHECK_FALSE(undeclared.declared);
+  CHECK_NOTHROW(MiniMaxH3CheckTaskPartition("t2va", undeclared));
+  CHECK_NOTHROW(MiniMaxH3CheckTaskPartition("ref2va", undeclared));
+
+  // --- The dispatch key: MiniMaxH3TaskOfRequest, the same discriminator
+  // MiniMaxH3GenerateT2va feeds the guard. ref_blocks => ref2va, keyframes => fl2va,
+  // else t2va.
+  vllm::MiniMaxH3T2vaRequest t2va_req;  // no conditioning
+  CHECK(vllm::MiniMaxH3TaskOfRequest(t2va_req) == "t2va");
+  vllm::MiniMaxH3T2vaRequest fl2va_req;
+  fl2va_req.keyframe_frame_indices = {0};
+  CHECK(vllm::MiniMaxH3TaskOfRequest(fl2va_req) == "fl2va");
+  vllm::MiniMaxH3T2vaRequest ref2va_req;
+  ref2va_req.ref_blocks.push_back(vllm::MiniMaxH3RefBlock{});
+  CHECK(vllm::MiniMaxH3TaskOfRequest(ref2va_req) == "ref2va");
+
+  // The exact #77 combination as the dispatch sees it: a t2va request pointed at a
+  // Ref2VA checkpoint. This is what MiniMaxH3GenerateT2va now refuses.
+  t2va_req.partition = ref2va;
+  CHECK_THROWS(MiniMaxH3CheckTaskPartition(vllm::MiniMaxH3TaskOfRequest(t2va_req), t2va_req.partition));
+  ref2va_req.partition = ref2va;  // the correct pairing passes
+  CHECK_NOTHROW(MiniMaxH3CheckTaskPartition(vllm::MiniMaxH3TaskOfRequest(ref2va_req), ref2va_req.partition));
+
+  // --- WHY the stripped case must refuse rather than auto-detect: the two REAL
+  // captured manifests (ref2va NVFP4 = 1051 tensors, FL2VA GGUF = 535) carry the
+  // IDENTICAL DiT — same base tensor names AND shapes. NVFP4 splits each quantized
+  // weight into {weight, weight_scale, weight_scale_2}; normalizing that away, the
+  // two name sets are equal, so no tensor-name/shape discriminator exists.
+  auto normalize_nvfp4 = [](std::string n) -> std::string {
+    for (const char* suffix : {".weight_scale_2", ".weight_scale"}) {
+      const std::string s = suffix;
+      if (n.size() >= s.size() && n.compare(n.size() - s.size(), s.size(), s) == 0) {
+        return n.substr(0, n.size() - s.size()) + ".weight";
+      }
+    }
+    return n;
+  };
+  std::set<std::string> nvfp4_names, gguf_names;
+  for (const vllm_test::H3Nvfp4Tensor& t : vllm_test::kH3Nvfp4Tensors) {
+    nvfp4_names.insert(normalize_nvfp4(t.name));
+  }
+  for (const vllm_test::H3GgufTensor& t : vllm_test::kH3GgufTensors) gguf_names.insert(t.name);
+  CHECK(nvfp4_names.size() == 535);
+  CHECK(gguf_names.size() == 535);
+  CHECK(nvfp4_names == gguf_names);  // no structural discriminator => --partition is required
+}
+
 TEST_CASE("minimax_h3: the denoise loop advances targets and pins condition rows") {
   // The loop itself has no upstream golden (upstream's own loop test needs the
   // checkpoint), so this gates its INVARIANTS, which are what the CFG-distilled
