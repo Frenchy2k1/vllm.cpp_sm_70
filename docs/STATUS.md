@@ -138,11 +138,11 @@ matched to vLLM.
 **Block-diffusion DFlash** (the z-lab Qwen3.6-27B draft over the 27B NVFP4
 target) is correctness-complete and at or above vLLM throughput on GB10 (final
 concurrency-1 A/B our-on 29.32 tok/s vs vLLM-on 29.24, non-overlapping bands,
-1.003x); it is recorded DONE across the engine, model and kernel matrices, built
-D0 through D14 on the vLLM 0.26.0.dev0 stack (which resolves vllm#40898), and it
-remains gated behind a spike while its user-facing serving surface is finalized.
+1.003x); it is recorded DONE across the engine, model and kernel matrices on the
+vLLM 0.26.0.dev0 stack (which resolves vllm#40898), and it remains gated behind
+a spike while its user-facing serving surface is finalized.
 
-**Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (k=1), DFlash and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, dspark, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer).
+**Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (k=1), DFlash and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, dspark, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer). Draft DEPTH (k>1, dynamic, adaptive) unbuilt (`ROAD-V1-D3-SPEC-K`, #81).
 
 **DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
 2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
@@ -167,7 +167,7 @@ loop (R2) + device draft (R4). fp16 dequant cache refuted net-slower on GB10; MH
 a measured tie; routed-MoE we already win. See
 `.agents/specs/deepseek-beat-ds4-sweep-2026-07-30.md`.
 
-**DeepSeek-V4-Flash decode levers (2026-08-03, byte-exact, default-ON; SUPERSEDED by the 1.14x BINDING below).** The Q8_K-preq launch-geometry port (+5.4%), the MHC-pre and norm+RoPE FP64->FP32 folds and the MHC-lean occupancy widen climbed decode ~13.5 -> 14.96 tok/s toward ds4 ~16.5; full per-lever forensics in docs/BENCHMARKS.md (`CLAIM-DSV4-Q8K-PREQ` / `-MHC-FOLD` / `-ROPE-FLOAT` / `-MHC-LEAN`).
+**DeepSeek-V4-Flash decode levers (2026-08-03, byte-exact, default-ON; SUPERSEDED by the 1.14x BINDING below).** The Q8_K-preq launch-geometry port (+5.4%), the MHC-pre and norm+RoPE FP64->FP32 folds and the MHC-lean occupancy widen climbed decode ~13.5 -> 14.96 tok/s toward ds4 ~16.5; per-lever forensics in `.agents/benchmark-record.md`.
 
 **BINDING 2026-08-05: `VT_V4_RESIDENT_W` (default-ON) BEATS ds4 — 18.69 vs 16.33 tok/s (1.144x), byte-exact:** the dense Q8_0 MLA/shared/lm_head proj tower was read from GGUF-mmap over ATS; staging it `cudaMalloc`-device once (Q8_0 per-launch ~20% each, ids-IDENTICAL) lifts decode 16.23→18.69 (median-of-3, drop_caches, PEAK flat 86.68 GiB, net move). Mirrors Laguna `VT_LAGUNA_RESIDENT_BF16W`; our GEMV was ATS-bound, not at ds4 parity. **Phase-2 routed-expert residency (`VT_V4_RESIDENT_EXPERTS`) MEASURED NEGATIVE, HELD default-OFF (2026-08-05):** the ~70 GiB IQ2/Q2_K expert slabs staged device-resident (madvise move-semantics) are byte-exact but **−3.4% steady** (18.76 vs 19.43 tok/s, same-binary median-of-3) + a one-time capture cost — the grouped-MoE kernels are dequant/latency-bound (~19-24% of DRAM peak), so residency (a bandwidth lever) cannot help, and device pinning cuts pool headroom (103→30 GiB avail). Prior (superseded, see record): PARITY 16.28 vs 16.33 (0.997x); `VT_V4_MHC_SINK4` +4.6% byte-exact; HC-expand + f16-DSA held default-OFF.
 
