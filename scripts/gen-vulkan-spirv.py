@@ -104,6 +104,34 @@ def compile_one(cc: pathlib.Path, src: pathlib.Path) -> bytes:
     return data
 
 
+# SPIR-V decoration constants (SPIR-V core spec: OpDecorate = 71 in §3.32.3
+# Annotation Instructions, Decoration SpecId = 1 in §3.20). Parsing the emitted
+# module is the only source of truth here: glslang offers no side-channel listing
+# of the SpecIds it produced, and a hand-maintained list beside the shaders is
+# exactly the kind of duplicate that drifts silently.
+SPIRV_OP_DECORATE = 71
+SPIRV_DECORATION_SPEC_ID = 1
+SPIRV_HEADER_WORDS = 5
+
+
+def spec_ids(blob: bytes) -> list[int]:
+    """Return the SpecId values decorated in one SPIR-V module, sorted ascending."""
+    words = [int.from_bytes(blob[i:i + 4], "little") for i in range(0, len(blob), 4)]
+    ids: set[int] = set()
+    i = SPIRV_HEADER_WORDS
+    while i < len(words):
+        word_count = words[i] >> 16
+        opcode = words[i] & 0xFFFF
+        if word_count == 0:
+            sys.exit("malformed SPIR-V: zero-length instruction")
+        # OpDecorate <target-id> <decoration> [<literal>...]
+        if opcode == SPIRV_OP_DECORATE and word_count >= 4:
+            if words[i + 2] == SPIRV_DECORATION_SPEC_ID:
+                ids.add(words[i + 3])
+        i += word_count
+    return sorted(ids)
+
+
 def render(blobs: dict[str, bytes], version: str) -> str:
     lines: list[str] = []
     add = lines.append
@@ -141,17 +169,35 @@ def render(blobs: dict[str, bytes], version: str) -> str:
             add(f"    {chunk},")
         add("};")
         add("")
+    for name in sorted(blobs):
+        ids = spec_ids(blobs[name])
+        if ids:
+            add(f"inline constexpr uint32_t kSpecIds_{name}[] = {{")
+            add("    " + ", ".join(f"{i}u" for i in ids) + ",")
+            add("};")
+            add("")
     add("// Name -> SPIR-V module. The NAME is the shader's file stem and is also the")
     add("// key the pipeline cache uses (src/vt/vulkan/vulkan_context.cpp).")
+    add("//")
+    add("// spec_ids lists the SPECIALIZATION CONSTANT IDs the module declares, parsed")
+    add("// from its OpDecorate SpecId instructions and sorted ascending. The host passes")
+    add("// specialization values BY ID, and Vulkan SILENTLY IGNORES a map entry whose ID")
+    add("// the module does not declare — so without this table a host/shader drift")
+    add("// produces WRONG NUMBERS instead of a clean failure.")
     add("struct SpirvModule {")
     add("  const char* name;")
     add("  const uint32_t* words;")
     add("  size_t word_count;")
+    add("  const uint32_t* spec_ids;")
+    add("  size_t spec_id_count;")
     add("};")
     add("")
     add("inline constexpr SpirvModule kSpirvModules[] = {")
     for name in sorted(blobs):
-        add(f'    {{"{name}", kSpv_{name}, sizeof(kSpv_{name}) / sizeof(uint32_t)}},')
+        ids = spec_ids(blobs[name])
+        idp = f"kSpecIds_{name}" if ids else "nullptr"
+        add(f'    {{"{name}", kSpv_{name}, sizeof(kSpv_{name}) / sizeof(uint32_t), '
+            f'{idp}, {len(ids)}}},')
     add("};")
     add("")
     add("}  // namespace vt::vulkan")
