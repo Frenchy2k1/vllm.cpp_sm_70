@@ -14159,3 +14159,47 @@ noise fix from #70 stands but was already known not to be the render fix.
    full canvas, and the real per-token timestep layout. A real-weights activation diff of
    the DiT INPUTS (encoder output, position grid, condition-noise) at real geometry is
    the untested surface #70 did not isolate.
+
+## MAIN IS RED: the GGUF oracle gate emits all-zero tokens on a CPU-only build (2026-08-06)
+
+Found while trying to run the owed oracle gate for `VT_CPU_ELEM_KN_REPACK`. It
+is NOT caused by that work, and not by anything on
+`row/KERNEL-GEMM-CPU-ELEM-X86WIDE`.
+
+**Reproduce.** dgx, idle, one flock, CPU-only Release build of PRISTINE `main`
+@`4a62c43f`, `test_qwen36_gguf_engine`, APEX-Compact 35B
+(`Qwen3.6-35B-A3B-APEX-Compact.gguf`):
+
+    got  = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}   continuation "!!!!!!!!!!!!!!!!"
+    want = {11751, 11, 9338, 13, 1049, 369, 799, 314, 279, 1379, ...}
+
+Every generated token is id 0. What still works: prompt tokenisation is exact
+(`prompt_token_ids` matches the golden), the engine reports `finished`, and
+16/16 tokens are produced. Only their values are garbage. The SIGSEGV doctest
+then reports at `:145` is a second-order effect on the following prompt.
+
+**Attribution: my branch is exonerated.** The identical failure (same line, same
+signature, same 8/9 assertions) reproduces on pristine `main` with none of the
+elem-GEMM work present.
+
+**Hypothesis RAISED AND REFUTED, recorded so nobody re-runs it.** The engine
+banner said "Asynchronous scheduling is enabled (max_concurrent_batches=2)", and
+the token-0 signature is exactly what `ROW-SERVE-ASYNC-LLM` and
+`ROW-SERVE-ASYNC-DENSE-MIRROR` describe ("batch-1 greedy decode degenerated into
+nondeterministic token-0 garbage"), so a third uncovered async path looked
+likely. It is not: with `VT_ASYNC_SCHED=0` ("Asynchronous scheduling is disabled
+(max_concurrent_batches=1)") the output is byte-for-byte the same all-zero
+stream. Async scheduling is NOT the cause.
+
+**What this means.** This gate is recorded PASSING on a CPU-only dgx build in
+the CIQ G4 entry (2026-07-22: "2/2 cases, 16/16 greedy tokens on APEX-Compact
+AND APEX-Balanced"). It does not pass there now. Either the CPU-only k-quant MoE
+decode path regressed since, or the gate's CPU-only support was lost silently.
+Bisecting that is a separate piece of work and is NOT attempted here.
+
+**Consequence for the repack.** The oracle token gate cannot certify
+`VT_CPU_ELEM_KN_REPACK` while it cannot certify main itself. The flag stays
+opt-in and its promotion evidence stays owed. The e2e self-comparison result
+(three prompts byte-identical with 55 tensors / 358,612,992 elements proven
+repacked) is unaffected and stands, but it is not oracle-verified and is not
+being presented as such.
