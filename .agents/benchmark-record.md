@@ -12376,3 +12376,40 @@ only "27"/"35"; no Yi30/8B key. Retargeting = MODEL_REVISIONS/REPOSITORIES entry
 max-num-seqs sizing. The fix unblocks the DEFAULT-config bench (no more VT_ASYNC_SCHED=0
 workaround); oracle proven to run the model today. Evidence: dgx:/dev/shm/serve-async-dense/
 {gates_06b.log,gates2.log,mxfp4_e2e.log,oracle_neartie2.log,oracle_tf.log}.
+
+## 2026-08-08T18:00 — KERNEL-FA2-GQA-SWAP: d128 varlen decode group-swap gated-OFF, correctness gates GREEN (bench PENDING)
+
+The #47-localized lever (`row/KERNEL-FA2-GQA-SWAP`, `VT_FA2_DECODE_GQA_SWAP`, default
+OFF): vLLM's FA2 `seqlenq_ngroups_swapped` decode grid ported into
+`LaunchDecodeVarlenFA2Bf16` so the Qwen3-dense d128 decode launches
+`(batch, kv_heads)` not `(batch, hq)`. `benchmark_binding=false` this session — the
+c1-c8 x3 binding grid + default flip is the recorded next step; what ran here is the
+CORRECTNESS bar that GATES the flip. dgx GB10, CUDA 13.0, sm_121a, RelWithDebInfo,
+VLLM_CPP_FLASH_ATTN=ON; the 4 changed files git-archived by SHA onto `~/mxfp4-bench/src`
+(md5-matched local), incremental `ninja` (both CUDA TUs recompiled clean on nvcc).
+
+GATES:
+- OP UNIT TEST (RED-first): `test_ops_paged_attn --test-case="*varlen d128*"` = 5/5
+  cases, **280/280 assertions GREEN** (OFF-path parity + group-swap-matches-ref both
+  ratios 16/8+32/8 × batch{1,2,4,8} × len{5,21,1024}, `swap_launches==1` asserted;
+  swap-vs-plain near-tie max_abs<2e-2; MHA qpk==1 inert `swap_launches==0`). Full
+  binary **28/28 cases, 454,679 assertions** — no regression.
+- RED PROVEN: injecting a wrong swapped `o_head_stride` (drop the ngroups factor) →
+  group-swap case FAILS (26,528 violations, max_abs 2.60). Restored + rebuilt
+  (md5 `ba34d5b8…`).
+- MEMCHECK: `compute-sanitizer --tool memcheck --leak-check full` on the swap cases =
+  **0 errors, 0 bytes leaked**.
+- #44 MXFP4 SMOKE (Yi30/Qwen3-8B-MXFP4, groups=4, DEFAULT async/graphed): swap-OFF PASS
+  (3/3 det token-exact + coherent); **swap-ON PASS (3/3 deterministic TOKEN-EXACT vs
+  golden AND byte-identical to swap-OFF** — capitals/arithmetic/fibonacci char-identical,
+  story identical). No token flip e2e → near-tie razor not needed; graphed capture-safety
+  token gate ON.
+
+NEXT (the flip campaign): `scripts/mxfp4-online-serving-grid.sh --snapshot <b3e7ab32>
+--build-dir ~/mxfp4-bench/build --configure-log <log>` with `VT_FA2_DECODE_GQA_SWAP=1`
+on OURS legs, vs the #45 numbers (tput c1 0.989 / c2 0.911 / c4 0.919 / c8 0.913; TPOT
+c2 28.27→25.45). #47 projects flash alone closes ~28%@c2 / ~55%@c8 (decode flash
+63.7→~41.7us c2 as the grid drops 192→96 CTAs); residual = marlin +7-9% + ~0.7ms host,
+so a single lever may not reach ≥1.0x — record the honest per-axis outcome. Then Qwen3
+0.6B/4B e2e SACRED swap-ON, then flip per parity-enablers. Box left clean (both locks
+free, GPU idle, worker down, disk 22G).
