@@ -13431,3 +13431,48 @@ The x86 wide-ISA row (`KERNEL-GEMM-CPU-ELEM-X86WIDE`, W1/W2 landed) is NOT
 affected by any of this: AVX2 and AVX-512 widen the OUTPUT-lane dimension, which
 preserves the reduction order, and both pass the 654-assertion memcmp gate. Its
 ~3.5x width headroom stands on its own.
+
+## KERNEL-GEMM-CPU-ELEM-X86WIDE W1/W2 landed: AVX2 and AVX-512 tiers, INDICATIVE speed
+
+Correctness is the binding result and it is met: 654/654 memcmp byte-identity
+assertions on every tier, with the tier ACTUALLY selected verified via
+`ElemGemmTierName()` so a silent fallback cannot pass the gate vacuously.
+
+| forced tier | selected | assertions |
+|---|---|---|
+| default | avx512 | 654/654 |
+| portable | portable | 654/654 |
+| avx2 | avx2 | 654/654 |
+| avx512 | avx512 | 654/654 |
+| ref | ref | 654/654 |
+
+**Speed below is INDICATIVE, NOT BINDING.** The x86 dev box is VOID for timing
+per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`, and these runs were taken at load ~10 while
+another session's test suite was finishing, not on an idle box. No ratio here
+may be quoted as a result. GFLOP/s, f16 weight with f32 activations, 8 threads:
+
+| shape | SSE2 (was) | AVX2 | AVX-512 | AVX-512 vs SSE2 |
+|---|---:|---:|---:|---:|
+| 256,256,5220 | 168.5 | 231.8 | 271.2 | 1.61x |
+| 131,2048,512 | 159.3 | 266.8 | 451.1 | 2.83x |
+| 131,512,2048 | 208.5 | 276.6 | 431.8 | 2.07x |
+| 131,512,512 | 210.8 | 279.5 | 428.9 | 2.03x |
+| 261,512,512 | 231.1 | 311.8 | 396.8 | 1.72x |
+| 1,640,2560 | 153.2 | 194.4 | 238.3 | 1.56x |
+
+Against the reference points from the same-day attribution: ggml WITHOUT
+llamafile is 449-587 on these shapes, so AVX-512 at 271-451 closes most of the
+width gap that motivated the row (`131,2048,512`: 451.1 vs 587.0, 1.30x
+remaining). The residue is consistent with FMA, which ggml uses and we cannot
+without breaking byte-identity, and with llamafile on top of that.
+
+A first attempt at these numbers produced 0.5-79 GFLOP/s and looked like a
+catastrophic regression. It was measured at load 202 while another session ran
+the full vllm.cpp test suite from
+`.claude/worktrees/agent-a1ebc9ca0b6aa195e/build-p26/`. Discarded, not reported.
+Recorded here because "no kernel design explains 300x" is the check that caught
+it, and because concurrent sessions on this box are a live hazard for anyone
+measuring here.
+
+A binding number needs an idle, qualified x86 host, which the project does not
+currently have.
