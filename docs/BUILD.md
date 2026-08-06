@@ -109,6 +109,36 @@ cmake -S . -B build-vulkan -DVLLM_CPP_VULKAN=ON
 cmake --build build-vulkan -j
 ```
 
+## ROCm build (AMD GPUs) — never yet compiled
+
+> **Read this before you file a bug.** The HIP sources in this tree have **never
+> been compiled by anyone.** There is no AMD GPU and no ROCm toolchain on any
+> machine the maintainers use, so unlike every other backend here this one has no
+> build report at all — not even "it compiles". If it fails for you, that is the
+> expected first outcome and the most useful thing you can report. Please do,
+> on [issue #41](https://github.com/mudler/vllm.cpp/issues/41).
+
+```sh
+cmake -S . -B build-hip -DVLLM_CPP_HIP=ON -DVLLM_CPP_HIP_ARCHITECTURES=gfx1100
+cmake --build build-hip -j
+ctest --test-dir build-hip -R 'rocm|cross_device'
+```
+
+`VLLM_CPP_HIP_ARCHITECTURES` is optional: leave it empty and hipcc targets the
+installed GPU, which is what you want when building on the machine you will run
+on. The validated names are upstream vLLM's `HIP_SUPPORTED_ARCHS`; anything else
+configures with a warning and is passed to hipcc anyway. If ROCm lives outside
+`/opt/rocm`, point at it with `-DROCM_PATH=<prefix>`.
+
+`-DVLLM_CPP_HIP=ON` **fails the configure** when no HIP compiler is found rather
+than quietly producing a CPU-only build, for the same reason the CUTLASS note
+above exists: a silent downgrade is indistinguishable from success.
+
+What exists today is the W0 skeleton — the `vt::Backend`, the `Platform`, one
+registered kernel (RmsNorm), and the tests that gate them. What that does and
+does not get you, and where to start on your specific board, is
+[docs/ROCM.md](ROCM.md).
+
 ## Nix shells
 
 The checked-in flake pins CMake, Ninja and the CUDA toolchain, so nothing has
@@ -144,6 +174,9 @@ defaults.
 | `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a`/`120a;121a` (consumer Blackwell), and cross-family targets `90a`, `80`/`86`/`87`/`89`, `100a`/`103a`, `110`. The `a` suffix is required for the native fp4 MMA |
 | `VLLM_CPP_METAL` | `AUTO` | Build the Metal backend: `ON`, `OFF`, or `AUTO` (on for an Apple host with an ObjC++ compiler) |
 | `VLLM_CPP_VULKAN` | `AUTO` (= `OFF`) | Build the Vulkan backend. Opt-in with `-DVLLM_CPP_VULKAN=ON`; headers are vendored and SPIR-V is committed |
+| `VLLM_CPP_HIP` | `AUTO` (= `OFF`) | Build the ROCm/HIP backend. Opt-in with `-DVLLM_CPP_HIP=ON`, which fails loudly if no `hipcc` is found. **Never compiled by anyone — see the ROCm section above** |
+| `VLLM_CPP_HIP_ARCHITECTURES` | (empty) | Target `gfx` arch(es), e.g. `gfx1100` or `gfx1100;gfx1151`. Empty means hipcc targets the installed GPU |
+| `ROCM_PATH` | `/opt/rocm` | ROCm installation prefix, for a nightly/TheRock install elsewhere |
 | `VLLM_CPP_MLX` | `OFF` | Build the optional MLX GEMM provider for Metal (needs `-DMLX_ROOT=<mlx install>`) |
 | `MLX_ROOT` | (empty) | Root of an MLX install (`include/` + `lib/`) for `VLLM_CPP_MLX` |
 | `VLLM_CPP_SERVER` | `ON` | Build the OpenAI HTTP server (needs `third_party/httplib/httplib.h`; disables itself with a warning if absent) |
@@ -168,7 +201,7 @@ defaults.
 | Metal | Apple Silicon | Two models run end to end and pass correctness; 18 of 75 ops native. Warm b=1 throughput is 95.9% of MLX-LM, or 97.6% with the optional MLX provider gated to prefill (where we are 1.5% ahead). Indicative |
 | Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet |
 | Intel XPU | Intel GPUs | Spiked, hardware-blocked |
-| ROCm | AMD GPUs | No code yet. Bring-up is open for contribution: [ROCM.md](ROCM.md) |
+| ROCm | AMD GPUs | W0 skeleton committed (backend, platform, one op); its HIP sources are **never compiled** — no AMD hardware here. Open for contribution: [ROCM.md](ROCM.md) |
 | ANE | Apple Neural Engine | Post-parity roadmap |
 
 Only GB10 / sm_121a is a runtime-gated CUDA target today. Consumer Blackwell
