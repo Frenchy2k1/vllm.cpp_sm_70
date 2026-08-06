@@ -19,6 +19,129 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## QUANT-CT-MXFP4-FUSED-GLUE W0 — the funded glue-fusion-into-Marlin kernel target is SOURCE-REFUTED; vLLM does NOT fuse glue into the extern Marlin GEMM for W4A16; the c2-c8 residual is FLASH-dominant, not glue (2026-08-06, `row/QUANT-CT-MXFP4-FUSED-GLUE`, source-side on dev box; GPU dumps box-contended by `row/H3-FP4-GPU-E2E`, base `origin/main` `672fc760`)
+
+W0 of the funded MXFP4 kernel campaign. The chartered vehicle is `Yi30/Qwen3-8B-MXFP4`
+(dense `Qwen3ForCausalLM`, compressed-tensors **W4A16** Marlin keep-quant); oracle arm
+`VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel` (sm_121 cute-dsl mxf4 crashes). The
+prior FINAL-STACK (#59) terminal statement funded a from-scratch Marlin kernel fusing
+`add+RMSNorm+quant` into the GEMM PROLOGUE and `silu+mul` into the EPILOGUE, framed as
+mirroring vLLM's Inductor "GEMM pro/epilogue fusion" (`triton_red_fused_fused_add_rms_norm_marlin_gemm`
+/ `triton_poi_fused_marlin_gemm_mul_silu_slice`, #46/#52). W0's precondition is to DUMP
+vLLM's actual kernels and never trust the label. The GPU dumps (TORCH_LOGS=output_code,
+same-tool decode-window) are box-contended and OWED, but the vLLM COMPILATION SOURCE is
+decisive on its own and REFUTES the premise. Reading is at the parity pin `555967922`
+(`~/_git/vllm`, 0.26.0.dev0).
+
+**FINDING 1 (source-conclusive): the two named vLLM fusion passes DO NOT FIRE for a
+W4A16 MXFP4 model — they are ACTIVATION-QUANT fusions and W4A16 keeps bf16 activations.**
+- `PostGradPassManager.configure` adds `RMSNormQuantFusionPass` under `fuse_norm_quant`
+  and `ActivationQuantFusionPass` under `fuse_act_quant` (`vllm/compilation/passes/pass_manager.py:163-171`).
+  Those flags resolve via `enable_norm_fusion`/`enable_act_fusion` (`vllm/config/vllm.py:108-129`;
+  wired into `OPTIMIZATION_LEVEL_0x` at `vllm.py:232-233,255-256,278-279`).
+- But the PASSES only match norm/act followed by an **fp8/nvfp4 quant** op:
+  `RMSNormQuantFusionPass` registers ONLY `{FusedAdd,}RMSNorm{Static,Dynamic,Group}QuantPattern(..., FP8_DTYPE)`
+  (`rms_quant_fusion.py:629-669` — every pattern is `FP8_DTYPE`); `ActivationQuantFusionPass`
+  registers ONLY `SiluMulFp8StaticQuantPattern` / `SiluMulNvfp4QuantPattern` /
+  `SiluMulBlockQuantPattern(kFp8Dynamic*)` (`act_quant_fusion.py:296-320`).
+- W4A16 has NO activation quant: `apply_gptq_marlin_linear` calls `marlin_quant_input` ONLY
+  for `input_dtype==int8`/`float8_e4m3fn` (`marlin_utils.py:704-715`); for MXFP4 W4A16
+  `input_dtype=None`, so the **bf16** RMSNorm output is passed STRAIGHT to `ops.marlin_gemm`
+  (`marlin_utils.py:717`). MXFP4 is not nvfp4 (`is_nvfp4_quantized()` is False), so the nvfp4
+  clause of `enable_act_fusion` also does not apply. ⇒ There is no `rms_norm→quant` or
+  `silu_mul→quant` sub-graph to match; BOTH passes are no-ops on this model.
+
+**FINDING 2 (source-conclusive): `marlin_gemm` is a non-decomposable EXTERN custom op —
+Inductor structurally CANNOT fuse elementwise into it.** `ops.marlin_gemm` is registered
+with `register_fake("_C::marlin_gemm")` (`vllm/_custom_ops.py:1200-1247`); Inductor treats
+a fake-registered custom op as a FallbackKernel and emits an extern CALL, never Triton for
+its body. The observed `triton_*_marlin_gemm_*` kernels are therefore INDUCTOR-NATIVE
+elementwise fusions (a `triton_red` reduction doing residual-add + decomposed-RMSNorm; a
+`triton_poi` pointwise doing silu+mul+slice) that Inductor NAMES after the region containing
+the adjacent extern `marlin_gemm` call — NOT a prologue/epilogue baked into the Marlin CUDA
+kernel. vLLM's decode Marlin runs as a SEPARATE `void marlin::Marlin` CUDA kernel — the
+same-tool trace #57 shows it as 144 distinct launches, which it could not be if fused into a
+Triton kernel. **So "vLLM fuses add+RMSNorm+quant into the Marlin prologue and silu+mul into
+the epilogue" is a MISREAD of Inductor's region-naming. vLLM does no such fusion for W4A16.**
+
+**FINDING 3 (structural corroboration): vLLM runs MORE glue launches than we do, not
+fewer.** The same-tool #57 c8 decode-window (`nsys --cuda-graph-trace=node`, both engines)
+already recorded glue: **ours 866 us / 255 calls vs vLLM 671 us / 299 calls**. If vLLM had
+collapsed glue into the GEMM pro/epilogue it would show FEWER glue launches; it shows more
+(8.3 vs 7.1 per layer), individually cheaper. The +195 us glue delta is per-kernel
+efficiency (Inductor Triton elementwise vs our hand-written glue), NOT a fusion-count gap —
+directly contradicting the #46 "collapses our ~5 glue launches into 2" narrative (which came
+from vLLM's ONLINE torch-profiler, a cross-tool read AGENTS.md forbids for invocation parity).
+
+**FINDING 4 (the reframe that matters): the dominant marlin-tiling term #52/#57 measured was
+ALREADY CLOSED on `main` by the dense-direct default, AFTER the terminal binding.** #52/#57
+same-tool decode-window (MoE-grouped route, base `027af9b0`) decomposed the c8 gap as
+**marlin +1,177 us (52%) / flash +784 us (35%) / glue +195 us (9%)**, and named the marlin
+fix as grouped→dense-direct + gate_up-fuse (the opt-in "par1" arm closed marlin +1,177→+226).
+That lever then LANDED as the byte-exact DEFAULT: commit `efa6e40d` "perf(marlin):
+VT_MARLIN_DENSE default ON — dense route beats MoE on every axis (#57)" (in my base). On
+current `main` `MarlinDenseEnabled()` is default-ON (`include/vllm/model_executor/models/dense_nvfp4_gemm.h:106-127`),
+dense MXFP4 projections run vLLM's own dense marlin `vt::MarlinDenseGemm`
+(`src/vt/cuda/cuda_marlin_dense.cu:92`) at the 48-CTA grid (~86 us/call vs the MoE route's
+~118 us/call), gate_up merged into one 2N GEMM by default (`VT_MOE_FUSED_W13`,
+`dense_nvfp4_gemm.h:98-104,519-544`), 32B-NVFP4A16 SACRED max gap 0.000 nats. That is
+exactly why the terminal binding rose from #51's `0.925/0.939/0.953` (MoE) to #57's
+`0.962/0.966/0.969` (dense). **So the +951 us marlin lever is BANKED, and in the
+dense-direct regime the residual is FLASH-DOMINANT: at c8 0.969 the gap is ~+1,100 us of
+which flash ~+784 us (~71%), glue ~+195 us (~18%), residual-marlin ~+226 us or less.**
+
+**THE W0 ours-vs-vLLM per-span table (c8 decode-window, same-tool nsys, current dense-direct
+regime ≈ #57 par1 arm; medians over 300+ steps):**
+
+| span between GEMMs | our launches/layer (vt::) | what covers it in vLLM's step | ours us/step (calls) | vLLM us/step (calls) | Δ |
+|---|---|---|---|---|---|
+| decode Marlin GEMMs (qkv, o, gate_up[2N], down = 4/layer) | `vt::MarlinDenseGemm` ×4, 48-CTA dense-direct | `void marlin::Marlin` ×4 (SEPARATE CUDA kernel) | 16,512 (144) | 16,286 (144) | +226 |
+| flash decode attention | `vt::PagedAttention` (flash_fwd_splitkv 1×3×64) | flash_fwd_splitkv (IDENTICAL grid 1×3×64) | 6,436 (36) | 5,629 (36) | **+807** |
+| glue: add+RMSNorm ×2, qk-norm ×2, RoPE, QkvSplit, ReshapeAndCache, SiluAndMul | ~7 separate `vt::` kernels/layer | ~8 SEPARATE Inductor Triton elementwise kernels/layer (NOT fused into marlin) | 869 (255) | 671 (299) | +198 |
+| lm_head | cuBLAS GEMV | cuBLAS GEMV | 5,398 | 5,395 | ~0 |
+
+Our per-layer decode order (source-mapped): `FusedChain(kFusedAddRmsNormStd)` input-norm
+(`qwen3.cpp:121`) → `MarlinDenseGemm` qkv → `QkvSplit` → `FusedChain(kAttnQkNormRope)` q/k
+norm+RoPE (composite = 3 launches on CUDA) → `ReshapeAndCache` → `PagedAttention` →
+`MarlinDenseGemm` o → `FusedChain(kFusedAddRmsNormStd)` post-attn-norm (`qwen3.cpp:131`) →
+`GateUpFusedMarlinD` (`MarlinDenseGemm` over 2N, `dense_nvfp4_gemm.h:542`) → `SiluAndMul`
+(SEPARATE launch, `dense_nvfp4_gemm.h:544`) → `MarlinDenseGemm` down. The add+RMSNorm sites
+already route through `vt::FusedChain` default-ON; the `FusedChain` catalog (`include/vt/recipes.h`,
+`include/vt/fused_recipe.h`) has NO GEMM opcode and by design produces only standalone
+fused elementwise kernels before/after a GEMM — it cannot express a GEMM prologue/epilogue.
+
+**VERDICT — the funded glue-fusion-into-Marlin kernel is the WRONG lever; DO NOT BUILD it.**
+1. It would MIRROR a fusion vLLM does not perform (Findings 1-3): a from-scratch Marlin with
+   fused prologue/epilogue is genuinely BEYOND vLLM (the "surpass rung"), not a mirror.
+2. It targets the +195-198 us glue span = ~9% of the MoE-route c8 gap and ~18% of the current
+   dense-direct residual. Even a PERFECT glue fusion (glue→0) leaves c8 ≈ 0.977 — still <1.0.
+3. The dominant marlin-tiling lever it was conflated with is ALREADY the byte-exact default
+   (`efa6e40d`), banked in the 0.962-0.969 terminal.
+4. The dominant REMAINING term is FLASH (+784-807 us on an IDENTICAL grid/kernel) — a
+   same-kernel/different-time STRUCTURAL-lens context question the FA2 num_splits refutation
+   (#59 lever 1) did NOT address. That, not glue, is the unexhausted high-value lever.
+
+**COSTED surpass-rung proposal (scoped, NOT built, per the charter):** a dedicated
+`MarlinDenseGemm` variant with (a) a fused `add+RMSNorm` reduction PROLOGUE that produces the
+bf16 marlin input in-kernel, and (b) a `silu+mul` EPILOGUE folded into the gate_up 2N GEMM's
+store. Numerics: the prologue changes the RMSNorm reduction boundary (register vs HBM
+round-trip) → not byte-exact → near-tie razor + distributional gate + 32B strict + regen
+under the ratified-tie rule; the epilogue is byte-safe (pointwise on the GEMM output).
+Expected recovery ≈ the glue span it removes, ~150-198 us/step (the ~5 glue launches + their
+HBM round-trips), i.e. c8 ~0.969→~0.977 — a real but sub-parity, numerics-delicate,
+non-portable kernel. NOT RECOMMENDED as the parity path.
+
+**OWED GPU work (box-contended by H3; short + batched when the flock frees):** (1) capture
+`TORCH_LOGS=output_code` on the oracle to VISUALLY confirm the `triton_*_marlin_gemm_*`
+kernels are elementwise-only calling the extern marlin (Findings 1-2 predict this exactly);
+(2) a FRESH same-tool nsys decode-window on CURRENT `main` (dense-direct default) c1..c8 to
+re-decompose the residual and confirm the flash-dominant split; (3) the real next lever — a
+STRUCTURAL-lens same-tool audit of why identical-grid `flash_fwd_splitkv` runs +22 us/call
+slower than vLLM's (residency/context, per AGENTS.md's STRUCTURAL lens), the +784 us term.
+No code shipped on this row: building the glue Marlin would gold-plate a source-refuted
+hypothesis (#46's own standard). Box left as found (no GPU touched; both flock locks
+untouched; H3 campaign uninterrupted).
+
 ## QUANT-CT-MXFP4 W4 throughput bench — RAN on GB10, BELOW-FLOOR (2026-08-06, `row/QUANT-CT-MXFP4-BENCH` `33e93608`)
 
 The binding ours-vs-oracle online-serving grid on the SAME checkpoint
