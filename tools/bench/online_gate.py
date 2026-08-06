@@ -30,7 +30,6 @@ import platform
 import re
 import shlex
 import sqlite3
-import statistics
 import subprocess
 import sys
 from collections import Counter
@@ -227,10 +226,6 @@ ENGINES = ("ours", "vllm")
 PERCENTILE_METRICS = ("ttft", "tpot", "itl", "e2el")
 PERCENTILES = (50, 90, 99)
 CACHE_DROP_METHOD = "posix_fadvise-dontneed+mincore"
-# A readiness probe coarser than this cannot resolve a startup of a few tens of
-# seconds to better than ~10%, which is the size of the effect being measured.
-STARTUP_MAX_POLL_INTERVAL_SECONDS = 1.0
-STARTUP_ENGINES = ("ours", "vllm")
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _NSYS_ALLOWED_DIAGNOSTIC = re.compile(
@@ -1141,119 +1136,6 @@ def _validated_cache_drop_artifact(path: pathlib.Path) -> dict[str, Any]:
         "roots": roots,
         "sha256": sha256_file(path),
     }
-
-
-def record_startup(
-    output: pathlib.Path,
-    *,
-    engine: str,
-    model_key: str,
-    repetition: int,
-    elapsed_seconds: float,
-    poll_interval_seconds: float,
-    probe_url: str,
-    cache_drop_report: pathlib.Path,
-) -> dict[str, Any]:
-    """Record one server-lifecycle startup measurement.
-
-    ``elapsed_seconds`` is elapsed wall time from immediately before the server
-    process is spawned to the first successful readiness probe.  Both engines
-    are measured with the identical probe, so the number answers "how long
-    until this server can serve", which is the startup question a user asks.
-
-    The measurement is only interpretable cold, and it is dominated by weight
-    paging, so the leg's cache-drop report is embedded and validated here: a
-    startup artifact cannot exist for a leg whose page cache was still warm.
-    """
-    if output.exists():
-        raise HarnessError(f"refusing to overwrite startup evidence: {output}")
-    if engine not in STARTUP_ENGINES:
-        raise HarnessError(f"unknown startup engine: {engine}")
-    if model_key not in MODEL_REVISIONS:
-        raise HarnessError(f"unknown startup model key: {model_key}")
-    if not isinstance(repetition, int) or repetition <= 0:
-        raise HarnessError("startup repetition must be a positive integer")
-    if not elapsed_seconds > 0:
-        raise HarnessError("startup elapsed seconds must be positive")
-    if not 0 < poll_interval_seconds <= STARTUP_MAX_POLL_INTERVAL_SECONDS:
-        raise HarnessError(
-            "startup readiness poll interval must be in "
-            f"(0, {STARTUP_MAX_POLL_INTERVAL_SECONDS}] seconds, "
-            f"got {poll_interval_seconds}"
-        )
-    if not probe_url.endswith("/health"):
-        raise HarnessError(
-            f"startup readiness must be the /health probe, got {probe_url}"
-        )
-    cache_drop = _validated_cache_drop_artifact(cache_drop_report)
-    result = {
-        "cache_drop": cache_drop,
-        "cold": True,
-        "engine": engine,
-        "model_key": model_key,
-        "poll_interval_seconds": poll_interval_seconds,
-        "probe_url": probe_url,
-        "repetition": repetition,
-        "startup_seconds": elapsed_seconds,
-    }
-    write_json_atomic(output, result)
-    return result
-
-
-def summarize_startup(
-    evidence: pathlib.Path,
-    *,
-    model_key: str,
-    repetitions: Sequence[int],
-) -> dict[str, Any]:
-    """Aggregate the interleaved startup legs into a paired ratio.
-
-    Every requested repetition must exist for BOTH engines: an incomplete
-    series is refused rather than summarized, because a missing leg silently
-    biases the median toward whichever arm happened to finish.
-    """
-    if not repetitions:
-        raise HarnessError("startup summary needs at least one repetition")
-    if model_key not in MODEL_REVISIONS:
-        raise HarnessError(f"unknown startup model key: {model_key}")
-    summary: dict[str, Any] = {
-        "model_key": model_key,
-        "repetitions": list(repetitions),
-    }
-    medians: dict[str, float] = {}
-    for engine in STARTUP_ENGINES:
-        seconds: list[float] = []
-        for repetition in repetitions:
-            path = (
-                evidence / "startup" / model_key / engine / f"r{repetition}.json"
-            )
-            if not path.is_file():
-                raise HarnessError(f"startup leg is absent: {path}")
-            leg = _load_json_object(path)
-            if leg.get("model_key") != model_key:
-                raise HarnessError(f"startup leg records another model: {path}")
-            if leg.get("engine") != engine:
-                raise HarnessError(f"startup leg records another engine: {path}")
-            if leg.get("repetition") != repetition:
-                raise HarnessError(
-                    f"startup leg records another repetition: {path}"
-                )
-            if leg.get("cold") is not True:
-                raise HarnessError(f"startup leg is not cold: {path}")
-            value = leg.get("startup_seconds")
-            if not isinstance(value, (int, float)) or not value > 0:
-                raise HarnessError(f"startup leg has no positive elapsed: {path}")
-            seconds.append(float(value))
-        medians[engine] = statistics.median(seconds)
-        summary[engine] = {
-            "max_seconds": max(seconds),
-            "median_seconds": medians[engine],
-            "min_seconds": min(seconds),
-            "seconds": seconds,
-        }
-    # > 1 means ours reaches readiness sooner than vLLM.
-    summary["startup_speedup_vs_vllm"] = medians["vllm"] / medians["ours"]
-    return summary
 
 
 def record_model_gate(
@@ -3910,28 +3792,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     memory_return.add_argument("--gpu-idle", action="store_true")
 
-    startup = commands.add_parser("record-startup")
-    startup.add_argument("--output", type=pathlib.Path, required=True)
-    startup.add_argument("--engine", choices=STARTUP_ENGINES, required=True)
-    startup.add_argument(
-        "--model-key", choices=tuple(MODEL_REVISIONS), required=True
-    )
-    startup.add_argument("--repetition", type=int, required=True)
-    startup.add_argument("--elapsed-seconds", type=float, required=True)
-    startup.add_argument("--poll-interval-seconds", type=float, required=True)
-    startup.add_argument("--probe-url", required=True)
-    startup.add_argument("--cache-drop-report", type=pathlib.Path, required=True)
-
-    startup_summary = commands.add_parser("summarize-startup")
-    startup_summary.add_argument("--evidence", type=pathlib.Path, required=True)
-    startup_summary.add_argument(
-        "--model-key", choices=tuple(MODEL_REVISIONS), required=True
-    )
-    startup_summary.add_argument(
-        "--repetitions", type=int, nargs="+", default=(1, 2, 3)
-    )
-    startup_summary.add_argument("--output", type=pathlib.Path, required=True)
-
     model_gate = commands.add_parser("record-model-gate")
     model_gate.add_argument("--output", type=pathlib.Path, required=True)
     model_gate.add_argument("--log", type=pathlib.Path, required=True)
@@ -4113,28 +3973,6 @@ def main() -> int:
             after_cache_drop_report=args.after_cache_drop_report,
             gpu_idle=args.gpu_idle,
         )
-    elif args.command == "record-startup":
-        result = record_startup(
-            args.output,
-            engine=args.engine,
-            model_key=args.model_key,
-            repetition=args.repetition,
-            elapsed_seconds=args.elapsed_seconds,
-            poll_interval_seconds=args.poll_interval_seconds,
-            probe_url=args.probe_url,
-            cache_drop_report=args.cache_drop_report,
-        )
-    elif args.command == "summarize-startup":
-        if args.output.exists():
-            raise HarnessError(
-                f"refusing to overwrite startup summary: {args.output}"
-            )
-        result = summarize_startup(
-            args.evidence,
-            model_key=args.model_key,
-            repetitions=tuple(args.repetitions),
-        )
-        write_json_atomic(args.output, result)
     elif args.command == "record-model-gate":
         result = record_model_gate(
             args.output,
