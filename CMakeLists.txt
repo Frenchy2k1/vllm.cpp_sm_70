@@ -379,9 +379,25 @@ if(VLLM_CPP_CUDA)
     set(VLLM_CPP_CUTLASS_NVFP4_SM100 OFF)
     set(VLLM_CPP_SCALEDMM_C3X_SM90 OFF)
     set(VLLM_CPP_SCALEDMM_C3X_SM100 OFF)
-    message(STATUS "CUTLASS not found / no CUTLASS-dependent feature for this arch; "
-                   "NVFP4 GEMM + FA2 disabled "
-                   "(set -DVLLM_CPP_CUTLASS_DIR=<cutlass> or -DVLLM_CPP_CUTLASS_FETCH=ON)")
+    # Two very different situations reach this branch, and only one of them is
+    # benign. If VT_FA2_ARCHS resolved, the requested arch DOES support FA2 and
+    # the build is about to drop it purely because no CUTLASS tree was found —
+    # a silently slower binary, which is the failure a first-time builder hits
+    # (they read "CUDA feature fa2: ENABLED for [86]" in the table above and
+    # never notice the STATUS line that takes it away). Warn there. If no arch
+    # wanted a CUTLASS-dependent feature in the first place, nothing is lost.
+    if(VT_FA2_ARCHS)
+      message(WARNING
+        "CUTLASS headers NOT found, so FlashAttention-2 will NOT be built even "
+        "though arch(es) [${VT_FA2_ARCHS}] support it. Attention falls back to "
+        "the portable path and decode/prefill will be slower. Fix with "
+        "-DVLLM_CPP_CUTLASS_FETCH=ON (downloads CUTLASS 4.5.0) or "
+        "-DVLLM_CPP_CUTLASS_DIR=<path to a CUTLASS >=4.5.0 checkout).")
+    else()
+      message(STATUS "CUTLASS not found / no CUTLASS-dependent feature for this arch; "
+                     "NVFP4 GEMM + FA2 disabled "
+                     "(set -DVLLM_CPP_CUTLASS_DIR=<cutlass> or -DVLLM_CPP_CUTLASS_FETCH=ON)")
+    endif()
   endif()
   # Marlin NVFP4 W4A16 grouped-MoE GEMM drop-in (the 35B expert kernel). Vendored
   # torch-free slice of vLLM's moe/marlin_moe_wna16 under src/vt/cuda/marlin/

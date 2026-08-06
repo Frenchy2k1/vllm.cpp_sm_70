@@ -22,7 +22,8 @@ The server is ON by default. Example binaries land under `build/examples/`:
 ```sh
 cmake -S . -B build-cuda \
   -DVLLM_CPP_CUDA=ON \
-  -DVLLM_CPP_TRITON=ON
+  -DVLLM_CPP_TRITON=ON \
+  -DVLLM_CPP_CUTLASS_FETCH=ON
 cmake --build build-cuda -j
 ```
 
@@ -30,11 +31,58 @@ Triton-AOT cubins for the fast GDN path are **vendored**: Python and Triton are
 needed only to regenerate them (`VLLM_CPP_TRITON_REGEN`), never to build or run
 them.
 
-For other CUDA families, set the arch explicitly:
+### CUTLASS: the one external build dependency
+
+CUTLASS (>= 4.5.0) is header-only, and it is the only thing a CUDA build fetches
+from the network. It feeds two independent consumers:
+
+- **FlashAttention-2** prefill/decode, on every arch in `8.0 8.6 8.7 8.9 12.0a 12.1a`.
+- The **sm_12xa NVFP4 block-scaled GEMM**, on Blackwell only.
+
+Without it the FA2 kernels are not compiled and attention falls back to the
+portable path, which is slower. Nothing fails and no test goes red, so it is
+worth being deliberate about. Pick one:
 
 ```sh
-cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=90a
+-DVLLM_CPP_CUTLASS_FETCH=ON            # download CUTLASS 4.5.0 (~200 MB, needs network)
+-DVLLM_CPP_CUTLASS_DIR=/path/to/cutlass  # reuse a checkout you already have
 ```
+
+The default is neither, so that a disk- or network-constrained box configures
+without surprises. When you skip it on an arch that supports FA2, configure
+prints a `CMake Warning` saying so.
+
+Confirm you got it from the configure output:
+
+```
+-- CUDA feature fa2: ENABLED for [86]
+-- FlashAttention-2 prefill/decode: ENABLED for arch(es) [86] (runtime toggles VT_FA2_PREFILL, VT_FA2_DECODE)
+```
+
+The first line means the arch supports FA2; the second means it was actually
+built. If only the first appears, CUTLASS was not found.
+
+### Other CUDA families
+
+Set the arch explicitly. It defaults to `121a` (GB10), which will not load on
+anything else:
+
+```sh
+# Hopper H100/H200
+cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=90a \
+  -DVLLM_CPP_CUTLASS_FETCH=ON
+
+# Ampere consumer (RTX 3090 = 86), Ada (89), Jetson Orin (87)
+cmake -S . -B build-cuda -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=86 \
+  -DVLLM_CPP_CUTLASS_FETCH=ON
+```
+
+Of these, only `sm_87` (Orin) and `sm_110` (Thor) have been run on real
+hardware. `sm_80/86/89`, `sm_90a` and `sm_100a/103a` are build-verified: they
+compile `-Werror`-clean and emit the expected SASS, but no board here has
+executed them. See [STATUS.md](STATUS.md) for what that label means and
+`.agents/specs/cuda-arch-ampere-fastpath.md` for the per-arch detail. Reports
+from those boards are welcome.
 
 ## Metal build (Apple Silicon)
 
@@ -101,8 +149,8 @@ defaults.
 | `VLLM_CPP_SERVER` | `ON` | Build the OpenAI HTTP server (needs `third_party/httplib/httplib.h`; disables itself with a warning if absent) |
 | `VLLM_CPP_TRITON` | `OFF` | Consume the vendored per-arch Triton-AOT GDN cubins (CUDA only; no Python needed) |
 | `VLLM_CPP_TRITON_REGEN` | `OFF` | Maintainer knob: regenerate the AOT cubins with Python + Triton |
-| `VLLM_CPP_CUTLASS_DIR` | `third_party/cutlass` | CUTLASS source root (>= 4.5.0) for the sm120a NVFP4 GEMM |
-| `VLLM_CPP_CUTLASS_FETCH` | `OFF` | FetchContent CUTLASS 4.5.0 if not found locally |
+| `VLLM_CPP_CUTLASS_DIR` | `third_party/cutlass` | CUTLASS source root (>= 4.5.0). Feeds the sm120a NVFP4 GEMM **and** FlashAttention-2 on `8.0/8.6/8.7/8.9/12.0a/12.1a`. Absent on an FA2-capable arch, configure warns and FA2 is not built |
+| `VLLM_CPP_CUTLASS_FETCH` | `OFF` | FetchContent CUTLASS 4.5.0 if not found locally (~200 MB, needs network) |
 | `VLLM_CPP_MARLIN` | `ON` | Build the vendored Marlin NVFP4 W4A16 MoE GEMM (sm_12xa) |
 | `VLLM_CPP_BUILD_TESTS` | `ON` | Compile and register ctest targets |
 | `VLLM_CPP_BUILD_EXAMPLES` | `ON` | Build the example CLI, server, and bench binaries |
