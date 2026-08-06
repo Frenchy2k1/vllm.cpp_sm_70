@@ -1430,9 +1430,14 @@ if(VLLM_CPP_CUDA)
     # instruction-bound, and the residual is vLLM's wheel-`ptxas` SASS-SCHEDULING
     # quality, not reachable from our nvcc 13.0. (native+fast-math REGRESSES to
     # 189.8 us, #68; compute_80 PTX driver-JIT alone is neutral, #75 Build B.) So
-    # we keep the plain native sm_121a compile and pass no -use_fast_math. The
-    # residual is an irreducible-for-us ptxas SASS-quality gap on a byte-identical
-    # kernel; see .agents/benchmark-record.md (#75).
+    # we keep the plain native sm_121a compile and pass no -use_fast_math. #82
+    # (FLASH-PTXAS) then ARBITRATED the "ptxas lineage" claim to a NO and CORRECTED
+    # it: the wheel ships NO sm_12x cubin — only CUDA-13.0 (PTX ISA 9.0) sm_80 PTX
+    # driver-JIT'd on GB10 — so there is no old-CUDA-12.x ptxas in vLLM's path (and
+    # ptxas 12.8 cannot even target sm_121a); a same-params cuModule A/B ties our
+    # PTX and vLLM's OWN PTX at ~144 us across driver-JIT / ptxas 13.0 / 13.2, so the
+    # +10 us/call gap is ENGINE CONTEXT (neighbour L2/orchestration), not this
+    # kernel's codegen. See .agents/benchmark-record.md (#75, #82).
     set_source_files_properties(
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS} PROPERTIES

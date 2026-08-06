@@ -39822,3 +39822,50 @@ assertions; restored → GREEN. Suite 67/67 (66 prior +1), 46549 assertions; `te
 4/4 (server wiring). No numbers changed (refusal gate, not a perf lever). Records: spec §8.7,
 STATUS/BENCHMARKS H3 rows, benchmark-record, NOW. Pre-existing preflight red
 (check-fusion-consistency `minimax_h3_video_vae_device`) is not this row.
+## 2026-08-07T00:45 - QUANT-CT-MXFP4-FLASH-PTXAS: the ptxas-lineage arbiter = NO; #75's "wheel ptxas SASS-quality" attribution RETIRED - vLLM's flash SASS is driver-JIT'd from CUDA-13.0 PTX, codegen ties across all ptxas AND vs vLLM's own PTX, the +10us gap is ENGINE CONTEXT (row/QUANT-CT-MXFP4-FLASH-PTXAS, helper, PR #82)
+<!-- state: 2026-08-07T00:45 -->
+
+The last MXFP4 flash lever. #75 owed obtaining vLLM's wheel `ptxas` (hypothesized
+"older CUDA 12.x lineage") and A/B'ing it against our flash PTX. Done. **Arbiter =
+NO, refuted three ways.**
+
+- **(a) No old lineage / no runnable GB10 cubin.** `cuobjdump` of vLLM 0.25.0's
+  `_vllm_fa2_C.abi3.so` = 52 `sm_80` cubins + 52 `.target sm_80 .version 9.0` PTX.
+  PTX ISA 9.0 = CUDA 13.0 (our own major), NOT 12.x; NO sm_12x cubin. On GB10 the
+  sm_80 SASS can't run, so vLLM's flash SASS is **driver-JIT'd from compute_80 PTX
+  by the box CUDA-13.0 driver (580.159.03)** - the SAME assembler #75's Build C
+  (`code=compute_80`) already used. The "wheel ptxas baked a fast sm_121a cubin"
+  premise is factually wrong.
+- **(b) Impossible by construction.** Box ptxas = 12.8 (triton), 13.0 (toolkit,
+  build default), 13.2 (nvidia/cu13). ptxas 12.8 tops out at sm_120a - it CANNOT
+  target sm_121a (first in 13.0) nor read PTX 9.0. So an old-12.x sm_121a cubin
+  cannot be built at all.
+- **(c) Measured tie.** Standalone cuModule harness (`dgx:~/mxfp4-ptxas/`,
+  `bench_flash_ptxas.cu`) times the byte-identical c8 GQA-swap decode kernel
+  (grid (1,3,64), dyn-smem 81 920 B, all cubins REG=241) from our compute_80+
+  fast-math PTX and vLLM's PTX #30, each via driver-JIT / ptxas 13.0 / ptxas 13.2.
+  Module/native ratios ∈ [0.969, 1.013] - a ±1.3% tie (native anchors drifted
+  138.7-149.4 across the sequential arms; the lone 0.969 is contradicted by both
+  sister vLLM arms 1.007/1.013 and our-PTX+ptxas13.0 1.004 = box drift, not a
+  lever).
+
+**Corrected mechanism:** the flash decode kernel codegen is at PARITY across every
+reachable toolchain AND vs vLLM's own PTX (~144-151 us in isolation); the +10
+us/call the engine showed (ours 167 / vLLM 157, #75) is ENGINE CONTEXT
+(neighbour-kernel L2/orchestration, exactly #69's finding), NOT the kernel's SASS.
+This RETIRES #75's "ptxas SASS-scheduling quality" attribution. (Microbench is
+L2-warm so its absolute sits below the engine's DRAM-cold number; irrelevant to the
+codegen arbitration since the dominant stalls are smem-scoreboard/CTA-barrier per
+#75, regime-independent, and they tie here.)
+
+**Verdict / follow-up.** W2/W3 none owed: NO vendor (nothing beat the driver JIT we
+already use), binding UNCHANGED c1 1.020 / c2 0.962 / c4 0.966 / c8 0.969, MXFP4
+TERMINAL below-floor at c2-c8 with the corrected map (flash codegen at parity;
+residual = flash engine-context adjacency + portable-fusion glue ~18% +
+marlin/host). No default flip owed. hd256 (27B/35B) cross-model projection:
+structurally identical (sm_80-only PTX driver-JIT'd), NO hd256 vendor owed; their
+flash-decode residuals are likewise context/glue, not ptxas. No functional code
+shipped; CMakeLists NOTE + benchmark-record (#82) + spec CLOSED capture the closed
+levers. Box: experiment left artifacts under `~/mxfp4-ptxas/`; box OOM-rebooted
+mid-confirmatory-run (another agent's 25 GiB vLLM on the 119 GiB unified pool, not
+this <1 GiB microbench) - run-1 data is on disk and decisive.
