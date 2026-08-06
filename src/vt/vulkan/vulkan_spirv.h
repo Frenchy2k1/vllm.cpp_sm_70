@@ -13,7 +13,7 @@
 // of re-running the generator when a .comp changes. See the generator's
 // docstring for the full rationale.
 //
-// Produced by: Glslang Version: 11:16.4.0
+// Produced by: Glslang Version: 11:16.5.0
 // Target environment: vulkan1.1
 #ifndef VT_VULKAN_VULKAN_SPIRV_H_
 #define VT_VULKAN_VULKAN_SPIRV_H_
@@ -3470,20 +3470,28 @@ inline constexpr uint32_t kSpv_vt_silu_and_mul[] = {
 
 // Name -> SPIR-V module. The NAME is the shader's file stem and is also the
 // key the pipeline cache uses (src/vt/vulkan/vulkan_context.cpp).
+//
+// spec_ids lists the SPECIALIZATION CONSTANT IDs the module declares, parsed
+// from its OpDecorate SpecId instructions and sorted ascending. The host passes
+// specialization values BY ID, and Vulkan SILENTLY IGNORES a map entry whose ID
+// the module does not declare — so without this table a host/shader drift
+// produces WRONG NUMBERS instead of a clean failure.
 struct SpirvModule {
   const char* name;
   const uint32_t* words;
   size_t word_count;
+  const uint32_t* spec_ids;
+  size_t spec_id_count;
 };
 
 inline constexpr SpirvModule kSpirvModules[] = {
-    {"vt_add", kSpv_vt_add, sizeof(kSpv_vt_add) / sizeof(uint32_t)},
-    {"vt_cast", kSpv_vt_cast, sizeof(kSpv_vt_cast) / sizeof(uint32_t)},
-    {"vt_fused_chain", kSpv_vt_fused_chain, sizeof(kSpv_vt_fused_chain) / sizeof(uint32_t)},
-    {"vt_layer_norm", kSpv_vt_layer_norm, sizeof(kSpv_vt_layer_norm) / sizeof(uint32_t)},
-    {"vt_relu", kSpv_vt_relu, sizeof(kSpv_vt_relu) / sizeof(uint32_t)},
-    {"vt_rms_norm", kSpv_vt_rms_norm, sizeof(kSpv_vt_rms_norm) / sizeof(uint32_t)},
-    {"vt_silu_and_mul", kSpv_vt_silu_and_mul, sizeof(kSpv_vt_silu_and_mul) / sizeof(uint32_t)},
+    {"vt_add", kSpv_vt_add, sizeof(kSpv_vt_add) / sizeof(uint32_t), nullptr, 0},
+    {"vt_cast", kSpv_vt_cast, sizeof(kSpv_vt_cast) / sizeof(uint32_t), nullptr, 0},
+    {"vt_fused_chain", kSpv_vt_fused_chain, sizeof(kSpv_vt_fused_chain) / sizeof(uint32_t), nullptr, 0},
+    {"vt_layer_norm", kSpv_vt_layer_norm, sizeof(kSpv_vt_layer_norm) / sizeof(uint32_t), nullptr, 0},
+    {"vt_relu", kSpv_vt_relu, sizeof(kSpv_vt_relu) / sizeof(uint32_t), nullptr, 0},
+    {"vt_rms_norm", kSpv_vt_rms_norm, sizeof(kSpv_vt_rms_norm) / sizeof(uint32_t), nullptr, 0},
+    {"vt_silu_and_mul", kSpv_vt_silu_and_mul, sizeof(kSpv_vt_silu_and_mul) / sizeof(uint32_t), nullptr, 0},
 };
 
 }  // namespace vt::vulkan

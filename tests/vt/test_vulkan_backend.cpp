@@ -69,6 +69,36 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   }
 }
 
+TEST_CASE("the committed SPIR-V table records each module's specialization constants") {
+  // Device-independent: a property of the checked-in artifact, so this also gates
+  // the generator on a box with no Vulkan.
+  //
+  // The host passes specialization values by constantID. Vulkan SILENTLY IGNORES
+  // a VkSpecializationMapEntry whose ID the module does not declare, so a drift
+  // between host and shader is WRONG NUMBERS, not a clean error. Recording the
+  // declared IDs alongside each blob is what lets GetPipeline check it.
+  for (const auto& m : vt::vulkan::kSpirvModules) {
+    CAPTURE(m.name);
+    // Structural: the pointer and the count agree, and the IDs are sorted with no
+    // duplicates — GetPipeline builds VkSpecializationMapEntry positionally from
+    // this array, so an unsorted or duplicated ID would bind the wrong value.
+    CHECK((m.spec_ids == nullptr) == (m.spec_id_count == 0));
+    for (size_t i = 1; i < m.spec_id_count; ++i) {
+      CHECK(m.spec_ids[i - 1] < m.spec_ids[i]);
+    }
+    // TODAY every module declares ZERO specialization constants: none of the W0
+    // shaders has a variant axis. This asserts that as a fact rather than leaving
+    // it implied, so the first shader that DOES take a constant (a dtype, a quant
+    // format, a coopmat tier) flips this loudly and whoever adds it is forced to
+    // supply the matching values at the GetPipeline call.
+    //
+    // The workgroup size is deliberately NOT that constant — see the measured
+    // reason in src/vt/vulkan/shaders/vt_common.glsl (local_size_x_id emits
+    // LocalSize 1 1 1 at the vulkan1.1 target and computes ~1/128 of the tensor).
+    CHECK(m.spec_id_count == 0);
+  }
+}
+
 TEST_CASE("Vulkan backend is registered on a Vulkan-capable host") {
   if (!VulkanPresent()) {
     MESSAGE("no Vulkan loader or no conformant device on this host; skipping");
