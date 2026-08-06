@@ -1042,6 +1042,105 @@ TEST_CASE("minimax_h3: the DEVICE-resident DiT forward matches upstream on CUDA"
   CheckDeviceForward(q, "cuda-device-forward");
 }
 
+// H3-RENDER-CLOSE: the one surface #74 left untested. The "REAL head_dim=128
+// ratio" device-vs-host case above runs on the CPU BACKEND, and the CUDA cases run
+// only at the SMALL fl2va geometry (seq ~<200). The #70 white latent is a REAL
+// render: CUDA kernels at REAL SEQ (t2va 512x512/22f -> latent 7x32x32 ->
+// seq_len 1920, cu_seqlens=[0,1874,1920] non-causal 2-document) at head_dim=128.
+// If a CUDA kernel (varlen non-causal attention, RoPE cache, AdaLN modulate) has a
+// scale-dependent bug that its CPU counterpart does not, the render is white while
+// every reduced-dim gate is green. This runs the SAME MiniMaxH3DitForwardDevice on
+// the CUDA backend vs the trusted CPU host loops at exactly the render geometry and
+// step-0 timestep partition; a divergence here IS the bug, a match points at S2.
+TEST_CASE("minimax_h3: CUDA device forward tracks the host at the REAL render seq (1920)") {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  const MiniMaxH3DitParams p = RealRatioParams();  // head_dim=128, rot_dim=96
+  const std::unique_ptr<GoldenWeights> weights = BuildGoldenWeights(p);
+
+  // The real t2va render geometry at 512x512/22f (verified on dgx: text_len=8,
+  // latent 7x32x32, audio_t=37, seq_len 1920).
+  const int64_t text_len = 8, latent_t = 7, latent_h = 32, latent_w = 32;
+  const int64_t audio_t = 37, audio_channel = 2;
+  const MiniMaxH3PackedSequence packed = BuildMiniMaxH3PackedSequence(
+      text_len, latent_t, latent_h, latent_w, audio_t, audio_channel,
+      /*include_keyframe_cond=*/false, {}, /*frame_count=*/0);
+  const int64_t seq_len = packed.seq_len;
+  const int64_t video_width = p.video_row_width();
+  const int64_t num_img = static_cast<int64_t>(packed.img_pos.size());
+  const int64_t num_audio = static_cast<int64_t>(packed.audio_pos.size());
+  const int64_t num_text = static_cast<int64_t>(packed.text_pos.size());
+  REQUIRE(seq_len == 1920);
+  REQUIRE(num_img == 1792);
+
+  std::vector<float> x(static_cast<size_t>(seq_len * video_width), 0.0f);
+  const std::vector<float> video_rows = MakeParam("h3seq.video_rows", num_img * video_width, 1.0);
+  for (int64_t r = 0; r < num_img; ++r) {
+    std::memcpy(x.data() + packed.img_pos[static_cast<size_t>(r)] * video_width,
+                video_rows.data() + r * video_width,
+                static_cast<size_t>(video_width) * sizeof(float));
+  }
+  std::vector<float> audio_x(static_cast<size_t>(seq_len * p.audio_latents_dim), 0.0f);
+  const std::vector<float> audio_rows =
+      MakeParam("h3seq.audio_rows", num_audio * p.audio_latents_dim, 1.0);
+  for (int64_t r = 0; r < num_audio; ++r) {
+    std::memcpy(audio_x.data() + packed.audio_pos[static_cast<size_t>(r)] * p.audio_latents_dim,
+                audio_rows.data() + r * p.audio_latents_dim,
+                static_cast<size_t>(p.audio_latents_dim) * sizeof(float));
+  }
+  const std::vector<float> prompt_embeds = MakeParam("h3seq.prompt_embeds", num_text * p.text_dim, 1.0);
+  // Step-0 partition (dumped from the real render): all timesteps 0 -> one unique.
+  const std::vector<float> unique_timesteps = {0.0f};
+  const std::vector<int64_t> inverse(static_cast<size_t>(seq_len), 0);
+  const std::vector<int32_t> refiner_cu = {0, static_cast<int32_t>(num_text),
+                                           static_cast<int32_t>(num_text)};
+
+  MiniMaxH3DitInputs in;
+  in.seq_len = seq_len;
+  in.x = x.data();
+  in.audio_x = audio_x.data();
+  in.img_position_ids = packed.img_position_ids.data();
+  in.unique_timesteps = unique_timesteps.data();
+  in.num_unique_timesteps = static_cast<int64_t>(unique_timesteps.size());
+  in.inverse_indices = inverse.data();
+  in.token_tags = packed.token_tags.data();
+  in.prompt_embeds = prompt_embeds.data();
+  in.img_pos = packed.img_pos.data();
+  in.num_img_pos = num_img;
+  in.audio_pos = packed.audio_pos.data();
+  in.num_audio_pos = num_audio;
+  in.text_pos = packed.text_pos.data();
+  in.num_text_pos = num_text;
+  in.infer_out_pos = packed.img_pos.data();
+  in.num_infer_out_pos = num_img;
+  in.update_mask = packed.update_mask.data();
+  in.cu_seqlens = packed.cu_seqlens.data();
+  in.num_cu_seqlens = static_cast<int64_t>(packed.cu_seqlens.size());
+  in.refiner_cu_seqlens = refiner_cu.data();
+  in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
+
+  const MiniMaxH3DitOutputs host =
+      MiniMaxH3DitForward(Cpu(), p, weights->views, in, vt::DType::kF32);
+  vt::Queue q = cuda->CreateQueue();
+  const MiniMaxH3DitDeviceWeights staged = StageMiniMaxH3DitWeights(q, p, weights->views);
+  const MiniMaxH3DitOutputs dev =
+      MiniMaxH3DitForwardDevice(q, p, staged.weights, in, vt::DType::kF32);
+
+  const double dv = MaxAbsDiff(dev.video_logits, host.video_logits.data(), host.video_logits.size());
+  const double da = MaxAbsDiff(dev.audio_logits, host.audio_logits.data(), host.audio_logits.size());
+  INFO("CUDA-vs-host at real seq 1920: video max|diff| = " << dv << ", audio max|diff| = " << da);
+  // f32 summation-order slack only (seq 1920 accumulates more than the small
+  // cases, so allow 5e-3); a structural CUDA-kernel-at-scale regression would be
+  // orders of magnitude larger and is exactly what #70 is hunting.
+  CHECK(dv <= 5e-3);
+  CHECK(da <= 5e-3);
+}
+
 TEST_CASE("minimax_h3: the bf16 production stream matches upstream's dtype policy") {
   // The f32 case above gates the ALGORITHM. This one gates the PRODUCTION dtype
   // policy: upstream's stream is bf16 with fp32 islands (both patch projections,

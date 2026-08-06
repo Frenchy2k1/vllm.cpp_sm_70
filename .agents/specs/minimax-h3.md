@@ -526,3 +526,42 @@ reduced-dim DiT gate into a GEOMETRY LADDER.
   embeddings, real fp64 position grid at full canvas, real per-token timesteps) is fed with
   RANDOM data here; a real-weights activation diff of the DiT inputs is the untested surface.
   Full tables: benchmark record (`row/H3-DIT-SCALE-GATE`).
+
+## 8.6 RENDER BUG CLOSED — wrong checkpoint PARTITION, not a code bug (2026-08-06, `row/H3-RENDER-CLOSE` PR #77)
+
+The #70/#74 white render was **using the wrong checkpoint partition for the task.**
+MiniMax-H3 ships two independently-served DiT partitions and the task MUST match
+(`recipes/MiniMaxAI/MiniMax-H3.md:50,289`; `pipeline._resolve_task` raises otherwise):
+
+| Partition | Serves | Available quantized DiT |
+|---|---|---|
+| **FL2VA** | **t2va + fl2va** | `MiniMax-H3-FL2VA-Q3_K_M.gguf` (GGUF), FL2VA NVFP4 (not downloaded) |
+| **Ref2VA** | ref2va (image/video + audio references) | `minimax_h3_ref2va_nvfp4_full` (the NVFP4 we had), REF2VA GGUF |
+
+Every render up to #74 ran **t2va on `minimax_h3_ref2va_nvfp4_full` (the Ref2VA
+partition)** — an out-of-distribution task/partition combination upstream rejects. That
+is the white latent, invariant to prompt/steps.
+
+**Verified before switching partitions (all NEW, real 512x512/22f scale, dgx):** the
+t2va DiT INPUTS diff EXACTLY vs upstream `pipeline_minimax_h3.py` (`VT_H3_DUMP_INPUTS`:
+packed layout / fp64 grid / token_tags / inverse+combined AdaLN indices / sigmas all
+byte-equal; tokenization byte-equal); the encoder conditioning is correctly shaped and
+carries the expected Qwen massive-activation; `DequantNvfp4ToBf16` is byte-exact
+(Laguna/Qwen3 + independent torch dequant); and the CUDA device forward == the CPU host
+forward at the REAL render seq (1920) at head_dim=128 (new permanent gate
+`test_minimax_h3 :: "CUDA device forward tracks the host at the REAL render seq (1920)"`,
+28/28) — closing the "CUDA kernel at scale" hole #74's CPU-backend device-vs-host left open.
+
+**Proof:** t2va on `MiniMax-H3-FL2VA-Q3_K_M.gguf` (`--dequant-bf16`, 512x512/22f, prompt
+"an orange cat sitting on a wooden table") renders a **COHERENT photorealistic orange cat
+on a wooden table** — VAE-input latent adj-cell cosine **0.9467** (white was 0.06), frame
+seam16/interior **1.00** (no patch grid), velocity stable ~1.37, final latent rms **1.00**.
+Valid h264 512x512 + AAC 32kHz mp4.
+
+**Fixed in this row:** `MiniMaxH3GenerateT2va` now strips the PREPENDED pinned reference
+rows (ref2va) before unpatchify/unpack — they are zeroed in the DiT output and only the
+trailing target rows are the clip; the old code fed unpatchify the full buffer and hit
+"rows not divisible by t*h*w" (no-op for t2va/fl2va). **Open:** a partition/supported_tasks
+guard mirroring upstream (community files strip the release config); the encoder vision
+tower (W3) is still unported, so image/video-conditioned ref2va/fl2va renders are not yet
+clean (ref2va with a synthetic reference + text-only encoder still grids).
