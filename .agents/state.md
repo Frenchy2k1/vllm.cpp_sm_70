@@ -37180,6 +37180,53 @@ also runs) or within the cross-tool attribution boundary. NEXT lever (only real 
 grouped→dense-direct-A marlin decode (#50 NO-GO'd the full port; a targeted E1 direct-A path is the
 open candidate). Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
 
+## SPEC-DECODE-INVENTORY: full vLLM speculative-method surface enumerated from source; 9 ABSENT methods rowed INVENTORIED
+<!-- state: 2026-08-09T13:00 -->
+
+Records-only branch `row/SPEC-DECODE-INVENTORY` off origin/main `4dd4e206`; pinned
+vLLM verified `555967922` / 0.26.0.dev0. No C++ — inventory/records only.
+
+Enumerated ALL vLLM speculative methods from SOURCE (not memory):
+`vllm/config/speculative.py:66-76` (`SpeculativeMethod` Literal),
+`vllm/v1/worker/gpu_model_runner.py:596-655` (default V1 method->proposer
+dispatch), the opt-in MRV2 factory `vllm/v1/worker/gpu/spec_decode/__init__.py:8-40`
+(narrower subset), `vllm/v1/spec_decode/*` proposers, `model_executor/models/*`
+speculator classes, and the HF `speculators` lib `algos.py:15,55,93,133`. Full
+method x status table: `.agents/specs/spec-decode-inventory.md`.
+
+Findings: 13 method strings + config axes (`rejection_sample_method`
+standard/synthetic/block, `draft_sample_method` greedy/probabilistic, dynamic
+`num_speculative_tokens_per_batch_size`). `mlp_speculator` has NO V1 proposer
+(dispatch raises `ValueError`) = upstream-deprecated. `dflash`/`dspark` are REAL
+vLLM methods — our DFlash MIRRORS vLLM, it is NOT ours-beyond-vLLM.
+
+Our side (verified vs code): DONE `SPEC-MTP` (Qwen3.5/3.6 k=1) + `SPEC-DFLASH`
++ GGUF variants; ACTIVE `SPEC-REJECTION`/`SPEC-GDN-SEGMENTS`/`SPEC-NGRAM`
+(27B 5/5 strict)/`SPEC-DRAFT-MODEL` (W0+W1 CPU brick, W3 GPU DGX residual);
+SPIKE `SPEC-MEDUSA` (W0 only, NO code — the FEATURES "CPU brick" mark was drift,
+corrected); BLOCKED `SPEC-EAGLE3` (no ungated gate-model checkpoint at pin);
+DeepSeek-V4 MTP ACTIVE-W1 weight-blocked (`MODEL-SPEC-deepseek-v4-deep-seek-v4-mtp`).
+Model-matrix already inventories 49 `MODEL-SPEC-*` speculator model classes.
+
+Added 9 engine-matrix rows (all `INVENTORIED`, value-ordered): `SPEC-NGRAM-GPU`,
+`SPEC-SUFFIX`, `SPEC-EAGLE`, `SPEC-MTP-FAMILY`, `SPEC-ACCEPT-VARIANTS`,
+`SPEC-DYNAMIC`, `SPEC-CUSTOM-CLASS`, `SPEC-EXTRACT-HIDDEN`, `SPEC-MLP-SPECULATOR`.
+`ENGINE_ROWS` 131->140 (check-agent-record.py); engine summary Total + area rows
+updated (INVENTORIED 32->41, Speculative area 12->21). INVENTORIED (not SPIKE)
+chosen to match the `SPEC-DSPARK`/`SPEC-TLI` precedent and because SPIKE demands
+an active coordination claim; each row is spike-first per the inventory directive.
+
+Roadmap `ROAD-V1-D3` portfolio + D3 track updated + gap paragraph enumerating the
+nine. FEATURES.md spec rows corrected (Medusa->spike, n-gram->DONE, EAGLE->EAGLE1/3,
++breadth row). BENCHMARKS spec table +ngram +breadth rows. STATUS: method-surface
+paragraph added, PAID by collapsing the 4 superseded DeepSeek-V4 decode-lever
+paragraphs (duplicated in BENCHMARKS, superseded by the 1.14x BEATS-ds4 binding)
+= -5772 chars; `STATUS_RATCHET` chars 287838->282066.
+
+NEXT (value order): implementable draft-free gaps first — `SPEC-NGRAM-GPU`,
+`SPEC-SUFFIX` (needs external `arctic_inference`) — then `SPEC-EAGLE`
+(checkpoint-gated like eagle3). Gates green: check-agent-record / doc-checkpoint
+/ public-doc-tables / now-current.
 ## QUANT-CT-MXFP4-C8-DIFF: fresh SAME-TOOL c8 decode-window diff on the POST-SLIVER binary — kernels are NOT identical; marlin grouped-5-GEMM is DOMINANT (+897us eager/+1377us graphed), eager launch-gap +880us is graph-closeable but nets only −334us (bandwidth contention); #50 "grouped==dense parity" SETTLED as an isolated-shape ubench artifact; decode-graph opt-in is a measured +1.3% byte-coherent secondary lever
 <!-- state: 2026-08-09T14:00 -->
 
@@ -37257,4 +37304,3 @@ Evidence dgx:~/mxfp4-nsys/ — reps ours_c8_dflt/ours_c8_graph/vllm_offline_c8.n
 kern_sum_c8_dflt.txt, vllm_offline_kern_c8.txt, kern_sum_c8_graph.txt; trace CSVs
 gpu_trace_c8_{dflt,graph}_cuda_gpu_trace.csv, vllm_offline_trace_c8_cuda_gpu_trace.csv; analyzers
 analyze_decode.py + gap_and_shape.py; vLLM offline capture nsys_vllm_c8_v2.sh/run_vllm_offline_nsys.sh.
-

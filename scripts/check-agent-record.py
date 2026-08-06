@@ -252,7 +252,7 @@ ENGINE_PREFIXES = (
 # the same change — the heads/`SequencePooler`/`DispatchPooler` composite — not a
 # new row.) Bumped for a real new row, never to make a failing state transition
 # pass.
-ENGINE_ROWS = 131
+ENGINE_ROWS = 140
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

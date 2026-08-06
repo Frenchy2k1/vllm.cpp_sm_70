@@ -254,6 +254,8 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 |---|---|---|---|
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
+| n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
+| Breadth (EAGLE1/3, suffix, ngram-gpu, dspark, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-09 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure
 
@@ -310,7 +312,7 @@ built on it rather than keeping the flattering one.
 | MXFP4 Qwen3-8B (W4A16 Marlin) | Closers binding x3 (d3b412f5): c1 **1.005 PASSES**, c2/c4/c8 0.925/0.939/0.953 BELOW (+0.3/0.9/1.1pp vs #49), TTFT parity, mem 2.18x WIN; byte-exact slivers (bitdiff=0), #44 3/3, gate NO | c8 same-tool diff (`QUANT-CT-MXFP4-C8-DIFF`): marlin grouped-5-GEMM DOMINANT (gate_up unfused); eager gap +0.88ms graph-closeable (decode-graph opt-in +1.3%); flash same-grid +11%; #50 = isolated-shape artifact |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
-| Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **NO NUMBER OWED OR PRODUCED — nothing executes on these arches.** 2026-08-06 compile audit at `sm_75` (nvcc 13.0.88): 20 unconditional CUDA TUs, first pass 18 PASS / 2 FAIL, **now 20/20 PASS (0 err, 0 warn)** after guarding the bf16/TF32 WMMA bodies in `cuda_gdn.cu` + `cuda_matmul_nvfp4.cu`. GB10 unaffected: `sm_121a` 0-warn with zero instruction-level SASS diffs. Build-audit evidence only; no library link, no board here, and `sm_70` is not compilable until a CUDA 12.x toolkit is wired | Port the llama.cpp `fattn-tile`/`fattn-vec` fp16 body. Perf floor when a card exists is **llama.cpp on the same card** (vLLM does not run there) |
+| Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **NO NUMBER OWED, nothing executes on these arches.** 2026-08-06 sm_75 compile audit (nvcc 13.0.88): 20 unconditional sm_80+ constructs enumerated; detail in .agents/benchmark-record.md | Port the llama.cpp `fattn-tile`/`fattn-vec` fp16 body. Perf floor when a card exists is **llama.cpp on the same card** (vLLM does not run there) |
 
 ## Reproduce
 

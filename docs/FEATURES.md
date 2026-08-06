@@ -109,10 +109,11 @@ the registered engine forward.
 |---|---|---|---|
 | MTP (multi-token prediction) | ✅ token-identical, ~4% faster at c1 | ✅ | ✅ |
 | Draft model | ◐ CPU brick | ✅ | ✅ |
-| Medusa | ◐ CPU brick | ✅ | ✅ |
-| EAGLE | ☐ | ✅ | ✅ |
+| Medusa | ☐ spike only | ✅ | ✅ |
+| EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
-| n-gram / prompt lookup | ☐ | ✅ | ✅ |
+| n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
+| Other methods (ngram-gpu, suffix, dspark, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
 
 ## Structured output and tool calling
 

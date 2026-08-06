@@ -26,8 +26,10 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
 | MXFP4 parity goal | c8 same-tool diff (`QUANT-CT-MXFP4-C8-DIFF`) SETTLES #50: marlin grouped-5-GEMM (gate_up unfused, 180 vs 144) DOMINANT +0.9/+1.4ms; eager gap +0.88ms graph-closeable nets +1.3%; flash same-grid +11% | NEXT: grouped→dense-direct + gate_up fuse |
 
-In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
-(fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
+In-flight branches (default-OFF, not pushed): `laguna-fp4proj-prod` (fp4),
+laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`. Records:
+`row/SPEC-DECODE-INVENTORY`: 13 vLLM spec-decode methods enumerated from
+source, 9 gaps `INVENTORIED` ([inventory](specs/spec-decode-inventory.md)).
 
 ## Current gate
 
@@ -52,12 +54,11 @@ MEASUREMENT arbitrates; distrust aggregate bytes/time and CROSS-TOOL comparisons
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always` + `docker start`).
-5. **Protocol substrate — partly done.** Claim triage DONE; `docs/STATUS.md`
-   under a shrink-only ratchet; roadmap compacted; `AGENTS.md` tiered. REMAINING:
-   anchor backfill (98 rows `SPIKE`/`ACTIVE`, need code/test anchors; 6 model rows
-   need a DECISION, architecture unregistered); record-era rollover BLOCKED on
-   `check-agent-record.py` binding `DONE` rows to `parity-ledger.md` LINE anchors
-   (re-anchor by ROW ID first; `state.md`/`benchmark-record.md` can roll now).
+5. **Protocol substrate — partly done.** `docs/STATUS.md` shrink-ratchet;
+   roadmap compacted; `AGENTS.md` tiered. REMAINING: anchor backfill (98
+   `SPIKE`/`ACTIVE` rows need anchors; 6 model rows need a DECISION); record-era
+   rollover BLOCKED on `check-agent-record.py` `DONE`->`parity-ledger.md` LINE
+   anchors (re-anchor by ROW ID first).
 
 **Operator/helper protocol**
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
