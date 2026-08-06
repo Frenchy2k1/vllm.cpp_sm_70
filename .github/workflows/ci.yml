@@ -264,6 +264,47 @@ jobs:
           echo "/tmp/glslang/bin" >> "$GITHUB_PATH"
       - name: Committed SPIR-V is not stale
         run: python3 scripts/gen-vulkan-spirv.py --check
+  build-test-vulkan:
+    # The Vulkan backend had NO CI leg at all: `VLLM_CPP_VULKAN=ON` appeared
+    # nowhere in this workflow, so tests/vt/test_vulkan_backend.cpp ran on no
+    # machine. It rotted exactly as you would expect. Accelerator-seam row S5
+    # (af0b21ba) gave unified-memory devices a portable CPU reference tier, which
+    # means a missed GetOp no longer throws; the Metal sibling test was updated for
+    # that as Metal work continued, and the Vulkan one was not, so its "the
+    # unimplemented ops throw" assertion sat RED and INVISIBLE from S5 until
+    # VK-A1 built the backend by hand (2026-08-06). That is the gap this closes.
+    #
+    # Runs GPU-FREE on `mesa-vulkan-drivers`' llvmpipe software ICD, which is the
+    # arrangement the fan-out spike already recorded as working. The suite is
+    # scoped to the Vulkan-specific targets rather than all of ctest: the full
+    # suite is already covered by build-test-cpu, and this lane exists to keep the
+    # Vulkan-only TUs compiled and executed, not to duplicate it.
+    #
+    # Tree-scoped: cancellable.
+    concurrency:
+      group: ci-build-test-vulkan-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the software Vulkan ICD
+        # Loader + llvmpipe only. No shader toolchain: the backend consumes the
+        # COMMITTED SPIR-V, which is the whole point of the committed-artifact
+        # route, and the vulkan-spirv-freshness job above is what keeps it honest.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers
+      - name: Configure
+        run: cmake -S . -B build-vulkan -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_VULKAN=ON
+      - name: Build
+        # Bounded parallelism for the same reason as build-test-cpu: an unbounded
+        # parallel link OOM-kills the runner.
+        run: cmake --build build-vulkan -j 2 --target test_vulkan_backend test_backend_cross_device
+      - name: Vulkan backend gate
+        run: ./build-vulkan/tests/test_vulkan_backend
+      - name: Cross-device numerics vs the CPU oracle
+        run: ./build-vulkan/tests/test_backend_cross_device
   device-leakage:
     # The DSR RATCHET (work row `S1` of .agents/specs/accelerator-seam-audit.md).
     # Counts device-specific references in `src/vllm/` + `include/vllm/` — the
