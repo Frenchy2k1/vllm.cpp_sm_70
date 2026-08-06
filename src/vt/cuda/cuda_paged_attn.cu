@@ -2565,13 +2565,22 @@ bool Fa2DecodeQwen3Enabled() {
 // launches (batch, hq), over-waving at batch>=2 (#47: decode flash 63.7us c2 /
 // 218us c8 vs vLLM 41.7/151). This routes the SAME vendored split-KV kernel through
 // the swapped presentation (already proven by the d256 LaunchDecodeFA2Bf16 arm).
-// DEFAULT OFF: it is non-byte-exact vs the plain arm when num_splits>1 (the split
-// reduction order changes -> near-tie, moving toward vLLM's numerics) and touches
-// the CUDA-graph-captured decode, so it flips ON only after the near-tie token
-// gates hold. =1 opts in for a same-binary A/B. Read fresh (host path per step).
+// DEFAULT ON (flipped 2026-08-06, row KERNEL-FA2-GQA-SWAP-FLIP, per
+// parity-enablers-ship-as-defaults): the flip campaign met every condition on GB10
+// — op test 5/5, Qwen3-0.6B/4B SACRED greedy near-tie gate 16/16 token-IDENTICAL to
+// the plain arm swap-ON (the split reduction is a near-tie the model never flips at
+// these lengths), #44 MXFP4-8B smoke token-exact, and the binding q3mxfp4 grid
+// improved with NO regression: total tok/s c2 0.911->0.922, c4 0.919->0.930,
+// c8 0.913->0.942 (each ours-rep beats every swap-OFF rep), c1 flat 0.989->0.990,
+// median TTFT at/above parity, peak GPU mem 2.614x LESS. Mechanism (ours nsys c2):
+// decode flash grid (1,3,64)=batch x query_heads -> (1,5,16)=batch x kv_heads,
+// per-call 63.7->45.3us. It is non-byte-exact vs the plain arm when num_splits>1
+// (split reduction order changes -> near-tie toward vLLM's numerics) and touches the
+// CUDA-graph-captured decode, hence gated: =0 opts OUT (restores the byte-identical
+// plain-varlen reduction) for a same-binary A/B. Read fresh (host path per step).
 bool Fa2DecodeGqaSwapEnabled() {
   const char* e = std::getenv("VT_FA2_DECODE_GQA_SWAP");
-  return e != nullptr && e[0] != '0';
+  return e == nullptr || e[0] != '0';
 }
 #endif  // VLLM_CPP_FLASH_ATTN
 

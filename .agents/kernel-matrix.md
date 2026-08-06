@@ -85,24 +85,30 @@ trace-proven at **180.28 us/call**, within 1.1% of the matched vLLM FA2 kernel
 at 178.40 us/call. Evidence:
 [2026-07-25 4B repair](../docs/bench-evidence/qwen35-4b-main-repair-20260725.md).
 
-`KERNEL-ATTN-FA2` d128 varlen decode GQA group-swap (2026-08-06,
-`row/KERNEL-FA2-GQA-SWAP`, `VT_FA2_DECODE_GQA_SWAP`, default OFF): vLLM's
-`seqlenq_ngroups_swapped` decode grid ported into `LaunchDecodeVarlenFA2Bf16`
-(`cuda_flash_attn_fa2.cu`) so the Qwen3-dense d128 decode launches
-(batch, kv_heads) not (batch, hq) — the ngroups query heads pack into seqlen_q,
-KV read once per group, heuristic sees `batch*kv_heads` — halving the CTA count
-at batch>=2 (#47: ours over-waved 192 CTAs c2 / ~5 waves c8). Presented WITHOUT a
-materialized transpose via kv-major-group-minor strides, mirroring the shipped
-d256 `LaunchDecodeFA2Bf16` swap (the vendored `get_lse_tile`/combine already
-honor the flag). Gated so OFF is byte-identical to the shipped plain-varlen
-reduction; ON is non-byte-exact only when num_splits>1 (split reduction order
-→ near-tie, toward vLLM). Correctness-complete on GB10 (CUDA 13.0, sm_121a):
-op RED-first test **280/280 assn GREEN** (both ratios 16/8+32/8, batch 1/2/4/8,
-short+long context; `swap_launches==1` proves the grid engaged; wrong-stride RED
-= 26528 violations), compute-sanitizer **0-err/0-leak**, and the #44 MXFP4 e2e
-smoke swap-ON **3/3 deterministic TOKEN-EXACT + coherent**, byte-identical to
-swap-OFF (no token flip, near-tie razor unneeded). c1-c8 x3 binding re-bench +
-default flip is the recorded next step. Detail: state `KERNEL-FA2-GQA-SWAP`.
+`KERNEL-ATTN-FA2` d128 varlen decode GQA group-swap (ported 2026-08-06
+`row/KERNEL-FA2-GQA-SWAP`; **FLIPPED DEFAULT-ON 2026-08-06 `row/KERNEL-FA2-GQA-SWAP-FLIP`**,
+`VT_FA2_DECODE_GQA_SWAP`, `=0` opts out): vLLM's `seqlenq_ngroups_swapped` decode
+grid ported into `LaunchDecodeVarlenFA2Bf16` (`cuda_flash_attn_fa2.cu`) so the
+Qwen3-dense d128 decode launches (batch, kv_heads) not (batch, hq) — the ngroups
+query heads pack into seqlen_q, KV read once per group, heuristic sees
+`batch*kv_heads` — halving the CTA count at batch>=2 (#47: ours over-waved 192 CTAs
+c2 / ~5 waves c8). Presented WITHOUT a materialized transpose via
+kv-major-group-minor strides, mirroring the shipped d256 `LaunchDecodeFA2Bf16` swap
+(the vendored `get_lse_tile`/combine already honor the flag). Gated so `=0` is
+byte-identical to the shipped plain-varlen reduction; ON is non-byte-exact only when
+num_splits>1 (split reduction order → near-tie, toward vLLM). **FLIP CAMPAIGN on
+GB10 (CUDA 13.0, sm_121a, HEAD 1f446fd7):** op RED-first test **280/280 assn GREEN**
+(both ratios, batch 1/2/4/8, short+long; `swap_launches==1`; wrong-stride RED =
+26528 violations), compute-sanitizer **0-err/0-leak**; **SACRED Qwen3-0.6B/4B greedy
+near-tie gate 16/16 both, TOKEN-IDENTICAL swap-ON vs plain (no token flip)** at
+default, `=1`, and `=0`; #44 MXFP4 smoke token-exact at the new default. nsys ours c2
+decode-flash grid **(1,3,64)=b×q_heads → (1,5,16)=b×kv_heads**, per-call **63.7→45.3us**
+(default no-env reproduces the swap grid). Binding q3mxfp4 grid swap-ON total tok/s
+c1 **0.990** / c2 **0.922** / c4 **0.930** / c8 **0.942** (was 0.989/0.911/0.919/0.913,
+c2-c8 outside per-rep noise, c1 flat, NO regression), median TTFT at/above parity,
+peak GPU mem **2.614x LESS**. Flipped per parity-enablers (improves, no regression,
+correctness holds). Still <1.0x tput/TPOT — residual grouped-Marlin +7-9% + ~0.7ms
+host/sched. Detail: state `KERNEL-FA2-GQA-SWAP-FLIP`.
 
 | ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|

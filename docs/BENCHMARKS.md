@@ -307,7 +307,7 @@ built on it rather than keeping the flattering one.
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
 | Kimi-Linear-48B-A3B (KDA+MLA+MoE) | Full-model GB10 e2e RUNS (bf16-resident §13), NEAR-TIE 106/128, pool math CLOSES; default OFF | Full model RUNS on GB10 (bf16-resident, RSS peak 1.7 GiB, min-avail 21 GiB, no OOM). Token NEAR-TIE 106/128 (6/8 prompts exact, numerics vs deterministic oracle). 1.59 tok/s. Detail: spec §13 |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
-| MXFP4 Qwen3-8B (W4A16 Marlin) | Compute proven (#38); **DEFAULT-config (async ON) e2e coherent + 3/4 token-exact** on dgx after `ROW-SERVE-ASYNC-DENSE-MIRROR`; degenerate without the fix | p2/p3 near-tie RATIFIED. W4 grid: 0.99x@c1 / ~0.91x@c2-c8, mem 2.6x LESS. c2-c8 lever = FA2 decode GQA group-swap **LANDED gated-OFF** (`VT_FA2_DECODE_GQA_SWAP`); bench+flip pending. state `KERNEL-FA2-GQA-SWAP` |
+| MXFP4 Qwen3-8B (W4A16 Marlin) | W4A16 proven; e2e 3/4 token-exact. FA2 GQA group-swap **FLIPPED DEFAULT-ON** (`KERNEL-FA2-GQA-SWAP-FLIP`): binding tput c1 0.990/c2 0.922/c4 0.930/c8 0.942 (c1 flat, no reg), mem 2.614x; SACRED 0.6B/4B identical | Still <1.0x tput/TPOT: residual grouped-Marlin +7-9% (E1 gather vs dense direct-A) + ~0.7ms host/sched. Full table in benchmark-record; state `KERNEL-FA2-GQA-SWAP-FLIP` |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
 
