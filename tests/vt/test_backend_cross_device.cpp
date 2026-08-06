@@ -57,6 +57,7 @@ const char* DeviceName(DeviceType t) {
     case DeviceType::kMETAL: return "METAL";
     case DeviceType::kVULKAN: return "VULKAN";
     case DeviceType::kXPU: return "XPU";
+    case DeviceType::kROCM: return "ROCM";
   }
   return "?";
 }
@@ -81,7 +82,7 @@ double Nmse(const std::vector<float>& ref, const std::vector<float>& got) {
 std::vector<DeviceType> RegisteredDevices() {
   std::vector<DeviceType> out;
   for (DeviceType t : {DeviceType::kCUDA, DeviceType::kMETAL, DeviceType::kVULKAN,
-                       DeviceType::kXPU}) {
+                       DeviceType::kXPU, DeviceType::kROCM}) {
     try {
       (void)vt::GetBackend(t);
       out.push_back(t);

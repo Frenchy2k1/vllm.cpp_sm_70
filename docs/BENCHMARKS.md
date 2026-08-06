@@ -248,6 +248,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 
 ## How we measure
 
+
 Record dates are CI-guarded: state anchors dated in the future are rejected
 (`check-state-order`), so scoreboard stamps trace to real landing dates. The
 review protocol behind these numbers is guarded the same way: the reviewer and
@@ -319,6 +320,7 @@ built on it rather than keeping the flattering one.
 | Startup latency (cold launch to first `/health`) | **PENDING: no number measured or claimed.** Listed in the gate protocol, never captured (readiness polled every 5 s, duration discarded). Harness landed 2026-08-06. [Detail](../.agents/specs/startup-latency-axis.md) | Run `dgx-online-serving.sh --startup-only --model 27` on dgx (needs a CUDA `server` build; the box was at 100% disk on 2026-08-06), then record ours/vLLM medians and the ratio here |
 | Speculation depth (`ROAD-V1-D3-SPEC-K`, #81) | **Never measured, MTP is k=1** (our port covers vLLM's k=1 branch only), so no acceptance-vs-depth curve exists | k=2..4 three-way greedy gate, then the c1/c>1 A/B + the per-workload (prose vs code) acceptance-vs-depth curve any dynamic or adaptive depth policy needs |
 | Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | **NOT APPLICABLE: nothing measured, claimed or owed.** 16 NATIVE kernels; 71 on the host reference tier. opt-125m runs e2e token-exact; no speed measured. [Detail](../.agents/specs/vulkan-full-support.md) | `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, `llama-bench`, same GGUF, three columns (ours-Vulkan, llama.cpp-Vulkan, ours-CUDA). Until then: `GetReferenceTierHits()` must reach 0 |
+| ROCm (`BACKEND-GATE-ROCM-VLLM` / `-SGLANG`) | **NOT APPLICABLE: no number measured, claimed or owed.** No AMD hardware here and no ROCm backend registers an op yet; `kROCM` exists as a device type with a unit-tested gfx capability parse | A contributor with an AMD board ([#41](https://github.com/mudler/vllm.cpp/issues/41)). The first ROCm op gets a CPU-oracle numeric gate for free: `test_backend_cross_device` covers any registered backend |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
 | Ampere consumer (`sm_86`, RTX 3090 class) | **No number owed; no such board here.** 2026-08-06 build-verify: 7/7 FA2 TUs 0-warn, real `sm_86` SASS. [Detail](../.agents/benchmark-record.md) | External RTX 3090 report. Floor is llama.cpp on that card (GGUF, not our Blackwell-only NVFP4 grid) |
