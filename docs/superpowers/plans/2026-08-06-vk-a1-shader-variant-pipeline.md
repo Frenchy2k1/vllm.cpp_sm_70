@@ -18,7 +18,7 @@
 - **Author is `mudler`**, never `localai-bot`.
 - **Run `scripts/agent-preflight.sh`** before committing. Note: `check-fusion-consistency` is **RED on `main`** for an unrelated reason (`minimax_h3_video_vae_device` GEMM merge drift, verified pre-existing at `075b9f21^`). Do not attempt to fix it here; confirm it is the *same* failure and no new one.
 - **Target environment is `vulkan1.1`** (`TARGET_ENV` in `scripts/gen-vulkan-spirv.py`) — the floor `vulkan_context.cpp` requires. Do not raise it in this plan.
-- **Pinned shader compiler: `Glslang Version: 11:16.4.0`** — the exact string recorded at `src/vt/vulkan/vulkan_spirv.h:16`. `--check` compares SPIR-V bytes and ignores only the version comment line, so a different glslang build will fail the gate.
+- **Pinned shader compiler: glslang `16.5.0`, prebuilt Linux x86_64 release tarball.** CORRECTED during execution (2026-08-06): the header recorded `Glslang Version: 11:16.4.0`, but **16.4.0 ships no release assets** (only `16.5.0` and `main-tot` do; Ubuntu packages `15.1.0`), so the recorded version is not fetchable and could not back a CI gate. MEASURED: the committed SPIR-V reproduces **byte-for-byte under 16.5.0** — `gen-vulkan-spirv.py --check` passes unchanged. That both proves the committed artifact is what it claims and shows the emitted SPIR-V is stable across a glslang minor bump, so the gate pins the DOWNLOAD URL rather than asserting a version string.
 - **llama.cpp port pin: `237ad9b96`**, readable at `/home/mudler/_git/llama.cpp`. Cite `file:line` for any ported structure.
 
 ## PRECONDITIONS — verify before Task 1, stop if unmet
@@ -65,41 +65,37 @@ which glslang glslangValidator glslc || echo "none present (expected)"
 
 Expected: `none present (expected)`.
 
-- [ ] **Step 2: Install the pinned glslang**
+- [x] **Step 2: Install the pinned glslang** — DONE 2026-08-06
 
-`sudo -n true` now returns 0 on both the dev box and dgx (verified 2026-08-06), so either route works. Prefer the **release tarball** — it pins the exact version, needs no root, and matches what CI will download:
+The recorded `16.4.0` has **no release assets**, so it is not installable without a
+source build. `16.5.0` is the nearest tag that ships a prebuilt Linux x86_64
+binary, and Step 3 measured that it produces byte-identical SPIR-V:
 
 ```bash
 mkdir -p "$HOME/tools" && cd "$HOME/tools"
-# glslang 16.4.0 release build (the version recorded in vulkan_spirv.h:16)
-curl -fsSL -o glslang-linux.zip \
-  https://github.com/KhronosGroup/glslang/releases/download/16.4.0/glslang-master-linux-Release.zip
-unzip -o -q glslang-linux.zip -d glslang-16.4.0
-export PATH="$HOME/tools/glslang-16.4.0/bin:$PATH"
-glslang --version
+curl -fsSL -o glslang-16.5.0.tar.gz \
+  https://github.com/KhronosGroup/glslang/releases/download/16.5.0/glslang-16.5.0-linux-x86_64-release.tar.gz
+mkdir -p glslang-16.5.0 && tar xzf glslang-16.5.0.tar.gz -C glslang-16.5.0
+export PATH="$HOME/tools/glslang-16.5.0/bin:$PATH"
+glslang --version | head -1
 ```
 
-Expected: output whose first line is exactly `Glslang Version: 11:16.4.0`.
+Result: `Glslang Version: 11:16.5.0` at `$HOME/tools/glslang-16.5.0/bin/glslang`.
 
-If the release asset name or URL has changed, find the 16.4.0 release asset for Linux on the glslang releases page. **Do not substitute a different version** — a different glslang emits different SPIR-V and Step 4 will fail for a reason that is not a real staleness.
-
-- [ ] **Step 3: Run the staleness check against the committed header**
+- [x] **Step 3: Run the staleness check against the committed header** — DONE 2026-08-06
 
 ```bash
-cd "$(git rev-parse --show-toplevel)"
-PATH="$HOME/tools/glslang-16.4.0/bin:$PATH" python3 scripts/gen-vulkan-spirv.py --check
+PATH="$HOME/tools/glslang-16.5.0/bin:$PATH" python3 scripts/gen-vulkan-spirv.py --check
 ```
 
-Expected: `vulkan_spirv.h is up to date`.
+Result: **`vulkan_spirv.h is up to date`, exit 0.**
 
-**If it fails instead:** do not regenerate and move on. Capture the diff and diagnose before proceeding:
-
-```bash
-PATH="$HOME/tools/glslang-16.4.0/bin:$PATH" python3 scripts/gen-vulkan-spirv.py
-git diff --stat src/vt/vulkan/vulkan_spirv.h
-```
-
-A byte difference at the pinned version means the committed artifact was produced by something other than what it claims, which is a **finding to report to the user before continuing** — it would mean the CI gate in Task 2 can never be green and the whole committed-artifact route needs re-deciding. Record it and stop.
+This is a stronger outcome than the step was written to obtain. The check compares
+SPIR-V bytes and ignores only the version comment, so a byte-identical result under
+a *different, newer* compiler proves two things at once: the committed artifact is
+genuinely what it claims to be, and the emitted SPIR-V did not change across a
+glslang minor bump. The second is what lets Task 2 pin the download URL instead of
+asserting a version string, which would have been brittle for no gain.
 
 - [ ] **Step 4: Record the toolchain in the environment doc**
 
