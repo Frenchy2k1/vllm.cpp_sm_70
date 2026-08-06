@@ -31,6 +31,11 @@ citing "vLLM 0.25.0" are the last binding measurement against the prior oracle
 
 ## Capability status
 
+Supported-model registry guard (2026-08-06): the public per-architecture list in
+[FEATURES](FEATURES.md) is CI-bound to the C++ registry by
+`scripts/check-supported-models.py` (+ mutation test), so the 30
+`REGISTER_VLLM_MODEL` architectures and the FEATURES rows cannot drift.
+
 GCC 12 production-library maintenance (2026-07-31): the two known `-Werror`
 blockers in GGUF prefaulting and KV-offload temporary-file naming are fixed
 without behavior or lifecycle changes. The production library and focused

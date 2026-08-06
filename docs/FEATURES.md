@@ -25,7 +25,7 @@ are our reading of their documented behavior, not measurements.
 | Embeddable behind a C ABI | ✅ | ☐ | ☐ | ✅ |
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
-| Architectures | 25+ gated | 130+ | 100+ | 100+ |
+| Architectures | 30 registered, 25+ gated | 130+ | 100+ | 100+ |
 
 ## Serving and scheduling
 
@@ -72,41 +72,85 @@ are our reading of their documented behavior, not measurements.
 
 ## Model coverage
 
-| Family | vllm.cpp | Gate |
+The supported set is exactly what the C++ registry registers: every
+architecture self-registers from its own translation unit via
+`REGISTER_VLLM_MODEL`, and `scripts/check-supported-models.py` gates this list
+against the source so it can never drift. Today that is **30 registered
+architectures**. Each row names the concrete checkpoint it was gated against and
+the honest verdict; per-arch lifecycle caveats are in [STATUS.md](STATUS.md) and
+the agent-facing detail is in `.agents/model-matrix.md`.
+
+Gate words: **strict** is token-for-token identical to the vLLM oracle;
+**near-tie** is the ratified distributional gate used where vLLM's own greedy is
+bf16-non-deterministic; **scaffold** means registered and config/loader-gated
+but the forward is not yet a real-checkpoint run. Speed is a separate bar (match
+or beat the reference on every axis); most rows are correctness-complete and
+speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
+
+### Registered architectures
+
+<!-- supported-arch-table:begin -->
+| Architecture | Tested checkpoint(s) | Correctness gate | Speed vs reference |
+|---|---|---|---|
+| `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B (NVFP4, GDN hybrid) | strict 235/235 text, image+video 32/32 vs vLLM 0.25.0 | gate model: at or above vLLM |
+| `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | strict 315/315 text vs vLLM 0.25.0 | gate model: 0.93x to 1.03x grid |
+| `Qwen3ForCausalLM` | Qwen3 dense 0.6B/1.7B/4B/32B, NVFP4A16 | near-tie strict 16/16 vs vLLM 0.25.0 | c1 every-axis parity, c8 decode residual |
+| `Qwen3MoeForCausalLM` | Qwen3-Coder-30B-A3B | strict 6/6 vs vLLM 0.25.0 | 11/16 grid cells at or above graphed vLLM |
+| `Qwen3VLForConditionalGeneration` | Qwen3-VL-4B-Instruct (image + video) | image strict 32/32, video near-tie vs vLLM 0.25.0 | vision tower 0.57x vs vLLM encode; umbrella pending |
+| `LlamaForCausalLM`, `InternLM3ForCausalLM` | Llama-3.2-1B, 01-ai/Yi-Coder-1.5B-Chat, internlm3-8b-instruct | strict 16/16 each vs vLLM 0.25.0 | pending |
+| `InternLM2ForCausalLM` | internlm2-chat-1_8b | near-tie 16/16 vs vLLM 0.25.0 | pending |
+| `MistralForCausalLM` | Mistral-7B-v0.3 | strict 16/16 vs vLLM 0.25.0 | pending |
+| `OPTForCausalLM` | facebook/opt-125m | strict 6/6 vs vLLM 0.25.0 | pending |
+| `PhiForCausalLM` | microsoft/phi-2 | near-tie 16/16 vs vLLM 0.25.0 | pending |
+| `Phi3ForCausalLM` | microsoft/phi-4 (14B), Phi-3 | strict 16/16 vs vLLM 0.25.0 | pending |
+| `GemmaForCausalLM` | google/gemma-1.1-2b-it, unsloth/gemma-2b | near-tie 48/48 vs vLLM 0.25.0 | pending |
+| `Gemma2ForCausalLM` | google/gemma-2-2b-it | near-tie 48/48 vs vLLM 0.25.0 | pending |
+| `Gemma3ForCausalLM` | google/gemma-3-1b-it | strict 48/48 vs vLLM 0.25.0 | pending |
+| `Gemma4ForConditionalGeneration` | Gemma-4 multimodal (unsloth/gemma-4-E4B-it) | text strict, image mm near-tie; audio pending | pending |
+| `GraniteForCausalLM` | ibm-granite/granite-3.3-2b-instruct | near-tie 16/16 vs vLLM 0.25.0 | pending |
+| `StableLmForCausalLM` | stabilityai/stablelm-2-1_6b | near-tie 16/16 vs vLLM 0.25.0 | pending |
+| `MiniCPMForCausalLM` | openbmb/MiniCPM-2B-sft-bf16 | strict 16/16 vs vLLM 0.25.0 | pending |
+| `MiniCPM3ForCausalLM` | openbmb/MiniCPM3-4B (MLA) | near-tie 16/16 vs vLLM 0.25.0 | pending |
+| `Olmo2ForCausalLM`, `Olmo3ForCausalLM` | allenai/OLMo-2-0425-1B; OLMo-3 (Olmo2 factory alias) | OLMo-2 strict 16/16; OLMo-3 oracle-blocked (vLLM 0.25.0 cannot build it) | pending |
+| `DeepseekV2ForCausalLM` | DeepSeek-V2-Lite (MLA) | strict 8/8 vs vLLM 0.25.0 | speed short, attributed |
+| `DeepseekV4ForCausalLM` | DeepSeek-V4-Flash GGUF (ds4 q2-imatrix, UD-IQ2) | coherent near-tie vs ds4 oracle (vLLM cannot fit one GB10) | decode beats ds4 1.144x, default on |
+| `Glm4ForCausalLM` | GLM-4-9B-0414 | near-tie 16/16 vs vLLM 0.25.0 | pending |
+| `Glm4MoeLiteForCausalLM` | zai-org/GLM-4.7-Flash (31.2B, MLA MoE) | near-tie 8/8 vs vLLM 0.25.0 | pending |
+| `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on |
+| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | e2e runs bf16-resident, near-tie 106/128 (numerics) | 1.59 tok/s, default off |
+| `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
+| `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
+<!-- supported-arch-table:end -->
+
+### Standalone and non-registered lanes
+
+These run through dedicated forwards, not the `REGISTER_VLLM_MODEL` registry, so
+they sit outside the gated list above.
+
+| Lane | Tested checkpoint(s) | Correctness gate | Speed vs reference |
+|---|---|---|---|
+| Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder TTFT ~17x, pending |
+| Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
+| MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable path 62/62; real-weights render coherence OPEN | FP4/Marlin routing landed, GB10 speed pending |
+| MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
+| DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
+| DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
+
+### Inventoried but blocked
+
+Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
+
+| Architecture | Model | Why blocked |
 |---|---|---|
-| Qwen3.6 27B and 35B-A3B (NVFP4, GDN MoE) | ✅ | token-exact, at or above vLLM speed |
-| Qwen3 / Qwen2 dense (bf16) | ✅ | token-exact, speed-pending |
-| Qwen3-Coder, Qwen3-VL | ✅ | token-exact |
-| Llama, Mistral, InternLM2/3 | ✅ | token-exact |
-| Gemma 1 / 2 / 3 / 4 | ✅ | token-exact, Gemma-4 multimodal near-tie |
-| DeepSeek-V2 (MLA), DeepSeek-V4-Flash | ✅ | token-exact; **DS4-Flash decode beats ds4 1.144x by default** (`VT_V4_RESIDENT_W` default-ON, byte-exact); Phase-2 routed-expert residency measured −3.4%, held default-OFF |
-| GLM-4, GLM-4.7-Flash | ✅ | token-exact |
-| OPT, Phi, MiniCPM, OLMo-2, StableLM, Granite, Yi | ✅ | token-exact |
-| Laguna-S / Laguna-XS 2.1 | ✅ | near-tie; **vLLM parity+ (1.03x) by default** (`VT_LAGUNA_RESIDENT_BF16W` default-ON) |
-| Whisper, Voxtral (audio) | ✅ | token-exact |
-| Embedding and reranking models | ☐ | engine-side pooler landed, no model registered |
+| `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | 671B, ~642 GiB fp8 vs 119 GiB unified; V3.2 also DSA-indexer dep-blocked |
+| `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
+| `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
 
-25+ architectures are gated today against vLLM's 130+ registered text
-architectures. The full per-model state, including which are oracle-blocked, is
-in [STATUS.md](STATUS.md) and `.agents/model-matrix.md`.
-
-The marks above are the accurate ones. The 2026-08-06 live-state audit moved
-**10** rows off a stale `ACTIVE` claim to `READY`: 3 model, 3 engine, 2 kernel,
-1 quantization and 1 backend. For the MODEL rows `check-model-checklist.py` then
-demotes the INTERNAL mark in `.agents/model-matrix.md` from `✅` to `🚧`,
-because `✅` is illegal at `READY`. That is a lifecycle-contract artifact:
-`READY` is the state contracts' legality floor for a row with no Git-visible
-claim, never a statement about capability. Every one of the ten carries in-row
-anchors asserting a passing gate. No capability changed, no gate was lost, and
-these public marks are deliberately NOT demoted to match.
-
-The same reasoning covers the Multimodal marks below: `Video ✅
-correctness-gated` and `Audio ✅ correctness-gated` rest on
-`ENG-MM-VIDEO-FORWARD` and `ENG-MM-AUDIO-ENCODER`, two of the three engine rows
-the audit moved. Their gates (video-processor 41/41, A2 encoder-tower 203/203)
-still pass and are still anchored in `.agents/engine-matrix.md`. No checker
-couples this page to that matrix, so the marks stay `✅` by decision, not by
-oversight.
+25 of the 30 registered architectures carry a passing correctness gate today;
+the rest are honestly marked scaffold or blocked above. vLLM registers 130+ text
+architectures, so this is a curated, gated subset, not a breadth claim. Embedding
+and reranking models are not yet registered: the engine-side pooler landed, no
+model architecture is wired.
 
 ## Multimodal
 

@@ -38,6 +38,7 @@ CHECKERS=(
   check-readme-structure
   check-public-doc-tables
   check-model-checklist
+  check-supported-models
   check-env-doc
   check-fusion-consistency
   check-runner-routing-consistency
@@ -55,6 +56,7 @@ SUITES=(
   test_check_readme_structure
   test_check_public_doc_tables
   test_check_model_checklist
+  test_check_supported_models
   test_check_env_doc
   test_check_fusion_consistency
   test_check_runner_routing_consistency

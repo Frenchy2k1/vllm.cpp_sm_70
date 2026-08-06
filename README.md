@@ -232,12 +232,13 @@ self-inconsistent at bf16 near-ties, the bar is a near-tie-robust check. "Speed"
 
 **Gate models:** Qwen3.6-27B and Qwen3.6-35B-A3B (hybrid GDN + MoE, NVFP4), both token-exact, the
 27B at or above vLLM throughput on every axis. **Also running:** Llama-3.x, Mistral, Qwen3/Qwen2
-dense and MoE, DeepSeek-V2 and V4-Flash (MLA), GLM-4 and GLM-4.7-Flash, Gemma-1 through Gemma-4,
-Phi-1 through Phi-4, OLMo-2, Granite-3, StableLM, InternLM2/3, MiniCPM and MiniCPM3, Yi, OPT, plus
-Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
+dense and MoE, DeepSeek-V2 and V4-Flash (MLA), GLM-4 and GLM-4.7-Flash, Laguna-S/XS-2.1,
+Kimi-Linear-48B, Gemma-1 through Gemma-4, Phi-1 through Phi-4, OLMo-2, Granite-3, StableLM,
+InternLM2/3, MiniCPM and MiniCPM3, Yi, OPT, plus Qwen3-VL and Qwen3.6-27B vision (image + video)
+and Voxtral (audio).
 
 <details>
-<summary><b>The full architecture matrix</b> (26 rows, with per-model correctness and speed state)</summary>
+<summary><b>The full architecture matrix</b> (28 rows, with per-model correctness and speed state)</summary>
 
 | Architecture | Example checkpoint | GGUF | Correctness | Speed |
 |---|---|:---:|---|---|
@@ -248,9 +249,11 @@ Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
 | Mistral dense | Mistral-7B-v0.3 | - | Token-exact | Speed-pending |
 | OPT | OPT-125m | - | Strict token-exact | Speed-pending |
 | DeepSeek-V2 (MLA) | DeepSeek-V2-Lite | - | Token-exact | Speed-pending |
-| DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Device-resident decode ~15.87 tok/s (~96% of ds4) |
+| DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Decode beats ds4 1.144x by default (byte-exact) |
 | GLM-4 dense | GLM-4-9B-0414 | - | Token-exact | Speed-pending |
-| GLM-4.7-Flash (MLA MoE) | GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
+| GLM-4.7-Flash (MLA MoE) | zai-org/GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
+| Laguna-S / Laguna-XS 2.1 (MoE) | poolside/Laguna-S-2.1-NVFP4 | NVFP4 + Q4_K | Near-tie (byte-exact) | vLLM parity+ 1.03x by default |
+| Kimi-Linear-48B-A3B (KDA + MLA + MoE) | Kimi-Linear-48B-A3B | - | Near-tie (106/128) | 1.59 tok/s, default off |
 | Gemma-3 / Gemma-2 / Gemma-1 dense | gemma-3-1b-it, gemma-2-2b-it, gemma-2b | - | Token-exact (48/48 each) | Speed-pending |
 | Gemma-4 text (Gemma4ForConditionalGeneration) | unsloth/gemma-4-E4B-it | - | Strict token-exact 32/32 (text path) | Speed-pending |
 | OLMo-2 dense | OLMo-2-0425-1B | - | Token-exact (near-tie-robust) | Speed-pending |
@@ -270,8 +273,11 @@ Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
-sliding-window attention are gated feature-positive. Family-by-family detail, including what is
-hardware-blocked and why: [docs/STATUS.md](docs/STATUS.md).
+sliding-window attention are gated feature-positive. The authoritative per-architecture list, bound
+to the C++ registry (all 30 registered architectures with their tested checkpoint and gate, plus the
+standalone audio/diffusion lanes and the inventoried-but-blocked archs), is in
+[docs/FEATURES.md](docs/FEATURES.md); family-by-family lifecycle detail, including what is
+hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 
 </details>
 

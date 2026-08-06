@@ -13,7 +13,9 @@
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 
 Reading the ratios: throughput is ours/reference, latency is reference/ours, so
-**1.0 or higher is a win** everywhere on this page.
+**1.0 or higher is a win** everywhere on this page. Which architecture each number
+is measured on, and the per-architecture correctness gate behind it, is the
+registry-bound list in [FEATURES.md](FEATURES.md).
 
 ## vLLM, online serving
 
