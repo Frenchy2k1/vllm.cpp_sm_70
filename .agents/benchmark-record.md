@@ -13161,3 +13161,79 @@ project is and how to run it, see the [README](../README.md); for per-capability
 lifecycle state, see [docs/STATUS.md](../docs/STATUS.md); for what is supported at all,
 see [docs/FEATURES.md](../docs/FEATURES.md).
 
+
+## FRESH op-dispatch profile, CPU aarch64 (2026-08-06) — the one `QUANT-GGUF-CIQ-GEMM` owed
+
+`CLAIM-KERNEL-CPU-ELEM-GEMM-1` closed with an explicit debt: "the 95.37 %
+`kMatmul` attribution is STALE. Next step is a FRESH op-dispatch profile of the
+current binary before any further lever is started." This is that profile. It
+re-ranks the CPU levers again, and it does NOT support starting G5.
+
+Method: gate host `dgx.casa` (GB10 Grace, aarch64), idle (load 0.35,
+`local-ai-worker` parked 45 h, top non-bench process 0.2 % CPU), one
+`flock /tmp/gpu`, CPU-only Release build of `main` at `dfd29060`,
+`Qwen3.5-2B-UD-Q8_K_XL.gguf` (the same bench file the G-row history uses),
+`perf record -F 999 -g`. `kernel.perf_event_paranoid` was lowered from 4 to 1
+for the two runs and restored to 4 immediately after each. Prefill arm: 1,801
+prompt tokens, `--max-tokens 1`. Decode arm: 2 prompt tokens,
+`--max-tokens 160`. Percentages are self time (`--no-children`), main thread.
+
+### Prefill (1,801 prompt tokens)
+
+| Symbol | Self |
+|---|---:|
+| `LoadF32` (paged-attn) | 21.93 % |
+| `BtM4Neon<bf16>` (elementwise GEMM) | 21.51 % |
+| `PagedAttentionKernel` | 18.63 % |
+| `Threadpool::Barrier` | 12.39 % |
+| `QuantRepackMatmul` | 5.06 % |
+| `Threadpool::ThreadReady` | 4.70 % |
+| `WidenRowToF32` | 3.97 % |
+| `GdnHeadTokenStep` | 2.83 % |
+| `BF16ToF32` | 2.48 % |
+| `F32ToBF16` | 1.50 % |
+| `Threadpool::PollForWork` | 1.47 % |
+
+Caller-resolved (`-g caller`, `--symbol-filter=LoadF32`): **20.68 % of prefill is
+`PagedAttentionKernel` calling `LoadF32`**, and only 1.25 % is any other caller.
+So CPU paged attention is **~39 % of prefill** (18.63 self + 20.68 in `LoadF32`),
+and over half of that is a **per-ELEMENT dtype switch in the attention dot loop**
+(`src/vt/cpu/cpu_paged_attn.cpp:29` called from `:143`). This is the SAME defect
+class E1 removed from the elementwise GEMM ("the per-element `LoadF32` dtype
+switch is hoisted out of the K loop"), still live in the attention kernel.
+
+### Decode (160 generated tokens)
+
+| Symbol | Self |
+|---|---:|
+| `Threadpool::ThreadReady` | 32.66 % |
+| `Bt16Neon<bf16>` (M=1 gemv) | 24.95 % |
+| `QuantRepackMatmul` | 15.99 % |
+| `Threadpool::PollForWork` | 10.92 % |
+| `LoadF32` | 4.50 % |
+| `Threadpool::Barrier` | 3.57 % |
+
+**Threadpool synchronisation is 47.15 % of decode** (`ThreadReady` +
+`PollForWork` + `Barrier`), rising to ~58 % on the secondary-thread view. At M=1
+the per-op work is too small to amortise the barrier, so decode is
+synchronisation-bound, not kernel-bound.
+
+### What this re-ranks
+
+1. **Decode: threadpool synchronisation (~47 %).** The largest single CPU
+   deficit anywhere in this profile. No GEMM kernel change can reach it.
+2. **Prefill: the paged-attention inner loop (~39 % of prefill, ~21 % in the
+   per-element dtype switch).** A known, already-solved defect class.
+3. **G5 (x86 SIMD quant) is NOT supported by this profile.** `QuantRepackMatmul`
+   is 5.06 % of prefill and 15.99 % of decode on aarch64, where the i8mm repack
+   tier already landed. G5 would raise x86 to roughly where aarch64 already is,
+   which is worth doing for x86 users but is not the top lever, and per
+   `CLAIM-KERNEL-CPU-ELEM-GEMM-1` the x86 box is VOID for timing so no binding
+   number could be produced for it here anyway.
+
+The elementwise GEMM (`BtM4Neon`/`Bt16Neon`, 21.5 % prefill / 24.9 % decode) is
+already on its optimised NEON tier and is NOT a defect; it is simply what is left
+once the avoidable work is removed.
+
+Recorded honestly as a profile, not a benchmark: no A/B, no ratio, no claim of
+speedup. Raw data on dgx at `/tmp/prefill.data` and `/tmp/decode.data`.

@@ -39275,3 +39275,47 @@ DISK-BLOCKED: NVFP4 working set (DiT + Qwen3-VL-32B NVFP4 encoder + 2 VAEs) is
 render. Comparability: vLLM-Omni CANNOT serve a quantized H3 on one GPU
 (BF16-only in practice; source-audited `a4ea67a2`) -> HW/loader-forced-indirect,
 DeepSeek-GGUF precedent. Draft PR is the claim.
+
+## QUANT-GGUF-CIQ-GEMM: the OWED fresh CPU op-dispatch profile is DONE and it re-ranks the levers away from G5; decode is 47% threadpool synchronisation and prefill is ~39% paged attention
+<!-- state: 2026-08-09T18:00 -->
+
+`CLAIM-KERNEL-CPU-ELEM-GEMM-1` closed owing one thing before any further CPU
+lever could start: a fresh op-dispatch profile, because E4's M-blocking bought
+1.63x op-level and 0.0% end-to-end and so the 95.37% `kMatmul` attribution the
+G-rows were ranked against was stale. That debt is now paid.
+
+Method and full tables in `.agents/benchmark-record.md` ("FRESH op-dispatch
+profile, CPU aarch64"). Gate host dgx.casa aarch64, idle and flocked, CPU-only
+Release build of `main` @`dfd29060`, `Qwen3.5-2B-UD-Q8_K_XL.gguf`,
+`perf record -F 999 -g`, paranoid lowered 4 to 1 per run and restored to 4 after.
+
+Result, prefill (1,801 prompt tokens): CPU paged attention is ~39% (18.63% in
+`PagedAttentionKernel` plus 20.68% caller-resolved in `LoadF32`), the elementwise
+NEON GEMM is 21.51%, threadpool 18.56%, `QuantRepackMatmul` only 5.06%. Result,
+decode (160 tokens): `ThreadReady` 32.66% + `PollForWork` 10.92% + `Barrier`
+3.57% = **47.15% threadpool synchronisation**, elementwise M=1 gemv 24.95%,
+`QuantRepackMatmul` 15.99%.
+
+Two consequences, both recorded on the `QUANT-GGUF-CIQ-GEMM` row:
+
+1. **Do not start G5 (x86 SIMD quant) as the next lever.** On aarch64, where the
+   i8mm repack tier already landed, the quant GEMM is 5% of prefill. G5 would
+   bring x86 up to roughly where aarch64 already is, which is worth doing for
+   x86 users, but it is not the top lever and the x86 dev box is VOID for timing
+   so no binding number could be produced for it here regardless.
+2. **The two real levers are new.** Decode is synchronisation-bound, not
+   kernel-bound: at M=1 the per-op work cannot amortise the barrier, and no GEMM
+   change reaches that 47%. Prefill's paged attention spends 20.68% of the whole
+   run in a per-ELEMENT dtype switch inside the attention dot loop
+   (`src/vt/cpu/cpu_paged_attn.cpp:29` called from `:143`), which is the same
+   defect class E1 already removed from the elementwise GEMM, so the fix shape is
+   known and proven.
+
+No code changed, no A/B run, no speedup claimed. This is a profile.
+
+Next: spike the Parakeet encoder row (upstream vLLM has
+`model_executor/models/parakeet.py` + `conformer_encoder.py` as the audio
+encoder of `nano_nemotron_vl.py`, which vllm.cpp already carries rows for, so it
+is mirror-vLLM work that is owed anyway). The transducer decode half of
+parakeet.cpp (RNN-T/TDT/CTC search, joint network) is NOT in vLLM and is a
+separate scope call.

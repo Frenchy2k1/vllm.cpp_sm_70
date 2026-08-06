@@ -24,6 +24,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | MXFP4 parity | **TERMINAL (`QUANT-CT-MXFP4-FINAL-STACK`)**: c1 1.020x PASS + mem 2.63x; c2-c8 0.962-0.969 GPU-intrinsic. Both last levers exhausted: num_splits cap `VT_FA2_NSPLITS_CAP` gated-OFF (c1-only, green, 32B strict char-identical); glue folds via `vt::FusedChain`, residual out-of-catalog Inductor GEMM-epilogue fusion (#46). `VT_MARLIN_DENSE` on | Record; branch not merged |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
+| CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** (20.7% dtype switch, `cpu_paged_attn.cpp:29`). **G5 not next** | Parakeet encoder; attn dtype hoist |
 
 In-flight branches (default-OFF, not pushed): `laguna-fp4proj-prod` (fp4),
 laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`. Records:
@@ -43,7 +44,11 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 
 ## Next actions
 
-1. **Qwen3.5-4B serving follow-up:** the synchronous 0.9971x harness remains
+1. **Spike the Parakeet encoder row.** Upstream vLLM has `parakeet.py` +
+   `conformer_encoder.py` as the audio encoder of `nano_nemotron_vl.py`, which we
+   already carry `MODEL-MM-nano-nemotron-vl-*` rows for, so it is owed mirror work.
+   The transducer decode half (RNN-T/TDT/CTC) is NOT in vLLM: separate scope call.
+2. **Qwen3.5-4B serving follow-up:** the synchronous 0.9971x harness remains
    speed-pending; bind the default-ON async-serving path against the same oracle
    before attributing the remaining TPOT gap.
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
