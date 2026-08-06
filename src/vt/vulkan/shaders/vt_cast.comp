@@ -15,10 +15,25 @@ layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
 layout(binding = 2) buffer Db32 { uint v[]; } D32;
 layout(binding = 3) buffer Db16 { uint16_t v[]; } D16;
 
+// The dtype pair is a SPECIALIZATION CONSTANT, not a push constant — this is the
+// backend's first variant axis and the reason the mechanism exists.
+//
+// It used to be `p.a_dt` / `p.out_dt`, re-tested per element inside VT_LOAD and
+// VT_STORE. As specialization constants the driver folds them at pipeline
+// creation and eliminates the branch that cannot be taken, so each (src, dst)
+// pair gets its own specialized pipeline out of ONE committed module. That is the
+// alternative to llama.cpp's approach, which spells the same axis as a GLSL
+// #define and therefore emits a separate SPIR-V module per combination.
+//
+// IDs are assigned per shader starting at 0 and must be passed by the host in
+// ascending order; vulkan_spirv.h records the declared set and GetPipeline checks
+// the count. Values are the VT_DT_* codes from vt_common.glsl. The defaults are
+// never relied upon — CastKernel always supplies both.
+layout(constant_id = 0) const uint VT_CAST_A_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_CAST_OUT_DT = VT_DT_F32;
+
 layout(push_constant) uniform Params {
   uint n;
-  uint a_dt;
-  uint out_dt;
   uint a_off;
   uint out_off;
 } p;
@@ -26,5 +41,6 @@ layout(push_constant) uniform Params {
 void main() {
   uint gid = gl_GlobalInvocationID.x;
   if (gid >= p.n) { return; }
-  VT_STORE(D32, D16, p.out_dt, p.out_off, gid, VT_LOAD(A32, A16, p.a_dt, p.a_off, gid));
+  VT_STORE(D32, D16, VT_CAST_OUT_DT, p.out_off, gid,
+           VT_LOAD(A32, A16, VT_CAST_A_DT, p.a_off, gid));
 }

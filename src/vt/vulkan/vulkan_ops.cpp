@@ -85,6 +85,11 @@ struct AddParams {
 struct UnaryParams {
   uint32_t n, a_dt, out_dt, a_off, out_off;
 };
+// vt_cast carries its dtype pair in specialization constants instead, so its
+// push block is only the shape and the two offsets.
+struct CastParams {
+  uint32_t n, a_off, out_off;
+};
 struct SiluMulParams {
   uint32_t t, d, x_dt, out_dt, x_off, out_off;
 };
@@ -108,8 +113,10 @@ static_assert(sizeof(LayerNormParams) <= 128, "push constants must fit the guara
 static_assert(sizeof(FcParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 
 template <typename P>
-void Go(const char* name, const Binder& b, const P& p, uint32_t groups) {
-  VulkanContext::Get().Dispatch(name, b.data(), b.count(), &p, sizeof(P), groups);
+void Go(const char* name, const Binder& b, const P& p, uint32_t groups,
+        const uint32_t* spec = nullptr, uint32_t spec_count = 0) {
+  VulkanContext::Get().Dispatch(name, b.data(), b.count(), &p, sizeof(P), groups, spec,
+                                spec_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -152,9 +159,13 @@ void CastKernel(Queue&, Tensor& out, const Tensor& in) {
   Binder bind;
   const uint32_t in_off = bind.Add(in, "cast: in");
   const uint32_t out_off = bind.Add(out, "cast: out");
-  UnaryParams p{static_cast<uint32_t>(n), DtypeCode(in.dtype), DtypeCode(out.dtype), in_off,
-                out_off};
-  Go("vt_cast", bind, p, FlatGroupCount(n));
+  // The dtype pair rides SPECIALIZATION CONSTANTS rather than push constants, so
+  // the per-element dtype branch is folded away at pipeline creation and each
+  // (src, dst) pair is its own cached pipeline. Ascending constantID order, which
+  // is what GetPipeline binds against the module's declared SpecIds.
+  const uint32_t spec[2] = {DtypeCode(in.dtype), DtypeCode(out.dtype)};
+  CastParams p{static_cast<uint32_t>(n), in_off, out_off};
+  Go("vt_cast", bind, p, FlatGroupCount(n), spec, 2);
 }
 
 // cpu_ops.cpp:252-264 SiluAndMulKernel.
