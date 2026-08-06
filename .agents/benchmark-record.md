@@ -12490,3 +12490,67 @@ uses indirect `sorted_token_ids` gather + fp32 `C_tmp` reduce vs vLLM's dense `m
 direct-A addressing; per-shape parity was shown at M≤8 (#46 microbench), so this is a delicate
 grouped→dense-direct-A port, not a config knob. (2) **~0.7ms/step host/sched slice**. No single
 lever reaches ≥1.0x. NEXT lever candidate: the grouped→dense-direct-A marlin decode path.
+
+## KERNEL-MARLIN-DENSE-DIRECT (#50): dense-direct-A marlin ARBITER re-run (4 same-tool runs) — the +7-9% is NOT a recoverable kernel/dispatch cost; port is a measured NO-GO (only M=8 shows a real ~+0.33ms/step signal, m_block_size_8, ~0.8% of a c8 step)
+
+The named residual-#1 lever (route the E=1 dense MXFP4/NVFP4 projections through vLLM's DENSE
+`marlin_gemm` — direct-A + `m_block_size_8` at prob_m≤8 — instead of our
+`MoeGroupedGemmNvfp4Marlin` E=1) was arbitrated per parity-lever-protocol (per-shape MEASUREMENT
+decides BEFORE a large port), NOT ported. The task's step-5 ubench ("the new dense op vs grouped at
+the model shapes — expect the +7-9% back") already exists as `dgx:~/mxfp4-nsys/mxfp4_marlin_ubench.py`
+(#46): it times the REFERENCE `apply_fp4_marlin_linear` (dense `ops.marlin_gemm`, the EXACT kernel a
+port would vendor) vs `ops.moe_wna16_marlin_gemm` E=1 (the 1:1 upstream twin of our production
+kernel) — same tool, both the oracle's compiled ops, cuda-event timed — at the Qwen3-8B **MXFP4**
+decode shapes {qkv 6144×4096, o 4096×4096, gate/up 12288×4096, down 4096×12288} × M∈{1,2,4,8}.
+Re-ran it 3× fresh on the idle GB10 under BOTH locks (worker down, free-g 93, disk unchanged 21G,
+tmux+done-marker); with #46 that is 4 same-tool runs.
+
+PER-STEP moe/dense ratio (dense = the port target; moe = our production twin; sum of 5 GEMMs ×36
+layers), 4 runs [#46, r1, r2, r3] and mean:
+| M | #46 | r1 | r2 | r3 | mean | delta_step_ms mean (moe−dense) | sign consistent? |
+|---|-----|-----|-----|-----|------|-------------------------------|------------------|
+| 1 | 1.023 | 1.008 | 0.952 | 1.006 | **0.997** | −0.030 | NO (flips ±) |
+| 2 | 0.986 | 0.983 | 1.028 | 1.032 | **1.007** | +0.057 | NO (flips ±) |
+| 4 | 1.077 | 1.023 | 0.964 | 0.975 | **1.010** | +0.071 | NO (flips ±) |
+| 8 | 1.020 | 1.016 | 1.044 | 1.077 | **1.039** | +0.327 | YES (all + ) |
+delta_step_ms per run: M=1 [+0.184,+0.061,−0.416,+0.052]; M=2 [−0.117,−0.142,+0.228,+0.258];
+M=4 [+0.617,+0.186,−0.312,−0.206]; M=8 [+0.169,+0.135,+0.367,+0.637]. Outputs match to bf16
+last-bit (maxdiff col = bf16 reduction-order near-tie, same class as the moe path's own near-tie).
+
+READING (the arbiter):
+- **M=1,2,4 (concurrencies c1/c2/c4): the port recovers ZERO.** moe/dense mean is within ±1% of
+  parity and the sign of delta_step FLIPS run-to-run (M=2 even favors MoE overall) — a true-zero
+  effect (benchmark-gate-statistics). The reference dense kernel a port would vendor is NOT faster
+  than the grouped-E1 twin we already run at these shapes.
+- **M=8 (c8) is the ONLY reproducible, mechanistically-real signal: ~+0.33ms/step, all 4 runs
+  positive.** Cause (per #46): at prob_m=8 dense picks `m_block_size_8`=TRUE (an 8-row tile) while
+  our grouped path picks `moe_block_size`=16 (m8=FALSE → a 16-row tile with 8 padding rows, ~2×
+  useful-row work). The clearest single shape is qkv M=8 (moe/dense 1.111/1.130/1.132/1.119 across
+  the 4 runs); gate/up/down partly wash so the per-STEP mean dilutes to 1.039. Magnitude: +0.33ms
+  out of a ~39.5ms c8 decode step (#46 TPOT) ≈ **0.8% of the c8 step** — recovers ~0.8pp of the
+  5.8% c8 gap and leaves c8 ≈0.95x, still BELOW 1.0x; at c1/c2/c4 it yields nothing.
+
+VERDICT = **NO-GO on the full dense-marlin port as an MXFP4 parity lever.** The +7-9% cross-tool
+figure (#47/#48 nsys-ours 120us vs torch-vLLM 113us) is the tool bias, NOT a recoverable
+kernel/dispatch cost — the same-tool per-shape arbiter (now 4 runs) reads parity/noise at M≤4 and
+only a ~0.8%-of-step M=8 sliver. Vendoring ~2000 lines of delicate dense marlin (`marlin_template.h`
+2081L + generated kernels + the `marlin_mm`/`marlin_gemm` launcher) behind a new `kMarlinDenseGemm`
+op and re-routing the CUDA-graph-captured decode through a NON-byte-exact (near-tie) path — for at
+most ~0.8pp at c8 only and nothing at c1–c4 — is gold-plating a measured near-dead hypothesis (the
+explicit #46 caution). "Never accept a ceiling" does not apply: the specific difference was FOUND
+and measured to be ~0 at M≤4. Provenance confirmed anyway: dense and MoE are genuinely separate
+`Marlin<>` templates (dense `MARLIN_KERNEL_PARAMS` has `lda`+`max_shared_mem`, direct A; moe has
+`sorted_token_ids/expert_ids/topk_weights`), so a real port IS ~2000 lines, not a shim — the cost
+side of the ledger is high, the win side is ~0.
+
+RESIDUAL MAP (refined): the recoverable slivers are NOT the dense port. (a) **M=8-only, CHEAP:** force
+`moe_block_size`=8 (not 16) for the E1 dense case in `dense_nvfp4_gemm.h::DenseAlignFor` →
+engages our ALREADY-VENDORED `m_block_size_8` grouped kernels (kernel_selector lines 3–8/33–38) →
+captures the ~0.33ms/step at c8 with a ~5-line change and NO new vendoring; its own small near-tie
++ SACRED gate. Legitimate because we run E1 (free to pick the block heuristic); recovers ~0.8pp of
+c8 only. (b) the per-call defensive `d.b.Memset(ws)` in `MatmulNvfp4MarlinD`/`GateUpFusedMarlinD`
+(marlin leaves its workspace zeroed; vLLM dense+moe both reuse without re-zeroing) — one tiny
+launch/GEMM, micro. (c) the **~0.7ms/step host/sched slice** — the real remaining term, host-side,
+not a kernel port. No single lever reaches ≥1.0x; the MXFP4 parity goal stays BELOW-FLOOR (best c8
+0.942). Evidence: `dgx:~/mxfp4-nsys/{mxfp4_marlin_ubench.py,ubench.log,ubench_3x.log}`. Box left
+clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
