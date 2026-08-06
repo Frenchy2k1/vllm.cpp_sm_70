@@ -332,8 +332,16 @@ VulkanContext::VulkanContext() {
   // reallocated. (llama.cpp grows a vector of pools instead; a fixed pool is
   // enough here because dispatch is synchronous and sets are re-updated.)
   constexpr uint32_t kMaxBindings = 12;  // llama.cpp's MAX_PARAMETER_COUNT
+  // ONE DESCRIPTOR SET PER PIPELINE, AND PIPELINES NOW OUTNUMBER MODULES.
+  // Since VK-A1 a module can be specialized into several pipelines — vt_cast
+  // alone reaches one per (src, dst) dtype pair — and each allocates its own set
+  // from this pool. Sizing it by module count would exhaust the pool on the Nth
+  // specialization and fail in vkAllocateDescriptorSets, far from the cause. The
+  // headroom factor is deliberate slack, not a computed bound; GetPipeline
+  // reports pool exhaustion with the kernel name if it is ever hit.
+  constexpr uint32_t kSpecializationHeadroom = 16;
   const uint32_t kernels =
-      static_cast<uint32_t>(sizeof(kSpirvModules) / sizeof(kSpirvModules[0]));
+      static_cast<uint32_t>(kSpirvModuleCount) * kSpecializationHeadroom;
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   pool_size.descriptorCount = kernels * kMaxBindings;
@@ -453,8 +461,8 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   auto device = Unpack<VkDevice>(device_);
 
   const SpirvModule* module = nullptr;
-  for (const SpirvModule& m : kSpirvModules) {
-    if (name == m.name) { module = &m; break; }
+  for (size_t i = 0; i < kSpirvModuleCount; ++i) {
+    if (name == kSpirvModules[i].name) { module = &kSpirvModules[i]; break; }
   }
   VT_CHECK(module != nullptr,
            "vulkan: no committed SPIR-V for kernel '" + name +
@@ -546,7 +554,12 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   dsai.descriptorPool = Unpack<VkDescriptorPool>(descriptor_pool_);
   dsai.descriptorSetCount = 1;
   dsai.pSetLayouts = &p.set_layout;
-  Check(vk.vkAllocateDescriptorSets(device, &dsai, &p.set), "vkAllocateDescriptorSets");
+  // Named, because the plausible cause is pool exhaustion from specialization
+  // (one set per PIPELINE, and a module can have many), which is otherwise a bare
+  // VkResult a long way from its reason.
+  Check(vk.vkAllocateDescriptorSets(device, &dsai, &p.set),
+        ("vkAllocateDescriptorSets for pipeline '" + key +
+         "' (descriptor pool may be exhausted by specialized pipelines)").c_str());
 
   return cache.emplace(key, p).first->second;
 }
