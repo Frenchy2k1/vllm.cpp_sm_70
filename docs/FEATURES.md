@@ -201,7 +201,7 @@ the registered engine forward.
 | CPU (x86 AVX-512, Arm i8mm) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | ☐ (device type + capability parse only) | ✅ | ✅ | ✅ |
+| ROCm | ☐ (W0 skeleton, HIP never compiled) | ✅ | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
@@ -255,7 +255,8 @@ abstraction, and `world_size == 1` stays byte-identical.
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |
 | Embedding / reranking models | Engine side only | Pooler and runner path landed, no model architecture registered |
-| ROCm, XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan only |
+| ROCm | W0 skeleton, unbuilt | Backend + platform + 1 op (RmsNorm); the HIP sources have never been compiled by anyone (no AMD board here). Open: [ROCM.md](ROCM.md), [#41](https://github.com/mudler/vllm.cpp/issues/41) |
+| XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | Scoped, spike owed | No profiling; KV pool is a hand-typed `--num-blocks`. Target: auto-size to the declared workload, optional total-footprint cap, refuse before allocating |
 

@@ -9,24 +9,24 @@ benchmark record. Budget: 100 lines.
 
 ## Live claims
 
-Working head: `bench/qwen35-upstream-rebenchmark-20260805`, one benchmark
-checkpoint on `upstream/main` at `59674cf1d`.
+Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
+`bench/qwen35-upstream-rebenchmark-20260805` on `upstream/main` @ `59674cf1d`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (byte-exact, default; `VT_LAGUNA_RESIDENT_BF16W`) | vLLM K-run when convenient |
-| DeepSeek-V4-Flash decode | **Closed: beats ds4 1.144x** (`VT_V4_RESIDENT_W`, byte-exact); phase-2 residency NEG, default-OFF | — |
+| Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
-| Invocation-parity prevention | CI guard + AGENTS.md checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
+| Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | **vision→cond scatter WIRED+gated; fl2va COHERENT via encoder path** (`H3-VISION-SCATTER` PR#90; indices {8,16,24} confirmed) | ref2va grids; residual = ref2va ref-row assembly (§8.9) |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **e2e RUNS** (bf16-resident §13): 13/13·656. Token gate **NEAR-TIE 106/128** | device GDN/MLA islands; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
-| CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
+| CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
 | `/v1/videos` OpenAI shape (`row/SERVE-VIDEOS-OAI`) | **PR open**: Sora `model`/`size`/`seconds` + `GET /{id}/content`, CPU-gated | Follow-up row: reference conditioning |
+| `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.

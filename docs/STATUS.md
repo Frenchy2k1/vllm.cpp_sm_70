@@ -396,8 +396,10 @@ The correctness form and the full D0-D14 measured chronology live in
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
 Vulkan (16 native kernels, 71 on the CPU tier; opt-125m
 runs e2e token-exact;
-[campaign](../.agents/specs/vulkan-full-support.md)), and the full tool-calling
-template surface. **Scale-out / distributed execution is scoped but unbuilt**
+[campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 skeleton:
+backend, platform, 1 of 106 ops; **its HIP sources have never been compiled by
+anyone** — weaker than "build-supported", since no AMD board is here;
+[guide](ROCM.md)), and the full tool-calling template surface. **Scale-out / distributed execution is scoped but unbuilt**
 (2026-07-28): the engine is single-GPU today — no NCCL / tensor-parallel /
 process-group code in `src/`. One `vt::` collective / process-group abstraction with
 backend-specific transports (NCCL / RDMA / MLX-ring) covers all three legs —
@@ -1398,28 +1400,24 @@ As of 2026-07-28, the datacenter-Blackwell `sm_100a` fan-out gained its first
 FAST-PATH body: the **NVFP4 tcgen05 block-scaled GEMM is BUILD-VERIFIED**
 (`DERIVED+BUILD-VERIFIED, testing-welcome`). A faithful 1:1 type-port of vLLM's
 `Fp4GemmSm100` (`ArchTag=Sm100` + `KernelScheduleAuto` — CUTLASS 4.5.0 selects the
-5th-gen tcgen05 collective) compiles single-arch `100a` on nvcc 13.0 `-Werror`-equiv
-0 warnings and `cuobjdump` shows a real `sm_100a` cubin; it is gated by its own
-`cutlass-nvfp4-sm100` cell (enabled only for `100a`, so the GB10 `sm_121a` gate
-build is byte-unchanged). The native consumer `mma.sync kind::mxf4nvf4` fp4
+5th-gen tcgen05 collective) compiles single-arch `100a` `-Werror`-clean and
+`cuobjdump` shows a real `sm_100a` cubin; its own `cutlass-nvfp4-sm100` cell
+gates it, so the GB10 `sm_121a` gate build is byte-unchanged. The native consumer `mma.sync kind::mxf4nvf4` fp4
 path stays `sm_12x`-only (it does not port to sm_100's tcgen05). **No B200/sm_100
-board ran it**: a green compile + SASS is not execution evidence, runtime
-support, or vLLM-competitive; the other sm_100 fast paths (CUTLASS C3x FP8,
-MoE, MXFP4, MLA) remain scoped.
+board ran it**: a green compile + SASS is not execution evidence; the other
+sm_100 fast paths (CUTLASS C3x FP8, MoE, MXFP4, MLA) remain scoped.
 
 As of 2026-07-28, the Hopper `sm_90a` fan-out gained its first FAST-PATH body: the
 **CUTLASS C3x FP8 (W8A8) scaled-mm GEMM is BUILD-VERIFIED**
 (`DERIVED+BUILD-VERIFIED, testing-welcome`). A faithful 1:1 type-port of vLLM's
 `cutlass_3x_gemm_sm90_fp8` (`ArchTag=Sm90` + `KernelTmaWarpSpecialized*FP8FastAccum`
 — CUTLASS 4.5.0 emits the 4th-gen wgmma/TMA warp-specialized collective) compiles
-single-arch `90a` on nvcc 13.0 `-Werror` 0 warnings and `cuobjdump` shows a real
-`sm_90a` cubin (ptxas even names `wgmma.mma_async` in the emitted kernels); it is
-gated by its own `scaledmm-c3x-sm90` feature cell (enabled only for `90a`, so the
-GB10 `sm_121a` gate build is byte-unchanged). The consumer `sm_12x` FP8 scaled-mm
+single-arch `90a` `-Werror`-clean and `cuobjdump` shows a real `sm_90a` cubin
+(ptxas names `wgmma.mma_async` in it); its own `scaledmm-c3x-sm90` cell gates it,
+so the GB10 `sm_121a` gate build is byte-unchanged. The consumer `sm_12x` FP8 scaled-mm
 body (`ArchTag=Sm120`) is untouched. **No H100/H200/sm_90 board ran it** — a green
-compile + SASS is not execution evidence, not runtime support, and not
-vLLM-competitive; the sm90 int8/blockwise C3x legs and the other Hopper fast paths
-(FA3, Machete, CUTLASS MoE) remain scoped.
+compile + SASS is not execution evidence; the sm90 int8/blockwise C3x legs and
+the other Hopper fast paths (FA3, Machete, CUTLASS MoE) remain scoped.
 
 As of 2026-07-28, the datacenter-Blackwell `sm_100a` fan-out gained its second
 FAST-PATH body (after the DC1 NVFP4 tcgen05 GEMM): the **CUTLASS C3x FP8 (W8A8)

@@ -1,12 +1,20 @@
 # ROCm (AMD GPU) backend — contributor guide
 
-**State today: no ROCm code exists.** `DeviceType` has no `kROCM`, there is no
-HIP build switch, no platform, no kernel. This page exists because several
-people offered to bring it up in
+**State today: the W0 skeleton is committed, and no HIP source in it has ever
+been compiled.** `kROCM` exists, `-DVLLM_CPP_HIP=ON` exists, and there is a
+`vt::Backend`, a `Platform`, and exactly one registered kernel (RmsNorm). The
+plain-C++ parts compile and are tested here; the three `.hip` files have not been
+built by anyone, because no maintainer machine has an AMD GPU. **Your first HIP
+compile is genuinely the first**, and a failure is the expected outcome rather
+than a sign you did something wrong.
+
+This page exists because several people offered hardware in
 [issue #41](https://github.com/mudler/vllm.cpp/issues/41), and it answers the
 three questions that decide whether that goes anywhere: what a backend actually
 *is* in this codebase, what to write first on the hardware you own, and what
-"done" means.
+"done" means. The design record behind the skeleton, including what was
+deliberately left out, is
+[.agents/specs/rocm-backend-w0.md](../.agents/specs/rocm-backend-w0.md).
 
 Everything here is checked against the tree on 2026-08-06. Where a number is
 counted, the command that counts it is given, because these numbers drift.
@@ -22,26 +30,43 @@ Three structural facts, in the order they matter:
    one enum and one switch, both in `include/vt/device.h`. That is the whole
    core edit.
 2. **Our CUDA kernels are ports of vLLM's `csrc/`, and upstream compiles that
-   same `csrc/` for ROCm through a hipify pass** (`cmake/hipify.py` in the vLLM
-   tree). So ROCm is not the Metal/Vulkan situation, where every kernel is
-   written from scratch against a foreign API. Most of `src/vt/cuda/` is HIP
-   source that has not been hipified yet. Upstream also ships RDNA3-specific
-   kernels in `csrc/rocm/` (`q_gemm_rdna3.cu`, `moe_q_gemm_rdna3.cu`,
-   `skinny_gemms.cu`), and every board offered in #41 so far is RDNA3.
+   same `csrc/` for ROCm through a hipify pass.** So ROCm is not the
+   Metal/Vulkan situation, where every kernel is written from scratch against a
+   foreign API. Most of `src/vt/cuda/` is HIP source that has not been hipified
+   yet. Upstream also ships RDNA3-specific kernels in `csrc/rocm/`
+   (`q_gemm_rdna3.cu`, `moe_q_gemm_rdna3.cu`, `skinny_gemms.cu`), and every board
+   offered in #41 so far is RDNA3.
+
+   One caveat, so nobody loses an afternoon to it: vLLM's own `cmake/hipify.py`
+   imports `torch.utils.hipify`, so it is a **torch-dependent** tool and we
+   cannot reuse it. Your route is ROCm's `hipify-clang`, or hand-translation.
+   `src/vt/rocm/rocm_rmsnorm.hip` is a hand-translation of
+   `src/vt/cuda/cuda_ops.cu:96-126` written out deliberately so the two can be
+   read side by side as a worked example of what the pass does.
 3. **On unified-memory parts, a model can run correctly with zero ROCm
    kernels.** See §3. This is the single biggest lever for getting started, and
    it splits the work by hardware rather than by skill.
 
 ## 2. What a backend is, file by file
 
-| Seam | File to write | Copy from | Size of the template |
-|---|---|---|---|
-| Device enum | `include/vt/device.h` (edit) | the existing entries | 2 lines: `kROCM = 5`, its `DeviceTypeName` case, `kNumDeviceTypes` |
-| Runtime backend | `src/vt/rocm/rocm_backend.cpp` | [`src/vt/cpu/cpu_backend.cpp`](../src/vt/cpu/cpu_backend.cpp) | **36 lines.** `vt::Backend` has exactly 6 pure virtuals: `Alloc`, `Free`, `Memset`, `Copy`, `CreateQueue`, `UnifiedMemory`, plus a static `Registrar` |
-| Platform | `src/vllm/platforms/rocm.cpp` | [`src/vllm/platforms/vulkan.cpp`](../src/vllm/platforms/vulkan.cpp) | **96 lines**, and it documents the reason behind every value it returns. Mirror `vllm/platforms/rocm.py` |
-| Op table | `src/vt/rocm/rocm_ops.hip` | [`src/vt/vulkan/vulkan_ops.cpp`](../src/vt/vulkan/vulkan_ops.cpp) | `RegisterOp(OpId::kX, DeviceType::kROCM, fn)`, one line per kernel |
-| Attention | one self-registering TU | [`include/vllm/v1/attention/registry.h`](../include/vllm/v1/attention/registry.h) | one `RegisterAttentionBackend(kROCM, name, factory)` + the name in your platform's `get_attn_backend_priority()`. Zero selector, model or runner edits |
-| Build | `VLLM_CPP_HIP` tri-state | the `VLLM_CPP_VULKAN` block: `CMakeLists.txt:50`, `:209-222`, `:916` | AUTO should resolve OFF until it works |
+These now exist. The column that matters is the last one: what has been checked
+on a real machine, and what has not.
+
+| Seam | File | Verified? |
+|---|---|---|
+| Device enum | [`include/vt/device.h`](../include/vt/device.h) | ✅ compiled; the enum forced exactly one switch site tree-wide |
+| — | [`include/vt/rocm/rocm_arch.h`](../include/vt/rocm/rocm_arch.h) — gfx name → `(major, minor)`, ported 1:1 from `rocm.py:223` | ✅ **unit-tested**, 40 assertions, no GPU needed |
+| Runtime backend | [`src/vt/rocm/rocm_backend.hip`](../src/vt/rocm/rocm_backend.hip) — the 6 `vt::Backend` virtuals | ❌ **never compiled** |
+| Op table | [`src/vt/rocm/rocm_ops.hip`](../src/vt/rocm/rocm_ops.hip) — one `RegisterOp` line | ❌ never compiled |
+| Kernel | [`src/vt/rocm/rocm_rmsnorm.hip`](../src/vt/rocm/rocm_rmsnorm.hip) | ❌ never compiled |
+| Platform | [`src/vllm/platforms/rocm.cpp`](../src/vllm/platforms/rocm.cpp) — mirrors `vllm/platforms/rocm.py` | ✅ compiles `-Werror` (plain C++, object-compiled in every build as a bit-rot guard); never *run* |
+| Attention | *(none yet — `get_attn_backend_priority()` returns empty)* | — |
+| Build | `VLLM_CPP_HIP` in [`CMakeLists.txt`](../CMakeLists.txt) | ✅ the OFF path and the fail-without-hipcc path |
+| Test | [`tests/vt/test_rocm_backend.cpp`](../tests/vt/test_rocm_backend.cpp) | ✅ compiles (same guard) — ❌ never run |
+
+So the shape is decided and the parts that hold a *decision* are tested; what
+you are validating is the API glue. Adding your own op is one line in
+`rocm_ops.hip` plus the kernel — no selector, model or runner edit anywhere.
 
 Op coverage as of 2026-08-06 (`OpId` has 106 entries):
 
@@ -51,6 +76,7 @@ Op coverage as of 2026-08-06 (`OpId` has 106 entries):
 | CPU | 83 |
 | Metal | 19 |
 | Vulkan | 8 |
+| **ROCm** | **1** (RmsNorm) |
 
 Recount before quoting:
 
@@ -91,9 +117,9 @@ performance measurement**. A non-zero value means you benchmarked the CPU.
 
 | Hardware | Arch | Memory | Start here |
 |---|---|---|---|
-| Strix Halo / GTR9 Pro 128GB | gfx1151 | unified | M0 + M1 + M2 via the reference tier. First model runs with no kernel written. Also the closest analogue to GB10, so the residency-policy questions in §5 M1 are yours |
-| Radeon 780M iGPU | gfx1103 | shared | Same path, smaller models. Ideal for M0/M1 review and for finding every place a "CUDA" assumption is really an "NVIDIA" assumption. A vLLM-ROCm oracle is unlikely here, so M4 will stay PENDING on this box, which is fine and must be said rather than papered over |
-| 4x 7900 XTX | gfx1100 | discrete | The kernel path: the hipify pass over `src/vt/cuda/` plus hipBLASLt routing. The only board that can host a vLLM-ROCm oracle for M4 and, later, multi-GPU TP |
+| Strix Halo / GTR9 Pro 128GB | gfx1151 | unified | **Build M0/M1, then M2.** Once it compiles, the reference tier means a model runs with no further kernel written. Closest analogue to GB10, so the residency-policy question in §6 is yours |
+| Radeon 780M iGPU | gfx1103 | shared | **Build M0/M1**, same path, smaller models. Best position to find every place a "CUDA" assumption is really an "NVIDIA" assumption. A vLLM-ROCm oracle is unlikely on this board, so M4 stays PENDING there — fine, and to be said rather than papered over |
+| 4x 7900 XTX | gfx1100 | discrete | **Build M0/M1, then the kernel path**, since the reference tier cannot install on a dGPU and a model needs real kernels. The only board that can host a vLLM-ROCm oracle for M4 and, later, multi-GPU TP — the backend already registers all four at `Device{kROCM, i}` |
 
 These do not collide. Two people can be on M0/M1/M2 on unified parts while a
 third does the hipify pass, and the discrete board is what turns the result into
@@ -101,21 +127,20 @@ a gated backend.
 
 ## 5. Milestones as concrete PRs
 
-**M0 — build.** Tri-state `VLLM_CPP_HIP`, `hipcc`/ROCm detection, target `gfx`
-arch, and the CPU/portable layer compiling under it. Acceptance: configure
-prints what it enabled, `ctest` still green on a non-HIP build. Nothing device
-runs yet.
+**M0 — build. WRITTEN, unverified.** Tri-state `VLLM_CPP_HIP`, hipcc detection
+that fails loudly, `VLLM_CPP_HIP_ARCHITECTURES`, `ROCM_PATH`. What remains is
+for someone to run it. Acceptance: `cmake -DVLLM_CPP_HIP=ON` configures and
+`cmake --build` produces a binary. **This is the open task.**
 
-**M1 — platform + backend.** `src/vt/rocm/rocm_backend.cpp` and
-`src/vllm/platforms/rocm.cpp`, both self-registering, plus the `kROCM` enum
-edit. Mirror `vllm/platforms/rocm.py`: `get_device_capability` (upstream maps
-gfx1100 to (11,0), gfx942 to (9,4), see `rocm.py:233`), `supported_dtypes`,
-`residency_policy` (does freeing host weights after upload free the only copy?
-on a unified part, yes), and `get_attn_backend_priority` (return **empty** until
-a kernel exists; an honest empty list makes selection throw loudly instead of
-handing back a backend whose kernels are absent). Acceptance:
-`tests/vt/test_backend.cpp` and `tests/vt/test_backend_cross_device.cpp` pass on
-the device, and `CurrentPlatform()` picks ROCm on an AMD box.
+**M1 — platform + backend. WRITTEN, unverified.** `rocm_backend.hip`,
+`platforms/rocm.cpp`, the `kROCM` enum, the capability parse (tested), and one
+registered op. Acceptance: `ctest -R 'rocm|cross_device'` green on the device —
+which also means the RmsNorm kernel matched the CPU oracle at NMSE ≤ 5e-4, so
+seam 3 is proven end to end.
+
+Expect M0/M1 to need fixes. A compile error in `rocm_backend.hip` is the single
+most valuable thing anyone can report right now, and it belongs in this repo
+rather than in a fork.
 
 **M2 — first model end to end.** On a unified part this is mostly free: assert
 `ReferenceTierEligible(kROCM)` and run a small dense model. Acceptance: greedy
