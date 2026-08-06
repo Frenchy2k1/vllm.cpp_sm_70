@@ -388,9 +388,10 @@ The correctness form and the full D0-D14 measured chronology live in
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed — see the capability table; not yet usable
-end-to-end), multi-GPU, Vulkan (14 native kernels, 73 ops on the CPU tier, no
-model run e2e; [campaign](../.agents/specs/vulkan-full-support.md)), and the
-full tool-calling template surface. **Scale-out /
+end-to-end), multi-GPU, Vulkan (16 native kernels, 71 on the CPU tier; opt-125m
+e2e token-exact, unbenched;
+[campaign](../.agents/specs/vulkan-full-support.md)), and
+the full tool-calling surface. **Scale-out /
 distributed execution is scoped but unbuilt** (spike, 2026-07-28): the engine is
 single-GPU today (verified — no NCCL / tensor-parallel / process-group code in
 `src/`). A single-dimension design is on record covering all three legs —
@@ -1340,9 +1341,9 @@ portable-kernels-only (fp8/fp4/CUTLASS/Marlin/FA2 fast paths resolve EMPTY).
 non-GB10 runtime proof.** vllm.cpp was built natively for `sm_110` on an NVIDIA
 Jetson Thor board (aarch64, JetPack R38, nvcc 13.0, `compute_cap=11.0`; cutlass
 absent and not needed), Release `-Werror` 0 warnings, 16 TUs of real `sm_110`
-SASS. It then ran the Llama-3.2-1B
-paged-engine greedy gate and was **STRICT token-exact 12/16 prompts (192/192
-tokens) vs the committed vLLM oracle golden** (every vLLM-deterministic prompt),
+SASS. It ran the Llama-3.2-1B paged-engine
+greedy gate and was **STRICT token-exact 12/16 prompts (192/192 tokens) vs the
+committed vLLM oracle golden** (every vLLM-deterministic prompt),
 **15/16 bit-identical to the GB10 `sm_121a` anchor**; the remaining 4/16 are the
 ratified bf16 near-tie prompts (committed teacher-forced gap 0.000 nats). Scope
 is precise: it covers only the portable bf16 path that ran; the fp8/fp4/CUTLASS
