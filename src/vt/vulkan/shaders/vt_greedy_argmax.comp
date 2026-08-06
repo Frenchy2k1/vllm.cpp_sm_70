@@ -1,0 +1,57 @@
+#version 450
+// vt::GreedyArgmax — per-row argmax over logits.
+// Ported from src/vt/cpu/cpu_sample.cpp GreedyArgmaxKernel (:40-56).
+//
+// TIE-BREAKING IS THE CONTRACT, not an implementation detail. The CPU kernel
+// scans with a STRICT `>` (cpu_sample.cpp:49), so the FIRST occurrence of the
+// maximum wins. Greedy decoding is compared token-for-token against a vLLM
+// golden, so a different tie-break is a different token and a failed gate, not a
+// rounding difference.
+//
+// ONE INVOCATION PER ROW, scanning the vocabulary sequentially. That is O(V) on a
+// single lane and slow for a 150k vocabulary, and it is the correct starting
+// point anyway: a parallel tree reduction has to carry the index alongside the
+// value AND break ties toward the lower index at every merge step to preserve the
+// contract above, which is a separate change with its own gate. Decode rows are
+// few (one per sequence), so the row dimension is not where the parallelism is
+// missing.
+//
+// logits are f32 by contract (cpu_sample.cpp:42 reads Ptr<float>), so there is no
+// dtype axis here.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Lb32 { uint v[]; } L32;
+layout(binding = 1) buffer Ob32 { uint v[]; } O32;
+
+layout(push_constant) uniform Params {
+  uint n;           // rows
+  uint v;           // vocabulary
+  uint logits_off;
+  uint out_off;
+} p;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= p.n) { return; }
+
+  uint row = (p.logits_off >> 2) + i * p.v;
+  float best_v = uintBitsToFloat(L32.v[row]);
+  uint best = 0u;
+  for (uint j = 1u; j < p.v; ++j) {
+    float x = uintBitsToFloat(L32.v[row + j]);
+    if (x > best_v) {  // strict `>`: first occurrence of the max wins
+      best_v = x;
+      best = j;
+    }
+  }
+
+  // token_ids is i64 (cpu_sample.cpp:43 writes Ptr<int64_t>). Write the low word
+  // and zero the high one: an argmax result is a vocabulary index, non-negative
+  // and far below 2^31, so no 64-bit integer support is needed at our 1.1 floor.
+  uint out_base = (p.out_off >> 2) + 2u * i;
+  O32.v[out_base] = best;
+  O32.v[out_base + 1u] = 0u;
+}

@@ -101,6 +101,7 @@ class CommittedArtifact(unittest.TestCase):
     SPECIALIZED = {
         "vt_cast": "src and dst dtype",
         "vt_matmul": "a/b/out dtype plus the b orientation",
+        "vt_embedding": "table/out dtype plus the id width",
     }
 
     def test_specialized_shaders_declare_their_constants(self):

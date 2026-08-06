@@ -141,6 +141,14 @@ Tensor T2(void* p, Device d, int64_t r, int64_t c) {
 Tensor T1(void* p, Device d, int64_t n) {
   return Tensor::Contiguous(p, DType::kF32, d, {n});
 }
+// Integer operands: embedding ids (i32 or i64, both accepted by vt::Embedding)
+// and sampler token ids (i64 by contract).
+Tensor TI32(void* p, Device d, int64_t n) {
+  return Tensor::Contiguous(p, DType::kI32, d, {n});
+}
+Tensor TI64(void* p, Device d, int64_t n) {
+  return Tensor::Contiguous(p, DType::kI64, d, {n});
+}
 
 }  // namespace
 
@@ -343,6 +351,105 @@ TEST_CASE("elementwise ops match the CPU oracle within NMSE <= 5e-4") {
       Tensor to = T2(dsilu.ptr(), d, kRows, kCols / 2);
       vt::SiluAndMul(q, to, ta);
       CHECK(Nmse(ref_silu, dsilu.Download()) <= kNmseTol);
+    }
+    dev.DestroyQueue(q);
+  }
+  cpu.DestroyQueue(cq);
+}
+
+TEST_CASE("Embedding gather and greedy argmax match the CPU oracle EXACTLY") {
+  // Neither op is arithmetic, so neither gets the NMSE tier: a gather must move
+  // the exact bytes, and an argmax must pick the exact index.
+  constexpr int64_t kVocab = 61;
+  constexpr int64_t kHidden = 40;
+  constexpr int64_t kTokens = 7;
+
+  const std::vector<float> table = RandomVec(kVocab * kHidden, 501);
+  // Ids chosen to include 0 and the last row, and to REPEAT — a gather that
+  // accidentally consumed ids positionally would pass on distinct ids.
+  const std::vector<int32_t> ids32 = {0, 60, 13, 13, 1, 59, 0};
+  std::vector<int64_t> ids64(ids32.begin(), ids32.end());
+
+  // Logits with a DELIBERATE TIE: row 0 has its maximum twice, at columns 2 and
+  // 5. The contract (cpu_sample.cpp:49, strict `>`) is that the FIRST wins, so a
+  // kernel that used `>=` or a tie-indifferent tree reduction returns 5 and fails
+  // here. That is a different token, not a rounding difference.
+  constexpr int64_t kRows = 3;
+  std::vector<float> logits(kRows * kVocab, 0.0f);
+  for (int64_t r = 0; r < kRows; ++r) {
+    for (int64_t c = 0; c < kVocab; ++c) logits[r * kVocab + c] = -1.0f * float(c + 1);
+  }
+  logits[0 * kVocab + 2] = 9.0f;
+  logits[0 * kVocab + 5] = 9.0f;   // tie with column 2; column 2 must win
+  logits[1 * kVocab + 60] = 5.0f;  // last column
+  logits[2 * kVocab + 0] = 5.0f;   // first column
+
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> ctable = table, clogits = logits;
+  std::vector<int32_t> cids = ids32;
+  std::vector<float> ref_emb(kTokens * kHidden);
+  std::vector<int64_t> ref_tok(kRows);
+  {
+    Tensor tt = T2(ctable.data(), cd, kVocab, kHidden);
+    Tensor ti = TI32(cids.data(), cd, kTokens);
+    Tensor to = T2(ref_emb.data(), cd, kTokens, kHidden);
+    vt::Embedding(cq, to, tt, ti);
+    Tensor tl = T2(clogits.data(), cd, kRows, kVocab);
+    Tensor ttok = TI64(ref_tok.data(), cd, kRows);
+    vt::GreedyArgmax(cq, ttok, tl);
+  }
+  REQUIRE(ref_tok[0] == 2);  // the oracle itself must honour the tie-break
+
+  for (DeviceType dt : RegisteredDevices()) {
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+
+    if (OpAvailable(vt::OpId::kEmbedding, dt)) {
+      DevBuf dtable(dev, q, kVocab * kHidden), demb(dev, q, kTokens * kHidden);
+      dtable.Upload(table);
+      // i32 and i64 ids are DIFFERENT index paths, so both are exercised.
+      for (bool wide : {false, true}) {
+        CAPTURE(wide);
+        void* dids = dev.Alloc(kTokens * (wide ? sizeof(int64_t) : sizeof(int32_t)));
+        if (wide) {
+          dev.Copy(q, dids, ids64.data(), kTokens * sizeof(int64_t));
+        } else {
+          dev.Copy(q, dids, ids32.data(), kTokens * sizeof(int32_t));
+        }
+        dev.Synchronize(q);
+        Tensor tt = T2(dtable.ptr(), d, kVocab, kHidden);
+        Tensor ti = wide ? TI64(static_cast<int64_t*>(dids), d, kTokens)
+                         : TI32(static_cast<int32_t*>(dids), d, kTokens);
+        Tensor to = T2(demb.ptr(), d, kTokens, kHidden);
+        vt::Embedding(q, to, tt, ti);
+        dev.Synchronize(q);
+        const std::vector<float> got = demb.Download();
+        // A gather moves bytes; equality is exact, not NMSE.
+        CHECK(std::memcmp(ref_emb.data(), got.data(), ref_emb.size() * sizeof(float)) == 0);
+        dev.Free(dids);
+      }
+    }
+
+    if (OpAvailable(vt::OpId::kGreedyArgmax, dt)) {
+      DevBuf dlog(dev, q, kRows * kVocab);
+      dlog.Upload(logits);
+      void* dtok = dev.Alloc(kRows * sizeof(int64_t));
+      Tensor tl = T2(dlog.ptr(), d, kRows, kVocab);
+      Tensor ttok = TI64(static_cast<int64_t*>(dtok), d, kRows);
+      vt::GreedyArgmax(q, ttok, tl);
+      dev.Synchronize(q);
+      std::vector<int64_t> got(kRows);
+      dev.Copy(q, got.data(), dtok, kRows * sizeof(int64_t));
+      dev.Synchronize(q);
+      for (int64_t r = 0; r < kRows; ++r) {
+        CAPTURE(r);
+        CHECK(got[r] == ref_tok[r]);
+      }
+      dev.Free(dtok);
     }
     dev.DestroyQueue(q);
   }
