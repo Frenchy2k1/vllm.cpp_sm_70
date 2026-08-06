@@ -90,6 +90,24 @@ are our reading of their documented behavior, not measurements.
 architectures. The full per-model state, including which are oracle-blocked, is
 in [STATUS.md](STATUS.md) and `.agents/model-matrix.md`.
 
+The marks above are the accurate ones. The 2026-08-06 live-state audit moved
+**10** rows off a stale `ACTIVE` claim to `READY`: 3 model, 3 engine, 2 kernel,
+1 quantization and 1 backend. For the MODEL rows `check-model-checklist.py` then
+demotes the INTERNAL mark in `.agents/model-matrix.md` from `✅` to `🚧`,
+because `✅` is illegal at `READY`. That is a lifecycle-contract artifact:
+`READY` is the state contracts' legality floor for a row with no Git-visible
+claim, never a statement about capability. Every one of the ten carries in-row
+anchors asserting a passing gate. No capability changed, no gate was lost, and
+these public marks are deliberately NOT demoted to match.
+
+The same reasoning covers the Multimodal marks below: `Video ✅
+correctness-gated` and `Audio ✅ correctness-gated` rest on
+`ENG-MM-VIDEO-FORWARD` and `ENG-MM-AUDIO-ENCODER`, two of the three engine rows
+the audit moved. Their gates (video-processor 41/41, A2 encoder-tower 203/203)
+still pass and are still anchored in `.agents/engine-matrix.md`. No checker
+couples this page to that matrix, so the marks stay `✅` by decision, not by
+oversight.
+
 ## Multimodal
 
 | Input | vllm.cpp | vLLM | SGLang | llama.cpp |

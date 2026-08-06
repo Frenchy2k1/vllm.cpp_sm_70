@@ -61,6 +61,7 @@ SUITES=(
   test_check_protocol_consistency
   test_check_state_order
   test_check_now_current
+  test_audit_live_rows
 )
 
 failed=()
@@ -98,6 +99,21 @@ done
 
 run "ready-for-helper" python3 scripts/ready-for-helper.py --check
 run "upstream-inventory" python3 scripts/upstream-inventory.py --check
+# Every ACTIVE row still has real Git evidence behind it. Wired only AFTER the
+# record was repaired (P0), so it never had to be relaxed to pass: a red here
+# means the record drifted, never that the gate is too strict.
+#
+# It is UNCONDITIONAL, and that is the deliberate call. The audit aborts when
+# origin/main does not resolve (a clone whose remote is not named `origin`, a
+# shallow/detached checkout), so preflight goes RED there rather than skipping.
+# A skip would have to survive the "All gates green." banner below, and a green
+# preflight that never verified the record is the one unacceptable outcome --
+# the same reason audit-live-rows.py refuses to treat absence of information as
+# absence of work. The repair is one command and the abort message names it, so
+# the red is actionable. Preflight itself must NOT fetch: it is documented above
+# as never writing anything, and a gate that mutates refs to make itself pass is
+# exactly the shape this protocol forbids.
+run "audit-live-rows" python3 scripts/audit-live-rows.py --check
 
 echo "Mutation suites:"
 for suite in "${SUITES[@]}"; do
