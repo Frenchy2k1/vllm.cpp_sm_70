@@ -38,6 +38,7 @@ from tools.bench.online_gate import (
     POINTS,
     REPETITIONS,
     VLLM_ORACLE_VERSION,
+    points_for,
     precise_max_concurrent_requests,
     validate_raw_result,
     _fingerprint_tree,
@@ -594,7 +595,7 @@ def _corpus_reasons(evidence_root: pathlib.Path, model: str) -> list[str]:
         files = manifest.get("files")
         expected = {
             (concurrency, repetition): requests
-            for concurrency, requests in POINTS
+            for concurrency, requests in points_for(model)
             for repetition in REPETITIONS
         }
         if not isinstance(files, list):
@@ -732,7 +733,7 @@ def summarize_evidence(
         (model, engine, concurrency)
         for model in selected_models
         for engine in ENGINES
-        for concurrency, _ in POINTS
+        for concurrency, _ in points_for(model)
     }
     missing_groups = sorted(expected_groups - set(grouped))
     campaign_reasons.extend(
@@ -763,7 +764,7 @@ def summarize_evidence(
     pair_reasons: dict[tuple[str, int, int], list[str]] = defaultdict(list)
     output_text_diagnostics: list[dict[str, Any]] = []
     for model in selected_models:
-        for concurrency, _ in POINTS:
+        for concurrency, _ in points_for(model):
             per_engine = {
                 engine: {rep: run for rep, run in grouped.get((model, engine, concurrency), [])}
                 for engine in ENGINES
@@ -879,7 +880,7 @@ def summarize_evidence(
 
     ratios: list[dict[str, Any]] = []
     for model in selected_models:
-        for concurrency, _ in POINTS:
+        for concurrency, _ in points_for(model):
             ours = aggregate_index[(model, "ours", concurrency)]
             floor = aggregate_index[(model, "vllm", concurrency)]
             for axis in (*HIGHER_AXES, *LOWER_AXES):

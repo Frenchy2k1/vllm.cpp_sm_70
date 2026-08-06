@@ -19,6 +19,68 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## QUANT-CT-MXFP4 W4 throughput bench — RAN on GB10, BELOW-FLOOR (2026-08-06, `row/QUANT-CT-MXFP4-BENCH` `33e93608`)
+
+The binding ours-vs-oracle online-serving grid on the SAME checkpoint
+(`Yi30/Qwen3-8B-MXFP4`, dense `Qwen3ForCausalLM`, native Marlin W4A16 MXFP4
+keep-quant), oracle arm forced to Marlin via `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`
+(sm_121 cute-dsl mxf4 crashes). Production graphed vLLM 0.25.0 (torch.compile ON,
+Marlin W4A16), `--no-enable-prefix-caching` both arms, max-num-seqs 32, batched-tokens
+2048, c1/c2/c4/c8 x3 interleaved, single load/arm, drop_caches + memory-return
+between legs, both flock locks. Smoke model gate reproduced #44 (3/3 deterministic
+token-exact + coherent near-tie). **VERDICT: BELOW-FLOOR** (gate NO, 74/84 axes below);
+throughput ~0.91x at c2-c8, ~0.99x at c1; a large memory WIN.
+
+**Binding table (medians of 3 reps; per-rep spread ~1-3%):**
+
+| conc | total tok/s ours→vllm (ratio) | output tok/s ratio | med TTFT ms ours→vllm (ratio, ≥1 pass) | med TPOT ms ours→vllm (ratio, ≥1 pass) |
+|---|---|---|---|---|
+| c1 | 324.2 → 327.9 (**0.989**) | 0.989 | 287.5 → 295.2 (**1.027** PASS) | 25.70 → 25.34 (0.986) |
+| c2 | 569.2 → 624.7 (**0.911**) | 0.911 | 458.4 → 450.3 (0.982) | 28.27 → 25.45 (0.900) |
+| c4 | 951.4 → 1034.7 (**0.919**) | 0.919 | 862.1 → 867.5 (**1.006** PASS) | 31.03 → 28.07 (0.905) |
+| c8 | 1419.6 → 1554.8 (**0.913**) | 0.913 | 1412.2 → 1408.3 (0.997) | 39.64 → 35.30 (0.891) |
+| memory | peak GPU 28284 → 73723 MiB = **2.607 PASS** (ours 2.6x LESS) | — | — | — |
+
+Per-rep total tok/s — c1 ours 324.2/324.4/320.0 vllm 331.5/327.7/327.9; c2 ours
+569.2/569.9/558.9 vllm 624.2/624.9/624.7; c4 ours 951.4/958.9/945.8 vllm
+1040.9/1034.7/1034.3; c8 ours 1415.0/1433.9/1419.6 vllm 1560.9/1554.8/1554.7. Per-rep
+TPOT ms — c1 ours 25.68/25.70/26.08 vllm 25.02/25.34/25.34; c2 ours 28.21/28.27/28.67
+vllm 25.43/25.45/25.49; c4 ours 31.03/30.92/32.48 vllm 27.94/28.07/28.12; c8 ours
+39.64/39.23/39.77 vllm 35.15/35.34/35.30.
+
+**FIRST attribution (grounded in the per-concurrency curve — the gap is a BATCHED
+decode cost, NOT batch-1):** at c1 (batch-1 decode) ours is at parity (throughput
+0.989, TPOT 0.986, within run-noise). At c2-c8 (batched decode 2-8 seqs) ours is
+~0.91x throughput driven ENTIRELY by TPOT (~10-12% higher per-token: c2 0.900, c4
+0.905, c8 0.891), while TTFT/prefill is at parity (2/4 cells pass, others within
+noise). So the divergent hot path is the GROUPED Marlin W4A16 keep-quant decode GEMM
+as M grows 2→8 (our per-expert/grouped tiling vs vLLM's Marlin), NOT the batch-1
+GEMV nor prefill. Memory is a 2.6x WIN (keep-quant weights stay compressed: 28.3 vs
+73.7 GiB peak). NOT a ceiling. The precise NEXT step: same-tool nsys decode-window
+on the WORST cell (c8) BOTH engines (our server under nsys; vLLM under nsys, not the
+torch profiler — same tool) to name the exact divergent kernel/shape at M=8, then a
+lever on the batched Marlin decode GEMM.
+
+**Repro (one command, dgx, both flock locks free, free -g ≥ 90):**
+`scripts/mxfp4-online-serving-grid.sh --snapshot ~/.cache/huggingface/hub/models--Yi30--Qwen3-8B-MXFP4/snapshots/b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47 --build-dir <PROD_BUILD> --configure-log <CONFIGURE_LOG>`.
+**Build contract (LEARNED THE HARD WAY — the online-serving `record-execution` is
+strict and DIFFERS from the generic build recipe):** the build MUST be on a REAL
+disk (NOT `/dev/shm` — tmpfs pages are always resident so the cache-drop
+`POSIX_FADV_DONTNEED`+mincore==0 proof fails on the server binary), and configured
+`-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc
+-DCMAKE_MAKE_PROGRAM=$HOME/venvs/vllm-oracle/bin/ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_TRITON_REGEN=OFF -DVLLM_CPP_FLASH_ATTN=ON -DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_BENCH_PROFILE_CONTROL=OFF -DVLLM_CPP_CUTLASS_DIR=$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass`
+(the oracle's flashinfer-bundled cutlass, which is 4.5.0 — `record-execution` pins
+`VLLM_CPP_CUTLASS_DIR` to the oracle's own cutlass tree, not `$HOME/cutlass-4.5.0`).
+The full build tree is only ~3 GiB (fits /home). nvcc 13.0.88. Evidence:
+`dgx:~/work/vllm.cpp-online-gate/evidence/33e936086a116c840518afcf732076c9917e96a5`
+(ratios.json + report.md + 24 raws + memory/thermal/cache-drop). Harness plumbing on
+this row (all additive; 27/35 byte-unchanged; CPU contract tests 45/45): `online_gate.py`
+`q3mxfp4` key + `POINTS_BY_MODEL`/`points_for`; `mxfp4_smoke_gate.py`;
+`dgx-online-serving.sh` q3mxfp4 branches; `mxfp4-online-serving-grid.sh` orchestrator.
+
 ## DeepSeek-V4-Flash UD-IQ2_M — IQ2_S + MXFP4 CPU keep-quant bring-up (2026-08-03, `CLAIM-DSV4-UDIQ2M-QUANT`) — no throughput owed (off-GPU correctness bring-up)
 
 Off-GPU task (GB10 down, no nvcc on the dev box), so NO throughput is measured or owed. Adds the two per-tensor "dynamic" encodings the `unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_M` checkpoint's last 4 routed-expert slabs use — **IQ2_S** (ggml type 22; 2.5625 bpw codebook, Q8_K activation) and **MXFP4** (type 39; OCP micro-scaling fp4, 32-elem blocks, Q8_0 activation) — as first-class vt block dtypes (`kIQ2_S`/`kMXFP4`): block traits + dequant + a keep-quant `vec_dot`, ported 1:1 from llama.cpp `ggml-quants.c` @ 237ad9b96 (`iq2s_grid` 1024-entry codebook copied verbatim + direct sign bytes; `kvalues_mxfp4` + `e8m0_to_fp32_half`). The memory point: these load COMPRESSED (keep-quant) instead of the ~17 GiB bf16 expansion that OOM-reboots the 119 GiB pool.

@@ -65,7 +65,7 @@ are our reading of their documented behavior, not measurements.
 | GGUF k-quants and i-quants | ✅ | ☐ | ☐ | ✅ |
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
-| MXFP4 compressed-tensors | ◐ W4A16 Marlin compute proven; default-config e2e coherent + 3/4 token-exact (async-mirror fix); throughput bench owed | ✅ | ✅ | ☐ |
+| MXFP4 compressed-tensors | ◐ W4A16 Marlin compute proven; e2e 3/4 token-exact; W4 throughput grid ran on GB10: ~0.91x vLLM c2-c8 / 0.99x c1, peak GPU mem 2.6x less; below-floor (batched-decode gap) | ✅ | ✅ | ☐ |
 | fp8 weights | ✅ | ✅ | ✅ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
 | Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |

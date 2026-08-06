@@ -29,6 +29,8 @@ from tools.bench.online_gate import (
     MAX_NUM_BATCHED_TOKENS,
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
+    MODEL_REPOSITORIES,
+    MODEL_REVISIONS,
     FLASHINFER_VERSION,
     NSYS_CAPTURE_RANGE,
     NSYS_CAPTURE_RANGE_END,
@@ -37,6 +39,8 @@ from tools.bench.online_gate import (
     NSYS_PRODUCT_VERSION,
     OUTPUT_LEN,
     PANDAS_VERSION,
+    POINTS,
+    POINTS_BY_MODEL,
     TRACE_CONCURRENCY,
     TRACE_CAPTURE_GRAPH_REPLAYS,
     TRACE_GDN_BA_ENV,
@@ -59,7 +63,9 @@ from tools.bench.online_gate import (
     OnlineRun,
     build_client_command,
     build_plan,
+    points_for,
     prepare_corpus_views,
+    prompts_for,
     record_execution_manifest,
     record_memory_return,
     record_model_gate,
@@ -746,6 +752,69 @@ class OnlineClientContractTests(unittest.TestCase):
                 ):
                     prepare_corpus_views(source, output, model_key="27")
 
+    def test_q3mxfp4_bench_key_is_registered_with_a_reduced_low_concurrency_sweep(
+        self,
+    ) -> None:
+        # The MXFP4 W4 throughput row's additive model key. The NVFP4 gate keys
+        # keep the full six-point sweep; q3mxfp4 benches only the low-concurrency
+        # decode regime (c1/c2/c4/c8), a strict prefix of POINTS so the
+        # concurrency -> num_prompts mapping is unchanged.
+        self.assertEqual(
+            MODEL_REVISIONS["q3mxfp4"],
+            "b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47",
+        )
+        self.assertEqual(MODEL_REPOSITORIES["q3mxfp4"], "Yi30/Qwen3-8B-MXFP4")
+        self.assertEqual(MAX_NUM_BATCHED_TOKENS["q3mxfp4"], 2048)
+        self.assertEqual(MAX_MODEL_LEN["q3mxfp4"], 40960)
+        self.assertEqual(points_for("q3mxfp4"), ((1, 6), (2, 6), (4, 12), (8, 24)))
+        # A prefix of POINTS, so prompts_for stays the single source of counts.
+        self.assertEqual(points_for("q3mxfp4"), POINTS[: len(points_for("q3mxfp4"))])
+        for concurrency, num_prompts in points_for("q3mxfp4"):
+            self.assertEqual(prompts_for(concurrency), num_prompts)
+        # The NVFP4 gate keys are untouched: they fall through to the full POINTS.
+        self.assertNotIn("27", POINTS_BY_MODEL)
+        self.assertNotIn("35", POINTS_BY_MODEL)
+        self.assertEqual(points_for("27"), POINTS)
+        self.assertEqual(points_for("35"), POINTS)
+
+    def test_prepare_corpus_for_q3mxfp4_only_materializes_its_scoped_points(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "manifest.json").write_text("{}\n", encoding="utf-8")
+            rows = [
+                {
+                    "conversations": [{"from": "human", "value": f"prompt-{index}"}],
+                    "index": index,
+                    "output_len": OUTPUT_LEN,
+                    "prompt_sha256": f"{index + 1:064x}",
+                    "prompt_token_ids": [index] * INPUT_LEN,
+                }
+                for index in range(2)
+            ]
+            (source / "c1-r1.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            output = root / "view"
+            # Scope q3mxfp4 to a single tiny point so the additive key routes
+            # through points_for without needing the full c1..c8 corpus fixture;
+            # a c16/c32 source is never demanded for this key.
+            with (
+                mock.patch(
+                    "tools.bench.online_gate.POINTS_BY_MODEL",
+                    {"q3mxfp4": ((1, 2),)},
+                ),
+                mock.patch("tools.bench.online_gate.REPETITIONS", (1,)),
+            ):
+                manifest = prepare_corpus_views(source, output, model_key="q3mxfp4")
+            self.assertEqual(manifest["model_key"], "q3mxfp4")
+            self.assertEqual(manifest["tokenizer_revision"], MODEL_REVISIONS["q3mxfp4"])
+            self.assertEqual([item["concurrency"] for item in manifest["files"]], [1])
+            self.assertTrue((output / "c1-r1.jsonl").is_file())
+
     def test_plan_has_one_lock_per_model_and_interleaves_arms(self) -> None:
         plan = build_plan(
             claim_root=pathlib.Path("/claim"),
@@ -1387,12 +1456,22 @@ class OnlineClientContractTests(unittest.TestCase):
         )[0]
         ours_block = start_server.split(
             "if [[ ${engine} == ours ]]; then", 1
-        )[1].split("\n  else", 1)[0]
-        vllm_block = start_server.split(
-            '"${client}" serve "${snapshot}"', 1
-        )[1].split("\n    )", 1)[0]
+        )[1].split("\n  elif", 1)[0]
+        # The additive q3mxfp4 (MXFP4 dense 8B) vLLM arm forces Marlin W4A16 via
+        # VLLM_DISABLED_KERNELS and, being a classic dense checkpoint, carries no
+        # mamba state; the 27/35 hybrid arm still pins the SSM cache dtype.
+        after_q3mxfp4 = start_server.split(
+            "elif [[ ${model} == q3mxfp4 ]]; then", 1
+        )[1]
+        mxfp4_block = after_q3mxfp4.split("\n  else", 1)[0]
+        vllm_block = after_q3mxfp4.split("\n  else", 1)[1].split("\n    )", 1)[0]
         self.assertIn("--mamba-ssm-cache-dtype float32", vllm_block)
+        self.assertNotIn("VLLM_DISABLED_KERNELS", vllm_block)
         self.assertNotIn("--mamba-ssm-cache-dtype", ours_block)
+        self.assertNotIn("--mamba-ssm-cache-dtype", mxfp4_block)
+        self.assertIn(
+            "VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel", mxfp4_block
+        )
 
     def test_trace_driver_sets_h1d_plan_environment_before_manifest(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
