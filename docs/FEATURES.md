@@ -115,7 +115,7 @@ oversight.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ portable path complete; e2e on real weights (Thor); FP4-resident Marlin-W4A16 routing CPU-landed, GB10 speed pending | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ portable path complete; fp4-resident e2e RUNS on GB10 (real 18.75 GB NVFP4 DiT + VAEs + GGUF encoder → valid mp4/wav); Marlin W4A16 GB10-verified byte-exact; render COHERENCE open (non-scene patch-grid) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
 | Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Serving them

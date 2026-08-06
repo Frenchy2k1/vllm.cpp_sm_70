@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
   std::string dit_path, video_vae_path, video_cfg_path, audio_vae_path, audio_cfg_path;
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
   bool keep_quant = false, dry_run = false, dequant_bf16 = false, denoise_only = false;
-  bool dump_params = false;
+  bool dump_params = false, fp4_resident = false;
   std::string device_name = "cpu";
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   std::string first_frame_path, last_frame_path;
@@ -184,6 +184,7 @@ int main(int argc, char** argv) {
       else if (f == "--ffmpeg") ffmpeg = Need(argc, argv, ++i, f);
       else if (f == "--keep-quant") keep_quant = true;
       else if (f == "--dequant-bf16") dequant_bf16 = true;
+      else if (f == "--fp4-resident") fp4_resident = true;
       else if (f == "--dry-run") dry_run = true;
       else if (f == "--denoise-only") denoise_only = true;
       else if (f == "--dump-params") dump_params = true;
@@ -311,9 +312,15 @@ int main(int argc, char** argv) {
         // tensor.
         vt::Queue sq = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue();
         const auto t0 = std::chrono::steady_clock::now();
-        streamed = vllm::StreamMiniMaxH3Nvfp4ToDeviceBf16(sq, f, &dit.params);
+        // --fp4-resident keeps the packed FP4 on device (~1/4 the bf16 footprint,
+        // ~16 GB vs ~66 GB) and routes every quantized projection through the
+        // Marlin W4A16 GEMM on sm_121a; the default bf16 stream dequantizes to bf16.
+        streamed = fp4_resident
+                       ? vllm::StreamMiniMaxH3Nvfp4ToDeviceFp4(sq, f, &dit.params)
+                       : vllm::StreamMiniMaxH3Nvfp4ToDeviceBf16(sq, f, &dit.params);
         have_streamed = true;
-        std::cerr << "  streamed NVFP4 DiT -> device (bf16) in "
+        std::cerr << "  streamed NVFP4 DiT -> device (" << (fp4_resident ? "fp4-resident" : "bf16")
+                  << ") in "
                   << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
                   << " s\n";
       } else {

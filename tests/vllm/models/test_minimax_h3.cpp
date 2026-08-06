@@ -17,8 +17,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <set>
@@ -356,6 +359,114 @@ std::unique_ptr<DitForwardCase> BuildDitForwardCase(const MiniMaxH3DitParams& p)
   in.refiner_cu_seqlens = c->refiner_cu.data();
   in.num_refiner_cu_seqlens = static_cast<int64_t>(c->refiner_cu.size());
   return c;
+}
+
+// Serialize a synthetic compressed-tensors NVFP4 (W4A16) MiniMax-H3 DiT file at
+// the geometry `want`, exactly as the real `lilcheaty/MiniMax-H3-NVFP4` file
+// stores it: quantized projections as U8 packed [out, in/2] + E4M3 group-16
+// weight_scale + F32 weight_scale_2; islands (patch/time/output/norms) plain F32.
+// Factored out of the CPU "NVFP4 checkpoint loads" case so the CUDA speed case
+// can build the SAME file at real geometry without duplicating 100 lines. Both
+// callers set num_layers == token_refiner_num_layers == 1, which is what makes
+// the quantized-GEMM count exactly 11 (refiner 4 + block 5 + condition + final).
+void WriteMiniMaxH3Nvfp4File(const MiniMaxH3DitParams& want, const std::string& path) {
+  struct Entry {
+    std::string name;
+    std::string dtype;
+    std::vector<int64_t> shape;
+    std::string bytes;
+  };
+  std::vector<Entry> entries;
+
+  auto add_plain = [&](const std::string& name, const std::vector<int64_t>& shape) {
+    int64_t numel = 1;
+    for (int64_t d : shape) numel *= d;
+    const std::vector<float> values = MakeParam("nvfp4." + name, numel, 0.1);
+    entries.push_back({name, "F32", shape,
+                       std::string(reinterpret_cast<const char*>(values.data()),
+                                   values.size() * sizeof(float))});
+  };
+  auto add_quant = [&](const std::string& name, int64_t out_dim, int64_t in_dim) {
+    REQUIRE(in_dim % 16 == 0);
+    std::string packed(static_cast<size_t>(out_dim * (in_dim / 2)), '\0');
+    for (size_t i = 0; i < packed.size(); ++i) {
+      packed[i] = static_cast<char>((i * 37 + 11) & 0xFF);  // deterministic nibbles
+    }
+    std::string scales(static_cast<size_t>(out_dim * (in_dim / 16)), '\0');
+    for (size_t i = 0; i < scales.size(); ++i) {
+      scales[i] = static_cast<char>(0x38);  // e4m3 ~ 1.0
+    }
+    const float global = 0.5f;
+    entries.push_back({name, "U8", {out_dim, in_dim / 2}, packed});
+    entries.push_back({name + "_scale", "F8_E4M3", {out_dim, in_dim / 16}, scales});
+    entries.push_back({name + "_scale_2", "F32", {},
+                       std::string(reinterpret_cast<const char*>(&global), sizeof(float))});
+  };
+
+  const int64_t inner = want.num_attention_heads * want.attention_head_dim;
+  const int64_t video_width = want.video_row_width();
+  // Islands stay unquantized, exactly as the real checkpoint has them.
+  add_plain("video_patch_proj.weight", {want.hidden_size, video_width});
+  add_plain("video_patch_proj.bias", {want.hidden_size});
+  add_plain("audio_patch_proj.weight", {want.hidden_size, want.audio_latents_dim});
+  add_plain("audio_patch_proj.bias", {want.hidden_size});
+  add_plain("condition_proj.bias", {want.hidden_size});
+  add_plain("time_embedder.proj_in.weight", {want.time_embed_hidden_size, want.timestep_input_dim});
+  add_plain("time_embedder.proj_in.bias", {want.time_embed_hidden_size});
+  add_plain("time_embedder.proj_out.weight", {want.time_embed_dim, want.time_embed_hidden_size});
+  add_plain("time_embedder.proj_out.bias", {want.time_embed_dim});
+  add_plain("rope.inv_freq", {want.rope_inv_freq_len});
+  add_quant("condition_proj.weight", want.hidden_size, want.text_dim);
+  auto add_block = [&](const std::string& prefix, bool with_adaln) {
+    add_plain(prefix + ".norm1.weight", {want.hidden_size});
+    add_plain(prefix + ".norm2.weight", {want.hidden_size});
+    add_plain(prefix + ".attn.q_norm.weight", {want.attention_head_dim});
+    add_plain(prefix + ".attn.k_norm.weight", {want.attention_head_dim});
+    add_quant(prefix + ".attn.qkv_proj.weight", 3 * inner, want.hidden_size);
+    add_quant(prefix + ".attn.out_proj.weight", want.hidden_size, inner);
+    add_quant(prefix + ".mlp.fc1.weight", 2 * want.ffn_hidden_size, want.hidden_size);
+    add_quant(prefix + ".mlp.fc2.weight", want.hidden_size, want.ffn_hidden_size);
+    if (with_adaln) {
+      add_quant(prefix + ".adaln_proj.linear.weight", want.adaln_out_features, want.time_embed_dim);
+      add_plain(prefix + ".adaln_proj.linear.bias", {want.adaln_out_features});
+    }
+  };
+  for (int64_t i = 0; i < want.token_refiner_num_layers; ++i)
+    add_block("token_refiner.blocks." + std::to_string(i), false);
+  add_plain("token_refiner.final_norm.weight", {want.hidden_size});
+  for (int64_t i = 0; i < want.num_layers; ++i)
+    add_block("blocks." + std::to_string(i), true);
+  add_plain("final_layer.norm.weight", {want.hidden_size});
+  add_quant("final_layer.adaln_proj.linear.weight", want.final_adaln_out_features, want.time_embed_dim);
+  add_plain("final_layer.adaln_proj.linear.bias", {want.final_adaln_out_features});
+  add_plain("final_layer.video_out.weight", {video_width, want.hidden_size});
+  add_plain("final_layer.video_out.bias", {video_width});
+  add_plain("final_layer.audio_out.weight", {want.audio_latents_dim, want.hidden_size});
+  add_plain("final_layer.audio_out.bias", {want.audio_latents_dim});
+
+  std::string header = "{";
+  size_t offset = 0;
+  bool first = true;
+  for (const Entry& e : entries) {
+    if (!first) header += ",";
+    first = false;
+    header += "\"" + e.name + "\":{\"dtype\":\"" + e.dtype + "\",\"shape\":[";
+    for (size_t i = 0; i < e.shape.size(); ++i) {
+      if (i) header += ",";
+      header += std::to_string(e.shape[i]);
+    }
+    header += "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + e.bytes.size()) + "]}";
+    offset += e.bytes.size();
+  }
+  header += "}";
+  FILE* fh = std::fopen(path.c_str(), "wb");
+  REQUIRE(fh != nullptr);
+  const uint64_t n = header.size();
+  std::fwrite(&n, sizeof(n), 1, fh);
+  std::fwrite(header.data(), 1, header.size(), fh);
+  for (const Entry& e : entries) std::fwrite(e.bytes.data(), 1, e.bytes.size(), fh);
+  std::fclose(fh);
 }
 
 }  // namespace
@@ -2884,107 +2995,10 @@ TEST_CASE("minimax_h3: an NVFP4 checkpoint loads into a runnable DiT") {
   want.final_adaln_out_features = 2 * want.hidden_size;
   want.rope_inv_freq_len = 2;
 
-  struct Entry {
-    std::string name;
-    std::string dtype;
-    std::vector<int64_t> shape;
-    std::string bytes;
-  };
-  std::vector<Entry> entries;
-
-  auto add_plain = [&](const std::string& name, const std::vector<int64_t>& shape) {
-    int64_t numel = 1;
-    for (int64_t d : shape) numel *= d;
-    const std::vector<float> values = MakeParam("nvfp4." + name, numel, 0.1);
-    entries.push_back({name, "F32", shape,
-                       std::string(reinterpret_cast<const char*>(values.data()),
-                                   values.size() * sizeof(float))});
-  };
-  // A quantized projection: packed U8 [out, in/2] + E4M3 [out, in/16] + F32 scalar.
-  auto add_quant = [&](const std::string& name, int64_t out_dim, int64_t in_dim) {
-    REQUIRE(in_dim % 16 == 0);
-    std::string packed(static_cast<size_t>(out_dim * (in_dim / 2)), '\0');
-    for (size_t i = 0; i < packed.size(); ++i) {
-      packed[i] = static_cast<char>((i * 37 + 11) & 0xFF);  // deterministic nibbles
-    }
-    std::string scales(static_cast<size_t>(out_dim * (in_dim / 16)), '\0');
-    for (size_t i = 0; i < scales.size(); ++i) {
-      scales[i] = static_cast<char>(0x38);  // e4m3 ~ 1.0
-    }
-    const float global = 0.5f;
-    entries.push_back({name, "U8", {out_dim, in_dim / 2}, packed});
-    entries.push_back({name + "_scale", "F8_E4M3", {out_dim, in_dim / 16}, scales});
-    entries.push_back({name + "_scale_2", "F32", {},
-                       std::string(reinterpret_cast<const char*>(&global), sizeof(float))});
-  };
-
   const int64_t inner = want.num_attention_heads * want.attention_head_dim;
   const int64_t video_width = want.video_row_width();
-  // Islands stay unquantized, exactly as the real checkpoint has them.
-  add_plain("video_patch_proj.weight", {want.hidden_size, video_width});
-  add_plain("video_patch_proj.bias", {want.hidden_size});
-  add_plain("audio_patch_proj.weight", {want.hidden_size, want.audio_latents_dim});
-  add_plain("audio_patch_proj.bias", {want.hidden_size});
-  add_plain("condition_proj.bias", {want.hidden_size});
-  add_plain("time_embedder.proj_in.weight", {want.time_embed_hidden_size, want.timestep_input_dim});
-  add_plain("time_embedder.proj_in.bias", {want.time_embed_hidden_size});
-  add_plain("time_embedder.proj_out.weight", {want.time_embed_dim, want.time_embed_hidden_size});
-  add_plain("time_embedder.proj_out.bias", {want.time_embed_dim});
-  add_plain("rope.inv_freq", {want.rope_inv_freq_len});
-  // condition_proj is quantized in the real file.
-  add_quant("condition_proj.weight", want.hidden_size, want.text_dim);
-  auto add_block = [&](const std::string& prefix, bool with_adaln) {
-    add_plain(prefix + ".norm1.weight", {want.hidden_size});
-    add_plain(prefix + ".norm2.weight", {want.hidden_size});
-    add_plain(prefix + ".attn.q_norm.weight", {want.attention_head_dim});
-    add_plain(prefix + ".attn.k_norm.weight", {want.attention_head_dim});
-    add_quant(prefix + ".attn.qkv_proj.weight", 3 * inner, want.hidden_size);
-    add_quant(prefix + ".attn.out_proj.weight", want.hidden_size, inner);
-    add_quant(prefix + ".mlp.fc1.weight", 2 * want.ffn_hidden_size, want.hidden_size);
-    add_quant(prefix + ".mlp.fc2.weight", want.hidden_size, want.ffn_hidden_size);
-    if (with_adaln) {
-      add_quant(prefix + ".adaln_proj.linear.weight", want.adaln_out_features, want.time_embed_dim);
-      add_plain(prefix + ".adaln_proj.linear.bias", {want.adaln_out_features});
-    }
-  };
-  add_block("token_refiner.blocks.0", false);
-  add_plain("token_refiner.final_norm.weight", {want.hidden_size});
-  add_block("blocks.0", true);
-  add_plain("final_layer.norm.weight", {want.hidden_size});
-  add_quant("final_layer.adaln_proj.linear.weight", want.final_adaln_out_features, want.time_embed_dim);
-  add_plain("final_layer.adaln_proj.linear.bias", {want.final_adaln_out_features});
-  add_plain("final_layer.video_out.weight", {video_width, want.hidden_size});
-  add_plain("final_layer.video_out.bias", {video_width});
-  add_plain("final_layer.audio_out.weight", {want.audio_latents_dim, want.hidden_size});
-  add_plain("final_layer.audio_out.bias", {want.audio_latents_dim});
-
-  // Serialize a safetensors file: 8-byte header length, JSON header, then data.
-  std::string header = "{";
-  size_t offset = 0;
-  bool first = true;
-  for (const Entry& e : entries) {
-    if (!first) header += ",";
-    first = false;
-    header += "\"" + e.name + "\":{\"dtype\":\"" + e.dtype + "\",\"shape\":[";
-    for (size_t i = 0; i < e.shape.size(); ++i) {
-      if (i) header += ",";
-      header += std::to_string(e.shape[i]);
-    }
-    header += "],\"data_offsets\":[" + std::to_string(offset) + "," +
-              std::to_string(offset + e.bytes.size()) + "]}";
-    offset += e.bytes.size();
-  }
-  header += "}";
   const std::string path = "/tmp/minimax_h3_nvfp4_test.safetensors";
-  {
-    FILE* fh = std::fopen(path.c_str(), "wb");
-    REQUIRE(fh != nullptr);
-    const uint64_t n = header.size();
-    std::fwrite(&n, sizeof(n), 1, fh);
-    std::fwrite(header.data(), 1, header.size(), fh);
-    for (const Entry& e : entries) std::fwrite(e.bytes.data(), 1, e.bytes.size(), fh);
-    std::fclose(fh);
-  }
+  WriteMiniMaxH3Nvfp4File(want, path);
 
   const vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(path);
   const vllm::MiniMaxH3GgufDit loaded = vllm::LoadMiniMaxH3DitFromNvfp4(st);
@@ -3149,6 +3163,209 @@ TEST_CASE("minimax_h3: an NVFP4 checkpoint loads into a runnable DiT") {
     CHECK(video_delta <= 2e-3);
     CHECK(audio_delta <= 2e-3);
   }
+  std::remove(path.c_str());
+}
+
+TEST_CASE("minimax_h3: the NVFP4 fp4 forward runs Marlin W4A16 on CUDA (speed)") {
+  // The GB10 leg the CPU wiring gate cannot reach (spec 8.4a): on the CUDA backend
+  // the W4A16 dispatcher hits dense_nvfp4::MatmulNvfp4MarlinD, so the fp4 path RAN
+  // is provable by `marlin_gemms == 11` (not the CPU `fallback_gemms`). Built at the
+  // REAL H3 geometry (one AdaLN block + one refiner) so the per-forward and
+  // per-GEMM times, and the fp4-vs-bf16 numeric delta, are the production shapes,
+  // not the reduced-dim wiring model. Env-tunable so the same binary sweeps
+  // sequence length and reps on dgx: H3_FP4_{LT,LH,LW,AT,AC,TEXT,REPS}.
+  namespace dnv = vllm::dense_nvfp4;
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  vt::Queue q = cuda->CreateQueue();
+
+  auto env_i = [](const char* k, int64_t dflt) -> int64_t {
+    const char* v = std::getenv(k);
+    return (v && *v) ? std::atoll(v) : dflt;
+  };
+  const int64_t lt = env_i("H3_FP4_LT", 16), lh = env_i("H3_FP4_LH", 32),
+                lw = env_i("H3_FP4_LW", 32), at = env_i("H3_FP4_AT", 8),
+                ac = env_i("H3_FP4_AC", 2), text_len = env_i("H3_FP4_TEXT", 64);
+  const int reps = static_cast<int>(env_i("H3_FP4_REPS", 8));
+
+  // Real geometry, single-layer: this is what makes the quantized-GEMM count 11.
+  MiniMaxH3DitParams want;  // defaults ARE the shipped H3 geometry
+  want.num_layers = 1;
+  want.token_refiner_num_layers = 1;
+  const int64_t video_width = want.video_row_width();
+  const std::string path = "/tmp/minimax_h3_nvfp4_cuda_speed.safetensors";
+  WriteMiniMaxH3Nvfp4File(want, path);
+  const vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(path);
+
+  // Stream BOTH arms to the DEVICE off the SAME file. bf16 dequantizes to bf16 and
+  // runs vt::MatmulBT; fp4 keeps the packed FP4 resident and routes each quantized
+  // projection through the Marlin W4A16 grouped GEMM.
+  vllm::MiniMaxH3DitParams bf16_params, fp4_params;
+  const vllm::MiniMaxH3DitDeviceWeights bf16_staged =
+      vllm::StreamMiniMaxH3Nvfp4ToDeviceBf16(q, st, &bf16_params);
+  const vllm::MiniMaxH3DitDeviceWeights fp4_staged =
+      vllm::StreamMiniMaxH3Nvfp4ToDeviceFp4(q, st, &fp4_params);
+  CHECK(!fp4_staged.weights.blocks[0].qkv_fp4.Empty());
+  CHECK(fp4_staged.weights.blocks[0].qkv_proj.data == nullptr);
+  CHECK(bf16_staged.weights.blocks[0].qkv_fp4.Empty());
+  CHECK(bf16_staged.weights.blocks[0].qkv_proj.data != nullptr);
+
+  // Production-shaped packed sequence.
+  const MiniMaxH3PackedSequence packed = BuildMiniMaxH3PackedSequence(
+      text_len, lt, lh, lw, at, ac, /*include_keyframe_cond=*/false, {}, 0);
+  const int64_t seq = packed.seq_len;
+  const int64_t num_img = static_cast<int64_t>(packed.img_pos.size());
+  const int64_t num_audio = static_cast<int64_t>(packed.audio_pos.size());
+  const int64_t num_text = static_cast<int64_t>(packed.text_pos.size());
+  const std::vector<float> x(static_cast<size_t>(seq * video_width), 0.25f);
+  const std::vector<float> audio_x(static_cast<size_t>(seq * want.audio_latents_dim), 0.1f);
+  const std::vector<float> prompt(static_cast<size_t>(num_text * want.text_dim), 0.2f);
+  const std::vector<float> unique_ts = {0.4f};
+  const std::vector<int64_t> inverse(static_cast<size_t>(seq), 0);
+  const std::vector<int32_t> refiner_cu = {0, static_cast<int32_t>(num_text),
+                                           static_cast<int32_t>(num_text)};
+  MiniMaxH3DitInputs in;
+  in.seq_len = seq;
+  in.x = x.data();
+  in.audio_x = audio_x.data();
+  in.img_position_ids = packed.img_position_ids.data();
+  in.unique_timesteps = unique_ts.data();
+  in.num_unique_timesteps = 1;
+  in.inverse_indices = inverse.data();
+  in.token_tags = packed.token_tags.data();
+  in.prompt_embeds = prompt.data();
+  in.img_pos = packed.img_pos.data();
+  in.num_img_pos = num_img;
+  in.audio_pos = packed.audio_pos.data();
+  in.num_audio_pos = num_audio;
+  in.text_pos = packed.text_pos.data();
+  in.num_text_pos = num_text;
+  in.infer_out_pos = packed.img_pos.data();
+  in.num_infer_out_pos = num_img;
+  in.update_mask = packed.update_mask.data();
+  in.cu_seqlens = packed.cu_seqlens.data();
+  in.num_cu_seqlens = static_cast<int64_t>(packed.cu_seqlens.size());
+  in.refiner_cu_seqlens = refiner_cu.data();
+  in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
+
+  auto now = [] { return std::chrono::steady_clock::now(); };
+  auto us = [](std::chrono::steady_clock::time_point a,
+               std::chrono::steady_clock::time_point b) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+  };
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.empty() ? 0.0 : v[v.size() / 2];
+  };
+
+  // ── Per-FORWARD timing: the whole DiT step, both arms (the forward returns host
+  // vectors, so each call syncs the device — no extra Synchronize needed). ──
+  MiniMaxH3DitOutputs bf16_out =
+      MiniMaxH3DitForwardDevice(q, bf16_params, bf16_staged.weights, in, vt::DType::kBF16);
+  std::vector<double> tb;
+  for (int r = 0; r < reps; ++r) {
+    const auto t0 = now();
+    bf16_out = MiniMaxH3DitForwardDevice(q, bf16_params, bf16_staged.weights, in, vt::DType::kBF16);
+    tb.push_back(us(t0, now()));
+  }
+
+  // Cold fp4 forward first (builds the Marlin resident/repack), then the counter
+  // is asserted on ONE clean forward, then timed.
+  MiniMaxH3DitOutputs fp4_out =
+      MiniMaxH3DitForwardDevice(q, fp4_params, fp4_staged.weights, in, vt::DType::kBF16);
+  dnv::ResetW4A16Stats();
+  fp4_out = MiniMaxH3DitForwardDevice(q, fp4_params, fp4_staged.weights, in, vt::DType::kBF16);
+  const dnv::Nvfp4W4A16Stats stats = dnv::GetW4A16Stats();
+  MESSAGE("H3FP4FWD counters marlin_gemms=" << stats.marlin_gemms
+          << " dense_gemms=" << stats.dense_gemms
+          << " fallback_gemms=" << stats.fallback_gemms
+          << " fused_gate_up=" << stats.fused_gate_up);
+  // The POSITIVE proof the Marlin W4A16 path RAN on the GPU for all 11 quantized
+  // projections, and NOT the CPU/redundant-dequant fallback. On CPU these would be
+  // fallback_gemms. On CUDA the production default (VT_MARLIN_DENSE on, sm_121a)
+  // routes each projection through vLLM's OWN dense Marlin GEMM -> `dense_gemms`;
+  // VT_MARLIN_DENSE=0 opts into the single-expert MoE-grouped Marlin -> `marlin_gemms`.
+  // Either Marlin sub-route is the "this-path-ran" signal; fallback_gemms MUST be 0.
+  const uint64_t marlin_family = stats.marlin_gemms + stats.dense_gemms;
+  CHECK(marlin_family == 11);
+  CHECK(stats.fallback_gemms == 0);
+  std::vector<double> tf;
+  for (int r = 0; r < reps; ++r) {
+    const auto t0 = now();
+    fp4_out = MiniMaxH3DitForwardDevice(q, fp4_params, fp4_staged.weights, in, vt::DType::kBF16);
+    tf.push_back(us(t0, now()));
+  }
+
+  REQUIRE(fp4_out.video_logits.size() == bf16_out.video_logits.size());
+  for (float v : fp4_out.video_logits) REQUIRE(std::isfinite(v));
+  for (float v : fp4_out.audio_logits) REQUIRE(std::isfinite(v));
+  const double video_delta =
+      MaxAbsDiff(fp4_out.video_logits, bf16_out.video_logits.data(), fp4_out.video_logits.size());
+  const double audio_delta =
+      MaxAbsDiff(fp4_out.audio_logits, bf16_out.audio_logits.data(), fp4_out.audio_logits.size());
+  double vmax = 0.0;
+  for (float v : bf16_out.video_logits) vmax = std::max(vmax, std::abs(static_cast<double>(v)));
+  const double mb = median(tb), mf = median(tf);
+  MESSAGE("H3FP4FWD seq=" << seq << " reps=" << reps
+          << " per_forward_bf16_ms=" << (mb / 1000.0)
+          << " per_forward_fp4_ms=" << (mf / 1000.0)
+          << " ratio(bf16/fp4)=" << (mf > 0 ? mb / mf : 0.0)
+          << " avg_per_marlin_gemm_us_fp4=" << (mf / 11.0));
+  MESSAGE("H3FP4FWD fp4-vs-bf16(CUDA Marlin) video max|diff|=" << video_delta
+          << " audio max|diff|=" << audio_delta
+          << " (bf16 video max|val|=" << vmax << ", rel="
+          << (vmax > 0 ? video_delta / vmax : 0.0) << ")");
+  // Both arms consume the SAME fp4 bytes; the delta is the GEMM path (Marlin's
+  // bf16 tensor-core accumulate vs the bf16 arm's dequant+MatmulBT), so it is
+  // matmul-reduction slack amplified through one block, not a quantization error.
+  CHECK(std::isfinite(video_delta));
+  CHECK(vmax > 0.0);
+  CHECK(video_delta <= 0.10 * vmax + 1e-3);  // <=10% relative: sanity, not a tie
+
+  // ── Per-GEMM microbench: the dominant per-token projections at M = seq. Marlin
+  // W4A16 (fp4-resident) vs the bf16 arm's own dequant+GEMM, SAME numbers. ──
+  dnv::Dev d{*cuda, q};
+  auto bench = [&](const char* nm, const vllm::Nvfp4Weight& w) {
+    const int64_t N = w.n, K = w.k;
+    std::vector<uint16_t> xh(static_cast<size_t>(seq) * K, 0x3DCCu);  // bf16 ~0.1
+    dnv::DBuf xb(d, vt::DType::kBF16, {seq, K}, xh.data());
+    for (int i = 0; i < 3; ++i) { auto o = dnv::MatmulNvfp4W4A16D(d, xb.t(), w, vt::DType::kBF16); (void)o; }
+    cuda->Synchronize(q);
+    std::vector<double> f;
+    for (int r = 0; r < reps; ++r) {
+      const auto t0 = now();
+      auto o = dnv::MatmulNvfp4W4A16D(d, xb.t(), w, vt::DType::kBF16);
+      cuda->Synchronize(q);
+      f.push_back(us(t0, now()));
+      (void)o;
+    }
+    const std::vector<uint16_t> wb = dnv::DequantNvfp4ToBLayout(w);  // [K, N] bf16
+    dnv::DBuf wbd(d, vt::DType::kBF16, {K, N}, wb.data());
+    for (int i = 0; i < 3; ++i) { dnv::DBuf o(d, vt::DType::kBF16, {seq, N}); vt::Matmul(q, o.t(), xb.t(), wbd.t()); }
+    cuda->Synchronize(q);
+    std::vector<double> b;
+    for (int r = 0; r < reps; ++r) {
+      dnv::DBuf o(d, vt::DType::kBF16, {seq, N});
+      const auto t0 = now();
+      vt::Matmul(q, o.t(), xb.t(), wbd.t());
+      cuda->Synchronize(q);
+      b.push_back(us(t0, now()));
+    }
+    const double gf = median(f), gb = median(b);
+    MESSAGE("H3FP4GEMM " << nm << " M=" << seq << " N=" << N << " K=" << K
+            << " fp4_marlin_us=" << gf << " bf16_us=" << gb
+            << " ratio(bf16/fp4)=" << (gf > 0 ? gb / gf : 0.0));
+  };
+  bench("qkv", fp4_staged.weights.blocks[0].qkv_fp4);
+  bench("out", fp4_staged.weights.blocks[0].out_fp4);
+  bench("fc1", fp4_staged.weights.blocks[0].fc1_fp4);
+  bench("fc2", fp4_staged.weights.blocks[0].fc2_fp4);
+
   std::remove(path.c_str());
 }
 

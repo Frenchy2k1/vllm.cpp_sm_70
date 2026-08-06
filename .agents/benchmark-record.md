@@ -13270,6 +13270,129 @@ vllm-omni source; the documented anchor is the recipe's 4×B300 BF16 evidence (F
 209f 1248×768 = 86.964 s; two-video Ref2VA = 784.394 s, `recipe:298-311`).
 
 
+## MiniMax-H3 W-FP4a GB10 leg — Marlin W4A16 RAN on sm_121a (byte-exact); fp4 is a MEMORY win not a diffusion-forward SPEED win; e2e RENDERS on real weights but the frame is a non-scene patch-grid (2026-08-06, `row/H3-FP4-GPU-E2E`, `ROAD-V1-H3`)
+
+**Setup.** dgx.casa GB10 sm_121a, CUDA 13, cutlass 4.5.0, Release. git-archive of
+`row/H3-FP4-GPU-E2E` (goldens md5 byte-identical both sides). Targeted build of
+`test_minimax_h3` only. New CUDA case `minimax_h3: the NVFP4 fp4 forward runs
+Marlin W4A16 on CUDA (speed)` builds a synthetic compressed-tensors NVFP4 file at
+REAL H3 geometry (1 AdaLN block + 1 refiner = 11 quantized projections), streams
+BOTH the bf16 arm and the fp4-resident arm off the SAME file, runs both device
+forwards, and times them (median over 12 reps, cold leg discarded) on an idle box
+(free=117 G after drop_caches). Env-tunable seq via `H3_FP4_{LT,LH,LW,AT,AC,TEXT}`.
+
+**The Marlin path RAN (the mission's `marlin_gemms==11`, corrected for the real route).**
+On CUDA the W4A16 dispatcher counter is:
+- **default (VT_MARLIN_DENSE ON): `dense_gemms=11, marlin_gemms=0, fallback_gemms=0`** —
+  each of the 11 quantized projections took vLLM's OWN dense Marlin GEMM
+  (`vt::MarlinDenseGemm`), NOT the single-expert MoE-grouped Marlin the spec §8.1
+  assumed.
+- **VT_MARLIN_DENSE=0: `marlin_gemms=11, dense_gemms=0, fallback_gemms=0`** — the
+  grouped MoE-Marlin route, the mission's literal counter.
+`fallback_gemms==0` in BOTH ⇒ no CPU/redundant-dequant fallback; the sm_121a
+Marlin W4A16 tensor-core path genuinely executed for every projection. (Spec §8.1
+routing note corrected: the production default is the DENSE marlin, not grouped.)
+
+**fp4-vs-bf16 numeric delta = 0 (byte-exact), all sizes.** Both arms consume the
+SAME packed NVFP4 bytes; the dense Marlin GEMM (fp32-C reduce) is byte-preserving
+vs the bf16 arm's dequant+MatmulBT, so the two device forwards produce BIT-IDENTICAL
+video+audio logits (bf16 video max|val|=1243.18, max|diff|=0). The fp4-resident arm
+costs nothing in accuracy.
+
+**Timing — the crossover (median/12, cold discarded).** Per-forward (whole 2-block
+DiT step; attention + fp32 islands + the 11 W4A16 GEMMs), dense route:
+
+| seq (M) | bf16 ms | fp4 ms | ratio bf16/fp4 |
+|---|---|---|---|
+| 64    | 12.57  | 3.62   | **3.47** (fp4 faster) |
+| 4224  | 76.61  | 92.83  | 0.825 (fp4 slower) |
+| 7040  | 129.36 | 164.23 | 0.788 (fp4 slower) |
+
+(grouped route @seq4224: bf16 76.07 / fp4 94.28 = 0.807 — same story, dense marginally faster.)
+
+Per-GEMM microbench, `ratio(bf16/fp4)` (fp4 faster when >1):
+
+| GEMM [N,K] | M=64 | M=4224 | M=7040 |
+|---|---|---|---|
+| qkv [21504,5376] | 3.16 | 0.582 | 0.529 |
+| out [5376,7168]  | 3.90 | 1.02  | 1.06  |
+| fc1 [28672,5376] | 3.32 | 0.596 | 0.533 |
+| fc2 [5376,14336] | 2.86 | 1.22  | 0.90  |
+
+**Verdict.** Marlin W4A16 is a WEIGHT-BANDWIDTH optimization: it reads ¼ the weight
+bytes but does the SAME bf16 tensor-core FLOPs plus an on-the-fly dequant. At small
+M (decode-like, memory-bound) it is ~3× faster; in H3's diffusion-forward regime
+(one forward over the WHOLE packed sequence, M = thousands, compute-bound) the big
+projections (qkv/fc1) are ~1.7–1.9× SLOWER and out/fc2 ~tied, netting ~0.8× per
+forward. **So for H3 the fp4-resident arm's value is MEMORY** (~16 GB packed vs
+~66 GB bf16 = 4×, which is what lets the DiT + encoder + VAEs fit the 119 GiB
+pool), not diffusion-forward throughput. A bf16 arm would be ~1.2× faster per step
+if it fit — it does not (66 GB DiT + 13 GB encoder + VAEs).
+
+**Leg 2 — real-checkpoint t2va e2e (fp4-resident), it RENDERS on real weights.**
+Files (byte-complete, sizes verified): DiT `minimax_h3_ref2va_nvfp4_full.safetensors`
+18 745 492 256 B (the UNPRUNED variant our forward implements — the pruned files use
+a timestep-LUT AdaLN we do not) + `vae/minimax_h3_video_vae_fp16.safetensors`
+5 207 808 496 B + `vae/minimax_h3_audio_vae_fp32.safetensors` 605 254 808 B +
+encoder `qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` 14 576 977 888 B, downloaded 8-way
+parallel (HF xet CDN throttles a single connection to ~5 MB/s). VAE configs
+(latents_mean/std) taken from the project's own baked `minimax_h3_vae_configs.inc`;
+tokenizer from public `Qwen/Qwen3-VL-32B-Instruct/tokenizer.json` (the GGUF is
+weights-only). `examples/minimax-h3-gen --fp4-resident --device cuda` (the new flag
+routes NVFP4 safetensors through `StreamMiniMaxH3Nvfp4ToDeviceFp4`): stages the real
+DiT in **6–18 s**, geometry recovered = 50 layers / 5376 / 56 heads.
+
+Small render 256×256 / 22 frames (1 VAE tile), UNCONDITIONED (synthetic embeds,
+12 steps) AND CONDITIONED (GGUF Qwen3-VL-32B encoder keep-quant 13.24 GiB →
+[16, 5120] conditioning; encoder+DiT+VAEs coresident ~35 GB, free stayed ≥80 G):
+both run the full path — 22 PPM frames + `audio.wav` (32 kHz stereo) + a VALID
+`h264/yuv420p 256×256 + AAC` mp4 (ffprobe-confirmed). **FRAME SANITY:** a decoded
+frame is a regular grid of small multicolour blocks (16 px = the vae_ratio-16 latent
+cell) with smooth internal gradients on a dark ground — structured image data (the
+VAE IS decoding, NOT white noise), **but NOT a coherent scene, IDENTICALLY at 12, 20
+AND 50 steps (the reference count) whether conditioned or not.** Step count and
+conditioning are ruled out; the grid is at exactly the latent-cell scale, i.e. each
+latent decodes to an independent block with no cross-patch coherence. **Honest
+verdict: the composed fp4-resident pipeline RUNS end to end on the real checkpoint
+and every stage executes, but it does NOT yet render a coherent scene — a real OPEN
+render bug (device video-VAE decode and/or denoise convergence at real geometry),
+separate from and NOT blocking the fp4 speed work.** This is precisely what the
+frame-sanity gate catches: every numeric unit gate green + valid mp4, yet the frame
+is a structured non-scene. First eyeball of an H3 frame (the prior Thor run reached
+`succeeded`/valid ffprobe but its content was never viewed).
+
+DiT s/step, FULL 50-layer fp4-resident, `--denoise-only` (per FORWARD, drop_caches,
+locks held):
+
+| config | seq | s/forward |
+|---|---|---|
+| 512×512 / 22f  | 1 898  | **5.45** |
+| 768×768 / 61f  | 12 948 | **20.03** |
+| **768×1344 / 209f (vllm-omni REF canvas)** | 63 224 | **209.09** |
+
+The reference canvas FITS in the pool (a forward runs) but a full 50-step render is
+49 × 209 ≈ **2.85 h** of DiT + the 209-frame tiled VAE decode — memory-feasible but
+hours-long, so the full reference render was NOT run (the honest "largest fitting
+config" per the mission). The composed path is proven on the real checkpoint at the
+small canvas.
+
+**Indirect speed statement (mission #3), HW/loader-forced-INDIRECT.** vLLM-Omni has
+NO quantized H3 arm (BF16-only, single-GPU only via `--enable-cpu-offload`;
+source-audited a4ea67a2/v0.26.0), so a quant-matched one-GB10 comparison is
+impossible (DeepSeek-GGUF precedent). The documented vLLM-Omni anchor is 4× B300
+BF16: FL2VA 209f 1248×768 = **86.964 s** mean client latency for a WHOLE 50-step
+render (recipe:298-311). Ours, single GB10 fp4-resident, is **209 s for ONE forward**
+at the comparable 209-frame reference canvas (768×1344) — so 4× B300 completes an
+entire ~49-forward render + VAE in 87 s (~1.8 s/forward-equivalent) while one GB10
+takes 209 s for a single forward, i.e. **~116× per-forward**. That is the expected
+HW/loader-forced-indirect gap: 4 datacenter B300s + BF16 + USP-4 sequence-parallel +
+torch.compile + block-caching vs one GB10 + fp4 + none of those — and vLLM-Omni
+cannot run a quantized H3 on one GPU at all. Our honest SAME-box number is the
+fp4-vs-bf16-arm ratio (leg 1, DiT-only real geometry): fp4 is **0.79–0.83×** the
+bf16 arm per diffusion forward — the fp4 arm trades ~20% forward speed for 4× less
+weight memory, which is what makes the DiT + encoder + VAEs fit one GB10 at all.
+
+
 ## Laguna-S-2.1-NVFP4 decode — router top-k KERNEL-EFFICIENCY (`VT_LAGUNA_TOPK_SHFL`), BYTE-EXACT, SigmoidTopK 1.67×, −0.57% decode-step GPU (2026-08-03, `CLAIM-LAGUNA-TOPK-SHFL`)
 Measured results for vllm.cpp, against the reference engine each workload
 actually competes with. Every number here was produced on real hardware, greedy,
