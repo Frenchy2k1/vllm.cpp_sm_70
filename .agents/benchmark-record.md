@@ -13237,3 +13237,52 @@ once the avoidable work is removed.
 
 Recorded honestly as a profile, not a benchmark: no A/B, no ratio, no claim of
 speedup. Raw data on dgx at `/tmp/prefill.data` and `/tmp/decode.data`.
+
+## CORRECTION: vt CPU q8_0 vs ggml, the repack tier was not engaged (2026-08-06)
+
+Supersedes the CPU half of the parakeet.cpp probe numbers quoted in the first
+revision of `.agents/specs/parakeet-conformer-encoder.md`. Recorded here rather
+than edited away, per "evidence is moved, never deleted".
+
+**What was wrong.** An A/B of `vt::MatmulBTQuant` against ggml's q8_0 `MUL_MAT`
+at a conformer encoder's real shapes reported ggml ahead 1.2x to 2.2x on dgx
+aarch64, and the conclusion drawn was "vt loses on CPU everywhere".
+
+**Why.** `MatmulBTQuantKernel` (`src/vt/cpu/cpu_quant_gemm.cpp:145-200`)
+dispatches in three tiers: `b.repacked` goes to the G7 i8mm repack GEMM; else
+the G6 mmla tier, but ONLY when `m % 2 == 0 && n % 2 == 0`; else the portable
+scalar `QuantChunk`. The bench constructed its weight tensor directly and left
+`Tensor.repacked` false, and a conformer's M values are odd (131 frames, 261
+frames, 1 at decode), so five of six cases missed BOTH fast tiers and ran the
+portable scalar path. That path is not what production runs: the GGUF keep-quant
+loader repacks at load (`qwen3_5_gguf_weights.cpp:104-107`, gated on
+`QuantRepackEligible`).
+
+**Corrected numbers.** Same box, same binary, same shapes, 8 threads, median of
+7 batches, with `vt::cpu::QuantRepackWeight` applied and `repacked` set. All six
+shapes are repack-eligible (q8_0, N%4==0, K%32==0). GFLOP/s:
+
+| shape (M,K,N) | ggml q8_0 | vt q8_0 repack | vt faster |
+|---|---:|---:|---:|
+| 256,256,5220 | 394.8 | **1961.8** | 4.97x |
+| 131,2048,512 | 455.5 | **628.5** | 1.38x |
+| 131,512,2048 | 429.1 | **1390.1** | 3.24x |
+| 131,512,512 | 403.9 | **565.3** | 1.40x |
+| 261,512,512 | 413.7 | **612.9** | 1.48x |
+| 1,640,2560 | 263.5 | **525.1** | 1.99x |
+
+`vt` wins every quantized case, including M=1. The 191 to 255 GFLOP/s the
+superseded run reported was the portable tier; the jump to 525 to 1962 is the
+3.7x to 5.9x G7 already claimed, independently reproduced here.
+
+**What did NOT change.** 16-bit is still ggml's. Dtype-matched (f32 activations,
+f16 weight, which is what ggml runs and what the elementwise kernel is designed
+for), ggml is ahead 1.14x to 2.00x (403-444 vs 141-242 GFLOP/s). Also measured:
+vt bf16-both 177-197, f32-both 260-322, f16-both 130-141, so feeding f16
+activations is a pessimisation and f32-act/16-bit-weight is the right call. And
+x86 is unchanged: `QuantRepackEligible` is false off i8mm, so x86 runs the
+portable tier by construction until G5 lands.
+
+**Standing lesson for benchmarks against this engine.** A `vt::` quant GEMM
+measured without the loader's repack, or at odd M, is measuring a tier
+production never selects. Any future A/B must state which tier it engaged.
