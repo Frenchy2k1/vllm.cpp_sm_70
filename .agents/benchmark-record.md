@@ -13638,3 +13638,44 @@ so CPU builds gain no noise.
 
 That any of it runs. There is no `sm_86` board on this network, and a compile
 plus a SASS dump is not execution evidence.
+
+## nkm landed: M blocking on the [K,N] path, and the prototype OVERESTIMATED it
+
+`KERNEL-GEMM-CPU-TILED` lever 1 is implemented (`nkm` family on every tier,
+dispatch degated from `kBT` in `cpu_ops.cpp:135`). Byte-identity holds: 654/654
+memcmp assertions on all five tiers, each verifying the tier actually selected.
+
+Measured on dgx aarch64 (load 6.35, one flock, same binary discipline), f16
+weight + f32 activations, GFLOP/s:
+
+| shape | bt (today's default) | nk BEFORE nkm | nk AFTER nkm | nkm gain | nk vs bt |
+|---|---:|---:|---:|---:|---:|
+| 256,256,5220 | 219.7 | 247.9 | 254.2 | 1.03x | 1.16x |
+| 131,2048,512 | 215.9 | 262.7 | 281.4 | **1.07x** | **1.30x** |
+| 131,512,2048 | 211.8 | 211.4 | 261.9 | **1.24x** | **1.24x** |
+| 131,512,512 | 211.0 | 269.2 | 274.4 | 1.02x | 1.30x |
+| 261,512,512 | 235.9 | 274.8 | 281.3 | 1.02x | 1.19x |
+| 1,640,2560 | 140.2 | 178.9 | 178.2 | 1.00x | 1.27x |
+
+**The prototype overestimated, and that is worth recording as a method lesson.**
+The standalone probe predicted 1.44x to 1.78x from M blocking; the real kernel
+delivers 1.02x to 1.24x. The probe was single threaded with a naive outer loop,
+so it modelled the register-level amortisation but not the CACHE behaviour of
+the real chunk worker, which already walks a 16-row activation tile
+(`blck_1 = 16`) against one column block. In that structure the weight tile is
+usually still in L1/L2 when the next row reads it, so most of what M blocking
+saves in registers was already being saved by the cache. A micro-probe that
+omits the caller's blocking structure will flatter a locality optimisation;
+this one did.
+
+**What is real.** The [K,N] orientation now beats the [N,K] default by **1.16x
+to 1.30x** at every shape, byte-identically. That is the payoff available from
+lever 2 (repack `[N,K] -> [K,N]` at load, as the q8_0 G7 tier already does),
+since `MatmulBT` is what production calls and it currently cannot reach this
+family at all.
+
+Context against the outside references on the same shapes: ggml stock is ~214
+and we are now at ~281 on `131,2048,512`, so we are **ahead of ggml's own
+kernel by ~1.3x**; ggml WITH llamafile is ~419, so ~1.5x still separates us and
+that residue is the FMA plus K-vectorised-hsum structure we are deliberately not
+adopting.
