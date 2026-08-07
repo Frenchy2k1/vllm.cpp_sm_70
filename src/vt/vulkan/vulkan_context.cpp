@@ -371,6 +371,14 @@ VulkanContext::VulkanContext() {
   denorm_preserve_f32_ = fc.shaderDenormPreserveFloat32 == VK_TRUE;
   sz_inf_nan_preserve_f32_ = fc.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
   max_workgroup_count_x_ = props2.properties.limits.maxComputeWorkGroupCount[0];
+  // GPU TIMESTAMP SUPPORT, probed rather than assumed. `timestampPeriod` is
+  // nanoseconds per tick; a device reporting 0 cannot timestamp at all, and
+  // `timestampComputeAndGraphics == VK_FALSE` means the compute queue family may
+  // not support it even when the device nominally does. Either way profiling
+  // silently stays off rather than producing nonsense numbers.
+  if (props2.properties.limits.timestampComputeAndGraphics == VK_TRUE) {
+    timestamp_period_ns_ = static_cast<double>(props2.properties.limits.timestampPeriod);
+  }
   VT_CHECK(props2.properties.limits.maxComputeWorkGroupInvocations >= kWorkgroupSize,
            "vulkan: device reports maxComputeWorkGroupInvocations below the Vulkan "
            "guaranteed minimum of 128, which the committed SPIR-V is compiled for");
@@ -516,6 +524,20 @@ VulkanContext::VulkanContext() {
   pipelines_ = new std::map<std::string, Pipeline>();
   dispatch_hist_ = new std::map<std::string, uint64_t>();
   dispatch_ms_ = new std::map<std::string, double>();
+  batch_names_ = new std::vector<std::string>();
+  // TWO timestamps per dispatch (before and after), for a whole batch. Created
+  // only under the stats flag: a query pool is cheap, but writing timestamps adds
+  // commands to every dispatch and production must not pay for a diagnostic.
+  if (kDispatchStats && timestamp_period_ns_ > 0.0) {
+    VkQueryPoolCreateInfo qpci{};
+    qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = kMaxBatch * 2;
+    VkQueryPool qp = VK_NULL_HANDLE;
+    if (Api().vkCreateQueryPool(Unpack<VkDevice>(device_), &qpci, nullptr, &qp) == VK_SUCCESS) {
+      query_pool_ = Pack(qp);
+    }
+  }
 
   // VT_VULKAN_DISPATCH_STATS=1 dumps the per-shader histogram at exit. Registered
   // with atexit rather than printed from a destructor because this context is a
@@ -549,13 +571,15 @@ VulkanContext::VulkanContext() {
       // answer and is not built. Until then, profile with VT_VULKAN_BATCH=0:
       // relative KERNEL cost is still meaningful there, it just also carries the
       // per-dispatch floor that batching removes.
-      if (!ctx.batching_enabled()) {
+      if (!ctx.batching_enabled() || total_ms > 0.0) {
         std::fprintf(stderr, "[vt vulkan] %-24s %8s %10s %7s %10s\n", "shader",
                      "count", "total ms", "%", "ms/call");
       } else {
+        // Reached only when batching is on AND the device could not timestamp
+        // (timestampComputeAndGraphics false, or the pool failed to create).
         std::fprintf(stderr,
-                     "[vt vulkan] per-shader TIME not measured under batching "
-                     "(one fence per batch, not per dispatch).\n"
+                     "[vt vulkan] per-shader TIME unavailable: batching is on and this "
+                     "device reports no compute timestamps.\n"
                      "[vt vulkan] Re-run with VT_VULKAN_BATCH=0 for per-kernel ms. "
                      "Counts below are exact.\n");
         std::fprintf(stderr, "[vt vulkan] %-24s %8s\n", "shader", "count");
@@ -857,6 +881,27 @@ void VulkanContext::FlushBatchLocked() {
   }
   Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 
+  // Read the timestamps back, now that the batch has certainly completed. This is
+  // what restores the per-shader TIME profile that batching removed -- and it
+  // measures GPU execution directly instead of a host-side fence wait.
+  auto* names = static_cast<std::vector<std::string>*>(batch_names_);
+  if (query_pool_ != nullptr && !names->empty()) {
+    const uint32_t n = static_cast<uint32_t>(names->size());
+    std::vector<uint64_t> ticks(n * 2, 0);
+    if (vk.vkGetQueryPoolResults(device, Unpack<VkQueryPool>(query_pool_), 0, n * 2,
+                                 ticks.size() * sizeof(uint64_t), ticks.data(),
+                                 sizeof(uint64_t),
+                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+        VK_SUCCESS) {
+      auto& acc = *static_cast<std::map<std::string, double>*>(dispatch_ms_);
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint64_t t0 = ticks[i * 2], t1 = ticks[i * 2 + 1];
+        if (t1 > t0) acc[(*names)[i]] += double(t1 - t0) * timestamp_period_ns_ / 1.0e6;
+      }
+    }
+    names->clear();
+  }
+
   // Every pipeline's ring is free again only AFTER the wait above.
   for (auto& kv : *static_cast<std::map<std::string, Pipeline>*>(pipelines_)) {
     kv.second.used_this_batch = 0;
@@ -939,6 +984,12 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
     Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(command_pool_), 0),
           "vkResetCommandPool");
     Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+    // The pool must be reset on the DEVICE timeline, inside the command buffer,
+    // before any query in it is written.
+    if (query_pool_ != nullptr) {
+      vk.vkCmdResetQueryPool(cmd, Unpack<VkQueryPool>(query_pool_), 0, kMaxBatch * 2);
+      static_cast<std::vector<std::string>*>(batch_names_)->clear();
+    }
     batch_open_ = true;
   } else {
     // BETWEEN recorded dispatches: the ops in a decode step are sequentially
@@ -960,7 +1011,20 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
                              nullptr);
   vk.vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size,
                         push_constants);
+  const bool timed = kBatchDispatch && query_pool_ != nullptr && batch_count_ < kMaxBatch;
+  if (timed) {
+    // TOP_OF_PIPE before / BOTTOM_OF_PIPE after brackets this dispatch's execution
+    // on the GPU. Because a barrier separates consecutive dispatches, the interval
+    // is this kernel's own time rather than an overlap with its neighbours.
+    vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           Unpack<VkQueryPool>(query_pool_), batch_count_ * 2);
+  }
   vk.vkCmdDispatch(cmd, group_count_x, 1, 1);
+  if (timed) {
+    vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                           Unpack<VkQueryPool>(query_pool_), batch_count_ * 2 + 1);
+    static_cast<std::vector<std::string>*>(batch_names_)->push_back(name);
+  }
 
   if (kBatchDispatch) {
     ++p.used_this_batch;

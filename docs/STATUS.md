@@ -411,7 +411,7 @@ Parakeet ASR (2026-08-07): *CPU-correct, ON THE ONE SURFACE (ROW 1)*. Ids exact 
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
 Vulkan (opt-125m exact, GEMV 1.8x,
-decode 8.59->59.3 t/s (6.9x); 2.7x off llama.cpp; GEMM 64% of kernel work
+decode 8.59->59.3 t/s (6.9x); HOST-bound now; qwen3_5 host-ptr bug fixed (#125), unrun off-CUDA
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 skeleton:
 backend, platform, 1 of 106 ops; **its HIP sources have never been compiled by
 anyone** — weaker than "build-supported", since no AMD board is here;
