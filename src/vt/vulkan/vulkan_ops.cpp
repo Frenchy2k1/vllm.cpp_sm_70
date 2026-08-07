@@ -367,6 +367,33 @@ void FusedChainKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight
 // The naive body is the portable correctness tier on purpose; the tiled and
 // cooperative-matrix ports (llama.cpp mul_mm.comp / mul_mm_cm2.comp) are VK-C,
 // which needs exactly this as its same-device A/B reference.
+// TACTIC SELECTION (VK-C). Every condition below is a HARD requirement of the
+// cooperative-matrix path, not a heuristic, and failing any one of them means the
+// scalar kernel -- which is always correct -- runs instead:
+//
+//   * the device reports the EXACT configuration the committed coopmat SPIR-V is
+//     written to (16x16x16, bf16/bf16/f32/f32, SUBGROUP). Vulkan matches
+//     configurations exactly, so "close enough" does not exist;
+//   * subgroup size is 32, because the shader's workgroup is a literal 32 (see
+//     the shader for why the size cannot travel as a specialization constant at
+//     this target);
+//   * BOTH operands are bf16. Every configuration GB10 reports takes
+//     bf16/f16/int8 inputs, so f32 operands can never use this path -- a hardware
+//     constraint, not a policy;
+//   * K is a multiple of 16. A ragged K tail cannot be masked inside a
+//     cooperative-matrix load, and silently truncating it would drop terms from
+//     the dot product. Ragged M and N are fine: the shader bounds-checks its
+//     store.
+//
+// MEASURED: GB10 satisfies all four; llvmpipe -- the only Vulkan device CI can
+// reach -- fails the first, so CI exercises the scalar tactic and this selection
+// returning false is the property CI can actually gate.
+bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k) {
+  const VulkanContext& ctx = VulkanContext::Get();
+  return ctx.coopmat_bf16_f32() && ctx.subgroup_size() == 32 &&
+         a.dtype == DType::kBF16 && b.dtype == DType::kBF16 && k % 16 == 0;
+}
+
 template <bool kBT>
 void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const int64_t m = a.shape[0], k = a.shape[1];
@@ -376,6 +403,22 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const uint32_t a_off = bind.Add(a, "matmul: a");
   const uint32_t b_off = bind.Add(b, "matmul: b");
   const uint32_t out_off = bind.Add(out, "matmul: out");
+
+  if (CoopMatMatmulUsable(a, b, k)) {
+    // One workgroup (= one subgroup) per 16x16 OUTPUT TILE. Deliberately not
+    // FlatGroupCount, which divides an element count by the workgroup size: here
+    // the whole subgroup cooperates on one tile.
+    const uint32_t tiles =
+        static_cast<uint32_t>(((m + 15) / 16) * ((n + 15) / 16));
+    const uint32_t spec[2] = {kBT ? 1u : 0u, DtypeCode(out.dtype)};
+    MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n),
+                   static_cast<uint32_t>(k), a_off, b_off, out_off};
+    Go("vt_matmul_coopmat", bind, p, tiles, spec, 2);
+    return;
+  }
+
+  // Scalar tactic: the portable reference, and the only one whose accumulation
+  // ORDER matches the CPU kernel's.
   // Ascending constantID order: a dtype, b dtype, out dtype, orientation.
   const uint32_t spec[4] = {DtypeCode(a.dtype), DtypeCode(b.dtype), DtypeCode(out.dtype),
                             kBT ? 1u : 0u};
