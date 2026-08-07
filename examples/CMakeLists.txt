@@ -76,3 +76,15 @@ vllm_cpp_set_warnings(minimax-h3-mux)
 add_executable(minimax-h3-gen minimax_h3_gen/main.cpp)
 target_link_libraries(minimax-h3-gen PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(minimax-h3-gen)
+
+# vulkan-gemm-ab: the VK-C tactic A/B — cooperative matrix vs the portable scalar
+# GEMM, SAME BINARY with VT_VULKAN_COOPMAT as the only variable. Built only in a
+# Vulkan build, because it links the Vulkan context directly to report which
+# tactic each arm actually ran (a silent fallback would post a plausible pair of
+# timings that mean nothing).
+if(VLLM_CPP_VULKAN)
+  add_executable(vulkan-gemm-ab ${CMAKE_SOURCE_DIR}/benchmarks/vulkan_gemm_ab.cpp)
+  target_link_libraries(vulkan-gemm-ab PRIVATE vllm::vllm)
+  target_include_directories(vulkan-gemm-ab PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  vllm_cpp_set_warnings(vulkan-gemm-ab)
+endif()
