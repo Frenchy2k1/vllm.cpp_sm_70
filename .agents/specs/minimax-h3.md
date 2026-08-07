@@ -774,3 +774,64 @@ the un-pinned target rows on them), NOT the prompt_embeds and NOT the DiT forwar
 dump the ref2va target-row VAE-input latent adjacency-cosine (like #77 did for the coherent fl2va,
 0.95) to confirm the target rows are white, and A/B the reference-row condition-noise vs a clean
 anchor.
+
+## 9. W-OAI — the `/v1/videos` OpenAI (Sora) WIRE SHAPE, 2026-08-06
+
+Row `SERVE-VIDEOS-OAI` (engine matrix, Serving surface), claim
+`CLAIM-SERVE-VIDEOS-OAI`, branch `row/SERVE-VIDEOS-OAI`.
+
+Developer-directed: an unmodified OpenAI client must work against `/v1/videos`.
+ADDITIVE — the vLLM-Omni-derived fields keep working, and every body that parsed
+before means exactly what it meant before.
+
+SPLIT, deliberately: this row is the REQUEST/RESPONSE SHAPE only (`model`,
+`size`, `seconds`, and the MP4 download route). It touches no generation code and
+loads no VAE. The REFERENCE CONDITIONING half (`input_reference` -> fl2va, plus
+the two `metadata` reference modalities -> ref2va) is a stacked follow-up row
+(spec §10), because it is a separate capability that pulls in the VAE
+encoder halves and the runner. Each half is independently reviewable and gated.
+
+### 9.0 Spike contract (`SERVE-VIDEOS-OAI`)
+
+| Section | Content |
+|---|---|
+| Scope | IN: the OpenAI (Sora) REQUEST SPELLINGS `model`, `size`, `seconds` on `/v1/videos`, their precedence against the native fields, the `model`-mismatch warning on the job, and `GET /v1/videos/{id}/content`. OUT: reference conditioning of any modality (§10); OpenAI's status vocabulary / id shape / `progress` / multipart upload; any change to generation, the DiT, the VAEs or the muxer. |
+| Upstream chain | OpenAI's published video API (`POST /v1/videos`, `GET /v1/videos/{video_id}/content`, `size` "WxH", `seconds` string enum) is the request CONTRACT; vLLM-Omni's `/v1/videos` async+sync job pair is the endpoint shape we already mirror. |
+| Our baseline | `ParseVideoRequest` took only the native spellings (`duration`, `height`/`width`, `num_frames`, `num_inference_steps`, `flow_shift`, `audio_flow_shift`, `seed`, plus `extra_params`); an OpenAI client's body parsed to DEFAULT geometry and duration. `VideoJobStore` had no `model`/`warning`. The routes stopped at status: the produced .mp4 was reachable only through the filesystem. |
+| Port map | Request contract -> `include/vllm/entrypoints/openai/video_api.h` (`VideoRequest::model` + `ParseVideoSize`) and `src/vllm/entrypoints/openai/video_api.cpp` (`ParseVideoRequest`, `ReadDuration`, `ParseWholeNumber`). Job record -> `VideoJobStore::Create(model, warning)` + `VideoJobStatusJson`. Download route -> `ApiServer::handle_video_content` + `video_model_warning` + their registration in `src/vllm/entrypoints/openai/api_server.cpp`. |
+| Tests to port | No upstream test module exists for this surface (OpenAI publishes an API, not tests; vLLM-Omni's video endpoint has no ported test). The contract is gated in-tree instead, extending the existing files: `tests/vllm/entrypoints/openai/test_video_api.cpp` (parsing, precedence, the job record) and `tests/vllm/entrypoints/openai/test_api_server.cpp` (routes, content behaviour, additivity over a real socket). Every assertion uses values that DIFFER from the field default. |
+| Gates | CPU, foreground: `test_video_api` 11/11 (125 assertions), `test_openai_api_server` 40/40 (509), `server` builds clean. Content route: 404 unknown / 409 unfinished (no bytes leaked) / 500 failed / 500 vanished / 200 byte-exact `video/mp4`. Additivity: with no `VideoRunner`, `POST /v1/videos` is 404 over a real socket with no `ErrorResponse` envelope; with one, it is 200 and the unknown-id 404 IS ours. Commands: `cmake --build build --target test_video_api test_openai_api_server server -j12`. Real-weights e2e rides §8's GB10/disk window. |
+| Dependencies | Row IDs: the MiniMax-H3 model rows and `row/H3-FP4-SPEED` (UNTOUCHED - no generation code changed); the stacked reference-conditioning row (§10) builds on this one. No new download, no GPU, no toolchain change for the CPU gate. |
+| Work breakdown | (1) alias parsing + precedence + `ParseVideoSize`; (2) `model` recording + the job `warning`; (3) `handle_video_content` + its route; (4) both test files; (5) docs + record. |
+| Risks/decisions | NATIVE-wins precedence: the only direction that leaves every previously-parsing body meaning what it meant. `model` mismatch WARNS rather than 404s: a Sora client cannot know the local model name, so a rejection would defeat the compatibility; silence would hide it. A 409 (never bytes) on an unfinished job: a partially muxed file would reach the client as a valid-looking, truncated MP4. No vLLM-defined behaviour is reopened. |
+
+### 9.1 The aliases and their precedence
+
+| OpenAI | Lands on | Notes |
+|---|---|---|
+| `model` | `VideoRequest::model` | Recorded + echoed; an unserved name is a job `warning`, never a rejection (a Sora client cannot know the local model's name) |
+| `size` | `width`, `height` | `"<w>x<h>"`, whole positive pixels, one `x`/`X` |
+| `seconds` | `duration_seconds` | Number OR numeric string — OpenAI types it as a string enum ("4"/"8"/"12") |
+
+PRECEDENCE: the NATIVE field WINS (`width`/`height` over `size`, `duration` over
+`seconds`). Both spellings are VALIDATED whichever wins, so a malformed `size` is
+a 400 even when explicit `width`/`height` override it. Precedence is PER-AXIS: an
+explicit `width` alone still lets `size` supply the height it did not specify.
+
+### 9.2 `GET /v1/videos/{id}/content`
+
+Returns the finished MP4 as `video/mp4`. Without it a caller could start and poll
+a job but never fetch the result over HTTP. Unknown id -> 404; queued/running ->
+409 naming the status (never a truncated file); failed -> 500 carrying the
+failure; a vanished output -> 500, not a 200 with zero bytes.
+
+### 9.3 Status
+
+- **CPU-LANDED + gated.** `test_video_api` 11/11 (125 assertions),
+  `test_openai_api_server` 40/40 (509), `server` builds clean. Additivity is
+  gated over a REAL socket: without a `VideoRunner` all four routes are absent
+  (a 404 with no `ErrorResponse` envelope), with one they serve.
+- **Residuals, named.** OpenAI's status vocabulary is not mirrored (ours stays
+  queued/running/succeeded/failed, ids `vid_N`, no `object`/`progress`/
+  `created_at`); reference conditioning is §10, not this row.
+- **Real-weights leg** rides the same GB10/disk window as §8.

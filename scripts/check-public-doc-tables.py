@@ -321,7 +321,17 @@ def features_errors(text: str) -> list[str]:
 # Lowering these numbers as the page is compacted is the gate closing.
 STATUS = ROOT / "docs/STATUS.md"
 STATUS_RATCHET = {
-    "chars": 284062,
+    # 283470 since 2026-08-07 (measured 283457): the `OpenAI server` row's cell
+    # was 1223 chars of endpoint prose, the single largest wall-of-prose cell on
+    # the page and exactly what MAX_CELL_CHARS targets. Collapsed to the binding
+    # result (which endpoints exist, which are flag-gated, which lack live
+    # backing) with the per-endpoint flag narrative kept in docs/USAGE.md and
+    # .agents/engine-matrix.md, which is what paid for the `/v1/videos` line
+    # this row owes the page. Set a few chars above the measurement rather than
+    # exactly on it: a ratchet pinned to the byte turns every concurrently
+    # merged row's one-line status edit into a spurious failure. Still strictly
+    # DOWN from 284062, the only direction this number may move.
+    "chars": 283470,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,

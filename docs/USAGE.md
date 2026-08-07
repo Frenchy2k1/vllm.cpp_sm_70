@@ -79,6 +79,15 @@ Registered in
 | POST | `/detokenize` | Detokenize token ids back to text |
 | GET | `/server_info` | Server info (`vllm_config`, `vllm_env`, `system_env`) |
 | POST | `/reset_prefix_cache` | Reset the prefix cache; returns `{"success": bool}` |
+| POST | `/v1/videos` | Start a video generation job, returns `{id, status}` (MiniMax-H3) |
+| POST | `/v1/videos/sync` | Same, but runs to completion before answering |
+| GET | `/v1/videos/{id}` | Job status |
+| GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
+
+The four `/v1/videos` routes are registered **only** when the server was started
+with `--video-dit`; without it they are absent (404) and the server is identical
+to one built without video support. See
+[MiniMax-H3: video + audio generation](#minimax-h3-video--audio-generation).
 
 ### Server flags
 
@@ -108,6 +117,64 @@ Registered in
 For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI
 API surface, auth, and metrics.
+
+## MiniMax-H3: video + audio generation
+
+`/v1/videos` generates video with sound through the MiniMax-H3 diffusion model.
+It speaks **OpenAI's Sora video shape**, so an OpenAI client works against it
+unmodified, and it keeps the richer native knobs alongside.
+
+```sh
+build/examples/server --model /path/to/Qwen3.6-27B \
+  --video-dit /path/to/h3-dit.gguf --video-vae /path/to/video-vae.safetensors \
+  --audio-vae /path/to/audio-vae.safetensors \
+  --video-vae-config video_vae/config.json --audio-vae-config audio_vae/config.json \
+  --video-encoder /path/to/h3-encoder.gguf
+```
+
+```python
+video = client.videos.create(model="sora-2-pro", prompt="a cat on a skateboard",
+                             size="1280x720", seconds="8")
+while client.videos.retrieve(video.id).status not in ("succeeded", "failed"):
+    time.sleep(5)
+open("out.mp4", "wb").write(client.videos.download_content(video.id).read())
+```
+
+### Request fields
+
+| Field | Spelling | Meaning |
+|---|---|---|
+| `prompt` | both | Required. The text conditioning |
+| `model` | OpenAI | Recorded and echoed back. A name this server does not serve is a `warning` on the job, never a rejection: the video model is chosen at startup |
+| `size` | OpenAI | `"<width>x<height>"`, e.g. `"1280x720"`. Whole pixels, both positive |
+| `seconds` | OpenAI | Duration, as a number or a numeric string (`8` and `"8"` both work) |
+| `width`, `height` | native | Output geometry in pixels |
+| `duration` | native | Duration in seconds |
+| `task` | native | `t2va`, `fl2va`, `ref2va`; defaults to `t2va` |
+| `num_frames`, `num_inference_steps`, `flow_shift`, `audio_flow_shift`, `seed` | native | The H3 generation knobs. Accepted at the top level or nested under `extra_params` |
+
+**Precedence.** When a body carries both spellings of one value, the **native
+field wins**: `width`/`height` beat `size`, `duration` beats `seconds`. That
+direction keeps every request that parses today meaning exactly what it meant
+before. Both spellings are validated either way, so a malformed `size` is a 400
+even when explicit `width`/`height` would have overridden it.
+
+### The job lifecycle
+
+`POST /v1/videos` returns immediately with `{"id": "vid_1", "status": "queued"}`;
+generation is minutes long, so the synchronous twin `POST /v1/videos/sync` exists
+for scripts that would rather block. `GET /v1/videos/{id}` reports `queued`,
+`running`, `succeeded` (with `output_path`) or `failed` (with `error`).
+
+`GET /v1/videos/{id}/content` returns the finished MP4 with
+`Content-Type: video/mp4`. An unknown id is a 404; a job that has not finished is
+a **409** naming its current status rather than a truncated file; a failed job is
+a 500 carrying its failure; an output that has since vanished from disk is a 500
+rather than a 200 with zero bytes.
+
+The library never spawns a process, so generation and muxing enter through a
+caller-supplied `VideoRunner` callback (`examples/server/main.cpp` supplies one
+that invokes `ffmpeg`, path configurable with `--video-ffmpeg`).
 
 ## Consuming it as a library (C ABI)
 

@@ -61,6 +61,139 @@ TEST_CASE("video api: request parsing applies H3 defaults and rejects bad input"
   CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","height":-8})"));
 }
 
+// ---------------------------------------------------------------------------
+// OpenAI's Sora video shape (developers.openai.com/api/docs/guides/video-generation):
+// {model, prompt, size:"<w>x<h>", seconds}. These are ALIASES
+// onto the native fields, so an OpenAI client works unmodified while every
+// existing body keeps its exact meaning.
+//
+// Every value below DIFFERS from the field's default, so a passing check proves
+// the parser was reached rather than that a default happened to match.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("video api: OpenAI `size` round-trips to width/height") {
+  const VideoRequest r = ParseVideoRequest(R"({"prompt":"a cat","size":"1280x720"})");
+  CHECK(r.width == 1280);   // default is 0
+  CHECK(r.height == 720);   // default is 0
+  // width x height, in that order: a portrait size must not come back landscape.
+  const VideoRequest portrait = ParseVideoRequest(R"({"prompt":"x","size":"720x1280"})");
+  CHECK(portrait.width == 720);
+  CHECK(portrait.height == 1280);
+  // The separator is case-insensitive; nothing else about the spelling is.
+  const VideoRequest upper = ParseVideoRequest(R"({"prompt":"x","size":"1024X1792"})");
+  CHECK(upper.width == 1024);
+  CHECK(upper.height == 1792);
+
+  // And the direct helper, so the geometry contract is gated without a body.
+  int64_t w = 0, h = 0;
+  vllm::openai::ParseVideoSize("1792x1024", &w, &h);
+  CHECK(w == 1792);
+  CHECK(h == 1024);
+}
+
+TEST_CASE("video api: a malformed `size` is a 400, never a silent default") {
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"1280"})"));       // no separator
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"1280x"})"));      // no height
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"x720"})"));       // no width
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"1280x720x2"})")); // two separators
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"1280 x 720"})")); // spaces
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"1280x720p"})"));  // trailing junk
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"-1280x720"})"));  // signed
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"0x720"})"));      // zero extent
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"1280.0x720"})")); // not whole
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":""})"));           // empty
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":720})"));          // not a string
+  // An UNREADABLE size stays a 400 even when width/height would override it: the
+  // client is never told the whole request was understood when half of it wasn't.
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","size":"nonsense","width":8,"height":8})"));
+}
+
+TEST_CASE("video api: OpenAI `seconds` maps to the duration, as number or string") {
+  const VideoRequest number = ParseVideoRequest(R"({"prompt":"x","seconds":8})");
+  CHECK(number.duration_seconds == doctest::Approx(8.0));  // default is 0.0
+  // OpenAI's schema types `seconds` as a STRING enum ("4"/"8"/"12"), so the
+  // literal client shape must parse too.
+  const VideoRequest text = ParseVideoRequest(R"({"prompt":"x","seconds":"12"})");
+  CHECK(text.duration_seconds == doctest::Approx(12.0));
+  const VideoRequest fractional = ParseVideoRequest(R"({"prompt":"x","seconds":"4.5"})");
+  CHECK(fractional.duration_seconds == doctest::Approx(4.5));
+
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","seconds":"soon"})"));   // not a number
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","seconds":"8s"})"));     // trailing junk
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","seconds":0})"));        // must be > 0
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","seconds":-4})"));
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","seconds":[8]})"));      // wrong type
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","seconds":"inf"})"));    // stod takes it; we must not
+}
+
+TEST_CASE("video api: the native spelling WINS over the OpenAI alias") {
+  // Documented precedence: `width`/`height` beat `size`, `duration` beats
+  // `seconds`. That direction is what guarantees every body which parses today
+  // keeps its exact meaning once the aliases exist.
+  const VideoRequest both = ParseVideoRequest(R"({
+    "prompt":"x", "size":"1280x720", "width":640, "height":480,
+    "seconds":8, "duration":3.0
+  })");
+  CHECK(both.width == 640);
+  CHECK(both.height == 480);
+  CHECK(both.duration_seconds == doctest::Approx(3.0));
+
+  // Per-axis, not all-or-nothing: an explicit width alone still lets `size`
+  // supply the height it did not specify.
+  const VideoRequest partial =
+      ParseVideoRequest(R"({"prompt":"x","size":"1280x720","width":640})");
+  CHECK(partial.width == 640);
+  CHECK(partial.height == 720);
+
+  // extra_params carries `duration` for vLLM-Omni clients; it wins there too.
+  const VideoRequest nested =
+      ParseVideoRequest(R"({"prompt":"x","seconds":8,"extra_params":{"duration":2.5}})");
+  CHECK(nested.duration_seconds == doctest::Approx(2.5));
+  // ... and with no `duration` anywhere, the top-level `seconds` applies even
+  // though extra_params is present (an OpenAI field is never nested).
+  const VideoRequest alias_only =
+      ParseVideoRequest(R"({"prompt":"x","seconds":8,"extra_params":{"flow_shift":9.5}})");
+  CHECK(alias_only.duration_seconds == doctest::Approx(8.0));
+  CHECK(alias_only.flow_shift == doctest::Approx(9.5));
+}
+
+TEST_CASE("video api: `model` is recorded, never a parse failure") {
+  const VideoRequest r = ParseVideoRequest(R"({"prompt":"x","model":"sora-2-pro"})");
+  CHECK(r.model == "sora-2-pro");  // default is empty
+  // Whether it names something this server serves is the ROUTE's call (a warning
+  // on the job); the parser only refuses shapes it cannot record.
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","model":7})"));
+  CHECK_THROWS(ParseVideoRequest(R"({"prompt":"x","model":""})"));
+  // Absent stays absent.
+  CHECK(ParseVideoRequest(R"({"prompt":"x"})").model.empty());
+}
+
+TEST_CASE("video api: a whole OpenAI-shaped body parses, keeping our rich fields") {
+  // The exact shape an unmodified OpenAI client sends, plus our native knobs
+  // alongside: this is ADDITIVE compatibility, not a replacement.
+  const VideoRequest r = ParseVideoRequest(R"({
+    "model": "sora-2-pro",
+    "prompt": "a cat on a skateboard",
+    "size": "1280x720",
+    "seconds": "8",
+    "task": "t2va",
+    "extra_params": {"num_frames": 97, "num_inference_steps": 30, "flow_shift": 9.5,
+                     "audio_flow_shift": 2.5, "seed": 4242}
+  })");
+  CHECK(r.model == "sora-2-pro");
+  CHECK(r.prompt == "a cat on a skateboard");
+  CHECK(r.width == 1280);
+  CHECK(r.height == 720);
+  CHECK(r.duration_seconds == doctest::Approx(8.0));
+  CHECK(r.task == "t2va");
+  CHECK(r.num_frames == 97);
+  CHECK(r.num_inference_steps == 30);   // default 50
+  CHECK(r.flow_shift == doctest::Approx(9.5));        // default 12.0
+  CHECK(r.audio_flow_shift == doctest::Approx(2.5));  // default 3.0
+  CHECK(r.has_seed);
+  CHECK(r.seed == 4242);
+}
+
 TEST_CASE("video api: the job store enforces its lifecycle") {
   VideoJobStore store;
   CHECK(store.Size() == 0);
@@ -137,6 +270,31 @@ TEST_CASE("video api: status JSON reports exactly what the client needs") {
   CHECK(failed.at("status") == "failed");
   CHECK(failed.at("error") == "boom");
   CHECK_FALSE(failed.contains("output_path"));
+}
+
+TEST_CASE("video api: the requested model and its mismatch note ride the job") {
+  VideoJobStore store;
+  const std::string id = store.Create("sora-2-pro", "not a served model");
+  VideoJob job;
+  REQUIRE(store.Get(id, &job));
+  CHECK(job.model == "sora-2-pro");
+  CHECK(job.warning == "not a served model");
+
+  // They survive to the terminal state, so a poller that only ever sees the
+  // FINISHED record still learns the model it asked for was not the one used.
+  store.MarkRunning(id);
+  store.MarkSucceeded(id, "/tmp/a.mp4");
+  REQUIRE(store.Get(id, &job));
+  nlohmann::json done = nlohmann::json::parse(VideoJobStatusJson(job));
+  CHECK(done.at("model") == "sora-2-pro");
+  CHECK(done.at("warning") == "not a served model");
+
+  // A job with neither omits both keys rather than emitting empty strings.
+  VideoJob plain;
+  REQUIRE(store.Get(store.Create(), &plain));
+  nlohmann::json plain_json = nlohmann::json::parse(VideoJobStatusJson(plain));
+  CHECK_FALSE(plain_json.contains("model"));
+  CHECK_FALSE(plain_json.contains("warning"));
 }
 
 TEST_CASE("video api: the job store is safe under concurrent creation") {

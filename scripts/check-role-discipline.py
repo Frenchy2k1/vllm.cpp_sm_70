@@ -75,24 +75,44 @@ def is_feature_path(path: str) -> bool:
     return path in FEATURE_FILES or path.startswith(FEATURE_PREFIXES)
 
 
-def arrives_via_row_pr(parents: list[str], subject: str, body: str) -> bool:
+def arrives_via_row_pr(
+    parents: list[str], subject: str, body: str, merged_messages: tuple[str, ...] = ()
+) -> bool:
     """Whether this commit reached main through a reviewed row/* PR."""
     message = f"{subject}\n{body}"
     if len(parents) >= 2:
         # A merge commit is a PR merge when it names the branch or the PR.
-        return bool(ROW_BRANCH.search(message) or PR_REFERENCE.search(message))
+        if ROW_BRANCH.search(message) or PR_REFERENCE.search(message):
+            return True
+        # ... or when the branch it MERGES IN does. GitHub builds a SYNTHETIC
+        # merge for `refs/pull/N/merge` whose entire message is
+        # "Merge <head> into <base>": it names neither the row branch nor the PR,
+        # and it never lands on main. CI checks out exactly that commit, so every
+        # feature PR failed a gate about MAIN's history, on a commit that is not
+        # main's history. The reviewed content is the SECOND parent, the PR head,
+        # so a merge of a branch whose own commits name the row IS arrival
+        # through a row PR, one hop away. A merge of a branch that names neither
+        # still fails, which is the case this gate exists for.
+        return any(
+            bool(ROW_BRANCH.search(m) or PR_REFERENCE.search(m)) for m in merged_messages
+        )
     # GitHub squash-merges land a single commit carrying "(#N)".
     return bool(ROW_BRANCH.search(message) or PR_REFERENCE.search(subject))
 
 
 def commit_violations(
-    commit: str, parents: list[str], subject: str, body: str, paths: list[str]
+    commit: str,
+    parents: list[str],
+    subject: str,
+    body: str,
+    paths: list[str],
+    merged_messages: tuple[str, ...] = (),
 ) -> list[str]:
     """Return the reasons this commit breaks role discipline (empty if fine)."""
     features = sorted(p for p in paths if is_feature_path(p))
     if not features:
         return []
-    if arrives_via_row_pr(parents, subject, body):
+    if arrives_via_row_pr(parents, subject, body, merged_messages):
         return []
     preview = ", ".join(features[:4])
     if len(features) > 4:
@@ -119,7 +139,10 @@ def inspect(commit: str) -> list[str]:
     subject = git("log", "-1", "--format=%s", commit)
     body = git("log", "-1", "--format=%b", commit)
     short = git("rev-parse", "--short", commit)
-    return commit_violations(short, parents, subject, body, commit_paths(commit))
+    # The messages of the branches this commit MERGES IN (parents[1:]), for the
+    # synthetic-PR-merge case in arrives_via_row_pr.
+    merged = tuple(git("log", "-1", "--format=%s%n%b", parent) for parent in parents[1:])
+    return commit_violations(short, parents, subject, body, commit_paths(commit), merged)
 
 
 def enforced(commit: str) -> bool:
