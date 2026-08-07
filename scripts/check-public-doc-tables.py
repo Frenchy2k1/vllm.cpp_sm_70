@@ -367,6 +367,14 @@ STATUS_RATCHET = {
     # on the page deliberately - it was the first thing that fit when trimming,
     # and dropping the unflattering number to satisfy a size limit is how a
     # status page starts reading better than the code. Net -4.
+
+    #
+
+    #
+    # 283442 since 2026-08-07 (measured 283442): the Vulkan row records the VOID
+    # subgroup-reduction outcome, paid for by dropping the native-kernel COUNT,
+    # which is derivable from the linked campaign doc while a void result is not
+    # derivable from anywhere. Net -0.
     "chars": 279200,
     "h2_sections": 11,
     "long_paragraphs": 89,

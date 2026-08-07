@@ -15379,3 +15379,49 @@ real rather than only gating that it is refused.
 wider per-lane loads and subgroup reductions in place of shared memory are the
 obvious next steps. `vt_rms_norm` is now the second cost at ~18%.
 
+### VK-F follow-up: the SUBGROUP reduction is a WASH — built, measured, NOT shipped (2026-08-07, GB10)
+
+The remaining GEMM headroom was chased in the obvious direction and the obvious
+direction was wrong. Recorded because the negative result redirects the next lever.
+
+**What was built.** `vt_matmul_vec` gives each output element a 128-lane workgroup
+and reduces through shared memory: a 7-step halving tree with a barrier at every
+step. For lm_head at K=1024 that is 8 loads per lane against 7 barriers, so the
+reduction looked like the larger half. `vt_matmul_vec_sg` gave each output element
+one SUBGROUP instead, reducing with a single `subgroupAdd` — no barriers, no
+shared memory, 4x more terms per lane. This is llama.cpp's own `mul_mat_vec`
+structure. It needed a probe (`VK_SUBGROUP_FEATURE_ARITHMETIC_BIT` in compute,
+optional in Vulkan 1.1 and a PIPELINE-CREATION failure where absent), a second
+committed module (the extension is compile-time, so it cannot be a specialization
+constant), and a `VT_VULKAN_GEMV_SG` bisect lever.
+
+It WORKED: llvmpipe supports subgroup arithmetic, so CI exercised the subgroup
+path rather than the fallback; `test_vulkan_backend` 15/15 on both devices;
+opt-125m STRICT 6/6 token-exact.
+
+**And it bought nothing.**
+
+| comparison | GEMM ms/call | decode tok/s |
+|---|---|---|
+| sg vs SCALAR, 8 interleaved pairs | 2.51x, 7/8 | 2.06x, 6/8 |
+| sg vs WORKGROUP form, 8 interleaved pairs, ONE binary | **4/8 pairs, median 1.05x** | **4/8 pairs** |
+
+**An exact coin flip.** A cross-session read had suggested ~1.2x (sg 2.66x over
+scalar in one session versus vec 1.80x in another) and that advantage did NOT
+survive a paired test — it was session drift, which is precisely what this box's
+2.1x run-to-run swing produces and why the `VT_VULKAN_GEMV_SG` lever had to exist
+before the claim could be made at all.
+
+**REVERTED.** A second SPIR-V module, an optional-feature probe, a
+device-dependent code path and a fourth env lever, for a measured wash. The
+workgroup form is simpler, has no optional-feature dependency and runs everywhere.
+
+**WHAT THE NEGATIVE RESULT BUYS.** Replacing a 7-barrier shared-memory tree with
+one instruction changed nothing measurable, so **the reduction was never the
+cost** — which was the premise of the whole attempt. The GEMV is a memory-path
+problem, and it is not yet at the roof either: 1.50 GB of bf16 weights per decode
+token against GB10's ~273 GB/s is a 5.49 ms floor, i.e. ~182 tok/s, versus 19.8
+measured — still **~9x off**. So the next lever is the memory path (wider per-lane
+loads, weight layout), NOT the reduction and NOT dispatch batching (`VK-A2`,
+already capped at 1.15x).
+

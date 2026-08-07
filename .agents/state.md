@@ -41914,3 +41914,47 @@ because a genuinely new row exists.
   declines at M=1. Each is a named, separately measurable lever.
 
   **Durable lesson: a run that never finishes is not a slow run until proven so.**
+
+- **2026-08-07 (levers)** — **★ Measured the three `VK-E` levers before building
+  them; TWO WERE DEAD, and a fourth idea died on the bench
+  (`CLAIM-VULKAN-FULL-1`).**
+
+  **The pattern that keeps paying: measure the lever before building it.**
+
+  | lever | verdict |
+  |---|---|
+  | 71/87 ops on the CPU tier | IRRELEVANT — exactly ONE fires per run, at setup |
+  | per-op sync dispatch (`VK-A2`) | CEILING **1.15x** — measured, not estimated |
+  | kernel quality | CONFIRMED, and it is where everything is |
+  | subgroup reduction (my own idea) | **WASH** — 4/8 pairs. Built, then reverted |
+
+  `VK-A2` was the one I had already PUBLISHED as "the measured bottleneck". A
+  dispatch-floor sweep killed it: cost is dead flat at **0.046 ms from 256 to
+  262,144 elements**, a 1,024x change in work, so that value is pure per-dispatch
+  overhead — 13% of the model's 0.357 ms average. Perfect batching saves 136 ms of
+  1,054 against a 19-27x gap. One benchmark to learn; a day to have built.
+
+  **SHIPPED:** argmax **18.9x** (a 151,936-entry vocabulary was being scanned on
+  ONE lane), and the GEMV tactic **1.8x** on the GEMM, 7/8 pairs — the old kernel
+  left adjacent lanes 2 KB apart, each pulling its own cache line for 2 bytes of
+  it. opt-125m stayed 6/6 token-exact, which mattered because the GEMV changes the
+  accumulation order and a decode GEMM feeds the sampler.
+
+  **NOT SHIPPED:** the subgroup form of that reduction. It worked, gated green on
+  both devices, and was an exact coin flip against the workgroup form in a direct
+  paired A/B — the ~1.2x that a cross-session read had suggested was session
+  drift. A second module, a probe, a device-dependent path and a fourth lever, for
+  nothing.
+
+  **Two durable lessons.** (1) A `>=` where a `>` belongs: my first argmax tree
+  returned token 900 where the CPU returns 8, with a perfectly correct maximum
+  VALUE — a halving tree does not combine lanes in index order, so "keep the left
+  operand" is not first-wins. Only the gate caught it. (2) **Absolute timings on
+  this box are unusable** (five identical repeats: 322.5-684.3 ms, 2.1x). Every
+  claim here is a per-pair majority from INTERLEAVED arms; the first GEMV A/B ran
+  the arms in blocks, the OFF arm degraded monotonically because it ran last, and
+  it was thrown away.
+
+  Next lever is the MEMORY PATH: the reduction is not the cost, and decode is
+  still ~9x off the bandwidth roof (1.50 GB/token vs ~273 GB/s = 182 tok/s
+  ceiling, 19.8 measured).
