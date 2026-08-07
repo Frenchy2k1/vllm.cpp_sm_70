@@ -30,6 +30,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace vt::vulkan {
 
@@ -85,6 +87,21 @@ class VulkanContext {
   // that checks numbers alone passes identically when the fallback served the
   // call -- the same trap the op-provider decline counters exist for.
   bool PipelineExistsFor(const std::string& name) const;
+
+  // DISPATCH ACCOUNTING (VK-E deep dive). Total submits, and a per-shader
+  // histogram. This exists because a wall-clock number could not distinguish two
+  // very different stories: a reasonable dispatch count each paying a large
+  // fence-wait, versus dispatching far more times than the model should need.
+  // Context-switch counts could not separate them either -- the driver's fence
+  // wait is a poll() loop that may wake more than once per fence -- so the count
+  // has to come from OUR side of the boundary.
+  //
+  // Always-on and lock-free-ish (guarded by the same mutex the dispatch already
+  // takes), because the cost is one increment against a submit that already costs
+  // milliseconds. `VT_VULKAN_DISPATCH_STATS=1` prints the histogram at exit.
+  uint64_t dispatch_count() const;
+  // name -> count, sorted by count descending. For the diagnostic dump.
+  std::vector<std::pair<std::string, uint64_t>> DispatchHistogram() const;
 
   // Number of distinct pipelines currently cached. Exposed for the unit gate: it
   // is how a test proves a new specialization produced a NEW pipeline rather than
@@ -159,6 +176,8 @@ class VulkanContext {
   void* scratch_buffer_ = nullptr;   // VkBuffer
   void* scratch_memory_ = nullptr;   // VkDeviceMemory
   void* scratch_mapped_ = nullptr;   // host pointer
+  void* dispatch_hist_ = nullptr;    // std::map<std::string, uint64_t>*
+  uint64_t dispatch_total_ = 0;
   void* pipelines_ = nullptr;        // std::map<std::string, Pipeline>*
   void* mutex_ = nullptr;            // std::mutex*
   uint32_t queue_family_ = 0;

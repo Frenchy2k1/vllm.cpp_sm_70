@@ -41739,3 +41739,178 @@ ratchet, so the Parakeet line was TIGHTENED while gaining the RNN-T/TDT coverage
 and two more verified checkpoints; the page NET-SHRINKS to 284063 and the ratchet
 was LOWERED to match. `check-agent-record.py`'s MODEL row count goes 360 -> 361
 because a genuinely new row exists.
+- **2026-08-07 (later)** — **`VK-E` UNBLOCKED and the denominator is now a FAIR one;
+  ours deliberately quoted as NO RATIO (`CLAIM-VULKAN-FULL-1`).**
+
+  The blocker recorded earlier ("no model on dgx loads in both engines") is
+  resolved WITHOUT needing `VK-D`: the stock `Qwen/Qwen3-0.6B` snapshot was
+  converted to GGUF with **llama.cpp's own** `convert_hf_to_gguf.py`, so llama.cpp
+  runs the GGUF and vllm.cpp runs the safetensors it came from — **byte-identical
+  weights by construction**, which is what makes the pairing falsifiable instead
+  of merely same-named.
+
+  **llama.cpp Vulkan, `NV_coopmat2`, Qwen3-0.6B F16 (1.40 GiB, 751.63 M):
+  pp128 11,514.16 ± 388.21 t/s, tg32 160.91 ± 1.54 t/s.** Consistent with the
+  finetune-GGUF run (11,730 / 161.4), which sanity-checks the measurement.
+
+  **vllm.cpp SELECTS Vulkan** (`[vt reference-tier] op=… device=3`, device 3 =
+  `kVULKAN`) **and is orders of magnitude slower** — a 4-prompt/128-in/32-out run
+  did not finish in 900 s against llama.cpp's seconds. Expected, not a defect:
+  **71 of 87 ops run on the portable CPU reference tier**, so this measures our
+  HOST FALLBACK wearing a Vulkan label. The tier announces itself per op, which is
+  why the slowness is attributable rather than mysterious.
+
+  **★ NO RATIO IS QUOTED, deliberately.** A number here would be read as "our
+  Vulkan vs their Vulkan" when it is "our CPU tier vs their Vulkan". It becomes
+  meaningful when native coverage closes; the progress metric is
+  `vt::GetReferenceTierHits()` reaching 0, and for THIS model the remaining ops are
+  the RoPE table build, the sampler tail, and the residual norm/glue set.
+
+  Toolchain note: the converter needs `transformers`+`gguf`+`torch` and no single
+  interpreter on dgx had all three (oracle venv has transformers, not gguf; system
+  python has gguf+torch, not transformers). Solved with **zero installs and zero
+  disk** via `PYTHONPATH=~/venvs/vllm-oracle/lib/python3.12/site-packages` into the
+  system python. The oracle venv was deliberately NOT pip-installed into — it is
+  the parity oracle and was expensive to repair.
+
+- **2026-08-07 (correction)** — **`VK-E`: the vllm.cpp Vulkan arm is GPU-BOUND, not
+  CPU-bound. My previous entry's attribution was WRONG.**
+
+  Measured mid-run (`vllm-bench`, Qwen3-0.6B, 1 prompt / 32 in / 8 out, 26 min
+  elapsed): **process CPU 1.6 %, GPU utilisation 96 %**, and `nvidia-smi
+  --query-compute-apps` shows our PID as the ONLY GPU compute app at 2,066 MiB. A
+  run pinned on the portable CPU reference tier would show the opposite — CPU
+  saturated, GPU idle.
+
+  A second assumption also failed: the weights are **BF16** (all 311 tensors), so
+  the coopmat dtype precondition is satisfiable; this is not "f16 model, coopmat
+  ineligible".
+
+  **The real cause is UNMEASURED and deliberately not replaced with another
+  guess.** Candidates in test order: (1) **per-op synchronous dispatch** —
+  `Dispatch` records, submits and fence-waits for EVERY op, the W0 skeleton's
+  documented "correct, not fast" design, and `VK-A2` (async submission +
+  command-buffer reuse) was scoped as "the single biggest speed lever" and NEVER
+  BUILT; (2) the naive scalar GEMM at call sites where coopmat's K%16 or dtype
+  precondition fails; (3) paged attention's sequential key walk.
+  `GetReferenceTierHits()` plus the provider counters separate (1)-(3), and
+  `VT_VULKAN_COOPMAT=0` isolates (2).
+
+  **Lesson: "we know why it is slow" is a claim like any other.** The 16/87
+  op-coverage figure made the CPU-tier story feel obvious enough to write into the
+  record without checking `top`, and it was wrong. The op count says what COULD be
+  slow, not what IS.
+
+- **2026-08-07 (attribution MEASURED)** — **The Vulkan e2e bottleneck is PER-OP
+  SYNCHRONOUS DISPATCH. Both of my earlier explanations were wrong.**
+
+  Prompted by the right question — "26 minutes for 1 prompt is a lot, are we sure
+  it's all right?" — because that number is not merely slow, it is
+  ~1000x more than any kernel inefficiency can explain.
+
+  **Arithmetic first.** Qwen3-0.6B is ~0.6 B params → ~1.2 GFLOP per token
+  position; 40 positions plus lm_head ≈ **48-60 GFLOP**. Our NAIVE scalar Vulkan
+  GEMM measures **52 GFLOP/s**. So even entirely on the slow kernel the compute is
+  **1-2 SECONDS** against ~34 minutes of wall clock. The kernels cannot be the
+  story.
+
+  **Measured.** `gdb -p` stack samples: **6 of 6** in `poll()` inside the NVIDIA
+  driver, called from `VulkanContext::Dispatch`, under
+  `ForwardLayers → MatmulGeneric<true>`. `/proc/<pid>/status`: 202,770 → 203,730
+  voluntary context switches in 10 s = **~96 blocking waits/second**. Process CPU
+  1.6 %. So the run is neither hung nor computing — it is WAITING, ~99 % of the
+  time.
+
+  **`Dispatch` records, submits and FENCE-WAITS for every single op** — the W0
+  skeleton's documented "correct, not fast" design. The GPU's 96 % "utilisation"
+  is the driver context being resident while we poll, not compute saturation;
+  on Tegra/GB10 that counter cannot separate the two, which is exactly how it
+  misled me into the GPU-bound reading after the CPU-tier reading.
+
+  **Two wrong claims retired, in order:** (1) "it is the CPU reference tier,
+  71/87 ops" — refuted by CPU 1.6 %; (2) "it is GPU-bound" — technically true of
+  the utilisation counter, false as an attribution, since the GPU is idle-waiting
+  inside our own fence. Op coverage is a real limitation but is NOT what makes
+  this workload slow.
+
+  **Roadmap consequence.** `VK-A2` (async submission + command-buffer reuse,
+  `SupportsGraphCapture()` via pre-recorded `VkCommandBuffer`) was scoped in the
+  campaign spec as "the single biggest speed lever", deferred, and is now the
+  MEASURED bottleneck. It outranks further native-kernel work for anything
+  end-to-end: every additional native op would still pay a ~10 ms round trip.
+
+- **2026-08-07 (VK-E close-out)** — **The minimal workload ALSO never completed, so
+  there is NO vllm.cpp Vulkan e2e number at all — and a SECOND anomaly is open.**
+
+  1 prompt / 32 in / 8 out hit its 2400 s timeout with no result line, after the
+  earlier 4-prompt run hit 900 s. So VK-E has llama.cpp's denominator and **nothing
+  on our side, not even a slow figure**.
+
+  **The dispatch COUNT does not add up, separately from the latency.** At the
+  measured ~96 waits/s, 40 minutes is **~230,000 waits**. A 28-layer Qwen3-0.6B
+  forward should need ~11 dispatches per layer ≈ **~310 per forward**; even
+  counting 32 prefill positions and 8 decode steps generously that is a few
+  thousand, not 230,000 — roughly an order of magnitude and a half unexplained.
+
+  **Two candidates, NOT distinguished:** (a) waits ≠ dispatches, because the
+  driver's fence wait is a `poll()` loop that may wake several times per fence, in
+  which case only the latency finding stands; (b) we genuinely dispatch far more
+  than expected — a per-token or per-head dispatch where per-tensor was intended,
+  or `kFusedChain` issuing one dispatch per recipe step.
+
+  **Cheap next step:** a dispatch counter on `VulkanContext`, or
+  `VT_OP_PROVIDER_STATS=1` per-op selection counts, printed per forward. Until
+  then this is an OPEN QUESTION, not a confirmed second defect — recorded that way
+  deliberately, since I already published two wrong attributions in this session by
+  reasoning ahead of measurement.
+
+  dgx left clean: no process, GPU lock released.
+
+- **2026-08-07 (RESOLVED)** — **★ It was a GPU HANG, not slowness. A coopmat
+  out-of-bounds LOAD faulted the GPU; the fence never signalled. Fixed, and VK-E
+  now has BOTH arms (`CLAIM-VULKAN-FULL-1`).**
+
+  **Three published attributions in this session were all wrong**, each inferred
+  from an indirect signal instead of instrumenting the thing that was blocking:
+  (1) "the CPU reference tier, 71/87 ops" — from an op count; refuted by CPU 1.6 %.
+  (2) "GPU-bound" — from GPU-utilisation %, which on Tegra cannot separate compute
+  from a resident context polling a fence. (3) "per-op synchronous dispatch is the
+  measured bottleneck, ~96 waits/s" — the waits were real but they were the
+  driver's `poll()` loop spinning on ONE fence that never completed.
+
+  **The find.** Dispatch instrumentation showed ~300 submits in 1.2 s then
+  silence, with NO slow-dispatch line — and that ABSENCE was the clue, because the
+  timing print only runs after the wait returns. Tracing each submit BEFORE the
+  wait named it at once: `#368 vt_matmul_coopmat groups=9496`, the lm_head GEMM at
+  **M=1**.
+
+  **The defect, mine, merged earlier today.** `coopMatLoad` reads a FULL 16x16
+  tile with no masking; at M=1 it read 15 rows (~30 KB) past the activation
+  buffer, faulting the GPU so `vkWaitForFences(UINT64_MAX)` never returned. The
+  shader's comment claimed ragged M/N were safe "because the store is
+  bounds-checked" — the store guard cannot help when the fault is on the LOAD.
+
+  **Why my own gate missed it.** It used M=20, N=12 *specifically* to exercise
+  ragged shapes and passed: the OOB read stayed INSIDE the allocation and its
+  garbage rows were discarded by the bounds-checked store. Raggedness was not
+  enough — the read must LEAVE the allocation to fault, which needs a large N
+  against a small operand, i.e. lm_head at decode.
+
+  **Fix:** tactic requires `m % 16 == 0 && n % 16 == 0` too; decode falls back to
+  scalar (where coopmat would waste 15/16 of a tile anyway). New gate asserts the
+  DECLINE at M=1, N=17 — expressible only as a tactic assertion, since the bad
+  path hangs rather than returning a wrong number. GB10: 13/13, 509 assertions.
+
+  **Result: 40+ minutes of not-finishing became 1,125 ms.**
+
+  | engine (same weights) | prefill tok/s | decode tok/s |
+  |---|---:|---:|
+  | llama.cpp Vulkan `NV_coopmat2` | **11,514** | **160.9** |
+  | vllm.cpp Vulkan | 22.98 | 5.85 |
+
+  ~500x prefill / ~27x decode behind — honest, and not yet diagnostic: 71/87 ops
+  still on the CPU tier, dispatch is still one submit+fence per op (`VK-A2`
+  unbuilt), and the scalar GEMM now serves every decode GEMM since coopmat
+  declines at M=1. Each is a named, separately measurable lever.
+
+  **Durable lesson: a run that never finishes is not a slow run until proven so.**
