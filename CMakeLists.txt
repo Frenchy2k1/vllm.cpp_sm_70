@@ -653,6 +653,19 @@ add_library(vllm STATIC
   src/vllm/multimodal/hasher.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
+  # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
+  # (spike .agents/specs/parakeet-conformer-encoder.md row P4). A standalone
+  # forward composed from the P1-P3 vt:: kernels, NOT a registry architecture —
+  # vLLM does not register one either (parakeet.py is a component of
+  # nano_nemotron_vl.py, and it delegates the encoder itself to transformers).
+  src/vllm/model_executor/models/parakeet_encoder.cpp
+  # The RNN-T / TDT transducer heads over that encoder (row P5). Upstream after
+  # all: transformers `main` implements ParakeetRNNTDecoder / ParakeetForRNNT /
+  # ParakeetForTDT, which the P4 spike wrongly recorded as absent because it
+  # measured the LOCALLY INSTALLED 5.3.0. Corrected in the spike.
+  src/vllm/model_executor/models/parakeet_transducer.cpp
+  src/vllm/model_executor/models/parakeet_weights.cpp
+  src/vllm/multimodal/parakeet_audio_processor.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
@@ -853,6 +866,12 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_quant_traits.cpp
   src/vt/cpu/cpu_quant_gemm.cpp
   src/vt/cpu/cpu_layernorm.cpp
+  # Conformer / FastConformer audio-encoder kernels (spike
+  # .agents/specs/parakeet-conformer-encoder.md rows P1/P2/P3). Self-registering
+  # translation units, reached through vllm's INTERFACE --whole-archive option.
+  src/vt/cpu/cpu_conv2d.cpp
+  src/vt/cpu/cpu_conv1d_depthwise.cpp
+  src/vt/cpu/cpu_attn_relpos.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
   src/vt/cpu/cpu_mla_prefill.cpp
