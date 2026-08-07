@@ -50,6 +50,35 @@ const bool kDispatchStats = [] {
   const char* v = std::getenv("VT_VULKAN_DISPATCH_STATS");
   return v != nullptr && std::strcmp(v, "0") != 0;
 }();
+// COMMAND-BUFFER BATCHING (VK-A2), VT_VULKAN_BATCH.
+//
+// DEFAULT ON. `=0` forces the per-dispatch submit-and-wait path, as a bisect
+// lever and for the same-binary A/B that measured this (decode 2.62x, 8 of 8
+// interleaved pairs on GB10).
+//
+// Batching is sound only if EVERY host read of device memory drains the batch
+// first, and there are exactly three such paths. Backend::Copy and Memset are
+// host memcpy over the persistently mapped allocation, and Synchronize is the
+// caller's explicit "make results readable" point -- all three flush. The third
+// is not a method on this backend at all: the PORTABLE REFERENCE TIER runs CPU
+// kernels DIRECTLY over device memory for any op with no native Vulkan kernel,
+// which is sound only because this backend is unified-memory.
+//
+// That last one is covered by `Backend::FlushPending` (backend.h:44-49), which
+// op_provider.cpp calls before dispatching a reference-tier kernel and which the
+// Vulkan backend implements. Without it a host kernel would read bytes a pending
+// dispatch had not written -- silently, with no error, which is the failure mode
+// this campaign has already paid for twice.
+const bool kBatchDispatch = [] {
+  const char* v = std::getenv("VT_VULKAN_BATCH");
+  return v == nullptr || std::strcmp(v, "0") != 0;
+}();
+
+// Cap on dispatches per submit. Bounded so a batch cannot pin an unbounded number
+// of descriptor sets, and so the fence granularity stays coarse enough to be
+// worth batching but fine enough to bound latency.
+constexpr uint32_t kMaxBatch = 128;
+
 const std::chrono::steady_clock::time_point g_dispatch_t0 =
     std::chrono::steady_clock::now();
 
@@ -256,12 +285,28 @@ Probe ProbeDevice(VkInstance instance) {
 
 // ---------------------------------------------------------------------------
 
+// How many descriptor sets each pipeline owns (VK-A2).
+//
+// A DESCRIPTOR SET IS READ AT EXECUTION TIME, NOT RECORD TIME. With one set per
+// pipeline -- the pre-VK-A2 shape -- recording two dispatches of the same
+// pipeline into one command buffer would have the second vkUpdateDescriptorSets
+// overwrite the first's operands before the GPU ran either. That was sound only
+// because every dispatch waited on a fence before the next one touched the set.
+// Batching therefore needs a set PER RECORDED DISPATCH, which is the substantive
+// part of this row; deferring the submit alone would silently compute garbage.
+//
+// The ring is bounded, so a pipeline used more than kDescriptorRing times in one
+// batch forces a flush. That is a throughput ceiling, never a correctness
+// question: the flush happens before the set is reused.
+constexpr uint32_t kDescriptorRing = 16;
+
 struct VulkanContext::Pipeline {
   VkShaderModule module = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
   VkPipelineLayout layout = VK_NULL_HANDLE;
   VkPipeline pipeline = VK_NULL_HANDLE;
-  VkDescriptorSet set = VK_NULL_HANDLE;
+  VkDescriptorSet sets[kDescriptorRing] = {};
+  uint32_t used_this_batch = 0;  // reset by FlushBatchLocked
   uint32_t buffer_count = 0;
   uint32_t push_size = 0;
 };
@@ -447,10 +492,12 @@ VulkanContext::VulkanContext() {
       static_cast<uint32_t>(kSpirvModuleCount) * kSpecializationHeadroom;
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_size.descriptorCount = kernels * kMaxBindings;
+  pool_size.descriptorCount = kernels * kDescriptorRing * kMaxBindings;
   VkDescriptorPoolCreateInfo dpci{};
   dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  dpci.maxSets = kernels;
+  // kDescriptorRing sets per pipeline now, not one -- see the ring's comment for
+  // why batching cannot share a set across recorded dispatches.
+  dpci.maxSets = kernels * kDescriptorRing;
   dpci.poolSizeCount = 1;
   dpci.pPoolSizes = &pool_size;
   VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
@@ -692,12 +739,14 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   VkDescriptorSetAllocateInfo dsai{};
   dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   dsai.descriptorPool = Unpack<VkDescriptorPool>(descriptor_pool_);
-  dsai.descriptorSetCount = 1;
-  dsai.pSetLayouts = &p.set_layout;
+  dsai.descriptorSetCount = kDescriptorRing;
+  VkDescriptorSetLayout layouts[kDescriptorRing];
+  for (uint32_t i = 0; i < kDescriptorRing; ++i) layouts[i] = p.set_layout;
+  dsai.pSetLayouts = layouts;
   // Named, because the plausible cause is pool exhaustion from specialization
   // (one set per PIPELINE, and a module can have many), which is otherwise a bare
   // VkResult a long way from its reason.
-  Check(vk.vkAllocateDescriptorSets(device, &dsai, &p.set),
+  Check(vk.vkAllocateDescriptorSets(device, &dsai, p.sets),
         ("vkAllocateDescriptorSets for pipeline '" + key +
          "' (descriptor pool may be exhausted by specialized pipelines)").c_str());
 
@@ -745,6 +794,50 @@ size_t VulkanContext::PipelineCacheSize() const {
   return static_cast<std::map<std::string, Pipeline>*>(pipelines_)->size();
 }
 
+bool VulkanContext::batching_enabled() const { return kBatchDispatch; }
+
+uint32_t VulkanContext::pending_batch() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return batch_count_;
+}
+
+void VulkanContext::FlushBatch() {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  FlushBatchLocked();
+}
+
+// Ends the open command buffer, submits it, and WAITS. The wait is what makes
+// every descriptor set in the batch free to reuse and every write visible to the
+// host, so it is not an optimisation to drop: without it the reset below would
+// race the GPU.
+void VulkanContext::FlushBatchLocked() {
+  if (!batch_open_) return;
+  const VulkanApi& vk = Api();
+  auto device = Unpack<VkDevice>(device_);
+  auto cmd = Unpack<VkCommandBuffer>(command_buffer_);
+  Check(vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+
+  VkSubmitInfo si{};
+  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  auto fence = Unpack<VkFence>(fence_);
+  Check(vk.vkResetFences(device, 1, &fence), "vkResetFences");
+  Check(vk.vkQueueSubmit(Unpack<VkQueue>(queue_), 1, &si, fence), "vkQueueSubmit");
+  if (kDispatchStats) {
+    std::fprintf(stderr, "[vt vulkan] FLUSH %u dispatches in one submit\n", batch_count_);
+    std::fflush(stderr);
+  }
+  Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+
+  // Every pipeline's ring is free again only AFTER the wait above.
+  for (auto& kv : *static_cast<std::map<std::string, Pipeline>*>(pipelines_)) {
+    kv.second.used_this_batch = 0;
+  }
+  batch_open_ = false;
+  batch_count_ = 0;
+}
+
 void VulkanContext::Dispatch(const std::string& name, const void* const* buffers,
                              uint32_t buffer_count, const void* push_constants,
                              uint32_t push_size, uint32_t group_count_x,
@@ -782,6 +875,15 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
 
   Pipeline& p = GetPipeline(name, buffer_count, push_size, spec_values, spec_count);
 
+  // A pipeline that has consumed its whole descriptor ring must flush before it
+  // can reuse set 0, because the GPU has not necessarily read the earlier ones
+  // yet. Flushing also resets every pipeline's counter.
+  if (kBatchDispatch && (p.used_this_batch >= kDescriptorRing || batch_count_ >= kMaxBatch)) {
+    FlushBatchLocked();
+  }
+
+  VkDescriptorSet set = kBatchDispatch ? p.sets[p.used_this_batch] : p.sets[0];
+
   std::vector<VkDescriptorBufferInfo> infos(buffer_count);
   std::vector<VkWriteDescriptorSet> writes(buffer_count);
   for (uint32_t i = 0; i < buffer_count; ++i) {
@@ -789,7 +891,7 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
     infos[i].offset = 0;  // always WHOLE; the element offset rides push constants
     infos[i].range = VK_WHOLE_SIZE;
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[i].dstSet = p.set;
+    writes[i].dstSet = set;
     writes[i].dstBinding = i;
     writes[i].descriptorCount = 1;
     writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -798,18 +900,46 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   vk.vkUpdateDescriptorSets(device, buffer_count, writes.data(), 0, nullptr);
 
   auto cmd = Unpack<VkCommandBuffer>(command_buffer_);
-  Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(command_pool_), 0),
-        "vkResetCommandPool");
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+
+  if (!kBatchDispatch) {
+    Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(command_pool_), 0),
+          "vkResetCommandPool");
+    Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+  } else if (!batch_open_) {
+    Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(command_pool_), 0),
+          "vkResetCommandPool");
+    Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+    batch_open_ = true;
+  } else {
+    // BETWEEN recorded dispatches: the ops in a decode step are sequentially
+    // dependent (norm feeds projection feeds attention), so every dispatch must
+    // see the previous one's writes. Without this the batch would run them
+    // concurrently and compute garbage. This is the cost batching pays back --
+    // a barrier is far cheaper than a fence round-trip to the host.
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0,
+                            nullptr);
+  }
+
   vk.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-  vk.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &p.set, 0,
+  vk.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0,
                              nullptr);
   vk.vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size,
                         push_constants);
   vk.vkCmdDispatch(cmd, group_count_x, 1, 1);
+
+  if (kBatchDispatch) {
+    ++p.used_this_batch;
+    ++batch_count_;
+    return;  // submitted by FlushBatch, at the next host read or Synchronize
+  }
   Check(vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
   VkSubmitInfo si{};

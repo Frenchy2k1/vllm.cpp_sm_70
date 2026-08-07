@@ -91,6 +91,7 @@ namespace vt::vulkan {
   X(vkCmdBindDescriptorSets)           \
   X(vkCmdPushConstants)                \
   X(vkCmdDispatch)                     \
+  X(vkCmdPipelineBarrier)              \
   X(vkQueueSubmit)                     \
   X(vkQueueWaitIdle)                   \
   X(vkCreateFence)                     \

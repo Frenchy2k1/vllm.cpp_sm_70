@@ -15492,4 +15492,169 @@ A CPU-only records/tooling change, no measurement.
   transcription, Kimi-Linear incremental, embeddings/pooling, mm-input) each carry
   a ranked fold in `.agents/specs/surface-coverage-2026-08-07.md`; their speed
   gates are owed by the folds themselves, not by this change.
+### VK-F: Tier-1 fusion NEGATIVE, and the dispatch floor is now 49% (2026-08-07, GB10)
+
+**Two findings that reorder the whole lever list.**
+
+**1. `VT_FUSED_TIER=1` on Vulkan is a NEGATIVE — because it fuses NOTHING.**
+
+The portable fusion framework already exists (`include/vt/recipes.h`,
+`.agents/specs/portable-fusion-framework.md`), Vulkan already registers the
+Tier-1 interpreter (`kFusedChain` -> `vt_fused_chain`), and Qwen3 already calls
+`vt::FusedChain(..., kFusedAddRmsNormStd, ...)` with `VT_FUSED_CHAIN_ADOPT` ON.
+Only `VT_FUSED_TIER` defaulted to 0, so every call was realized as the Tier-0
+composite. That looked like a free lever: flip the flag.
+
+It engages, and it is correct — 456 `vt_fused_chain` dispatches versus 0, gate
+15/15, and opt-125m STRICT 6/6 token-exact under tier 1. **And the dispatch count
+is IDENTICAL in both arms: 2,952.**
+
+    tier 0:  vt_rms_norm 904
+    tier 1:  vt_rms_norm 448  +  vt_fused_chain 456  =  904
+
+`kFusedAddRmsNormStd` is (residual add + RMS norm), and `vt_rms_norm` ALREADY
+does both in a single dispatch through its `has_res` path. There was nothing to
+fuse. Tier 1 swapped a specialized kernel for a generic recipe interpreter and
+lost accordingly: **314.7 ms vs 275.8 ms total GPU, tier 1 faster in only 2 of 8
+interleaved pairs.** `VT_FUSED_TIER` stays 0.
+
+**The durable lesson: fusion that does not REMOVE a dispatch is not fusion.** The
+recipe adoption was real and the framework worked exactly as designed; the recipe
+in play simply described something one kernel already did.
+
+**2. The dispatch floor has grown from 13% to 49% of GPU time.**
+
+This is the growth predicted when `VK-A2` was first measured and set aside. Total
+GPU time fell from ~1,054 ms to 275.8 ms as argmax and the GEMV landed, while the
+per-dispatch floor (0.046 ms x 2,952 = 135.8 ms) did not move at all.
+
+The small ops are now almost pure launch overhead:
+
+| shader | calls | ms/call | vs the 0.046 ms floor |
+|---|---:|---:|---:|
+| `vt_rms_norm` | 904 | 0.0806 | 1.75x |
+| `vt_reshape_and_cache` | 224 | 0.0500 | 1.09x |
+| `vt_silu_and_mul` | 224 | 0.0462 | **1.00x** |
+| `vt_rope_from_cache` | 224 | 0.0433 | **0.94x** |
+| `vt_qkv_split` | 224 | 0.0422 | **0.92x** |
+
+Those 1,800 dispatches cost 113.6 ms of which **73% is launch overhead**. Several
+sit AT or BELOW the measured floor, which is the signature of a kernel that does
+no meaningful work relative to being launched at all.
+
+**So making these kernels faster is pointless; only removing dispatches helps.**
+`VK-A2` (command-buffer batching) is no longer a 1.15x afterthought — it is the
+top lever, and its ceiling is higher than the fence cost alone because batching
+also recovers the pipelining lost when the GPU idles between every submit.
+
+**Fusion is still worth having, but for the DISPATCH COUNT, not the kernel time.**
+The collapsible chain is `qkv_split -> rope_from_cache -> reshape_and_cache`:
+224x3 = 672 dispatches that could be 224, removing 448 launches. `kAttnQkNormRope`
+exists as a recipe but is composite-only — the Tier-1 vocabulary is
+`{kAdd,kMul,kSilu,kSigmoid,kRmsNorm}`, so extending it is shared-framework work
+that every backend inherits, not a Vulkan shader.
+
+**Also corrected here: the "~500x behind on prefill" figure was a metric
+artifact.** `bench_core.h` computed `input_throughput = total_input / WHOLE run
+duration`, so a 1-prompt 32-in/8-out run reported 32/E2EL and charged the entire
+decode to prefill. It was being compared against llama-bench `pp128`, which is
+prefill-ONLY. A true `prefill_throughput = total_input / sum(TTFT)` is now
+reported alongside it; `sum_prefill` was already being accumulated and discarded
+with `(void)sum_prefill`.
+
+### VK-A2: command-buffer batching — decode 2.62x, 8/8 pairs (2026-08-07, GB10)
+
+The lever this campaign twice mis-ranked. It was first published as "the measured
+bottleneck" (wrong), then measured at a 1.15x ceiling and set aside (right at the
+time), then predicted to grow — and it did, to 49% of GPU time once argmax and the
+GEMV landed.
+
+**THE BLOCKER, now solved.** `VulkanContext::Pipeline` held ONE `VkDescriptorSet`,
+updated per dispatch. That is sound only because each dispatch waited on a fence
+before the next touched the set. **A descriptor set is read at EXECUTION time, not
+record time**, so batching two dispatches of the same pipeline would have the
+second `vkUpdateDescriptorSets` overwrite the first's operands before the GPU ran
+either — silent garbage, not an error. Each pipeline now owns a ring of 16 sets,
+and a pipeline that exhausts its ring forces a flush.
+
+Between recorded dispatches there is a `VkMemoryBarrier`
+(COMPUTE->COMPUTE, SHADER_WRITE->SHADER_READ|WRITE): decode ops are sequentially
+dependent, so without it the batch would run them concurrently.
+
+**RESULT, 8 interleaved pairs, `VT_VULKAN_BATCH` the only variable:**
+
+| metric | batched | per-op | result |
+|---|---:|---:|---|
+| decode tok/s (median) | **64.5** | 24.8 | **2.62x, 8 of 8 pairs** |
+| per-pair ratios | 1.79 / 1.87 / 1.96 / 2.26 / 2.98 / 3.02 / 3.52 / 3.55 | | every pair a win |
+| prefill tok/s (median) | ~142 | ~135 | ~1.05x, as expected |
+
+Batches run **40-46 dispatches per submit**. Prefill barely moves, which is the
+right shape: it has fewer, larger kernels, so it was never floor-bound.
+
+**Decode is now 35% of the 182 tok/s bandwidth roof, up from 11%, and the gap to
+llama.cpp's 160.9 tok/s is 2.5x, down from ~19x on this workload.**
+
+**Correctness: opt-125m STRICT 6/6 token-exact (96/96), 0 declines, with batches
+of 40-46 actually recorded** — verified after catching that the first "pass" was a
+STALE BINARY (only `test_vulkan_backend` had been rebuilt), which reported zero
+flushes and a green gate. A gate that passes on a binary without the change is
+worth nothing.
+
+**The new gate asserts the MECHANISM**, because results cannot show it: batching
+runs the same kernels in the same order, so a batch silently degrading to one
+dispatch per submit computes identical numbers. It asserts `pending_batch() > 1`
+with the lever on and `== 0` with it off, so neither arm is vacuous.
+
+**DEFAULT OFF, and this is the one measured win in this campaign that does not
+immediately become the default.** Batching is sound only if every host read of
+device memory flushes first. `Backend::Copy`/`Memset`/`Synchronize` now do. The
+PORTABLE REFERENCE TIER does not and cannot yet: it runs CPU kernels directly
+against the shared mapped allocation, and `Resolve` caches the provider function,
+so there is no per-call seam to flush at. An op with no native Vulkan kernel would
+read STALE BYTES with no error. For the models that run on Vulkan today the
+reference tier fires once, at setup (`kRopeCosSinCache`), which is why the STRICT
+gate passes — but "empirically safe for two models" is not the bar for a default.
+
+**Closing that hazard is the gate on the default flip, and is the next task.**
+
+### VK-A2 DEFAULT-ON: the reference-tier hazard is closed by an existing seam (2026-08-07)
+
+The 2.62x batching win shipped OFF because the PORTABLE REFERENCE TIER runs CPU
+kernels directly over device memory with no per-call flush point — `Resolve`
+caches the provider function, so there appeared to be no seam.
+
+**There already was one.** `Backend::FlushPending` (`include/vt/backend.h:44-49`)
+exists for exactly this, is documented for exactly this, is already called by
+`op_provider.cpp` whenever a reference-tier kernel is selected, and Metal already
+implements it (M3c-1). Vulkan simply had not. The fix is one override.
+
+That is the second time in this campaign the framework already had the answer —
+the first was the fusion recipes. Looking for the seam before building one is
+cheaper than either.
+
+**`VT_VULKAN_BATCH` now defaults ON.** All three host-read paths drain first:
+`Copy`/`Memset` (host memcpy over the mapped allocation), `Synchronize`, and
+`FlushPending` for the reference tier.
+
+**A GATE THAT THE STRICT RUN COULD NOT PROVIDE.** opt-125m STRICT passes 6/6
+token-exact with batching on — and it would pass whether or not the hook existed,
+because OPT touches the reference tier only once, at setup, before any batch is
+open. So the hazard has its own gate: open a batch, resolve `kRopeNeox` (genuinely
+unimplemented natively on Vulkan), and assert `pending_batch() == 0` afterwards.
+
+**Verified by DISABLING the hook**: the gate goes red (`pending_batch() == 0` fails
+at 4 pending) and green again when restored. A gate never observed failing is a
+gate that has not been shown to test anything.
+
+**One bug caught in my own gate along the way.** The VK-A2 mechanism test
+re-derived the lever's default from the environment variable, so flipping the
+default to ON made it assert the wrong branch. It failed loudly, which was luck —
+a subtler duplication would have gone vacuously green. The context now exposes
+`batching_enabled()` and the test ASKS rather than restating. A predicate
+duplicated between an implementation and its gate will eventually disagree with
+itself.
+
+llvmpipe `test_vulkan_backend` **17/17 (873 assertions)** with the lever on AND
+off; opt-125m STRICT 6/6 (96/96), 0 declines, batching default.
 

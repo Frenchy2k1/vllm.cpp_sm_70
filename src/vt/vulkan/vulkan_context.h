@@ -115,6 +115,30 @@ class VulkanContext {
   // nothing else, and these sum to the run's GPU time rather than overlapping.
   std::vector<std::pair<std::string, double>> DispatchTimeMs() const;
 
+  // COMMAND-BUFFER BATCHING (VK-A2). Records dispatches into ONE command buffer
+  // and submits once, instead of submit+fence-wait per op.
+  //
+  // WHY: a measured per-dispatch floor of 0.046 ms times 2,952 dispatches is
+  // 135.8 ms of a 275.8 ms decode run -- 49% of GPU time, up from 13% before the
+  // argmax and GEMV kernels landed. Three shaders now cost AT OR BELOW that
+  // floor, meaning they do no meaningful work relative to being launched.
+  //
+  // FLUSH is mandatory before ANY host read of device memory. This backend's
+  // Copy/Memset are plain memcpy over the persistently mapped, host-coherent
+  // allocation, so a pending batch means the host reads STALE bytes -- silently,
+  // with no error. Backend::Copy, Memset and Synchronize all flush.
+  void FlushBatch();
+  // Whether dispatch batching is active. Exposed so a test never has to restate
+  // the default: the VK-A2 gate originally re-derived it from the environment
+  // variable and silently asserted the wrong branch the moment the default
+  // flipped from off to on. A predicate duplicated between an implementation and
+  // its gate is a predicate that will disagree with itself.
+  bool batching_enabled() const;
+  // Dispatches currently recorded and not yet submitted. For the gate: batching
+  // is invisible in results by construction (same kernels, same order), so a test
+  // has to assert the MECHANISM rather than the numbers.
+  uint32_t pending_batch() const;
+
   // Number of distinct pipelines currently cached. Exposed for the unit gate: it
   // is how a test proves a new specialization produced a NEW pipeline rather than
   // silently reusing an existing one — which would look identical in the results.
@@ -188,6 +212,9 @@ class VulkanContext {
   void* scratch_buffer_ = nullptr;   // VkBuffer
   void* scratch_memory_ = nullptr;   // VkDeviceMemory
   void* scratch_mapped_ = nullptr;   // host pointer
+  void FlushBatchLocked();           // caller holds mutex_
+  bool batch_open_ = false;          // a command buffer is recording
+  uint32_t batch_count_ = 0;         // dispatches recorded into it
   void* dispatch_hist_ = nullptr;    // std::map<std::string, uint64_t>*
   void* dispatch_ms_ = nullptr;      // std::map<std::string, double>*
   uint64_t dispatch_total_ = 0;
