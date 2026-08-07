@@ -42333,3 +42333,23 @@ the GB10 speed recipe must move to the seam. (3) Server-arm numeric deltas
 disclosed above. (4) The CPU host-f32 GGUF arm is off the ABI (keep-quant is
 the gated arm). (5) /v1/videos job/status/content stay VideoJobStore-served
 (unchanged); no async-job C-ABI shape yet.
+
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 2 device dispatch repaired (PR #135; replaces #134)
+<!-- state: 2026-08-08T05:00 -->
+
+The H3 ABI-v12 fold introduced two literal `GetBackend(kCUDA)` calls in
+`src/vllm/multimodal/minimax_h3_video.cpp`, raising the shared-layer DSR from
+its immutable 32 floor to 34 and blocking unrelated main-based work. RED was
+captured with `check-device-leakage.py --report` (`kcuda=2`, exit 1).
+
+The repair keeps the public contract 0=CPU / 1=CUDA, validates that selector in
+`MiniMaxH3VideoDeviceType`, converts once to `vt::DeviceType`, and creates one
+queue through `GetBackend(device_type)`; the queue's device becomes the engine
+device. The fold test pins 0, 1 and both rejected values. GREEN locally:
+DSR=32 at the unchanged baseline, no allowlist added, and the checker mutation
+suite is 25/25. No GPU/download/benchmark/release-row work occurred.
+
+Honest pending gate: the from-scratch CPU build was stopped at the operator's
+request when the shared filesystem reached 100%; compile/fold/C-ABI/H3 tests
+are NOT locally claimed and must run in GitHub CI before merge.
