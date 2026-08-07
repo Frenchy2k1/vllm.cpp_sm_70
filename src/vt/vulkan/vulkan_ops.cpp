@@ -23,6 +23,7 @@
 // its BYTE OFFSET travels in the push constants. See
 // src/vt/vulkan/shaders/vt_common.glsl § STORAGE MODEL for why.
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -389,6 +390,18 @@ void FusedChainKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight
 // reach -- fails the first, so CI exercises the scalar tactic and this selection
 // returning false is the property CI can actually gate.
 bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k) {
+  // VT_VULKAN_COOPMAT=0 forces the scalar tactic. This exists for ONE reason: a
+  // same-binary A/B. Comparing the two tactics across two builds would confound
+  // the kernel with everything else that differs between them, and the project's
+  // benchmark protocol wants the arms to differ in exactly one thing. Default is
+  // ON -- absent or any value other than "0" leaves selection to the capability
+  // probe, so production behaviour is unchanged by the lever's existence.
+  static const bool kDisabled = [] {
+    const char* v = std::getenv("VT_VULKAN_COOPMAT");
+    return v != nullptr && std::strcmp(v, "0") == 0;
+  }();
+  if (kDisabled) return false;
+
   const VulkanContext& ctx = VulkanContext::Get();
   return ctx.coopmat_bf16_f32() && ctx.subgroup_size() == 32 &&
          a.dtype == DType::kBF16 && b.dtype == DType::kBF16 && k % 16 == 0;

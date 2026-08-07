@@ -88,6 +88,8 @@ portable/reference path. In normal operation leave them unset.
 | `VT_DFLASH_ATTN_WARP` | off (CUDA) | `=1` falls back to the older per-key warp-reduction block-attention kernel instead of the default chunked reduce-scatter form. Kept for the same-binary A/B that recorded the verdict |
 | `VT_DFLASH_ATTN_KEYLANE` | off (CUDA) | `=1` selects the one-key-per-lane block-attention form. **MEASURED NEGATIVE and not a tuning knob:** 28.90 s/step against the per-key warp kernel's 18.73 on the same binary (sm_110, MiniMax-H3 512x512/33f, seq 3224), 54% slower, because giving each lane a whole K row makes every K load 32-way scattered. Kept only because it is the experiment that located the real constraint |
 
+| `VT_VULKAN_COOPMAT` | on | `=0` forces the Vulkan GEMM onto the portable SCALAR kernel instead of the cooperative-matrix (tensor-core) tactic. The coopmat path is selected only where the device reports the exact `16x16x16 bf16/bf16/f32/f32 SUBGROUP` configuration, subgroup size is 32, both operands are bf16 and K is a multiple of 16; this switch bypasses that selection entirely. It exists for the same-binary A/B in `examples/vulkan-gemm-ab` (measured 11.1x-32.9x on NVIDIA Thor) and as the bisect lever if a coopmat result is ever suspect. Vulkan-only |
+
 ## Diagnostic
 
 Read-only observability; none change output.

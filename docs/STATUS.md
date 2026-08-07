@@ -395,7 +395,7 @@ The correctness form and the full D0-D14 measured chronology live in
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
 Vulkan (16 native kernels, 71 on CPU tier; opt-125m e2e
-token-exact, coopmat on GB10;
+token-exact, coopmat 11-33x on Thor;
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 skeleton:
 backend, platform, 1 of 106 ops; **its HIP sources have never been compiled by
 anyone** — weaker than "build-supported", since no AMD board is here;
