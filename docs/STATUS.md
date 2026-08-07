@@ -2208,4 +2208,10 @@ GCC-only `-Wstringop-overflow` suppression is now guarded out of Clang builds,
 where the unknown warning name was itself fatal under `-Werror`. The Go
 `go-m1cpu` folding diagnostics in that run were nonfatal and outside this repo.
 
-**Session onboarding: design accepted, step 5/5** (`.agents/specs/session-onboarding.md`).
+**Agent onboarding:** session setup is implemented
+([spec](../.agents/specs/session-onboarding.md)); the public contribution entry
+point design is accepted
+([spec](../.agents/specs/developer-agent-protocol-entrypoint.md),
+`DOCS-AGENT-PROTOCOL-ENTRYPOINT`). It adds a welcoming `CONTRIBUTING.md` and a
+binding check of issues, claims, code, tests and evidence before work starts.
+Design checkpoint only; no engine code, capability state or number changed.

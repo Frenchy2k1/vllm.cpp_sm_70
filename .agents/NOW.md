@@ -14,6 +14,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 
 | Claim / track | State | Next command or step |
 |---|---|---|
+| Agent contribution entry (`DOCS-AGENT-PROTOCOL-ENTRYPOINT`) | **DESIGN ACCEPTED**: public guide + pre-claim intake | Draft PR; implement policy, PR evidence, mutation gate |
 | Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
