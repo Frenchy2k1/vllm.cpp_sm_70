@@ -40832,6 +40832,28 @@ STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Box left clean.
   output element to match the CPU's order, while a cooperative matrix accumulates
   a tile at a time in a hardware-defined order.
 
+## 2026-08-07T09:45 — Kimi-Linear-48B W7-speed STRICT lever MEASURED: bf16 regime 106→120/128, plateaus; device islands remain the residual
+<!-- state: 2026-08-07T09:45 -->
+KIMI-LINEAR-STRICT-SPEED (`row/KIMI-LINEAR-STRICT-SPEED`, helper) — implemented + MEASURED the recorded
+STRICT path ("device islands + bf16 residual stream") as three env-gated numeric knobs in
+`kimi_linear_device.cpp` (default OFF → f32 vehicle byte-identical, CPU gate `test_kimi_linear_forward`
+13/13·656 in the CUDA binary). Clean CUDA build on GB10 (sm_121a, cutlass-4.5.0, 14 GDN AOT symbols),
+full 48.9B model, §12 128-token gate vs the STRICT deterministic golden, both flock locks + reclaim-waits,
+min-avail ≥115 GiB, no reboot. RESULT (token match /128): control 106; `VT_KIMI_BF16_RESIDUAL` alone 106
+(net-zero — shuffles flips, BREAKS p3 into a `163586×` repeat); `VT_KIMI_BF16_ISLANDS` alone 106 (fixes p2
+but destabilizes p3); **residual + islands = 120/128 BEST** (p0–p6 all 16/16; only p7 pos-8 flips: golden
+`18705` vs ours `58084`, a single near-tie that cascades). The two levers INTERACT — island input-rounding
+fixes p2 but repeats p3; the bf16 residual re-stabilizes p3. Further precision-matching MEASURED NEGATIVE
+(island-output bf16 → 90, reverted; f32 accumulation → 91–106, kept as documented-negative A/B knob):
+host-precision-matching PLATEAUS at 120/128 because it is not vLLM's ACTUAL GDN-Triton/FA2 arithmetic.
+VERDICT: NO arm STRICT (golden is K=3-deterministic → STRICT, not distributional); default STAYS OFF
+(parity-enablers). NAMED residual (also the speed lever): the device islands — a NEW per-channel-decay GDN
+kernel (`g[T,H,D]` per `kda.py`; `vt::GdnDecode`/`GdnPrefill` carry only per-head `g[T,Hv]`, ops.h:1797,1846
+— NOT a drop-in) + the paged `mla::ForwardMlaAttentionBlock` (FA2). Speed: 1.30 tok/s (O(n²) full-recompute
++ host islands; invariant to the numeric knobs, confirming the cost is the recompute structure not the
+arithmetic); vLLM can't SERVE Kimi-Linear-48B at bf16 on ONE GB10 (oracle capture needed util 0.82 for a
+single-seq eager run) → HW-forced-indirect. SHAs e048f4ee/3d6f81d1/(revert) on the row branch; PR pending.
+Records: spec §14, STATUS/BENCHMARKS/FEATURES Kimi rows, benchmark-record, NOW. Box left clean.
 - **2026-08-07 (later)** — **`VK-C` SPEED A/B on NVIDIA Thor: the coopmat tactic is
   11.1x-32.9x over our scalar kernel (`CLAIM-VULKAN-FULL-1`).**
 

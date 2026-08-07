@@ -752,6 +752,84 @@ is not token-exact). Row STAYS `ACTIVE`.
 
 ---
 
+## 14. W7-speed STRICT lever MEASURED — bf16 regime recovers 106→120/128, plateaus; device islands remain the residual (2026-08-07, `row/KIMI-LINEAR-STRICT-SPEED`)
+
+The recorded path to STRICT ("device islands + bf16 residual stream = the same work as
+speed") was implemented as three env-gated numeric knobs in `kimi_linear_device.cpp`
+(default OFF → the f32 vehicle is byte-identical, CPU gate `test_kimi_linear_forward`
+**13/13·656** in the CUDA binary) and MEASURED on GB10 (the full 48.9B model, the §12
+128-token gate vs the STRICT deterministic golden). Clean-from-`origin/main` CUDA build
+(`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_
+CUTLASS_DIR=…cutlass-4.5.0`, nvcc 13.0.88, Release, 14 GDN AOT symbols linked). Memory
+safe throughout every reload (min-avail ≥ 115 GiB, both flock locks, reclaim-wait, no
+reboot).
+
+### Knobs (`kimi_linear_device.cpp`)
+- `VT_KIMI_BF16_RESIDUAL` — carry the residual stream in bf16 like vLLM's
+  `fused_add_rms_norm` (residual stored bf16, block outputs bf16, RMSNorm variance over
+  the f32 pre-store sum). Implemented as in-place `CastBf16`→`CastF32` rounds at exactly
+  vLLM's rounding points (embed out, each block out, residual after each add) keeping f32
+  STORAGE so the islands still read f32 — byte-matching vLLM's fused-add order.
+- `VT_KIMI_BF16_ISLANDS` — round the host-fallback island INPUTS (KDA q/k/v/g1/beta,
+  NoPE-MLA q/kv/kpe) to bf16 (RNE) before the recurrence/softmax.
+- `VT_KIMI_ISLAND_F32ACC` — f32 (not f64) accumulation in the islands. **MEASURED NEGATIVE**,
+  kept as a documented-negative A/B knob.
+
+### Measurement (token match /128 vs the deterministic golden; STRICT required)
+| Config | env | /128 | verdict |
+|---|---|---|---|
+| control | (none) | **106** | reproduces §13 baseline exactly |
+| residual only | `BF16_RESIDUAL` | 106 | net-zero — SHUFFLES flips (fixes p2, BREAKS p3 into a `163586×` repeat loop) |
+| islands only | `BF16_ISLANDS` | 106 | fixes p2 but destabilizes p3 (repeat loop) — net-zero |
+| **residual + islands** | `BF16_RESIDUAL BF16_ISLANDS` | **120** | **BEST** — p0–p6 all 16/16 exact; only p7 flips |
+| + island-output bf16 | `…BF16_ISLANDS(out)` | 90 | **REGRESSION** (reverted) |
+| + f32 accumulation | `…ISLAND_F32ACC` | 91–106 | **NEGATIVE** (reverted from the ISLANDS path) |
+
+### Flip ledger / razor verdict (the deterministic golden arbitrates every flip)
+- The two levers INTERACT: island bf16-input rounding fixes p2 but destabilizes p3 into a
+  degenerate repeat (`163586×`); the bf16 residual stream then RE-stabilizes p3 (kills the
+  repeat). Together they make **p0–p6 all 16/16 token-exact** (was 6/8 → 7/8 fully exact).
+- The SOLE remaining divergence at 120/128 is **p7 position 8**: the golden deterministically
+  emits `18705`, our island emits `58084` (a genuine near-tie), then the greedy path cascades
+  (8/16 on p7). A single near-tie flip across the whole 8-prompt battery.
+- Further precision-"matching" (rounding the island OUTPUT to bf16 → 90; f32 accumulation →
+  91–106) is a COIN-FLIP that regresses, because it is not vLLM's ACTUAL GDN-Triton / FA2
+  kernel arithmetic — it just perturbs which near-ties flip. Host-precision-matching PLATEAUS
+  at 120/128.
+
+### Verdict + default
+**NO arm reaches STRICT** (best 120/128 is a DIVERGENCE; the golden is K=3 deterministic so
+STRICT — not the distributional gate — is required). Per parity-enablers, `VT_KIMI_DEVICE_
+COMPUTE` and all three knobs STAY **OFF** (a near-tie is not token-exact). Row STAYS `ACTIVE`.
+
+### The named residual — the device islands (why host-matching cannot close p7)
+The one principled path to STRICT is routing the two islands through vLLM's ACTUAL device
+kernels, but it is NOT a drop-in (the mission's own assessment, now proven by measurement):
+- **KDA:** vLLM's decay is **per-k-channel** `g[T,H,D]` (`kimi_gdn_linear_attn.py` +
+  `third_party/flash_linear_attention/ops/kda.py`), but our `vt::GdnDecode`/`GdnPrefill`
+  carry only a **per-HEAD scalar** decay `g/beta[T,Hv]` (`include/vt/ops.h:1797,1846`). So the
+  vendored GDN Triton-AOT cubins CANNOT express KDA — a NEW per-channel-decay GDN kernel
+  (`g[T,H,D]` + the `-exp(A_log)*softplus(f_b(f_a(x))+dt_bias)` gate) is required.
+- **NoPE-MLA:** needs the paged `mla::ForwardMlaAttentionBlock` (FA2) over the runner's het-KV
+  (the born-on-runner residual), not a host softmax.
+These are ALSO the speed levers — the correctness vehicle re-computes the WHOLE sequence every
+decode step (O(n²)) with a host Download/upload per KDA/MLA layer per step. That is why the
+measured tok/s is invariant to the numeric knobs.
+
+### Speed (HW-forced-indirect — vLLM cannot serve this model on one GB10 at bf16)
+Steady tok/s over 127 steps (single-load, medians, cold first-leg discarded): control **1.31**,
+islands **1.30**, resIsl **1.30** (first-step ~0.62 s, steady ~0.77 s/step). The extra bf16
+rounding casts cost ~0.15 s/step vs the §13 1.59 baseline; ALL configs are the same O(n²)
+full-recompute + host-island rate. **Honest bar:** the §12 oracle golden capture itself needed
+`gpu_memory_utilization=0.82` (~97.6 GiB) with only 15 GiB min-avail for a SINGLE-seq eager
+run — vLLM cannot SERVE Kimi-Linear-48B at bf16 on ONE GB10 with any KV headroom, so a direct
+`vllm bench throughput` arm is HW-infeasible; the comparison is recorded as HW-forced-indirect
+(our absolute 1.30 tok/s + the per-step GPU-active anchor). No isolated host-tail lever (grouped
+MoE seam, on-GPU sampling) moves the needle without the device-island + paged-incremental-decode
+rewrite, which is the SAME W7-speed residual. Scoped as the named follow-up, not forced.
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope
