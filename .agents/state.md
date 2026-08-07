@@ -41838,3 +41838,30 @@ because a genuinely new row exists.
   campaign spec as "the single biggest speed lever", deferred, and is now the
   MEASURED bottleneck. It outranks further native-kernel work for anything
   end-to-end: every additional native op would still pay a ~10 ms round trip.
+
+- **2026-08-07 (VK-E close-out)** — **The minimal workload ALSO never completed, so
+  there is NO vllm.cpp Vulkan e2e number at all — and a SECOND anomaly is open.**
+
+  1 prompt / 32 in / 8 out hit its 2400 s timeout with no result line, after the
+  earlier 4-prompt run hit 900 s. So VK-E has llama.cpp's denominator and **nothing
+  on our side, not even a slow figure**.
+
+  **The dispatch COUNT does not add up, separately from the latency.** At the
+  measured ~96 waits/s, 40 minutes is **~230,000 waits**. A 28-layer Qwen3-0.6B
+  forward should need ~11 dispatches per layer ≈ **~310 per forward**; even
+  counting 32 prefill positions and 8 decode steps generously that is a few
+  thousand, not 230,000 — roughly an order of magnitude and a half unexplained.
+
+  **Two candidates, NOT distinguished:** (a) waits ≠ dispatches, because the
+  driver's fence wait is a `poll()` loop that may wake several times per fence, in
+  which case only the latency finding stands; (b) we genuinely dispatch far more
+  than expected — a per-token or per-head dispatch where per-tensor was intended,
+  or `kFusedChain` issuing one dispatch per recipe step.
+
+  **Cheap next step:** a dispatch counter on `VulkanContext`, or
+  `VT_OP_PROVIDER_STATS=1` per-op selection counts, printed per forward. Until
+  then this is an OPEN QUESTION, not a confirmed second defect — recorded that way
+  deliberately, since I already published two wrong attributions in this session by
+  reasoning ahead of measurement.
+
+  dgx left clean: no process, GPU lock released.
