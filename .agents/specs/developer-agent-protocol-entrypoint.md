@@ -31,6 +31,11 @@ The project description stays aligned with `README.md`:
 - every architecture, model family, feature, and backend must be tested against
   its reference and benchmarked on the same workload.
 
+The public page receives a humanizer pass after the factual draft. The pass
+preserves every claim, code block, and link target, but may reshape the prose.
+It uses plain technical language, adds no facts, and removes promotional filler,
+vague attribution, em dashes, and en dashes.
+
 ## Public entry point
 
 Create a concise root-level `CONTRIBUTING.md` and link it from the README's
@@ -105,17 +110,24 @@ require inventing an issue for small governance or documentation work.
 Expected implementation files:
 
 - `CONTRIBUTING.md` (new public entry point);
-- `README.md` (one discoverability link only);
+- `README.md` (add the contributor row and compact prose only inside the
+  Documentation table and the canonical-record paragraph immediately below it;
+  preserve every link and its meaning in that bounded region, make no other
+  README edits, and finish at or below 29,900 characters);
 - `AGENTS.md` and `.agents/workflow.md` (the synchronized intake obligation);
 - `.github/pull_request_template.md` (recorded intake evidence);
 - `scripts/check-protocol-consistency.py` and
   `tests/scripts/test_check_protocol_consistency.py` (drift enforcement and
-  mutation proof).
+  mutation proof);
+- `scripts/check-readme-structure.py` and
+  `tests/scripts/test_check_readme_structure.py` (contributor-link enforcement
+  and mutation proof);
+- `docs/STATUS.md`, `docs/BENCHMARKS.md`, `.agents/NOW.md`, and
+  `.agents/state.md` (same-change checkpoint record).
 
 No engine, model, kernel, benchmark number, capability state, or lifecycle row
-changes. `docs/STATUS.md`, `docs/BENCHMARKS.md`, and `docs/FEATURES.md` therefore
-remain unchanged unless `check-doc-checkpoint.py` identifies an existing
-same-change obligation.
+changes. `docs/FEATURES.md` remains unchanged because the feature, model,
+backend, and quantization surfaces do not move.
 
 ## Verification
 

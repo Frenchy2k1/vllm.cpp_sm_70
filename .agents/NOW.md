@@ -14,12 +14,12 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Agent contribution entry (`DOCS-AGENT-PROTOCOL-ENTRYPOINT`) | **DESIGN ACCEPTED**: public guide + pre-claim intake | Draft PR; implement policy, PR evidence, mutation gate |
+| Contributor entry | **IMPLEMENTED** (`DOCS-AGENT-PROTOCOL-ENTRYPOINT`) | Merge #119 |
 | Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | **bf16 shards STREAM both towers (DiT + encoder); Q4_K_M enc cond cos 0.9975, 3.5° med, DIFFUSE** | render A/B on saved embeds |
-| Kimi-Linear-48B | 122/128 @ 18.9 tok/s (0.90× vLLM) = best. **bf16 stream REFUTED (§20/#118: 122→4/128 KDA repeat-loop, no speed win); STRICT unreachable (p7 near-tie).** SERVER fold scoped (ARCH-ONE-SURFACE req4; runner aborts on Kimi KV `runner.cpp:489`) | ACTIVE: SERVER fold + last 0.10× |
+| Kimi-Linear-48B | **Best: 122/128, 18.9 tok/s (0.90× vLLM); bf16 stream refuted; strict blocked by p7 near-tie** | ACTIVE: server fold + 0.10× |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |

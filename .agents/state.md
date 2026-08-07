@@ -41988,6 +41988,26 @@ This is a design checkpoint only. No engine code, capability state, benchmark
 number, or public feature surface changed. Implementation follows in the same
 row after the draft PR is opened.
 
+## 2026-08-07 — Developer agent protocol entry point implemented
+<!-- state: 2026-08-07T20:00 -->
+
+Row `DOCS-AGENT-PROTOCOL-ENTRYPOINT` now has its public entry point. Root
+`CONTRIBUTING.md` welcomes developers, explains the 1:1 C++ vLLM target and the
+SGLang and multimodal additions, gives the first instruction for an agent, and
+walks from open issues and PRs through live records to a code-grounded claim.
+It also states that reference and hardware setup happens just in time. Missing
+required inputs leave the applicable gate `PENDING`; the gate is not waived.
+
+The same marker-delimited intake obligation now appears verbatim in `AGENTS.md`
+and `.agents/workflow.md`. Every agent checks issues, claims, current code,
+tests, and evidence before claiming or implementing, records exact anchors, and
+reconciles work that already landed or is owned. The protocol checker and its
+mutation suite reject either missing copy, a removed instruction, or drift
+between copies. README discoverability and its mutation gate, plus matching PR
+template evidence fields, complete the entry path. This documentation-only
+checkpoint is benchmark-void and changes no engine behavior or capability
+state.
+
 ## Kimi-Linear: bf16 residual stream REFUTED; STRICT is intrinsically unreachable; SERVER fold scoped (spec §20, PR #118)
 <!-- state: 2026-08-07T20:30 -->
 
@@ -42060,4 +42080,3 @@ leaves (Kimi runner fold #279, Parakeet ASR #280). Reviewer findings 1-8 applied
 (quoted+angle includes, comment-stripped ABI tokenize, subprocess enforcement
 tests, ratchet equality pin, reachable-row-removal design note, meta-gap note). No
 CUDA build; no perf number owed; STATUS inside its char ratchet.
-

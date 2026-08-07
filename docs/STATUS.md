@@ -2203,15 +2203,10 @@ _(Laguna decode KV+attention → shared-framework port, bf16-KV slice (2026-08-0
 used by every call site, so non-CUDA AppleClang builds do not emit
 `-Wunused-function` under `-Werror`. A static regression gate enforces that
 boundary; runtime behavior and Laguna's lifecycle state are unchanged.
-The next consumer run exposed a separate Voxtral portability error: its
-GCC-only `-Wstringop-overflow` suppression is now guarded out of Clang builds,
-where the unknown warning name was itself fatal under `-Werror`. The Go
-`go-m1cpu` folding diagnostics in that run were nonfatal and outside this repo.
+The next run also guarded Voxtral's GCC-only `-Wstringop-overflow` suppression
+out of Clang, where it was fatal. Its Go `go-m1cpu` diagnostics were nonfatal
+and outside this repo.
 
-**Agent onboarding:** session setup is implemented
-([spec](../.agents/specs/session-onboarding.md)); the public contribution entry
-point design is accepted
-([spec](../.agents/specs/developer-agent-protocol-entrypoint.md),
-`DOCS-AGENT-PROTOCOL-ENTRYPOINT`). It adds a welcoming `CONTRIBUTING.md` and a
-binding check of issues, claims, code, tests and evidence before work starts.
-Design checkpoint only; no engine code, capability state or number changed.
+**Agent onboarding:** [session](../.agents/specs/session-onboarding.md) +
+[entry](../.agents/specs/developer-agent-protocol-entrypoint.md) implemented;
+documentation-only.

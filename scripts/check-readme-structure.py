@@ -50,6 +50,7 @@ MAX_PARAGRAPH_CHARS = 900
 # The README must point at the status ledger, and the ledger must actually carry
 # the capability table (otherwise "move it to STATUS.md" silently loses it).
 STATUS_LINK = "docs/STATUS.md"
+CONTRIBUTOR_LINK = "CONTRIBUTING.md"
 STATUS_REQUIRED_HEADINGS = ("capability status",)
 
 
@@ -143,6 +144,12 @@ def readme_errors(text: str) -> list[str]:
         errors.append(
             f"README does not link to {STATUS_LINK}; the landing page must "
             "point at the per-capability status ledger"
+        )
+
+    if CONTRIBUTOR_LINK not in text:
+        errors.append(
+            f"README does not link to {CONTRIBUTOR_LINK}; contributors need a "
+            "public entry point to the agent protocol"
         )
 
     for lineno, para in _prose_paragraphs(text):
