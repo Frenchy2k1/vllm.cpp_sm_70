@@ -442,6 +442,92 @@ TEST_CASE("cooperative-matrix capability is PROBED, and absent on llvmpipe") {
   }
 }
 
+TEST_CASE("bf16 GEMM takes the COOPMAT tactic where available, scalar where not") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // K = 32 is a multiple of 16 (the tactic requires it); M = 20 and N = 12 are
+  // deliberately RAGGED so the shader's bounds-checked store is exercised rather
+  // than only whole tiles.
+  constexpr int64_t kM = 20, kK = 32, kN = 12;
+
+  std::vector<float> a(kM * kK), b(kN * kK);
+  for (int64_t i = 0; i < kM * kK; ++i) a[i] = 0.5f * static_cast<float>((i % 7) - 3);
+  for (int64_t i = 0; i < kN * kK; ++i) b[i] = 0.25f * static_cast<float>((i % 5) - 2);
+
+  // bf16 device operands. The values above are chosen to be exactly
+  // representable in bf16, so the ORACLE below can be computed in f32 without the
+  // narrowing itself becoming the error under test.
+  std::vector<uint16_t> a_bf(kM * kK), b_bf(kN * kK);
+  for (size_t i = 0; i < a.size(); ++i) a_bf[i] = vt::F32ToBF16(a[i]);
+  for (size_t i = 0; i < b.size(); ++i) b_bf[i] = vt::F32ToBF16(b[i]);
+
+  // Oracle: MatmulBT semantics, b is [N,K]. Sequential f32 accumulation, which is
+  // the CPU kernel's contract; the coopmat tile order differs, hence the NMSE bar.
+  std::vector<float> ref(kM * kN, 0.0f);
+  for (int64_t i = 0; i < kM; ++i) {
+    for (int64_t j = 0; j < kN; ++j) {
+      float acc = 0.0f;
+      for (int64_t p2 = 0; p2 < kK; ++p2) {
+        acc += vt::BF16ToF32(a_bf[i * kK + p2]) * vt::BF16ToF32(b_bf[j * kK + p2]);
+      }
+      ref[i * kN + j] = acc;
+    }
+  }
+
+  void* da = vk.Alloc(a_bf.size() * sizeof(uint16_t));
+  void* db = vk.Alloc(b_bf.size() * sizeof(uint16_t));
+  auto* dout = static_cast<float*>(vk.Alloc(kM * kN * sizeof(float)));
+  vk.Copy(q, da, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+  vk.Copy(q, db, b_bf.data(), b_bf.size() * sizeof(uint16_t));
+  vk.Synchronize(q);
+
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kBF16, d, {kM, kK});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kBF16, d, {kN, kK});
+  Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {kM, kN});
+  vt::MatmulBT(q, to, ta, tb);
+  vk.Synchronize(q);
+
+  // WHICH TACTIC RAN. This is the load-bearing assertion, not the numbers: the
+  // scalar kernel would produce results just as correct, so a numeric check alone
+  // cannot tell a working coopmat path from a silent fallback. Same reasoning as
+  // the op-provider decline counters.
+  const bool coop_expected = ctx.coopmat_bf16_f32() && ctx.subgroup_size() == 32;
+  const std::string tactic_line =
+      std::string("bf16 GEMM tactic: ") + (coop_expected ? "COOPMAT" : "scalar");
+  MESSAGE(tactic_line);
+  CHECK(ctx.PipelineExistsFor(coop_expected ? "vt_matmul_coopmat" : "vt_matmul"));
+  if (!coop_expected) {
+    // On a device without the configuration the coopmat module must NEVER be
+    // built -- selecting it there would fail at pipeline creation.
+    CHECK_FALSE(ctx.PipelineExistsFor("vt_matmul_coopmat"));
+  }
+
+  std::vector<float> got(kM * kN);
+  vk.Copy(q, got.data(), dout, got.size() * sizeof(float));
+  vk.Synchronize(q);
+
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double diff = static_cast<double>(ref[i]) - static_cast<double>(got[i]);
+    num += diff * diff;
+    den += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+  }
+  const double nmse = den == 0.0 ? num : num / den;
+  const std::string nmse_line =
+      std::string("bf16 GEMM NMSE vs the f32 oracle: ") + std::to_string(nmse);
+  MESSAGE(nmse_line);
+  CHECK(nmse <= 5e-4);
+
+  vk.Free(da);
+  vk.Free(db);
+  vk.Free(dout);
+  vk.DestroyQueue(q);
+}
+
 TEST_CASE("Vulkan float-controls are PROBED and reported, not assumed") {
   if (!VulkanPresent()) return;
   // The relaxed-precision knobs Vulkan leaves implementation-defined. We cannot
