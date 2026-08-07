@@ -28,6 +28,9 @@
 //      which is integer arithmetic and therefore unaffected either way.
 #include "vulkan_context.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -41,6 +44,14 @@
 
 namespace vt::vulkan {
 namespace {
+
+// Dispatch accounting, enabled by VT_VULKAN_DISPATCH_STATS (VK-E deep dive).
+const bool kDispatchStats = [] {
+  const char* v = std::getenv("VT_VULKAN_DISPATCH_STATS");
+  return v != nullptr && std::strcmp(v, "0") != 0;
+}();
+const std::chrono::steady_clock::time_point g_dispatch_t0 =
+    std::chrono::steady_clock::now();
 
 // The void* handle smuggling in vulkan_context.h is only sound while every
 // Vulkan handle fits in a pointer. Dispatchable handles are pointers by
@@ -456,6 +467,27 @@ VulkanContext::VulkanContext() {
   scratch_mapped_ = AllocBuffer(kScratchBytes, &scratch_buffer_, &scratch_memory_);
 
   pipelines_ = new std::map<std::string, Pipeline>();
+  dispatch_hist_ = new std::map<std::string, uint64_t>();
+
+  // VT_VULKAN_DISPATCH_STATS=1 dumps the per-shader histogram at exit. Registered
+  // with atexit rather than printed from a destructor because this context is a
+  // never-destroyed process singleton, and because a run that is KILLED by a
+  // timeout -- which is exactly how the VK-E runs ended -- still unwinds atexit
+  // handlers on SIGTERM only if the handler is installed. A run that never
+  // reaches a clean exit still leaves the counters readable via the accessors.
+  if (const char* v = std::getenv("VT_VULKAN_DISPATCH_STATS");
+      v != nullptr && std::strcmp(v, "0") != 0) {
+    std::atexit([] {
+      if (!Available()) return;
+      const VulkanContext& ctx = Get();
+      std::fprintf(stderr, "[vt vulkan] TOTAL DISPATCHES: %llu\n",
+                   static_cast<unsigned long long>(ctx.dispatch_count()));
+      for (const auto& kv : ctx.DispatchHistogram()) {
+        std::fprintf(stderr, "[vt vulkan]   %-24s %llu\n", kv.first.c_str(),
+                     static_cast<unsigned long long>(kv.second));
+      }
+    });
+  }
   mutex_ = new std::mutex();
 }
 
@@ -669,6 +701,20 @@ bool VulkanContext::PipelineExistsFor(const std::string& name) const {
   return false;
 }
 
+uint64_t VulkanContext::dispatch_count() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return dispatch_total_;
+}
+
+std::vector<std::pair<std::string, uint64_t>> VulkanContext::DispatchHistogram() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  const auto& hist = *static_cast<std::map<std::string, uint64_t>*>(dispatch_hist_);
+  std::vector<std::pair<std::string, uint64_t>> out(hist.begin(), hist.end());
+  std::sort(out.begin(), out.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+  return out;
+}
+
 size_t VulkanContext::PipelineCacheSize() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   return static_cast<std::map<std::string, Pipeline>*>(pipelines_)->size();
@@ -691,6 +737,23 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   // serialized. Correct, not fast — the same trade the Metal skeleton makes with
   // one command buffer per op (src/vt/metal/metal_ops.mm § DISPATCH MODEL).
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+
+  // Counted under the mutex the dispatch already holds -- see the header for why
+  // this is measured on OUR side rather than inferred from context switches.
+  ++dispatch_total_;
+  ++(*static_cast<std::map<std::string, uint64_t>*>(dispatch_hist_))[name];
+  // PERIODIC dump, not just atexit: `timeout` sends SIGTERM, whose default action
+  // terminates WITHOUT running atexit handlers, and every VK-E run so far ended
+  // exactly that way. A diagnostic that only reports on a clean exit would have
+  // reported nothing on precisely the runs worth diagnosing.
+  if (kDispatchStats && dispatch_total_ % 100 == 0) {
+    const auto now = std::chrono::steady_clock::now();
+    const double secs =
+        std::chrono::duration<double>(now - g_dispatch_t0).count();
+    std::fprintf(stderr, "[vt vulkan] dispatches=%llu  elapsed=%.1fs  rate=%.0f/s\n",
+                 static_cast<unsigned long long>(dispatch_total_), secs,
+                 secs > 0 ? dispatch_total_ / secs : 0.0);
+  }
 
   Pipeline& p = GetPipeline(name, buffer_count, push_size, spec_values, spec_count);
 
@@ -736,7 +799,30 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   // needs no invalidate, and vkQueueSubmit itself makes prior host writes
   // visible to the device (the host-write ordering guarantee), so there is no
   // flush on the way in either.
+  // PER-DISPATCH TIMING. The periodic counter showed fewer than 2000 dispatches
+  // in 150 s, which rules out "many cheap submits" and points at a few very
+  // expensive ones -- so the useful diagnostic is WHICH shader is slow, not how
+  // many ran. Anything over the threshold names itself.
+  // Printed BEFORE the wait, and flushed. The timing print below runs only if the
+  // wait RETURNS -- so if a fence never completes, the post-wait line never
+  // appears and the hang is invisible. The last line printed here names the
+  // dispatch that hung.
+  if (kDispatchStats) {
+    std::fprintf(stderr, "[vt vulkan] submit #%llu %-22s groups=%u\n",
+                 static_cast<unsigned long long>(dispatch_total_), name.c_str(),
+                 group_count_x);
+    std::fflush(stderr);
+  }
+  const auto wait_t0 = std::chrono::steady_clock::now();
   Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+  if (kDispatchStats) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - wait_t0).count();
+    if (ms > 200.0) {
+      std::fprintf(stderr, "[vt vulkan] SLOW dispatch %-22s %8.1f ms  groups=%u\n",
+                   name.c_str(), ms, group_count_x);
+    }
+  }
 }
 
 }  // namespace vt::vulkan

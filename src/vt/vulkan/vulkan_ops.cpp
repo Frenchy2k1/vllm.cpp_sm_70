@@ -389,7 +389,7 @@ void FusedChainKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight
 // MEASURED: GB10 satisfies all four; llvmpipe -- the only Vulkan device CI can
 // reach -- fails the first, so CI exercises the scalar tactic and this selection
 // returning false is the property CI can actually gate.
-bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k) {
+bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k, int64_t m, int64_t n) {
   // VT_VULKAN_COOPMAT=0 forces the scalar tactic. This exists for ONE reason: a
   // same-binary A/B. Comparing the two tactics across two builds would confound
   // the kernel with everything else that differs between them, and the project's
@@ -404,7 +404,21 @@ bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k) {
 
   const VulkanContext& ctx = VulkanContext::Get();
   return ctx.coopmat_bf16_f32() && ctx.subgroup_size() == 32 &&
-         a.dtype == DType::kBF16 && b.dtype == DType::kBF16 && k % 16 == 0;
+         a.dtype == DType::kBF16 && b.dtype == DType::kBF16 && k % 16 == 0 &&
+         // M AND N MUST ALSO BE WHOLE TILES. `coopMatLoad` reads a FULL 16x16
+         // tile with no masking, so a partial tile reads past the end of the
+         // operand -- and the store being bounds-checked does not save it,
+         // because the fault happens on the LOAD. MEASURED: lm_head at M=1
+         // (single decode token) read 15 rows (~30 KB) past a small activation
+         // buffer, faulted the GPU, and the fence NEVER SIGNALLED -- an infinite
+         // vkWaitForFences, which presents as a hang, not as an error.
+         //
+         // The original correctness gate used M=20, N=12 precisely to exercise
+         // ragged shapes and PASSED, because there the out-of-bounds read stayed
+         // inside the allocation and its garbage rows were discarded by the
+         // bounds-checked store. Raggedness alone was not enough; the read has to
+         // leave the allocation to fault.
+         m % 16 == 0 && n % 16 == 0;
 }
 
 template <bool kBT>
@@ -417,7 +431,7 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const uint32_t b_off = bind.Add(b, "matmul: b");
   const uint32_t out_off = bind.Add(out, "matmul: out");
 
-  if (CoopMatMatmulUsable(a, b, k)) {
+  if (CoopMatMatmulUsable(a, b, k, m, n)) {
     // One workgroup (= one subgroup) per 16x16 OUTPUT TILE. Deliberately not
     // FlatGroupCount, which divides an element count by the workgroup size: here
     // the whole subgroup cooperates on one tile.
