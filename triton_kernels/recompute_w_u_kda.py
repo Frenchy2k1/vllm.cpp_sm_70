@@ -1,10 +1,10 @@
-# triton_kernels/recompute_w_u_kda.py  (STAGED — see .agents/specs/kimi-linear.md §17)
+# triton_kernels/recompute_w_u_kda.py  (KDA chunk-prefill kernel; see .agents/specs/kimi-linear.md §17)
 #
 # KDA chunk-prefill kernel 4/5: recompute W and U (the WY-representation "apply"),
 # the KDA PER-K-CHANNEL variant. Distinct from the GDN wy_fast.py kernel: KDA
 # applies exp2(b_gk) per-K-channel and stores kg = k*exp2(gn - gk) (the STORE_KG
-# branch). STAGED authored harness body (Phase-1 spike); Phase-2 moves it to
-# triton_kernels/ + regenerates the sm_121a cubin.
+# branch). VENDORED kernel source; regenerate the cubin via
+# scripts/regen-triton-aot.sh.
 #
 # Ported VERBATIM FROM (vLLM oracle @ pin 555967922):
 #   vllm/third_party/flash_linear_attention/ops/kda.py:817-957
@@ -32,7 +32,9 @@ exp = tl.exp
 exp2 = tl.exp2
 
 # driver always passes DOT_PRECISION="ieee" (kda.py:1002); see header note 2.
-DOT_PRECISION: tl.constexpr = "ieee"
+# tl.constexpr INSTANTIATION form: the annotation form (`x: tl.constexpr = v`) is
+# rejected for a module global accessed from a @jit kernel (Triton 3.6).
+DOT_PRECISION = tl.constexpr("ieee")
 
 
 @triton.jit(do_not_specialize=["T", "NT"])

@@ -1,8 +1,7 @@
-# triton_kernels/chunk_gla_o.py  (STAGED — see .agents/specs/kimi-linear.md §17)
+# triton_kernels/chunk_gla_o.py  (KDA chunk-prefill kernel; see .agents/specs/kimi-linear.md §17)
 #
 # KDA chunk-prefill kernel 5/5: the GLA-style output with per-K-channel gk decay.
-# STAGED authored harness body (Phase-1 spike); Phase-2 moves it to
-# triton_kernels/ + regenerates the sm_121a cubin.
+# VENDORED kernel source; regenerate the cubin via scripts/regen-triton-aot.sh.
 #
 # Ported VERBATIM FROM (vLLM oracle @ pin 555967922):
 #   vllm/third_party/flash_linear_attention/ops/kda.py:1019-1123

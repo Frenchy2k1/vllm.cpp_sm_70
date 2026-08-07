@@ -1869,6 +1869,57 @@ void KdaGatedDeltaRule(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& 
       q, out, q_in, k, v, g, beta, state, query_start_loc, args);
 }
 
+void KdaChunkPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                     const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                     const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                     const Tensor& query_start_loc, const GdnArgs& args) {
+  constexpr const char* name = "kda_chunk_prefill";
+  // Same tensor contracts as KdaGatedDeltaRule EXCEPT the gate is supplied RAW
+  // (g_raw + a_log + dt_bias fused on-device by kda_gate_cumsum), not pre-gated.
+  VT_CHECK(q_in.rank == 3 && k.rank == 3 && v.rank == 3 && out.rank == 3 && g_raw.rank == 3 &&
+               beta.rank == 2 && state.rank == 4,
+           std::string(name) +
+               ": q/k [T,Hk,Dk], v/out [T,Hv,Dv], g_raw [T,Hv,Dk], beta [T,Hv], state [N,Hv,Dv,Dk]");
+  const int64_t t = q_in.shape[0], hk = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv = v.shape[1], dv = v.shape[2];
+  VT_CHECK(k.shape[0] == t && k.shape[1] == hk && k.shape[2] == dk,
+           std::string(name) + ": k shape must match q");
+  VT_CHECK(v.shape[0] == t, std::string(name) + ": v token count must match q");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hv && out.shape[2] == dv,
+           std::string(name) + ": out must be [T,Hv,Dv]");
+  VT_CHECK(g_raw.shape[0] == t && g_raw.shape[1] == hv && g_raw.shape[2] == dk,
+           std::string(name) + ": g_raw must be [T,Hv,Dk] (raw per-K-channel gate projection)");
+  VT_CHECK(beta.shape[0] == t && beta.shape[1] == hv,
+           std::string(name) + ": beta must be [T,Hv]");
+  VT_CHECK(hk >= 1 && hv % hk == 0,
+           std::string(name) + ": Hv must be a multiple of Hk (GQA broadcast)");
+  VT_CHECK(state.shape[0] == 1 && state.shape[1] == hv && state.shape[2] == dv &&
+               state.shape[3] == dk,
+           std::string(name) + ": state must be [1,Hv,Dv,Dk] (single prefill sequence)");
+  VT_CHECK(IsFloat(q_in.dtype) && IsFloat(k.dtype) && IsFloat(v.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float q/k/v, f32/bf16 out");
+  VT_CHECK(g_raw.dtype == DType::kF32 && beta.dtype == DType::kF32,
+           std::string(name) + ": g_raw/beta must be f32");
+  VT_CHECK(a_log.dtype == DType::kF32 && dt_bias.dtype == DType::kF32,
+           std::string(name) + ": a_log/dt_bias must be f32");
+  VT_CHECK(a_log.rank == 1 && a_log.shape[0] == hv,
+           std::string(name) + ": a_log must be [Hv]");
+  VT_CHECK(dt_bias.rank == 1 && (dt_bias.shape[0] == hv * dk || dt_bias.shape[0] == 0),
+           std::string(name) + ": dt_bias must be [Hv*Dk] or empty");
+  VT_CHECK(state.dtype == DType::kF32, std::string(name) + ": state must be f32");
+  VT_CHECK(q_in.IsContiguous() && k.IsContiguous() && v.IsContiguous() && out.IsContiguous() &&
+               g_raw.IsContiguous() && beta.IsContiguous() && state.IsContiguous(),
+           std::string(name) + ": contiguous required");
+  VT_CHECK(q_in.device == q.device && k.device == q.device && v.device == q.device &&
+               out.device == q.device && g_raw.device == q.device && beta.device == q.device &&
+               state.device == q.device,
+           std::string(name) + ": device mismatch (q/k/v/out/g_raw/beta/state/queue)");
+  VT_CHECK(args.scale > 0.0f, std::string(name) + ": args.scale must be set (> 0)");
+  CheckI32Meta(q, query_start_loc, state.shape[0] + 1, name, "query_start_loc");
+  reinterpret_cast<KdaChunkPrefillFn>(GetOp(OpId::kKdaChunkPrefill, q.device.type))(
+      q, out, q_in, k, v, g_raw, beta, a_log, dt_bias, state, query_start_loc, args);
+}
+
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
                const Tensor* state_idx) {

@@ -102,6 +102,7 @@ enum class OpId : uint8_t {
   kGdnSpecDecode,
   kGdnPackedDecode,
   kKdaGatedDeltaRule,
+  kKdaChunkPrefill,
   kMoeRouterTopK,
   kMoeCombine,
   kAttention,
@@ -857,6 +858,15 @@ using GdnPackedDecodeFn =
 using KdaGatedDeltaRuleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                      const Tensor&, const Tensor&, Tensor&, const Tensor&,
                                      const GdnArgs&);
+// KDA CHUNK-PREFILL: the chunked (WY-representation) forward of the SAME
+// per-K-channel gated-delta linear attention as KdaGatedDeltaRule, but processing
+// the whole prompt in BT=64 chunks through the vendored FLA Triton-AOT cubins
+// (vLLM's actual prefill kernels) instead of the token-sequential recurrence.
+// Takes the RAW gate projection g_raw + a_log + dt_bias (the gate is fused
+// on-device by kda_gate_cumsum), NOT a pre-gated per-channel decay.
+using KdaChunkPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                   const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                   Tensor&, const Tensor&, const GdnArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -1833,6 +1843,28 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
 void KdaGatedDeltaRule(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                        const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                        const Tensor& query_start_loc, const GdnArgs& args);
+
+// KDA CHUNK-PREFILL — the chunked forward of KdaGatedDeltaRule, computing the same
+// per-K-channel gated-delta linear-attention output but in BT=64 chunks through the
+// vendored FLA Triton-AOT cubins (kda_gate_cumsum -> kkt(inter+intra) -> solve_tril
+// -> recompute_w_u -> chunk_delta_h -> chunk_gla_o), mirroring vLLM's prefill path
+// (kimi_gdn_linear_attn.py:141 chunk_kda_with_fused_gate; decode stays the recurrent
+// KdaGatedDeltaRule). Result differs from the recurrence only by chunked-vs-recurrent
+// REDUCTION ORDER (not bit-exact). Fires only at the pinned Kimi KDA geometry
+// (Hk==Hv==32, Dk==Dv==128) in a CUDA + VLLM_CPP_TRITON build; any other shape or a
+// CPU queue transparently falls back to the recurrence. Inputs:
+//   q_in/k [T,H,Dk] f32/bf16, L2-normalized by the caller (as KdaGatedDeltaRule);
+//   v [T,H,Dv] f32/bf16; out [T,H,Dv] f32/bf16;
+//   g_raw [T,H,Dk] f32 — the RAW gate projection (kda_gate_cumsum fuses the gate:
+//     -exp(a_log)*softplus(g_raw+dt_bias), chunk-cumsum, RCP_LN2 fold, on device);
+//   beta [T,H] f32 — the per-head gate (sigmoid(b), applied directly);
+//   a_log [H] f32; dt_bias [H*Dk] f32 (or empty => no bias);
+//   state [1,H,Dv,Dk] f32 (fresh zeros in, final written); query_start_loc [N+1] i32.
+// args.scale == Dk^-0.5 (baked in the cubins; guarded).
+void KdaChunkPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                     const Tensor& v, const Tensor& g_raw, const Tensor& beta,
+                     const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
+                     const Tensor& query_start_loc, const GdnArgs& args);
 
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and

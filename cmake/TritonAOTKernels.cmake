@@ -121,6 +121,28 @@ function(vllm_triton_aot_declare_all)
       "NT,${_H},1"
       "${_wu_head}, ${_H}, 16, 128, 128, 64, 64, 64, 1")
   endforeach()
+
+  # KDA chunk-prefill family (Kimi-Linear; H=32). Mirrors the GDN WY pins. See
+  # .agents/specs/kimi-linear.md §17.3; each line is byte-identical to the matching
+  # add_triton_kernel() call in CMakeLists.txt (the drift check compares the two).
+  _vllm_triton_aot_declare(kda_gate_cumsum kda_gate_cumsum.py kda_gate_cumsum_fwd_kernel 4 2
+    "2,NT,32"
+    "*bf16:16, *fp32:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 64, 1, 1")
+  _vllm_triton_aot_declare(kda_kkt_inter chunk_kda_kkt.py chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter 4 3
+    "NT,16,32"
+    "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 16, 64, 4, 1")
+  _vllm_triton_aot_declare(kda_kkt_intra chunk_kda_kkt.py chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra 4 2
+    "NT,4,32"
+    "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 64, 16, 128, 1")
+  _vllm_triton_aot_declare(kda_wu recompute_w_u_kda.py recompute_w_u_fwd_kernel 4 3
+    "NT,32,1"
+    "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 128, 64, 64, 64, 0, 1, 1")
+  _vllm_triton_aot_declare(kda_deltah_h32 chunk_delta_h.py chunk_gated_delta_rule_fwd_kernel_h_blockdim64 4 3
+    "2,NH,1"
+    "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 32, 128, 128, 64, 64, 0, 1, 1, 1, 1, 1, 1")
+  _vllm_triton_aot_declare(kda_gla_o chunk_gla_o.py chunk_gla_fwd_kernel_o 4 3
+    "2,NT,32"
+    "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 128, 128, 64, 64, 64, 1")
 endfunction()
 
 function(vllm_triton_aot_expected_lines OUT_VAR)
