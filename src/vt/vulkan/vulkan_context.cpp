@@ -538,8 +538,35 @@ VulkanContext::VulkanContext() {
       // Sorted by TIME, not count. The ordering is the point: reading a
       // count-sorted list is how a cheap shader that runs often gets mistaken
       // for the bottleneck.
-      std::fprintf(stderr, "[vt vulkan] %-24s %8s %10s %7s %10s\n", "shader",
-                   "count", "total ms", "%", "ms/call");
+      // PER-SHADER TIME IS UNAVAILABLE UNDER BATCHING, and printing 0.0 for
+      // every row would read as "these kernels are free" rather than "this was
+      // not measured". The wait that attributed time to a shader was the
+      // per-dispatch fence; batching submits many dispatches under ONE fence, so
+      // there is nothing to attribute. Counts stay exact either way.
+      //
+      // Getting per-kernel time back under batching needs GPU timestamp queries
+      // (vkCmdWriteTimestamp around each dispatch), which is the proper Vulkan
+      // answer and is not built. Until then, profile with VT_VULKAN_BATCH=0:
+      // relative KERNEL cost is still meaningful there, it just also carries the
+      // per-dispatch floor that batching removes.
+      if (!ctx.batching_enabled()) {
+        std::fprintf(stderr, "[vt vulkan] %-24s %8s %10s %7s %10s\n", "shader",
+                     "count", "total ms", "%", "ms/call");
+      } else {
+        std::fprintf(stderr,
+                     "[vt vulkan] per-shader TIME not measured under batching "
+                     "(one fence per batch, not per dispatch).\n"
+                     "[vt vulkan] Re-run with VT_VULKAN_BATCH=0 for per-kernel ms. "
+                     "Counts below are exact.\n");
+        std::fprintf(stderr, "[vt vulkan] %-24s %8s\n", "shader", "count");
+        for (const auto& kv : counts) {
+          std::fprintf(stderr, "[vt vulkan] %-24s %8llu\n", kv.first.c_str(),
+                       static_cast<unsigned long long>(kv.second));
+        }
+        std::fprintf(stderr, "[vt vulkan] %-24s %8llu\n", "TOTAL",
+                     static_cast<unsigned long long>(ctx.dispatch_count()));
+        return;
+      }
       for (const auto& kv : times) {
         const uint64_t n = counts[kv.first];
         std::fprintf(stderr, "[vt vulkan] %-24s %8llu %10.1f %6.1f%% %10.4f\n",
