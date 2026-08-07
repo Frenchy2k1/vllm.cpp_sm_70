@@ -83,6 +83,97 @@ bool FusedGlue() {
 
 inline double Sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
+// ─── STRICT-path numerics knobs (W7-speed lane) ────────────────────────────────
+// The correctness vehicle is MORE precise than vLLM (f32 residual stream + f64 host
+// islands), which flips near-tie argmaxes where vLLM's deterministic bf16 top-1 has
+// a small margin (spec §13 root cause). These two knobs mirror vLLM's bf16 compute
+// regime so the near-ties become token-exact. Both default OFF → the f32 vehicle is
+// byte-identical (the CPU tiny-config gate stays 13/13·656); flip ON only for the
+// full-model on-box token gate vs the STRICT golden.
+//
+// (1) VT_KIMI_BF16_RESIDUAL — carry the residual stream in bf16 like vLLM. vLLM's
+// fused_add_rms_norm stores `residual` as bf16 and `hidden_states`/block-outputs are
+// bf16, while it computes the RMSNorm variance over the f32 pre-store sum
+// (layernorm.py / fused_add_rms_norm.cu). We keep f32 STORAGE (so the two host-fallback
+// islands still consume f32) but round the VALUE to bf16 precision at exactly vLLM's
+// rounding points: the embed output, each block output before it re-enters the add,
+// and the residual AFTER each add (so the norm still sees the f32 sum — byte-matching
+// vLLM's fused-add-rms-norm order). 54 bf16 roundings across 27 layers × 2 norms that
+// vLLM does and our f32 vehicle does not.
+bool Bf16Residual() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_KIMI_BF16_RESIDUAL");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+// (2) VT_KIMI_BF16_ISLANDS — round the host-fallback island INPUTS (KDA recurrence
+// q/k/v/g1/beta, MLA softmax q/kv/kpe) to bf16 precision before the f64 recurrence.
+// vLLM feeds bf16 activations into the GDN Triton-AOT / FA2 kernels; our islands
+// download f32 (bf16-precision projection outputs stored to f32) and recompute in f64.
+// Rounding the inputs to bf16 moves the island toward vLLM's kernel precision without a
+// new device kernel (the true fix — the device GDN per-channel-decay recurrence + the
+// paged FA2 MLA — is the named W7-speed residual, spec §13).
+bool Bf16Islands() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_KIMI_BF16_ISLANDS");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+// Round an f32 value to bf16 precision (round-to-nearest-even), matching torch/vLLM's
+// bf16 cast (and vt::CastBf16). Truncate-with-RNE-bias on the top 16 bits; qNaN-safe.
+inline float ToBf16Rne(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, sizeof(u));
+  if ((u & 0x7fffffffu) > 0x7f800000u) {
+    u |= 0x00400000u;  // qNaN
+  } else {
+    u += 0x00007fffu + ((u >> 16) & 1u);  // RNE rounding bias
+  }
+  u &= 0xffff0000u;
+  float r;
+  std::memcpy(&r, &u, sizeof(r));
+  return r;
+}
+inline void RoundHostBf16(std::vector<float>& v) {
+  if (!Bf16Islands()) return;
+  for (float& x : v) x = ToBf16Rne(x);
+}
+
+// (3) VT_KIMI_ISLAND_F32ACC — compute the host-fallback island recurrence/softmax in
+// f32 accumulation (not f64), matching vLLM's GDN Triton / FA2 kernels (bf16 I/O, f32
+// accumulation). Our island defaults to f64 (MORE precise than vLLM); rounding each
+// accumulation step to f32 mirrors the device kernel's rounding. Combined with
+// VT_KIMI_BF16_ISLANDS (bf16 I/O), this is the closest host approximation of vLLM's
+// actual kernel numerics without a new device kernel (the named W7-speed residual).
+bool IslandF32Acc() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_KIMI_ISLAND_F32ACC");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+// Round a running f64 accumulator to f32 precision when the knob is on (identity else).
+inline double AccR(double x) {
+  static const bool f32 = IslandF32Acc();
+  return f32 ? static_cast<double>(static_cast<float>(x)) : x;
+}
+
+// In-place round an f32 device buffer to bf16 precision (f32→bf16→f32, on-device, no
+// download). The VALUE becomes bf16-exact so the RMSNorm variance and the next residual
+// add see the same bf16 numbers vLLM does; the STORAGE stays f32 (the islands read f32).
+void RoundDevBf16(const Dev& d, DBuf& x) {
+  Tensor xt = x.t();
+  std::vector<int64_t> shape(xt.shape, xt.shape + xt.rank);
+  DBuf b(d, DType::kBF16, shape);
+  vt::CastBf16(d.q, b.t(), xt);
+  Tensor out = x.t();
+  vt::CastF32(d.q, out, b.t());
+}
+
 // Device-resident weight view. On CPU this ALIASES the host f32 bytes exactly as
 // dense_attn::ResidentWeight does for a CPU device (host-pointer aliasing is a CPU
 // property); the CUDA staging over materialized OwnedTensors is the born-on-runner
@@ -197,6 +288,13 @@ DBuf KdaRecurrenceIsland(const Dev& d, DBuf& qn, DBuf& kn, DBuf& vc, DBuf& g1,
   vc.Download(d, hv.data());
   g1.Download(d, hg1.data());
   braw.Download(d, hbraw.data());
+  // VT_KIMI_BF16_ISLANDS: feed bf16-precision inputs to the recurrence (like vLLM's
+  // GDN kernel), keeping the f64 accumulation. No-op when the knob is off.
+  RoundHostBf16(hqn);
+  RoundHostBf16(hkn);
+  RoundHostBf16(hv);
+  RoundHostBf16(hg1);
+  RoundHostBf16(hbraw);
 
   const std::vector<float> g =
       kimi_kda::KdaDecayGate(hg1, a_log, dt_bias, T, nh, hd);  // [T,nh,hd]
@@ -215,26 +313,26 @@ DBuf KdaRecurrenceIsland(const Dev& d, DBuf& qn, DBuf& kn, DBuf& vc, DBuf& g1,
       double* Sp = &S[static_cast<size_t>(h) * hd * hd];
       for (int64_t vd = 0; vd < hd; ++vd) {
         double* Sr = &Sp[vd * hd];
-        for (int64_t k = 0; k < hd; ++k) Sr[k] *= std::exp(static_cast<double>(gh[k]));
+        for (int64_t k = 0; k < hd; ++k) Sr[k] = AccR(Sr[k] * std::exp(static_cast<double>(gh[k])));
       }
       for (int64_t vd = 0; vd < hd; ++vd) {
         const double* Sr = &Sp[vd * hd];
         double pred = 0.0;
-        for (int64_t k = 0; k < hd; ++k) pred += Sr[k] * knp[k];
-        u[static_cast<size_t>(vd)] = (static_cast<double>(vvp[vd]) - pred) * b;
+        for (int64_t k = 0; k < hd; ++k) pred = AccR(pred + Sr[k] * knp[k]);
+        u[static_cast<size_t>(vd)] = AccR((static_cast<double>(vvp[vd]) - pred) * b);
       }
       for (int64_t vd = 0; vd < hd; ++vd) {
         double* Sr = &Sp[vd * hd];
         const double uv = u[static_cast<size_t>(vd)];
-        for (int64_t k = 0; k < hd; ++k) Sr[k] += uv * knp[k];
+        for (int64_t k = 0; k < hd; ++k) Sr[k] = AccR(Sr[k] + uv * knp[k]);
       }
       float* cr = &core[static_cast<size_t>(base)];
       for (int64_t vd = 0; vd < hd; ++vd) {
         const double* Sr = &Sp[vd * hd];
         double o = 0.0;
         for (int64_t k = 0; k < hd; ++k)
-          o += Sr[k] * (static_cast<double>(qnp[k]) * scale);
-        cr[vd] = static_cast<float>(o);
+          o = AccR(o + Sr[k] * (static_cast<double>(qnp[k]) * scale));
+        cr[vd] = static_cast<float>(o);  // f32 output (bf16-rounding the output MEASURED -14, reverted)
       }
     }
   }
@@ -258,6 +356,10 @@ DBuf MlaSoftmaxIsland(const Dev& d, DBuf& dq, DBuf& dkv, DBuf& dkpe,
   dq.Download(d, hq.data());
   dkv.Download(d, hkv.data());
   dkpe.Download(d, hkpe.data());
+  // VT_KIMI_BF16_ISLANDS: bf16-precision inputs to the softmax core (like vLLM's FA2).
+  RoundHostBf16(hq);
+  RoundHostBf16(hkv);
+  RoundHostBf16(hkpe);
   const double scale = std::pow(static_cast<double>(qk), -0.5);
   std::vector<float> out(static_cast<size_t>(T) * nah * vh, 0.0f);
   std::vector<double> sc(static_cast<size_t>(T));
@@ -271,27 +373,27 @@ DBuf MlaSoftmaxIsland(const Dev& d, DBuf& dq, DBuf& dkv, DBuf& dkpe,
         const float* kpe = &hkpe[static_cast<size_t>(s * qr)];
         double dot = 0.0;
         for (int64_t dd = 0; dd < qn; ++dd)
-          dot += static_cast<double>(q_nope[dd]) * k_nope[dd];
+          dot = AccR(dot + static_cast<double>(q_nope[dd]) * k_nope[dd]);
         for (int64_t dd = 0; dd < qr; ++dd)
-          dot += static_cast<double>(q_pe[dd]) * kpe[dd];
-        dot *= scale;
+          dot = AccR(dot + static_cast<double>(q_pe[dd]) * kpe[dd]);
+        dot = AccR(dot * scale);
         sc[static_cast<size_t>(s)] = dot;
         mx = std::max(mx, dot);
       }
       double sum = 0.0;
       for (int64_t s = 0; s <= t; ++s) {
-        const double e = std::exp(sc[static_cast<size_t>(s)] - mx);
+        const double e = AccR(std::exp(sc[static_cast<size_t>(s)] - mx));
         sc[static_cast<size_t>(s)] = e;
-        sum += e;
+        sum = AccR(sum + e);
       }
       float* ot = &out[static_cast<size_t>(t * nah * vh + h * vh)];
       for (int64_t dd = 0; dd < vh; ++dd) {
         double acc = 0.0;
         for (int64_t s = 0; s <= t; ++s) {
           const float* vs = &hkv[static_cast<size_t>(s * kvw + h * (qn + vh) + qn)];
-          acc += (sc[static_cast<size_t>(s)] / sum) * static_cast<double>(vs[dd]);
+          acc = AccR(acc + (sc[static_cast<size_t>(s)] / sum) * static_cast<double>(vs[dd]));
         }
-        ot[dd] = static_cast<float>(acc);
+        ot[dd] = static_cast<float>(acc);  // f32 output (bf16-rounding the output MEASURED -14, reverted)
       }
     }
   }
@@ -807,6 +909,8 @@ DBuf DeviceForwardBodyBf16(const Dev& d, const KimiLinearWeights& weights,
     Tensor hh = hidden.t();
     vt::Embedding(d.q, hh, htab, dids.t());
   }
+  const bool bf16_res = Bf16Residual();
+  if (bf16_res) RoundDevBf16(d, hidden);  // vLLM embed output is bf16
   DBuf res(d, DType::kF32, {T, H});
   res.Zero(d);
   Tensor hcur = hidden.t();
@@ -816,12 +920,16 @@ DBuf DeviceForwardBodyBf16(const Dev& d, const KimiLinearWeights& weights,
     const KimiLinearLayerResidentWeights& lw = rw.layers[static_cast<size_t>(l)];
     DBuf dhn(d, DType::kF32, {T, H});
     AddRmsNorm(d, dhn, hcur, WF32(d, lw.input_layernorm, {H}), res, eps);
+    if (bf16_res) RoundDevBf16(d, res);  // vLLM stores residual bf16 (variance saw f32 sum)
     DBuf attn = lw.is_kda ? KdaLayerDeviceBf16(d, lw.kda, dhn.t(), p, T)
                           : MlaLayerDeviceBf16(d, lw.mla, dhn.t(), p, T);
+    if (bf16_res) RoundDevBf16(d, attn);  // vLLM attn_output is bf16
     DBuf dh2(d, DType::kF32, {T, H});
     AddRmsNorm(d, dh2, attn.t(), WF32(d, lw.post_attention_layernorm, {H}), res, eps);
+    if (bf16_res) RoundDevBf16(d, res);
     DBuf mlp = lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
                          : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T);
+    if (bf16_res) RoundDevBf16(d, mlp);  // vLLM mlp output is bf16
     auto* held = new DBuf(std::move(mlp));
     hcur = held->t();
     hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });
