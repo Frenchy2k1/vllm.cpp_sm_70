@@ -39216,7 +39216,6 @@ numerics-delicate) — a kernel rewrite, not a routing/config lever. Full forens
 benchmark record (QUANT-CT-MXFP4-FINAL-STACK). Branch pushed to
 `row/QUANT-CT-MXFP4-FINAL-STACK`; not merged to main.
 
-
 ## 2026-08-06T13:45 - RECORDS REPAIR: future-dated stamps corrected to the evidenced date
 <!-- state: 2026-08-06T13:45 -->
 
@@ -39232,7 +39231,6 @@ were mapped the same way (body cross-references of duplicated stamps map to
 the first occurrence). The DATES are now evidence-true; the intra-day minutes
 on corrected entries are synthetic ordering values, not measured times. No
 cited SHA changed.
-
 
 ## 2026-08-06T14:19 - MiniMax-H3 W-FP4a: fp4-resident Marlin-W4A16 routing (CPU-landed)
 <!-- state: 2026-08-06T14:19 -->
@@ -39357,6 +39355,7 @@ encoder of `nano_nemotron_vl.py`, which vllm.cpp already carries rows for, so it
 is mirror-vLLM work that is owed anyway). The transducer decode half of
 parakeet.cpp (RNN-T/TDT/CTC search, joint network) is NOT in vLLM and is a
 separate scope call.
+
 ## 2026-08-06T16:05 - MiniMax-H3 W-FP4a GB10 leg: Marlin W4A16 GB10-verified byte-exact; fp4 = memory win; real-checkpoint e2e RUNS but frame is a non-scene patch-grid
 <!-- state: 2026-08-06T16:05 -->
 
@@ -39482,6 +39481,7 @@ functional code ships. The +450 us/step flash residual is occupancy/L2, NOT the 
 count; NEXT lever = lift flash occupancy above 8.3% (register pressure / `__launch_bounds__`)
 or cut the barrier/smem stalls. No default flip (no throughput win). Full tables in
 `.agents/benchmark-record.md` (QUANT-CT-MXFP4-FLASH-AUDIT) + the spec. Box left clean.
+
 ## 2026-08-06T20:30 - H3 render-coherence ROOT-CAUSED by latent bisection: VAE is FINE (round-trip coherent), the DiT emits a spatially-WHITE latent at real geometry
 <!-- state: 2026-08-06T20:30 -->
 
@@ -39537,6 +39537,7 @@ are committed on the row for the next session. fp4 speed path stays CLOSED.
 Box left clean (GPU idle, both locks free, worker down, ~39 G ckpt cached at
 `dgx:~/h3fp4/ckpt`, diagnostic latents at `dgx:~/h3fp4/diag`). Evidence:
 `dgx:~/h3fp4/{diag,rt_out,out_small,out_cond}`; PR #70.
+
 ## 2026-08-06T20:45 - H3 DiT geometry-ladder gate CLAIMED (row/H3-DIT-SCALE-GATE, helper, DRAFT PR) - pin the #70 spatial-mixing divergence at real token geometry
 <!-- state: 2026-08-06T20:45 -->
 
@@ -39558,6 +39559,7 @@ ladder as a permanent below-one-tile gate. If the ladder does NOT reproduce even
 at 8x8+temporal+mix, record that verdict with data and redirect to the
 device-vs-host diff at ladder geometry. Harness verified: gen script reproduces
 the checked-in goldens byte-identically against the local `~/_git/vllm-omni`.
+
 ## 2026-08-06T20:55 - H3 DiT geometry-ladder BUILT + run: #70 spatial-mixing-math hypothesis REFUTED; the white latent is trained-weights/real-scale, not a reduced-dim DiT bug
 <!-- state: 2026-08-06T20:55 -->
 
@@ -39708,6 +39710,7 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
 
   Next: `VK-A1` (shader-variant pipeline + the feature-matrix drift repair),
   which blocks every shader written after it.
+
 ## 2026-08-06T23:10 - BACKEND-ROCM W0: the AMD skeleton lands UNBUILT and says so - plus the one non-additive platform site the enum change uncovered
 <!-- state: 2026-08-06T23:10 -->
 
@@ -39838,7 +39841,6 @@ and the encoder vision tower (W3) for clean image/video-conditioned ref2va/fl2va
 a synthetic reference + text-only encoder still grids). dgx assets: `~/h3fp4/ckpt/MiniMax-H3-
 FL2VA-Q3_K_M.gguf`, `~/h3fp4/fl2va_t2va_20/`. Box left clean.
 
-
 ## 2026-08-06 — startup latency becomes a MEASURABLE axis (harness only; no number)
 <!-- state: 2026-08-06T23:55 -->
 
@@ -39880,6 +39882,7 @@ Open: **the number.** dgx.casa root was at 100% (20 GiB free) with no existing
 CUDA `server` build, so the ours arm could not be built. User authorized
 reclaiming the untagged 7.37 GB docker image + 4.4 GB builder cache (NOT the
 stopped `local-ai-worker` container). Run owed: 27B, 3 interleaved repetitions.
+
 ## 2026-08-06 — Parakeet/FastConformer encoder kernels P1-P3 land on CPU: Conv2d, non-causal depthwise Conv1d, relative-position attention
 <!-- state: 2026-08-06T23:58 -->
 
@@ -39992,6 +39995,7 @@ assertions; restored → GREEN. Suite 67/67 (66 prior +1), 46549 assertions; `te
 4/4 (server wiring). No numbers changed (refusal gate, not a perf lever). Records: spec §8.7,
 STATUS/BENCHMARKS H3 rows, benchmark-record, NOW. Pre-existing preflight red
 (check-fusion-consistency `minimax_h3_video_vae_device`) is not this row.
+
 ## 2026-08-07T00:45 - QUANT-CT-MXFP4-FLASH-PTXAS: the ptxas-lineage arbiter = NO; #75's "wheel ptxas SASS-quality" attribution RETIRED - vLLM's flash SASS is driver-JIT'd from CUDA-13.0 PTX, codegen ties across all ptxas AND vs vLLM's own PTX, the +10us gap is ENGINE CONTEXT (row/QUANT-CT-MXFP4-FLASH-PTXAS, helper, PR #82)
 <!-- state: 2026-08-07T00:45 -->
 
@@ -40304,6 +40308,7 @@ this <1 GiB microbench) - run-1 data is on disk and decisive.
 
   Still on the reference tier: quant, MoE, GDN/MLA, the rotary TABLE build and
   every sampler beyond greedy argmax.
+
 ## 2026-08-07T01:45 - MiniMax-H3 encoder VISION TOWER — record reconciled + real-weights loader wired (row/H3-CONDITIONED-E2E, helper, DRAFT PR)
 <!-- state: 2026-08-07T01:45 -->
 
@@ -40353,6 +40358,7 @@ into the DEVICE text tower changing the frames) needs the exact deepstack indexe
 device-text DeepStack/merge extension + an on-box GPU render; recorded in the benchmark record.
 Records: spec §8.8, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Pre-existing
 preflight red (check-fusion-consistency `minimax_h3_video_vae_device`) is not this row.
+
 ## 2026-08-07T03:20 - MiniMax-H3 vision tower GB10-VERIFIED on real weights; fl2va COHERENT, ref2va STILL GRIDS (row/H3-CONDITIONED-E2E, helper, PR #86)
 <!-- state: 2026-08-07T03:20 -->
 
@@ -40652,6 +40658,7 @@ the pipeline is the failure that looks like it worked), and an illegal pair is a
 video reference is a frame DIRECTORY; OpenAI's real `input_reference` upload is
 multipart, ours is the JSON spelling; the real-weights leg rides the H3 GB10/disk
 window.
+
 ## 2026-08-07T05:30 - MiniMax-H3 ref2va assembly bug FIXED + gated; render grid RE-ATTRIBUTED to the ref2va NVFP4 CHECKPOINT (NOT the assembly) (row/H3-REF2VA-ASSEMBLY, helper, PR #93)
 <!-- state: 2026-08-07T05:30 -->
 
@@ -40791,7 +40798,6 @@ nibble, fp4, or free-gen. fp4-resident Marlin arm grids differently again (3rd, 
 wiring-gated). NEXT: layer-by-layer activation diff of the NVFP4-bf16 stream vs the GGUF-bf16 stream
 (identical weights; differ only in dequant source + island read bf16-disk vs f16-disk). Records: spec
 §8.11 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Box left clean.
-
 
 ## 2026-08-07 — startup latency MEASURED (provisional): 36.51 s vs vLLM 221.51 s = 6.07x
 <!-- state: 2026-08-07T05:35 -->
@@ -41040,6 +41046,7 @@ question is UNBLOCKED, not answered.
 
 Next: `row/H3-BF16-SHARDED-STREAM` (device streamer), then the operator runs the real
 13-shard bf16 DiT.
+
 ## 2026-08-07 — Parakeet/FastConformer P4 lands on CPU: the encoder, the CTC head, greedy collapse, the log-mel front end and an HF-safetensors loader
 <!-- state: 2026-08-07T10:00 -->
 
@@ -41224,6 +41231,7 @@ is required") is now IMPLEMENTED as the additive device op `vt::KdaGatedDeltaRul
   dgx gained `glslc`, `glslang-tools`, `libvulkan-dev`, `spirv-headers` (apt) and
   a source-built shaderc at `/tmp/shaderc`; llama.cpp at the pin is unpacked at
   `~/lcpp-vk` with `build-vk/bin/llama-bench` ready.
+
 ## 2026-08-07T12:35 — Kimi-Linear: device NoPE-MLA attention lever `VT_KIMI_DEVICE_MLA` MEASURED-NEGATIVE (122→109/128, slower); STRICT owes the ACTUAL FA2/chunk_kda kernels (row/KIMI-STRICT-CLOSE, #107)
 <!-- state: 2026-08-07T12:35 -->
 - The §15 residual (d) — the 7 NoPE-MLA layers still run a host f64 softmax island; closing p7 needs
@@ -41286,6 +41294,7 @@ pinned-config record.
   high util is an OOM-reboot trigger; ONE attempt, record honestly if it OOMs). Recorded in §17.5.
 - No GPU work this session (pure authoring); box untouched, `local-ai-worker` left as-is. No STRICT
   claimed. Branch `row/KIMI-CHUNK-KDA-AOT` off `origin/main` @ `ea89926f`; DRAFT PR opened.
+
 ## 2026-08-07T13:10 - H3: the ORIGINAL bf16 DiT now STREAMS to the device - one tensor at a time, zero host buffer for the bulk (row/H3-BF16-SHARDED-STREAM, CPU-only)
 <!-- state: 2026-08-07T13:10 -->
 
@@ -41959,6 +41968,26 @@ because a genuinely new row exists.
   still ~9x off the bandwidth roof (1.50 GB/token vs ~273 GB/s = 182 tok/s
   ceiling, 19.8 measured).
 
+## 2026-08-07 — Developer agent protocol entry point design accepted
+<!-- state: 2026-08-07T19:00 -->
+
+User-directed row `DOCS-AGENT-PROTOCOL-ENTRYPOINT`. The accepted design adds a
+friendly root-level contribution page that explains the project's 1:1 C++ vLLM
+target, the additional SGLang and multimodal surface, and the one instruction a
+developer gives an agent: read `AGENTS.md` completely and run preflight.
+
+The scope grew from public prose to one binding intake obligation. Before a row
+is claimed or implementation starts, the agent must search open issues and PRs,
+read the live records and helper queue, inspect the current code and tests, and
+confirm that the recorded gap still exists. The PR records the issue search and
+exact code/test anchors. `check-protocol-consistency.py` will keep the obligation
+verbatim in `AGENTS.md` and `.agents/workflow.md`; GitHub availability will not
+become a local role-claim dependency.
+
+This is a design checkpoint only. No engine code, capability state, benchmark
+number, or public feature surface changed. Implementation follows in the same
+row after the draft PR is opened.
+
 ## Kimi-Linear: bf16 residual stream REFUTED; STRICT is intrinsically unreachable; SERVER fold scoped (spec §20, PR #118)
 <!-- state: 2026-08-07T20:30 -->
 
@@ -42031,3 +42060,4 @@ leaves (Kimi runner fold #279, Parakeet ASR #280). Reviewer findings 1-8 applied
 (quoted+angle includes, comment-stripped ABI tokenize, subprocess enforcement
 tests, ratchet equality pin, reachable-row-removal design note, meta-gap note). No
 CUDA build; no perf number owed; STATUS inside its char ratchet.
+
