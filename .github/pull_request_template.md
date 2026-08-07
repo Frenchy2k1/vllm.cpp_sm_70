@@ -5,6 +5,15 @@
 
 `ROW-ID` — one row per PR.
 
+## Before starting
+
+<!-- Record what you found before implementation. "No matching issue or PR" is
+     valid; do not invent one for small governance or documentation work. -->
+
+- Issue/PR search and existing claim:
+- Roadmap or matrix row, plus `scripts/ready-for-helper.py` result when applicable:
+- Exact current-code and test/evidence anchors inspected:
+
 ## What changed
 
 <!-- One paragraph. What it does, not how you felt about it. -->
