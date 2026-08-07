@@ -1,6 +1,6 @@
 # ONE SURFACE — every capability ships through the C ABI
 
-Row: `ARCH-ONE-SURFACE`. Status: **AUDIT DONE, remediation NOT started.**
+Row: `ARCH-ONE-SURFACE`. Status: **AUDIT DONE; remediation IN PROGRESS — ROW 1 (Parakeet ASR / audio transcription) LANDED 2026-08-07: ABI v11 `vllm_transcribe`, live `/v1/audio/transcriptions`, registry refuse-by-task, example folded, ratchet 12 -> 11.**
 
 ## The defect
 
@@ -34,9 +34,12 @@ stay OPEN. The complete, code-grounded matrix (all 30 archs + every off-registry
 | DeepSeek-V4 | YES | KV spec is a "never exercised" stub; registry forward discards attn_meta/kv | `examples/deepseek_v4_gen` | 240 lines |
 
 This table also UNDER-COUNTS: it omits Parakeet ASR (a 5th off-surface capability, landed
-`fd2259d8`) and the partial internal-reachers `minimax_h3_mux`, `bench`, `tokenize`,
-`dump_container`, `dequant_nvfp4`, `quant_gemm_bench` — 12 of 13 example binaries include
-non-public headers today (only `examples/cli` is clean). The full list is the audit spec.
+`fd2259d8` — **CLOSED 2026-08-07 by ROW 1**: `vllm_transcribe` on ABI v11, live
+`/v1/audio/transcriptions`, registry refuse-by-task, example rewritten as a `vllm.h`
+client, ratchet 12 -> 11) and the partial internal-reachers `minimax_h3_mux`, `bench`,
+`tokenize`, `dump_container`, `dequant_nvfp4`, `quant_gemm_bench` — 11 of 13 example
+binaries still include non-public headers (`examples/cli` and `examples/parakeet_transcribe`
+are the clean ABI clients). The full list is the audit spec.
 
 `examples/server/main.cpp` also carries ~32 internal includes (54 direct `MiniMaxH3`
 references), i.e. it re-implements wiring rather than consuming a library entry point. So
@@ -137,5 +140,11 @@ embedder produce an MP4 without reinventing the command: the library composes it
 
 ## NOT claimed
 
-No ABI work has been done. The shape above is a proposal, not an implementation,
-and it has not been reviewed against an embedder other than LocalAI.
+The VIDEO ABI shape above is a proposal, not an implementation, and it has not
+been reviewed against an embedder other than LocalAI. The ONE landed slice is
+audio transcription (ROW 1, 2026-08-07): `vllm_transcribe` + params/result
+structs on ABI v11, the `ParakeetTranscriber` library seam, task-conditional
+`/v1/audio/transcriptions`, registry refuse-by-task, and the example as a thin
+`vllm.h` client — gated byte-identical to the pre-fold transcripts. Video,
+Laguna/DeepSeek/Kimi fast decode, embeddings and multimodal input remain open
+rows of this program.

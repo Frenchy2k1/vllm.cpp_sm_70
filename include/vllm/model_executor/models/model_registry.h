@@ -55,6 +55,17 @@ struct ModelInfo {
   bool is_hybrid = false;
   bool has_inner_state = false;
   bool supports_multimodal = false;
+  // Mirror of the SupportsTranscription protocol
+  // (vllm/model_executor/models/interfaces.py:1110-1118):
+  // `supports_transcription` marks an ASR-capable arch;
+  // `supports_transcription_only` marks one with NO text-generation path
+  // (interfaces.py:1118 `supports_transcription_only: ClassVar[bool]`), which
+  // the entrypoints use to refuse-by-task: LoadedEngine::FromModelDir rejects
+  // such an arch with a message pointing at the transcription entry points
+  // (vllm_transcribe / /v1/audio/transcriptions), mirroring how vLLM excludes
+  // "generate" from supported_tasks for them.
+  bool supports_transcription = false;
+  bool supports_transcription_only = false;
   std::string_view score_type = "bi-encoder";
 };
 

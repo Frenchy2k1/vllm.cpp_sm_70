@@ -108,9 +108,20 @@ ApiServer::ApiServer(OpenAIServingCompletion& completion,
                      OpenAIServingChat& chat, OpenAIServingModels& models,
                      std::string version, size_t max_concurrent_streams,
                      HttpWorkerPoolMode worker_pool_mode)
-    : completion_(completion),
-      chat_(chat),
+    : completion_(&completion),
+      chat_(&chat),
       models_(models),
+      version_(std::move(version)),
+      impl_(std::make_unique<Impl>(max_concurrent_streams, worker_pool_mode)) {}
+
+// Serving-less construction (transcription-only servers, ARCH-ONE-SURFACE
+// ROW 1): no AsyncLLM exists, so the generate handlers stay null and their
+// routes are not registered — vLLM's task-conditional route registration
+// (api_server.py:255-265) expressed at construction.
+ApiServer::ApiServer(OpenAIServingModels& models, std::string version,
+                     size_t max_concurrent_streams,
+                     HttpWorkerPoolMode worker_pool_mode)
+    : models_(models),
       version_(std::move(version)),
       impl_(std::make_unique<Impl>(max_concurrent_streams, worker_pool_mode)) {}
 
@@ -130,6 +141,14 @@ ApiServer::~ApiServer() {
 
 ApiServer::DispatchResult ApiServer::handle_completions(
     const std::string& request_body) {
+  if (completion_ == nullptr) {
+    // vLLM's api_router `if handler is None: raise NotImplementedError` mirror
+    // for a serving-less (transcription-only) server; the socket layer never
+    // registers the route in that mode, so this answers direct dispatch only.
+    return MakeError(500, "InternalServerError",
+                     "The model does not support Completions API "
+                     "(transcription-only server)");
+  }
   // completion/api_router.py:46 (create_completion): parse → check_model →
   // handler → JSON (non-stream) or text/event-stream (stream).
   nlohmann::json body;
@@ -156,8 +175,8 @@ ApiServer::DispatchResult ApiServer::handle_completions(
   try {
     std::unique_lock<std::mutex> legacy_lock(impl_->legacy_engine_mutex,
                                              std::defer_lock);
-    if (!completion_.uses_async_engine()) legacy_lock.lock();
-    result = completion_.create_completion(request);
+    if (!completion_->uses_async_engine()) legacy_lock.lock();
+    result = completion_->create_completion(request);
   } catch (const std::exception& e) {
     // DISCRIMINATOR: attribute a 500 to its endpoint + model + raw cause so a
     // benchmark driver that only sees the generic HTTP body can still recover
@@ -183,6 +202,11 @@ ApiServer::DispatchResult ApiServer::handle_completions(
 
 ApiServer::DispatchResult ApiServer::handle_chat_completions(
     const std::string& request_body) {
+  if (chat_ == nullptr) {
+    return MakeError(500, "InternalServerError",
+                     "The model does not support Chat Completions API "
+                     "(transcription-only server)");
+  }
   // chat_completion/api_router.py:53 (create_chat_completion).
   nlohmann::json body;
   try {
@@ -208,8 +232,8 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
   try {
     std::unique_lock<std::mutex> legacy_lock(impl_->legacy_engine_mutex,
                                              std::defer_lock);
-    if (!chat_.uses_async_engine()) legacy_lock.lock();
-    result = chat_.create_chat_completion(request);
+    if (!chat_->uses_async_engine()) legacy_lock.lock();
+    result = chat_->create_chat_completion(request);
   } catch (const std::exception& e) {
     std::cerr << "api-server: 500 endpoint=/v1/chat/completions model="
               << request.model.value_or("") << " what=" << e.what() << "\n";
@@ -286,6 +310,59 @@ std::string ApiServer::video_model_warning(
   return "requested model '" + request.model +
          "' is not a served model ('" + models_.model_name() +
          "'); generated with the video model this server was started with";
+}
+
+ApiServer::DispatchResult ApiServer::handle_audio_transcriptions(
+    const std::string& file_bytes, const std::string& response_format) const {
+  // Mirror of vLLM speech_to_text/transcription: api_router.py:31
+  // `create_transcriptions` reads the multipart upload
+  // (read_upload_with_limit) and hands the bytes to
+  // OpenAIServingTranscription.create_transcription (serving.py:50), which
+  // answers TranscriptionResponse {"text": ...} for response_format json and
+  // the raw text otherwise. The transcription itself runs through the ONE
+  // library seam (ParakeetTranscriber) — the same code path vllm_transcribe
+  // drives, so HTTP and FFI cannot drift.
+  if (!transcriber_) {
+    // The api_router `if handler is None: raise NotImplementedError` mirror;
+    // the socket layer never registers the route without a transcriber.
+    return MakeError(500, "InternalServerError",
+                     "The model does not support Transcriptions API");
+  }
+  if (file_bytes.empty()) {
+    return MakeError(400, "BadRequestError",
+                     "Expected a non-empty `file` upload (16-bit PCM mono "
+                     "RIFF/WAVE)");
+  }
+  const std::string fmt = response_format.empty() ? "json" : response_format;
+  if (fmt != "json" && fmt != "text") {
+    // verbose_json / srt / vtt are NAMED RESIDUALS of this fold (protocol.py
+    // AudioResponseFormat lists them; nothing here produces segment timing).
+    return MakeError(400, "BadRequestError",
+                     "response_format '" + fmt +
+                         "' is not supported (supported: json, text; "
+                         "verbose_json/srt/vtt are named residuals)");
+  }
+  try {
+    const ::vllm::multimodal::ParakeetTranscription result = transcriber_(
+        reinterpret_cast<const uint8_t*>(file_bytes.data()), file_bytes.size());
+    if (!result.has_text) {
+      return MakeError(500, "InternalServerError",
+                       "the checkpoint ships no tokenizer.json, so ids-only "
+                       "transcription has no OpenAI response shape");
+    }
+    DispatchResult r;
+    if (fmt == "text") {
+      r.content_type = "text/plain; charset=utf-8";
+      r.body = result.text;
+    } else {
+      r.body = nlohmann::json{{"text", result.text}}.dump();
+    }
+    return r;
+  } catch (const std::exception& e) {
+    // Undecodable audio (not RIFF/WAVE, not PCM16 mono, wrong sample rate) is
+    // a caller error; the pipeline names the cause.
+    return MakeError(400, "BadRequestError", e.what());
+  }
 }
 
 ApiServer::DispatchResult ApiServer::handle_videos(
@@ -495,7 +572,12 @@ ApiServer::DispatchResult ApiServer::handle_tokenize(
     const bool render_generation_prompt =
         add_generation_prompt && !continue_final_message;
     try {
-      prompt = chat_.prompt_fn()(messages, render_generation_prompt, tools);
+      if (chat_ == nullptr) {
+        return MakeError(500, "InternalServerError",
+                         "tokenize: the chat form needs the chat template of a "
+                         "text-generation server (transcription-only server)");
+      }
+      prompt = chat_->prompt_fn()(messages, render_generation_prompt, tools);
     } catch (const std::exception& e) {
       return MakeError(400, "BadRequestError",
                        std::string("Chat template render failed: ") + e.what());
@@ -778,14 +860,22 @@ void ApiServer::register_routes() {
     }
   };
 
-  server.Post("/v1/completions",
-              [this, write](const httplib::Request& req, httplib::Response& res) {
-                write(handle_completions(req.body), res);
-              });
-  server.Post("/v1/chat/completions",
-              [this, write](const httplib::Request& req, httplib::Response& res) {
-                write(handle_chat_completions(req.body), res);
-              });
+  // TASK-CONDITIONAL (mirrors vLLM registering the generate routes only when
+  // "generate" is in supported_tasks, api_server.py:255-265): a serving-less
+  // (transcription-only) server has no completion/chat handlers, so the two
+  // generate routes are NOT registered and answer 404.
+  if (completion_ != nullptr) {
+    server.Post("/v1/completions",
+                [this, write](const httplib::Request& req, httplib::Response& res) {
+                  write(handle_completions(req.body), res);
+                });
+  }
+  if (chat_ != nullptr) {
+    server.Post("/v1/chat/completions",
+                [this, write](const httplib::Request& req, httplib::Response& res) {
+                  write(handle_chat_completions(req.body), res);
+                });
+  }
   server.Get("/v1/models",
              [this, write](const httplib::Request&, httplib::Response& res) {
                write(handle_models(), res);
@@ -814,6 +904,29 @@ void ApiServer::register_routes() {
              [this, write](const httplib::Request&, httplib::Response& res) {
                write(handle_server_info(), res);
              });
+
+  if (transcriber_) {
+    // Parakeet ASR (ARCH-ONE-SURFACE ROW 1). Registered ONLY when a
+    // transcriber is attached, so a text server answers 404 exactly as before.
+    // The multipart shape mirrors vLLM's create_transcriptions
+    // (speech_to_text/transcription/api_router.py:31): the audio arrives as
+    // the `file` upload, `response_format` as an ordinary form field.
+    server.Post("/v1/audio/transcriptions",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  if (!req.form.has_file("file")) {
+                    write(MakeError(400, "BadRequestError",
+                                    "multipart/form-data with a `file` upload "
+                                    "is required"),
+                          res);
+                    return;
+                  }
+                  write(handle_audio_transcriptions(
+                            req.form.get_file("file").content,
+                            req.form.get_field("response_format")),
+                        res);
+                });
+  }
 
   if (video_runner_) {
     // MiniMax-H3. Registered ONLY when a runner is attached, so a server built

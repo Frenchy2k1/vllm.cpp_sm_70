@@ -25,10 +25,10 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
-| Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
+| Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
-| Surface coverage (`ARCH-ONE-SURFACE`) | **Guard LANDS** `check-surface-coverage.py` (2 axes): examples+FEATURES caps→ABI or tracked | PR #120 |
+| Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 1 LANDED (#121)**: Parakeet ASR on the surface (`vllm_transcribe` v11, `/v1/audio/transcriptions`, ratchet 12→11) | Next fold row |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.

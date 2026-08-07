@@ -1,0 +1,24 @@
+{
+ "architectures": [
+  "ParakeetForCTC"
+ ],
+ "model_type": "parakeet_ctc",
+ "vocab_size": 8,
+ "pad_token_id": 7,
+ "encoder_config": {
+  "hidden_size": 16,
+  "num_hidden_layers": 1,
+  "num_attention_heads": 2,
+  "intermediate_size": 32,
+  "num_mel_bins": 8,
+  "subsampling_conv_channels": 4,
+  "subsampling_factor": 4,
+  "subsampling_conv_kernel_size": 3,
+  "subsampling_conv_stride": 2,
+  "conv_kernel_size": 3,
+  "attention_bias": true,
+  "convolution_bias": true,
+  "scale_input": true,
+  "hidden_act": "silu"
+ }
+}

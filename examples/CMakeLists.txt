@@ -99,11 +99,11 @@ if(VLLM_CPP_VULKAN)
   vllm_cpp_set_warnings(vulkan-dispatch-floor)
 endif()
 
-# parakeet-transcribe: the ASR driver — real WAV, real pretrained
-# ParakeetForCTC weights, log-mel -> encoder -> CTC -> collapsed token ids.
-# Lives here for the same reason the h3 drivers do: it is a driver over real
-# checkpoints, not library surface. The unit gates prove the math against a
-# random-weight HF oracle; this proves the model actually transcribes.
+# parakeet-transcribe: the ASR example — a THIN client of the public C ABI
+# (include/vllm.h + vllm::shared ONLY, like vllm-cli), per the ONE SURFACE
+# directive. The pipeline it used to own privately lives in the library behind
+# vllm_engine_load + vllm_transcribe (ARCH-ONE-SURFACE ROW 1); the fold gate
+# holds its transcript byte-identical to the pre-fold binary.
 add_executable(parakeet-transcribe parakeet_transcribe/main.cpp)
-target_link_libraries(parakeet-transcribe PRIVATE vllm::vllm)
+target_link_libraries(parakeet-transcribe PRIVATE vllm::shared)
 vllm_cpp_set_warnings(parakeet-transcribe)

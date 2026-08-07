@@ -1223,6 +1223,149 @@ TEST_CASE("capi: version and abi-version are exposed") {
   CHECK(std::string(vllm_version()).size() > 0);
   CHECK(vllm_abi_version() == VLLM_ABI_VERSION);
   // The engine-config growth (max_num_batched_tokens / scheduling_policy /
-  // kv_transfer_config) is ABI v9; the jump-forward toggle is ABI v10.
-  CHECK(vllm_abi_version() >= 10);
+  // kv_transfer_config) is ABI v9; the jump-forward toggle is ABI v10; the
+  // transcription slice (vllm_transcribe) is ABI v11. The >= pin is the one
+  // check that can catch a WRONG bump: the == VLLM_ABI_VERSION assertions here
+  // and in test_dlopen compare against the same macro and move with it.
+  CHECK(vllm_abi_version() >= 11);
+}
+
+// ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────
+// The FIRST real-checkpoint load gated through the PUBLIC ABI: vllm_engine_load
+// on the committed tiny Parakeet fixtures (tests/vllm/models/fixtures/
+// parakeet_e2e), then vllm_transcribe reproducing the transcript goldens the
+// PRE-refactor example binary printed. Everything before this exercised
+// vllm_engine_load's bad-path contract only (the severity note in
+// .agents/specs/surface-coverage-2026-08-07.md § C-ABI capability coverage).
+
+namespace {
+std::string ParakeetFixture(const char* head) {
+  return std::string(PARAKEET_E2E_FIXTURE_DIR) + "/" + head;
+}
+std::string ParakeetWav() {
+  return std::string(PARAKEET_E2E_FIXTURE_DIR) + "/audio.wav";
+}
+}  // namespace
+
+TEST_CASE("capi v11: vllm_transcribe reproduces the pre-refactor goldens") {
+  struct Golden {
+    const char* head;
+    std::vector<int32_t> ids;
+    const char* text;
+  };
+  const std::vector<Golden> goldens = {
+      {"ctc", {3, 4, 3}, "atheat"},
+      {"rnnt",
+       {5, 5, 5, 6, 6, 6, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6},
+       "sss on on onssssss on on on on on on on on"},
+  };
+  for (const Golden& g : goldens) {
+    CAPTURE(g.head);
+    vllm_model_params mp = vllm_model_params_default();
+    const std::string dir = ParakeetFixture(g.head);
+    mp.model_path = dir.c_str();
+    vllm_engine* eng = nullptr;
+    REQUIRE(vllm_engine_load(&mp, &eng) == VLLM_OK);
+    REQUIRE(eng != nullptr);
+
+    vllm_transcription_params tp = vllm_transcription_params_default();
+    const std::string wav = ParakeetWav();
+    tp.audio_path = wav.c_str();
+    vllm_transcription out;
+    REQUIRE(vllm_transcribe(eng, &tp, &out) == VLLM_OK);
+    REQUIRE(out.token_ids != nullptr);
+    const std::vector<int32_t> ids(out.token_ids,
+                                   out.token_ids + out.n_token_ids);
+    CHECK(ids == g.ids);
+    CHECK(out.has_text == 1);
+    REQUIRE(out.text != nullptr);
+    CHECK(std::string(out.text) == g.text);
+    vllm_transcription_free(&out);
+    CHECK(out.text == nullptr);      // zeroed after free
+    CHECK(out.token_ids == nullptr);
+    vllm_transcription_free(&out);   // double-free is a safe no-op
+    vllm_engine_free(eng);
+  }
+}
+
+TEST_CASE("capi v11: refuse-by-task in both directions") {
+  // Transcription handle: every text entry point refuses with the actionable
+  // message instead of crashing on the absent text stack.
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = ParakeetFixture("ctc");
+  mp.model_path = dir.c_str();
+  vllm_engine* asr = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &asr) == VLLM_OK);
+
+  vllm_sampling_params sp = vllm_sampling_params_default();
+  vllm_completion comp;
+  CHECK(vllm_complete(asr, "hello", &sp, &comp) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("transcription-only") !=
+        std::string::npos);
+  char* chat_out = nullptr;
+  CHECK(vllm_chat(asr, "{\"messages\":[]}", &chat_out) ==
+        VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("vllm_transcribe") !=
+        std::string::npos);
+  vllm_engine_free(asr);
+
+  // Text handle: vllm_transcribe refuses symmetrically.
+  vllm_engine* text = MakeSyntheticEngine();
+  REQUIRE(text != nullptr);
+  vllm_transcription_params tp = vllm_transcription_params_default();
+  const std::string wav = ParakeetWav();
+  tp.audio_path = wav.c_str();
+  vllm_transcription out;
+  CHECK(vllm_transcribe(text, &tp, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("text-generation engine") !=
+        std::string::npos);
+  vllm_engine_free(text);
+}
+
+TEST_CASE("capi v11: vllm_transcribe argument contract") {
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = ParakeetFixture("ctc");
+  mp.model_path = dir.c_str();
+  vllm_engine* eng = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &eng) == VLLM_OK);
+
+  vllm_transcription out;
+  // Neither input selected.
+  vllm_transcription_params none = vllm_transcription_params_default();
+  CHECK(vllm_transcribe(eng, &none, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  // Both inputs selected.
+  vllm_transcription_params both = vllm_transcription_params_default();
+  const std::string wav = ParakeetWav();
+  const float pcm[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  both.audio_path = wav.c_str();
+  both.pcm = pcm;
+  both.n_samples = 4;
+  both.sample_rate = 16000;
+  CHECK(vllm_transcribe(eng, &both, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  // pcm without a sample rate.
+  vllm_transcription_params bad_pcm = vllm_transcription_params_default();
+  bad_pcm.pcm = pcm;
+  bad_pcm.n_samples = 4;
+  CHECK(vllm_transcribe(eng, &bad_pcm, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  // Null engine / params / out.
+  CHECK(vllm_transcribe(nullptr, &none, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_transcribe(eng, nullptr, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_transcribe(eng, &none, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  // Unreadable audio file -> runtime error naming the path problem.
+  vllm_transcription_params missing = vllm_transcription_params_default();
+  missing.audio_path = "/nonexistent/vllm-cpp/audio.wav";
+  CHECK(vllm_transcribe(eng, &missing, &out) == VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).size() > 0);
+  // A raw-PCM arm through the ABI marshals and runs end to end.
+  std::vector<float> silence(4000, 0.0f);
+  vllm_transcription_params pcm_ok = vllm_transcription_params_default();
+  pcm_ok.pcm = silence.data();
+  pcm_ok.n_samples = static_cast<int64_t>(silence.size());
+  pcm_ok.sample_rate = 16000;
+  REQUIRE(vllm_transcribe(eng, &pcm_ok, &out) == VLLM_OK);
+  CHECK(out.has_text == 1);
+  vllm_transcription_free(&out);
+  // NULL result free is a no-op.
+  vllm_transcription_free(nullptr);
+  vllm_engine_free(eng);
 }

@@ -42080,3 +42080,71 @@ leaves (Kimi runner fold #279, Parakeet ASR #280). Reviewer findings 1-8 applied
 (quoted+angle includes, comment-stripped ABI tokenize, subprocess enforcement
 tests, ratchet equality pin, reachable-row-removal design note, meta-gap note). No
 CUDA build; no perf number owed; STATUS inside its char ratchet.
+
+## 2026-08-07 — ARCH-ONE-SURFACE ROW 1: Parakeet ASR folded onto the ONE surface (PR #121)
+<!-- state: 2026-08-07T23:30 -->
+
+**Landed** (`row/PARAKEET-ONE-SURFACE`, helper claim = PR #121, base `f98e1e48`):
+the first remediation slice of the ONE SURFACE program — audio transcription is
+now reachable by every consumer, gated BYTE-IDENTICAL to the pre-fold example.
+
+**Correctness anchor first.** Real `nvidia/parakeet-*` checkpoints were deleted
+post-#89, so a deterministic tiny CTC+RNNT fixture pair + clip was committed
+(`tests/vllm/models/fixtures/parakeet_e2e`, generator
+`scripts/mm/parakeet_e2e_fixture_gen.py`) and the transcript goldens were
+captured from the PRE-refactor binary at `main@f98e1e48` BEFORE any change
+(ctc: ids `3 4 3` / "atheat"; rnnt: 20 ids / "sss on on onssssss ...").
+`tests/vllm/models/test_parakeet_transcription_fold.cpp` holds seam ==
+replicated old pipeline == committed goldens, per head.
+
+**The fold, in the binding order.**
+- W1a tokenizer: `Tokenizer::FromHfJson` accepts Metaspace `split:true`
+  (MergedWithNext pre-split; merges cannot cross ▁) and a bare `Metaspace`
+  DECODER node selects HF's decode_chain rule (first token drops ▁) —
+  the guard at `tokenizer.cpp:554` implemented instead of refusing;
+  Mistral/Gemma Sequence chain regression-pinned
+  (`tests/vllm/test_tokenizer_metaspace_split.cpp`, metaspace.rs ports).
+- W1b/c library: `vllm::multimodal::ParakeetTranscriber`
+  (`parakeet_transcription.{h,cpp}`) absorbs WAV ingest
+  (`DecodeWavPcm16Mono`), model_type head dispatch and tokenizer decode; the
+  example's private `ReadWav16BitMono`/`LoadVocab`/`DecodeIds` are DELETED.
+- W2 registry: `ParakeetForCTC/ForRNNT/ForTDT` registered
+  (`parakeet_registry.cpp`), `ModelInfo` grows the SupportsTranscription
+  mirror (interfaces.py:1110-1118); BEYOND-PIN breadth recorded (pinned vLLM:
+  Parakeet = NemotronH audio component only, registry.py:511-513).
+  Refuse-by-task: every factory hook + `LoadedEngine::FromModelDir` (via new
+  non-throwing `PeekHfArchitectures`) refuse actionably; registry pins moved
+  30 -> 33.
+- W3 C ABI: `vllm_transcribe` + params/result structs, ABI v10 -> 11;
+  `vllm_engine_load` task-dispatches a transcription-only dir to the seam;
+  text entrypoints and `vllm_transcribe` refuse each other's handles cleanly.
+  FIRST real-checkpoint load gated through the public ABI (`test_capi` v11
+  cases close the audit's severity note). FEATURES abi-capability row flips
+  to reachable; `abi-capability-allowlist.txt` shrinks by the transcription
+  row.
+- W4 server: task-conditional `/v1/audio/transcriptions` (multipart `file`,
+  response_format json/text) through the SAME seam; serving-less `ApiServer`
+  ctor = vLLM's supported_tasks-conditional registration (generate routes 404
+  on an ASR server); `examples/server` dispatches by resolved arch; verified
+  LIVE with curl. Residuals: run_batch transcription line;
+  verbose_json/srt/vtt.
+- W5 example: `examples/parakeet_transcribe` = thin `vllm.h` client
+  (`vllm::shared`), stdout DIFF-IDENTICAL to the pre-fold binary on both
+  fixtures; `example-abi-allowlist.txt` loses its row;
+  `MAX_INTERNAL_REACHING` 12 -> 11 with the test pin + spec claims moved.
+
+**Gates.** Full CPU build clean (`-Werror`, 0 warnings); ctest 349/349 (345
+parallel + 4 serial; the only 2 reds were the registry count pins, moved as
+their comments instruct); surface guard + 46-case mutation suite green with
+the SHRINK enforced; every new test mutation-verified red/green (tokenizer
+decode rule + split gate, CTC collapse, transcription-only flag, ABI dispatch
++ input validation, server response_format + route gate).
+
+**Residuals (honest).** (1) run_batch `/v1/audio/transcriptions` stays a named
+residual (batch line shape carries no audio). (2) verbose_json/srt/vtt
+response formats -> 400 naming the residual. (3) A REAL pretrained checkpoint
+was not re-downloaded (safe defaults); the fold gate rests on the committed
+synthetic pair + the P4/P6 pretrained evidence. (4) A real Parakeet
+tokenizer.json may carry normalizer fields `FromHfJson` refuses loudly —
+untestable CPU-side without the checkpoint, fails loud not wrong. (5) Whisper/
+Voxtral remain off-registry (fold #9/#10 of the audit).

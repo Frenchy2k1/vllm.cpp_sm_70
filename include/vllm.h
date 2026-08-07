@@ -81,8 +81,17 @@ extern "C" {
  * when set, overrides this field. 0 (the default) is the byte-identical
  * default, so zero-filling the struct growth keeps a v9 engine byte-identical.
  * Scheduler policy (incl. SGLang's cache-aware LPM) is selected through the v9
- * string field .scheduling_policy = "lpm" — there is no separate int knob. */
-#define VLLM_ABI_VERSION 10
+ * string field .scheduling_policy = "lpm" — there is no separate int knob.
+ * v11: AUDIO TRANSCRIPTION (ARCH-ONE-SURFACE fold #4) — vllm_transcribe /
+ * vllm_transcription_params(_default) / vllm_transcription(_free), appended so
+ * zero values preserve behaviour. vllm_engine_load now RESOLVES a
+ * transcription-only checkpoint (Parakeet CTC/RNNT/TDT, the vLLM
+ * SupportsTranscription mirror) into a transcription engine: the text entry
+ * points on such a handle report VLLM_ERR_INVALID_ARGUMENT with an actionable
+ * message instead of serving, and vllm_transcribe on a TEXT handle does the
+ * same. A pre-v11 caller that never loads a Parakeet directory is
+ * byte-identical. */
+#define VLLM_ABI_VERSION 11
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -451,6 +460,60 @@ VLLM_API vllm_status vllm_chat(vllm_engine* engine, const char* request_json,
 VLLM_API vllm_status vllm_chat_stream(vllm_engine* engine,
                                       const char* request_json,
                                       vllm_token_callback cb, void* user_data);
+
+/* ── Audio transcription (ABI v11) ────────────────────────────────────────────
+ * The transcription slice of the ONE-SURFACE fold: an engine loaded from a
+ * transcription-only checkpoint (a directory whose config.json architectures
+ * resolve to the Parakeet CTC / RNN-T / TDT family — the mirror of vLLM's
+ * SupportsTranscription protocol) transcribes audio to text through the SAME
+ * library pipeline the bundled server's /v1/audio/transcriptions route and the
+ * parakeet-transcribe example drive. Greedy decode, 16 kHz mono input (the
+ * extractor refuses to resample, mirroring the HF feature extractor).
+ *
+ * Input is EXACTLY ONE of:
+ *   - audio_path: a 16-bit PCM mono RIFF/WAVE file path;
+ *   - pcm + n_samples + sample_rate: a mono float32 waveform in [-1, 1).
+ * Setting both or neither is VLLM_ERR_INVALID_ARGUMENT. All pointers are
+ * borrowed for the duration of the call. */
+typedef struct vllm_transcription_params {
+  const char* audio_path;  /* WAV path, or NULL when pcm is used. */
+  const float* pcm;        /* mono f32 samples, or NULL when audio_path is used. */
+  int64_t n_samples;       /* number of entries in pcm. */
+  int32_t sample_rate;     /* pcm sampling rate in Hz (16000). */
+} vllm_transcription_params;
+
+/* One transcription result. OWNERSHIP: the caller frees text + token_ids via
+ * vllm_transcription_free(out) (text may also go through vllm_string_free).
+ *   - text: heap NUL-terminated transcript. NULL when has_text == 0 (the
+ *     checkpoint ships no tokenizer.json: ids only, exactly like the
+ *     pre-fold example).
+ *   - token_ids / n_token_ids: the decoded token ids (CTC: after the greedy
+ *     collapse; transducer: blanks and the start token dropped).
+ *   - has_text: 0/1 — whether `text` was produced. */
+typedef struct vllm_transcription {
+  char* text;
+  int32_t* token_ids;
+  int32_t n_token_ids;
+  int32_t has_text;
+} vllm_transcription;
+
+/* Zero-initialized params (no input selected — the caller sets exactly one). */
+VLLM_API vllm_transcription_params vllm_transcription_params_default(void);
+
+/* Run a blocking transcription on a transcription-capable engine handle,
+ * filling *out. Returns VLLM_OK on success; VLLM_ERR_INVALID_ARGUMENT for a
+ * text-generation handle (use the completion/chat entry points there) or a bad
+ * input selection; VLLM_ERR_RUNTIME when the audio cannot be read/decoded
+ * (non-PCM16-mono WAV, wrong sample rate) or the forward fails — matching
+ * vllm_complete's convention. On any non-OK status *out is zeroed and
+ * vllm_last_error() carries the detail. */
+VLLM_API vllm_status vllm_transcribe(vllm_engine* engine,
+                                     const vllm_transcription_params* params,
+                                     vllm_transcription* out);
+
+/* Free the owned members of a transcription result and zero the struct. The
+ * struct itself is caller storage. NULL is a no-op. */
+VLLM_API void vllm_transcription_free(vllm_transcription* out);
 
 /* ── Memory helpers ───────────────────────────────────────────────────────────
  * Free a heap string returned by the library. NULL is a no-op. */

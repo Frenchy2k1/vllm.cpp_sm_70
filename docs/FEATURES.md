@@ -121,6 +121,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on, via the `laguna-gen` CLI; the registered engine forward VT_CHECKs non-bf16 (`ARCH-ONE-SURFACE` fold) |
 | `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | **Paged-incremental decode (§19) GB10: 18.9 tok/s (0.90× vLLM) @ 122/128 = coherent best**; STRICT unreachable (bf16 stream REFUTED §20/#118 122→4/128; p7 intrinsic near-tie) | CLI opt-in `--incremental`; SERVER fold scoped (ARCH-ONE-SURFACE req 4; runner aborts on Kimi KV) |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
+| `ParakeetForCTC`, `ParakeetForRNNT`, `ParakeetForTDT` | nvidia/parakeet-ctc-0.6b/-1.1b, -rnnt-0.6b, -tdt-0.6b-v3 (transcribed, ids exact vs HF `generate()`, P4/P6 2026-08-07; not retained) + committed synthetic fold fixture | ASR transcription-only (`SupportsTranscription` mirror; text paths refuse by task); fold gate byte-identical to the pre-refactor pipeline | n/a (CPU correctness-grade ASR via `vllm_transcribe` + `/v1/audio/transcriptions`) |
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
 <!-- supported-arch-table:end -->
 
@@ -243,7 +244,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Speculative decoding config | `speculative_config` | reachable |
 | Custom logits processor | `vllm_logits_processor` | reachable |
 | Embeddings / pooling | none | embedder-unreachable |
-| Audio transcription | none | embedder-unreachable |
+| Audio transcription (Parakeet ASR) | `vllm_transcribe`, `vllm_transcription_params_default`, `vllm_transcription_free` | reachable |
 | Video+audio generation (MiniMax-H3) | none | embedder-unreachable |
 | Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->
 

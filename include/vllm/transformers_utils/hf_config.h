@@ -115,4 +115,13 @@ struct HfConfig {
 // path) on missing file, malformed JSON, or missing required fields.
 HfConfig LoadHfConfig(const std::string& path);
 
+// Cheap, non-throwing peek at config.json's `architectures` array — empty on
+// any parse/read problem. Exists for TASK dispatch BEFORE the full text-model
+// HfConfig parse: a SupportsTranscription-only checkpoint (Parakeet) nests its
+// fields under `encoder_config`, so LoadHfConfig's required-field errors would
+// fire before the registry's refuse-by-task message could (ARCH-ONE-SURFACE
+// ROW 1). Callers that need the parsed config still go through LoadHfConfig;
+// this never replaces it.
+std::vector<std::string> PeekHfArchitectures(const std::string& path);
+
 }  // namespace vllm

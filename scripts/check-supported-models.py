@@ -58,7 +58,7 @@ REGISTER_RE = re.compile(
 # future registered arch stops matching this, the self-check below fails loudly
 # rather than silently dropping it from the comparison.
 ARCH_TOKEN_RE = re.compile(
-    r"`([A-Za-z0-9_]+For(?:CausalLM|ConditionalGeneration))`"
+    r"`([A-Za-z0-9_]+For(?:CausalLM|ConditionalGeneration|CTC|RNNT|TDT))`"
 )
 
 

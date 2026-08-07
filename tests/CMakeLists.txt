@@ -217,6 +217,13 @@ vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forwar
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
 vllm_cpp_add_test(test_pretokenizer vllm/test_pretokenizer.cpp)
+# Metaspace split=true + Metaspace decoder (Parakeet tokenizer shape) —
+# ARCH-ONE-SURFACE ROW 1 W1(a); gates against the pre-refactor DecodeIds
+# reference on the committed parakeet_e2e fixture tokenizers.
+vllm_cpp_add_test(test_tokenizer_metaspace_split
+  vllm/test_tokenizer_metaspace_split.cpp)
+target_compile_definitions(test_tokenizer_metaspace_split PRIVATE
+  PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
 vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
 vllm_cpp_add_test(test_detokenizer vllm/test_detokenizer.cpp)
 vllm_cpp_add_test(test_request vllm/test_request.cpp)
@@ -365,6 +372,16 @@ vllm_cpp_add_test(test_parakeet_encoder vllm/models/test_parakeet_encoder.cpp)
 vllm_cpp_add_test(test_parakeet_ctc_engine vllm/models/test_parakeet_ctc_engine.cpp)
 target_compile_definitions(test_parakeet_ctc_engine PRIVATE
   PARAKEET_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet")
+
+# ARCH-ONE-SURFACE ROW 1 fold gate: the library transcription seam
+# (ParakeetTranscriber) byte-identical to the PRE-refactor example pipeline
+# AND to the committed goldens captured from the pre-refactor binary; plus the
+# registry refuse-by-task contract. Fixture committed
+# (scripts/mm/parakeet_e2e_fixture_gen.py).
+vllm_cpp_add_test(test_parakeet_transcription_fold
+  vllm/models/test_parakeet_transcription_fold.cpp)
+target_compile_definitions(test_parakeet_transcription_fold PRIVATE
+  PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
 # P5: the RNN-T / TDT TRANSDUCER gate: the LSTM prediction network, the joint
 # (with the TDT duration head) and the greedy transducer loop vs a dumped
 # HuggingFace `ParakeetForRNNT` / `ParakeetForTDT` ORACLE from transformers
@@ -616,6 +633,11 @@ target_compile_definitions(test_chat_template PRIVATE
 # The HTTP api_server smoke test needs the vendored cpp-httplib (gated).
 if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
+  # /v1/audio/transcriptions dispatch + socket smoke run against the REAL
+  # library transcription seam on the committed parakeet_e2e fixture
+  # (ARCH-ONE-SURFACE ROW 1).
+  target_compile_definitions(test_openai_api_server PRIVATE
+    PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
   # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
   # end to end over the REAL cpp-httplib server on an ephemeral port.
   vllm_cpp_add_test(test_openai_conformance vllm/entrypoints/openai/test_conformance.cpp)
@@ -643,6 +665,8 @@ target_include_directories(test_bench PRIVATE ${CMAKE_SOURCE_DIR}/examples/bench
 # engine via the internal MakeEngineHandle hook (reached under src/).
 vllm_cpp_add_test(test_capi capi/test_capi.cpp)
 target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_capi PRIVATE
+  PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e")
 vllm_cpp_add_test(test_chat_prompt capi/test_chat_prompt.cpp)
 target_include_directories(test_chat_prompt PRIVATE ${CMAKE_SOURCE_DIR}/src)
 

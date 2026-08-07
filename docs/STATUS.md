@@ -405,7 +405,7 @@ re-read the whole weight 131 times), and an opt-in load-time `[N,K]` to `[K,N]` 
 Byte-identical: both orientations accumulate each output over K in strict increasing order, so the
 repack is a layout choice and never a numerical one.
 
-Parakeet/FastConformer ASR (2026-08-07): *correctness-complete, CPU only*. Kernels, encoder, CTC greedy, log-mel; ids exact vs HF `ParakeetForCTC` oracle; transcribes ctc-0.6b/1.1b, rnnt-0.6b, tdt-0.6b-v3. No CUDA/aarch64, no speed number.
+Parakeet ASR (2026-08-07): *CPU-correct, ON THE ONE SURFACE (ROW 1)*. Ids exact vs HF; registered transcription-only; `vllm_transcribe` (ABI v11) + `/v1/audio/transcriptions`; thin `vllm.h` example, golden-exact; ratchet 12 -> 11. No CUDA, no speed number.
 
 ## Not supported yet
 
