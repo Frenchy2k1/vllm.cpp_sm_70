@@ -27,7 +27,7 @@ The four surfaces, and the public boundary the guard draws:
 | 1 | **MiniMax-H3 video+audio generation** | NO (off-registry diffusion) | `/v1/videos` ONLY via an example-injected `VideoRunner` | NO | `examples/minimax_h3_gen` + `examples/minimax_h3_mux` (whole pipeline) |
 | 2 | **Laguna fast decode** | yes, but forward is a stub | no (stub `VT_CHECK`s non-bf16) | no | `examples/laguna_gen` (keep-quant GGUF + NVFP4 W4A4) |
 | 3 | **DeepSeek-V4 fast decode** | yes, but forward is a W3 stub | no (stub) | no | `examples/deepseek_v4_gen` (keep-quant GGUF) |
-| 4 | **Audio transcription** | NO (Whisper/Voxtral/Parakeet off-registry) | no (`/v1/audio/*` = batch residual) | no | `examples/parakeet_transcribe`; Whisper/Voxtral test-only |
+| 4 | **Audio transcription** | **CLOSED (ROW 1)**: Parakeet CTC/RNNT/TDT registered (transcription-only; Whisper/Voxtral still off-registry) | **live `/v1/audio/transcriptions`** (task-conditional; the run_batch line stays a residual) | **`vllm_transcribe` (ABI v11)** | library seam `ParakeetTranscriber`; example is a clean ABI client |
 | 5 | **Kimi-Linear incremental decode** | yes (recompute forward IS shared) | recompute only | no | `examples/kimi_linear_gen` (§18/§19 paged-incremental + resident loader) |
 | 6 | **Embeddings / pooling** | NO (all `is_pooling_model=false`) | no (`/v1/embeddings` = residual) | no | engine-side pooler exists (`ENG-POOLER-SEQ`), never invoked live |
 | 7 | **Multimodal input over HTTP/ABI** | 5 archs `supports_multimodal` | image seam only; tower not run in engine step | no (text-only chat) | `chat_mm.cpp` seam; towers test-only |
@@ -61,7 +61,7 @@ All three drivers run a PRIVATE host-argmax greedy loop, not the on-GPU sampler.
 | Lane | Registered | Code (file:line) | Server | C-ABI | Driver |
 |---|---|---|---|---|---|
 | MiniMax-H3 video+audio GEN | NO | `minimax_h3*.cpp` (~22 TUs), vt op `kMiniMaxH3` | `/v1/videos` via `set_video_runner` (example-injected only; `api_server.h:167`, `api_server.cpp:818`; library never sets it) | NO | `examples/minimax_h3_gen`, `examples/minimax_h3_mux` |
-| Parakeet/FastConformer ASR | NO (grep `parakeet_*.cpp` for `REGISTER_VLLM_MODEL` = 0) | `parakeet_encoder.cpp`, `parakeet_transducer.cpp`, `parakeet_audio_processor.cpp`; owns transcript logic (`ReadWav16BitMono`, `LoadVocab`, `DecodeIds` Metaspace decoder — bypasses `vllm::Tokenizer`) | NO | NO | `examples/parakeet_transcribe` (#89) |
+| Parakeet/FastConformer ASR | **YES (ROW 1)**: ParakeetForCTC/RNNT/TDT, `parakeet_registry.cpp` (SupportsTranscription-only; text paths refuse by task) | `parakeet_transcription.cpp` seam composes encoder/transducer/audio-processor; the example's private `ReadWav16BitMono`/`LoadVocab`/`DecodeIds` are DELETED (`vllm::Tokenizer` now decodes Metaspace split=true) | **`/v1/audio/transcriptions`** (task-conditional) | **`vllm_transcribe` (ABI v11)** | `examples/parakeet_transcribe` = thin `vllm.h` client |
 | Voxtral audio->text | NO (`VoxtralForConditionalGeneration` unregistered) | `voxtral.cpp` (`vllm::multimodal`) | NO (`/v1/audio/transcriptions` = `run_batch.cpp:188` residual) | NO | tests-only reachability |
 | Whisper audio encoder | NO | `whisper_audio.cpp:174` | NO | NO | tests-only callers |
 | Pooling / embeddings | NO (`is_pooling_model=false` in all 27) | `layers/pooler/*.cpp`, `pool/pooling_runner` (`ENG-POOLER-SEQ`) | NO (`/v1/embeddings` = residual) | NO | `PoolingRunner` test-only |
@@ -75,11 +75,13 @@ JSON sub-config, not a separate surface) — the model for how the others should
 
 Public boundary = `#include "vllm.h"` only. 13 example units; `examples/cli` (vllm-cli,
 links `vllm::shared`, `#include "vllm.h"` only, `cli/main.cpp:16`) is the sole clean ABI
-client. The other 12 reach `include/vllm/**` / `vt/**` and are transition-tracked in
-`scripts/example-abi-allowlist.txt`:
+client. **ROW 1 UPDATE (2026-08-07): `parakeet_transcribe` is the SECOND clean ABI
+client** — the Parakeet fold rewrote it against `vllm.h` + `vllm::shared` only, and the
+ratchet fell 12 -> 11. The remaining 11 reach `include/vllm/**` / `vt/**` and are
+transition-tracked in `scripts/example-abi-allowlist.txt`:
 
 - Capability drivers: `deepseek_v4_gen`, `laguna_gen`, `kimi_linear_gen`,
-  `minimax_h3_gen`, `minimax_h3_mux`, `parakeet_transcribe`, `server`.
+  `minimax_h3_gen`, `minimax_h3_mux`, `server`.
 - Dev/diagnostic (internal-by-nature, folded for consistency): `bench` (via
   `bench_core.h`), `tokenize`, `dump_container`, `dequant_nvfp4`, `quant_gemm_bench`.
 - Out of the gated `examples/` tree: `benchmarks/vulkan_gemm_ab.cpp` (Vulkan A/B harness).
@@ -87,7 +89,7 @@ client. The other 12 reach `include/vllm/**` / `vt/**` and are transition-tracke
 **Policy (developer-directed 2026-08-07): no permanent exemptions.** Every allowlist entry
 — drivers AND dev/diagnostic tools — is a transition-tracker pointing at a fold row; the
 guard fails on any internal include not tracked, and a shrink-only ratchet
-(`MAX_INTERNAL_REACHING = 12`) means the count can only fall as folds land, never grow to
+(`MAX_INTERNAL_REACHING`, 11 since ROW 1) means the count can only fall as folds land, never grow to
 admit a new violation. The public header set is DERIVED from the CMake install rules
 (exactly `include/vllm.h` today), not hardcoded. The guard catches BOTH breach vectors: a
 `#include "vllm/..."|"vt/..."|"src/..."` AND a CMake `-I` grant into the internal tree
@@ -129,7 +131,7 @@ lanes are leaves of `ARCH-ONE-SURFACE` (do not open parallel rows).
 | 1 | Video+audio gen | `vllm_video_generate` + job/status/content entry points (mirror `/v1/videos`; carry the `VideoRunner` internally, not example-injected) | rewrite `minimax_h3_gen`/`server` as clients; delete driver glue | L | H3 loaders; ffmpeg-mux boundary (ratified in `examples/`) |
 | 2 | Laguna fast decode | make the registered `LagunaForCausalLM` forward route the keep-quant/NVFP4 device path (retire the stub); load keep-quant GGUF/NVFP4 dirs through `vllm_engine_load` | rewrite `laguna_gen`; delete `LagunaForwardGguf*` | M | keep-quant load in the engine loader |
 | 3 | DeepSeek-V4 fast decode | same as (2) for `DeepseekV4ForCausalLM`; real MLA paged KV (retire the W3 stub) | rewrite `deepseek_v4_gen`; delete `DeepseekV4ForwardGguf*` | M | MLA paged-KV topology |
-| 4 | Audio transcription | `vllm_transcribe` + live `/v1/audio/transcriptions`; register a Whisper/Voxtral/Parakeet arch or an encoder lane | rewrite `parakeet_transcribe`; wire the route | M | encoder→text seam |
+| 4 | Audio transcription | **DONE (ROW 1, 2026-08-07)**: `vllm_transcribe` (ABI v11) + live `/v1/audio/transcriptions`; ParakeetForCTC/RNNT/TDT registered (SupportsTranscription mirror, refuse-by-task) | **DONE**: `parakeet_transcribe` rewritten as a `vllm.h` client (byte-identical transcript goldens); route live, task-conditional | M | encoder→text seam (LANDED: `ParakeetTranscriber`) |
 | 5 | Kimi-Linear incremental | expose the incremental decode path through the runner/engine (the recompute forward already routes) | rewrite `kimi_linear_gen` | S–M | `KimiDecodeCache` on the runner |
 | 6 | Embeddings/pooling | `vllm_embed`/pooling entry point + live `/v1/embeddings`; register a pooling arch (`is_pooling_model=true`); invoke `PoolingRunner` in the step | — | M | pooler live-wiring |
 | 7 | Multimodal input | multimodal-content entry point on `vllm_chat`; run the vision/audio tower in the engine step (`mm_features`→`ModelForwardInput.mm`) | wire `chat_mm` seam into the ABI | L | `MM-SERVE-E2E` engine mm-forward residual |

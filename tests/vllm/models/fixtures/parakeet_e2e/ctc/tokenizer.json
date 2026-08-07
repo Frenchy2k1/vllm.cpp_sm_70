@@ -1,0 +1,36 @@
+{
+ "version": "1.0",
+ "pre_tokenizer": {
+  "type": "Metaspace",
+  "replacement": "▁",
+  "prepend_scheme": "always",
+  "split": true
+ },
+ "decoder": {
+  "type": "Metaspace",
+  "replacement": "▁",
+  "prepend_scheme": "always",
+  "split": true
+ },
+ "model": {
+  "type": "BPE",
+  "unk_token": null,
+  "vocab": {
+   "▁the": 0,
+   "▁cat": 1,
+   "▁sat": 2,
+   "at": 3,
+   "he": 4,
+   "s": 5,
+   "▁on": 6
+  },
+  "merges": []
+ },
+ "added_tokens": [
+  {
+   "id": 7,
+   "content": "<blank>",
+   "special": true
+  }
+ ]
+}

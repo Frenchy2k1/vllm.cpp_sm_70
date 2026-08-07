@@ -12,6 +12,7 @@
 // (tiny hybrid-MoE Qwen3.6 + the BPE fixture, vocab ids 0..21).
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/video_api.h"
+#include "vllm/multimodal/parakeet_transcription.h"
 
 #include <doctest/doctest.h>
 
@@ -2113,4 +2114,198 @@ TEST_CASE("api_server: the /v1/videos routes do not exist without a runner") {
             "NotFoundError");
     });
   }
+}
+
+// ─── /v1/audio/transcriptions (ARCH-ONE-SURFACE ROW 1) ───────────────────────
+// Task-conditional like /v1/videos: a TEXT server never registers the route; a
+// serving-less (transcription-only) server registers it and NOT the generate
+// routes — vLLM's supported_tasks-conditional registration
+// (api_server.py:255-265) + speech_to_text/transcription semantics. The
+// transcriber wraps the REAL library seam (ParakeetTranscriber) on the
+// committed parakeet_e2e fixture, so the route is gated against the SAME
+// pre-refactor transcript golden as the C ABI and the example.
+
+namespace {
+
+std::string ReadFileBytes(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  REQUIRE_MESSAGE(f.good(), "cannot open ", path);
+  return std::string((std::istreambuf_iterator<char>(f)),
+                     std::istreambuf_iterator<char>());
+}
+
+struct AsrHarness {
+  vllm::entrypoints::openai::OpenAIServingModels models{"parakeet-fixture"};
+  ApiServer server{models, "test-version"};
+  std::shared_ptr<vllm::multimodal::ParakeetTranscriber> transcriber;
+
+  AsrHarness() {
+    transcriber = std::make_shared<vllm::multimodal::ParakeetTranscriber>(
+        vllm::multimodal::ParakeetTranscriber::FromDir(
+            std::string(PARAKEET_E2E_FIXTURE_DIR) + "/ctc"));
+    auto t = transcriber;
+    server.set_transcriber([t](const uint8_t* wav, size_t n) {
+      return t->TranscribeWavBytes(wav, n);
+    });
+  }
+  std::string wav_bytes() const {
+    return ReadFileBytes(std::string(PARAKEET_E2E_FIXTURE_DIR) + "/audio.wav");
+  }
+};
+
+}  // namespace
+
+TEST_CASE("api_server: transcriptions dispatch reproduces the golden") {
+  AsrHarness h;
+  const std::string wav = h.wav_bytes();
+
+  // Default response_format ("json") -> TranscriptionResponse {"text": ...}.
+  ApiServer::DispatchResult r = h.server.handle_audio_transcriptions(wav, "");
+  CHECK(r.status == 200);
+  CHECK(r.content_type == "application/json");
+  CHECK(json::parse(r.body).at("text") == "atheat");
+
+  // response_format=text -> the raw transcript as text/plain.
+  r = h.server.handle_audio_transcriptions(wav, "text");
+  CHECK(r.status == 200);
+  CHECK(r.content_type == "text/plain; charset=utf-8");
+  CHECK(r.body == "atheat");
+
+  // Unsupported formats are named residuals -> 400.
+  r = h.server.handle_audio_transcriptions(wav, "verbose_json");
+  CHECK(r.status == 400);
+  CHECK(json::parse(r.body).at("error").at("type") == "BadRequestError");
+
+  // An empty upload -> 400.
+  r = h.server.handle_audio_transcriptions("", "");
+  CHECK(r.status == 400);
+
+  // Undecodable audio -> 400 naming the cause.
+  r = h.server.handle_audio_transcriptions("not a wav at all", "");
+  CHECK(r.status == 400);
+
+  // The serving-less server refuses the generate handlers with the
+  // NotImplementedError mirror (the socket layer does not even register them).
+  r = h.server.handle_completions("{}");
+  CHECK(r.status == 500);
+  CHECK(json::parse(r.body).at("error").at("message").get<std::string>().find(
+            "does not support Completions") != std::string::npos);
+  r = h.server.handle_chat_completions("{}");
+  CHECK(r.status == 500);
+}
+
+TEST_CASE("api_server: transcriptions without a transcriber is a 500, not a crash") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"no-asr"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r = server.handle_audio_transcriptions("bytes", "");
+  CHECK(r.status == 500);
+  CHECK(json::parse(r.body).at("error").at("message").get<std::string>().find(
+            "does not support Transcriptions") != std::string::npos);
+}
+
+TEST_CASE("api_server: transcriptions socket smoke (multipart), generate routes 404") {
+  AsrHarness h;
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&h]() { h.server.serve(); });
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(15, 0);
+
+    // Multipart upload, exactly the OpenAI wire shape.
+    httplib::UploadFormDataItems items = {
+        {"file", h.wav_bytes(), "audio.wav", "audio/wav"},
+        {"response_format", "json", "", ""},
+    };
+    auto res = client.Post("/v1/audio/transcriptions", items);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(json::parse(res->body).at("text") == "atheat");
+
+    // A multipart body without the `file` part -> 400.
+    httplib::UploadFormDataItems no_file = {
+        {"response_format", "json", "", ""},
+    };
+    auto bad = client.Post("/v1/audio/transcriptions", no_file);
+    REQUIRE(bad);
+    CHECK(bad->status == 400);
+
+    // The generate routes are NOT registered on a transcription-only server.
+    auto completions = client.Post("/v1/completions", "{}", "application/json");
+    REQUIRE(completions);
+    CHECK(completions->status == 404);
+    auto chat = client.Post("/v1/chat/completions", "{}", "application/json");
+    REQUIRE(chat);
+    CHECK(chat->status == 404);
+
+    // Liveness + discovery still serve.
+    auto health = client.Get("/health");
+    REQUIRE(health);
+    CHECK(health->status == 200);
+    auto models_res = client.Get("/v1/models");
+    REQUIRE(models_res);
+    CHECK(models_res->status == 200);
+    CHECK(json::parse(models_res->body).at("data").at(0).at("id") ==
+          "parakeet-fixture");
+  }
+
+  h.server.stop();
+  server_thread.join();
+}
+
+TEST_CASE("api_server: the audio routes do not exist on a TEXT server") {
+  // The reverse of the ASR socket smoke above, and the exact twin of "the
+  // /v1/videos routes do not exist without a runner": task-conditional
+  // registration means a TEXT-engine server (no transcriber attached) must
+  // answer 404 from the ROUTE TABLE for /v1/audio/*. This pins the
+  // `if (transcriber_)` registration gate itself — the direct-dispatch 500
+  // test above cannot see route registration, so `if (true)` there would
+  // register the route on every text server and only THIS test reds (the
+  // mutated server answers 400/500 from the handler instead of 404).
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&h]() { h.server.serve(); });
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(15, 0);
+
+    // A well-formed multipart upload — exactly what the route would accept if
+    // it existed — must fall through to httplib's 404, proving the route was
+    // never registered (not merely that the handler rejected the payload).
+    httplib::UploadFormDataItems items = {
+        {"file", "RIFF fake", "audio.wav", "audio/wav"},
+    };
+    auto res = client.Post("/v1/audio/transcriptions", items);
+    REQUIRE(res);
+    CHECK(res->status == 404);
+
+    // /v1/audio/translations is NOT routed anywhere yet (a named residual of
+    // the ROW 1 fold): 404 on the text server documents that absence too.
+    auto translations = client.Post("/v1/audio/translations", items);
+    REQUIRE(translations);
+    CHECK(translations->status == 404);
+
+    // The text server still serves its own task, so the 404s above are about
+    // the audio routes, not a dead server.
+    auto health = client.Get("/health");
+    REQUIRE(health);
+    CHECK(health->status == 200);
+  }
+
+  h.server.stop();
+  server_thread.join();
 }

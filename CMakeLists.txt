@@ -666,6 +666,13 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/parakeet_transducer.cpp
   src/vllm/model_executor/models/parakeet_weights.cpp
   src/vllm/multimodal/parakeet_audio_processor.cpp
+  # The ONE transcription seam every consumer drives (C ABI vllm_transcribe,
+  # the server's /v1/audio/transcriptions, the parakeet-transcribe example) —
+  # ARCH-ONE-SURFACE ROW 1: absorbs the pipeline examples/parakeet_transcribe
+  # used to own privately. The refuse-by-task registry TU registers the three
+  # Parakeet head archs so config.json RESOLVES (SupportsTranscription mirror).
+  src/vllm/multimodal/parakeet_transcription.cpp
+  src/vllm/model_executor/models/parakeet_registry.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp

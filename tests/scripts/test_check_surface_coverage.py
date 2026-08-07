@@ -311,9 +311,13 @@ class ShippedTreeTests(unittest.TestCase):
         self.assertNotIn("examples/cli", reaching)
         self.assertNotIn("examples/cli", allow)
         # The known CLI-only capability drivers ARE internal-reachers.
+        # (parakeet_transcribe left this list when the ROW 1 fold made it a
+        # clean vllm.h client — asserted below instead.)
         for unit in ("examples/laguna_gen", "examples/deepseek_v4_gen",
-                     "examples/minimax_h3_gen", "examples/parakeet_transcribe"):
+                     "examples/minimax_h3_gen"):
             self.assertIn(unit, reaching)
+        self.assertNotIn("examples/parakeet_transcribe", reaching)
+        self.assertNotIn("examples/parakeet_transcribe", allow)
 
     def test_public_surface_pinned_green(self) -> None:
         self.assertTrue(mod.public_surface_pinned(mod.read(mod.CMAKELISTS)))
@@ -324,10 +328,10 @@ class ShippedTreeTests(unittest.TestCase):
         reaching |= set(mod.internal_include_dir_grant_units(mod.read(mod.EXAMPLES_CMAKE)))
         self.assertLessEqual(len(reaching), mod.MAX_INTERNAL_REACHING)
 
-    def test_ratchet_ceiling_pinned_at_12(self) -> None:
-        # EQUALITY pin: a ceiling bump (up OR down) must move this line + the "12" claims in
+    def test_ratchet_ceiling_pinned_at_11(self) -> None:
+        # EQUALITY pin: a ceiling bump (up OR down) must move this line + the ratchet claims in
         # the spec/state, so the change is test-visible and reviewed, never silent.
-        self.assertEqual(mod.MAX_INTERNAL_REACHING, 12)
+        self.assertEqual(mod.MAX_INTERNAL_REACHING, 11)
 
     def test_capability_green(self) -> None:
         cap_allow, allow_errors = mod.parse_allowlist(mod.read(mod.CAP_ALLOWLIST))

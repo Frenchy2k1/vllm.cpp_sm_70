@@ -18,6 +18,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -39,14 +40,25 @@
 #include "vllm/entrypoints/openai/tool_parsers/detect.h"    // DetectToolParser
 #include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"  // get_reasoning_parser
 #include "vllm/entrypoints/openai/reasoning_parsers/detect.h"  // DetectReasoningParser
+#include "vllm/model_executor/models/model_registry.h"  // refuse-by-task (v11)
+#include "vllm/multimodal/parakeet_transcription.h"     // vllm_transcribe (v11)
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
+#include "vllm/transformers_utils/hf_config.h"  // PeekHfArchitectures (v11)
 #include "vllm/version.h"
 #include "vllm/v1/engine/async_llm.h"
 
-// The opaque handle: owns the whole C++ engine stack behind LoadedEngine.
+// The opaque handle: owns the whole C++ engine stack behind LoadedEngine —
+// OR, since ABI v11, a transcription stack (ParakeetTranscriber) when the
+// model directory resolves to a SupportsTranscription-ONLY architecture.
+// Exactly one of `loaded` / `transcriber` is set; every text entry point
+// guards on `loaded` (RequireTextEngine) and vllm_transcribe on `transcriber`,
+// so the two task families refuse each other cleanly instead of crashing.
 struct vllm_engine {
   std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded;
+  // ABI v11 transcription stack (the ONE library seam the server route and the
+  // parakeet-transcribe example also drive). Null for text engines.
+  std::unique_ptr<vllm::multimodal::ParakeetTranscriber> transcriber;
   // Monotonic per-handle request-id source. Each vllm_complete[_stream] call
   // uses a FRESH id so a request left in-flight by a mid-call exception can never
   // collide with a later call's id — a collision would make LLMEngine.add_request
@@ -127,6 +139,19 @@ thread_local std::string g_last_error;
 
 void SetError(const std::string& msg) { g_last_error = msg; }
 void ClearError() { g_last_error.clear(); }
+
+// ABI v11 refuse-by-task: true when the handle owns the TEXT engine stack.
+// A transcription-only handle (Parakeet) reports an actionable error instead
+// of dereferencing the null LoadedEngine — the SupportsTranscription-only
+// mirror of vLLM excluding "generate" from supported_tasks
+// (vllm/model_executor/models/interfaces.py:1118).
+bool RequireTextEngine(const vllm_engine* engine, const char* fn) {
+  if (engine->loaded != nullptr) return true;
+  SetError(std::string(fn) +
+           ": this engine was loaded from a transcription-only checkpoint "
+           "(Parakeet); it has no text-generation path — use vllm_transcribe");
+  return false;
+}
 
 // Heap-copy a std::string into a caller-owned NUL-terminated C string (freed via
 // vllm_string_free / vllm_completion_free). Returns nullptr on allocation
@@ -575,6 +600,36 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
         return VLLM_ERR_INVALID_ARGUMENT;
     }
 
+    // ABI v11 task dispatch: a directory whose config.json architectures
+    // resolve to a SupportsTranscription-ONLY registration (Parakeet
+    // CTC/RNNT/TDT) gets the TRANSCRIPTION stack — the same library seam the
+    // server's /v1/audio/transcriptions route and the parakeet-transcribe
+    // example drive. The peek is non-throwing and narrow: every other path,
+    // including unknown architectures and .gguf files, is byte-identical to
+    // pre-v11 (FromModelDir owns the diagnosis).
+    if (const std::vector<std::string> archs =
+            vllm::PeekHfArchitectures(std::string(params->model_path) +
+                                      "/config.json");
+        !archs.empty()) {
+      const vllm::ModelRegistration* peek = nullptr;
+      try {
+        peek = &vllm::ModelRegistry::Resolve(
+            std::span<const std::string>(archs));
+      } catch (const std::exception&) {
+        peek = nullptr;
+      }
+      if (peek != nullptr && peek->info.supports_transcription_only) {
+        auto* handle = new vllm_engine;
+        handle->transcriber =
+            std::make_unique<vllm::multimodal::ParakeetTranscriber>(
+                vllm::multimodal::ParakeetTranscriber::FromDir(
+                    params->model_path));
+        handle->model_path = params->model_path;
+        *out = handle;
+        ClearError();
+        return VLLM_OK;
+      }
+    }
     auto loaded =
         vllm::entrypoints::LoadedEngine::FromModelDir(params->model_path, ep);
     auto* handle = new vllm_engine;
@@ -619,6 +674,7 @@ VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
     SetError("vllm_complete: engine, prompt or params is null");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  if (!RequireTextEngine(engine, "vllm_complete")) return VLLM_ERR_INVALID_ARGUMENT;
   try {
     const vllm::SamplingParams sp =
         ToSamplingParams(*params, vllm::RequestOutputKind::kCumulative);
@@ -674,6 +730,7 @@ VLLM_API vllm_status vllm_complete_stream(vllm_engine* engine,
     SetError("vllm_complete_stream: engine, prompt, params or cb is null");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  if (!RequireTextEngine(engine, "vllm_complete_stream")) return VLLM_ERR_INVALID_ARGUMENT;
   try {
     // DELTA output_kind: each step yields one incremental delta (mirrors the M3.1
     // OpenAI streaming path, serving_completion.cpp). PostInit runs inside.
@@ -742,6 +799,7 @@ VLLM_API vllm_status vllm_request_submit(
     SetError("vllm_request_submit: engine, prompt, params or cb is null");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  if (!RequireTextEngine(engine, "vllm_request_submit")) return VLLM_ERR_INVALID_ARGUMENT;
   try {
     vllm::SamplingParams sp =
         ToSamplingParams(*params, vllm::RequestOutputKind::kDelta);
@@ -863,6 +921,7 @@ VLLM_API vllm_status vllm_chat(vllm_engine* engine, const char* request_json,
     SetError("vllm_chat: engine or request_json is null");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  if (!RequireTextEngine(engine, "vllm_chat")) return VLLM_ERR_INVALID_ARGUMENT;
   try {
     vllm::entrypoints::openai::ChatCompletionRequest request =
         ParseChatRequest(request_json);
@@ -902,6 +961,7 @@ VLLM_API vllm_status vllm_chat_stream(vllm_engine* engine,
     SetError("vllm_chat_stream: engine, request_json or cb is null");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  if (!RequireTextEngine(engine, "vllm_chat_stream")) return VLLM_ERR_INVALID_ARGUMENT;
   try {
     vllm::entrypoints::openai::ChatCompletionRequest request =
         ParseChatRequest(request_json);
@@ -951,6 +1011,105 @@ VLLM_API vllm_status vllm_chat_stream(vllm_engine* engine,
     SetError("vllm_chat_stream: unknown error");
     return VLLM_ERR_UNKNOWN;
   }
+}
+
+// ── Audio transcription (ABI v11) ───────────────────────────────────────────
+
+VLLM_API vllm_transcription_params vllm_transcription_params_default(void) {
+  vllm_transcription_params p;
+  p.audio_path = nullptr;
+  p.pcm = nullptr;
+  p.n_samples = 0;
+  p.sample_rate = 0;
+  return p;
+}
+
+VLLM_API vllm_status vllm_transcribe(vllm_engine* engine,
+                                     const vllm_transcription_params* params,
+                                     vllm_transcription* out) {
+  if (out == nullptr) {
+    SetError("vllm_transcribe: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  out->text = nullptr;
+  out->token_ids = nullptr;
+  out->n_token_ids = 0;
+  out->has_text = 0;
+  if (engine == nullptr || params == nullptr) {
+    SetError("vllm_transcribe: engine or params is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (engine->transcriber == nullptr) {
+    SetError(
+        "vllm_transcribe: this engine is a text-generation engine (no "
+        "SupportsTranscription architecture); use the completion/chat entry "
+        "points, or load a Parakeet checkpoint for transcription");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  const bool has_path = params->audio_path != nullptr;
+  const bool has_pcm = params->pcm != nullptr;
+  if (has_path == has_pcm) {
+    SetError(
+        "vllm_transcribe: set exactly ONE input — audio_path (a 16-bit PCM "
+        "mono WAV) or pcm+n_samples+sample_rate");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (has_pcm && (params->n_samples <= 0 || params->sample_rate <= 0)) {
+    SetError("vllm_transcribe: pcm requires n_samples > 0 and sample_rate > 0");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    const vllm::multimodal::ParakeetTranscription result =
+        has_path ? engine->transcriber->TranscribeWavFile(params->audio_path)
+                 : engine->transcriber->Transcribe(params->pcm,
+                                                   params->n_samples,
+                                                   params->sample_rate);
+    int32_t* ids = nullptr;
+    if (!result.token_ids.empty()) {
+      ids = static_cast<int32_t*>(
+          std::malloc(result.token_ids.size() * sizeof(int32_t)));
+      if (ids == nullptr) {
+        SetError("vllm_transcribe: out-of-memory copying token ids");
+        return VLLM_ERR_RUNTIME;
+      }
+      std::memcpy(ids, result.token_ids.data(),
+                  result.token_ids.size() * sizeof(int32_t));
+    }
+    if (result.has_text) {
+      char* text = DupString(result.text);
+      if (text == nullptr) {
+        std::free(ids);
+        SetError("vllm_transcribe: out-of-memory copying transcript");
+        return VLLM_ERR_RUNTIME;
+      }
+      out->text = text;
+      out->has_text = 1;
+    }
+    out->token_ids = ids;
+    out->n_token_ids = static_cast<int32_t>(result.token_ids.size());
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    // One catch for the whole pipeline (unreadable/undecodable audio, wrong
+    // sample rate, forward failure): VLLM_ERR_RUNTIME with the cause named,
+    // matching vllm_complete's convention. The cheap argument-shape errors
+    // were already reported as VLLM_ERR_INVALID_ARGUMENT above.
+    SetError(std::string("vllm_transcribe: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_transcribe: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_transcription_free(vllm_transcription* out) {
+  if (out == nullptr) return;
+  std::free(out->text);
+  std::free(out->token_ids);
+  out->text = nullptr;
+  out->token_ids = nullptr;
+  out->n_token_ids = 0;
+  out->has_text = 0;
 }
 
 VLLM_API void vllm_string_free(char* s) { std::free(s); }

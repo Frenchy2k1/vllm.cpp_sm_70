@@ -103,11 +103,20 @@ class Tokenizer {
   bool IsSentencePiece() const { return family_ == Family::kSentencePiece; }
 
   // Applies this SentencePiece tokenizer's DECODER chain to a window of already
-  // resolved token strings [begin, end): HF tokenizers' Sequence decoder
-  // Replace(▁->space) -> ByteFallback (runs of "<0xNN>" -> raw bytes, invalid
-  // UTF-8 run -> one U+FFFD per byte) -> Fuse -> Strip(1 leading space). Shared
-  // by Decode() and the incremental detokenizer so both mirror HF exactly.
-  // Precondition: IsSentencePiece().
+  // resolved token strings [begin, end). Two chains exist, selected from the
+  // tokenizer.json `decoder` node at load:
+  //   - default (Mistral/Gemma, no `Metaspace` decoder node): HF tokenizers'
+  //     Sequence decoder Replace(▁->space) -> ByteFallback (runs of "<0xNN>" ->
+  //     raw bytes, invalid UTF-8 run -> one U+FFFD per byte) -> Fuse ->
+  //     Strip(1 leading space);
+  //   - a bare `Metaspace` decoder node (every published Parakeet checkpoint):
+  //     HF tokenizers 0.22 decoders `Metaspace::decode_chain` — inside the
+  //     FIRST token of the window each replacement is DROPPED (unless
+  //     prepend_scheme == "never", where it maps to a space like everywhere
+  //     else), inside every later token it becomes ONE space; no ByteFallback,
+  //     no Fuse, no Strip.
+  // Shared by Decode() and the incremental detokenizer so both mirror HF
+  // exactly. Precondition: IsSentencePiece().
   std::string SpDecodeTokens(const std::vector<std::string>& tokens,
                              size_t begin, size_t end) const;
 
@@ -139,6 +148,13 @@ class Tokenizer {
   std::string metaspace_replacement_;  // e.g. "▁" (U+2581), UTF-8
   PrependScheme prepend_scheme_ = PrependScheme::kFirst;
   bool metaspace_split_ = false;  // Metaspace `split` flag
+  // --- DECODER selection (tokenizer.json `decoder` node). False => the
+  // Sequence chain (Replace -> ByteFallback -> Fuse -> Strip). True => the bare
+  // Metaspace decode_chain (Parakeet), with the DECODER node's own replacement
+  // and prepend_scheme (HF reads them off the decoder, not the pre_tokenizer).
+  bool sp_decoder_metaspace_ = false;
+  std::string sp_decoder_replacement_;
+  bool sp_decoder_prepend_never_ = false;
   bool byte_fallback_ = false;    // model.byte_fallback
   bool fuse_unk_ = false;         // model.fuse_unk (fuse consecutive unk ids)
   int32_t unk_id_ = -1;           // model.unk_token resolved to an id, else -1

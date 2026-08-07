@@ -85,6 +85,7 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       "'LlamaForCausalLM', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
+      "'ParakeetForCTC', 'ParakeetForRNNT', 'ParakeetForTDT', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
       "'Qwen3MoeForCausalLM', 'Qwen3VLForConditionalGeneration', "
       "'Qwen3_5ForConditionalGeneration', "

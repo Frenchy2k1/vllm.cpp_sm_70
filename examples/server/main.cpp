@@ -38,6 +38,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -68,6 +69,8 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/model_executor/models/model_registry.h"
+#include "vllm/multimodal/parakeet_transcription.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/version.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -463,6 +466,50 @@ int main(int argc, char** argv) {
             ? (dir.has_filename() ? dir.filename().string()
                                   : dir.parent_path().filename().string())
             : args.served_model_name;
+
+    // ── TASK DISPATCH (ARCH-ONE-SURFACE ROW 1): a model dir whose
+    // architectures resolve to a SupportsTranscription-ONLY registration
+    // (Parakeet CTC/RNNT/TDT) serves /v1/audio/transcriptions through the ONE
+    // library seam — the same ParakeetTranscriber vllm_transcribe drives — and
+    // registers NO generate routes (vLLM's task-conditional registration,
+    // api_server.py:255-265). Every other model takes the text path below,
+    // byte-identical to before. ────────────────────────────────────────────────
+    {
+      bool transcription_only = false;
+      const std::vector<std::string> archs =
+          vllm::PeekHfArchitectures(config_path);
+      if (!archs.empty()) {
+        try {
+          transcription_only =
+              vllm::ModelRegistry::Resolve(std::span<const std::string>(archs))
+                  .info.supports_transcription_only;
+        } catch (const std::exception&) {
+          transcription_only = false;  // unknown arch: the text path diagnoses
+        }
+      }
+      if (transcription_only) {
+        std::cerr << "server: transcription-only model (" << archs[0]
+                  << "); serving /v1/audio/transcriptions\n";
+        auto transcriber =
+            std::make_shared<vllm::multimodal::ParakeetTranscriber>(
+                vllm::multimodal::ParakeetTranscriber::FromDir(args.model_dir));
+        namespace oai = vllm::entrypoints::openai;
+        oai::OpenAIServingModels asr_models(served_model_name);
+        oai::ApiServer asr_server(asr_models, vllm::Version());
+        asr_server.set_transcriber(
+            [transcriber](const uint8_t* wav, size_t n) {
+              return transcriber->TranscribeWavBytes(wav, n);
+            });
+        std::cerr << "server: listening on http://" << args.host << ":"
+                  << args.port << "\n";
+        if (!asr_server.listen(args.host, args.port)) {
+          std::cerr << "server: failed to bind " << args.host << ":"
+                    << args.port << "\n";
+          return 1;
+        }
+        return 0;
+      }
+    }
 
     // ── Load the model + build the full engine stack via the shared loader
     // (src/vllm/entrypoints/model_loader.cpp) — the same path the C ABI drives.

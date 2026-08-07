@@ -314,6 +314,24 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
 
 }  // namespace
 
+std::vector<std::string> PeekHfArchitectures(const std::string& path) {
+  // Non-throwing by contract (see the header): any problem yields {} so the
+  // caller's ordinary LoadHfConfig path keeps owning every diagnostic.
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return {};
+  nlohmann::json doc = nlohmann::json::parse(in, /*cb=*/nullptr,
+                                             /*allow_exceptions=*/false);
+  if (doc.is_discarded() || !doc.is_object()) return {};
+  const auto it = doc.find("architectures");
+  if (it == doc.end() || !it->is_array()) return {};
+  std::vector<std::string> archs;
+  for (const auto& a : *it) {
+    if (!a.is_string()) return {};
+    archs.push_back(a.get<std::string>());
+  }
+  return archs;
+}
+
 HfConfig LoadHfConfig(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {

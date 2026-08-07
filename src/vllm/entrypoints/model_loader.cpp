@@ -891,6 +891,37 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   const std::string config_path = (dir / "config.json").string();
   const std::string tokenizer_path = (dir / "tokenizer.json").string();
 
+  // Refuse-by-task (ARCH-ONE-SURFACE ROW 1), BEFORE the full HfConfig parse: a
+  // SupportsTranscription-ONLY architecture (Parakeet CTC/RNNT/TDT) has no
+  // text-generation path, so the text engine must not be built around it —
+  // mirror of vLLM excluding "generate" from supported_tasks for
+  // supports_transcription_only models (interfaces.py:1118). The peek is
+  // deliberately narrow: only a config whose architectures RESOLVE to a
+  // transcription-only registration takes this exit (its config shape — e.g.
+  // hidden_size nested under encoder_config — would otherwise fail the text
+  // HfConfig parse below with a misleading message); every other model, known
+  // or unknown, falls through with error ordering unchanged. The C ABI routes
+  // such a directory to the transcription stack before reaching here
+  // (vllm_c.cpp), so this fires only for a text-only consumer (server --task
+  // generate, vllm-cli, bench).
+  if (const std::vector<std::string> archs =
+          vllm::PeekHfArchitectures(config_path);
+      !archs.empty()) {
+    const ModelRegistration* peek = nullptr;
+    try {
+      peek = &ModelRegistry::Resolve(std::span<const std::string>(archs));
+    } catch (const std::exception&) {
+      peek = nullptr;  // unknown arch: the existing path owns the diagnosis
+    }
+    if (peek != nullptr && peek->info.supports_transcription_only) {
+      throw std::runtime_error(
+          "Model architecture " + std::string(peek->architecture) +
+          " supports transcription only (no text generation). Use "
+          "vllm_transcribe on the C ABI or the server's "
+          "/v1/audio/transcriptions instead of the text-generation entry "
+          "points.");
+    }
+  }
   HfConfig config = vllm::LoadHfConfig(config_path);
   const ModelRegistration& registration = ModelRegistry::Resolve(config);
   tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
