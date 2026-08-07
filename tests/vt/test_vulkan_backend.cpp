@@ -53,7 +53,7 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // point of the split: at the target shader surface the words must not be
   // re-parsed by every TU that merely needs the table.
   const size_t n = vt::vulkan::kSpirvModuleCount;
-  CHECK(n == 14);
+  CHECK(n == 15);
   for (size_t mi = 0; mi < n; ++mi) {
     const auto& m = vt::vulkan::kSpirvModules[mi];
     CAPTURE(m.name);
@@ -65,8 +65,8 @@ TEST_CASE("the committed SPIR-V table is present and well-formed") {
   // rather than at pipeline-creation time on a device we might not have.
   for (const char* want : {"vt_add", "vt_cast", "vt_embedding", "vt_fused_chain",
                            "vt_greedy_argmax", "vt_layer_norm", "vt_matmul",
-                           "vt_paged_attn", "vt_qkv_split", "vt_relu",
-                           "vt_reshape_and_cache", "vt_rms_norm",
+                           "vt_matmul_coopmat", "vt_paged_attn", "vt_qkv_split",
+                           "vt_relu", "vt_reshape_and_cache", "vt_rms_norm",
                            "vt_rope_from_cache", "vt_silu_and_mul"}) {
     bool found = false;
     for (size_t mi = 0; mi < vt::vulkan::kSpirvModuleCount; ++mi) {
@@ -127,6 +127,11 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // query / k-cache / v-cache / out dtype.
       REQUIRE(m.spec_id_count == 4);
       for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_matmul_coopmat") == 0) {
+      // Only the b orientation and the output dtype: A and B are bf16 by the
+      // hardware configuration this shader is written to, so they are not axes.
+      REQUIRE(m.spec_id_count == 2);
+      for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul") == 0) {
       // a dtype, b dtype, out dtype, orientation: 3*3*3*2 = 54 variants served by
       // ONE committed module, which is the argument for specialization constants
