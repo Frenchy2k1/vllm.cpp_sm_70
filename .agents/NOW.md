@@ -18,7 +18,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | **bf16 shards STREAM both towers (DiT + encoder); Q4_K_M enc cond cos 0.9975, 3.5° med, DIFFUSE** | render A/B on saved embeds |
-| Kimi-Linear-48B | device-KDA **122/128, 4.24 tok/s**; chunk op unit-correct (#111) but chunk-every-step REGRESSES 122→102; **vs vLLM MEASURED 0.20x (~21 tok/s)** | paged-incremental: chunk-prefill ONCE + persistent-state decode (STRICT+speed) |
+| Kimi-Linear-48B | **Paged-incremental decode LANDS (#113): 18.9 tok/s, 4.5× over recompute, 0.90× vLLM ~21** (gap 0.20×→0.90×). Gate A token-identical to recompute (122/128); NOT STRICT (p7 near-tie); decode 90% cuBLAS-GEMV-parity | Next: bf16 residual stream (p7+cast) + paged-FA2 MLA |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |

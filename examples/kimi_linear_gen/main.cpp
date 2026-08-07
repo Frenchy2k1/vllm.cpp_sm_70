@@ -138,7 +138,7 @@ NpyInts ReadNpyInts(const std::string& path) {
 int main(int argc, char** argv) {
   std::string model, golden;
   int steps = 16, prompts = 8;
-  bool use_gpu = false, load_only = false;
+  bool use_gpu = false, load_only = false, incremental = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -148,6 +148,7 @@ int main(int argc, char** argv) {
     else if (a == "--prompts") prompts = std::atoi(next());
     else if (a == "--gpu") use_gpu = true;
     else if (a == "--load-only") load_only = true;
+    else if (a == "--incremental") incremental = true;  // §18 paged-incremental decode
     else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
   }
   if (model.empty()) {
@@ -228,27 +229,56 @@ int main(int argc, char** argv) {
 
     std::vector<int32_t> seq = prompt;
     std::vector<int32_t> gen;
-    for (int s = 0; s < steps; ++s) {
-      std::vector<int32_t> positions(seq.size());
-      for (size_t t = 0; t < seq.size(); ++t) positions[t] = static_cast<int32_t>(t);
-      const std::vector<int32_t> li = {static_cast<int32_t>(seq.size() - 1)};
-      const auto ts = std::chrono::steady_clock::now();
-      vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardDeviceCompute(
-          seq, positions, attn_meta, attn_kv, w, q, li);
-      // download the single logit row + argmax on host.
+    auto argmax_row = [&](const vllm::ForwardLogits& fl) {
       std::vector<float> row(static_cast<size_t>(V));
       be.Copy(q, row.data(), fl.device_tensor.data, row.size() * sizeof(float));
       be.Synchronize(q);
-      const auto te = std::chrono::steady_clock::now();
-      const double dt = std::chrono::duration<double>(te - ts).count();
-      if (pi == 0 && s == 0) first_tok_s = dt;
-      else { steady_s += dt; ++steady_steps; }
       int best = 0;
       float bv = row[0];
       for (int64_t o = 1; o < V; ++o)
         if (row[static_cast<size_t>(o)] > bv) { bv = row[static_cast<size_t>(o)]; best = static_cast<int>(o); }
+      return best;
+    };
+    if (incremental) {
+      // §18 paged-incremental: PREFILL the prompt ONCE (fills the cache), then decode
+      // one token per step from the CARRIED state — no O(n²) recompute.
+      vllm::KimiDecodeCache cache;
+      std::vector<int32_t> positions(prompt.size());
+      for (size_t t = 0; t < prompt.size(); ++t) positions[t] = static_cast<int32_t>(t);
+      const std::vector<int32_t> li = {static_cast<int32_t>(prompt.size() - 1)};
+      const auto tp0 = std::chrono::steady_clock::now();
+      vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardPrefillIncremental(
+          prompt, positions, w, q, cache, li);
+      int best = argmax_row(fl);
+      const auto tp1 = std::chrono::steady_clock::now();
+      if (pi == 0) first_tok_s = std::chrono::duration<double>(tp1 - tp0).count();
       gen.push_back(best);
-      seq.push_back(best);
+      for (int s = 1; s < steps; ++s) {
+        const auto ts = std::chrono::steady_clock::now();
+        vllm::ForwardLogits d = vllm::KimiLinearModel::ForwardDecodeStepIncremental(
+            best, cache.seq_len, w, q, cache);
+        best = argmax_row(d);
+        const auto te = std::chrono::steady_clock::now();
+        steady_s += std::chrono::duration<double>(te - ts).count();
+        ++steady_steps;
+        gen.push_back(best);
+      }
+    } else {
+      for (int s = 0; s < steps; ++s) {
+        std::vector<int32_t> positions(seq.size());
+        for (size_t t = 0; t < seq.size(); ++t) positions[t] = static_cast<int32_t>(t);
+        const std::vector<int32_t> li = {static_cast<int32_t>(seq.size() - 1)};
+        const auto ts = std::chrono::steady_clock::now();
+        vllm::ForwardLogits fl = vllm::KimiLinearModel::ForwardDeviceCompute(
+            seq, positions, attn_meta, attn_kv, w, q, li);
+        int best = argmax_row(fl);
+        const auto te = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(te - ts).count();
+        if (pi == 0 && s == 0) first_tok_s = dt;
+        else { steady_s += dt; ++steady_steps; }
+        gen.push_back(best);
+        seq.push_back(best);
+      }
     }
 
     // compare to golden row pi.
