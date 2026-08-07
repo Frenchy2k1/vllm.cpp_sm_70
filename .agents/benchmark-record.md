@@ -14535,3 +14535,41 @@ Ran #94's prescribed next diagnostic — a layer-by-layer activation diff of the
 **Render A/B re-confirmed in the same byte-inert build (256×256/22f/12steps, `pe.f32`, `VT_H3_ACT_DUMP` unset).** NVFP4 t2va = pale multicolour PATCH GRID every frame (0/10/21, per-patch uniform = degenerate latent); FL2VA-GGUF t2va = a COHERENT photorealistic orange cat on a windowsill. The diagnostic hooks are byte-inert (reproduce #94's outputs exactly).
 
 **CONCLUSION.** The mission's "2nd load-path defect" does not exist — our loader materializes the community NVFP4 file's weights faithfully (byte-verified). The residual is the **community NVFP4 checkpoint's quantization fidelity** (metadata `converted_by: "Star Ultimate Model Converter Pro"` — same dubious-converter lineage as the #94 nibble bug; corr to the coherent Q3_K only 0.85-0.94, well below the >0.99 a clean 4-bit quant gives) interacting with the DiT's massive-activation sensitivity. Definitively separating "poor community quant" from "inherent t2va-OOD sensitivity of these fl2va/ref2va finetunes" needs a clean reference — a bf16 ground truth (132 GiB host-f32 = OOM on one GB10) or a same-finetune REF2VA-GGUF control (disk-blocked, 23 GiB free) — both currently blocked; the path forward is an official modelopt-NVFP4 checkpoint, not a loader change. The #94 nibble fix stands as the objectively-correct dequant. The fp4-resident Marlin arm's separate grid stays a distinct, wiring-gated-only residual (untouched, per the mission). Artifacts `~/h3fp4/diff/{nvfp4_t2va,gguf_t2va}.mp4` + `{gguf,nvfp4}{2,3,4}.txt` fingerprints.
+
+## Vulkan GEMM tactic A/B — cooperative matrix vs the portable scalar kernel (2026-08-07, `VK-C`, NVIDIA Thor)
+
+**Setup.** NVIDIA Thor (Jetson, aarch64, JetPack R39, Vulkan 1.4 loader 1.4.321,
+NVIDIA ICD at `/etc/vulkan/icd.d`). SAME BINARY both arms —
+`examples/vulkan-gemm-ab`, built Release `-Werror` 0-warn with a user-local cmake
+3.31.6 — and the ONLY variable is `VT_VULKAN_COOPMAT`, which forces the scalar
+tactic when `0`. `MatmulBT` (the torch Linear layout), bf16 operands, f32 output,
+median of 20–30 reps after 5 warm-up dispatches. Every arm printed the tactic it
+actually ran (`PipelineExistsFor`) and verified against a host f32 oracle.
+
+Thor exposes the SAME 11 cooperative-matrix configurations as GB10, including the
+`16x16x16 bf16/bf16/f32/f32 SUBGROUP` one this shader is written to, and reports
+subgroup size 32 — so both selection preconditions hold and the COOPMAT arm
+genuinely engaged.
+
+| M x K x N | COOPMAT ms | scalar ms | speedup | coopmat GFLOP/s |
+|---|---:|---:|---:|---:|
+| 128 x 1024 x 1024 | 0.495 | 5.470 | **11.1x** | 542 |
+| 512 x 2048 x 2048 | 2.596 | 81.997 | **31.6x** | 1,655 |
+| 1024 x 4096 x 4096 | 19.896 | 654.181 | **32.9x** | 1,727 |
+
+`worst rel err = 0.000e+00` in every arm, so no arm is fast by being wrong.
+
+**WHAT THIS NUMBER IS NOT.** The baseline is our own `vt_matmul.comp`, which is
+DELIBERATELY a naive untiled kernel — one invocation per output element, sequential
+f32 accumulation, no shared-memory blocking — written to match the CPU's
+accumulation order and serve as the portable correctness tier. So this measures
+*tensor cores vs a naive scalar loop*, NOT *our coopmat vs a competent scalar
+GEMM*. A tiled scalar kernel would close a large part of this gap on its own. The
+honest reading is "the coopmat tactic is worth having and is correctly selected",
+not "we are 32x faster than anyone".
+
+It is also NOT a competitor comparison. llama.cpp's Vulkan backend is untouched
+here; that is `BENCH-VK-LLAMA` / `VK-E`, still owed.
+
+Speedup grows with size (11x -> 33x), which is what a tensor-core path should do:
+the fixed per-dispatch cost amortises and arithmetic intensity rises.
