@@ -26,6 +26,10 @@
 // predicate refuses anything but MatmulBT for that reason, rather than treating
 // this as a universally better kernel.
 //
+// The four partials are combined pairwise, `(p0+p1)+(p2+p3)`, which is a fixed
+// order -- not associativity left to the compiler -- so this kernel's result is
+// reproducible run to run even though it differs from the scalar tactic's.
+//
 // ACCUMULATION ORDER CHANGES, AND THAT IS A REAL COST. vt_matmul keeps each
 // output element's whole K reduction on one lane specifically to share the CPU's
 // accumulation order rather than merely a tolerance. A tree reduction cannot: each
@@ -51,6 +55,11 @@ layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
 layout(constant_id = 0) const uint VT_MM_A_DT = VT_DT_F32;
 layout(constant_id = 1) const uint VT_MM_B_DT = VT_DT_F32;
 layout(constant_id = 2) const uint VT_MM_OUT_DT = VT_DT_F32;
+// Unroll factor, 1 or 4. A specialization constant rather than a literal so the
+// unrolled and non-unrolled kernels are the SAME committed module and can be A/B'd
+// in one binary -- a cross-session comparison of two builds is what produced a
+// false 1.2x reading for the subgroup tactic earlier in this campaign.
+layout(constant_id = 3) const uint VT_MM_UNROLL = 4u;
 
 layout(push_constant) uniform Params {
   uint m;
@@ -74,14 +83,39 @@ void main() {
   uint b_row = j * p.k;  // MatmulBT: b is [N,K] row-major
 
   // Strided by VT_TG so adjacent lanes touch adjacent elements -- the whole point.
-  float partial = 0.0;
-  for (uint q = tid; q < p.k; q += VT_TG) {
-    float av = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q);
-    float bv = VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + q);
-    partial += av * bv;
+  //
+  // FOUR-WAY UNROLL, for MEMORY-LEVEL PARALLELISM rather than fewer instructions.
+  // With one load per lane per iteration, each lane has a single outstanding read
+  // and the loop stalls on it; the memory system is idle most of the time, which
+  // is why this kernel sat at a third of the bandwidth roof. Four independent
+  // accumulators let four reads per lane be in flight at once, and nothing in the
+  // chain depends on the previous iteration.
+  //
+  // The strides stay VT_TG apart so every one of the four loads is still
+  // coalesced across the workgroup -- the unroll adds concurrency WITHOUT giving
+  // up the access pattern the tactic exists for.
+  float p0 = 0.0, p1 = 0.0, p2 = 0.0, p3 = 0.0;
+  const uint step = VT_TG * VT_MM_UNROLL;
+  uint q = tid;
+  for (; VT_MM_UNROLL == 4u && q + VT_TG * 3u < p.k; q += step) {
+    p0 += VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q) *
+          VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + q);
+    p1 += VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q + VT_TG) *
+          VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + q + VT_TG);
+    p2 += VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q + VT_TG * 2u) *
+          VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + q + VT_TG * 2u);
+    p3 += VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q + VT_TG * 3u) *
+          VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + q + VT_TG * 3u);
+  }
+  // Tail: whatever the unrolled body could not cover, at the original stride. K is
+  // not required to be a multiple of 4*VT_TG, and truncating it would silently
+  // drop dot-product terms.
+  for (; q < p.k; q += VT_TG) {
+    p0 += VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, a_row + q) *
+          VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_row + q);
   }
 
-  float acc = vt_tg_sum(tid, partial);
+  float acc = vt_tg_sum(tid, (p0 + p1) + (p2 + p3));
   if (tid != 0u) { return; }
   VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, gid, acc);
 }
