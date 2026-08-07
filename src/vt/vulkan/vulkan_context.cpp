@@ -127,6 +127,51 @@ bool HasStorageBuffer16BitAccess(VkPhysicalDevice pd) {
   return f16.storageBuffer16BitAccess == VK_TRUE;
 }
 
+bool HasDeviceExtension(VkPhysicalDevice pd, const char* want) {
+  const VulkanApi& vk = Api();
+  uint32_t count = 0;
+  if (vk.vkEnumerateDeviceExtensionProperties(pd, nullptr, &count, nullptr) != VK_SUCCESS) {
+    return false;
+  }
+  std::vector<VkExtensionProperties> exts(count);
+  if (vk.vkEnumerateDeviceExtensionProperties(pd, nullptr, &count, exts.data()) != VK_SUCCESS) {
+    return false;
+  }
+  for (const auto& e : exts) {
+    if (std::strcmp(e.extensionName, want) == 0) return true;
+  }
+  return false;
+}
+
+// The ONE configuration the committed coopmat SPIR-V is written to:
+// 16x16x16, A/B bf16, C/Result f32, SUBGROUP scope. Vulkan requires an EXACT
+// match against a reported configuration -- there is no "nearest" -- so this
+// asks for exactly that tuple and nothing else.
+bool HasBf16F32CoopMatConfig(VkPhysicalDevice pd) {
+  const VulkanApi& vk = Api();
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR == nullptr) return false;
+  uint32_t count = 0;
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &count, nullptr) != VK_SUCCESS) {
+    return false;
+  }
+  std::vector<VkCooperativeMatrixPropertiesKHR> cfg(count);
+  for (auto& c : cfg) c.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+  if (vk.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(pd, &count, cfg.data()) != VK_SUCCESS) {
+    return false;
+  }
+  for (const auto& c : cfg) {
+    if (c.MSize == 16 && c.NSize == 16 && c.KSize == 16 &&
+        c.AType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+        c.BType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+        c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+        c.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+        c.scope == VK_SCOPE_SUBGROUP_KHR) {
+      return true;
+    }
+  }
+  return false;
+}
+
 int FindComputeQueueFamily(VkPhysicalDevice pd) {
   const VulkanApi& vk = Api();
   uint32_t count = 0;
@@ -279,6 +324,51 @@ VulkanContext::VulkanContext() {
   f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
   f16.storageBuffer16BitAccess = VK_TRUE;
 
+  // --- COOPERATIVE MATRIX (VK-C), enabled only where the device actually has it.
+  //
+  // Enablement is CONDITIONAL for a load-bearing reason: naming an unsupported
+  // extension in VkDeviceCreateInfo makes vkCreateDevice FAIL OUTRIGHT, so an
+  // unconditional request would take the whole backend down on llvmpipe -- which
+  // is the only Vulkan device CI can reach, and which exposes the extension not
+  // at all (measured 2026-08-07). The scalar tactic stays correct there.
+  //
+  // The predicate is deliberately narrow: extension present, AND a bf16 x bf16
+  // -> f32 16x16x16 SUBGROUP configuration reported, AND the subgroup size known.
+  // A device with cooperative matrix but only f16 or int8 configurations gets the
+  // scalar path, because the committed coopmat SPIR-V is written to the bf16
+  // shape and Vulkan gives no way to "almost" match a configuration.
+  std::vector<const char*> device_exts;
+  const bool has_coopmat_ext = HasDeviceExtension(probe.physical_device,
+                                                  "VK_KHR_cooperative_matrix");
+  const bool has_bf16_ext = HasDeviceExtension(probe.physical_device,
+                                               "VK_KHR_shader_bfloat16");
+  VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop_feat{};
+  coop_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+  VkPhysicalDeviceShaderBfloat16FeaturesKHR bf16_feat{};
+  bf16_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+
+  // Subgroup size, which the coopmat shader's workgroup shape depends on.
+  VkPhysicalDeviceSubgroupProperties sub{};
+  sub.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+  VkPhysicalDeviceProperties2 sprops{};
+  sprops.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  sprops.pNext = &sub;
+  Api().vkGetPhysicalDeviceProperties2(probe.physical_device, &sprops);
+  subgroup_size_ = sub.subgroupSize;
+
+  if (has_coopmat_ext && has_bf16_ext &&
+      HasBf16F32CoopMatConfig(probe.physical_device) && subgroup_size_ > 0) {
+    coopmat_bf16_f32_ = true;
+    coop_feat.cooperativeMatrix = VK_TRUE;
+    bf16_feat.shaderBFloat16Type = VK_TRUE;
+    bf16_feat.shaderBFloat16CooperativeMatrix = VK_TRUE;
+    device_exts.push_back("VK_KHR_cooperative_matrix");
+    device_exts.push_back("VK_KHR_shader_bfloat16");
+    // Chain: f16 -> coopmat -> bf16.
+    coop_feat.pNext = &bf16_feat;
+    f16.pNext = &coop_feat;
+  }
+
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo qci{};
   qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -289,6 +379,8 @@ VulkanContext::VulkanContext() {
   VkDeviceCreateInfo dci{};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dci.pNext = &f16;
+  dci.enabledExtensionCount = static_cast<uint32_t>(device_exts.size());
+  dci.ppEnabledExtensionNames = device_exts.empty() ? nullptr : device_exts.data();
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
   VkDevice device = VK_NULL_HANDLE;

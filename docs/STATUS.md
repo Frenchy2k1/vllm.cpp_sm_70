@@ -395,10 +395,10 @@ The correctness form and the full D0-D14 measured chronology live in
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
 Vulkan (16 native kernels, 71 on CPU tier; opt-125m
-e2e token-exact, llvmpipe;
+e2e exact, llvmpipe; coopmat dgx-only;
 [campaign](../.agents/specs/vulkan-full-support.md)), and the full tool-calling
-template surface. **Scale-out / distributed execution is scoped but unbuilt**
-(2026-07-28): the engine is single-GPU today — no NCCL / tensor-parallel /
+template surface. **Scale-out is scoped but unbuilt**
+(2026-07-28): the engine is single-GPU — no NCCL / tensor-parallel /
 process-group code in `src/`. One `vt::` collective / process-group abstraction with
 backend-specific transports (NCCL / RDMA / MLX-ring) covers all three legs —
 multi-GPU tensor+pipeline parallel, multiple DGX Sparks over the ConnectX-7

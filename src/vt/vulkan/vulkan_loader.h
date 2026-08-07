@@ -49,6 +49,14 @@ namespace vt::vulkan {
   X(vkCreateDevice)                          \
   X(vkGetDeviceProcAddr)
 
+// OPTIONAL instance entry points: EXTENSION functions that are legitimately
+// absent. These must NOT go in the list above, which VT_CHECKs every name -- a
+// missing extension function there would abort the backend on any device without
+// the extension, and llvmpipe (the only Vulkan device CI can reach) exposes
+// VK_KHR_cooperative_matrix not at all. Callers null-check instead.
+#define VT_VK_INSTANCE_FUNCS_OPTIONAL(X)                 \
+  X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+
 #define VT_VK_DEVICE_FUNCS(X)          \
   X(vkDestroyDevice)                   \
   X(vkDeviceWaitIdle)                  \
@@ -97,6 +105,7 @@ struct VulkanApi {
 #define VT_VK_DECL(name) PFN_##name name = nullptr;
   VT_VK_GLOBAL_FUNCS(VT_VK_DECL)
   VT_VK_INSTANCE_FUNCS(VT_VK_DECL)
+  VT_VK_INSTANCE_FUNCS_OPTIONAL(VT_VK_DECL)
   VT_VK_DEVICE_FUNCS(VT_VK_DECL)
 #undef VT_VK_DECL
 };

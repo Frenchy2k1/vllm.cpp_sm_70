@@ -406,6 +406,37 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
   CHECK(vt::GetReferenceTierHits() > 0);
 }
 
+TEST_CASE("cooperative-matrix capability is PROBED, and absent on llvmpipe") {
+  if (!VulkanPresent()) return;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  MESSAGE("vulkan device: " << ctx.device_name());
+  // Assembled BEFORE the macro. MESSAGE(x << y) expands to
+  // `MessageBuilder << x << y`, so an expression written inside it is consumed by
+  // the builder rather than evaluated first -- `MESSAGE("text" << flag)` renders
+  // as "1", which reads as if the capability were TRUE. For a line whose entire
+  // job is to report a capability honestly, that is the worst failure mode.
+  const std::string coop_line = std::string("coopmat bf16xbf16->f32 16x16x16 SUBGROUP: ") +
+                                (ctx.coopmat_bf16_f32() ? "YES" : "no");
+  MESSAGE(coop_line);
+  MESSAGE("subgroup size: " << ctx.subgroup_size());
+
+  // The predicate must be a REPORT, never an assumption, so this asserts the
+  // property rather than a specific answer: a device may or may not have it.
+  // What IS asserted unconditionally is that the backend stayed usable either
+  // way -- enabling an absent extension would have failed vkCreateDevice
+  // outright, so merely getting here proves the enablement is conditional.
+  CHECK(ctx.subgroup_size() > 0);
+
+  // MEASURED 2026-08-07: llvmpipe exposes VK_KHR_cooperative_matrix NOT AT ALL,
+  // so on the software rasterizer -- the only Vulkan device CI can reach -- the
+  // answer must be NO, and the scalar GEMM tactic is what runs. This is pinned
+  // because it is what makes the CI leg a real test of the FALLBACK path rather
+  // than an accident.
+  if (ctx.device_name().find("llvmpipe") != std::string::npos) {
+    CHECK_FALSE(ctx.coopmat_bf16_f32());
+  }
+}
+
 TEST_CASE("Vulkan float-controls are PROBED and reported, not assumed") {
   if (!VulkanPresent()) return;
   // The relaxed-precision knobs Vulkan leaves implementation-defined. We cannot
