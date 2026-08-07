@@ -25,7 +25,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
-| `/v1/videos` OpenAI shape (`row/SERVE-VIDEOS-OAI`) | **PR open**: Sora `model`/`size`/`seconds` + `GET /{id}/content`, CPU-gated | Follow-up row: reference conditioning |
+| `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna

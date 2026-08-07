@@ -8,6 +8,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
+
+// DecodeDataUri: the RFC 2397 `data:` decode the chat multimodal parts already
+// use. `input_reference` accepting a data: URL means the SAME decoder serves both
+// surfaces rather than a second, subtly different one.
+#include "vllm/entrypoints/openai/chat_mm.h"
 #include "vt/dtype.h"
 
 namespace vllm::openai {
@@ -65,6 +70,65 @@ double ReadDuration(const nlohmann::json& body, const char* key) {
   return 0.0;  // unreachable; VT_CHECK(false) throws
 }
 
+// A reference SOURCE: a filesystem path, or an inline `data:` URL. An http(s)
+// URL is REFUSED by name rather than treated as a path, because silently
+// stat-ing "https://..." would fail much later with a confusing message.
+// `field` names the offending field so the 400 says which one.
+void ReadReferenceSource(const std::string& field, const std::string& value,
+                         std::string* out_path, std::vector<uint8_t>* out_bytes,
+                         std::string* out_media_type) {
+  VT_CHECK(!value.empty(), "video request: `" + field + "` must not be empty");
+  if (value.compare(0, 5, "data:") == 0) {
+    try {
+      const entrypoints::openai::DecodedMedia media =
+          entrypoints::openai::DecodeDataUri(value);
+      VT_CHECK(!media.bytes.empty(),
+               "video request: `" + field + "` data: URL decoded to no bytes");
+      *out_bytes = media.bytes;
+      if (out_media_type != nullptr) *out_media_type = media.media_type;
+    } catch (const std::exception& e) {
+      VT_CHECK(false, "video request: `" + field + "` is not a valid data: URL: " +
+                          e.what());
+    }
+    return;
+  }
+  VT_CHECK(value.compare(0, 7, "http://") != 0 && value.compare(0, 8, "https://") != 0,
+           "video request: `" + field +
+               "` must be a filesystem path or a data: URL; fetching an http(s) "
+               "URL is not supported");
+  *out_path = value;
+}
+
+// OpenAI `metadata`: a free-form string->string map. Everything is kept, and the
+// two H3 reference keys OpenAI has no slot for are lifted into typed fields.
+void ReadMetadata(const nlohmann::json& value, VideoRequest* out) {
+  VT_CHECK(value.is_object(), "video request: `metadata` must be an object");
+  for (const auto& [key, item] : value.items()) {
+    VT_CHECK(item.is_string(),
+             "video request: `metadata." + key +
+                 "` must be a string (metadata is a string map)");
+    out->metadata[key] = item.get<std::string>();
+  }
+  const auto video = out->metadata.find("input_reference_video");
+  if (video != out->metadata.end()) {
+    VT_CHECK(!video->second.empty(),
+             "video request: `metadata.input_reference_video` must not be empty");
+    // A DIRECTORY of frame_%06d.ppm, not a container file: no demuxer is
+    // vendored, and this is exactly the layout `minimax-h3-gen` writes, so one
+    // run's frames chain into the next request. `data:` cannot name a directory.
+    VT_CHECK(video->second.compare(0, 5, "data:") != 0,
+             "video request: `metadata.input_reference_video` must be a directory "
+             "of frame_%06d.ppm files, so a data: URL cannot express it");
+    out->input_reference_video_dir = video->second;
+  }
+  const auto audio = out->metadata.find("input_reference_audio");
+  if (audio != out->metadata.end()) {
+    ReadReferenceSource("metadata.input_reference_audio", audio->second,
+                        &out->input_reference_audio_path,
+                        &out->input_reference_audio_bytes, nullptr);
+  }
+}
+
 }  // namespace
 
 void ParseVideoSize(const std::string& size, int64_t* width, int64_t* height) {
@@ -109,6 +173,24 @@ VideoRequest ParseVideoRequest(const std::string& body) {
     out.model = json.at("model").get<std::string>();
     VT_CHECK(!out.model.empty(), "video request: `model` must not be empty");
   }
+  if (Has(json, "input_reference")) {
+    VT_CHECK(json.at("input_reference").is_string(),
+             "video request: `input_reference` must be a string (a filesystem path "
+             "or a data: URL)");
+    ReadReferenceSource("input_reference", json.at("input_reference").get<std::string>(),
+                        &out.input_reference_path, &out.input_reference_bytes,
+                        &out.input_reference_media_type);
+  }
+  if (Has(json, "metadata")) ReadMetadata(json.at("metadata"), &out);
+  // The pipeline's own exclusion (minimax_h3_pipeline.cpp:251), enforced HERE so
+  // it is a 400 with the offending pair named rather than a failed job — and so a
+  // supplied reference is never silently dropped.
+  VT_CHECK(!(out.has_input_reference() &&
+             (out.has_input_reference_video() || out.has_input_reference_audio())),
+           "video request: `input_reference` (fl2va first-frame conditioning) cannot "
+           "be combined with `metadata.input_reference_video`/"
+           "`metadata.input_reference_audio` (ref2va reference blocks); keyframe and "
+           "reference conditioning are exclusive");
   // vLLM-Omni carries the generation knobs under `extra_params`; accept them at
   // the top level too so a plain client does not have to nest.
   const nlohmann::json& extra =
