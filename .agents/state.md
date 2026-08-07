@@ -42148,3 +42148,40 @@ synthetic pair + the P4/P6 pretrained evidence. (4) A real Parakeet
 tokenizer.json may carry normalizer fields `FromHfJson` refuses loudly —
 untestable CPU-side without the checkpoint, fails loud not wrong. (5) Whisper/
 Voxtral remain off-registry (fold #9/#10 of the audit).
+- **2026-08-07 (levers, cont.)** — **★ Tier-1 fusion is a NEGATIVE, the dispatch
+  floor has grown 13% -> 49%, and `VK-A2`'s real blocker is named
+  (`CLAIM-VULKAN-FULL-1`).**
+
+  **Fusion that does not REMOVE a dispatch is not fusion.** `VT_FUSED_TIER=1`
+  engages on Vulkan (456 `vt_fused_chain` dispatches vs 0) and stays token-exact,
+  but the dispatch count is IDENTICAL at 2,952: `kFusedAddRmsNormStd` is
+  add+RMS-norm and `vt_rms_norm` already did both in one dispatch via `has_res`.
+  It swapped a specialized kernel for a generic interpreter and lost — 314.7 vs
+  275.8 ms, 2/8 pairs. `VT_FUSED_TIER` stays 0. The framework worked exactly as
+  designed; the recipe simply described something one kernel already did.
+
+  **The floor grew exactly as predicted.** GPU time fell ~1,054 -> 275.8 ms as
+  argmax and the GEMV landed; the 0.046 ms x 2,952 = 135.8 ms floor did not move,
+  so it went from 13% to **49%**. `vt_silu_and_mul`, `vt_rope_from_cache` and
+  `vt_qkv_split` now sit AT or BELOW the floor — a kernel doing no meaningful work
+  relative to being launched. 73% of those 1,800 small dispatches' cost is launch
+  overhead. **Making them faster is pointless; only removing dispatches helps.**
+
+  **`VK-A2`'s blocker, now named.** `VulkanContext::Pipeline` holds ONE
+  `VkDescriptorSet`, and every `Dispatch` calls `vkUpdateDescriptorSets` on it and
+  then submits and waits. Batching N dispatches into one command buffer would let
+  a later dispatch to the same pipeline OVERWRITE the descriptor set before the
+  GPU executes the earlier one — the set is read at EXECUTION time, not record
+  time. So batching requires a per-dispatch descriptor set (a ring or per-batch
+  pool with recycling), not just deferring the submit. That is the substantive
+  change, and it is why this row has stayed unbuilt.
+
+  Also corrected: the "~500x behind on prefill" figure was a METRIC ARTIFACT —
+  `input_throughput` divided by the WHOLE run, so a 1-prompt run reported
+  32/E2EL and charged the whole decode to prefill, then was compared against
+  llama-bench `pp128` which is prefill-ONLY. A true `prefill_throughput` now
+  ships alongside it.
+
+  Pre-existing red, NOT from this work: `test_bench` fails on any Vulkan-ON build
+  (synthetic engine's host-allocated embedding table is not a Vulkan allocation).
+  Verified identical on unmodified HEAD before attributing.
