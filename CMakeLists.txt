@@ -673,6 +673,12 @@ add_library(vllm STATIC
   # Parakeet head archs so config.json RESOLVES (SupportsTranscription mirror).
   src/vllm/multimodal/parakeet_transcription.cpp
   src/vllm/model_executor/models/parakeet_registry.cpp
+  # The ONE video-generation seam every consumer drives (C ABI vllm_video_*,
+  # the server's /v1/videos, the minimax-h3-gen example) — ARCH-ONE-SURFACE
+  # ROW 2: absorbs the assembly pipeline examples/minimax_h3_gen and the
+  # server's private /v1/videos twin. Builds artifacts + the ffmpeg argv and
+  # SPAWNS NOTHING (the ratified process boundary).
+  src/vllm/multimodal/minimax_h3_video.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp

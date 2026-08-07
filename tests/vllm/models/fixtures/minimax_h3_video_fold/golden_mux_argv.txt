@@ -1,0 +1,1 @@
+ffmpeg -y -loglevel error -framerate 24 -i W/frame_%06d.ppm -i W/audio.wav -c:v libx264 -pix_fmt yuv420p -crf 18 -c:a aac -b:a 192k -shortest -movflags +faststart W/video.mp4
