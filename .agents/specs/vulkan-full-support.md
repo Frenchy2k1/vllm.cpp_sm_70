@@ -12,8 +12,18 @@ rows and does NOT re-litigate the landed design; read § V1 landed there first.
 (verified present locally, 132 `.comp` + 26 `.glsl`). **vLLM has no Vulkan path
 anywhere**, so this is a recorded extension
 ([porting-inventory.md](../porting-inventory.md) §9), not a mirror.
-**Status:** **PLAN ONLY.** No code, no shader, no build, no benchmark, no model.
-No row moves lifecycle state on this change.
+**Status:** **`VK-A1` LANDED 2026-08-06** (§6.1). Everything else PLAN ONLY.
+
+> **CORRECTION, 2026-08-06 — two baseline claims in this spec were WRONG and are
+> superseded by §1.1.** This spec stated, from the backend matrix, that Vulkan's
+> unregistered ops make `vt::GetOp` THROW and that its op surface is "8 of 83".
+> Both are false. Accelerator-seam row `S5` (`af0b21ba`) gave unified-memory
+> devices a **portable reference tier**, so a missed `GetOp` installs the CPU
+> kernel instead of throwing, and Vulkan is eligible. Measured on the tree:
+> **87** CPU-registered ops, **8** native on Vulkan, **79** served by the
+> reference tier, **0** throwing. The op-gap arithmetic in §2 (83 − 8 = 75) is
+> therefore off by the same four ops; the GROUPING there is still the work, but
+> the count of record is 79, not 75. Read §1.1 before quoting any number here.
 
 ---
 
@@ -93,7 +103,51 @@ GPU-free CI path**.
 **Record drift to repair (owned by `VK-A1`).** `feature-matrix.md:280` carries
 `BACKEND-VULKAN` as `INVENTORIED | runtime absent` while `backend-matrix.md:233`
 carries it as `ACTIVE` (gated skeleton). Same row, two states. `backend-matrix`
-is correct; `feature-matrix` is the stale one.
+is correct; `feature-matrix` is the stale one. **REPAIRED 2026-08-06 by `VK-A1`.**
+
+### 1.1 What `VK-A1` MEASURED, superseding §1 and §2 above
+
+The op surface was re-counted at RUNTIME (not by grepping `RegisterOp`), on a
+Vulkan-ON build, by asking `vt::OpRegistered` and `vt::GetOp` for every `OpId`:
+
+| | at `VK-A1` | after the first `VK-B` bricks |
+|---|---|---|
+| CPU-registered ops | **87** | **87** |
+| **NATIVE** on Vulkan | **8** | **16** |
+| served by the **portable reference tier** (S5, CPU kernel on shared memory) | **79** | **71** |
+| **ABSENT** (`GetOp` throws) | **0** | **0** |
+
+The six that moved are `kMatmul`, `kMatmulBT` (dense GEMM, both orientations),
+`kEmbedding`, `kGreedyArgmax`, `kPagedAttention` and `kReshapeAndCache` — the
+model's two ends, the op it spends most of its time in, and the attention block's
+read and write halves.
+
+**`VK-B`'s next brick needs a DECISION, not just work: RoPE.** The CPU kernel
+computes the angle in DOUBLE (`cpu_ops.cpp:701-705` — `std::pow` for the
+frequency, `std::cos`/`std::sin` of `pos * freq`), and an f32 transcription loses
+precision badly at long context, where `pos` is in the thousands. Two ways out:
+require `shaderFloat64` and transcribe faithfully, or implement `kRopeFromCache`
+(the apply, pure f32 multiply-add) natively and leave `kRopeCosSinCache` (the
+once-per-model table build, where the double math lives) on the reference tier.
+The second is what vLLM's own structure suggests and costs no device feature. Re-measure with the same method rather than quoting this table.
+
+`vt::ReferenceTierEligible(kVULKAN)` is TRUE — GB10 integrated and llvmpipe both
+report unified memory. So **every op the CPU backend has is already reachable on
+Vulkan**, and the campaign's real content is moving those 79 off the host, which
+is a PERFORMANCE project rather than a make-it-run project. `vt::GetReferenceTierHits()`
+is the built-in progress metric: it must reach **0** for a genuinely native run.
+
+**One honest limit.** Op resolution is not an end-to-end claim.
+`VulkanPlatform::get_attn_backend_priority()` is still deliberately EMPTY, so the
+attention-backend registry has no Vulkan entry — a separate gate at the platform
+seam that `VK-A1` did not test past. No model has been run on Vulkan.
+
+**Why nobody knew.** `test_vulkan_backend`'s "unimplemented ops throw" assertion
+had been RED since `S5` landed. The Metal sibling was updated as Metal work
+continued; Vulkan was not, because **`VLLM_CPP_VULKAN=ON` appeared nowhere in
+`ci.yml`** — the backend was built on no machine, so its whole suite ran nowhere.
+`VK-A1` added the `build-test-vulkan` leg (llvmpipe, GPU-free) so this class of
+rot is visible.
 
 ---
 
@@ -262,7 +316,7 @@ the umbrella, not a substitute for them.
 
 | ID | Sub-project | Blocked by | Deliverable |
 |---|---|---|---|
-| **VK-A1** | **Shader-variant pipeline + record repair** | — | The build/emit strategy for the shader explosion, DECIDED and implemented at 7 shaders. Plus the `feature-matrix.md:280` drift fix |
+| **VK-A1** | **Shader-variant pipeline + record repair** | — | **LANDED 2026-08-06 — see §6.1** |
 | **VK-B** | **Dense bf16 model end to end** (23 ops) | A1 | A small dense model token-exact vs our CUDA backend on GB10, mirroring Metal's `M3a` (OPT-125m, 6/6 prompts / 96/96 tokens) |
 | **VK-E** | **Competitive harness + `BENCH-VK-LLAMA`** | B | A pinned llama.cpp-Vulkan build on dgx and the first three-column number. **Activates `BACKEND-GATE-VULKAN-LLAMACPP`** |
 | **VK-A2** | **Async dispatch + command-buffer graph capture** | B, E | `SupportsGraphCapture()` TRUE via pre-recorded `VkCommandBuffer`; submission off the per-op fence-wait. Measured against the E denominator |
@@ -272,6 +326,54 @@ the umbrella, not a substitute for them.
 | **VK-G** | **Linear attention, MLA, conv** (19 ops) | F | GDN/KDA + MLA models running; ported from `gated_delta_net.comp` et al |
 | **VK-H** | **Attention variants + samplers** (16 ops) | B (samplers), G (attn variants) | **83/83 — closes the op surface** |
 | **VK-I** | **AMD/RDNA (or Arc) bring-up** | hardware acquisition | The staging path for non-host-visible memory, and the gate re-run where Vulkan actually matters |
+
+### 6.1 `VK-A1` landed — 2026-08-06 (`CLAIM-VULKAN-FULL-1`)
+
+**DECISION: keep the committed-SPIR-V route; make SPECIALIZATION CONSTANTS the
+variant mechanism instead of GLSL `#define`s.** The build still needs no shader
+toolchain on any machine. llama.cpp spells a variant as a `#define`, so every
+dtype x quant x coopmat-tier combination is a whole new module — 242
+`string_to_spv(` call sites at pin `237ad9b96`, most inside those loops. A
+specialization constant is ONE module specialized at pipeline creation, with the
+driver eliminating the branches the value kills, so artifact count tracks shader
+FILES rather than their cross product.
+
+| Delivered | Evidence |
+|---|---|
+| glslang **16.5.0** pinned (`$HOME/tools`, release tarball, nothing linked) | The recorded `16.4.0` **ships no release assets**, so it could never back a CI gate. Committed SPIR-V reproduces **byte-for-byte** under 16.5.0 — proving both that the artifact is what it claims and that the output survives a glslang minor bump |
+| CI job `vulkan-spirv-freshness` | Pins the download URL (not a version string — the bytes are stable across versions). **Mutation-proved**: an equivalent rewrite of relu's select turns it RED, reverting turns it green |
+| CI job `build-test-vulkan` | GPU-free on llvmpipe; runs the backend gate + cross-device numerics. Closes the hole that let the suite rot |
+| SpecId metadata in the module table | Parsed from `OpDecorate SpecId` in the emitted module — glslang exposes no side channel, and a hand-kept list is the duplicate that drifts. `GetPipeline` checks the count, because Vulkan SILENTLY IGNORES an undeclared constantID (wrong numbers, not an error) |
+| Specialized pipelines, cache keyed by specialization | `VkSpecializationInfo` built from named locals that outlive `vkCreateComputePipelines` — the escaping-temporary class this project hit twice under CUDA-graph capture |
+| `vt_cast` dtype pair = the FIRST variant axis | Was a per-element push-constant branch; now constants 0 and 1. ONE module still serves every (src, dst) pair and the module got **SMALLER**, 109,436 → 109,216 bytes. Gated on the pipeline cache growing by TWO across two pairs — results alone prove nothing, since the defaults are f32→f32 |
+| SPIR-V words moved to `vulkan_spirv.cpp` | Header 3,487 → **55 lines**. Adding shaders costs one TU's compile time, not every includer's. A test fails if the arrays reappear in the header |
+| Descriptor-pool bug fixed | Pool was sized one set per MODULE; since specialization a module has many pipelines, each allocating a set, so it would have exhausted on the Nth specialization inside `vkAllocateDescriptorSets` |
+| Record repaired | `feature-matrix.md:280` `INVENTORIED` → `ACTIVE`; §1.1 supersedes the "GetOp throws / 8 of 83" claims |
+
+**MEASURED NEGATIVE RESULT — do not retry the workgroup size.** VT_TG is written
+down three times (`vt_common.glsl`, each `.comp`'s `local_size_x`, and
+`kWorkgroupSize` on the host, which derives the workgroup COUNT from it), exactly
+the shape a specialization constant should collapse. It cannot at this target:
+`layout(local_size_x_id = 0)` makes glslang emit `ExecutionMode LocalSize 1 1 1`
+plus the legacy `BuiltIn WorkgroupSize` vector, because the modern `LocalSizeId`
+mode needs SPIR-V 1.2 + `VK_KHR_maintenance4` (core in Vulkan 1.3) and this
+backend targets `vulkan1.1` deliberately. On llvmpipe the literal `LocalSize 1`
+wins: every workgroup runs ONE thread against a `ceil(n/128)` dispatch, and
+cross-device NMSE went from ~1e-14 to **0.99 on `kAdd`**. An A/B isolated it —
+keeping the constant and reverting only `local_size_x_id` is fully green. Raising
+the target env would raise the device floor and is out of scope. The reasoning is
+recorded beside the `#define` in `vt_common.glsl`.
+
+**Deliberately NOT done:** the `vt::arch_tactics` generalization (§6 question 3).
+A tactic registry with exactly one tactic is speculative; it belongs with `VK-C`,
+which has a real second tactic to select.
+
+**Gates:** clean `-Werror` build, Vulkan ON — 0 warnings. `test_vulkan_backend`
+10/10 (405 assertions), `test_backend_cross_device` 6/6 (73, including the
+bit-exact bf16 codec tier), generator suite 9/9, `--check` green on both generated
+files. `CMakeLists.txt`'s tri-state is untouched, so `AUTO` still resolves OFF and
+the CUDA gate build is unaffected by construction. **No speed number measured,
+claimed or owed.**
 
 ### Why `VK-A1` is first, and why it is not bikeshedding
 

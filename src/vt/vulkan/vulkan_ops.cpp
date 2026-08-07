@@ -68,6 +68,19 @@ class Binder {
   // A raw buffer bound ONCE (no 16-bit view): the fused-chain step list.
   void AddRaw(void* buffer) { buffers_.push_back(buffer); }
 
+  // A tensor bound through the uint32_t view ONLY, for shaders that declare a
+  // single binding per operand because the operand is integer (embedding ids,
+  // sampler token ids) or f32-by-contract (logits). Binding the unused 16-bit
+  // view would need the shader to declare it too, and a descriptor a shader does
+  // not declare must not be written.
+  uint32_t AddU32Only(const Tensor& t, const char* what) {
+    Resolved r = Resolve(t.data, what);
+    buffers_.push_back(r.buffer);
+    VT_CHECK(r.offset % 4 == 0,
+             std::string("vulkan: ") + what + " has a byte offset that is not 4-byte aligned");
+    return r.offset;
+  }
+
   const void* const* data() const { return buffers_.data(); }
   uint32_t count() const { return static_cast<uint32_t>(buffers_.size()); }
 
@@ -84,6 +97,46 @@ struct AddParams {
 };
 struct UnaryParams {
   uint32_t n, a_dt, out_dt, a_off, out_off;
+};
+// vt_cast carries its dtype pair in specialization constants instead, so its
+// push block is only the shape and the two offsets.
+struct CastParams {
+  uint32_t n, a_off, out_off;
+};
+struct MatmulParams {
+  uint32_t m, n, k, a_off, b_off, out_off;
+};
+struct EmbeddingParams {
+  uint32_t t, h, table_off, ids_off, out_off;
+};
+struct ArgmaxParams {
+  uint32_t n, v, logits_off, out_off;
+};
+struct QkvSplitParams {
+  uint32_t tokens, q_dim, k_dim, v_dim, src_off, q_off, k_off, v_off;
+};
+struct RopeFromCacheParams {
+  uint32_t tokens, half_dim, rotary_dim, hq, hk;
+  uint32_t q_s0, q_s1, k_s0, k_s1;
+  uint32_t q_off, k_off, c_off, p_off;
+};
+struct ReshapeAndCacheParams {
+  uint32_t num_slots, n_elems, block_size;
+  uint32_t k_blk, k_pg, v_blk, v_pg;
+  uint32_t k_tok, v_tok;
+  uint32_t k_off, v_off, kc_off, vc_off, sm_off;
+};
+struct PagedAttnParams {
+  uint32_t total_q, hq, d, block_size, qpk, num_reqs;
+  uint32_t causal;
+  int32_t window_left, window_right;
+  uint32_t kc_blk, kc_pg, kc_hd;
+  uint32_t vc_blk, vc_pg, vc_hd;
+  uint32_t bt_row, bt_col;
+  uint32_t q_off, k_off, v_off, out_off;
+  uint32_t bt_off, sl_off, qsl_off;
+  float scale;
+  float softcap;
 };
 struct SiluMulParams {
   uint32_t t, d, x_dt, out_dt, x_off, out_off;
@@ -106,10 +159,14 @@ struct FcParams {
 static_assert(sizeof(RmsParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(LayerNormParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(FcParams) <= 128, "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(PagedAttnParams) <= 128,
+              "push constants must fit the guaranteed 128 bytes");
 
 template <typename P>
-void Go(const char* name, const Binder& b, const P& p, uint32_t groups) {
-  VulkanContext::Get().Dispatch(name, b.data(), b.count(), &p, sizeof(P), groups);
+void Go(const char* name, const Binder& b, const P& p, uint32_t groups,
+        const uint32_t* spec = nullptr, uint32_t spec_count = 0) {
+  VulkanContext::Get().Dispatch(name, b.data(), b.count(), &p, sizeof(P), groups, spec,
+                                spec_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -152,9 +209,13 @@ void CastKernel(Queue&, Tensor& out, const Tensor& in) {
   Binder bind;
   const uint32_t in_off = bind.Add(in, "cast: in");
   const uint32_t out_off = bind.Add(out, "cast: out");
-  UnaryParams p{static_cast<uint32_t>(n), DtypeCode(in.dtype), DtypeCode(out.dtype), in_off,
-                out_off};
-  Go("vt_cast", bind, p, FlatGroupCount(n));
+  // The dtype pair rides SPECIALIZATION CONSTANTS rather than push constants, so
+  // the per-element dtype branch is folded away at pipeline creation and each
+  // (src, dst) pair is its own cached pipeline. Ascending constantID order, which
+  // is what GetPipeline binds against the module's declared SpecIds.
+  const uint32_t spec[2] = {DtypeCode(in.dtype), DtypeCode(out.dtype)};
+  CastParams p{static_cast<uint32_t>(n), in_off, out_off};
+  Go("vt_cast", bind, p, FlatGroupCount(n), spec, 2);
 }
 
 // cpu_ops.cpp:252-264 SiluAndMulKernel.
@@ -298,6 +359,283 @@ void FusedChainKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight
   Go("vt_fused_chain", bind, p, static_cast<uint32_t>(t));
 }
 
+// cpu_ops.cpp:187-260 MatmulChunked / MatmulKernel / MatmulBTKernel. One
+// invocation per OUTPUT ELEMENT with the whole K reduction on it, which is what
+// the CPU kernel does too (it deliberately never splits a K reduction across
+// threads), so the accumulation ORDER matches rather than merely the tolerance.
+//
+// The naive body is the portable correctness tier on purpose; the tiled and
+// cooperative-matrix ports (llama.cpp mul_mm.comp / mul_mm_cm2.comp) are VK-C,
+// which needs exactly this as its same-device A/B reference.
+template <bool kBT>
+void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  const int64_t m = a.shape[0], k = a.shape[1];
+  const int64_t n = kBT ? b.shape[0] : b.shape[1];
+  if (m == 0 || n == 0) return;
+  Binder bind;
+  const uint32_t a_off = bind.Add(a, "matmul: a");
+  const uint32_t b_off = bind.Add(b, "matmul: b");
+  const uint32_t out_off = bind.Add(out, "matmul: out");
+  // Ascending constantID order: a dtype, b dtype, out dtype, orientation.
+  const uint32_t spec[4] = {DtypeCode(a.dtype), DtypeCode(b.dtype), DtypeCode(out.dtype),
+                            kBT ? 1u : 0u};
+  MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n), static_cast<uint32_t>(k),
+                 a_off, b_off, out_off};
+  Go("vt_matmul", bind, p, FlatGroupCount(m * n), spec, 4);
+}
+
+// cpu_ops.cpp:661-672 EmbeddingKernel. One output ELEMENT per invocation.
+// The id dtype (i32 vs i64) is a specialization constant rather than a
+// per-element branch; see the shader for why only the low 32 bits are read.
+void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
+  const int64_t t = ids.shape[0], h = table.shape[1];
+  if (t == 0 || h == 0) return;
+  VT_CHECK(ids.dtype == DType::kI32 || ids.dtype == DType::kI64,
+           "vulkan embedding: ids must be i32 or i64");
+  Binder bind;
+  const uint32_t table_off = bind.Add(table, "embedding: table");
+  const uint32_t ids_off = bind.Add(ids, "embedding: ids");
+  const uint32_t out_off = bind.Add(out, "embedding: out");
+  const uint32_t spec[3] = {DtypeCode(table.dtype), DtypeCode(out.dtype),
+                            ids.dtype == DType::kI64 ? 1u : 0u};
+  EmbeddingParams p{static_cast<uint32_t>(t), static_cast<uint32_t>(h), table_off, ids_off,
+                    out_off};
+  Go("vt_embedding", bind, p, FlatGroupCount(t * h), spec, 3);
+}
+
+// cpu_sample.cpp:40-56 GreedyArgmaxKernel. ONE INVOCATION PER ROW, because the
+// tie-break (strict `>`, so the first maximum wins) is part of the token-exact
+// contract and a tree reduction would have to carry the index and break ties
+// toward the lower one at every merge. Rows are few at decode; the vocabulary
+// scan is the slow axis and is deliberately left for a later change.
+void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  if (n == 0 || v == 0) return;
+  VT_CHECK(logits.dtype == DType::kF32, "vulkan greedy argmax: logits must be f32");
+  VT_CHECK(token_ids.dtype == DType::kI64, "vulkan greedy argmax: token_ids must be i64");
+  Binder bind;
+  const uint32_t logits_off = bind.AddU32Only(logits, "argmax: logits");
+  const uint32_t out_off = bind.AddU32Only(token_ids, "argmax: token_ids");
+  ArgmaxParams p{static_cast<uint32_t>(n), static_cast<uint32_t>(v), logits_off, out_off};
+  Go("vt_greedy_argmax", bind, p, FlatGroupCount(n));
+}
+
+// cpu_paged_attn.cpp:52-171 PagedAttentionKernel. ONE WORKGROUP per (query
+// token, query head), lanes splitting the head dimension; see the shader for why
+// the CPU's three passes become one online-softmax recurrence (its `probs` array
+// is one float per key in the window, which a shader cannot allocate).
+//
+// This is the only kernel in the backend with NO llama.cpp counterpart to port
+// from: its Vulkan backend has no paged KV anywhere. The block-table indirection
+// and windowing come from the CPU kernel above, the online-softmax skeleton from
+// flash_attn.comp's shape.
+void PagedAttentionKernel(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                          const Tensor& v_cache, const Tensor& block_table,
+                          const Tensor& seq_lens, const Tensor& query_start_loc,
+                          const PagedAttentionArgs& args) {
+  const int64_t num_reqs = seq_lens.shape[0];
+  const int64_t total_q = query.shape[0];
+  const int64_t hq = query.shape[1], d = query.shape[2];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t num_kv_heads = k_cache.shape[2];
+
+  // PER-CALL REFUSAL, not a silent regression. An fp8 KV cache stores 1-byte
+  // pages that must be dequantised as Dequant(fp8) * k_scale|v_scale before the
+  // f32 softmax (cpu_paged_attn.cpp:79-93). This shader reads f32/f16/bf16 only,
+  // so rather than throw -- which would REMOVE a capability the portable
+  // reference tier already provides -- it declines through the provider seam and
+  // forwards to the next provider down, which is exactly what GetOpFallback is
+  // for (op_provider.h:94-100: per-call refusal belongs in the kernel, because
+  // GetOp has no shape or dtype to inspect).
+  if (args.kv_cache_dtype != vt::Fp8KVCacheDataType::kAuto) {
+    auto next = reinterpret_cast<PagedAttentionFn>(
+        GetOpFallback(OpId::kPagedAttention, DeviceType::kVULKAN, kNativeProviderName));
+    next(q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
+    return;
+  }
+
+  if (total_q == 0 || hq == 0 || d == 0) return;
+  // The shader keeps its accumulator in VT_PA_ACC_MAX slots per lane, one per
+  // head-dim element the lane owns. Asserted rather than trusted: overflowing it
+  // would write past a local array.
+  VT_CHECK(d <= 8 * static_cast<int64_t>(kWorkgroupSize),
+           "vulkan paged attention: head dim " + std::to_string(d) +
+               " exceeds the per-lane accumulator (8 * workgroup)");
+  VT_CHECK(num_kv_heads > 0 && hq % num_kv_heads == 0,
+           "vulkan paged attention: query heads must be a multiple of kv heads");
+
+  Binder bind;
+  const uint32_t q_off = bind.Add(query, "paged_attn: query");
+  const uint32_t k_off = bind.Add(k_cache, "paged_attn: k_cache");
+  const uint32_t v_off = bind.Add(v_cache, "paged_attn: v_cache");
+  const uint32_t out_off = bind.Add(out, "paged_attn: out");
+  const uint32_t bt_off = bind.AddU32Only(block_table, "paged_attn: block_table");
+  const uint32_t sl_off = bind.AddU32Only(seq_lens, "paged_attn: seq_lens");
+  const uint32_t qsl_off = bind.AddU32Only(query_start_loc, "paged_attn: query_start_loc");
+
+  const int64_t wl = args.window_size.has_value() ? args.window_size->left : -1;
+  const int64_t wr = args.window_size.has_value() ? args.window_size->right : -1;
+
+  const uint32_t spec[4] = {DtypeCode(query.dtype), DtypeCode(k_cache.dtype),
+                            DtypeCode(v_cache.dtype), DtypeCode(out.dtype)};
+  PagedAttnParams p{static_cast<uint32_t>(total_q),
+                    static_cast<uint32_t>(hq),
+                    static_cast<uint32_t>(d),
+                    static_cast<uint32_t>(block_size),
+                    static_cast<uint32_t>(hq / num_kv_heads),
+                    static_cast<uint32_t>(num_reqs),
+                    args.causal ? 1u : 0u,
+                    static_cast<int32_t>(wl),
+                    static_cast<int32_t>(wr),
+                    static_cast<uint32_t>(k_cache.stride[0]),
+                    static_cast<uint32_t>(k_cache.stride[1]),
+                    static_cast<uint32_t>(k_cache.stride[2]),
+                    static_cast<uint32_t>(v_cache.stride[0]),
+                    static_cast<uint32_t>(v_cache.stride[1]),
+                    static_cast<uint32_t>(v_cache.stride[2]),
+                    static_cast<uint32_t>(block_table.stride[0]),
+                    static_cast<uint32_t>(block_table.stride[1]),
+                    q_off,
+                    k_off,
+                    v_off,
+                    out_off,
+                    bt_off,
+                    sl_off,
+                    qsl_off,
+                    args.scale,
+                    args.logits_soft_cap};
+  // One workgroup per (token, head) -- NOT FlatGroupCount, which divides by the
+  // workgroup size; here the whole workgroup cooperates on one output row.
+  Go("vt_paged_attn", bind, p, static_cast<uint32_t>(total_q * hq), spec, 4);
+}
+
+// cpu_cache.cpp:33-72 ReshapeAndCacheKernel. Pure BYTE MOVEMENT -- the CPU
+// kernel is two memcpys per token and converts nothing -- so the dtype selects
+// only the storage WIDTH to copy at, and the gate for it is bit-exactness.
+void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                           Tensor& v_cache, const Tensor& slot_mapping) {
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t n_elems = k_cache.shape[2] * k_cache.shape[3];  // one token's page
+  if (num_slots == 0 || n_elems == 0) return;
+  VT_CHECK(slot_mapping.dtype == DType::kI64,
+           "vulkan reshape_and_cache: slot_mapping must be i64");
+  VT_CHECK(k.dtype == k_cache.dtype && v.dtype == v_cache.dtype,
+           "vulkan reshape_and_cache: source and cache dtypes must match (this op "
+           "moves bytes and converts nothing)");
+
+  Binder bind;
+  const uint32_t k_off = bind.Add(k, "reshape_and_cache: k");
+  const uint32_t v_off = bind.Add(v, "reshape_and_cache: v");
+  const uint32_t kc_off = bind.Add(k_cache, "reshape_and_cache: k_cache");
+  const uint32_t vc_off = bind.Add(v_cache, "reshape_and_cache: v_cache");
+  const uint32_t sm_off = bind.AddU32Only(slot_mapping, "reshape_and_cache: slot_mapping");
+
+  const uint32_t spec[1] = {k.dtype == DType::kF32 ? 0u : 1u};
+  ReshapeAndCacheParams p{static_cast<uint32_t>(num_slots),
+                          static_cast<uint32_t>(n_elems),
+                          static_cast<uint32_t>(block_size),
+                          static_cast<uint32_t>(k_cache.stride[0]),
+                          static_cast<uint32_t>(k_cache.stride[1]),
+                          static_cast<uint32_t>(v_cache.stride[0]),
+                          static_cast<uint32_t>(v_cache.stride[1]),
+                          static_cast<uint32_t>(k.stride[0]),
+                          static_cast<uint32_t>(v.stride[0]),
+                          k_off,
+                          v_off,
+                          kc_off,
+                          vc_off,
+                          sm_off};
+  Go("vt_reshape_and_cache", bind, p, FlatGroupCount(num_slots * n_elems), spec, 1);
+}
+
+// vt::RopeFromCache — the APPLY half of vLLM's rotary split.
+// Upstream: rotary_embedding/base.py:160-252, common.py:145-185 @ e24d1b24fe96;
+// our reference is cpu_ops.cpp RopeFromCacheKernel (:751-802).
+//
+// vLLM's RotaryEmbedding builds cos_sin_cache once in __init__ and the forward
+// only applies it, so kRopeCosSinCache (the table, built in double) stays on the
+// portable tier and this native kernel is the per-token apply. See the shader for
+// why that boundary is also the right one numerically.
+void RopeFromCacheKernel(Queue& queue, Tensor& qs, Tensor* ks, const Tensor& positions,
+                         const Tensor& cache, const RopeArgs& args) {
+  // MROPE DECLINES rather than throws. Multimodal RoPE selects a different
+  // position AXIS per pair (cpu_ops.cpp:769-771 via MropeAxisForPair, mirroring
+  // vLLM mrope.py), which this shader does not implement -- and throwing would
+  // REMOVE a capability the portable reference tier already provides. Forwarded
+  // through the provider seam, the same per-call refusal fp8 KV uses.
+  if (positions.rank == 2) {
+    auto next = reinterpret_cast<RopeFromCacheFn>(
+        GetOpFallback(OpId::kRopeFromCache, DeviceType::kVULKAN, kNativeProviderName));
+    next(queue, qs, ks, positions, cache, args);
+    return;
+  }
+
+  const int64_t tokens = qs.shape[0];
+  const int64_t hq = qs.shape[1];
+  const int64_t hk = ks == nullptr ? 0 : ks->shape[1];
+  const int64_t half = args.rotary_dim / 2;
+  if (tokens == 0 || half == 0 || (hq + hk) == 0) return;
+  VT_CHECK(positions.dtype == DType::kI32 || positions.dtype == DType::kI64,
+           "vulkan rope_from_cache: positions must be i32 or i64");
+
+  Binder bind;
+  const uint32_t q_off = bind.Add(qs, "rope_from_cache: q");
+  // Bindings 2/3 are declared by the shader whether or not k exists, and a
+  // descriptor a shader statically uses must be valid even on the path that never
+  // reads it -- so with hk == 0 they alias q and are dead. Same arrangement the
+  // rmsnorm kernel already uses for its optional residual.
+  const uint32_t k_off = ks != nullptr ? bind.Add(*ks, "rope_from_cache: k")
+                                       : bind.Add(qs, "rope_from_cache: q");
+  const uint32_t c_off = bind.Add(cache, "rope_from_cache: cos_sin_cache");
+  const uint32_t p_off = bind.AddU32Only(positions, "rope_from_cache: positions");
+
+  const uint32_t spec[5] = {DtypeCode(qs.dtype),
+                            ks != nullptr ? DtypeCode(ks->dtype) : DtypeCode(qs.dtype),
+                            DtypeCode(cache.dtype),
+                            args.is_neox_style ? 1u : 0u,
+                            positions.dtype == DType::kI64 ? 1u : 0u};
+  RopeFromCacheParams p{static_cast<uint32_t>(tokens),
+                        static_cast<uint32_t>(half),
+                        static_cast<uint32_t>(args.rotary_dim),
+                        static_cast<uint32_t>(hq),
+                        static_cast<uint32_t>(hk),
+                        static_cast<uint32_t>(qs.stride[0]),
+                        static_cast<uint32_t>(qs.stride[1]),
+                        static_cast<uint32_t>(ks != nullptr ? ks->stride[0] : 0),
+                        static_cast<uint32_t>(ks != nullptr ? ks->stride[1] : 0),
+                        q_off,
+                        k_off,
+                        c_off,
+                        p_off};
+  Go("vt_rope_from_cache", bind, p, FlatGroupCount(tokens * half * (hq + hk)), spec, 5);
+}
+
+// cpu_ops.cpp:2162-2176 QkvSplitKernel. Mirrors vLLM's QKVParallelLinear output
+// split (qkv.split([q_size, kv_size, kv_size], dim=-1)); the three widths are
+// independent because under GQA k and v are narrower than q. One invocation per
+// OUTPUT element across all three destinations, so this is one dispatch.
+void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
+  const int64_t t = qkv.shape[0];
+  if (t == 0) return;
+  const int64_t q_dim = q_out.Numel() / t;
+  const int64_t k_dim = k_out.Numel() / t;
+  const int64_t v_dim = v_out.Numel() / t;
+  VT_CHECK(q_out.dtype == k_out.dtype && k_out.dtype == v_out.dtype,
+           "vulkan qkv_split: the three destinations must share a dtype");
+  Binder bind;
+  const uint32_t src_off = bind.Add(qkv, "qkv_split: qkv");
+  const uint32_t q_off = bind.Add(q_out, "qkv_split: q");
+  const uint32_t k_off = bind.Add(k_out, "qkv_split: k");
+  const uint32_t v_off = bind.Add(v_out, "qkv_split: v");
+  const uint32_t spec[2] = {DtypeCode(qkv.dtype), DtypeCode(q_out.dtype)};
+  QkvSplitParams p{static_cast<uint32_t>(t),     static_cast<uint32_t>(q_dim),
+                   static_cast<uint32_t>(k_dim), static_cast<uint32_t>(v_dim),
+                   src_off,                      q_off,
+                   k_off,                        v_off};
+  Go("vt_qkv_split", bind, p, FlatGroupCount(t * (q_dim + k_dim + v_dim)), spec, 2);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -306,6 +644,22 @@ struct Registrar {
     if (!VulkanContext::Available()) return;
     // static_cast against the ops.h aliases ties every kernel signature to the
     // registration contract at COMPILE time (the cpu_ops.cpp idiom).
+    RegisterOp(OpId::kQkvSplit, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
+    RegisterOp(OpId::kRopeFromCache, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<RopeFromCacheFn>(&RopeFromCacheKernel)));
+    RegisterOp(OpId::kReshapeAndCache, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
+    RegisterOp(OpId::kPagedAttention, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<PagedAttentionFn>(&PagedAttentionKernel)));
+    RegisterOp(OpId::kEmbedding, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
+    RegisterOp(OpId::kGreedyArgmax, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<GreedyArgmaxFn>(&GreedyArgmaxKernel)));
+    RegisterOp(OpId::kMatmul, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulGeneric<false>)));
+    RegisterOp(OpId::kMatmulBT, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulGeneric<true>)));
     RegisterOp(OpId::kAdd, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<AddFn>(&AddKernel)));
     RegisterOp(OpId::kRelu, DeviceType::kVULKAN,

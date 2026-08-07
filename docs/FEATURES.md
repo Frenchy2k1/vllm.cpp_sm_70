@@ -208,6 +208,14 @@ CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 is a correctness venue only: CUTLASS has no FP4 tensor-core
 kernels for it.
 
+Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact, 6/6
+prompts / 96/96 tokens vs the vLLM 0.25.0 oracle, all nine of that model's ops
+dispatched natively with **zero provider declines**, on llvmpipe (no Vulkan GPU is
+reachable here). Still partial: **16 native kernels**, the other 71 ops fall back
+to the portable CPU tier, and quant/MoE/MLA/linear-attention have none at all (MLA
+is refused at the platform seam, not mis-routed). **No speed number is owed.**
+Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
+
 ## Serving, API and operations
 
 | Feature | vllm.cpp | vLLM | SGLang | llama.cpp |
