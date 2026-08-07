@@ -41772,3 +41772,31 @@ because a genuinely new row exists.
   disk** via `PYTHONPATH=~/venvs/vllm-oracle/lib/python3.12/site-packages` into the
   system python. The oracle venv was deliberately NOT pip-installed into — it is
   the parity oracle and was expensive to repair.
+
+- **2026-08-07 (correction)** — **`VK-E`: the vllm.cpp Vulkan arm is GPU-BOUND, not
+  CPU-bound. My previous entry's attribution was WRONG.**
+
+  Measured mid-run (`vllm-bench`, Qwen3-0.6B, 1 prompt / 32 in / 8 out, 26 min
+  elapsed): **process CPU 1.6 %, GPU utilisation 96 %**, and `nvidia-smi
+  --query-compute-apps` shows our PID as the ONLY GPU compute app at 2,066 MiB. A
+  run pinned on the portable CPU reference tier would show the opposite — CPU
+  saturated, GPU idle.
+
+  A second assumption also failed: the weights are **BF16** (all 311 tensors), so
+  the coopmat dtype precondition is satisfiable; this is not "f16 model, coopmat
+  ineligible".
+
+  **The real cause is UNMEASURED and deliberately not replaced with another
+  guess.** Candidates in test order: (1) **per-op synchronous dispatch** —
+  `Dispatch` records, submits and fence-waits for EVERY op, the W0 skeleton's
+  documented "correct, not fast" design, and `VK-A2` (async submission +
+  command-buffer reuse) was scoped as "the single biggest speed lever" and NEVER
+  BUILT; (2) the naive scalar GEMM at call sites where coopmat's K%16 or dtype
+  precondition fails; (3) paged attention's sequential key walk.
+  `GetReferenceTierHits()` plus the provider counters separate (1)-(3), and
+  `VT_VULKAN_COOPMAT=0` isolates (2).
+
+  **Lesson: "we know why it is slow" is a claim like any other.** The 16/87
+  op-coverage figure made the CPU-tier story feel obvious enough to write into the
+  record without checking `top`, and it was wrong. The op count says what COULD be
+  slow, not what IS.

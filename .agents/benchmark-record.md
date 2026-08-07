@@ -15081,3 +15081,45 @@ comparison becomes meaningful when native coverage closes — the progress metri
 `vt::GetReferenceTierHits()` reaching 0, and the ops that matter for this model are
 the RoPE table build, the sampler tail, and the remaining norm/glue set.
 >>>>>>> 814230a0 (bench(vulkan): VK-E unblocked with identical weights; ours quoted as NO RATIO)
+
+#### CORRECTION (2026-08-07, same session): the vllm.cpp Vulkan arm is GPU-BOUND, not CPU-bound
+
+The entry above attributes vllm.cpp's slowness to "our HOST FALLBACK wearing a
+Vulkan label" — 71 of 87 ops on the portable CPU reference tier. **That
+attribution was asserted, not measured, and the measurement contradicts it.**
+
+Taken while the run was in flight (`vllm-bench`, Qwen3-0.6B, 1 prompt / 32 in /
+8 out, 26 min elapsed):
+
+| signal | value |
+|---|---|
+| process CPU | **1.6 %** |
+| GPU utilisation | **96 %** |
+| GPU compute apps | `495202 ./build-vk/examples/vllm-bench, 2066 MiB` — the ONLY one |
+
+A run pinned on the CPU reference tier would show the opposite: CPU saturated, GPU
+idle. This one is GPU-resident and GPU-busy, so the dominant cost is on the DEVICE.
+
+A second assumption also fails: the weights are **BF16** (all 311 tensors), so the
+coopmat tactic's dtype precondition is satisfiable here — this is not a case of
+"f16 model, coopmat ineligible".
+
+**The true attribution is UNMEASURED and is deliberately not replaced with another
+guess.** The candidates, in the order worth testing:
+1. **Per-op synchronous dispatch.** `VulkanContext::Dispatch` records, submits and
+   fence-waits for EVERY op (the W0 skeleton's documented design, "correct, not
+   fast"). `VK-A2` — async submission plus command-buffer reuse — was scoped as
+   "the single biggest speed lever" and never built. Thousands of round trips per
+   token would look exactly like this.
+2. **The naive GEMM where coopmat does not apply.** The tactic needs K % 16 == 0
+   and both operands bf16; activations may be f32 at some call sites, silently
+   falling back to the untiled scalar kernel measured at 52 GFLOP/s on Thor.
+3. **Paged attention**, which walks keys sequentially with a workgroup reduction
+   per key.
+
+`GetReferenceTierHits()` and the per-op provider counters distinguish (1)–(3)
+directly, and a `VT_VULKAN_COOPMAT=0` A/B isolates (2). None of that was run here.
+
+**Lesson, recorded because it recurs:** "we know why it is slow" is a claim like
+any other. The op-coverage number (16/87) made the CPU-tier story feel obvious
+enough to write down without checking `top`, and it was wrong.
