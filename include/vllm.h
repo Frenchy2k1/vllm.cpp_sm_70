@@ -102,8 +102,15 @@ extern "C" {
  * points on such a handle report VLLM_ERR_INVALID_ARGUMENT with an actionable
  * message instead of serving, and vllm_transcribe on a TEXT handle does the
  * same. A pre-v11 caller that never loads a Parakeet directory is
- * byte-identical. */
-#define VLLM_ABI_VERSION 12
+ * byte-identical.
+ * v13: vllm_complete_tokens — blocking completion from a PRE-TOKENIZED prompt
+ * (vLLM's TokensPrompt), returning the generated token ids (and optionally the
+ * detokenized vllm_completion). The entry point for embedders that manage
+ * their own tokenization and for token-exact gates/benchmarks that compare
+ * whole token streams against a reference (the Kimi-Linear paged-runner fold
+ * battery, ARCH-ONE-SURFACE ROW 7, is the first consumer). Purely additive —
+ * no struct changed. */
+#define VLLM_ABI_VERSION 13
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -369,6 +376,27 @@ VLLM_API void vllm_engine_free(vllm_engine* engine);
 VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
                                    const vllm_sampling_params* params,
                                    vllm_completion* out);
+
+/* ── Pre-tokenized completion (ABI v13) ───────────────────────────────────────
+ * Run a single blocking completion for a PRE-TOKENIZED prompt (vLLM's
+ * TokensPrompt): tokenization is skipped and generation starts from
+ * `prompt_tokens` directly.
+ *   - prompt_tokens / n_prompt_tokens: the prompt token ids, BORROWED for the
+ *     duration of the call. n_prompt_tokens must be > 0.
+ *   - out_tokens / max_out_tokens: caller-owned buffer that receives the
+ *     GENERATED token ids; *n_out_tokens is set to the number written
+ *     (<= max_out_tokens). Generation length is bounded by params->max_tokens
+ *     as usual — a smaller buffer only truncates what is REPORTED, never the
+ *     generation. out_tokens may be NULL iff max_out_tokens == 0.
+ *   - out: OPTIONAL (may be NULL). When non-NULL it is filled exactly like
+ *     vllm_complete (detokenized text owned by the caller, finish_reason,
+ *     token counts).
+ * Returns VLLM_OK on success; a VLLM_ERR_* code with vllm_last_error() set on
+ * failure (*n_out_tokens zeroed, out zeroed when supplied). */
+VLLM_API vllm_status vllm_complete_tokens(
+    vllm_engine* engine, const int32_t* prompt_tokens, int32_t n_prompt_tokens,
+    const vllm_sampling_params* params, int32_t* out_tokens,
+    int32_t max_out_tokens, int32_t* n_out_tokens, vllm_completion* out);
 
 /* ── Streaming completion (M3.5 Task 2) ───────────────────────────────────────
  * vllm_token_callback: invoked once per engine-step delta for the streaming

@@ -42333,3 +42333,38 @@ the GB10 speed recipe must move to the seam. (3) Server-arm numeric deltas
 disclosed above. (4) The CPU host-f32 GGUF arm is off the ABI (keep-quant is
 the gated arm). (5) /v1/videos job/status/content stay VideoJobStore-served
 (unchanged); no async-job C-ABI shape yet.
+
+## 2026-08-08 — ROW 7: Kimi-Linear FOLDED onto the shared paged runner (engine==CLI 128/128; golden 122/128 profile; speed residual named)
+<!-- state: 2026-08-08T05:00 -->
+`row/KIMI-RUNNER-FOLD` (#122), ARCH-ONE-SURFACE ROW 7 / kimi-linear.md §20.3→§21, task #281.
+The full digits and file:line map live in spec §21; the binding facts:
+
+- **B1**: `LoadHfConfig` synthesizes `layer_types` + GDN geometry from `linear_attn_config`
+  (additive; `runner.cpp` untouched) — the §20.3 runner ABORT is gone.
+- **B2/B3**: `KimiLinearModel::ForwardPaged` — KDA over the paged `gdn_state` group
+  (`KdaChunkPrefill` prefill / `KdaGatedDeltaRule` decode, conv in vLLM's chunk(3) layout);
+  NoPE-MLA latent through `ConcatAndCacheMla` with **`mla::ForwardMlaAttentionBlock` DEFAULT-ON**
+  (GB10-ruled: that arm reproduces the golden's 122/128 near-tie profile EXACTLY; the diagnostic
+  f64-island arm measured 111/128 = the §19 GPU M-tiling near-tie class, not a paging bug).
+- **B4**: engine loads the bf16-resident tower (`stage_on_load`, §13 recipe);
+  `vllm_complete_tokens` (ABI v13 after the #123 video-v12 rebase); `kimi_linear_gen` = thin `vllm.h` client; allowlist kimi row removed (merged ratchet 8 with #123's two minimax removals);
+  CLI reference leg preserved as env-gated `test_kimi_linear_fold_gate`.
+- **Gate A**: engine==CLI **128/128 BYTE-IDENTICAL** (p7 got-strings equal); vs golden **122/128**
+  (>=122 bound MET). SACRED re-run post-fold: 35B 315/315, 27B 235/235. CPU: paged suite 8/8·206
+  (logits byte-equal, mutation-verified ×4), ctest 351/351.
+- **The async-mirror catch**: round-1 engine leg diverged 9/128 — ForwardPaged embedded the host
+  ids the DEFAULT-ON async device mirror leaves stale; fixed by honoring `device_token_ids`
+  (RED-first CPU pin). ★ AUDIT RESIDUAL: models outside qwen3_5/kimi still ignore this field —
+  any of them served on GB10 through the async engine would hit the same divergence.
+- **SPEED (honest)**: server stream **19.0 tok/s wall** (48 tok incl. prefill+warmup — the
+  production-surface anchor) vs CLI 18.93 (reproduced) vs vLLM ~21 → ~0.90×, >= vLLM NOT met.
+  The example's two-length diffs (16.9 N=64; 9.8-11.5 N=16) ran the long leg first and cold, so
+  warmup pollutes the subtraction — measurement caveat recorded. Residual levers: device KDA decay
+  gate + beta (per-step host islands), grouped MoE via the shared seam, decode graph.
+- **Tokenizer**: Kimi ships tiktoken-only; converted to tokenizer.json via transformers
+  TikTokenConverter (round-trip verified) → `~/kimi-linear-engine-dir` for the engine/server legs;
+  a shippable-converter residual is noted.
+- **vLLM same-session re-measure: ABORTED BY BOX REBOOT** (util 0.82 + torch.compile/graph
+  capture pushed the unified pool below the floor at 00:25 — reproduces the §19 measured
+  box-safety violation; NOT retried per the safety mandate). Denominator stays the #111
+  recorded ~21 floor. Box recovered clean; worker auto-restored (--restart=always).

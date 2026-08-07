@@ -45,16 +45,20 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <numeric>
 #include <vector>
 
+#include "vllm/model_executor/models/deepseek_v2.h"        // MlaBatchSplit (ROW 7 fold)
 #include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::{Dev,DBuf,MakeTensor}
 #include "vllm/model_executor/models/device_pool.h"        // Pool()
 #include "vllm/model_executor/models/kimi_kda.h"
+#include "vllm/model_executor/models/mla_attention.h"      // mla::ForwardMlaAttentionBlock
 #include "vllm/platforms/interface.h"                       // platforms::GetPlatform (is_cpu)
+#include "vllm/v1/attention/backends/gdn_attn.h"           // GDNAttentionMetadata
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -1629,6 +1633,728 @@ DBuf DeviceForwardBodyBf16Incremental(const Dev& d, const KimiLinearWeights& wei
   return logits;
 }
 
+// ═══ ROW 7 — THE SHARED-PAGED-RUNNER FOLD (kimi-linear.md §20.3) ════════════════
+// The born-on-the-runner PRODUCTION forward: byte-for-byte the
+// DeviceForwardBodyBf16Incremental per-token compute with the single-sequence
+// host KimiDecodeCache replaced by the runner's OWN paged state groups —
+//   * KDA conv+recurrent state in the MambaSpec `gdn_state` group, keyed by
+//     `gdn_meta.non_spec_state_indices_tensor` (mirror vLLM
+//     kimi_gdn_linear_attn.py:296-440 `_forward`: `constant_caches` =
+//     (conv_state, recurrent_state) indexed by non_spec_state_indices_tensor;
+//     prefill = chunk_kda_with_fused_gate, decode = fused_recurrent_kda);
+//   * NoPE-MLA latent-KV in the paged `attn_kv` MLA group, written through
+//     vt::ConcatAndCacheMla at `attn_meta.slot_mapping` (the MLAAttentionSpec
+//     page: ONE 576-wide latent row per token, mla_attention.py:553-620 order).
+// Batches are decode-first (the GDN builder's segmentation): nd single-token
+// decodes then np prefills. NOT GdnBlockPaged — KDA's per-K-channel decay
+// g[T,Hv,Dk] needs the KDA ops (vt::KdaChunkPrefill / vt::KdaGatedDeltaRule);
+// the shared per-head GDN kernels stay untouched (qwen3_5 byte-identical).
+
+// VT_KIMI_PAGED_KDA_CHUNK (default ON) — process fresh prefill requests with the
+// CHUNKED KDA kernel family (vt::KdaChunkPrefill — vLLM's prompt path and the
+// §19 Gate-A-winning config); '0' falls back to the recurrence for A/B. Decode
+// and continuing (has_initial_state) prefills always use the recurrence, exactly
+// as vLLM (decode: fused_recurrent_kda; our chunk op takes a fresh zero state).
+bool PagedKdaChunkEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_KIMI_PAGED_KDA_CHUNK");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+// VT_KIMI_PAGED_MLA_FA2 (default ON — GB10-RULED 2026-08-07): route the 7
+// NoPE-MLA layers through mla::ForwardMlaAttentionBlock — vLLM's ACTUAL
+// absorbed-MQA decode / FA2 prefill over the paged latent cache (§20.3c),
+// identity RoPE, scale qk^-0.5. MEASURED on the real 48.9B (§21): this arm
+// reproduces the golden's near-tie profile EXACTLY — 122/128 with p0-p6 16/16
+// and p7 10/16, the same 122/128 the CLI reference and the §12/§19 batteries
+// carry — so per the parity-enablers-ship-as-defaults policy it IS the
+// production arm. '0' selects the diagnostic EXACT arm (the f64 softmax island
+// over kv_b-up-projected paged rows — byte-comparable to the CLI on CPU, the
+// fold-identity vehicle): on GB10 it measured 111/128, the §19-documented
+// GPU M-dimension-tiling near-tie perturbation (re-up-projecting the whole
+// prefix at M=S vs the CLI's M=T append-time GEMM flips near-tie tokens:
+// p7 flips TOWARD golden 16/16, p4 one flip that recovers, p2's token-1 flip
+// cascades to 0/16) — a numeric-regime difference, not a paging bug (the CPU
+// gate is byte-exact and FA2 shares every projection/cache write).
+// NOT memoized (a cheap getenv per layer): the CPU gates pin the arm per test
+// case, and a per-process latch would weld the whole binary to one arm.
+bool PagedMlaFa2() {
+  const char* e = std::getenv("VT_KIMI_PAGED_MLA_FA2");
+  return e == nullptr || e[0] != '0';
+}
+
+// Contiguous row-range view over a rank-N device tensor: rows [start, start+len).
+inline Tensor RowsView(const Tensor& t, int64_t start, int64_t len,
+                       const std::vector<int64_t>& shape) {
+  VT_CHECK(!shape.empty() && shape[0] == len,
+           "kimi paged: RowsView shape[0] must equal len");
+  int64_t row = 1;
+  for (int i = 1; i < t.rank; ++i) row *= t.shape[i];
+  return MakeTensor(static_cast<char*>(t.data) +
+                        static_cast<size_t>(start * row) * vt::SizeOf(t.dtype),
+                    t.dtype, t.device, shape);
+}
+
+// The decode-first non-spec segmentation the GDN builder emits, validated for
+// the Kimi paged forward (no spec rows — this checkpoint has no MTP head).
+struct KimiPagedSeg {
+  int nd = 0, np = 0;
+  int64_t nd_tok = 0, np_tok = 0;
+  const std::vector<int32_t>* sidx = nullptr;  // per-request GDN state slots
+  const std::vector<int32_t>* qsl = nullptr;   // [nreq+1] cumulative offsets
+  const std::vector<uint8_t>* his = nullptr;   // per-request has_initial (np>0)
+};
+KimiPagedSeg KimiSegment(const v1::GDNAttentionMetadata& gm, int64_t T) {
+  KimiPagedSeg s;
+  VT_CHECK(gm.num_spec_decodes == 0 && gm.num_spec_decode_tokens == 0,
+           "kimi paged: spec-decode rows are not expressible (the 48B-Instruct "
+           "checkpoint has no MTP head; num_nextn_predict_layers=0)");
+  s.nd = gm.num_decodes;
+  s.np = gm.num_prefills;
+  s.nd_tok = gm.num_decode_tokens;
+  s.np_tok = gm.num_prefill_tokens;
+  VT_CHECK(s.nd_tok + s.np_tok == T, "kimi paged: decode+prefill tokens != T");
+  VT_CHECK(s.nd_tok == s.nd, "kimi paged: decode segment must be 1 token/request");
+  VT_CHECK(gm.non_spec_state_indices_tensor.has_value() &&
+               gm.non_spec_query_start_loc.has_value(),
+           "kimi paged: GDN metadata is missing state indices / query offsets");
+  s.sidx = &*gm.non_spec_state_indices_tensor;
+  s.qsl = &*gm.non_spec_query_start_loc;
+  VT_CHECK(static_cast<int64_t>(s.sidx->size()) >= s.nd + s.np,
+           "kimi paged: state index vector shorter than the batch");
+  if (s.np > 0) {
+    VT_CHECK(gm.has_initial_state.has_value() &&
+                 static_cast<int64_t>(gm.has_initial_state->size()) >= s.nd + s.np,
+             "kimi paged: prefill batch is missing has_initial_state");
+    s.his = &*gm.has_initial_state;
+  }
+  return s;
+}
+
+// KDA layer over the PAGED conv+recurrent state (the paged form of
+// KdaLayerDeviceBf16Inc). The projection/conv/L2/gate/gated-norm op sequence is
+// byte-identical; only the state residency changes: conv taps + recurrent state
+// are gathered from / scattered to the runner's `gdn_state` group rows named by
+// the per-request state slots. Layout of one conv row: [q taps | k taps | v taps]
+// each [proj, K-1] — vLLM's `conv_state.chunk(3)` (kimi_gdn_linear_attn.py:331).
+DBuf KdaLayerPagedBf16(const Dev& d, const KdaResidentWeights& w, const Tensor& dh,
+                       const KimiLinearParams& p, int64_t T, const KimiPagedSeg& seg,
+                       const GdnStateCache& state) {
+  const int64_t H = p.hidden_size;
+  const int64_t nh = p.kda_num_heads;
+  const int64_t hd = p.kda_head_dim;
+  const int64_t proj = nh * hd;
+  const int64_t K = p.kda_short_conv_kernel_size;
+  const int64_t conv_dim = 3 * proj;
+  const int64_t nreq = seg.nd + seg.np;
+  const float scale = static_cast<float>(std::pow(static_cast<double>(hd), -0.5));
+
+  VT_CHECK(state.conv_state.shape[1] == conv_dim &&
+               state.conv_state.shape[2] == K - 1 &&
+               state.ssm_state.shape[1] == nh && state.ssm_state.shape[2] == hd &&
+               state.ssm_state.shape[3] == hd,
+           "kimi paged: runner GDN state geometry disagrees with linear_attn_config");
+
+  DBuf rq(d, DType::kF32, {T, proj});
+  GemmBf16(d, rq.t(), dh, w.q_proj, proj, H);
+  DBuf rk(d, DType::kF32, {T, proj});
+  GemmBf16(d, rk.t(), dh, w.k_proj, proj, H);
+  DBuf rv(d, DType::kF32, {T, proj});
+  GemmBf16(d, rv.t(), dh, w.v_proj, proj, H);
+
+  // ── conv (3 separate q/k/v short convs over the paged conv row) ──
+  DBuf didx(d, DType::kI32, {nreq}, seg.sidx->data());
+  DBuf dcs(d, DType::kF32, {nreq, conv_dim, K - 1});
+  vt::GdnStateGather(d.q, dcs.t(), state.conv_state, didx.t());
+  const size_t sec_bytes = static_cast<size_t>(proj) * (K - 1) * sizeof(float);
+  const size_t row_bytes = static_cast<size_t>(conv_dim) * (K - 1) * sizeof(float);
+  auto section_out = [&](int64_t sec) {
+    DBuf s(d, DType::kF32, {nreq, proj, K - 1});
+    for (int64_t r = 0; r < nreq; ++r)
+      d.b.Copy(d.q, static_cast<char*>(s.ptr()) + static_cast<size_t>(r) * sec_bytes,
+               static_cast<char*>(dcs.ptr()) + static_cast<size_t>(r) * row_bytes +
+                   static_cast<size_t>(sec) * sec_bytes,
+               sec_bytes);
+    return s;
+  };
+  auto section_back = [&](DBuf& s, int64_t sec) {
+    for (int64_t r = 0; r < nreq; ++r)
+      d.b.Copy(d.q,
+               static_cast<char*>(dcs.ptr()) + static_cast<size_t>(r) * row_bytes +
+                   static_cast<size_t>(sec) * sec_bytes,
+               static_cast<char*>(s.ptr()) + static_cast<size_t>(r) * sec_bytes,
+               sec_bytes);
+  };
+  DBuf cs_q = section_out(0);
+  DBuf cs_k = section_out(1);
+  DBuf cs_v = section_out(2);
+
+  DBuf qc(d, DType::kF32, {T, proj});
+  DBuf kc(d, DType::kF32, {T, proj});
+  DBuf vc(d, DType::kF32, {T, proj});
+  if (seg.np > 0) {
+    // Any prefill: varlen conv over the whole non-spec stream (decodes lead,
+    // each a 1-token slice with has_initial=1) — qwen3_5.cpp's np>0 conv branch,
+    // with Kimi's three separate convs in place of the merged one.
+    std::vector<int32_t> his32(seg.his->begin(), seg.his->begin() + nreq);
+    DBuf dqsl(d, DType::kI32, {nreq + 1}, seg.qsl->data());
+    DBuf dhis(d, DType::kI32, {nreq}, his32.data());
+    vt::CausalConv1dFwd(d.q, qc.t(), rq.t(), WF32(d, w.q_conv, {proj, K}), nullptr,
+                        cs_q.t(), dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
+    vt::CausalConv1dFwd(d.q, kc.t(), rk.t(), WF32(d, w.k_conv, {proj, K}), nullptr,
+                        cs_k.t(), dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
+    vt::CausalConv1dFwd(d.q, vc.t(), rv.t(), WF32(d, w.v_conv, {proj, K}), nullptr,
+                        cs_v.t(), dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
+  } else {
+    // Pure decode: single-token conv step per sequence on the compact gathered
+    // rows (mamba causal_conv1d_update; numerically the same window sum as
+    // CausalConv1dFwd(T=1, has_initial=1) — the CLI ConvSiluInc form).
+    vt::CausalConv1dUpdate(d.q, qc.t(), rq.t(), WF32(d, w.q_conv, {proj, K}), nullptr,
+                           cs_q.t(), vt::CausalConv1dArgs{true});
+    vt::CausalConv1dUpdate(d.q, kc.t(), rk.t(), WF32(d, w.k_conv, {proj, K}), nullptr,
+                           cs_k.t(), vt::CausalConv1dArgs{true});
+    vt::CausalConv1dUpdate(d.q, vc.t(), rv.t(), WF32(d, w.v_conv, {proj, K}), nullptr,
+                           cs_v.t(), vt::CausalConv1dArgs{true});
+  }
+  section_back(cs_q, 0);
+  section_back(cs_k, 1);
+  section_back(cs_v, 2);
+  {
+    Tensor conv_cache = state.conv_state;
+    vt::GdnStateScatter(d.q, conv_cache, dcs.t(), didx.t());
+  }
+
+  // ── post-conv: q/k L2 norm + the low-rank decay/gate projections (== Inc) ──
+  DBuf qn(d, DType::kF32, {T, proj});
+  DBuf kn(d, DType::kF32, {T, proj});
+  {
+    Tensor qc2 = MakeTensor(qc.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    Tensor qn2 = MakeTensor(qn.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    Tensor kc2 = MakeTensor(kc.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    Tensor kn2 = MakeTensor(kn.ptr(), DType::kF32, d.q.device, {T * nh, hd});
+    vt::L2Norm(d.q, qn2, qc2, vt::L2NormArgs{1e-6f});
+    vt::L2Norm(d.q, kn2, kc2, vt::L2NormArgs{1e-6f});
+  }
+  DBuf braw(d, DType::kF32, {T, nh});
+  GemmBf16(d, braw.t(), dh, w.b_proj, nh, H);
+  DBuf fa(d, DType::kF32, {T, hd});
+  GemmBf16(d, fa.t(), dh, w.f_a_proj, hd, H);
+  DBuf g1(d, DType::kF32, {T, proj});
+  GemmBf16(d, g1.t(), fa.t(), w.f_b_proj, proj, hd);
+  DBuf ga(d, DType::kF32, {T, hd});
+  GemmBf16(d, ga.t(), dh, w.g_a_proj, hd, H);
+  DBuf g2(d, DType::kF32, {T, proj});
+  GemmBf16(d, g2.t(), ga.t(), w.g_b_proj, proj, hd);
+
+  // beta = sigmoid(b_proj) — host elementwise, exactly the Inc island's form.
+  std::vector<float> hbraw(static_cast<size_t>(T) * nh);
+  braw.Download(d, hbraw.data());
+  RoundHostBf16(hbraw);
+  std::vector<float> hbeta(hbraw.size());
+  for (size_t i = 0; i < hbeta.size(); ++i)
+    hbeta[i] = static_cast<float>(Sigmoid(hbraw[i]));
+  DBuf dbeta(d, DType::kF32, {T, nh}, hbeta.data());
+
+  // Raw per-channel gate projection, downloaded once; the recurrent segments
+  // compute the decay gate on host (kimi_kda::KdaDecayGate — the Inc island),
+  // the chunk segment hands the RAW g1 to the fused on-device gate.
+  std::vector<float> hg1(static_cast<size_t>(T) * proj);
+  g1.Download(d, hg1.data());
+  RoundHostBf16(hg1);
+
+  DBuf dcore(d, DType::kF32, {T, proj});
+
+  // ── decode segment [0, nd): batched T==1 recurrence over the paged state ──
+  if (seg.nd > 0) {
+    const int64_t ndt = seg.nd_tok;
+    DBuf dss(d, DType::kF32, {seg.nd, nh, hd, hd});
+    Tensor didx_dec = RowsView(didx.t(), 0, seg.nd, {seg.nd});
+    vt::GdnStateGather(d.q, dss.t(), state.ssm_state, didx_dec);
+    const std::vector<float> hg_dec(hg1.begin(),
+                                    hg1.begin() + static_cast<size_t>(ndt) * proj);
+    const std::vector<float> gch =
+        kimi_kda::KdaDecayGate(hg_dec, w.a_log, w.dt_bias, ndt, nh, hd);
+    DBuf dg(d, DType::kF32, {ndt, nh, hd}, gch.data());
+    std::vector<int32_t> qsl_dec(static_cast<size_t>(seg.nd) + 1);
+    for (int64_t i = 0; i <= seg.nd; ++i) qsl_dec[static_cast<size_t>(i)] =
+        static_cast<int32_t>(i);
+    DBuf dqsl(d, DType::kI32, {seg.nd + 1}, qsl_dec.data());
+    Tensor q3v = RowsView(qn.t(), 0, ndt, {ndt, nh, hd});
+    Tensor k3v = RowsView(kn.t(), 0, ndt, {ndt, nh, hd});
+    Tensor v3v = RowsView(vc.t(), 0, ndt, {ndt, nh, hd});
+    Tensor b2v = RowsView(dbeta.t(), 0, ndt, {ndt, nh});
+    Tensor o3v = RowsView(dcore.t(), 0, ndt, {ndt, nh, hd});
+    vt::KdaGatedDeltaRule(d.q, o3v, q3v, k3v, v3v, dg.t(), b2v, dss.t(), dqsl.t(),
+                          vt::GdnArgs{scale});
+    Tensor ssm_cache = state.ssm_state;
+    vt::GdnStateScatter(d.q, ssm_cache, dss.t(), didx_dec);
+  }
+
+  // ── prefill segment: per request — chunk (fresh) or recurrence (continuing) ──
+  for (int r = 0; r < seg.np; ++r) {
+    const int req = seg.nd + r;
+    const int64_t tok0 = (*seg.qsl)[static_cast<size_t>(req)];
+    const int64_t tok1 = (*seg.qsl)[static_cast<size_t>(req) + 1];
+    const int64_t Tr = tok1 - tok0;
+    if (Tr <= 0) continue;
+    const bool has_init = seg.his != nullptr && (*seg.his)[static_cast<size_t>(req)] != 0;
+    DBuf dss1(d, DType::kF32, {1, nh, hd, hd});
+    Tensor didx_r = RowsView(didx.t(), req, 1, {1});
+    const int32_t hi32[1] = {has_init ? 1 : 0};
+    DBuf dhi(d, DType::kI32, {1}, hi32);
+    Tensor dhi_t = dhi.t();
+    vt::GdnStateGather(d.q, dss1.t(), state.ssm_state, didx_r, &dhi_t);
+    const int32_t qsl1[2] = {0, static_cast<int32_t>(Tr)};
+    DBuf dqsl1(d, DType::kI32, {2}, qsl1);
+    Tensor q3v = RowsView(qn.t(), tok0, Tr, {Tr, nh, hd});
+    Tensor k3v = RowsView(kn.t(), tok0, Tr, {Tr, nh, hd});
+    Tensor v3v = RowsView(vc.t(), tok0, Tr, {Tr, nh, hd});
+    Tensor b2v = RowsView(dbeta.t(), tok0, Tr, {Tr, nh});
+    Tensor o3v = RowsView(dcore.t(), tok0, Tr, {Tr, nh, hd});
+    if (PagedKdaChunkEnabled() && !has_init && Tr > 1) {
+      // vLLM's PROMPT path: the chunk kernels fuse the gate from the RAW g1.
+      DBuf da_log(d, DType::kF32, {nh}, w.a_log.data());
+      DBuf ddt(d, DType::kF32, {static_cast<int64_t>(w.dt_bias.size())},
+               w.dt_bias.empty() ? nullptr : w.dt_bias.data());
+      Tensor gr3 = RowsView(g1.t(), tok0, Tr, {Tr, nh, hd});
+      vt::KdaChunkPrefill(d.q, o3v, q3v, k3v, v3v, gr3, b2v, da_log.t(), ddt.t(),
+                          dss1.t(), dqsl1.t(), vt::GdnArgs{scale});
+    } else {
+      const std::vector<float> hg_r(
+          hg1.begin() + static_cast<size_t>(tok0) * proj,
+          hg1.begin() + static_cast<size_t>(tok1) * proj);
+      const std::vector<float> gch =
+          kimi_kda::KdaDecayGate(hg_r, w.a_log, w.dt_bias, Tr, nh, hd);
+      DBuf dg(d, DType::kF32, {Tr, nh, hd}, gch.data());
+      vt::KdaGatedDeltaRule(d.q, o3v, q3v, k3v, v3v, dg.t(), b2v, dss1.t(),
+                            dqsl1.t(), vt::GdnArgs{scale});
+    }
+    Tensor ssm_cache = state.ssm_state;
+    vt::GdnStateScatter(d.q, ssm_cache, dss1.t(), didx_r);
+  }
+
+  // ── sigmoid-gated RMSNorm output + o_proj (== Inc) ──
+  DBuf dcn(d, DType::kF32, {T, proj});
+  {
+    Tensor x3 = MakeTensor(dcore.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor g3 = MakeTensor(g2.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    Tensor o3 = MakeTensor(dcn.ptr(), DType::kF32, d.q.device, {T, nh, hd});
+    vt::RmsNormGated(d.q, o3, x3, g3, WF32(d, w.o_norm, {hd}),
+                     vt::RmsNormGatedArgs{p.rms_norm_eps, /*sigmoid_gate=*/true});
+  }
+  DBuf out(d, DType::kF32, {T, H});
+  GemmBf16(d, out.t(), dcn.t(), w.o_proj, H, proj);
+  return out;
+}
+
+// ── the per-forward shared MLA step state (positions/slot_mapping/FA2 meta) ────
+struct KimiMlaStep {
+  std::vector<DBuf> owned;
+  Tensor positions;     // [T] i32 device
+  Tensor slot_mapping;  // [T] i64 device
+  // FA2 arm only:
+  mla::MlaBlockMetadata meta;
+  MlaBatchSplit split;
+  DBuf* rope_cache = nullptr;  // identity [rows, qr] bf16 (owned)
+  v1::TritonMLAImpl impl;
+};
+
+template <typename T>
+Tensor KimiUploadInto(const Dev& d, std::vector<DBuf>& owned, DType dt,
+                      const std::vector<int64_t>& shape, const T* host) {
+  owned.emplace_back(d, dt, shape, host);
+  return owned.back().t();
+}
+
+// Build the per-step MLA metadata (the Kimi-local, EAGER-only port of
+// deepseek_v2.cpp BuildMlaStep — `MLACommonMetadataBuilder.build`
+// mla_attention.py:1652-1830, non-DCP; no CUDA-graph constraints because the
+// Kimi paged forward is eager).
+void BuildKimiMlaStep(const Dev& d, const std::vector<int32_t>& positions,
+                      const v1::CommonAttentionMetadata& am,
+                      const KimiLinearParams& p, int64_t block_size, bool fa2,
+                      KimiMlaStep& s) {
+  const int64_t T = static_cast<int64_t>(positions.size());
+  s.positions = KimiUploadInto(d, s.owned, DType::kI32, {T}, positions.data());
+  s.slot_mapping =
+      KimiUploadInto(d, s.owned, DType::kI64, {T}, am.slot_mapping.data());
+  if (!fa2) return;
+
+  s.split = BuildMlaBatchSplit(am);
+  const MlaBatchSplit& sp = s.split;
+  const int64_t cols = am.block_table_num_cols;
+  s.meta.num_decode_tokens = sp.num_decode_tokens;
+  if (sp.num_decodes > 0) {
+    s.meta.decode.block_table = KimiUploadInto(
+        d, s.owned, DType::kI32, {sp.num_decodes, cols}, am.block_table_tensor.data());
+    s.meta.decode.seq_lens = KimiUploadInto(d, s.owned, DType::kI32,
+                                            {sp.num_decodes}, am.seq_lens.data());
+    s.meta.decode.max_seq_len = sp.decode_max_seq_len;
+  }
+  if (sp.num_prefills > 0) {
+    s.meta.prefill_cu_seqlens_q =
+        KimiUploadInto(d, s.owned, DType::kI32, {sp.num_prefills + 1},
+                       sp.prefill_cu_seqlens_q.data());
+    s.meta.prefill_block_table = KimiUploadInto(
+        d, s.owned, DType::kI32, {sp.num_prefills, cols},
+        am.block_table_tensor.data() +
+            static_cast<size_t>(sp.num_decodes) * static_cast<size_t>(cols));
+    s.meta.max_query_len = sp.prefill_max_query_len;
+    if (sp.num_prefills_with_context > 0) {
+      const int64_t workspace = mla::DetermineChunkedPrefillWorkspaceSize(
+          p.max_position_embeddings, am.num_reqs, block_size);
+      const mla::MlaChunkedContextMetadata cm = mla::BuildMlaChunkedContext(
+          sp.prefill_context_lens, sp.prefill_cu_seqlens_q, workspace, block_size);
+      s.meta.prefill_tokens_with_context = cm.prefill_tokens_with_context;
+      s.meta.chunk_workspace_tokens = workspace;
+      const int64_t np = cm.num_prefills;
+      const int32_t row = std::max<int32_t>(cm.max_token_num_over_chunk, 1);
+      for (int32_t i = 0; i < cm.num_chunks; ++i) {
+        mla::MlaChunkDeviceMetadata cd;
+        cd.cu_seq_lens = KimiUploadInto(
+            d, s.owned, DType::kI32, {np + 1},
+            cm.cu_seq_lens.data() + static_cast<size_t>(i) * (np + 1));
+        cd.starts = KimiUploadInto(d, s.owned, DType::kI32, {np},
+                                   cm.starts.data() + static_cast<size_t>(i) * np);
+        cd.token_to_seq =
+            KimiUploadInto(d, s.owned, DType::kI32, {row},
+                           cm.token_to_seq.data() + static_cast<size_t>(i) * row);
+        cd.total_tokens = cm.chunk_total_token[static_cast<size_t>(i)];
+        cd.max_seq_len = cm.max_seq_lens[static_cast<size_t>(i)];
+        s.meta.chunks.push_back(cd);
+      }
+    }
+  }
+}
+
+// NoPE-MLA layer over the PAGED latent cache — the EXACT-island arm (default;
+// the fold-identity vehicle). Projections + kv_a_layernorm + the cache write are
+// on-device; the attention core re-derives each request's per-head K/V from the
+// paged 576-wide latent rows (kv_b up-projection — the SAME GemmBf16 the CLI ran
+// at append time; the cache stores bf16 exactly as vLLM does) and runs the SAME
+// f64 causal-softmax island as MlaSoftmaxIslandInc.
+DBuf MlaLayerPagedExact(const Dev& d, const MlaResidentWeights& w, const Tensor& dh,
+                        const KimiLinearParams& p, int64_t T,
+                        const v1::CommonAttentionMetadata& am,
+                        const PagedKvCache& kv, const KimiMlaStep& step) {
+  const int64_t H = p.hidden_size;
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim;
+  const int64_t qr = p.qk_rope_head_dim;
+  const int64_t qk = qn + qr;
+  const int64_t vh = p.v_head_dim;
+  const int64_t L = p.kv_lora_rank;
+  const int64_t kvw = nah * (qn + vh);
+  const int64_t head = L + qr;
+  VT_CHECK(kv.num_kv_heads == 1 && kv.head_size == head,
+           "kimi paged: the MLA cache must be 1-head, kv_lora+qk_rope wide "
+           "(MLAAttentionSpec)");
+
+  DBuf dq(d, DType::kF32, {T, nah * qk});
+  GemmBf16(d, dq.t(), dh, w.q_proj, nah * qk, H);
+  DBuf dlat(d, DType::kF32, {T, L + qr});
+  GemmBf16(d, dlat.t(), dh, w.kv_a_proj_with_mqa, L + qr, H);
+  DBuf dkvc(d, DType::kF32, {T, L});
+  DBuf dkpe(d, DType::kF32, {T, qr});
+  {
+    const size_t rl = static_cast<size_t>(L + qr) * sizeof(float);
+    const char* src = static_cast<const char*>(dlat.ptr());
+    char* pc = static_cast<char*>(dkvc.ptr());
+    char* pp = static_cast<char*>(dkpe.ptr());
+    for (int64_t t = 0; t < T; ++t) {
+      d.b.Copy(d.q, pc + static_cast<size_t>(t) * L * sizeof(float),
+               src + static_cast<size_t>(t) * rl,
+               static_cast<size_t>(L) * sizeof(float));
+      d.b.Copy(d.q, pp + static_cast<size_t>(t) * qr * sizeof(float),
+               src + static_cast<size_t>(t) * rl + static_cast<size_t>(L) * sizeof(float),
+               static_cast<size_t>(qr) * sizeof(float));
+    }
+  }
+  DBuf dkvcn(d, DType::kF32, {T, L});
+  vt::RmsNorm(d.q, dkvcn.t(), dkvc.t(), WF32(d, w.kv_a_layernorm, {L}),
+              vt::RmsNormArgs{p.rms_norm_eps, false});
+
+  // Write this step's latent rows into the paged cache at slot_mapping (vLLM's
+  // concat_and_cache_mla order: BEFORE the attention reads). Cache dtype follows
+  // the spec (bf16 default — vLLM's regime; f32 under VT_KV_CACHE_F32).
+  Tensor cache_t = MakeTensor(kv.data, kv.dtype, d.q.device,
+                              {kv.num_blocks, kv.block_size, head});
+  if (kv.dtype == DType::kF32) {
+    vt::ConcatAndCacheMla(d.q, dkvcn.t(), dkpe.t(), cache_t, step.slot_mapping);
+  } else {
+    DBuf ckv(d, kv.dtype, {T, L});
+    DBuf cpe(d, kv.dtype, {T, qr});
+    vt::CastBf16(d.q, ckv.t(), dkvcn.t());
+    vt::CastBf16(d.q, cpe.t(), dkpe.t());
+    vt::ConcatAndCacheMla(d.q, ckv.t(), cpe.t(), cache_t, step.slot_mapping);
+  }
+
+  // Attention per request over the paged rows (query rows [tok0, tok1) at global
+  // positions [base, base+Tq)).
+  DBuf dout(d, DType::kF32, {T, nah * vh});
+  const size_t es = vt::SizeOf(kv.dtype);
+  const size_t row_b = static_cast<size_t>(head) * es;
+  std::vector<uint8_t> hrows;
+  for (int r = 0; r < am.num_reqs; ++r) {
+    const int64_t tok0 = am.query_start_loc[static_cast<size_t>(r)];
+    const int64_t tok1 = am.query_start_loc[static_cast<size_t>(r) + 1];
+    const int64_t Tq = tok1 - tok0;
+    if (Tq <= 0) continue;
+    const int64_t base = am.num_computed_tokens_cpu[static_cast<size_t>(r)];
+    const int64_t S = base + Tq;
+    // Gather the request's S latent rows (block table walk) to host.
+    hrows.resize(static_cast<size_t>(S) * row_b);
+    const int32_t* bt = am.block_table_tensor.data() +
+                        static_cast<size_t>(r) * am.block_table_num_cols;
+    for (int64_t s0 = 0; s0 < S; s0 += kv.block_size) {
+      const int64_t blk = bt[s0 / kv.block_size];
+      const int64_t n = std::min<int64_t>(kv.block_size, S - s0);
+      d.b.Copy(d.q, hrows.data() + static_cast<size_t>(s0) * row_b,
+               static_cast<const char*>(kv.data) +
+                   static_cast<size_t>(blk) * kv.block_size * row_b,
+               static_cast<size_t>(n) * row_b);
+    }
+    d.b.Synchronize(d.q);
+    // Split latent | kpe to f32 host.
+    std::vector<float> hlat(static_cast<size_t>(S) * L);
+    std::vector<float> hkpe(static_cast<size_t>(S) * qr);
+    for (int64_t s0 = 0; s0 < S; ++s0) {
+      const uint8_t* row = hrows.data() + static_cast<size_t>(s0) * row_b;
+      if (kv.dtype == DType::kF32) {
+        std::memcpy(&hlat[static_cast<size_t>(s0) * L], row,
+                    static_cast<size_t>(L) * sizeof(float));
+        std::memcpy(&hkpe[static_cast<size_t>(s0) * qr],
+                    row + static_cast<size_t>(L) * sizeof(float),
+                    static_cast<size_t>(qr) * sizeof(float));
+      } else {
+        const uint16_t* rb = reinterpret_cast<const uint16_t*>(row);
+        for (int64_t i = 0; i < L; ++i)
+          hlat[static_cast<size_t>(s0 * L + i)] = vt::BF16ToF32(rb[i]);
+        for (int64_t i = 0; i < qr; ++i)
+          hkpe[static_cast<size_t>(s0 * qr + i)] = vt::BF16ToF32(rb[L + i]);
+      }
+    }
+    // Up-project the latent to per-head k_nope|v (the CLI's append-time GemmBf16;
+    // the bf16 activation cast of the same latent values feeds the same GEMM).
+    DBuf dlat_r(d, DType::kF32, {S, L}, hlat.data());
+    DBuf dkv_r(d, DType::kF32, {S, kvw});
+    GemmBf16(d, dkv_r.t(), dlat_r.t(), w.kv_b_proj, kvw, L);
+    std::vector<float> hkv(static_cast<size_t>(S) * kvw);
+    dkv_r.Download(d, hkv.data());
+    RoundHostBf16(hkv);
+    RoundHostBf16(hkpe);
+    // The SAME f64 causal-softmax island as the CLI (MlaSoftmaxIslandInc).
+    DBuf dq_r(d, DType::kF32, {Tq, nah * qk});
+    d.b.Copy(d.q, dq_r.ptr(),
+             static_cast<const char*>(dq.ptr()) +
+                 static_cast<size_t>(tok0) * nah * qk * sizeof(float),
+             static_cast<size_t>(Tq) * nah * qk * sizeof(float));
+    DBuf o_r = MlaSoftmaxIslandInc(d, dq_r, hkv, hkpe, p, Tq, base);
+    d.b.Copy(d.q,
+             static_cast<char*>(dout.ptr()) +
+                 static_cast<size_t>(tok0) * nah * vh * sizeof(float),
+             o_r.ptr(), static_cast<size_t>(Tq) * nah * vh * sizeof(float));
+  }
+  DBuf attn(d, DType::kF32, {T, H});
+  GemmBf16(d, attn.t(), dout.t(), w.o_proj, H, nah * vh);
+  return attn;
+}
+
+// NoPE-MLA layer through mla::ForwardMlaAttentionBlock — vLLM's ACTUAL absorbed-
+// MQA decode / FA2 prefill over the paged latent cache (§20.3c / §20.2). Identity
+// RoPE (cos=1, sin=0: the GPT-J pair rotation is then the identity — NoPE, no
+// positional term), scale qk_head_dim^-0.5, the no-q-lora branch. The block does
+// its OWN ConcatAndCacheMla write.
+DBuf MlaLayerPagedFa2(const Dev& d, const MlaResidentWeights& w, const Tensor& dh_f32,
+                      const KimiLinearParams& p, int64_t T, const PagedKvCache& kv,
+                      KimiMlaStep& step, const DBuf& kv_a_ln_bf16) {
+  const int64_t H = p.hidden_size;
+  const int64_t nah = p.num_attention_heads;
+  const int64_t qn = p.qk_nope_head_dim;
+  const int64_t qr = p.qk_rope_head_dim;
+  const int64_t qk = qn + qr;
+  const int64_t vh = p.v_head_dim;
+  const int64_t L = p.kv_lora_rank;
+  const int64_t head = L + qr;
+  VT_CHECK(kv.dtype == DType::kBF16,
+           "kimi paged FA2 MLA: the paged latent cache must be bf16 (unset "
+           "VT_KV_CACHE_F32 for the FA2 arm)");
+  VT_CHECK(!w.w_uk_t.Empty() && !w.w_uv.Empty(),
+           "kimi paged FA2 MLA: absorbed W_UK_T/W_UV missing (loader absorption)");
+
+  mla::MlaBlockDims dm;
+  dm.hidden_size = H;
+  dm.num_heads = nah;
+  dm.qk_nope_head_dim = qn;
+  dm.qk_rope_head_dim = qr;
+  dm.v_head_dim = vh;
+  dm.kv_lora_rank = L;
+  dm.q_lora_rank = 0;
+  dm.rms_norm_eps = p.rms_norm_eps;
+  dm.scale = static_cast<float>(std::pow(static_cast<double>(qk), -0.5));
+
+  mla::MlaBlockWeights mw;
+  mw.kv_a_proj_with_mqa = ResidentBf16W(d, w.kv_a_proj_with_mqa, {L + qr, H});
+  mw.q_proj = ResidentBf16W(d, w.q_proj, {nah * qk, H});
+  mw.kv_a_layernorm = kv_a_ln_bf16.t();
+  mw.kv_b_proj = ResidentBf16W(d, w.kv_b_proj, {nah * (qn + vh), L});
+  mw.w_uk_t = ResidentBf16W(d, w.w_uk_t, {nah, qn, L});
+  mw.w_uv = ResidentBf16W(d, w.w_uv, {nah, L, vh});
+  mw.o_proj = ResidentBf16W(d, w.o_proj, {H, nah * vh});
+  mw.rope_cos_sin_cache = step.rope_cache->t();
+
+  Tensor cache_t = MakeTensor(kv.data, kv.dtype, d.q.device,
+                              {kv.num_blocks, kv.block_size, head});
+  DBuf dh_bf16(d, DType::kBF16, {T, H});
+  vt::CastBf16(d.q, dh_bf16.t(), dh_f32);
+  DBuf attn_bf16(d, DType::kBF16, {T, H});
+  Tensor attn_t = attn_bf16.t();
+  mla::ForwardMlaAttentionBlock(d, dm, mw, dh_bf16.t(), step.positions, cache_t,
+                                step.slot_mapping, step.meta, step.impl, attn_t);
+  DBuf attn(d, DType::kF32, {T, H});
+  Tensor attn_f = attn.t();
+  vt::CastF32(d.q, attn_f, attn_bf16.t());
+  return attn;
+}
+
+// The whole paged-runner device forward — DeviceForwardBodyBf16Incremental's
+// skeleton with the paged KDA/MLA layer forms and the runner's own metadata.
+DBuf DeviceForwardBodyBf16Paged(const Dev& d, const KimiLinearWeights& weights,
+                                const ModelForwardInput& in) {
+  const KimiLinearResidentWeights& rw = weights.resident;
+  const KimiLinearParams& p = weights.params;
+  const int64_t H = p.hidden_size;
+  const int64_t V = p.vocab_size;
+  const int64_t L = p.num_hidden_layers;
+  const int64_t T = static_cast<int64_t>(in.token_ids.size());
+  const float eps = p.rms_norm_eps;
+  VT_CHECK(T > 0, "kimi paged: empty token batch");
+  VT_CHECK(rw.resident, "kimi paged: bf16-resident weights required (§13)");
+  VT_CHECK(static_cast<int64_t>(rw.layers.size()) == L,
+           "kimi paged: resident layer count != num_hidden_layers");
+  VT_CHECK(in.attn_meta.num_actual_tokens == T,
+           "kimi paged: attn_meta num_actual_tokens != token count");
+  int64_t nkda = 0, nmla = 0;
+  for (int64_t l = 0; l < L; ++l) (p.is_kda_layer(l) ? nkda : nmla)++;
+  VT_CHECK(static_cast<int64_t>(in.gdn_state.size()) == nkda,
+           "kimi paged: one GdnStateCache per KDA layer required");
+  VT_CHECK(static_cast<int64_t>(in.attn_kv.size()) == nmla,
+           "kimi paged: one MLA PagedKvCache per full-attention layer required");
+
+  const KimiPagedSeg seg = KimiSegment(in.gdn_meta, T);
+  const bool fa2 = PagedMlaFa2();
+  const int64_t block_size = in.attn_kv.empty() ? 0 : in.attn_kv[0].block_size;
+  KimiMlaStep step;
+  BuildKimiMlaStep(d, in.positions, in.attn_meta, p, block_size, fa2, step);
+  // Per-layer bf16 kv_a_layernorm views + the identity rope cache (FA2 arm).
+  std::vector<std::unique_ptr<DBuf>> kv_a_ln_bf16(rw.layers.size());
+  std::unique_ptr<DBuf> rope;
+  if (fa2) {
+    const int64_t rows =
+        std::max<int64_t>(in.attn_meta.max_seq_len + 1, 2);
+    std::vector<uint16_t> ident(static_cast<size_t>(rows) * p.qk_rope_head_dim);
+    const uint16_t one = vt::F32ToBF16(1.0f);
+    const int64_t half = p.qk_rope_head_dim / 2;
+    for (int64_t rr = 0; rr < rows; ++rr)
+      for (int64_t i = 0; i < half; ++i)
+        ident[static_cast<size_t>(rr * p.qk_rope_head_dim + i)] = one;  // cos=1|sin=0
+    rope = std::make_unique<DBuf>(d, DType::kBF16,
+                                  std::vector<int64_t>{rows, p.qk_rope_head_dim},
+                                  ident.data());
+    step.rope_cache = rope.get();
+  }
+
+  DBuf hidden(d, DType::kF32, {T, H});
+  {
+    Tensor htab = ResidentBf16W(d, rw.embed_tokens, {V, H});
+    Tensor hh = hidden.t();
+    if (in.device_token_ids != nullptr) {
+      // ENG-ASYNC-SCHED W4 (the async device mirror, DEFAULT ON on a real CUDA
+      // GPU): the runner patched each decode row's sampled token into ITS device
+      // input-id buffer and deliberately left the host `token_ids` STALE — a
+      // forward that embeds the host vector reads the previous step's token and
+      // decodes garbage (the GB10 9/128 divergence this branch was cut from).
+      // Embed from the device pointer, exactly like qwen3_5's
+      // DeviceTokenIdsScope consumer.
+      Tensor ids = MakeTensor(const_cast<int32_t*>(in.device_token_ids),
+                              DType::kI32, d.q.device, {T});
+      vt::Embedding(d.q, hh, htab, ids);
+    } else {
+      DBuf dids(d, DType::kI32, {T}, in.token_ids.data());
+      vt::Embedding(d.q, hh, htab, dids.t());
+    }
+  }
+  DBuf res(d, DType::kF32, {T, H});
+  res.Zero(d);
+  Tensor hcur = hidden.t();
+  std::shared_ptr<void> hold;
+
+  int64_t kda_idx = 0, mla_idx = 0;
+  for (int64_t l = 0; l < L; ++l) {
+    const KimiLinearLayerResidentWeights& lw = rw.layers[static_cast<size_t>(l)];
+    DBuf dhn(d, DType::kF32, {T, H});
+    AddRmsNormS(d, dhn, hcur, lw.input_layernorm, H, res, eps, DType::kF32);
+    DBuf attn = [&]() -> DBuf {
+      if (lw.is_kda) {
+        return KdaLayerPagedBf16(d, lw.kda, dhn.t(), p, T, seg,
+                                 in.gdn_state[static_cast<size_t>(kda_idx++)]);
+      }
+      const PagedKvCache& kv = in.attn_kv[static_cast<size_t>(mla_idx++)];
+      if (!fa2) return MlaLayerPagedExact(d, lw.mla, dhn.t(), p, T, in.attn_meta,
+                                          kv, step);
+      std::unique_ptr<DBuf>& ln = kv_a_ln_bf16[static_cast<size_t>(l)];
+      if (!ln) {
+        DBuf lnf(d, DType::kF32,
+                 {static_cast<int64_t>(lw.mla.kv_a_layernorm.size())},
+                 lw.mla.kv_a_layernorm.data());
+        ln = std::make_unique<DBuf>(
+            d, DType::kBF16,
+            std::vector<int64_t>{static_cast<int64_t>(lw.mla.kv_a_layernorm.size())});
+        vt::CastBf16(d.q, ln->t(), lnf.t());
+      }
+      return MlaLayerPagedFa2(d, lw.mla, dhn.t(), p, T, kv, step, *ln);
+    }();
+    DBuf dh2(d, DType::kF32, {T, H});
+    AddRmsNormS(d, dh2, attn.t(), lw.post_attention_layernorm, H, res, eps,
+                DType::kF32);
+    DBuf mlp = lw.is_moe ? MoeBlockDeviceBf16(d, lw.moe, dh2.t(), p, T)
+                         : DenseMlpDeviceBf16(d, lw.dense, dh2.t(), p, T);
+    auto* held = new DBuf(std::move(mlp));
+    hcur = held->t();
+    hold = std::shared_ptr<void>(held, [](void* q) { delete static_cast<DBuf*>(q); });
+  }
+
+  DBuf dnorm(d, DType::kF32, {T, H});
+  AddRmsNormS(d, dnorm, hcur, rw.final_norm, H, res, eps, DType::kF32);
+
+  Tensor src = dnorm.t();
+  DBuf dgather(d, DType::kF32,
+               in.logits_indices.empty()
+                   ? std::vector<int64_t>{1, 1}
+                   : std::vector<int64_t>{
+                         static_cast<int64_t>(in.logits_indices.size()), H});
+  if (!in.logits_indices.empty()) {
+    const size_t rb = static_cast<size_t>(H) * sizeof(float);
+    char* dp = static_cast<char*>(dgather.ptr());
+    const char* sp = static_cast<const char*>(dnorm.ptr());
+    for (size_t i = 0; i < in.logits_indices.size(); ++i) {
+      const int32_t idx = in.logits_indices[i];
+      VT_CHECK(idx >= 0 && idx < T, "kimi paged: logits index out of range");
+      d.b.Copy(d.q, dp + i * rb, sp + static_cast<size_t>(idx) * rb, rb);
+    }
+    src = dgather.t();
+  }
+  const int64_t n_out = src.shape[0];
+
+  const bool tied = p.tie_word_embeddings || rw.lm_head.Empty();
+  const OwnedTensor& lm = tied ? rw.embed_tokens : rw.lm_head;
+  DBuf logits(d, DType::kF32, {n_out, V});
+  GemmBf16(d, logits.t(), src, lm, V, H);
+  return logits;
+}
+
 }  // namespace
 
 // ─── per-op device wrappers (host-in / host-out) — the per-op CPU gates ────────
@@ -1761,6 +2487,15 @@ ForwardLogits KimiLinearModel::ForwardPrefillIncremental(
   cache.prefilled = true;
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, p.vocab_size);
+}
+
+// ─── ROW 7 — the shared-paged-runner fold (§20.3) — public entry ───────────────
+ForwardLogits KimiLinearModel::ForwardPaged(const ModelForwardInput& input,
+                                            const KimiLinearWeights& weights) {
+  Dev d{vt::GetBackend(input.queue.device.type), input.queue};
+  DBuf dlogits = DeviceForwardBodyBf16Paged(d, weights, input);
+  const int64_t n_out = dlogits.t().shape[0];
+  return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);
 }
 
 ForwardLogits KimiLinearModel::ForwardDecodeStepIncremental(
