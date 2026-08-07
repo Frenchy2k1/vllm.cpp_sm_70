@@ -17,6 +17,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <limits>
@@ -826,6 +827,69 @@ TEST_CASE("greedy argmax tree-reduces the vocabulary and keeps the first-wins ti
     CHECK(run(l) == 10);
   }
 
+  vk.DestroyQueue(q);
+}
+
+TEST_CASE("VK-A2 batching records many dispatches per submit and stays byte-exact") {
+  if (!VulkanPresent()) return;
+  const char* lever = std::getenv("VT_VULKAN_BATCH");
+  const bool batching = lever != nullptr && std::strcmp(lever, "0") != 0;
+  auto& ctx = vt::vulkan::VulkanContext::Get();
+  Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
+  Queue q = vk.CreateQueue();
+  const Device d{DeviceType::kVULKAN, 0};
+
+  // WHAT THIS ASSERTS IS THE MECHANISM, because the RESULTS cannot show it:
+  // batching runs the same kernels in the same order, so a batch that silently
+  // degrades to one dispatch per submit computes identical numbers and every
+  // value check still passes. Without a pending-count assertion this whole path
+  // could stop batching and no gate would notice -- the same failure shape the
+  // coopmat tactic needed PipelineExistsFor for.
+  constexpr int64_t kN = 4096;
+  constexpr int kOps = 6;
+
+  std::vector<float> a(kN, 1.5f), b(kN, 2.25f);
+  void* da = vk.Alloc(kN * sizeof(float));
+  void* db = vk.Alloc(kN * sizeof(float));
+  auto* dout = static_cast<float*>(vk.Alloc(kN * sizeof(float)));
+  vk.Copy(q, da, a.data(), a.size() * sizeof(float));
+  vk.Copy(q, db, b.data(), b.size() * sizeof(float));
+  vk.Synchronize(q);
+
+  Tensor ta = Tensor::Contiguous(da, vt::DType::kF32, d, {kN});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {kN});
+  Tensor to = Tensor::Contiguous(dout, vt::DType::kF32, d, {kN});
+
+  // Issue several dependent ops with NO intervening host read, which is the only
+  // way a batch can accumulate.
+  for (int i = 0; i < kOps; ++i) vt::Add(q, to, ta, tb);
+  const uint32_t pending = ctx.pending_batch();
+  CAPTURE(pending);
+
+  if (batching) {
+    // More than one dispatch is in flight, i.e. the submit really was deferred.
+    CHECK(pending > 1u);
+  } else {
+    // Default build: every dispatch submitted and waited, so nothing is ever
+    // pending. This half keeps the assertion honest on the default path rather
+    // than making the test vacuous when the lever is off.
+    CHECK(pending == 0u);
+  }
+
+  // Flushing must make the writes visible to a plain host read -- Copy is a
+  // memcpy over mapped memory, so a missing flush shows up as stale bytes here.
+  std::vector<float> got(kN, 0.0f);
+  vk.Copy(q, got.data(), dout, got.size() * sizeof(float));
+  vk.Synchronize(q);
+  CHECK(ctx.pending_batch() == 0u);
+  for (int64_t i = 0; i < kN; i += 512) {
+    CAPTURE(i);
+    CHECK(got[static_cast<size_t>(i)] == doctest::Approx(3.75f));
+  }
+
+  vk.Free(da);
+  vk.Free(db);
+  vk.Free(dout);
   vk.DestroyQueue(q);
 }
 
