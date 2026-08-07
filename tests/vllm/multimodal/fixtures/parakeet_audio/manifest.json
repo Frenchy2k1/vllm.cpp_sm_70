@@ -1,0 +1,35 @@
+{
+  "config": {
+    "feature_size": 80,
+    "hop_length": 160,
+    "n_fft": 512,
+    "padding_value": 0.0,
+    "preemphasis": 0.97,
+    "sampling_rate": 16000,
+    "win_length": 400
+  },
+  "max_abs_bank_delta": 1.862645149230957e-09,
+  "num_samples": 8000,
+  "provenance": {
+    "feature_extractor": "transformers/models/parakeet/feature_extraction_parakeet.py ParakeetFeatureExtractor:36",
+    "librosa": "0.11.0",
+    "mel_filter_bank": "transformers/audio_utils.py mel_filter_bank:453",
+    "torch": "2.11.0+cu130",
+    "transformers": "5.3.0",
+    "vllm_extractor": "vllm/model_executor/models/parakeet.py ParakeetExtractor:138"
+  },
+  "shapes": {
+    "attention_mask": [
+      51
+    ],
+    "input_features": [
+      51,
+      80
+    ],
+    "mel_filters": [
+      80,
+      257
+    ]
+  },
+  "valid_frames": 50
+}

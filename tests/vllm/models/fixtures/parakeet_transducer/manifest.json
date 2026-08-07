@@ -1,0 +1,1054 @@
+{
+ "provenance": {
+  "transformers": "5.15.0.dev0",
+  "torch": "2.11.0+cu130",
+  "pretrained": false,
+  "seed": 20260807
+ },
+ "models": {
+  "rnnt": {
+   "architecture": "ParakeetForRNNT",
+   "config": {
+    "vocab_size": 17,
+    "decoder_hidden_size": 24,
+    "num_decoder_layers": 2,
+    "hidden_act": "relu",
+    "max_symbols_per_step": 3,
+    "blank_token_id": 16,
+    "pad_token_id": 0,
+    "durations": []
+   },
+   "encoder_config": {
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "intermediate_size": 64,
+    "hidden_act": "silu",
+    "attention_bias": true,
+    "convolution_bias": true,
+    "conv_kernel_size": 5,
+    "subsampling_factor": 4,
+    "subsampling_conv_channels": 8,
+    "num_mel_bins": 16,
+    "subsampling_conv_kernel_size": 3,
+    "subsampling_conv_stride": 2,
+    "max_position_embeddings": 5000,
+    "scale_input": true
+   },
+   "generation_config": {
+    "decoder_start_token_id": 16,
+    "eos_token_id": null,
+    "suppress_tokens": null
+   },
+   "attn_implementation": "sdpa",
+   "shaping": {
+    "init_std": 0.2,
+    "blank_delta": 2.0,
+    "dur0_delta": 0.0
+   },
+   "branch_coverage": {
+    "blank_emissions": 7,
+    "token_emissions": 27,
+    "frame_advancing_tokens": 9,
+    "tokens_held_at_frame": 18,
+    "distinct_advances": [
+     0,
+     1
+    ]
+   },
+   "frames": 61,
+   "valid_frames": 61,
+   "encoder_frames": 16,
+   "walk": [
+    16,
+    1,
+    1,
+    2,
+    16,
+    3
+   ],
+   "decoder_trace": [
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    }
+   ],
+   "sequences": [
+    16,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    16,
+    16,
+    12,
+    12,
+    12,
+    16,
+    12,
+    12,
+    12,
+    16,
+    12,
+    12,
+    12,
+    16,
+    12,
+    12,
+    12,
+    16,
+    12,
+    12,
+    12,
+    16
+   ],
+   "step_durations": [
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    1,
+    1
+   ]
+  },
+  "tdt": {
+   "architecture": "ParakeetForTDT",
+   "config": {
+    "vocab_size": 17,
+    "decoder_hidden_size": 24,
+    "num_decoder_layers": 2,
+    "hidden_act": "relu",
+    "max_symbols_per_step": 3,
+    "blank_token_id": 16,
+    "pad_token_id": 0,
+    "durations": [
+     0,
+     1,
+     2,
+     3
+    ]
+   },
+   "encoder_config": {
+    "hidden_size": 32,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "intermediate_size": 64,
+    "hidden_act": "silu",
+    "attention_bias": true,
+    "convolution_bias": true,
+    "conv_kernel_size": 5,
+    "subsampling_factor": 4,
+    "subsampling_conv_channels": 8,
+    "num_mel_bins": 16,
+    "subsampling_conv_kernel_size": 3,
+    "subsampling_conv_stride": 2,
+    "max_position_embeddings": 5000,
+    "scale_input": true
+   },
+   "generation_config": {
+    "decoder_start_token_id": 16,
+    "eos_token_id": null,
+    "suppress_tokens": [
+     17,
+     18,
+     19,
+     20
+    ]
+   },
+   "attn_implementation": "sdpa",
+   "shaping": {
+    "init_std": 0.2,
+    "blank_delta": 2.0,
+    "dur0_delta": 1.0
+   },
+   "branch_coverage": {
+    "blank_emissions": 3,
+    "token_emissions": 44,
+    "frame_advancing_tokens": 1,
+    "tokens_held_at_frame": 43,
+    "distinct_advances": [
+     0,
+     1,
+     2
+    ]
+   },
+   "frames": 61,
+   "valid_frames": 61,
+   "encoder_frames": 16,
+   "walk": [
+    16,
+    1,
+    1,
+    2,
+    16,
+    3
+   ],
+   "decoder_trace": [
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      16
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    },
+    {
+     "input_ids_shape": [
+      1,
+      1
+     ],
+     "input_ids": [
+      12
+     ]
+    }
+   ],
+   "sequences": [
+    16,
+    16,
+    12,
+    16,
+    16,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12,
+    12
+   ],
+   "step_durations": [
+    0,
+    1,
+    2,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  }
+ }
+}

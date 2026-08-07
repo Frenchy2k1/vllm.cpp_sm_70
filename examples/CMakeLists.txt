@@ -88,3 +88,12 @@ if(VLLM_CPP_VULKAN)
   target_include_directories(vulkan-gemm-ab PRIVATE ${CMAKE_SOURCE_DIR}/src)
   vllm_cpp_set_warnings(vulkan-gemm-ab)
 endif()
+
+# parakeet-transcribe: the ASR driver — real WAV, real pretrained
+# ParakeetForCTC weights, log-mel -> encoder -> CTC -> collapsed token ids.
+# Lives here for the same reason the h3 drivers do: it is a driver over real
+# checkpoints, not library surface. The unit gates prove the math against a
+# random-weight HF oracle; this proves the model actually transcribes.
+add_executable(parakeet-transcribe parakeet_transcribe/main.cpp)
+target_link_libraries(parakeet-transcribe PRIVATE vllm::vllm)
+vllm_cpp_set_warnings(parakeet-transcribe)

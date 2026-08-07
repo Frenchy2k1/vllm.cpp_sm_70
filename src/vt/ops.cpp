@@ -2309,6 +2309,135 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                                                                         value, args);
 }
 
+// --- Conformer / FastConformer audio-encoder kernels (spike P1/P2/P3) --------
+// Upstream mirror: transformers 5.3.0
+// transformers/models/parakeet/modeling_parakeet.py (:357 subsampling Conv2d,
+// :116 convolution module depthwise Conv1d, :259 relative-position attention),
+// which is the module vLLM itself runs (parakeet.py:37,62). The validation here
+// mirrors torch's own shape contracts for nn.Conv2d / nn.Conv1d(groups=C) so a
+// caller that passes what the Python module passes is accepted verbatim.
+
+void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv2dArgs& args) {
+  VT_CHECK(x.rank == 4 && out.rank == 4, "conv2d: x/out must be rank-4 [N,C,H,W]");
+  VT_CHECK(weight.rank == 4, "conv2d: weight must be rank-4 [Cout,Cin/groups,KH,KW]");
+  const int64_t g = args.groups;
+  VT_CHECK(g >= 1, "conv2d: groups must be >= 1");
+  const int64_t n = x.shape[0], cin = x.shape[1], hin = x.shape[2], win = x.shape[3];
+  const int64_t cout = weight.shape[0], cin_g = weight.shape[1];
+  const int64_t kh = weight.shape[2], kw = weight.shape[3];
+  VT_CHECK(n >= 0 && cin > 0 && hin > 0 && win > 0, "conv2d: x extents must be positive");
+  VT_CHECK(cout > 0 && kh > 0 && kw > 0, "conv2d: weight extents must be positive");
+  VT_CHECK(cin % g == 0 && cout % g == 0, "conv2d: groups must divide both Cin and Cout");
+  VT_CHECK(cin_g == cin / g, "conv2d: weight dim 1 must be Cin/groups");
+  VT_CHECK(args.stride_h >= 1 && args.stride_w >= 1, "conv2d: stride must be >= 1");
+  VT_CHECK(args.dilation_h >= 1 && args.dilation_w >= 1, "conv2d: dilation must be >= 1");
+  VT_CHECK(args.pad_h >= 0 && args.pad_w >= 0, "conv2d: padding must be >= 0");
+  const int64_t hout = (hin + 2 * args.pad_h - args.dilation_h * (kh - 1) - 1) / args.stride_h + 1;
+  const int64_t wout = (win + 2 * args.pad_w - args.dilation_w * (kw - 1) - 1) / args.stride_w + 1;
+  VT_CHECK(hout > 0 && wout > 0, "conv2d: kernel/dilation larger than the padded input");
+  VT_CHECK(out.shape[0] == n && out.shape[1] == cout && out.shape[2] == hout &&
+               out.shape[3] == wout,
+           "conv2d: out must be [N,Cout,Hout,Wout] for the given stride/padding/dilation");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsFloat(out.dtype),
+           "conv2d: x/weight/out must be f32, f16 or bf16");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "conv2d: contiguous tensors required");
+  VT_CHECK(x.device == q.device && weight.device == q.device && out.device == q.device,
+           "conv2d: device mismatch (x/weight/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == cout, "conv2d: bias must be rank-1 [Cout]");
+    VT_CHECK(IsFloat(bias->dtype) && bias->IsContiguous() && bias->device == q.device,
+             "conv2d: bias must be a contiguous float tensor on the queue device");
+  }
+  reinterpret_cast<Conv2dFn>(GetOp(OpId::kConv2d, q.device.type))(q, out, x, weight, bias, args);
+}
+
+void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     const Tensor* bias, const DepthwiseConv1dArgs& args) {
+  VT_CHECK(x.rank == 3 && out.rank == 3, "depthwise_conv1d: x/out must be rank-3 [N,C,L]");
+  // torch's depthwise parameter is [C, 1, K]; the flat [C, K] form is accepted
+  // because that is how vt::CausalConv1dFwd already carries a per-channel filter.
+  VT_CHECK(weight.rank == 3 || weight.rank == 2,
+           "depthwise_conv1d: weight must be [C,1,K] (torch) or [C,K]");
+  const int64_t n = x.shape[0], c = x.shape[1], lin = x.shape[2];
+  const int64_t k = weight.shape[weight.rank - 1];
+  VT_CHECK(c > 0 && lin > 0 && k > 0, "depthwise_conv1d: C/L/K must be positive");
+  VT_CHECK(weight.shape[0] == c, "depthwise_conv1d: weight dim 0 must be C (groups == C)");
+  if (weight.rank == 3) {
+    VT_CHECK(weight.shape[1] == 1, "depthwise_conv1d: weight dim 1 must be 1 (in_channels/groups)");
+  }
+  VT_CHECK(args.stride >= 1, "depthwise_conv1d: stride must be >= 1");
+  VT_CHECK(args.dilation >= 1, "depthwise_conv1d: dilation must be >= 1");
+  VT_CHECK(args.padding >= 0, "depthwise_conv1d: padding must be >= 0");
+  const int64_t lout = (lin + 2 * args.padding - args.dilation * (k - 1) - 1) / args.stride + 1;
+  VT_CHECK(lout > 0, "depthwise_conv1d: kernel/dilation larger than the padded input");
+  VT_CHECK(out.shape[0] == n && out.shape[1] == c && out.shape[2] == lout,
+           "depthwise_conv1d: out must be [N,C,Lout] for the given stride/padding/dilation");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsFloat(out.dtype),
+           "depthwise_conv1d: x/weight/out must be f32, f16 or bf16");
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "depthwise_conv1d: contiguous tensors required");
+  VT_CHECK(x.device == q.device && weight.device == q.device && out.device == q.device,
+           "depthwise_conv1d: device mismatch (x/weight/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 1 && bias->shape[0] == c, "depthwise_conv1d: bias must be rank-1 [C]");
+    VT_CHECK(IsFloat(bias->dtype) && bias->IsContiguous() && bias->device == q.device,
+             "depthwise_conv1d: bias must be a contiguous float tensor on the queue device");
+  }
+  reinterpret_cast<DepthwiseConv1dFn>(GetOp(OpId::kDepthwiseConv1d, q.device.type))(
+      q, out, x, weight, bias, args);
+}
+
+void AttentionRelPos(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                     const Tensor& value, const Tensor& rel_key, const Tensor* bias_u,
+                     const Tensor* bias_v, const Tensor* key_mask,
+                     const AttentionRelPosArgs& args) {
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3 &&
+               rel_key.rank == 3,
+           "attention_relpos: query/key/value/rel_key/out rank-3 [T,H,D]");
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  VT_CHECK(t > 0 && hq > 0 && d > 0, "attention_relpos: T/Hq/D must be positive");
+  VT_CHECK(key.shape[0] == t && value.shape[0] == t,
+           "attention_relpos: query/key/value token count must match");
+  VT_CHECK(key.shape[2] == d && value.shape[2] == d,
+           "attention_relpos: key/value head_dim must match query");
+  VT_CHECK(value.shape[1] == hk, "attention_relpos: key/value must share the kv-head count");
+  VT_CHECK(hk >= 1 && hq % hk == 0,
+           "attention_relpos: Hq must be a positive multiple of Hk (GQA broadcast)");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hq && out.shape[2] == d,
+           "attention_relpos: out must be [T,Hq,D] matching query");
+  // P == 2T-1: the relative-position table spans offsets T-1 .. -(T-1), exactly
+  // what ParakeetEncoderRelPositionalEncoding emits (modeling_parakeet.py:78
+  // `arange(seq_length-1, -seq_length, -1)`), and what _rel_shift assumes.
+  VT_CHECK(rel_key.shape[0] == 2 * t - 1 && rel_key.shape[1] == hq && rel_key.shape[2] == d,
+           "attention_relpos: rel_key must be [2*T-1, Hq, D]");
+  VT_CHECK(args.scale > 0.0f, "attention_relpos: scale must be set (> 0), e.g. head_dim^-0.5");
+  VT_CHECK(IsFloat(query.dtype) && IsFloat(key.dtype) && IsFloat(value.dtype) &&
+               IsFloat(rel_key.dtype),
+           "attention_relpos: query/key/value/rel_key must be f32, f16 or bf16");
+  VT_CHECK(IsFloat(out.dtype), "attention_relpos: out must be f32, f16 or bf16");
+  VT_CHECK(query.IsContiguous() && key.IsContiguous() && value.IsContiguous() &&
+               rel_key.IsContiguous() && out.IsContiguous(),
+           "attention_relpos: contiguous tensors required");
+  VT_CHECK(query.device == q.device && key.device == q.device && value.device == q.device &&
+               rel_key.device == q.device && out.device == q.device,
+           "attention_relpos: device mismatch (query/key/value/rel_key/out/queue)");
+  for (const Tensor* b : {bias_u, bias_v}) {
+    if (b == nullptr) continue;
+    VT_CHECK(b->rank == 2 && b->shape[0] == hq && b->shape[1] == d,
+             "attention_relpos: bias_u/bias_v must be rank-2 [Hq,D]");
+    VT_CHECK(IsFloat(b->dtype) && b->IsContiguous() && b->device == q.device,
+             "attention_relpos: bias_u/bias_v must be contiguous float on the queue device");
+  }
+  if (key_mask != nullptr) {
+    CheckBoolMeta(q, *key_mask, t, "attention_relpos", "key_mask");
+  }
+  reinterpret_cast<AttentionRelPosFn>(GetOp(OpId::kAttentionRelPos, q.device.type))(
+      q, out, query, key, value, rel_key, bias_u, bias_v, key_mask, args);
+}
+
 void AttentionDenseFast(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                         const Tensor& value, const AttentionArgs& args) {
   VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,

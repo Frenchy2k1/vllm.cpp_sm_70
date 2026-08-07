@@ -36718,8 +36718,8 @@ any of them is worth building is a roadmap decision the rows now make visible.
 No source, kernel, model, gate, benchmark or capability mark changed.
 
 ## Kimi-Linear-48B-A3B W0 dedicated spike — SPIKE→READY, the one e2e-gateable Kimi text model
-
 <!-- state: 2026-08-05T09:00 -->
+
 
 Wrote the full W0 spike contract for `KimiLinearForCausalLM` (Kimi-Linear-48B-A3B-Instruct),
 `specs/kimi-linear.md`, `CLAIM-KIMI-LINEAR-W0`. CPU-only, records-only: NO build, NO GPU, NO
@@ -37693,8 +37693,8 @@ found. Evidence: local logs `scratchpad/kimi_build_dgx.log` + `kimi_test_dgx.log
 records in spec section 11, model-matrix `MODEL-TEXT-kimi-linear-*`, benchmark record.
 
 ## QUANT-CT-MXFP4 Qwen vehicle: W0 checkpoint + W1 kernel target PINNED; empirical GPU/disk-gated
-
 <!-- state: 2026-08-06T13:15 -->
+
 
 USER re-scope (full MXFP4 at vLLM parity, benchmarked on a Qwen model; DeepSeek/Kimi
 NOT the vehicle). Spike checkpoint on `row/QUANT-CT-MXFP4` (branch off `main`
@@ -37805,8 +37805,8 @@ async input path. Evidence `dgx:~/work/mirror-ab/option-a/`, branch `row/SERVE-A
 OPTION-A`.
 
 ## QUANT-CT-MXFP4 Qwen W0+W1 EMPIRICAL: oracle golden RUNS (Marlin W4A16); FlashInfer W4A4 CRASHES on sm_121
-
 <!-- state: 2026-08-06T13:17 -->
+
 
 Box freed (coordinator); resumed the QUEUED empirical steps under both flock locks,
 mem gate (94-95 GiB free >= 90), tmux + done-markers, oracle alone, single load,
@@ -37881,8 +37881,8 @@ checkpoint retained in the HF cache. Evidence: `dgx:~/kimi-e2e/{oracle_full.log,
 local golden `tests/parity/goldens/kimi_linear_greedy/`.
 
 ## QUANT-CT-MXFP4 W2 native Marlin mxf4 keep-quant LANDS (builds+runs on GB10); e2e RED, bug localized to group_blocks=2 GEMM
-
 <!-- state: 2026-08-06T13:19 -->
+
 
 Coordinator freed the box for W2-W4. Implemented the native MXFP4 (mxfp4-pack-quantized)
 Marlin W4A16 keep-quant path for dense Qwen3, routed through the EXISTING Marlin FP4
@@ -38047,8 +38047,8 @@ this branch, keep `test_kimi_linear_forward` 12/12·614 green, then the full-mod
 (free -g >= 90, monitor, STOP if the pool math does not close in practice).
 
 ## QUANT-CT-MXFP4 W3 unit gate GREEN: MXFP4 GEMM PROVEN correct; e2e residual is NOT the compute
-
 <!-- state: 2026-08-06T13:23 -->
+
 
 Built + ran the owed W3 device unit gate (`test_ops_moe_grouped.cpp`, commit `8469e333`):
 MXFP4 Marlin GEMM vs the INDEPENDENT CPU dequant reference (`DequantMxfp4ToF32` + f32
@@ -38109,8 +38109,8 @@ diverges toward the limit). Row STAYS `ACTIVE`; `VT_KIMI_DEVICE_COMPUTE` default
 the e2e token gate is green.
 
 ## QUANT-CT-MXFP4 e2e RESOLVED: compute CORRECT (async-off 3/4 token-exact); async-default degeneration is a PRE-EXISTING classic-dense-Qwen3 bug
-
 <!-- state: 2026-08-06T13:25 -->
+
 
 Closed the e2e residual. Root-caused via the box-free continuation: the DEFAULT
 (async scheduling ON) degeneration is NOT the MXFP4 compute — with VT_ASYNC_SCHED=0
@@ -39406,8 +39406,8 @@ idle, locks free, worker down, disk ≥15 G; checkpoint cached for reruns). Benc
 record + spec §8 + STATUS/BENCHMARKS/FEATURES + model-matrix/roadmap updated.
 
 ## 2026-08-06T16:44 - DOCS-SUPPORTED-MODELS-MATRIX: public per-architecture supported list is now CI-bound to the C++ registry
-
 <!-- state: 2026-08-06T16:44 -->
+
 
 Row `row/DOCS-SUPPORTED-MODELS-MATRIX` (helper worktree, DRAFT PR). USER-directed:
 the public surface must show every supported architecture AND the concrete
@@ -39449,8 +39449,8 @@ HW-infeasible ~1.56 TB). Both marked scaffold in FEATURES.
 the public list bound to the registry going forward.
 
 ## QUANT-CT-MXFP4-FLASH-AUDIT — `-use_fast_math` on the FA2 TUs REJECTED (measured flash regression); the flash decode gap vs vLLM is occupancy/L2-bound, not the SASS instruction count
-
 <!-- state: 2026-08-06T17:38 -->
+
 
 Helper row `QUANT-CT-MXFP4-FLASH-AUDIT` (worktree `row/QUANT-CT-MXFP4-FLASH-AUDIT`,
 draft PR #69, base `origin/main` `4ce9fb74`). Runs the #67-OWED flash audit to a MEASURED
@@ -39603,8 +39603,8 @@ surface #70 did not isolate. Pre-existing preflight red
 (check-fusion-consistency minimax_h3_video_vae_device) is NOT this row's.
 
 ## 2026-08-06T21:45 - QUANT-CT-MXFP4-FLASH-OCCUPANCY: the owed matched-c8 flash ncu diff - occupancy is IDENTICAL (8.33%), the gap is an irreducible-for-us ptxas SASS-scheduling quality difference (matched vLLM's exact reg+instr, still +10us), NO lever on our stack
-
 <!-- state: 2026-08-06T21:45 -->
+
 
 Ran the #69-owed ours-vs-vLLM flash decode ncu diff to a MEASURED verdict on an
 idle box (PR #75, `row/QUANT-CT-MXFP4-FLASH-OCCUPANCY`, base `f7a1e322`).
@@ -39709,8 +39709,8 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
   Next: `VK-A1` (shader-variant pipeline + the feature-matrix drift repair),
   which blocks every shader written after it.
 ## 2026-08-06T23:10 - BACKEND-ROCM W0: the AMD skeleton lands UNBUILT and says so - plus the one non-additive platform site the enum change uncovered
-
 <!-- state: 2026-08-06T23:10 -->
+
 
 Three contributors offered AMD hardware on [#41](https://github.com/mudler/vllm.cpp/issues/41)
 (gfx1151 Strix Halo, gfx1103 Radeon 780M, 4x gfx1100 7900 XTX). What they lacked
@@ -39880,6 +39880,81 @@ Open: **the number.** dgx.casa root was at 100% (20 GiB free) with no existing
 CUDA `server` build, so the ours arm could not be built. User authorized
 reclaiming the untagged 7.37 GB docker image + 4.4 GB builder cache (NOT the
 stopped `local-ai-worker` container). Run owed: 27B, 3 interleaved repetitions.
+## 2026-08-06 — Parakeet/FastConformer encoder kernels P1-P3 land on CPU: Conv2d, non-causal depthwise Conv1d, relative-position attention
+<!-- state: 2026-08-06T23:58 -->
+
+Row `MODEL-AUDIO-PARAKEET-ENCODER`, helper worktree
+`/home/mudler/_git/vllm.cpp-parakeet`, branch
+`row/MODEL-AUDIO-PARAKEET-ENCODER`. Executes work items P1/P2/P3 of the accepted
+spike [parakeet-conformer-encoder](specs/parakeet-conformer-encoder.md). The
+three primitives the spike named as the encoder's blockers are now ordinary
+`vt::` ops on the portable CPU tier, registered through the existing
+`op_provider` seam. No new seam, no existing kernel modified.
+
+- `vt::Conv2d` (`kConv2d`, [cpu_conv2d.cpp](../src/vt/cpu/cpu_conv2d.cpp)) —
+  torch `nn.Conv2d` with groups/stride/padding/dilation, serving all three
+  `ParakeetEncoderSubsamplingConv2D` stages (dense, depthwise, pointwise;
+  transformers 5.3.0 `modeling_parakeet.py:357`, :369-371 / :377-386 / :388).
+  Supersedes the host `std::vector<float>` loop `gemma4_audio.cpp:92`, which
+  stays as an independent reference.
+- `vt::DepthwiseConv1d` (`kDepthwiseConv1d`,
+  [cpu_conv1d_depthwise.cpp](../src/vt/cpu/cpu_conv1d_depthwise.cpp)) — the
+  centre-padded, stateless, activation-free conformer conv
+  (`modeling_parakeet.py:116`, ctor :138-146). A SIBLING of
+  `vt::CausalConv1dFwd`, which is untouched, per the spike's port map.
+- `vt::AttentionRelPos` (`kAttentionRelPos`,
+  [cpu_attn_relpos.cpp](../src/vt/cpu/cpu_attn_relpos.cpp)) — Transformer-XL
+  encoder self-attention, no KV cache, no paging, non-causal
+  (`modeling_parakeet.py:259`, forward :302-347, `_rel_shift` :349-355).
+
+**The `_rel_shift` result is a closed form, and that is the interesting part.**
+Both upstreams materialise a `[T, 2T-1]` matrix, left-pad a column, reinterpret
+as `[2T, T]`, drop a row, reinterpret back and truncate. That whole sequence is
+exactly `shifted(i,j) = raw(i, T-1-i+j)`, because `1 <= T-i+p <= 2T-1` for every
+`i,p in [0,T)`, so the flat index `i*(2T-1)+p+T` always lands in row `i`. The
+kernel indexes `rel_key` by that expression and never allocates the scratch
+matrix. The unit test's reference performs the literal pad/reshape/slice, so
+byte-identity between them is what PROVES the derivation — checked by execution,
+not by reading.
+
+**Gate: byte-identity vs an INDEPENDENT in-test scalar reference**, the
+`test_ops_matmul_elem.cpp` bar, not NMSE. Every output element keeps one f32
+accumulator in a fixed order and the parallel dispatch partitions output rows
+only, so thread-count independence is by construction. CPU x86-64,
+`-DVLLM_CPP_CUDA=OFF`: `test_ops_conv2d` 4 cases / 1631 assertions,
+`test_ops_conv1d_depthwise` 5 / 1184, `test_ops_attn_relpos` 7 / 368; all green.
+Coverage is dtype (f32/f16/bf16, including mixed operands) x shape (ragged
+extents, grouped/dilated/non-square, `L < K`, `T == 1`) x thread count (1/2/4/8).
+
+**Mutation-verified, not just green.** 11 single-line kernel mutations were
+compiled and run: 10 killed (group mapping, stride/dilation axis swap, weight
+base, bias placement, the `_rel_shift` index, the GQA kv-head map, the bias
+row offset, the scale placement, the softmax denominator, the all-masked
+guard). One survived and is a genuine no-op: adding `1e-9f` to a softmax
+denominator of order `T` is below the f32 ulp there; the same mutation at
+`1e-3f` is killed.
+
+Two recorded deviations, both stated in `include/vt/ops.h`: the attention adds
+`bias_u`/`bias_v` in f32 inside the kernel where upstream materialises them in
+the activation dtype (pass `nullptr` + a pre-biased query to reproduce upstream
+rounding exactly), and an all-masked query row yields zeros rather than
+upstream's NaN. The vLLM-native conformer's one arithmetic divergence — scaling
+the summed score rather than the two terms — is an arg (`scale_after_sum`), not
+a choice, so both upstreams have a byte-exact path.
+
+NOT done, deliberately, and owned by P4: the encoder model, the CTC head and
+the mel extractor. NOT done: CUDA providers for the three ops (CPU is the
+deliverable for this row; the ops decline to nothing on kCUDA today). NOT run:
+any GPU regression suite, per the row's CPU-only instruction and the dgx.casa
+hard-reset earlier the same day.
+
+Inherited red gates, untouched and NOT caused here: `check-fusion-consistency`
+(`minimax_h3_video_vae_device` gate-up fold), `check-public-doc-tables`
+(docs/BENCHMARKS.md:316 is a 371-char cell, and docs/STATUS.md was already 645
+chars over its ratchet at this branch point). The missing `<!-- state: -->`
+anchor on the startup-latency entry WAS repaired here, because an append cannot
+be order-checked without it.
+
 ## MiniMax-H3 task/partition GUARD landed — mirror `_resolve_task`'s raise (`row/H3-TASK-PARTITION-GUARD` PR #84, helper, DRAFT PR, CPU-only)
 <!-- state: 2026-08-06T23:59 -->
 
@@ -40401,8 +40476,8 @@ Box left clean (renders exited, GPU idle, gpu.lock released, worker stays parked
 ckpts kept). Records: spec §8.9 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW.
 
 ## 2026-08-07T04:15 - `/v1/videos` speaks OpenAI's Sora WIRE SHAPE, plus the MP4 content route
-
 <!-- state: 2026-08-07T04:15 -->
+
 
 Row `SERVE-VIDEOS-OAI`, claim `CLAIM-SERVE-VIDEOS-OAI`, branch
 `row/SERVE-VIDEOS-OAI`. Developer-directed: an unmodified OpenAI client must work
@@ -40503,8 +40578,8 @@ weakening, and gated as such: a new test asserts that a merge naming no row
 anywhere (and a plain local `Merge branch 'wip'`) STILL fails. Suite 40/40.
 
 ## 2026-08-07T04:40 - reference CONDITIONING over `/v1/videos`: `input_reference` -> fl2va, `metadata` -> ref2va
-
 <!-- state: 2026-08-07T04:40 -->
+
 
 Row `SERVE-VIDEOS-REFS`, claim `CLAIM-SERVE-VIDEOS-REFS`, branch
 `row/SERVE-VIDEOS-REFS`, STACKED on `SERVE-VIDEOS-OAI`. That row made an OpenAI
@@ -40625,8 +40700,8 @@ regardless; box left clean (renders exited, gpu.lock released, worker stays park
 spec §8.10 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW.
 
 ## 2026-08-07T05:35 - MiniMax-H3: half of every video was being discarded (audio duration), plus the user-facing docs the lane never had
-
 <!-- state: 2026-08-07T05:35 -->
+
 
 Branch `fix/h3-audio-duration-and-readme` (PR #68). Found by RENDERING, not by
 the suite.
@@ -40965,6 +41040,95 @@ question is UNBLOCKED, not answered.
 
 Next: `row/H3-BF16-SHARDED-STREAM` (device streamer), then the operator runs the real
 13-shard bf16 DiT.
+## 2026-08-07 — Parakeet/FastConformer P4 lands on CPU: the encoder, the CTC head, greedy collapse, the log-mel front end and an HF-safetensors loader
+<!-- state: 2026-08-07T10:00 -->
+
+
+Row `MODEL-AUDIO-PARAKEET-ENCODER` (NEW), claim `CLAIM-PARAKEET-MODEL-P4`,
+helper worktree `/home/mudler/_git/vllm.cpp-parakeet`, branch
+`row/MODEL-AUDIO-PARAKEET-ENCODER`, base `1ace9e27`. Work item P4 of the
+accepted spike
+[parakeet-conformer-encoder](specs/parakeet-conformer-encoder.md), CPU tier
+only, CTC only.
+
+**What landed.** `ParakeetEncoderForward` and `ParakeetForCTCForward`
+(`include/vllm/model_executor/models/parakeet_encoder.h`,
+`src/vllm/model_executor/models/parakeet_encoder.cpp`), the HF-format
+safetensors loader (`parakeet_weights.cpp`), and the log-mel front end
+(`include/vllm/multimodal/parakeet_audio_processor.h`,
+`src/vllm/multimodal/parakeet_audio_processor.cpp`). The forward composes the
+three P1-P3 kernels — `vt::Conv2d` for the subsampling stack, `vt::DepthwiseConv1d`
+for the conformer convolution module, `vt::AttentionRelPos` for the
+Transformer-XL self-attention — with `vt::MatmulBT`/`vt::Add`/`vt::LayerNorm`/
+`vt::Relu` for everything else, and explicit host loops (each individually
+cited) for the leftovers vt has no standalone op for: SiLU, GLU, the eval-time
+BatchNorm1d affine, the conformer 0.5 residual scaling and the two transposes.
+f32 end to end, which is the dtype the HF reference runs at.
+
+**The mirror source is HF, and that is the deviation.** vLLM does NOT implement
+this encoder: `vllm/model_executor/models/parakeet.py:14,61` imports and
+instantiates `transformers.ParakeetEncoder` as the audio component of
+`nano_nemotron_vl.py`. Every ported file therefore cites transformers 5.3.0
+`modeling_parakeet.py`, recorded as `.agents/porting-inventory.md` §9 item 12.
+The vLLM-native halves are mirrored where they exist — the front end follows
+`ParakeetExtractor:138` and `ExtractorConfig:41`.
+
+**Traced, not read.** `ParakeetEncoderAttention` picks its path at runtime
+(`:306-308`). A torch run of the oracle shows the path that ACTUALLY executes is
+`sdpa`, which returns exactly ZERO for a fully-masked query row where `eager`
+returns NaN. That is the behaviour `vt::AttentionRelPos` already documents, so
+the forward reproduces the traced observable rather than the source's apparent
+one; the fixture manifest records the implementation and the test asserts it.
+
+**Gates, all CPU x86-64, `-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`.**
+`test_parakeet_encoder` 7 cases / 543 assertions against an INDEPENDENT in-test
+double-precision reference written from the upstream definition, which performs
+`_rel_shift` LITERALLY (pad a column, reinterpret as [2T,T], drop the first row,
+reinterpret) rather than the closed form the kernel uses — encoder rel-L2 1.9e-7
+to 2.4e-7 across four frame/valid-length shapes, CTC logits 2.0e-7, greedy and
+collapsed token ids EXACT. `test_parakeet_ctc_engine` 2 / 12485 against a dumped
+HuggingFace `ParakeetForCTC` oracle, stage by stage over the FULL padded extent
+(subsampling, layer0 ff1/attn/conv, block0, block1, last_hidden_state, logits,
+every one rel-L2 <= 3.5e-7), with greedy and collapsed ids EXACT on a
+full-length AND a padded batch item. `test_parakeet_audio_processor` 6 / 41054:
+the mel bank is BIT-IDENTICAL (rel-L2 0) to a dump of transformers
+`mel_filter_bank`, within 1.9e-9 of librosa's float32 bank, and the full log-mel
+is rel-L2 4.9e-6 vs `ParakeetFeatureExtractor`.
+
+**Mutation-verified.** 20 single-line mutations were compiled and run across the
+two source files — dropped conv padding mask, dropped fully-masked attention
+rows, swapped `bias_u`/`bias_v`, dropped input scale, sin/cos collapse in the
+position table, dropped pointwise subsampling mask, 0.5 -> 1.0 macaron residual,
+collapse-order inversion, dropped BatchNorm affine and mean, GLU without the
+sigmoid, subsampling flatten order, argmax tie direction, dropped preemphasis,
+periodic Hann, biased variance, uncentred window, dropped slaney norm, changed
+log guard. **20 killed, 0 survivors.** The argmax tie mutant needed a targeted
+case (a zeroed CTC head makes every logit equal, so the tie direction becomes
+observable); random logits never tie.
+
+**NOT verified, stated plainly.** No pretrained `nvidia/parakeet-*` checkpoint
+was downloaded: AGENTS.md's safe defaults forbid pulling large assets without
+the developer saying so, `.env`/`developer-preferences.md` are both absent here,
+and the smallest HF-format CTC checkpoint (`nvidia/parakeet-ctc-0.6b`) is a
+2.4 GB `model.safetensors` on a box at 92% disk shared with other sessions. So
+the oracle is a seeded, RANDOMLY-INITIALISED `ParakeetForCTC` and **no
+transcript is claimed anywhere**; the pretrained arm exists, is one env var away
+(`VLLM_PARAKEET_CKPT`), and SKIPS rather than silently passing. Also NOT run:
+any GPU regression suite or CUDA test (the three ops still have no CUDA
+provider, and dgx.casa was down), aarch64, and any speed or memory measurement —
+no number is measured, claimed or owed for this row.
+
+**Out of scope by spike decision:** RNN-T / TDT transducer decode. It has no
+upstream in either vLLM or HF, so it stays a product call and `parakeet.cpp`
+keeps it.
+
+Inherited red gates, untouched and NOT caused here (both verified present at the
+branch point by running the checkers' pure functions over the base files):
+`check-fusion-consistency` (`minimax_h3_video_vae_device`) and
+`check-public-doc-tables` (docs/BENCHMARKS.md:316 is a 371-char cell owned by
+another row, and docs/STATUS.md was already 645 chars over its ratchet). This
+change NET-SHRINKS docs/STATUS.md and .agents/NOW.md rather than growing either.
+
 ## 2026-08-07T12:30 — Kimi-Linear: per-channel-decay KDA device kernel `vt::KdaGatedDeltaRule` LANDED (the §14 STRICT+speed residual, one object)
 <!-- state: 2026-08-07T12:30 -->
 KIMI-KDA-DEVICE-KERNEL (`row/KIMI-KDA-DEVICE-KERNEL`, helper) — the §14 named residual ("`vt::GdnDecode`/
@@ -41180,8 +41344,8 @@ Next: the operator runs the real 13-shard bf16 DiT and answers the quantization
 quality question; nothing here claims it.
 
 ## 2026-08-07T13:30 - H3: the bf16 TEXT ENCODER (14 shards, 63 GB) LOADS + `--encoder-only`, so the Q4_K_M conditioning question is measurable (row/H3-ENC-BF16-COND-DIFF)
-
 <!-- state: 2026-08-07T13:30 -->
+
 
 `row/H3-ENC-BF16-COND-DIFF` (helper, branched from `origin/main` `ad231615`, with
 §8.13's `MiniMaxH3ShardedCheckpoint` (landed separately as `row/H3-BF16-SHARDED-DIT` + `row/H3-BF16-SHARDED-STREAM`)
@@ -41247,8 +41411,8 @@ Thor GPU and diff the `[tokens, 5120]` conditioning (max|diff|, RMS, relative RM
 per-token cosine). Numbers land in the same row.
 
 ## 2026-08-07T13:40 - H3 THE NUMBER: Q4_K_M encoder moves the conditioning as much as a ONE-WORD prompt edit, but DIFFUSELY (row/H3-ENC-BF16-COND-DIFF, Thor)
-
 <!-- state: 2026-08-07T13:40 -->
+
 
 The measurement the loader existed for. Full tables:
 [benchmark-record.md](benchmark-record.md) and
@@ -41465,3 +41629,113 @@ both named residuals). Harness `--incremental`; commit `f9ba4a9c` off `origin/ma
 - **Default:** `--incremental` opt-in; `VT_KIMI_DEVICE_KDA`/`_CHUNK` STAY OFF (≠ STRICT). Row STAYS
   ACTIVE. Next: bf16 residual stream (closes 3% CastBf16 + island round-trips AND the p7 near-tie) +
   paged-FA2 MLA decode. `local-ai-worker` parked during GPU, RESTORED at end. PR #113.
+
+## 2026-08-07: Parakeet P6: the RNN-T and TDT transducer heads land on CPU, and the "no upstream" record is CORRECTED
+<!-- state: 2026-08-07T18:00 -->
+
+Row `MODEL-AUDIO-PARAKEET-TRANSDUCER` (NEW), claim
+`CLAIM-PARAKEET-MODEL-P4`, worktree `/home/mudler/_git/vllm.cpp-parakeet`,
+branch `row/MODEL-AUDIO-PARAKEET-ENCODER`, work item P6 of the spike
+[parakeet-conformer-encoder](specs/parakeet-conformer-encoder.md). CPU only,
+additive.
+
+**The correction first, because it is the reason this row exists.** P4 recorded,
+in the spike, in `include/vllm/model_executor/models/parakeet_encoder.h`, in
+`model-matrix.md` and in the parity ledger, that the RNN-T / TDT transducer had
+"NO upstream in either vLLM or HF transformers" and was therefore a PRODUCT call
+rather than mirror work. The grep behind that was run against the transformers
+INSTALLED on the box, 5.3.0, which ships only `ParakeetForCTC`. It is false of
+upstream: transformers `main` implements the whole stack -
+`ParakeetRNNTDecoder:831`, `ParakeetRNNTJointNetwork:879`, `ParakeetForRNNT:922`,
+`ParakeetTDTJointNetwork:1035`, `ParakeetForTDT:1052` in `modeling_parakeet.py`,
+plus `ParakeetRNNTDecoderCache:23`, `ParakeetRNNTGenerationMixin:125` and
+`ParakeetTDTGenerationMixin:271` in `generation_parakeet.py` and
+`ParakeetRNNTConfig:136` / `ParakeetTDTConfig:188` in
+`configuration_parakeet.py`. The transducer was never a product call; it was
+mirror work behind a stale version check. **Method rule this earns: a grep
+against the installed package is not evidence about upstream. State the version
+you measured, and check `main` before recording anything as unmirrored.**
+
+**What landed.** `include/vllm/model_executor/models/parakeet_transducer.h` +
+`src/vllm/model_executor/models/parakeet_transducer.cpp`: the LSTM prediction
+network (embedding -> stacked `nn.LSTM` cell with BOTH torch bias vectors ->
+decoder projector) carrying `ParakeetRNNTDecoderCache`'s blank fast path, where a
+blank input returns the cached output and advances neither the hidden nor the
+cell state; the joint `head(relu(encoder_projected + decoder))`, widened by
+`len(durations)` for TDT; and the greedy transducer loop with the RNN-T
+`max_symbols_per_step` forced advance, the TDT duration-driven frame skip and its
+blank-with-zero-duration guard, the clamped encoder gather, and the
+`max_symbols_per_step * frames` output bound. The transducer half of
+`src/vllm/model_executor/models/parakeet_weights.cpp` loads
+`encoder_projector.*`, `decoder.embedding.*`, `decoder.lstm.{weight,bias}_{ih,hh}_l*`,
+`decoder.decoder_projector.*` and `joint.head.*`, reusing the P4 encoder key map
+through a new shared `LoadEncoder` helper.
+
+**Gates, all CPU x86-64 `-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`.**
+`tests/vllm/models/test_parakeet_transducer.cpp`, 3 cases / 777 assertions:
+the LSTM cell against an INDEPENDENT in-test scalar reference (gates sliced out
+first, then the recurrence: a different loop structure and accumulation order
+from the port's fused row walk) over 5 shapes x bias/no-bias x 6 sequential
+steps; decoder and joint tensors rel-L2 <= 1.2e-7 against a dumped HF oracle over
+a fixed token walk chosen to drive the blank fast path; and **the emitted
+sequence and the per-step durations EXACT** for both `ParakeetForRNNT` and
+`ParakeetForTDT`, from the oracle's own projected encoder output AND end to end
+from mel features. The fixture asserts its own branch coverage: blank
+emissions, non-blank emissions, tokens held at one frame, RNN-T forced advances -
+so a regeneration that degenerated to a single branch fails instead of gating
+nothing quietly. The TDT case additionally exercises the `max_length` bound
+(48 steps at `max_symbols_per_step` 3 x 16 encoder frames).
+
+**TRACED, not read (T0).** `ParakeetRNNTDecoderCache` is not a `past_key_values`
+cache, so the base `prepare_inputs_for_generation` slicing rules do not visibly
+apply and the per-step decoder input shape cannot be read off the source with
+confidence. A forward hook over a full `generate()` run records that EVERY
+decoder call took `input_ids` of shape `[1, 1]`. That trace is in the fixture
+manifest and the gate asserts it, because the whole greedy loop rests on it.
+
+**PRETRAINED, and this is the binding claim.** `nvidia/parakeet-rnnt-0.6b` and
+`nvidia/parakeet-tdt-0.6b-v3` were downloaded and run. Our emitted token ids are
+EXACT against a real HF `generate()` run on the LibriSpeech clip
+`1089-134686-0000.wav`, both through the reference's own `input_features` and end
+to end through our own WAV reader and log-mel front end. Transcripts:
+CTC/RNN-T (vocab 1025) "he hoped there would be stew for dinner turnips and
+carrots and bruised potatoes and fat mutton pieces to be ladled out in thick
+peppered flour fattened sauce"; TDT-v3 (vocab 8193, punctuation and casing)
+"He hoped there would be stew for dinner, turnips and carrots and bruised
+potatoes, and fat mutton pieces to be ladled out in thick, peppered, flour
+fattened sauce." `nvidia/parakeet-ctc-1.1b` was also verified on the EXISTING P4
+loader with no code change (identical architecture at 42 encoder layers instead
+of 24), producing the same transcript as ctc-0.6b; it was deleted immediately
+after, since the box is shared and was at 98% disk.
+
+**`examples/parakeet_transcribe`** now dispatches on `model_type` in config.json
+(`parakeet_ctc` / `parakeet_rnnt` / `parakeet_tdt`), drives the extractor from the
+checkpoint's own `num_mel_bins` (80 on CTC/RNN-T, 128 on tdt-0.6b-v3) and prints
+DECODED TEXT as well as ids, implementing the `Metaspace` decoder rule directly
+rather than weakening `Tokenizer::FromHfJson`'s deliberate `split: true` refusal,
+which is an encode-side guard this example never needs.
+
+**Checkpoint reach, recorded in the spike.** The HF-safetensors models are in
+(ctc-0.6b, ctc-1.1b, rnnt-0.6b, rnnt-1.1b by construction, tdt-0.6b-v3). The
+`.nemo`-only ones are out until converted: `parakeet-tdt-0.6b-v2` and
+`parakeet-tdt-1.1b` are plain TDT and upstream's own
+`src/transformers/models/parakeet/convert_nemo_to_hf.py` covers them, but the
+`tdt_ctc` hybrids lose their aux CTC head (no hybrid HF class; the converter's
+CTC regex does not match `ctc_decoder.decoder_layers.0.*`) and
+`parakeet_realtime_eou_120m-v1` would convert to a SILENTLY WRONG model, because
+`convert_encoder_config` ignores `att_context_size`, `att_context_style`,
+`causal_downsampling`, `conv_context_size` and `conv_norm_type` and
+`ParakeetEncoderConfig` has no field for any of them. We are NOT writing a
+`.nemo` reader: the pickle/zip part is small, but it would also owe an OmegaConf
+YAML parser and a reimplementation of NeMo's `setup_streaming_params()`
+derivation.
+
+**NOT verified.** No GPU path (the three P1-P3 ops still have no CUDA provider
+and no GPU suite was run), no aarch64, and no speed or memory number measured,
+claimed or owed. No mutation run for the transducer sources this session.
+
+**Doc budgets.** `docs/STATUS.md` had ZERO headroom against its 284067-char
+ratchet, so the Parakeet line was TIGHTENED while gaining the RNN-T/TDT coverage
+and two more verified checkpoints; the page NET-SHRINKS to 284063 and the ratchet
+was LOWERED to match. `check-agent-record.py`'s MODEL row count goes 360 -> 361
+because a genuinely new row exists.

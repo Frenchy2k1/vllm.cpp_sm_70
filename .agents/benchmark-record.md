@@ -14701,6 +14701,91 @@ Full 48.9B GB10 gate vs the §12 STRICT `greedy_ids.npy` (single-load per config
 WHY NEGATIVE (the §14 razor, re-proven). device-KDA WORKS (106→122) because the recurrence is the SAME algorithm as vLLM's decode kernel, only f32-on-bf16 — it MATCHES. But vLLM's MLA prefill uses FA2 (a specific flash tiling/reduction ORDER); `vt::Attention`'s plain f32 online-softmax is the right MATH but a DIFFERENT reduction order, so — exactly like §14's host-precision plateau — it COIN-FLIPS near-ties: it BREAKS p3 16/16→3/16 (got `220,41938,382,1810,…163586,163586` — the same `163586×` degenerate repeat §14's bf16 knobs caused) while p7 stays diverged at 10/16. And it is SLOWER (4.24→3.89): the per-`(t,h)` key/value build copies + the 192-dim pad-V waste add overhead to the O(n²) recompute path. An approximation of vLLM's kernel is not enough — only the ACTUAL kernel matches.
 
 VERDICT: `VT_KIMI_DEVICE_MLA` STAYS OFF, kept as a documented-MEASURED-NEGATIVE A/B knob (parity-lever precedent: §14's `ISLAND_F32ACC`). device-KDA (122/128, 4.24 tok/s) remains the best config, itself default OFF (122 ≠ STRICT). The one-brick STRICT-close did NOT land. STRICT residual, SHARPENED: needs vLLM's ACTUAL kernels, not a device approximation — (c) the **chunk_kda** prefill family (`chunk_kda_scaled_dot_kkt`+`recompute_w_u`+`chunk_gla_fwd_o_gk`+`fused_kda_gate_chunk_cumsum`, FLA `ops/kda.py`) via a Triton-AOT regen for sm_121a (`scripts/regen-triton-aot.sh` + new `triton_kernels/*.py`), the named prime suspect; (d) the paged FA2 `mla::ForwardMlaAttentionBlock` (NOT the `vt::Attention` approximation tried here); (e) paged-incremental decode (needs a decode/paged-attn op with `query_len≠key_len`, which `vt::Attention` cannot express; kills the O(n²)). Each is a substantial multi-kernel brick, recorded as the named follow-on. Row STAYS ACTIVE. HONEST bar stays HW-forced-indirect (vLLM cannot serve this bf16 on one GB10 with KV headroom — §14).
+## Parakeet ASR port: first timing attempt, recorded VOID (2026-08-07)
+
+Recorded so the next person does not repeat it and does not mistake these
+numbers for a result.
+
+`examples/parakeet-transcribe`, `nvidia/parakeet-ctc-0.6b`, x86 dev box, 20
+cores, CPU f32:
+
+| clip | audio | wall |
+|---|---:|---|
+| 1089-134686-0000 | 10.44 s | 8.38 / 12.59 / 9.15 s |
+| 1089-134686-0001 | 3.27 s | 17.39 / 9.51 s |
+
+**VOID on three independent counts**, any one of which is disqualifying:
+
+1. The timed region includes loading a **2.4 GiB f32 safetensors** on every run,
+   which dominates it. The 3.27 s clip taking LONGER than the 10.44 s one is the
+   tell: this measures the loader, not the model.
+2. Run-to-run spread is ~2x (9.51 vs 17.39 s on the same clip), so there is no
+   stable median to quote. The box was at 98% disk with other sessions active.
+3. The x86 dev box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`
+   regardless of the above.
+
+**What a real number needs**, in order: hoist the checkpoint load out of the
+timed region (load once, transcribe N clips); run on the gate host `dgx.casa`
+idle under one flock with 3+ reps; and put **parakeet.cpp on the SAME
+checkpoint** beside it as the floor, which today means converting
+`parakeet-ctc-0.6b` to GGUF since the local parakeet.cpp build only has
+`tdt_ctc-110m` (a 5.5x smaller model at f16, so the existing 0.17 s figure for
+it is NOT a comparable baseline and must not be quoted as one).
+
+Also worth stating plainly: **no optimisation pass has been attempted on this
+port.** It is f32, portable/AVX2 CPU tiers, no quantisation, no CUDA provider
+for its three new ops. The correctness work is done; the speed work has not
+started, and the first honest number will likely be poor.
+
+## Parakeet port vs parakeet.cpp, SAME checkpoint, load excluded (2026-08-07)
+
+Supersedes the VOID attempt above. Same box, same clip, and for the first time
+the SAME weights on both sides: `nvidia/parakeet-ctc-0.6b`, taken as HF
+safetensors by vllm.cpp and as `mudler/parakeet-cpp-gguf:ctc-0.6b-f16.gguf` by
+parakeet.cpp. LibriSpeech `1089-134686-0000.wav`, 10.44 s, x86 20 cores.
+
+### Correctness: the two engines agree EXACTLY
+
+parakeet.cpp `--json` emits token ids
+`67 17 163 33 131 209 50 70 969 69 26 10 896 808 346 1003 25 ...`
+and vllm.cpp's `parakeet-transcribe` emits the identical sequence, 63 ids, same
+order. Two independent implementations, one of them gated at WER 0 against NeMo,
+produce byte-identical token output on real audio. That is a stronger
+correctness signal than either engine's own oracle gate.
+
+### Speed: we are at least 12x slower, and that is the honest headline
+
+| engine | dtype | measurement |
+|---|---|---|
+| vllm.cpp | f32 | **6217 ms** forward-only, best of 5, load and mel EXCLUDED |
+| parakeet.cpp | f16 | **9.09 s** total for the 10.44 s clip, **9.24 s** total for a 3.27 s clip |
+
+parakeet.cpp's wall time is insensitive to clip length (9.09 vs 9.24 s for 3.2x
+the audio), so it is load-dominated and its INFERENCE is bounded by the
+difference: well under 0.5 s, and by the trend nearer 0.15 s. Against our
+6217 ms that is a floor of **>12x slower**, and plausibly ~40x.
+
+Method caveats, stated rather than buried: the x86 box is VOID for binding
+timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`, so treat the RATIO (same box, same
+clip, both engines) as the result and neither absolute as bindable. Our number
+excludes load while parakeet.cpp's includes it, which flatters US, and the gap
+is still >12x. Our f32 against their f16 also flatters them on memory
+bandwidth, so a like-for-like dtype comparison is still owed.
+
+### Why, and what would close it
+
+Nothing here is surprising and none of it is a defect:
+- we run **f32**; they run f16, and their GGUF path also has q8_0/q4_k
+- our three new ops (`kConv2d`, `kDepthwiseConv1d`, `kAttentionRelPos`) have a
+  portable CPU tier ONLY: no CUDA provider, and no arch-specific tier
+- ggml carries llamafile's tiled sgemm, measured earlier in this record as worth
+  ~1.9x on Arm 16-bit and ~2.4x on x86, which we deliberately do not match
+  because it splits the K reduction and uses FMA
+- no optimisation pass of any kind has been attempted on this port
+
+**The correctness work is done; the speed work has not started.** This entry
+exists so nobody mistakes the port for competitive, and so the first optimisation
+claim has a real baseline to beat.
 
 ## 2026-08-07 — Kimi-Linear-48B: chunk_kda PREFILL AOT port SPIKED (kernel set + pinned-config record + regen recipe; NO gate yet) (`row/KIMI-CHUNK-KDA-AOT`)
 

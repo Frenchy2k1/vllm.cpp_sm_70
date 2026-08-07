@@ -350,6 +350,18 @@ enum class OpId : uint8_t {
   // CI too; resolved via minimax_h3::MiniMaxH3Device(). Additive: only
   // MiniMaxH3DitForwardDevice dispatches it. Appended before kCount (no id shift).
   kMiniMaxH3,
+  // --- Conformer / FastConformer audio-encoder kernels (spike
+  // .agents/specs/parakeet-conformer-encoder.md rows P1/P2/P3). Three primitives
+  // the tree had no device op for, each mirroring a transformers 5.3.0
+  // `transformers/models/parakeet/modeling_parakeet.py` module and, where the
+  // structure is identical, vLLM's own native conformer
+  // (`vllm/model_executor/models/conformer_encoder.py`). See vt::Conv2d,
+  // vt::DepthwiseConv1d and vt::AttentionRelPos below for the exact contracts.
+  // Additive: nothing outside the audio-encoder path dispatches them. Appended
+  // before kCount so no existing op's id shifts.
+  kConv2d,
+  kDepthwiseConv1d,
+  kAttentionRelPos,
   kCount
 };
 
@@ -474,6 +486,56 @@ struct AttentionArgs {
   // Causal masking: key position j attends only when j <= query position i.
   // Always true for the M0.9 decoder path (bidirectional is a M1.6+ concern).
   bool causal = true;
+};
+
+// --- Conformer / FastConformer audio-encoder op args (spike
+// .agents/specs/parakeet-conformer-encoder.md P1/P2/P3). ------------------------
+
+// torch `nn.Conv2d` arguments. Mirrors the constructor keywords 1:1 so a reader
+// of `ParakeetEncoderSubsamplingConv2D.__init__`
+// (transformers 5.3.0 transformers/models/parakeet/modeling_parakeet.py:357-390)
+// can map every field by name. `groups == in_channels == out_channels` is the
+// DEPTHWISE form that module's inner layers use (:377-386); `groups == 1` with
+// a 1x1 kernel is its pointwise layer (:388).
+struct Conv2dArgs {
+  int64_t stride_h = 1;
+  int64_t stride_w = 1;
+  int64_t pad_h = 0;
+  int64_t pad_w = 0;
+  int64_t dilation_h = 1;
+  int64_t dilation_w = 1;
+  int64_t groups = 1;
+};
+
+// torch `nn.Conv1d(C, C, K, stride, padding, groups=C)` arguments — the
+// NON-CAUSAL depthwise conv1d of `ParakeetEncoderConvolutionModule`
+// (modeling_parakeet.py:116, ctor :138-146; padding = (K-1)//2 at :136). Not to
+// be confused with CausalConv1dArgs, which drives the Mamba/GDN CAUSAL conv and
+// carries a persistent conv_state; this op is stateless and centre-padded.
+struct DepthwiseConv1dArgs {
+  int64_t stride = 1;
+  int64_t padding = 0;
+  int64_t dilation = 1;
+};
+
+// Transformer-XL relative-position self-attention args — the conformer
+// attention of `ParakeetEncoderAttention` (modeling_parakeet.py:259, forward
+// :302-347, `_rel_shift` :349-355) and of vLLM's own native
+// `RelPosMultiHeadAttention` (conformer_encoder.py:170, forward :188-217,
+// `_rel_shift` :179-186). See vt::AttentionRelPos for the full formula.
+struct AttentionRelPosArgs {
+  // Softmax scale. Upstream sets it to head_dim^-0.5 (ParakeetEncoderAttention
+  // .scaling :271; RelPosMultiHeadAttention.scale :174).
+  float scale = 0.0f;
+  // WHERE the scale is applied, the one arithmetic difference between the two
+  // upstreams. false (default) = HF's form: `matrix_bd *= scaling` (:322) and
+  // `attn_weights = q@k^T * scaling + matrix_bd` (eager_attention_forward :247),
+  // i.e. `s = ac*scale + bd*scale`. true = vLLM's native form:
+  // `attn_scores = (matrix_ac + matrix_bd); attn_scores.mul_(self.scale)`
+  // (conformer_encoder.py:212-213), i.e. `s = (ac + bd) * scale`. The two agree
+  // in exact arithmetic and differ in f32 rounding, so the flag is exposed
+  // rather than chosen, and each upstream gets its own byte-exact path.
+  bool scale_after_sum = false;
 };
 
 // Arguments for vt::DFlashBlockAttention — the DFlash draft's IN-BLOCK attention
@@ -881,6 +943,17 @@ using MoeCombineGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&);
 using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const AttentionArgs&);
+// Conformer / FastConformer audio-encoder kernels (spike P1/P2/P3).
+using Conv2dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
+                          const Tensor* /*bias*/, const Conv2dArgs&);
+using DepthwiseConv1dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                   const Tensor& /*weight*/, const Tensor* /*bias*/,
+                                   const DepthwiseConv1dArgs&);
+using AttentionRelPosFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*query*/,
+                                   const Tensor& /*key*/, const Tensor& /*value*/,
+                                   const Tensor& /*rel_key*/, const Tensor* /*bias_u*/,
+                                   const Tensor* /*bias_v*/, const Tensor* /*key_mask*/,
+                                   const AttentionRelPosArgs&);
 using DFlashBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                         const Tensor&, const DFlashBlockAttentionArgs&);
 using DFlashPagedBlockAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
@@ -2052,6 +2125,105 @@ void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tenso
 // f32 or bf16 in, f32/bf16 out; all softmax/accumulation math in f32.
 void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                const Tensor& value, const AttentionArgs& args);
+
+// --- Conformer / FastConformer audio-encoder kernels -------------------------
+// Spike: .agents/specs/parakeet-conformer-encoder.md (rows P1/P2/P3). Upstream
+// mirror: transformers 5.3.0 transformers/models/parakeet/modeling_parakeet.py,
+// which is what vLLM itself runs (vllm/model_executor/models/parakeet.py:37,62
+// delegate to `from transformers import ParakeetEncoder`); the structurally
+// identical vLLM-NATIVE conformer at
+// vllm/model_executor/models/conformer_encoder.py is cited alongside where it
+// agrees, and its one arithmetic divergence is a flag (AttentionRelPosArgs).
+//
+// P1 — torch `nn.Conv2d`, the encoder front end.
+//   out    [N, Cout, Hout, Wout]
+//   x      [N, Cin,  Hin,  Win ]
+//   weight [Cout, Cin/groups, KH, KW]   (torch's exact parameter layout)
+//   bias   optional rank-1 [Cout]
+// Hout = (Hin + 2*pad_h - dilation_h*(KH-1) - 1)/stride_h + 1, likewise Wout.
+// `groups` must divide both Cin and Cout; output channel oc reads input group
+// oc/(Cout/groups). Zero padding: taps outside [0,Hin)x[0,Win) are SKIPPED.
+// Per output element the reduction is a SINGLE f32 accumulator walked strictly
+// in (ic, kh, kw) order with the bias added LAST, so the result does not depend
+// on the thread count and is byte-reproducible; the in-test scalar reference in
+// tests/vt/test_ops_conv2d.cpp gates exactly that order.
+//
+// This is the op `ParakeetEncoderSubsamplingConv2D` (modeling_parakeet.py:357)
+// is built from: a dense 1->C k/stride/pad conv (:369-371), then per extra
+// stage a DEPTHWISE C->C conv (groups=C, :377-386) and a POINTWISE 1x1 conv
+// (:388). vLLM's native `Conv2dSubsampling` (conformer_encoder.py:18) is the
+// same stack. It also REPLACES the host `std::vector<float>` Conv2dK3S2P1 loop
+// in src/vllm/model_executor/models/gemma4_audio.cpp:92, which stays as an
+// independent correctness reference for that model's prefix.
+// x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
+void Conv2d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const Tensor* bias,
+            const Conv2dArgs& args);
+
+// P2 — NON-CAUSAL depthwise `nn.Conv1d(C, C, K, stride, padding, groups=C)`, the
+// conformer convolution module's temporal mixer.
+//   out    [N, C, Lout]
+//   x      [N, C, Lin]
+//   weight [C, 1, K] (torch's depthwise parameter shape) or [C, K]
+//   bias   optional rank-1 [C]
+// Lout = (Lin + 2*padding - dilation*(K-1) - 1)/stride + 1. Zero padding: taps
+// outside [0,Lin) are SKIPPED. Per output element a SINGLE f32 accumulator over
+// k in increasing order, bias added LAST — thread-count independent and
+// byte-reproducible, gated in tests/vt/test_ops_conv1d_depthwise.cpp.
+//
+// Upstream: `ParakeetEncoderConvolutionModule.depthwise_conv`
+// (modeling_parakeet.py:116, constructed :138-146 with padding=(K-1)//2 :136,
+// applied :180); vLLM native `ConformerConvolution.depthwise_conv`
+// (conformer_encoder.py:229). DELIBERATELY a sibling of, never a modification
+// of, vt::CausalConv1dFwd (ops.h kCausalConv1dFwd): that op is causal, carries a
+// persistent conv_state across steps and folds a SiLU; this one is centre-padded,
+// stateless and activation-free, exactly as the conformer module wants.
+// x/weight/bias f32/f16/bf16; out f32/f16/bf16; all math in f32.
+void DepthwiseConv1d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     const Tensor* bias, const DepthwiseConv1dArgs& args);
+
+// P3 — Transformer-XL relative-position ENCODER self-attention. No KV cache, no
+// paging, no RoPE, non-causal: every existing vt attention path is a decoder
+// path and none of them can express this.
+//   out      [T, Hq,  D]
+//   query    [T, Hq,  D]   raw q projection (bias_u/bias_v added here)
+//   key      [T, Hkv, D]   Hq a multiple of Hkv (GQA broadcast, as vt::Attention)
+//   value    [T, Hkv, D]
+//   rel_key  [P, Hq,  D]   P == 2*T-1, the projected relative-position keys
+//   bias_u   optional [Hq, D]  global CONTENT bias   (term (c))
+//   bias_v   optional [Hq, D]  global POSITION bias  (term (d))
+//   key_mask optional rank-1 [T] i8/i32, 1 = valid key, 0 = masked to -inf
+// Per q-head h (kv-head g = h/(Hq/Hkv)), query i, key j:
+//   ac = Σ_d (query[i,h,d] + bias_u[h,d]) * key[j,g,d]              (a)+(c)
+//   bd = Σ_d (query[i,h,d] + bias_v[h,d]) * rel_key[T-1-i+j, h, d]  (b)+(d)
+//   s[j] = scale*ac + scale*bd     (or (ac+bd)*scale, see scale_after_sum)
+//   p    = softmax_j(s)            (f32, max-subtracted)
+//   out[i,h] = Σ_j p[j] * value[j,g]
+// The `T-1-i+j` index IS the `_rel_shift` of both upstreams, closed-form. Proof:
+// _rel_shift left-pads the [T, 2T-1] matrix_bd by one column, reinterprets it as
+// [2T, T], drops the first row and reinterprets as [T, 2T-1]; element (i,p) then
+// carries flat index i*(2T-1)+p+T, whose (row, col) in the [T, 2T] padded view is
+// (i, T-i+p) because 1 <= T-i+p <= 2T-1 for all i,p in [0,T). Column c>=1 of the
+// padded view is original column c-1, so shifted(i,p) = raw(i, T-1-i+p); the
+// `[..., :T]` truncation then leaves p == j. HF (modeling_parakeet.py:349-355,
+// truncated :320) and vLLM native (conformer_encoder.py:179-186, truncated to
+// T2//2+1 == T) perform the identical map, so the closed form serves both.
+//
+// Deviation, recorded: upstream MATERIALIZES query+bias_u and query+bias_v as
+// activation-dtype tensors (:295-300 / conformer_encoder.py:205-206); we add the
+// bias inside the kernel in f32, which is at least as accurate but rounds
+// differently for a bf16/f16 activation. Pass bias_u/bias_v == nullptr and a
+// pre-biased query to reproduce upstream's rounding exactly.
+//
+// A query row whose every key is masked yields ZEROS rather than upstream's NaN
+// (softmax over an all -inf row); such a row is itself padding and its output is
+// discarded. Recorded deviation, asserted in tests/vt/test_ops_attn_relpos.cpp.
+// Reductions are strictly sequential per output element => thread-count
+// independent and byte-reproducible. f32/f16/bf16 in, f32/f16/bf16 out; all
+// softmax and accumulation math in f32.
+void AttentionRelPos(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                     const Tensor& value, const Tensor& rel_key, const Tensor* bias_u,
+                     const Tensor* bias_v, const Tensor* key_mask,
+                     const AttentionRelPosArgs& args);
 
 // Same contract and math as Attention (dense full/causal, GQA broadcast, f32
 // online-softmax), but the CUDA impl is WARP-scoped (one warp per (query,head),
