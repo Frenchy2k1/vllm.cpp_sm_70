@@ -6408,6 +6408,37 @@ TEST_CASE("minimax_h3: the DEVICE keep-quant encoder matches the host f32 refere
   CHECK(err <= 2e-3);
   CHECK(mag > 1e-3);  // the tower produced something, not zeros
   for (float v : got) REQUIRE(std::isfinite(v));
+
+  // DEEPSTACK: the surface #86 could not cover — the DEVICE forward now takes the
+  // visual position mask + per-tap blocks and injects them into the first N layers,
+  // exactly like the gated host reference and upstream `_deepstack_process`. Gate the
+  // device against the host reference WITH deepstack, and prove it changes the result.
+  std::vector<uint8_t> visual_mask(static_cast<size_t>(SEQ), 0);
+  visual_mask[1] = 1;
+  visual_mask[3] = 1;
+  visual_mask[4] = 1;
+  int64_t num_visual = 0;
+  for (uint8_t m : visual_mask) num_visual += m;
+  std::vector<std::vector<float>> deepstack;  // one [num_visual, H] block per injected layer
+  for (int64_t l = 0; l < LAYERS; ++l) {
+    deepstack.push_back(MakeParam("encd.deepstack." + std::to_string(l), num_visual * H, 0.05));
+  }
+  const std::vector<float> want_deep = vllm::MiniMaxH3EncoderTextForward(
+      cfg, host, embeds, pos.data(), SEQ, visual_mask.data(), deepstack);
+  const std::vector<float> got_deep = vllm::MiniMaxH3EncoderTextForwardDevice(
+      q, cfg, staged, embeds, pos.data(), SEQ, visual_mask.data(), deepstack);
+  REQUIRE(got_deep.size() == want_deep.size());
+  double derr = 0.0, dmag = 0.0, delta = 0.0;
+  for (size_t i = 0; i < want_deep.size(); ++i) {
+    derr = std::max(derr, std::abs(static_cast<double>(got_deep[i] - want_deep[i])));
+    dmag = std::max(dmag, std::abs(static_cast<double>(want_deep[i])));
+    delta = std::max(delta, std::abs(static_cast<double>(want_deep[i] - want[i])));
+  }
+  INFO("device keep-quant encoder (deepstack) vs host: max|diff| = " << derr << " (scale " << dmag
+                                                                     << ")");
+  CHECK(derr <= 2e-3);
+  CHECK(delta > 1e-4);  // DeepStack must actually move the conditioning, or the gate is vacuous
+  for (float v : got_deep) REQUIRE(std::isfinite(v));
 }
 
 TEST_CASE("minimax_h3: the embedding gather decodes ONLY the rows it needs, exactly") {

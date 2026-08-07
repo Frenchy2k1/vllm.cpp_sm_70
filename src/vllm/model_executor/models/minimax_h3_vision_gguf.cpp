@@ -45,8 +45,11 @@ multimodal::Qwen3VLVisionConfig MiniMaxH3EncoderVisionConfig() {
   cfg.in_channels = 3;
   // H3's encoder carries 3 REAL DeepStack mergers (visual.deepstack_merger_list.{0,1,2}),
   // UNLIKE the Qwen3.6-27B (empty). The WHICH-layers taps are not in the weights-only
-  // GGUF; these are inferred evenly-spaced over depth 27 and must be confirmed against
-  // the upstream vision_config for a bit-correct DeepStack inject (spec §8.8 residual).
+  // GGUF but are now CONFIRMED against the release config: MiniMax-H3's text_encoder is
+  // Qwen3-VL-32B-Instruct, whose `vision_config.deepstack_visual_indexes = [8, 16, 24]`
+  // (depth 27) — identical to the Qwen3-VL-MoE vision tower (vllm-omni
+  // `Qwen3VLMoeVisionConfig` default, and the public Qwen/Qwen3-VL-30B-A3B config.json).
+  // The #86 inference was correct (spec §8.8).
   cfg.deepstack_visual_indexes = {8, 16, 24};
   cfg.norm_eps = 1e-6f;
   return cfg;

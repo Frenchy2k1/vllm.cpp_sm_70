@@ -40259,3 +40259,48 @@ kept). Records: spec §8.8 + §8.2, STATUS/BENCHMARKS/FEATURES, benchmark-record
   Note also that `agent-record` was ALREADY failing on `main` at `4cfeee13`
   before this merge (`check-fusion-consistency`, `minimax_h3_video_vae_device`),
   verified on `origin/main` itself. That one is not from this work.
+
+## 2026-08-07T04:10 - MiniMax-H3 ENCODER VISION SCATTER wired+gated; fl2va COHERENT via encoder vision path; ref2va grid RE-ATTRIBUTED to the reference-row assembly (row/H3-VISION-SCATTER, helper, PR #90)
+<!-- state: 2026-08-07T04:10 -->
+
+Closes the #86 framework residual and re-attributes the ref2va grid with a GB10 render A/B.
+
+**deepstack_visual_indexes CONFIRMED (was #86-inferred).** `{8,16,24}` grounded in the release
+config: H3's text_encoder/ IS Qwen3-VL-32B-Instruct, whose vision_config.deepstack_visual_indexes =
+[8,16,24], depth 27, text num_hidden_layers 64 (→50). Same as vllm-omni Qwen3VLMoeVisionConfig
+default and public Qwen/Qwen3-VL-30B-A3B. No value change; comment updated (minimax_h3_vision_gguf.cpp).
+
+**Deliverable 1 — DEVICE scatter+inject WIRED 1:1 + GATED.** MiniMaxH3EncoderTextForwardDevice
+(minimax_h3_encoder_device.cpp:103,216-243) now takes visual_pos_mask + per-tap deepstack blocks and
+ADDS each block into the masked visual rows after each of the first N decoder layers — device mirror of
+the gated host reference and upstream _deepstack_process (encoder.py:770-800). Merged masked_scatter
+into inputs_embeds stays the caller's job (upstream _encode). Text-only byte-identical (defaults).
+Gate: device keep-quant encoder test now runs WITH a visual mask + 2 DeepStack blocks → device==host
+max|diff| 3.8e-4 (≤2e-3), DeepStack moves conditioning (scale 1.006→1.062); PASS 1562 assertions.
+Host text tower + full vision tower + GGUF visual.* loader + MM processor all green. NVFP4 line-3503
+SIGSEGV is the known standalone-passing cross-test flake, not mine.
+
+**Driver --cond-image** routes an image through the encoder vision path (reuse: Qwen3VLImageProcessor →
+Qwen3VLVisionForward → merged+3 deepstack; ExpandImagePlaceholders; masked_scatter; Qwen3VLGetRopeIndex
+== H3 _get_rope_index for t==1, position math verified). Additive.
+
+**GB10 render A/B (256x256/22f/12steps).**
+- fl2va + --cond-image = COHERENT + matching (deliverable 3 PASS): FL2VA GGUF --dequant-bf16 +
+  --first-frame + --cond-image + --partition fl2va, conditioning [82,5120] (64 merged + 3 deepstack).
+  Frame 0 = coherent orange cat (keyframe); frame 21 = cat on a WINDOWSILL in warm sunlight (evolved
+  toward the prompt). No grid. Artifact ~/h3fp4/out_vs_fl2va.mp4. Vision conditioning is SOUND.
+- ref2va + --cond-image STILL GRIDS (deliverable 2, honest FAIL): Ref2VA NVFP4 --fp4-resident +
+  --ref-image + --cond-image + --partition ref2va, conditioning [82,5120], latent 7x16x16. Every frame
+  the same multicolour patch grid as #86. Artifact ~/h3fp4/out_vs_ref2va.mp4.
+
+**RE-ATTRIBUTION (evidence).** The "vision-enriched conditioning fixes the grid" hypothesis is REFUTED.
+NOT the encoder conditioning: (a) DiT forward math byte-exact (geometry ladder #74, device==host seq
+1920 #77); (b) SAME vision scatter path renders a COHERENT fl2va; (c) grid invariant to text-only vs
+vision-enriched prompt. Only difference: fl2va PINS output rows (keyframe), ref2va PREPENDS free-running
+reference rows. Residual = the ref2va reference-row conditioning ASSEMBLY (MiniMaxH3EncodeReferenceImages
+VAE-reference rows + minimax_h3_packed_sequence_ref2va_blocks noised-anchor layout + un-pinned target-row
+denoise), NOT prompt_embeds and NOT the DiT forward. Next: dump ref2va target-row VAE-input adjacency
+cosine (vs #77's 0.95 for coherent fl2va) + A/B the reference-row condition-noise.
+
+Box left clean (renders exited, GPU idle, gpu.lock released, worker stays parked, temp PNGs pruned,
+ckpts kept). Records: spec §8.9 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW.

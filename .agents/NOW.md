@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-06 -->
+<!-- now-updated: 2026-08-07 -->
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
@@ -18,7 +18,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | DeepSeek-V4-Flash decode | **Closed: beats ds4 1.144x** (`VT_V4_RESIDENT_W`, byte-exact); phase-2 residency NEG, default-OFF | — |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + AGENTS.md checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **vision tower RUNS on real weights + fl2va COHERENT** (`H3-CONDITIONED-E2E` PR#86: `visual.*` loader+probe; fl2va matched cat; ref2va grids) | scatter feats→embeds + DeepStack→text tower |
+| MiniMax-H3 lane | **vision→cond scatter WIRED+gated; fl2va COHERENT via encoder path** (`H3-VISION-SCATTER` PR#90; indices {8,16,24} confirmed) | ref2va grids; residual = ref2va ref-row assembly (§8.9) |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **e2e RUNS** (bf16-resident §13): 13/13·656. Token gate **NEAR-TIE 106/128** | device GDN/MLA islands; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |

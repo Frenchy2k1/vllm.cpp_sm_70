@@ -1065,10 +1065,22 @@ MiniMaxH3EncoderDeviceWeights StageMiniMaxH3EncoderWeights(
 // its ggml blocks with no dequantization. `positions` is [3, seq] (the M-RoPE
 // temporal/height/width axes); for a pure text prompt all three are the token
 // index. Returns [seq, hidden] f32.
+//
+// DeepStack (image/video conditioning): `visual_pos_mask` is [seq] (1 at each
+// visual-token row) and `deepstack` is one [num_visual, hidden] block per tap.
+// After each of the FIRST `len(deepstack)` decoder layers, each block is ADDED to
+// the masked rows — the device mirror of MiniMaxH3EncoderTextForward's DeepStack
+// and of upstream `MiniMaxH3Qwen3VLTextModel._deepstack_process` (encoder.py:770-800,
+// `hidden_states[visual_pos_masks] += visual_embeds`). Text-only prompts pass the
+// defaults (no mask, no blocks) and the path is byte-identical to before. The
+// MERGED-feature masked_scatter into `inputs_embeds` is the CALLER's job (upstream
+// `_encode` does it on inputs_embeds before the tower runs); this forward consumes
+// the already-scattered stream, exactly like the host reference.
 std::vector<float> MiniMaxH3EncoderTextForwardDevice(
     vt::Queue& queue, const MiniMaxH3EncoderConfig& config,
     const MiniMaxH3EncoderDeviceWeights& weights, const std::vector<float>& inputs_embeds,
-    const int64_t* positions, int64_t seq);
+    const int64_t* positions, int64_t seq, const uint8_t* visual_pos_mask = nullptr,
+    const std::vector<std::vector<float>>& deepstack = {});
 
 MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
                                                           int64_t max_layers = 0);
