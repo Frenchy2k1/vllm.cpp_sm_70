@@ -42374,6 +42374,38 @@ leaves (Kimi runner fold #279, Parakeet ASR #280). Reviewer findings 1-8 applied
 tests, ratchet equality pin, reachable-row-removal design note, meta-gap note). No
 CUDA build; no perf number owed; STATUS inside its char ratchet.
 
+## 2026-08-07T21:41 — exact GDN chunks transplanted onto current main
+
+<!-- state: 2026-08-07T21:41 -->
+
+`ROAD-V1-C2-LOCAL-BF16` / `SERVE-CLI-BENCH` / `KERNEL-SSM-MAMBA`, clean
+branch `row/KERNEL-SSM-MAMBA-EXACT-CHUNKS` from `upstream/main` `f91a5917a`.
+
+- **Clean transplant.** The unrelated profile-aware agent-efficiency commit and
+  five intermediate measurement-only commits are absent. This branch carries
+  the production-`AsyncLLM` benchmark correction used by the measurement, its
+  committed spike, the exact-chunk kernel change, tests, final evidence and the
+  current-main keyed-record reconciliation.
+- **Upstream partition ported.** `GDNAttentionMetadata` constructs exact
+  `(sequence, 8-token chunk)` descriptors once per step, uploads once and
+  shares them across GDN layers. `VT_CONV_EXACT_CHUNKS=0` restores the legacy
+  mapping; `VT_CONV_REG=0` remains tiled/scalar. Default is ON.
+- **Measured source result.** RED-first host/CUDA/model gates and cached 4B
+  3/3·1672 were green on the source tree. Three production rollback/default
+  pairs were byte-identical. Same-binary `nsys`: conv **720.047→234.607 ms =
+  3.069x**; vLLM 145.421 ms leaves **1.613x**. Enclosing total/output +2.152%,
+  TTFT -2.945%, TPOT -1.920%, E2E -2.118%; VRAM unchanged. Against sealed
+  vLLM, throughput **1.021246x PASS**; latency and VRAM remain open.
+- **Fresh-oracle caveat.** Two 18-leg attempts were VOID on FlashInfer/Torch/
+  Triton JIT infrastructure. The linker search is repaired; the sealed same-box
+  denominator remains binding. No 4B result extrapolates to 27B/35B.
+- **Transplant gate GREEN.** Contained CPU/CUDA rebuild passes; focused CPU
+  6/6, full CUDA GDN 66/66·4300, cached Qwen3.5-4B 3/3·1672. Current-main
+  same-binary graph-node reprofile is token-identical and reproduces conv
+  **720.217→234.379 ms (3.073x)**. Profiled total throughput
+  **6587.66→6727.35 tok/s (+2.121%)**, TTFT -3.142%, TPOT -1.849%, E2E -2.088%.
+  Next: spike the residual tile/register-pressure hypothesis.
+
 ## 2026-08-07 — ARCH-ONE-SURFACE ROW 1: Parakeet ASR folded onto the ONE surface (PR #121)
 <!-- state: 2026-08-07T23:30 -->
 
@@ -42982,8 +43014,23 @@ removing only `; #129: SPIKE∅`; the compact clause consumes the existing
 279150-character ratchet exactly. `ENG-RELEASE-BINARIES` remains `SPIKE`: there
 is no archive, runtime, correctness or performance evidence.
 
+## 2026-08-08 — sm_120 exact chunks rebased and revalidated
+<!-- state: 2026-08-08T20:30 -->
 
-<<<<<<< ours
+The measured code tree `3d2581551` was one commit above `upstream/main`
+`48a54141f`; it was subsequently rebased code-identically onto `b38f78a77`
+(the intervening release-binary merge changes only records/checkers/workflow).
+Keyed records took each new main wholesale before the exact branch edits were
+reapplied. The contained 881-target CUDA build is clean. Focused gates pass
+6/6, full CUDA GDN passes 66/66 cases and 4300 assertions, and cached
+Qwen3.5-4B passes 3/3 cases and 1672 assertions.
+
+Fresh same-binary graph-node traces preserve byte-identical token files.
+Rollback/exact causal-conv totals are 718.704016/233.954533 ms, **3.07198x**;
+the enclosing run is 6589.65→6739.34 tok/s (**+2.272%**) with TTFT, TPOT and
+E2E all improving. The result survives the main advance. The sealed vLLM
+causal-conv denominator remains 145.421 ms, leaving **1.60881x** open; latency,
+VRAM and both hardware-unavailable release-model gates remain open.
 
 ## 2026-08-08 — Tensor-parallelism end-to-end spike lands at the current pin (task #287)
 <!-- state: 2026-08-08T21:00 -->
@@ -43024,7 +43071,6 @@ scoping stays a future spike.
 Rows moved: none in lifecycle (`BACKEND-DISTRIBUTED-TP`/`PAR-TP` stay
 `READY`, now pointing at the new spec; `SPEC-DSPARK` stays `INVENTORIED`).
 Next: dispatch TP-W1 (GroupCoordinator-analog) — CPU-completable, no HW wait.
-=======
 
 ## 2026-08-08T21:00 - richiejp stack LANDS: #65 + #79 merged with fix map (prep/land-65, prep/land-79)
 <!-- state: 2026-08-08T21:00 -->
@@ -43054,37 +43100,6 @@ RESIDUALS, recorded not fixed (per the review map, operator-held): F79-3 and
 F79-4 remain open on the landed tree; the review's merge-and-fix map is the
 binding description. Pi concurrency, BF16 GEMM/speed closure (W6) stay open
 as the lane's own next steps.
->>>>>>> theirs
-
-## 2026-08-08T21:00 - richiejp stack LANDS: #65 + #79 merged with fix map (prep/land-65, prep/land-79)
-<!-- state: 2026-08-08T21:00 -->
-
-The external RPi5/Cortex-A76 stack lands as two prepared branches off
-`b38f78a7`: `prep/land-65` (PR #65, PMU kernel-bench harness + lane records)
-and `prep/land-79` (PR #79, the Q8_0 SDOT/AAPCS64 tier), keyed records merged
-by the resolution law (main wholesale + in-lane rows; state pure-append in
-anchor order). The mutation review's fix map applied: F65-1 (ONE-SURFACE
-allowlist entry for `examples/cpu_kernel_bench`, ratchet 8->9 with a dated
-operator exception), F79-5 (KERNEL count 50->51 on top of main, their dated
-comment transplanted), F79-6 (the two RPi5 BENCHMARKS.md paragraphs are keyed
-table rows pointing at `docs/bench-evidence/rpi5-*.md`; the STATUS.md CPU cell
-condensed inside the char/cell ratchets), and F79-1: the new
-`test_ops_quant_dot` A76 byte-equality case referenced
-`QuantTraits(kQ8_0).vec_dot` — the SELECTED kernel, i.e. the assembly tier on
-a real A76 — so its CHECKs were a self-comparison. A true-portable seam
-`vt::cpu::QuantQ8PortableVecDot()` (quants.c:400 order) is exported next to
-the existing sdot/asm getters, the reference arm retargeted, and a new
-seam-pinning case compares the portable kernel byte-equal against an
-independent in-test transcription of the exact order on EVERY platform
-(contraction-robust: mul and fma candidates). Mutation kill verified on x86:
-reversing the portable block accumulation order REDs exactly that case
-(2 assertions, blocks=3/64), green on revert; 23/23 cases, 150231 assertions.
-
-RESIDUALS, recorded not fixed (per the review map, operator-held): F79-3 and
-F79-4 remain open on the landed tree; the review's merge-and-fix map is the
-binding description. Pi concurrency, BF16 GEMM/speed closure (W6) stay open
-as the lane's own next steps.
-
 
 ## 2026-08-08 — ROCm approach-(b): unified memory true by construction on integrated APUs
 <!-- state: 2026-08-08T21:30 -->

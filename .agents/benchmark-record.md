@@ -15124,8 +15124,6 @@ llama.cpp's Vulkan" when it is really "our CPU tier vs llama.cpp's Vulkan". The
 comparison becomes meaningful when native coverage closes — the progress metric is
 `vt::GetReferenceTierHits()` reaching 0, and the ops that matter for this model are
 the RoPE table build, the sampler tail, and the remaining norm/glue set.
->>>>>>> 814230a0 (bench(vulkan): VK-E unblocked with identical weights; ours quoted as NO RATIO)
-
 #### CORRECTION (2026-08-07, same session): the vllm.cpp Vulkan arm is GPU-BOUND, not CPU-bound
 
 The entry above attributes vllm.cpp's slowness to "our HOST FALLBACK wearing a
@@ -15983,3 +15981,76 @@ loads, or caching the K/V slice across the query heads that share a KV head —
 Recorded because the hypothesis was specific and the refutation is reusable: this
 is the second kernel this session where a barrier-count argument looked compelling
 and measured flat (the subgroup GEMV was the first).
+
+## 2026-08-07 — sm_120 exact GDN causal-conv chunks: 3.069x kernel, +2.152% enclosing
+
+**Disposition:** ACCEPTED and reproduced on clean current-main transplant
+`upstream/main` `f91a5917a`. Exact chunks default ON; latency, VRAM and
+27B/35B gates stay open.
+
+The metadata builder enumerates exact `(sequence, 8-token chunk)` work, uploads
+its two i32 descriptors once per step and shares them across GDN layers. The
+register kernel consumes one descriptor per `grid.y`.
+`VT_CONV_EXACT_CHUNKS=0` is the same-binary whole-sequence rollback;
+`VT_CONV_REG=0` selects tiled/scalar.
+
+**Correctness.** RED compile evidence:
+`/tmp/vllm-agent-runs/gdn-exact-red-escalated.json`. Focused host metadata and
+flags, affected Qwen fixtures, full CUDA GDN and cached Qwen3.5-4B 3/3·1672
+were green. Three production ON/OFF pairs had identical token files for all
+128 requests × 128 outputs.
+
+**Same-binary profile.** Manifest
+`/tmp/vllm-agent-runs/qwen35-conv-exact-ab-profile.json`; rollback/default
+traces `/tmp/qwen35-conv-exact-{off,on}.nsys-rep`. Rollback: 1728 calls,
+720.047171 ms, 416.694 us mean. Exact: 1728 calls, 234.607112 ms, 135.768 us.
+That is **3.069x**, saving 485.440 ms. Exact `grid.y=279/280/282` work counts
+replace dominant `(64,28..32,1)` whole-sequence grids, confirming the proposed
+mechanism. Pinned-vLLM same-tool total is 145.421 ms; residual **1.613x**.
+
+**Enclosing A/B.** Manifest
+`/tmp/vllm-agent-runs/qwen35-conv-exact-local-ab.json`; evidence root
+`/tmp/qwen35-conv-exact-local-ab-20260807`. Three alternating pairs under one
+GPU lock and a 25 GiB user-systemd scope:
+
+| Axis | rollback | exact default | ratio |
+|---|---:|---:|---:|
+| total | 6641.800 tok/s | 6784.743 tok/s | 1.02152x |
+| output | 734.433 tok/s | 750.237 tok/s | 1.02152x |
+| TTFT | 1048.927 ms | 1018.040 ms | 0.97055x |
+| TPOT / ITL | 35.420 ms | 34.740 ms | 0.98080x |
+| E2E | 5547.687 ms | 5430.180 ms | 0.97882x |
+
+Against sealed vLLM, exact local is **1.021246x** throughput,
+**1.085812x** TTFT and **1.024597x** TPOT. Exact peak VRAM
+13044/13058/13058 MiB, mean 13053.3, versus old local 13054 and vLLM 12820.
+
+**VOID oracle attempts.** `qwen35-conv-exact-default-full-compare.json` exposed
+the missing live-driver link path; the harness now adds `/run/opengl-driver/lib`
+to `LIBRARY_PATH`. `qwen35-conv-exact-default-full-compare-rerun.json` reached
+13/18 legs before a transient Torch bytecode read invalidated Triton AOT cache
+keys. Neither attempt supersedes the sealed denominator. Full evidence:
+`docs/bench-evidence/qwen35-4b-sm120-main-20260807.md`.
+
+**Clean-transplant reproduction (`f91a5917a`).** Contained CPU/CUDA rebuild;
+focused CPU 6/6, full CUDA GDN 66/66·4300, cached 4B 3/3·1672. Same-binary
+graph-node traces `/tmp/qwen35-conv-exact-transplant-{off,on}.nsys-rep` and
+token files reproduce the mechanism with byte identity: rollback 1728 calls /
+720.216507 ms / 416.792 us, exact 1728 / 234.379395 ms / 135.636 us =
+**3.072866x**. Profiled enclosing totals are 6587.66→6727.35 tok/s
+(**1.021205x**), TTFT 1058.73→1025.46 ms, TPOT 35.70→35.04 ms and E2E
+5592.69→5475.91 ms. The transplanted result is therefore reproduced, not merely
+carried from its old branch. Against the sealed vLLM conv trace, residual is
+**1.611730x**.
+
+**Post-rebase reproduction (`3d2581551` on `upstream/main` `48a54141f`).** The
+contained rebuild and all three gates remain green: focused 6/6, CUDA GDN
+66/66·4300, cached 4B 3/3·1672. Fresh graph-node traces and token files under
+`/tmp/qwen35-conv-exact-rebase-3d2581551-{off,on}.*` are byte-identical.
+Rollback is 1728 calls / 718.704016 ms / 415.917 us; exact is 1728 /
+233.954533 ms / 135.390 us = **3.07198x**. Profiled enclosing totals are
+6589.65→6739.34 tok/s (**1.02272x**), TTFT 1057.63→1022.70 ms, TPOT
+35.70→34.99 ms and E2E 5590.92→5466.20 ms. The result therefore survives the
+27-commit main advance; against the sealed vLLM conv trace the residual is
+**1.60881x**. Trace SHA-256: rollback `6a5dde18e...f97c47`, exact
+`f47fb9cc...7aecf9`; both token files `83fcdc45...453545`.

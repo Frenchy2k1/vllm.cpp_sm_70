@@ -294,6 +294,10 @@ GDNAttentionMetadata PrefillGdnMeta(int64_t T, int32_t sidx) {
   g.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
   g.prefill_state_indices = std::vector<int32_t>{sidx};
   g.prefill_has_initial_state = std::vector<uint8_t>{0};
+  const auto conv =
+      vllm::v1::ComputeCausalConv1dMetadata(*g.non_spec_query_start_loc);
+  g.batch_ptr = conv.batch_ptr;
+  g.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
   return g;
 }
 
@@ -351,6 +355,10 @@ GDNAttentionMetadata ChunkGdnMeta(int64_t qlen, int32_t sidx, bool has_initial) 
   g.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(qlen)};
   g.prefill_state_indices = std::vector<int32_t>{sidx};
   g.prefill_has_initial_state = std::vector<uint8_t>{hi};
+  const auto conv =
+      vllm::v1::ComputeCausalConv1dMetadata(*g.non_spec_query_start_loc);
+  g.batch_ptr = conv.batch_ptr;
+  g.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
   return g;
 }
 
@@ -603,6 +611,10 @@ TEST_CASE("qwen27 GDN metadata validates complete prefill suffixes before I/O") 
   gm.prefill_state_indices = std::vector<int32_t>{1, 2};
   gm.prefill_query_start_loc = std::vector<int32_t>{0, 2, 5};
   gm.prefill_has_initial_state = std::vector<uint8_t>{0, 1};
+  const auto conv =
+      vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+  gm.batch_ptr = conv.batch_ptr;
+  gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
 
   CHECK_NOTHROW(vllm::detail::ValidateGdnAttentionMetadata(
       gm, /*state_slots=*/3, /*allow_inert_padding=*/false));
@@ -1164,6 +1176,10 @@ TEST_CASE("qwen27 dense paged: indexed GDN mixed turnover matches row-copy fallb
   gm.prefill_query_start_loc = std::vector<int32_t>{0, 2};
   gm.prefill_state_indices = std::vector<int32_t>{1};
   gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  const auto conv =
+      vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+  gm.batch_ptr = conv.batch_ptr;
+  gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
 
   const std::vector<int32_t> ids = {4, 11, 0};
   const std::vector<int32_t> pos = {3, 0, 1};
@@ -1246,6 +1262,10 @@ TEST_CASE("qwen27 dense paged: GDN state zeroing protects a fresh req in a mixed
   gm.prefill_query_start_loc = gm.non_spec_query_start_loc;
   gm.prefill_state_indices = std::vector<int32_t>{0, 1};
   gm.prefill_has_initial_state = std::vector<uint8_t>{0, 0};
+  const auto conv =
+      vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+  gm.batch_ptr = conv.batch_ptr;
+  gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
 
   const std::vector<float> batch = Qwen3_5DenseModel::Forward(
       ids, pos, am, gm, pool.attn_kv, pool.gdn_state, w, c, q);

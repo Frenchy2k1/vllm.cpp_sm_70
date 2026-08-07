@@ -1676,6 +1676,16 @@ void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
   const int64_t n = conv_state.shape[0];
   CheckI32Meta(q, query_start_loc, n + 1, "causal_conv1d_fwd", "query_start_loc");
   CheckBoolMeta(q, has_initial_state, n, "causal_conv1d_fwd", "has_initial_state");
+  VT_CHECK((args.batch_ptr == nullptr) == (args.token_chunk_offset_ptr == nullptr),
+           "causal_conv1d_fwd: batch_ptr and token_chunk_offset_ptr must be supplied together");
+  if (args.batch_ptr != nullptr) {
+    const int64_t programs = args.batch_ptr->shape[0];
+    CheckI32Meta(q, *args.batch_ptr, programs, "causal_conv1d_fwd", "batch_ptr");
+    CheckI32Meta(q, *args.token_chunk_offset_ptr, programs, "causal_conv1d_fwd",
+                 "token_chunk_offset_ptr");
+    VT_CHECK(programs > 0,
+             "causal_conv1d_fwd: exact chunk descriptor must not be empty");
+  }
   reinterpret_cast<CausalConv1dFwdFn>(GetOp(OpId::kCausalConv1dFwd, q.device.type))(
       q, out, x, weight, bias, conv_state, query_start_loc, has_initial_state, args);
 }
