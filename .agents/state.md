@@ -41093,3 +41093,32 @@ is required") is now IMPLEMENTED as the additive device op `vt::KdaGatedDeltaRul
   (needs a decode/paged-attn op, query_len≠key_len, which `vt::Attention` cannot express; kills O(n²)).
   Each a substantial multi-kernel brick. Row STAYS ACTIVE. Box left clean (build tree/markers removed,
   memory restored to 112 GiB avail, worker restarted --restart=always, golden preserved, no reboot).
+
+## 2026-08-07T13:00 — Kimi-Linear chunk_kda PREFILL AOT port — Phase-1 SPIKE (kernel set + pins + recipe; no gate) (`row/KIMI-CHUNK-KDA-AOT`)
+<!-- state: 2026-08-07T13:00 -->
+The §16 STRICT residual (c) — vLLM runs the PROMPT through the CHUNKED `chunk_kda` kernel while we
+still run the recurrent form (a different reduction order that coin-flips the p7 near-tie) — is now
+SCOPED, GROUNDED and de-risked to mechanical execution. Spec §17 is the AOT regen recipe +
+pinned-config record.
+- **Exact forward-only kernel set** (`chunk_kda_with_fused_gate`→`_fwd`, FLA `kda.py` @ 555967922):
+  5 NEW Triton kernels — `kda_gate_cumsum_fwd_kernel` `:1182`, the two `chunk_kda_scaled_dot_kkt`
+  sub-kernels `:521`/`:627`, `recompute_w_u_fwd_kernel` `:817` (KDA per-K-channel, ≠ GDN `wy_fast.py`),
+  `chunk_gla_fwd_kernel_o` `:1019`; + 1 NEW PIN of an existing .py (`chunk_delta_h.py` with
+  `USE_GK=1,USE_EXP2=1,USE_G=0,Hg=32` — GDN's `gdn_deltah` pin is NOT reusable); + 1 pure REUSE
+  (`solve_tril`→`gdn_tril_h32`, byte-identical sig). Decode STAYS #104 recurrent (vLLM's own split).
+- **Delivered**: 5 harness bodies authored (verbatim FLA ports, AOT-adapted) STAGED in
+  `.agents/specs/kda-chunk-aot/` (CI-safe — drift globs `triton_kernels/*.py` non-recursively); the
+  full `_vllm_triton_aot_declare` recipe (§17.3); the `vt::KdaChunkPrefill` op design (buffer layout,
+  6-launch order, dispatch guard, prefill/decode split, mirrors `cuda_gdn.cu` GdnPrefill); the
+  RED-first gate plan (unit vs #104 recurrent + #173 host refs + FLA-python golden; then 48.9B STRICT).
+- **NOT YET (Phase-2, coupled)**: the harness signatures depend on the op's confirmed buffer dtypes,
+  so regen is premature until the op exists. Phase-2 = move harness → `triton_kernels/`, add the §17.3
+  declarations, regen sm_121a cubins, wire `vt::KdaChunkPrefill`, run RED-first unit + FLA golden +
+  full 48.9B GB10 STRICT gate (`DEVICE_KDA=1` + chunk-prefill) + tok/s/TTFT ladder. Row STAYS ACTIVE.
+- **USER 2026-08-07: the Kimi bar is MEET vLLM SPEED; the §14/§16 "HW-forced-indirect" framing is
+  SUPERSEDED.** vLLM DOES run this on one GB10 (§12 golden used util 0.82, single-seq, eager). The
+  Phase-2 speed ladder MUST add a vLLM arm at that EXACT recipe on the same prompts (SEQUENTIAL after
+  ours, worker parked, drop_caches, PRE-WARM FlashInfer autotune at tiny util first — cold autotune at
+  high util is an OOM-reboot trigger; ONE attempt, record honestly if it OOMs). Recorded in §17.5.
+- No GPU work this session (pure authoring); box untouched, `local-ai-worker` left as-is. No STRICT
+  claimed. Branch `row/KIMI-CHUNK-KDA-AOT` off `origin/main` @ `ea89926f`; DRAFT PR opened.
