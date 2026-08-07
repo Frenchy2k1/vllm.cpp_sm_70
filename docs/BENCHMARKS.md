@@ -306,6 +306,7 @@ built on it rather than keeping the flattering one.
 
 | Track | Status | Next gate |
 |---|---|---|
+| Surface coverage (`ARCH-ONE-SURFACE`) | **No number owed**: a CPU records/tooling change (the ONE SURFACE audit + `scripts/check-surface-coverage.py` guard, two axes, preflight + CI); no kernel or generation path touched | Fold-plan lanes carry their own gates; guard keeps CLI-only capabilities from landing untracked |
 | 35B prefill TTFT | 0.93x to 0.98x at every concurrency (2026-08-05) | Attribute the residual, then close |
 | 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |

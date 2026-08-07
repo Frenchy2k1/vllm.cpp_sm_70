@@ -72,6 +72,10 @@ jobs:
         run: |
           python3 scripts/check-runner-routing-consistency.py
           python3 tests/scripts/test_check_runner_routing_consistency.py
+      - name: Examples are thin clients of the public ABI, capabilities reach it
+        run: |
+          python3 scripts/check-surface-coverage.py
+          python3 tests/scripts/test_check_surface_coverage.py
       - name: cuBLASLt GEMM invocation stays dtype-faithful (template parity)
         run: |
           python3 scripts/check-gemv-invocation-consistency.py

@@ -15469,3 +15469,27 @@ measured — still **~9x off**. So the next lever is the memory path (wider per-
 loads, weight layout), NOT the reduction and NOT dispatch batching (`VK-A2`,
 already capped at 1.15x).
 
+## Surface-coverage audit + ONE SURFACE guard (2026-08-07, `ARCH-ONE-SURFACE`, `row/SURFACE-COVERAGE-AUDIT`)
+
+A CPU-only records/tooling change, no measurement.
+
+- **No number owed on any axis.** No kernel, generation, scheduling, or engine
+  code path was touched — the change adds a checker
+  (`scripts/check-surface-coverage.py`, two axes), its two allowlists, a mutation
+  suite (46 cases, incl. subprocess enforcement seams), preflight + CI wiring, the audit spec, and public-doc edits.
+  No throughput/latency/memory number was measured, claimed, or owed.
+- **What was verified (CPU, no build):** `check-surface-coverage.py` rc=0 (13
+  example units; 12 internal-reachers tracked, `examples/cli` the clean baseline;
+  C-ABI table 7 reachable / 4 embedder-unreachable, all tracked; public set
+  derived from CMake; shrink-only ratchet at 12);
+  `test_check_surface_coverage.py` 46/46; `check-public-doc-tables.py` rc=0 (STATUS
+  inside its char ratchet); `check-now-current.py`, `check-agent-record.py`,
+  `check-state-order.py`, `check-supported-models.py` all rc=0.
+- **The guard caught one on landing:** the rebase onto the Parakeet `#89` main
+  surfaced `examples/parakeet_transcribe` (CLI-only ASR reaching internal headers,
+  Parakeet off-registry) — added to the transition tracker, not silently ignored.
+- The seven surface gaps (H3 video-gen, Laguna/DeepSeek-V4 fast decode,
+  transcription, Kimi-Linear incremental, embeddings/pooling, mm-input) each carry
+  a ranked fold in `.agents/specs/surface-coverage-2026-08-07.md`; their speed
+  gates are owed by the folds themselves, not by this change.
+

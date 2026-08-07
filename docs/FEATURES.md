@@ -115,10 +115,10 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `MiniCPM3ForCausalLM` | openbmb/MiniCPM3-4B (MLA) | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `Olmo2ForCausalLM`, `Olmo3ForCausalLM` | allenai/OLMo-2-0425-1B; OLMo-3 (Olmo2 factory alias) | OLMo-2 strict 16/16; OLMo-3 oracle-blocked (vLLM 0.25.0 cannot build it) | pending |
 | `DeepseekV2ForCausalLM` | DeepSeek-V2-Lite (MLA) | strict 8/8 vs vLLM 0.25.0 | speed short, attributed |
-| `DeepseekV4ForCausalLM` | DeepSeek-V4-Flash GGUF (ds4 q2-imatrix, UD-IQ2) | coherent near-tie vs ds4 oracle (vLLM cannot fit one GB10) | decode beats ds4 1.144x, default on |
+| `DeepseekV4ForCausalLM` | DeepSeek-V4-Flash GGUF (ds4 q2-imatrix, UD-IQ2) | coherent near-tie vs ds4 oracle (vLLM cannot fit one GB10) | decode beats ds4 1.144x, default on, via the `deepseek-v4-gen` CLI; the registered engine forward is a W3 stub (`ARCH-ONE-SURFACE` fold) |
 | `Glm4ForCausalLM` | GLM-4-9B-0414 | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `Glm4MoeLiteForCausalLM` | zai-org/GLM-4.7-Flash (31.2B, MLA MoE) | near-tie 8/8 vs vLLM 0.25.0 | pending |
-| `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on |
+| `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on, via the `laguna-gen` CLI; the registered engine forward VT_CHECKs non-bf16 (`ARCH-ONE-SURFACE` fold) |
 | `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | **Paged-incremental decode (§19) GB10: 18.9 tok/s (0.90× vLLM) @ 122/128 = coherent best**; STRICT unreachable (bf16 stream REFUTED §20/#118 122→4/128; p7 intrinsic near-tie) | CLI opt-in `--incremental`; SERVER fold scoped (ARCH-ONE-SURFACE req 4; runner aborts on Kimi KV) |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
@@ -229,6 +229,23 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Embedding / pooling endpoints | ◐ engine only | ✅ | ✅ | ✅ |
 | OpenAI video generation `/v1/videos` (Sora shape) | ✅ `model`/`size`/`seconds` aliases + `GET /{id}/content`; `input_reference` and the `metadata` video/audio references condition the render | ◐ (vllm-omni, its own request shape) | ☐ | ☐ |
 | Flat C ABI for embedding in other languages | ✅ versioned | ☐ | ☐ | ✅ |
+
+#### C-ABI capability coverage <!-- abi-capability-table:begin -->
+- Which capabilities an embedder drives through the flat C ABI (`include/vllm.h`, the only installed header), gated by `scripts/check-surface-coverage.py`: a `reachable` row names an entry point that exists; an `embedder-unreachable` row is tracked in `scripts/abi-capability-allowlist.txt` against its fold row (`ARCH-ONE-SURFACE`). The ABI is text-generation-complete; the four `embedder-unreachable` rows are the open capability gaps.
+
+| Capability | C-ABI surface | Embedder-reachable |
+|---|---|---|
+| Text completion (blocking + streaming) | `vllm_complete`, `vllm_complete_stream` | reachable |
+| OpenAI chat (tools, streaming) | `vllm_chat`, `vllm_chat_stream` | reachable |
+| Async request submission | `vllm_request_submit` | reachable |
+| Structured output / grammars | `structured_json`, `structured_grammar` | reachable |
+| Tool + reasoning parser selection | `tool_parser`, `reasoning_parser` | reachable |
+| Speculative decoding config | `speculative_config` | reachable |
+| Custom logits processor | `vllm_logits_processor` | reachable |
+| Embeddings / pooling | none | embedder-unreachable |
+| Audio transcription | none | embedder-unreachable |
+| Video+audio generation (MiniMax-H3) | none | embedder-unreachable |
+| Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->
 
 ## Parallelism and scale-out
 

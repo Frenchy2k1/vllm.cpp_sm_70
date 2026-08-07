@@ -65,6 +65,7 @@ CHECKERS=(
   check-env-doc
   check-fusion-consistency
   check-runner-routing-consistency
+  check-surface-coverage
   check-protocol-consistency
   check-state-order
   check-now-current
@@ -85,6 +86,7 @@ SUITES=(
   test_check_env_doc
   test_check_fusion_consistency
   test_check_runner_routing_consistency
+  test_check_surface_coverage
   test_check_protocol_consistency
   test_check_state_order
   test_check_now_current
