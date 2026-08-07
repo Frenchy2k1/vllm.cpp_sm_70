@@ -4062,6 +4062,153 @@ TEST_CASE("minimax_h3: the FULL encoder vision tower matches upstream") {
   CHECK(grid[1] != grid[4]);
 }
 
+TEST_CASE("minimax_h3: the encoder GGUF visual.* loader dequantizes the vision tower") {
+  // The record reconciliation (spec §8.8) found the vision tower math was gated ONLY
+  // at reduced dims with SYNTHETIC weights and never wired to real weights: the
+  // encoder GGUF loader loaded the TEXT tower only and skipped every visual.* tensor.
+  // This gates the new loader — that it reads a `visual.*` GGUF, DEQUANTIZES each
+  // ggml-block projection + F16 patch/pos to f32, and fills the shared
+  // multimodal::Qwen3VLVisionWeights the Qwen3-VL front end consumes — the piece that
+  // makes a REAL-weights vision forward possible. The loader is encoding-agnostic (it
+  // calls DequantGgufRowToF32 per tensor), so a Q8_0 fixture exercises the exact code
+  // path the shipped Q4_K/Q5_K tower takes; the real-file forward is the on-box proof.
+  vllm::multimodal::Qwen3VLVisionConfig cfg;  // reduced dims, but the tower's exact shape math
+  cfg.hidden_size = 64;
+  cfg.num_heads = 4;
+  cfg.depth = 3;
+  cfg.intermediate_size = 128;
+  cfg.out_hidden_size = 96;
+  cfg.patch_size = 16;
+  cfg.temporal_patch_size = 2;
+  cfg.spatial_merge_size = 2;
+  cfg.num_position_embeddings = 2304;
+  cfg.in_channels = 3;
+  cfg.deepstack_visual_indexes = {1};  // one DeepStack merger
+  const int64_t dim = cfg.hidden_size;
+  const int64_t patch_elems =
+      cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+  const int64_t merged = dim * cfg.spatial_merge_size * cfg.spatial_merge_size;
+
+  gguf_test::GgufModelBuilder builder;
+  builder.AddKv(gguf_test::StrKv("general.architecture", "qwen3vl"));
+  std::map<std::string, std::vector<float>> orig;  // logical name -> the exact f32 written
+  auto add_f32 = [&](const std::string& name, int64_t numel) {
+    const std::vector<float> v = MakeParam("vg." + name, numel, 0.05);
+    orig[name] = v;
+    std::string bytes(reinterpret_cast<const char*>(v.data()), v.size() * sizeof(float));
+    builder.AddTensor(name, {static_cast<uint64_t>(numel)}, /*ggml_type=*/0 /*F32*/, bytes);
+  };
+  // A quantized [out, in] projection stored the way the real tower ships it (block
+  // encoding). Rows are whole Q8_0 blocks (in % 32 == 0 here).
+  auto add_q8 = [&](const std::string& name, int64_t out_dim, int64_t in_dim) {
+    const std::vector<float> values = MakeParam("vg." + name, out_dim * in_dim, 0.05);
+    orig[name] = values;
+    const size_t row_bytes = vt::RowSizeBytes(vt::DType::kQ8_0, in_dim);
+    std::string bytes(static_cast<size_t>(out_dim) * row_bytes, '\0');
+    vt::cpu::FromFloatFn q = vt::cpu::BlockFromFloat(vt::DType::kQ8_0);
+    REQUIRE(q != nullptr);
+    for (int64_t r = 0; r < out_dim; ++r)
+      q(values.data() + r * in_dim, bytes.data() + static_cast<size_t>(r) * row_bytes, in_dim);
+    builder.AddTensor(name, {static_cast<uint64_t>(in_dim), static_cast<uint64_t>(out_dim)},
+                      /*ggml_type=*/8 /*Q8_0*/, bytes);
+  };
+
+  const std::string V = "visual.";
+  add_q8(V + "patch_embed.proj.weight", dim, patch_elems);
+  add_f32(V + "patch_embed.proj.bias", dim);
+  add_f32(V + "pos_embed.weight", cfg.num_position_embeddings * dim);
+  for (int64_t l = 0; l < cfg.depth; ++l) {
+    const std::string p = V + "blocks." + std::to_string(l);
+    add_f32(p + ".norm1.weight", dim);
+    add_f32(p + ".norm1.bias", dim);
+    add_f32(p + ".norm2.weight", dim);
+    add_f32(p + ".norm2.bias", dim);
+    add_q8(p + ".attn.qkv.weight", 3 * dim, dim);
+    add_f32(p + ".attn.qkv.bias", 3 * dim);
+    add_q8(p + ".attn.proj.weight", dim, dim);
+    add_f32(p + ".attn.proj.bias", dim);
+    add_q8(p + ".mlp.linear_fc1.weight", cfg.intermediate_size, dim);
+    add_f32(p + ".mlp.linear_fc1.bias", cfg.intermediate_size);
+    add_q8(p + ".mlp.linear_fc2.weight", dim, cfg.intermediate_size);
+    add_f32(p + ".mlp.linear_fc2.bias", dim);
+  }
+  // main merger norms the pre-shuffle width (dim); deepstack norms the post-shuffle (merged)
+  add_f32(V + "merger.norm.weight", dim);
+  add_f32(V + "merger.norm.bias", dim);
+  add_q8(V + "merger.linear_fc1.weight", merged, merged);
+  add_f32(V + "merger.linear_fc1.bias", merged);
+  add_q8(V + "merger.linear_fc2.weight", cfg.out_hidden_size, merged);
+  add_f32(V + "merger.linear_fc2.bias", cfg.out_hidden_size);
+  add_f32(V + "deepstack_merger_list.0.norm.weight", merged);
+  add_f32(V + "deepstack_merger_list.0.norm.bias", merged);
+  add_q8(V + "deepstack_merger_list.0.linear_fc1.weight", merged, merged);
+  add_f32(V + "deepstack_merger_list.0.linear_fc1.bias", merged);
+  add_q8(V + "deepstack_merger_list.0.linear_fc2.weight", cfg.out_hidden_size, merged);
+  add_f32(V + "deepstack_merger_list.0.linear_fc2.bias", cfg.out_hidden_size);
+
+  const std::string path = "/tmp/minimax_h3_visual_q.gguf";
+  {
+    const std::string bytes = builder.Build();
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    CHECK(std::fwrite(bytes.data(), 1, bytes.size(), fh) == bytes.size());
+    std::fclose(fh);
+  }
+
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(path);
+  const vllm::multimodal::Qwen3VLVisionWeights vw = vllm::LoadQwen3VLVisionFromGguf(gguf, cfg);
+
+  // STRUCTURE: every field is filled at the flat [out*in] size the tower reads.
+  CHECK(static_cast<int64_t>(vw.patch_proj_w.size()) == dim * patch_elems);
+  CHECK(static_cast<int64_t>(vw.patch_proj_b.size()) == dim);
+  CHECK(static_cast<int64_t>(vw.pos_embed_w.size()) == cfg.num_position_embeddings * dim);
+  REQUIRE(static_cast<int64_t>(vw.blocks.size()) == cfg.depth);
+  for (const vllm::multimodal::VisionBlockWeights& b : vw.blocks) {
+    CHECK(static_cast<int64_t>(b.qkv_w.size()) == 3 * dim * dim);
+    CHECK(static_cast<int64_t>(b.qkv_b.size()) == 3 * dim);
+    CHECK(static_cast<int64_t>(b.proj_w.size()) == dim * dim);
+    CHECK(static_cast<int64_t>(b.fc1_w.size()) == cfg.intermediate_size * dim);
+    CHECK(static_cast<int64_t>(b.fc2_w.size()) == dim * cfg.intermediate_size);
+    CHECK(static_cast<int64_t>(b.norm1_w.size()) == dim);
+  }
+  CHECK(vw.merger.use_postshuffle_norm == false);
+  CHECK(static_cast<int64_t>(vw.merger.norm_w.size()) == dim);         // pre-shuffle width
+  CHECK(static_cast<int64_t>(vw.merger.fc2_w.size()) == cfg.out_hidden_size * merged);
+  REQUIRE(vw.deepstack_mergers.size() == cfg.deepstack_visual_indexes.size());
+  CHECK(vw.deepstack_mergers[0].use_postshuffle_norm == true);
+  CHECK(static_cast<int64_t>(vw.deepstack_mergers[0].norm_w.size()) == merged);  // post-shuffle
+
+  // DEQUANT CORRECTNESS: an f32 tensor round-trips EXACTLY, a Q8_0 tensor within its
+  // block tolerance, in the SAME flat order — this is the load that the reduced-dim
+  // synthetic gate never exercised on real bytes.
+  {
+    const std::vector<float>& want = orig[V + "patch_embed.proj.bias"];
+    double e = MaxAbsDiff(vw.patch_proj_b, want.data(), want.size());
+    INFO("patch bias f32 exact err=" << e);
+    CHECK(e == 0.0);
+  }
+  {
+    const std::vector<float>& want = orig[V + "blocks.0.attn.qkv.weight"];
+    REQUIRE(vw.blocks[0].qkv_w.size() == want.size());
+    double e = MaxAbsDiff(vw.blocks[0].qkv_w, want.data(), want.size());
+    INFO("qkv Q8_0 dequant err=" << e);
+    CHECK(e <= 5e-3);  // Q8_0 block tolerance
+    // and it is NON-degenerate: real spread, not all-zeros.
+    double s2 = 0.0;
+    for (float f : vw.blocks[0].qkv_w) s2 += double(f) * f;
+    CHECK(std::sqrt(s2 / vw.blocks[0].qkv_w.size()) > 1e-3);
+  }
+
+  // The production config the driver uses is the measured H3 vision geometry.
+  const vllm::multimodal::Qwen3VLVisionConfig prod = vllm::MiniMaxH3EncoderVisionConfig();
+  CHECK(prod.hidden_size == 1152);
+  CHECK(prod.num_heads == 16);
+  CHECK(prod.depth == 27);
+  CHECK(prod.out_hidden_size == 5120);
+  CHECK(prod.num_position_embeddings == 2304);
+  CHECK(prod.deepstack_visual_indexes.size() == 3);
+}
+
 TEST_CASE("minimax_h3: condition-noise augmentation matches upstream") {
   // fl2va/ref2va pin their keyframe and reference-audio rows to a NOISED anchor.
   // The mix is trivial; the ROW ACCOUNTING is what this gates -- and the golden

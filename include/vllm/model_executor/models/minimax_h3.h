@@ -50,6 +50,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // Nvfp4Weight (fp4 arm)
+#include "vllm/model_executor/models/qwen3_vl_vision.h"  // encoder vision tower reuse
 #include "vt/device.h"
 #include "vt/tensor.h"
 
@@ -1071,6 +1072,35 @@ std::vector<float> MiniMaxH3EncoderTextForwardDevice(
 
 MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
                                                           int64_t max_layers = 0);
+
+// ---------------------------------------------------------------------------
+// Encoder VISION tower (image/video conditioning) — REUSE of the shared Qwen3-VL
+// front end (`multimodal::Qwen3VLVisionForward` + `Qwen3VLImageProcessor`).
+//
+// The H3 encoder is a fine-tuned Qwen3-VL, so its ViT is the SAME architecture the
+// project already ports; only the config differs. `MiniMaxH3EncoderVisionConfig`
+// returns that config, measured from the real encoder GGUF + the shared
+// Qwen3.6-27B vision config (state.md 2026-07-25): hidden 1152 / 16 heads / depth
+// 27 / intermediate 4304 / out_hidden 5120 / patch 16 / temporal 2 / merge 2 /
+// num_position_embeddings 2304. H3 differs from the 27B by carrying 3 REAL
+// DeepStack mergers (`visual.deepstack_merger_list.{0,1,2}`). The one value the
+// weights-only ComfyUI GGUF does NOT carry is `deepstack_visual_indexes` (WHICH
+// text/vision layers the DeepStack taps sit after); the default here is inferred
+// (evenly spaced) and must be confirmed against the upstream vision_config for a
+// bit-correct DeepStack inject.
+multimodal::Qwen3VLVisionConfig MiniMaxH3EncoderVisionConfig();
+
+// Load the encoder GGUF's `visual.*` tower into the shared f32 weight struct the
+// Qwen3-VL front end consumes. Mirrors the safetensors `LoadQwen3VLVisionWeights`
+// (`qwen3_vl.cpp`) but (a) strips the `visual.` prefix and (b) DEQUANTIZES every
+// tensor to f32 via `DequantGgufRowToF32` — the encoder GGUF stores the ViT in
+// Q4_K/Q5_K (blocks) with F16 patch_embed/pos_embed. The ComfyUI export reshapes a
+// non-256-aligned row (hidden 1152) to `ne0=256`; dequantizing the whole flat
+// buffer preserves the row-major `[out,in]` order the tower reads (it indexes every
+// weight as a flat buffer with dims taken from the config), so no reshape metadata
+// is needed. `cfg.depth` / `cfg.deepstack_visual_indexes.size()` drive the loop.
+multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionFromGguf(
+    const GgufFile& file, const multimodal::Qwen3VLVisionConfig& cfg);
 
 // Materialize the H3-Encoder (FL2VA/text_encoder, 14 shards / 1058 tensors) into
 // the name map both encoder forwards read.
