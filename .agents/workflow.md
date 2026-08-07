@@ -101,6 +101,18 @@ Run `scripts/agent-onboard.py --probe` to see what is still unresolved.
      `python3 tests/scripts/test_doc_checkpoint.py` pass: every feature or
      iteration checkpoint updates the obligated public surfaces below in the
      same change, even when the honest result is pending, failed, or void;
+   - **for a SERIES of commits, additionally
+     `python3 scripts/check-doc-checkpoint.py --base origin/main --head HEAD`.**
+     `--staged` inspects the STAGED paths only, so it is VACUOUS when nothing is
+     staged — running it after `git commit` (the natural order, and what
+     `agent-preflight.sh` does) checks nothing at all. CI is DIFF-scoped over the
+     whole pushed range and checks EVERY commit independently, so a branch that
+     defers its doc update into a following `record(...)` commit passes locally
+     and fails on `main`, where the range can never be re-covered. This is not
+     hypothetical: PR #80 (Vulkan) landed eight such commits and reddened
+     `documentation-checkpoint` for its range (state log, 2026-08-07). A feature
+     commit carries its OWN STATUS/BENCHMARKS update; if the numbers are not yet
+     known, write the pending/void line with its reason;
    - tests green (op-parity / behavioral / e2e as applicable);
    - every feature/milestone that can plausibly affect speed, latency,
      scheduling, memory traffic, loading, or peak memory completes its own

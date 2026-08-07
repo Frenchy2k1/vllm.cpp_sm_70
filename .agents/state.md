@@ -40218,3 +40218,44 @@ SIGSEGVs at an UNRELATED CUDA case (line 3503) that PASSES in isolation (585) an
 the new case — pre-existing cross-test CUDA resource-accumulation flake, not this change.
 Box left clean (no procs, GPU idle, locks released, worker parked, my artifacts pruned, ckpts
 kept). Records: spec §8.8 + §8.2, STATUS/BENCHMARKS/FEATURES, benchmark-record, NOW.
+
+- **2026-08-07** — **PROTOCOL VIOLATION, self-reported: the Vulkan campaign (PR
+  #80, merged `5397e91d`) split feature commits from record commits, so
+  `documentation-checkpoint` FAILED for that push range.**
+
+  The gate requires every commit touching a checkpoint path (`src/`, `tests/`,
+  `scripts/`, `.agents/specs/`, …) to update `docs/STATUS.md` AND
+  `docs/BENCHMARKS.md` **in that same commit**. Eight commits did not:
+  `9579f94e`, `ba5ea0cf`, `196ea46f`, `e32c5ed3`, `3bfa1f12`, `34a3efe6`,
+  `2c86f79e`, `f4738bb8` — each a `feat(vulkan)`/`refactor(vulkan)` touching
+  `src/` and `tests/`, with its doc update deferred into a following
+  `record(vulkan)` commit.
+
+  **Substance vs process.** The public docs on `main` ARE current — STATUS,
+  BENCHMARKS and FEATURES all describe the shipped 16-native-kernel /
+  71-on-the-tier state with the llvmpipe-only and no-speed-number caveats intact.
+  What was violated is the gate's per-COMMIT granularity, which exists so that a
+  bisect lands on a commit whose docs match its code, and so a half-landed series
+  cannot leave the public surface describing something that does not exist.
+
+  **Why it was not caught locally.** `scripts/check-doc-checkpoint.py` with no
+  arguments validates the single committed HEAD, and it was run that way and
+  passed. The CI job is DIFF-scoped over `before..sha` and checks EVERY commit in
+  the range independently. The correct local invocation for a series is
+  `--base origin/main --head HEAD`, which would have caught all eight.
+
+  **Not repaired by rewriting history.** `main` had already moved (#86 landed on
+  top) and other sessions branch from it, so a force-push to fix eight commit
+  messages-worth of file grouping would cost more than the defect. The gate is
+  diff-scoped, so the NEXT push to `main` only covers new commits — no ongoing
+  red. What is permanently true is that this one range is recorded as
+  gate-failed, and no later run re-covers it. Recorded rather than quietly left.
+
+  **Rule going forward:** a feature commit carries its own STATUS/BENCHMARKS
+  update. If the numbers are not yet known, the honest line is "pending/void with
+  the reason", which is what the gate's own error message asks for — not a
+  deferred record commit.
+
+  Note also that `agent-record` was ALREADY failing on `main` at `4cfeee13`
+  before this merge (`check-fusion-consistency`, `minimax_h3_video_vae_device`),
+  verified on `origin/main` itself. That one is not from this work.
