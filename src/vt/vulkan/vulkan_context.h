@@ -78,6 +78,14 @@ class VulkanContext {
                 const void* push_constants, uint32_t push_size, uint32_t group_count_x,
                 const uint32_t* spec_values = nullptr, uint32_t spec_count = 0);
 
+  // Was a pipeline for this SPIR-V module ever created? The cache key is the
+  // module name plus its specialization values, so this asks "did any variant of
+  // `name` get built", which is the only honest way for a test to prove that a
+  // TACTIC actually ran rather than merely that the results were right. A gate
+  // that checks numbers alone passes identically when the fallback served the
+  // call -- the same trap the op-provider decline counters exist for.
+  bool PipelineExistsFor(const std::string& name) const;
+
   // Number of distinct pipelines currently cached. Exposed for the unit gate: it
   // is how a test proves a new specialization produced a NEW pipeline rather than
   // silently reusing an existing one — which would look identical in the results.

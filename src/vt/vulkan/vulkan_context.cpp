@@ -656,6 +656,19 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   return cache.emplace(key, p).first->second;
 }
 
+bool VulkanContext::PipelineExistsFor(const std::string& name) const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  const auto& cache = *static_cast<std::map<std::string, Pipeline>*>(pipelines_);
+  // Keys are "<module>" or "<module>|<spec values>", so a prefix match up to the
+  // separator identifies every specialization of one module.
+  for (const auto& kv : cache) {
+    if (kv.first == name || kv.first.compare(0, name.size() + 1, name + "|") == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 size_t VulkanContext::PipelineCacheSize() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   return static_cast<std::map<std::string, Pipeline>*>(pipelines_)->size();
