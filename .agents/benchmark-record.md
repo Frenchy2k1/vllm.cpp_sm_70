@@ -15161,3 +15161,37 @@ Op coverage is a real limitation, but it is not what makes the e2e run slow here
 campaign spec as "the single biggest speed lever" and deferred. It is now the
 MEASURED bottleneck, and it outranks further native-kernel work for anything
 end-to-end: more native ops would each still pay a ~10 ms round trip.
+
+#### SECOND, SEPARATE ANOMALY: the dispatch COUNT looks far too high
+
+The minimal workload — **1 prompt, 32 in, 8 out** — also failed to complete, hitting
+its 2400 s timeout with no result line. Per-dispatch latency alone does not
+explain that, and the gap is worth stating as its own open question rather than
+folding into the first finding.
+
+**Order-of-magnitude.** At the measured ~96 blocking waits/s, 40 minutes is
+**~230,000 waits**. A 28-layer Qwen3-0.6B forward should need roughly 11 dispatches
+per layer (qkv matmul, qkv split, rope, KV write, paged attn, o_proj, 2 norms,
+gate/up matmul, silu, down matmul) ≈ **~310 per forward**. Even counting 32 prefill
+positions plus 8 decode steps generously, the expected total is a few thousand —
+**not ~230,000**. That is roughly an order of magnitude and a half unaccounted for.
+
+**Two candidate explanations, NOT yet distinguished:**
+1. **Waits ≠ dispatches.** The driver's fence wait is a `poll()` loop that may wake
+   several times per fence, inflating the context-switch count relative to the
+   real dispatch count. If so the dispatch count is fine and only the latency
+   finding stands.
+2. **We really do dispatch far more than expected** — e.g. a per-token or per-head
+   dispatch where a per-tensor one was intended, or the `kFusedChain` interpreter
+   issuing one dispatch per recipe step.
+
+**Distinguishing them is cheap and is the next thing to do:** add a dispatch
+counter to `VulkanContext` (or read the existing per-op provider selection counts
+with `VT_OP_PROVIDER_STATS=1`) and print it per forward. Until then, the
+per-dispatch latency finding is MEASURED and this one is an OPEN QUESTION — not a
+second confirmed defect.
+
+**Recorded so it is not lost:** the e2e comparison against llama.cpp therefore has
+NO vllm.cpp number at all, not even a slow one. The workload never produced a
+completion at any size attempted (4 prompts/128/32 at 900 s; 1 prompt/32/8 at
+2400 s).
