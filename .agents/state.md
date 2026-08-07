@@ -40695,3 +40695,24 @@ stale base silently loses another row's section.
 **GATE (CPU, foreground).** `test_minimax_h3` full suite, plus the new duration
 case. No numbers changed by the doc work; the Thor speed figures are prior
 measurements now recorded in the scoreboard rather than new ones.
+
+[2026-08-07] H3-NVFP4-LOADER-DIFF (#94) — fp4 nibble-order loader bug FOUND+FIXED (byte-verified);
+grid 2nd defect isolated. Independent-oracle loader diff (no download): own fp8-e4m3fn+E2M1+bf16 math
+(each primitive byte-exact vs torch) vs the coherent FL2VA GGUF (gguf.quants). The two files are ONE base
+model — islands BYTE-IDENTICAL, every sampled projection (qkv/out/fc1/fc2/adaln blocks 0..45 + refiners)
+sign-agree 1.000. ROOT CAUSE: the community ckpt (converted_by "Star Ultimate Model Converter Pro") packs
+fp4 HIGH-first (element 2i in the high nibble) vs the modelopt low-first our DequantNvfp4ToBf16+Marlin
+assume; read low-first every adjacent pair is swapped -> scrambled matrix. Low-first corr 0.000; HIGH-first
+sign-agree 1.000 over 115M weights, corr 0.85->0.94 with |w| (NVFP4-vs-Q3K quant-noise floor). #93 three
+guesses (island preservation/weight_scale_2/name mapping) ALL wrong. FIX: nibble-swap (b>>4)|(b<<4) at load
+in the 3 H3 NVFP4 loaders (reference+bf16+fp4 streamers); H3-scoped, shared DequantNvfp4ToBf16 untouched
+(Laguna/DS4/Qwen3 stay low-first); default ON, VT_H3_NVFP4_LOWNIBBLE=1 reverts. BYTE-VERIFIED on GB10: the
+binary streamer dump of blocks.0.attn.qkv_proj[0:16] == the oracle HIGH-first row exactly, sign-matches the
+GGUF; params IDENTICAL between the files. BUT the render STILL grids: t2va, ref2va, AND fl2va-with-keyframe
+(output-pinned) all grid, while the FL2VA-GGUF control renders a coherent cat on IDENTICAL weights+params in
+the same build. So checkpoint content sound + loader dequant byte-correct + params identical + pinning does
+NOT rescue -> a SECOND, independent defect in the NVFP4 render PATH (device stream/forward), NOT the ckpt,
+nibble, fp4, or free-gen. fp4-resident Marlin arm grids differently again (3rd, Marlin-specific, only ever
+wiring-gated). NEXT: layer-by-layer activation diff of the NVFP4-bf16 stream vs the GGUF-bf16 stream
+(identical weights; differ only in dequant source + island read bf16-disk vs f16-disk). Records: spec
+§8.11 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Box left clean.

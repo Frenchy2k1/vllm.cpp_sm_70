@@ -1087,9 +1087,17 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
       float global_scale = 0.0f;
       std::memcpy(&global_scale, global.data, sizeof(float));
       bf16.resize(static_cast<size_t>(out_dim * in_dim));
-      DequantNvfp4ToBf16(static_cast<const uint8_t*>(t.data),
-                         static_cast<const uint8_t*>(scale.data), global_scale, out_dim, in_dim,
-                         bf16.data());
+      // Correct the community checkpoint's high-nibble-first fp4 packing before the
+      // standard (low-first) dequant. See MiniMaxH3Nvfp4HighNibbleFirst.
+      const uint8_t* packed = static_cast<const uint8_t*>(t.data);
+      std::vector<uint8_t> swapped;
+      if (MiniMaxH3Nvfp4HighNibbleFirst()) {
+        swapped.resize(t.nbytes);
+        MiniMaxH3Nvfp4SwapNibbles(static_cast<const uint8_t*>(t.data), t.nbytes, swapped.data());
+        packed = swapped.data();
+      }
+      DequantNvfp4ToBf16(packed, static_cast<const uint8_t*>(scale.data), global_scale, out_dim,
+                         in_dim, bf16.data());
       if (island) {
         f32.resize(bf16.size());
         for (size_t i = 0; i < bf16.size(); ++i) {
@@ -1219,7 +1227,14 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
       w.packed.shape[1] = in_dim / 2;
       w.packed.bytes.resize(static_cast<size_t>(out_dim) * (in_dim / 2));
       VT_CHECK(t.nbytes == w.packed.bytes.size(), "minimax_h3 nvfp4-fp4: packed byte-size mismatch");
-      std::memcpy(w.packed.bytes.data(), t.data, t.nbytes);
+      // Correct the community checkpoint's high-nibble-first fp4 packing so the
+      // Marlin W4A16 kernel (low-first, like every other NVFP4 arm) reads it right.
+      // See MiniMaxH3Nvfp4HighNibbleFirst.
+      if (MiniMaxH3Nvfp4HighNibbleFirst()) {
+        MiniMaxH3Nvfp4SwapNibbles(t.data, t.nbytes, w.packed.bytes.data());
+      } else {
+        std::memcpy(w.packed.bytes.data(), t.data, t.nbytes);
+      }
       w.scale.dtype = DType::kI8;
       w.scale.rank = 2;
       w.scale.shape[0] = out_dim;

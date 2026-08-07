@@ -14445,3 +14445,27 @@ the video duration, to within one latent step.
 conditioning rows reached unpatchify, was independently fixed on `main` by
 `row/H3-RENDER-CLOSE` taking the TRAILING target rows; this row's alternative
 `update_mask` mechanism was dropped rather than landed twice.)
+## MiniMax-H3 NVFP4 ref2va grid — independent-oracle loader diff: fp4 nibble-order bug FIXED, but a 2nd NVFP4-path defect remains (`row/H3-NVFP4-LOADER-DIFF` PR #94, 2026-08-07, dgx sm_121a)
+
+Followed #93's residual (the ref2va NVFP4 checkpoint/loader) with an independent-oracle loader diff — NO new download. Root-caused + fixed a REAL loader bug #93 mis-guessed, verified byte-exact, but the render still grids from a SECOND, independent defect that is NOT the checkpoint content and NOT the loader dequant.
+
+**Method.** An independent CPU dequant of `minimax_h3_ref2va_nvfp4_full.safetensors` (own fp8-e4m3fn + E2M1 + bf16 math; each primitive byte-EXACT vs torch, verified over all 256 fp8 bytes and 200k bf16 RNE cases) diffed against the coherent FL2VA GGUF via the maintained `gguf.quants` dequant (trusted, independent). The two files share the SAME base DiT: the islands (`condition_proj`, `time_embedder`, both patch projections, norms, `rope.inv_freq`) are BYTE-IDENTICAL, and every sampled projection (`qkv`/`out`/`fc1`/`fc2`/`adaln`, blocks 0..45 step 5 + both token_refiners) has sign-agreement 1.000 — so fl2va and ref2va are one model, and the coherent GGUF is a per-tensor oracle for the ref2va projections too.
+
+**Root cause (fixed).** The community checkpoint (metadata `converted_by: "Star Ultimate Model Converter Pro"`) packs the two fp4 elements per byte HIGH-first (element 2i in the high nibble, 2i+1 in the low) — the opposite of the modelopt standard our `DequantNvfp4ToBf16` + Marlin assume. Read low-first, every adjacent fp4 pair is swapped, so each projection matrix is internally scrambled: vs the coherent GGUF, low-first gives elementwise corr **0.000**; HIGH-first gives **sign-agreement 1.000 over 115M+ weights** and corr 0.85→0.94 rising with |w| (the NVFP4-vs-Q3_K quant-noise floor). Islands are bf16 (not nibble-packed) → byte-identical → exactly why #93/#86 misattributed. #93's three guesses (island preservation / weight_scale_2 / name mapping) were all wrong; none named the nibble order. Fix: swap the two nibbles of every packed byte at load (`(b>>4)|(b<<4)`) in the three H3 NVFP4 loaders (reference + bf16 streamer + fp4-resident Marlin streamer) → the file's high-first bytes become the standard low-first both arms expect. H3-scoped; shared `DequantNvfp4ToBf16` untouched (Laguna/DS4/Qwen3 stay low-first). Default ON; `VT_H3_NVFP4_LOWNIBBLE=1` reverts.
+
+**Fix BYTE-VERIFIED on GB10.** An env-gated dump of the actual streamer output: the binary's `blocks.0.attn.qkv_proj[0:16]` with the fix = `-0.0859 -0.0430 -0.1289 -0.0430 -0.0859 0.1719 -0.1289 0.2578 ...` = EXACTLY the independent oracle's HIGH-first row, sign-identical to the GGUF (`-0.0679 -0.0679 -0.1357 ...`). Derived params IDENTICAL between the two files (L=50 refL=2 H=5376 heads=56 ffn=14336 txt=5120 lat=24 alat=32 adaln=96768 …).
+
+**GB10 render A/B (256×256/22f/12steps).**
+
+| Render | Checkpoint | Quant | nibble | Result |
+|---|---|---|---|---|
+| t2va (no refs, `--partition fl2va`) | ref2va NVFP4 | bf16 | LOW (=1) | severe dark GRID (= #93 baseline) |
+| t2va (no refs, `--partition fl2va`) | ref2va NVFP4 | bf16 | HIGH (fix) | pale GRID (weights now correct; STILL grids) |
+| ref2va (`--ref-image`+`--cond-image`) | ref2va NVFP4 | bf16 & fp4 | HIGH (fix) | GRID |
+| fl2va + keyframe (`--first-frame`) | ref2va NVFP4 | bf16 | HIGH (fix) | GRID (output-pinning does NOT rescue) |
+| t2va (no refs, `--partition fl2va`) | FL2VA GGUF | bf16 | — | COHERENT orange cat (control, this build) |
+| fl2va + keyframe (`--first-frame`) | FL2VA GGUF | bf16 | — | COHERENT (#93) |
+
+**RE-ATTRIBUTION (corrects #93 again).** The nibble fix CHANGES the output (low-first severe grid → high-first pale grid, so the swap IS applied) yet EVERY NVFP4 render grids — t2va, ref2va, AND fl2va-with-keyframe — while the fl2va-GGUF control (SAME weights, SAME params, verified byte-for-byte) renders a coherent cat in the same build and same task. So: the checkpoint CONTENT is sound (byte-matches the coherent GGUF), the loader dequant is now byte-correct (binary dump == oracle == GGUF-sign), the derived params are identical, and output-pinning (keyframe) does NOT rescue it (rules out free-generation divergence). The residual grid is therefore a SECOND, independent defect in the NVFP4 render PATH itself — the device stream / forward, NOT the checkpoint, NOT the fp4 nibble order, NOT free-gen. The fp4-resident Marlin arm additionally grids differently (a THIRD, Marlin-specific issue — that path was only ever wiring-gated, never correctness-gated). The nibble fix is the objectively-correct dequant (the file IS high-first) and lands default-ON (A/B via `VT_H3_NVFP4_LOWNIBBLE=1`); it is byte-verified but not yet render-validated, blocked on the second defect. Next diagnostic: layer-by-layer intermediate-activation diff of the NVFP4-bf16 stream vs the GGUF-bf16 stream (identical weights) to locate where they diverge — the streamers are structurally identical except the dequant source and the island read (bf16-disk vs f16-disk), so the divergence is a candidate.
+
+Artifacts `~/h3fp4/{t2va_fix,t2va_nofix,ctrl_t2va,ab_bf16fix,ab_fix,ab_nofix,kf_nvfp4}.mp4`.

@@ -21,6 +21,7 @@
 // actually comes from; nothing here claims a speed result.
 #include "vllm/model_executor/models/minimax_h3.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -41,6 +42,23 @@ float Bf16ToF32(uint16_t bits) {
 }
 
 }  // namespace
+
+bool MiniMaxH3Nvfp4HighNibbleFirst() {
+  // Read once. DEFAULT high-first (the shipped community checkpoint's packing);
+  // VT_H3_NVFP4_LOWNIBBLE=1 restores the pre-fix modelopt low-first read for A/B.
+  static const bool high = [] {
+    const char* e = std::getenv("VT_H3_NVFP4_LOWNIBBLE");
+    return !(e != nullptr && e[0] == '1');
+  }();
+  return high;
+}
+
+void MiniMaxH3Nvfp4SwapNibbles(const uint8_t* src, size_t n, uint8_t* dst) {
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t b = src[i];
+    dst[i] = static_cast<uint8_t>((b >> 4) | (b << 4));
+  }
+}
 
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file) {
   MiniMaxH3GgufDit out;
@@ -76,7 +94,16 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file) {
     std::memcpy(&global_scale, global.data, sizeof(float));
 
     std::vector<uint16_t> bf16(static_cast<size_t>(out_dim * in_dim));
-    DequantNvfp4ToBf16(t.data, scale.data, global_scale, out_dim, in_dim, bf16.data());
+    // Correct the community checkpoint's high-nibble-first fp4 packing before the
+    // standard (low-first) dequant. See MiniMaxH3Nvfp4HighNibbleFirst.
+    const uint8_t* packed = t.data;
+    std::vector<uint8_t> swapped;
+    if (MiniMaxH3Nvfp4HighNibbleFirst()) {
+      swapped.resize(t.nbytes);
+      MiniMaxH3Nvfp4SwapNibbles(t.data, t.nbytes, swapped.data());
+      packed = swapped.data();
+    }
+    DequantNvfp4ToBf16(packed, scale.data, global_scale, out_dim, in_dim, bf16.data());
     std::vector<float> values(bf16.size());
     for (size_t i = 0; i < bf16.size(); ++i) values[i] = Bf16ToF32(bf16[i]);
     out.storage[name] = std::move(values);
