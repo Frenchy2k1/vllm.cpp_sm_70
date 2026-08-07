@@ -295,6 +295,8 @@ M4. We never publish a partial, contended, or stale-denominator number as
 binding, and when a denominator turns out to be wrong we correct every ratio
 built on it rather than keeping the flattering one.
 
+**CPU elementwise GEMM, wide x86 tiers (2026-08-07).** INDICATIVE ONLY, not binding: the x86 dev box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`. The AVX-512 tier measures 1.56x to 2.83x over SSE2 on the elementwise micro-kernels, byte-identically. A binding number needs a qualified x86 host, which the project does not have.
+
 ## Open gaps
 
 | Track | Status | Next gate |

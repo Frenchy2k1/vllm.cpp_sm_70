@@ -391,6 +391,12 @@ The correctness form and the full D0-D14 measured chronology live in
 [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) and
 [.agents/specs/dflash-spec-decode.md](../.agents/specs/dflash-spec-decode.md).
 
+CPU elementwise GEMM, wide x86 tiers (2026-08-07): AVX2 (16 outputs as two groups of 8, mr 4) and
+AVX-512 (16 outputs in one ZMM, mr 6) elementwise tiers replace SSE2 when the runtime probe finds
+them, each in its own ISA-flagged TU. Byte-identical to the portable tier on every tier and dtype:
+widening adds OUTPUT lanes, each output's K reduction stays sequential, and products are
+mul-then-add, never FMA. Speed is indicative only, the x86 box is VOID for timing.
+
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
@@ -932,30 +938,10 @@ run; gguf_load 12/12). The CUDA graph stays OPT-IN default OFF (graph 7.92 ≈ e
 
 (2026-08-01 nsys state and Q8_0-GEMV-lever framing superseded by the 2026-08-04 binding parity line; detail in the benchmark record.)
 Row `ACTIVE`; see docs/BENCHMARKS.md.
-**Last-mile campaign — Brick 0 (PROFILE-ONLY): the keep-quant GEMM roofline (2026-07-30, base `aed4a498`,
-branch `deepseek-v4-last-mile`, commit `42a99471`, NOT pushed).** Profile-only (holding for the coordinator's
-synthesis with parallel source research — no MMQ implementation). MEASURED the T=1 decode keep-quant GEMM
-efficiency vs roofline (real 80.7 GB, nsys per-kernel time ÷ exact weight bytes; **GB10 peak = 240 GB/s** via a
-float4 copy microbench): `QuantDotGemmQ8_0` (35.6%, 6.60 GB/step) = **~150 GB/s = 63% of peak → MEMORY-bound**
-(~1.6× headroom); `QuantDotGemmGrouped<IQ2_XXS>` (20.2%) = **~45 GB/s = 19% → DEQUANT/LATENCY-bound** (~5×);
-`<Q2_K>` (10.0%) = **~57 GB/s = 24%** (~2.5×); `QuantizeQ8K`/`QuantizeQ8_0` (12%) = **LAUNCH-bound** (~795 tiny
-launches/step). KEY: every T=1 GEMM is <1% of int8 compute peak → memory-bound; **tensor cores do NOT help a
-decode matvec** (mmq.cu is prefill; the reference is llama.cpp `mmvq.cu`). Ranked levers: (1) grouped-MoE
-dequant (the 5× gap, mmvq.cu vectorized dequant + dp4a), (2) fuse activation-quant, (3) Q8_0 coalescing,
-(4) fp8 KV (parity/long-ctx, NOT the short-ctx lever). Honest projection: **~14-16 tok/s target** (ds4 16.5 =
-58% of the BW roofline, fully fused); ~28 tok/s is the hard ceiling. Full table: `.agents/specs/deepseek-v4-last-mile.md`. Row `ACTIVE`; see docs/BENCHMARKS.md.
-**Last-mile campaign — Brick 1: __dp4a vectorized-dequant matvec for the grouped keep-quant GEMMs — SPLIT
-result (2026-07-30, base `aed4a498`, branch `deepseek-v4-last-mile`, commit `c1f92d24`, NOT pushed).** Ported
-llama.cpp `mmvq.cu`/`vecdotq.cuh` SIMD dequant into `DotIQ2XXS` (vecdotq.cuh:920-928) + `DotQ2K`
-(vecdotq.cuh:329-354), keeping warp-per-output + Q8_K activation. BIT-IDENTICAL (`__dp4a` = exact int32); the
-`test_cuda_quant_dot` nmse≤1e-6 gate CAUGHT a signed-overflow UB in the IQ2 sign broadcast (RED-first worked) →
-fixed to unsigned → **2/2·105601 zero drift**; `test_cuda_deepseek_v4` 18/18; `test_deepseek_v4_gguf_load`
-12/12; real model resident-default TOKEN-IDENTICAL "…Paris.". **SPLIT:** Q2_K grouped **2.35×** (24%→56% of
-peak, MAC was the bottleneck → now memory-bound; 10.0%→4.4% of step); IQ2_XXS grouped **FLAT** (~17-19% of
-peak) — GROUNDED: `d_iq2xxs_grid` is `__constant__`, our 32 lanes look up different indices → divergent
-constant-memory reads ~32-way serialized/warp = the bottleneck, not the MAC. **Decode 8.01 → 8.51 tok/s (+6%,
-4 stable warm runs) vs ds4 16.5.** NEXT (Brick 1b): the IQ2 grid-lookup (move to GLOBAL / mmvq.cu handling) —
-the bigger grouped kernel's win. STOPPED for review. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Last-mile campaign — Bricks 0 and 1 (2026-07-30): the keep-quant GEMM roofline profile, then the
+`__dp4a` vectorized-dequant matvec (Q2_K grouped 2.35x, IQ2_XXS flat and grid-serialization-bound).
+Bit-identical; decode 8.01 -> 8.51 tok/s.** Per-brick forensics, profiler tables and the refuted
+framings live in [.agents/benchmark-record.md](../.agents/benchmark-record.md).
 **Last-mile campaign — Brick 1b: IQ2_XXS grid-lookup fix (`__constant__` → GLOBAL) — the flat kernel unblocked,
 +12.5% (2026-07-30, base `f6c34252`, branch `deepseek-v4-last-mile`, commit `e4d8845b`, NOT pushed).** Brick 1's
 finding: IQ2_XXS grouped stayed at ~19% of peak because `d_iq2xxs_grid[256]` is `__constant__` and the 32 warp

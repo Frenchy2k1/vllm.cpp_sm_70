@@ -337,7 +337,14 @@ STATUS_RATCHET = {
     # it was paid for inside the same cell rather than out of the page - the
     # ref2va activation-diff narrative collapsed to its binding result, with the
     # full guilty-class audit kept in .agents/specs/minimax-h3.md 8.12. Net -6.
-    "chars": 283455,
+    #
+    # 281700 since 2026-08-07 (measured 281668): the wide-x86 elementwise GEMM
+    # tiers owe this page a status line, and it was paid for OUT of the page.
+    # The DeepSeek-V4 last-mile Bricks 0 and 1 paragraphs were duplicated here
+    # in an abridged form; the fuller originals already live in
+    # .agents/benchmark-record.md, so the duplicates collapsed to their binding
+    # result plus a pointer. Nothing was lost, only de-duplicated. Net -1755.
+    "chars": 281700,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,

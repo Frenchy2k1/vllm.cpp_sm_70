@@ -14,6 +14,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -270,4 +271,26 @@ TEST_CASE("elementwise CPU GEMM: inf/nan weight patterns match the scalar conver
       CHECK(std::memcmp(got.data(), want.data(), want.size()) == 0);
     }
   }
+}
+
+// KERNEL-GEMM-CPU-ELEM-X86WIDE. The whole suite above is a byte-identity gate,
+// and a byte-identity gate passes VACUOUSLY if the tier under test silently
+// fell back to a narrower one: "avx512 is byte-identical" is worthless if what
+// ran was sse2. So a same-binary tier sweep (VT_CPU_MATMUL_TIER=portable /
+// avx2 / avx512 / ref) must be able to PROVE which tier it exercised. This
+// asserts the forced tier is the tier BuildTier() actually selected, and
+// reports the selection either way so a plain `ctest` run records it.
+TEST_CASE("elementwise CPU GEMM: the forced tier is the tier that actually ran") {
+  const char* forced = std::getenv("VT_CPU_MATMUL_TIER");
+  const std::string requested = forced == nullptr ? std::string("<unset>") : forced;
+  const std::string selected = vt::cpu::ElemGemmTierName();
+  MESSAGE("VT_CPU_MATMUL_TIER=" << requested << " selected tier: " << selected);
+  if (forced == nullptr || forced[0] == '\0') {
+    // Unset is the production default: whatever this CPU probes into is
+    // correct, so there is nothing to assert, only to report. (An assertion
+    // here would hard-code one CPU's feature set into the suite.)
+    CHECK(!selected.empty());
+    return;
+  }
+  CHECK(selected == std::string(forced));
 }
