@@ -866,6 +866,28 @@ add_library(vllm::vllm ALIAS vllm)
 # tier's per-function `target("f16c")`): every other TU stays on the default
 # baseline, and the kernels are additionally runtime-gated on HWCAP2_I8MM so the
 # binary still runs on non-i8mm aarch64 (portable tier serves those shapes).
+# KERNEL-GEMM-CPU-ELEM-X86WIDE W1: the AVX2 elementwise tier needs the ISA
+# enabled so <immintrin.h> exposes the 256-bit intrinsics. Same surgical shape
+# as the aarch64 i8mm block below and the same discipline llama.cpp uses when it
+# builds the CPU backend once per ISA level (ggml/src/CMakeLists.txt:371-401):
+# build ONLY this TU wide, leave every other TU on the baseline, and gate entry
+# on a runtime __builtin_cpu_supports probe so the binary still runs on
+# pre-AVX2 x86-64 (the SSE2 tier serves those). The global -ffp-contract=off
+# still applies on top, which is what keeps mul-then-add non-fused and therefore
+# byte-identical to the portable tier.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  # x86-only TUs: <immintrin.h> does not exist on aarch64, so they are ADDED
+  # here rather than in the unconditional source list.
+  target_sources(vllm PRIVATE
+    src/vt/cpu/cpu_matmul_elem_avx2.cpp
+    src/vt/cpu/cpu_matmul_elem_avx512.cpp)
+  set_source_files_properties(
+    src/vt/cpu/cpu_matmul_elem_avx2.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx2;-mf16c>")
+  set_source_files_properties(
+    src/vt/cpu/cpu_matmul_elem_avx512.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx512f;-mavx512bw;-mavx512vl;-mf16c>")
+endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   # G6 mmla tier AND G7 repack tier (cpu_quant_repack_arm.cpp) both need i8mm.
   # The global -ffp-contract=off (top of this file) still applies on top of this

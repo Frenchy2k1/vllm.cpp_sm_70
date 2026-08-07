@@ -62,6 +62,15 @@ struct ElemGemmTierTable {
   const char* name;
 };
 
+// Wide-x86 tiers (KERNEL-GEMM-CPU-ELEM-X86WIDE). Each lives in its own TU built
+// with that ISA's flags, mirroring llama.cpp's per-ISA CPU build; they are
+// always COMPILED on x86-64 and only ever ENTERED when the runtime probe in
+// BuildTier() says the CPU supports them. Defined in cpu_matmul_elem_avx2.cpp.
+#if defined(__x86_64__) || defined(_M_X64)
+void FillAvx2Tier(ElemGemmTierTable* t);
+void FillAvx512Tier(ElemGemmTierTable* t);  // cpu_matmul_elem_avx512.cpp
+#endif
+
 // Selected ONCE per process: compile-time ISA plus a runtime feature probe
 // (mirrors ggml's `ggml_cpu_has_*` discipline, ggml-cpu.c). The portable
 // tier is always built and is what CI exercises.

@@ -246,6 +246,8 @@ abstraction, and `world_size == 1` stays byte-identical.
 | Multi-node | ☐ spike written | ✅ | ✅ |
 | PD disaggregation | ☐ | ✅ | ✅ |
 
+CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the CPU supports them (SSE2 before), selected by a runtime probe and byte-identical to the portable tier.
+
 ## Not supported yet
 
 | Gap | State | Detail |

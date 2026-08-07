@@ -486,6 +486,18 @@ ElemGemmTierTable BuildTier() {
     // f16 only, which the caller selects on a null btm entry.
     t.btm[kF16] = nullptr;
   }
+  // Wider tiers replace the SSE2 table wholesale when the CPU has them. AVX2
+  // needs F16C for its f16 widening (_mm256_cvtph_ps); every x86-64 CPU with
+  // AVX2 also has F16C, but the probe is explicit rather than assumed.
+  if ((forced.empty() || forced == "avx2") && __builtin_cpu_supports("avx2") &&
+      __builtin_cpu_supports("f16c")) {
+    FillAvx2Tier(&t);
+  }
+  // AVX-512F last so it wins when present, unless a narrower tier was forced
+  // for a same-binary A/B.
+  if ((forced.empty() || forced == "avx512") && __builtin_cpu_supports("avx512f")) {
+    FillAvx512Tier(&t);
+  }
 #endif
   return t;
 }
